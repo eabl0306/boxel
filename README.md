@@ -47,19 +47,26 @@ Shift izquierdo baja, Ctrl izquierdo acelera. F3 muestra el overlay de debug, F5
 de FPS (30, 60, 144, 240, sin límite) y F6 prende o apaga el vsync.
 
 Opciones útiles: `--fps-limit N` (0 = sin límite), `--vsync on|off`, `--seed N`,
-`--view-distance N` (en chunks), `--size 1280x720`,
-`--camera x,y,z,yaw,pitch` (ángulos en grados), `--tier high|mid|low`, `--help` (lista todo).
+`--view-distance N` (en chunks), `--vertical-radius N` (chunks hacia arriba y hacia abajo, 8 por
+defecto), `--size 1280x720`, `--camera x,y,z,yaw,pitch` (ángulos en grados), `--tier high|mid|low`,
+`--help` (lista todo).
 Para pruebas automáticas usa siempre `--frames N --timeout SEG`: la ventana se cierra sola.
 `--wait-chunks` empieza a contar frames cuando el terreno terminó de cargar y
 `--screenshot shot.png` guarda una captura en el frame N. `--duration SEG` corre el juego normal
 SEG segundos; al salir imprime updates y frames mostrados por segundo y el uso de CPU.
 
 **headless_world**: sin ventana ni GPU. Genera y mallea el mundo alrededor de un punto e imprime
-cuántos chunks y quads salieron. Sirve en CI.
+cuántos chunks y quads salieron y cuánto tardó. Sirve en CI y para medir la carga.
 
 ```bash
 cargo run --release --example headless_world
+just run headless_world --view-distance 32 --hz 144 --speed 256
 ```
+
+Opciones: `--view-distance N`, `--vertical-radius N`, `--hz N` (frames por segundo del bucle),
+`--idle S` (se queda quieto S segundos después de cargar y mide los frames), `--speed V` (camina a
+V vóxeles/s y mide los frames), `--jump N` (salta N chunks y mide hasta que la zona nueva está
+lista), `--fixed-height` (carga como M0, con el alto fijo del generador), `--help`.
 
 **gpu_info**: lista los adaptadores, cómo los clasifica boxel y qué elige.
 

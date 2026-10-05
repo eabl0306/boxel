@@ -1,6 +1,11 @@
 //! State machine tests: neighbor bookkeeping, stale results, the job contract, event budget and
 //! interest transitions (no ECS; fake mesher).
+//!
+//! Most tests use a fixed-height world (`vertical_bounds` = the generator's range, every layer
+//! wanted), as boxel M0 streamed; the `tall_*` tests and the property test cover the unbounded
+//! one.
 use super::*;
+use crate::interest::MAX_RADIUS;
 use crate::jobs::InlineExecutor;
 use crate::tests::support::{HoldExecutor, LayerGen, fake_mesh, panicking_mesh};
 use crate::{BlockEdit, WorldStats};
@@ -8,6 +13,9 @@ use boxel_voxel::{BlockPos, CHUNK_VOLUME, neighbor_index};
 use boxel_worldgen::WorldGenerator;
 
 const STONE: BlockState = BlockState(1);
+
+/// A viewer chunk and its horizontal radius (every layer of the vertical bounds is wanted).
+type ViewerChunk = (ChunkPos, u32);
 
 struct Harness {
     map: ChunkMap,
@@ -24,20 +32,32 @@ impl Harness {
         max_in_flight: usize,
     ) -> Self {
         let registry = Arc::new(BlockRegistry::default_blocks());
+        let settings = WorldSettings {
+            vertical_bounds: Some(generator.vertical_chunks()),
+            interest_budget: Duration::MAX,
+            job_budget: Duration::MAX,
+            ..WorldSettings::default()
+        };
         let content = WorldContent {
             generator: Arc::new(generator),
             materials: Arc::new(MaterialTable::from_registry(&registry)),
             registry,
         };
-        let mut jobs = WorldJobs::new(max_in_flight, executor);
+        let mut jobs = WorldJobs::new(max_in_flight, 1, executor);
         jobs.mesh_fn = fake_mesh;
         Self {
             map: ChunkMap::default(),
             jobs,
             content,
-            settings: WorldSettings::default(),
+            settings,
             events: Vec::new(),
         }
+    }
+
+    /// The same world without a height limit.
+    fn tall(mut self) -> Self {
+        self.settings.vertical_bounds = None;
+        self
     }
 
     fn with<R>(&mut self, f: impl FnOnce(&mut WorldJobs, &mut Ctx<'_>, &WorldSettings) -> R) -> R {
@@ -45,8 +65,20 @@ impl Harness {
         f(&mut self.jobs, &mut cx, &self.settings)
     }
 
+    /// Viewers with every layer of the bounds (ids by position in the list), applied fully.
     fn interest(&mut self, viewers: &[ViewerChunk]) {
+        let viewers: Vec<(u64, Viewer)> = (0u64..)
+            .zip(viewers)
+            .map(|(id, &(c, r))| (id, Viewer::new(c, r, MAX_RADIUS)))
+            .collect();
+        self.viewers(&viewers);
+    }
+
+    /// Applies `viewers` (sorted by id) fully.
+    fn viewers(&mut self, viewers: &[(u64, Viewer)]) {
         self.with(|jobs, cx, settings| jobs.update_interest(cx, settings, viewers));
+        assert_eq!(self.jobs.interest_backlog(), 0, "unlimited budget");
+        assert_eq!(self.jobs.scheduler.stale(), 0);
     }
 
     fn dispatch(&mut self) {
@@ -778,3 +810,109 @@ fn empty_mesh_is_redone_after_a_neighbor_reloads() {
     assert!(upserted(&h.take_events()).contains(&ChunkPos::new(1, 0, 0)));
     h.check_published();
 }
+
+#[test]
+fn auto_cap_keeps_workers_busy_for_one_and_a_half_frames() {
+    // 144 Hz, 60 us jobs, 6 workers: 6 x ceil(1.5 x 6.94 ms / 60 us) = 6 x 174.
+    assert_eq!(auto_cap(6, 1.0 / 144.0, 60e-6), 6 * 174);
+    // An uncapped loop (4000 updates/s).
+    assert_eq!(auto_cap(6, 0.25e-3, 60e-6), 6 * 7);
+    // At least 2 per worker, at most MAX_AUTO_IN_FLIGHT.
+    assert_eq!(auto_cap(4, 1e-6, 1e-3), 8);
+    assert_eq!(auto_cap(8, 1.0, 1e-6), MAX_AUTO_IN_FLIGHT);
+    assert_eq!(auto_cap(0, 0.0, 0.0), 2);
+
+    // The averages follow the measurements.
+    let mut cap = AutoCap::new(4);
+    let t0 = Instant::now();
+    for i in 0..64 {
+        cap.observe_frame(t0 + Duration::from_millis(10 * i));
+        for _ in 0..40 {
+            cap.observe_job(Duration::from_micros(100));
+        }
+    }
+    cap.observe_frame(t0 + Duration::from_millis(640));
+    assert!((cap.frame - 0.010).abs() < 1e-4, "{}", cap.frame);
+    assert!((cap.job - 100e-6).abs() < 1e-6, "{}", cap.job);
+    assert_eq!(cap.cap(), auto_cap(4, cap.frame, cap.job));
+    // A hitch counts as 33 ms at most.
+    cap.observe_frame(t0 + Duration::from_secs(60));
+    assert!(cap.frame < 0.0135, "{}", cap.frame);
+    // A frame with a single slow job (10 times the average) barely moves the job cost.
+    let job = cap.job;
+    cap.observe_job(Duration::from_millis(1));
+    cap.observe_frame(t0 + Duration::from_secs(61));
+    assert!(
+        cap.job > job && cap.job < job * 1.05,
+        "{} after {job}",
+        cap.job
+    );
+}
+
+/// Jobs come back in no useful order: cheap generations and expensive meshes mixed, some frames
+/// ending with a run of one kind. The cap depends on what the frames finished, not on that order,
+/// and it stays steady while the mix does.
+#[test]
+fn auto_cap_is_steady_under_a_mixed_job_stream() {
+    let t0 = Instant::now();
+    let cheap = Duration::from_micros(5);
+    let costly = Duration::from_micros(150);
+    let mut caps = Vec::new();
+    let mut cap = AutoCap::new(6);
+    for frame in 0..200u32 {
+        cap.observe_frame(t0 + Duration::from_micros(6944 * u64::from(frame)));
+        caps.push(cap.cap());
+        // 300 of each per frame; every other frame ends with all the cheap ones.
+        let (first, last) = if frame % 2 == 0 {
+            (costly, cheap)
+        } else {
+            (cheap, costly)
+        };
+        for busy in std::iter::repeat_n(first, 300).chain(std::iter::repeat_n(last, 300)) {
+            cap.observe_job(busy);
+        }
+    }
+    // After the first frames, consecutive caps differ by a few percent at most.
+    let settled = &caps[64..];
+    let (lo, hi) = (
+        *settled.iter().min().expect("caps"),
+        *settled.iter().max().expect("caps"),
+    );
+    assert!(hi * 100 <= lo * 103, "cap between {lo} and {hi}");
+    // 6 workers x 1.5 frames / 77.5 us per job.
+    let expected = auto_cap(6, 6.944e-3, 77.5e-6);
+    assert!(
+        lo.abs_diff(expected) * 100 <= expected * 3,
+        "{lo} vs {expected}"
+    );
+
+    // The same jobs in another order give the same cap.
+    let mut a = AutoCap::new(6);
+    let mut b = AutoCap::new(6);
+    for frame in 0..10u32 {
+        let now = t0 + Duration::from_millis(7 * u64::from(frame));
+        a.observe_frame(now);
+        b.observe_frame(now);
+        for i in 0..100u64 {
+            a.observe_job(Duration::from_micros(i));
+            b.observe_job(Duration::from_micros(99 - i));
+        }
+    }
+    a.observe_frame(t0 + Duration::from_millis(70));
+    b.observe_frame(t0 + Duration::from_millis(70));
+    assert!((a.job - b.job).abs() < 1e-12, "{} vs {}", a.job, b.job);
+    assert_eq!(a.cap(), b.cap());
+}
+
+#[test]
+fn the_cap_follows_the_settings_every_frame() {
+    let mut h = surface_world(Arc::new(InlineExecutor));
+    h.settings.max_jobs_in_flight = 5;
+    h.jobs.begin_frame(&h.settings, Instant::now());
+    assert_eq!(h.jobs.scheduler.max_in_flight(), 5);
+    h.settings.max_jobs_in_flight = 0;
+    h.jobs.begin_frame(&h.settings, Instant::now());
+    assert_eq!(h.jobs.scheduler.max_in_flight(), h.jobs.auto_cap.cap());
+}
+
+mod tall;

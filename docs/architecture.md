@@ -604,37 +604,56 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
 
 Los chunks **no son entidades**. `ChunkMap` (recurso) = `SlotMap<ChunkId, ChunkSlot>` +
 `HashMap<ChunkPos, ChunkId>` con foldhash `FixedState` (determinista; 6.5 ns por lookup medidos).
-Los viewers sí son entidades (`Transform` + `ChunkViewer { radius }`).
+Los viewers sí son entidades (`Transform` + `ChunkViewer { radius, vertical_radius }`).
 
 Estados ortogonales por slot:
 
-- `DataState`: `Queued`, `Generating`, `Ready(Arc<ChunkData>)`, `Missing` (fuera del rango
-  vertical del generador, o generación fallida: aire permanente).
+- `DataState`: `Queued`, `Generating`, `Ready(Arc<ChunkData>)`, `Missing` (generación
+  fallida: aire permanente).
 - `MeshState`: `None`, `Queued`, `InFlight { data_version, epoch }`, `Ready { mesh, data_version,
   epoch }`, `Empty`.
 - `Interest`: `DATA`, `MESH`, `PINNED`.
 - `neighbors_ready`: máscara de 26 bits; `epoch`: contador que sube cuando cambia el borde de un
   vecino; `cancel`: `Arc<AtomicBool>` para cancelación cooperativa.
 
-Radios: malla en el círculo `radius` (xz), datos en `radius + 1` más los vecinos xz de cada
-columna con malla (el círculo solo deja fuera algunas diagonales del borde), descarga más allá de
-`radius + 1 + hysteresis` (2). Vertical: `WorldGenerator::vertical_chunks()`.
+Cada viewer quiere un cilindro vertical: malla en el círculo `radius` (xz) y en las capas a
+`vertical_radius` o menos (8 por defecto); datos un chunk más en cada dirección (círculo
+`radius + 1` más los vecinos xz de cada columna con malla, que el círculo solo deja fuera en
+algunas diagonales del borde); descarga más allá de otros `hysteresis` (2) chunks, en xz y en y.
+El mundo no tiene alto máximo; `WorldSettings::vertical_bounds` fija uno si hace falta (con el
+rango del generador y un `vertical_radius` grande reproduce el streaming de M0). Las capas fuera
+de `WorldGenerator::vertical_chunks()` se crean como aire sin job: el rango es una promesa del
+generador ("afuera todo es aire"), no un límite del mundo. Un vecino sin cargar no cuenta como
+listo, salvo fuera de `vertical_bounds`.
 
 Sistemas en `Update`, encadenados (`WorldSystems`):
 
-1. **Interest:** recalcula el conjunto deseado cuando un viewer cambia de chunk; crea slots,
-   encola generación con prioridad = distancia² al viewer más cercano; descarga (marca `cancel`,
-   emite `ChunkMeshEvent::Remove`, invalida vecinos); reprioriza la cola.
+1. **Interest:** cuando un viewer cambia de chunk o de radio, lista solo las posiciones cuyo
+   nivel (malla, datos, banda de descarga, fuera) cambia: un paso corto se compara fila por fila,
+   O(filas + cambios); un viewer nuevo o un salto lista su región nueva por cáscaras, la más
+   cercana primero, y después la vieja. Cada posición listada se evalúa contra los viewers
+   actuales dentro de `interest_budget` (1 ms por frame): crea slots (prioridad = distancia² al
+   viewer más cercano), actualiza el interés o descarga (marca `cancel`, emite
+   `ChunkMeshEvent::Remove`, invalida vecinos). Las prioridades de la cola quedan viejas y se
+   recalculan por lotes, las más cercanas primero. El mapa reserva lugar para dos vistas: al
+   saltar, la vieja sigue cargada hasta que se crea la nueva y el mapa no crece a mitad de la
+   carga.
 2. **Edits:** aplica `EditQueue` agrupando por chunk: `make_mut`, `set`, sube `version`, pide
    remesh del chunk y de los vecinos de cara tocados (sube su `epoch`). Prioridad 0.
-3. **Dispatch:** saca jobs mientras `in_flight < tope` (por defecto 2x hilos de async compute).
-   Generación: captura generador, registry y clave. Malla: solo si los 26 vecinos están `Ready`
-   o `Missing`; captura el centro y los 26 `Arc`, la tabla de materiales, `data_version` y
-   `epoch`. Atajos: centro aire uniforme, o centro opaco uniforme rodeado de opacos uniformes en
-   las 6 caras, da `Empty` sin job.
-4. **Collect:** vacía el canal con presupuesto de tiempo (4 ms) y de eventos (512 por frame).
-   Descarta resultados viejos (generación del slotmap, `data_version`, `epoch`, `cancel`).
-   Publica `ChunkMeshEvent::Upsert` / `Remove`.
+3. **Dispatch:** primero vacía el canal de resultados (libera sus lugares en vuelo) y después
+   saca jobs mientras `in_flight < tope`; repite mientras lleguen resultados, dentro de
+   `job_budget` (2 ms por frame). Antes de sacar un job recalcula las prioridades viejas que
+   podrían ir antes que él: el viewer se acercó como mucho tanto como se movió, y eso acota cada
+   prioridad vieja. Así los jobs salen siempre del más cercano al más lejano. El tope por defecto
+   sale de los hilos de async compute, del costo medido de un job (promedio de cada frame,
+   suavizado entre frames) y del intervalo entre frames: trabajo para 1.5 frames (al menos 2 por
+   hilo, como mucho 4096). Generación: captura generador, registry y clave. Malla: solo si los 26
+   vecinos están `Ready` o `Missing`; captura el centro y los 26 `Arc`, la tabla de materiales,
+   `data_version` y `epoch`. Atajos: centro aire uniforme, o centro opaco uniforme rodeado de
+   opacos uniformes en las 6 caras, da `Empty` sin job. Descarta resultados viejos (generación
+   del slotmap, `data_version`, `epoch`, `cancel`).
+4. **Collect:** publica `ChunkMeshEvent::Upsert` / `Remove` de las mallas listas, hasta 512 por
+   frame.
 
 **Contrato de resultados:** todo job enviado devuelve **exactamente un** mensaje: `Generated`,
 `Meshed`, `Cancelled` (vio la bandera de cancelación) o `Failed` (con el texto del pánico). El

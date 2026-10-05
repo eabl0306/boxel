@@ -232,6 +232,50 @@ fn terrain_fast_paths_are_uniform() {
     assert_eq!(floor.get(LocalPos::new(4, 1, 9)), state(&r, "boxel:stone"));
 }
 
+/// The world has no height limit, so generators get chunks at any height: far above, far below
+/// the floor and deep in the stone, the answer is a uniform chunk computed without the column
+/// heights. 100 000 noise octaves make any height computation take about a second per chunk.
+#[test]
+fn terrain_answers_far_chunks_without_heights() {
+    let r = registry();
+    let g = TerrainGenerator::new(
+        7,
+        TerrainSettings {
+            octaves: 100_000,
+            bottom: -100_000,
+            ..TerrainSettings::default()
+        },
+    );
+    let stone = state(&r, "boxel:stone");
+    let start = std::time::Instant::now();
+    for (x, z) in [(0, 0), (-9, 4), (1 << 20, -(1 << 20))] {
+        for (y, expected) in [
+            (4, BlockState::AIR),
+            (1000, BlockState::AIR),
+            ((1 << 26) - 1, BlockState::AIR),
+            (-1, stone),
+            (-1000, stone),
+            // Layer -3125 holds the floor (y = -100 000); below it is air.
+            (-3124, stone),
+            (-3126, BlockState::AIR),
+            (-(1 << 26), BlockState::AIR),
+        ] {
+            let data = chunk(&g, &r, x, y, z);
+            assert_eq!(data, ChunkData::uniform(expected), "chunk ({x}, {y}, {z})");
+        }
+    }
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(1),
+        "far chunks took {:?}",
+        start.elapsed()
+    );
+    // The default terrain agrees with its column rules around the same layers.
+    let d = TerrainGenerator::default();
+    for y in [-3, -1, 4, 5] {
+        assert_matches_rules(&d, &r, ChunkPos::new(2, y, -7));
+    }
+}
+
 #[test]
 fn surface_chunk_has_grass_on_top() {
     let r = registry();
@@ -306,6 +350,10 @@ fn flat_layers_are_exact() {
     }
     // Deterministic.
     assert_eq!(chunk(&g, &r, 4, 0, 4), chunk(&g, &r, 4, 0, 4));
+    // Any height: air far above and below.
+    for y in [(1 << 26) - 1, 1000, -1000, -(1 << 26)] {
+        assert_eq!(chunk(&g, &r, 3, y, -2), ChunkData::uniform(BlockState::AIR));
+    }
 }
 
 #[test]

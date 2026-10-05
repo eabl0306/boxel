@@ -71,7 +71,7 @@ fn spawn_camera_viewer(app: &mut App) -> Entity {
         .spawn((
             Transform::from_translation(DVec3::new(0.5, 80.0, 0.0)),
             FlyCamera::default(),
-            ChunkViewer { radius: 0 },
+            ChunkViewer::new(0).with_vertical_radius(0),
         ))
         .id()
 }

@@ -5,6 +5,10 @@ Fecha: 2026-10-05. Máquina: Ryzen 7 250 (16 hilos) y RTX 5050 Laptop, Vulkan, t
 Sale de dos análisis: uno siguió un chunk por todo el código de boxel y lo midió; el otro leyó
 Bevy 0.19.1 y midió en esta misma máquina cómo sube las mallas.
 
+**Actualización (streaming v2, mismo día):** el interés incremental, la carga desatada de los
+frames y el mundo infinito en vertical ya están hechos. Las secciones 7.1, 7.2, 7.5 y 9 cuentan
+qué cambió, con números nuevos. El resto describe el estado anterior.
+
 ## En resumen
 
 1. Cada chunk de 32³ se guarda comprimido con una paleta. Si es de puro aire, sus vóxeles no
@@ -19,11 +23,8 @@ Bevy 0.19.1 y midió en esta misma máquina cómo sube las mallas.
    se borró; sección 6.4). boxel no debería caer por la subida de mallas: no tiene ese trabajo
    extra.
 5. Lo que falta resolver o probar:
-   - Al cruzar un borde de chunk, también al subir o bajar, boxel recalcula de cero qué chunks
-     quiere. A radio 32 tarda 5 a 8.5 ms (medido): entre el 70 % y más de un frame entero a
-     144 Hz (6.94 ms). Es el pico más grande hoy.
-   - La carga va atada a los frames. Con el bucle a 144 Hz, radio 32 tarda 40 s en cargar.
-   - El mundo tiene 6 chunks de alto (y de -64 a 127). No es infinito en vertical.
+   - Resuelto después (7.1, 7.2 y 9): el pico de 5 a 8.5 ms al cruzar un borde, los 40 s de
+     carga a 144 Hz y el alto fijo de 6 chunks.
    - Nada se probó todavía con un juego real: jugador moviéndose, ediciones y cuevas.
 6. Escala: los 32 chunks de 16³ del juego en Bevy son 512 vóxeles, o sea radio 16 en boxel.
 7. Llamadas a la GPU: boxel nunca dibuja un vóxel suelto. La unidad es el chunk, mallado en quads
@@ -422,67 +423,100 @@ entero mientras se carga, no solo la subida (sección 10, paso 1).
 
 | # | Problema | Peor caso medido | Dónde |
 |---|---|---|---|
-| 1 | Recalcular el interés entero al cruzar un borde, también vertical | 6.3 a 8.5 ms en un frame a radio 32 | `world/streaming.rs:261-309` |
-| 2 | Carga atada a los frames | 40 s para cargar radio 32 a 144 Hz | `world/streaming.rs:674`, `world/plugin.rs:180-203` |
+| 1 | Recalcular el interés entero al cruzar un borde, también vertical (resuelto, 7.1) | 6.3 a 8.5 ms en un frame a radio 32 | `world/interest.rs`, `world/streaming.rs` |
+| 2 | Carga atada a los frames (resuelto, 7.2) | 40 s para cargar radio 32 a 144 Hz | `world/streaming.rs`, `world/plugin.rs` |
 | 3 | Render sin presupuesto propio | 1.0 a 2.2 ms con 512 chunks en un frame | `render/plugin.rs:987-1024` |
 | 4 | Resync de todo en un frame | 16 a 35 ms (estimado) | `render/plugin.rs:952-963` |
-| 5 | Costo fijo por frame | 0.24 ms del mundo en reposo a radio 32 | `world/plugin.rs:300-326` |
+| 5 | Costo fijo por frame (resuelto en el mundo, 7.5) | 0.34 ms del descarte en CPU con 8000 chunks (Mid y Low) | `render/path/mod.rs:361-394` |
 | 6 | Warning de fixed timestep | sale con un frame de más de unos 140 ms; en tu log, el primero (250 ms o más) | `app/time.rs:39`, `app/time.rs:198-240` |
 | 7 | Tope de draws en High | warning desde unos 10 900 chunks vivos | `render/renderer.rs:237`, `render/renderer.rs:428-438` |
 
 ### 7.1 Recalcular el interés al cruzar un borde
 
-Cada vez que la cámara pasa a otro chunk, boxel rehace la lista entera de chunks que quiere
-(`world/interest.rs:58-78`), recorre todos los slots (`world/streaming.rs:274-291`), crea los
-nuevos (`world/streaming.rs:293-297`) y rehace el heap (`world/streaming.rs:299-308`). El costo
-depende del tamaño de la vista, no de lo que cambió.
+**Antes:** cada vez que la cámara pasaba a otro chunk, también al subir o bajar, boxel rehacía la
+lista entera de chunks, recorría todos los slots y rehacía el heap. A radio 32 eran 5 a 8.5 ms
+en un frame (medido).
 
-Pasa también al cruzar un borde vertical (cada 32 vóxeles al subir o bajar), aunque no entre ni
-salga ningún chunk. La cámara se guarda como chunk 3D (`world/plugin.rs:224`) y cualquier
-cambio dispara el recálculo (`world/streaming.rs:267`), aunque la altura no cambie qué chunks se
-quieren (`world/interest.rs:68-69`).
+**Ahora** (`world/interest.rs`, `world/streaming.rs`):
 
-| Radio | Costo por cruce (medido) |
-|---|---|
-| 12 | 1.1 a 1.5 ms |
-| 16 | 2.2 a 2.7 ms |
-| 32 | 4.8 a 5.5 ms con el bucle libre; 6.3 a 8.5 ms con el bucle a 144 Hz |
+- Al moverse, solo se listan las posiciones que cambian: las capas que entran y las que salen. Se
+  calcula fila por fila, sin recorrer la vista.
+- Lo listado se aplica con un tope por frame (`interest_budget`, 1 ms). Si es mucho (un salto,
+  un viewer nuevo, un radio más grande) se reparte entre frames, lo más cercano primero.
+- Las prioridades de la cola se recalculan por lotes, no todas en el frame del cruce. Mientras
+  tanto, antes de lanzar un job se recalculan las que podrían ir antes que él: los jobs salen
+  siempre del más cercano al más lejano.
+- El mapa reserva lugar para dos vistas cuando aparece el viewer. Al saltar lejos, la vista
+  vieja sigue cargada hasta que se crea la nueva; con ese lugar el mapa no crece a mitad de la
+  carga. Solo crece en el frame en que la vista se agranda (radio más grande, viewer nuevo).
 
-El primer cálculo, al arrancar, tarda 16 ms a radio 32. Desglose medido a radio 32: armar la
-lista 2.23 ms, recorrer los slots 0.57 ms, buscar en el índice 0.08 ms. El resto de un cruce
-(unos 2 a 5 ms) no se midió por partes: crear y borrar slots, rehacer el heap y, quizás, fallos
-de caché.
+Medido con `cargo bench -p boxel_world --bench interest`: el frame del cruce, con el mundo ya
+cargado antes de cada cruce. "Mismos chunks" es el alto fijo de M0, sin tope de tiempo.
 
-**Arreglo:** calcular solo lo que entra y sale. A radio 32 son unas 67 columnas de cada lado, no
-las 3473 de la vista. Cambiar el `BTreeMap` por un set o un bitmap de columnas y no rehacer el
-heap entero. Mientras el interés no use la altura, subir o bajar no debería recalcular la lista.
+| Cruce | M0 | Ahora, mismos chunks | Ahora, radio vertical 8: frame (trabajo total) |
+|---|---|---|---|
+| En x, radio 16 | 1.73 ms | 0.33 ms | 0.92 ms (0.95 ms) |
+| En x, radio 32 | 6.15 ms | 0.73 ms | 1.27 ms (2.04 ms) |
+| Subir, radio 16 | 1.17 ms | 0.03 ms | 0.60 ms (0.66 ms) |
+| Subir, radio 32 | 4.70 ms | 0.05 ms | 1.11 ms (2.55 ms) |
+
+Con radio vertical 8 hay 3 veces más chunks (66 000 a radio 32) y subir cambia una capa entera.
+Lo que pasa de 1 ms va a los frames siguientes.
+
+Un salto de 100 chunks (`headless_world --jump 100`, 144 Hz, 9 corridas de cada uno):
+
+| Salto | Antes de reservar dos vistas | Ahora |
+|---|---|---|
+| Radio 32: peor frame | 3.2 a 4.9 ms (mediana 4.0) | 2.6 a 4.7 ms (mediana 3.2) |
+| Radio 32: zona nueva lista | 0.95 a 1.02 s | 0.77 a 0.92 s |
+| Radio 16: zona nueva lista | 0.20 a 0.26 s | 0.15 a 0.18 s |
+
+Antes, a mitad de la carga el índice pasaba de 114 688 a 229 376 lugares en un frame. Ahora tiene
+229 376 desde el principio: unos 3 MB más a radio 32 antes del primer salto, lo mismo que antes
+quedaba después de él. La zona nueva sale antes porque los jobs van del más cercano al más
+lejano también después del salto.
 
 ### 7.2 Carga atada a los frames
 
-Dispatch corre antes que Collect, y los lugares en vuelo solo se liberan en Collect
-(`world/streaming.rs:674`). Collect corre justo después de Dispatch, cuando el job todavía no
-terminó. Su lugar se libera en el Collect del frame siguiente, cuando el Dispatch de ese frame ya
-pasó. Resultado: cada lugar hace un job cada 2 frames; con 12 lugares, unos 6 jobs por frame. El
-informe M0 ya lo había visto (`docs/informe-m0.md`, M1 punto 1).
+**Antes:** Dispatch iba antes que Collect, así que cada lugar en vuelo hacía un job cada 2 frames.
+Con 12 lugares, unos 6 jobs por frame: radio 32 tardaba 40 s en cargar a 144 Hz y se atrasaba
+al moverse.
 
-| Escenario a 144 Hz | Tiempo de carga (medido) |
-|---|---|
-| Radio 12, 12 en vuelo | 5.93 s |
-| Radio 16, 12 en vuelo | 10.6 s |
-| Radio 32, 12 en vuelo | 39.95 s |
-| Radio 16, 64 en vuelo | 1.96 s |
-| Radio 32, 256 en vuelo | 1.80 s |
-| Radio 32, bucle libre | 0.61 s |
+**Ahora:**
 
-Moviéndose a 64 vóxeles/s a radio 32 con 12 en vuelo se juntan 1400 jobs atrasados en 5 s
-(medido). Con 256 en vuelo y 256 vóxeles/s no hay atraso (medido). Los workers no son el cuello.
+- En cada frame primero se recogen los jobs terminados y después se lanzan nuevos. Se repite
+  mientras sigan llegando resultados, con un tope de 2 ms (`job_budget`).
+- El tope de jobs en vuelo sale solo: lo que los hilos hacen en 1.5 frames, con el costo medido de
+  un job y el tiempo medido entre frames. A 144 Hz, con jobs de 60 µs y 6 hilos, son unos 1000.
+  El costo se promedia por frame y después entre frames. Antes seguía a los últimos jobs de cada
+  frame y el tope saltaba entre 558 y 3114 de un frame al siguiente; ahora cambia como mucho un
+  23 % (medido a radio 32 cargando y caminando).
+- Los chunks que el generador declara de puro aire se crean listos, sin job (sección 9).
 
-Con el límite de FPS (144 por defecto, ADR 0013) ya se nota. Medido con `voxel_world
---wait-chunks`: radio 12 carga en 6.5 s (sin límite, 0.6 s), radio 16 en 11 s y radio 32 en 41 s
-(sin límite, 1.7 s).
+Medido con `headless_world` en release, terreno por defecto, bucle a 144 Hz (`--hz 144`), que es
+el ritmo del límite de FPS por defecto (ADR 0013). El frame es todo el `App::update` (mundo sin
+render).
 
-**Arreglo:** recolectar antes de despachar, o despachar otra vez después de Collect. Subir el
-tope o cambiarlo por un tope de memoria.
+| Escenario | M0 | Ahora, mismos chunks | Ahora, radio vertical 8 |
+|---|---|---|---|
+| Cargar radio 16 | 10.5 s | 0.09 s | 0.10 a 0.12 s |
+| Cargar radio 32 | 40.4 s | 0.28 a 0.34 s | 0.38 a 0.45 s |
+| Frame mientras carga radio 32: p99 / peor | 0.5 a 1.2 / 13 a 20 ms | 3.2 a 3.7 / 3.3 a 3.9 ms | 2.9 a 3.1 / 3.1 a 4.4 ms |
+| Caminar a 64 vóxeles/s, radio 32: p99 / peor | 4.6 a 5.3 / 7.7 a 7.9 ms | 1.4 a 1.9 / 2.0 a 2.4 ms | 1.6 a 1.8 / 2.2 a 2.5 ms |
+| Caminar a 256 vóxeles/s, radio 32: p99 / peor | 8 a 15 / 9 a 20 ms | 1.4 a 1.5 / 1.7 a 2.0 ms | 2.0 a 2.1 / 2.5 ms |
+| Al parar después de 5 s a 256 vóxeles/s | 37 000 jobs atrasados, 24.7 s para ponerse al día | 0.02 s | 0.02 s |
+
+Mientras carga, el mundo usa casi todo su tope: unos 3 ms de los 6.94 ms de un frame a 144 Hz.
+Antes el frame era más corto, pero la carga tardaba 100 veces más. Los dos topes se pueden bajar
+en `WorldSettings` si el juego necesita más margen.
+
+En `voxel_world` (ventana, bucle sin límite, `--wait-chunks`, incluye elegir la GPU): radio 16
+tardaba 1.1 a 1.2 s y ahora 0.5 a 0.6 s; radio 32, 3.7 a 7.0 s antes y 0.8 a 1.0 s ahora.
+
+Para repetirlo: `headless_world --view-distance 32 --hz 144`, con `--fixed-height` para los
+chunks de M0, `--speed 256` para caminar, `--jump 100` para saltar y `--idle 5` para el reposo.
+Carga del sistema durante las medidas: 3 a 12. Repetido después de los arreglos de la revisión
+(con carga 2 a 7): cargar y caminar dan lo mismo que antes de ellos.
 
 ### 7.3 Render sin presupuesto propio
 
@@ -508,10 +542,17 @@ Con GPU nueva, pérdida de dispositivo o cambio de tier, Extract mete todas las 
 
 ### 7.5 Costo fijo por frame
 
-`publish_stats` recorre todos los slots y arma un texto en cada frame
-(`world/plugin.rs:300-326`, `world/map.rs:176`). El mundo en reposo mide 0.24 ms a radio 32
-contra 0.195 ms a radio 12, con el bucle a 144 Hz (medido). En Mid y Low el descarte en CPU
-recorre todos los chunks (`render/path/mod.rs:361-394`): 0.34 ms con 8000 (medido).
+**Antes:** `publish_stats` recorría todos los slots y armaba un texto en cada frame. El mundo en
+reposo medía 0.24 ms a radio 32 y 0.195 ms a radio 12: crecía con el radio (medido con
+`world_stream`, sección 11).
+
+**Ahora:** solo recorre los slots y arma el texto si el mapa cambió (`world/plugin.rs:354-392`,
+`world/map.rs:182-208`). En reposo, el frame entero de `headless_world --idle 5` (mundo sin
+render, 144 Hz) mide 0.11 a 0.14 ms de mediana y 0.3 a 0.43 ms de p99, igual a radio 12 que a
+radio 32 (medido). Ya no crece con el radio.
+
+**Queda:** en Mid y Low el descarte en CPU recorre todos los chunks
+(`render/path/mod.rs:361-394`): 0.34 ms con 8000 (medido).
 
 ### 7.6 El warning de fixed timestep
 
@@ -557,40 +598,42 @@ sale como mucho cada 5 s con la cuenta acumulada. Si vuelve a salir en pleno jue
 
 ## 9. Mundo infinito en vertical
 
-**Hoy no lo es.**
+**Antes:** el alto era fijo, el rango del generador: 6 chunks, de y = -64 a 127.
 
-- El rango vertical es fijo: lo da el generador (`world/streaming.rs:195-199`).
-  `TerrainGenerator` da -2 a 3: 6 chunks, de y = -64 a 127 (`worldgen/lib.rs:280-284`).
-- La altura de la cámara no cuenta para elegir chunks (`world/interest.rs:68-69`), pero cruzar
-  un borde vertical igual dispara el recálculo completo de 7.1.
-- Un vecino fuera del rango cuenta como listo (`world/streaming.rs:810-824`).
-- La descarga mira solo xz (`world/interest.rs:82-87`).
-- Cada columna recorre todo el rango (`world/interest.rs:58-78`). Un rango enorme haría explotar
-  el costo y la memoria.
-- El generador tiene piso y techo fijos (`worldgen/lib.rs:223-238`).
+**Ahora el mundo no tiene alto máximo.**
 
-**Lo que ya sirve.**
+- Cada viewer tiene un radio horizontal y uno vertical: `ChunkViewer { radius, vertical_radius }`.
+  Quiere un cilindro: mallas en las columnas a `radius` o menos y en las capas a
+  `vertical_radius` o menos (8 por defecto, 256 vóxeles arriba y abajo); datos un chunk más en
+  cada dirección; descarga 2 chunks más allá, también en vertical (histéresis).
+- Por qué un cilindro: el terreno es ancho y bajo, y se mira más lejos a los costados que hacia
+  arriba o abajo. Una esfera de radio 32 serían 137 000 chunks.
+- Un vecino sin cargar no cuenta como listo: el borde de arriba y el de abajo esperan a sus
+  vecinos.
+- `vertical_chunks()` del generador ya no limita el mundo: dice dónde puede haber algo que no sea
+  aire. Afuera, los chunks se crean como aire, sin job, y se pueden editar. El generador tiene que
+  contestar rápido a cualquier altura: `TerrainGenerator` devuelve aire o piedra uniforme sin
+  calcular alturas lejos del terreno (probado).
+- Para comparar con M0, `WorldSettings::vertical_bounds` fija un alto. Con el rango del generador
+  y un radio vertical grande el mundo carga como antes (`--fixed-height` en los ejemplos).
 
-- `ChunkPos` ya usa `i32` en y (`voxel/coords.rs:17`).
-- La prioridad ya es distancia 3D (`world/interest.rs:91-97`).
-- Un chunk de puro aire o puro piedra: sus vóxeles no ocupan memoria (`voxel/storage.rs:9-23`),
-  se genera sin recorrer vóxeles (`worldgen/lib.rs:223-238`) y no lanza job de malla
-  (`world/streaming.rs:426-441`, `world/streaming.rs:834`). Hace falta, porque la mayoría de los
-  chunks de un mundo alto son así: a radio 32, 11 460 de 19 254 mallas pedidas salieron vacías
-  (medido).
+Chunks con datos por viewer (calculado):
 
-**Lo que hay que cambiar.**
+| Radio | Alto fijo de M0 | Radio vertical 4 | Radio vertical 8 |
+|---|---|---|---|
+| 16 | 5 598 | 10 263 | 17 727 |
+| 32 | 20 838 | 38 203 | 65 987 |
 
-1. **Interés 3D:** un radio vertical alrededor de la cámara, con un anillo de datos uno más
-   grande que el de malla, igual que hoy en xz.
-2. **Descarga 3D:** histéresis también en y.
-3. **Vecinos sin cargar = no listos.** Si no, el borde de arriba y de abajo se mallea con caras
-   de más, que después hay que rehacer.
-4. **Interés incremental (7.1):** ya hoy subir o bajar dispara el recálculo completo. Con
-   interés 3D, además, cada cruce vertical cambiaría la lista de verdad.
-5. **Generador 3D:** sin piso ni techo fijos, con cuevas.
-6. **Oclusión:** con cuevas, el descarte por pirámide dibuja mucho bajo tierra. Hi-Z (M2) gana
-   peso. Es una hipótesis hasta medirlo.
+Con el terreno por defecto, solo las 6 capas del generador necesitan job; el resto es aire, sin
+memoria de vóxeles. Las mallas con quads son las mismas que en M0 (7234 a radio 32 en
+`headless_world`, medido).
+
+**Lo que falta:**
+
+- Un generador 3D con cuevas: hoy el terreno es un mapa de alturas.
+- Oclusión (Hi-Z): con cuevas, el descarte por pirámide dibuja mucho bajo tierra.
+- A más de 8 chunks sobre el terreno, el suelo deja de cargarse. Un juego que necesite ver lejos
+  hacia abajo sube `vertical_radius`.
 
 ## 10. Plan hacia 32 chunks a 144 fps sin picos
 
@@ -599,10 +642,10 @@ En orden. Cada paso se mide antes y después.
 | # | Qué | Qué arregla |
 |---|---|---|
 | 1 | Overlay de debug y contadores | sin esto no se puede medir lo demás |
-| 2 | Interés incremental | el pico de 5 a 8.5 ms al cruzar un borde, también vertical (7.1) |
-| 3 | Desatar la carga de los frames | los 40 s de carga y el atraso al moverse (7.2) |
+| 2 | Interés incremental (hecho) | el pico de 5 a 8.5 ms al cruzar un borde, también vertical (7.1) |
+| 3 | Desatar la carga de los frames (hecho) | los 40 s de carga y el atraso al moverse (7.2) |
 | 4 | Presupuesto y lotes de subida en el render | ráfagas y el piso de 2 µs por chunk (7.3) |
-| 5 | Interés 3D | mundo infinito en vertical (9) |
+| 5 | Interés 3D (hecho) | mundo infinito en vertical (9) |
 | 6 | Resync en cuotas | el pico de 16 a 35 ms (7.4) |
 | 7 | Oclusión (Hi-Z) | quads bajo tierra y detrás de montañas |
 

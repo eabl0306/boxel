@@ -26,6 +26,16 @@ tracing.workspace = true
 [dev-dependencies]
 # Tests get system/component names in ECS diagnostics (dev-only; users opt in through boxel/debug).
 boxel_ecs = { workspace = true, features = ["debug"] }
+proptest.workspace = true
+criterion.workspace = true
+
+# Criterion flags (--quick, --save-baseline) must not reach the lib unit-test harness.
+[lib]
+bench = false
+
+[[bench]]
+name = "interest"
+harness = false
 
 [lints]
 workspace = true

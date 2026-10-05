@@ -30,8 +30,8 @@ pub(crate) mod support {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Uniform stone below chunk y = 0, uniform air from y = 0 up (both mesh fast paths), with an
-    /// optional key that panics.
+    /// Uniform stone from the bottom of `vertical` up to chunk y = -1, uniform air elsewhere (both
+    /// mesh fast paths), with an optional key that panics.
     pub(crate) struct LayerGen {
         pub(crate) vertical: RangeInclusive<i32>,
         pub(crate) panic_at: Option<ChunkPos>,
@@ -53,7 +53,7 @@ pub(crate) mod support {
                 "test generator panics at {:?}",
                 key.pos
             );
-            if key.pos.y < 0 {
+            if key.pos.y < 0 && self.vertical.contains(&key.pos.y) {
                 ChunkData::uniform(registry.by_name("boxel:stone").expect("stone"))
             } else {
                 ChunkData::uniform(BlockState::AIR)
@@ -137,8 +137,22 @@ fn settings(max_jobs_in_flight: usize) -> WorldSettings {
     }
 }
 
-/// App with the world plugin, the fake mesher and a diagnostics board.
+/// App with the world plugin, the fake mesher and a diagnostics board. The world has the
+/// generator's fixed height (boxel M0 streaming; viewers from [`spawn_viewer`] want every layer).
 fn world_app(generator: LayerGen, settings: WorldSettings, executor: Arc<dyn JobExecutor>) -> App {
+    let settings = WorldSettings {
+        vertical_bounds: Some(generator.vertical.clone()),
+        ..settings
+    };
+    tall_world_app(generator, settings, executor)
+}
+
+/// App with the world plugin, the fake mesher and a diagnostics board, with `settings` as given.
+fn tall_world_app(
+    generator: LayerGen,
+    settings: WorldSettings,
+    executor: Arc<dyn JobExecutor>,
+) -> App {
     let mut app = App::new();
     app.add_plugins(WorldPlugin {
         generator: Arc::new(generator),
@@ -161,11 +175,19 @@ fn chunk_center(chunk: ChunkPos) -> DVec3 {
     )
 }
 
+/// A viewer that wants every layer (of a fixed-height world).
 fn spawn_viewer(app: &mut App, chunk: ChunkPos, radius: u32) -> Entity {
+    spawn_tall_viewer(app, chunk, radius, u32::MAX)
+}
+
+fn spawn_tall_viewer(app: &mut App, chunk: ChunkPos, radius: u32, vertical_radius: u32) -> Entity {
     app.world_mut()
         .spawn((
             Transform::from_translation(chunk_center(chunk)),
-            ChunkViewer { radius },
+            ChunkViewer {
+                radius,
+                vertical_radius,
+            },
         ))
         .id()
 }
@@ -324,6 +346,7 @@ fn plugin_streams_settles_and_uses_fast_paths() {
             meshing: 0,
             queued_jobs: 0,
             in_flight: 0,
+            interest_backlog: 0,
         }
     );
     assert_eq!(
@@ -494,18 +517,21 @@ fn panicking_generator_marks_the_chunk_missing_and_settles() {
 
 #[test]
 fn task_pool_executor_settles_the_same_world() {
-    // max_jobs_in_flight = 0: 2 x async compute threads.
+    // max_jobs_in_flight = 0: the automatic cap, at least 2 per async compute thread.
     let mut app = world_app(
         LayerGen::new(-3..=1),
         settings(0),
         Arc::new(TaskPoolExecutor),
     );
+    let threads = boxel_tasks::AsyncComputeTaskPool::get_or_init(boxel_tasks::TaskPool::default)
+        .thread_num()
+        .max(1);
     let max = app
         .world()
         .resource::<WorldJobs>()
         .scheduler
         .max_in_flight();
-    assert!(max >= 2 && max.is_multiple_of(2), "auto cap {max}");
+    assert!(max >= 2 * threads, "auto cap {max}");
     spawn_viewer(&mut app, ChunkPos::new(0, 0, 0), 1);
     let start = std::time::Instant::now();
     let mut events = Vec::new();
@@ -573,4 +599,68 @@ fn world_systems_have_no_ambiguities() {
     app.add_systems(Last, read_stats);
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.update()));
     assert!(caught.is_err(), "ambiguity detection is active");
+}
+
+/// Without a height limit the world loads a cylinder around the viewer. A big change (the first
+/// viewer) is spread over frames when the interest budget is small, and `WorldStats` shows the
+/// backlog until it is applied.
+#[test]
+fn tall_world_spreads_big_changes_over_frames() {
+    let settings = WorldSettings {
+        interest_budget: std::time::Duration::ZERO,
+        max_jobs_in_flight: 64,
+        ..WorldSettings::default()
+    };
+    let mut app = tall_world_app(LayerGen::new(-3..=1), settings, Arc::new(InlineExecutor));
+    spawn_tall_viewer(&mut app, ChunkPos::new(0, 0, 0), 4, 2);
+    app.update();
+    let first = *app.world().resource::<WorldStats>();
+    assert!(
+        first.interest_backlog > 0,
+        "64 positions per frame: {first:?}"
+    );
+    assert!(!first.is_settled());
+    settle(&mut app, 500);
+    // Data: columns within radius 5 plus the xz neighbors of the radius-4 mesh columns, layers
+    // -3..=3 (vertical radius 2, plus one).
+    let mut expected = BTreeSet::new();
+    for y in -3..=3 {
+        for z in -6..=6_i32 {
+            for x in -6..=6_i32 {
+                let mesh = |x: i32, z: i32| x * x + z * z <= 16;
+                let data =
+                    x * x + z * z <= 25 || (-1..=1).any(|a| (-1..=1).any(|b| mesh(x + a, z + b)));
+                if data {
+                    expected.insert(ChunkPos::new(x, y, z));
+                }
+            }
+        }
+    }
+    assert_eq!(loaded(&app), expected);
+    assert_eq!(app.world().resource::<WorldStats>().interest_backlog, 0);
+    // Stone layers -3..=-1 under air: only the top of the stone (layer -1) is exposed; layer -3
+    // sits on layer -4, which is not meshed (outside the mesh layers -2..=2).
+    let map = app.world().resource::<ChunkMap>();
+    let mut exposed: Vec<i32> = map.ready_meshes().map(|(_, k, _)| k.pos.y).collect();
+    exposed.sort_unstable();
+    exposed.dedup();
+    assert_eq!(exposed, vec![-1]);
+}
+
+/// The job step collects before it dispatches and loops while results arrive: with jobs that
+/// finish at once, even 2 jobs in flight load the whole world in two frames.
+#[test]
+fn jobs_run_back_to_back_within_a_frame() {
+    let executor = Arc::new(CountingExecutor::default());
+    let mut app = world_app(LayerGen::new(-3..=1), settings(2), executor.clone());
+    spawn_viewer(&mut app, ChunkPos::new(0, 0, 0), 1);
+    app.update();
+    app.update();
+    let stats = *app.world().resource::<WorldStats>();
+    assert!(stats.is_settled(), "{stats:?}");
+    assert_eq!(
+        executor.spawned.load(Ordering::Relaxed),
+        105 + 10,
+        "every generation plus the exposed meshes"
+    );
 }
