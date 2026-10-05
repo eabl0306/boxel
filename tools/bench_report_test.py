@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""Tests of tools/bench_report.py: python3 tools/bench_report_test.py (or `just test-tools`).
+
+Also parses every committed stress summary under docs/rendimiento/ (the JSON data of each run),
+so a change of the summary layout in examples/stress.rs that the tool does not follow fails
+here."""
+import contextlib
+import copy
+import io
+import json
+import os
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bench_report as br  # noqa: E402
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+SAMPLE = {
+    'format': 1,
+    'run': {
+        'scenario': 'fly', 'label': 'abc', 'radius': 16, 'speed': 32, 'seed': '1',
+        'backend': 'Vulkan', 'tier': 'High', 'adapter': 'GPU', 'build': 'release',
+        'duration_s': 20, 'window': '1280x720',
+    },
+    'frames': {
+        'count': 1000, 'avg_fps': 500.0, 'p50_ms': 2.0, 'p95_ms': 2.5, 'p99_ms': 3.0,
+        'p999_ms': 5.0, 'max_ms': 8.0, 'low_1_fps': 200.0, 'over_144hz': 2, 'over_60hz': 0,
+        'crossing': {'frames': 10, 'p50_ms': 3.0, 'p99_ms': 6.0, 'max_ms': 6.5},
+        'other': {'frames': 990, 'p50_ms': 2.0, 'p99_ms': 3.0, 'max_ms': 8.0},
+    },
+    'world': {
+        'generated_per_s': 100.0, 'meshes_per_s': 50.0,
+        'queued': {'avg': 1.0, 'p95': 3, 'max': 10, 'first': 0, 'last': 0},
+        'backlog_trend_per_s': 0.0, 'catch_up_s': 0.5,
+        'border_catch_up': {'crossings': 10, 'finished': 10, 'avg_ms': 120.0, 'max_ms': 250.0},
+    },
+}
+
+
+def markdown(data):
+    return ('# boxel stress: fly r16 32 vox/s\n\n## Frames\n\n| a |\n\n## Data\n\nText.\n\n'
+            '```json\n' + json.dumps(data, indent=2) + '\n```\n')
+
+
+def run_main(*args):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = br.main(list(args))
+    return code, out.getvalue(), err.getvalue()
+
+
+class ParseTest(unittest.TestCase):
+    def test_markdown_and_json(self):
+        self.assertEqual(br.parse_summary(markdown(SAMPLE)), SAMPLE)
+        self.assertEqual(br.parse_summary(json.dumps(SAMPLE)), SAMPLE)
+
+    def test_rejects_other_files(self):
+        with self.assertRaises(br.ReportError):
+            br.parse_summary('# just a doc\n\n```json\n{"format": 1}\n```\n')
+        other = dict(SAMPLE, format=2)
+        with self.assertRaises(br.ReportError):
+            br.parse_summary(markdown(other))
+        with self.assertRaises(ValueError):
+            br.parse_summary('## Data\n\n```json\n{not json}\n```\n')
+
+
+class FormatTest(unittest.TestCase):
+    def test_fmt(self):
+        self.assertEqual(br.fmt(None), '-')
+        self.assertEqual(br.fmt(True), 'yes')
+        self.assertEqual(br.fmt(32.0), '32')
+        self.assertEqual(br.fmt(2.345), '2.35')
+        self.assertEqual(br.fmt(1234.5), '1234')
+        self.assertEqual(br.fmt('x'), 'x')
+
+    def test_change(self):
+        self.assertEqual(br.change(2.0, 1.0, -1), ('-50.0 %', 'better'))
+        self.assertEqual(br.change(2.0, 3.0, -1), ('+50.0 %', 'worse'))
+        self.assertEqual(br.change(100.0, 150.0, 1), ('+50.0 %', 'better'))
+        self.assertEqual(br.change(100.0, 100.5, 1), ('+0.5 %', ''))
+        self.assertEqual(br.change(100.0, 150.0, 0), ('+50.0 %', ''))
+        self.assertEqual(br.change(3, 3, -1), ('0 %', ''))
+        self.assertEqual(br.change(4, 0, -1), ('-100.0 %', 'better'))
+        self.assertEqual(br.change(-2.0, -1.0, -1), ('+50.0 %', 'worse'))
+        self.assertEqual(br.change(None, 3, -1), ('-', ''))
+
+    def test_change_from_zero(self):
+        # No percent from 0, but the direction still decides.
+        self.assertEqual(br.change(0, 3, -1), ('n/a', 'worse'))
+        self.assertEqual(br.change(0, -0.5, -1), ('n/a', 'better'))
+        self.assertEqual(br.change(0.0, 120.0, 1), ('n/a', 'better'))
+        self.assertEqual(br.change(0, -1, 1), ('n/a', 'worse'))
+        self.assertEqual(br.change(0, 3, 0), ('n/a', ''))
+        self.assertEqual(br.change(0, 0.0, -1), ('0 %', ''))
+
+    def test_title_and_get(self):
+        self.assertEqual(br.title(SAMPLE), 'fly r16 32 vox/s')
+        static = copy.deepcopy(SAMPLE)
+        static['run']['scenario'] = 'static'
+        self.assertEqual(br.title(static), 'static r16')
+        self.assertEqual(br.get(SAMPLE, ('frames', 'crossing', 'max_ms')), 6.5)
+        self.assertIsNone(br.get(SAMPLE, ('frames', 'missing', 'max_ms')))
+
+
+class OutputTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def write(self, name, data, sub=''):
+        folder = os.path.join(self.dir.name, sub)
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, name)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(markdown(data) if name.endswith('.md') else json.dumps(data))
+        return path
+
+    def test_table_has_one_row_per_run(self):
+        a = self.write('a.md', SAMPLE)
+        b = self.write('b.json', SAMPLE)
+        code, out, _ = run_main(a, b)
+        self.assertEqual(code, 0)
+        rows = [line for line in out.splitlines() if line.startswith('| fly r16')]
+        self.assertEqual(len(rows), 2)
+        self.assertIn('| 500 | 2 | 3 | 5 | 8 | 200 | 2 | 0 | 6.50 | 100 | 10 | 250 |', rows[0])
+
+    def test_directories_skip_other_files(self):
+        self.write('run.md', SAMPLE, 'runs')
+        with open(os.path.join(self.dir.name, 'runs', 'README.md'), 'w') as f:
+            f.write('# notes\n')
+        code, out, _ = run_main(os.path.join(self.dir.name, 'runs'))
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count('| fly r16'), 1)
+        empty = os.path.join(self.dir.name, 'empty')
+        os.makedirs(empty)
+        self.assertEqual(run_main(empty)[0], 2)
+
+    def test_compare_two_files(self):
+        faster = copy.deepcopy(SAMPLE)
+        faster['frames']['p99_ms'] = 1.5
+        faster['run']['radius'] = 32
+        code, out, _ = run_main('--compare', self.write('a.md', SAMPLE), self.write('b.md', faster))
+        self.assertEqual(code, 0)
+        self.assertIn('| p99 ms | 3 | 1.50 | -50.0 % | better |', out)
+        self.assertIn('Note: the settings differ (radius 16 -> 32)', out)
+
+    def test_compare_flags_new_spikes(self):
+        clean = copy.deepcopy(SAMPLE)
+        clean['frames']['over_144hz'] = 0
+        spiky = copy.deepcopy(clean)
+        spiky['frames']['over_144hz'] = 5
+        spiky['frames']['over_60hz'] = 1
+        code, out, _ = run_main('--compare', self.write('a.md', clean), self.write('b.md', spiky))
+        self.assertEqual(code, 0)
+        self.assertIn('| frames > 6.94 ms | 0 | 5 | n/a | worse |', out)
+        self.assertIn('| frames > 16.7 ms | 0 | 1 | n/a | worse |', out)
+        code, out, _ = run_main('--compare', self.write('b.md', spiky), self.write('a.md', clean))
+        self.assertIn('| frames > 6.94 ms | 5 | 0 | -100.0 % | better |', out)
+
+    def test_compare_directories_pairs_runs(self):
+        spin = copy.deepcopy(SAMPLE)
+        spin['run'].update(scenario='spin', speed=0)
+        self.write('1-fly.md', SAMPLE, 'base')
+        self.write('2-spin.md', spin, 'base')
+        self.write('3-fly.md', SAMPLE, 'new')
+        code, out, _ = run_main('--compare', os.path.join(self.dir.name, 'base'),
+                                os.path.join(self.dir.name, 'new'))
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count('### '), 1, 'only fly has a pair')
+        self.assertNotIn('Note:', out)
+        self.write('4-spin.md', spin, 'other')
+        code, _, err = run_main('--compare', os.path.join(self.dir.name, 'new'),
+                                os.path.join(self.dir.name, 'other'))
+        self.assertEqual(code, 2)
+        self.assertIn('no runs', err)
+
+    def test_compare_directories_keeps_gpus_apart(self):
+        # Same backend and tier on two adapters: each run pairs with its own GPU.
+        amd = copy.deepcopy(SAMPLE)
+        amd['run']['adapter'] = 'AMD'
+        amd['frames']['p99_ms'] = 9.0
+        self.write('1-gpu.md', SAMPLE, 'base')
+        self.write('2-amd.md', amd, 'base')
+        self.write('3-amd.json', amd, 'new')
+        code, out, _ = run_main('--compare', os.path.join(self.dir.name, 'base'),
+                                os.path.join(self.dir.name, 'new'))
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count('### '), 1)
+        self.assertIn('2-amd.md -> 3-amd.json', out)
+        self.assertIn('| p99 ms | 9 | 9 | 0 % |  |', out)
+        self.assertNotIn('Note:', out)
+
+    def test_usage_errors(self):
+        self.assertEqual(run_main()[0], 1)
+        self.assertEqual(run_main('--help')[0], 0)
+        self.assertEqual(run_main('--compare', 'only-one')[0], 1)
+        self.assertEqual(run_main(os.path.join(self.dir.name, 'missing.md'))[0], 1)
+        bad = os.path.join(self.dir.name, 'bad.md')
+        with open(bad, 'w') as f:
+            f.write('# not a summary\n')
+        code, _, err = run_main(bad)
+        self.assertEqual(code, 1)
+        self.assertIn('no "## Data" section', err)
+
+
+class CommittedSummariesTest(unittest.TestCase):
+    def test_every_committed_summary_parses(self):
+        folder = os.path.join(ROOT, 'docs', 'rendimiento')
+        files = []
+        for dirpath, _, names in os.walk(folder):
+            for name in names:
+                path = os.path.join(dirpath, name)
+                with open(path, encoding='utf-8') as f:
+                    text = f.read()
+                if name.endswith('.json') or (name.endswith('.md') and br.DATA_HEADING in text):
+                    files.append(path)
+        self.assertGreaterEqual(len(files), 13, 'the October 2026 baseline')
+        for path in files:
+            run = br.load(path)
+            br.table([run])
+            br.compare(run, run)
+            for _, keys, _ in br.METRICS:
+                optional = {'catch_up_s', 'crossing', 'border_catch_up'}
+                if not optional.intersection(keys):
+                    self.assertIsNotNone(br.get(run, keys), f'{path}: {keys}')
+
+
+if __name__ == '__main__':
+    unittest.main()

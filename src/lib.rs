@@ -63,7 +63,8 @@ pub mod prelude {
     pub use crate::{DefaultPlugins, MinimalPlugins};
     pub use boxel_app::prelude::*;
     pub use boxel_diagnostic::{
-        DiagnosticsBoard, FrameStats, FrameStatsPlugin, LogDiagnosticsPlugin,
+        DiagnosticsBoard, FrameStats, FrameStatsPlugin, FrameTimeHistory, FrameTimeSummary,
+        LogDiagnosticsPlugin,
     };
     pub use boxel_ecs::prelude::*;
     pub use boxel_log::LogPlugin;

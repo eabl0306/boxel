@@ -30,6 +30,7 @@ Estado: milestone M0, en desarrollo. Solo escritorio (Linux, Windows, macOS).
 | `just test-window` | Precisión del límite de FPS con una ventana real (necesita pantalla) |
 | `just test-lavapipe` / `just test-llvmpipe` | Tests de GPU por CPU (Vulkan / GL) |
 | `just bench` | Benchmarks |
+| `just bench-fly`, `bench-static`, `bench-spin`, `bench-all` | Mide los tirones del frame mientras carga el mundo ([docs/benchmarks.md](docs/benchmarks.md)) |
 | `just gpu-info` | Informe de GPUs y qué elegiría boxel |
 | `just run <ejemplo> <opciones>` | Corre `voxel_world` o `headless_world` en release |
 
@@ -130,6 +131,7 @@ monitor. Detalles en [ADR 0013](docs/adr/0013-limite-de-fps-y-vsync-en-tiempo-de
 ## Documentación
 
 - [docs/architecture.md](docs/architecture.md): cómo está hecho y por qué.
+- [docs/benchmarks.md](docs/benchmarks.md): cómo medir los tirones y comparar corridas.
 - [docs/adr/](docs/adr/): una decisión por archivo.
 
 ## Licencia

@@ -1,5 +1,13 @@
 //! Frame statistics and a shared, named diagnostics board that other crates fill
 //! (`"gpu"`, `"render"`, `"world"`) and [`LogDiagnosticsPlugin`] prints periodically.
+//!
+//! [`FrameStatsPlugin`] keeps two views of the frame time: [`FrameStats`] (last, moving
+//! average, worst since the last log) and [`FrameTimeHistory`] (the last frames, for
+//! percentiles, the worst frames and the "1% low" through [`FrameTimeSummary`]).
+
+mod history;
+
+pub use history::{FrameTimeHistory, FrameTimeSummary, percentile};
 
 use boxel_app::{App, Last, Plugin, Time};
 use boxel_ecs::prelude::*;
@@ -42,13 +50,15 @@ impl DiagnosticsBoard {
     }
 }
 
-/// Inserts [`FrameStats`] and [`DiagnosticsBoard`]; updates `FrameStats` in `Last`.
-/// Requires `boxel_app::TimePlugin`.
+/// Inserts [`FrameStats`], [`FrameTimeHistory`] (unless the app inserted its own) and
+/// [`DiagnosticsBoard`]; updates the first two in `Last`. Requires `boxel_app::TimePlugin`.
 ///
 /// Per frame: `frame += 1`, `last_frame_time = delta`, `avg_frame_time` is an exponential moving
 /// average (`avg * 0.9 + delta * 0.1`) seeded with the first non-zero delta (the first update of
 /// `Time` always has delta 0), `fps = 1 / avg` (0 while there is no average) and
 /// `worst_frame_time = max(worst, delta)` (reset by [`LogDiagnosticsPlugin`] after each log).
+/// From the second update of `Time` on, `Time::real_delta` is pushed to the history (the first
+/// update has no previous one to measure from).
 #[derive(Default)]
 pub struct FrameStatsPlugin;
 
@@ -62,6 +72,7 @@ const AVG_ALPHA: f64 = 0.1;
 impl Plugin for FrameStatsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FrameStats>()
+            .init_resource::<FrameTimeHistory>()
             .init_resource::<DiagnosticsBoard>()
             .add_systems(Last, update_frame_stats.in_set(FrameStatsSystems));
     }
@@ -74,7 +85,14 @@ impl Plugin for FrameStatsPlugin {
     }
 }
 
-fn update_frame_stats(time: Res<Time>, mut stats: ResMut<FrameStats>) {
+fn update_frame_stats(
+    time: Res<Time>,
+    mut stats: ResMut<FrameStats>,
+    mut history: ResMut<FrameTimeHistory>,
+) {
+    if time.frame_count() > 1 {
+        history.push(time.real_delta());
+    }
     let delta = time.delta();
     stats.frame += 1;
     stats.last_frame_time = delta;

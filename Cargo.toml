@@ -167,6 +167,12 @@ required-features = ["render", "voxel", "png"]
 # Runs its option-parsing tests with `cargo test`.
 test = true
 
+# `cargo test` also runs the unit tests inside the example (options, camera script, report).
+[[example]]
+name = "stress"
+required-features = ["render", "voxel"]
+test = true
+
 # Profiles only apply to this workspace's own examples/tests/benches.
 [profile.dev]
 opt-level = 1

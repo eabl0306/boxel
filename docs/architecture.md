@@ -980,6 +980,10 @@ schedule `Shutdown` es el lugar para el `flush` final.
 - Overlay F3 (`boxel_debug`): frames mostrados por segundo (de `RenderInfo::frames_presented`) y
   updates por segundo por separado, tiempo de frame, límite, vsync y modo de presentación, GPU,
   cámara y contadores de chunks. Teclas opcionales `FrameKeys` (F5 límite, F6 vsync).
+- `FrameTimeHistory`: los últimos frames (4096 por defecto, mínimo 1024) con su tiempo real
+  (`Time::real_delta`); `summary()` da p50, p95, p99, p99.9, máximo, promedio y 1% low.
+- Tirones mientras se carga el mundo: `examples/stress.rs` y `just bench-*`
+  ([benchmarks.md](benchmarks.md)).
 - Línea estable para scripts: `boxel: backend=Vulkan tier=High class=Discrete adapter="..."
   driver="..."` al estar listo el GPU, y `DECISION: ...` al final del reporte de selección.
 - Tracy: feature `trace_tracy` (tracing-tracy 0.12.0 + tracy-client 0.19.0, GUI 0.14.1) y
