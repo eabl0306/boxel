@@ -1,0 +1,454 @@
+# boxel stress: static r16
+
+- Run: 2026-10-05 14:00:16 UTC, release build, label `e933486`, AMD Ryzen 7 250 w/ Radeon 780M Graphics (16 threads), load 4.57 -> 5.40.
+- GPU: NVIDIA GeForce RTX 5050 Laptop GPU, Vulkan High (Discrete), driver `NVIDIA 595.91.07`, present immediate, window 1280x720.
+- World: seed 11566621, trees on, radius 16, settled in 0.62 s with 5598 chunks; 20 s measured after 2 s of warmup.
+
+## Frames
+
+| frames | avg fps | p50 ms | p95 ms | p99 ms | p99.9 ms | max ms | 1% low fps | > 6.94 ms | > 16.7 ms |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 117840 | 5892 | 0.14 | 0.33 | 0.47 | 2.54 | 10.11 | 946 | 1 | 0 |
+
+| frames | count | p50 ms | p99 ms | max ms |
+|---|---:|---:|---:|---:|
+| crossed a chunk border | 0 | - | - | - |
+| other | 117840 | 0.14 | 0.47 | 10.11 |
+
+## World
+
+| generated/s | meshes/s | removed/s | jobs/s | quads uploaded/s | crossings |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 0 | 0 | 0 | 0 | 0 |
+
+| backlog | avg | p95 | max | first | last |
+|---|---:|---:|---:|---:|---:|
+| jobs queued | 0.0 | 0 | 0 | 0 | 0 |
+| jobs in flight | 0.0 | 0 | 0 | 0 | 0 |
+| chunks generating or meshing | 0.0 | 0 | 0 | 0 | 0 |
+
+Queue trend +0.0 jobs/s (above 0: the world falls behind). It settled again 0.00 s after the camera stopped. At the end: 5598 chunks, 1951 meshes (2831 empty), 1951 on the GPU, 439764 quads, 2 draws.
+
+## Worst 5 frames
+
+| frame | t s | ms | crossed | generated | meshes | removed | quads up | queued | in flight |
+|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|
+| 41384 | 6.81 | 10.11 | no | 0 | 0 | 0 | 0 | 0 | 0 |
+| 48445 | 8.06 | 4.69 | no | 0 | 0 | 0 | 0 | 0 | 0 |
+| 23835 | 3.72 | 4.08 | no | 0 | 0 | 0 | 0 | 0 | 0 |
+| 57701 | 9.66 | 4.02 | no | 0 | 0 | 0 | 0 | 0 | 0 |
+| 21495 | 3.32 | 3.53 | no | 0 | 0 | 0 | 0 | 0 | 0 |
+
+## Per second
+
+| s | frames | fps | worst ms | generated | meshes | crossings | queued max | in flight max |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 5954 | 5954 | 3.04 | 0 | 0 | 0 | 0 | 0 |
+| 1 | 6968 | 6967 | 3.14 | 0 | 0 | 0 | 0 | 0 |
+| 2 | 6729 | 6729 | 2.82 | 0 | 0 | 0 | 0 | 0 |
+| 3 | 5767 | 5768 | 4.08 | 0 | 0 | 0 | 0 | 0 |
+| 4 | 5594 | 5593 | 3.24 | 0 | 0 | 0 | 0 | 0 |
+| 5 | 5761 | 5762 | 2.90 | 0 | 0 | 0 | 0 | 0 |
+| 6 | 5543 | 5543 | 10.11 | 0 | 0 | 0 | 0 | 0 |
+| 7 | 5813 | 5813 | 3.01 | 0 | 0 | 0 | 0 | 0 |
+| 8 | 5833 | 5833 | 4.69 | 0 | 0 | 0 | 0 | 0 |
+| 9 | 5606 | 5602 | 4.02 | 0 | 0 | 0 | 0 | 0 |
+| 10 | 5943 | 5947 | 3.10 | 0 | 0 | 0 | 0 | 0 |
+| 11 | 6138 | 6138 | 3.45 | 0 | 0 | 0 | 0 | 0 |
+| 12 | 5886 | 5886 | 2.82 | 0 | 0 | 0 | 0 | 0 |
+| 13 | 5796 | 5796 | 2.93 | 0 | 0 | 0 | 0 | 0 |
+| 14 | 5599 | 5598 | 3.04 | 0 | 0 | 0 | 0 | 0 |
+| 15 | 5941 | 5942 | 2.79 | 0 | 0 | 0 | 0 | 0 |
+| 16 | 5870 | 5870 | 3.07 | 0 | 0 | 0 | 0 | 0 |
+| 17 | 5878 | 5878 | 3.21 | 0 | 0 | 0 | 0 | 0 |
+| 18 | 5461 | 5460 | 2.85 | 0 | 0 | 0 | 0 | 0 |
+| 19 | 5760 | 5761 | 3.35 | 0 | 0 | 0 | 0 | 0 |
+
+## Data
+
+For `tools/bench_report.py` (format 1).
+
+```json
+{
+  "format": 1,
+  "run": {
+    "scenario": "static",
+    "label": "e933486",
+    "radius": 16,
+    "speed": 0,
+    "seed": "11566621",
+    "trees": true,
+    "duration_s": 20,
+    "warmup_s": 2,
+    "settle_s": 0.623,
+    "settle_chunks": 5598,
+    "adapter": "NVIDIA GeForce RTX 5050 Laptop GPU",
+    "backend": "Vulkan",
+    "tier": "High",
+    "class": "Discrete",
+    "driver": "NVIDIA 595.91.07",
+    "present": "immediate",
+    "window": "1280x720",
+    "build": "release",
+    "cpu": "AMD Ryzen 7 250 w/ Radeon 780M Graphics",
+    "threads": 16,
+    "load_start": 4.57,
+    "load_end": 5.4,
+    "unix_time": 1791208816,
+    "date_utc": "2026-10-05 14:00:16 UTC",
+    "frames_presented": 2867
+  },
+  "frames": {
+    "count": 117840,
+    "seconds": 20,
+    "avg_fps": 5892,
+    "mean_ms": 0.1697,
+    "p50_ms": 0.1426,
+    "p95_ms": 0.331,
+    "p99_ms": 0.4698,
+    "p999_ms": 2.5435,
+    "min_ms": 0.0736,
+    "max_ms": 10.1116,
+    "low_1_fps": 945.7,
+    "over_144hz": 1,
+    "over_60hz": 0,
+    "crossing": null,
+    "other": {
+      "frames": 117840,
+      "p50_ms": 0.1426,
+      "p99_ms": 0.4698,
+      "max_ms": 10.1116
+    }
+  },
+  "world": {
+    "generated": 0,
+    "generated_per_s": 0,
+    "meshes": 0,
+    "meshes_per_s": 0,
+    "removed": 0,
+    "removed_per_s": 0,
+    "jobs": 0,
+    "jobs_per_s": 0,
+    "upload_quads": 0,
+    "upload_quads_per_s": 0,
+    "crossings": 0,
+    "queued": {
+      "avg": 0,
+      "p95": 0,
+      "max": 0,
+      "first": 0,
+      "last": 0
+    },
+    "in_flight": {
+      "avg": 0,
+      "p95": 0,
+      "max": 0,
+      "first": 0,
+      "last": 0
+    },
+    "pending_chunks": {
+      "avg": 0,
+      "p95": 0,
+      "max": 0,
+      "first": 0,
+      "last": 0
+    },
+    "backlog_trend_per_s": 0,
+    "border_catch_up": null,
+    "catch_up_s": 0.001,
+    "final": {
+      "chunks": 5598,
+      "data_ready": 5598,
+      "mesh_ready": 1951,
+      "mesh_empty": 2831,
+      "gpu_chunks": 1951,
+      "quads": 439764,
+      "draws": 2
+    }
+  },
+  "worst": [
+    {
+      "frame": 41384,
+      "t_s": 6.811,
+      "ms": 10.1116,
+      "crossed": false,
+      "generated": 0,
+      "meshes": 0,
+      "removed": 0,
+      "upload_quads": 0,
+      "queued": 0,
+      "in_flight": 0
+    },
+    {
+      "frame": 48445,
+      "t_s": 8.056,
+      "ms": 4.6949,
+      "crossed": false,
+      "generated": 0,
+      "meshes": 0,
+      "removed": 0,
+      "upload_quads": 0,
+      "queued": 0,
+      "in_flight": 0
+    },
+    {
+      "frame": 23835,
+      "t_s": 3.721,
+      "ms": 4.0829,
+      "crossed": false,
+      "generated": 0,
+      "meshes": 0,
+      "removed": 0,
+      "upload_quads": 0,
+      "queued": 0,
+      "in_flight": 0
+    },
+    {
+      "frame": 57701,
+      "t_s": 9.663,
+      "ms": 4.0166,
+      "crossed": false,
+      "generated": 0,
+      "meshes": 0,
+      "removed": 0,
+      "upload_quads": 0,
+      "queued": 0,
+      "in_flight": 0
+    },
+    {
+      "frame": 21495,
+      "t_s": 3.321,
+      "ms": 3.5313,
+      "crossed": false,
+      "generated": 0,
+      "meshes": 0,
+      "removed": 0,
+      "upload_quads": 0,
+      "queued": 0,
+      "in_flight": 0
+    }
+  ],
+  "timeline": [
+    {
+      "second": 0,
+      "frames": 5954,
+      "fps": 5953.9,
+      "worst_ms": 3.0424,
+      "generated": 0,
+      "meshes": 0,
+      "crossings": 0,
+      "queued_max": 0,
+      "in_flight_max": 0
+    },
+    {
+      "second": 1,
+      "frames": 6968,
+      "fps": 6967,
+      "worst_ms": 3.1445,
+      "generated": 0,
+      "meshes": 0,
+      "crossings": 0,
+      "queued_max": 0,
+      "in_flight_max": 0
+    },
+    {
+      "second": 2,
+      "frames": 6729,
+      "fps": 6729.2,
+      "worst_ms": 2.8247,
+      "generated": 0,
+      "meshes": 0,
+      "crossings": 0,
+      "queued_max": 0,
+      "in_flight_max": 0
+    },
+    {
+      "second": 3,
+      "frames": 5767,
+      "fps": 5767.6,
+      "worst_ms": 4.0829,
+      "generated": 0,
+      "meshes": 0,
+      "crossings": 0,
+      "queued_max": 0,
+      "in_flight_max": 0
+    },
+    {
+      "second": 4,
+      "frames": 5594,
+      "fps": 5593.2,
+      "worst_ms": 3.2425,
+      "generated": 0,
+      "meshes": 0,
+      "crossings": 0,
+      "queued_max": 0,
+      "in_flight_max": 0
+    },
+    {
+      "second": 5,
+      "frames": 5761,
+      "fps": 5761.7,
+      "worst_ms": 2.8986,
+      "generated": 0,
+      "meshes": 0,
+      "crossings": 0,
+      "queued_max": 0,
+      "in_flight_max": 0
+    },
+    {
+      "second": 6,
+      "frames": 5543,
+      "fps": 5542.5,
+      "worst_ms": 10.1116,
+      "generated": 0,
+      "meshes": 0,
+      "crossings": 0,
+      "queued_max": 0,
+      "in_flight_max": 0
+    },
+    {
+      "second": 7,
+      "frames": 5813,
+      "fps": 5813.4,
+      "worst_ms": 3.0062,
+      "generated": 0,
+      "meshes": 0,
+      "crossings": 0,
+      "queued_max": 0,
+      "in_flight_max": 0
+    },
+    {
+      "second": 8,
+      "frames": 5833,
+      "fps": 5832.9,
+      "worst_ms": 4.6949,
+      "generated": 0,
+      "meshes": 0,
+      "crossings": 0,
+      "queued_max": 0,
+      "in_flight_max": 0
+    },
+    {
+      "second": 9,
+      "frames": 5606,
+      "fps": 5602.1,
+      "worst_ms": 4.0166,
+      "generated": 0,
+      "meshes": 0,
+      "crossings": 0,
+      "queued_max": 0,
+      "in_flight_max": 0
+    },
+    {
+      "second": 10,
+      "frames": 5943,
+      "fps": 5946.9,
+      "worst_ms": 3.1029,
+      "generated": 0,
+      "meshes": 0,
+      "crossings": 0,
+      "queued_max": 0,
+      "in_flight_max": 0
+    },
+    {
+      "second": 11,
+      "frames": 6138,
+      "fps": 6138.2,
+      "worst_ms": 3.4548,
+      "generated": 0,
+      "meshes": 0,
+      "crossings": 0,
+      "queued_max": 0,
+      "in_flight_max": 0
+    },
+    {
+      "second": 12,
+      "frames": 5886,
+      "fps": 5886.1,
+      "worst_ms": 2.8242,
+      "generated": 0,
+      "meshes": 0,
+      "crossings": 0,
+      "queued_max": 0,
+      "in_flight_max": 0
+    },
+    {
+      "second": 13,
+      "frames": 5796,
+      "fps": 5796.1,
+      "worst_ms": 2.93,
+      "generated": 0,
+      "meshes": 0,
+      "crossings": 0,
+      "queued_max": 0,
+      "in_flight_max": 0
+    },
+    {
+      "second": 14,
+      "frames": 5599,
+      "fps": 5598.3,
+      "worst_ms": 3.037,
+      "generated": 0,
+      "meshes": 0,
+      "crossings": 0,
+      "queued_max": 0,
+      "in_flight_max": 0
+    },
+    {
+      "second": 15,
+      "frames": 5941,
+      "fps": 5941.7,
+      "worst_ms": 2.7894,
+      "generated": 0,
+      "meshes": 0,
+      "crossings": 0,
+      "queued_max": 0,
+      "in_flight_max": 0
+    },
+    {
+      "second": 16,
+      "frames": 5870,
+      "fps": 5870.4,
+      "worst_ms": 3.067,
+      "generated": 0,
+      "meshes": 0,
+      "crossings": 0,
+      "queued_max": 0,
+      "in_flight_max": 0
+    },
+    {
+      "second": 17,
+      "frames": 5878,
+      "fps": 5877.9,
+      "worst_ms": 3.2099,
+      "generated": 0,
+      "meshes": 0,
+      "crossings": 0,
+      "queued_max": 0,
+      "in_flight_max": 0
+    },
+    {
+      "second": 18,
+      "frames": 5461,
+      "fps": 5460.1,
+      "worst_ms": 2.8452,
+      "generated": 0,
+      "meshes": 0,
+      "crossings": 0,
+      "queued_max": 0,
+      "in_flight_max": 0
+    },
+    {
+      "second": 19,
+      "frames": 5760,
+      "fps": 5760.8,
+      "worst_ms": 3.3529,
+      "generated": 0,
+      "meshes": 0,
+      "crossings": 0,
+      "queued_max": 0,
+      "in_flight_max": 0
+    }
+  ]
+}
+```
