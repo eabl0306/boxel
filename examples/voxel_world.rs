@@ -3,10 +3,10 @@
 //! `cargo run --release --example voxel_world -- [GPU options] [options]` (see `--help`).
 //! Interactive by default: left click grabs the mouse, WASD/Space/`ShiftLeft` fly, `ControlLeft`
 //! boosts, Escape releases the cursor, F3 toggles the debug overlay, F5 cycles the frame limit
-//! (30, 60, 144, 240, unlimited) and F6 toggles vsync. The automation flags (`--frames`,
-//! `--duration`, `--screenshot`, `--minimize-test`, `--resize-test`, `--vsync-test`, ...) make
-//! it close by itself; the last summary line gives the update and presented frame rates and the
-//! CPU use (Linux).
+//! (30, 60, 144, 240, unlimited) and F6 toggles vsync. `--frames`, `--duration`, `--screenshot`,
+//! `--minimize-test`, `--resize-test`, `--vsync-test` and the like make it close by itself
+//! (`--duration` keeps the interactive path: fly camera on, nothing rendered while hidden); the
+//! last summary line gives the update and presented frame rates and the CPU use (Linux).
 //!
 //! Exit codes: 0 success, 1 usage error, 2 no usable GPU, 3 check failed (screenshot, image
 //! diff, resize, minimize), 4 timeout.
@@ -38,8 +38,10 @@ usage: voxel_world [GPU options] [options]
   --frames N              exit 0 after N rendered frames (automation: renders while hidden,
                           disables fly-camera input)
   --wait-chunks           start counting frames once the world settled for 3 frames
-  --duration SECS         exit 0 after SECS seconds of the normal (interactive) path
-  --timeout SECS          wall-clock limit, exit 4 (default 120 with automation flags)
+  --duration SECS         exit 0 after SECS seconds of the normal interactive path (fly
+                          camera on, nothing rendered while hidden)
+  --timeout SECS          wall-clock limit, exit 4 (default 120 with automation flags; with
+                          --duration at least SECS + 30)
   --fps-limit N           max updates per second, 0 = unlimited (default 144; F5 cycles it)
   --vsync on|off          vsync (default off, so the fps limit governs; F6 toggles it)
   --vsync-test            switch vsync at frame 30 and back at frame 60, check the surface
@@ -68,6 +70,8 @@ exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 check failed, 4 timeout";
 const IMPLIED_FRAMES: u64 = 120;
 /// Default `--timeout` for automation runs.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+/// `--duration` without `--timeout`: the default timeout is at least the duration plus this.
+const DURATION_GRACE: Duration = Duration::from_secs(30);
 /// Extra time the watchdog thread waits after `--timeout` before killing the process.
 const WATCHDOG_GRACE: Duration = Duration::from_secs(15);
 /// Consecutive settled frames before `--wait-chunks` starts counting.
@@ -129,8 +133,22 @@ struct Options {
 }
 
 impl Options {
+    /// Scripted runs (`--frames`, `--minimize-test`, `--resize-test`): fly-camera input is off
+    /// and `--timeout` defaults to [`DEFAULT_TIMEOUT`]. A `--duration` run is not one: it times
+    /// the normal interactive path.
     fn automation(&self) -> bool {
-        self.frames.is_some() || self.duration.is_some() || self.minimize_test || self.resize_test
+        self.frames.is_some() || self.minimize_test || self.resize_test
+    }
+
+    /// `--timeout` when none is given: [`DEFAULT_TIMEOUT`] for automation runs, and with
+    /// `--duration` at least the duration plus [`DURATION_GRACE`], so the run ends with exit 0
+    /// and not with the timeout.
+    fn default_timeout(&self) -> Option<Duration> {
+        let automation = self.automation().then_some(DEFAULT_TIMEOUT);
+        let duration = self
+            .duration
+            .map(|d| d.saturating_add(DURATION_GRACE).max(DEFAULT_TIMEOUT));
+        automation.max(duration)
     }
 }
 
@@ -270,8 +288,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
     if o.frames.is_none() && (o.wait_chunks || !o.simulate_device_loss.is_empty()) {
         return Err("--wait-chunks and --simulate-device-loss need --frames".to_string());
     }
-    if o.automation() && o.timeout.is_none() {
-        o.timeout = Some(DEFAULT_TIMEOUT);
+    if o.timeout.is_none() {
+        o.timeout = o.default_timeout();
     }
     Ok(Some(o))
 }
@@ -1194,4 +1212,60 @@ fn main() -> AppExit {
                 .chain(),
         );
     app.run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Options {
+        let args: Vec<String> = args.iter().map(ToString::to_string).collect();
+        parse_options(&args)
+            .expect("valid options")
+            .expect("not --help")
+    }
+
+    #[test]
+    fn duration_keeps_the_interactive_path_and_outlasts_the_default_timeout() {
+        let short = parse(&["--duration", "8"]);
+        assert!(!short.automation(), "fly-camera input stays on");
+        assert_eq!(short.timeout, Some(DEFAULT_TIMEOUT));
+
+        // Longer than the 120 s default: the timeout grows, so the run ends with exit 0.
+        let long = parse(&["--duration", "150"]);
+        assert!(!long.automation());
+        assert_eq!(long.timeout, Some(Duration::from_secs(180)));
+        let long = parse(&["--duration", "150", "--frames", "10"]);
+        assert!(long.automation());
+        assert_eq!(long.timeout, Some(Duration::from_secs(180)));
+
+        // An explicit timeout wins.
+        let capped = parse(&["--duration", "150", "--timeout", "20"]);
+        assert_eq!(capped.timeout, Some(Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn automation_flags_turn_input_off_and_get_the_default_timeout() {
+        for args in [
+            &["--frames", "10"][..],
+            &["--minimize-test"],
+            &["--resize-test"],
+            &["--screenshot", "shot.png"],
+            &["--vsync-test"],
+        ] {
+            let o = parse(args);
+            assert!(o.automation(), "{args:?}");
+            assert_eq!(o.timeout, Some(DEFAULT_TIMEOUT), "{args:?}");
+        }
+        let interactive = parse(&[]);
+        assert!(!interactive.automation());
+        assert_eq!(interactive.timeout, None, "a plain run has no timeout");
+    }
+
+    #[test]
+    fn duration_run_completes_once_the_time_is_up() {
+        let info = RenderInfo::default();
+        assert!(Run::new(parse(&["--duration", "0"])).complete(&info));
+        assert!(!Run::new(parse(&["--duration", "3600"])).complete(&info));
+    }
 }
