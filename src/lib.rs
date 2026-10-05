@@ -34,6 +34,8 @@ pub use boxel_camera as camera;
 pub use boxel_window as window;
 
 #[cfg(feature = "render")]
+pub use boxel_debug as debug_overlay;
+#[cfg(feature = "render")]
 pub use boxel_gfx as gfx;
 #[cfg(feature = "render")]
 pub use boxel_render as render;
@@ -69,6 +71,8 @@ pub mod prelude {
     pub use boxel_window::prelude::*;
 
     #[cfg(feature = "render")]
+    pub use boxel_debug::{DebugOverlay, DebugOverlayPlugin};
+    #[cfg(feature = "render")]
     pub use boxel_gfx::{GpuPreferences, Tier};
     #[cfg(feature = "render")]
     pub use boxel_render::prelude::*;
@@ -81,8 +85,8 @@ pub mod prelude {
     pub use boxel_worldgen::{TerrainGenerator, WorldGenerator};
 }
 
-/// Log, task pools, time, frame stats, input, window + winit runner, voxel world, renderer
-/// (each behind its cargo feature). Configure with `.set(...)`, remove with `.disable::<T>()`.
+/// Log, task pools, time, frame stats, input, window + winit runner, voxel world, renderer and
+/// the F3 debug overlay (each behind its cargo feature). Configure with `.set(...)`, remove with `.disable::<T>()`.
 pub struct DefaultPlugins;
 
 impl PluginGroup for DefaultPlugins {
@@ -99,7 +103,9 @@ impl PluginGroup for DefaultPlugins {
         #[cfg(feature = "voxel")]
         let group = group.add(boxel_world::WorldPlugin::default());
         #[cfg(feature = "render")]
-        let group = group.add(boxel_render::RenderPlugin::default());
+        let group = group
+            .add(boxel_render::RenderPlugin::default())
+            .add(boxel_debug::DebugOverlayPlugin::default());
         group
     }
 }

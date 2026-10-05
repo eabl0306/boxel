@@ -2,8 +2,9 @@
 //!
 //! `cargo run --release --example voxel_world -- [GPU options] [options]` (see `--help`).
 //! Interactive by default: left click grabs the mouse, WASD/Space/`ShiftLeft` fly, `ControlLeft`
-//! boosts, Escape releases the cursor. The automation flags (`--frames`, `--screenshot`,
-//! `--minimize-test`, `--resize-test`, ...) make it close by itself.
+//! boosts, Escape releases the cursor, F3 toggles the debug overlay. The automation flags
+//! (`--frames`, `--screenshot`, `--minimize-test`, `--resize-test`, ...) make it close by
+//! itself.
 //!
 //! Exit codes: 0 success, 1 usage error, 2 no usable GPU, 3 check failed (screenshot, image
 //! diff, resize, minimize), 4 timeout.
@@ -51,6 +52,7 @@ usage: voxel_world [GPU options] [options]
                           list repeats it: the second loss of an adapter lowers its tier)
   --async-threads N       async compute pool size (chunk jobs)
   --no-trees              plain TerrainGenerator (no trees, so no cutout leaves)
+  --debug-overlay         start with the F3 debug overlay visible (F3 toggles it)
   --help                  this text
 exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 check failed, 4 timeout";
 
@@ -104,6 +106,7 @@ struct Options {
     simulate_device_loss: Vec<u64>,
     async_threads: Option<usize>,
     trees: bool,
+    debug_overlay: bool,
 }
 
 impl Options {
@@ -131,6 +134,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         simulate_device_loss: Vec::new(),
         async_threads: None,
         trees: true,
+        debug_overlay: false,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -211,6 +215,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                 );
             }
             "--no-trees" => o.trees = false,
+            "--debug-overlay" => o.debug_overlay = true,
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
@@ -868,6 +873,9 @@ fn main() -> AppExit {
         .set(WorldPlugin {
             generator,
             ..WorldPlugin::default()
+        })
+        .set(DebugOverlayPlugin {
+            visible: options.debug_overlay,
         });
     if let Some(threads) = options.async_threads {
         plugins = plugins.set(TaskPoolPlugin {

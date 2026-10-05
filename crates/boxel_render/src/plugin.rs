@@ -11,6 +11,7 @@
 //! - `ExtractedFrame`: everything `Prepare` and `Draw` may read, copied by `Extract`, plus the
 //!   frame results `Cleanup` writes back.
 
+use crate::overlay::{OverlayDraw, OverlayPass, OverlayRect};
 use crate::{RendererConfig, RendererSmokeTest, ViewParams, VoxelRenderer};
 use boxel_app::{App, Last, MainScheduleOrder, Plugin, Shutdown, Time};
 use boxel_camera::{Camera, CameraView};
@@ -116,6 +117,12 @@ pub struct RenderInfo {
     pub class: Option<DeviceClass>,
     /// `GpuContext::summary_line()`.
     pub summary: String,
+    /// Adapter name.
+    pub adapter: String,
+    /// Backend (`Vulkan`, `Gl`, ...).
+    pub backend: String,
+    /// Driver name and version (as reported by wgpu; may be empty).
+    pub driver: String,
     /// Frames presented since startup.
     pub frames_presented: u64,
     /// Frames rendered into the main color target (presented or not, see
@@ -209,6 +216,7 @@ impl Plugin for RenderPlugin {
         app.insert_resource(self.settings.clone())
             .init_resource::<RenderInfo>()
             .init_resource::<SurfaceInfo>()
+            .init_resource::<OverlayDraw>()
             .init_resource::<GpuState>()
             .init_resource::<InstanceState>()
             .init_resource::<LkgRes>()
@@ -290,6 +298,8 @@ enum GpuStage {
 /// surface, context), see [`ReadyGpu::teardown`].
 struct ReadyGpu {
     renderer: VoxelRenderer,
+    /// Overlay rectangles drawn on top of the frame.
+    overlay: OverlayPass,
     /// `None` only between a failed `Lost` recreation and the next `Setup`.
     surface: Option<wgpu::Surface<'static>>,
     config: wgpu::SurfaceConfiguration,
@@ -314,11 +324,13 @@ impl ReadyGpu {
     fn teardown(self: Box<Self>) {
         let ReadyGpu {
             renderer,
+            overlay,
             surface,
             config,
             ctx,
             ..
         } = *self;
+        drop(overlay);
         drop(renderer);
         drop(surface);
         drop(config);
@@ -462,6 +474,8 @@ struct ExtractedFrame {
     meshes: Vec<MeshOp>,
     /// Pending screenshot paths (kept until a frame exists to read).
     screenshots: Vec<PathBuf>,
+    /// Copy of `OverlayDraw::rects`.
+    overlay: Vec<OverlayRect>,
     destroy_device: bool,
     /// `Prepare` output.
     view: Option<ViewParams>,
@@ -806,11 +820,21 @@ fn bootstrap(p: &mut SetupParams) {
     p.info.tier = Some(ctx.tier);
     p.info.class = Some(ctx.class);
     p.info.summary.clone_from(&summary);
+    p.info.adapter.clone_from(&ctx.caps.info.name);
+    p.info.backend = format!("{:?}", ctx.caps.info.backend);
+    p.info.driver = [&ctx.caps.info.driver, &ctx.caps.info.driver_info]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(" ");
     if let Some(board) = p.board.as_deref_mut() {
         board.set("gpu", summary);
     }
+    let overlay = OverlayPass::new(&ctx.device);
     p.gpu.stage = GpuStage::Ready(Box::new(ReadyGpu {
         renderer,
+        overlay,
         surface: Some(surface),
         config: surface_config,
         ctx,
@@ -937,8 +961,11 @@ fn extract(
     mut mesh_events: MessageReader<ChunkMeshEvent>,
     mut screenshots: MessageReader<RequestScreenshot>,
     mut destroy: MessageReader<DebugDestroyDevice>,
+    overlay: Res<OverlayDraw>,
 ) {
     let frame = &mut *frame;
+    frame.overlay.clear();
+    frame.overlay.extend_from_slice(&overlay.rects);
     frame.camera = cameras
         .iter()
         .find(|(camera, _)| camera.active)
@@ -1026,6 +1053,13 @@ fn prepare(
         }
     }
     warnings.flush(ready.renderer.stats().dropped_chunks);
+    let color = ready.renderer.main_color().size();
+    ready.overlay.prepare(
+        &ready.ctx.device,
+        queue,
+        &frame.overlay,
+        UVec2::new(color.width, color.height),
+    );
     frame.view = frame.camera.map(|(camera, transform)| {
         let aspect = ready.config.width.max(1) as f32 / ready.config.height.max(1) as f32;
         let view = CameraView::compute(&camera, &transform, aspect);
@@ -1070,6 +1104,9 @@ fn draw(
                 ready
                     .renderer
                     .render(&ready.ctx.device, &ready.ctx.queue, &mut encoder, &view);
+                ready
+                    .overlay
+                    .encode(&mut encoder, ready.renderer.main_color_view());
                 ready.renderer.blit(&mut encoder, &target);
                 ready.ctx.queue.submit([encoder.finish()]);
                 if let Some(window) = window.as_deref() {
@@ -1124,6 +1161,9 @@ fn render_offscreen(ready: &mut ReadyGpu, view: &ViewParams) {
     ready
         .renderer
         .render(&ready.ctx.device, &ready.ctx.queue, &mut encoder, view);
+    ready
+        .overlay
+        .encode(&mut encoder, ready.renderer.main_color_view());
     let index = ready.ctx.queue.submit([encoder.finish()]);
     ready.offscreen.push_back(index);
     ready.frames += 1;
@@ -1142,6 +1182,7 @@ fn cleanup(
     mut surface_info: ResMut<SurfaceInfo>,
     board: Option<ResMut<DiagnosticsBoard>>,
     mut saved: MessageWriter<ScreenshotSaved>,
+    time: Option<ResMut<Time>>,
 ) {
     let frame = &mut *frame;
     if frame.gate_used
@@ -1167,7 +1208,9 @@ fn cleanup(
                 }
             }
             let lost = ready.ctx.health.is_lost();
-            if ready.frames > 0 && !lost {
+            if ready.frames > 0 && !lost && !frame.screenshots.is_empty() {
+                // The readback waits for the GPU and writes a file: a known stall.
+                let started = Instant::now();
                 for path in frame.screenshots.drain(..) {
                     let result = save_screenshot(
                         &ready.ctx.device,
@@ -1180,6 +1223,9 @@ fn cleanup(
                         Err(e) => tracing::error!("screenshot {}: {e}", path.display()),
                     }
                     saved.write(ScreenshotSaved { path, result });
+                }
+                if let Some(mut time) = time {
+                    time.declare_stall(started.elapsed());
                 }
             }
             if frame.destroy_device && !lost {

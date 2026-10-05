@@ -250,6 +250,7 @@ version = "0.1.0-dev"
 dependencies = [
  "boxel_app",
  "boxel_camera",
+ "boxel_debug",
  "boxel_diagnostic",
  "boxel_ecs",
  "boxel_gfx",
@@ -286,6 +287,21 @@ dependencies = [
  "boxel_math",
  "boxel_transform",
  "boxel_window",
+]
+
+[[package]]
+name = "boxel_debug"
+version = "0.1.0-dev"
+dependencies = [
+ "boxel_app",
+ "boxel_camera",
+ "boxel_ecs",
+ "boxel_math",
+ "boxel_render",
+ "boxel_transform",
+ "boxel_voxel",
+ "boxel_window",
+ "boxel_world",
 ]
 
 [[package]]

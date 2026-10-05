@@ -22,6 +22,8 @@ pub const VOXEL_INSTANCED_WGSL: &str = include_str!("../shaders/voxel_instanced.
 pub const CULL_WGSL: &str = include_str!("../shaders/cull.wgsl");
 /// `blit.wgsl`: fullscreen blit (`vs_fullscreen`, `fs_blit`, `fs_blit_encode_srgb`).
 pub const BLIT_WGSL: &str = include_str!("../shaders/blit.wgsl");
+/// `overlay.wgsl`: screen-space overlay rectangles (`vs_overlay`, `fs_overlay`).
+pub const OVERLAY_WGSL: &str = include_str!("../shaders/overlay.wgsl");
 
 /// Shader stage of an entry point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +47,8 @@ pub enum ShaderModuleId {
     Cull,
     /// blit (all tiers).
     Blit,
+    /// overlay rectangles (all tiers).
+    Overlay,
 }
 
 static VOXEL_PULL: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{VOXEL_PULL_WGSL}"));
@@ -54,11 +58,12 @@ static CULL: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{CULL_W
 
 impl ShaderModuleId {
     /// All modules.
-    pub const ALL: [ShaderModuleId; 4] = [
+    pub const ALL: [ShaderModuleId; 5] = [
         ShaderModuleId::VoxelPull,
         ShaderModuleId::VoxelInstanced,
         ShaderModuleId::Cull,
         ShaderModuleId::Blit,
+        ShaderModuleId::Overlay,
     ];
 
     /// Debug label.
@@ -68,6 +73,7 @@ impl ShaderModuleId {
             ShaderModuleId::VoxelInstanced => "boxel voxel_instanced",
             ShaderModuleId::Cull => "boxel cull",
             ShaderModuleId::Blit => "boxel blit",
+            ShaderModuleId::Overlay => "boxel overlay",
         }
     }
 
@@ -78,6 +84,7 @@ impl ShaderModuleId {
             ShaderModuleId::VoxelInstanced => VOXEL_INSTANCED.as_str(),
             ShaderModuleId::Cull => CULL.as_str(),
             ShaderModuleId::Blit => BLIT_WGSL,
+            ShaderModuleId::Overlay => OVERLAY_WGSL,
         }
     }
 
@@ -100,6 +107,10 @@ impl ShaderModuleId {
                 ("fs_blit", Stage::Fragment),
                 ("fs_blit_encode_srgb", Stage::Fragment),
             ],
+            ShaderModuleId::Overlay => &[
+                ("vs_overlay", Stage::Vertex),
+                ("fs_overlay", Stage::Fragment),
+            ],
         }
     }
 
@@ -113,7 +124,9 @@ impl ShaderModuleId {
     pub const fn min_gl(self) -> (u8, u8) {
         match self {
             ShaderModuleId::VoxelPull | ShaderModuleId::Cull => (4, 3),
-            ShaderModuleId::VoxelInstanced | ShaderModuleId::Blit => (3, 3),
+            ShaderModuleId::VoxelInstanced | ShaderModuleId::Blit | ShaderModuleId::Overlay => {
+                (3, 3)
+            }
         }
     }
 }

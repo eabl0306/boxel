@@ -445,6 +445,10 @@ impl VoxelRenderer {
     pub fn main_color(&self) -> &wgpu::Texture {
         &self.targets.color
     }
+    /// View of the main color texture (overlays draw into it before the blit).
+    pub fn main_color_view(&self) -> &wgpu::TextureView {
+        &self.targets.color_view
+    }
     /// Last frame counters.
     pub fn stats(&self) -> RenderStats {
         RenderStats {

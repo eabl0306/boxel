@@ -11,6 +11,7 @@
 //! [`VoxelRenderer`] is ECS-free (used directly by offscreen tests); [`RenderPlugin`] wires it
 //! into the app: GPU bootstrap when the window appears, mesh extraction from `boxel_world`,
 //! camera, present, screenshots, device-loss recovery.
+mod overlay;
 mod plugin;
 mod renderer;
 mod smoke;
@@ -21,6 +22,7 @@ mod chunk_table;
 mod path;
 mod targets;
 
+pub use overlay::{OverlayDraw, OverlayRect};
 pub use plugin::{
     DebugDestroyDevice, GpuFailed, GpuReady, Render, RenderInfo, RenderPlugin, RenderSettings,
     RenderSystems, RequestScreenshot, ScreenshotSaved, SurfaceInfo,
