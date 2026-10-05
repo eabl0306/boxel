@@ -1,8 +1,217 @@
-//! Deterministic value noise (no dependencies). Same seed + coordinates = same value on every
-//! platform (integer hashing + f64 math).
+//! Deterministic value noise from integers (no dependencies). Same seed + coordinates = same
+//! value on every platform (integer lattice and hashing, `f64` interpolation).
+//!
+//! Samples are integer coordinates and frequencies exact fractions ([`Frequency`]), so the
+//! lattice cell of a sample is an exact integer and its position inside the cell an exact
+//! fraction: the noise is the same function at any `i64` coordinate, with no precision loss, no
+//! saturated lattice and no repetition. Only the position inside the cell, in `[0, 1)`, becomes
+//! an `f64`; an absolute coordinate never does.
 //!
 //! The seed goes through `SplitMix64` before it is combined with the lattice coordinates, so
 //! nearby seeds (`fbm_2d` uses `seed + octave` per octave) give unrelated lattices.
+
+/// A noise frequency as an exact fraction: `num` lattice cells every `den` voxels.
+///
+/// Kept in lowest terms, so equal frequencies compare equal
+/// (`Frequency::new(2, 512) == Frequency::one_in(256)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Frequency {
+    num: u32,
+    den: u32,
+}
+
+impl Frequency {
+    /// One lattice cell every `n` voxels (frequency `1 / n`). Panics if `n` is 0.
+    pub const fn one_in(n: u32) -> Self {
+        Self::new(1, n)
+    }
+
+    /// `num / den` lattice cells per voxel, reduced to lowest terms. Panics if `den` is 0.
+    pub const fn new(num: u32, den: u32) -> Self {
+        assert!(den != 0, "Frequency: the denominator must not be 0");
+        let g = gcd(num, den);
+        Self {
+            num: num / g,
+            den: den / g,
+        }
+    }
+
+    /// Numerator (lowest terms).
+    pub const fn num(self) -> u32 {
+        self.num
+    }
+
+    /// Denominator (lowest terms, never 0).
+    pub const fn den(self) -> u32 {
+        self.den
+    }
+
+    /// The frequency in cells per voxel, rounded to `f64` (for display: the noise never
+    /// samples with it).
+    pub fn to_f64(self) -> f64 {
+        f64::from(self.num) / f64::from(self.den)
+    }
+}
+
+/// Greatest common divisor (`gcd(0, b) = b`).
+const fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// Parameters of [`fbm_2d`]: octave `k` (from 0) has `frequency * lacunarity^k` lattice cells
+/// per voxel and weight `gain^k`.
+///
+/// The lacunarity is an integer so every octave's frequency stays an exact fraction. The sum
+/// stops before the first octave whose frequency numerator (`num * lacunarity^k`) overflows
+/// `u64`: such an octave has more than `2^32` cells per voxel. With a lacunarity of 2 that
+/// leaves at least 33 octaves (64 for a frequency `1 / n`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fbm {
+    /// Frequency of octave 0.
+    pub frequency: Frequency,
+    /// Number of octaves (0 gives a constant 0).
+    pub octaves: u32,
+    /// Frequency factor from one octave to the next.
+    pub lacunarity: u32,
+    /// Weight factor from one octave to the next.
+    pub gain: f64,
+}
+
+impl Fbm {
+    /// The octaves that are sampled, in order (see [`Fbm`] for where they stop).
+    fn octaves(self, seed: u64) -> impl Iterator<Item = Octave> {
+        // Every octave shares the denominator.
+        let base = Scale::new(self.frequency.num.into(), self.frequency.den);
+        let mut num = Some(base.num);
+        let mut amplitude = 1.0;
+        (0..self.octaves).map_while(move |k| {
+            let octave = Octave {
+                mixed_seed: splitmix64(seed.wrapping_add(u64::from(k))),
+                scale: Scale { num: num?, ..base },
+                amplitude,
+            };
+            num = num?.checked_mul(u64::from(self.lacunarity));
+            amplitude *= self.gain;
+            Some(octave)
+        })
+    }
+}
+
+/// One octave of an [`Fbm`].
+#[derive(Clone, Copy, Debug)]
+struct Octave {
+    /// `splitmix64(seed + k)`.
+    mixed_seed: u64,
+    scale: Scale,
+    /// `gain^k`.
+    amplitude: f64,
+}
+
+impl Octave {
+    /// The octave's value noise at `(x, z)` (without the amplitude). Always inlined: it is the
+    /// inner step of every sample, and the rare products past `i64` go out of line.
+    #[inline(always)]
+    fn sample(self, x: i64, z: i64) -> f64 {
+        let s = self.scale;
+        if let (Some((x0, rx)), Some((z0, rz))) = (s.split_narrow(x), s.split_narrow(z)) {
+            let corners = corners(self.mixed_seed, x0, z0);
+            return interpolate(corners, s.weight(rx), s.weight(rz));
+        }
+        self.sample_wide(x, z)
+    }
+
+    /// [`Octave::sample`] when a product `c * num` leaves `i64`.
+    #[inline(never)]
+    fn sample_wide(self, x: i64, z: i64) -> f64 {
+        let ((x0, tx), (z0, tz)) = (self.scale.cell(x), self.scale.cell(z));
+        interpolate(wide_corners(self.mixed_seed, x0, z0), tx, tz)
+    }
+}
+
+/// The lattice of one octave: `num / den` cells per voxel (`num` includes the lacunarity, so it
+/// can exceed `u32`).
+#[derive(Clone, Copy, Debug)]
+struct Scale {
+    num: u64,
+    den: u32,
+    /// `log2(den)` when `den` is a power of two: cell and remainder by shift and mask.
+    shift: Option<u32>,
+    /// `1 / den`, used only when `den` is a power of two (then it is exact).
+    inverse: f64,
+}
+
+impl Scale {
+    fn new(num: u64, den: u32) -> Self {
+        Self {
+            num,
+            den,
+            shift: den.is_power_of_two().then(|| den.trailing_zeros()),
+            inverse: 1.0 / f64::from(den),
+        }
+    }
+
+    /// [`Scale::split`] in 64 bits, when `c * num` fits in `i64` (the common case: every octave
+    /// of the terrain within `2^55` voxels of the origin).
+    #[inline]
+    fn split_narrow(self, c: i64) -> Option<(i64, u32)> {
+        let p = c.checked_mul(i64::try_from(self.num).ok()?)?;
+        Some(match self.shift {
+            Some(shift) => (p >> shift, (p as u32) & ((1 << shift) - 1)),
+            None => {
+                let den = i64::from(self.den);
+                (p.div_euclid(den), p.rem_euclid(den) as u32)
+            }
+        })
+    }
+
+    /// `floor(c * num / den)` and `(c * num) mod den`, exact: `|c * num| < 2^63 * 2^64` fits in
+    /// `i128`, and so does the cell.
+    #[inline]
+    fn split(self, c: i64) -> (i128, u32) {
+        let p = i128::from(c) * i128::from(self.num);
+        match self.shift {
+            // An arithmetic shift is a floor division; the low bits are the remainder.
+            Some(shift) => (p >> shift, (p as u32) & ((1 << shift) - 1)),
+            None => match i64::try_from(p) {
+                // The common case: one 64-bit division.
+                Ok(p) => {
+                    let den = i64::from(self.den);
+                    (p.div_euclid(den).into(), p.rem_euclid(den) as u32)
+                }
+                Err(_) => {
+                    let den = i128::from(self.den);
+                    (p.div_euclid(den), p.rem_euclid(den) as u32)
+                }
+            },
+        }
+    }
+
+    /// Smoothstep weight of a position `rem / den` inside a cell, with `rem` and `den` exact in
+    /// `f64` (one correctly rounded division, exact when `den` is a power of two).
+    #[inline]
+    fn weight(self, rem: u32) -> f64 {
+        let t = if self.shift.is_some() {
+            // Times the exact inverse of a power of two: equal to the division, and cheaper.
+            f64::from(rem) * self.inverse
+        } else {
+            f64::from(rem) / f64::from(self.den)
+        };
+        smoothstep(t)
+    }
+
+    /// Lattice cell of coordinate `c` and the smoothstep weight of `c` inside it.
+    #[inline]
+    fn cell(self, c: i64) -> (i128, f64) {
+        let (cell, rem) = match self.split_narrow(c) {
+            Some((cell, rem)) => (cell.into(), rem),
+            None => self.split(c),
+        };
+        (cell, self.weight(rem))
+    }
+}
 
 /// `SplitMix64` output function (Steele, Lea and Flood 2014): a bijective 64-bit mix.
 #[inline]
@@ -13,62 +222,12 @@ const fn splitmix64(x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// [`hash2`] with the seed already mixed (`splitmix64(seed)`).
+/// [`hash2`] of a point inside `i32` with the seed already mixed (`splitmix64(seed)`).
 #[inline]
 const fn lattice_hash(mixed_seed: u64, x: i32, z: i32) -> u32 {
     // Injective in (x, z): x in the high half, z in the low half (two's complement bits).
     let key = ((x as u32 as u64) << 32) | (z as u32 as u64);
     splitmix64(mixed_seed ^ key) as u32
-}
-
-/// Lattice value in `[-1, 1]`.
-#[inline]
-fn lattice_value(mixed_seed: u64, x: i32, z: i32) -> f64 {
-    f64::from(lattice_hash(mixed_seed, x, z)) / f64::from(u32::MAX) * 2.0 - 1.0
-}
-
-/// Cubic smoothstep `t * t * (3 - 2t)` for `t` in `[0, 1]`.
-#[inline]
-fn smoothstep(t: f64) -> f64 {
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// Lattice cell (floor) of a coordinate and the smoothstep weight inside it.
-#[inline]
-fn cell(c: f64) -> (i32, f64) {
-    let f = c.floor();
-    // Saturating cast: coordinates beyond i32 clamp to the last lattice cell (NaN maps to 0).
-    (f as i32, smoothstep(c - f))
-}
-
-/// Corner values `(v00, v10, v01, v11)` of cell `(x0, z0)` (`v10` is at `x0 + 1`, wrapping).
-#[inline]
-fn corners(mixed_seed: u64, x0: i32, z0: i32) -> [f64; 4] {
-    let (x1, z1) = (x0.wrapping_add(1), z0.wrapping_add(1));
-    [
-        lattice_value(mixed_seed, x0, z0),
-        lattice_value(mixed_seed, x1, z0),
-        lattice_value(mixed_seed, x0, z1),
-        lattice_value(mixed_seed, x1, z1),
-    ]
-}
-
-/// Bilinear interpolation of the corners with smoothstep weights. Shared by the point and the
-/// grid paths so both produce bit-identical values.
-#[inline]
-fn interpolate([v00, v10, v01, v11]: [f64; 4], tx: f64, tz: f64) -> f64 {
-    let near = v00 + (v10 - v00) * tx;
-    let far = v01 + (v11 - v01) * tx;
-    // The clamp only removes rounding overshoot of the interpolation.
-    (near + (far - near) * tz).clamp(-1.0, 1.0)
-}
-
-/// [`value_noise_2d`] with the seed already mixed.
-#[inline]
-fn value_noise_mixed(mixed_seed: u64, x: f64, z: f64) -> f64 {
-    let (x0, tx) = cell(x);
-    let (z0, tz) = cell(z);
-    interpolate(corners(mixed_seed, x0, z0), tx, tz)
 }
 
 /// The [`splitmix64`] finalizer without the increment: a bijective 64-bit mix with `mix(0) = 0`.
@@ -88,6 +247,16 @@ const fn excess(v: i64) -> u32 {
     (v.wrapping_sub(v as i32 as i64) >> 32) as u32
 }
 
+/// `v` as the `i64` its low 64 bits sign-extend to and the multiple of `2^64` left above it, as
+/// a 64-bit pattern: `(v, 0)` exactly when `v` fits in `i64` (a bijection of `i128` onto
+/// `(i64, u64)`, [`excess`] one level up).
+#[inline]
+const fn split_wide(v: i128) -> (i64, u64) {
+    let low = v as i64;
+    // `v - sext(low)` is a multiple of 2^64 (mod 2^128), so the shift is exact.
+    (low, (v.wrapping_sub(low as i128) >> 64) as u64)
+}
+
 /// 32-bit hash of `(seed, x, z)` (e.g. a SplitMix64/xxhash-style mix).
 ///
 /// `SplitMix64(SplitMix64(seed) ^ mix(e) ^ (x << 32 | z))` truncated to the low 32 bits, with the
@@ -97,35 +266,151 @@ const fn excess(v: i64) -> u32 {
 /// former `(seed, i32, i32)` version and each `2^32 x 2^32` tile beyond gets an unrelated seed
 /// (no repetition with a period of `2^32`).
 pub fn hash2(seed: u64, x: i64, z: i64) -> u32 {
+    hash2_mixed(splitmix64(seed), x, z)
+}
+
+/// [`hash2`] with the seed already mixed.
+#[inline]
+const fn hash2_mixed(mixed_seed: u64, x: i64, z: i64) -> u32 {
     let e = ((excess(x) as u64) << 32) | excess(z) as u64;
-    lattice_hash(splitmix64(seed) ^ mix(e), x as i32, z as i32)
+    lattice_hash(mixed_seed ^ mix(e), x as i32, z as i32)
 }
 
-/// 2D value noise in `[-1, 1]`: smoothstep-interpolated lattice values.
-///
-/// Lattice values are `hash2(seed, x, z) / u32::MAX * 2 - 1` at integer corners, so the noise
-/// equals that value at integer coordinates.
-pub fn value_noise_2d(seed: u64, x: f64, z: f64) -> f64 {
-    value_noise_mixed(splitmix64(seed), x, z)
+/// Hash of lattice cell `(x, z)` with the seed already mixed: [`hash2`] for cells inside `i64`.
+/// Beyond (only for octaves finer than a voxel, far out), the multiples of `2^64` above `i64`
+/// pick a seed for their `2^64 x 2^64` tile of cells, the way `hash2` folds what is above
+/// `i32`; tiles differ by a hash of both parts, so they never repeat periodically.
+#[inline]
+fn cell_hash(mixed_seed: u64, x: i128, z: i128) -> u32 {
+    if let (Ok(x), Ok(z)) = (i32::try_from(x), i32::try_from(z)) {
+        // Inside i32 (every cell near the origin): `hash2_mixed` with `e = 0`.
+        return lattice_hash(mixed_seed, x, z);
+    }
+    let ((x, x_high), (z, z_high)) = (split_wide(x), split_wide(z));
+    let tile_seed = if x_high | z_high == 0 {
+        mixed_seed
+    } else {
+        mixed_seed ^ splitmix64(splitmix64(x_high) ^ z_high)
+    };
+    hash2_mixed(tile_seed, x, z)
 }
 
-/// Fractal Brownian motion of [`value_noise_2d`] in roughly `[-1, 1]`.
+/// A lattice hash as a value in `[-1, 1]`.
+#[inline]
+fn unit(h: u32) -> f64 {
+    f64::from(h) / f64::from(u32::MAX) * 2.0 - 1.0
+}
+
+/// Lattice value in `[-1, 1]` of cell `(x, z)`.
+#[inline]
+fn lattice_value(mixed_seed: u64, x: i128, z: i128) -> f64 {
+    unit(cell_hash(mixed_seed, x, z))
+}
+
+/// Cubic smoothstep `t * t * (3 - 2t)` for `t` in `[0, 1]`.
+#[inline]
+fn smoothstep(t: f64) -> f64 {
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Corner values `(v00, v10, v01, v11)` of cell `(x0, z0)` (`v10` is at `x0 + 1`). Always
+/// inlined: it is the inner step of every sample.
+#[inline(always)]
+fn corners(mixed_seed: u64, x0: i64, z0: i64) -> [f64; 4] {
+    if let (Ok(x0), Ok(z0)) = (i32::try_from(x0), i32::try_from(z0))
+        && x0 < i32::MAX
+        && z0 < i32::MAX
+    {
+        // Every corner inside i32 (all cells near the origin): `hash2` without excess.
+        return tile_corners(mixed_seed, x0, z0);
+    }
+    far_corners(mixed_seed, x0, z0)
+}
+
+/// Lattice values of the corners `(x0, z0)` to `(x0 + 1, z0 + 1)` with one seed (the callers
+/// keep `x0` and `z0` below `i32::MAX`).
+#[inline(always)]
+fn tile_corners(seed: u64, x0: i32, z0: i32) -> [f64; 4] {
+    let (x1, z1) = (x0 + 1, z0 + 1);
+    [
+        unit(lattice_hash(seed, x0, z0)),
+        unit(lattice_hash(seed, x1, z0)),
+        unit(lattice_hash(seed, x0, z1)),
+        unit(lattice_hash(seed, x1, z1)),
+    ]
+}
+
+/// [`corners`] of a cell with a corner outside `i32`. Usually the four corners still share
+/// their bits above `i32` (they are in one `2^32 x 2^32` tile), and so the seed `hash2` folds
+/// those bits into: one fold instead of four.
+#[inline(never)]
+fn far_corners(mixed_seed: u64, x0: i64, z0: i64) -> [f64; 4] {
+    // `c + 1` exists and has the excess of `c` unless its low 32 bits wrap.
+    let same_tile = |c: i64| c as i32 != i32::MAX && c != i64::MAX;
+    if same_tile(x0) && same_tile(z0) {
+        let e = ((excess(x0) as u64) << 32) | excess(z0) as u64;
+        return tile_corners(mixed_seed ^ mix(e), x0 as i32, z0 as i32);
+    }
+    wide_corners(mixed_seed, x0.into(), z0.into())
+}
+
+/// [`corners`] of any cell, corner by corner (for cells whose corners straddle a `2^32` tile
+/// or leave `i64`); kept out of line so the common path stays small. `+ 1` cannot overflow:
+/// cells are below `2^127 - 2^63` in magnitude ([`Scale::split`]).
+#[inline(never)]
+fn wide_corners(mixed_seed: u64, x0: i128, z0: i128) -> [f64; 4] {
+    let (x1, z1) = (x0 + 1, z0 + 1);
+    [
+        lattice_value(mixed_seed, x0, z0),
+        lattice_value(mixed_seed, x1, z0),
+        lattice_value(mixed_seed, x0, z1),
+        lattice_value(mixed_seed, x1, z1),
+    ]
+}
+
+/// Bilinear interpolation of the corners with smoothstep weights. Shared by the point and the
+/// grid paths so both produce bit-identical values.
+#[inline]
+fn interpolate([v00, v10, v01, v11]: [f64; 4], tx: f64, tz: f64) -> f64 {
+    let near = v00 + (v10 - v00) * tx;
+    let far = v01 + (v11 - v01) * tx;
+    // The clamp only removes rounding overshoot of the interpolation.
+    (near + (far - near) * tz).clamp(-1.0, 1.0)
+}
+
+/// 2D value noise in `[-1, 1]` at integer `(x, z)`: smoothstep-interpolated lattice values,
+/// with `frequency` lattice cells per voxel.
 ///
-/// Octave `i` (from 0) samples `value_noise_2d(seed + i, x * f, z * f)` with `f = lacunarity^i`
-/// and weight `gain^i`; the sum is divided by the sum of the absolute weights, so the result
-/// stays in `[-1, 1]`. One octave equals [`value_noise_2d`]; zero octaves give 0.
-pub fn fbm_2d(seed: u64, x: f64, z: f64, octaves: u32, lacunarity: f64, gain: f64) -> f64 {
+/// The lattice value of cell `(cx, cz)` is `hash2(seed, cx, cz) / u32::MAX * 2 - 1` (for cells
+/// inside `i64`), and the cell of `x` is `floor(x * frequency)`, exact. With a frequency of 1 the
+/// noise is that value at every sample.
+pub fn value_noise_2d(seed: u64, x: i64, z: i64, frequency: Frequency) -> f64 {
+    let octave = Octave {
+        mixed_seed: splitmix64(seed),
+        scale: Scale::new(frequency.num.into(), frequency.den),
+        amplitude: 1.0,
+    };
+    octave.sample(x, z)
+}
+
+/// Fractal Brownian motion of [`value_noise_2d`] in `[-1, 1]` at integer `(x, z)`.
+///
+/// Octave `k` (from 0) samples `value_noise_2d(seed + k, x, z, frequency * lacunarity^k)` with
+/// weight `gain^k`; the sum is divided by the sum of the absolute weights, so the result stays
+/// in `[-1, 1]`. One octave equals [`value_noise_2d`]; zero octaves give 0.
+pub fn fbm_2d(seed: u64, x: i64, z: i64, fbm: Fbm) -> f64 {
     let mut sum = 0.0;
     let mut weight_sum = 0.0;
-    let mut frequency = 1.0;
-    let mut amplitude = 1.0;
-    for octave in 0..octaves {
-        let mixed_seed = splitmix64(seed.wrapping_add(u64::from(octave)));
-        sum += amplitude * value_noise_mixed(mixed_seed, x * frequency, z * frequency);
-        weight_sum += f64::abs(amplitude);
-        frequency *= lacunarity;
-        amplitude *= gain;
+    for octave in fbm.octaves(seed) {
+        sum += octave.amplitude * octave.sample(x, z);
+        weight_sum += f64::abs(octave.amplitude);
     }
+    normalize(sum, weight_sum)
+}
+
+/// `sum / weight_sum`, or 0 without weights.
+#[inline]
+fn normalize(sum: f64, weight_sum: f64) -> f64 {
     if weight_sum > 0.0 {
         sum / weight_sum
     } else {
@@ -134,326 +419,106 @@ pub fn fbm_2d(seed: u64, x: f64, z: f64, octaves: u32, lacunarity: f64, gain: f6
 }
 
 /// [`fbm_2d`] at every point of the grid `xs` x `zs` (`out[i * zs.len() + j]` gets the value at
-/// `(xs[i], zs[j])`), bit-identical to calling [`fbm_2d`] per point. Each octave hashes every
-/// lattice corner the grid touches once instead of four times per point.
-pub(crate) fn fbm_2d_grid(
-    seed: u64,
-    xs: &[f64],
-    zs: &[f64],
-    octaves: u32,
-    lacunarity: f64,
-    gain: f64,
-    out: &mut [f64],
-) {
+/// `(xs[i], zs[j])`), bit-identical to calling [`fbm_2d`] per point. Each octave splits each
+/// coordinate into cell and weight once, and hashes every lattice corner the grid touches once
+/// instead of four times per point.
+pub(crate) fn fbm_2d_grid(seed: u64, xs: &[i64], zs: &[i64], fbm: Fbm, out: &mut [f64]) {
     assert_eq!(out.len(), xs.len() * zs.len(), "fbm_2d_grid output size");
     if out.is_empty() {
         return;
     }
     out.fill(0.0);
     let mut table = LatticeTable::default();
+    let mut x_cells = Vec::with_capacity(xs.len());
+    let mut z_cells = Vec::with_capacity(zs.len());
+    let points = out.len();
     let mut weight_sum = 0.0;
-    let mut frequency = 1.0;
-    let mut amplitude = 1.0;
-    for octave in 0..octaves {
-        let mixed_seed = splitmix64(seed.wrapping_add(u64::from(octave)));
-        let x_cells: Vec<(i32, f64)> = xs.iter().map(|&x| cell(x * frequency)).collect();
-        let z_cells: Vec<(i32, f64)> = zs.iter().map(|&z| cell(z * frequency)).collect();
-        table.rebuild(mixed_seed, &x_cells, &z_cells, out.len());
-        for (row, &(x0, tx)) in out.chunks_exact_mut(zs.len()).zip(&x_cells) {
-            for (sum, &(z0, tz)) in row.iter_mut().zip(&z_cells) {
-                *sum += amplitude * interpolate(table.corners(x0, z0), tx, tz);
+    for octave in fbm.octaves(seed) {
+        x_cells.clear();
+        x_cells.extend(xs.iter().map(|&x| octave.scale.cell(x)));
+        z_cells.clear();
+        z_cells.extend(zs.iter().map(|&z| octave.scale.cell(z)));
+        let amplitude = octave.amplitude;
+        let rows = out.chunks_exact_mut(zs.len()).zip(&x_cells);
+        if table.rebuild(octave.mixed_seed, &x_cells, &z_cells, points) {
+            let (values, d) = (&table.values, table.depth);
+            for ((row, &(_, tx)), &x_row) in rows.zip(&table.rows) {
+                for ((sum, &(_, tz)), &z_col) in row.iter_mut().zip(&z_cells).zip(&table.cols) {
+                    let i = x_row + z_col;
+                    let corners = [values[i], values[i + d], values[i + 1], values[i + d + 1]];
+                    *sum += amplitude * interpolate(corners, tx, tz);
+                }
+            }
+        } else {
+            for (row, &(x0, tx)) in rows {
+                for (sum, &(z0, tz)) in row.iter_mut().zip(&z_cells) {
+                    let corners = wide_corners(octave.mixed_seed, x0, z0);
+                    *sum += amplitude * interpolate(corners, tx, tz);
+                }
             }
         }
         weight_sum += f64::abs(amplitude);
-        frequency *= lacunarity;
-        amplitude *= gain;
     }
     for v in out.iter_mut() {
-        *v = if weight_sum > 0.0 {
-            *v / weight_sum
-        } else {
-            0.0
-        };
+        *v = normalize(*v, weight_sum);
     }
 }
 
-/// Lattice values of one octave over every corner a grid touches. Falls back to hashing per
-/// point when the grid is so sparse (high frequency) that the table would cost more.
+/// Lattice values of one octave over every corner a grid touches.
 #[derive(Default)]
 struct LatticeTable {
-    mixed_seed: u64,
-    x_min: i64,
-    z_min: i64,
+    /// Row-major `[x][z]` values over the corners `x_min..=x_max + 1` by `z_min..=z_max + 1`.
+    values: Vec<f64>,
     /// Corners along z per x row.
     depth: usize,
-    /// Row-major `[x][z]` values; empty when hashing per point.
-    values: Vec<f64>,
+    /// Per grid x: start of its cell's row in `values`.
+    rows: Vec<usize>,
+    /// Per grid z: offset of its cell inside a row.
+    cols: Vec<usize>,
 }
 
 impl LatticeTable {
-    fn rebuild(&mut self, mixed_seed: u64, xs: &[(i32, f64)], zs: &[(i32, f64)], points: usize) {
-        let span = |cells: &[(i32, f64)]| {
+    /// Hashes every corner of the `xs` x `zs` cells once. False, with nothing hashed, when the
+    /// grid is so sparse (high frequency) that the table would cost more than hashing per point.
+    fn rebuild(
+        &mut self,
+        mixed_seed: u64,
+        xs: &[(i128, f64)],
+        zs: &[(i128, f64)],
+        points: usize,
+    ) -> bool {
+        let span = |cells: &[(i128, f64)]| {
             cells
                 .iter()
-                .fold((i64::MAX, i64::MIN), |(lo, hi), &(c, _)| {
-                    (lo.min(i64::from(c)), hi.max(i64::from(c)))
+                .fold((i128::MAX, i128::MIN), |(lo, hi), &(c, _)| {
+                    (lo.min(c), hi.max(c))
                 })
         };
         let ((x_min, x_max), (z_min, z_max)) = (span(xs), span(zs));
-        // Corners x_min..=x_max + 1 by z_min..=z_max + 1 (both spans fit in u32 + 2).
-        let (width, depth) = ((x_max - x_min + 2) as u64, (z_max - z_min + 2) as u64);
-        self.mixed_seed = mixed_seed;
-        self.values.clear();
-        if width.saturating_mul(depth) > 4 * points as u64 {
-            return;
+        // Corners x_min..=x_max + 1 by z_min..=z_max + 1.
+        let width = x_max.abs_diff(x_min).saturating_add(2);
+        let depth = z_max.abs_diff(z_min).saturating_add(2);
+        if width.saturating_mul(depth) > 4 * points as u128 {
+            return false;
         }
-        (self.x_min, self.z_min, self.depth) = (x_min, z_min, depth as usize);
+        // Both spans are at most `4 * points`, so every offset below fits in usize.
+        let depth = depth as usize;
+        self.depth = depth;
+        self.values.clear();
         for x in x_min..=x_max + 1 {
             for z in z_min..=z_max + 1 {
-                // `as i32` wraps exactly like `wrapping_add(1)` in `corners`.
-                self.values
-                    .push(lattice_value(mixed_seed, x as i32, z as i32));
+                self.values.push(lattice_value(mixed_seed, x, z));
             }
         }
-    }
-
-    #[inline]
-    fn corners(&self, x0: i32, z0: i32) -> [f64; 4] {
-        if self.values.is_empty() {
-            return corners(self.mixed_seed, x0, z0);
-        }
-        let i = (i64::from(x0) - self.x_min) as usize * self.depth
-            + (i64::from(z0) - self.z_min) as usize;
-        let d = self.depth;
-        [
-            self.values[i],
-            self.values[i + d],
-            self.values[i + 1],
-            self.values[i + d + 1],
-        ]
+        self.rows.clear();
+        self.rows
+            .extend(xs.iter().map(|&(c, _)| (c - x_min) as usize * depth));
+        self.cols.clear();
+        self.cols
+            .extend(zs.iter().map(|&(c, _)| (c - z_min) as usize));
+        true
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn splitmix64_matches_reference_values() {
-        // First two outputs of the reference SplitMix64 generator seeded with 0 (the state
-        // advances by the gamma before each mix).
-        assert_eq!(splitmix64(0), 0xe220_a839_7b1d_cdaf);
-        assert_eq!(splitmix64(0x9e37_79b9_7f4a_7c15), 0x6e78_9e6a_a1b9_65f4);
-    }
-
-    #[test]
-    fn hash2_is_deterministic_and_depends_on_every_input() {
-        assert_eq!(hash2(7, -3, 12), hash2(7, -3, 12));
-        assert_ne!(hash2(7, -3, 12), hash2(8, -3, 12));
-        assert_ne!(hash2(7, -3, 12), hash2(7, -2, 12));
-        assert_ne!(hash2(7, -3, 12), hash2(7, -3, 13));
-        // Swapped and sign-flipped coordinates are different lattice points.
-        assert_ne!(hash2(7, 1, 2), hash2(7, 2, 1));
-        assert_ne!(hash2(7, -1, 0), hash2(7, 0, -1));
-    }
-
-    #[test]
-    fn hash2_is_unchanged_inside_i32() {
-        // The former `hash2(seed, x: i32, z: i32)`, spelled out.
-        let old = |seed: u64, x: i32, z: i32| {
-            splitmix64(splitmix64(seed) ^ ((x as u32 as u64) << 32 | z as u32 as u64)) as u32
-        };
-        let edges = [
-            0,
-            1,
-            -1,
-            7,
-            -3,
-            1 << 30,
-            -(1 << 30),
-            i32::MAX,
-            i32::MIN,
-            i32::MAX - 1,
-        ];
-        for seed in [0, 7, 42, 0x00b0_7e1d ^ 0x007e_e50f_b0e1, u64::MAX] {
-            for x in edges {
-                for z in edges {
-                    let h = hash2(seed, i64::from(x), i64::from(z));
-                    assert_eq!(h, old(seed, x, z), "seed {seed:#x} ({x}, {z})");
-                }
-            }
-        }
-        // Recorded with the i32 API before the change.
-        for (seed, x, z, h) in [
-            (0x0, 0, 0, 0x4d19_7e6f),
-            (0x7, -3, 12, 0x92b2_2bbf),
-            (0x2a, 2_147_483_647, -2_147_483_648, 0xf266_2151),
-            (0x7e_e5bf_cefc, -268_435_456, 268_435_455, 0xdba8_76dd),
-            (u64::MAX, -1, -1, 0x67a4_7936),
-            (0x3039, 1_073_741_824, -1_073_741_824, 0xe7b7_b5e4),
-            (0x63, -2_147_483_648, 2_147_483_647, 0x76a0_c215),
-        ] {
-            assert_eq!(hash2(seed, x, z), h, "seed {seed:#x} ({x}, {z})");
-        }
-    }
-
-    #[test]
-    fn hash2_key_is_injective_past_i32() {
-        // (low 32 bits, excess) determines the value: the excess is 0 exactly inside i32 and
-        // differs for values 2^32 apart.
-        let values = [
-            0,
-            -1,
-            i64::from(i32::MAX),
-            i64::from(i32::MIN),
-            1 << 31,
-            -(1 << 31) - 1,
-            1 << 32,
-            -(1 << 32),
-            (1 << 32) + 5,
-            1 << 40,
-            -(1 << 40),
-            1 << 61,
-            i64::MAX,
-            i64::MIN,
-        ];
-        let mut seen = std::collections::HashSet::new();
-        for v in values {
-            let low = v as i32;
-            let e = excess(v);
-            assert_eq!(e == 0, i32::try_from(v).is_ok(), "{v}");
-            // Inverse: sext(low) + e * 2^32 (mod 2^64).
-            let back = i64::from(low).wrapping_add((i64::from(e as i32)) << 32);
-            assert_eq!(back, v);
-            assert!(seen.insert((low, e)), "{v} collides");
-        }
-        // Points 2^32 apart (the period the low bits alone would have) hash differently, and so
-        // do the four points that share their low bits around the origin.
-        for (x, z) in [
-            (0i64, 0i64),
-            (-3, 12),
-            (1 << 31, -(1 << 31)),
-            (1 << 40, 1 << 40),
-        ] {
-            let hashes = [
-                hash2(7, x, z),
-                hash2(7, x + (1 << 32), z),
-                hash2(7, x, z + (1 << 32)),
-                hash2(7, x - (1 << 32), z - (1 << 32)),
-            ];
-            for (i, a) in hashes.iter().enumerate() {
-                for b in &hashes[i + 1..] {
-                    assert_ne!(a, b, "({x}, {z})");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn hash2_bits_are_balanced() {
-        // Each output bit should be set about half of the time over a block of the lattice.
-        let mut ones = [0u32; 32];
-        let n = 64 * 64;
-        for x in -32..32 {
-            for z in -32..32 {
-                let h = hash2(42, x, z);
-                for (bit, count) in ones.iter_mut().enumerate() {
-                    *count += (h >> bit) & 1;
-                }
-            }
-        }
-        for (bit, &count) in ones.iter().enumerate() {
-            let ratio = f64::from(count) / f64::from(n);
-            assert!((0.45..0.55).contains(&ratio), "bit {bit}: {ratio}");
-        }
-    }
-
-    #[test]
-    fn value_noise_hits_lattice_values_and_stays_in_range() {
-        for (x, z) in [(0i32, 0i32), (-5, 9), (123, -456)] {
-            let expected =
-                f64::from(hash2(3, x.into(), z.into())) / f64::from(u32::MAX) * 2.0 - 1.0;
-            assert_eq!(value_noise_2d(3, f64::from(x), f64::from(z)), expected);
-        }
-        let mut min = f64::MAX;
-        let mut max = f64::MIN;
-        for i in 0..4000 {
-            let x = f64::from(i) * 0.37 - 700.0;
-            let z = f64::from(i) * -0.61 + 300.0;
-            let v = value_noise_2d(11, x, z);
-            assert!((-1.0..=1.0).contains(&v), "{v} at ({x}, {z})");
-            min = min.min(v);
-            max = max.max(v);
-        }
-        assert!(
-            min < -0.5 && max > 0.5,
-            "noise range too narrow: [{min}, {max}]"
-        );
-    }
-
-    #[test]
-    fn value_noise_is_continuous() {
-        // Smoothstep interpolation: tiny steps give tiny changes, also across cell borders.
-        let step = 1e-6;
-        for i in 0..200 {
-            let x = f64::from(i) * 0.25 - 25.0;
-            let z = f64::from(i) * 0.5 - 50.0;
-            let a = value_noise_2d(5, x, z);
-            let b = value_noise_2d(5, x + step, z + step);
-            assert!((a - b).abs() < 1e-4, "jump at ({x}, {z}): {a} vs {b}");
-        }
-    }
-
-    #[test]
-    fn grid_matches_point_evaluation_bit_for_bit() {
-        let axis = |origin: f64, step: f64| -> Vec<f64> {
-            (0..32).map(|i| origin + f64::from(i) * step).collect()
-        };
-        let cases = [
-            // (x origin, z origin, step, octaves, lacunarity, gain)
-            (0.0, 0.0, 1.0 / 256.0, 5, 2.0, 0.5),
-            (-1000.0 / 256.0, 77.0 / 256.0, 1.0 / 256.0, 5, 2.0, 0.5),
-            (3.5, -9.25, 0.3, 4, 2.0, 0.5),
-            // Dense lattice (frequency above 1): the per-point fallback.
-            (-40.0, 12.0, 7.3, 3, 2.0, 0.5),
-            // Descending coordinates, odd lacunarity and gain, 1 and 0 octaves.
-            (100.0, 50.0, -0.11, 6, 1.7, 0.6),
-            (0.5, 0.5, 0.01, 1, 2.0, 0.5),
-            (0.5, 0.5, 0.01, 0, 2.0, 0.5),
-            // Near the i32 lattice limit (wrapping corners).
-            (2_147_483_640.0, -2_147_483_640.0, 0.5, 2, 2.0, 0.5),
-        ];
-        for (seed, &(x0, z0, step, octaves, lacunarity, gain)) in (40u64..).zip(&cases) {
-            let (xs, zs) = (axis(x0, step), axis(z0, step));
-            let mut grid = vec![0.0; 32 * 32];
-            fbm_2d_grid(seed, &xs, &zs, octaves, lacunarity, gain, &mut grid);
-            for (i, &x) in xs.iter().enumerate() {
-                for (j, &z) in zs.iter().enumerate() {
-                    let point = fbm_2d(seed, x, z, octaves, lacunarity, gain);
-                    assert_eq!(
-                        grid[i * 32 + j].to_bits(),
-                        point.to_bits(),
-                        "case {x0} {z0} {step} at ({x}, {z})"
-                    );
-                }
-            }
-        }
-        // Non-square grids.
-        let (xs, zs) = (axis(1.0, 0.2), axis(-3.0, 0.7)[..5].to_vec());
-        let mut grid = vec![0.0; 32 * 5];
-        fbm_2d_grid(1, &xs, &zs, 3, 2.0, 0.5, &mut grid);
-        assert_eq!(grid[7 * 5 + 3], fbm_2d(1, xs[7], zs[3], 3, 2.0, 0.5));
-    }
-
-    #[test]
-    fn fbm_normalizes_and_degenerates_cleanly() {
-        for i in 0..500 {
-            let x = f64::from(i) * 1.7;
-            let z = f64::from(i) * -0.3;
-            let v = fbm_2d(9, x, z, 6, 2.0, 0.5);
-            assert!((-1.0..=1.0).contains(&v));
-            assert_eq!(fbm_2d(9, x, z, 1, 2.0, 0.5), value_noise_2d(9, x, z));
-        }
-        assert_eq!(fbm_2d(9, 1.5, 2.5, 0, 2.0, 0.5), 0.0);
-    }
-}
+mod tests;

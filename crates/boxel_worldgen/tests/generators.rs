@@ -3,7 +3,7 @@ use boxel_voxel::{
     BlockPos, BlockRegistry, BlockState, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, ChunkKey, ChunkPos,
     LocalPos, Paletted,
 };
-use boxel_worldgen::{FlatGenerator, TerrainGenerator, TerrainSettings, WorldGenerator};
+use boxel_worldgen::{FlatGenerator, Frequency, TerrainGenerator, TerrainSettings, WorldGenerator};
 
 fn registry() -> BlockRegistry {
     BlockRegistry::default_blocks()
@@ -174,7 +174,7 @@ fn terrain_chunks_follow_the_column_rules() {
         TerrainSettings {
             base_height: 8,
             amplitude: 20.0,
-            frequency: 1.0 / 16.0,
+            frequency: Frequency::one_in(16),
             octaves: 3,
             dirt_depth: 2,
             sand_level: 2,
@@ -237,14 +237,16 @@ fn terrain_fast_paths_are_uniform() {
 
 /// The world has no height limit, so generators get chunks at any height: far above, far below
 /// the floor and deep in the stone, the answer is a uniform chunk computed without the column
-/// heights. 100 000 noise octaves make any height computation take about a second per chunk.
+/// heights. A million noise octaves make any height computation take over a second per chunk
+/// (at frequency 0, since the fbm drops the octaves whose frequency would overflow).
 #[test]
 fn terrain_answers_far_chunks_without_heights() {
     let r = registry();
     let g = TerrainGenerator::new(
         7,
         TerrainSettings {
-            octaves: 100_000,
+            frequency: Frequency::new(0, 1),
+            octaves: 1_000_000,
             bottom: -100_000,
             ..TerrainSettings::default()
         },

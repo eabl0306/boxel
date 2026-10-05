@@ -141,8 +141,11 @@ orden que usa el mallador, así copia filas enteras.
 
 El límite que se nota antes es el de `Transform`, que es `f64`: el paso mínimo de la cámara es
 1 mm a unos 4.4e12 vóxeles (2^42), 3 cm a 2^47 y un vóxel entero a 2^52. Los enteros siguen
-exactos hasta el límite del mundo. El ruido del terreno todavía se calcula en `f64`: se degrada
-desde unos 2^35 vóxeles y queda plano pasados 2^39 (el reemplazo por ruido entero viene después).
+exactos hasta el límite del mundo. El ruido del terreno también se calcula con enteros
+(`worldgen/noise.rs`): la frecuencia es una fracción exacta (`Frequency`, 1/256 por defecto), la
+celda de la grilla sale exacta y solo la posición dentro de la celda pasa a `f64`. El terreno es
+igual de variado en cualquier coordenada `i64`, sin aplanarse ni repetirse. Dentro del rango
+`i32` de antes las alturas no cambiaron, bit a bit.
 
 **Bloques.** Cada estado es un `u16` y el 0 es aire (`voxel/registry.rs:10`). Las propiedades
 viven en tablas por campo (`voxel/registry.rs:268`). Hoy hay 12 bloques: las hojas son cutout y

@@ -9,6 +9,8 @@ use std::ops::RangeInclusive;
 
 pub mod noise;
 
+pub use noise::Frequency;
+
 /// A chunk generator.
 ///
 /// The world has no height limit: it asks for chunks at any height around its viewers, so a
@@ -111,8 +113,9 @@ pub struct TerrainSettings {
     pub base_height: i32,
     /// Max deviation from `base_height` (voxels).
     pub amplitude: f32,
-    /// Base frequency of the height fbm (1/voxels).
-    pub frequency: f64,
+    /// Lattice cells per voxel of the first octave of the height fbm, an exact fraction so the
+    /// terrain is the same function at any distance from the origin.
+    pub frequency: Frequency,
     /// fbm octaves.
     pub octaves: u32,
     /// Dirt thickness under grass.
@@ -130,7 +133,7 @@ impl Default for TerrainSettings {
         Self {
             base_height: 64,
             amplitude: 48.0,
-            frequency: 1.0 / 256.0,
+            frequency: Frequency::one_in(256),
             octaves: 5,
             dirt_depth: 3,
             sand_level: 40,
@@ -141,7 +144,7 @@ impl Default for TerrainSettings {
 }
 
 /// Lacunarity of the terrain height fbm.
-const FBM_LACUNARITY: f64 = 2.0;
+const FBM_LACUNARITY: u32 = 2;
 /// Gain of the terrain height fbm.
 const FBM_GAIN: f64 = 0.5;
 
@@ -165,41 +168,36 @@ impl TerrainGenerator {
     }
     /// Surface height at world column `(x, z)` (top solid block y). Exposed for tests/spawn.
     ///
-    /// `base_height + round(amplitude * fbm_2d(seed, x * frequency, z * frequency, octaves, 2.0,
-    /// 0.5))`, so it never leaves `base_height +- ceil(|amplitude|)`. The columns are converted
-    /// to `f64` (exact up to `2^53`; bit-identical to the former `i32` API inside `i32`).
+    /// `base_height + round(amplitude * fbm_2d(seed, x, z, fbm))` with the settings' frequency
+    /// and octaves, lacunarity 2 and gain 0.5, so it never leaves `base_height +-
+    /// ceil(|amplitude|)`. The noise works on the integer columns ([`noise`]): exact at any
+    /// `i64`, and bit-identical to the former `f64` noise inside `i32` for a power-of-two
+    /// frequency denominator (the default `1/256`).
     pub fn height_at(&self, x: i64, z: i64) -> i32 {
+        self.height_from_noise(noise::fbm_2d(self.seed, x, z, self.fbm()))
+    }
+
+    /// The height fbm.
+    fn fbm(&self) -> noise::Fbm {
         let s = &self.settings;
-        let n = noise::fbm_2d(
-            self.seed,
-            column(x) * s.frequency,
-            column(z) * s.frequency,
-            s.octaves,
-            FBM_LACUNARITY,
-            FBM_GAIN,
-        );
-        self.height_from_noise(n)
+        noise::Fbm {
+            frequency: s.frequency,
+            octaves: s.octaves,
+            lacunarity: FBM_LACUNARITY,
+            gain: FBM_GAIN,
+        }
     }
 
     /// Heights of the 32x32 columns whose min corner is `(x0, z0)`, indexed `x * 32 + z` (like
     /// one y layer of a chunk). Equal to [`TerrainGenerator::height_at`] per column, computed
     /// with one lattice hash per corner and octave.
     fn column_heights(&self, x0: i64, z0: i64) -> [i32; CHUNK_AREA] {
-        let s = &self.settings;
         // `origin + i` cannot overflow: chunk origins are within the world limit (`+-2^61`).
-        let axis = |origin: i64| -> [f64; CHUNK_SIZE as usize] {
-            std::array::from_fn(|i| column(origin + i as i64) * s.frequency)
+        let axis = |origin: i64| -> [i64; CHUNK_SIZE as usize] {
+            std::array::from_fn(|i| origin + i as i64)
         };
         let mut noise = [0.0; CHUNK_AREA];
-        noise::fbm_2d_grid(
-            self.seed,
-            &axis(x0),
-            &axis(z0),
-            s.octaves,
-            FBM_LACUNARITY,
-            FBM_GAIN,
-            &mut noise,
-        );
+        noise::fbm_2d_grid(self.seed, &axis(x0), &axis(z0), self.fbm(), &mut noise);
         noise.map(|n| self.height_from_noise(n))
     }
 
@@ -223,12 +221,6 @@ impl TerrainGenerator {
         s.base_height
             .saturating_sub(f64::from(s.amplitude).abs().ceil() as i32)
     }
-}
-
-/// A world column coordinate as the `f64` the noise samples (exact up to `2^53`, rounded
-/// beyond).
-fn column(c: i64) -> f64 {
-    c as f64
 }
 
 impl Default for TerrainGenerator {
@@ -339,14 +331,14 @@ mod tests {
         let settings = [
             TerrainSettings::default(),
             TerrainSettings {
-                frequency: 1.0 / 7.0,
+                frequency: Frequency::one_in(7),
                 octaves: 7,
                 amplitude: 12.5,
                 ..TerrainSettings::default()
             },
             // Higher than one lattice cell per voxel: the per-point fallback.
             TerrainSettings {
-                frequency: 1.9,
+                frequency: Frequency::new(19, 10),
                 octaves: 2,
                 ..TerrainSettings::default()
             },
@@ -362,8 +354,11 @@ mod tests {
                 (-32, 64),
                 (-4096, -1_000_000),
                 (1 << 25, -(1 << 24)),
-                // Across the former i32 edge.
+                // Across the former i32 edge, far out, and at the ends of i64.
                 ((1 << 31) - 16, -(1 << 31) - 16),
+                (1 << 40, -(1 << 50)),
+                (-(1 << 61), (1 << 61) - 32),
+                (i64::MAX - 31, i64::MIN),
             ] {
                 let grid = g.column_heights(x0, z0);
                 for (column, &h) in grid.iter().enumerate() {
