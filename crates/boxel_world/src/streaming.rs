@@ -3,7 +3,7 @@
 //! so the rules are unit tested directly.
 //!
 //! Slot invariants:
-//! - `neighbors_ready` bit `i` is set iff neighbor `i` is outside the generator's vertical range
+//! - `neighbors_ready` bit `i` is set iff neighbor `i` is outside `WorldSettings::vertical_bounds`
 //!   or has a slot whose data is `Ready` or `Missing`.
 //! - A slot has at most one job in flight (generation runs before meshing, and a mesh job is only
 //!   dispatched from `MeshState::Queued`).
@@ -14,7 +14,10 @@
 //!   `InFlight` (so `ChunkMap::ready_meshes()` only misses published chunks during a remesh).
 //! - An `Empty` mesh is never stale: a data change remeshes it, and unloading a neighbor resets
 //!   it (a `Ready` mesh kept in the hysteresis band is checked by epoch when wanted again).
-use crate::interest::{self, ViewerChunk};
+//! - Once the interest backlog is empty, every slot's interest is what the viewers want
+//!   ([`Planner::level`]), every wanted position has a slot, and every unwanted unpinned slot is
+//!   inside some viewer's keep region with data that was at least started.
+use crate::interest::{Level, Planner, Viewer};
 use crate::jobs::JobExecutor;
 use crate::scheduler::{JobKind, JobScheduler};
 use crate::{
@@ -34,10 +37,23 @@ use std::ops::RangeInclusive;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// `neighbors_ready` with all 26 bits set.
 pub(crate) const ALL_NEIGHBORS: u32 = (1 << 26) - 1;
+
+/// Positions re-evaluated per frame whatever `WorldSettings::interest_budget` says (progress).
+const MIN_INTEREST_STEPS: usize = 64;
+
+/// Stale job priorities refreshed per frame whatever the interest budget says (progress), and
+/// the batch size of the refreshes that use the rest of the budget.
+const PRIORITY_BATCH: usize = 256;
+
+/// The automatic in-flight cap keeps the workers busy for this many frames.
+const AUTO_FRAMES: f64 = 1.5;
+
+/// Upper bound of the automatic in-flight cap.
+pub(crate) const MAX_AUTO_IN_FLIGHT: usize = 4096;
 
 /// Index of the opposite offset: `NEIGHBOR_OFFSETS` is lexicographic in `(dy, dx, dz)` without
 /// the center, so negating an offset mirrors its index.
@@ -67,6 +83,13 @@ pub(crate) enum JobMessage {
     },
 }
 
+/// A job's message and how long its body ran on the worker (zero when it did not run).
+#[derive(Debug)]
+pub(crate) struct JobReport {
+    message: JobMessage,
+    busy: Duration,
+}
+
 /// A `Meshed` result waiting for the per-frame event budget.
 #[derive(Debug)]
 struct MeshedResult {
@@ -81,14 +104,14 @@ struct MeshedResult {
 struct ResultToken {
     id: ChunkId,
     kind: JobKind,
-    tx: Option<Sender<JobMessage>>,
+    tx: Option<Sender<JobReport>>,
 }
 
 impl ResultToken {
-    fn send(mut self, message: JobMessage) {
+    fn send(mut self, message: JobMessage, busy: Duration) {
         if let Some(tx) = self.tx.take() {
             // Err only if the world (receiver) is gone: nobody is waiting for the result.
-            let _ = tx.send(message);
+            let _ = tx.send(JobReport { message, busy });
         }
     }
 }
@@ -96,10 +119,13 @@ impl ResultToken {
 impl Drop for ResultToken {
     fn drop(&mut self) {
         if let Some(tx) = self.tx.take() {
-            let _ = tx.send(JobMessage::Failed {
-                id: self.id,
-                kind: self.kind,
-                panic: "job dropped before sending a result".to_string(),
+            let _ = tx.send(JobReport {
+                message: JobMessage::Failed {
+                    id: self.id,
+                    kind: self.kind,
+                    panic: "job dropped before sending a result".to_string(),
+                },
+                busy: Duration::ZERO,
             });
         }
     }
@@ -133,10 +159,11 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 /// Spawns `body` on `executor` under the result contract: cancelled jobs send `Cancelled`, a
-/// panicking body sends `Failed`, a dropped job sends `Failed` through the token.
+/// panicking body sends `Failed`, a dropped job sends `Failed` through the token. The report
+/// carries how long the body ran.
 fn spawn_job(
     executor: &dyn JobExecutor,
-    tx: &Sender<JobMessage>,
+    tx: &Sender<JobReport>,
     id: ChunkId,
     kind: JobKind,
     cancel: Arc<AtomicBool>,
@@ -149,9 +176,10 @@ fn spawn_job(
     };
     executor.spawn(Box::new(move || {
         if cancel.load(Ordering::Relaxed) {
-            token.send(JobMessage::Cancelled { id, kind });
+            token.send(JobMessage::Cancelled { id, kind }, Duration::ZERO);
             return;
         }
+        let start = Instant::now();
         let message = match catch_unwind(AssertUnwindSafe(body)) {
             Ok(message) => message,
             Err(payload) => JobMessage::Failed {
@@ -160,13 +188,14 @@ fn spawn_job(
                 panic: panic_text(payload.as_ref()),
             },
         };
-        token.send(message);
+        token.send(message, start.elapsed());
     }));
 }
 
-/// Viewer chunks, refreshed every frame from `Transform` + `ChunkViewer` (sorted).
+/// Every `ChunkViewer` as `(entity bits, viewer)`, sorted by entity; refreshed every frame from
+/// `Transform` + `ChunkViewer` (only written when it changes).
 #[derive(Resource, Debug, Default)]
-pub(crate) struct ViewerChunks(pub(crate) Vec<ViewerChunk>);
+pub(crate) struct ViewerChunks(pub(crate) Vec<(u64, Viewer)>);
 
 /// What the state machine works on during one system run: the map, the content and the
 /// `ChunkMeshEvent`s to publish (written by the calling system).
@@ -174,7 +203,7 @@ pub(crate) struct Ctx<'a> {
     pub(crate) map: &'a mut ChunkMap,
     pub(crate) content: &'a WorldContent,
     pub(crate) events: &'a mut Vec<ChunkMeshEvent>,
-    vertical: Option<RangeInclusive<i32>>,
+    generator_layers: Option<RangeInclusive<i32>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -187,24 +216,90 @@ impl<'a> Ctx<'a> {
             map,
             content,
             events,
-            vertical: None,
+            generator_layers: None,
         }
     }
 
-    /// The generator's vertical chunk range (queried once per run).
-    fn vertical(&mut self) -> RangeInclusive<i32> {
-        self.vertical
+    /// True if the generator declares layer `y` all air (outside its `vertical_chunks()`, queried
+    /// once per run): such chunks are created as air without a generation job.
+    fn known_air(&mut self, y: i32) -> bool {
+        !self
+            .generator_layers
             .get_or_insert_with(|| self.content.generator.vertical_chunks())
-            .clone()
+            .contains(&y)
     }
+}
+
+/// Sizes the in-flight cap when `WorldSettings::max_jobs_in_flight` is 0: enough jobs to keep
+/// every async compute worker busy for [`AUTO_FRAMES`] frames, from moving averages of the job
+/// cost (measured on the workers) and of the frame interval.
+#[derive(Debug)]
+pub(crate) struct AutoCap {
+    workers: usize,
+    /// Average seconds a job body runs.
+    job: f64,
+    /// Average seconds between frames.
+    frame: f64,
+    last_frame: Option<Instant>,
+}
+
+impl AutoCap {
+    /// Before any measurement: 50 us per job, 60 Hz.
+    pub(crate) fn new(workers: usize) -> Self {
+        Self {
+            workers: workers.max(1),
+            job: 50e-6,
+            frame: 1.0 / 60.0,
+            last_frame: None,
+        }
+    }
+
+    /// A finished job body ran for `busy` (samples clamped to [1 us, 20 ms]).
+    fn observe_job(&mut self, busy: Duration) {
+        let sample = busy.as_secs_f64().clamp(1e-6, 20e-3);
+        self.job += (sample - self.job) / 32.0;
+    }
+
+    /// A frame starts at `now` (intervals clamped to [50 us, 33 ms]: a longer one is a hitch,
+    /// not the frame rate).
+    fn observe_frame(&mut self, now: Instant) {
+        if let Some(last) = self.last_frame {
+            let sample = now
+                .saturating_duration_since(last)
+                .as_secs_f64()
+                .clamp(50e-6, 33e-3);
+            self.frame += (sample - self.frame) / 8.0;
+        }
+        self.last_frame = Some(now);
+    }
+
+    /// The cap for the current averages.
+    pub(crate) fn cap(&self) -> usize {
+        auto_cap(self.workers, self.frame, self.job)
+    }
+}
+
+/// `workers x ceil(AUTO_FRAMES x frame / job)`, at least 2 per worker, at most
+/// [`MAX_AUTO_IN_FLIGHT`] (times in seconds).
+pub(crate) fn auto_cap(workers: usize, frame: f64, job: f64) -> usize {
+    let workers = workers.max(1);
+    let per_worker = (AUTO_FRAMES * frame / job.max(1e-7)).ceil().max(0.0);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "clamped to MAX_AUTO_IN_FLIGHT first; worker counts are small"
+    )]
+    let n = (workers as f64 * per_worker).min(MAX_AUTO_IN_FLIGHT as f64) as usize;
+    n.clamp(2 * workers, MAX_AUTO_IN_FLIGHT.max(2 * workers))
 }
 
 /// Private job state of the world (scheduler, result channel, executor, event bookkeeping).
 #[derive(Resource)]
 pub(crate) struct WorldJobs {
     pub(crate) scheduler: JobScheduler,
-    tx: Sender<JobMessage>,
-    rx: Receiver<JobMessage>,
+    tx: Sender<JobReport>,
+    rx: Receiver<JobReport>,
     executor: Arc<dyn JobExecutor>,
     /// Mesh job body (always [`mesh_with_thread_mesher`] outside unit tests).
     pub(crate) mesh_fn: MeshFn,
@@ -213,8 +308,14 @@ pub(crate) struct WorldJobs {
     pending: VecDeque<MeshedResult>,
     /// Chunks whose last published event was an `Upsert`.
     published: HashSet<ChunkId, foldhash::fast::FixedState>,
-    /// Viewers of the last interest computation (`None` before the first one).
-    viewers: Option<Vec<ViewerChunk>>,
+    /// Viewers, interest settings and the interest work not done yet.
+    pub(crate) planner: Planner,
+    /// The automatic in-flight cap.
+    pub(crate) auto_cap: AutoCap,
+    /// One shared snapshot per uniform state (uniform chunks are most of a tall world).
+    uniform: Vec<(BlockState, Arc<ChunkData>)>,
+    /// Positions re-evaluated by the interest since start (tests and benchmarks).
+    pub(crate) interest_steps: usize,
     /// Failed jobs since start (the `failed=` field of the `"world"` board line).
     pub(crate) failed: usize,
     /// Chunks whose failure was already error-logged.
@@ -222,8 +323,13 @@ pub(crate) struct WorldJobs {
 }
 
 impl WorldJobs {
-    /// Empty state with `max_in_flight` job slots.
-    pub(crate) fn new(max_in_flight: usize, executor: Arc<dyn JobExecutor>) -> Self {
+    /// Empty state with `max_in_flight` job slots (the cap until the first frame sets one) and
+    /// `workers` async compute threads (for the automatic cap).
+    pub(crate) fn new(
+        max_in_flight: usize,
+        workers: usize,
+        executor: Arc<dyn JobExecutor>,
+    ) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
         Self {
             scheduler: JobScheduler::new(max_in_flight),
@@ -233,91 +339,215 @@ impl WorldJobs {
             mesh_fn: mesh_with_thread_mesher,
             pending: VecDeque::new(),
             published: HashSet::default(),
-            viewers: None,
+            planner: Planner::default(),
+            auto_cap: AutoCap::new(workers),
+            uniform: Vec::new(),
+            interest_steps: 0,
             failed: 0,
             failure_logged: HashSet::default(),
         }
     }
 
-    /// Priority of a new job for `pos` (nearest viewer of the last interest computation).
+    /// Priority of a new job for `pos` (nearest current viewer).
     fn priority(&self, pos: ChunkPos) -> u32 {
-        interest::priority(pos, self.viewers.as_deref().unwrap_or_default())
+        self.planner.priority(pos)
     }
 
-    /// True if `viewers` differ from the last interest computation (or there was none).
-    pub(crate) fn viewers_changed(&self, viewers: &[ViewerChunk]) -> bool {
-        self.viewers.as_deref() != Some(viewers)
+    /// True if jobs are queued or results wait in the channel.
+    pub(crate) fn has_job_work(&self) -> bool {
+        self.scheduler.queued() > 0 || !self.rx.is_empty()
     }
 
-    /// True if job results wait in the channel or for the event budget.
-    pub(crate) fn has_results(&self) -> bool {
-        !self.rx.is_empty() || !self.pending.is_empty()
+    /// True if mesh results wait for the event budget.
+    pub(crate) fn has_meshes(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// One shared snapshot of a uniform chunk of `state`.
+    fn uniform(&mut self, state: BlockState) -> Arc<ChunkData> {
+        if let Some((_, data)) = self.uniform.iter().find(|(s, _)| *s == state) {
+            return Arc::clone(data);
+        }
+        let data = Arc::new(ChunkData::uniform(state));
+        self.uniform.push((state, Arc::clone(&data)));
+        data
+    }
+
+    /// `data` as a snapshot: uniform chunks share one per state.
+    fn snapshot(&mut self, data: ChunkData) -> Arc<ChunkData> {
+        match data.as_uniform() {
+            Some(state) if data == ChunkData::uniform(state) => self.uniform(state),
+            _ => Arc::new(data),
+        }
     }
 
     // ---- Interest ----------------------------------------------------------------------------
 
-    /// Creates, updates and unloads slots for `viewers`. No-op unless the viewers changed since
-    /// the last call (or on the first call).
+    /// True if the viewers or the interest settings changed since the last plan, or earlier
+    /// interest work (positions, stale priorities) is still pending.
+    pub(crate) fn interest_pending(
+        &self,
+        viewers: &[(u64, Viewer)],
+        settings: &WorldSettings,
+    ) -> bool {
+        self.planner.backlog() > 0
+            || self.scheduler.stale() > 0
+            || self.planner.changed(
+                viewers,
+                settings.unload_hysteresis,
+                settings.vertical_bounds.as_ref(),
+            )
+    }
+
+    /// Viewer changes not applied yet (positions and work lists).
+    pub(crate) fn interest_backlog(&self) -> usize {
+        self.planner.backlog()
+    }
+
+    /// Plans the work of a viewer or settings change, then applies interest work within
+    /// `settings.interest_budget`.
     pub(crate) fn update_interest(
         &mut self,
         cx: &mut Ctx<'_>,
         settings: &WorldSettings,
-        viewers: &[ViewerChunk],
+        viewers: &[(u64, Viewer)],
     ) {
-        if !self.viewers_changed(viewers) {
-            return;
-        }
-        self.viewers = Some(viewers.to_vec());
-        let vertical = cx.vertical();
-        let wanted = interest::wanted_chunks(viewers, &vertical);
+        self.plan_interest(cx, settings, viewers);
+        self.process_interest(cx, settings, settings.interest_budget);
+    }
 
-        let existing: Vec<ChunkId> = cx.map.slots.keys().collect();
-        for id in existing {
-            let slot = &cx.map.slots[id];
-            let pos = slot.key.pos;
-            let pinned = slot.interest & Interest::PINNED;
-            let want = wanted.get(&pos).copied().unwrap_or(Interest::empty());
-            if want.is_empty()
-                && pinned.is_empty()
-                && (matches!(slot.data, DataState::Queued)
-                    || interest::beyond_hysteresis(pos, viewers, settings.unload_hysteresis))
-            {
-                // Unwanted data that was never started is dropped right away; anything else
-                // waits for the hysteresis band.
-                self.unload(cx, id);
-            } else {
-                self.set_interest(cx, id, want | pinned);
-            }
-        }
-
-        for (&pos, &want) in &wanted {
-            if !cx.map.index.contains_key(&pos) {
-                self.create_slot(cx, settings, &vertical, pos, want);
-            }
-        }
-
+    /// Records new viewers or settings: lists the positions to re-evaluate (nothing is applied
+    /// yet) and marks queued job priorities stale.
+    pub(crate) fn plan_interest(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        settings: &WorldSettings,
+        viewers: &[(u64, Viewer)],
+    ) {
+        let bounds_changed =
+            self.planner.is_planned() && self.planner.bounds() != settings.vertical_bounds.as_ref();
         let map = &*cx.map;
-        let viewers = self.viewers.as_deref().unwrap_or_default();
-        self.scheduler.reprioritize(|id, kind| {
+        let changed = self.planner.update(
+            viewers,
+            settings.unload_hysteresis,
+            settings.vertical_bounds.as_ref(),
+            || map.slots.values().map(|s| s.key.pos).collect(),
+        );
+        if changed {
+            self.scheduler.invalidate_priorities();
+            // Grow the map once, now, instead of rehashing it in the middle of a loading frame.
+            let room = self
+                .planner
+                .capacity_hint()
+                .saturating_sub(cx.map.slots.len());
+            cx.map.slots.reserve(room);
+            cx.map.index.reserve(room);
+        }
+        if bounds_changed {
+            self.refresh_neighbor_bits(cx);
+        }
+    }
+
+    /// The vertical bounds changed (a rare settings change): neighbor bits follow the new bounds,
+    /// and every slot whose bits changed has its mesh redone, since its neighbors are no longer
+    /// what the mesh was built from. Walks every slot once.
+    fn refresh_neighbor_bits(&mut self, cx: &mut Ctx<'_>) {
+        let ids: Vec<ChunkId> = cx.map.slots.keys().collect();
+        for id in ids {
+            let pos = cx.map.slots[id].key.pos;
+            let bits = own_neighbor_bits(cx.map, &self.planner, pos);
+            let slot = &mut cx.map.slots[id];
+            if slot.neighbors_ready == bits {
+                continue;
+            }
+            slot.neighbors_ready = bits;
+            slot.epoch = slot.epoch.wrapping_add(1);
+            if !matches!(slot.mesh, MeshState::None) {
+                let priority = self.priority(pos);
+                self.request_remesh(cx, id, priority);
+            }
+        }
+    }
+
+    /// Applies planned interest work for about `budget`: re-evaluates listed positions (at least
+    /// [`MIN_INTEREST_STEPS`]), then refreshes stale job priorities (one batch whatever the
+    /// budget, more while it lasts). Positions go first so the refresh drops the jobs of the slots
+    /// they unloaded.
+    pub(crate) fn process_interest(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        settings: &WorldSettings,
+        budget: Duration,
+    ) {
+        let start = Instant::now();
+        let mut steps = 0usize;
+        while let Some(pos) = self.planner.next() {
+            self.refresh_position(cx, settings, pos);
+            steps += 1;
+            if steps >= MIN_INTEREST_STEPS && steps.is_multiple_of(32) && start.elapsed() >= budget
+            {
+                break;
+            }
+        }
+        self.interest_steps += steps;
+        self.refresh_priorities(cx, PRIORITY_BATCH);
+        while self.scheduler.stale() > 0 && start.elapsed() < budget {
+            self.refresh_priorities(cx, PRIORITY_BATCH);
+        }
+    }
+
+    /// Recomputes up to `max` stale job priorities for the current viewers (jobs whose slot no
+    /// longer wants them are dropped).
+    fn refresh_priorities(&mut self, cx: &Ctx<'_>, max: usize) {
+        let (map, planner) = (&*cx.map, &self.planner);
+        self.scheduler.refresh_priorities(max, |id, kind| {
             let slot = map.slots.get(id)?;
             let queued = match kind {
                 JobKind::Generate => matches!(slot.data, DataState::Queued),
                 JobKind::Mesh => matches!(slot.mesh, MeshState::Queued),
             };
-            queued.then(|| interest::priority(slot.key.pos, viewers))
+            queued.then(|| planner.priority(slot.key.pos))
         });
     }
 
-    /// New slot at `pos` (data `Queued`, generation job queued).
+    /// Brings the slot at `pos` in line with the current viewers: creates it if wanted and
+    /// missing, updates its interest, or unloads it (unwanted, unpinned, and either never started
+    /// or outside every keep region).
+    fn refresh_position(&mut self, cx: &mut Ctx<'_>, settings: &WorldSettings, pos: ChunkPos) {
+        let level = self.planner.level(pos);
+        let want = level.interest();
+        match cx.map.index.get(&pos) {
+            Some(&id) => {
+                let slot = &cx.map.slots[id];
+                let pinned = slot.interest & Interest::PINNED;
+                if want.is_empty()
+                    && pinned.is_empty()
+                    && (matches!(slot.data, DataState::Queued) || level == Level::Out)
+                {
+                    // Unwanted data that was never started is dropped right away; anything else
+                    // waits for the hysteresis band.
+                    self.unload(cx, id);
+                } else {
+                    self.set_interest(cx, id, want | pinned);
+                }
+            }
+            None if !want.is_empty() => {
+                self.create_slot(cx, settings, pos, want);
+            }
+            None => {}
+        }
+    }
+
+    /// New slot at `pos`: data `Queued` with a generation job, or `Ready` air at once if the
+    /// generator declares the layer all air.
     pub(crate) fn create_slot(
         &mut self,
         cx: &mut Ctx<'_>,
         settings: &WorldSettings,
-        vertical: &RangeInclusive<i32>,
         pos: ChunkPos,
         interest: Interest,
     ) -> ChunkId {
-        let neighbors_ready = own_neighbor_bits(cx.map, vertical, pos);
+        let neighbors_ready = own_neighbor_bits(cx.map, &self.planner, pos);
         let slot = ChunkSlot {
             key: ChunkKey {
                 dim: settings.dimension,
@@ -334,9 +564,14 @@ impl WorldJobs {
         };
         let id = cx.map.slots.insert(slot);
         cx.map.index.insert(pos, id);
-        self.scheduler
-            .push(id, JobKind::Generate, self.priority(pos));
         self.set_interest(cx, id, interest);
+        if cx.known_air(pos.y) {
+            cx.map.slots[id].data = DataState::Ready(self.uniform(BlockState::AIR));
+            self.data_available(cx, id);
+        } else {
+            self.scheduler
+                .push(id, JobKind::Generate, self.priority(pos));
+        }
         id
     }
 
@@ -389,6 +624,9 @@ impl WorldJobs {
     /// Removes a slot: cancels its job, publishes `Remove` if its mesh was published, clears its
     /// bit in the 26 neighbors and bumps their epoch. A neighbor with an `Empty` mesh forgets it
     /// (it may have been empty only because of this chunk, which may come back different).
+    ///
+    /// A slot outside the vertical bounds (left behind by a bounds change) becomes air for its
+    /// neighbors instead: their bit stays set and the ones with mesh interest are remeshed.
     pub(crate) fn unload(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
         let Some(slot) = cx.map.slots.remove(id) else {
             return;
@@ -399,18 +637,26 @@ impl WorldJobs {
         if self.published.remove(&id) {
             cx.events.push(ChunkMeshEvent::Remove { id, key: slot.key });
         }
+        let outside = !self.planner.in_bounds(slot.key.pos.y);
         for (i, offset) in NEIGHBOR_OFFSETS.iter().enumerate() {
             let npos = slot.key.pos.offset(*offset);
             let Some(&n) = cx.map.index.get(&npos) else {
                 continue;
             };
             let neighbor = &mut cx.map.slots[n];
-            neighbor.neighbors_ready &= !(1 << opposite_neighbor(i));
+            let bit = 1 << opposite_neighbor(i);
+            if outside {
+                neighbor.neighbors_ready |= bit;
+            } else {
+                neighbor.neighbors_ready &= !bit;
+            }
             neighbor.epoch = neighbor.epoch.wrapping_add(1);
-            if matches!(neighbor.mesh, MeshState::Empty) {
-                // Nothing is published for it. Without mesh interest (the usual case: a mesh
-                // chunk's neighbors are always wanted) this resets it to `None`, so it is meshed
-                // again when wanted; a `Ready` mesh is checked by epoch instead.
+            if matches!(neighbor.mesh, MeshState::Empty)
+                || (outside && neighbor.interest.contains(Interest::MESH))
+            {
+                // Nothing is published for an `Empty` mesh. Without mesh interest (the usual
+                // case: a mesh chunk's neighbors are always wanted) this resets it to `None`, so
+                // it is meshed again when wanted; a `Ready` mesh is checked by epoch instead.
                 let priority = self.priority(npos);
                 self.request_remesh(cx, n, priority);
             }
@@ -485,9 +731,8 @@ impl WorldJobs {
     /// The slot's data became `Ready` or `Missing`: refresh its own neighbor bits, set its bit in
     /// the 26 neighbors and schedule every mesh that became possible.
     fn data_available(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
-        let vertical = cx.vertical();
         let pos = cx.map.slots[id].key.pos;
-        cx.map.slots[id].neighbors_ready = own_neighbor_bits(cx.map, &vertical, pos);
+        cx.map.slots[id].neighbors_ready = own_neighbor_bits(cx.map, &self.planner, pos);
         self.schedule_mesh(cx, id, self.priority(pos));
         for (i, offset) in NEIGHBOR_OFFSETS.iter().enumerate() {
             let npos = pos.offset(*offset);
@@ -560,20 +805,62 @@ impl WorldJobs {
         }
     }
 
-    // ---- Dispatch ----------------------------------------------------------------------------
+    // ---- Jobs --------------------------------------------------------------------------------
+
+    /// Frame bookkeeping before the job step: measures the frame interval and applies the
+    /// in-flight cap (`settings.max_jobs_in_flight`, or the automatic one when it is 0).
+    pub(crate) fn begin_frame(&mut self, settings: &WorldSettings, now: Instant) {
+        self.auto_cap.observe_frame(now);
+        let cap = match settings.max_jobs_in_flight {
+            0 => self.auto_cap.cap(),
+            n => n,
+        };
+        self.scheduler.set_max_in_flight(cap);
+    }
+
+    /// The job step of a frame: collects finished jobs (freeing their in-flight slots) and starts
+    /// queued ones, again and again while results keep arriving, within `settings.job_budget`.
+    /// Collecting first means a slot freed by a job that finished since the last frame is reused
+    /// in this frame, not the next one.
+    pub(crate) fn run_jobs(&mut self, cx: &mut Ctx<'_>, settings: &WorldSettings) {
+        let start = Instant::now();
+        let budget = settings.job_budget;
+        loop {
+            let collected = self.drain_results(cx, start, budget);
+            let started = self.dispatch_until(cx, start, budget);
+            if (collected == 0 && started == 0) || start.elapsed() >= budget {
+                break;
+            }
+        }
+    }
 
     /// Starts queued jobs while below the in-flight cap. Jobs whose slot no longer wants them are
     /// discarded (their in-flight slot is released immediately).
+    #[cfg(test)]
     pub(crate) fn dispatch(&mut self, cx: &mut Ctx<'_>) {
+        self.dispatch_until(cx, Instant::now(), Duration::MAX);
+    }
+
+    /// [`WorldJobs::dispatch`] until `budget` after `start` (checked every 16 jobs). Returns the
+    /// jobs started.
+    fn dispatch_until(&mut self, cx: &mut Ctx<'_>, start: Instant, budget: Duration) -> usize {
+        let (mut started, mut popped) = (0, 0usize);
         while let Some(job) = self.scheduler.pop_ready() {
-            let started = match job.kind {
+            let ok = match job.kind {
                 JobKind::Generate => self.start_generate(cx, job.id),
                 JobKind::Mesh => self.start_mesh(cx, job.id),
             };
-            if !started {
+            if ok {
+                started += 1;
+            } else {
                 self.scheduler.complete();
             }
+            popped += 1;
+            if popped.is_multiple_of(16) && start.elapsed() >= budget {
+                break;
+            }
         }
+        started
     }
 
     fn start_generate(&mut self, cx: &mut Ctx<'_>, id: ChunkId) -> bool {
@@ -626,7 +913,7 @@ impl WorldJobs {
             let neighbor = map.get(map.id_at(pos.offset(NEIGHBOR_OFFSETS[i]))?)?;
             match &neighbor.data {
                 DataState::Ready(d) => Some(Arc::clone(d)),
-                // Missing chunks are air, like chunks outside the vertical range.
+                // Missing chunks are air, like chunks outside the vertical bounds.
                 DataState::Missing | DataState::Queued | DataState::Generating => None,
             }
         });
@@ -665,36 +952,55 @@ impl WorldJobs {
 
     // ---- Collect -----------------------------------------------------------------------------
 
-    /// Drains job results within `settings.collect_budget` (at least one per call; every message
-    /// releases its in-flight slot) and applies mesh results within
+    /// Drains job results within `settings.job_budget`, then applies mesh results within
     /// `settings.max_mesh_events_per_frame` events (the rest wait for the next call).
+    #[cfg(test)]
     pub(crate) fn collect(&mut self, cx: &mut Ctx<'_>, settings: &WorldSettings) {
-        let start = Instant::now();
-        while let Ok(message) = self.rx.try_recv() {
+        self.drain_results(cx, Instant::now(), settings.job_budget);
+        self.apply_meshes(cx, settings);
+    }
+
+    /// Drains job results until `budget` after `start` (at least one per call; every message
+    /// releases its in-flight slot). Mesh results wait for [`WorldJobs::apply_meshes`]. Returns
+    /// how many results were drained.
+    fn drain_results(&mut self, cx: &mut Ctx<'_>, start: Instant, budget: Duration) -> usize {
+        let mut drained = 0;
+        while let Ok(JobReport { message, busy }) = self.rx.try_recv() {
             self.scheduler.complete();
+            drained += 1;
             match message {
-                JobMessage::Generated { id, data } => self.on_generated(cx, id, data),
+                JobMessage::Generated { id, data } => {
+                    self.auto_cap.observe_job(busy);
+                    self.on_generated(cx, id, data);
+                }
                 JobMessage::Meshed {
                     id,
                     data_version,
                     epoch,
                     mesh,
-                } => self.pending.push_back(MeshedResult {
-                    id,
-                    data_version,
-                    epoch,
-                    mesh,
-                }),
+                } => {
+                    self.auto_cap.observe_job(busy);
+                    self.pending.push_back(MeshedResult {
+                        id,
+                        data_version,
+                        epoch,
+                        mesh,
+                    });
+                }
                 JobMessage::Cancelled { id, kind } => {
                     tracing::trace!(?id, ?kind, "chunk job cancelled (slot unloaded)");
                 }
                 JobMessage::Failed { id, kind, panic } => self.on_failed(cx, id, kind, &panic),
             }
-            if start.elapsed() >= settings.collect_budget {
+            if start.elapsed() >= budget {
                 break;
             }
         }
+        drained
+    }
 
+    /// Applies waiting mesh results within `settings.max_mesh_events_per_frame` events.
+    pub(crate) fn apply_meshes(&mut self, cx: &mut Ctx<'_>, settings: &WorldSettings) {
         let budget = settings.max_mesh_events_per_frame.max(1);
         let first = cx.events.len();
         while cx.events.len() - first < budget {
@@ -706,13 +1012,14 @@ impl WorldJobs {
     }
 
     fn on_generated(&mut self, cx: &mut Ctx<'_>, id: ChunkId, data: ChunkData) {
-        let Some(slot) = cx.map.slots.get_mut(id) else {
+        let Some(slot) = cx.map.slots.get(id) else {
             return;
         };
         if !matches!(slot.data, DataState::Generating) || slot.cancel.load(Ordering::Relaxed) {
             return;
         }
-        slot.data = DataState::Ready(Arc::new(data));
+        let data = self.snapshot(data);
+        cx.map.slots[id].data = DataState::Ready(data);
         self.data_available(cx, id);
     }
 
@@ -728,7 +1035,7 @@ impl WorldJobs {
         match kind {
             JobKind::Generate => {
                 if matches!(slot.data, DataState::Generating) {
-                    // Permanently air, like chunks outside the vertical range.
+                    // Permanently air, like chunks outside the vertical bounds.
                     slot.data = DataState::Missing;
                     self.data_available(cx, id);
                 }
@@ -805,13 +1112,13 @@ impl WorldJobs {
     }
 }
 
-/// Neighbor bits of a slot at `pos` from the current map: outside `vertical` counts as ready,
-/// as do loaded neighbors whose data is `Ready` or `Missing`.
-fn own_neighbor_bits(map: &ChunkMap, vertical: &RangeInclusive<i32>, pos: ChunkPos) -> u32 {
+/// Neighbor bits of a slot at `pos` from the current map: outside the vertical bounds counts as
+/// ready, as do loaded neighbors whose data is `Ready` or `Missing`.
+fn own_neighbor_bits(map: &ChunkMap, planner: &Planner, pos: ChunkPos) -> u32 {
     let mut bits = 0;
     for (i, offset) in NEIGHBOR_OFFSETS.iter().enumerate() {
         let npos = pos.offset(*offset);
-        let ready = !vertical.contains(&npos.y)
+        let ready = !planner.in_bounds(npos.y)
             || map
                 .id_at(npos)
                 .and_then(|n| map.get(n))

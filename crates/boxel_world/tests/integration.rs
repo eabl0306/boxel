@@ -25,25 +25,33 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn terrain_app(executor: Arc<dyn JobExecutor>, max_jobs_in_flight: usize) -> App {
+    terrain_app_with(
+        executor,
+        WorldSettings {
+            max_jobs_in_flight,
+            ..WorldSettings::default()
+        },
+    )
+}
+
+fn terrain_app_with(executor: Arc<dyn JobExecutor>, settings: WorldSettings) -> App {
     let mut app = App::new();
     app.add_plugins(WorldPlugin {
         generator: Arc::new(TerrainGenerator::default()),
         registry: Arc::new(BlockRegistry::default_blocks()),
-        settings: WorldSettings {
-            max_jobs_in_flight,
-            ..WorldSettings::default()
-        },
+        settings,
         executor,
     });
     app
 }
 
-/// A viewer at the center of chunk column `(cx, cz)`, at height 80 (terrain surface level).
+/// A viewer at the center of chunk column `(cx, cz)`, at height 80 (terrain surface level, chunk
+/// layer 2), with the default vertical radius (8).
 fn spawn_viewer(app: &mut App, cx: i32, cz: i32, radius: u32) -> Entity {
     app.world_mut()
         .spawn((
             Transform::from_translation(column_center(cx, cz)),
-            ChunkViewer { radius },
+            ChunkViewer::new(radius),
         ))
         .id()
 }
@@ -197,7 +205,7 @@ fn real_terrain_publishes_meshes() {
     let mut app = terrain_app(Arc::new(TaskPoolExecutor), 0);
     app.world_mut().spawn((
         Transform::from_translation(DVec3::new(0.0, 80.0, 0.0)),
-        ChunkViewer { radius: 3 },
+        ChunkViewer::new(3),
     ));
     let events = settle(&mut app);
 
@@ -223,11 +231,12 @@ fn real_terrain_publishes_meshes() {
     let stats = *app.world().resource::<WorldStats>();
     assert_eq!(stats.data_ready, stats.chunks, "every chunk generated");
     assert!(stats.mesh_ready > 0 && stats.mesh_empty > 0);
-    // Every chunk of every mesh column (radius 3 circle x the vertical range) is meshed.
-    let vertical = TerrainGenerator::default().vertical_chunks().count();
-    assert_eq!(
-        stats.mesh_ready + stats.mesh_empty,
-        mesh_columns(3) * vertical
+    // Every chunk of the mesh cylinder (radius 3 circle x 17 layers around layer 2) is meshed.
+    assert_eq!(stats.mesh_ready + stats.mesh_empty, mesh_columns(3) * 17);
+    let map = app.world().resource::<ChunkMap>();
+    assert!(
+        map.iter()
+            .all(|(_, slot)| (2 - 9..=2 + 9).contains(&slot.key.pos.y))
     );
     // The resource and the slot-based counters agree.
     let slots = map.stats();
@@ -316,7 +325,7 @@ fn edits_remesh_neighbors() {
     let mut app = terrain_app(Arc::new(InlineExecutor), 64);
     app.world_mut().spawn((
         Transform::from_translation(DVec3::new(0.0, 80.0, 0.0)),
-        ChunkViewer { radius: 2 },
+        ChunkViewer::new(2),
     ));
     let events = settle(&mut app);
     let before = last_meshes(&events);
@@ -374,4 +383,112 @@ fn edits_remesh_neighbors() {
     let mut replica = before;
     apply_events(&mut replica, &events);
     assert_replica_matches(&app, &replica);
+}
+
+/// Flying up leaves the terrain behind (its meshes are removed) and loads sky; coming back down
+/// rebuilds the same meshes.
+#[test]
+fn vertical_moves_stream_and_unload() {
+    let mut app = terrain_app(Arc::new(TaskPoolExecutor), 0);
+    let viewer = app
+        .world_mut()
+        .spawn((
+            Transform::from_translation(column_center(0, 0)),
+            ChunkViewer::new(2).with_vertical_radius(2),
+        ))
+        .id();
+    let mut replica = BTreeMap::new();
+    apply_events(&mut replica, &settle(&mut app));
+    assert_replica_matches(&app, &replica);
+    let snapshot = |app: &App| {
+        let map = app.world().resource::<ChunkMap>();
+        map.ready_meshes()
+            .map(|(_, key, mesh)| (key, (**mesh).clone()))
+            .collect::<BTreeMap<ChunkKey, ChunkMesh>>()
+    };
+    let home = snapshot(&app);
+    assert!(!home.is_empty());
+    let move_to = |app: &mut App, y: f64| {
+        app.world_mut()
+            .get_mut::<Transform>(viewer)
+            .expect("viewer")
+            .translation
+            .y = y;
+    };
+
+    // Up to layer 12 (y = 400): the terrain (layers -2..=3) is far below the loaded layers
+    // 9..=15 and beyond the hysteresis: everything there unloads.
+    move_to(&mut app, 400.0);
+    apply_events(&mut replica, &settle(&mut app));
+    assert_replica_matches(&app, &replica);
+    assert!(replica.is_empty(), "no terrain meshes in the sky");
+    let map = app.world().resource::<ChunkMap>();
+    assert!(map.iter().all(|(_, slot)| slot.key.pos.y >= 12 - 5));
+    assert!(
+        map.id_at(ChunkPos::new(0, 15, 0)).is_some(),
+        "no height limit"
+    );
+    assert_world_matches_direct_or_empty(&app);
+
+    // Back down: the same meshes again.
+    move_to(&mut app, 80.0);
+    apply_events(&mut replica, &settle(&mut app));
+    assert_replica_matches(&app, &replica);
+    assert_world_matches_direct(&app, &[]);
+    assert_eq!(snapshot(&app), home);
+}
+
+/// Like `assert_world_matches_direct`, for worlds that may have no mesh at all.
+fn assert_world_matches_direct_or_empty(app: &App) {
+    let map = app.world().resource::<ChunkMap>();
+    for (_, slot) in map.iter() {
+        assert!(
+            matches!(slot.mesh, MeshState::None | MeshState::Empty),
+            "{:?}: sky chunks mesh to nothing",
+            slot.key.pos
+        );
+    }
+}
+
+/// With `vertical_bounds` set to the generator's layers and a viewer that wants every layer, the
+/// world streams like boxel M0: every chunk of every mesh column of those layers, nothing outside.
+#[test]
+fn fixed_height_streams_every_layer_of_the_generator() {
+    let generator = TerrainGenerator::default();
+    let layers = generator.vertical_chunks();
+    let mut app = terrain_app_with(
+        Arc::new(TaskPoolExecutor),
+        WorldSettings {
+            vertical_bounds: Some(layers.clone()),
+            ..WorldSettings::default()
+        },
+    );
+    let viewer = app
+        .world_mut()
+        .spawn((
+            Transform::from_translation(column_center(0, 0)),
+            ChunkViewer::new(3).with_vertical_radius(u32::MAX),
+        ))
+        .id();
+    let events = settle(&mut app);
+    let stats = *app.world().resource::<WorldStats>();
+    assert_eq!(
+        stats.mesh_ready + stats.mesh_empty,
+        mesh_columns(3) * layers.clone().count()
+    );
+    let map = app.world().resource::<ChunkMap>();
+    assert!(map.iter().all(|(_, s)| layers.contains(&s.key.pos.y)));
+    assert_world_matches_direct(&app, &[]);
+    assert_replica_matches(&app, &last_meshes(&events));
+
+    // Moving up changes nothing: every layer is already wanted.
+    let chunks = stats.chunks;
+    app.world_mut()
+        .get_mut::<Transform>(viewer)
+        .expect("viewer")
+        .translation
+        .y = 2000.0;
+    let events = settle(&mut app);
+    assert!(events.is_empty(), "{} mesh events", events.len());
+    assert_eq!(app.world().resource::<WorldStats>().chunks, chunks);
 }

@@ -10,12 +10,21 @@ use std::ops::RangeInclusive;
 pub mod noise;
 
 /// A chunk generator.
+///
+/// The world has no height limit: it asks for chunks at any height around its viewers, so a
+/// generator must answer fast far above and below its terrain.
 pub trait WorldGenerator: Send + Sync + 'static {
     /// Generates the chunk at `key` (lod 0 in M0). Must be deterministic: same inputs, same output.
-    /// Must return `Uniform` storage for chunks entirely above/below the terrain (fast path).
+    /// Must return `Uniform` storage, without walking the voxels, for chunks entirely above or
+    /// below the terrain (fast path), at any height.
     fn generate(&self, key: ChunkKey, registry: &BlockRegistry) -> ChunkData;
-    /// Chunk-y range that may contain non-air blocks; outside it the world streams nothing.
-    fn vertical_chunks(&self) -> RangeInclusive<i32>;
+    /// Chunk-y range that may contain non-air blocks: every chunk outside it is uniform air. The
+    /// world creates those chunks as air without calling [`WorldGenerator::generate`] (they still
+    /// exist and can be edited: the range is not a height limit). The default,
+    /// `i32::MIN..=i32::MAX`, promises nothing.
+    fn vertical_chunks(&self) -> RangeInclusive<i32> {
+        i32::MIN..=i32::MAX
+    }
     /// Name for logs.
     fn name(&self) -> &str;
 }
@@ -56,6 +65,10 @@ impl WorldGenerator for FlatGenerator {
             })
             .collect();
         let y0 = i64::from(key.pos.origin().y);
+        if y0 + i64::from(CHUNK_SIZE) <= 0 || y0 >= self.total_height() {
+            // Fully below 0 or above the layers.
+            return ChunkData::uniform(BlockState::AIR);
+        }
         let mut column = [BlockState::AIR; CHUNK_SIZE as usize];
         for (ly, slot) in (0i64..).zip(column.iter_mut()) {
             let y = y0 + ly;
@@ -109,7 +122,7 @@ pub struct TerrainSettings {
     pub sand_level: i32,
     /// Columns above this height get snow on top.
     pub snow_level: i32,
-    /// Lowest generated y (bedrock); below is air (and out of `vertical_chunks`).
+    /// Lowest generated y (bedrock); below is air (and outside `vertical_chunks`).
     pub bottom: i32,
 }
 
@@ -134,8 +147,10 @@ const FBM_LACUNARITY: f64 = 2.0;
 const FBM_GAIN: f64 = 0.5;
 
 /// Heightmap terrain (fbm value noise): bedrock at `bottom`, stone, dirt, grass/sand/snow top.
-/// Per chunk: compute the 32x32 column heights once; return Uniform air above `max height`,
-/// Uniform stone fully below `min height - dirt_depth`.
+/// Per chunk: Uniform air above the highest possible column or below `bottom`, and Uniform
+/// stone below the lowest possible column minus `dirt_depth`, without computing heights;
+/// otherwise compute the 32x32 column heights once and return Uniform air above the chunk's
+/// highest column, Uniform stone fully below its lowest column minus `dirt_depth`.
 #[derive(Clone, Debug)]
 pub struct TerrainGenerator {
     /// World seed.
@@ -200,6 +215,13 @@ impl TerrainGenerator {
         s.base_height
             .saturating_add(f64::from(s.amplitude).abs().ceil() as i32)
     }
+
+    /// Lower bound of every column height: `base_height - ceil(|amplitude|)`.
+    fn min_possible_height(&self) -> i32 {
+        let s = &self.settings;
+        s.base_height
+            .saturating_sub(f64::from(s.amplitude).abs().ceil() as i32)
+    }
 }
 
 impl Default for TerrainGenerator {
@@ -219,9 +241,13 @@ impl WorldGenerator for TerrainGenerator {
         let origin = key.pos.origin();
         let y0 = origin.y;
         let y1 = y0 + (CHUNK_SIZE - 1);
-        // Fast paths that need no heights.
+        // Fast paths that need no heights: above every column, below the floor, and (the rule
+        // below with the lowest possible column) fully inside the stone.
         if y1 < s.bottom || y0 > self.max_possible_height().max(s.bottom) {
             return ChunkData::uniform(BlockState::AIR);
+        }
+        if y0 > s.bottom && y1 < self.min_possible_height().saturating_sub(s.dirt_depth) {
+            return ChunkData::uniform(block(registry, "boxel:stone", "TerrainGenerator"));
         }
         // Column heights, indexed like one y layer of the chunk: `x * 32 + z`.
         let heights = self.column_heights(origin.x, origin.z);

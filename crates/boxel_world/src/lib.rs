@@ -2,16 +2,23 @@
 //! [`ChunkMap`] resource (slotmap + hash index), as `Arc<ChunkData>` snapshots. Viewers are
 //! entities with `Transform` + [`ChunkViewer`].
 //!
+//! Each viewer wants a vertical cylinder of chunks around it ([`ChunkViewer`]: horizontal and
+//! vertical radius); the world has no height limit unless [`WorldSettings::vertical_bounds`] sets
+//! one.
+//!
 //! Per frame (in `Update`, chained [`WorldSystems`]):
-//! 1. `Interest`: compute the wanted set around viewers (data radius = mesh radius + 1, plus
-//!    every column next to a mesh column; unload beyond data radius + hysteresis), create/unload
-//!    slots, (re)prioritize the job queue.
+//! 1. `Interest`: when a viewer moves, list only the chunk positions whose interest changes (the
+//!    slabs entering and leaving), then create, update and unload slots within
+//!    [`WorldSettings::interest_budget`], nearest first; refresh the stale job priorities a batch
+//!    at a time.
 //! 2. `Edits`: apply [`EditQueue`] (copy-on-write, version bump, remesh center + touched face
 //!    neighbors, bump their `epoch`).
-//! 3. `Dispatch`: pop jobs by priority while in-flight < cap; run them on the
-//!    `AsyncComputeTaskPool` through a [`jobs::JobExecutor`].
-//! 4. `Collect`: drain results within a time budget; drop stale ones (slot generation, data
-//!    version, neighbor epoch, cancel flag); publish [`ChunkMeshEvent`]s.
+//! 3. `Dispatch`: collect finished jobs, then pop jobs by priority while in-flight < cap and run
+//!    them on the `AsyncComputeTaskPool` through a [`jobs::JobExecutor`]; repeated while results
+//!    keep arriving, within [`WorldSettings::job_budget`]. Stale results are dropped (slot
+//!    generation, data version, neighbor epoch, cancel flag).
+//! 4. `Collect`: publish mesh results as [`ChunkMeshEvent`]s, up to
+//!    [`WorldSettings::max_mesh_events_per_frame`].
 
 mod interest;
 mod map;

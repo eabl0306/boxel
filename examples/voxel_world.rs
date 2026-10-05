@@ -46,6 +46,9 @@ usage: voxel_world [GPU options] [options]
                           100x50 and check the surface follows (implies --frames 120)
   --seed N                terrain seed
   --view-distance N       mesh radius in chunks (default 12; 6 on a software adapter)
+  --vertical-radius N     vertical mesh radius in chunks, up and down (default 8)
+  --fixed-height          stream every layer of the generator and nothing else, whatever the
+                          camera height (boxel M0 streaming, for comparisons)
   --size WxH              window size in logical pixels (default 1280x720)
   --camera x,y,z,yaw,pitch  initial camera, degrees (default 0,120,0,45,-30)
   --simulate-device-loss N[,M..]  destroy the GPU device at frame N (recovery check; a
@@ -100,6 +103,8 @@ struct Options {
     resize_test: bool,
     seed: u64,
     view_distance: Option<u32>,
+    vertical_radius: u32,
+    fixed_height: bool,
     size: (u32, u32),
     camera: [f64; 5],
     /// Frames at which the device is destroyed, ascending.
@@ -129,6 +134,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         resize_test: false,
         seed: TerrainGenerator::default().seed,
         view_distance: None,
+        vertical_radius: ChunkViewer::DEFAULT_VERTICAL_RADIUS,
+        fixed_height: false,
         size: (1280, 720),
         camera: [0.0, 120.0, 0.0, 45.0, -30.0],
         simulate_device_loss: Vec::new(),
@@ -176,6 +183,14 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                         .ok_or_else(|| format!("{flag}: {radius} is not in 1..=64"))?,
                 );
             }
+            "--vertical-radius" => {
+                let radius = number(flag, &value()?)?;
+                o.vertical_radius = u32::try_from(radius)
+                    .ok()
+                    .filter(|r| *r <= 64)
+                    .ok_or_else(|| format!("{flag}: {radius} is not in 0..=64"))?;
+            }
+            "--fixed-height" => o.fixed_height = true,
             "--size" => {
                 let v = value()?;
                 o.size = v
@@ -518,7 +533,11 @@ fn spawn_camera(mut commands: Commands, run: Res<Run>) {
             pitch,
             ..FlyCamera::default()
         },
-        ChunkViewer { radius },
+        ChunkViewer::new(radius).with_vertical_radius(if o.fixed_height {
+            u32::MAX
+        } else {
+            o.vertical_radius
+        }),
     ));
 }
 
@@ -849,6 +868,10 @@ fn main() -> AppExit {
     } else {
         Arc::new(terrain)
     };
+    let world_settings = WorldSettings {
+        vertical_bounds: options.fixed_height.then(|| generator.vertical_chunks()),
+        ..WorldSettings::default()
+    };
     let mut plugins = DefaultPlugins
         .set(WindowPlugin {
             primary: WindowSettings {
@@ -872,6 +895,7 @@ fn main() -> AppExit {
         })
         .set(WorldPlugin {
             generator,
+            settings: world_settings,
             ..WorldPlugin::default()
         })
         .set(DebugOverlayPlugin {

@@ -534,8 +534,10 @@ dependencies = [
  "boxel_transform",
  "boxel_voxel",
  "boxel_worldgen",
+ "criterion",
  "crossbeam-channel",
  "foldhash",
+ "proptest",
  "slotmap",
  "tracing",
 ]

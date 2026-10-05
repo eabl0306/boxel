@@ -1,6 +1,11 @@
 //! State machine tests: neighbor bookkeeping, stale results, the job contract, event budget and
 //! interest transitions (no ECS; fake mesher).
+//!
+//! Most tests use a fixed-height world (`vertical_bounds` = the generator's range, every layer
+//! wanted), as boxel M0 streamed; the `tall_*` tests and the property test cover the unbounded
+//! one.
 use super::*;
+use crate::interest::MAX_RADIUS;
 use crate::jobs::InlineExecutor;
 use crate::tests::support::{HoldExecutor, LayerGen, fake_mesh, panicking_mesh};
 use crate::{BlockEdit, WorldStats};
@@ -8,6 +13,9 @@ use boxel_voxel::{BlockPos, CHUNK_VOLUME, neighbor_index};
 use boxel_worldgen::WorldGenerator;
 
 const STONE: BlockState = BlockState(1);
+
+/// A viewer chunk and its horizontal radius (every layer of the vertical bounds is wanted).
+type ViewerChunk = (ChunkPos, u32);
 
 struct Harness {
     map: ChunkMap,
@@ -24,20 +32,32 @@ impl Harness {
         max_in_flight: usize,
     ) -> Self {
         let registry = Arc::new(BlockRegistry::default_blocks());
+        let settings = WorldSettings {
+            vertical_bounds: Some(generator.vertical_chunks()),
+            interest_budget: Duration::MAX,
+            job_budget: Duration::MAX,
+            ..WorldSettings::default()
+        };
         let content = WorldContent {
             generator: Arc::new(generator),
             materials: Arc::new(MaterialTable::from_registry(&registry)),
             registry,
         };
-        let mut jobs = WorldJobs::new(max_in_flight, executor);
+        let mut jobs = WorldJobs::new(max_in_flight, 1, executor);
         jobs.mesh_fn = fake_mesh;
         Self {
             map: ChunkMap::default(),
             jobs,
             content,
-            settings: WorldSettings::default(),
+            settings,
             events: Vec::new(),
         }
+    }
+
+    /// The same world without a height limit.
+    fn tall(mut self) -> Self {
+        self.settings.vertical_bounds = None;
+        self
     }
 
     fn with<R>(&mut self, f: impl FnOnce(&mut WorldJobs, &mut Ctx<'_>, &WorldSettings) -> R) -> R {
@@ -45,8 +65,20 @@ impl Harness {
         f(&mut self.jobs, &mut cx, &self.settings)
     }
 
+    /// Viewers with every layer of the bounds (ids by position in the list), applied fully.
     fn interest(&mut self, viewers: &[ViewerChunk]) {
+        let viewers: Vec<(u64, Viewer)> = (0u64..)
+            .zip(viewers)
+            .map(|(id, &(c, r))| (id, Viewer::new(c, r, MAX_RADIUS)))
+            .collect();
+        self.viewers(&viewers);
+    }
+
+    /// Applies `viewers` (sorted by id) fully.
+    fn viewers(&mut self, viewers: &[(u64, Viewer)]) {
         self.with(|jobs, cx, settings| jobs.update_interest(cx, settings, viewers));
+        assert_eq!(self.jobs.interest_backlog(), 0, "unlimited budget");
+        assert_eq!(self.jobs.scheduler.stale(), 0);
     }
 
     fn dispatch(&mut self) {
@@ -778,3 +810,42 @@ fn empty_mesh_is_redone_after_a_neighbor_reloads() {
     assert!(upserted(&h.take_events()).contains(&ChunkPos::new(1, 0, 0)));
     h.check_published();
 }
+
+#[test]
+fn auto_cap_keeps_workers_busy_for_one_and_a_half_frames() {
+    // 144 Hz, 60 us jobs, 6 workers: 6 x ceil(1.5 x 6.94 ms / 60 us) = 6 x 174.
+    assert_eq!(auto_cap(6, 1.0 / 144.0, 60e-6), 6 * 174);
+    // An uncapped loop (4000 updates/s).
+    assert_eq!(auto_cap(6, 0.25e-3, 60e-6), 6 * 7);
+    // At least 2 per worker, at most MAX_AUTO_IN_FLIGHT.
+    assert_eq!(auto_cap(4, 1e-6, 1e-3), 8);
+    assert_eq!(auto_cap(8, 1.0, 1e-6), MAX_AUTO_IN_FLIGHT);
+    assert_eq!(auto_cap(0, 0.0, 0.0), 2);
+
+    // The averages follow the measurements.
+    let mut cap = AutoCap::new(4);
+    let t0 = Instant::now();
+    for i in 0..64 {
+        cap.observe_frame(t0 + Duration::from_millis(10 * i));
+        cap.observe_job(Duration::from_micros(100));
+    }
+    assert!((cap.frame - 0.010).abs() < 1e-4, "{}", cap.frame);
+    assert!((cap.job - 100e-6).abs() < 20e-6, "{}", cap.job);
+    assert_eq!(cap.cap(), auto_cap(4, cap.frame, cap.job));
+    // A hitch counts as 33 ms at most.
+    cap.observe_frame(t0 + Duration::from_secs(60));
+    assert!(cap.frame < 0.0135, "{}", cap.frame);
+}
+
+#[test]
+fn the_cap_follows_the_settings_every_frame() {
+    let mut h = surface_world(Arc::new(InlineExecutor));
+    h.settings.max_jobs_in_flight = 5;
+    h.jobs.begin_frame(&h.settings, Instant::now());
+    assert_eq!(h.jobs.scheduler.max_in_flight(), 5);
+    h.settings.max_jobs_in_flight = 0;
+    h.jobs.begin_frame(&h.settings, Instant::now());
+    assert_eq!(h.jobs.scheduler.max_in_flight(), h.jobs.auto_cap.cap());
+}
+
+mod tall;

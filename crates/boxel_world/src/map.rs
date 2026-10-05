@@ -26,7 +26,7 @@ pub enum DataState {
     Generating,
     /// Data available.
     Ready(Arc<ChunkData>),
-    /// Outside the generator's vertical range: permanently air, never generated.
+    /// Generation failed: permanently air.
     Missing,
 }
 
@@ -111,12 +111,20 @@ pub struct WorldStats {
     pub queued_jobs: usize,
     /// Jobs running.
     pub in_flight: usize,
+    /// Viewer changes not applied yet (chunk positions and work lists waiting for the interest
+    /// budget); 0 when every wanted chunk has a slot.
+    pub interest_backlog: usize,
 }
 
 impl WorldStats {
-    /// Nothing queued or running: everything wanted is generated and meshed.
+    /// Nothing queued or running and no viewer change pending: everything wanted is generated
+    /// and meshed.
     pub fn is_settled(&self) -> bool {
-        self.generating == 0 && self.meshing == 0 && self.queued_jobs == 0 && self.in_flight == 0
+        self.generating == 0
+            && self.meshing == 0
+            && self.queued_jobs == 0
+            && self.in_flight == 0
+            && self.interest_backlog == 0
     }
 }
 
@@ -171,8 +179,8 @@ impl ChunkMap {
             _ => None,
         })
     }
-    /// Slot-based counters (`queued_jobs` and `in_flight` are 0 here; the `WorldStats` resource
-    /// has them).
+    /// Slot-based counters (`queued_jobs`, `in_flight` and `interest_backlog` are 0 here; the
+    /// `WorldStats` resource has them).
     pub fn stats(&self) -> WorldStats {
         let mut stats = WorldStats {
             chunks: self.slots.len(),

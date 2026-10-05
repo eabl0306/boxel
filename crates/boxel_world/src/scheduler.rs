@@ -45,9 +45,17 @@ pub struct QueuedJob {
 
 /// Min-priority queue + in-flight accounting. Duplicate (id, kind) entries are tolerated; the
 /// dispatcher re-validates slot state when popping.
+///
+/// Priorities depend on where the viewers are, so they go stale when a viewer moves. Instead of
+/// rebuilding the whole heap in one frame, [`JobScheduler::invalidate_priorities`] moves every
+/// queued job to a stale heap (O(1) when nothing was stale yet) and
+/// [`JobScheduler::refresh_priorities`] recomputes them a batch at a time, nearest under the old
+/// priorities first. [`JobScheduler::pop_ready`] takes refreshed jobs first and falls back to the
+/// stale ones.
 #[derive(Debug, Default)]
 pub struct JobScheduler {
     heap: BinaryHeap<Reverse<(u32, u64, ChunkId, u8)>>,
+    stale: BinaryHeap<Reverse<(u32, u64, ChunkId, u8)>>,
     next_seq: u64,
     in_flight: usize,
     max_in_flight: usize,
@@ -67,12 +75,16 @@ impl JobScheduler {
         self.next_seq = self.next_seq.wrapping_add(1);
         self.heap.push(Reverse((priority, seq, id, kind.code())));
     }
-    /// Pops the best job if below the in-flight cap (and counts it as in flight).
+    /// Pops the best job if below the in-flight cap (and counts it as in flight): refreshed jobs
+    /// first, then stale ones (in their old order).
     pub fn pop_ready(&mut self) -> Option<QueuedJob> {
         if self.in_flight >= self.max_in_flight {
             return None;
         }
-        let Reverse((priority, seq, id, code)) = self.heap.pop()?;
+        let Reverse((priority, seq, id, code)) = match self.heap.pop() {
+            Some(job) => job,
+            None => self.stale.pop()?,
+        };
         self.in_flight += 1;
         Some(QueuedJob {
             priority,
@@ -85,21 +97,48 @@ impl JobScheduler {
     pub fn complete(&mut self) {
         self.in_flight = self.in_flight.saturating_sub(1);
     }
-    /// Rebuilds priorities (`f` returns `None` to drop a job). Called when a viewer changes chunk.
-    /// Insertion order (`seq`) is kept, so ties stay FIFO.
-    pub fn reprioritize(&mut self, mut f: impl FnMut(ChunkId, JobKind) -> Option<u32>) {
-        let mut jobs = std::mem::take(&mut self.heap).into_vec();
-        jobs.retain_mut(|Reverse((priority, _, id, code))| {
-            f(*id, JobKind::from_code(*code)).is_some_and(|p| {
-                *priority = p;
-                true
-            })
-        });
-        self.heap = BinaryHeap::from(jobs);
+    /// Marks every queued priority stale (the viewers changed); see
+    /// [`JobScheduler::refresh_priorities`].
+    pub fn invalidate_priorities(&mut self) {
+        if self.stale.is_empty() {
+            std::mem::swap(&mut self.heap, &mut self.stale);
+        } else {
+            self.stale.append(&mut self.heap);
+        }
     }
-    /// Jobs waiting.
+    /// Recomputes up to `max` stale priorities with `f` (`None` drops the job), nearest under the
+    /// old priorities first. Insertion order (`seq`) is kept, so ties stay FIFO. Returns how many
+    /// were processed.
+    pub fn refresh_priorities(
+        &mut self,
+        max: usize,
+        mut f: impl FnMut(ChunkId, JobKind) -> Option<u32>,
+    ) -> usize {
+        let mut done = 0;
+        while done < max {
+            let Some(Reverse((_, seq, id, code))) = self.stale.pop() else {
+                break;
+            };
+            if let Some(priority) = f(id, JobKind::from_code(code)) {
+                self.heap.push(Reverse((priority, seq, id, code)));
+            }
+            done += 1;
+        }
+        done
+    }
+    /// Rebuilds every priority at once (`f` returns `None` to drop a job). Insertion order
+    /// (`seq`) is kept, so ties stay FIFO.
+    pub fn reprioritize(&mut self, f: impl FnMut(ChunkId, JobKind) -> Option<u32>) {
+        self.invalidate_priorities();
+        self.refresh_priorities(usize::MAX, f);
+    }
+    /// Jobs waiting (refreshed and stale).
     pub fn queued(&self) -> usize {
-        self.heap.len()
+        self.heap.len() + self.stale.len()
+    }
+    /// Jobs waiting whose priority is stale.
+    pub fn stale(&self) -> usize {
+        self.stale.len()
     }
     /// Jobs running.
     pub fn in_flight(&self) -> usize {
@@ -108,6 +147,10 @@ impl JobScheduler {
     /// Cap.
     pub fn max_in_flight(&self) -> usize {
         self.max_in_flight
+    }
+    /// Changes the cap (>= 1). Jobs already in flight above a lower cap finish normally.
+    pub fn set_max_in_flight(&mut self, max_in_flight: usize) {
+        self.max_in_flight = max_in_flight.max(1);
     }
 }
 
@@ -220,5 +263,62 @@ mod tests {
                 (id[0], JobKind::Generate, 5),
             ]
         );
+    }
+
+    #[test]
+    fn stale_priorities_refresh_in_batches() {
+        let id = ids(5);
+        let mut s = JobScheduler::new(8);
+        for (i, &chunk) in id.iter().enumerate() {
+            s.push(chunk, JobKind::Generate, i as u32);
+        }
+        s.invalidate_priorities();
+        assert_eq!((s.queued(), s.stale()), (5, 5));
+        // New jobs go to the refreshed heap.
+        let extra = ids(6)[5];
+        s.push(extra, JobKind::Mesh, 50);
+        // Batch of 2, old order: id[0] and id[1] get new priorities (reversed), id[1] is dropped.
+        let n = s.refresh_priorities(2, |i, _| (i != id[1]).then_some(100));
+        assert_eq!((n, s.queued(), s.stale()), (2, 5, 3));
+        // Refreshed jobs pop first (extra at 50, id[0] at 100), then the stale ones in old order.
+        let order: Vec<(ChunkId, u32)> = drain(&mut s).into_iter().map(|j| (j.0, j.2)).collect();
+        assert_eq!(
+            order,
+            vec![
+                (extra, 50),
+                (id[0], 100),
+                (id[2], 2),
+                (id[3], 3),
+                (id[4], 4)
+            ]
+        );
+        // A second invalidation while jobs are still stale merges both heaps.
+        s.push(id[0], JobKind::Generate, 1);
+        s.invalidate_priorities();
+        s.push(id[1], JobKind::Generate, 2);
+        s.invalidate_priorities();
+        assert_eq!(s.stale(), 2);
+        assert_eq!(s.refresh_priorities(usize::MAX, |_, _| Some(0)), 2);
+        assert_eq!(s.stale(), 0);
+        // FIFO among equal refreshed priorities.
+        let order: Vec<ChunkId> = drain(&mut s).into_iter().map(|j| j.0).collect();
+        assert_eq!(order, vec![id[0], id[1]]);
+    }
+
+    #[test]
+    fn cap_can_change() {
+        let id = ids(3);
+        let mut s = JobScheduler::new(1);
+        for &i in &id {
+            s.push(i, JobKind::Generate, 1);
+        }
+        assert!(s.pop_ready().is_some());
+        assert!(s.pop_ready().is_none());
+        s.set_max_in_flight(3);
+        assert!(s.pop_ready().is_some());
+        assert!(s.pop_ready().is_some());
+        s.set_max_in_flight(0);
+        assert_eq!(s.max_in_flight(), 1);
+        assert_eq!(s.in_flight(), 3, "running jobs are not affected");
     }
 }
