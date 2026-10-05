@@ -44,18 +44,24 @@ just run voxel_world --tier mid
 Controles: clic izquierdo captura el mouse, Escape lo suelta. WASD para moverse, Espacio sube,
 Shift izquierdo baja, Ctrl izquierdo acelera.
 
-Opciones útiles: `--seed N`, `--view-distance N` (en chunks), `--size 1280x720`,
-`--camera x,y,z,yaw,pitch` (ángulos en grados), `--tier high|mid|low`, `--help` (lista todo).
+Opciones útiles: `--seed N`, `--view-distance N` (en chunks), `--vertical-radius N` (chunks
+hacia arriba y hacia abajo, 8 por defecto), `--size 1280x720`, `--camera x,y,z,yaw,pitch` (ángulos
+en grados), `--tier high|mid|low`, `--help` (lista todo).
 Para pruebas automáticas usa siempre `--frames N --timeout SEG`: la ventana se cierra sola.
 `--wait-chunks` empieza a contar frames cuando el terreno terminó de cargar y
 `--screenshot shot.png` guarda una captura en el frame N.
 
 **headless_world**: sin ventana ni GPU. Genera y mallea el mundo alrededor de un punto e imprime
-cuántos chunks y quads salieron. Sirve en CI.
+cuántos chunks y quads salieron y cuánto tardó. Sirve en CI y para medir la carga.
 
 ```bash
 cargo run --release --example headless_world
+just run headless_world --view-distance 32 --hz 144 --speed 256
 ```
+
+Opciones: `--view-distance N`, `--vertical-radius N`, `--hz N` (frames por segundo del bucle),
+`--speed V` (camina a V vóxeles/s después de cargar y mide los frames), `--fixed-height` (carga
+como M0, con el alto fijo del generador), `--help`.
 
 **gpu_info**: lista los adaptadores, cómo los clasifica boxel y qué elige.
 
