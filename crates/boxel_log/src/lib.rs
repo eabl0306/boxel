@@ -10,7 +10,14 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 /// Default filter when `RUST_LOG` is unset.
-pub const DEFAULT_FILTER: &str = "info,wgpu_core=warn,wgpu_hal=warn,naga=warn";
+///
+/// `sctk_adwaita=error`: winit's client-side decorations on Wayland (`sctk-adwaita`) warn about
+/// every button-layout entry they cannot draw. GNOME's default layout `":minimize,maximize,close"`
+/// has an empty left side, so every window prints `Ignoring unknown button type: ` (empty name).
+/// The crate's other warnings are cosmetic too (a layout without valid buttons falls back to the
+/// default one, out-of-range title pixels are skipped); its errors (settings portal timeout,
+/// font failures) still show.
+pub const DEFAULT_FILTER: &str = "info,wgpu_core=warn,wgpu_hal=warn,naga=warn,sctk_adwaita=error";
 
 /// Error from [`init_logging`].
 #[derive(Debug, thiserror::Error)]

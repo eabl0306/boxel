@@ -912,7 +912,9 @@ schedule `Shutdown` es el lugar para el `flush` final.
 ## 13. Diagnóstico y profiling
 
 - Logs: `tracing` + `tracing-subscriber` (`RUST_LOG`, filtro por defecto
-  `info,wgpu_core=warn,wgpu_hal=warn,naga=warn`), puente de `log`.
+  `info,wgpu_core=warn,wgpu_hal=warn,naga=warn,sctk_adwaita=error`), puente de `log`. El
+  último silencia los avisos cosméticos de las decoraciones de ventana de winit en Wayland
+  (`Ignoring unknown button type`, por el layout de botones de GNOME); sus errores siguen saliendo.
 - Nombres en los diagnósticos del ECS: feature `debug` de la fachada (activa por defecto).
 - `FrameStats` (frame time, EMA, fps, peor frame) y `DiagnosticsBoard` con líneas nombradas:
   `gpu` (resumen de selección), `render` (tier, chunks, quads, draws, visibles, descartados),
