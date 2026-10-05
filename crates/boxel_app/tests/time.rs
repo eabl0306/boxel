@@ -16,7 +16,7 @@ fn a_declared_stall_is_excluded_from_delta_but_not_from_real_delta() {
     time.update_with_instant(t0);
     assert_eq!(
         (time.delta(), time.real_delta(), time.stall()),
-        (MS * 0, MS * 0, MS * 0)
+        (Duration::ZERO, Duration::ZERO, Duration::ZERO)
     );
 
     // A 180 ms GPU bring-up inside a 190 ms frame.
@@ -32,7 +32,7 @@ fn a_declared_stall_is_excluded_from_delta_but_not_from_real_delta() {
     time.update_with_instant(t0 + MS * 200);
     assert_eq!(
         (time.delta(), time.real_delta(), time.stall()),
-        (MS * 10, MS * 10, MS * 0)
+        (MS * 10, MS * 10, Duration::ZERO)
     );
     assert_eq!(time.elapsed(), MS * 20);
     assert_eq!(time.frame_count(), 3);
@@ -53,7 +53,7 @@ fn stalls_add_up_and_never_remove_more_than_the_interval() {
     time.update_with_instant(t0 + MS * 150);
     assert_eq!(
         (time.delta(), time.real_delta(), time.stall()),
-        (MS * 0, MS * 50, MS * 50)
+        (Duration::ZERO, MS * 50, MS * 50)
     );
 }
 
@@ -82,9 +82,13 @@ fn a_stall_declared_before_the_first_update_is_dropped() {
     let mut time = Time::new(t0);
     time.declare_stall(MS * 50);
     time.update_with_instant(t0 + MS * 60);
-    assert_eq!(time.delta(), MS * 0, "the first delta is always zero");
+    assert_eq!(
+        time.delta(),
+        Duration::ZERO,
+        "the first delta is always zero"
+    );
     time.update_with_instant(t0 + MS * 76);
-    assert_eq!((time.delta(), time.stall()), (MS * 16, MS * 0));
+    assert_eq!((time.delta(), time.stall()), (MS * 16, Duration::ZERO));
 }
 
 // ---------------------------------------------------------------- the fixed loop
