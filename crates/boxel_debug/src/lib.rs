@@ -498,6 +498,37 @@ mod tests {
     }
 
     #[test]
+    fn lines_show_position_chunk_and_facing() {
+        let inputs = OverlayInputs {
+            camera: Some((
+                DVec3::new(-1.5, 70.25, 33.0),
+                boxel_math::Vec3::new(1.0, 0.0, 0.0),
+            )),
+            world: Some(WorldStats::default()),
+            ..OverlayInputs::default()
+        };
+        let lines = overlay_lines(&inputs);
+        assert!(
+            lines.contains(&"XYZ -1.50 / 70.25 / 33.00".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("Chunk -1 2 1")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("Facing east (yaw 90.0")),
+            "{lines:?}"
+        );
+        assert_eq!(cardinal(0.0), "north");
+        assert_eq!(cardinal(359.0), "north");
+        assert_eq!(cardinal(180.0), "south");
+        assert_eq!(cardinal(270.0), "west");
+        assert_eq!(cardinal(314.999_999), "north");
+        assert_eq!(shorten(&"x".repeat(80)).len(), MAX_NAME);
+    }
+
+    #[test]
     fn present_window_measures_shown_frames_over_one_second() {
         let mut window = PresentWindow::default();
         assert_eq!(window.fps(), 0.0);
