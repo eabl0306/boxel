@@ -9,7 +9,7 @@ pub struct ViewUniform {
     pub view_proj: [[f32; 4]; 4],
     /// Frustum planes (left, right, bottom, top, near, far), camera-relative.
     pub frustum: [[f32; 4]; 6],
-    /// xyz = render origin (voxels), w = 0.
+    /// xyz = render origin (voxels), low 32 bits of the `i64` value (wrapping), w = 0.
     pub render_origin: [i32; 4],
     /// xyz = eye relative to render origin, w = 0.
     pub camera_rel: [f32; 4],
@@ -27,7 +27,9 @@ pub struct ViewUniform {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct ChunkGpu {
-    /// World voxel coordinates of the chunk min corner (absolute).
+    /// World voxel coordinates of the chunk min corner, low 32 bits of the `i64` value (wrapping).
+    /// The shaders only use it minus `ViewUniform::render_origin` (wrapping too), which is exact
+    /// for chunks less than `2^31` voxels from the camera.
     pub origin: [i32; 3],
     /// First quad of bucket 0 in the arena (buckets are contiguous, `boxel_mesh` order).
     pub quad_base: u32,
@@ -59,7 +61,7 @@ pub struct DrawRef {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct ChunkImmediate {
-    /// xyz = world voxel origin, w = 0.
+    /// xyz = world voxel origin (low 32 bits, like [`ChunkGpu::origin`]), w = 0.
     pub origin: [i32; 4],
 }
 

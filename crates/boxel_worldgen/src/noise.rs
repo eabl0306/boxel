@@ -71,12 +71,34 @@ fn value_noise_mixed(mixed_seed: u64, x: f64, z: f64) -> f64 {
     interpolate(corners(mixed_seed, x0, z0), tx, tz)
 }
 
+/// The [`splitmix64`] finalizer without the increment: a bijective 64-bit mix with `mix(0) = 0`.
+#[inline]
+const fn mix(x: u64) -> u64 {
+    let mut z = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// How many times `2^32` separate `v` from the `i32` its low 32 bits sign-extend to, as a 32-bit
+/// pattern: 0 exactly when `v` fits in `i32`. With the low 32 bits it determines `v` (a
+/// bijection of `i64` onto `(u32, u32)`).
+#[inline]
+const fn excess(v: i64) -> u32 {
+    // `v - sext(low)` is a multiple of 2^32 (mod 2^64), so the shift is exact.
+    (v.wrapping_sub(v as i32 as i64) >> 32) as u32
+}
+
 /// 32-bit hash of `(seed, x, z)` (e.g. a SplitMix64/xxhash-style mix).
 ///
-/// `SplitMix64(SplitMix64(seed) ^ (x << 32 | z))` truncated to the low 32 bits, with `x` and `z`
-/// taken as their `u32` bit patterns.
-pub fn hash2(seed: u64, x: i32, z: i32) -> u32 {
-    lattice_hash(splitmix64(seed), x, z)
+/// `SplitMix64(SplitMix64(seed) ^ mix(e) ^ (x << 32 | z))` truncated to the low 32 bits, with the
+/// low 32 bits of `x` and `z` in the key and `e = excess(x) << 32 | excess(z)` (what is left of
+/// `x` and `z` above `i32`, 0 inside it). The lattice point maps injectively to `(e, key)`;
+/// `mix` is bijective with `mix(0) = 0`, so every point inside `i32` hashes exactly as the
+/// former `(seed, i32, i32)` version and each `2^32 x 2^32` tile beyond gets an unrelated seed
+/// (no repetition with a period of `2^32`).
+pub fn hash2(seed: u64, x: i64, z: i64) -> u32 {
+    let e = ((excess(x) as u64) << 32) | excess(z) as u64;
+    lattice_hash(splitmix64(seed) ^ mix(e), x as i32, z as i32)
 }
 
 /// 2D value noise in `[-1, 1]`: smoothstep-interpolated lattice values.
@@ -236,6 +258,98 @@ mod tests {
     }
 
     #[test]
+    fn hash2_is_unchanged_inside_i32() {
+        // The former `hash2(seed, x: i32, z: i32)`, spelled out.
+        let old = |seed: u64, x: i32, z: i32| {
+            splitmix64(splitmix64(seed) ^ ((x as u32 as u64) << 32 | z as u32 as u64)) as u32
+        };
+        let edges = [
+            0,
+            1,
+            -1,
+            7,
+            -3,
+            1 << 30,
+            -(1 << 30),
+            i32::MAX,
+            i32::MIN,
+            i32::MAX - 1,
+        ];
+        for seed in [0, 7, 42, 0x00b0_7e1d ^ 0x007e_e50f_b0e1, u64::MAX] {
+            for x in edges {
+                for z in edges {
+                    let h = hash2(seed, i64::from(x), i64::from(z));
+                    assert_eq!(h, old(seed, x, z), "seed {seed:#x} ({x}, {z})");
+                }
+            }
+        }
+        // Recorded with the i32 API before the change.
+        for (seed, x, z, h) in [
+            (0x0, 0, 0, 0x4d19_7e6f),
+            (0x7, -3, 12, 0x92b2_2bbf),
+            (0x2a, 2_147_483_647, -2_147_483_648, 0xf266_2151),
+            (0x7e_e5bf_cefc, -268_435_456, 268_435_455, 0xdba8_76dd),
+            (u64::MAX, -1, -1, 0x67a4_7936),
+            (0x3039, 1_073_741_824, -1_073_741_824, 0xe7b7_b5e4),
+            (0x63, -2_147_483_648, 2_147_483_647, 0x76a0_c215),
+        ] {
+            assert_eq!(hash2(seed, x, z), h, "seed {seed:#x} ({x}, {z})");
+        }
+    }
+
+    #[test]
+    fn hash2_key_is_injective_past_i32() {
+        // (low 32 bits, excess) determines the value: the excess is 0 exactly inside i32 and
+        // differs for values 2^32 apart.
+        let values = [
+            0,
+            -1,
+            i64::from(i32::MAX),
+            i64::from(i32::MIN),
+            1 << 31,
+            -(1 << 31) - 1,
+            1 << 32,
+            -(1 << 32),
+            (1 << 32) + 5,
+            1 << 40,
+            -(1 << 40),
+            1 << 61,
+            i64::MAX,
+            i64::MIN,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for v in values {
+            let low = v as i32;
+            let e = excess(v);
+            assert_eq!(e == 0, i32::try_from(v).is_ok(), "{v}");
+            // Inverse: sext(low) + e * 2^32 (mod 2^64).
+            let back = i64::from(low).wrapping_add((i64::from(e as i32)) << 32);
+            assert_eq!(back, v);
+            assert!(seen.insert((low, e)), "{v} collides");
+        }
+        // Points 2^32 apart (the period the low bits alone would have) hash differently, and so
+        // do the four points that share their low bits around the origin.
+        for (x, z) in [
+            (0i64, 0i64),
+            (-3, 12),
+            (1 << 31, -(1 << 31)),
+            (1 << 40, 1 << 40),
+        ] {
+            let hashes = [
+                hash2(7, x, z),
+                hash2(7, x + (1 << 32), z),
+                hash2(7, x, z + (1 << 32)),
+                hash2(7, x - (1 << 32), z - (1 << 32)),
+            ];
+            for (i, a) in hashes.iter().enumerate() {
+                for b in &hashes[i + 1..] {
+                    assert_ne!(a, b, "({x}, {z})");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn hash2_bits_are_balanced() {
         // Each output bit should be set about half of the time over a block of the lattice.
         let mut ones = [0u32; 32];
@@ -256,8 +370,9 @@ mod tests {
 
     #[test]
     fn value_noise_hits_lattice_values_and_stays_in_range() {
-        for (x, z) in [(0, 0), (-5, 9), (123, -456)] {
-            let expected = f64::from(hash2(3, x, z)) / f64::from(u32::MAX) * 2.0 - 1.0;
+        for (x, z) in [(0i32, 0i32), (-5, 9), (123, -456)] {
+            let expected =
+                f64::from(hash2(3, x.into(), z.into())) / f64::from(u32::MAX) * 2.0 - 1.0;
             assert_eq!(value_noise_2d(3, f64::from(x), f64::from(z)), expected);
         }
         let mut min = f64::MAX;

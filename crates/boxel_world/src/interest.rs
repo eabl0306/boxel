@@ -17,7 +17,7 @@
 //! first; a viewer that leaves or jumps far lists its old keep region. The caller re-evaluates
 //! each listed position against the current viewers, within a time budget.
 use crate::Interest;
-use boxel_voxel::ChunkPos;
+use boxel_voxel::{ChunkPos, MAX_CHUNK_COORD};
 use std::collections::VecDeque;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -26,9 +26,10 @@ use std::sync::Arc;
 /// 131 km) so the column math can never overflow; real view distances are far smaller.
 pub(crate) const MAX_RADIUS: u32 = 4096;
 
-/// Viewer centers are clamped to `+-MAX_CENTER` chunks per axis, so every offset position fits in
-/// `i32` (block positions only reach `+-2^26` chunks anyway).
-const MAX_CENTER: i32 = 1 << 28;
+/// Viewer centers are clamped to the world limit (`+-MAX_CHUNK_COORD` = `+-2^56` chunks per
+/// axis), so every position the planner lists (center +- at most `2 * MAX_RADIUS + 1` chunks) and
+/// every difference between them stays far inside `i64`, and so do their voxel origins.
+const MAX_CENTER: i64 = MAX_CHUNK_COORD;
 
 /// Rows a [`Task`] scans per [`Task::fill`] call when they produce nothing (bounds one call).
 const ROWS_PER_FILL: usize = 256;
@@ -44,7 +45,7 @@ const MAX_CAPACITY_HINT: usize = 1 << 18;
 
 /// Viewer moves up to this many chunks per axis (same radii) are diffed row by row; longer jumps
 /// re-list the new data region nearest first and then the old keep region.
-const SMALL_MOVE: i64 = 4;
+const SMALL_MOVE: u64 = 4;
 
 /// One viewer as the world sees it: its chunk, horizontal mesh radius and vertical mesh radius
 /// (in chunks, clamped to [`MAX_RADIUS`]).
@@ -59,9 +60,10 @@ pub(crate) struct Viewer {
 }
 
 impl Viewer {
-    /// A viewer with clamped radii and center.
+    /// A viewer with clamped radii and center (a viewer past the world limit streams the chunks
+    /// at the limit).
     pub(crate) fn new(center: ChunkPos, radius: u32, vertical: u32) -> Self {
-        let clamp = |v: i32| v.clamp(-MAX_CENTER, MAX_CENTER);
+        let clamp = |v: i64| v.clamp(-MAX_CENTER, MAX_CENTER);
         Self {
             center: ChunkPos::new(clamp(center.x), clamp(center.y), clamp(center.z)),
             radius: radius.min(MAX_RADIUS),
@@ -150,7 +152,7 @@ impl Columns {
 
     /// `[mesh, data, keep]` half widths of row `dz` (all `-1` outside the table).
     fn row(&self, dz: i64) -> [i64; 3] {
-        if dz.abs() > self.extent {
+        if dz.saturating_abs() > self.extent {
             return [-1; 3];
         }
         self.widths[usize::try_from(dz + self.extent).expect("row inside the table")]
@@ -159,7 +161,7 @@ impl Columns {
     /// Level of the column at offset `(dx, dz)`.
     pub(crate) fn level(&self, dx: i64, dz: i64) -> Level {
         let [mesh, data, keep] = self.row(dz);
-        let dx = dx.abs();
+        let dx = dx.saturating_abs();
         if dx <= mesh {
             Level::Mesh
         } else if dx <= data {
@@ -193,9 +195,9 @@ impl Shape {
         i64::from(self.columns.hysteresis)
     }
 
-    /// Level of the layer `y`.
+    /// Level of the layer `y` (any `i64`: the distance saturates, far layers are out).
     fn layer(&self, y: i64) -> Level {
-        let dy = (y - i64::from(self.viewer.center.y)).abs();
+        let dy = y.saturating_sub(self.viewer.center.y).saturating_abs();
         let (v, h) = (self.vertical(), self.hysteresis());
         if dy <= v {
             Level::Mesh
@@ -208,17 +210,17 @@ impl Shape {
         }
     }
 
-    /// Level of `pos` for this viewer alone (vertical bounds not applied).
+    /// Level of `pos` for this viewer alone (vertical bounds not applied). Any position works:
+    /// offsets saturate, and saturated offsets are out of every table.
     pub(crate) fn level(&self, pos: ChunkPos) -> Level {
         let c = self.viewer.center;
-        let layer = self.layer(i64::from(pos.y));
+        let layer = self.layer(pos.y);
         if layer == Level::Out {
             return Level::Out;
         }
-        let column = self.columns.level(
-            i64::from(pos.x) - i64::from(c.x),
-            i64::from(pos.z) - i64::from(c.z),
-        );
+        let column = self
+            .columns
+            .level(pos.x.saturating_sub(c.x), pos.z.saturating_sub(c.z));
         layer.min(column)
     }
 
@@ -226,8 +228,9 @@ impl Shape {
     /// row `(y, z)`; `None` = empty.
     fn row(&self, y: i64, z: i64) -> [Option<(i64, i64)>; 3] {
         let layer = self.layer(y);
-        let widths = self.columns.row(z - i64::from(self.viewer.center.z));
-        let cx = i64::from(self.viewer.center.x);
+        // Rows come from the keep rows of a clamped center: no overflow.
+        let widths = self.columns.row(z - self.viewer.center.z);
+        let cx = self.viewer.center.x;
         let mut out = [None; 3];
         for (i, (slot, level)) in out
             .iter_mut()
@@ -243,32 +246,39 @@ impl Shape {
     }
 
     /// Layers that may hold a keep position, clipped to `bounds`.
-    fn keep_layers(&self, bounds: Option<&RangeInclusive<i32>>) -> (i64, i64) {
+    fn keep_layers(&self, bounds: Option<&RangeInclusive<i64>>) -> (i64, i64) {
         let reach = self.vertical() + 1 + self.hysteresis();
-        clip(i64::from(self.viewer.center.y), reach, bounds)
+        clip(self.viewer.center.y, reach, bounds)
     }
 
     /// Rows `z` that may hold a keep position.
     fn keep_rows(&self) -> (i64, i64) {
-        let cz = i64::from(self.viewer.center.z);
+        let cz = self.viewer.center.z;
         (cz - self.columns.extent, cz + self.columns.extent)
     }
 }
 
-/// `center +- reach`, clipped to `bounds`; empty (`lo > hi`) if they do not meet.
-fn clip(center: i64, reach: i64, bounds: Option<&RangeInclusive<i32>>) -> (i64, i64) {
+/// `center +- reach`, clipped to `bounds`; empty (`lo > hi`) if they do not meet. `center` is a
+/// clamped viewer center and `reach` at most `2 * MAX_RADIUS + 1`: no overflow.
+fn clip(center: i64, reach: i64, bounds: Option<&RangeInclusive<i64>>) -> (i64, i64) {
     let (mut lo, mut hi) = (center - reach, center + reach);
     if let Some(b) = bounds {
-        lo = lo.max(i64::from(*b.start()));
-        hi = hi.min(i64::from(*b.end()));
+        lo = lo.max(*b.start());
+        hi = hi.min(*b.end());
     }
     (lo, hi)
 }
 
-/// `ChunkPos` from in-range `i64` coordinates (viewer centers are clamped, so offsets fit).
+/// `ChunkPos` of a listed position (a clamped center plus a bounded offset: inside the world
+/// limit grown by the reach, so its origin fits in `i64` too).
 fn pos(x: i64, y: i64, z: i64) -> ChunkPos {
-    let narrow = |v: i64| i32::try_from(v).expect("interest positions fit in i32");
-    ChunkPos::new(narrow(x), narrow(y), narrow(z))
+    debug_assert!(
+        [x, y, z]
+            .iter()
+            .all(|v| v.unsigned_abs() <= MAX_CENTER.unsigned_abs() + 2 * u64::from(MAX_RADIUS) + 2),
+        "interest position ({x}, {y}, {z}) outside the clamped reach"
+    );
+    ChunkPos::new(x, y, z)
 }
 
 /// A cursor over the rows `(y, z)` of an inclusive box, `y` outer.
@@ -327,8 +337,8 @@ enum Task {
 }
 
 impl Task {
-    fn add(shape: Shape, bounds: Option<&RangeInclusive<i32>>) -> Self {
-        let cy = i64::from(shape.viewer.center.y);
+    fn add(shape: Shape, bounds: Option<&RangeInclusive<i64>>) -> Self {
+        let cy = shape.viewer.center.y;
         let layers = clip(cy, shape.vertical() + 1, bounds);
         let last_shell = if layers.0 > layers.1 {
             // The data layers are all outside the vertical bounds.
@@ -345,12 +355,12 @@ impl Task {
         }
     }
 
-    fn remove(shape: Shape, bounds: Option<&RangeInclusive<i32>>) -> Self {
+    fn remove(shape: Shape, bounds: Option<&RangeInclusive<i64>>) -> Self {
         let rows = Rows::new(shape.keep_layers(bounds), shape.keep_rows());
         Task::Remove { shape, rows }
     }
 
-    fn moved(from: Shape, to: Shape, bounds: Option<&RangeInclusive<i32>>) -> Self {
+    fn moved(from: Shape, to: Shape, bounds: Option<&RangeInclusive<i64>>) -> Self {
         let (a, b) = (from.keep_layers(bounds), to.keep_layers(bounds));
         let (c, d) = (from.keep_rows(), to.keep_rows());
         let rows = Rows::new((a.0.min(b.0), a.1.max(b.1)), (c.0.min(d.0), c.1.max(d.1)));
@@ -455,7 +465,7 @@ fn symmetric_difference(a: Option<(i64, i64)>, b: Option<(i64, i64)>) -> [Option
 /// Positions at data level or better on Chebyshev shell `d` around the viewer, within `layers`.
 fn add_shell(shape: &Shape, d: i64, (y0, y1): (i64, i64), out: &mut VecDeque<ChunkPos>) {
     let c = shape.viewer.center;
-    let (cx, cy, cz) = (i64::from(c.x), i64::from(c.y), i64::from(c.z));
+    let (cx, cy, cz) = (c.x, c.y, c.z);
     // Data columns never reach past radius + 1 in x or z.
     let ext = (i64::from(shape.viewer.radius) + 1).min(d);
     let mut push = |dx: i64, dy: i64, dz: i64| {
@@ -500,7 +510,7 @@ pub(crate) struct Planner {
     /// A plan was made (the first one starts from an empty world).
     planned: bool,
     hysteresis: u32,
-    bounds: Option<RangeInclusive<i32>>,
+    bounds: Option<RangeInclusive<i64>>,
     columns: Vec<Arc<Columns>>,
     tasks: VecDeque<Task>,
     pending: VecDeque<ChunkPos>,
@@ -512,7 +522,7 @@ impl Planner {
         &self,
         viewers: &[(u64, Viewer)],
         hysteresis: u32,
-        bounds: Option<&RangeInclusive<i32>>,
+        bounds: Option<&RangeInclusive<i64>>,
     ) -> bool {
         !self.planned
             || self.viewers != viewers
@@ -529,7 +539,7 @@ impl Planner {
         &mut self,
         viewers: &[(u64, Viewer)],
         hysteresis: u32,
-        bounds: Option<&RangeInclusive<i32>>,
+        bounds: Option<&RangeInclusive<i64>>,
         loaded: impl FnOnce() -> Vec<ChunkPos>,
     ) -> Option<u32> {
         if !self.changed(viewers, hysteresis, bounds) {
@@ -657,12 +667,12 @@ impl Planner {
     }
 
     /// The vertical bounds of the last plan.
-    pub(crate) fn bounds(&self) -> Option<&RangeInclusive<i32>> {
+    pub(crate) fn bounds(&self) -> Option<&RangeInclusive<i64>> {
         self.bounds.as_ref()
     }
 
     /// True if layer `y` is inside the vertical bounds (always without bounds).
-    pub(crate) fn in_bounds(&self, y: i32) -> bool {
+    pub(crate) fn in_bounds(&self, y: i64) -> bool {
         self.bounds.as_ref().is_none_or(|b| b.contains(&y))
     }
 
@@ -708,8 +718,8 @@ fn drift(old: &[(u64, Viewer)], new: &[(u64, Viewer)]) -> u32 {
 
 /// Euclidean distance between two chunks, rounded up (`u32::MAX` if it does not fit).
 fn distance_ceil(a: ChunkPos, b: ChunkPos) -> u32 {
-    let d = |p: i32, q: i32| u128::from(p.abs_diff(q)).pow(2);
-    let sq = d(a.x, b.x) + d(a.y, b.y) + d(a.z, b.z);
+    // Exact in u128 for clamped centers (saturates only far outside the world limit).
+    let sq = a.distance_sq(b);
     let root = sq.isqrt();
     let root = if root * root < sq { root + 1 } else { root };
     u32::try_from(root).unwrap_or(u32::MAX)
@@ -720,9 +730,9 @@ fn small_move(a: &Shape, b: &Shape) -> bool {
     let (ca, cb) = (a.viewer.center, b.viewer.center);
     a.viewer.radius == b.viewer.radius
         && a.viewer.vertical == b.viewer.vertical
-        && (i64::from(ca.x) - i64::from(cb.x)).abs() <= SMALL_MOVE
-        && (i64::from(ca.y) - i64::from(cb.y)).abs() <= SMALL_MOVE
-        && (i64::from(ca.z) - i64::from(cb.z)).abs() <= SMALL_MOVE
+        && ca.x.abs_diff(cb.x) <= SMALL_MOVE
+        && ca.y.abs_diff(cb.y) <= SMALL_MOVE
+        && ca.z.abs_diff(cb.z) <= SMALL_MOVE
 }
 
 #[cfg(test)]

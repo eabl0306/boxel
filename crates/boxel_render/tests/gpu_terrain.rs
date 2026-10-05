@@ -10,7 +10,11 @@
 //! draws two fixed views offscreen: an overview from above one corner and a low view across the
 //! surface. Asserts: the upload stats match the scene, every image has a non-background fraction
 //! in [0.05, 0.95], and every tier matches the best tier of its adapter within 0.1 % of the
-//! pixels (channel tolerance 2). Failing images are saved under `CARGO_TARGET_TMPDIR/gpu_terrain/`
+//! pixels (channel tolerance 2). Then every tier renders the same scene and views moved far from
+//! the origin along x and -z ([`FAR_SHIFTS`]: straddling the former `i32` edge at `+-2^31`, past
+//! it, and `2^40`) and must give exactly the pixels it gave near the origin: chunk origins are
+//! `i64` on the CPU and wrapped to 32 bits for the GPU, whose wrapping subtraction gives the same
+//! camera-relative positions. Failing images are saved under `CARGO_TARGET_TMPDIR/gpu_terrain/`
 //! (every image with `GPU_TERRAIN_SAVE=1`).
 #![expect(clippy::print_stderr, reason = "test progress and failure details")]
 use boxel_camera::{Camera, CameraView};
@@ -18,7 +22,7 @@ use boxel_gfx::{
     AdapterCaps, GlVersion, RgbaImage, Tier, floors, gpu_tests_required, read_texture_rgba8,
     run_in_error_scopes, submit_and_wait, tier_request,
 };
-use boxel_math::{DVec3, IVec3, UVec2};
+use boxel_math::{DVec3, I64Vec3, UVec2};
 use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, Mesher};
 use boxel_render::{RendererConfig, ViewParams, VoxelRenderer};
 use boxel_transform::Transform;
@@ -34,7 +38,11 @@ const HEIGHT: u32 = 180;
 /// Pixels may differ between tiers in at most this fraction (channel tolerance 2).
 const MAX_TIER_DIFF: f64 = 0.001;
 /// Meshed columns are `-MESH_RADIUS..MESH_RADIUS` in x and z (data goes one column further).
-const MESH_RADIUS: i32 = 3;
+const MESH_RADIUS: i64 = 3;
+/// Far-from-origin translations (voxels, applied as `+x`, `-z`; multiples of 32 so the chunk grid
+/// lines up with the one near the origin): the meshed area straddles `+2^31` in x and `-2^31` in
+/// z, lies just past them, and at `2^40`.
+const FAR_SHIFTS: [i64; 3] = [(1 << 31) - 64, (1 << 31) + (1 << 20), 1 << 40];
 
 // ---------------------------------------------------------------- adapters
 
@@ -197,36 +205,52 @@ fn terrain_scene() -> Scene {
 
 /// Chunk id used by the test (any stable u64).
 fn chunk_id(c: ChunkPos) -> u64 {
-    let pack = |v: i32| u64::from((v + 512) as u32 & 0x3ff);
+    let pack = |v: i64| (v + 512) as u64 & 0x3ff;
     pack(c.x) | pack(c.y) << 10 | pack(c.z) << 20
 }
 
-fn view_params(transform: &Transform) -> ViewParams {
+/// Translation of the whole scene (and views) for `shift` voxels: `+x`, `-z`.
+fn offset(shift: i64) -> I64Vec3 {
+    I64Vec3::new(shift, 0, -shift)
+}
+
+/// `transform` moved by [`offset`]. Eye coordinates are multiples of 1/64, exact in `f64` at
+/// every shift, so the camera-relative eye and the view matrix are the same as near the origin.
+fn view_params(transform: &Transform, shift: i64) -> ViewParams {
     let camera = Camera::default();
-    let view = CameraView::compute(&camera, transform, WIDTH as f32 / HEIGHT as f32);
+    let mut transform = *transform;
+    transform.translation += offset(shift).as_dvec3();
+    let view = CameraView::compute(&camera, &transform, WIDTH as f32 / HEIGHT as f32);
     ViewParams::from_camera(&view, &camera, RendererConfig::default().clear_color, 0.6)
 }
 
 /// From above the (-x, -z) corner of the meshed area, looking at its center.
-fn overview(scene: &Scene) -> ViewParams {
-    let eye = DVec3::new(-110.3, f64::from(scene.max_height) + 40.6, -104.2);
+fn overview(scene: &Scene, shift: i64) -> ViewParams {
+    let eye = DVec3::new(
+        -110.296_875,
+        f64::from(scene.max_height) + 40.593_75,
+        -104.203_125,
+    );
     let target = DVec3::new(0.0, f64::from(scene.max_height) - 30.0, 0.0);
     let d = (target - eye).as_vec3();
     let yaw = (-d.x).atan2(-d.z);
     let pitch = d.y.atan2(d.x.hypot(d.z));
-    view_params(&Transform::from_yaw_pitch(eye, yaw, pitch))
+    view_params(&Transform::from_yaw_pitch(eye, yaw, pitch), shift)
 }
 
 /// Just above the highest column at the -x edge, looking across the surface toward +x (hills,
 /// valleys and the horizon at the far edge, many chunks in depth).
-fn across(scene: &Scene) -> ViewParams {
-    let eye = DVec3::new(-94.6, f64::from(scene.max_height) + 3.4, 8.7);
+fn across(scene: &Scene, shift: i64) -> ViewParams {
+    let eye = DVec3::new(
+        -94.593_75,
+        f64::from(scene.max_height) + 3.406_25,
+        8.703_125,
+    );
     // yaw -90 degrees turns the -z forward vector toward +x
-    view_params(&Transform::from_yaw_pitch(
-        eye,
-        -90f32.to_radians(),
-        -12f32.to_radians(),
-    ))
+    view_params(
+        &Transform::from_yaw_pitch(eye, -90f32.to_radians(), -12f32.to_radians()),
+        shift,
+    )
 }
 
 // ---------------------------------------------------------------- rendering
@@ -262,12 +286,14 @@ struct TierImages {
 /// View names, in the order `render_tier` renders them.
 const VIEWS: [&str; 2] = ["overview", "across"];
 
-/// Uploads the scene and renders every view on one tier.
+/// Uploads the scene moved by [`offset`]`(shift)` and renders every view (moved the same way)
+/// on one tier.
 fn render_tier(
     adapter: &wgpu::Adapter,
     caps: &AdapterCaps,
     tier: Tier,
     scene: &Scene,
+    shift: i64,
 ) -> Result<TierImages, String> {
     let (device, queue, errors) = device_for(adapter, caps, tier)?;
     let config = RendererConfig {
@@ -289,7 +315,7 @@ fn render_tier(
         return Err(format!("renderer reports tier {}", renderer.tier()));
     }
     for (pos, mesh) in &scene.meshes {
-        let origin = IVec3::new(pos.x, pos.y, pos.z) * 32;
+        let origin = pos.origin().as_i64vec3() + offset(shift);
         renderer
             .upsert_chunk(&queue, chunk_id(*pos), origin, mesh)
             .map_err(|e| format!("upsert {pos:?}: {e}"))?;
@@ -304,13 +330,16 @@ fn render_tier(
     }
 
     let mut images = Vec::new();
-    for (name, view) in VIEWS.iter().zip([overview(scene), across(scene)]) {
+    for (name, view) in VIEWS
+        .iter()
+        .zip([overview(scene, shift), across(scene, shift)])
+    {
         render(&device, &queue, &mut renderer, &view)?; // warm-up
         let (image, cpu) = render(&device, &queue, &mut renderer, &view)?;
         let stats = renderer.stats();
         eprintln!(
-            "gpu_terrain: {} {tier} {name}: render {:.3} ms cpu, chunks={} quads={} draws={} \
-             visible={} non_background={:.3}",
+            "gpu_terrain: {} {tier} {name} shift {shift}: render {:.3} ms cpu, chunks={} quads={} \
+             draws={} visible={} non_background={:.3}",
             adapter_label(caps),
             cpu.as_secs_f64() * 1e3,
             stats.chunks,
@@ -377,6 +406,19 @@ impl Report {
         }
     }
 
+    fn check_identical(&mut self, what: &str, a: (&str, &RgbaImage), b: (&str, &RgbaImage)) {
+        let diff = a.1.compare(b.1, 0);
+        if diff.differing_pixels > 0 {
+            self.fail(
+                format!(
+                    "{what}: {} of {} pixels differ (max channel {})",
+                    diff.differing_pixels, diff.total_pixels, diff.max_channel_diff
+                ),
+                &[a, b],
+            );
+        }
+    }
+
     fn check_same(&mut self, what: &str, a: (&str, &RgbaImage), b: (&str, &RgbaImage)) {
         let diff = a.1.compare(b.1, 2);
         eprintln!(
@@ -430,9 +472,31 @@ fn real_terrain_renders_identically_on_every_tier() {
         eprintln!("gpu_terrain: {label}: tiers {tiers:?}");
         let mut results = Vec::new();
         for &tier in &tiers {
-            match render_tier(adapter, &caps, tier, &scene) {
+            match render_tier(adapter, &caps, tier, &scene, 0) {
                 Ok(r) => results.push(r),
                 Err(e) => report.fail(format!("{label} {tier}: {e}"), &[]),
+            }
+        }
+        // The same scene and views far from the origin: the same pixels on each tier.
+        for near in &results {
+            for shift in FAR_SHIFTS {
+                let far = match render_tier(adapter, &caps, near.tier, &scene, shift) {
+                    Ok(far) => far,
+                    Err(e) => {
+                        report.fail(format!("{label} {} shift {shift}: {e}", near.tier), &[]);
+                        continue;
+                    }
+                };
+                for (i, view) in VIEWS.iter().enumerate() {
+                    report.check_identical(
+                        &format!("{label}: {} shift {shift} vs origin ({view})", near.tier),
+                        (&format!("{label}_{}_{view}", near.tier), &near.images[i]),
+                        (
+                            &format!("{label}_{}_{view}_shift{shift}", near.tier),
+                            &far.images[i],
+                        ),
+                    );
+                }
             }
         }
         let save_all = std::env::var_os("GPU_TERRAIN_SAVE").is_some();

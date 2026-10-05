@@ -12,17 +12,22 @@
 //! - `--speed`: `walk: moved=V voxels in S s, frames=N max_update_ms=X p99_update_ms=X, behind=N,
 //!   caught_up_after=S`, where `behind` counts the jobs and interest work left when the walk
 //!   stops.
-//! - `--jump`: `jump: chunks=N settled_after=S frames=N max_update_ms=X p99_update_ms=X` from the
-//!   frame of the teleport until the new area is settled.
+//! - `--jump`: `jump: chunks=N settled_after=S frames=N max_update_ms=X p99_update_ms=X
+//!   center=X,Y,Z` from the frame of the teleport until the new area is settled; `center` is the
+//!   viewer's chunk, and the run fails (exit 5) unless its whole mesh region is loaded there.
+//!   World coordinates are `i64`: `--jump 70000000` (past the former `i32` edge of voxels,
+//!   `2^26` chunks) or `--jump -40000000000` (past `2^40` voxels) stream at the true position.
 //!
-//! Exit codes: 0 settled, 1 usage error, 4 not settled within the timeout. Set `RUST_LOG` for
-//! more logging (default filter `warn`).
+//! Exit codes: 0 settled, 1 usage error, 4 not settled within the timeout, 5 the world settled
+//! somewhere else than around the viewer after a jump. Set `RUST_LOG` for more logging (default
+//! filter `warn`).
 #![expect(clippy::print_stdout, clippy::print_stderr, reason = "CLI output")]
 
 use boxel::log::LogPlugin;
 use boxel::prelude::*;
-use boxel::voxel::CHUNK_SIZE;
+use boxel::voxel::{CHUNK_SIZE, MAX_CHUNK_COORD};
 use boxel::world::{WorldStats, WorldSystems};
+use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "\
@@ -34,12 +39,15 @@ usage: headless_world [options]
   --idle S             once settled, stand still for S seconds and report the update times
   --speed V            then move the viewer along +x at V voxels/s
   --duration S         walk duration in seconds with --speed (default 5)
-  --jump N             then teleport the viewer N chunks along +x and wait for the new area
+  --jump N             then teleport the viewer N chunks along x (negative: -x, up to the
+                       world limit of 2^56) and wait for the new area
   --timeout S          wall-clock limit in seconds (default 60), exit 4 past it
   --help               this text";
 
 /// Exit code for a timeout.
 const EXIT_TIMEOUT: u8 = 4;
+/// Exit code when the world settled away from the viewer after a jump.
+const EXIT_OFF_CENTER: u8 = 5;
 
 /// Viewer position.
 const VIEWER: DVec3 = DVec3::new(0.0, 80.0, 0.0);
@@ -53,7 +61,8 @@ struct Options {
     speed: f64,
     duration: Duration,
     idle: Duration,
-    jump: u32,
+    /// Chunks along x (`0`: no jump).
+    jump: i64,
     timeout: Duration,
 }
 
@@ -92,9 +101,14 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--duration" => o.duration = Duration::from_secs_f64(number(flag, &value()?)?),
             "--idle" => o.idle = Duration::from_secs_f64(number(flag, &value()?)?),
             "--jump" => {
-                o.jump = value()?
-                    .parse()
-                    .map_err(|_| format!("{flag}: not a chunk count"))?;
+                let v = value()?;
+                o.jump = v
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|n| n.unsigned_abs() <= MAX_CHUNK_COORD.unsigned_abs())
+                    .ok_or_else(|| {
+                        format!("{flag}: {v:?} is not a chunk count within +-{MAX_CHUNK_COORD}")
+                    })?;
             }
             "--timeout" => o.timeout = Duration::from_secs_f64(number(flag, &value()?)?),
             other => return Err(format!("unknown argument {other:?}")),
@@ -169,7 +183,7 @@ impl Run {
         let candidates = [
             (o.idle > Duration::ZERO).then_some(Phase::Idle { since: now }),
             (o.speed > 0.0).then_some(Phase::Walking { since: now }),
-            (o.jump > 0).then_some(Phase::Jumping { since: now }),
+            (o.jump != 0).then_some(Phase::Jumping { since: now }),
         ];
         let Some(next) = candidates
             .into_iter()
@@ -182,7 +196,8 @@ impl Run {
         match next {
             Phase::Walking { .. } => self.walk_from = x,
             Phase::Jumping { .. } => {
-                self.teleport = Some(f64::from(o.jump) * f64::from(CHUNK_SIZE));
+                // At most 2^61 voxels (the jump is within the world limit); exact up to 2^53.
+                self.teleport = Some((o.jump * i64::from(CHUNK_SIZE)) as f64);
             }
             _ => {}
         }
@@ -283,6 +298,35 @@ fn end_update(mut run: ResMut<Run>) {
     }
 }
 
+/// Positions of the mesh region of a viewer in chunk `center` (columns within `radius`, layers
+/// within `vertical` clipped to `bounds`) for which `loaded` is false: empty when the world is
+/// loaded around the viewer.
+fn missing_around(
+    center: ChunkPos,
+    radius: u32,
+    vertical: u32,
+    bounds: Option<&RangeInclusive<i64>>,
+    loaded: impl Fn(ChunkPos) -> bool,
+) -> Vec<ChunkPos> {
+    let (r, v) = (i64::from(radius), i64::from(vertical));
+    let mut layers = center.y.saturating_sub(v)..=center.y.saturating_add(v);
+    if let Some(b) = bounds {
+        layers = *layers.start().max(b.start())..=*layers.end().min(b.end());
+    }
+    let mut missing = Vec::new();
+    for y in layers {
+        for dz in -r..=r {
+            for dx in -r..=r {
+                let p = ChunkPos::new(center.x + dx, y, center.z + dz);
+                if dx * dx + dz * dz <= r * r && !loaded(p) {
+                    missing.push(p);
+                }
+            }
+        }
+    }
+    missing
+}
+
 /// 99th percentile of `values` (0 when empty).
 fn p99(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
@@ -316,14 +360,18 @@ fn drive(
     mut run: ResMut<Run>,
     stats: Res<WorldStats>,
     map: Res<ChunkMap>,
+    settings: Res<WorldSettings>,
     frames: Res<FrameStats>,
-    viewers: Query<&Transform, With<ChunkViewer>>,
+    viewers: Query<(&Transform, &ChunkViewer)>,
     mut exit: MessageWriter<AppExit>,
 ) {
     let now = Instant::now();
     let elapsed = run.started.elapsed();
     let settled = stats.chunks > 0 && stats.is_settled();
-    let x = viewers.iter().next().map_or(VIEWER.x, |t| t.translation.x);
+    let x = viewers
+        .iter()
+        .next()
+        .map_or(VIEWER.x, |(t, _)| t.translation.x);
     match run.phase {
         Phase::Loading if settled => {
             let quads: u64 = map
@@ -383,15 +431,40 @@ fn drive(
         // The counters here are from the end of the previous frame, which already planned the
         // teleport: the new area is settled.
         Phase::Jumping { since } if settled => {
+            let Some((transform, viewer)) = viewers.iter().next() else {
+                return;
+            };
+            // The world clamps viewers to its limit; so does the expected center.
+            let center =
+                ChunkPos::containing(BlockPos::from_world(transform.translation)).clamp_to_world();
             println!(
                 "jump: chunks={} settled_after={:.3}s frames={} max_update_ms={:.2} \
-                 p99_update_ms={:.2}",
+                 p99_update_ms={:.2} center={},{},{}",
                 run.options.jump,
                 now.duration_since(since).as_secs_f64(),
                 run.updates.len(),
                 max(&run.updates),
                 p99(&run.updates),
+                center.x,
+                center.y,
+                center.z,
             );
+            let missing = missing_around(
+                center,
+                viewer.radius,
+                viewer.vertical_radius,
+                settings.vertical_bounds.as_ref(),
+                |p| map.id_at(p).is_some(),
+            );
+            if let Some(first) = missing.first() {
+                eprintln!(
+                    "headless_world: the world settled away from the viewer: {} chunks of its \
+                     mesh region around {center:?} are not loaded (first {first:?})",
+                    missing.len()
+                );
+                run.exit(EXIT_OFF_CENTER, &mut exit);
+                return;
+            }
             run.next_phase(Phase::Jumping { since }, now, x, &mut exit);
         }
         _ => {}
@@ -404,5 +477,49 @@ fn drive(
             *stats
         );
         run.exit(EXIT_TIMEOUT, &mut exit);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Option<Options>, String> {
+        let args: Vec<String> = args.iter().map(ToString::to_string).collect();
+        parse_options(&args)
+    }
+
+    #[test]
+    fn jumps_reach_the_world_limit_in_both_directions() {
+        for (arg, chunks) in [
+            ("100", 100),
+            ("70000000", 70_000_000),
+            ("-40000000000", -40_000_000_000),
+            ("72057594037927936", MAX_CHUNK_COORD),
+        ] {
+            let o = parse(&["--jump", arg]).expect("valid").expect("not help");
+            assert_eq!(o.jump, chunks);
+        }
+        for arg in ["72057594037927937", "-9223372036854775808", "1.5", "x"] {
+            assert!(parse(&["--jump", arg]).is_err(), "{arg} was accepted");
+        }
+    }
+
+    #[test]
+    fn missing_around_finds_an_off_center_world() {
+        let center = ChunkPos::new((1 << 26) + 3, 2, -(1 << 26));
+        let mesh = |p: ChunkPos| {
+            let (dx, dz) = (p.x - center.x, p.z - center.z);
+            dx * dx + dz * dz <= 4 && (p.y - center.y).abs() <= 1
+        };
+        assert!(missing_around(center, 2, 1, None, mesh).is_empty());
+        // Saturated at the former i32 edge: the world is around another chunk.
+        let elsewhere = ChunkPos::new((1 << 26) - 1, 2, -(1 << 26));
+        let wrong = |p: ChunkPos| (p.x - elsewhere.x).abs() <= 2;
+        assert!(!missing_around(center, 2, 1, None, wrong).is_empty());
+        // Vertical bounds clip the layers that must be loaded.
+        let one_layer = |p: ChunkPos| p.y == 2 && mesh(p);
+        assert!(missing_around(center, 2, 1, Some(&(2..=2)), one_layer).is_empty());
+        assert!(!missing_around(center, 2, 1, None, one_layer).is_empty());
     }
 }

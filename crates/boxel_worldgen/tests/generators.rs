@@ -13,7 +13,7 @@ fn state(r: &BlockRegistry, name: &str) -> BlockState {
     r.by_name(name).unwrap()
 }
 
-fn chunk(g: &dyn WorldGenerator, r: &BlockRegistry, x: i32, y: i32, z: i32) -> ChunkData {
+fn chunk(g: &dyn WorldGenerator, r: &BlockRegistry, x: i64, y: i64, z: i64) -> ChunkData {
     g.generate(ChunkKey::new(ChunkPos::new(x, y, z)), r)
 }
 
@@ -26,15 +26,16 @@ fn block_at(g: &dyn WorldGenerator, r: &BlockRegistry, p: BlockPos) -> BlockStat
 fn expected_terrain(g: &TerrainGenerator, r: &BlockRegistry, p: BlockPos, h: i32) -> BlockState {
     let s = &g.settings;
     let y = p.y;
-    if y < s.bottom {
+    let (bottom, top) = (i64::from(s.bottom), i64::from(h));
+    if y < bottom {
         BlockState::AIR
-    } else if y == s.bottom {
+    } else if y == bottom {
         state(r, "boxel:bedrock")
-    } else if y < h - s.dirt_depth {
+    } else if y < top - i64::from(s.dirt_depth) {
         state(r, "boxel:stone")
-    } else if y < h {
+    } else if y < top {
         state(r, "boxel:dirt")
-    } else if y == h {
+    } else if y == top {
         if h <= s.sand_level {
             state(r, "boxel:sand")
         } else if h > s.snow_level {
@@ -54,7 +55,7 @@ fn assert_matches_rules(g: &TerrainGenerator, r: &BlockRegistry, c: ChunkPos) {
     let mut heights = [[0; 32]; 32];
     for (x, row) in heights.iter_mut().enumerate() {
         for (z, h) in row.iter_mut().enumerate() {
-            *h = g.height_at(origin.x + x as i32, origin.z + z as i32);
+            *h = g.height_at(origin.x + x as i64, origin.z + z as i64);
         }
     }
     let mut dense = vec![BlockState::AIR; CHUNK_VOLUME];
@@ -161,7 +162,8 @@ fn terrain_heights_stay_within_amplitude() {
 fn terrain_chunks_follow_the_column_rules() {
     let r = registry();
     let g = TerrainGenerator::default();
-    for (x, z) in [(0, 0), (-1, -1), (3, -2)] {
+    // Also past the former i32 range of voxels (chunk 2^26 and below -2^26).
+    for (x, z) in [(0, 0), (-1, -1), (3, -2), (1 << 26, -(1 << 26) - 1)] {
         for y in g.vertical_chunks() {
             assert_matches_rules(&g, &r, ChunkPos::new(x, y, z));
         }
@@ -185,10 +187,11 @@ fn terrain_chunks_follow_the_column_rules() {
         for y in varied.vertical_chunks() {
             assert_matches_rules(&varied, &r, ChunkPos::new(x, y, z));
         }
-        for lx in 0..CHUNK_SIZE {
-            let (wx, wz) = (x * CHUNK_SIZE + lx, z * CHUNK_SIZE);
+        let size = i64::from(CHUNK_SIZE);
+        for lx in 0..size {
+            let (wx, wz) = (x * size + lx, z * size);
             let h = varied.height_at(wx, wz);
-            tops.insert(block_at(&varied, &r, BlockPos::new(wx, h, wz)));
+            tops.insert(block_at(&varied, &r, BlockPos::new(wx, h.into(), wz)));
         }
     }
     for name in ["boxel:sand", "boxel:grass", "boxel:snow"] {
@@ -206,7 +209,7 @@ fn terrain_chunks_follow_the_column_rules() {
             },
         );
         let range = g.vertical_chunks();
-        assert!(range.contains(&(bottom >> 5)), "{range:?}");
+        assert!(range.contains(&i64::from(bottom >> 5)), "{range:?}");
         for y in *range.start() - 1..=*range.end() + 1 {
             assert_matches_rules(&g, &r, ChunkPos::new(1, y, -1));
         }
@@ -286,20 +289,21 @@ fn surface_chunk_has_grass_on_top() {
         .map(|x| (x, 0, g.height_at(x, 0)))
         .find(|&(_, _, h)| h > s.sand_level && h <= s.snow_level)
         .expect("a grass column");
+    let (h, dirt_depth) = (i64::from(h), i64::from(s.dirt_depth));
     let grass = state(&r, "boxel:grass");
     assert_eq!(block_at(&g, &r, BlockPos::new(x, h, z)), grass);
     assert_eq!(
         block_at(&g, &r, BlockPos::new(x, h + 1, z)),
         BlockState::AIR
     );
-    for depth in 1..=s.dirt_depth {
+    for depth in 1..=dirt_depth {
         assert_eq!(
             block_at(&g, &r, BlockPos::new(x, h - depth, z)),
             state(&r, "boxel:dirt")
         );
     }
     assert_eq!(
-        block_at(&g, &r, BlockPos::new(x, h - s.dirt_depth - 1, z)),
+        block_at(&g, &r, BlockPos::new(x, h - dirt_depth - 1, z)),
         state(&r, "boxel:stone")
     );
     // The surface chunk is paletted compactly (a handful of states, not Direct).

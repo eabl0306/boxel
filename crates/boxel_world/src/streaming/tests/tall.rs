@@ -23,8 +23,8 @@ fn reference_wanted(h: &Harness, viewers: &[Viewer]) -> BTreeMap<ChunkPos, Inter
     let bounds = h.settings.vertical_bounds.as_ref();
     let mut out = BTreeMap::new();
     for v in viewers {
-        let reach = i32::try_from(v.radius).expect("small") + 2;
-        let vreach = i32::try_from(v.vertical).expect("small") + 2;
+        let reach = i64::from(v.radius) + 2;
+        let vreach = i64::from(v.vertical) + 2;
         let c = v.center;
         for y in c.y - vreach..=c.y + vreach {
             for z in c.z - reach..=c.z + reach {
@@ -124,7 +124,7 @@ fn the_loaded_volume_follows_the_viewer_up_and_down() {
     h.viewers(&at(-2));
     check_interest(&h, &viewers(-2));
     run_all(&mut h, &hold);
-    let mut exposed: Vec<i32> = h.map.ready_meshes().map(|(_, k, _)| k.pos.y).collect();
+    let mut exposed: Vec<i64> = h.map.ready_meshes().map(|(_, k, _)| k.pos.y).collect();
     exposed.sort_unstable();
     exposed.dedup();
     assert_eq!(exposed, vec![-2, -1]);
@@ -360,7 +360,7 @@ fn vertical_bounds_can_change_at_runtime() {
         run_all(&mut h, &hold);
         check_interest(&h, &current);
         check_meshes_match_neighbors(&h);
-        let layers: BTreeSet<i32> = h.map.iter().map(|(_, s)| s.key.pos.y).collect();
+        let layers: BTreeSet<i64> = h.map.iter().map(|(_, s)| s.key.pos.y).collect();
         match &bounds {
             Some(b) => assert!(layers.iter().all(|y| b.contains(y)), "{layers:?}"),
             None => assert_eq!(layers, (-4..=4).collect()),
@@ -378,9 +378,9 @@ fn vertical_bounds_can_change_at_runtime() {
 #[derive(Clone, Debug)]
 enum Op {
     /// Viewer `i` moves by a small offset.
-    Move(u8, i32, i32, i32),
+    Move(u8, i64, i64, i64),
     /// Viewer `i` jumps to a position.
-    Jump(u8, i32, i32, i32),
+    Jump(u8, i64, i64, i64),
     /// Viewer `i` gets new radii.
     Radius(u8, u32, u32),
     /// Viewer `i` appears or disappears.
@@ -389,9 +389,9 @@ enum Op {
 
 fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
-        6 => (0u8..2, -2i32..=2, -2i32..=2, -2i32..=2)
+        6 => (0u8..2, -2i64..=2, -2i64..=2, -2i64..=2)
             .prop_map(|(i, x, y, z)| Op::Move(i, x, y, z)),
-        1 => (0u8..2, -12i32..=12, -6i32..=6, -12i32..=12)
+        1 => (0u8..2, -12i64..=12, -6i64..=6, -12i64..=12)
             .prop_map(|(i, x, y, z)| Op::Jump(i, x, y, z)),
         1 => (0u8..2, 0u32..=3, 0u32..=2).prop_map(|(i, r, v)| Op::Radius(i, r, v)),
         1 => (0u8..2).prop_map(Op::Toggle),
@@ -436,7 +436,7 @@ enum FrameOp {
     /// A viewer change, as in the walks above.
     Viewer(Op),
     /// New vertical bounds (`None`: no height limit).
-    Bounds(Option<(i32, i32)>),
+    Bounds(Option<(i64, i64)>),
     /// A new unload hysteresis.
     Hysteresis(u32),
     /// Nothing changes.

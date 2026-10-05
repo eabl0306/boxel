@@ -8,7 +8,7 @@ use crate::targets::{Blit, Targets};
 use crate::textures::{BLOCK_TEXTURE_SIZE, generate_block_textures, layer_bytes};
 use boxel_camera::{Camera, CameraView};
 use boxel_gfx::Tier;
-use boxel_math::{Frustum, IVec3, Mat4, UVec2, Vec3};
+use boxel_math::{Frustum, I64Vec3, Mat4, UVec2, Vec3, wrap_to_i32};
 use boxel_mesh::{BUCKET_COUNT, ChunkMesh};
 use boxel_shaders::gpu::{ChunkGpu, ViewUniform, bindings};
 use boxel_voxel::TextureSpec;
@@ -51,8 +51,8 @@ pub struct ViewParams {
     pub view_proj: Mat4,
     /// Camera-relative frustum (far plane at view distance).
     pub frustum: Frustum,
-    /// Integer origin.
-    pub render_origin: IVec3,
+    /// Integer origin (`i64` world voxels; the GPU gets its low 32 bits).
+    pub render_origin: I64Vec3,
     /// Eye relative to `render_origin`.
     pub eye_rel: Vec3,
     /// Fog color (linear RGBA).
@@ -328,12 +328,13 @@ impl VoxelRenderer {
         self.blit.rebind(device, &self.targets.color_view);
     }
     /// Uploads (or replaces) a chunk mesh. `id` is any stable `u64` (`ChunkId::to_bits`),
-    /// `origin` the chunk's world voxel min corner. Empty meshes remove the chunk.
+    /// `origin` the chunk's world voxel min corner (`i64`; the chunk table on the GPU keeps its
+    /// low 32 bits, see [`boxel_math::wrap_to_i32`]). Empty meshes remove the chunk.
     pub fn upsert_chunk(
         &mut self,
         queue: &wgpu::Queue,
         id: u64,
-        origin: IVec3,
+        origin: I64Vec3,
         mesh: &ChunkMesh,
     ) -> Result<(), RendererError> {
         if mesh.is_empty() {
@@ -407,7 +408,8 @@ impl VoxelRenderer {
         let uniform = ViewUniform {
             view_proj: view.view_proj.to_cols_array_2d(),
             frustum: view.frustum.to_array(),
-            render_origin: view.render_origin.extend(0).to_array(),
+            // Low 32 bits, like the chunk origins (the shaders subtract them with wrapping).
+            render_origin: wrap_to_i32(view.render_origin).extend(0).to_array(),
             camera_rel: view.eye_rel.extend(0.0).to_array(),
             fog_color: view.fog_color,
             fog_params: [view.fog_start, view.fog_end, 0.0, 0.0],

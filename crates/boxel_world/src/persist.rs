@@ -2,7 +2,9 @@
 use boxel_voxel::ChunkKey;
 
 /// Chunk blob store. Implementations must be callable from an IO worker thread; batching is the
-/// caller's job (redb allows one write transaction at a time).
+/// caller's job (redb allows one write transaction at a time). Keys carry `i64` chunk positions
+/// (up to the world limit, `boxel_voxel::MAX_CHUNK_COORD`): a store must keep all 64 bits of
+/// every axis.
 pub trait ChunkStore: Send + Sync + 'static {
     /// Loads one chunk blob.
     fn load(&self, key: ChunkKey) -> std::io::Result<Option<Vec<u8>>>;

@@ -2,7 +2,7 @@
 
 use boxel_app::{App, Plugin, Time, Update};
 use boxel_ecs::prelude::*;
-use boxel_math::{DVec3, Frustum, IVec3, Mat4, Quat, Vec2, Vec3};
+use boxel_math::{DVec3, Frustum, I64Vec3, IVec3, Mat4, Quat, Vec2, Vec3};
 use boxel_transform::Transform;
 use boxel_window::{
     AccumulatedMouseMotion, ButtonInput, CursorGrab, CursorOptions, KeyCode, MouseButton,
@@ -42,12 +42,13 @@ impl Camera {
 }
 
 /// Camera-relative view for one frame. `render_origin` is the camera position floored to whole
-/// voxels; every GPU position is `world - render_origin`, so `f32` stays exact near the camera
-/// at any world coordinate.
+/// voxels (`i64`, like world block positions); every GPU position is `world - render_origin`,
+/// so `f32` stays exact near the camera at any world coordinate. The only limit left is the
+/// `f64` camera position itself (1 mm steps at about `4.4e12` voxels).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CameraView {
-    /// Integer origin of the camera-relative frame.
-    pub render_origin: IVec3,
+    /// Integer origin of the camera-relative frame (saturates past `i64`, far outside the world).
+    pub render_origin: I64Vec3,
     /// Eye position relative to `render_origin` (each component in [0, 1)).
     pub eye_rel: Vec3,
     /// Unit forward.
@@ -66,7 +67,8 @@ impl CameraView {
     /// Builds the view for `aspect` (width / height).
     pub fn compute(camera: &Camera, transform: &Transform, aspect: f32) -> Self {
         let t = transform.translation;
-        let render_origin = t.floor().as_ivec3();
+        // `t - floor(t)` is exact in f64, and so is the i64 round trip of an f64 integer.
+        let render_origin = t.floor().as_i64vec3();
         let eye_rel = (t - render_origin.as_dvec3()).as_vec3();
         let forward = transform.forward();
         let view = boxel_math::projection::look_to(eye_rel, forward, transform.up());
@@ -83,6 +85,13 @@ impl CameraView {
             view_proj,
             frustum,
         }
+    }
+
+    /// The render origin as the GPU gets it: its low 32 bits ([`boxel_math::wrap_to_i32`]). The
+    /// shaders subtract it from chunk origins wrapped the same way, which gives the exact
+    /// relative position of every chunk less than `2^31` voxels away.
+    pub const fn gpu_render_origin(&self) -> IVec3 {
+        boxel_math::wrap_to_i32(self.render_origin)
     }
 }
 

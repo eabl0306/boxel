@@ -1,6 +1,6 @@
 // Tier Low: no storage buffers in any stage (desktop GL 3.3 / GLES 3.0 class).
 // PackedQuad is an INSTANCE-STEP vertex attribute (TriangleStrip, 4 vertices per instance,
-// first_instance = first quad of the bucket). The chunk origin comes from immediates.
+// first_instance = first quad of the bucket). The chunk origin (low 32 bits) comes from immediates.
 // Exactly ONE uniform block and ONE texture/sampler pair per pipeline: wgpu 30 skips the GL
 // uniform-block remap on NVIDIA GL 3.3 contexts, so every block would land on binding 0.
 struct ChunkImmediate { origin: vec4<i32> };

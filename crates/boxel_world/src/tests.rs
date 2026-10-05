@@ -13,7 +13,7 @@ use boxel_ecs::prelude::*;
 use boxel_ecs::schedule::{LogLevel, ScheduleBuildSettings};
 use boxel_math::DVec3;
 use boxel_transform::Transform;
-use boxel_voxel::{BlockPos, BlockRegistry, BlockState, CHUNK_SIZE, ChunkPos};
+use boxel_voxel::{BlockPos, BlockRegistry, BlockState, CHUNK_SIZE, ChunkPos, MAX_CHUNK_COORD};
 use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -27,21 +27,23 @@ pub(crate) mod support {
     use boxel_voxel::{BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, ChunkKey, ChunkPos};
     use boxel_worldgen::WorldGenerator;
     use std::ops::RangeInclusive;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     /// Uniform stone from the bottom of `vertical` up to chunk y = -1, uniform air elsewhere (both
-    /// mesh fast paths), with an optional key that panics.
+    /// mesh fast paths), with an optional key that panics. Records every position it generates.
     pub(crate) struct LayerGen {
-        pub(crate) vertical: RangeInclusive<i32>,
+        pub(crate) vertical: RangeInclusive<i64>,
         pub(crate) panic_at: Option<ChunkPos>,
+        pub(crate) generated: Arc<Mutex<Vec<ChunkPos>>>,
     }
 
     impl LayerGen {
-        pub(crate) fn new(vertical: RangeInclusive<i32>) -> Self {
+        pub(crate) fn new(vertical: RangeInclusive<i64>) -> Self {
             Self {
                 vertical,
                 panic_at: None,
+                generated: Arc::default(),
             }
         }
     }
@@ -53,13 +55,14 @@ pub(crate) mod support {
                 "test generator panics at {:?}",
                 key.pos
             );
+            self.generated.lock().expect("lock").push(key.pos);
             if key.pos.y < 0 && self.vertical.contains(&key.pos.y) {
                 ChunkData::uniform(registry.by_name("boxel:stone").expect("stone"))
             } else {
                 ChunkData::uniform(BlockState::AIR)
             }
         }
-        fn vertical_chunks(&self) -> RangeInclusive<i32> {
+        fn vertical_chunks(&self) -> RangeInclusive<i64> {
             self.vertical.clone()
         }
         fn name(&self) -> &str {
@@ -167,12 +170,8 @@ fn tall_world_app(
 
 fn chunk_center(chunk: ChunkPos) -> DVec3 {
     let o = chunk.origin();
-    let half = f64::from(CHUNK_SIZE) / 2.0;
-    DVec3::new(
-        f64::from(o.x) + half,
-        f64::from(o.y) + half,
-        f64::from(o.z) + half,
-    )
+    // Exact in f64 for every chunk of these tests (origins below 2^53).
+    o.as_i64vec3().as_dvec3() + DVec3::splat(f64::from(CHUNK_SIZE) / 2.0)
 }
 
 /// A viewer that wants every layer (of a fixed-height world).
@@ -224,10 +223,10 @@ fn settle(app: &mut App, max_frames: usize) -> Vec<ChunkMeshEvent> {
 }
 
 /// Chunks of a radius-1 viewer in column (cx, cz): the 5x5 square minus its corners.
-fn radius1_chunks(cx: i32, cz: i32, vertical: RangeInclusive<i32>) -> BTreeSet<ChunkPos> {
+fn radius1_chunks(cx: i64, cz: i64, vertical: RangeInclusive<i64>) -> BTreeSet<ChunkPos> {
     let mut out = BTreeSet::new();
-    for dz in -2..=2_i32 {
-        for dx in -2..=2_i32 {
+    for dz in -2..=2_i64 {
+        for dx in -2..=2_i64 {
             if dx.abs() == 2 && dz.abs() == 2 {
                 continue;
             }
@@ -278,7 +277,7 @@ fn removes(events: &[ChunkMeshEvent]) -> Vec<ChunkPos> {
 }
 
 /// Radius-1 mesh columns around (0, 0).
-const MESH_COLUMNS: [(i32, i32); 5] = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)];
+const MESH_COLUMNS: [(i64, i64); 5] = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)];
 
 /// With vertical -3..=1: mesh chunks at y = -1 (air above) and y = -3 (nothing below) are
 /// exposed stone and need a mesh job; y = -2 is enclosed and y >= 0 is air (fast paths).
@@ -389,6 +388,61 @@ fn moving_far_unloads_everything_and_streams_the_new_area() {
         "new slots get new ids"
     );
     assert_eq!(loaded(&app), radius1_chunks(40, -3, -3..=1));
+}
+
+/// World coordinates are i64: the world follows a viewer across the former i32 edge of voxels
+/// (chunk 2^26 = voxel 2^31, where positions used to saturate or wrap), far past it, and is
+/// clamped at the world limit. Every chunk is generated for its own position.
+#[test]
+fn streaming_follows_the_viewer_far_from_the_origin() {
+    let generator = LayerGen::new(-3..=1);
+    let generated = Arc::clone(&generator.generated);
+    let mut app = world_app(generator, settings(64), Arc::new(InlineExecutor));
+    let edge = 1i64 << 26;
+    let take = || -> BTreeSet<ChunkPos> {
+        std::mem::take(&mut *generated.lock().expect("lock"))
+            .into_iter()
+            .collect()
+    };
+    let viewer = spawn_viewer(&mut app, ChunkPos::new(edge - 1, 0, -edge), 1);
+    // Jumps far enough to unload the previous area.
+    for (cx, cz) in [
+        // The loaded area straddles +2^31 in x (chunks 2^26 - 3..=2^26 + 1) and -2^31 in z.
+        (edge - 1, -edge),
+        // The mirrored edges: a 2^32-voxel jump that used to land on the same chunks.
+        (-edge, edge - 1),
+        // 2^40 voxels and much further.
+        (1 << 35, -(1 << 35)),
+        (-(1 << 50) + 3, (1 << 50) - 3),
+    ] {
+        move_viewer(&mut app, viewer, ChunkPos::new(cx, 0, cz));
+        settle(&mut app, 200);
+        let expected = radius1_chunks(cx, cz, -3..=1);
+        assert_eq!(loaded(&app), expected, "viewer in column ({cx}, {cz})");
+        // Every chunk was generated at its true position, nothing else.
+        assert_eq!(take(), expected, "generated around ({cx}, {cz})");
+        // Block lookups use the true coordinates.
+        let map = app.world().resource::<ChunkMap>();
+        let block = BlockPos::new(cx * 32 + 31, -1, cz * 32);
+        assert_eq!(block.split().0, ChunkPos::new(cx, -1, cz));
+        assert_eq!(
+            map.block_at(block),
+            Some(BlockState(1)),
+            "stone at {block:?}"
+        );
+        assert_eq!(
+            map.block_at(BlockPos::new(cx * 32 + 32 * 3, -1, cz * 32)),
+            None
+        );
+    }
+    // Past the world limit the viewer is clamped: the world streams the chunks at the limit.
+    let beyond = ChunkPos::new(MAX_CHUNK_COORD * 2, 0, -MAX_CHUNK_COORD * 2);
+    move_viewer(&mut app, viewer, beyond);
+    settle(&mut app, 200);
+    assert_eq!(
+        loaded(&app),
+        radius1_chunks(MAX_CHUNK_COORD, -MAX_CHUNK_COORD, -3..=1)
+    );
 }
 
 #[test]
@@ -625,9 +679,9 @@ fn tall_world_spreads_big_changes_over_frames() {
     // -3..=3 (vertical radius 2, plus one).
     let mut expected = BTreeSet::new();
     for y in -3..=3 {
-        for z in -6..=6_i32 {
-            for x in -6..=6_i32 {
-                let mesh = |x: i32, z: i32| x * x + z * z <= 16;
+        for z in -6..=6_i64 {
+            for x in -6..=6_i64 {
+                let mesh = |x: i64, z: i64| x * x + z * z <= 16;
                 let data =
                     x * x + z * z <= 25 || (-1..=1).any(|a| (-1..=1).any(|b| mesh(x + a, z + b)));
                 if data {
@@ -641,7 +695,7 @@ fn tall_world_spreads_big_changes_over_frames() {
     // Stone layers -3..=-1 under air: only the top of the stone (layer -1) is exposed; layer -3
     // sits on layer -4, which is not meshed (outside the mesh layers -2..=2).
     let map = app.world().resource::<ChunkMap>();
-    let mut exposed: Vec<i32> = map.ready_meshes().map(|(_, k, _)| k.pos.y).collect();
+    let mut exposed: Vec<i64> = map.ready_meshes().map(|(_, k, _)| k.pos.y).collect();
     exposed.sort_unstable();
     exposed.dedup();
     assert_eq!(exposed, vec![-1]);

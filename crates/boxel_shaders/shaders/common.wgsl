@@ -10,6 +10,12 @@
 //    per-draw data arrives through the DrawRef instance-step vertex attribute or immediates.
 //  - @builtin(vertex_index) is only used with first_vertex = 0 / base_vertex = 0 draws.
 //  - textureLoad mip levels are always i32 (naga GLSL bug gfx-rs/wgpu#10037).
+//
+// World integer positions are i64 on the CPU. Chunk origins and render_origin arrive as their
+// low 32 bits (two's complement wrapping) and are only ever subtracted from each other in i32.
+// WGSL integer arithmetic wraps, so (chunk_origin - render_origin) is the true difference modulo
+// 2^32: exact whenever the chunk is less than 2^31 voxels from the camera, which every live
+// chunk is, at any world position.
 
 const GEO_POS_MASK: u32 = 31u;
 const GEO_Y_SHIFT: u32 = 5u;
@@ -27,7 +33,7 @@ const CHUNK_SIZE: f32 = 32.0;
 struct View {
   view_proj: mat4x4<f32>,          // camera-relative: positions are (world - render_origin)
   frustum: array<vec4<f32>, 6>,    // xyz = inward normal, w = d; inside if dot(n, p) + d >= 0
-  render_origin: vec4<i32>,        // xyz = integer voxel origin of the camera-relative frame
+  render_origin: vec4<i32>,        // xyz = integer voxel origin of the camera-relative frame (low 32 bits)
   camera_rel: vec4<f32>,           // xyz = eye position relative to render_origin
   fog_color: vec4<f32>,
   fog_params: vec4<f32>,           // x = fog start, y = fog end (world units)
@@ -35,7 +41,7 @@ struct View {
 };
 
 struct ChunkGpu {                  // 64 bytes, mirrors boxel_shaders::gpu::ChunkGpu
-  origin: vec3<i32>,               // world voxel coordinates of the chunk min corner (absolute)
+  origin: vec3<i32>,               // world voxel min corner of the chunk, low 32 bits (wraps; only used minus render_origin)
   quad_base: u32,                  // first quad of bucket 0 in the quad arena
   counts: array<u32, 8>,           // [0..6) opaque face buckets, [6] cutout, [7] translucent
   flags: u32,                      // bit0 = live
@@ -104,7 +110,7 @@ fn decode_quad(q: vec2<u32>, corner_in: u32) -> Decoded {
 }
 
 fn finish_vertex(d: Decoded, chunk_origin: vec3<i32>, view: View) -> VsOut {
-  // integer subtraction first: exact for any world position, then small floats
+  // wrapping i32 subtraction first: exact for any world position (see the top), then small floats
   let rel = vec3<f32>(chunk_origin - view.render_origin.xyz) + d.local;
   var o: VsOut;
   o.clip = view.view_proj * vec4(rel, 1.0);

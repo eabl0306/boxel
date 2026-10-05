@@ -529,6 +529,28 @@ mod tests {
     }
 
     #[test]
+    fn far_positions_show_their_true_chunk() {
+        // Past the former i32 edge (2^31 voxels = chunk 2^26) and at 2^40, negatives too.
+        for (position, chunk) in [
+            (
+                DVec3::new(2_147_483_648.5, 64.0, -2_147_483_649.5),
+                "Chunk 67108864 2 -67108865  in chunk 0 0 30",
+            ),
+            (
+                DVec3::new(1_099_511_627_776.25, -1.0, -1_099_511_627_807.0),
+                "Chunk 34359738368 -1 -34359738369  in chunk 0 31 1",
+            ),
+        ] {
+            let inputs = OverlayInputs {
+                camera: Some((position, boxel_math::Vec3::new(0.0, 0.0, -1.0))),
+                ..OverlayInputs::default()
+            };
+            let lines = overlay_lines(&inputs);
+            assert!(lines.contains(&chunk.to_string()), "{lines:?}");
+        }
+    }
+
+    #[test]
     fn present_window_measures_shown_frames_over_one_second() {
         let mut window = PresentWindow::default();
         assert_eq!(window.fps(), 0.0);

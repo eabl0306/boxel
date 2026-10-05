@@ -25,7 +25,7 @@ use boxel_gfx::{
     build_fingerprint, configure_surface, create_gl_instance, create_instance,
     install_lkg_panic_hook, read_texture_rgba8, select_gpu,
 };
-use boxel_math::{IVec3, UVec2};
+use boxel_math::{I64Vec3, UVec2};
 use boxel_mesh::ChunkMesh;
 use boxel_transform::Transform;
 use boxel_voxel::{BlockRegistry, TextureSpec};
@@ -511,7 +511,8 @@ impl Losses {
 enum MeshOp {
     Upsert {
         id: u64,
-        origin: IVec3,
+        /// World voxel origin (`i64`; wrapped to 32 bits only when uploaded).
+        origin: I64Vec3,
         mesh: Arc<ChunkMesh>,
     },
     Remove {
@@ -1108,7 +1109,7 @@ fn extract(
                 .meshes
                 .extend(map.ready_meshes().map(|(id, key, mesh)| MeshOp::Upsert {
                     id: id.to_bits(),
-                    origin: key.pos.origin().as_ivec3(),
+                    origin: key.pos.origin().as_i64vec3(),
                     mesh: Arc::clone(mesh),
                 }));
         }
@@ -1124,7 +1125,7 @@ fn mesh_op(event: &ChunkMeshEvent) -> MeshOp {
     match event {
         ChunkMeshEvent::Upsert { id, key, mesh } => MeshOp::Upsert {
             id: id.to_bits(),
-            origin: key.pos.origin().as_ivec3(),
+            origin: key.pos.origin().as_i64vec3(),
             mesh: Arc::clone(mesh),
         },
         ChunkMeshEvent::Remove { id, .. } => MeshOp::Remove { id: id.to_bits() },
@@ -1544,7 +1545,7 @@ mod tests {
         }) {
             MeshOp::Upsert { id, origin, .. } => {
                 assert_eq!(id, chunk.to_bits());
-                assert_eq!(origin, IVec3::new(32, -64, 96));
+                assert_eq!(origin, I64Vec3::new(32, -64, 96));
             }
             MeshOp::Remove { .. } => panic!("expected an upsert"),
         }

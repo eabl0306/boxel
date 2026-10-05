@@ -85,7 +85,7 @@ pub struct WorldSettings {
     /// count as air. `None` (the default): no height limit. With
     /// `Some(generator.vertical_chunks())` and a large `ChunkViewer::vertical_radius`, the world
     /// streams like boxel M0 did (every layer of the generator, whatever the viewer's height).
-    pub vertical_bounds: Option<RangeInclusive<i32>>,
+    pub vertical_bounds: Option<RangeInclusive<i64>>,
 }
 
 impl Default for WorldSettings {
@@ -120,7 +120,9 @@ pub enum ChunkMeshEvent {
     Upsert {
         /// Chunk id.
         id: ChunkId,
-        /// Key (origin = `key.pos.origin()`).
+        /// Key. The mesh's world origin is `key.pos.origin()`, an `i64` voxel position: the
+        /// renderer keeps it in `i64` on the CPU and uploads its low 32 bits
+        /// (`boxel_math::wrap_to_i32`).
         key: ChunkKey,
         /// Mesh.
         mesh: Arc<ChunkMesh>,
@@ -261,7 +263,9 @@ fn async_compute_threads() -> usize {
         .max(1)
 }
 
-/// Every `ChunkViewer` with its chunk, sorted by entity (only written when it changes).
+/// Every `ChunkViewer` with its chunk, sorted by entity (only written when it changes). The chunk
+/// is exact at any `f64` position inside `i64`; past the world limit (`MAX_CHUNK_COORD`) the
+/// viewer is clamped to it.
 fn track_viewers(
     viewers: Query<(Entity, &Transform, &ChunkViewer)>,
     mut chunks: ResMut<ViewerChunks>,

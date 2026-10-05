@@ -10,11 +10,7 @@ pub(crate) fn reference_level(v: &Viewer, hysteresis: u32, p: ChunkPos) -> Level
     let r = i64::from(v.radius);
     let (vv, h) = (i64::from(v.vertical), i64::from(hysteresis));
     let c = v.center;
-    let (dx, dy, dz) = (
-        i64::from(p.x) - i64::from(c.x),
-        i64::from(p.y) - i64::from(c.y),
-        i64::from(p.z) - i64::from(c.z),
-    );
+    let (dx, dy, dz) = (p.x - c.x, p.y - c.y, p.z - c.z);
     let mesh_column = |dx: i64, dz: i64| dx * dx + dz * dz <= r * r;
     let d2 = dx * dx + dz * dz;
     let column = if mesh_column(dx, dz) {
@@ -44,7 +40,7 @@ pub(crate) fn reference_level(v: &Viewer, hysteresis: u32, p: ChunkPos) -> Level
 pub(crate) fn reference_world_level(
     viewers: &[Viewer],
     hysteresis: u32,
-    bounds: Option<&RangeInclusive<i32>>,
+    bounds: Option<&RangeInclusive<i64>>,
     p: ChunkPos,
 ) -> Level {
     if bounds.is_some_and(|b| !b.contains(&p.y)) {
@@ -59,8 +55,8 @@ pub(crate) fn reference_world_level(
 
 /// Every position at keep level or better for one viewer (brute force over its box).
 fn reference_region(v: &Viewer, hysteresis: u32) -> BTreeMap<ChunkPos, Level> {
-    let reach = i32::try_from(v.radius + 2 + hysteresis).expect("small");
-    let vreach = i32::try_from(v.vertical + 2 + hysteresis).expect("small");
+    let reach = i64::from(v.radius + 2 + hysteresis);
+    let vreach = i64::from(v.vertical + 2 + hysteresis);
     let c = v.center;
     let mut out = BTreeMap::new();
     for y in c.y - vreach..=c.y + vreach {
@@ -91,7 +87,7 @@ fn drain(mut task: Task) -> Vec<ChunkPos> {
     out.into_iter().collect()
 }
 
-fn viewer(x: i32, y: i32, z: i32, radius: u32, vertical: u32) -> Viewer {
+fn viewer(x: i64, y: i64, z: i64, radius: u32, vertical: u32) -> Viewer {
     Viewer::new(ChunkPos::new(x, y, z), radius, vertical)
 }
 
@@ -103,11 +99,7 @@ fn columns_match_the_definitions() {
             let reach = i64::from(radius + h) + 3;
             for dz in -reach..=reach {
                 for dx in -reach..=reach {
-                    let p = ChunkPos::new(
-                        i32::try_from(dx).expect("small"),
-                        0,
-                        i32::try_from(dz).expect("small"),
-                    );
+                    let p = ChunkPos::new(dx, 0, dz);
                     // A huge vertical radius makes the layer level Mesh: the column level shows.
                     let v = viewer(0, 0, 0, radius, 1000);
                     assert_eq!(
@@ -156,8 +148,8 @@ fn shape_levels_match_the_definitions() {
     for (radius, vertical, h) in [(0, 0, 0), (1, 0, 2), (3, 2, 1), (5, 1, 3), (2, 4, 0)] {
         let v = viewer(3, -2, 7, radius, vertical);
         let s = shape(v, h);
-        let reach = i32::try_from(radius + h + 3).expect("small");
-        let vreach = i32::try_from(vertical + h + 3).expect("small");
+        let reach = i64::from(radius + h + 3);
+        let vreach = i64::from(vertical + h + 3);
         for y in -2 - vreach..=-2 + vreach {
             for z in 7 - reach..=7 + reach {
                 for x in 3 - reach..=3 + reach {
@@ -346,16 +338,28 @@ fn drift_is_the_longest_move() {
     assert_eq!(drift(&old, &[(3, at(1, 0, 0)), (4, at(5, 2, 0))]), 2);
     assert_eq!(drift(&old, &[(1, at(0, 0, 0)), (3, at(0, 0, 0))]), u32::MAX);
     assert_eq!(drift(&old, &[(3, at(0, 0, 0)), (5, at(0, 0, 0))]), u32::MAX);
-    // Extreme centers do not overflow.
-    let far = Viewer::new(ChunkPos::new(i32::MIN, i32::MIN, i32::MIN), 1, 1);
-    let near = Viewer::new(ChunkPos::new(i32::MAX, i32::MAX, i32::MAX), 1, 1);
+    // Moves across the former i32 edge are measured exactly.
+    let edge = 1i64 << 31;
     assert_eq!(
-        drift(&[(1, far)], &[(1, near)]),
-        (3 * (2 * u64::from(MAX_CENTER.unsigned_abs())).pow(2)).isqrt() as u32 + 1
+        drift(
+            &[(1, at(edge - 3, 0, -edge))],
+            &[(1, at(edge + 1, 3, -edge))]
+        ),
+        5
     );
+    // Extreme centers do not overflow: clamped to the world limit, a distance past u32.
+    let far = Viewer::new(ChunkPos::new(i64::MIN, i64::MIN, i64::MIN), 1, 1);
+    let near = Viewer::new(ChunkPos::new(i64::MAX, i64::MAX, i64::MAX), 1, 1);
+    assert_eq!(drift(&[(1, far)], &[(1, near)]), u32::MAX);
     assert_eq!(
-        distance_ceil(ChunkPos::new(i32::MIN, 0, 0), ChunkPos::new(i32::MAX, 0, 0)),
+        distance_ceil(ChunkPos::new(i64::MIN, 0, 0), ChunkPos::new(i64::MAX, 0, 0)),
         u32::MAX
+    );
+    // Long distances across the former edge stay exact up to u32.
+    let d = i64::from(u32::MAX) - 1;
+    assert_eq!(
+        distance_ceil(ChunkPos::new(-edge, 0, 0), ChunkPos::new(d - edge, 0, 0)),
+        u32::MAX - 1
     );
 }
 
@@ -382,10 +386,14 @@ fn capacity_hint_is_the_keep_region() {
 
 #[test]
 fn viewers_are_clamped() {
-    let v = Viewer::new(ChunkPos::new(i32::MAX, i32::MIN, 0), u32::MAX, u32::MAX);
+    let v = Viewer::new(ChunkPos::new(i64::MAX, i64::MIN, 0), u32::MAX, u32::MAX);
     assert_eq!(v.radius, MAX_RADIUS);
     assert_eq!(v.vertical, MAX_RADIUS);
     assert_eq!(v.center, ChunkPos::new(MAX_CENTER, -MAX_CENTER, 0));
+    assert_eq!(MAX_CENTER, MAX_CHUNK_COORD);
+    // Inside the limit (past the former i32 range of blocks) nothing changes.
+    let c = ChunkPos::new(1 << 26, -(1 << 40), (1 << 55) + 3);
+    assert_eq!(Viewer::new(c, 4, 4).center, c);
 }
 
 /// A model of the world's slot set: interest per loaded position.
@@ -412,16 +420,16 @@ impl Model {
 /// One step of a random walk: which viewer, and what happens to it.
 #[derive(Clone, Debug)]
 enum Step {
-    Move(u8, i32, i32, i32),
-    Jump(u8, i32, i32, i32),
+    Move(u8, i64, i64, i64),
+    Jump(u8, i64, i64, i64),
     Radius(u8, u32, u32),
     Toggle(u8),
 }
 
 fn step() -> impl Strategy<Value = Step> {
     prop_oneof![
-        6 => (0u8..2, -2i32..=2, -2i32..=2, -2i32..=2).prop_map(|(i, x, y, z)| Step::Move(i, x, y, z)),
-        1 => (0u8..2, -20i32..=20, -20i32..=20, -20i32..=20).prop_map(|(i, x, y, z)| Step::Jump(i, x, y, z)),
+        6 => (0u8..2, -2i64..=2, -2i64..=2, -2i64..=2).prop_map(|(i, x, y, z)| Step::Move(i, x, y, z)),
+        1 => (0u8..2, -20i64..=20, -20i64..=20, -20i64..=20).prop_map(|(i, x, y, z)| Step::Jump(i, x, y, z)),
         1 => (0u8..2, 0u32..=4, 0u32..=3).prop_map(|(i, r, v)| Step::Radius(i, r, v)),
         1 => (0u8..2).prop_map(Step::Toggle),
     ]
@@ -431,24 +439,37 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(96))]
 
     /// After every change and a full drain of the planner, the modeled slot set equals the
-    /// from-scratch wanted set, and every kept unwanted slot is inside some keep region.
+    /// from-scratch wanted set, and every kept unwanted slot is inside some keep region. The walk
+    /// happens near the origin, across the former i32 edge of blocks (chunk 2^26), far past it,
+    /// and against the world limit (where viewers are clamped).
     #[test]
     fn incremental_interest_matches_from_scratch(
         steps in proptest::collection::vec(step(), 1..24),
         hysteresis in 0u32..=2,
         bounded in any::<bool>(),
+        base in prop_oneof![
+            3 => Just(0i64),
+            1 => Just((1i64 << 26) - 6),
+            1 => Just(-(1i64 << 40)),
+            1 => Just(MAX_CENTER - 6),
+        ],
     ) {
         let bounds = bounded.then_some(-3..=2);
         let mut planner = Planner::default();
         let mut model = Model::default();
-        let mut viewers: [Option<Viewer>; 2] = [Some(viewer(0, 0, 0, 2, 1)), None];
+        // `base` shifts x and z (y keeps the vertical bounds meaningful).
+        let mut viewers: [Option<Viewer>; 2] = [Some(viewer(base, 0, -base, 2, 1)), None];
         for step in steps {
             match step {
                 Step::Move(i, x, y, z) | Step::Jump(i, x, y, z) => {
                     let jump = matches!(step, Step::Jump(..));
                     let slot = &mut viewers[usize::from(i)];
                     if let Some(v) = slot {
-                        let c = if jump { ChunkPos::new(x, y, z) } else { v.center.offset(ChunkPos::new(x, y, z).as_ivec3()) };
+                        let c = if jump {
+                            ChunkPos::new(base + x, y, -base + z)
+                        } else {
+                            ChunkPos::new(v.center.x + x, v.center.y + y, v.center.z + z)
+                        };
                         *v = Viewer::new(c, v.radius, v.vertical);
                     }
                 }
@@ -461,7 +482,7 @@ proptest! {
                     let slot = &mut viewers[usize::from(i)];
                     *slot = match slot {
                         Some(_) => None,
-                        None => Some(viewer(3, 1, -2, 1, 1)),
+                        None => Some(viewer(base + 3, 1, -base - 2, 1, 1)),
                     };
                 }
             }

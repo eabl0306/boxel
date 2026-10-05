@@ -738,7 +738,7 @@ impl WorldGenerator for HoleGen {
             ChunkData::uniform(STONE)
         }
     }
-    fn vertical_chunks(&self) -> RangeInclusive<i32> {
+    fn vertical_chunks(&self) -> RangeInclusive<i64> {
         -1..=1
     }
     fn name(&self) -> &str {

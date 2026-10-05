@@ -23,7 +23,7 @@ use boxel_gfx::{
     AdapterCaps, GlVersion, RgbaImage, SmokeContext, SmokeLevel, SmokeTest, Tier, floors,
     gpu_tests_required, read_texture_rgba8, run_in_error_scopes, submit_and_wait, tier_request,
 };
-use boxel_math::{DVec3, IVec3, UVec2};
+use boxel_math::{DVec3, I64Vec3, IVec3, UVec2};
 use boxel_mesh::{BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, PackedQuad};
 use boxel_render::{RendererConfig, RendererError, RendererSmokeTest, ViewParams, VoxelRenderer};
 use boxel_transform::Transform;
@@ -439,7 +439,7 @@ fn full_arena_scenes(
     .map_err(|e| format!("full arena: VoxelRenderer::new: {e}"))?;
     for (c, mesh) in terrain {
         renderer
-            .upsert_chunk(queue, chunk_id(*c), *c * 32, mesh)
+            .upsert_chunk(queue, chunk_id(*c), (*c * 32).as_i64vec3(), mesh)
             .map_err(|e| format!("full arena: upsert {c}: {e}"))?;
     }
     // fillers behind the camera, the largest that fits first, until not one quad is free
@@ -449,7 +449,7 @@ fn full_arena_scenes(
         let free = stats.arena_capacity_quads - stats.arena_used_quads;
         let fits = (1..=free).rev().any(|n| {
             renderer
-                .upsert_chunk(queue, filler_id, IVec3::splat(-2048), &hidden_mesh(n))
+                .upsert_chunk(queue, filler_id, I64Vec3::splat(-2048), &hidden_mesh(n))
                 .is_ok()
         });
         if !fits {
@@ -466,7 +466,7 @@ fn full_arena_scenes(
         .iter()
         .find(|(c, _)| *c == REMOVED_CHUNK)
         .ok_or("full arena: no REMOVED_CHUNK")?;
-    let (id, origin) = (chunk_id(REMOVED_CHUNK), REMOVED_CHUNK * 32);
+    let (id, origin) = (chunk_id(REMOVED_CHUNK), (REMOVED_CHUNK * 32).as_i64vec3());
     let view = heightfield_view();
     let grown = hidden_mesh(original.total_quads() + 1);
     match renderer.upsert_chunk(queue, id, origin, &grown) {
@@ -530,7 +530,7 @@ fn render_tier(
 
     for (c, mesh) in terrain {
         renderer
-            .upsert_chunk(&queue, chunk_id(*c), *c * 32, mesh)
+            .upsert_chunk(&queue, chunk_id(*c), (*c * 32).as_i64vec3(), mesh)
             .map_err(|e| format!("upsert {c}: {e}"))?;
     }
     let quads: u32 = terrain.iter().map(|(_, m)| m.total_quads()).sum();
@@ -570,22 +570,22 @@ fn render_tier(
     }
     let far = far_view();
     renderer
-        .upsert_chunk(&queue, 7, IVec3::ZERO, &far_scene(registry, true, true))
+        .upsert_chunk(&queue, 7, I64Vec3::ZERO, &far_scene(registry, true, true))
         .map_err(|e| e.to_string())?;
     let (far_both, _) = render(&device, &queue, &mut renderer, &far)?;
     // replace the same chunk id with one slab at a time
     renderer
-        .upsert_chunk(&queue, 7, IVec3::ZERO, &far_scene(registry, true, false))
+        .upsert_chunk(&queue, 7, I64Vec3::ZERO, &far_scene(registry, true, false))
         .map_err(|e| e.to_string())?;
     let (far_front, _) = render(&device, &queue, &mut renderer, &far)?;
     renderer
-        .upsert_chunk(&queue, 7, IVec3::ZERO, &far_scene(registry, false, true))
+        .upsert_chunk(&queue, 7, I64Vec3::ZERO, &far_scene(registry, false, true))
         .map_err(|e| e.to_string())?;
     let (far_back, _) = render(&device, &queue, &mut renderer, &far)?;
 
     // an empty mesh removes the chunk: nothing but sky is left
     renderer
-        .upsert_chunk(&queue, 7, IVec3::ZERO, &ChunkMesh::default())
+        .upsert_chunk(&queue, 7, I64Vec3::ZERO, &ChunkMesh::default())
         .map_err(|e| e.to_string())?;
     let (empty, _) = render(&device, &queue, &mut renderer, &far)?;
     if renderer.chunk_count() != 0 || empty.non_background_fraction() != 0.0 {

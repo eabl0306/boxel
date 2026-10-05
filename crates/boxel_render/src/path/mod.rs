@@ -335,7 +335,8 @@ fn storage_entry(
 pub(crate) struct BucketDraw {
     /// Chunk table slot.
     pub slot: u32,
-    /// Chunk world origin (Low passes it as immediates).
+    /// Chunk origin as the GPU gets it, the low 32 bits of the world origin (Low passes it as
+    /// immediates).
     pub origin: IVec3,
     /// First quad in the arena.
     pub quad_start: u32,
@@ -363,7 +364,10 @@ impl CpuCull {
         self.cutout.clear();
         self.visible_chunks = 0;
         for (slot, record) in chunks.iter() {
-            let min = (record.origin - view.render_origin).as_vec3();
+            // In i64 first, then to f32 (exact for every chunk near the camera). Within the world
+            // limit (|v| <= 2^61) nothing saturates; a camera past i64 sees every chunk as far
+            // (culled) instead of overflowing.
+            let min = record.origin.saturating_sub(view.render_origin).as_vec3();
             let max = min + Vec3::splat(CHUNK_EDGE);
             if !view.frustum.intersects_aabb(&Aabb::new(min, max)) {
                 continue;
@@ -374,7 +378,7 @@ impl CpuCull {
                 if n > 0 && bucket_visible(face, min, max, view.eye_rel) {
                     self.opaque.push(BucketDraw {
                         slot,
-                        origin: record.origin,
+                        origin: record.gpu_origin(),
                         quad_start: start,
                         count: n.min(MAX_QUADS_PER_BUCKET),
                     });
@@ -385,7 +389,7 @@ impl CpuCull {
             if n > 0 {
                 self.cutout.push(BucketDraw {
                     slot,
-                    origin: record.origin,
+                    origin: record.gpu_origin(),
                     quad_start: start,
                     count: n.min(MAX_QUADS_PER_BUCKET),
                 });
@@ -413,7 +417,7 @@ mod tests {
     use crate::arena::ArenaAllocator;
     use crate::chunk_table::ChunkRecord;
     use boxel_camera::{Camera, CameraView};
-    use boxel_math::DVec3;
+    use boxel_math::{DVec3, I64Vec3, wrap_to_i32};
     use boxel_transform::Transform;
 
     /// Camera at `eye` looking along `-Z` rotated by yaw/pitch (radians).
@@ -425,7 +429,7 @@ mod tests {
     }
 
     /// Chunks with one quad in every opaque face bucket, two cutout quads and one translucent.
-    fn table_with(origins: &[IVec3]) -> ChunkTable {
+    fn table_with(origins: &[I64Vec3]) -> ChunkTable {
         let mut arena = ArenaAllocator::new(1 << 16, 1024);
         let mut table = ChunkTable::new(64);
         for (i, origin) in origins.iter().enumerate() {
@@ -489,7 +493,7 @@ mod tests {
     #[test]
     fn cpu_cull_drops_hidden_face_buckets_and_keeps_the_cutout_bucket() {
         // Camera above the chunk looking down: the -Y bucket faces away from it.
-        let table = table_with(&[IVec3::new(0, 0, 0)]);
+        let table = table_with(&[I64Vec3::new(0, 0, 0)]);
         let view = camera_view(DVec3::new(16.5, 80.5, 16.5), 0.0, -89f32.to_radians());
         let mut cull = CpuCull::default();
         cull.run(&table, &view);
@@ -510,7 +514,7 @@ mod tests {
     fn cutout_bucket_only_needs_the_frustum() {
         // Camera inside the first chunk: every face bucket passes. The second chunk is behind the
         // camera and is culled entirely, cutout bucket included.
-        let table = table_with(&[IVec3::new(0, 0, 0), IVec3::new(0, 0, 320)]);
+        let table = table_with(&[I64Vec3::new(0, 0, 0), I64Vec3::new(0, 0, 320)]);
         let view = camera_view(DVec3::new(16.5, 16.5, 16.5), 0.0, 0.0);
         let mut cull = CpuCull::default();
         cull.run(&table, &view);
@@ -523,18 +527,69 @@ mod tests {
     #[test]
     fn far_chunks_are_culled_by_the_view_distance() {
         // Camera::default().view_distance = 384: a chunk 1000 voxels ahead is past the far plane.
-        let table = table_with(&[IVec3::new(0, 0, -64), IVec3::new(0, 0, -1000)]);
+        let table = table_with(&[I64Vec3::new(0, 0, -64), I64Vec3::new(0, 0, -1000)]);
         let view = camera_view(DVec3::new(16.5, 16.5, 16.5), 0.0, 0.0);
         let mut cull = CpuCull::default();
         cull.run(&table, &view);
         assert_eq!(cull.visible_chunks, 1);
         assert!(cull.opaque.iter().chain(&cull.cutout).all(|d| d.slot == 0));
         // integer subtraction first: the same result far from the world origin
-        let far = 1 << 24;
-        let table = table_with(&[IVec3::new(far, 0, far - 64)]);
-        let eye = DVec3::new(f64::from(far) + 16.5, 16.5, f64::from(far) + 16.5);
+        let far = 1i64 << 24;
+        let table = table_with(&[I64Vec3::new(far, 0, far - 64)]);
+        let eye = DVec3::new(far as f64 + 16.5, 16.5, far as f64 + 16.5);
         cull.run(&table, &camera_view(eye, 0.0, 0.0));
         assert_eq!(cull.visible_chunks, 1);
         assert_eq!(visible_faces(&cull, &table, 0), [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn cpu_cull_is_exact_across_the_former_i32_edge() {
+        // Chunks around a camera in chunk (0, 0, 0): ahead, beside, behind and past the view
+        // distance. Shifted so the camera and the chunks straddle +-2^31 (where i32 origins used
+        // to overflow) and far beyond, the same buckets must pass in the same order.
+        let layout = [
+            I64Vec3::new(0, 0, 0),
+            I64Vec3::new(0, 0, -64),
+            I64Vec3::new(-32, 0, -32),
+            I64Vec3::new(32, -32, -96),
+            I64Vec3::new(0, 0, 320),
+            I64Vec3::new(0, 0, -1024),
+        ];
+        let run = |shift: I64Vec3| {
+            let origins: Vec<I64Vec3> = layout.iter().map(|o| *o + shift).collect();
+            let table = table_with(&origins);
+            let eye = shift.as_dvec3() + DVec3::new(16.5, 20.25, 16.5);
+            let mut cull = CpuCull::default();
+            cull.run(&table, &camera_view(eye, 0.3, -0.2));
+            let buckets = |list: &[BucketDraw]| -> Vec<(u32, u32, u32)> {
+                list.iter()
+                    .map(|d| (d.slot, d.quad_start, d.count))
+                    .collect()
+            };
+            // Low draws with the wrapped origin of each chunk.
+            for d in cull.opaque.iter().chain(&cull.cutout) {
+                assert_eq!(d.origin, wrap_to_i32(origins[d.slot as usize]));
+            }
+            (
+                cull.visible_chunks,
+                buckets(&cull.opaque),
+                buckets(&cull.cutout),
+            )
+        };
+        let near = run(I64Vec3::ZERO);
+        assert_eq!(
+            near.0, 4,
+            "the chunks behind and past the far plane are culled"
+        );
+        for shift in [
+            I64Vec3::new((1 << 31) - 32, 0, -(1 << 31)),
+            I64Vec3::new(-(1 << 31), 64, (1 << 31) - 64),
+            I64Vec3::new(1 << 40, -(1 << 31), -(1 << 40)),
+            // The eye is still exact in f64 here (steps of 1/4); far beyond, f64 rounds the
+            // camera itself (the documented next limit), not the integer math.
+            I64Vec3::new(1 << 50, 0, -(1 << 50)),
+        ] {
+            assert_eq!(run(shift), near, "shift {shift}");
+        }
     }
 }

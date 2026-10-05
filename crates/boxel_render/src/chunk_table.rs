@@ -1,6 +1,6 @@
 //! Chunk slots: `ChunkGpu` storage table (High/Mid) mirrored on the CPU (all tiers, CPU culling).
 use crate::arena::ArenaAlloc;
-use boxel_math::IVec3;
+use boxel_math::{I64Vec3, IVec3, wrap_to_i32};
 use boxel_mesh::BUCKET_COUNT;
 use boxel_shaders::gpu::ChunkGpu;
 use std::collections::{BTreeSet, HashMap};
@@ -10,8 +10,8 @@ use std::collections::{BTreeSet, HashMap};
 pub(crate) struct ChunkRecord {
     /// Caller id (`ChunkId::to_bits`).
     pub id: u64,
-    /// World voxel min corner; the culling AABB is `[origin, origin + 32]`.
-    pub origin: IVec3,
+    /// World voxel min corner (`i64`); the culling AABB is `[origin, origin + 32]`.
+    pub origin: I64Vec3,
     /// Quad range of all buckets (bucket 0 first).
     pub alloc: ArenaAlloc,
     /// Quads per bucket.
@@ -19,10 +19,16 @@ pub(crate) struct ChunkRecord {
 }
 
 impl ChunkRecord {
+    /// The origin as the GPU stores it: its low 32 bits ([`wrap_to_i32`]). The shaders only use
+    /// it minus the (equally wrapped) render origin, exact for chunks nearer than `2^31` voxels.
+    pub fn gpu_origin(&self) -> IVec3 {
+        wrap_to_i32(self.origin)
+    }
+
     /// The GPU mirror of this record.
     pub fn gpu(&self) -> ChunkGpu {
         ChunkGpu {
-            origin: self.origin.to_array(),
+            origin: self.gpu_origin().to_array(),
             quad_base: self.alloc.offset,
             counts: self.counts,
             flags: ChunkGpu::FLAG_LIVE,
@@ -137,7 +143,7 @@ mod tests {
         counts[6] = 1;
         ChunkRecord {
             id,
-            origin: IVec3::new(id as i32 * 32, 0, 0),
+            origin: I64Vec3::new(id as i64 * 32, 0, 0),
             alloc: arena.allocate(3).expect("arena"),
             counts,
         }
@@ -167,11 +173,11 @@ mod tests {
         table.insert(record(&mut arena, 5));
         table.insert(record(&mut arena, 6));
         let mut updated = record(&mut arena, 5);
-        updated.origin = IVec3::new(-64, 32, 96);
+        updated.origin = I64Vec3::new(-64, 32, 96);
         assert_eq!(table.insert(updated), Some(0));
         assert_eq!(table.len(), 2);
         let (slot, r) = table.get(5).expect("record");
-        assert_eq!((slot, r.origin), (0, IVec3::new(-64, 32, 96)));
+        assert_eq!((slot, r.origin), (0, I64Vec3::new(-64, 32, 96)));
     }
 
     #[test]
@@ -217,5 +223,15 @@ mod tests {
         assert_eq!(gpu.counts, r.counts);
         assert_eq!(gpu.flags, ChunkGpu::FLAG_LIVE);
         assert_eq!(gpu.pad, [0; 3]);
+    }
+
+    #[test]
+    fn far_origins_upload_their_low_32_bits() {
+        let mut arena = ArenaAllocator::new(1024, 64);
+        let mut r = record(&mut arena, 0);
+        // 2^31 wraps to i32::MIN, -2^31 - 32 to i32::MAX - 31, 2^40 + 64 to 64.
+        r.origin = I64Vec3::new(1 << 31, -(1 << 31) - 32, (1 << 40) + 64);
+        assert_eq!(r.gpu().origin, [i32::MIN, i32::MAX - 31, 64]);
+        assert_eq!(r.gpu_origin(), IVec3::from_array(r.gpu().origin));
     }
 }

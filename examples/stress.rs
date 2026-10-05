@@ -33,7 +33,7 @@ use boxel::app::{TaskPoolOptions, TaskPoolThreadAssignmentPolicy};
 use boxel::gfx::{CLI_HELP, PresentModePref};
 use boxel::prelude::*;
 use boxel::render::GpuFailed;
-use boxel::voxel::{BlockPos, BlockRegistry, ChunkData, ChunkKey, ChunkPos};
+use boxel::voxel::{BlockPos, BlockRegistry, ChunkData, ChunkKey, ChunkPos, MAX_BLOCK_COORD};
 use boxel::world::jobs::{JobExecutor, TaskPoolExecutor};
 use boxel::world::{ChunkId, ChunkMeshEvent, WorldStats, WorldSystems};
 use boxel::worldgen::TerrainSettings;
@@ -206,6 +206,15 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                     .ok()
                     .filter(|c: &[f64; 5]| c.iter().all(|x| x.is_finite()))
                     .ok_or_else(|| format!("{flag}: {v:?} is not x,y,z,yaw,pitch"))?;
+                if o.camera[..3]
+                    .iter()
+                    .any(|c| c.abs() > MAX_BLOCK_COORD as f64)
+                {
+                    return Err(format!(
+                        "{flag}: {v:?} is outside the world: x, y and z must be within \
+                         +-{MAX_BLOCK_COORD} (2^61 voxels)"
+                    ));
+                }
             }
             "--size" => {
                 let v = value()?;
@@ -277,7 +286,7 @@ impl WorldGenerator for CountingGenerator {
         data
     }
 
-    fn vertical_chunks(&self) -> RangeInclusive<i32> {
+    fn vertical_chunks(&self) -> RangeInclusive<i64> {
         self.inner.vertical_chunks()
     }
 
@@ -969,6 +978,8 @@ mod tests {
             &["--duration", "0"],
             &["--duration"],
             &["--camera", "1,2,3"],
+            &["--camera", "3e18,80,0,0,0"],
+            &["--camera", "0,0,-1e300,0,0"],
             &["--size", "0x10"],
             &["--async-threads", "0"],
             &["--fly"],
@@ -1001,6 +1012,23 @@ mod tests {
         let b = camera_at(Scenario::Fly, start, 32.0, 20.0, 32.1 / 32.0);
         let (ca, cb) = (chunk_of(&a), chunk_of(&b));
         assert_eq!((cb.x - ca.x, cb.y - ca.y, cb.z - ca.z), (1, 0, 0));
+        // Past the former i32 edge (2^31 voxels): the crossing is still one chunk in x.
+        let edge = [
+            2_147_483_647.0 - 31.9,
+            140.0,
+            -2_147_483_648.0 - 16.0,
+            -90.0,
+            -20.0,
+        ];
+        let a = camera_at(Scenario::Fly, edge, 32.0, 20.0, 31.0 / 32.0);
+        let b = camera_at(Scenario::Fly, edge, 32.0, 20.0, 33.0 / 32.0);
+        let (ca, cb) = (chunk_of(&a), chunk_of(&b));
+        assert_eq!((ca.x, cb.x, ca.z), ((1 << 26) - 1, 1 << 26, -(1 << 26) - 1));
+        // Far cameras parse.
+        let far = parse(&["--camera", "3e9,80,-1e12,0,0"])
+            .expect("valid")
+            .expect("not help");
+        assert_eq!(far.camera[..3], [3e9, 80.0, -1e12]);
         // The default start is the middle of a chunk.
         let o = parse(&[]).expect("valid").expect("not help");
         let begin = camera_at(Scenario::Fly, o.camera, 32.0, 20.0, 0.0);

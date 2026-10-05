@@ -214,7 +214,7 @@ pub(crate) struct Ctx<'a> {
     pub(crate) map: &'a mut ChunkMap,
     pub(crate) content: &'a WorldContent,
     pub(crate) events: &'a mut Vec<ChunkMeshEvent>,
-    generator_layers: Option<RangeInclusive<i32>>,
+    generator_layers: Option<RangeInclusive<i64>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -233,7 +233,7 @@ impl<'a> Ctx<'a> {
 
     /// True if the generator declares layer `y` all air (outside its `vertical_chunks()`, queried
     /// once per run): such chunks are created as air without a generation job.
-    fn known_air(&mut self, y: i32) -> bool {
+    fn known_air(&mut self, y: i64) -> bool {
         !self
             .generator_layers
             .get_or_insert_with(|| self.content.generator.vertical_chunks())

@@ -21,9 +21,9 @@ pub trait WorldGenerator: Send + Sync + 'static {
     /// Chunk-y range that may contain non-air blocks: every chunk outside it is uniform air. The
     /// world creates those chunks as air without calling [`WorldGenerator::generate`] (they still
     /// exist and can be edited: the range is not a height limit). The default,
-    /// `i32::MIN..=i32::MAX`, promises nothing.
-    fn vertical_chunks(&self) -> RangeInclusive<i32> {
-        i32::MIN..=i32::MAX
+    /// `i64::MIN..=i64::MAX`, promises nothing.
+    fn vertical_chunks(&self) -> RangeInclusive<i64> {
+        i64::MIN..=i64::MAX
     }
     /// Name for logs.
     fn name(&self) -> &str;
@@ -64,7 +64,7 @@ impl WorldGenerator for FlatGenerator {
                 )
             })
             .collect();
-        let y0 = i64::from(key.pos.origin().y);
+        let y0 = key.pos.origin().y;
         if y0 + i64::from(CHUNK_SIZE) <= 0 || y0 >= self.total_height() {
             // Fully below 0 or above the layers.
             return ChunkData::uniform(BlockState::AIR);
@@ -95,10 +95,9 @@ impl WorldGenerator for FlatGenerator {
         }
         ChunkData::from_dense(&dense)
     }
-    fn vertical_chunks(&self) -> RangeInclusive<i32> {
+    fn vertical_chunks(&self) -> RangeInclusive<i64> {
         // Empty (`0..=-1`) when there are no layers.
-        let top = (self.total_height() - 1).min(i64::from(i32::MAX));
-        0..=(top >> CHUNK_SHIFT) as i32
+        0..=((self.total_height() - 1) >> CHUNK_SHIFT)
     }
     fn name(&self) -> &str {
         "flat"
@@ -167,13 +166,14 @@ impl TerrainGenerator {
     /// Surface height at world column `(x, z)` (top solid block y). Exposed for tests/spawn.
     ///
     /// `base_height + round(amplitude * fbm_2d(seed, x * frequency, z * frequency, octaves, 2.0,
-    /// 0.5))`, so it never leaves `base_height +- ceil(|amplitude|)`.
-    pub fn height_at(&self, x: i32, z: i32) -> i32 {
+    /// 0.5))`, so it never leaves `base_height +- ceil(|amplitude|)`. The columns are converted
+    /// to `f64` (exact up to `2^53`; bit-identical to the former `i32` API inside `i32`).
+    pub fn height_at(&self, x: i64, z: i64) -> i32 {
         let s = &self.settings;
         let n = noise::fbm_2d(
             self.seed,
-            f64::from(x) * s.frequency,
-            f64::from(z) * s.frequency,
+            column(x) * s.frequency,
+            column(z) * s.frequency,
             s.octaves,
             FBM_LACUNARITY,
             FBM_GAIN,
@@ -184,10 +184,11 @@ impl TerrainGenerator {
     /// Heights of the 32x32 columns whose min corner is `(x0, z0)`, indexed `x * 32 + z` (like
     /// one y layer of a chunk). Equal to [`TerrainGenerator::height_at`] per column, computed
     /// with one lattice hash per corner and octave.
-    fn column_heights(&self, x0: i32, z0: i32) -> [i32; CHUNK_AREA] {
+    fn column_heights(&self, x0: i64, z0: i64) -> [i32; CHUNK_AREA] {
         let s = &self.settings;
-        let axis = |origin: i32| -> [f64; CHUNK_SIZE as usize] {
-            std::array::from_fn(|i| f64::from(origin + i as i32) * s.frequency)
+        // `origin + i` cannot overflow: chunk origins are within the world limit (`+-2^61`).
+        let axis = |origin: i64| -> [f64; CHUNK_SIZE as usize] {
+            std::array::from_fn(|i| column(origin + i as i64) * s.frequency)
         };
         let mut noise = [0.0; CHUNK_AREA];
         noise::fbm_2d_grid(
@@ -224,6 +225,12 @@ impl TerrainGenerator {
     }
 }
 
+/// A world column coordinate as the `f64` the noise samples (exact up to `2^53`, rounded
+/// beyond).
+fn column(c: i64) -> f64 {
+    c as f64
+}
+
 impl Default for TerrainGenerator {
     fn default() -> Self {
         Self::new(0x00b0_7e1d, TerrainSettings::default())
@@ -240,13 +247,15 @@ impl WorldGenerator for TerrainGenerator {
         let s = &self.settings;
         let origin = key.pos.origin();
         let y0 = origin.y;
-        let y1 = y0 + (CHUNK_SIZE - 1);
+        let y1 = y0 + i64::from(CHUNK_SIZE - 1);
+        // Heights and settings are i32; the chunk's y range is compared in i64.
+        let bottom = i64::from(s.bottom);
         // Fast paths that need no heights: above every column, below the floor, and (the rule
         // below with the lowest possible column) fully inside the stone.
-        if y1 < s.bottom || y0 > self.max_possible_height().max(s.bottom) {
+        if y1 < bottom || y0 > i64::from(self.max_possible_height().max(s.bottom)) {
             return ChunkData::uniform(BlockState::AIR);
         }
-        if y0 > s.bottom && y1 < self.min_possible_height().saturating_sub(s.dirt_depth) {
+        if y0 > bottom && y1 < i64::from(self.min_possible_height().saturating_sub(s.dirt_depth)) {
             return ChunkData::uniform(block(registry, "boxel:stone", "TerrainGenerator"));
         }
         // Column heights, indexed like one y layer of the chunk: `x * 32 + z`.
@@ -255,11 +264,11 @@ impl WorldGenerator for TerrainGenerator {
             .iter()
             .fold((i32::MAX, i32::MIN), |(lo, hi), &h| (lo.min(h), hi.max(h)));
         // `max(bottom)`: the bedrock floor exists even under (degenerate) terrain below it.
-        if y0 > max_h.max(s.bottom) {
+        if y0 > i64::from(max_h.max(s.bottom)) {
             return ChunkData::uniform(BlockState::AIR);
         }
         let stone = block(registry, "boxel:stone", "TerrainGenerator");
-        if y0 > s.bottom && y1 < min_h.saturating_sub(s.dirt_depth) {
+        if y0 > bottom && y1 < i64::from(min_h.saturating_sub(s.dirt_depth)) {
             return ChunkData::uniform(stone);
         }
         let bedrock = block(registry, "boxel:bedrock", "TerrainGenerator");
@@ -277,7 +286,7 @@ impl WorldGenerator for TerrainGenerator {
             }
         };
         // World y to chunk-local y, clamped to the chunk.
-        let local = |y: i32| (i64::from(y) - i64::from(y0)).clamp(0, CHUNK_SIZE.into()) as usize;
+        let local = |y: i32| (i64::from(y) - y0).clamp(0, CHUNK_SIZE.into()) as usize;
         let mut dense = vec![BlockState::AIR; CHUNK_VOLUME];
         for (column, &h) in heights.iter().enumerate() {
             // The column rules as runs: each voxel takes the first run whose end is above it,
@@ -303,10 +312,10 @@ impl WorldGenerator for TerrainGenerator {
     }
     /// `(bottom >> 5) ..= ((base_height + ceil(|amplitude|) + 1) >> 5)`; the end never goes below
     /// the chunk of `bottom` (degenerate settings with the floor above every column).
-    fn vertical_chunks(&self) -> RangeInclusive<i32> {
+    fn vertical_chunks(&self) -> RangeInclusive<i64> {
         let bottom = self.settings.bottom;
         let top = self.max_possible_height().saturating_add(1).max(bottom);
-        (bottom >> CHUNK_SHIFT)..=(top >> CHUNK_SHIFT)
+        i64::from(bottom >> CHUNK_SHIFT)..=i64::from(top >> CHUNK_SHIFT)
     }
     fn name(&self) -> &str {
         "terrain"
@@ -353,10 +362,12 @@ mod tests {
                 (-32, 64),
                 (-4096, -1_000_000),
                 (1 << 25, -(1 << 24)),
+                // Across the former i32 edge.
+                ((1 << 31) - 16, -(1 << 31) - 16),
             ] {
                 let grid = g.column_heights(x0, z0);
                 for (column, &h) in grid.iter().enumerate() {
-                    let (x, z) = (x0 + (column >> 5) as i32, z0 + (column & 31) as i32);
+                    let (x, z) = (x0 + (column >> 5) as i64, z0 + (column & 31) as i64);
                     assert_eq!(h, g.height_at(x, z), "seed {seed} column ({x}, {z})");
                 }
             }

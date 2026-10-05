@@ -160,6 +160,8 @@ tracing.workspace = true
 [[example]]
 name = "headless_world"
 required-features = ["voxel"]
+# Runs its option and jump-check tests with `cargo test`.
+test = true
 
 [[example]]
 name = "voxel_world"

@@ -10,7 +10,7 @@ fn bench(c: &mut Criterion) {
     let range = terrain.vertical_chunks();
 
     // The chunk holding the surface at column (0, 0).
-    let surface = ChunkKey::new(ChunkPos::new(0, terrain.height_at(0, 0) >> 5, 0));
+    let surface = ChunkKey::new(ChunkPos::new(0, (terrain.height_at(0, 0) >> 5).into(), 0));
     // An all-air chunk inside the height band: needs the 32x32 heights before it can answer.
     let air_in_band = (0..64)
         .flat_map(|x| {
@@ -21,7 +21,9 @@ fn bench(c: &mut Criterion) {
         })
         .find(|&k| {
             k.pos.origin().y
-                <= terrain.settings.base_height + terrain.settings.amplitude.ceil() as i32
+                <= i64::from(
+                    terrain.settings.base_height + terrain.settings.amplitude.ceil() as i32,
+                )
                 && terrain.generate(k, &registry).as_uniform() == Some(BlockState::AIR)
         })
         .expect("an all-air chunk inside the height band");
