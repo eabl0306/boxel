@@ -2,9 +2,11 @@
 //!
 //! `cargo run --release --example voxel_world -- [GPU options] [options]` (see `--help`).
 //! Interactive by default: left click grabs the mouse, WASD/Space/`ShiftLeft` fly, `ControlLeft`
-//! boosts, Escape releases the cursor, F3 toggles the debug overlay. The automation flags
-//! (`--frames`, `--screenshot`, `--minimize-test`, `--resize-test`, ...) make it close by
-//! itself.
+//! boosts, Escape releases the cursor, F3 toggles the debug overlay, F5 cycles the frame limit
+//! (30, 60, 144, 240, unlimited) and F6 toggles vsync. The automation flags (`--frames`,
+//! `--duration`, `--screenshot`, `--minimize-test`, `--resize-test`, `--vsync-test`, ...) make
+//! it close by itself; the last summary line gives the update and presented frame rates and the
+//! CPU use (Linux).
 //!
 //! Exit codes: 0 success, 1 usage error, 2 no usable GPU, 3 check failed (screenshot, image
 //! diff, resize, minimize), 4 timeout.
@@ -15,6 +17,7 @@
 
 use boxel::app::{TaskPoolOptions, TaskPoolThreadAssignmentPolicy};
 use boxel::camera::FlyCameraSystems;
+use boxel::gfx::wgpu::PresentMode;
 use boxel::gfx::{CLI_HELP, DeviceClass, RgbaImage};
 use boxel::prelude::*;
 use boxel::render::{DebugDestroyDevice, GpuFailed, GpuReady, SurfaceInfo};
@@ -35,7 +38,12 @@ usage: voxel_world [GPU options] [options]
   --frames N              exit 0 after N rendered frames (automation: renders while hidden,
                           disables fly-camera input)
   --wait-chunks           start counting frames once the world settled for 3 frames
+  --duration SECS         exit 0 after SECS seconds of the normal (interactive) path
   --timeout SECS          wall-clock limit, exit 4 (default 120 with automation flags)
+  --fps-limit N           max updates per second, 0 = unlimited (default 144; F5 cycles it)
+  --vsync on|off          vsync (default off, so the fps limit governs; F6 toggles it)
+  --vsync-test            switch vsync at frame 30 and back at frame 60, check the surface
+                          follows (implies --frames 120)
   --screenshot PATH       at frame N save a PNG of the frame (implies --frames 120)
   --expect-terrain        after the screenshot: non-background fraction in [0.05, 0.99]
   --compare-to PATH       after the screenshot: compare with PATH (channel tolerance 2)
@@ -83,6 +91,11 @@ const MINIMIZED_MIN_FIXED_STEPS: u64 = 60;
 /// Default mesh radius, and the one used on software adapters.
 const DEFAULT_RADIUS: u32 = 12;
 const SOFTWARE_RADIUS: u32 = 6;
+/// `--vsync-test`: frame of the first switch, frame of the switch back, and frames allowed for
+/// `RenderInfo::present_mode` to follow (the surface is reconfigured in the next `Render`).
+const VSYNC_AT: u64 = 30;
+const VSYNC_BACK_AT: u64 = 60;
+const VSYNC_SETTLE_FRAMES: u64 = 2;
 
 // ---------------------------------------------------------------------------------------------
 // Options
@@ -107,11 +120,17 @@ struct Options {
     async_threads: Option<usize>,
     trees: bool,
     debug_overlay: bool,
+    duration: Option<Duration>,
+    /// `None`: the engine default (`FrameLimit::default()`, 144).
+    fps_limit: Option<u32>,
+    /// `None`: the engine default (`PresentSettings::default()`, vsync off).
+    vsync: Option<bool>,
+    vsync_test: bool,
 }
 
 impl Options {
     fn automation(&self) -> bool {
-        self.frames.is_some() || self.minimize_test || self.resize_test
+        self.frames.is_some() || self.duration.is_some() || self.minimize_test || self.resize_test
     }
 }
 
@@ -135,6 +154,10 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         async_threads: None,
         trees: true,
         debug_overlay: false,
+        duration: None,
+        fps_limit: None,
+        vsync: None,
+        vsync_test: false,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -216,13 +239,32 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             }
             "--no-trees" => o.trees = false,
             "--debug-overlay" => o.debug_overlay = true,
+            "--duration" => o.duration = Some(Duration::from_secs(number(flag, &value()?)?)),
+            "--fps-limit" => {
+                let n = number(flag, &value()?)?;
+                o.fps_limit = Some(
+                    u32::try_from(n)
+                        .ok()
+                        .filter(|n| *n <= 100_000)
+                        .ok_or_else(|| format!("{flag}: {n} is not in 0..=100000"))?,
+                );
+            }
+            "--vsync" => {
+                let v = value()?;
+                o.vsync = Some(match v.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err(format!("{flag}: {v:?} is not on or off")),
+                });
+            }
+            "--vsync-test" => o.vsync_test = true,
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
     if (o.expect_terrain || o.compare_to.is_some()) && o.screenshot.is_none() {
         return Err("--expect-terrain and --compare-to need --screenshot".to_string());
     }
-    if o.frames.is_none() && (o.screenshot.is_some() || o.resize_test) {
+    if o.frames.is_none() && (o.screenshot.is_some() || o.resize_test || o.vsync_test) {
         o.frames = Some(IMPLIED_FRAMES);
     }
     if o.frames.is_none() && (o.wait_chunks || !o.simulate_device_loss.is_empty()) {
@@ -412,6 +454,51 @@ enum Minimize {
     Done,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VsyncTest {
+    Off,
+    /// Before frame `VSYNC_AT`.
+    Pending,
+    /// Vsync was switched to `vsync` at frame `at`; the surface had `original` before.
+    Switched {
+        at: u64,
+        original: PresentMode,
+        vsync: bool,
+        reconfigures: u32,
+    },
+    /// Switched back at frame `at`.
+    Restored {
+        at: u64,
+        original: PresentMode,
+        switched_to: PresentMode,
+        reconfigures: u32,
+    },
+    Done,
+}
+
+/// The start of the rate measurement printed at exit.
+#[derive(Clone, Copy, Debug)]
+struct Probe {
+    at: Instant,
+    updates: u64,
+    presented: u64,
+    cpu: Option<Duration>,
+    /// Started once the world had settled (loading excluded).
+    settled: bool,
+}
+
+impl Probe {
+    fn start(run: &Run, info: &RenderInfo, settled: bool) -> Self {
+        Self {
+            at: Instant::now(),
+            updates: run.updates,
+            presented: info.frames_presented,
+            cpu: process_cpu_time(),
+            settled,
+        }
+    }
+}
+
 #[derive(Resource)]
 struct Run {
     options: Options,
@@ -425,12 +512,23 @@ struct Run {
     losses_sent: usize,
     resize: Resize,
     minimize: Minimize,
+    vsync_test: VsyncTest,
+    probe: Option<Probe>,
+    /// The frame limit as of the latest `drive` (F5 may change it).
+    limit: FrameLimit,
     exiting: bool,
 }
 
 impl Run {
     fn new(options: Options) -> Self {
         Self {
+            vsync_test: if options.vsync_test {
+                VsyncTest::Pending
+            } else {
+                VsyncTest::Off
+            },
+            probe: None,
+            limit: FrameLimit::new(options.fps_limit.unwrap_or(FrameLimit::default().max_fps)),
             counting_from: (!options.wait_chunks).then_some(0),
             shot: if options.screenshot.is_some() {
                 Shot::Pending
@@ -462,17 +560,22 @@ impl Run {
             .map(|base| info.frames_rendered.saturating_sub(base))
     }
 
-    /// Every requested check is done (`--frames` reached, screenshot checked, resize seen,
-    /// minimize test finished).
+    /// Every requested check is done (`--frames` reached, `--duration` elapsed, screenshot
+    /// checked, resize seen, minimize and vsync tests finished).
     fn complete(&self, info: &RenderInfo) -> bool {
         let frames_done = match self.options.frames {
             Some(frames) => self.counted(info).is_some_and(|c| c >= frames),
             None => true,
         };
         frames_done
+            && self
+                .options
+                .duration
+                .is_none_or(|d| self.started.elapsed() >= d)
             && matches!(self.shot, Shot::Off | Shot::Done)
             && matches!(self.resize, Resize::Off | Resize::Done)
             && matches!(self.minimize, Minimize::Off | Minimize::Done)
+            && matches!(self.vsync_test, VsyncTest::Off | VsyncTest::Done)
     }
 
     /// Prints the summary and writes the exit status once.
@@ -491,8 +594,57 @@ impl Run {
             info.dropped_chunks,
             self.started.elapsed().as_secs_f64()
         );
+        if let Some(probe) = self.probe {
+            let seconds = probe.at.elapsed().as_secs_f64();
+            let cpu = match (probe.cpu, process_cpu_time()) {
+                (Some(start), Some(end)) if seconds > 0.0 => format!(
+                    "{:.1}%",
+                    end.saturating_sub(start).as_secs_f64() / seconds * 100.0
+                ),
+                _ => "n/a".to_string(),
+            };
+            let limit = match self.limit.max_fps {
+                0 => "none".to_string(),
+                fps => fps.to_string(),
+            };
+            let present = info
+                .present_mode
+                .map_or_else(|| "none".to_string(), |m| format!("{m:?}"));
+            println!(
+                "boxel: rates over {seconds:.1}s ({}): updates={:.1}/s presented={:.1}/s \
+                 limit={limit} present={present} cpu={cpu} (100% = one core)",
+                if probe.settled {
+                    "world settled"
+                } else {
+                    "while loading"
+                },
+                (self.updates - probe.updates) as f64 / seconds.max(1e-9),
+                (info.frames_presented - probe.presented) as f64 / seconds.max(1e-9),
+            );
+        }
         exit.write(AppExit::from_code(code));
     }
+}
+
+/// CPU time used by the whole process so far (all threads): the sum of the first field of
+/// `/proc/self/task/*/schedstat` (nanoseconds on a CPU). Linux only; `None` elsewhere.
+fn process_cpu_time() -> Option<Duration> {
+    let tasks = std::fs::read_dir("/proc/self/task").ok()?;
+    let mut total = 0u64;
+    for task in tasks.flatten() {
+        // A thread that exits meanwhile is skipped.
+        let Ok(stat) = std::fs::read_to_string(task.path().join("schedstat")) else {
+            continue;
+        };
+        if let Some(nanos) = stat
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            total += nanos;
+        }
+    }
+    Some(Duration::from_nanos(total))
 }
 
 #[derive(Resource, Default)]
@@ -528,11 +680,23 @@ fn gpu_events(
     mut failed: MessageReader<GpuFailed>,
     mut run: ResMut<Run>,
     info: Res<RenderInfo>,
+    present: Res<PresentSettings>,
     mut viewers: Query<(&mut ChunkViewer, &mut Camera)>,
     mut exit: MessageWriter<AppExit>,
 ) {
     for event in ready.read() {
         println!("boxel: {}", event.summary);
+        let limit = match run.limit.max_fps {
+            0 => "unlimited".to_string(),
+            fps => format!("{fps} fps"),
+        };
+        let mode = info
+            .present_mode
+            .map_or_else(|| "none".to_string(), |m| format!("{m:?}"));
+        println!(
+            "boxel: frame limit {limit}, vsync wanted {}, present mode {mode}",
+            on_off(present.is_vsync()),
+        );
         if info.class == Some(DeviceClass::Software) && run.options.view_distance.is_none() {
             for (mut viewer, mut camera) in &mut viewers {
                 viewer.radius = SOFTWARE_RADIUS;
@@ -559,12 +723,14 @@ fn drive(
     surface: Res<SurfaceInfo>,
     window: NonSend<PrimaryWindow>,
     state: Res<WindowState>,
+    limit: Res<FrameLimit>,
     mut resized: MessageReader<WindowResized>,
     mut destroy: MessageWriter<DebugDestroyDevice>,
     mut screenshot: MessageWriter<RequestScreenshot>,
     mut exit: MessageWriter<AppExit>,
 ) {
     run.updates += 1;
+    run.limit = *limit;
     if run.exiting {
         return;
     }
@@ -592,6 +758,17 @@ fn drive(
     let Some(counted) = run.counted(&info) else {
         return;
     };
+    // Rates are measured from the first rendered frame, and again from the moment the world
+    // settles (so loading does not count when the run is long enough).
+    let world_settled = stats.chunks > 0 && stats.is_settled();
+    let restart = match run.probe {
+        None => info.ready && info.frames_rendered > 0,
+        Some(probe) => !probe.settled && world_settled,
+    };
+    if restart {
+        let probe = Probe::start(&run, &info, world_settled);
+        run.probe = Some(probe);
+    }
 
     if let Some(&at) = run.options.simulate_device_loss.get(run.losses_sent)
         && counted >= at
@@ -646,10 +823,13 @@ fn drive(
         _ => {}
     }
 
-    let Some(frames) = run.options.frames else {
-        return;
+    // `--frames` reached, or a `--duration` run (`complete` checks the time). Without either,
+    // `minimize_test` decides when to exit.
+    let target_reached = match run.options.frames {
+        Some(frames) => counted >= frames,
+        None => run.options.duration.is_some(),
     };
-    if counted < frames {
+    if !target_reached {
         return;
     }
     if run.shot == Shot::Pending {
@@ -806,6 +986,98 @@ fn minimize_test(
     }
 }
 
+fn on_off(on: bool) -> &'static str {
+    if on { "on" } else { "off" }
+}
+
+/// `--vsync-test`: switch vsync at frame `VSYNC_AT` and back at `VSYNC_BACK_AT`; each time the
+/// surface must be reconfigured (same device) without errors, vsync on must give `Fifo` and the
+/// switch back must restore the original mode.
+fn vsync_test(
+    mut run: ResMut<Run>,
+    info: Res<RenderInfo>,
+    surface: Res<SurfaceInfo>,
+    mut present: ResMut<PresentSettings>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    if run.exiting {
+        return;
+    }
+    let (Some(counted), Some(mode)) = (run.counted(&info), info.present_mode) else {
+        return;
+    };
+    let failure = match run.vsync_test {
+        VsyncTest::Pending if counted >= VSYNC_AT => {
+            let vsync = !present.is_vsync();
+            present.set_vsync(vsync);
+            println!(
+                "boxel: vsync test: {mode:?}, switching vsync {} at frame {counted}",
+                on_off(vsync)
+            );
+            run.vsync_test = VsyncTest::Switched {
+                at: counted,
+                original: mode,
+                vsync,
+                reconfigures: surface.reconfigures,
+            };
+            None
+        }
+        VsyncTest::Switched {
+            at,
+            original,
+            vsync,
+            reconfigures,
+        } if counted >= VSYNC_BACK_AT.max(at + VSYNC_SETTLE_FRAMES) => {
+            if surface.reconfigures == reconfigures {
+                Some("the surface was not reconfigured".to_string())
+            } else if vsync && mode != PresentMode::Fifo {
+                Some(format!("vsync on gave {mode:?}, not Fifo"))
+            } else {
+                present.set_vsync(!vsync);
+                println!(
+                    "boxel: vsync test: {mode:?}, switching vsync {} at frame {counted}",
+                    on_off(!vsync)
+                );
+                run.vsync_test = VsyncTest::Restored {
+                    at: counted,
+                    original,
+                    switched_to: mode,
+                    reconfigures: surface.reconfigures,
+                };
+                None
+            }
+        }
+        VsyncTest::Restored {
+            at,
+            original,
+            switched_to,
+            reconfigures,
+        } if counted >= at + VSYNC_SETTLE_FRAMES => {
+            if surface.reconfigures == reconfigures {
+                Some("the surface was not reconfigured back".to_string())
+            } else if mode != original {
+                Some(format!("switching back gave {mode:?}, not {original:?}"))
+            } else if surface.errors > 0 {
+                Some(format!("{} surface errors", surface.errors))
+            } else {
+                println!(
+                    "boxel: vsync test: {original:?} -> {switched_to:?} -> {mode:?} \
+                     reconfigures={} errors=0",
+                    surface.reconfigures
+                );
+                run.vsync_test = VsyncTest::Done;
+                None
+            }
+        }
+        _ => None,
+    };
+    if let Some(failure) = failure {
+        eprintln!("boxel: vsync test failed: {failure}");
+        run.vsync_test = VsyncTest::Done;
+        run.exit(3, &info, &mut exit);
+    }
+}
+
 /// Kills the process if `main` has not returned `limit` after start (the event loop stopped
 /// updating, so the in-app timeout cannot fire). Dropping the returned sender disarms it.
 fn spawn_watchdog(limit: Duration) -> Sender<()> {
@@ -876,7 +1148,8 @@ fn main() -> AppExit {
         })
         .set(DebugOverlayPlugin {
             visible: options.debug_overlay,
-            ..DebugOverlayPlugin::default()
+            // F5 cycles the frame limit, F6 toggles vsync.
+            frame_keys: Some(FrameKeys::default()),
         });
     if let Some(threads) = options.async_threads {
         plugins = plugins.set(TaskPoolPlugin {
@@ -891,9 +1164,18 @@ fn main() -> AppExit {
         });
     }
 
+    let fps_limit = options.fps_limit;
+    let vsync = options.vsync;
     let mut app = App::new();
-    app.add_plugins(plugins)
-        .add_plugins((LogDiagnosticsPlugin::default(), FlyCameraPlugin))
+    app.add_plugins(plugins);
+    // After the plugins, so these replace the engine defaults (144 fps, vsync off).
+    if let Some(fps) = fps_limit {
+        app.insert_resource(FrameLimit::new(fps));
+    }
+    if let Some(on) = vsync {
+        app.insert_resource(PresentSettings::vsync(on));
+    }
+    app.add_plugins((LogDiagnosticsPlugin::default(), FlyCameraPlugin))
         // The camera moves first; the world then computes interest from the new position.
         .configure_sets(Update, FlyCameraSystems.before(WorldSystems::Interest))
         .insert_resource(Run::new(options))
@@ -902,7 +1184,14 @@ fn main() -> AppExit {
         .add_systems(FixedUpdate, count_fixed_steps)
         .add_systems(
             Update,
-            (gpu_events, drive, check_screenshot, minimize_test).chain(),
+            (
+                gpu_events,
+                drive,
+                check_screenshot,
+                minimize_test,
+                vsync_test,
+            )
+                .chain(),
         );
     app.run()
 }
