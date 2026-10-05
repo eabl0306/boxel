@@ -17,10 +17,13 @@ boxel_camera.workspace = true
 boxel_render.workspace = true
 boxel_voxel.workspace = true
 boxel_world.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 # Tests get system/component names in ECS diagnostics (dev-only; users opt in through boxel/debug).
 boxel_ecs = { workspace = true, features = ["debug"] }
+# `RenderInfo::present_mode` values in the overlay text tests.
+wgpu.workspace = true
 
 [lints]
 workspace = true

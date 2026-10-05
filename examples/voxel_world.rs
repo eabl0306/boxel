@@ -876,6 +876,7 @@ fn main() -> AppExit {
         })
         .set(DebugOverlayPlugin {
             visible: options.debug_overlay,
+            ..DebugOverlayPlugin::default()
         });
     if let Some(threads) = options.async_threads {
         plugins = plugins.set(TaskPoolPlugin {

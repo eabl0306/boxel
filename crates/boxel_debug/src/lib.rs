@@ -3,11 +3,16 @@
 //! `boxel_render::OverlayDraw`, which the render plugin draws on top of every frame (and so in
 //! screenshots too).
 //!
-//! Shown: average FPS and frame time with the worst frame of the last second, the GPU (adapter,
-//! backend, tier, device class, driver), the camera (position, chunk, facing) and the chunk
-//! counters of `boxel_world::WorldStats` plus the GPU-side chunk and draw call counts of
+//! Shown: frames presented per second and app updates per second (they differ: see
+//! `boxel_app::FrameLimit`), the average and worst frame time of the last second, the frame
+//! limit with the vsync state and present mode, the GPU (adapter, backend, tier, device class,
+//! driver), the camera (position, chunk, facing) and the chunk counters of
+//! `boxel_world::WorldStats` plus the GPU-side chunk and draw call counts of
 //! `boxel_render::RenderInfo`. Missing resources (no world, no renderer yet) just hide their
 //! lines.
+//!
+//! Optional debug keys ([`FrameKeys`], off by default; F5 and F6 when on) cycle the frame limit
+//! and toggle vsync at runtime; the overlay then shows a hint line for them.
 //!
 //! Facing convention: north is -Z, east is +X; yaw is a compass heading in degrees (0 north,
 //! 90 east), pitch is positive looking up.
@@ -16,18 +21,18 @@ mod font;
 
 pub use font::{GLYPH_SIZE, TextStyle, glyph, layout_text};
 
-use boxel_app::{App, Last, Plugin, Time, Update};
+use boxel_app::{App, FrameLimit, Last, Plugin, Time, Update};
 use boxel_camera::Camera;
 use boxel_ecs::prelude::*;
 use boxel_math::DVec3;
-use boxel_render::{OverlayDraw, RenderInfo};
+use boxel_render::{OverlayDraw, PresentSettings, RenderInfo};
 use boxel_transform::Transform;
 use boxel_voxel::BlockPos;
 use boxel_window::{ButtonInput, KeyCode};
 use boxel_world::WorldStats;
 use std::collections::VecDeque;
 use std::fmt::Write;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Adds the F3 debug overlay. Requires `TimePlugin` and `RenderPlugin` (for `OverlayDraw`;
 /// the plugin inits it when missing so it also runs headless). Input comes from
@@ -36,6 +41,9 @@ use std::time::Duration;
 pub struct DebugOverlayPlugin {
     /// Start visible (screenshots, `voxel_world --debug-overlay`).
     pub visible: bool,
+    /// Debug keys for the frame limit and vsync (`None`, the default: no keys, so games keep
+    /// F5 and F6 for themselves).
+    pub frame_keys: Option<FrameKeys>,
 }
 
 /// State of the overlay. Flip `visible` from code, or press [`DebugOverlay::toggle_key`].
@@ -47,6 +55,8 @@ pub struct DebugOverlay {
     pub toggle_key: KeyCode,
     /// Text placement and colors.
     pub style: TextStyle,
+    /// Frame-settings debug keys (`None`: off); the overlay shows a hint line for them.
+    pub frame_keys: Option<FrameKeys>,
 }
 
 impl Default for DebugOverlay {
@@ -55,18 +65,54 @@ impl Default for DebugOverlay {
             visible: false,
             toggle_key: KeyCode::F3,
             style: TextStyle::default(),
+            frame_keys: None,
         }
     }
 }
 
-/// Frame times of the last second (wall clock, `Time::real_delta`).
+/// Debug keys that change the frame settings at runtime: one cycles `boxel_app::FrameLimit`
+/// through [`FRAME_LIMIT_STEPS`], the other toggles vsync in `boxel_render::PresentSettings`.
+/// Both log the new value at info level. A game's settings menu writes the same two resources.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameKeys {
+    /// Cycles the frame limit (default F5).
+    pub cycle_limit: KeyCode,
+    /// Toggles vsync (default F6).
+    pub toggle_vsync: KeyCode,
+}
+
+impl Default for FrameKeys {
+    fn default() -> Self {
+        Self {
+            cycle_limit: KeyCode::F5,
+            toggle_vsync: KeyCode::F6,
+        }
+    }
+}
+
+/// The limits [`FrameKeys::cycle_limit`] steps through, in order (0 = unlimited).
+pub const FRAME_LIMIT_STEPS: [u32; 5] = [30, 60, 144, 240, 0];
+
+/// The limit after `max_fps` in [`FRAME_LIMIT_STEPS`]: the next larger step, unlimited after
+/// the largest one (or after any value above it), and the first step after unlimited.
+pub fn next_frame_limit(max_fps: u32) -> u32 {
+    if max_fps == 0 {
+        return FRAME_LIMIT_STEPS[0];
+    }
+    FRAME_LIMIT_STEPS
+        .into_iter()
+        .find(|&step| step > max_fps)
+        .unwrap_or(0)
+}
+
+/// Frame times of the last second (wall clock, `Time::real_delta`): one entry per app update.
 #[derive(Resource, Clone, Debug, Default)]
 pub struct FrameWindow {
     frames: VecDeque<Duration>,
     sum: Duration,
 }
 
-/// Length of the [`FrameWindow`].
+/// Length of the [`FrameWindow`] and [`PresentWindow`].
 const WINDOW: Duration = Duration::from_secs(1);
 
 impl FrameWindow {
@@ -85,7 +131,7 @@ impl FrameWindow {
             self.sum -= oldest;
         }
     }
-    /// Average frames per second over the window (0 when empty).
+    /// Average updates per second over the window (0 when empty).
     pub fn fps(&self) -> f64 {
         if self.sum.is_zero() {
             0.0
@@ -106,15 +152,52 @@ impl FrameWindow {
     }
 }
 
+/// Presented frames of the last second, from `RenderInfo::frames_presented` sampled every
+/// update (frames shown on screen, as opposed to the app updates of [`FrameWindow`]).
+#[derive(Resource, Clone, Debug, Default)]
+pub struct PresentWindow {
+    samples: VecDeque<(Instant, u64)>,
+}
+
+impl PresentWindow {
+    /// Adds the presented-frame count seen at `now`, keeping the newest sample that is at
+    /// least one second old as the start of the window.
+    pub fn push(&mut self, now: Instant, presented: u64) {
+        self.samples.push_back((now, presented));
+        while self.samples.len() > 2
+            && self
+                .samples
+                .get(1)
+                .is_some_and(|&(at, _)| now.saturating_duration_since(at) >= WINDOW)
+        {
+            self.samples.pop_front();
+        }
+    }
+    /// Presented frames per second over the window (0 before two samples).
+    pub fn fps(&self) -> f64 {
+        let (Some(&(t0, c0)), Some(&(t1, c1))) = (self.samples.front(), self.samples.back()) else {
+            return 0.0;
+        };
+        let span = t1.saturating_duration_since(t0);
+        if span.is_zero() {
+            0.0
+        } else {
+            c1.saturating_sub(c0) as f64 / span.as_secs_f64()
+        }
+    }
+}
+
 impl Plugin for DebugOverlayPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(DebugOverlay {
             visible: self.visible,
+            frame_keys: self.frame_keys,
             ..DebugOverlay::default()
         })
         .init_resource::<FrameWindow>()
+        .init_resource::<PresentWindow>()
         .init_resource::<OverlayDraw>()
-        .add_systems(Update, toggle_overlay)
+        .add_systems(Update, (toggle_overlay, frame_keys))
         .add_systems(Last, (track_frames, build_overlay).chain());
     }
 }
@@ -126,15 +209,69 @@ fn toggle_overlay(keys: Option<Res<ButtonInput<KeyCode>>>, mut overlay: ResMut<D
     }
 }
 
-fn track_frames(time: Res<Time>, mut window: ResMut<FrameWindow>) {
-    window.push(time.real_delta());
+/// [`FrameKeys`]: cycles the frame limit and toggles vsync (when the keys are on and the
+/// resources exist).
+fn frame_keys(
+    keys: Option<Res<ButtonInput<KeyCode>>>,
+    overlay: Res<DebugOverlay>,
+    limit: Option<ResMut<FrameLimit>>,
+    present: Option<ResMut<PresentSettings>>,
+) {
+    let (Some(keys), Some(bind)) = (keys, overlay.frame_keys) else {
+        return;
+    };
+    if keys.just_pressed(bind.cycle_limit)
+        && let Some(mut limit) = limit
+    {
+        limit.max_fps = next_frame_limit(limit.max_fps);
+        tracing::info!("frame limit: {}", limit_text(Some(*limit)));
+    }
+    if keys.just_pressed(bind.toggle_vsync)
+        && let Some(mut present) = present
+    {
+        let on = !present.is_vsync();
+        present.set_vsync(on);
+        tracing::info!("vsync: {}", on_off(on));
+    }
+}
+
+fn track_frames(
+    time: Res<Time>,
+    render: Option<Res<RenderInfo>>,
+    mut updates: ResMut<FrameWindow>,
+    mut presented: ResMut<PresentWindow>,
+) {
+    updates.push(time.real_delta());
+    if let (Some(render), Some(now)) = (render, time.last_update()) {
+        presented.push(now, render.frames_presented);
+    }
+}
+
+fn on_off(on: bool) -> &'static str {
+    if on { "on" } else { "off" }
+}
+
+/// `144 fps`, or `none` (unlimited, or no limit resource).
+fn limit_text(limit: Option<FrameLimit>) -> String {
+    match limit {
+        Some(limit) if !limit.is_unlimited() => format!("{} fps", limit.max_fps),
+        _ => "none".to_string(),
+    }
 }
 
 /// Everything the text is made from (missing parts hide their lines).
 #[derive(Clone, Debug, Default)]
 pub struct OverlayInputs {
-    /// Average FPS, average frame time and worst frame of the last second.
+    /// App updates per second, average frame time and worst frame of the last second.
     pub frames: (f64, Duration, Duration),
+    /// Frames presented per second over the last second (`None`: no renderer).
+    pub presented_fps: Option<f64>,
+    /// The app's frame limit (`None`: no resource, so no limit).
+    pub frame_limit: Option<FrameLimit>,
+    /// Wanted presentation (`None`: no renderer).
+    pub present: Option<PresentSettings>,
+    /// Frame-settings keys to show a hint for.
+    pub frame_keys: Option<FrameKeys>,
     /// Renderer status.
     pub render: Option<RenderInfo>,
     /// Active camera: position and forward direction.
@@ -164,15 +301,52 @@ fn shorten(text: &str) -> String {
     }
 }
 
+/// `Limit 144 fps  vsync off (Mailbox)`: the vsync state is the configured present mode when a
+/// GPU is ready (plus the wanted state when it differs, as when the surface cannot turn vsync
+/// off), else the wanted one.
+fn frame_settings_line(inputs: &OverlayInputs) -> String {
+    let mut line = format!("Limit {}", limit_text(inputs.frame_limit));
+    let configured = inputs
+        .render
+        .as_ref()
+        .filter(|info| info.ready)
+        .and_then(|info| Some((info.present_mode?, info.vsync()?)));
+    let wanted = inputs.present.map(PresentSettings::is_vsync);
+    match (configured, wanted) {
+        (Some((mode, on)), wanted) => {
+            let _ = write!(line, "  vsync {} ({mode:?})", on_off(on));
+            if let Some(wanted) = wanted.filter(|&w| w != on) {
+                let _ = write!(line, "  wanted {}", on_off(wanted));
+            }
+        }
+        (None, Some(wanted)) => {
+            let _ = write!(line, "  vsync {}", on_off(wanted));
+        }
+        (None, None) => {}
+    }
+    line
+}
+
 /// The overlay text, one string per line (ASCII).
 pub fn overlay_lines(inputs: &OverlayInputs) -> Vec<String> {
     let mut lines = vec!["boxel debug (F3)".to_string()];
-    let (fps, average, worst) = inputs.frames;
+    let (updates, average, worst) = inputs.frames;
+    lines.push(match inputs.presented_fps {
+        Some(shown) => format!("FPS {shown:.0} shown  {updates:.0} updates/s"),
+        None => format!("Updates {updates:.0}/s"),
+    });
     lines.push(format!(
-        "FPS {fps:.0}  {:.2} ms avg  worst {:.2} ms (1 s)",
+        "Frame {:.2} ms avg  worst {:.2} ms (1 s)",
         average.as_secs_f64() * 1e3,
         worst.as_secs_f64() * 1e3
     ));
+    lines.push(frame_settings_line(inputs));
+    if let Some(keys) = inputs.frame_keys {
+        lines.push(format!(
+            "Keys {:?} fps limit  {:?} vsync",
+            keys.cycle_limit, keys.toggle_vsync
+        ));
+    }
     match &inputs.render {
         Some(info) if info.ready => {
             lines.push(format!("GPU {}", shorten(&info.adapter)));
@@ -245,6 +419,9 @@ pub fn overlay_lines(inputs: &OverlayInputs) -> Vec<String> {
 fn build_overlay(
     overlay: Res<DebugOverlay>,
     window: Res<FrameWindow>,
+    presented: Res<PresentWindow>,
+    limit: Option<Res<FrameLimit>>,
+    present: Option<Res<PresentSettings>>,
     render: Option<Res<RenderInfo>>,
     world: Option<Res<WorldStats>>,
     cameras: Query<(&Camera, &Transform)>,
@@ -258,6 +435,10 @@ fn build_overlay(
     }
     let inputs = OverlayInputs {
         frames: (window.fps(), window.average(), window.worst()),
+        presented_fps: render.is_some().then(|| presented.fps()),
+        frame_limit: limit.as_deref().copied(),
+        present: present.as_deref().copied(),
+        frame_keys: overlay.frame_keys,
         render: render.as_deref().cloned(),
         camera: cameras
             .iter()
@@ -317,33 +498,121 @@ mod tests {
     }
 
     #[test]
-    fn lines_show_position_chunk_and_facing() {
+    fn present_window_measures_shown_frames_over_one_second() {
+        let mut window = PresentWindow::default();
+        assert_eq!(window.fps(), 0.0);
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        // 144 updates per second, a frame shown on 5 of every 6 (120 per second), for 3 s.
+        let mut presented = 0;
+        for i in 0..432u32 {
+            if i % 6 != 0 {
+                presented += 1;
+            }
+            window.push(t0 + Duration::from_nanos(6_944_444) * i, presented);
+        }
+        assert!((window.fps() - 120.0).abs() < 1.0, "{}", window.fps());
+        // Only about one second of samples is kept.
+        assert!(window.samples.len() <= 146, "{}", window.samples.len());
+        // Nothing shown for a while (hidden window): the rate decays to 0.
+        let end = t0 + ms(3000);
+        for i in 0..200u32 {
+            window.push(end + ms(10) * i, presented);
+        }
+        assert_eq!(window.fps(), 0.0);
+    }
+
+    #[test]
+    fn frame_limit_steps_cycle() {
+        let mut limit = 144;
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            limit = next_frame_limit(limit);
+            seen.push(limit);
+        }
+        assert_eq!(seen, [240, 0, 30, 60, 144, 240]);
+        assert_eq!(
+            next_frame_limit(100),
+            144,
+            "a custom limit goes to the next step"
+        );
+        assert_eq!(next_frame_limit(1000), 0);
+    }
+
+    #[test]
+    fn frame_keys_change_the_limit_and_vsync_only_when_enabled() {
+        for enabled in [false, true] {
+            let mut app = App::new();
+            app.add_plugins((
+                TimePlugin,
+                DebugOverlayPlugin {
+                    frame_keys: enabled.then(FrameKeys::default),
+                    ..DebugOverlayPlugin::default()
+                },
+            ))
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<FrameLimit>()
+            .init_resource::<PresentSettings>();
+            app.update();
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.press(KeyCode::F5);
+            keys.press(KeyCode::F6);
+            app.update();
+            let limit = app.world().resource::<FrameLimit>().max_fps;
+            let vsync = app.world().resource::<PresentSettings>().is_vsync();
+            if enabled {
+                assert_eq!((limit, vsync), (240, true));
+            } else {
+                assert_eq!((limit, vsync), (144, false));
+            }
+        }
+    }
+
+    #[test]
+    fn lines_show_shown_and_update_rates_limit_vsync_and_keys() {
+        let mut render = RenderInfo {
+            ready: true,
+            present_mode: Some(wgpu::PresentMode::Mailbox),
+            ..RenderInfo::default()
+        };
         let inputs = OverlayInputs {
-            camera: Some((
-                DVec3::new(-1.5, 70.25, 33.0),
-                boxel_math::Vec3::new(1.0, 0.0, 0.0),
-            )),
-            world: Some(WorldStats::default()),
+            frames: (
+                144.2,
+                Duration::from_micros(6944),
+                Duration::from_micros(7100),
+            ),
+            presented_fps: Some(120.4),
+            frame_limit: Some(FrameLimit::default()),
+            present: Some(PresentSettings::default()),
+            frame_keys: Some(FrameKeys::default()),
+            render: Some(render.clone()),
             ..OverlayInputs::default()
         };
         let lines = overlay_lines(&inputs);
-        assert!(
-            lines.contains(&"XYZ -1.50 / 70.25 / 33.00".to_string()),
-            "{lines:?}"
-        );
-        assert!(
-            lines.iter().any(|l| l.starts_with("Chunk -1 2 1")),
-            "{lines:?}"
-        );
-        assert!(
-            lines.iter().any(|l| l.starts_with("Facing east (yaw 90.0")),
-            "{lines:?}"
-        );
-        assert_eq!(cardinal(0.0), "north");
-        assert_eq!(cardinal(359.0), "north");
-        assert_eq!(cardinal(180.0), "south");
-        assert_eq!(cardinal(270.0), "west");
-        assert_eq!(cardinal(314.999_999), "north");
-        assert_eq!(shorten(&"x".repeat(80)).len(), MAX_NAME);
+        assert_eq!(lines[1], "FPS 120 shown  144 updates/s");
+        assert_eq!(lines[2], "Frame 6.94 ms avg  worst 7.10 ms (1 s)");
+        assert_eq!(lines[3], "Limit 144 fps  vsync off (Mailbox)");
+        assert_eq!(lines[4], "Keys F5 fps limit  F6 vsync");
+
+        // Vsync off wanted, but the surface only offers Fifo.
+        render.present_mode = Some(wgpu::PresentMode::Fifo);
+        let inputs = OverlayInputs {
+            frame_limit: Some(FrameLimit::UNLIMITED),
+            render: Some(render),
+            frame_keys: None,
+            ..inputs
+        };
+        let lines = overlay_lines(&inputs);
+        assert_eq!(lines[3], "Limit none  vsync on (Fifo)  wanted off");
+        assert!(!lines.iter().any(|l| l.starts_with("Keys")));
+
+        // No renderer: update rate only, wanted vsync state.
+        let lines = overlay_lines(&OverlayInputs {
+            frames: (60.0, Duration::ZERO, Duration::ZERO),
+            frame_limit: Some(FrameLimit::new(60)),
+            ..OverlayInputs::default()
+        });
+        assert_eq!(lines[1], "Updates 60/s");
+        assert_eq!(lines[3], "Limit 60 fps");
     }
 }

@@ -302,6 +302,8 @@ dependencies = [
  "boxel_voxel",
  "boxel_window",
  "boxel_world",
+ "tracing",
+ "wgpu",
 ]
 
 [[package]]

@@ -16,6 +16,11 @@
 //! - The window is a non-send resource: use `NonSend<PrimaryWindow>` (main thread). Calling
 //!   winit window methods from parallel systems deadlocks on macOS and Windows.
 //!
+//! Frame rate: [`app::FrameLimit`] (in the prelude) caps updates per second, 144 by default and
+//! 0 for unlimited; `render::PresentSettings` (feature `render`, also in the prelude) switches
+//! vsync, off by default. Both are resources that any system can change at runtime, for
+//! example from a settings menu.
+//!
 //! Features: `window`, `render`, `voxel`, `png` and `debug` (ECS diagnostics with system and
 //! component names) are on by default; `trace`/`trace_tracy` add spans; `hal` adds the Vulkan
 //! escape hatch (Windows/Linux).
@@ -71,9 +76,9 @@ pub mod prelude {
     pub use boxel_window::prelude::*;
 
     #[cfg(feature = "render")]
-    pub use boxel_debug::{DebugOverlay, DebugOverlayPlugin};
+    pub use boxel_debug::{DebugOverlay, DebugOverlayPlugin, FrameKeys};
     #[cfg(feature = "render")]
-    pub use boxel_gfx::{GpuPreferences, Tier};
+    pub use boxel_gfx::{GpuPreferences, PresentModePref, Tier};
     #[cfg(feature = "render")]
     pub use boxel_render::prelude::*;
 
