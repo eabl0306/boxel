@@ -21,6 +21,10 @@ Bevy 0.19.1 y midió en esta misma máquina cómo sube las mallas.
    - El mundo tiene 6 chunks de alto (y de -64 a 127). No es infinito en vertical.
    - Nada se probó todavía con un juego real: jugador moviéndose, ediciones y cuevas.
 6. Escala: los 32 chunks de 16³ del juego en Bevy son 512 vóxeles, o sea radio 16 en boxel.
+7. Llamadas a la GPU: boxel nunca dibuja un vóxel suelto. La unidad es el chunk, mallado en quads
+   grandes. En el tier High todos los chunks visibles salen en **2 draw calls** (sólidos y hojas):
+   el overlay F3 muestra "draw calls 2" con 1096 chunks (medido). En Mid y Low es una llamada por
+   grupo de caras visible: 650 con esos mismos chunks (medido).
 
 ## Cómo leer este documento
 
@@ -289,7 +293,22 @@ El hilo aparte solo sacaba del frame el ruido y el mallado. Todo lo demás se pa
 5. **Preparación por vista.** Cada chunk se prepara para la cámara, el prepass y las 4 cascadas
    de sombra, en sistemas exclusivos. Cada chunk es su propio grupo de dibujo.
 
-### 6.2 Lado a lado
+### 6.2 Llamadas a la GPU
+
+En Bevy, cada chunk es una entidad con su malla y se prepara y se dibuja por separado (salvo lo
+que Bevy logre agrupar). Con miles de chunks eso son miles de llamadas y miles de preparaciones
+por frame, y no hay forma de cambiarlo sin tocar el motor.
+
+En boxel:
+
+| Tier | Llamadas por frame | Con 1096 chunks (overlay F3, medido) |
+|---|---|---|
+| High | 2, siempre (multi-draw indirect, la GPU decide qué se ve) | 2 |
+| Mid y Low | 1 por grupo de caras visible | 650 |
+
+El número del tier High no crece con el mundo. Es lo que permite pensar en radio 32 o más.
+
+### 6.3 Lado a lado
 
 | | Bevy 0.19 | boxel |
 |---|---|---|
@@ -307,7 +326,7 @@ CPU. Copiar esos mismos bytes ya empaquetados con un solo `write_buffer` tarda 2
 Crecer el buffer de Bevy, medido: de 128 a 192 MiB, 2.2 ms de CPU más 1.6 ms de GPU; de 256 a
 384 MiB, 4.1 ms más 3.2 ms.
 
-### 6.3 Por qué caía a 20 fps (estimación)
+### 6.4 Por qué caía a 20 fps (estimación)
 
 | Paso | Cuenta |
 |---|---|
@@ -329,7 +348,7 @@ otras causas sumadas:
 - Un lock compartido entre generadores y el hilo principal.
 - Entidades para chunks vacíos, que inflan todos los recorridos.
 
-### 6.4 Qué se lleva boxel de esto
+### 6.5 Qué se lleva boxel de esto
 
 boxel ya evita lo principal: sin entidades por chunk, sin conversión de formato, sin trabajo por
 vista, con quads 19 veces más chicos y con topes por frame. Quedan tres parecidos:
