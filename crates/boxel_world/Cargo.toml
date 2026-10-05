@@ -1,0 +1,31 @@
+[package]
+name = "boxel_world"
+description = "Chunk map, streaming lifecycle, job scheduling and edits for boxel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+boxel_ecs.workspace = true
+boxel_tasks.workspace = true
+boxel_app.workspace = true
+boxel_diagnostic.workspace = true
+boxel_math.workspace = true
+boxel_transform.workspace = true
+boxel_voxel.workspace = true
+boxel_mesh.workspace = true
+boxel_worldgen.workspace = true
+slotmap.workspace = true
+foldhash.workspace = true
+crossbeam-channel.workspace = true
+bitflags.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Tests get system/component names in ECS diagnostics (dev-only; users opt in through boxel/debug).
+boxel_ecs = { workspace = true, features = ["debug"] }
+
+[lints]
+workspace = true

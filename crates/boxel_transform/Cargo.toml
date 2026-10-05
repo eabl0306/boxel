@@ -1,0 +1,15 @@
+[package]
+name = "boxel_transform"
+description = "Transform component for boxel (f64 translation for large voxel worlds)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+boxel_ecs.workspace = true
+boxel_math.workspace = true
+
+[lints]
+workspace = true

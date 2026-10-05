@@ -1,0 +1,22 @@
+[package]
+name = "boxel_log"
+description = "Logging setup for boxel (tracing + tracing-subscriber, optional Tracy)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+tracy = ["dep:tracing-tracy", "dep:profiling", "profiling/profile-with-tracing"]
+
+[dependencies]
+boxel_app.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-tracy = { workspace = true, optional = true }
+profiling = { workspace = true, optional = true }
+thiserror.workspace = true
+
+[lints]
+workspace = true

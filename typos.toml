@@ -1,0 +1,12 @@
+[files]
+# vendor/ is upstream Bevy code (never "fix" it here); docs/ and README.md are in Spanish.
+extend-exclude = ["target/", "vendor/", "docs/", "README.md", "*.png", "*.lock"]
+
+[default]
+locale = "en-us"
+
+[default.extend-words]
+# level of detail
+lod = "lod"
+
+[default.extend-identifiers]

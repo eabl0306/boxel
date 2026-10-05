@@ -1,0 +1,17 @@
+/target/
+/vendor/target/
+**/*.rs.bk
+/.cargo/config.local.toml
+*.tracy
+*.rdc
+perf.data*
+flamegraph*.svg
+/shots/
+**/*-actual.png
+**/*-diff.png
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+# Cargo.lock IS committed (root and vendor/).

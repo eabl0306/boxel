@@ -1,0 +1,21 @@
+[package]
+name = "boxel_app"
+description = "App, plugins, schedules, time and task pools for boxel (inspired by bevy_app, not a fork)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+boxel_ecs.workspace = true
+boxel_tasks.workspace = true
+variadics_please.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Tests get system/component names in ECS diagnostics (dev-only; users opt in through boxel/debug).
+boxel_ecs = { workspace = true, features = ["debug"] }
+
+[lints]
+workspace = true

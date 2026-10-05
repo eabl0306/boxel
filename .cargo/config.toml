@@ -1,0 +1,10 @@
+# Linker: nothing to configure on x86_64-unknown-linux-gnu (rust-lld is the default since 1.90,
+# verified on 1.98.1). Per-developer tweaks (mold, target-cpu=native) go in the untracked
+# .cargo/config.local.toml (see config.local.toml.example).
+include = [{ path = "config.local.toml", optional = true }]
+
+[alias]
+lint = "clippy --workspace --all-targets --all-features --locked"
+
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"

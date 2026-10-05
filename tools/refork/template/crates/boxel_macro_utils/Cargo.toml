@@ -1,0 +1,19 @@
+# Template copied over vendor/crates/boxel_macro_utils/Cargo.toml by tools/refork/refork.sh. Edit HERE, not in vendor/.
+[package]
+name = "boxel_macro_utils"
+version = "0.1.0"
+edition = "2024"
+description = "Proc-macro helpers for boxel (fork of bevy_macro_utils)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+syn = "2.0"
+quote = "1.0"
+proc-macro2 = "1.0"
+toml_edit = { version = "0.25.1", default-features = false, features = [
+  "parse",
+] }
+
+[lints]
+workspace = true
+

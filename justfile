@@ -1,0 +1,141 @@
+# boxel task runner. Requires just >= 1.56.
+set shell := ["bash", "-euo", "pipefail", "-c"]
+set windows-shell := ["pwsh", "-NoLogo", "-Command"]
+
+msrv := `grep -m1 '^rust-version = ' Cargo.toml | cut -d'"' -f2`
+
+[default]
+list:
+    @just --list --unsorted
+
+[group('quality')]
+[doc('Format all code')]
+fmt:
+    cargo fmt
+
+[group('quality')]
+[doc('Check formatting (CI)')]
+fmt-check:
+    cargo fmt --check
+
+[group('quality')]
+[doc('Clippy on every target and feature; warnings are errors')]
+[env('CARGO_BUILD_WARNINGS', 'deny')]
+lint:
+    cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+    python3 tools/ecs_surface.py
+
+[group('quality')]
+[doc('Dependency policy: advisories, licenses, bans, sources, no bevy* crates, lock sync')]
+deny:
+    cargo deny --all-features check
+    python3 tools/no_bevy.py
+    python3 tools/vendor_lock_sync.py
+
+[group('quality')]
+[doc('Spell check (code only; Spanish docs are excluded). BOXEL_SKIP_TYPOS=1 skips it explicitly')]
+typos:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "${BOXEL_SKIP_TYPOS:-}" = "1" ]; then echo "typos: skipped (BOXEL_SKIP_TYPOS=1)"; exit 0; fi
+    command -v typos >/dev/null || { echo "typos is not installed: cargo install typos-cli --locked (or BOXEL_SKIP_TYPOS=1)"; exit 1; }
+    typos
+
+[group('quality')]
+[doc('Build docs; rustdoc warnings are errors')]
+[env('CARGO_BUILD_WARNINGS', 'deny')]
+doc:
+    cargo doc --workspace --no-deps --all-features --locked
+
+[group('quality')]
+[doc('Compile with the declared MSRV toolchain')]
+msrv:
+    rustup toolchain install {{ msrv }} --profile minimal --no-self-update
+    cargo +{{ msrv }} check --workspace --all-targets --locked
+
+[group('test')]
+[doc('Unit + integration tests (GPU tests self-skip without an adapter)')]
+test *args:
+    cargo test --workspace --locked {{ args }}
+
+[group('test')]
+[doc('GPU tests forced onto Mesa lavapipe (Vulkan, CPU)')]
+[env('WGPU_BACKEND', 'vulkan')]
+[env('WGPU_ADAPTER_NAME', 'llvmpipe')]
+[env('BOXEL_REQUIRE_GPU', '1')]
+test-lavapipe:
+    cargo test --workspace --locked --test '*gpu*' -- --test-threads=1
+
+# NVIDIA's glvnd EGL vendor wins on hybrid laptops when headless; force Mesa's.
+[group('test')]
+[doc('GPU tests forced onto Mesa llvmpipe (GL via EGL, CPU)')]
+[env('__EGL_VENDOR_LIBRARY_FILENAMES', '/usr/share/glvnd/egl_vendor.d/50_mesa.json')]
+[env('LIBGL_ALWAYS_SOFTWARE', '1')]
+[env('WGPU_BACKEND', 'gl')]
+[env('BOXEL_REQUIRE_GPU', '1')]
+test-llvmpipe:
+    cargo test --workspace --locked --test '*gpu*' -- --test-threads=1
+
+[group('test')]
+[doc('GPU tests on every real adapter of this machine')]
+[env('BOXEL_REQUIRE_GPU', '1')]
+test-gpu:
+    cargo test --workspace --locked --test '*gpu*' -- --nocapture --test-threads=1
+
+[group('test')]
+[doc('Tests of the vendored ECS fork (its own workspace; upstream expects backtraces + debug)')]
+[env('RUST_BACKTRACE', '1')]
+test-vendor:
+    cd vendor && cargo test --workspace --lib --locked
+    cd vendor && cargo test -p boxel_ecs --doc --features debug --locked
+
+[group('test')]
+[doc('Miri on the vendored ECS (needs: rustup toolchain install nightly-2026-09-30 --component miri)')]
+[env('MIRIFLAGS', '-Zmiri-disable-isolation')]
+[env('CARGO_BUILD_WARNINGS', 'warn')]
+[env('RUSTFLAGS', '-Zrandomize-layout')]
+miri:
+    cd vendor && cargo +nightly-2026-09-30 miri test -p boxel_ecs -p boxel_ptr -p boxel_tasks --lib
+
+[group('test')]
+[doc('Benchmarks (criterion). Filter: just bench mesh')]
+bench *args:
+    cargo bench --workspace {{ args }}
+
+[group('run')]
+[doc('Headless GPU report: just gpu-info --backend gl')]
+gpu-info *args:
+    cargo run -p boxel_gfx --example gpu_info -- {{ args }}
+
+[group('run')]
+[doc('Run an example: just run voxel_world --tier mid')]
+run example *args:
+    cargo run --release --example {{ example }} -- {{ args }}
+
+[group('run')]
+[doc('Optimized build with symbols, for Tracy/perf/RenderDoc')]
+run-profiling example *args:
+    cargo run --profile profiling --features trace_tracy --example {{ example }} -- {{ args }}
+
+[group('run')]
+[doc('RenderDoc capture under XWayland (RenderDoc does not support Wayland)')]
+[env('WAYLAND_DISPLAY', '')]
+[env('QT_QPA_PLATFORM', 'xcb')]
+renderdoc example *args:
+    cargo build --profile profiling --example {{ example }}
+    @echo "In qrenderdoc launch target/profiling/examples/{{ example }} {{ args }} (env WAYLAND_DISPLAY= is set)"
+    qrenderdoc
+
+[group('vendor')]
+[doc('Regenerate vendor/ from upstream bevy (default version: tools/refork/UPSTREAM_VERSION)')]
+refork *version:
+    tools/refork/refork.sh {{ version }}
+
+[group('vendor')]
+[doc('Check that vendor/Cargo.lock and Cargo.lock agree on shared packages')]
+vendor-lock:
+    python3 tools/vendor_lock_sync.py
+
+[group('ci')]
+[doc('Everything the per-PR CI runs, locally')]
+ci: fmt-check lint test doc deny typos test-vendor

@@ -1,0 +1,18 @@
+[package]
+name = "boxel_math"
+description = "Math types and helpers for boxel (glam re-export, AABB, frustum, reverse-Z projection)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+glam.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

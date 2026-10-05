@@ -1,0 +1,169 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_BUILD_WARNINGS: deny # Cargo >= 1.97: rustc + rustdoc warnings are errors without RUSTFLAGS churn
+  RUST_BACKTRACE: 1
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: cargo fmt --check # never --all: it would also format vendor/
+
+  clippy:
+    name: clippy (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # --all-features includes `hal`, which compiles to nothing on macOS (cfg-gated: wgpu-hal has
+      # no Vulkan backend there without vulkan-portability).
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - if: runner.os == 'Linux'
+        run: python3 tools/ecs_surface.py
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04 # Mesa lavapipe (Vulkan) + llvmpipe (GL): GPU tests REQUIRED
+            require_gpu: "1"
+          - os: windows-2025 # WARP / whatever exists: GPU tests self-skip
+            require_gpu: ""
+          - os: macos-15 # Metal: GPU tests self-skip if no adapter
+            require_gpu: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Mesa software rasterizers (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libvulkan1 mesa-vulkan-drivers libegl1 libegl-mesa0 libgl1-mesa-dri
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Unit + integration tests
+        run: cargo test --workspace --locked
+      - name: GPU tests on Vulkan (lavapipe)
+        if: runner.os == 'Linux'
+        env:
+          BOXEL_REQUIRE_GPU: ${{ matrix.require_gpu }}
+          WGPU_BACKEND: vulkan
+          WGPU_ADAPTER_NAME: llvmpipe
+        run: cargo test --workspace --locked --test '*gpu*' -- --nocapture --test-threads=1
+      - name: GPU tests on GL (llvmpipe via EGL)
+        if: runner.os == 'Linux'
+        env:
+          BOXEL_REQUIRE_GPU: ${{ matrix.require_gpu }}
+          WGPU_BACKEND: gl
+          __EGL_VENDOR_LIBRARY_FILENAMES: /usr/share/glvnd/egl_vendor.d/50_mesa.json
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: cargo test --workspace --locked --test '*gpu*' -- --nocapture --test-threads=1
+      - name: gpu_info (informational; DX12 uses FXC unless dxcompiler.dll is on PATH)
+        if: runner.os != 'Linux'
+        continue-on-error: true
+        run: cargo run --locked -p boxel_gfx --example gpu_info -- --all-tiers
+      - name: gpu_info (smoke)
+        if: runner.os == 'Linux'
+        env:
+          WGPU_BACKEND: vulkan
+        run: cargo run --locked -p boxel_gfx --example gpu_info
+
+  vendor:
+    name: vendored ECS tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: vendor
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test --workspace --lib --locked
+        working-directory: vendor
+      - run: cargo test -p boxel_ecs --doc --features debug --locked
+        working-directory: vendor
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: echo "version=$(grep -m1 '^rust-version = ' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - run: rustup toolchain install "${{ steps.msrv.outputs.version }}" --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo +${{ steps.msrv.outputs.version }} check --workspace --all-targets --all-features --locked
+
+  docs:
+    name: docs
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo doc --workspace --no-deps --all-features --locked
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features
+      - name: no bevy* crates anywhere (root and vendor graphs)
+        run: python3 tools/no_bevy.py
+      - name: vendor/Cargo.lock agrees with Cargo.lock
+        run: python3 tools/vendor_lock_sync.py
+
+  typos:
+    name: typos
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: crate-ci/typos@00f422f3b19c57bc6338715ebfe3316d38768461 # v1.50.3

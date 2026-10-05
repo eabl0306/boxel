@@ -1,0 +1,17 @@
+[package]
+name = "boxel_facade_check"
+description = "CI-only: proves the derive macros resolve ::boxel::ecs for a crate that depends only on the boxel facade"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Depends ONLY on the facade (no boxel_ecs): BevyManifest then resolves derives to ::boxel::ecs,
+# which is what real users get. A direct boxel_ecs dependency would mask a broken refork rename.
+[dependencies]
+boxel = { path = "../..", default-features = false }
+
+[lints]
+workspace = true

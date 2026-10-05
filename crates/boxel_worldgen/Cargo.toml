@@ -1,0 +1,21 @@
+[package]
+name = "boxel_worldgen"
+description = "World generation traits and M0 generators (flat, noise terrain) for boxel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+boxel_voxel.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "terrain"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "boxel_shaders"
+description = "WGSL shaders and their #[repr(C)] GPU mirror types for boxel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wgpu.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+naga = { workspace = true, features = ["wgsl-in", "glsl-out", "msl-out", "hlsl-out", "spv-out"] }
+boxel_mesh.workspace = true
+
+[lints]
+workspace = true

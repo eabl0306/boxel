@@ -1,0 +1,20 @@
+[package]
+name = "boxel_diagnostic"
+description = "Frame statistics and periodic diagnostic logging for boxel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+boxel_ecs.workspace = true
+boxel_app.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Tests get system/component names in ECS diagnostics (dev-only; users opt in through boxel/debug).
+boxel_ecs = { workspace = true, features = ["debug"] }
+
+[lints]
+workspace = true

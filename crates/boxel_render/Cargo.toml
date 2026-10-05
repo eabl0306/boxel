@@ -1,0 +1,42 @@
+[package]
+name = "boxel_render"
+description = "boxel's voxel renderer: High/Mid/Low tier paths over one quad format, no render graph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# PNG screenshots (RequestScreenshot). Without it ScreenshotSaved carries an error.
+png = ["boxel_gfx/png"]
+
+[dependencies]
+boxel_ecs.workspace = true
+boxel_app.workspace = true
+boxel_diagnostic.workspace = true
+boxel_math.workspace = true
+boxel_transform.workspace = true
+boxel_window.workspace = true
+boxel_camera.workspace = true
+boxel_gfx.workspace = true
+boxel_shaders.workspace = true
+boxel_voxel.workspace = true
+boxel_mesh.workspace = true
+boxel_world.workspace = true
+wgpu.workspace = true
+bytemuck.workspace = true
+offset-allocator.workspace = true
+pollster.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+boxel_gfx = { workspace = true, features = ["png"] }
+boxel_worldgen.workspace = true
+# Tests get system/component names in ECS diagnostics (dev-only; users opt in through boxel/debug).
+boxel_ecs = { workspace = true, features = ["debug"] }
+pollster.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,31 @@
+# Template copied over vendor/crates/boxel_utils/Cargo.toml by tools/refork/refork.sh. Edit HERE, not in vendor/.
+[package]
+name = "boxel_utils"
+version = "0.1.0"
+edition = "2024"
+description = "Small utilities for boxel_ecs (fork of bevy_utils plus a minimal bevy_platform replacement)"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["parallel", "std"]
+parallel = ["dep:thread_local"]
+buffered_channel = ["dep:async-channel"]
+std = ["disqualified/alloc"]
+debug = []
+serialize = ["dep:serde", "hashbrown/serde"]
+
+[dependencies]
+disqualified = { version = "1.0", default-features = false }
+thread_local = { version = "1.0", optional = true }
+async-channel = { version = "2.3.0", optional = true }
+indexmap = { version = "2", default-features = false }
+hashbrown = { version = "0.16.1", default-features = false, features = ["equivalent", "raw-entry", "inline-more"] }
+foldhash = { version = "0.2.0", default-features = false, features = ["std"] }
+futures-lite = { version = "2.0.1", default-features = false, features = ["std"] }
+serde = { version = "1", default-features = false, optional = true }
+
+[dev-dependencies]
+static_assertions = "1.1.0"
+
+[lints]
+workspace = true

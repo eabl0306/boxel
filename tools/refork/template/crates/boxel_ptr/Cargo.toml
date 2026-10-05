@@ -1,0 +1,14 @@
+# Template copied over vendor/crates/boxel_ptr/Cargo.toml by tools/refork/refork.sh. Edit HERE, not in vendor/.
+[package]
+name = "boxel_ptr"
+version = "0.1.0"
+edition = "2024"
+description = "Untyped pointer utilities for boxel_ecs (fork of bevy_ptr)"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85.0"
+
+[dependencies]
+
+[lints]
+workspace = true
+

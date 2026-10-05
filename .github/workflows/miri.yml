@@ -1,0 +1,38 @@
+# file: .github/workflows/miri.yml
+name: Miri
+# Weekly, on demand, and on every PR that touches the vendored ECS or its regeneration tooling
+# (backports of unsound/UB fixes must not merge without Miri).
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "vendor/**"
+      - "tools/refork/**"
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned nightly: bump deliberately (Miri breaks often on new nightlies).
+  MIRI_NIGHTLY: nightly-2026-09-30
+  # New nightly lints in upstream code we must not edit would otherwise fail the job.
+  CARGO_BUILD_WARNINGS: warn
+jobs:
+  miri:
+    name: Miri (vendored ECS)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install "$MIRI_NIGHTLY" --profile minimal --component miri --no-self-update
+      - run: cargo +"$MIRI_NIGHTLY" miri test --locked -p boxel_ecs -p boxel_ptr -p boxel_tasks --lib
+        working-directory: vendor
+        env:
+          RUSTFLAGS: -Zrandomize-layout
+          MIRIFLAGS: -Zmiri-disable-isolation

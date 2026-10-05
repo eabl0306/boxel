@@ -1,0 +1,21 @@
+# Template copied over vendor/crates/boxel_ecs_macros/Cargo.toml by tools/refork/refork.sh. Edit HERE, not in vendor/.
+[package]
+name = "boxel_ecs_macros"
+version = "0.1.0"
+description = "Derive macros for boxel_ecs (fork of bevy_ecs_macros)"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+boxel_macro_utils = { path = "../boxel_macro_utils", version = "0.1.0" }
+boxel_ecs_macro_logic = { path = "../boxel_ecs_macro_logic", version = "0.1.0" }
+
+syn = { version = "2.0.108", features = ["full", "extra-traits"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+[lints]
+workspace = true
+

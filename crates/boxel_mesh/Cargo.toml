@@ -1,0 +1,24 @@
+[package]
+name = "boxel_mesh"
+description = "Binary greedy meshing of 32^3 voxel chunks into 8-byte PackedQuads for boxel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+boxel_voxel.workspace = true
+binary-greedy-meshing.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "mesh"
+harness = false
+
+[lints]
+workspace = true

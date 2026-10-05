@@ -1,0 +1,5 @@
+[toolchain]
+# Bump deliberately (1.99.0 is out since 2026-10-01). MSRV lives in Cargo.toml (rust-version).
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

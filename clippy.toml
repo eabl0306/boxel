@@ -1,0 +1,14 @@
+# MSRV is read from `rust-version` in Cargo.toml.
+allow-print-in-tests = true
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-dbg-in-tests = true
+avoid-breaking-exported-api = false
+doc-valid-idents = ["WebGPU", "WGSL", "SPIR-V", "GLES", "OpenGL", "Vulkan", "RenderDoc", "DirectX", "MoltenVK", "llvmpipe", "lavapipe", "radeonsi", "RADV", "glvnd", "EGL", "Wayland", "XWayland", ".."]
+stack-size-threshold = 524288
+array-size-threshold = 16384
+disallowed-methods = [
+  { path = "std::thread::sleep", reason = "blocks the frame; use the runner's pacing (allowed with #[expect] in runners only)" },
+  { path = "wgpu::util::initialize_adapter_from_env", reason = "panics on no match; use boxel_gfx::select_gpu" },
+  { path = "wgpu::util::initialize_adapter_from_env_or_default", reason = "use boxel_gfx::select_gpu" },
+]

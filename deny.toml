@@ -1,0 +1,76 @@
+# cargo-deny 0.20.x (flags such as --all-features go before `check`).
+# vendor/ is a separate Cargo workspace: its crates are path dependencies here, so licenses,
+# advisories and bans apply to them too, but [bans.workspace-dependencies] only to crates/*.
+[graph]
+all-features = true
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+]
+
+[output]
+feature-depth = 1
+
+[advisories]
+unmaintained = "workspace"
+unsound = "workspace"
+yanked = "deny"
+ignore = [
+  # { id = "RUSTSEC-YYYY-NNNN", reason = "why", expiry = "2027-01-01" },
+]
+
+[licenses]
+allow = [
+  "MIT", "MIT-0", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause",
+  "BSL-1.0", "CC0-1.0", "ISC", "Unicode-3.0", "Zlib",
+]
+confidence-threshold = 0.9
+unused-allowed-license = "allow"
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+deny = [
+  { crate = "wgpu", deny-multiple-versions = true },
+  { crate = "naga", deny-multiple-versions = true },
+  { crate = "glam", deny-multiple-versions = true },
+  { crate = "winit", deny-multiple-versions = true },
+  { crate = "raw-window-handle", deny-multiple-versions = true },
+  { crate = "tracy-client", deny-multiple-versions = true },
+  # Policy (ADR 0003): no Bevy crates in the tree; the ECS is vendored under vendor/.
+  # cargo-deny needs exact names; tools/no_bevy.py (CI) catches every other bevy* name.
+  { crate = "bevy", reason = "boxel is standalone" },
+  { crate = "bevy_ecs", reason = "use the vendored boxel_ecs" },
+  { crate = "bevy_ecs_macros", reason = "use the vendored boxel_ecs_macros" },
+  { crate = "bevy_ecs_macro_logic", reason = "use the vendored boxel_ecs_macro_logic" },
+  { crate = "bevy_macro_utils", reason = "use the vendored boxel_macro_utils" },
+  { crate = "bevy_ptr", reason = "use the vendored boxel_ptr" },
+  { crate = "bevy_utils", reason = "use the vendored boxel_utils" },
+  { crate = "bevy_app", reason = "use boxel_app" },
+  { crate = "bevy_tasks", reason = "use the vendored boxel_tasks" },
+  { crate = "bevy_platform", reason = "replaced by boxel_utils::platform" },
+  { crate = "bevy_reflect", reason = "not used" },
+  { crate = "bevy_reflect_derive", reason = "not used" },
+  { crate = "bevy_derive", reason = "not used" },
+  { crate = "bevy_math", reason = "use boxel_math (glam)" },
+  { crate = "bevy_color", reason = "not used" },
+]
+
+[bans.workspace-dependencies]
+duplicates = "deny"
+include-path-dependencies = true
+unused = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

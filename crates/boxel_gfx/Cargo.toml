@@ -1,0 +1,33 @@
+[package]
+name = "boxel_gfx"
+description = "boxel's thin layer over wgpu: runtime backend/adapter detection, capability tiers, smoke tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["png"]
+# PNG encoding for RgbaImage::save_png (screenshots, test artifacts).
+png = ["dep:png"]
+# Vulkan escape hatch (as_hal). Unsafe; compiled only on Windows/Linux/Android/FreeBSD
+# (wgpu-hal's Vulkan backend is off on Apple targets without vulkan-portability).
+hal = []
+
+[dependencies]
+wgpu.workspace = true
+pollster.workspace = true
+serde.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+png = { workspace = true, optional = true }
+
+[dev-dependencies]
+pollster.workspace = true
+# examples/gpu_info.rs logs through boxel_log (dev-only: the library stays ECS-free).
+boxel_log.workspace = true
+
+[lints]
+workspace = true
