@@ -156,6 +156,10 @@ _stress scenario *args:
     out="bench-results/$(date +%Y%m%d-%H%M%S)-{{ scenario }}"
     label="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
     git diff --quiet HEAD 2>/dev/null || label="$label-dirty"
+    cargo build --release --locked --example stress
+    # A busy machine (a build, another session's tests) ruins the numbers: wait, and if it
+    # never calms down, run anyway but mark the run.
+    tools/wait-idle.sh 60 || label="$label-busy"
     cargo run --release --locked --example stress -- --scenario {{ scenario }} --label "$label" \
         --csv "$out.csv" --summary "$out.md" {{ args }}
     python3 tools/bench_report.py "$out.md"

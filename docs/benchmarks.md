@@ -30,8 +30,10 @@ como en M0: úsalo para comparar con corridas viejas, que no tienen radio vertic
 Para que los números sirvan:
 
 - Siempre en release (las recetas ya lo hacen).
-- Con la máquina quieta: nada compilando ni otro juego abierto. El resumen anota la carga del
-  sistema (load average) al empezar y al terminar.
+- Con la máquina quieta: nada compilando ni otro juego abierto. Las recetas compilan primero y
+  después esperan hasta 60 s a que la CPU se calme (`tools/wait-idle.sh`). Si no se calma, corren
+  igual pero la etiqueta de la corrida termina en `-busy`: esos números no sirven para comparar.
+  El resumen también anota la carga del sistema (load average) al empezar y al terminar.
 - Comparar solo corridas con la misma GPU, escenario, radio y velocidad.
 
 ## Escenarios
@@ -105,6 +107,7 @@ Cualquier juego con `FrameStatsPlugin` (está en `DefaultPlugins`) tiene el recu
 
 ## Notas
 
-- Cuando el motor tenga límite de fps, stress tiene que ponerlo en 0 (sin límite). Está marcado
-  con `TODO(frame-limit)` en `examples/stress.rs`.
+- Para compilar o correr tests en segundo plano sin frenar el escritorio está `tools/quiet.sh`
+  (ejemplo: `tools/quiet.sh cargo test --workspace`). Deja como mucho 2 trabajos pesados a la vez,
+  con prioridad baja y un tope de RAM, y no arranca si quedan menos de 40 GB de disco.
 - La primera medición está en [rendimiento/baseline-2026-10.md](rendimiento/baseline-2026-10.md).
