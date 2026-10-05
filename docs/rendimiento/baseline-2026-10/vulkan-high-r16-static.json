@@ -1,74 +1,3 @@
-# boxel stress: static r16
-
-- Run: 2026-10-05 14:00:16 UTC, release build, label `e933486`, AMD Ryzen 7 250 w/ Radeon 780M Graphics (16 threads), load 4.57 -> 5.40.
-- GPU: NVIDIA GeForce RTX 5050 Laptop GPU, Vulkan High (Discrete), driver `NVIDIA 595.91.07`, present immediate, window 1280x720.
-- World: seed 11566621, trees on, radius 16, settled in 0.62 s with 5598 chunks; 20 s measured after 2 s of warmup.
-
-## Frames
-
-| frames | avg fps | p50 ms | p95 ms | p99 ms | p99.9 ms | max ms | 1% low fps | > 6.94 ms | > 16.7 ms |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 117840 | 5892 | 0.14 | 0.33 | 0.47 | 2.54 | 10.11 | 946 | 1 | 0 |
-
-| frames | count | p50 ms | p99 ms | max ms |
-|---|---:|---:|---:|---:|
-| crossed a chunk border | 0 | - | - | - |
-| other | 117840 | 0.14 | 0.47 | 10.11 |
-
-## World
-
-| generated/s | meshes/s | removed/s | jobs/s | quads uploaded/s | crossings |
-|---:|---:|---:|---:|---:|---:|
-| 0 | 0 | 0 | 0 | 0 | 0 |
-
-| backlog | avg | p95 | max | first | last |
-|---|---:|---:|---:|---:|---:|
-| jobs queued | 0.0 | 0 | 0 | 0 | 0 |
-| jobs in flight | 0.0 | 0 | 0 | 0 | 0 |
-| chunks generating or meshing | 0.0 | 0 | 0 | 0 | 0 |
-
-Queue trend +0.0 jobs/s (above 0: the world falls behind). It settled again 0.00 s after the camera stopped. At the end: 5598 chunks, 1951 meshes (2831 empty), 1951 on the GPU, 439764 quads, 2 draws.
-
-## Worst 5 frames
-
-| frame | t s | ms | crossed | generated | meshes | removed | quads up | queued | in flight |
-|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|
-| 41384 | 6.81 | 10.11 | no | 0 | 0 | 0 | 0 | 0 | 0 |
-| 48445 | 8.06 | 4.69 | no | 0 | 0 | 0 | 0 | 0 | 0 |
-| 23835 | 3.72 | 4.08 | no | 0 | 0 | 0 | 0 | 0 | 0 |
-| 57701 | 9.66 | 4.02 | no | 0 | 0 | 0 | 0 | 0 | 0 |
-| 21495 | 3.32 | 3.53 | no | 0 | 0 | 0 | 0 | 0 | 0 |
-
-## Per second
-
-| s | frames | fps | worst ms | generated | meshes | crossings | queued max | in flight max |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 0 | 5954 | 5954 | 3.04 | 0 | 0 | 0 | 0 | 0 |
-| 1 | 6968 | 6967 | 3.14 | 0 | 0 | 0 | 0 | 0 |
-| 2 | 6729 | 6729 | 2.82 | 0 | 0 | 0 | 0 | 0 |
-| 3 | 5767 | 5768 | 4.08 | 0 | 0 | 0 | 0 | 0 |
-| 4 | 5594 | 5593 | 3.24 | 0 | 0 | 0 | 0 | 0 |
-| 5 | 5761 | 5762 | 2.90 | 0 | 0 | 0 | 0 | 0 |
-| 6 | 5543 | 5543 | 10.11 | 0 | 0 | 0 | 0 | 0 |
-| 7 | 5813 | 5813 | 3.01 | 0 | 0 | 0 | 0 | 0 |
-| 8 | 5833 | 5833 | 4.69 | 0 | 0 | 0 | 0 | 0 |
-| 9 | 5606 | 5602 | 4.02 | 0 | 0 | 0 | 0 | 0 |
-| 10 | 5943 | 5947 | 3.10 | 0 | 0 | 0 | 0 | 0 |
-| 11 | 6138 | 6138 | 3.45 | 0 | 0 | 0 | 0 | 0 |
-| 12 | 5886 | 5886 | 2.82 | 0 | 0 | 0 | 0 | 0 |
-| 13 | 5796 | 5796 | 2.93 | 0 | 0 | 0 | 0 | 0 |
-| 14 | 5599 | 5598 | 3.04 | 0 | 0 | 0 | 0 | 0 |
-| 15 | 5941 | 5942 | 2.79 | 0 | 0 | 0 | 0 | 0 |
-| 16 | 5870 | 5870 | 3.07 | 0 | 0 | 0 | 0 | 0 |
-| 17 | 5878 | 5878 | 3.21 | 0 | 0 | 0 | 0 | 0 |
-| 18 | 5461 | 5460 | 2.85 | 0 | 0 | 0 | 0 | 0 |
-| 19 | 5760 | 5761 | 3.35 | 0 | 0 | 0 | 0 | 0 |
-
-## Data
-
-For `tools/bench_report.py` (format 1).
-
-```json
 {
   "format": 1,
   "run": {
@@ -451,4 +380,3 @@ For `tools/bench_report.py` (format 1).
     }
   ]
 }
-```

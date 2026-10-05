@@ -26,15 +26,16 @@ Radio 16 de boxel equivale a los 32 chunks del juego en Bevy (sección "Escala" 
    arreglar.
 3. **La carga no se atrasa.** Después de cada borde, el mundo termina los chunks nuevos en 10 a
    48 ms (Vulkan), mucho antes del cruce siguiente (0.5 s a 64 vóxeles/s). La cola nunca crece.
-4. **En la NVIDIA hay frames lentos sin trabajo del mundo**: de 1.5 a 5 ms, unas 8 a 18 veces por
-   segundo. Son los que marcan el p99.9 (2.3 a 3.6 ms). Dos veces llegaron a 8.9 y 10.1 ms (static
-   radio 12 y 16). En una prueba corta con la AMD en Vulkan no aparecieron. Hipótesis: vienen del
-   driver o de la presentación, no del motor.
+4. **Hay frames lentos sin trabajo del mundo, en las dos GPUs**: de 1.5 a 5 ms. En la NVIDIA salen
+   unas 8 a 18 veces por segundo y marcan el p99.9 (2.3 a 3.6 ms); dos veces llegaron a 8.9 y
+   10.1 ms (static radio 12 y 16). En la AMD con Vulkan salen menos, unas 3 por segundo. La causa
+   sigue abierta: en la NVIDIA no se ve una relación con la presentación más allá del azar.
 5. **GL Mid en la AMD** hace 1932 fps, unas 4 veces menos que Vulkan High. Tuvo 15 frames de más de
    6.94 ms (máximo 13.6 ms); 13 de esos 15 no tenían cruce de borde ni mallas nuevas.
-6. **Ojo:** sin límite de fps el bucle da 3300 a 8500 vueltas por segundo, y por eso la carga
-   atada a los frames ([voxeles.md](../voxeles.md), punto 7.2) no se nota. Con el límite a 144 fps
-   hay que medir todo de nuevo.
+6. **Ojo:** sin límite de fps el bucle da 3300 a 8500 vueltas por segundo, pero solo unas 143 por
+   segundo se presentan (una por refresco del monitor); el resto se dibuja sin mostrarse. Por eso
+   la carga atada a los frames ([voxeles.md](../voxeles.md), punto 7.2) no se nota. Con el límite
+   a 144 fps hay que medir todo de nuevo.
 
 Los fps promedio varían hasta un 45 % entre corridas parecidas (por ejemplo, radio 12: 5900 a
 8500) sin un patrón claro: es ruido de la máquina. Para comparar sirven más el p99, el máximo, los
@@ -87,12 +88,14 @@ mallas llegan repartidas y la subida no pesa.
 1. Interés incremental (paso 2 del plan de [voxeles.md](../voxeles.md)): repetir `fly r32` y
    comparar los frames de cruce. Hoy: 6 ms de mediana.
 2. Cuando exista el límite de fps: repetir todo con el límite a 144 y sin límite.
-3. Los frames lentos sin trabajo en la NVIDIA: perfilar con tracy para ver de dónde salen.
+3. Los frames lentos sin trabajo (punto 4, las dos GPUs): perfilar con tracy para ver de dónde
+   salen. Los resúmenes nuevos dicen si cada uno de los peores frames se presentó.
 
 ## Archivos
 
-- Un resumen por corrida en [baseline-2026-10/](baseline-2026-10/): tablas y un bloque JSON
-  para `tools/bench_report.py`.
+- Los datos de cada corrida en [baseline-2026-10/](baseline-2026-10/): el JSON de su resumen,
+  para `tools/bench_report.py`. Para verlas en una tabla: `just bench-report
+  docs/rendimiento/baseline-2026-10/`.
 - Los CSV (una fila por frame) no se suben: se regeneran corriendo de nuevo.
 - Para comparar una corrida nueva: `just bench-report --compare
   docs/rendimiento/baseline-2026-10/ bench-results/`.
