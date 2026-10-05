@@ -898,12 +898,16 @@ presenta como mucho una vez por refresco del monitor.
   del período (2 ms como máximo) y, si llega, reinicia la grilla ahí. Así las updates se
   enganchan al reloj del compositor. Medido con el límite igual al panel (144 Hz): sin esto se
   mostraban 113 a 126 frames por segundo; con esto, 136 a 143, con 143.6 updates por segundo.
+  El costo: con render, las updates pueden quedar hasta un 2 % abajo del límite (119 con 120,
+  127.5 con 130, 143.6 con 144; 60 y 100 exactos) y los frames mostrados unos pocos por ciento
+  abajo aunque el límite esté por debajo del panel (111 a 119 con 120).
 - `PresentSettings { mode }` (recurso de `boxel_render`) cambia el vsync en tiempo de ejecución:
   `Setup` reconfigura la superficie con el mismo dispositivo. Por defecto vsync apagado:
   `Mailbox`, si no `Immediate`, si no `Fifo` con una nota en el log. Así manda el límite.
 - Frames mostrados: con vsync, como mucho la frecuencia del monitor (y en X11 las updates
-  también bajan a ella, porque presentar bloquea; Windows no se midió). Sin vsync, hasta el límite, salvo en
-  Wayland, donde la compuerta deja presentar una vez por refresco con o sin vsync.
+  también bajan a ella, porque presentar bloquea; Windows no se midió). Sin vsync, hasta el
+  límite, salvo en Wayland, donde la compuerta deja presentar una vez por refresco con o sin
+  vsync, y por debajo del panel pueden quedar unos pocos por ciento abajo del límite (ver arriba).
 
 | RTX 5050, panel de 144 Hz, radio 12 | Updates/s | Mostrados/s | CPU (un núcleo = 100 %) |
 |---|---|---|---|

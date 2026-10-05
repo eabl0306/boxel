@@ -54,8 +54,14 @@ Medido en la máquina de desarrollo (panel de 144 Hz, Wayland, radio 12, mundo c
 | 60 | 60.0 | 60.0 | 9 % |
 | 144, vsync (Fifo) | 143.6 | unos 107 | 17 % |
 
-- El límite se cumple con precisión: con una ventana real y sin render, 60.00 y 144.00 updates
+- Sin render el límite se cumple con precisión: con una ventana real, 60.00 y 144.00 updates
   por segundo en Wayland y en X11 (`just test-window`).
+- Con render en Wayland, la espera del frame callback cuesta un poco de precisión: las updates
+  pueden quedar hasta un 2 % abajo del límite (119 con 120, 127.5 con 130, 143.6 con 144, 238.6
+  con 240; 60 y 100 exactos). Los frames mostrados también pueden quedar unos pocos por ciento
+  abajo aunque el límite esté por debajo del panel (111 a 119 con 120, 119 a 126.5 con 130).
+  Sin la espera las updates son exactas, pero se muestran solo 100 a 109 por segundo con 120 a
+  144: el canje vale la pena.
 - La CPU baja de 150 % a 20 % de un núcleo con el límite por defecto. Los 300 µs de espera activa
   cuestan entre 3 y 4 % de un núcleo a 144 fps.
 - En Wayland, con vsync (Fifo), NVIDIA y RADV muestran unos 107 frames por segundo de 144, con o

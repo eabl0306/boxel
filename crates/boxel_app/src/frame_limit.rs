@@ -22,6 +22,12 @@ pub const DEFAULT_MAX_FPS: u32 = 144;
 /// - On Wayland the runner presents only after the compositor's frame callback (the
 ///   presentation gate, `WindowState::frame_ready`), with or without vsync. Shown frames are
 ///   then at most the refresh rate; updates past it run the simulation without presenting.
+///   A due update whose gate is still closed waits a little for the callback and the pacing
+///   restarts there, so more updates present. The cost: with a renderer the update rate can
+///   land up to about 2 % under the limit (measured on a 144 Hz panel: 119 at 120, 127.5 at
+///   130, 143.6 at 144, 238.6 at 240; 60 and 100 exact), and shown frames can be a few percent
+///   under the limit even below the refresh rate (111 to 119 at 120). Without the wait the
+///   update rate is exact but only 100 to 109 frames per second are shown at 120 to 144.
 /// - While the window is hidden the runner caps updates at 30 per second (a lower limit stays).
 ///
 /// Pacing is deadline based ([`FramePacer`]): each frame is due one period after the previous
