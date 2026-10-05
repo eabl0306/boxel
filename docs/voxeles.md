@@ -6,8 +6,8 @@ Sale de dos análisis: uno siguió un chunk por todo el código de boxel y lo mi
 Bevy 0.19.1 y midió en esta misma máquina cómo sube las mallas.
 
 **Actualización (streaming v2, mismo día):** el interés incremental, la carga desatada de los
-frames y el mundo infinito en vertical ya están hechos. Las secciones 7.1, 7.2 y 9 cuentan qué
-cambió, con números nuevos. El resto describe el estado anterior.
+frames y el mundo infinito en vertical ya están hechos. Las secciones 7.1, 7.2, 7.5 y 9 cuentan
+qué cambió, con números nuevos. El resto describe el estado anterior.
 
 ## En resumen
 
@@ -427,7 +427,7 @@ entero mientras se carga, no solo la subida (sección 10, paso 1).
 | 2 | Carga atada a los frames (resuelto, 7.2) | 40 s para cargar radio 32 a 144 Hz | `world/streaming.rs`, `world/plugin.rs` |
 | 3 | Render sin presupuesto propio | 1.0 a 2.2 ms con 512 chunks en un frame | `render/plugin.rs:987-1024` |
 | 4 | Resync de todo en un frame | 16 a 35 ms (estimado) | `render/plugin.rs:952-963` |
-| 5 | Costo fijo por frame | 0.24 ms del mundo en reposo a radio 32 | `world/plugin.rs:300-326` |
+| 5 | Costo fijo por frame (resuelto en el mundo, 7.5) | 0.34 ms del descarte en CPU con 8000 chunks (Mid y Low) | `render/path/mod.rs:361-394` |
 | 6 | Warning de fixed timestep | sale con un frame de más de unos 140 ms; en tu log, el primero (250 ms o más) | `app/time.rs:39`, `app/time.rs:198-240` |
 | 7 | Tope de draws en High | warning desde unos 10 900 chunks vivos | `render/renderer.rs:237`, `render/renderer.rs:428-438` |
 
@@ -443,8 +443,12 @@ en un frame (medido).
   calcula fila por fila, sin recorrer la vista.
 - Lo listado se aplica con un tope por frame (`interest_budget`, 1 ms). Si es mucho (un salto,
   un viewer nuevo, un radio más grande) se reparte entre frames, lo más cercano primero.
-- Las prioridades de la cola se recalculan por lotes, no todas en el frame del cruce.
-- El mapa reserva lugar para toda la vista de una vez, así no crece a mitad de una carga.
+- Las prioridades de la cola se recalculan por lotes, no todas en el frame del cruce. Mientras
+  tanto, antes de lanzar un job se recalculan las que podrían ir antes que él: los jobs salen
+  siempre del más cercano al más lejano.
+- El mapa reserva lugar para dos vistas cuando aparece el viewer. Al saltar lejos, la vista
+  vieja sigue cargada hasta que se crea la nueva; con ese lugar el mapa no crece a mitad de la
+  carga. Solo crece en el frame en que la vista se agranda (radio más grande, viewer nuevo).
 
 Medido con `cargo bench -p boxel_world --bench interest`: el frame del cruce, con el mundo ya
 cargado antes de cada cruce. "Mismos chunks" es el alto fijo de M0, sin tope de tiempo.
@@ -459,6 +463,19 @@ cargado antes de cada cruce. "Mismos chunks" es el alto fijo de M0, sin tope de 
 Con radio vertical 8 hay 3 veces más chunks (66 000 a radio 32) y subir cambia una capa entera.
 Lo que pasa de 1 ms va a los frames siguientes.
 
+Un salto de 100 chunks (`headless_world --jump 100`, 144 Hz, 9 corridas de cada uno):
+
+| Salto | Antes de reservar dos vistas | Ahora |
+|---|---|---|
+| Radio 32: peor frame | 3.2 a 4.9 ms (mediana 4.0) | 2.6 a 4.7 ms (mediana 3.2) |
+| Radio 32: zona nueva lista | 0.95 a 1.02 s | 0.77 a 0.92 s |
+| Radio 16: zona nueva lista | 0.20 a 0.26 s | 0.15 a 0.18 s |
+
+Antes, a mitad de la carga el índice pasaba de 114 688 a 229 376 lugares en un frame. Ahora tiene
+229 376 desde el principio: unos 3 MB más a radio 32 antes del primer salto, lo mismo que antes
+quedaba después de él. La zona nueva sale antes porque los jobs van del más cercano al más
+lejano también después del salto.
+
 ### 7.2 Carga atada a los frames
 
 **Antes:** Dispatch iba antes que Collect, así que cada lugar en vuelo hacía un job cada 2 frames.
@@ -471,6 +488,9 @@ al moverse.
   mientras sigan llegando resultados, con un tope de 2 ms (`job_budget`).
 - El tope de jobs en vuelo sale solo: lo que los hilos hacen en 1.5 frames, con el costo medido de
   un job y el tiempo medido entre frames. A 144 Hz, con jobs de 60 µs y 6 hilos, son unos 1000.
+  El costo se promedia por frame y después entre frames. Antes seguía a los últimos jobs de cada
+  frame y el tope saltaba entre 558 y 3114 de un frame al siguiente; ahora cambia como mucho un
+  23 % (medido a radio 32 cargando y caminando).
 - Los chunks que el generador declara de puro aire se crean listos, sin job (sección 9).
 
 Medido con `headless_world` en release, terreno por defecto, bucle a 144 Hz (`--hz 144`). El
@@ -493,7 +513,9 @@ En `voxel_world` (ventana, bucle sin límite, `--wait-chunks`, incluye elegir la
 tardaba 1.1 a 1.2 s y ahora 0.5 a 0.6 s; radio 32, 3.7 a 7.0 s antes y 0.8 a 1.0 s ahora.
 
 Para repetirlo: `headless_world --view-distance 32 --hz 144`, con `--fixed-height` para los
-chunks de M0 y `--speed 256` para caminar. Carga del sistema durante las medidas: 3 a 12.
+chunks de M0, `--speed 256` para caminar, `--jump 100` para saltar y `--idle 5` para el reposo.
+Carga del sistema durante las medidas: 3 a 12. Repetido después de los arreglos de la revisión
+(con carga 2 a 7): cargar y caminar dan lo mismo que antes de ellos.
 
 ### 7.3 Render sin presupuesto propio
 
@@ -519,11 +541,17 @@ Con GPU nueva, pérdida de dispositivo o cambio de tier, Extract mete todas las 
 
 ### 7.5 Costo fijo por frame
 
-`publish_stats` recorre todos los slots y arma un texto en cada frame
-(`world/plugin.rs:300-326`, `world/map.rs:176`). Ahora solo recorre y arma el texto si el mapa
-cambió: en reposo ya no cuesta. El mundo en reposo mide 0.24 ms a radio 32
-contra 0.195 ms a radio 12, con el bucle a 144 Hz (medido). En Mid y Low el descarte en CPU
-recorre todos los chunks (`render/path/mod.rs:361-394`): 0.34 ms con 8000 (medido).
+**Antes:** `publish_stats` recorría todos los slots y armaba un texto en cada frame. El mundo en
+reposo medía 0.24 ms a radio 32 y 0.195 ms a radio 12: crecía con el radio (medido con
+`world_stream`, sección 11).
+
+**Ahora:** solo recorre los slots y arma el texto si el mapa cambió (`world/plugin.rs:354-392`,
+`world/map.rs:182-208`). En reposo, el frame entero de `headless_world --idle 5` (mundo sin
+render, 144 Hz) mide 0.11 a 0.14 ms de mediana y 0.3 a 0.43 ms de p99, igual a radio 12 que a
+radio 32 (medido). Ya no crece con el radio.
+
+**Queda:** en Mid y Low el descarte en CPU recorre todos los chunks
+(`render/path/mod.rs:361-394`): 0.34 ms con 8000 (medido).
 
 ### 7.6 El warning de fixed timestep
 

@@ -60,8 +60,9 @@ just run headless_world --view-distance 32 --hz 144 --speed 256
 ```
 
 Opciones: `--view-distance N`, `--vertical-radius N`, `--hz N` (frames por segundo del bucle),
-`--speed V` (camina a V vóxeles/s después de cargar y mide los frames), `--fixed-height` (carga
-como M0, con el alto fijo del generador), `--help`.
+`--idle S` (se queda quieto S segundos después de cargar y mide los frames), `--speed V` (camina a
+V vóxeles/s y mide los frames), `--jump N` (salta N chunks y mide hasta que la zona nueva está
+lista), `--fixed-height` (carga como M0, con el alto fijo del generador), `--help`.
 
 **gpu_info**: lista los adaptadores, cómo los clasifica boxel y qué elige.
 

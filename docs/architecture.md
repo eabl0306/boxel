@@ -631,13 +631,18 @@ Sistemas en `Update`, encadenados (`WorldSystems`):
    actuales dentro de `interest_budget` (1 ms por frame): crea slots (prioridad = distancia² al
    viewer más cercano), actualiza el interés o descarga (marca `cancel`, emite
    `ChunkMeshEvent::Remove`, invalida vecinos). Las prioridades de la cola quedan viejas y se
-   recalculan por lotes, las más cercanas primero.
+   recalculan por lotes, las más cercanas primero. El mapa reserva lugar para dos vistas: al
+   saltar, la vieja sigue cargada hasta que se crea la nueva y el mapa no crece a mitad de la
+   carga.
 2. **Edits:** aplica `EditQueue` agrupando por chunk: `make_mut`, `set`, sube `version`, pide
    remesh del chunk y de los vecinos de cara tocados (sube su `epoch`). Prioridad 0.
 3. **Dispatch:** primero vacía el canal de resultados (libera sus lugares en vuelo) y después
    saca jobs mientras `in_flight < tope`; repite mientras lleguen resultados, dentro de
-   `job_budget` (2 ms por frame). El tope por defecto sale de los hilos de async compute, del
-   costo medido de un job y del intervalo entre frames: trabajo para 1.5 frames (al menos 2 por
+   `job_budget` (2 ms por frame). Antes de sacar un job recalcula las prioridades viejas que
+   podrían ir antes que él: el viewer se acercó como mucho tanto como se movió, y eso acota cada
+   prioridad vieja. Así los jobs salen siempre del más cercano al más lejano. El tope por defecto
+   sale de los hilos de async compute, del costo medido de un job (promedio de cada frame,
+   suavizado entre frames) y del intervalo entre frames: trabajo para 1.5 frames (al menos 2 por
    hilo, como mucho 4096). Generación: captura generador, registry y clave. Malla: solo si los 26
    vecinos están `Ready` o `Missing`; captura el centro y los 26 `Arc`, la tabla de materiales,
    `data_version` y `epoch`. Atajos: centro aire uniforme, o centro opaco uniforme rodeado de
