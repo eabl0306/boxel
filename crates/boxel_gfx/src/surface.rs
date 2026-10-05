@@ -46,8 +46,9 @@ pub fn choose_alpha_mode(modes: &[wgpu::CompositeAlphaMode]) -> wgpu::CompositeA
     }
 }
 
-/// `Vsync` -> `Fifo`; `Mailbox` -> `Mailbox` if supported else `Fifo`; `Immediate` ->
-/// `Immediate`, else `Mailbox`, else `Fifo` (`Fifo` is always supported).
+/// `Vsync` -> `Fifo`; `NoVsync` -> `Mailbox`, else `Immediate`, else `Fifo`; `Mailbox` ->
+/// `Mailbox` if supported else `Fifo`; `Immediate` -> `Immediate`, else `Mailbox`, else `Fifo`
+/// (`Fifo` is always supported).
 pub fn choose_present_mode(
     pref: PresentModePref,
     modes: &[wgpu::PresentMode],
@@ -55,6 +56,7 @@ pub fn choose_present_mode(
     use wgpu::PresentMode as P;
     let wanted: &[P] = match pref {
         PresentModePref::Vsync => &[P::Fifo],
+        PresentModePref::NoVsync => &[P::Mailbox, P::Immediate, P::Fifo],
         PresentModePref::Mailbox => &[P::Mailbox, P::Fifo],
         PresentModePref::Immediate => &[P::Immediate, P::Mailbox, P::Fifo],
     };

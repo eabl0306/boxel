@@ -27,6 +27,7 @@ Estado: milestone M0, en desarrollo. Solo escritorio (Linux, Windows, macOS).
 | `just doc` | Genera la documentación |
 | `just ci` | Lo principal de la CI, en local (MSRV y los tests de GPU por CPU van aparte) |
 | `just test-gpu` | Tests de GPU en todos los adaptadores reales |
+| `just test-window` | Precisión del límite de FPS con una ventana real (necesita pantalla) |
 | `just test-lavapipe` / `just test-llvmpipe` | Tests de GPU por CPU (Vulkan / GL) |
 | `just bench` | Benchmarks |
 | `just gpu-info` | Informe de GPUs y qué elegiría boxel |
@@ -42,13 +43,16 @@ just run voxel_world --tier mid
 ```
 
 Controles: clic izquierdo captura el mouse, Escape lo suelta. WASD para moverse, Espacio sube,
-Shift izquierdo baja, Ctrl izquierdo acelera.
+Shift izquierdo baja, Ctrl izquierdo acelera. F3 muestra el overlay de debug, F5 cambia el límite
+de FPS (30, 60, 144, 240, sin límite) y F6 prende o apaga el vsync.
 
-Opciones útiles: `--seed N`, `--view-distance N` (en chunks), `--size 1280x720`,
+Opciones útiles: `--fps-limit N` (0 = sin límite), `--vsync on|off`, `--seed N`,
+`--view-distance N` (en chunks), `--size 1280x720`,
 `--camera x,y,z,yaw,pitch` (ángulos en grados), `--tier high|mid|low`, `--help` (lista todo).
 Para pruebas automáticas usa siempre `--frames N --timeout SEG`: la ventana se cierra sola.
 `--wait-chunks` empieza a contar frames cuando el terreno terminó de cargar y
-`--screenshot shot.png` guarda una captura en el frame N.
+`--screenshot shot.png` guarda una captura en el frame N. `--duration SEG` corre el juego normal
+SEG segundos; al salir imprime updates y frames mostrados por segundo y el uso de CPU.
 
 **headless_world**: sin ventana ni GPU. Genera y mallea el mundo alrededor de un punto e imprime
 cuántos chunks y quads salieron. Sirve en CI.
@@ -84,7 +88,7 @@ CLI, `BOXEL_*`, `WGPU_*`, archivo.
 | Solo CPU | `--software` | `BOXEL_SOFTWARE=1` | | `software` |
 | Validación | `--validation` | `BOXEL_GPU_VALIDATION=1` | | `validation` |
 | Memoria de crashes (LKG) | `--lkg` / `--no-lkg` | `BOXEL_LKG=1` o `0` | | `use_lkg` |
-| Presentación | `--present vsync`, `mailbox` o `immediate` | `BOXEL_PRESENT` | | `present_mode` |
+| Presentación | `--present vsync`, `novsync`, `mailbox` o `immediate` | `BOXEL_PRESENT` | | `present_mode` |
 | Archivo | `--gpu-config ruta.toml` | `BOXEL_GPU_CONFIG` | | |
 
 `--tier` es un tope, no una orden: boxel nunca sube de ahí, pero puede bajar. En un portátil con
@@ -98,6 +102,23 @@ backends = "vulkan"
 power = "low"
 max_tier = "mid"
 ```
+
+## Límite de FPS y vsync
+
+Por defecto el motor hace como mucho 144 frames por segundo y el vsync está apagado. Los dos se
+cambian mientras corre el juego, por ejemplo desde un menú de opciones:
+
+```rust
+use boxel::prelude::*;
+
+fn opciones(mut limite: ResMut<FrameLimit>, mut vsync: ResMut<PresentSettings>) {
+    limite.max_fps = 60; // 0 = sin límite
+    vsync.set_vsync(true);
+}
+```
+
+El cambio vale desde el frame siguiente. Con vsync nunca se muestran más frames que los Hz del
+monitor. Detalles en [ADR 0013](docs/adr/0013-limite-de-fps-y-vsync-en-tiempo-de-ejecucion.md).
 
 ## Documentación
 

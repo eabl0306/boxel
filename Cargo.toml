@@ -164,6 +164,8 @@ required-features = ["voxel"]
 [[example]]
 name = "voxel_world"
 required-features = ["render", "voxel", "png"]
+# Runs its option-parsing tests with `cargo test`.
+test = true
 
 # Profiles only apply to this workspace's own examples/tests/benches.
 [profile.dev]

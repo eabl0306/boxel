@@ -477,8 +477,9 @@ informe M0 ya lo había visto (`docs/informe-m0.md`, M1 punto 1).
 Moviéndose a 64 vóxeles/s a radio 32 con 12 en vuelo se juntan 1400 jobs atrasados en 5 s
 (medido). Con 256 en vuelo y 256 vóxeles/s no hay atraso (medido). Los workers no son el cuello.
 
-Hoy no se nota porque el bucle no tiene límite: `voxel_world` gira a unas 4000 updates/s
-(medido, sección 10). Cuando se limite a la frecuencia del monitor (planeado en M1), aparece.
+Con el límite de FPS (144 por defecto, ADR 0013) ya se nota. Medido con `voxel_world
+--wait-chunks`: radio 12 carga en 6.5 s (sin límite, 0.6 s), radio 16 en 11 s y radio 32 en 41 s
+(sin límite, 1.7 s).
 
 **Arreglo:** recolectar antes de despachar, o despachar otra vez después de Collect. Subir el
 tope o cambiarlo por un tope de memoria.
@@ -605,11 +606,10 @@ En orden. Cada paso se mide antes y después.
 | 6 | Resync en cuotas | el pico de 16 a 35 ms (7.4) |
 | 7 | Oclusión (Hi-Z) | quads bajo tierra y detrás de montañas |
 
-**Ojo con los FPS del overlay.** La línea `fps=` cuenta updates de la App, no frames presentados
-(`diagnostic/lib.rs:79-95`). Los frames reales están en `RenderInfo::frames_presented`
-(`render/plugin.rs:120`, `render/plugin.rs:1144`). Medido: con `--frames` la línea dio 3861 a
-4293 "fps", pero se presentaron 978 frames en unos 8 s, unos 120 Hz. El overlay tiene que usar
-frames presentados.
+**Ojo con los FPS del log.** La línea `fps=` del log cuenta updates de la App, no frames
+presentados (`diagnostic/lib.rs:79-95`). Medido antes del límite de FPS: con `--frames` dio 3861
+a 4293 "fps", pero se presentaron 978 frames en unos 8 s. El overlay F3 ya muestra las dos cosas
+por separado (frames mostrados y updates, ADR 0013).
 
 **Contadores útiles:** chunks cargados y con malla, jobs en vuelo y en cola, mallas y bytes
 subidos por frame, llamadas a `write_buffer` por frame, ms de interés y de collect por frame.

@@ -10,7 +10,8 @@
 //!
 //! [`VoxelRenderer`] is ECS-free (used directly by offscreen tests); [`RenderPlugin`] wires it
 //! into the app: GPU bootstrap when the window appears, mesh extraction from `boxel_world`,
-//! camera, present, screenshots, device-loss recovery.
+//! camera, present (vsync switchable at runtime with [`PresentSettings`]), screenshots,
+//! device-loss recovery.
 mod overlay;
 mod plugin;
 mod renderer;
@@ -24,8 +25,8 @@ mod targets;
 
 pub use overlay::{OverlayDraw, OverlayRect};
 pub use plugin::{
-    DebugDestroyDevice, GpuFailed, GpuReady, Render, RenderInfo, RenderPlugin, RenderSettings,
-    RenderSystems, RequestScreenshot, ScreenshotSaved, SurfaceInfo,
+    DebugDestroyDevice, GpuFailed, GpuReady, PresentSettings, Render, RenderInfo, RenderPlugin,
+    RenderSettings, RenderSystems, RequestScreenshot, ScreenshotSaved, SurfaceInfo,
 };
 pub use renderer::{RenderStats, RendererConfig, RendererError, ViewParams, VoxelRenderer};
 pub use smoke::RendererSmokeTest;
@@ -38,5 +39,8 @@ pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// Common items.
 pub mod prelude {
-    pub use crate::{RenderInfo, RenderPlugin, RenderSettings, RequestScreenshot, ScreenshotSaved};
+    pub use crate::{
+        PresentSettings, RenderInfo, RenderPlugin, RenderSettings, RequestScreenshot,
+        ScreenshotSaved,
+    };
 }

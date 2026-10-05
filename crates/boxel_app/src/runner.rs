@@ -1,4 +1,5 @@
-use crate::{App, AppExit, Plugin, PluginsState};
+use crate::{App, AppExit, FrameLimit, FramePacer, Plugin, PluginsState};
+use boxel_ecs::world::World;
 use std::time::{Duration, Instant};
 
 /// How the headless runner drives updates.
@@ -6,9 +7,11 @@ use std::time::{Duration, Instant};
 pub enum RunMode {
     /// One update, then exit.
     Once,
-    /// Update until an [`AppExit`] is written; sleep `wait` minus the update time between frames.
+    /// Update until an [`AppExit`] is written, starting one frame every `wait` (deadline based,
+    /// see [`FramePacer`]). A [`FrameLimit`] resource, when the app has one, replaces `wait`
+    /// and is read before every frame, so it can change at runtime.
     Loop {
-        /// Target frame period (`None` = no sleep).
+        /// Target frame period (`None` or zero = no pacing).
         wait: Option<Duration>,
     },
 }
@@ -56,25 +59,28 @@ fn run_headless(mut app: App, mode: RunMode) -> AppExit {
             app.update();
             app.should_exit()
         }
-        RunMode::Loop { wait } => loop {
-            let start = Instant::now();
-            app.update();
-            if let Some(exit) = app.should_exit() {
-                break Some(exit);
+        RunMode::Loop { wait } => {
+            let mut pacer = FramePacer::new();
+            loop {
+                let period = loop_period(app.world(), wait);
+                pacer.block_until_due(period);
+                pacer.start_frame(Instant::now(), period);
+                app.update();
+                if let Some(exit) = app.should_exit() {
+                    break Some(exit);
+                }
             }
-            if let Some(remaining) = wait.and_then(|w| w.checked_sub(start.elapsed()))
-                && !remaining.is_zero()
-            {
-                pace(remaining);
-            }
-        },
+        }
     };
     app.shutdown();
     exit.unwrap_or_default()
 }
 
-/// Sleeps between headless frames (the only place the engine sleeps on purpose).
-#[expect(clippy::disallowed_methods, reason = "headless runner pacing")]
-fn pace(duration: Duration) {
-    std::thread::sleep(duration);
+/// The frame period of the headless loop: the app's [`FrameLimit`] if it has one, else `wait`
+/// (`None` = unlimited).
+fn loop_period(world: &World, wait: Option<Duration>) -> Option<Duration> {
+    match world.get_resource::<FrameLimit>() {
+        Some(limit) => limit.period(),
+        None => wait.filter(|w| !w.is_zero()),
+    }
 }
