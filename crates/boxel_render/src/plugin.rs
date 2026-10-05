@@ -106,6 +106,51 @@ impl Default for RenderSettings {
     }
 }
 
+/// Presentation setting (vsync), read by the renderer every frame. A change reconfigures the
+/// surface on the same device in the next `Render` (`RenderSystems::Setup`): no new device, no
+/// renderer rebuild, no chunk re-upload. Inserted by [`RenderPlugin`] with `init_resource`
+/// (insert your own to start with another mode).
+///
+/// The default is vsync off ([`PresentModePref::NoVsync`]: `Mailbox`, else `Immediate`, else
+/// `Fifo` with a logged note), so the app's `boxel_app::FrameLimit` governs the frame rate.
+/// The wanted mode is mapped to what the surface supports with
+/// [`boxel_gfx::choose_present_mode`]; [`RenderInfo::present_mode`] shows the result. A
+/// `--present`, `BOXEL_PRESENT` or config file preference (`GpuPreferences::present_mode`)
+/// replaces this value once, when the first GPU is selected; runtime changes win after that.
+///
+/// Frames shown on screen with each choice:
+/// - Vsync on (`Fifo`): at most the display refresh rate. Where presenting blocks (X11;
+///   Windows is expected to behave the same, not measured) the update rate also drops to the
+///   refresh rate when the frame limit is higher.
+/// - Vsync off: up to the frame limit (`Mailbox` drops frames instead of tearing, `Immediate`
+///   may tear). On Wayland the presentation gate (`WindowState::frame_ready`, opened by the
+///   compositor's frame callback) still allows at most one present per refresh in both modes;
+///   the extra updates run the simulation without presenting.
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PresentSettings {
+    /// Wanted present mode.
+    pub mode: PresentModePref,
+}
+
+impl PresentSettings {
+    /// Vsync on ([`PresentModePref::Vsync`]) or off ([`PresentModePref::NoVsync`]).
+    pub fn vsync(on: bool) -> Self {
+        Self {
+            mode: PresentModePref::from_vsync(on),
+        }
+    }
+
+    /// The wanted mode is vsync ([`PresentModePref::Vsync`]).
+    pub fn is_vsync(self) -> bool {
+        self.mode.is_vsync()
+    }
+
+    /// Switches vsync on or off (see [`PresentSettings::vsync`]).
+    pub fn set_vsync(&mut self, on: bool) {
+        self.mode = PresentModePref::from_vsync(on);
+    }
+}
+
 /// Public renderer status (read by apps, examples, diagnostics).
 #[derive(Resource, Clone, Debug, Default)]
 pub struct RenderInfo {
@@ -123,6 +168,9 @@ pub struct RenderInfo {
     pub backend: String,
     /// Driver name and version (as reported by wgpu; may be empty).
     pub driver: String,
+    /// Present mode the surface is configured with (`None` while no GPU is selected); see
+    /// [`PresentSettings`].
+    pub present_mode: Option<wgpu::PresentMode>,
     /// Frames presented since startup.
     pub frames_presented: u64,
     /// Frames rendered into the main color target (presented or not, see
@@ -139,13 +187,22 @@ pub struct RenderInfo {
     pub dropped_chunks: u32,
 }
 
+impl RenderInfo {
+    /// Whether the configured present mode waits for the display (`Fifo`, `FifoRelaxed`);
+    /// `None` while no GPU is selected.
+    pub fn vsync(&self) -> Option<bool> {
+        self.present_mode.map(vsync_of)
+    }
+}
+
 /// Surface and error counters of the render plugin, for automation and diagnostics (additive to
 /// the M0 skeleton API; `voxel_world --resize-test` reads it). Updated in `Cleanup`.
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SurfaceInfo {
     /// Size of the configured surface in physical pixels (zero before the first selection).
     pub size: UVec2,
-    /// Successful reconfigurations since startup (resize, `Outdated`, `Suboptimal`).
+    /// Successful reconfigurations since startup (resize, `Outdated`, `Suboptimal`, present
+    /// mode changes).
     pub reconfigures: u32,
     /// Surfaces recreated after `Lost` (same device).
     pub recreates: u32,
@@ -214,6 +271,7 @@ pub struct RenderPlugin {
 impl Plugin for RenderPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(self.settings.clone())
+            .init_resource::<PresentSettings>()
             .init_resource::<RenderInfo>()
             .init_resource::<SurfaceInfo>()
             .init_resource::<OverlayDraw>()
@@ -306,6 +364,7 @@ struct ReadyGpu {
     ctx: GpuContext,
     /// Window size the surface was last configured for (`config` may be clamped).
     configured_for: UVec2,
+    /// Present preference the surface is configured with (follows [`PresentSettings`]).
     present: PresentModePref,
     /// Next `Extract` uploads every ready mesh (`renderer.clear_chunks` first).
     resync: bool,
@@ -529,6 +588,7 @@ impl UploadWarnings {
 #[derive(SystemParam)]
 struct SetupParams<'w> {
     settings: Res<'w, RenderSettings>,
+    present: ResMut<'w, PresentSettings>,
     gpu: ResMut<'w, GpuState>,
     instance: ResMut<'w, InstanceState>,
     lkg: ResMut<'w, LkgRes>,
@@ -564,8 +624,12 @@ fn setup(mut p: SetupParams) {
     }
     let size = p.window_state.as_deref().map(|s| s.physical_size);
     let window = p.window.as_deref().map(|w| Arc::clone(&w.window));
+    let wanted_present = p.present.mode;
     let GpuState { stage, counters } = &mut *p.gpu;
     if let GpuStage::Ready(ready) = stage {
+        if ready.present != wanted_present {
+            change_present_mode(ready, counters, wanted_present);
+        }
         if ready.surface.is_none()
             && let Some(window) = window
         {
@@ -664,6 +728,10 @@ fn bootstrap(p: &mut SetupParams) {
                 GpuPreferences::resolve(settings.gpu.clone(), settings.gpu_config.as_deref());
             for warning in warnings {
                 tracing::warn!("GPU preferences: {warning}");
+            }
+            // A user override (CLI, env, config file) replaces the app's present setting once.
+            if let Some(mode) = prefs.present_mode {
+                p.present.set_if_neq(PresentSettings { mode });
             }
             p.instance.prefs = Some(prefs.clone());
             prefs
@@ -764,7 +832,7 @@ fn bootstrap(p: &mut SetupParams) {
         max_chunk_slots: settings.max_chunk_slots,
         clear_color: settings.clear_color,
     };
-    let present = prefs.present_mode.unwrap_or_default();
+    let present = p.present.mode;
     let built = VoxelRenderer::new(
         &ctx.device,
         &ctx.queue,
@@ -812,6 +880,7 @@ fn bootstrap(p: &mut SetupParams) {
     // 8. Success.
     let summary = ctx.summary_line();
     tracing::info!("boxel: {summary}");
+    log_present_mode(&surface, &ctx, present, surface_config.present_mode);
     p.gpu_ready.write(GpuReady {
         summary: summary.clone(),
         tier: ctx.tier,
@@ -912,6 +981,51 @@ fn reconfigure(ready: &mut ReadyGpu, counters: &mut SurfaceCounters, size: UVec2
     }
     // Do not retry every frame on failure: the next real size change tries again.
     ready.configured_for = size;
+}
+
+/// [`PresentSettings`] changed: reconfigure the current surface (same device, same size) with
+/// the new preference.
+fn change_present_mode(
+    ready: &mut ReadyGpu,
+    counters: &mut SurfaceCounters,
+    wanted: PresentModePref,
+) {
+    ready.present = wanted;
+    let size = ready.configured_for;
+    reconfigure(ready, counters, size);
+    if let Some(surface) = ready.surface.as_ref() {
+        log_present_mode(surface, &ready.ctx, wanted, ready.config.present_mode);
+    }
+}
+
+/// Logs the present mode a configuration picked, with a note when vsync off was wanted but the
+/// surface only offers `Fifo`.
+fn log_present_mode(
+    surface: &wgpu::Surface<'_>,
+    ctx: &GpuContext,
+    wanted: PresentModePref,
+    chosen: wgpu::PresentMode,
+) {
+    tracing::info!(
+        "present mode {chosen:?} (wanted {}, vsync {})",
+        wanted.as_str(),
+        if vsync_of(chosen) { "on" } else { "off" }
+    );
+    if !wanted.is_vsync() && chosen == wgpu::PresentMode::Fifo {
+        let offered = surface.get_capabilities(&ctx.adapter).present_modes;
+        tracing::info!(
+            "vsync off is not available on this surface (it offers {offered:?}): presenting \
+             with Fifo, so shown frames follow the display refresh rate"
+        );
+    }
+}
+
+/// `Fifo` and `FifoRelaxed` wait for the display (vsync).
+pub(crate) fn vsync_of(mode: wgpu::PresentMode) -> bool {
+    matches!(
+        mode,
+        wgpu::PresentMode::Fifo | wgpu::PresentMode::FifoRelaxed
+    )
 }
 
 /// `Lost` surface on a healthy device: drop the old surface FIRST, then create a new one from the
@@ -1243,8 +1357,10 @@ fn cleanup(
             }
             gpu_errors = gpu_errors.saturating_add(ready.gpu_errors());
             surface_info.size = UVec2::new(ready.config.width, ready.config.height);
+            info.present_mode = Some(ready.config.present_mode);
         }
         GpuStage::Failed | GpuStage::Stopped => {
+            info.present_mode = None;
             for path in frame.screenshots.drain(..) {
                 saved.write(ScreenshotSaved {
                     path,
@@ -1252,7 +1368,7 @@ fn cleanup(
                 });
             }
         }
-        GpuStage::WaitingForWindow => {}
+        GpuStage::WaitingForWindow => info.present_mode = None,
     }
     surface_info.reconfigures = counters.reconfigures;
     surface_info.recreates = counters.recreates;
@@ -1352,6 +1468,34 @@ mod tests {
         assert!(!adds_lkg_strike(false, false), "first loss: retry only");
         assert!(adds_lkg_strike(true, false), "repeated driver loss");
         assert!(!adds_lkg_strike(true, true), "DebugDestroyDevice");
+    }
+
+    #[test]
+    fn present_settings_switch_vsync() {
+        let mut settings = PresentSettings::default();
+        assert_eq!(
+            settings.mode,
+            PresentModePref::NoVsync,
+            "vsync off by default"
+        );
+        assert!(!settings.is_vsync());
+        settings.set_vsync(true);
+        assert_eq!(settings, PresentSettings::vsync(true));
+        assert_eq!(settings.mode, PresentModePref::Vsync);
+        settings.set_vsync(false);
+        assert_eq!(settings.mode, PresentModePref::NoVsync);
+
+        let mut info = RenderInfo::default();
+        assert_eq!(info.vsync(), None);
+        for (mode, vsync) in [
+            (wgpu::PresentMode::Fifo, true),
+            (wgpu::PresentMode::FifoRelaxed, true),
+            (wgpu::PresentMode::Mailbox, false),
+            (wgpu::PresentMode::Immediate, false),
+        ] {
+            info.present_mode = Some(mode);
+            assert_eq!(info.vsync(), Some(vsync), "{mode:?}");
+        }
     }
 
     #[test]

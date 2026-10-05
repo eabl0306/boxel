@@ -114,4 +114,24 @@ fn surface_choices() {
         choose_present_mode(PresentModePref::Immediate, &[P::Fifo, P::Mailbox]),
         P::Mailbox
     );
+    // Vsync off (the default): Mailbox, else Immediate, else Fifo.
+    assert_eq!(PresentModePref::default(), PresentModePref::NoVsync);
+    let all = [P::Fifo, P::Immediate, P::Mailbox];
+    assert_eq!(
+        choose_present_mode(PresentModePref::NoVsync, &all),
+        P::Mailbox
+    );
+    assert_eq!(
+        choose_present_mode(PresentModePref::NoVsync, &[P::Fifo, P::Immediate]),
+        P::Immediate
+    );
+    assert_eq!(
+        choose_present_mode(PresentModePref::NoVsync, &[P::Fifo, P::FifoRelaxed]),
+        P::Fifo
+    );
+    assert_eq!(choose_present_mode(PresentModePref::Vsync, &all), P::Fifo);
+    assert_eq!(PresentModePref::from_vsync(true), PresentModePref::Vsync);
+    assert_eq!(PresentModePref::from_vsync(false), PresentModePref::NoVsync);
+    assert!(PresentModePref::Vsync.is_vsync());
+    assert!(!PresentModePref::Mailbox.is_vsync());
 }

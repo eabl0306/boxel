@@ -2,21 +2,53 @@ use crate::{Tier, one_line};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Present mode preference (mapped to the closest supported `wgpu::PresentMode`, else `Fifo`).
+/// Present mode preference (mapped to the closest supported `wgpu::PresentMode`, else `Fifo`,
+/// by [`crate::choose_present_mode`]).
+///
+/// The default is [`PresentModePref::NoVsync`]: the app's frame limit (`boxel_app::FrameLimit`,
+/// 144 fps by default) governs the frame rate, not the display. Vsync caps shown frames at the
+/// refresh rate and, where presenting blocks (measured on X11), the update rate too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PresentModePref {
-    /// `Fifo` (always supported).
-    #[default]
+    /// Vsync on: `Fifo` (always supported).
     Vsync,
+    /// Vsync off (default): `Mailbox` (no tearing), else `Immediate` (may tear), else `Fifo`
+    /// (the surface supports nothing else; the renderer logs a note).
+    #[default]
+    NoVsync,
     /// `Mailbox`, else `Fifo`.
     Mailbox,
     /// `Immediate`, else `Mailbox`, else `Fifo`.
     Immediate,
 }
 
+impl PresentModePref {
+    /// The preference for a vsync switch: on = [`PresentModePref::Vsync`], off =
+    /// [`PresentModePref::NoVsync`].
+    pub fn from_vsync(vsync: bool) -> Self {
+        if vsync { Self::Vsync } else { Self::NoVsync }
+    }
+
+    /// True only for [`PresentModePref::Vsync`] (the wish; the surface may still end up on
+    /// `Fifo` without it).
+    pub fn is_vsync(self) -> bool {
+        self == Self::Vsync
+    }
+
+    /// The `--present` / `BOXEL_PRESENT` / config spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Vsync => "vsync",
+            Self::NoVsync => "novsync",
+            Self::Mailbox => "mailbox",
+            Self::Immediate => "immediate",
+        }
+    }
+}
+
 /// Accepted `--present` values, for help texts.
-pub const PRESENT_MODES: &str = "vsync|mailbox|immediate";
+pub const PRESENT_MODES: &str = "vsync|novsync|mailbox|immediate";
 
 /// GPU selection preferences. Every field is optional so layers can be merged with
 /// [`GpuPreferences::overlay`]. Resolution order (frozen, highest first):
@@ -56,7 +88,7 @@ GPU options (also BOXEL_* / WGPU_* env vars, see docs):
   --software           only CPU rasterizers (lavapipe/llvmpipe/WARP) [BOXEL_SOFTWARE=1]
   --validation         backend validation layers              [BOXEL_GPU_VALIDATION=1]
   --lkg / --no-lkg     use / ignore last-known-good (default: on in release builds) [BOXEL_LKG=1|0]
-  --present <mode>     vsync|mailbox|immediate                [BOXEL_PRESENT]
+  --present <mode>     vsync|novsync|mailbox|immediate (default novsync) [BOXEL_PRESENT]
   --gpu-config <path>  TOML file with a [gpu] table           [BOXEL_GPU_CONFIG]
 ";
 
@@ -427,6 +459,7 @@ fn parse_tier(key: &str, value: &str) -> Result<Tier, PrefsError> {
 fn parse_present(key: &str, value: &str) -> Result<PresentModePref, PrefsError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "vsync" => Ok(PresentModePref::Vsync),
+        "novsync" => Ok(PresentModePref::NoVsync),
         "mailbox" => Ok(PresentModePref::Mailbox),
         "immediate" => Ok(PresentModePref::Immediate),
         _ => Err(bad(key, value, PRESENT_MODES)),
@@ -530,6 +563,27 @@ mod tests {
         assert_eq!(p.validation, Some(false));
         assert_eq!(p.use_lkg, Some(false));
         assert_eq!(p.present_mode, Some(PresentModePref::Immediate));
+    }
+
+    #[test]
+    fn present_modes_parse_and_print_the_same_names() {
+        for pref in [
+            PresentModePref::Vsync,
+            PresentModePref::NoVsync,
+            PresentModePref::Mailbox,
+            PresentModePref::Immediate,
+        ] {
+            assert_eq!(parse_present("--present", pref.as_str()).unwrap(), pref);
+            assert!(PRESENT_MODES.split('|').any(|name| name == pref.as_str()));
+        }
+        assert_eq!(
+            parse_present("BOXEL_PRESENT", " NoVsync ").unwrap(),
+            PresentModePref::NoVsync
+        );
+        assert!(parse_present("--present", "fast").is_err());
+        let (p, warnings) = boxel_env_with(&env(&[("BOXEL_PRESENT", "novsync")]));
+        assert!(warnings.is_empty());
+        assert_eq!(p.present_mode, Some(PresentModePref::NoVsync));
     }
 
     #[test]

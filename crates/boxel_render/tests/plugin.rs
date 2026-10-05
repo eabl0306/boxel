@@ -8,9 +8,10 @@
 use boxel_app::{App, Last, MainScheduleOrder, Plugin, TaskPoolOptions, TaskPoolPlugin, Update};
 use boxel_ecs::prelude::*;
 use boxel_ecs::schedule::ScheduleLabel;
+use boxel_gfx::PresentModePref;
 use boxel_render::{
-    GpuFailed, GpuReady, Render, RenderInfo, RenderPlugin, RenderSettings, RenderSystems,
-    RequestScreenshot, ScreenshotSaved, SurfaceInfo,
+    GpuFailed, GpuReady, PresentSettings, Render, RenderInfo, RenderPlugin, RenderSettings,
+    RenderSystems, RequestScreenshot, ScreenshotSaved, SurfaceInfo,
 };
 use boxel_world::ChunkMeshEvent;
 use std::collections::HashSet;
@@ -147,6 +148,32 @@ fn render_runs_right_after_last_and_registers_its_messages() {
     assert!(world.contains_resource::<RenderInfo>());
     assert!(world.contains_resource::<SurfaceInfo>());
     assert_eq!(world.resource::<RenderSettings>().app_name, "plugin_test");
+    // Vsync off by default, so the frame limit governs.
+    assert_eq!(
+        world.resource::<PresentSettings>().mode,
+        PresentModePref::NoVsync
+    );
+    assert_eq!(world.resource::<RenderInfo>().present_mode, None);
+}
+
+#[test]
+fn an_app_present_setting_survives_the_plugin() {
+    for before in [true, false] {
+        let mut app = App::new();
+        if before {
+            app.insert_resource(PresentSettings::vsync(true));
+            app.add_plugins(RenderPlugin::default());
+        } else {
+            app.add_plugins(RenderPlugin::default());
+            app.insert_resource(PresentSettings::vsync(true));
+        }
+        let mut app = finished(app);
+        app.update();
+        assert!(
+            app.world().resource::<PresentSettings>().is_vsync(),
+            "{before}"
+        );
+    }
 }
 
 #[derive(Resource, Default)]
