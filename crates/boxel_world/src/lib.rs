@@ -14,8 +14,9 @@
 //! 2. `Edits`: apply [`EditQueue`] (copy-on-write, version bump, remesh center + touched face
 //!    neighbors, bump their `epoch`).
 //! 3. `Dispatch`: collect finished jobs, then pop jobs by priority while in-flight < cap and run
-//!    them on the `AsyncComputeTaskPool` through a [`jobs::JobExecutor`]; repeated while results
-//!    keep arriving, within [`WorldSettings::job_budget`]. Stale results are dropped (slot
+//!    them on the `AsyncComputeTaskPool` through a [`jobs::JobExecutor`] (stale priorities that
+//!    may come first are refreshed on the way, so jobs start nearest first); repeated while
+//!    results keep arriving, within [`WorldSettings::job_budget`]. Stale results are dropped (slot
 //!    generation, data version, neighbor epoch, cancel flag).
 //! 4. `Collect`: publish mesh results as [`ChunkMeshEvent`]s, up to
 //!    [`WorldSettings::max_mesh_events_per_frame`].

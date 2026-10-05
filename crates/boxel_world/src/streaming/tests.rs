@@ -827,14 +827,81 @@ fn auto_cap_keeps_workers_busy_for_one_and_a_half_frames() {
     let t0 = Instant::now();
     for i in 0..64 {
         cap.observe_frame(t0 + Duration::from_millis(10 * i));
-        cap.observe_job(Duration::from_micros(100));
+        for _ in 0..40 {
+            cap.observe_job(Duration::from_micros(100));
+        }
     }
+    cap.observe_frame(t0 + Duration::from_millis(640));
     assert!((cap.frame - 0.010).abs() < 1e-4, "{}", cap.frame);
-    assert!((cap.job - 100e-6).abs() < 20e-6, "{}", cap.job);
+    assert!((cap.job - 100e-6).abs() < 1e-6, "{}", cap.job);
     assert_eq!(cap.cap(), auto_cap(4, cap.frame, cap.job));
     // A hitch counts as 33 ms at most.
     cap.observe_frame(t0 + Duration::from_secs(60));
     assert!(cap.frame < 0.0135, "{}", cap.frame);
+    // A frame with a single slow job (10 times the average) barely moves the job cost.
+    let job = cap.job;
+    cap.observe_job(Duration::from_millis(1));
+    cap.observe_frame(t0 + Duration::from_secs(61));
+    assert!(
+        cap.job > job && cap.job < job * 1.05,
+        "{} after {job}",
+        cap.job
+    );
+}
+
+/// Jobs come back in no useful order: cheap generations and expensive meshes mixed, some frames
+/// ending with a run of one kind. The cap depends on what the frames finished, not on that order,
+/// and it stays steady while the mix does.
+#[test]
+fn auto_cap_is_steady_under_a_mixed_job_stream() {
+    let t0 = Instant::now();
+    let cheap = Duration::from_micros(5);
+    let costly = Duration::from_micros(150);
+    let mut caps = Vec::new();
+    let mut cap = AutoCap::new(6);
+    for frame in 0..200u32 {
+        cap.observe_frame(t0 + Duration::from_micros(6944 * u64::from(frame)));
+        caps.push(cap.cap());
+        // 300 of each per frame; every other frame ends with all the cheap ones.
+        let (first, last) = if frame % 2 == 0 {
+            (costly, cheap)
+        } else {
+            (cheap, costly)
+        };
+        for busy in std::iter::repeat_n(first, 300).chain(std::iter::repeat_n(last, 300)) {
+            cap.observe_job(busy);
+        }
+    }
+    // After the first frames, consecutive caps differ by a few percent at most.
+    let settled = &caps[64..];
+    let (lo, hi) = (
+        *settled.iter().min().expect("caps"),
+        *settled.iter().max().expect("caps"),
+    );
+    assert!(hi * 100 <= lo * 103, "cap between {lo} and {hi}");
+    // 6 workers x 1.5 frames / 77.5 us per job.
+    let expected = auto_cap(6, 6.944e-3, 77.5e-6);
+    assert!(
+        lo.abs_diff(expected) * 100 <= expected * 3,
+        "{lo} vs {expected}"
+    );
+
+    // The same jobs in another order give the same cap.
+    let mut a = AutoCap::new(6);
+    let mut b = AutoCap::new(6);
+    for frame in 0..10u32 {
+        let now = t0 + Duration::from_millis(7 * u64::from(frame));
+        a.observe_frame(now);
+        b.observe_frame(now);
+        for i in 0..100u64 {
+            a.observe_job(Duration::from_micros(i));
+            b.observe_job(Duration::from_micros(99 - i));
+        }
+    }
+    a.observe_frame(t0 + Duration::from_millis(70));
+    b.observe_frame(t0 + Duration::from_millis(70));
+    assert!((a.job - b.job).abs() < 1e-12, "{} vs {}", a.job, b.job);
+    assert_eq!(a.cap(), b.cap());
 }
 
 #[test]

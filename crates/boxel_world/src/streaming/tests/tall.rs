@@ -1,7 +1,8 @@
 //! Worlds without a height limit: the loaded volume follows the viewer up and down, layers the
-//! generator declares all air need no job, one-chunk moves touch only the slabs that change, and
-//! random walks (with interest work spread over frames and jobs running in between) always end
-//! in the from-scratch wanted set.
+//! generator declares all air need no job, one-chunk moves touch only the slabs that change, jobs
+//! start nearest first while priorities are stale, a jump does not grow the map, and random walks
+//! (with interest work spread over frames and jobs running in between, also when changes pile up
+//! on pending work) always end in the from-scratch wanted set.
 use super::*;
 use crate::interest::tests::reference_world_level;
 use proptest::prelude::*;
@@ -231,6 +232,87 @@ fn small_moves_touch_only_the_changed_positions() {
     }
 }
 
+/// After a move, interest work and stale priorities are spread over frames, and new far jobs are
+/// queued with fresh priorities while nearer ones still wait with stale ones. Jobs must still
+/// start nearest first.
+#[test]
+fn jobs_start_nearest_first_while_priorities_are_stale() {
+    let hold = Arc::new(HoldExecutor::default());
+    let mut h = tall_world(hold.clone());
+    h.jobs.scheduler.set_max_in_flight(600);
+    h.viewers(&one(ChunkPos::new(0, 0, 0), 12, 1));
+    let queued = h.jobs.scheduler.queued();
+    assert!(queued > 2000, "{queued} generation jobs");
+    // One chunk in x, applied with a zero budget: 64 positions and one batch of priorities.
+    let moved = one(ChunkPos::new(1, 0, 0), 12, 1);
+    h.with(|jobs, cx, settings| {
+        jobs.plan_interest(cx, settings, &moved);
+        jobs.process_interest(cx, settings, Duration::ZERO);
+    });
+    assert!(h.jobs.interest_backlog() > 0);
+    assert!(h.jobs.scheduler.stale() > queued / 2);
+    h.dispatch();
+    assert_eq!(hold.held(), 600);
+    let distance = |state: fn(&DataState) -> bool| {
+        h.map
+            .iter()
+            .filter(|(_, s)| state(&s.data))
+            .map(|(_, s)| h.jobs.planner.priority(s.key.pos))
+            .collect::<Vec<u32>>()
+    };
+    let started = distance(|d| matches!(d, DataState::Generating));
+    let waiting = distance(|d| matches!(d, DataState::Queued));
+    assert_eq!(started.len(), 600);
+    let farthest_started = started.iter().max().expect("started");
+    let nearest_waiting = waiting.iter().min().expect("waiting");
+    assert!(
+        farthest_started <= nearest_waiting,
+        "a job at {farthest_started} started before one at {nearest_waiting}"
+    );
+    // Only the stale jobs that might come first were refreshed on the way.
+    assert!(h.jobs.scheduler.stale() > 0);
+}
+
+/// After a jump the old view stays loaded until the new one is created, so for a while the map
+/// holds both. The room reserved when the viewer appeared covers that: no rehash mid-load.
+#[test]
+fn a_jump_does_not_grow_the_map() {
+    let mut h = tall_world(Arc::new(InlineExecutor));
+    // Sizes where room for one view (the keep region) is not enough, slots and index alike.
+    h.viewers(&one(ChunkPos::new(0, 0, 0), 14, 4));
+    h.settle(400);
+    let (slots, index) = (h.map.slots.capacity(), h.map.index.capacity());
+    let view = h.map.len();
+    let hint = h.jobs.planner.capacity_hint();
+    assert!(slots >= 2 * hint && index >= 2 * hint);
+    // Far away, applied a few positions per frame with jobs in between.
+    let far = one(ChunkPos::new(500, 3, -200), 14, 4);
+    let mut peak = 0;
+    for _ in 0..10_000 {
+        h.with(|jobs, cx, settings| {
+            jobs.plan_interest(cx, settings, &far);
+            jobs.process_interest(cx, settings, Duration::ZERO);
+        });
+        h.step();
+        peak = peak.max(h.map.len());
+        if h.jobs.interest_backlog() == 0 {
+            break;
+        }
+    }
+    check_interest(&h, &[far[0].1]);
+    assert!(
+        peak > hint && peak > view * 3 / 2,
+        "both views were loaded: {peak} for a view of {view} (keep region {hint})"
+    );
+    assert_eq!(h.map.slots.capacity(), slots);
+    // A resize doubles the index; removed entries may only lower what it reports (tombstones).
+    assert!(
+        h.map.index.capacity() <= index,
+        "{index} -> {}",
+        h.map.index.capacity()
+    );
+}
+
 /// Empty for an all-air center, else `1 + the number of loaded neighbors` quads: a mesh built
 /// with other neighbors than the map has now shows a different count.
 fn neighbor_count_mesh(input: &MeshInput<'_>, materials: &MaterialTable) -> ChunkMesh {
@@ -348,8 +430,118 @@ fn apply(viewers: &mut [Option<Viewer>; 2], op: &Op) {
     }
 }
 
+/// What changes in one frame of a walk that never waits for the interest to catch up.
+#[derive(Clone, Debug)]
+enum FrameOp {
+    /// A viewer change, as in the walks above.
+    Viewer(Op),
+    /// New vertical bounds (`None`: no height limit).
+    Bounds(Option<(i32, i32)>),
+    /// A new unload hysteresis.
+    Hysteresis(u32),
+    /// Nothing changes.
+    Idle,
+}
+
+fn frame_op() -> impl Strategy<Value = FrameOp> {
+    prop_oneof![
+        8 => op().prop_map(FrameOp::Viewer),
+        1 => prop_oneof![
+            Just(None),
+            Just(Some((-2, 1))),
+            Just(Some((-1, 0))),
+            Just(Some((-3, 3))),
+        ]
+        .prop_map(FrameOp::Bounds),
+        1 => (0u32..=2).prop_map(FrameOp::Hysteresis),
+        2 => Just(FrameOp::Idle),
+    ]
+}
+
+/// The viewers as the world sees them (ids by slot).
+fn viewer_list(viewers: &[Option<Viewer>; 2]) -> Vec<(u64, Viewer)> {
+    (0u64..)
+        .zip(viewers.iter())
+        .filter_map(|(id, v)| v.map(|v| (id, v)))
+        .collect()
+}
+
+/// One frame: interest with a zero budget (64 positions, one batch of priorities), then
+/// optionally a job round.
+fn frame(h: &mut Harness, hold: &HoldExecutor, list: &[(u64, Viewer)], run: bool) {
+    h.with(|jobs, cx, settings| {
+        jobs.plan_interest(cx, settings, list);
+        jobs.process_interest(cx, settings, Duration::ZERO);
+    });
+    if run {
+        h.dispatch();
+        hold.run_all();
+        h.collect();
+    }
+}
+
+/// Bookkeeping that holds after every frame, whatever interest work is pending: neighbor bits
+/// match the map and published meshes match the slots.
+fn check_bookkeeping(h: &Harness) {
+    for (_, slot) in h.map.iter() {
+        assert_eq!(
+            slot.neighbors_ready,
+            own_neighbor_bits(&h.map, &h.jobs.planner, slot.key.pos),
+            "{:?} neighbor bits",
+            slot.key.pos
+        );
+    }
+    h.check_published();
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
+
+    /// One change per frame (viewer moves, jumps, radii, viewers coming and going, vertical
+    /// bounds, hysteresis), each planned on top of the interest work earlier changes left
+    /// pending: the budget is zero (64 positions per frame) and nothing waits for the backlog to
+    /// drain. Jobs run in some frames. The bookkeeping holds after every frame, and once the
+    /// backlog is drained at the end the world matches the from-scratch wanted set.
+    #[test]
+    fn changes_on_top_of_pending_work_end_in_the_wanted_set(
+        frames in proptest::collection::vec((frame_op(), any::<bool>()), 1..40),
+        hysteresis in 0u32..=2,
+    ) {
+        let hold = Arc::new(HoldExecutor::default());
+        let mut h = Harness::new(LayerGen::new(-2..=1), hold.clone(), 16).tall();
+        h.settings.unload_hysteresis = hysteresis;
+        let mut viewers: [Option<Viewer>; 2] = [Some(Viewer::new(ChunkPos::new(0, 0, 0), 2, 1)), None];
+        for (op, run) in &frames {
+            match op {
+                FrameOp::Viewer(op) => apply(&mut viewers, op),
+                FrameOp::Bounds(b) => h.settings.vertical_bounds = b.map(|(lo, hi)| lo..=hi),
+                FrameOp::Hysteresis(n) => h.settings.unload_hysteresis = *n,
+                FrameOp::Idle => {}
+            }
+            frame(&mut h, &hold, &viewer_list(&viewers), *run);
+            check_bookkeeping(&h);
+        }
+        // Drain with jobs in between, without new changes.
+        let list = viewer_list(&viewers);
+        let mut frames_left = 10_000;
+        while h.jobs.interest_backlog() > 0 || h.jobs.scheduler.stale() > 0 {
+            frame(&mut h, &hold, &list, true);
+            frames_left -= 1;
+            prop_assert!(frames_left > 0, "interest never caught up");
+        }
+        let current: Vec<Viewer> = list.iter().map(|&(_, v)| v).collect();
+        check_interest(&h, &current);
+        run_all(&mut h, &hold);
+        check_interest(&h, &current);
+        for (_, slot) in h.map.iter() {
+            if slot.interest.contains(Interest::MESH) {
+                prop_assert!(
+                    matches!(slot.mesh, MeshState::Ready { .. } | MeshState::Empty),
+                    "{:?} mesh {:?}", slot.key.pos, slot.mesh
+                );
+            }
+        }
+    }
 
     /// Random viewer walks (small moves, vertical moves, jumps, radius changes, a second viewer
     /// coming and going) on the real state machine. Interest work is spread over frames (budget

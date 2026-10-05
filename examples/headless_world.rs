@@ -5,16 +5,23 @@
 //!
 //! Output (stdout): once settled, `chunks=N ready=N meshed=N empty=N quads=N elapsed=S frames=N
 //! max_update_ms=X p99_update_ms=X`, where `quads` is the sum of the ready mesh quads and the
-//! update times are the longest and 99th percentile `App::update` while loading. With `--speed`,
-//! a second line after the walk: `walk: moved=V voxels in S s, frames=N max_update_ms=X
-//! p99_update_ms=X, behind=N, caught_up_after=S`, where `behind` counts the jobs and interest
-//! work left when the walk stops.
+//! update times are the longest and 99th percentile `App::update` while loading. Then, in this
+//! order and only when asked for:
+//! - `--idle`: `idle: frames=N median_update_ms=X p99_update_ms=X max_update_ms=X` while the
+//!   viewer stands still.
+//! - `--speed`: `walk: moved=V voxels in S s, frames=N max_update_ms=X p99_update_ms=X, behind=N,
+//!   caught_up_after=S`, where `behind` counts the jobs and interest work left when the walk
+//!   stops.
+//! - `--jump`: `jump: chunks=N settled_after=S frames=N max_update_ms=X p99_update_ms=X` from the
+//!   frame of the teleport until the new area is settled.
+//!
 //! Exit codes: 0 settled, 1 usage error, 4 not settled within the timeout. Set `RUST_LOG` for
 //! more logging (default filter `warn`).
 #![expect(clippy::print_stdout, clippy::print_stderr, reason = "CLI output")]
 
 use boxel::log::LogPlugin;
 use boxel::prelude::*;
+use boxel::voxel::CHUNK_SIZE;
 use boxel::world::{WorldStats, WorldSystems};
 use std::time::{Duration, Instant};
 
@@ -24,8 +31,10 @@ usage: headless_world [options]
   --vertical-radius N  vertical mesh radius in chunks (default 8)
   --fixed-height       stream every layer of the generator and nothing else (boxel M0 streaming)
   --hz N               frames per second of the loop (default 62.5; 0 = no wait between frames)
-  --speed V            once settled, move the viewer along +x at V voxels/s
+  --idle S             once settled, stand still for S seconds and report the update times
+  --speed V            then move the viewer along +x at V voxels/s
   --duration S         walk duration in seconds with --speed (default 5)
+  --jump N             then teleport the viewer N chunks along +x and wait for the new area
   --timeout S          wall-clock limit in seconds (default 60), exit 4 past it
   --help               this text";
 
@@ -43,6 +52,8 @@ struct Options {
     hz: f64,
     speed: f64,
     duration: Duration,
+    idle: Duration,
+    jump: u32,
     timeout: Duration,
 }
 
@@ -55,6 +66,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         hz: 62.5,
         speed: 0.0,
         duration: Duration::from_secs(5),
+        idle: Duration::ZERO,
+        jump: 0,
         timeout: Duration::from_secs(60),
     };
     let mut it = args.iter();
@@ -77,6 +90,12 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--hz" => o.hz = number(flag, &value()?)?,
             "--speed" => o.speed = number(flag, &value()?)?,
             "--duration" => o.duration = Duration::from_secs_f64(number(flag, &value()?)?),
+            "--idle" => o.idle = Duration::from_secs_f64(number(flag, &value()?)?),
+            "--jump" => {
+                o.jump = value()?
+                    .parse()
+                    .map_err(|_| format!("{flag}: not a chunk count"))?;
+            }
             "--timeout" => o.timeout = Duration::from_secs_f64(number(flag, &value()?)?),
             other => return Err(format!("unknown argument {other:?}")),
         }
@@ -105,10 +124,14 @@ fn number(flag: &str, value: &str) -> Result<f64, String> {
 enum Phase {
     /// Loading the first area.
     Loading,
+    /// Standing still since `since`.
+    Idle { since: Instant },
     /// Walking since `since`.
     Walking { since: Instant },
     /// Walk over at `since` with `behind` work left; waiting to settle again.
     CatchingUp { since: Instant, behind: usize },
+    /// Teleported at `since`; waiting for the new area.
+    Jumping { since: Instant },
 }
 
 #[derive(Resource)]
@@ -125,12 +148,59 @@ struct Run {
     /// Viewer x when the walk started.
     walk_from: f64,
     walk_report: Option<String>,
+    /// Voxels to move the viewer along x in this frame (a jump).
+    teleport: Option<f64>,
 }
 
 impl Run {
     fn exit(&self, code: u8, exit: &mut MessageWriter<AppExit>) {
         exit.write(AppExit::from_code(code));
     }
+
+    /// Starts the phase after `done` that was asked for (idle, walk, jump), or exits.
+    fn next_phase(&mut self, done: Phase, now: Instant, x: f64, exit: &mut MessageWriter<AppExit>) {
+        let o = &self.options;
+        let rank = |p: &Phase| match p {
+            Phase::Loading => 0,
+            Phase::Idle { .. } => 1,
+            Phase::Walking { .. } | Phase::CatchingUp { .. } => 2,
+            Phase::Jumping { .. } => 3,
+        };
+        let candidates = [
+            (o.idle > Duration::ZERO).then_some(Phase::Idle { since: now }),
+            (o.speed > 0.0).then_some(Phase::Walking { since: now }),
+            (o.jump > 0).then_some(Phase::Jumping { since: now }),
+        ];
+        let Some(next) = candidates
+            .into_iter()
+            .flatten()
+            .find(|p| rank(p) > rank(&done))
+        else {
+            self.exit(0, exit);
+            return;
+        };
+        match next {
+            Phase::Walking { .. } => self.walk_from = x,
+            Phase::Jumping { .. } => {
+                self.teleport = Some(f64::from(o.jump) * f64::from(CHUNK_SIZE));
+            }
+            _ => {}
+        }
+        self.updates.clear();
+        self.phase = next;
+    }
+}
+
+/// Median of `values` (0 when empty).
+fn median(values: &[f64]) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    sorted.get(sorted.len() / 2).copied().unwrap_or(0.0)
+}
+
+/// Longest of `values` (0 when empty).
+fn max(values: &[f64]) -> f64 {
+    values.iter().copied().fold(0.0, f64::max)
 }
 
 fn main() -> AppExit {
@@ -178,11 +248,12 @@ fn main() -> AppExit {
             max_update: 0.0,
             walk_from: VIEWER.x,
             walk_report: None,
+            teleport: None,
         })
         .add_systems(Startup, spawn_viewer)
         .add_systems(First, start_update)
         .add_systems(PreUpdate, drive)
-        .add_systems(Update, walk.before(WorldSystems::Interest))
+        .add_systems(Update, move_viewer.before(WorldSystems::Interest))
         .add_systems(Last, end_update)
         .run()
 }
@@ -222,13 +293,20 @@ fn p99(values: &[f64]) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Moves the viewer along +x while walking.
-fn walk(run: Res<Run>, time: Res<Time>, mut viewers: Query<&mut Transform, With<ChunkViewer>>) {
-    if !matches!(run.phase, Phase::Walking { .. }) {
-        return;
+/// Moves the viewer along +x while walking, and teleports it for a jump.
+fn move_viewer(
+    mut run: ResMut<Run>,
+    time: Res<Time>,
+    mut viewers: Query<&mut Transform, With<ChunkViewer>>,
+) {
+    let mut dx = run.teleport.take().unwrap_or(0.0);
+    if matches!(run.phase, Phase::Walking { .. }) {
+        dx += run.options.speed * time.delta().as_secs_f64();
     }
-    for mut transform in &mut viewers {
-        transform.translation.x += run.options.speed * time.delta().as_secs_f64();
+    if dx != 0.0 {
+        for mut transform in &mut viewers {
+            transform.translation.x += dx;
+        }
     }
 }
 
@@ -265,13 +343,17 @@ fn drive(
                 run.max_update,
                 p99(&run.updates),
             );
-            if run.options.speed > 0.0 {
-                run.phase = Phase::Walking { since: now };
-                run.walk_from = x;
-                run.updates.clear();
-            } else {
-                run.exit(0, &mut exit);
-            }
+            run.next_phase(Phase::Loading, now, x, &mut exit);
+        }
+        Phase::Idle { since } if now.duration_since(since) >= run.options.idle => {
+            println!(
+                "idle: frames={} median_update_ms={:.3} p99_update_ms={:.3} max_update_ms={:.3}",
+                run.updates.len(),
+                median(&run.updates),
+                p99(&run.updates),
+                max(&run.updates),
+            );
+            run.next_phase(Phase::Idle { since }, now, x, &mut exit);
         }
         Phase::Walking { since } if now.duration_since(since) >= run.options.duration => {
             let behind = stats.queued_jobs
@@ -279,24 +361,38 @@ fn drive(
                 + stats.generating
                 + stats.meshing
                 + stats.interest_backlog;
-            let max = run.updates.iter().copied().fold(0.0, f64::max);
             run.walk_report = Some(format!(
-                "walk: moved={:.0} voxels in {:.1} s, frames={} max_update_ms={max:.2} \
+                "walk: moved={:.0} voxels in {:.1} s, frames={} max_update_ms={:.2} \
                  p99_update_ms={:.2}, behind={behind}",
                 x - run.walk_from,
                 now.duration_since(since).as_secs_f64(),
                 run.updates.len(),
+                max(&run.updates),
                 p99(&run.updates),
             ));
             run.phase = Phase::CatchingUp { since: now, behind };
         }
-        Phase::CatchingUp { since, .. } if settled => {
+        Phase::CatchingUp { since, behind } if settled => {
             let report = run.walk_report.take().unwrap_or_default();
             println!(
                 "{report}, caught_up_after={:.3}s",
                 now.duration_since(since).as_secs_f64()
             );
-            run.exit(0, &mut exit);
+            run.next_phase(Phase::CatchingUp { since, behind }, now, x, &mut exit);
+        }
+        // The counters here are from the end of the previous frame, which already planned the
+        // teleport: the new area is settled.
+        Phase::Jumping { since } if settled => {
+            println!(
+                "jump: chunks={} settled_after={:.3}s frames={} max_update_ms={:.2} \
+                 p99_update_ms={:.2}",
+                run.options.jump,
+                now.duration_since(since).as_secs_f64(),
+                run.updates.len(),
+                max(&run.updates),
+                p99(&run.updates),
+            );
+            run.next_phase(Phase::Jumping { since }, now, x, &mut exit);
         }
         _ => {}
     }

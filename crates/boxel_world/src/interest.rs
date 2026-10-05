@@ -522,18 +522,21 @@ impl Planner {
 
     /// Plans the work for new viewers (`viewers` sorted by id) or settings. `loaded` lists every
     /// loaded slot; it is only called when the settings changed (everything is re-evaluated).
-    /// Returns true if anything changed (queued job priorities are then stale).
+    /// Returns `None` if nothing changed. Otherwise queued job priorities are stale, and the
+    /// value is how many chunks closer to its nearest viewer any position may have come (the
+    /// longest viewer move, `u32::MAX` if a viewer was added).
     pub(crate) fn update(
         &mut self,
         viewers: &[(u64, Viewer)],
         hysteresis: u32,
         bounds: Option<&RangeInclusive<i32>>,
         loaded: impl FnOnce() -> Vec<ChunkPos>,
-    ) -> bool {
+    ) -> Option<u32> {
         if !self.changed(viewers, hysteresis, bounds) {
-            return false;
+            return None;
         }
         debug_assert!(viewers.is_sorted_by_key(|(id, _)| *id));
+        let drift = drift(&self.viewers, viewers);
         let hysteresis = hysteresis.min(MAX_RADIUS);
         let settings_changed =
             self.planned && (self.hysteresis != hysteresis || self.bounds.as_ref() != bounds);
@@ -597,7 +600,7 @@ impl Planner {
         self.viewers = viewers.to_vec();
         self.shapes = shapes;
         self.planned = true;
-        true
+        Some(drift)
     }
 
     /// Column tables for `radius` (cached).
@@ -685,6 +688,31 @@ impl Planner {
             .min()
             .map_or(u32::MAX, |d| u32::try_from(d).unwrap_or(u32::MAX))
     }
+}
+
+/// How many chunks closer to its nearest viewer any position may be with `new` viewers than with
+/// `old` ones (both sorted by id): the longest move of a viewer present in both, rounded up, or
+/// `u32::MAX` if `new` has a viewer `old` does not. Viewers that left only move positions away.
+fn drift(old: &[(u64, Viewer)], new: &[(u64, Viewer)]) -> u32 {
+    let mut drift = 0;
+    let mut old = old.iter().peekable();
+    for (id, viewer) in new {
+        while old.next_if(|(old_id, _)| old_id < id).is_some() {}
+        let Some((_, before)) = old.next_if(|(old_id, _)| old_id == id) else {
+            return u32::MAX;
+        };
+        drift = drift.max(distance_ceil(before.center, viewer.center));
+    }
+    drift
+}
+
+/// Euclidean distance between two chunks, rounded up (`u32::MAX` if it does not fit).
+fn distance_ceil(a: ChunkPos, b: ChunkPos) -> u32 {
+    let d = |p: i32, q: i32| u128::from(p.abs_diff(q)).pow(2);
+    let sq = d(a.x, b.x) + d(a.y, b.y) + d(a.z, b.z);
+    let root = sq.isqrt();
+    let root = if root * root < sq { root + 1 } else { root };
+    u32::try_from(root).unwrap_or(u32::MAX)
 }
 
 /// True if `b` is `a` moved by at most [`SMALL_MOVE`] chunks per axis, radii unchanged.

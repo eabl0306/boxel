@@ -269,9 +269,13 @@ fn planner_pairs_viewers_by_id() {
     let mut p = Planner::default();
     let a = viewer(0, 0, 0, 2, 1);
     assert!(p.changed(&[(1, a)], 2, None));
-    assert!(p.update(&[(1, a)], 2, None, Vec::new));
+    assert_eq!(p.update(&[(1, a)], 2, None, Vec::new), Some(u32::MAX));
     assert!(!p.changed(&[(1, a)], 2, None));
-    assert!(!p.update(&[(1, a)], 2, None, Vec::new), "nothing changed");
+    assert_eq!(
+        p.update(&[(1, a)], 2, None, Vec::new),
+        None,
+        "nothing changed"
+    );
     let first: BTreeSet<ChunkPos> = std::iter::from_fn(|| p.next()).collect();
     assert_eq!(p.backlog(), 0);
     assert_eq!(
@@ -284,7 +288,7 @@ fn planner_pairs_viewers_by_id() {
 
     // A one-chunk move lists a slab, not the view.
     let moved = viewer(1, 0, 0, 2, 1);
-    assert!(p.update(&[(1, moved)], 2, None, Vec::new));
+    assert_eq!(p.update(&[(1, moved)], 2, None, Vec::new), Some(1));
     let listed: Vec<ChunkPos> = std::iter::from_fn(|| p.next()).collect();
     assert_eq!(
         listed.iter().copied().collect::<BTreeSet<_>>(),
@@ -299,7 +303,11 @@ fn planner_pairs_viewers_by_id() {
     // A settings change re-lists every loaded slot plus the data regions.
     let loaded = vec![ChunkPos::new(50, 0, 0), ChunkPos::new(51, 0, 0)];
     let bounds = 0..=0;
-    assert!(p.update(&[(1, moved)], 2, Some(&bounds), || loaded.clone()));
+    assert_eq!(
+        p.update(&[(1, moved)], 2, Some(&bounds), || loaded.clone()),
+        Some(0),
+        "priorities only depend on where the viewers are"
+    );
     let listed: BTreeSet<ChunkPos> = std::iter::from_fn(|| p.next()).collect();
     assert!(loaded.iter().all(|l| listed.contains(l)));
     assert!(listed.iter().filter(|q| q.x < 50).all(|q| q.y == 0));
@@ -311,9 +319,44 @@ fn planner_pairs_viewers_by_id() {
     assert!(p.in_bounds(0) && !p.in_bounds(1));
 
     // No viewers: everything is out, priorities are the max.
-    assert!(p.update(&[], 2, Some(&bounds), Vec::new));
+    assert_eq!(p.update(&[], 2, Some(&bounds), Vec::new), Some(0));
     assert_eq!(p.level(ChunkPos::new(1, 0, 0)), Level::Out);
     assert_eq!(p.priority(ChunkPos::new(1, 0, 0)), u32::MAX);
+}
+
+#[test]
+fn drift_is_the_longest_move() {
+    let at = |x, y, z| viewer(x, y, z, 2, 1);
+    assert_eq!(drift(&[], &[]), 0);
+    assert_eq!(drift(&[], &[(1, at(0, 0, 0))]), u32::MAX, "new viewer");
+    assert_eq!(drift(&[(1, at(0, 0, 0))], &[]), 0, "a viewer left");
+    assert_eq!(drift(&[(1, at(0, 0, 0))], &[(1, at(3, 0, -4))]), 5);
+    assert_eq!(
+        drift(&[(1, at(0, 0, 0))], &[(1, at(1, 1, 1))]),
+        2,
+        "rounded up"
+    );
+    assert_eq!(
+        drift(&[(1, at(0, 0, 0))], &[(1, viewer(0, 0, 0, 9, 9))]),
+        0,
+        "radii do not move priorities"
+    );
+    // Paired by id: 2 left, 3 moved by 1, 4 moved by 2.
+    let old = [(2, at(9, 9, 9)), (3, at(0, 0, 0)), (4, at(5, 0, 0))];
+    assert_eq!(drift(&old, &[(3, at(1, 0, 0)), (4, at(5, 2, 0))]), 2);
+    assert_eq!(drift(&old, &[(1, at(0, 0, 0)), (3, at(0, 0, 0))]), u32::MAX);
+    assert_eq!(drift(&old, &[(3, at(0, 0, 0)), (5, at(0, 0, 0))]), u32::MAX);
+    // Extreme centers do not overflow.
+    let far = Viewer::new(ChunkPos::new(i32::MIN, i32::MIN, i32::MIN), 1, 1);
+    let near = Viewer::new(ChunkPos::new(i32::MAX, i32::MAX, i32::MAX), 1, 1);
+    assert_eq!(
+        drift(&[(1, far)], &[(1, near)]),
+        (3 * (2 * u64::from(MAX_CENTER.unsigned_abs())).pow(2)).isqrt() as u32 + 1
+    );
+    assert_eq!(
+        distance_ceil(ChunkPos::new(i32::MIN, 0, 0), ChunkPos::new(i32::MAX, 0, 0)),
+        u32::MAX
+    );
 }
 
 #[test]

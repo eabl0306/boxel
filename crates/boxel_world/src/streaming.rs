@@ -49,8 +49,19 @@ const MIN_INTEREST_STEPS: usize = 64;
 /// the batch size of the refreshes that use the rest of the budget.
 const PRIORITY_BATCH: usize = 256;
 
+/// Jobs started or priorities refreshed between two checks of the job budget.
+const DISPATCH_CHECK: usize = 16;
+
 /// The automatic in-flight cap keeps the workers busy for this many frames.
 const AUTO_FRAMES: f64 = 1.5;
+
+/// How far the average job cost of the automatic cap moves toward the average of one frame's
+/// finished jobs (a time constant of about 8 frames). Frames with fewer than
+/// [`JOB_COST_FULL_FRAME`] finished jobs move it proportionally less.
+const JOB_COST_WEIGHT: f64 = 1.0 / 8.0;
+
+/// Finished jobs for a frame to count fully in the average job cost.
+const JOB_COST_FULL_FRAME: f64 = 32.0;
 
 /// Upper bound of the automatic in-flight cap.
 pub(crate) const MAX_AUTO_IN_FLIGHT: usize = 4096;
@@ -233,6 +244,10 @@ impl<'a> Ctx<'a> {
 /// Sizes the in-flight cap when `WorldSettings::max_jobs_in_flight` is 0: enough jobs to keep
 /// every async compute worker busy for [`AUTO_FRAMES`] frames, from moving averages of the job
 /// cost (measured on the workers) and of the frame interval.
+///
+/// The job cost is averaged per frame first, then across frames: results arrive in no useful
+/// order (cheap generations and expensive meshes mixed), so a per-job average would follow the
+/// last few results of each frame and make the cap jump from frame to frame.
 #[derive(Debug)]
 pub(crate) struct AutoCap {
     workers: usize,
@@ -241,6 +256,9 @@ pub(crate) struct AutoCap {
     /// Average seconds between frames.
     frame: f64,
     last_frame: Option<Instant>,
+    /// Seconds of the jobs finished since the frame started, and how many.
+    frame_busy: f64,
+    frame_jobs: u32,
 }
 
 impl AutoCap {
@@ -251,18 +269,29 @@ impl AutoCap {
             job: 50e-6,
             frame: 1.0 / 60.0,
             last_frame: None,
+            frame_busy: 0.0,
+            frame_jobs: 0,
         }
     }
 
-    /// A finished job body ran for `busy` (samples clamped to [1 us, 20 ms]).
+    /// A finished job body ran for `busy` (samples clamped to [1 us, 20 ms]). Counted at the
+    /// start of the next frame.
     fn observe_job(&mut self, busy: Duration) {
-        let sample = busy.as_secs_f64().clamp(1e-6, 20e-3);
-        self.job += (sample - self.job) / 32.0;
+        self.frame_busy += busy.as_secs_f64().clamp(1e-6, 20e-3);
+        self.frame_jobs = self.frame_jobs.saturating_add(1);
     }
 
-    /// A frame starts at `now` (intervals clamped to [50 us, 33 ms]: a longer one is a hitch,
-    /// not the frame rate).
+    /// A frame starts at `now`: folds the jobs of the previous frame into the job cost, and the
+    /// interval into the frame time (clamped to [50 us, 33 ms]: a longer one is a hitch, not the
+    /// frame rate).
     fn observe_frame(&mut self, now: Instant) {
+        if self.frame_jobs > 0 {
+            let jobs = f64::from(self.frame_jobs);
+            let weight = JOB_COST_WEIGHT * (jobs / JOB_COST_FULL_FRAME).min(1.0);
+            self.job += (self.frame_busy / jobs - self.job) * weight;
+            self.frame_busy = 0.0;
+            self.frame_jobs = 0;
+        }
         if let Some(last) = self.last_frame {
             let sample = now
                 .saturating_duration_since(last)
@@ -427,18 +456,22 @@ impl WorldJobs {
         let bounds_changed =
             self.planner.is_planned() && self.planner.bounds() != settings.vertical_bounds.as_ref();
         let map = &*cx.map;
-        let changed = self.planner.update(
+        let drift = self.planner.update(
             viewers,
             settings.unload_hysteresis,
             settings.vertical_bounds.as_ref(),
             || map.slots.values().map(|s| s.key.pos).collect(),
         );
-        if changed {
-            self.scheduler.invalidate_priorities();
-            // Grow the map once, now, instead of rehashing it in the middle of a loading frame.
+        if let Some(drift) = drift {
+            self.scheduler.invalidate_priorities(drift);
+            // Room for the view twice: after a jump the old view stays loaded until the new one
+            // is created, and growing the map then would rehash it inside a loading frame.
+            // Reserving is cheap while the map is small (the first plan); a larger view (radius,
+            // new viewer) grows it here, in the frame of the change.
             let room = self
                 .planner
                 .capacity_hint()
+                .saturating_mul(2)
                 .saturating_sub(cx.map.slots.len());
             cx.map.slots.reserve(room);
             cx.map.index.reserve(room);
@@ -500,14 +533,8 @@ impl WorldJobs {
     /// longer wants them are dropped).
     fn refresh_priorities(&mut self, cx: &Ctx<'_>, max: usize) {
         let (map, planner) = (&*cx.map, &self.planner);
-        self.scheduler.refresh_priorities(max, |id, kind| {
-            let slot = map.slots.get(id)?;
-            let queued = match kind {
-                JobKind::Generate => matches!(slot.data, DataState::Queued),
-                JobKind::Mesh => matches!(slot.mesh, MeshState::Queued),
-            };
-            queued.then(|| planner.priority(slot.key.pos))
-        });
+        self.scheduler
+            .refresh_priorities(max, |id, kind| current_priority(map, planner, id, kind));
     }
 
     /// Brings the slot at `pos` in line with the current viewers: creates it if wanted and
@@ -841,23 +868,39 @@ impl WorldJobs {
         self.dispatch_until(cx, Instant::now(), Duration::MAX);
     }
 
-    /// [`WorldJobs::dispatch`] until `budget` after `start` (checked every 16 jobs). Returns the
-    /// jobs started.
+    /// [`WorldJobs::dispatch`] until `budget` after `start` (checked every
+    /// [`DISPATCH_CHECK`] jobs or priority refreshes). Stale priorities that may come before the
+    /// next job are refreshed first, so jobs start nearest first even right after a viewer move.
+    /// Returns the jobs started.
     fn dispatch_until(&mut self, cx: &mut Ctx<'_>, start: Instant, budget: Duration) -> usize {
-        let (mut started, mut popped) = (0, 0usize);
-        while let Some(job) = self.scheduler.pop_ready() {
-            let ok = match job.kind {
-                JobKind::Generate => self.start_generate(cx, job.id),
-                JobKind::Mesh => self.start_mesh(cx, job.id),
-            };
-            if ok {
-                started += 1;
+        let (mut started, mut work, mut check) = (0, 0usize, DISPATCH_CHECK);
+        while !self.scheduler.is_full() {
+            let (map, planner) = (&*cx.map, &self.planner);
+            let refreshed = self.scheduler.refresh_ahead(DISPATCH_CHECK, |id, kind| {
+                current_priority(map, planner, id, kind)
+            });
+            if refreshed > 0 {
+                work += refreshed;
             } else {
-                self.scheduler.complete();
+                let Some(job) = self.scheduler.pop_ready() else {
+                    break;
+                };
+                let ok = match job.kind {
+                    JobKind::Generate => self.start_generate(cx, job.id),
+                    JobKind::Mesh => self.start_mesh(cx, job.id),
+                };
+                if ok {
+                    started += 1;
+                } else {
+                    self.scheduler.complete();
+                }
+                work += 1;
             }
-            popped += 1;
-            if popped.is_multiple_of(16) && start.elapsed() >= budget {
-                break;
+            if work >= check {
+                if start.elapsed() >= budget {
+                    break;
+                }
+                check = work + DISPATCH_CHECK;
             }
         }
         started
@@ -1110,6 +1153,16 @@ impl WorldJobs {
             mesh,
         });
     }
+}
+
+/// Priority of a queued job for the current viewers, `None` if its slot no longer wants it.
+fn current_priority(map: &ChunkMap, planner: &Planner, id: ChunkId, kind: JobKind) -> Option<u32> {
+    let slot = map.slots.get(id)?;
+    let queued = match kind {
+        JobKind::Generate => matches!(slot.data, DataState::Queued),
+        JobKind::Mesh => matches!(slot.mesh, MeshState::Queued),
+    };
+    queued.then(|| planner.priority(slot.key.pos))
 }
 
 /// Neighbor bits of a slot at `pos` from the current map: outside the vertical bounds counts as
