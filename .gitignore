@@ -15,3 +15,6 @@ flamegraph*.svg
 .DS_Store
 Thumbs.db
 # Cargo.lock IS committed (root and vendor/).
+
+# Agent worktrees (local only)
+/.claude/worktrees/

@@ -16,7 +16,7 @@ Bevy 0.19.1 y midió en esta misma máquina cómo sube las mallas.
    sin tope. La parte medida cuesta 5 a 20 µs por malla de 16³ (supuesto: 50 a 250 quads). Si
    cientos de mallas caen en un mismo frame, son 1 a 13 ms: el juego baja de 92 a unos 40 a 80
    fps, no a 20. Para llegar a 20 fps tuvo que sumarse algo que no se midió (estimado: el juego
-   se borró; sección 6.3). boxel no debería caer por la subida de mallas: no tiene ese trabajo
+   se borró; sección 6.4). boxel no debería caer por la subida de mallas: no tiene ese trabajo
    extra.
 5. Lo que falta resolver o probar:
    - Al cruzar un borde de chunk, también al subir o bajar, boxel recalcula de cero qué chunks
@@ -525,6 +525,10 @@ más. Elegir la GPU tomó unos 140 ms (tu log: 140.8 ms en la RTX) y probablemen
 frame. El resto (crear la ventana, el renderer y el primer interés) no se midió por partes. Si
 sale en pleno juego, es un pico de verdad.
 
+**Ya corregido** (después de este análisis): el arranque de la GPU se declara como pausa conocida
+con `Time::declare_stall` y no se simula; en los primeros frames el aviso baja a debug y, después,
+sale como mucho cada 5 s con la cuenta acumulada. Si vuelve a salir en pleno juego, es un pico real.
+
 ### 7.7 Otros límites
 
 - **Draws en High.** La lista tiene lugar para 65 535 draws opacos (`render/renderer.rs:237`).
@@ -547,7 +551,7 @@ sale en pleno juego, es un pico de verdad.
 | 8.3 | Cada lugar en vuelo hace un job cada 2 frames. Sale del orden de los sistemas y lo confirman los números (unos 5 jobs por frame con tope 12). | Contador de jobs terminados por frame. |
 | 8.4 | El frame de GPU de 0.39 ms con 8000 chunks usa un disco artificial, no la escena real. | Medir en `voxel_world` con la cámara volando. |
 | 8.5 | 144 fps se sostienen a radio 16 y 32 mientras se carga. | Volar a velocidad fija y medir el peor frame y el percentil 99. Meta: ningún frame de más de 6.94 ms. |
-| 8.6 | La caída en Bevy fue sobre todo por la subida de mallas. Con mallas realistas, lo medido explica solo una parte (6.3). | No se puede medir: el juego se borró. Al rehacerlo en boxel, medir el frame entero mientras carga y contar los quads por malla. |
+| 8.6 | La caída en Bevy fue sobre todo por la subida de mallas. Con mallas realistas, lo medido explica solo una parte (6.4). | No se puede medir: el juego se borró. Al rehacerlo en boxel, medir el frame entero mientras carga y contar los quads por malla. |
 | 8.7 | Un mundo infinito en vertical cabe en memoria y en tiempo de interés. | Medir slots y costo de interés con un radio vertical (sección 9). |
 
 ## 9. Mundo infinito en vertical
