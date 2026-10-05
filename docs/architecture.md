@@ -2,7 +2,7 @@
 
 Documento técnico de referencia. Fecha: 2026-10-05. Estado: aprobado para el milestone M0
 (revisión final, después de tres revisiones adversariales del borrador v1).
-Las decisiones puntuales están en `docs/adr/` (0001 a 0012). Durante M0 hubo además una
+Las decisiones puntuales están en `docs/adr/` (0001 a 0013). Durante M0 hubo además una
 especificación para los agentes implementadores (en inglés, en `.scaffold/`), borrada al cerrar M0;
 este documento queda como referencia.
 
@@ -130,7 +130,7 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | Crate | Responsabilidad | Depende de (boxel) |
 |---|---|---|
 | `boxel` (raíz) | Fachada: re-exports, `prelude`, `DefaultPlugins`, `MinimalPlugins`, ejemplos | todos |
-| `boxel_app` | `App`, `Plugin`, `PluginGroup`, schedules (`Main`...`Last`, fixed, `Shutdown`), `Time`, `FixedTime`, task pools, runner headless, `AppExit` | ecs, tasks |
+| `boxel_app` | `App`, `Plugin`, `PluginGroup`, schedules (`Main`...`Last`, fixed, `Shutdown`), `Time`, `FixedTime`, `FrameLimit` y `FramePacer`, task pools, runner headless, `AppExit` | ecs, tasks |
 | `boxel_log` | Subscriber de `tracing`, puente de `log`, Tracy opcional | app |
 | `boxel_diagnostic` | `FrameStats`, `DiagnosticsBoard`, log periódico | app, ecs |
 | `boxel_math` | re-export de glam, `Aabb`, `Frustum`, proyección reverse-Z | (glam) |
@@ -143,7 +143,7 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_mesh` | `PackedQuad`, `ChunkMesh`, `PaddedChunk`, `Mesher` (bgm) | voxel |
 | `boxel_worldgen` | trait `WorldGenerator`, `FlatGenerator`, `TerrainGenerator`, ruido | voxel |
 | `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, eventos, `ChunkStore` | app, voxel, mesh, worldgen, transform, diagnostic |
-| `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, texturas procedurales, screenshots | gfx, shaders, world, camera, window |
+| `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `PresentSettings` (vsync en tiempo de ejecución), texturas procedurales, screenshots | gfx, shaders, world, camera, window |
 | `boxel_facade_check` | solo CI: prueba que los derives resuelven `::boxel::ecs` para un usuario que depende solo de `boxel` | fachada |
 | `vendor/*` (7 crates) | ECS y tareas (fork de Bevy) | - |
 
@@ -353,11 +353,13 @@ Precedencia (de mayor a menor): **CLI > `BOXEL_*` > `WGPU_*` > archivo > automá
 | Solo software | `--software` | `BOXEL_SOFTWARE=1` | - | `software` |
 | Validación | `--validation` | `BOXEL_GPU_VALIDATION=1` | `WGPU_VALIDATION` (flags) | `validation` |
 | LKG | `--lkg` / `--no-lkg` | `BOXEL_LKG=1/0` | - | `use_lkg` |
-| Present | `--present vsync/mailbox/immediate` | `BOXEL_PRESENT` | - | `present_mode` |
+| Present | `--present vsync/novsync/mailbox/immediate` | `BOXEL_PRESENT` | - | `present_mode` |
 | Archivo | `--gpu-config ruta` | `BOXEL_GPU_CONFIG` | - | - |
 
 Detalles: `WGPU_BACKEND` se parsea con `Backends::from_comma_list`; un resultado vacío se ignora
-con aviso. El nombre de adaptador lo compara boxel; no se usa
+con aviso. `present` es el valor inicial de `PresentSettings` (vsync apagado si no se da, ver
+§11): reemplaza el de la app una vez, al elegir la primera GPU, y después se puede cambiar en
+tiempo de ejecución. El nombre de adaptador lo compara boxel; no se usa
 `wgpu::util::initialize_adapter_from_env` porque hace pánico si no hay coincidencia (está
 prohibido en `clippy.toml`). `--tier` es un tope, no una orden.
 
@@ -567,7 +569,9 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   también ejecuta sistemas, así que los workers son `paralelismo - 1`: IO 10 % (1 a 2), async
   compute 40 % (1 a 8, jobs de chunks), compute el resto. Con 16 hilos: 2, 6 y 7.
 - Runners: `ScheduleRunnerPlugin` (headless, `Once` o `Loop`) y el runner winit de
-  `boxel_window`. El runner por defecto actualiza una vez.
+  `boxel_window`. El runner por defecto actualiza una vez. Los dos respetan `FrameLimit` (144 fps
+  por defecto, 0 = sin límite, cambiable en tiempo de ejecución) con el mismo `FramePacer`
+  (§11, ADR 0013); en headless, `FrameLimit` reemplaza el `wait` de `Loop` cuando existe.
 
 ---
 
@@ -880,8 +884,38 @@ callback, y una superficie oculta no recibe frame callbacks. Diseño:
 Medido con una ventana minimizada durante 2 s: presentando en cada update con FIFO, GL se congeló
 (0 updates) y Vulkan quedó limitado a ~105 updates/s; con la compuerta, Vulkan (NVIDIA, RADV) y GL
 (radeonsi) siguieron actualizando sin presentar nada. Con la ventana visible, la compuerta
-presenta a la frecuencia del monitor. Mailbox sigue siendo opcional (`--present mailbox`): con la
-compuerta, FIFO ya no bloquea, y Mailbox dibujaría a fps ilimitados en laptops.
+presenta como mucho una vez por refresco del monitor.
+
+**Límite de FPS y vsync (ADR 0013).** El runner no usa `Poll` salvo sin límite:
+
+- `FrameLimit { max_fps }` (recurso de `boxel_app`, 144 por defecto, 0 = sin límite) se lee antes
+  de cada frame. `FramePacer` calcula deadlines: el frame siguiente vence un período después de
+  que venció el anterior (sin deriva), y un frame atrasado más de un período reinicia la grilla
+  (sin ráfagas). La espera usa `WaitUntil` hasta 300 µs antes del deadline y cede el hilo en un
+  bucle el resto. Los eventos que despiertan el bucle antes se traducen a mensajes enseguida.
+- Ventana oculta: el período es el mayor entre el límite y 33 ms (30 Hz como antes).
+- Wayland: si un frame vence con la compuerta cerrada, espera el frame callback hasta un cuarto
+  del período (2 ms como máximo) y, si llega, reinicia la grilla ahí. Así las updates se
+  enganchan al reloj del compositor. Medido con el límite igual al panel (144 Hz): sin esto se
+  mostraban 113 a 126 frames por segundo; con esto, 136 a 143, con 143.6 updates por segundo.
+- `PresentSettings { mode }` (recurso de `boxel_render`) cambia el vsync en tiempo de ejecución:
+  `Setup` reconfigura la superficie con el mismo dispositivo. Por defecto vsync apagado:
+  `Mailbox`, si no `Immediate`, si no `Fifo` con una nota en el log. Así manda el límite.
+- Frames mostrados: con vsync, como mucho la frecuencia del monitor (y en X11 las updates
+  también bajan a ella, porque presentar bloquea; Windows no se midió). Sin vsync, hasta el límite, salvo en
+  Wayland, donde la compuerta deja presentar una vez por refresco con o sin vsync.
+
+| RTX 5050, panel de 144 Hz, radio 12 | Updates/s | Mostrados/s | CPU (un núcleo = 100 %) |
+|---|---|---|---|
+| Wayland, 144, Mailbox | 143.6 | 136 a 143 | 20 % |
+| Wayland, sin límite, Mailbox | 11 000 a 16 000 | 139 a 143 | 150 % |
+| Wayland, 144, Fifo | 143.6 | unos 107 | 17 % |
+| X11 (XWayland), 144, Immediate | 144.0 | 144.0 | 17 % |
+| X11 (XWayland), sin límite, Immediate | 1477 | 1477 | 90 % |
+| X11 (XWayland), 144, Fifo | 143.4 | 143.4 | 25 % |
+
+Con Fifo en Wayland, NVIDIA y RADV muestran unos 107 de 144 con o sin límite (la combinación de
+Fifo con la compuerta). La Radeon 780M con Mailbox muestra 143.3. GL (radeonsi) solo ofrece Fifo.
 
 En GL, wgpu reproduce los comandos en el hilo que hace submit, así que los frames GL pagan el
 grabado dos veces (no medido aún). El render en un hilo propio con un mundo de render (`SubApp` +
@@ -919,7 +953,10 @@ schedule `Shutdown` es el lugar para el `flush` final.
 - `FrameStats` (frame time, EMA, fps, peor frame) y `DiagnosticsBoard` con líneas nombradas:
   `gpu` (resumen de selección), `render` (tier, chunks, quads, draws, visibles, descartados),
   `world` (chunks por estado, cola, en vuelo, fallidos). `LogDiagnosticsPlugin` las imprime cada
-  2 s.
+  2 s. Su `fps=` cuenta updates de la App, no frames mostrados.
+- Overlay F3 (`boxel_debug`): frames mostrados por segundo (de `RenderInfo::frames_presented`) y
+  updates por segundo por separado, tiempo de frame, límite, vsync y modo de presentación, GPU,
+  cámara y contadores de chunks. Teclas opcionales `FrameKeys` (F5 límite, F6 vsync).
 - Línea estable para scripts: `boxel: backend=Vulkan tier=High class=Discrete adapter="..."
   driver="..."` al estar listo el GPU, y `DECISION: ...` al final del reporte de selección.
 - Tracy: feature `trace_tracy` (tracing-tracy 0.12.0 + tracy-client 0.19.0, GUI 0.14.1) y

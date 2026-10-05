@@ -49,3 +49,13 @@ sistemas paralelos, que en macOS y Windows es un deadlock.
 - Depender de `Occluded`: no existe en Wayland ni Windows.
 - Mailbox por defecto en Vulkan: con la compuerta ya no hace falta y dibujaría sin límite.
 - winit 0.31 beta: API aún cambiante.
+
+## Revisión: límite de FPS (ADR 0013)
+
+- El runner ya no usa `ControlFlow::Poll` por defecto: espera el deadline de `FrameLimit` (144 fps
+  por defecto) con `WaitUntil` y una espera activa corta. `Poll` queda solo para el límite 0.
+- Si un frame vence con la compuerta cerrada, el runner espera el frame callback hasta un cuarto
+  del período (2 ms como máximo) y se engancha a él.
+- El modo por defecto pasa a ser vsync apagado (`Mailbox`, si no `Immediate`, si no `Fifo`), y se
+  puede cambiar en tiempo de ejecución con `PresentSettings`. Ya no hay fps ilimitados en
+  laptops: los limita `FrameLimit`.
