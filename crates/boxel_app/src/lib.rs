@@ -25,7 +25,10 @@ pub use schedules::{
     RunFixedMainLoop, Shutdown, Startup, Update,
 };
 pub use task_pool::{TaskPoolOptions, TaskPoolPlugin, TaskPoolThreadAssignmentPolicy};
-pub use time::{FixedTime, Time, TimePlugin, TimeSystems, run_fixed_main_loop, time_system};
+pub use time::{
+    DEFAULT_STARTUP_GRACE_FRAMES, FixedOverruns, FixedTime, OVERRUN_WARNING_INTERVAL, Time,
+    TimePlugin, TimeSystems, run_fixed_main_loop, time_system,
+};
 
 /// Common app items (re-exported by `boxel::prelude`).
 pub mod prelude {

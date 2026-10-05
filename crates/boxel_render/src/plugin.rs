@@ -12,7 +12,7 @@
 //!   frame results `Cleanup` writes back.
 
 use crate::{RendererConfig, RendererSmokeTest, ViewParams, VoxelRenderer};
-use boxel_app::{App, Last, MainScheduleOrder, Plugin, Shutdown};
+use boxel_app::{App, Last, MainScheduleOrder, Plugin, Shutdown, Time};
 use boxel_camera::{Camera, CameraView};
 use boxel_diagnostic::DiagnosticsBoard;
 use boxel_ecs::prelude::*;
@@ -527,16 +527,26 @@ struct SetupParams<'w> {
     gpu_failed: MessageWriter<'w, GpuFailed>,
     info: ResMut<'w, RenderInfo>,
     board: Option<ResMut<'w, DiagnosticsBoard>>,
+    time: Option<ResMut<'w, Time>>,
 }
 
-/// `RenderSystems::Setup`.
+/// `RenderSystems::Setup`. GPU selection and renderer creation are declared as a stall
+/// (`Time::declare_stall`): the simulation does not try to catch up on them.
 fn setup(mut p: SetupParams) {
+    let started = Instant::now();
     let lost = p.gpu.ready().is_some_and(|r| r.ctx.health.is_lost());
     if lost {
         recover_from_loss(&mut p);
     }
+    let bring_up = lost || matches!(p.gpu.stage, GpuStage::WaitingForWindow);
     if matches!(p.gpu.stage, GpuStage::WaitingForWindow) {
         bootstrap(&mut p);
+    }
+    if bring_up
+        && !matches!(p.gpu.stage, GpuStage::WaitingForWindow)
+        && let Some(time) = p.time.as_deref_mut()
+    {
+        time.declare_stall(started.elapsed());
     }
     let size = p.window_state.as_deref().map(|s| s.physical_size);
     let window = p.window.as_deref().map(|w| Arc::clone(&w.window));

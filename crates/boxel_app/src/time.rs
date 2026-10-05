@@ -7,15 +7,27 @@ use std::time::{Duration, Instant};
 
 /// Frame time (real clock, clamped). Updated in `First` by [`time_system`].
 ///
+/// Two deltas per update:
+/// - [`Time::delta`] advances the simulation: wall-clock time since the previous update minus
+///   any declared stall ([`Time::declare_stall`]), clamped to [`Time::max_delta`]. `elapsed`
+///   and the [`FixedTime`] accumulator follow it.
+/// - [`Time::real_delta`] measures the frame: wall-clock time since the previous update, never
+///   clamped and stalls included. Use it for frame-time statistics.
+///
 /// Inside `FixedMain` (and so in `FixedUpdate`) this resource is temporarily replaced by the
 /// fixed-step view: `delta() == FixedTime::timestep()`, `elapsed() == FixedTime::elapsed()`,
-/// same `frame_count()`. Bevy-style physics code (`time.delta_secs()` in `FixedUpdate`) is
-/// therefore correct. The frame view is restored after each step.
+/// same `frame_count()` and `real_delta()`. Bevy-style physics code (`time.delta_secs()` in
+/// `FixedUpdate`) is therefore correct. The frame view is restored after each step.
 #[derive(Resource, Debug, Clone)]
 pub struct Time {
     startup: Instant,
     last_update: Option<Instant>,
     delta: Duration,
+    real_delta: Duration,
+    /// Stall excluded from the latest `delta`.
+    stall: Duration,
+    /// Stalls declared since the latest update (applied by the next one).
+    pending_stall: Duration,
     elapsed: Duration,
     frame_count: u64,
     max_delta: Duration,
@@ -34,6 +46,9 @@ impl Time {
             startup,
             last_update: None,
             delta: Duration::ZERO,
+            real_delta: Duration::ZERO,
+            stall: Duration::ZERO,
+            pending_stall: Duration::ZERO,
             elapsed: Duration::ZERO,
             frame_count: 0,
             max_delta: Duration::from_millis(250),
@@ -43,13 +58,29 @@ impl Time {
     pub fn startup(&self) -> Instant {
         self.startup
     }
-    /// Time since the previous update (0 on the first), clamped to `max_delta`.
+    /// The instant of the latest update (`None` before the first).
+    pub fn last_update(&self) -> Option<Instant> {
+        self.last_update
+    }
+    /// Simulation time since the previous update (0 on the first): wall-clock time minus
+    /// declared stalls, clamped to `max_delta`.
     pub fn delta(&self) -> Duration {
         self.delta
     }
     /// `delta` in seconds.
     pub fn delta_secs(&self) -> f32 {
         self.delta.as_secs_f32()
+    }
+    /// Wall-clock time between the previous update and the latest one (0 on the first), not
+    /// clamped and including declared stalls. Use it to measure frame times; use
+    /// [`Time::delta`] to advance the simulation.
+    pub fn real_delta(&self) -> Duration {
+        self.real_delta
+    }
+    /// The part of the latest `real_delta` that `delta` excludes because a stall was declared
+    /// ([`Time::declare_stall`]); zero when none was.
+    pub fn stall(&self) -> Duration {
+        self.stall
     }
     /// Sum of all (clamped) deltas.
     pub fn elapsed(&self) -> Duration {
@@ -71,13 +102,39 @@ impl Time {
     pub fn set_max_delta(&mut self, max: Duration) {
         self.max_delta = max;
     }
+
+    /// Declares that `duration` of the wall-clock time since the latest update was a known
+    /// stall the simulation must not catch up on: GPU bring-up, device-loss recovery, a process
+    /// that was suspended. The next update subtracts it from [`Time::delta`], so neither
+    /// `elapsed` nor the [`FixedTime`] accumulator see it (no burst of fixed steps, no jump of
+    /// anything moved with `delta`). [`Time::real_delta`] still includes it, so frame-time
+    /// statistics stay honest, and [`Time::stall`] reports the part that was excluded.
+    ///
+    /// Call it right after the stall, from any schedule (before or after `First`): the stall
+    /// always lies in the interval of the next update. Declarations add up until that update
+    /// and never remove more than its real interval. A declaration before the first update is
+    /// dropped (the first delta is zero anyway).
+    pub fn declare_stall(&mut self, duration: Duration) {
+        self.pending_stall = self.pending_stall.saturating_add(duration);
+        tracing::debug!(
+            "stall of {:.1} ms declared: the next frame delta excludes it",
+            duration.as_secs_f64() * 1e3
+        );
+    }
+
     /// Advances the clock to `now` (deterministic tests use this directly). First call: delta 0.
-    /// Later calls: `delta = min(now - last, max_delta)`. `frame_count` grows on every call.
+    /// Later calls: `real_delta = now - last` and `delta = min(real_delta - declared stalls,
+    /// max_delta)`. `frame_count` grows on every call.
     pub fn update_with_instant(&mut self, now: Instant) {
-        self.delta = match self.last_update {
-            None => Duration::ZERO,
-            Some(last) => now.saturating_duration_since(last).min(self.max_delta),
+        let pending = std::mem::take(&mut self.pending_stall);
+        (self.real_delta, self.stall) = match self.last_update {
+            None => (Duration::ZERO, Duration::ZERO),
+            Some(last) => {
+                let real = now.saturating_duration_since(last);
+                (real, pending.min(real))
+            }
         };
+        self.delta = (self.real_delta - self.stall).min(self.max_delta);
         self.last_update = Some(now);
         self.elapsed += self.delta;
         self.frame_count += 1;
@@ -93,6 +150,28 @@ impl Time {
     }
 }
 
+/// Default of [`FixedTime::startup_grace_frames`]: updates whose fixed-step overruns are
+/// expected (window creation, GPU bring-up, first uploads) and only debug-logged.
+pub const DEFAULT_STARTUP_GRACE_FRAMES: u64 = 10;
+
+/// Minimum app-clock time between two fixed-step overrun warnings (overruns in between are
+/// summed into the next one).
+pub const OVERRUN_WARNING_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Frames that hit the fixed-step limit (see [`run_fixed_main_loop`]), cumulative since startup.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FixedOverruns {
+    /// Frames after the startup grace that ran the maximum number of steps and still had whole
+    /// steps left, which were dropped: the simulation fell behind real time.
+    pub frames: u64,
+    /// Whole steps dropped in those frames.
+    pub dropped_steps: u64,
+    /// Overrun frames inside the startup grace (debug-logged only, not counted in `frames`).
+    pub startup_frames: u64,
+    /// Overrun warnings logged.
+    pub warnings: u64,
+}
+
 /// Fixed-timestep accumulator driving `FixedMain` (default 64 Hz, max 8 steps per frame).
 #[derive(Resource, Debug, Clone)]
 pub struct FixedTime {
@@ -100,6 +179,11 @@ pub struct FixedTime {
     accumulator: Duration,
     elapsed: Duration,
     max_steps_per_frame: u32,
+    steps_last_frame: u32,
+    startup_grace_frames: u64,
+    overruns: FixedOverruns,
+    /// Overrun frames and dropped steps not reported by a warning yet.
+    unreported: (u64, u64),
     last_overrun_warning: Option<Instant>,
 }
 
@@ -125,6 +209,10 @@ impl FixedTime {
             accumulator: Duration::ZERO,
             elapsed: Duration::ZERO,
             max_steps_per_frame: 8,
+            steps_last_frame: 0,
+            startup_grace_frames: DEFAULT_STARTUP_GRACE_FRAMES,
+            overruns: FixedOverruns::default(),
+            unreported: (0, 0),
             last_overrun_warning: None,
         };
         fixed.set_timestep(Duration::from_secs_f64(1.0 / hz));
@@ -176,6 +264,75 @@ impl FixedTime {
             false
         }
     }
+    /// Most steps one frame runs (8); whole steps beyond it are dropped.
+    pub fn max_steps_per_frame(&self) -> u32 {
+        self.max_steps_per_frame
+    }
+    /// Steps [`run_fixed_main_loop`] ran in the latest frame.
+    pub fn steps_last_frame(&self) -> u32 {
+        self.steps_last_frame
+    }
+    /// Updates (`Time::frame_count`) whose overruns are only debug-logged.
+    pub fn startup_grace_frames(&self) -> u64 {
+        self.startup_grace_frames
+    }
+    /// Sets the startup grace (default [`DEFAULT_STARTUP_GRACE_FRAMES`]). The first updates
+    /// include window creation, GPU bring-up and the first uploads: their overruns are expected
+    /// and say nothing about the simulation being too slow. 0 warns from the first frame.
+    pub fn set_startup_grace_frames(&mut self, frames: u64) {
+        self.startup_grace_frames = frames;
+    }
+    /// Overrun counters since startup.
+    pub fn overruns(&self) -> FixedOverruns {
+        self.overruns
+    }
+
+    /// Counts an overrun of update `frame` that dropped `dropped` whole steps.
+    fn record_overrun(&mut self, frame: u64, dropped: u32) {
+        if frame <= self.startup_grace_frames {
+            self.overruns.startup_frames += 1;
+            tracing::debug!(
+                "fixed timestep overrun during startup (frame {frame}): dropped {dropped} steps"
+            );
+            return;
+        }
+        self.overruns.frames += 1;
+        self.overruns.dropped_steps += u64::from(dropped);
+        self.unreported.0 += 1;
+        self.unreported.1 += u64::from(dropped);
+    }
+
+    /// Warns about the unreported overruns, at most once per [`OVERRUN_WARNING_INTERVAL`] of
+    /// the app clock (`now` is `Time::last_update`, so synthetic clocks work).
+    fn flush_overrun_warning(&mut self, now: Instant) {
+        let (frames, dropped) = self.unreported;
+        if frames == 0 {
+            return;
+        }
+        let since = match self.last_overrun_warning {
+            Some(last) if now.saturating_duration_since(last) < OVERRUN_WARNING_INTERVAL => {
+                return;
+            }
+            Some(last) => format!(
+                "in the last {:.1} s",
+                now.saturating_duration_since(last).as_secs_f64()
+            ),
+            None => "so far".to_string(),
+        };
+        let lost = self
+            .timestep
+            .saturating_mul(u32::try_from(dropped).unwrap_or(u32::MAX));
+        tracing::warn!(
+            "fixed timestep overrun: {frames} frame(s) {since} ran the maximum of {} steps and \
+             still dropped {dropped} step(s) ({:.0} ms of simulated time): the simulation is \
+             falling behind real time",
+            self.max_steps_per_frame,
+            lost.as_secs_f64() * 1e3,
+        );
+        self.overruns.warnings += 1;
+        self.last_overrun_warning = Some(now);
+        self.unreported = (0, 0);
+    }
 }
 
 /// System set of [`time_system`] (in `First`).
@@ -188,15 +345,25 @@ pub fn time_system(mut time: ResMut<Time>) {
 }
 
 /// Exclusive system in `RunFixedMainLoop`: accumulates `Time::delta` into [`FixedTime`] and
-/// runs `FixedMain` while `expend()` returns true (at most `max_steps_per_frame` times; whole
-/// steps left over are dropped with a warning at most once per second, the remainder is kept).
-/// While `FixedMain` runs, [`Time`] holds the fixed-step view (see [`Time`]).
+/// runs `FixedMain` while `expend()` returns true, at most `max_steps_per_frame` times. Whole
+/// steps left over after that are dropped (the remainder is kept) and counted in
+/// [`FixedTime::overruns`]. While `FixedMain` runs, [`Time`] holds the fixed-step view (see
+/// [`Time`]).
+///
+/// Overrun warnings: overruns in the first [`FixedTime::startup_grace_frames`] updates are
+/// expected (bring-up) and only debug-logged. Later ones are summed and warned at most once per
+/// [`OVERRUN_WARNING_INTERVAL`] of the app clock, with the frames and steps since the previous
+/// warning. Known stalls should be declared with [`Time::declare_stall`], so they never reach
+/// the accumulator.
 ///
 /// A frame with a zero `Time::delta` (paused time, e.g. `Time::set_max_delta(Duration::ZERO)`)
 /// cannot bring a fixed step closer, so it lets the next `First` rotate the message buffers
 /// anyway. Without this, paused time would keep every message ever written.
 pub fn run_fixed_main_loop(world: &mut World) {
-    let delta = world.resource::<Time>().delta();
+    let (delta, frame, now) = {
+        let time = world.resource::<Time>();
+        (time.delta(), time.frame_count(), time.last_update())
+    };
     if delta.is_zero()
         && let Some(mut registry) = world.get_resource_mut::<MessageRegistry>()
         && registry.should_update == ShouldUpdateMessages::Waiting
@@ -217,25 +384,21 @@ pub fn run_fixed_main_loop(world: &mut World) {
         *world.resource_mut::<Time>() = frame_view;
         steps += 1;
     }
+    let mut fixed = world.resource_mut::<FixedTime>();
+    fixed.steps_last_frame = steps;
     if steps == max_steps {
-        let mut fixed = world.resource_mut::<FixedTime>();
         let step = fixed.timestep;
         let mut dropped = 0u32;
         while !step.is_zero() && fixed.accumulator >= step {
             fixed.accumulator -= step;
             dropped += 1;
         }
-        let now = Instant::now();
-        if dropped > 0
-            && fixed
-                .last_overrun_warning
-                .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1))
-        {
-            fixed.last_overrun_warning = Some(now);
-            tracing::warn!(
-                "fixed timestep overrun: ran {max_steps} steps this frame, dropped {dropped} more"
-            );
+        if dropped > 0 {
+            fixed.record_overrun(frame, dropped);
         }
+    }
+    if let Some(now) = now {
+        fixed.flush_overrun_warning(now);
     }
 }
 
