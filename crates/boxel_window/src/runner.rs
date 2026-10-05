@@ -5,7 +5,7 @@ use crate::window::{
     CursorGrab, CursorOptions, PrimaryWindow, WindowCloseRequested, WindowCreated, WindowFocused,
     WindowMode, WindowOccluded, WindowResized, WindowSettings, WindowState,
 };
-use boxel_app::{App, AppExit, PluginsState};
+use boxel_app::{App, AppExit, FrameLimit, FramePacer, FrameWait, PluginsState, spin_until};
 use boxel_ecs::prelude::*;
 use boxel_math::{UVec2, Vec2};
 use std::sync::Arc;
@@ -18,13 +18,16 @@ use winit::keyboard::PhysicalKey;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
-/// Update pacing of the winit runner.
+/// Update pacing of the winit runner. Both modes respect [`FrameLimit`] (the app's resource,
+/// read before every frame; `WindowPlugin` inserts the default of 144 fps).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum UpdateMode {
-    /// `ControlFlow::Poll`: update as fast as presentation allows (games).
+    /// Update continuously at the [`FrameLimit`] rate (games): `ControlFlow::WaitUntil` for the
+    /// coarse part of each wait, a short spin for the last fraction of a millisecond, and
+    /// `ControlFlow::Poll` when the limit is 0 (unlimited).
     #[default]
     Continuous,
-    /// `ControlFlow::WaitUntil(now + wait)` between updates (tools).
+    /// Update when an event arrives or after `wait` (tools), never faster than [`FrameLimit`].
     Reactive {
         /// Max time between updates.
         wait: Duration,
@@ -35,6 +38,8 @@ pub enum UpdateMode {
 const REDRAW_TIMEOUT: Duration = Duration::from_millis(100);
 /// Time between updates while the window is occluded (30 Hz).
 const OCCLUDED_WAIT: Duration = Duration::from_millis(33);
+/// Longest wait past a frame deadline for the presentation gate (see `RunnerCore::gate_wait`).
+const GATE_WAIT_MAX: Duration = Duration::from_millis(2);
 /// Time between `Plugin::ready` polls while plugins are still being set up.
 const PLUGINS_POLL: Duration = Duration::from_millis(1);
 /// Time between `Window::is_minimized` polls (X11 only; each poll is a server round trip).
@@ -75,8 +80,10 @@ impl Default for RunnerSettings {
 ///    `occluded = winit_occluded || (redraw pending for > 100 ms)` and writes `WindowOccluded` on
 ///    change; runs `app.update()`; if `!frame_ready` and no redraw is pending, calls
 ///    `window.request_redraw()` and records the time; exits the loop on `app.should_exit()`.
-///    Control flow: `Poll` (`Continuous`), `WaitUntil(now + wait)` (`Reactive`), and
-///    `WaitUntil(now + 33 ms)` while occluded. Updates are never driven by `RedrawRequested`.
+///    Control flow: `Continuous` waits for the next [`FrameLimit`] deadline (`WaitUntil` the
+///    deadline minus the spin margin, then a spin; `Poll` when unlimited); `Reactive` waits
+///    `WaitUntil(now + wait)` but never runs an update before the limit allows it; while
+///    occluded the period is at least 33 ms. Updates are never driven by `RedrawRequested`.
 /// 6. `exiting`: `app.shutdown()` (renderer releases renderer, surface and device in that
 ///    order), then removes `PrimaryWindow`, all while the event loop is still alive.
 /// 7. Returns the stored `AppExit` (`AppExit::error()` if `run_app` failed).
@@ -91,6 +98,14 @@ impl Default for RunnerSettings {
 ///   `RedrawRequested` at once, so neither source above fires. The runner also polls
 ///   `Window::is_minimized` there (at most every 100 ms) and ORs it into `occluded`.
 /// - In `Reactive` mode an occluded window waits `max(wait, 33 ms)`.
+/// - Pacing ([`FramePacer`]) is deadline based: the next update is due one period after the
+///   previous one was due (no drift from late wake-ups), and an update late by more than one
+///   period restarts the grid (no catch-up burst). Events that wake the loop before the
+///   deadline are translated into messages at once and seen by the next update.
+/// - When a frame is due but its presentation gate is still closed (a redraw is pending), the
+///   runner waits up to a quarter of the period (at most 2 ms) for `RedrawRequested`, so on
+///   Wayland a frame callback that lands just after the deadline is not missed (that would
+///   show only every other frame when the limit equals the refresh rate).
 pub fn winit_runner(mut app: App, event_loop: EventLoop<()>) -> AppExit {
     let settings = app
         .world()
@@ -251,6 +266,18 @@ impl ApplicationHandler for WinitApp {
         let Some(window) = self.window.clone() else {
             return;
         };
+        loop {
+            match self.core.pace(self.app.world(), Instant::now()) {
+                FrameWait::Ready => break,
+                // Then ask again: the frame may still wait for its presentation gate.
+                FrameWait::Spin { until } => spin_until(until),
+                FrameWait::Sleep { wake } => {
+                    // Woken early (an event), or waiting for the gate: keep waiting.
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
+                    return;
+                }
+            }
+        }
         if self.poll_size {
             self.core
                 .resized(self.app.world_mut(), size_of(window.inner_size()));
@@ -292,7 +319,8 @@ struct EndOfUpdate {
 }
 
 /// Runner state that does not need the winit window or event loop: event translation, the
-/// redraw protocol and the occlusion watchdog. Kept apart so it is testable without a display.
+/// redraw protocol, the occlusion watchdog and frame pacing. Kept apart so it is testable
+/// without a display.
 #[derive(Debug)]
 struct RunnerCore {
     settings: RunnerSettings,
@@ -308,8 +336,12 @@ struct RunnerCore {
     occluded: bool,
     /// When the outstanding redraw was requested (`None`: nothing pending).
     redraw_pending_since: Option<Instant>,
+    /// When the latest `RedrawRequested` opened the presentation gate.
+    gate_opened_at: Option<Instant>,
     /// The cursor state last applied to the window (the OS default at creation).
     applied_cursor: CursorOptions,
+    /// Frame deadlines ([`FrameLimit`]).
+    pacer: FramePacer,
 }
 
 impl RunnerCore {
@@ -322,10 +354,65 @@ impl RunnerCore {
             minimized_polled_at: None,
             occluded: false,
             redraw_pending_since: None,
+            gate_opened_at: None,
             applied_cursor: CursorOptions {
                 grab: CursorGrab::None,
                 visible: true,
             },
+            pacer: FramePacer::new(),
+        }
+    }
+
+    /// The period between updates: [`FrameLimit`] (`None` = unlimited or no resource), at
+    /// least `OCCLUDED_WAIT` while the window is occluded.
+    fn frame_period(&self, world: &World) -> Option<Duration> {
+        let limit = world
+            .get_resource::<FrameLimit>()
+            .and_then(|limit| limit.period());
+        if self.occluded {
+            Some(limit.map_or(OCCLUDED_WAIT, |period| period.max(OCCLUDED_WAIT)))
+        } else {
+            limit
+        }
+    }
+
+    /// Before an update: whether the frame deadline allows it at `now`. A due frame whose
+    /// presentation gate is still closed (the redraw was requested and has not arrived) waits a
+    /// little longer for it, see [`RunnerCore::gate_wait`].
+    fn pace(&self, world: &World, now: Instant) -> FrameWait {
+        let period = self.frame_period(world);
+        match self.pacer.wait(now, period) {
+            FrameWait::Ready => self.gate_wait(world, now, period),
+            wait => wait,
+        }
+    }
+
+    /// Waits up to [`gate_window`] past the deadline for the presentation gate.
+    ///
+    /// On Wayland the gate opens with the compositor's frame callback, and the compositor
+    /// sends it on its own clock. When the limit is close to the refresh rate, a fixed update
+    /// grid drifts against that clock: callbacks land just after the deadlines, or the commit
+    /// lands just after the compositor's deadline and the callback comes a whole refresh late,
+    /// and those updates run without presenting. So a due frame with a closed gate waits a
+    /// little for the callback, and `begin_update` then restarts the grid at the callback time:
+    /// the updates lock onto the compositor's clock, right after each callback, which is also
+    /// the safest moment to commit. Measured on a 144 Hz panel at 144 fps with `Mailbox`:
+    /// without it 113 to 126 frames shown per second, with it 136 to 143. The cost is that an
+    /// update that waited starts up to the window late, so the update rate can end slightly
+    /// below the limit (143.6 instead of 144 there).
+    ///
+    /// No wait while unlimited, occluded, or when no redraw is pending (no renderer, or X11,
+    /// where the redraw arrives at once).
+    fn gate_wait(&self, world: &World, now: Instant, period: Option<Duration>) -> FrameWait {
+        let gate_closed =
+            !self.occluded && self.redraw_pending_since.is_some() && !frame_ready(world);
+        let until = period.and_then(|period| {
+            let due = self.pacer.next_frame(Some(period))?;
+            due.checked_add(gate_window(period))
+        });
+        match until {
+            Some(until) if gate_closed && now < until => FrameWait::Sleep { wake: until },
+            _ => FrameWait::Ready,
         }
     }
 
@@ -400,6 +487,7 @@ impl RunnerCore {
             }
             WindowEvent::RedrawRequested => {
                 self.redraw_pending_since = None;
+                self.gate_opened_at = Some(Instant::now());
                 update_state(world, |state| state.frame_ready = true);
             }
             _ => {}
@@ -478,29 +566,66 @@ impl RunnerCore {
             update_state(world, |state| state.occluded = occluded);
             write(world, WindowOccluded(occluded));
         }
+        let period = self.frame_period(world);
+        let due = self.pacer.next_frame(period);
+        self.pacer.start_frame(now, period);
+        // Phase lock (see `gate_wait`): the gate opened after the deadline, within the wait
+        // window, so this update waited for the frame callback; the grid restarts there.
+        if let (Some(due), Some(period), Some(opened)) = (due, period, self.gate_opened_at)
+            && opened > due
+            && opened - due <= gate_window(period)
+            && frame_ready(world)
+        {
+            self.pacer.reanchor(opened);
+        }
     }
 
     /// After an update: request the next redraw if the presentation gate was consumed, and pick
-    /// the pacing.
+    /// the pacing (with the [`FrameLimit`] of now: a change made during the update paces the
+    /// next one).
     fn end_update(&mut self, world: &World, now: Instant) -> EndOfUpdate {
-        let frame_ready = world
-            .get_resource::<WindowState>()
-            .is_some_and(|state| state.frame_ready);
-        let request_redraw = !frame_ready && self.redraw_pending_since.is_none();
+        let request_redraw = !frame_ready(world) && self.redraw_pending_since.is_none();
         if request_redraw {
             self.redraw_pending_since = Some(now);
         }
-        let control_flow = match (self.settings.update_mode, self.occluded) {
-            (UpdateMode::Continuous, false) => ControlFlow::Poll,
-            (UpdateMode::Continuous, true) => wait_until(now, OCCLUDED_WAIT),
-            (UpdateMode::Reactive { wait }, false) => wait_until(now, wait),
-            (UpdateMode::Reactive { wait }, true) => wait_until(now, wait.max(OCCLUDED_WAIT)),
+        let pace = self.pacer.wait(now, self.frame_period(world));
+        let control_flow = match self.settings.update_mode {
+            UpdateMode::Continuous => match pace {
+                FrameWait::Sleep { wake } => ControlFlow::WaitUntil(wake),
+                FrameWait::Ready | FrameWait::Spin { .. } => ControlFlow::Poll,
+            },
+            UpdateMode::Reactive { wait } => {
+                let wait = if self.occluded {
+                    wait.max(OCCLUDED_WAIT)
+                } else {
+                    wait
+                };
+                match (wait_until(now, wait), pace) {
+                    (ControlFlow::WaitUntil(timeout), FrameWait::Sleep { wake }) => {
+                        ControlFlow::WaitUntil(timeout.max(wake))
+                    }
+                    (control_flow, _) => control_flow,
+                }
+            }
         };
         EndOfUpdate {
             request_redraw,
             control_flow,
         }
     }
+}
+
+/// How long a due frame may wait for its presentation gate: a quarter of the period, at most
+/// `GATE_WAIT_MAX`.
+fn gate_window(period: Duration) -> Duration {
+    (period / 4).min(GATE_WAIT_MAX)
+}
+
+/// The presentation gate (`WindowState::frame_ready`) is open.
+fn frame_ready(world: &World) -> bool {
+    world
+        .get_resource::<WindowState>()
+        .is_some_and(|state| state.frame_ready)
 }
 
 /// `WaitUntil(now + wait)`, or `Wait` if that instant is not representable.
@@ -802,9 +927,10 @@ mod tests {
         assert!(state(world).occluded);
         let end = core.end_update(world, late);
         assert!(!end.request_redraw);
+        // 30 Hz while occluded: the deadline minus the spin margin.
         assert_eq!(
             end.control_flow,
-            ControlFlow::WaitUntil(late + OCCLUDED_WAIT)
+            ControlFlow::WaitUntil(late + OCCLUDED_WAIT - FramePacer::DEFAULT_SPIN_MARGIN)
         );
 
         core.window_event(world, WindowEvent::RedrawRequested);
@@ -852,7 +978,10 @@ mod tests {
         core.begin_update(world, t0);
         assert!(state(world).occluded);
         let end = core.end_update(world, t0);
-        assert_eq!(end.control_flow, ControlFlow::WaitUntil(t0 + OCCLUDED_WAIT));
+        assert_eq!(
+            end.control_flow,
+            ControlFlow::WaitUntil(t0 + OCCLUDED_WAIT - FramePacer::DEFAULT_SPIN_MARGIN)
+        );
 
         // Rate limited: no new query before `MINIMIZED_POLL`.
         let early = t0 + MINIMIZED_POLL - Duration::from_millis(1);
@@ -922,6 +1051,188 @@ mod tests {
         assert_eq!(
             core().end_update(&world, now).control_flow,
             ControlFlow::Poll
+        );
+    }
+
+    /// A visible window with a presented first frame and the given limit.
+    fn paced(max_fps: u32) -> (App, RunnerCore, Instant) {
+        let mut app = app();
+        app.insert_resource(FrameLimit::new(max_fps));
+        let mut core = core();
+        let t0 = Instant::now();
+        created(&mut core, app.world_mut(), t0);
+        core.window_event(app.world_mut(), WindowEvent::RedrawRequested);
+        (app, core, t0)
+    }
+
+    #[test]
+    fn frame_limit_paces_continuous_updates() {
+        let (mut app, mut core, t0) = paced(100);
+        let ms = Duration::from_millis;
+        let margin = FramePacer::DEFAULT_SPIN_MARGIN;
+        assert_eq!(core.pace(app.world(), t0), FrameWait::Ready, "first frame");
+        core.begin_update(app.world_mut(), t0);
+        let end = core.end_update(app.world(), t0 + ms(2));
+        assert_eq!(
+            end.control_flow,
+            ControlFlow::WaitUntil(t0 + ms(10) - margin)
+        );
+        // An event wakes the loop early: keep waiting, then spin, then run.
+        assert_eq!(
+            core.pace(app.world(), t0 + ms(5)),
+            FrameWait::Sleep {
+                wake: t0 + ms(10) - margin
+            }
+        );
+        assert_eq!(
+            core.pace(app.world(), t0 + ms(10) - margin / 2),
+            FrameWait::Spin { until: t0 + ms(10) }
+        );
+        assert_eq!(core.pace(app.world(), t0 + ms(10)), FrameWait::Ready);
+
+        // Deadlines accumulate: a frame started 1 ms late is still due 10 ms after the first.
+        core.begin_update(app.world_mut(), t0 + ms(11));
+        let end = core.end_update(app.world(), t0 + ms(13));
+        assert_eq!(
+            end.control_flow,
+            ControlFlow::WaitUntil(t0 + ms(20) - margin)
+        );
+
+        // A limit changed during the update paces the next frame.
+        app.world_mut().resource_mut::<FrameLimit>().max_fps = 50;
+        let end = core.end_update(app.world(), t0 + ms(13));
+        assert_eq!(
+            end.control_flow,
+            ControlFlow::WaitUntil(t0 + ms(30) - margin)
+        );
+
+        // 0 = unlimited: poll.
+        app.insert_resource(FrameLimit::UNLIMITED);
+        assert_eq!(
+            core.end_update(app.world(), t0 + ms(13)).control_flow,
+            ControlFlow::Poll
+        );
+        assert_eq!(core.pace(app.world(), t0 + ms(13)), FrameWait::Ready);
+    }
+
+    #[test]
+    fn a_due_frame_waits_briefly_for_the_presentation_gate() {
+        let ms = Duration::from_millis;
+        let period = Duration::from_nanos(6_944_444);
+        let (mut app, mut core, t0) = paced(144);
+        // A renderer presents (closes the gate): the runner requests the next redraw.
+        core.begin_update(app.world_mut(), t0);
+        app.world_mut().resource_mut::<WindowState>().frame_ready = false;
+        assert!(core.end_update(app.world(), t0).request_redraw);
+        // Due, but the frame callback has not come: wait up to a quarter of the period.
+        let due = t0 + period;
+        let until = due + period / 4;
+        assert_eq!(
+            core.pace(app.world(), due),
+            FrameWait::Sleep { wake: until }
+        );
+        // It comes 0.3 ms later: run now (the runner stamps the gate with the real clock; the
+        // test sets the synthetic instant).
+        core.window_event(app.world_mut(), WindowEvent::RedrawRequested);
+        let callback = due + Duration::from_micros(300);
+        core.gate_opened_at = Some(callback);
+        assert_eq!(core.pace(app.world(), callback), FrameWait::Ready);
+        // Phase lock: the grid restarts at the callback.
+        core.begin_update(app.world_mut(), callback);
+        assert_eq!(core.pacer.next_frame(Some(period)), Some(callback + period));
+
+        // The next callback comes before the deadline: no wait, and the grid is kept.
+        app.world_mut().resource_mut::<WindowState>().frame_ready = false;
+        assert!(core.end_update(app.world(), callback).request_redraw);
+        let due = callback + period;
+        core.window_event(app.world_mut(), WindowEvent::RedrawRequested);
+        core.gate_opened_at = Some(due - ms(1));
+        assert_eq!(core.pace(app.world(), due), FrameWait::Ready);
+        core.begin_update(app.world_mut(), due);
+        assert_eq!(core.pacer.next_frame(Some(period)), Some(due + period));
+
+        // A gate that opens after the wait window (the update was late anyway): no lock.
+        app.world_mut().resource_mut::<WindowState>().frame_ready = false;
+        assert!(core.end_update(app.world(), due).request_redraw);
+        let next = due + period;
+        core.window_event(app.world_mut(), WindowEvent::RedrawRequested);
+        core.gate_opened_at = Some(next + ms(3));
+        core.begin_update(app.world_mut(), next + ms(3));
+        assert_eq!(core.pacer.next_frame(Some(period)), Some(next + period));
+
+        // No callback at all (hidden window): give up at the end of the wait.
+        app.world_mut().resource_mut::<WindowState>().frame_ready = false;
+        assert!(core.end_update(app.world(), next + ms(3)).request_redraw);
+        let due = next + period;
+        assert!(matches!(
+            core.pace(app.world(), due),
+            FrameWait::Sleep { .. }
+        ));
+        assert_eq!(core.pace(app.world(), due + period / 4), FrameWait::Ready);
+
+        // The wait is at most 2 ms (60 fps: a quarter period would be 4.2 ms).
+        app.insert_resource(FrameLimit::new(60));
+        let due = core.pacer.next_frame(FrameLimit::new(60).period()).unwrap();
+        assert_eq!(
+            core.pace(app.world(), due),
+            FrameWait::Sleep {
+                wake: due + GATE_WAIT_MAX
+            }
+        );
+        // Never while unlimited or occluded.
+        app.insert_resource(FrameLimit::UNLIMITED);
+        assert_eq!(core.pace(app.world(), due), FrameWait::Ready);
+        app.insert_resource(FrameLimit::new(144));
+        core.winit_occluded = true;
+        core.begin_update(app.world_mut(), due + ms(200));
+        let due = core.pacer.next_frame(Some(OCCLUDED_WAIT)).unwrap();
+        assert_eq!(core.pace(app.world(), due), FrameWait::Ready);
+    }
+
+    #[test]
+    fn frame_limit_keeps_the_occluded_cap_and_lower_limits() {
+        let ms = Duration::from_millis;
+        let margin = FramePacer::DEFAULT_SPIN_MARGIN;
+        for (max_fps, period) in [(144, OCCLUDED_WAIT), (10, ms(100)), (0, OCCLUDED_WAIT)] {
+            let (mut app, mut core, t0) = paced(max_fps);
+            core.winit_occluded = true;
+            core.begin_update(app.world_mut(), t0);
+            assert!(state(app.world()).occluded);
+            assert_eq!(
+                core.end_update(app.world(), t0).control_flow,
+                ControlFlow::WaitUntil(t0 + period - margin),
+                "max_fps={max_fps}"
+            );
+        }
+    }
+
+    #[test]
+    fn reactive_updates_never_run_faster_than_the_limit() {
+        let ms = Duration::from_millis;
+        let margin = FramePacer::DEFAULT_SPIN_MARGIN;
+        let reactive = RunnerSettings {
+            update_mode: UpdateMode::Reactive { wait: ms(50) },
+            ..RunnerSettings::default()
+        };
+        // The timeout is later than the frame deadline: it wins.
+        let (mut app, _, t0) = paced(144);
+        let mut core = RunnerCore::new(reactive);
+        core.begin_update(app.world_mut(), t0);
+        assert_eq!(
+            core.end_update(app.world(), t0).control_flow,
+            ControlFlow::WaitUntil(t0 + ms(50))
+        );
+        // A 10 fps limit pushes the timeout to the deadline, and an early event waits for it.
+        app.insert_resource(FrameLimit::new(10));
+        assert_eq!(
+            core.end_update(app.world(), t0).control_flow,
+            ControlFlow::WaitUntil(t0 + ms(100) - margin)
+        );
+        assert_eq!(
+            core.pace(app.world(), t0 + ms(60)),
+            FrameWait::Sleep {
+                wake: t0 + ms(100) - margin
+            }
         );
     }
 

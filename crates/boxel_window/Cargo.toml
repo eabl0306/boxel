@@ -20,3 +20,9 @@ boxel_ecs = { workspace = true, features = ["debug"] }
 
 [lints]
 workspace = true
+
+# Opens a window (opt-in with BOXEL_WINDOW_TESTS=1, see `just test-window`); winit needs the
+# main thread, so it brings its own `main`.
+[[test]]
+name = "frame_limit_window"
+harness = false

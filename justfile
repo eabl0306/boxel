@@ -94,6 +94,12 @@ test-vendor:
     cd vendor && cargo test --workspace --lib --locked
     cd vendor && cargo test -p boxel_ecs --doc --features debug --locked
 
+[group('test')]
+[doc('Window tests: frame limit precision with a real window (needs a display, ~5 s)')]
+[env('BOXEL_WINDOW_TESTS', '1')]
+test-window:
+    cargo test --release -p boxel_window --locked --test frame_limit_window
+
 # Flags as in Bevy's CI: the executor reads the clock (isolation off) and some tests do not join
 # their threads (leaks ignored). Miri reports 1 CPU by default, which makes the task pool serial
 # and fails the contiguous par_iter scheduling tests; 4 emulated CPUs keep them meaningful.

@@ -1,5 +1,5 @@
 use crate::runner::{RunnerSettings, UpdateMode, winit_runner};
-use boxel_app::{App, Plugin};
+use boxel_app::{App, FrameLimit, Plugin};
 use boxel_ecs::prelude::*;
 use boxel_math::UVec2;
 use std::sync::Arc;
@@ -46,6 +46,9 @@ impl Default for WindowSettings {
 /// Creates the event loop, registers window messages and installs the winit runner.
 /// Must be added from the main thread (winit refuses to create an event loop elsewhere on
 /// Linux). Panics with a clear message if an event loop cannot be created (no display).
+///
+/// Also inserts the default [`FrameLimit`] (144 fps) unless the app already has one; insert
+/// your own (before or after this plugin) to change it, at startup or at runtime.
 #[derive(Clone, Debug)]
 pub struct WindowPlugin {
     /// Primary window settings (inserted as a resource).
@@ -86,6 +89,7 @@ impl Plugin for WindowPlugin {
                 exit_on_close: self.exit_on_close,
                 update_mode: self.update_mode,
             })
+            .init_resource::<FrameLimit>()
             .add_message::<WindowCreated>()
             .add_message::<WindowResized>()
             .add_message::<WindowCloseRequested>()

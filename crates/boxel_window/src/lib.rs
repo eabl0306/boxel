@@ -9,6 +9,8 @@
 //!   opens the presentation gate [`WindowState::frame_ready`] (see [`winit_runner`]).
 //! - Window and device events become messages; [`InputPlugin`] folds them into [`ButtonInput`]
 //!   and accumulated mouse resources in `PreUpdate`.
+//! - Updates are paced by `boxel_app::FrameLimit` (default 144 fps, 0 = unlimited, changeable
+//!   at runtime), see [`UpdateMode`].
 mod input;
 mod runner;
 mod window;
