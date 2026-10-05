@@ -23,6 +23,10 @@ Opciones útiles (todas en `cargo run --release --example stress -- --help`): `-
 `--speed V`, `--duration S` (20 por defecto), `--warmup S` (2), `--seed N`, y las de GPU de
 siempre: `--backend vulkan`, `--adapter nvidia`, `--tier mid`.
 
+El stress corre siempre sin límite de FPS. `--vertical-radius N` fija cuántos chunks se cargan
+arriba y abajo de la cámara (8 por defecto). `--fixed-height` carga solo las capas del generador,
+como en M0: úsalo para comparar con corridas viejas, que no tienen radio vertical.
+
 Para que los números sirvan:
 
 - Siempre en release (las recetas ya lo hacen).

@@ -45,6 +45,7 @@ METRICS = [
 SETTINGS = [
     ('scenario', ('run', 'scenario')),
     ('radius', ('run', 'radius')),
+    ('vertical', ('run', 'vertical')),
     ('speed', ('run', 'speed')),
     ('seed', ('run', 'seed')),
     ('backend', ('run', 'backend')),
@@ -82,6 +83,9 @@ def load(path):
     with open(path, encoding='utf-8') as f:
         data = parse_summary(f.read(), path)
     data['_path'] = path
+    # Runs from before the vertical radius existed loaded only the generator's layers.
+    if isinstance(data.get('run'), dict):
+        data['run'].setdefault('vertical', 'fixed')
     return data
 
 
@@ -120,9 +124,10 @@ def title(run):
 
 
 def key(run):
-    """Runs with the same key are comparable (same scenario, radius, speed and GPU)."""
+    """Runs with the same key are comparable (same scenario, radius, height, speed and GPU)."""
     r = run['run']
-    return (r['scenario'], r['radius'], r['speed'], r['backend'], r['tier'], r.get('adapter'))
+    return (r['scenario'], r['radius'], r.get('vertical', 'fixed'), r['speed'], r['backend'], r['tier'],
+            r.get('adapter'))
 
 
 def fmt(value):

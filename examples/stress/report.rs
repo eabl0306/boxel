@@ -100,6 +100,8 @@ pub struct RunInfo {
     pub seed: u64,
     /// Trees on.
     pub trees: bool,
+    /// Vertical radius in chunks, or `fixed` (`--fixed-height`, the M0 layers only).
+    pub vertical: String,
     /// Requested measurement (`--duration`), in seconds.
     pub duration_s: f64,
     /// Seconds between settling and the measurement.
@@ -688,6 +690,7 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
         ("speed", Json::num(info.speed, 2)),
         ("seed", Json::Str(info.seed.to_string())),
         ("trees", Json::Bool(info.trees)),
+        ("vertical", Json::Str(info.vertical.clone())),
         ("duration_s", Json::num(info.duration_s, 3)),
         ("warmup_s", Json::num(info.warmup_s, 3)),
         ("settle_s", Json::num(info.settle_s, 3)),

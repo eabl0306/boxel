@@ -68,6 +68,8 @@ usage: stress [--scenario static|fly|spin] [GPU options] [options]
   --size WxH          window size in logical pixels (default 1280x720)
   --async-threads N   async compute pool size (chunk jobs)
   --no-trees          plain TerrainGenerator (no trees)
+  --vertical-radius N chunks loaded above and below the camera (default 8)
+  --fixed-height      load only the generator's layers, like M0 (for comparisons with older runs)
   --help              this text
 The run presents with --present immediate unless --present or BOXEL_PRESENT is given.
 exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 output not written, 4 timeout";
@@ -126,6 +128,8 @@ struct Options {
     size: (u32, u32),
     async_threads: Option<usize>,
     trees: bool,
+    vertical_radius: u32,
+    fixed_height: bool,
 }
 
 /// `Ok(None)` for `--help`.
@@ -145,6 +149,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         size: (1280, 720),
         async_threads: None,
         trees: true,
+        vertical_radius: ChunkViewer::DEFAULT_VERTICAL_RADIUS,
+        fixed_height: false,
     };
     let mut timeout = None;
     let mut it = args.iter();
@@ -219,6 +225,14 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                 );
             }
             "--no-trees" => o.trees = false,
+            "--vertical-radius" => {
+                let r = number(flag, &value()?)?;
+                o.vertical_radius = u32::try_from(r)
+                    .ok()
+                    .filter(|r| *r <= 64)
+                    .ok_or_else(|| format!("{flag}: {r} is not in 0..=64"))?;
+            }
+            "--fixed-height" => o.fixed_height = true,
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
@@ -398,7 +412,11 @@ fn spawn_camera(mut commands: Commands, bench: Res<Bench>) {
             ..Camera::default()
         },
         camera_at(o.scenario, o.camera, o.speed, 1.0, 0.0),
-        ChunkViewer { radius: o.radius },
+        ChunkViewer::new(o.radius).with_vertical_radius(if o.fixed_height {
+            u32::MAX
+        } else {
+            o.vertical_radius
+        }),
     ));
 }
 
@@ -775,6 +793,7 @@ fn main() -> AppExit {
     } else {
         Arc::new(terrain)
     };
+    let fixed_bounds = options.fixed_height.then(|| inner.vertical_chunks());
     let info = RunInfo {
         scenario: options.scenario.name().to_string(),
         label: options.label.clone(),
@@ -786,6 +805,11 @@ fn main() -> AppExit {
         },
         seed: options.seed,
         trees: options.trees,
+        vertical: if options.fixed_height {
+            "fixed".to_string()
+        } else {
+            options.vertical_radius.to_string()
+        },
         duration_s: options.duration.as_secs_f64(),
         warmup_s: options.warmup.as_secs_f64(),
         present,
@@ -827,6 +851,10 @@ fn main() -> AppExit {
             executor: Arc::new(CountingExecutor {
                 done: Arc::clone(&jobs_done),
             }),
+            settings: WorldSettings {
+                vertical_bounds: fixed_bounds,
+                ..WorldSettings::default()
+            },
             ..WorldPlugin::default()
         });
     if let Some(threads) = options.async_threads {
@@ -851,9 +879,8 @@ fn main() -> AppExit {
         Recorder::new(generated, jobs_done),
         Instant::now(),
     );
-    // The bench measures the uncapped loop.
-    // TODO(frame-limit): once boxel_app has the `FrameLimit` resource (0 = unlimited), add
-    // `app.insert_resource(FrameLimit(0));` here, or the runs are capped at the default 144 fps.
+    // The bench measures the uncapped loop (the engine default is 144 fps).
+    app.insert_resource(FrameLimit::UNLIMITED);
     app.run()
 }
 
@@ -1189,6 +1216,7 @@ mod tests {
         meshing: 0,
         queued_jobs: 5,
         in_flight: 0,
+        interest_backlog: 0,
     };
     const SETTLED: WorldStats = WorldStats {
         queued_jobs: 0,
