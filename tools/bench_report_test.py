@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Tests of tools/bench_report.py: python3 tools/bench_report_test.py (or `just test-tools`).
 
-Also parses every committed stress summary under docs/rendimiento/, so a change of the summary
-layout in examples/stress.rs that the tool does not follow fails here."""
+Also parses every committed stress summary under docs/rendimiento/ (the JSON data of each run),
+so a change of the summary layout in examples/stress.rs that the tool does not follow fails
+here."""
 import contextlib
 import copy
 import io
@@ -81,9 +82,19 @@ class FormatTest(unittest.TestCase):
         self.assertEqual(br.change(100.0, 150.0, 1), ('+50.0 %', 'better'))
         self.assertEqual(br.change(100.0, 100.5, 1), ('+0.5 %', ''))
         self.assertEqual(br.change(100.0, 150.0, 0), ('+50.0 %', ''))
-        self.assertEqual(br.change(0, 3, -1), ('n/a', ''))
         self.assertEqual(br.change(3, 3, -1), ('0 %', ''))
+        self.assertEqual(br.change(4, 0, -1), ('-100.0 %', 'better'))
+        self.assertEqual(br.change(-2.0, -1.0, -1), ('+50.0 %', 'worse'))
         self.assertEqual(br.change(None, 3, -1), ('-', ''))
+
+    def test_change_from_zero(self):
+        # No percent from 0, but the direction still decides.
+        self.assertEqual(br.change(0, 3, -1), ('n/a', 'worse'))
+        self.assertEqual(br.change(0, -0.5, -1), ('n/a', 'better'))
+        self.assertEqual(br.change(0.0, 120.0, 1), ('n/a', 'better'))
+        self.assertEqual(br.change(0, -1, 1), ('n/a', 'worse'))
+        self.assertEqual(br.change(0, 3, 0), ('n/a', ''))
+        self.assertEqual(br.change(0, 0.0, -1), ('0 %', ''))
 
     def test_title_and_get(self):
         self.assertEqual(br.title(SAMPLE), 'fly r16 32 vox/s')
@@ -136,6 +147,19 @@ class OutputTest(unittest.TestCase):
         self.assertIn('| p99 ms | 3 | 1.50 | -50.0 % | better |', out)
         self.assertIn('Note: the settings differ (radius 16 -> 32)', out)
 
+    def test_compare_flags_new_spikes(self):
+        clean = copy.deepcopy(SAMPLE)
+        clean['frames']['over_144hz'] = 0
+        spiky = copy.deepcopy(clean)
+        spiky['frames']['over_144hz'] = 5
+        spiky['frames']['over_60hz'] = 1
+        code, out, _ = run_main('--compare', self.write('a.md', clean), self.write('b.md', spiky))
+        self.assertEqual(code, 0)
+        self.assertIn('| frames > 6.94 ms | 0 | 5 | n/a | worse |', out)
+        self.assertIn('| frames > 16.7 ms | 0 | 1 | n/a | worse |', out)
+        code, out, _ = run_main('--compare', self.write('b.md', spiky), self.write('a.md', clean))
+        self.assertIn('| frames > 6.94 ms | 5 | 0 | -100.0 % | better |', out)
+
     def test_compare_directories_pairs_runs(self):
         spin = copy.deepcopy(SAMPLE)
         spin['run'].update(scenario='spin', speed=0)
@@ -152,6 +176,22 @@ class OutputTest(unittest.TestCase):
                                 os.path.join(self.dir.name, 'other'))
         self.assertEqual(code, 2)
         self.assertIn('no runs', err)
+
+    def test_compare_directories_keeps_gpus_apart(self):
+        # Same backend and tier on two adapters: each run pairs with its own GPU.
+        amd = copy.deepcopy(SAMPLE)
+        amd['run']['adapter'] = 'AMD'
+        amd['frames']['p99_ms'] = 9.0
+        self.write('1-gpu.md', SAMPLE, 'base')
+        self.write('2-amd.md', amd, 'base')
+        self.write('3-amd.json', amd, 'new')
+        code, out, _ = run_main('--compare', os.path.join(self.dir.name, 'base'),
+                                os.path.join(self.dir.name, 'new'))
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count('### '), 1)
+        self.assertIn('2-amd.md -> 3-amd.json', out)
+        self.assertIn('| p99 ms | 9 | 9 | 0 % |  |', out)
+        self.assertNotIn('Note:', out)
 
     def test_usage_errors(self):
         self.assertEqual(run_main()[0], 1)
@@ -174,8 +214,10 @@ class CommittedSummariesTest(unittest.TestCase):
             for name in names:
                 path = os.path.join(dirpath, name)
                 with open(path, encoding='utf-8') as f:
-                    if br.DATA_HEADING in f.read() and name.endswith('.md'):
-                        files.append(path)
+                    text = f.read()
+                if name.endswith('.json') or (name.endswith('.md') and br.DATA_HEADING in text):
+                    files.append(path)
+        self.assertGreaterEqual(len(files), 13, 'the October 2026 baseline')
         for path in files:
             run = br.load(path)
             br.table([run])

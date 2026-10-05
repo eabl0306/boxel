@@ -7,7 +7,9 @@ usage:
 
 RUN, BASE and NEW are summary files (Markdown with a JSON block, or plain JSON) or directories
 (every summary inside, not recursive). Comparing two directories pairs the runs with the same
-scenario, radius, speed, backend and tier. Output is Markdown, so it can go into docs as is.
+scenario, radius, speed, backend, tier and adapter. A metric that was 0 in BASE has no percent
+change ('n/a') but still gets a verdict (0 spikes before, 3 after: worse). Output is Markdown,
+so it can go into docs as is.
 Exit codes: 0 ok, 1 usage error or a file without a summary, 2 nothing to compare."""
 import json
 import os
@@ -118,8 +120,9 @@ def title(run):
 
 
 def key(run):
+    """Runs with the same key are comparable (same scenario, radius, speed and GPU)."""
     r = run['run']
-    return (r['scenario'], r['radius'], r['speed'], r['backend'], r['tier'])
+    return (r['scenario'], r['radius'], r['speed'], r['backend'], r['tier'], r.get('adapter'))
 
 
 def fmt(value):
@@ -137,17 +140,20 @@ def fmt(value):
 
 
 def change(base, new, direction):
-    """(percent text, verdict) for one metric."""
+    """(percent text, verdict) for one metric. Changes under 1 % get no verdict; from 0 there
+    is no percent ('n/a'), but any change gets one (new spikes are worse)."""
     if not isinstance(base, (int, float)) or not isinstance(new, (int, float)):
         return '-', ''
     if base == new:
         return '0 %', ''
+    up = 'better' if direction > 0 else 'worse'
+    down = 'worse' if direction > 0 else 'better'
     if base == 0:
-        return 'n/a', ''
+        return 'n/a', (up if new > base else down) if direction else ''
     pct = (new - base) / abs(base) * 100.0
     verdict = ''
     if direction and abs(pct) >= 1.0:
-        verdict = 'better' if (pct > 0) == (direction > 0) else 'worse'
+        verdict = up if new > base else down
     return f'{pct:+.1f} %', verdict
 
 
@@ -210,7 +216,7 @@ def main(argv):
             else:
                 matched = [(load(base), load(new))]
             if not matched:
-                print('no runs with the same scenario, radius, speed, backend and tier',
+                print('no runs with the same scenario, radius, speed, backend, tier and adapter',
                       file=sys.stderr)
                 return 2
             print('\n\n'.join(compare(b, n) for b, n in matched))

@@ -163,6 +163,16 @@ jobs:
       - name: vendor/Cargo.lock agrees with Cargo.lock
         run: python3 tools/vendor_lock_sync.py
 
+  tools:
+    name: python tools
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Also checks that the committed stress summaries still parse (`just test-tools`).
+      - run: python3 tools/bench_report_test.py
+
   typos:
     name: typos
     runs-on: ubuntu-24.04

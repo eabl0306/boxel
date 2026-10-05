@@ -12,11 +12,13 @@
 //!
 //! Every run waits until the world settled, runs `--warmup` seconds, then measures
 //! `--duration` seconds. Each frame records its wall-clock time (`Time::real_delta`, the whole
-//! loop: world, render, present) and the work it did: chunks generated and jobs finished (counted
-//! by wrapping the generator and the job executor), meshes sent and removed (`ChunkMeshEvent`),
-//! `WorldStats` (and its change), the GPU chunks and draws (`RenderInfo`) and the resident
-//! quads. The window renders every update even when covered (`render_when_hidden`), presents
-//! with `immediate` unless `--present`/`BOXEL_PRESENT` say otherwise, and closes itself.
+//! loop: world and render) and the work it did: chunks generated and jobs finished (counted by
+//! wrapping the generator and the job executor), meshes sent and removed (`ChunkMeshEvent`),
+//! `WorldStats` (and its change), the GPU chunks and draws (`RenderInfo`), the resident quads
+//! and whether it was presented. The window renders every update even when covered
+//! (`render_when_hidden`), but only about one frame per monitor refresh is presented (the
+//! compositor's frame callback opens the gate); the others render offscreen. It presents with
+//! `immediate` unless `--present`/`BOXEL_PRESENT` say otherwise, and closes itself.
 //!
 //! Exit codes: 0 success, 1 usage error, 2 no usable GPU, 3 an output file could not be
 //! written, 4 timeout (the world did not settle, or the run took longer than `--timeout`).
@@ -472,7 +474,11 @@ fn record(
 }
 
 /// `Update`, before the world computes interest: phases, the camera script and the exit.
+///
+/// Its clock is the start of the frame (`Time::last_update`, set in `First`), so the `t` values
+/// of two consecutive records differ by exactly the frame time of the first one.
 fn drive(
+    time: Res<Time>,
     mut bench: ResMut<Bench>,
     mut rec: ResMut<Recorder>,
     info: Res<RenderInfo>,
@@ -483,8 +489,9 @@ fn drive(
     if bench.exiting {
         return;
     }
-    let now = Instant::now();
-    if bench.started.elapsed() > bench.options.timeout {
+    let now = time.last_update().unwrap_or_else(Instant::now);
+    let elapsed = now.saturating_duration_since(bench.started);
+    if elapsed > bench.options.timeout {
         match bench.phase {
             Phase::Loading { .. } => eprintln!(
                 "stress: the world did not settle within {:.0} s: {:?}",
@@ -510,7 +517,7 @@ fn drive(
             let streak = if settled { streak + 1 } else { 0 };
             bench.phase = Phase::Loading { streak };
             if streak >= SETTLED_FRAMES {
-                let elapsed = bench.started.elapsed().as_secs_f64();
+                let elapsed = elapsed.as_secs_f64();
                 println!(
                     "stress: world settled after {elapsed:.2} s: chunks={} meshed={} empty={} \
                      gpu_chunks={}",
@@ -681,6 +688,38 @@ fn unix_time() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Name of the present mode a run uses: `--present`, else a valid `BOXEL_PRESENT` (the engine
+/// reads it the same way), else `immediate`, which is then returned to be set (the bench measures
+/// the uncapped loop).
+fn present_mode(
+    cli: Option<PresentModePref>,
+    env: Option<PresentModePref>,
+) -> (String, Option<PresentModePref>) {
+    match cli.or(env) {
+        Some(mode) => (format!("{mode:?}").to_lowercase(), None),
+        None => ("immediate".to_string(), Some(PresentModePref::Immediate)),
+    }
+}
+
+/// Adds the bench resources and systems (everything but the engine plugins).
+fn add_bench(app: &mut App, options: Options, info: RunInfo, recorder: Recorder, started: Instant) {
+    app.insert_resource(recorder)
+        .insert_resource(Bench {
+            started,
+            phase: Phase::Loading { streak: 0 },
+            info,
+            presented_at_start: 0,
+            exiting: false,
+            options,
+        })
+        .add_systems(Startup, spawn_camera)
+        .add_systems(PreUpdate, record)
+        .add_systems(
+            Update,
+            (gpu_failed, drive).chain().before(WorldSystems::Interest),
+        );
+}
+
 /// Kills the process if `main` has not returned `limit` after start (the event loop stopped
 /// updating, so the in-app timeout cannot fire). Dropping the returned sender disarms it.
 fn spawn_watchdog(limit: Duration) -> Sender<()> {
@@ -721,14 +760,13 @@ fn main() -> AppExit {
 
     // Uncapped: every update renders (offscreen while the window is covered or between
     // compositor frame callbacks) and presents without waiting for vblank.
-    let present = match gpu.present_mode {
-        Some(mode) => format!("{mode:?}").to_lowercase(),
-        None if std::env::var_os("BOXEL_PRESENT").is_some() => "BOXEL_PRESENT".to_string(),
-        None => {
-            gpu.present_mode = Some(PresentModePref::Immediate);
-            "immediate".to_string()
-        }
-    };
+    let (present, set) = present_mode(
+        gpu.present_mode,
+        GpuPreferences::from_boxel_env().0.present_mode,
+    );
+    if set.is_some() {
+        gpu.present_mode = set;
+    }
     let generated = Arc::new(AtomicU64::new(0));
     let jobs_done = Arc::new(AtomicU64::new(0));
     let terrain = TerrainGenerator::new(options.seed, TerrainSettings::default());
@@ -805,22 +843,14 @@ fn main() -> AppExit {
     }
 
     let mut app = App::new();
-    app.add_plugins(plugins)
-        .insert_resource(Recorder::new(generated, jobs_done))
-        .insert_resource(Bench {
-            started: Instant::now(),
-            phase: Phase::Loading { streak: 0 },
-            info,
-            presented_at_start: 0,
-            exiting: false,
-            options,
-        })
-        .add_systems(Startup, spawn_camera)
-        .add_systems(PreUpdate, record)
-        .add_systems(
-            Update,
-            (gpu_failed, drive).chain().before(WorldSystems::Interest),
-        );
+    app.add_plugins(plugins);
+    add_bench(
+        &mut app,
+        options,
+        info,
+        Recorder::new(generated, jobs_done),
+        Instant::now(),
+    );
     // The bench measures the uncapped loop.
     // TODO(frame-limit): once boxel_app has the `FrameLimit` resource (0 = unlimited), add
     // `app.insert_resource(FrameLimit(0));` here, or the runs are capped at the default 144 fps.
@@ -830,6 +860,7 @@ fn main() -> AppExit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boxel::mesh::{ChunkMesh, PackedQuad};
 
     fn parse(args: &[&str]) -> Result<Option<Options>, String> {
         let args: Vec<String> = args.iter().map(ToString::to_string).collect();
@@ -1015,5 +1046,304 @@ mod tests {
             assert_eq!(Scenario::parse(s.name()), Some(s));
         }
         assert_eq!(Scenario::parse("Fly"), None);
+    }
+
+    #[test]
+    fn present_mode_is_the_requested_one_or_immediate() {
+        use PresentModePref::{Immediate, Mailbox, Vsync};
+        assert_eq!(
+            present_mode(None, None),
+            ("immediate".into(), Some(Immediate))
+        );
+        assert_eq!(present_mode(Some(Vsync), None), ("vsync".into(), None));
+        // BOXEL_PRESENT (already parsed: invalid values are None) applies without --present.
+        assert_eq!(present_mode(None, Some(Mailbox)), ("mailbox".into(), None));
+        assert_eq!(
+            present_mode(Some(Immediate), Some(Vsync)),
+            ("immediate".into(), None)
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The bench systems in an app: a hand-driven clock, a scripted world and renderer.
+
+    /// What the fake world and renderer do in one frame.
+    #[derive(Clone, Debug, Default)]
+    struct FakeFrame {
+        /// Time until the next frame starts.
+        duration: Duration,
+        /// `WorldStats` published at the end of the frame (`Last`, as the world plugin).
+        stats: WorldStats,
+        /// Quads of each mesh sent in `Update` (always the same chunk).
+        upserts: Vec<usize>,
+        /// Meshes removed in `Update`.
+        removes: usize,
+        /// Generator calls that finish during the frame.
+        generated: u64,
+        /// The renderer presents this frame.
+        presented: bool,
+    }
+
+    #[derive(Resource)]
+    struct Script {
+        frame: usize,
+        frames: Vec<FakeFrame>,
+        generated: Arc<AtomicU64>,
+    }
+
+    impl Script {
+        fn now(&self) -> Option<&FakeFrame> {
+            self.frames.get(self.frame)
+        }
+    }
+
+    fn fake_world(script: Res<Script>, mut meshes: MessageWriter<ChunkMeshEvent>) {
+        let Some(frame) = script.now() else {
+            return;
+        };
+        let (id, key) = (ChunkId::default(), ChunkKey::new(ChunkPos::new(0, 0, 0)));
+        for &quads in &frame.upserts {
+            let mesh = ChunkMesh {
+                quads: vec![PackedQuad::default(); quads],
+                ..ChunkMesh::default()
+            };
+            meshes.write(ChunkMeshEvent::Upsert {
+                id,
+                key,
+                mesh: Arc::new(mesh),
+            });
+        }
+        for _ in 0..frame.removes {
+            meshes.write(ChunkMeshEvent::Remove { id, key });
+        }
+        script
+            .generated
+            .fetch_add(frame.generated, Ordering::Relaxed);
+    }
+
+    fn fake_render(
+        script: Res<Script>,
+        mut stats: ResMut<WorldStats>,
+        mut info: ResMut<RenderInfo>,
+    ) {
+        let Some(frame) = script.now() else {
+            return;
+        };
+        *stats = frame.stats;
+        info.ready = true;
+        info.frames_presented += u64::from(frame.presented);
+    }
+
+    /// The bench systems with a fake world and renderer; no window, GPU or threads.
+    fn bench_app(options: Options, t0: Instant, frames: Vec<FakeFrame>) -> App {
+        let generated = Arc::new(AtomicU64::new(0));
+        let mut app = App::new();
+        app.add_message::<ChunkMeshEvent>()
+            .add_message::<GpuFailed>()
+            .init_resource::<WorldStats>()
+            .init_resource::<RenderInfo>()
+            .insert_resource(Time::new(t0))
+            .insert_resource(Script {
+                frame: 0,
+                frames,
+                generated: Arc::clone(&generated),
+            });
+        let recorder = Recorder::new(generated, Arc::new(AtomicU64::new(0)));
+        add_bench(&mut app, options, RunInfo::default(), recorder, t0);
+        app.add_systems(Update, fake_world.after(drive))
+            .add_systems(Last, fake_render);
+        app.finish();
+        app.cleanup();
+        app
+    }
+
+    /// Runs the script (frame `i` starts when frame `i - 1` ends) until the app asks to exit:
+    /// the exit and the frame that asked, or `None` after the last frame.
+    fn run(app: &mut App, t0: Instant) -> Option<(AppExit, usize)> {
+        let mut now = t0;
+        let frames = app.world().resource::<Script>().frames.len();
+        for i in 0..frames {
+            app.world_mut().resource_mut::<Script>().frame = i;
+            app.world_mut()
+                .resource_mut::<Time>()
+                .update_with_instant(now);
+            app.update();
+            if let Some(exit) = app.should_exit() {
+                return Some((exit, i));
+            }
+            now += app.world().resource::<Script>().frames[i].duration;
+        }
+        None
+    }
+
+    fn options(args: &[&str]) -> Options {
+        parse(args).expect("valid").expect("not help")
+    }
+
+    const BUSY: WorldStats = WorldStats {
+        chunks: 10,
+        data_ready: 0,
+        generating: 0,
+        mesh_ready: 0,
+        mesh_empty: 0,
+        meshing: 0,
+        queued_jobs: 5,
+        in_flight: 0,
+    };
+    const SETTLED: WorldStats = WorldStats {
+        queued_jobs: 0,
+        ..BUSY
+    };
+
+    /// `count` frames of `ms` milliseconds with the world in `stats`.
+    fn frames(count: usize, ms: u64, stats: WorldStats) -> Vec<FakeFrame> {
+        vec![
+            FakeFrame {
+                duration: Duration::from_millis(ms),
+                stats,
+                ..FakeFrame::default()
+            };
+            count
+        ]
+    }
+
+    #[test]
+    fn phases_advance_and_each_record_holds_its_own_frame() {
+        // Frame i lasts i + 1 ms, so it starts at i (i + 1) / 2 ms. The world is busy in frames
+        // 0 and 1 and settled from frame 2; drive sees a frame's stats in the next frame, so the
+        // third settled frame it sees is frame 4, at frame 5 (15 ms): warmup until 25 ms, the
+        // measurement starts at frame 7 (28 ms) and its 30 ms end at frame 11 (66 ms, t = 38 ms).
+        // Frames 7 to 10 are measured; catch-up needs 3 more settled frames: done at frame 14.
+        let mut script: Vec<FakeFrame> = (0..20u64)
+            .map(|i| FakeFrame {
+                duration: Duration::from_millis(i + 1),
+                stats: if i < 2 { BUSY } else { SETTLED },
+                ..FakeFrame::default()
+            })
+            .collect();
+        script[2].upserts = vec![6]; // before the measurement: resident, not recorded
+        script[6].presented = true; // warmup: not counted
+        script[7].upserts = vec![10];
+        script[7].generated = 2;
+        script[7].stats.data_ready = 3;
+        script[8].generated = 3;
+        script[8].presented = true;
+        script[8].stats.data_ready = 5;
+        script[9].upserts = vec![4];
+        script[9].stats = WorldStats {
+            chunks: 12,
+            data_ready: 5,
+            queued_jobs: 4,
+            ..SETTLED
+        };
+        script[10].removes = 1;
+        script[10].presented = true;
+        for frame in &mut script[10..] {
+            frame.stats = WorldStats {
+                chunks: 12,
+                data_ready: 5,
+                ..SETTLED
+            };
+        }
+        // Flying at 1000 voxels/s from x = 16 crosses x = 32 between t = 8 and 17 ms.
+        let o = options(&[
+            "--scenario=fly",
+            "--speed=1000",
+            "--duration=0.030",
+            "--warmup=0.010",
+            "--radius=1",
+        ]);
+        let t0 = Instant::now();
+        let mut app = bench_app(o, t0, script);
+        assert_eq!(run(&mut app, t0), Some((AppExit::Success, 14)));
+
+        let rec = app.world().resource::<Recorder>();
+        let records = rec.log.to_vec();
+        let ms = Duration::from_millis;
+        let t: Vec<Duration> = records.iter().map(|r| r.t).collect();
+        assert_eq!(t, [ms(0), ms(8), ms(17), ms(27)]);
+        let frame_times: Vec<Duration> = records.iter().map(|r| r.frame_time).collect();
+        assert_eq!(
+            frame_times,
+            [ms(8), ms(9), ms(10), ms(11)],
+            "frames 7 to 10"
+        );
+        let field = |f: fn(&FrameRecord) -> u64| records.iter().map(f).collect::<Vec<_>>();
+        assert_eq!(field(|r| u64::from(r.presented)), [0, 1, 0, 1]);
+        assert_eq!(field(|r| u64::from(r.crossed)), [0, 0, 1, 0]);
+        assert_eq!(field(|r| u64::from(r.generated)), [2, 3, 0, 0]);
+        assert_eq!(field(|r| u64::from(r.meshes)), [1, 0, 1, 0]);
+        assert_eq!(field(|r| u64::from(r.removed)), [0, 0, 0, 1]);
+        assert_eq!(field(|r| r.upload_quads), [10, 0, 4, 0]);
+        // The upsert of frame 2 (6 quads) was replaced by frame 7's (10), then by 4, then removed.
+        assert_eq!(field(|r| r.quads), [10, 10, 4, 0]);
+        assert_eq!(field(|r| r.d_data_ready as u64), [3, 2, 0, 0]);
+        assert_eq!(field(|r| r.d_chunks as u64), [0, 0, 2, 0]);
+        assert_eq!(field(|r| r.world.queued_jobs as u64), [0, 0, 4, 0]);
+        // Consecutive records are exactly one frame apart.
+        assert!(
+            records
+                .windows(2)
+                .all(|w| w[1].t - w[0].t == w[0].frame_time)
+        );
+
+        let bench = app.world().resource::<Bench>();
+        assert_eq!(bench.phase, Phase::Done);
+        assert_eq!(bench.info.settle_s, 0.015);
+        assert_eq!(bench.info.settle_chunks, 10);
+        assert_eq!(bench.info.frames_presented, 2, "frames 8 and 10");
+        assert_eq!(
+            bench.info.catch_up_s,
+            Some(0.039),
+            "frame 11 (66 ms) to 14 (105 ms)"
+        );
+    }
+
+    #[test]
+    fn a_world_that_never_settles_times_out_with_4() {
+        let o = options(&["--timeout=0.020"]);
+        let t0 = Instant::now();
+        let mut app = bench_app(o, t0, frames(20, 5, BUSY));
+        // 25 ms > 20 ms at frame 5.
+        assert_eq!(run(&mut app, t0), Some((AppExit::from_code(4), 5)));
+        assert!(app.world().resource::<Recorder>().log.to_vec().is_empty());
+    }
+
+    #[test]
+    fn a_measurement_longer_than_the_timeout_exits_with_4() {
+        let o = options(&["--duration=10", "--warmup=0", "--timeout=0.050"]);
+        let t0 = Instant::now();
+        let mut app = bench_app(o, t0, frames(40, 5, SETTLED));
+        // Settled at frame 3 (third settled frame seen), measuring from frame 4, 55 ms > 50 ms
+        // at frame 11.
+        assert_eq!(run(&mut app, t0), Some((AppExit::from_code(4), 11)));
+        let bench = app.world().resource::<Bench>();
+        assert_eq!(bench.phase, Phase::Done);
+        let records = app.world().resource::<Recorder>().log.to_vec();
+        assert_eq!(records.len(), 7, "frames 4 to 10, and no outputs written");
+    }
+
+    #[test]
+    fn a_catch_up_past_the_timeout_still_succeeds() {
+        // The measurement (frames 4 and 5) is complete; the world never settles again.
+        let o = options(&["--duration=0.010", "--warmup=0", "--timeout=0.100"]);
+        let mut script = frames(5, 5, SETTLED);
+        script.extend(frames(40, 5, BUSY));
+        let t0 = Instant::now();
+        let mut app = bench_app(o, t0, script);
+        assert_eq!(run(&mut app, t0), Some((AppExit::Success, 21)));
+        let bench = app.world().resource::<Bench>();
+        assert_eq!(bench.info.catch_up_s, None);
+        assert_eq!(app.world().resource::<Recorder>().log.to_vec().len(), 2);
+    }
+
+    #[test]
+    fn no_gpu_exits_with_2() {
+        let t0 = Instant::now();
+        let mut app = bench_app(options(&[]), t0, frames(5, 5, BUSY));
+        app.world_mut().write_message(GpuFailed {
+            error: "no adapter".to_string(),
+        });
+        assert_eq!(run(&mut app, t0), Some((AppExit::from_code(2), 0)));
     }
 }

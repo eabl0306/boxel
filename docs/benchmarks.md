@@ -42,11 +42,13 @@ Todos esperan a que el mundo termine de cargar, corren `--warmup` segundos sin m
 miden `--duration` segundos.
 
 El bucle corre sin límite de fps y dibuja en cada vuelta, aunque la ventana esté tapada. Los fps
-de acá dicen cuántos frames puede hacer el motor, no cuántos muestra el monitor.
+de acá dicen cuántos frames puede hacer el motor, no cuántos muestra el monitor: solo se presenta
+un frame por cada refresco del monitor (unos 144 por segundo) y el resto se dibuja sin mostrarse.
 
 ## Qué significa cada número
 
-Un frame es una vuelta entera del bucle: mundo, render y presentación.
+Un frame es una vuelta entera del bucle: mundo y render. Solo algunos llegan a la pantalla (ver
+arriba).
 
 | Número | Qué es |
 |---|---|
@@ -59,10 +61,10 @@ Un frame es una vuelta entera del bucle: mundo, render y presentación.
 | frames con cruce de borde | frames en que la cámara pasó a otro chunk. Ahí el mundo recalcula qué chunks quiere |
 | generated/s, meshes/s | chunks generados y mallas subidas a la GPU por segundo |
 | jobs queued, in flight | trabajos esperando y trabajos corriendo |
-| queue trend | cuánto crece la cola por segundo. Si es mayor que 0, el mundo se atrasa |
-| border catch-up | después de cada cruce, cuánto tardó el mundo en terminar los chunks nuevos. Si no termina antes del próximo cruce, va atrasado |
+| queue trend | cuánto crece la cola por segundo, mirando toda la medición. Si es claramente mayor que 0, el mundo se atrasa |
+| border catch-up | después de cada cruce, cuánto tardó el mundo en terminar los chunks nuevos. Si no termina antes del próximo cruce, va atrasado. Si la medición corta el último cruce a la mitad, ese no cuenta |
 | catch-up after stop | cuánto tardó en terminar todo después de que la cámara frenó |
-| Worst 5 frames | los 5 peores, con lo que pasó en cada uno (cruce, chunks generados, mallas, cola) |
+| Worst 5 frames | los 5 peores, con lo que pasó en cada uno (cruce, chunks generados, mallas, cola) y si se presentó |
 | Per second | fps, peor frame y pico de la cola, segundo a segundo |
 
 Los chunks generados y los trabajos terminados se cuentan exactos (stress envuelve el generador
@@ -77,9 +79,10 @@ just bench-report --compare antes.md despues.md
 just bench-report --compare carpeta-antes/ carpeta-despues/
 ```
 
-`--compare` muestra cada número, el cambio en % y si mejoró o empeoró. Si las corridas tienen
-otra configuración (radio, GPU, velocidad), lo avisa. Con dos carpetas empareja las corridas del
-mismo escenario, radio, velocidad y GPU.
+`--compare` muestra cada número, el cambio en % y si mejoró o empeoró. Si antes era 0 no hay %,
+pero igual dice si empeoró (por ejemplo, tirones nuevos). Si las corridas tienen otra
+configuración (radio, GPU, velocidad), lo avisa. Con dos carpetas empareja las corridas del mismo
+escenario, radio, velocidad, backend, tier y GPU.
 
 Flujo sugerido: `just bench-all` antes del cambio, mover `bench-results/` a otra carpeta,
 aplicar el cambio, `just bench-all` otra vez y comparar las dos carpetas.

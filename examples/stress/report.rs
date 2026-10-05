@@ -100,18 +100,18 @@ pub struct RunInfo {
     pub seed: u64,
     /// Trees on.
     pub trees: bool,
-    /// Requested measurement and warmup, in seconds.
+    /// Requested measurement (`--duration`), in seconds.
     pub duration_s: f64,
     /// Seconds between settling and the measurement.
     pub warmup_s: f64,
-    /// Seconds from start until the world first settled, and the slots then.
+    /// Seconds from start until the world first settled.
     pub settle_s: f64,
     /// Slots when the world settled.
     pub settle_chunks: usize,
     /// Seconds the world needed after the measurement to settle again (`None`: not within the
     /// limit).
     pub catch_up_s: Option<f64>,
-    /// GPU: adapter, backend, tier, device class, driver.
+    /// Adapter name.
     pub adapter: String,
     /// Backend name.
     pub backend: String,
@@ -121,13 +121,13 @@ pub struct RunInfo {
     pub class: String,
     /// Driver name and version.
     pub driver: String,
-    /// Requested present mode.
+    /// Requested present mode (`--present`, `BOXEL_PRESENT`, or `immediate` by default).
     pub present: String,
     /// Window size in logical pixels.
     pub window: (u32, u32),
     /// `release` or `debug`.
     pub build: String,
-    /// CPU model (Linux) and hardware threads.
+    /// CPU model (Linux; empty elsewhere).
     pub cpu: String,
     /// Hardware threads.
     pub threads: usize,
@@ -228,10 +228,13 @@ pub struct SecondStats {
 /// crossing frame to the first frame with nothing queued, running, generating or meshing.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BorderCatchUp {
-    /// Crossings measured.
+    /// Crossings in the measurement (`cut_off` included).
     pub crossings: usize,
-    /// Crossings the world finished before the next one (or before the end).
+    /// Crossings the world finished before the next one (or, for the last one, before the end).
     pub finished: usize,
+    /// 1 when the measurement ended before the world finished the last crossing, else 0. That
+    /// crossing is neither finished nor late: the run stopped too soon to tell.
+    pub cut_off: usize,
     /// Mean time to finish, over the finished crossings (zero if none).
     pub avg: Duration,
     /// Longest time to finish.
@@ -239,24 +242,32 @@ pub struct BorderCatchUp {
 }
 
 impl BorderCatchUp {
-    /// `None` without crossings. A crossing not finished before the next crossing (or the end of
-    /// the measurement) counts as unfinished: the world is behind the camera.
+    /// `None` without crossings. A crossing not finished before the next crossing counts as
+    /// unfinished (the world is behind the camera); the last crossing, if the measurement ends
+    /// before the world finished it, counts as cut off.
     fn of(records: &[FrameRecord]) -> Option<Self> {
         let crossings: Vec<usize> = (0..records.len()).filter(|&i| records[i].crossed).collect();
-        let (mut finished, mut sum, mut max) = (0usize, Duration::ZERO, Duration::ZERO);
+        let (mut finished, mut cut_off) = (0usize, 0usize);
+        let (mut sum, mut max) = (Duration::ZERO, Duration::ZERO);
         for (n, &at) in crossings.iter().enumerate() {
-            let until = crossings.get(n + 1).copied().unwrap_or(records.len());
+            let next = crossings.get(n + 1).copied();
             let start = records[at].t;
-            if let Some(done) = records[at..until].iter().find(|r| r.world.is_settled()) {
-                let lag = done.t.saturating_sub(start);
-                finished += 1;
-                sum += lag;
-                max = max.max(lag);
+            let until = next.unwrap_or(records.len());
+            match records[at..until].iter().find(|r| r.world.is_settled()) {
+                Some(done) => {
+                    let lag = done.t.saturating_sub(start);
+                    finished += 1;
+                    sum += lag;
+                    max = max.max(lag);
+                }
+                None if next.is_none() => cut_off = 1,
+                None => {}
             }
         }
         (!crossings.is_empty()).then(|| Self {
             crossings: crossings.len(),
             finished,
+            cut_off,
             avg: if finished == 0 {
                 Duration::ZERO
             } else {
@@ -264,6 +275,70 @@ impl BorderCatchUp {
             },
             max,
         })
+    }
+
+    /// Crossings whose outcome is known: finished or overtaken by the next crossing.
+    pub fn judged(&self) -> usize {
+        self.crossings - self.cut_off
+    }
+
+    /// The sentence of the summary.
+    pub fn text(&self) -> String {
+        let cut = if self.cut_off > 0 {
+            " The measurement ended before the world finished the last border, so it is left out."
+        } else {
+            ""
+        };
+        match (self.finished, self.judged()) {
+            (_, 0) => {
+                "The measurement ended before the world finished the only chunk border.".to_string()
+            }
+            (0, judged) => format!(
+                "The world finished none of the {judged} chunk borders before the next one.{cut}"
+            ),
+            (finished, judged) => format!(
+                "After a chunk border the world finished the new chunks in {:.0} ms on average, \
+                 {:.0} ms at most ({finished} of {judged} borders finished before the next \
+                 one).{cut}",
+                ms(self.avg),
+                ms(self.max),
+            ),
+        }
+    }
+}
+
+/// Slope of the job queue over the measurement, in jobs per second: a least-squares line
+/// through `queued_jobs` over `t`, each frame weighted by its frame time (a time average, so
+/// periods with many short frames do not count more). A queue that fills at each border and
+/// empties before the next one gives about 0 wherever the run stops; a queue that keeps growing
+/// gives its growth per second. 0 with fewer than two distinct times.
+fn queue_slope(records: &[FrameRecord]) -> f64 {
+    let weight = |r: &FrameRecord| r.frame_time.as_secs_f64();
+    let total: f64 = records.iter().map(weight).sum();
+    if total <= 0.0 {
+        return 0.0;
+    }
+    let mean_t = records
+        .iter()
+        .map(|r| weight(r) * r.t.as_secs_f64())
+        .sum::<f64>()
+        / total;
+    let mean_q = records
+        .iter()
+        .map(|r| weight(r) * r.world.queued_jobs as f64)
+        .sum::<f64>()
+        / total;
+    let (mut covariance, mut variance) = (0.0, 0.0);
+    for r in records {
+        let dt = r.t.as_secs_f64() - mean_t;
+        covariance += weight(r) * dt * (r.world.queued_jobs as f64 - mean_q);
+        variance += weight(r) * dt * dt;
+    }
+    // Below 1 microsecond squared on average the times are all the same (rounding noise).
+    if variance > total * 1e-12 {
+        covariance / variance
+    } else {
+        0.0
     }
 }
 
@@ -316,8 +391,8 @@ pub struct Summary {
     pub in_flight: Spread,
     /// Slots generating or meshing (`generating + meshing`).
     pub pending_chunks: Spread,
-    /// Growth of the job queue per second (last minus first, over the measured time): above 0
-    /// the world falls behind the camera.
+    /// Growth of the job queue per second ([`queue_slope`]): clearly above 0, the world falls
+    /// behind the camera.
     pub backlog_trend: f64,
     /// Time to finish the chunks of each border crossing (`None` without crossings).
     pub border: Option<BorderCatchUp>,
@@ -334,19 +409,12 @@ impl Summary {
     pub fn compute(records: &[FrameRecord]) -> Option<Self> {
         let frames = FrameTimeSummary::from_frame_times(records.iter().map(|r| r.frame_time))?;
         let last = *records.last()?;
-        let first = records.first()?;
         let mut totals = WorldTotals::default();
         records.iter().for_each(|r| totals.add(r));
         let mut worst: Vec<(usize, FrameRecord)> = records.iter().copied().enumerate().collect();
         // Slowest first; ties keep the earlier frame first.
         worst.sort_by(|(ia, a), (ib, b)| b.frame_time.cmp(&a.frame_time).then(ia.cmp(ib)));
         worst.truncate(WORST_FRAMES);
-        let seconds = frames.total.as_secs_f64();
-        let backlog_trend = if seconds > 0.0 {
-            (last.world.queued_jobs as f64 - first.world.queued_jobs as f64) / seconds
-        } else {
-            0.0
-        };
         Some(Self {
             over_144hz: records
                 .iter()
@@ -364,7 +432,7 @@ impl Summary {
             pending_chunks: Spread::of(
                 records.iter().map(|r| r.world.generating + r.world.meshing),
             ),
-            backlog_trend,
+            backlog_trend: queue_slope(records),
             border: BorderCatchUp::of(records),
             worst,
             timeline: timeline(records),
@@ -424,6 +492,13 @@ fn close_second(second: Option<&mut SecondStats>, time: Duration) {
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
+}
+
+/// `value` rounded to `decimals`, with `-0` turned into `0`.
+fn rounded(value: f64, decimals: i32) -> f64 {
+    let scale = 10f64.powi(decimals);
+    let v = (value * scale).round() / scale;
+    if v == 0.0 { 0.0 } else { v }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -497,9 +572,9 @@ pub enum Json {
 }
 
 impl Json {
+    /// `value` rounded to `decimals`; a value that rounds to zero is `0`, never `-0`.
     fn num(value: f64, decimals: i32) -> Self {
-        let scale = 10f64.powi(decimals);
-        Json::Num((value * scale).round() / scale)
+        Json::Num(rounded(value, decimals))
     }
 
     fn ms(d: Duration) -> Self {
@@ -678,6 +753,7 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
                 Json::Obj(vec![
                     ("crossings", Json::uint(b.crossings)),
                     ("finished", Json::uint(b.finished)),
+                    ("cut_off", Json::uint(b.cut_off)),
                     ("avg_ms", Json::ms(b.avg)),
                     ("max_ms", Json::ms(b.max)),
                 ])
@@ -706,6 +782,7 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
                 ("t_s", Json::num(r.t.as_secs_f64(), 3)),
                 ("ms", Json::ms(r.frame_time)),
                 ("crossed", Json::Bool(r.crossed)),
+                ("presented", Json::Bool(r.presented)),
                 ("generated", Json::uint(r.generated)),
                 ("meshes", Json::uint(r.meshes)),
                 ("removed", Json::uint(r.removed)),
@@ -867,16 +944,7 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
             sp.avg, sp.p95, sp.max, sp.first, sp.last
         );
     }
-    let border = s.border.map_or_else(String::new, |b| {
-        format!(
-            "After a chunk border the world finished the new chunks in {:.0} ms on average, \
-             {:.0} ms at most ({} of {} borders finished before the next one). ",
-            ms(b.avg),
-            ms(b.max),
-            b.finished,
-            b.crossings
-        )
-    });
+    let border = s.border.map_or_else(String::new, |b| b.text() + " ");
     let catch_up = info.catch_up_s.map_or_else(
         || "It did not settle again within the time limit.".to_string(),
         |c| format!("It settled again {c:.2} s after the camera stopped."),
@@ -884,9 +952,10 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
     let w = &s.last.world;
     let _ = writeln!(
         out,
-        "\n{border}Queue trend {:+.1} jobs/s (above 0: the world falls behind). {catch_up} At the \
-         end: {} chunks, {} meshes ({} empty), {} on the GPU, {} quads, {} draws.\n",
-        s.backlog_trend,
+        "\n{border}Queue trend {:+.1} jobs/s (slope over the measurement; clearly above 0: the \
+         world falls behind). {catch_up} At the end: {} chunks, {} meshes ({} empty), {} on the \
+         GPU, {} quads, {} draws.\n",
+        rounded(s.backlog_trend, 1),
         w.chunks,
         w.mesh_ready,
         w.mesh_empty,
@@ -898,17 +967,22 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
     let _ = writeln!(out, "## Worst {} frames\n", s.worst.len());
     let _ = writeln!(
         out,
-        "| frame | t s | ms | crossed | generated | meshes | removed | quads up | queued | in \
-         flight |"
+        "| frame | t s | ms | crossed | presented | generated | meshes | removed | quads up | \
+         queued | in flight |"
     );
-    let _ = writeln!(out, "|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|");
+    let _ = writeln!(
+        out,
+        "|---:|---:|---:|---|---|---:|---:|---:|---:|---:|---:|"
+    );
+    let yes_no = |b: bool| if b { "yes" } else { "no" };
     for (i, r) in &s.worst {
         let _ = writeln!(
             out,
-            "| {i} | {:.2} | {:.2} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {i} | {:.2} | {:.2} | {} | {} | {} | {} | {} | {} | {} | {} |",
             r.t.as_secs_f64(),
             ms(r.frame_time),
-            if r.crossed { "yes" } else { "no" },
+            yes_no(r.crossed),
+            yes_no(r.presented),
             r.generated,
             r.meshes,
             r.removed,
@@ -1067,7 +1141,8 @@ mod tests {
         assert_eq!(s.queued.last, 24);
         assert_eq!(s.queued.max, 24);
         assert_eq!(s.in_flight.avg, 12.0);
-        assert!((s.backlog_trend - 24.0 / 2.526).abs() < 1e-9);
+        // The queue grows by one job every 100 ms.
+        assert!((s.backlog_trend - 10.0).abs() < 0.1, "{}", s.backlog_trend);
         assert_eq!(s.last, *records.last().expect("records"));
         assert_eq!(Summary::compute(&[]), None);
     }
@@ -1087,30 +1162,180 @@ mod tests {
         assert_eq!(s.timeline[1].crossings, 1);
     }
 
-    #[test]
-    fn border_catch_up_measures_the_lag_after_each_crossing() {
-        // Frames every 10 ms. Crossings at 0 ms (settled again at 30 ms), 100 ms (settled at
-        // 180 ms) and 200 ms (never settled before the end).
-        let records: Vec<FrameRecord> = (0..30u64)
+    /// Frames every 10 ms; a crossing at each frame of `crossings`; busy (one job queued) in
+    /// the frames of `busy`.
+    fn crossings(frames: u64, crossings: &[u64], busy: impl Fn(u64) -> bool) -> Vec<FrameRecord> {
+        (0..frames)
             .map(|i| {
-                let mut r = frame(i * 10, 1.0);
-                r.crossed = matches!(i, 0 | 10 | 20);
-                let busy = matches!(i, 0..=2 | 10..=17 | 20..);
-                r.world.queued_jobs = usize::from(busy);
+                let mut r = frame(i * 10, 10.0);
+                r.crossed = crossings.contains(&i);
+                r.world.queued_jobs = usize::from(busy(i));
                 r
             })
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn border_catch_up_measures_the_lag_after_each_crossing() {
+        // Crossings at 0 ms (settled again at 30 ms), 100 ms (settled at 180 ms), 200 ms (still
+        // busy at the next crossing: late) and 300 ms (still busy when the measurement ends).
+        let records = crossings(
+            40,
+            &[0, 10, 20, 30],
+            |i| matches!(i, 0..=2 | 10..=17 | 20..),
+        );
         let b = BorderCatchUp::of(&records).expect("crossings");
-        assert_eq!((b.crossings, b.finished), (3, 2));
+        assert_eq!((b.crossings, b.finished, b.cut_off), (4, 2, 1));
+        assert_eq!(
+            b.judged(),
+            3,
+            "the cut-off crossing is neither finished nor late"
+        );
         assert_eq!(b.max, Duration::from_millis(80));
         assert_eq!(b.avg, Duration::from_millis(55));
+        assert_eq!(
+            b.text(),
+            "After a chunk border the world finished the new chunks in 55 ms on average, 80 ms at \
+             most (2 of 3 borders finished before the next one). The measurement ended before \
+             the world finished the last border, so it is left out."
+        );
         let none: Vec<FrameRecord> = (0..5u64).map(|i| frame(i, 1.0)).collect();
         assert_eq!(BorderCatchUp::of(&none), None);
         // A crossing frame that is already settled finishes at once.
         let mut quick = none.clone();
         quick[1].crossed = true;
         let b = BorderCatchUp::of(&quick).expect("one crossing");
-        assert_eq!((b.finished, b.max), (1, Duration::ZERO));
+        assert_eq!((b.finished, b.cut_off, b.max), (1, 0, Duration::ZERO));
+    }
+
+    #[test]
+    fn a_run_ending_right_after_a_crossing_is_not_late() {
+        // The last crossing finished in the last frame: finished, not cut off.
+        let b = BorderCatchUp::of(&crossings(12, &[1, 11], |i| i == 1)).expect("crossings");
+        assert_eq!((b.crossings, b.finished, b.cut_off), (2, 2, 0));
+        // The only crossing is cut off by the end.
+        let b = BorderCatchUp::of(&crossings(12, &[11], |i| i == 11)).expect("one crossing");
+        assert_eq!(
+            (b.crossings, b.finished, b.cut_off, b.judged()),
+            (1, 0, 1, 0)
+        );
+        assert_eq!(
+            b.text(),
+            "The measurement ended before the world finished the only chunk border."
+        );
+        // Every border overtaken by the next one: the world is behind.
+        let b = BorderCatchUp::of(&crossings(30, &[0, 10, 20], |_| true)).expect("crossings");
+        assert_eq!((b.crossings, b.finished, b.cut_off), (3, 0, 1));
+        assert_eq!(
+            b.text(),
+            "The world finished none of the 2 chunk borders before the next one. The measurement \
+             ended before the world finished the last border, so it is left out."
+        );
+    }
+
+    /// Frames every `step_ms` for `seconds`, queue from `queue(t in ms)`.
+    fn queue_run(seconds: f64, step_ms: u64, queue: impl Fn(u64) -> usize) -> Vec<FrameRecord> {
+        let end = (seconds * 1e3) as u64;
+        (0..)
+            .map(|i| i * step_ms)
+            .take_while(|&t| t <= end)
+            .map(|t| {
+                let mut r = frame(t, step_ms as f64);
+                r.world.queued_jobs = queue(t);
+                r
+            })
+            .collect()
+    }
+
+    #[test]
+    fn queue_trend_is_the_slope_of_the_queue() {
+        // A queue growing by 5 jobs every 10 ms grows by 500 per second.
+        let ramp = queue_run(2.0, 10, |t| (t / 10 * 5) as usize);
+        assert!(
+            (queue_slope(&ramp) - 500.0).abs() < 1e-6,
+            "{}",
+            queue_slope(&ramp)
+        );
+        // Flat queue.
+        assert!(queue_slope(&queue_run(2.0, 1, |_| 7)).abs() < 1e-9);
+        // Nothing to fit.
+        assert_eq!(queue_slope(&[]), 0.0);
+        assert_eq!(queue_slope(&[frame(5, 1.0)]), 0.0);
+        assert_eq!(queue_slope(&[frame(5, 1.0), frame(5, 1.0)]), 0.0);
+        assert_eq!(queue_slope(&[frame(5, 0.0), frame(6, 0.0)]), 0.0);
+    }
+
+    #[test]
+    fn queue_trend_does_not_depend_on_where_the_run_stops() {
+        // A border every 500 ms from 250 ms: 200 jobs queued for 15 ms, then none. The run stops
+        // 2 ms after the eighth border, with the queue full: last minus first would say
+        // +53 jobs/s, but the world keeps up.
+        let sawtooth = |t: u64| {
+            if t >= 250 && (t - 250) % 500 < 15 {
+                200
+            } else {
+                0
+            }
+        };
+        let records = queue_run(3.752, 1, sawtooth);
+        assert_eq!(records.last().map(|r| r.world.queued_jobs), Some(200));
+        let slope = queue_slope(&records);
+        assert!(slope.abs() < 1.0, "{slope}");
+        // Ending between two borders gives about the same.
+        let between = queue_slope(&queue_run(3.5, 1, sawtooth));
+        assert!(between.abs() < 1.0, "{between}");
+        // A world that falls behind (each border leaves 20 jobs more) still shows.
+        let behind = |t: u64| sawtooth(t) + 20 * ((t + 250) / 500) as usize;
+        let slope = queue_slope(&queue_run(3.752, 1, behind));
+        assert!((slope - 40.0).abs() < 5.0, "{slope}");
+    }
+
+    #[test]
+    fn queue_trend_weighs_frames_by_their_time() {
+        // First second: 1000 frames of 1 ms with an empty queue. Second second: 10 frames of
+        // 100 ms with 10 jobs. In time that is a step from 0 to 10 in the middle of 2 s (slope
+        // 7.5); counting frames instead would weigh the first second 100 times more.
+        let mut records = queue_run(0.999, 1, |_| 0);
+        records.extend((10..20u64).map(|i| {
+            let mut r = frame(i * 100, 100.0);
+            r.world.queued_jobs = 10;
+            r
+        }));
+        let slope = queue_slope(&records);
+        assert!((slope - 7.5).abs() < 0.5, "{slope}");
+    }
+
+    #[test]
+    fn worst_frames_say_whether_they_were_presented() {
+        let mut records: Vec<FrameRecord> = (0..10u64).map(|i| frame(i, 1.0)).collect();
+        records[3].frame_time = Duration::from_millis(5);
+        records[9].frame_time = Duration::from_millis(4);
+        records[9].presented = true;
+        let s = Summary::compute(&records).expect("records");
+        let text = markdown(&RunInfo::default(), &s);
+        assert!(text.contains("| 3 | 0.00 | 5.00 | no | no | 0 |"), "{text}");
+        assert!(
+            text.contains("| 9 | 0.01 | 4.00 | no | yes | 0 |"),
+            "{text}"
+        );
+        let data = json(&RunInfo::default(), &s);
+        let Json::Obj(fields) = data else {
+            panic!("an object")
+        };
+        let worst = fields.iter().find(|(k, _)| *k == "worst").map(|(_, v)| v);
+        let Some(Json::Arr(worst)) = worst else {
+            panic!("a worst array")
+        };
+        let presented: Vec<bool> = worst
+            .iter()
+            .map(|w| match w {
+                Json::Obj(f) => f
+                    .iter()
+                    .any(|(k, v)| *k == "presented" && *v == Json::Bool(true)),
+                _ => false,
+            })
+            .collect();
+        assert_eq!(presented, [false, true, false, false, false]);
     }
 
     #[test]
@@ -1167,6 +1392,11 @@ mod tests {
              true,\n    null\n  ],\n  \"e\": []\n}"
         );
         assert_eq!(Json::num(1.23456, 2), Json::Num(1.23));
+        let mut out = String::new();
+        Json::num(-0.004, 1).write(&mut out, 0);
+        assert_eq!(out, "0", "no negative zero");
+        assert_eq!(format!("{:+.1}", rounded(-0.04, 1)), "+0.0");
+        assert_eq!(rounded(-0.06, 1), -0.1);
     }
 
     #[test]
@@ -1195,6 +1425,12 @@ mod tests {
         let data = data.split("\n```").next().expect("closed block");
         assert!(data.starts_with("{\n  \"format\": 1,"));
         assert!(data.contains("\"catch_up_s\": 1.5"));
+        assert!(data.contains("\"presented\": false"));
+        assert!(text.contains("| frame | t s | ms | crossed | presented | generated |"));
+        assert!(
+            data.contains("\"cut_off\": 1"),
+            "the crossing at 1 s never settles"
+        );
         assert!(data.contains("\"over_144hz\": 2"));
         assert!(one_line(&info, &s).contains(">6.94ms=2 >16.7ms=1"));
     }
