@@ -4,14 +4,6 @@
 //! drawn with alpha test and no backface culling) and 1 translucent bucket. Same bytes on every
 //! render tier.
 //! No ECS, no GPU.
-// SKELETON: remove this attribute when the crate is fully implemented (owner: WP5).
-#![allow(
-    unused_variables,
-    unused_mut,
-    dead_code,
-    clippy::todo,
-    reason = "skeleton stubs"
-)]
 
 mod mesher;
 mod packed;

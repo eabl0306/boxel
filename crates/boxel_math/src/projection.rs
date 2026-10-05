@@ -10,5 +10,6 @@ pub fn perspective_infinite_reverse(fov_y_radians: f32, aspect: f32, near: f32) 
 
 /// Right-handed view matrix looking from `eye` along `dir` (`dir` need not be normalized).
 pub fn look_to(eye: Vec3, dir: Vec3, up: Vec3) -> Mat4 {
-    glam::camera::rh::view::look_to_mat4(eye, dir, up)
+    // glam expects a unit `dir` (a longer one scales the view's Y and Z axes).
+    glam::camera::rh::view::look_to_mat4(eye, dir.normalize(), up)
 }

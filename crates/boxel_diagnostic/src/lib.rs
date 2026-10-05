@@ -1,15 +1,7 @@
 //! Frame statistics and a shared, named diagnostics board that other crates fill
 //! (`"gpu"`, `"render"`, `"world"`) and [`LogDiagnosticsPlugin`] prints periodically.
-// SKELETON: remove this attribute when the crate is fully implemented (owner: WP1).
-#![allow(
-    unused_variables,
-    unused_mut,
-    dead_code,
-    clippy::todo,
-    reason = "skeleton stubs"
-)]
 
-use boxel_app::{App, Plugin};
+use boxel_app::{App, Last, Plugin, Time};
 use boxel_ecs::prelude::*;
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -52,16 +44,59 @@ impl DiagnosticsBoard {
 
 /// Inserts [`FrameStats`] and [`DiagnosticsBoard`]; updates `FrameStats` in `Last`.
 /// Requires `boxel_app::TimePlugin`.
+///
+/// Per frame: `frame += 1`, `last_frame_time = delta`, `avg_frame_time` is an exponential moving
+/// average (`avg * 0.9 + delta * 0.1`) seeded with the first non-zero delta (the first update of
+/// `Time` always has delta 0), `fps = 1 / avg` (0 while there is no average) and
+/// `worst_frame_time = max(worst, delta)` (reset by [`LogDiagnosticsPlugin`] after each log).
 #[derive(Default)]
 pub struct FrameStatsPlugin;
 
+/// The [`FrameStats`] update system (ordering anchor for the diagnostics logger).
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+struct FrameStatsSystems;
+
+/// EMA weight of the newest frame.
+const AVG_ALPHA: f64 = 0.1;
+
 impl Plugin for FrameStatsPlugin {
     fn build(&self, app: &mut App) {
-        todo!("WP1")
+        app.init_resource::<FrameStats>()
+            .init_resource::<DiagnosticsBoard>()
+            .add_systems(Last, update_frame_stats.in_set(FrameStatsSystems));
+    }
+
+    fn finish(&self, app: &mut App) {
+        assert!(
+            app.world().contains_resource::<Time>(),
+            "FrameStatsPlugin requires boxel_app::TimePlugin (the Time resource is missing)"
+        );
     }
 }
 
+fn update_frame_stats(time: Res<Time>, mut stats: ResMut<FrameStats>) {
+    let delta = time.delta();
+    stats.frame += 1;
+    stats.last_frame_time = delta;
+    stats.avg_frame_time = if stats.frame == 1 || stats.avg_frame_time.is_zero() {
+        delta
+    } else {
+        Duration::from_secs_f64(
+            stats.avg_frame_time.as_secs_f64() * (1.0 - AVG_ALPHA)
+                + delta.as_secs_f64() * AVG_ALPHA,
+        )
+    };
+    stats.fps = if stats.avg_frame_time.is_zero() {
+        0.0
+    } else {
+        1.0 / stats.avg_frame_time.as_secs_f32()
+    };
+    stats.worst_frame_time = stats.worst_frame_time.max(delta);
+}
+
 /// Logs `fps`, frame times and every [`DiagnosticsBoard`] line at info level every `interval`.
+/// Requires [`FrameStatsPlugin`]. The timer sums `Time::delta`, so it follows the app clock.
+/// Each log resets [`FrameStats::worst_frame_time`].
 #[derive(Clone, Debug)]
 pub struct LogDiagnosticsPlugin {
     /// Log period.
@@ -78,6 +113,41 @@ impl Default for LogDiagnosticsPlugin {
 
 impl Plugin for LogDiagnosticsPlugin {
     fn build(&self, app: &mut App) {
-        todo!("WP1")
+        let interval = self.interval;
+        let log_system = move |time: Res<Time>,
+                               mut since_last: Local<Duration>,
+                               mut stats: ResMut<FrameStats>,
+                               board: Res<DiagnosticsBoard>| {
+            *since_last += time.delta();
+            if *since_last >= interval {
+                *since_last = Duration::ZERO;
+                log_diagnostics(&mut stats, &board);
+            }
+        };
+        app.add_systems(Last, log_system.after(FrameStatsSystems));
     }
+
+    fn finish(&self, app: &mut App) {
+        assert!(
+            app.world().contains_resource::<FrameStats>()
+                && app.world().contains_resource::<DiagnosticsBoard>(),
+            "LogDiagnosticsPlugin requires FrameStatsPlugin (FrameStats/DiagnosticsBoard missing)"
+        );
+    }
+}
+
+/// Logs the frame line and every board line, then resets `worst_frame_time`.
+fn log_diagnostics(stats: &mut FrameStats, board: &DiagnosticsBoard) {
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    tracing::info!(
+        "fps={:.0} frame={:.2}ms avg={:.2}ms worst={:.2}ms",
+        stats.fps,
+        ms(stats.last_frame_time),
+        ms(stats.avg_frame_time),
+        ms(stats.worst_frame_time)
+    );
+    for (key, value) in board.iter() {
+        tracing::info!("{key}: {value}");
+    }
+    stats.worst_frame_time = Duration::ZERO;
 }

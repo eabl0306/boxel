@@ -14,14 +14,6 @@
 //! - [`LkgStore`]: persisted last-known-good / known-bad (adapter, tier) pairs. Crash detection
 //!   only: a pair becomes `Bad` after two unexplained process deaths during GPU bring-up.
 //! - Surface helpers ([`configure_surface`], [`acquire_frame`]) and readback ([`read_texture_rgba8`]).
-// SKELETON: remove this attribute when the crate is fully implemented (owner: WP3).
-#![allow(
-    unused_variables,
-    unused_mut,
-    dead_code,
-    clippy::todo,
-    reason = "skeleton stubs"
-)]
 
 mod caps;
 mod classify;
@@ -82,4 +74,14 @@ pub use wgpu;
 /// device is available (CI sets it on Linux with lavapipe/llvmpipe).
 pub fn gpu_tests_required() -> bool {
     std::env::var("BOXEL_REQUIRE_GPU").is_ok_and(|v| v == "1")
+}
+
+/// Joins a multi-line message (parser errors, wgpu errors) into one trimmed line for reports.
+pub(crate) fn one_line(message: &str) -> String {
+    message
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }

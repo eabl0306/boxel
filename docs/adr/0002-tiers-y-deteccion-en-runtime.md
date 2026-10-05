@@ -42,7 +42,7 @@ pedido de límites podía exigir más de lo que la clasificación había comprob
   `pending` ajeno de más de 30 s suma un strike (`suspect`, luego `bad` con dos); clave con huella
   del build; solo lectura con flags de depuración; apagado por defecto en builds de desarrollo.
 - Dispositivo perdido: superficie nueva siempre; primer fallo reintenta, segundo excluye el par y
-  suma un strike.
+  suma un strike (no si lo causó `DebugDestroyDevice`).
 - `panic = "abort"`: la instancia se crea primero sin GL y GL se intenta en una segunda instancia
   solo si hace falta.
 

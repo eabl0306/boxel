@@ -1,4 +1,5 @@
-use boxel_app::{App, Plugin};
+use crate::window::WindowFocused;
+use boxel_app::{App, Plugin, PreUpdate};
 use boxel_ecs::prelude::*;
 use boxel_math::Vec2;
 use std::collections::HashSet;
@@ -78,27 +79,31 @@ impl<T: Copy + Eq + Hash + Send + Sync + 'static> Default for ButtonInput<T> {
 impl<T: Copy + Eq + Hash + Send + Sync + 'static> ButtonInput<T> {
     /// Registers a press (`just_pressed` only if it was not already held).
     pub fn press(&mut self, input: T) {
-        todo!("WP2")
+        if self.pressed.insert(input) {
+            self.just_pressed.insert(input);
+        }
     }
     /// Registers a release (`just_released` only if it was held).
     pub fn release(&mut self, input: T) {
-        todo!("WP2")
+        if self.pressed.remove(&input) {
+            self.just_released.insert(input);
+        }
     }
     /// Currently held.
     pub fn pressed(&self, input: T) -> bool {
-        todo!("WP2")
+        self.pressed.contains(&input)
     }
     /// Pressed this frame.
     pub fn just_pressed(&self, input: T) -> bool {
-        todo!("WP2")
+        self.just_pressed.contains(&input)
     }
     /// Released this frame.
     pub fn just_released(&self, input: T) -> bool {
-        todo!("WP2")
+        self.just_released.contains(&input)
     }
     /// Any of `inputs` held.
     pub fn any_pressed(&self, inputs: impl IntoIterator<Item = T>) -> bool {
-        todo!("WP2")
+        inputs.into_iter().any(|input| self.pressed(input))
     }
     /// All held inputs.
     pub fn get_pressed(&self) -> impl Iterator<Item = &T> {
@@ -106,11 +111,13 @@ impl<T: Copy + Eq + Hash + Send + Sync + 'static> ButtonInput<T> {
     }
     /// Clears `just_pressed` and `just_released`.
     pub fn clear_just(&mut self) {
-        todo!("WP2")
+        self.just_pressed.clear();
+        self.just_released.clear();
     }
-    /// Releases everything (focus loss).
+    /// Releases everything (focus loss): every held input moves to `just_released`.
+    /// `just_pressed` is kept (an input pressed and released in the same frame reports both).
     pub fn reset_all(&mut self) {
-        todo!("WP2")
+        self.just_released.extend(self.pressed.drain());
     }
 }
 
@@ -137,7 +144,13 @@ pub fn keyboard_input_system(
     mut keys: ResMut<ButtonInput<KeyCode>>,
     mut events: MessageReader<KeyboardInput>,
 ) {
-    todo!("WP2")
+    keys.clear_just();
+    for event in events.read().filter(|event| !event.repeat) {
+        match event.state {
+            ButtonState::Pressed => keys.press(event.key),
+            ButtonState::Released => keys.release(event.key),
+        }
+    }
 }
 
 /// `clear_just`, then apply [`MouseButtonInput`] messages.
@@ -145,7 +158,13 @@ pub fn mouse_button_input_system(
     mut buttons: ResMut<ButtonInput<MouseButton>>,
     mut events: MessageReader<MouseButtonInput>,
 ) {
-    todo!("WP2")
+    buttons.clear_just();
+    for event in events.read() {
+        match event.state {
+            ButtonState::Pressed => buttons.press(event.button),
+            ButtonState::Released => buttons.release(event.button),
+        }
+    }
 }
 
 /// Reset, then sum [`MouseMotion`] messages.
@@ -153,7 +172,8 @@ pub fn accumulate_mouse_motion_system(
     mut acc: ResMut<AccumulatedMouseMotion>,
     mut events: MessageReader<MouseMotion>,
 ) {
-    todo!("WP2")
+    let delta = events.read().map(|event| event.delta).sum();
+    acc.set_if_neq(AccumulatedMouseMotion { delta });
 }
 
 /// Reset, then sum [`MouseWheel`] messages.
@@ -161,7 +181,24 @@ pub fn accumulate_mouse_scroll_system(
     mut acc: ResMut<AccumulatedMouseScroll>,
     mut events: MessageReader<MouseWheel>,
 ) {
-    todo!("WP2")
+    let delta = events.read().map(|event| event.delta).sum();
+    acc.set_if_neq(AccumulatedMouseScroll { delta });
+}
+
+/// Releases every key and mouse button when the window loses focus (the matching key-up
+/// events go to whichever window has focus now). Runs after the button systems so the
+/// releases show up as `just_released` this frame.
+fn release_on_focus_loss_system(
+    mut keys: ResMut<ButtonInput<KeyCode>>,
+    mut buttons: ResMut<ButtonInput<MouseButton>>,
+    mut events: MessageReader<WindowFocused>,
+) {
+    // Count every message (not `any`) so the reader's cursor consumes all of them.
+    let lost = events.read().filter(|focus| !focus.0).count();
+    if lost > 0 {
+        keys.reset_all();
+        buttons.reset_all();
+    }
 }
 
 /// Registers the input messages and resources and adds the four systems to `PreUpdate`
@@ -171,6 +208,28 @@ pub struct InputPlugin;
 
 impl Plugin for InputPlugin {
     fn build(&self, app: &mut App) {
-        todo!("WP2")
+        app.add_message::<KeyboardInput>()
+            .add_message::<MouseButtonInput>()
+            .add_message::<MouseMotion>()
+            .add_message::<MouseWheel>()
+            .add_message::<CursorMoved>()
+            .add_message::<WindowFocused>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<ButtonInput<MouseButton>>()
+            .init_resource::<AccumulatedMouseMotion>()
+            .init_resource::<AccumulatedMouseScroll>()
+            .add_systems(
+                PreUpdate,
+                (
+                    (
+                        (keyboard_input_system, mouse_button_input_system),
+                        release_on_focus_loss_system,
+                    )
+                        .chain(),
+                    accumulate_mouse_motion_system,
+                    accumulate_mouse_scroll_system,
+                )
+                    .in_set(InputSystems),
+            );
     }
 }

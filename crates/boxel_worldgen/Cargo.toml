@@ -13,6 +13,10 @@ boxel_voxel.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 
+# Criterion flags (--quick, --save-baseline) must not reach the lib unit-test harness.
+[lib]
+bench = false
+
 [[bench]]
 name = "terrain"
 harness = false

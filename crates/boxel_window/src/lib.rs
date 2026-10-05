@@ -9,15 +9,6 @@
 //!   opens the presentation gate [`WindowState::frame_ready`] (see [`winit_runner`]).
 //! - Window and device events become messages; [`InputPlugin`] folds them into [`ButtonInput`]
 //!   and accumulated mouse resources in `PreUpdate`.
-// SKELETON: remove this attribute when the crate is fully implemented (owner: WP2).
-#![allow(
-    unused_variables,
-    unused_mut,
-    dead_code,
-    clippy::todo,
-    reason = "skeleton stubs"
-)]
-
 mod input;
 mod runner;
 mod window;

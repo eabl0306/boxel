@@ -145,7 +145,12 @@ impl ChunkMap {
     }
     /// Block at a world position (None if the chunk is not Ready; air if Missing).
     pub fn block_at(&self, p: BlockPos) -> Option<BlockState> {
-        todo!("WP6")
+        let (chunk, local) = p.split();
+        match &self.slots.get(self.id_at(chunk)?)?.data {
+            DataState::Ready(d) => Some(d.get(local)),
+            DataState::Missing => Some(BlockState::AIR),
+            DataState::Queued | DataState::Generating => None,
+        }
     }
     /// Number of slots.
     pub fn len(&self) -> usize {
@@ -169,6 +174,28 @@ impl ChunkMap {
     /// Slot-based counters (`queued_jobs` and `in_flight` are 0 here; the `WorldStats` resource
     /// has them).
     pub fn stats(&self) -> WorldStats {
-        todo!("WP6")
+        let mut stats = WorldStats {
+            chunks: self.slots.len(),
+            ..WorldStats::default()
+        };
+        for slot in self.slots.values() {
+            match slot.data {
+                DataState::Ready(_) => stats.data_ready += 1,
+                DataState::Queued | DataState::Generating => stats.generating += 1,
+                DataState::Missing => {}
+            }
+            match slot.mesh {
+                MeshState::Ready { .. } => stats.mesh_ready += 1,
+                MeshState::Empty => stats.mesh_empty += 1,
+                MeshState::None | MeshState::Queued | MeshState::InFlight { .. } => {}
+            }
+            // One count per slot (`remesh_pending` is only set while a job is in flight).
+            if slot.remesh_pending
+                || matches!(slot.mesh, MeshState::Queued | MeshState::InFlight { .. })
+            {
+                stats.meshing += 1;
+            }
+        }
+        stats
     }
 }

@@ -17,6 +17,10 @@ thiserror.workspace = true
 proptest.workspace = true
 criterion.workspace = true
 
+# Criterion flags (--quick, --save-baseline) must not reach the lib unit-test harness.
+[lib]
+bench = false
+
 [[bench]]
 name = "paletted"
 harness = false

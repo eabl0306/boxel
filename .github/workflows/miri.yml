@@ -31,8 +31,10 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install "$MIRI_NIGHTLY" --profile minimal --component miri --no-self-update
-      - run: cargo +"$MIRI_NIGHTLY" miri test --locked -p boxel_ecs -p boxel_ptr -p boxel_tasks --lib
+      # Same flags and serial test threads as `just miri` (see the comment there): clock access,
+      # unjoined test threads, 4 emulated CPUs for the parallel query scheduling tests.
+      - run: cargo +"$MIRI_NIGHTLY" miri test --locked -p boxel_ecs -p boxel_ptr -p boxel_tasks --lib -- --test-threads=1
         working-directory: vendor
         env:
           RUSTFLAGS: -Zrandomize-layout
-          MIRIFLAGS: -Zmiri-disable-isolation
+          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-ignore-leaks -Zmiri-num-cpus=4

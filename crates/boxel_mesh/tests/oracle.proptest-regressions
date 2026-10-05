@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 22da962f8dddb5e489b686286f47884440b6098b19e3de60bcfba88ca5023a6c # shrinks to fill = Lattice, seed = 12365060244345380544, density = 0, palette = [6, 7]

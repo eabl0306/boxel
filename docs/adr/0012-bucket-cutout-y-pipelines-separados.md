@@ -25,7 +25,9 @@ congelarlo.
   se emite un `multi_draw_indexed_indirect_count` por lista. El bucket cutout solo pasa el test de
   frustum (mezcla caras de todas las direcciones).
 - El buffer de índices compartido cubre 98 304 quads (el bucket cutout puede juntar las seis caras
-  de un tablero de ajedrez de hojas).
+  de un tablero de ajedrez de hojas). Vale con un solo material cutout: con dos alternados un
+  bucket llega a 196 608 y los tiers dibujan solo los primeros 98 304 (riesgo abierto, ver
+  `informe-m0.md`).
 - M0 acepta la omisión de caras entre hojas vecinas (bgm): la copa se ve como una cáscara
   texturada, con las caras interiores visibles por los huecos gracias a `cull_mode: None`. Las
   caras interiores ("hojas elegantes") son una opción de M1 que no cambia el layout.

@@ -157,6 +157,67 @@ fn messages_written_in_update_reach_fixed_update() {
 }
 
 #[test]
+fn a_message_from_the_first_frame_reaches_fixed_update() {
+    // The first frame has a zero delta, like paused time: its message must still wait for the
+    // first fixed step (frame 5 with 5.2 ms frames and a 15.6 ms step).
+    let mut app = app_with_synthetic_time(std::time::Duration::from_micros(5_200));
+    app.add_message::<Ping>()
+        .init_resource::<Pings>()
+        .add_systems(
+            Update,
+            |mut w: MessageWriter<Ping>, mut p: ResMut<Pings>| {
+                if p.written == 0 {
+                    w.write(Ping);
+                    p.written = 1;
+                }
+            },
+        )
+        .add_systems(
+            FixedUpdate,
+            |mut r: MessageReader<Ping>, mut p: ResMut<Pings>| {
+                p.read_fixed += r.read().count() as u32;
+            },
+        );
+    for _ in 0..10 {
+        app.update();
+    }
+    assert_eq!(app.world().resource::<Pings>().read_fixed, 1);
+}
+
+#[test]
+fn paused_time_still_rotates_messages() {
+    let mut app = app_with_synthetic_time(std::time::Duration::from_micros(5_200));
+    app.world_mut()
+        .resource_mut::<Clock>()
+        .time
+        .set_max_delta(std::time::Duration::ZERO);
+    app.add_message::<Ping>()
+        .add_systems(Update, |mut w: MessageWriter<Ping>| {
+            w.write(Ping);
+        });
+    for _ in 0..100 {
+        app.update();
+    }
+    // Double buffer: this frame's message and the previous one, never the whole history.
+    let buffered = app.world().resource::<Messages<Ping>>().len();
+    assert!(buffered <= 2, "{buffered} messages kept while paused");
+}
+
+#[test]
+#[should_panic(expected = "must not be zero")]
+fn a_zero_timestep_is_rejected() {
+    FixedTime::default().set_timestep(std::time::Duration::ZERO);
+}
+
+#[test]
+fn a_rate_without_a_usable_step_is_rejected() {
+    for hz in [0.0, -1.0, f64::INFINITY, f64::NAN, 1e300] {
+        let result = std::panic::catch_unwind(|| FixedTime::from_hz(hz));
+        assert!(result.is_err(), "from_hz({hz}) accepted");
+    }
+}
+
+#[test]
 fn time_in_fixed_update_is_the_fixed_view() {
     let mut app = app_with_synthetic_time(std::time::Duration::from_millis(50));
     #[derive(Resource, Default)]

@@ -1,17 +1,13 @@
 //! Camera component, camera-relative view math ([`CameraView`]) and [`FlyCameraPlugin`].
-// SKELETON: remove this attribute when the crate is fully implemented (owner: WP2).
-#![allow(
-    unused_variables,
-    unused_mut,
-    dead_code,
-    clippy::todo,
-    reason = "skeleton stubs"
-)]
 
-use boxel_app::{App, Plugin};
+use boxel_app::{App, Plugin, Time, Update};
 use boxel_ecs::prelude::*;
-use boxel_math::{Frustum, IVec3, Mat4, Vec3};
+use boxel_math::{DVec3, Frustum, IVec3, Mat4, Quat, Vec2, Vec3};
 use boxel_transform::Transform;
+use boxel_window::{
+    AccumulatedMouseMotion, ButtonInput, CursorGrab, CursorOptions, KeyCode, MouseButton,
+};
+use std::f32::consts::{PI, TAU};
 
 /// Perspective camera. Uses `Transform` for placement. The renderer draws from the first
 /// active camera (M0 supports one).
@@ -126,12 +122,131 @@ impl Default for FlyCamera {
 pub struct FlyCameraSystems;
 
 /// Adds the fly camera systems to `Update` (in [`FlyCameraSystems`]). Requires `InputPlugin`.
+///
+/// Also needs `Time` (`TimePlugin`). Inserts the default `CursorOptions` (free, visible) if no
+/// `WindowPlugin` did, so the controller also runs headless. The systems write `Transform`:
+/// order systems of other plugins that read the camera's `Transform` in `Update` against
+/// [`FlyCameraSystems`] (for example `FlyCameraSystems.before(WorldSystems::Interest)`).
 #[derive(Default)]
 pub struct FlyCameraPlugin;
 
 impl Plugin for FlyCameraPlugin {
     fn build(&self, app: &mut App) {
-        todo!("WP2")
+        if !app.world().contains_resource::<CursorOptions>() {
+            app.insert_resource(CursorOptions {
+                grab: CursorGrab::None,
+                visible: true,
+            });
+        }
+        app.add_systems(
+            Update,
+            (
+                fly_camera_grab_system,
+                fly_camera_look_system,
+                fly_camera_move_system,
+            )
+                .chain()
+                .in_set(FlyCameraSystems),
+        );
+    }
+}
+
+/// Pitch limit (89 degrees): looking straight up or down would flip the view.
+const MAX_PITCH: f32 = 89.0_f32.to_radians();
+
+/// Left click grabs the cursor (locked, hidden), Escape releases it. Only while an enabled
+/// fly camera exists.
+fn fly_camera_grab_system(
+    cameras: Query<&FlyCamera, With<Transform>>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut cursor: ResMut<CursorOptions>,
+) {
+    if !cameras.iter().any(|camera| camera.enabled) {
+        return;
+    }
+    if keys.just_pressed(KeyCode::Escape) {
+        cursor.set_if_neq(CursorOptions {
+            grab: CursorGrab::None,
+            visible: true,
+        });
+    } else if buttons.just_pressed(MouseButton::Left) {
+        cursor.set_if_neq(CursorOptions {
+            grab: CursorGrab::Locked,
+            visible: false,
+        });
+    }
+}
+
+/// Mouse look while the cursor is locked: yaw around +Y, pitch around the local +X, clamped.
+fn fly_camera_look_system(
+    cursor: Res<CursorOptions>,
+    motion: Res<AccumulatedMouseMotion>,
+    mut cameras: Query<(&mut FlyCamera, &mut Transform)>,
+) {
+    if cursor.grab != CursorGrab::Locked || motion.delta == Vec2::ZERO {
+        return;
+    }
+    for (mut camera, mut transform) in &mut cameras {
+        if !camera.enabled {
+            continue;
+        }
+        let yaw = wrap_angle(camera.yaw - motion.delta.x * camera.sensitivity);
+        let pitch =
+            (camera.pitch - motion.delta.y * camera.sensitivity).clamp(-MAX_PITCH, MAX_PITCH);
+        camera.yaw = yaw;
+        camera.pitch = pitch;
+        transform.rotation = Quat::from_rotation_y(yaw) * Quat::from_rotation_x(pitch);
+    }
+}
+
+/// WASD on the horizontal plane of the yaw, Space up, `ShiftLeft` down, `ControlLeft` boost.
+fn fly_camera_move_system(
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut cameras: Query<(&FlyCamera, &mut Transform)>,
+) {
+    let dt = time.delta().as_secs_f64();
+    let forward = axis(&keys, KeyCode::KeyW, KeyCode::KeyS);
+    let right = axis(&keys, KeyCode::KeyD, KeyCode::KeyA);
+    let up = axis(&keys, KeyCode::Space, KeyCode::ShiftLeft);
+    if dt == 0.0 || (forward == 0.0 && right == 0.0 && up == 0.0) {
+        return;
+    }
+    let boosting = keys.pressed(KeyCode::ControlLeft);
+    for (camera, mut transform) in &mut cameras {
+        if !camera.enabled {
+            continue;
+        }
+        let (sin, cos) = f64::from(camera.yaw).sin_cos();
+        // Rotation of -Z and +X around +Y by the yaw.
+        let forward_dir = DVec3::new(-sin, 0.0, -cos);
+        let right_dir = DVec3::new(cos, 0.0, -sin);
+        let dir = forward_dir * forward + right_dir * right + DVec3::Y * up;
+        let mut speed = f64::from(camera.speed);
+        if boosting {
+            speed *= f64::from(camera.boost);
+        }
+        transform.translation += dir.normalize_or_zero() * speed * dt;
+    }
+}
+
+/// +1 if only `positive` is held, -1 if only `negative` is, else 0.
+fn axis(keys: &ButtonInput<KeyCode>, positive: KeyCode, negative: KeyCode) -> f64 {
+    match (keys.pressed(positive), keys.pressed(negative)) {
+        (true, false) => 1.0,
+        (false, true) => -1.0,
+        _ => 0.0,
+    }
+}
+
+/// Keeps an angle in [-PI, PI] so `f32` precision does not degrade after many turns (values
+/// already in range are returned unchanged).
+fn wrap_angle(angle: f32) -> f32 {
+    if (-PI..=PI).contains(&angle) {
+        angle
+    } else {
+        (angle + PI).rem_euclid(TAU) - PI
     }
 }
 

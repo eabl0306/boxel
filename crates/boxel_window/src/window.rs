@@ -1,9 +1,9 @@
-use crate::runner::{UpdateMode, winit_runner};
+use crate::runner::{RunnerSettings, UpdateMode, winit_runner};
 use boxel_app::{App, Plugin};
 use boxel_ecs::prelude::*;
 use boxel_math::UVec2;
 use std::sync::Arc;
-use winit::event_loop::OwnedDisplayHandle;
+use winit::event_loop::{EventLoop, OwnedDisplayHandle};
 use winit::window::{Window, WindowId};
 
 /// Fullscreen policy.
@@ -68,8 +68,30 @@ impl Default for WindowPlugin {
 
 impl Plugin for WindowPlugin {
     fn build(&self, app: &mut App) {
-        let _ = winit_runner;
-        todo!("WP2")
+        let event_loop = EventLoop::new().unwrap_or_else(|err| {
+            panic!(
+                "boxel_window: cannot create the winit event loop: {err}. WindowPlugin needs a \
+                 display (Wayland or X11 on Linux), must be added from the main thread and only \
+                 once per process"
+            )
+        });
+        app.insert_resource(DisplayHandle(event_loop.owned_display_handle()))
+            .insert_resource(self.primary.clone())
+            .insert_resource(WindowState::default())
+            .insert_resource(CursorOptions {
+                grab: CursorGrab::None,
+                visible: true,
+            })
+            .insert_resource(RunnerSettings {
+                exit_on_close: self.exit_on_close,
+                update_mode: self.update_mode,
+            })
+            .add_message::<WindowCreated>()
+            .add_message::<WindowResized>()
+            .add_message::<WindowCloseRequested>()
+            .add_message::<WindowFocused>()
+            .add_message::<WindowOccluded>()
+            .set_runner(move |app| winit_runner(app, event_loop));
     }
 }
 
@@ -100,16 +122,22 @@ pub struct PrimaryWindow {
 /// Live window state, maintained by the runner.
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq)]
 pub struct WindowState {
-    /// Size in physical pixels (0 while minimized on some platforms).
+    /// Size in physical pixels: the last non-zero size (a 0x0 size, reported while minimized
+    /// on some platforms, is ignored, so this is never 0 once the window exists). On Wayland
+    /// it also follows `Window::request_inner_size`, which winit applies without a `Resized`
+    /// event (the runner polls `Window::inner_size` there).
     pub physical_size: UVec2,
     /// DPI scale factor.
     pub scale_factor: f64,
     /// Keyboard focus.
     pub focused: bool,
-    /// Not visible. True when winit reported `Occluded(true)` (macOS, X11) OR when a redraw was
-    /// requested and no `RedrawRequested` arrived for more than 100 ms (Wayland and Windows,
-    /// where winit 0.30 never reports occlusion: a hidden Wayland surface gets no frame
-    /// callbacks). The runner paces updates at 30 Hz while true.
+    /// Not visible. True when winit reported `Occluded(true)` (macOS; X11 when the window is
+    /// fully covered), OR when the window is minimized on X11 (polled with
+    /// `Window::is_minimized` at most every 100 ms: X11 sends no `Occluded` on minimize and
+    /// delivers `RedrawRequested` at once), OR when a redraw was requested and no
+    /// `RedrawRequested` arrived for more than 100 ms (Wayland and Windows, where winit 0.30
+    /// never reports occlusion: a hidden Wayland surface gets no frame callbacks). The runner
+    /// paces updates at 30 Hz while true.
     pub occluded: bool,
     /// Presentation gate. The runner sets it when winit delivers `RedrawRequested` (on Wayland
     /// only after the compositor's frame callback for the last presented frame). A renderer
@@ -146,6 +174,9 @@ pub enum CursorGrab {
 pub struct WindowCreated;
 
 /// The surface size changed (physical pixels, never 0x0: minimization is not reported here).
+/// Written only when the size really differs from `WindowState::physical_size`; a size the
+/// compositor overrides before the runner sees it (for example a `request_inner_size` during
+/// the initial Wayland configure sequence) produces no message.
 #[derive(Message, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowResized {
     /// Width in physical pixels.
@@ -162,6 +193,7 @@ pub struct WindowCloseRequested;
 #[derive(Message, Clone, Copy, Debug)]
 pub struct WindowFocused(pub bool);
 
-/// `WindowState::occluded` changed (winit occlusion or the redraw watchdog).
+/// `WindowState::occluded` changed (winit occlusion, the X11 minimized poll or the redraw
+/// watchdog).
 #[derive(Message, Clone, Copy, Debug)]
 pub struct WindowOccluded(pub bool);

@@ -1,8 +1,11 @@
 // Tier High: GPU frustum + per-face-bucket culling. Writes two compacted lists of
 // DrawIndexedIndirectArgs with matching DrawRefs and atomic counts for
 // multi_draw_indexed_indirect_count: opaque face buckets at [0, counts.y) and the cutout bucket
-// at [counts.y, counts.y + counts.z). The *_count path is NOT validated by wgpu: never write past
-// a list's capacity (capacities are <= 65535 = Vulkan's minimum maxDrawIndirectCount).
+// at [counts.y, counts.y + counts.z). The *_count path is NOT validated by wgpu, so every value
+// stays in range: index_count <= 6 * MAX_QUADS_PER_BUCKET (the shared index buffer), no write past
+// a list's capacity, and each stored count ends <= its capacity (<= 65535 = Vulkan's minimum
+// maxDrawIndirectCount): a bucket that finds its list full undoes its increment. Those buckets are
+// dropped; which ones depends on GPU scheduling, not on distance (M3 segments the lists).
 struct DrawArgs { index_count: u32, instance_count: u32, first_index: u32, base_vertex: i32, first_instance: u32 };
 
 @group(0) @binding(0) var<uniform> view: View;
@@ -10,6 +13,9 @@ struct DrawArgs { index_count: u32, instance_count: u32, first_index: u32, base_
 @group(0) @binding(2) var<storage, read_write> draw_args: array<DrawArgs>;
 @group(0) @binding(3) var<storage, read_write> draw_refs: array<vec2<u32>>;
 @group(0) @binding(4) var<storage, read_write> draw_counts: array<atomic<u32>, 2>; // [0] opaque, [1] cutout
+
+// Quads covered by the shared index buffer (boxel_mesh::MAX_QUADS_PER_BUCKET, checked by a naga test).
+const MAX_QUADS_PER_BUCKET: u32 = 98304u;
 
 fn in_frustum(mn: vec3<f32>, mx: vec3<f32>) -> bool {
   for (var k = 0u; k < 6u; k++) {
@@ -47,8 +53,10 @@ fn cull_chunks(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (n > 0u && bucket_visible(f, mn, mx, view.camera_rel.xyz)) {
       let s = atomicAdd(&draw_counts[0], 1u);
       if (s < view.counts.y) {
-        draw_args[s] = DrawArgs(n * 6u, 1u, 0u, 0, s);
+        draw_args[s] = DrawArgs(min(n, MAX_QUADS_PER_BUCKET) * 6u, 1u, 0u, 0, s);
         draw_refs[s] = vec2(slot, start);
+      } else {
+        atomicSub(&draw_counts[0], 1u);
       }
     }
     start += n;
@@ -59,8 +67,10 @@ fn cull_chunks(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = atomicAdd(&draw_counts[1], 1u);
     if (c < view.counts.z) {
       let s = view.counts.y + c;
-      draw_args[s] = DrawArgs(nc * 6u, 1u, 0u, 0, s);
+      draw_args[s] = DrawArgs(min(nc, MAX_QUADS_PER_BUCKET) * 6u, 1u, 0u, 0, s);
       draw_refs[s] = vec2(slot, start);
+    } else {
+      atomicSub(&draw_counts[1], 1u);
     }
   }
 }

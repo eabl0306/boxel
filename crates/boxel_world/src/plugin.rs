@@ -1,15 +1,20 @@
-use crate::ChunkId;
 use crate::jobs::{JobExecutor, TaskPoolExecutor};
-use boxel_app::{App, Plugin};
+use crate::streaming::{Ctx, ViewerChunks, WorldJobs};
+use crate::{ChunkId, ChunkMap, WorldStats};
+use boxel_app::{App, Last, Plugin, Update};
+use boxel_diagnostic::DiagnosticsBoard;
 use boxel_ecs::prelude::*;
 use boxel_mesh::{ChunkMesh, MaterialTable};
-use boxel_voxel::{BlockPos, BlockRegistry, BlockState, ChunkKey, DimensionId};
+use boxel_tasks::{AsyncComputeTaskPool, TaskPool};
+use boxel_transform::Transform;
+use boxel_voxel::{BlockPos, BlockRegistry, BlockState, ChunkKey, ChunkPos, DimensionId};
 use boxel_worldgen::{TerrainGenerator, WorldGenerator};
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Streams chunks around this entity (needs `Transform`). `radius` is the horizontal mesh
-/// radius in chunks (circle in xz); data is loaded one chunk further; vertically the generator's
+/// radius in chunks (circle in xz); data is loaded one chunk further (plus every column next to a
+/// mesh column, so each mesh has its 26 neighbors); vertically the generator's
 /// `vertical_chunks()` range is used.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChunkViewer {
@@ -145,7 +150,7 @@ pub struct WorldPlugin {
 
 impl Default for WorldPlugin {
     /// `TerrainGenerator::default()`, `BlockRegistry::default_blocks()`, default settings,
-    /// `TaskPoolExecutor`. (Calls WP4 code: do not use in tests before integration.)
+    /// `TaskPoolExecutor`.
     fn default() -> Self {
         Self {
             generator: Arc::new(TerrainGenerator::default()),
@@ -158,6 +163,164 @@ impl Default for WorldPlugin {
 
 impl Plugin for WorldPlugin {
     fn build(&self, app: &mut App) {
-        todo!("WP6")
+        let content = WorldContent {
+            generator: Arc::clone(&self.generator),
+            registry: Arc::clone(&self.registry),
+            materials: Arc::new(MaterialTable::from_registry(&self.registry)),
+        };
+        let max_in_flight = resolve_max_jobs_in_flight(self.settings.max_jobs_in_flight);
+        app.insert_resource(self.settings.clone())
+            .insert_resource(content)
+            .init_resource::<ChunkMap>()
+            .init_resource::<EditQueue>()
+            .init_resource::<WorldStats>()
+            .init_resource::<ViewerChunks>()
+            .insert_resource(WorldJobs::new(max_in_flight, Arc::clone(&self.executor)))
+            .add_message::<ChunkMeshEvent>()
+            .configure_sets(
+                Update,
+                (
+                    WorldSystems::Interest,
+                    WorldSystems::Edits,
+                    WorldSystems::Dispatch,
+                    WorldSystems::Collect,
+                )
+                    .chain(),
+            )
+            .add_systems(
+                Update,
+                (
+                    // Reads viewer transforms only (into a private resource). Its order relative
+                    // to systems that move viewers does not matter (interest lags at most one
+                    // frame), and naming them would tie this crate to camera/gameplay crates.
+                    (track_viewers.ambiguous_with_all(), update_interest)
+                        .chain()
+                        .in_set(WorldSystems::Interest),
+                    apply_edits.in_set(WorldSystems::Edits),
+                    dispatch_jobs.in_set(WorldSystems::Dispatch),
+                    collect_results.in_set(WorldSystems::Collect),
+                ),
+            )
+            .add_systems(Last, publish_stats);
+    }
+}
+
+/// `0` means `2 x` the async compute pool's threads (initializing a default pool if
+/// `TaskPoolPlugin` did not run first).
+fn resolve_max_jobs_in_flight(requested: usize) -> usize {
+    if requested > 0 {
+        return requested;
+    }
+    let threads = AsyncComputeTaskPool::get_or_init(TaskPool::default).thread_num();
+    2 * threads.max(1)
+}
+
+/// Viewer chunk + radius of every `ChunkViewer`, sorted (only written when it changes).
+fn track_viewers(viewers: Query<(&Transform, &ChunkViewer)>, mut chunks: ResMut<ViewerChunks>) {
+    let mut now: Vec<_> = viewers
+        .iter()
+        .map(|(transform, viewer)| {
+            let block = BlockPos::from_world(transform.translation);
+            (ChunkPos::containing(block), viewer.radius)
+        })
+        .collect();
+    now.sort_unstable();
+    if chunks.0 != now {
+        chunks.0 = now;
+    }
+}
+
+fn update_interest(
+    mut map: ResMut<ChunkMap>,
+    mut jobs: ResMut<WorldJobs>,
+    content: Res<WorldContent>,
+    settings: Res<WorldSettings>,
+    viewers: Res<ViewerChunks>,
+    mut writer: MessageWriter<ChunkMeshEvent>,
+) {
+    // Early-outs keep idle frames from touching (and change-marking) the map.
+    if !jobs.viewers_changed(&viewers.0) {
+        return;
+    }
+    let mut events = Vec::new();
+    let mut cx = Ctx::new(&mut map, &content, &mut events);
+    jobs.update_interest(&mut cx, &settings, &viewers.0);
+    writer.write_batch(events);
+}
+
+fn apply_edits(
+    mut queue: ResMut<EditQueue>,
+    mut map: ResMut<ChunkMap>,
+    mut jobs: ResMut<WorldJobs>,
+    content: Res<WorldContent>,
+    mut writer: MessageWriter<ChunkMeshEvent>,
+) {
+    if queue.is_empty() {
+        return;
+    }
+    let edits = std::mem::take(&mut queue.edits);
+    let mut events = Vec::new();
+    let mut cx = Ctx::new(&mut map, &content, &mut events);
+    jobs.apply_edits(&mut cx, edits);
+    writer.write_batch(events);
+}
+
+fn dispatch_jobs(
+    mut map: ResMut<ChunkMap>,
+    mut jobs: ResMut<WorldJobs>,
+    content: Res<WorldContent>,
+    mut writer: MessageWriter<ChunkMeshEvent>,
+) {
+    if jobs.scheduler.queued() == 0 {
+        return;
+    }
+    let mut events = Vec::new();
+    let mut cx = Ctx::new(&mut map, &content, &mut events);
+    jobs.dispatch(&mut cx);
+    writer.write_batch(events);
+}
+
+fn collect_results(
+    mut map: ResMut<ChunkMap>,
+    mut jobs: ResMut<WorldJobs>,
+    content: Res<WorldContent>,
+    settings: Res<WorldSettings>,
+    mut writer: MessageWriter<ChunkMeshEvent>,
+) {
+    if !jobs.has_results() {
+        return;
+    }
+    let mut events = Vec::new();
+    let mut cx = Ctx::new(&mut map, &content, &mut events);
+    jobs.collect(&mut cx, &settings);
+    writer.write_batch(events);
+}
+
+/// Refreshes `WorldStats` (slot counts + scheduler counts) and the `"world"` board line.
+fn publish_stats(
+    map: Res<ChunkMap>,
+    jobs: Res<WorldJobs>,
+    mut stats: ResMut<WorldStats>,
+    board: Option<ResMut<DiagnosticsBoard>>,
+) {
+    let mut now = map.stats();
+    now.queued_jobs = jobs.scheduler.queued();
+    now.in_flight = jobs.scheduler.in_flight();
+    stats.set_if_neq(now);
+    if let Some(mut board) = board {
+        board.set(
+            "world",
+            format!(
+                "chunks={} ready={} meshed={} empty={} meshing={} queued={} in_flight={} failed={}",
+                now.chunks,
+                now.data_ready,
+                now.mesh_ready,
+                now.mesh_empty,
+                now.meshing,
+                now.queued_jobs,
+                now.in_flight,
+                jobs.failed
+            ),
+        );
     }
 }

@@ -12,7 +12,7 @@ fn readback_and_error_scopes() {
         d
     });
     let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
-    // Honor WGPU_ADAPTER_NAME (case-insensitive substring), like every GPU test (spec section 4).
+    // Honor WGPU_ADAPTER_NAME (case-insensitive substring), like every GPU test.
     let wanted = std::env::var("WGPU_ADAPTER_NAME")
         .ok()
         .map(|n| n.to_lowercase())

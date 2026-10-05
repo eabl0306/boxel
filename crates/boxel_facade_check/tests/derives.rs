@@ -1,4 +1,4 @@
-//! Every derive a user writes, expanded through `::boxel::ecs` (contract test, owner WP0).
+//! Every derive a user writes, expanded through `::boxel::ecs` (contract test).
 use boxel::ecs::query::{QueryData, QueryFilter};
 use boxel::ecs::schedule::ScheduleLabel;
 use boxel::ecs::system::SystemParam;

@@ -1,4 +1,5 @@
 //! Where chunk jobs run.
+use boxel_tasks::{AsyncComputeTaskPool, TaskPool};
 
 /// Runs boxed jobs somewhere. Results come back through channels owned by the world.
 ///
@@ -21,7 +22,9 @@ pub struct TaskPoolExecutor;
 
 impl JobExecutor for TaskPoolExecutor {
     fn spawn(&self, job: Box<dyn FnOnce() + Send + 'static>) {
-        todo!("WP6")
+        AsyncComputeTaskPool::get_or_init(TaskPool::default)
+            .spawn(async move { job() })
+            .detach();
     }
 }
 
@@ -32,5 +35,41 @@ pub struct InlineExecutor;
 impl JobExecutor for InlineExecutor {
     fn spawn(&self, job: Box<dyn FnOnce() + Send + 'static>) {
         job();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn inline_executor_runs_immediately() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        InlineExecutor.spawn(Box::new(move || tx.send(7).expect("receiver alive")));
+        assert_eq!(rx.try_recv(), Ok(7));
+    }
+
+    #[test]
+    fn task_pool_executor_runs_jobs_off_thread() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let caller = std::thread::current().id();
+        for i in 0..8 {
+            let tx = tx.clone();
+            TaskPoolExecutor.spawn(Box::new(move || {
+                tx.send((i, std::thread::current().id()))
+                    .expect("receiver alive");
+            }));
+        }
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            let (i, thread) = rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("job result within 30 s");
+            assert_ne!(thread, caller, "jobs run on the async compute pool");
+            seen.push(i);
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, (0..8).collect::<Vec<_>>());
     }
 }

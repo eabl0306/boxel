@@ -32,7 +32,7 @@ insumos de diseño no pueden vivir solo ahí.
   todos los backends de escritorio en `cargo test`.
 - Documentos técnicos en español; código, identificadores y rustdoc en inglés.
 - Implementación del M0 en paralelo: copia privada del repositorio por paquete, target dir semilla
-  compartido, compuerta de propiedad (`.scaffold/`, se borra al cerrar M0).
+  compartido, compuerta de propiedad (`.scaffold/`, borrada al cerrar M0).
 
 ## Consecuencias
 

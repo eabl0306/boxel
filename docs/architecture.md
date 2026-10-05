@@ -2,9 +2,9 @@
 
 Documento técnico de referencia. Fecha: 2026-10-05. Estado: aprobado para el milestone M0
 (revisión final, después de tres revisiones adversariales del borrador v1).
-Las decisiones puntuales están en `docs/adr/` (0001 a 0012). Durante M0, la especificación para
-los agentes implementadores (en inglés) vive en `.scaffold/design/SCAFFOLD_SPEC.md`; se borra al
-cerrar M0 y este documento queda como referencia.
+Las decisiones puntuales están en `docs/adr/` (0001 a 0012). Durante M0 hubo además una
+especificación para los agentes implementadores (en inglés, en `.scaffold/`), borrada al cerrar M0;
+este documento queda como referencia.
 
 Convención: "medido" significa probado en la máquina de desarrollo (Ubuntu 26.04, Wayland,
 RTX 5050 Laptop driver 595.91 + Radeon 780M con RADV/radeonsi Mesa 26.0.8, lavapipe/llvmpipe,
@@ -200,8 +200,8 @@ tiempo de GPU que en Vulkan. Por eso GL nunca usa la ruta High.
 
 ### 5.2 Algoritmo de detección y selección (paso a paso)
 
-Lo ejecuta `boxel_render` en el schedule `Render` (sistema exclusivo `RenderSystems::Setup`, hilo
-principal) cuando existe la ventana, y `gpu_info` en modo headless. Bloqueante (pollster); dura
+Lo ejecuta `boxel_render` en el schedule `Render` (sistema `RenderSystems::Setup`, en el hilo
+principal: `Render` usa el ejecutor de un solo hilo) cuando existe la ventana, y `gpu_info` en modo headless. Bloqueante (pollster); dura
 50 ms a 1 s según si el dGPU estaba dormido (~1.05 s medidos al despertar la NVIDIA). Todo corre
 en un solo hilo porque los error scopes de wgpu 30 son por hilo (`ErrorScopeGuard` no es `Send`).
 
@@ -381,7 +381,8 @@ modificación del ejecutable, sin build script), pid, estado previo, fecha y mot
 - Al abrir el archivo: un `pending` de otro pid con más de 30 s (menos puede ser otra instancia
   arrancando en paralelo) suma un strike: el primero deja el par en `suspect` (se sigue probando,
   con -500 de puntaje), el segundo en `bad` (se salta).
-- Una segunda pérdida de dispositivo en la misma sesión también suma un strike.
+- Una segunda pérdida de dispositivo en la misma sesión también suma un strike (no si la causó
+  `DebugDestroyDevice`).
 - Una entrada solo aplica si coinciden adaptador, `driver_info`, versiones y build: actualizar el
   driver o recompilar le da otra oportunidad al par.
 - Con flags de depuración activos (`--validation`, `WGPU_VALIDATION...`) el LKG es de solo
@@ -403,8 +404,8 @@ adquiere nada si el dispositivo está perdido. En el siguiente `Setup`:
 1. Se registra el motivo y se emite al log.
 2. Se sueltan, en este orden: renderer, superficie, dispositivo y cola. La instancia se conserva.
 3. Política: la primera pérdida reintenta el mismo par (TDR transitorio). Una segunda pérdida en
-   la sesión excluye el par (`Exclusion`) y suma un strike en el LKG; la selección baja de tier o
-   cambia de adaptador.
+   la sesión excluye el par (`Exclusion`) y suma un strike en el LKG (salvo si la causó
+   `DebugDestroyDevice`); la selección baja de tier o cambia de adaptador.
 4. El renderer se reconstruye desde el estado del ECS: `ChunkMap::ready_meshes()` conserva todas
    las mallas en CPU, así que cambiar de tier o de dispositivo es una recarga, no un reinicio.
 
@@ -414,7 +415,8 @@ viva por ventana).
 
 Para verificarlo existe el mensaje `DebugDestroyDevice` (`voxel_world --simulate-device-loss N`),
 que llama `device.destroy()` (verificado en todos los adaptadores de la máquina: llega el callback
-con `DeviceLostReason::Destroyed` y se puede crear otro dispositivo en el mismo adaptador). La
+con `DeviceLostReason::Destroyed` y se puede crear otro dispositivo en el mismo adaptador). Esa
+pérdida nunca suma strike en el LKG: una prueba no cambia la GPU de la próxima ejecución. La
 recuperación cambiando de backend sobre la misma ventana no se pudo ejercitar (riesgo abierto).
 Si el presupuesto del M0 se agota, la re-selección en caliente es lo primero que se recorta: queda
 el aviso, `GpuFailed` y salida limpia con código 2.
@@ -424,7 +426,7 @@ el aviso, `GpuFailed` y salida limpia con código 2.
 | SO | Backends compilados | Instancia por defecto | Notas |
 |---|---|---|---|
 | Linux/BSD | vulkan, gles | `VULKAN | GL` | GL sigue al EGL del display: en Wayland/XWayland la GPU del compositor. Hybrid: `--power` elige NVIDIA o AMD en Vulkan; GL no puede elegir la dGPU sin variables PRIME |
-| Windows | vulkan, dx12, gles | `VULKAN | DX12` | GL solo con `--backend gl`. DX12 limitado a Mid hasta verificar High en hardware real (`BOXEL_DX12_HIGH=1` para experimentar). Compilador de shaders: `Dx12Compiler::Auto` usa `dxcompiler.dll` si está en el PATH y si no FXC (lento, sin mantenimiento); la CI de Windows mide el tiempo del smoke test y M1 decide entre `static-dxc` y distribuir la DLL |
+| Windows | vulkan, dx12, gles | `VULKAN | DX12` | GL solo con `--backend gl`. DX12 limitado a Mid hasta verificar High en hardware real (para experimentar: `BOXEL_DX12_HIGH=1` en `gpu_info`; en apps, `RenderSettings::tier_policy`). Compilador de shaders: `Dx12Compiler::Auto` usa `dxcompiler.dll` si está en el PATH y si no FXC (lento, sin mantenimiento); la CI de Windows mide el tiempo del smoke test y M1 decide entre `static-dxc` y distribuir la DLL |
 | macOS | metal | `METAL` | Metal no tiene MDI-count en wgpu: tope Mid. El módulo `hal` no existe en Apple (wgpu-hal no compila Vulkan ahí sin `vulkan-portability`) |
 
 ### 5.11 Política de `VALIDATION_INDIRECT_CALL` y límites del multi-draw
@@ -441,16 +443,20 @@ wgpu 30 activa este flag por defecto incluso en release (`from_build_config` dev
    indirecta es la variante `*_count`, que wgpu no valida de todos modos.
 4. Cuesta CPU: MDI de 16k: 0.547 ms con el flag contra 0.076 ms sin él.
 
-Contrapartida: el shader de culling debe generar argumentos válidos. Lo garantiza por
-construcción: `first_index = 0`, `base_vertex = 0`, `instance_count = 1`, `index_count <=
-6 * 98304` (cubierto por el índice compartido), `first_instance` dentro de la lista, y nunca
-escribe más allá de la capacidad de cada lista.
+Contrapartida: el shader de culling debe generar argumentos válidos. Lo garantiza así:
+`first_index = 0`, `base_vertex = 0`, `instance_count = 1`, `index_count` recortado con `min` a
+`6 * 98304` (lo que cubre el índice compartido; ver §9), `first_instance` dentro de la lista, nunca
+escribe más allá de la capacidad de cada lista y el contador guardado nunca la pasa (un bucket que
+encuentra la lista llena deshace su `atomicAdd`).
 
 Límite adicional (verificado en wgpu-hal 30.0.1): en la variante `*_count`, wgpu-hal pasa
 `max_count` a `vkCmdDrawIndexedIndirectCount` sin compararlo con `maxDrawIndirectCount`, cuyo
-mínimo en Vulkan es 65535 (los drivers de escritorio reportan 2³² - 1). boxel limita cada lista y
-cada llamada a 65535 draws; si hay más buckets visibles que eso (no pasa con la distancia de vista
-por defecto), los más lejanos se omiten y se avisa una vez. M3 segmenta las listas.
+mínimo en Vulkan es 65535 (los drivers de escritorio reportan 2³² - 1). boxel limita cada lista,
+cada llamada y cada contador a 65535 draws. Si hay más buckets visibles (no pasa con la
+configuración por defecto), High omite algunos sin orden (no los más lejanos: pueden faltar chunks
+cercanos), Mid y Low dibujan todos, y se avisa una vez. M3 segmenta las listas. Ese mínimo vale
+solo si el dispositivo tiene `multiDrawIndirect` (si no, el límite es 1), y wgpu ofrece el
+multi-draw con count aunque no lo tenga (riesgo abierto; las GPUs de escritorio lo tienen).
 
 ### 5.12 `catch_unwind` en la creación de la instancia
 
@@ -606,7 +612,8 @@ Estados ortogonales por slot:
 - `neighbors_ready`: máscara de 26 bits; `epoch`: contador que sube cuando cambia el borde de un
   vecino; `cancel`: `Arc<AtomicBool>` para cancelación cooperativa.
 
-Radios: malla en el círculo `radius` (xz), datos en `radius + 1`, descarga más allá de
+Radios: malla en el círculo `radius` (xz), datos en `radius + 1` más los vecinos xz de cada
+columna con malla (el círculo solo deja fuera algunas diagonales del borde), descarga más allá de
 `radius + 1 + hysteresis` (2). Vertical: `WorldGenerator::vertical_chunks()`.
 
 Sistemas en `Update`, encadenados (`WorldSystems`):
@@ -639,7 +646,7 @@ snapshots viejos de un vecino ya no se acepta aunque la versión del centro coin
 Prioridades: ni rayon ni `boxel_tasks` las tienen; por eso `JobScheduler` propio (min-heap por
 `(prioridad, secuencia)`, tope en vuelo). Los jobs corren en `AsyncComputeTaskPool` a través del
 trait `JobExecutor` (`TaskPoolExecutor`; `InlineExecutor` en tests deterministas). Cada hilo usa
-un `Mesher` thread-local (~100 KiB de scratch).
+un `Mesher` thread-local (~210 KiB de scratch).
 
 ---
 
@@ -669,8 +676,11 @@ ejes (u, v): ±Y -> (X, Z); ±X -> (Z, Y); ±Z -> (X, Y)
 ```
 
 Máximo por bucket de cara: 16 384 quads (tablero de ajedrez 3D: 32x32x16). Los buckets cutout y
-translúcido juntan las seis caras: hasta 98 304 quads, que es lo que cubre el buffer de índices
-compartido. AO: bgm no tiene; en M0 todos los quads llevan AO abierto (0xFF). M1 decide entre AO
+translúcido juntan las seis caras: hasta 98 304 quads con un solo material por bucket, que es lo
+que cubre el buffer de índices compartido. Dos materiales cutout (o translúcidos) alternados no se
+tapan entre sí y llegan a 196 608; el registry de M0 tiene uno de cada (riesgo abierto, ver
+`informe-m0.md`). Pasado el límite, los tres tiers dibujan solo los primeros 98 304 quads del
+bucket. AO: bgm no tiene; en M0 todos los quads llevan AO abierto (0xFF). M1 decide entre AO
 en la clave de merge (+36 a +65 % de quads, medido) para Mid/Low y AO en el fragment shader desde
 ocupación en GPU para High.
 
@@ -968,9 +978,9 @@ actualiza al empezar M1, con `boxel_gfx` como frontera.
 | glam 0.34.0 salió el mismo día del diseño y rompió API | fricción con crates de terceros | pin `=0.34.0`; volver a 0.33.12 si un crate necesario lo exige (cambio acotado a `boxel_math`) |
 | binary-greedy-meshing: crate chico, MIT, sin AO | dependencia frágil | envoltorio propio y oráculo de tests; fork in-repo en M1 si hace falta |
 | Arranque lento en laptops híbridos (despertar la dGPU ~1 s) | mala primera impresión | documentado; inicialización asíncrona en M3 |
-| Más de 65 535 buckets visibles en High | huecos lejanos | aviso; segmentación en M3 |
+| Más de 65 535 buckets visibles en High | huecos, también cerca | aviso; segmentación en M3 |
 | Implementación en paralelo con varios agentes | bloqueos y pisadas | copias privadas por paquete, compuerta de propiedad, elementos transversales ya implementados en el esqueleto, protocolo de bloqueo con el lead |
-| `/tmp` es tmpfs de 12 GB con cuota | builds que fallan, insumos que desaparecen | target dirs en disco; el diseño se copia al repo (`.scaffold/design/`) |
+| `/tmp` es tmpfs de 12 GB con cuota | builds que fallan, insumos que desaparecen | target dirs en disco; el diseño se copió al repo durante M0 |
 
 ---
 
@@ -979,10 +989,9 @@ actualiza al empezar M1, con `boxel_gfx` como frontera.
 - Investigación previa: mediciones de wgpu contra ash, capacidades por backend, detección con
   salida real de sondas, datos de vóxeles, meshing, ECS (forks y alternativas) y tooling. Las
   cifras de este documento salen de ahí.
-- Sonda de render del arquitecto (copiada en `.scaffold/design/reference/renderprobe` durante
-  M0): oráculo del mesher, tres rutas con `DrawRef`, comparación de imágenes en 6 configuraciones
+- Sonda de render del arquitecto (usada durante M0, no está en el repo): oráculo del mesher, tres rutas con `DrawRef`, comparación de imágenes en 6 configuraciones
   de adaptador, naga GLSL. Descubrió la colisión de uniform blocks en NVIDIA GL 3.3.
-- Sonda de ventana oculta (`reference/hidden_window_probe.rs`): FIFO ingenuo contra compuerta por
+- Sonda de ventana oculta (usada durante M0, no está en el repo): FIFO ingenuo contra compuerta por
   frame callbacks, en Vulkan y GL, ventana minimizada (§11).
 - Tres revisiones adversariales del borrador v1 (gráficos, ECS y arquitectura Rust, entrega en
   paralelo). Cada observación quedó resuelta o rechazada con motivo en el registro de revisión de

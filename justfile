@@ -2,8 +2,6 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 set windows-shell := ["pwsh", "-NoLogo", "-Command"]
 
-msrv := `grep -m1 '^rust-version = ' Cargo.toml | cut -d'"' -f2`
-
 [default]
 list:
     @just --list --unsorted
@@ -47,11 +45,17 @@ typos:
 doc:
     cargo doc --workspace --no-deps --all-features --locked
 
+# The version is read inside the recipe: a top-level backtick would run on every `just` call,
+# also under pwsh on Windows, where grep and cut do not exist.
 [group('quality')]
-[doc('Compile with the declared MSRV toolchain')]
+[doc('Compile with the declared MSRV toolchain (as the CI MSRV job)')]
+[env('CARGO_BUILD_WARNINGS', 'deny')]
 msrv:
-    rustup toolchain install {{ msrv }} --profile minimal --no-self-update
-    cargo +{{ msrv }} check --workspace --all-targets --locked
+    #!/usr/bin/env bash
+    set -euo pipefail
+    msrv=$(grep -m1 '^rust-version = ' Cargo.toml | cut -d'"' -f2)
+    rustup toolchain install "$msrv" --profile minimal --no-self-update
+    cargo +"$msrv" check --workspace --all-targets --all-features --locked
 
 [group('test')]
 [doc('Unit + integration tests (GPU tests self-skip without an adapter)')]
@@ -85,22 +89,29 @@ test-gpu:
 [group('test')]
 [doc('Tests of the vendored ECS fork (its own workspace; upstream expects backtraces + debug)')]
 [env('RUST_BACKTRACE', '1')]
+[env('CARGO_BUILD_WARNINGS', 'warn')]
 test-vendor:
     cd vendor && cargo test --workspace --lib --locked
     cd vendor && cargo test -p boxel_ecs --doc --features debug --locked
 
+# Flags as in Bevy's CI: the executor reads the clock (isolation off) and some tests do not join
+# their threads (leaks ignored). Miri reports 1 CPU by default, which makes the task pool serial
+# and fails the contiguous par_iter scheduling tests; 4 emulated CPUs keep them meaningful.
+# Tests still run one at a time: with parallel test threads Miri reports a data race inside
+# bumpalo 3.20.3 (zero-sized allocations on a fresh Bump write its shared static empty chunk),
+# an upstream bug recorded in docs/informe-m0.md.
 [group('test')]
 [doc('Miri on the vendored ECS (needs: rustup toolchain install nightly-2026-09-30 --component miri)')]
-[env('MIRIFLAGS', '-Zmiri-disable-isolation')]
+[env('MIRIFLAGS', '-Zmiri-disable-isolation -Zmiri-ignore-leaks -Zmiri-num-cpus=4')]
 [env('CARGO_BUILD_WARNINGS', 'warn')]
 [env('RUSTFLAGS', '-Zrandomize-layout')]
 miri:
-    cd vendor && cargo +nightly-2026-09-30 miri test -p boxel_ecs -p boxel_ptr -p boxel_tasks --lib
+    cd vendor && cargo +nightly-2026-09-30 miri test --locked -p boxel_ecs -p boxel_ptr -p boxel_tasks --lib -- --test-threads=1
 
 [group('test')]
 [doc('Benchmarks (criterion). Filter: just bench mesh')]
 bench *args:
-    cargo bench --workspace {{ args }}
+    cargo bench --workspace --bench '*' {{ args }}
 
 [group('run')]
 [doc('Headless GPU report: just gpu-info --backend gl')]
@@ -137,5 +148,5 @@ vendor-lock:
     python3 tools/vendor_lock_sync.py
 
 [group('ci')]
-[doc('Everything the per-PR CI runs, locally')]
+[doc('The main per-PR CI checks, locally (MSRV and the software GPU tests run apart)')]
 ci: fmt-check lint test doc deny typos test-vendor

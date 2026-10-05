@@ -85,22 +85,57 @@ impl PluginGroupBuilder {
         self
     }
 
-    /// Inserts `plugin` right before the plugin of type `Target`.
+    /// Inserts `plugin` right before the plugin of type `Target`. If a plugin of type `T` is
+    /// already in the group, it is replaced by `plugin` and moved (it keeps its enabled state).
+    /// With `Target == T` the plugin is replaced in place.
     ///
     /// # Panics
     /// If `Target` is not in the group.
     pub fn add_before<Target: Plugin, T: Plugin>(self, plugin: T) -> Self {
-        let _ = TypeId::of::<Target>();
-        todo!("WP1")
+        self.insert_relative::<Target, T>(plugin, false)
     }
 
-    /// Inserts `plugin` right after the plugin of type `Target`.
+    /// Inserts `plugin` right after the plugin of type `Target`. If a plugin of type `T` is
+    /// already in the group, it is replaced by `plugin` and moved (it keeps its enabled state).
+    /// With `Target == T` the plugin is replaced in place.
     ///
     /// # Panics
     /// If `Target` is not in the group.
     pub fn add_after<Target: Plugin, T: Plugin>(self, plugin: T) -> Self {
-        let _ = TypeId::of::<Target>();
-        todo!("WP1")
+        self.insert_relative::<Target, T>(plugin, true)
+    }
+
+    /// Shared body of [`Self::add_before`] and [`Self::add_after`].
+    fn insert_relative<Target: Plugin, T: Plugin>(mut self, plugin: T, after: bool) -> Self {
+        let target = self
+            .entries
+            .iter()
+            .position(|e| e.type_id == TypeId::of::<Target>())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} is not in this plugin group",
+                    std::any::type_name::<Target>()
+                )
+            });
+        let mut index = target + usize::from(after);
+        let type_id = TypeId::of::<T>();
+        let mut enabled = true;
+        if let Some(old) = self.entries.iter().position(|e| e.type_id == type_id) {
+            // Removing an entry in front of the insertion point shifts that point left.
+            if old < index {
+                index -= 1;
+            }
+            enabled = self.entries.remove(old).enabled;
+        }
+        self.entries.insert(
+            index,
+            Entry {
+                type_id,
+                plugin: Box::new(plugin),
+                enabled,
+            },
+        );
+        self
     }
 
     /// Adds every enabled plugin to `app`, in order.

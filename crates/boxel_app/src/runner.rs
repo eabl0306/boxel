@@ -1,5 +1,5 @@
-use crate::{App, AppExit, Plugin};
-use std::time::Duration;
+use crate::{App, AppExit, Plugin, PluginsState};
+use std::time::{Duration, Instant};
 
 /// How the headless runner drives updates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +43,38 @@ impl Plugin for ScheduleRunnerPlugin {
     }
 }
 
-fn run_headless(app: App, mode: RunMode) -> AppExit {
-    todo!("WP1")
+/// The headless runner installed by [`ScheduleRunnerPlugin`]. Runs `Shutdown` once before
+/// returning, in both modes.
+fn run_headless(mut app: App, mode: RunMode) -> AppExit {
+    while app.plugins_state() == PluginsState::Adding {
+        std::thread::yield_now();
+    }
+    app.finish();
+    app.cleanup();
+    let exit = match mode {
+        RunMode::Once => {
+            app.update();
+            app.should_exit()
+        }
+        RunMode::Loop { wait } => loop {
+            let start = Instant::now();
+            app.update();
+            if let Some(exit) = app.should_exit() {
+                break Some(exit);
+            }
+            if let Some(remaining) = wait.and_then(|w| w.checked_sub(start.elapsed()))
+                && !remaining.is_zero()
+            {
+                pace(remaining);
+            }
+        },
+    };
+    app.shutdown();
+    exit.unwrap_or_default()
+}
+
+/// Sleeps between headless frames (the only place the engine sleeps on purpose).
+#[expect(clippy::disallowed_methods, reason = "headless runner pacing")]
+fn pace(duration: Duration) {
+    std::thread::sleep(duration);
 }

@@ -254,6 +254,15 @@ fn wgsl_bit_layout_matches_boxel_mesh() {
     }
 }
 
+#[test]
+fn cull_clamps_to_the_index_buffer_of_boxel_mesh() {
+    let (module, _) = load(ShaderModuleId::Cull);
+    assert_eq!(
+        const_u32(&module, "MAX_QUADS_PER_BUCKET"),
+        boxel_mesh::MAX_QUADS_PER_BUCKET
+    );
+}
+
 fn struct_layout(module: &naga::Module, name: &str) -> (u32, Vec<u32>) {
     let mut layouter = naga::proc::Layouter::default();
     layouter.update(module.to_ctx()).expect("layout");

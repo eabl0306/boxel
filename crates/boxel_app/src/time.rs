@@ -1,5 +1,7 @@
 use crate::{App, First, FixedMain, FixedPostUpdate, Plugin, RunFixedMainLoop};
-use boxel_ecs::message::{MessageRegistry, ShouldUpdateMessages, signal_message_update_system};
+use boxel_ecs::message::{
+    MessageRegistry, ShouldUpdateMessages, message_update_system, signal_message_update_system,
+};
 use boxel_ecs::prelude::*;
 use std::time::{Duration, Instant};
 
@@ -36,6 +38,10 @@ impl Time {
             frame_count: 0,
             max_delta: Duration::from_millis(250),
         }
+    }
+    /// The instant this clock started (the `startup` given to [`Time::new`]).
+    pub fn startup(&self) -> Instant {
+        self.startup
     }
     /// Time since the previous update (0 on the first), clamped to `max_delta`.
     pub fn delta(&self) -> Duration {
@@ -105,21 +111,39 @@ impl Default for FixedTime {
 
 impl FixedTime {
     /// Timestep of `1 / hz` seconds.
+    ///
+    /// # Panics
+    ///
+    /// If `hz` is not finite and positive, or so large that the step rounds to zero (as Bevy).
     pub fn from_hz(hz: f64) -> Self {
-        Self {
-            timestep: Duration::from_secs_f64(1.0 / hz),
+        assert!(
+            hz.is_finite() && hz > 0.0,
+            "FixedTime::from_hz: rate must be finite and positive, got {hz}"
+        );
+        let mut fixed = Self {
+            timestep: Duration::ZERO,
             accumulator: Duration::ZERO,
             elapsed: Duration::ZERO,
             max_steps_per_frame: 8,
             last_overrun_warning: None,
-        }
+        };
+        fixed.set_timestep(Duration::from_secs_f64(1.0 / hz));
+        fixed
     }
     /// Step length.
     pub fn timestep(&self) -> Duration {
         self.timestep
     }
     /// Changes the step length.
+    ///
+    /// # Panics
+    ///
+    /// If `timestep` is zero (as Bevy): no fixed step could ever run.
     pub fn set_timestep(&mut self, timestep: Duration) {
+        assert!(
+            !timestep.is_zero(),
+            "FixedTime::set_timestep: the timestep must not be zero"
+        );
         self.timestep = timestep;
     }
     /// Pending time not yet consumed by steps.
@@ -167,8 +191,18 @@ pub fn time_system(mut time: ResMut<Time>) {
 /// runs `FixedMain` while `expend()` returns true (at most `max_steps_per_frame` times; whole
 /// steps left over are dropped with a warning at most once per second, the remainder is kept).
 /// While `FixedMain` runs, [`Time`] holds the fixed-step view (see [`Time`]).
+///
+/// A frame with a zero `Time::delta` (paused time, e.g. `Time::set_max_delta(Duration::ZERO)`)
+/// cannot bring a fixed step closer, so it lets the next `First` rotate the message buffers
+/// anyway. Without this, paused time would keep every message ever written.
 pub fn run_fixed_main_loop(world: &mut World) {
     let delta = world.resource::<Time>().delta();
+    if delta.is_zero()
+        && let Some(mut registry) = world.get_resource_mut::<MessageRegistry>()
+        && registry.should_update == ShouldUpdateMessages::Waiting
+    {
+        registry.should_update = ShouldUpdateMessages::Ready;
+    }
     let max_steps = {
         let mut fixed = world.resource_mut::<FixedTime>();
         fixed.accumulate(delta);
@@ -210,6 +244,12 @@ pub fn run_fixed_main_loop(world: &mut World) {
 /// fixed step has seen them: `signal_message_update_system` runs in `FixedPostUpdate` and
 /// `MessageRegistry::should_update` starts as `Waiting` (Bevy's behavior). Without this, a
 /// `FixedUpdate` reader would lose messages whenever frames run faster than half the fixed rate.
+/// While time is paused, buffers rotate every frame (see [`run_fixed_main_loop`]).
+///
+/// [`time_system`] is marked ambiguous with `message_update_system` (also in `First`, added by
+/// [`App::new`]), as in Bevy: the message update is an exclusive system, so the pair counts as
+/// a conflict, but it never touches [`Time`] and their order does not matter. Strict ambiguity
+/// detection on `First` then stays clean.
 #[derive(Default)]
 pub struct TimePlugin;
 
@@ -217,7 +257,12 @@ impl Plugin for TimePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Time>()
             .init_resource::<FixedTime>()
-            .add_systems(First, time_system.in_set(TimeSystems))
+            .add_systems(
+                First,
+                time_system
+                    .in_set(TimeSystems)
+                    .ambiguous_with(message_update_system),
+            )
             .add_systems(RunFixedMainLoop, run_fixed_main_loop)
             .add_systems(FixedPostUpdate, signal_message_update_system);
         app.world_mut()

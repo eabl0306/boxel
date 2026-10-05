@@ -11,15 +11,6 @@
 //! [`VoxelRenderer`] is ECS-free (used directly by offscreen tests); [`RenderPlugin`] wires it
 //! into the app: GPU bootstrap when the window appears, mesh extraction from `boxel_world`,
 //! camera, present, screenshots, device-loss recovery.
-// SKELETON: remove this attribute when the crate is fully implemented (owner: WP7).
-#![allow(
-    unused_variables,
-    unused_mut,
-    dead_code,
-    clippy::todo,
-    reason = "skeleton stubs"
-)]
-
 mod plugin;
 mod renderer;
 mod smoke;
@@ -32,7 +23,7 @@ mod targets;
 
 pub use plugin::{
     DebugDestroyDevice, GpuFailed, GpuReady, Render, RenderInfo, RenderPlugin, RenderSettings,
-    RenderSystems, RequestScreenshot, ScreenshotSaved,
+    RenderSystems, RequestScreenshot, ScreenshotSaved, SurfaceInfo,
 };
 pub use renderer::{RenderStats, RendererConfig, RendererError, ViewParams, VoxelRenderer};
 pub use smoke::RendererSmokeTest;

@@ -102,6 +102,10 @@ jobs:
   vendor:
     name: vendored ECS tests
     runs-on: ubuntu-24.04
+    env:
+      # The refork strips reflect-only test code and leaves unused imports in upstream code we
+      # must not edit (same as miri.yml). `just test-vendor` uses the same setting.
+      CARGO_BUILD_WARNINGS: warn
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

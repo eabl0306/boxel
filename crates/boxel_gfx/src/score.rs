@@ -17,6 +17,30 @@ pub fn score(
     power: wgpu::PowerPreference,
     lkg: Option<LkgStatus>,
 ) -> i64 {
-    let _ = DeviceClass::Other;
-    todo!("WP3")
+    let tier_score = match tier {
+        Tier::High => 3000,
+        Tier::Mid => 2000,
+        Tier::Low => 1000,
+    };
+    let low_power = power == wgpu::PowerPreference::LowPower;
+    let class_score = match caps.class() {
+        DeviceClass::Discrete if low_power => 300,
+        DeviceClass::Discrete => 400,
+        DeviceClass::Integrated if low_power => 400,
+        DeviceClass::Integrated => 300,
+        DeviceClass::Other => 200,
+        DeviceClass::Virtual => 100,
+        DeviceClass::Software => -5000,
+    };
+    let backend_score = match caps.info.backend {
+        wgpu::Backend::Vulkan | wgpu::Backend::Metal => 100,
+        wgpu::Backend::Dx12 => 90,
+        _ => 0,
+    };
+    let lkg_score = match lkg {
+        Some(LkgStatus::Good) => 50,
+        Some(LkgStatus::Suspect) => -500,
+        Some(LkgStatus::Pending | LkgStatus::Bad) | None => 0,
+    };
+    tier_score + class_score + backend_score + lkg_score
 }

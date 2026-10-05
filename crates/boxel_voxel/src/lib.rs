@@ -8,14 +8,6 @@
 //!   separate light storage.
 //! - [`ChunkData`]: one chunk's immutable snapshot payload (shared as `Arc<ChunkData>`; edits use
 //!   `Arc::make_mut` copy-on-write). Voxel arrays never live inline in ECS components.
-// SKELETON: remove this attribute when the crate is fully implemented (owner: WP4).
-#![allow(
-    unused_variables,
-    unused_mut,
-    dead_code,
-    clippy::todo,
-    reason = "skeleton stubs"
-)]
 
 pub mod coords;
 pub mod registry;

@@ -6,14 +6,6 @@
 //! frame `First`, `PreUpdate`, `RunFixedMainLoop`, `Update`, `PostUpdate`, `Last`, plus any label
 //! inserted with [`MainScheduleOrder::insert_after`] (the renderer inserts `Render` after `Last`).
 //! [`Shutdown`] runs once at exit (runners call [`App::shutdown`]).
-// SKELETON: remove this attribute when the crate is fully implemented (owner: WP1).
-#![allow(
-    unused_variables,
-    unused_mut,
-    dead_code,
-    clippy::todo,
-    reason = "skeleton stubs"
-)]
 
 mod app;
 mod plugin;

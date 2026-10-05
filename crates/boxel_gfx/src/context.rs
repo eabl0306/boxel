@@ -59,7 +59,22 @@ impl GpuHealth {
 /// panics, unlike wgpu's default handler) and `Device::set_device_lost_callback`
 /// (`health.mark_lost`). Called by `select_gpu` right after `request_device`, before smoke tests.
 pub fn install_device_callbacks(device: &wgpu::Device, health: &Arc<GpuHealth>) {
-    todo!("WP3")
+    let errors = Arc::clone(health);
+    device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+        let message = error.to_string();
+        tracing::error!("uncaptured wgpu error: {message}");
+        errors.record_error(message);
+    }));
+    let lost = Arc::clone(health);
+    device.set_device_lost_callback(move |reason, message| {
+        match reason {
+            wgpu::DeviceLostReason::Destroyed => {
+                tracing::warn!("GPU device destroyed: {message}");
+            }
+            wgpu::DeviceLostReason::Unknown => tracing::error!("GPU device lost: {message}"),
+        }
+        lost.mark_lost(format!("{reason:?}: {message}"));
+    });
 }
 
 /// The selected GPU: everything the renderer needs.

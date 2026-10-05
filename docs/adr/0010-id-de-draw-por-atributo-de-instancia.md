@@ -33,8 +33,8 @@ dispositivo en NVIDIA GL y cuesta CPU por sub-draw. Además, wgpu-hal pasa `max_
   High, Mid y Low en 6 configuraciones).
 - Un buffer de instancia extra (8 bytes por draw).
 - Sin red de seguridad de wgpu para argumentos indirectos: responsabilidad del shader de culling.
-- Con distancias de vista muy grandes (más de 65 535 buckets visibles) se omiten los más lejanos
-  con un aviso; M3 segmenta las listas.
+- Con distancias de vista muy grandes (más de 65 535 buckets visibles) High omite algunos
+  buckets sin orden (no los más lejanos) con un aviso; M3 segmenta las listas.
 
 ## Alternativas descartadas
 
