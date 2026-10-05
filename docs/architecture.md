@@ -582,8 +582,11 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   `Mesher<32>` con borde (34 = 32 + 2, entra en una columna `u64`).
 - **Índice local** `(y << 10) | (x << 5) | z` (z más rápido): mismo orden que el `pad_linearize`
   de binary-greedy-meshing, así el gather copia filas.
-- **Coordenadas:** `ChunkPos`, `BlockPos`, `LocalPos` (u16), `ChunkKey { dim, lod, pos }`,
-  `Face` (orden congelado `+Y, -Y, +X, -X, +Z, -Z`), 26 vecinos en orden fijo.
+- **Coordenadas:** `ChunkPos` y `BlockPos` en `i64`, `LocalPos` (u16), `ChunkKey { dim, lod,
+  pos }`, `Face` (orden congelado `+Y, -Y, +X, -X, +Z, -Z`), 26 vecinos en orden fijo. Límite
+  de mundo único: `MAX_CHUNK_COORD` = ±2^56 chunks (±2^61 vóxeles). Dentro de él ningún origen,
+  vecino o radio desborda `i64`, y las distancias al cuadrado van en `u128`. El mundo sujeta a
+  los viewers a ese límite. Un chunk de lod k empieza en `pos << (5 + k)`.
 - **Registry** de datos: `BlockState(u16)` denso en tiempo de ejecución (0 = aire), nunca se
   persiste crudo (M1 agrega el IdMap nombre a id). Tablas SoA: nombre, forma (`None`, `Opaque`,
   `Cutout`, `Translucent`), flags, emisión, texturas por cara. Contenido M0 congelado: aire,
@@ -727,9 +730,13 @@ cambia el layout.
   local.
 - **Reverse-Z** (`Depth32Float`, `CompareFunction::Greater`, clear 0, proyección infinita) y
   **coordenadas relativas a la cámara**: el origen de render es la posición de la cámara
-  redondeada a vóxeles; los chunks guardan su origen absoluto en `i32` y el shader resta en
-  enteros antes de pasar a `f32`. Precisión exacta a cualquier distancia del origen del mundo,
-  sin re-basar tablas.
+  redondeada a vóxeles. En la CPU, ese origen y los orígenes de los chunks son `i64`; a la GPU
+  suben sus 32 bits bajos (`boxel_math::wrap_to_i32`) y el shader los resta en `i32`. La resta
+  de WGSL da la vuelta (módulo 2^32), así que el resultado es exacto mientras el chunk esté a
+  menos de 2^31 vóxeles de la cámara, y los chunks vivos siempre lo están. El culling en CPU
+  (Mid, Low) resta en `i64` y recién después pasa a `f32`. Precisión exacta a cualquier
+  distancia del origen del mundo, sin re-basar tablas y sin cambiar el layout de la GPU. El
+  límite siguiente es el `f64` de `Transform` (paso de 1 mm a unos 4.4e12 vóxeles).
 - **Limitación en GL** (verificada en wgpu-hal 30.0.1 y naga): el backend GL siempre remapea z de
   [0, 1] a [-1, 1] (`z * 2 - w`) y no usa `glClipControl`, así que en los tiers sobre GL el
   reverse-Z pierde su ventaja de precisión: con near = 0.1, la resolución de profundidad es de
@@ -746,8 +753,8 @@ cambia el layout.
 | Recurso | Uso | Tiers |
 |---|---|---|
 | Arena de quads | un buffer `STORAGE | VERTEX | COPY_DST` de `PackedQuad`, sub-asignado con `offset-allocator` (una asignación por chunk con los 8 buckets contiguos); 8 Mi quads = 64 MiB por defecto | todos |
-| Tabla de chunks | storage `array<ChunkGpu>` (64 B: origen i32x3, `quad_base`, 8 contadores, flags, relleno) | High, Mid |
-| Tabla CPU | espejo en CPU (origen, rangos, contadores) para culling en CPU | todos |
+| Tabla de chunks | storage `array<ChunkGpu>` (64 B: origen i32x3 con los 32 bits bajos del origen `i64`, `quad_base`, 8 contadores, flags, relleno) | High, Mid |
+| Tabla CPU | espejo en CPU (origen `i64`, rangos, contadores) para culling en CPU | todos |
 | Índice compartido | u32 `[0,1,2,2,1,3] + 4i` para 98 304 quads (2.36 MB) | High, Mid |
 | Textura de bloques | `texture_2d_array` RGBA8 sRGB 16x16 con mips, procedural en M0 | todos |
 | View uniform | 240 B (std140): `view_proj`, 6 planos, origen de render, cámara relativa, niebla, contadores | todos |

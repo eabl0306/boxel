@@ -131,9 +131,18 @@ problema real de boxel no está en este camino sino en el paso 1 (sección 7.1).
 
 ## 2. Los datos de un chunk
 
-**Coordenadas.** Un chunk mide 32³ (`voxel/coords.rs:5-13`). `ChunkPos` usa `i32` en x, y, z
-(`voxel/coords.rs:17`). Dentro del chunk, la posición es un `u16` con z como eje más rápido
-(`voxel/coords.rs:125-131`), el mismo orden que usa el mallador, así copia filas enteras.
+**Coordenadas.** Un chunk mide 32³ (`voxel/coords.rs:9-17`). `ChunkPos` y `BlockPos` usan
+`i64` en x, y, z (`voxel/coords.rs:51`), con un solo límite de mundo: `MAX_CHUNK_COORD`, ±2^56
+chunks (±2^61 vóxeles, `voxel/coords.rs:36`). El mundo sujeta a los viewers a ese límite y
+dentro de él ninguna cuenta desborda. Antes eran `i32` y todo se rompía a 2^31 vóxeles (unos
+2 100 millones): el streaming dejaba de seguir a la cámara y los chunks se repetían. Dentro del
+chunk, la posición es un `u16` con z como eje más rápido (`voxel/coords.rs:186-192`), el mismo
+orden que usa el mallador, así copia filas enteras.
+
+El límite que se nota antes es el de `Transform`, que es `f64`: el paso mínimo de la cámara es
+1 mm a unos 4.4e12 vóxeles (2^42), 3 cm a 2^47 y un vóxel entero a 2^52. Los enteros siguen
+exactos hasta el límite del mundo. El ruido del terreno todavía se calcula en `f64`: se degrada
+desde unos 2^35 vóxeles y queda plano pasados 2^39 (el reemplazo por ruido entero viene después).
 
 **Bloques.** Cada estado es un `u16` y el 0 es aire (`voxel/registry.rs:10`). Las propiedades
 viven en tablas por campo (`voxel/registry.rs:268`). Hoy hay 12 bloques: las hojas son cutout y
