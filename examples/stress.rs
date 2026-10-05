@@ -1,0 +1,1019 @@
+//! Stress benchmark: frame times (and their spikes) while the world streams.
+//!
+//! `cargo run --release --example stress -- --scenario fly --speed 64 --radius 16 \
+//!   --summary out.md --csv out.csv` (see `--help`; `just bench-fly` and friends wrap it).
+//!
+//! Scenarios (the camera is scripted, never driven by input):
+//! - `static`: the camera stays put; measures the settled world.
+//! - `fly`: the camera flies straight ahead at `--speed` voxels per second, so new chunks
+//!   stream in all the time.
+//! - `spin`: the camera turns 360 degrees in place over the measurement (visibility changes,
+//!   no new chunks).
+//!
+//! Every run waits until the world settled, runs `--warmup` seconds, then measures
+//! `--duration` seconds. Each frame records its wall-clock time (`Time::real_delta`, the whole
+//! loop: world, render, present) and the work it did: chunks generated and jobs finished (counted
+//! by wrapping the generator and the job executor), meshes sent and removed (`ChunkMeshEvent`),
+//! `WorldStats` (and its change), the GPU chunks and draws (`RenderInfo`) and the resident
+//! quads. The window renders every update even when covered (`render_when_hidden`), presents
+//! with `immediate` unless `--present`/`BOXEL_PRESENT` say otherwise, and closes itself.
+//!
+//! Exit codes: 0 success, 1 usage error, 2 no usable GPU, 3 an output file could not be
+//! written, 4 timeout (the world did not settle, or the run took longer than `--timeout`).
+#![expect(clippy::print_stdout, clippy::print_stderr, reason = "CLI output")]
+
+#[path = "stress/forest.rs"]
+mod forest;
+#[path = "stress/report.rs"]
+mod report;
+
+use boxel::app::{TaskPoolOptions, TaskPoolThreadAssignmentPolicy};
+use boxel::gfx::{CLI_HELP, PresentModePref};
+use boxel::prelude::*;
+use boxel::render::GpuFailed;
+use boxel::voxel::{BlockPos, BlockRegistry, ChunkData, ChunkKey, ChunkPos};
+use boxel::world::jobs::{JobExecutor, TaskPoolExecutor};
+use boxel::world::{ChunkId, ChunkMeshEvent, WorldStats, WorldSystems};
+use boxel::worldgen::TerrainSettings;
+use forest::Forest;
+use report::{FrameRecord, RecordLog, RunInfo, Summary};
+use std::collections::HashMap;
+use std::f64::consts::TAU;
+use std::ops::RangeInclusive;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const USAGE: &str = "\
+usage: stress [--scenario static|fly|spin] [GPU options] [options]
+  --scenario NAME     static (default), fly or spin
+  --radius N          mesh radius in chunks (default 16)
+  --speed V           fly speed in voxels per second (default 32)
+  --duration SECS     measured time (default 20)
+  --warmup SECS       time between the world settling and the measurement (default 2)
+  --timeout SECS      wall-clock limit for the whole run, exit 4 (default 120 + warmup +
+                      duration)
+  --csv PATH          write one row per measured frame
+  --summary PATH      write the summary (Markdown tables plus a JSON block for
+                      tools/bench_report.py)
+  --label TEXT        free text kept in the summary (for example a commit)
+  --seed N            terrain seed
+  --camera x,y,z,yaw,pitch  start camera, degrees (default 16,140,16,-90,-20: the middle of a
+                      chunk, above the terrain, looking along +X;
+                      fly moves along the yaw direction, horizontally)
+  --size WxH          window size in logical pixels (default 1280x720)
+  --async-threads N   async compute pool size (chunk jobs)
+  --no-trees          plain TerrainGenerator (no trees)
+  --help              this text
+The run presents with --present immediate unless --present or BOXEL_PRESENT is given.
+exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 output not written, 4 timeout";
+
+/// Consecutive settled frames before the world counts as settled.
+const SETTLED_FRAMES: u32 = 3;
+/// Default `--timeout` part spent waiting for the world to settle.
+const SETTLE_ALLOWANCE: Duration = Duration::from_secs(120);
+/// After the measurement, the world gets this long (within `--timeout`) to settle again.
+const CATCH_UP_LIMIT: Duration = Duration::from_secs(60);
+/// Extra time the watchdog thread waits after `--timeout` before killing the process.
+const WATCHDOG_GRACE: Duration = Duration::from_secs(15);
+/// Expected chunks resident on the GPU at most (render chunk table size): the quad map is
+/// allocated once so it never rehashes during the measurement.
+const RESIDENT_CAPACITY: usize = 32_768;
+
+// ---------------------------------------------------------------------------------------------
+// Options
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scenario {
+    Static,
+    Fly,
+    Spin,
+}
+
+impl Scenario {
+    fn name(self) -> &'static str {
+        match self {
+            Scenario::Static => "static",
+            Scenario::Fly => "fly",
+            Scenario::Spin => "spin",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        [Scenario::Static, Scenario::Fly, Scenario::Spin]
+            .into_iter()
+            .find(|s| s.name() == name)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Options {
+    scenario: Scenario,
+    radius: u32,
+    speed: f64,
+    duration: Duration,
+    warmup: Duration,
+    timeout: Duration,
+    csv: Option<PathBuf>,
+    summary: Option<PathBuf>,
+    label: String,
+    seed: u64,
+    camera: [f64; 5],
+    size: (u32, u32),
+    async_threads: Option<usize>,
+    trees: bool,
+}
+
+/// `Ok(None)` for `--help`.
+fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
+    let mut o = Options {
+        scenario: Scenario::Static,
+        radius: 16,
+        speed: 32.0,
+        duration: Duration::from_secs(20),
+        warmup: Duration::from_secs(2),
+        timeout: Duration::ZERO,
+        csv: None,
+        summary: None,
+        label: String::new(),
+        seed: TerrainGenerator::default().seed,
+        camera: [16.0, 140.0, 16.0, -90.0, -20.0],
+        size: (1280, 720),
+        async_threads: None,
+        trees: true,
+    };
+    let mut timeout = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+            _ => (arg.as_str(), None),
+        };
+        let mut value = || {
+            inline
+                .clone()
+                .or_else(|| it.next().cloned())
+                .ok_or_else(|| format!("{flag} needs a value"))
+        };
+        match flag {
+            "--help" | "-h" => return Ok(None),
+            "--scenario" => {
+                let v = value()?;
+                o.scenario = Scenario::parse(&v)
+                    .ok_or_else(|| format!("{flag}: {v:?} is not static, fly or spin"))?;
+            }
+            "--radius" => {
+                let r = number(flag, &value()?)?;
+                o.radius = u32::try_from(r)
+                    .ok()
+                    .filter(|r| (1..=64).contains(r))
+                    .ok_or_else(|| format!("{flag}: {r} is not in 1..=64"))?;
+            }
+            "--speed" => o.speed = positive(flag, &value()?)?,
+            "--duration" => o.duration = seconds(flag, &value()?)?,
+            "--warmup" => {
+                let v = value()?;
+                o.warmup = if v.trim() == "0" {
+                    Duration::ZERO
+                } else {
+                    seconds(flag, &v)?
+                };
+            }
+            "--timeout" => timeout = Some(seconds(flag, &value()?)?),
+            "--csv" => o.csv = Some(PathBuf::from(value()?)),
+            "--summary" => o.summary = Some(PathBuf::from(value()?)),
+            "--label" => o.label = value()?,
+            "--seed" => o.seed = number(flag, &value()?)?,
+            "--camera" => {
+                let v = value()?;
+                let parts: Vec<f64> = v
+                    .split(',')
+                    .map(|p| p.trim().parse::<f64>())
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| format!("{flag}: {v:?} is not x,y,z,yaw,pitch"))?;
+                o.camera = parts
+                    .try_into()
+                    .ok()
+                    .filter(|c: &[f64; 5]| c.iter().all(|x| x.is_finite()))
+                    .ok_or_else(|| format!("{flag}: {v:?} is not x,y,z,yaw,pitch"))?;
+            }
+            "--size" => {
+                let v = value()?;
+                o.size = v
+                    .split_once(['x', 'X'])
+                    .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+                    .filter(|&(w, h): &(u32, u32)| w > 0 && h > 0 && w <= 16384 && h <= 16384)
+                    .ok_or_else(|| format!("{flag}: {v:?} is not WxH"))?;
+            }
+            "--async-threads" => {
+                let n = number(flag, &value()?)?;
+                o.async_threads = Some(
+                    usize::try_from(n)
+                        .ok()
+                        .filter(|n| (1..=64).contains(n))
+                        .ok_or_else(|| format!("{flag}: {n} is not in 1..=64"))?,
+                );
+            }
+            "--no-trees" => o.trees = false,
+            other => return Err(format!("unknown argument {other:?}")),
+        }
+    }
+    o.timeout = timeout.unwrap_or(SETTLE_ALLOWANCE + o.warmup + o.duration);
+    Ok(Some(o))
+}
+
+fn number(flag: &str, value: &str) -> Result<u64, String> {
+    value
+        .trim()
+        .parse()
+        .map_err(|_| format!("{flag}: {value:?} is not a non-negative integer"))
+}
+
+fn positive(flag: &str, value: &str) -> Result<f64, String> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .ok_or_else(|| format!("{flag}: {value:?} is not a positive number"))
+}
+
+fn seconds(flag: &str, value: &str) -> Result<Duration, String> {
+    let s = positive(flag, value)?;
+    Duration::try_from_secs_f64(s).map_err(|_| format!("{flag}: {value:?} is too large"))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Counting wrappers (exact world counters without touching boxel_world)
+
+/// Counts finished generator calls.
+struct CountingGenerator {
+    inner: Arc<dyn WorldGenerator>,
+    generated: Arc<AtomicU64>,
+}
+
+impl WorldGenerator for CountingGenerator {
+    fn generate(&self, key: ChunkKey, registry: &BlockRegistry) -> ChunkData {
+        let data = self.inner.generate(key, registry);
+        self.generated.fetch_add(1, Ordering::Relaxed);
+        data
+    }
+
+    fn vertical_chunks(&self) -> RangeInclusive<i32> {
+        self.inner.vertical_chunks()
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+}
+
+/// Runs jobs on the async compute pool (as `TaskPoolExecutor`) and counts the finished ones.
+struct CountingExecutor {
+    done: Arc<AtomicU64>,
+}
+
+impl JobExecutor for CountingExecutor {
+    fn spawn(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+        let done = Arc::clone(&self.done);
+        TaskPoolExecutor.spawn(Box::new(move || {
+            job();
+            done.fetch_add(1, Ordering::Relaxed);
+        }));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Camera script
+
+/// Camera pose of the scenario `t` seconds into the measurement, from the start pose
+/// `[x, y, z, yaw, pitch]` (degrees): `fly` moves along the horizontal yaw direction (yaw 0
+/// looks along -Z, -90 along +X), `spin` turns once over `duration` seconds.
+fn camera_at(scenario: Scenario, start: [f64; 5], speed: f64, duration: f64, t: f64) -> Transform {
+    let [x, y, z, yaw, pitch] = start;
+    let mut yaw = yaw.to_radians();
+    let mut position = DVec3::new(x, y, z);
+    match scenario {
+        Scenario::Static => {}
+        Scenario::Fly => position += flat_direction(yaw) * (speed * t),
+        Scenario::Spin => yaw += TAU * (t / duration).min(1.0),
+    }
+    Transform::from_yaw_pitch(position, yaw as f32, (pitch as f32).to_radians())
+}
+
+/// Horizontal unit direction of `yaw` (radians). Components within 1e-12 of zero are zero, so
+/// flying along an axis never drifts across the neighboring chunk border (sin(-90 degrees)
+/// leaves -6e-17 in z).
+fn flat_direction(yaw: f64) -> DVec3 {
+    let snap = |v: f64| if v.abs() < 1e-12 { 0.0 } else { v };
+    DVec3::new(snap(-yaw.sin()), 0.0, snap(-yaw.cos()))
+}
+
+fn chunk_of(transform: &Transform) -> ChunkPos {
+    ChunkPos::containing(BlockPos::from_world(transform.translation))
+}
+
+// ---------------------------------------------------------------------------------------------
+// App state
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Phase {
+    /// Waiting for the GPU and the world (settled for `SETTLED_FRAMES` frames).
+    Loading { streak: u32 },
+    /// The world settled; measuring starts at `until`.
+    Warmup { until: Instant },
+    /// Measuring since `start`.
+    Measuring { start: Instant },
+    /// The camera stopped at `since`; waiting for the world to settle again.
+    CatchUp { since: Instant, streak: u32 },
+    /// Outputs written, exit requested.
+    Done,
+}
+
+/// The part of a record known during the frame's `Update` (the rest comes from the next one).
+#[derive(Clone, Copy, Debug)]
+struct Pending {
+    t: Duration,
+    crossed: bool,
+    camera: (f64, f64, f32),
+}
+
+#[derive(Resource)]
+struct Bench {
+    options: Options,
+    started: Instant,
+    phase: Phase,
+    info: RunInfo,
+    /// `frames_presented` when the measurement started.
+    presented_at_start: u64,
+    exiting: bool,
+}
+
+/// Turns the counters of each measured frame into a [`FrameRecord`].
+#[derive(Resource)]
+struct Recorder {
+    generated: Arc<AtomicU64>,
+    jobs_done: Arc<AtomicU64>,
+    last_generated: u64,
+    last_jobs: u64,
+    last_stats: WorldStats,
+    last_presented: u64,
+    /// Quads of every mesh sent to the renderer and not removed.
+    resident: HashMap<ChunkId, u32>,
+    quads: u64,
+    /// Set by `drive` for a measured frame, completed by `record` in the next frame.
+    pending: Option<Pending>,
+    log: RecordLog,
+}
+
+impl Recorder {
+    fn new(generated: Arc<AtomicU64>, jobs_done: Arc<AtomicU64>) -> Self {
+        Self {
+            generated,
+            jobs_done,
+            last_generated: 0,
+            last_jobs: 0,
+            last_stats: WorldStats::default(),
+            last_presented: 0,
+            resident: HashMap::with_capacity(RESIDENT_CAPACITY),
+            quads: 0,
+            pending: None,
+            log: RecordLog::default(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Systems
+
+fn spawn_camera(mut commands: Commands, bench: Res<Bench>) {
+    let o = &bench.options;
+    commands.spawn((
+        Camera {
+            view_distance: o.radius as f32 * 32.0,
+            ..Camera::default()
+        },
+        camera_at(o.scenario, o.camera, o.speed, 1.0, 0.0),
+        ChunkViewer { radius: o.radius },
+    ));
+}
+
+/// Exit 2 when no GPU can be used.
+fn gpu_failed(
+    mut failed: MessageReader<GpuFailed>,
+    mut bench: ResMut<Bench>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    if let Some(event) = failed.read().last() {
+        eprintln!("stress: no usable GPU: {}", event.error);
+        bench.exit(2, &mut exit);
+    }
+}
+
+/// `PreUpdate`: completes the record of the previous frame. Its `Time::real_delta` (measured
+/// at this frame's `First`) spans that whole frame; `WorldStats` (its `Last`), `RenderInfo` (its
+/// `Render`) and the mesh messages (its `Update`) belong to it too.
+fn record(
+    time: Res<Time>,
+    stats: Res<WorldStats>,
+    info: Res<RenderInfo>,
+    mut events: MessageReader<ChunkMeshEvent>,
+    mut rec: ResMut<Recorder>,
+) {
+    let (mut meshes, mut removed, mut upload_quads) = (0u32, 0u32, 0u64);
+    for event in events.read() {
+        match event {
+            ChunkMeshEvent::Upsert { id, mesh, .. } => {
+                let quads = mesh.total_quads();
+                meshes += 1;
+                upload_quads += u64::from(quads);
+                let old = rec.resident.insert(*id, quads).unwrap_or(0);
+                rec.quads = rec.quads + u64::from(quads) - u64::from(old);
+            }
+            ChunkMeshEvent::Remove { id, .. } => {
+                removed += 1;
+                if let Some(quads) = rec.resident.remove(id) {
+                    rec.quads -= u64::from(quads);
+                }
+            }
+        }
+    }
+    let generated = rec.generated.load(Ordering::Relaxed);
+    let jobs = rec.jobs_done.load(Ordering::Relaxed);
+    let now = *stats;
+    if let Some(p) = rec.pending.take() {
+        let delta = |a: usize, b: usize| a as i64 - b as i64;
+        let record = FrameRecord {
+            t: p.t,
+            frame_time: time.real_delta(),
+            presented: info.frames_presented > rec.last_presented,
+            crossed: p.crossed,
+            camera: p.camera,
+            generated: (generated - rec.last_generated) as u32,
+            jobs_done: (jobs - rec.last_jobs) as u32,
+            meshes,
+            removed,
+            upload_quads,
+            d_data_ready: delta(now.data_ready, rec.last_stats.data_ready),
+            d_chunks: delta(now.chunks, rec.last_stats.chunks),
+            world: now,
+            gpu_chunks: info.chunks,
+            quads: rec.quads,
+            draws: info.draws,
+        };
+        rec.log.push(record);
+    }
+    rec.last_generated = generated;
+    rec.last_jobs = jobs;
+    rec.last_stats = now;
+    rec.last_presented = info.frames_presented;
+}
+
+/// `Update`, before the world computes interest: phases, the camera script and the exit.
+fn drive(
+    mut bench: ResMut<Bench>,
+    mut rec: ResMut<Recorder>,
+    info: Res<RenderInfo>,
+    stats: Res<WorldStats>,
+    mut cameras: Query<&mut Transform, With<Camera>>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    if bench.exiting {
+        return;
+    }
+    let now = Instant::now();
+    if bench.started.elapsed() > bench.options.timeout {
+        match bench.phase {
+            Phase::Loading { .. } => eprintln!(
+                "stress: the world did not settle within {:.0} s: {:?}",
+                bench.options.timeout.as_secs_f64(),
+                *stats
+            ),
+            Phase::CatchUp { .. } => {
+                // The measurement is complete; only the catch-up time is missing.
+                bench.finish(&rec, &info, None, &mut exit);
+                return;
+            }
+            _ => eprintln!(
+                "stress: timeout after {:.0} s",
+                bench.options.timeout.as_secs_f64()
+            ),
+        }
+        bench.exit(4, &mut exit);
+        return;
+    }
+    let settled = info.ready && stats.chunks > 0 && stats.is_settled();
+    match bench.phase {
+        Phase::Loading { streak } => {
+            let streak = if settled { streak + 1 } else { 0 };
+            bench.phase = Phase::Loading { streak };
+            if streak >= SETTLED_FRAMES {
+                let elapsed = bench.started.elapsed().as_secs_f64();
+                println!(
+                    "stress: world settled after {elapsed:.2} s: chunks={} meshed={} empty={} \
+                     gpu_chunks={}",
+                    stats.chunks, stats.mesh_ready, stats.mesh_empty, info.chunks
+                );
+                bench.info.settle_s = elapsed;
+                bench.info.settle_chunks = stats.chunks;
+                bench.phase = Phase::Warmup {
+                    until: now + bench.options.warmup,
+                };
+            }
+        }
+        Phase::Warmup { until } if now >= until => {
+            bench.phase = Phase::Measuring { start: now };
+            bench.presented_at_start = info.frames_presented;
+            bench.info.load_start = load_average();
+            bench.info.unix_time = unix_time();
+            println!(
+                "stress: measuring {} for {:.0} s",
+                bench.options.scenario.name(),
+                bench.options.duration.as_secs_f64()
+            );
+            measure_frame(&bench.options, now, now, &mut rec, &mut cameras);
+        }
+        Phase::Measuring { start } => {
+            if now.duration_since(start) >= bench.options.duration {
+                bench.info.load_end = load_average();
+                bench.info.frames_presented = info.frames_presented - bench.presented_at_start;
+                bench.phase = Phase::CatchUp {
+                    since: now,
+                    streak: 0,
+                };
+            } else {
+                measure_frame(&bench.options, start, now, &mut rec, &mut cameras);
+            }
+        }
+        Phase::CatchUp { since, streak } => {
+            let streak = if settled { streak + 1 } else { 0 };
+            bench.phase = Phase::CatchUp { since, streak };
+            if streak >= SETTLED_FRAMES {
+                bench.finish(&rec, &info, Some(now.duration_since(since)), &mut exit);
+            } else if now.duration_since(since) > CATCH_UP_LIMIT {
+                bench.finish(&rec, &info, None, &mut exit);
+            }
+        }
+        Phase::Warmup { .. } | Phase::Done => {}
+    }
+}
+
+/// Moves the camera for a measured frame and leaves the frame's first half of the record.
+fn measure_frame(
+    options: &Options,
+    start: Instant,
+    now: Instant,
+    rec: &mut Recorder,
+    cameras: &mut Query<&mut Transform, With<Camera>>,
+) {
+    let t = now.duration_since(start);
+    for mut transform in cameras.iter_mut() {
+        let before = chunk_of(&transform);
+        let next = camera_at(
+            options.scenario,
+            options.camera,
+            options.speed,
+            options.duration.as_secs_f64(),
+            t.as_secs_f64(),
+        );
+        // Only a real move marks the transform changed (a static camera stays untouched).
+        transform.set_if_neq(next);
+        // Compass yaw of the view direction (0 looks along -Z, -90 along +X).
+        let forward = next.forward();
+        let yaw = (-forward.x).atan2(-forward.z).to_degrees();
+        rec.pending = Some(Pending {
+            t,
+            crossed: chunk_of(&next) != before,
+            camera: (next.translation.x, next.translation.z, yaw),
+        });
+    }
+}
+
+impl Bench {
+    /// Writes the outputs, prints the result line and exits (0, or 3 if a file failed).
+    fn finish(
+        &mut self,
+        rec: &Recorder,
+        info: &RenderInfo,
+        catch_up: Option<Duration>,
+        exit: &mut MessageWriter<AppExit>,
+    ) {
+        self.phase = Phase::Done;
+        self.info.catch_up_s = catch_up.map(|d| d.as_secs_f64());
+        self.info.adapter.clone_from(&info.adapter);
+        self.info.backend.clone_from(&info.backend);
+        self.info.driver.clone_from(&info.driver);
+        self.info.tier = info
+            .tier
+            .map_or_else(|| "?".to_string(), |t| format!("{t:?}"));
+        self.info.class = info
+            .class
+            .map_or_else(|| "?".to_string(), |c| format!("{c:?}"));
+        let records = rec.log.to_vec();
+        let Some(summary) = Summary::compute(&records) else {
+            eprintln!("stress: no frame was measured");
+            self.exit(3, exit);
+            return;
+        };
+        println!("{}", report::one_line(&self.info, &summary));
+        let mut code = 0;
+        if let Some(path) = &self.options.csv
+            && let Err(e) = write_file(path, &report::csv(&records))
+        {
+            eprintln!("stress: {e}");
+            code = 3;
+        }
+        if let Some(path) = &self.options.summary
+            && let Err(e) = write_file(path, &report::markdown(&self.info, &summary))
+        {
+            eprintln!("stress: {e}");
+            code = 3;
+        }
+        self.exit(code, exit);
+    }
+
+    fn exit(&mut self, code: u8, exit: &mut MessageWriter<AppExit>) {
+        if self.exiting {
+            return;
+        }
+        self.exiting = true;
+        self.phase = Phase::Done;
+        exit.write(AppExit::from_code(code));
+    }
+}
+
+fn write_file(path: &Path, text: &str) -> Result<(), String> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+    println!("stress: wrote {}", path.display());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Machine information
+
+/// 1-minute load average (Linux; `None` elsewhere).
+fn load_average() -> Option<f64> {
+    let text = std::fs::read_to_string("/proc/loadavg").ok()?;
+    text.split_whitespace().next()?.parse().ok()
+}
+
+/// CPU model name (Linux; empty elsewhere).
+fn cpu_name() -> String {
+    std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find(|l| l.starts_with("model name"))
+                .and_then(|l| l.split_once(':'))
+                .map(|(_, name)| name.trim().to_string())
+        })
+        .unwrap_or_default()
+}
+
+fn unix_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Kills the process if `main` has not returned `limit` after start (the event loop stopped
+/// updating, so the in-app timeout cannot fire). Dropping the returned sender disarms it.
+fn spawn_watchdog(limit: Duration) -> Sender<()> {
+    let (disarm, armed) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if armed.recv_timeout(limit) == Err(RecvTimeoutError::Timeout) {
+            eprintln!("stress: watchdog: still running after {limit:?}, exiting with 4");
+            std::process::exit(4);
+        }
+    });
+    disarm
+}
+
+fn main() -> AppExit {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (mut gpu, gpu_config, rest) = match GpuPreferences::from_args(&args) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("stress: {e}\n\n{USAGE}\n\n{CLI_HELP}");
+            return AppExit::from_code(1);
+        }
+    };
+    let options = match parse_options(&rest) {
+        Ok(Some(options)) => options,
+        Ok(None) => {
+            println!("{USAGE}\n\n{CLI_HELP}");
+            return AppExit::Success;
+        }
+        Err(message) => {
+            eprintln!("stress: {message}\n\n{USAGE}\n\n{CLI_HELP}");
+            return AppExit::from_code(1);
+        }
+    };
+    if cfg!(debug_assertions) {
+        eprintln!("stress: debug build: the numbers are not comparable, use --release");
+    }
+    let _watchdog = spawn_watchdog(options.timeout.saturating_add(WATCHDOG_GRACE));
+
+    // Uncapped: every update renders (offscreen while the window is covered or between
+    // compositor frame callbacks) and presents without waiting for vblank.
+    let present = match gpu.present_mode {
+        Some(mode) => format!("{mode:?}").to_lowercase(),
+        None if std::env::var_os("BOXEL_PRESENT").is_some() => "BOXEL_PRESENT".to_string(),
+        None => {
+            gpu.present_mode = Some(PresentModePref::Immediate);
+            "immediate".to_string()
+        }
+    };
+    let generated = Arc::new(AtomicU64::new(0));
+    let jobs_done = Arc::new(AtomicU64::new(0));
+    let terrain = TerrainGenerator::new(options.seed, TerrainSettings::default());
+    let inner: Arc<dyn WorldGenerator> = if options.trees {
+        Arc::new(Forest { terrain })
+    } else {
+        Arc::new(terrain)
+    };
+    let info = RunInfo {
+        scenario: options.scenario.name().to_string(),
+        label: options.label.clone(),
+        radius: options.radius,
+        speed: if options.scenario == Scenario::Fly {
+            options.speed
+        } else {
+            0.0
+        },
+        seed: options.seed,
+        trees: options.trees,
+        duration_s: options.duration.as_secs_f64(),
+        warmup_s: options.warmup.as_secs_f64(),
+        present,
+        window: options.size,
+        build: if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+        .to_string(),
+        cpu: cpu_name(),
+        threads: std::thread::available_parallelism().map_or(0, usize::from),
+        ..RunInfo::default()
+    };
+    let mut plugins = DefaultPlugins
+        .set(WindowPlugin {
+            primary: WindowSettings {
+                title: format!("boxel stress ({})", options.scenario.name()),
+                width: options.size.0,
+                height: options.size.1,
+                ..WindowSettings::default()
+            },
+            ..WindowPlugin::default()
+        })
+        .set(RenderPlugin {
+            settings: RenderSettings {
+                app_name: "stress".to_string(),
+                gpu,
+                gpu_config,
+                render_when_hidden: true,
+                ..RenderSettings::default()
+            },
+        })
+        .set(WorldPlugin {
+            generator: Arc::new(CountingGenerator {
+                inner,
+                generated: Arc::clone(&generated),
+            }),
+            executor: Arc::new(CountingExecutor {
+                done: Arc::clone(&jobs_done),
+            }),
+            ..WorldPlugin::default()
+        });
+    if let Some(threads) = options.async_threads {
+        plugins = plugins.set(TaskPoolPlugin {
+            task_pool_options: TaskPoolOptions {
+                async_compute: TaskPoolThreadAssignmentPolicy {
+                    min_threads: threads,
+                    max_threads: threads,
+                    percent: 0.4,
+                },
+                ..TaskPoolOptions::default()
+            },
+        });
+    }
+
+    let mut app = App::new();
+    app.add_plugins(plugins)
+        .insert_resource(Recorder::new(generated, jobs_done))
+        .insert_resource(Bench {
+            started: Instant::now(),
+            phase: Phase::Loading { streak: 0 },
+            info,
+            presented_at_start: 0,
+            exiting: false,
+            options,
+        })
+        .add_systems(Startup, spawn_camera)
+        .add_systems(PreUpdate, record)
+        .add_systems(
+            Update,
+            (gpu_failed, drive).chain().before(WorldSystems::Interest),
+        );
+    // The bench measures the uncapped loop.
+    // TODO(frame-limit): once boxel_app has the `FrameLimit` resource (0 = unlimited), add
+    // `app.insert_resource(FrameLimit(0));` here, or the runs are capped at the default 144 fps.
+    app.run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Option<Options>, String> {
+        let args: Vec<String> = args.iter().map(ToString::to_string).collect();
+        parse_options(&args)
+    }
+
+    #[test]
+    fn defaults() {
+        let o = parse(&[]).expect("valid").expect("not help");
+        assert_eq!(o.scenario, Scenario::Static);
+        assert_eq!(o.radius, 16);
+        assert_eq!(o.speed, 32.0);
+        assert_eq!(o.duration, Duration::from_secs(20));
+        assert_eq!(o.warmup, Duration::from_secs(2));
+        assert_eq!(o.timeout, Duration::from_secs(142));
+        assert!(o.trees);
+        assert_eq!((o.csv, o.summary), (None, None));
+    }
+
+    #[test]
+    fn flags_and_inline_values() {
+        let o = parse(&[
+            "--scenario=fly",
+            "--radius",
+            "32",
+            "--speed",
+            "64",
+            "--duration",
+            "1.5",
+            "--warmup",
+            "0",
+            "--csv",
+            "a.csv",
+            "--summary=b.md",
+            "--label",
+            "abc",
+            "--camera",
+            "1,2,3,4,5",
+            "--size",
+            "800x600",
+            "--async-threads",
+            "4",
+            "--no-trees",
+            "--seed",
+            "9",
+        ])
+        .expect("valid")
+        .expect("not help");
+        assert_eq!(o.scenario, Scenario::Fly);
+        assert_eq!((o.radius, o.speed), (32, 64.0));
+        assert_eq!(o.duration, Duration::from_millis(1500));
+        assert_eq!(o.warmup, Duration::ZERO);
+        assert_eq!(o.timeout, SETTLE_ALLOWANCE + Duration::from_millis(1500));
+        assert_eq!(o.csv.as_deref(), Some(Path::new("a.csv")));
+        assert_eq!(o.summary.as_deref(), Some(Path::new("b.md")));
+        assert_eq!(o.label, "abc");
+        assert_eq!(o.camera, [1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(o.size, (800, 600));
+        assert_eq!(o.async_threads, Some(4));
+        assert!(!o.trees);
+        assert_eq!(o.seed, 9);
+        let o = parse(&["--timeout", "30", "--scenario", "spin"])
+            .expect("valid")
+            .expect("not help");
+        assert_eq!(
+            (o.timeout, o.scenario),
+            (Duration::from_secs(30), Scenario::Spin)
+        );
+    }
+
+    #[test]
+    fn bad_input_is_rejected() {
+        for args in [
+            &["--scenario", "walk"][..],
+            &["--radius", "0"],
+            &["--radius", "65"],
+            &["--speed", "-1"],
+            &["--speed", "inf"],
+            &["--duration", "0"],
+            &["--duration"],
+            &["--camera", "1,2,3"],
+            &["--size", "0x10"],
+            &["--async-threads", "0"],
+            &["--fly"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?} was accepted");
+        }
+        assert_eq!(parse(&["--help"]), Ok(None));
+    }
+
+    #[test]
+    fn fly_moves_along_the_yaw_direction() {
+        let start = [0.0, 140.0, 0.0, -90.0, -20.0];
+        let t = camera_at(Scenario::Fly, start, 32.0, 20.0, 2.0);
+        assert_eq!(
+            t.translation,
+            DVec3::new(64.0, 140.0, 0.0),
+            "no drift off the axis"
+        );
+        // Looking where it flies (pitch aside).
+        let forward = t.forward();
+        assert!(
+            forward.x > 0.9 && forward.y < 0.0 && forward.z.abs() < 1e-6,
+            "{forward:?}"
+        );
+        // Yaw 0 looks along -Z.
+        let t = camera_at(Scenario::Fly, [0.0, 0.0, 0.0, 0.0, 0.0], 10.0, 1.0, 1.0);
+        assert!((t.translation - DVec3::new(0.0, 0.0, -10.0)).length() < 1e-9);
+        // Crossing a chunk border: x = 31.9 -> 32.1, and only in x.
+        let a = camera_at(Scenario::Fly, start, 32.0, 20.0, 31.9 / 32.0);
+        let b = camera_at(Scenario::Fly, start, 32.0, 20.0, 32.1 / 32.0);
+        let (ca, cb) = (chunk_of(&a), chunk_of(&b));
+        assert_eq!((cb.x - ca.x, cb.y - ca.y, cb.z - ca.z), (1, 0, 0));
+        // The default start is the middle of a chunk.
+        let o = parse(&[]).expect("valid").expect("not help");
+        let begin = camera_at(Scenario::Fly, o.camera, 32.0, 20.0, 0.0);
+        let local = begin.translation.rem_euclid(DVec3::splat(32.0));
+        assert_eq!((local.x, local.z), (16.0, 16.0));
+    }
+
+    #[test]
+    fn spin_turns_once_and_static_stays() {
+        let start = [5.0, 140.0, 7.0, -90.0, -20.0];
+        let begin = camera_at(Scenario::Spin, start, 32.0, 20.0, 0.0);
+        let half = camera_at(Scenario::Spin, start, 32.0, 20.0, 10.0);
+        let end = camera_at(Scenario::Spin, start, 32.0, 20.0, 20.0);
+        let after = camera_at(Scenario::Spin, start, 32.0, 20.0, 30.0);
+        assert_eq!(begin.translation, half.translation);
+        assert!(
+            (half.forward().x + begin.forward().x).abs() < 1e-5,
+            "half a turn"
+        );
+        assert!(
+            (end.forward() - begin.forward()).length() < 1e-5,
+            "a full turn"
+        );
+        assert_eq!(after, end, "never more than one turn");
+        let still = camera_at(Scenario::Static, start, 32.0, 20.0, 15.0);
+        assert_eq!(still, begin);
+    }
+
+    #[test]
+    fn counting_generator_counts_and_forwards() {
+        let generated = Arc::new(AtomicU64::new(0));
+        let inner: Arc<dyn WorldGenerator> = Arc::new(TerrainGenerator::default());
+        let counting = CountingGenerator {
+            inner: Arc::clone(&inner),
+            generated: Arc::clone(&generated),
+        };
+        let registry = BlockRegistry::default_blocks();
+        let key = ChunkKey::new(ChunkPos::new(0, 1, 0));
+        let data = counting.generate(key, &registry);
+        assert!(data == inner.generate(key, &registry));
+        assert_eq!(generated.load(Ordering::Relaxed), 1);
+        assert_eq!(counting.vertical_chunks(), inner.vertical_chunks());
+        assert_eq!(counting.name(), inner.name());
+    }
+
+    #[test]
+    fn counting_executor_counts_finished_jobs() {
+        let done = Arc::new(AtomicU64::new(0));
+        let executor = CountingExecutor {
+            done: Arc::clone(&done),
+        };
+        let (tx, rx) = mpsc::channel();
+        for i in 0..4 {
+            let tx = tx.clone();
+            executor.spawn(Box::new(move || tx.send(i).expect("receiver alive")));
+        }
+        for _ in 0..4 {
+            rx.recv_timeout(Duration::from_secs(30)).expect("job ran");
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while done.load(Ordering::Relaxed) < 4 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(done.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn scenario_names_round_trip() {
+        for s in [Scenario::Static, Scenario::Fly, Scenario::Spin] {
+            assert_eq!(Scenario::parse(s.name()), Some(s));
+        }
+        assert_eq!(Scenario::parse("Fly"), None);
+    }
+}

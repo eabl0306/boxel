@@ -18,3 +18,7 @@ Thumbs.db
 
 # Agent worktrees (local only)
 /.claude/worktrees/
+
+# Stress runs (just bench-*)
+/bench-results/
+__pycache__/

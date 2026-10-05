@@ -113,6 +113,47 @@ miri:
 bench *args:
     cargo bench --workspace --bench '*' {{ args }}
 
+[group('test')]
+[doc('Tests of the Python tools (tools/bench_report.py)')]
+test-tools:
+    python3 tools/bench_report_test.py
+
+# Stress runs (examples/stress.rs, docs/benchmarks.md). Each one opens a window that closes by
+# itself and writes bench-results/<timestamp>-<scenario>.{md,csv} (git-ignored). Extra options
+# go to the example: just bench-fly --radius 32 --speed 64 --backend vulkan --tier high
+[group('bench')]
+[doc('Stress run, fixed camera on the settled world: just bench-static --radius 32')]
+bench-static *args: (_stress "static" args)
+
+[group('bench')]
+[doc('Stress run, camera flying straight (default 32 voxels/s): just bench-fly --speed 64')]
+bench-fly *args: (_stress "fly" args)
+
+[group('bench')]
+[doc('Stress run, camera turning 360 degrees in place: just bench-spin --radius 16')]
+bench-spin *args: (_stress "spin" args)
+
+[group('bench')]
+[doc('static, fly at 32 and 64 voxels/s, and spin, with the same options')]
+bench-all *args: (_stress "static" args) (_stress "fly" "--speed 32" args) (_stress "fly" "--speed 64" args) (_stress "spin" args)
+
+[group('bench')]
+[doc('Tables from stress summaries: just bench-report bench-results/ (or --compare BASE NEW)')]
+bench-report *args:
+    python3 tools/bench_report.py {{ args }}
+
+[private]
+_stress scenario *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p bench-results
+    out="bench-results/$(date +%Y%m%d-%H%M%S)-{{ scenario }}"
+    label="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    git diff --quiet HEAD 2>/dev/null || label="$label-dirty"
+    cargo run --release --locked --example stress -- --scenario {{ scenario }} --label "$label" \
+        --csv "$out.csv" --summary "$out.md" {{ args }}
+    python3 tools/bench_report.py "$out.md"
+
 [group('run')]
 [doc('Headless GPU report: just gpu-info --backend gl')]
 gpu-info *args:
@@ -149,4 +190,4 @@ vendor-lock:
 
 [group('ci')]
 [doc('The main per-PR CI checks, locally (MSRV and the software GPU tests run apart)')]
-ci: fmt-check lint test doc deny typos test-vendor
+ci: fmt-check lint test doc deny typos test-vendor test-tools

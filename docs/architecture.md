@@ -920,6 +920,10 @@ schedule `Shutdown` es el lugar para el `flush` final.
   `gpu` (resumen de selección), `render` (tier, chunks, quads, draws, visibles, descartados),
   `world` (chunks por estado, cola, en vuelo, fallidos). `LogDiagnosticsPlugin` las imprime cada
   2 s.
+- `FrameTimeHistory`: los últimos frames (4096 por defecto, mínimo 1024) con su tiempo real
+  (`Time::real_delta`); `summary()` da p50, p95, p99, p99.9, máximo, promedio y 1% low.
+- Tirones mientras se carga el mundo: `examples/stress.rs` y `just bench-*`
+  ([benchmarks.md](benchmarks.md)).
 - Línea estable para scripts: `boxel: backend=Vulkan tier=High class=Discrete adapter="..."
   driver="..."` al estar listo el GPU, y `DECISION: ...` al final del reporte de selección.
 - Tracy: feature `trace_tracy` (tracing-tracy 0.12.0 + tracy-client 0.19.0, GUI 0.14.1) y
