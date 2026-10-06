@@ -4,8 +4,11 @@
 //! Each span is keyed by its name, or by its `name` field when it has one: an ECS system span
 //! (`system`, feature `trace` of the facade) is keyed by the system name, a `schedule` span by
 //! `schedule <label>`, any other span with a `name` field by `<span> <name>`. The time between
-//! entering and exiting a span is added to its key, whatever the thread (systems that run in
-//! parallel add up to more than the wall time). Entering the span whose key is the frame root
+//! entering and exiting a span is added to its key, whatever the thread. Each thread inside a span
+//! counts on its own, also when several are inside the same span at once (the batches of a
+//! parallel query): systems and spans that run in parallel add up to more than the wall time. A
+//! span entered again inside itself on the same thread counts its time once (and both calls).
+//! Entering the span whose key is the frame root
 //! (`schedule Main`: one per `App::update`) closes the frame: the sums so far become the last
 //! frame ([`SpanTimes::last_frame`]) and the next frame starts from zero.
 //!
@@ -160,7 +163,96 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 struct Slot {
     key: usize,
     root: bool,
-    entered: Option<Instant>,
+    /// The first thread inside the span (usually the only one).
+    first: Option<Inside>,
+    /// Other threads inside the span at the same time.
+    more: Vec<Inside>,
+}
+
+/// One thread inside a span.
+#[derive(Clone, Copy)]
+struct Inside {
+    thread: u64,
+    /// Entries not exited yet (more than 1: the span was entered again inside itself).
+    depth: u32,
+    /// When the outermost entry began.
+    since: Instant,
+}
+
+impl Slot {
+    fn new(key: usize, root: bool) -> Self {
+        Self {
+            key,
+            root,
+            first: None,
+            more: Vec::new(),
+        }
+    }
+
+    /// Entry of `thread`.
+    fn enter(&mut self, thread: u64, now: Instant) {
+        let inside = match &mut self.first {
+            Some(first) if first.thread == thread => Some(first),
+            Some(_) => self.more.iter_mut().find(|i| i.thread == thread),
+            None => {
+                self.first = Some(Inside {
+                    thread,
+                    depth: 1,
+                    since: now,
+                });
+                return;
+            }
+        };
+        match inside {
+            Some(inside) => inside.depth += 1,
+            None => self.more.push(Inside {
+                thread,
+                depth: 1,
+                since: now,
+            }),
+        }
+    }
+
+    /// Exit of `thread`.
+    fn exit(&mut self, thread: u64) -> Exit {
+        let inside = match &mut self.first {
+            Some(first) if first.thread == thread => first,
+            _ => match self.more.iter_mut().find(|i| i.thread == thread) {
+                Some(inside) => inside,
+                None => return Exit::NotInside,
+            },
+        };
+        inside.depth -= 1;
+        if inside.depth > 0 {
+            return Exit::Nested;
+        }
+        let since = inside.since;
+        if self.first.is_some_and(|first| first.thread == thread) {
+            self.first = self.more.pop();
+        } else {
+            self.more.retain(|i| i.thread != thread);
+        }
+        Exit::Left(since)
+    }
+}
+
+/// What [`Slot::exit`] did.
+enum Exit {
+    /// The thread was not inside (it entered before the layer saw the span).
+    NotInside,
+    /// Still inside an outer entry of the same span.
+    Nested,
+    /// Left its outermost entry, which began at this instant.
+    Left(Instant),
+}
+
+/// A small number for the calling thread, unique in the process (cheaper than `ThreadId`).
+fn thread_number() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    thread_local! {
+        static NUMBER: u64 = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    NUMBER.with(|n| *n)
 }
 
 /// Reads the `name`, `busy_ns` and `calls` fields.
@@ -224,11 +316,7 @@ where
             return;
         }
         if let Some(span) = ctx.span(id) {
-            span.extensions_mut().insert(Slot {
-                key,
-                root,
-                entered: None,
-            });
+            span.extensions_mut().insert(Slot::new(key, root));
         }
     }
 
@@ -243,7 +331,7 @@ where
         if slot.root {
             self.shared.close_frame();
         }
-        slot.entered = Some(Instant::now());
+        slot.enter(thread_number(), Instant::now());
     }
 
     fn on_exit(&self, id: &Id, ctx: Context<'_, S>) {
@@ -255,10 +343,16 @@ where
         let Some(slot) = extensions.get_mut::<Slot>() else {
             return;
         };
-        if let Some(entered) = slot.entered.take() {
-            let ns = u64::try_from(now.duration_since(entered).as_nanos()).unwrap_or(u64::MAX);
-            self.shared.busy[slot.key].fetch_add(ns, Ordering::Relaxed);
-            self.shared.calls[slot.key].fetch_add(1, Ordering::Relaxed);
+        match slot.exit(thread_number()) {
+            Exit::NotInside => {}
+            Exit::Nested => {
+                self.shared.calls[slot.key].fetch_add(1, Ordering::Relaxed);
+            }
+            Exit::Left(since) => {
+                let ns = u64::try_from(now.duration_since(since).as_nanos()).unwrap_or(u64::MAX);
+                self.shared.busy[slot.key].fetch_add(ns, Ordering::Relaxed);
+                self.shared.calls[slot.key].fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -333,6 +427,48 @@ mod tests {
         let (main_ns, main_calls) = busy(&times, &frame, "schedule Main");
         assert!(main_ns >= system_ns, "the root holds the system");
         assert_eq!(main_calls, 1);
+    }
+
+    #[test]
+    fn threads_inside_one_span_count_on_their_own() {
+        let (layer, times) = span_times("schedule Main");
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let mut frame = SpanFrame::default();
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("par.batch");
+            let _main = tracing::info_span!("schedule", name = ?Main).entered();
+            // Two threads inside the same span at once, like the batches of a parallel query:
+            // both stay inside until both have entered.
+            let both_in = std::sync::Barrier::new(2);
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            std::thread::scope(|scope| {
+                for _ in 0..2 {
+                    scope.spawn(|| {
+                        tracing::dispatcher::with_default(&dispatch, || {
+                            let _in = span.enter();
+                            both_in.wait();
+                            spin_2ms();
+                        });
+                    });
+                }
+            });
+            // Entered again inside itself: both calls, the time once.
+            let nested = tracing::info_span!("nested");
+            nested.in_scope(|| nested.in_scope(spin_2ms));
+            drop(_main);
+            let _next = tracing::info_span!("schedule", name = ?Main).entered();
+            times.last_frame(&mut frame);
+        });
+        let (par_ns, par_calls) = busy(&times, &frame, "par.batch");
+        assert_eq!(par_calls, 2);
+        assert!(par_ns >= 4_000_000, "both threads counted: {par_ns}");
+        let (nested_ns, nested_calls) = busy(&times, &frame, "nested");
+        assert_eq!(nested_calls, 2);
+        let (main_ns, _) = busy(&times, &frame, "schedule Main");
+        assert!(
+            (2_000_000..main_ns).contains(&nested_ns),
+            "nested time counted once: {nested_ns} (frame {main_ns})"
+        );
     }
 
     #[test]
