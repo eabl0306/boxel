@@ -11,11 +11,14 @@
 //! surface. Asserts: the upload stats match the scene, every image has a non-background fraction
 //! in [0.05, 0.95], and every tier matches the best tier of its adapter within 0.1 % of the
 //! pixels (channel tolerance 2). Then every tier renders the same scene and views moved far from
-//! the origin along x and -z ([`FAR_SHIFTS`]: straddling the former `i32` edge at `+-2^31`, past
-//! it, and `2^40`) and must give exactly the pixels it gave near the origin: chunk origins are
-//! `i64` on the CPU and wrapped to 32 bits for the GPU, whose wrapping subtraction gives the same
-//! camera-relative positions. Failing images are saved under `CARGO_TARGET_TMPDIR/gpu_terrain/`
-//! (every image with `GPU_TERRAIN_SAVE=1`).
+//! the origin ([`FAR_SHIFTS`]: straddling the former `i32` edge at `+-2^31` in x, z and y, past
+//! it, and far beyond) and must give exactly the pixels it gave near the origin: chunk origins
+//! are `i64` on the CPU and wrapped to 32 bits for the GPU, whose wrapping subtraction gives the
+//! same camera-relative positions. Every renderer also teleports its camera `2^32` voxels away
+//! with the chunks still resident (where their wrapped origins land exactly under the camera)
+//! and must draw nothing there, then the original pixels again when the camera comes back.
+//! Failing images are saved under `CARGO_TARGET_TMPDIR/gpu_terrain/` (every image with
+//! `GPU_TERRAIN_SAVE=1`).
 #![expect(clippy::print_stderr, reason = "test progress and failure details")]
 use boxel_camera::{Camera, CameraView};
 use boxel_gfx::{
@@ -39,10 +42,23 @@ const HEIGHT: u32 = 180;
 const MAX_TIER_DIFF: f64 = 0.001;
 /// Meshed columns are `-MESH_RADIUS..MESH_RADIUS` in x and z (data goes one column further).
 const MESH_RADIUS: i64 = 3;
-/// Far-from-origin translations (voxels, applied as `+x`, `-z`; multiples of 32 so the chunk grid
-/// lines up with the one near the origin): the meshed area straddles `+2^31` in x and `-2^31` in
-/// z, lies just past them, and at `2^40`.
-const FAR_SHIFTS: [i64; 3] = [(1 << 31) - 64, (1 << 31) + (1 << 20), 1 << 40];
+/// Far-from-origin translations of the scene and the views (voxels, multiples of 32 so the chunk
+/// grid lines up with the one near the origin).
+const FAR_SHIFTS: [I64Vec3; 5] = [
+    // The meshed area straddles +2^31 in x and -2^31 in z (where the wrapped origins jump).
+    I64Vec3::new((1 << 31) - 64, 0, -(1 << 31) + 64),
+    // Just past them.
+    I64Vec3::new((1 << 31) + (1 << 20), 0, -(1 << 31) - (1 << 20)),
+    // 2^40 away and across the wrap again (2^40 alone wraps to the same 32 bits as 0).
+    I64Vec3::new((1 << 40) + (1 << 31) - 64, 0, -(1 << 40) - (1 << 31) + 64),
+    // The surface (around y = 64) straddles +2^31 in y, then -2^31.
+    I64Vec3::new(-(1 << 35), (1 << 31) - 64, 1 << 35),
+    I64Vec3::new(1 << 31, -(1 << 31) - 64, 0),
+];
+
+/// How far the camera teleports with the chunks left resident: their wrapped origins are then
+/// the same as near the camera.
+const TELEPORT: I64Vec3 = I64Vec3::new(1 << 32, 0, -(1 << 32));
 
 // ---------------------------------------------------------------- adapters
 
@@ -209,23 +225,18 @@ fn chunk_id(c: ChunkPos) -> u64 {
     pack(c.x) | pack(c.y) << 10 | pack(c.z) << 20
 }
 
-/// Translation of the whole scene (and views) for `shift` voxels: `+x`, `-z`.
-fn offset(shift: i64) -> I64Vec3 {
-    I64Vec3::new(shift, 0, -shift)
-}
-
-/// `transform` moved by [`offset`]. Eye coordinates are multiples of 1/64, exact in `f64` at
-/// every shift, so the camera-relative eye and the view matrix are the same as near the origin.
-fn view_params(transform: &Transform, shift: i64) -> ViewParams {
+/// `transform` moved by `shift`. Eye coordinates are multiples of 1/64, exact in `f64` at every
+/// shift, so the camera-relative eye and the view matrix are the same as near the origin.
+fn view_params(transform: &Transform, shift: I64Vec3) -> ViewParams {
     let camera = Camera::default();
     let mut transform = *transform;
-    transform.translation += offset(shift).as_dvec3();
+    transform.translation += shift.as_dvec3();
     let view = CameraView::compute(&camera, &transform, WIDTH as f32 / HEIGHT as f32);
     ViewParams::from_camera(&view, &camera, RendererConfig::default().clear_color, 0.6)
 }
 
 /// From above the (-x, -z) corner of the meshed area, looking at its center.
-fn overview(scene: &Scene, shift: i64) -> ViewParams {
+fn overview(scene: &Scene, shift: I64Vec3) -> ViewParams {
     let eye = DVec3::new(
         -110.296_875,
         f64::from(scene.max_height) + 40.593_75,
@@ -240,7 +251,7 @@ fn overview(scene: &Scene, shift: i64) -> ViewParams {
 
 /// Just above the highest column at the -x edge, looking across the surface toward +x (hills,
 /// valleys and the horizon at the far edge, many chunks in depth).
-fn across(scene: &Scene, shift: i64) -> ViewParams {
+fn across(scene: &Scene, shift: I64Vec3) -> ViewParams {
     let eye = DVec3::new(
         -94.593_75,
         f64::from(scene.max_height) + 3.406_25,
@@ -277,23 +288,29 @@ fn render(
     Ok((image, cpu))
 }
 
-/// Images of one tier, in the order of [`VIEWS`].
+/// Images of one tier.
 struct TierImages {
     tier: Tier,
+    /// In the order of [`VIEWS`].
     images: Vec<RgbaImage>,
+    /// The overview moved by [`TELEPORT`] with the scene left where it was: right after the
+    /// teleport, and after uploading every mesh again from there.
+    teleported: [RgbaImage; 2],
+    /// The overview again, back at the scene.
+    back: RgbaImage,
 }
 
 /// View names, in the order `render_tier` renders them.
 const VIEWS: [&str; 2] = ["overview", "across"];
 
-/// Uploads the scene moved by [`offset`]`(shift)` and renders every view (moved the same way)
-/// on one tier.
+/// Uploads the scene moved by `shift` and renders every view (moved the same way) on one tier,
+/// then the overview after a [`TELEPORT`] and back.
 fn render_tier(
     adapter: &wgpu::Adapter,
     caps: &AdapterCaps,
     tier: Tier,
     scene: &Scene,
-    shift: i64,
+    shift: I64Vec3,
 ) -> Result<TierImages, String> {
     let (device, queue, errors) = device_for(adapter, caps, tier)?;
     let config = RendererConfig {
@@ -314,12 +331,16 @@ fn render_tier(
     if renderer.tier() != tier {
         return Err(format!("renderer reports tier {}", renderer.tier()));
     }
-    for (pos, mesh) in &scene.meshes {
-        let origin = pos.origin().as_i64vec3() + offset(shift);
-        renderer
-            .upsert_chunk(&queue, chunk_id(*pos), origin, mesh)
-            .map_err(|e| format!("upsert {pos:?}: {e}"))?;
-    }
+    let upload = |renderer: &mut VoxelRenderer| -> Result<(), String> {
+        for (pos, mesh) in &scene.meshes {
+            let origin = pos.origin().as_i64vec3() + shift;
+            renderer
+                .upsert_chunk(&queue, chunk_id(*pos), origin, mesh)
+                .map_err(|e| format!("upsert {pos:?}: {e}"))?;
+        }
+        Ok(())
+    };
+    upload(&mut renderer)?;
     let stats = renderer.stats();
     if stats.chunks as usize != scene.meshes.len() || stats.arena_used_quads != scene.quads() {
         return Err(format!(
@@ -351,11 +372,25 @@ fn render_tier(
         images.push(image);
     }
 
+    // The old chunks are still resident after a teleport (the world removes them over a few
+    // frames). Their wrapped origins equal the ones they had near the camera: only an i64 test
+    // keeps them from being drawn under it.
+    let away = overview(scene, shift + TELEPORT);
+    let (teleported, _) = render(&device, &queue, &mut renderer, &away)?;
+    upload(&mut renderer)?;
+    let (uploaded, _) = render(&device, &queue, &mut renderer, &away)?;
+    let (back, _) = render(&device, &queue, &mut renderer, &overview(scene, shift))?;
+
     let errors = errors.lock().map(|e| e.clone()).unwrap_or_default();
     if !errors.is_empty() {
         return Err(format!("uncaptured errors: {errors:?}"));
     }
-    Ok(TierImages { tier, images })
+    Ok(TierImages {
+        tier,
+        images,
+        teleported: [teleported, uploaded],
+        back,
+    })
 }
 
 // ---------------------------------------------------------------- checks
@@ -404,6 +439,25 @@ impl Report {
                 &[(what, image)],
             );
         }
+    }
+
+    /// After the teleport of `r` nothing is drawn; back at the scene, the overview is unchanged.
+    fn check_teleport(&mut self, what: &str, r: &TierImages) {
+        for (when, image) in ["at_once", "reuploaded"].iter().zip(&r.teleported) {
+            let f = image.non_background_fraction();
+            if f > 0.0 {
+                let name = format!("{what}_teleported_{when}");
+                self.fail(
+                    format!("{what}: {f:.4} of the pixels drawn after a teleport ({when})"),
+                    &[(&name, image)],
+                );
+            }
+        }
+        self.check_identical(
+            &format!("{what}: back from a teleport"),
+            (&format!("{what}_overview"), &r.images[0]),
+            (&format!("{what}_back"), &r.back),
+        );
     }
 
     fn check_identical(&mut self, what: &str, a: (&str, &RgbaImage), b: (&str, &RgbaImage)) {
@@ -472,13 +526,14 @@ fn real_terrain_renders_identically_on_every_tier() {
         eprintln!("gpu_terrain: {label}: tiers {tiers:?}");
         let mut results = Vec::new();
         for &tier in &tiers {
-            match render_tier(adapter, &caps, tier, &scene, 0) {
+            match render_tier(adapter, &caps, tier, &scene, I64Vec3::ZERO) {
                 Ok(r) => results.push(r),
                 Err(e) => report.fail(format!("{label} {tier}: {e}"), &[]),
             }
         }
         // The same scene and views far from the origin: the same pixels on each tier.
         for near in &results {
+            report.check_teleport(&format!("{label}_{}", near.tier), near);
             for shift in FAR_SHIFTS {
                 let far = match render_tier(adapter, &caps, near.tier, &scene, shift) {
                     Ok(far) => far,
@@ -487,6 +542,7 @@ fn real_terrain_renders_identically_on_every_tier() {
                         continue;
                     }
                 };
+                report.check_teleport(&format!("{label}_{}_shift{shift}", near.tier), &far);
                 for (i, view) in VIEWS.iter().enumerate() {
                     report.check_identical(
                         &format!("{label}: {} shift {shift} vs origin ({view})", near.tier),

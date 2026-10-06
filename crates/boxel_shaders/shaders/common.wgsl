@@ -14,8 +14,11 @@
 // World integer positions are i64 on the CPU. Chunk origins and render_origin arrive as their
 // low 32 bits (two's complement wrapping) and are only ever subtracted from each other in i32.
 // WGSL integer arithmetic wraps, so (chunk_origin - render_origin) is the true difference modulo
-// 2^32: exact whenever the chunk is less than 2^31 voxels from the camera, which every live
-// chunk is, at any world position.
+// 2^32: exact whenever the chunk is less than 2^31 voxels from the camera, at any world position.
+// Resident chunks can be farther (the old area right after a teleport); the renderer never draws
+// those: only chunks within about 2^30 voxels of the camera are drawn (boxel_render chunk_table).
+// The CPU sets the live flag only on them (High culls only live chunks), and the CPU cull of Mid
+// and Low skips the rest.
 
 const GEO_POS_MASK: u32 = 31u;
 const GEO_Y_SHIFT: u32 = 5u;

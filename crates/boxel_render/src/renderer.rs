@@ -329,7 +329,9 @@ impl VoxelRenderer {
     }
     /// Uploads (or replaces) a chunk mesh. `id` is any stable `u64` (`ChunkId::to_bits`),
     /// `origin` the chunk's world voxel min corner (`i64`; the chunk table on the GPU keeps its
-    /// low 32 bits, see [`boxel_math::wrap_to_i32`]). Empty meshes remove the chunk.
+    /// low 32 bits, see [`boxel_math::wrap_to_i32`]). While the camera is about `2^30` voxels or
+    /// more away from it on some axis, the chunk stays resident but no tier draws it (its wrapped
+    /// origin difference may not be exact). Empty meshes remove the chunk.
     pub fn upsert_chunk(
         &mut self,
         queue: &wgpu::Queue,
@@ -365,7 +367,7 @@ impl VoxelRenderer {
             self.stats.dropped_chunks += 1;
             return Err(RendererError::ChunkTableFull(self.chunks.capacity()));
         };
-        self.write_slot(queue, slot, &record.gpu());
+        self.write_slot(queue, slot, &self.chunks.gpu_entry(&record));
         Ok(())
     }
     /// Removes a chunk; returns false if unknown.
@@ -405,6 +407,17 @@ impl VoxelRenderer {
         // Every resource already exists; the device parameter is kept for M1 arena growth.
         let _ = device;
         let slot_count = self.chunks.slot_count();
+        // The GPU window follows the camera before any cull: only chunks whose wrapped origin
+        // difference is exact are drawn, on every tier (see `chunk_table`). High reads the
+        // window from the live flags, uploaded again when it moves.
+        let window_moved = self.chunks.follow(view.render_origin);
+        if window_moved
+            && slot_count > 0
+            && let Some(buffer) = &self.chunk_buffer
+        {
+            let entries = self.chunks.gpu_entries();
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&entries));
+        }
         let uniform = ViewUniform {
             view_proj: view.view_proj.to_cols_array_2d(),
             frustum: view.frustum.to_array(),

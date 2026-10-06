@@ -44,7 +44,8 @@ fn cull_chunks(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (slot >= view.counts.x) { return; }
   let ch = chunks[slot];
   if ((ch.flags & 1u) == 0u) { return; }
-  // wrapping i32 subtraction: exact for chunks nearer than 2^31 voxels (see common.wgsl)
+  // wrapping i32 subtraction: exact for chunks nearer than 2^31 voxels, which every live chunk is
+  // (the CPU clears the live flag of chunks far from the camera, see common.wgsl)
   let mn = vec3<f32>(ch.origin - view.render_origin.xyz);
   let mx = mn + vec3(CHUNK_SIZE);
   if (!in_frustum(mn, mx)) { return; }

@@ -1,9 +1,30 @@
 //! Chunk slots: `ChunkGpu` storage table (High/Mid) mirrored on the CPU (all tiers, CPU culling).
+//!
+//! The GPU gets the low 32 bits of each chunk origin, and the shaders subtract them from the
+//! (equally wrapped) render origin in `i32`: exact only for chunks nearer than `2^31` voxels. A
+//! chunk still loaded farther away (the old area for a few frames after a teleport, the area at
+//! the world limit seen from a camera past it) would wrap to a position near the camera. So only
+//! chunks inside a window around the camera ([`GPU_WINDOW`]) are drawn, on every tier: they are
+//! the ones flagged live in the GPU table (the High cull skips the rest) and the only ones the
+//! CPU cull passes (Mid, Low). The window follows the render origin ([`ChunkTable::follow`]).
 use crate::arena::ArenaAlloc;
 use boxel_math::{I64Vec3, IVec3, wrap_to_i32};
 use boxel_mesh::BUCKET_COUNT;
 use boxel_shaders::gpu::ChunkGpu;
 use std::collections::{BTreeSet, HashMap};
+
+/// Half width of the GPU window, in voxels per axis: a chunk whose origin is nearer than this to
+/// the window center on every axis can be drawn (flagged live in the GPU table, passed by the
+/// CPU cull); the rest stay resident but hidden.
+pub(crate) const GPU_WINDOW: u64 = 1 << 30;
+
+/// How far (voxels, on any axis) the render origin may move from the window center before the
+/// window follows it and every live flag is uploaded again.
+pub(crate) const GPU_WINDOW_SLACK: u64 = 1 << 20;
+
+// A chunk inside the window is less than `GPU_WINDOW + GPU_WINDOW_SLACK` voxels from the render
+// origin on every axis, so the GPU's wrapping `i32` subtraction is exact for it.
+const _: () = assert!(GPU_WINDOW + GPU_WINDOW_SLACK < 1 << 31);
 
 /// CPU record of a resident chunk.
 #[derive(Clone, Copy, Debug)]
@@ -25,13 +46,13 @@ impl ChunkRecord {
         wrap_to_i32(self.origin)
     }
 
-    /// The GPU mirror of this record.
-    pub fn gpu(&self) -> ChunkGpu {
+    /// The GPU mirror of this record, flagged live if `live` ([`ChunkTable::gpu_entry`] decides).
+    pub fn gpu(&self, live: bool) -> ChunkGpu {
         ChunkGpu {
             origin: self.gpu_origin().to_array(),
             quad_base: self.alloc.offset,
             counts: self.counts,
-            flags: ChunkGpu::FLAG_LIVE,
+            flags: if live { ChunkGpu::FLAG_LIVE } else { 0 },
             pad: [0; 3],
         }
     }
@@ -44,6 +65,8 @@ pub(crate) struct ChunkTable {
     free: BTreeSet<u32>,
     by_id: HashMap<u64, u32>,
     capacity: u32,
+    /// Center of the GPU window (a recent render origin).
+    window: I64Vec3,
 }
 
 impl ChunkTable {
@@ -54,6 +77,7 @@ impl ChunkTable {
             free: BTreeSet::new(),
             by_id: HashMap::new(),
             capacity,
+            window: I64Vec3::ZERO,
         }
     }
 
@@ -129,6 +153,47 @@ impl ChunkTable {
             .iter()
             .enumerate()
             .filter_map(|(slot, r)| r.as_ref().map(|r| (slot as u32, r)))
+    }
+
+    /// True if a chunk at `origin` is inside the GPU window (nearer than [`GPU_WINDOW`] to its
+    /// center on every axis). Exact for any `i64` positions.
+    pub fn in_window(&self, origin: I64Vec3) -> bool {
+        let c = self.window;
+        origin.x.abs_diff(c.x) < GPU_WINDOW
+            && origin.y.abs_diff(c.y) < GPU_WINDOW
+            && origin.z.abs_diff(c.z) < GPU_WINDOW
+    }
+
+    /// The GPU entry of `record`: live only inside the window.
+    pub fn gpu_entry(&self, record: &ChunkRecord) -> ChunkGpu {
+        record.gpu(self.in_window(record.origin))
+    }
+
+    /// Re-centers the window on `render_origin` when that is more than [`GPU_WINDOW_SLACK`] from
+    /// the center on some axis. Returns true if the window moved: live flags may have changed,
+    /// and the caller uploads [`ChunkTable::gpu_entries`] before the High cull runs. Called every
+    /// frame before culling, so the render origin is never farther than the slack from the
+    /// center.
+    pub fn follow(&mut self, render_origin: I64Vec3) -> bool {
+        let c = self.window;
+        let moved = render_origin.x.abs_diff(c.x) > GPU_WINDOW_SLACK
+            || render_origin.y.abs_diff(c.y) > GPU_WINDOW_SLACK
+            || render_origin.z.abs_diff(c.z) > GPU_WINDOW_SLACK;
+        if moved {
+            self.window = render_origin;
+        }
+        moved
+    }
+
+    /// GPU entries of slots `0..slot_count()` (free slots zeroed), for a full upload.
+    pub fn gpu_entries(&self) -> Vec<ChunkGpu> {
+        self.records
+            .iter()
+            .map(|r| {
+                r.as_ref()
+                    .map_or(ChunkGpu::default(), |r| self.gpu_entry(r))
+            })
+            .collect()
     }
 }
 
@@ -217,12 +282,13 @@ mod tests {
         let mut arena = ArenaAllocator::new(1024, 64);
         let _gap = arena.allocate(10).expect("gap");
         let r = record(&mut arena, 3);
-        let gpu = r.gpu();
+        let gpu = r.gpu(true);
         assert_eq!(gpu.origin, [96, 0, 0]);
         assert_eq!(gpu.quad_base, r.alloc.offset);
         assert_eq!(gpu.counts, r.counts);
         assert_eq!(gpu.flags, ChunkGpu::FLAG_LIVE);
         assert_eq!(gpu.pad, [0; 3]);
+        assert_eq!(r.gpu(false), ChunkGpu { flags: 0, ..gpu });
     }
 
     #[test]
@@ -231,7 +297,113 @@ mod tests {
         let mut r = record(&mut arena, 0);
         // 2^31 wraps to i32::MIN, -2^31 - 32 to i32::MAX - 31, 2^40 + 64 to 64.
         r.origin = I64Vec3::new(1 << 31, -(1 << 31) - 32, (1 << 40) + 64);
-        assert_eq!(r.gpu().origin, [i32::MIN, i32::MAX - 31, 64]);
-        assert_eq!(r.gpu_origin(), IVec3::from_array(r.gpu().origin));
+        assert_eq!(r.gpu(true).origin, [i32::MIN, i32::MAX - 31, 64]);
+        assert_eq!(r.gpu_origin(), IVec3::from_array(r.gpu(true).origin));
+    }
+
+    /// Live flag of every slot, in slot order.
+    fn live(table: &ChunkTable) -> Vec<bool> {
+        table
+            .gpu_entries()
+            .iter()
+            .map(|e| e.flags == ChunkGpu::FLAG_LIVE)
+            .collect()
+    }
+
+    #[test]
+    fn only_chunks_near_the_camera_are_live_on_the_gpu() {
+        let mut arena = ArenaAllocator::new(1024, 64);
+        let mut table = ChunkTable::new(8);
+        let edge = GPU_WINDOW as i64;
+        let origins = [
+            I64Vec3::ZERO,
+            I64Vec3::new(edge - 32, -(edge - 32), 0),
+            I64Vec3::new(0, edge, 0),
+            // The old area after a 2^32-voxel teleport, which wraps onto the new one.
+            I64Vec3::new(1 << 32, 0, -(1 << 32)),
+            I64Vec3::new(i64::MIN, 0, i64::MAX),
+        ];
+        for (id, origin) in origins.into_iter().enumerate() {
+            let mut r = record(&mut arena, id as u64);
+            r.origin = origin;
+            table.insert(r);
+        }
+        assert_eq!(live(&table), [true, true, false, false, false]);
+        let (_, r) = table.get(3).expect("record");
+        assert_eq!(
+            table.gpu_entry(r).origin,
+            [0; 3],
+            "wraps to the world origin"
+        );
+
+        // Moves within the slack keep the window (and the flags).
+        assert!(!table.follow(I64Vec3::new(1000, -(1 << 20), 1 << 20)));
+        assert!(table.follow(I64Vec3::new(0, 0, (1 << 20) + 1)));
+        assert_eq!(live(&table), [true, true, false, false, false]);
+
+        // A teleport: the window follows and the area left behind goes dark.
+        assert!(table.follow(I64Vec3::new((1 << 32) + 7, 3, -(1 << 32) - 9)));
+        assert_eq!(live(&table), [false, false, false, true, false]);
+        // Coming back makes the old chunks live again.
+        assert!(table.follow(I64Vec3::new(16, -16, 16)));
+        assert_eq!(live(&table), [true, true, false, false, false]);
+        // At the ends of i64 (a camera far past the world limit) nothing overflows.
+        assert!(table.follow(I64Vec3::new(i64::MIN + 5, 0, i64::MAX)));
+        assert_eq!(live(&table), [false, false, false, false, true]);
+
+        // Free slots upload zeroed entries.
+        table.remove(1);
+        let entries = table.gpu_entries();
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[1], ChunkGpu::default());
+    }
+
+    #[test]
+    fn live_chunks_have_exact_wrapped_differences() {
+        // Wherever the camera goes, a chunk flagged live has an exact wrapping `i32` difference
+        // to the render origin (what `cull.wgsl` and the vertex shaders compute).
+        let mut arena = ArenaAllocator::new(1 << 16, 1024);
+        let mut table = ChunkTable::new(64);
+        let base = I64Vec3::new((1 << 31) - 64, -(1 << 31), 1 << 40);
+        let mut origins = Vec::new();
+        for (id, k) in (-6i64..=6).enumerate() {
+            let mut r = record(&mut arena, id as u64);
+            r.origin = base + I64Vec3::new(k << 28, k * 32, -(k << 29));
+            origins.push(r.origin);
+            table.insert(r);
+        }
+        // Camera positions relative to `base` and the chunks (`k`) live there.
+        for (camera, expected) in [
+            (I64Vec3::ZERO, vec![-1, 0, 1]),
+            // within the slack: the window stays
+            (I64Vec3::new(1 << 20, -(1 << 20), 1 << 20), vec![-1, 0, 1]),
+            (I64Vec3::new(1 << 30, 0, -(1 << 31)), vec![3, 4, 5]),
+            (
+                I64Vec3::new((1 << 30) + (1 << 20), 1 << 20, -(1 << 31) - (1 << 20)),
+                vec![3, 4, 5],
+            ),
+            (
+                I64Vec3::new(-(1 << 30) - (1 << 20), 0, 1 << 31),
+                vec![-5, -4, -3],
+            ),
+            (I64Vec3::new(0, 1 << 31, 0), vec![]),
+            (I64Vec3::ZERO, vec![-1, 0, 1]),
+        ] {
+            let camera = base + camera;
+            table.follow(camera);
+            let mut live = Vec::new();
+            for ((entry, origin), k) in table.gpu_entries().iter().zip(&origins).zip(-6i64..) {
+                if entry.flags == ChunkGpu::FLAG_LIVE {
+                    live.push(k);
+                    let wrapped = IVec3::from_array(entry.origin).wrapping_sub(wrap_to_i32(camera));
+                    assert_eq!(
+                        wrapped.as_i64vec3(),
+                        *origin - camera,
+                        "{origin} from {camera}"
+                    );
+                }
+            }
+            assert_eq!(live, expected, "camera at {camera}");
+        }
     }
 }

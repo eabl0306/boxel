@@ -356,14 +356,21 @@ pub(crate) struct CpuCull {
 }
 
 impl CpuCull {
-    /// Culls every live chunk exactly like `cull_chunks` in `cull.wgsl`: chunk AABB
+    /// Culls every chunk inside the GPU window (the live ones of `cull.wgsl`, about `2^30` voxels
+    /// around the camera, see `chunk_table`) with the tests of `cull_chunks`: chunk AABB
     /// `[origin - render_origin, + 32]` against the frustum (p-vertex test), then the per-face
     /// bucket test with the camera-relative eye; the cutout bucket only needs the frustum.
+    ///
+    /// Chunks outside the window are skipped at any view distance: Mid and Low draw with the
+    /// wrapped origins too, whose difference is exact only inside it.
     pub fn run(&mut self, chunks: &ChunkTable, view: &ViewParams) {
         self.opaque.clear();
         self.cutout.clear();
         self.visible_chunks = 0;
         for (slot, record) in chunks.iter() {
+            if !chunks.in_window(record.origin) {
+                continue;
+            }
             // In i64 first, then to f32 (exact for every chunk near the camera). Within the world
             // limit (|v| <= 2^61) nothing saturates; a camera past i64 sees every chunk as far
             // (culled) instead of overflowing.
@@ -557,10 +564,13 @@ mod tests {
         ];
         let run = |shift: I64Vec3| {
             let origins: Vec<I64Vec3> = layout.iter().map(|o| *o + shift).collect();
-            let table = table_with(&origins);
+            let mut table = table_with(&origins);
             let eye = shift.as_dvec3() + DVec3::new(16.5, 20.25, 16.5);
+            let view = camera_view(eye, 0.3, -0.2);
+            // As the renderer does every frame before culling.
+            table.follow(view.render_origin);
             let mut cull = CpuCull::default();
-            cull.run(&table, &camera_view(eye, 0.3, -0.2));
+            cull.run(&table, &view);
             let buckets = |list: &[BucketDraw]| -> Vec<(u32, u32, u32)> {
                 list.iter()
                     .map(|d| (d.slot, d.quad_start, d.count))
@@ -590,6 +600,55 @@ mod tests {
             I64Vec3::new(1 << 50, 0, -(1 << 50)),
         ] {
             assert_eq!(run(shift), near, "shift {shift}");
+        }
+    }
+
+    #[test]
+    fn chunks_outside_the_gpu_window_are_culled_at_any_view_distance() {
+        // Two chunks 2^32 voxels apart straight ahead of the camera: the old area after a
+        // teleport, still resident. With an unlimited view distance both are in the frustum, but
+        // their wrapped origins are the same, so drawing the far one (Mid and Low draw with
+        // wrapped origins) would put it on top of the near one: the window keeps it out.
+        let teleport = I64Vec3::new(0, 0, -(1 << 32));
+        let ahead = I64Vec3::new(0, 0, -64);
+        let mut table = table_with(&[ahead, ahead + teleport]);
+        let camera = Camera {
+            view_distance: f32::INFINITY,
+            ..Camera::default()
+        };
+        let view_at = |eye: DVec3| {
+            let transform = Transform::from_yaw_pitch(eye, 0.0, 0.0);
+            let cv = CameraView::compute(&camera, &transform, 16.0 / 9.0);
+            ViewParams::from_camera(&cv, &camera, [0.0; 4], 0.6)
+        };
+        let eye = DVec3::new(16.5, 16.5, 16.5);
+        let mut cull = CpuCull::default();
+        for (eye, visible) in [
+            (eye, vec![0]),
+            // The first chunk is behind the camera now.
+            (eye + teleport.as_dvec3(), vec![1]),
+            // Both ahead, both outside the window.
+            (eye - teleport.as_dvec3(), vec![]),
+            (eye, vec![0]),
+        ] {
+            let view = view_at(eye);
+            // As the renderer does every frame before culling.
+            table.follow(view.render_origin);
+            for (_, record) in table.iter() {
+                let min = record.origin.saturating_sub(view.render_origin).as_vec3();
+                let aabb = Aabb::new(min, min + Vec3::splat(CHUNK_EDGE));
+                let in_front = (record.origin - view.render_origin).z < 0;
+                assert_eq!(view.frustum.intersects_aabb(&aabb), in_front, "{eye}");
+            }
+            cull.run(&table, &view);
+            let mut slots: Vec<u32> = cull.opaque.iter().map(|d| d.slot).collect();
+            slots.dedup();
+            assert_eq!(slots, visible, "camera at {eye}");
+            assert_eq!(
+                cull.visible_chunks as usize,
+                visible.len(),
+                "camera at {eye}"
+            );
         }
     }
 }

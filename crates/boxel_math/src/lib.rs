@@ -27,8 +27,9 @@ pub use frustum::Frustum;
 ///
 /// The GPU only uses differences of such values, computed in `i32`, and WGSL integer arithmetic
 /// wraps: `wrap(a) - wrap(b)` is `a - b` modulo 2^32, so it is exactly `a - b` whenever the
-/// true difference fits in `i32` (`|a - b| < 2^31` voxels), however large `a` and `b` are. For
-/// chunks the renderer draws (a few thousand voxels from the camera) it always does.
+/// true difference fits in `i32` (`|a - b| < 2^31` voxels), however large `a` and `b` are.
+/// `boxel_render` only draws chunks within about `2^30` voxels of the camera (in practice a few
+/// thousand); resident chunks farther away (right after a teleport) are not drawn.
 pub const fn wrap_to_i32(v: I64Vec3) -> IVec3 {
     IVec3::new(v.x as i32, v.y as i32, v.z as i32)
 }
