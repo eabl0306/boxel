@@ -348,7 +348,7 @@ fn render_tier(
         for (pos, mesh) in &scene.meshes {
             let origin = pos.origin().as_i64vec3() + shift;
             renderer
-                .upsert_chunk(&queue, chunk_id(*pos), origin, mesh)
+                .upsert_chunk(chunk_id(*pos), origin, mesh)
                 .map_err(|e| format!("upsert {pos:?}: {e}"))?;
         }
         Ok(())

@@ -447,6 +447,7 @@ dependencies = [
  "boxel_world",
  "boxel_worldgen",
  "bytemuck",
+ "foldhash",
  "offset-allocator",
  "pollster",
  "thiserror 2.0.21",

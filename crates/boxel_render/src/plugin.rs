@@ -1150,18 +1150,18 @@ fn prepare(
     let frame = &mut *frame;
     let queue = &ready.ctx.queue;
     if frame.resync {
-        ready.renderer.clear_chunks(queue);
+        ready.renderer.clear_chunks();
         ready.resync = false;
     }
     for op in frame.meshes.drain(..) {
         let result = match op {
             MeshOp::Upsert { id, origin, mesh } => {
                 let _span = frame_span!("render.upsert");
-                ready.renderer.upsert_chunk(queue, id, origin, &mesh)
+                ready.renderer.upsert_chunk(id, origin, &mesh)
             }
             MeshOp::Remove { id } => {
                 let _span = frame_span!("render.remove");
-                ready.renderer.remove_chunk(queue, id);
+                ready.renderer.remove_chunk(id);
                 Ok(())
             }
         };
@@ -1231,6 +1231,8 @@ fn draw(
                         .overlay
                         .encode(&mut encoder, ready.renderer.main_color_view());
                     ready.renderer.blit(&mut encoder, &target);
+                    // wgpu validates and encodes the recorded commands here
+                    let _span = frame_span!("render.finish");
                     encoder.finish()
                 };
                 {
@@ -1299,6 +1301,7 @@ fn render_offscreen(ready: &mut ReadyGpu, view: &ViewParams) {
         ready
             .overlay
             .encode(&mut encoder, ready.renderer.main_color_view());
+        let _span = frame_span!("render.finish");
         encoder.finish()
     };
     let index = {
