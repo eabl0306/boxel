@@ -14,6 +14,10 @@
 //! Optional debug keys ([`FrameKeys`], off by default; F5 and F6 when on) cycle the frame limit
 //! and toggle vsync at runtime; the overlay then shows a hint line for them.
 //!
+//! Apps add their own lines through [`OverlayLines`] (shown last, in key order), and can turn on
+//! a [`Crosshair`] at the center of the frame, drawn whether the text is shown or not (for
+//! aiming from the screen center, as block picking does).
+//!
 //! Facing convention: north is -Z, east is +X; yaw is a compass heading in degrees (0 north,
 //! 90 east), pitch is positive looking up.
 
@@ -24,13 +28,13 @@ pub use font::{GLYPH_SIZE, TextStyle, glyph, layout_text};
 use boxel_app::{App, FrameLimit, Last, Plugin, Time, Update};
 use boxel_camera::Camera;
 use boxel_ecs::prelude::*;
-use boxel_math::DVec3;
-use boxel_render::{OverlayDraw, PresentSettings, RenderInfo};
+use boxel_math::{DVec3, UVec2};
+use boxel_render::{OverlayDraw, OverlayRect, PresentSettings, RenderInfo, SurfaceInfo};
 use boxel_transform::Transform;
 use boxel_voxel::BlockPos;
 use boxel_window::{ButtonInput, KeyCode};
 use boxel_world::WorldStats;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write;
 use std::time::{Duration, Instant};
 
@@ -87,6 +91,78 @@ impl Default for FrameKeys {
             cycle_limit: KeyCode::F5,
             toggle_vsync: KeyCode::F6,
         }
+    }
+}
+
+/// Extra overlay lines from apps and other crates (a picked block, game state), shown after the
+/// engine's lines in key order. Inserted by [`DebugOverlayPlugin`]; write it from any system.
+#[derive(Resource, Clone, Debug, Default, PartialEq, Eq)]
+pub struct OverlayLines {
+    lines: BTreeMap<&'static str, String>,
+}
+
+impl OverlayLines {
+    /// Sets (replaces) the line for `key`.
+    pub fn set(&mut self, key: &'static str, line: impl Into<String>) {
+        self.lines.insert(key, line.into());
+    }
+    /// Removes the line for `key`.
+    pub fn remove(&mut self, key: &str) {
+        self.lines.remove(key);
+    }
+    /// The line for `key`.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.lines.get(key).map(String::as_str)
+    }
+    /// The lines, in key order.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.lines.values().map(String::as_str)
+    }
+}
+
+/// A cross at the center of the frame. Off by default; [`DebugOverlayPlugin`] draws it while
+/// `visible`, with or without the F3 text (it needs the renderer's `SurfaceInfo` for the frame
+/// size).
+#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+pub struct Crosshair {
+    /// Drawn.
+    pub visible: bool,
+    /// Arm length from the center, in physical pixels.
+    pub size: f32,
+    /// Line thickness, in physical pixels.
+    pub thickness: f32,
+    /// Linear RGBA.
+    pub color: [f32; 4],
+}
+
+impl Default for Crosshair {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            size: 10.0,
+            thickness: 2.0,
+            color: [1.0, 1.0, 1.0, 0.8],
+        }
+    }
+}
+
+impl Crosshair {
+    /// The two bars of the cross for a frame of `size` physical pixels (horizontal first).
+    pub fn rects(&self, size: UVec2) -> [OverlayRect; 2] {
+        let center = [size.x as f32 / 2.0, size.y as f32 / 2.0];
+        let (arm, half) = (self.size, self.thickness / 2.0);
+        [
+            OverlayRect {
+                min: [center[0] - arm, center[1] - half],
+                max: [center[0] + arm, center[1] + half],
+                color: self.color,
+            },
+            OverlayRect {
+                min: [center[0] - half, center[1] - arm],
+                max: [center[0] + half, center[1] + arm],
+                color: self.color,
+            },
+        ]
     }
 }
 
@@ -197,6 +273,8 @@ impl Plugin for DebugOverlayPlugin {
         .init_resource::<FrameWindow>()
         .init_resource::<PresentWindow>()
         .init_resource::<OverlayDraw>()
+        .init_resource::<OverlayLines>()
+        .init_resource::<Crosshair>()
         .add_systems(Update, (toggle_overlay, frame_keys))
         .add_systems(Last, (track_frames, build_overlay).chain());
     }
@@ -278,6 +356,8 @@ pub struct OverlayInputs {
     pub camera: Option<(DVec3, boxel_math::Vec3)>,
     /// Chunk counters.
     pub world: Option<WorldStats>,
+    /// Lines added by apps ([`OverlayLines`]), shown last.
+    pub extra: Vec<String>,
 }
 
 /// Compass name of a heading in degrees (0 north, 90 east). Rounded to the 0.1 degree the
@@ -412,10 +492,12 @@ pub fn overlay_lines(inputs: &OverlayInputs) -> Vec<String> {
         );
         lines.push(line);
     }
+    lines.extend(inputs.extra.iter().cloned());
     lines
 }
 
-/// Rebuilds `OverlayDraw` from the current state (clears it while hidden).
+/// Rebuilds `OverlayDraw` from the current state. While hidden it holds only the crosshair (or
+/// nothing), and is written only when that changes.
 fn build_overlay(
     overlay: Res<DebugOverlay>,
     window: Res<FrameWindow>,
@@ -424,12 +506,22 @@ fn build_overlay(
     present: Option<Res<PresentSettings>>,
     render: Option<Res<RenderInfo>>,
     world: Option<Res<WorldStats>>,
+    extra: Option<Res<OverlayLines>>,
+    crosshair: Option<Res<Crosshair>>,
+    surface: Option<Res<SurfaceInfo>>,
     cameras: Query<(&Camera, &Transform)>,
     mut draw: ResMut<OverlayDraw>,
 ) {
+    let frame = surface.map(|s| s.size).filter(|s| s.x > 0 && s.y > 0);
+    let cross = match (crosshair.as_deref(), frame) {
+        (Some(c), Some(frame)) if c.visible => Some(c.rects(frame)),
+        _ => None,
+    };
     if !overlay.visible {
-        if !draw.rects.is_empty() {
+        let want: &[OverlayRect] = cross.as_ref().map_or(&[], |r| r.as_slice());
+        if draw.rects.as_slice() != want {
             draw.rects.clear();
+            draw.rects.extend_from_slice(want);
         }
         return;
     }
@@ -445,10 +537,17 @@ fn build_overlay(
             .find(|(camera, _)| camera.active)
             .map(|(_, transform)| (transform.translation, transform.forward())),
         world: world.as_deref().copied(),
+        extra: extra
+            .as_deref()
+            .map(|e| e.iter().map(str::to_string).collect())
+            .unwrap_or_default(),
     };
     let lines = overlay_lines(&inputs);
     draw.rects.clear();
     layout_text(&lines, &overlay.style, &mut draw.rects);
+    if let Some(cross) = cross {
+        draw.rects.extend_from_slice(&cross);
+    }
 }
 
 #[cfg(test)]
@@ -479,6 +578,66 @@ mod tests {
         app.update();
         assert!(!app.world().resource::<DebugOverlay>().visible);
         assert!(app.world().resource::<OverlayDraw>().rects.is_empty());
+    }
+
+    #[test]
+    fn app_lines_come_last_and_the_crosshair_shows_with_or_without_text() {
+        let mut app = App::new();
+        app.add_plugins((TimePlugin, DebugOverlayPlugin::default()))
+            .init_resource::<ButtonInput<KeyCode>>();
+        app.update();
+        // Off by default: a hidden overlay draws nothing, even with a frame size.
+        app.insert_resource(SurfaceInfo {
+            size: UVec2::new(800, 600),
+            ..SurfaceInfo::default()
+        });
+        app.update();
+        assert!(app.world().resource::<OverlayDraw>().rects.is_empty());
+        // Crosshair on, text hidden: only the two bars, centered.
+        app.world_mut().resource_mut::<Crosshair>().visible = true;
+        app.update();
+        let rects = app.world().resource::<OverlayDraw>().rects.clone();
+        assert_eq!(rects.len(), 2);
+        assert_eq!(
+            (rects[0].min, rects[0].max),
+            ([390.0, 299.0], [410.0, 301.0])
+        );
+        assert_eq!(
+            (rects[1].min, rects[1].max),
+            ([399.0, 290.0], [401.0, 310.0])
+        );
+        // Unchanged frames do not touch the draw list.
+        let tick = app.world().resource_ref::<OverlayDraw>().last_changed();
+        app.update();
+        assert_eq!(
+            app.world().resource_ref::<OverlayDraw>().last_changed(),
+            tick
+        );
+        // Text visible: the crosshair stays on top (last).
+        app.world_mut().resource_mut::<DebugOverlay>().visible = true;
+        app.update();
+        let rects = &app.world().resource::<OverlayDraw>().rects;
+        assert!(rects.len() > 2);
+        assert_eq!(
+            rects[rects.len() - 2..],
+            Crosshair {
+                visible: true,
+                ..Crosshair::default()
+            }
+            .rects(UVec2::new(800, 600))
+        );
+
+        let mut extra = OverlayLines::default();
+        extra.set("z", "last");
+        extra.set("a", "first");
+        let inputs = OverlayInputs {
+            extra: extra.iter().map(str::to_string).collect(),
+            ..OverlayInputs::default()
+        };
+        let lines = overlay_lines(&inputs);
+        assert_eq!(lines[lines.len() - 2..], ["first", "last"]);
+        extra.remove("z");
+        assert_eq!((extra.get("a"), extra.get("z")), (Some("first"), None));
     }
 
     #[test]
