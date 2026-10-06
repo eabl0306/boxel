@@ -383,6 +383,51 @@ fn vertical_bounds_can_change_at_runtime() {
     }
 }
 
+/// Bounds changes while generation is pending (`false`: no job runs before the next change).
+/// The neighbor refresh skips slots still waiting for their data, edge layers included, and
+/// they get their bits when it arrives: every mesh is still built from the neighbors the map
+/// has.
+#[test]
+fn vertical_bounds_can_change_while_generation_is_pending() {
+    let hold = Arc::new(HoldExecutor::default());
+    // Stone in layers -3..=-1, air above.
+    let mut h = Harness::new(LayerGen::new(-3..=1), hold.clone(), 64);
+    h.jobs.mesh_fn = neighbor_count_mesh;
+    let viewer = [(0, Viewer::new(ChunkPos::new(0, 0, 0), 1, 3))];
+    let current = [viewer[0].1];
+    let changes = [
+        (Some(-2..=1), false),
+        // Grows past both edges of the pending layers.
+        (None, true),
+        (Some(-1..=0), true),
+        (Some(-3..=1), false),
+        // Drops the pending edge layers -3 and 1; -2 becomes the edge while pending.
+        (Some(-2..=0), true),
+    ];
+    for (bounds, run) in changes {
+        h.settings.vertical_bounds = bounds;
+        h.viewers(&viewer);
+        if !run {
+            assert!(
+                h.map
+                    .iter()
+                    .any(|(_, s)| matches!(s.data(), DataState::Queued)),
+                "nothing pending"
+            );
+            check_bookkeeping(&h);
+            continue;
+        }
+        run_all(&mut h, &hold);
+        check_interest(&h, &current);
+        check_meshes_match_neighbors(&h);
+        assert!(
+            h.map
+                .ready_meshes()
+                .any(|(_, k, _)| k.pos == ChunkPos::new(0, -1, 0))
+        );
+    }
+}
+
 /// What happens between two checks of a random walk.
 #[derive(Clone, Debug)]
 enum Op {

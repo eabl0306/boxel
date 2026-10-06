@@ -50,6 +50,13 @@ const MIN_INTEREST_STEPS: usize = 64;
 /// batches; [`MIN_INTEREST_STEPS`] is a multiple of it).
 const LOOKUP_BATCH: usize = 32;
 
+// `process_interest` marks the batch indices that created or unloaded a slot in a `u64`, and
+// stops only between batches.
+const _: () = assert!(
+    LOOKUP_BATCH <= u64::BITS as usize && MIN_INTEREST_STEPS.is_multiple_of(LOOKUP_BATCH),
+    "LOOKUP_BATCH must fit the u64 of changed indices and divide MIN_INTEREST_STEPS"
+);
+
 /// Stale job priorities refreshed per frame whatever the interest budget says (progress), and
 /// the batch size of the refreshes that use the rest of the budget.
 const PRIORITY_BATCH: usize = 256;
@@ -413,6 +420,10 @@ pub(crate) struct WorldJobs {
     uniform: Vec<(BlockState, Arc<ChunkData>)>,
     /// Positions re-evaluated by the interest since start (tests and benchmarks).
     pub(crate) interest_steps: usize,
+    /// Positions looked up again because an earlier step of their batch created or unloaded a
+    /// slot (tests check that path runs).
+    #[cfg(test)]
+    pub(crate) relookups: usize,
     /// Failed jobs since start (the `failed=` field of the `"world"` board line).
     pub(crate) failed: usize,
     /// Chunks whose failure was already error-logged.
@@ -440,6 +451,8 @@ impl WorldJobs {
             auto_cap: AutoCap::new(workers),
             uniform: Vec::new(),
             interest_steps: 0,
+            #[cfg(test)]
+            relookups: 0,
             failed: 0,
             failure_logged: HashSet::default(),
         }
@@ -554,7 +567,11 @@ impl WorldJobs {
     /// The vertical bounds changed (a rare settings change): neighbor bits follow the new bounds,
     /// and every slot whose bits changed has its mesh redone, since its neighbors are no longer
     /// what the mesh was built from. Walks every slot once. Slots still waiting for their data
-    /// are skipped: their bits are computed when it arrives.
+    /// are skipped: their bits are computed when it arrives. Their epoch is not bumped either,
+    /// unlike a walk of every slot (which bumps it where the bounds change their bits): such a
+    /// slot has no mesh built or building (`None` or `Queued`), so no recorded epoch exists that
+    /// a bump would invalidate. Skipping them changes the value of their epoch, never what is
+    /// meshed or published.
     fn refresh_neighbor_bits(&mut self, cx: &mut Ctx<'_>) {
         let ids: Vec<ChunkId> = cx
             .map
@@ -629,6 +646,10 @@ impl WorldJobs {
                         earlier &= earlier - 1;
                         if batch[j].0 == pos {
                             id = cx.map.id_at(pos);
+                            #[cfg(test)]
+                            {
+                                self.relookups += 1;
+                            }
                             break;
                         }
                     }

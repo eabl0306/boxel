@@ -75,6 +75,10 @@ pub(crate) struct Uploads {
     pieces: Vec<(Piece, u64)>,
     /// Scratch: table entries of one run.
     entries: Vec<ChunkGpu>,
+    /// A flush could not record all its copies since [`Uploads::take_lost`] was last called.
+    lost: bool,
+    /// The next staging buffer is created invalid (tests, see [`Uploads::fail_next_batch`]).
+    fail_next: bool,
 }
 
 impl Uploads {
@@ -92,6 +96,19 @@ impl Uploads {
     /// Drops every pending mesh (the arena was reset).
     pub fn clear(&mut self) {
         self.meshes.clear();
+    }
+
+    /// True once after a flush that could not record all its copies (a staging buffer could not
+    /// be created). Their changes were taken from the chunk table all the same: the GPU no
+    /// longer matches it until every chunk is uploaded again.
+    pub fn take_lost(&mut self) -> bool {
+        std::mem::take(&mut self.lost)
+    }
+
+    /// Makes the next staging buffer fail like one that cannot be created (too large or out of
+    /// memory): wgpu reports the error and its copies are lost.
+    pub fn fail_next_batch(&mut self) {
+        self.fail_next = true;
     }
 
     /// Records into `encoder` the copies that bring the GPU up to date: every pending mesh into
@@ -154,7 +171,12 @@ impl Uploads {
             .sum();
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("boxel uploads"),
-            size: bytes,
+            // Over every `max_buffer_size` (and unaligned): `fail_next_batch`.
+            size: if std::mem::take(&mut self.fail_next) {
+                u64::MAX
+            } else {
+                bytes
+            },
             usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: true,
         });
@@ -162,9 +184,12 @@ impl Uploads {
             let mut view = match staging.slice(..).get_mapped_range_mut() {
                 Ok(view) => view,
                 Err(e) => {
-                    // Only with a lost device: the buffer was just created mapped. The render
-                    // plugin then builds a new renderer and uploads every chunk again.
-                    tracing::error!("chunk uploads skipped: {e}");
+                    // The buffer could not be created (out of memory, a lost device): wgpu
+                    // reported why, and the device stays usable. These copies are lost, but
+                    // their meshes and stale slots were already taken: `take_lost` tells the
+                    // caller to upload every chunk again (the render plugin resyncs).
+                    tracing::error!("chunk uploads lost: {e}");
+                    self.lost = true;
                     return;
                 }
             };

@@ -642,6 +642,54 @@ fn interest_changes_drop_unstarted_work() {
     assert_eq!(h.stats().mesh_empty, 1);
 }
 
+/// Every slot sits at its own position in the index: no second slot was created at an occupied
+/// position (it would be left out of the index, with its own job and counts).
+fn check_one_slot_per_position(h: &Harness) {
+    for (id, slot) in h.map.iter() {
+        assert_eq!(
+            h.map.id_at(slot.pos),
+            Some(id),
+            "{:?} has two slots",
+            slot.pos
+        );
+    }
+    h.check_stats();
+}
+
+/// Two viewers that want the same 27 chunks list the same positions one after the other, so the
+/// first batch of interest lookups holds all of the first viewer's positions and the start of
+/// the second one's, each after the step that created (later: unloaded) its slot. Those are
+/// looked up again: no position gets a second slot and no step reads a removed one. Release
+/// builds rely on this alone (the stale lookup checks are `debug_assert`s).
+#[test]
+fn a_position_listed_twice_in_one_batch_is_looked_up_again() {
+    let hold = Arc::new(HoldExecutor::default());
+    let mut h = Harness::new(LayerGen::new(-1..=1), hold.clone(), 64);
+    // Keep regions are the data regions: both viewers list the same 27 positions when they leave.
+    h.settings.unload_hysteresis = 0;
+    let center = ChunkPos::new(0, 0, 0);
+    // Radius 0 and 3 layers: 3 x 3 columns x 3 layers each.
+    h.interest(&[(center, 0), (center, 0)]);
+    assert!(
+        h.jobs.relookups > 0,
+        "no position was listed twice in a batch"
+    );
+    assert_eq!(h.map.len(), 27);
+    check_one_slot_per_position(&h);
+    assert_eq!(h.jobs.scheduler.queued(), 27, "one generation job per slot");
+
+    let created = h.jobs.relookups;
+    h.interest(&[]);
+    assert!(
+        h.jobs.relookups > created,
+        "no unloaded position listed again"
+    );
+    assert!(h.map.is_empty());
+    check_one_slot_per_position(&h);
+    assert_eq!(h.jobs.scheduler.queued(), 0);
+    assert_eq!(hold.held(), 0);
+}
+
 fn removed(events: &[ChunkMeshEvent]) -> Vec<ChunkId> {
     events
         .iter()

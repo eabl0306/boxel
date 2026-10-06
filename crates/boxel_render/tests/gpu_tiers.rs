@@ -15,6 +15,8 @@
 //! - the same picture after a lost frame: more churn rendered into a frame with one invalid
 //!   command, which wgpu rejects whole (uploads included) and reports while finishing or
 //!   submitting it, then a resync of every chunk, as the render plugin does;
+//! - the same picture after lost uploads: more churn in a frame whose staging buffer cannot be
+//!   created (as when out of memory), which the renderer must report, then a resync;
 //! - the heightfield in a second renderer whose arena is exactly full: a chunk that no longer
 //!   fits keeps its old mesh, a smaller mesh reuses the chunk's own range;
 //! - a far scene: a 32x32 slab ~480 voxels away and a second slab of another texture 1 voxel
@@ -409,6 +411,8 @@ struct TierImages {
     churn: RgbaImage,
     /// `minus_chunk` again, after a lost frame and a resync (see [`lost_frame`]).
     lost_frame: RgbaImage,
+    /// `minus_chunk` again, after lost uploads and a resync (see [`lost_uploads`]).
+    lost_uploads: RgbaImage,
     far_both: RgbaImage,
     far_front: RgbaImage,
     far_back: RgbaImage,
@@ -584,6 +588,9 @@ fn lost_frame(
     renderer.render(device, queue, &mut encoder, &view);
     // 16 bytes at offset 8 of a 16-byte buffer
     encoder.copy_buffer_to_buffer(&src, 0, &dst, 8, Some(16));
+    if renderer.take_lost_uploads() {
+        return Err("lost frame: render could not record its uploads".to_string());
+    }
     let before = errors.lock().map_err(|e| e.to_string())?.len();
     queue.submit([encoder.finish()]);
     {
@@ -594,17 +601,75 @@ fn lost_frame(
         // expected: the tier fails on any other uncaptured error
         errors.truncate(before);
     }
+    resync(renderer, terrain, 3)?;
+    let (image, _) = render(device, queue, renderer, &view)?;
+    Ok(image)
+}
+
+/// Every terrain chunk but `REMOVED_CHUNK` again, under id generation `generation`, after
+/// `clear_chunks`: the render plugin's resync.
+fn resync(
+    renderer: &mut VoxelRenderer,
+    terrain: &[(IVec3, ChunkMesh)],
+    generation: u64,
+) -> Result<(), String> {
     renderer.clear_chunks();
     for (c, mesh) in terrain.iter().filter(|(c, _)| *c != REMOVED_CHUNK) {
         renderer
             .upsert_chunk(
-                generation_id(*c, 3),
+                generation_id(*c, generation),
                 (*c * 32).as_i64vec3(),
                 Arc::new(mesh.clone()),
             )
-            .map_err(|e| format!("lost frame: resync {c}: {e}"))?;
+            .map_err(|e| format!("resync {c}: {e}"))?;
     }
+    Ok(())
+}
+
+/// The heightfield minus `REMOVED_CHUNK` after lost uploads. More churn (id generation 3 to 4)
+/// goes into a frame whose staging buffer cannot be created (`debug_fail_next_upload`, as when
+/// out of memory). wgpu reports that inside `render`, and the frame itself is valid and runs
+/// without the uploads, so nothing fails while finishing or submitting it: the renderer must say
+/// so itself (`take_lost_uploads`, once), which is how the render plugin knows to resync. Then a
+/// resync and a normal frame.
+fn lost_uploads(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    renderer: &mut VoxelRenderer,
+    terrain: &[(IVec3, ChunkMesh)],
+    errors: &Mutex<Vec<String>>,
+) -> Result<RgbaImage, String> {
+    churn(renderer, terrain, 3, 4)?;
+    let view = heightfield_view();
+    let before = errors.lock().map_err(|e| e.to_string())?.len();
+    renderer.debug_fail_next_upload();
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("gpu_tiers lost uploads"),
+    });
+    renderer.render(device, queue, &mut encoder, &view);
+    if !renderer.take_lost_uploads() {
+        return Err("lost uploads: not reported by take_lost_uploads".to_string());
+    }
+    if renderer.take_lost_uploads() {
+        return Err("lost uploads: reported twice".to_string());
+    }
+    {
+        let mut errors = errors.lock().map_err(|e| e.to_string())?;
+        if errors.len() == before {
+            return Err("lost uploads: no error for the staging buffer".to_string());
+        }
+        // expected: the tier fails on any other uncaptured error
+        errors.truncate(before);
+    }
+    submit_and_wait(device, queue, encoder)?;
+    if errors.lock().map_err(|e| e.to_string())?.len() != before {
+        return Err("lost uploads: the frame itself failed".to_string());
+    }
+    resync(renderer, terrain, 5)?;
     let (image, _) = render(device, queue, renderer, &view)?;
+    if renderer.take_lost_uploads() {
+        return Err("lost uploads: the resync lost its uploads too".to_string());
+    }
     Ok(image)
 }
 
@@ -673,6 +738,7 @@ fn render_tier(
     churn(&mut renderer, terrain, 0, 1)?;
     let (churn, _) = render(&device, &queue, &mut renderer, &view)?;
     let lost_frame = lost_frame(&device, &queue, &mut renderer, terrain, &errors)?;
+    let lost_uploads = lost_uploads(&device, &queue, &mut renderer, terrain, &errors)?;
     let full_arena = full_arena_scenes(&device, &queue, tier, registry, terrain)?;
 
     renderer.clear_chunks();
@@ -714,6 +780,7 @@ fn render_tier(
         minus_chunk,
         churn,
         lost_frame,
+        lost_uploads,
         far_both,
         far_front,
         far_back,
@@ -850,6 +917,7 @@ fn tiers_render_identically() {
                     (&name("minus_chunk"), &i.minus_chunk),
                     (&name("churn"), &i.churn),
                     (&name("lost_frame"), &i.lost_frame),
+                    (&name("lost_uploads"), &i.lost_uploads),
                     (&name("far_both"), &i.far_both),
                     (&name("far_front"), &i.far_front),
                     (&name("far_back"), &i.far_back),
@@ -882,6 +950,12 @@ fn tiers_render_identically() {
             for (scene, image, expected, expected_name) in [
                 ("churn", &i.churn, &i.minus_chunk, "minus_chunk"),
                 ("lost_frame", &i.lost_frame, &i.minus_chunk, "minus_chunk"),
+                (
+                    "lost_uploads",
+                    &i.lost_uploads,
+                    &i.minus_chunk,
+                    "minus_chunk",
+                ),
                 (
                     "full_arena_kept",
                     &i.full_arena[0],

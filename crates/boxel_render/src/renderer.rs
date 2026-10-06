@@ -396,6 +396,20 @@ impl VoxelRenderer {
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
     }
+    /// True once after a [`VoxelRenderer::render`] that could not record all its chunk uploads
+    /// (a staging buffer could not be created, as when out of memory). The frame itself is valid
+    /// and runs without them, so nothing else reports it: the GPU no longer matches the resident
+    /// chunks until every chunk is uploaded again ([`VoxelRenderer::clear_chunks`], then
+    /// [`VoxelRenderer::upsert_chunk`] each).
+    pub fn take_lost_uploads(&mut self) -> bool {
+        self.uploads.take_lost()
+    }
+    /// Testing: the next [`VoxelRenderer::render`] with chunk changes cannot create its first
+    /// staging buffer, as when out of memory (wgpu reports an error), so those uploads are lost.
+    #[doc(hidden)]
+    pub fn debug_fail_next_upload(&mut self) {
+        self.uploads.fail_next_batch();
+    }
     /// Encodes the tier's passes into the main color/depth targets: the chunk changes since the
     /// last call (uploads), clear, (High) cull, opaque buckets with the opaque pipeline, then the
     /// cutout bucket with the cutout pipeline. Submit `encoder` before the next `render`.

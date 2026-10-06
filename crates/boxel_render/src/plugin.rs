@@ -261,7 +261,9 @@ pub struct DebugDestroyDevice;
 /// [`GpuFailed`], after which it stays idle). A lost device is dropped (renderer, surface,
 /// device) and the next frame re-selects with a new surface; a second loss of the same adapter
 /// excludes its tier and adds an LKG strike (none when [`DebugDestroyDevice`] caused the loss).
-/// Chunk meshes are then re-uploaded from `ChunkMap::ready_meshes()`.
+/// Chunk meshes are then re-uploaded from `ChunkMap::ready_meshes()`, as they are after a frame
+/// that lost its chunk uploads (rejected by the GPU, or a staging buffer that could not be
+/// created); a few such frames close together count as a device loss.
 #[derive(Clone, Debug, Default)]
 pub struct RenderPlugin {
     /// Settings.
@@ -337,6 +339,12 @@ const OFFSCREEN_WAIT: Duration = Duration::from_secs(2);
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 /// Chunk upload failures are warn-logged at most this often.
 const UPLOAD_WARN_INTERVAL: Duration = Duration::from_secs(5);
+/// Frames close together that lose their chunk uploads and count as a device loss: the earlier
+/// ones resync every chunk, the last one rebuilds the device (a second time also excludes its
+/// tier, see [`RejectedFrames`]).
+const MAX_REJECTED_FRAMES: u32 = 3;
+/// Accepted frames in a row after which earlier rejected frames no longer count.
+const REJECTED_FRAMES_FORGOTTEN_AFTER: u32 = 120;
 
 /// Lifecycle of the GPU side.
 #[derive(Default)]
@@ -367,8 +375,10 @@ struct ReadyGpu {
     /// Present preference the surface is configured with (follows [`PresentSettings`]).
     present: PresentModePref,
     /// Next `Extract` uploads every ready mesh (`renderer.clear_chunks` first): a new renderer, or a
-    /// frame the GPU rejected (its chunk uploads were lost with it).
+    /// frame whose chunk uploads were lost (see [`after_frame`]).
     resync: bool,
+    /// Recent frames with lost chunk uploads.
+    rejected: RejectedFrames,
     /// LKG `confirm_good` was called (first presented frame of this selection).
     confirmed: bool,
     /// Frames rendered with this renderer (screenshots wait for the first one).
@@ -545,6 +555,49 @@ struct ExtractedFrame {
     presented: bool,
     /// The presentation gate was used (presented or skipped): `Cleanup` closes it.
     gate_used: bool,
+}
+
+/// What to do after a frame (see [`RejectedFrames::record`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameVerdict {
+    /// The chunk uploads reached the GPU.
+    Accepted,
+    /// They were lost: upload every chunk again next frame.
+    Resync,
+    /// Lost again, [`MAX_REJECTED_FRAMES`] recent times: treat the device as lost.
+    Lost,
+}
+
+/// Counts recent frames whose chunk uploads were lost. A device that keeps losing them would
+/// resync (and warn) every frame, and a full resync allocates more than the frame it replaces,
+/// so memory pressure tends to repeat: past [`MAX_REJECTED_FRAMES`] the device is rebuilt
+/// instead, like after a device loss (a second time excludes its tier).
+#[derive(Debug, Default)]
+struct RejectedFrames {
+    /// Rejected frames that still count.
+    recent: u32,
+    /// Accepted frames since the last rejected one.
+    accepted: u32,
+}
+
+impl RejectedFrames {
+    /// Records one frame (`rejected`: its chunk uploads were lost).
+    fn record(&mut self, rejected: bool) -> FrameVerdict {
+        if !rejected {
+            self.accepted = self.accepted.saturating_add(1);
+            if self.accepted >= REJECTED_FRAMES_FORGOTTEN_AFTER {
+                self.recent = 0;
+            }
+            return FrameVerdict::Accepted;
+        }
+        self.accepted = 0;
+        self.recent += 1;
+        if self.recent >= MAX_REJECTED_FRAMES {
+            FrameVerdict::Lost
+        } else {
+            FrameVerdict::Resync
+        }
+    }
 }
 
 /// Rate limiter of the chunk upload warning.
@@ -912,6 +965,7 @@ fn bootstrap(p: &mut SetupParams) {
         configured_for: size,
         present,
         resync: true,
+        rejected: RejectedFrames::default(),
         confirmed: false,
         frames: 0,
         offscreen: VecDeque::new(),
@@ -1241,7 +1295,7 @@ fn draw(
                     let _span = frame_span!("render.submit");
                     ready.ctx.queue.submit([commands]);
                 }
-                resync_if_frame_failed(ready, errors);
+                after_frame(ready, errors);
                 {
                     let _span = frame_span!("render.present");
                     if let Some(window) = window.as_deref() {
@@ -1315,21 +1369,46 @@ fn render_offscreen(ready: &mut ReadyGpu, view: &ViewParams) {
         let _span = frame_span!("render.submit");
         ready.ctx.queue.submit([commands])
     };
-    resync_if_frame_failed(ready, errors);
+    after_frame(ready, errors);
     ready.offscreen.push_back(index);
     ready.frames += 1;
 }
 
 /// Called after a frame's submit with the device's error count from just before its `finish`.
-/// An error since then means none of the frame's commands ran (one invalid command buffer fails
-/// the whole submit), including the chunk uploads `VoxelRenderer::render` recorded at their
-/// start: the renderer's chunk table and arena no longer match the GPU. The next frame then
-/// uploads every chunk again. wgpu reports these errors on this thread, inside `finish` or
-/// `submit` (an error from another thread at the same time only costs a needless resync).
-fn resync_if_frame_failed(ready: &mut ReadyGpu, errors_before_finish: u32) {
-    if ready.ctx.health.error_count() != errors_before_finish {
-        tracing::warn!("the GPU rejected a frame; uploading every chunk again");
-        ready.resync = true;
+/// The frame's chunk uploads were lost if
+/// - an error came since then: none of the frame's commands ran (one invalid command buffer
+///   fails the whole submit), the uploads `VoxelRenderer::render` recorded at its start
+///   included. wgpu reports these errors on this thread, inside `finish` or `submit` (an error
+///   from another thread at the same time only costs a needless resync);
+/// - or `render` could not record them (`take_lost_uploads`: a staging buffer could not be
+///   created, which wgpu reports before `finish`, and the frame itself runs).
+///
+/// Either way the renderer's chunk table and arena no longer match the GPU: the next frame
+/// uploads every chunk again. Past [`MAX_REJECTED_FRAMES`] recent losses the device is marked
+/// lost instead, and `Setup` rebuilds it.
+fn after_frame(ready: &mut ReadyGpu, errors_before_finish: u32) {
+    let submit_failed = ready.ctx.health.error_count() != errors_before_finish;
+    let uploads_lost = ready.renderer.take_lost_uploads();
+    match ready.rejected.record(submit_failed || uploads_lost) {
+        FrameVerdict::Accepted => {}
+        FrameVerdict::Resync => {
+            let what = if submit_failed {
+                "the GPU rejected a frame"
+            } else {
+                "a frame lost its chunk uploads"
+            };
+            tracing::warn!(
+                "{what} ({} of {MAX_REJECTED_FRAMES} before the device is rebuilt); uploading \
+                 every chunk again",
+                ready.rejected.recent
+            );
+            ready.resync = true;
+        }
+        FrameVerdict::Lost => {
+            ready.ctx.health.mark_lost(format!(
+                "{MAX_REJECTED_FRAMES} recent frames lost their chunk uploads"
+            ));
+        }
     }
 }
 
@@ -1511,6 +1590,34 @@ mod tests {
         assert_eq!(losses.exclusions[0].max_tier, None);
         losses.exclude("nv", Some(Tier::High));
         assert_eq!(losses.exclusions[0].max_tier, None, "never loosened");
+    }
+
+    #[test]
+    fn repeated_rejected_frames_escalate_to_a_device_loss() {
+        let mut frames = RejectedFrames::default();
+        assert_eq!(frames.record(false), FrameVerdict::Accepted);
+        assert_eq!(frames.record(true), FrameVerdict::Resync);
+        assert_eq!(frames.record(true), FrameVerdict::Resync);
+        assert_eq!(frames.record(true), FrameVerdict::Lost);
+
+        // Rejected frames between accepted ones still add up...
+        let mut frames = RejectedFrames::default();
+        for _ in 0..MAX_REJECTED_FRAMES - 1 {
+            assert_eq!(frames.record(true), FrameVerdict::Resync);
+            for _ in 0..REJECTED_FRAMES_FORGOTTEN_AFTER - 1 {
+                assert_eq!(frames.record(false), FrameVerdict::Accepted);
+            }
+        }
+        assert_eq!(frames.record(true), FrameVerdict::Lost);
+
+        // ...until enough accepted frames in a row forget them.
+        let mut frames = RejectedFrames::default();
+        for _ in 0..3 * MAX_REJECTED_FRAMES {
+            assert_eq!(frames.record(true), FrameVerdict::Resync);
+            for _ in 0..REJECTED_FRAMES_FORGOTTEN_AFTER {
+                assert_eq!(frames.record(false), FrameVerdict::Accepted);
+            }
+        }
     }
 
     #[test]
