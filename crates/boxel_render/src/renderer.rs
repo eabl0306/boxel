@@ -409,9 +409,11 @@ impl VoxelRenderer {
         let slot_count = self.chunks.slot_count();
         // The GPU window follows the camera before any cull: only chunks whose wrapped origin
         // difference is exact are drawn, on every tier (see `chunk_table`). High reads the
-        // window from the live flags, uploaded again when it moves.
+        // window from the live flags, uploaded again when it moves. Mid and Low test the window
+        // in `CpuCull`; no Mid shader reads the flags, so on Mid they may lag behind.
         let window_moved = self.chunks.follow(view.render_origin);
         if window_moved
+            && self.tier == Tier::High
             && slot_count > 0
             && let Some(buffer) = &self.chunk_buffer
         {
@@ -439,14 +441,16 @@ impl VoxelRenderer {
         };
         self.stats.visible_chunks = visible;
         self.stats.draws = draws;
-        let live = self.chunks.len() as u64;
+        // Only chunks inside the window take draws: the old area still resident after a
+        // teleport does not count (it would warn falsely, and only once).
+        let drawable = self.chunks.drawable_len() as u64;
         if self.tier == Tier::High
-            && 6 * live > u64::from(self.cap_opaque)
+            && 6 * drawable > u64::from(self.cap_opaque)
             && !self.warned_list_overflow
         {
             self.warned_list_overflow = true;
             tracing::warn!(
-                "{live} chunks may need more than {} opaque indirect draws: past that, High \
+                "{drawable} chunks may need more than {} opaque indirect draws: past that, High \
                  skips arbitrary buckets, not the farthest (draw lists are not segmented until M3)",
                 self.cap_opaque
             );

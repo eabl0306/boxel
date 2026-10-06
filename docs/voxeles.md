@@ -7,7 +7,11 @@ Bevy 0.19.1 y midió en esta misma máquina cómo sube las mallas.
 
 **Actualización (streaming v2, mismo día):** el interés incremental, la carga desatada de los
 frames y el mundo infinito en vertical ya están hechos. Las secciones 7.1, 7.2, 7.5 y 9 cuentan
-qué cambió, con números nuevos. El resto describe el estado anterior.
+qué cambió, con números nuevos.
+
+**Actualización (coordenadas de 64 bits, ADR 0014):** la sección 2 describe las coordenadas
+`i64`. El resto describe el estado anterior, y algunas de sus referencias de línea pueden haber
+quedado corridas.
 
 ## En resumen
 
@@ -47,7 +51,7 @@ qué cambió, con números nuevos. El resto describe el estado anterior.
 
 | | Juego en Bevy | boxel |
 |---|---|---|
-| Lado de un chunk | 16 vóxeles | 32 vóxeles (`voxel/coords.rs:5`) |
+| Lado de un chunk | 16 vóxeles | 32 vóxeles (`voxel/coords.rs:9`) |
 | 32 chunks del juego (512 vóxeles) | radio 32 | radio 16 |
 | Radio 32 de boxel (1024 vóxeles) | radio 64 | radio 32 |
 
@@ -122,8 +126,8 @@ y cuatro veces el área. Este documento mide los dos.
 | Generar | worker | 47 a 52 µs | `world/streaming.rs:579-602` |
 | Mallar, con lectura de vecinos | worker | 51 a 70 µs | `world/streaming.rs:604-664` |
 | Aplicar un resultado de malla | principal | unos 5 µs | `world/streaming.rs:671-706` |
-| Subir al render | principal | 2.0 a 2.5 µs (máquina quieta), 3.3 a 4.7 µs (con carga) | `render/renderer.rs:332-369` |
-| Borrar del render | principal | 1.2 a 1.8 µs | `render/renderer.rs:371-378` |
+| Subir al render | principal | 2.0 a 2.5 µs (máquina quieta), 3.3 a 4.7 µs (con carga) | `render/renderer.rs:335-372` |
+| Borrar del render | principal | 1.2 a 1.8 µs | `render/renderer.rs:374-381` |
 | Frame en High con 8000 chunks | principal | 0.03 a 0.05 ms de CPU | `render/path/high.rs:117-152` |
 
 La parte cara (generar y mallar) va fuera del frame. Dentro del frame queda poco por chunk. El
@@ -136,7 +140,7 @@ problema real de boxel no está en este camino sino en el paso 1 (sección 7.1).
 chunks (±2^61 vóxeles, `voxel/coords.rs:36`). El mundo sujeta a los viewers a ese límite y
 dentro de él ninguna cuenta desborda. Antes eran `i32` y todo se rompía a 2^31 vóxeles (unos
 2 100 millones): el streaming dejaba de seguir a la cámara y los chunks se repetían. Dentro del
-chunk, la posición es un `u16` con z como eje más rápido (`voxel/coords.rs:186-192`), el mismo
+chunk, la posición es un `u16` con z como eje más rápido (`voxel/coords.rs:188-194`), el mismo
 orden que usa el mallador, así copia filas enteras.
 
 El límite que se nota antes es el de `Transform`, que es `f64`: el paso mínimo de la cámara es
@@ -280,12 +284,12 @@ con un presupuesto de 4 ms y aplica hasta 512 mallas por frame (`world/plugin.rs
 mete todas las mallas en un solo frame (`render/plugin.rs:952-963`).
 
 **Prepare** sube todo lo del frame sin presupuesto propio (`render/plugin.rs:987-1024`). Por
-cada chunk nuevo (`render/renderer.rs:332-369`):
+cada chunk nuevo (`render/renderer.rs:335-372`):
 
-1. Busca un lugar en la tabla de chunks (`render/chunk_table.rs:36-98`).
+1. Busca un lugar en la tabla de chunks (`render/chunk_table.rs:63-143`).
 2. Pide un rango en el arena, O(1) (`render/arena.rs:92-101`).
 3. Copia los quads con `write_buffer` (`render/arena.rs:140-147`).
-4. Escribe 64 B en la tabla de la GPU (`render/renderer.rs:459-467`), solo en High y Mid.
+4. Escribe 64 B en la tabla de la GPU (`render/renderer.rs:482-490`), solo en High y Mid.
 
 En wgpu-core 30.0.1 cada `write_buffer` crea su propio buffer temporal (`queue.rs:662` de
 wgpu-core). Son dos por chunk nuevo.
@@ -299,14 +303,14 @@ wgpu-core). Son dos por chunk nuevo.
 | Índices compartidos | 98 304 quads, 2.36 MB | `render/path/mod.rs:268-278` |
 
 Nada de esto crece. Si se llena, el chunk no se dibuja y se cuenta como descartado
-(`render/renderer.rs:343-353`).
+(`render/renderer.rs:346-356`).
 
 **Tiers:**
 
 | Tier | Cómo descarta chunks | Costo de CPU |
 |---|---|---|
-| High | compute en GPU, un hilo por chunk (`render/path/high.rs:117-129`, `shaders/cull.wgsl:42-76`) y dos multi-draw indirect (`render/path/high.rs:131-152`) | no depende de cuántos chunks haya: 0.03 a 0.05 ms con 8000 (medido) |
-| Mid | recorre todos los chunks en CPU (`render/path/mod.rs:361-394`, `render/path/mid.rs:49-99`) | 0.34 ms con 8000 (medido) |
+| High | compute en GPU, un hilo por chunk (`render/path/high.rs:117-129`, `shaders/cull.wgsl:42-78`) y dos multi-draw indirect (`render/path/high.rs:131-152`) | no depende de cuántos chunks haya: 0.03 a 0.05 ms con 8000 (medido) |
+| Mid | recorre todos los chunks en CPU (`render/path/mod.rs:366-405`, `render/path/mid.rs:49-99`) | 0.34 ms con 8000 (medido) |
 | Low | igual que Mid, un draw por grupo (`render/path/low.rs:25-60`) | sin medir |
 
 En esa misma prueba de 8000 chunks (`upload_bench`, con los chunks en un disco artificial), la
@@ -314,7 +318,7 @@ GPU tardó 0.39 ms por frame (medido).
 
 No hay descarte por oclusión todavía. Solo se descarta lo que está fuera de la pirámide de la
 cámara, que llega hasta radio × 32 vóxeles (`examples/voxel_world.rs:505-507`), y los grupos de
-caras que miran para atrás (`shaders/cull.wgsl:53`, `render/path/mod.rs:374`).
+caras que miran para atrás (`shaders/cull.wgsl:55`, `render/path/mod.rs:385`).
 
 **Medido en estático a radio 32** (`voxel_world`, 7794 mallas, 1.76 M quads): una vuelta entera
 del bucle (mundo y render) tarda unos 0.25 ms de CPU. Sale de las unas 4000 updates/s medidas
@@ -425,7 +429,7 @@ boxel ya evita lo principal: sin entidades por chunk, sin conversión de formato
 vista en CPU, con quads 19 veces más chicos y con topes por frame. Quedan tres parecidos:
 
 1. Dos buffers temporales de wgpu por chunk (`render/arena.rs:142`,
-   `render/renderer.rs:461`). Es el mismo mecanismo que en Bevy, aunque con 2 KiB por chunk.
+   `render/renderer.rs:484`). Es el mismo mecanismo que en Bevy, aunque con 2 KiB por chunk.
 2. Cuando el arena crezca (M1), no copiar cientos de MB dentro de un frame.
 3. El remesh de vecinos multiplica el trabajo. En boxel va en workers, pero cada uno es otra
    subida.
@@ -441,9 +445,9 @@ entero mientras se carga, no solo la subida (sección 10, paso 1).
 | 2 | Carga atada a los frames (resuelto, 7.2) | 40 s para cargar radio 32 a 144 Hz | `world/streaming.rs`, `world/plugin.rs` |
 | 3 | Render sin presupuesto propio | 1.0 a 2.2 ms con 512 chunks en un frame | `render/plugin.rs:987-1024` |
 | 4 | Resync de todo en un frame | 16 a 35 ms (estimado) | `render/plugin.rs:952-963` |
-| 5 | Costo fijo por frame (resuelto en el mundo, 7.5) | 0.34 ms del descarte en CPU con 8000 chunks (Mid y Low) | `render/path/mod.rs:361-394` |
+| 5 | Costo fijo por frame (resuelto en el mundo, 7.5) | 0.34 ms del descarte en CPU con 8000 chunks (Mid y Low) | `render/path/mod.rs:366-405` |
 | 6 | Warning de fixed timestep | sale con un frame de más de unos 140 ms; en tu log, el primero (250 ms o más) | `app/time.rs:39`, `app/time.rs:198-240` |
-| 7 | Tope de draws en High | warning desde unos 10 900 chunks vivos | `render/renderer.rs:237`, `render/renderer.rs:428-438` |
+| 7 | Tope de draws en High | warning desde unos 10 900 chunks vivos | `render/renderer.rs:237`, `render/renderer.rs:446-457` |
 
 ### 7.1 Recalcular el interés al cruzar un borde
 
@@ -560,13 +564,13 @@ Con GPU nueva, pérdida de dispositivo o cambio de tier, Extract mete todas las 
 reposo medía 0.24 ms a radio 32 y 0.195 ms a radio 12: crecía con el radio (medido con
 `world_stream`, sección 11).
 
-**Ahora:** solo recorre los slots y arma el texto si el mapa cambió (`world/plugin.rs:354-392`,
+**Ahora:** solo recorre los slots y arma el texto si el mapa cambió (`world/plugin.rs:358-396`,
 `world/map.rs:182-208`). En reposo, el frame entero de `headless_world --idle 5` (mundo sin
 render, 144 Hz) mide 0.11 a 0.14 ms de mediana y 0.3 a 0.43 ms de p99, igual a radio 12 que a
 radio 32 (medido). Ya no crece con el radio.
 
 **Queda:** en Mid y Low el descarte en CPU recorre todos los chunks
-(`render/path/mod.rs:361-394`): 0.34 ms con 8000 (medido).
+(`render/path/mod.rs:366-405`): 0.34 ms con 8000 (medido).
 
 ### 7.6 El warning de fixed timestep
 
@@ -588,11 +592,11 @@ sale como mucho cada 5 s con la cuenta acumulada. Si vuelve a salir en pleno jue
 ### 7.7 Otros límites
 
 - **Draws en High.** La lista tiene lugar para 65 535 draws opacos (`render/renderer.rs:237`).
-  Pasando unos 10 900 chunks vivos sale un warning y se saltean grupos cualquiera, no los más
-  lejanos (`render/renderer.rs:428-438`). Radio 32 tiene 7794 mallas, más las del anillo de
-  descarga (`world/streaming.rs:349-360`).
+  Pasando unos 10 900 chunks vivos dentro de la ventana de la GPU (ADR 0014) sale un warning y
+  se saltean grupos cualquiera, no los más lejanos (`render/renderer.rs:446-457`). Radio 32
+  tiene 7794 mallas, más las del anillo de descarga (`world/streaming.rs:349-360`).
 - **Nada crece.** Arena y tabla tienen tamaño fijo; si se llenan, el chunk no se dibuja
-  (`render/renderer.rs:343-353`).
+  (`render/renderer.rs:346-356`).
 - **AO.** Con AO (M1), editar un bloque también cambia vecinos de arista y esquina, que hoy no
   se remeshean (`world/streaming.rs:550-558`).
 - **Sin oclusión.** A radio 32 se dibujan 1.76 M quads solo con descarte por pirámide. Hi-Z

@@ -19,7 +19,7 @@ use std::collections::{BTreeSet, HashMap};
 pub(crate) const GPU_WINDOW: u64 = 1 << 30;
 
 /// How far (voxels, on any axis) the render origin may move from the window center before the
-/// window follows it and every live flag is uploaded again.
+/// window follows it (and High uploads every live flag again).
 pub(crate) const GPU_WINDOW_SLACK: u64 = 1 << 20;
 
 // A chunk inside the window is less than `GPU_WINDOW + GPU_WINDOW_SLACK` voxels from the render
@@ -67,6 +67,8 @@ pub(crate) struct ChunkTable {
     capacity: u32,
     /// Center of the GPU window (a recent render origin).
     window: I64Vec3,
+    /// Records inside the window.
+    drawable: usize,
 }
 
 impl ChunkTable {
@@ -78,6 +80,7 @@ impl ChunkTable {
             by_id: HashMap::new(),
             capacity,
             window: I64Vec3::ZERO,
+            drawable: 0,
         }
     }
 
@@ -89,6 +92,12 @@ impl ChunkTable {
     /// Live chunks.
     pub fn len(&self) -> usize {
         self.by_id.len()
+    }
+
+    /// Live chunks inside the GPU window: the ones a tier may draw. The rest stay resident
+    /// (the old area for a few frames after a teleport) but take no draws.
+    pub fn drawable_len(&self) -> usize {
+        self.drawable
     }
 
     /// Highest live slot + 1.
@@ -122,7 +131,13 @@ impl ChunkTable {
         if slot as usize == self.records.len() {
             self.records.push(None);
         }
-        self.records[slot as usize] = Some(record);
+        let old = self.records[slot as usize].replace(record);
+        if old.is_some_and(|r| self.in_window(r.origin)) {
+            self.drawable -= 1;
+        }
+        if self.in_window(record.origin) {
+            self.drawable += 1;
+        }
         self.by_id.insert(record.id, slot);
         Some(slot)
     }
@@ -132,6 +147,9 @@ impl ChunkTable {
         let slot = self.by_id.remove(&id)?;
         let record = self.records[slot as usize].take()?;
         self.free.insert(slot);
+        if self.in_window(record.origin) {
+            self.drawable -= 1;
+        }
         // keep `records.len()` = highest live slot + 1
         while self.records.last().is_some_and(Option::is_none) {
             self.records.pop();
@@ -145,6 +163,7 @@ impl ChunkTable {
         self.records.clear();
         self.free.clear();
         self.by_id.clear();
+        self.drawable = 0;
     }
 
     /// Live records in slot order.
@@ -171,8 +190,8 @@ impl ChunkTable {
 
     /// Re-centers the window on `render_origin` when that is more than [`GPU_WINDOW_SLACK`] from
     /// the center on some axis. Returns true if the window moved: live flags may have changed,
-    /// and the caller uploads [`ChunkTable::gpu_entries`] before the High cull runs. Called every
-    /// frame before culling, so the render origin is never farther than the slack from the
+    /// and on High the caller uploads [`ChunkTable::gpu_entries`] before the cull runs. Called
+    /// every frame before culling, so the render origin is never farther than the slack from the
     /// center.
     pub fn follow(&mut self, render_origin: I64Vec3) -> bool {
         let c = self.window;
@@ -181,6 +200,10 @@ impl ChunkTable {
             || render_origin.z.abs_diff(c.z) > GPU_WINDOW_SLACK;
         if moved {
             self.window = render_origin;
+            self.drawable = self
+                .iter()
+                .filter(|(_, r)| self.in_window(r.origin))
+                .count();
         }
         moved
     }
@@ -356,6 +379,54 @@ mod tests {
         let entries = table.gpu_entries();
         assert_eq!(entries.len(), 5);
         assert_eq!(entries[1], ChunkGpu::default());
+    }
+
+    /// `drawable_len` against a count of the records inside the window.
+    fn assert_drawable(table: &ChunkTable, expected: usize) {
+        let counted = table
+            .iter()
+            .filter(|(_, r)| table.in_window(r.origin))
+            .count();
+        assert_eq!((table.drawable_len(), counted), (expected, expected));
+    }
+
+    #[test]
+    fn drawable_len_counts_only_the_chunks_inside_the_window() {
+        let mut arena = ArenaAllocator::new(1024, 64);
+        let mut table = ChunkTable::new(8);
+        let far = I64Vec3::new(1 << 32, 0, 0);
+        let far_record = |arena: &mut ArenaAllocator, id: u64| {
+            let mut r = record(arena, id);
+            r.origin += far;
+            r
+        };
+        for id in 0..3 {
+            table.insert(record(&mut arena, id));
+        }
+        assert_drawable(&table, 3);
+        // The old area after a teleport: resident, not drawable.
+        for id in 3..6 {
+            table.insert(far_record(&mut arena, id));
+        }
+        assert_eq!(table.len(), 6);
+        assert_drawable(&table, 3);
+        // A replaced record can move out of the window or into it.
+        table.insert(far_record(&mut arena, 0));
+        assert_drawable(&table, 2);
+        table.insert(record(&mut arena, 4));
+        assert_drawable(&table, 3);
+        table.remove(1);
+        table.remove(5);
+        assert_drawable(&table, 2);
+        table.insert(far_record(&mut arena, 6));
+        assert_drawable(&table, 2);
+        // The window follows the camera: now the far records are the drawable ones.
+        assert!(table.follow(far));
+        assert_drawable(&table, 3);
+        assert!(!table.follow(far + I64Vec3::new(1000, 0, 0)));
+        assert_drawable(&table, 3);
+        table.clear();
+        assert_drawable(&table, 0);
     }
 
     #[test]

@@ -15,8 +15,10 @@
 //! it, and far beyond) and must give exactly the pixels it gave near the origin: chunk origins
 //! are `i64` on the CPU and wrapped to 32 bits for the GPU, whose wrapping subtraction gives the
 //! same camera-relative positions. Every renderer also teleports its camera `2^32` voxels away
-//! with the chunks still resident (where their wrapped origins land exactly under the camera)
-//! and must draw nothing there, then the original pixels again when the camera comes back.
+//! on every axis with the chunks still resident and must draw nothing there, then the original
+//! pixels again when the camera comes back. Their wrapped origins land exactly under the camera,
+//! and seen in `i64` they lie straight ahead, inside a view distance of `2^34`: neither the
+//! frustum nor the view distance hides them, only the GPU window does, on every tier.
 //! Failing images are saved under `CARGO_TARGET_TMPDIR/gpu_terrain/` (every image with
 //! `GPU_TERRAIN_SAVE=1`).
 #![expect(clippy::print_stderr, reason = "test progress and failure details")]
@@ -25,7 +27,7 @@ use boxel_gfx::{
     AdapterCaps, GlVersion, RgbaImage, Tier, floors, gpu_tests_required, read_texture_rgba8,
     run_in_error_scopes, submit_and_wait, tier_request,
 };
-use boxel_math::{DVec3, I64Vec3, UVec2};
+use boxel_math::{Aabb, DVec3, I64Vec3, UVec2, Vec3};
 use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, Mesher};
 use boxel_render::{RendererConfig, ViewParams, VoxelRenderer};
 use boxel_transform::Transform;
@@ -57,8 +59,9 @@ const FAR_SHIFTS: [I64Vec3; 5] = [
 ];
 
 /// How far the camera teleports with the chunks left resident: their wrapped origins are then
-/// the same as near the camera.
-const TELEPORT: I64Vec3 = I64Vec3::new(1 << 32, 0, -(1 << 32));
+/// the same as near the camera. The chunks are left `2^32` voxels behind on every axis, which
+/// from there is straight ahead of the overview (about 10 degrees off its center).
+const TELEPORT: I64Vec3 = I64Vec3::new(-(1 << 32), 1 << 32, -(1 << 32));
 
 // ---------------------------------------------------------------- adapters
 
@@ -225,18 +228,27 @@ fn chunk_id(c: ChunkPos) -> u64 {
     pack(c.x) | pack(c.y) << 10 | pack(c.z) << 20
 }
 
-/// `transform` moved by `shift`. Eye coordinates are multiples of 1/64, exact in `f64` at every
-/// shift, so the camera-relative eye and the view matrix are the same as near the origin.
-fn view_params(transform: &Transform, shift: I64Vec3) -> ViewParams {
-    let camera = Camera::default();
+/// `transform` moved by `shift`, seen with `camera`. Eye coordinates are multiples of 1/64,
+/// exact in `f64` at every shift, so the camera-relative eye and the view matrix are the same as
+/// near the origin.
+fn view_params(camera: &Camera, transform: &Transform, shift: I64Vec3) -> ViewParams {
     let mut transform = *transform;
     transform.translation += shift.as_dvec3();
-    let view = CameraView::compute(&camera, &transform, WIDTH as f32 / HEIGHT as f32);
-    ViewParams::from_camera(&view, &camera, RendererConfig::default().clear_color, 0.6)
+    let view = CameraView::compute(camera, &transform, WIDTH as f32 / HEIGHT as f32);
+    ViewParams::from_camera(&view, camera, RendererConfig::default().clear_color, 0.6)
+}
+
+/// The default camera with a view distance of `2^34` voxels, past the chunks left behind by a
+/// [`TELEPORT`]. Fog starts at 60 % of it, so it does not touch anything near the camera.
+fn far_sighted() -> Camera {
+    Camera {
+        view_distance: 17_179_869_184.0,
+        ..Camera::default()
+    }
 }
 
 /// From above the (-x, -z) corner of the meshed area, looking at its center.
-fn overview(scene: &Scene, shift: I64Vec3) -> ViewParams {
+fn overview(camera: &Camera, scene: &Scene, shift: I64Vec3) -> ViewParams {
     let eye = DVec3::new(
         -110.296_875,
         f64::from(scene.max_height) + 40.593_75,
@@ -246,7 +258,7 @@ fn overview(scene: &Scene, shift: I64Vec3) -> ViewParams {
     let d = (target - eye).as_vec3();
     let yaw = (-d.x).atan2(-d.z);
     let pitch = d.y.atan2(d.x.hypot(d.z));
-    view_params(&Transform::from_yaw_pitch(eye, yaw, pitch), shift)
+    view_params(camera, &Transform::from_yaw_pitch(eye, yaw, pitch), shift)
 }
 
 /// Just above the highest column at the -x edge, looking across the surface toward +x (hills,
@@ -259,6 +271,7 @@ fn across(scene: &Scene, shift: I64Vec3) -> ViewParams {
     );
     // yaw -90 degrees turns the -z forward vector toward +x
     view_params(
+        &Camera::default(),
         &Transform::from_yaw_pitch(eye, -90f32.to_radians(), -12f32.to_radians()),
         shift,
     )
@@ -293,8 +306,8 @@ struct TierImages {
     tier: Tier,
     /// In the order of [`VIEWS`].
     images: Vec<RgbaImage>,
-    /// The overview moved by [`TELEPORT`] with the scene left where it was: right after the
-    /// teleport, and after uploading every mesh again from there.
+    /// The overview moved by [`TELEPORT`] with the scene left where it was, seen with
+    /// [`far_sighted`]: right after the teleport, and after uploading every mesh again from there.
     teleported: [RgbaImage; 2],
     /// The overview again, back at the scene.
     back: RgbaImage,
@@ -351,10 +364,10 @@ fn render_tier(
     }
 
     let mut images = Vec::new();
-    for (name, view) in VIEWS
-        .iter()
-        .zip([overview(scene, shift), across(scene, shift)])
-    {
+    for (name, view) in VIEWS.iter().zip([
+        overview(&Camera::default(), scene, shift),
+        across(scene, shift),
+    ]) {
         render(&device, &queue, &mut renderer, &view)?; // warm-up
         let (image, cpu) = render(&device, &queue, &mut renderer, &view)?;
         let stats = renderer.stats();
@@ -374,12 +387,29 @@ fn render_tier(
 
     // The old chunks are still resident after a teleport (the world removes them over a few
     // frames). Their wrapped origins equal the ones they had near the camera: only an i64 test
-    // keeps them from being drawn under it.
-    let away = overview(scene, shift + TELEPORT);
+    // keeps them from being drawn under it. In i64 they are in the frustum of the far-sighted
+    // view, so the CPU cull of Mid and Low cannot drop them by distance or direction either.
+    let away = overview(&far_sighted(), scene, shift + TELEPORT);
+    for (pos, _) in &scene.meshes {
+        let min = (pos.origin().as_i64vec3() + shift - away.render_origin).as_vec3();
+        if !away
+            .frustum
+            .intersects_aabb(&Aabb::new(min, min + Vec3::splat(32.0)))
+        {
+            return Err(format!(
+                "teleported view: {pos:?} left behind is not in the frustum"
+            ));
+        }
+    }
     let (teleported, _) = render(&device, &queue, &mut renderer, &away)?;
     upload(&mut renderer)?;
     let (uploaded, _) = render(&device, &queue, &mut renderer, &away)?;
-    let (back, _) = render(&device, &queue, &mut renderer, &overview(scene, shift))?;
+    let (back, _) = render(
+        &device,
+        &queue,
+        &mut renderer,
+        &overview(&Camera::default(), scene, shift),
+    )?;
 
     let errors = errors.lock().map(|e| e.clone()).unwrap_or_default();
     if !errors.is_empty() {

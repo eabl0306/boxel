@@ -740,12 +740,13 @@ cambia el layout.
   cámara. Por eso solo se dibujan los chunks a menos de 2^30 vóxeles por eje del centro de una
   ventana que sigue a la cámara: cuando el origen de render se aleja más de 2^20 vóxeles de su
   centro, la ventana se mueve. Vale para todos los tiers: la tabla de GPU marca vivo
-  (`FLAG_LIVE`) solo a esos chunks y el cull de High salta los demás (al moverse la ventana se
-  vuelve a subir la tabla entera, una vez por salto largo); el culling en CPU (Mid, Low) también
-  salta los de afuera, y resta en `i64` antes de pasar a `f32`. Los demás siguen cargados hasta
-  que el mundo los quita. Precisión exacta a cualquier distancia del origen del mundo, sin
-  re-basar tablas y sin cambiar el layout de la GPU (ADR 0014). El límite siguiente es el `f64`
-  de `Transform` (paso de 1 mm a unos 4.4e12 vóxeles).
+  (`FLAG_LIVE`) solo a esos chunks y el cull de High salta los demás (al moverse la ventana,
+  High vuelve a subir los slots en uso: una vez por salto largo o cada 2^20 vóxeles de viaje);
+  el culling en CPU (Mid, Low) también salta los de afuera, y resta en `i64` antes de
+  pasar a `f32`. Los demás siguen cargados hasta que el mundo los quita. Precisión exacta a
+  cualquier distancia del origen del mundo, sin re-basar tablas y sin cambiar el layout de la GPU
+  (ADR 0014). El límite siguiente es el `f64` de `Transform` (paso de 1 mm a unos 4.4e12
+  vóxeles).
 - **Limitación en GL** (verificada en wgpu-hal 30.0.1 y naga): el backend GL siempre remapea z de
   [0, 1] a [-1, 1] (`z * 2 - w`) y no usa `glClipControl`, así que en los tiers sobre GL el
   reverse-Z pierde su ventaja de precisión: con near = 0.1, la resolución de profundidad es de
@@ -762,7 +763,7 @@ cambia el layout.
 | Recurso | Uso | Tiers |
 |---|---|---|
 | Arena de quads | un buffer `STORAGE | VERTEX | COPY_DST` de `PackedQuad`, sub-asignado con `offset-allocator` (una asignación por chunk con los 8 buckets contiguos); 8 Mi quads = 64 MiB por defecto | todos |
-| Tabla de chunks | storage `array<ChunkGpu>` (64 B: origen i32x3 con los 32 bits bajos del origen `i64`, `quad_base`, 8 contadores, flags con el bit vivo solo dentro de la ventana de la cámara, relleno) | High, Mid |
+| Tabla de chunks | storage `array<ChunkGpu>` (64 B: origen i32x3 con los 32 bits bajos del origen `i64`, `quad_base`, 8 contadores, flags con el bit vivo solo dentro de la ventana de la cámara, que lee solo High, relleno) | High, Mid |
 | Tabla CPU | espejo en CPU (origen `i64`, rangos, contadores) para culling en CPU | todos |
 | Índice compartido | u32 `[0,1,2,2,1,3] + 4i` para 98 304 quads (2.36 MB) | High, Mid |
 | Textura de bloques | `texture_2d_array` RGBA8 sRGB 16x16 con mips, procedural en M0 | todos |

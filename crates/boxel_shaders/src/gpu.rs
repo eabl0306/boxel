@@ -43,7 +43,8 @@ pub struct ChunkGpu {
 
 impl ChunkGpu {
     /// `flags` bit: slot is live, i.e. holds a chunk the cull may draw. The renderer sets it only
-    /// for chunks near enough to the camera for the wrapped origin difference to be exact.
+    /// for chunks near enough to the camera for the wrapped origin difference to be exact. Only
+    /// the High cull reads it (Mid tests the same window on the CPU, and its flags may lag).
     pub const FLAG_LIVE: u32 = 1;
 }
 
