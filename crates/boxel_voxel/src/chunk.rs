@@ -72,7 +72,7 @@ impl ChunkData {
     /// The block storage, to change it in place. Drops the mask cache; does not bump
     /// `version` (use [`ChunkData::set`] for edits).
     pub fn blocks_mut(&mut self) -> &mut Paletted {
-        self.masks = MaskCache::default();
+        self.masks.0.take();
         &mut self.blocks
     }
     /// Compacts the block storage ([`Paletted::compact`]). The voxels stay the same, so the
@@ -99,7 +99,7 @@ impl ChunkData {
         let previous = self.blocks.set(p, state);
         if previous != state {
             self.version = self.version.wrapping_add(1);
-            self.masks = MaskCache::default();
+            self.masks.0.take();
         }
         previous
     }

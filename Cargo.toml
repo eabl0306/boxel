@@ -40,7 +40,6 @@ boxel_shaders = { path = "crates/boxel_shaders", version = "0.1.0-dev" }
 boxel_render = { path = "crates/boxel_render", version = "0.1.0-dev" }
 boxel_voxel = { path = "crates/boxel_voxel", version = "0.1.0-dev" }
 boxel_mesh = { path = "crates/boxel_mesh", version = "0.1.0-dev" }
-boxel_light = { path = "crates/boxel_light", version = "0.1.0-dev" }
 boxel_worldgen = { path = "crates/boxel_worldgen", version = "0.1.0-dev" }
 boxel_world = { path = "crates/boxel_world", version = "0.1.0-dev" }
 boxel_debug = { path = "crates/boxel_debug", version = "0.1.0-dev" }

@@ -15,8 +15,9 @@ oracle = []
 boxel_voxel.workspace = true
 
 [dev-dependencies]
-# Enables `oracle` for the integration tests.
-boxel_light = { workspace = true, features = ["oracle"] }
+# Enables `oracle` for the integration tests. A path to itself, not a workspace entry: no other
+# crate depends on boxel_light yet (cargo-deny reports unused workspace entries).
+boxel_light = { path = ".", features = ["oracle"] }
 # The sky walk tests and the benches use the real generators.
 boxel_worldgen.workspace = true
 proptest.workspace = true
