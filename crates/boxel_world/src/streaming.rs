@@ -28,7 +28,7 @@ use boxel_ecs::prelude::*;
 use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, Mesher};
 use boxel_voxel::{
     BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, Face, LocalPos, NEIGHBOR_OFFSETS,
-    RenderShape,
+    RenderShape, neighbor_index,
 };
 use crossbeam_channel::{Receiver, Sender};
 use std::cell::RefCell;
@@ -655,7 +655,8 @@ impl WorldJobs {
     }
 
     /// New slot at `pos`: data `Queued` with a generation job, or `Ready` air at once if the
-    /// generator declares the layer all air.
+    /// generator declares the layer all air (then its 26 neighbors are looked up once, for its
+    /// own bits and for theirs).
     pub(crate) fn create_slot(
         &mut self,
         cx: &mut Ctx<'_>,
@@ -663,7 +664,11 @@ impl WorldJobs {
         pos: ChunkPos,
         interest: Interest,
     ) -> ChunkId {
-        let neighbors_ready = own_neighbor_bits(cx.map, &self.planner, pos);
+        let near = cx.known_air(pos.y).then(|| neighbor_ids(cx.map, pos));
+        let neighbors_ready = match &near {
+            Some(near) => neighbor_bits(cx.map, &self.planner, pos, near),
+            None => own_neighbor_bits(cx.map, &self.planner, pos),
+        };
         let slot = ChunkSlot {
             key: ChunkKey {
                 dim: settings.dimension,
@@ -679,11 +684,13 @@ impl WorldJobs {
             cancel: Arc::new(AtomicBool::new(false)),
         };
         let id = cx.map.insert(slot);
+        // Gaining mesh interest only queues the mesh here (the data is not ready yet): no slot
+        // comes or goes, so `near` stays valid.
         self.set_interest(cx, id, interest);
-        if cx.known_air(pos.y) {
+        if let Some(near) = near {
             cx.map
                 .set_data(id, DataState::Ready(self.uniform(BlockState::AIR)));
-            self.data_available(cx, id);
+            self.data_available_near(cx, id, pos, &near);
         } else {
             self.scheduler
                 .push(id, JobKind::Generate, self.priority(pos));
@@ -844,11 +851,24 @@ impl WorldJobs {
     /// the 26 neighbors and schedule every mesh that became possible.
     fn data_available(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
         let pos = cx.map.slots[id].key.pos;
-        cx.map.slots[id].neighbors_ready = own_neighbor_bits(cx.map, &self.planner, pos);
+        let near = neighbor_ids(cx.map, pos);
+        self.data_available_near(cx, id, pos, &near);
+    }
+
+    /// [`WorldJobs::data_available`] for the slot `id` at `pos` with its neighbors already
+    /// looked up (`near`, current: no slot came or went since).
+    fn data_available_near(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        id: ChunkId,
+        pos: ChunkPos,
+        near: &[Option<ChunkId>; 26],
+    ) {
+        cx.map.slots[id].neighbors_ready = neighbor_bits(cx.map, &self.planner, pos, near);
         self.schedule_mesh(cx, id, self.priority(pos));
-        for (i, offset) in NEIGHBOR_OFFSETS.iter().enumerate() {
-            let npos = pos.offset(*offset);
-            let Some(&n) = cx.map.index.get(&npos) else {
+        // Scheduling meshes adds or removes no slot: `near` stays valid.
+        for (i, &n) in near.iter().enumerate() {
+            let Some(n) = n else {
                 continue;
             };
             let bit = 1 << opposite_neighbor(i);
@@ -856,6 +876,7 @@ impl WorldJobs {
             if neighbor.neighbors_ready & bit == 0 {
                 neighbor.neighbors_ready |= bit;
                 if neighbor.neighbors_ready == ALL_NEIGHBORS {
+                    let npos = pos.offset(NEIGHBOR_OFFSETS[i]);
                     self.schedule_mesh(cx, n, self.priority(npos));
                 }
             }
@@ -1038,19 +1059,19 @@ impl WorldJobs {
         };
         let pos = slot.key.pos;
         let registry = &cx.content.registry;
-        if is_uniform_empty(center, registry) || is_enclosed_opaque(map, registry, pos, center) {
+        if is_uniform_empty(center, registry) {
+            self.set_mesh_empty(cx, id);
+            return false;
+        }
+        // Each neighbor is looked up once: the face neighbors first, for the enclosed check.
+        let mut near = NearData::default();
+        if is_enclosed_opaque(map, registry, pos, center, &mut near) {
             self.set_mesh_empty(cx, id);
             return false;
         }
         let center = Arc::clone(center);
-        let neighbors: [Option<Arc<ChunkData>>; 26] = std::array::from_fn(|i| {
-            let neighbor = map.get(map.id_at(pos.offset(NEIGHBOR_OFFSETS[i]))?)?;
-            match &neighbor.data {
-                DataState::Ready(d) => Some(Arc::clone(d)),
-                // Missing chunks are air, like chunks outside the vertical bounds.
-                DataState::Missing | DataState::Queued | DataState::Generating => None,
-            }
-        });
+        let neighbors: [Option<Arc<ChunkData>>; 26] =
+            std::array::from_fn(|i| near.get(map, pos, i).cloned());
         let (data_version, epoch) = (center.version, slot.epoch);
         let cancel = Arc::clone(&slot.cancel);
         cx.map.set_mesh_and_pending(
@@ -1256,6 +1277,30 @@ fn current_priority(map: &ChunkMap, planner: &Planner, id: ChunkId, kind: JobKin
     queued.then(|| planner.priority(slot.key.pos))
 }
 
+/// The slots of the 26 neighbors of `pos`, in [`NEIGHBOR_OFFSETS`] order (one lookup each).
+fn neighbor_ids(map: &ChunkMap, pos: ChunkPos) -> [Option<ChunkId>; 26] {
+    std::array::from_fn(|i| map.id_at(pos.offset(NEIGHBOR_OFFSETS[i])))
+}
+
+/// [`own_neighbor_bits`] from the neighbors' slots already looked up ([`neighbor_ids`]).
+fn neighbor_bits(
+    map: &ChunkMap,
+    planner: &Planner,
+    pos: ChunkPos,
+    near: &[Option<ChunkId>; 26],
+) -> u32 {
+    let mut bits = 0;
+    for (i, (offset, n)) in NEIGHBOR_OFFSETS.iter().zip(near).enumerate() {
+        let ready = !planner.in_bounds(pos.y + i64::from(offset.y))
+            || n.and_then(|n| map.get(n))
+                .is_some_and(|n| matches!(n.data, DataState::Ready(_) | DataState::Missing));
+        if ready {
+            bits |= 1 << i;
+        }
+    }
+    bits
+}
+
 /// Neighbor bits of a slot at `pos` from the current map: outside the vertical bounds counts as
 /// ready, as do loaded neighbors whose data is `Ready` or `Missing`.
 fn own_neighbor_bits(map: &ChunkMap, planner: &Planner, pos: ChunkPos) -> u32 {
@@ -1280,23 +1325,57 @@ fn is_uniform_empty(data: &ChunkData, registry: &BlockRegistry) -> bool {
         .is_some_and(|s| registry.shape(s) == RenderShape::None)
 }
 
+/// Indices of the 6 face neighbors in [`NEIGHBOR_OFFSETS`], in [`Face::ALL`] order.
+const FACE_NEIGHBORS: [usize; 6] = {
+    let mut out = [0; 6];
+    let mut f = 0;
+    while f < 6 {
+        out[f] = match neighbor_index(Face::ALL[f].normal()) {
+            Some(i) => i,
+            None => panic!("a face normal is a neighbor offset"),
+        };
+        f += 1;
+    }
+    out
+};
+
+/// The `Ready` data of the 26 neighbors of one chunk, each looked up on first use only.
+#[derive(Default)]
+struct NearData<'a> {
+    /// Bit `i` set once neighbor `i` was looked up.
+    looked: u32,
+    data: [Option<&'a Arc<ChunkData>>; 26],
+}
+
+impl<'a> NearData<'a> {
+    /// `Ready` data of neighbor `i` of `pos` (`None` if not loaded, or `Missing`, `Queued` or
+    /// `Generating`: missing chunks mesh as air, like chunks outside the vertical bounds).
+    fn get(&mut self, map: &'a ChunkMap, pos: ChunkPos, i: usize) -> Option<&'a Arc<ChunkData>> {
+        if self.looked & (1 << i) == 0 {
+            self.looked |= 1 << i;
+            self.data[i] = map.data_at(pos.offset(NEIGHBOR_OFFSETS[i]));
+        }
+        self.data[i]
+    }
+}
+
 /// Uniform opaque chunk whose 6 face neighbors are loaded uniform opaque chunks: fully enclosed,
-/// meshes to nothing.
-fn is_enclosed_opaque(
-    map: &ChunkMap,
+/// meshes to nothing. The face neighbors it looks up stay in `near`.
+fn is_enclosed_opaque<'a>(
+    map: &'a ChunkMap,
     registry: &BlockRegistry,
     pos: ChunkPos,
     data: &ChunkData,
+    near: &mut NearData<'a>,
 ) -> bool {
     let opaque = |d: &ChunkData| {
         d.as_uniform()
             .is_some_and(|s| registry.shape(s) == RenderShape::Opaque)
     };
     opaque(data)
-        && Face::ALL.iter().all(|face| {
-            map.data_at(pos.offset(face.normal()))
-                .is_some_and(|d| opaque(d))
-        })
+        && FACE_NEIGHBORS
+            .iter()
+            .all(|&i| near.get(map, pos, i).is_some_and(|d| opaque(d)))
 }
 
 #[cfg(test)]
