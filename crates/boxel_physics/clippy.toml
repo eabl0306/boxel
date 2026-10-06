@@ -1,0 +1,48 @@
+# boxel_physics: the workspace clippy.toml (clippy reads only the nearest file, so it is
+# repeated here) plus the determinism guard of ADR 0016. The simulation uses only + - * /,
+# sqrt, floor, ceil, abs, min and max on floats: IEEE 754 gives them one exact result on every
+# platform. Fused multiply-add and the libm functions below differ between platforms and
+# compilers, so they are disallowed in this crate (tests included).
+allow-print-in-tests = true
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-dbg-in-tests = true
+avoid-breaking-exported-api = false
+doc-valid-idents = ["WebGPU", "WGSL", "SPIR-V", "GLES", "OpenGL", "Vulkan", "RenderDoc", "DirectX", "MoltenVK", "llvmpipe", "lavapipe", "radeonsi", "RADV", "glvnd", "EGL", "Wayland", "XWayland", "Amanatides", ".."]
+stack-size-threshold = 524288
+array-size-threshold = 16384
+disallowed-methods = [
+  { path = "std::thread::sleep", reason = "blocks the frame; use the runner's pacing (allowed with #[expect] in runners only)" },
+  { path = "wgpu::util::initialize_adapter_from_env", reason = "panics on no match; use boxel_gfx::select_gpu" },
+  { path = "wgpu::util::initialize_adapter_from_env_or_default", reason = "use boxel_gfx::select_gpu" },
+  # Determinism guard (ADR 0016): results must be bit-identical across platforms.
+  { path = "f64::mul_add", reason = "fused multiply-add rounds once: results differ from a * b + c (ADR 0016)" },
+  { path = "f64::powf", reason = "libm: not correctly rounded, differs between platforms (ADR 0016)" },
+  { path = "f64::powi", reason = "not correctly rounded, differs between platforms (ADR 0016)" },
+  { path = "f64::exp", reason = "libm: differs between platforms (ADR 0016)" },
+  { path = "f64::exp2", reason = "libm: differs between platforms (ADR 0016)" },
+  { path = "f64::ln", reason = "libm: differs between platforms (ADR 0016)" },
+  { path = "f64::log2", reason = "libm: differs between platforms (ADR 0016)" },
+  { path = "f64::sin", reason = "libm: differs between platforms (ADR 0016)" },
+  { path = "f64::cos", reason = "libm: differs between platforms (ADR 0016)" },
+  { path = "f64::sin_cos", reason = "libm: differs between platforms (ADR 0016)" },
+  { path = "f32::mul_add", reason = "fused multiply-add rounds once: results differ from a * b + c (ADR 0016)" },
+  { path = "f32::powf", reason = "libm: not correctly rounded, differs between platforms (ADR 0016)" },
+  { path = "f32::powi", reason = "not correctly rounded, differs between platforms (ADR 0016)" },
+  { path = "f32::exp", reason = "libm: differs between platforms (ADR 0016)" },
+  { path = "f32::ln", reason = "libm: differs between platforms (ADR 0016)" },
+  { path = "f32::sin", reason = "libm: differs between platforms (ADR 0016)" },
+  { path = "f32::cos", reason = "libm: differs between platforms (ADR 0016)" },
+  { path = "glam::DVec3::mul_add", reason = "fused multiply-add (ADR 0016)" },
+  { path = "glam::DVec3::powf", reason = "libm (ADR 0016)" },
+  { path = "glam::DVec3::exp", reason = "libm (ADR 0016)" },
+  { path = "glam::DVec3::exp2", reason = "libm (ADR 0016)" },
+  { path = "glam::DVec3::ln", reason = "libm (ADR 0016)" },
+  { path = "glam::DVec3::log2", reason = "libm (ADR 0016)" },
+  { path = "glam::DVec3::sin", reason = "libm (ADR 0016)" },
+  { path = "glam::DVec3::cos", reason = "libm (ADR 0016)" },
+  { path = "glam::DVec3::sin_cos", reason = "libm (ADR 0016)" },
+  { path = "glam::Vec3::mul_add", reason = "fused multiply-add (ADR 0016)" },
+  { path = "glam::Vec3::powf", reason = "libm (ADR 0016)" },
+  { path = "glam::Vec3::exp", reason = "libm (ADR 0016)" },
+]
