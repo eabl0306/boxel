@@ -1,12 +1,14 @@
-//! Headless world streaming: generates and meshes the default terrain around one viewer with no
-//! GPU and no window, then prints the world counters.
+//! Headless world streaming: generates and meshes a world (the default terrain, or `--world`)
+//! around one viewer with no GPU and no window, then prints the world counters.
 //!
 //! `cargo run --release --example headless_world -- [options]` (see `--help`).
 //!
 //! Output (stdout): once settled, `chunks=N ready=N meshed=N empty=N quads=N elapsed=S frames=N
 //! max_update_ms=X p99_update_ms=X`, where `quads` is the sum of the ready mesh quads and the
-//! update times are the longest and 99th percentile `App::update` while loading. Then, in this
-//! order and only when asked for:
+//! update times are the longest and 99th percentile `App::update` while loading, and `world:
+//! meshed_fraction=X quads_per_mesh_p50=N p99=N max=N voxel_mib=X`: the share of the meshed
+//! chunks with a non-empty mesh, the quads of those meshes, and the heap bytes of the voxel data.
+//! Then, in this order and only when asked for:
 //! - `--idle`: `idle: frames=N median_update_ms=X p99_update_ms=X max_update_ms=X` while the
 //!   viewer stands still.
 //! - `--speed`: `walk: moved=V voxels in S s, frames=N max_update_ms=X p99_update_ms=X, behind=N,
@@ -23,18 +25,26 @@
 //! filter `warn`).
 #![expect(clippy::print_stdout, clippy::print_stderr, reason = "CLI output")]
 
+#[path = "shared/world.rs"]
+mod world;
+
 use boxel::log::LogPlugin;
 use boxel::prelude::*;
-use boxel::voxel::{CHUNK_SIZE, MAX_CHUNK_COORD};
+use boxel::voxel::{CHUNK_SIZE, MAX_BLOCK_COORD, MAX_CHUNK_COORD};
+use boxel::world::DataState;
 use boxel::world::{WorldStats, WorldSystems};
 use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
+use world::{World, WorldChoice};
 
 const USAGE: &str = "\
 usage: headless_world [options]
   --view-distance N    horizontal mesh radius in chunks (default 4)
   --vertical-radius N  vertical mesh radius in chunks (default 8)
-  --fixed-height       stream every layer of the generator and nothing else (boxel M0 streaming)
+  --fixed-height       stream every layer of the generator and nothing else (boxel M0 streaming;
+                       not with the overworld, which has no floor)
+  --viewer-y Y         viewer height in voxels (default 80; -1000 is deep in the overworld's
+                       caves)
   --hz N               frames per second of the loop (default 62.5; 0 = no wait between frames)
   --idle S             once settled, stand still for S seconds and report the update times
   --speed V            then move the viewer along +x at V voxels/s
@@ -44,12 +54,17 @@ usage: headless_world [options]
   --timeout S          wall-clock limit in seconds (default 60), exit 4 past it
   --help               this text";
 
+/// The whole help: [`USAGE`] and the world options.
+fn usage() -> String {
+    format!("{USAGE}\nworld options:\n{}", world::usage(World::Terrain))
+}
+
 /// Exit code for a timeout.
 const EXIT_TIMEOUT: u8 = 4;
 /// Exit code when the world settled away from the viewer after a jump.
 const EXIT_OFF_CENTER: u8 = 5;
 
-/// Viewer position.
+/// Viewer position (`--viewer-y` replaces y).
 const VIEWER: DVec3 = DVec3::new(0.0, 80.0, 0.0);
 
 #[derive(Clone, Debug)]
@@ -64,6 +79,9 @@ struct Options {
     /// Chunks along x (`0`: no jump).
     jump: i64,
     timeout: Duration,
+    /// The terrain unless `--world` says otherwise (the world of the earlier measurements).
+    world: WorldChoice,
+    viewer_y: f64,
 }
 
 /// `Ok(None)` for `--help`.
@@ -78,6 +96,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         idle: Duration::ZERO,
         jump: 0,
         timeout: Duration::from_secs(60),
+        world: WorldChoice::with_world(World::Terrain),
+        viewer_y: VIEWER.y,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -91,6 +111,9 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                 .or_else(|| it.next().cloned())
                 .ok_or_else(|| format!("{flag} needs a value"))
         };
+        if o.world.parse_flag(flag, &mut value)? {
+            continue;
+        }
         match flag {
             "--help" | "-h" => return Ok(None),
             "--view-distance" => o.radius = radius(flag, &value()?)?,
@@ -111,9 +134,20 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                     })?;
             }
             "--timeout" => o.timeout = Duration::from_secs_f64(number(flag, &value()?)?),
+            "--viewer-y" => {
+                let v = value()?;
+                o.viewer_y = v
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|y| y.abs() <= MAX_BLOCK_COORD as f64)
+                    .ok_or_else(|| {
+                        format!("{flag}: {v:?} is not a height within +-{MAX_BLOCK_COORD}")
+                    })?;
+            }
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
+    o.world.validate(o.fixed_height)?;
     Ok(Some(o))
 }
 
@@ -223,15 +257,15 @@ fn main() -> AppExit {
     let options = match parse_options(&args) {
         Ok(Some(o)) => o,
         Ok(None) => {
-            println!("{USAGE}");
+            println!("{}", usage());
             return AppExit::Success;
         }
         Err(message) => {
-            eprintln!("headless_world: {message}\n\n{USAGE}");
+            eprintln!("headless_world: {message}\n\n{}", usage());
             return AppExit::from_code(1);
         }
     };
-    let generator = TerrainGenerator::default();
+    let generator = options.world.generator(TerrainGenerator::default().seed);
     let settings = WorldSettings {
         vertical_bounds: options.fixed_height.then(|| generator.vertical_chunks()),
         ..WorldSettings::default()
@@ -249,7 +283,7 @@ fn main() -> AppExit {
             MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(wait)),
             FrameStatsPlugin,
             WorldPlugin {
-                generator: std::sync::Arc::new(generator),
+                generator,
                 settings,
                 ..WorldPlugin::default()
             },
@@ -281,7 +315,7 @@ fn spawn_viewer(mut commands: Commands, run: Res<Run>) {
         o.vertical_radius
     };
     commands.spawn((
-        Transform::from_translation(VIEWER),
+        Transform::from_translation(DVec3::new(VIEWER.x, o.viewer_y, VIEWER.z)),
         ChunkViewer::new(o.radius).with_vertical_radius(vertical),
     ));
 }
@@ -325,6 +359,42 @@ fn missing_around(
         }
     }
     missing
+}
+
+/// The `world:` line: meshed fraction, quads per non-empty mesh and voxel memory.
+fn world_line(map: &ChunkMap) -> String {
+    let mut quads: Vec<u32> = map
+        .ready_meshes()
+        .map(|(_, _, mesh)| mesh.total_quads())
+        .collect();
+    quads.sort_unstable();
+    let stats = map.stats();
+    let meshed = stats.mesh_ready + stats.mesh_empty;
+    let fraction = if meshed > 0 {
+        stats.mesh_ready as f64 / meshed as f64
+    } else {
+        0.0
+    };
+    let at = |q: usize| {
+        quads
+            .get(quads.len().saturating_sub(1) * q / 100)
+            .copied()
+            .unwrap_or(0)
+    };
+    let voxel_bytes: usize = map
+        .iter()
+        .filter_map(|(_, slot)| match slot.data() {
+            DataState::Ready(data) => Some(data.heap_bytes()),
+            _ => None,
+        })
+        .sum();
+    format!(
+        "world: meshed_fraction={fraction:.3} quads_per_mesh_p50={} p99={} max={} voxel_mib={:.1}",
+        at(50),
+        at(99),
+        quads.last().copied().unwrap_or(0),
+        voxel_bytes as f64 / f64::from(1 << 20),
+    )
 }
 
 /// 99th percentile of `values` (0 when empty).
@@ -391,6 +461,7 @@ fn drive(
                 run.max_update,
                 p99(&run.updates),
             );
+            println!("{}", world_line(&map));
             run.next_phase(Phase::Loading, now, x, &mut exit);
         }
         Phase::Idle { since } if now.duration_since(since) >= run.options.idle => {
@@ -502,6 +573,26 @@ mod tests {
         }
         for arg in ["72057594037927937", "-9223372036854775808", "1.5", "x"] {
             assert!(parse(&["--jump", arg]).is_err(), "{arg} was accepted");
+        }
+    }
+
+    #[test]
+    fn world_and_viewer_height() {
+        let o = parse(&[]).expect("valid").expect("not help");
+        assert_eq!((o.world.label(), o.viewer_y), ("terrain".to_string(), 80.0));
+        let o = parse(&["--world", "overworld", "--viewer-y", "-1000"])
+            .expect("valid")
+            .expect("not help");
+        assert_eq!(
+            (o.world.label(), o.viewer_y),
+            ("overworld/mc".to_string(), -1000.0)
+        );
+        for args in [
+            &["--world", "overworld", "--fixed-height"][..],
+            &["--viewer-y", "3e18"],
+            &["--viewer-y", "x"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?} was accepted");
         }
     }
 

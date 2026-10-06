@@ -7,6 +7,8 @@
 //! - `static`: the camera stays put; measures the settled world.
 //! - `fly`: the camera flies straight ahead at `--speed` voxels per second, so new chunks
 //!   stream in all the time.
+//! - `dive`: the camera moves straight down at `--speed` voxels per second (new layers of
+//!   chunks under it all the time; with `--world overworld` it digs into the caves).
 //! - `spin`: the camera turns 360 degrees in place over the measurement (visibility changes,
 //!   no new chunks).
 //!
@@ -24,12 +26,12 @@
 //! written, 4 timeout (the world did not settle, or the run took longer than `--timeout`).
 #![expect(clippy::print_stdout, clippy::print_stderr, reason = "CLI output")]
 
-#[path = "stress/forest.rs"]
-mod forest;
 #[path = "stress/report.rs"]
 mod report;
 #[path = "stress/spans.rs"]
 mod spans;
+#[path = "shared/world.rs"]
+mod world;
 
 use boxel::app::{TaskPoolOptions, TaskPoolThreadAssignmentPolicy};
 use boxel::gfx::{CLI_HELP, PresentModePref};
@@ -39,8 +41,6 @@ use boxel::render::GpuFailed;
 use boxel::voxel::{BlockPos, BlockRegistry, ChunkData, ChunkKey, ChunkPos, MAX_BLOCK_COORD};
 use boxel::world::jobs::{JobExecutor, TaskPoolExecutor};
 use boxel::world::{ChunkId, ChunkMeshEvent, WorldStats, WorldSystems};
-use boxel::worldgen::TerrainSettings;
-use forest::Forest;
 use report::{FrameRecord, RecordLog, RunInfo, Summary};
 use spans::{SpanLog, SpanRow};
 use std::collections::HashMap;
@@ -51,12 +51,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use world::{World, WorldChoice};
 
 const USAGE: &str = "\
-usage: stress [--scenario static|fly|spin] [GPU options] [options]
-  --scenario NAME     static (default), fly or spin
+usage: stress [--scenario static|fly|dive|spin] [GPU options] [options]
+  --scenario NAME     static (default), fly, dive (straight down) or spin
   --radius N          mesh radius in chunks (default 16)
-  --speed V           fly speed in voxels per second (default 32)
+  --speed V           fly and dive speed in voxels per second (default 32)
   --duration SECS     measured time (default 20)
   --warmup SECS       time between the world settling and the measurement (default 2)
   --timeout SECS      wall-clock limit for the whole run, exit 4 (default 120 + warmup +
@@ -71,15 +72,22 @@ usage: stress [--scenario static|fly|spin] [GPU options] [options]
                       fly moves along the yaw direction, horizontally)
   --size WxH          window size in logical pixels (default 1280x720)
   --async-threads N   async compute pool size (chunk jobs)
-  --no-trees          plain TerrainGenerator (no trees)
   --vertical-radius N chunks loaded above and below the camera (default 8)
-  --fixed-height      load only the generator's layers, like M0 (for comparisons with older runs)
+  --fixed-height      load only the generator's layers, like M0 (for comparisons with older runs;
+                      not with the overworld, which has no floor)
+  --arena-quads N     renderer quad arena (default 8388608, 25165824 with the overworld)
+  --chunk-slots N     renderer chunk table (default 32768, 65536 with the overworld)
   --spans             busy time per system and span in each frame, added to the summary (needs
                       a build with --features trace)
   --spans-csv PATH    also write it per frame (implies --spans)
   --help              this text
 The run presents with --present immediate unless --present or BOXEL_PRESENT is given.
 exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 output not written, 4 timeout";
+
+/// The whole help: [`USAGE`] and the world options.
+fn usage() -> String {
+    format!("{USAGE}\nworld options:\n{}", world::usage(World::Forest))
+}
 
 /// Consecutive settled frames before the world counts as settled.
 const SETTLED_FRAMES: u32 = 3;
@@ -89,9 +97,6 @@ const SETTLE_ALLOWANCE: Duration = Duration::from_secs(120);
 const CATCH_UP_LIMIT: Duration = Duration::from_secs(60);
 /// Extra time the watchdog thread waits after `--timeout` before killing the process.
 const WATCHDOG_GRACE: Duration = Duration::from_secs(15);
-/// Expected chunks resident on the GPU at most (render chunk table size): the quad map is
-/// allocated once so it never rehashes during the measurement.
-const RESIDENT_CAPACITY: usize = 32_768;
 
 // ---------------------------------------------------------------------------------------------
 // Options
@@ -100,22 +105,34 @@ const RESIDENT_CAPACITY: usize = 32_768;
 enum Scenario {
     Static,
     Fly,
+    Dive,
     Spin,
 }
 
 impl Scenario {
+    const ALL: [Scenario; 4] = [
+        Scenario::Static,
+        Scenario::Fly,
+        Scenario::Dive,
+        Scenario::Spin,
+    ];
+
     fn name(self) -> &'static str {
         match self {
             Scenario::Static => "static",
             Scenario::Fly => "fly",
+            Scenario::Dive => "dive",
             Scenario::Spin => "spin",
         }
     }
 
     fn parse(name: &str) -> Option<Self> {
-        [Scenario::Static, Scenario::Fly, Scenario::Spin]
-            .into_iter()
-            .find(|s| s.name() == name)
+        Self::ALL.into_iter().find(|s| s.name() == name)
+    }
+
+    /// True if the camera moves at `--speed`.
+    fn moves(self) -> bool {
+        matches!(self, Scenario::Fly | Scenario::Dive)
     }
 }
 
@@ -134,11 +151,25 @@ struct Options {
     camera: [f64; 5],
     size: (u32, u32),
     async_threads: Option<usize>,
-    trees: bool,
+    world: WorldChoice,
     vertical_radius: u32,
     fixed_height: bool,
+    /// `--arena-quads` and `--chunk-slots` (`None`: the world's default).
+    arena_quads: Option<u32>,
+    chunk_slots: Option<u32>,
     spans: bool,
     spans_csv: Option<PathBuf>,
+}
+
+impl Options {
+    /// Renderer `(arena quads, chunk slots)`: the flags, else the world's defaults.
+    fn render_capacity(&self) -> (u32, u32) {
+        let (quads, slots) = self.world.render_capacity();
+        (
+            self.arena_quads.unwrap_or(quads),
+            self.chunk_slots.unwrap_or(slots),
+        )
+    }
 }
 
 /// `Ok(None)` for `--help`.
@@ -157,9 +188,11 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         camera: [16.0, 140.0, 16.0, -90.0, -20.0],
         size: (1280, 720),
         async_threads: None,
-        trees: true,
+        world: WorldChoice::default(),
         vertical_radius: ChunkViewer::DEFAULT_VERTICAL_RADIUS,
         fixed_height: false,
+        arena_quads: None,
+        chunk_slots: None,
         spans: false,
         spans_csv: None,
     };
@@ -176,12 +209,15 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                 .or_else(|| it.next().cloned())
                 .ok_or_else(|| format!("{flag} needs a value"))
         };
+        if o.world.parse_flag(flag, &mut value)? {
+            continue;
+        }
         match flag {
             "--help" | "-h" => return Ok(None),
             "--scenario" => {
                 let v = value()?;
                 o.scenario = Scenario::parse(&v)
-                    .ok_or_else(|| format!("{flag}: {v:?} is not static, fly or spin"))?;
+                    .ok_or_else(|| format!("{flag}: {v:?} is not static, fly, dive or spin"))?;
             }
             "--radius" => {
                 let r = number(flag, &value()?)?;
@@ -244,7 +280,24 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                         .ok_or_else(|| format!("{flag}: {n} is not in 1..=64"))?,
                 );
             }
-            "--no-trees" => o.trees = false,
+            "--arena-quads" => {
+                let n = number(flag, &value()?)?;
+                o.arena_quads = Some(
+                    u32::try_from(n)
+                        .ok()
+                        .filter(|n| *n >= 1024)
+                        .ok_or_else(|| format!("{flag}: {n} is not in 1024..=4294967295"))?,
+                );
+            }
+            "--chunk-slots" => {
+                let n = number(flag, &value()?)?;
+                o.chunk_slots = Some(
+                    u32::try_from(n)
+                        .ok()
+                        .filter(|n| (1..=1 << 20).contains(n))
+                        .ok_or_else(|| format!("{flag}: {n} is not in 1..=1048576"))?,
+                );
+            }
             "--vertical-radius" => {
                 let r = number(flag, &value()?)?;
                 o.vertical_radius = u32::try_from(r)
@@ -261,6 +314,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
+    o.world.validate(o.fixed_height)?;
     o.timeout = timeout.unwrap_or(SETTLE_ALLOWANCE + o.warmup + o.duration);
     Ok(Some(o))
 }
@@ -331,7 +385,8 @@ impl JobExecutor for CountingExecutor {
 
 /// Camera pose of the scenario `t` seconds into the measurement, from the start pose
 /// `[x, y, z, yaw, pitch]` (degrees): `fly` moves along the horizontal yaw direction (yaw 0
-/// looks along -Z, -90 along +X), `spin` turns once over `duration` seconds.
+/// looks along -Z, -90 along +X), `dive` moves straight down (the view keeps its yaw and
+/// pitch), `spin` turns once over `duration` seconds.
 fn camera_at(scenario: Scenario, start: [f64; 5], speed: f64, duration: f64, t: f64) -> Transform {
     let [x, y, z, yaw, pitch] = start;
     let mut yaw = yaw.to_radians();
@@ -339,6 +394,7 @@ fn camera_at(scenario: Scenario, start: [f64; 5], speed: f64, duration: f64, t: 
     match scenario {
         Scenario::Static => {}
         Scenario::Fly => position += flat_direction(yaw) * (speed * t),
+        Scenario::Dive => position.y -= speed * t,
         Scenario::Spin => yaw += TAU * (t / duration).min(1.0),
     }
     Transform::from_yaw_pitch(position, yaw as f32, (pitch as f32).to_radians())
@@ -432,7 +488,9 @@ struct Recorder {
 }
 
 impl Recorder {
-    fn new(generated: Arc<AtomicU64>, jobs_done: Arc<AtomicU64>) -> Self {
+    /// `slots`: the renderer's chunk table, the most meshes resident at once (the quad map is
+    /// allocated once so it never rehashes during the measurement).
+    fn new(generated: Arc<AtomicU64>, jobs_done: Arc<AtomicU64>, slots: usize) -> Self {
         Self {
             generated,
             jobs_done,
@@ -440,7 +498,7 @@ impl Recorder {
             last_jobs: 0,
             last_stats: WorldStats::default(),
             last_presented: 0,
-            resident: HashMap::with_capacity(RESIDENT_CAPACITY),
+            resident: HashMap::with_capacity(slots),
             quads: 0,
             pending: None,
             log: RecordLog::default(),
@@ -834,18 +892,18 @@ fn main() -> AppExit {
     let (mut gpu, gpu_config, rest) = match GpuPreferences::from_args(&args) {
         Ok(parsed) => parsed,
         Err(e) => {
-            eprintln!("stress: {e}\n\n{USAGE}\n\n{CLI_HELP}");
+            eprintln!("stress: {e}\n\n{}\n\n{CLI_HELP}", usage());
             return AppExit::from_code(1);
         }
     };
     let options = match parse_options(&rest) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            println!("{USAGE}\n\n{CLI_HELP}");
+            println!("{}\n\n{CLI_HELP}", usage());
             return AppExit::Success;
         }
         Err(message) => {
-            eprintln!("stress: {message}\n\n{USAGE}\n\n{CLI_HELP}");
+            eprintln!("stress: {message}\n\n{}\n\n{CLI_HELP}", usage());
             return AppExit::from_code(1);
         }
     };
@@ -855,7 +913,8 @@ fn main() -> AppExit {
     let times = if options.spans {
         if !cfg!(feature = "trace") {
             eprintln!(
-                "stress: --spans needs the system spans: build with --features trace\n\n{USAGE}"
+                "stress: --spans needs the system spans: build with --features trace\n\n{}",
+                usage()
             );
             return AppExit::from_code(1);
         }
@@ -882,24 +941,23 @@ fn main() -> AppExit {
     }
     let generated = Arc::new(AtomicU64::new(0));
     let jobs_done = Arc::new(AtomicU64::new(0));
-    let terrain = TerrainGenerator::new(options.seed, TerrainSettings::default());
-    let inner: Arc<dyn WorldGenerator> = if options.trees {
-        Arc::new(Forest { terrain })
-    } else {
-        Arc::new(terrain)
-    };
+    let inner = options.world.generator(options.seed);
     let fixed_bounds = options.fixed_height.then(|| inner.vertical_chunks());
+    let (arena_quads, chunk_slots) = options.render_capacity();
     let info = RunInfo {
         scenario: options.scenario.name().to_string(),
         label: options.label.clone(),
         radius: options.radius,
-        speed: if options.scenario == Scenario::Fly {
+        speed: if options.scenario.moves() {
             options.speed
         } else {
             0.0
         },
         seed: options.seed,
-        trees: options.trees,
+        world: options.world.label(),
+        trees: options.world.trees,
+        arena_quads,
+        chunk_slots,
         vertical: if options.fixed_height {
             "fixed".to_string()
         } else {
@@ -935,6 +993,8 @@ fn main() -> AppExit {
                 gpu,
                 gpu_config,
                 render_when_hidden: true,
+                arena_quads,
+                max_chunk_slots: chunk_slots,
                 ..RenderSettings::default()
             },
         })
@@ -971,7 +1031,7 @@ fn main() -> AppExit {
         &mut app,
         options,
         info,
-        Recorder::new(generated, jobs_done),
+        Recorder::new(generated, jobs_done, chunk_slots as usize),
         Instant::now(),
     );
     if let Some(times) = times {
@@ -1001,7 +1061,9 @@ mod tests {
         assert_eq!(o.duration, Duration::from_secs(20));
         assert_eq!(o.warmup, Duration::from_secs(2));
         assert_eq!(o.timeout, Duration::from_secs(142));
-        assert!(o.trees);
+        assert_eq!(o.world, WorldChoice::default());
+        assert_eq!(o.world.label(), "forest");
+        assert_eq!(o.render_capacity(), (8 << 20, 32_768));
         assert_eq!((o.csv, o.summary), (None, None));
     }
 
@@ -1045,7 +1107,8 @@ mod tests {
         assert_eq!(o.camera, [1.0, 2.0, 3.0, 4.0, 5.0]);
         assert_eq!(o.size, (800, 600));
         assert_eq!(o.async_threads, Some(4));
-        assert!(!o.trees);
+        assert!(!o.world.trees);
+        assert_eq!(o.world.label(), "terrain");
         assert_eq!(o.seed, 9);
         let o = parse(&["--timeout", "30", "--scenario", "spin"])
             .expect("valid")
@@ -1085,6 +1148,11 @@ mod tests {
             &["--size", "0x10"],
             &["--async-threads", "0"],
             &["--fly"],
+            &["--arena-quads", "100"],
+            &["--chunk-slots", "0"],
+            &["--chunk-slots", "2000000"],
+            &["--world", "overworld", "--fixed-height"],
+            &["--caves", "mc"],
         ] {
             assert!(parse(args).is_err(), "{args:?} was accepted");
         }
@@ -1136,6 +1204,49 @@ mod tests {
         let begin = camera_at(Scenario::Fly, o.camera, 32.0, 20.0, 0.0);
         let local = begin.translation.rem_euclid(DVec3::splat(32.0));
         assert_eq!((local.x, local.z), (16.0, 16.0));
+    }
+
+    #[test]
+    fn worlds_set_the_render_capacity_and_flags_override_it() {
+        let o = parse(&[
+            "--world",
+            "overworld",
+            "--scenario",
+            "dive",
+            "--speed",
+            "64",
+        ])
+        .expect("valid")
+        .expect("not help");
+        assert_eq!((o.scenario, o.speed), (Scenario::Dive, 64.0));
+        assert_eq!(o.world.label(), "overworld/mc");
+        assert_eq!(o.render_capacity(), (24 << 20, 65_536));
+        let o = parse(&[
+            "--world=overworld",
+            "--caves=closed",
+            "--arena-quads",
+            "1048576",
+            "--chunk-slots=4096",
+        ])
+        .expect("valid")
+        .expect("not help");
+        assert_eq!(o.world.label(), "overworld/closed");
+        assert_eq!(o.render_capacity(), (1 << 20, 4096));
+        // The forest keeps --fixed-height (it has a floor).
+        assert!(parse(&["--fixed-height"]).expect("valid").is_some());
+    }
+
+    #[test]
+    fn dive_moves_straight_down() {
+        let start = [16.0, 140.0, 16.0, -90.0, -20.0];
+        let t = camera_at(Scenario::Dive, start, 64.0, 20.0, 2.5);
+        assert_eq!(t.translation, DVec3::new(16.0, -20.0, 16.0));
+        let begin = camera_at(Scenario::Dive, start, 64.0, 20.0, 0.0);
+        assert!((t.forward() - begin.forward()).length() < 1e-6, "same view");
+        // One layer of chunks every half second at 64 voxels/s.
+        let a = chunk_of(&camera_at(Scenario::Dive, start, 64.0, 20.0, 0.1));
+        let b = chunk_of(&camera_at(Scenario::Dive, start, 64.0, 20.0, 0.6));
+        assert_eq!((b.x - a.x, b.y - a.y, b.z - a.z), (0, -1, 0));
     }
 
     #[test]
@@ -1199,7 +1310,7 @@ mod tests {
 
     #[test]
     fn scenario_names_round_trip() {
-        for s in [Scenario::Static, Scenario::Fly, Scenario::Spin] {
+        for s in Scenario::ALL {
             assert_eq!(Scenario::parse(s.name()), Some(s));
         }
         assert_eq!(Scenario::parse("Fly"), None);
@@ -1305,7 +1416,7 @@ mod tests {
                 frames,
                 generated: Arc::clone(&generated),
             });
-        let recorder = Recorder::new(generated, Arc::new(AtomicU64::new(0)));
+        let recorder = Recorder::new(generated, Arc::new(AtomicU64::new(0)), 16);
         add_bench(&mut app, options, RunInfo::default(), recorder, t0);
         app.add_systems(Update, fake_world.after(drive))
             .add_systems(Last, fake_render);

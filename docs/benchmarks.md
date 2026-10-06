@@ -27,6 +27,13 @@ El stress corre siempre sin límite de FPS. `--vertical-radius N` fija cuántos 
 arriba y abajo de la cámara (8 por defecto). `--fixed-height` carga solo las capas del generador,
 como en M0: úsalo para comparar con corridas viejas, que no tienen radio vertical.
 
+El mundo se elige con `--world`: `forest` (por defecto, el de todas las corridas anteriores),
+`terrain`, `flat` u `overworld` (piedra infinita hacia abajo con cuevas). Con el overworld,
+`--caves mc|closed|off` elige las cuevas: `mc` tiene entradas desde la superficie y `closed` no
+deja ver ninguna cueva desde arriba. El overworld no acepta `--fixed-height` (no tiene piso) y usa
+un arena de 24 Mi quads y 65 536 slots; `--arena-quads N` y `--chunk-slots N` los cambian. El
+resumen anota el mundo, y `tools/bench_report.py` solo compara corridas del mismo mundo.
+
 Para que los números sirvan:
 
 - Siempre en release (las recetas ya lo hacen).
@@ -42,6 +49,7 @@ Para que los números sirvan:
 |---|---|---|
 | `static` | queda quieta | el costo fijo con el mundo ya cargado |
 | `fly` | vuela recto a velocidad fija | los tirones mientras entran chunks nuevos |
+| `dive` | baja en línea recta a velocidad fija | los tirones al entrar capas nuevas por debajo |
 | `spin` | gira 360 grados en su lugar | el costo de que cambie lo que se ve, sin chunks nuevos |
 
 Todos esperan a que el mundo termine de cargar, corren `--warmup` segundos sin medir y después

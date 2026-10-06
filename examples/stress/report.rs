@@ -88,7 +88,7 @@ impl RecordLog {
 /// Everything about a run that is not a per-frame number.
 #[derive(Clone, Debug, Default)]
 pub struct RunInfo {
-    /// `static`, `fly` or `spin`.
+    /// `static`, `fly`, `dive` or `spin`.
     pub scenario: String,
     /// Free text (`--label`).
     pub label: String,
@@ -98,8 +98,15 @@ pub struct RunInfo {
     pub speed: f64,
     /// Terrain seed.
     pub seed: u64,
+    /// The world (`--world`, with the caves of the overworld): `forest`, `overworld/mc`...
+    /// Empty in runs from before the option, which all streamed the forest.
+    pub world: String,
     /// Trees on.
     pub trees: bool,
+    /// Renderer quad arena (quads) and chunk table (slots).
+    pub arena_quads: u32,
+    /// See `arena_quads`.
+    pub chunk_slots: u32,
     /// Vertical radius in chunks, or `fixed` (`--fixed-height`, the M0 layers only).
     pub vertical: String,
     /// Requested measurement (`--duration`), in seconds.
@@ -689,7 +696,10 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
         ("radius", Json::uint(info.radius)),
         ("speed", Json::num(info.speed, 2)),
         ("seed", Json::Str(info.seed.to_string())),
+        ("world", Json::Str(info.world.clone())),
         ("trees", Json::Bool(info.trees)),
+        ("arena_quads", Json::uint(info.arena_quads)),
+        ("chunk_slots", Json::uint(info.chunk_slots)),
         ("vertical", Json::Str(info.vertical.clone())),
         ("duration_s", Json::num(info.duration_s, 3)),
         ("warmup_s", Json::num(info.warmup_s, 3)),
@@ -830,11 +840,16 @@ pub const DATA_HEADING: &str = "## Data";
 
 /// Short name of a run: `fly r16 32 vox/s`, `static r12`.
 pub fn run_title(info: &RunInfo) -> String {
-    if info.scenario == "fly" {
+    let mut title = if matches!(info.scenario.as_str(), "fly" | "dive") {
         format!("{} r{} {} vox/s", info.scenario, info.radius, info.speed)
     } else {
         format!("{} r{}", info.scenario, info.radius)
+    };
+    // The forest (the default) keeps the titles of the earlier runs.
+    if !info.world.is_empty() && info.world != "forest" {
+        title = format!("{title} {}", info.world);
     }
+    title
 }
 
 /// The summary document: tables for people, then the JSON block for tools.
@@ -869,8 +884,13 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
     );
     let _ = writeln!(
         out,
-        "- World: seed {}, trees {}, radius {}, settled in {:.2} s with {} chunks; {:.0} s \
-         measured after {:.0} s of warmup.\n",
+        "- World: {}, seed {}, trees {}, radius {}, settled in {:.2} s with {} chunks; {:.0} s \
+         measured after {:.0} s of warmup. Renderer: {} quads, {} chunk slots.\n",
+        if info.world.is_empty() {
+            "?"
+        } else {
+            &info.world
+        },
         info.seed,
         if info.trees { "on" } else { "off" },
         info.radius,
@@ -878,6 +898,8 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
         info.settle_chunks,
         info.duration_s,
         info.warmup_s,
+        info.arena_quads,
+        info.chunk_slots,
     );
 
     let _ = writeln!(out, "## Frames\n");
@@ -1436,6 +1458,24 @@ mod tests {
         );
         assert!(data.contains("\"over_144hz\": 2"));
         assert!(one_line(&info, &s).contains(">6.94ms=2 >16.7ms=1"));
+    }
+
+    #[test]
+    fn titles_name_the_speed_and_any_world_but_the_forest() {
+        let mut info = RunInfo {
+            scenario: "dive".to_string(),
+            radius: 16,
+            speed: 64.0,
+            world: "forest".to_string(),
+            ..RunInfo::default()
+        };
+        assert_eq!(run_title(&info), "dive r16 64 vox/s");
+        info.world = "overworld/mc".to_string();
+        assert_eq!(run_title(&info), "dive r16 64 vox/s overworld/mc");
+        info.scenario = "static".to_string();
+        assert_eq!(run_title(&info), "static r16 overworld/mc");
+        info.world = String::new();
+        assert_eq!(run_title(&info), "static r16");
     }
 
     #[test]

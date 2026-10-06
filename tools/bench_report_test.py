@@ -177,6 +177,27 @@ class OutputTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn('no runs', err)
 
+    def test_compare_directories_keeps_worlds_apart(self):
+        # Old runs have no world: the forest (trees on) or the terrain (trees off).
+        caves = copy.deepcopy(SAMPLE)
+        caves['run']['world'] = 'overworld/mc'
+        bare = copy.deepcopy(SAMPLE)
+        bare['run']['trees'] = False
+        self.write('1-fly.md', SAMPLE, 'base')
+        self.write('2-caves.md', caves, 'base')
+        self.write('3-bare.md', bare, 'base')
+        named = copy.deepcopy(SAMPLE)
+        named['run']['world'] = 'forest'
+        self.write('4-fly.md', named, 'new')
+        self.write('5-caves.md', caves, 'new')
+        code, out, _ = run_main('--compare', os.path.join(self.dir.name, 'base'),
+                                os.path.join(self.dir.name, 'new'))
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count('### '), 2, 'forest with forest, caves with caves')
+        self.assertIn('1-fly.md -> 4-fly.md', out)
+        self.assertIn('2-caves.md -> 5-caves.md', out)
+        self.assertIn('fly r16 32 vox/s overworld/mc', out)
+
     def test_compare_directories_keeps_gpus_apart(self):
         # Same backend and tier on two adapters: each run pairs with its own GPU.
         amd = copy.deepcopy(SAMPLE)

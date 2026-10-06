@@ -7,7 +7,7 @@ usage:
 
 RUN, BASE and NEW are summary files (Markdown with a JSON block, or plain JSON) or directories
 (every summary inside, not recursive). Comparing two directories pairs the runs with the same
-scenario, radius, speed, backend, tier and adapter. A metric that was 0 in BASE has no percent
+world, scenario, radius, speed, backend, tier and adapter. A metric that was 0 in BASE has no percent
 change ('n/a') but still gets a verdict (0 spikes before, 3 after: worse). Output is Markdown,
 so it can go into docs as is.
 Exit codes: 0 ok, 1 usage error or a file without a summary, 2 nothing to compare."""
@@ -43,6 +43,7 @@ METRICS = [
 
 # Settings that make two runs comparable.
 SETTINGS = [
+    ('world', ('run', 'world')),
     ('scenario', ('run', 'scenario')),
     ('radius', ('run', 'radius')),
     ('vertical', ('run', 'vertical')),
@@ -83,9 +84,13 @@ def load(path):
     with open(path, encoding='utf-8') as f:
         data = parse_summary(f.read(), path)
     data['_path'] = path
-    # Runs from before the vertical radius existed loaded only the generator's layers.
-    if isinstance(data.get('run'), dict):
-        data['run'].setdefault('vertical', 'fixed')
+    run = data.get('run')
+    if isinstance(run, dict):
+        # Runs from before the vertical radius existed loaded only the generator's layers.
+        run.setdefault('vertical', 'fixed')
+        # Runs from before --world streamed the forest, or the plain terrain without trees.
+        if not run.get('world'):
+            run['world'] = 'forest' if run.get('trees', True) else 'terrain'
     return data
 
 
@@ -118,16 +123,19 @@ def get(data, path):
 def title(run):
     r = run['run']
     text = f"{r['scenario']} r{r['radius']}"
-    if r['scenario'] == 'fly':
+    if r['scenario'] in ('fly', 'dive'):
         text += f" {fmt(r['speed'])} vox/s"
+    if r.get('world', 'forest') != 'forest':
+        text += f" {r['world']}"
     return text
 
 
 def key(run):
-    """Runs with the same key are comparable (same scenario, radius, height, speed and GPU)."""
+    """Runs with the same key are comparable (same world, scenario, radius, height, speed and
+    GPU)."""
     r = run['run']
-    return (r['scenario'], r['radius'], r.get('vertical', 'fixed'), r['speed'], r['backend'], r['tier'],
-            r.get('adapter'))
+    return (r.get('world', 'forest'), r['scenario'], r['radius'], r.get('vertical', 'fixed'),
+            r['speed'], r['backend'], r['tier'], r.get('adapter'))
 
 
 def fmt(value):

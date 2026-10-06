@@ -11,9 +11,13 @@
 //! Exit codes: 0 success, 1 usage error, 2 no usable GPU, 3 check failed (screenshot, image
 //! diff, resize, minimize), 4 timeout.
 //!
-//! The terrain is `TerrainGenerator` plus a few deterministic trees (log trunk, leaf canopy) so
-//! the cutout pipeline is visible; `--no-trees` gives the plain generator.
+//! The world is `ForestGenerator` by default: `TerrainGenerator` plus deterministic trees (log
+//! trunk, leaf canopy) so the cutout pipeline is visible; `--no-trees` gives the plain
+//! generator, and `--world overworld` the caves.
 #![expect(clippy::print_stdout, clippy::print_stderr, reason = "CLI output")]
+
+#[path = "shared/world.rs"]
+mod world;
 
 use boxel::app::{TaskPoolOptions, TaskPoolThreadAssignmentPolicy};
 use boxel::camera::FlyCameraSystems;
@@ -21,19 +25,14 @@ use boxel::gfx::wgpu::PresentMode;
 use boxel::gfx::{CLI_HELP, DeviceClass, RgbaImage};
 use boxel::prelude::*;
 use boxel::render::{DebugDestroyDevice, GpuFailed, GpuReady, SurfaceInfo};
-use boxel::voxel::{
-    BlockRegistry, BlockState, CHUNK_SIZE, ChunkData, ChunkKey, LocalPos, MAX_BLOCK_COORD,
-};
+use boxel::voxel::MAX_BLOCK_COORD;
 use boxel::window::winit::dpi::PhysicalSize;
 use boxel::window::{PrimaryWindow, WindowResized};
 use boxel::world::{WorldStats, WorldSystems};
-use boxel::worldgen::TerrainSettings;
-use boxel::worldgen::noise::hash2;
-use std::ops::RangeInclusive;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
+use world::{World, WorldChoice};
 
 const USAGE: &str = "\
 usage: voxel_world [GPU options] [options]
@@ -66,10 +65,14 @@ usage: voxel_world [GPU options] [options]
   --simulate-device-loss N[,M..]  destroy the GPU device at frame N (recovery check; a
                           list repeats it: the second loss of an adapter lowers its tier)
   --async-threads N       async compute pool size (chunk jobs)
-  --no-trees              plain TerrainGenerator (no trees, so no cutout leaves)
   --debug-overlay         start with the F3 debug overlay visible (F3 toggles it)
   --help                  this text
 exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 check failed, 4 timeout";
+
+/// The whole help: [`USAGE`] and the world options.
+fn usage() -> String {
+    format!("{USAGE}\nworld options:\n{}", world::usage(World::Forest))
+}
 
 /// Default frames when a flag implies `--frames`.
 const IMPLIED_FRAMES: u64 = 120;
@@ -129,7 +132,7 @@ struct Options {
     /// Frames at which the device is destroyed, ascending.
     simulate_device_loss: Vec<u64>,
     async_threads: Option<usize>,
-    trees: bool,
+    world: WorldChoice,
     debug_overlay: bool,
     duration: Option<Duration>,
     /// `None`: the engine default (`FrameLimit::default()`, 144).
@@ -179,7 +182,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         camera: [0.0, 120.0, 0.0, 45.0, -30.0],
         simulate_device_loss: Vec::new(),
         async_threads: None,
-        trees: true,
+        world: WorldChoice::default(),
         debug_overlay: false,
         duration: None,
         fps_limit: None,
@@ -198,6 +201,9 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                 .or_else(|| it.next().cloned())
                 .ok_or_else(|| format!("{flag} needs a value"))
         };
+        if o.world.parse_flag(flag, &mut value)? {
+            continue;
+        }
         match flag {
             "--help" | "-h" => return Ok(None),
             "--frames" => o.frames = Some(number(flag, &value()?)?),
@@ -281,7 +287,6 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                         .ok_or_else(|| format!("{flag}: {n} is not in 1..=64"))?,
                 );
             }
-            "--no-trees" => o.trees = false,
             "--debug-overlay" => o.debug_overlay = true,
             "--duration" => o.duration = Some(Duration::from_secs(number(flag, &value()?)?)),
             "--fps-limit" => {
@@ -305,6 +310,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
+    o.world.validate(o.fixed_height)?;
     if (o.expect_terrain || o.compare_to.is_some()) && o.screenshot.is_none() {
         return Err("--expect-terrain and --compare-to need --screenshot".to_string());
     }
@@ -324,138 +330,6 @@ fn number(flag: &str, value: &str) -> Result<u64, String> {
     value
         .parse()
         .map_err(|_| format!("{flag}: {value:?} is not a non-negative integer"))
-}
-
-// ---------------------------------------------------------------------------------------------
-// Terrain with trees
-
-/// Trees: at most one per `TREE_CELL`^2 columns, on grass only.
-const TREE_CELL: i64 = 8;
-/// Canopy reach around the trunk.
-const CANOPY_RADIUS: i64 = 2;
-/// Shortest trunk, and the tallest tree above the ground (trunk + 2 canopy layers above it).
-const TRUNK_MIN: i64 = 4;
-const TREE_HEIGHT_MAX: i64 = TRUNK_MIN + 2 + 2;
-/// Salt so the tree lattice is not correlated with the height noise.
-const TREE_SALT: u64 = 0x007e_e50f_b0e1;
-
-/// [`TerrainGenerator`] plus deterministic trees. Each chunk places the parts of every tree
-/// whose blocks reach into it (trunk column heights come from `height_at`), so trees crossing
-/// chunk borders are consistent without neighbor data.
-struct Forest {
-    terrain: TerrainGenerator,
-}
-
-/// World coordinates are `i64` (cells, trunks and blocks); inside the former `i32` range the
-/// trees are the same as before (same cells, same `hash2` values).
-#[derive(Clone, Copy, Debug)]
-struct Tree {
-    x: i64,
-    z: i64,
-    ground: i64,
-    trunk: i64,
-}
-
-impl Forest {
-    fn tree_in_cell(&self, cx: i64, cz: i64) -> Option<Tree> {
-        let h = hash2(self.terrain.seed ^ TREE_SALT, cx, cz);
-        if !h.is_multiple_of(3) {
-            return None;
-        }
-        let span = (TREE_CELL - 2 * CANOPY_RADIUS) as u32;
-        let x = cx * TREE_CELL + CANOPY_RADIUS + i64::from((h >> 8) % span);
-        let z = cz * TREE_CELL + CANOPY_RADIUS + i64::from((h >> 16) % span);
-        let ground = self.terrain.height_at(x, z);
-        let s = &self.terrain.settings;
-        if ground <= s.sand_level || ground > s.snow_level {
-            return None;
-        }
-        Some(Tree {
-            x,
-            z,
-            ground: ground.into(),
-            trunk: TRUNK_MIN + i64::from((h >> 24) % 3),
-        })
-    }
-}
-
-impl Tree {
-    /// Calls `put(x, y, z, is_log)` for every block of the tree.
-    fn blocks(self, mut put: impl FnMut(i64, i64, i64, bool)) {
-        let top = self.ground + self.trunk;
-        for y in self.ground + 1..=top {
-            put(self.x, y, self.z, true);
-        }
-        for y in top - 1..=top + 2 {
-            let (radius, round) = match y - top {
-                -1 | 0 => (CANOPY_RADIUS, true),
-                1 => (1, false),
-                _ => (1, true),
-            };
-            for dx in -radius..=radius {
-                for dz in -radius..=radius {
-                    let corner = dx.abs() == radius && dz.abs() == radius;
-                    if (round && corner) || (dx == 0 && dz == 0 && y <= top) {
-                        continue;
-                    }
-                    put(self.x + dx, y, self.z + dz, false);
-                }
-            }
-        }
-    }
-}
-
-impl WorldGenerator for Forest {
-    fn generate(&self, key: ChunkKey, registry: &BlockRegistry) -> ChunkData {
-        let mut data = self.terrain.generate(key, registry);
-        let (Some(log), Some(leaves)) = (
-            registry.by_name("boxel:log"),
-            registry.by_name("boxel:leaves"),
-        ) else {
-            return data;
-        };
-        let s = &self.terrain.settings;
-        let o = key.pos.origin();
-        let size = i64::from(CHUNK_SIZE);
-        if o.y + size <= i64::from(s.sand_level) + 1
-            || o.y > i64::from(s.snow_level) + TREE_HEIGHT_MAX
-        {
-            return data;
-        }
-        // Tree cells that may reach into the chunk (no overflow: origins stay within the world
-        // limit, +-2^61).
-        let cells = |lo: i64| {
-            (lo - CANOPY_RADIUS).div_euclid(TREE_CELL)
-                ..=(lo + size - 1 + CANOPY_RADIUS).div_euclid(TREE_CELL)
-        };
-        for cx in cells(o.x) {
-            for cz in cells(o.z) {
-                let Some(tree) = self.tree_in_cell(cx, cz) else {
-                    continue;
-                };
-                tree.blocks(|x, y, z, is_log| {
-                    let (lx, ly, lz) = (x - o.x, y - o.y, z - o.z);
-                    if [lx, ly, lz].iter().all(|c| (0..size).contains(c)) {
-                        let p = LocalPos::new(lx as u32, ly as u32, lz as u32);
-                        if data.get(p) == BlockState::AIR {
-                            data.set(p, if is_log { log } else { leaves });
-                        }
-                    }
-                });
-            }
-        }
-        data
-    }
-
-    fn vertical_chunks(&self) -> RangeInclusive<i64> {
-        let inner = self.terrain.vertical_chunks();
-        let tree_top = (i64::from(self.terrain.settings.snow_level) + TREE_HEIGHT_MAX) >> 5;
-        *inner.start()..=(*inner.end()).max(tree_top)
-    }
-
-    fn name(&self) -> &str {
-        "terrain+trees"
-    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1150,18 +1024,18 @@ fn main() -> AppExit {
     let (gpu, gpu_config, rest) = match GpuPreferences::from_args(&args) {
         Ok(parsed) => parsed,
         Err(e) => {
-            eprintln!("boxel: {e}\n\n{USAGE}\n\n{CLI_HELP}");
+            eprintln!("boxel: {e}\n\n{}\n\n{CLI_HELP}", usage());
             return AppExit::from_code(1);
         }
     };
     let options = match parse_options(&rest) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            println!("{USAGE}\n\n{CLI_HELP}");
+            println!("{}\n\n{CLI_HELP}", usage());
             return AppExit::Success;
         }
         Err(message) => {
-            eprintln!("boxel: {message}\n\n{USAGE}\n\n{CLI_HELP}");
+            eprintln!("boxel: {message}\n\n{}\n\n{CLI_HELP}", usage());
             return AppExit::from_code(1);
         }
     };
@@ -1169,12 +1043,8 @@ fn main() -> AppExit {
         .timeout
         .map(|timeout| spawn_watchdog(timeout.saturating_add(WATCHDOG_GRACE)));
 
-    let terrain = TerrainGenerator::new(options.seed, TerrainSettings::default());
-    let generator: Arc<dyn WorldGenerator> = if options.trees {
-        Arc::new(Forest { terrain })
-    } else {
-        Arc::new(terrain)
-    };
+    let generator = options.world.generator(options.seed);
+    let (arena_quads, max_chunk_slots) = options.world.render_capacity();
     let world_settings = WorldSettings {
         vertical_bounds: options.fixed_height.then(|| generator.vertical_chunks()),
         ..WorldSettings::default()
@@ -1197,6 +1067,8 @@ fn main() -> AppExit {
                 // Only `--frames` sets it. `--minimize-test` alone keeps the interactive path on
                 // purpose: nothing is rendered while hidden, as in a normal run.
                 render_when_hidden: options.frames.is_some(),
+                arena_quads,
+                max_chunk_slots,
                 ..RenderSettings::default()
             },
         })
@@ -1258,74 +1130,32 @@ fn main() -> AppExit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boxel::voxel::{CHUNK_VOLUME, ChunkPos};
-
-    /// Fingerprint (log count, FNV-1a of every voxel state) of the 3x3 chunk columns from
-    /// `(x, z)`, layers 1..=4. Same check as in `examples/stress/forest.rs`: the two Forest
-    /// copies must stay in sync.
-    fn forest_fingerprint(
-        forest: &Forest,
-        registry: &BlockRegistry,
-        x: i64,
-        z: i64,
-    ) -> (usize, u64) {
-        let log = registry.by_name("boxel:log");
-        let (mut logs, mut h) = (0, 0xcbf2_9ce4_8422_2325u64);
-        let mut dense = vec![BlockState::AIR; CHUNK_VOLUME];
-        for dz in 0..3 {
-            for dx in 0..3 {
-                for y in 1..=4 {
-                    let key = ChunkKey::new(ChunkPos::new(x + dx, y, z + dz));
-                    forest.generate(key, registry).to_dense(&mut dense);
-                    logs += dense.iter().filter(|s| Some(**s) == log).count();
-                    for s in &dense {
-                        for b in u64::from(s.0).to_le_bytes() {
-                            h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
-                        }
-                    }
-                }
-            }
-        }
-        (logs, h)
-    }
-
-    #[test]
-    fn forest_inside_i32_is_unchanged_and_crosses_the_former_edge() {
-        let forest = Forest {
-            terrain: TerrainGenerator::default(),
-        };
-        let registry = BlockRegistry::default_blocks();
-        // Recorded with the i32 coordinates (the last chunks before the old edge included).
-        for ((x, z), expected) in [
-            ((0, 0), (259, 0x0e4e_2255_79a0_f38d)),
-            ((-3, 5), (284, 0xa713_c5ca_ff29_5b64)),
-            ((7, -9), (6, 0x2418_de68_72ea_8247)),
-            ((31_250, -31_250), (250, 0x9a87_d49f_8d57_45e4)),
-            ((67_108_860, -67_108_863), (224, 0xdfd3_f57c_9c42_38a5)),
-            ((-67_108_863, 67_108_860), (230, 0x96e8_7562_ea15_86c5)),
-            ((12_345_678, -8_765_432), (245, 0x7995_606d_8843_dc2c)),
-            ((-67_108_000, -67_100_000), (243, 0x97e4_a0c8_100c_a62c)),
-        ] {
-            assert_eq!(
-                forest_fingerprint(&forest, &registry, x, z),
-                expected,
-                "({x}, {z})"
-            );
-        }
-        // Across +-2^31 voxels (chunks +-2^26), where the i32 tree math overflowed: trees keep
-        // growing on both sides.
-        let edge = 1i64 << 26;
-        for (x, z) in [(edge - 1, 0), (edge + 2, 5), (-edge - 2, -edge - 1)] {
-            let (logs, _) = forest_fingerprint(&forest, &registry, x, z);
-            assert!(logs > 0, "no trees at chunk ({x}, {z})");
-        }
-    }
 
     fn parse(args: &[&str]) -> Options {
         let args: Vec<String> = args.iter().map(ToString::to_string).collect();
         parse_options(&args)
             .expect("valid options")
             .expect("not --help")
+    }
+
+    #[test]
+    fn world_options() {
+        let o = parse(&[]);
+        assert_eq!(
+            (o.world.label(), o.world.trees),
+            ("forest".to_string(), true)
+        );
+        let o = parse(&["--world", "overworld", "--caves", "off"]);
+        assert_eq!(o.world.label(), "overworld/off");
+        assert_eq!(o.world.render_capacity(), (24 << 20, 65_536));
+        assert_eq!(parse(&["--no-trees"]).world.label(), "terrain");
+        for args in [
+            &["--world", "overworld", "--fixed-height"][..],
+            &["--caves", "closed"],
+        ] {
+            let args: Vec<String> = args.iter().map(ToString::to_string).collect();
+            assert!(parse_options(&args).is_err(), "{args:?}");
+        }
     }
 
     #[test]
