@@ -92,7 +92,7 @@ fn find(
 ) -> ChunkPos {
     (0..4096)
         .map(|dx| ChunkPos::new(pos.x + dx, pos.y, pos.z))
-        .find(|&p| pick(&g.generate(ChunkKey::new(p), r).blocks))
+        .find(|&p| pick(g.generate(ChunkKey::new(p), r).blocks()))
         .unwrap_or_else(|| panic!("no such chunk near {pos:?}"))
 }
 

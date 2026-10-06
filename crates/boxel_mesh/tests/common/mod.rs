@@ -5,8 +5,8 @@ use boxel_mesh::{
     BUCKET_COUNT, ChunkMesh, MaterialTable, PaddedChunk, VoxelClass, reference_visible_faces,
 };
 use boxel_voxel::{
-    BlockState, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, Face, LightStorage, LocalPos,
-    NEIGHBOR_OFFSETS, Paletted, RenderShape,
+    BlockState, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, Face, LocalPos, NEIGHBOR_OFFSETS, Paletted,
+    RenderShape,
 };
 use std::collections::BTreeSet;
 
@@ -108,11 +108,7 @@ pub fn encode_packed(states: &[BlockState]) -> Paletted {
 
 /// Chunk with an explicit representation.
 pub fn chunk_from(blocks: Paletted) -> ChunkData {
-    ChunkData {
-        blocks,
-        light: LightStorage::default(),
-        version: 0,
-    }
+    ChunkData::from_paletted(blocks)
 }
 
 /// Representation used for a non-uniform test chunk.

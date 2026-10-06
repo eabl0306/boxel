@@ -129,7 +129,7 @@ proptest! {
             prop_assert_eq!(chunk.get(p), s);
             prop_assert_eq!(chunk.version, version);
         }
-        check_invariants(&chunk.blocks);
+        check_invariants(chunk.blocks());
         let mut dense = vec![BlockState::AIR; CHUNK_VOLUME];
         chunk.to_dense(&mut dense);
         prop_assert!(dense == mirror);
@@ -137,12 +137,12 @@ proptest! {
             prop_assert_eq!(chunk.get(LocalPos::from_index(i)), mirror[i]);
         }
         // Compaction keeps the contents and yields the minimal representation.
-        let mut compacted = chunk.blocks.clone();
+        let mut compacted = chunk.blocks().clone();
         compacted.compact();
         check_invariants(&compacted);
         prop_assert!(dense_of(&compacted) == mirror);
         check_minimal(&compacted);
-        prop_assert!(compacted.heap_bytes() <= chunk.blocks.heap_bytes());
+        prop_assert!(compacted.heap_bytes() <= chunk.blocks().heap_bytes());
     }
 
     #[test]
@@ -176,7 +176,7 @@ proptest! {
         prop_assert_eq!(&compacted, &p);
         prop_assert_eq!(&Paletted::encode(&dense_of(&p)), &p);
         let chunk = ChunkData::from_dense(&dense);
-        prop_assert_eq!(&chunk.blocks, &p);
+        prop_assert_eq!(chunk.blocks(), &p);
         prop_assert_eq!(chunk.version, 0);
     }
 }
@@ -266,10 +266,10 @@ fn compact_collapses_to_uniform() {
     let p = LocalPos::new(4, 5, 6);
     c.set(p, BlockState(1));
     c.set(p, BlockState::AIR);
-    assert!(matches!(c.blocks, Paletted::Packed { .. }));
+    assert!(matches!(c.blocks(), Paletted::Packed { .. }));
     assert_eq!(c.version, 2);
-    c.blocks.compact();
-    assert_eq!(c.blocks, Paletted::Uniform(BlockState::AIR));
+    c.compact();
+    assert_eq!(c.blocks(), &Paletted::Uniform(BlockState::AIR));
     assert_eq!(c.as_uniform(), Some(BlockState::AIR));
     assert_eq!(c.heap_bytes(), 0);
 
@@ -369,7 +369,7 @@ fn version_bumps_only_on_change_and_wraps() {
     assert_eq!(c.version, 0, "wrapping bump");
     // Direct containers follow the same rule.
     let mut d = ChunkData::from_dense(&random_dense(8, 300, 1000, 2));
-    assert!(matches!(d.blocks, Paletted::Direct(_)));
+    assert!(matches!(d.blocks(), Paletted::Direct(_)));
     let old = d.get(p);
     assert_eq!(d.set(p, old), old);
     assert_eq!(d.version, 0);
@@ -440,7 +440,7 @@ fn occupancy_bits_follow_opaque_shapes() {
         .map(|i| shapes[rng.below(5) as usize].max(BlockState((i % 40) as u16 * 3)))
         .collect();
     let c = ChunkData::from_dense(&wide);
-    assert_eq!(c.blocks.bits_per_voxel(), 8);
+    assert_eq!(c.blocks().bits_per_voxel(), 8);
     assert_eq!(
         c.opaque_occupancy(&r)[..],
         expected_occupancy(&wide, &r)[..]
@@ -449,7 +449,7 @@ fn occupancy_bits_follow_opaque_shapes() {
         *s = BlockState((i % 400) as u16);
     }
     let c = ChunkData::from_dense(&wide);
-    assert!(matches!(c.blocks, Paletted::Direct(_)));
+    assert!(matches!(c.blocks(), Paletted::Direct(_)));
     assert_eq!(
         c.opaque_occupancy(&r)[..],
         expected_occupancy(&wide, &r)[..]
@@ -502,8 +502,8 @@ fn from_occupancy_equals_from_dense() {
                 ChunkData::from_dense(&dense),
                 "{set:?} {clear:?}"
             );
-            check_invariants(&from_mask.blocks);
-            check_minimal(&from_mask.blocks);
+            check_invariants(from_mask.blocks());
+            check_minimal(from_mask.blocks());
             if set == stone && clear == BlockState::AIR {
                 // A stone/air chunk's opaque occupancy is the mask itself.
                 assert_eq!(from_mask.opaque_occupancy(&r)[..], occ[..]);
@@ -530,10 +530,13 @@ fn heap_bytes_track_the_representation() {
     assert_eq!(direct.heap_bytes(), CHUNK_VOLUME * 2);
 
     let mut c = ChunkData::from_dense(&random_dense(2, 9, 100, 5));
-    let blocks = c.blocks.heap_bytes();
-    assert_eq!(blocks, CHUNK_VOLUME / 2 + palette_bytes(&c.blocks));
+    let blocks = c.blocks().heap_bytes();
+    assert_eq!(blocks, CHUNK_VOLUME / 2 + palette_bytes(c.blocks()));
     assert_eq!(c.heap_bytes(), blocks);
-    c.light = LightStorage::Packed(vec![0xf0; CHUNK_VOLUME].into_boxed_slice());
-    assert_eq!(c.heap_bytes(), blocks + CHUNK_VOLUME);
-    assert_eq!(LightStorage::default().heap_bytes(), 0);
+    // Built masks count too; a change of the blocks drops them.
+    let tables = LightTables::from_registry(&BlockRegistry::default_blocks());
+    c.masks(&tables);
+    assert_eq!(c.heap_bytes(), blocks + size_of::<ChunkMasks>());
+    c.set(LocalPos::new(0, 0, 0), BlockState(77));
+    assert!(!c.has_cached_masks());
 }

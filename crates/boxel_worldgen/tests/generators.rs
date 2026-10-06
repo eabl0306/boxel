@@ -311,7 +311,10 @@ fn surface_chunk_has_grass_on_top() {
     // The surface chunk is paletted compactly (a handful of states, not Direct).
     let (c, _) = BlockPos::new(x, h, z).split();
     let data = g.generate(ChunkKey::new(c), &r);
-    assert!(matches!(data.blocks, Paletted::Packed { bits: 1..=4, .. }));
+    assert!(matches!(
+        data.blocks(),
+        Paletted::Packed { bits: 1..=4, .. }
+    ));
     assert!(data.heap_bytes() <= CHUNK_VOLUME * 4 / 8 + 64);
 }
 
