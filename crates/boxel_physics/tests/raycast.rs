@@ -365,13 +365,11 @@ fn filters_choose_what_stops_the_ray() {
 
 /// A chunk of `state` stored as `Packed` (1 bit, every index 0) instead of `Uniform`.
 fn packed(state: BlockState) -> ChunkData {
-    let mut data = ChunkData::uniform(state);
-    data.blocks = Paletted::Packed {
+    ChunkData::from_paletted(Paletted::Packed {
         palette: vec![state, BlockState::AIR],
         bits: 1,
         words: vec![0u64; CHUNK_VOLUME / 64].into_boxed_slice(),
-    };
-    data
+    })
 }
 
 #[test]
