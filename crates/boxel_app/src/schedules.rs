@@ -60,6 +60,10 @@ labels! {
 ///
 /// `Time` holds the frame view in both (only `FixedMain` sees the fixed-step view).
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "Bevy's names, so code written for Bevy ports unchanged"
+)]
 pub enum RunFixedMainLoopSystems {
     /// Before the fixed steps of the frame.
     BeforeFixedMainLoop,
