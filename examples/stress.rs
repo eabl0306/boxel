@@ -759,6 +759,22 @@ impl Bench {
         self.info.class = info
             .class
             .map_or_else(|| "?".to_string(), |c| format!("{c:?}"));
+        // What the renderer got: the device's limits may cut the requested arena and table.
+        if info.arena_capacity_quads > 0 {
+            if (info.arena_capacity_quads, info.chunk_slot_capacity)
+                != (self.info.arena_quads, self.info.chunk_slots)
+            {
+                println!(
+                    "stress: the renderer got {} quads and {} chunk slots (asked for {} and {})",
+                    info.arena_capacity_quads,
+                    info.chunk_slot_capacity,
+                    self.info.arena_quads,
+                    self.info.chunk_slots
+                );
+            }
+            self.info.arena_quads = info.arena_capacity_quads;
+            self.info.chunk_slots = info.chunk_slot_capacity;
+        }
         let records = rec.log.to_vec();
         let Some(summary) = Summary::compute(&records) else {
             eprintln!("stress: no frame was measured");
@@ -955,7 +971,7 @@ fn main() -> AppExit {
         },
         seed: options.seed,
         world: options.world.label(),
-        trees: options.world.trees,
+        trees: options.world.has_trees(),
         arena_quads,
         chunk_slots,
         vertical: if options.fixed_height {
@@ -1400,6 +1416,9 @@ mod tests {
         *stats = frame.stats;
         info.ready = true;
         info.frames_presented += u64::from(frame.presented);
+        // A device that cuts the arena and the chunk table.
+        info.arena_capacity_quads = 1 << 20;
+        info.chunk_slot_capacity = 4096;
     }
 
     /// The bench systems with a fake world and renderer; no window, GPU or threads.
@@ -1417,7 +1436,13 @@ mod tests {
                 generated: Arc::clone(&generated),
             });
         let recorder = Recorder::new(generated, Arc::new(AtomicU64::new(0)), 16);
-        add_bench(&mut app, options, RunInfo::default(), recorder, t0);
+        let (arena_quads, chunk_slots) = options.render_capacity();
+        let info = RunInfo {
+            arena_quads,
+            chunk_slots,
+            ..RunInfo::default()
+        };
+        add_bench(&mut app, options, info, recorder, t0);
         app.add_systems(Update, fake_world.after(drive))
             .add_systems(Last, fake_render);
         app.finish();
@@ -1565,6 +1590,11 @@ mod tests {
             bench.info.catch_up_s,
             Some(0.039),
             "frame 11 (66 ms) to 14 (105 ms)"
+        );
+        // The summary keeps what the renderer got, not the 8 Mi quads and 32 768 slots asked.
+        assert_eq!(
+            (bench.info.arena_quads, bench.info.chunk_slots),
+            (1 << 20, 4096)
         );
     }
 

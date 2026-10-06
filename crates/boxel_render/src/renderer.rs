@@ -92,8 +92,10 @@ pub struct RenderStats {
     pub chunks: u32,
     /// Arena quads in use.
     pub arena_used_quads: u32,
-    /// Arena capacity.
+    /// Arena capacity: `RendererConfig::arena_quads`, cut to the device's buffer limits.
     pub arena_capacity_quads: u32,
+    /// Chunk table capacity: `RendererConfig::max_chunk_slots`, cut to the device's limits.
+    pub chunk_slot_capacity: u32,
     /// Chunks passing CPU culling (Mid/Low; High: 0, culling is on the GPU).
     pub visible_chunks: u32,
     /// Draw calls recorded (High: 2 multi-draws, opaque + cutout).
@@ -490,6 +492,7 @@ impl VoxelRenderer {
             chunks: self.chunks.len() as u32,
             arena_used_quads: self.arena.alloc.used(),
             arena_capacity_quads: self.arena.alloc.capacity(),
+            chunk_slot_capacity: self.chunks.capacity(),
             ..self.stats
         }
     }

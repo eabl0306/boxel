@@ -103,7 +103,8 @@ pub struct RunInfo {
     pub world: String,
     /// Trees on.
     pub trees: bool,
-    /// Renderer quad arena (quads) and chunk table (slots).
+    /// Renderer quad arena (quads) and chunk table (slots) the renderer got: the requested ones
+    /// (`--arena-quads`, `--chunk-slots` or the world's default) cut to the device's limits.
     pub arena_quads: u32,
     /// See `arena_quads`.
     pub chunk_slots: u32,

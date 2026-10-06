@@ -140,6 +140,10 @@ bench-fly *args: (_stress "fly" args)
 bench-spin *args: (_stress "spin" args)
 
 [group('bench')]
+[doc('Stress run, camera going straight down: just bench-dive --world overworld --speed 64')]
+bench-dive *args: (_stress "dive" args)
+
+[group('bench')]
 [doc('static, fly at 32 and 64 voxels/s, and spin, with the same options')]
 bench-all *args: (_stress "static" args) (_stress "fly" "--speed 32" args) (_stress "fly" "--speed 64" args) (_stress "spin" args)
 

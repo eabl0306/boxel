@@ -172,6 +172,12 @@ impl WorldChoice {
         (self.world == World::Overworld).then(|| self.caves.unwrap_or(CaveMode::Mc))
     }
 
+    /// True if the generator places trees: the forest and the overworld, unless `--no-trees`
+    /// (flat and terrain never have any).
+    pub fn has_trees(self) -> bool {
+        self.trees && matches!(self.world, World::Forest | World::Overworld)
+    }
+
     /// True if the generator has no floor (`vertical_chunks` starts at `i64::MIN`).
     pub fn unbounded(self) -> bool {
         self.world == World::Overworld
@@ -275,6 +281,17 @@ mod tests {
             parse(&["--world", "overworld", "--caves", "closed", "--no-trees"]).expect("valid");
         assert_eq!(closed.label(), "overworld/closed-no-trees");
         assert_eq!(parse(&["--no-trees"]).expect("valid").label(), "terrain");
+        // Trees only where the generator has them: one record per generator.
+        for (args, trees) in [
+            (&[][..], true),
+            (&["--no-trees"], false),
+            (&["--world", "terrain"], false),
+            (&["--world", "flat"], false),
+            (&["--world", "overworld"], true),
+            (&["--world", "overworld", "--no-trees"], false),
+        ] {
+            assert_eq!(parse(args).expect("valid").has_trees(), trees, "{args:?}");
+        }
         assert_eq!(
             parse(&["--no-trees"]).expect("valid").generator(1).name(),
             "terrain"
