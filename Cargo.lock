@@ -257,6 +257,7 @@ dependencies = [
  "boxel_log",
  "boxel_math",
  "boxel_mesh",
+ "boxel_physics",
  "boxel_render",
  "boxel_shaders",
  "boxel_tasks",
@@ -433,6 +434,21 @@ dependencies = [
  "boxel_voxel",
  "boxel_worldgen",
  "bytemuck",
+ "criterion",
+ "proptest",
+]
+
+[[package]]
+name = "boxel_physics"
+version = "0.1.0-dev"
+dependencies = [
+ "boxel_app",
+ "boxel_ecs",
+ "boxel_math",
+ "boxel_transform",
+ "boxel_voxel",
+ "boxel_world",
+ "boxel_worldgen",
  "criterion",
  "proptest",
 ]

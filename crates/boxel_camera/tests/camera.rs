@@ -8,7 +8,7 @@ use boxel_math::{Aabb, DVec3, Quat, Vec2, Vec3};
 use boxel_transform::Transform;
 use boxel_window::{
     ButtonState, CursorGrab, CursorOptions, InputPlugin, KeyCode, KeyboardInput, MouseButton,
-    MouseButtonInput, MouseMotion,
+    MouseButtonInput, MouseMotion, WindowFocused,
 };
 use std::f32::consts::FRAC_PI_2;
 use std::time::{Duration, Instant};
@@ -278,6 +278,29 @@ fn click_grabs_and_escape_releases_the_cursor() {
             visible: true
         }
     );
+}
+
+#[test]
+fn losing_the_focus_releases_the_cursor() {
+    let mut h = Harness::new(FlyCamera::default());
+    h.click(MouseButton::Left).step();
+    assert_eq!(h.cursor().grab, CursorGrab::Locked);
+    // Alt-tab: the OS frees the cursor, and so does the controller.
+    h.app.world_mut().write_message(WindowFocused(false));
+    h.step();
+    assert_eq!(
+        h.cursor(),
+        CursorOptions {
+            grab: CursorGrab::None,
+            visible: true
+        }
+    );
+    // Focus back: nothing changes until a click grabs it again.
+    h.app.world_mut().write_message(WindowFocused(true));
+    h.step();
+    assert_eq!(h.cursor().grab, CursorGrab::None);
+    h.click(MouseButton::Left).step();
+    assert_eq!(h.cursor().grab, CursorGrab::Locked);
 }
 
 #[test]

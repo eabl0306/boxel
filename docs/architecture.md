@@ -2,7 +2,7 @@
 
 Documento técnico de referencia. Fecha: 2026-10-05. Estado: aprobado para el milestone M0
 (revisión final, después de tres revisiones adversariales del borrador v1).
-Las decisiones puntuales están en `docs/adr/` (0001 a 0015). Durante M0 hubo además una
+Las decisiones puntuales están en `docs/adr/` (0001 a 0016). Durante M0 hubo además una
 especificación para los agentes implementadores (en inglés, en `.scaffold/`), borrada al cerrar M0;
 este documento queda como referencia.
 
@@ -72,6 +72,9 @@ cargo-deny, el MSRV 1.97.1 y los tests del ECS vendorizado (961 + 480) con lockf
    decisión queda registrada y es reproducible con overrides.
 6. Calidad de proyecto: CI con tests de GPU en rasterizadores por software, validación de shaders
    con naga en todos los backends, Miri para el ECS vendorizado, lints estrictos.
+7. Física propia y mínima para juegos de bloques (ADR 0016): cajas y esferas sin rotaciones,
+   gravedad, raycast exacto contra vóxeles, sólidos y sensores entre entidades. Sin motores de
+   terceros.
 
 ### No objetivos (por ahora)
 
@@ -79,7 +82,7 @@ cargo-deny, el MSRV 1.97.1 y los tests del ECS vendorizado (961 + 480) con lockf
   no se compila ni se prueba para ellos.
 - Un RHI propio o backends crudos de Vulkan/GL (ADR 0001).
 - Render graph genérico.
-- Editor, assets en disco, audio, red, física. Fuera del alcance del motor en M0..M2.
+- Editor, assets en disco, audio, red. Fuera del alcance del motor en M0..M2.
 - Compatibilidad binaria o de API con Bevy.
 
 ---
@@ -91,6 +94,9 @@ cargo-deny, el MSRV 1.97.1 y los tests del ECS vendorizado (961 + 480) con lockf
  |  Aplicación / juego / ejemplos (voxel_world, headless_world, gpu_info)             |
  +-----------------------------------------------------------------------------------+
  |  boxel (fachada): prelude, DefaultPlugins, MinimalPlugins, features                |
+ +----------------------+------------------------+-----------------------------------+
+ |                      |  boxel_physics         |                                   |
+ |                      |  (barrido, raycast)    |                                   |
  +----------------------+------------------------+-----------------------------------+
  |  boxel_render        |  boxel_world           |  boxel_camera                     |
  |  (plugin + renderer  |  (ChunkMap, streaming, |  (Camera, CameraView,             |
@@ -121,6 +127,8 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 - Solo `vendor/` depende de código derivado de Bevy. Ningún crate `bevy*` puede entrar al árbol
   (cargo-deny con nombres exactos más `tools/no_bevy.py` para cualquier nombre).
 - `boxel_render` depende de `boxel_world` (consume `ChunkMeshEvent`), nunca al revés.
+- `boxel_physics` depende de `boxel_world` (lee `ChunkMap`); ni `boxel_world` ni `boxel_render`
+  dependen de él. Su núcleo (`boxel_physics::core`) no usa el ECS.
 - El núcleo del renderer (`VoxelRenderer`) no usa el ECS; el plugin es una capa fina encima.
 
 ---
@@ -130,7 +138,7 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | Crate | Responsabilidad | Depende de (boxel) |
 |---|---|---|
 | `boxel` (raíz) | Fachada: re-exports, `prelude`, `DefaultPlugins`, `MinimalPlugins`, ejemplos | todos |
-| `boxel_app` | `App`, `Plugin`, `PluginGroup`, schedules (`Main`...`Last`, fixed, `Shutdown`), `Time`, `FixedTime`, `FrameLimit` y `FramePacer`, task pools, runner headless, `AppExit` | ecs, tasks |
+| `boxel_app` | `App`, `Plugin`, `PluginGroup`, schedules (`Main`...`Last`, fixed con `RunFixedMainLoopSystems`, `Shutdown`), `Time`, `FixedTime`, `FrameLimit` y `FramePacer`, task pools, runner headless, `AppExit` | ecs, tasks |
 | `boxel_log` | Subscriber de `tracing`, puente de `log`, Tracy opcional | app |
 | `boxel_diagnostic` | `FrameStats`, `DiagnosticsBoard`, log periódico | app, ecs |
 | `boxel_math` | re-export de glam, `Aabb`, `Frustum`, proyección reverse-Z | (glam) |
@@ -139,19 +147,21 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_camera` | `Camera`, `CameraView` (relativa a cámara), `FlyCamera` | app, transform, window |
 | `boxel_gfx` | política sobre wgpu: preferencias, instancia, tiers, scoring, smoke, selección, LKG, superficie, readback, hal; ejemplo `gpu_info` | (wgpu) |
 | `boxel_shaders` | WGSL embebido, composición, espejos `#[repr(C)]`, tests de naga | (wgpu, bytemuck) |
-| `boxel_voxel` | coordenadas, `Face`, registry (con emisión RGB y opacidad de luz), paleta, `LightValue` y `LightTables`, `ChunkData` con sus máscaras de luz (`LightMasks`) | (glam) |
+| `boxel_voxel` | coordenadas (`BlockPos`, `ChunkPos`, `WorldPos`: bloque más offset, exacto a cualquier distancia), `Face`, registry (con emisión RGB y opacidad de luz), paleta, `LightValue` y `LightTables`, `ChunkData` con sus máscaras de luz (`LightMasks`) | (glam) |
 | `boxel_mesh` | `PackedQuad`, `ChunkMesh`, `PaddedChunk`, `Mesher` (bgm) | voxel |
 | `boxel_light` | luz de vóxeles en CPU, sin ECS ni GPU (ADR 0015): techos de cielo por columna (`SkyTile`, caminata hacia abajo), luz exacta de un chunk desde una caja de 64³ (cielo y RGB, caminos rápidos para cuevas oscuras y cielo abierto), `PaddedLight`, `ChunkLight`; oráculo global para los tests | voxel |
 | `boxel_worldgen` | trait `WorldGenerator`; generadores `FlatGenerator`, `TerrainGenerator`, `ForestGenerator` (terreno con árboles) y `OverworldGenerator` (superficie sobre piedra infinita hacia abajo, con cuevas y árboles; etapas en `overworld`: `Heightmap`, `SurfaceRules`, `Caves`, más `Trees`); ruido 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`) | voxel |
 | `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, eventos, `ChunkStore` | app, voxel, mesh, worldgen, transform, diagnostic |
 | `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `PresentSettings` (vsync en tiempo de ejecución), texturas procedurales, screenshots | gfx, shaders, world, camera, window |
+| `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::solid`), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas. Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`), `PhysicsQuery`. Hoy fase P1: cuerpos, gravedad y entidades vienen en P2 a P4 | ecs, app, math, voxel, world |
 | `boxel_facade_check` | solo CI: prueba que los derives resuelven `::boxel::ecs` para un usuario que depende solo de `boxel` | fachada |
 | `vendor/*` (7 crates) | ECS y tareas (fork de Bevy) | - |
 
-Features de la fachada: `default = [window, render, voxel, png, debug]`, más `trace` (spans de
-sistemas, implica `debug`), `trace_tracy` (Tracy), `track_location` y `hal` (escape hatch
-Vulkan). `debug` hace que los diagnósticos del ECS (conflictos B0001, errores de schedule, spans)
-muestren nombres de sistemas y componentes; conviene apagarla en builds de distribución.
+Features de la fachada: `default = [window, render, voxel, png, debug, physics]`, más `trace`
+(spans de sistemas, implica `debug`), `trace_tracy` (Tracy), `track_location` y `hal` (escape
+hatch Vulkan). `physics` implica `voxel` y expone `boxel::physics`. `debug` hace que los
+diagnósticos del ECS (conflictos B0001, errores de schedule, spans) muestren nombres de sistemas
+y componentes; conviene apagarla en builds de distribución.
 
 ---
 
@@ -559,9 +569,11 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   runners lo corren una vez al salir (`App::shutdown`), con la ventana todavía viva, para soltar
   recursos de GPU y ventana en orden.
 - Tiempo: `Time` (delta con tope de 250 ms, elapsed, frames) en `First`; `FixedTime` a 64 Hz con
-  acumulador y máximo de 8 pasos por frame; `FixedMain` = `FixedPreUpdate`, `FixedUpdate`,
-  `FixedPostUpdate`. Mientras corre `FixedMain`, `Res<Time>` es la vista fija (delta = paso
-  fijo), como en Bevy.
+  acumulador y máximo de 8 pasos por frame (`set_max_steps_per_frame` lo cambia); `FixedMain` =
+  `FixedPreUpdate`, `FixedUpdate`, `FixedPostUpdate`. Mientras corre `FixedMain`, `Res<Time>` es
+  la vista fija (delta = paso fijo), como en Bevy. `RunFixedMainLoop` se divide en los sets
+  encadenados `RunFixedMainLoopSystems` (los nombres de Bevy): `BeforeFixedMainLoop` (muestrear
+  la entrada para los pasos), `FixedMainLoop` (los pasos) y `AfterFixedMainLoop` (interpolar).
 - Mensajes y paso fijo: `TimePlugin` agrega `signal_message_update_system` en `FixedPostUpdate`
   y deja la rotación de mensajes en espera hasta que corra un paso fijo. Sin esto, un lector en
   `FixedUpdate` perdía los mensajes escritos en `Update` cuando los frames iban a más del doble
@@ -1011,7 +1023,9 @@ schedule `Shutdown` es el lugar para el `flush` final.
   2 s. Su `fps=` cuenta updates de la App, no frames mostrados.
 - Overlay F3 (`boxel_debug`): frames mostrados por segundo (de `RenderInfo::frames_presented`) y
   updates por segundo por separado, tiempo de frame, límite, vsync y modo de presentación, GPU,
-  cámara y contadores de chunks. Teclas opcionales `FrameKeys` (F5 límite, F6 vsync).
+  cámara y contadores de chunks. Teclas opcionales `FrameKeys` (F5 límite, F6 vsync). Las apps
+  suman líneas propias con `OverlayLines` (`voxel_world` muestra el bloque apuntado y la
+  selección) y `Crosshair` dibuja una mira en el centro.
 - `FrameTimeHistory`: los últimos frames (4096 por defecto, mínimo 1024) con su tiempo real
   (`Time::real_delta`); `summary()` da p50, p95, p99, p99.9, máximo, promedio y 1% low.
 - Tirones mientras se carga el mundo: `examples/stress.rs` y `just bench-*`
@@ -1049,7 +1063,7 @@ schedule `Shutdown` es el lugar para el `flush` final.
 | Milestone | Contenido | Criterio de salida |
 |---|---|---|
 | **M0 scaffold** | workspace y tooling; fork del ECS; `boxel_app`; ventana con compuerta de presentación e input; detección completa (tiers, scoring, smoke, overrides, LKG de crashes, device lost, catch_unwind); tiers High, Mid y Low con buckets opaco y cutout (High sin Hi-Z); paleta, registry, worldgen, mesher, streaming con jobs; cámara libre; `gpu_info`, `voxel_world`, `headless_world` | compila, tests, clippy y rustdoc limpios; `voxel_world` dibuja terreno en Vulkan High y en GL (Mid y Low); imágenes iguales entre tiers; la simulación no se congela con la ventana minimizada |
-| **M1 mundo jugable** | criterio de entrada: re-fork sobre bevy 0.20.0 final. Pase translúcido; AO; raycast y edición de bloques (y el sistema de ediciones si se recortó); propiedades de bloque e IdMap; `ChunkStore` con redb; crecimiento del arena y presupuesto de subida; caras interiores de hojas (opcional); re-selección en caliente si se recortó; decisión `static-dxc` o DLL en Windows; timestamps de GPU; actualizar a wgpu 31 | editar y guardar un mundo; agua visible |
+| **M1 mundo jugable** | criterio de entrada: re-fork sobre bevy 0.20.0 final. Pase translúcido; AO; raycast y edición de bloques (hechos: ADR 0016, `voxel_world`); el sistema de ediciones si se recortó; propiedades de bloque e IdMap; `ChunkStore` con redb; crecimiento del arena y presupuesto de subida; caras interiores de hojas (opcional); re-selección en caliente si se recortó; decisión `static-dxc` o DLL en Windows; timestamps de GPU; actualizar a wgpu 31 | editar y guardar un mundo; agua visible |
 | **M2 GPU-driven completo** | Hi-Z en dos fases (High); cave culling por BFS (Mid/Low); pool de ocupación en GPU; `create_shader_module_trusted` con medición; pipeline cache de Vulkan; verificar DX12 High; clip control en GL (upstream); decidir WESL | caída de draws y de tiempo de GPU medida |
 | **M3 escala** | LOD con mips de 32³ y anillos; listas indirectas segmentadas (más de 65 535 draws); render en hilo propio; inicialización de GPU asíncrona (respetando los error scopes por hilo); luz (cielo y bloque) | distancias de vista grandes estables |
 | **M4 experimental** | ray marching sobre bricks/ocupación; mesh shaders opt-in; evaluar bevy_ecs 0.21 y el núcleo ECS propio | prototipos medidos |

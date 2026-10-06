@@ -45,6 +45,34 @@ labels! {
     Shutdown,
 }
 
+/// The three parts of [`RunFixedMainLoop`], chained (Bevy's names). [`crate::TimePlugin`] puts
+/// [`crate::run_fixed_main_loop`] (which runs `FixedMain` zero or more times) in
+/// [`RunFixedMainLoopSystems::FixedMainLoop`]; a system added to `RunFixedMainLoop` belongs in
+/// one of the other two.
+///
+/// - [`RunFixedMainLoopSystems::BeforeFixedMainLoop`]: once per frame, before this frame's fixed
+///   steps. Sample input for the simulation here (for example a jump latch the fixed steps
+///   consume), so a press during a frame that runs no step is not lost and a frame that runs two
+///   steps does not see it twice.
+/// - [`RunFixedMainLoopSystems::AfterFixedMainLoop`]: once per frame, after them and before
+///   `Update`. Interpolate what the steps moved here (`FixedTime::overstep_fraction_f64` is the
+///   factor for `f64` positions), so `Update` and the renderer see the same interpolated state.
+///
+/// `Time` holds the frame view in both (only `FixedMain` sees the fixed-step view).
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "Bevy's names, so code written for Bevy ports unchanged"
+)]
+pub enum RunFixedMainLoopSystems {
+    /// Before the fixed steps of the frame.
+    BeforeFixedMainLoop,
+    /// The fixed steps ([`crate::run_fixed_main_loop`]).
+    FixedMainLoop,
+    /// After the fixed steps of the frame, before `Update`.
+    AfterFixedMainLoop,
+}
+
 /// Order of the per-frame and startup schedules run by [`Main`].
 #[derive(Resource, Debug)]
 pub struct MainScheduleOrder {
@@ -139,8 +167,9 @@ fn run_fixed_main(world: &mut World) {
     });
 }
 
-/// Installs `Main`/`FixedMain` (single-threaded facilitator schedules) and their order resources.
-/// Added by [`App::new`].
+/// Installs `Main`/`FixedMain` (single-threaded facilitator schedules) and their order resources,
+/// and chains the [`RunFixedMainLoopSystems`] sets in [`RunFixedMainLoop`]. Added by
+/// [`App::new`].
 pub struct MainSchedulePlugin;
 
 impl Plugin for MainSchedulePlugin {
@@ -154,6 +183,15 @@ impl Plugin for MainSchedulePlugin {
             .init_resource::<MainScheduleOrder>()
             .init_resource::<FixedMainScheduleOrder>()
             .add_systems(Main, run_main)
-            .add_systems(FixedMain, run_fixed_main);
+            .add_systems(FixedMain, run_fixed_main)
+            .configure_sets(
+                RunFixedMainLoop,
+                (
+                    RunFixedMainLoopSystems::BeforeFixedMainLoop,
+                    RunFixedMainLoopSystems::FixedMainLoop,
+                    RunFixedMainLoopSystems::AfterFixedMainLoop,
+                )
+                    .chain(),
+            );
     }
 }

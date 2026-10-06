@@ -6,6 +6,7 @@ use boxel_math::{DVec3, Frustum, I64Vec3, IVec3, Mat4, Quat, Vec2, Vec3};
 use boxel_transform::Transform;
 use boxel_window::{
     AccumulatedMouseMotion, ButtonInput, CursorGrab, CursorOptions, KeyCode, MouseButton,
+    WindowFocused,
 };
 use std::f32::consts::{PI, TAU};
 
@@ -96,7 +97,8 @@ impl CameraView {
 }
 
 /// Free-fly controller: mouse look while the cursor is grabbed, WASD move, Space/ShiftLeft
-/// up/down, `ControlLeft` boost. Left click grabs the cursor, Escape releases it.
+/// up/down, `ControlLeft` boost. Left click grabs the cursor; Escape and losing the window
+/// focus release it.
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 pub struct FlyCamera {
     /// Speed in world units per second.
@@ -163,18 +165,25 @@ impl Plugin for FlyCameraPlugin {
 /// Pitch limit (89 degrees): looking straight up or down would flip the view.
 const MAX_PITCH: f32 = 89.0_f32.to_radians();
 
-/// Left click grabs the cursor (locked, hidden), Escape releases it. Only while an enabled
-/// fly camera exists.
+/// Left click grabs the cursor (locked, hidden); Escape and losing the window focus release it.
+/// Only while an enabled fly camera exists.
+///
+/// Releasing on focus loss keeps `CursorOptions` true to the window: after alt-tab the cursor
+/// is free, so the click that focuses the window again only grabs it (apps that act on clicks
+/// while grabbed, like block picking, do not see that click as one).
 fn fly_camera_grab_system(
     cameras: Query<&FlyCamera, With<Transform>>,
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
+    mut focus: MessageReader<WindowFocused>,
     mut cursor: ResMut<CursorOptions>,
 ) {
+    // Read every message (not `any`) so the reader's cursor consumes all of them.
+    let lost_focus = focus.read().filter(|focused| !focused.0).count() > 0;
     if !cameras.iter().any(|camera| camera.enabled) {
         return;
     }
-    if keys.just_pressed(KeyCode::Escape) {
+    if lost_focus || keys.just_pressed(KeyCode::Escape) {
         cursor.set_if_neq(CursorOptions {
             grab: CursorGrab::None,
             visible: true,

@@ -2,11 +2,17 @@
 //!
 //! `cargo run --release --example voxel_world -- [GPU options] [options]` (see `--help`).
 //! Interactive by default: left click grabs the mouse, WASD/Space/`ShiftLeft` fly, `ControlLeft`
-//! boosts, Escape releases the cursor, F3 toggles the debug overlay, F5 cycles the frame limit
-//! (30, 60, 144, 240, unlimited) and F6 toggles vsync. `--frames`, `--duration`, `--screenshot`,
-//! `--minimize-test`, `--resize-test`, `--vsync-test` and the like make it close by itself
-//! (`--duration` keeps the interactive path: fly camera on, nothing rendered while hidden); the
-//! last summary line gives the update and presented frame rates and the CPU use (Linux).
+//! boosts, Escape (or leaving the window) releases the cursor, F3 toggles the debug overlay, F5
+//! cycles the frame limit (30, 60, 144, 240, unlimited) and F6 toggles vsync. While the mouse is
+//! grabbed, left click breaks the block under the crosshair and right click places the selected
+//! block on the face it points at (keys 1 to 9 select it; F3 shows the target and the
+//! selection). Picking is a voxel raycast from the camera (`PhysicsQuery::raycast_voxels`),
+//! reach 6 blocks.
+//!
+//! `--frames`, `--duration`, `--screenshot`, `--minimize-test`, `--resize-test`, `--vsync-test`
+//! and the like make it close by itself (`--duration` keeps the interactive path: fly camera
+//! on, nothing rendered while hidden); the last summary line gives the update and presented
+//! frame rates and the CPU use (Linux).
 //!
 //! Exit codes: 0 success, 1 usage error, 2 no usable GPU, 3 check failed (screenshot, image
 //! diff, resize, minimize), 4 timeout.
@@ -21,14 +27,16 @@ mod world;
 
 use boxel::app::{TaskPoolOptions, TaskPoolThreadAssignmentPolicy};
 use boxel::camera::FlyCameraSystems;
+use boxel::debug_overlay::{Crosshair, OverlayLines};
 use boxel::gfx::wgpu::PresentMode;
 use boxel::gfx::{CLI_HELP, DeviceClass, RgbaImage};
+use boxel::physics::{PhysicsPlugin, Probe as VoxelProbe};
 use boxel::prelude::*;
 use boxel::render::{DebugDestroyDevice, GpuFailed, GpuReady, SurfaceInfo};
-use boxel::voxel::MAX_BLOCK_COORD;
+use boxel::voxel::{BlockRegistry, MAX_BLOCK_COORD};
 use boxel::window::winit::dpi::PhysicalSize;
 use boxel::window::{PrimaryWindow, WindowResized};
-use boxel::world::{WorldStats, WorldSystems};
+use boxel::world::{BlockEdit, WorldContent, WorldStats, WorldSystems};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
@@ -1006,6 +1014,220 @@ fn vsync_test(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Block picking and editing
+
+/// How far the camera reaches when picking blocks, in blocks.
+const REACH: f64 = 6.0;
+/// The blocks keys 1 to 9 select for placing (names missing from the registry are skipped).
+const HOTBAR: [&str; 9] = [
+    "boxel:stone",
+    "boxel:dirt",
+    "boxel:grass",
+    "boxel:planks",
+    "boxel:log",
+    "boxel:leaves",
+    "boxel:sand",
+    "boxel:gravel",
+    "boxel:snow",
+];
+const HOTBAR_KEYS: [KeyCode; 9] = [
+    KeyCode::Digit1,
+    KeyCode::Digit2,
+    KeyCode::Digit3,
+    KeyCode::Digit4,
+    KeyCode::Digit5,
+    KeyCode::Digit6,
+    KeyCode::Digit7,
+    KeyCode::Digit8,
+    KeyCode::Digit9,
+];
+
+/// Block picking: the block under the crosshair and the block to place.
+#[derive(Resource, Debug)]
+struct Picking {
+    /// Placeable blocks: [`HOTBAR`] resolved against the registry.
+    hotbar: Vec<(&'static str, BlockState)>,
+    /// Index into `hotbar`.
+    selected: usize,
+    /// The block under the crosshair, refreshed every frame.
+    target: Option<VoxelHit>,
+}
+
+impl Picking {
+    fn new(registry: &BlockRegistry) -> Self {
+        Self {
+            hotbar: HOTBAR
+                .iter()
+                .filter_map(|&name| Some((name, registry.by_name(name)?)))
+                .collect(),
+            selected: 0,
+            target: None,
+        }
+    }
+
+    /// The selected block (air if the hotbar is empty).
+    fn block(&self) -> BlockState {
+        self.hotbar
+            .get(self.selected)
+            .map_or(BlockState::AIR, |&(_, state)| state)
+    }
+}
+
+/// What a click asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Click {
+    Break,
+    Place,
+}
+
+impl Click {
+    /// This frame's click: left breaks, right places. Only while the cursor was grabbed before
+    /// this frame: the click that grabs it does nothing else.
+    fn from_input(buttons: &ButtonInput<MouseButton>, grabbed: bool) -> Option<Click> {
+        if !grabbed {
+            None
+        } else if buttons.just_pressed(MouseButton::Left) {
+            Some(Click::Break)
+        } else if buttons.just_pressed(MouseButton::Right) {
+            Some(Click::Place)
+        } else {
+            None
+        }
+    }
+}
+
+/// The edit a click makes on `hit`. Breaking sets the block to air. Placing puts `block` in
+/// front of the face the ray entered, if `free` says that cell can take it (air or a fluid,
+/// loaded); a ray that started inside a block has no face and places nothing.
+fn click_edit(
+    click: Click,
+    hit: &VoxelHit,
+    block: BlockState,
+    free: impl FnOnce(BlockPos) -> bool,
+) -> Option<BlockEdit> {
+    match click {
+        Click::Break => Some(BlockEdit {
+            pos: hit.block,
+            state: BlockState::AIR,
+        }),
+        Click::Place => {
+            let pos = hit.adjacent()?;
+            (!block.is_air() && free(pos)).then_some(BlockEdit { pos, state: block })
+        }
+    }
+}
+
+/// `+Y`, `-X`...
+fn face_name(face: Face) -> &'static str {
+    match face {
+        Face::PosY => "+Y",
+        Face::NegY => "-Y",
+        Face::PosX => "+X",
+        Face::NegX => "-X",
+        Face::PosZ => "+Z",
+        Face::NegZ => "-Z",
+    }
+}
+
+/// The F3 lines of block picking.
+fn picking_lines(picking: &Picking, registry: &BlockRegistry) -> [String; 2] {
+    let target = match &picking.target {
+        Some(hit) => format!(
+            "Target {} {} {} {}  face {}",
+            registry.name(hit.state),
+            hit.block.x,
+            hit.block.y,
+            hit.block.z,
+            hit.face.map_or("inside", face_name)
+        ),
+        None => format!("Target none (reach {REACH})"),
+    };
+    let place = match picking.hotbar.get(picking.selected) {
+        Some((name, _)) => format!("Place [{}] {name}  (keys 1-9)", picking.selected + 1),
+        None => "Place nothing".to_string(),
+    };
+    [target, place]
+}
+
+/// Picks the block under the screen center (a voxel raycast from the active camera) and applies
+/// this frame's click. Runs before the fly camera, so the cursor state is the one the click was
+/// made with, and before the world's systems (`WorldSystems::Interest`, then `Edits`), so it
+/// reads the map unambiguously and the edit shows this frame.
+fn pick_blocks(
+    physics: PhysicsQuery,
+    cameras: Query<(&Camera, &Transform)>,
+    cursor: Res<CursorOptions>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    content: Res<WorldContent>,
+    mut picking: ResMut<Picking>,
+    mut edits: ResMut<EditQueue>,
+    lines: Option<ResMut<OverlayLines>>,
+) {
+    if let Some(slot) = HOTBAR_KEYS.iter().position(|&key| keys.just_pressed(key))
+        && slot < picking.hotbar.len()
+    {
+        picking.selected = slot;
+    }
+    let target = cameras
+        .iter()
+        .find(|(camera, _)| camera.active)
+        .and_then(|(_, transform)| {
+            physics
+                .raycast_voxels(
+                    WorldPos::from_dvec3(transform.translation),
+                    transform.forward().as_dvec3(),
+                    REACH,
+                    VoxelFilter::Outline { fluids: false },
+                )
+                .hit()
+                .copied()
+        });
+    if picking.target != target {
+        picking.target = target;
+    }
+    let click = Click::from_input(&buttons, cursor.grab == CursorGrab::Locked);
+    if let (Some(hit), Some(click)) = (target, click) {
+        let free = |pos: BlockPos| match physics.probe(pos) {
+            VoxelProbe::Block(state) => state.is_air() || physics.collision().is_fluid(state),
+            VoxelProbe::Unloaded => false,
+        };
+        if let Some(edit) = click_edit(click, &hit, picking.block(), free) {
+            edits.set_block(edit.pos, edit.state);
+        }
+    }
+    if let Some(mut lines) = lines {
+        let [target, place] = picking_lines(&picking, &content.registry);
+        if lines.get("pick target") != Some(target.as_str()) {
+            lines.set("pick target", target);
+        }
+        if lines.get("pick place") != Some(place.as_str()) {
+            lines.set("pick place", place);
+        }
+    }
+}
+
+/// Block picking and editing: [`Picking`] (built from the world's registry in `finish`) and
+/// [`pick_blocks`] in `Update`. Needs `WorldPlugin`, `PhysicsPlugin` and input.
+struct PickingPlugin;
+
+impl Plugin for PickingPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(
+            Update,
+            pick_blocks
+                .before(FlyCameraSystems)
+                .before(WorldSystems::Interest),
+        );
+    }
+
+    fn finish(&self, app: &mut App) {
+        let registry = std::sync::Arc::clone(&app.world().resource::<WorldContent>().registry);
+        app.insert_resource(Picking::new(&registry));
+    }
+}
+
 /// Kills the process if `main` has not returned `limit` after start (the event loop stopped
 /// updating, so the in-app timeout cannot fire). Dropping the returned sender disarms it.
 fn spawn_watchdog(limit: Duration) -> Sender<()> {
@@ -1106,9 +1328,15 @@ fn main() -> AppExit {
     if let Some(on) = vsync {
         app.insert_resource(PresentSettings::vsync(on));
     }
-    app.add_plugins((LogDiagnosticsPlugin::default(), FlyCameraPlugin))
-        // The camera moves first; the world then computes interest from the new position.
-        .configure_sets(Update, FlyCameraSystems.before(WorldSystems::Interest))
+    let interactive = !options.automation();
+    app.add_plugins((
+        LogDiagnosticsPlugin::default(),
+        FlyCameraPlugin,
+        PhysicsPlugin,
+        PickingPlugin,
+    ));
+    // The camera moves first; the world then computes interest from the new position.
+    app.configure_sets(Update, FlyCameraSystems.before(WorldSystems::Interest))
         .insert_resource(Run::new(options))
         .init_resource::<FixedSteps>()
         .add_systems(Startup, spawn_camera)
@@ -1124,6 +1352,13 @@ fn main() -> AppExit {
             )
                 .chain(),
         );
+    if interactive {
+        // Aiming aid for picking; automation runs keep their screenshots unchanged.
+        app.insert_resource(Crosshair {
+            visible: true,
+            ..Crosshair::default()
+        });
+    }
     app.run()
 }
 
@@ -1204,6 +1439,205 @@ mod tests {
         let interactive = parse(&[]);
         assert!(!interactive.automation());
         assert_eq!(interactive.timeout, None, "a plain run has no timeout");
+    }
+
+    /// A headless app with the world (stone y 0..=2, grass at y = 3, inline jobs), physics,
+    /// the fly camera and picking, settled; the cursor is free and a fly camera at (0.5, 6, 0.5)
+    /// looks straight down at the grass (top face at y = 4). `Update` is strict about
+    /// ambiguities, so picking must be ordered against the fly camera's grab (both use
+    /// `CursorOptions`).
+    fn picking_app() -> App {
+        use boxel::ecs::schedule::{LogLevel, ScheduleBuildSettings};
+        use boxel::world::jobs::InlineExecutor;
+        use boxel::worldgen::FlatGenerator;
+        let mut app = App::new();
+        app.add_plugins((
+            TimePlugin,
+            InputPlugin,
+            FlyCameraPlugin,
+            WorldPlugin {
+                generator: std::sync::Arc::new(FlatGenerator::new(vec![
+                    ("boxel:stone".to_string(), 3),
+                    ("boxel:grass".to_string(), 1),
+                ])),
+                executor: std::sync::Arc::new(InlineExecutor),
+                ..WorldPlugin::default()
+            },
+            PhysicsPlugin,
+            PickingPlugin,
+        ))
+        .init_resource::<OverlayLines>()
+        .edit_schedule(Update, |schedule| {
+            schedule.set_build_settings(ScheduleBuildSettings {
+                ambiguity_detection: LogLevel::Error,
+                ..ScheduleBuildSettings::default()
+            });
+        });
+        let pitch = -std::f32::consts::FRAC_PI_2;
+        app.world_mut().spawn((
+            Camera::default(),
+            FlyCamera {
+                pitch,
+                ..FlyCamera::default()
+            },
+            Transform::from_yaw_pitch(DVec3::new(0.5, 6.0, 0.5), 0.0, pitch),
+            ChunkViewer::new(1).with_vertical_radius(1),
+        ));
+        app.finish();
+        app.cleanup();
+        let start = Instant::now();
+        loop {
+            app.update();
+            let stats = *app.world().resource::<WorldStats>();
+            if stats.chunks > 0 && stats.is_settled() {
+                // Picking runs early in `Update`: one more frame so it sees the settled world.
+                app.update();
+                return app;
+            }
+            assert!(start.elapsed() < Duration::from_secs(60), "{stats:?}");
+        }
+    }
+
+    /// Presses and releases `button` over two updates, as the window would.
+    fn click(app: &mut App, button: MouseButton) {
+        use boxel::window::{ButtonState, MouseButtonInput};
+        for state in [ButtonState::Pressed, ButtonState::Released] {
+            app.world_mut()
+                .resource_mut::<Messages<MouseButtonInput>>()
+                .write(MouseButtonInput { button, state });
+            app.update();
+        }
+    }
+
+    fn block_at(app: &App, pos: BlockPos) -> Option<BlockState> {
+        app.world().resource::<ChunkMap>().block_at(pos)
+    }
+
+    fn grab(app: &App) -> CursorGrab {
+        app.world().resource::<CursorOptions>().grab
+    }
+
+    #[test]
+    fn clicks_break_and_place_the_picked_block() {
+        use boxel::window::{ButtonState, KeyboardInput, WindowFocused};
+        let mut app = picking_app();
+        let grass = BlockRegistry::default_blocks()
+            .by_name("boxel:grass")
+            .expect("built-in");
+        // The first click only grabs the cursor (the fly camera does it in the same frame,
+        // after picking): the grass stays.
+        assert_eq!(grab(&app), CursorGrab::None);
+        click(&mut app, MouseButton::Left);
+        assert_eq!(grab(&app), CursorGrab::Locked);
+        assert_eq!(block_at(&app, BlockPos::new(0, 3, 0)), Some(grass));
+        let target = app
+            .world()
+            .resource::<Picking>()
+            .target
+            .expect("grass below");
+        assert_eq!(
+            (target.block, target.face),
+            (BlockPos::new(0, 3, 0), Some(Face::PosY))
+        );
+        // The f32 camera forward is not exactly -Y.
+        assert!((target.t - 2.0).abs() < 1e-6, "{}", target.t);
+        let lines = app.world().resource::<OverlayLines>();
+        assert_eq!(
+            lines.get("pick target"),
+            Some("Target boxel:grass 0 3 0  face +Y")
+        );
+        assert_eq!(
+            lines.get("pick place"),
+            Some("Place [1] boxel:stone  (keys 1-9)")
+        );
+
+        // Left click breaks the grass; the stone under it becomes the target.
+        click(&mut app, MouseButton::Left);
+        assert_eq!(
+            block_at(&app, BlockPos::new(0, 3, 0)),
+            Some(BlockState::AIR)
+        );
+        let target = app
+            .world()
+            .resource::<Picking>()
+            .target
+            .expect("stone below");
+        assert_eq!(target.block, BlockPos::new(0, 2, 0));
+
+        // Key 3 selects grass; right click places it on the stone's top face.
+        app.world_mut()
+            .resource_mut::<Messages<KeyboardInput>>()
+            .write(KeyboardInput {
+                key: KeyCode::Digit3,
+                state: ButtonState::Pressed,
+                repeat: false,
+            });
+        app.update();
+        click(&mut app, MouseButton::Right);
+        assert_eq!(block_at(&app, BlockPos::new(0, 3, 0)), Some(grass));
+        assert_eq!(
+            app.world().resource::<OverlayLines>().get("pick place"),
+            Some("Place [3] boxel:grass  (keys 1-9)")
+        );
+
+        // Alt-tab frees the cursor; the click that focuses the window again only grabs it.
+        app.world_mut().write_message(WindowFocused(false));
+        app.update();
+        assert_eq!(grab(&app), CursorGrab::None);
+        app.world_mut().write_message(WindowFocused(true));
+        click(&mut app, MouseButton::Left);
+        assert_eq!(grab(&app), CursorGrab::Locked);
+        assert_eq!(block_at(&app, BlockPos::new(0, 3, 0)), Some(grass));
+    }
+
+    #[test]
+    fn click_edits_need_a_face_a_free_cell_and_a_block() {
+        let stone = BlockState(1);
+        let hit = VoxelHit {
+            block: BlockPos::new(1, 2, 3),
+            face: Some(Face::NegX),
+            t: 1.0,
+            point: WorldPos::default(),
+            state: stone,
+        };
+        assert_eq!(
+            click_edit(Click::Break, &hit, stone, |_| false),
+            Some(BlockEdit {
+                pos: hit.block,
+                state: BlockState::AIR
+            })
+        );
+        assert_eq!(
+            click_edit(Click::Place, &hit, stone, |p| p == BlockPos::new(0, 2, 3)),
+            Some(BlockEdit {
+                pos: BlockPos::new(0, 2, 3),
+                state: stone
+            })
+        );
+        assert_eq!(
+            click_edit(Click::Place, &hit, stone, |_| false),
+            None,
+            "occupied"
+        );
+        assert_eq!(
+            click_edit(Click::Place, &hit, BlockState::AIR, |_| true),
+            None,
+            "nothing selected"
+        );
+        let inside = VoxelHit { face: None, ..hit };
+        assert_eq!(
+            click_edit(Click::Place, &inside, stone, |_| true),
+            None,
+            "no face"
+        );
+        let mut buttons = ButtonInput::<MouseButton>::default();
+        buttons.press(MouseButton::Right);
+        assert_eq!(Click::from_input(&buttons, true), Some(Click::Place));
+        assert_eq!(
+            Click::from_input(&buttons, false),
+            None,
+            "the click that grabs"
+        );
     }
 
     #[test]

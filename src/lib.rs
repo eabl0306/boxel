@@ -21,9 +21,10 @@
 //! vsync, off by default. Both are resources that any system can change at runtime, for
 //! example from a settings menu.
 //!
-//! Features: `window`, `render`, `voxel`, `png` and `debug` (ECS diagnostics with system and
-//! component names) are on by default; `trace`/`trace_tracy` add spans; `hal` adds the Vulkan
-//! escape hatch (Windows/Linux).
+//! Features: `window`, `render`, `voxel`, `png`, `debug` (ECS diagnostics with system and
+//! component names) and `physics` (boxel's own minimal physics: add `physics::PhysicsPlugin`)
+//! are on by default; `trace`/`trace_tracy` add spans; `hal` adds the Vulkan escape hatch
+//! (Windows/Linux).
 
 pub use boxel_app as app;
 pub use boxel_diagnostic as diagnostic;
@@ -55,6 +56,9 @@ pub use boxel_voxel as voxel;
 pub use boxel_world as world;
 #[cfg(feature = "voxel")]
 pub use boxel_worldgen as worldgen;
+
+#[cfg(feature = "physics")]
+pub use boxel_physics as physics;
 
 use boxel_app::{PluginGroup, PluginGroupBuilder};
 
@@ -91,6 +95,9 @@ pub mod prelude {
     pub use boxel_worldgen::{
         ForestGenerator, OverworldGenerator, TerrainGenerator, WorldGenerator,
     };
+
+    #[cfg(feature = "physics")]
+    pub use boxel_physics::prelude::*;
 }
 
 /// Log, task pools, time, frame stats, input, window + winit runner, voxel world, renderer and
