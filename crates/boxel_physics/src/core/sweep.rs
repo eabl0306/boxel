@@ -25,15 +25,25 @@ use boxel_voxel::{BlockPos, Face, WorldPos};
 /// at 100 blocks per second moves 1.6 blocks per 64 Hz step.
 pub const MAX_SWEEP_DISTANCE: f64 = 1024.0;
 
+/// The smallest contact tolerance [`move_box`] uses, in blocks (`2^-32`, about `2.3e-10`): a
+/// smaller [`SweepConfig::eps`] is raised to it, so a widened thin shape (see [`move_box`])
+/// stays many `f64` steps wide anywhere in a block's frame.
+const MIN_EPS: f64 = 1.0 / 4_294_967_296.0;
+
+/// The largest contact tolerance [`move_box`] uses, in blocks: a larger [`SweepConfig::eps`] is
+/// lowered to it.
+const MAX_EPS: f64 = 1.0 / 64.0;
+
 /// Tuning of [`move_box`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SweepConfig {
     /// Contact tolerance, in blocks (default `1e-7`). A box within `eps` of a block touches it
     /// and never counts as overlapping it. Positions are local to a block, so this tolerance
-    /// means the same everywhere in the world.
+    /// means the same everywhere in the world. Clamped to `2^-32..=1/64`; NaN counts as
+    /// `2^-32`.
     pub eps: f64,
     /// The most a box that starts inside full blocks is pushed out per call, in blocks (default
-    /// 1).
+    /// 1). Clamped to `0..=`[`MAX_SWEEP_DISTANCE`]; NaN counts as 0.
     pub max_depenetration: f64,
 }
 
@@ -95,8 +105,14 @@ pub struct Unloaded {
 /// with the box's face exactly on the blocking plane (`position = plane - face offset`, so a
 /// resting box computes the same position every time and never drifts).
 ///
-/// `shape` must be larger than `2 * cfg.eps` on every axis. Components of `d` that are not
-/// finite count as 0, and each component is clamped to [`MAX_SWEEP_DISTANCE`].
+/// On an axis where `shape` is not larger than `2 * eps`, it is widened to `4 * eps` around its
+/// center (a tiny sphere or a point collides like a box that wide instead of slipping between
+/// blocks); a shape with a non-finite corner counts as a point at the position. Components of
+/// `d` that are not finite count as 0, and each component is clamped to
+/// [`MAX_SWEEP_DISTANCE`]. `start` is made canonical first ([`WorldPos::normalize`]).
+///
+/// At the world limit the end is clamped onto the limit ([`WorldPos::normalize`]); `moved`
+/// then reports the movement that happened.
 ///
 /// # Errors
 ///
@@ -110,12 +126,8 @@ pub fn move_box<S: VoxelSource + ?Sized>(
     obstacles: &[LocalBox],
     cfg: &SweepConfig,
 ) -> Result<SweepOut, Unloaded> {
-    debug_assert!(
-        (shape.max - shape.min)
-            .cmpgt(DVec3::splat(2.0 * cfg.eps))
-            .all(),
-        "move_box: shape {shape:?} is not larger than 2 * eps"
-    );
+    // A hand-built start may be outside the canonical form (a NaN frac, a block past i64 room).
+    let start = start.normalize();
     let clean = |v: f64| {
         if v.is_finite() {
             v.clamp(-MAX_SWEEP_DISTANCE, MAX_SWEEP_DISTANCE)
@@ -124,14 +136,26 @@ pub fn move_box<S: VoxelSource + ?Sized>(
         }
     };
     let d = DVec3::new(clean(d.x), clean(d.y), clean(d.z));
+    // `>=` is false for NaN: NaN counts as the minimum.
+    let eps = if cfg.eps >= MIN_EPS {
+        cfg.eps.min(MAX_EPS)
+    } else {
+        MIN_EPS
+    };
+    let shape = usable_shape(shape, eps);
+    let max_depenetration = if cfg.max_depenetration >= 0.0 {
+        cfg.max_depenetration.min(MAX_SWEEP_DISTANCE)
+    } else {
+        0.0
+    };
     let mut grid = Grid {
         src,
         table,
         origin: start.block,
-        eps: cfg.eps,
+        eps,
     };
     let mut pos = start.frac;
-    let depenetrated = match grid.depenetrate(pos, shape, cfg.max_depenetration)? {
+    let depenetrated = match grid.depenetrate(pos, shape, max_depenetration)? {
         Some(out) => {
             pos = out;
             true
@@ -157,14 +181,41 @@ pub fn move_box<S: VoxelSource + ?Sized>(
         }
     }
     let in_fluid = grid.any_fluid(shape.translate(pos))?;
+    let end = WorldPos::from_block(start.block, pos);
+    // `end` holds `pos` exactly unless it was clamped at the world limit (or a tiny negative
+    // frac carried): then the movement is measured to the end itself.
+    let moved = if end.block.as_i64vec3() == start.block.as_i64vec3() + pos.floor().as_i64vec3() {
+        pos - start.frac
+    } else {
+        start.delta_to(&end)
+    };
     Ok(SweepOut {
-        end: WorldPos::from_block(start.block, pos),
-        moved: pos - start.frac,
+        end,
+        moved,
         faces,
         ground,
         in_fluid,
         depenetrated,
     })
+}
+
+/// `shape` as the sweep uses it (see [`move_box`]): a shape with a non-finite corner becomes a
+/// point at the origin, and an axis not larger than `2 * eps` is widened to `4 * eps` around
+/// its center, so the strict footprint of the box is never empty.
+fn usable_shape(shape: LocalBox, eps: f64) -> LocalBox {
+    let mut shape = if shape.min.is_finite() && shape.max.is_finite() {
+        shape
+    } else {
+        LocalBox::default()
+    };
+    for a in 0..3 {
+        if shape.max[a] - shape.min[a] <= 2.0 * eps {
+            let center = (shape.min[a] + shape.max[a]) * 0.5;
+            shape.min[a] = center - 2.0 * eps;
+            shape.max[a] = center + 2.0 * eps;
+        }
+    }
+    shape
 }
 
 /// Y, then the larger of |d.x| and |d.z| (X on a tie), then the other. Frozen by tests.
@@ -197,18 +248,12 @@ fn others(axis: usize) -> (usize, usize) {
     }
 }
 
-/// First block index of the strict footprint of `[min, max]` on one axis: blocks the box
-/// overlaps by more than `eps`.
+/// The strict footprint of `[min, max]` on one axis: the first and last index of the blocks the
+/// box overlaps by more than `eps` (none when the box is not larger than `2 * eps`, which
+/// [`move_box`] prevents by widening such shapes).
 #[inline]
-fn first_block(min: f64, eps: f64) -> i64 {
-    (min + eps).floor() as i64
-}
-
-/// Last block index of the strict footprint (see [`first_block`]); smaller than the first when
-/// the box is thinner than `2 * eps`.
-#[inline]
-fn last_block(max: f64, eps: f64) -> i64 {
-    (max - eps).ceil() as i64 - 1
+fn footprint(min: f64, max: f64, eps: f64) -> (i64, i64) {
+    ((min + eps).floor() as i64, (max - eps).ceil() as i64 - 1)
 }
 
 /// How one axis of a move ended.
@@ -250,12 +295,18 @@ impl<S: VoxelSource + ?Sized> Grid<'_, S> {
         }
     }
 
+    /// The strict footprint of `bx` on `axis` (see [`footprint`]).
+    #[inline]
+    fn span(&self, bx: LocalBox, axis: usize) -> (i64, i64) {
+        footprint(bx.min[axis], bx.max[axis], self.eps)
+    }
+
     /// Some full block overlaps `bx` by more than `eps` on every axis.
     fn any_full(&mut self, bx: LocalBox) -> Result<bool, Unloaded> {
-        let eps = self.eps;
-        for y in first_block(bx.min.y, eps)..=last_block(bx.max.y, eps) {
-            for x in first_block(bx.min.x, eps)..=last_block(bx.max.x, eps) {
-                for z in first_block(bx.min.z, eps)..=last_block(bx.max.z, eps) {
+        let ((x0, x1), (y0, y1), (z0, z1)) = (self.span(bx, 0), self.span(bx, 1), self.span(bx, 2));
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                for z in z0..=z1 {
                     if self.full([x, y, z])? {
                         return Ok(true);
                     }
@@ -267,10 +318,10 @@ impl<S: VoxelSource + ?Sized> Grid<'_, S> {
 
     /// Some fluid block overlaps `bx` by more than `eps` on every axis.
     fn any_fluid(&mut self, bx: LocalBox) -> Result<bool, Unloaded> {
-        let eps = self.eps;
-        for y in first_block(bx.min.y, eps)..=last_block(bx.max.y, eps) {
-            for x in first_block(bx.min.x, eps)..=last_block(bx.max.x, eps) {
-                for z in first_block(bx.min.z, eps)..=last_block(bx.max.z, eps) {
+        let ((x0, x1), (y0, y1), (z0, z1)) = (self.span(bx, 0), self.span(bx, 1), self.span(bx, 2));
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                for z in z0..=z1 {
                     let block = self.world([x, y, z]);
                     match self.src.probe(block) {
                         Probe::Block(state) if self.table.is_fluid(state) => return Ok(true),
@@ -307,7 +358,9 @@ impl<S: VoxelSource + ?Sized> Grid<'_, S> {
         Ok(None)
     }
 
-    /// Moves along one axis: the nearest blocking layer or obstacle within `d` clips it.
+    /// Moves along one axis: the nearest blocking layer or obstacle within `d` clips it. The
+    /// nearest obstacle is found first and the layer scan stops at it: blocks behind an
+    /// obstacle are never probed (they may be in an unloaded chunk the box never reaches).
     fn clip_axis(
         &mut self,
         axis: usize,
@@ -319,16 +372,10 @@ impl<S: VoxelSource + ?Sized> Grid<'_, S> {
         let eps = self.eps;
         let bx = shape.translate(pos);
         let (b_axis, c_axis) = others(axis);
-        let b = (
-            first_block(bx.min[b_axis], eps),
-            last_block(bx.max[b_axis], eps),
-        );
-        let c = (
-            first_block(bx.min[c_axis], eps),
-            last_block(bx.max[c_axis], eps),
-        );
+        let b = self.span(bx, b_axis);
+        let c = self.span(bx, c_axis);
         // An obstacle is in the way if it overlaps the footprint strictly.
-        let across = |o: &LocalBox| {
+        let across = |o: &&LocalBox| {
             o.min[b_axis] < bx.max[b_axis] - eps
                 && o.max[b_axis] > bx.min[b_axis] + eps
                 && o.min[c_axis] < bx.max[c_axis] - eps
@@ -336,11 +383,21 @@ impl<S: VoxelSource + ?Sized> Grid<'_, S> {
         };
         if d > 0.0 {
             let lead = bx.max[axis];
+            // The nearest obstacle face ahead (infinity when none).
+            let mut plane = obstacles
+                .iter()
+                .filter(across)
+                .map(|o| o.min[axis])
+                .filter(|&min| min >= lead - eps)
+                .fold(f64::INFINITY, f64::min);
             // Layers whose min plane the leading face has not passed (by more than eps), up to
-            // the last one the moved face enters.
+            // the last one the moved face enters, and only those nearer than the obstacle (a
+            // block flush with it would stop the box at the same plane).
             let first = (lead - eps).ceil() as i64;
-            let last = (lead + d).ceil() as i64 - 1;
-            let mut plane = f64::INFINITY;
+            let mut last = (lead + d).ceil() as i64 - 1;
+            if plane < f64::INFINITY {
+                last = last.min(plane.ceil() as i64 - 1);
+            }
             for layer in first..=last {
                 if self
                     .first_full_in_layer(axis, layer, (b_axis, c_axis), b, c)?
@@ -348,11 +405,6 @@ impl<S: VoxelSource + ?Sized> Grid<'_, S> {
                 {
                     plane = layer as f64;
                     break;
-                }
-            }
-            for o in obstacles.iter().filter(|o| across(o)) {
-                if o.min[axis] >= lead - eps && o.min[axis] < plane {
-                    plane = o.min[axis];
                 }
             }
             if plane < lead + d {
@@ -363,11 +415,21 @@ impl<S: VoxelSource + ?Sized> Grid<'_, S> {
             }
         } else {
             let lead = bx.min[axis];
+            // The nearest obstacle face below (minus infinity when none).
+            let mut plane = obstacles
+                .iter()
+                .filter(across)
+                .map(|o| o.max[axis])
+                .filter(|&max| max <= lead + eps)
+                .fold(f64::NEG_INFINITY, f64::max);
             // Layers whose top plane the leading face has not passed, down to the last one the
-            // moved face enters.
+            // moved face enters, and only those whose top is not below the obstacle (a block
+            // flush with it is the one reported as ground).
             let first = (lead + eps).floor() as i64 - 1;
-            let last = (lead + d).floor() as i64;
-            let mut plane = f64::NEG_INFINITY;
+            let mut last = (lead + d).floor() as i64;
+            if plane > f64::NEG_INFINITY {
+                last = last.max(plane.ceil() as i64 - 1);
+            }
             let mut block = None;
             let mut layer = first;
             while layer >= last {
@@ -379,12 +441,6 @@ impl<S: VoxelSource + ?Sized> Grid<'_, S> {
                     break;
                 }
                 layer -= 1;
-            }
-            for o in obstacles.iter().filter(|o| across(o)) {
-                if o.max[axis] <= lead + eps && o.max[axis] > plane {
-                    plane = o.max[axis];
-                    block = None;
-                }
             }
             if plane > lead + d {
                 let ground = match block {

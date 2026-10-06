@@ -193,8 +193,14 @@ impl BlockPos {
 /// vector gives bit-identical results.
 ///
 /// Canonical form: every `frac` component in `[0, 1)` and every `block` coordinate within
-/// `-MAX_BLOCK_COORD..=MAX_BLOCK_COORD`. Constructors and [`WorldPos::offset`] return canonical
-/// values; a value built field by field is made canonical by [`WorldPos::normalize`].
+/// `-MAX_BLOCK_COORD..=MAX_BLOCK_COORD + 31` (the blocks of the chunks inside the world limit,
+/// [`MAX_CHUNK_COORD`]). Constructors and [`WorldPos::offset`] return canonical values; a value
+/// built field by field is made canonical by [`WorldPos::normalize`].
+///
+/// A position past the world limit is clamped onto it: to the min corner of block
+/// `-MAX_BLOCK_COORD` on the negative side, and to just below the max corner of block
+/// `MAX_BLOCK_COORD + 31` on the positive side (`frac = 1 - 2^-53`). It never wraps back inside
+/// the last block.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct WorldPos {
     /// The voxel containing the position.
@@ -224,8 +230,10 @@ impl WorldPos {
         Self::from_block(BlockPos::default(), p)
     }
 
-    /// As an `f64` position: `block + frac`, rounded once. This is the only lossy conversion; the
-    /// error grows with the distance to the origin like any `f64` (see [`MAX_CHUNK_COORD`]).
+    /// As an `f64` position: `block + frac`. This is the only lossy conversion; the error grows
+    /// with the distance to the origin like any `f64` (see [`MAX_CHUNK_COORD`]). It is rounded
+    /// once while `|block| <= 2^53`; beyond, the block itself rounds first, so the result can be
+    /// one `f64` step (2 voxels or more there) from the nearest `f64`.
     pub fn to_dvec3(self) -> DVec3 {
         self.block.as_i64vec3().as_dvec3() + self.frac
     }
@@ -262,8 +270,9 @@ impl WorldPos {
 
     /// The canonical form of this position: per axis, `block += floor(frac)` and
     /// `frac -= floor(frac)`, then the carry when `frac - floor(frac)` rounded up to 1 (a tiny
-    /// negative `frac`), then the clamp to the world limit. Exact except as described in
-    /// [`WorldPos::from_dvec3`], which also says how non-finite components are replaced.
+    /// negative `frac`), then the clamp of the position to the world limit (see [`WorldPos`]).
+    /// Exact except as described in [`WorldPos::from_dvec3`], which also says how non-finite
+    /// components are replaced.
     pub fn normalize(self) -> Self {
         let (x, fx) = normalize_axis(self.block.x, self.frac.x);
         let (y, fy) = normalize_axis(self.block.y, self.frac.y);
@@ -282,6 +291,13 @@ impl From<BlockPos> for WorldPos {
     }
 }
 
+/// The last block inside the world limit on the positive side: the last block of chunk
+/// [`MAX_CHUNK_COORD`].
+const LAST_BLOCK: i64 = MAX_BLOCK_COORD + CHUNK_MASK as i64;
+
+/// The largest `frac`, `1 - 2^-53`: where a position clamped to the positive limit stays.
+const LAST_FRAC: f64 = 1.0 - f64::EPSILON / 2.0;
+
 /// One axis of [`WorldPos::normalize`].
 fn normalize_axis(block: i64, frac: f64) -> (i64, f64) {
     let whole = frac.floor();
@@ -295,7 +311,15 @@ fn normalize_axis(block: i64, frac: f64) -> (i64, f64) {
     } else if frac.is_nan() {
         frac = 0.0;
     }
-    (block.clamp(-MAX_BLOCK_COORD, MAX_BLOCK_COORD), frac)
+    // Clamp the position, not only the block: keeping `frac` would wrap a position past the
+    // limit back inside the last block.
+    if block > LAST_BLOCK {
+        (LAST_BLOCK, LAST_FRAC)
+    } else if block < -MAX_BLOCK_COORD {
+        (-MAX_BLOCK_COORD, 0.0)
+    } else {
+        (block, frac)
+    }
 }
 
 /// Position inside a chunk; packed index `(y << 10) | (x << 5) | z`.

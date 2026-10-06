@@ -207,6 +207,12 @@ fn world_pos_splits_exactly_far_away() {
             assert_eq!(WorldPos::from(p.block).frac, DVec3::ZERO);
         }
     }
+    // The last block of the last chunk inside the limit too.
+    let last = BlockPos::new(MAX_BLOCK_COORD + 31, 0, 0);
+    for f in FRACS {
+        let p = WorldPos::from_block(last, DVec3::splat(f));
+        assert_eq!((p.block, p.frac), (last, DVec3::splat(f)));
+    }
     assert_eq!(
         WorldPos::from_block(BlockPos::new(MAX_BLOCK_COORD, 0, 0), DVec3::splat(0.5))
             .to_dvec3()
@@ -241,23 +247,41 @@ fn normalize_carries_a_frac_that_rounds_up_to_one() {
 
 #[test]
 fn world_pos_clamps_to_the_world_limit_and_never_panics() {
+    // The world's blocks: those of the chunks inside the limit, -2^61 ..= 2^61 + 31. A position
+    // past them stops on the limit: the min corner on the negative side, just below the max
+    // corner (frac 1 - 2^-53) on the positive side.
+    let last = MAX_BLOCK_COORD + 31;
+    let top = 1.0 - f64::EPSILON / 2.0;
     let p = WorldPos::from_dvec3(DVec3::new(1e300, -1e300, f64::NAN));
-    assert_eq!(p.block, BlockPos::new(MAX_BLOCK_COORD, -MAX_BLOCK_COORD, 0));
-    assert_eq!(p.frac, DVec3::ZERO);
+    assert_eq!(p.block, BlockPos::new(last, -MAX_BLOCK_COORD, 0));
+    assert_eq!(p.frac, DVec3::new(top, 0.0, 0.0));
     let p = WorldPos::from_dvec3(DVec3::new(f64::INFINITY, f64::NEG_INFINITY, 0.5));
-    assert_eq!(p.block, BlockPos::new(MAX_BLOCK_COORD, -MAX_BLOCK_COORD, 0));
-    assert_eq!(p.frac, DVec3::new(0.0, 0.0, 0.5));
-    let edge = WorldPos::from(BlockPos::new(MAX_BLOCK_COORD, -MAX_BLOCK_COORD, 0));
-    let out = edge.offset(DVec3::new(10.5, -10.5, 0.0));
-    assert_eq!(out.block, edge.block, "clamped");
-    assert_eq!(out.frac, DVec3::new(0.5, 0.5, 0.0));
+    assert_eq!(p.block, BlockPos::new(last, -MAX_BLOCK_COORD, 0));
+    assert_eq!(p.frac, DVec3::new(top, 0.0, 0.5));
+    // Every block of the last chunk is reachable.
+    let inside = WorldPos::from(BlockPos::new(MAX_BLOCK_COORD, 0, 0)).offset(DVec3::X * 31.25);
+    assert_eq!((inside.block.x, inside.frac.x), (last, 0.25));
+    // A move past the limit stops on it and never wraps back inside the last block: before the
+    // fix, 0.9 + 0.2 gave frac 0.1 in the same block (0.8 backward).
+    let edge = WorldPos::from_block(
+        BlockPos::new(last, -MAX_BLOCK_COORD, 0),
+        DVec3::new(0.9, 0.1, 0.0),
+    );
+    for d in [0.2, 10.5] {
+        let out = edge.offset(DVec3::new(d, -d, 0.0));
+        assert_eq!(out.block, edge.block, "clamped");
+        assert_eq!(out.frac, DVec3::new(top, 0.0, 0.0));
+        let moved = edge.delta_to(&out);
+        assert!(moved.x > 0.0 && moved.x <= d, "{moved:?}");
+        assert!(moved.y < 0.0 && moved.y >= -d, "{moved:?}");
+    }
     // Any i64 block: no overflow anywhere.
     let wild = WorldPos {
         block: BlockPos::new(i64::MAX, i64::MIN, 0),
         frac: DVec3::new(5.0, -5.0, 0.0),
     };
     let n = wild.normalize();
-    assert_eq!(n.block, BlockPos::new(MAX_BLOCK_COORD, -MAX_BLOCK_COORD, 0));
+    assert_eq!(n.block, BlockPos::new(last, -MAX_BLOCK_COORD, 0));
     let d = wild.delta_to(&WorldPos::default());
     assert!(d.is_finite(), "{d:?}");
 }

@@ -68,6 +68,8 @@ fn sweep_course(base: I64Vec3) -> Vec<Result<SweepStep, I64Vec3>> {
         DVec3::new(-3.0, -2.0, 4.0),
         DVec3::new(3.25, -1.0, -8.5),
         DVec3::new(0.0, -0.5, 0.0),
+        // Into the pool (x 1..3, z -5..-3).
+        DVec3::new(1.0, -0.0078125, -4.0),
         DVec3::new(0.4, 0.0, 0.3),
     ];
     let mut pos = WorldPos::from_block(at(base, 0, 5, 0), DVec3::new(0.3, 0.25, 0.7));
@@ -77,7 +79,7 @@ fn sweep_course(base: I64Vec3) -> Vec<Result<SweepStep, I64Vec3>> {
             // A block placed into the body: the next move starts by pushing it out.
             world.set(pos.block, STONE);
         }
-        if i == 9 {
+        if i == 10 {
             // The body's chunk unloads: the move must stop.
             world.set_unloaded(ChunkPos::containing(pos.block), true);
         }
@@ -108,6 +110,7 @@ fn sweeps_are_bit_identical_at_any_shift() {
     let ok: Vec<&SweepStep> = reference.iter().filter_map(|s| s.as_ref().ok()).collect();
     assert!(ok.iter().any(|s| s.3 & 1 << 1 != 0), "landed");
     assert!(ok.iter().any(|s| s.3 & 0b11_1100 != 0), "hit a wall");
+    assert!(ok.iter().any(|s| s.5), "swam");
     assert!(ok.iter().any(|s| s.6), "pushed out");
     assert!(
         reference.last().is_some_and(Result::is_err),

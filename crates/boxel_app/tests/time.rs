@@ -269,6 +269,21 @@ fn the_step_limit_can_be_lowered() {
 }
 
 #[test]
+fn the_overstep_fraction_is_also_given_in_f64() {
+    let mut fixed = FixedTime::default();
+    let step = fixed.timestep();
+    fixed.accumulate(step * 3 / 4);
+    assert_eq!(fixed.overstep_fraction_f64(), 0.75);
+    assert_eq!(fixed.overstep_fraction(), 0.75);
+    // A third of a step (5 208 333 of 15 625 000 ns): f64 keeps what f32 rounds away.
+    let mut fixed = FixedTime::default();
+    fixed.accumulate(step / 3);
+    let exact = 5_208_333.0 / 15_625_000.0;
+    assert!((fixed.overstep_fraction_f64() - exact).abs() < 1e-15);
+    assert!((f64::from(fixed.overstep_fraction()) - exact).abs() > 1e-12);
+}
+
+#[test]
 #[should_panic(expected = "at least one step per frame")]
 fn a_step_limit_of_zero_is_rejected() {
     FixedTime::default().set_max_steps_per_frame(0);
@@ -293,6 +308,7 @@ fn before_and_after_fixed_main_loop_wrap_the_steps_of_each_frame() {
                     // The frame view of Time is back; the leftover is less than one step.
                     assert!(time.delta() == Duration::ZERO || time.delta() == MS * 40);
                     assert!(fixed.overstep_fraction() < 1.0);
+                    assert!((0.0..1.0).contains(&fixed.overstep_fraction_f64()));
                     log.0.push("after");
                 })
                 .in_set(RunFixedMainLoopSystems::AfterFixedMainLoop),

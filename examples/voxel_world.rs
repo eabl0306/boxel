@@ -2,14 +2,17 @@
 //!
 //! `cargo run --release --example voxel_world -- [GPU options] [options]` (see `--help`).
 //! Interactive by default: left click grabs the mouse, WASD/Space/`ShiftLeft` fly, `ControlLeft`
-//! boosts, Escape releases the cursor, F3 toggles the debug overlay, F5 cycles the frame limit
-//! (30, 60, 144, 240, unlimited) and F6 toggles vsync. While the mouse is grabbed, left click
-//! breaks the block under the crosshair and right click places the selected block on the face
-//! it points at (keys 1 to 9 select it; F3 shows the target and the selection). Picking is a
-//! voxel raycast from the camera (`PhysicsQuery::raycast_voxels`), reach 6 blocks. `--frames`, `--duration`, `--screenshot`,
-//! `--minimize-test`, `--resize-test`, `--vsync-test` and the like make it close by itself
-//! (`--duration` keeps the interactive path: fly camera on, nothing rendered while hidden); the
-//! last summary line gives the update and presented frame rates and the CPU use (Linux).
+//! boosts, Escape (or leaving the window) releases the cursor, F3 toggles the debug overlay, F5
+//! cycles the frame limit (30, 60, 144, 240, unlimited) and F6 toggles vsync. While the mouse is
+//! grabbed, left click breaks the block under the crosshair and right click places the selected
+//! block on the face it points at (keys 1 to 9 select it; F3 shows the target and the
+//! selection). Picking is a voxel raycast from the camera (`PhysicsQuery::raycast_voxels`),
+//! reach 6 blocks.
+//!
+//! `--frames`, `--duration`, `--screenshot`, `--minimize-test`, `--resize-test`, `--vsync-test`
+//! and the like make it close by itself (`--duration` keeps the interactive path: fly camera
+//! on, nothing rendered while hidden); the last summary line gives the update and presented
+//! frame rates and the CPU use (Linux).
 //!
 //! Exit codes: 0 success, 1 usage error, 2 no usable GPU, 3 check failed (screenshot, image
 //! diff, resize, minimize), 4 timeout.
@@ -1149,7 +1152,8 @@ fn picking_lines(picking: &Picking, registry: &BlockRegistry) -> [String; 2] {
 
 /// Picks the block under the screen center (a voxel raycast from the active camera) and applies
 /// this frame's click. Runs before the fly camera, so the cursor state is the one the click was
-/// made with, and before `WorldSystems::Edits`, so the edit shows this frame.
+/// made with, and before the world's systems (`WorldSystems::Interest`, then `Edits`), so it
+/// reads the map unambiguously and the edit shows this frame.
 fn pick_blocks(
     physics: PhysicsQuery,
     cameras: Query<(&Camera, &Transform)>,
@@ -1214,7 +1218,7 @@ impl Plugin for PickingPlugin {
             Update,
             pick_blocks
                 .before(FlyCameraSystems)
-                .before(WorldSystems::Edits),
+                .before(WorldSystems::Interest),
         );
     }
 
@@ -1330,9 +1334,9 @@ fn main() -> AppExit {
         FlyCameraPlugin,
         PhysicsPlugin,
         PickingPlugin,
-    ))
+    ));
     // The camera moves first; the world then computes interest from the new position.
-    .configure_sets(Update, FlyCameraSystems.before(WorldSystems::Interest))
+    app.configure_sets(Update, FlyCameraSystems.before(WorldSystems::Interest))
         .insert_resource(Run::new(options))
         .init_resource::<FixedSteps>()
         .add_systems(Startup, spawn_camera)
@@ -1437,15 +1441,20 @@ mod tests {
         assert_eq!(interactive.timeout, None, "a plain run has no timeout");
     }
 
-    /// A headless app with the world (stone y 0..=2, grass at y = 3, inline jobs), physics and
-    /// picking, settled; the cursor is grabbed and a camera at (0.5, 6, 0.5) looks straight down
-    /// at the grass (top face at y = 4).
+    /// A headless app with the world (stone y 0..=2, grass at y = 3, inline jobs), physics,
+    /// the fly camera and picking, settled; the cursor is free and a fly camera at (0.5, 6, 0.5)
+    /// looks straight down at the grass (top face at y = 4). `Update` is strict about
+    /// ambiguities, so picking must be ordered against the fly camera's grab (both use
+    /// `CursorOptions`).
     fn picking_app() -> App {
+        use boxel::ecs::schedule::{LogLevel, ScheduleBuildSettings};
         use boxel::world::jobs::InlineExecutor;
         use boxel::worldgen::FlatGenerator;
         let mut app = App::new();
         app.add_plugins((
+            TimePlugin,
             InputPlugin,
+            FlyCameraPlugin,
             WorldPlugin {
                 generator: std::sync::Arc::new(FlatGenerator::new(vec![
                     ("boxel:stone".to_string(), 3),
@@ -1457,14 +1466,21 @@ mod tests {
             PhysicsPlugin,
             PickingPlugin,
         ))
-        .insert_resource(CursorOptions {
-            grab: CursorGrab::Locked,
-            visible: false,
-        })
-        .init_resource::<OverlayLines>();
+        .init_resource::<OverlayLines>()
+        .edit_schedule(Update, |schedule| {
+            schedule.set_build_settings(ScheduleBuildSettings {
+                ambiguity_detection: LogLevel::Error,
+                ..ScheduleBuildSettings::default()
+            });
+        });
+        let pitch = -std::f32::consts::FRAC_PI_2;
         app.world_mut().spawn((
             Camera::default(),
-            Transform::from_yaw_pitch(DVec3::new(0.5, 6.0, 0.5), 0.0, -std::f32::consts::FRAC_PI_2),
+            FlyCamera {
+                pitch,
+                ..FlyCamera::default()
+            },
+            Transform::from_yaw_pitch(DVec3::new(0.5, 6.0, 0.5), 0.0, pitch),
             ChunkViewer::new(1).with_vertical_radius(1),
         ));
         app.finish();
@@ -1497,13 +1513,23 @@ mod tests {
         app.world().resource::<ChunkMap>().block_at(pos)
     }
 
+    fn grab(app: &App) -> CursorGrab {
+        app.world().resource::<CursorOptions>().grab
+    }
+
     #[test]
     fn clicks_break_and_place_the_picked_block() {
-        use boxel::window::{ButtonState, KeyboardInput};
+        use boxel::window::{ButtonState, KeyboardInput, WindowFocused};
         let mut app = picking_app();
         let grass = BlockRegistry::default_blocks()
             .by_name("boxel:grass")
             .expect("built-in");
+        // The first click only grabs the cursor (the fly camera does it in the same frame,
+        // after picking): the grass stays.
+        assert_eq!(grab(&app), CursorGrab::None);
+        click(&mut app, MouseButton::Left);
+        assert_eq!(grab(&app), CursorGrab::Locked);
+        assert_eq!(block_at(&app, BlockPos::new(0, 3, 0)), Some(grass));
         let target = app
             .world()
             .resource::<Picking>()
@@ -1554,12 +1580,13 @@ mod tests {
             Some("Place [3] boxel:grass  (keys 1-9)")
         );
 
-        // A click while the cursor is free only grabs it (in the real app): no edit.
-        app.insert_resource(CursorOptions {
-            grab: CursorGrab::None,
-            visible: true,
-        });
+        // Alt-tab frees the cursor; the click that focuses the window again only grabs it.
+        app.world_mut().write_message(WindowFocused(false));
+        app.update();
+        assert_eq!(grab(&app), CursorGrab::None);
+        app.world_mut().write_message(WindowFocused(true));
         click(&mut app, MouseButton::Left);
+        assert_eq!(grab(&app), CursorGrab::Locked);
         assert_eq!(block_at(&app, BlockPos::new(0, 3, 0)), Some(grass));
     }
 

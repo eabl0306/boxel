@@ -244,12 +244,22 @@ impl FixedTime {
     pub fn elapsed(&self) -> Duration {
         self.elapsed
     }
-    /// `accumulator / timestep`, in `[0, 1)` after a frame's steps (interpolation factor).
+    /// `accumulator / timestep`, in `[0, 1)` after a frame's steps (interpolation factor), in
+    /// `f32`. For `f64` positions use [`FixedTime::overstep_fraction_f64`].
     pub fn overstep_fraction(&self) -> f32 {
         if self.timestep.is_zero() {
             0.0
         } else {
             self.accumulator.as_secs_f32() / self.timestep.as_secs_f32()
+        }
+    }
+    /// [`FixedTime::overstep_fraction`] in `f64` (Bevy's name): the interpolation factor for
+    /// `f64` positions (physics), with no `f32` rounding.
+    pub fn overstep_fraction_f64(&self) -> f64 {
+        if self.timestep.is_zero() {
+            0.0
+        } else {
+            self.accumulator.as_secs_f64() / self.timestep.as_secs_f64()
         }
     }
     /// Adds frame time to the accumulator.

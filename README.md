@@ -43,8 +43,10 @@ cargo run --release --example voxel_world
 just run voxel_world --tier mid
 ```
 
-Controles: clic izquierdo captura el mouse, Escape lo suelta. WASD para moverse, Espacio sube,
-Shift izquierdo baja, Ctrl izquierdo acelera. F3 muestra el overlay de debug, F5 cambia el límite
+Controles: clic izquierdo captura el mouse, Escape (o salir de la ventana) lo suelta. WASD para
+moverse, Espacio sube, Shift izquierdo baja, Ctrl izquierdo acelera. Con el mouse capturado, clic
+izquierdo rompe el bloque de la mira y clic derecho pone el bloque elegido (teclas 1 a 9), a 6
+bloques como máximo. F3 muestra el overlay de debug (con el bloque apuntado), F5 cambia el límite
 de FPS (30, 60, 144, 240, sin límite) y F6 prende o apaga el vsync.
 
 Opciones útiles: `--fps-limit N` (0 = sin límite), `--vsync on|off`, `--seed N`,

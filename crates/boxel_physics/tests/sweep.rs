@@ -1,14 +1,14 @@
 //! The per-axis AABB sweep (`move_box`): exact landing, the axis order, no snags at block and
-//! chunk seams, resting without drift, depenetration, obstacles, fluids, unloaded chunks, and a
-//! proptest over random block fields.
+//! chunk seams, resting without drift, depenetration, obstacles, fluids, unloaded chunks, the
+//! world limit, degenerate inputs, and a proptest over random block fields.
 mod common;
 
 use boxel_math::{DVec3, I64Vec3};
 use boxel_physics::{
-    CollisionTable, LocalBox, MAX_SWEEP_DISTANCE, SweepConfig, SweepOut, TestWorld, Unloaded,
-    VoxelSource, axis_order, move_box,
+    CollisionTable, LocalBox, MAX_SWEEP_DISTANCE, Probe, Shape, SweepConfig, SweepOut, TestWorld,
+    Unloaded, VoxelSource, axis_order, move_box,
 };
-use boxel_voxel::{BlockPos, ChunkPos, Face, WorldPos};
+use boxel_voxel::{BlockPos, ChunkPos, Face, MAX_BLOCK_COORD, WorldPos};
 use common::{STONE, WATER, at, fill, player, random_field, table};
 use proptest::prelude::*;
 
@@ -351,6 +351,178 @@ fn bad_displacements_are_sanitized() {
     assert_eq!(out.moved.x, MAX_SWEEP_DISTANCE);
 }
 
+#[test]
+fn obstacles_stop_the_scan_before_unloaded_chunks() {
+    let mut world = TestWorld::new();
+    world.set_unloaded(ChunkPos::new(1, 0, 0), true);
+    world.set_unloaded(ChunkPos::new(0, -1, 0), true);
+    let run = |world: &mut TestWorld, start: WorldPos, d: DVec3, obstacle: Option<LocalBox>| {
+        let frame = start.block.as_i64vec3().as_dvec3();
+        let obstacles: Vec<LocalBox> = obstacle.into_iter().map(|o| o.translate(-frame)).collect();
+        move_box(
+            world,
+            &table(),
+            start,
+            narrow(),
+            d,
+            &obstacles,
+            &SweepConfig::default(),
+        )
+    };
+    // +X: a crate 0.25 ahead, the unloaded chunk x >= 32 0.375 ahead. The box stops at the
+    // crate and never needs the chunk behind it.
+    let start = WorldPos::from_dvec3(DVec3::new(31.375, 0.0, 0.5));
+    let crate_box = LocalBox::new(DVec3::new(31.875, 0.0, 0.0), DVec3::new(32.5, 1.0, 1.0));
+    let d = DVec3::new(0.75, 0.0, 0.0);
+    assert_eq!(
+        run(&mut world, start, d, None).unwrap_err(),
+        Unloaded {
+            block: BlockPos::new(32, 0, 0)
+        },
+        "nothing in front: the move needs the chunk"
+    );
+    let out = run(&mut world, start, d, Some(crate_box)).expect("the crate is nearer");
+    assert_eq!(out.end.to_dvec3().x, 31.625);
+    assert!(out.touched(Face::PosX));
+    // -Y: a crate top at y = 0.25 under the box, the unloaded chunk y < 0 below it.
+    let start = WorldPos::from_dvec3(DVec3::new(0.5, 0.5, 0.5));
+    let crate_box = LocalBox::new(DVec3::new(0.0, -1.0, 0.0), DVec3::new(1.0, 0.25, 1.0));
+    let d = DVec3::new(0.0, -1.0, 0.0);
+    assert_eq!(
+        run(&mut world, start, d, None).unwrap_err(),
+        Unloaded {
+            block: BlockPos::new(0, -1, 0)
+        }
+    );
+    let out = run(&mut world, start, d, Some(crate_box)).expect("the crate is nearer");
+    assert_eq!(out.end.to_dvec3().y, 0.25);
+    assert!(out.on_ground());
+    assert_eq!(out.ground, None);
+    // A block flush with the crate top is still scanned: it is the ground.
+    world.set_unloaded(ChunkPos::new(0, -1, 0), false);
+    world.set(BlockPos::new(0, -1, 0), STONE);
+    let flush = LocalBox::new(DVec3::new(0.0, -1.0, 0.0), DVec3::new(1.0, 0.0, 1.0));
+    let out = run(&mut world, start, d, Some(flush)).expect("loaded");
+    assert_eq!(out.end.to_dvec3().y, 0.0);
+    assert_eq!(out.ground, Some(BlockPos::new(0, -1, 0)));
+}
+
+#[test]
+fn moves_past_the_world_limit_stop_on_it() {
+    let mut world = TestWorld::new();
+    let last = MAX_BLOCK_COORD + 31;
+    // 0.9 + 0.2 in the last block: the end is clamped just below the limit and `moved` says
+    // what happened (before, the end wrapped to frac 0.1 while `moved` said +0.2).
+    let start = WorldPos::from_block(BlockPos::new(last, 0, 0), DVec3::new(0.9, 0.5, 0.5));
+    let out = sweep(&mut world, start, narrow(), DVec3::new(0.2, 0.0, 0.0)).expect("loaded");
+    assert_eq!(out.end.block, start.block);
+    assert_eq!(out.end.frac.x, 1.0 - f64::EPSILON / 2.0);
+    assert_eq!(out.moved, start.delta_to(&out.end));
+    assert!(out.moved.x > 0.09 && out.moved.x < 0.1, "{:?}", out.moved);
+    // The negative side stops on the min corner of the first block.
+    let start = WorldPos::from_block(
+        BlockPos::new(-MAX_BLOCK_COORD, 0, 0),
+        DVec3::new(0.125, 0.5, 0.5),
+    );
+    let out = sweep(&mut world, start, narrow(), DVec3::new(-2.0, 0.0, 0.0)).expect("loaded");
+    assert_eq!((out.end.block, out.end.frac.x), (start.block, 0.0));
+    assert_eq!(out.moved.x, -0.125);
+}
+
+/// Every block is stone, everywhere.
+struct Solid;
+
+impl VoxelSource for Solid {
+    fn probe(&mut self, _: BlockPos) -> Probe {
+        Probe::Block(STONE)
+    }
+}
+
+#[test]
+fn degenerate_shapes_starts_and_configs_are_sanitized() {
+    let mut world = TestWorld::new();
+    floor(&mut world, I64Vec3::ZERO, 0, 3);
+    fill(&mut world, I64Vec3::ZERO, [3, 0, -3], [3, 4, 3], STONE);
+    fill(&mut world, I64Vec3::ZERO, [-3, 5, -3], [3, 5, 3], STONE);
+    // Thinner than 2 eps (a tiny sphere, a point, a NaN box): widened to 4 eps around the
+    // center, so they land, hit walls and ceilings and rest there instead of slipping through.
+    let shapes = [
+        Shape::Sphere { radius: 1e-9 }.bounds(),
+        LocalBox::default(),
+        LocalBox::new(DVec3::NAN, DVec3::ONE),
+    ];
+    for shape in shapes {
+        for x in [0.5, 1.0] {
+            let start = WorldPos::from_dvec3(DVec3::new(x, 3.0, 0.5));
+            let out = sweep(&mut world, start, shape, DVec3::new(0.0, -5.0, 0.0)).expect("loaded");
+            assert!(out.on_ground(), "{shape:?} at x = {x}");
+            assert!((out.end.to_dvec3().y - 2e-7).abs() < 1e-12, "{:?}", out.end);
+            let out = sweep(&mut world, start, shape, DVec3::new(5.0, 0.0, 0.0)).expect("loaded");
+            assert!(out.touched(Face::PosX) && out.end.to_dvec3().x < 3.0);
+            let up = sweep(&mut world, start, shape, DVec3::new(0.0, 5.0, 0.0)).expect("loaded");
+            assert!(up.touched(Face::PosY) && up.end.to_dvec3().y < 5.0);
+            let rest = sweep(&mut world, up.end, shape, DVec3::ZERO).expect("loaded");
+            assert!(!rest.depenetrated && rest.end == up.end, "{shape:?}");
+        }
+    }
+    // A start outside the canonical form is normalized first, like the raycast's origin.
+    let canonical = WorldPos::from_dvec3(DVec3::new(0.5, 3.25, 0.5));
+    let reference = sweep(&mut world, canonical, player(), DVec3::new(0.0, -5.0, 0.0));
+    let hand_built = WorldPos {
+        block: BlockPos::new(0, 1, 0),
+        frac: DVec3::new(0.5, 2.25, 0.5),
+    };
+    assert_eq!(
+        sweep(&mut world, hand_built, player(), DVec3::new(0.0, -5.0, 0.0)),
+        reference
+    );
+    let nan = WorldPos {
+        block: BlockPos::new(0, 3, 0),
+        frac: DVec3::new(0.5, f64::NAN, 0.5),
+    };
+    assert_eq!(
+        sweep(&mut world, nan, player(), DVec3::ZERO)
+            .expect("loaded")
+            .end
+            .frac
+            .y,
+        0.0
+    );
+    // A block past the i64 room of the frame: clamped to the world limit, no overflow.
+    let far = WorldPos {
+        block: BlockPos::new(i64::MAX, i64::MIN, 0),
+        frac: DVec3::splat(0.5),
+    };
+    let out = sweep(&mut world, far, player(), DVec3::ONE).expect("loaded");
+    assert_eq!(out.end.block.x, MAX_BLOCK_COORD + 31);
+    // Configs: NaN, negative and infinite values are clamped; an infinite push-out inside
+    // solid stone used to search for ever.
+    let start = WorldPos::from_dvec3(DVec3::new(0.5, 0.5, 0.5));
+    for (eps, max_depenetration, pushed) in [
+        (f64::NAN, f64::INFINITY, MAX_SWEEP_DISTANCE),
+        (-1.0, f64::NAN, 0.0),
+        (f64::INFINITY, -3.0, 0.0),
+        (1e-7, 2.0, 2.0),
+    ] {
+        let cfg = SweepConfig {
+            eps,
+            max_depenetration,
+        };
+        let out = move_box(
+            &mut Solid,
+            &table(),
+            start,
+            player(),
+            DVec3::ZERO,
+            &[],
+            &cfg,
+        )
+        .expect("loaded");
+        assert!(out.depenetrated);
+        assert_eq!(out.moved, DVec3::new(0.0, pushed, 0.0), "{cfg:?}");
+    }
+}
+
 // ---------------------------------------------------------------- proptest
 
 /// Full blocks overlapping `bx` by more than `eps` on every axis.
@@ -366,7 +538,7 @@ fn overlaps_full(
         for x in lo(bx.min.x)..=hi(bx.max.x) {
             for z in lo(bx.min.z)..=hi(bx.max.z) {
                 let p = BlockPos::new(origin.x + x, origin.y + y, origin.z + z);
-                if let boxel_physics::Probe::Block(s) = world.probe(p)
+                if let Probe::Block(s) = world.probe(p)
                     && table.is_full(s)
                 {
                     return true;

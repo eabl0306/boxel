@@ -17,8 +17,8 @@ Decisiones del dueño (2026-10-06):
   avisa cuándo empieza y termina el contacto).
 - Sin motores de física de terceros.
 
-Hubo dos propuestas (A y B, en `.claude/plans/light-physics-proposals.json`) y una revisión que
-eligió A como base y le sumó cinco piezas de B (`.claude/plans/physics-plan.md`).
+Hubo dos propuestas de diseño (A y B) y una revisión que eligió A como base y le sumó cinco
+piezas de B; la comparación está en "Alternativas descartadas".
 
 Dos datos del código pesan en el diseño:
 
@@ -38,8 +38,8 @@ Dos datos del código pesan en el diseño:
     tabla de colisión, fuentes de vóxeles, formas, barrido y raycast.
   - La capa ECS: `ChunkSource`, `PhysicsPlugin` y el `SystemParam` `PhysicsQuery`.
 
-  La fachada tiene la feature `physics` (implica `voxel`), activada por defecto. El crate se
-  compila siempre, pero `PhysicsPlugin` no está en `DefaultPlugins`: cada juego lo agrega.
+  La fachada tiene la feature `physics` (implica `voxel`), activada por defecto: el crate se
+  compila con ella. `PhysicsPlugin` no está en `DefaultPlugins`: cada juego lo agrega.
 
 - **2. Posiciones exactas en cualquier lugar del mundo.** `boxel_voxel::WorldPos { block:
   BlockPos, frac: DVec3 }`: el bloque en `i64` más el desplazamiento dentro de él, con `frac` en
@@ -47,7 +47,9 @@ Dos datos del código pesan en el diseño:
   cajas enteras exactas y la tolerancia de `1e-7` vale igual en el origen y en `2^61`. La
   diferencia entre dos posiciones resta primero los bloques en `i64` (`delta_to`). `Transform`
   pasa a ser una vista de la posición, con el único redondeo del sistema. Consecuencia que se
-  prueba: la misma escena corrida por un vector entero da resultados idénticos bit a bit.
+  prueba: la misma escena corrida por un vector entero da resultados idénticos bit a bit. Los
+  bloques de un `WorldPos` van de `-2^61` a `2^61 + 31` (los de los chunks dentro del límite);
+  una posición que se pasa queda sobre el límite, sin volver al último bloque.
 
 - **3. Colisión con vóxeles: el recorte por ejes de Minecraft.** `move_box` mueve una caja por un
   desplazamiento, un eje por vez: primero Y, después el mayor de X y Z (X si empatan). En cada
@@ -62,6 +64,12 @@ Dos datos del código pesan en el diseño:
   Si la caja empieza dentro de bloques llenos (un bloque puesto encima de un cuerpo), primero se
   la empuja hacia el lado libre más cercano a un bloque o menos (desempate +Y, -Y, +X, -X, +Z,
   -Z); si no hay ninguno, un bloque hacia arriba.
+
+  Las cajas obstáculo se miran antes que los bloques: el recorrido por capas se corta en el
+  obstáculo más cercano, así un chunk sin cargar detrás de él no frena el movimiento. Las
+  entradas raras tienen un resultado definido: una forma más fina que `2 * eps` se ensancha a
+  `4 * eps` (una esfera diminuta no se cuela entre bloques), el inicio se normaliza y `eps` y el
+  empuje máximo se acotan.
 
   Las esferas chocan con los vóxeles como su caja envolvente en v1. Los rayos contra esferas sí
   son exactos.
@@ -85,22 +93,29 @@ Dos datos del código pesan en el diseño:
   `i64`. Cada eje guarda la distancia entera de su próximo plano al bloque de origen, y cada
   paso calcula `t = (plano - frac) * (1 / dir)` de cero en vez de acumular: el resultado no
   depende de la distancia recorrida ni de dónde empieza el rayo. Los empates (un rayo justo por
-  una arista o un vértice) avanzan x, después y, después z. Filtros: `Collision` (bloques
-  llenos), `Outline` (bloques con geometría, fluidos opcionales: para apuntar) y `Custom`. Un
-  rayo que empieza dentro de un bloque que acepta lo devuelve con `t = 0` y sin cara. El punto
-  de impacto queda exactamente sobre el plano de la cara.
+  una arista o un vértice) avanzan x, después y, después z: de los bloques que el rayo solo toca
+  en esa arista o vértice visita los de esa escalera (uno de los dos de una arista). Filtros:
+  `Collision` (bloques llenos), `Outline` (bloques con geometría, fluidos opcionales: para
+  apuntar) y `Custom`. Un rayo que empieza dentro de un bloque que acepta lo devuelve con
+  `t = 0` y sin cara. El punto de impacto queda exactamente sobre el plano de la cara. Todo rayo
+  termina: a lo sumo `MAX_RAY_DISTANCE` (4096) bloques por eje, y una dirección con NaN o
+  infinito solo mira el bloque de origen (antes, un `max_t` infinito por el aire de arriba
+  recorría `2^61` bloques).
 
 - **7. Determinismo.** Los floats solo pasan por `+ - * /`, `sqrt`, `floor`, `ceil`, `abs`,
   `min` y `max`, que IEEE 754 define igual en todas las plataformas. `crates/boxel_physics/
-  clippy.toml` prohíbe `mul_add` (FMA) y las funciones de libm (`powf`, `powi`, `exp`, `ln`,
-  `sin`, `cos` y parecidas) para `f64`, `f32` y los vectores de `glam`. Desde P3: pares y
+  clippy.toml` prohíbe `mul_add` (FMA), `powi` y todas las funciones de libm (`powf`, `exp`,
+  `ln`, `sin`, `atan2`, `hypot` y parecidas) para `f64` y `f32`, y lo mismo más los ayudantes de
+  ángulos y rotaciones (`angle_between`, `slerp`, `to_angle`...) para `DVec3`, `Vec3`, `DVec2` y
+  `Vec2`. Desde P3: pares y
   eventos en orden de `Entity`, mapas con `foldhash::FixedState` que nunca se recorren para
   ordenar, y paralelismo solo por cuerpo.
 
 - **8. Tiempo y orden.** Los pasos de física corren a 64 Hz en `FixedPostUpdate` (desde P2), así
   el gameplay de `FixedUpdate` no tiene que ordenarse contra ellos. `boxel_app` suma los sets
   `RunFixedMainLoopSystems::{BeforeFixedMainLoop, FixedMainLoop, AfterFixedMainLoop}` (los
-  nombres de Bevy) para muestrear la entrada antes de los pasos e interpolar después, y
+  nombres de Bevy) para muestrear la entrada antes de los pasos e interpolar después (con
+  `FixedTime::overstep_fraction_f64`, en `f64` como las posiciones), y
   `FixedTime::set_max_steps_per_frame` para bajar el tope de pasos por frame (8 por defecto; con
   muchos cuerpos se recomienda 3).
 
@@ -125,7 +140,8 @@ Hecho (P0 y P1):
   `normalize` (con el acarreo cuando un `frac` negativo diminuto redondea a 1, y sujeto al
   límite del mundo).
 - `boxel_app::RunFixedMainLoopSystems` (encadenados, con `run_fixed_main_loop` en
-  `FixedMainLoop`) y `FixedTime::set_max_steps_per_frame` (0 entra en pánico).
+  `FixedMainLoop`), `FixedTime::set_max_steps_per_frame` (0 entra en pánico) y
+  `FixedTime::overstep_fraction_f64`.
 - `boxel_physics`: `CollisionTable`, `VoxelSource`, `TestWorld`, `Shape` y `LocalBox` con rayos
   contra cajas y esferas, `move_box`, `raycast_voxels`, `ChunkSource`, `PhysicsPlugin` (arma la
   tabla en `Plugin::finish` desde `WorldContent`; sin `WorldPlugin` entra en pánico con un
@@ -133,33 +149,40 @@ Hecho (P0 y P1):
 - `voxel_world`: con el mouse capturado, clic izquierdo rompe el bloque apuntado y clic derecho
   pone el elegido (teclas 1 a 9) en la cara apuntada, con alcance de 6 bloques. F3 muestra el
   bloque apuntado, su cara y la selección, y hay una mira en el centro. Para eso `boxel_debug`
-  suma `OverlayLines` (líneas de las apps en el overlay) y `Crosshair`.
+  suma `OverlayLines` (líneas de las apps en el overlay) y `Crosshair`. La cámara libre suelta
+  el cursor al perder el foco, así el clic que vuelve a la ventana no rompe un bloque.
 
 Tests que lo vigilan:
 
-- `boxel_voxel/tests/far_coords.rs`: `WorldPos` exacto hasta el límite, el acarreo, la sujeción,
-  `delta_to` de punta a punta del mundo y una proptest de invariancia por traslación.
+- `boxel_voxel/tests/far_coords.rs`: `WorldPos` exacto hasta el límite, el acarreo, la sujeción
+  (sin volver atrás dentro del último bloque), `delta_to` de punta a punta del mundo y una
+  proptest de invariancia por traslación.
 - `boxel_app/tests/time.rs`: los sets antes y después corren una vez por frame alrededor de 0, 2
   o 3 pasos, y el tope se puede bajar.
 - `boxel_physics/tests/sweep.rs`: aterrizaje exacto en el plano, la regla del orden de ejes,
   deslizar por las seis superficies sin engancharse en bloques ni chunks (coordenadas
   negativas), 10 000 pasos apoyado sin cambiar un bit, despenetración (dirección y desempate),
-  obstáculos, fluidos, chunks sin cargar, y una proptest sobre campos aleatorios (0 a 60 % de
+  obstáculos (y chunks sin cargar detrás de ellos), fluidos, chunks sin cargar, el límite del
+  mundo, formas finas y entradas raras, y una proptest sobre campos aleatorios (0 a 60 % de
   piedra, movimientos de hasta 50 bloques): nunca termina dentro de un bloque, cada tramo por eje
   no cruza ninguno, cada cara marcada toca de verdad y nada se mueve más de lo pedido.
-- `boxel_physics/tests/raycast.rs`: el DDA contra un oráculo de fuerza bruta (prueba de slabs
-  contra cada bloque) en rayos aleatorios, y casos a mano (ejes, aristas, vértices, componentes
-  en cero, empezar dentro o sobre un borde, `max_t` inclusivo, chunks sin cargar, filtros,
-  almacenamiento uniforme contra empaquetado).
+- `boxel_physics/tests/raycast.rs`: el DDA contra un oráculo de fuerza bruta independiente
+  (slabs con división exacta contra cada bloque y la regla de empates escrita aparte): el camino
+  completo y el primer impacto, en rayos aleatorios y en rayos diádicos que pasan justo por
+  aristas y vértices. Casos a mano: ejes, aristas, vértices, componentes en cero o degeneradas,
+  empezar dentro o sobre un borde, `max_t` inclusivo, el tope de distancia, el aire fuera de los
+  límites verticales, chunks sin cargar, filtros, almacenamiento uniforme contra empaquetado.
 - `boxel_physics/tests/far_coords.rs`: un recorrido de barridos (caer, chocar, nadar, ser
   empujado afuera, congelarse) y rayos, corridos por 0, ±2^31, 2^40, 2^52 y ±(2^61 - 64) en cada
   eje y en los tres: idénticos bit a bit.
 - `boxel_physics/tests/query.rs`: `ChunkSource` sobre un `ChunkMap` real en cada estado (listo,
   uniforme, `Missing`, en cola, sin slot, fuera de los límites verticales) y `PhysicsQuery` desde
   un sistema.
-- `tests/ambiguity.rs`: ahora con `PhysicsPlugin` y estricto también en `RunFixedMainLoop` y
-  `FixedPostUpdate`.
-- `voxel_world`: un test sin ventana rompe y pone bloques con clics simulados.
+- `tests/ambiguity.rs`: ahora con `PhysicsPlugin` (con la feature `physics`) y estricto también
+  en `RunFixedMainLoop` y `FixedPostUpdate`.
+- `voxel_world`: un test sin ventana rompe y pone bloques con clics simulados, con la cámara
+  libre y `Update` estricto: el clic que captura el cursor (también al volver a la ventana) no
+  edita.
 - Cambiar el barrido para que saltee la última capa, o la cara del raycast, hace fallar las
   proptests (probado a mano).
 
@@ -176,8 +199,10 @@ tests).
 Cambios de API:
 
 - Nuevos: `boxel_voxel::WorldPos`, `boxel_app::RunFixedMainLoopSystems`,
-  `FixedTime::set_max_steps_per_frame`, el crate `boxel_physics` (`boxel::physics`, en el
-  prelude), `boxel_debug::{OverlayLines, Crosshair}`.
+  `FixedTime::set_max_steps_per_frame`, `FixedTime::overstep_fraction_f64`, el crate
+  `boxel_physics` (`boxel::physics`, en el prelude), `boxel_debug::{OverlayLines, Crosshair}`.
+- `FlyCameraPlugin` suelta el cursor cuando la ventana pierde el foco.
+- El ejemplo `voxel_world` pide la feature `physics`.
 - El prelude de `boxel_app` suma `FixedPostUpdate`, `RunFixedMainLoop` y
   `RunFixedMainLoopSystems`.
 - Un sistema agregado a `RunFixedMainLoop` sin set ahora queda ambiguo con el bucle: va en

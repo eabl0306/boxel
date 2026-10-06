@@ -178,7 +178,8 @@ test = true
 
 [[example]]
 name = "voxel_world"
-required-features = ["render", "voxel", "png"]
+# Block picking uses boxel::physics.
+required-features = ["render", "voxel", "png", "physics"]
 # Runs its option-parsing tests with `cargo test`.
 test = true
 

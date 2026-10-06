@@ -1,7 +1,7 @@
 //! The engine's systems are not ambiguous with each other.
 //!
 //! An app with the headless engine plugins, the fly camera, the world (inline jobs) and physics
-//! runs with `ambiguity_detection: LogLevel::Error` on `First`, `PreUpdate`, `RunFixedMainLoop`,
+//! (with the `physics` feature) runs with `ambiguity_detection: LogLevel::Error` on `First`, `PreUpdate`, `RunFixedMainLoop`,
 //! `FixedPostUpdate`, `Update`, `PostUpdate` and `Last`: building those schedules on the first
 //! `app.update()` panics on any pair of systems with conflicting access and no order between
 //! them. The first update runs one fixed step, so the fixed schedules are built too.
@@ -21,8 +21,9 @@
 //! `configure_sets(Update, FlyCameraSystems.before(WorldSystems::Interest))` (recommended for
 //! `voxel_world`); that order is tested here too.
 //!
-//! Needs the `window`, `voxel` and `physics` features (all in the default set).
-#![cfg(all(feature = "window", feature = "voxel", feature = "physics"))]
+//! Needs the `window` and `voxel` features (both in the default set); `physics` adds
+//! `PhysicsPlugin`.
+#![cfg(all(feature = "window", feature = "voxel"))]
 
 use boxel::app::{
     App, First, FixedPostUpdate, FixedTime, Last, PostUpdate, PreUpdate, RunFixedMainLoop,
@@ -33,7 +34,6 @@ use boxel::diagnostic::FrameStatsPlugin;
 use boxel::ecs::prelude::*;
 use boxel::ecs::schedule::{LogLevel, ScheduleBuildSettings};
 use boxel::math::DVec3;
-use boxel::physics::PhysicsPlugin;
 use boxel::transform::Transform;
 use boxel::voxel::{BlockPos, ChunkPos};
 use boxel::window::{ButtonInput, InputPlugin, KeyCode};
@@ -65,8 +65,9 @@ fn strict_app() -> App {
             executor: Arc::new(InlineExecutor),
             ..WorldPlugin::default()
         },
-        PhysicsPlugin,
     ));
+    #[cfg(feature = "physics")]
+    app.add_plugins(boxel::physics::PhysicsPlugin);
     app.edit_schedule(First, strict)
         .edit_schedule(PreUpdate, strict)
         .edit_schedule(RunFixedMainLoop, strict)

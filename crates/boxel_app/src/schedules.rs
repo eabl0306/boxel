@@ -55,8 +55,8 @@ labels! {
 ///   consume), so a press during a frame that runs no step is not lost and a frame that runs two
 ///   steps does not see it twice.
 /// - [`RunFixedMainLoopSystems::AfterFixedMainLoop`]: once per frame, after them and before
-///   `Update`. Interpolate what the steps moved here (`FixedTime::overstep_fraction` is the
-///   factor), so `Update` and the renderer see the same interpolated state.
+///   `Update`. Interpolate what the steps moved here (`FixedTime::overstep_fraction_f64` is the
+///   factor for `f64` positions), so `Update` and the renderer see the same interpolated state.
 ///
 /// `Time` holds the frame view in both (only `FixedMain` sees the fixed-step view).
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]

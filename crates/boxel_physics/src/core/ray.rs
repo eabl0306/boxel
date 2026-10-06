@@ -6,12 +6,20 @@
 //! ray traveled or on where in the world it started: the same ray shifted by any integer vector
 //! visits the same blocks at bit-identical `t`.
 //!
-//! Ties (a ray exactly through an edge or a corner) step x, then y, then z: every block the ray
-//! touches is visited, the edge-adjacent ones included.
+//! Ties (a ray exactly through an edge or a corner) step x, then y, then z. Of the blocks the ray
+//! only touches along that edge or at that corner, it visits the ones on that staircase and skips
+//! the rest: one of the two blocks beside an edge, two of the six around a corner.
 
 use super::source::{CollisionTable, Probe, VoxelSource};
 use boxel_math::DVec3;
 use boxel_voxel::{BlockPos, BlockState, Face, MAX_BLOCK_COORD, WorldPos};
+
+/// The farthest [`raycast_voxels`] follows a ray on any axis, in blocks: a larger `max_t` is
+/// shortened to `MAX_RAY_DISTANCE / max(|dir.x|, |dir.y|, |dir.z|)`. A guard against runaway
+/// rays (an infinite `max_t` through the air above the world would walk on for `2^61` blocks):
+/// the cost is one probe per block crossed, so the longest ray costs some tens of microseconds.
+/// 4096 blocks is 128 chunks, more than any view distance.
+pub const MAX_RAY_DISTANCE: f64 = 4096.0;
 
 /// Which blocks stop a ray.
 pub enum VoxelFilter<'a> {
@@ -112,8 +120,13 @@ impl RayResult {
 
 /// Casts the ray `origin + dir * t`, `t` in `0..=max_t`, through the voxels of `src` and returns
 /// the first block `filter` accepts. `dir` need not be a unit vector (`t` is in multiples of
-/// it); a zero component never steps that axis. A ray that starts inside an accepted block hits
-/// it at `t = 0` with no face. `max_t` should be finite; the ray also stops at the world limit.
+/// it); a zero component never steps that axis, and neither does one so small that its
+/// reciprocal overflows. A `dir` with a NaN or infinite component has no direction: only the
+/// origin block is tested, as with a zero `dir`. A ray that starts inside an accepted block hits
+/// it at `t = 0` with no face.
+///
+/// The ray ends at `max_t` (NaN counts as 0), at [`MAX_RAY_DISTANCE`] blocks on its longest
+/// axis, or at the world limit, whichever comes first.
 ///
 /// Cost: one probe per block crossed (about `max_t * (|dir.x| + |dir.y| + |dir.z|)` of them),
 /// with one chunk lookup per chunk crossed when `src` caches its last chunk
@@ -128,7 +141,15 @@ pub fn raycast_voxels<S: VoxelSource + ?Sized>(
 ) -> RayResult {
     // A hand-built origin may be outside the canonical form (NaN frac would never step).
     let origin = origin.normalize();
-    let max_t = if max_t.is_nan() { 0.0 } else { max_t };
+    // An infinite component would make every step distance 0 (the ray would never advance).
+    let dir = if dir.is_finite() { dir } else { DVec3::ZERO };
+    // Every ray is finite: at most MAX_RAY_DISTANCE blocks on its longest axis (a zero `dir`
+    // divides to infinity and leaves `max_t` as it is).
+    let max_t = if max_t.is_nan() {
+        0.0
+    } else {
+        max_t.min(MAX_RAY_DISTANCE / dir.abs().max_element())
+    };
     let mut voxel = [origin.block.x, origin.block.y, origin.block.z];
     let frac = origin.frac;
     let mut step = [0i64; 3];
@@ -137,17 +158,20 @@ pub fn raycast_voxels<S: VoxelSource + ?Sized>(
     let mut inv = [0.0f64; 3];
     let mut next = [f64::INFINITY; 3];
     for a in 0..3 {
+        let recip = 1.0 / dir[a];
+        if !recip.is_finite() {
+            // Zero, or so small that the reciprocal overflows (a step distance of `0 * inf`
+            // would be NaN): this axis never steps.
+            continue;
+        }
         if dir[a] > 0.0 {
             step[a] = 1;
             plane[a] = 1;
-        } else if dir[a] < 0.0 {
-            step[a] = -1;
         } else {
-            // Zero or NaN: this axis never steps.
-            continue;
+            step[a] = -1;
         }
-        inv[a] = 1.0 / dir[a];
-        next[a] = (plane[a] as f64 - frac[a]) * inv[a];
+        inv[a] = recip;
+        next[a] = (plane[a] as f64 - frac[a]) * recip;
     }
 
     match src.probe(origin.block) {
@@ -170,7 +194,7 @@ pub fn raycast_voxels<S: VoxelSource + ?Sized>(
         }
     }
 
-    // Past this the ray left the world (a few chunks of margin around the limit).
+    // Past this the ray left the world (the world's blocks end at `MAX_BLOCK_COORD + 31`).
     const LIMIT: i64 = MAX_BLOCK_COORD + 64;
     loop {
         // Smallest t; ties step x, then y, then z.
@@ -182,7 +206,7 @@ pub fn raycast_voxels<S: VoxelSource + ?Sized>(
             2
         };
         let t = next[a];
-        // An infinite t also ends a ray with no direction.
+        // An infinite t ends a ray with no direction (no axis steps).
         if t > max_t || t == f64::INFINITY {
             return RayResult::Miss;
         }

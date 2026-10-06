@@ -2,7 +2,8 @@
 
 Documento técnico de referencia. Fecha: 2026-10-05. Estado: aprobado para el milestone M0
 (revisión final, después de tres revisiones adversariales del borrador v1).
-Las decisiones puntuales están en `docs/adr/` (0001 a 0014). Durante M0 hubo además una
+Las decisiones puntuales están en `docs/adr/` (0001 a 0016; la 0015, luz de vóxeles, llega con
+su rama). Durante M0 hubo además una
 especificación para los agentes implementadores (en inglés, en `.scaffold/`), borrada al cerrar M0;
 este documento queda como referencia.
 
@@ -158,8 +159,9 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 
 Features de la fachada: `default = [window, render, voxel, png, debug, physics]`, más `trace`
 (spans de sistemas, implica `debug`), `trace_tracy` (Tracy), `track_location` y `hal` (escape
-hatch Vulkan). `physics` implica `voxel` y expone `boxel::physics`. `debug` hace que los diagnósticos del ECS (conflictos B0001, errores de schedule, spans)
-muestren nombres de sistemas y componentes; conviene apagarla en builds de distribución.
+hatch Vulkan). `physics` implica `voxel` y expone `boxel::physics`. `debug` hace que los
+diagnósticos del ECS (conflictos B0001, errores de schedule, spans) muestren nombres de sistemas
+y componentes; conviene apagarla en builds de distribución.
 
 ---
 
@@ -1016,7 +1018,9 @@ schedule `Shutdown` es el lugar para el `flush` final.
   2 s. Su `fps=` cuenta updates de la App, no frames mostrados.
 - Overlay F3 (`boxel_debug`): frames mostrados por segundo (de `RenderInfo::frames_presented`) y
   updates por segundo por separado, tiempo de frame, límite, vsync y modo de presentación, GPU,
-  cámara y contadores de chunks. Teclas opcionales `FrameKeys` (F5 límite, F6 vsync).
+  cámara y contadores de chunks. Teclas opcionales `FrameKeys` (F5 límite, F6 vsync). Las apps
+  suman líneas propias con `OverlayLines` (`voxel_world` muestra el bloque apuntado y la
+  selección) y `Crosshair` dibuja una mira en el centro.
 - `FrameTimeHistory`: los últimos frames (4096 por defecto, mínimo 1024) con su tiempo real
   (`Time::real_delta`); `summary()` da p50, p95, p99, p99.9, máximo, promedio y 1% low.
 - Tirones mientras se carga el mundo: `examples/stress.rs` y `just bench-*`
@@ -1054,7 +1058,7 @@ schedule `Shutdown` es el lugar para el `flush` final.
 | Milestone | Contenido | Criterio de salida |
 |---|---|---|
 | **M0 scaffold** | workspace y tooling; fork del ECS; `boxel_app`; ventana con compuerta de presentación e input; detección completa (tiers, scoring, smoke, overrides, LKG de crashes, device lost, catch_unwind); tiers High, Mid y Low con buckets opaco y cutout (High sin Hi-Z); paleta, registry, worldgen, mesher, streaming con jobs; cámara libre; `gpu_info`, `voxel_world`, `headless_world` | compila, tests, clippy y rustdoc limpios; `voxel_world` dibuja terreno en Vulkan High y en GL (Mid y Low); imágenes iguales entre tiers; la simulación no se congela con la ventana minimizada |
-| **M1 mundo jugable** | criterio de entrada: re-fork sobre bevy 0.20.0 final. Pase translúcido; AO; raycast y edición de bloques (y el sistema de ediciones si se recortó); propiedades de bloque e IdMap; `ChunkStore` con redb; crecimiento del arena y presupuesto de subida; caras interiores de hojas (opcional); re-selección en caliente si se recortó; decisión `static-dxc` o DLL en Windows; timestamps de GPU; actualizar a wgpu 31 | editar y guardar un mundo; agua visible |
+| **M1 mundo jugable** | criterio de entrada: re-fork sobre bevy 0.20.0 final. Pase translúcido; AO; raycast y edición de bloques (hechos: ADR 0016, `voxel_world`); el sistema de ediciones si se recortó; propiedades de bloque e IdMap; `ChunkStore` con redb; crecimiento del arena y presupuesto de subida; caras interiores de hojas (opcional); re-selección en caliente si se recortó; decisión `static-dxc` o DLL en Windows; timestamps de GPU; actualizar a wgpu 31 | editar y guardar un mundo; agua visible |
 | **M2 GPU-driven completo** | Hi-Z en dos fases (High); cave culling por BFS (Mid/Low); pool de ocupación en GPU; `create_shader_module_trusted` con medición; pipeline cache de Vulkan; verificar DX12 High; clip control en GL (upstream); decidir WESL | caída de draws y de tiempo de GPU medida |
 | **M3 escala** | LOD con mips de 32³ y anillos; listas indirectas segmentadas (más de 65 535 draws); render en hilo propio; inicialización de GPU asíncrona (respetando los error scopes por hilo); luz (cielo y bloque) | distancias de vista grandes estables |
 | **M4 experimental** | ray marching sobre bricks/ocupación; mesh shaders opt-in; evaluar bevy_ecs 0.21 y el núcleo ECS propio | prototipos medidos |

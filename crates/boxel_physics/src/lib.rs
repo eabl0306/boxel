@@ -28,9 +28,9 @@ mod query;
 mod source;
 
 pub use crate::core::{
-    CollisionShape, CollisionTable, LocalBox, MAX_SWEEP_DISTANCE, Probe, RayResult, Shape,
-    ShapeHit, SweepConfig, SweepOut, TestWorld, Unloaded, VoxelFilter, VoxelHit, VoxelSource,
-    axis_order, move_box, raycast_voxels,
+    CollisionShape, CollisionTable, LocalBox, MAX_RAY_DISTANCE, MAX_SWEEP_DISTANCE, Probe,
+    RayResult, Shape, ShapeHit, SweepConfig, SweepOut, TestWorld, Unloaded, VoxelFilter, VoxelHit,
+    VoxelSource, axis_order, move_box, raycast_voxels,
 };
 pub use boxel_voxel::WorldPos;
 pub use plugin::{PhysicsContent, PhysicsPlugin};
