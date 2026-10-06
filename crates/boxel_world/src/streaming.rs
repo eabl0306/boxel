@@ -678,11 +678,11 @@ impl WorldJobs {
             remesh_pending: false,
             cancel: Arc::new(AtomicBool::new(false)),
         };
-        let id = cx.map.slots.insert(slot);
-        cx.map.index.insert(pos, id);
+        let id = cx.map.insert(slot);
         self.set_interest(cx, id, interest);
         if cx.known_air(pos.y) {
-            cx.map.slots[id].data = DataState::Ready(self.uniform(BlockState::AIR));
+            cx.map
+                .set_data(id, DataState::Ready(self.uniform(BlockState::AIR)));
             self.data_available(cx, id);
         } else {
             self.scheduler
@@ -702,8 +702,8 @@ impl WorldJobs {
                 // queued or running is no longer wanted: the old mesh goes now (`Remove`), so the
                 // events keep agreeing with `ready_meshes()`. A running job keeps the slot
                 // `InFlight` (one job per slot); its result is dropped when it arrives.
-                slot.remesh_pending = false;
-                match slot.mesh {
+                cx.map.set_remesh_pending(id, false);
+                match cx.map.slots[id].mesh {
                     MeshState::Queued => self.drop_mesh(cx, id),
                     MeshState::InFlight { .. } => self.unpublish(cx, id),
                     MeshState::None | MeshState::Ready { .. } | MeshState::Empty => {}
@@ -713,7 +713,7 @@ impl WorldJobs {
                 let priority = self.priority(slot.key.pos);
                 match &slot.mesh {
                     MeshState::None => {
-                        slot.mesh = MeshState::Queued;
+                        cx.map.set_mesh(id, MeshState::Queued);
                         self.schedule_mesh(cx, id, priority);
                     }
                     MeshState::Ready {
@@ -744,10 +744,9 @@ impl WorldJobs {
     /// A slot outside the vertical bounds (left behind by a bounds change) becomes air for its
     /// neighbors instead: their bit stays set and the ones with mesh interest are remeshed.
     pub(crate) fn unload(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
-        let Some(slot) = cx.map.slots.remove(id) else {
+        let Some(slot) = cx.map.remove(id) else {
             return;
         };
-        cx.map.index.remove(&slot.key.pos);
         slot.cancel.store(true, Ordering::Relaxed);
         self.failure_logged.remove(&id);
         if self.published.remove(&id) {
@@ -805,15 +804,16 @@ impl WorldJobs {
     /// Asks for a new mesh of `id` (its data or a neighbor changed). Slots without
     /// [`Interest::MESH`] drop their mesh instead (rebuilt when they are wanted again).
     fn request_remesh(&mut self, cx: &mut Ctx<'_>, id: ChunkId, priority: u32) {
-        let slot = &mut cx.map.slots[id];
+        let slot = &cx.map.slots[id];
+        let wanted = slot.interest.contains(Interest::MESH);
         if let MeshState::InFlight { .. } = slot.mesh {
             // The running job used the old data or epoch: its result is rejected, then requeued
             // (or dropped if the mesh is no longer wanted).
-            slot.remesh_pending = slot.interest.contains(Interest::MESH);
+            cx.map.set_remesh_pending(id, wanted);
             return;
         }
-        if slot.interest.contains(Interest::MESH) {
-            slot.mesh = MeshState::Queued;
+        if wanted {
+            cx.map.set_mesh(id, MeshState::Queued);
             self.schedule_mesh(cx, id, priority);
         } else {
             self.drop_mesh(cx, id);
@@ -830,17 +830,13 @@ impl WorldJobs {
 
     /// `MeshState::Empty`, and `Remove` if a mesh was published.
     fn set_mesh_empty(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
-        let slot = &mut cx.map.slots[id];
-        slot.mesh = MeshState::Empty;
-        slot.remesh_pending = false;
+        cx.map.set_mesh_and_pending(id, MeshState::Empty, false);
         self.unpublish(cx, id);
     }
 
     /// `MeshState::None`, and `Remove` if a mesh was published.
     fn drop_mesh(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
-        let slot = &mut cx.map.slots[id];
-        slot.mesh = MeshState::None;
-        slot.remesh_pending = false;
+        cx.map.set_mesh_and_pending(id, MeshState::None, false);
         self.unpublish(cx, id);
     }
 
@@ -1002,14 +998,14 @@ impl WorldJobs {
     }
 
     fn start_generate(&mut self, cx: &mut Ctx<'_>, id: ChunkId) -> bool {
-        let Some(slot) = cx.map.slots.get_mut(id) else {
+        let Some(slot) = cx.map.slots.get(id) else {
             return false;
         };
         if !matches!(slot.data, DataState::Queued) {
             return false;
         }
-        slot.data = DataState::Generating;
-        let key = slot.key;
+        let (key, cancel) = (slot.key, Arc::clone(&slot.cancel));
+        cx.map.set_data(id, DataState::Generating);
         let generator = Arc::clone(&cx.content.generator);
         let registry = Arc::clone(&cx.content.registry);
         spawn_job(
@@ -1017,7 +1013,7 @@ impl WorldJobs {
             &self.tx,
             id,
             JobKind::Generate,
-            Arc::clone(&slot.cancel),
+            cancel,
             move || JobMessage::Generated {
                 id,
                 data: generator.generate(key, &registry),
@@ -1057,12 +1053,14 @@ impl WorldJobs {
         });
         let (data_version, epoch) = (center.version, slot.epoch);
         let cancel = Arc::clone(&slot.cancel);
-        let slot = &mut cx.map.slots[id];
-        slot.mesh = MeshState::InFlight {
-            data_version,
-            epoch,
-        };
-        slot.remesh_pending = false;
+        cx.map.set_mesh_and_pending(
+            id,
+            MeshState::InFlight {
+                data_version,
+                epoch,
+            },
+            false,
+        );
         let materials = Arc::clone(&cx.content.materials);
         let mesh_fn = self.mesh_fn;
         spawn_job(
@@ -1157,13 +1155,13 @@ impl WorldJobs {
             return;
         }
         let data = self.snapshot(data);
-        cx.map.slots[id].data = DataState::Ready(data);
+        cx.map.set_data(id, DataState::Ready(data));
         self.data_available(cx, id);
     }
 
     fn on_failed(&mut self, cx: &mut Ctx<'_>, id: ChunkId, kind: JobKind, panic: &str) {
         self.failed += 1;
-        let Some(slot) = cx.map.slots.get_mut(id) else {
+        let Some(slot) = cx.map.slots.get(id) else {
             tracing::debug!(?kind, "job for an unloaded chunk failed: {panic}");
             return;
         };
@@ -1174,7 +1172,7 @@ impl WorldJobs {
             JobKind::Generate => {
                 if matches!(slot.data, DataState::Generating) {
                     // Permanently air, like chunks outside the vertical bounds.
-                    slot.data = DataState::Missing;
+                    cx.map.set_data(id, DataState::Missing);
                     self.data_available(cx, id);
                 }
             }
@@ -1184,9 +1182,8 @@ impl WorldJobs {
                 }
                 if slot.remesh_pending {
                     // The data changed meanwhile: try again with the new data.
-                    slot.remesh_pending = false;
-                    slot.mesh = MeshState::Queued;
                     let priority = self.priority(slot.key.pos);
+                    cx.map.set_mesh_and_pending(id, MeshState::Queued, false);
                     self.schedule_mesh(cx, id, priority);
                 } else {
                     self.set_mesh_empty(cx, id);
@@ -1199,7 +1196,7 @@ impl WorldJobs {
     /// remesh requested, mesh still wanted); otherwise requeues the mesh or drops it.
     fn apply_meshed(&mut self, cx: &mut Ctx<'_>, result: MeshedResult) {
         let id = result.id;
-        let Some(slot) = cx.map.slots.get_mut(id) else {
+        let Some(slot) = cx.map.slots.get(id) else {
             return;
         };
         let MeshState::InFlight {
@@ -1225,9 +1222,8 @@ impl WorldJobs {
             && current_version == Some(result.data_version)
             && slot.epoch == result.epoch;
         if !fresh {
-            slot.remesh_pending = false;
-            slot.mesh = MeshState::Queued;
             let priority = self.priority(slot.key.pos);
+            cx.map.set_mesh_and_pending(id, MeshState::Queued, false);
             self.schedule_mesh(cx, id, priority);
             return;
         }
@@ -1235,18 +1231,18 @@ impl WorldJobs {
             self.set_mesh_empty(cx, id);
             return;
         }
+        let key = slot.key;
         let mesh = Arc::new(result.mesh);
-        slot.mesh = MeshState::Ready {
-            mesh: Arc::clone(&mesh),
-            data_version: result.data_version,
-            epoch: result.epoch,
-        };
-        self.published.insert(id);
-        cx.events.push(ChunkMeshEvent::Upsert {
+        cx.map.set_mesh(
             id,
-            key: slot.key,
-            mesh,
-        });
+            MeshState::Ready {
+                mesh: Arc::clone(&mesh),
+                data_version: result.data_version,
+                epoch: result.epoch,
+            },
+        );
+        self.published.insert(id);
+        cx.events.push(ChunkMeshEvent::Upsert { id, key, mesh });
     }
 }
 

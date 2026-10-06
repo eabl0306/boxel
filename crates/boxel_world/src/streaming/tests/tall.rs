@@ -492,6 +492,7 @@ fn check_bookkeeping(h: &Harness) {
         );
     }
     h.check_published();
+    h.check_stats();
 }
 
 proptest! {

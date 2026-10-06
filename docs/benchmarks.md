@@ -109,7 +109,7 @@ cargo run --release --features trace --example stress -- --scenario fly --speed 
 ```
 
 Con `--features trace` cada sistema del ECS abre un span de `tracing`, y el mundo y el render
-agregan spans propios por dentro (`world.positions`, `world.stats_walk`, `world.drain`,
+agregan spans propios por dentro (`world.positions`, `world.drain`,
 `world.dispatch`, `render.upsert`, `render.submit`...). `world.step create`, `unload`, `update`,
 etc. reparten el tiempo de `world.positions` por tipo de paso. `--spans` suma el tiempo de cada
 uno en cada frame y agrega al resumen la sección "Time per system":

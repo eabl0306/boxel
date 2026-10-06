@@ -356,7 +356,8 @@ fn publish_meshes(
 }
 
 /// Refreshes `WorldStats` (slot counts, scheduler counts, interest backlog) and the `"world"`
-/// board line. The slot counts walk every slot, so they are only recounted when the map changed.
+/// board line. The slot counts are kept by the map (no walk); debug builds check them against a
+/// walk of every slot in the frames that changed the map.
 fn publish_stats(
     map: Res<ChunkMap>,
     jobs: Res<WorldJobs>,
@@ -364,12 +365,12 @@ fn publish_stats(
     mut failed: Local<Option<usize>>,
     board: Option<ResMut<DiagnosticsBoard>>,
 ) {
-    let mut now = if map.is_changed() {
-        let _span = frame_span!("world.stats_walk");
-        map.stats()
-    } else {
-        *stats
-    };
+    let mut now = map.stats();
+    debug_assert!(
+        !map.is_changed() || now == map.recount(),
+        "incremental slot counts {now:?} differ from a recount {:?}",
+        map.recount()
+    );
     now.queued_jobs = jobs.scheduler.queued();
     now.in_flight = jobs.scheduler.in_flight();
     now.interest_backlog = jobs.interest_backlog();

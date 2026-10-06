@@ -106,12 +106,23 @@ impl Harness {
         &self.map.slots[self.id(pos)]
     }
 
+    /// The slot counters (checked against a walk of every slot) and the scheduler counts.
     fn stats(&self) -> WorldStats {
+        self.check_stats();
         WorldStats {
             queued_jobs: self.jobs.scheduler.queued(),
             in_flight: self.jobs.scheduler.in_flight(),
             ..self.map.stats()
         }
+    }
+
+    /// The incremental slot counters match a walk of every slot.
+    fn check_stats(&self) {
+        assert_eq!(
+            self.map.stats(),
+            self.map.recount(),
+            "incremental slot counts"
+        );
     }
 
     fn settle(&mut self, max_steps: usize) {
@@ -207,7 +218,8 @@ fn neighbor_bits_follow_data_states() {
     let mut expected = 0;
     for (i, offset) in NEIGHBOR_OFFSETS.iter().enumerate() {
         let n = h.id(ChunkPos::from_ivec3(*offset));
-        h.map.slots[n].data = DataState::Ready(Arc::new(ChunkData::uniform(STONE)));
+        h.map
+            .set_data(n, DataState::Ready(Arc::new(ChunkData::uniform(STONE))));
         h.with(|jobs, cx, _| jobs.data_available(cx, n));
         expected |= 1 << i;
         assert_eq!(
@@ -225,7 +237,10 @@ fn neighbor_bits_follow_data_states() {
 
     // The center becomes ready: every neighbor gets its bit; the enclosed stone center is then
     // meshed by the fast path at dispatch (no job).
-    h.map.slots[center].data = DataState::Ready(Arc::new(ChunkData::uniform(STONE)));
+    h.map.set_data(
+        center,
+        DataState::Ready(Arc::new(ChunkData::uniform(STONE))),
+    );
     h.with(|jobs, cx, _| jobs.data_available(cx, center));
     for (i, offset) in NEIGHBOR_OFFSETS.iter().enumerate() {
         let n = h.slot(ChunkPos::from_ivec3(*offset));
@@ -913,6 +928,81 @@ fn the_cap_follows_the_settings_every_frame() {
     h.settings.max_jobs_in_flight = 0;
     h.jobs.begin_frame(&h.settings, Instant::now());
     assert_eq!(h.jobs.scheduler.max_in_flight(), h.jobs.auto_cap.cap());
+}
+
+/// The slot counters behind `WorldStats` are kept on every transition, not recounted: after
+/// each step of a run through every kind of change (create, generate, fail, mesh, remesh,
+/// edits under running jobs, dropped and cancelled jobs, unload, reload, moves inside the
+/// hysteresis band) they match a walk of every slot.
+#[test]
+fn slot_counters_follow_every_transition() {
+    let hold = Arc::new(HoldExecutor::default());
+    let mut generator = LayerGen::new(-2..=1);
+    generator.panic_at = Some(ChunkPos::new(1, -1, 1));
+    let mut h = Harness::new(generator, hold.clone(), 8);
+    h.settings.unload_hysteresis = 1;
+    let round = |h: &mut Harness| {
+        h.dispatch();
+        h.check_stats();
+        hold.run_all();
+        h.collect();
+        h.check_stats();
+    };
+    let settle = |h: &mut Harness| {
+        for _ in 0..100 {
+            if h.stats().is_settled() {
+                return;
+            }
+            round(h);
+        }
+        panic!("not settled: {:?}", h.stats());
+    };
+
+    h.interest(&origin(2));
+    h.check_stats();
+    // A few rounds at 8 jobs in flight: generations, then meshes, some still queued.
+    for _ in 0..3 {
+        round(&mut h);
+    }
+    // Edits under running mesh jobs and on settled chunks; border voxels touch neighbors.
+    h.dispatch();
+    for x in [0, 31, 32, 63] {
+        h.edit(BlockPos::new(x, -1, 0), BlockState::AIR);
+        h.check_stats();
+        h.edit(BlockPos::new(x, -33, 5), BlockState::AIR);
+        h.check_stats();
+    }
+    hold.run_all();
+    h.collect();
+    h.check_stats();
+    // Failing meshers and dropped jobs.
+    h.jobs.mesh_fn = panicking_mesh;
+    round(&mut h);
+    h.jobs.mesh_fn = fake_mesh;
+    h.dispatch();
+    hold.drop_all();
+    h.collect();
+    h.check_stats();
+    // A jump unloads everything (jobs still running are cancelled), then the way back reloads.
+    h.dispatch();
+    h.interest(&[(ChunkPos::new(40, 0, 0), 1)]);
+    h.check_stats();
+    round(&mut h);
+    h.interest(&origin(2));
+    h.check_stats();
+    settle(&mut h);
+    // Small moves: slots enter and leave the hysteresis band, mesh interest comes and goes.
+    for x in [1, 2, 3, 2, 0, -1] {
+        h.interest(&[(ChunkPos::new(x, 0, 0), 2)]);
+        h.check_stats();
+        round(&mut h);
+        h.edit(BlockPos::new(32 * x, -1, 0), STONE);
+        h.check_stats();
+    }
+    settle(&mut h);
+    let stats = h.stats();
+    assert!(stats.is_settled(), "{stats:?}");
+    assert!(stats.mesh_ready > 0 && stats.mesh_empty > 0, "{stats:?}");
 }
 
 mod tall;

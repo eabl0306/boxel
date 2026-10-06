@@ -128,11 +128,79 @@ impl WorldStats {
     }
 }
 
+// The slot counters of `WorldStats` one slot counts toward, as bits (index into `Tally`).
+/// `data_ready`.
+const DATA_READY: u8 = 1;
+/// `generating`.
+const GENERATING: u8 = 1 << 1;
+/// `mesh_ready`.
+const MESH_READY: u8 = 1 << 2;
+/// `mesh_empty`.
+const MESH_EMPTY: u8 = 1 << 3;
+/// `meshing`.
+const MESHING: u8 = 1 << 4;
+
+impl ChunkSlot {
+    /// Which slot counters of [`WorldStats`] this slot counts toward (bits of [`Tally`]).
+    fn tally_bits(&self) -> u8 {
+        let data = match self.data {
+            DataState::Ready(_) => DATA_READY,
+            DataState::Queued | DataState::Generating => GENERATING,
+            DataState::Missing => 0,
+        };
+        let mesh = match self.mesh {
+            MeshState::Ready { .. } => MESH_READY,
+            MeshState::Empty => MESH_EMPTY,
+            MeshState::None | MeshState::Queued | MeshState::InFlight { .. } => 0,
+        };
+        // One count per slot (`remesh_pending` is only set while a job is in flight).
+        let meshing = if self.remesh_pending
+            || matches!(self.mesh, MeshState::Queued | MeshState::InFlight { .. })
+        {
+            MESHING
+        } else {
+            0
+        };
+        data | mesh | meshing
+    }
+}
+
+/// The slot counters of [`WorldStats`], kept up to date on every slot change (see
+/// [`ChunkMap::update`]), so reading them never walks the slots.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Tally {
+    /// By bit index of [`ChunkSlot::tally_bits`].
+    counts: [usize; 5],
+}
+
+impl Tally {
+    /// A slot that counted toward `before` now counts toward `after`.
+    fn change(&mut self, before: u8, after: u8) {
+        if before == after {
+            return;
+        }
+        for (i, count) in self.counts.iter_mut().enumerate() {
+            let bit = 1 << i;
+            if before & bit != 0 {
+                *count -= 1;
+            }
+            if after & bit != 0 {
+                *count += 1;
+            }
+        }
+    }
+}
+
 /// All loaded chunks. Owned by the main thread (ECS resource); workers only see `Arc` snapshots.
+/// The slot counters of [`ChunkMap::stats`] are kept up to date on every change (no walk).
 #[derive(Resource, Default)]
 pub struct ChunkMap {
+    // Slots are added and removed with `insert` and `remove`, and their `data`, `mesh` and
+    // `remesh_pending` change only through `update` (or the setters built on it), which keeps
+    // `tally` up to date. The other fields may be written in place.
     pub(crate) slots: slotmap::SlotMap<ChunkId, ChunkSlot>,
     pub(crate) index: HashMap<ChunkPos, ChunkId, foldhash::fast::FixedState>,
+    tally: Tally,
 }
 
 impl ChunkMap {
@@ -180,8 +248,22 @@ impl ChunkMap {
         })
     }
     /// Slot-based counters (`queued_jobs`, `in_flight` and `interest_backlog` are 0 here; the
-    /// `WorldStats` resource has them).
+    /// `WorldStats` resource has them). Kept up to date on every slot change, so this is O(1).
     pub fn stats(&self) -> WorldStats {
+        let [data_ready, generating, mesh_ready, mesh_empty, meshing] = self.tally.counts;
+        WorldStats {
+            chunks: self.slots.len(),
+            data_ready,
+            generating,
+            mesh_ready,
+            mesh_empty,
+            meshing,
+            ..WorldStats::default()
+        }
+    }
+    /// [`ChunkMap::stats`] counted from scratch by walking every slot: the cross-check of the
+    /// incremental counters (tests, debug builds).
+    pub(crate) fn recount(&self) -> WorldStats {
         let mut stats = WorldStats {
             chunks: self.slots.len(),
             ..WorldStats::default()
@@ -197,7 +279,6 @@ impl ChunkMap {
                 MeshState::Empty => stats.mesh_empty += 1,
                 MeshState::None | MeshState::Queued | MeshState::InFlight { .. } => {}
             }
-            // One count per slot (`remesh_pending` is only set while a job is in flight).
             if slot.remesh_pending
                 || matches!(slot.mesh, MeshState::Queued | MeshState::InFlight { .. })
             {
@@ -205,5 +286,49 @@ impl ChunkMap {
             }
         }
         stats
+    }
+    /// Adds a slot (and its index entry). The position must be free.
+    pub(crate) fn insert(&mut self, slot: ChunkSlot) -> ChunkId {
+        let (pos, bits) = (slot.key.pos, slot.tally_bits());
+        let id = self.slots.insert(slot);
+        let previous = self.index.insert(pos, id);
+        debug_assert!(previous.is_none(), "two slots at {pos:?}");
+        self.tally.change(0, bits);
+        id
+    }
+    /// Removes a slot (and its index entry).
+    pub(crate) fn remove(&mut self, id: ChunkId) -> Option<ChunkSlot> {
+        let slot = self.slots.remove(id)?;
+        self.index.remove(&slot.key.pos);
+        self.tally.change(slot.tally_bits(), 0);
+        Some(slot)
+    }
+    /// Runs `f` on a slot and recounts it. Every change of `data`, `mesh` or `remesh_pending`
+    /// goes through here. Panics if `id` is not loaded.
+    pub(crate) fn update<R>(&mut self, id: ChunkId, f: impl FnOnce(&mut ChunkSlot) -> R) -> R {
+        let slot = &mut self.slots[id];
+        let before = slot.tally_bits();
+        let out = f(slot);
+        self.tally.change(before, slot.tally_bits());
+        out
+    }
+    /// Sets a slot's data state.
+    pub(crate) fn set_data(&mut self, id: ChunkId, data: DataState) {
+        self.update(id, |slot| slot.data = data);
+    }
+    /// Sets a slot's mesh state.
+    pub(crate) fn set_mesh(&mut self, id: ChunkId, mesh: MeshState) {
+        self.update(id, |slot| slot.mesh = mesh);
+    }
+    /// Sets a slot's mesh state and remesh request.
+    pub(crate) fn set_mesh_and_pending(&mut self, id: ChunkId, mesh: MeshState, pending: bool) {
+        self.update(id, |slot| {
+            slot.mesh = mesh;
+            slot.remesh_pending = pending;
+        });
+    }
+    /// Sets a slot's remesh request.
+    pub(crate) fn set_remesh_pending(&mut self, id: ChunkId, pending: bool) {
+        self.update(id, |slot| slot.remesh_pending = pending);
     }
 }
