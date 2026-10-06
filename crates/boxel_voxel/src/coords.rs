@@ -4,6 +4,7 @@
 //! world limit [`MAX_CHUNK_COORD`]. Chunk-local data (`LocalPos`, `CHUNK_SIZE`, offsets) stays
 //! small and 32-bit.
 use glam::{DVec3, I64Vec3, IVec3};
+use std::hash::{Hash, Hasher};
 
 /// log2 of the chunk edge.
 pub const CHUNK_SHIFT: u32 = 5;
@@ -47,7 +48,8 @@ const fn sq_diff(a: i64, b: i64) -> u128 {
 }
 
 /// Chunk coordinates (world voxel = chunk * 32 + local). Ordered (x, y, z) for deterministic sorts.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// Hashed as one 128-bit word (see its `Hash` impl).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ChunkPos {
     /// X.
     pub x: i64,
@@ -127,6 +129,31 @@ impl ChunkPos {
     /// `u128::MAX` only far outside it.
     pub const fn distance_sq_xz(self, other: ChunkPos) -> u128 {
         sq_diff(self.x, other.x).saturating_add(sq_diff(self.z, other.z))
+    }
+    /// The word [`Hash`] feeds: `x ^ (y << 32)` in the low half, `z ^ y * K` in the high half
+    /// (`K` odd, so `y * K` is a bijection that spreads `y` over all 64 bits).
+    ///
+    /// Distinct for any two positions less than `2^32` chunks apart on every axis (the low half
+    /// gives `x`, then `y`; the high half then gives `z`), which covers every view. Farther apart
+    /// positions may share a word, but no regular pattern does: two positions with the same low
+    /// half differ in `y`, so their high halves differ unless `z` happens to differ by exactly
+    /// `y * K ^ y' * K`. Equality still compares all three coordinates.
+    const fn hash_word(self) -> u128 {
+        const K: u64 = 0x9e37_79b9_7f4a_7c15;
+        let (x, y, z) = (self.x as u64, self.y as u64, self.z as u64);
+        let lo = x ^ (y << 32);
+        let hi = z ^ y.wrapping_mul(K);
+        ((hi as u128) << 64) | lo as u128
+    }
+}
+
+/// One `write_u128` of a word built from the three coordinates (`x ^ (y << 32)` in the low
+/// half, `z ^ y * K` in the high half, `K` odd) instead of three `write_i64`: a hasher that folds
+/// 128 bits per multiply (foldhash, the world's chunk index) does one multiply instead of two
+/// dependent ones. Positions less than `2^32` chunks apart on every axis never share a word.
+impl Hash for ChunkPos {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u128(self.hash_word());
     }
 }
 
