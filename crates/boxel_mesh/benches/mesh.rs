@@ -1,11 +1,16 @@
-//! Meshing benchmarks: gather + mesh of terrain-like, caves and checkerboard chunks.
+//! Meshing benchmarks: gather + mesh of terrain-like, caves and checkerboard chunks, and of a
+//! deep cave chunk of `OverworldGenerator` (`gather_mesh/cave`, 1-bit stone and air with its
+//! 26 neighbors; the quad count is printed).
 //!
 //! Targets (informational in M0): `mesh` of a terrain-like padded chunk < 60 us,
 //! gather + mesh < 150 us (release).
 #![expect(clippy::print_stderr, reason = "bench scene statistics")]
 
 use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, Mesher, PaddedChunk};
-use boxel_voxel::{BlockRegistry, CHUNK_SIZE, ChunkData, NEIGHBOR_OFFSETS};
+use boxel_voxel::{
+    BlockRegistry, BlockState, CHUNK_SIZE, ChunkData, ChunkKey, ChunkPos, NEIGHBOR_OFFSETS,
+};
+use boxel_worldgen::{OverworldGenerator, WorldGenerator};
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
@@ -140,6 +145,25 @@ impl Scene {
         }
     }
 
+    /// The chunk at `pos` and its neighbors from a generator.
+    fn generated(g: &dyn WorldGenerator, registry: &BlockRegistry, pos: ChunkPos) -> Self {
+        let generate = |p: ChunkPos| g.generate(ChunkKey::new(p), registry);
+        let neighbors = NEIGHBOR_OFFSETS
+            .iter()
+            .map(|o| {
+                generate(ChunkPos::new(
+                    pos.x + i64::from(o.x),
+                    pos.y + i64::from(o.y),
+                    pos.z + i64::from(o.z),
+                ))
+            })
+            .collect();
+        Self {
+            center: generate(pos),
+            neighbors,
+        }
+    }
+
     fn input(&self) -> MeshInput<'_> {
         MeshInput {
             center: &self.center,
@@ -161,6 +185,19 @@ fn bench(c: &mut Criterion) {
         if (x + y + z) % 2 == 0 { stone } else { 0 }
     });
 
+    // A deep overworld chunk with caves: the first one along +x with at least 5% air.
+    let overworld = OverworldGenerator::default();
+    let air_share = |data: &ChunkData| {
+        let mut d = vec![BlockState::AIR; boxel_voxel::CHUNK_VOLUME];
+        data.to_dense(&mut d);
+        d.iter().filter(|s| **s == BlockState::AIR).count() as f64 / d.len() as f64
+    };
+    let cave_pos = (0..4096)
+        .map(|x| ChunkPos::new(x, -10, 0))
+        .find(|&p| air_share(&overworld.generate(ChunkKey::new(p), &registry)) >= 0.05)
+        .expect("a cave chunk");
+    let generated = Scene::generated(&overworld, &registry, cave_pos);
+
     let mut mesher = Mesher::new();
     let mut padded = PaddedChunk::new();
     let mut out = ChunkMesh::default();
@@ -168,6 +205,7 @@ fn bench(c: &mut Criterion) {
         ("terrain", &terrain_packed),
         ("caves", &cave),
         ("checkerboard", &checker),
+        ("cave", &generated),
     ] {
         mesher.gather(&scene.input(), &table, &mut padded);
         mesher.mesh(&padded, &table, &mut out);
@@ -183,9 +221,11 @@ fn bench(c: &mut Criterion) {
             });
         });
     }
+    eprintln!("scene cave: overworld chunk {cave_pos:?}");
     for (name, scene) in [
         ("terrain_packed", &terrain_packed),
         ("terrain_direct", &terrain_direct),
+        ("cave", &generated),
     ] {
         let input = scene.input();
         c.bench_function(&format!("gather/{name}"), |bench| {

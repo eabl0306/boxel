@@ -15,6 +15,8 @@ bytemuck.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 criterion.workspace = true
+# The `gather_mesh/cave` bench meshes a chunk of the overworld generator.
+boxel_worldgen.workspace = true
 
 # Criterion flags (--quick, --save-baseline) must not reach the lib unit-test harness.
 [lib]

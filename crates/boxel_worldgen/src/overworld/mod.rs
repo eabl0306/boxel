@@ -1,0 +1,358 @@
+//! [`OverworldGenerator`]: the heightmap surface over stone down to `i64::MIN`, carved by caves,
+//! with trees.
+//!
+//! The generator is a chain of stages, each a pure function of `(seed, voxel)` with a point form
+//! (the spec, for tests, spawning and debugging) and a bulk form per chunk that gives the same
+//! voxels:
+//!
+//! 1. [`Heightmap`]: one surface height per column (the heightmap of
+//!    [`TerrainGenerator`](crate::TerrainGenerator), bit for bit).
+//! 2. [`SurfaceRules`]: grass, sand or snow on top, dirt under it, stone further down. No
+//!    bedrock: the stone goes on forever.
+//! 3. [`Caves`]: carve the stone ([`CaveSettings`] has the model).
+//! 4. [`Trees`]: on grass whose top block the caves left solid.
+//!
+//! Per chunk, from the cheapest answer to the dearest:
+//!
+//! - Above every possible column and tree: air, without heights (and outside
+//!   [`WorldGenerator::vertical_chunks`], so the world does not even ask).
+//! - Below the reach of every surface rule (the deepest of the dirt, the cave fades, the
+//!   entrances and the roof, under the lowest possible column): no heights; the caves' 405
+//!   corners decide between `Uniform(stone)`, `Uniform(air)` and a stone/air 1-bit chunk built
+//!   straight from the carve mask ([`ChunkData::from_occupancy`]).
+//! - Near the surface: the 32x32 column heights, then air above the chunk's highest column, the
+//!   same 1-bit path when the whole chunk is stone before carving, or the dense path (surface
+//!   rules, carve, trees, [`ChunkData::from_dense`]).
+
+mod caves;
+mod terrain;
+
+pub use caves::{
+    CELL, CarveMask, CaveSettings, Caves, Cheese, Entrances, Fade, Noodles, SurfaceFade, Tunnels,
+    carve_mask,
+};
+pub use terrain::{Heightmap, SurfaceBlocks, SurfaceRules};
+
+use crate::{Tree, Trees, WorldGenerator, block};
+use boxel_voxel::{
+    BlockPos, BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SHIFT, CHUNK_SIZE, CHUNK_VOLUME,
+    ChunkData, ChunkKey, LocalPos,
+};
+use std::ops::RangeInclusive;
+
+/// Name in logs and panics.
+const NAME: &str = "OverworldGenerator";
+
+/// Parameters of [`OverworldGenerator`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct OverworldSettings {
+    /// Surface heights.
+    pub heightmap: Heightmap,
+    /// Surface blocks.
+    pub surface: SurfaceRules,
+    /// Caves (`None`: plain stone under the surface).
+    pub caves: Option<Caves>,
+    /// Trees (`None`: no trees).
+    pub trees: Option<Trees>,
+}
+
+impl Default for OverworldSettings {
+    /// The default heightmap and surface, the default caves (with openings) and trees.
+    fn default() -> Self {
+        Self {
+            heightmap: Heightmap::default(),
+            surface: SurfaceRules::default(),
+            caves: Some(Caves {
+                settings: CaveSettings::default(),
+            }),
+            trees: Some(Trees::default()),
+        }
+    }
+}
+
+/// The overworld: [`Heightmap`] surface, [`SurfaceRules`], stone down to `i64::MIN` carved by
+/// [`Caves`], and [`Trees`] (see the [module docs](self) for the stages and the fast paths).
+///
+/// Exact at any `i64` coordinate: every stage works on integer columns and lattice corners, and
+/// the carve decision is integer arithmetic.
+#[derive(Clone, Debug)]
+pub struct OverworldGenerator {
+    /// World seed.
+    pub seed: u64,
+    /// Parameters.
+    pub settings: OverworldSettings,
+}
+
+impl Default for OverworldGenerator {
+    /// The default settings with the default seed of [`TerrainGenerator`](crate::TerrainGenerator).
+    fn default() -> Self {
+        Self::new(
+            crate::TerrainGenerator::default().seed,
+            OverworldSettings::default(),
+        )
+    }
+}
+
+impl OverworldGenerator {
+    /// New generator.
+    pub fn new(seed: u64, settings: OverworldSettings) -> Self {
+        Self { seed, settings }
+    }
+
+    /// Surface height of column `(x, z)` (before the caves).
+    pub fn height_at(&self, x: i64, z: i64) -> i64 {
+        self.settings.heightmap.height_at(self.seed, x, z)
+    }
+
+    /// True if the terrain (surface and caves, without trees) is solid at `p` (the spec).
+    pub fn is_solid(&self, p: BlockPos) -> bool {
+        self.is_solid_in(p, self.height_at(p.x, p.z))
+    }
+
+    /// [`OverworldGenerator::is_solid`] in a column of height `h`.
+    fn is_solid_in(&self, p: BlockPos, h: i64) -> bool {
+        p.y <= h && !self.carves(p, h)
+    }
+
+    /// True if the caves carve `p`, in a column of height `h` (the spec).
+    fn carves(&self, p: BlockPos, h: i64) -> bool {
+        self.settings
+            .caves
+            .as_ref()
+            .is_some_and(|caves| caves.carves(self.seed, p, h, |x, z| self.height_at(x, z)))
+    }
+
+    /// The cave density at voxel `p` (the trilinear sum of its cell's corners in density units;
+    /// negative is carved where the roof allows), or `None` without caves. For debugging the
+    /// look.
+    pub fn density_at(&self, p: BlockPos) -> Option<f64> {
+        let caves = self.settings.caves.as_ref()?;
+        Some(caves.density_at(self.seed, p, |x, z| self.height_at(x, z)))
+    }
+
+    /// The block at `p`: what [`WorldGenerator::generate`] puts there, computed for that voxel
+    /// alone (the spec the chunk path is tested against; slow).
+    pub fn block_at(&self, p: BlockPos, registry: &BlockRegistry) -> BlockState {
+        let h = self.height_at(p.x, p.z);
+        if p.y <= h && !self.carves(p, h) {
+            let blocks = SurfaceBlocks::new(registry, NAME);
+            return self.settings.surface.block_at(&blocks, h, p.y);
+        }
+        let (Some(trees), Some(log), Some(leaves)) = (
+            &self.settings.trees,
+            registry.by_name("boxel:log"),
+            registry.by_name("boxel:leaves"),
+        ) else {
+            return BlockState::AIR;
+        };
+        let tree = trees.block_at(self.seed, p, |x, z| {
+            let ground = self.height_at(x, z);
+            let grows = self.settings.surface.is_grass(ground)
+                && self.is_solid_in(BlockPos::new(x, ground, z), ground);
+            grows.then_some(ground)
+        });
+        match tree {
+            Some(crate::TreeBlock::Log) => log,
+            Some(crate::TreeBlock::Leaves) => leaves,
+            None => BlockState::AIR,
+        }
+    }
+
+    /// Voxels above the surface that trees may reach.
+    fn reach_above(&self) -> i64 {
+        if self.settings.trees.is_some() {
+            Trees::HEIGHT
+        } else {
+            0
+        }
+    }
+
+    /// Depth under the lowest possible column from which no surface rule applies: chunks wholly
+    /// below it are stone (and caves) without heights.
+    fn surface_reach(&self) -> i64 {
+        let caves = self
+            .settings
+            .caves
+            .as_ref()
+            .map_or(0, |c| c.settings.surface_reach());
+        caves.max(self.settings.surface.dirt_depth)
+    }
+
+    /// Stone carved by the caves: the corners of the chunk at `origin` (`corner_heights`: the
+    /// heights of its 9x9 corner columns, `None` deep under every depth rule) decide between
+    /// uniform stone, uniform air and the 1-bit chunk. Without caves: uniform stone.
+    fn carved_stone(
+        &self,
+        origin: BlockPos,
+        corner_heights: Option<&[i64; 81]>,
+        stone: BlockState,
+    ) -> ChunkData {
+        let Some(caves) = &self.settings.caves else {
+            return ChunkData::uniform(stone);
+        };
+        let q = caves.chunk_corners(self.seed, origin, corner_heights);
+        match carve_mask(&q) {
+            CarveMask::Solid => ChunkData::uniform(stone),
+            CarveMask::Air => ChunkData::uniform(BlockState::AIR),
+            CarveMask::Mixed(occupancy) => {
+                ChunkData::from_occupancy(&occupancy, stone, BlockState::AIR)
+            }
+        }
+    }
+
+    /// The dense path of a chunk near the surface: the surface rules per column, then the caves
+    /// carve under the roof. Indexed like [`LocalPos::index`].
+    fn surface_voxels(
+        &self,
+        origin: BlockPos,
+        heights: &[i64; CHUNK_AREA],
+        highest: i64,
+        registry: &BlockRegistry,
+    ) -> Vec<BlockState> {
+        let blocks = SurfaceBlocks::new(registry, NAME);
+        let y0 = origin.y;
+        let mut dense = vec![BlockState::AIR; CHUNK_VOLUME];
+        for (column, &h) in heights.iter().enumerate() {
+            // `LocalPos` index: y << 10 | x << 5 | z, and `column` is x << 5 | z.
+            self.settings
+                .surface
+                .fill_column(&blocks, h, y0, |ly, state| {
+                    dense[(ly << (2 * CHUNK_SHIFT)) | column] = state;
+                });
+        }
+        let Some(caves) = &self.settings.caves else {
+            return dense;
+        };
+        let roof = caves.settings.surface_fade.roof;
+        // No voxel is under the roof of its column.
+        if y0 > highest.saturating_sub(roof) {
+            return dense;
+        }
+        let corner_heights = Caves::corner_heights(&self.settings.heightmap, self.seed, origin);
+        let q = caves.chunk_corners(self.seed, origin, Some(&corner_heights));
+        let solid = match carve_mask(&q) {
+            CarveMask::Solid => return dense,
+            CarveMask::Air => Box::new([0; CHUNK_AREA]),
+            CarveMask::Mixed(occupancy) => occupancy,
+        };
+        for (i, &word) in solid.iter().enumerate() {
+            // Word `ly * 32 + lx`, bit z.
+            let (ly, lx) = (i >> CHUNK_SHIFT, i & 31);
+            let y = y0 + ly as i64;
+            let mut carved = !word;
+            while carved != 0 {
+                let lz = carved.trailing_zeros() as usize;
+                carved &= carved - 1;
+                let column = (lx << CHUNK_SHIFT) | lz;
+                if y <= heights[column].saturating_sub(roof) {
+                    dense[(ly << (2 * CHUNK_SHIFT)) | column] = BlockState::AIR;
+                }
+            }
+        }
+        dense
+    }
+
+    /// Ground heights trees may grow on.
+    fn tree_grounds(&self) -> RangeInclusive<i64> {
+        let s = &self.settings.surface;
+        s.sand_level + 1..=s.snow_level.min(self.settings.heightmap.max_height())
+    }
+
+    /// The trees with a block in the chunk at `origin`, whose column heights are `heights` and
+    /// whose terrain is `terrain` (`None`: all air), and the log and leaves blocks. Empty
+    /// without trees or without those blocks.
+    fn trees_in(
+        &self,
+        origin: BlockPos,
+        heights: &[i64; CHUNK_AREA],
+        terrain: Option<&[BlockState]>,
+        registry: &BlockRegistry,
+    ) -> (Vec<Tree>, BlockState, BlockState) {
+        let (Some(trees), Some(log), Some(leaves)) = (
+            &self.settings.trees,
+            registry.by_name("boxel:log"),
+            registry.by_name("boxel:leaves"),
+        ) else {
+            return (Vec::new(), BlockState::AIR, BlockState::AIR);
+        };
+        let size = i64::from(CHUNK_SIZE);
+        let found = trees.reaching(self.seed, origin, self.tree_grounds(), |x, z| {
+            // Trees stay in the chunk's columns (see `Trees`).
+            let (lx, lz) = (x - origin.x, z - origin.z);
+            let ground = heights[((lx << CHUNK_SHIFT) | lz) as usize];
+            // Only trees with a block in this chunk need the (dearer) ground check.
+            if !self.settings.surface.is_grass(ground)
+                || ground + 1 >= origin.y + size
+                || ground + Trees::HEIGHT < origin.y
+            {
+                return None;
+            }
+            let ly = ground - origin.y;
+            let solid = if (0..size).contains(&ly) {
+                terrain.is_some_and(|t| {
+                    t[LocalPos::new(lx as u32, ly as u32, lz as u32).index()] != BlockState::AIR
+                })
+            } else {
+                self.is_solid_in(BlockPos::new(x, ground, z), ground)
+            };
+            solid.then_some(ground)
+        });
+        (found, log, leaves)
+    }
+}
+
+impl WorldGenerator for OverworldGenerator {
+    fn generate(&self, key: ChunkKey, registry: &BlockRegistry) -> ChunkData {
+        let heightmap = &self.settings.heightmap;
+        let origin = key.pos.origin();
+        let (y0, size) = (origin.y, i64::from(CHUNK_SIZE));
+        if y0 > heightmap.max_height() + self.reach_above() {
+            return ChunkData::uniform(BlockState::AIR);
+        }
+        let stone = || block(registry, "boxel:stone", NAME);
+        // Deep: every corner and voxel is below every depth rule of every column.
+        if y0 + size <= heightmap.min_height().saturating_sub(self.surface_reach()) {
+            return self.carved_stone(origin, None, stone());
+        }
+        let heights = heightmap.chunk_heights(self.seed, origin.x, origin.z);
+        let (lowest, highest) = heights
+            .iter()
+            .fold((i64::MAX, i64::MIN), |(lo, hi), &h| (lo.min(h), hi.max(h)));
+        let roof = self
+            .settings
+            .caves
+            .as_ref()
+            .map_or(i64::MIN, |c| c.settings.surface_fade.roof);
+        if y0 + size <= lowest.saturating_sub(self.settings.surface.dirt_depth)
+            && y0 + size - 1 <= lowest.saturating_sub(roof)
+        {
+            // All stone before carving, and all under the roof (so below every tree).
+            let corner_heights = Caves::corner_heights(heightmap, self.seed, origin);
+            return self.carved_stone(origin, Some(&corner_heights), stone());
+        }
+        // Air above the terrain, or the dense path; trees go into the dense voxels before they
+        // are encoded once.
+        let mut dense =
+            (y0 <= highest).then(|| self.surface_voxels(origin, &heights, highest, registry));
+        let (trees, log, leaves) = self.trees_in(origin, &heights, dense.as_deref(), registry);
+        if !trees.is_empty() {
+            let dense = dense.get_or_insert_with(|| vec![BlockState::AIR; CHUNK_VOLUME]);
+            Trees::place_dense(&trees, origin, dense, log, leaves);
+        }
+        dense.map_or_else(
+            || ChunkData::uniform(BlockState::AIR),
+            |d| ChunkData::from_dense(&d),
+        )
+    }
+
+    /// `i64::MIN ..= (max_height + 1 + tree height) >> 5`: no floor, and air above the highest
+    /// possible column and tree.
+    fn vertical_chunks(&self) -> RangeInclusive<i64> {
+        let top = self.settings.heightmap.max_height() + 1 + self.reach_above();
+        i64::MIN..=top >> CHUNK_SHIFT
+    }
+
+    fn name(&self) -> &str {
+        "overworld"
+    }
+}

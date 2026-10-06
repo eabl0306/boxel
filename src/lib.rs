@@ -88,7 +88,9 @@ pub mod prelude {
     #[cfg(feature = "voxel")]
     pub use boxel_world::prelude::*;
     #[cfg(feature = "voxel")]
-    pub use boxel_worldgen::{TerrainGenerator, WorldGenerator};
+    pub use boxel_worldgen::{
+        ForestGenerator, OverworldGenerator, TerrainGenerator, WorldGenerator,
+    };
 }
 
 /// Log, task pools, time, frame stats, input, window + winit runner, voxel world, renderer and

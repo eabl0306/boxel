@@ -1,6 +1,6 @@
 [package]
 name = "boxel_worldgen"
-description = "World generation traits and M0 generators (flat, noise terrain) for boxel"
+description = "World generation traits and generators (flat, terrain, forest, overworld with caves) for boxel"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

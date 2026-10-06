@@ -1,5 +1,11 @@
 //! World generation. A generator is a pure function of `(seed, key)`: no I/O, no global state,
-//! callable from any worker thread. M0 has one stage (no cross-chunk decoration yet).
+//! callable from any worker thread.
+//!
+//! Generators: [`FlatGenerator`] (layers), [`TerrainGenerator`] (the M0 heightmap, frozen by its
+//! goldens), [`ForestGenerator`] (that terrain with [`Trees`]) and [`OverworldGenerator`] (the
+//! heightmap over infinite stone carved by caves, with trees; its stages are in [`overworld`]).
+//! Every stage reads only its own chunk and the seed: features that cross chunk borders (trees,
+//! cave corners) are recomputed by each chunk they touch.
 
 use boxel_voxel::{
     BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SHIFT, CHUNK_SIZE, CHUNK_VOLUME, ChunkData,
@@ -7,9 +13,17 @@ use boxel_voxel::{
 };
 use std::ops::RangeInclusive;
 
+mod forest;
 pub mod noise;
+pub mod overworld;
+mod trees;
 
+pub use forest::ForestGenerator;
 pub use noise::Frequency;
+pub use overworld::{
+    CaveSettings, Caves, Heightmap, OverworldGenerator, OverworldSettings, SurfaceRules,
+};
+pub use trees::{Tree, TreeBlock, Trees};
 
 /// A chunk generator.
 ///
@@ -143,11 +157,6 @@ impl Default for TerrainSettings {
     }
 }
 
-/// Lacunarity of the terrain height fbm.
-const FBM_LACUNARITY: u32 = 2;
-/// Gain of the terrain height fbm.
-const FBM_GAIN: f64 = 0.5;
-
 /// Heightmap terrain (fbm value noise): bedrock at `bottom`, stone, dirt, grass/sand/snow top.
 /// Per chunk: Uniform air above the highest possible column or below `bottom`, and Uniform
 /// stone below the lowest possible column minus `dirt_depth`, without computing heights;
@@ -177,52 +186,32 @@ impl TerrainGenerator {
     /// octaves; more octaves or a higher frequency saturated the former noise sooner). Other
     /// denominators differ from it by its rounding.
     pub fn height_at(&self, x: i64, z: i64) -> i32 {
-        self.height_from_noise(noise::fbm_2d(self.seed, x, z, self.fbm()))
+        // Computed in i32 (`Heightmap` keeps the settings' types), so it fits.
+        self.heightmap().height_at(self.seed, x, z) as i32
     }
 
-    /// The height fbm.
-    fn fbm(&self) -> noise::Fbm {
-        let s = &self.settings;
-        noise::Fbm {
-            frequency: s.frequency,
-            octaves: s.octaves,
-            lacunarity: FBM_LACUNARITY,
-            gain: FBM_GAIN,
-        }
+    /// The heightmap stage of these settings.
+    pub fn heightmap(&self) -> Heightmap {
+        Heightmap::from_terrain(&self.settings)
     }
 
     /// Heights of the 32x32 columns whose min corner is `(x0, z0)`, indexed `x * 32 + z` (like
     /// one y layer of a chunk). Equal to [`TerrainGenerator::height_at`] per column, computed
     /// with one lattice hash per corner and octave.
     fn column_heights(&self, x0: i64, z0: i64) -> [i32; CHUNK_AREA] {
-        // `origin + i` cannot overflow: chunk origins are within the world limit (`+-2^61`).
-        let axis = |origin: i64| -> [i64; CHUNK_SIZE as usize] {
-            std::array::from_fn(|i| origin + i as i64)
-        };
-        let mut noise = [0.0; CHUNK_AREA];
-        noise::fbm_2d_grid(self.seed, &axis(x0), &axis(z0), self.fbm(), &mut noise);
-        noise.map(|n| self.height_from_noise(n))
-    }
-
-    /// `base_height + round(amplitude * n)` (saturating; `|amplitude * n| <= |amplitude|`).
-    fn height_from_noise(&self, n: f64) -> i32 {
-        let s = &self.settings;
-        s.base_height
-            .saturating_add((f64::from(s.amplitude) * n).round() as i32)
+        self.heightmap()
+            .chunk_heights(self.seed, x0, z0)
+            .map(|h| h as i32)
     }
 
     /// Upper bound of every column height: `base_height + ceil(|amplitude|)`.
     fn max_possible_height(&self) -> i32 {
-        let s = &self.settings;
-        s.base_height
-            .saturating_add(f64::from(s.amplitude).abs().ceil() as i32)
+        self.heightmap().max_height() as i32
     }
 
     /// Lower bound of every column height: `base_height - ceil(|amplitude|)`.
     fn min_possible_height(&self) -> i32 {
-        let s = &self.settings;
-        s.base_height
-            .saturating_sub(f64::from(s.amplitude).abs().ceil() as i32)
+        self.heightmap().min_height() as i32
     }
 }
 
@@ -319,7 +308,7 @@ impl WorldGenerator for TerrainGenerator {
 
 /// State of block `name`; panics with the name if `registry` lacks it (a programmer error: the
 /// generator and the registry do not match).
-fn block(registry: &BlockRegistry, name: &str, generator: &str) -> BlockState {
+pub(crate) fn block(registry: &BlockRegistry, name: &str, generator: &str) -> BlockState {
     registry
         .by_name(name)
         .unwrap_or_else(|| panic!("{generator}: block {name:?} is not in the registry"))

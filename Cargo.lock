@@ -420,6 +420,7 @@ version = "0.1.0-dev"
 dependencies = [
  "binary-greedy-meshing",
  "boxel_voxel",
+ "boxel_worldgen",
  "bytemuck",
  "criterion",
  "proptest",
