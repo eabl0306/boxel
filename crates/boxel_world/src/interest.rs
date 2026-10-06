@@ -259,7 +259,9 @@ impl Shape {
 }
 
 /// `center +- reach`, clipped to `bounds`; empty (`lo > hi`) if they do not meet. `center` is a
-/// clamped viewer center and `reach` at most `2 * MAX_RADIUS + 1`: no overflow.
+/// clamped viewer center and `reach` at most `2 * MAX_RADIUS + 1`: no overflow. Bounds are not
+/// clamped, so an empty result may be far apart (`hi - lo` can overflow): callers check
+/// `lo > hi` first, and a non-empty result lies within `center +- reach`.
 fn clip(center: i64, reach: i64, bounds: Option<&RangeInclusive<i64>>) -> (i64, i64) {
     let (mut lo, mut hi) = (center - reach, center + reach);
     if let Some(b) = bounds {
@@ -650,7 +652,13 @@ impl Planner {
         let bounds = self.bounds.as_ref();
         let total = self.shapes.iter().fold(0usize, |total, s| {
             let (lo, hi) = s.keep_layers(bounds);
-            let layers = usize::try_from(hi - lo + 1).unwrap_or(0);
+            // Empty when the bounds miss the viewer's layers: then `hi - lo` could overflow (a
+            // bound far outside the world limit). Otherwise both are within center +- reach.
+            let layers = if lo > hi {
+                0
+            } else {
+                usize::try_from(hi - lo + 1).unwrap_or(0)
+            };
             total.saturating_add(s.columns.keep_columns.saturating_mul(layers))
         });
         total.min(MAX_CAPACITY_HINT)

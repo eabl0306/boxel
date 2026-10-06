@@ -385,6 +385,25 @@ fn capacity_hint_is_the_keep_region() {
 }
 
 #[test]
+fn bounds_far_outside_the_world_limit_hold_nothing() {
+    // Vertical bounds are not clamped to the world limit. Bounds that miss the viewer's layers
+    // clip them to an empty range whose ends can be far apart (`i64::MIN` against layer 8).
+    let mut p = Planner::default();
+    for (y, bounds) in [
+        (20, i64::MIN..=i64::MIN),
+        (20, i64::MIN..=-100),
+        (-20, i64::MAX..=i64::MAX),
+        (MAX_CENTER, i64::MIN..=i64::MIN + 1),
+        (-MAX_CENTER, i64::MAX - 1..=i64::MAX),
+    ] {
+        p.update(&[(1, viewer(0, y, 0, 2, 1))], 10, Some(&bounds), Vec::new);
+        assert_eq!(p.capacity_hint(), 0, "viewer at y {y}, bounds {bounds:?}");
+        assert_eq!(p.next(), None, "nothing to load");
+        assert_eq!(p.level(ChunkPos::new(0, y, 0)), Level::Out);
+    }
+}
+
+#[test]
 fn viewers_are_clamped() {
     let v = Viewer::new(ChunkPos::new(i64::MAX, i64::MIN, 0), u32::MAX, u32::MAX);
     assert_eq!(v.radius, MAX_RADIUS);
@@ -426,6 +445,17 @@ enum Step {
     Toggle(u8),
 }
 
+/// Where a random walk happens on one axis: near the origin, across the former i32 edge of
+/// blocks (chunk 2^26), far past it, or against the world limit.
+fn far_base() -> impl Strategy<Value = i64> {
+    prop_oneof![
+        3 => Just(0i64),
+        1 => Just((1i64 << 26) - 6),
+        1 => Just(-(1i64 << 40)),
+        1 => Just(MAX_CENTER - 6),
+    ]
+}
+
 fn step() -> impl Strategy<Value = Step> {
     prop_oneof![
         6 => (0u8..2, -2i64..=2, -2i64..=2, -2i64..=2).prop_map(|(i, x, y, z)| Step::Move(i, x, y, z)),
@@ -441,24 +471,21 @@ proptest! {
     /// After every change and a full drain of the planner, the modeled slot set equals the
     /// from-scratch wanted set, and every kept unwanted slot is inside some keep region. The walk
     /// happens near the origin, across the former i32 edge of blocks (chunk 2^26), far past it,
-    /// and against the world limit (where viewers are clamped).
+    /// and against the world limit (where viewers are clamped), independently in x/z and in y
+    /// (the vertical bounds move with the walk).
     #[test]
     fn incremental_interest_matches_from_scratch(
         steps in proptest::collection::vec(step(), 1..24),
         hysteresis in 0u32..=2,
         bounded in any::<bool>(),
-        base in prop_oneof![
-            3 => Just(0i64),
-            1 => Just((1i64 << 26) - 6),
-            1 => Just(-(1i64 << 40)),
-            1 => Just(MAX_CENTER - 6),
-        ],
+        base in far_base(),
+        base_y in far_base(),
     ) {
-        let bounds = bounded.then_some(-3..=2);
+        let bounds = bounded.then_some(base_y - 3..=base_y + 2);
         let mut planner = Planner::default();
         let mut model = Model::default();
-        // `base` shifts x and z (y keeps the vertical bounds meaningful).
-        let mut viewers: [Option<Viewer>; 2] = [Some(viewer(base, 0, -base, 2, 1)), None];
+        // `base` shifts x and z, `base_y` shifts y and the bounds.
+        let mut viewers: [Option<Viewer>; 2] = [Some(viewer(base, base_y, -base, 2, 1)), None];
         for step in steps {
             match step {
                 Step::Move(i, x, y, z) | Step::Jump(i, x, y, z) => {
@@ -466,7 +493,7 @@ proptest! {
                     let slot = &mut viewers[usize::from(i)];
                     if let Some(v) = slot {
                         let c = if jump {
-                            ChunkPos::new(base + x, y, -base + z)
+                            ChunkPos::new(base + x, base_y + y, -base + z)
                         } else {
                             ChunkPos::new(v.center.x + x, v.center.y + y, v.center.z + z)
                         };
@@ -482,7 +509,7 @@ proptest! {
                     let slot = &mut viewers[usize::from(i)];
                     *slot = match slot {
                         Some(_) => None,
-                        None => Some(viewer(base + 3, 1, -base - 2, 1, 1)),
+                        None => Some(viewer(base + 3, base_y + 1, -base - 2, 1, 1)),
                     };
                 }
             }

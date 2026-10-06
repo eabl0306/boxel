@@ -30,10 +30,12 @@ pub(crate) mod support {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    /// Uniform stone from the bottom of `vertical` up to chunk y = -1, uniform air elsewhere (both
-    /// mesh fast paths), with an optional key that panics. Records every position it generates.
+    /// Uniform stone from the bottom of `vertical` up to chunk y = `surface - 1` (-1 by default),
+    /// uniform air elsewhere (both mesh fast paths), with an optional key that panics. Records
+    /// every position it generates.
     pub(crate) struct LayerGen {
         pub(crate) vertical: RangeInclusive<i64>,
+        pub(crate) surface: i64,
         pub(crate) panic_at: Option<ChunkPos>,
         pub(crate) generated: Arc<Mutex<Vec<ChunkPos>>>,
     }
@@ -42,6 +44,7 @@ pub(crate) mod support {
         pub(crate) fn new(vertical: RangeInclusive<i64>) -> Self {
             Self {
                 vertical,
+                surface: 0,
                 panic_at: None,
                 generated: Arc::default(),
             }
@@ -56,7 +59,7 @@ pub(crate) mod support {
                 key.pos
             );
             self.generated.lock().expect("lock").push(key.pos);
-            if key.pos.y < 0 && self.vertical.contains(&key.pos.y) {
+            if key.pos.y < self.surface && self.vertical.contains(&key.pos.y) {
                 ChunkData::uniform(registry.by_name("boxel:stone").expect("stone"))
             } else {
                 ChunkData::uniform(BlockState::AIR)
@@ -443,6 +446,83 @@ fn streaming_follows_the_viewer_far_from_the_origin() {
         loaded(&app),
         radius1_chunks(MAX_CHUNK_COORD, -MAX_CHUNK_COORD, -3..=1)
     );
+}
+
+/// The same in y, whose code paths are separate (layers, vertical bounds, known-air layers):
+/// bounded worlds whose layers straddle +2^31 and -2^31 voxels in y, then a world without a
+/// height limit following a viewer up and down across those edges and to the world limit.
+#[test]
+fn streaming_follows_the_viewer_far_in_y() {
+    let edge = 1i64 << 26;
+    let set = |generated: &Arc<std::sync::Mutex<Vec<ChunkPos>>>| -> BTreeSet<ChunkPos> {
+        std::mem::take(&mut *generated.lock().expect("lock"))
+            .into_iter()
+            .collect()
+    };
+    // Stone below layer `surface`, air from it up: the first air voxel is `surface * 32`.
+    let check_surface = |app: &App, x: i64, surface: i64, z: i64| {
+        let map = app.world().resource::<ChunkMap>();
+        let top = BlockPos::new(x * 32 + 5, surface * 32, z * 32 + 7);
+        assert_eq!(map.block_at(top), Some(BlockState::AIR), "air at {top:?}");
+        let below = BlockPos::new(top.x, top.y - 1, top.z);
+        assert_eq!(
+            map.block_at(below),
+            Some(BlockState(1)),
+            "stone at {below:?}"
+        );
+    };
+
+    // Fixed height: every layer of the generator (chunks around -2^26 or 2^26, the former i32
+    // edge of voxels), wherever the viewer is.
+    for surface in [edge - 1, -edge] {
+        let layers = surface - 3..=surface + 1;
+        let generator = LayerGen {
+            surface,
+            ..LayerGen::new(layers.clone())
+        };
+        let generated = Arc::clone(&generator.generated);
+        let mut app = world_app(generator, settings(64), Arc::new(InlineExecutor));
+        spawn_viewer(&mut app, ChunkPos::new(3, surface + 40, -2), 1);
+        settle(&mut app, 200);
+        let expected = radius1_chunks(3, -2, layers);
+        assert_eq!(loaded(&app), expected, "surface {surface}");
+        assert_eq!(set(&generated), expected, "generated, surface {surface}");
+        check_surface(&app, 3, surface, -2);
+    }
+
+    // No height limit: the viewer's layers (vertical radius 1, data one more) follow it, and
+    // layers outside the generator's are known air, created without a job.
+    let gen_layers = edge - 4..=edge;
+    let generator = LayerGen {
+        surface: edge - 1,
+        ..LayerGen::new(gen_layers.clone())
+    };
+    let generated = Arc::clone(&generator.generated);
+    let mut app = tall_world_app(generator, settings(64), Arc::new(InlineExecutor));
+    let viewer = spawn_tall_viewer(&mut app, ChunkPos::new(0, edge - 1, 0), 1, 1);
+    // Far jumps only (each unloads the previous area): across +2^31, to -2^31, back above
+    // +2^31, and past the world limit (clamped).
+    for (y, center) in [
+        (edge - 1, edge - 1),
+        (-edge, -edge),
+        (edge + 1, edge + 1),
+        (MAX_CHUNK_COORD * 2, MAX_CHUNK_COORD),
+    ] {
+        move_viewer(&mut app, viewer, ChunkPos::new(0, y, 0));
+        settle(&mut app, 200);
+        let expected = radius1_chunks(0, 0, center - 2..=center + 2);
+        assert_eq!(loaded(&app), expected, "viewer in layer {y}");
+        let in_generator: BTreeSet<ChunkPos> = expected
+            .iter()
+            .copied()
+            .filter(|p| gen_layers.contains(&p.y))
+            .collect();
+        assert_eq!(set(&generated), in_generator, "generated around layer {y}");
+    }
+    // Back at the surface: the true layers again.
+    move_viewer(&mut app, viewer, ChunkPos::new(0, edge - 1, 0));
+    settle(&mut app, 200);
+    check_surface(&app, 0, edge - 1, 0);
 }
 
 #[test]
