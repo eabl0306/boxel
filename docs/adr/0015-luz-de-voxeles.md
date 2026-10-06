@@ -324,8 +324,9 @@ Solo un uniform: sin remallado y sin subidas.
 - `DaylightPlugin` (en `DefaultPlugins`) agrega los dos recursos y el sistema. El `Extract` del
   render arma la `SceneLight` y el color del cielo del frame con ellos; sin el plugin queda un
   mediodía con `RenderSettings::clear_color`.
-- `voxel_world`: `[` y `]` mueven el reloj una hora, T lo pausa, G lo acelera 60 veces y
-  `--time HH:MM` elige la hora de inicio; las corridas con `--frames` dejan el reloj quieto.
+- `voxel_world`: `[` y `]` mueven el reloj una hora, T lo pausa, F lo acelera 60 veces (G es
+  caminar) y `--time HH:MM` elige la hora de inicio; las corridas con `--frames` dejan el reloj
+  quieto.
   `stress --time HH:MM` fija la hora y el reloj queda quieto toda la corrida.
 
 La luz de bloque se ve igual al mediodía y a medianoche (lo verifica `gpu_terrain`).

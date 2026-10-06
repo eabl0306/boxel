@@ -445,6 +445,7 @@ name = "boxel_physics"
 version = "0.1.0-dev"
 dependencies = [
  "boxel_app",
+ "boxel_diagnostic",
  "boxel_ecs",
  "boxel_math",
  "boxel_transform",

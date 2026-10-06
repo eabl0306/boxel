@@ -153,7 +153,7 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_worldgen` | trait `WorldGenerator`; generadores `FlatGenerator`, `TerrainGenerator`, `ForestGenerator` (terreno con árboles) y `OverworldGenerator` (superficie sobre piedra infinita hacia abajo, con cuevas y árboles; etapas en `overworld`: `Heightmap`, `SurfaceRules`, `Caves`, más `Trees`); ruido 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`) | voxel |
 | `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, eventos, `ChunkStore`, reloj del mundo (`TimeOfDay`, `DaylightCurve`, `DaylightPlugin`) | app, voxel, mesh, light, worldgen, transform, diagnostic |
 | `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `SceneLight` (luz del cielo, ambiente y curva de brillo del frame), `PresentSettings` (vsync en tiempo de ejecución), texturas procedurales, screenshots | gfx, shaders, world, camera, window |
-| `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::solid`), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas. Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`), `PhysicsQuery`. Hoy fase P1: cuerpos, gravedad y entidades vienen en P2 a P4 | ecs, app, math, voxel, world |
+| `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::solid`), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas, el integrador de un cuerpo (`step_body`, `predict`). Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`; pasos en `FixedPostUpdate`, interpolación en `AfterFixedMainLoop`), `PhysicsQuery`, cuerpos (`RigidBody`, `Collider`, `Velocity`, `BodyPosition`, `Contacts`, `Interpolated`, `Teleport`, `Frozen`), `CharacterController` y `VoxelImpact`. Hoy fase P2: entre entidades y proyectiles vienen en P3 y P4 | ecs, app, math, transform, voxel, world, diagnostic |
 | `boxel_facade_check` | solo CI: prueba que los derives resuelven `::boxel::ecs` para un usuario que depende solo de `boxel` | fachada |
 | `vendor/*` (7 crates) | ECS y tareas (fork de Bevy) | - |
 
@@ -574,6 +574,10 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   la vista fija (delta = paso fijo), como en Bevy. `RunFixedMainLoop` se divide en los sets
   encadenados `RunFixedMainLoopSystems` (los nombres de Bevy): `BeforeFixedMainLoop` (muestrear
   la entrada para los pasos), `FixedMainLoop` (los pasos) y `AfterFixedMainLoop` (interpolar).
+  `PhysicsPlugin` baja el tope a 3 pasos (para toda la app: por debajo de 21.3 fps el juego
+  de paso fijo va en cámara lenta; `voxel_world` deja los 8) y corre `FixedPostUpdate` y
+  `RunFixedMainLoop` con el ejecutor de un hilo (sus sistemas van encadenados; el multi-hilo
+  solo sumaba unos 24 µs por corrida).
 - Mensajes y paso fijo: `TimePlugin` agrega `signal_message_update_system` en `FixedPostUpdate`
   y deja la rotación de mensajes en espera hasta que corra un paso fijo. Sin esto, un lector en
   `FixedUpdate` perdía los mensajes escritos en `Update` cuando los frames iban a más del doble
@@ -1088,8 +1092,11 @@ schedule `Shutdown` es el lugar para el `flush` final.
 - Overlay F3 (`boxel_debug`): frames mostrados por segundo (de `RenderInfo::frames_presented`) y
   updates por segundo por separado, tiempo de frame, límite, vsync y modo de presentación, GPU,
   cámara y contadores de chunks. Teclas opcionales `FrameKeys` (F5 límite, F6 vsync). Las apps
-  suman líneas propias con `OverlayLines` (`voxel_world` muestra el bloque apuntado y la
-  selección) y `Crosshair` dibuja una mira en el centro.
+  suman líneas propias con `OverlayLines` (`voxel_world` muestra el bloque apuntado, la
+  selección, el modo, con el estado del jugador si camina, y la línea de física) y `Crosshair`
+  dibuja una mira en el centro.
+- Línea `physics` de `DiagnosticsBoard` (`PhysicsStats`): cuerpos, dinámicos, congelados,
+  impactos y tiempo del último paso de física.
 - `FrameTimeHistory`: los últimos frames (4096 por defecto, mínimo 1024) con su tiempo real
   (`Time::real_delta`); `summary()` da p50, p95, p99, p99.9, máximo, promedio y 1% low.
 - Tirones mientras se carga el mundo: `examples/stress.rs` y `just bench-*`

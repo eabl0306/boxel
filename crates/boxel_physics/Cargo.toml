@@ -1,6 +1,6 @@
 [package]
 name = "boxel_physics"
-description = "Minimal own physics for boxel: per-axis AABB sweep against the voxel grid and an exact voxel raycast"
+description = "Minimal own physics for boxel: bodies with per-axis AABB sweeps against the voxel grid and an exact voxel raycast"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,21 +8,22 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# Tracing spans inside the physics systems (the facade's `trace`). Reserved: phase P1 has no
-# per-tick systems yet, so it adds nothing today.
+# Tracing spans inside the physics systems (the facade's `trace`). Reserved: the per-system
+# spans come from boxel_ecs/trace, and the step has no inner spans yet.
 trace = []
 
 [dependencies]
 boxel_ecs.workspace = true
 boxel_app.workspace = true
+boxel_diagnostic.workspace = true
 boxel_math.workspace = true
+boxel_transform.workspace = true
 boxel_voxel.workspace = true
 boxel_world.workspace = true
 
 [dev-dependencies]
 # Tests get system/component names in ECS diagnostics (dev-only; users opt in through boxel/debug).
 boxel_ecs = { workspace = true, features = ["debug"] }
-boxel_transform.workspace = true
 boxel_worldgen.workspace = true
 proptest.workspace = true
 criterion.workspace = true

@@ -46,11 +46,13 @@ just run voxel_world --tier mid
 Controles: clic izquierdo captura el mouse, Escape (o salir de la ventana) lo suelta. WASD para
 moverse, Espacio sube, Shift izquierdo baja, Ctrl izquierdo acelera. Con el mouse capturado, clic
 izquierdo rompe el bloque de la mira y clic derecho pone el bloque elegido (teclas 1 a 9 y 0; las
-lámparas de color van del 7 al 0), a 6 bloques como máximo. F3 muestra el overlay de debug (con
-el bloque apuntado, la luz en el ojo y en la mira, y la hora), F5 cambia el límite de FPS (30,
-60, 144, 240, sin límite) y F6 prende o apaga el vsync.
+lámparas de color van del 7 al 0), a 6 bloques como máximo. G cambia entre volar y caminar:
+caminando hay gravedad, WASD camina hacia donde mira la cámara y Espacio salta (`--walk` arranca
+caminando). F3 muestra el overlay de debug (con el bloque apuntado, el modo, una línea de física,
+la luz en el ojo y en la mira, y la hora), F5 cambia el límite de FPS (30, 60, 144, 240, sin
+límite) y F6 prende o apaga el vsync.
 
-Día y noche: un día dura 20 minutos. `[` y `]` mueven el reloj una hora, T lo pausa y G lo
+Día y noche: un día dura 20 minutos. `[` y `]` mueven el reloj una hora, T lo pausa y F lo
 acelera 60 veces.
 
 Opciones útiles: `--fps-limit N` (0 = sin límite), `--vsync on|off`, `--seed N`,
@@ -65,6 +67,18 @@ reloj queda quieto en `--time`.
 `--wait-chunks` empieza a contar frames cuando el terreno terminó de cargar y
 `--screenshot shot.png` guarda una captura en el frame N. `--duration SEG` corre el juego normal
 SEG segundos; al salir imprime updates y frames mostrados por segundo y el uso de CPU.
+
+**physics_sandbox**: la física propia (ADR 0016) en un mundo generado. Arranca caminando sobre el
+suelo: WASD camina, Espacio salta, G vuela, Q tira un objeto que cae y se queda quieto. F3 muestra
+el estado del jugador, la línea de física y los objetos (los cuerpos todavía no se dibujan).
+
+```bash
+cargo run --release --example physics_sandbox
+cargo run --release --example physics_sandbox -- --drop-test
+```
+
+`--drop-test` suelta 100 objetos desde 40 bloques y sale con 0 si todos quedan quietos, o con 3
+si no.
 
 **headless_world**: sin ventana ni GPU. Genera y mallea el mundo alrededor de un punto e imprime
 cuántos chunks y quads salieron y cuánto tardó. Sirve en CI y para medir la carga.
