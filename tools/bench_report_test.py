@@ -101,6 +101,8 @@ class FormatTest(unittest.TestCase):
         static = copy.deepcopy(SAMPLE)
         static['run']['scenario'] = 'static'
         self.assertEqual(br.title(static), 'static r16')
+        static['run']['fps_limit'] = 60
+        self.assertEqual(br.title(static), 'static r16 limit 60 fps')
         self.assertEqual(br.get(SAMPLE, ('frames', 'crossing', 'max_ms')), 6.5)
         self.assertIsNone(br.get(SAMPLE, ('frames', 'missing', 'max_ms')))
 
@@ -213,6 +215,28 @@ class OutputTest(unittest.TestCase):
         self.assertIn('2-amd.md -> 3-amd.json', out)
         self.assertIn('| p99 ms | 9 | 9 | 0 % |  |', out)
         self.assertNotIn('Note:', out)
+
+    def test_compare_directories_keeps_fps_limits_apart(self):
+        # Old runs have no fps_limit: they were all uncapped (0).
+        named = copy.deepcopy(SAMPLE)
+        named['run']['fps_limit'] = 0
+        capped = copy.deepcopy(SAMPLE)
+        capped['run']['fps_limit'] = 144
+        capped['frames']['avg_fps'] = 144.0
+        self.write('1-fly.md', SAMPLE, 'base')
+        self.write('2-capped.md', capped, 'base')
+        self.write('3-fly.md', named, 'new')
+        self.write('4-capped.md', capped, 'new')
+        code, out, _ = run_main('--compare', os.path.join(self.dir.name, 'base'),
+                                os.path.join(self.dir.name, 'new'))
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count('### '), 2, 'uncapped with uncapped, capped with capped')
+        self.assertIn('1-fly.md -> 3-fly.md', out)
+        self.assertIn('### fly r16 32 vox/s limit 144 fps: 2-capped.md -> 4-capped.md', out)
+        self.assertNotIn('Note:', out)
+        code, out, _ = run_main('--compare', self.write('a.md', SAMPLE), self.write('b.md', capped))
+        self.assertEqual(code, 0)
+        self.assertIn('Note: the settings differ (fps limit 0 -> 144)', out)
 
     def test_usage_errors(self):
         self.assertEqual(run_main()[0], 1)

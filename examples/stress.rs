@@ -77,6 +77,7 @@ usage: stress [--scenario static|fly|dive|spin] [GPU options] [options]
                       not with the overworld, which has no floor)
   --arena-quads N     renderer quad arena (default 8388608, 25165824 with the overworld)
   --chunk-slots N     renderer chunk table (default 32768, 65536 with the overworld)
+  --fps-limit N       at most N updates per second (default 0: unlimited, the uncapped loop)
   --spans             busy time per system and span in each frame, added to the summary (needs
                       a build with --features trace)
   --spans-csv PATH    also write it per frame (implies --spans)
@@ -157,6 +158,8 @@ struct Options {
     /// `--arena-quads` and `--chunk-slots` (`None`: the world's default).
     arena_quads: Option<u32>,
     chunk_slots: Option<u32>,
+    /// `--fps-limit` (0: unlimited).
+    fps_limit: u32,
     spans: bool,
     spans_csv: Option<PathBuf>,
 }
@@ -193,6 +196,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         fixed_height: false,
         arena_quads: None,
         chunk_slots: None,
+        fps_limit: 0,
         spans: false,
         spans_csv: None,
     };
@@ -306,6 +310,13 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                     .ok_or_else(|| format!("{flag}: {r} is not in 0..=64"))?;
             }
             "--fixed-height" => o.fixed_height = true,
+            "--fps-limit" => {
+                let n = number(flag, &value()?)?;
+                o.fps_limit = u32::try_from(n)
+                    .ok()
+                    .filter(|n| *n <= 100_000)
+                    .ok_or_else(|| format!("{flag}: {n} is not in 0..=100000"))?;
+            }
             "--spans" => o.spans = true,
             "--spans-csv" => {
                 o.spans_csv = Some(PathBuf::from(value()?));
@@ -982,6 +993,7 @@ fn main() -> AppExit {
         duration_s: options.duration.as_secs_f64(),
         warmup_s: options.warmup.as_secs_f64(),
         present,
+        fps_limit: options.fps_limit,
         window: options.size,
         build: if cfg!(debug_assertions) {
             "debug"
@@ -1041,6 +1053,7 @@ fn main() -> AppExit {
         });
     }
 
+    let fps_limit = FrameLimit::new(options.fps_limit);
     let mut app = App::new();
     app.add_plugins(plugins);
     add_bench(
@@ -1053,8 +1066,9 @@ fn main() -> AppExit {
     if let Some(times) = times {
         app.insert_resource(SpanRecorder::new(times));
     }
-    // The bench measures the uncapped loop (the engine default is 144 fps).
-    app.insert_resource(FrameLimit::UNLIMITED);
+    // The bench measures the uncapped loop unless --fps-limit says otherwise (the engine default
+    // is 144 fps).
+    app.insert_resource(fps_limit);
     app.run()
 }
 
@@ -1080,6 +1094,7 @@ mod tests {
         assert_eq!(o.world, WorldChoice::default());
         assert_eq!(o.world.label(), "forest");
         assert_eq!(o.render_capacity(), (8 << 20, 32_768));
+        assert_eq!(o.fps_limit, 0, "unlimited");
         assert_eq!((o.csv, o.summary), (None, None));
     }
 
@@ -1109,6 +1124,8 @@ mod tests {
             "--no-trees",
             "--seed",
             "9",
+            "--fps-limit",
+            "144",
         ])
         .expect("valid")
         .expect("not help");
@@ -1126,6 +1143,9 @@ mod tests {
         assert!(!o.world.trees);
         assert_eq!(o.world.label(), "terrain");
         assert_eq!(o.seed, 9);
+        assert_eq!(o.fps_limit, 144);
+        let o = parse(&["--fps-limit=0"]).expect("valid").expect("not help");
+        assert_eq!(FrameLimit::new(o.fps_limit), FrameLimit::UNLIMITED);
         let o = parse(&["--timeout", "30", "--scenario", "spin"])
             .expect("valid")
             .expect("not help");
@@ -1167,6 +1187,9 @@ mod tests {
             &["--arena-quads", "100"],
             &["--chunk-slots", "0"],
             &["--chunk-slots", "2000000"],
+            &["--fps-limit", "-1"],
+            &["--fps-limit", "100001"],
+            &["--fps-limit"],
             &["--world", "overworld", "--fixed-height"],
             &["--caves", "mc"],
         ] {

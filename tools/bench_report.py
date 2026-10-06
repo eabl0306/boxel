@@ -7,7 +7,7 @@ usage:
 
 RUN, BASE and NEW are summary files (Markdown with a JSON block, or plain JSON) or directories
 (every summary inside, not recursive). Comparing two directories pairs the runs with the same
-world, scenario, radius, speed, backend, tier and adapter. A metric that was 0 in BASE has no percent
+world, scenario, radius, speed, fps limit, backend, tier and adapter. A metric that was 0 in BASE has no percent
 change ('n/a') but still gets a verdict (0 spikes before, 3 after: worse). Output is Markdown,
 so it can go into docs as is.
 Exit codes: 0 ok, 1 usage error or a file without a summary, 2 nothing to compare."""
@@ -48,6 +48,7 @@ SETTINGS = [
     ('radius', ('run', 'radius')),
     ('vertical', ('run', 'vertical')),
     ('speed', ('run', 'speed')),
+    ('fps limit', ('run', 'fps_limit')),
     ('seed', ('run', 'seed')),
     ('backend', ('run', 'backend')),
     ('tier', ('run', 'tier')),
@@ -91,6 +92,8 @@ def load(path):
         # Runs from before --world streamed the forest, or the plain terrain without trees.
         if not run.get('world'):
             run['world'] = 'forest' if run.get('trees', True) else 'terrain'
+        # Runs from before --fps-limit were all uncapped.
+        run.setdefault('fps_limit', 0)
     return data
 
 
@@ -127,15 +130,17 @@ def title(run):
         text += f" {fmt(r['speed'])} vox/s"
     if r.get('world', 'forest') != 'forest':
         text += f" {r['world']}"
+    if r.get('fps_limit'):
+        text += f" limit {r['fps_limit']} fps"
     return text
 
 
 def key(run):
-    """Runs with the same key are comparable (same world, scenario, radius, height, speed and
-    GPU)."""
+    """Runs with the same key are comparable (same world, scenario, radius, height, speed, fps
+    limit and GPU)."""
     r = run['run']
     return (r.get('world', 'forest'), r['scenario'], r['radius'], r.get('vertical', 'fixed'),
-            r['speed'], r['backend'], r['tier'], r.get('adapter'))
+            r['speed'], r.get('fps_limit') or 0, r['backend'], r['tier'], r.get('adapter'))
 
 
 def fmt(value):
@@ -229,8 +234,8 @@ def main(argv):
             else:
                 matched = [(load(base), load(new))]
             if not matched:
-                print('no runs with the same scenario, radius, speed, backend, tier and adapter',
-                      file=sys.stderr)
+                print('no runs with the same scenario, radius, speed, fps limit, backend, tier and '
+                      'adapter', file=sys.stderr)
                 return 2
             print('\n\n'.join(compare(b, n) for b, n in matched))
             return 0

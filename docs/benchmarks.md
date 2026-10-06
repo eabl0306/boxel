@@ -24,9 +24,14 @@ Opciones útiles (todas en `cargo run --release --example stress -- --help`): `-
 `--speed V`, `--duration S` (20 por defecto), `--warmup S` (2), `--seed N`, y las de GPU de
 siempre: `--backend vulkan`, `--adapter nvidia`, `--tier mid`.
 
-El stress corre siempre sin límite de FPS. `--vertical-radius N` fija cuántos chunks se cargan
-arriba y abajo de la cámara (8 por defecto). `--fixed-height` carga solo las capas del generador,
-como en M0: úsalo para comparar con corridas viejas, que no tienen radio vertical.
+El stress corre sin límite de FPS. `--fps-limit N` lo limita a N frames por segundo (0, el valor
+por defecto, es sin límite), por ejemplo para ver cómo se comporta con el límite de 144 de un
+juego. El resumen anota el límite y `tools/bench_report.py` no mezcla corridas con límites
+distintos (las corridas viejas, sin el dato, cuentan como sin límite).
+
+`--vertical-radius N` fija cuántos chunks se cargan arriba y abajo de la cámara (8 por defecto).
+`--fixed-height` carga solo las capas del generador, como en M0: úsalo para comparar con corridas
+viejas, que no tienen radio vertical.
 
 El mundo se elige con `--world`: `forest` (por defecto, el de todas las corridas anteriores),
 `terrain`, `flat` u `overworld` (piedra infinita hacia abajo con cuevas). Con el overworld,
@@ -57,9 +62,10 @@ Para que los números sirvan:
 Todos esperan a que el mundo termine de cargar, corren `--warmup` segundos sin medir y después
 miden `--duration` segundos.
 
-El bucle corre sin límite de fps y dibuja en cada vuelta, aunque la ventana esté tapada. Los fps
-de acá dicen cuántos frames puede hacer el motor, no cuántos muestra el monitor: solo se presenta
-un frame por cada refresco del monitor (unos 144 por segundo) y el resto se dibuja sin mostrarse.
+Sin `--fps-limit`, el bucle corre sin límite de fps y dibuja en cada vuelta, aunque la ventana
+esté tapada. Los fps de acá dicen cuántos frames puede hacer el motor, no cuántos muestra el
+monitor: solo se presenta un frame por cada refresco del monitor (unos 144 por segundo) y el resto
+se dibuja sin mostrarse.
 
 ## Qué significa cada número
 
@@ -98,7 +104,7 @@ just bench-report --compare carpeta-antes/ carpeta-despues/
 `--compare` muestra cada número, el cambio en % y si mejoró o empeoró. Si antes era 0 no hay %,
 pero igual dice si empeoró (por ejemplo, tirones nuevos). Si las corridas tienen otra
 configuración (radio, GPU, velocidad), lo avisa. Con dos carpetas empareja las corridas del mismo
-escenario, radio, velocidad, backend, tier y GPU.
+escenario, radio, velocidad, límite de fps, backend, tier y GPU.
 
 Flujo sugerido: `just bench-all` antes del cambio, mover `bench-results/` a otra carpeta,
 aplicar el cambio, `just bench-all` otra vez y comparar las dos carpetas.

@@ -133,6 +133,9 @@ pub struct RunInfo {
     pub driver: String,
     /// Requested present mode (`--present`, `BOXEL_PRESENT`, or `immediate` by default).
     pub present: String,
+    /// Updates per second cap (`--fps-limit`); 0 = unlimited, the default and the only mode of
+    /// runs from before the option.
+    pub fps_limit: u32,
     /// Window size in logical pixels.
     pub window: (u32, u32),
     /// `release` or `debug`.
@@ -712,6 +715,7 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
         ("class", Json::Str(info.class.clone())),
         ("driver", Json::Str(info.driver.clone())),
         ("present", Json::Str(info.present.clone())),
+        ("fps_limit", Json::uint(info.fps_limit)),
         (
             "window",
             Json::Str(format!("{}x{}", info.window.0, info.window.1)),
@@ -839,7 +843,7 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
 /// Heading of the JSON block (`tools/bench_report.py` reads the first JSON code block after it).
 pub const DATA_HEADING: &str = "## Data";
 
-/// Short name of a run: `fly r16 32 vox/s`, `static r12`.
+/// Short name of a run: `fly r16 32 vox/s`, `static r12`, `fly r32 64 vox/s limit 144 fps`.
 pub fn run_title(info: &RunInfo) -> String {
     let mut title = if matches!(info.scenario.as_str(), "fly" | "dive") {
         format!("{} r{} {} vox/s", info.scenario, info.radius, info.speed)
@@ -849,6 +853,9 @@ pub fn run_title(info: &RunInfo) -> String {
     // The forest (the default) keeps the titles of the earlier runs.
     if !info.world.is_empty() && info.world != "forest" {
         title = format!("{title} {}", info.world);
+    }
+    if info.fps_limit > 0 {
+        title = format!("{title} limit {} fps", info.fps_limit);
     }
     title
 }
@@ -873,13 +880,18 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
     );
     let _ = writeln!(
         out,
-        "- GPU: {}, {} {} ({}), driver `{}`, present {}, window {}x{}.",
+        "- GPU: {}, {} {} ({}), driver `{}`, present {}, fps limit {}, window {}x{}.",
         info.adapter,
         info.backend,
         info.tier,
         info.class,
         info.driver,
         info.present,
+        if info.fps_limit == 0 {
+            "none".to_string()
+        } else {
+            info.fps_limit.to_string()
+        },
         info.window.0,
         info.window.1,
     );
@@ -1451,6 +1463,8 @@ mod tests {
         let data = data.split("\n```").next().expect("closed block");
         assert!(data.starts_with("{\n  \"format\": 1,"));
         assert!(data.contains("\"catch_up_s\": 1.5"));
+        assert!(data.contains("\"fps_limit\": 0"));
+        assert!(text.contains(", fps limit none, window "));
         assert!(data.contains("\"presented\": false"));
         assert!(text.contains("| frame | t s | ms | crossed | presented | generated |"));
         assert!(
@@ -1477,6 +1491,8 @@ mod tests {
         assert_eq!(run_title(&info), "static r16 overworld/mc");
         info.world = String::new();
         assert_eq!(run_title(&info), "static r16");
+        info.fps_limit = 144;
+        assert_eq!(run_title(&info), "static r16 limit 144 fps");
     }
 
     #[test]
