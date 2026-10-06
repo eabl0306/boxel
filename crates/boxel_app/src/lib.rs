@@ -5,6 +5,8 @@
 //! Frame structure (frozen): `Main` runs `PreStartup`/`Startup`/`PostStartup` once, then every
 //! frame `First`, `PreUpdate`, `RunFixedMainLoop`, `Update`, `PostUpdate`, `Last`, plus any label
 //! inserted with [`MainScheduleOrder::insert_after`] (the renderer inserts `Render` after `Last`).
+//! `RunFixedMainLoop` is split in the chained [`RunFixedMainLoopSystems`]: before the fixed
+//! steps, the steps (`FixedMain` zero or more times, see [`FixedTime`]) and after them.
 //! [`Shutdown`] runs once at exit (runners call [`App::shutdown`]).
 //!
 //! Frame rate: [`FrameLimit`] (default 144 fps, 0 = unlimited) is read by the runners before
@@ -28,7 +30,7 @@ pub use runner::{RunMode, ScheduleRunnerPlugin};
 pub use schedules::{
     First, FixedMain, FixedMainScheduleOrder, FixedPostUpdate, FixedPreUpdate, FixedUpdate, Last,
     Main, MainScheduleOrder, MainSchedulePlugin, PostStartup, PostUpdate, PreStartup, PreUpdate,
-    RunFixedMainLoop, Shutdown, Startup, Update,
+    RunFixedMainLoop, RunFixedMainLoopSystems, Shutdown, Startup, Update,
 };
 pub use task_pool::{TaskPoolOptions, TaskPoolPlugin, TaskPoolThreadAssignmentPolicy};
 pub use time::{
@@ -39,9 +41,9 @@ pub use time::{
 /// Common app items (re-exported by `boxel::prelude`).
 pub mod prelude {
     pub use crate::{
-        App, AppExit, First, FixedTime, FixedUpdate, FrameLimit, Last, Main, MainScheduleOrder,
-        Plugin, PluginGroup, PluginGroupBuilder, PostStartup, PostUpdate, PreStartup, PreUpdate,
-        ScheduleRunnerPlugin, Shutdown, Startup, TaskPoolOptions, TaskPoolPlugin, Time, TimePlugin,
-        Update,
+        App, AppExit, First, FixedPostUpdate, FixedTime, FixedUpdate, FrameLimit, Last, Main,
+        MainScheduleOrder, Plugin, PluginGroup, PluginGroupBuilder, PostStartup, PostUpdate,
+        PreStartup, PreUpdate, RunFixedMainLoop, RunFixedMainLoopSystems, ScheduleRunnerPlugin,
+        Shutdown, Startup, TaskPoolOptions, TaskPoolPlugin, Time, TimePlugin, Update,
     };
 }

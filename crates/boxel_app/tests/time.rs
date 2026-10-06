@@ -236,3 +236,83 @@ fn defaults() {
     assert_eq!(fixed.steps_last_frame(), 0);
     assert_eq!(fixed.overruns(), FixedOverruns::default());
 }
+
+#[test]
+fn the_step_limit_can_be_lowered() {
+    // 200 ms frames on a 64 Hz step: 12 steps due per frame; a limit of 3 runs 3 and drops 9.
+    let mut app = app_with_frames(&[MS * 200]);
+    app.world_mut()
+        .resource_mut::<FixedTime>()
+        .set_max_steps_per_frame(3);
+    app.update();
+    app.update();
+    let fixed = app.world().resource::<FixedTime>();
+    assert_eq!(fixed.max_steps_per_frame(), 3);
+    assert_eq!((steps(&app), fixed.steps_last_frame()), (3, 3));
+    assert!(
+        fixed.accumulator() < fixed.timestep(),
+        "whole steps dropped"
+    );
+    assert_eq!(
+        fixed.overruns().startup_frames,
+        1,
+        "dropped inside the startup grace"
+    );
+    // Raising it again takes effect on the next frame.
+    app.world_mut()
+        .resource_mut::<FixedTime>()
+        .set_max_steps_per_frame(20);
+    app.update();
+    // 200 ms plus the leftover of the previous frame (less than one step): 12 or 13 steps.
+    let ran = app.world().resource::<FixedTime>().steps_last_frame();
+    assert!((12..=13).contains(&ran), "{ran}");
+}
+
+#[test]
+#[should_panic(expected = "at least one step per frame")]
+fn a_step_limit_of_zero_is_rejected() {
+    FixedTime::default().set_max_steps_per_frame(0);
+}
+
+/// What ran, in order.
+#[derive(Resource, Default)]
+struct Log(Vec<&'static str>);
+
+#[test]
+fn before_and_after_fixed_main_loop_wrap_the_steps_of_each_frame() {
+    use boxel_app::{RunFixedMainLoop, RunFixedMainLoopSystems};
+    // 40 ms frames on a 15.625 ms step: 2, 3, 2, 3... steps.
+    let mut app = app_with_frames(&[MS * 40]);
+    app.init_resource::<Log>()
+        .add_systems(
+            RunFixedMainLoop,
+            (
+                (|mut log: ResMut<Log>| log.0.push("before"))
+                    .in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop),
+                (|mut log: ResMut<Log>, time: Res<Time>, fixed: Res<FixedTime>| {
+                    // The frame view of Time is back; the leftover is less than one step.
+                    assert!(time.delta() == Duration::ZERO || time.delta() == MS * 40);
+                    assert!(fixed.overstep_fraction() < 1.0);
+                    log.0.push("after");
+                })
+                .in_set(RunFixedMainLoopSystems::AfterFixedMainLoop),
+            ),
+        )
+        .add_systems(FixedUpdate, |mut log: ResMut<Log>| log.0.push("fixed"));
+    app.update();
+    assert_eq!(
+        std::mem::take(&mut app.world_mut().resource_mut::<Log>().0),
+        ["before", "after"],
+        "the first frame has delta 0: no step, but both sides run"
+    );
+    app.update();
+    assert_eq!(
+        std::mem::take(&mut app.world_mut().resource_mut::<Log>().0),
+        ["before", "fixed", "fixed", "after"]
+    );
+    app.update();
+    assert_eq!(
+        std::mem::take(&mut app.world_mut().resource_mut::<Log>().0),
+        ["before", "fixed", "fixed", "fixed", "after"]
+    );
+}

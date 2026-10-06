@@ -1,4 +1,6 @@
-use crate::{App, First, FixedMain, FixedPostUpdate, Plugin, RunFixedMainLoop};
+use crate::{
+    App, First, FixedMain, FixedPostUpdate, Plugin, RunFixedMainLoop, RunFixedMainLoopSystems,
+};
 use boxel_ecs::message::{
     MessageRegistry, ShouldUpdateMessages, message_update_system, signal_message_update_system,
 };
@@ -264,9 +266,24 @@ impl FixedTime {
             false
         }
     }
-    /// Most steps one frame runs (8); whole steps beyond it are dropped.
+    /// Most steps one frame runs (default 8); whole steps beyond it are dropped.
     pub fn max_steps_per_frame(&self) -> u32 {
         self.max_steps_per_frame
+    }
+    /// Sets the most steps one frame runs (default 8). After a hitch, a frame runs up to this
+    /// many steps to catch up and drops the rest (counted in [`FixedTime::overruns`]). A lower
+    /// limit bounds the cost of a catch-up frame when steps are expensive (many physics bodies:
+    /// 3 is a good value), at the price of simulated time lost sooner.
+    ///
+    /// # Panics
+    ///
+    /// If `steps` is 0: no fixed step could ever run.
+    pub fn set_max_steps_per_frame(&mut self, steps: u32) {
+        assert!(
+            steps >= 1,
+            "FixedTime::set_max_steps_per_frame: at least one step per frame, got 0"
+        );
+        self.max_steps_per_frame = steps;
     }
     /// Steps [`run_fixed_main_loop`] ran in the latest frame.
     pub fn steps_last_frame(&self) -> u32 {
@@ -344,11 +361,11 @@ pub fn time_system(mut time: ResMut<Time>) {
     time.update_with_instant(Instant::now());
 }
 
-/// Exclusive system in `RunFixedMainLoop`: accumulates `Time::delta` into [`FixedTime`] and
-/// runs `FixedMain` while `expend()` returns true, at most `max_steps_per_frame` times. Whole
-/// steps left over after that are dropped (the remainder is kept) and counted in
-/// [`FixedTime::overruns`]. While `FixedMain` runs, [`Time`] holds the fixed-step view (see
-/// [`Time`]).
+/// Exclusive system in `RunFixedMainLoop` ([`RunFixedMainLoopSystems::FixedMainLoop`]):
+/// accumulates `Time::delta` into [`FixedTime`] and runs `FixedMain` while `expend()` returns
+/// true, at most `max_steps_per_frame` times. Whole steps left over after that are dropped (the
+/// remainder is kept) and counted in [`FixedTime::overruns`]. While `FixedMain` runs, [`Time`]
+/// holds the fixed-step view (see [`Time`]).
 ///
 /// Overrun warnings: overruns in the first [`FixedTime::startup_grace_frames`] updates are
 /// expected (bring-up) and only debug-logged. Later ones are summed and warned at most once per
@@ -403,7 +420,8 @@ pub fn run_fixed_main_loop(world: &mut World) {
 }
 
 /// Inserts [`Time`] and [`FixedTime`], adds [`time_system`] in `First` (in [`TimeSystems`]),
-/// [`run_fixed_main_loop`] in `RunFixedMainLoop`, and makes buffered messages survive until a
+/// [`run_fixed_main_loop`] in `RunFixedMainLoop` (in
+/// [`RunFixedMainLoopSystems::FixedMainLoop`]), and makes buffered messages survive until a
 /// fixed step has seen them: `signal_message_update_system` runs in `FixedPostUpdate` and
 /// `MessageRegistry::should_update` starts as `Waiting` (Bevy's behavior). Without this, a
 /// `FixedUpdate` reader would lose messages whenever frames run faster than half the fixed rate.
@@ -426,7 +444,10 @@ impl Plugin for TimePlugin {
                     .in_set(TimeSystems)
                     .ambiguous_with(message_update_system),
             )
-            .add_systems(RunFixedMainLoop, run_fixed_main_loop)
+            .add_systems(
+                RunFixedMainLoop,
+                run_fixed_main_loop.in_set(RunFixedMainLoopSystems::FixedMainLoop),
+            )
             .add_systems(FixedPostUpdate, signal_message_update_system);
         app.world_mut()
             .get_resource_or_init::<MessageRegistry>()
