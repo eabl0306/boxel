@@ -456,6 +456,62 @@ fn occupancy_bits_follow_opaque_shapes() {
     );
 }
 
+/// The states of a mask, voxel by voxel: `set` where bit `z` of word `y * 32 + x` is 1.
+fn expand_occupancy(occ: &Occupancy, set: BlockState, clear: BlockState) -> Vec<BlockState> {
+    (0..CHUNK_VOLUME)
+        .map(|i| {
+            let p = LocalPos::from_index(i);
+            let word = occ[(p.y() * 32 + p.x()) as usize];
+            if word >> p.z() & 1 == 1 { set } else { clear }
+        })
+        .collect()
+}
+
+#[test]
+fn from_occupancy_equals_from_dense() {
+    let r = BlockRegistry::default_blocks();
+    let stone = r.by_name("boxel:stone").unwrap();
+    let dirt = r.by_name("boxel:dirt").unwrap();
+    let mut rng = Rng(91);
+    let mut masks: Vec<Box<Occupancy>> = vec![
+        Box::new([0; 1024]),
+        Box::new([u32::MAX; 1024]),
+        // One voxel set, and one voxel clear: at voxel 0 (the palette order flips) and last.
+        Box::new(std::array::from_fn(|i| u32::from(i == 0))),
+        Box::new(std::array::from_fn(|i| if i == 1023 { 1 << 31 } else { 0 })),
+        Box::new(std::array::from_fn(|i| if i == 0 { !1 } else { u32::MAX })),
+        Box::new(std::array::from_fn(|i| {
+            if i == 1023 { !(1 << 31) } else { u32::MAX }
+        })),
+    ];
+    for density in [1, 8, 32, 64] {
+        masks.push(Box::new(std::array::from_fn(|_| {
+            (0..32).fold(0, |w, z| w | (u32::from(rng.below(64) < density) << z))
+        })));
+    }
+    for occ in &masks {
+        for (set, clear) in [
+            (stone, BlockState::AIR),
+            (BlockState::AIR, dirt),
+            (stone, stone),
+        ] {
+            let dense = expand_occupancy(occ, set, clear);
+            let from_mask = ChunkData::from_occupancy(occ, set, clear);
+            assert_eq!(
+                from_mask,
+                ChunkData::from_dense(&dense),
+                "{set:?} {clear:?}"
+            );
+            check_invariants(&from_mask.blocks);
+            check_minimal(&from_mask.blocks);
+            if set == stone && clear == BlockState::AIR {
+                // A stone/air chunk's opaque occupancy is the mask itself.
+                assert_eq!(from_mask.opaque_occupancy(&r)[..], occ[..]);
+            }
+        }
+    }
+}
+
 #[test]
 fn heap_bytes_track_the_representation() {
     assert_eq!(Paletted::Uniform(BlockState(1)).heap_bytes(), 0);

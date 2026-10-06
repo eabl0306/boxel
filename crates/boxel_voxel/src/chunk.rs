@@ -61,6 +61,46 @@ impl ChunkData {
             version: 0,
         }
     }
+    /// From a 1-bit mask, version 0: `set` where the bit of `occupancy` is 1, `clear` where it
+    /// is 0 (bit `z` of word `y * 32 + x`, the layout of [`ChunkData::opaque_occupancy`]).
+    ///
+    /// Equal to [`ChunkData::from_dense`] of the expanded states, representation included:
+    /// `Uniform` when every voxel gets the same state (all bits equal, or `set == clear`),
+    /// otherwise `Packed` with 1 bit per voxel and the palette in first-seen order. The mask
+    /// becomes the packed words directly (word `m` is masks `2m` and `2m + 1`), with no dense
+    /// array and no palette scan.
+    pub fn from_occupancy(occupancy: &Occupancy, set: BlockState, clear: BlockState) -> Self {
+        let all = occupancy.iter().fold(u32::MAX, |acc, &w| acc & w);
+        let any = occupancy.iter().fold(0, |acc, &w| acc | w);
+        let blocks = if set == clear || all == u32::MAX {
+            Paletted::Uniform(set)
+        } else if any == 0 {
+            Paletted::Uniform(clear)
+        } else {
+            // Palette in first-seen order: voxel 0 gets index 0.
+            let (palette, flip) = if occupancy[0] & 1 == 1 {
+                (vec![set, clear], u64::MAX)
+            } else {
+                (vec![clear, set], 0)
+            };
+            let words = occupancy
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&[low, high]| (u64::from(low) | (u64::from(high) << 32)) ^ flip)
+                .collect();
+            Paletted::Packed {
+                palette,
+                bits: 1,
+                words,
+            }
+        };
+        Self {
+            blocks,
+            light: LightStorage::default(),
+            version: 0,
+        }
+    }
     /// Decodes into `out` (`len == CHUNK_VOLUME`).
     pub fn to_dense(&self, out: &mut [BlockState]) {
         self.blocks.decode_into(out);
