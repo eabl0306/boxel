@@ -415,15 +415,21 @@ pub fn markdown(records: &[FrameRecord], log: &SpanLog, keys: &[String]) -> Stri
         let _ = writeln!(
             out,
             "\nPer border, summed from the crossing frame to the frame after which the world was \
-             settled ({} borders that finished; `{FRAME}` is the wall time of those frames, and \
-             the last column the frames per border or how many times each span ran):\n",
-            finished.len()
+             settled: {} of {} borders, the ones that settled before the next crossing (a build \
+             that catches up more slowly leaves out more of its heavy borders, so compare runs \
+             with about the same share). `{FRAME}` is the wall time of those frames; the last \
+             column, the frames per border or how many times each span ran. A sum grows with the \
+             frames per border even when each frame costs the same, so `above normal` takes away \
+             what those frames cost in a normal frame (frames per border times the normal-frame \
+             mean): the extra work of a crossing.\n",
+            finished.len(),
+            windows.len()
         );
         let _ = writeln!(
             out,
-            "| span (ms) | mean per border | max per border | frames or calls |"
+            "| span (ms) | mean per border | above normal | max per border | frames or calls |"
         );
-        let _ = writeln!(out, "|---|---:|---:|---:|");
+        let _ = writeln!(out, "|---|---:|---:|---:|---:|");
         let sums: Vec<Vec<u64>> = (0..series.len())
             .map(|s| {
                 finished
@@ -454,16 +460,18 @@ pub fn markdown(records: &[FrameRecord], log: &SpanLog, keys: &[String]) -> Stri
         };
         for s in [0, 1].into_iter().chain(rows) {
             let st = window_stats[s];
-            let frames = match s {
+            let above = st.mean - frames.mean * stats.stats[2][s].mean;
+            let count = match s {
                 0 => format!("{:.1} avg, {} max", frames.mean, frames.max),
                 1 => String::new(),
                 s => format!("{:.0}", calls(s)),
             };
             let _ = writeln!(
                 out,
-                "| `{}` | {:.3} | {:.3} | {frames} |",
+                "| `{}` | {:.3} | {:.3} | {:.3} | {count} |",
                 names[s],
                 ms(st.mean),
+                ms(above),
                 ms(st.max as f64)
             );
         }
@@ -723,13 +731,15 @@ mod tests {
         );
         assert!(md.contains("| `outside Main` | 0.200 |"), "{md}");
         assert!(!md.contains("`tiny`"), "too small for a row: {md}");
-        // One finished border: frames 1 and 2 (6 ms).
+        // One finished border: frames 1 and 2 (6 ms), 4 ms more than two normal frames (1 ms
+        // each, no update_interest).
+        assert!(md.contains("1 of 1 borders"), "{md}");
         assert!(
-            md.contains("| `frame` | 6.000 | 6.000 | 2.0 avg, 2 max |"),
+            md.contains("| `frame` | 6.000 | 4.000 | 6.000 | 2.0 avg, 2 max |"),
             "{md}"
         );
         assert!(
-            md.contains("| `world::update_interest` | 3.000 | 3.000 | 2 |"),
+            md.contains("| `world::update_interest` | 3.000 | 3.000 | 3.000 | 2 |"),
             "{md}"
         );
         assert!(md.contains("`world::update_interest` 2.50"), "{md}");
