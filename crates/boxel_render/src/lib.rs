@@ -43,6 +43,7 @@ mod arena;
 mod chunk_table;
 mod path;
 mod targets;
+mod upload;
 
 pub use overlay::{OverlayDraw, OverlayRect};
 pub use plugin::{

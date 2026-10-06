@@ -75,7 +75,7 @@ fn draw(ctx: &SmokeContext<'_>) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     renderer
-        .upsert_chunk(ctx.queue, 0, I64Vec3::ZERO, &smoke_mesh(&registry))
+        .upsert_chunk(0, I64Vec3::ZERO, &smoke_mesh(&registry))
         .map_err(|e| e.to_string())?;
 
     let camera = Camera::default();

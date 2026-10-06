@@ -135,16 +135,6 @@ impl QuadArena {
     pub fn buffer(&self) -> &wgpu::Buffer {
         &self.buffer
     }
-
-    /// Uploads `quads` into `alloc` (staged until the next submit).
-    pub fn write(&self, queue: &wgpu::Queue, alloc: &ArenaAlloc, quads: &[PackedQuad]) {
-        debug_assert_eq!(quads.len(), alloc.size as usize);
-        queue.write_buffer(
-            &self.buffer,
-            u64::from(alloc.offset) * QUAD_BYTES,
-            bytemuck::cast_slice(quads),
-        );
-    }
 }
 
 #[cfg(test)]

@@ -9,6 +9,9 @@
 //! - a close-up of the canopy from above (mip 0 alpha test: terrain and the inner side of the
 //!   leaves show through the holes);
 //! - the same heightfield with one chunk removed (exercises zeroed chunk-table slots);
+//! - the same picture again after one frame of churn: removes, re-inserts under new ids and
+//!   replaced meshes, all uploaded together by the next render (freed slots and arena ranges
+//!   are reused within the frame);
 //! - the heightfield in a second renderer whose arena is exactly full: a chunk that no longer
 //!   fits keeps its old mesh, a smaller mesh reuses the chunk's own range;
 //! - a far scene: a 32x32 slab ~480 voxels away and a second slab of another texture 1 voxel
@@ -399,6 +402,8 @@ struct TierImages {
     heightfield: RgbaImage,
     canopy: RgbaImage,
     minus_chunk: RgbaImage,
+    /// `minus_chunk` again, after one frame of churn (see [`churn`]).
+    churn: RgbaImage,
     far_both: RgbaImage,
     far_front: RgbaImage,
     far_back: RgbaImage,
@@ -439,7 +444,7 @@ fn full_arena_scenes(
     .map_err(|e| format!("full arena: VoxelRenderer::new: {e}"))?;
     for (c, mesh) in terrain {
         renderer
-            .upsert_chunk(queue, chunk_id(*c), (*c * 32).as_i64vec3(), mesh)
+            .upsert_chunk(chunk_id(*c), (*c * 32).as_i64vec3(), mesh)
             .map_err(|e| format!("full arena: upsert {c}: {e}"))?;
     }
     // fillers behind the camera, the largest that fits first, until not one quad is free
@@ -449,7 +454,7 @@ fn full_arena_scenes(
         let free = stats.arena_capacity_quads - stats.arena_used_quads;
         let fits = (1..=free).rev().any(|n| {
             renderer
-                .upsert_chunk(queue, filler_id, I64Vec3::splat(-2048), &hidden_mesh(n))
+                .upsert_chunk(filler_id, I64Vec3::splat(-2048), &hidden_mesh(n))
                 .is_ok()
         });
         if !fits {
@@ -469,7 +474,7 @@ fn full_arena_scenes(
     let (id, origin) = (chunk_id(REMOVED_CHUNK), (REMOVED_CHUNK * 32).as_i64vec3());
     let view = heightfield_view();
     let grown = hidden_mesh(original.total_quads() + 1);
-    match renderer.upsert_chunk(queue, id, origin, &grown) {
+    match renderer.upsert_chunk(id, origin, &grown) {
         Err(RendererError::ArenaFull { .. }) => {}
         other => return Err(format!("full arena: growing a chunk returned {other:?}")),
     }
@@ -484,11 +489,11 @@ fn full_arena_scenes(
     let (kept, _) = render(device, queue, &mut renderer, &view)?;
 
     renderer
-        .upsert_chunk(queue, id, origin, &hidden_mesh(1))
+        .upsert_chunk(id, origin, &hidden_mesh(1))
         .map_err(|e| format!("full arena: shrinking a chunk: {e}"))?;
     let (shrunk, _) = render(device, queue, &mut renderer, &view)?;
     renderer
-        .upsert_chunk(queue, id, origin, original)
+        .upsert_chunk(id, origin, original)
         .map_err(|e| format!("full arena: growing a chunk back: {e}"))?;
     let (regrown, _) = render(device, queue, &mut renderer, &view)?;
     let end = renderer.stats();
@@ -498,6 +503,38 @@ fn full_arena_scenes(
         ));
     }
     Ok([kept, shrunk, regrown])
+}
+
+/// Changes the heightfield minus `REMOVED_CHUNK` in many ways that leave the same picture, with
+/// no render in between: the renderer uploads them all with the next frame. Every terrain chunk
+/// is removed and comes back under a new id; `REMOVED_CHUNK` comes back and goes again; one chunk
+/// gets a hidden mesh first and its real one after. Freed slots and arena ranges are reused
+/// within the frame, so an upload of an older mesh or slot over a newer one shows.
+fn churn(renderer: &mut VoxelRenderer, terrain: &[(IVec3, ChunkMesh)]) -> Result<(), String> {
+    let new_id = |c: IVec3| chunk_id(c) | 1 << 40;
+    let origin = |c: IVec3| (c * 32).as_i64vec3();
+    for (c, mesh) in terrain {
+        if *c == REMOVED_CHUNK {
+            renderer
+                .upsert_chunk(chunk_id(*c), origin(*c), mesh)
+                .map_err(|e| format!("churn: re-add {c}: {e}"))?;
+            renderer.remove_chunk(chunk_id(*c));
+            continue;
+        }
+        if !renderer.remove_chunk(chunk_id(*c)) {
+            return Err(format!("churn: {c} was not resident"));
+        }
+        renderer
+            .upsert_chunk(new_id(*c), origin(*c), &hidden_mesh(3))
+            .map_err(|e| format!("churn: hidden {c}: {e}"))?;
+        renderer
+            .upsert_chunk(new_id(*c), origin(*c), mesh)
+            .map_err(|e| format!("churn: upsert {c}: {e}"))?;
+    }
+    if renderer.chunk_count() != terrain.len() - 1 {
+        return Err(format!("churn: {} chunks resident", renderer.chunk_count()));
+    }
+    Ok(())
 }
 
 /// Uploads and renders every scene on one tier.
@@ -530,7 +567,7 @@ fn render_tier(
 
     for (c, mesh) in terrain {
         renderer
-            .upsert_chunk(&queue, chunk_id(*c), (*c * 32).as_i64vec3(), mesh)
+            .upsert_chunk(chunk_id(*c), (*c * 32).as_i64vec3(), mesh)
             .map_err(|e| format!("upsert {c}: {e}"))?;
     }
     let quads: u32 = terrain.iter().map(|(_, m)| m.total_quads()).sum();
@@ -558,34 +595,36 @@ fn render_tier(
 
     let (canopy, _) = render(&device, &queue, &mut renderer, &canopy_view())?;
 
-    if !renderer.remove_chunk(&queue, chunk_id(REMOVED_CHUNK)) {
+    if !renderer.remove_chunk(chunk_id(REMOVED_CHUNK)) {
         return Err(format!("chunk {REMOVED_CHUNK} was not resident"));
     }
     let (minus_chunk, _) = render(&device, &queue, &mut renderer, &view)?;
+    churn(&mut renderer, terrain)?;
+    let (churn, _) = render(&device, &queue, &mut renderer, &view)?;
     let full_arena = full_arena_scenes(&device, &queue, tier, registry, terrain)?;
 
-    renderer.clear_chunks(&queue);
+    renderer.clear_chunks();
     if renderer.chunk_count() != 0 || renderer.stats().arena_used_quads != 0 {
         return Err(format!("clear_chunks left {:?}", renderer.stats()));
     }
     let far = far_view();
     renderer
-        .upsert_chunk(&queue, 7, I64Vec3::ZERO, &far_scene(registry, true, true))
+        .upsert_chunk(7, I64Vec3::ZERO, &far_scene(registry, true, true))
         .map_err(|e| e.to_string())?;
     let (far_both, _) = render(&device, &queue, &mut renderer, &far)?;
     // replace the same chunk id with one slab at a time
     renderer
-        .upsert_chunk(&queue, 7, I64Vec3::ZERO, &far_scene(registry, true, false))
+        .upsert_chunk(7, I64Vec3::ZERO, &far_scene(registry, true, false))
         .map_err(|e| e.to_string())?;
     let (far_front, _) = render(&device, &queue, &mut renderer, &far)?;
     renderer
-        .upsert_chunk(&queue, 7, I64Vec3::ZERO, &far_scene(registry, false, true))
+        .upsert_chunk(7, I64Vec3::ZERO, &far_scene(registry, false, true))
         .map_err(|e| e.to_string())?;
     let (far_back, _) = render(&device, &queue, &mut renderer, &far)?;
 
     // an empty mesh removes the chunk: nothing but sky is left
     renderer
-        .upsert_chunk(&queue, 7, I64Vec3::ZERO, &ChunkMesh::default())
+        .upsert_chunk(7, I64Vec3::ZERO, &ChunkMesh::default())
         .map_err(|e| e.to_string())?;
     let (empty, _) = render(&device, &queue, &mut renderer, &far)?;
     if renderer.chunk_count() != 0 || empty.non_background_fraction() != 0.0 {
@@ -601,6 +640,7 @@ fn render_tier(
         heightfield,
         canopy,
         minus_chunk,
+        churn,
         far_both,
         far_front,
         far_back,
@@ -735,6 +775,7 @@ fn tiers_render_identically() {
                     (&name("heightfield"), &i.heightfield),
                     (&name("canopy"), &i.canopy),
                     (&name("minus_chunk"), &i.minus_chunk),
+                    (&name("churn"), &i.churn),
                     (&name("far_both"), &i.far_both),
                     (&name("far_front"), &i.far_front),
                     (&name("far_back"), &i.far_back),
@@ -765,6 +806,7 @@ fn tiers_render_identically() {
                 0.002,
             );
             for (scene, image, expected, expected_name) in [
+                ("churn", &i.churn, &i.minus_chunk, "minus_chunk"),
                 (
                     "full_arena_kept",
                     &i.full_arena[0],

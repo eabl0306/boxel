@@ -28,6 +28,7 @@ boxel_mesh.workspace = true
 boxel_world.workspace = true
 wgpu.workspace = true
 bytemuck.workspace = true
+foldhash.workspace = true
 offset-allocator.workspace = true
 pollster.workspace = true
 tracing.workspace = true

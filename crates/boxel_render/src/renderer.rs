@@ -6,6 +6,7 @@ use crate::path::{
 };
 use crate::targets::{Blit, Targets};
 use crate::textures::{BLOCK_TEXTURE_SIZE, generate_block_textures, layer_bytes};
+use crate::upload::{UploadTargets, Uploads};
 use boxel_camera::{Camera, CameraView};
 use boxel_gfx::Tier;
 use boxel_math::{Frustum, I64Vec3, Mat4, UVec2, Vec3, wrap_to_i32};
@@ -133,6 +134,8 @@ pub struct VoxelRenderer {
     chunks: ChunkTable,
     /// GPU chunk table (High/Mid).
     chunk_buffer: Option<wgpu::Buffer>,
+    /// Meshes (and, through `chunks`, table entries) waiting for the next `render`.
+    uploads: Uploads,
     path: Box<dyn TierPath + Send + Sync>,
     targets: Targets,
     blit: Blit,
@@ -306,6 +309,7 @@ impl VoxelRenderer {
             arena,
             chunks: ChunkTable::new(slots),
             chunk_buffer,
+            uploads: Uploads::default(),
             path,
             targets,
             blit,
@@ -332,15 +336,17 @@ impl VoxelRenderer {
     /// low 32 bits, see [`boxel_math::wrap_to_i32`]). While the camera is about `2^30` voxels or
     /// more away from it on some axis, the chunk stays resident but no tier draws it (its wrapped
     /// origin difference may not be exact). Empty meshes remove the chunk.
+    ///
+    /// Chunk changes stay on the CPU until the next [`VoxelRenderer::render`], which records all
+    /// of them at the start of its encoder (one staging buffer for the whole frame).
     pub fn upsert_chunk(
         &mut self,
-        queue: &wgpu::Queue,
         id: u64,
         origin: I64Vec3,
         mesh: &ChunkMesh,
     ) -> Result<(), RendererError> {
         if mesh.is_empty() {
-            self.remove_chunk(queue, id);
+            self.remove_chunk(id);
             return Ok(());
         }
         if self.chunks.slot_for(id).is_none() {
@@ -354,49 +360,43 @@ impl VoxelRenderer {
             self.stats.dropped_chunks += 1;
             return Err(RendererError::ArenaFull { needed });
         };
-        self.arena.write(queue, &alloc, &mesh.quads);
         let record = ChunkRecord {
             id,
             origin,
             alloc,
             counts: bucket_counts(mesh),
         };
-        let Some(slot) = self.chunks.insert(record) else {
+        if self.chunks.insert(record).is_none() {
             // unreachable: `slot_for` succeeded above, so this is a new chunk (no old range)
             self.arena.alloc.free(alloc);
             self.stats.dropped_chunks += 1;
             return Err(RendererError::ChunkTableFull(self.chunks.capacity()));
-        };
-        self.write_slot(queue, slot, &self.chunks.gpu_entry(&record));
+        }
+        self.uploads.mesh(id, alloc.offset, &mesh.quads);
         Ok(())
     }
-    /// Removes a chunk; returns false if unknown.
-    pub fn remove_chunk(&mut self, queue: &wgpu::Queue, id: u64) -> bool {
-        let Some((slot, record)) = self.chunks.remove(id) else {
+    /// Removes a chunk; returns false if unknown. Reaches the GPU with the next `render`.
+    pub fn remove_chunk(&mut self, id: u64) -> bool {
+        let Some((_, record)) = self.chunks.remove(id) else {
             return false;
         };
         self.arena.alloc.free(record.alloc);
-        self.write_slot(queue, slot, &ChunkGpu::default());
+        self.uploads.forget(id);
         true
     }
-    /// Removes every chunk.
-    pub fn clear_chunks(&mut self, queue: &wgpu::Queue) {
-        let slot_count = self.chunks.slot_count();
+    /// Removes every chunk. Reaches the GPU with the next `render`.
+    pub fn clear_chunks(&mut self) {
         self.chunks.clear();
         self.arena.alloc.reset();
-        if let Some(buffer) = &self.chunk_buffer
-            && slot_count > 0
-        {
-            let zeros = vec![0u8; slot_count as usize * CHUNK_GPU_BYTES as usize];
-            queue.write_buffer(buffer, 0, &zeros);
-        }
+        self.uploads.clear();
     }
     /// Resident chunks.
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
     }
-    /// Encodes the tier's passes into the main color/depth targets: clear, (High) cull, opaque
-    /// buckets with the opaque pipeline, then the cutout bucket with the cutout pipeline.
+    /// Encodes the tier's passes into the main color/depth targets: the chunk changes since the
+    /// last call (uploads), clear, (High) cull, opaque buckets with the opaque pipeline, then the
+    /// cutout bucket with the cutout pipeline. Submit `encoder` before the next `render`.
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -404,22 +404,22 @@ impl VoxelRenderer {
         encoder: &mut wgpu::CommandEncoder,
         view: &ViewParams,
     ) {
-        // Every resource already exists; the device parameter is kept for M1 arena growth.
-        let _ = device;
-        let slot_count = self.chunks.slot_count();
         // The GPU window follows the camera before any cull: only chunks whose wrapped origin
         // difference is exact are drawn, on every tier (see `chunk_table`). High reads the
-        // window from the live flags, uploaded again when it moves. Mid and Low test the window
-        // in `CpuCull`; no Mid shader reads the flags, so on Mid they may lag behind.
-        let window_moved = self.chunks.follow(view.render_origin);
-        if window_moved
-            && self.tier == Tier::High
-            && slot_count > 0
-            && let Some(buffer) = &self.chunk_buffer
+        // window from the live flags: a move marks every slot stale, so the upload below sends
+        // them all again. Mid and Low test the window in `CpuCull`.
+        self.chunks.follow(view.render_origin);
         {
-            let entries = self.chunks.gpu_entries();
-            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&entries));
+            let _span = frame_span!("render.upload");
+            let targets = UploadTargets {
+                arena: self.arena.buffer(),
+                table: self.chunk_buffer.as_ref(),
+            };
+            self.uploads
+                .flush(device, encoder, targets, &mut self.chunks);
         }
+        debug_assert!(self.chunks.is_synced());
+        let slot_count = self.chunks.slot_count();
         let uniform = ViewUniform {
             view_proj: view.view_proj.to_cols_array_2d(),
             frustum: view.frustum.to_array(),
@@ -475,17 +475,6 @@ impl VoxelRenderer {
             arena_used_quads: self.arena.alloc.used(),
             arena_capacity_quads: self.arena.alloc.capacity(),
             ..self.stats
-        }
-    }
-
-    /// Writes one chunk table entry (High/Mid; Low keeps the table on the CPU only).
-    fn write_slot(&self, queue: &wgpu::Queue, slot: u32, entry: &ChunkGpu) {
-        if let Some(buffer) = &self.chunk_buffer {
-            queue.write_buffer(
-                buffer,
-                u64::from(slot) * CHUNK_GPU_BYTES,
-                bytemuck::bytes_of(entry),
-            );
         }
     }
 }
