@@ -384,6 +384,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "boxel_light"
+version = "0.1.0-dev"
+dependencies = [
+ "boxel_light",
+ "boxel_voxel",
+ "boxel_worldgen",
+ "criterion",
+ "proptest",
+]
+
+[[package]]
 name = "boxel_log"
 version = "0.1.0-dev"
 dependencies = [

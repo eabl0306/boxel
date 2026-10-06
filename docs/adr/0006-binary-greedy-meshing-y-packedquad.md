@@ -1,6 +1,7 @@
 # ADR 0006: binary greedy meshing y PackedQuad de 8 bytes
 
-- Estado: aceptado (revisado 2026-10-05: 8 buckets, ver ADR 0012)
+- Estado: aceptado (revisado 2026-10-05: 8 buckets, ver ADR 0012; enmendado 2026-10-06 por
+  ADR 0015: `mat` v2 y fork del merge, se aplica en la fase P2)
 - Fecha: 2026-10-04
 
 ## Contexto
@@ -30,3 +31,20 @@ no sirve directo para la GPU. Todos los tiers deben compartir los mismos bytes.
 - block-mesh: mucho más lento.
 - Meshing en GPU (compute) en M0: complejidad y no hace falta (el worldgen domina).
 - Vértices clásicos (posición, normal, uv): 4 a 8x más memoria y sin vertex pulling.
+
+## Enmienda (2026-10-06, ADR 0015)
+
+Se aplica en la fase P2 de la luz; hasta entonces el código sigue con el formato de arriba.
+
+- **`PackedQuad` v2, sigue en 8 bytes.** `geo` usa sus 4 bits reservados como flags (bits 28 a
+  31). `mat = capa:12 | ao:8 | índice de paleta de luz:12`: desaparecen cielo, bloque y flags de
+  `mat`. Constantes nuevas `GEO_FLAGS_SHIFT = 28`, `MAT_LIGHT_SHIFT = 20` y
+  `MAT_LIGHT_MASK = 0xFFF`; se quitan `MAT_SKY_SHIFT`, `MAT_BLOCK_SHIFT` y `MAT_FLAGS_SHIFT`.
+- **Paleta de luz por chunk**: hasta 4096 entradas `[u32; 2]` con la luz de las 4 esquinas, en
+  orden de primera aparición. `ChunkMesh` suma `palette` y un `hash` de quads y paleta.
+- **AO en la clave del merge** (la opción de M1 de arriba), sin AO en las caras con las 4
+  esquinas a oscuras.
+- **Fork en el repo**: el merge compara una clave por cara (material, AO, índice de paleta) en
+  lugar del `u16` del vóxel, así que `src/greedy.rs` pasa a ser un fork de
+  binary-greedy-meshing 0.5.2 (aviso MIT incluido). El crate queda como dependencia de desarrollo:
+  con AO apagado y sin luz, los quads del fork son idénticos byte a byte a los de bgm.

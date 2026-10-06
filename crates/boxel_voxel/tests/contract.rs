@@ -54,7 +54,8 @@ fn registry_builder_assigns_dense_states() {
             name: "test:stone".into(),
             shape: RenderShape::Opaque,
             solid: true,
-            light_emission: 0,
+            emission: [0; 3],
+            light_opacity: 15,
             textures: FaceTextures::all(t),
         })
         .unwrap();

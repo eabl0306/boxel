@@ -13,6 +13,10 @@ qué cambió, con números nuevos.
 `i64`. El resto describe el estado anterior, y algunas de sus referencias de línea pueden haber
 quedado corridas.
 
+**Actualización (luz, ADR 0015):** la luz ya no vive en el chunk. `ChunkData.light` y
+`LightStorage` se borraron; la luz es un dato derivado que calcula `boxel_light`. La sección 2
+lo dice en el párrafo de la luz.
+
 ## En resumen
 
 1. Cada chunk de 32³ se guarda comprimido con una paleta. Si es de puro aire, sus vóxeles no
@@ -160,8 +164,8 @@ redondeaba o se saturaba: el nuevo es exacto.
 viven en tablas por campo (`voxel/registry.rs:268`). Hoy hay 12 bloques: las hojas son cutout y
 el agua translúcida (`voxel/registry.rs:283`).
 
-**Un chunk** es bloques, luz y un número de versión (`voxel/chunk.rs:9`). Cambiar un bloque sube
-la versión (`voxel/chunk.rs:41`). Los bloques se guardan con paleta (`voxel/storage.rs:9-23`):
+**Un chunk** es bloques y un número de versión (`voxel/chunk.rs`), más una caché de máscaras de
+luz cuando hace falta. Cambiar un bloque sube la versión. Los bloques se guardan con paleta (`voxel/storage.rs:9-23`):
 
 | Forma | Cuándo | Memoria |
 |---|---|---|
@@ -172,9 +176,9 @@ la versión (`voxel/chunk.rs:41`). Los bloques se guardan con paleta (`voxel/sto
 La paleta crece sola al editar (`voxel/storage.rs:57-103`) pero nunca encoge: `compact()` existe
 (`voxel/storage.rs:173`) y nadie lo llama.
 
-**Luz.** Hoy es uniforme, cielo 15 (`voxel/storage.rs:427-443`), y todos los quads llevan ese
-valor fijo (`mesh/packed.rs:64`). El formato de luz por vóxel (32 KiB por chunk) existe pero no
-se usa.
+**Luz.** No se guarda en el chunk (ADR 0015): es una función pura de los bloques y de un techo de
+cielo por columna, que calcula `boxel_light` (dentro del job de malla desde la fase P3). Hasta
+entonces los quads siguen con cielo 15 fijo (`mesh/packed.rs`).
 
 **Memoria medida** con el generador Forest (terreno y árboles):
 

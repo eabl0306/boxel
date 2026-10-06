@@ -5,16 +5,22 @@
 //!   `(y << 10) | (x << 5) | z` (z fastest), the same order as binary-greedy-meshing's padded
 //!   linearization.
 //! - [`registry`]: data-driven blocks; runtime `BlockState(u16)` is dense and never persisted raw.
-//! - [`storage`]: Minecraft-style paletted container (Uniform | Packed 1/2/4/8 bits | Direct u16),
-//!   separate light storage.
+//!   Each block has an RGB emission and a light opacity (ADR 0015).
+//! - [`storage`]: Minecraft-style paletted container (Uniform | Packed 1/2/4/8 bits | Direct u16).
+//! - [`light`]: the light value format ([`LightValue`]) and the per-state [`LightTables`]. Light
+//!   itself is derived data, computed by `boxel_light`; chunks do not store it.
 //! - [`ChunkData`]: one chunk's immutable snapshot payload (shared as `Arc<ChunkData>`; edits use
-//!   `Arc::make_mut` copy-on-write). Voxel arrays never live inline in ECS components.
+//!   `Arc::make_mut` copy-on-write), with its light masks ([`LightMasks`]: opaque, partial,
+//!   emitters; built and cached only when the storage cannot serve them as is). Voxel arrays
+//!   never live inline in ECS components.
 
 pub mod coords;
+pub mod light;
 pub mod registry;
 pub mod storage;
 
 mod chunk;
+mod masks;
 
 pub use chunk::ChunkData;
 pub use coords::{
@@ -22,11 +28,13 @@ pub use coords::{
     DimensionId, Face, LocalPos, MAX_BLOCK_COORD, MAX_CHUNK_COORD, NEIGHBOR_OFFSETS,
     neighbor_index,
 };
+pub use light::{LightTables, LightValue, MAX_LIGHT, OPAQUE_OPACITY};
+pub use masks::{LightMasks, MaskRows, MaskWords, OwnedLightMasks};
 pub use registry::{
     BlockDef, BlockRegistry, BlockRegistryBuilder, BlockState, FaceTextures, RegistryError,
     RenderShape, StateFlags, TextureId, TexturePattern, TextureSpec,
 };
-pub use storage::{LightStorage, Occupancy, Paletted};
+pub use storage::{Occupancy, Paletted};
 
 /// Common items.
 pub mod prelude {

@@ -1,4 +1,4 @@
-//! Paletted block storage and light storage for one 32^3 chunk.
+//! Paletted block storage for one 32^3 chunk.
 use crate::{BlockState, CHUNK_VOLUME, LocalPos};
 
 /// Paletted container. Indices never span `u64` words (`64 / bits` entries per word).
@@ -422,38 +422,8 @@ impl PaletteBuilder {
     }
 }
 
-/// Sky and block light (4 bits each). M0 only uses `Uniform { sky: 15, block: 0 }`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LightStorage {
-    /// Same light everywhere.
-    Uniform {
-        /// Sky light 0..=15.
-        sky: u8,
-        /// Block light 0..=15.
-        block: u8,
-    },
-    /// One byte per voxel: `sky << 4 | block` (allocated by M1 lighting).
-    Packed(Box<[u8]>),
-}
-
-impl Default for LightStorage {
-    fn default() -> Self {
-        LightStorage::Uniform { sky: 15, block: 0 }
-    }
-}
-
-impl LightStorage {
-    /// Heap bytes used (0 for `Uniform`).
-    pub fn heap_bytes(&self) -> usize {
-        match self {
-            LightStorage::Uniform { .. } => 0,
-            LightStorage::Packed(bytes) => bytes.len(),
-        }
-    }
-}
-
-/// 1 bit per voxel, `u32` columns along z, indexed `y * 32 + x` (4 KiB). Base for mesher masks,
-/// physics and raycasts (maintained incrementally from M1).
+/// 1 bit per voxel, `u32` columns along z, indexed `y * 32 + x` (4 KiB). The layout of the
+/// mesher masks and of [`LightMasks`](crate::LightMasks).
 pub type Occupancy = [u32; 1024];
 
 const _: () = assert!(CHUNK_VOLUME == 32768);

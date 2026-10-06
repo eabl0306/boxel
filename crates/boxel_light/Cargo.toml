@@ -1,0 +1,35 @@
+[package]
+name = "boxel_light"
+description = "Voxel light for boxel: sky tops per column and exact per-chunk light boxes (sky and RGB block light), pure CPU"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# The scalar global light solver (`oracle`), for tests in this crate and downstream.
+oracle = []
+
+[dependencies]
+boxel_voxel.workspace = true
+
+[dev-dependencies]
+# Enables `oracle` for the integration tests. A path to itself, not a workspace entry: no other
+# crate depends on boxel_light yet (cargo-deny reports unused workspace entries).
+boxel_light = { path = ".", features = ["oracle"] }
+# The sky walk tests and the benches use the real generators.
+boxel_worldgen.workspace = true
+proptest.workspace = true
+criterion.workspace = true
+
+# Criterion flags (--quick, --save-baseline) must not reach the lib unit-test harness.
+[lib]
+bench = false
+
+[[bench]]
+name = "light"
+harness = false
+
+[lints]
+workspace = true

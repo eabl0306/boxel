@@ -1,6 +1,6 @@
 # ADR 0005: chunks de 32³ con contenedor de paleta
 
-- Estado: aceptado
+- Estado: aceptado (enmendado 2026-10-06 por ADR 0015: la luz sale del chunk, caché de máscaras)
 - Fecha: 2026-10-04
 
 ## Contexto
@@ -34,3 +34,18 @@ no el mesher, domina el costo (26 ns/vóxel contra ~1 ns/vóxel).
 - Arrays planos de u16 por chunk: 64 KiB por chunk, 14x más memoria.
 - Chunks como entidades con componentes de vóxeles: copia de componentes grandes en cambios de
   arquetipo (7 µs a 32 KiB medidos) y mezcla de responsabilidades.
+
+## Enmienda (2026-10-06, ADR 0015)
+
+- **La luz sale de `ChunkData`.** Es un dato derivado: una función pura de los bloques y de un
+  techo de cielo por columna, calculada en los jobs (`boxel_light`) y nunca persistida.
+  `ChunkData.light` y `LightStorage`, que siempre valían cielo 15, se borraron.
+- **La ocupación pasa a ser una vista perezosa**, no algo mantenido en cada edición:
+  `LightMasks` (opaca = opacidad 15, parcial = opacidad 1 a 14, y la lista de emisores), que se
+  pide con `ChunkData::light_masks`. Los chunks uniformes y los de 1 bit sin emisores la sirven
+  desde sus propias palabras, sin memoria extra. Los demás la construyen la primera vez y la
+  guardan en caché, compartida por todos los lectores del snapshot. `set` y `blocks_mut` la
+  tiran, `clone` (y por lo tanto `Arc::make_mut` con el snapshot compartido) empieza sin ella y la
+  igualdad la ignora.
+- `ChunkData.blocks` pasa a privado (`blocks()`, `blocks_mut()`, `from_paletted()`, `compact()`)
+  para que ningún cambio se saltee la caché.

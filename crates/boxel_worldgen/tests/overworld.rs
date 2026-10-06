@@ -214,7 +214,7 @@ fn generate_matches_the_point_spec_near_far_and_deep() {
     let mut one_bit = 0;
     for &pos in &chunks {
         let data = g.generate(ChunkKey::new(pos), &r);
-        if matches!(data.blocks, Paletted::Packed { bits: 1, .. }) {
+        if matches!(data.blocks(), Paletted::Packed { bits: 1, .. }) {
             one_bit += 1;
         }
         assert_matches_spec(&g, &r, pos);
@@ -412,7 +412,7 @@ fn fast_paths_are_uniform_or_one_bit() {
     let g = OverworldGenerator::default();
     let pos = mixed_near(&g, &r, ChunkPos::new(0, -50, 0));
     let data = g.generate(ChunkKey::new(pos), &r);
-    match &data.blocks {
+    match data.blocks() {
         Paletted::Packed { palette, bits, .. } => {
             assert_eq!(*bits, 1);
             assert!(palette.contains(&stone) && palette.contains(&BlockState::AIR));

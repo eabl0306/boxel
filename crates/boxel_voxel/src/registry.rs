@@ -1,7 +1,7 @@
 //! Data-driven block registry. M0: one state per block (no properties yet); `BlockState(u16)` is
 //! the dense runtime id (`0` = air), assigned in registration order. Frozen before the world
 //! loads and shared as `Arc<BlockRegistry>`.
-use crate::Face;
+use crate::{Face, LightValue, OPAQUE_OPACITY};
 
 /// Dense runtime block state id. `BlockState::AIR == BlockState(0)`. Never persisted raw
 /// (persistence will store names through an id map, M1).
@@ -43,7 +43,7 @@ bitflags::bitflags! {
         const OCCLUDES = 1 << 1;
         /// Liquid.
         const FLUID = 1 << 2;
-        /// Emits light (`light_emission > 0`).
+        /// Emits light (some `emission` channel above 0).
         const EMISSIVE = 1 << 3;
     }
 }
@@ -129,8 +129,13 @@ pub struct BlockDef {
     pub shape: RenderShape,
     /// Collides.
     pub solid: bool,
-    /// Block light emission 0..=15.
-    pub light_emission: u8,
+    /// Block light emission `[red, green, blue]`, each `0..=15` (white light has equal
+    /// channels; `[0, 0, 0]` emits nothing). Emitters keep their emission even when opaque.
+    pub emission: [u8; 3],
+    /// Light opacity `0..=15`: 15 stops light (required for `RenderShape::Opaque`), 0 lets it
+    /// through (air, glass), 1..=14 lets it through at a cost of `max(1, opacity)` levels per
+    /// voxel (leaves and water are 1). Any value above 0 also stops direct sky.
+    pub light_opacity: u8,
     /// Textures (ignored for `RenderShape::None`).
     pub textures: FaceTextures,
 }
@@ -150,6 +155,10 @@ pub enum RegistryError {
     /// Texture id not registered.
     #[error("unknown texture id {0}")]
     UnknownTexture(u16),
+    /// Emission channel or light opacity above 15, or an `Opaque` shape whose light opacity is
+    /// not 15.
+    #[error("invalid light values of {0}")]
+    InvalidLight(String),
 }
 
 /// Builder; `boxel:air` is pre-registered as `BlockState(0)`.
@@ -168,119 +177,16 @@ impl BlockRegistryBuilder {
                 name: "boxel:air".to_string(),
                 shape: RenderShape::None,
                 solid: false,
-                light_emission: 0,
+                emission: [0; 3],
+                light_opacity: 0,
                 textures: FaceTextures::all(TextureId(0)),
             }],
         }
     }
 
-    /// Registers a texture layer.
-    pub fn add_texture(&mut self, spec: TextureSpec) -> Result<TextureId, RegistryError> {
-        validate_name(&spec.name)?;
-        if self.textures.iter().any(|t| t.name == spec.name) {
-            return Err(RegistryError::Duplicate(spec.name));
-        }
-        if self.textures.len() >= 4096 {
-            return Err(RegistryError::Full("textures"));
-        }
-        self.textures.push(spec);
-        Ok(TextureId((self.textures.len() - 1) as u16))
-    }
-
-    /// Registers a block; returns its state.
-    pub fn add_block(&mut self, def: BlockDef) -> Result<BlockState, RegistryError> {
-        validate_name(&def.name)?;
-        if self.blocks.iter().any(|b| b.name == def.name) {
-            return Err(RegistryError::Duplicate(def.name));
-        }
-        if self.blocks.len() >= u16::MAX as usize {
-            return Err(RegistryError::Full("block states"));
-        }
-        if def.shape != RenderShape::None {
-            for t in [def.textures.top, def.textures.bottom, def.textures.side] {
-                if t.0 as usize >= self.textures.len() {
-                    return Err(RegistryError::UnknownTexture(t.0));
-                }
-            }
-        }
-        self.blocks.push(def);
-        Ok(BlockState((self.blocks.len() - 1) as u16))
-    }
-
-    /// Freezes the registry (builds the `SoA` lookup tables).
-    pub fn build(self) -> BlockRegistry {
-        let mut by_name =
-            std::collections::HashMap::with_hasher(foldhash::fast::FixedState::default());
-        for (i, b) in self.blocks.iter().enumerate() {
-            by_name.insert(b.name.clone(), BlockState(i as u16));
-        }
-        BlockRegistry {
-            names: self.blocks.iter().map(|b| b.name.clone()).collect(),
-            shapes: self.blocks.iter().map(|b| b.shape).collect(),
-            flags: self
-                .blocks
-                .iter()
-                .map(|b| {
-                    let mut f = StateFlags::empty();
-                    f.set(StateFlags::SOLID, b.solid);
-                    f.set(StateFlags::OCCLUDES, b.shape == RenderShape::Opaque);
-                    f.set(
-                        StateFlags::FLUID,
-                        b.shape == RenderShape::Translucent && !b.solid,
-                    );
-                    f.set(StateFlags::EMISSIVE, b.light_emission > 0);
-                    f
-                })
-                .collect(),
-            light: self
-                .blocks
-                .iter()
-                .map(|b| b.light_emission.min(15))
-                .collect(),
-            faces: self.blocks.iter().map(|b| b.textures).collect(),
-            textures: self.textures,
-            by_name,
-        }
-    }
-}
-
-/// `namespace:path`, both non-empty, `[a-z0-9_]` (path may contain `/`).
-fn validate_name(name: &str) -> Result<(), RegistryError> {
-    let ok = name.split_once(':').is_some_and(|(ns, path)| {
-        !ns.is_empty()
-            && !path.is_empty()
-            && ns
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-            && path
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '/')
-    });
-    if ok {
-        Ok(())
-    } else {
-        Err(RegistryError::InvalidName(name.to_string()))
-    }
-}
-
-/// Frozen registry with `SoA` lookup tables indexed by `BlockState.0`.
-#[derive(Debug, Clone)]
-pub struct BlockRegistry {
-    names: Vec<String>,
-    shapes: Vec<RenderShape>,
-    flags: Vec<StateFlags>,
-    light: Vec<u8>,
-    faces: Vec<FaceTextures>,
-    textures: Vec<TextureSpec>,
-    by_name: std::collections::HashMap<String, BlockState, foldhash::fast::FixedState>,
-}
-
-impl BlockRegistry {
-    /// Built-in M0 content, in this exact order (state ids are frozen for tests and worldgen):
-    /// 0 `boxel:air`, 1 `boxel:stone`, 2 `boxel:dirt`, 3 `boxel:grass`, 4 `boxel:sand`,
-    /// 5 `boxel:gravel`, 6 `boxel:snow`, 7 `boxel:bedrock`, 8 `boxel:log`, 9 `boxel:leaves`
-    /// (Cutout), 10 `boxel:water` (Translucent), 11 `boxel:planks`.
-    pub fn default_blocks() -> BlockRegistry {
+    /// A builder with the built-in M0 content of [`BlockRegistry::default_blocks`], to add more
+    /// blocks after it (their states follow the built-in ones).
+    pub fn with_default_blocks() -> Self {
         use TexturePattern as P;
         let mut b = BlockRegistryBuilder::new();
         let mut tex = |name: &str, rgb: [u8; 3], noise: u8, pattern: TexturePattern| {
@@ -329,12 +235,19 @@ impl BlockRegistry {
         let leaves = tex("leaves", [60, 130, 40], 20, P::Leaves);
         let water = tex("water", [40, 90, 200], 6, P::Noise);
         let planks = tex("planks", [162, 130, 78], 10, P::Planks);
+        // Light opacity: 15 for opaque cubes, 1 for leaves and water (light passes, losing one
+        // level per voxel like in air, but direct sky stops at them). Nothing emits.
         let block =
             |name: &str, shape: RenderShape, solid: bool, textures: FaceTextures| BlockDef {
                 name: format!("boxel:{name}"),
                 shape,
                 solid,
-                light_emission: 0,
+                emission: [0; 3],
+                light_opacity: if shape == RenderShape::Opaque {
+                    OPAQUE_OPACITY
+                } else {
+                    1
+                },
                 textures,
             };
         let all = FaceTextures::all;
@@ -372,7 +285,126 @@ impl BlockRegistry {
         ] {
             b.add_block(def).expect("built-in block");
         }
-        b.build()
+        b
+    }
+
+    /// Registers a texture layer.
+    pub fn add_texture(&mut self, spec: TextureSpec) -> Result<TextureId, RegistryError> {
+        validate_name(&spec.name)?;
+        if self.textures.iter().any(|t| t.name == spec.name) {
+            return Err(RegistryError::Duplicate(spec.name));
+        }
+        if self.textures.len() >= 4096 {
+            return Err(RegistryError::Full("textures"));
+        }
+        self.textures.push(spec);
+        Ok(TextureId((self.textures.len() - 1) as u16))
+    }
+
+    /// Registers a block; returns its state.
+    pub fn add_block(&mut self, def: BlockDef) -> Result<BlockState, RegistryError> {
+        validate_name(&def.name)?;
+        if self.blocks.iter().any(|b| b.name == def.name) {
+            return Err(RegistryError::Duplicate(def.name));
+        }
+        if self.blocks.len() >= u16::MAX as usize {
+            return Err(RegistryError::Full("block states"));
+        }
+        let channels_ok = def.emission.iter().all(|&c| c <= crate::MAX_LIGHT);
+        let opacity_ok = def.light_opacity <= OPAQUE_OPACITY
+            && (def.shape != RenderShape::Opaque || def.light_opacity == OPAQUE_OPACITY);
+        if !channels_ok || !opacity_ok {
+            return Err(RegistryError::InvalidLight(def.name));
+        }
+        if def.shape != RenderShape::None {
+            for t in [def.textures.top, def.textures.bottom, def.textures.side] {
+                if t.0 as usize >= self.textures.len() {
+                    return Err(RegistryError::UnknownTexture(t.0));
+                }
+            }
+        }
+        self.blocks.push(def);
+        Ok(BlockState((self.blocks.len() - 1) as u16))
+    }
+
+    /// Freezes the registry (builds the `SoA` lookup tables).
+    pub fn build(self) -> BlockRegistry {
+        let mut by_name =
+            std::collections::HashMap::with_hasher(foldhash::fast::FixedState::default());
+        for (i, b) in self.blocks.iter().enumerate() {
+            by_name.insert(b.name.clone(), BlockState(i as u16));
+        }
+        BlockRegistry {
+            names: self.blocks.iter().map(|b| b.name.clone()).collect(),
+            shapes: self.blocks.iter().map(|b| b.shape).collect(),
+            flags: self
+                .blocks
+                .iter()
+                .map(|b| {
+                    let mut f = StateFlags::empty();
+                    f.set(StateFlags::SOLID, b.solid);
+                    f.set(StateFlags::OCCLUDES, b.shape == RenderShape::Opaque);
+                    f.set(
+                        StateFlags::FLUID,
+                        b.shape == RenderShape::Translucent && !b.solid,
+                    );
+                    f.set(StateFlags::EMISSIVE, b.emission != [0; 3]);
+                    f
+                })
+                .collect(),
+            emission: self
+                .blocks
+                .iter()
+                .map(|b| LightValue::from_rgb(b.emission))
+                .collect(),
+            opacity: self.blocks.iter().map(|b| b.light_opacity).collect(),
+            faces: self.blocks.iter().map(|b| b.textures).collect(),
+            textures: self.textures,
+            by_name,
+        }
+    }
+}
+
+/// `namespace:path`, both non-empty, `[a-z0-9_]` (path may contain `/`).
+fn validate_name(name: &str) -> Result<(), RegistryError> {
+    let ok = name.split_once(':').is_some_and(|(ns, path)| {
+        !ns.is_empty()
+            && !path.is_empty()
+            && ns
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            && path
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '/')
+    });
+    if ok {
+        Ok(())
+    } else {
+        Err(RegistryError::InvalidName(name.to_string()))
+    }
+}
+
+/// Frozen registry with `SoA` lookup tables indexed by `BlockState.0`.
+#[derive(Debug, Clone)]
+pub struct BlockRegistry {
+    names: Vec<String>,
+    shapes: Vec<RenderShape>,
+    flags: Vec<StateFlags>,
+    emission: Vec<LightValue>,
+    opacity: Vec<u8>,
+    faces: Vec<FaceTextures>,
+    textures: Vec<TextureSpec>,
+    by_name: std::collections::HashMap<String, BlockState, foldhash::fast::FixedState>,
+}
+
+impl BlockRegistry {
+    /// Built-in M0 content ([`BlockRegistryBuilder::with_default_blocks`], built), in this exact
+    /// order (state ids are frozen for tests and worldgen): 0 `boxel:air`, 1 `boxel:stone`,
+    /// 2 `boxel:dirt`, 3 `boxel:grass`, 4 `boxel:sand`, 5 `boxel:gravel`, 6 `boxel:snow`,
+    /// 7 `boxel:bedrock`, 8 `boxel:log`, 9 `boxel:leaves` (Cutout), 10 `boxel:water`
+    /// (Translucent), 11 `boxel:planks`.
+    pub fn default_blocks() -> BlockRegistry {
+        BlockRegistryBuilder::with_default_blocks().build()
     }
     /// Number of states.
     pub fn len(&self) -> usize {
@@ -400,9 +432,16 @@ impl BlockRegistry {
     pub fn flags(&self, s: BlockState) -> StateFlags {
         self.flags.get(s.0 as usize).copied().unwrap_or_default()
     }
-    /// Light emission.
-    pub fn light_emission(&self, s: BlockState) -> u8 {
-        self.light.get(s.0 as usize).copied().unwrap_or(0)
+    /// Light emission (sky 0; out of range -> none).
+    pub fn emission(&self, s: BlockState) -> LightValue {
+        self.emission
+            .get(s.0 as usize)
+            .copied()
+            .unwrap_or(LightValue::DARK)
+    }
+    /// Light opacity `0..=15` (out of range -> 0).
+    pub fn light_opacity(&self, s: BlockState) -> u8 {
+        self.opacity.get(s.0 as usize).copied().unwrap_or(0)
     }
     /// Texture layer of `face` of `s`.
     pub fn face_texture(&self, s: BlockState, face: Face) -> TextureId {
