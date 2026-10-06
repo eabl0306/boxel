@@ -1,27 +1,4 @@
-//! The cave stage: one density per lattice corner, a carve decision per voxel in integers.
-//!
-//! # Density model
-//!
-//! The density `D` (positive: solid) is sampled at a world-anchored lattice with one corner every
-//! 4 voxels along x and z and every 8 along y ([`CELL`]), so a chunk has `9 x 5 x 9 = 405`
-//! corners and shares the ones on its faces with its neighbors (no seams). At each corner:
-//!
-//! - `D = min(cheese, spaghetti, noodles, entrance) - density`, over the cave types that are on
-//!   at that corner (a type that is off is left out, not counted as 0; with none, the corner is
-//!   solid). Each type is a pure function of the corner and of the height of its column
-//!   ([`CaveSettings`] has the formulas).
-//! - `q = round(clamp(D, -4, 4) * 2^20)`, an `i32`.
-//!
-//! A voxel at offsets `(fx, fy, fz)` inside its cell (`fx, fz` in `0..4`, `fy` in `0..8`) gets
-//! the integer trilinear sum `S = sum(wx * wy * wz * q)` over the cell's 8 corners, with weights
-//! `4 - fx` and `fx` along x (the same along z) and `8 - fy` and `fy` along y. The weights sum to
-//! 128, so `|S| < 2^30`, and the sum is exact. The voxel is carved (air) iff `S < 0`, and it is
-//! under the surface roof ([`SurfaceFade::roof`]).
-//!
-//! The decision is integer arithmetic on integers that the `f64` noise produced through a fixed
-//! sequence of `+ - * /`: every platform carves the same voxels. The interpolation is a convex
-//! mix of the corners, so a cell whose 8 corners are `>= 0` is solid and one whose corners are
-//! all `< 0` is air, exactly: the bulk path fills such cells whole.
+//! The cave stage ([`Caves`], whose docs describe the density model).
 
 use super::terrain::Heightmap;
 use crate::Frequency;
@@ -225,13 +202,14 @@ pub struct CaveSettings {
     pub entrances: Option<Entrances>,
     /// How caves keep away from the surface.
     pub surface_fade: SurfaceFade,
-    /// Subtracted from the combined density before the carve decision: 0 is the tuned look,
-    /// positive values open more air everywhere (wider tunnels, bigger caverns), negative
-    /// values close caves.
+    /// Subtracted from the combined density before the carve decision: 0 is the tuned look
+    /// (about 10% of the deep volume is air), positive values open more air everywhere (wider
+    /// tunnels, bigger caverns) and negative values close caves. It is a strong knob: measured
+    /// deep, -0.1 leaves 1.3% air, -0.05 3%, 0.05 23% and 0.1 40%.
     pub density: f64,
 }
 
-/// One fbm per axis-scaled wavelength: `xz` and `y` voxels per lattice cell.
+/// An fbm with lacunarity 2 and gain 0.5, with the frequency `xz` across and `y` up.
 const fn fbm3(xz: Frequency, y: Frequency, octaves: u32) -> Fbm3 {
     Fbm3 {
         frequency: Frequency3 { xz, y },
@@ -242,9 +220,13 @@ const fn fbm3(xz: Frequency, y: Frequency, octaves: u32) -> Fbm3 {
 }
 
 impl Default for CaveSettings {
-    /// Cheese, spaghetti, noodles and entrances. Wavelengths in voxels (across x 1 in y): cheese
-    /// 128 x 85 (3 octaves) in layers 512 x 32, spaghetti 93 x 64, noodles 32, entrances 64 x 23
-    /// in regions of 256.
+    /// Cheese, spaghetti, noodles and entrances. Wavelengths in voxels, across by up: cheese
+    /// 128 by 85 (3 octaves) in layers 512 by 32, spaghetti 93 by 64, noodles 32 in regions of
+    /// 128, entrances 64 by 23 in regions of 256 (2D).
+    ///
+    /// Measured deep down, about 10% of the volume is air: caverns 6%, spaghetti 3% and
+    /// noodles 1% (each alone; they overlap). About 0.3% of the surface columns open into a
+    /// cave.
     fn default() -> Self {
         Self {
             salt: 0,
@@ -367,6 +349,29 @@ const NOISE_COUNT: usize = 12;
 /// The caves stage: a pure function of `(seed, voxel)` with a point form ([`Caves::carves`],
 /// the spec) and a bulk form ([`Caves::chunk_corners`] and [`carve_mask`]) that gives the same
 /// voxels, faster.
+///
+/// # Density model
+///
+/// The density `D` (positive: solid) is sampled at a world-anchored lattice with one corner every
+/// 4 voxels along x and z and every 8 along y ([`CELL`]), so a chunk has `9 x 5 x 9 = 405`
+/// corners and shares the ones on its faces with its neighbors (no seams). At each corner:
+///
+/// - `D = min(cheese, spaghetti, noodles, entrance) - density`, over the cave types that are on
+///   at that corner (a type that is off is left out, not counted as 0; with none, the corner is
+///   solid). Each type is a pure function of the corner and of the height of its column
+///   ([`CaveSettings`] has the formulas).
+/// - `q = round(clamp(D, -4, 4) * 2^20)`, an `i32`.
+///
+/// A voxel at offsets `(fx, fy, fz)` inside its cell (`fx, fz` in `0..4`, `fy` in `0..8`) gets
+/// the integer trilinear sum `S = sum(wx * wy * wz * q)` over the cell's 8 corners, with weights
+/// `4 - fx` and `fx` along x (the same along z) and `8 - fy` and `fy` along y. The weights sum to
+/// 128, so `|S| < 2^30`, and the sum is exact. The voxel is carved (air) iff `S < 0`, and it is
+/// under the surface roof ([`SurfaceFade::roof`]).
+///
+/// The decision is integer arithmetic on integers that the `f64` noise produced through a fixed
+/// sequence of `+ - * /`: every platform carves the same voxels. The interpolation is a convex
+/// mix of the corners, so a cell whose 8 corners are `>= 0` is solid and one whose corners are
+/// all `< 0` is air, exactly: the bulk path fills such cells whole.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Caves {
     /// Parameters.
@@ -501,7 +506,7 @@ impl Caves {
         })
     }
 
-    /// The trilinear sum `S` of voxel `p` (see the [module docs](self)): carved iff `S < 0`.
+    /// The trilinear sum `S` of voxel `p` (see [`Caves`]): carved iff `S < 0`.
     /// `height(x, z)` gives the surface height of a corner column. The spec: 8 corners, each
     /// computed from scratch.
     pub fn voxel_sum(&self, seed: u64, p: BlockPos, height: impl Fn(i64, i64) -> i64) -> i64 {
@@ -539,8 +544,8 @@ impl Caves {
     /// indexed `(i * 5 + j) * 9 + k` for the corner at `origin + (4i, 8j, 4k)`.
     ///
     /// `surface` gives the heights of the 9x9 corner columns (indexed `i * 9 + k`) for chunks
-    /// near the surface; `None` is only right for chunks wholly deeper than
-    /// [`CaveSettings::surface_reach`] under every column, where no depth rule applies.
+    /// near the surface; `None` is only right for chunks wholly below every depth rule (the
+    /// fades, the entrances and the roof) under the lowest possible column.
     /// Bit-identical to [`Caves::corner_density`] per corner (with the true heights), with
     /// one noise grid per noise ([`noise::fbm_3d_grid`]).
     pub fn chunk_corners(

@@ -9,7 +9,8 @@
 //!    [`TerrainGenerator`](crate::TerrainGenerator), bit for bit).
 //! 2. [`SurfaceRules`]: grass, sand or snow on top, dirt under it, stone further down. No
 //!    bedrock: the stone goes on forever.
-//! 3. [`Caves`]: carve the stone ([`CaveSettings`] has the model).
+//! 3. [`Caves`]: carve the stone ([`Caves`] describes the density model, [`CaveSettings`] the
+//!    knobs).
 //! 4. [`Trees`]: on grass whose top block the caves left solid.
 //!
 //! Per chunk, from the cheapest answer to the dearest:
