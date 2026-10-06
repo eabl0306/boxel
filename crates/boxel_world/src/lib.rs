@@ -27,6 +27,10 @@
 //!    [`WorldSettings::max_mesh_events_per_frame`]. A mesh identical to the published one is not
 //!    sent again, and the meshes of one edit batch are published together (held up to
 //!    [`WorldSettings::edit_batch_hold_frames`]).
+//!
+//! [`DaylightPlugin`] adds the world clock ([`TimeOfDay`], one tick per fixed step, 20-minute
+//! days) and the [`DaylightCurve`] the renderer turns into the scene light: day and night change
+//! a uniform only, never a mesh.
 
 /// `let _span = frame_span!("name");` opens a tracing span until the end of the scope, for frame
 /// breakdowns (`boxel_log::span_times`, the stress example's `--spans`). Only with feature
@@ -48,6 +52,7 @@ macro_rules! frame_span {
 #[cfg(not(feature = "trace"))]
 pub(crate) struct NoSpan;
 
+mod daylight;
 mod interest;
 mod map;
 mod plugin;
@@ -61,6 +66,10 @@ pub mod persist;
 pub mod reference;
 pub mod scheduler;
 
+pub use daylight::{
+    DEFAULT_TICKS_PER_DAY, Daylight, DaylightCurve, DaylightPlugin, SUNRISE_HOUR, SkyKey,
+    TICKS_PER_SECOND, TimeOfDay,
+};
 pub use map::{ChunkId, ChunkMap, ChunkSlot, DataState, Interest, MeshState, WorldStats};
 pub use plugin::{
     BlockEdit, ChunkMeshEvent, ChunkViewer, EditQueue, WorldContent, WorldPlugin, WorldSettings,
@@ -70,5 +79,7 @@ pub use sky::{ColumnId, SkyMap};
 
 /// Common items.
 pub mod prelude {
-    pub use crate::{ChunkMap, ChunkViewer, EditQueue, WorldPlugin, WorldSettings};
+    pub use crate::{
+        ChunkMap, ChunkViewer, DaylightPlugin, EditQueue, TimeOfDay, WorldPlugin, WorldSettings,
+    };
 }

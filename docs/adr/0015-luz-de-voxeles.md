@@ -1,6 +1,6 @@
 # ADR 0015: luz de vóxeles
 
-- Estado: aceptado (fases P0 a P3 hechas; P4 en adelante, pendientes)
+- Estado: aceptado (fases P0 a P6 hechas; P7, medir con la máquina libre, y P8, pendientes)
 - Fecha: 2026-10-06
 
 ## Contexto
@@ -76,9 +76,9 @@ mundo.
 - `BlockDef { emission: [u8; 3], light_opacity: u8 }` reemplaza a `light_emission: u8`.
   Validación (`RegistryError::InvalidLight`): cada canal y la opacidad valen como mucho 15, y la
   forma `Opaque` exige opacidad 15. `StateFlags::EMISSIVE` es "algún canal mayor que 0".
-- Contenido de fábrica: bloques opacos 15, hojas y agua 1, aire 0, ningún emisor. Las lámparas de
-  color llegan en P6. `BlockRegistryBuilder::with_default_blocks` permite agregar bloques
-  después de los de fábrica.
+- Contenido de fábrica: bloques opacos 15, hojas y agua 1, aire 0. En P0 no había emisores; P6
+  suma las lámparas de color y la lava provisoria (sección 10).
+  `BlockRegistryBuilder::with_default_blocks` permite agregar bloques después de los de fábrica.
 - `LightValue(u16)`: cielo en los bits 12 a 15, rojo 8 a 11, verde 4 a 7, azul 0 a 3. La emisión
   del registry usa el mismo formato con cielo 0.
 - `LightTables::from_registry`: tablas SoA de opacidad, emisión y clase (opaco, parcial, emite),
@@ -271,29 +271,85 @@ de gameplay.
 - **`reference`**: `Reference` recalcula tiles, luz y mallas desde cero (datos cargados y
   generador, sin cachés ni caminos rápidos). Los tests comparan contra ella.
 
-### 8. GPU (P4)
+### 8. GPU (P4, hecho)
 
 - La paleta vive en el arena de quads, justo después de los 8 buckets del chunk:
   `light_base = quad_base + total_quads`, en un relleno libre de `ChunkGpu` (offset 52; sigue en
-  64 bytes). High y Mid la leen del mismo storage buffer: ningún binding nuevo.
+  64 bytes). High y Mid la leen del mismo storage buffer: ningún binding nuevo. Cada chunk toma
+  `boxel_render::arena_len` entradas de 8 bytes: sus quads más su paleta, con al menos una entrada
+  (una malla hecha a mano sin paleta recibe una de cielo abierto, así ningún índice lee otro
+  chunk). `RenderStats::arena_used_quads` cuenta esas entradas. La subida escribe los quads y la
+  paleta en la misma copia.
 - Low recibe la paleta expandida por quad en un segundo vertex buffer por instancia
   (`Uint32x2` en `@location(1)`), paralelo al arena con los mismos offsets: un atributo, no un
   binding, así que la regla de ADR 0011 se mantiene. `boxel_gfx::tier::floors::VERTEX_BUFFERS`
-  pasa de 1 a 2. Low paga 8 bytes más por quad (16 en total).
+  pasa de 1 a 2 (en todos los tiers, como el resto de los pisos). Low paga 8 bytes más por quad
+  (16 en total). Cada tramo de mallas que sube tiene una segunda copia a ese buffer; la entrada de
+  cada quad se arma al escribir el buffer temporal (un índice fuera de la paleta lee cielo
+  abierto).
 - `ViewUniform` pasa de 240 a 336 bytes (solo `vec4`, std140): `sky_light` (color del cielo por
   luz del día, y piso de ambiente), `light_params` (fuerza del AO, 0.55 por defecto, igual al
-  `mix(0.45, 1, ao)` de hoy; ganancia de luz de bloque) y `light_curve` (16 niveles).
-- Fragment: interpolación bilineal por canal de las 4 esquinas en (s, t) del quad;
+  `mix(0.45, 1, ao)` de antes; ganancia de luz de bloque) y `light_curve` (16 niveles).
+- Fragment (`common.wgsl`: `corner_light`, `level_curve`, `voxel_light`, `ao_factor`,
+  `shade_fragment`): interpolación bilineal por canal de las 4 esquinas en (s, t) del quad,
+  escrita como `a + (b - a) * s` para que 4 esquinas iguales den su valor exacto;
   `luz = max(curva(cielo) * sky_light.rgb, curva(rgb) * ganancia, ambiente)`;
-  `color = albedo * sombreado de cara * mix(1 - fuerza_ao, 1, ao / 3) * luz`, después niebla. Con
-  cielo 15 al mediodía y AO abierto da la imagen de hoy. Igual en todos los tiers.
+  `color = albedo * sombreado de cara * mix(1 - fuerza_ao, 1, ao / 3) * luz`, con el AO también
+  bilineal (antes era lineal por triángulo), después niebla. Con cielo 15 al mediodía y AO
+  abierto da la imagen de antes. Igual en todos los tiers. `VsOut` cambia `shade` por la cara,
+  (s, t), la entrada de paleta y el byte de AO (los tres enteros, planos).
+- Rust: `SceneLight` (color del cielo por la luz del día, ambiente, fuerza del AO, ganancia y
+  curva) va en `ViewParams::light`; `ViewParams::clear_color` es el color de fondo del frame (el
+  renderer ya no lo toma de su configuración: `RendererConfig::clear_color` desaparece y
+  `DEFAULT_SKY_COLOR` es el de antes). `light_curve(gamma)` es la curva de Minecraft
+  `f / (4 - 3f)`, llevada hacia `1 - (1 - b)^4` por la gamma; por defecto gamma 0 (la curva
+  "moody"). `RenderSettings` suma `ao_strength`, `block_light_gain` y `light_gamma`; su
+  `clear_color` queda como el cielo de las apps sin reloj.
 
-### 9. Día y noche (P5)
+### 9. Día y noche (P5, hecho)
 
-Solo un uniform: sin remallado y sin subidas. `TimeOfDay` avanza en `FixedUpdate` (64 Hz; un día
-de 20 minutos son 76 800 ticks). La luz de bloque se ve igual al mediodía y a medianoche.
+Solo un uniform: sin remallado y sin subidas.
 
-### 10. Más adelante (P8)
+- `boxel_world::TimeOfDay { tick, ticks_per_day, paused, speed }` avanza `speed` ticks por paso
+  de `FixedUpdate` (64 Hz; un día de 20 minutos son 76 800 ticks), así el reloj no depende de los
+  fps. El tick 0 de cada día es la salida del sol (06:00), un cuarto de día el mediodía y tres
+  cuartos la medianoche. Empieza al mediodía. `scrub` mueve la hora dentro del día.
+- `DaylightCurve` da, según la altura del sol (el seno de la fracción del día), la luz del cielo
+  (tinte por intensidad), el color del cielo (fondo y niebla) y el piso de ambiente: día blanco a
+  1.0 desde que el seno llega a 0.25, atardecer cálido (1.0, 0.75, 0.55) a 0.6 con el sol en el
+  horizonte, noche azul a 0.2 desde -0.2, con smoothstep entre ellos; el amanecer es igual al
+  atardecer. El tinte de noche es el (0.30, 0.35, 0.55) del plan escalado para que su canal más
+  brillante valga 1, así "20 % de brillo" es el brillo real del azul. El ambiente es 0.02 a toda
+  hora.
+- `DaylightPlugin` (en `DefaultPlugins`) agrega los dos recursos y el sistema. El `Extract` del
+  render arma la `SceneLight` y el color del cielo del frame con ellos; sin el plugin queda un
+  mediodía con `RenderSettings::clear_color`.
+- `voxel_world`: `[` y `]` mueven el reloj una hora, T lo pausa, G lo acelera 60 veces y
+  `--time HH:MM` elige la hora de inicio; las corridas con `--frames` dejan el reloj quieto.
+  `stress --time HH:MM` fija la hora y el reloj queda quieto toda la corrida.
+
+La luz de bloque se ve igual al mediodía y a medianoche (lo verifica `gpu_terrain`).
+
+### 10. Contenido y herramientas (P6, hecho)
+
+- Emisores de cubo completo en `BlockRegistry::default_blocks` (estados 12 a 16, después de los
+  de antes): lámparas naranja (14, 11, 6), roja (14, 2, 2), azul (3, 6, 14) y blanca
+  (15, 15, 15), y la lava provisoria (15, 7, 2), opaca y sólida hasta que haya fluidos
+  (`boxel_voxel::LAMPS`, `LAVA_EMISSION`). Cada uno tiene su textura con puntos brillantes. Su
+  cara se ilumina con la luz del vóxel de enfrente (la emisión menos 1): no hay superficies que
+  brillen solas todavía. Las antorchas esperan a las formas que no son cubos.
+- Overlay F3: la luz (cielo y RGB) del vóxel del ojo y del vóxel al que apunta la mira
+  (`boxel_debug::CrosshairTarget`, que las apps con picking llenan con la celda delante de la cara
+  apuntada), y la hora del reloj. La luz sale de `ChunkMap::light_at` (dentro de
+  `light_cache_radius`; afuera muestra `-`).
+- `voxel_world`: las lámparas en las teclas 7 a 0 y `--lamps`, que pone lámparas y lava alrededor
+  del inicio y empieza a las 21:00.
+- `stress --edits`: una edición por segundo durante la medición (poner una lámpara y sacarla,
+  cavar un pozo de 24 bloques y taparlo); el resumen da los frames hasta que el mundo vuelve a
+  estar quieto y los lotes retenidos o partidos. `headless_world` suma `arena_entries` a su línea
+  `light:` (quads más paletas).
+
+### 11. Más adelante (P8)
 
 AO desde ocupación en GPU en High y Mid si el gate G1 o las mediciones lo piden; cascadas de
 sombras del sol en High (profundidad con solo `geo`, el cielo horneado como máscara de
@@ -301,10 +357,10 @@ exterior); luces dinámicas en el shader; vidrio teñido.
 
 ### Fases
 
-P0 (datos de bloque, máscaras, este ADR), P1 (`boxel_light`), P2 (mesher) y P3 (integración en
-`boxel_world`: `SkyMap`, jobs de caminata, luz en `start_mesh`, ediciones con lotes atómicos)
-están hechas. Siguen P4 (render), P5 (día y noche), P6 (contenido: lámparas de color y lava
-provisoria), P7 (medir con la máquina libre y decidir) y P8.
+P0 (datos de bloque, máscaras, este ADR), P1 (`boxel_light`), P2 (mesher), P3 (integración en
+`boxel_world`: `SkyMap`, jobs de caminata, luz en `start_mesh`, ediciones con lotes atómicos), P4
+(render), P5 (día y noche) y P6 (lámparas de color, lava provisoria, overlay y herramientas) están
+hechas. Siguen P7 (medir con la máquina libre y decidir) y P8.
 
 ### Valores por defecto (decisiones abiertas del dueño)
 
@@ -454,6 +510,22 @@ Cambios de API que rompen:
   identifican con `JobId` (`Chunk` o `Column`) en lugar de `ChunkId`. `boxel_light` suma
   `LayerData::AirUntil`. `boxel_world` depende de `boxel_light`. Una malla igual a la publicada
   ya no genera un `ChunkMeshEvent::Upsert`.
+- P4: `RendererConfig::clear_color` desaparece; `ViewParams` suma `clear_color` y `light`
+  (`SceneLight`), y `ViewParams::from_camera` toma el color del cielo para el fondo y la niebla.
+  Nuevos: `SceneLight`, `light_curve`, `LIGHT_LEVELS`, `DEFAULT_SKY_COLOR` y `arena_len` en
+  `boxel_render`; `RenderSettings` suma `ao_strength`, `block_light_gain` y `light_gamma`.
+  `RenderStats::arena_used_quads` cuenta quads más paletas. `ChunkGpu` cambia `pad: [u32; 3]`
+  por `light_base` y `pad: [u32; 2]`; `ViewUniform` suma `sky_light`, `light_params` y
+  `light_curve`. `floors::VERTEX_BUFFERS` pasa a 2: un adaptador con un solo vertex buffer ya no
+  entra en ningún tier. En WGSL, `decode_quad` toma la entrada de paleta y `VsOut` cambia `shade`
+  por `face`, `st`, `light` y `ao`.
+- P5: nuevos en `boxel_world`: `TimeOfDay`, `DaylightCurve`, `Daylight`, `SkyKey`,
+  `DaylightPlugin` (en `DefaultPlugins`) y las constantes `DEFAULT_TICKS_PER_DAY`,
+  `TICKS_PER_SECOND` y `SUNRISE_HOUR`.
+- P6: `BlockRegistry::default_blocks` pasa de 12 a 17 estados y de 13 a 18 texturas, y el
+  registry de fábrica ya tiene emisores (`LightTables::any_emitter` es verdadero). Nuevos:
+  `boxel_voxel::{BuiltinLamp, LAMPS, LAVA_EMISSION}`, `boxel_debug::{CrosshairTarget,
+  LightProbe}` y los campos `light` y `time` de `OverlayInputs`.
 
 Tests que lo vigilan:
 
@@ -502,6 +574,28 @@ Tests que lo vigilan:
   capas capturadas, el vacío y el contenido fuera del generador.
 - `boxel_world/tests/integration.rs`: cada malla del terreno real, también después de editar,
   igual a la de `Reference`; `light_at` lee la caché.
+- `boxel_shaders/tests/naga.rs` (P4): las constantes de `LightValue` en WGSL, `View` de 336 B,
+  `light_base` en el offset 52, Low con dos atributos de instancia `Uint32x2` y un solo uniform
+  block; High y Mid con un atributo. `boxel_gfx/tests/policy.rs`: todo tier pide 2 vertex
+  buffers y con 1 no clasifica.
+- `boxel_render/tests/gpu_terrain.rs` (P4 y P5): una escena iluminada hecha a mano (árbol,
+  alero, pared baja junto a suelo con sol, cueva cerrada con lámparas roja, azul y naranja) con la
+  luz calculada como la calcula el mundo, en 7 vistas (mediodía y medianoche). Los píxeles son
+  idénticos en High, Mid y Low y en cada posición de `FAR_SHIFTS`, donde las mallas salen iguales
+  byte a byte; la cueva es igual al mediodía y a medianoche; la noche tiene como mucho la mitad
+  del brillo del día; la cueva tiene píxeles rojos y azules; bajo el árbol, el alero y junto a la
+  pared la imagen es más oscura que sin luz ni AO.
+- `boxel_render` (unitarios): el smoke test de cada tier dibuja quads con luz de bloque roja y
+  falla si el píxel central no sale rojo (así la paleta llega al fragment shader también en GL);
+  la paleta va detrás de los quads en el arena y en Low cada quad recibe su entrada; la escena
+  sigue al reloj del mundo. `gpu_tiers` cuenta las entradas de paleta en el arena lleno.
+- `boxel_world/src/daylight.rs` (P5): un día son 76 800 pasos fijos, los ticks son
+  deterministas (pausa y velocidad incluidas), mover la hora da la vuelta dentro del día y la
+  curva da 1.0 blanco al mediodía, 0.2 azul a medianoche, 0.6 cálido en el horizonte y 0.02 de
+  ambiente a toda hora.
+- P6: el registry de fábrica fija los estados 12 a 16 y sus emisiones (`contract.rs`,
+  `masks.rs`); el overlay muestra la luz del ojo y de la mira y la hora; `voxel_world` y `stress`
+  prueban `--time`, `--lamps` y el guion de `--edits`.
 
 ## Alternativas descartadas
 

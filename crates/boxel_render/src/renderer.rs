@@ -1,12 +1,13 @@
-use crate::arena::QuadArena;
+use crate::arena::{QUAD_BYTES, QuadArena};
 use crate::chunk_table::{ChunkRecord, ChunkTable};
+use crate::light::SceneLight;
 use crate::path::{
     HighInputs, HighPath, LowPath, MidPath, TierPath, TierPipelines, geometry_bind_group,
     quad_index_buffer,
 };
 use crate::targets::{Blit, Targets};
 use crate::textures::{BLOCK_TEXTURE_SIZE, generate_block_textures, layer_bytes};
-use crate::upload::{UploadTargets, Uploads};
+use crate::upload::{UploadTargets, Uploads, arena_len};
 use boxel_camera::{Camera, CameraView};
 use boxel_gfx::Tier;
 use boxel_math::{Frustum, I64Vec3, Mat4, UVec2, Vec3, wrap_to_i32};
@@ -21,19 +22,22 @@ const MAX_SLOTS: u32 = 1 << 20;
 /// Bytes of one chunk table entry.
 const CHUNK_GPU_BYTES: u64 = size_of::<ChunkGpu>() as u64;
 
+/// The default sky: the clear color and fog color of a noon view (linear RGBA).
+pub const DEFAULT_SKY_COLOR: [f32; 4] = [0.30, 0.52, 0.85, 1.0];
+
 /// Renderer construction parameters.
 #[derive(Clone, Debug)]
 pub struct RendererConfig {
     /// Quad arena capacity (clamped to `max_storage_buffer_binding_size / 8` on High/Mid and
-    /// `max_buffer_size / 8` on Low).
+    /// `max_buffer_size / 8` on Low). Each chunk takes its quads plus its light palette (one
+    /// entry of 8 bytes per distinct corner light set, usually a few dozen). Low also allocates
+    /// a second buffer of the same size (each quad's light, ADR 0015).
     pub arena_quads: u32,
     /// Chunk slots. High clamps it to `64 * max_compute_workgroups_per_dimension`; its draw
     /// lists hold `min(6 * slots, 65535)` opaque and `min(slots, 65535)` cutout draws. When more
     /// buckets are visible, High skips arbitrary ones (not the farthest; not counted in
     /// [`RenderStats`]) and logs one warning; Mid and Low draw them all.
     pub max_chunk_slots: u32,
-    /// Clear color (linear).
-    pub clear_color: [f32; 4],
 }
 
 impl Default for RendererConfig {
@@ -41,7 +45,6 @@ impl Default for RendererConfig {
         Self {
             arena_quads: 8 << 20,
             max_chunk_slots: 32768,
-            clear_color: [0.30, 0.52, 0.85, 1.0],
         }
     }
 }
@@ -63,14 +66,21 @@ pub struct ViewParams {
     pub fog_start: f32,
     /// Fog end distance.
     pub fog_end: f32,
+    /// Clear color of the main pass, the sky behind the terrain (linear RGBA).
+    pub clear_color: [f32; 4],
+    /// The scene light the baked corner light is multiplied by (sky color, ambient floor, AO
+    /// strength, brightness curve).
+    pub light: SceneLight,
 }
 
 impl ViewParams {
-    /// From a camera view: fog from `camera.view_distance * fog_start_fraction` to the distance.
+    /// From a camera view: fog from `camera.view_distance * fog_start_fraction` to the distance,
+    /// `sky_color` as both the fog and the clear color, and a noon [`SceneLight`] (set
+    /// [`ViewParams::light`] for another time of day).
     pub fn from_camera(
         view: &CameraView,
         camera: &Camera,
-        fog_color: [f32; 4],
+        sky_color: [f32; 4],
         fog_start_fraction: f32,
     ) -> Self {
         Self {
@@ -78,9 +88,11 @@ impl ViewParams {
             frustum: view.frustum,
             render_origin: view.render_origin,
             eye_rel: view.eye_rel,
-            fog_color,
+            fog_color: sky_color,
             fog_start: camera.view_distance * fog_start_fraction,
             fog_end: camera.view_distance,
+            clear_color: sky_color,
+            light: SceneLight::default(),
         }
     }
 }
@@ -90,7 +102,7 @@ impl ViewParams {
 pub struct RenderStats {
     /// Resident chunks.
     pub chunks: u32,
-    /// Arena quads in use.
+    /// Arena entries in use: the quads of every resident chunk plus their light palettes.
     pub arena_used_quads: u32,
     /// Arena capacity: `RendererConfig::arena_quads`, cut to the device's buffer limits.
     pub arena_capacity_quads: u32,
@@ -127,7 +139,6 @@ pub enum RendererError {
 /// The ECS-free voxel renderer for one device and one tier.
 pub struct VoxelRenderer {
     tier: Tier,
-    clear_color: [f32; 4],
     /// Group 0: block texture array + sampler.
     materials: wgpu::BindGroup,
     view_buffer: wgpu::Buffer,
@@ -137,6 +148,8 @@ pub struct VoxelRenderer {
     chunks: ChunkTable,
     /// GPU chunk table (High/Mid).
     chunk_buffer: Option<wgpu::Buffer>,
+    /// Low: the light palette entry of each arena quad, at the quad's offset (vertex slot 1).
+    low_light: Option<wgpu::Buffer>,
     /// Meshes (and, through `chunks`, table entries) waiting for the next `render`.
     uploads: Uploads,
     path: Box<dyn TierPath + Send + Sync>,
@@ -229,9 +242,17 @@ impl VoxelRenderer {
             limits.max_buffer_size
         };
         let arena_quads = u64::from(config.arena_quads)
-            .min(arena_limit / crate::arena::QUAD_BYTES)
+            .min(arena_limit / QUAD_BYTES)
             .max(1) as u32;
         let arena = QuadArena::new(device, arena_quads, 2 * slots + 4);
+        let low_light = (tier == Tier::Low).then(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("boxel low light"),
+                size: u64::from(arena_quads) * QUAD_BYTES,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
         let chunk_buffer = (tier >= Tier::Mid).then(|| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("boxel chunk table"),
@@ -271,8 +292,8 @@ impl VoxelRenderer {
             }],
         });
 
-        let path: Box<dyn TierPath + Send + Sync> = if tier == Tier::Low {
-            Box::new(LowPath::new(voxel))
+        let path: Box<dyn TierPath + Send + Sync> = if let Some(light) = &low_light {
+            Box::new(LowPath::new(voxel, light.clone()))
         } else {
             let (Some(geometry_layout), Some(chunk_buffer)) =
                 (layouts.geometry.as_ref(), chunk_buffer.as_ref())
@@ -304,7 +325,6 @@ impl VoxelRenderer {
         let blit = Blit::new(device, output_format, &targets.color_view);
         Ok(Self {
             tier,
-            clear_color: config.clear_color,
             materials,
             view_buffer,
             view_bind_group,
@@ -312,6 +332,7 @@ impl VoxelRenderer {
             arena,
             chunks: ChunkTable::new(slots),
             chunk_buffer,
+            low_light,
             uploads: Uploads::default(),
             path,
             targets,
@@ -340,6 +361,11 @@ impl VoxelRenderer {
     /// more away from it on some axis, the chunk stays resident but no tier draws it (its wrapped
     /// origin difference may not be exact). Empty meshes remove the chunk.
     ///
+    /// The chunk's arena range holds its quads and then its light palette (High and Mid read it
+    /// there; Low gets each quad's entry in a parallel buffer). Every quad's light index must be
+    /// inside the palette (the mesher guarantees it; debug-asserted); a mesh without a palette is
+    /// lit as open sky.
+    ///
     /// Chunk changes stay on the CPU until the next [`VoxelRenderer::render`], which records all
     /// of them at the start of its encoder (one staging buffer for the whole frame). Until then
     /// the renderer holds `mesh` (no copy of its quads).
@@ -357,7 +383,15 @@ impl VoxelRenderer {
             self.stats.dropped_chunks += 1;
             return Err(RendererError::ChunkTableFull(self.chunks.capacity()));
         }
-        let needed = mesh.total_quads();
+        debug_assert!(
+            mesh.palette.is_empty()
+                || mesh
+                    .quads
+                    .iter()
+                    .all(|q| usize::from(q.light_index()) < mesh.palette.len()),
+            "a quad's light index is outside its palette"
+        );
+        let needed = arena_len(&mesh);
         let old = self.chunks.get(id).map(|(_, r)| r.alloc);
         let Some(alloc) = self.arena.alloc.replace(old, needed) else {
             // Nothing changed: a resident chunk keeps its old mesh (range and slot untouched).
@@ -369,6 +403,7 @@ impl VoxelRenderer {
             origin,
             alloc,
             counts: bucket_counts(&mesh),
+            light_base: alloc.offset + mesh.total_quads(),
         };
         if self.chunks.insert(record).is_none() {
             // unreachable: `slot_for` succeeded above, so this is a new chunk (no old range)
@@ -432,12 +467,14 @@ impl VoxelRenderer {
             let targets = UploadTargets {
                 arena: self.arena.buffer(),
                 table: self.chunk_buffer.as_ref(),
+                low_light: self.low_light.as_ref(),
             };
             self.uploads
                 .flush(device, encoder, targets, &mut self.chunks);
         }
         debug_assert!(self.chunks.is_synced());
         let slot_count = self.chunks.slot_count();
+        let (sky_light, light_params, light_curve) = view.light.uniform();
         let uniform = ViewUniform {
             view_proj: view.view_proj.to_cols_array_2d(),
             frustum: view.frustum.to_array(),
@@ -447,12 +484,15 @@ impl VoxelRenderer {
             fog_color: view.fog_color,
             fog_params: [view.fog_start, view.fog_end, 0.0, 0.0],
             counts: [slot_count, self.cap_opaque, self.cap_cutout, 0],
+            sky_light,
+            light_params,
+            light_curve,
         };
         queue.write_buffer(&self.view_buffer, 0, bytemuck::bytes_of(&uniform));
         let visible = self.path.prepare(queue, &self.chunks, view);
         self.path.encode_compute(encoder, slot_count);
         let draws = {
-            let mut pass = self.targets.begin_main_pass(encoder, self.clear_color);
+            let mut pass = self.targets.begin_main_pass(encoder, view.clear_color);
             pass.set_bind_group(bindings::GROUP_MATERIALS, &self.materials, &[]);
             pass.set_bind_group(bindings::GROUP_VIEW, &self.view_bind_group, &[]);
             self.path.draw(&mut pass, self.arena.buffer())

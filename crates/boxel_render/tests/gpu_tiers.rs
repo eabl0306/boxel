@@ -17,7 +17,8 @@
 //!   submitting it, then a resync of every chunk, as the render plugin does;
 //! - the same picture after lost uploads: more churn in a frame whose staging buffer cannot be
 //!   created (as when out of memory), which the renderer must report, then a resync;
-//! - the heightfield in a second renderer whose arena is exactly full: a chunk that no longer
+//! - the heightfield in a second renderer whose arena is full (one entry may stay free: a mesh
+//!   takes at least two, a quad and its light palette): a chunk that no longer
 //!   fits keeps its old mesh, a smaller mesh reuses the chunk's own range;
 //! - a far scene: a 32x32 slab ~480 voxels away and a second slab of another texture 1 voxel
 //!   behind it (hidden), compared with the front slab alone (depth precision on every backend,
@@ -33,7 +34,10 @@ use boxel_gfx::{
 };
 use boxel_math::{DVec3, I64Vec3, IVec3, UVec2};
 use boxel_mesh::{BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, PackedQuad};
-use boxel_render::{RendererConfig, RendererError, RendererSmokeTest, ViewParams, VoxelRenderer};
+use boxel_render::{
+    DEFAULT_SKY_COLOR, RendererConfig, RendererError, RendererSmokeTest, ViewParams, VoxelRenderer,
+    arena_len,
+};
 use boxel_transform::Transform;
 use boxel_voxel::{BlockRegistry, BlockState, Face, RenderShape};
 use std::path::PathBuf;
@@ -328,7 +332,7 @@ fn hidden_mesh(n: u32) -> ChunkMesh {
 
 fn view_params(camera: &Camera, transform: &Transform) -> ViewParams {
     let view = CameraView::compute(camera, transform, WIDTH as f32 / HEIGHT as f32);
-    ViewParams::from_camera(&view, camera, RendererConfig::default().clear_color, 0.6)
+    ViewParams::from_camera(&view, camera, DEFAULT_SKY_COLOR, 0.6)
 }
 
 /// Looks over the heightfield from above one corner (the slab and the canopy are in view).
@@ -412,10 +416,11 @@ struct TierImages {
     full_arena: [RgbaImage; 3],
 }
 
-/// Renders the heightfield in a renderer whose arena is exactly full (terrain plus out-of-view
-/// filler chunks), then re-upserts `REMOVED_CHUNK`: one quad more than it has must fail with
-/// `ArenaFull` and change nothing; one hidden quad must succeed in the chunk's own range (no
-/// other quad is free); its original mesh must fit there again.
+/// Renders the heightfield in a renderer whose arena is full (terrain plus out-of-view filler
+/// chunks, at most one entry left), then re-upserts `REMOVED_CHUNK`: two quads more than it has
+/// (two entries more, while at most one is free) must fail with `ArenaFull` and change nothing;
+/// one hidden quad must succeed in the chunk's own range (no other quad fits); its original mesh
+/// must fit there again.
 fn full_arena_scenes(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -423,13 +428,12 @@ fn full_arena_scenes(
     registry: &BlockRegistry,
     terrain: &[(IVec3, ChunkMesh)],
 ) -> Result<[RgbaImage; 3], String> {
-    let quads: u32 = terrain.iter().map(|(_, m)| m.total_quads()).sum();
-    let largest = terrain.iter().map(|(_, m)| m.total_quads()).max();
+    let quads: u32 = terrain.iter().map(|(_, m)| arena_len(m)).sum();
+    let largest = terrain.iter().map(|(_, m)| arena_len(m)).max();
     let config = RendererConfig {
         // slack for the size bins of `offset_allocator`, filled below
         arena_quads: quads + largest.unwrap_or(0) / 4 + 8,
         max_chunk_slots: 256,
-        ..RendererConfig::default()
     };
     let mut renderer = VoxelRenderer::new(
         device,
@@ -446,12 +450,14 @@ fn full_arena_scenes(
             .upsert_chunk(chunk_id(*c), (*c * 32).as_i64vec3(), Arc::new(mesh.clone()))
             .map_err(|e| format!("full arena: upsert {c}: {e}"))?;
     }
-    // fillers behind the camera, the largest that fits first, until not one quad is free
+    // Fillers behind the camera, the largest that fits first, until no filler fits. A filler of
+    // n quads takes n + 1 entries (its light palette), so at most one entry can stay free: no
+    // chunk mesh fits in it.
     let mut filler_id = 1 << 40;
     loop {
         let stats = renderer.stats();
         let free = stats.arena_capacity_quads - stats.arena_used_quads;
-        let fits = (1..=free).rev().any(|n| {
+        let fits = (1..free).rev().any(|n| {
             renderer
                 .upsert_chunk(filler_id, I64Vec3::splat(-2048), Arc::new(hidden_mesh(n)))
                 .is_ok()
@@ -462,7 +468,7 @@ fn full_arena_scenes(
         filler_id += 1;
     }
     let full = renderer.stats();
-    if full.arena_used_quads != full.arena_capacity_quads {
+    if full.arena_capacity_quads - full.arena_used_quads > 1 {
         return Err(format!("full arena: not full after the fillers: {full:?}"));
     }
 
@@ -472,7 +478,7 @@ fn full_arena_scenes(
         .ok_or("full arena: no REMOVED_CHUNK")?;
     let (id, origin) = (chunk_id(REMOVED_CHUNK), (REMOVED_CHUNK * 32).as_i64vec3());
     let view = heightfield_view();
-    let grown = hidden_mesh(original.total_quads() + 1);
+    let grown = hidden_mesh(original.total_quads() + 2);
     match renderer.upsert_chunk(id, origin, Arc::new(grown)) {
         Err(RendererError::ArenaFull { .. }) => {}
         other => return Err(format!("full arena: growing a chunk returned {other:?}")),
@@ -675,7 +681,6 @@ fn render_tier(
     let config = RendererConfig {
         arena_quads: 1 << 20,
         max_chunk_slots: 256,
-        ..RendererConfig::default()
     };
     let mut renderer = VoxelRenderer::new(
         &device,
@@ -696,7 +701,7 @@ fn render_tier(
             .upsert_chunk(chunk_id(*c), (*c * 32).as_i64vec3(), Arc::new(mesh.clone()))
             .map_err(|e| format!("upsert {c}: {e}"))?;
     }
-    let quads: u32 = terrain.iter().map(|(_, m)| m.total_quads()).sum();
+    let quads: u32 = terrain.iter().map(|(_, m)| arena_len(m)).sum();
     let stats = renderer.stats();
     if stats.chunks as usize != terrain.len() || stats.arena_used_quads != quads {
         return Err(format!(

@@ -23,6 +23,13 @@ en 8 bytes, pero `mat` cambió: capa, AO y un índice de paleta. Cada worker usa
 memoria de trabajo, y una edición también remalla los vecinos de arista y de esquina, porque el AO
 los lee. Lo que sigue describe el estado anterior.
 
+**Actualización (luz en pantalla, ADR 0015 fases P4 a P6):** el shader ya lee la luz. Cada chunk
+sube sus quads y, justo detrás en el mismo arena, su paleta de luz (8 bytes por entrada); en Low,
+además, un segundo buffer del tamaño del arena con la luz de cada quad (16 bytes por quad en
+total). El fragment shader interpola las 4 esquinas y aplica la luz del cielo de la hora: un día
+dura 20 minutos y cambiarlo es un uniform, sin remallar ni subir nada. Hay 17 bloques: los 12 de
+antes, cuatro lámparas de color y una lava provisoria. La sección 5 cuenta la subida.
+
 ## En resumen
 
 1. Cada chunk de 32³ se guarda comprimido con una paleta. Si es de puro aire, sus vóxeles no
@@ -167,8 +174,9 @@ bit a bit. Con otra configuración puede cambiar alguna altura, solo donde el ru
 redondeaba o se saturaba: el nuevo es exacto.
 
 **Bloques.** Cada estado es un `u16` y el 0 es aire (`voxel/registry.rs:10`). Las propiedades
-viven en tablas por campo (`voxel/registry.rs:268`). Hoy hay 12 bloques: las hojas son cutout y
-el agua translúcida (`voxel/registry.rs:283`).
+viven en tablas por campo (`voxel/registry.rs:268`). Hoy hay 17 bloques: las hojas son cutout y
+el agua translúcida (`voxel/registry.rs:283`); los últimos cinco emiten luz de color (lámparas
+naranja, roja, azul y blanca, y una lava provisoria).
 
 **Un chunk** es bloques y un número de versión (`voxel/chunk.rs`), más una caché de máscaras de
 luz cuando hace falta. Cambiar un bloque sube la versión. Los bloques se guardan con paleta (`voxel/storage.rs:9-23`):
@@ -185,7 +193,8 @@ La paleta crece sola al editar (`voxel/storage.rs:57-103`) pero nunca encoge: `c
 **Luz.** No se guarda en el chunk (ADR 0015): es una función pura de los bloques y de un techo de
 cielo por columna, que calcula `boxel_light` dentro del job de malla (`world/streaming.rs`,
 `start_mesh`) y el mesher hornea en los quads. Los techos de cielo viven en `SkyMap`
-(`world/sky.rs`). El shader todavía no la lee (fase P4): se dibuja con cielo 15.
+(`world/sky.rs`). El fragment shader interpola la luz de las 4 esquinas de cada quad y la
+multiplica por la luz del cielo de la hora (`TimeOfDay`, `DaylightCurve`).
 
 **Memoria medida** con el generador Forest (terreno y árboles):
 
@@ -312,6 +321,11 @@ de la tabla (en High y Mid; tramos separados por 16 slots o menos van juntos). A
 temporal (`queue.rs:662` de wgpu-core): unos 450 por cruce de borde a radio 32. Las copias van en
 el mismo command buffer del frame. Si la GPU rechaza el frame, se pierden con él, y el plugin
 vuelve a subir todos los chunks (`render/plugin.rs:1329-1334`).
+
+Desde la luz (ADR 0015, P4), el rango de cada chunk en el arena lleva sus quads y detrás su paleta
+de luz, en la misma copia; `ChunkGpu::light_base` dice dónde empieza la paleta. En Low, cada tramo
+de mallas tiene una segunda copia al buffer de luz por quad, con la entrada de paleta de cada quad
+ya expandida (se arma al escribir el buffer temporal).
 
 **Recursos fijos:**
 

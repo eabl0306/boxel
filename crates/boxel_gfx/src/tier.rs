@@ -79,8 +79,10 @@ pub struct TierRequest {
 pub mod floors {
     /// All tiers: immediates bytes (Low passes the chunk origin through them).
     pub const IMMEDIATE_SIZE: u32 = 16;
-    /// All tiers: vertex buffer slots (instance-step `DrawRef` or quad attribute).
-    pub const VERTEX_BUFFERS: u32 = 1;
+    /// All tiers: vertex buffer slots. High and Mid use one (the instance-step `DrawRef`); Low
+    /// uses two, both instance-step: the quad and its light palette entry (ADR 0015; an
+    /// attribute, not a binding, so ADR 0011 holds).
+    pub const VERTEX_BUFFERS: u32 = 2;
     /// All tiers: layers of the block texture array.
     pub const TEXTURE_ARRAY_LAYERS: u32 = 256;
     /// Mid/High: storage buffers per stage (quad arena + chunk table in the vertex stage; the

@@ -12,6 +12,10 @@
 //! - `spin`: the camera turns 360 degrees in place over the measurement (visibility changes,
 //!   no new chunks).
 //!
+//! `--edits` adds scripted block edits during the measurement (a lamp placed and removed, a
+//! shaft dug and capped, one per second near the start) and reports how many frames the world
+//! takes to publish each one. The world clock stays still at `--time` (noon by default).
+//!
 //! Every run waits until the world settled, runs `--warmup` seconds, then measures
 //! `--duration` seconds. Each frame records its wall-clock time (`Time::real_delta`, the whole
 //! loop: world and render) and the work it did: chunks generated and jobs finished (counted by
@@ -26,6 +30,10 @@
 //! written, 4 timeout (the world did not settle, or the run took longer than `--timeout`).
 #![expect(clippy::print_stdout, clippy::print_stderr, reason = "CLI output")]
 
+#[path = "shared/clock.rs"]
+mod clock;
+#[path = "stress/edits.rs"]
+mod edits;
 #[path = "stress/report.rs"]
 mod report;
 #[path = "stress/spans.rs"]
@@ -40,7 +48,8 @@ use boxel::prelude::*;
 use boxel::render::GpuFailed;
 use boxel::voxel::{BlockPos, BlockRegistry, ChunkData, ChunkKey, ChunkPos, MAX_BLOCK_COORD};
 use boxel::world::jobs::{JobExecutor, TaskPoolExecutor};
-use boxel::world::{ChunkId, ChunkMeshEvent, WorldStats, WorldSystems};
+use boxel::world::{ChunkId, ChunkMeshEvent, WorldContent, WorldStats, WorldSystems};
+use edits::EditScript;
 use report::{FrameRecord, RecordLog, RunInfo, Summary};
 use spans::{SpanLog, SpanRow};
 use std::collections::HashMap;
@@ -81,6 +90,10 @@ usage: stress [--scenario static|fly|dive|spin] [GPU options] [options]
   --spans             busy time per system and span in each frame, added to the summary (needs
                       a build with --features trace)
   --spans-csv PATH    also write it per frame (implies --spans)
+  --edits             scripted edits during the measurement, one per second near the start: a
+                      lamp placed and removed, a shaft dug and capped; the summary gives the
+                      frames each one took to publish (meant for --scenario static)
+  --time HH[:MM]      clock time of the world, kept still (default 12:00)
   --help              this text
 The run presents with --present immediate unless --present or BOXEL_PRESENT is given.
 exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 output not written, 4 timeout";
@@ -162,6 +175,10 @@ struct Options {
     fps_limit: u32,
     spans: bool,
     spans_csv: Option<PathBuf>,
+    /// `--edits`.
+    edits: bool,
+    /// `--time`, clock hours.
+    time: f64,
 }
 
 impl Options {
@@ -199,6 +216,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         fps_limit: 0,
         spans: false,
         spans_csv: None,
+        edits: false,
+        time: 12.0,
     };
     let mut timeout = None;
     let mut it = args.iter();
@@ -322,6 +341,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                 o.spans_csv = Some(PathBuf::from(value()?));
                 o.spans = true;
             }
+            "--edits" => o.edits = true,
+            "--time" => o.time = clock::parse_clock(flag, &value()?)?,
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
@@ -634,11 +655,13 @@ fn drive(
     mut cameras: Query<&mut Transform, With<Camera>>,
     mut exit: MessageWriter<AppExit>,
     spans: Option<Res<SpanRecorder>>,
+    script: Option<Res<EditScript>>,
 ) {
     if bench.exiting {
         return;
     }
     let spans = spans.as_deref();
+    let script = script.as_deref();
     let now = time.last_update().unwrap_or_else(Instant::now);
     let elapsed = now.saturating_duration_since(bench.started);
     if elapsed > bench.options.timeout {
@@ -650,7 +673,7 @@ fn drive(
             ),
             Phase::CatchUp { .. } => {
                 // The measurement is complete; only the catch-up time is missing.
-                bench.finish(&rec, &info, spans, None, &mut exit);
+                bench.finish(&rec, &info, spans, script, None, &mut exit);
                 return;
             }
             _ => eprintln!(
@@ -709,13 +732,37 @@ fn drive(
             bench.phase = Phase::CatchUp { since, streak };
             if streak >= SETTLED_FRAMES {
                 let catch_up = Some(now.duration_since(since));
-                bench.finish(&rec, &info, spans, catch_up, &mut exit);
+                bench.finish(&rec, &info, spans, script, catch_up, &mut exit);
             } else if now.duration_since(since) > CATCH_UP_LIMIT {
-                bench.finish(&rec, &info, spans, None, &mut exit);
+                bench.finish(&rec, &info, spans, script, None, &mut exit);
             }
         }
         Phase::Warmup { .. } | Phase::Done => {}
     }
+}
+
+/// `--edits`, after `drive`: the next scripted edit while measuring (see [`edits`]).
+fn scripted_edits(
+    time: Res<Time>,
+    bench: Res<Bench>,
+    stats: Res<WorldStats>,
+    script: Option<ResMut<EditScript>>,
+    world: Option<(Res<ChunkMap>, Res<WorldContent>, ResMut<EditQueue>)>,
+) {
+    let (Some(mut script), Some((map, content, mut queue))) = (script, world) else {
+        return;
+    };
+    if !matches!(bench.phase, Phase::Measuring { .. }) {
+        return;
+    }
+    let now = time.last_update().unwrap_or_else(Instant::now);
+    script.frame(
+        now,
+        stats.is_settled(),
+        &content,
+        |p| map.block_at(p),
+        |pos, state| queue.set_block(pos, state),
+    );
 }
 
 /// Moves the camera for a measured frame and leaves the frame's first half of the record.
@@ -756,6 +803,7 @@ impl Bench {
         rec: &Recorder,
         info: &RenderInfo,
         spans: Option<&SpanRecorder>,
+        script: Option<&EditScript>,
         catch_up: Option<Duration>,
         exit: &mut MessageWriter<AppExit>,
     ) {
@@ -787,6 +835,9 @@ impl Bench {
             self.info.chunk_slots = info.chunk_slot_capacity;
         }
         let records = rec.log.to_vec();
+        if let (Some(script), Some(first), Some(last)) = (script, records.first(), records.last()) {
+            self.info.edits = Some(script.stats(&first.world, &last.world));
+        }
         let Some(summary) = Summary::compute(&records) else {
             eprintln!("stress: no frame was measured");
             self.exit(3, exit);
@@ -897,7 +948,9 @@ fn add_bench(app: &mut App, options: Options, info: RunInfo, recorder: Recorder,
         .add_systems(PreUpdate, record)
         .add_systems(
             Update,
-            (gpu_failed, drive).chain().before(WorldSystems::Interest),
+            (gpu_failed, drive, scripted_edits)
+                .chain()
+                .before(WorldSystems::Interest),
         );
 }
 
@@ -1003,6 +1056,7 @@ fn main() -> AppExit {
         .to_string(),
         cpu: cpu_name(),
         threads: std::thread::available_parallelism().map_or(0, usize::from),
+        time: clock::start_time(options.time, true).clock_text(),
         ..RunInfo::default()
     };
     let mut plugins = DefaultPlugins
@@ -1056,6 +1110,12 @@ fn main() -> AppExit {
     let fps_limit = FrameLimit::new(options.fps_limit);
     let mut app = App::new();
     app.add_plugins(plugins);
+    // The day and night clock stays still: every run sees the same light.
+    app.insert_resource(clock::start_time(options.time, true));
+    if options.edits {
+        let [x, y, z, ..] = options.camera;
+        app.insert_resource(EditScript::new(DVec3::new(x, y, z)));
+    }
     add_bench(
         &mut app,
         options,
@@ -1166,6 +1226,18 @@ mod tests {
         assert!(o.spans, "--spans-csv implies --spans");
         assert_eq!(o.spans_csv.as_deref(), Some(Path::new("s.csv")));
         assert!(!parse(&[]).expect("valid").expect("not help").spans);
+    }
+
+    #[test]
+    fn edit_and_time_flags() {
+        let o = parse(&[]).expect("valid").expect("not help");
+        assert_eq!((o.edits, o.time), (false, 12.0));
+        let o = parse(&["--edits", "--time", "21:30"])
+            .expect("valid")
+            .expect("not help");
+        assert_eq!((o.edits, o.time), (true, 21.5));
+        assert!(parse(&["--time", "7:75"]).is_err());
+        assert_eq!(clock::start_time(o.time, true).clock_text(), "21:30");
     }
 
     #[test]

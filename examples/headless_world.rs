@@ -8,10 +8,11 @@
 //! update times are the longest and 99th percentile `App::update` while loading, and `world:
 //! meshed_fraction=X quads_per_mesh_p50=N p99=N max=N voxel_mib=X`: the share of the meshed
 //! chunks with a non-empty mesh, the quads of those meshes, and the heap bytes of the voxel data;
-//! `light: ao=MODE palette_p50=N p99=N max=N requantized=N`: the AO policy (`--ao`), the light
-//! palette entries of the non-empty meshes and how many of them overflowed the palette and were
-//! requantized; and `sky: light=on|off full=N fast=N columns=N walked=N walks=N
-//! private_generations=N cache_mib=X sky_mib=X`: the light boxes that ran the floods or took a
+//! `light: ao=MODE palette_p50=N p99=N max=N requantized=N arena_entries=N`: the AO policy
+//! (`--ao`), the light palette entries of the non-empty meshes, how many of them overflowed the
+//! palette and were requantized, and the renderer arena entries they take (quads plus palettes,
+//! at least one palette entry per mesh); and `sky: light=on|off full=N fast=N columns=N
+//! walked=N walks=N private_generations=N cache_mib=X sky_mib=X`: the light boxes that ran the floods or took a
 //! fast path (dark, open sky or under the walk floor), the chunk columns with a sky tile slot
 //! and with a walked tile, the walks run and the chunks they generated because they were not
 //! loaded, and the memory of the gameplay light cache and of the sky tiles. Compare `quads=`
@@ -452,9 +453,12 @@ fn world_line(map: &ChunkMap) -> String {
 fn light_line(map: &ChunkMap, ao: AoPolicy) -> String {
     let mut entries: Vec<usize> = Vec::new();
     let mut requantized = 0;
+    // What `boxel_render::arena_len` gives (this example has no renderer).
+    let mut arena = 0u64;
     for (_, _, mesh) in map.ready_meshes() {
         entries.push(mesh.palette.len());
         requantized += usize::from(mesh.light_quantization != LightQuantization::Exact);
+        arena += u64::from(mesh.total_quads()) + mesh.palette.len().max(1) as u64;
     }
     entries.sort_unstable();
     let at = |q: usize| {
@@ -464,7 +468,7 @@ fn light_line(map: &ChunkMap, ao: AoPolicy) -> String {
             .unwrap_or(0)
     };
     format!(
-        "light: ao={} palette_p50={} p99={} max={} requantized={requantized}",
+        "light: ao={} palette_p50={} p99={} max={} requantized={requantized} arena_entries={arena}",
         ao_name(ao),
         at(50),
         at(99),

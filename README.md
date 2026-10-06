@@ -45,17 +45,23 @@ just run voxel_world --tier mid
 
 Controles: clic izquierdo captura el mouse, Escape (o salir de la ventana) lo suelta. WASD para
 moverse, Espacio sube, Shift izquierdo baja, Ctrl izquierdo acelera. Con el mouse capturado, clic
-izquierdo rompe el bloque de la mira y clic derecho pone el bloque elegido (teclas 1 a 9), a 6
-bloques como máximo. F3 muestra el overlay de debug (con el bloque apuntado), F5 cambia el límite
-de FPS (30, 60, 144, 240, sin límite) y F6 prende o apaga el vsync.
+izquierdo rompe el bloque de la mira y clic derecho pone el bloque elegido (teclas 1 a 9 y 0; las
+lámparas de color van del 7 al 0), a 6 bloques como máximo. F3 muestra el overlay de debug (con
+el bloque apuntado, la luz en el ojo y en la mira, y la hora), F5 cambia el límite de FPS (30,
+60, 144, 240, sin límite) y F6 prende o apaga el vsync.
+
+Día y noche: un día dura 20 minutos. `[` y `]` mueven el reloj una hora, T lo pausa y G lo
+acelera 60 veces.
 
 Opciones útiles: `--fps-limit N` (0 = sin límite), `--vsync on|off`, `--seed N`,
 `--view-distance N` (en chunks), `--vertical-radius N` (chunks hacia arriba y hacia abajo, 8 por
 defecto), `--size 1280x720`, `--camera x,y,z,yaw,pitch` (ángulos en grados), `--tier high|mid|low`,
-`--help` (lista todo).
+`--time HH:MM` (hora de inicio, 12:00 por defecto), `--lamps` (pone lámparas de color y lava
+alrededor del inicio y empieza de noche), `--help` (lista todo).
 `--world overworld` muestra el mundo con cuevas (piedra infinita hacia abajo) en vez del bosque
 de siempre; `--caves mc|closed|off` elige las cuevas y `--no-trees` saca los árboles.
-Para pruebas automáticas usa siempre `--frames N --timeout SEG`: la ventana se cierra sola.
+Para pruebas automáticas usa siempre `--frames N --timeout SEG`: la ventana se cierra sola y el
+reloj queda quieto en `--time`.
 `--wait-chunks` empieza a contar frames cuando el terreno terminó de cargar y
 `--screenshot shot.png` guarda una captura en el frame N. `--duration SEG` corre el juego normal
 SEG segundos; al salir imprime updates y frames mostrados por segundo y el uso de CPU.

@@ -151,8 +151,8 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_mesh` | `PackedQuad`, `ChunkMesh` con su paleta de luz, `PaddedChunk`, `Mesher` (fork de bgm que fusiona por material, AO y luz) | voxel |
 | `boxel_light` | luz de vóxeles en CPU, sin ECS ni GPU (ADR 0015): techos de cielo por columna (`SkyTile`, caminata hacia abajo), luz exacta de un chunk desde una caja de 64³ (cielo y RGB, caminos rápidos para cuevas oscuras y cielo abierto), `PaddedLight`, `ChunkLight`; oráculo global para los tests | voxel |
 | `boxel_worldgen` | trait `WorldGenerator`; generadores `FlatGenerator`, `TerrainGenerator`, `ForestGenerator` (terreno con árboles) y `OverworldGenerator` (superficie sobre piedra infinita hacia abajo, con cuevas y árboles; etapas en `overworld`: `Heightmap`, `SurfaceRules`, `Caves`, más `Trees`); ruido 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`) | voxel |
-| `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, eventos, `ChunkStore` | app, voxel, mesh, worldgen, transform, diagnostic |
-| `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `PresentSettings` (vsync en tiempo de ejecución), texturas procedurales, screenshots | gfx, shaders, world, camera, window |
+| `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, eventos, `ChunkStore`, reloj del mundo (`TimeOfDay`, `DaylightCurve`, `DaylightPlugin`) | app, voxel, mesh, light, worldgen, transform, diagnostic |
+| `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `SceneLight` (luz del cielo, ambiente y curva de brillo del frame), `PresentSettings` (vsync en tiempo de ejecución), texturas procedurales, screenshots | gfx, shaders, world, camera, window |
 | `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::solid`), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas. Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`), `PhysicsQuery`. Hoy fase P1: cuerpos, gravedad y entidades vienen en P2 a P4 | ecs, app, math, voxel, world |
 | `boxel_facade_check` | solo CI: prueba que los derives resuelven `::boxel::ecs` para un usuario que depende solo de `boxel` | fachada |
 | `vendor/*` (7 crates) | ECS y tareas (fork de Bevy) | - |
@@ -268,7 +268,7 @@ pedido de dispositivo no pueden contradecirse:
 
 | Tier | Requisitos (todos) |
 |---|---|
-| Low | backend real; `Features::IMMEDIATES`; `max_immediate_size >= 16`; `max_vertex_buffers >= 1`; `max_texture_array_layers >= 256` |
+| Low | backend real; `Features::IMMEDIATES`; `max_immediate_size >= 16`; `max_vertex_buffers >= 2` (el quad y su luz, ADR 0015); `max_texture_array_layers >= 256` |
 | Mid | Low + `DownlevelFlags::VERTEX_STORAGE`; `max_storage_buffers_per_shader_stage >= 4`; `max_storage_buffer_binding_size >= 128 MiB`; en GL, versión parseada >= 4.3 (ES >= 3.1) |
 | High | Mid + `COMPUTE_SHADERS | INDIRECT_EXECUTION`; `MULTI_DRAW_INDIRECT_COUNT | INDIRECT_FIRST_INSTANCE`; `max_compute_workgroup_size_x >= 64`; `max_compute_invocations_per_workgroup >= 64`; `max_compute_workgroups_per_dimension >= 1024`; backend Vulkan (DX12 solo con `TierPolicy::dx12_high`) |
 
@@ -604,17 +604,19 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
 - **Registry** de datos: `BlockState(u16)` denso en tiempo de ejecución (0 = aire), nunca se
   persiste crudo (M1 agrega el IdMap nombre a id). Tablas SoA: nombre, forma (`None`, `Opaque`,
   `Cutout`, `Translucent`), flags, emisión RGB, opacidad de luz (15 en los opacos, 1 en hojas y
-  agua), texturas por cara. Contenido M0 congelado: aire,
+  agua), texturas por cara. Contenido congelado: aire,
   piedra, tierra, pasto, arena, grava, nieve, bedrock, tronco, hojas (cutout), agua (translúcida),
-  tablones.
+  tablones y, desde la fase P6 de la luz, los primeros emisores: lámparas de cubo completo naranja
+  (14, 11, 6), roja (14, 2, 2), azul (3, 6, 14) y blanca (15, 15, 15) y una lava provisoria
+  (15, 7, 2), opaca y sólida hasta que haya fluidos (`boxel_voxel::LAMPS`, `LAVA_EMISSION`).
 - **Contenedor de paleta:** `Uniform(state)` | `Packed { palette, bits 1/2/4/8, words }` |
   `Direct(u16)`. Los índices nunca cruzan palabras de 64 bits. `set` agrega a la paleta en el
   lugar mientras entra; se compacta al guardar o en reposo. Medido en un mundo de 512x256x512:
   60.6 % de los chunks son aire uniforme; la paleta reduce 128 MiB a 9 MiB (0.14 B/vóxel).
 - **Luz:** no vive en el chunk. Es un dato derivado, función pura de los bloques y de un techo de
-  cielo por columna, que calcula `boxel_light` (ADR 0015) dentro del job de malla (fase P3); el
-  mesher la hornea por esquina. Hasta que el shader la lea (P4) todo se dibuja con cielo 15. Los
-  chunks cerca del viewer guardan su luz para gameplay (`ChunkMap::light_at`).
+  cielo por columna, que calcula `boxel_light` (ADR 0015) dentro del job de malla; el mesher la
+  hornea por esquina y el fragment shader la interpola (sección 10.7). Los chunks cerca del
+  viewer guardan su luz para gameplay (`ChunkMap::light_at`, que también muestra el overlay F3).
 - **Máscaras de luz** de 4 KiB (1 bit por vóxel): `LightMasks` (opaca, parcial y emisores). Los
   chunks uniformes y los de 1 bit sin emisores la sirven desde sus propias palabras; los demás la
   construyen la primera vez que se pide y la guardan en caché hasta que cambian sus bloques.
@@ -741,7 +743,8 @@ un `Mesher` thread-local (~0.6 MiB de scratch) y un `LightScratch` (~0.7 MiB).
    sombreado.
 4. **Buckets (8, congelados, ADR 0012):** 0 a 5 = caras opacas en orden `Face`; 6 = **cutout**
    (todas las caras de materiales cutout, como las hojas); 7 = translúcido. `ChunkMesh` guarda los
-   quads contiguos por bucket, `bucket_counts[8]`, la paleta de luz y un hash de todo.
+   quads contiguos por bucket, `bucket_counts[8]`, la paleta de luz y un hash de todo. En el arena
+   de la GPU la paleta va justo después de los quads del chunk (sección 10.2).
 
 **`PackedQuad` (8 bytes):**
 
@@ -814,12 +817,13 @@ cambia el layout.
 
 | Recurso | Uso | Tiers |
 |---|---|---|
-| Arena de quads | un buffer `STORAGE | VERTEX | COPY_DST` de `PackedQuad`, sub-asignado con `offset-allocator` (una asignación por chunk con los 8 buckets contiguos); 8 Mi quads = 64 MiB por defecto | todos |
-| Tabla de chunks | storage `array<ChunkGpu>` (64 B: origen i32x3 con los 32 bits bajos del origen `i64`, `quad_base`, 8 contadores, flags con el bit vivo solo dentro de la ventana de la cámara, que lee solo High, relleno) | High, Mid |
+| Arena de quads | un buffer `STORAGE | VERTEX | COPY_DST` de entradas de 8 bytes, sub-asignado con `offset-allocator`: una asignación por chunk con los 8 buckets contiguos y, a continuación, su paleta de luz (`boxel_render::arena_len`: quads más entradas de paleta, al menos una); 8 Mi entradas = 64 MiB por defecto | todos |
+| Tabla de chunks | storage `array<ChunkGpu>` (64 B: origen i32x3 con los 32 bits bajos del origen `i64`, `quad_base`, 8 contadores, flags con el bit vivo solo dentro de la ventana de la cámara, que lee solo High, `light_base` = `quad_base` + quads en el offset 52, relleno) | High, Mid |
+| Luz por quad | buffer `VERTEX | COPY_DST` paralelo al arena, del mismo tamaño: en el offset de cada quad, su entrada de paleta ya expandida (segundo atributo de instancia) | Low |
 | Tabla CPU | espejo en CPU (origen `i64`, rangos, contadores) para culling en CPU | todos |
 | Índice compartido | u32 `[0,1,2,2,1,3] + 4i` para 98 304 quads (2.36 MB) | High, Mid |
 | Textura de bloques | `texture_2d_array` RGBA8 sRGB 16x16 con mips, procedural en M0 | todos |
-| View uniform | 240 B (std140): `view_proj`, 6 planos, origen de render, cámara relativa, niebla, contadores | todos |
+| View uniform | 336 B (std140, solo `vec4`): `view_proj`, 6 planos, origen de render, cámara relativa, niebla, contadores, `sky_light` (color del cielo por la luz del día y piso de ambiente), `light_params` (fuerza del AO, ganancia de la luz de bloque) y `light_curve` (brillo de los 16 niveles) | todos |
 | Color principal | `Rgba8UnormSrgb` (`RENDER_ATTACHMENT | COPY_SRC | TEXTURE_BINDING`), luego blit a la superficie (alfa siempre 1); facilita screenshots | todos |
 | Profundidad | `Depth32Float` | todos |
 
@@ -867,8 +871,10 @@ tiene compute).
 
 1. Culling en CPU.
 2. Pipeline `vs_instanced` (opaco y luego cutout), arena como buffer de vértices por instancia
-   (`Uint32x2`, stride 8), `TriangleStrip`; por bucket visible: `set_immediates(0, origen del
-   chunk)` y `draw(0..4, primer_quad..primer_quad+n)`.
+   (`Uint32x2` en `@location(0)`, stride 8) y el buffer de luz por quad como segundo buffer por
+   instancia (`Uint32x2` en `@location(1)`, mismos offsets: el mismo `first_instance` llega a los
+   dos), `TriangleStrip`; por bucket visible: `set_immediates(0, origen del chunk)` y
+   `draw(0..4, primer_quad..primer_quad+n)`.
 3. Blit.
 
 El bucket translúcido se genera y se sube pero no se dibuja en M0 (pase translúcido con orden de
@@ -932,7 +938,40 @@ Validados en `cargo test` con naga 30.0.1 contra **todos** los backends que wgpu
 escritorio: GLSL en el piso de cada módulo, MSL 2.1 y 2.4, HLSL SM 5.1 (FXC) y SM 6.0 (DXC) y
 SPIR-V, además de layouts y reglas. Así se cubren DX12 y Metal sin hardware. Reglas: niveles de
 mip de `textureLoad` en `i32` (bug wgpu#10037), nada de `enable subgroups;`, `var<immediate>` (no
-`var<push_constant>`). WESL se reevalúa en M2.
+`var<push_constant>`). WESL se reevalúa en M2. Los tests de naga también fijan el layout de
+`View` (336 B) y `ChunkGpu` (`light_base` en el offset 52), los nibbles de `LightValue` y que Low
+recibe exactamente dos atributos de instancia (el quad y su luz) con un solo uniform block.
+
+### 10.7 Luz en el fragment shader y día y noche (ADR 0015)
+
+Cada quad lleva el índice de su entrada en la paleta de luz del chunk: las `LightValue` (cielo,
+rojo, verde, azul, 4 bits cada uno) de sus 4 esquinas. High y Mid la leen del arena en
+`ChunkGpu::light_base` más el índice, sin binding nuevo; Low la recibe ya expandida como segundo
+atributo de instancia. El vertex shader pasa la entrada, el byte de AO y la cara como valores
+planos, y (s, t), la posición dentro del quad (la esquina k está en (k & 1, k >> 1)).
+
+El fragment shader, igual en los tres tiers:
+
+1. Interpola bilinealmente cada canal de las 4 esquinas en (s, t) (en la forma `a + (b - a) * s`,
+   exacta cuando las 4 esquinas son iguales) y pasa cada canal por la curva de brillo
+   (`light_curve`, 16 niveles, interpolación lineal).
+2. `luz = max(curva(cielo) * sky_light.rgb, curva(rgb) * ganancia, ambiente)`.
+3. `color = albedo * sombreado de cara * mix(1 - fuerza_ao, 1, ao / 3) * luz`, con el AO también
+   interpolado bilinealmente, y después la niebla.
+
+Con cielo 15 bajo un cielo blanco de mediodía y AO abierto da exactamente la imagen anterior a la
+luz. La curva por defecto es la de Minecraft, `f / (4 - 3f)` con `f = nivel / 15`, con un ajuste
+de gamma (`RenderSettings::light_gamma`); la fuerza del AO (0.55) y la ganancia de la luz de
+bloque (1) también están en `RenderSettings`.
+
+Día y noche no remallan ni suben nada: `boxel_world::DaylightPlugin` (en `DefaultPlugins`) avanza
+`TimeOfDay` un tick por paso fijo (64 Hz; un día de 20 minutos son 76 800 ticks, el tick 0 es la
+salida del sol), y `DaylightCurve` da, según la altura del sol, el color de la luz del cielo (día
+blanco a 1.0, atardecer cálido a 0.6, noche azul a 0.2), el piso de ambiente (0.02 a toda hora:
+las cuevas quedan casi negras) y el color del cielo, que es también el de la niebla. El `Extract`
+del render arma con eso la `SceneLight` del frame; sin el plugin queda un mediodía con
+`RenderSettings::clear_color`. La luz de bloque no depende de la hora: una cueva cerrada se ve
+igual al mediodía y a medianoche (lo verifica `gpu_terrain`).
 
 ---
 
@@ -1090,7 +1129,7 @@ schedule `Shutdown` es el lugar para el `flush` final.
 | **M0 scaffold** | workspace y tooling; fork del ECS; `boxel_app`; ventana con compuerta de presentación e input; detección completa (tiers, scoring, smoke, overrides, LKG de crashes, device lost, catch_unwind); tiers High, Mid y Low con buckets opaco y cutout (High sin Hi-Z); paleta, registry, worldgen, mesher, streaming con jobs; cámara libre; `gpu_info`, `voxel_world`, `headless_world` | compila, tests, clippy y rustdoc limpios; `voxel_world` dibuja terreno en Vulkan High y en GL (Mid y Low); imágenes iguales entre tiers; la simulación no se congela con la ventana minimizada |
 | **M1 mundo jugable** | criterio de entrada: re-fork sobre bevy 0.20.0 final. Pase translúcido; AO; raycast y edición de bloques (hechos: ADR 0016, `voxel_world`); el sistema de ediciones si se recortó; propiedades de bloque e IdMap; `ChunkStore` con redb; crecimiento del arena y presupuesto de subida; caras interiores de hojas (opcional); re-selección en caliente si se recortó; decisión `static-dxc` o DLL en Windows; timestamps de GPU; actualizar a wgpu 31 | editar y guardar un mundo; agua visible |
 | **M2 GPU-driven completo** | Hi-Z en dos fases (High); cave culling por BFS (Mid/Low); pool de ocupación en GPU; `create_shader_module_trusted` con medición; pipeline cache de Vulkan; verificar DX12 High; clip control en GL (upstream); decidir WESL | caída de draws y de tiempo de GPU medida |
-| **M3 escala** | LOD con mips de 32³ y anillos; listas indirectas segmentadas (más de 65 535 draws); render en hilo propio; inicialización de GPU asíncrona (respetando los error scopes por hilo); luz (cielo y bloque) | distancias de vista grandes estables |
+| **M3 escala** | LOD con mips de 32³ y anillos; listas indirectas segmentadas (más de 65 535 draws); render en hilo propio; inicialización de GPU asíncrona (respetando los error scopes por hilo) | distancias de vista grandes estables |
 | **M4 experimental** | ray marching sobre bricks/ocupación; mesh shaders opt-in; evaluar bevy_ecs 0.21 y el núcleo ECS propio | prototipos medidos |
 
 wgpu v31 (milestone con fecha 2026-10-09) trae cambios que tocan el scaffold

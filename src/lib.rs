@@ -100,8 +100,9 @@ pub mod prelude {
     pub use boxel_physics::prelude::*;
 }
 
-/// Log, task pools, time, frame stats, input, window + winit runner, voxel world, renderer and
-/// the F3 debug overlay (each behind its cargo feature). Configure with `.set(...)`, remove with `.disable::<T>()`.
+/// Log, task pools, time, frame stats, input, window + winit runner, voxel world with its day and
+/// night clock (`boxel_world::DaylightPlugin`), renderer and the F3 debug overlay (each behind
+/// its cargo feature). Configure with `.set(...)`, remove with `.disable::<T>()`.
 pub struct DefaultPlugins;
 
 impl PluginGroup for DefaultPlugins {
@@ -116,7 +117,9 @@ impl PluginGroup for DefaultPlugins {
             .add(boxel_window::InputPlugin)
             .add(boxel_window::WindowPlugin::default());
         #[cfg(feature = "voxel")]
-        let group = group.add(boxel_world::WorldPlugin::default());
+        let group = group
+            .add(boxel_world::WorldPlugin::default())
+            .add(boxel_world::DaylightPlugin);
         #[cfg(feature = "render")]
         let group = group
             .add(boxel_render::RenderPlugin::default())

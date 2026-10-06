@@ -37,6 +37,8 @@ thiserror.workspace = true
 [dev-dependencies]
 boxel_gfx = { workspace = true, features = ["png"] }
 boxel_worldgen.workspace = true
+# Lit scenes in tests/gpu_terrain.rs: light computed exactly as the world computes it.
+boxel_light.workspace = true
 # Tests get system/component names in ECS diagnostics (dev-only; users opt in through boxel/debug).
 boxel_ecs = { workspace = true, features = ["debug"] }
 pollster.workspace = true

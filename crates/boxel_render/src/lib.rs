@@ -33,6 +33,7 @@ macro_rules! frame_span {
 #[cfg(not(feature = "trace"))]
 pub(crate) struct NoSpan;
 
+mod light;
 mod overlay;
 mod plugin;
 mod renderer;
@@ -45,14 +46,18 @@ mod path;
 mod targets;
 mod upload;
 
+pub use light::{LIGHT_LEVELS, SceneLight, light_curve};
 pub use overlay::{OverlayDraw, OverlayRect};
 pub use plugin::{
     DebugDestroyDevice, GpuFailed, GpuReady, PresentSettings, Render, RenderInfo, RenderPlugin,
     RenderSettings, RenderSystems, RequestScreenshot, ScreenshotSaved, SurfaceInfo,
 };
-pub use renderer::{RenderStats, RendererConfig, RendererError, ViewParams, VoxelRenderer};
+pub use renderer::{
+    DEFAULT_SKY_COLOR, RenderStats, RendererConfig, RendererError, ViewParams, VoxelRenderer,
+};
 pub use smoke::RendererSmokeTest;
 pub use textures::{BLOCK_TEXTURE_SIZE, BlockTextureData, generate_block_textures};
+pub use upload::arena_len;
 
 /// Format of the main color target (screenshots read it).
 pub const MAIN_COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;

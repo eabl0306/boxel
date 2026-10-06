@@ -355,8 +355,28 @@ fn may_emit_is_a_palette_scan() {
     assert!(c.may_emit(&tables));
     assert!(c.light_masks(&tables).emitters.is_empty());
     // Without any emitter in the registry, never.
-    let default = LightTables::from_registry(&BlockRegistry::default_blocks());
-    assert!(!ChunkData::uniform(BlockState(1)).may_emit(&default));
+    let mut plain_registry = BlockRegistryBuilder::new();
+    let texture = plain_registry
+        .add_texture(TextureSpec {
+            name: "test:stone".to_string(),
+            base_color: [128; 3],
+            noise: 0,
+            pattern: TexturePattern::Noise,
+        })
+        .unwrap();
+    plain_registry
+        .add_block(BlockDef {
+            name: "test:stone".to_string(),
+            shape: RenderShape::Opaque,
+            solid: true,
+            emission: [0; 3],
+            light_opacity: 15,
+            textures: FaceTextures::all(texture),
+        })
+        .unwrap();
+    let none = LightTables::from_registry(&plain_registry.build());
+    assert!(!none.any_emitter());
+    assert!(!ChunkData::uniform(BlockState(1)).may_emit(&none));
 }
 
 #[test]
@@ -381,7 +401,27 @@ fn registry_light_fields_and_validation() {
     assert!(!r.flags(BlockState(1)).contains(StateFlags::EMISSIVE));
     let tables = LightTables::from_registry(&r);
     assert_eq!(tables.max_partial_opacity(), 1);
-    assert!(!tables.any_emitter());
+    // The built-in emitters: four lamps and the lava placeholder, opaque and solid.
+    for (name, emission) in LAMPS
+        .iter()
+        .map(|lamp| (lamp.name, lamp.emission))
+        .chain([("boxel:lava", LAVA_EMISSION)])
+    {
+        let s = r.by_name(name).unwrap();
+        assert_eq!(r.emission(s), LightValue::from_rgb(emission), "{name}");
+        assert_eq!(r.light_opacity(s), 15, "{name}");
+        assert!(
+            r.flags(s)
+                .contains(StateFlags::EMISSIVE | StateFlags::SOLID)
+        );
+        assert!(tables.emits(s) && tables.is_opaque(s), "{name}");
+    }
+    assert_eq!(
+        r.emission(r.by_name("boxel:lamp_orange").unwrap()),
+        LightValue::from_rgb([14, 11, 6])
+    );
+    assert_eq!(LAVA_EMISSION, [15, 7, 2]);
+    assert!(tables.any_emitter());
     assert!(tables.blocks_sky(r.by_name("boxel:leaves").unwrap()));
     assert!(!tables.blocks_sky(BlockState::AIR));
     assert_eq!(
@@ -403,7 +443,7 @@ fn registry_light_fields_and_validation() {
     let lamp = b
         .add_block(def("lamp", RenderShape::Opaque, [14, 11, 6], 15))
         .unwrap();
-    assert_eq!(lamp, BlockState(12));
+    assert_eq!(lamp, BlockState(17));
     // Cutout may stop light; partial opacities and full channels are fine.
     b.add_block(def("dense_leaves", RenderShape::Cutout, [0; 3], 15))
         .unwrap();

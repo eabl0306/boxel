@@ -468,6 +468,7 @@ dependencies = [
  "boxel_diagnostic",
  "boxel_ecs",
  "boxel_gfx",
+ "boxel_light",
  "boxel_math",
  "boxel_mesh",
  "boxel_shaders",
@@ -490,6 +491,7 @@ name = "boxel_shaders"
 version = "0.1.0-dev"
 dependencies = [
  "boxel_mesh",
+ "boxel_voxel",
  "bytemuck",
  "naga",
  "wgpu",

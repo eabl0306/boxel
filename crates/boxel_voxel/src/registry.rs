@@ -73,6 +73,52 @@ pub enum TexturePattern {
     Planks,
 }
 
+/// One built-in lamp of [`BlockRegistry::default_blocks`]: an opaque, solid cube that emits
+/// colored light.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuiltinLamp {
+    /// Block (and texture) name, `"boxel:lamp_orange"`.
+    pub name: &'static str,
+    /// Emission: red, green, blue, each `0..=15`.
+    pub emission: [u8; 3],
+    /// Texture base color and speckle color (sRGB).
+    pub colors: [[u8; 3]; 2],
+}
+
+impl BuiltinLamp {
+    /// The name without the `boxel:` prefix.
+    pub fn short_name(&self) -> &'static str {
+        self.name.strip_prefix("boxel:").unwrap_or(self.name)
+    }
+}
+
+/// The built-in lamps, in state order (states 12 to 15 of [`BlockRegistry::default_blocks`]).
+pub const LAMPS: [BuiltinLamp; 4] = [
+    BuiltinLamp {
+        name: "boxel:lamp_orange",
+        emission: [14, 11, 6],
+        colors: [[235, 150, 60], [255, 225, 160]],
+    },
+    BuiltinLamp {
+        name: "boxel:lamp_red",
+        emission: [14, 2, 2],
+        colors: [[200, 40, 35], [255, 150, 130]],
+    },
+    BuiltinLamp {
+        name: "boxel:lamp_blue",
+        emission: [3, 6, 14],
+        colors: [[50, 90, 220], [160, 205, 255]],
+    },
+    BuiltinLamp {
+        name: "boxel:lamp_white",
+        emission: [15, 15, 15],
+        colors: [[230, 230, 220], [255, 255, 255]],
+    },
+];
+
+/// Emission (red, green, blue) of the built-in lava placeholder, `boxel:lava` (state 16).
+pub const LAVA_EMISSION: [u8; 3] = [15, 7, 2];
+
 /// One texture layer description.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TextureSpec {
@@ -235,8 +281,18 @@ impl BlockRegistryBuilder {
         let leaves = tex("leaves", [60, 130, 40], 20, P::Leaves);
         let water = tex("water", [40, 90, 200], 6, P::Noise);
         let planks = tex("planks", [162, 130, 78], 10, P::Planks);
+        // Glowing cubes: a base color with bright speckles.
+        let glow = |spark: [u8; 3]| P::Speckle {
+            color: spark,
+            density: 60,
+        };
+        let lamp_textures = LAMPS.map(|lamp| {
+            let [base, spark] = lamp.colors;
+            tex(lamp.short_name(), base, 10, glow(spark))
+        });
+        let lava = tex("lava", [207, 78, 16], 22, glow([255, 190, 50]));
         // Light opacity: 15 for opaque cubes, 1 for leaves and water (light passes, losing one
-        // level per voxel like in air, but direct sky stops at them). Nothing emits.
+        // level per voxel like in air, but direct sky stops at them).
         let block =
             |name: &str, shape: RenderShape, solid: bool, textures: FaceTextures| BlockDef {
                 name: format!("boxel:{name}"),
@@ -284,6 +340,20 @@ impl BlockRegistryBuilder {
             block("planks", opaque, true, all(planks)),
         ] {
             b.add_block(def).expect("built-in block");
+        }
+        // The first emitters (ADR 0015): full-cube colored lamps and a lava placeholder (an
+        // opaque, solid, glowing cube until fluids exist). Torches wait for non-cube shapes.
+        let emitters = LAMPS
+            .iter()
+            .zip(lamp_textures)
+            .map(|(lamp, texture)| (lamp.short_name(), lamp.emission, texture))
+            .chain([("lava", LAVA_EMISSION, lava)]);
+        for (name, emission, texture) in emitters {
+            let def = BlockDef {
+                emission,
+                ..block(name, opaque, true, all(texture))
+            };
+            b.add_block(def).expect("built-in emitter");
         }
         b
     }
@@ -398,11 +468,15 @@ pub struct BlockRegistry {
 }
 
 impl BlockRegistry {
-    /// Built-in M0 content ([`BlockRegistryBuilder::with_default_blocks`], built), in this exact
+    /// Built-in content ([`BlockRegistryBuilder::with_default_blocks`], built), in this exact
     /// order (state ids are frozen for tests and worldgen): 0 `boxel:air`, 1 `boxel:stone`,
     /// 2 `boxel:dirt`, 3 `boxel:grass`, 4 `boxel:sand`, 5 `boxel:gravel`, 6 `boxel:snow`,
     /// 7 `boxel:bedrock`, 8 `boxel:log`, 9 `boxel:leaves` (Cutout), 10 `boxel:water`
-    /// (Translucent), 11 `boxel:planks`.
+    /// (Translucent), 11 `boxel:planks`, then the emitters (opaque, solid, light opacity 15;
+    /// emission red, green, blue): 12 `boxel:lamp_orange` (14, 11, 6), 13 `boxel:lamp_red`
+    /// (14, 2, 2), 14 `boxel:lamp_blue` (3, 6, 14), 15 `boxel:lamp_white` (15, 15, 15) and
+    /// 16 `boxel:lava` (15, 7, 2), a placeholder until fluids exist ([`LAMPS`],
+    /// [`LAVA_EMISSION`]).
     pub fn default_blocks() -> BlockRegistry {
         BlockRegistryBuilder::with_default_blocks().build()
     }
