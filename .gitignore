@@ -16,8 +16,15 @@ flamegraph*.svg
 Thumbs.db
 # Cargo.lock IS committed (root and vendor/).
 
-# Agent worktrees (local only)
+# Agent worktrees and their target dirs (local only)
 /.claude/worktrees/
+/target-*/
+
+# Local only, never published: third-party texture packs used as placeholders while developing
+# the engine (their licenses forbid redistribution), and the game built on top of the engine
+# (this repository is the engine; the game may move to its own repository later).
+/assets/
+/game/
 
 # Stress runs (just bench-*)
 /bench-results/

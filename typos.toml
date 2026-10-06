@@ -1,6 +1,7 @@
 [files]
 # vendor/ is upstream Bevy code (never "fix" it here); docs/ and README.md are in Spanish.
-extend-exclude = ["target/", "vendor/", "docs/", "README.md", "*.png", "*.lock"]
+# assets/ and game/ are local only (git-ignored); target-*/ are agent build dirs.
+extend-exclude = ["target/", "target-*/", "vendor/", "docs/", "README.md", "*.png", "*.lock", "assets/", "game/"]
 
 [default]
 locale = "en-us"
