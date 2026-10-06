@@ -567,9 +567,11 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   runners lo corren una vez al salir (`App::shutdown`), con la ventana todavía viva, para soltar
   recursos de GPU y ventana en orden.
 - Tiempo: `Time` (delta con tope de 250 ms, elapsed, frames) en `First`; `FixedTime` a 64 Hz con
-  acumulador y máximo de 8 pasos por frame; `FixedMain` = `FixedPreUpdate`, `FixedUpdate`,
-  `FixedPostUpdate`. Mientras corre `FixedMain`, `Res<Time>` es la vista fija (delta = paso
-  fijo), como en Bevy.
+  acumulador y máximo de 8 pasos por frame (`set_max_steps_per_frame` lo cambia); `FixedMain` =
+  `FixedPreUpdate`, `FixedUpdate`, `FixedPostUpdate`. Mientras corre `FixedMain`, `Res<Time>` es
+  la vista fija (delta = paso fijo), como en Bevy. `RunFixedMainLoop` se divide en los sets
+  encadenados `RunFixedMainLoopSystems` (los nombres de Bevy): `BeforeFixedMainLoop` (muestrear
+  la entrada para los pasos), `FixedMainLoop` (los pasos) y `AfterFixedMainLoop` (interpolar).
 - Mensajes y paso fijo: `TimePlugin` agrega `signal_message_update_system` en `FixedPostUpdate`
   y deja la rotación de mensajes en espera hasta que corra un paso fijo. Sin esto, un lector en
   `FixedUpdate` perdía los mensajes escritos en `Update` cuando los frames iban a más del doble
