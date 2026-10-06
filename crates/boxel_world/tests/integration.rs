@@ -16,8 +16,8 @@ use boxel_voxel::{
 };
 use boxel_world::jobs::{InlineExecutor, JobExecutor, TaskPoolExecutor};
 use boxel_world::{
-    ChunkId, ChunkMap, ChunkMeshEvent, ChunkViewer, DataState, EditQueue, MeshState, WorldContent,
-    WorldPlugin, WorldSettings, WorldStats,
+    ChunkId, ChunkMap, ChunkMeshEvent, ChunkSlot, ChunkViewer, DataState, EditQueue, MeshState,
+    WorldContent, WorldPlugin, WorldSettings, WorldStats,
 };
 use boxel_worldgen::{TerrainGenerator, WorldGenerator};
 use std::collections::BTreeMap;
@@ -139,7 +139,7 @@ fn assert_world_matches_direct(app: &App, edited: &[ChunkPos]) {
     let (mut meshes, mut empties) = (0, 0);
     for (_, slot) in map.iter() {
         let pos = slot.pos;
-        if let DataState::Ready(data) = &slot.data
+        if let DataState::Ready(data) = slot.data()
             && !edited.contains(&pos)
         {
             assert_eq!(
@@ -148,12 +148,12 @@ fn assert_world_matches_direct(app: &App, edited: &[ChunkPos]) {
                 "{pos:?}: data equals a fresh generate"
             );
         }
-        let expected_empty = match &slot.mesh {
+        let expected_empty = match slot.mesh() {
             MeshState::Ready { .. } => false,
             MeshState::Empty => true,
             MeshState::None | MeshState::Queued | MeshState::InFlight { .. } => continue,
         };
-        let center = match &slot.data {
+        let center = match slot.data() {
             DataState::Ready(data) => Arc::clone(data),
             // Missing data is air: it can only mesh to nothing.
             _ => {
@@ -169,7 +169,7 @@ fn assert_world_matches_direct(app: &App, edited: &[ChunkPos]) {
             }),
         };
         let direct = mesher.mesh_chunk(&input, &content.materials);
-        if let MeshState::Ready { mesh, .. } = &slot.mesh {
+        if let MeshState::Ready { mesh, .. } = slot.mesh() {
             assert_eq!(**mesh, direct, "{pos:?}: streamed mesh == direct mesh");
             assert!(!mesh.is_empty());
             meshes += 1;
@@ -343,7 +343,10 @@ fn edits_remesh_neighbors() {
     'search: for &(a, pos) in &ready {
         let east = ChunkPos::new(pos.x + 1, pos.y, pos.z);
         let Some(b) = map.id_at(east) else { continue };
-        if !matches!(map.get(b).map(|s| &s.mesh), Some(MeshState::Ready { .. })) {
+        if !matches!(
+            map.get(b).map(ChunkSlot::mesh),
+            Some(MeshState::Ready { .. })
+        ) {
             continue;
         }
         for y in 0..32 {
@@ -372,7 +375,7 @@ fn edits_remesh_neighbors() {
     }
     let map = app.world().resource::<ChunkMap>();
     assert_eq!(map.block_at(voxel), Some(BlockState::AIR));
-    let DataState::Ready(data) = &map.get(a).expect("chunk A").data else {
+    let DataState::Ready(data) = map.get(a).expect("chunk A").data() else {
         panic!("chunk A data is ready");
     };
     assert_eq!(data.version, 1, "one edit, one version bump");
@@ -443,7 +446,7 @@ fn assert_world_matches_direct_or_empty(app: &App) {
     let map = app.world().resource::<ChunkMap>();
     for (_, slot) in map.iter() {
         assert!(
-            matches!(slot.mesh, MeshState::None | MeshState::Empty),
+            matches!(slot.mesh(), MeshState::None | MeshState::Empty),
             "{:?}: sky chunks mesh to nothing",
             slot.pos
         );

@@ -3,8 +3,10 @@
 //! so the rules are unit tested directly.
 //!
 //! Slot invariants:
-//! - `neighbors_ready` bit `i` is set iff neighbor `i` is outside `WorldSettings::vertical_bounds`
-//!   or has a slot whose data is `Ready` or `Missing`.
+//! - In a slot whose data is `Ready` or `Missing`, `neighbors_ready` bit `i` is set iff neighbor
+//!   `i` is outside `WorldSettings::vertical_bounds` or has a slot whose data is `Ready` or
+//!   `Missing`. Slots still waiting for their data get their bits when it arrives (nothing reads
+//!   them before).
 //! - A slot has at most one job in flight (generation runs before meshing, and a mesh job is only
 //!   dispatched from `MeshState::Queued`).
 //! - `WorldJobs::published` holds exactly the chunks whose last event was an `Upsert`, so every
@@ -27,8 +29,8 @@ use crate::{
 use boxel_ecs::prelude::*;
 use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, Mesher};
 use boxel_voxel::{
-    BlockRegistry, BlockState, ChunkData, ChunkPos, Face, LocalPos, NEIGHBOR_OFFSETS, RenderShape,
-    neighbor_index,
+    BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, Face, LocalPos, NEIGHBOR_OFFSETS,
+    RenderShape, neighbor_index,
 };
 use crossbeam_channel::{Receiver, Sender};
 use std::cell::RefCell;
@@ -44,6 +46,9 @@ pub(crate) const ALL_NEIGHBORS: u32 = (1 << 26) - 1;
 
 /// Positions re-evaluated per frame whatever `WorldSettings::interest_budget` says (progress).
 const MIN_INTEREST_STEPS: usize = 64;
+/// Interest positions looked up together before their steps run (the budget is checked between
+/// batches; [`MIN_INTEREST_STEPS`] is a multiple of it).
+const LOOKUP_BATCH: usize = 32;
 
 /// Stale job priorities refreshed per frame whatever the interest budget says (progress), and
 /// the batch size of the refreshes that use the rest of the budget.
@@ -170,22 +175,24 @@ enum Step {
 #[cfg(feature = "trace")]
 struct StepTimer {
     last: Instant,
-    ns: [u64; 5],
-    calls: [u64; 5],
+    ns: [u64; 6],
+    calls: [u64; 6],
 }
 
 #[cfg(feature = "trace")]
 impl StepTimer {
-    /// By `Step as usize`, then air creates.
-    const NAMES: [&'static str; 5] = ["create", "unload", "update", "skip", "create_air"];
+    /// By `Step as usize`, then air creates, then the batches.
+    const NAMES: [&'static str; 6] = ["create", "unload", "update", "skip", "create_air", "batch"];
     /// Index of a `Step::Create` of a known-air slot.
     const CREATE_AIR: usize = 4;
+    /// Index of filling a batch of positions and looking them up (once per batch).
+    const BATCH: usize = 5;
 
     fn new() -> Self {
         Self {
             last: Instant::now(),
-            ns: [0; 5],
-            calls: [0; 5],
+            ns: [0; 6],
+            calls: [0; 6],
         }
     }
 
@@ -546,9 +553,16 @@ impl WorldJobs {
 
     /// The vertical bounds changed (a rare settings change): neighbor bits follow the new bounds,
     /// and every slot whose bits changed has its mesh redone, since its neighbors are no longer
-    /// what the mesh was built from. Walks every slot once.
+    /// what the mesh was built from. Walks every slot once. Slots still waiting for their data
+    /// are skipped: their bits are computed when it arrives.
     fn refresh_neighbor_bits(&mut self, cx: &mut Ctx<'_>) {
-        let ids: Vec<ChunkId> = cx.map.slots.keys().collect();
+        let ids: Vec<ChunkId> = cx
+            .map
+            .slots
+            .iter()
+            .filter(|(_, slot)| matches!(slot.data(), DataState::Ready(_) | DataState::Missing))
+            .map(|(id, _)| id)
+            .collect();
         for id in ids {
             let pos = cx.map.slots[id].pos;
             let bits = own_neighbor_bits(cx.map, &self.planner, pos);
@@ -558,7 +572,7 @@ impl WorldJobs {
             }
             slot.neighbors_ready = bits;
             slot.epoch = slot.epoch.wrapping_add(1);
-            if !matches!(slot.mesh, MeshState::None) {
+            if !matches!(slot.mesh(), MeshState::None) {
                 let priority = self.priority(pos);
                 self.request_remesh(cx, id, priority);
             }
@@ -581,20 +595,55 @@ impl WorldJobs {
             let _span = frame_span!("world.positions");
             #[cfg(feature = "trace")]
             let mut timer = StepTimer::new();
-            while let Some(pos) = self.planner.next() {
-                let step = self.refresh_position(cx, settings, pos);
-                #[cfg(feature = "trace")]
-                timer.lap(match step {
-                    Step::Create if cx.known_air(pos.y) => StepTimer::CREATE_AIR,
-                    step => step as usize,
-                });
-                #[cfg(not(feature = "trace"))]
-                let _ = step;
-                steps += 1;
-                if steps >= MIN_INTEREST_STEPS
-                    && steps.is_multiple_of(32)
-                    && start.elapsed() >= budget
+            let mut batch = [(ChunkPos::default(), None); LOOKUP_BATCH];
+            loop {
+                let mut len = 0;
+                while len < LOOKUP_BATCH
+                    && let Some(pos) = self.planner.next()
                 {
+                    batch[len] = (pos, None);
+                    len += 1;
+                }
+                if len == 0 {
+                    break;
+                }
+                // Every position of the batch is looked up (and its slot read) before any step
+                // runs: the lookups do not depend on each other, so their cache misses overlap
+                // instead of stalling one step at a time.
+                for (pos, id) in &mut batch[..len] {
+                    *id = cx.map.id_at(*pos);
+                    if let Some(id) = *id {
+                        std::hint::black_box(cx.map.slots[id].interest);
+                    }
+                }
+                #[cfg(feature = "trace")]
+                timer.lap(StepTimer::BATCH);
+                // Batch indices whose step created or unloaded a slot: a position listed twice
+                // in one batch is looked up again after them.
+                let mut changed = 0u64;
+                for i in 0..len {
+                    let (pos, mut id) = batch[i];
+                    let mut earlier = changed;
+                    while earlier != 0 {
+                        let j = earlier.trailing_zeros() as usize;
+                        earlier &= earlier - 1;
+                        if batch[j].0 == pos {
+                            id = cx.map.id_at(pos);
+                            break;
+                        }
+                    }
+                    let step = self.refresh_position(cx, settings, pos, id);
+                    if matches!(step, Step::Create | Step::Unload) {
+                        changed |= 1 << i;
+                    }
+                    #[cfg(feature = "trace")]
+                    timer.lap(match step {
+                        Step::Create if cx.known_air(pos.y) => StepTimer::CREATE_AIR,
+                        step => step as usize,
+                    });
+                }
+                steps += len;
+                if steps >= MIN_INTEREST_STEPS && start.elapsed() >= budget {
                     break;
                 }
             }
@@ -617,24 +666,26 @@ impl WorldJobs {
             .refresh_priorities(max, |id, kind| current_priority(map, planner, id, kind));
     }
 
-    /// Brings the slot at `pos` in line with the current viewers: creates it if wanted and
-    /// missing, updates its interest, or unloads it (unwanted, unpinned, and either never started
-    /// or outside every keep region). Returns what it did.
+    /// Brings the slot at `pos` (`id`, looked up by the caller) in line with the current viewers:
+    /// creates it if wanted and missing, updates its interest, or unloads it (unwanted, unpinned,
+    /// and either never started or outside every keep region). Returns what it did.
     fn refresh_position(
         &mut self,
         cx: &mut Ctx<'_>,
         settings: &WorldSettings,
         pos: ChunkPos,
+        id: Option<ChunkId>,
     ) -> Step {
+        debug_assert_eq!(id, cx.map.id_at(pos), "stale lookup of {pos:?}");
         let level = self.planner.level(pos);
         let want = level.interest();
-        match cx.map.id_at(pos) {
+        match id {
             Some(id) => {
                 let slot = &cx.map.slots[id];
                 let pinned = slot.interest & Interest::PINNED;
                 if want.is_empty()
                     && pinned.is_empty()
-                    && (matches!(slot.data, DataState::Queued) || level == Level::Out)
+                    && (matches!(slot.data(), DataState::Queued) || level == Level::Out)
                 {
                     // Unwanted data that was never started is dropped right away; anything else
                     // waits for the hysteresis band.
@@ -655,7 +706,8 @@ impl WorldJobs {
 
     /// New slot at `pos`: data `Queued` with a generation job, or `Ready` air at once if the
     /// generator declares the layer all air (then its 26 neighbors are looked up once, for its
-    /// own bits and for theirs).
+    /// own bits and for theirs). A `Queued` slot's own neighbor bits are not looked up: they are
+    /// computed when its data arrives.
     pub(crate) fn create_slot(
         &mut self,
         cx: &mut Ctx<'_>,
@@ -664,22 +716,11 @@ impl WorldJobs {
         interest: Interest,
     ) -> ChunkId {
         let near = cx.known_air(pos.y).then(|| neighbor_ids(cx.map, pos));
-        let neighbors_ready = match &near {
-            Some(near) => neighbor_bits(cx.map, &self.planner, pos, near),
-            None => own_neighbor_bits(cx.map, &self.planner, pos),
-        };
-        let slot = ChunkSlot {
-            pos,
+        let slot = ChunkSlot::new(ChunkKey {
             dim: settings.dimension,
             lod: 0,
-            data: DataState::Queued,
-            mesh: MeshState::None,
-            interest: Interest::empty(),
-            neighbors_ready,
-            epoch: 0,
-            remesh_pending: false,
-            cancel: Arc::new(AtomicBool::new(false)),
-        };
+            pos,
+        });
         let id = cx.map.insert(slot);
         // Gaining mesh interest only queues the mesh here (the data is not ready yet): no slot
         // comes or goes, so `near` stays valid.
@@ -707,7 +748,7 @@ impl WorldJobs {
                 // events keep agreeing with `ready_meshes()`. A running job keeps the slot
                 // `InFlight` (one job per slot); its result is dropped when it arrives.
                 cx.map.set_remesh_pending(id, false);
-                match cx.map.slots[id].mesh {
+                match cx.map.slots[id].mesh() {
                     MeshState::Queued => self.drop_mesh(cx, id),
                     MeshState::InFlight { .. } => self.unpublish(cx, id),
                     MeshState::None | MeshState::Ready { .. } | MeshState::Empty => {}
@@ -715,7 +756,7 @@ impl WorldJobs {
             }
             (false, true) => {
                 let priority = self.priority(slot.pos);
-                match &slot.mesh {
+                match slot.mesh() {
                     MeshState::None => {
                         cx.map.set_mesh(id, MeshState::Queued);
                         self.schedule_mesh(cx, id, priority);
@@ -725,7 +766,7 @@ impl WorldJobs {
                         epoch,
                         ..
                     } => {
-                        let current = match &slot.data {
+                        let current = match slot.data() {
                             DataState::Ready(d) => Some(d.version),
                             _ => None,
                         };
@@ -760,9 +801,10 @@ impl WorldJobs {
             });
         }
         let outside = !self.planner.in_bounds(slot.pos.y);
-        for (i, offset) in NEIGHBOR_OFFSETS.iter().enumerate() {
-            let npos = slot.pos.offset(*offset);
-            let Some(n) = cx.map.id_at(npos) else {
+        // All 26 lookups first: independent, so their cache misses overlap.
+        let near = neighbor_ids(cx.map, slot.pos);
+        for (i, &n) in near.iter().enumerate() {
+            let Some(n) = n else {
                 continue;
             };
             let neighbor = &mut cx.map.slots[n];
@@ -773,13 +815,14 @@ impl WorldJobs {
                 neighbor.neighbors_ready &= !bit;
             }
             neighbor.epoch = neighbor.epoch.wrapping_add(1);
-            if matches!(neighbor.mesh, MeshState::Empty)
+            if matches!(neighbor.mesh(), MeshState::Empty)
                 || (outside && neighbor.interest.contains(Interest::MESH))
             {
                 // Nothing is published for an `Empty` mesh. Without mesh interest (the usual
                 // case: a mesh chunk's neighbors are always wanted) this resets it to `None`, so
                 // it is meshed again when wanted; a `Ready` mesh is checked by epoch instead.
-                let priority = self.priority(npos);
+                // (Remeshing adds or removes no slot: `near` stays valid.)
+                let priority = self.priority(slot.pos.offset(NEIGHBOR_OFFSETS[i]));
                 self.request_remesh(cx, n, priority);
             }
         }
@@ -793,10 +836,10 @@ impl WorldJobs {
     /// last neighbor becomes ready).
     fn schedule_mesh(&mut self, cx: &mut Ctx<'_>, id: ChunkId, priority: u32) {
         let slot = &cx.map.slots[id];
-        if !matches!(slot.mesh, MeshState::Queued) || !slot.interest.contains(Interest::MESH) {
+        if !matches!(slot.mesh(), MeshState::Queued) || !slot.interest.contains(Interest::MESH) {
             return;
         }
-        match &slot.data {
+        match slot.data() {
             DataState::Missing => self.set_mesh_empty(cx, id),
             DataState::Ready(data) if is_uniform_empty(data, &cx.content.registry) => {
                 self.set_mesh_empty(cx, id);
@@ -813,7 +856,7 @@ impl WorldJobs {
     fn request_remesh(&mut self, cx: &mut Ctx<'_>, id: ChunkId, priority: u32) {
         let slot = &cx.map.slots[id];
         let wanted = slot.interest.contains(Interest::MESH);
-        if let MeshState::InFlight { .. } = slot.mesh {
+        if let MeshState::InFlight { .. } = slot.mesh() {
             // The running job used the old data or epoch: its result is rejected, then requeued
             // (or dropped if the mesh is no longer wanted).
             cx.map.set_remesh_pending(id, wanted);
@@ -903,7 +946,7 @@ impl WorldJobs {
                 );
                 continue;
             };
-            let DataState::Ready(data) = &mut cx.map.slots[id].data else {
+            let Some(data) = cx.map.ready_data_mut(id) else {
                 tracing::debug!(
                     ?chunk,
                     edits = changes.len(),
@@ -1022,7 +1065,7 @@ impl WorldJobs {
         let Some(slot) = cx.map.slots.get(id) else {
             return false;
         };
-        if !matches!(slot.data, DataState::Queued) {
+        if !matches!(slot.data(), DataState::Queued) {
             return false;
         }
         let (key, cancel) = (slot.key(), Arc::clone(&slot.cancel));
@@ -1048,13 +1091,13 @@ impl WorldJobs {
         let Some(slot) = map.slots.get(id) else {
             return false;
         };
-        if !matches!(slot.mesh, MeshState::Queued)
+        if !matches!(slot.mesh(), MeshState::Queued)
             || !slot.interest.contains(Interest::MESH)
             || slot.neighbors_ready != ALL_NEIGHBORS
         {
             return false;
         }
-        let DataState::Ready(center) = &slot.data else {
+        let DataState::Ready(center) = slot.data() else {
             return false;
         };
         let pos = slot.pos;
@@ -1172,7 +1215,7 @@ impl WorldJobs {
         let Some(slot) = cx.map.slots.get(id) else {
             return;
         };
-        if !matches!(slot.data, DataState::Generating) || slot.cancel.load(Ordering::Relaxed) {
+        if !matches!(slot.data(), DataState::Generating) || slot.cancel.load(Ordering::Relaxed) {
             return;
         }
         let data = self.snapshot(data);
@@ -1191,17 +1234,17 @@ impl WorldJobs {
         }
         match kind {
             JobKind::Generate => {
-                if matches!(slot.data, DataState::Generating) {
+                if matches!(slot.data(), DataState::Generating) {
                     // Permanently air, like chunks outside the vertical bounds.
                     cx.map.set_data(id, DataState::Missing);
                     self.data_available(cx, id);
                 }
             }
             JobKind::Mesh => {
-                if !matches!(slot.mesh, MeshState::InFlight { .. }) {
+                if !matches!(slot.mesh(), MeshState::InFlight { .. }) {
                     return;
                 }
-                if slot.remesh_pending {
+                if slot.remesh_pending() {
                     // The data changed meanwhile: try again with the new data.
                     let priority = self.priority(slot.pos);
                     cx.map.set_mesh_and_pending(id, MeshState::Queued, false);
@@ -1223,7 +1266,7 @@ impl WorldJobs {
         let MeshState::InFlight {
             data_version,
             epoch,
-        } = slot.mesh
+        } = *slot.mesh()
         else {
             return;
         };
@@ -1234,11 +1277,11 @@ impl WorldJobs {
             self.drop_mesh(cx, id);
             return;
         }
-        let current_version = match &slot.data {
+        let current_version = match slot.data() {
             DataState::Ready(d) => Some(d.version),
             _ => None,
         };
-        let fresh = !slot.remesh_pending
+        let fresh = !slot.remesh_pending()
             && (data_version, epoch) == (result.data_version, result.epoch)
             && current_version == Some(result.data_version)
             && slot.epoch == result.epoch;
@@ -1271,8 +1314,8 @@ impl WorldJobs {
 fn current_priority(map: &ChunkMap, planner: &Planner, id: ChunkId, kind: JobKind) -> Option<u32> {
     let slot = map.slots.get(id)?;
     let queued = match kind {
-        JobKind::Generate => matches!(slot.data, DataState::Queued),
-        JobKind::Mesh => matches!(slot.mesh, MeshState::Queued),
+        JobKind::Generate => matches!(slot.data(), DataState::Queued),
+        JobKind::Mesh => matches!(slot.mesh(), MeshState::Queued),
     };
     queued.then(|| planner.priority(slot.pos))
 }
@@ -1293,7 +1336,7 @@ fn neighbor_bits(
     for (i, (offset, n)) in NEIGHBOR_OFFSETS.iter().zip(near).enumerate() {
         let ready = !planner.in_bounds(pos.y + i64::from(offset.y))
             || n.and_then(|n| map.get(n))
-                .is_some_and(|n| matches!(n.data, DataState::Ready(_) | DataState::Missing));
+                .is_some_and(|n| matches!(n.data(), DataState::Ready(_) | DataState::Missing));
         if ready {
             bits |= 1 << i;
         }
@@ -1311,7 +1354,7 @@ fn own_neighbor_bits(map: &ChunkMap, planner: &Planner, pos: ChunkPos) -> u32 {
             || map
                 .id_at(npos)
                 .and_then(|n| map.get(n))
-                .is_some_and(|n| matches!(n.data, DataState::Ready(_) | DataState::Missing));
+                .is_some_and(|n| matches!(n.data(), DataState::Ready(_) | DataState::Missing));
         if ready {
             bits |= 1 << i;
         }

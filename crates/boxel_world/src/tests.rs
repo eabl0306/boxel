@@ -306,7 +306,7 @@ fn plugin_streams_settles_and_uses_fast_paths() {
     let map = app.world().resource::<ChunkMap>();
     for (_, slot) in map.iter() {
         let pos = slot.pos;
-        assert!(matches!(slot.data, DataState::Ready(_)), "{pos:?} data");
+        assert!(matches!(slot.data(), DataState::Ready(_)), "{pos:?} data");
         let mesh_column = MESH_COLUMNS.contains(&(pos.x, pos.z));
         assert!(slot.interest.contains(Interest::DATA));
         assert_eq!(
@@ -317,7 +317,7 @@ fn plugin_streams_settles_and_uses_fast_paths() {
         if mesh_column {
             assert_eq!(slot.neighbors_ready, ALL_NEIGHBORS, "{pos:?} neighbors");
         }
-        match (&slot.mesh, mesh_column, exposed.contains(&pos)) {
+        match (slot.mesh(), mesh_column, exposed.contains(&pos)) {
             (MeshState::Ready { mesh, .. }, true, true) => assert_eq!(mesh.total_quads(), 1),
             (MeshState::Empty, true, false) | (MeshState::None, false, false) => {}
             (state, ..) => panic!("{pos:?}: unexpected mesh state {state:?}"),
@@ -546,11 +546,11 @@ fn small_moves_keep_chunks_inside_the_hysteresis_band() {
     // Left the data set: kept (hysteresis) with no interest.
     let gone = slot_at(&app, ChunkPos::new(-2, -1, 0));
     assert!(gone.interest.is_empty());
-    assert!(matches!(gone.mesh, MeshState::None));
+    assert!(matches!(gone.mesh(), MeshState::None));
     // Left the mesh radius: keeps its published mesh until unload.
     let kept = slot_at(&app, ChunkPos::new(-1, -1, 0));
     assert_eq!(kept.interest, Interest::DATA);
-    assert!(matches!(kept.mesh, MeshState::Ready { .. }));
+    assert!(matches!(kept.mesh(), MeshState::Ready { .. }));
     // New mesh columns (2, 0), (1, 1) and (1, -1); the y = -1 layer is exposed stone.
     assert_eq!(
         upserts(&events),
@@ -602,10 +602,10 @@ fn edits_remesh_the_chunk_and_touched_face_neighbors() {
         above_epoch + 1,
         "air neighbor stays Empty"
     );
-    assert!(matches!(slot_at(&app, above).mesh, MeshState::Empty));
+    assert!(matches!(slot_at(&app, above).mesh(), MeshState::Empty));
     let map = app.world().resource::<ChunkMap>();
     assert_eq!(map.block_at(edited), Some(BlockState::AIR));
-    match &slot_at(&app, center).mesh {
+    match slot_at(&app, center).mesh() {
         MeshState::Ready {
             mesh, data_version, ..
         } => {
@@ -629,8 +629,8 @@ fn panicking_generator_marks_the_chunk_missing_and_settles() {
     spawn_viewer(&mut app, ChunkPos::new(0, 0, 0), 1);
     settle(&mut app, 200);
     let failed = slot_at(&app, ChunkPos::new(0, -2, 0));
-    assert!(matches!(failed.data, DataState::Missing));
-    assert!(matches!(failed.mesh, MeshState::Empty));
+    assert!(matches!(failed.data(), DataState::Missing));
+    assert!(matches!(failed.mesh(), MeshState::Empty));
     let map = app.world().resource::<ChunkMap>();
     assert_eq!(
         map.block_at(BlockPos::new(0, -40, 0)),

@@ -145,8 +145,8 @@ impl Harness {
         for (id, slot) in self.map.iter() {
             let published = self.jobs.published.contains(&id);
             let remeshing = slot.interest.contains(Interest::MESH)
-                && matches!(slot.mesh, MeshState::Queued | MeshState::InFlight { .. });
-            match slot.mesh {
+                && matches!(slot.mesh(), MeshState::Queued | MeshState::InFlight { .. });
+            match slot.mesh() {
                 MeshState::Ready { .. } => {
                     assert!(published, "{:?} Ready, not published", slot.pos);
                 }
@@ -154,7 +154,7 @@ impl Harness {
                     !published || remeshing,
                     "{:?} published with {:?} and {:?}",
                     slot.pos,
-                    slot.mesh,
+                    slot.mesh(),
                     slot.interest
                 ),
             }
@@ -202,13 +202,14 @@ fn neighbor_bits_follow_data_states() {
     let mut h = Harness::new(LayerGen::new(-1..=1), hold.clone(), 64);
     h.interest(&origin(0));
     assert_eq!(h.map.len(), 27);
-    // Out-of-range layers count as ready from the start.
+    // Out-of-range layers count as ready (a slot gets its bits when its data arrives).
+    let planner = &h.jobs.planner;
     assert_eq!(
-        h.slot(ChunkPos::new(0, 1, 0)).neighbors_ready,
+        own_neighbor_bits(&h.map, planner, ChunkPos::new(0, 1, 0)),
         mask(|dy| dy == 1)
     );
     assert_eq!(
-        h.slot(ChunkPos::new(0, -1, 0)).neighbors_ready,
+        own_neighbor_bits(&h.map, planner, ChunkPos::new(0, -1, 0)),
         mask(|dy| dy == -1)
     );
     let center = h.id(ChunkPos::new(0, 0, 0));
@@ -233,7 +234,7 @@ fn neighbor_bits_follow_data_states() {
         );
     }
     assert_eq!(expected, ALL_NEIGHBORS);
-    assert!(matches!(h.map.slots[center].mesh, MeshState::Queued));
+    assert!(matches!(h.map.slots[center].mesh(), MeshState::Queued));
 
     // The center becomes ready: every neighbor gets its bit; the enclosed stone center is then
     // meshed by the fast path at dispatch (no job).
@@ -251,10 +252,10 @@ fn neighbor_bits_follow_data_states() {
     // job); (0, 1, 0) and (0, -1, 0) border the empty out-of-range layers and get mesh jobs.
     assert_eq!(hold.held(), 2);
     assert_eq!(h.jobs.scheduler.in_flight(), 2);
-    assert!(matches!(h.map.slots[center].mesh, MeshState::Empty));
+    assert!(matches!(h.map.slots[center].mesh(), MeshState::Empty));
     for y in [-1, 1] {
         assert!(matches!(
-            h.slot(ChunkPos::new(0, y, 0)).mesh,
+            h.slot(ChunkPos::new(0, y, 0)).mesh(),
             MeshState::InFlight { .. }
         ));
     }
@@ -286,13 +287,13 @@ fn stale_results_are_rejected_by_version() {
     h.collect();
     let center = ChunkPos::new(0, -1, 0);
     assert!(
-        matches!(h.slot(ChunkPos::new(0, 0, 0)).mesh, MeshState::Empty),
+        matches!(h.slot(ChunkPos::new(0, 0, 0)).mesh(), MeshState::Empty),
         "air fast path"
     );
     h.dispatch();
     assert_eq!(hold.held(), 1, "the surface mesh job");
     assert!(matches!(
-        h.slot(center).mesh,
+        h.slot(center).mesh(),
         MeshState::InFlight {
             data_version: 0,
             epoch: 0
@@ -301,20 +302,20 @@ fn stale_results_are_rejected_by_version() {
 
     // An interior edit while the job runs: version 1, remesh pending.
     h.edit(BlockPos::new(10, -10, 10), BlockState::AIR);
-    assert!(h.slot(center).remesh_pending);
+    assert!(h.slot(center).remesh_pending());
     assert_eq!(h.stats().meshing, 1);
     hold.run_all();
     h.collect();
     assert!(h.take_events().is_empty(), "version 0 result rejected");
-    assert!(matches!(h.slot(center).mesh, MeshState::Queued));
-    assert!(!h.slot(center).remesh_pending);
+    assert!(matches!(h.slot(center).mesh(), MeshState::Queued));
+    assert!(!h.slot(center).remesh_pending());
     assert_eq!(h.jobs.scheduler.queued(), 1, "requeued");
 
     h.dispatch();
     hold.run_all();
     h.collect();
     assert_eq!(upserted(&h.take_events()), vec![center]);
-    match &h.slot(center).mesh {
+    match h.slot(center).mesh() {
         MeshState::Ready {
             mesh, data_version, ..
         } => assert_eq!((mesh.total_quads(), *data_version), (2, 1)),
@@ -339,13 +340,13 @@ fn stale_results_are_rejected_by_epoch() {
     hold.run_all();
     h.collect();
     assert!(h.take_events().is_empty(), "epoch 0 result rejected");
-    assert!(matches!(h.slot(center).mesh, MeshState::Queued));
+    assert!(matches!(h.slot(center).mesh(), MeshState::Queued));
     h.dispatch();
     hold.run_all();
     h.collect();
     assert_eq!(upserted(&h.take_events()), vec![center]);
     assert!(matches!(
-        h.slot(center).mesh,
+        h.slot(center).mesh(),
         MeshState::Ready {
             data_version: 0,
             epoch: 1,
@@ -364,7 +365,7 @@ fn stale_results_are_rejected_by_epoch() {
     hold.run_all();
     h.collect();
     assert!(h.take_events().is_empty());
-    assert!(matches!(h.slot(center).mesh, MeshState::Queued));
+    assert!(matches!(h.slot(center).mesh(), MeshState::Queued));
     assert_eq!(h.jobs.scheduler.queued(), 0);
 }
 
@@ -389,12 +390,12 @@ fn neighbor_edits_bump_epoch_and_remesh() {
     // (1, -1, 0) has no mesh interest (radius 0): only the center is remeshed.
     assert_eq!(upserted(&h.take_events()), vec![center]);
     assert!(matches!(
-        h.slot(ChunkPos::new(1, -1, 0)).mesh,
+        h.slot(ChunkPos::new(1, -1, 0)).mesh(),
         MeshState::None
     ));
     assert!(matches!(
-        h.slot(center).mesh,
-        MeshState::Ready { data_version: 0, epoch: e, .. } if e == epoch + 1
+        h.slot(center).mesh(),
+        MeshState::Ready { data_version: 0, epoch: e, .. } if *e == epoch + 1
     ));
 }
 
@@ -463,11 +464,11 @@ fn generator_panic_releases_its_slot() {
     assert_eq!(h.jobs.scheduler.in_flight(), 0);
     assert_eq!(h.jobs.failed, 1);
     assert!(matches!(
-        h.slot(ChunkPos::new(0, 0, 0)).data,
+        h.slot(ChunkPos::new(0, 0, 0)).data(),
         DataState::Missing
     ));
     assert!(matches!(
-        h.slot(ChunkPos::new(0, 0, 0)).mesh,
+        h.slot(ChunkPos::new(0, 0, 0)).mesh(),
         MeshState::Empty
     ));
     assert!(h.stats().is_settled());
@@ -515,7 +516,7 @@ fn dropped_jobs_report_failure() {
     assert!(
         h.map
             .iter()
-            .all(|(_, s)| matches!(s.data, DataState::Missing))
+            .all(|(_, s)| matches!(s.data(), DataState::Missing))
     );
     assert!(h.stats().is_settled());
 }
@@ -526,7 +527,7 @@ fn mesher_panic_marks_the_mesh_empty() {
     h.jobs.mesh_fn = panicking_mesh;
     h.settle(20);
     assert!(matches!(
-        h.slot(ChunkPos::new(0, -1, 0)).mesh,
+        h.slot(ChunkPos::new(0, -1, 0)).mesh(),
         MeshState::Empty
     ));
     assert_eq!(h.jobs.failed, 1);
@@ -547,7 +548,10 @@ fn failed_remesh_with_pending_request_retries() {
     hold.drop_all();
     h.collect();
     assert_eq!(h.jobs.failed, 1);
-    assert!(matches!(h.slot(center).mesh, MeshState::Queued), "retried");
+    assert!(
+        matches!(h.slot(center).mesh(), MeshState::Queued),
+        "retried"
+    );
     h.dispatch();
     hold.run_all();
     h.collect();
@@ -578,7 +582,7 @@ fn remesh_to_empty_and_unload_remove_published_meshes() {
         matches!(events.as_slice(), [ChunkMeshEvent::Remove { id: removed, .. }] if *removed == id),
         "{events:?}"
     );
-    assert!(matches!(h.slot(center).mesh, MeshState::Empty));
+    assert!(matches!(h.slot(center).mesh(), MeshState::Empty));
     // Put one block back, then unload by moving away: Remove again.
     h.edit(BlockPos::new(3, -3, 3), STONE);
     h.settle(20);
@@ -603,7 +607,7 @@ fn interest_changes_drop_unstarted_work() {
     assert_eq!(hold.held(), 1, "cap 1");
     let first = h.id(ChunkPos::new(0, 0, 0));
     assert!(
-        matches!(h.map.slots[first].data, DataState::Generating),
+        matches!(h.map.slots[first].data(), DataState::Generating),
         "priority 0 first"
     );
     assert_eq!(
@@ -619,10 +623,10 @@ fn interest_changes_drop_unstarted_work() {
         assert!(h.map.id_at(ChunkPos::new(-1, 0, z)).is_none());
     }
     assert_eq!(h.map.len(), 9);
-    assert!(matches!(h.map.slots[first].mesh, MeshState::None));
+    assert!(matches!(h.map.slots[first].mesh(), MeshState::None));
     assert_eq!(h.map.slots[first].interest, Interest::DATA);
     assert!(matches!(
-        h.slot(ChunkPos::new(1, 0, 0)).mesh,
+        h.slot(ChunkPos::new(1, 0, 0)).mesh(),
         MeshState::Queued
     ));
     // Queued generation jobs: the 8 slots that are still `Queued` (stale ones were dropped).
@@ -655,29 +659,29 @@ fn losing_mesh_interest_mid_remesh_removes_the_old_mesh() {
     h.interest(&origin(1));
     h.settle(50);
     let a = h.id(ChunkPos::new(1, -1, 0));
-    assert!(matches!(h.map.slots[a].mesh, MeshState::Ready { .. }));
+    assert!(matches!(h.map.slots[a].mesh(), MeshState::Ready { .. }));
     // A stays in the hysteresis band with its mesh; its neighbor (2, -1, 0) unloads.
     h.interest(&away);
     h.settle(50);
     assert!(h.map.id_at(ChunkPos::new(2, -1, 0)).is_none());
-    assert!(matches!(h.map.slots[a].mesh, MeshState::Ready { .. }));
+    assert!(matches!(h.map.slots[a].mesh(), MeshState::Ready { .. }));
     h.check_published();
     h.take_events();
 
     // Back: A is wanted again with a stale epoch, so its remesh waits for the neighbor. Away
     // again before that: the old mesh is removed at once.
     h.interest(&origin(1));
-    assert!(matches!(h.map.slots[a].mesh, MeshState::Queued));
+    assert!(matches!(h.map.slots[a].mesh(), MeshState::Queued));
     h.check_published();
     let mut remeshing: Vec<ChunkId> = h
         .map
         .iter()
-        .filter(|(id, s)| matches!(s.mesh, MeshState::Queued) && h.jobs.published.contains(id))
+        .filter(|(id, s)| matches!(s.mesh(), MeshState::Queued) && h.jobs.published.contains(id))
         .map(|(id, _)| id)
         .collect();
     assert!(remeshing.contains(&a));
     h.interest(&away);
-    assert!(matches!(h.map.slots[a].mesh, MeshState::None));
+    assert!(matches!(h.map.slots[a].mesh(), MeshState::None));
     let mut events = removed(&h.take_events());
     events.sort_unstable();
     remeshing.sort_unstable();
@@ -688,7 +692,7 @@ fn losing_mesh_interest_mid_remesh_removes_the_old_mesh() {
     // Wanted again: rebuilt and published.
     h.interest(&origin(1));
     h.settle(50);
-    assert!(matches!(h.map.slots[a].mesh, MeshState::Ready { .. }));
+    assert!(matches!(h.map.slots[a].mesh(), MeshState::Ready { .. }));
     assert!(upserted(&h.take_events()).contains(&ChunkPos::new(1, -1, 0)));
     h.check_published();
 }
@@ -713,14 +717,14 @@ fn losing_mesh_interest_while_in_flight_removes_the_old_mesh() {
     // An edit starts a remesh; the viewer leaves while it runs (the center keeps only data).
     h.edit(BlockPos::new(10, -10, 10), BlockState::AIR);
     h.dispatch();
-    assert!(matches!(h.slot(center).mesh, MeshState::InFlight { .. }));
+    assert!(matches!(h.slot(center).mesh(), MeshState::InFlight { .. }));
     h.interest(&[(ChunkPos::new(1, 0, 0), 0)]);
     assert_eq!(h.slot(center).interest, Interest::DATA);
-    assert!(matches!(h.slot(center).mesh, MeshState::InFlight { .. }));
+    assert!(matches!(h.slot(center).mesh(), MeshState::InFlight { .. }));
     assert_eq!(removed(&h.take_events()), vec![id]);
     h.check_published();
     run(&mut h);
-    assert!(matches!(h.slot(center).mesh, MeshState::None));
+    assert!(matches!(h.slot(center).mesh(), MeshState::None));
     let late = h.take_events().into_iter().find(|e| match e {
         ChunkMeshEvent::Upsert { id: other, .. } | ChunkMeshEvent::Remove { id: other, .. } => {
             *other == id
@@ -733,7 +737,7 @@ fn losing_mesh_interest_while_in_flight_removes_the_old_mesh() {
     run(&mut h);
     assert_eq!(upserted(&h.take_events()), vec![center]);
     assert!(matches!(
-        h.slot(center).mesh,
+        h.slot(center).mesh(),
         MeshState::Ready {
             data_version: 1,
             ..
@@ -788,7 +792,7 @@ fn empty_mesh_is_redone_after_a_neighbor_reloads() {
     h.interest(&origin(1));
     h.settle(50);
     let a = h.id(ChunkPos::new(1, 0, 0));
-    assert!(matches!(h.map.slots[a].mesh, MeshState::Ready { .. }));
+    assert!(matches!(h.map.slots[a].mesh(), MeshState::Ready { .. }));
 
     // Filling the slab of the air chunk B = (2, 0, 0) that touches A hides A: Empty.
     let fill: Vec<BlockEdit> = (0..32 * 32)
@@ -799,7 +803,7 @@ fn empty_mesh_is_redone_after_a_neighbor_reloads() {
         .collect();
     h.with(|jobs, cx, _| jobs.apply_edits(cx, fill));
     h.settle(50);
-    assert!(matches!(h.map.slots[a].mesh, MeshState::Empty));
+    assert!(matches!(h.map.slots[a].mesh(), MeshState::Empty));
     assert_eq!(removed(&h.take_events()), vec![a]);
 
     // Away: A stays in the band, B unloads and its edit is lost.
@@ -818,9 +822,9 @@ fn empty_mesh_is_redone_after_a_neighbor_reloads() {
         Some(Some(BlockState::AIR))
     );
     assert!(
-        matches!(h.map.slots[a].mesh, MeshState::Ready { .. }),
+        matches!(h.map.slots[a].mesh(), MeshState::Ready { .. }),
         "{:?}",
-        h.map.slots[a].mesh
+        h.map.slots[a].mesh()
     );
     assert!(upserted(&h.take_events()).contains(&ChunkPos::new(1, 0, 0)));
     h.check_published();

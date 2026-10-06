@@ -72,6 +72,9 @@ bitflags::bitflags! {
 
 /// One chunk's bookkeeping. Its key is stored field by field (see [`ChunkSlot::key`]), so the
 /// small fields share the padding a nested `ChunkKey` would leave.
+///
+/// `data`, `mesh` and `remesh_pending` are read with their getters and changed only through
+/// [`ChunkMap`], which counts them for [`ChunkMap::stats`].
 #[derive(Clone, Debug)]
 pub struct ChunkSlot {
     /// Position (the key's `pos`).
@@ -81,17 +84,19 @@ pub struct ChunkSlot {
     /// Level of detail (the key's `lod`).
     pub lod: u8,
     /// Data state.
-    pub data: DataState,
+    data: DataState,
     /// Mesh state.
-    pub mesh: MeshState,
+    mesh: MeshState,
     /// Interest flags.
     pub interest: Interest,
-    /// Bit `i` set when neighbor `NEIGHBOR_OFFSETS[i]` is `Ready` or `Missing` (26 bits).
+    /// Bit `i` set when neighbor `NEIGHBOR_OFFSETS[i]` is `Ready` or `Missing` (26 bits). Only
+    /// kept while this slot's own data is `Ready` or `Missing`: the bits are computed when the
+    /// data arrives, and mean nothing before.
     pub neighbors_ready: u32,
     /// Bumped when a neighbor's border data changes (closes the neighbor-staleness gap).
     pub epoch: u32,
     /// A remesh was requested while a job was in flight.
-    pub remesh_pending: bool,
+    remesh_pending: bool,
     /// Set on unload; jobs check it before heavy work (cooperative cancellation).
     pub cancel: Arc<AtomicBool>,
 }
@@ -146,6 +151,21 @@ const MESH_EMPTY: u8 = 1 << 3;
 const MESHING: u8 = 1 << 4;
 
 impl ChunkSlot {
+    /// A new slot for `key`: data `Queued`, no mesh, no interest.
+    pub(crate) fn new(key: ChunkKey) -> Self {
+        Self {
+            pos: key.pos,
+            dim: key.dim,
+            lod: key.lod,
+            data: DataState::Queued,
+            mesh: MeshState::None,
+            interest: Interest::empty(),
+            neighbors_ready: 0,
+            epoch: 0,
+            remesh_pending: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
     /// The chunk's key, as events, jobs and stores see it.
     pub fn key(&self) -> ChunkKey {
         ChunkKey {
@@ -153,6 +173,18 @@ impl ChunkSlot {
             lod: self.lod,
             pos: self.pos,
         }
+    }
+    /// Data state.
+    pub fn data(&self) -> &DataState {
+        &self.data
+    }
+    /// Mesh state.
+    pub fn mesh(&self) -> &MeshState {
+        &self.mesh
+    }
+    /// A remesh was requested while a job was in flight.
+    pub fn remesh_pending(&self) -> bool {
+        self.remesh_pending
     }
     /// Which slot counters of [`WorldStats`] this slot counts toward (bits of [`Tally`]).
     fn tally_bits(&self) -> u8 {
@@ -209,8 +241,9 @@ impl Tally {
 #[derive(Resource, Default)]
 pub struct ChunkMap {
     // Slots are added and removed with `insert` and `remove`, and their `data`, `mesh` and
-    // `remesh_pending` change only through `update` (or the setters built on it), which keeps
-    // `tally` up to date. The other fields may be written in place.
+    // `remesh_pending` (private to this module) change only through `update` and the setters
+    // built on it, which keep `tally` up to date (`ready_data_mut` only edits the data of a
+    // `Ready` slot, which keeps its counts). The other fields may be written in place.
     pub(crate) slots: slotmap::SlotMap<ChunkId, ChunkSlot>,
     pub(crate) index: HashMap<ChunkPos, ChunkId, foldhash::fast::FixedState>,
     tally: Tally,
@@ -323,7 +356,7 @@ impl ChunkMap {
     }
     /// Runs `f` on a slot and recounts it. Every change of `data`, `mesh` or `remesh_pending`
     /// goes through here. Panics if `id` is not loaded.
-    pub(crate) fn update<R>(&mut self, id: ChunkId, f: impl FnOnce(&mut ChunkSlot) -> R) -> R {
+    fn update<R>(&mut self, id: ChunkId, f: impl FnOnce(&mut ChunkSlot) -> R) -> R {
         let slot = &mut self.slots[id];
         let before = slot.tally_bits();
         let out = f(slot);
@@ -348,5 +381,13 @@ impl ChunkMap {
     /// Sets a slot's remesh request.
     pub(crate) fn set_remesh_pending(&mut self, id: ChunkId, pending: bool) {
         self.update(id, |slot| slot.remesh_pending = pending);
+    }
+    /// The data of a `Ready` slot, to edit in place (the slot stays `Ready`, so its counts do
+    /// not change). `None` if the slot is not loaded or not `Ready`.
+    pub(crate) fn ready_data_mut(&mut self, id: ChunkId) -> Option<&mut Arc<ChunkData>> {
+        match &mut self.slots.get_mut(id)?.data {
+            DataState::Ready(data) => Some(data),
+            DataState::Queued | DataState::Generating | DataState::Missing => None,
+        }
     }
 }

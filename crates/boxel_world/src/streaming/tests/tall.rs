@@ -41,6 +41,19 @@ fn reference_wanted(h: &Harness, viewers: &[Viewer]) -> BTreeMap<ChunkPos, Inter
     out
 }
 
+/// A slot whose data arrived (`Ready` or `Missing`) has the neighbor bits of the current map.
+/// Slots still waiting for their data get them when it arrives.
+fn check_neighbor_bits(h: &Harness, slot: &ChunkSlot) {
+    if matches!(slot.data(), DataState::Ready(_) | DataState::Missing) {
+        assert_eq!(
+            slot.neighbors_ready,
+            own_neighbor_bits(&h.map, &h.jobs.planner, slot.pos),
+            "{:?} neighbor bits",
+            slot.pos
+        );
+    }
+}
+
 /// The interest invariants of a world whose interest backlog is empty.
 fn check_interest(h: &Harness, viewers: &[Viewer]) {
     let hysteresis = h.settings.unload_hysteresis;
@@ -57,15 +70,11 @@ fn check_interest(h: &Harness, viewers: &[Viewer]) {
         if level.interest().is_empty() {
             assert_eq!(level, Level::Keep, "{pos:?} kept outside every keep region");
             assert!(
-                !matches!(slot.data, DataState::Queued),
+                !matches!(slot.data(), DataState::Queued),
                 "{pos:?} kept without being started"
             );
         }
-        assert_eq!(
-            slot.neighbors_ready,
-            own_neighbor_bits(&h.map, &h.jobs.planner, pos),
-            "{pos:?} neighbor bits"
-        );
+        check_neighbor_bits(h, slot);
     }
     let loaded: BTreeSet<ChunkPos> = h.map.iter().map(|(_, s)| s.pos).collect();
     for pos in reference_wanted(h, viewers).keys() {
@@ -146,7 +155,7 @@ fn chunks_above_the_generator_can_be_edited() {
     let air: Vec<&Arc<ChunkData>> = h
         .map
         .iter()
-        .filter_map(|(_, s)| match &s.data {
+        .filter_map(|(_, s)| match s.data() {
             DataState::Ready(d) if s.pos != ChunkPos::new(0, 20, 0) => Some(d),
             _ => None,
         })
@@ -172,7 +181,7 @@ fn edge_meshes_wait_for_their_neighbors_above_and_below() {
     );
     h.dispatch();
     assert_eq!(hold.held(), 18);
-    assert!(matches!(h.slot(center).mesh, MeshState::Queued));
+    assert!(matches!(h.slot(center).mesh(), MeshState::Queued));
     assert_eq!(
         h.jobs.scheduler.queued(),
         0,
@@ -185,7 +194,7 @@ fn edge_meshes_wait_for_their_neighbors_above_and_below() {
     assert_eq!(hold.held(), 1, "the center's mesh job");
     hold.run_all();
     h.collect();
-    assert!(matches!(h.slot(center).mesh, MeshState::Ready { .. }));
+    assert!(matches!(h.slot(center).mesh(), MeshState::Ready { .. }));
     assert!(h.stats().is_settled());
 }
 
@@ -256,7 +265,7 @@ fn jobs_start_nearest_first_while_priorities_are_stale() {
     let distance = |state: fn(&DataState) -> bool| {
         h.map
             .iter()
-            .filter(|(_, s)| state(&s.data))
+            .filter(|(_, s)| state(s.data()))
             .map(|(_, s)| h.jobs.planner.priority(s.pos))
             .collect::<Vec<u32>>()
     };
@@ -330,7 +339,7 @@ fn neighbor_count_mesh(input: &MeshInput<'_>, materials: &MaterialTable) -> Chun
 /// Every `Ready` mesh was built from the neighbors the map has now.
 fn check_meshes_match_neighbors(h: &Harness) {
     for (_, slot) in h.map.iter() {
-        if let MeshState::Ready { mesh, .. } = &slot.mesh {
+        if let MeshState::Ready { mesh, .. } = slot.mesh() {
             let loaded = NEIGHBOR_OFFSETS
                 .iter()
                 .filter(|o| h.map.data_at(slot.pos.offset(**o)).is_some())
@@ -484,12 +493,7 @@ fn frame(h: &mut Harness, hold: &HoldExecutor, list: &[(u64, Viewer)], run: bool
 /// match the map and published meshes match the slots.
 fn check_bookkeeping(h: &Harness) {
     for (_, slot) in h.map.iter() {
-        assert_eq!(
-            slot.neighbors_ready,
-            own_neighbor_bits(&h.map, &h.jobs.planner, slot.pos),
-            "{:?} neighbor bits",
-            slot.pos
-        );
+        check_neighbor_bits(h, slot);
     }
     h.check_published();
     h.check_stats();
@@ -537,8 +541,8 @@ proptest! {
         for (_, slot) in h.map.iter() {
             if slot.interest.contains(Interest::MESH) {
                 prop_assert!(
-                    matches!(slot.mesh, MeshState::Ready { .. } | MeshState::Empty),
-                    "{:?} mesh {:?}", slot.pos, slot.mesh
+                    matches!(slot.mesh(), MeshState::Ready { .. } | MeshState::Empty),
+                    "{:?} mesh {:?}", slot.pos, slot.mesh()
                 );
             }
         }
@@ -596,8 +600,8 @@ proptest! {
         for (_, slot) in h.map.iter() {
             if slot.interest.contains(Interest::MESH) {
                 prop_assert!(
-                    matches!(slot.mesh, MeshState::Ready { .. } | MeshState::Empty),
-                    "{:?} mesh {:?}", slot.pos, slot.mesh
+                    matches!(slot.mesh(), MeshState::Ready { .. } | MeshState::Empty),
+                    "{:?} mesh {:?}", slot.pos, slot.mesh()
                 );
             }
         }
