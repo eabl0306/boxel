@@ -1,6 +1,6 @@
 use boxel_ecs::prelude::*;
 use boxel_mesh::ChunkMesh;
-use boxel_voxel::{BlockPos, BlockState, ChunkData, ChunkKey, ChunkPos};
+use boxel_voxel::{BlockPos, BlockState, ChunkData, ChunkKey, ChunkPos, DimensionId};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -70,11 +70,16 @@ bitflags::bitflags! {
     }
 }
 
-/// One chunk's bookkeeping.
+/// One chunk's bookkeeping. Its key is stored field by field (see [`ChunkSlot::key`]), so the
+/// small fields share the padding a nested `ChunkKey` would leave.
 #[derive(Clone, Debug)]
 pub struct ChunkSlot {
-    /// Key.
-    pub key: ChunkKey,
+    /// Position (the key's `pos`).
+    pub pos: ChunkPos,
+    /// Dimension (the key's `dim`).
+    pub dim: DimensionId,
+    /// Level of detail (the key's `lod`).
+    pub lod: u8,
     /// Data state.
     pub data: DataState,
     /// Mesh state.
@@ -141,6 +146,14 @@ const MESH_EMPTY: u8 = 1 << 3;
 const MESHING: u8 = 1 << 4;
 
 impl ChunkSlot {
+    /// The chunk's key, as events, jobs and stores see it.
+    pub fn key(&self) -> ChunkKey {
+        ChunkKey {
+            dim: self.dim,
+            lod: self.lod,
+            pos: self.pos,
+        }
+    }
     /// Which slot counters of [`WorldStats`] this slot counts toward (bits of [`Tally`]).
     fn tally_bits(&self) -> u8 {
         let data = match self.data {
@@ -243,7 +256,7 @@ impl ChunkMap {
     /// Every non-empty Ready mesh (renderer resync).
     pub fn ready_meshes(&self) -> impl Iterator<Item = (ChunkId, ChunkKey, &Arc<ChunkMesh>)> {
         self.slots.iter().filter_map(|(id, s)| match &s.mesh {
-            MeshState::Ready { mesh, .. } => Some((id, s.key, mesh)),
+            MeshState::Ready { mesh, .. } => Some((id, s.key(), mesh)),
             _ => None,
         })
     }
@@ -287,9 +300,14 @@ impl ChunkMap {
         }
         stats
     }
+    /// Room for `additional` more slots without growing the slots or the index.
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.slots.reserve(additional);
+        self.index.reserve(additional);
+    }
     /// Adds a slot (and its index entry). The position must be free.
     pub(crate) fn insert(&mut self, slot: ChunkSlot) -> ChunkId {
-        let (pos, bits) = (slot.key.pos, slot.tally_bits());
+        let (pos, bits) = (slot.pos, slot.tally_bits());
         let id = self.slots.insert(slot);
         let previous = self.index.insert(pos, id);
         debug_assert!(previous.is_none(), "two slots at {pos:?}");
@@ -299,7 +317,7 @@ impl ChunkMap {
     /// Removes a slot (and its index entry).
     pub(crate) fn remove(&mut self, id: ChunkId) -> Option<ChunkSlot> {
         let slot = self.slots.remove(id)?;
-        self.index.remove(&slot.key.pos);
+        self.index.remove(&slot.pos);
         self.tally.change(slot.tally_bits(), 0);
         Some(slot)
     }

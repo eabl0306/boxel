@@ -138,13 +138,13 @@ fn assert_world_matches_direct(app: &App, edited: &[ChunkPos]) {
     let mut mesher = Mesher::new();
     let (mut meshes, mut empties) = (0, 0);
     for (_, slot) in map.iter() {
-        let pos = slot.key.pos;
+        let pos = slot.pos;
         if let DataState::Ready(data) = &slot.data
             && !edited.contains(&pos)
         {
             assert_eq!(
                 **data,
-                content.generator.generate(slot.key, &content.registry),
+                content.generator.generate(slot.key(), &content.registry),
                 "{pos:?}: data equals a fresh generate"
             );
         }
@@ -236,7 +236,7 @@ fn real_terrain_publishes_meshes() {
     let map = app.world().resource::<ChunkMap>();
     assert!(
         map.iter()
-            .all(|(_, slot)| (2 - 9..=2 + 9).contains(&slot.key.pos.y))
+            .all(|(_, slot)| (2 - 9..=2 + 9).contains(&slot.pos.y))
     );
     // The resource and the slot-based counters agree.
     let slots = map.stats();
@@ -305,7 +305,7 @@ fn moving_the_viewer_streams_and_unloads() {
     assert_world_matches_direct(&app, &[]);
     let map = app.world().resource::<ChunkMap>();
     assert!(
-        map.iter().all(|(_, slot)| slot.key.pos.x >= 20 - 6),
+        map.iter().all(|(_, slot)| slot.pos.x >= 20 - 6),
         "the old area was unloaded"
     );
     assert!(map.id_at(ChunkPos::new(20, 2, 0)).is_some());
@@ -423,7 +423,7 @@ fn vertical_moves_stream_and_unload() {
     assert_replica_matches(&app, &replica);
     assert!(replica.is_empty(), "no terrain meshes in the sky");
     let map = app.world().resource::<ChunkMap>();
-    assert!(map.iter().all(|(_, slot)| slot.key.pos.y >= 12 - 5));
+    assert!(map.iter().all(|(_, slot)| slot.pos.y >= 12 - 5));
     assert!(
         map.id_at(ChunkPos::new(0, 15, 0)).is_some(),
         "no height limit"
@@ -445,7 +445,7 @@ fn assert_world_matches_direct_or_empty(app: &App) {
         assert!(
             matches!(slot.mesh, MeshState::None | MeshState::Empty),
             "{:?}: sky chunks mesh to nothing",
-            slot.key.pos
+            slot.pos
         );
     }
 }
@@ -477,7 +477,7 @@ fn fixed_height_streams_every_layer_of_the_generator() {
         mesh_columns(3) * layers.clone().count()
     );
     let map = app.world().resource::<ChunkMap>();
-    assert!(map.iter().all(|(_, s)| layers.contains(&s.key.pos.y)));
+    assert!(map.iter().all(|(_, s)| layers.contains(&s.pos.y)));
     assert_world_matches_direct(&app, &[]);
     assert_replica_matches(&app, &last_meshes(&events));
 

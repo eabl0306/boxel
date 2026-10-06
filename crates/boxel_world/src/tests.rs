@@ -245,7 +245,7 @@ fn loaded(app: &App) -> BTreeSet<ChunkPos> {
     app.world()
         .resource::<ChunkMap>()
         .iter()
-        .map(|(_, s)| s.key.pos)
+        .map(|(_, s)| s.pos)
         .collect()
 }
 
@@ -305,7 +305,7 @@ fn plugin_streams_settles_and_uses_fast_paths() {
     let exposed = exposed_chunks();
     let map = app.world().resource::<ChunkMap>();
     for (_, slot) in map.iter() {
-        let pos = slot.key.pos;
+        let pos = slot.pos;
         assert!(matches!(slot.data, DataState::Ready(_)), "{pos:?} data");
         let mesh_column = MESH_COLUMNS.contains(&(pos.x, pos.z));
         assert!(slot.interest.contains(Interest::DATA));
@@ -688,6 +688,15 @@ fn task_pool_executor_settles_the_same_world() {
         10
     );
     assert_eq!(upserts(&events), exposed_chunks());
+}
+
+/// The structures every interest step touches keep their size: a slot is 88 bytes (96 in the
+/// slot map, with its version; its key is stored flat, so the small fields fill the padding a
+/// nested `ChunkKey` would leave), an index entry 32.
+#[test]
+fn hot_structures_stay_small() {
+    assert_eq!(size_of::<crate::ChunkSlot>(), 88, "chunk slot");
+    assert_eq!(size_of::<(ChunkPos, crate::ChunkId)>(), 32, "index entry");
 }
 
 #[test]

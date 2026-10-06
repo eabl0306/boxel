@@ -9,7 +9,7 @@ use crate::interest::MAX_RADIUS;
 use crate::jobs::InlineExecutor;
 use crate::tests::support::{HoldExecutor, LayerGen, fake_mesh, panicking_mesh};
 use crate::{BlockEdit, WorldStats};
-use boxel_voxel::{BlockPos, CHUNK_VOLUME, neighbor_index};
+use boxel_voxel::{BlockPos, CHUNK_VOLUME, ChunkKey, neighbor_index};
 use boxel_worldgen::WorldGenerator;
 
 const STONE: BlockState = BlockState(1);
@@ -148,12 +148,12 @@ impl Harness {
                 && matches!(slot.mesh, MeshState::Queued | MeshState::InFlight { .. });
             match slot.mesh {
                 MeshState::Ready { .. } => {
-                    assert!(published, "{:?} Ready, not published", slot.key.pos);
+                    assert!(published, "{:?} Ready, not published", slot.pos);
                 }
                 _ => assert!(
                     !published || remeshing,
                     "{:?} published with {:?} and {:?}",
-                    slot.key.pos,
+                    slot.pos,
                     slot.mesh,
                     slot.interest
                 ),

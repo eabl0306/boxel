@@ -27,8 +27,8 @@ use crate::{
 use boxel_ecs::prelude::*;
 use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, Mesher};
 use boxel_voxel::{
-    BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, Face, LocalPos, NEIGHBOR_OFFSETS,
-    RenderShape, neighbor_index,
+    BlockRegistry, BlockState, ChunkData, ChunkPos, Face, LocalPos, NEIGHBOR_OFFSETS, RenderShape,
+    neighbor_index,
 };
 use crossbeam_channel::{Receiver, Sender};
 use std::cell::RefCell;
@@ -524,7 +524,7 @@ impl WorldJobs {
             viewers,
             settings.unload_hysteresis,
             settings.vertical_bounds.as_ref(),
-            || map.slots.values().map(|s| s.key.pos).collect(),
+            || map.slots.values().map(|s| s.pos).collect(),
         );
         if let Some(drift) = drift {
             self.scheduler.invalidate_priorities(drift);
@@ -537,8 +537,7 @@ impl WorldJobs {
                 .capacity_hint()
                 .saturating_mul(2)
                 .saturating_sub(cx.map.slots.len());
-            cx.map.slots.reserve(room);
-            cx.map.index.reserve(room);
+            cx.map.reserve(room);
         }
         if bounds_changed {
             self.refresh_neighbor_bits(cx);
@@ -551,7 +550,7 @@ impl WorldJobs {
     fn refresh_neighbor_bits(&mut self, cx: &mut Ctx<'_>) {
         let ids: Vec<ChunkId> = cx.map.slots.keys().collect();
         for id in ids {
-            let pos = cx.map.slots[id].key.pos;
+            let pos = cx.map.slots[id].pos;
             let bits = own_neighbor_bits(cx.map, &self.planner, pos);
             let slot = &mut cx.map.slots[id];
             if slot.neighbors_ready == bits {
@@ -629,8 +628,8 @@ impl WorldJobs {
     ) -> Step {
         let level = self.planner.level(pos);
         let want = level.interest();
-        match cx.map.index.get(&pos) {
-            Some(&id) => {
+        match cx.map.id_at(pos) {
+            Some(id) => {
                 let slot = &cx.map.slots[id];
                 let pinned = slot.interest & Interest::PINNED;
                 if want.is_empty()
@@ -670,11 +669,9 @@ impl WorldJobs {
             None => own_neighbor_bits(cx.map, &self.planner, pos),
         };
         let slot = ChunkSlot {
-            key: ChunkKey {
-                dim: settings.dimension,
-                lod: 0,
-                pos,
-            },
+            pos,
+            dim: settings.dimension,
+            lod: 0,
             data: DataState::Queued,
             mesh: MeshState::None,
             interest: Interest::empty(),
@@ -717,7 +714,7 @@ impl WorldJobs {
                 }
             }
             (false, true) => {
-                let priority = self.priority(slot.key.pos);
+                let priority = self.priority(slot.pos);
                 match &slot.mesh {
                     MeshState::None => {
                         cx.map.set_mesh(id, MeshState::Queued);
@@ -757,12 +754,15 @@ impl WorldJobs {
         slot.cancel.store(true, Ordering::Relaxed);
         self.failure_logged.remove(&id);
         if self.published.remove(&id) {
-            cx.events.push(ChunkMeshEvent::Remove { id, key: slot.key });
+            cx.events.push(ChunkMeshEvent::Remove {
+                id,
+                key: slot.key(),
+            });
         }
-        let outside = !self.planner.in_bounds(slot.key.pos.y);
+        let outside = !self.planner.in_bounds(slot.pos.y);
         for (i, offset) in NEIGHBOR_OFFSETS.iter().enumerate() {
-            let npos = slot.key.pos.offset(*offset);
-            let Some(&n) = cx.map.index.get(&npos) else {
+            let npos = slot.pos.offset(*offset);
+            let Some(n) = cx.map.id_at(npos) else {
                 continue;
             };
             let neighbor = &mut cx.map.slots[n];
@@ -830,7 +830,7 @@ impl WorldJobs {
     /// `Remove` if the slot's mesh was published (its state is left as is).
     fn unpublish(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
         if self.published.remove(&id) {
-            let key = cx.map.slots[id].key;
+            let key = cx.map.slots[id].key();
             cx.events.push(ChunkMeshEvent::Remove { id, key });
         }
     }
@@ -850,7 +850,7 @@ impl WorldJobs {
     /// The slot's data became `Ready` or `Missing`: refresh its own neighbor bits, set its bit in
     /// the 26 neighbors and schedule every mesh that became possible.
     fn data_available(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
-        let pos = cx.map.slots[id].key.pos;
+        let pos = cx.map.slots[id].pos;
         let near = neighbor_ids(cx.map, pos);
         self.data_available_near(cx, id, pos, &near);
     }
@@ -1025,7 +1025,7 @@ impl WorldJobs {
         if !matches!(slot.data, DataState::Queued) {
             return false;
         }
-        let (key, cancel) = (slot.key, Arc::clone(&slot.cancel));
+        let (key, cancel) = (slot.key(), Arc::clone(&slot.cancel));
         cx.map.set_data(id, DataState::Generating);
         let generator = Arc::clone(&cx.content.generator);
         let registry = Arc::clone(&cx.content.registry);
@@ -1057,7 +1057,7 @@ impl WorldJobs {
         let DataState::Ready(center) = &slot.data else {
             return false;
         };
-        let pos = slot.key.pos;
+        let pos = slot.pos;
         let registry = &cx.content.registry;
         if is_uniform_empty(center, registry) {
             self.set_mesh_empty(cx, id);
@@ -1187,7 +1187,7 @@ impl WorldJobs {
             return;
         };
         if self.failure_logged.insert(id) {
-            tracing::error!(chunk = ?slot.key.pos, ?kind, "chunk job failed: {panic}");
+            tracing::error!(chunk = ?slot.pos, ?kind, "chunk job failed: {panic}");
         }
         match kind {
             JobKind::Generate => {
@@ -1203,7 +1203,7 @@ impl WorldJobs {
                 }
                 if slot.remesh_pending {
                     // The data changed meanwhile: try again with the new data.
-                    let priority = self.priority(slot.key.pos);
+                    let priority = self.priority(slot.pos);
                     cx.map.set_mesh_and_pending(id, MeshState::Queued, false);
                     self.schedule_mesh(cx, id, priority);
                 } else {
@@ -1243,7 +1243,7 @@ impl WorldJobs {
             && current_version == Some(result.data_version)
             && slot.epoch == result.epoch;
         if !fresh {
-            let priority = self.priority(slot.key.pos);
+            let priority = self.priority(slot.pos);
             cx.map.set_mesh_and_pending(id, MeshState::Queued, false);
             self.schedule_mesh(cx, id, priority);
             return;
@@ -1252,7 +1252,7 @@ impl WorldJobs {
             self.set_mesh_empty(cx, id);
             return;
         }
-        let key = slot.key;
+        let key = slot.key();
         let mesh = Arc::new(result.mesh);
         cx.map.set_mesh(
             id,
@@ -1274,7 +1274,7 @@ fn current_priority(map: &ChunkMap, planner: &Planner, id: ChunkId, kind: JobKin
         JobKind::Generate => matches!(slot.data, DataState::Queued),
         JobKind::Mesh => matches!(slot.mesh, MeshState::Queued),
     };
-    queued.then(|| planner.priority(slot.key.pos))
+    queued.then(|| planner.priority(slot.pos))
 }
 
 /// The slots of the 26 neighbors of `pos`, in [`NEIGHBOR_OFFSETS`] order (one lookup each).
