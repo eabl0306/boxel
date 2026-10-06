@@ -1,11 +1,13 @@
 //! The sky walk against a brute-force scan of the generated chunks, voxel by voxel, for the
 //! overworld (with trees and a cave entrance), forest, flat and terrain generators, near the
-//! origin and at x = z = 2^40; the limit cap; `i64::MIN` for open columns; and the column
-//! rescan after an edit.
-use boxel_light::sky_tile::{DEFAULT_WALK_LIMIT, generator_top_voxel, walk};
+//! origin and at x = z = 2^40; the limit cap; `i64::MIN` for open columns; the column rescan
+//! after an edit; an edit far above the generator changes only its own column (the floor is
+//! the world's); tiles without a floor; and generators without a top.
+use boxel_light::sky_tile::{DEFAULT_WALK_LIMIT, GeneratorTop, walk, walk_floor};
 use boxel_light::{LayerData, Rescan, SkyTile};
 use boxel_voxel::{
     BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, LightTables, LocalPos,
+    MAX_BLOCK_COORD, MAX_CHUNK_COORD,
 };
 use boxel_worldgen::{
     FlatGenerator, ForestGenerator, OverworldGenerator, TerrainGenerator, WorldGenerator,
@@ -91,8 +93,8 @@ fn walk_generated(
     limit: u32,
 ) -> SkyTile {
     let range = generator.vertical_chunks();
-    let top = generator_top_voxel(&range).expect("bounded generator");
-    walk(top, limit, tables, |cy| {
+    let top = GeneratorTop::of(&range).voxel().expect("bounded generator");
+    walk(top, walk_floor(top, limit), tables, |cy| {
         if cy < *range.start() {
             LayerData::Void
         } else if cy > *range.end() {
@@ -108,7 +110,9 @@ fn check(generator: &dyn WorldGenerator, column: (i64, i64), limit: u32) -> SkyT
     let registry = BlockRegistry::default_blocks();
     let tables = LightTables::from_registry(&registry);
     let tile = walk_generated(generator, &registry, &tables, column, limit);
-    let top = generator_top_voxel(&generator.vertical_chunks()).unwrap();
+    let top = GeneratorTop::of(&generator.vertical_chunks())
+        .voxel()
+        .unwrap();
     let want =
         Column::new(generator, &registry, column.0, column.1).brute_force(&tables, top, limit);
     for (i, (&got, &want)) in tile.tops().iter().zip(&want).enumerate() {
@@ -207,7 +211,10 @@ fn open_columns_reach_the_void() {
     assert_eq!((tile.min(), tile.max()), (i64::MIN, i64::MIN));
     // A flat world without layers has nothing to walk.
     let empty = FlatGenerator::new(Vec::new());
-    assert_eq!(generator_top_voxel(&empty.vertical_chunks()), None);
+    assert_eq!(
+        GeneratorTop::of(&empty.vertical_chunks()),
+        GeneratorTop::Empty
+    );
 }
 
 #[test]
@@ -227,7 +234,7 @@ fn rescan_after_removing_a_top() {
         0 => LayerData::Ref(&lower),
         _ => LayerData::Void,
     };
-    let mut tile = walk(63, DEFAULT_WALK_LIMIT, &tables, layers);
+    let mut tile = walk(63, walk_floor(63, DEFAULT_WALK_LIMIT), &tables, layers);
     assert_eq!(tile.top(3, 4), 40);
     assert_eq!(tile.top(0, 0), i64::MIN);
     assert_eq!((tile.min(), tile.max()), (i64::MIN, 40));
@@ -263,5 +270,135 @@ fn rescan_after_removing_a_top() {
     assert_eq!(
         (tile.top(3, 4), tile.max(), tile.min()),
         (5000, 5000, i64::MIN)
+    );
+}
+
+#[test]
+fn an_edit_far_above_changes_only_its_column() {
+    let g = OverworldGenerator::default();
+    let registry = BlockRegistry::default_blocks();
+    let tables = LightTables::from_registry(&registry);
+    let stone = registry.by_name("boxel:stone").unwrap();
+    let range = g.vertical_chunks();
+    let top = GeneratorTop::of(&range).voxel().unwrap();
+    let floor = walk_floor(top, DEFAULT_WALK_LIMIT);
+    let (cx, cz) = (2, -1);
+    // A platform block 5000 voxels above the generator's top, over local column (3, 4).
+    let y = top + 5000;
+    let mut platform = ChunkData::uniform(BlockState::AIR);
+    platform.set(LocalPos::new(3, (y & 31) as u32, 4), stone);
+    let layer = |cy: i64, edited: bool| {
+        if edited && cy == y >> 5 {
+            LayerData::Ref(&platform)
+        } else if cy > *range.end() {
+            LayerData::Air
+        } else {
+            LayerData::Owned(g.generate(ChunkKey::new(ChunkPos::new(cx, cy, cz)), &registry))
+        }
+    };
+    let plain = walk(top, floor, &tables, |cy| layer(cy, false));
+    // A fresh walk of the edited content starts at the platform, with the same floor.
+    let fresh = walk(y, floor, &tables, |cy| layer(cy, true));
+    assert_eq!(fresh.floor(), plain.floor());
+    assert_eq!(fresh.top(3, 4), y);
+    let edited = (3 << 5) | 4;
+    for (i, (&got, &want)) in fresh.tops().iter().zip(plain.tops()).enumerate() {
+        if i != edited {
+            assert_eq!(got, want, "local ({}, {})", i >> 5, i & 31);
+        }
+    }
+    // The edit applied to the plain tile gives the same tile.
+    let mut incremental = plain.clone();
+    assert!(incremental.raise(3, 4, y));
+    assert_eq!(incremental.tops(), fresh.tops());
+    assert_eq!(
+        (incremental.min(), incremental.max()),
+        (fresh.min(), fresh.max())
+    );
+    // Removing it: the rescan finds what the plain walk found.
+    let mut removed = fresh.clone();
+    let rescan = removed.rescan_column(3, 4, y - 1, &tables, |cy| Some(layer(cy, false)));
+    assert_eq!(rescan, Rescan::Found(plain.top(3, 4)));
+    assert_eq!(removed.tops(), plain.tops());
+    assert_eq!((removed.min(), removed.max()), (plain.min(), plain.max()));
+}
+
+#[test]
+fn tiles_without_a_floor_rescan_and_walk_to_the_world_bottom() {
+    let registry = BlockRegistry::default_blocks();
+    let tables = LightTables::from_registry(&registry);
+    let stone = registry.by_name("boxel:stone").unwrap();
+    // A hand-made tile without a floor, in a positive layer: the top of column (1, 2) at
+    // y = 100 (layer 3) is removed, a stone remains at y = 97.
+    let mut tile = SkyTile::uniform(100, i64::MIN);
+    let mut chunk = ChunkData::uniform(BlockState::AIR);
+    chunk.set(LocalPos::new(1, 97 - 96, 2), stone);
+    let rescan = tile.rescan_column(1, 2, 99, &tables, |cy| {
+        Some(if cy == 3 {
+            LayerData::Ref(&chunk)
+        } else {
+            LayerData::Void
+        })
+    });
+    assert_eq!(rescan, Rescan::Found(97));
+    // Near the bottom of the world, air layers end at the world limit: open forever.
+    let bottom = -MAX_BLOCK_COORD;
+    let mut deep = SkyTile::uniform(bottom + 40, i64::MIN);
+    let mut layers = 0;
+    let rescan = deep.rescan_column(0, 0, bottom + 39, &tables, |_| {
+        layers += 1;
+        Some(LayerData::Air)
+    });
+    assert_eq!(rescan, Rescan::Found(i64::MIN));
+    assert_eq!(layers, 2);
+    let walked = walk(bottom + 40, i64::MIN, &tables, |cy| {
+        assert!(cy >= -MAX_CHUNK_COORD);
+        LayerData::Air
+    });
+    assert_eq!((walked.min(), walked.max()), (i64::MIN, i64::MIN));
+    // A start below the floor reads nothing: every column at the floor.
+    let low = walk(10, 50, &tables, |_| {
+        unreachable!("no layer above the floor")
+    });
+    assert_eq!((low.min(), low.max(), low.floor()), (50, 50, 50));
+}
+
+/// A generator that keeps the trait's default range (`i64::MIN..=i64::MAX`).
+struct Unbounded;
+
+impl WorldGenerator for Unbounded {
+    fn generate(&self, _: ChunkKey, _: &BlockRegistry) -> ChunkData {
+        ChunkData::uniform(BlockState::AIR)
+    }
+    fn name(&self) -> &str {
+        "unbounded"
+    }
+}
+
+#[test]
+fn generator_tops() {
+    assert_eq!(
+        GeneratorTop::of(&Unbounded.vertical_chunks()),
+        GeneratorTop::Unbounded
+    );
+    assert_eq!(GeneratorTop::Unbounded.voxel(), None);
+    assert_eq!(
+        GeneratorTop::of(&(0..=MAX_CHUNK_COORD + 1)),
+        GeneratorTop::Unbounded
+    );
+    assert_eq!(
+        GeneratorTop::of(&(0..=MAX_CHUNK_COORD)),
+        GeneratorTop::Voxel(MAX_BLOCK_COORD + 31)
+    );
+    assert_eq!(
+        GeneratorTop::of(&(i64::MIN..=-MAX_CHUNK_COORD - 1)),
+        GeneratorTop::Empty
+    );
+    assert_eq!(GeneratorTop::of(&(i64::MIN..=2)).voxel(), Some(95));
+    let overworld = OverworldGenerator::default();
+    assert!(
+        GeneratorTop::of(&overworld.vertical_chunks())
+            .voxel()
+            .is_some()
     );
 }

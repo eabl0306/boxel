@@ -2,8 +2,8 @@
 //!
 //! Light is derived data: a pure function of the blocks and of one sky top per column, computed
 //! by `boxel_light` and never stored in [`ChunkData`](crate::ChunkData). This module holds the
-//! value format and the registry lookups that the computation and the chunk mask cache
-//! ([`ChunkMasks`](crate::ChunkMasks)) need.
+//! value format and the registry lookups that the computation and the chunk light masks
+//! ([`LightMasks`](crate::LightMasks)) need.
 //!
 //! The rules, all integer:
 //! - Opacity 15 is opaque (light stops), 0 is clear (air, glass), 1..=14 is partial (leaves and
@@ -115,13 +115,13 @@ impl LightValue {
 pub(crate) const CLASS_OPAQUE: u8 = 1;
 /// Class bit: opacity 1..=14.
 pub(crate) const CLASS_PARTIAL: u8 = 1 << 1;
-/// Class bit: collides (`BlockDef::solid`).
-pub(crate) const CLASS_SOLID: u8 = 1 << 2;
 /// Class bit: emits light.
-pub(crate) const CLASS_EMITS: u8 = 1 << 3;
+pub(crate) const CLASS_EMITS: u8 = 1 << 2;
 
 /// Per-state light lookups, built once from a frozen [`BlockRegistry`] (`SoA`, indexed by
-/// `BlockState.0`). States outside the registry read as air: opacity 0, no emission, not solid.
+/// `BlockState.0`). States outside the registry read as air: opacity 0, no emission.
+///
+/// Light only: collision is not here (the physics derives it from `StateFlags::SOLID`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LightTables {
     opacity: Vec<u8>,
@@ -147,9 +147,6 @@ impl LightTables {
                     c |= CLASS_OPAQUE;
                 } else if opacity[i] > 0 {
                     c |= CLASS_PARTIAL;
-                }
-                if registry.flags(s).contains(crate::StateFlags::SOLID) {
-                    c |= CLASS_SOLID;
                 }
                 if !emission[i].is_dark() {
                     c |= CLASS_EMITS;
@@ -215,11 +212,6 @@ impl LightTables {
     #[inline]
     pub fn is_opaque(&self, s: BlockState) -> bool {
         self.class(s) & CLASS_OPAQUE != 0
-    }
-    /// True if `s` collides (`BlockDef::solid`).
-    #[inline]
-    pub fn is_solid(&self, s: BlockState) -> bool {
-        self.class(s) & CLASS_SOLID != 0
     }
     /// True if `s` emits light.
     #[inline]

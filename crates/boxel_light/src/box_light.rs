@@ -9,11 +9,13 @@
 //! holds, so no chunk ever reads another chunk's light.
 //!
 //! **Steps** ([`compute`]):
-//! 1. Fast paths, from the palettes and the tiles' bounds alone: no emitter and the box under
-//!    every sky top is uniformly dark ([`LightPath::FastDark`]); no emitter and the padded
-//!    chunk above every sky top is uniformly open sky ([`LightPath::FastOpen`]).
+//! 1. Emitters inside the box, from the chunks whose palette may emit (the others are skipped
+//!    without reading a voxel). Fast paths, from that and the tiles' bounds alone: no emitter
+//!    and the box under every sky top is uniformly dark ([`LightPath::FastDark`]); no emitter
+//!    and the padded chunk above every sky top is uniformly open sky ([`LightPath::FastOpen`]).
+//!    A lamp that is gone but still in a palette, or one outside the box, does not block them.
 //! 2. Opaque (and, when some state has opacity 2..=14, partial) z-row masks of the box, from
-//!    the 27 cached [`ChunkMasks`].
+//!    the 27 chunks' [`LightMasks`].
 //! 3. Sky: the direct voxels (above the top of their column) as row masks, built from the 9
 //!    tiles; seeds are the open non-direct voxels next to a direct one, at `15 - cost`; then a
 //!    flood into open non-direct voxels.
@@ -29,7 +31,7 @@
 //! result is the same at any position up to the world limit.
 use crate::SkyTile;
 use crate::padded::{PADDED, PaddedLight, new_full};
-use boxel_voxel::{ChunkData, ChunkMasks, ChunkPos, LightTables, LightValue, LocalPos, Occupancy};
+use boxel_voxel::{ChunkData, ChunkPos, LightMasks, LightTables, LightValue, LocalPos, MaskRows};
 
 /// Box edge in voxels: the chunk plus [`MARGIN`] on each side.
 pub const BOX: usize = 64;
@@ -125,9 +127,16 @@ pub struct LightScratch {
     buckets: [Vec<u32>; 16],
     /// Emitters inside the box: box index and emission.
     emitters: Vec<(u32, LightValue)>,
-    /// A spare padded buffer, so a uniform result does not drop the allocation.
-    spare: Option<Box<[u16; crate::PADDED_VOLUME]>>,
+    /// Spare padded buffers (at most [`MAX_SPARES`]: the one `out` gives back and the one a
+    /// uniform result did not keep), so alternating uniform and full results never allocate.
+    spares: Vec<Box<[u16; crate::PADDED_VOLUME]>>,
+    /// Padded buffers allocated so far.
+    #[cfg(test)]
+    allocations: usize,
 }
+
+/// Spare padded buffers kept by [`LightScratch`].
+const MAX_SPARES: usize = 2;
 
 impl Default for LightScratch {
     fn default() -> Self {
@@ -161,8 +170,28 @@ impl LightScratch {
             touched: [0; ROW_WORDS],
             buckets: Default::default(),
             emitters: Vec::new(),
-            spare: None,
+            spares: Vec::with_capacity(MAX_SPARES),
+            #[cfg(test)]
+            allocations: 0,
         }
+    }
+
+    /// Keeps `values` as a spare if there is room.
+    fn keep_spare(&mut self, values: Box<[u16; crate::PADDED_VOLUME]>) {
+        if self.spares.len() < MAX_SPARES {
+            self.spares.push(values);
+        }
+    }
+
+    /// A spare padded buffer, or a new one.
+    fn take_spare(&mut self) -> Box<[u16; crate::PADDED_VOLUME]> {
+        self.spares.pop().unwrap_or_else(|| {
+            #[cfg(test)]
+            {
+                self.allocations += 1;
+            }
+            new_full()
+        })
     }
 }
 
@@ -222,7 +251,8 @@ fn run(
     let origin_y = input.origin.origin().y;
     let tables = input.tables;
     let sky = classify(&input.sky, origin_y);
-    let emits = input.chunks.iter().flatten().any(|c| c.may_emit(tables));
+    let any_emission = box_emitters(input, &mut scratch.emitters);
+    let emits = !scratch.emitters.is_empty();
     if !force_full && !emits {
         match sky {
             Sky::Dark => {
@@ -236,12 +266,13 @@ fn run(
             Sky::Mixed => {}
         }
     }
-    let masks: [&ChunkMasks; 27] =
-        std::array::from_fn(|i| input.chunks[i].map_or(ChunkMasks::empty(), |c| c.masks(tables)));
+    let masks: [LightMasks<'_>; 27] = std::array::from_fn(|i| {
+        input.chunks[i].map_or(LightMasks::EMPTY, |c| c.light_masks(tables))
+    });
     let heavy = tables.max_partial_opacity() > 1;
-    gather_rows(&masks, |m| &m.opaque, &mut scratch.opaque);
+    gather_rows(&masks.map(|m| m.opaque), &mut scratch.opaque);
     if heavy {
-        gather_rows(&masks, |m| &m.partial, &mut scratch.partial);
+        gather_rows(&masks.map(|m| m.partial), &mut scratch.partial);
     }
     let cost_of = |bi: usize| opacity_cost(input, bi);
     let sky = match (force_full, &input.sky) {
@@ -263,8 +294,8 @@ fn run(
     }
     let block_pops = match (emits, heavy) {
         (false, _) => 0,
-        (true, true) => block_flood::<true>(input, &masks, scratch, &cost_of),
-        (true, false) => block_flood::<false>(input, &masks, scratch, &cost_of),
+        (true, true) => block_flood::<true>(any_emission, scratch, &cost_of),
+        (true, false) => block_flood::<false>(any_emission, scratch, &cost_of),
     };
     extract(scratch, out);
     // Reset the touched rows.
@@ -282,13 +313,33 @@ fn run(
     }
 }
 
-/// `out = Uniform(v)`, keeping a `Full` buffer as the spare.
+/// `out = Uniform(v)`, keeping a `Full` buffer as a spare.
 fn set_uniform(out: &mut PaddedLight, scratch: &mut LightScratch, v: LightValue) {
-    if let PaddedLight::Full(values) = std::mem::replace(out, PaddedLight::Uniform(v))
-        && scratch.spare.is_none()
-    {
-        scratch.spare = Some(values);
+    if let PaddedLight::Full(values) = std::mem::replace(out, PaddedLight::Uniform(v)) {
+        scratch.keep_spare(values);
     }
+}
+
+/// Collects the emitters inside the box into `emitters` (box index and emission) from the
+/// chunks whose palette may emit; returns the OR of their emissions.
+fn box_emitters(input: &LightInput<'_>, emitters: &mut Vec<(u32, LightValue)>) -> u16 {
+    emitters.clear();
+    let mut any = 0u16;
+    for (ci, chunk) in input.chunks.iter().enumerate() {
+        let Some(chunk) = chunk.filter(|c| c.may_emit(input.tables)) else {
+            continue;
+        };
+        let (dy, dx, dz) = (ci as i32 / 9 - 1, ci as i32 / 3 % 3 - 1, ci as i32 % 3 - 1);
+        for &(p, e) in chunk.light_masks(input.tables).emitters {
+            let b = |d: i32, l: u32| d * 32 + l as i32 + MARGIN as i32;
+            let (bx, by, bz) = (b(dx, p.x()), b(dy, p.y()), b(dz, p.z()));
+            if [bx, by, bz].iter().all(|v| (0..BOX as i32).contains(v)) {
+                emitters.push((((by << 12) | (bx << 6) | bz) as u32, e));
+                any |= e.0;
+            }
+        }
+    }
+    any
 }
 
 /// Box coordinate (`0..64`) to chunk offset (`-1..=1`) and local coordinate (`0..32`).
@@ -301,17 +352,13 @@ fn split(b: usize) -> (i32, usize) {
 /// Fills the z-row masks of the box from one mask of each chunk: box z `0..16` is the
 /// `dz = -1` chunk's local `16..32`, `16..48` the center's `0..32`, `48..64` the `dz = 1`
 /// chunk's `0..16`.
-fn gather_rows(
-    masks: &[&ChunkMasks; 27],
-    pick: impl Fn(&ChunkMasks) -> &Occupancy,
-    rows: &mut BoxRows,
-) {
+fn gather_rows(masks: &[MaskRows<'_>; 27], rows: &mut BoxRows) {
     for by in 0..BOX {
         let (dy, ly) = split(by);
         for bx in 0..BOX {
             let (dx, lx) = split(bx);
             let w = ly * 32 + lx;
-            let word = |dz| pick(masks[chunk_index(dx, dy, dz)])[w];
+            let word = |dz| masks[chunk_index(dx, dy, dz)].row(w);
             rows[(by << 6) | bx] = u64::from(word(-1) >> 16)
                 | (u64::from(word(0)) << 16)
                 | (u64::from(word(1) & 0xFFFF) << 48);
@@ -443,10 +490,10 @@ fn sky_flood<const HEAVY: bool>(
     )
 }
 
-/// Seeds the emitters inside the box and floods each channel present.
+/// Seeds the emitters inside the box (collected by [`box_emitters`]; `any` is the OR of their
+/// emissions) and floods each channel present.
 fn block_flood<const HEAVY: bool>(
-    input: &LightInput<'_>,
-    masks: &[&ChunkMasks; 27],
+    any: u16,
     scratch: &mut LightScratch,
     cost_of: &impl Fn(usize) -> u16,
 ) -> u32 {
@@ -459,22 +506,6 @@ fn block_flood<const HEAVY: bool>(
         emitters,
         ..
     } = scratch;
-    emitters.clear();
-    let mut any = 0u16;
-    for (ci, chunk) in input.chunks.iter().enumerate() {
-        if !chunk.is_some_and(|c| c.may_emit(input.tables)) {
-            continue;
-        }
-        let (dy, dx, dz) = (ci as i32 / 9 - 1, ci as i32 / 3 % 3 - 1, ci as i32 % 3 - 1);
-        for &(p, e) in &masks[ci].emitters {
-            let b = |d: i32, l: u32| d * 32 + l as i32 + MARGIN as i32;
-            let (bx, by, bz) = (b(dx, p.x()), b(dy, p.y()), b(dz, p.z()));
-            if [bx, by, bz].iter().all(|v| (0..BOX as i32).contains(v)) {
-                emitters.push((((by << 12) | (bx << 6) | bz) as u32, e));
-                any |= e.0;
-            }
-        }
-    }
     let mut pops = 0;
     for shift in LightValue::BLOCK_SHIFTS {
         if (any >> shift) & 15 == 0 {
@@ -557,7 +588,7 @@ fn flood<const HEAVY: bool>(
 /// Copies the padded region out of the box into `out` (direct voxels get sky 15); a uniform
 /// result becomes `Uniform`.
 fn extract(scratch: &mut LightScratch, out: &mut PaddedLight) {
-    let mut values = scratch.spare.take().unwrap_or_else(new_full);
+    let mut values = scratch.take_spare();
     for py in 0..PADDED {
         let by = py + PADDED_START;
         for px in 0..PADDED {
@@ -581,9 +612,50 @@ fn extract(scratch: &mut LightScratch, out: &mut PaddedLight) {
     }
     let first = values[0];
     if values.iter().all(|&v| v == first) {
-        scratch.spare = Some(values);
+        scratch.keep_spare(values);
         set_uniform(out, scratch, LightValue(first));
     } else if let PaddedLight::Full(old) = std::mem::replace(out, PaddedLight::Full(values)) {
-        scratch.spare = Some(old);
+        scratch.keep_spare(old);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boxel_voxel::{BlockRegistry, BlockState};
+
+    fn input<'a>(air: &'a ChunkData, tile: &'a SkyTile, tables: &'a LightTables) -> LightInput<'a> {
+        LightInput {
+            origin: ChunkPos::new(0, 0, 0),
+            chunks: [Some(air); 27],
+            sky: SkyInput::Tiles([tile; 9]),
+            tables,
+        }
+    }
+
+    #[test]
+    fn alternating_results_reuse_two_padded_buffers() {
+        let tables = LightTables::from_registry(&BlockRegistry::default_blocks());
+        let air = ChunkData::uniform(BlockState::AIR);
+        // Sky tops 10 voxels into the chunk (a full result) and far above it (uniform dark).
+        let mixed = SkyTile::uniform(10, i64::MIN);
+        let roof = SkyTile::uniform(1000, i64::MIN);
+        let mut scratch = LightScratch::new();
+        let mut out = PaddedLight::default();
+        for i in 0..6 {
+            compute_full(&input(&air, &mixed, &tables), &mut scratch, &mut out);
+            assert!(out.as_uniform().is_none());
+            // Uniform from a flood (extract) and from the fast path (set_uniform), in turn.
+            let dark = input(&air, &roof, &tables);
+            let path = if i % 2 == 0 {
+                compute_full(&dark, &mut scratch, &mut out)
+            } else {
+                compute(&dark, &mut scratch, &mut out)
+            };
+            assert_eq!(path == LightPath::FastDark, i % 2 == 1);
+            assert_eq!(out.as_uniform(), Some(LightValue::DARK));
+        }
+        assert_eq!(scratch.allocations, 2);
+        assert!(scratch.spares.len() <= MAX_SPARES);
     }
 }

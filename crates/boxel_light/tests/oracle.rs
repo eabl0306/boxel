@@ -1,12 +1,22 @@
 //! The light box against the global solution: in random 5x5x5-chunk worlds (opacity 0, 1, 5
-//! and 15, RGB emitters opaque and clear, sky tops from the blocks, roofs far above, tops below
-//! the world and `i64::MIN`), every chunk of the inner 3x3x3 gets the padded light of the
-//! scalar global solver, bit for bit, with and without the fast paths.
+//! and 15, RGB emitters opaque and clear, sky tops from the blocks, roofs far above, caps over
+//! air inside the world, tops below the world and `i64::MIN`), every chunk of the inner 3x3x3
+//! gets the padded light of the scalar global solver, bit for bit, with and without the fast
+//! paths. End to end on generated content: tiles from the walk feed the box and match the
+//! oracle with brute-force tops capped at the walk floor.
 mod common;
 
+use boxel_light::box_light::{chunk_index, tile_index};
 use boxel_light::oracle::OracleWorld;
-use boxel_light::{LightPath, LightScratch, PaddedLight, SkyInput, SkyTile, compute, compute_full};
-use boxel_voxel::{ChunkData, ChunkPos, LightTables, LightValue, LocalPos};
+use boxel_light::sky_tile::{DEFAULT_WALK_LIMIT, GeneratorTop, walk, walk_floor};
+use boxel_light::{
+    LayerData, LightInput, LightPath, LightScratch, PaddedLight, SkyInput, SkyTile, compute,
+    compute_full,
+};
+use boxel_voxel::{
+    BlockRegistry, ChunkData, ChunkKey, ChunkPos, LightTables, LightValue, LocalPos,
+};
+use boxel_worldgen::{OverworldGenerator, WorldGenerator};
 use common::{Blocks, World, random_world, test_registry};
 use proptest::prelude::*;
 
@@ -17,7 +27,9 @@ const N: usize = 5;
 fn first_mismatch(got: &PaddedLight, want: &[LightValue]) -> Option<String> {
     let got = got.to_vec();
     (0..want.len()).find(|&i| got[i] != want[i]).map(|i| {
-        let (y, x, z) = (i / (34 * 34) - 1, i / 34 % 34 - 1, i % 34 - 1);
+        // Signed: the border is local -1.
+        let v = i as i64;
+        let (y, x, z) = (v / (34 * 34) - 1, v / 34 % 34 - 1, v % 34 - 1);
         format!(
             "local ({x}, {y}, {z}): got {:04x}, want {:04x}",
             got[i].0, want[i].0
@@ -129,7 +141,7 @@ fn light_of(
     tables: &LightTables,
 ) -> (PaddedLight, LightPath) {
     let refs: [Option<&ChunkData>; 27] = std::array::from_fn(|i| Some(&chunks[i]));
-    let input = boxel_light::LightInput {
+    let input = LightInput {
         origin: ChunkPos::new(0, 0, 0),
         chunks: refs,
         sky: SkyInput::Tiles(tiles),
@@ -282,4 +294,151 @@ fn missing_chunks_read_as_air_and_below_floor_is_dark() {
     compute(&below, &mut scratch, &mut c);
     assert_eq!(a, c);
     assert!(a.to_vec().iter().all(|v| v.sky() == 0));
+}
+
+#[test]
+fn mismatches_on_the_border_are_reported() {
+    let want = vec![LightValue::DARK; boxel_light::PADDED_VOLUME];
+    let got = PaddedLight::Uniform(LightValue::FULL_SKY);
+    let m = first_mismatch(&got, &want).expect("a mismatch");
+    assert!(m.starts_with("local (-1, -1, -1)"), "{m}");
+}
+
+#[test]
+fn a_removed_lamp_or_one_outside_the_box_keeps_the_fast_paths() {
+    let (registry, b) = test_registry(false);
+    let tables = LightTables::from_registry(&registry);
+    let mut chunks: Vec<ChunkData> = (0..27).map(|_| ChunkData::uniform(b.stone)).collect();
+    // A lamp placed and removed in the center chunk: still in its palette.
+    let center = chunk_index(0, 0, 0);
+    chunks[center].set(LocalPos::new(5, 5, 5), b.lamps[0]);
+    chunks[center].set(LocalPos::new(5, 5, 5), b.stone);
+    assert!(chunks[center].may_emit(&tables));
+    // A lamp in the far half of the +x neighbor: 20 voxels past the chunk, outside the box.
+    let east = chunk_index(1, 0, 0);
+    chunks[east].set(LocalPos::new(20, 16, 16), b.lamps[1]);
+    let roof = SkyTile::uniform(1000, i64::MIN);
+    let (light, path) = light_of(&chunks, [&roof; 9], &tables);
+    assert_eq!(path, LightPath::FastDark);
+    assert_eq!(light, PaddedLight::Uniform(LightValue::DARK));
+    // The same under open sky.
+    let below = SkyTile::uniform(-1000, i64::MIN);
+    let (_, path) = light_of(&chunks, [&below; 9], &tables);
+    assert_eq!(path, LightPath::FastOpen);
+    // A lamp inside the box (local x 10 of the neighbor): the floods run.
+    chunks[east].set(LocalPos::new(10, 16, 16), b.lamps[1]);
+    let (_, path) = light_of(&chunks, [&roof; 9], &tables);
+    assert!(
+        matches!(path, LightPath::Full { block_pops, .. } if block_pops > 0),
+        "{path:?}"
+    );
+}
+
+/// The walk feeding the box on generated content: 3x3 overworld chunk columns, the 5 layers
+/// under the generator's top. Tiles come from `walk`, with a short limit (most surface columns
+/// end at the floor, over air inside the boxes) and the default one; the oracle uses the
+/// brute-force tops of the same content, capped at the floor. The center column's inner
+/// chunks match bit for bit.
+#[test]
+fn walked_tiles_light_generated_content_exactly() {
+    let g = OverworldGenerator::default();
+    let registry = BlockRegistry::default_blocks();
+    let tables = LightTables::from_registry(&registry);
+    let range = g.vertical_chunks();
+    let top = GeneratorTop::of(&range).voxel().unwrap();
+    let ny = 5usize;
+    let center = (3i64, -2i64);
+    let min = ChunkPos::new(center.0 - 1, *range.end() - (ny as i64 - 1), center.1 - 1);
+    let dims = [3, ny, 3];
+    let generate =
+        |x: i64, y: i64, z: i64| g.generate(ChunkKey::new(ChunkPos::new(x, y, z)), &registry);
+    let mut chunks = Vec::with_capacity(9 * ny);
+    for cy in 0..ny as i64 {
+        for cx in 0..3 {
+            for cz in 0..3 {
+                chunks.push(generate(min.x + cx, min.y + cy, min.z + cz));
+            }
+        }
+    }
+    let side = 96usize;
+    let world_bottom = min.origin().y;
+    let mut oracle = OracleWorld::from_chunks(min, dims, &chunks, &tables, vec![0; side * side]);
+    let brute = oracle.brute_force_tops();
+    let mut scratch = LightScratch::new();
+    let mut out = PaddedLight::default();
+    for limit in [40, DEFAULT_WALK_LIMIT] {
+        let floor = walk_floor(top, limit);
+        let tiles: Vec<SkyTile> = (0..9)
+            .map(|i| {
+                let (dx, dz) = (i / 3 - 1, i % 3 - 1);
+                walk(top, floor, &tables, |cy| {
+                    if cy > *range.end() {
+                        LayerData::Air
+                    } else {
+                        LayerData::Owned(generate(center.0 + dx, cy, center.1 + dz))
+                    }
+                })
+            })
+            .collect();
+        oracle.tops = brute.iter().map(|&t| t.max(floor)).collect();
+        // The walk's tops are the capped brute force (or both lie below the world: the same
+        // light inside it).
+        let mut capped = 0;
+        for x in 0..side {
+            for z in 0..side {
+                let (dx, dz) = ((x / 32) as i32 - 1, (z / 32) as i32 - 1);
+                let got = tiles[tile_index(dx, dz)].top((x % 32) as u32, (z % 32) as u32);
+                let want = oracle.tops[x * side + z];
+                assert!(
+                    got == want || (got < world_bottom && want < world_bottom),
+                    "limit {limit}, column ({x}, {z}): walk {got}, brute force {want}"
+                );
+                capped += usize::from(got == floor && brute[x * side + z] < floor);
+            }
+        }
+        if limit == 40 {
+            assert!(capped > 0, "no column capped at the floor");
+            assert!(
+                floor > world_bottom + 32,
+                "the floor lies inside an inner chunk"
+            );
+        }
+        let solution = oracle.solve();
+        let refs: [&SkyTile; 9] = std::array::from_fn(|i| &tiles[i]);
+        let mut sky_pops = 0;
+        for cy in 1..ny - 1 {
+            let mut near = [None; 27];
+            for dy in -1..=1i32 {
+                for dx in -1..=1i32 {
+                    for dz in -1..=1i32 {
+                        let (x, y, z) = (
+                            (1 + dx) as usize,
+                            (cy as i32 + dy) as usize,
+                            (1 + dz) as usize,
+                        );
+                        near[chunk_index(dx, dy, dz)] = Some(&chunks[(y * 3 + x) * 3 + z]);
+                    }
+                }
+            }
+            let input = LightInput {
+                origin: ChunkPos::new(min.x + 1, min.y + cy as i64, min.z + 1),
+                chunks: near,
+                sky: SkyInput::Tiles(refs),
+                tables: &tables,
+            };
+            let want = oracle.padded(&solution, input.origin);
+            let path = compute(&input, &mut scratch, &mut out);
+            if let Some(m) = first_mismatch(&out, &want) {
+                panic!("limit {limit}, chunk {:?} ({path:?}): {m}", input.origin);
+            }
+            if let LightPath::Full { sky_pops: n, .. } = path {
+                sky_pops += n;
+            }
+            compute_full(&input, &mut scratch, &mut out);
+            if let Some(m) = first_mismatch(&out, &want) {
+                panic!("limit {limit}, chunk {:?} (forced full): {m}", input.origin);
+            }
+        }
+        assert!(sky_pops > 0, "limit {limit}: no sky flood");
+    }
 }

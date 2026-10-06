@@ -10,8 +10,9 @@
 //! - [`light`]: the light value format ([`LightValue`]) and the per-state [`LightTables`]. Light
 //!   itself is derived data, computed by `boxel_light`; chunks do not store it.
 //! - [`ChunkData`]: one chunk's immutable snapshot payload (shared as `Arc<ChunkData>`; edits use
-//!   `Arc::make_mut` copy-on-write), with its cached [`ChunkMasks`] (opaque, partial, solid,
-//!   emitters). Voxel arrays never live inline in ECS components.
+//!   `Arc::make_mut` copy-on-write), with its light masks ([`LightMasks`]: opaque, partial,
+//!   emitters; built and cached only when the storage cannot serve them as is). Voxel arrays
+//!   never live inline in ECS components.
 
 pub mod coords;
 pub mod light;
@@ -28,7 +29,7 @@ pub use coords::{
     neighbor_index,
 };
 pub use light::{LightTables, LightValue, MAX_LIGHT, OPAQUE_OPACITY};
-pub use masks::ChunkMasks;
+pub use masks::{LightMasks, MaskRows, MaskWords, OwnedLightMasks};
 pub use registry::{
     BlockDef, BlockRegistry, BlockRegistryBuilder, BlockState, FaceTextures, RegistryError,
     RenderShape, StateFlags, TextureId, TexturePattern, TextureSpec,

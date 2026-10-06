@@ -1,6 +1,7 @@
-//! Light fields of the registry, `LightTables`, and the chunk mask cache: masks equal a brute
-//! force in every storage representation, the cache resets on every change, and `may_emit`
-//! never misses an emitter.
+//! Light fields of the registry, `LightTables`, and the chunk light masks: masks equal a brute
+//! force in every storage representation, uniform and 1-bit chunks without emission are served
+//! from their storage (nothing cached), the cache resets on every change, and `may_emit` never
+//! misses an emitter.
 use boxel_voxel::*;
 use proptest::prelude::*;
 use std::sync::Arc;
@@ -24,7 +25,7 @@ impl Rng {
 const STATES: u16 = 320;
 
 /// A registry whose states cycle through every light class: opacity 0, 1, 7 and 15, solid or
-/// not, and every 5th state emits a color of its own.
+/// not (no effect on the light masks), and every 5th state emits a color of its own.
 fn light_registry() -> BlockRegistry {
     let mut b = BlockRegistryBuilder::new();
     let t = b
@@ -61,11 +62,28 @@ fn light_registry() -> BlockRegistry {
     b.build()
 }
 
+/// Light masks as plain data: opaque, partial, emitters.
+#[derive(Debug, PartialEq, Eq)]
+struct Plain {
+    opaque: Box<Occupancy>,
+    partial: Box<Occupancy>,
+    emitters: Vec<(LocalPos, LightValue)>,
+}
+
+impl Plain {
+    fn of(m: LightMasks<'_>) -> Self {
+        Self {
+            opaque: m.opaque.to_occupancy(),
+            partial: m.partial.to_occupancy(),
+            emitters: m.emitters.to_vec(),
+        }
+    }
+}
+
 /// The masks voxel by voxel, from the public table lookups.
-fn brute_force(chunk: &ChunkData, tables: &LightTables) -> ChunkMasks {
-    let mut opaque = [0u32; 1024];
-    let mut partial = [0u32; 1024];
-    let mut solid = [0u32; 1024];
+fn brute_force(chunk: &ChunkData, tables: &LightTables) -> Plain {
+    let mut opaque = Box::new([0u32; 1024]);
+    let mut partial = Box::new([0u32; 1024]);
     let mut emitters = Vec::new();
     for i in 0..CHUNK_VOLUME {
         let p = LocalPos::from_index(i);
@@ -76,27 +94,28 @@ fn brute_force(chunk: &ChunkData, tables: &LightTables) -> ChunkMasks {
             15 => opaque[word] |= bit,
             _ => partial[word] |= bit,
         }
-        if tables.is_solid(s) {
-            solid[word] |= bit;
-        }
         if !tables.emission(s).is_dark() {
             emitters.push((p, tables.emission(s)));
         }
     }
-    // `ChunkMasks` has a private field; compare through the public ones.
-    let mut out = ChunkMasks::compute(&ChunkData::uniform(BlockState::AIR), tables);
-    out.opaque = opaque;
-    out.partial = partial;
-    out.solid = solid;
-    out.emitters = emitters;
-    *out
+    Plain {
+        opaque,
+        partial,
+        emitters,
+    }
 }
 
-fn assert_masks_eq(got: &ChunkMasks, want: &ChunkMasks, what: &str) {
+fn assert_masks_eq(got: LightMasks<'_>, want: &Plain, what: &str) {
+    let got = Plain::of(got);
     assert!(got.opaque == want.opaque, "{what}: opaque");
     assert!(got.partial == want.partial, "{what}: partial");
-    assert!(got.solid == want.solid, "{what}: solid");
     assert_eq!(got.emitters, want.emitters, "{what}: emitters");
+}
+
+/// True if `chunk` is served from its storage: uniform or 1-bit, with no emitting palette entry
+/// (a palette scan, as `may_emit`).
+fn served_from_storage(chunk: &ChunkData, tables: &LightTables) -> bool {
+    chunk.blocks().bits_per_voxel() <= 1 && !chunk.may_emit(tables)
 }
 
 /// A dense chunk with `k` distinct states below `STATES` in runs of up to `run`.
@@ -143,8 +162,9 @@ proptest! {
             chunk.set(p, BlockState(rng.below(u64::from(STATES)) as u16));
         }
         let want = brute_force(&chunk, &tables);
-        assert_masks_eq(&ChunkMasks::compute(&chunk, &tables), &want, "compute");
-        assert_masks_eq(chunk.masks(&tables), &want, "cached");
+        assert_masks_eq(OwnedLightMasks::compute(&chunk, &tables).view(), &want, "compute");
+        assert_masks_eq(chunk.light_masks(&tables), &want, "chunk");
+        prop_assert_eq!(chunk.has_cached_light_masks(), !served_from_storage(&chunk, &tables));
         // `may_emit` never misses an emitter.
         if !want.emitters.is_empty() {
             prop_assert!(chunk.may_emit(&tables));
@@ -192,11 +212,19 @@ fn masks_of_every_representation() {
         seen.insert(chunk.blocks().bits_per_voxel());
         let want = brute_force(chunk, &tables);
         assert_masks_eq(
-            &ChunkMasks::compute(chunk, &tables),
+            OwnedLightMasks::compute(chunk, &tables).view(),
             &want,
             &format!("chunk {n}"),
         );
-        assert_masks_eq(chunk.masks(&tables), &want, &format!("chunk {n} cached"));
+        let heap = chunk.heap_bytes();
+        assert_masks_eq(
+            chunk.light_masks(&tables),
+            &want,
+            &format!("chunk {n} view"),
+        );
+        let borrowed = served_from_storage(chunk, &tables);
+        assert_eq!(chunk.has_cached_light_masks(), !borrowed, "chunk {n}");
+        assert_eq!(chunk.heap_bytes() == heap, borrowed, "chunk {n}");
         assert!(
             chunk.may_emit(&tables) || want.emitters.is_empty(),
             "chunk {n}"
@@ -206,30 +234,45 @@ fn masks_of_every_representation() {
 }
 
 #[test]
-fn uniform_chunks_share_static_masks() {
+fn uniform_and_one_bit_chunks_need_no_build() {
     let registry = BlockRegistry::default_blocks();
     let tables = LightTables::from_registry(&registry);
     let stone = registry.by_name("boxel:stone").unwrap();
-    let dirt = registry.by_name("boxel:dirt").unwrap();
-    let (a, b) = (ChunkData::uniform(stone), ChunkData::uniform(dirt));
-    assert!(std::ptr::eq(a.masks(&tables), b.masks(&tables)));
-    assert!(!a.has_cached_masks());
-    assert!(std::ptr::eq(
-        ChunkData::default().masks(&tables),
-        ChunkMasks::empty()
-    ));
-    assert!(a.masks(&tables).opaque.iter().all(|&w| w == u32::MAX));
-    assert!(a.masks(&tables).solid.iter().all(|&w| w == u32::MAX));
+    let full = |m: MaskRows<'_>| m.count() == CHUNK_VOLUME as u32;
+    let a = ChunkData::uniform(stone);
+    assert!(full(a.light_masks(&tables).opaque));
+    assert_eq!(a.light_masks(&tables).partial.count(), 0);
+    assert!(!a.has_cached_light_masks());
+    assert_eq!(ChunkData::default().light_masks(&tables).opaque.count(), 0);
+    assert_eq!(LightMasks::EMPTY.opaque.count(), 0);
     let leaves = ChunkData::uniform(registry.by_name("boxel:leaves").unwrap());
-    assert!(leaves.masks(&tables).partial.iter().all(|&w| w == u32::MAX));
-    let water = ChunkData::uniform(registry.by_name("boxel:water").unwrap());
-    assert!(water.masks(&tables).solid.iter().all(|&w| w == 0));
+    assert!(full(leaves.light_masks(&tables).partial));
+    assert_eq!(leaves.light_masks(&tables).opaque.count(), 0);
+    // A 1-bit cave chunk (stone and air, both palette orders) reads its packed words.
+    let mask: Box<Occupancy> = Box::new(std::array::from_fn(|i| {
+        (i as u32).wrapping_mul(0x9E37_79B9) | 1
+    }));
+    for (set, clear) in [(stone, BlockState::AIR), (BlockState::AIR, stone)] {
+        let cave = ChunkData::from_occupancy(&mask, set, clear);
+        assert_eq!(cave.blocks().bits_per_voxel(), 1);
+        let heap = cave.heap_bytes();
+        let m = cave.light_masks(&tables);
+        let want = if set == stone {
+            mask.clone()
+        } else {
+            Box::new(mask.map(|w| !w))
+        };
+        assert!(m.opaque.to_occupancy() == want);
+        assert_eq!(m.partial.count(), 0);
+        assert!(!cave.has_cached_light_masks());
+        assert_eq!(cave.heap_bytes(), heap);
+    }
     // An emitting uniform chunk lists every voxel and is cached.
     let lit = light_registry();
     let lit_tables = LightTables::from_registry(&lit);
     let lamp = ChunkData::uniform(BlockState(5));
-    assert_eq!(lamp.masks(&lit_tables).emitters.len(), CHUNK_VOLUME);
-    assert!(lamp.has_cached_masks());
+    assert_eq!(lamp.light_masks(&lit_tables).emitters.len(), CHUNK_VOLUME);
+    assert!(lamp.has_cached_light_masks());
 }
 
 #[test]
@@ -237,56 +280,62 @@ fn cache_resets_after_set_and_make_mut() {
     let registry = BlockRegistry::default_blocks();
     let tables = LightTables::from_registry(&registry);
     let stone = registry.by_name("boxel:stone").unwrap();
+    let dirt = registry.by_name("boxel:dirt").unwrap();
     let leaves = registry.by_name("boxel:leaves").unwrap();
     let p = LocalPos::new(3, 4, 5);
-    let bit = |m: &Occupancy| m[4 * 32 + 3] >> 5 & 1;
+    let bit = |m: MaskRows<'_>| m.row(4 * 32 + 3) >> 5 & 1;
 
+    // Three states (2 bits per voxel): the masks are built and cached.
     let mut chunk = ChunkData::uniform(BlockState::AIR);
     chunk.set(LocalPos::new(0, 0, 0), stone);
-    let first: *const ChunkMasks = chunk.masks(&tables);
-    assert!(chunk.has_cached_masks());
-    assert!(std::ptr::eq(first, chunk.masks(&tables)), "cached");
-    assert_eq!(bit(&chunk.masks(&tables).opaque), 0);
+    chunk.set(LocalPos::new(1, 0, 0), dirt);
+    assert_eq!(chunk.blocks().bits_per_voxel(), 2);
+    let heap = chunk.heap_bytes();
+    assert_eq!(bit(chunk.light_masks(&tables).opaque), 0);
+    assert!(chunk.has_cached_light_masks());
+    assert!(chunk.heap_bytes() > heap);
 
     // No change, no reset.
     chunk.set(LocalPos::new(0, 0, 0), stone);
-    assert!(chunk.has_cached_masks());
+    assert!(chunk.has_cached_light_masks());
     // A change resets, and the new masks see it.
     chunk.set(p, stone);
-    assert!(!chunk.has_cached_masks());
-    assert_eq!(bit(&chunk.masks(&tables).opaque), 1);
+    assert!(!chunk.has_cached_light_masks());
+    assert_eq!(chunk.heap_bytes(), heap);
+    assert_eq!(bit(chunk.light_masks(&tables).opaque), 1);
 
     // Copy-on-write: the copy starts without masks, the shared snapshot keeps its own.
     let shared = Arc::new(chunk);
     let mut edited = Arc::clone(&shared);
-    assert!(shared.has_cached_masks());
+    assert!(shared.has_cached_light_masks());
     Arc::make_mut(&mut edited).set(p, leaves);
-    assert!(shared.has_cached_masks());
-    assert!(!edited.has_cached_masks());
-    assert_eq!(bit(&edited.masks(&tables).opaque), 0);
-    assert_eq!(bit(&edited.masks(&tables).partial), 1);
-    assert_eq!(bit(&shared.masks(&tables).opaque), 1);
+    assert!(shared.has_cached_light_masks());
+    assert!(!edited.has_cached_light_masks());
+    assert_eq!(bit(edited.light_masks(&tables).opaque), 0);
+    assert_eq!(bit(edited.light_masks(&tables).partial), 1);
+    assert_eq!(bit(shared.light_masks(&tables).opaque), 1);
 
     // A unique Arc is not copied: the masks stay until the edit.
     let mut unique = Arc::new(ChunkData::from_dense(&vec![stone; CHUNK_VOLUME]));
     Arc::make_mut(&mut unique).set(p, BlockState::AIR);
-    unique.masks(&tables);
+    Arc::make_mut(&mut unique).set(LocalPos::new(0, 0, 0), dirt);
+    unique.light_masks(&tables);
     let chunk = Arc::make_mut(&mut unique);
-    assert!(chunk.has_cached_masks());
+    assert!(chunk.has_cached_light_masks());
     chunk.set(p, stone);
-    assert!(!chunk.has_cached_masks());
+    assert!(!chunk.has_cached_light_masks());
 
     // `blocks_mut` resets, `compact` keeps; clones start empty and equality ignores the cache.
     chunk.set(p, BlockState::AIR);
-    chunk.masks(&tables);
+    chunk.light_masks(&tables);
     chunk.compact();
-    assert!(chunk.has_cached_masks());
+    assert!(chunk.has_cached_light_masks());
     let copy = chunk.clone();
-    assert!(!copy.has_cached_masks());
+    assert!(!copy.has_cached_light_masks());
     assert_eq!(&copy, &*chunk);
     chunk.blocks_mut().set(p, leaves);
-    assert!(!chunk.has_cached_masks());
-    assert_eq!(bit(&chunk.masks(&tables).partial), 1);
+    assert!(!chunk.has_cached_light_masks());
+    assert_eq!(bit(chunk.light_masks(&tables).partial), 1);
 }
 
 #[test]
@@ -304,7 +353,7 @@ fn may_emit_is_a_palette_scan() {
     // The lamp is gone but stays in the palette: a yes that is allowed to be wrong.
     c.set(LocalPos::new(1, 2, 3), plain);
     assert!(c.may_emit(&tables));
-    assert!(c.masks(&tables).emitters.is_empty());
+    assert!(c.light_masks(&tables).emitters.is_empty());
     // Without any emitter in the registry, never.
     let default = LightTables::from_registry(&BlockRegistry::default_blocks());
     assert!(!ChunkData::uniform(BlockState(1)).may_emit(&default));
@@ -335,8 +384,6 @@ fn registry_light_fields_and_validation() {
     assert!(!tables.any_emitter());
     assert!(tables.blocks_sky(r.by_name("boxel:leaves").unwrap()));
     assert!(!tables.blocks_sky(BlockState::AIR));
-    assert!(tables.is_solid(r.by_name("boxel:leaves").unwrap()));
-    assert!(!tables.is_solid(r.by_name("boxel:water").unwrap()));
     assert_eq!(
         tables.id(),
         LightTables::from_registry(&BlockRegistry::default_blocks()).id()

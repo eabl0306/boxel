@@ -535,8 +535,11 @@ fn heap_bytes_track_the_representation() {
     assert_eq!(c.heap_bytes(), blocks);
     // Built masks count too; a change of the blocks drops them.
     let tables = LightTables::from_registry(&BlockRegistry::default_blocks());
-    c.masks(&tables);
-    assert_eq!(c.heap_bytes(), blocks + size_of::<ChunkMasks>());
+    c.light_masks(&tables);
+    assert!(c.has_cached_light_masks());
+    let masks = OwnedLightMasks::compute(&c, &tables).heap_bytes();
+    assert!(masks >= 4096);
+    assert_eq!(c.heap_bytes(), blocks + masks);
     c.set(LocalPos::new(0, 0, 0), BlockState(77));
-    assert!(!c.has_cached_masks());
+    assert!(!c.has_cached_light_masks());
 }

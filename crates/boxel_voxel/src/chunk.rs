@@ -1,15 +1,16 @@
 use crate::{
-    BlockRegistry, BlockState, CHUNK_AREA, CHUNK_VOLUME, ChunkMasks, LightTables, LocalPos,
-    Occupancy, Paletted, RenderShape,
+    BlockRegistry, BlockState, CHUNK_AREA, CHUNK_VOLUME, LightMasks, LightTables, LocalPos,
+    Occupancy, OwnedLightMasks, Paletted, RenderShape,
 };
 use std::sync::OnceLock;
 
 /// One chunk's voxel payload. Shared as `Arc<ChunkData>` snapshots; edit through
 /// `Arc::make_mut` (copy-on-write when a job still holds the old snapshot).
 ///
-/// Light is not stored here: it is derived data (ADR 0015). The chunk caches its
-/// [`ChunkMasks`] ([`ChunkData::masks`]): built on first use, shared by every reader of the
-/// snapshot, dropped by every change of the blocks (and not carried by `clone`).
+/// Light is not stored here: it is derived data (ADR 0015). The chunk may cache its light masks
+/// ([`ChunkData::light_masks`]): built on first use when the storage cannot serve them as is,
+/// shared by every reader of the snapshot, dropped by every change of the blocks (and not
+/// carried by `clone`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChunkData {
     /// Block states (private so that every change goes through a method that resets the mask
@@ -17,14 +18,14 @@ pub struct ChunkData {
     blocks: Paletted,
     /// Bumped by every mutation (mesh results built from an older version are discarded).
     pub version: u32,
-    /// Lazily built masks of `blocks`.
+    /// Lazily built light masks of `blocks` (only for storage that cannot serve them as is).
     masks: MaskCache,
 }
 
-/// The cached [`ChunkMasks`] of a chunk. A clone starts empty and equality ignores it: it is a
+/// The cached light masks of a chunk. A clone starts empty and equality ignores it: it is a
 /// pure function of the blocks.
 #[derive(Default)]
-struct MaskCache(OnceLock<Box<ChunkMasks>>);
+struct MaskCache(OnceLock<Box<OwnedLightMasks>>);
 
 impl Clone for MaskCache {
     fn clone(&self) -> Self {
@@ -155,30 +156,31 @@ impl ChunkData {
     pub fn to_dense(&self, out: &mut [BlockState]) {
         self.blocks.decode_into(out);
     }
-    /// The light, physics and raycast masks of this chunk, built on first use and cached until
-    /// the blocks change ([`ChunkMasks::compute`] describes the paths). Uniform chunks without
-    /// emission share static masks and never allocate.
+    /// The light masks of this chunk ([`LightMasks`]).
+    ///
+    /// Uniform and 1-bit chunks without emission are served from their storage (static words,
+    /// or the packed words kept or flipped by the palette order): no build, no memory. Any
+    /// other chunk builds its masks on first use ([`OwnedLightMasks::compute`]) and caches them
+    /// until the blocks change.
     ///
     /// The cache belongs to one set of tables (one registry per world): asking with other
     /// tables is a bug, checked in debug builds.
-    pub fn masks(&self, tables: &LightTables) -> &ChunkMasks {
-        if let Paletted::Uniform(s) = &self.blocks
-            && let Some(shared) = ChunkMasks::shared_uniform(tables.class(*s))
-        {
-            return shared;
+    pub fn light_masks(&self, tables: &LightTables) -> LightMasks<'_> {
+        if let Some(masks) = LightMasks::borrowed(&self.blocks, tables) {
+            return masks;
         }
         let masks = self
             .masks
             .0
-            .get_or_init(|| ChunkMasks::compute(self, tables));
+            .get_or_init(|| OwnedLightMasks::compute(self, tables));
         debug_assert!(
             masks.built_with(tables),
-            "ChunkData::masks called with other light tables than the cached masks"
+            "ChunkData::light_masks called with other light tables than the cached masks"
         );
-        masks
+        masks.view()
     }
-    /// True if the cached masks are built (for tests and memory reports).
-    pub fn has_cached_masks(&self) -> bool {
+    /// True if built light masks are cached (for tests and memory reports).
+    pub fn has_cached_light_masks(&self) -> bool {
         self.masks.0.get().is_some()
     }
     /// True if some voxel may emit light per `tables`: a palette scan, so it may answer yes for
@@ -194,7 +196,8 @@ impl ChunkData {
             Paletted::Direct(_) => true,
         }
     }
-    /// Occupancy of voxels whose shape is `Opaque` per `registry`.
+    /// Occupancy of voxels whose shape is `Opaque` per `registry` (the render shape; light
+    /// opacity 15 is [`LightMasks::opaque`], which may also hold `Cutout` blocks).
     ///
     /// Bit `z` of word `y * 32 + x`, so word `k` holds voxels `32 * k .. 32 * k + 32` in
     /// [`LocalPos`] index order.
@@ -239,13 +242,10 @@ impl ChunkData {
         }
         occupancy
     }
-    /// Heap bytes used: the block storage plus the cached masks, if built (excludes
+    /// Heap bytes used: the block storage plus the cached light masks, if built (excludes
     /// `size_of::<ChunkData>()` itself).
     pub fn heap_bytes(&self) -> usize {
-        let masks = self.masks.0.get().map_or(0, |m| {
-            size_of::<ChunkMasks>()
-                + m.emitters.capacity() * size_of::<(LocalPos, crate::LightValue)>()
-        });
+        let masks = self.masks.0.get().map_or(0, |m| m.heap_bytes());
         self.blocks.heap_bytes() + masks
     }
 }

@@ -1,8 +1,8 @@
 //! Paletted container benchmarks: encode/decode/get/set on a terrain-like chunk, and the light
-//! masks (`ChunkMasks`) of a cave chunk and of that terrain chunk.
+//! masks (`LightMasks`) of a cave chunk and of that terrain chunk.
 use boxel_voxel::{
-    BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, ChunkMasks, LightTables, LocalPos,
-    Occupancy, Paletted,
+    BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, LightTables, LocalPos, Occupancy,
+    OwnedLightMasks, Paletted,
 };
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -102,8 +102,10 @@ fn bench(c: &mut Criterion) {
     });
     g.finish();
 
-    // Masks without the cache (`ChunkMasks::compute`), what the first reader of a chunk pays.
-    // Targets (ADR 0015): cave_1bit 2 us or less, surface_packed 25 us or less.
+    // What the first reader of a chunk pays: a 1-bit cave chunk is served from its packed words
+    // (`ChunkData::light_masks`, nothing built); a surface chunk builds its masks
+    // (`OwnedLightMasks::compute`, then cached). Targets (ADR 0015): cave_1bit 2 us or less,
+    // surface_packed 25 us or less.
     let tables = LightTables::from_registry(&registry);
     let cave = cave_like(&registry);
     assert_eq!(
@@ -114,10 +116,14 @@ fn bench(c: &mut Criterion) {
     let mut g = c.benchmark_group("masks");
     g.throughput(Throughput::Elements(CHUNK_VOLUME as u64));
     g.bench_function("cave_1bit", |b| {
-        b.iter(|| ChunkMasks::compute(black_box(&cave), &tables));
+        b.iter(|| black_box(&cave).light_masks(&tables).opaque.row(511));
     });
+    assert!(
+        !cave.has_cached_light_masks(),
+        "a 1-bit chunk needs no build"
+    );
     g.bench_function("surface_packed", |b| {
-        b.iter(|| ChunkMasks::compute(black_box(&chunk), &tables));
+        b.iter(|| OwnedLightMasks::compute(black_box(&chunk), &tables));
     });
     g.finish();
 }

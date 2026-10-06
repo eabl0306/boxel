@@ -231,8 +231,9 @@ impl World {
 }
 
 /// A random world of `n^3` chunks from `min`. Sky tops: the highest blocker of each column, or
-/// in some columns a roof above the world, or (open columns) a top below the world or
-/// `i64::MIN`. Some chunk columns are kept open (air and glass only).
+/// in some chunk columns a roof above the world, a cap at a random height inside the world
+/// (over air where the blockers are lower, as the walk floor), or (open columns) a top below
+/// the world or `i64::MIN`. Some chunk columns are kept open (air and glass only).
 pub fn random_world(seed: u64, n: usize, min: ChunkPos, b: &Blocks, tables: &LightTables) -> World {
     let mut rng = Rng::new(seed);
     let open_columns: Vec<bool> = (0..n * n).map(|_| rng.chance(0.15)).collect();
@@ -278,6 +279,8 @@ pub fn random_world(seed: u64, n: usize, min: ChunkPos, b: &Blocks, tables: &Lig
                 1 => brute.max(world_top + (1 << 40)),
                 2 if brute == i64::MIN => y0 - 1 - rng.below(3) as i64,
                 3 if brute == i64::MIN => y0 + rng.below(side as u64) as i64 - side as i64,
+                // The same cap for the whole chunk column (its generator gives the same value).
+                4 => brute.max(y0 + column_rng.below(side as u64) as i64),
                 _ => brute,
             };
         }

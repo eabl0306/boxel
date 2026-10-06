@@ -14,7 +14,7 @@
 #![expect(clippy::print_stderr, reason = "bench scene statistics")]
 
 use boxel_light::box_light::tile_index;
-use boxel_light::sky_tile::{DEFAULT_WALK_LIMIT, generator_top_voxel, walk};
+use boxel_light::sky_tile::{DEFAULT_WALK_LIMIT, GeneratorTop, walk, walk_floor};
 use boxel_light::{
     LayerData, LightInput, LightPath, LightScratch, PaddedLight, SkyInput, SkyTile, compute,
 };
@@ -37,8 +37,8 @@ fn generated_tile(
     cz: i64,
 ) -> SkyTile {
     let range = g.vertical_chunks();
-    let top = generator_top_voxel(&range).expect("bounded top");
-    walk(top, DEFAULT_WALK_LIMIT, tables, |cy| {
+    let top = GeneratorTop::of(&range).voxel().expect("bounded top");
+    walk(top, walk_floor(top, DEFAULT_WALK_LIMIT), tables, |cy| {
         if cy > *range.end() {
             LayerData::Air
         } else {
@@ -150,9 +150,28 @@ impl Neighborhood {
     }
 }
 
+/// Trees and cave entrances of a chunk column's tile: whether some top is above the ground
+/// (a tree), and the first column whose surface voxel is carved (top 3 or more below it).
+fn trees_and_entrance(
+    g: &OverworldGenerator,
+    tile: &SkyTile,
+    cx: i64,
+    cz: i64,
+) -> (bool, Option<i64>) {
+    let (mut trees, mut entrance) = (false, None);
+    for i in 0..1024 {
+        let (x, z) = (cx * 32 + (i >> 5) as i64, cz * 32 + (i & 31) as i64);
+        let h = g.height_at(x, z);
+        trees |= tile.tops()[i] > h;
+        if tile.tops()[i] < h - 2 && entrance.is_none() {
+            entrance = Some(h);
+        }
+    }
+    (trees, entrance)
+}
+
 /// A surface chunk near the origin whose box holds trees and a cave entrance: the first chunk
-/// column (searching outwards) with a column whose surface voxel is carved, at the layer of
-/// that surface.
+/// column (searching outwards) with both, at the layer of the entrance's surface.
 fn surface_origin(
     g: &OverworldGenerator,
     registry: &BlockRegistry,
@@ -170,16 +189,12 @@ fn surface_origin(
             (-r, r),
         ] {
             let tile = generated_tile(g, registry, tables, cx, cz);
-            for i in 0..1024 {
-                let (x, z) = (cx * 32 + (i >> 5) as i64, cz * 32 + (i & 31) as i64);
-                let h = g.height_at(x, z);
-                if tile.tops()[i] < h - 2 {
-                    return ChunkPos::new(cx, h >> 5, cz);
-                }
+            if let (true, Some(h)) = trees_and_entrance(g, &tile, cx, cz) {
+                return ChunkPos::new(cx, h >> 5, cz);
             }
         }
     }
-    ChunkPos::new(0, 2, 0)
+    panic!("no chunk column with trees and a cave entrance near the origin");
 }
 
 /// The default blocks plus three opaque lamps: orange, red, blue.
@@ -268,10 +283,26 @@ fn bench(c: &mut Criterion) {
         );
         path
     };
+    // Each bench must time the path its target is for: a fast path that slips in after a
+    // worldgen change would "meet" the full-path targets.
     assert_eq!(report("box_cave_dark", &deep), LightPath::FastDark);
+    let center = &surface.tiles[tile_index(0, 0)];
+    let (cx, cz) = (surface.origin.x, surface.origin.z);
+    assert!(
+        trees_and_entrance(&g, center, cx, cz).0,
+        "box_surface without trees"
+    );
     let surface_path = report("box_surface", &surface);
+    assert!(
+        matches!(surface_path, LightPath::Full { sky_pops, .. } if sky_pops > 0),
+        "box_surface took {surface_path:?}"
+    );
     assert_eq!(report("box_far", &far), surface_path);
-    report("box_cave_lamps_rgb", &cave);
+    let lamps_path = report("box_cave_lamps_rgb", &cave);
+    assert!(
+        matches!(lamps_path, LightPath::Full { block_pops, .. } if block_pops > 0),
+        "box_cave_lamps_rgb took {lamps_path:?}"
+    );
     eprintln!("box_cave_lamps_rgb: {placed} lamps");
 
     let mut g_light = c.benchmark_group("light");
@@ -305,7 +336,8 @@ fn bench(c: &mut Criterion) {
     // whose masks are not built yet.
     let (cx, cz) = (surface.origin.x, surface.origin.z);
     let range = g.vertical_chunks();
-    let top = generator_top_voxel(&range).expect("bounded top");
+    let top = GeneratorTop::of(&range).voxel().expect("bounded top");
+    let floor = walk_floor(top, DEFAULT_WALK_LIMIT);
     let loaded: Vec<(i64, Arc<ChunkData>)> = (-64..=top >> 5)
         .rev()
         .map(|cy| {
@@ -315,7 +347,7 @@ fn bench(c: &mut Criterion) {
         .collect();
     let layer_of = |cy: i64| loaded.iter().find(|(y, _)| *y == cy).map(|(_, c)| c);
     let mut layers_read = 0;
-    walk(top, DEFAULT_WALK_LIMIT, &tables, |cy| {
+    walk(top, floor, &tables, |cy| {
         layers_read += 1;
         layer_of(cy).map_or(LayerData::Air, |c| LayerData::Shared(Arc::clone(c)))
     });
@@ -334,7 +366,7 @@ fn bench(c: &mut Criterion) {
                     .collect::<Vec<_>>()
             },
             |chunks| {
-                walk(top, DEFAULT_WALK_LIMIT, &tables, |cy| {
+                walk(top, floor, &tables, |cy| {
                     chunks
                         .iter()
                         .find(|(y, _)| *y == cy)

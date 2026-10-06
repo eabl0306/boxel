@@ -423,7 +423,7 @@ impl PaletteBuilder {
 }
 
 /// 1 bit per voxel, `u32` columns along z, indexed `y * 32 + x` (4 KiB). The layout of the
-/// mesher masks and of [`ChunkMasks`](crate::ChunkMasks) (light, physics and raycasts).
+/// mesher masks and of [`LightMasks`](crate::LightMasks).
 pub type Occupancy = [u32; 1024];
 
 const _: () = assert!(CHUNK_VOLUME == 32768);
