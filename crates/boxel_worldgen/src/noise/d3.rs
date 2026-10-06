@@ -9,6 +9,7 @@
 //! no tiles and no `i128` cells.
 
 use super::{Frequency, Scale, normalize, splitmix64};
+use std::cell::RefCell;
 
 /// A noise frequency per axis: `xz` along x and z, `y` along y (caverns taller than they are wide
 /// take a lower `y` frequency). Both are exact fractions, so every axis splits exactly.
@@ -289,6 +290,9 @@ pub fn fbm_3d(seed: u64, x: i64, y: i64, z: i64, fbm: Fbm3) -> f64 {
 /// may come in any order and with any spacing (a stride is a coarser grid); a grid too sparse
 /// for its lattice is sampled point by point.
 ///
+/// The buffers it needs (the split coordinates and one octave's lattice table) are kept per
+/// thread, so a chunk's noise does not allocate once a thread has run a grid of its size.
+///
 /// # Panics
 ///
 /// If `out.len()` is not `xs.len() * ys.len() * zs.len()`.
@@ -301,28 +305,45 @@ pub fn fbm_3d_grid(seed: u64, xs: &[i64], ys: &[i64], zs: &[i64], fbm: Fbm3, out
     if out.is_empty() {
         return;
     }
+    let mut run = |scratch: &mut GridScratch| {
+        fbm_3d_grid_in(scratch, seed, [xs, ys, zs], fbm, out);
+        scratch.trim();
+    };
+    // A fresh scratch only while the thread is being torn down (no thread-local left).
+    let reused = GRID_SCRATCH.try_with(|cell| match cell.try_borrow_mut() {
+        Ok(mut scratch) => run(&mut scratch),
+        Err(_) => run(&mut GridScratch::default()),
+    });
+    if reused.is_err() {
+        run(&mut GridScratch::default());
+    }
+}
+
+/// [`fbm_3d_grid`] with its buffers in `scratch`.
+fn fbm_3d_grid_in(
+    scratch: &mut GridScratch,
+    seed: u64,
+    [xs, ys, zs]: [&[i64]; 3],
+    fbm: Fbm3,
+    out: &mut [f64],
+) {
     out.fill(0.0);
-    let mut table = LatticeTable3::default();
-    let (mut x, mut y, mut z) = (
-        Vec::with_capacity(xs.len()),
-        Vec::with_capacity(ys.len()),
-        Vec::with_capacity(zs.len()),
-    );
+    let GridScratch { x, y, z, table } = scratch;
     let mut weight_sum = 0.0;
     for octave in fbm.octaves(seed) {
         let split = |axes: &mut Vec<Axis>, coords: &[i64], scale: Scale| {
             axes.clear();
             axes.extend(coords.iter().map(|&c| axis(scale, c)));
         };
-        split(&mut x, xs, octave.xz);
-        split(&mut y, ys, octave.y);
-        split(&mut z, zs, octave.xz);
-        if table.rebuild(octave.mixed_seed, &x, &y, &z, out.len()) {
-            table.accumulate(&x, &y, &z, octave.amplitude, out);
+        split(x, xs, octave.xz);
+        split(y, ys, octave.y);
+        split(z, zs, octave.xz);
+        if table.rebuild(octave.mixed_seed, x, y, z, out.len()) {
+            table.accumulate(x, y, z, octave.amplitude, out);
         } else {
             let mut sums = out.iter_mut();
-            for xa in &x {
-                for ya in &y {
+            for xa in x.iter() {
+                for ya in y.iter() {
                     // `z` first: `zip` stops on it without taking another sum.
                     for (za, sum) in z.iter().zip(sums.by_ref()) {
                         *sum += octave.amplitude * octave.sample_axes(xa, ya, za);
@@ -334,6 +355,46 @@ pub fn fbm_3d_grid(seed: u64, xs: &[i64], ys: &[i64], zs: &[i64], fbm: Fbm3, out
     }
     for v in out.iter_mut() {
         *v = normalize(*v, weight_sum);
+    }
+}
+
+thread_local! {
+    /// The buffers of [`fbm_3d_grid`], one set per thread (a chunk's lattice needs a few KiB).
+    static GRID_SCRATCH: RefCell<GridScratch> = RefCell::new(GridScratch::default());
+}
+
+/// Reusable buffers of [`fbm_3d_grid`].
+#[derive(Default)]
+struct GridScratch {
+    /// The x coordinates split on the current octave's lattice.
+    x: Vec<Axis>,
+    /// The y coordinates.
+    y: Vec<Axis>,
+    /// The z coordinates.
+    z: Vec<Axis>,
+    /// The current octave's corners.
+    table: LatticeTable3,
+}
+
+impl GridScratch {
+    /// Elements a buffer may keep between calls: a huge grid does not pin its memory to the
+    /// thread for good (a chunk's lattice needs a few hundred).
+    const KEEP: usize = 1 << 14;
+
+    /// Frees every buffer that grew past [`GridScratch::KEEP`].
+    fn trim(&mut self) {
+        fn trim<T>(v: &mut Vec<T>) {
+            if v.capacity() > GridScratch::KEEP {
+                *v = Vec::new();
+            }
+        }
+        trim(&mut self.x);
+        trim(&mut self.y);
+        trim(&mut self.z);
+        trim(&mut self.table.gradients);
+        trim(&mut self.table.xs);
+        trim(&mut self.table.ys);
+        trim(&mut self.table.zs);
     }
 }
 

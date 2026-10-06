@@ -21,6 +21,8 @@
 //!   entrances and the roof, under the lowest possible column): no heights; the caves' 405
 //!   corners decide between `Uniform(stone)`, `Uniform(air)` and a stone/air 1-bit chunk built
 //!   straight from the carve mask ([`ChunkData::from_occupancy`]).
+//! - Below the dirt and the roof of the lowest possible column, but within reach of the cave
+//!   fades or the entrances: the same, with only the heights of the 9x9 corner columns.
 //! - Near the surface: the 32x32 column heights, then air above the chunk's highest column, the
 //!   same 1-bit path when the whole chunk is stone before carving, or the dense path (surface
 //!   rules, carve, trees, [`ChunkData::from_dense`]).
@@ -29,7 +31,7 @@ mod caves;
 mod terrain;
 
 pub use caves::{
-    CELL, CarveMask, CaveSettings, Caves, Cheese, Entrances, Fade, Noodles, SurfaceFade, Tunnels,
+    CarveMask, CaveSettings, Caves, Cheese, Entrances, Fade, Noodles, SurfaceFade, Tunnels,
     carve_mask,
 };
 pub use terrain::{Heightmap, SurfaceBlocks, SurfaceRules};
@@ -74,8 +76,11 @@ impl Default for OverworldSettings {
 /// The overworld: [`Heightmap`] surface, [`SurfaceRules`], stone down to `i64::MIN` carved by
 /// [`Caves`], and [`Trees`] (see the [module docs](self) for the stages and the fast paths).
 ///
-/// Exact at any `i64` coordinate: every stage works on integer columns and lattice corners, and
-/// the carve decision is integer arithmetic.
+/// Exact everywhere in the world (`+-2^61` voxels on every axis, `MAX_BLOCK_COORD`, the limit
+/// the world streams within): every stage works on integer columns and lattice corners, and
+/// the carve decision is integer arithmetic. The point helpers ([`OverworldGenerator::block_at`],
+/// [`OverworldGenerator::is_solid`], [`OverworldGenerator::density_at`]) take positions inside
+/// that limit too (checked in debug builds): the cells at the ends of `i64` have no far corner.
 #[derive(Clone, Debug)]
 pub struct OverworldGenerator {
     /// World seed.
@@ -179,19 +184,33 @@ impl OverworldGenerator {
         caves.max(self.settings.surface.dirt_depth)
     }
 
-    /// Stone carved by the caves: the corners of the chunk at `origin` (`corner_heights`: the
-    /// heights of its 9x9 corner columns, `None` deep under every depth rule) decide between
-    /// uniform stone, uniform air and the 1-bit chunk. Without caves: uniform stone.
+    /// True if every voxel of the chunk layer starting at `y0` is stone before carving and
+    /// under the cave roof in a column of height `lowest` or more (so below every tree too).
+    fn under_surface_rules(&self, y0: i64, lowest: i64) -> bool {
+        let size = i64::from(CHUNK_SIZE);
+        let roof = self
+            .settings
+            .caves
+            .as_ref()
+            .map_or(i64::MIN, |c| c.settings.surface_fade.roof);
+        y0 + size <= lowest.saturating_sub(self.settings.surface.dirt_depth)
+            && y0 + size - 1 <= lowest.saturating_sub(roof)
+    }
+
+    /// Stone carved by the caves: the corners of the chunk at `origin` decide between uniform
+    /// stone, uniform air and the 1-bit chunk. `corner_heights` gives the heights of its 9x9
+    /// corner columns (called only with caves), or `None` deep under every depth rule. Without
+    /// caves: uniform stone.
     fn carved_stone(
         &self,
         origin: BlockPos,
-        corner_heights: Option<&[i64; 81]>,
+        corner_heights: impl FnOnce() -> Option<[i64; 81]>,
         stone: BlockState,
     ) -> ChunkData {
         let Some(caves) = &self.settings.caves else {
             return ChunkData::uniform(stone);
         };
-        let q = caves.chunk_corners(self.seed, origin, corner_heights);
+        let q = caves.chunk_corners(self.seed, origin, corner_heights().as_ref());
         match carve_mask(&q) {
             CarveMask::Solid => ChunkData::uniform(stone),
             CarveMask::Air => ChunkData::uniform(BlockState::AIR),
@@ -229,7 +248,8 @@ impl OverworldGenerator {
         if y0 > highest.saturating_sub(roof) {
             return dense;
         }
-        let corner_heights = Caves::corner_heights(&self.settings.heightmap, self.seed, origin);
+        let corner_heights =
+            Caves::corner_heights_from(&self.settings.heightmap, self.seed, origin, heights);
         let q = caves.chunk_corners(self.seed, origin, Some(&corner_heights));
         let solid = match carve_mask(&q) {
             CarveMask::Solid => return dense,
@@ -313,23 +333,26 @@ impl WorldGenerator for OverworldGenerator {
         let stone = || block(registry, "boxel:stone", NAME);
         // Deep: every corner and voxel is below every depth rule of every column.
         if y0 + size <= heightmap.min_height().saturating_sub(self.surface_reach()) {
-            return self.carved_stone(origin, None, stone());
+            return self.carved_stone(origin, || None, stone());
+        }
+        // All stone before carving and under the roof of the lowest possible column: the caves
+        // only need the heights of the corner columns (for the fades and the entrances).
+        if self.under_surface_rules(y0, heightmap.min_height()) {
+            let corners = || Some(Caves::corner_heights(heightmap, self.seed, origin));
+            return self.carved_stone(origin, corners, stone());
         }
         let heights = heightmap.chunk_heights(self.seed, origin.x, origin.z);
         let (lowest, highest) = heights
             .iter()
             .fold((i64::MAX, i64::MIN), |(lo, hi), &h| (lo.min(h), hi.max(h)));
-        let roof = self
-            .settings
-            .caves
-            .as_ref()
-            .map_or(i64::MIN, |c| c.settings.surface_fade.roof);
-        if y0 + size <= lowest.saturating_sub(self.settings.surface.dirt_depth)
-            && y0 + size - 1 <= lowest.saturating_sub(roof)
-        {
-            // All stone before carving, and all under the roof (so below every tree).
-            let corner_heights = Caves::corner_heights(heightmap, self.seed, origin);
-            return self.carved_stone(origin, Some(&corner_heights), stone());
+        if self.under_surface_rules(y0, lowest) {
+            // The same under this chunk's lowest column.
+            let corners = || {
+                Some(Caves::corner_heights_from(
+                    heightmap, self.seed, origin, &heights,
+                ))
+            };
+            return self.carved_stone(origin, corners, stone());
         }
         // Air above the terrain, or the dense path; trees go into the dense voxels before they
         // are encoded once.

@@ -7,7 +7,9 @@
 //!   (`cave_chunk`, and `cave_chunk_far` at x = 2^40, y = -2^40), the mean of 64 consecutive
 //!   deep chunks (`deep_chunks_mean`, per chunk), a deep chunk the caves leave whole
 //!   (`solid_chunk`), the surface chunk at column (0, 0) with caves and trees
-//!   (`surface_chunk_caves`), and the 405 corner densities alone (`density_corners_405`).
+//!   (`surface_chunk_caves`), the chunk at layer -1 under it, below the surface rules but
+//!   inside the reach of the cave fades and entrances (`shallow_chunk`), and the 405 corner
+//!   densities alone (`density_corners_405`).
 //!
 //! Phase 2 targets: `cave_chunk` 60 us or less (aim 40), `cave_chunk_far` within 1.3x of it,
 //! `solid_chunk` 25 us or less, `surface_chunk_caves` 90 us or less.
@@ -112,11 +114,13 @@ fn overworld(c: &mut Criterion) {
         b.as_uniform().is_some()
     });
     let surface = ChunkPos::new(0, g.height_at(0, 0) >> 5, 0);
+    let shallow = ChunkPos::new(0, -1, 0);
     for (name, pos) in [
         ("cave_chunk", cave),
         ("cave_chunk_far", cave_far),
         ("solid_chunk", solid),
         ("surface_chunk_caves", surface),
+        ("shallow_chunk", shallow),
     ] {
         eprintln!("{name}: {pos:?}, air {:.3}", air(&g, &r, pos));
     }
@@ -133,6 +137,7 @@ fn overworld(c: &mut Criterion) {
         ("cave_chunk_far", cave_far),
         ("solid_chunk", solid),
         ("surface_chunk_caves", surface),
+        ("shallow_chunk", shallow),
     ] {
         let key = ChunkKey::new(pos);
         group.bench_function(name, |b| b.iter(|| g.generate(black_box(key), &r)));

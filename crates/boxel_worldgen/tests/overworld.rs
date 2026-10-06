@@ -8,7 +8,7 @@ use boxel_voxel::{
 };
 use boxel_worldgen::overworld::{CaveSettings, Cheese, Fade, Heightmap, SurfaceFade};
 use boxel_worldgen::{
-    Caves, ForestGenerator, OverworldGenerator, OverworldSettings, TerrainGenerator, Trees,
+    Caves, ForestGenerator, OverworldGenerator, OverworldSettings, TerrainGenerator, Tree, Trees,
     WorldGenerator,
 };
 
@@ -85,6 +85,81 @@ fn mixed_near(g: &OverworldGenerator, r: &BlockRegistry, pos: ChunkPos) -> Chunk
         .unwrap_or_else(|| panic!("no chunk with caves near {pos:?}"))
 }
 
+/// The 32x32 column heights of chunk column `(cx, cz)`, indexed `x * 32 + z`.
+fn column_heights(g: &OverworldGenerator, cx: i64, cz: i64) -> [i64; 1024] {
+    g.settings.heightmap.chunk_heights(g.seed, cx * 32, cz * 32)
+}
+
+/// True if `data` (the chunk at `pos`) has air at the top block of one of its columns: a cave
+/// opens the surface there.
+fn opens_the_surface(g: &OverworldGenerator, pos: ChunkPos, data: &[BlockState]) -> bool {
+    let heights = column_heights(g, pos.x, pos.z);
+    heights.iter().enumerate().any(|(column, &h)| {
+        let ly = h - pos.y * 32;
+        (0..32).contains(&ly) && data[(ly as usize) << 10 | column] == BlockState::AIR
+    })
+}
+
+/// Up to `want` surface chunks where the entrances open the ground, from the chunk columns
+/// whose middle column is inside an entrance region (the mask picks them, so the coverage does
+/// not depend on which columns a fixed list happens to hit).
+fn opened_surface_chunks(g: &OverworldGenerator, r: &BlockRegistry, want: usize) -> Vec<ChunkPos> {
+    let caves = g.settings.caves.as_ref().expect("caves");
+    let e = caves.settings.entrances.expect("entrances");
+    let mut found = Vec::new();
+    for cx in -64..64 {
+        for cz in -64..64 {
+            if caves.entrance_mask(g.seed, cx * 32 + 16, cz * 32 + 16) <= e.mask_threshold {
+                continue;
+            }
+            let heights = column_heights(g, cx, cz);
+            let (lo, hi) = (heights.iter().min().unwrap(), heights.iter().max().unwrap());
+            if let Some(pos) = (lo >> 5..=hi >> 5)
+                .map(|y| ChunkPos::new(cx, y, cz))
+                .find(|&pos| opens_the_surface(g, pos, &dense(g, r, pos)))
+            {
+                found.push(pos);
+                if found.len() == want {
+                    return found;
+                }
+            }
+        }
+    }
+    found
+}
+
+/// A tree whose trunk ground a cave carved (so it is not generated), from the tree cells
+/// around the origin.
+fn lost_tree(g: &OverworldGenerator) -> Option<Tree> {
+    let trees = g.settings.trees.as_ref().expect("trees");
+    let grass = |x: i64, z: i64| {
+        let h = g.height_at(x, z);
+        g.settings.surface.is_grass(h).then_some(h)
+    };
+    (-120..120)
+        .flat_map(|cx| (-120..120).map(move |cz| (cx, cz)))
+        .filter_map(|(cx, cz)| trees.tree_in_cell(g.seed, cx, cz, grass))
+        .find(|t| !g.is_solid(BlockPos::new(t.x, t.ground, t.z)))
+}
+
+/// True if a lattice corner of the chunk at `pos` is inside an entrance region and above the
+/// entrances' bottom (the corners where the entrance tunnels count).
+fn has_entrance_corner(g: &OverworldGenerator, pos: ChunkPos) -> bool {
+    let caves = g.settings.caves.as_ref().expect("caves");
+    let e = caves.settings.entrances.expect("entrances");
+    let origin = pos.origin();
+    let heights = Caves::corner_heights(&g.settings.heightmap, g.seed, origin);
+    heights.iter().enumerate().any(|(c, &h)| {
+        let [step_x, step_y, step_z] = Caves::CELL;
+        let (x, z) = (
+            origin.x + step_x * (c / 9) as i64,
+            origin.z + step_z * (c % 9) as i64,
+        );
+        let mask = caves.entrance_mask(g.seed, x, z);
+        (0..5).any(|j| mask > e.mask_threshold && h - (origin.y + step_y * j) < e.max_depth)
+    })
+}
+
 #[test]
 fn generate_matches_the_point_spec_near_far_and_deep() {
     let r = registry();
@@ -93,7 +168,7 @@ fn generate_matches_the_point_spec_near_far_and_deep() {
     let far = 1i64 << 35; // 2^40 voxels
     let limit = MAX_CHUNK_COORD - 1;
     let mut chunks = Vec::new();
-    // Surface chunks (trees, entrances, the dense path) and the chunk above and below them.
+    // Surface chunks (trees, the dense path) and the chunk above and below them.
     for (cx, cz) in [
         (0, 0),
         (7, -3),
@@ -104,6 +179,21 @@ fn generate_matches_the_point_spec_near_far_and_deep() {
     ] {
         let s = surface_chunk(&g, cx, cz);
         chunks.extend([-1, 0, 1].map(|dy| ChunkPos::new(s.x, s.y + dy, s.z)));
+    }
+    // Surface chunks where the entrances open the ground, with the chunk under them.
+    let opened = opened_surface_chunks(&g, &r, 2);
+    assert_eq!(
+        opened.len(),
+        2,
+        "entrances that open the surface: {opened:?}"
+    );
+    for s in &opened {
+        chunks.extend([0, -1].map(|dy| ChunkPos::new(s.x, s.y + dy, s.z)));
+    }
+    // The chunks of a tree that lost its ground to a cave: the ground's and the trunk's.
+    let tree = lost_tree(&g).expect("a tree over a cave opening");
+    for y in [tree.ground, tree.ground + 1] {
+        chunks.push(ChunkPos::new(tree.x >> 5, y >> 5, tree.z >> 5));
     }
     // Deep chunks with caves (the 1-bit path), near the origin, deep, far and at the limit.
     for pos in [
@@ -119,6 +209,8 @@ fn generate_matches_the_point_spec_near_far_and_deep() {
     ] {
         chunks.push(mixed_near(&g, &r, pos));
     }
+    chunks.sort();
+    chunks.dedup();
     let mut one_bit = 0;
     for &pos in &chunks {
         let data = g.generate(ChunkKey::new(pos), &r);
@@ -128,6 +220,23 @@ fn generate_matches_the_point_spec_near_far_and_deep() {
         assert_matches_spec(&g, &r, pos);
     }
     assert!(one_bit >= 9, "deep cave chunks are 1-bit ({one_bit})");
+    // What the chunks covered: a carved top block, corners where the entrances count, and the
+    // chunk where the lost tree would stand.
+    assert!(
+        chunks
+            .iter()
+            .any(|&pos| opens_the_surface(&g, pos, &dense(&g, &r, pos))),
+        "no compared chunk opens the surface"
+    );
+    assert!(
+        chunks.iter().any(|&pos| has_entrance_corner(&g, pos)),
+        "no compared chunk has an entrance corner"
+    );
+    let trunk = ChunkPos::new(tree.x >> 5, (tree.ground + 1) >> 5, tree.z >> 5);
+    assert!(chunks.contains(&trunk));
+    let log = state(&r, "boxel:log");
+    let trunk_base = BlockPos::new(tree.x, tree.ground + 1, tree.z);
+    assert_ne!(g.block_at(trunk_base, &r), log, "a trunk over a hole");
 }
 
 #[test]
@@ -366,21 +475,31 @@ fn air_fraction(g: &OverworldGenerator, r: &BlockRegistry, at: ChunkPos, windows
 fn caves_have_the_same_statistics_at_any_distance_and_depth() {
     let r = registry();
     let g = OverworldGenerator::default();
-    let windows = 256;
-    let near = air_fraction(&g, &r, ChunkPos::new(0, -20, 0), windows);
-    // About 10% of the deep volume is air (the tuned look).
-    assert!((0.08..0.12).contains(&near), "air near the origin {near}");
     let limit = MAX_CHUNK_COORD - 4096;
-    for at in [
+    let places = [
+        ChunkPos::new(0, -20, 0),
         ChunkPos::new(1 << 35, -20, 0),
         ChunkPos::new(0, -(1 << 35), 0),
         ChunkPos::new(-(1 << 26), -(1 << 20), 1 << 26),
         ChunkPos::new(limit, -limit, -limit),
-    ] {
-        let air = air_fraction(&g, &r, at, windows);
-        // Measured spread of 256 windows: about +-12%.
+    ];
+    // Measured spread of one estimate from 1024 windows: 3% to 4% (standard deviation over 8
+    // samplings), so two estimates differ by about 5%; 256 windows spread 4% to 8%.
+    let windows = 1024;
+    let air: Vec<f64> = std::thread::scope(|s| {
+        let (g, r) = (&g, &r);
+        let threads: Vec<_> = places
+            .iter()
+            .map(|&at| s.spawn(move || air_fraction(g, r, at, windows)))
+            .collect();
+        threads.into_iter().map(|t| t.join().unwrap()).collect()
+    });
+    let near = air[0];
+    // About 10% of the deep volume is air (the tuned look).
+    assert!((0.08..0.12).contains(&near), "air near the origin {near}");
+    for (at, &air) in places.iter().zip(&air).skip(1) {
         assert!(
-            (air - near).abs() < 0.25 * near,
+            (air - near).abs() < 0.2 * near,
             "air at {at:?}: {air} against {near} near the origin"
         );
     }

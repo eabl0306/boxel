@@ -31,8 +31,11 @@ pub use trees::{Tree, TreeBlock, Trees};
 /// generator must answer fast far above and below its terrain.
 pub trait WorldGenerator: Send + Sync + 'static {
     /// Generates the chunk at `key` (lod 0 in M0). Must be deterministic: same inputs, same output.
-    /// Must return `Uniform` storage, without walking the voxels, for chunks entirely above or
-    /// below the terrain (fast path), at any height.
+    /// Must answer in bounded time at any height: a chunk with nothing to place (above the
+    /// terrain, or inside plain ground with no feature in it) is `Uniform` storage, built
+    /// without walking the voxels (fast path). A generator with features at every depth, such
+    /// as the caves of [`OverworldGenerator`], may return other storage there (a 1-bit chunk),
+    /// but its cost per chunk must not grow with the height.
     fn generate(&self, key: ChunkKey, registry: &BlockRegistry) -> ChunkData;
     /// Chunk-y range that may contain non-air blocks: every chunk outside it is uniform air. The
     /// world creates those chunks as air without calling [`WorldGenerator::generate`] (they still

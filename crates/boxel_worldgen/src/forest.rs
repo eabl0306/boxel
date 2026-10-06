@@ -12,6 +12,13 @@ use std::ops::RangeInclusive;
 /// This is the world the examples streamed as `Forest` before it moved here: for the same seed
 /// it gives the same chunks. Without `boxel:log` or `boxel:leaves` in the registry the trees
 /// are skipped.
+///
+/// The trees go in with [`Trees::place`] ([`ChunkData::set`], about 60 us per chunk with trees)
+/// on purpose: it is the default world of the stress runs, and the earlier runs (master and the
+/// phase 0 baselines) paid that cost, so a faster path here would show up as an engine gain in
+/// every comparison with them. [`Trees::place_dense`] (as in
+/// [`OverworldGenerator`](crate::OverworldGenerator)) is the fast path; switching to it needs
+/// new forest baselines.
 #[derive(Clone, Debug, Default)]
 pub struct ForestGenerator {
     /// Height map, surface and seed.

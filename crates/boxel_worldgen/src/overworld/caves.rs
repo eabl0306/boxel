@@ -2,11 +2,12 @@
 
 use super::terrain::Heightmap;
 use crate::Frequency;
-use crate::noise::{self, Fbm, Fbm3, Frequency3};
-use boxel_voxel::{BlockPos, CHUNK_AREA, Occupancy};
+use crate::noise::{self, Fbm, Fbm3, Frequency3, splitmix64};
+use boxel_voxel::{BlockPos, CHUNK_AREA, CHUNK_SIZE, MAX_BLOCK_COORD, Occupancy};
+use std::cell::RefCell;
 
-/// Voxels per lattice cell along x, y and z.
-pub const CELL: [i64; 3] = [4, 8, 4];
+/// Voxels per lattice cell along x, y and z ([`Caves::CELL`]).
+const CELL: [i64; 3] = [4, 8, 4];
 /// Lattice corners of one chunk along x, y and z.
 const CORNERS: [usize; 3] = [9, 5, 9];
 /// Lattice corners of one chunk.
@@ -20,8 +21,9 @@ const Q_SCALE: f64 = 1_048_576.0;
 /// Sum of the trilinear weights of a voxel (`4 * 8 * 4`).
 const WEIGHT_SUM: i64 = 128;
 
-// Explicit salts, one per noise, XORed into `seed ^ CaveSettings::salt`. Never derived from
-// the order of the stages or the types, so adding one never reshuffles another.
+// Explicit salts, one per noise, XORed into the mix of the world seed and `CaveSettings::salt`
+// (see `Caves::base_seed`). Never derived from the order of the stages or the types, so adding
+// one never reshuffles another.
 const SALT_CHEESE: u64 = 0x63a1_5e5c_8b2d_0f17;
 const SALT_CHEESE_LAYER: u64 = 0x1f0c_d3a7_49e2_b6c5;
 const SALT_SPAGHETTI_A: u64 = 0x5bd1_e995_7c3f_a20b;
@@ -58,8 +60,10 @@ impl Fade {
         if depth <= self.full {
             return self.strength;
         }
-        // full < depth < none: both differences are positive and fit in i64.
-        let t = (self.none - depth) as f64 / (self.none - self.full) as f64;
+        // full < depth < none: both differences are positive, in i128 because they need not
+        // fit in i64 (`full = i64::MIN`). Where they fit, the f64 is the same as from i64.
+        let t = (i128::from(self.none) - i128::from(depth)) as f64
+            / (i128::from(self.none) - i128::from(self.full)) as f64;
         self.strength * t
     }
 
@@ -189,8 +193,9 @@ pub struct SurfaceFade {
 /// frozen once the look is approved).
 #[derive(Clone, Debug, PartialEq)]
 pub struct CaveSettings {
-    /// Salt mixed (XOR) into the world seed for every cave noise (each noise also has its own
-    /// constant salt): another salt gives other caves over the same terrain.
+    /// Salt of every cave noise, mixed with the world seed (each noise also has its own constant
+    /// salt): another salt gives other caves over the same terrain, unrelated to the caves of
+    /// any other salt or world seed.
     pub salt: u64,
     /// Big caverns.
     pub cheese: Option<Cheese>,
@@ -306,8 +311,10 @@ impl CaveSettings {
     }
 
     /// Depth under the lowest column from which no depth rule applies: every fade is 0, the
-    /// entrances are off and the roof is above. Chunks wholly below it need no heights.
-    pub(crate) fn surface_reach(&self) -> i64 {
+    /// entrances are off and the roof is above. Chunks wholly below it need no heights: a chunk
+    /// whose top voxel is under `Heightmap::min_height() - surface_reach()` may pass `None` to
+    /// [`Caves::chunk_corners`].
+    pub fn surface_reach(&self) -> i64 {
         let f = &self.surface_fade;
         let mut reach = f.roof;
         if self.cheese.is_some() {
@@ -353,7 +360,7 @@ const NOISE_COUNT: usize = 12;
 /// # Density model
 ///
 /// The density `D` (positive: solid) is sampled at a world-anchored lattice with one corner every
-/// 4 voxels along x and z and every 8 along y ([`CELL`]), so a chunk has `9 x 5 x 9 = 405`
+/// 4 voxels along x and z and every 8 along y ([`Caves::CELL`]), so a chunk has `9 x 5 x 9 = 405`
 /// corners and shares the ones on its faces with its neighbors (no seams). At each corner:
 ///
 /// - `D = min(cheese, spaghetti, noodles, entrance) - density`, over the cave types that are on
@@ -388,7 +395,30 @@ struct Column {
     mask: f64,
 }
 
+thread_local! {
+    /// The noise grids of [`Caves::chunk_corners`], one set per thread (`12 x 405` values, 38
+    /// KiB), so a chunk's corners do not allocate.
+    static CORNER_GRIDS: RefCell<Vec<[f64; CORNER_COUNT]>> =
+        RefCell::new(vec![[0.0; CORNER_COUNT]; NOISE_COUNT]);
+}
+
 impl Caves {
+    /// Voxels per lattice cell of the density along x, y and z: one corner every 4 voxels
+    /// across and every 8 up.
+    pub const CELL: [i64; 3] = CELL;
+
+    /// The seed every cave noise starts from: `splitmix64(splitmix64(seed) ^ salt)`. Each noise
+    /// XORs its own constant salt into it.
+    ///
+    /// Mixed, not only combined with XOR, because an fbm gives octave `k` the seed `seed + k`:
+    /// two salts (or two world seeds) that differ only in the low bits, such as 0 and 1, would
+    /// hand one salt's octave lattices to the other's octaves at another frequency, and their
+    /// caves would be related. The world seed is mixed before the salt goes in, so world 1
+    /// with salt 0 does not get the caves of world 0 with salt 1 either.
+    fn base_seed(&self, seed: u64) -> u64 {
+        splitmix64(splitmix64(seed) ^ self.settings.salt)
+    }
+
     /// The seed and fbm of one noise.
     fn noise(&self, seed: u64, n: Noise) -> (u64, Fbm3) {
         let s = &self.settings;
@@ -437,12 +467,12 @@ impl Caves {
                 s.entrances.map_or_else(unset, |e| e.tunnels.noise),
             ),
         };
-        (seed ^ s.salt ^ salt, fbm)
+        (self.base_seed(seed) ^ salt, fbm)
     }
 
     /// Seed of the entrance mask.
     fn mask_seed(&self, seed: u64) -> u64 {
-        seed ^ self.settings.salt ^ SALT_ENTRANCE_MASK
+        self.base_seed(seed) ^ SALT_ENTRANCE_MASK
     }
 
     /// The entrance mask of column `(x, z)` (0 without entrances).
@@ -493,8 +523,8 @@ impl Caves {
         ((d - s.density).clamp(-D_LIMIT, D_LIMIT) * Q_SCALE).round() as i32
     }
 
-    /// The quantized density at lattice corner `(x, y, z)` (multiples of [`CELL`]) of a column
-    /// of height `h` (the spec, one corner at a time).
+    /// The quantized density at lattice corner `(x, y, z)` (multiples of [`Caves::CELL`]) of a
+    /// column of height `h` (the spec, one corner at a time).
     pub fn corner_density(&self, seed: u64, x: i64, y: i64, z: i64, h: i64) -> i32 {
         let column = Column {
             depth: h.saturating_sub(y),
@@ -509,7 +539,17 @@ impl Caves {
     /// The trilinear sum `S` of voxel `p` (see [`Caves`]): carved iff `S < 0`.
     /// `height(x, z)` gives the surface height of a corner column. The spec: 8 corners, each
     /// computed from scratch.
+    ///
+    /// `p` must be inside the world limit (`-MAX_BLOCK_COORD..MAX_BLOCK_COORD + 32` on every
+    /// axis, as every chunk the world streams): the far corners of the cells at the ends of
+    /// `i64` do not exist. Checked in debug builds.
     pub fn voxel_sum(&self, seed: u64, p: BlockPos, height: impl Fn(i64, i64) -> i64) -> i64 {
+        debug_assert!(
+            [p.x, p.y, p.z]
+                .iter()
+                .all(|c| (-MAX_BLOCK_COORD..MAX_BLOCK_COORD + 32).contains(c)),
+            "cave density at {p:?}, outside the world limit"
+        );
         let [cx, cy, cz] = CELL;
         let (fx, fy, fz) = (p.x.rem_euclid(cx), p.y.rem_euclid(cy), p.z.rem_euclid(cz));
         let (x0, y0, z0) = (p.x - fx, p.y - fy, p.z - fz);
@@ -543,24 +583,44 @@ impl Caves {
     /// The quantized densities of the 405 corners of the chunk whose lowest corner is `origin`,
     /// indexed `(i * 5 + j) * 9 + k` for the corner at `origin + (4i, 8j, 4k)`.
     ///
-    /// `surface` gives the heights of the 9x9 corner columns (indexed `i * 9 + k`) for chunks
-    /// near the surface; `None` is only right for chunks wholly below every depth rule (the
-    /// fades, the entrances and the roof) under the lowest possible column.
+    /// `surface` gives the heights of the 9x9 corner columns (indexed `i * 9 + k`, from
+    /// [`Caves::corner_heights`]). `None` stands for "below every depth rule" (the fades, the
+    /// entrances and the roof): it is only right for a chunk whose top voxel is under
+    /// `heightmap.min_height() - settings.surface_reach()` ([`CaveSettings::surface_reach`]);
+    /// higher up it gives other corners than the spec.
+    ///
     /// Bit-identical to [`Caves::corner_density`] per corner (with the true heights), with
-    /// one noise grid per noise ([`noise::fbm_3d_grid`]).
+    /// one noise grid per noise ([`noise::fbm_3d_grid`]). The grids are kept per thread.
     pub fn chunk_corners(
         &self,
         seed: u64,
         origin: BlockPos,
         surface: Option<&[i64; COLUMN_COUNT]>,
     ) -> [i32; CORNER_COUNT] {
+        let run =
+            |grids: &mut [[f64; CORNER_COUNT]]| self.chunk_corners_in(grids, seed, origin, surface);
+        // Fresh grids only while the thread is being torn down (no thread-local left).
+        let reused = CORNER_GRIDS.try_with(|cell| match cell.try_borrow_mut() {
+            Ok(mut grids) => run(&mut grids),
+            Err(_) => run(&mut vec![[0.0; CORNER_COUNT]; NOISE_COUNT]),
+        });
+        reused.unwrap_or_else(|_| run(&mut vec![[0.0; CORNER_COUNT]; NOISE_COUNT]))
+    }
+
+    /// [`Caves::chunk_corners`] with the noise grids in `grids` (`NOISE_COUNT` of them). Only
+    /// the grids of the noises in use are written, and only those are read.
+    fn chunk_corners_in(
+        &self,
+        grids: &mut [[f64; CORNER_COUNT]],
+        seed: u64,
+        origin: BlockPos,
+        surface: Option<&[i64; COLUMN_COUNT]>,
+    ) -> [i32; CORNER_COUNT] {
         let s = &self.settings;
-        let lattice = |o: i64, step: i64, n: usize| -> Vec<i64> {
-            (0..n as i64).map(|i| o + i * step).collect()
-        };
-        let xs = lattice(origin.x, CELL[0], CORNERS[0]);
-        let ys = lattice(origin.y, CELL[1], CORNERS[1]);
-        let zs = lattice(origin.z, CELL[2], CORNERS[2]);
+        let lattice =
+            |o: i64, step: i64| -> [i64; 9] { std::array::from_fn(|i| o + i as i64 * step) };
+        let (xs, zs) = (lattice(origin.x, CELL[0]), lattice(origin.z, CELL[2]));
+        let ys: [i64; 5] = std::array::from_fn(|j| origin.y + j as i64 * CELL[1]);
         let column_of = |i: usize| (i / (CORNERS[1] * CORNERS[2])) * CORNERS[2] + i % CORNERS[2];
         let y_of = |i: usize| ys[(i / CORNERS[2]) % CORNERS[1]];
         // Column inputs per corner.
@@ -575,47 +635,57 @@ impl Caves {
                 mask: masks[c],
             }
         });
-        // The noise grids the corners need.
-        let mut grids = vec![[0.0; CORNER_COUNT]; NOISE_COUNT];
-        let fill = |n: Noise, grids: &mut Vec<[f64; CORNER_COUNT]>| {
+        // The noise grids the corners need (`filled`: which ones, checked in debug builds).
+        let mut filled = 0u32;
+        let mut fill = |n: Noise, grids: &mut [[f64; CORNER_COUNT]]| {
             let (seed, fbm) = self.noise(seed, n);
             noise::fbm_3d_grid(seed, &xs, &ys, &zs, fbm, &mut grids[n as usize]);
+            filled |= 1 << n as u32;
         };
         if s.cheese.is_some() {
-            fill(Noise::Cheese, &mut grids);
-            fill(Noise::CheeseLayer, &mut grids);
+            fill(Noise::Cheese, grids);
+            fill(Noise::CheeseLayer, grids);
         }
         if let Some(t) = &s.spaghetti {
-            fill(Noise::SpaghettiA, &mut grids);
-            fill(Noise::SpaghettiB, &mut grids);
+            fill(Noise::SpaghettiA, grids);
+            fill(Noise::SpaghettiB, grids);
             if t.width_variation != 0.0 {
-                fill(Noise::SpaghettiWidth, &mut grids);
+                fill(Noise::SpaghettiWidth, grids);
             }
         }
         if let Some(n) = &s.noodles {
-            fill(Noise::NoodleToggle, &mut grids);
+            fill(Noise::NoodleToggle, grids);
             if grids[Noise::NoodleToggle as usize].iter().any(|&t| t > 0.0) {
-                fill(Noise::NoodleA, &mut grids);
-                fill(Noise::NoodleB, &mut grids);
+                fill(Noise::NoodleA, grids);
+                fill(Noise::NoodleB, grids);
                 if n.tunnels.width_variation != 0.0 {
-                    fill(Noise::NoodleWidth, &mut grids);
+                    fill(Noise::NoodleWidth, grids);
                 }
             }
         }
         if let Some(e) = &s.entrances
             && columns.iter().any(|c| e.scale(c.depth, c.mask).is_some())
         {
-            fill(Noise::EntranceA, &mut grids);
-            fill(Noise::EntranceB, &mut grids);
+            fill(Noise::EntranceA, grids);
+            fill(Noise::EntranceB, grids);
             if e.tunnels.width_variation != 0.0 {
-                fill(Noise::EntranceWidth, &mut grids);
+                fill(Noise::EntranceWidth, grids);
             }
         }
-        std::array::from_fn(|i| self.corner_q(columns[i], |n| grids[n as usize][i]))
+        // The grids are reused between chunks: a noise read without being filled would be
+        // another chunk's.
+        let grids = &*grids;
+        std::array::from_fn(|i| {
+            self.corner_q(columns[i], |n| {
+                debug_assert!(filled & 1 << n as u32 != 0, "{n:?} read but not filled");
+                grids[n as usize][i]
+            })
+        })
     }
 
-    /// The heights of the 9x9 corner columns of the chunk at `origin` (indexed `i * 9 + k`).
-    pub(crate) fn corner_heights(
+    /// The heights of the 9x9 corner columns of the chunk at `origin`, indexed `i * 9 + k` for
+    /// column `(origin.x + 4i, origin.z + 4k)`: the `surface` of [`Caves::chunk_corners`].
+    pub fn corner_heights(
         heightmap: &Heightmap,
         seed: u64,
         origin: BlockPos,
@@ -629,6 +699,48 @@ impl Caves {
             &mut [0.0; COLUMN_COUNT],
             &mut out,
         );
+        out
+    }
+
+    /// [`Caves::corner_heights`] of a chunk whose 32x32 column heights are already known
+    /// (`heights`, indexed `x * 32 + z`): the 8x8 corner columns inside the chunk are read from
+    /// them, and only the 17 on its +x and +z borders (in the next chunks) are computed.
+    pub(crate) fn corner_heights_from(
+        heightmap: &Heightmap,
+        seed: u64,
+        origin: BlockPos,
+        heights: &[i64; CHUNK_AREA],
+    ) -> [i64; COLUMN_COUNT] {
+        let [step_x, _, step_z] = CELL.map(|c| c as usize);
+        let size = i64::from(CHUNK_SIZE);
+        let mut out = [0; COLUMN_COUNT];
+        for i in 0..CORNERS[0] - 1 {
+            for k in 0..CORNERS[2] - 1 {
+                out[i * CORNERS[2] + k] = heights[((i * step_x) << 5) | (k * step_z)];
+            }
+        }
+        // The +x border (9 columns, its +z corner included), then the +z border (8 columns).
+        let axis = |o: i64, step: i64| -> [i64; 9] { std::array::from_fn(|i| o + i as i64 * step) };
+        let (xs, zs) = (axis(origin.x, CELL[0]), axis(origin.z, CELL[2]));
+        let last = CORNERS[0] - 1;
+        heightmap.heights_with(
+            seed,
+            &[origin.x + size],
+            &zs,
+            &mut [0.0; 9],
+            &mut out[last * CORNERS[2]..],
+        );
+        let mut border = [0; 8];
+        heightmap.heights_with(
+            seed,
+            &xs[..last],
+            &[origin.z + size],
+            &mut [0.0; 8],
+            &mut border,
+        );
+        for (i, h) in border.into_iter().enumerate() {
+            out[i * CORNERS[2] + last] = h;
+        }
         out
     }
 }
@@ -818,5 +930,120 @@ mod tests {
         assert_eq!(e.scale(0, 1.0), Some(1.0));
         assert_eq!(e.scale(e.max_depth - e.depth_ramp / 2, 1.0), Some(0.5));
         assert_eq!(e.scale(i64::MIN, 1.0), Some(1.0));
+    }
+
+    #[test]
+    fn fades_wider_than_i64_keep_their_sign() {
+        // `none - full` does not fit in i64: the fade still goes from `strength` down to 0.
+        for (full, none) in [(i64::MIN, 24), (i64::MIN, i64::MAX), (-5, i64::MAX)] {
+            let f = Fade {
+                full,
+                none,
+                strength: 1.5,
+            };
+            let depths = [
+                full,
+                full.saturating_add(1),
+                -1,
+                0,
+                23,
+                none.saturating_sub(1),
+            ];
+            let mut last = f.at(full);
+            assert_eq!(last, 1.5, "{f:?}");
+            for depth in depths {
+                let v = f.at(depth);
+                assert!((0.0..=1.5).contains(&v), "{f:?} at {depth}: {v}");
+                assert!(v <= last, "{f:?} grows at {depth}");
+                last = v;
+            }
+            assert_eq!(f.at(none), 0.0);
+        }
+        // Half way between i64::MIN and i64::MAX: half the strength.
+        let wide = Fade {
+            full: i64::MIN,
+            none: i64::MAX,
+            strength: 2.0,
+        };
+        assert_eq!(wide.at(0), 1.0);
+    }
+
+    #[test]
+    fn cave_noises_share_no_octave_seeds() {
+        // Octave k of an fbm uses the seed `seed + k`: no two noises, salts or nearby world
+        // seeds may reach the same octave seed (with plain XOR, salt 1 took salt 0's octaves).
+        let noises = [
+            Noise::Cheese,
+            Noise::CheeseLayer,
+            Noise::SpaghettiA,
+            Noise::SpaghettiB,
+            Noise::SpaghettiWidth,
+            Noise::NoodleA,
+            Noise::NoodleB,
+            Noise::NoodleWidth,
+            Noise::NoodleToggle,
+            Noise::EntranceA,
+            Noise::EntranceB,
+            Noise::EntranceWidth,
+        ];
+        assert_eq!(noises.len(), NOISE_COUNT);
+        let default_seed = crate::TerrainGenerator::default().seed;
+        let mut seen = std::collections::HashMap::new();
+        for world in [
+            0,
+            1,
+            2,
+            3,
+            default_seed - 1,
+            default_seed,
+            default_seed + 1,
+            u64::MAX,
+        ] {
+            for salt in 0..16 {
+                let caves = Caves {
+                    settings: CaveSettings {
+                        salt,
+                        ..CaveSettings::default()
+                    },
+                };
+                let seeds = noises
+                    .iter()
+                    .map(|&n| (format!("{n:?}"), caves.noise(world, n).0))
+                    .chain([("Mask".to_string(), caves.mask_seed(world))]);
+                for (name, seed) in seeds {
+                    // Up to 8 octaves each.
+                    for k in 0..8u64 {
+                        let here = (world, salt, name.clone(), k);
+                        if let Some(other) = seen.insert(seed.wrapping_add(k), here.clone()) {
+                            panic!("octave seed shared by {other:?} and {here:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn corner_heights_from_the_chunk_heights_are_the_heights() {
+        let heightmap = Heightmap::default();
+        let seed = crate::TerrainGenerator::default().seed;
+        let limit = MAX_BLOCK_COORD - 32;
+        for (x, z) in [(0, 0), (-32, 96), (1 << 40, -(1 << 40)), (limit, -limit)] {
+            let origin = BlockPos::new(x, 64, z);
+            let heights = heightmap.chunk_heights(seed, x, z);
+            assert_eq!(
+                Caves::corner_heights_from(&heightmap, seed, origin, &heights),
+                Caves::corner_heights(&heightmap, seed, origin),
+                "{origin:?}"
+            );
+            for (c, &h) in Caves::corner_heights(&heightmap, seed, origin)
+                .iter()
+                .enumerate()
+            {
+                let (i, k) = (c / 9, c % 9);
+                let (cx, cz) = (x + 4 * i as i64, z + 4 * k as i64);
+                assert_eq!(h, heightmap.height_at(seed, cx, cz), "column ({cx}, {cz})");
+            }
+        }
     }
 }
