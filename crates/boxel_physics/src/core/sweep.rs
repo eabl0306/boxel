@@ -67,8 +67,13 @@ pub struct SweepOut {
     /// it landed (on blocks or on an obstacle), `Face::PosX` that it hit something moving +X.
     pub faces: u8,
     /// When it landed on blocks: the block under the center of the box's bottom if that block is
-    /// full, else the first full block found under the box.
+    /// full, else the first full block found under the box (`blocks[1]` of a downward clip).
     pub ground: Option<BlockPos>,
+    /// Per axis (0 = X, 1 = Y, 2 = Z), the full block that clipped the move on that axis: on the
+    /// blocking layer, the block in line with the center of the box's leading face if it is
+    /// full, else the first full block found there. `None` when the axis moved freely or an
+    /// obstacle box clipped it.
+    pub blocks: [Option<BlockPos>; 3],
     /// The box ends overlapping a fluid block.
     pub in_fluid: bool,
     /// The box started inside full blocks and was pushed out first.
@@ -164,6 +169,7 @@ pub fn move_box<S: VoxelSource + ?Sized>(
     };
     let mut faces = 0u8;
     let mut ground = None;
+    let mut blocks = [None; 3];
     for axis in axis_order(d) {
         if d[axis] == 0.0 {
             continue;
@@ -171,11 +177,12 @@ pub fn move_box<S: VoxelSource + ?Sized>(
         let clip = grid.clip_axis(axis, pos, shape, d[axis], obstacles)?;
         match clip {
             Clip::Free => pos[axis] += d[axis],
-            Clip::Plane { pos: p, ground: g } => {
+            Clip::Plane { pos: p, block } => {
                 pos[axis] = p;
                 faces |= 1 << face_of(axis, d[axis] > 0.0).index();
+                blocks[axis] = block;
                 if axis == 1 && d[axis] < 0.0 {
-                    ground = g;
+                    ground = block;
                 }
             }
         }
@@ -194,6 +201,7 @@ pub fn move_box<S: VoxelSource + ?Sized>(
         moved,
         faces,
         ground,
+        blocks,
         in_fluid,
         depenetrated,
     })
@@ -260,9 +268,9 @@ fn footprint(min: f64, max: f64, eps: f64) -> (i64, i64) {
 enum Clip {
     /// Nothing in the way: the whole displacement.
     Free,
-    /// Stopped: the new position on that axis, and the supporting block for a downward clip on
-    /// blocks.
-    Plane { pos: f64, ground: Option<BlockPos> },
+    /// Stopped: the new position on that axis, and the block that stopped it (`None` for an
+    /// obstacle).
+    Plane { pos: f64, block: Option<BlockPos> },
 }
 
 /// The voxel grid seen from the frame of `origin`: block `(x, y, z)` of the frame is world
@@ -398,19 +406,24 @@ impl<S: VoxelSource + ?Sized> Grid<'_, S> {
             if plane < f64::INFINITY {
                 last = last.min(plane.ceil() as i64 - 1);
             }
+            let mut block = None;
             for layer in first..=last {
-                if self
-                    .first_full_in_layer(axis, layer, (b_axis, c_axis), b, c)?
-                    .is_some()
+                if let Some(found) =
+                    self.first_full_in_layer(axis, layer, (b_axis, c_axis), b, c)?
                 {
                     plane = layer as f64;
+                    block = Some(found);
                     break;
                 }
             }
             if plane < lead + d {
+                let block = match block {
+                    Some(found) => Some(self.contact_block(axis, found, bx, b, c)?),
+                    None => None,
+                };
                 return Ok(Clip::Plane {
                     pos: plane - shape.max[axis],
-                    ground: None,
+                    block,
                 });
             }
         } else {
@@ -443,37 +456,38 @@ impl<S: VoxelSource + ?Sized> Grid<'_, S> {
                 layer -= 1;
             }
             if plane > lead + d {
-                let ground = match block {
-                    Some(found) if axis == 1 => Some(self.ground(found, bx, b, c)?),
-                    _ => None,
+                let block = match block {
+                    Some(found) => Some(self.contact_block(axis, found, bx, b, c)?),
+                    None => None,
                 };
                 return Ok(Clip::Plane {
                     pos: plane - shape.min[axis],
-                    ground,
+                    block,
                 });
             }
         }
         Ok(Clip::Free)
     }
 
-    /// The supporting block of a downward clip on layer `found[1]`: the block under the center
-    /// of the box's bottom if it is full and in the footprint, else `found` (the first full
-    /// block of the layer).
-    fn ground(
+    /// The block that clipped `axis` on layer `found[axis]`: the block in line with the center
+    /// of the box's leading face (clamped to the footprint `b` x `c` on the other two axes, in
+    /// increasing order) if it is full, else `found` (the first full block of the layer). For a
+    /// downward clip this is the supporting block under the center of the box's bottom.
+    fn contact_block(
         &mut self,
+        axis: usize,
         found: [i64; 3],
         bx: LocalBox,
-        x: (i64, i64),
-        z: (i64, i64),
+        b: (i64, i64),
+        c: (i64, i64),
     ) -> Result<BlockPos, Unloaded> {
         let center = bx.center();
-        let under = [
-            (center.x.floor() as i64).clamp(x.0, x.1),
-            found[1],
-            (center.z.floor() as i64).clamp(z.0, z.1),
-        ];
-        Ok(if under != found && self.full(under)? {
-            self.world(under)
+        let (b_axis, c_axis) = others(axis);
+        let mut facing = found;
+        facing[b_axis] = (center[b_axis].floor() as i64).clamp(b.0, b.1);
+        facing[c_axis] = (center[c_axis].floor() as i64).clamp(c.0, c.1);
+        Ok(if facing != found && self.full(facing)? {
+            self.world(facing)
         } else {
             self.world(found)
         })

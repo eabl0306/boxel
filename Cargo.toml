@@ -183,6 +183,12 @@ required-features = ["render", "voxel", "png", "physics"]
 # Runs its option-parsing tests with `cargo test`.
 test = true
 
+[[example]]
+name = "physics_sandbox"
+required-features = ["render", "voxel", "physics"]
+# Runs its option, drop-test and item tests (headless) with `cargo test`.
+test = true
+
 # `cargo test` also runs the unit tests inside the example (options, camera script, report).
 [[example]]
 name = "stress"

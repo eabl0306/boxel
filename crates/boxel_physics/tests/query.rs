@@ -67,7 +67,7 @@ fn app_with(generator: Arc<dyn WorldGenerator>, settings: WorldSettings) -> App 
             executor: Arc::new(InlineExecutor),
             ..WorldPlugin::default()
         },
-        PhysicsPlugin,
+        PhysicsPlugin::default(),
     ));
     app.finish();
     app.cleanup();
@@ -292,6 +292,6 @@ fn chunk_source_agrees_with_the_same_chunks_in_a_test_world() {
 #[should_panic(expected = "PhysicsPlugin needs the voxel world")]
 fn the_plugin_needs_the_world() {
     let mut app = App::new();
-    app.add_plugins(PhysicsPlugin);
+    app.add_plugins(PhysicsPlugin::default());
     app.finish();
 }

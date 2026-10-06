@@ -7,7 +7,9 @@
 //! grabbed, left click breaks the block under the crosshair and right click places the selected
 //! block on the face it points at (keys 1 to 9 select it; F3 shows the target and the
 //! selection). Picking is a voxel raycast from the camera (`PhysicsQuery::raycast_voxels`),
-//! reach 6 blocks.
+//! reach 6 blocks. G switches between flying and walking: walking is a player body with gravity
+//! (`boxel::physics`, a 0.6 x 1.8 x 0.6 box and a `CharacterController`) that WASD moves along
+//! the view and Space makes jump, with the camera at its eye; F3 then shows a physics line.
 //!
 //! `--frames`, `--duration`, `--screenshot`, `--minimize-test`, `--resize-test`, `--vsync-test`
 //! and the like make it close by itself (`--duration` keeps the interactive path: fly camera
@@ -22,6 +24,8 @@
 //! generator, and `--world overworld` the caves.
 #![expect(clippy::print_stdout, clippy::print_stderr, reason = "CLI output")]
 
+#[path = "shared/player.rs"]
+mod player;
 #[path = "shared/world.rs"]
 mod world;
 
@@ -37,6 +41,7 @@ use boxel::voxel::{BlockRegistry, MAX_BLOCK_COORD};
 use boxel::window::winit::dpi::PhysicalSize;
 use boxel::window::{PrimaryWindow, WindowResized};
 use boxel::world::{BlockEdit, WorldContent, WorldStats, WorldSystems};
+use player::WalkPlugin;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
@@ -74,6 +79,7 @@ usage: voxel_world [GPU options] [options]
                           list repeats it: the second loss of an adapter lowers its tier)
   --async-threads N       async compute pool size (chunk jobs)
   --debug-overlay         start with the F3 debug overlay visible (F3 toggles it)
+  --walk                  start walking on the ground under the camera (G toggles walking)
   --help                  this text
 exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 check failed, 4 timeout";
 
@@ -142,6 +148,8 @@ struct Options {
     async_threads: Option<usize>,
     world: WorldChoice,
     debug_overlay: bool,
+    /// Start walking (G switches walking and flying).
+    walk: bool,
     duration: Option<Duration>,
     /// `None`: the engine default (`FrameLimit::default()`, 144).
     fps_limit: Option<u32>,
@@ -192,6 +200,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         async_threads: None,
         world: WorldChoice::default(),
         debug_overlay: false,
+        walk: false,
         duration: None,
         fps_limit: None,
         vsync: None,
@@ -296,6 +305,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                 );
             }
             "--debug-overlay" => o.debug_overlay = true,
+            "--walk" => o.walk = true,
             "--duration" => o.duration = Some(Duration::from_secs(number(flag, &value()?)?)),
             "--fps-limit" => {
                 let n = number(flag, &value()?)?;
@@ -1329,11 +1339,13 @@ fn main() -> AppExit {
         app.insert_resource(PresentSettings::vsync(on));
     }
     let interactive = !options.automation();
+    let start_walking = options.walk;
     app.add_plugins((
         LogDiagnosticsPlugin::default(),
         FlyCameraPlugin,
-        PhysicsPlugin,
+        PhysicsPlugin::default(),
         PickingPlugin,
+        WalkPlugin { start_walking },
     ));
     // The camera moves first; the world then computes interest from the new position.
     app.configure_sets(Update, FlyCameraSystems.before(WorldSystems::Interest))
@@ -1442,10 +1454,11 @@ mod tests {
     }
 
     /// A headless app with the world (stone y 0..=2, grass at y = 3, inline jobs), physics,
-    /// the fly camera and picking, settled; the cursor is free and a fly camera at (0.5, 6, 0.5)
-    /// looks straight down at the grass (top face at y = 4). `Update` is strict about
-    /// ambiguities, so picking must be ordered against the fly camera's grab (both use
-    /// `CursorOptions`).
+    /// the fly camera, picking and walking, settled; the cursor is free and a fly camera at
+    /// (0.5, 6, 0.5) looks straight down at the grass (top face at y = 4). `Update` is strict
+    /// about ambiguities, so picking must be ordered against the fly camera's grab (both use
+    /// `CursorOptions`), and walking against the camera's moves. Every update is one fixed step
+    /// (a synthetic clock).
     fn picking_app() -> App {
         use boxel::ecs::schedule::{LogLevel, ScheduleBuildSettings};
         use boxel::world::jobs::InlineExecutor;
@@ -1463,8 +1476,9 @@ mod tests {
                 executor: std::sync::Arc::new(InlineExecutor),
                 ..WorldPlugin::default()
             },
-            PhysicsPlugin,
+            PhysicsPlugin::default(),
             PickingPlugin,
+            WalkPlugin::default(),
         ))
         .init_resource::<OverlayLines>()
         .edit_schedule(Update, |schedule| {
@@ -1473,6 +1487,7 @@ mod tests {
                 ..ScheduleBuildSettings::default()
             });
         });
+        player::clock::fixed_frames(&mut app, player::clock::STEP);
         let pitch = -std::f32::consts::FRAC_PI_2;
         app.world_mut().spawn((
             Camera::default(),
@@ -1588,6 +1603,113 @@ mod tests {
         click(&mut app, MouseButton::Left);
         assert_eq!(grab(&app), CursorGrab::Locked);
         assert_eq!(block_at(&app, BlockPos::new(0, 3, 0)), Some(grass));
+    }
+
+    /// Presses or releases `key` (seen by the next update).
+    fn key(app: &mut App, key: KeyCode, pressed: bool) {
+        use boxel::window::{ButtonState, KeyboardInput};
+        let state = if pressed {
+            ButtonState::Pressed
+        } else {
+            ButtonState::Released
+        };
+        app.world_mut()
+            .resource_mut::<Messages<KeyboardInput>>()
+            .write(KeyboardInput {
+                key,
+                state,
+                repeat: false,
+            });
+    }
+
+    /// Taps `key`: pressed for one update, released in the next.
+    fn tap(app: &mut App, k: KeyCode) {
+        key(app, k, true);
+        app.update();
+        key(app, k, false);
+        app.update();
+    }
+
+    fn walker(app: &mut App) -> Option<Entity> {
+        let mut players = app
+            .world_mut()
+            .query_filtered::<Entity, With<player::Player>>();
+        players.iter(app.world()).next()
+    }
+
+    fn camera_at(app: &mut App) -> DVec3 {
+        let mut cameras = app
+            .world_mut()
+            .query_filtered::<&Transform, With<FlyCamera>>();
+        cameras.single(app.world()).expect("camera").translation
+    }
+
+    #[test]
+    fn g_walks_with_gravity_and_jumps_then_flies_again() {
+        use boxel::physics::{BodyPosition, Contacts};
+        use player::{EYE_HEIGHT, WALK_KEY};
+        let mut app = picking_app();
+        assert!(walker(&mut app).is_none());
+        let line = |app: &App, key: &str| {
+            app.world()
+                .resource::<OverlayLines>()
+                .get(key)
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(line(&app, "move"), "Fly (G walks)");
+
+        // G: the player appears under the camera's eye and falls onto the grass (top at y = 4).
+        tap(&mut app, WALK_KEY);
+        for _ in 0..64 {
+            app.update();
+        }
+        let body = walker(&mut app).expect("walking");
+        let feet = |app: &App| app.world().get::<BodyPosition>(body).expect("body").0;
+        assert_eq!(feet(&app), WorldPos::from_dvec3(DVec3::new(0.5, 4.0, 0.5)));
+        assert_eq!(camera_at(&mut app), DVec3::new(0.5, 4.0 + EYE_HEIGHT, 0.5));
+        assert_eq!(
+            line(&app, "move"),
+            "Walk (G flies)  on ground  speed 0.00 b/s"
+        );
+        assert!(
+            line(&app, "physics").starts_with("Physics bodies=1 dynamic=1 frozen=0"),
+            "{}",
+            line(&app, "physics")
+        );
+
+        // W walks along the camera's heading (yaw 0: north, -Z) at about 4.3 blocks/s.
+        key(&mut app, KeyCode::KeyW, true);
+        for _ in 0..64 {
+            app.update();
+        }
+        key(&mut app, KeyCode::KeyW, false);
+        app.update();
+        let p = feet(&app).to_dvec3();
+        assert_eq!((p.x, p.y), (0.5, 4.0));
+        assert!(p.z < -2.5, "{p:?}");
+
+        // Space jumps about 1.24 blocks and lands again.
+        tap(&mut app, KeyCode::Space);
+        let mut top: f64 = 4.0;
+        for _ in 0..64 {
+            app.update();
+            top = top.max(feet(&app).to_dvec3().y);
+        }
+        assert!((5.1..5.3).contains(&top), "{top}");
+        assert_eq!(feet(&app).to_dvec3().y, 4.0);
+        assert!(app.world().get::<Contacts>(body).expect("body").on_ground);
+
+        // G again: flying, the body is gone and Space flies the camera up.
+        tap(&mut app, WALK_KEY);
+        assert!(walker(&mut app).is_none());
+        assert_eq!(line(&app, "move"), "Fly (G walks)");
+        let before = camera_at(&mut app);
+        key(&mut app, KeyCode::Space, true);
+        for _ in 0..10 {
+            app.update();
+        }
+        assert!(camera_at(&mut app).y > before.y + 2.0);
     }
 
     #[test]

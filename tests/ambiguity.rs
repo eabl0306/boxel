@@ -67,7 +67,7 @@ fn strict_app() -> App {
         },
     ));
     #[cfg(feature = "physics")]
-    app.add_plugins(boxel::physics::PhysicsPlugin);
+    app.add_plugins(boxel::physics::PhysicsPlugin::default());
     app.edit_schedule(First, strict)
         .edit_schedule(PreUpdate, strict)
         .edit_schedule(RunFixedMainLoop, strict)

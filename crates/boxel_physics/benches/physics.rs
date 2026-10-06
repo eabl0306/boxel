@@ -1,7 +1,7 @@
 //! Physics core benches on generated worlds, read through `ChunkSource` like the ECS layer does
 //! (one hash lookup per chunk touched, uniform chunks without decoding).
 //!
-//! Targets (physics plan, phase P1; dev laptop, one thread):
+//! Targets (physics plan, phases P1 and P2; dev laptop, one thread):
 //!
 //! | Bench | Target |
 //! |---|---|
@@ -9,17 +9,26 @@
 //! | `raycast/pick_6` | <= 0.5 us |
 //! | `raycast/cave_256` | <= 5 us |
 //! | `raycast/sky_1024` | <= 10 us |
+//! | `tick/0` | <= 20 us |
+//! | `tick/100` | <= 0.05 ms |
+//! | `tick/1000` | <= 0.5 ms |
 //!
 //! The worlds are streamed once by a headless app (`WorldPlugin`, inline jobs) before the
 //! measurements: forest terrain around the origin, a wide sky above it and a line of
-//! underground overworld chunks with caves. Run when the machine is idle (`tools/wait-idle.sh`).
+//! underground overworld chunks with caves. A `tick` is one run of `FixedPostUpdate` with
+//! `PhysicsPlugin` (every physics system of a fixed step) on the forest, with that many awake
+//! bodies: 70 % walking characters that turn around every 64 steps (some jump then), 30 % items
+//! dropped from up to 20 blocks. Run when the machine is idle (`tools/wait-idle.sh`).
 #![expect(clippy::print_stdout, reason = "bench setup output")]
 
-use boxel_app::App;
-use boxel_math::DVec3;
+use boxel_app::{App, FixedPostUpdate, FixedTime};
+use boxel_ecs::message::Messages;
+use boxel_ecs::prelude::*;
+use boxel_math::{DVec3, Vec2};
 use boxel_physics::{
-    ChunkSource, CollisionTable, LocalBox, RayResult, SweepConfig, VoxelFilter, move_box,
-    raycast_voxels,
+    BodyPosition, BodySettings, CharacterController, ChunkSource, Collider, CollisionTable,
+    LocalBox, MoveIntent, PhysicsPlugin, PhysicsStats, RayResult, RigidBody, SweepConfig, Teleport,
+    Velocity, VoxelFilter, VoxelImpact, move_box, raycast_voxels,
 };
 use boxel_transform::Transform;
 use boxel_voxel::{BlockRegistry, WorldPos};
@@ -258,5 +267,174 @@ fn benches(c: &mut Criterion) {
     ray.finish();
 }
 
-criterion_group!(physics, benches);
+/// A headless app with the forest streamed around the origin (radius 2) and `PhysicsPlugin`,
+/// without `TimePlugin`: the bench runs `FixedPostUpdate` itself.
+fn physics_app() -> App {
+    let start = Instant::now();
+    let mut app = App::new();
+    app.add_plugins((
+        WorldPlugin {
+            generator: Arc::new(ForestGenerator::default()),
+            executor: Arc::new(InlineExecutor),
+            ..WorldPlugin::default()
+        },
+        PhysicsPlugin::default(),
+    ))
+    .init_resource::<FixedTime>();
+    app.finish();
+    app.cleanup();
+    app.world_mut().spawn((
+        Transform::from_translation(DVec3::new(0.0, 70.0, 0.0)),
+        ChunkViewer::new(2).with_vertical_radius(2),
+    ));
+    loop {
+        app.update();
+        let stats = *app.world().resource::<WorldStats>();
+        if stats.chunks > 0 && stats.is_settled() {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(300),
+            "not settled: {stats:?}"
+        );
+    }
+    app
+}
+
+/// Where a walker started: the bench puts it back there every 1024 steps, so walkers that get
+/// stuck on one side of a tree do not drift out of the loaded area over a long measurement.
+#[derive(Component, Clone, Copy)]
+struct Home(WorldPos);
+
+/// `SplitMix64`, for the bodies' places.
+fn mix(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Spawns `n` bodies on the forest within 48 blocks of the origin (see the module docs).
+fn spawn_bodies(app: &mut App, table: &CollisionTable, n: u64) {
+    let mut places = Vec::new();
+    {
+        let world = app.world();
+        let mut source = ChunkSource::new(
+            world.resource::<ChunkMap>(),
+            world.resource::<WorldSettings>(),
+        );
+        for i in 0..n {
+            let r = mix(i);
+            let x = (r % 96) as f64 - 47.5;
+            let z = ((r >> 8) % 96) as f64 - 47.5;
+            let top = WorldPos::from_dvec3(DVec3::new(x, 150.0, z));
+            let RayResult::Hit(hit) = raycast_voxels(
+                &mut source,
+                table,
+                top,
+                DVec3::NEG_Y,
+                200.0,
+                VoxelFilter::Collision,
+            ) else {
+                panic!("no ground under ({x}, {z})");
+            };
+            places.push((r, hit.point));
+        }
+    }
+    for (r, ground) in places {
+        if r % 10 < 7 {
+            let angle = (r >> 16) % 8;
+            let wish = [
+                Vec2::X,
+                Vec2::NEG_X,
+                Vec2::Y,
+                Vec2::NEG_Y,
+                Vec2::ONE.normalize(),
+                Vec2::NEG_ONE.normalize(),
+                Vec2::new(1.0, -1.0).normalize(),
+                Vec2::new(-1.0, 1.0).normalize(),
+            ][angle as usize];
+            app.world_mut().spawn((
+                RigidBody::Dynamic,
+                Collider::standing(0.6, 1.8),
+                CharacterController::default(),
+                MoveIntent { wish, jump: false },
+                Teleport(ground),
+                Home(ground),
+            ));
+        } else {
+            let height = ((r >> 24) % 20) as f64 + 0.5;
+            app.world_mut().spawn((
+                RigidBody::Dynamic,
+                Collider::aabb(DVec3::splat(0.125)).sensor(),
+                BodySettings::item(),
+                Teleport(ground.offset(DVec3::new(0.0, height, 0.0))),
+            ));
+        }
+    }
+}
+
+/// Every 64 steps the walkers turn around and every fourth one jumps, and every 1024 steps they
+/// go back home; the impact messages of those steps are dropped (no `First` runs here to
+/// rotate them).
+fn turn(app: &mut App, tick: u64) {
+    let world = app.world_mut();
+    let home = tick.is_multiple_of(1024);
+    let mut walkers = world.query::<(
+        Entity,
+        &mut MoveIntent,
+        &Home,
+        &mut BodyPosition,
+        &mut Velocity,
+    )>();
+    for (entity, mut intent, start, mut position, mut velocity) in walkers.iter_mut(world) {
+        intent.wish = -intent.wish;
+        if (entity.to_bits() ^ (tick / 64)).is_multiple_of(4) {
+            intent.jump = true;
+        }
+        if home {
+            // `Transform` still holds what physics wrote: no teleport, the position stays.
+            position.0 = start.0;
+            velocity.0 = DVec3::ZERO;
+        }
+    }
+    world.resource_mut::<Messages<VoxelImpact>>().update();
+}
+
+fn tick_benches(c: &mut Criterion) {
+    let table = CollisionTable::from_registry(&BlockRegistry::default_blocks());
+    let mut app = physics_app();
+    let mut tick = c.benchmark_group("tick");
+    let mut spawned = 0;
+    for n in [0, 100, 1000] {
+        spawn_bodies(&mut app, &table, n - spawned);
+        spawned = n;
+        // Settle the drops a little before measuring.
+        for t in 0..256u64 {
+            if t.is_multiple_of(64) {
+                turn(&mut app, t);
+            }
+            app.world_mut().run_schedule(FixedPostUpdate);
+        }
+        let mut t = 0u64;
+        tick.bench_function(n.to_string(), |b| {
+            b.iter(|| {
+                t += 1;
+                if t.is_multiple_of(64) {
+                    turn(&mut app, t);
+                }
+                app.world_mut().run_schedule(FixedPostUpdate);
+            });
+        });
+        let stats = *app.world().resource::<PhysicsStats>();
+        println!(
+            "physics bench: tick/{n}: bodies={} dynamic={} frozen={}",
+            stats.bodies, stats.dynamic, stats.frozen
+        );
+        assert_eq!(stats.frozen, 0, "every body is on loaded ground");
+    }
+    tick.finish();
+}
+
+criterion_group!(physics, benches, tick_benches);
 criterion_main!(physics);
