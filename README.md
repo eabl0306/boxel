@@ -30,7 +30,7 @@ Estado: milestone M0, en desarrollo. Solo escritorio (Linux, Windows, macOS).
 | `just test-window` | Precisión del límite de FPS con una ventana real (necesita pantalla) |
 | `just test-lavapipe` / `just test-llvmpipe` | Tests de GPU por CPU (Vulkan / GL) |
 | `just bench` | Benchmarks |
-| `just bench-fly`, `bench-static`, `bench-spin`, `bench-all` | Mide los tirones del frame mientras carga el mundo ([docs/benchmarks.md](docs/benchmarks.md)) |
+| `just bench-fly`, `bench-static`, `bench-spin`, `bench-dive`, `bench-all` | Mide los tirones del frame mientras carga el mundo ([docs/benchmarks.md](docs/benchmarks.md)) |
 | `just gpu-info` | Informe de GPUs y qué elegiría boxel |
 | `just run <ejemplo> <opciones>` | Corre `voxel_world` o `headless_world` en release |
 
@@ -51,6 +51,8 @@ Opciones útiles: `--fps-limit N` (0 = sin límite), `--vsync on|off`, `--seed N
 `--view-distance N` (en chunks), `--vertical-radius N` (chunks hacia arriba y hacia abajo, 8 por
 defecto), `--size 1280x720`, `--camera x,y,z,yaw,pitch` (ángulos en grados), `--tier high|mid|low`,
 `--help` (lista todo).
+`--world overworld` muestra el mundo con cuevas (piedra infinita hacia abajo) en vez del bosque
+de siempre; `--caves mc|closed|off` elige las cuevas y `--no-trees` saca los árboles.
 Para pruebas automáticas usa siempre `--frames N --timeout SEG`: la ventana se cierra sola.
 `--wait-chunks` empieza a contar frames cuando el terreno terminó de cargar y
 `--screenshot shot.png` guarda una captura en el frame N. `--duration SEG` corre el juego normal
@@ -64,10 +66,13 @@ cargo run --release --example headless_world
 just run headless_world --view-distance 32 --hz 144 --speed 256
 ```
 
-Opciones: `--view-distance N`, `--vertical-radius N`, `--hz N` (frames por segundo del bucle),
+Opciones: `--view-distance N`, `--vertical-radius N`, `--viewer-y Y` (altura del punto, 80 por
+defecto; -1000 queda en las cuevas del overworld), `--hz N` (frames por segundo del bucle),
 `--idle S` (se queda quieto S segundos después de cargar y mide los frames), `--speed V` (camina a
 V vóxeles/s y mide los frames), `--jump N` (salta N chunks y mide hasta que la zona nueva está
-lista), `--fixed-height` (carga como M0, con el alto fijo del generador), `--help`.
+lista), `--fixed-height` (carga como M0, con el alto fijo del generador; no con el overworld),
+`--world flat|terrain|forest|overworld` (`terrain` por defecto), `--caves mc|closed|off` (solo
+con el overworld), `--no-trees`, `--help`.
 
 **gpu_info**: lista los adaptadores, cómo los clasifica boxel y qué elige.
 

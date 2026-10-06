@@ -141,7 +141,7 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_shaders` | WGSL embebido, composición, espejos `#[repr(C)]`, tests de naga | (wgpu, bytemuck) |
 | `boxel_voxel` | coordenadas, `Face`, registry, paleta, luz, `ChunkData` | (glam) |
 | `boxel_mesh` | `PackedQuad`, `ChunkMesh`, `PaddedChunk`, `Mesher` (bgm) | voxel |
-| `boxel_worldgen` | trait `WorldGenerator`, `FlatGenerator`, `TerrainGenerator`, ruido | voxel |
+| `boxel_worldgen` | trait `WorldGenerator`; generadores `FlatGenerator`, `TerrainGenerator`, `ForestGenerator` (terreno con árboles) y `OverworldGenerator` (superficie sobre piedra infinita hacia abajo, con cuevas y árboles; etapas en `overworld`: `Heightmap`, `SurfaceRules`, `Caves`, más `Trees`); ruido 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`) | voxel |
 | `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, eventos, `ChunkStore` | app, voxel, mesh, worldgen, transform, diagnostic |
 | `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `PresentSettings` (vsync en tiempo de ejecución), texturas procedurales, screenshots | gfx, shaders, world, camera, window |
 | `boxel_facade_check` | solo CI: prueba que los derives resuelven `::boxel::ecs` para un usuario que depende solo de `boxel` | fachada |
@@ -599,6 +599,9 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   60.6 % de los chunks son aire uniforme; la paleta reduce 128 MiB a 9 MiB (0.14 B/vóxel).
 - **Luz** separada (`Uniform { sky, block }` o `Packed`), en M0 siempre cielo 15.
 - **Ocupación** de 4 KiB (1 bit por vóxel): calculable en M0, mantenida incrementalmente desde M1.
+  `ChunkData::from_occupancy` hace el camino inverso: arma un chunk de 1 bit (o `Uniform` si la
+  máscara está toda llena o toda vacía) directo de la máscara, sin arreglo denso. El overworld lo
+  usa para los chunks de piedra y cuevas bajo la superficie.
 - **`ChunkData`** = bloques + luz + `version`. Se comparte como `Arc<ChunkData>`; las ediciones
   usan `Arc::make_mut`. Los arrays de vóxeles nunca van inline en componentes del ECS.
 
@@ -630,7 +633,8 @@ algunas diagonales del borde); descarga más allá de otros `hysteresis` (2) chu
 El mundo no tiene alto máximo; `WorldSettings::vertical_bounds` fija uno si hace falta (con el
 rango del generador y un `vertical_radius` grande reproduce el streaming de M0). Las capas fuera
 de `WorldGenerator::vertical_chunks()` se crean como aire sin job: el rango es una promesa del
-generador ("afuera todo es aire"), no un límite del mundo. Un vecino sin cargar no cuenta como
+generador ("afuera todo es aire"), no un límite del mundo. El overworld no tiene piso: su rango
+empieza en `i64::MIN`, y el mundo carga hacia abajo hasta el radio vertical del viewer. Un vecino sin cargar no cuenta como
 listo, salvo fuera de `vertical_bounds`.
 
 Sistemas en `Update`, encadenados (`WorldSystems`):

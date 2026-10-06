@@ -666,7 +666,10 @@ memoria de vóxeles. Las mallas con quads son las mismas que en M0 (7234 a radio
 
 **Lo que falta:**
 
-- Un generador 3D con cuevas: hoy el terreno es un mapa de alturas.
+- Aprobar el aspecto de las cuevas y sumar el contenido de profundidad (fase 6 del plan). El
+  generador 3D ya existe: `OverworldGenerator` v1 (`--world overworld` en los ejemplos), con
+  cuevas tipo Minecraft 1.18 y piedra infinita hacia abajo. Costo y carga en
+  [rendimiento/cuevas-fase2-2026-10.md](rendimiento/cuevas-fase2-2026-10.md).
 - Oclusión (Hi-Z): con cuevas, el descarte por pirámide dibuja mucho bajo tierra.
 - A más de 8 chunks sobre el terreno, el suelo deja de cargarse. Un juego que necesite ver lejos
   hacia abajo sube `vertical_radius`.

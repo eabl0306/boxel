@@ -47,6 +47,26 @@ Medido lejos de la superficie: un 10 % del volumen es aire (cavernas 6 %, espagu
 1 %, cada uno por separado). Un 0.3 % de las columnas de superficie se abre a una cueva. La perilla
 `density` es fuerte: -0.05 deja un 3 % de aire y +0.05 un 23 %.
 
+## Después de la revisión
+
+Medido igual, con las mismas cuevas para comparar:
+
+- Las capas -1 y -2 (bajo la superficie, dentro del alcance de las cuevas) ya no calculan las
+  32x32 alturas, solo las 9x9 de las esquinas. `caves/shallow_chunk` (capa -1 bajo la columna
+  (0, 0)) bajó de 29.3 a 15.4 us.
+- El ruido 3D y las esquinas reusan sus buffers por hilo: de 3 a 6 % menos por chunk profundo
+  (`deep_chunks_mean` de 23.5 a 22.7 us).
+
+Las semillas de las cuevas ahora mezclan la semilla del mundo y la sal (antes, sales o semillas
+vecinas compartían octavas). Las cuevas cambiaron de lugar pero no de aspecto: medido de nuevo, 10 %
+de aire en profundidad y 0.35 % de columnas de superficie abiertas. Con las cuevas nuevas:
+`deep_chunks_mean` 22.0 us, `surface_chunk_caves` 85.4 us (objetivo 90) y `solid_chunk` 14.0 us.
+`cave_chunk` cae ahora en otro chunk (26 % de aire en vez de 5.7 %): no se compara con la tabla.
+
+`headless_world` a radio 16 con las cuevas nuevas (2 corridas por altura): carga en 0.20 s a 80 y
+en 0.34-0.35 s a -1000. Bajo tierra quedan 8.41 M quads en 12 981 mallas (fracción 0.96, p50 572):
+ahora pasan los 8 Mi del arena por defecto, así que los 24 Mi del overworld hacen falta.
+
 ## Cómo se midió
 
 - Criterion en release, con `tools/wait-idle.sh 60` antes y nada compilando.

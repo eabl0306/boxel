@@ -10,6 +10,7 @@ just bench-fly                          # vuela a 32 vóxeles/s, radio 16
 just bench-fly --speed 64 --radius 32
 just bench-static --radius 32
 just bench-spin
+just bench-dive --world overworld --speed 64   # baja en línea recta por las cuevas
 just bench-all --radius 16              # static, fly a 32 y a 64, spin
 ```
 
@@ -32,7 +33,8 @@ El mundo se elige con `--world`: `forest` (por defecto, el de todas las corridas
 `--caves mc|closed|off` elige las cuevas: `mc` tiene entradas desde la superficie y `closed` no
 deja ver ninguna cueva desde arriba. El overworld no acepta `--fixed-height` (no tiene piso) y usa
 un arena de 24 Mi quads y 65 536 slots; `--arena-quads N` y `--chunk-slots N` los cambian. El
-resumen anota el mundo, y `tools/bench_report.py` solo compara corridas del mismo mundo.
+resumen anota el mundo y el arena y los slots que el renderer obtuvo de verdad (los límites del
+dispositivo pueden recortarlos), y `tools/bench_report.py` solo compara corridas del mismo mundo.
 
 Para que los números sirvan:
 
