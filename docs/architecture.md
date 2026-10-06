@@ -72,6 +72,9 @@ cargo-deny, el MSRV 1.97.1 y los tests del ECS vendorizado (961 + 480) con lockf
    decisión queda registrada y es reproducible con overrides.
 6. Calidad de proyecto: CI con tests de GPU en rasterizadores por software, validación de shaders
    con naga en todos los backends, Miri para el ECS vendorizado, lints estrictos.
+7. Física propia y mínima para juegos de bloques (ADR 0016): cajas y esferas sin rotaciones,
+   gravedad, raycast exacto contra vóxeles, sólidos y sensores entre entidades. Sin motores de
+   terceros.
 
 ### No objetivos (por ahora)
 
@@ -79,7 +82,7 @@ cargo-deny, el MSRV 1.97.1 y los tests del ECS vendorizado (961 + 480) con lockf
   no se compila ni se prueba para ellos.
 - Un RHI propio o backends crudos de Vulkan/GL (ADR 0001).
 - Render graph genérico.
-- Editor, assets en disco, audio, red, física. Fuera del alcance del motor en M0..M2.
+- Editor, assets en disco, audio, red. Fuera del alcance del motor en M0..M2.
 - Compatibilidad binaria o de API con Bevy.
 
 ---
@@ -91,6 +94,9 @@ cargo-deny, el MSRV 1.97.1 y los tests del ECS vendorizado (961 + 480) con lockf
  |  Aplicación / juego / ejemplos (voxel_world, headless_world, gpu_info)             |
  +-----------------------------------------------------------------------------------+
  |  boxel (fachada): prelude, DefaultPlugins, MinimalPlugins, features                |
+ +----------------------+------------------------+-----------------------------------+
+ |                      |  boxel_physics         |                                   |
+ |                      |  (barrido, raycast)    |                                   |
  +----------------------+------------------------+-----------------------------------+
  |  boxel_render        |  boxel_world           |  boxel_camera                     |
  |  (plugin + renderer  |  (ChunkMap, streaming, |  (Camera, CameraView,             |
@@ -121,6 +127,8 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 - Solo `vendor/` depende de código derivado de Bevy. Ningún crate `bevy*` puede entrar al árbol
   (cargo-deny con nombres exactos más `tools/no_bevy.py` para cualquier nombre).
 - `boxel_render` depende de `boxel_world` (consume `ChunkMeshEvent`), nunca al revés.
+- `boxel_physics` depende de `boxel_world` (lee `ChunkMap`); ni `boxel_world` ni `boxel_render`
+  dependen de él. Su núcleo (`boxel_physics::core`) no usa el ECS.
 - El núcleo del renderer (`VoxelRenderer`) no usa el ECS; el plugin es una capa fina encima.
 
 ---
@@ -130,7 +138,7 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | Crate | Responsabilidad | Depende de (boxel) |
 |---|---|---|
 | `boxel` (raíz) | Fachada: re-exports, `prelude`, `DefaultPlugins`, `MinimalPlugins`, ejemplos | todos |
-| `boxel_app` | `App`, `Plugin`, `PluginGroup`, schedules (`Main`...`Last`, fixed, `Shutdown`), `Time`, `FixedTime`, `FrameLimit` y `FramePacer`, task pools, runner headless, `AppExit` | ecs, tasks |
+| `boxel_app` | `App`, `Plugin`, `PluginGroup`, schedules (`Main`...`Last`, fixed con `RunFixedMainLoopSystems`, `Shutdown`), `Time`, `FixedTime`, `FrameLimit` y `FramePacer`, task pools, runner headless, `AppExit` | ecs, tasks |
 | `boxel_log` | Subscriber de `tracing`, puente de `log`, Tracy opcional | app |
 | `boxel_diagnostic` | `FrameStats`, `DiagnosticsBoard`, log periódico | app, ecs |
 | `boxel_math` | re-export de glam, `Aabb`, `Frustum`, proyección reverse-Z | (glam) |
@@ -139,17 +147,18 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_camera` | `Camera`, `CameraView` (relativa a cámara), `FlyCamera` | app, transform, window |
 | `boxel_gfx` | política sobre wgpu: preferencias, instancia, tiers, scoring, smoke, selección, LKG, superficie, readback, hal; ejemplo `gpu_info` | (wgpu) |
 | `boxel_shaders` | WGSL embebido, composición, espejos `#[repr(C)]`, tests de naga | (wgpu, bytemuck) |
-| `boxel_voxel` | coordenadas, `Face`, registry, paleta, luz, `ChunkData` | (glam) |
+| `boxel_voxel` | coordenadas (`BlockPos`, `ChunkPos`, `WorldPos`: bloque más offset, exacto a cualquier distancia), `Face`, registry, paleta, luz, `ChunkData` | (glam) |
 | `boxel_mesh` | `PackedQuad`, `ChunkMesh`, `PaddedChunk`, `Mesher` (bgm) | voxel |
 | `boxel_worldgen` | trait `WorldGenerator`; generadores `FlatGenerator`, `TerrainGenerator`, `ForestGenerator` (terreno con árboles) y `OverworldGenerator` (superficie sobre piedra infinita hacia abajo, con cuevas y árboles; etapas en `overworld`: `Heightmap`, `SurfaceRules`, `Caves`, más `Trees`); ruido 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`) | voxel |
 | `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, eventos, `ChunkStore` | app, voxel, mesh, worldgen, transform, diagnostic |
 | `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `PresentSettings` (vsync en tiempo de ejecución), texturas procedurales, screenshots | gfx, shaders, world, camera, window |
+| `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::solid`), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas. Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`), `PhysicsQuery`. Hoy fase P1: cuerpos, gravedad y entidades vienen en P2 a P4 | ecs, app, math, voxel, world |
 | `boxel_facade_check` | solo CI: prueba que los derives resuelven `::boxel::ecs` para un usuario que depende solo de `boxel` | fachada |
 | `vendor/*` (7 crates) | ECS y tareas (fork de Bevy) | - |
 
-Features de la fachada: `default = [window, render, voxel, png, debug]`, más `trace` (spans de
-sistemas, implica `debug`), `trace_tracy` (Tracy), `track_location` y `hal` (escape hatch
-Vulkan). `debug` hace que los diagnósticos del ECS (conflictos B0001, errores de schedule, spans)
+Features de la fachada: `default = [window, render, voxel, png, debug, physics]`, más `trace`
+(spans de sistemas, implica `debug`), `trace_tracy` (Tracy), `track_location` y `hal` (escape
+hatch Vulkan). `physics` implica `voxel` y expone `boxel::physics`. `debug` hace que los diagnósticos del ECS (conflictos B0001, errores de schedule, spans)
 muestren nombres de sistemas y componentes; conviene apagarla en builds de distribución.
 
 ---
