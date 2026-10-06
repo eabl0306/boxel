@@ -1,14 +1,18 @@
 use crate::interest::Viewer;
 use crate::jobs::{JobExecutor, TaskPoolExecutor};
+use crate::sky::{SkyMap, SkyRule};
 use crate::streaming::{Ctx, ViewerChunks, WorldJobs};
 use crate::{ChunkId, ChunkMap, WorldStats};
 use boxel_app::{App, Last, Plugin, Update};
 use boxel_diagnostic::DiagnosticsBoard;
 use boxel_ecs::prelude::*;
+use boxel_light::sky_tile::DEFAULT_WALK_LIMIT;
 use boxel_mesh::{AoPolicy, ChunkMesh, MaterialTable};
 use boxel_tasks::{AsyncComputeTaskPool, TaskPool};
 use boxel_transform::Transform;
-use boxel_voxel::{BlockPos, BlockRegistry, BlockState, ChunkKey, ChunkPos, DimensionId};
+use boxel_voxel::{
+    BlockPos, BlockRegistry, BlockState, ChunkKey, ChunkPos, DimensionId, LightTables,
+};
 use boxel_worldgen::{TerrainGenerator, WorldGenerator};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -87,9 +91,26 @@ pub struct WorldSettings {
     /// streams like boxel M0 did (every layer of the generator, whatever the viewer's height).
     pub vertical_bounds: Option<RangeInclusive<i64>>,
     /// Which faces the mesher bakes ambient occlusion into (ADR 0015). The default,
-    /// `BakedLitOnly`, skips faces whose 4 corners are dark. A change applies to the meshes
-    /// built after it. Until the world computes light, every face counts as lit (open sky).
+    /// `BakedLitOnly`, skips faces whose 4 corners are dark (most cave faces). A change applies
+    /// to the meshes built after it. With `light` off every face counts as lit.
     pub ao_policy: AoPolicy,
+    /// Voxel light (ADR 0015): sky light from per-column sky tops plus RGB block light, baked
+    /// into each mesh by its job. Off: meshes see open sky everywhere (the look before light)
+    /// and no sky tops are computed. Read when the world starts (a later change does nothing).
+    pub light: bool,
+    /// How deep, in voxels under the generator's top, a column is walked looking for its sky
+    /// top. A column still open there (a natural shaft deeper than this) gets its top at that
+    /// floor: no direct sky below it. A box under the floor needs no sky tile at all, so deep
+    /// viewers walk nothing. Read when the world starts.
+    pub sky_walk_limit: u32,
+    /// Chunks (distance to the nearest viewer) within which each mesh job also keeps the
+    /// chunk's light for gameplay queries ([`ChunkMap::light_at`](crate::ChunkMap::light_at))
+    /// and for sizing edit remeshes (16 to 64 KiB per lit chunk, nothing for uniform light).
+    pub light_cache_radius: u32,
+    /// Frames the finished meshes of one edit batch wait for the rest of the batch before they
+    /// are published anyway (0: no wait). Holding them keeps a frame from showing half of an
+    /// edit's light change.
+    pub edit_batch_hold_frames: u32,
 }
 
 impl Default for WorldSettings {
@@ -103,6 +124,10 @@ impl Default for WorldSettings {
             unload_hysteresis: 2,
             vertical_bounds: None,
             ao_policy: AoPolicy::default(),
+            light: true,
+            sky_walk_limit: DEFAULT_WALK_LIMIT,
+            light_cache_radius: 8,
+            edit_batch_hold_frames: 2,
         }
     }
 }
@@ -116,6 +141,20 @@ pub struct WorldContent {
     pub registry: Arc<BlockRegistry>,
     /// Mesher view of `registry`.
     pub materials: Arc<MaterialTable>,
+    /// Light view of `registry` (opacity and emission per state).
+    pub light_tables: Arc<LightTables>,
+}
+
+impl WorldContent {
+    /// The content of a world with `generator` and `registry` (the tables derived from it).
+    pub fn new(generator: Arc<dyn WorldGenerator>, registry: Arc<BlockRegistry>) -> Self {
+        Self {
+            generator,
+            materials: Arc::new(MaterialTable::from_registry(&registry)),
+            light_tables: Arc::new(LightTables::from_registry(&registry)),
+            registry,
+        }
+    }
 }
 
 /// Mesh changes for the renderer, written in `WorldSystems::Collect` (and on unload).
@@ -185,8 +224,8 @@ pub enum WorldSystems {
     Collect,
 }
 
-/// Adds the world: resources (`ChunkMap`, `WorldSettings`, `WorldContent`, `EditQueue`,
-/// `WorldStats`, internal job state), the `ChunkMeshEvent` message and the chained systems in
+/// Adds the world: resources (`ChunkMap`, `SkyMap`, `WorldSettings`, `WorldContent`,
+/// `EditQueue`, `WorldStats`, internal job state), the `ChunkMeshEvent` message and the chained systems in
 /// `Update`. A stats system in `Last` refreshes `WorldStats` and publishes a `"world"` line to
 /// `DiagnosticsBoard` if present. `TaskPoolPlugin` is recommended (pool sizes); without it the
 /// default executor initializes a default async compute pool.
@@ -216,17 +255,26 @@ impl Default for WorldPlugin {
 
 impl Plugin for WorldPlugin {
     fn build(&self, app: &mut App) {
-        let content = WorldContent {
-            generator: Arc::clone(&self.generator),
-            registry: Arc::clone(&self.registry),
-            materials: Arc::new(MaterialTable::from_registry(&self.registry)),
-        };
+        let content = WorldContent::new(Arc::clone(&self.generator), Arc::clone(&self.registry));
+        let rule = SkyRule::new(
+            self.settings.light,
+            self.generator.vertical_chunks(),
+            self.settings.sky_walk_limit,
+        );
+        if rule == SkyRule::Open {
+            tracing::warn!(
+                generator = self.generator.name(),
+                "the generator does not declare its top (WorldGenerator::vertical_chunks): \
+                 light runs without sky tops, every column is open sky"
+            );
+        }
         let workers = async_compute_threads();
         let mut jobs = WorldJobs::new(1, workers, Arc::clone(&self.executor));
         jobs.begin_frame(&self.settings, Instant::now());
         app.insert_resource(self.settings.clone())
             .insert_resource(content)
             .init_resource::<ChunkMap>()
+            .insert_resource(SkyMap::new(rule))
             .init_resource::<EditQueue>()
             .init_resource::<WorldStats>()
             .init_resource::<ViewerChunks>()
@@ -294,6 +342,7 @@ fn track_viewers(
 
 fn update_interest(
     mut map: ResMut<ChunkMap>,
+    mut sky: ResMut<SkyMap>,
     mut jobs: ResMut<WorldJobs>,
     content: Res<WorldContent>,
     settings: Res<WorldSettings>,
@@ -305,7 +354,7 @@ fn update_interest(
         return;
     }
     let mut events = Vec::new();
-    let mut cx = Ctx::new(&mut map, &content, &mut events);
+    let mut cx = Ctx::new(&mut map, &mut sky, &content, &mut events);
     jobs.update_interest(&mut cx, &settings, &viewers.0);
     writer.write_batch(events);
 }
@@ -313,6 +362,7 @@ fn update_interest(
 fn apply_edits(
     mut queue: ResMut<EditQueue>,
     mut map: ResMut<ChunkMap>,
+    mut sky: ResMut<SkyMap>,
     mut jobs: ResMut<WorldJobs>,
     content: Res<WorldContent>,
     mut writer: MessageWriter<ChunkMeshEvent>,
@@ -322,13 +372,14 @@ fn apply_edits(
     }
     let edits = std::mem::take(&mut queue.edits);
     let mut events = Vec::new();
-    let mut cx = Ctx::new(&mut map, &content, &mut events);
+    let mut cx = Ctx::new(&mut map, &mut sky, &content, &mut events);
     jobs.apply_edits(&mut cx, edits);
     writer.write_batch(events);
 }
 
 fn run_jobs(
     mut map: ResMut<ChunkMap>,
+    mut sky: ResMut<SkyMap>,
     mut jobs: ResMut<WorldJobs>,
     content: Res<WorldContent>,
     settings: Res<WorldSettings>,
@@ -339,13 +390,14 @@ fn run_jobs(
         return;
     }
     let mut events = Vec::new();
-    let mut cx = Ctx::new(&mut map, &content, &mut events);
+    let mut cx = Ctx::new(&mut map, &mut sky, &content, &mut events);
     jobs.run_jobs(&mut cx, &settings);
     writer.write_batch(events);
 }
 
 fn publish_meshes(
     mut map: ResMut<ChunkMap>,
+    mut sky: ResMut<SkyMap>,
     mut jobs: ResMut<WorldJobs>,
     content: Res<WorldContent>,
     settings: Res<WorldSettings>,
@@ -355,7 +407,7 @@ fn publish_meshes(
         return;
     }
     let mut events = Vec::new();
-    let mut cx = Ctx::new(&mut map, &content, &mut events);
+    let mut cx = Ctx::new(&mut map, &mut sky, &content, &mut events);
     jobs.apply_meshes(&mut cx, &settings);
     writer.write_batch(events);
 }
@@ -365,6 +417,7 @@ fn publish_meshes(
 /// walk of every slot in the frames that changed the map.
 fn publish_stats(
     map: Res<ChunkMap>,
+    sky: Res<SkyMap>,
     jobs: Res<WorldJobs>,
     mut stats: ResMut<WorldStats>,
     mut failed: Local<Option<usize>>,
@@ -379,6 +432,8 @@ fn publish_stats(
     now.queued_jobs = jobs.scheduler.queued();
     now.in_flight = jobs.scheduler.in_flight();
     now.interest_backlog = jobs.interest_backlog();
+    jobs.light_stats(&mut now);
+    now.sky_columns = sky.len();
     let changed = *stats != now || *failed != Some(jobs.failed);
     stats.set_if_neq(now);
     *failed = Some(jobs.failed);
@@ -399,5 +454,23 @@ fn publish_stats(
                 jobs.failed
             ),
         );
+        if sky.rule != SkyRule::Off {
+            board.set(
+                "light",
+                format!(
+                    "full={} fast={} columns={} walks={} private={} waiting_sky={} \
+                     fanout={} batches_held={} split={}",
+                    now.light_full,
+                    now.light_fast,
+                    now.sky_columns,
+                    now.sky_walks,
+                    now.sky_private_generations,
+                    now.waiting_sky,
+                    now.light_fanout,
+                    now.edit_batches_held,
+                    now.edit_batches_split
+                ),
+            );
+        }
     }
 }

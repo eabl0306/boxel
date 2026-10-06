@@ -20,6 +20,7 @@ boxel_math.workspace = true
 boxel_transform.workspace = true
 boxel_voxel.workspace = true
 boxel_mesh.workspace = true
+boxel_light.workspace = true
 boxel_worldgen.workspace = true
 slotmap.workspace = true
 foldhash.workspace = true

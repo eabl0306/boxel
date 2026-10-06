@@ -42,6 +42,11 @@ pub const DEFAULT_WALK_LIMIT: u32 = 1024;
 pub enum LayerData<'a> {
     /// All air (a missing chunk, or a layer outside the generator's range).
     Air,
+    /// All air, and so is every layer from here down to layer `n` (exclusive): the walk reads
+    /// layer `n` next. Skips long gaps of air (an edit far above the generator, below a
+    /// bounded generator) in one step. A value at or above the current layer reads as
+    /// [`LayerData::Air`].
+    AirUntil(i64),
     /// All air, and so is every layer below it.
     Void,
     /// A borrowed chunk.
@@ -56,7 +61,7 @@ impl LayerData<'_> {
     /// The chunk, if the layer has blocks.
     fn chunk(&self) -> Option<&ChunkData> {
         match self {
-            LayerData::Air | LayerData::Void => None,
+            LayerData::Air | LayerData::AirUntil(_) | LayerData::Void => None,
             LayerData::Ref(c) => Some(c),
             LayerData::Shared(c) => Some(c),
             LayerData::Owned(c) => Some(c),
@@ -181,7 +186,7 @@ impl SkyTile {
                     break y0 + ly;
                 }
             }
-            cy -= 1;
+            cy = next_layer(&data, cy);
         };
         self.set(i, found);
         Rescan::Found(found)
@@ -300,7 +305,7 @@ pub fn walk<'a>(
             break;
         }
         let Some(chunk) = data.chunk() else {
-            cy -= 1;
+            cy = next_layer(&data, cy);
             continue;
         };
         // Local y range to read: at most S, at least the floor.
@@ -336,6 +341,15 @@ pub fn walk<'a>(
         cy -= 1;
     }
     SkyTile::from_tops(top, floor)
+}
+
+/// The layer a walk or a rescan reads after layer `cy` held `data` (never below the first
+/// layer under the world limit, which reads as [`LayerData::Void`]).
+fn next_layer(data: &LayerData<'_>, cy: i64) -> i64 {
+    match *data {
+        LayerData::AirUntil(n) if n < cy => n.max(-MAX_CHUNK_COORD - 1),
+        _ => cy - 1,
+    }
 }
 
 #[inline]

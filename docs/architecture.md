@@ -612,9 +612,9 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   lugar mientras entra; se compacta al guardar o en reposo. Medido en un mundo de 512x256x512:
   60.6 % de los chunks son aire uniforme; la paleta reduce 128 MiB a 9 MiB (0.14 B/vóxel).
 - **Luz:** no vive en el chunk. Es un dato derivado, función pura de los bloques y de un techo de
-  cielo por columna, que calcula `boxel_light` (ADR 0015). El mesher ya la hornea por esquina
-  (fase P2), pero hasta que el mundo la calcule (P3) y el shader la lea (P4) todo se dibuja con
-  cielo 15.
+  cielo por columna, que calcula `boxel_light` (ADR 0015) dentro del job de malla (fase P3); el
+  mesher la hornea por esquina. Hasta que el shader la lea (P4) todo se dibuja con cielo 15. Los
+  chunks cerca del viewer guardan su luz para gameplay (`ChunkMap::light_at`).
 - **Máscaras de luz** de 4 KiB (1 bit por vóxel): `LightMasks` (opaca, parcial y emisores). Los
   chunks uniformes y los de 1 bit sin emisores la sirven desde sus propias palabras; los demás la
   construyen la primera vez que se pide y la guardan en caché hasta que cambian sus bloques.
@@ -643,7 +643,14 @@ Estados ortogonales por slot:
 - `Interest`: `DATA`, `MESH`, `PINNED`.
 - `neighbors_ready`: máscara de 26 bits, válida desde que llegan los datos del propio slot (antes
   nadie la lee, y crear un slot no busca a sus vecinos); `epoch`: contador que sube cuando cambia
-  el borde de un vecino; `cancel`: `Arc<AtomicBool>` para cancelación cooperativa.
+  el borde de un vecino o su luz; `cancel`: `Arc<AtomicBool>` para cancelación cooperativa;
+  `light`: la luz del chunk (`ChunkLight`) dentro de `light_cache_radius`.
+
+`SkyMap` (recurso) guarda un `SkyColumn` por columna de chunks con algún slot: el `SkyTile` con
+el techo de cielo de cada una de sus 32x32 columnas, calculado por un job `SkyTile` que camina la
+columna hacia abajo (ADR 0015). Se crea con el primer slot de la columna y se borra con el último.
+Una columna se camina solo cuando una malla la necesita, y antes espera los datos cargados que va
+a leer.
 
 Cada viewer quiere un cilindro vertical: malla en el círculo `radius` (xz) y en las capas a
 `vertical_radius` o menos (8 por defecto); datos un chunk más en cada dirección (círculo
@@ -669,10 +676,12 @@ Sistemas en `Update`, encadenados (`WorldSystems`):
    recalculan por lotes, las más cercanas primero. El mapa reserva lugar para dos vistas: al
    saltar, la vieja sigue cargada hasta que se crea la nueva y el mapa no crece a mitad de la
    carga.
-2. **Edits:** aplica `EditQueue` agrupando por chunk: `make_mut`, `set`, sube `version`, pide
-   remesh del chunk y de todo vecino cuya región acolchada contiene un vóxel cambiado: los de cara,
-   y también los de arista y esquina, porque su AO y su luz de esquina lo leen (sube su `epoch`).
-   Prioridad 0.
+2. **Edits:** aplica `EditQueue` agrupando por chunk: `make_mut`, `set`, sube `version`, y
+   remalla como un lote (prioridad 0, sube el `epoch`): todo chunk cuya región acolchada contiene
+   un vóxel cambiado (caras, AO y luz de esquina: hasta 8); si cambió la opacidad o la emisión,
+   todo chunk al alcance del cambio de luz (a lo sumo 14 vóxeles, medido con la luz guardada); si
+   se movió el techo de cielo de la columna, los chunks de la banda alrededor de la columna. Un
+   techo que no se resuelve con lo cargado manda la columna a caminar de nuevo.
 3. **Dispatch:** primero vacía el canal de resultados (libera sus lugares en vuelo) y después
    saca jobs mientras `in_flight < tope`; repite mientras lleguen resultados, dentro de
    `job_budget` (2 ms por frame). Antes de sacar un job recalcula las prioridades viejas que
@@ -681,15 +690,19 @@ Sistemas en `Update`, encadenados (`WorldSystems`):
    sale de los hilos de async compute, del costo medido de un job (promedio de cada frame,
    suavizado entre frames) y del intervalo entre frames: trabajo para 1.5 frames (al menos 2 por
    hilo, como mucho 4096). Generación: captura generador, registry y clave. Malla: solo si los 26
-   vecinos están `Ready` o `Missing`; captura el centro y los 26 `Arc`, la tabla de materiales,
-   `data_version` y `epoch`. Atajos: centro aire uniforme, o centro opaco uniforme rodeado de
-   opacos uniformes en las 6 caras, da `Empty` sin job. Descarta resultados viejos (generación
-   del slotmap, `data_version`, `epoch`, `cancel`).
+   vecinos están `Ready` o `Missing` y, si su caja de luz puede tener cielo directo, los techos
+   de sus 3x3 columnas están calculados; captura el centro y los 26 `Arc`, los 9 tiles, la tabla
+   de materiales, `data_version` y `epoch`, y en el hilo calcula la luz y después malla. Atajos:
+   centro aire uniforme, o centro opaco uniforme rodeado de opacos uniformes en las 6 caras, da
+   `Empty` sin job. Descarta resultados viejos (generación del slotmap, `data_version`, `epoch`,
+   `cancel`; en las caminatas, la `version` de la columna).
 4. **Collect:** publica `ChunkMeshEvent::Upsert` / `Remove` de las mallas listas, hasta 512 por
-   frame.
+   frame. Una malla igual a la publicada no se envía; las mallas de un lote de ediciones salen
+   juntas (esperan al resto hasta 2 frames).
 
 **Contrato de resultados:** todo job enviado devuelve **exactamente un** mensaje: `Generated`,
-`Meshed`, `Cancelled` (vio la bandera de cancelación) o `Failed` (con el texto del pánico). El
+`Meshed`, `Walked` (una caminata de cielo), `Cancelled` (vio la bandera de cancelación) o
+`Failed` (con el texto del pánico). El
 cuerpo del job corre dentro de `catch_unwind` y el job lleva un token cuyo `Drop` envía `Failed`
 si no se envió nada. Motivo: los hilos de `boxel_tasks` atrapan el pánico de una tarea y siguen;
 sin el contrato, cada job perdido dejaba ocupado un lugar "en vuelo" y tras 16 pérdidas el
@@ -702,7 +715,7 @@ snapshots viejos de un vecino ya no se acepta aunque la versión del centro coin
 Prioridades: ni rayon ni `boxel_tasks` las tienen; por eso `JobScheduler` propio (min-heap por
 `(prioridad, secuencia)`, tope en vuelo). Los jobs corren en `AsyncComputeTaskPool` a través del
 trait `JobExecutor` (`TaskPoolExecutor`; `InlineExecutor` en tests deterministas). Cada hilo usa
-un `Mesher` thread-local (~0.6 MiB de scratch).
+un `Mesher` thread-local (~0.6 MiB de scratch) y un `LightScratch` (~0.7 MiB).
 
 ---
 
@@ -744,9 +757,10 @@ que cubre el buffer de índices compartido. Dos materiales cutout (o translúcid
 tapan entre sí y llegan a 196 608; el registry de M0 tiene uno de cada (riesgo abierto, ver
 `informe-m0.md`). Pasado el límite, los tres tiers dibujan solo los primeros 98 304 quads del
 bucket. AO: va en la clave del merge en todos los tiers (ADR 0015), por defecto solo en las caras
-con algo de luz (`AoPolicy::BakedLitOnly`); sin luz todavía en el mundo (hasta la fase P3) cuesta
-1.6 a 1.75x de quads. El AO en el fragment shader desde ocupación en GPU queda para High y Mid si
-las mediciones lo piden.
+con algo de luz (`AoPolicy::BakedLitOnly`). Con la luz del mundo cuesta 1.08x de quads en el
+overworld a y = 80, 1.00x bajo tierra (las cuevas oscuras se fusionan como sin AO) y 1.74x en el
+forest, sin cuevas (gate G1 de P3). El AO en el fragment shader desde ocupación en GPU queda para
+High y Mid si las mediciones lo piden.
 
 Hojas en M0: como bgm omite las caras entre dos hojas vecinas, la copa de un árbol se ve como una
 cáscara texturada (el pipeline cutout no descarta caras traseras, así que por los huecos se ve la

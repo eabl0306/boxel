@@ -8,16 +8,16 @@
 use boxel_app::App;
 use boxel_ecs::prelude::*;
 use boxel_math::DVec3;
-use boxel_mesh::{ChunkMesh, MeshInput, MeshOptions, Mesher};
+use boxel_mesh::{ChunkMesh, MeshOptions};
 use boxel_transform::Transform;
 use boxel_voxel::{
-    BlockPos, BlockRegistry, BlockState, CHUNK_SIZE, ChunkKey, ChunkPos, LocalPos,
-    NEIGHBOR_OFFSETS, RenderShape,
+    BlockPos, BlockRegistry, BlockState, CHUNK_SIZE, ChunkKey, ChunkPos, LocalPos, RenderShape,
 };
 use boxel_world::jobs::{InlineExecutor, JobExecutor, TaskPoolExecutor};
+use boxel_world::reference::Reference;
 use boxel_world::{
     ChunkId, ChunkMap, ChunkMeshEvent, ChunkSlot, ChunkViewer, DataState, EditQueue, MeshState,
-    WorldContent, WorldPlugin, WorldSettings, WorldStats,
+    SkyMap, WorldContent, WorldPlugin, WorldSettings, WorldStats,
 };
 use boxel_worldgen::{TerrainGenerator, WorldGenerator};
 use std::collections::BTreeMap;
@@ -130,13 +130,15 @@ fn assert_replica_matches(app: &App, replica: &BTreeMap<u64, Arc<ChunkMesh>>) {
 }
 
 /// Generated data equals a fresh `generate` call (edited chunks excepted), and every `Ready` or
-/// `Empty` mesh equals what `Mesher` builds now from the map's data and its 26 neighbors (not
-/// loaded or not generated = air, as the world defines it).
+/// `Empty` mesh equals what the from-scratch [`Reference`] builds now from the map's data, its
+/// 26 neighbors (not loaded or not generated = air, as the world defines it) and sky tiles
+/// walked again.
 fn assert_world_matches_direct(app: &App, edited: &[ChunkPos]) {
     let map = app.world().resource::<ChunkMap>();
+    let sky = app.world().resource::<SkyMap>();
     let content = app.world().resource::<WorldContent>();
     let options = MeshOptions::with_ao(app.world().resource::<WorldSettings>().ao_policy);
-    let mut mesher = Mesher::new();
+    let mut reference = Reference::new(map, sky, content);
     let (mut meshes, mut empties) = (0, 0);
     for (_, slot) in map.iter() {
         let pos = slot.pos;
@@ -154,23 +156,12 @@ fn assert_world_matches_direct(app: &App, edited: &[ChunkPos]) {
             MeshState::Empty => true,
             MeshState::None | MeshState::Queued | MeshState::InFlight { .. } => continue,
         };
-        let center = match slot.data() {
-            DataState::Ready(data) => Arc::clone(data),
+        if !matches!(slot.data(), DataState::Ready(_)) {
             // Missing data is air: it can only mesh to nothing.
-            _ => {
-                assert!(expected_empty, "{pos:?}: a mesh without data");
-                continue;
-            }
-        };
-        let input = MeshInput {
-            center: &center,
-            neighbors: std::array::from_fn(|i| {
-                map.data_at(pos.offset(NEIGHBOR_OFFSETS[i]))
-                    .map(Arc::as_ref)
-            }),
-            light: None,
-        };
-        let direct = mesher.mesh_chunk(&input, &content.materials, options);
+            assert!(expected_empty, "{pos:?}: a mesh without data");
+            continue;
+        }
+        let direct = reference.mesh(pos, options);
         if let MeshState::Ready { mesh, .. } = slot.mesh() {
             assert_eq!(**mesh, direct, "{pos:?}: streamed mesh == direct mesh");
             assert!(!mesh.is_empty());
@@ -257,8 +248,47 @@ fn real_terrain_publishes_meshes() {
         )
     );
 
+    // Light: the surface boxes ran the floods, every column with a mesh around it was walked
+    // once, from loaded data (the terrain's bedrock closes every column).
+    assert!(stats.light_full > 0, "{stats:?}");
+    assert_eq!(
+        stats.light_full + stats.light_fast,
+        stats.mesh_ready + mesh_empty_jobs(map)
+    );
+    assert!(stats.sky_walks > 0 && stats.sky_walks <= stats.sky_columns);
+    assert_eq!(stats.waiting_sky, 0);
+    let sky = app.world().resource::<SkyMap>();
+    assert_eq!(sky.len(), stats.sky_columns);
+    assert_eq!(sky.walked(), stats.sky_walks);
+    // The light near the viewer is cached for gameplay (all-air chunks are meshed without a
+    // job and keep none): some top voxels of surface chunks are direct sky.
+    let mut open = 0;
+    for (_, slot) in map.iter() {
+        let Some(light) = slot.light() else {
+            continue;
+        };
+        let top = LocalPos::new(3, 31, 4);
+        let p = BlockPos::from_parts(slot.pos, top);
+        assert_eq!(map.light_at(p), Some(light.get(top)));
+        open += usize::from(light.get(top).sky() == 15);
+    }
+    assert!(open > 0);
+    assert_eq!(
+        map.light_at(BlockPos::new(5, 200, 5000)),
+        None,
+        "not loaded"
+    );
+
     assert_world_matches_direct(&app, &[]);
     assert_replica_matches(&app, &last_meshes(&events));
+}
+
+/// Empty meshes that came from a mesh job (not from the all-air or enclosed fast paths): the
+/// chunks with a cached light and nothing to draw.
+fn mesh_empty_jobs(map: &ChunkMap) -> usize {
+    map.iter()
+        .filter(|(_, s)| matches!(s.mesh(), MeshState::Empty) && s.light().is_some())
+        .count()
 }
 
 /// Inline (deterministic order) and task pool (parallel) jobs build the same meshes.

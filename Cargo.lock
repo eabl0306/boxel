@@ -561,6 +561,7 @@ dependencies = [
  "boxel_app",
  "boxel_diagnostic",
  "boxel_ecs",
+ "boxel_light",
  "boxel_math",
  "boxel_mesh",
  "boxel_tasks",

@@ -323,6 +323,71 @@ fn an_edit_far_above_changes_only_its_column() {
     assert_eq!((removed.min(), removed.max()), (plain.min(), plain.max()));
 }
 
+/// `LayerData::AirUntil` skips a gap of air in one step: a platform 2^50 voxels above the
+/// generator walks and rescans like a layer-by-layer walk would, reading only the platform's
+/// layer and the generator's layers.
+#[test]
+fn air_until_skips_long_gaps() {
+    let g = ForestGenerator::default();
+    let registry = BlockRegistry::default_blocks();
+    let tables = LightTables::from_registry(&registry);
+    let stone = registry.by_name("boxel:stone").unwrap();
+    let range = g.vertical_chunks();
+    let top = GeneratorTop::of(&range).voxel().unwrap();
+    let floor = walk_floor(top, DEFAULT_WALK_LIMIT);
+    let y = top + (1 << 50);
+    let mut platform = ChunkData::uniform(BlockState::AIR);
+    platform.set(LocalPos::new(7, (y & 31) as u32, 9), stone);
+    let mut reads = 0;
+    let mut layer = |cy: i64| {
+        reads += 1;
+        if cy == y >> 5 {
+            LayerData::Ref(&platform)
+        } else if cy > *range.end() {
+            LayerData::AirUntil(*range.end())
+        } else if cy < *range.start() {
+            LayerData::Void
+        } else {
+            LayerData::Owned(g.generate(ChunkKey::new(ChunkPos::new(0, cy, 0)), &registry))
+        }
+    };
+    let skipped = walk(y, floor, &tables, &mut layer);
+    let plain = walk(top, floor, &tables, |cy| {
+        if cy > *range.end() {
+            LayerData::Air
+        } else {
+            LayerData::Owned(g.generate(ChunkKey::new(ChunkPos::new(0, cy, 0)), &registry))
+        }
+    });
+    assert_eq!(skipped.top(7, 9), y);
+    let edited = (7 << 5) | 9;
+    for (i, (&got, &want)) in skipped.tops().iter().zip(plain.tops()).enumerate() {
+        if i != edited {
+            assert_eq!(got, want, "local ({}, {})", i >> 5, i & 31);
+        }
+    }
+    assert!(reads < 40, "{reads} layers read");
+    // The rescan after removing the platform skips the same gap.
+    let mut removed = skipped.clone();
+    let mut rescans = 0;
+    let rescan = removed.rescan_column(7, 9, y - 1, &tables, |cy| {
+        rescans += 1;
+        Some(if cy > *range.end() {
+            LayerData::AirUntil(*range.end())
+        } else {
+            LayerData::Owned(g.generate(ChunkKey::new(ChunkPos::new(0, cy, 0)), &registry))
+        })
+    });
+    assert_eq!(rescan, Rescan::Found(plain.top(7, 9)));
+    assert!(rescans < 40, "{rescans} layers read");
+    // A gap past the world limit ends at the void.
+    let low = walk(0, i64::MIN, &tables, |cy| {
+        assert!(cy >= -MAX_CHUNK_COORD - 1, "layer {cy} below the world");
+        LayerData::AirUntil(i64::MIN)
+    });
+    assert_eq!((low.min(), low.max()), (i64::MIN, i64::MIN));
+}
+
 #[test]
 fn tiles_without_a_floor_rescan_and_walk_to_the_world_bottom() {
     let registry = BlockRegistry::default_blocks();

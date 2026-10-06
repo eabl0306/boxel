@@ -183,8 +183,9 @@ La paleta crece sola al editar (`voxel/storage.rs:57-103`) pero nunca encoge: `c
 (`voxel/storage.rs:173`) y nadie lo llama.
 
 **Luz.** No se guarda en el chunk (ADR 0015): es una función pura de los bloques y de un techo de
-cielo por columna, que calcula `boxel_light` (dentro del job de malla desde la fase P3). Hasta
-entonces los quads siguen con cielo 15 fijo (`mesh/packed.rs`).
+cielo por columna, que calcula `boxel_light` dentro del job de malla (`world/streaming.rs`,
+`start_mesh`) y el mesher hornea en los quads. Los techos de cielo viven en `SkyMap`
+(`world/sky.rs`). El shader todavía no la lee (fase P4): se dibuja con cielo 15.
 
 **Memoria medida** con el generador Forest (terreno y árboles):
 

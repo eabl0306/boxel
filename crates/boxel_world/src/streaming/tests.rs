@@ -19,6 +19,7 @@ type ViewerChunk = (ChunkPos, u32);
 
 struct Harness {
     map: ChunkMap,
+    sky: SkyMap,
     jobs: WorldJobs,
     content: WorldContent,
     settings: WorldSettings,
@@ -26,6 +27,8 @@ struct Harness {
 }
 
 impl Harness {
+    /// A world without light (these tests check the streaming rules; [`Harness::lit`] turns it
+    /// on).
     fn new(
         generator: impl WorldGenerator,
         executor: Arc<dyn JobExecutor>,
@@ -36,17 +39,15 @@ impl Harness {
             vertical_bounds: Some(generator.vertical_chunks()),
             interest_budget: Duration::MAX,
             job_budget: Duration::MAX,
+            light: false,
             ..WorldSettings::default()
         };
-        let content = WorldContent {
-            generator: Arc::new(generator),
-            materials: Arc::new(MaterialTable::from_registry(&registry)),
-            registry,
-        };
+        let content = WorldContent::new(Arc::new(generator), registry);
         let mut jobs = WorldJobs::new(max_in_flight, 1, executor);
         jobs.mesh_fn = fake_mesh;
         Self {
             map: ChunkMap::default(),
+            sky: SkyMap::new(SkyRule::Off),
             jobs,
             content,
             settings,
@@ -60,8 +61,28 @@ impl Harness {
         self
     }
 
+    /// The same world with light (before anything is loaded).
+    fn lit(mut self) -> Self {
+        assert!(
+            self.map.is_empty(),
+            "light is chosen before streaming starts"
+        );
+        self.settings.light = true;
+        self.sky = SkyMap::new(SkyRule::new(
+            true,
+            self.content.generator.vertical_chunks(),
+            self.settings.sky_walk_limit,
+        ));
+        self
+    }
+
     fn with<R>(&mut self, f: impl FnOnce(&mut WorldJobs, &mut Ctx<'_>, &WorldSettings) -> R) -> R {
-        let mut cx = Ctx::new(&mut self.map, &self.content, &mut self.events);
+        let mut cx = Ctx::new(
+            &mut self.map,
+            &mut self.sky,
+            &self.content,
+            &mut self.events,
+        );
         f(&mut self.jobs, &mut cx, &self.settings)
     }
 
@@ -143,7 +164,15 @@ impl Harness {
     /// `Ready` mesh is published.
     fn check_published(&self) {
         for (id, slot) in self.map.iter() {
-            let published = self.jobs.published.contains(&id);
+            let published = self.jobs.published.get(&id);
+            if let (Some(published), MeshState::Ready { mesh, .. }) = (published, slot.mesh()) {
+                assert!(
+                    Arc::ptr_eq(published, mesh),
+                    "{:?}: published mesh",
+                    slot.pos
+                );
+            }
+            let published = published.is_some();
             let remeshing = slot.interest.contains(Interest::MESH)
                 && matches!(slot.mesh(), MeshState::Queued | MeshState::InFlight { .. });
             match slot.mesh() {
@@ -162,7 +191,7 @@ impl Harness {
         assert!(
             self.jobs
                 .published
-                .iter()
+                .keys()
                 .all(|&id| self.map.get(id).is_some())
         );
     }
@@ -379,6 +408,24 @@ fn padded_neighbors_are_the_chunks_whose_mesh_reads_the_voxel() {
             .map(|(_, o)| (o.x, o.y, o.z))
             .collect()
     };
+    // `box_chunks(p, 0)`, used by the edits, is the chunk and these neighbors.
+    for p in [
+        LocalPos::new(5, 1, 30),
+        LocalPos::new(5, 31, 7),
+        LocalPos::new(31, 5, 0),
+        LocalPos::new(0, 0, 0),
+        LocalPos::new(31, 31, 31),
+    ] {
+        let chunk = ChunkPos::new(-3, 7, 2);
+        let mut got = BTreeSet::new();
+        box_chunks(BlockPos::from_parts(chunk, p), 0, &mut got);
+        let mut want: BTreeSet<ChunkPos> = offsets(p)
+            .into_iter()
+            .map(|(x, y, z)| chunk.offset(boxel_math::IVec3::new(x, y, z)))
+            .collect();
+        want.insert(chunk);
+        assert_eq!(got, want, "{p:?}");
+    }
     assert!(offsets(LocalPos::new(5, 1, 30)).is_empty());
     assert_eq!(offsets(LocalPos::new(5, 31, 7)), [(0, 1, 0)]);
     // An edge voxel: two face neighbors and the edge neighbor between them.
@@ -418,8 +465,9 @@ fn neighbor_edits_bump_epoch_and_remesh() {
         1
     );
     h.settle(20);
-    // (1, -1, 0) has no mesh interest (radius 0): only the center is remeshed.
-    assert_eq!(upserted(&h.take_events()), vec![center]);
+    // (1, -1, 0) has no mesh interest (radius 0): only the center is remeshed, and its mesh
+    // (the fake mesher's, from its own unchanged data) is the same: nothing is sent again.
+    assert!(h.take_events().is_empty());
     assert!(matches!(
         h.slot(ChunkPos::new(1, -1, 0)).mesh(),
         MeshState::None
@@ -755,7 +803,9 @@ fn losing_mesh_interest_mid_remesh_removes_the_old_mesh() {
     let mut remeshing: Vec<ChunkId> = h
         .map
         .iter()
-        .filter(|(id, s)| matches!(s.mesh(), MeshState::Queued) && h.jobs.published.contains(id))
+        .filter(|(id, s)| {
+            matches!(s.mesh(), MeshState::Queued) && h.jobs.published.contains_key(id)
+        })
         .map(|(id, _)| id)
         .collect();
     assert!(remeshing.contains(&a));
@@ -1092,4 +1142,5 @@ fn slot_counters_follow_every_transition() {
     assert!(stats.mesh_ready > 0 && stats.mesh_empty > 0, "{stats:?}");
 }
 
+mod sky;
 mod tall;

@@ -1,6 +1,6 @@
 # ADR 0015: luz de vóxeles
 
-- Estado: aceptado (fases P0, P1 y P2 hechas; P3 en adelante, pendientes)
+- Estado: aceptado (fases P0 a P3 hechas; P4 en adelante, pendientes)
 - Fecha: 2026-10-06
 
 ## Contexto
@@ -107,7 +107,7 @@ mundo.
   que no si hay uno.
 - Se borraron `ChunkData.light` y `LightStorage`.
 
-### 4. Techo de cielo por columna (P1, hecho; el mundo lo usa en P3)
+### 4. Techo de cielo por columna (P1 y P3, hecho)
 
 `T(x, z)` es el vóxel más alto con opacidad mayor que 0 en el contenido del mundo (generador más
 ediciones), nunca en "lo que está cargado". Por eso el streaming nunca cambia la luz: un chunk que
@@ -139,14 +139,21 @@ en o debajo de todos los techos de sus 9 columnas no tiene cielo directo. Si nin
 mundo llega al vacío dentro del límite (el overworld, o generadores acotados con columnas
 cerradas), eso vale para toda caja debajo del piso, sin pedir ningún tile.
 
+Debajo del rango del generador solo cuenta el contenido: un chunk cargado sin bloqueadores se lee
+igual que uno sin cargar (aire, o vacío si no hay contenido más abajo). Si no, el techo dependería
+de qué chunks de aire están cargados.
+
 Ediciones (P3): poner un bloqueador encima de `T` sube `T` (`SkyTile::raise`). Quitar el bloque de
 `T` busca el siguiente hacia abajo en los datos cargados (`SkyTile::rescan_column`); si la
-búsqueda sale de lo cargado, la columna vuelve a `Pending` y corre una caminata. Queda un caso
-para P3: en un mundo cuyas columnas llegan al vacío (uno de aire), una edición debajo del piso hace
-que una caminata nueva cierre en el piso todas las columnas abiertas del tile, y `raise` solo la
-suya.
+búsqueda sale de lo cargado o baja del rango del generador, la columna vuelve a `Pending` y corre
+una caminata. El caso que quedaba abierto en P1, un mundo cuyas columnas llegan al vacío: ahí el
+contenido debajo del piso decide si las columnas abiertas del tile terminan en el piso o siguen
+abiertas para siempre, así que toda edición de un bloqueador debajo del piso manda la columna a
+caminar de nuevo. Así los techos de un tile editado son siempre los de una caminata nueva.
+`LayerData::AirUntil` salta de una vez un tramo de aire (una plataforma a 2^50 vóxeles de altura
+no recorre 2^45 capas).
 
-### 5. Caja exacta por chunk (P1, hecho; corre dentro del job de malla en P3)
+### 5. Caja exacta por chunk (P1, hecho; corre dentro del job de malla desde P3)
 
 `boxel_light::compute` calcula la luz del chunk acolchado (local -1 a 32, lo que lee el mesher):
 
@@ -208,13 +215,63 @@ suya.
   visible lee sus 9 celdas de enfrente y busca su clave (material, AO, 4 esquinas) en una tabla
   de direccionamiento abierto; la paleta solo se consulta para claves nuevas.
   `reference_face_shading` es el oráculo de fuerza bruta de AO y luz por cara.
-- En P2 el mundo todavía no calcula luz: malla con `light: None`, así que toda cara cuenta como
-  iluminada y `BakedLitOnly` hornea AO en todas (el peor caso, ver Consecuencias). La política es
-  `WorldSettings::ao_policy` (adelantado de P3). Como el AO lee vecinos de arista y esquina, una
-  edición ya remalla todo chunk cuya región acolchada contiene el vóxel (hasta 8), no solo los
+- La política es `WorldSettings::ao_policy`. Como el AO lee vecinos de arista y esquina, una
+  edición remalla todo chunk cuya región acolchada contiene el vóxel (hasta 8), no solo los
   vecinos de cara.
 
-### 7. GPU (P4)
+### 7. Mundo (P3, hecho)
+
+`boxel_world` calcula la luz dentro del job de malla. Sin estado nuevo por chunk, salvo la caché
+de gameplay.
+
+- **`SkyMap`** (recurso, `src/sky.rs`): un `SkyColumn` por columna de chunks con algún slot
+  cargado, creado con su primer slot y borrado con el último. Estado `Pending`, `InFlight
+  { version }` o `Exact(Arc<SkyTile>)`, más `version`, `edited` y el bloqueador editado más alto
+  (el comienzo `S` de la próxima caminata). Un resultado cuya `version` cambió se descarta y la
+  columna se camina de nuevo.
+- **Caminata perezosa** (`JobKind::SkyTile`, `JobId::Column`): una columna se camina solo cuando
+  una malla la necesita, así que un viewer hondo, con todas sus cajas debajo del piso, no camina
+  nada. Comparte el tope de jobs en vuelo y su prioridad es la de su slot más cercano al viewer.
+  Antes de arrancar espera los datos de las capas cargadas que va a leer (desde `S` hasta abajo
+  de la malla más baja que la espera), así casi no genera nada por su cuenta: lo que sí genera lo
+  cuenta `WorldStats::sky_private_generations`. Las capas cargadas las lee del snapshot (ahí
+  están las ediciones).
+- **Regla del mundo** (fija al arrancar): con `light` apagada no hay luz (mallas con cielo 15,
+  como antes). Con un generador sin tope (`GeneratorTop::Unbounded`), luz sin techos: toda
+  columna abierta, con un aviso en el log. Con un generador vacío, solo las ediciones tapan el
+  cielo (sin piso). Con tope, el piso es el tope menos `sky_walk_limit`.
+- **`start_mesh`**: si la caja del chunk (su origen más 47) está en el piso o arriba, o si el
+  mundo puede llegar al vacío, espera que las 9 columnas de alrededor estén `Exact`; la malla
+  queda `Queued` y se agenda cuando llega el tile (`WorldStats::waiting_sky`). Debajo del piso
+  usa `SkyInput::BelowFloor`, sin tiles. El job toma un `LightScratch` y un `PaddedLight` por hilo,
+  corre `boxel_light::compute` y después malla. Dentro de `light_cache_radius` (8 chunks) guarda
+  también el `ChunkLight` del chunk, que lee `ChunkMap::light_at`.
+- **Publicación**: una malla igual a la publicada (mismo hash y mismos bytes) no se envía de
+  nuevo. Las mallas de un mismo lote de ediciones salen en el mismo frame: las que llegan antes
+  esperan al resto hasta `edit_batch_hold_frames` (2) frames; si el resto tarda más, salen como
+  están (`WorldStats::edit_batches_split`). Dos lotes que tocan el mismo chunk se juntan.
+- **Ediciones** (`apply_edits`), por vóxel cambiado `p`, todo en un lote con prioridad 0 y
+  `epoch` subido:
+  - Caras y AO: todo chunk cuya región acolchada contiene `p` (hasta 8).
+  - Si cambió la opacidad o la emisión: todo chunk cuya región acolchada toca la caja `p ± r`,
+    con `r` el alcance del cambio: el nivel más alto por canal de la luz vieja en `p` y sus 6
+    vecinos, y de la emisión vieja y la nueva, como mucho 14. La luz vieja sale de las cachés,
+    leídas antes de aplicar el lote; si falta una o no es la del contenido actual, `r` es 14.
+    Excavar en una cueva oscura remalla solo el chunk (o los de su región acolchada).
+  - Si se movió el techo: todo chunk cargado cuya región acolchada toca la banda de la columna,
+    14 vóxeles alrededor, desde 14 debajo del techo más bajo hasta 14 encima del más alto. Si la
+    columna vuelve a caminar, el tile nuevo se compara con el viejo y remalla las bandas de las
+    columnas que cambiaron, en el mismo lote.
+  - Descarga: un chunk cuya edición movió un techo se lleva la edición (todavía no hay
+    persistencia), así que su columna vuelve a caminar y remalla lo que cambie. Con el
+    `ChunkStore` persistente se guardarán los techos editados por columna.
+- **Coordenadas**: las cuentas de bandas y cajas usan `i64` con resta saturada; los techos se
+  comparan relativos a la caja dentro de `boxel_light`. El mismo mundo en x = 2^40 e y = -2^40
+  da los mismos bits.
+- **`reference`**: `Reference` recalcula tiles, luz y mallas desde cero (datos cargados y
+  generador, sin cachés ni caminos rápidos). Los tests comparan contra ella.
+
+### 8. GPU (P4)
 
 - La paleta vive en el arena de quads, justo después de los 8 buckets del chunk:
   `light_base = quad_base + total_quads`, en un relleno libre de `ChunkGpu` (offset 52; sigue en
@@ -231,12 +288,12 @@ suya.
   `color = albedo * sombreado de cara * mix(1 - fuerza_ao, 1, ao / 3) * luz`, después niebla. Con
   cielo 15 al mediodía y AO abierto da la imagen de hoy. Igual en todos los tiers.
 
-### 8. Día y noche (P5)
+### 9. Día y noche (P5)
 
 Solo un uniform: sin remallado y sin subidas. `TimeOfDay` avanza en `FixedUpdate` (64 Hz; un día
 de 20 minutos son 76 800 ticks). La luz de bloque se ve igual al mediodía y a medianoche.
 
-### 9. Más adelante (P8)
+### 10. Más adelante (P8)
 
 AO desde ocupación en GPU en High y Mid si el gate G1 o las mediciones lo piden; cascadas de
 sombras del sol en High (profundidad con solo `geo`, el cielo horneado como máscara de
@@ -244,9 +301,9 @@ exterior); luces dinámicas en el shader; vidrio teñido.
 
 ### Fases
 
-P0 (datos de bloque, máscaras, este ADR), P1 (`boxel_light`) y P2 (mesher) están hechas. Siguen
-P3 (integración en `boxel_world`: `SkyMap`, jobs de caminata, luz en `start_mesh`, ediciones con
-lotes atómicos), P4 (render), P5 (día y noche), P6 (contenido: lámparas de color y lava
+P0 (datos de bloque, máscaras, este ADR), P1 (`boxel_light`), P2 (mesher) y P3 (integración en
+`boxel_world`: `SkyMap`, jobs de caminata, luz en `start_mesh`, ediciones con lotes atómicos)
+están hechas. Siguen P4 (render), P5 (día y noche), P6 (contenido: lámparas de color y lava
 provisoria), P7 (medir con la máquina libre y decidir) y P8.
 
 ### Valores por defecto (decisiones abiertas del dueño)
@@ -298,10 +355,13 @@ cielo en la superficie, de bloque en las lámparas) y que la caja de superficie 
   66 y 244 MiB de vóxeles. En superficie (y = 80) el techo es 8 KiB por chunk con malla: como mucho
   52 MiB a radio 16 y 210 MiB a radio 32, menos en la práctica.
 - P0 y P1 no cambiaron nada en pantalla. P2 pasa los quads a v2 y el mundo ya hornea AO, que el
-  shader de hoy dibuja; la luz se ve recién con P3 (el mundo la calcula) y P4 (el shader la lee).
-- Riesgos abiertos: el AO en la clave del merge infla los quads (gate G1 en P3); Low paga 8 bytes
-  más por quad (16 en total); una paleta con más de 4096 entradas pierde precisión en los canales
-  de bloque; las ediciones de luz remallan hasta 8 chunks.
+  shader de hoy dibuja. P3 calcula la luz en el mundo (las caras oscuras pierden su AO); la luz se
+  ve con P4 (el shader la lee).
+- Riesgos abiertos: Low paga 8 bytes más por quad (16 en total); una paleta con más de 4096
+  entradas pierde precisión en los canales de bloque; las ediciones de luz remallan hasta 8
+  chunks, más las bandas de los techos que se mueven; un viewer cuya vista toca los 1024 vóxeles
+  bajo el tope camina las columnas generando la superficie (abajo). El AO en la clave del merge
+  pasó el gate G1 (abajo).
 
 **P2 (mesher), medido el 2026-10-06** con criterion (release), cada bench después de
 `tools/wait-idle.sh`, en la máquina compartida con otros builds (load average de 3 a 7): números
@@ -329,7 +389,7 @@ que da lo mismo que `baked`):
 | forest, y = 80 | 439 764 | 717 965 (1.63x) |
 
 - Hasta P3 el mundo paga el AO en todas las caras, cuevas incluidas: bajo tierra a radio 16 son
-  14.7 M quads en lugar de 8.4 M. Con la luz de P3 las cuevas oscuras vuelven a fusionarse como
+  14.7 M quads en lugar de 8.4 M (con la luz de P3, 8.4 M: abajo). Con la luz de P3 las cuevas oscuras vuelven a fusionarse como
   con AO apagado (estimado 1.0 a 1.05x); el gate G1 de P3 lo mide.
 - Las paletas son de 1 entrada mientras la luz sea uniforme. En los benches: 74 entradas en la
   superficie con árboles y 411 en la cueva con lámparas.
@@ -337,6 +397,34 @@ que da lo mismo que `baked`):
   los vértices de bgm): `mesh/cave` con AO apagado da 19.6 µs contra los 28.8 µs medidos antes.
 - Memoria: el `Mesher` de cada hilo pasa de unos 210 KiB a unos 0.6 MiB (claves de 34³ en `u32`,
   la paleta y la tabla de claves).
+
+**P3 (mundo), medido el 2026-10-06** con `headless_world` (release, `--hz 0`). Los quads no
+dependen de la carga de la máquina. Gate G1, quads contra hoy (luz apagada y AO apagado), con luz
+y AO `lit-only` (el valor por defecto):
+
+| Vista | Hoy | Con luz | Relación | Límite |
+|---|---|---|---|---|
+| forest, radio 16, y = 80 | 439 764 | 766 460 | 1.74x | 1.9x |
+| overworld, radio 16, y = 80 | 4 222 233 | 4 562 418 | 1.08x | 1.25x |
+| overworld, radio 16, y = -1000 | 8 407 250 | 8 407 250 | 1.00x | 1.10x |
+| overworld, radio 32, y = 80 | 16 690 909 | 18 043 891 | 1.08x | 22 M |
+| overworld, radio 32, y = -1000 | 33 613 075 | 33 613 075 | 1.00x | |
+| forest, radio 32, y = 80 | 1 760 326 | 3 076 455 | 1.75x | |
+
+El forest a y = -1000 no tiene nada (está debajo de su fondo). G1 pasa: queda `BakedLitOnly`.
+
+- AO omitido en caras oscuras contra AO en todas (`--ao baked`), con luz, a radio 16: overworld
+  y = 80, 4.56 M contra 7.38 M; y = -1000, 8.41 M contra 14.67 M; forest igual (todo tiene luz).
+  Sin AO (`--ao off`) la luz sola cuesta 1.03x en el overworld (las claves de luz parten algunas
+  fusiones) y 1.27x en el forest (las sombras de los árboles).
+- Caminos de la luz y caminatas a radio 16: overworld y = 80, 1690 cajas con inundación y 5266
+  rápidas, 933 columnas caminadas con 1 generación privada; forest, 1645 y 1934, 933 caminatas,
+  ninguna privada. A y = -1000 todas las cajas son rápidas, pero las 6 capas más altas de la
+  vista quedan a menos de 1024 vóxeles del tope del generador, así que las 933 columnas se
+  caminan y generan 2540 chunks de superficie que no están cargados (unos 2.7 por columna).
+- Memoria: la caché de luz de gameplay, 4.6 MiB (radio 8); los tiles, 7.4 MiB a radio 16 y
+  27.7 MiB a radio 32. Paletas: p50 1, p99 38, máximo 222, ninguna recuantizada.
+- P3 no suma benches de criterion: el trabajo nuevo de la luz son las funciones medidas en P1.
 
 Cambios de API que rompen:
 
@@ -357,6 +445,15 @@ Cambios de API que rompen:
   `has_cached_light_masks`, los tipos `LightMasks`, `MaskRows` y `OwnedLightMasks`, y
   `heap_bytes` cuenta las máscaras construidas.
 - Nuevo crate `boxel_light` (depende solo de `boxel_voxel`).
+- P3: `WorldSettings` suma `light`, `sky_walk_limit`, `light_cache_radius` y
+  `edit_batch_hold_frames`; `WorldContent` suma `light_tables` y `WorldContent::new`;
+  `WorldStats` suma `light_full`, `light_fast`, `sky_columns`, `sky_walks`,
+  `sky_private_generations`, `waiting_sky`, `edit_batches_held`, `edit_batches_split` y
+  `light_fanout`. Nuevos: el recurso `SkyMap`, `ColumnId`, `ChunkMap::light_at`,
+  `ChunkSlot::light` y el módulo `reference`. En `scheduler`, `JobKind::SkyTile` y los jobs se
+  identifican con `JobId` (`Chunk` o `Column`) en lugar de `ChunkId`. `boxel_light` suma
+  `LayerData::AirUntil`. `boxel_world` depende de `boxel_light`. Una malla igual a la publicada
+  ya no genera un `ChunkMeshEvent::Upsert`.
 
 Tests que lo vigilan:
 
@@ -386,8 +483,25 @@ Tests que lo vigilan:
 - `boxel_light/tests/sky_walk.rs`: la caminata igual a un recorrido de fuerza bruta de los chunks
   generados (overworld con árboles y entradas, forest, terrain y flat, cerca y en 2^40), el
   límite, el vacío, la búsqueda después de una edición, una edición 5000 vóxeles arriba que solo
-  cambia su columna (la edición aplicada al tile es igual a una caminata nueva), tiles sin piso y
-  generadores sin tope.
+  cambia su columna (la edición aplicada al tile es igual a una caminata nueva), tiles sin piso,
+  generadores sin tope y `AirUntil` (una plataforma a 2^50 se camina en pocas capas).
+- `boxel_world/src/tests/light.rs` (P3, mesher real; cada caso compara las mallas con
+  `Reference`): las mallas no dependen del camino del viewer (volar, bajar, teletransportarse),
+  del ejecutor ni de los hilos (1 y 6); un mundo en reposo malla cada chunk una vez; ediciones
+  al azar dejan cada malla igual a la de cero y todo chunk que cambió fue remallado; quitar una
+  lámpara es igual a no ponerla; cavar en una cueva oscura remalla solo su chunk, y ahí abajo no
+  se camina ninguna columna; un pozo tiene cielo 15 en el fondo y queda oscuro al taparlo; el
+  límite de la caminata corta un pozo más hondo; una plataforma a +5000 sombrea el suelo y al
+  descargarse se lleva la sombra; contenido debajo del piso cierra en el piso las columnas
+  abiertas (y al quitarlo vuelven a abrirse); un lote de ediciones sale en un frame, o en partes
+  pasado `edit_batch_hold_frames`; el mismo mundo en x = 2^40, y = -2^40 da los mismos bits.
+- `boxel_world/src/streaming/tests/sky.rs`: las caminatas esperan los datos cargados y no
+  generan nada; una caminata que leyó contenido editado se repite; un chunk editado que se
+  descarga devuelve su columna a una caminata; generadores sin tope o vacíos. En `sky.rs`, las
+  reglas según el rango del generador, `padded_chunks` contra fuerza bruta y las caminatas con
+  capas capturadas, el vacío y el contenido fuera del generador.
+- `boxel_world/tests/integration.rs`: cada malla del terreno real, también después de editar,
+  igual a la de `Reference`; `light_at` lee la caché.
 
 ## Alternativas descartadas
 
@@ -408,5 +522,5 @@ Tests que lo vigilan:
   entradas que dan a cavernas.
 - **En High y Mid, un buffer lateral de luz de 8 bytes por quad, o quads de 16 bytes**: el doble
   de memoria de quads (unos 290 MB contra 145 MB a radio 16 bajo tierra). Solo Low lo paga
-  (sección 7), porque no puede leer la paleta de un storage buffer.
+  (sección 8), porque no puede leer la paleta de un storage buffer.
 - **Mezcla aditiva de colores**: necesita un BFS por fuente y satura.

@@ -20,6 +20,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use support::{CountingExecutor, LayerGen, fake_mesh};
 
+mod light;
+
 /// Fixtures shared with the module-level unit tests.
 pub(crate) mod support {
     use crate::jobs::JobExecutor;
@@ -328,11 +330,22 @@ fn plugin_streams_settles_and_uses_fast_paths() {
             (state, ..) => panic!("{pos:?}: unexpected mesh state {state:?}"),
         }
     }
-    // Fast paths: air chunks (y >= 0) and enclosed stone (y = -2) never spawn a mesh job.
+    // Fast paths: air chunks (y >= 0) and enclosed stone (y = -2) never spawn a mesh job. The
+    // layers reach the void above the walk floor, so every mesh needs the sky tiles of its
+    // 3x3 columns: the 21 data columns are walked once each, from loaded data only.
+    let stats = *app.world().resource::<WorldStats>();
+    assert_eq!(
+        (
+            stats.sky_walks,
+            stats.sky_private_generations,
+            stats.sky_columns
+        ),
+        (21, 0, 21)
+    );
     assert_eq!(
         executor.spawned.load(Ordering::Relaxed),
-        expected.len() + exposed.len(),
-        "one job per generation plus one per exposed mesh"
+        expected.len() + exposed.len() + 21,
+        "one job per generation, one per exposed mesh and one per sky walk"
     );
     assert_eq!(upserts(&events), exposed);
     assert!(removes(&events).is_empty());
@@ -354,8 +367,18 @@ fn plugin_streams_settles_and_uses_fast_paths() {
             queued_jobs: 0,
             in_flight: 0,
             interest_backlog: 0,
+            light_full: stats.light_full,
+            light_fast: stats.light_fast,
+            sky_columns: 21,
+            sky_walks: 21,
+            sky_private_generations: 0,
+            waiting_sky: 0,
+            edit_batches_held: 0,
+            edit_batches_split: 0,
+            light_fanout: 0,
         }
     );
+    assert_eq!(stats.light_full + stats.light_fast, exposed.len());
     assert_eq!(
         app.world().resource::<DiagnosticsBoard>().get("world"),
         Some("chunks=105 ready=105 meshed=10 empty=15 meshing=0 queued=0 in_flight=0 failed=0")
@@ -599,13 +622,15 @@ fn edits_remesh_the_chunk_and_the_neighbors_that_read_the_voxel() {
     let events = settle(&mut app, 50);
     assert!(app.world().resource::<EditQueue>().is_empty());
 
-    assert_eq!(
-        upserts(&events),
-        vec![center, east],
-        "center + east neighbor"
-    );
+    // The east neighbor is remeshed too, but its (fake) mesh comes out the same: only the
+    // center's new mesh is sent.
+    assert_eq!(upserts(&events), vec![center], "center");
     assert!(removes(&events).is_empty());
     assert_eq!(slot_at(&app, east).epoch, east_epoch + 1);
+    assert!(matches!(
+        slot_at(&app, east).mesh(),
+        MeshState::Ready { epoch, .. } if *epoch == east_epoch + 1
+    ));
     assert_eq!(
         slot_at(&app, above).epoch,
         above_epoch + 1,
@@ -710,7 +735,7 @@ fn task_pool_executor_settles_the_same_world() {
 /// nested `ChunkKey` would leave), an index entry 32.
 #[test]
 fn hot_structures_stay_small() {
-    assert_eq!(size_of::<crate::ChunkSlot>(), 88, "chunk slot");
+    assert_eq!(size_of::<crate::ChunkSlot>(), 112, "chunk slot");
     assert_eq!(size_of::<(ChunkPos, crate::ChunkId)>(), 32, "index entry");
 }
 
@@ -818,7 +843,7 @@ fn jobs_run_back_to_back_within_a_frame() {
     assert!(stats.is_settled(), "{stats:?}");
     assert_eq!(
         executor.spawned.load(Ordering::Relaxed),
-        105 + 10,
-        "every generation plus the exposed meshes"
+        105 + 10 + 21,
+        "every generation, the exposed meshes and a sky walk per column"
     );
 }

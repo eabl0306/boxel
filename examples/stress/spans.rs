@@ -621,6 +621,15 @@ mod tests {
         queued_jobs: 5,
         in_flight: 0,
         interest_backlog: 0,
+        light_full: 0,
+        light_fast: 0,
+        sky_columns: 0,
+        sky_walks: 0,
+        sky_private_generations: 0,
+        waiting_sky: 0,
+        edit_batches_held: 0,
+        edit_batches_split: 0,
+        light_fanout: 0,
     };
 
     /// Frame `i` lasts `ms[i]`; crossings at `crossed`, the world busy at `busy`.

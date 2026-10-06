@@ -21,20 +21,25 @@
 //!   inside some viewer's keep region with data that was at least started.
 use crate::interest::{Level, Planner, Viewer};
 use crate::jobs::JobExecutor;
-use crate::scheduler::{JobKind, JobScheduler};
+use crate::scheduler::{JobId, JobKind, JobScheduler};
+use crate::sky::{ColumnId, SkyMap, SkyRule, SkyState, WalkJob, may_block, padded_chunks};
 use crate::{
     BlockEdit, ChunkId, ChunkMap, ChunkMeshEvent, ChunkSlot, DataState, Interest, MeshState,
-    WorldContent, WorldSettings,
+    WorldContent, WorldSettings, WorldStats,
 };
 use boxel_ecs::prelude::*;
+use boxel_light::{
+    ChunkLight, LayerData, LightInput, LightPath, LightScratch, PaddedLight, Rescan, SkyInput,
+    SkyTile,
+};
 use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher};
 use boxel_voxel::{
-    BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, Face, LocalPos, NEIGHBOR_OFFSETS,
-    RenderShape, neighbor_index,
+    BlockPos, BlockRegistry, BlockState, CHUNK_SHIFT, ChunkData, ChunkKey, ChunkPos, Face,
+    LightValue, LocalPos, NEIGHBOR_OFFSETS, RenderShape, neighbor_index,
 };
 use crossbeam_channel::{Receiver, Sender};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::ops::RangeInclusive;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -43,6 +48,10 @@ use std::time::{Duration, Instant};
 
 /// `neighbors_ready` with all 26 bits set.
 pub(crate) const ALL_NEIGHBORS: u32 = (1 << 26) - 1;
+
+/// Frames after which an edit batch that never got a result is closed (its members, waiting for
+/// neighbors that may never come, publish on their own).
+const STALE_BATCH_FRAMES: u32 = 120;
 
 /// Positions re-evaluated per frame whatever `WorldSettings::interest_budget` says (progress).
 const MIN_INTEREST_STEPS: usize = 64;
@@ -95,12 +104,25 @@ pub(crate) enum JobMessage {
         data_version: u32,
         epoch: u32,
         mesh: ChunkMesh,
+        /// The chunk's light, when the job keeps it (within `light_cache_radius`).
+        light: Option<Arc<ChunkLight>>,
+        /// How the light box was computed (`None`: light off).
+        path: Option<LightPath>,
+    },
+    /// A sky walk finished.
+    Walked {
+        column: ColumnId,
+        /// The column version the walk read.
+        version: u32,
+        tile: SkyTile,
+        /// Chunks it generated privately.
+        generated: u32,
     },
     /// The job saw the slot's cancel flag and did nothing.
-    Cancelled { id: ChunkId, kind: JobKind },
+    Cancelled { id: JobId, kind: JobKind },
     /// The job panicked, or was dropped without running.
     Failed {
-        id: ChunkId,
+        id: JobId,
         kind: JobKind,
         panic: String,
     },
@@ -113,19 +135,44 @@ pub(crate) struct JobReport {
     busy: Duration,
 }
 
-/// A `Meshed` result waiting for the per-frame event budget.
+/// A `Meshed` result waiting for the per-frame event budget (or for the rest of its edit
+/// batch).
 #[derive(Debug)]
 struct MeshedResult {
     id: ChunkId,
     data_version: u32,
     epoch: u32,
     mesh: ChunkMesh,
+    light: Option<Arc<ChunkLight>>,
+}
+
+/// The remeshes requested by one call of [`WorldJobs::apply_edits`] (or by the sky tiles it sent
+/// back to a walk): their meshes are published in the same frame.
+#[derive(Debug, Default)]
+struct EditBatch {
+    /// Slots whose result has not arrived.
+    members: Vec<ChunkId>,
+    /// Fresh results waiting for the rest.
+    held: Vec<MeshedResult>,
+    /// Frames since the first result was held.
+    held_frames: Option<u32>,
+    /// Frames since the batch was opened.
+    age: u32,
+}
+
+/// The sky of a light box ([`WorldJobs::sky_for`]).
+enum SkyFor {
+    /// The 9 tiles around the chunk, or `None` when the box needs none (under the walk floor,
+    /// or light off).
+    Ready(Option<[Arc<SkyTile>; 9]>),
+    /// A tile is not walked yet: the slot waits for it.
+    Waiting,
 }
 
 /// Owned by every spawned job: sends the job's single message, or `Failed` from `Drop` if the
 /// job ends (panic outside the guarded body, executor dropping the closure) without sending.
 struct ResultToken {
-    id: ChunkId,
+    id: JobId,
     kind: JobKind,
     tx: Option<Sender<JobReport>>,
 }
@@ -157,6 +204,53 @@ impl Drop for ResultToken {
 thread_local! {
     /// One mesher per worker thread (~0.6 MiB of scratch, reused across jobs).
     static MESHER: RefCell<Mesher> = RefCell::new(Mesher::new());
+    /// One light scratch per worker thread (~0.7 MiB, reused across jobs) and the padded light
+    /// of the last job.
+    static LIGHT: RefCell<(LightScratch, PaddedLight)> = RefCell::default();
+}
+
+/// The light part of a mesh job, captured on the main thread.
+struct LightJob {
+    tables: Arc<boxel_voxel::LightTables>,
+    /// The 9 tiles around the chunk (by `boxel_light::box_light::tile_index`), or `None` when
+    /// the box is under the walk floor.
+    tiles: Option<[Arc<SkyTile>; 9]>,
+    /// Keep the chunk's light for gameplay.
+    keep: bool,
+}
+
+/// Computes the light of `pos` from its 27 chunks (center at 13) into this thread's scratch and
+/// runs `f` on it. A panic inside resets the scratch (its light array must be zero between
+/// calls).
+fn with_light<R>(
+    job: &LightJob,
+    pos: ChunkPos,
+    chunks: [Option<&ChunkData>; 27],
+    f: impl FnOnce(&PaddedLight, LightPath) -> R,
+) -> R {
+    /// Resets the thread's scratch unless disarmed (a panic unwound through it).
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            if self.0 {
+                LIGHT.set(Default::default());
+            }
+        }
+    }
+    let mut reset = Reset(true);
+    let out = LIGHT.with_borrow_mut(|(scratch, padded)| {
+        let tiles = job.tiles.as_ref().map(|t| std::array::from_fn(|i| &*t[i]));
+        let input = LightInput {
+            origin: pos,
+            chunks,
+            sky: tiles.map_or(SkyInput::BelowFloor, SkyInput::Tiles),
+            tables: &job.tables,
+        };
+        let path = boxel_light::compute(&input, scratch, padded);
+        f(padded, path)
+    });
+    reset.0 = false;
+    out
 }
 
 /// How mesh jobs turn their input into a mesh (a seam for unit tests).
@@ -236,7 +330,8 @@ pub(crate) fn mesh_with_thread_mesher(
 
 /// The neighbors (bit `i` = `NEIGHBOR_OFFSETS[i]`) whose padded region, the chunk and its
 /// 1-voxel border that their mesh reads, contains local voxel `p` of this chunk: up to 7 for a
-/// corner voxel, none for an inner one.
+/// corner voxel, none for an inner one (the reference of `box_chunks(p, 0)`).
+#[cfg(test)]
 fn padded_neighbors(p: LocalPos) -> u32 {
     if p.border_faces() == 0 {
         return 0;
@@ -266,7 +361,7 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
 fn spawn_job(
     executor: &dyn JobExecutor,
     tx: &Sender<JobReport>,
-    id: ChunkId,
+    id: JobId,
     kind: JobKind,
     cancel: Arc<AtomicBool>,
     body: impl FnOnce() -> JobMessage + Send + 'static,
@@ -303,6 +398,7 @@ pub(crate) struct ViewerChunks(pub(crate) Vec<(u64, Viewer)>);
 /// `ChunkMeshEvent`s to publish (written by the calling system).
 pub(crate) struct Ctx<'a> {
     pub(crate) map: &'a mut ChunkMap,
+    pub(crate) sky: &'a mut SkyMap,
     pub(crate) content: &'a WorldContent,
     pub(crate) events: &'a mut Vec<ChunkMeshEvent>,
     generator_layers: Option<RangeInclusive<i64>>,
@@ -311,11 +407,13 @@ pub(crate) struct Ctx<'a> {
 impl<'a> Ctx<'a> {
     pub(crate) fn new(
         map: &'a mut ChunkMap,
+        sky: &'a mut SkyMap,
         content: &'a WorldContent,
         events: &'a mut Vec<ChunkMeshEvent>,
     ) -> Self {
         Self {
             map,
+            sky,
             content,
             events,
             generator_layers: None,
@@ -425,11 +523,25 @@ pub(crate) struct WorldJobs {
     pub(crate) mesh_fn: MeshFn,
     /// Mesher options of new mesh jobs (from `WorldSettings::ao_policy`, every frame).
     mesh_options: MeshOptions,
+    /// `WorldSettings::light_cache_radius`, squared (every frame).
+    light_cache_sq: u32,
+    /// `WorldSettings::edit_batch_hold_frames` (every frame).
+    hold_frames: u32,
+    /// Open edit batches by id.
+    batches: BTreeMap<u32, EditBatch>,
+    /// Id of the next edit batch.
+    next_batch: u32,
+    /// Light counters for [`WorldStats`] (`waiting_sky` is a gauge, the rest add up).
+    light_counts: WorldStats,
+    /// Mesh jobs started per chunk position (tests: no light ripples).
+    #[cfg(test)]
+    pub(crate) mesh_jobs: std::collections::HashMap<ChunkPos, u32>,
     /// Mesh results waiting for the event budget (`scheduler.complete()` already called; their
     /// slots stay `InFlight` until applied, so the world is not settled while any wait).
     pending: VecDeque<MeshedResult>,
-    /// Chunks whose last published event was an `Upsert`.
-    published: HashSet<ChunkId, foldhash::fast::FixedState>,
+    /// Chunks whose last published event was an `Upsert`, with that mesh (an identical new
+    /// mesh is not sent again).
+    published: std::collections::HashMap<ChunkId, Arc<ChunkMesh>, foldhash::fast::FixedState>,
     /// Viewers, interest settings and the interest work not done yet.
     pub(crate) planner: Planner,
     /// The automatic in-flight cap.
@@ -464,8 +576,16 @@ impl WorldJobs {
             executor,
             mesh_fn: mesh_with_thread_mesher,
             mesh_options: MeshOptions::default(),
+            // `WorldSettings::default()` until the first `begin_frame`.
+            light_cache_sq: 8 * 8,
+            hold_frames: 2,
+            batches: BTreeMap::new(),
+            next_batch: 0,
+            light_counts: WorldStats::default(),
+            #[cfg(test)]
+            mesh_jobs: std::collections::HashMap::new(),
             pending: VecDeque::new(),
-            published: HashSet::default(),
+            published: std::collections::HashMap::default(),
             planner: Planner::default(),
             auto_cap: AutoCap::new(workers),
             uniform: Vec::new(),
@@ -487,9 +607,23 @@ impl WorldJobs {
         self.scheduler.queued() > 0 || !self.rx.is_empty()
     }
 
-    /// True if mesh results wait for the event budget.
+    /// True if mesh results wait for the event budget, or an edit batch is open (its results
+    /// may be held, and it ages every frame).
     pub(crate) fn has_meshes(&self) -> bool {
-        !self.pending.is_empty()
+        !self.pending.is_empty() || !self.batches.is_empty()
+    }
+
+    /// Copies the light counters into `stats`.
+    pub(crate) fn light_stats(&self, stats: &mut WorldStats) {
+        let c = &self.light_counts;
+        stats.light_full = c.light_full;
+        stats.light_fast = c.light_fast;
+        stats.sky_walks = c.sky_walks;
+        stats.sky_private_generations = c.sky_private_generations;
+        stats.waiting_sky = c.waiting_sky;
+        stats.edit_batches_held = c.edit_batches_held;
+        stats.edit_batches_split = c.edit_batches_split;
+        stats.light_fanout = c.light_fanout;
     }
 
     /// One shared snapshot of a uniform chunk of `state`.
@@ -701,9 +835,10 @@ impl WorldJobs {
     /// Recomputes up to `max` stale job priorities for the current viewers (jobs whose slot no
     /// longer wants them are dropped).
     fn refresh_priorities(&mut self, cx: &Ctx<'_>, max: usize) {
-        let (map, planner) = (&*cx.map, &self.planner);
-        self.scheduler
-            .refresh_priorities(max, |id, kind| current_priority(map, planner, id, kind));
+        let (map, sky, planner) = (&*cx.map, &*cx.sky, &self.planner);
+        self.scheduler.refresh_priorities(max, |id, kind| {
+            current_priority(map, sky, planner, id, kind)
+        });
     }
 
     /// Brings the slot at `pos` (`id`, looked up by the caller) in line with the current viewers:
@@ -756,11 +891,15 @@ impl WorldJobs {
         interest: Interest,
     ) -> ChunkId {
         let near = cx.known_air(pos.y).then(|| neighbor_ids(cx.map, pos));
-        let slot = ChunkSlot::new(ChunkKey {
-            dim: settings.dimension,
-            lod: 0,
-            pos,
-        });
+        let column = cx.sky.attach(pos, settings.dimension);
+        let slot = ChunkSlot::new(
+            ChunkKey {
+                dim: settings.dimension,
+                lod: 0,
+                pos,
+            },
+            column,
+        );
         let id = cx.map.insert(slot);
         // Gaining mesh interest only queues the mesh here (the data is not ready yet): no slot
         // comes or goes, so `near` stays valid.
@@ -829,17 +968,20 @@ impl WorldJobs {
     /// A slot outside the vertical bounds (left behind by a bounds change) becomes air for its
     /// neighbors instead: their bit stays set and the ones with mesh interest are remeshed.
     pub(crate) fn unload(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
+        self.leave_batch(cx, id);
+        self.set_waits_sky(cx, id, false);
         let Some(slot) = cx.map.remove(id) else {
             return;
         };
         slot.cancel.store(true, Ordering::Relaxed);
         self.failure_logged.remove(&id);
-        if self.published.remove(&id) {
+        if self.published.remove(&id).is_some() {
             cx.events.push(ChunkMeshEvent::Remove {
                 id,
                 key: slot.key(),
             });
         }
+        self.column_lost_slot(cx, &slot, id);
         let outside = !self.planner.in_bounds(slot.pos.y);
         // All 26 lookups first: independent, so their cache misses overlap.
         let near = neighbor_ids(cx.map, slot.pos);
@@ -872,9 +1014,11 @@ impl WorldJobs {
 
     /// For a slot in `MeshState::Queued` that wants a mesh: resolves the empty fast paths that
     /// need no neighbors (`Missing` data, uniform air), or queues a mesh job once its data is
-    /// `Ready` and all 26 neighbors are ready. Otherwise it waits (it is scheduled again when the
-    /// last neighbor becomes ready).
+    /// `Ready`, all 26 neighbors are ready and, when its light box may hold direct sky, the sky
+    /// tiles of its 3x3 columns are walked. Otherwise it waits (it is scheduled again when the
+    /// last neighbor becomes ready, or when the tile lands).
     fn schedule_mesh(&mut self, cx: &mut Ctx<'_>, id: ChunkId, priority: u32) {
+        self.set_waits_sky(cx, id, false);
         let slot = &cx.map.slots[id];
         if !matches!(slot.mesh(), MeshState::Queued) || !slot.interest.contains(Interest::MESH) {
             return;
@@ -885,10 +1029,233 @@ impl WorldJobs {
                 self.set_mesh_empty(cx, id);
             }
             DataState::Ready(_) if slot.neighbors_ready == ALL_NEIGHBORS => {
-                self.scheduler.push(id, JobKind::Mesh, priority);
+                if matches!(self.sky_for(cx, id, false), SkyFor::Ready(_)) {
+                    self.scheduler.push(id, JobKind::Mesh, priority);
+                }
             }
             DataState::Ready(_) | DataState::Queued | DataState::Generating => {}
         }
+    }
+
+    /// The sky of the light box of slot `id` (without `collect`, only whether it is ready:
+    /// `Ready(None)`). When a tile of its 3x3 columns is not walked yet, the slot waits for it
+    /// ([`SkyFor::Waiting`]) and the walk is requested.
+    fn sky_for(&mut self, cx: &mut Ctx<'_>, id: ChunkId, collect: bool) -> SkyFor {
+        let pos = cx.map.slots[id].pos;
+        match cx.sky.rule {
+            SkyRule::Off => return SkyFor::Ready(None),
+            SkyRule::Open => {
+                let open = &cx.sky.open;
+                return SkyFor::Ready(collect.then(|| std::array::from_fn(|_| Arc::clone(open))));
+            }
+            SkyRule::Walk(_) if !cx.sky.needs_tiles(pos) => return SkyFor::Ready(None),
+            SkyRule::Walk(_) => {}
+        }
+        let mut tiles: [Option<Arc<SkyTile>>; 9] = Default::default();
+        let mut waiting = false;
+        for (i, tile) in (0i64..).zip(tiles.iter_mut()) {
+            // `boxel_light::box_light::tile_index`: (dx + 1) * 3 + (dz + 1).
+            let (dx, dz) = (i / 3 - 1, i % 3 - 1);
+            let Some(col) = cx.sky.id_at(pos.x + dx, pos.z + dz) else {
+                // A chunk with its 26 neighbors loaded has every column around it.
+                debug_assert!(false, "no sky column next to {pos:?}");
+                *tile = Some(Arc::clone(&cx.sky.open));
+                continue;
+            };
+            let column = &mut cx.sky.columns[col];
+            if let Some(exact) = column.exact() {
+                if collect {
+                    *tile = Some(Arc::clone(exact));
+                }
+                continue;
+            }
+            waiting = true;
+            if !column.waiters.contains(&id) {
+                column.waiters.push(id);
+            }
+            let priority = self.planner.column_priority(column.x, column.z);
+            self.request_walk(cx.sky, col, priority);
+        }
+        if waiting {
+            self.set_waits_sky(cx, id, true);
+            return SkyFor::Waiting;
+        }
+        SkyFor::Ready(collect.then(|| tiles.map(|t| t.expect("every tile was set"))))
+    }
+
+    /// Queues the walk of column `col` if it is `Pending`, not queued and not waiting for data.
+    fn request_walk(&mut self, sky: &mut SkyMap, col: ColumnId, priority: u32) {
+        let Some(c) = sky.columns.get_mut(col) else {
+            return;
+        };
+        if matches!(c.state, SkyState::Pending { .. }) && !c.queued && c.waiting_for.is_none() {
+            c.queued = true;
+            self.scheduler.push(col, JobKind::SkyTile, priority);
+        }
+    }
+
+    /// Marks whether slot `id` waits for a sky tile ([`WorldStats::waiting_sky`]).
+    fn set_waits_sky(&mut self, cx: &mut Ctx<'_>, id: ChunkId, waits: bool) {
+        if let Some(slot) = cx.map.slots.get_mut(id)
+            && slot.waits_sky != waits
+        {
+            slot.waits_sky = waits;
+            let gauge = &mut self.light_counts.waiting_sky;
+            *gauge = if waits { *gauge + 1 } else { *gauge - 1 };
+        }
+    }
+
+    /// The data of slot `id` arrived (or the slot is gone): a walk of its column that waited for
+    /// it is queued again.
+    fn walk_data_arrived(&mut self, cx: &mut Ctx<'_>, col: ColumnId, id: ChunkId) {
+        let Some(c) = cx.sky.columns.get_mut(col) else {
+            return;
+        };
+        if c.waiting_for == Some(id) {
+            c.waiting_for = None;
+            let priority = self.planner.column_priority(c.x, c.z);
+            self.request_walk(cx.sky, col, priority);
+        }
+    }
+
+    /// Slot `slot` (id `id`) was removed: its column loses it (and goes with its last slot). A
+    /// chunk whose edits moved a sky top takes them with it (nothing is persisted yet), so its
+    /// column is walked again.
+    fn column_lost_slot(&mut self, cx: &mut Ctx<'_>, slot: &ChunkSlot, id: ChunkId) {
+        let col = slot.column;
+        self.walk_data_arrived(cx, col, id);
+        if cx.sky.detach(col) || !slot.sky_edited {
+            return;
+        }
+        let c = &mut cx.sky.columns[col];
+        c.version = c.version.wrapping_add(1);
+        if let SkyState::Exact(tile) = &c.state {
+            c.state = SkyState::Pending {
+                old: Some(Arc::clone(tile)),
+            };
+        }
+        let priority = self.planner.column_priority(c.x, c.z);
+        self.request_walk(cx.sky, col, priority);
+    }
+
+    // ---- Edit batches ------------------------------------------------------------------------
+
+    /// A new, empty edit batch.
+    fn new_batch(&mut self) -> u32 {
+        let b = self.next_batch;
+        self.next_batch = self.next_batch.wrapping_add(1);
+        self.batches.insert(b, EditBatch::default());
+        b
+    }
+
+    /// Slot `id` (with mesh interest) is remeshed as part of batch `b`. A slot already in an open
+    /// batch merges that batch into `b`: neither is published without the other.
+    fn join_batch(&mut self, cx: &mut Ctx<'_>, b: u32, id: ChunkId) {
+        let slot = &mut cx.map.slots[id];
+        match slot.batch {
+            Some(old) if old == b && self.batches.contains_key(&b) => return,
+            Some(old) if old != b => {
+                if let Some(merged) = self.batches.remove(&old) {
+                    for &m in merged
+                        .members
+                        .iter()
+                        .chain(merged.held.iter().map(|r| &r.id))
+                    {
+                        if let Some(s) = cx.map.slots.get_mut(m) {
+                            s.batch = Some(b);
+                        }
+                    }
+                    let batch = self.batches.entry(b).or_default();
+                    batch.members.extend(merged.members);
+                    if !merged.held.is_empty() {
+                        batch.held_frames = batch.held_frames.max(merged.held_frames);
+                    }
+                    batch.held.extend(merged.held);
+                }
+            }
+            _ => {}
+        }
+        cx.map.slots[id].batch = Some(b);
+        let batch = self.batches.entry(b).or_default();
+        if !batch.members.contains(&id) {
+            batch.members.push(id);
+        }
+    }
+
+    /// Slot `id` leaves its batch without a result to publish (its mesh became empty or was
+    /// dropped, or it unloads; a held result of it is discarded). The batch is published once no
+    /// member is left.
+    fn leave_batch(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
+        let Some(slot) = cx.map.slots.get_mut(id) else {
+            return;
+        };
+        let Some(b) = slot.batch.take() else {
+            return;
+        };
+        let Some(batch) = self.batches.get_mut(&b) else {
+            return;
+        };
+        batch.members.retain(|&m| m != id);
+        batch.held.retain(|r| r.id != id);
+        if batch.members.is_empty() {
+            self.flush_batch(cx, b, false);
+        }
+    }
+
+    /// Closes batch `b` and publishes its held results (`split`: some members are still out,
+    /// they are published on their own when they arrive).
+    fn flush_batch(&mut self, cx: &mut Ctx<'_>, b: u32, split: bool) {
+        let Some(batch) = self.batches.remove(&b) else {
+            return;
+        };
+        if split {
+            self.light_counts.edit_batches_split += 1;
+        }
+        for &m in batch.members.iter().chain(batch.held.iter().map(|r| &r.id)) {
+            if let Some(s) = cx.map.slots.get_mut(m)
+                && s.batch == Some(b)
+            {
+                s.batch = None;
+            }
+        }
+        for result in batch.held {
+            self.apply_meshed(cx, result);
+        }
+    }
+
+    /// Frame step of the open batches: a batch holding results for more than
+    /// `edit_batch_hold_frames` is published as it is; one that never got a result is closed
+    /// after [`STALE_BATCH_FRAMES`].
+    fn age_batches(&mut self, cx: &mut Ctx<'_>) {
+        let hold = self.hold_frames;
+        let due: Vec<(u32, bool)> = self
+            .batches
+            .iter_mut()
+            .filter_map(|(&b, batch)| {
+                batch.age += 1;
+                match &mut batch.held_frames {
+                    Some(frames) => {
+                        *frames += 1;
+                        (*frames > hold).then_some((b, true))
+                    }
+                    None => (batch.age > STALE_BATCH_FRAMES).then_some((b, false)),
+                }
+            })
+            .collect();
+        for (b, split) in due {
+            self.flush_batch(cx, b, split);
+        }
+    }
+
+    /// Remeshes slot `id` for edit batch `b`: its light or data changed, so its epoch is bumped
+    /// (a running job read the old content) and the remesh runs first (priority 0).
+    fn remesh_for_edit(&mut self, cx: &mut Ctx<'_>, id: ChunkId, b: u32) {
+        let slot = &mut cx.map.slots[id];
+        slot.epoch = slot.epoch.wrapping_add(1);
+        if slot.interest.contains(Interest::MESH) {
+            self.join_batch(cx, b, id);
+        }
+        self.request_remesh(cx, id, 0);
     }
 
     /// Asks for a new mesh of `id` (its data or a neighbor changed). Slots without
@@ -912,7 +1279,7 @@ impl WorldJobs {
 
     /// `Remove` if the slot's mesh was published (its state is left as is).
     fn unpublish(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
-        if self.published.remove(&id) {
+        if self.published.remove(&id).is_some() {
             let key = cx.map.slots[id].key();
             cx.events.push(ChunkMeshEvent::Remove { id, key });
         }
@@ -920,14 +1287,18 @@ impl WorldJobs {
 
     /// `MeshState::Empty`, and `Remove` if a mesh was published.
     fn set_mesh_empty(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
+        self.set_waits_sky(cx, id, false);
         cx.map.set_mesh_and_pending(id, MeshState::Empty, false);
         self.unpublish(cx, id);
+        self.leave_batch(cx, id);
     }
 
     /// `MeshState::None`, and `Remove` if a mesh was published.
     fn drop_mesh(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
+        self.set_waits_sky(cx, id, false);
         cx.map.set_mesh_and_pending(id, MeshState::None, false);
         self.unpublish(cx, id);
+        self.leave_batch(cx, id);
     }
 
     /// The slot's data became `Ready` or `Missing`: refresh its own neighbor bits, set its bit in
@@ -968,57 +1339,180 @@ impl WorldJobs {
 
     // ---- Edits -------------------------------------------------------------------------------
 
-    /// Applies edits grouped by chunk (copy-on-write, `ChunkData::set` bumps the version);
-    /// remeshes each changed chunk and every neighbor whose padded region (the voxels its mesh
-    /// reads) holds a changed voxel: face neighbors for visibility, and edge and corner
-    /// neighbors too, whose AO and corner light read them (their epoch is bumped). All at
-    /// priority 0. Edits to chunks that are not `Ready` are dropped.
+    /// Applies edits grouped by chunk (copy-on-write, `ChunkData::set` bumps the version) and
+    /// remeshes, as one edit batch at priority 0 (epochs bumped), every chunk whose mesh may
+    /// change (ADR 0015):
+    ///
+    /// - every chunk whose padded region (what its mesh reads) holds a changed voxel: the center
+    ///   and up to 7 neighbors, edges and corners included (faces and AO);
+    /// - when the voxel's opacity or emission changed, every chunk whose padded region meets the
+    ///   box `p +- r`, with `r` the reach of the light change: the highest level, by channel,
+    ///   of the old light at `p` and its 6 neighbors, and of the old and new emission, at most
+    ///   14. The old light comes from the chunks' light caches; without a current one, `r` is
+    ///   14. Up to 8 chunks;
+    /// - when the voxel's sky top moved (a blocker placed over it, or the blocker at it removed),
+    ///   every loaded chunk whose padded region meets the column's band: 14 voxels around the
+    ///   column, from 14 under the lower of the two tops to 14 over the higher. A removed top
+    ///   whose next blocker is not in the loaded data sends the column back to a walk: the
+    ///   chunks around it are remeshed when the new tile lands.
+    ///
+    /// Edits to chunks that are not `Ready` are dropped.
     pub(crate) fn apply_edits(&mut self, cx: &mut Ctx<'_>, edits: Vec<BlockEdit>) {
         let mut by_chunk: BTreeMap<ChunkPos, Vec<(LocalPos, BlockState)>> = BTreeMap::new();
         for edit in edits {
             let (chunk, local) = edit.pos.split();
             by_chunk.entry(chunk).or_default().push((local, edit.state));
         }
-        for (chunk, changes) in by_chunk {
+        let light_on = cx.sky.rule != SkyRule::Off;
+        let tables = Arc::clone(&cx.content.light_tables);
+        // 1. What each edit changes, from the content and the light before any of them.
+        let mut changes: Vec<(ChunkId, LocalPos, BlockState, BlockState)> = Vec::new();
+        let mut remesh = BTreeSet::new();
+        let mut faces = BTreeSet::new();
+        for (chunk, edits) in by_chunk {
             let Some(id) = cx.map.id_at(chunk) else {
                 tracing::debug!(
                     ?chunk,
-                    edits = changes.len(),
+                    edits = edits.len(),
                     "edits dropped: chunk not loaded"
                 );
                 continue;
             };
-            let Some(data) = cx.map.ready_data_mut(id) else {
+            let DataState::Ready(data) = cx.map.slots[id].data() else {
                 tracing::debug!(
                     ?chunk,
-                    edits = changes.len(),
+                    edits = edits.len(),
                     "edits dropped: chunk not ready"
                 );
                 continue;
             };
-            if changes
-                .iter()
-                .all(|&(local, state)| data.get(local) == state)
-            {
-                continue;
-            }
-            let data = Arc::make_mut(data);
-            let mut touched = 0u32;
-            for (local, state) in changes {
-                if data.set(local, state) != state {
-                    touched |= padded_neighbors(local);
-                }
-            }
-            self.request_remesh(cx, id, 0);
-            for (i, offset) in NEIGHBOR_OFFSETS.iter().enumerate() {
-                if touched & (1 << i) == 0 {
+            // The state each voxel will have after the earlier edits of this call.
+            let mut now: BTreeMap<LocalPos, BlockState> = BTreeMap::new();
+            for (local, state) in edits {
+                let old = now.get(&local).copied().unwrap_or_else(|| data.get(local));
+                if old == state {
                     continue;
                 }
-                if let Some(n) = cx.map.id_at(chunk.offset(*offset)) {
-                    let neighbor = &mut cx.map.slots[n];
-                    neighbor.epoch = neighbor.epoch.wrapping_add(1);
-                    self.request_remesh(cx, n, 0);
-                }
+                now.insert(local, state);
+                let p = BlockPos::from_parts(chunk, local);
+                box_chunks(p, 0, &mut faces);
+                let reach = if light_on
+                    && (tables.opacity(old) != tables.opacity(state)
+                        || tables.emission(old) != tables.emission(state))
+                {
+                    light_reach(cx.map, &tables, p, old, state)
+                } else {
+                    0
+                };
+                box_chunks(p, reach, &mut remesh);
+                changes.push((id, local, old, state));
+            }
+        }
+        if changes.is_empty() {
+            return;
+        }
+        // 2. The data.
+        for &(id, local, _, state) in &changes {
+            if let Some(data) = cx.map.ready_data_mut(id) {
+                Arc::make_mut(data).set(local, state);
+            }
+        }
+        // 3. The sky tops, from the new data.
+        let batch = self.new_batch();
+        let walked = matches!(cx.sky.rule, SkyRule::Walk(_));
+        for &(id, local, old, state) in &changes {
+            let (placed, removed) = (tables.blocks_sky(state), tables.blocks_sky(old));
+            if !walked || placed == removed {
+                continue;
+            }
+            let p = BlockPos::from_parts(cx.map.slots[id].pos, local);
+            cx.map.slots[id].sky_edited = true;
+            if let Some(band) = self.sky_edit(cx, p, placed, batch) {
+                band_chunks(cx.map, cx.sky, &band, &mut remesh);
+            }
+        }
+        // 4. The remeshes.
+        remesh.extend(faces.iter().copied());
+        let mut fanout = 0;
+        for pos in remesh {
+            let Some(id) = cx.map.id_at(pos) else {
+                continue;
+            };
+            fanout += usize::from(!faces.contains(&pos));
+            self.remesh_for_edit(cx, id, batch);
+        }
+        self.light_counts.light_fanout += fanout;
+        self.close_if_empty(cx, batch);
+    }
+
+    /// A voxel at `p` now stops direct sky (`placed`) or no longer does: updates the sky top of
+    /// its column. Returns the band to remesh when the top moved; `None` when it did not, or
+    /// when the column must be walked again (pending: the walk's result remeshes, as part of
+    /// `batch`).
+    fn sky_edit(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        p: BlockPos,
+        placed: bool,
+        batch: u32,
+    ) -> Option<[RangeInclusive<i64>; 3]> {
+        let SkyRule::Walk(rule) = &cx.sky.rule else {
+            return None;
+        };
+        let layers = rule.layers.clone();
+        // In a world whose columns can reach the void, content under the floor decides whether
+        // the open columns of the tile end at the floor or stay open forever: walk again.
+        let under_floor = rule.void_reachable && p.y < rule.floor;
+        let (chunk, local) = p.split();
+        let col = cx.sky.id_at(chunk.x, chunk.z)?;
+        let c = &mut cx.sky.columns[col];
+        c.edited = true;
+        if placed {
+            c.edit_top = c.edit_top.max(p.y);
+        }
+        let SkyState::Exact(tile) = &mut c.state else {
+            // Not walked yet, or a walk is running with the old content: it is discarded, and
+            // what the next tile changes is remeshed with this batch.
+            c.version = c.version.wrapping_add(1);
+            c.batch = Some(batch);
+            return None;
+        };
+        if under_floor {
+            let old = Some(Arc::clone(tile));
+            c.state = SkyState::Pending { old };
+            c.version = c.version.wrapping_add(1);
+            c.batch = Some(batch);
+            self.request_walk(cx.sky, col, 0);
+            return None;
+        }
+        let (lx, lz) = (local.x(), local.z());
+        let top = tile.top(lx, lz);
+        if placed {
+            if p.y <= top {
+                return None;
+            }
+            Arc::make_mut(tile).raise(lx, lz, p.y);
+            return Some(sky_band(p.x, p.z, top, p.y));
+        }
+        if p.y != top {
+            return None;
+        }
+        // The top was cleared: the next blocker down, in the loaded data.
+        let (x, z, hi) = (c.x, c.z, c.hi);
+        let map = &*cx.map;
+        let found =
+            Arc::make_mut(tile).rescan_column(lx, lz, p.y - 1, &cx.content.light_tables, |cy| {
+                rescan_layer(map, (x, z), cy, hi, &layers)
+            });
+        match found {
+            Rescan::Found(next) => Some(sky_band(p.x, p.z, next, top)),
+            Rescan::Unresolved => {
+                let old = Some(Arc::clone(tile));
+                c.state = SkyState::Pending { old };
+                c.version = c.version.wrapping_add(1);
+                c.batch = Some(batch);
+                self.request_walk(cx.sky, col, 0);
+                None
             }
         }
     }
@@ -1030,6 +1524,10 @@ impl WorldJobs {
     /// the mesher options of the jobs it starts.
     pub(crate) fn begin_frame(&mut self, settings: &WorldSettings, now: Instant) {
         self.mesh_options = MeshOptions::with_ao(settings.ao_policy);
+        self.light_cache_sq = settings
+            .light_cache_radius
+            .saturating_mul(settings.light_cache_radius);
+        self.hold_frames = settings.edit_batch_hold_frames;
         self.auto_cap.observe_frame(now);
         let cap = match settings.max_jobs_in_flight {
             0 => self.auto_cap.cap(),
@@ -1074,9 +1572,9 @@ impl WorldJobs {
     fn dispatch_until(&mut self, cx: &mut Ctx<'_>, start: Instant, budget: Duration) -> usize {
         let (mut started, mut work, mut check) = (0, 0usize, DISPATCH_CHECK);
         while !self.scheduler.is_full() {
-            let (map, planner) = (&*cx.map, &self.planner);
+            let (map, sky, planner) = (&*cx.map, &*cx.sky, &self.planner);
             let refreshed = self.scheduler.refresh_ahead(DISPATCH_CHECK, |id, kind| {
-                current_priority(map, planner, id, kind)
+                current_priority(map, sky, planner, id, kind)
             });
             if refreshed > 0 {
                 work += refreshed;
@@ -1084,9 +1582,11 @@ impl WorldJobs {
                 let Some(job) = self.scheduler.pop_ready() else {
                     break;
                 };
-                let ok = match job.kind {
-                    JobKind::Generate => self.start_generate(cx, job.id),
-                    JobKind::Mesh => self.start_mesh(cx, job.id),
+                let ok = match (job.kind, job.id) {
+                    (JobKind::Generate, JobId::Chunk(id)) => self.start_generate(cx, id),
+                    (JobKind::Mesh, JobId::Chunk(id)) => self.start_mesh(cx, id),
+                    (JobKind::SkyTile, JobId::Column(col)) => self.start_walk(cx, col),
+                    _ => false,
                 };
                 if ok {
                     started += 1;
@@ -1119,7 +1619,7 @@ impl WorldJobs {
         spawn_job(
             self.executor.as_ref(),
             &self.tx,
-            id,
+            JobId::Chunk(id),
             JobKind::Generate,
             cancel,
             move || JobMessage::Generated {
@@ -1161,6 +1661,16 @@ impl WorldJobs {
             std::array::from_fn(|i| near.get(map, pos, i).cloned());
         let (data_version, epoch) = (center.version, slot.epoch);
         let cancel = Arc::clone(&slot.cancel);
+        // The tiles were walked when the job was queued, but an edit may have sent one back.
+        let light = match self.sky_for(cx, id, true) {
+            SkyFor::Waiting => return false,
+            SkyFor::Ready(_) if cx.sky.rule == SkyRule::Off => None,
+            SkyFor::Ready(tiles) => Some(LightJob {
+                tables: Arc::clone(&cx.content.light_tables),
+                tiles,
+                keep: self.planner.priority(pos) <= self.light_cache_sq,
+            }),
+        };
         cx.map.set_mesh_and_pending(
             id,
             MeshState::InFlight {
@@ -1169,31 +1679,207 @@ impl WorldJobs {
             },
             false,
         );
+        #[cfg(test)]
+        {
+            *self.mesh_jobs.entry(pos).or_default() += 1;
+        }
         let materials = Arc::clone(&cx.content.materials);
         let (mesh_fn, options) = (self.mesh_fn, self.mesh_options);
         spawn_job(
             self.executor.as_ref(),
             &self.tx,
-            id,
+            JobId::Chunk(id),
             JobKind::Mesh,
             cancel,
             move || {
-                // No light yet: open sky everywhere (ADR 0015, phase P3 computes it here).
-                let input = MeshInput {
-                    center: &center,
-                    neighbors: std::array::from_fn(|i| neighbors[i].as_deref()),
-                    light: None,
+                let near: [Option<&ChunkData>; 26] =
+                    std::array::from_fn(|i| neighbors[i].as_deref());
+                let Some(light) = light else {
+                    let input = MeshInput {
+                        center: &center,
+                        neighbors: near,
+                        light: None,
+                    };
+                    let mesh = mesh_fn(&input, &materials, options);
+                    return JobMessage::Meshed {
+                        id,
+                        data_version,
+                        epoch,
+                        mesh,
+                        light: None,
+                        path: None,
+                    };
                 };
-                let mesh = mesh_fn(&input, &materials, options);
-                JobMessage::Meshed {
-                    id,
-                    data_version,
-                    epoch,
-                    mesh,
+                // The 27 chunks in `boxel_light::box_light::chunk_index` order: the
+                // neighbor order with the center inserted at 13.
+                let chunks = std::array::from_fn(|i| match i {
+                    13 => Some(&*center),
+                    i if i < 13 => near[i],
+                    i => near[i - 1],
+                });
+                with_light(&light, pos, chunks, |padded, path| {
+                    let input = MeshInput {
+                        center: &center,
+                        neighbors: near,
+                        light: Some(padded),
+                    };
+                    let mesh = mesh_fn(&input, &materials, options);
+                    JobMessage::Meshed {
+                        id,
+                        data_version,
+                        epoch,
+                        mesh,
+                        light: light
+                            .keep
+                            .then(|| Arc::new(ChunkLight::from_padded(padded))),
+                        path: Some(path),
+                    }
+                })
+            },
+        );
+        true
+    }
+
+    /// Starts the walk of column `col` if it is still `Pending`: first waits for the data of the
+    /// loaded layers it reads (down to just under its lowest waiting mesh), so it generates as
+    /// few layers as it can; then captures the loaded layers and spawns the walk.
+    fn start_walk(&mut self, cx: &mut Ctx<'_>, col: ColumnId) -> bool {
+        let SkyRule::Walk(rule) = &cx.sky.rule else {
+            return false;
+        };
+        let rule = rule.clone();
+        let Some(c) = cx.sky.columns.get_mut(col) else {
+            return false;
+        };
+        c.queued = false;
+        let SkyState::Pending { old } = &c.state else {
+            return false;
+        };
+        let old = old.clone();
+        let Some(start) = rule.start(c.edit_top) else {
+            // Nothing in the column: open forever.
+            let open = Arc::clone(&cx.sky.open);
+            self.land_tile(cx, col, old, open);
+            return false;
+        };
+        let (x, z, lo, hi) = (c.x, c.z, c.lo, c.hi);
+        let top = hi.min(start >> CHUNK_SHIFT);
+        let floor = lo.max(rule.floor >> CHUNK_SHIFT);
+        let map = &*cx.map;
+        let wait_from = c
+            .waiters
+            .iter()
+            .filter_map(|&w| map.get(w))
+            .map(|s| s.pos.y - 1)
+            .min()
+            .map_or(floor, |y| y.max(floor));
+        let slot_at = |cy| map.id_at(ChunkPos::new(x, cy, z));
+        for cy in (wait_from..=top).rev() {
+            if let Some(id) = slot_at(cy)
+                && matches!(
+                    map.slots[id].data(),
+                    DataState::Queued | DataState::Generating
+                )
+            {
+                c.waiting_for = Some(id);
+                return false;
+            }
+        }
+        let captured: Vec<(i64, Option<Arc<ChunkData>>)> = (floor..=top)
+            .rev()
+            .filter_map(|cy| match map.slots[slot_at(cy)?].data() {
+                DataState::Ready(data) => Some((cy, Some(Arc::clone(data)))),
+                DataState::Missing => Some((cy, None)),
+                DataState::Queued | DataState::Generating => None,
+            })
+            .collect();
+        let tables = &cx.content.light_tables;
+        let content_below = rule.void_reachable
+            && (lo..floor).any(|cy| {
+                map.data_at(ChunkPos::new(x, cy, z))
+                    .is_some_and(|d| may_block(d, tables))
+            });
+        let version = c.version;
+        c.state = SkyState::InFlight { version, old };
+        let job = WalkJob {
+            x,
+            z,
+            dim: c.dim,
+            start,
+            floor: rule.floor,
+            layers: rule.layers,
+            captured,
+            content_below,
+        };
+        let cancel = Arc::clone(&c.cancel);
+        let generator = Arc::clone(&cx.content.generator);
+        let registry = Arc::clone(&cx.content.registry);
+        let tables = Arc::clone(tables);
+        spawn_job(
+            self.executor.as_ref(),
+            &self.tx,
+            JobId::Column(col),
+            JobKind::SkyTile,
+            cancel,
+            move || {
+                let (tile, generated) = job.run(generator.as_ref(), &registry, &tables);
+                JobMessage::Walked {
+                    column: col,
+                    version,
+                    tile,
+                    generated,
                 }
             },
         );
         true
+    }
+
+    /// Column `col` gets `tile` (it was `old`): every loaded chunk whose light the changed tops
+    /// can reach is remeshed (one edit batch: the column's, or a new one), and the meshes that
+    /// waited for the tile are scheduled.
+    fn land_tile(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        col: ColumnId,
+        old: Option<Arc<SkyTile>>,
+        tile: Arc<SkyTile>,
+    ) {
+        let c = &mut cx.sky.columns[col];
+        let (x, z) = (c.x, c.z);
+        c.state = SkyState::Exact(Arc::clone(&tile));
+        let batch = c.batch.take();
+        let waiters = std::mem::take(&mut c.waiters);
+        if let Some(old) = old
+            && let Some(band) = changed_band(&old, &tile, x, z)
+        {
+            let mut chunks = BTreeSet::new();
+            band_chunks(cx.map, cx.sky, &band, &mut chunks);
+            let b = batch.unwrap_or_else(|| self.new_batch());
+            self.light_counts.light_fanout += chunks.len();
+            for pos in chunks {
+                if let Some(id) = cx.map.id_at(pos) {
+                    self.remesh_for_edit(cx, id, b);
+                }
+            }
+            self.close_if_empty(cx, b);
+        }
+        for w in waiters {
+            if let Some(slot) = cx.map.get(w) {
+                let priority = self.priority(slot.pos);
+                self.schedule_mesh(cx, w, priority);
+            }
+        }
+    }
+
+    /// Batch `b` closes if no member joined it.
+    fn close_if_empty(&mut self, cx: &mut Ctx<'_>, b: u32) {
+        if self
+            .batches
+            .get(&b)
+            .is_some_and(|batch| batch.members.is_empty())
+        {
+            self.flush_batch(cx, b, false);
+        }
     }
 
     // ---- Collect -----------------------------------------------------------------------------
@@ -1224,17 +1910,38 @@ impl WorldJobs {
                     data_version,
                     epoch,
                     mesh,
+                    light,
+                    path,
                 } => {
                     self.auto_cap.observe_job(busy);
+                    match path {
+                        Some(LightPath::Full { .. }) => self.light_counts.light_full += 1,
+                        Some(LightPath::FastDark | LightPath::FastOpen) => {
+                            self.light_counts.light_fast += 1;
+                        }
+                        None => {}
+                    }
                     self.pending.push_back(MeshedResult {
                         id,
                         data_version,
                         epoch,
                         mesh,
+                        light,
                     });
                 }
+                JobMessage::Walked {
+                    column,
+                    version,
+                    tile,
+                    generated,
+                } => {
+                    self.auto_cap.observe_job(busy);
+                    self.light_counts.sky_walks += 1;
+                    self.light_counts.sky_private_generations += generated as usize;
+                    self.on_walked(cx, column, version, tile);
+                }
                 JobMessage::Cancelled { id, kind } => {
-                    tracing::trace!(?id, ?kind, "chunk job cancelled (slot unloaded)");
+                    tracing::trace!(?id, ?kind, "job cancelled (slot or column unloaded)");
                 }
                 JobMessage::Failed { id, kind, panic } => self.on_failed(cx, id, kind, &panic),
             }
@@ -1245,8 +1952,11 @@ impl WorldJobs {
         drained
     }
 
-    /// Applies waiting mesh results within `settings.max_mesh_events_per_frame` events.
+    /// Applies waiting mesh results within `settings.max_mesh_events_per_frame` events (the
+    /// meshes of an edit batch go out together, whatever the budget), after publishing the edit
+    /// batches that waited long enough.
     pub(crate) fn apply_meshes(&mut self, cx: &mut Ctx<'_>, settings: &WorldSettings) {
+        self.age_batches(cx);
         let budget = settings.max_mesh_events_per_frame.max(1);
         let first = cx.events.len();
         while cx.events.len() - first < budget {
@@ -1267,10 +1977,49 @@ impl WorldJobs {
         let data = self.snapshot(data);
         cx.map.set_data(id, DataState::Ready(data));
         self.data_available(cx, id);
+        let col = cx.map.slots[id].column;
+        self.walk_data_arrived(cx, col, id);
     }
 
-    fn on_failed(&mut self, cx: &mut Ctx<'_>, id: ChunkId, kind: JobKind, panic: &str) {
+    /// A walk of column `col` (its `version`) finished: the tile becomes the column's, unless
+    /// the column changed meanwhile (then it is walked again).
+    fn on_walked(&mut self, cx: &mut Ctx<'_>, col: ColumnId, version: u32, tile: SkyTile) {
+        let Some(c) = cx.sky.columns.get_mut(col) else {
+            return;
+        };
+        let SkyState::InFlight { version: v, old } = &mut c.state else {
+            return;
+        };
+        let old = old.take();
+        if *v != version || c.version != version {
+            c.state = SkyState::Pending { old };
+            let priority = self.planner.column_priority(c.x, c.z);
+            self.request_walk(cx.sky, col, priority);
+            return;
+        }
+        self.land_tile(cx, col, old, Arc::new(tile));
+    }
+
+    fn on_failed(&mut self, cx: &mut Ctx<'_>, id: JobId, kind: JobKind, panic: &str) {
         self.failed += 1;
+        let id = match id {
+            JobId::Chunk(id) => id,
+            JobId::Column(col) => {
+                // A walk that panics (private generations that panic read as air already)
+                // would panic again: the column gets open sky rather than blocking its meshes.
+                let Some(c) = cx.sky.columns.get_mut(col) else {
+                    return;
+                };
+                tracing::error!(column = ?(c.x, c.z), "sky walk failed: {panic}");
+                let SkyState::InFlight { old, .. } = &mut c.state else {
+                    return;
+                };
+                let old = old.take();
+                let open = Arc::clone(&cx.sky.open);
+                self.land_tile(cx, col, old, open);
+                return;
+            }
+        };
         let Some(slot) = cx.map.slots.get(id) else {
             tracing::debug!(?kind, "job for an unloaded chunk failed: {panic}");
             return;
@@ -1282,10 +2031,13 @@ impl WorldJobs {
             JobKind::Generate => {
                 if matches!(slot.data(), DataState::Generating) {
                     // Permanently air, like chunks outside the vertical bounds.
+                    let col = slot.column;
                     cx.map.set_data(id, DataState::Missing);
                     self.data_available(cx, id);
+                    self.walk_data_arrived(cx, col, id);
                 }
             }
+            JobKind::SkyTile => {}
             JobKind::Mesh => {
                 if !matches!(slot.mesh(), MeshState::InFlight { .. }) {
                     return;
@@ -1337,12 +2089,37 @@ impl WorldJobs {
             self.schedule_mesh(cx, id, priority);
             return;
         }
+        // Part of an edit batch: wait for the rest of it.
+        if self.hold_frames > 0
+            && let Some(b) = slot.batch
+            && let Some(batch) = self.batches.get_mut(&b)
+        {
+            batch.members.retain(|&m| m != id);
+            let first = batch.held.is_empty();
+            batch.held.push(result);
+            if batch.members.is_empty() {
+                self.flush_batch(cx, b, false);
+            } else if first {
+                batch.held_frames = Some(0);
+                self.light_counts.edit_batches_held += 1;
+            }
+            return;
+        }
+        self.leave_batch_published(cx, id);
+        cx.map.set_light(id, result.light);
         if result.mesh.is_empty() {
             self.set_mesh_empty(cx, id);
             return;
         }
-        let key = slot.key();
-        let mesh = Arc::new(result.mesh);
+        let key = cx.map.slots[id].key();
+        // A mesh identical to the published one (a remesh whose light or AO did not change) is
+        // kept as it is: no event, no upload.
+        let unchanged = self
+            .published
+            .get(&id)
+            .filter(|old| old.hash == result.mesh.hash && ***old == result.mesh)
+            .cloned();
+        let mesh = unchanged.clone().unwrap_or_else(|| Arc::new(result.mesh));
         cx.map.set_mesh(
             id,
             MeshState::Ready {
@@ -1351,19 +2128,193 @@ impl WorldJobs {
                 epoch: result.epoch,
             },
         );
-        self.published.insert(id);
-        cx.events.push(ChunkMeshEvent::Upsert { id, key, mesh });
+        if unchanged.is_none() {
+            self.published.insert(id, Arc::clone(&mesh));
+            cx.events.push(ChunkMeshEvent::Upsert { id, key, mesh });
+        }
+    }
+
+    /// Slot `id` publishes its result on its own (no hold): it leaves its batch, if any.
+    fn leave_batch_published(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
+        let Some(b) = cx.map.slots[id].batch.take() else {
+            return;
+        };
+        if let Some(batch) = self.batches.get_mut(&b) {
+            batch.members.retain(|&m| m != id);
+            if batch.members.is_empty() {
+                self.flush_batch(cx, b, false);
+            }
+        }
     }
 }
 
-/// Priority of a queued job for the current viewers, `None` if its slot no longer wants it.
-fn current_priority(map: &ChunkMap, planner: &Planner, id: ChunkId, kind: JobKind) -> Option<u32> {
+/// Priority of a queued job for the current viewers, `None` if its slot (or column) no longer
+/// wants it.
+fn current_priority(
+    map: &ChunkMap,
+    sky: &SkyMap,
+    planner: &Planner,
+    id: JobId,
+    kind: JobKind,
+) -> Option<u32> {
+    let id = match id {
+        JobId::Chunk(id) => id,
+        JobId::Column(col) => {
+            let c = sky.columns.get(col)?;
+            return c.queued.then(|| planner.column_priority(c.x, c.z));
+        }
+    };
     let slot = map.slots.get(id)?;
     let queued = match kind {
         JobKind::Generate => matches!(slot.data(), DataState::Queued),
         JobKind::Mesh => matches!(slot.mesh(), MeshState::Queued),
+        JobKind::SkyTile => false,
     };
     queued.then(|| planner.priority(slot.pos))
+}
+
+/// The voxels whose light a change of sky tops from `old` to `new` (column `(x, z)`) can reach:
+/// the columns whose top moved, +-14 horizontally, from 14 under the lower of the two tops to 14
+/// over the higher. `None` if no top moved.
+fn changed_band(old: &SkyTile, new: &SkyTile, x: i64, z: i64) -> Option<[RangeInclusive<i64>; 3]> {
+    let mut band: Option<[(i64, i64); 3]> = None;
+    for (i, (&a, &b)) in old.tops().iter().zip(new.tops()).enumerate() {
+        if a == b {
+            continue;
+        }
+        let wx = (x << CHUNK_SHIFT) + (i >> CHUNK_SHIFT) as i64;
+        let wz = (z << CHUNK_SHIFT) + (i & 31) as i64;
+        let (lo, hi) = (a.min(b).saturating_add(1), a.max(b));
+        let r = band.get_or_insert([(wx, wx), (lo, hi), (wz, wz)]);
+        for (axis, (l, h)) in r.iter_mut().zip([(wx, wx), (lo, hi), (wz, wz)]) {
+            axis.0 = axis.0.min(l);
+            axis.1 = axis.1.max(h);
+        }
+    }
+    band.map(|axes| axes.map(|(l, h)| reach(l, h)))
+}
+
+/// Sky band of one column whose top moved from `a` to `b` (see [`changed_band`]).
+fn sky_band(x: i64, z: i64, a: i64, b: i64) -> [RangeInclusive<i64>; 3] {
+    [
+        reach(x, x),
+        reach(a.min(b).saturating_add(1), b.max(a)),
+        reach(z, z),
+    ]
+}
+
+/// Voxels `lo..=hi` widened by the reach of light (14).
+fn reach(lo: i64, hi: i64) -> RangeInclusive<i64> {
+    lo.saturating_sub(i64::from(LIGHT_REACH))..=hi.saturating_add(i64::from(LIGHT_REACH))
+}
+
+/// How far light of level 15 reaches past its source (a voxel of level 1 is 14 away).
+const LIGHT_REACH: u8 = 14;
+
+/// The loaded chunks whose padded region meets the voxel box `band` (x, y, z), into `out`.
+/// Layers are looked up only within each column's loaded range.
+fn band_chunks(
+    map: &ChunkMap,
+    sky: &SkyMap,
+    band: &[RangeInclusive<i64>; 3],
+    out: &mut BTreeSet<ChunkPos>,
+) {
+    let ys = padded_chunks(*band[1].start(), *band[1].end());
+    for cx in padded_chunks(*band[0].start(), *band[0].end()) {
+        for cz in padded_chunks(*band[2].start(), *band[2].end()) {
+            let Some(col) = sky.id_at(cx, cz) else {
+                continue;
+            };
+            let c = &sky.columns[col];
+            for cy in (*ys.start()).max(c.lo)..=(*ys.end()).min(c.hi) {
+                let pos = ChunkPos::new(cx, cy, cz);
+                if map.id_at(pos).is_some() {
+                    out.insert(pos);
+                }
+            }
+        }
+    }
+}
+
+/// The chunks whose padded region meets the voxels within `r` of `p` (a box), into `out`.
+fn box_chunks(p: BlockPos, r: u8, out: &mut BTreeSet<ChunkPos>) {
+    let r = i64::from(r);
+    for cy in padded_chunks(p.y - r, p.y + r) {
+        for cx in padded_chunks(p.x - r, p.x + r) {
+            for cz in padded_chunks(p.z - r, p.z + r) {
+                out.insert(ChunkPos::new(cx, cy, cz));
+            }
+        }
+    }
+}
+
+/// Reach of the light change of voxel `p` going from `old` to `new` (see
+/// [`WorldJobs::apply_edits`]): 14 when a light it needs is not cached or not current.
+fn light_reach(
+    map: &ChunkMap,
+    tables: &boxel_voxel::LightTables,
+    p: BlockPos,
+    old: BlockState,
+    new: BlockState,
+) -> u8 {
+    let mut r = max_level(tables.emission(old)).max(max_level(tables.emission(new)));
+    let around = [
+        (0, 0, 0),
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    ];
+    for (dx, dy, dz) in around {
+        let (chunk, local) = BlockPos::new(p.x + dx, p.y + dy, p.z + dz).split();
+        let light = map
+            .id_at(chunk)
+            .and_then(|id| map.slots[id].current_light());
+        match light {
+            Some(light) => r = r.max(max_level(light.get(local))),
+            None => return LIGHT_REACH,
+        }
+    }
+    r.min(LIGHT_REACH)
+}
+
+/// Layer `cy` of column `(x, z)` for a rescan after an edit: loaded data, or air above the
+/// generator's range (an unloaded chunk there lost its edits; `hi`: the column's highest
+/// loaded layer). `None` otherwise: inside the range a walk generates the layer, and under it
+/// a walk decides between air and void from the loaded content below.
+fn rescan_layer<'m>(
+    map: &'m ChunkMap,
+    (x, z): (i64, i64),
+    cy: i64,
+    hi: i64,
+    layers: &RangeInclusive<i64>,
+) -> Option<LayerData<'m>> {
+    if layers.is_empty() || cy < *layers.start() {
+        return None;
+    }
+    if let Some(id) = map.id_at(ChunkPos::new(x, cy, z)) {
+        match map.slots[id].data() {
+            DataState::Ready(data) => return Some(LayerData::Ref(data)),
+            DataState::Missing => return Some(LayerData::Air),
+            DataState::Queued | DataState::Generating => {}
+        }
+    }
+    if !layers.is_empty() && cy > *layers.end() {
+        let next = if cy > hi {
+            hi.max(*layers.end())
+        } else {
+            cy - 1
+        };
+        return Some(LayerData::AirUntil(next));
+    }
+    None
+}
+
+/// The highest channel of `v`.
+fn max_level(v: LightValue) -> u8 {
+    v.sky().max(v.red()).max(v.green()).max(v.blue())
 }
 
 /// The slots of the 26 neighbors of `pos`, in [`NEIGHBOR_OFFSETS`] order (one lookup each).
