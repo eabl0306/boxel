@@ -142,10 +142,10 @@ fn sliding_along_any_surface_never_snags_on_seams() {
                 }
                 assert_eq!(face_bit.count_ones(), 1, "only the pressed face touches");
                 // 100 steps of 0.37 crossed several blocks and a chunk border.
-                let travelled = WorldPos::from_block(at(base, 0, 0, 0), start).delta_to(&pos);
+                let traveled = WorldPos::from_block(at(base, 0, 0, 0), start).delta_to(&pos);
                 assert!(
-                    (travelled[tangent] - 37.0 * sign).abs() < 1e-9,
-                    "{travelled:?}"
+                    (traveled[tangent] - 37.0 * sign).abs() < 1e-9,
+                    "{traveled:?}"
                 );
             }
         }
