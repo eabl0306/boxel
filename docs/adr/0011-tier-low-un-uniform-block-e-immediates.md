@@ -47,4 +47,5 @@ Se aplica en la fase P4 de la luz.
   `glUniform1i` (`gles/device.rs:544`), así que caería en la unidad 0. El segundo buffer sí
   funciona: sin layouts, GL reporta 16 vertex buffers (`gles/adapter.rs:800-806`) y la emulación
   de `first_instance` vuelve a enlazar cada buffer por instancia (`gles/command.rs:134-160`).
-- `boxel_gfx::tier::floors::VERTEX_BUFFERS` pasa de 1 a 2. Low paga 8 bytes más por quad.
+- `boxel_gfx::tier::floors::VERTEX_BUFFERS` pasa de 1 a 2. Low paga 8 bytes más por quad (16 en
+  total).

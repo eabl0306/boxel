@@ -139,7 +139,7 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_camera` | `Camera`, `CameraView` (relativa a cámara), `FlyCamera` | app, transform, window |
 | `boxel_gfx` | política sobre wgpu: preferencias, instancia, tiers, scoring, smoke, selección, LKG, superficie, readback, hal; ejemplo `gpu_info` | (wgpu) |
 | `boxel_shaders` | WGSL embebido, composición, espejos `#[repr(C)]`, tests de naga | (wgpu, bytemuck) |
-| `boxel_voxel` | coordenadas, `Face`, registry (con emisión RGB y opacidad de luz), paleta, `LightValue` y `LightTables`, `ChunkData` con su caché de máscaras (`ChunkMasks`) | (glam) |
+| `boxel_voxel` | coordenadas, `Face`, registry (con emisión RGB y opacidad de luz), paleta, `LightValue` y `LightTables`, `ChunkData` con sus máscaras de luz (`LightMasks`) | (glam) |
 | `boxel_mesh` | `PackedQuad`, `ChunkMesh`, `PaddedChunk`, `Mesher` (bgm) | voxel |
 | `boxel_light` | luz de vóxeles en CPU, sin ECS ni GPU (ADR 0015): techos de cielo por columna (`SkyTile`, caminata hacia abajo), luz exacta de un chunk desde una caja de 64³ (cielo y RGB, caminos rápidos para cuevas oscuras y cielo abierto), `PaddedLight`, `ChunkLight`; oráculo global para los tests | voxel |
 | `boxel_worldgen` | trait `WorldGenerator`; generadores `FlatGenerator`, `TerrainGenerator`, `ForestGenerator` (terreno con árboles) y `OverworldGenerator` (superficie sobre piedra infinita hacia abajo, con cuevas y árboles; etapas en `overworld`: `Heightmap`, `SurfaceRules`, `Caves`, más `Trees`); ruido 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`) | voxel |
@@ -602,12 +602,13 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
 - **Luz:** no vive en el chunk. Es un dato derivado, función pura de los bloques y de un techo de
   cielo por columna, que calcula `boxel_light` (ADR 0015). Hasta que el mesher la use (fase P2)
   todo se dibuja con cielo 15.
-- **Máscaras** de 4 KiB (1 bit por vóxel): `ChunkMasks` (opaca, parcial, sólida y emisores) se
-  construye la primera vez que se pide y queda en caché en el chunk hasta que cambian sus bloques.
+- **Máscaras de luz** de 4 KiB (1 bit por vóxel): `LightMasks` (opaca, parcial y emisores). Los
+  chunks uniformes y los de 1 bit sin emisores la sirven desde sus propias palabras; los demás la
+  construyen la primera vez que se pide y la guardan en caché hasta que cambian sus bloques.
   `ChunkData::from_occupancy` hace el camino inverso: arma un chunk de 1 bit (o `Uniform` si la
   máscara está toda llena o toda vacía) directo de la máscara, sin arreglo denso. El overworld lo
   usa para los chunks de piedra y cuevas bajo la superficie.
-- **`ChunkData`** = bloques + `version` + caché de máscaras. Se comparte como `Arc<ChunkData>`; las ediciones
+- **`ChunkData`** = bloques + `version` + caché de máscaras de luz. Se comparte como `Arc<ChunkData>`; las ediciones
   usan `Arc::make_mut`. Los arrays de vóxeles nunca van inline en componentes del ECS.
 
 ---
