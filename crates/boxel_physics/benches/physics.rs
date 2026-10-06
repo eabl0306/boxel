@@ -12,23 +12,28 @@
 //! | `tick/0` | <= 20 us |
 //! | `tick/100` | <= 0.05 ms |
 //! | `tick/1000` | <= 0.5 ms |
+//! | `frame/1000`, `frame/1000_multi_thread` | no target (per-frame cost, compare the two) |
 //!
 //! The worlds are streamed once by a headless app (`WorldPlugin`, inline jobs) before the
 //! measurements: forest terrain around the origin, a wide sky above it and a line of
 //! underground overworld chunks with caves. A `tick` is one run of `FixedPostUpdate` with
 //! `PhysicsPlugin` (every physics system of a fixed step) on the forest, with that many awake
 //! bodies: 70 % walking characters that turn around every 64 steps (some jump then), 30 % items
-//! dropped from up to 20 blocks. Run when the machine is idle (`tools/wait-idle.sh`).
+//! dropped from up to 20 blocks, all `Interpolated` as in the examples. A `frame` is one run of
+//! `RunFixedMainLoop` in a frame without a fixed step (144 fps): the interpolation of the 1000
+//! bodies and the schedule's executor, on the single-threaded executor `PhysicsPlugin` sets and
+//! on the multi-threaded one. Run when the machine is idle (`tools/wait-idle.sh`).
 #![expect(clippy::print_stdout, reason = "bench setup output")]
 
-use boxel_app::{App, FixedPostUpdate, FixedTime};
+use boxel_app::{App, FixedPostUpdate, FixedTime, RunFixedMainLoop};
 use boxel_ecs::message::Messages;
 use boxel_ecs::prelude::*;
+use boxel_ecs::schedule::MultiThreadedExecutor;
 use boxel_math::{DVec3, Vec2};
 use boxel_physics::{
     BodyPosition, BodySettings, CharacterController, ChunkSource, Collider, CollisionTable,
-    LocalBox, MoveIntent, PhysicsPlugin, PhysicsStats, RayResult, RigidBody, SweepConfig, Teleport,
-    Velocity, VoxelFilter, VoxelImpact, move_box, raycast_voxels,
+    Interpolated, LocalBox, MoveIntent, PhysicsPlugin, PhysicsStats, RayResult, RigidBody,
+    SweepConfig, Teleport, Velocity, VoxelFilter, VoxelImpact, move_box, raycast_voxels,
 };
 use boxel_transform::Transform;
 use boxel_voxel::{BlockRegistry, WorldPos};
@@ -359,6 +364,7 @@ fn spawn_bodies(app: &mut App, table: &CollisionTable, n: u64) {
                 Collider::standing(0.6, 1.8),
                 CharacterController::default(),
                 MoveIntent { wish, jump: false },
+                Interpolated::default(),
                 Teleport(ground),
                 Home(ground),
             ));
@@ -368,6 +374,7 @@ fn spawn_bodies(app: &mut App, table: &CollisionTable, n: u64) {
                 RigidBody::Dynamic,
                 Collider::aabb(DVec3::splat(0.125)).sensor(),
                 BodySettings::item(),
+                Interpolated::default(),
                 Teleport(ground.offset(DVec3::new(0.0, height, 0.0))),
             ));
         }
@@ -434,6 +441,25 @@ fn tick_benches(c: &mut Criterion) {
         assert_eq!(stats.frozen, 0, "every body is on loaded ground");
     }
     tick.finish();
+
+    // Frames at 144 fps that run no step: the accumulator moves, so alpha (and every
+    // interpolated `Transform`) changes each frame.
+    let frame_time = Duration::from_nanos(6_944_444);
+    let run_frame = |app: &mut App| {
+        {
+            let mut fixed = app.world_mut().resource_mut::<FixedTime>();
+            fixed.accumulate(frame_time);
+            while fixed.expend() {}
+        }
+        app.world_mut().run_schedule(RunFixedMainLoop);
+    };
+    let mut frame = c.benchmark_group("frame");
+    frame.bench_function("1000", |b| b.iter(|| run_frame(&mut app)));
+    app.edit_schedule(RunFixedMainLoop, |schedule| {
+        schedule.set_executor(MultiThreadedExecutor::new());
+    });
+    frame.bench_function("1000_multi_thread", |b| b.iter(|| run_frame(&mut app)));
+    frame.finish();
 }
 
 criterion_group!(physics, benches, tick_benches);

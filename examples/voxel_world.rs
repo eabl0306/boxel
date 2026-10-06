@@ -9,7 +9,8 @@
 //! selection). Picking is a voxel raycast from the camera (`PhysicsQuery::raycast_voxels`),
 //! reach 6 blocks. G switches between flying and walking: walking is a player body with gravity
 //! (`boxel::physics`, a 0.6 x 1.8 x 0.6 box and a `CharacterController`) that WASD moves along
-//! the view and Space makes jump, with the camera at its eye; F3 then shows a physics line.
+//! the view and Space makes jump, with the camera at its eye. F3 shows the mode and a physics
+//! line (`PhysicsStats`) in both modes.
 //!
 //! `--frames`, `--duration`, `--screenshot`, `--minimize-test`, `--resize-test`, `--vsync-test`
 //! and the like make it close by itself (`--duration` keeps the interactive path: fly camera
@@ -1343,7 +1344,12 @@ fn main() -> AppExit {
     app.add_plugins((
         LogDiagnosticsPlugin::default(),
         FlyCameraPlugin,
-        PhysicsPlugin::default(),
+        // At most one body (the walking player): keep the engine's 8 fixed steps per frame, so
+        // walking keeps real time down to 8 fps (3 steps would slow it down below 21 fps).
+        PhysicsPlugin {
+            max_steps_per_frame: None,
+            ..PhysicsPlugin::default()
+        },
         PickingPlugin,
         WalkPlugin { start_walking },
     ));
@@ -1699,6 +1705,18 @@ mod tests {
         assert!((5.1..5.3).contains(&top), "{top}");
         assert_eq!(feet(&app).to_dvec3().y, 4.0);
         assert!(app.world().get::<Contacts>(body).expect("body").on_ground);
+
+        // A tap shorter than a frame (pressed and released before the same update, as in a
+        // long frame) still jumps.
+        key(&mut app, KeyCode::Space, true);
+        key(&mut app, KeyCode::Space, false);
+        let mut top: f64 = 4.0;
+        for _ in 0..64 {
+            app.update();
+            top = top.max(feet(&app).to_dvec3().y);
+        }
+        assert!((5.1..5.3).contains(&top), "{top}");
+        assert_eq!(feet(&app).to_dvec3().y, 4.0);
 
         // G again: flying, the body is gone and Space flies the camera up.
         tap(&mut app, WALK_KEY);

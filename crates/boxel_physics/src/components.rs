@@ -2,7 +2,9 @@
 
 use crate::core::{BodySettings, LocalBox, Shape, StepParams, SweepConfig, SweepOut};
 use boxel_ecs::component::{Mutable, StorageType};
+use boxel_ecs::lifecycle::HookContext;
 use boxel_ecs::prelude::*;
+use boxel_ecs::world::DeferredWorld;
 use boxel_math::{DVec3, Vec2};
 use boxel_transform::Transform;
 use boxel_voxel::{BlockPos, Face, WorldPos};
@@ -33,7 +35,8 @@ use std::time::Duration;
 /// [`WorldPos`]); `Transform` is a view of it that physics writes after every step (or the
 /// interpolated position, with [`Interpolated`]). Writing `Transform` counts as a teleport: the
 /// next step starts from the written value. Past `2^53` blocks, where an `f64` cannot hold a
-/// position exactly, teleport with [`Teleport`] instead.
+/// position exactly, teleport with [`Teleport`] instead. A teleport keeps the velocity and
+/// clears [`Contacts`] (the body is not on its old ground any more).
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[require(Transform, Velocity, BodyPosition, Contacts, BodySettings, PhysicsSync)]
 pub enum RigidBody {
@@ -159,9 +162,14 @@ impl Collider {
 pub struct Velocity(pub DVec3);
 
 /// The authoritative position of a body, exact at any distance (see [`RigidBody`]). Read it in
-/// fixed steps; `Transform` is a view of it (interpolated with [`Interpolated`]). Set it through
-/// [`Teleport`] or `Transform`, not directly: a direct write is overwritten from `Transform` by
-/// the next step if the two disagree.
+/// fixed steps; `Transform` is a view of it (interpolated with [`Interpolated`]).
+///
+/// To move a body somewhere else, use [`Teleport`] or write `Transform` (a teleport). A direct
+/// write is kept too, but it is a nudge, not a teleport: the body moves exactly there and keeps
+/// its velocity and [`Contacts`], and `Transform` follows at the end of the step. Do it in a
+/// fixed step (`FixedUpdate`); written in `Update`, the interpolated view of a frame without a
+/// step would slide toward it. If `Transform` was also written since the last step, `Transform`
+/// wins.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct BodyPosition(pub WorldPos);
 
@@ -171,7 +179,8 @@ impl Component for BodySettings {
     type Mutability = Mutable;
 }
 
-/// What the latest step of a dynamic body touched, rewritten every step.
+/// What the latest step of a dynamic body touched, rewritten every step and cleared by a
+/// teleport.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Contacts {
     /// Bit `Face::index()` for each face of the body that a clip stopped in the latest step
@@ -229,9 +238,30 @@ impl Interpolated {
 
 /// Moves a body exactly to this position at the start of the next step, then removes itself.
 /// Use it past `2^53` blocks (where writing `Transform` rounds) or to spawn a body at an exact
-/// far position. The velocity is kept.
+/// far position. The velocity is kept and [`Contacts`] are cleared.
+///
+/// Inserting it also sets `Transform` to the position right away (rounded to `f64`), so
+/// `Update` and the renderer see the body there before the step runs: a body spawned with
+/// only a `Teleport` never shows at the origin.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+#[component(on_insert = show_teleport)]
 pub struct Teleport(pub WorldPos);
+
+/// [`Teleport`]'s insert hook: `Transform` shows the target at once (the next step still moves
+/// [`BodyPosition`] from the exact `Teleport`).
+fn show_teleport(mut world: DeferredWorld, context: HookContext) {
+    let Some(target) = world
+        .get::<Teleport>(context.entity)
+        .map(|t| t.0.to_dvec3())
+    else {
+        return;
+    };
+    if let Some(mut transform) = world.get_mut::<Transform>(context.entity)
+        && transform.translation != target
+    {
+        transform.translation = target;
+    }
+}
 
 /// What physics last wrote to the body's `Transform` (`None` before its first step). Physics
 /// compares it with `Transform` to tell a teleport (gameplay wrote `Transform`) from its own
@@ -249,13 +279,16 @@ impl PhysicsSync {
 }
 
 /// A walking character: turns [`MoveIntent`] into [`Velocity`] every fixed step, before the
-/// body moves (`PhysicsSystems::Controller`). For players and mobs alike.
+/// body moves (`PhysicsSystems::Controller`). For players and mobs alike. Only
+/// [`RigidBody::Dynamic`] bodies walk: on the other kinds it does nothing.
 ///
 /// The horizontal acceleration is `walk_speed * k`, with `k` the body's ground friction on the
 /// ground and its air drag in the air (times `air_control`), so the top speed with a full wish
-/// is `walk_speed` on the ground and `walk_speed * air_control` in the air, whatever the
-/// [`BodySettings`]. A jump sets the vertical velocity to `jump_speed` when the body is on the
-/// ground.
+/// is `walk_speed` on the ground and `walk_speed * air_control` in the air, for any positive
+/// rates in [`BodySettings`]. A rate of 0 means no drag and so no top speed to level off at: the
+/// controller does not steer at all there (with `drag_xz = 0`, no air control; with
+/// `ground_friction = 0`, no walking). A jump sets the vertical velocity to `jump_speed` when the
+/// body is on the ground.
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 #[require(MoveIntent)]
 pub struct CharacterController {

@@ -25,12 +25,14 @@ use std::time::Instant;
 /// is a teleport.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PhysicsSystems {
-    /// [`CharacterController`]s turn [`MoveIntent`] into [`Velocity`].
-    Controller,
     /// New bodies take their position from `Transform`; teleports (a [`Teleport`], or a
-    /// `Transform` that differs from what physics wrote) move [`BodyPosition`]; [`Interpolated`]
-    /// bodies keep their position before the step.
+    /// `Transform` that differs from what physics wrote) move [`BodyPosition`] and clear
+    /// [`Contacts`]; [`Interpolated`] bodies keep their position before the step.
     Prepare,
+    /// [`CharacterController`]s turn [`MoveIntent`] into [`Velocity`]. After `Prepare`, so a
+    /// body teleported this step is in the air for its controller (no jump from the old
+    /// ground).
+    Controller,
     /// Kinematic bodies move by their velocity.
     Kinematic,
     /// Dynamic bodies move: gravity, drag, the voxel sweep, bounces, freezing in unloaded
@@ -69,12 +71,14 @@ fn clean(d: DVec3) -> DVec3 {
     DVec3::new(axis(d.x), axis(d.y), axis(d.z))
 }
 
-/// [`PhysicsSystems::Controller`]: walking and jumping (see [`CharacterController`]). Frozen
-/// bodies are skipped (their steps do not happen) and keep the jump latch.
+/// [`PhysicsSystems::Controller`]: walking and jumping (see [`CharacterController`]). Only
+/// dynamic bodies walk (the others have no drag to level the speed off). Frozen bodies are
+/// skipped (their steps do not happen) and keep the jump latch.
 pub(crate) fn drive_characters(
     fixed: Res<FixedTime>,
     mut characters: Query<
         (
+            &RigidBody,
             &CharacterController,
             &mut MoveIntent,
             &mut Velocity,
@@ -85,7 +89,10 @@ pub(crate) fn drive_characters(
     >,
 ) {
     let dt = timestep(&fixed);
-    for (controller, mut intent, mut velocity, contacts, settings) in &mut characters {
+    for (kind, controller, mut intent, mut velocity, contacts, settings) in &mut characters {
+        if *kind != RigidBody::Dynamic {
+            continue;
+        }
         let mut wish = intent.wish.as_dvec2();
         if !wish.is_finite() {
             wish = DVec2::ZERO;
@@ -114,13 +121,15 @@ pub(crate) fn drive_characters(
     }
 }
 
-/// [`PhysicsSystems::Prepare`].
+/// [`PhysicsSystems::Prepare`]. A teleport clears [`Contacts`]: the body is not on its old
+/// ground any more (the next step finds the new one).
 pub(crate) fn prepare_bodies(
     mut commands: Commands,
     mut bodies: Query<(
         Entity,
         &Transform,
         &mut BodyPosition,
+        &mut Contacts,
         &PhysicsSync,
         Option<&Teleport>,
         Option<&mut Interpolated>,
@@ -128,14 +137,23 @@ pub(crate) fn prepare_bodies(
     mut stats: ResMut<PhysicsStats>,
 ) {
     let mut count = 0;
-    for (entity, transform, mut position, sync, teleport, interpolated) in &mut bodies {
+    for (entity, transform, mut position, mut contacts, sync, teleport, interpolated) in &mut bodies
+    {
         count += 1;
-        if let Some(teleport) = teleport {
+        let teleported = if let Some(teleport) = teleport {
             position.set_if_neq(BodyPosition(teleport.0.normalize()));
-            commands.entity(entity).remove::<Teleport>();
+            // `try_`: a command of another system may have despawned it at this sync point.
+            commands.entity(entity).try_remove::<Teleport>();
+            true
         } else if sync.last_written != Some(transform.translation) {
             // A new body, or gameplay wrote `Transform`: start from it.
             position.set_if_neq(BodyPosition(WorldPos::from_dvec3(transform.translation)));
+            true
+        } else {
+            false
+        };
+        if teleported {
+            contacts.set_if_neq(Contacts::default());
         }
         if let Some(mut interpolated) = interpolated {
             interpolated.prev = Some(position.0);
@@ -218,13 +236,15 @@ pub(crate) fn step_dynamic(
                     speed: impact.speed,
                 }));
                 if was_frozen {
-                    commands.entity(entity).remove::<Frozen>();
+                    commands.entity(entity).try_remove::<Frozen>();
                 }
             }
             Err(_) => {
                 frozen += 1;
                 if !was_frozen {
-                    commands.entity(entity).insert(Frozen);
+                    // `try_`: another system's command applied at the same sync point may
+                    // despawn the body first.
+                    commands.entity(entity).try_insert(Frozen);
                 }
             }
         }
@@ -246,8 +266,11 @@ pub(crate) fn write_events(
     if pending.0.is_empty() {
         return;
     }
-    // Stable: a body's impacts keep their axis order.
-    pending.0.sort_by_key(|impact| impact.entity.to_bits());
+    // A body has at most one impact per axis, so the key is unique: an unstable sort (no
+    // scratch allocation) gives one order, axis X, Y, Z within each body.
+    pending
+        .0
+        .sort_unstable_by_key(|impact| (impact.entity.to_bits(), impact.face.axes().0));
     impacts.write_batch(pending.0.drain(..));
 }
 
@@ -304,5 +327,58 @@ pub(crate) fn publish_stats(stats: Res<PhysicsStats>, board: Option<ResMut<Diagn
     };
     if stats.is_changed() || board.get("physics").is_none() {
         board.set("physics", stats.summary());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boxel_ecs::message::Messages;
+    use boxel_ecs::system::RunSystemOnce;
+    use boxel_voxel::{BlockPos, Face};
+
+    #[test]
+    fn impacts_are_written_by_entity_then_axis() {
+        let mut world = World::new();
+        let (a, b) = (world.spawn_empty().id(), world.spawn_empty().id());
+        // `a` sorts first.
+        let (a, b) = if a.to_bits() < b.to_bits() {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let impact = |entity, face| VoxelImpact {
+            entity,
+            face,
+            block: BlockPos::new(1, 2, 3),
+            speed: 5.0,
+        };
+        world.insert_resource(PendingImpacts(vec![
+            impact(b, Face::NegY),
+            impact(a, Face::PosZ),
+            impact(b, Face::PosX),
+            impact(a, Face::NegY),
+            impact(a, Face::NegX),
+        ]));
+        world.init_resource::<Messages<VoxelImpact>>();
+        world.init_resource::<PhysicsStats>();
+        world.run_system_once(write_events).expect("runs");
+        let written: Vec<_> = world
+            .resource::<Messages<VoxelImpact>>()
+            .iter_current_update_messages()
+            .map(|i| (i.entity, i.face))
+            .collect();
+        assert_eq!(
+            written,
+            [
+                (a, Face::NegX),
+                (a, Face::NegY),
+                (a, Face::PosZ),
+                (b, Face::PosX),
+                (b, Face::NegY),
+            ]
+        );
+        assert!(world.resource::<PendingImpacts>().0.is_empty());
+        assert_eq!(world.resource::<PhysicsStats>().impacts, 5);
     }
 }

@@ -16,7 +16,8 @@ pub mod source;
 pub mod sweep;
 
 pub use body::{
-    BodyImpact, BodySettings, BodyStep, StepParams, integrate_velocity, predict, step_body,
+    BodyImpact, BodySettings, BodyStep, STOP_SPEED, StepParams, integrate_velocity, predict,
+    step_body,
 };
 pub use ray::{MAX_RAY_DISTANCE, RayResult, VoxelFilter, VoxelHit, raycast_voxels};
 pub use shape::{LocalBox, Shape, ShapeHit};

@@ -168,7 +168,6 @@ fn item(pos: WorldPos, velocity: DVec3) -> impl Bundle {
         BodySettings::item(),
         Interpolated::default(),
         Teleport(pos),
-        Transform::from_translation(pos.to_dvec3()),
         Velocity(velocity),
     )
 }

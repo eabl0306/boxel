@@ -1,12 +1,13 @@
 //! The integrator of a body (`step_body`, `integrate_velocity`, `predict`) without an `App`:
 //! exact landings, resting without drift, terminal speed, drag and friction, the speed limit,
-//! bounces that decay, impacts, freezing on unloaded chunks, `predict` against a real flight,
-//! and translation invariance of whole flights.
+//! slides that stop exactly, bounces that decay (and rest even with a tiny bounce speed or a
+//! slow fixed rate), impacts, freezing on unloaded chunks, `predict` against a real flight, and
+//! translation invariance of whole flights.
 mod common;
 
 use boxel_math::{DVec3, I64Vec3};
 use boxel_physics::{
-    BodySettings, BodyStep, CharacterController, LocalBox, StepParams, TestWorld,
+    BodySettings, BodyStep, CharacterController, LocalBox, STOP_SPEED, StepParams, TestWorld,
     integrate_velocity, predict, step_body,
 };
 use boxel_voxel::{BlockPos, ChunkPos, Face, MAX_BLOCK_COORD, WorldPos};
@@ -164,6 +165,43 @@ fn ground_friction_stops_a_slide_faster_than_air_drag() {
 }
 
 #[test]
+fn slides_and_drifts_stop_exactly() {
+    let settings = BodySettings::player();
+    let params = StepParams::default();
+    // On the ground (friction 12 /s, 0.84 per step) a run stops within a second and a half
+    // instead of decaying through subnormal floats for over a minute.
+    let mut v = DVec3::new(6.0, 0.0, -4.317);
+    let mut steps = 0;
+    while v != DVec3::ZERO {
+        v = integrate_velocity(v, true, &settings, &params);
+        // Gravity is clipped away by the ground in a real step.
+        v.y = 0.0;
+        steps += 1;
+        assert!(steps < 128, "{v:?}");
+    }
+    assert!(steps > 64, "{steps}");
+    // A floating body (no gravity) drifting in the air stops too, and stays stopped.
+    let float = BodySettings {
+        gravity_scale: 0.0,
+        ..settings
+    };
+    let mut v = DVec3::new(0.0, 3.0, 2.0);
+    // Vertical drag 0.4 /s is slow: about 38 s down to the stop speed.
+    for _ in 0..64 * 60 {
+        v = integrate_velocity(v, false, &float, &params);
+    }
+    assert_eq!(v, DVec3::ZERO);
+    // Without drag nothing slows down, however slow: only drag ends at 0.
+    let no_drag = BodySettings {
+        drag_xz: 0.0,
+        drag_y: 0.0,
+        ..float
+    };
+    let slow = DVec3::new(STOP_SPEED * 2.0, 0.0, -STOP_SPEED * 2.0);
+    assert_eq!(integrate_velocity(slow, false, &no_drag, &params), slow);
+}
+
+#[test]
 fn a_default_jump_peaks_about_a_block_and_a_quarter() {
     // Minecraft's jump peaks at 1.25 blocks. With gravity before the move (64 Hz), 9 blocks/s
     // would peak at 1.11; the default 9.5 peaks at 1.24, so a jump clears a one-block step.
@@ -222,6 +260,89 @@ fn a_ball_bounces_lower_each_time_and_comes_to_rest() {
         "resting on the floor (center 0.25 above it)"
     );
     assert_eq!(pos.block.y, 0);
+}
+
+/// Drops a quarter-block ball from 2 blocks onto the floor and runs it for 20 s at `hz`;
+/// returns its last velocity and how many of the last 64 steps had a non-zero velocity.
+fn bouncy_rest(settings: &BodySettings, hz: f64) -> (DVec3, usize) {
+    let base = I64Vec3::new(-9, 4, 11);
+    let mut world = floor(base);
+    let ball = LocalBox::from_center_half(DVec3::ZERO, DVec3::splat(0.25));
+    let params = StepParams {
+        dt: 1.0 / hz,
+        ..StepParams::default()
+    };
+    let (mut pos, mut vel, mut on_ground) = (
+        WorldPos::from_block(at(base, 0, 2, 0), DVec3::splat(0.5)),
+        DVec3::ZERO,
+        false,
+    );
+    let steps = (hz * 20.0) as usize;
+    let mut moving = 0;
+    for i in 0..steps {
+        let s = step_body(
+            &mut world,
+            &table(),
+            pos,
+            vel,
+            ball,
+            on_ground,
+            settings,
+            &params,
+        )
+        .expect("loaded");
+        (pos, vel, on_ground) = (s.pos, s.vel, s.sweep.on_ground());
+        if i + 64 >= steps && vel != DVec3::ZERO {
+            moving += 1;
+        }
+    }
+    (vel, moving)
+}
+
+#[test]
+fn a_bouncy_body_comes_to_rest_whatever_its_bounce_speed_and_rate() {
+    // A resting body hits the ground with one step of gravity (0.5 b/s at 64 Hz) every step.
+    // With a lower bounce speed it used to bounce in place forever: its velocity never reached
+    // 0, so it could never sleep.
+    let springy = BodySettings {
+        bounce_min_speed: 0.1,
+        ..BodySettings::ball()
+    };
+    assert_eq!(bouncy_rest(&springy, 64.0), (DVec3::ZERO, 0));
+    let no_floor = BodySettings {
+        bounce_min_speed: 0.0,
+        restitution: 0.9,
+        ..BodySettings::ball()
+    };
+    assert_eq!(bouncy_rest(&no_floor, 64.0), (DVec3::ZERO, 0));
+    // The ball preset (2 b/s) at a slow fixed rate: one step of gravity at 10 Hz is 3.2 b/s.
+    assert_eq!(bouncy_rest(&BodySettings::ball(), 10.0), (DVec3::ZERO, 0));
+    // Real bounces still happen: the first one keeps 0.6 of the landing speed.
+    let base = I64Vec3::ZERO;
+    let mut world = floor(base);
+    let ball = LocalBox::from_center_half(DVec3::ZERO, DVec3::splat(0.25));
+    let mut pos = WorldPos::from_block(at(base, 0, 0, 0), DVec3::new(0.5, 0.3, 0.5));
+    let mut vel = DVec3::new(0.0, -6.0, 0.0);
+    let mut on_ground = false;
+    for _ in 0..8 {
+        let s = step_body(
+            &mut world,
+            &table(),
+            pos,
+            vel,
+            ball,
+            on_ground,
+            &springy,
+            &StepParams::default(),
+        )
+        .expect("loaded");
+        if s.sweep.on_ground() {
+            assert!(s.vel.y > 3.0, "{:?}", s.vel);
+            return;
+        }
+        (pos, vel, on_ground) = (s.pos, s.vel, s.sweep.on_ground());
+    }
+    panic!("never landed");
 }
 
 #[test]

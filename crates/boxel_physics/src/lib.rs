@@ -51,9 +51,9 @@ pub use crate::components::{
 };
 pub use crate::core::{
     BodyImpact, BodySettings, BodyStep, CollisionShape, CollisionTable, LocalBox, MAX_RAY_DISTANCE,
-    MAX_SWEEP_DISTANCE, Probe, RayResult, Shape, ShapeHit, StepParams, SweepConfig, SweepOut,
-    TestWorld, Unloaded, VoxelFilter, VoxelHit, VoxelSource, axis_order, integrate_velocity,
-    move_box, predict, raycast_voxels, step_body,
+    MAX_SWEEP_DISTANCE, Probe, RayResult, STOP_SPEED, Shape, ShapeHit, StepParams, SweepConfig,
+    SweepOut, TestWorld, Unloaded, VoxelFilter, VoxelHit, VoxelSource, axis_order,
+    integrate_velocity, move_box, predict, raycast_voxels, step_body,
 };
 pub use boxel_voxel::WorldPos;
 pub use plugin::{PhysicsContent, PhysicsPlugin};

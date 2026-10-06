@@ -9,7 +9,9 @@
 //! Frame order:
 //! - `RunFixedMainLoopSystems::BeforeFixedMainLoop`: the keys are sampled once per frame into
 //!   the player's `MoveIntent` (the jump is a latch, so a press in a frame without a fixed step
-//!   still jumps once).
+//!   still jumps once). The walk direction uses the camera's yaw from the previous frame: mouse
+//!   look stays in `Update` (`FlyCameraSystems`), not before the fixed loop as the physics plan
+//!   puts it, so walking lags the view by one frame (7 ms at 144 fps), which is not noticeable.
 //! - Fixed steps: the controller and the physics move the player.
 //! - `Update`: [`switch_mode`] (before the fly camera) spawns or removes the player, and
 //!   [`follow_player`] (after the fly camera, before `WorldSystems::Interest`) puts the camera
@@ -81,7 +83,8 @@ impl Plugin for WalkPlugin {
     }
 }
 
-/// The player body standing at `feet` (exact: through `Teleport`).
+/// The player body standing at `feet` (exact: through `Teleport`, which also puts its
+/// `Transform` there at once).
 pub fn player_body(feet: WorldPos) -> impl Bundle {
     (
         Player,
@@ -90,7 +93,6 @@ pub fn player_body(feet: WorldPos) -> impl Bundle {
         CharacterController::default(),
         Interpolated::default(),
         Teleport(feet),
-        Transform::from_translation(feet.to_dvec3()),
     )
 }
 
@@ -152,7 +154,8 @@ fn axis(keys: &ButtonInput<KeyCode>, positive: KeyCode, negative: KeyCode) -> f3
 }
 
 /// Once per frame, before the fixed steps: WASD along the active camera's heading into the
-/// player's `MoveIntent::wish`, and Space into its jump latch. Nothing while the fly camera
+/// player's `MoveIntent::wish`, and Space into its jump latch (held, or tapped within this
+/// frame: a press and release in one long frame still jumps). Nothing while the fly camera
 /// takes no input (automation).
 pub fn sample_input(
     keys: Res<ButtonInput<KeyCode>>,
@@ -166,7 +169,7 @@ pub fn sample_input(
         (
             axis(&keys, KeyCode::KeyW, KeyCode::KeyS),
             axis(&keys, KeyCode::KeyD, KeyCode::KeyA),
-            keys.pressed(KeyCode::Space),
+            keys.pressed(KeyCode::Space) || keys.just_pressed(KeyCode::Space),
         )
     } else {
         (0.0, 0.0, false)

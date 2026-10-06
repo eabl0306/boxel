@@ -32,11 +32,13 @@ pub struct PhysicsContent {
 ///   refreshed in `Last`) and, in `Plugin::finish`, [`PhysicsContent`] from the world's
 ///   registry, which [`crate::PhysicsQuery`] and the step read.
 /// - Message: [`VoxelImpact`].
-/// - In `Plugin::finish` it lowers `FixedTime::set_max_steps_per_frame` to
+/// - In `Plugin::finish` it sets `FixedTime::set_max_steps_per_frame` to
 ///   [`PhysicsPlugin::max_steps_per_frame`] (3 by default): after a hitch, a frame runs at most
-///   that many physics steps, which bounds the cost of a catch-up frame.
-/// - With [`PhysicsPlugin::single_threaded`] (the default) `FixedPostUpdate` runs on the
-///   single-threaded executor: the physics systems are a chain, so threads only add overhead.
+///   that many fixed steps, which bounds the cost of a catch-up frame. The cap is app-wide, see
+///   the field.
+/// - With [`PhysicsPlugin::single_threaded`] (the default) `FixedPostUpdate` and
+///   `RunFixedMainLoop` run on the single-threaded executor: the physics systems are a chain,
+///   so threads only add overhead.
 ///
 /// Runners call `App::finish` before the first update; a test that drives `App::update` by hand
 /// calls it too.
@@ -49,12 +51,22 @@ pub struct PhysicsPlugin {
     /// The most fixed steps a frame runs (`FixedTime::set_max_steps_per_frame`), set in
     /// `Plugin::finish`. `None` leaves `FixedTime` as it is (the engine default is 8). 0 counts
     /// as 1.
+    ///
+    /// The cap is for the whole app, not only physics: every `FixedMain` schedule
+    /// (`FixedUpdate` too) runs at most this many times a frame, and the time left over is
+    /// dropped (an overrun, logged at most every 5 s). So it is also a frame rate floor: below
+    /// `steps * rate` fps (21.3 fps with 3 steps at 64 Hz, 42.7 fps at 128 Hz) the fixed-step
+    /// game runs in slow motion. A game with few bodies that must keep real time on slow
+    /// machines can pass `None`. `finish` overrides a cap set earlier (in another plugin's
+    /// `build`); change it after `App::finish` to keep your own.
     pub max_steps_per_frame: Option<u32>,
-    /// Run `FixedPostUpdate` (the physics step and any other system there) on the
-    /// single-threaded executor. The physics systems are chained, so the multi-threaded executor
-    /// gains nothing and costs about 24 us per step on its own (measured: an empty step takes
-    /// 0.65 us instead of 25 us, and 1000 bodies 0.22 ms instead of 0.32 ms). `false` leaves the
-    /// schedule's executor alone.
+    /// Run `FixedPostUpdate` (the physics step and any other system there) and
+    /// `RunFixedMainLoop` (input sampling, the fixed loop and the interpolation, every frame) on
+    /// the single-threaded executor. The physics systems are chained, so the multi-threaded
+    /// executor gains nothing and costs about 24 us per run on its own (measured on
+    /// `FixedPostUpdate`: an empty step takes 0.65 us instead of 25 us, and 1000 bodies 0.22 ms
+    /// instead of 0.32 ms). `RunFixedMainLoop` is a chain too (before the loop, the exclusive
+    /// loop, after it). `false` leaves both executors alone.
     pub single_threaded: bool,
 }
 
@@ -72,9 +84,11 @@ impl Default for PhysicsPlugin {
 impl Plugin for PhysicsPlugin {
     fn build(&self, app: &mut App) {
         if self.single_threaded {
-            app.edit_schedule(FixedPostUpdate, |schedule| {
+            let single = |schedule: &mut Schedule| {
                 schedule.set_executor(SingleThreadedExecutor::new());
-            });
+            };
+            app.edit_schedule(FixedPostUpdate, single)
+                .edit_schedule(RunFixedMainLoop, single);
         }
         app.init_resource::<PhysicsSettings>()
             .init_resource::<PhysicsStats>()
@@ -83,8 +97,8 @@ impl Plugin for PhysicsPlugin {
             .configure_sets(
                 FixedPostUpdate,
                 (
-                    PhysicsSystems::Controller,
                     PhysicsSystems::Prepare,
+                    PhysicsSystems::Controller,
                     PhysicsSystems::Kinematic,
                     PhysicsSystems::Step,
                     PhysicsSystems::Broadphase,
@@ -97,8 +111,8 @@ impl Plugin for PhysicsPlugin {
             .add_systems(
                 FixedPostUpdate,
                 (
-                    drive_characters.in_set(PhysicsSystems::Controller),
                     prepare_bodies.in_set(PhysicsSystems::Prepare),
+                    drive_characters.in_set(PhysicsSystems::Controller),
                     move_kinematic.in_set(PhysicsSystems::Kinematic),
                     step_dynamic.in_set(PhysicsSystems::Step),
                     write_events.in_set(PhysicsSystems::Events),

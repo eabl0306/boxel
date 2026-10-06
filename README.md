@@ -48,8 +48,8 @@ moverse, Espacio sube, Shift izquierdo baja, Ctrl izquierdo acelera. Con el mous
 izquierdo rompe el bloque de la mira y clic derecho pone el bloque elegido (teclas 1 a 9), a 6
 bloques como máximo. G cambia entre volar y caminar: caminando hay gravedad, WASD camina hacia
 donde mira la cámara y Espacio salta (`--walk` arranca caminando). F3 muestra el overlay de debug
-(con el bloque apuntado y, caminando, una línea de física), F5 cambia el límite de FPS (30, 60,
-144, 240, sin límite) y F6 prende o apaga el vsync.
+(con el bloque apuntado, el modo y una línea de física), F5 cambia el límite de FPS (30, 60, 144,
+240, sin límite) y F6 prende o apaga el vsync.
 
 Opciones útiles: `--fps-limit N` (0 = sin límite), `--vsync on|off`, `--seed N`,
 `--view-distance N` (en chunks), `--vertical-radius N` (chunks hacia arriba y hacia abajo, 8 por

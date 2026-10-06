@@ -51,3 +51,26 @@ dentro del paso (`par_iter_mut`), llega en P4.
   números pueden estar inflados hasta unas 1.5 veces. Una segunda corrida con la CPU ocupada en
   promedio un 73 % dio 0.74 µs, 49 µs y 0.23 ms: con tanta carga `tick/100` queda justo en el
   límite. Falta repetirlos con la máquina quieta.
+
+## Después de la revisión (2026-10-06)
+
+Cambios que tocan el costo: los cuerpos del bench ahora son `Interpolated` (como el jugador y
+los objetos de los ejemplos), `PhysicsPlugin` también pone `RunFixedMainLoop` en el ejecutor de
+un hilo, los impactos se ordenan sin memoria extra (`sort_unstable_by_key`) y una velocidad por
+debajo de `STOP_SPEED` queda en 0. El bench nuevo `frame/1000` mide un frame sin paso a 144 fps:
+`RunFixedMainLoop` con la interpolación de los 1000 cuerpos, que corre en cada frame (144 veces
+por segundo, contra 64 pasos).
+
+| Bench | Objetivo | Medido |
+|---|---|---|
+| `tick/0` | 20 µs | 0.48 µs |
+| `tick/100` | 0.05 ms | 24.4 µs |
+| `tick/1000` | 0.5 ms | 0.234 ms |
+| `frame/1000` (un hilo) | sin objetivo | 5.1 µs |
+| `frame/1000_multi_thread` | sin objetivo | 13.6 µs |
+
+El ejecutor multi-hilo sumaba unos 8.5 µs por frame en `RunFixedMainLoop` (1.2 ms por segundo a
+144 fps); con el de un hilo, interpolar 1000 cuerpos cuesta 5 ns por cuerpo. Mismo equipo y
+perfil que arriba, configuración por defecto de criterion. `tools/wait-idle.sh 60` pasó justo
+antes (CPU ocupada a lo sumo un 15 %). Estos son los números de referencia de P2 (`tick/1000`
+ahora incluye la interpolación).

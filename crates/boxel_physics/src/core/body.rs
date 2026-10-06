@@ -8,12 +8,14 @@
 //!    `v.y /= 1 + drag_y * dt`, and `v.x`, `v.z /= 1 + k * dt` with `k` the
 //!    [`BodySettings::ground_friction`] when the body was on the ground at the end of the previous
 //!    step, else [`BodySettings::drag_xz`].
-//! 3. Each component is clamped to `max_speed`.
+//! 3. Each component is clamped to `max_speed`, and one slower than [`STOP_SPEED`] becomes
+//!    exactly 0 (drag alone only decays a speed geometrically, so a slide would never end).
 //! 4. The body's box moves by `v * dt` through the voxels ([`move_box`]).
 //! 5. On each clipped axis the velocity bounces (`v = -v * restitution`) if its speed is above
-//!    [`BodySettings::bounce_min_speed`], and stops otherwise. As in Minecraft, the rest of the
-//!    step after a bounce is dropped. A clip faster than the impact speed is reported as a
-//!    [`BodyImpact`].
+//!    both [`BodySettings::bounce_min_speed`] and one step of gravity along that axis
+//!    (`|gravity| * gravity_scale * dt`, the speed a body resting on the ground hits it with),
+//!    and stops otherwise. As in Minecraft, the rest of the step after a bounce is dropped. A
+//!    clip faster than the impact speed is reported as a [`BodyImpact`].
 //!
 //! The defaults are Minecraft's per-tick factors turned into per-second rates: gravity 32
 //! blocks/s^2 (0.08 per tick^2 at 20 Hz), vertical drag 0.4 /s (0.98 per tick, a terminal fall
@@ -44,7 +46,9 @@ pub struct BodySettings {
     /// Fraction of the speed kept by a bounce, in `0..=1` (0: no bounce).
     pub restitution: f64,
     /// A clip slower than this (blocks per second) stops the body on that axis instead of
-    /// bouncing it, so bounces decay to rest.
+    /// bouncing it, so bounces decay to rest. A clip no faster than one step of gravity along
+    /// the axis never bounces either, whatever this is: otherwise a body resting on the ground
+    /// would bounce in place every step and never reach a velocity of 0.
     pub bounce_min_speed: f64,
     /// Share of a push between two solid bodies (phase P3): a body with twice the weight moves
     /// half as much. Unused today.
@@ -116,6 +120,12 @@ impl BodySettings {
     }
 }
 
+/// A velocity component slower than this after drag (blocks per second) is set to exactly 0, so
+/// a slide or a drift ends instead of decaying forever through ever smaller floats. At 64 Hz it
+/// moves a body far less than the contact tolerance per step. Not a sleep threshold: sleeping
+/// (phase P4) uses its own, larger one.
+pub const STOP_SPEED: f64 = 1e-6;
+
 /// The world-wide inputs of one step: gravity, the timestep and the limits.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StepParams {
@@ -175,10 +185,10 @@ impl BodyStep {
     }
 }
 
-/// Steps 1 to 3 of the integrator (gravity, drag, speed limit): the velocity a body moves with
-/// this step. `on_ground` is whether it ended the previous step on the ground (ground friction
-/// instead of air drag). A component that is not finite counts as 0; a `max_speed` that is NaN
-/// or not positive means no limit.
+/// Steps 1 to 3 of the integrator (gravity, drag, speed limit, [`STOP_SPEED`]): the velocity a
+/// body moves with this step. `on_ground` is whether it ended the previous step on the ground
+/// (ground friction instead of air drag). A component that is not finite counts as 0; a
+/// `max_speed` that is NaN or not positive means no limit.
 pub fn integrate_velocity(
     vel: DVec3,
     on_ground: bool,
@@ -204,7 +214,8 @@ pub fn integrate_velocity(
     if max > 0.0 {
         v = v.clamp(DVec3::splat(-max), DVec3::splat(max));
     }
-    v
+    let stop = |v: f64| if v.abs() < STOP_SPEED { 0.0 } else { v };
+    DVec3::new(stop(v.x), stop(v.y), stop(v.z))
 }
 
 /// One step of a dynamic body with the voxel box `shape` (relative to `pos`): gravity, drag,
@@ -239,8 +250,12 @@ pub fn step_body<S: VoxelSource + ?Sized>(
         {
             *impact = Some(BodyImpact { face, block, speed });
         }
+        // A resting body hits the ground with one step of gravity every step: bouncing that
+        // would never let it rest. (`max` ignores a NaN side.)
+        let resting = (params.gravity[axis] * settings.gravity_scale * params.dt).abs();
         let bounced = -v[axis] * settings.restitution;
-        v[axis] = if speed > settings.bounce_min_speed && bounced != 0.0 && bounced.is_finite() {
+        let min_speed = settings.bounce_min_speed.max(resting);
+        v[axis] = if speed > min_speed && bounced != 0.0 && bounced.is_finite() {
             bounced
         } else {
             0.0

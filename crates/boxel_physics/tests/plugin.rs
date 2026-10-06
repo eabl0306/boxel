@@ -5,19 +5,23 @@
 //!
 //! Falling onto the exact surface with one impact (the same speed as the pure integrator),
 //! freezing over unloaded chunks, block edits under and into a body, teleports through
-//! `Transform` and `Teleport`, interpolation, every message reaching `Update` at 144 fps, the
-//! jump latch, walking and jumping onto a step, the stats line, determinism (two runs, 144 vs
-//! 64 fps, interpolation on or off) and the same scene far from the origin.
+//! `Transform` and `Teleport` (they clear the ground, and `Teleport` shows at once), a despawn
+//! racing the freeze, interpolation, every message reaching `Update` at 144 fps, the jump latch,
+//! walking and jumping onto a step, controllers on kinematic bodies, the stats line,
+//! determinism (two runs, 144 vs 64 fps, interpolation on or off) and the same scene far from
+//! the origin.
 mod common;
 
-use boxel_app::{App, First, FixedTime, FixedUpdate, Time, TimePlugin, TimeSystems, Update};
+use boxel_app::{
+    App, First, FixedPostUpdate, FixedTime, FixedUpdate, Time, TimePlugin, TimeSystems, Update,
+};
 use boxel_diagnostic::DiagnosticsBoard;
 use boxel_ecs::prelude::*;
 use boxel_math::{DVec3, I64Vec3, Vec2};
 use boxel_physics::{
     BodyPosition, BodySettings, CharacterController, Collider, Contacts, Frozen, Interpolated,
-    MoveIntent, PhysicsPlugin, PhysicsSettings, PhysicsStats, RigidBody, Teleport, TestWorld,
-    Velocity, VoxelImpact, integrate_velocity, step_body,
+    MoveIntent, PhysicsPlugin, PhysicsSettings, PhysicsStats, PhysicsSystems, RigidBody, Teleport,
+    TestWorld, Velocity, VoxelImpact, integrate_velocity, step_body,
 };
 use boxel_transform::Transform;
 use boxel_voxel::{
@@ -173,6 +177,17 @@ impl Sim {
     fn frame(&mut self, frame: Duration) {
         self.app.world_mut().resource_mut::<Clock>().next = frame;
         self.app.update();
+    }
+
+    /// One update that runs no fixed step (shorter than what the accumulator still needs).
+    fn idle_frame(&mut self) {
+        let fixed = self.app.world().resource::<FixedTime>();
+        let room = fixed.timestep() - fixed.accumulator();
+        self.frame(room / 2);
+        assert_eq!(
+            self.app.world().resource::<FixedTime>().steps_last_frame(),
+            0
+        );
     }
 
     /// `n` updates of one fixed step each.
@@ -332,7 +347,8 @@ fn writing_transform_or_adding_teleport_moves_a_body_exactly() {
     let body = sim.spawn(sim.pos(0.5, 4.0, 0.5), ());
     sim.steps(2);
     let params = PhysicsSettings::default().step_params(1.0 / 64.0);
-    // The next step from `pos` in open air, as the body would do it.
+    // The next step from `pos` in open air, as the body would do it (a teleport clears the
+    // ground: air drag).
     let expect = |sim: &Sim, pos: WorldPos| {
         let mut air = TestWorld::new();
         step_body(
@@ -341,7 +357,7 @@ fn writing_transform_or_adding_teleport_moves_a_body_exactly() {
             pos,
             sim.get::<Velocity>(body).0,
             player(),
-            sim.get::<Contacts>(body).on_ground,
+            false,
             &BodySettings::player(),
             &params,
         )
@@ -377,6 +393,152 @@ fn writing_transform_or_adding_teleport_moves_a_body_exactly() {
         sim.get::<Velocity>(body).0.y < falling.y,
         "kept and still falling"
     );
+}
+
+#[test]
+fn a_teleport_clears_the_ground_so_a_held_jump_does_not_fire_in_the_air() {
+    let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    let body = sim.spawn(sim.pos(0.5, 4.0, 0.5), CharacterController::default());
+    sim.steps(3);
+    assert!(sim.get::<Contacts>(body).on_ground);
+    let params = PhysicsSettings::default().step_params(1.0 / 64.0);
+    let settings = BodySettings::player();
+    let slide = DVec3::new(4.0, 0.0, 0.0);
+    // The jump is held (the latch is set every frame) and the body slides along +X.
+    let hold = |sim: &mut Sim| {
+        sim.app
+            .world_mut()
+            .get_mut::<MoveIntent>(body)
+            .expect("intent")
+            .jump = true;
+        sim.app.world_mut().get_mut::<Velocity>(body).expect("v").0 = slide;
+    };
+    // One step in the air from `slide`: air drag, no jump.
+    let in_air = integrate_velocity(slide, false, &settings, &params);
+    assert!(in_air.y < 0.0);
+
+    // Through `Teleport`: 20 blocks up, the latch is spent without a jump.
+    hold(&mut sim);
+    let up = sim.pos(0.5, 24.0, 0.5);
+    sim.app.world_mut().entity_mut(body).insert(Teleport(up));
+    sim.steps(1);
+    assert_eq!(sim.get::<Velocity>(body).0, in_air);
+    assert!(!sim.get::<MoveIntent>(body).jump);
+    assert!(!sim.get::<Contacts>(body).on_ground);
+
+    // Back on the ground, then through `Transform`.
+    for _ in 0..256 {
+        sim.steps(1);
+        if sim.get::<Contacts>(body).on_ground && sim.get::<Velocity>(body).0 == DVec3::ZERO {
+            break;
+        }
+    }
+    assert!(sim.get::<Contacts>(body).on_ground);
+    hold(&mut sim);
+    sim.app
+        .world_mut()
+        .get_mut::<Transform>(body)
+        .expect("transform")
+        .translation = DVec3::new(-3.5, 30.0, 2.5);
+    sim.steps(1);
+    assert_eq!(sim.get::<Velocity>(body).0, in_air);
+    assert!(!sim.get::<Contacts>(body).on_ground);
+
+    // On the ground a held jump still jumps.
+    for _ in 0..256 {
+        sim.steps(1);
+        if sim.get::<Contacts>(body).on_ground && sim.get::<Velocity>(body).0 == DVec3::ZERO {
+            break;
+        }
+    }
+    hold(&mut sim);
+    sim.steps(1);
+    let jump = CharacterController::default().jump_speed;
+    let expected = integrate_velocity(DVec3::new(slide.x, jump, 0.0), true, &settings, &params);
+    assert_eq!(sim.get::<Velocity>(body).0, expected);
+}
+
+#[test]
+fn a_body_spawned_with_only_teleport_shows_there_before_its_first_step() {
+    let mut sim = Sim::new(I64Vec3::ZERO, FRAME_144);
+    let target = sim.pos(3.25, 20.0, -2.75);
+    let body = sim.body(
+        target,
+        (Collider::standing(0.6, 1.8), Interpolated::default()),
+    );
+    // The insert hook moved `Transform` already: no frame shows the body at the origin, not
+    // even one without a fixed step.
+    assert_eq!(sim.translation(body), target.to_dvec3());
+    sim.idle_frame();
+    assert_eq!(
+        sim.get::<Interpolated>(body).previous(),
+        None,
+        "no step yet"
+    );
+    assert_eq!(sim.translation(body), target.to_dvec3());
+
+    // A `Teleport` on a falling interpolated body shows at once too, stays until the step, and
+    // the step starts exactly there (no smear from the old place).
+    sim.steps(4);
+    let far = sim.pos(-7.5, 30.0, 6.5);
+    sim.app.world_mut().entity_mut(body).insert(Teleport(far));
+    assert_eq!(sim.translation(body), far.to_dvec3());
+    sim.idle_frame();
+    assert_eq!(sim.translation(body), far.to_dvec3(), "kept until the step");
+    sim.frame(STEP);
+    assert_eq!(sim.get::<Interpolated>(body).previous(), Some(far));
+}
+
+#[test]
+fn a_despawn_applied_before_the_freeze_does_not_panic() {
+    #[derive(Component)]
+    struct Doomed;
+    fn despawn_doomed(mut commands: Commands, doomed: Query<Entity, With<Doomed>>) {
+        for entity in &doomed {
+            commands.entity(entity).despawn();
+        }
+    }
+    let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    // Between `Prepare` and the step, with no sync point before the step: its despawn and the
+    // step's `Frozen` insert are applied at the same sync point, the despawn first.
+    sim.app.add_systems(
+        FixedPostUpdate,
+        despawn_doomed
+            .after(PhysicsSystems::Prepare)
+            .before_ignore_deferred(PhysicsSystems::Step),
+    );
+    // Over unloaded chunks: its first step freezes it.
+    let body = sim.spawn(sim.pos(640.5, 20.0, 0.5), Doomed);
+    sim.steps(1);
+    assert!(sim.app.world().get_entity(body).is_err(), "despawned");
+    assert_eq!(sim.app.world().resource::<PhysicsStats>().frozen, 1);
+}
+
+#[test]
+fn a_character_controller_moves_only_dynamic_bodies() {
+    let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    let spawn = |sim: &mut Sim, kind: RigidBody, x: f64| {
+        let pos = sim.pos(x, 8.0, 0.5);
+        sim.app
+            .world_mut()
+            .spawn((
+                kind,
+                Teleport(pos),
+                CharacterController::default(),
+                MoveIntent {
+                    wish: Vec2::X,
+                    jump: true,
+                },
+            ))
+            .id()
+    };
+    let kinematic = spawn(&mut sim, RigidBody::Kinematic, 0.5);
+    let fixed = spawn(&mut sim, RigidBody::Static, 2.5);
+    sim.steps(64);
+    for (body, x) in [(kinematic, 0.5), (fixed, 2.5)] {
+        assert_eq!(sim.get::<Velocity>(body).0, DVec3::ZERO, "no walking");
+        assert_eq!(sim.position(body), sim.pos(x, 8.0, 0.5), "never moved");
+    }
 }
 
 #[test]

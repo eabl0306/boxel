@@ -574,8 +574,10 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   la vista fija (delta = paso fijo), como en Bevy. `RunFixedMainLoop` se divide en los sets
   encadenados `RunFixedMainLoopSystems` (los nombres de Bevy): `BeforeFixedMainLoop` (muestrear
   la entrada para los pasos), `FixedMainLoop` (los pasos) y `AfterFixedMainLoop` (interpolar).
-  `PhysicsPlugin` baja el tope a 3 pasos y corre `FixedPostUpdate` con el ejecutor de un hilo
-  (sus sistemas van encadenados; el multi-hilo solo sumaba unos 24 µs por paso).
+  `PhysicsPlugin` baja el tope a 3 pasos (para toda la app: por debajo de 21.3 fps el juego
+  de paso fijo va en cámara lenta; `voxel_world` deja los 8) y corre `FixedPostUpdate` y
+  `RunFixedMainLoop` con el ejecutor de un hilo (sus sistemas van encadenados; el multi-hilo
+  solo sumaba unos 24 µs por corrida).
 - Mensajes y paso fijo: `TimePlugin` agrega `signal_message_update_system` en `FixedPostUpdate`
   y deja la rotación de mensajes en espera hasta que corra un paso fijo. Sin esto, un lector en
   `FixedUpdate` perdía los mensajes escritos en `Update` cuando los frames iban a más del doble
@@ -1026,9 +1028,9 @@ schedule `Shutdown` es el lugar para el `flush` final.
 - Overlay F3 (`boxel_debug`): frames mostrados por segundo (de `RenderInfo::frames_presented`) y
   updates por segundo por separado, tiempo de frame, límite, vsync y modo de presentación, GPU,
   cámara y contadores de chunks. Teclas opcionales `FrameKeys` (F5 límite, F6 vsync). Las apps
-  suman líneas propias con `OverlayLines` (`voxel_world` muestra el bloque apuntado y la
-  selección; caminando, el estado del jugador y la línea de física) y `Crosshair` dibuja una
-  mira en el centro.
+  suman líneas propias con `OverlayLines` (`voxel_world` muestra el bloque apuntado, la
+  selección, el modo, con el estado del jugador si camina, y la línea de física) y `Crosshair`
+  dibuja una mira en el centro.
 - Línea `physics` de `DiagnosticsBoard` (`PhysicsStats`): cuerpos, dinámicos, congelados,
   impactos y tiempo del último paso de física.
 - `FrameTimeHistory`: los últimos frames (4096 por defecto, mínimo 1024) con su tiempo real
