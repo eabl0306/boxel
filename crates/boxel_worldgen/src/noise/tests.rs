@@ -163,6 +163,31 @@ fn hash2_key_is_injective_past_i32() {
 }
 
 #[test]
+fn far_tiles_are_not_relabeled_copies_of_the_origin_tile() {
+    // Folding the tag into the seed (`seed ^ mix(e)`) would make tile `e` hash every point
+    // `(a, b)` exactly like point `(a ^ dx, b ^ dz)` of the origin tile, with `(dx, dz)` the
+    // halves of `mix(e)`, for every seed (whole aligned blocks copied). The tag is mixed in
+    // after the key is hashed instead, so those points are unrelated.
+    let tile = 1i64 << 32;
+    for seed in [0, 7, 0x00b0_7e1d] {
+        for (tx, tz) in [(1, 0), (0, -1), (3, 5), (-(1 << 20), 1 << 30)] {
+            let e = ((excess(tx * tile) as u64) << 32) | excess(tz * tile) as u64;
+            let d = mix(e);
+            let (dx, dz) = ((d >> 32) as u32, d as u32);
+            let mut same = 0;
+            for a in 0..8u32 {
+                for b in 0..8u32 {
+                    let far = hash2(seed, tx * tile + i64::from(a), tz * tile + i64::from(b));
+                    let image = hash2(seed, i64::from((a ^ dx) as i32), i64::from((b ^ dz) as i32));
+                    same += u32::from(far == image);
+                }
+            }
+            assert_eq!(same, 0, "seed {seed}, tile ({tx}, {tz})");
+        }
+    }
+}
+
+#[test]
 fn hash2_bits_are_balanced() {
     // Each output bit should be set about half of the time over a block of the lattice.
     let mut ones = [0u32; 32];

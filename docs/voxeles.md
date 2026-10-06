@@ -145,7 +145,9 @@ exactos hasta el límite del mundo. El ruido del terreno también se calcula con
 (`worldgen/noise.rs`): la frecuencia es una fracción exacta (`Frequency`, 1/256 por defecto), la
 celda de la grilla sale exacta y solo la posición dentro de la celda pasa a `f64`. El terreno es
 igual de variado en cualquier coordenada `i64`, sin aplanarse ni repetirse. Dentro del rango
-`i32` de antes las alturas no cambiaron, bit a bit.
+`i32` de antes y con la configuración por defecto (1/256, 5 octavas), las alturas no cambiaron,
+bit a bit. Con otra configuración puede cambiar alguna altura, solo donde el ruido de antes
+redondeaba o se saturaba: el nuevo es exacto.
 
 **Bloques.** Cada estado es un `u16` y el 0 es aire (`voxel/registry.rs:10`). Las propiedades
 viven en tablas por campo (`voxel/registry.rs:268`). Hoy hay 12 bloques: las hojas son cutout y

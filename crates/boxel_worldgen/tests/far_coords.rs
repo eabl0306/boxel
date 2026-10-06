@@ -260,13 +260,13 @@ fn far_terrain_is_deterministic() {
     let g = TerrainGenerator::default();
     for (x, z, h) in [
         (1 << 35, -(1 << 35), 42),
-        ((1 << 39) + 17, 5, 47),
-        (-(1 << 50), (1 << 50) - 1, 62),
-        (1 << 62, -(1 << 62), 54),
-        (i64::MAX, i64::MIN, 58),
-        (i64::MIN, i64::MAX, 34),
-        ((1 << 61) - 1, -(1 << 61), 71),
-        (-7, (1 << 44) + 3, 57),
+        ((1 << 39) + 17, 5, 43),
+        (-(1 << 50), (1 << 50) - 1, 85),
+        (1 << 62, -(1 << 62), 81),
+        (i64::MAX, i64::MIN, 79),
+        (i64::MIN, i64::MAX, 75),
+        ((1 << 61) - 1, -(1 << 61), 83),
+        (-7, (1 << 44) + 3, 76),
     ] {
         assert_eq!(g.height_at(x, z), h, "height_at({x}, {z})");
     }
@@ -274,15 +274,15 @@ fn far_terrain_is_deterministic() {
     let heights = (0..64).flat_map(|dx| {
         (0..64).map(move |dz| u64::from(g.height_at((1 << 40) + dx, -(1 << 40) + dz) as u32))
     });
-    assert_eq!(fnv(heights), 0x58dd_393c_15ef_537a, "window at 2^40");
+    assert_eq!(fnv(heights), 0x78eb_b2ac_76f4_4765, "window at 2^40");
     // Surface chunks, at the world limit included.
     let r = BlockRegistry::default_blocks();
     let m = MAX_CHUNK_COORD;
     for ((x, y, z), expected) in [
-        ((1 << 35, 2, -(1 << 35)), 0x25f0_97a7_17df_1804),
-        ((-(1 << 45), 1, 1 << 45), 0x58e6_5735_836b_8726),
-        ((m, 2, -m), 0xe3cd_0ca0_c028_17e5),
-        ((-m, 0, m - 1), 0x5699_4c5b_ff49_4306),
+        ((1 << 35, 2, -(1 << 35)), 0xc137_0a68_b44c_3ce5),
+        ((-(1 << 45), 2, 1 << 45), 0x858b_58f2_e267_77c4),
+        ((m, 2, -m), 0xaa9b_a900_bb3c_ef25),
+        ((-m, 2, m - 1), 0x1d94_12f2_f2b0_d005),
     ] {
         let pos = ChunkPos::new(x, y, z);
         assert_eq!(chunk_fingerprint(g, &r, pos), expected, "{pos:?}");

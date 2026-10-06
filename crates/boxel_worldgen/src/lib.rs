@@ -171,8 +171,11 @@ impl TerrainGenerator {
     /// `base_height + round(amplitude * fbm_2d(seed, x, z, fbm))` with the settings' frequency
     /// and octaves, lacunarity 2 and gain 0.5, so it never leaves `base_height +-
     /// ceil(|amplitude|)`. The noise works on the integer columns ([`noise`]): exact at any
-    /// `i64`, and bit-identical to the former `f64` noise inside `i32` for a power-of-two
-    /// frequency denominator (the default `1/256`).
+    /// `i64`. With a power-of-two frequency denominator it is bit-identical to the former `f64`
+    /// noise wherever that one was exact: every octave's lattice cells (both corners) inside
+    /// `i32` and `x * num` exact in `f64` (every `i32` column with the default `1/256` and 5
+    /// octaves; more octaves or a higher frequency saturated the former noise sooner). Other
+    /// denominators differ from it by its rounding.
     pub fn height_at(&self, x: i64, z: i64) -> i32 {
         self.height_from_noise(noise::fbm_2d(self.seed, x, z, self.fbm()))
     }

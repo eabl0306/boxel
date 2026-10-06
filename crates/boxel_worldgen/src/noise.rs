@@ -222,12 +222,26 @@ const fn splitmix64(x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// The 64-bit key of `(x, z)`, injective: x in the high half, z in the low half (two's
+/// complement bits).
+#[inline]
+const fn lattice_key(x: i32, z: i32) -> u64 {
+    ((x as u32 as u64) << 32) | (z as u32 as u64)
+}
+
 /// [`hash2`] of a point inside `i32` with the seed already mixed (`splitmix64(seed)`).
 #[inline]
 const fn lattice_hash(mixed_seed: u64, x: i32, z: i32) -> u32 {
-    // Injective in (x, z): x in the high half, z in the low half (two's complement bits).
-    let key = ((x as u32 as u64) << 32) | (z as u32 as u64);
-    splitmix64(mixed_seed ^ key) as u32
+    splitmix64(mixed_seed ^ lattice_key(x, z)) as u32
+}
+
+/// [`hash2`] of a point outside `i32` with the seed already mixed: `(x, z)` are its low 32 bits
+/// and `tag` stands for the bits above them. The tag is mixed in after the key is hashed, so
+/// the values under two tags are a pseudo-random rearrangement of each other, never a shifted
+/// or relabeled copy.
+#[inline]
+const fn tile_hash(mixed_seed: u64, tag: u64, x: i32, z: i32) -> u32 {
+    splitmix64(splitmix64(mixed_seed ^ lattice_key(x, z)) ^ tag) as u32
 }
 
 /// The [`splitmix64`] finalizer without the increment: a bijective 64-bit mix with `mix(0) = 0`.
@@ -259,12 +273,14 @@ const fn split_wide(v: i128) -> (i64, u64) {
 
 /// 32-bit hash of `(seed, x, z)` (e.g. a SplitMix64/xxhash-style mix).
 ///
-/// `SplitMix64(SplitMix64(seed) ^ mix(e) ^ (x << 32 | z))` truncated to the low 32 bits, with the
-/// low 32 bits of `x` and `z` in the key and `e = excess(x) << 32 | excess(z)` (what is left of
-/// `x` and `z` above `i32`, 0 inside it). The lattice point maps injectively to `(e, key)`;
-/// `mix` is bijective with `mix(0) = 0`, so every point inside `i32` hashes exactly as the
-/// former `(seed, i32, i32)` version and each `2^32 x 2^32` tile beyond gets an unrelated seed
-/// (no repetition with a period of `2^32`).
+/// With `key = x << 32 | z` from the low 32 bits of `x` and `z`, and `e = excess(x) << 32 |
+/// excess(z)` (what is left of them above `i32`, 0 exactly inside it), the point maps
+/// injectively to `(e, key)`. Inside `i32` the hash is `SplitMix64(SplitMix64(seed) ^ key)`
+/// truncated to the low 32 bits: exactly the former `(seed, i32, i32)` version. Beyond, `mix(e)`
+/// tags the point's `2^32 x 2^32` tile and is mixed in after the key is hashed:
+/// `SplitMix64(SplitMix64(SplitMix64(seed) ^ key) ^ mix(e))` (`mix` is bijective with
+/// `mix(0) = 0`, so tiles get distinct nonzero tags). No tile is a shifted or relabeled copy of
+/// another, and nothing repeats with a period of `2^32`.
 pub fn hash2(seed: u64, x: i64, z: i64) -> u32 {
     hash2_mixed(splitmix64(seed), x, z)
 }
@@ -273,13 +289,20 @@ pub fn hash2(seed: u64, x: i64, z: i64) -> u32 {
 #[inline]
 const fn hash2_mixed(mixed_seed: u64, x: i64, z: i64) -> u32 {
     let e = ((excess(x) as u64) << 32) | excess(z) as u64;
-    lattice_hash(mixed_seed ^ mix(e), x as i32, z as i32)
+    if e == 0 {
+        lattice_hash(mixed_seed, x as i32, z as i32)
+    } else {
+        tile_hash(mixed_seed, mix(e), x as i32, z as i32)
+    }
 }
 
 /// Hash of lattice cell `(x, z)` with the seed already mixed: [`hash2`] for cells inside `i64`.
-/// Beyond (only for octaves finer than a voxel, far out), the multiples of `2^64` above `i64`
-/// pick a seed for their `2^64 x 2^64` tile of cells, the way `hash2` folds what is above
-/// `i32`; tiles differ by a hash of both parts, so they never repeat periodically.
+/// Beyond (only octaves finer than a voxel reach them, far out, where every sample lands in
+/// another cell and the octave is white noise anyway), the multiples of `2^64` above `i64`
+/// (`xh`, `zh`) go into the tag of the cell's `2^32 x 2^32` tile: `tag ^ s(s(xh) ^ zh)` (`s` =
+/// [`splitmix64`]). That pair hash has 64 bits for `2^128` tiles of `2^64 x 2^64` cells, so whole
+/// tiles repeat: tile `(xh, zh)` has the values of tile `(xh', zh ^ s(xh) ^ s(xh'))` for every
+/// `xh'` that does not give tile `(0, 0)` (the `i64` cells, without a pair hash).
 #[inline]
 fn cell_hash(mixed_seed: u64, x: i128, z: i128) -> u32 {
     if let (Ok(x), Ok(z)) = (i32::try_from(x), i32::try_from(z)) {
@@ -287,12 +310,12 @@ fn cell_hash(mixed_seed: u64, x: i128, z: i128) -> u32 {
         return lattice_hash(mixed_seed, x, z);
     }
     let ((x, x_high), (z, z_high)) = (split_wide(x), split_wide(z));
-    let tile_seed = if x_high | z_high == 0 {
-        mixed_seed
-    } else {
-        mixed_seed ^ splitmix64(splitmix64(x_high) ^ z_high)
-    };
-    hash2_mixed(tile_seed, x, z)
+    if x_high | z_high == 0 {
+        return hash2_mixed(mixed_seed, x, z);
+    }
+    let e = ((excess(x) as u64) << 32) | excess(z) as u64;
+    let tag = mix(e) ^ splitmix64(splitmix64(x_high) ^ z_high);
+    tile_hash(mixed_seed, tag, x as i32, z as i32)
 }
 
 /// A lattice hash as a value in `[-1, 1]`.
@@ -341,15 +364,25 @@ fn tile_corners(seed: u64, x0: i32, z0: i32) -> [f64; 4] {
 }
 
 /// [`corners`] of a cell with a corner outside `i32`. Usually the four corners still share
-/// their bits above `i32` (they are in one `2^32 x 2^32` tile), and so the seed `hash2` folds
-/// those bits into: one fold instead of four.
+/// their bits above `i32` (they are in one `2^32 x 2^32` tile), and so the tag `hash2` makes of
+/// those bits: one tag instead of four.
 #[inline(never)]
 fn far_corners(mixed_seed: u64, x0: i64, z0: i64) -> [f64; 4] {
     // `c + 1` exists and has the excess of `c` unless its low 32 bits wrap.
     let same_tile = |c: i64| c as i32 != i32::MAX && c != i64::MAX;
     if same_tile(x0) && same_tile(z0) {
         let e = ((excess(x0) as u64) << 32) | excess(z0) as u64;
-        return tile_corners(mixed_seed ^ mix(e), x0 as i32, z0 as i32);
+        // `corners` takes the i32 path otherwise.
+        debug_assert!(e != 0, "far_corners of a cell inside i32");
+        let tag = mix(e);
+        let (x0, z0) = (x0 as i32, z0 as i32);
+        let (x1, z1) = (x0 + 1, z0 + 1);
+        return [
+            unit(tile_hash(mixed_seed, tag, x0, z0)),
+            unit(tile_hash(mixed_seed, tag, x1, z0)),
+            unit(tile_hash(mixed_seed, tag, x0, z1)),
+            unit(tile_hash(mixed_seed, tag, x1, z1)),
+        ];
     }
     wide_corners(mixed_seed, x0.into(), z0.into())
 }
