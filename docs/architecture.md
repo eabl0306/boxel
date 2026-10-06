@@ -608,6 +608,8 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
 
 Los chunks **no son entidades**. `ChunkMap` (recurso) = `SlotMap<ChunkId, ChunkSlot>` +
 `HashMap<ChunkPos, ChunkId>` con foldhash `FixedState` (determinista; 6.5 ns por lookup medidos).
+El mapa lleva al día los contadores de `WorldStats` en cada cambio de un slot (`data`, `mesh` y
+`remesh_pending` solo cambian por sus métodos), así que leerlos no recorre los slots.
 Los viewers sí son entidades (`Transform` + `ChunkViewer { radius, vertical_radius }`).
 
 Estados ortogonales por slot:
@@ -617,8 +619,9 @@ Estados ortogonales por slot:
 - `MeshState`: `None`, `Queued`, `InFlight { data_version, epoch }`, `Ready { mesh, data_version,
   epoch }`, `Empty`.
 - `Interest`: `DATA`, `MESH`, `PINNED`.
-- `neighbors_ready`: máscara de 26 bits; `epoch`: contador que sube cuando cambia el borde de un
-  vecino; `cancel`: `Arc<AtomicBool>` para cancelación cooperativa.
+- `neighbors_ready`: máscara de 26 bits, válida desde que llegan los datos del propio slot (antes
+  nadie la lee, y crear un slot no busca a sus vecinos); `epoch`: contador que sube cuando cambia
+  el borde de un vecino; `cancel`: `Arc<AtomicBool>` para cancelación cooperativa.
 
 Cada viewer quiere un cilindro vertical: malla en el círculo `radius` (xz) y en las capas a
 `vertical_radius` o menos (8 por defecto); datos un chunk más en cada dirección (círculo
@@ -636,8 +639,9 @@ Sistemas en `Update`, encadenados (`WorldSystems`):
    nivel (malla, datos, banda de descarga, fuera) cambia: un paso corto se compara fila por fila,
    O(filas + cambios); un viewer nuevo o un salto lista su región nueva por cáscaras, la más
    cercana primero, y después la vieja. Cada posición listada se evalúa contra los viewers
-   actuales dentro de `interest_budget` (1 ms por frame): crea slots (prioridad = distancia² al
-   viewer más cercano), actualiza el interés o descarga (marca `cancel`, emite
+   actuales dentro de `interest_budget` (1 ms por frame), en tandas de 32: primero se buscan todas
+   en el mapa (así sus fallos de caché se solapan) y después se evalúan. Crea slots (prioridad =
+   distancia² al viewer más cercano), actualiza el interés o descarga (marca `cancel`, emite
    `ChunkMeshEvent::Remove`, invalida vecinos). Las prioridades de la cola quedan viejas y se
    recalculan por lotes, las más cercanas primero. El mapa reserva lugar para dos vistas: al
    saltar, la vieja sigue cargada hasta que se crea la nueva y el mapa no crece a mitad de la
@@ -740,8 +744,9 @@ cambia el layout.
   cámara. Por eso solo se dibujan los chunks a menos de 2^30 vóxeles por eje del centro de una
   ventana que sigue a la cámara: cuando el origen de render se aleja más de 2^20 vóxeles de su
   centro, la ventana se mueve. Vale para todos los tiers: la tabla de GPU marca vivo
-  (`FLAG_LIVE`) solo a esos chunks y el cull de High salta los demás (al moverse la ventana,
-  High vuelve a subir los slots en uso: una vez por salto largo o cada 2^20 vóxeles de viaje);
+  (`FLAG_LIVE`) solo a esos chunks y el cull de High salta los demás (al moverse la ventana se
+  vuelven a subir todos los slots en uso, en High y Mid, junto con las demás subidas del frame:
+  una vez por salto largo o cada 2^20 vóxeles de viaje);
   el culling en CPU (Mid, Low) también salta los de afuera, y resta en `i64` antes de
   pasar a `f32`. Los demás siguen cargados hasta que el mundo los quita. Precisión exacta a
   cualquier distancia del origen del mundo, sin re-basar tablas y sin cambiar el layout de la GPU

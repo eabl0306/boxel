@@ -110,15 +110,18 @@ y cuatro veces el área. Este documento mide los dos.
  MISMO HILO, schedule Render (después de Last)
  =============================================
  8. Extract: clona el Arc de la malla
- 9. Prepare: upsert_chunk                      2 a 5 us (medido)
+ 9. Prepare: upsert_chunk
       - pide un rango en el arena               O(1)
-      - write_buffer de los quads               ~2 KiB
-      - write_buffer de 64 B en la tabla
+      - guarda el Arc y marca el slot de la tabla
+10. Draw: render() sube todo lo del frame
+      - un solo buffer temporal
+      - una copia por tramo seguido del arena
+        y otra por tramo de slots de la tabla
               |
  GPU (tier High)
  ===============
- 10. compute: un hilo por chunk, frustum y caras de espalda
- 11. dos multi-draw indirect (opaco y cutout)
+ 11. compute: un hilo por chunk, frustum y caras de espalda
+ 12. dos multi-draw indirect (opaco y cutout)
 ```
 
 | Paso | Hilo | Costo (medido) | Dónde |
@@ -126,8 +129,8 @@ y cuatro veces el área. Este documento mide los dos.
 | Generar | worker | 47 a 52 µs | `world/streaming.rs:579-602` |
 | Mallar, con lectura de vecinos | worker | 51 a 70 µs | `world/streaming.rs:604-664` |
 | Aplicar un resultado de malla | principal | unos 5 µs | `world/streaming.rs:671-706` |
-| Subir al render | principal | 2.0 a 2.5 µs (máquina quieta), 3.3 a 4.7 µs (con carga) | `render/renderer.rs:335-372` |
-| Borrar del render | principal | 1.2 a 1.8 µs | `render/renderer.rs:374-381` |
+| Subir al render | principal | 2.0 a 2.5 µs (máquina quieta), 3.3 a 4.7 µs (con carga), medido con un `write_buffer` por chunk (ver sección 5) | `render/renderer.rs:344-379`, `render/upload.rs:100-140` |
+| Borrar del render | principal | 1.2 a 1.8 µs, medido con un `write_buffer` por chunk | `render/renderer.rs:381-388` |
 | Frame en High con 8000 chunks | principal | 0.03 a 0.05 ms de CPU | `render/path/high.rs:117-152` |
 
 La parte cara (generar y mallar) va fuera del frame. Dentro del frame queda poco por chunk. El
@@ -283,16 +286,21 @@ con un presupuesto de 4 ms y aplica hasta 512 mallas por frame (`world/plugin.rs
 (`render/plugin.rs:920-982`). Si hubo cambio de GPU, pérdida de dispositivo o cambio de tier,
 mete todas las mallas en un solo frame (`render/plugin.rs:952-963`).
 
-**Prepare** sube todo lo del frame sin presupuesto propio (`render/plugin.rs:987-1024`). Por
-cada chunk nuevo (`render/renderer.rs:335-372`):
+**Prepare** procesa todo lo del frame sin presupuesto propio (`render/plugin.rs:1140-1186`), pero
+ya no copia nada a la GPU. Por cada chunk nuevo (`render/renderer.rs:344-379`):
 
-1. Busca un lugar en la tabla de chunks (`render/chunk_table.rs:63-143`).
+1. Busca un lugar en la tabla de chunks (`render/chunk_table.rs:146-162`).
 2. Pide un rango en el arena, O(1) (`render/arena.rs:92-101`).
-3. Copia los quads con `write_buffer` (`render/arena.rs:140-147`).
-4. Escribe 64 B en la tabla de la GPU (`render/renderer.rs:482-490`), solo en High y Mid.
+3. Guarda el `Arc` de la malla hasta el frame, sin copiar los quads (`render/upload.rs`).
+4. Marca su slot de la tabla como pendiente (`render/chunk_table.rs:286-292`).
 
-En wgpu-core 30.0.1 cada `write_buffer` crea su propio buffer temporal (`queue.rs:662` de
-wgpu-core). Son dos por chunk nuevo.
+**Draw**: al empezar el frame, `render()` sube todo lo pendiente (`render/upload.rs:100-140`): un
+solo buffer temporal, una copia por tramo de mallas seguidas en el arena y otra por tramo de slots
+de la tabla (en High y Mid; tramos separados por 16 slots o menos van juntos). Antes era un
+`write_buffer` por malla y otro por slot, y en wgpu-core 30.0.1 cada uno crea su propio buffer
+temporal (`queue.rs:662` de wgpu-core): unos 450 por cruce de borde a radio 32. Las copias van en
+el mismo command buffer del frame. Si la GPU rechaza el frame, se pierden con él, y el plugin
+vuelve a subir todos los chunks (`render/plugin.rs:1329-1334`).
 
 **Recursos fijos:**
 
@@ -380,7 +388,7 @@ El número del tier High no crece con el mundo. Es lo que permite pensar en radi
 |---|---|---|
 | Un chunk es | entidad, asset Mesh y RenderMesh | un slot en un mapa y un rango en un arena |
 | Bytes por quad | 152 B con el layout usual | 8 B (`mesh/packed.rs:6-66`) |
-| Subida | buffer temporal y conversión por malla, en serie | copia de quads ya empaquetados (`render/arena.rs:140-147`) |
+| Subida | buffer temporal y conversión por malla, en serie | copia de quads ya empaquetados, un buffer temporal por frame (`render/upload.rs:143-207`) |
 | Tope por frame | ninguno efectivo en la copia | 512 mallas por frame (`world/plugin.rs:53`) |
 | Trabajo por vista | por cada vista activa: cámara y, si estaban activos, prepass y 4 cascadas | ninguno en CPU; descarte en GPU (High) |
 | Costo por chunk en el frame | 5 a 20 µs medidos con 50 a 250 quads, más entidad y vista sin medir | 2 a 5 µs de render más unos 5 µs de mundo, con unos 226 quads (medido) |
@@ -552,6 +560,10 @@ El piso de unos 2 µs por chunk viene de los dos buffers temporales de wgpu (hip
 **Arreglo:** presupuesto en bytes o en chunks dentro del render y un solo `write_buffer` por lote
 o un ring de staging propio.
 
+**Hecho en parte:** las subidas de un frame van juntas en un solo buffer temporal (sección 5). El
+render del hilo principal por cruce de borde bajó de 3.42 a 2.89 ms a radio 32 (medido con
+`--spans`). Falta el presupuesto.
+
 ### 7.4 Resync de todo en un frame
 
 Con GPU nueva, pérdida de dispositivo o cambio de tier, Extract mete todas las mallas en un frame
@@ -564,10 +576,16 @@ Con GPU nueva, pérdida de dispositivo o cambio de tier, Extract mete todas las 
 reposo medía 0.24 ms a radio 32 y 0.195 ms a radio 12: crecía con el radio (medido con
 `world_stream`, sección 11).
 
-**Ahora:** solo recorre los slots y arma el texto si el mapa cambió (`world/plugin.rs:358-396`,
-`world/map.rs:182-208`). En reposo, el frame entero de `headless_world --idle 5` (mundo sin
-render, 144 Hz) mide 0.11 a 0.14 ms de mediana y 0.3 a 0.43 ms de p99, igual a radio 12 que a
-radio 32 (medido). Ya no crece con el radio.
+**Después:** solo recorría los slots y armaba el texto si el mapa cambió. En reposo, el frame
+entero de `headless_world --idle 5` (mundo sin render, 144 Hz) mide 0.11 a 0.14 ms de mediana y
+0.3 a 0.43 ms de p99, igual a radio 12 que a radio 32 (medido). Pero al cruzar un borde el mapa
+cambia en cada frame: a radio 32 el recorrido costaba unos 0.5 ms por frame de borde y unos 2.7 ms
+por cruce (medido con `--spans`).
+
+**Ahora:** el `ChunkMap` lleva los contadores al insertar, borrar o cambiar un slot
+(`world/map.rs:213-249`, `world/map.rs:342-366`), así que `publish_stats` los lee sin recorrer nada y solo arma el texto si
+algo cambió (`world/plugin.rs:361-399`). Las builds de debug los comparan con un recorrido completo
+en los frames que cambiaron el mapa.
 
 **Queda:** en Mid y Low el descarte en CPU recorre todos los chunks
 (`render/path/mod.rs:366-405`): 0.34 ms con 8000 (medido).

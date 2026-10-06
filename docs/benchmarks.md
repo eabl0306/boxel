@@ -111,13 +111,22 @@ cargo run --release --features trace --example stress -- --scenario fly --speed 
 Con `--features trace` cada sistema del ECS abre un span de `tracing`, y el mundo y el render
 agregan spans propios por dentro (`world.positions`, `world.drain`,
 `world.dispatch`, `render.upsert`, `render.submit`...). `world.step create`, `unload`, `update`,
-etc. reparten el tiempo de `world.positions` por tipo de paso. `--spans` suma el tiempo de cada
+etc. reparten el tiempo de `world.positions` por tipo de paso (`world.step batch` es llenar cada
+tanda de 32 posiciones y buscarlas en el mapa, antes de sus pasos). `--spans` suma el tiempo de cada
 uno en cada frame y agrega al resumen la sección "Time per system":
 
 - media, p99 y máximo por sistema en tres grupos de frames: cruce de borde, puesta al día (los
   frames después del cruce hasta que el mundo termina) y el resto;
-- el total por cruce de borde, sumando el cruce y su puesta al día;
+- el total por cruce de borde, sumando el cruce y su puesta al día, de los cruces en que el mundo
+  terminó antes del siguiente (dice cuántos de cuántos);
 - los 10 peores frames de cruce, con lo que más tardó en cada uno.
+
+Una suma por cruce crece con los frames que dura el cruce aunque cada frame cueste lo mismo: si
+los frames se vuelven más rápidos, el cruce tiene más frames y sistemas que no cambiaron parecen
+más caros. Por eso la tabla trae "above normal", la suma menos lo que esos frames cuestan en un
+frame normal (frames por cruce por la media de los frames normales): el trabajo extra del cruce.
+Al comparar dos versiones, mirar esa columna junto con los frames por cruce y cuántos cruces
+terminaron (una versión que tarda más en ponerse al día deja afuera más cruces pesados).
 
 `--spans-csv` deja lo mismo frame a frame. Para comparar dos versiones, las dos tienen que estar
 compiladas con `--features trace`, porque los spans también cuestan tiempo: en radio 32, cerca de
