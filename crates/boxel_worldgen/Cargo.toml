@@ -21,5 +21,9 @@ bench = false
 name = "terrain"
 harness = false
 
+[[bench]]
+name = "caves"
+harness = false
+
 [lints]
 workspace = true

@@ -1,5 +1,7 @@
-//! Deterministic value noise from integers (no dependencies). Same seed + coordinates = same
-//! value on every platform (integer lattice and hashing, `f64` interpolation).
+//! Deterministic noise from integers (no dependencies): 2D value noise ([`value_noise_2d`],
+//! [`fbm_2d`]) and 3D gradient noise ([`gradient_noise_3d`], [`fbm_3d`]). Same seed +
+//! coordinates = same value on every platform (integer lattice and hashing, `f64`
+//! interpolation).
 //!
 //! Samples are integer coordinates and frequencies exact fractions ([`Frequency`]), so the
 //! lattice cell of a sample is an exact integer and its position inside the cell an exact
@@ -9,6 +11,10 @@
 //!
 //! The seed goes through `SplitMix64` before it is combined with the lattice coordinates, so
 //! nearby seeds (`fbm_2d` uses `seed + octave` per octave) give unrelated lattices.
+//!
+//! After the integer split the noise uses only `+`, `-`, `*` and `/` on `f64` (correctly rounded
+//! by IEEE 754 everywhere), in a fixed order: no `mul_add` (Rust never fuses on its own), no
+//! `powf` and no other libm call, whose results may differ between platforms.
 
 /// A noise frequency as an exact fraction: `num` lattice cells every `den` voxels.
 ///
@@ -189,17 +195,22 @@ impl Scale {
         }
     }
 
-    /// Smoothstep weight of a position `rem / den` inside a cell, with `rem` and `den` exact in
-    /// `f64` (one correctly rounded division, exact when `den` is a power of two).
+    /// The position `rem / den` inside a cell, in `[0, 1)`, with `rem` and `den` exact in `f64`
+    /// (one correctly rounded division, exact when `den` is a power of two).
     #[inline]
-    fn weight(self, rem: u32) -> f64 {
-        let t = if self.shift.is_some() {
+    fn fraction(self, rem: u32) -> f64 {
+        if self.shift.is_some() {
             // Times the exact inverse of a power of two: equal to the division, and cheaper.
             f64::from(rem) * self.inverse
         } else {
             f64::from(rem) / f64::from(self.den)
-        };
-        smoothstep(t)
+        }
+    }
+
+    /// Smoothstep weight of the position `rem / den` inside a cell ([`Scale::fraction`]).
+    #[inline]
+    fn weight(self, rem: u32) -> f64 {
+        smoothstep(self.fraction(rem))
     }
 
     /// Lattice cell of coordinate `c` and the smoothstep weight of `c` inside it.
@@ -455,7 +466,14 @@ fn normalize(sum: f64, weight_sum: f64) -> f64 {
 /// `(xs[i], zs[j])`), bit-identical to calling [`fbm_2d`] per point. Each octave splits each
 /// coordinate into cell and weight once, and hashes every lattice corner the grid touches once
 /// instead of four times per point.
-pub(crate) fn fbm_2d_grid(seed: u64, xs: &[i64], zs: &[i64], fbm: Fbm, out: &mut [f64]) {
+///
+/// The coordinates may come in any order and with any spacing (a stride is a coarser grid);
+/// a grid too sparse for its lattice is sampled point by point.
+///
+/// # Panics
+///
+/// If `out.len()` is not `xs.len() * zs.len()`.
+pub fn fbm_2d_grid(seed: u64, xs: &[i64], zs: &[i64], fbm: Fbm, out: &mut [f64]) {
     assert_eq!(out.len(), xs.len() * zs.len(), "fbm_2d_grid output size");
     if out.is_empty() {
         return;
@@ -552,6 +570,10 @@ impl LatticeTable {
         true
     }
 }
+
+mod d3;
+
+pub use d3::{Fbm3, Frequency3, fbm_3d, fbm_3d_grid, gradient_noise_3d, hash3};
 
 #[cfg(test)]
 mod tests;

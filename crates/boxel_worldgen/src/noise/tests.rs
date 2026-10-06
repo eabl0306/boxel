@@ -1,7 +1,9 @@
 //! The noise against its definitions: an exact lattice split, `hash2` unchanged inside `i32` and
 //! extended past it without repetition, the point and grid paths bit-identical and equal to a
 //! shortcut-free reference far from the origin, continuity at the lattice edges, and the octaves
-//! the fbm drops.
+//! the fbm drops. The 3D noise (at the end) the same way: `hash3` against its formula, the grid
+//! bit-identical to the point function anywhere in `i64`, the Lipschitz bound, the dropped
+//! octaves, and the same statistics far away as near the origin.
 use super::*;
 
 /// Shorthand for an [`Fbm`].
@@ -570,5 +572,553 @@ fn fbm_stops_before_the_frequency_overflows() {
             fbm_2d(3, x, z, all).to_bits(),
             fbm_2d(3, x, z, many).to_bits()
         );
+    }
+}
+
+/// Shorthand for an [`Fbm3`] with frequencies `xz.0 / xz.1` and `y.0 / y.1`.
+fn fbm3(xz: (u32, u32), y: (u32, u32), octaves: u32, lacunarity: u32, gain: f64) -> Fbm3 {
+    Fbm3 {
+        frequency: Frequency3 {
+            xz: Frequency::new(xz.0, xz.1),
+            y: Frequency::new(y.0, y.1),
+        },
+        octaves,
+        lacunarity,
+        gain,
+    }
+}
+
+/// The cheese caverns of the cave plan: 1/128 across, about 1/85 up, 3 octaves.
+fn cheese() -> Fbm3 {
+    fbm3((1, 128), (3, 256), 3, 2, 0.5)
+}
+
+/// Steepest slope of one octave of gradient noise along one axis, per lattice cell. Along x, the
+/// fade moves the weight by at most 15/8 per cell from the x0 to the x1 corners, whose dot
+/// products differ by at most 4 (each is at most 2: two unit components times offsets of at most
+/// 1); and the weighted dot products themselves move by at most 1 (one unit component).
+const SLOPE_3D: f64 = 15.0 / 8.0 * 4.0 + 1.0;
+
+/// Bound of `|fbm_3d(p + step) - fbm_3d(p)|` for one voxel along x or z (`along_y` false) or y:
+/// the weighted mean of the octaves' [`SLOPE_3D`] times their cells per voxel.
+fn lipschitz(f: Fbm3, along_y: bool) -> f64 {
+    let axis = if along_y {
+        f.frequency.y
+    } else {
+        f.frequency.xz
+    };
+    let (xz, y) = (f.frequency.xz, f.frequency.y);
+    let (mut xz_num, mut y_num) = (u64::from(xz.num()), u64::from(y.num()));
+    let mut num = u64::from(axis.num());
+    let (mut amplitude, mut slope, mut weight) = (1.0, 0.0, 0.0);
+    for _ in 0..f.octaves {
+        if xz_num > u64::from(xz.den()) || y_num > u64::from(y.den()) {
+            break;
+        }
+        slope += f64::abs(amplitude) * SLOPE_3D * num as f64 / f64::from(axis.den());
+        weight += f64::abs(amplitude);
+        let lacunarity = u64::from(f.lacunarity);
+        (xz_num, y_num, num) = (xz_num * lacunarity, y_num * lacunarity, num * lacunarity);
+        amplitude *= f.gain;
+    }
+    if weight > 0.0 { slope / weight } else { 0.0 }
+}
+
+#[test]
+fn hash3_matches_its_formula_and_recorded_values() {
+    let formula = |seed: u64, x: i64, y: i64, z: i64| {
+        let s = splitmix64;
+        s(s(s(s(seed) ^ x as u64) ^ y as u64) ^ z as u64) as u32
+    };
+    let edges = [
+        0,
+        1,
+        -1,
+        7,
+        i64::from(i32::MAX),
+        i64::from(i32::MIN),
+        1 << 32,
+        1 << 40,
+        -(1 << 60),
+        1 << 61,
+        i64::MAX,
+        i64::MIN,
+    ];
+    for seed in [0, 7, u64::MAX] {
+        for x in edges {
+            for y in edges {
+                for z in edges {
+                    assert_eq!(
+                        hash3(seed, x, y, z),
+                        formula(seed, x, y, z),
+                        "({x}, {y}, {z})"
+                    );
+                }
+            }
+        }
+    }
+    // Recorded from an independent implementation of the formula (Python integers).
+    for (seed, x, y, z, h) in [
+        (0x0, 0, 0, 0, 0xaac8_0268),
+        (0x7, -3, 12, 5, 0xb611_c53b),
+        (0x2a, 1 << 31, -(1 << 31) - 1, 1 << 32, 0xd5bd_474f),
+        (0x3039, 1 << 40, -(1 << 60), -(1 << 61), 0x387f_eddb),
+        (u64::MAX, i64::MAX, i64::MIN, -1, 0x75c0_5aa4),
+        (0x63, 1, 2, 3, 0xf511_d0a5),
+        (0x63, 3, 2, 1, 0x366b_0907),
+    ] {
+        assert_eq!(hash3(seed, x, y, z), h, "seed {seed:#x} ({x}, {y}, {z})");
+    }
+}
+
+#[test]
+fn hash3_depends_on_every_input_and_never_repeats() {
+    assert_ne!(hash3(7, 1, 2, 3), hash3(8, 1, 2, 3));
+    // Every permutation and sign flip is another lattice point.
+    let points = [
+        (1, 2, 3),
+        (1, 3, 2),
+        (2, 1, 3),
+        (2, 3, 1),
+        (3, 1, 2),
+        (3, 2, 1),
+        (-1, 0, 0),
+        (0, -1, 0),
+        (0, 0, -1),
+        (0, 0, 0),
+    ];
+    let hashes: Vec<u32> = points.iter().map(|&(x, y, z)| hash3(7, x, y, z)).collect();
+    for (i, a) in hashes.iter().enumerate() {
+        for b in &hashes[i + 1..] {
+            assert_ne!(a, b);
+        }
+    }
+    // Points 2^32 apart on any axis (the period of a 32-bit key) hash differently.
+    let step = 1i64 << 32;
+    for (x, y, z) in [(0, 0, 0), (-3, 12, 5), (1 << 31, -(1 << 31), 1 << 40)] {
+        let hashes = [
+            hash3(7, x, y, z),
+            hash3(7, x + step, y, z),
+            hash3(7, x, y + step, z),
+            hash3(7, x, y, z + step),
+            hash3(7, x - step, y - step, z - step),
+        ];
+        for (i, a) in hashes.iter().enumerate() {
+            for b in &hashes[i + 1..] {
+                assert_ne!(a, b, "({x}, {y}, {z})");
+            }
+        }
+    }
+    // Each output bit is set about half of the time over a block of the lattice.
+    let mut ones = [0u32; 32];
+    for x in -8..8 {
+        for y in -8..8 {
+            for z in -8..8 {
+                let h = hash3(42, x, y, z);
+                for (bit, count) in ones.iter_mut().enumerate() {
+                    *count += (h >> bit) & 1;
+                }
+            }
+        }
+    }
+    for (bit, &count) in ones.iter().enumerate() {
+        let ratio = f64::from(count) / 4096.0;
+        assert!((0.45..0.55).contains(&ratio), "bit {bit}: {ratio}");
+    }
+}
+
+#[test]
+fn noise_3d_matches_an_independent_implementation() {
+    // Recorded from the documented definition in Python (its floats are IEEE doubles, with the
+    // same operations in the same order).
+    for (seed, f, (x, y, z), bits) in [
+        (0, cheese(), (3, 1, -2), 0x3f98_1433_0ed1_8e3f),
+        (0, cheese(), (37, -5, 91), 0xbfc2_f354_f990_23a8),
+        (0, cheese(), (-1000, 77, 5), 0x3fb2_512c_434b_8687),
+        (
+            12345,
+            fbm3((1, 64), (1, 64), 1, 2, 0.5),
+            ((1 << 40) + 7, -(1 << 40) + 21, (1 << 40) + 50),
+            0x3fdb_cf88_3854_9d0c,
+        ),
+        (
+            12345,
+            fbm3((1, 64), (1, 64), 1, 2, 0.5),
+            (5, -(1 << 60), -9),
+            0x3fb7_cc7b_4a91_b560,
+        ),
+        (
+            12345,
+            fbm3((1, 64), (1, 64), 1, 2, 0.5),
+            ((1 << 61) - 3, (1 << 61) - 3, -(1 << 61)),
+            0xbfb7_b561_eddc_4338,
+        ),
+        (
+            9,
+            fbm3((3, 10), (1, 7), 2, 2, 0.5),
+            (-(1 << 61), (1 << 61) - 1, 123),
+            0x3fd0_a0e6_e04e_d2d1,
+        ),
+        (
+            9,
+            fbm3((3, 10), (1, 7), 2, 2, 0.5),
+            (17, -4, 1 << 33),
+            0x3fb1_451b_7586_edc0,
+        ),
+    ] {
+        let v = fbm_3d(seed, x, y, z, f);
+        assert_eq!(v.to_bits(), bits, "{f:?} at ({x}, {y}, {z}): {v}");
+    }
+}
+
+#[test]
+fn gradient_noise_is_zero_on_the_lattice_and_stays_in_range() {
+    let f = Frequency3 {
+        xz: Frequency::one_in(16),
+        y: Frequency::one_in(8),
+    };
+    for (cx, cy, cz) in [(0, 0, 0), (-3, 7, 2), (1 << 40, -(1 << 50), 1 << 55)] {
+        let v = gradient_noise_3d(3, cx * 16, cy * 8, cz * 16, f);
+        assert_eq!(v, 0.0, "cell ({cx}, {cy}, {cz})");
+    }
+    let f = Frequency3 {
+        xz: Frequency::new(37, 100),
+        y: Frequency::new(3, 20),
+    };
+    let (mut min, mut max) = (f64::MAX, f64::MIN);
+    for i in 0..20_000 {
+        let (x, y, z) = (i * 3 - 700, i * -5 + 300, i * 7);
+        let v = gradient_noise_3d(11, x, y, z, f);
+        assert!((-1.0..=1.0).contains(&v), "{v} at ({x}, {y}, {z})");
+        (min, max) = (min.min(v), max.max(v));
+    }
+    assert!(
+        min < -0.5 && max > 0.5,
+        "noise range too narrow: [{min}, {max}]"
+    );
+}
+
+#[test]
+fn noise_3d_is_continuous_at_any_distance() {
+    // 2^20 voxels per cell: a voxel step moves the noise by at most SLOPE_3D / 2^20, across cell
+    // borders too, wherever the cells are (2^41 cells out at the edge of the world).
+    let cell = 1i64 << 20;
+    let f = Frequency3::uniform(Frequency::one_in(1 << 20));
+    let bound = SLOPE_3D / cell as f64 + 1e-12;
+    for start in [
+        0,
+        -cell,
+        (1 << 31) - 8,
+        -(1 << 31) - 8,
+        (1 << 32) - 8,
+        (1 << 31) * cell - 8,
+        1 << 40,
+        -(1 << 60),
+        (1 << 61) - 8,
+        -(1 << 61),
+        i64::MAX - 16,
+        i64::MIN,
+    ] {
+        for i in 0..16 {
+            let (x, y, z) = (start + i, start / 3 + i, start / 5 - i);
+            let v = gradient_noise_3d(5, x, y, z, f);
+            for (dx, dy, dz) in [(1, 0, 0), (0, 1, 0), (0, 0, 1)] {
+                let next = gradient_noise_3d(5, x + dx, y + dy, z + dz, f);
+                assert!(
+                    (next - v).abs() <= bound,
+                    "jump at ({x}, {y}, {z}) + ({dx}, {dy}, {dz}): {v} vs {next}"
+                );
+            }
+        }
+        // The noise is not constant there: it moves within a cell (off the lattice planes, where
+        // it can be 0 along a whole edge).
+        let (x, y, z) = (
+            start.min(i64::MAX - 2 * cell),
+            start / 3 + cell / 3,
+            start / 5 + cell / 5,
+        );
+        let moved = (1..8).any(|i| {
+            let x = x + i * cell / 8;
+            gradient_noise_3d(5, x, y, z, f) != gradient_noise_3d(5, x + cell / 2, y, z, f)
+        });
+        assert!(moved, "constant noise around {start}");
+    }
+    // Fine lattices, every octave crossing many cells: the fbm stays under the weighted bound.
+    for f in [
+        cheese(),
+        fbm3((3, 40), (1, 16), 4, 2, 0.5),
+        fbm3((1, 4), (1, 2), 3, 3, 0.7),
+    ] {
+        let (bound_xz, bound_y) = (lipschitz(f, false) + 1e-12, lipschitz(f, true) + 1e-12);
+        for origin in [0, 1 << 40, -(1 << 60)] {
+            for i in 0..2000 {
+                let (x, y, z) = (origin + i, origin / 3 - 2 * i, origin / 5 + 3 * i);
+                let v = fbm_3d(8, x, y, z, f);
+                for (dx, dy, dz, bound) in
+                    [(1, 0, 0, bound_xz), (0, 1, 0, bound_y), (0, 0, 1, bound_xz)]
+                {
+                    let next = fbm_3d(8, x + dx, y + dy, z + dz, f);
+                    assert!(
+                        (next - v).abs() <= bound,
+                        "{f:?} jump at ({x}, {y}, {z}) + ({dx}, {dy}, {dz}): {v} vs {next}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn grid_3d_matches_point_evaluation_bit_for_bit() {
+    let axis = |origin: i64, step: i64, n: i64| -> Vec<i64> {
+        (0..n).map(|i| origin + i * step).collect()
+    };
+    let cases = [
+        // (origin, step, fbm): a chunk's density lattice (4x8x4 voxels) near the origin.
+        ((0, 0, 0), (4, 8, 4), cheese()),
+        ((-1000, 77, 5), (1, 1, 1), fbm3((1, 16), (1, 16), 3, 2, 0.5)),
+        // Frequencies that are not powers of two (a division per split).
+        ((3, -9, 12), (1, 2, 3), fbm3((3, 10), (1, 7), 4, 2, 0.5)),
+        // Sparse grid: the per-point fallback.
+        ((7, -3, 11), (1000, 1000, 1000), cheese()),
+        // Descending coordinates, odd lacunarity and gain.
+        (
+            (100, 50, -20),
+            (-1, -1, -1),
+            fbm3((1, 7), (2, 9), 6, 3, 0.6),
+        ),
+        // One octave, none, and every octave dropped.
+        ((5, 5, 5), (1, 1, 1), fbm3((1, 100), (1, 100), 1, 2, 0.5)),
+        ((5, 5, 5), (1, 1, 1), fbm3((1, 100), (1, 100), 0, 2, 0.5)),
+        ((5, 5, 5), (1, 1, 1), fbm3((3, 2), (1, 8), 3, 2, 0.5)),
+        // Up to one cell per voxel: a corner per voxel in the table.
+        ((-7, 3, 9), (1, 1, 1), fbm3((1, 4), (1, 8), 5, 2, 0.5)),
+        // Voxels across +-2^31 on every axis, and cells across +-2^31.
+        (
+            ((1 << 31) - 6, -(1 << 31) - 6, (1 << 31) - 6),
+            (1, 1, 1),
+            fbm3((1, 4), (1, 2), 2, 2, 0.5),
+        ),
+        (
+            ((1 << 32) - 6, -(1 << 32) - 6, (1 << 32) - 6),
+            (1, 1, 1),
+            fbm3((1, 2), (1, 2), 1, 2, 0.5),
+        ),
+        // Far out: 2^40, y = -2^60, the edge of the world (2^61).
+        ((1 << 40, -(1 << 40), 1 << 40), (4, 8, 4), cheese()),
+        ((0, -(1 << 60), 0), (4, 8, 4), cheese()),
+        (
+            (-(1 << 61), (1 << 61) - 64, (1 << 61) - 64),
+            (4, 8, 4),
+            cheese(),
+        ),
+        // `c * num` past i64 (the i128 split).
+        (
+            ((1 << 61) - 16, -(1 << 61), (1 << 61) - 16),
+            (1, 1, 1),
+            fbm3((3, 10), (3, 10), 2, 2, 0.5),
+        ),
+        // The ends of i64 with one cell per voxel: the `+ 1` corners wrap (with weight 0).
+        (
+            (i64::MAX - 11, i64::MIN, i64::MAX - 11),
+            (1, 1, 1),
+            fbm3((1, 1), (1, 2), 1, 2, 0.5),
+        ),
+        (
+            (i64::MIN, i64::MAX - 6, i64::MIN),
+            (1, 1, 1),
+            fbm3((1, 2), (1, 1), 1, 2, 0.5),
+        ),
+    ];
+    for (seed, &((x0, y0, z0), (sx, sy, sz), f)) in (40u64..).zip(&cases) {
+        let (xs, ys, zs) = (axis(x0, sx, 12), axis(y0, sy, 7), axis(z0, sz, 12));
+        let mut grid = vec![f64::NAN; xs.len() * ys.len() * zs.len()];
+        fbm_3d_grid(seed, &xs, &ys, &zs, f, &mut grid);
+        let mut values = grid.iter();
+        for &x in &xs {
+            for &y in &ys {
+                for &z in &zs {
+                    let point = fbm_3d(seed, x, y, z, f);
+                    assert_eq!(
+                        values.next().map(|v| v.to_bits()),
+                        Some(point.to_bits()),
+                        "case {x0} {y0} {z0} at ({x}, {y}, {z})"
+                    );
+                }
+            }
+        }
+    }
+    // Unordered coordinates with repeats, and an empty grid.
+    let (xs, ys, zs) = ([9, -40, 9, 3], [17, -2], [0, 100, -7, 33, 32]);
+    let mut grid = vec![0.0; 4 * 2 * 5];
+    fbm_3d_grid(1, &xs, &ys, &zs, cheese(), &mut grid);
+    assert_eq!(grid[(2 * 2 + 1) * 5 + 3], fbm_3d(1, 9, -2, 33, cheese()));
+    fbm_3d_grid(1, &xs, &[], &zs, cheese(), &mut []);
+}
+
+#[test]
+#[should_panic(expected = "output size")]
+fn grid_3d_rejects_a_wrong_output_size() {
+    fbm_3d_grid(1, &[0, 1], &[0], &[0, 1], cheese(), &mut [0.0; 3]);
+}
+
+#[test]
+fn fbm_3d_drops_octaves_finer_than_a_voxel() {
+    // 1/4 doubles to 1/2 and to 1 cell per voxel; 2 per voxel and every octave after it are
+    // dropped. The y axis alone drops them too (1/16 across, 1/2 up: two octaves).
+    let pairs = [
+        (
+            fbm3((1, 4), (1, 4), 3, 2, 0.5),
+            fbm3((1, 4), (1, 4), 1000, 2, 0.5),
+        ),
+        (
+            fbm3((1, 16), (1, 2), 2, 2, 0.5),
+            fbm3((1, 16), (1, 2), 40, 2, 0.5),
+        ),
+        (
+            fbm3((1, 9), (1, 3), 2, 3, 0.7),
+            fbm3((1, 9), (1, 3), 7, 3, 0.7),
+        ),
+    ];
+    for (kept, asked) in pairs {
+        for (x, y, z) in [
+            (0, 0, 0),
+            (-77, 5, 1 << 33),
+            (1 << 40, -(1 << 60), 3),
+            (i64::MAX, i64::MIN, 0),
+        ] {
+            assert_eq!(
+                fbm_3d(3, x, y, z, kept).to_bits(),
+                fbm_3d(3, x, y, z, asked).to_bits(),
+                "{asked:?} at ({x}, {y}, {z})"
+            );
+        }
+        // And the last kept octave counts: one fewer changes the value.
+        let fewer = Fbm3 {
+            octaves: kept.octaves - 1,
+            ..kept
+        };
+        assert_ne!(fbm_3d(3, 5, 6, 7, kept), fbm_3d(3, 5, 6, 7, fewer));
+    }
+    // Above one cell per voxel from the first octave: nothing is summed.
+    let (x, y, z) = (12, -5, 99);
+    assert_eq!(fbm_3d(3, x, y, z, fbm3((3, 2), (1, 8), 4, 2, 0.5)), 0.0);
+    assert_eq!(fbm_3d(3, x, y, z, fbm3((1, 8), (9, 8), 4, 2, 0.5)), 0.0);
+    let dense = Frequency3 {
+        xz: Frequency::one_in(8),
+        y: Frequency::new(9, 8),
+    };
+    assert_eq!(gradient_noise_3d(3, x, y, z, dense), 0.0);
+}
+
+#[test]
+fn fbm_3d_normalizes_and_degenerates_cleanly() {
+    let f = fbm3((10, 170), (3, 170), 6, 2, 0.5);
+    for i in 0..500 {
+        let (x, y, z) = (i * 7 - 1000, i * -3 + 50, i * 11);
+        let v = fbm_3d(9, x, y, z, f);
+        assert!((-1.0..=1.0).contains(&v));
+        let one = Fbm3 { octaves: 1, ..f };
+        assert_eq!(
+            fbm_3d(9, x, y, z, one).to_bits(),
+            gradient_noise_3d(9, x, y, z, f.frequency).to_bits()
+        );
+    }
+    assert_eq!(fbm_3d(9, 1, 2, 3, Fbm3 { octaves: 0, ..f }), 0.0);
+    assert_eq!(
+        Frequency3::uniform(Frequency::one_in(64)),
+        Frequency3 {
+            xz: Frequency::new(2, 128),
+            y: Frequency::one_in(64),
+        }
+    );
+}
+
+/// Mean and variance of `n` samples of `f` spread over `2^24` voxels per axis around `center`,
+/// far enough apart that their cells are unrelated.
+fn sample_stats(f: Fbm3, center: (i64, i64, i64), n: u64) -> (f64, f64) {
+    let spread = |r: u64| (r & ((1 << 24) - 1)) as i64 - (1 << 23);
+    let (mut sum, mut squares) = (0.0, 0.0);
+    for i in 0..n {
+        let x = center.0 + spread(splitmix64(3 * i));
+        let y = center.1 + spread(splitmix64(3 * i + 1));
+        let z = center.2 + spread(splitmix64(3 * i + 2));
+        let v = fbm_3d(21, x, y, z, f);
+        sum += v;
+        squares += v * v;
+    }
+    let mean = sum / n as f64;
+    (mean, squares / n as f64 - mean * mean)
+}
+
+#[test]
+fn noise_3d_is_as_varied_far_away_as_near_the_origin() {
+    let n = 100_000;
+    let edge = (1 << 61) - (1 << 24);
+    for f in [cheese(), fbm3((1, 64), (1, 64), 1, 2, 0.5)] {
+        let (mean, variance) = sample_stats(f, (0, 0, 0), n);
+        let sd = variance.sqrt();
+        // Noise, not a constant or a flattened copy.
+        assert!(
+            mean.abs() < 0.02 * sd && (0.1..0.5).contains(&sd),
+            "{f:?}: {mean} {sd}"
+        );
+        for center in [
+            (1 << 40, 0, -(1 << 40)),
+            (0, -(1 << 60), 0),
+            (edge, -edge, edge),
+            (-edge, edge, -edge),
+        ] {
+            let (far_mean, far_variance) = sample_stats(f, center, n);
+            assert!(
+                (far_mean - mean).abs() <= 0.02 * sd,
+                "{f:?} mean at {center:?}: {far_mean} vs {mean}"
+            );
+            assert!(
+                (far_variance / variance - 1.0).abs() <= 0.02,
+                "{f:?} variance at {center:?}: {far_variance} vs {variance}"
+            );
+        }
+    }
+}
+
+#[test]
+fn noise_3d_windows_2_pow_32_apart_differ() {
+    let window = |(x, y, z): (i64, i64, i64), f: Fbm3| {
+        let axis = |o: i64| (o..o + 64).collect::<Vec<i64>>();
+        let mut out = vec![0.0; 64 * 64 * 64];
+        fbm_3d_grid(3, &axis(x), &axis(y), &axis(z), f, &mut out);
+        out
+    };
+    let tile = 1i64 << 32;
+    // Voxels 2^32 apart (cells 2^25 apart for the cheese), and cells 2^32 apart (1/32 of a cell
+    // per voxel, windows 2^37 apart).
+    let fine = fbm3((1, 32), (1, 32), 1, 2, 0.5);
+    for (f, step) in [(cheese(), tile), (fine, 32 * tile)] {
+        let origin = window((0, 0, 0), f);
+        let nonzero = origin.iter().filter(|&&v| v != 0.0).count();
+        assert!(nonzero * 2 > origin.len(), "{f:?}: {nonzero} nonzero");
+        for offset in [
+            (step, 0, 0),
+            (0, step, 0),
+            (0, 0, step),
+            (2 * step, 0, 0),
+            (0, -2 * step, 0),
+            (step, step, step),
+            (-step, -step, -step),
+        ] {
+            // Equal values other than the zeros on the lattice points both windows share (a few
+            // more can match by chance on the lattice planes, where few gradients mix).
+            let other = window(offset, f);
+            let same = origin
+                .iter()
+                .zip(&other)
+                .filter(|&(a, b)| *a != 0.0 && a.to_bits() == b.to_bits())
+                .count();
+            assert!(
+                same * 1000 < origin.len(),
+                "{f:?} at {offset:?}: {same} equal"
+            );
+        }
     }
 }
