@@ -2,7 +2,7 @@
 
 Documento técnico de referencia. Fecha: 2026-10-05. Estado: aprobado para el milestone M0
 (revisión final, después de tres revisiones adversariales del borrador v1).
-Las decisiones puntuales están en `docs/adr/` (0001 a 0013). Durante M0 hubo además una
+Las decisiones puntuales están en `docs/adr/` (0001 a 0014). Durante M0 hubo además una
 especificación para los agentes implementadores (en inglés, en `.scaffold/`), borrada al cerrar M0;
 este documento queda como referencia.
 
@@ -586,7 +586,8 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   pos }`, `Face` (orden congelado `+Y, -Y, +X, -X, +Z, -Z`), 26 vecinos en orden fijo. Límite
   de mundo único: `MAX_CHUNK_COORD` = ±2^56 chunks (±2^61 vóxeles). Dentro de él ningún origen,
   vecino o radio desborda `i64`, y las distancias al cuadrado van en `u128`. El mundo sujeta a
-  los viewers a ese límite. Un chunk de lod k empieza en `pos << (5 + k)`.
+  los viewers a ese límite. Un chunk de lod k empieza en `pos << (5 + k)`. Detalles en
+  ADR 0014.
 - **Registry** de datos: `BlockState(u16)` denso en tiempo de ejecución (0 = aire), nunca se
   persiste crudo (M1 agrega el IdMap nombre a id). Tablas SoA: nombre, forma (`None`, `Opaque`,
   `Cutout`, `Translucent`), flags, emisión, texturas por cara. Contenido M0 congelado: aire,
@@ -743,8 +744,8 @@ cambia el layout.
   vuelve a subir la tabla entera, una vez por salto largo); el culling en CPU (Mid, Low) también
   salta los de afuera, y resta en `i64` antes de pasar a `f32`. Los demás siguen cargados hasta
   que el mundo los quita. Precisión exacta a cualquier distancia del origen del mundo, sin
-  re-basar tablas y sin cambiar el layout de la GPU. El límite siguiente es el `f64` de
-  `Transform` (paso de 1 mm a unos 4.4e12 vóxeles).
+  re-basar tablas y sin cambiar el layout de la GPU (ADR 0014). El límite siguiente es el `f64`
+  de `Transform` (paso de 1 mm a unos 4.4e12 vóxeles).
 - **Limitación en GL** (verificada en wgpu-hal 30.0.1 y naga): el backend GL siempre remapea z de
   [0, 1] a [-1, 1] (`z * 2 - w`) y no usa `glClipControl`, así que en los tiers sobre GL el
   reverse-Z pierde su ventaja de precisión: con near = 0.1, la resolución de profundidad es de
