@@ -31,5 +31,9 @@ criterion.workspace = true
 [lib]
 bench = false
 
+[[bench]]
+name = "physics"
+harness = false
+
 [lints]
 workspace = true
