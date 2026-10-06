@@ -1,7 +1,9 @@
-//! `ChunkPos` hashes as one 128-bit word. Through foldhash (the world's chunk index) the hashes
-//! of the position sets a world holds (grids, columns, rows, negative and far coordinates, views
-//! `2^32` chunks apart) spread like random ones: no shared 64-bit hash, bucket use and the
-//! hashbrown tag (top 7 bits) as even as random hashing gives.
+//! Through foldhash (the world's chunk index) the hashes of `ChunkPos` spread like random ones
+//! over the position sets a world holds (grids, columns, rows, negative and far coordinates, views
+//! `2^32` chunks apart): no shared 64-bit hash, bucket use and the hashbrown tag (top 7 bits) as
+//! even as random hashing gives. Nor does any straight line of positions share one hash (a hash
+//! that feeds foldhash one 128-bit word made of two halves hashes a whole line to 0 when one half
+//! matches foldhash's seed).
 use boxel_voxel::{ChunkPos, MAX_CHUNK_COORD};
 use std::collections::HashSet;
 use std::hash::BuildHasher;
@@ -121,4 +123,59 @@ fn views_far_apart_do_not_collide() {
         }
     }
     check("lattice", &lattice);
+}
+
+/// All 64-bit hashes of `line` differ.
+fn assert_distinct(name: &str, line: impl Iterator<Item = ChunkPos>) {
+    let mut seen = HashSet::new();
+    for p in line {
+        assert!(seen.insert(hash(p)), "{name}: {p:?} shares a hash");
+    }
+}
+
+#[test]
+fn lines_do_not_share_a_hash() {
+    // Lines that hashed to 0 when `ChunkPos` fed foldhash the word `x ^ (y << 32)`,
+    // `z ^ y * 0x9e3779b97f4a7c15` (the halves matched foldhash's seeds).
+    assert_distinct(
+        "z row",
+        (-2048..2048).map(|z| ChunkPos::new(3_964_562_569, 137_296_536, z)),
+    );
+    assert_distinct(
+        "x row",
+        (-2048..2048).map(|x| ChunkPos::new(x, 36, -44_693_351_583_899_095)),
+    );
+    assert_distinct(
+        "x row, y < 0",
+        (-2048..2048).map(|x| ChunkPos::new(x, -36, 44_693_351_583_899_089)),
+    );
+    // Rows along every axis and the diagonals through a few starting points, near and far.
+    let m = MAX_CHUNK_COORD;
+    for start in [
+        ChunkPos::new(0, 0, 0),
+        ChunkPos::new(-7, 3, 11),
+        ChunkPos::new(1 << 40, -(1 << 33), 5),
+        ChunkPos::new(m - 4096, -m, m - 4096),
+    ] {
+        for step in [
+            (1, 0, 0),
+            (0, 1, 0),
+            (0, 0, 1),
+            (1, 1, 0),
+            (1, 0, 1),
+            (0, 1, 1),
+            (1, -1, 1),
+        ] {
+            assert_distinct(
+                &format!("{start:?} + t * {step:?}"),
+                (0..4096).map(|t| {
+                    ChunkPos::new(
+                        start.x + t * step.0,
+                        start.y + t * step.1,
+                        start.z + t * step.2,
+                    )
+                }),
+            );
+        }
+    }
 }
