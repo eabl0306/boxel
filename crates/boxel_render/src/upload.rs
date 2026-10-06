@@ -5,10 +5,11 @@
 //! chunk border changes a few hundred chunks.
 use crate::arena::QUAD_BYTES;
 use crate::chunk_table::ChunkTable;
-use boxel_mesh::PackedQuad;
+use boxel_mesh::{ChunkMesh, PackedQuad};
 use boxel_shaders::gpu::ChunkGpu;
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 /// Bytes of one chunk table entry.
 const ENTRY_BYTES: u64 = size_of::<ChunkGpu>() as u64;
@@ -17,8 +18,9 @@ const ENTRY_BYTES: u64 = size_of::<ChunkGpu>() as u64;
 /// cost about as much as recording another copy.
 const TABLE_MERGE_GAP: u32 = 16;
 
-/// Largest staging buffer: a bigger frame (a full resync of a large world) is split into several.
-/// A single range larger than this still goes in one buffer of its own size.
+/// Largest staging buffer: a bigger frame (a full resync of a large world) is split into several,
+/// and so is a run of meshes that follow each other in the arena. Only a single mesh larger than
+/// this (far more than a chunk can hold) would go in one buffer of its own size.
 const STAGING_BYTES: u64 = 64 << 20;
 
 /// A mesh waiting for its upload.
@@ -26,7 +28,18 @@ const STAGING_BYTES: u64 = 64 << 20;
 struct PendingMesh {
     /// First arena quad (the chunk's current range).
     offset: u32,
-    quads: Vec<PackedQuad>,
+    /// The mesh, shared with the world: its quads are copied once, into the staging buffer.
+    mesh: Arc<ChunkMesh>,
+}
+
+impl PendingMesh {
+    fn quads(&self) -> &[PackedQuad] {
+        &self.mesh.quads
+    }
+
+    fn bytes(&self) -> u64 {
+        self.quads().len() as u64 * QUAD_BYTES
+    }
 }
 
 /// One copy into the arena or the chunk table.
@@ -65,15 +78,10 @@ pub(crate) struct Uploads {
 }
 
 impl Uploads {
-    /// Queues `quads` for the arena range starting at quad `offset`, the new range of chunk `id`.
-    pub fn mesh(&mut self, id: u64, offset: u32, quads: &[PackedQuad]) {
-        let pending = self.meshes.entry(id).or_insert_with(|| PendingMesh {
-            offset,
-            quads: Vec::new(),
-        });
-        pending.offset = offset;
-        pending.quads.clear();
-        pending.quads.extend_from_slice(quads);
+    /// Queues the quads of `mesh` for the arena range starting at quad `offset`, the new range of
+    /// chunk `id`.
+    pub fn mesh(&mut self, id: u64, offset: u32, mesh: Arc<ChunkMesh>) {
+        self.meshes.insert(id, PendingMesh { offset, mesh });
     }
 
     /// Drops the pending mesh of a removed chunk.
@@ -106,7 +114,7 @@ impl Uploads {
         debug_assert!(
             self.meshes.iter().all(|(&id, mesh)| {
                 chunks.get(id).is_some_and(|(_, r)| {
-                    (r.alloc.offset, r.alloc.size as usize) == (mesh.offset, mesh.quads.len())
+                    (r.alloc.offset, r.alloc.size as usize) == (mesh.offset, mesh.quads().len())
                 })
             }),
             "a pending mesh is not the current range of a live chunk"
@@ -114,14 +122,14 @@ impl Uploads {
         self.pending
             .extend(self.meshes.drain().map(|(_, mesh)| mesh));
         self.pending.sort_unstable_by_key(|mesh| mesh.offset);
+        let limit = device.limits().max_buffer_size.min(STAGING_BYTES);
         self.pieces.clear();
-        mesh_pieces(&self.pending, &mut self.pieces);
+        mesh_pieces(&self.pending, limit, &mut self.pieces);
         self.pieces.extend(self.runs.iter().map(|slots| {
             let bytes = u64::from(slots.end - slots.start) * ENTRY_BYTES;
             (Piece::Slots(slots.clone()), bytes)
         }));
 
-        let limit = device.limits().max_buffer_size.min(STAGING_BYTES);
         let mut start = 0;
         while start < self.pieces.len() {
             let end = start + batch_len(&self.pieces[start..], limit);
@@ -169,7 +177,7 @@ impl Uploads {
                 match piece {
                     Piece::Meshes(range) => {
                         for mesh in &self.pending[range.clone()] {
-                            put(bytemuck::cast_slice(&mesh.quads));
+                            put(bytemuck::cast_slice(mesh.quads()));
                         }
                     }
                     Piece::Slots(slots) => {
@@ -200,15 +208,16 @@ impl Uploads {
 }
 
 /// Appends the copies of `pending` (sorted by offset) to `pieces`: one per run of meshes that
-/// follow each other in the arena. Never across a gap: it may hold another chunk's quads.
-fn mesh_pieces(pending: &[PendingMesh], pieces: &mut Vec<(Piece, u64)>) {
+/// follow each other in the arena, cut where it would pass `limit` bytes. Never across a gap: it
+/// may hold another chunk's quads.
+fn mesh_pieces(pending: &[PendingMesh], limit: u64, pieces: &mut Vec<(Piece, u64)>) {
     let mut first = 0;
     let mut bytes = 0;
     for (i, mesh) in pending.iter().enumerate() {
-        bytes += mesh.quads.len() as u64 * QUAD_BYTES;
-        let joined = pending
-            .get(i + 1)
-            .is_some_and(|next| mesh.offset + mesh.quads.len() as u32 == next.offset);
+        bytes += mesh.bytes();
+        let joined = pending.get(i + 1).is_some_and(|next| {
+            mesh.offset + mesh.quads().len() as u32 == next.offset && bytes + next.bytes() <= limit
+        });
         if !joined {
             pieces.push((Piece::Meshes(first..i + 1), bytes));
             first = i + 1;
@@ -237,8 +246,23 @@ mod tests {
     fn pending(offset: u32, quads: usize) -> PendingMesh {
         PendingMesh {
             offset,
-            quads: vec![PackedQuad::default(); quads],
+            mesh: Arc::new(ChunkMesh {
+                quads: vec![PackedQuad::default(); quads],
+                ..ChunkMesh::default()
+            }),
         }
+    }
+
+    fn mesh_ranges(meshes: &[PendingMesh], limit: u64) -> Vec<(Range<usize>, u64)> {
+        let mut pieces = Vec::new();
+        mesh_pieces(meshes, limit, &mut pieces);
+        pieces
+            .into_iter()
+            .map(|(piece, bytes)| match piece {
+                Piece::Meshes(range) => (range, bytes / QUAD_BYTES),
+                Piece::Slots(_) => unreachable!(),
+            })
+            .collect()
     }
 
     #[test]
@@ -250,20 +274,25 @@ mod tests {
             pending(7, 4),
             pending(20, 1),
         ];
-        let mut pieces = Vec::new();
-        mesh_pieces(&meshes, &mut pieces);
-        let pieces: Vec<_> = pieces
-            .into_iter()
-            .map(|(piece, bytes)| match piece {
-                Piece::Meshes(range) => (range, bytes / QUAD_BYTES),
-                Piece::Slots(_) => unreachable!(),
-            })
-            .collect();
         // slot 5 is someone else's: no copy over it
-        assert_eq!(pieces, [(0..2, 5), (2..4, 5), (4..5, 1)]);
-        let mut none = Vec::new();
-        mesh_pieces(&[], &mut none);
-        assert!(none.is_empty());
+        assert_eq!(
+            mesh_ranges(&meshes, u64::MAX),
+            [(0..2, 5), (2..4, 5), (4..5, 1)]
+        );
+        assert!(mesh_ranges(&[], u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn runs_of_meshes_are_cut_at_the_staging_limit() {
+        // A resync: every mesh right after the previous one.
+        let meshes: Vec<_> = (0..6).map(|i| pending(4 * i, 4)).collect();
+        let limit = 10 * QUAD_BYTES;
+        let ranges = mesh_ranges(&meshes, limit);
+        assert_eq!(ranges, [(0..2, 8), (2..4, 8), (4..6, 8)]);
+        assert!(ranges.iter().all(|(_, quads)| quads * QUAD_BYTES <= limit));
+        // A mesh larger than the limit still goes alone.
+        let big = [pending(0, 2), pending(2, 20), pending(22, 2)];
+        assert_eq!(mesh_ranges(&big, limit), [(0..1, 2), (1..2, 20), (2..3, 2)]);
     }
 
     #[test]

@@ -366,7 +366,8 @@ struct ReadyGpu {
     configured_for: UVec2,
     /// Present preference the surface is configured with (follows [`PresentSettings`]).
     present: PresentModePref,
-    /// Next `Extract` uploads every ready mesh (`renderer.clear_chunks` first).
+    /// Next `Extract` uploads every ready mesh (`renderer.clear_chunks` first): a new renderer, or a
+    /// frame the GPU rejected (its chunk uploads were lost with it).
     resync: bool,
     /// LKG `confirm_good` was called (first presented frame of this selection).
     confirmed: bool,
@@ -1157,7 +1158,7 @@ fn prepare(
         let result = match op {
             MeshOp::Upsert { id, origin, mesh } => {
                 let _span = frame_span!("render.upsert");
-                ready.renderer.upsert_chunk(id, origin, &mesh)
+                ready.renderer.upsert_chunk(id, origin, mesh)
             }
             MeshOp::Remove { id } => {
                 let _span = frame_span!("render.remove");
@@ -1212,7 +1213,7 @@ fn draw(
                 texture,
                 suboptimal,
             } => {
-                let commands = {
+                let (commands, errors) = {
                     let _span = frame_span!("render.encode");
                     let target = texture
                         .texture
@@ -1233,22 +1234,27 @@ fn draw(
                     ready.renderer.blit(&mut encoder, &target);
                     // wgpu validates and encodes the recorded commands here
                     let _span = frame_span!("render.finish");
-                    encoder.finish()
+                    let errors = ready.ctx.health.error_count();
+                    (encoder.finish(), errors)
                 };
                 {
                     let _span = frame_span!("render.submit");
                     ready.ctx.queue.submit([commands]);
                 }
-                let _span = frame_span!("render.present");
-                if let Some(window) = window.as_deref() {
-                    window.window.pre_present_notify();
+                resync_if_frame_failed(ready, errors);
+                {
+                    let _span = frame_span!("render.present");
+                    if let Some(window) = window.as_deref() {
+                        window.window.pre_present_notify();
+                    }
+                    ready.ctx.queue.present(texture);
                 }
-                ready.ctx.queue.present(texture);
                 ready.frames += 1;
                 frame.rendered = true;
                 frame.presented = true;
                 frame.gate_used = true;
                 if suboptimal {
+                    let _span = frame_span!("render.reconfigure");
                     reconfigure(ready, counters, frame.window.physical_size);
                 }
                 return;
@@ -1286,7 +1292,7 @@ fn render_offscreen(ready: &mut ReadyGpu, view: &ViewParams) {
             }
         }
     }
-    let commands = {
+    let (commands, errors) = {
         let _span = frame_span!("render.encode");
         let mut encoder =
             ready
@@ -1302,14 +1308,29 @@ fn render_offscreen(ready: &mut ReadyGpu, view: &ViewParams) {
             .overlay
             .encode(&mut encoder, ready.renderer.main_color_view());
         let _span = frame_span!("render.finish");
-        encoder.finish()
+        let errors = ready.ctx.health.error_count();
+        (encoder.finish(), errors)
     };
     let index = {
         let _span = frame_span!("render.submit");
         ready.ctx.queue.submit([commands])
     };
+    resync_if_frame_failed(ready, errors);
     ready.offscreen.push_back(index);
     ready.frames += 1;
+}
+
+/// Called after a frame's submit with the device's error count from just before its `finish`.
+/// An error since then means none of the frame's commands ran (one invalid command buffer fails
+/// the whole submit), including the chunk uploads `VoxelRenderer::render` recorded at their
+/// start: the renderer's chunk table and arena no longer match the GPU. The next frame then
+/// uploads every chunk again. wgpu reports these errors on this thread, inside `finish` or
+/// `submit` (an error from another thread at the same time only costs a needless resync).
+fn resync_if_frame_failed(ready: &mut ReadyGpu, errors_before_finish: u32) {
+    if ready.ctx.health.error_count() != errors_before_finish {
+        tracing::warn!("the GPU rejected a frame; uploading every chunk again");
+        ready.resync = true;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

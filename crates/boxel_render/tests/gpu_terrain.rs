@@ -163,7 +163,7 @@ fn adapter_label(caps: &AdapterCaps) -> String {
 struct Scene {
     registry: BlockRegistry,
     /// Non-empty meshes: (chunk position, mesh).
-    meshes: Vec<(ChunkPos, ChunkMesh)>,
+    meshes: Vec<(ChunkPos, Arc<ChunkMesh>)>,
     /// Highest terrain column in the meshed area.
     max_height: i32,
 }
@@ -204,7 +204,7 @@ fn terrain_scene() -> Scene {
         };
         let mesh = mesher.mesh_chunk(&input, &materials);
         if !mesh.is_empty() {
-            meshes.push((pos, mesh));
+            meshes.push((pos, Arc::new(mesh)));
         }
     }
 
@@ -348,7 +348,7 @@ fn render_tier(
         for (pos, mesh) in &scene.meshes {
             let origin = pos.origin().as_i64vec3() + shift;
             renderer
-                .upsert_chunk(chunk_id(*pos), origin, mesh)
+                .upsert_chunk(chunk_id(*pos), origin, Arc::clone(mesh))
                 .map_err(|e| format!("upsert {pos:?}: {e}"))?;
         }
         Ok(())

@@ -12,6 +12,9 @@
 //! - the same picture again after one frame of churn: removes, re-inserts under new ids and
 //!   replaced meshes, all uploaded together by the next render (freed slots and arena ranges
 //!   are reused within the frame);
+//! - the same picture after a lost frame: more churn rendered into a frame with one invalid
+//!   command, which wgpu rejects whole (uploads included) and reports while finishing or
+//!   submitting it, then a resync of every chunk, as the render plugin does;
 //! - the heightfield in a second renderer whose arena is exactly full: a chunk that no longer
 //!   fits keeps its old mesh, a smaller mesh reuses the chunk's own range;
 //! - a far scene: a 32x32 slab ~480 voxels away and a second slab of another texture 1 voxel
@@ -404,6 +407,8 @@ struct TierImages {
     minus_chunk: RgbaImage,
     /// `minus_chunk` again, after one frame of churn (see [`churn`]).
     churn: RgbaImage,
+    /// `minus_chunk` again, after a lost frame and a resync (see [`lost_frame`]).
+    lost_frame: RgbaImage,
     far_both: RgbaImage,
     far_front: RgbaImage,
     far_back: RgbaImage,
@@ -444,7 +449,7 @@ fn full_arena_scenes(
     .map_err(|e| format!("full arena: VoxelRenderer::new: {e}"))?;
     for (c, mesh) in terrain {
         renderer
-            .upsert_chunk(chunk_id(*c), (*c * 32).as_i64vec3(), mesh)
+            .upsert_chunk(chunk_id(*c), (*c * 32).as_i64vec3(), Arc::new(mesh.clone()))
             .map_err(|e| format!("full arena: upsert {c}: {e}"))?;
     }
     // fillers behind the camera, the largest that fits first, until not one quad is free
@@ -454,7 +459,7 @@ fn full_arena_scenes(
         let free = stats.arena_capacity_quads - stats.arena_used_quads;
         let fits = (1..=free).rev().any(|n| {
             renderer
-                .upsert_chunk(filler_id, I64Vec3::splat(-2048), &hidden_mesh(n))
+                .upsert_chunk(filler_id, I64Vec3::splat(-2048), Arc::new(hidden_mesh(n)))
                 .is_ok()
         });
         if !fits {
@@ -474,7 +479,7 @@ fn full_arena_scenes(
     let (id, origin) = (chunk_id(REMOVED_CHUNK), (REMOVED_CHUNK * 32).as_i64vec3());
     let view = heightfield_view();
     let grown = hidden_mesh(original.total_quads() + 1);
-    match renderer.upsert_chunk(id, origin, &grown) {
+    match renderer.upsert_chunk(id, origin, Arc::new(grown)) {
         Err(RendererError::ArenaFull { .. }) => {}
         other => return Err(format!("full arena: growing a chunk returned {other:?}")),
     }
@@ -489,11 +494,11 @@ fn full_arena_scenes(
     let (kept, _) = render(device, queue, &mut renderer, &view)?;
 
     renderer
-        .upsert_chunk(id, origin, &hidden_mesh(1))
+        .upsert_chunk(id, origin, Arc::new(hidden_mesh(1)))
         .map_err(|e| format!("full arena: shrinking a chunk: {e}"))?;
     let (shrunk, _) = render(device, queue, &mut renderer, &view)?;
     renderer
-        .upsert_chunk(id, origin, original)
+        .upsert_chunk(id, origin, Arc::new(original.clone()))
         .map_err(|e| format!("full arena: growing a chunk back: {e}"))?;
     let (regrown, _) = render(device, queue, &mut renderer, &view)?;
     let end = renderer.stats();
@@ -505,36 +510,102 @@ fn full_arena_scenes(
     Ok([kept, shrunk, regrown])
 }
 
+/// The id of terrain chunk `c` in id generation `generation` (0: `chunk_id`).
+fn generation_id(c: IVec3, generation: u64) -> u64 {
+    chunk_id(c) | generation << 40
+}
+
 /// Changes the heightfield minus `REMOVED_CHUNK` in many ways that leave the same picture, with
 /// no render in between: the renderer uploads them all with the next frame. Every terrain chunk
-/// is removed and comes back under a new id; `REMOVED_CHUNK` comes back and goes again; one chunk
-/// gets a hidden mesh first and its real one after. Freed slots and arena ranges are reused
-/// within the frame, so an upload of an older mesh or slot over a newer one shows.
-fn churn(renderer: &mut VoxelRenderer, terrain: &[(IVec3, ChunkMesh)]) -> Result<(), String> {
-    let new_id = |c: IVec3| chunk_id(c) | 1 << 40;
+/// is removed and comes back under a new id (from id generation `from` to `to`);
+/// `REMOVED_CHUNK` comes back and goes again; one chunk gets a hidden mesh first and its real one
+/// after. Freed slots and arena ranges are reused within the frame, so an upload of an older
+/// mesh or slot over a newer one shows.
+fn churn(
+    renderer: &mut VoxelRenderer,
+    terrain: &[(IVec3, ChunkMesh)],
+    from: u64,
+    to: u64,
+) -> Result<(), String> {
     let origin = |c: IVec3| (c * 32).as_i64vec3();
     for (c, mesh) in terrain {
         if *c == REMOVED_CHUNK {
             renderer
-                .upsert_chunk(chunk_id(*c), origin(*c), mesh)
+                .upsert_chunk(chunk_id(*c), origin(*c), Arc::new(mesh.clone()))
                 .map_err(|e| format!("churn: re-add {c}: {e}"))?;
             renderer.remove_chunk(chunk_id(*c));
             continue;
         }
-        if !renderer.remove_chunk(chunk_id(*c)) {
+        if !renderer.remove_chunk(generation_id(*c, from)) {
             return Err(format!("churn: {c} was not resident"));
         }
         renderer
-            .upsert_chunk(new_id(*c), origin(*c), &hidden_mesh(3))
+            .upsert_chunk(generation_id(*c, to), origin(*c), Arc::new(hidden_mesh(3)))
             .map_err(|e| format!("churn: hidden {c}: {e}"))?;
         renderer
-            .upsert_chunk(new_id(*c), origin(*c), mesh)
+            .upsert_chunk(generation_id(*c, to), origin(*c), Arc::new(mesh.clone()))
             .map_err(|e| format!("churn: upsert {c}: {e}"))?;
     }
     if renderer.chunk_count() != terrain.len() - 1 {
         return Err(format!("churn: {} chunks resident", renderer.chunk_count()));
     }
     Ok(())
+}
+
+/// The heightfield minus `REMOVED_CHUNK` after a lost frame. More churn (id generation 1 to 2)
+/// goes into a frame that also records one invalid copy. wgpu rejects that frame whole, the
+/// uploads `render` recorded at its start included, and must say so through the uncaptured
+/// error handler (`errors`) while finishing or submitting it: that is how the render plugin knows
+/// to resync. Then a resync like the plugin's (every chunk again) and a normal frame.
+fn lost_frame(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    renderer: &mut VoxelRenderer,
+    terrain: &[(IVec3, ChunkMesh)],
+    errors: &Mutex<Vec<String>>,
+) -> Result<RgbaImage, String> {
+    churn(renderer, terrain, 1, 2)?;
+    let view = heightfield_view();
+    let buffer = |usage| {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_tiers lost frame"),
+            size: 16,
+            usage,
+            mapped_at_creation: false,
+        })
+    };
+    let (src, dst) = (
+        buffer(wgpu::BufferUsages::COPY_SRC),
+        buffer(wgpu::BufferUsages::COPY_DST),
+    );
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("gpu_tiers lost frame"),
+    });
+    renderer.render(device, queue, &mut encoder, &view);
+    // 16 bytes at offset 8 of a 16-byte buffer
+    encoder.copy_buffer_to_buffer(&src, 0, &dst, 8, Some(16));
+    let before = errors.lock().map_err(|e| e.to_string())?.len();
+    queue.submit([encoder.finish()]);
+    {
+        let mut errors = errors.lock().map_err(|e| e.to_string())?;
+        if errors.len() == before {
+            return Err("lost frame: no error while finishing or submitting it".to_string());
+        }
+        // expected: the tier fails on any other uncaptured error
+        errors.truncate(before);
+    }
+    renderer.clear_chunks();
+    for (c, mesh) in terrain.iter().filter(|(c, _)| *c != REMOVED_CHUNK) {
+        renderer
+            .upsert_chunk(
+                generation_id(*c, 3),
+                (*c * 32).as_i64vec3(),
+                Arc::new(mesh.clone()),
+            )
+            .map_err(|e| format!("lost frame: resync {c}: {e}"))?;
+    }
+    let (image, _) = render(device, queue, renderer, &view)?;
+    Ok(image)
 }
 
 /// Uploads and renders every scene on one tier.
@@ -567,7 +638,7 @@ fn render_tier(
 
     for (c, mesh) in terrain {
         renderer
-            .upsert_chunk(chunk_id(*c), (*c * 32).as_i64vec3(), mesh)
+            .upsert_chunk(chunk_id(*c), (*c * 32).as_i64vec3(), Arc::new(mesh.clone()))
             .map_err(|e| format!("upsert {c}: {e}"))?;
     }
     let quads: u32 = terrain.iter().map(|(_, m)| m.total_quads()).sum();
@@ -599,8 +670,9 @@ fn render_tier(
         return Err(format!("chunk {REMOVED_CHUNK} was not resident"));
     }
     let (minus_chunk, _) = render(&device, &queue, &mut renderer, &view)?;
-    churn(&mut renderer, terrain)?;
+    churn(&mut renderer, terrain, 0, 1)?;
     let (churn, _) = render(&device, &queue, &mut renderer, &view)?;
+    let lost_frame = lost_frame(&device, &queue, &mut renderer, terrain, &errors)?;
     let full_arena = full_arena_scenes(&device, &queue, tier, registry, terrain)?;
 
     renderer.clear_chunks();
@@ -609,22 +681,22 @@ fn render_tier(
     }
     let far = far_view();
     renderer
-        .upsert_chunk(7, I64Vec3::ZERO, &far_scene(registry, true, true))
+        .upsert_chunk(7, I64Vec3::ZERO, Arc::new(far_scene(registry, true, true)))
         .map_err(|e| e.to_string())?;
     let (far_both, _) = render(&device, &queue, &mut renderer, &far)?;
     // replace the same chunk id with one slab at a time
     renderer
-        .upsert_chunk(7, I64Vec3::ZERO, &far_scene(registry, true, false))
+        .upsert_chunk(7, I64Vec3::ZERO, Arc::new(far_scene(registry, true, false)))
         .map_err(|e| e.to_string())?;
     let (far_front, _) = render(&device, &queue, &mut renderer, &far)?;
     renderer
-        .upsert_chunk(7, I64Vec3::ZERO, &far_scene(registry, false, true))
+        .upsert_chunk(7, I64Vec3::ZERO, Arc::new(far_scene(registry, false, true)))
         .map_err(|e| e.to_string())?;
     let (far_back, _) = render(&device, &queue, &mut renderer, &far)?;
 
     // an empty mesh removes the chunk: nothing but sky is left
     renderer
-        .upsert_chunk(7, I64Vec3::ZERO, &ChunkMesh::default())
+        .upsert_chunk(7, I64Vec3::ZERO, Arc::new(ChunkMesh::default()))
         .map_err(|e| e.to_string())?;
     let (empty, _) = render(&device, &queue, &mut renderer, &far)?;
     if renderer.chunk_count() != 0 || empty.non_background_fraction() != 0.0 {
@@ -641,6 +713,7 @@ fn render_tier(
         canopy,
         minus_chunk,
         churn,
+        lost_frame,
         far_both,
         far_front,
         far_back,
@@ -776,6 +849,7 @@ fn tiers_render_identically() {
                     (&name("canopy"), &i.canopy),
                     (&name("minus_chunk"), &i.minus_chunk),
                     (&name("churn"), &i.churn),
+                    (&name("lost_frame"), &i.lost_frame),
                     (&name("far_both"), &i.far_both),
                     (&name("far_front"), &i.far_front),
                     (&name("far_back"), &i.far_back),
@@ -807,6 +881,7 @@ fn tiers_render_identically() {
             );
             for (scene, image, expected, expected_name) in [
                 ("churn", &i.churn, &i.minus_chunk, "minus_chunk"),
+                ("lost_frame", &i.lost_frame, &i.minus_chunk, "minus_chunk"),
                 (
                     "full_arena_kept",
                     &i.full_arena[0],

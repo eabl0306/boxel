@@ -10,6 +10,7 @@ use boxel_math::{DVec3, I64Vec3, UVec2};
 use boxel_mesh::{BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, PackedQuad};
 use boxel_transform::Transform;
 use boxel_voxel::{BlockRegistry, Face};
+use std::sync::Arc;
 
 /// Edge of the smoke test targets.
 const SIZE: u32 = 16;
@@ -75,7 +76,7 @@ fn draw(ctx: &SmokeContext<'_>) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     renderer
-        .upsert_chunk(0, I64Vec3::ZERO, &smoke_mesh(&registry))
+        .upsert_chunk(0, I64Vec3::ZERO, Arc::new(smoke_mesh(&registry)))
         .map_err(|e| e.to_string())?;
 
     let camera = Camera::default();

@@ -13,6 +13,7 @@ use boxel_math::{Frustum, I64Vec3, Mat4, UVec2, Vec3, wrap_to_i32};
 use boxel_mesh::{BUCKET_COUNT, ChunkMesh};
 use boxel_shaders::gpu::{ChunkGpu, ViewUniform, bindings};
 use boxel_voxel::TextureSpec;
+use std::sync::Arc;
 use wgpu::util::DeviceExt as _;
 
 /// Upper bound of chunk slots (keeps the allocator node table and the GPU table bounded).
@@ -338,12 +339,13 @@ impl VoxelRenderer {
     /// origin difference may not be exact). Empty meshes remove the chunk.
     ///
     /// Chunk changes stay on the CPU until the next [`VoxelRenderer::render`], which records all
-    /// of them at the start of its encoder (one staging buffer for the whole frame).
+    /// of them at the start of its encoder (one staging buffer for the whole frame). Until then
+    /// the renderer holds `mesh` (no copy of its quads).
     pub fn upsert_chunk(
         &mut self,
         id: u64,
         origin: I64Vec3,
-        mesh: &ChunkMesh,
+        mesh: Arc<ChunkMesh>,
     ) -> Result<(), RendererError> {
         if mesh.is_empty() {
             self.remove_chunk(id);
@@ -364,7 +366,7 @@ impl VoxelRenderer {
             id,
             origin,
             alloc,
-            counts: bucket_counts(mesh),
+            counts: bucket_counts(&mesh),
         };
         if self.chunks.insert(record).is_none() {
             // unreachable: `slot_for` succeeded above, so this is a new chunk (no old range)
@@ -372,7 +374,7 @@ impl VoxelRenderer {
             self.stats.dropped_chunks += 1;
             return Err(RendererError::ChunkTableFull(self.chunks.capacity()));
         }
-        self.uploads.mesh(id, alloc.offset, &mesh.quads);
+        self.uploads.mesh(id, alloc.offset, mesh);
         Ok(())
     }
     /// Removes a chunk; returns false if unknown. Reaches the GPU with the next `render`.
