@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [features]
+# Tracing spans inside the systems (frame breakdowns; the facade's `trace`). Off: no code.
+trace = []
 # PNG screenshots (RequestScreenshot). Without it ScreenshotSaved carries an error.
 png = ["boxel_gfx/png"]
 

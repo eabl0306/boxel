@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Tracing spans inside the systems (frame breakdowns; the facade's `trace`). Off: no code.
+trace = []
+
 [dependencies]
 boxel_ecs.workspace = true
 boxel_tasks.workspace = true

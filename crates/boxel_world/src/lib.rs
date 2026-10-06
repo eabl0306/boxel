@@ -21,6 +21,26 @@
 //! 4. `Collect`: publish mesh results as [`ChunkMeshEvent`]s, up to
 //!    [`WorldSettings::max_mesh_events_per_frame`].
 
+/// `let _span = frame_span!("name");` opens a tracing span until the end of the scope, for frame
+/// breakdowns (`boxel_log::span_times`, the stress example's `--spans`). Only with feature
+/// `trace`; without it the macro is a zero-sized value and no code.
+#[cfg(feature = "trace")]
+macro_rules! frame_span {
+    ($name:literal) => {
+        tracing::info_span!($name).entered()
+    };
+}
+#[cfg(not(feature = "trace"))]
+macro_rules! frame_span {
+    ($name:literal) => {
+        $crate::NoSpan
+    };
+}
+
+/// What `frame_span!` gives without feature `trace`.
+#[cfg(not(feature = "trace"))]
+pub(crate) struct NoSpan;
+
 mod interest;
 mod map;
 mod plugin;

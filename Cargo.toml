@@ -130,7 +130,9 @@ png = ["boxel_gfx?/png", "boxel_render?/png"]
 debug = ["boxel_ecs/debug"]
 # Spawn/insert caller locations in ECS diagnostics.
 track_location = ["boxel_ecs/track_location"]
-trace = ["debug", "boxel_ecs/trace"]
+# A tracing span per system run, plus spans inside the world and render systems (interest,
+# jobs, uploads, submit). For profiling only: every span costs time, even without a reader.
+trace = ["debug", "boxel_ecs/trace", "boxel_world?/trace", "boxel_render?/trace"]
 trace_tracy = ["trace", "boxel_log/tracy"]
 # Vulkan escape hatch (Windows/Linux only; a no-op elsewhere).
 hal = ["boxel_gfx?/hal"]

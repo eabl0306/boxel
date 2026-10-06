@@ -150,6 +150,67 @@ thread_local! {
 /// How mesh jobs turn their input into a mesh (a seam for unit tests).
 pub(crate) type MeshFn = fn(&MeshInput<'_>, &MaterialTable) -> ChunkMesh;
 
+/// What [`WorldJobs::refresh_position`] did with one position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// Created a slot (with a generation job, or ready air when the generator declares the
+    /// layer all air).
+    Create,
+    /// Unloaded the slot.
+    Unload,
+    /// Updated the slot's interest.
+    Update,
+    /// Nothing there and nothing wanted.
+    Skip,
+}
+
+/// Feature `trace`: time of the interest steps by [`Step`], reported as `world.step <kind>`
+/// spans (`boxel_log::span_times` adds their `busy_ns`). One clock read per step; a span per
+/// step would cost more than most steps.
+#[cfg(feature = "trace")]
+struct StepTimer {
+    last: Instant,
+    ns: [u64; 5],
+    calls: [u64; 5],
+}
+
+#[cfg(feature = "trace")]
+impl StepTimer {
+    /// By `Step as usize`, then air creates.
+    const NAMES: [&'static str; 5] = ["create", "unload", "update", "skip", "create_air"];
+    /// Index of a `Step::Create` of a known-air slot.
+    const CREATE_AIR: usize = 4;
+
+    fn new() -> Self {
+        Self {
+            last: Instant::now(),
+            ns: [0; 5],
+            calls: [0; 5],
+        }
+    }
+
+    /// The time since the previous lap (or `new`) was spent on step kind `i` (see `NAMES`).
+    fn lap(&mut self, i: usize) {
+        let now = Instant::now();
+        self.ns[i] += u64::try_from((now - self.last).as_nanos()).unwrap_or(u64::MAX);
+        self.calls[i] += 1;
+        self.last = now;
+    }
+
+    fn report(&self) {
+        for (i, name) in Self::NAMES.iter().enumerate() {
+            if self.calls[i] > 0 {
+                tracing::info_span!(
+                    "world.step",
+                    name = *name,
+                    busy_ns = self.ns[i],
+                    calls = self.calls[i]
+                );
+            }
+        }
+    }
+}
+
 /// The production [`MeshFn`]: this thread's `boxel_mesh::Mesher`.
 pub(crate) fn mesh_with_thread_mesher(
     input: &MeshInput<'_>,
@@ -441,7 +502,10 @@ impl WorldJobs {
         settings: &WorldSettings,
         viewers: &[(u64, Viewer)],
     ) {
-        self.plan_interest(cx, settings, viewers);
+        {
+            let _span = frame_span!("world.plan");
+            self.plan_interest(cx, settings, viewers);
+        }
         self.process_interest(cx, settings, settings.interest_budget);
     }
 
@@ -514,15 +578,32 @@ impl WorldJobs {
     ) {
         let start = Instant::now();
         let mut steps = 0usize;
-        while let Some(pos) = self.planner.next() {
-            self.refresh_position(cx, settings, pos);
-            steps += 1;
-            if steps >= MIN_INTEREST_STEPS && steps.is_multiple_of(32) && start.elapsed() >= budget
-            {
-                break;
+        {
+            let _span = frame_span!("world.positions");
+            #[cfg(feature = "trace")]
+            let mut timer = StepTimer::new();
+            while let Some(pos) = self.planner.next() {
+                let step = self.refresh_position(cx, settings, pos);
+                #[cfg(feature = "trace")]
+                timer.lap(match step {
+                    Step::Create if cx.known_air(pos.y) => StepTimer::CREATE_AIR,
+                    step => step as usize,
+                });
+                #[cfg(not(feature = "trace"))]
+                let _ = step;
+                steps += 1;
+                if steps >= MIN_INTEREST_STEPS
+                    && steps.is_multiple_of(32)
+                    && start.elapsed() >= budget
+                {
+                    break;
+                }
             }
+            #[cfg(feature = "trace")]
+            timer.report();
         }
         self.interest_steps += steps;
+        let _span = frame_span!("world.priorities");
         self.refresh_priorities(cx, PRIORITY_BATCH);
         while self.scheduler.stale() > 0 && start.elapsed() < budget {
             self.refresh_priorities(cx, PRIORITY_BATCH);
@@ -539,8 +620,13 @@ impl WorldJobs {
 
     /// Brings the slot at `pos` in line with the current viewers: creates it if wanted and
     /// missing, updates its interest, or unloads it (unwanted, unpinned, and either never started
-    /// or outside every keep region).
-    fn refresh_position(&mut self, cx: &mut Ctx<'_>, settings: &WorldSettings, pos: ChunkPos) {
+    /// or outside every keep region). Returns what it did.
+    fn refresh_position(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        settings: &WorldSettings,
+        pos: ChunkPos,
+    ) -> Step {
         let level = self.planner.level(pos);
         let want = level.interest();
         match cx.map.index.get(&pos) {
@@ -554,14 +640,17 @@ impl WorldJobs {
                     // Unwanted data that was never started is dropped right away; anything else
                     // waits for the hysteresis band.
                     self.unload(cx, id);
+                    Step::Unload
                 } else {
                     self.set_interest(cx, id, want | pinned);
+                    Step::Update
                 }
             }
             None if !want.is_empty() => {
                 self.create_slot(cx, settings, pos, want);
+                Step::Create
             }
-            None => {}
+            None => Step::Skip,
         }
     }
 
@@ -853,8 +942,14 @@ impl WorldJobs {
         let start = Instant::now();
         let budget = settings.job_budget;
         loop {
-            let collected = self.drain_results(cx, start, budget);
-            let started = self.dispatch_until(cx, start, budget);
+            let collected = {
+                let _span = frame_span!("world.drain");
+                self.drain_results(cx, start, budget)
+            };
+            let started = {
+                let _span = frame_span!("world.dispatch");
+                self.dispatch_until(cx, start, budget)
+            };
             if (collected == 0 && started == 0) || start.elapsed() >= budget {
                 break;
             }

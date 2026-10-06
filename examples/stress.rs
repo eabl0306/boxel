@@ -28,9 +28,12 @@
 mod forest;
 #[path = "stress/report.rs"]
 mod report;
+#[path = "stress/spans.rs"]
+mod spans;
 
 use boxel::app::{TaskPoolOptions, TaskPoolThreadAssignmentPolicy};
 use boxel::gfx::{CLI_HELP, PresentModePref};
+use boxel::log::span_times::{self, SpanFrame, SpanTimes};
 use boxel::prelude::*;
 use boxel::render::GpuFailed;
 use boxel::voxel::{BlockPos, BlockRegistry, ChunkData, ChunkKey, ChunkPos, MAX_BLOCK_COORD};
@@ -39,6 +42,7 @@ use boxel::world::{ChunkId, ChunkMeshEvent, WorldStats, WorldSystems};
 use boxel::worldgen::TerrainSettings;
 use forest::Forest;
 use report::{FrameRecord, RecordLog, RunInfo, Summary};
+use spans::{SpanLog, SpanRow};
 use std::collections::HashMap;
 use std::f64::consts::TAU;
 use std::ops::RangeInclusive;
@@ -70,6 +74,9 @@ usage: stress [--scenario static|fly|spin] [GPU options] [options]
   --no-trees          plain TerrainGenerator (no trees)
   --vertical-radius N chunks loaded above and below the camera (default 8)
   --fixed-height      load only the generator's layers, like M0 (for comparisons with older runs)
+  --spans             busy time per system and span in each frame, added to the summary (needs
+                      a build with --features trace)
+  --spans-csv PATH    also write it per frame (implies --spans)
   --help              this text
 The run presents with --present immediate unless --present or BOXEL_PRESENT is given.
 exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 output not written, 4 timeout";
@@ -130,6 +137,8 @@ struct Options {
     trees: bool,
     vertical_radius: u32,
     fixed_height: bool,
+    spans: bool,
+    spans_csv: Option<PathBuf>,
 }
 
 /// `Ok(None)` for `--help`.
@@ -151,6 +160,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         trees: true,
         vertical_radius: ChunkViewer::DEFAULT_VERTICAL_RADIUS,
         fixed_height: false,
+        spans: false,
+        spans_csv: None,
     };
     let mut timeout = None;
     let mut it = args.iter();
@@ -242,6 +253,11 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                     .ok_or_else(|| format!("{flag}: {r} is not in 0..=64"))?;
             }
             "--fixed-height" => o.fixed_height = true,
+            "--spans" => o.spans = true,
+            "--spans-csv" => {
+                o.spans_csv = Some(PathBuf::from(value()?));
+                o.spans = true;
+            }
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
@@ -376,6 +392,28 @@ struct Bench {
     exiting: bool,
 }
 
+/// `--spans`: the span times of each measured frame, next to its [`FrameRecord`].
+#[derive(Resource)]
+struct SpanRecorder {
+    times: SpanTimes,
+    /// The layer's last closed frame (reused buffer).
+    frame: SpanFrame,
+    /// `frame.seq` seen by the previous `record`.
+    last_seq: u64,
+    log: SpanLog,
+}
+
+impl SpanRecorder {
+    fn new(times: SpanTimes) -> Self {
+        Self {
+            times,
+            frame: SpanFrame::default(),
+            last_seq: 0,
+            log: SpanLog::default(),
+        }
+    }
+}
+
 /// Turns the counters of each measured frame into a [`FrameRecord`].
 #[derive(Resource)]
 struct Recorder {
@@ -443,14 +481,19 @@ fn gpu_failed(
 
 /// `PreUpdate`: completes the record of the previous frame. Its `Time::real_delta` (measured
 /// at this frame's `First`) spans that whole frame; `WorldStats` (its `Last`), `RenderInfo` (its
-/// `Render`) and the mesh messages (its `Update`) belong to it too.
+/// `Render`) and the mesh messages (its `Update`) belong to it too. With `--spans`, so do the
+/// span times the layer closed when this frame's `Main` schedule started.
 fn record(
     time: Res<Time>,
     stats: Res<WorldStats>,
     info: Res<RenderInfo>,
     mut events: MessageReader<ChunkMeshEvent>,
     mut rec: ResMut<Recorder>,
+    mut spans: Option<ResMut<SpanRecorder>>,
 ) {
+    if let Some(spans) = spans.as_deref_mut() {
+        spans.times.last_frame(&mut spans.frame);
+    }
     let (mut meshes, mut removed, mut upload_quads) = (0u32, 0u32, 0u64);
     for event in events.read() {
         match event {
@@ -493,6 +536,15 @@ fn record(
             draws: info.draws,
         };
         rec.log.push(record);
+        if let Some(spans) = spans.as_deref_mut() {
+            if spans.frame.seq != spans.last_seq + 1 {
+                spans.log.unmatched += 1;
+            }
+            spans.log.push(SpanRow::from_frame(&spans.frame));
+        }
+    }
+    if let Some(spans) = spans.as_deref_mut() {
+        spans.last_seq = spans.frame.seq;
     }
     rec.last_generated = generated;
     rec.last_jobs = jobs;
@@ -512,10 +564,12 @@ fn drive(
     stats: Res<WorldStats>,
     mut cameras: Query<&mut Transform, With<Camera>>,
     mut exit: MessageWriter<AppExit>,
+    spans: Option<Res<SpanRecorder>>,
 ) {
     if bench.exiting {
         return;
     }
+    let spans = spans.as_deref();
     let now = time.last_update().unwrap_or_else(Instant::now);
     let elapsed = now.saturating_duration_since(bench.started);
     if elapsed > bench.options.timeout {
@@ -527,7 +581,7 @@ fn drive(
             ),
             Phase::CatchUp { .. } => {
                 // The measurement is complete; only the catch-up time is missing.
-                bench.finish(&rec, &info, None, &mut exit);
+                bench.finish(&rec, &info, spans, None, &mut exit);
                 return;
             }
             _ => eprintln!(
@@ -585,9 +639,10 @@ fn drive(
             let streak = if settled { streak + 1 } else { 0 };
             bench.phase = Phase::CatchUp { since, streak };
             if streak >= SETTLED_FRAMES {
-                bench.finish(&rec, &info, Some(now.duration_since(since)), &mut exit);
+                let catch_up = Some(now.duration_since(since));
+                bench.finish(&rec, &info, spans, catch_up, &mut exit);
             } else if now.duration_since(since) > CATCH_UP_LIMIT {
-                bench.finish(&rec, &info, None, &mut exit);
+                bench.finish(&rec, &info, spans, None, &mut exit);
             }
         }
         Phase::Warmup { .. } | Phase::Done => {}
@@ -631,6 +686,7 @@ impl Bench {
         &mut self,
         rec: &Recorder,
         info: &RenderInfo,
+        spans: Option<&SpanRecorder>,
         catch_up: Option<Duration>,
         exit: &mut MessageWriter<AppExit>,
     ) {
@@ -659,8 +715,21 @@ impl Bench {
             eprintln!("stress: {e}");
             code = 3;
         }
-        if let Some(path) = &self.options.summary
-            && let Err(e) = write_file(path, &report::markdown(&self.info, &summary))
+        let span_keys = spans.map(|s| s.times.keys()).unwrap_or_default();
+        if let Some(path) = &self.options.summary {
+            let mut text = report::markdown(&self.info, &summary);
+            if let Some(spans) = spans {
+                // Before the data block, with the other tables for people.
+                let at = text.find(report::DATA_HEADING).unwrap_or(text.len());
+                text.insert_str(at, &spans::markdown(&records, &spans.log, &span_keys));
+            }
+            if let Err(e) = write_file(path, &text) {
+                eprintln!("stress: {e}");
+                code = 3;
+            }
+        }
+        if let (Some(path), Some(spans)) = (&self.options.spans_csv, spans)
+            && let Err(e) = write_file(path, &spans::csv(&records, &spans.log, &span_keys))
         {
             eprintln!("stress: {e}");
             code = 3;
@@ -783,6 +852,23 @@ fn main() -> AppExit {
     if cfg!(debug_assertions) {
         eprintln!("stress: debug build: the numbers are not comparable, use --release");
     }
+    let times = if options.spans {
+        if !cfg!(feature = "trace") {
+            eprintln!(
+                "stress: --spans needs the system spans: build with --features trace\n\n{USAGE}"
+            );
+            return AppExit::from_code(1);
+        }
+        // Installed before the app: LogPlugin then keeps this subscriber.
+        let (layer, times) = span_times::span_times(span_times::MAIN_SCHEDULE);
+        if let Err(e) = boxel::log::init_logging_with_layer(boxel::log::DEFAULT_FILTER, layer) {
+            eprintln!("stress: --spans: {e}");
+            return AppExit::from_code(1);
+        }
+        Some(times)
+    } else {
+        None
+    };
     let _watchdog = spawn_watchdog(options.timeout.saturating_add(WATCHDOG_GRACE));
 
     // Uncapped: every update renders (offscreen while the window is covered or between
@@ -888,6 +974,9 @@ fn main() -> AppExit {
         Recorder::new(generated, jobs_done),
         Instant::now(),
     );
+    if let Some(times) = times {
+        app.insert_resource(SpanRecorder::new(times));
+    }
     // The bench measures the uncapped loop (the engine default is 144 fps).
     app.insert_resource(FrameLimit::UNLIMITED);
     app.run()
@@ -965,6 +1054,19 @@ mod tests {
             (o.timeout, o.scenario),
             (Duration::from_secs(30), Scenario::Spin)
         );
+    }
+
+    #[test]
+    fn span_flags() {
+        let o = parse(&["--spans"]).expect("valid").expect("not help");
+        assert!(o.spans);
+        assert_eq!(o.spans_csv, None);
+        let o = parse(&["--spans-csv", "s.csv"])
+            .expect("valid")
+            .expect("not help");
+        assert!(o.spans, "--spans-csv implies --spans");
+        assert_eq!(o.spans_csv.as_deref(), Some(Path::new("s.csv")));
+        assert!(!parse(&[]).expect("valid").expect("not help").spans);
     }
 
     #[test]

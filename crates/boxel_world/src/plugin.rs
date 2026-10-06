@@ -365,6 +365,7 @@ fn publish_stats(
     board: Option<ResMut<DiagnosticsBoard>>,
 ) {
     let mut now = if map.is_changed() {
+        let _span = frame_span!("world.stats_walk");
         map.stats()
     } else {
         *stats

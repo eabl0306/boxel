@@ -1,12 +1,17 @@
 //! Logging for boxel. One global `tracing` subscriber: fmt output filtered by `RUST_LOG`
 //! (falls back to [`DEFAULT_FILTER`]), `log` records bridged (wgpu, naga and the ECS use `log`),
 //! and with feature `tracy` a Tracy layer plus `profiling/profile-with-tracing` so wgpu's internal
-//! scopes reach Tracy.
+//! scopes reach Tracy. [`init_logging_with_layer`] adds one more layer, such as
+//! [`span_times::SpanTimesLayer`] (busy time per span and frame).
+
+pub mod span_times;
 
 use boxel_app::{App, Plugin};
 use std::io::IsTerminal;
+use tracing::Subscriber;
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::layer::{Layer, SubscriberExt};
+use tracing_subscriber::registry::{LookupSpan, Registry};
 use tracing_subscriber::util::SubscriberInitExt;
 
 /// Default filter when `RUST_LOG` is unset.
@@ -38,6 +43,29 @@ pub enum LogInitError {
 /// with a warning once the subscriber is up. `AlreadySet` also covers a `log` logger installed
 /// by someone else (the `log` bridge cannot be set twice).
 pub fn init_logging(filter: &str) -> Result<(), LogInitError> {
+    let (env_filter, ignored_rust_log) = env_filter(filter)?;
+    install(tracing_subscriber::registry(), env_filter)?;
+    warn_ignored(ignored_rust_log.as_deref(), filter);
+    Ok(())
+}
+
+/// [`init_logging`] plus `layer`, which sees every span and event the filter lets through
+/// (`RUST_LOG` or `filter`, as in [`init_logging`]). For tools that measure the app, such as
+/// [`span_times::SpanTimesLayer`]. Call it before `LogPlugin` runs: the plugin keeps the
+/// subscriber already set.
+pub fn init_logging_with_layer<L>(filter: &str, layer: L) -> Result<(), LogInitError>
+where
+    L: Layer<Registry> + Send + Sync + 'static,
+{
+    let (env_filter, ignored_rust_log) = env_filter(filter)?;
+    install(tracing_subscriber::registry().with(layer), env_filter)?;
+    warn_ignored(ignored_rust_log.as_deref(), filter);
+    Ok(())
+}
+
+/// `RUST_LOG` if it is set and valid, else `filter`; also the parse error of an ignored
+/// `RUST_LOG`.
+fn env_filter(filter: &str) -> Result<(EnvFilter, Option<String>), LogInitError> {
     // RUST_LOG wins when it is set (non-empty) and valid; otherwise `filter` is used.
     let mut ignored_rust_log = None;
     let from_env = match std::env::var(EnvFilter::DEFAULT_ENV) {
@@ -55,21 +83,27 @@ pub fn init_logging(filter: &str) -> Result<(), LogInitError> {
         None => EnvFilter::try_new(filter)
             .map_err(|error| LogInitError::BadFilter(format!("\"{filter}\" ({error})")))?,
     };
+    Ok((env_filter, ignored_rust_log))
+}
 
+/// Sets `base` with the filter, the fmt layer (and Tracy) as the global subscriber.
+fn install<S>(base: S, env_filter: EnvFilter) -> Result<(), LogInitError>
+where
+    S: Subscriber + for<'a> LookupSpan<'a> + Send + Sync + 'static,
+{
     let fmt = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
         .with_ansi(std::io::stderr().is_terminal());
-    let subscriber = tracing_subscriber::registry().with(env_filter).with(fmt);
+    let subscriber = base.with(env_filter).with(fmt);
     #[cfg(feature = "tracy")]
     let subscriber = subscriber.with(tracing_tracy::TracyLayer::default());
-    subscriber
-        .try_init()
-        .map_err(|_| LogInitError::AlreadySet)?;
+    subscriber.try_init().map_err(|_| LogInitError::AlreadySet)
+}
 
+fn warn_ignored(ignored_rust_log: Option<&str>, filter: &str) {
     if let Some(error) = ignored_rust_log {
         tracing::warn!("ignoring invalid RUST_LOG ({error}); using the filter \"{filter}\"");
     }
-    Ok(())
 }
 
 /// Calls [`init_logging`] in `build`; `AlreadySet` is reported at debug level, not as an error.

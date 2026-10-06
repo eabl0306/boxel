@@ -1156,9 +1156,11 @@ fn prepare(
     for op in frame.meshes.drain(..) {
         let result = match op {
             MeshOp::Upsert { id, origin, mesh } => {
+                let _span = frame_span!("render.upsert");
                 ready.renderer.upsert_chunk(queue, id, origin, &mesh)
             }
             MeshOp::Remove { id } => {
+                let _span = frame_span!("render.remove");
                 ready.renderer.remove_chunk(queue, id);
                 Ok(())
             }
@@ -1201,29 +1203,41 @@ fn draw(
     };
     let gate_open = frame.window.frame_ready && !frame.window.occluded;
     if gate_open && let Some(surface) = ready.surface.as_ref() {
-        match acquire_frame(surface) {
+        let acquired = {
+            let _span = frame_span!("render.acquire");
+            acquire_frame(surface)
+        };
+        match acquired {
             FrameAcquire::Frame {
                 texture,
                 suboptimal,
             } => {
-                let target = texture
-                    .texture
-                    .create_view(&wgpu::TextureViewDescriptor::default());
-                let mut encoder =
+                let commands = {
+                    let _span = frame_span!("render.encode");
+                    let target = texture
+                        .texture
+                        .create_view(&wgpu::TextureViewDescriptor::default());
+                    let mut encoder =
+                        ready
+                            .ctx
+                            .device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("boxel frame"),
+                            });
                     ready
-                        .ctx
-                        .device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("boxel frame"),
-                        });
-                ready
-                    .renderer
-                    .render(&ready.ctx.device, &ready.ctx.queue, &mut encoder, &view);
-                ready
-                    .overlay
-                    .encode(&mut encoder, ready.renderer.main_color_view());
-                ready.renderer.blit(&mut encoder, &target);
-                ready.ctx.queue.submit([encoder.finish()]);
+                        .renderer
+                        .render(&ready.ctx.device, &ready.ctx.queue, &mut encoder, &view);
+                    ready
+                        .overlay
+                        .encode(&mut encoder, ready.renderer.main_color_view());
+                    ready.renderer.blit(&mut encoder, &target);
+                    encoder.finish()
+                };
+                {
+                    let _span = frame_span!("render.submit");
+                    ready.ctx.queue.submit([commands]);
+                }
+                let _span = frame_span!("render.present");
                 if let Some(window) = window.as_deref() {
                     window.window.pre_present_notify();
                 }
@@ -1259,27 +1273,38 @@ fn draw(
 /// Renders into the main color target only (no acquire, no present), keeping at most
 /// `MAX_OFFSCREEN_IN_FLIGHT` such frames queued on the GPU.
 fn render_offscreen(ready: &mut ReadyGpu, view: &ViewParams) {
-    while ready.offscreen.len() >= MAX_OFFSCREEN_IN_FLIGHT {
-        if let Some(oldest) = ready.offscreen.pop_front() {
-            let _ = ready.ctx.device.poll(wgpu::PollType::Wait {
-                submission_index: Some(oldest),
-                timeout: Some(OFFSCREEN_WAIT),
-            });
+    {
+        let _span = frame_span!("render.offscreen_wait");
+        while ready.offscreen.len() >= MAX_OFFSCREEN_IN_FLIGHT {
+            if let Some(oldest) = ready.offscreen.pop_front() {
+                let _ = ready.ctx.device.poll(wgpu::PollType::Wait {
+                    submission_index: Some(oldest),
+                    timeout: Some(OFFSCREEN_WAIT),
+                });
+            }
         }
     }
-    let mut encoder = ready
-        .ctx
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("boxel offscreen frame"),
-        });
-    ready
-        .renderer
-        .render(&ready.ctx.device, &ready.ctx.queue, &mut encoder, view);
-    ready
-        .overlay
-        .encode(&mut encoder, ready.renderer.main_color_view());
-    let index = ready.ctx.queue.submit([encoder.finish()]);
+    let commands = {
+        let _span = frame_span!("render.encode");
+        let mut encoder =
+            ready
+                .ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("boxel offscreen frame"),
+                });
+        ready
+            .renderer
+            .render(&ready.ctx.device, &ready.ctx.queue, &mut encoder, view);
+        ready
+            .overlay
+            .encode(&mut encoder, ready.renderer.main_color_view());
+        encoder.finish()
+    };
+    let index = {
+        let _span = frame_span!("render.submit");
+        ready.ctx.queue.submit([commands])
+    };
     ready.offscreen.push_back(index);
     ready.frames += 1;
 }

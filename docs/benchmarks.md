@@ -99,6 +99,38 @@ Una fila por frame: `frame_ms`, `crossed` (cruzó un borde), `generated`, `meshe
 `queued_jobs`, `in_flight`, los contadores de `WorldStats` y la posición de la cámara. Sirve para
 graficar o para buscar qué pasó en un tirón puntual.
 
+## Tiempo por sistema (--spans)
+
+Para saber en qué se va el tiempo de un frame, sistema por sistema:
+
+```bash
+cargo run --release --features trace --example stress -- --scenario fly --speed 64 \
+    --radius 32 --summary out.md --spans --spans-csv out-spans.csv
+```
+
+Con `--features trace` cada sistema del ECS abre un span de `tracing`, y el mundo y el render
+agregan spans propios por dentro (`world.positions`, `world.stats_walk`, `world.drain`,
+`world.dispatch`, `render.upsert`, `render.submit`...). `world.step create`, `unload`, `update`,
+etc. reparten el tiempo de `world.positions` por tipo de paso. `--spans` suma el tiempo de cada
+uno en cada frame y agrega al resumen la sección "Time per system":
+
+- media, p99 y máximo por sistema en tres grupos de frames: cruce de borde, puesta al día (los
+  frames después del cruce hasta que el mundo termina) y el resto;
+- el total por cruce de borde, sumando el cruce y su puesta al día;
+- los 10 peores frames de cruce, con lo que más tardó en cada uno.
+
+`--spans-csv` deja lo mismo frame a frame. Para comparar dos versiones, las dos tienen que estar
+compiladas con `--features trace`, porque los spans también cuestan tiempo: en radio 32, cerca de
+un 1 % de fps, y unos 50 ns más por posición en `world.positions`.
+
+Detalles:
+
+- Sin `--features trace` el flag da error y los spans no existen en el binario. Con la feature
+  pero sin `--spans`, los spans igual cuestan (los recibe el log), solo que nadie los suma.
+- Los sistemas que corren en paralelo suman más que el frame. Las filas `schedule` son tiempo
+  real en el hilo principal, y `outside Main` es lo que pasa fuera de `App::update` (winit).
+- `RUST_LOG` tiene que dejar pasar spans de nivel `info`. El filtro por defecto lo hace.
+
 ## Para juegos
 
 Cualquier juego con `FrameStatsPlugin` (está en `DefaultPlugins`) tiene el recurso
