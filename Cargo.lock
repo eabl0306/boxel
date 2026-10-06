@@ -431,10 +431,12 @@ name = "boxel_mesh"
 version = "0.1.0-dev"
 dependencies = [
  "binary-greedy-meshing",
+ "boxel_light",
  "boxel_voxel",
  "boxel_worldgen",
  "bytemuck",
  "criterion",
+ "foldhash",
  "proptest",
 ]
 

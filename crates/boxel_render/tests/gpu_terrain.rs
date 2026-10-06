@@ -28,7 +28,7 @@ use boxel_gfx::{
     run_in_error_scopes, submit_and_wait, tier_request,
 };
 use boxel_math::{Aabb, DVec3, I64Vec3, UVec2, Vec3};
-use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, Mesher};
+use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher};
 use boxel_render::{RendererConfig, ViewParams, VoxelRenderer};
 use boxel_transform::Transform;
 use boxel_voxel::{BlockRegistry, ChunkData, ChunkKey, ChunkPos, NEIGHBOR_OFFSETS};
@@ -198,11 +198,13 @@ fn terrain_scene() -> Scene {
         {
             continue;
         }
+        // No light (open sky everywhere) and the default AO policy: AO on every face.
         let input = MeshInput {
             center,
             neighbors: std::array::from_fn(|i| data.get(&pos.offset(NEIGHBOR_OFFSETS[i]))),
+            light: None,
         };
-        let mesh = mesher.mesh_chunk(&input, &materials);
+        let mesh = mesher.mesh_chunk(&input, &materials, MeshOptions::default());
         if !mesh.is_empty() {
             meshes.push((pos, Arc::new(mesh)));
         }

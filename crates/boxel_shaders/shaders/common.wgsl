@@ -1,8 +1,9 @@
 // boxel: shared voxel shader code (all tiers). Prepended to voxel_pull.wgsl, voxel_instanced.wgsl and cull.wgsl.
 //
 // PackedQuad = vec2<u32>(geo, mat), 8 bytes, identical bytes on every tier.
-//   geo: x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | reserved:4
-//   mat: layer:12 | ao:8 (2 bits per corner, 3 = unoccluded) | sky:4 | block:4 | flags:4
+//   geo: x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | flags:4 (none defined yet)
+//   mat: layer:12 | ao:8 (2 bits per corner, 3 = unoccluded) | light:12 (index into the chunk's
+//        light palette: the sky and RGB light of the 4 corners; not read before light phase P4)
 // face: 0=+Y 1=-Y 2=+X 3=-X 4=+Z 5=-Z  (u,v axes: ±Y -> (X,Z), ±X -> (Z,Y), ±Z -> (X,Y))
 //
 // RULES (enforced by boxel_shaders tests):
@@ -26,11 +27,11 @@ const GEO_Z_SHIFT: u32 = 10u;
 const GEO_W_SHIFT: u32 = 15u;
 const GEO_H_SHIFT: u32 = 20u;
 const GEO_FACE_SHIFT: u32 = 25u;
+const GEO_FLAGS_SHIFT: u32 = 28u;
 const MAT_LAYER_MASK: u32 = 0xFFFu;
 const MAT_AO_SHIFT: u32 = 12u;
-const MAT_SKY_SHIFT: u32 = 20u;
-const MAT_BLOCK_SHIFT: u32 = 24u;
-const MAT_FLAGS_SHIFT: u32 = 28u;
+const MAT_LIGHT_SHIFT: u32 = 20u;
+const MAT_LIGHT_MASK: u32 = 0xFFFu;
 const CHUNK_SIZE: f32 = 32.0;
 
 struct View {
@@ -106,9 +107,8 @@ fn decode_quad(q: vec2<u32>, corner_in: u32) -> Decoded {
   o.face = f;
   o.layer = mat & MAT_LAYER_MASK;
   let ao = f32((mat >> (MAT_AO_SHIFT + 2u * c)) & 3u) / 3.0;
-  let sky = f32((mat >> MAT_SKY_SHIFT) & 15u) / 15.0;
-  let blk = f32((mat >> MAT_BLOCK_SHIFT) & 15u) / 15.0;
-  o.shade = face_shade(f) * mix(0.45, 1.0, ao) * (max(sky, blk) * 0.85 + 0.15);
+  // Light (the palette entry at MAT_LIGHT_SHIFT) is not read yet: every quad is lit as open sky.
+  o.shade = face_shade(f) * mix(0.45, 1.0, ao);
   return o;
 }
 

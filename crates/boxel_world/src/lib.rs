@@ -11,8 +11,9 @@
 //!    slabs entering and leaving), then create, update and unload slots within
 //!    [`WorldSettings::interest_budget`], nearest first; refresh the stale job priorities a batch
 //!    at a time.
-//! 2. `Edits`: apply [`EditQueue`] (copy-on-write, version bump, remesh center + touched face
-//!    neighbors, bump their `epoch`).
+//! 2. `Edits`: apply [`EditQueue`] (copy-on-write, version bump, remesh the center and every
+//!    neighbor whose padded region holds a changed voxel, edges and corners included for AO, and
+//!    bump their `epoch`).
 //! 3. `Dispatch`: collect finished jobs, then pop jobs by priority while in-flight < cap and run
 //!    them on the `AsyncComputeTaskPool` through a [`jobs::JobExecutor`] (stale priorities that
 //!    may come first are refreshed on the way, so jobs start nearest first); repeated while

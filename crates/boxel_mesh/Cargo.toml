@@ -9,13 +9,19 @@ repository.workspace = true
 
 [dependencies]
 boxel_voxel.workspace = true
-binary-greedy-meshing.workspace = true
+# `PaddedLight`, the light the mesher bakes into the quads.
+boxel_light.workspace = true
 bytemuck.workspace = true
+foldhash.workspace = true
 
 [dev-dependencies]
+# The merge is an in-repo fork (src/greedy.rs); the original is the reference of the
+# byte-for-byte regression test.
+binary-greedy-meshing.workspace = true
 proptest.workspace = true
 criterion.workspace = true
-# The `gather_mesh/cave` bench meshes a chunk of the overworld generator.
+# The `gather_mesh/cave` and `gather_mesh/surface` benches mesh chunks of the overworld
+# generator (the surface one lit by `boxel_light`).
 boxel_worldgen.workspace = true
 
 # Criterion flags (--quick, --save-baseline) must not reach the lib unit-test harness.

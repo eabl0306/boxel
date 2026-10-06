@@ -1,12 +1,16 @@
-//! Property tests: the mesher against the brute-force oracle on random padded chunks, and
-//! `gather` against a per-voxel reference on random chunks with random neighbors.
+//! Property tests: the mesher against the brute-force oracles on random padded chunks (the
+//! visible faces, and the AO and corner light of each one under random light and AO policies),
+//! and `gather` against a per-voxel reference on random chunks with random neighbors.
 mod common;
 
-use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, Mesher, PaddedChunk, VoxelClass};
+use boxel_mesh::{
+    AoPolicy, ChunkMesh, LightQuantization, MaterialTable, MeshInput, MeshOptions, Mesher,
+    PaddedChunk, VoxelClass,
+};
 use boxel_voxel::{BlockState, CHUNK_VOLUME, ChunkData, LocalPos};
 use common::{
-    CUTOUT, NO_GEOMETRY, OPAQUE, Repr, Rng, TRANSLUCENT, chunk_repr, neighbor_slot, set_material,
-    split, test_table, verify_mesh,
+    CUTOUT, Fill, LIGHT_FILLS, LightFill, NO_GEOMETRY, OPAQUE, Repr, Rng, TRANSLUCENT, chunk_repr,
+    neighbor_slot, random_light, random_padded, split, test_table, verify_mesh, verify_shading,
 };
 use proptest::prelude::*;
 
@@ -21,91 +25,6 @@ const MATERIALS: [u16; 8] = [
     TRANSLUCENT[1],
     NO_GEOMETRY,
 ];
-
-/// How a random padded chunk is filled.
-#[derive(Clone, Copy, Debug)]
-enum Fill {
-    /// Independent voxels with probability `density` percent.
-    Noise,
-    /// Overlapping random boxes (large greedy merges, partial overlaps).
-    Boxes,
-    /// Layered heightmap with a liquid level (terrain-like surfaces and borders).
-    Terrain,
-    /// Periodic lattice `(a x + b y + c z) mod m < k` (checkerboards, stripes, slopes).
-    Lattice,
-}
-
-/// Fills the whole padded chunk (inner voxels and the 1-voxel border) from the parameters.
-fn random_padded(
-    table: &MaterialTable,
-    fill: Fill,
-    seed: u64,
-    density: u32,
-    palette: &[u16],
-) -> PaddedChunk {
-    let mut rng = Rng::new(seed);
-    let mut padded = PaddedChunk::new();
-    let all =
-        || (-1..=32).flat_map(|y| (-1..=32).flat_map(move |x| (-1..=32).map(move |z| [x, y, z])));
-    match fill {
-        Fill::Noise => {
-            for p in all() {
-                if rng.below(100) < u64::from(density) {
-                    let material = rng.pick(palette);
-                    set_material(&mut padded, table, p, material);
-                }
-            }
-        }
-        Fill::Boxes => {
-            for _ in 0..1 + density / 4 {
-                let material = rng.pick(palette);
-                let lo = [0; 3].map(|_| rng.range(-1, 32));
-                let size = [0; 3].map(|_| rng.range(1, 20));
-                for y in lo[1]..(lo[1] + size[1]).min(33) {
-                    for x in lo[0]..(lo[0] + size[0]).min(33) {
-                        for z in lo[2]..(lo[2] + size[2]).min(33) {
-                            set_material(&mut padded, table, [x, y, z], material);
-                        }
-                    }
-                }
-            }
-        }
-        Fill::Terrain => {
-            let base = density as i32 * 34 / 100 - 1;
-            let (fx, fz) = (rng.range(1, 9) as f32 / 37.0, rng.range(1, 9) as f32 / 29.0);
-            let amplitude = rng.range(0, 12) as f32;
-            let sea = rng.range(-1, 32);
-            let layer = |depth: i32| palette[(depth.clamp(0, 3) as usize).min(palette.len() - 1)];
-            for x in -1..=32 {
-                for z in -1..=32 {
-                    let h =
-                        base + (amplitude * ((x as f32 * fx).sin() + (z as f32 * fz).cos())) as i32;
-                    for y in -1..=32 {
-                        if y <= h {
-                            set_material(&mut padded, table, [x, y, z], layer(h - y));
-                        } else if y <= sea {
-                            let liquid = palette[palette.len() - 1];
-                            set_material(&mut padded, table, [x, y, z], liquid);
-                        }
-                    }
-                }
-            }
-        }
-        Fill::Lattice => {
-            let (a, b, c) = (rng.range(0, 3), rng.range(0, 3), rng.range(0, 3));
-            let m = rng.range(2, 5);
-            let k = rng.range(1, m - 1);
-            for p in all() {
-                let phase = (a * p[0] + b * p[1] + c * p[2]).rem_euclid(m);
-                if phase < k {
-                    let material = palette[phase as usize % palette.len()];
-                    set_material(&mut padded, table, p, material);
-                }
-            }
-        }
-    }
-    padded
-}
 
 fn fill_strategy() -> impl Strategy<Value = Fill> {
     prop_oneof![
@@ -127,6 +46,18 @@ enum ChunkKind {
     Direct,
     /// Random voxels, `Paletted::Packed`.
     Packed,
+}
+
+fn light_strategy() -> impl Strategy<Value = LightFill> {
+    proptest::sample::select(LIGHT_FILLS.to_vec())
+}
+
+fn policy_strategy() -> impl Strategy<Value = AoPolicy> {
+    prop_oneof![
+        Just(AoPolicy::Off),
+        Just(AoPolicy::Baked),
+        Just(AoPolicy::BakedLitOnly),
+    ]
 }
 
 fn kind_strategy() -> impl Strategy<Value = ChunkKind> {
@@ -210,8 +141,74 @@ proptest! {
         let table = test_table();
         let padded = random_padded(&table, fill, seed, density, &palette);
         let mut out = ChunkMesh::default();
-        Mesher::new().mesh(&padded, &table, &mut out);
+        Mesher::new().mesh(&padded, None, &table, MeshOptions::default(), &mut out);
         verify_mesh(&padded, &table, &out);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(160))]
+
+    /// Under any light and AO policy: the geometry still equals the oracle, and each quad,
+    /// expanded to unit faces and decoded through the palette, equals
+    /// `reference_face_shading` (at the mesh's quantization level). Meshing again with a used
+    /// mesher gives the same mesh, palette order and hash included.
+    #[test]
+    fn shading_matches_oracle(
+        fill in fill_strategy(),
+        light in light_strategy(),
+        policy in policy_strategy(),
+        seed in any::<u64>(),
+        density in 0u32..=100,
+        palette in proptest::collection::vec(proptest::sample::select(MATERIALS.to_vec()), 1..=4),
+    ) {
+        let table = test_table();
+        let padded = random_padded(&table, fill, seed, density, &palette);
+        let light = random_light(light, seed);
+        let options = MeshOptions::with_ao(policy);
+        let mut mesher = Mesher::new();
+        let mut out = ChunkMesh::default();
+        mesher.mesh(&padded, light.as_ref(), &table, options, &mut out);
+        verify_mesh(&padded, &table, &out);
+        verify_shading(&padded, light.as_ref(), policy, &out);
+        prop_assert_eq!(out.hash, out.compute_hash());
+
+        // Reuse after another chunk (scratch, palette and key table state).
+        let other = random_padded(&table, Fill::Noise, seed ^ 1, 50, &palette);
+        let mut scratch = ChunkMesh::default();
+        mesher.mesh(&other, light.as_ref(), &table, options, &mut scratch);
+        let mut again = ChunkMesh::default();
+        mesher.mesh(&padded, light.as_ref(), &table, options, &mut again);
+        prop_assert_eq!(&again, &out);
+    }
+}
+
+/// The palette overflow fallback, forced: block channels in a 12..=15 band overflow the exact
+/// palette but fit at 3 bits; noise overflows that too and goes flat. Both still match the
+/// oracle at their level.
+#[test]
+fn palette_overflow_requantizes() {
+    let table = test_table();
+    // Sparse stone: tens of thousands of visible faces, most of them with 4 open front cells.
+    let padded = random_padded(&table, Fill::Noise, 3, 20, &[OPAQUE[0]]);
+    for (fill, level) in [
+        (LightFill::Band, LightQuantization::Block3),
+        (LightFill::Noise, LightQuantization::Flat),
+    ] {
+        for policy in [AoPolicy::Off, AoPolicy::BakedLitOnly] {
+            let light = random_light(fill, 7);
+            let mut out = ChunkMesh::default();
+            Mesher::new().mesh(
+                &padded,
+                light.as_ref(),
+                &table,
+                MeshOptions::with_ao(policy),
+                &mut out,
+            );
+            assert_eq!(out.light_quantization, level, "{fill:?} {policy:?}");
+            verify_mesh(&padded, &table, &out);
+            verify_shading(&padded, light.as_ref(), policy, &out);
+        }
     }
 }
 
@@ -238,6 +235,7 @@ proptest! {
         let input = MeshInput {
             center: &center,
             neighbors: std::array::from_fn(|i| neighbors[i].as_ref()),
+            light: None,
         };
         let mut mesher = Mesher::new();
         let mut padded = PaddedChunk::new();
@@ -247,9 +245,10 @@ proptest! {
         prop_assert!(padded.opaque == expected.opaque, "opaque masks differ");
         prop_assert!(padded.transparent == expected.transparent, "transparent masks differ");
 
+        let options = MeshOptions::default();
         let mut out = ChunkMesh::default();
-        mesher.mesh(&padded, &table, &mut out);
+        mesher.mesh(&padded, None, &table, options, &mut out);
         verify_mesh(&padded, &table, &out);
-        prop_assert_eq!(mesher.mesh_chunk(&input, &table), out);
+        prop_assert_eq!(mesher.mesh_chunk(&input, &table, options), out);
     }
 }

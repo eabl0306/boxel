@@ -27,7 +27,7 @@ use crate::{
     WorldContent, WorldSettings,
 };
 use boxel_ecs::prelude::*;
-use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, Mesher};
+use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher};
 use boxel_voxel::{
     BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, Face, LocalPos, NEIGHBOR_OFFSETS,
     RenderShape, neighbor_index,
@@ -155,12 +155,12 @@ impl Drop for ResultToken {
 }
 
 thread_local! {
-    /// One mesher per worker thread (~210 KiB of scratch, reused across jobs).
+    /// One mesher per worker thread (~0.6 MiB of scratch, reused across jobs).
     static MESHER: RefCell<Mesher> = RefCell::new(Mesher::new());
 }
 
 /// How mesh jobs turn their input into a mesh (a seam for unit tests).
-pub(crate) type MeshFn = fn(&MeshInput<'_>, &MaterialTable) -> ChunkMesh;
+pub(crate) type MeshFn = fn(&MeshInput<'_>, &MaterialTable, MeshOptions) -> ChunkMesh;
 
 /// What [`WorldJobs::refresh_position`] did with one position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,8 +229,24 @@ impl StepTimer {
 pub(crate) fn mesh_with_thread_mesher(
     input: &MeshInput<'_>,
     materials: &MaterialTable,
+    options: MeshOptions,
 ) -> ChunkMesh {
-    MESHER.with_borrow_mut(|mesher| mesher.mesh_chunk(input, materials))
+    MESHER.with_borrow_mut(|mesher| mesher.mesh_chunk(input, materials, options))
+}
+
+/// The neighbors (bit `i` = `NEIGHBOR_OFFSETS[i]`) whose padded region, the chunk and its
+/// 1-voxel border that their mesh reads, contains local voxel `p` of this chunk: up to 7 for a
+/// corner voxel, none for an inner one.
+fn padded_neighbors(p: LocalPos) -> u32 {
+    if p.border_faces() == 0 {
+        return 0;
+    }
+    let reaches = |c: u32, d: i32| d == 0 || (d < 0 && c == 0) || (d > 0 && c == 31);
+    NEIGHBOR_OFFSETS
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| reaches(p.x(), o.x) && reaches(p.y(), o.y) && reaches(p.z(), o.z))
+        .fold(0, |bits, (i, _)| bits | 1 << i)
 }
 
 /// Text of a panic payload.
@@ -407,6 +423,8 @@ pub(crate) struct WorldJobs {
     executor: Arc<dyn JobExecutor>,
     /// Mesh job body (always [`mesh_with_thread_mesher`] outside unit tests).
     pub(crate) mesh_fn: MeshFn,
+    /// Mesher options of new mesh jobs (from `WorldSettings::ao_policy`, every frame).
+    mesh_options: MeshOptions,
     /// Mesh results waiting for the event budget (`scheduler.complete()` already called; their
     /// slots stay `InFlight` until applied, so the world is not settled while any wait).
     pending: VecDeque<MeshedResult>,
@@ -445,6 +463,7 @@ impl WorldJobs {
             rx,
             executor,
             mesh_fn: mesh_with_thread_mesher,
+            mesh_options: MeshOptions::default(),
             pending: VecDeque::new(),
             published: HashSet::default(),
             planner: Planner::default(),
@@ -950,8 +969,10 @@ impl WorldJobs {
     // ---- Edits -------------------------------------------------------------------------------
 
     /// Applies edits grouped by chunk (copy-on-write, `ChunkData::set` bumps the version);
-    /// remeshes each changed chunk and the face neighbors its changed border voxels touch (their
-    /// epoch is bumped), all at priority 0. Edits to chunks that are not `Ready` are dropped.
+    /// remeshes each changed chunk and every neighbor whose padded region (the voxels its mesh
+    /// reads) holds a changed voxel: face neighbors for visibility, and edge and corner
+    /// neighbors too, whose AO and corner light read them (their epoch is bumped). All at
+    /// priority 0. Edits to chunks that are not `Ready` are dropped.
     pub(crate) fn apply_edits(&mut self, cx: &mut Ctx<'_>, edits: Vec<BlockEdit>) {
         let mut by_chunk: BTreeMap<ChunkPos, Vec<(LocalPos, BlockState)>> = BTreeMap::new();
         for edit in edits {
@@ -982,18 +1003,18 @@ impl WorldJobs {
                 continue;
             }
             let data = Arc::make_mut(data);
-            let mut touched = 0u8;
+            let mut touched = 0u32;
             for (local, state) in changes {
                 if data.set(local, state) != state {
-                    touched |= local.border_faces();
+                    touched |= padded_neighbors(local);
                 }
             }
             self.request_remesh(cx, id, 0);
-            for face in Face::ALL {
-                if touched & (1 << face.index()) == 0 {
+            for (i, offset) in NEIGHBOR_OFFSETS.iter().enumerate() {
+                if touched & (1 << i) == 0 {
                     continue;
                 }
-                if let Some(n) = cx.map.id_at(chunk.offset(face.normal())) {
+                if let Some(n) = cx.map.id_at(chunk.offset(*offset)) {
                     let neighbor = &mut cx.map.slots[n];
                     neighbor.epoch = neighbor.epoch.wrapping_add(1);
                     self.request_remesh(cx, n, 0);
@@ -1004,9 +1025,11 @@ impl WorldJobs {
 
     // ---- Jobs --------------------------------------------------------------------------------
 
-    /// Frame bookkeeping before the job step: measures the frame interval and applies the
-    /// in-flight cap (`settings.max_jobs_in_flight`, or the automatic one when it is 0).
+    /// Frame bookkeeping before the job step: measures the frame interval, applies the
+    /// in-flight cap (`settings.max_jobs_in_flight`, or the automatic one when it is 0) and takes
+    /// the mesher options of the jobs it starts.
     pub(crate) fn begin_frame(&mut self, settings: &WorldSettings, now: Instant) {
+        self.mesh_options = MeshOptions::with_ao(settings.ao_policy);
         self.auto_cap.observe_frame(now);
         let cap = match settings.max_jobs_in_flight {
             0 => self.auto_cap.cap(),
@@ -1147,7 +1170,7 @@ impl WorldJobs {
             false,
         );
         let materials = Arc::clone(&cx.content.materials);
-        let mesh_fn = self.mesh_fn;
+        let (mesh_fn, options) = (self.mesh_fn, self.mesh_options);
         spawn_job(
             self.executor.as_ref(),
             &self.tx,
@@ -1155,11 +1178,13 @@ impl WorldJobs {
             JobKind::Mesh,
             cancel,
             move || {
+                // No light yet: open sky everywhere (ADR 0015, phase P3 computes it here).
                 let input = MeshInput {
                     center: &center,
                     neighbors: std::array::from_fn(|i| neighbors[i].as_deref()),
+                    light: None,
                 };
-                let mesh = mesh_fn(&input, &materials);
+                let mesh = mesh_fn(&input, &materials, options);
                 JobMessage::Meshed {
                     id,
                     data_version,

@@ -135,13 +135,13 @@ fn smoke_mesh(registry: &BlockRegistry) -> ChunkMesh {
     let mut bucket_counts = [0; BUCKET_COUNT];
     bucket_counts[Face::PosY.index()] = 1;
     bucket_counts[CUTOUT_BUCKET] = 1;
-    ChunkMesh {
-        quads: vec![
+    ChunkMesh::from_quads(
+        vec![
             PackedQuad::new([0, 0, 0], 32, 32, Face::PosY, layer("boxel:stone")),
             PackedQuad::new([0, 4, 0], 32, 32, Face::PosY, layer("boxel:leaves")),
         ],
         bucket_counts,
-    }
+    )
 }
 
 /// 16x16 render target of the output format.

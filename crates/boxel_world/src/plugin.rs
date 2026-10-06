@@ -5,7 +5,7 @@ use crate::{ChunkId, ChunkMap, WorldStats};
 use boxel_app::{App, Last, Plugin, Update};
 use boxel_diagnostic::DiagnosticsBoard;
 use boxel_ecs::prelude::*;
-use boxel_mesh::{ChunkMesh, MaterialTable};
+use boxel_mesh::{AoPolicy, ChunkMesh, MaterialTable};
 use boxel_tasks::{AsyncComputeTaskPool, TaskPool};
 use boxel_transform::Transform;
 use boxel_voxel::{BlockPos, BlockRegistry, BlockState, ChunkKey, ChunkPos, DimensionId};
@@ -86,6 +86,10 @@ pub struct WorldSettings {
     /// `Some(generator.vertical_chunks())` and a large `ChunkViewer::vertical_radius`, the world
     /// streams like boxel M0 did (every layer of the generator, whatever the viewer's height).
     pub vertical_bounds: Option<RangeInclusive<i64>>,
+    /// Which faces the mesher bakes ambient occlusion into (ADR 0015). The default,
+    /// `BakedLitOnly`, skips faces whose 4 corners are dark. A change applies to the meshes
+    /// built after it. Until the world computes light, every face counts as lit (open sky).
+    pub ao_policy: AoPolicy,
 }
 
 impl Default for WorldSettings {
@@ -98,6 +102,7 @@ impl Default for WorldSettings {
             max_mesh_events_per_frame: 512,
             unload_hysteresis: 2,
             vertical_bounds: None,
+            ao_policy: AoPolicy::default(),
         }
     }
 }

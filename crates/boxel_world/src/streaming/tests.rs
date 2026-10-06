@@ -370,6 +370,37 @@ fn stale_results_are_rejected_by_epoch() {
 }
 
 #[test]
+fn padded_neighbors_are_the_chunks_whose_mesh_reads_the_voxel() {
+    let offsets = |p: LocalPos| -> Vec<(i32, i32, i32)> {
+        NEIGHBOR_OFFSETS
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| padded_neighbors(p) & (1 << i) != 0)
+            .map(|(_, o)| (o.x, o.y, o.z))
+            .collect()
+    };
+    assert!(offsets(LocalPos::new(5, 1, 30)).is_empty());
+    assert_eq!(offsets(LocalPos::new(5, 31, 7)), [(0, 1, 0)]);
+    // An edge voxel: two face neighbors and the edge neighbor between them.
+    let mut edge = offsets(LocalPos::new(31, 5, 0));
+    edge.sort_unstable();
+    assert_eq!(edge, [(0, 0, -1), (1, 0, -1), (1, 0, 0)]);
+    // A corner voxel: 7 neighbors, each offset in -1..=0 per axis.
+    let corner = offsets(LocalPos::new(0, 0, 0));
+    assert_eq!(corner.len(), 7);
+    assert!(corner.iter().all(|&(x, y, z)| x <= 0 && y <= 0 && z <= 0));
+    // Brute force: neighbor `o` reads p when p lies in its padded box (-1..=32 in its frame).
+    for i in 0..32 * 32 * 32 {
+        let p = LocalPos::from_index(i);
+        for (bit, o) in NEIGHBOR_OFFSETS.iter().enumerate() {
+            let inside = |c: u32, d: i32| (-1..=32).contains(&(c as i32 - 32 * d));
+            let reads = inside(p.x(), o.x) && inside(p.y(), o.y) && inside(p.z(), o.z);
+            assert_eq!(padded_neighbors(p) & (1 << bit) != 0, reads, "{p:?} {o:?}");
+        }
+    }
+}
+
+#[test]
 fn neighbor_edits_bump_epoch_and_remesh() {
     let mut h = surface_world(Arc::new(InlineExecutor));
     h.settle(20);
@@ -815,7 +846,11 @@ impl WorldGenerator for HoleGen {
 
 /// Empty when the center and the 6 neighbor slabs that touch it are all solid (an absent
 /// neighbor is air), like a real mesher; otherwise `fake_mesh`.
-fn hidden_mesh(input: &MeshInput<'_>, materials: &MaterialTable) -> ChunkMesh {
+fn hidden_mesh(
+    input: &MeshInput<'_>,
+    materials: &MaterialTable,
+    options: MeshOptions,
+) -> ChunkMesh {
     let all_solid = |d: &ChunkData, border: Option<Face>| {
         (0..CHUNK_VOLUME).map(LocalPos::from_index).all(|p| {
             border.is_some_and(|f| p.border_faces() & (1 << f.index()) == 0) || !d.get(p).is_air()
@@ -829,7 +864,7 @@ fn hidden_mesh(input: &MeshInput<'_>, materials: &MaterialTable) -> ChunkMesh {
     if hidden {
         ChunkMesh::default()
     } else {
-        fake_mesh(input, materials)
+        fake_mesh(input, materials, options)
     }
 }
 

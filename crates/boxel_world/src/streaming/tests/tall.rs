@@ -324,16 +324,19 @@ fn a_jump_does_not_grow_the_map() {
 
 /// Empty for an all-air center, else `1 + the number of loaded neighbors` quads: a mesh built
 /// with other neighbors than the map has now shows a different count.
-fn neighbor_count_mesh(input: &MeshInput<'_>, materials: &MaterialTable) -> ChunkMesh {
-    let mut mesh = fake_mesh(input, materials);
+fn neighbor_count_mesh(
+    input: &MeshInput<'_>,
+    materials: &MaterialTable,
+    options: MeshOptions,
+) -> ChunkMesh {
+    let mesh = fake_mesh(input, materials, options);
     if mesh.is_empty() {
         return mesh;
     }
     let n = 1 + u32::try_from(input.neighbors.iter().flatten().count()).expect("26");
-    mesh.quads = vec![boxel_mesh::PackedQuad::default(); n as usize];
-    mesh.bucket_counts = [0; 8];
-    mesh.bucket_counts[0] = n;
-    mesh
+    let mut counts = [0; 8];
+    counts[0] = n;
+    ChunkMesh::from_quads(vec![boxel_mesh::PackedQuad::default(); n as usize], counts)
 }
 
 /// Every `Ready` mesh was built from the neighbors the map has now.

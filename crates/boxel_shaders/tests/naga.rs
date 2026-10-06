@@ -244,11 +244,11 @@ fn wgsl_bit_layout_matches_boxel_mesh() {
         ("GEO_W_SHIFT", l::GEO_W_SHIFT),
         ("GEO_H_SHIFT", l::GEO_H_SHIFT),
         ("GEO_FACE_SHIFT", l::GEO_FACE_SHIFT),
+        ("GEO_FLAGS_SHIFT", l::GEO_FLAGS_SHIFT),
         ("MAT_LAYER_MASK", l::MAT_LAYER_MASK),
         ("MAT_AO_SHIFT", l::MAT_AO_SHIFT),
-        ("MAT_SKY_SHIFT", l::MAT_SKY_SHIFT),
-        ("MAT_BLOCK_SHIFT", l::MAT_BLOCK_SHIFT),
-        ("MAT_FLAGS_SHIFT", l::MAT_FLAGS_SHIFT),
+        ("MAT_LIGHT_SHIFT", l::MAT_LIGHT_SHIFT),
+        ("MAT_LIGHT_MASK", l::MAT_LIGHT_MASK),
     ] {
         assert_eq!(const_u32(&module, name), v, "{name}");
     }

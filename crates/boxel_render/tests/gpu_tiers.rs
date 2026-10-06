@@ -254,12 +254,8 @@ fn mesh_chunk(
             }
         }
     }
-    let mut mesh = ChunkMesh::default();
-    for (b, quads) in buckets.iter().enumerate() {
-        mesh.bucket_counts[b] = quads.len() as u32;
-        mesh.quads.extend_from_slice(quads);
-    }
-    mesh
+    let counts = buckets.each_ref().map(|quads| quads.len() as u32);
+    ChunkMesh::from_quads(buckets.concat(), counts)
 }
 
 /// Chunk id used by the tests (any stable u64).
@@ -318,10 +314,7 @@ fn far_scene(registry: &BlockRegistry, front: bool, back: bool) -> ChunkMesh {
     }
     let mut bucket_counts = [0; BUCKET_COUNT];
     bucket_counts[Face::PosZ.index()] = quads.len() as u32;
-    ChunkMesh {
-        quads,
-        bucket_counts,
-    }
+    ChunkMesh::from_quads(quads, bucket_counts)
 }
 
 /// `n` copies of the bottom face of voxel (0, 0, 0): never visible from above the chunk (face
@@ -330,10 +323,7 @@ fn hidden_mesh(n: u32) -> ChunkMesh {
     let quad = PackedQuad::new([0, 0, 0], 1, 1, Face::NegY, 0);
     let mut bucket_counts = [0; BUCKET_COUNT];
     bucket_counts[Face::NegY.index()] = n;
-    ChunkMesh {
-        quads: vec![quad; n as usize],
-        bucket_counts,
-    }
+    ChunkMesh::from_quads(vec![quad; n as usize], bucket_counts)
 }
 
 fn view_params(camera: &Camera, transform: &Transform) -> ViewParams {

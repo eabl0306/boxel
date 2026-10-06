@@ -1,6 +1,6 @@
 # ADR 0015: luz de vóxeles
 
-- Estado: aceptado (fases P0 y P1 hechas; P2 en adelante, pendientes)
+- Estado: aceptado (fases P0, P1 y P2 hechas; P3 en adelante, pendientes)
 - Fecha: 2026-10-06
 
 ## Contexto
@@ -175,7 +175,7 @@ suya.
   64 KiB), que el mundo guarda dentro de `light_cache_radius` (8 chunks).
 - `LightScratch` ocupa unos 0.7 MiB por hilo.
 
-### 6. Malla: `PackedQuad` v2 con paleta de luz (P2)
+### 6. Malla: `PackedQuad` v2 con paleta de luz (P2, hecho)
 
 - El quad sigue en 8 bytes. `geo` usa sus 4 bits reservados como flags (bits 28 a 31). `mat`
   pasa a `capa:12 | ao:8 | índice de paleta de luz:12`. Desaparecen los campos cielo, bloque y
@@ -183,8 +183,11 @@ suya.
   `GEO_FLAGS_SHIFT = 28`, `MAT_LIGHT_SHIFT = 20` y `MAT_LIGHT_MASK = 0xFFF`.
 - Paleta por chunk de hasta 4096 entradas de 8 bytes (`[u32; 2]`: las 4 esquinas en
   `LightValue`, en el orden de esquinas del AO y de `common.wgsl`), en orden determinista de
-  primera aparición. Si se pasa de 4096, los canales de bloque del chunk se recuantizan a 3 bits y
-  se cuenta en las estadísticas.
+  primera aparición. Si se pasa de 4096, el chunk se vuelve a mallar con los canales de bloque a
+  3 bits (`LightQuantization::Block3`). Eso tampoco garantiza que entre (quedan 8192 valores por
+  esquina), así que hay un último nivel, `Flat`: cada cara toma una sola luz, el promedio de sus
+  esquinas con el bloque a 2 bits, que siempre entra (1024 valores). `ChunkMesh` guarda el nivel
+  y `headless_world` cuenta las mallas recuantizadas.
 - Luz de esquina: los 4 vóxeles de la capa de enfrente alrededor del vértice, sin los opacos (y
   sin el de la esquina cuando los dos laterales son opacos), promedio redondeado por canal. Depende
   solo del vértice, así que dos caras coplanares visibles que comparten el vértice ven lo mismo: un
@@ -199,6 +202,17 @@ suya.
   falta un fork en el repo de `binary-greedy-meshing` 0.5.2 (aviso MIT incluido) que fusione por
   clave de cara en lugar del `u16` del vóxel. El crate queda como dependencia de desarrollo para
   la prueba de regresión: con `AoPolicy::Off` y sin luz, los quads son idénticos byte a byte.
+- Implementación: `MeshInput.light` (`Option<&PaddedLight>`, `None` es cielo 15 en todo),
+  `MeshOptions { ao: AoPolicy }`, `Mesher::mesh(padded, light, materials, options, out)`. Con luz
+  uniforme la clave es el material (y el AO si va), sin tablas. Con luz completa, cada cara
+  visible lee sus 9 celdas de enfrente y busca su clave (material, AO, 4 esquinas) en una tabla
+  de direccionamiento abierto; la paleta solo se consulta para claves nuevas.
+  `reference_face_shading` es el oráculo de fuerza bruta de AO y luz por cara.
+- En P2 el mundo todavía no calcula luz: malla con `light: None`, así que toda cara cuenta como
+  iluminada y `BakedLitOnly` hornea AO en todas (el peor caso, ver Consecuencias). La política es
+  `WorldSettings::ao_policy` (adelantado de P3). Como el AO lee vecinos de arista y esquina, una
+  edición ya remalla todo chunk cuya región acolchada contiene el vóxel (hasta 8), no solo los
+  vecinos de cara.
 
 ### 7. GPU (P4)
 
@@ -230,7 +244,7 @@ exterior); luces dinámicas en el shader; vidrio teñido.
 
 ### Fases
 
-P0 (datos de bloque, máscaras, este ADR) y P1 (`boxel_light`) están hechas. Siguen P2 (mesher),
+P0 (datos de bloque, máscaras, este ADR), P1 (`boxel_light`) y P2 (mesher) están hechas. Siguen
 P3 (integración en `boxel_world`: `SkyMap`, jobs de caminata, luz en `start_mesh`, ediciones con
 lotes atómicos), P4 (render), P5 (día y noche), P6 (contenido: lámparas de color y lava
 provisoria), P7 (medir con la máquina libre y decidir) y P8.
@@ -283,14 +297,58 @@ cielo en la superficie, de bloque en las lámparas) y que la caja de superficie 
   por chunk no uniforme: a y = -1000 eran unos 155 MiB a radio 16 y 630 MiB a radio 32, encima de
   66 y 244 MiB de vóxeles. En superficie (y = 80) el techo es 8 KiB por chunk con malla: como mucho
   52 MiB a radio 16 y 210 MiB a radio 32, menos en la práctica.
-- Hasta P2 y P4 no cambia nada en pantalla: el mesher y el renderer no se tocaron y los quads
-  siguen en v1.
+- P0 y P1 no cambiaron nada en pantalla. P2 pasa los quads a v2 y el mundo ya hornea AO, que el
+  shader de hoy dibuja; la luz se ve recién con P3 (el mundo la calcula) y P4 (el shader la lee).
 - Riesgos abiertos: el AO en la clave del merge infla los quads (gate G1 en P3); Low paga 8 bytes
   más por quad (16 en total); una paleta con más de 4096 entradas pierde precisión en los canales
   de bloque; las ediciones de luz remallan hasta 8 chunks.
 
+**P2 (mesher), medido el 2026-10-06** con criterion (release), cada bench después de
+`tools/wait-idle.sh`, en la máquina compartida con otros builds (load average de 3 a 7): números
+indicativos, se repiten en P7.
+
+| Bench | Medido | Objetivo |
+|---|---|---|
+| `mesh/cave` (AO apagado, sin luz: el camino de bgm) | 19.6 µs | 1.15x de 28.8 µs o menos |
+| `gather_mesh/cave` (luz uniforme oscura, AO solo en caras con luz) | 82.4 µs | 1.1x de 91.5 µs o menos |
+| `gather_mesh/cave_lit` (146 lámparas, luz calculada antes) | 103 µs | 160 µs o menos |
+| `gather_mesh/surface` (luz de cielo y claves de AO, luz calculada antes) | 143 µs | 150 µs o menos |
+
+En la superficie (2993 caras visibles), solo el paso de malla: 19 µs sin AO ni luz, 33 µs con AO
+en todas las caras y 82 µs con la luz. La luz cuesta sobre todo el promedio de las esquinas (cada
+celda se expande una vez a carriles de 16 bits y las 4 esquinas se suman en paralelo) y la
+búsqueda de la clave.
+
+Quads de `headless_world` a radio 16 (sin luz todavía: con `lit-only` toda cara tiene luz, así
+que da lo mismo que `baked`):
+
+| Mundo | `--ao off` | `--ao baked` y `lit-only` |
+|---|---|---|
+| overworld, y = 80 | 4 222 233 | 7 330 180 (1.74x) |
+| overworld, y = -1000 | 8 407 250 | 14 669 107 (1.74x) |
+| forest, y = 80 | 439 764 | 717 965 (1.63x) |
+
+- Hasta P3 el mundo paga el AO en todas las caras, cuevas incluidas: bajo tierra a radio 16 son
+  14.7 M quads en lugar de 8.4 M. Con la luz de P3 las cuevas oscuras vuelven a fusionarse como
+  con AO apagado (estimado 1.0 a 1.05x); el gate G1 de P3 lo mide.
+- Las paletas son de 1 entrada mientras la luz sea uniforme. En los benches: 74 entradas en la
+  superficie con árboles y 411 en la cueva con lámparas.
+- El fork de bgm fusiona una cara a la vez y saca los quads ya en forma canónica (sin pasar por
+  los vértices de bgm): `mesh/cave` con AO apagado da 19.6 µs contra los 28.8 µs medidos antes.
+- Memoria: el `Mesher` de cada hilo pasa de unos 210 KiB a unos 0.6 MiB (claves de 34³ en `u32`,
+  la paleta y la tabla de claves).
+
 Cambios de API que rompen:
 
+- `PackedQuad`: se van `with_light`, `sky` y `block_light`; entran `with_light_index`,
+  `light_index`, `with_flags`, `flags`, `with_ao_byte` y `ao_byte`. En `layout` se van
+  `MAT_SKY_SHIFT`, `MAT_BLOCK_SHIFT` y `MAT_FLAGS_SHIFT`; entran `GEO_FLAGS_SHIFT`,
+  `MAT_LIGHT_SHIFT` y `MAT_LIGHT_MASK` (también en `common.wgsl`).
+- `ChunkMesh` suma `palette`, `light_quantization` y `hash` (`ChunkMesh::from_quads` arma una a
+  mano con la paleta de cielo abierto). `MeshInput` suma `light`; `Mesher::mesh` y
+  `Mesher::mesh_chunk` toman la luz y `MeshOptions`. `WorldSettings` suma `ao_policy`.
+- `boxel_mesh` depende de `boxel_light`; `binary-greedy-meshing` queda solo como dependencia de
+  desarrollo.
 - `BlockDef.light_emission` desaparece: `emission: [u8; 3]` y `light_opacity: u8`.
   `BlockRegistry::light_emission` pasa a `emission` (devuelve `LightValue`) y `light_opacity`.
   Nuevos: `RegistryError::InvalidLight` y `BlockRegistryBuilder::with_default_blocks`.
@@ -315,6 +373,16 @@ Tests que lo vigilan:
   15 en el fondo, y una lámpara quitada o fuera de la caja que no impide los caminos rápidos.
 - `boxel_light/tests/far_coords.rs`: el mismo vecindario en 0, ±2^31, ±2^40 y
   `MAX_BLOCK_COORD - 64` da los mismos bits.
+- `boxel_mesh/tests/oracle.rs`: con luz aleatoria (ausente, uniforme, suave con luces de color,
+  en bloques, en banda y ruido) y cada política de AO, cada quad expandido a caras unitarias y
+  leído por la paleta es igual a `reference_face_shading` (al nivel de cuantización de la malla);
+  volver a mallar con un `Mesher` usado da la misma malla, hash incluido. La recuantización
+  forzada: una banda de luz cae en `Block3` y el ruido en `Flat`.
+- `boxel_mesh/tests/bgm_regression.rs`: con AO apagado y sin luz (o luz uniforme, o luz oscura
+  con `BakedLitOnly`) los quads son idénticos byte a byte a los de bgm 0.5.2.
+- `boxel_mesh/tests/mesher.rs`: el AO de un piso junto a una pared sigue la política, las hojas no
+  dan AO, la luz parte las fusiones y la paleta es determinista. En `boxel_world`, una edición en
+  un borde remalla también el vecino de arista (`padded_neighbors`, contra fuerza bruta).
 - `boxel_light/tests/sky_walk.rs`: la caminata igual a un recorrido de fuerza bruta de los chunks
   generados (overworld con árboles y entradas, forest, terrain y flat, cerca y en 2^40), el
   límite, el vacío, la búsqueda después de una edición, una edición 5000 vóxeles arriba que solo

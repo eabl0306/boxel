@@ -8,7 +8,7 @@
 use boxel_app::App;
 use boxel_ecs::prelude::*;
 use boxel_math::DVec3;
-use boxel_mesh::{ChunkMesh, MeshInput, Mesher};
+use boxel_mesh::{ChunkMesh, MeshInput, MeshOptions, Mesher};
 use boxel_transform::Transform;
 use boxel_voxel::{
     BlockPos, BlockRegistry, BlockState, CHUNK_SIZE, ChunkKey, ChunkPos, LocalPos,
@@ -135,6 +135,7 @@ fn assert_replica_matches(app: &App, replica: &BTreeMap<u64, Arc<ChunkMesh>>) {
 fn assert_world_matches_direct(app: &App, edited: &[ChunkPos]) {
     let map = app.world().resource::<ChunkMap>();
     let content = app.world().resource::<WorldContent>();
+    let options = MeshOptions::with_ao(app.world().resource::<WorldSettings>().ao_policy);
     let mut mesher = Mesher::new();
     let (mut meshes, mut empties) = (0, 0);
     for (_, slot) in map.iter() {
@@ -167,8 +168,9 @@ fn assert_world_matches_direct(app: &App, edited: &[ChunkPos]) {
                 map.data_at(pos.offset(NEIGHBOR_OFFSETS[i]))
                     .map(Arc::as_ref)
             }),
+            light: None,
         };
-        let direct = mesher.mesh_chunk(&input, &content.materials);
+        let direct = mesher.mesh_chunk(&input, &content.materials, options);
         if let MeshState::Ready { mesh, .. } = slot.mesh() {
             assert_eq!(**mesh, direct, "{pos:?}: streamed mesh == direct mesh");
             assert!(!mesh.is_empty());

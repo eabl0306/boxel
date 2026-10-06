@@ -17,6 +17,12 @@ quedado corridas.
 `LightStorage` se borraron; la luz es un dato derivado que calcula `boxel_light`. La sección 2
 lo dice en el párrafo de la luz.
 
+**Actualización (mesher con AO y luz, ADR 0015 fase P2):** el greedy binario es ahora un fork en
+el repo que fusiona por material, AO y luz, y cada malla trae una paleta de luz. Los quads siguen
+en 8 bytes, pero `mat` cambió: capa, AO y un índice de paleta. Cada worker usa unos 0.6 MiB de
+memoria de trabajo, y una edición también remalla los vecinos de arista y de esquina, porque el AO
+los lee. Lo que sigue describe el estado anterior.
+
 ## En resumen
 
 1. Cada chunk de 32³ se guarda comprimido con una paleta. Si es de puro aire, sus vóxeles no

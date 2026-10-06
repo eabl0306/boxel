@@ -23,7 +23,7 @@ use support::{CountingExecutor, LayerGen, fake_mesh};
 /// Fixtures shared with the module-level unit tests.
 pub(crate) mod support {
     use crate::jobs::JobExecutor;
-    use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, PackedQuad};
+    use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, MeshOptions, PackedQuad};
     use boxel_voxel::{BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, ChunkKey, ChunkPos};
     use boxel_worldgen::WorldGenerator;
     use std::ops::RangeInclusive;
@@ -75,23 +75,28 @@ pub(crate) mod support {
 
     /// Deterministic stand-in for `boxel_mesh::Mesher`: empty for an
     /// all-air center, else `1 + center.version` quads (an edit produces a different mesh).
-    pub(crate) fn fake_mesh(input: &MeshInput<'_>, _materials: &MaterialTable) -> ChunkMesh {
+    pub(crate) fn fake_mesh(
+        input: &MeshInput<'_>,
+        _materials: &MaterialTable,
+        _options: MeshOptions,
+    ) -> ChunkMesh {
         let mut dense = vec![BlockState::AIR; CHUNK_VOLUME];
         input.center.to_dense(&mut dense);
         if dense.iter().all(|s| s.is_air()) {
             return ChunkMesh::default();
         }
         let n = 1 + input.center.version;
-        let mut mesh = ChunkMesh {
-            quads: vec![PackedQuad::default(); n as usize],
-            ..ChunkMesh::default()
-        };
-        mesh.bucket_counts[0] = n;
-        mesh
+        let mut counts = [0; 8];
+        counts[0] = n;
+        ChunkMesh::from_quads(vec![PackedQuad::default(); n as usize], counts)
     }
 
     /// A mesher that always panics.
-    pub(crate) fn panicking_mesh(_input: &MeshInput<'_>, _materials: &MaterialTable) -> ChunkMesh {
+    pub(crate) fn panicking_mesh(
+        _input: &MeshInput<'_>,
+        _materials: &MaterialTable,
+        _options: MeshOptions,
+    ) -> ChunkMesh {
         panic!("test mesher panic")
     }
 
@@ -563,7 +568,7 @@ fn small_moves_keep_chunks_inside_the_hysteresis_band() {
 }
 
 #[test]
-fn edits_remesh_the_chunk_and_touched_face_neighbors() {
+fn edits_remesh_the_chunk_and_the_neighbors_that_read_the_voxel() {
     let mut app = world_app(
         LayerGen::new(-3..=1),
         settings(64),
@@ -576,7 +581,11 @@ fn edits_remesh_the_chunk_and_touched_face_neighbors() {
         ChunkPos::new(1, -1, 0),
         ChunkPos::new(0, 0, 0),
     );
+    // The +X+Y edge neighbor reads the voxel too (AO and corner light of its faces).
+    let edge = ChunkPos::new(1, 0, 0);
     let (east_epoch, above_epoch) = (slot_at(&app, east).epoch, slot_at(&app, above).epoch);
+    let edge_epoch = slot_at(&app, edge).epoch;
+    let far_epoch = slot_at(&app, ChunkPos::new(-1, -1, 0)).epoch;
 
     // Local (31, 31, 5) of chunk (0, -1, 0) touches its +X and +Y faces.
     let edited = BlockPos::new(31, -1, 5);
@@ -603,6 +612,12 @@ fn edits_remesh_the_chunk_and_touched_face_neighbors() {
         "air neighbor stays Empty"
     );
     assert!(matches!(slot_at(&app, above).mesh(), MeshState::Empty));
+    assert_eq!(slot_at(&app, edge).epoch, edge_epoch + 1, "edge neighbor");
+    assert_eq!(
+        slot_at(&app, ChunkPos::new(-1, -1, 0)).epoch,
+        far_epoch,
+        "the -X neighbor does not read the voxel"
+    );
     let map = app.world().resource::<ChunkMap>();
     assert_eq!(map.block_at(edited), Some(BlockState::AIR));
     match slot_at(&app, center).mesh() {
