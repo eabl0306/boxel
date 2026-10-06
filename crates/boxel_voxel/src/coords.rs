@@ -75,8 +75,9 @@ impl ChunkPos {
         I64Vec3::new(self.x, self.y, self.z)
     }
     /// World voxel position of the chunk's min corner (lod 0; a lod-`k` chunk starts at
-    /// `pos << (5 + k)`). Exact for every chunk within `+-2^58` (32 times the world limit);
-    /// further out the shift would drop bits (debug-asserted).
+    /// `pos << (5 + k)`). Exact for every chunk in `-2^58..2^58` (4 times the world limit: every
+    /// chunk that contains an `i64` block); further out the shift would drop bits
+    /// (debug-asserted).
     pub const fn origin(self) -> BlockPos {
         const fn shift(c: i64) -> i64 {
             let o = c << CHUNK_SHIFT;
