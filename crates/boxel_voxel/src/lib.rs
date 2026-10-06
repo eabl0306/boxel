@@ -1,7 +1,8 @@
 //! `boxel_voxel`: the voxel data model. No ECS, no GPU.
 //!
 //! - [`coords`]: 32^3 chunks (`CHUNK_SHIFT = 5`), `ChunkPos`/`BlockPos` (`i64`, bounded by the
-//!   world limit [`MAX_CHUNK_COORD`]), `LocalPos`, faces, 26-neighborhood. Local index layout
+//!   world limit [`MAX_CHUNK_COORD`]), [`WorldPos`] (a block plus an offset in it: exact
+//!   sub-voxel positions at any distance), `LocalPos`, faces, 26-neighborhood. Local index layout
 //!   `(y << 10) | (x << 5) | z` (z fastest), the same order as binary-greedy-meshing's padded
 //!   linearization.
 //! - [`registry`]: data-driven blocks; runtime `BlockState(u16)` is dense and never persisted raw.
@@ -19,7 +20,7 @@ mod chunk;
 pub use chunk::ChunkData;
 pub use coords::{
     BlockPos, CHUNK_AREA, CHUNK_MASK, CHUNK_SHIFT, CHUNK_SIZE, CHUNK_VOLUME, ChunkKey, ChunkPos,
-    DimensionId, Face, LocalPos, MAX_BLOCK_COORD, MAX_CHUNK_COORD, NEIGHBOR_OFFSETS,
+    DimensionId, Face, LocalPos, MAX_BLOCK_COORD, MAX_CHUNK_COORD, NEIGHBOR_OFFSETS, WorldPos,
     neighbor_index,
 };
 pub use registry::{
@@ -32,5 +33,6 @@ pub use storage::{LightStorage, Occupancy, Paletted};
 pub mod prelude {
     pub use crate::{
         BlockPos, BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, Face, LocalPos,
+        WorldPos,
     };
 }

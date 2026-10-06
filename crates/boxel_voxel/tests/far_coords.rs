@@ -163,3 +163,167 @@ proptest! {
         prop_assert_eq!(c.origin().x, x.div_euclid(32) * 32);
     }
 }
+
+// ---------------------------------------------------------------- WorldPos
+
+/// Integer shifts of the far-coords scenes: the former `i32` edge both ways, `2^40`, `2^52`
+/// (where an `f64` stops holding sub-voxel positions) and the world limit both ways.
+const SHIFTS: [i64; 7] = [
+    0,
+    1 << 31,
+    -(1 << 31),
+    1 << 40,
+    1 << 52,
+    MAX_BLOCK_COORD - 64,
+    -(MAX_BLOCK_COORD - 64),
+];
+
+/// Offsets inside a voxel, exact in `f64`.
+const FRACS: [f64; 5] = [0.0, 0.25, 0.5, 0.75, 1.0 - f64::EPSILON / 2.0];
+
+#[test]
+fn world_pos_splits_exactly_far_away() {
+    // Below 2^52 an f64 still holds a quarter voxel: the split gives the block and frac back.
+    for v in BLOCKS.into_iter().filter(|v| v.unsigned_abs() < 1 << 50) {
+        for f in FRACS.into_iter().take(4) {
+            let p = WorldPos::from_dvec3(DVec3::new(v as f64 + f, -(v as f64) + f, v as f64));
+            assert_eq!(p.block, BlockPos::new(v, -v, v), "{v} + {f}");
+            assert_eq!(p.frac, DVec3::new(f, f, 0.0), "{v} + {f}");
+            assert_eq!(
+                p.to_dvec3(),
+                DVec3::new(v as f64 + f, -(v as f64) + f, v as f64)
+            );
+        }
+    }
+    // Anywhere, up to the limit: from_block keeps the block and the frac exactly (an f64
+    // cannot hold these positions), and to_dvec3 rounds them only on the way out.
+    for v in BLOCKS.into_iter().filter(|v| v.abs() <= MAX_BLOCK_COORD) {
+        for f in FRACS {
+            let p = WorldPos::from_block(BlockPos::new(v, v, -v), DVec3::splat(f));
+            assert_eq!(
+                (p.block, p.frac),
+                (BlockPos::new(v, v, -v), DVec3::splat(f))
+            );
+            assert_eq!(WorldPos::from(p.block).frac, DVec3::ZERO);
+        }
+    }
+    assert_eq!(
+        WorldPos::from_block(BlockPos::new(MAX_BLOCK_COORD, 0, 0), DVec3::splat(0.5))
+            .to_dvec3()
+            .x,
+        MAX_BLOCK_COORD as f64,
+        "2^61 + 0.5 rounds to 2^61 in f64"
+    );
+}
+
+#[test]
+fn normalize_carries_a_frac_that_rounds_up_to_one() {
+    // -2^-60 - floor(-2^-60) = 1 - 2^-60, which rounds to 1.0: it must carry, never stay 1.
+    let tiny = -(2f64.powi(-60));
+    let p = WorldPos {
+        block: BlockPos::new(5, -7, 1 << 40),
+        frac: DVec3::new(tiny, tiny, tiny),
+    }
+    .normalize();
+    assert_eq!(p.block, BlockPos::new(5, -7, 1 << 40));
+    assert_eq!(p.frac, DVec3::ZERO);
+    let p = WorldPos::from_dvec3(DVec3::new(tiny, 0.0, -0.0));
+    assert_eq!((p.block, p.frac), (BlockPos::new(0, 0, 0), DVec3::ZERO));
+    assert!(p.frac.x.is_sign_positive() && p.frac.z.is_sign_positive());
+    // A move by a tiny negative amount from an integer position.
+    let q = WorldPos::from(BlockPos::new(3, 3, 3)).offset(DVec3::splat(tiny));
+    assert_eq!((q.block, q.frac), (BlockPos::new(3, 3, 3), DVec3::ZERO));
+    // Larger negative fracs borrow from the block, exactly.
+    let r = WorldPos::from_block(BlockPos::new(0, 0, 0), DVec3::new(-0.25, -1.5, -3.0));
+    assert_eq!(r.block, BlockPos::new(-1, -2, -3));
+    assert_eq!(r.frac, DVec3::new(0.75, 0.5, 0.0));
+}
+
+#[test]
+fn world_pos_clamps_to_the_world_limit_and_never_panics() {
+    let p = WorldPos::from_dvec3(DVec3::new(1e300, -1e300, f64::NAN));
+    assert_eq!(p.block, BlockPos::new(MAX_BLOCK_COORD, -MAX_BLOCK_COORD, 0));
+    assert_eq!(p.frac, DVec3::ZERO);
+    let p = WorldPos::from_dvec3(DVec3::new(f64::INFINITY, f64::NEG_INFINITY, 0.5));
+    assert_eq!(p.block, BlockPos::new(MAX_BLOCK_COORD, -MAX_BLOCK_COORD, 0));
+    assert_eq!(p.frac, DVec3::new(0.0, 0.0, 0.5));
+    let edge = WorldPos::from(BlockPos::new(MAX_BLOCK_COORD, -MAX_BLOCK_COORD, 0));
+    let out = edge.offset(DVec3::new(10.5, -10.5, 0.0));
+    assert_eq!(out.block, edge.block, "clamped");
+    assert_eq!(out.frac, DVec3::new(0.5, 0.5, 0.0));
+    // Any i64 block: no overflow anywhere.
+    let wild = WorldPos {
+        block: BlockPos::new(i64::MAX, i64::MIN, 0),
+        frac: DVec3::new(5.0, -5.0, 0.0),
+    };
+    let n = wild.normalize();
+    assert_eq!(n.block, BlockPos::new(MAX_BLOCK_COORD, -MAX_BLOCK_COORD, 0));
+    let d = wild.delta_to(&WorldPos::default());
+    assert!(d.is_finite(), "{d:?}");
+}
+
+#[test]
+fn delta_to_is_exact_between_far_positions() {
+    for shift in SHIFTS {
+        // 2^40 toward the origin on z, so the far shifts stay inside the world.
+        let far = if shift > 0 { -(1i64 << 40) } else { 1 << 40 };
+        let a = WorldPos::from_block(BlockPos::new(shift, -shift, shift), DVec3::splat(0.25));
+        let b = WorldPos::from_block(
+            BlockPos::new(shift + 3, -shift - 5, shift + far),
+            DVec3::new(0.5, 0.75, 0.125),
+        );
+        assert_eq!(a.delta_to(&b), DVec3::new(3.25, -4.5, far as f64 - 0.125));
+        assert_eq!(b.delta_to(&a), -a.delta_to(&b));
+        assert_eq!(a.delta_to(&a), DVec3::ZERO);
+    }
+    // Across the whole world the integer part is 2^62: still exact (a power of two).
+    let west = WorldPos::from(BlockPos::new(-MAX_BLOCK_COORD, 0, 0));
+    let east = WorldPos::from(BlockPos::new(MAX_BLOCK_COORD, 0, 0));
+    assert_eq!(west.delta_to(&east).x, 2f64.powi(62));
+}
+
+proptest! {
+    /// The same moves from the same frac give the same frac and the same block delta at every
+    /// shift: `WorldPos` arithmetic never looks at the size of the block. (At most 32 moves of
+    /// less than 2 voxels: the scene stays inside the world at the `MAX_BLOCK_COORD - 64`
+    /// shift.)
+    #[test]
+    fn offsets_are_translation_invariant(
+        fx in 0.0..1.0f64, fy in 0.0..1.0f64, fz in 0.0..1.0f64,
+        moves in proptest::collection::vec(
+            (-1.9..1.9f64, -1.9..1.9f64, -1.9..1.9f64), 1..32),
+    ) {
+        let frac = DVec3::new(fx, fy, fz);
+        let mut reference: Option<Vec<(I64Vec3, DVec3)>> = None;
+        for shift in SHIFTS {
+            let base = BlockPos::new(shift, -shift, shift);
+            let mut p = WorldPos::from_block(base, frac);
+            let mut trace = Vec::new();
+            for &(x, y, z) in &moves {
+                let before = p;
+                p = p.offset(DVec3::new(x, y, z));
+                prop_assert!(p.frac.cmpge(DVec3::ZERO).all() && p.frac.cmplt(DVec3::ONE).all());
+                // The move is the requested one, up to the f64 step of the move itself.
+                prop_assert!((before.delta_to(&p) - DVec3::new(x, y, z)).abs().max_element() < 1e-12);
+                trace.push((p.block.as_i64vec3() - base.as_i64vec3(), p.frac));
+            }
+            match &reference {
+                None => reference = Some(trace),
+                Some(r) => prop_assert_eq!(r, &trace, "shift {}", shift),
+            }
+        }
+    }
+
+    /// `from_dvec3` and `to_dvec3` round-trip every f64 position whose frac is exact.
+    #[test]
+    fn dvec3_round_trip(x in -1e12..1e12f64, y in -1e12..1e12f64, z in 0.0..1e15f64) {
+        let p = DVec3::new(x, y, z);
+        let w = WorldPos::from_dvec3(p);
+        prop_assert!(w.frac.cmpge(DVec3::ZERO).all() && w.frac.cmplt(DVec3::ONE).all());
+        // |p| >= 0.5 for all but a vanishing set of draws; the split is then exact.
+        if p.abs().cmpge(DVec3::splat(0.5)).all() {
+            prop_assert_eq!(w.to_dvec3(), p);
+            prop_assert_eq!(w.block, BlockPos::from_world(p));
+        }
+    }
+}

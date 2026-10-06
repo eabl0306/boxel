@@ -182,6 +182,122 @@ impl BlockPos {
     }
 }
 
+/// A world position exact at any distance: the voxel that contains it (`block`, exact `i64`)
+/// plus the offset inside that voxel (`frac`, each component in `[0, 1)`).
+///
+/// An `f64` world coordinate (`Transform`) loses resolution with distance: its step is 1 mm at
+/// `2^42` and a whole voxel at `2^52`. A `WorldPos` keeps the resolution of an `f64` in `[0, 1)`
+/// (about `1e-16` voxels) everywhere up to the world limit, because the large part is an
+/// integer and the small part never grows. Physics and raycasts keep their positions this way
+/// and compute in the frame of a block, with small numbers, so a scene shifted by any integer
+/// vector gives bit-identical results.
+///
+/// Canonical form: every `frac` component in `[0, 1)` and every `block` coordinate within
+/// `-MAX_BLOCK_COORD..=MAX_BLOCK_COORD`. Constructors and [`WorldPos::offset`] return canonical
+/// values; a value built field by field is made canonical by [`WorldPos::normalize`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WorldPos {
+    /// The voxel containing the position.
+    pub block: BlockPos,
+    /// Offset inside `block`, each component in `[0, 1)`.
+    pub frac: DVec3,
+}
+
+impl WorldPos {
+    /// The position `offset` away from the min corner of `block` (any finite offset), made
+    /// canonical. Exact when `offset` is in `[0, 1)` (the usual case, and the way to build
+    /// positions past `2^53`, where an `f64` cannot hold them).
+    pub fn from_block(block: BlockPos, offset: DVec3) -> Self {
+        Self {
+            block,
+            frac: offset,
+        }
+        .normalize()
+    }
+
+    /// Splits an `f64` world position: `block = floor(p)` and `frac = p - floor(p)`. Exact for
+    /// every finite `p` except a component in `(-0.5, 0)` with bits below `2^-53`: its `frac`
+    /// (`1 - |p|`) is rounded, by at most `2^-54`, and a `frac` that rounds to 1 carries into the
+    /// block. Components past the world limit are clamped to it; NaN gives 0 and infinities
+    /// saturate, like [`BlockPos::from_world`].
+    pub fn from_dvec3(p: DVec3) -> Self {
+        Self::from_block(BlockPos::default(), p)
+    }
+
+    /// As an `f64` position: `block + frac`, rounded once. This is the only lossy conversion; the
+    /// error grows with the distance to the origin like any `f64` (see [`MAX_CHUNK_COORD`]).
+    pub fn to_dvec3(self) -> DVec3 {
+        self.block.as_i64vec3().as_dvec3() + self.frac
+    }
+
+    /// This position moved by `d`. The integer part of `d` goes to `block` exactly and only the
+    /// fractional part is added to `frac`, so the result does not depend on `block` (the same
+    /// move gives the same `frac` anywhere in the world). Clamped to the world limit.
+    pub fn offset(self, d: DVec3) -> Self {
+        let whole = d.floor();
+        let block = self.block.as_i64vec3();
+        Self {
+            block: BlockPos::new(
+                block.x.saturating_add(whole.x as i64),
+                block.y.saturating_add(whole.y as i64),
+                block.z.saturating_add(whole.z as i64),
+            ),
+            frac: self.frac + (d - whole),
+        }
+        .normalize()
+    }
+
+    /// The vector from this position to `other`: the `i64` block difference converted to `f64`
+    /// plus the `frac` difference. The integer part is exact while it is below `2^53` (any two
+    /// positions that can interact); the result is rounded once more, at the `f64` step of the
+    /// distance itself and never at the step of the absolute positions.
+    pub fn delta_to(&self, other: &WorldPos) -> DVec3 {
+        let axis = |a: i64, b: i64, fa: f64, fb: f64| b.saturating_sub(a) as f64 + (fb - fa);
+        DVec3::new(
+            axis(self.block.x, other.block.x, self.frac.x, other.frac.x),
+            axis(self.block.y, other.block.y, self.frac.y, other.frac.y),
+            axis(self.block.z, other.block.z, self.frac.z, other.frac.z),
+        )
+    }
+
+    /// The canonical form of this position: per axis, `block += floor(frac)` and
+    /// `frac -= floor(frac)`, then the carry when `frac - floor(frac)` rounded up to 1 (a tiny
+    /// negative `frac`), then the clamp to the world limit. Exact except as described in
+    /// [`WorldPos::from_dvec3`], which also says how non-finite components are replaced.
+    pub fn normalize(self) -> Self {
+        let (x, fx) = normalize_axis(self.block.x, self.frac.x);
+        let (y, fy) = normalize_axis(self.block.y, self.frac.y);
+        let (z, fz) = normalize_axis(self.block.z, self.frac.z);
+        Self {
+            block: BlockPos::new(x, y, z),
+            frac: DVec3::new(fx, fy, fz),
+        }
+    }
+}
+
+impl From<BlockPos> for WorldPos {
+    /// The min corner of the block.
+    fn from(block: BlockPos) -> Self {
+        Self::from_block(block, DVec3::ZERO)
+    }
+}
+
+/// One axis of [`WorldPos::normalize`].
+fn normalize_axis(block: i64, frac: f64) -> (i64, f64) {
+    let whole = frac.floor();
+    // `as` saturates: infinities go to the i64 ends (clamped below), NaN to 0.
+    let mut block = block.saturating_add(whole as i64);
+    let mut frac = frac - whole;
+    if frac >= 1.0 {
+        // `frac` was a tiny negative number: `frac - (-1)` is `1 - |frac|`, which rounds to 1.
+        block = block.saturating_add(1);
+        frac = 0.0;
+    } else if frac.is_nan() {
+        frac = 0.0;
+    }
+    (block.clamp(-MAX_BLOCK_COORD, MAX_BLOCK_COORD), frac)
+}
+
 /// Position inside a chunk; packed index `(y << 10) | (x << 5) | z`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
