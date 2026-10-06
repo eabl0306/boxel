@@ -2,7 +2,7 @@
 
 Documento técnico de referencia. Fecha: 2026-10-05. Estado: aprobado para el milestone M0
 (revisión final, después de tres revisiones adversariales del borrador v1).
-Las decisiones puntuales están en `docs/adr/` (0001 a 0014). Durante M0 hubo además una
+Las decisiones puntuales están en `docs/adr/` (0001 a 0015). Durante M0 hubo además una
 especificación para los agentes implementadores (en inglés, en `.scaffold/`), borrada al cerrar M0;
 este documento queda como referencia.
 
@@ -116,8 +116,8 @@ cargo-deny, el MSRV 1.97.1 y los tests del ECS vendorizado (961 + 480) con lockf
 
 Reglas de dependencia (verificadas por el esqueleto que compila):
 
-- `boxel_math`, `boxel_voxel`, `boxel_mesh`, `boxel_worldgen`, `boxel_gfx`, `boxel_shaders` no
-  dependen del ECS. Son puros y testeables sin App.
+- `boxel_math`, `boxel_voxel`, `boxel_mesh`, `boxel_light`, `boxel_worldgen`, `boxel_gfx`,
+  `boxel_shaders` no dependen del ECS. Son puros y testeables sin App.
 - Solo `vendor/` depende de código derivado de Bevy. Ningún crate `bevy*` puede entrar al árbol
   (cargo-deny con nombres exactos más `tools/no_bevy.py` para cualquier nombre).
 - `boxel_render` depende de `boxel_world` (consume `ChunkMeshEvent`), nunca al revés.
@@ -139,8 +139,9 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_camera` | `Camera`, `CameraView` (relativa a cámara), `FlyCamera` | app, transform, window |
 | `boxel_gfx` | política sobre wgpu: preferencias, instancia, tiers, scoring, smoke, selección, LKG, superficie, readback, hal; ejemplo `gpu_info` | (wgpu) |
 | `boxel_shaders` | WGSL embebido, composición, espejos `#[repr(C)]`, tests de naga | (wgpu, bytemuck) |
-| `boxel_voxel` | coordenadas, `Face`, registry, paleta, luz, `ChunkData` | (glam) |
+| `boxel_voxel` | coordenadas, `Face`, registry (con emisión RGB y opacidad de luz), paleta, `LightValue` y `LightTables`, `ChunkData` con su caché de máscaras (`ChunkMasks`) | (glam) |
 | `boxel_mesh` | `PackedQuad`, `ChunkMesh`, `PaddedChunk`, `Mesher` (bgm) | voxel |
+| `boxel_light` | luz de vóxeles en CPU, sin ECS ni GPU (ADR 0015): techos de cielo por columna (`SkyTile`, caminata hacia abajo), luz exacta de un chunk desde una caja de 64³ (cielo y RGB, caminos rápidos para cuevas oscuras y cielo abierto), `PaddedLight`, `ChunkLight`; oráculo global para los tests | voxel |
 | `boxel_worldgen` | trait `WorldGenerator`; generadores `FlatGenerator`, `TerrainGenerator`, `ForestGenerator` (terreno con árboles) y `OverworldGenerator` (superficie sobre piedra infinita hacia abajo, con cuevas y árboles; etapas en `overworld`: `Heightmap`, `SurfaceRules`, `Caves`, más `Trees`); ruido 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`) | voxel |
 | `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, eventos, `ChunkStore` | app, voxel, mesh, worldgen, transform, diagnostic |
 | `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `PresentSettings` (vsync en tiempo de ejecución), texturas procedurales, screenshots | gfx, shaders, world, camera, window |
@@ -590,19 +591,23 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   ADR 0014.
 - **Registry** de datos: `BlockState(u16)` denso en tiempo de ejecución (0 = aire), nunca se
   persiste crudo (M1 agrega el IdMap nombre a id). Tablas SoA: nombre, forma (`None`, `Opaque`,
-  `Cutout`, `Translucent`), flags, emisión, texturas por cara. Contenido M0 congelado: aire,
+  `Cutout`, `Translucent`), flags, emisión RGB, opacidad de luz (15 en los opacos, 1 en hojas y
+  agua), texturas por cara. Contenido M0 congelado: aire,
   piedra, tierra, pasto, arena, grava, nieve, bedrock, tronco, hojas (cutout), agua (translúcida),
   tablones.
 - **Contenedor de paleta:** `Uniform(state)` | `Packed { palette, bits 1/2/4/8, words }` |
   `Direct(u16)`. Los índices nunca cruzan palabras de 64 bits. `set` agrega a la paleta en el
   lugar mientras entra; se compacta al guardar o en reposo. Medido en un mundo de 512x256x512:
   60.6 % de los chunks son aire uniforme; la paleta reduce 128 MiB a 9 MiB (0.14 B/vóxel).
-- **Luz** separada (`Uniform { sky, block }` o `Packed`), en M0 siempre cielo 15.
-- **Ocupación** de 4 KiB (1 bit por vóxel): calculable en M0, mantenida incrementalmente desde M1.
+- **Luz:** no vive en el chunk. Es un dato derivado, función pura de los bloques y de un techo de
+  cielo por columna, que calcula `boxel_light` (ADR 0015). Hasta que el mesher la use (fase P2)
+  todo se dibuja con cielo 15.
+- **Máscaras** de 4 KiB (1 bit por vóxel): `ChunkMasks` (opaca, parcial, sólida y emisores) se
+  construye la primera vez que se pide y queda en caché en el chunk hasta que cambian sus bloques.
   `ChunkData::from_occupancy` hace el camino inverso: arma un chunk de 1 bit (o `Uniform` si la
   máscara está toda llena o toda vacía) directo de la máscara, sin arreglo denso. El overworld lo
   usa para los chunks de piedra y cuevas bajo la superficie.
-- **`ChunkData`** = bloques + luz + `version`. Se comparte como `Arc<ChunkData>`; las ediciones
+- **`ChunkData`** = bloques + `version` + caché de máscaras. Se comparte como `Arc<ChunkData>`; las ediciones
   usan `Arc::make_mut`. Los arrays de vóxeles nunca van inline en componentes del ECS.
 
 ---
