@@ -4,15 +4,19 @@
 //!
 //! Each built-in layer has a [`Recipe`]: the Minecraft block whose blockstate and model name the
 //! texture (`cube_column` end/side, the grass overlay...), and fallback texture names for packs
-//! that ship no model. Grayscale textures Minecraft tints by biome (grass, foliage, water) get a
+//! that ship no model. The blockstate variant is picked by the property values of one of our
+//! states (ADR 0019): `boxel:log[axis=y]` reads the pack's `axis=y` variant ([`pack_variant`]). Grayscale textures Minecraft tints by biome (grass, foliage, water) get a
 //! fixed plains tint baked in. Layers the pack cannot fill keep their procedural pixels and add a
 //! warning to the [`TextureReport`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use boxel_pack::{BlockState as PackState, FaceName, ResourceId, ResourcePack, Texture};
+use boxel_pack::{
+    BlockState as PackState, FaceName, ResourceId, ResourcePack, Texture, VariantList,
+    condition_matches, parse_variant_key,
+};
 use boxel_voxel::{BlockRegistry, BlockState, Face, RenderShape, TextureSpec};
 
 use crate::textures::{
@@ -130,7 +134,10 @@ struct Recipe {
     layer: &'static str,
     /// Minecraft block whose blockstate and model are read (`grass_block`).
     block: &'static str,
-    /// Preferred variant key of the blockstate (`snowy=false`); then `""`, then the first one.
+    /// Our state whose property values pick the blockstate variant (`boxel:log[axis=y]`), or
+    /// `""`. Its properties are named like Minecraft's.
+    state: &'static str,
+    /// Values of Minecraft properties our block lacks (`snowy=false`), added to the state's.
     variant: &'static str,
     /// Model face giving the texture (`North` stands for every side face).
     face: FaceName,
@@ -149,6 +156,7 @@ const fn recipe(
     Recipe {
         layer,
         block,
+        state: "",
         variant: "",
         face,
         tint: Tint::None,
@@ -219,7 +227,7 @@ const RECIPES: &[Recipe] = &[
         &[("block/bedrock", Tint::None)],
     ),
     Recipe {
-        variant: "axis=y",
+        state: "boxel:log[axis=y]",
         ..recipe(
             "boxel:log_side",
             "oak_log",
@@ -228,7 +236,7 @@ const RECIPES: &[Recipe] = &[
         )
     },
     Recipe {
-        variant: "axis=y",
+        state: "boxel:log[axis=y]",
         ..recipe(
             "boxel:log_top",
             "oak_log",
@@ -293,8 +301,8 @@ const RECIPES: &[Recipe] = &[
         FaceName::Up,
         &[("block/lava_still", Tint::None)],
     ),
-    // ADR 0018: glass (translucent, its alpha kept), and the cross plants (cutout). Slabs use
-    // the stone layer and the turned logs the log layers.
+    // ADR 0018: glass (translucent, its alpha kept), and the cross plants (cutout). Slabs (all
+    // three types) use the stone layer and the turned logs the log layers.
     recipe(
         "boxel:glass",
         "glass",
@@ -339,7 +347,7 @@ fn pack_block_textures(
     let mut from_pack = 0;
     for (index, spec) in specs.iter().enumerate() {
         let shape = shapes.get(index).copied().flatten();
-        match pack_layer(pack, spec, size, warnings) {
+        match pack_layer(registry, pack, spec, size, warnings) {
             Some(mut texels) => {
                 let cutout = finish_alpha(&mut texels, shape);
                 push_layer(&mut data, &texels, size, cutout);
@@ -439,6 +447,7 @@ fn finish_alpha(texels: &mut [[u8; 4]], shape: Option<RenderShape>) -> bool {
 /// Level 0 of `spec`'s layer from the pack (`size`^2 texels), or `None` (with a warning) when
 /// the pack lacks its textures.
 fn pack_layer(
+    registry: &BlockRegistry,
     pack: &ResourcePack,
     spec: &TextureSpec,
     size: u32,
@@ -463,7 +472,7 @@ fn pack_layer(
             }
         };
     };
-    if let Some(parts) = model_parts(pack, recipe) {
+    if let Some(parts) = model_parts(pack, recipe, &recipe_values(registry, recipe)) {
         match compose(pack, &parts, size, warnings) {
             Ok(texels) => return Some(texels),
             Err(missing) => warnings.push(format!(
@@ -489,26 +498,73 @@ fn pack_layer(
     }
 }
 
+/// The property values `recipe` asks the blockstate for: those of its state (when `registry`
+/// has it) and its extra `variant` ones.
+fn recipe_values(registry: &BlockRegistry, recipe: &Recipe) -> BTreeMap<String, String> {
+    let mut values = parse_variant_key(recipe.variant);
+    if let Ok(state) = registry.parse_state(recipe.state) {
+        for (property, value) in registry.values(state).iter() {
+            values.insert(property.to_string(), value.to_string());
+        }
+    }
+    values
+}
+
+/// The models a Minecraft blockstate gives the state with property `values` (one of ours, by its
+/// property string: `boxel:stone_slab[type=top]` -> `type=top`). Variants: the key whose
+/// conditions all hold and name the most properties (`""` holds always), else the first one.
+/// Multipart: the first case whose condition holds. Properties the key names and `values` lack
+/// do not hold.
+pub(crate) fn pack_variant<'a>(
+    state: &'a PackState,
+    values: &BTreeMap<String, String>,
+) -> Option<&'a VariantList> {
+    match state {
+        PackState::Variants(variants) => {
+            let holds = |key: &str| {
+                let conditions = parse_variant_key(key);
+                conditions
+                    .iter()
+                    .all(|(k, v)| values.get(k) == Some(v))
+                    .then_some(conditions.len())
+            };
+            let mut best: Option<(usize, &VariantList)> = None;
+            for (key, list) in variants {
+                if let Some(n) = holds(key)
+                    && best.is_none_or(|(m, _)| n > m)
+                {
+                    best = Some((n, list));
+                }
+            }
+            best.map(|(_, list)| list)
+                .or_else(|| variants.values().next())
+        }
+        PackState::Multipart(cases) => cases
+            .iter()
+            .find(|case| {
+                case.when
+                    .as_ref()
+                    .is_none_or(|when| condition_matches(when, values))
+            })
+            .map(|case| &case.apply),
+    }
+}
+
 /// The textures of `recipe.face` in the pack's model of `recipe.block` (first model of the
-/// preferred variant, every element that has the face, in order). `None` when the pack ships no
-/// blockstate or model for it (vanilla models are not built in), or the face is missing.
-/// Variant rotations and face UVs are ignored: built-in blocks are full cubes.
-fn model_parts(pack: &ResourcePack, recipe: &Recipe) -> Option<Vec<Part>> {
+/// variant [`pack_variant`] picks for `values`, every element that has the face, in order).
+/// `None` when the pack ships no blockstate or model for it (vanilla models are not built in),
+/// or the face is missing. Variant rotations and face UVs are ignored: built-in blocks are full
+/// cubes, and a turned log turns its texture itself.
+fn model_parts(
+    pack: &ResourcePack,
+    recipe: &Recipe,
+    values: &BTreeMap<String, String>,
+) -> Option<Vec<Part>> {
     let state = pack.blockstate(&ResourceId::new(
         ResourceId::DEFAULT_NAMESPACE,
         recipe.block,
     ))?;
-    let model = match state {
-        PackState::Variants(variants) => variants
-            .get(recipe.variant)
-            .or_else(|| variants.get(""))
-            .or_else(|| variants.values().next())?
-            .0
-            .first()?
-            .model
-            .clone(),
-        PackState::Multipart(cases) => cases.first()?.apply.0.first()?.model.clone(),
-    };
+    let model = pack_variant(state, values)?.0.first()?.model.clone();
     let model = pack.model(&model)?;
     let parts: Vec<Part> = model
         .elements
@@ -848,6 +904,92 @@ pub(crate) mod tests {
         let dirt = layer_of(&registry, "boxel:dirt");
         let procedural = generate_block_textures(registry.textures());
         assert_eq!(texel(&data, dirt, 7, 9), texel(&procedural, dirt, 3, 4));
+    }
+
+    /// ADR 0019: every state of ours reads the pack variant of its property string, so the logs
+    /// and slabs map onto Minecraft's `oak_log` and `stone_slab` blockstates as they are.
+    #[test]
+    fn each_state_picks_the_variant_of_its_properties() {
+        let pack = TempPack::new("variants");
+        pack.file(
+            "blockstates/oak_log.json",
+            r#"{"variants":{"axis=x":{"model":"block/log_x"},"axis=y":{"model":"block/log_y"},
+                "axis=z":{"model":"block/log_z"}}}"#,
+        );
+        pack.file(
+            "blockstates/stone_slab.json",
+            r#"{"variants":{"type=bottom":{"model":"block/slab"},
+                "type=double":{"model":"block/stone"},"type=top":{"model":"block/slab_top"}}}"#,
+        );
+        // A key over two properties, one we lack: only a state that has both holds it.
+        pack.file(
+            "blockstates/grass_block.json",
+            r#"{"variants":{"":{"model":"block/any"},"snowy=false":{"model":"block/grass"},
+                "snowy=true":{"model":"block/snowy"}}}"#,
+        );
+        pack.file(
+            "blockstates/oak_fence.json",
+            r#"{"multipart":[{"when":{"north":"true"},"apply":{"model":"block/fence_side"}},
+                {"apply":{"model":"block/fence_post"}}]}"#,
+        );
+        let pack = ResourcePack::open(&pack.0).expect("pack");
+        let registry = BlockRegistry::default_blocks();
+        let model_of = |block: &str, values: &BTreeMap<String, String>| {
+            let state = pack
+                .blockstate(&ResourceId::new(ResourceId::DEFAULT_NAMESPACE, block))
+                .expect("blockstate");
+            pack_variant(state, values).map(|list| list.0[0].model.to_string())
+        };
+        let values_of = |state| {
+            registry
+                .values(state)
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        for (block, mc, want) in [
+            ("boxel:log", "oak_log", ["log_x", "log_y", "log_z"]),
+            (
+                "boxel:stone_slab",
+                "stone_slab",
+                ["slab", "slab_top", "stone"],
+            ),
+        ] {
+            let block = registry.block_by_name(block).expect("block");
+            let models: Vec<String> = registry
+                .states(block)
+                .map(|s| model_of(mc, &values_of(s)).expect("variant"))
+                .collect();
+            let want: Vec<String> = want
+                .iter()
+                .map(|m| format!("minecraft:block/{m}"))
+                .collect();
+            assert_eq!(models, want);
+        }
+        let grass = |key: &str| model_of("grass_block", &parse_variant_key(key));
+        assert_eq!(
+            grass("snowy=false").as_deref(),
+            Some("minecraft:block/grass")
+        );
+        assert_eq!(grass("").as_deref(), Some("minecraft:block/any"));
+        let fence = |key: &str| model_of("oak_fence", &parse_variant_key(key));
+        assert_eq!(
+            fence("north=true").as_deref(),
+            Some("minecraft:block/fence_side")
+        );
+        assert_eq!(
+            fence("north=false").as_deref(),
+            Some("minecraft:block/fence_post")
+        );
+        // The recipes ask with the state's values: the log layers read `axis=y`.
+        let log_top = RECIPES
+            .iter()
+            .find(|r| r.layer == "boxel:log_top")
+            .expect("recipe");
+        assert_eq!(
+            model_of("oak_log", &recipe_values(&registry, log_top)).as_deref(),
+            Some("minecraft:block/log_y")
+        );
     }
 
     #[test]
