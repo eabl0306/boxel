@@ -484,7 +484,7 @@ impl BlockRegistryBuilder {
         let lava = tex("lava", [207, 78, 16], 22, glow([255, 190, 50]));
         // Non-cube content (ADR 0018), after the lamps so the earlier texture ids stay.
         let glass = tex("glass", [214, 236, 240], 4, P::Glass);
-        let short_grass = tex("short_grass", [96, 156, 56], 18, P::Plant);
+        let short_grass = tex("short_grass", [124, 178, 66], 18, P::Plant);
         let poppy = tex(
             "poppy",
             [58, 120, 38],
