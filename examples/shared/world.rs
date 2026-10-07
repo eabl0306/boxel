@@ -1,5 +1,5 @@
-//! The world options shared by the examples: `--world`, `--caves` and `--no-trees`, the
-//! generator they build, and the render capacity each world needs.
+//! The world options shared by the examples: `--world`, `--caves`, `--no-trees` and `--no-sea`,
+//! the generator they build, and the render capacity each world needs.
 #![allow(
     dead_code,
     reason = "each example uses its own part (headless_world has no renderer)"
@@ -7,7 +7,7 @@
 
 use boxel::prelude::*;
 use boxel::worldgen::overworld::CaveSettings;
-use boxel::worldgen::{Caves, FlatGenerator, OverworldSettings, TerrainSettings};
+use boxel::worldgen::{Caves, FlatGenerator, OverworldSettings, Sea, TerrainSettings};
 use std::sync::Arc;
 
 /// Help lines of the world options (two-space indent, flag column of 20), with the example's
@@ -19,7 +19,9 @@ pub fn usage(default: World) -> String {
                       over stone that goes down forever, with caves and trees); default {}
   --caves MODE        overworld caves: mc (default, with openings), closed (none reach the
                       surface) or off
-  --no-trees          no trees or plants (forest becomes terrain)",
+  --no-trees          no trees or plants (forest becomes terrain)
+  --no-sea            no sea: the forest and the overworld stay dry (water up to y = 46 by
+                      default, ADR 0021)",
         default.name()
     )
 }
@@ -96,6 +98,8 @@ pub struct WorldChoice {
     /// `--caves`, if given (only the overworld has caves).
     pub caves: Option<CaveMode>,
     pub trees: bool,
+    /// The sea of the forest and the overworld (`--no-sea` turns it off).
+    pub sea: bool,
 }
 
 impl Default for WorldChoice {
@@ -120,6 +124,7 @@ impl WorldChoice {
             world,
             caves: None,
             trees: true,
+            sea: true,
         }
     }
 
@@ -144,6 +149,7 @@ impl WorldChoice {
                 );
             }
             "--no-trees" => self.trees = false,
+            "--no-sea" => self.sea = false,
             _ => return Ok(false),
         }
         Ok(true)
@@ -172,6 +178,12 @@ impl WorldChoice {
         (self.world == World::Overworld).then(|| self.caves.unwrap_or(CaveMode::Mc))
     }
 
+    /// True if the world has a sea to turn off: the forest with trees and the overworld (the
+    /// terrain, which the forest without trees becomes, is always dry).
+    pub fn has_sea_option(self) -> bool {
+        self.has_trees() || self.world == World::Overworld
+    }
+
     /// True if the generator places trees: the forest and the overworld, unless `--no-trees`
     /// (flat and terrain never have any).
     pub fn has_trees(self) -> bool {
@@ -197,6 +209,9 @@ impl WorldChoice {
         if !self.trees && self.world == World::Overworld {
             label.push_str("-no-trees");
         }
+        if !self.sea && self.has_sea_option() {
+            label.push_str("-dry");
+        }
         label
     }
 
@@ -212,9 +227,10 @@ impl WorldChoice {
             (World::Terrain, _) | (World::Forest, false) => {
                 Arc::new(TerrainGenerator::new(seed, TerrainSettings::default()))
             }
-            (World::Forest, true) => {
-                Arc::new(ForestGenerator::new(seed, TerrainSettings::default()))
-            }
+            (World::Forest, true) => Arc::new(ForestGenerator {
+                sea: self.sea.then(Sea::default),
+                ..ForestGenerator::new(seed, TerrainSettings::default())
+            }),
             (World::Overworld, trees) => {
                 let mut settings = OverworldSettings {
                     caves: self
@@ -226,6 +242,9 @@ impl WorldChoice {
                 if !trees {
                     settings.trees = None;
                     settings.plants = None;
+                }
+                if !self.sea {
+                    settings.sea = None;
                 }
                 Arc::new(OverworldGenerator::new(seed, settings))
             }
@@ -271,6 +290,11 @@ mod tests {
         assert_eq!(default.label(), "forest");
         assert_eq!(default.generator(1).name(), "forest");
         assert_eq!(default.cave_mode(), None);
+        assert!(default.sea);
+        let dry = parse(&["--no-sea"]).expect("valid");
+        assert_eq!((dry.sea, dry.label().as_str()), (false, "forest-dry"));
+        let terrain = parse(&["--world", "terrain", "--no-sea"]).expect("valid");
+        assert_eq!(terrain.label(), "terrain", "the terrain is always dry");
         let o = parse(&["--world", "overworld"]).expect("valid");
         assert_eq!(
             (o.cave_mode(), o.label().as_str()),
