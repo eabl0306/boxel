@@ -1,6 +1,6 @@
 # ADR 0017: con el límite en la frecuencia del monitor, el ritmo lo marca el monitor
 
-- Estado: aceptado
+- Estado: aceptado, con la revisión del 2026-10-07 (issue #2, ver "Revisión")
 - Fecha: 2026-10-07
 - Revisa: ADR 0013 (la espera a la compuerta) y el punto 5 del contrato del runner (ADR 0008)
 
@@ -44,14 +44,22 @@ frame de la RTX cruza por PRIME y el compositor espera su fence (sincronización
   - la compuerta sigue a los frame callbacks: Wayland, y los redraws de verdad esperan al
     compositor (un `RedrawRequested` que llega menos de 0.5 ms después de pedirlo no cuenta, y
     tras 8 seguidos se deja de seguir al monitor; así una ventana sin render, que recibe el redraw
-    al instante, sigue con su grilla);
+    al instante, sigue con su grilla). Para empezar a seguirlo hacen falta 2 callbacks seguidos;
   - `FrameLimit` está en el 99 % de la frecuencia del monitor o más
-    (`MonitorHandle::refresh_rate_millihertz`, que el runner consulta una vez por segundo);
+    (`MonitorHandle::refresh_rate_millihertz`, que el runner consulta una vez por segundo, solo
+    en Wayland; en las demás plataformas, una vez al crear la ventana);
+  - los frame callbacks llegan a esa frecuencia: si la mediana de los últimos 16 intervalos se
+    aleja más de un 10 % del período informado, se vuelve a la grilla (la ventana está en otro
+    monitor que el que dice winit, o hay VRR);
   - la ventana está visible.
 - Entonces el reloj es el frame callback: cada update corre apenas llega el suyo (no antes de
   medio período después del deadline anterior; los deadlines usan el período del monitor), y con
-  la compuerta cerrada lo espera hasta un refresco y un cuarto después del deadline (lo que tarda
-  el callback de un refresco salteado), sin espera activa: el callback despierta el bucle. Si no
+  la compuerta cerrada lo espera hasta un refresco más un cuarto de refresco, con ese cuarto de
+  2 ms como máximo (1.25 refrescos a 144 Hz, 1.12 a 60 Hz), contados desde el deadline o desde el
+  pedido del redraw si la update anterior terminó más tarde (lo que tarda el callback de un
+  refresco salteado), sin espera activa: el callback despierta el bucle. Una compuerta abierta que
+  ninguna update usó (no se presentó nada) no cuenta como callback: la update espera su deadline.
+  Si no
   llega, la update corre sin presentar, como antes, y una ventana oculta baja a 30 Hz por el
   watchdog de 100 ms (ADR 0008).
 - Arrancar justo en el callback le da al frame el mayor margen antes del límite del compositor.
@@ -128,6 +136,34 @@ de 20 s por caso y versión, intercaladas (antes: 0e92379, que mide sin cambiar 
   depende de que winit no informe una frecuencia más baja que la real (si no, la grilla se corre
   contra el compositor como pasaba con 143).
 - Medir la frecuencia con los callbacks en vez de preguntarle a winit: los callbacks solo llegan
-  después de presentar, así que con un límite bajo medirían el límite y no el monitor.
+  después de presentar, así que con un límite bajo medirían el límite y no el monitor. La
+  revisión sí los mide, pero solo para comprobar lo que dice winit, y solo los intervalos de un
+  redraw pedido menos de medio refresco después del callback anterior, que sí miden el monitor.
 - Tener la GPU ocupada para que no baje de estado: gasta batería para esconder un problema del
   driver.
+
+## Revisión
+
+Una revisión adversaria del código (issue #2) encontró estos problemas. Cada arreglo tiene su
+test sobre `RunnerCore`.
+
+- **Compuerta abierta sin usar (alto).** Al seguir al monitor, si nada presentaba (sin cámara, un
+  menú, la GPU sin estar lista, la superficie reconstruyéndose), la compuerta quedaba abierta y cada
+  update corría medio refresco después de la anterior: 288 updates por segundo a 144 Hz, sin
+  respetar el límite. Ahora solo cuenta un callback que llegó después de la última update; si
+  no, la update espera su deadline.
+- **Update lenta (medio).** La espera máxima se contaba desde el deadline, así que una update que
+  terminaba más de 1.25 refrescos tarde (un juego por debajo de unos 64 fps) no esperaba su
+  callback y la siguiente corría sin presentar. Ahora se cuenta desde el pedido del redraw si es
+  más tarde.
+- **Frecuencia informada distinta de la real (medio).** Winit da la frecuencia del primer monitor
+  donde entró la ventana; con varios monitores o VRR puede no ser la de los callbacks. Ahora se
+  comprueba con la mediana de los intervalos entre callbacks, como dice la decisión.
+- **Menores.** La frecuencia se consulta cada segundo solo en Wayland (en macOS cuesta un viaje
+  al servidor de ventanas). Hacen falta 2 callbacks seguidos para empezar a seguir al monitor. Un
+  cambio de límite mientras se espera la compuerta ya no arrastra la espera anterior en
+  `FramePacingInfo`. El texto decía "un refresco y un cuarto", pero el cuarto tiene tope de
+  2 ms: a 60 Hz son 1.12 refrescos.
+- El test con ventana (`frame_limit_window`) no puede ver `display_locked` en ningún caso: en
+  Wayland la ventana no se mapea y no hay frecuencia, y en X11 la compuerta no sigue callbacks.
+  Lo cubren los tests unitarios del runner.

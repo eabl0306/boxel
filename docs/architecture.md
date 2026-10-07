@@ -1072,9 +1072,10 @@ presenta como mucho una vez por refresco del monitor.
   abajo aunque el límite esté por debajo del panel (111 a 119 con 120).
 - Con el límite en el 99 % de la frecuencia del monitor o más (ADR 0017), en Wayland el ritmo lo
   marca el monitor (`MonitorHandle::refresh_rate_millihertz`): cada update corre apenas llega su
-  frame callback, y con la compuerta cerrada lo espera hasta un refresco y un cuarto, lo que tarda
-  el de un refresco que el compositor salteó. Solo si los redraws de verdad esperan al
-  compositor: una ventana sin render sigue con la grilla del límite. `FramePacingInfo` dice en
+  frame callback, y con la compuerta cerrada lo espera hasta un refresco más un cuarto de refresco
+  (con tope de 2 ms para ese cuarto), lo que tarda el de un refresco que el compositor salteó.
+  Solo si los redraws de verdad esperan al compositor (2 callbacks seguidos) y los callbacks
+  llegan a la frecuencia que dice winit: una ventana sin render sigue con la grilla del límite. `FramePacingInfo` dice en
   cada update cómo se marcó el ritmo y el overlay F3 muestra `paced by the display`.
 - `PresentSettings { mode }` (recurso de `boxel_render`) cambia el vsync en tiempo de ejecución:
   `Setup` reconfigura la superficie con el mismo dispositivo. Por defecto vsync apagado:
