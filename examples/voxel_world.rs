@@ -10,8 +10,9 @@
 //! F3 shows the target, the selection and the light at the eye and the crosshair), never where a
 //! solid body is (the walking player: `PhysicsQuery::state_is_free`, against the placed block's
 //! shape). A slab goes in as a top slab when the click hits the bottom of a block or the upper
-//! half of a side, and a log lies along the axis of the clicked face. Picking is a voxel raycast from the
-//! camera (`PhysicsQuery::raycast_voxels`), reach 6 blocks. G switches between flying and
+//! half of a side, and a log lies along the axis of the clicked face; a slab placed on the free
+//! half of a slab of the same block makes a double slab. F3 shows the target's full state
+//! (`boxel:log[axis=x]`). Picking is a voxel raycast from the camera (`PhysicsQuery::raycast_voxels`), reach 6 blocks. G switches between flying and
 //! walking: walking is a player body with gravity (`boxel::physics`, a 0.6 x 1.8 x 0.6 box and a
 //! `CharacterController`) that WASD moves along the view and Space makes jump, with the camera at
 //! its eye. F3 shows the mode and a physics line (`PhysicsStats`) in both modes.
@@ -50,7 +51,7 @@ use boxel::gfx::{CLI_HELP, DeviceClass, RgbaImage};
 use boxel::physics::{PhysicsPlugin, Probe as VoxelProbe};
 use boxel::prelude::*;
 use boxel::render::{DebugDestroyDevice, GpuFailed, GpuReady, SurfaceInfo, TextureSource};
-use boxel::voxel::{BlockModel, BlockRegistry, MAX_BLOCK_COORD};
+use boxel::voxel::{Axis, BlockRegistry, MAX_BLOCK_COORD};
 use boxel::window::winit::dpi::PhysicalSize;
 use boxel::window::{PrimaryWindow, WindowResized};
 use boxel::world::{BlockEdit, TimeOfDay, WorldContent, WorldStats, WorldSystems};
@@ -1175,52 +1176,74 @@ fn click_edit(
     }
 }
 
-/// The state that placing `block` on `hit` puts in (ADR 0018, until blocks have state
-/// properties): a slab (`NAME` or `NAME_top`) is a top slab when the click hits a bottom face or
-/// the upper half of a side face, a bottom slab otherwise; a block with turned variants
-/// (`NAME_x`, `NAME_z`, the logs) lies along the axis of the clicked face. Anything else is
-/// `block` itself.
+/// The state that placing `block` on `hit` puts in, from its state properties (ADR 0018, 0019):
+/// a slab (a `type` of `bottom | top | double`) goes in as a top slab when the click hits a
+/// bottom face or the upper half of a side face, as a bottom slab otherwise; a block with an
+/// `axis` (the logs) lies along the axis of the clicked face. Anything else is `block` itself.
 fn placed_state(registry: &BlockRegistry, block: BlockState, hit: &VoxelHit) -> BlockState {
-    let name = registry.name(block);
     let Some(face) = hit.face else {
         return block;
     };
-    let variant = |name: String| registry.by_name(&name).unwrap_or(block);
-    match registry.model(block) {
-        BlockModel::Slab(_) => {
-            let base = name.strip_suffix("_top").unwrap_or(name);
-            let top = match face {
-                Face::NegY => true,
-                Face::PosY => false,
-                _ => hit.point.frac.y >= 0.5,
-            };
-            variant(if top {
-                format!("{base}_top")
-            } else {
-                base.to_string()
-            })
-        }
-        BlockModel::Cube { .. } => {
-            let base = name
-                .strip_suffix("_x")
-                .or_else(|| name.strip_suffix("_z"))
-                .unwrap_or(name);
-            let turned = match face {
-                Face::PosX | Face::NegX => Some("_x"),
-                Face::PosZ | Face::NegZ => Some("_z"),
-                Face::PosY | Face::NegY => None,
-            };
-            match turned {
-                // Only blocks that have the turned variants turn.
-                Some(suffix) => registry
-                    .by_name(&format!("{base}{suffix}"))
-                    .unwrap_or(block),
-                None if base != name => variant(base.to_string()),
-                None => block,
-            }
-        }
-        BlockModel::Cross | BlockModel::Fluid => block,
+    if is_slab(registry, block) {
+        let top = match face {
+            Face::NegY => true,
+            Face::PosY => false,
+            _ => hit.point.frac.y >= 0.5,
+        };
+        return registry
+            .with(block, "type", if top { "top" } else { "bottom" })
+            .unwrap_or(block);
     }
+    registry
+        .with(block, "axis", Axis::of_face(face).name())
+        .unwrap_or(block)
+}
+
+/// True for a slab: a `type` property with `bottom`, `top` and `double`.
+fn is_slab(registry: &BlockRegistry, state: BlockState) -> bool {
+    ["bottom", "top", "double"]
+        .iter()
+        .all(|v| registry.with(state, "type", v).is_some())
+}
+
+/// The double slab a right click with slab `held` makes on `hit`, as in Minecraft (ADR 0019):
+/// clicking the inner face of a slab of the same block (the top of a bottom slab, the bottom of
+/// a top slab) fills its cell, and so does placing the other half into a cell that holds a slab
+/// of the same block (`at` reads the cell in front of the face). `None`: an ordinary placement.
+fn slab_merge(
+    registry: &BlockRegistry,
+    held: BlockState,
+    hit: &VoxelHit,
+    at: impl FnOnce(BlockPos) -> Option<BlockState>,
+) -> Option<BlockEdit> {
+    let face = hit.face?;
+    if !is_slab(registry, held) {
+        return None;
+    }
+    let same = |s: BlockState| registry.block(s) == registry.block(held);
+    let double = |s: BlockState| registry.with(s, "type", "double");
+    let half = |s: BlockState| registry.property(s, "type");
+    let inner = matches!(
+        (face, half(hit.state)),
+        (Face::PosY, Some("bottom")) | (Face::NegY, Some("top"))
+    );
+    if inner && same(hit.state) {
+        return Some(BlockEdit {
+            pos: hit.block,
+            state: double(hit.state)?,
+        });
+    }
+    let pos = hit.adjacent()?;
+    let existing = at(pos)?;
+    let placed = placed_state(registry, held, hit);
+    let other_half = matches!(
+        (half(existing), half(placed)),
+        (Some("bottom"), Some("top")) | (Some("top"), Some("bottom"))
+    );
+    (same(existing) && other_half).then_some(BlockEdit {
+        pos,
+        state: double(existing)?,
+    })
 }
 
 /// `+Y`, `-X`...
@@ -1240,7 +1263,7 @@ fn picking_lines(picking: &Picking, registry: &BlockRegistry) -> [String; 2] {
     let target = match &picking.target {
         Some(hit) => format!(
             "Target {} {} {} {}  face {}",
-            registry.name(hit.state),
+            registry.state_name(hit.state),
             hit.block.x,
             hit.block.y,
             hit.block.z,
@@ -1321,7 +1344,8 @@ fn pick_blocks(
     if let (Some(hit), Some(click)) = (target, click) {
         // The placement check: never a block inside the player (or any solid body), against the
         // shape the block will have.
-        let block = placed_state(&content.registry, picking.block(), &hit);
+        let registry = &content.registry;
+        let block = placed_state(registry, picking.block(), &hit);
         let free = |pos: BlockPos| match physics.probe(pos) {
             VoxelProbe::Block(state) => {
                 (state.is_air() || physics.collision().is_fluid(state))
@@ -1329,7 +1353,20 @@ fn pick_blocks(
             }
             VoxelProbe::Unloaded => false,
         };
-        if let Some(edit) = click_edit(click, &hit, block, free) {
+        // A slab on a slab of the same block: the double slab, checked as the full cube.
+        let probe = |pos: BlockPos| match physics.probe(pos) {
+            VoxelProbe::Block(state) => Some(state),
+            VoxelProbe::Unloaded => None,
+        };
+        let merge = match click {
+            Click::Place => slab_merge(registry, picking.block(), &hit, probe),
+            Click::Break => None,
+        };
+        let edit = match merge {
+            Some(edit) => physics.state_is_free(edit.pos, edit.state).then_some(edit),
+            None => click_edit(click, &hit, block, free),
+        };
+        if let Some(edit) = edit {
             edits.set_block(edit.pos, edit.state);
         }
     }
@@ -2058,7 +2095,7 @@ mod tests {
     #[test]
     fn placed_slabs_take_the_clicked_half_and_logs_the_clicked_axis() {
         let registry = BlockRegistry::default_blocks();
-        let by = |n: &str| registry.by_name(n).expect("built-in");
+        let by = |n: &str| registry.parse_state(n).expect("built-in");
         let hit = |face, y: f64| VoxelHit {
             block: BlockPos::new(0, 0, 0),
             face: Some(face),
@@ -2067,7 +2104,8 @@ mod tests {
             state: by("boxel:stone"),
         };
         let slab = by("boxel:stone_slab");
-        let slab_top = by("boxel:stone_slab_top");
+        let slab_top = by("boxel:stone_slab[type=top]");
+        let double = by("boxel:stone_slab[type=double]");
         for (face, y, want) in [
             (Face::PosY, 1.0, slab),
             (Face::NegY, 0.0, slab_top),
@@ -2075,34 +2113,107 @@ mod tests {
             (Face::NegZ, 0.75, slab_top),
             (Face::PosZ, 0.5, slab_top),
         ] {
-            assert_eq!(
-                placed_state(&registry, slab, &hit(face, y)),
-                want,
-                "{face:?}"
-            );
-            assert_eq!(
-                placed_state(&registry, slab_top, &hit(face, y)),
-                want,
-                "{face:?}"
-            );
+            for held in [slab, slab_top, double] {
+                assert_eq!(
+                    placed_state(&registry, held, &hit(face, y)),
+                    want,
+                    "{face:?}"
+                );
+            }
         }
         let log = by("boxel:log");
         for (face, want) in [
             (Face::PosY, log),
-            (Face::NegX, by("boxel:log_x")),
-            (Face::PosZ, by("boxel:log_z")),
+            (Face::NegX, by("boxel:log[axis=x]")),
+            (Face::PosZ, by("boxel:log[axis=z]")),
         ] {
-            assert_eq!(
-                placed_state(&registry, log, &hit(face, 0.5)),
-                want,
-                "{face:?}"
-            );
+            for held in [log, want] {
+                assert_eq!(
+                    placed_state(&registry, held, &hit(face, 0.5)),
+                    want,
+                    "{face:?}"
+                );
+            }
         }
-        // Blocks without variants stay as they are.
+        // Blocks without those properties stay as they are.
         let stone = by("boxel:stone");
         assert_eq!(placed_state(&registry, stone, &hit(Face::PosX, 0.5)), stone);
         let grass = by("boxel:short_grass");
         assert_eq!(placed_state(&registry, grass, &hit(Face::NegY, 0.0)), grass);
+    }
+
+    #[test]
+    fn a_slab_on_the_free_half_of_a_slab_makes_a_double_slab() {
+        let registry = BlockRegistry::default_blocks();
+        let by = |n: &str| registry.parse_state(n).expect("built-in");
+        let (bottom, top) = (by("boxel:stone_slab"), by("boxel:stone_slab[type=top]"));
+        let double = by("boxel:stone_slab[type=double]");
+        let cell = BlockPos::new(4, 5, 6);
+        let hit = |state, face, y: f64| VoxelHit {
+            block: cell,
+            face: Some(face),
+            t: 1.0,
+            point: WorldPos::from_dvec3(DVec3::new(4.5, 5.0 + y, 6.0)),
+            state,
+        };
+        let air = |_| Some(BlockState::AIR);
+        let at_cell = |pos| Some(BlockEdit { pos, state: double });
+        // The inner face of the slab itself, with either half held.
+        for held in [bottom, top] {
+            assert_eq!(
+                slab_merge(&registry, held, &hit(bottom, Face::PosY, 0.5), air),
+                at_cell(cell)
+            );
+            assert_eq!(
+                slab_merge(&registry, held, &hit(top, Face::NegY, 0.5), air),
+                at_cell(cell)
+            );
+        }
+        // Its outer faces place into the next cell as usual.
+        assert_eq!(
+            slab_merge(&registry, bottom, &hit(bottom, Face::NegY, 0.0), air),
+            None
+        );
+        assert_eq!(
+            slab_merge(&registry, bottom, &hit(top, Face::PosY, 1.0), air),
+            None
+        );
+        // Not a slab of the same block (or not a slab at all): no merge.
+        let stone = by("boxel:stone");
+        assert_eq!(
+            slab_merge(&registry, stone, &hit(bottom, Face::PosY, 0.5), air),
+            None
+        );
+        assert_eq!(
+            slab_merge(&registry, bottom, &hit(stone, Face::PosY, 1.0), air),
+            None
+        );
+        assert_eq!(
+            slab_merge(&registry, bottom, &hit(double, Face::PosY, 1.0), air),
+            None
+        );
+        // The side of a wall whose next cell holds a bottom slab: the upper half of the side
+        // places a top slab there, which merges; the lower half a bottom slab, which does not.
+        let east = BlockPos::new(5, 5, 6);
+        let next = |pos: BlockPos| (pos == east).then_some(bottom);
+        assert_eq!(
+            slab_merge(&registry, bottom, &hit(stone, Face::PosX, 0.75), next),
+            at_cell(east)
+        );
+        assert_eq!(
+            slab_merge(&registry, bottom, &hit(stone, Face::PosX, 0.25), next),
+            None
+        );
+        // An unloaded cell or a ray from inside a block: nothing.
+        assert_eq!(
+            slab_merge(&registry, bottom, &hit(stone, Face::PosX, 0.75), |_| None),
+            None
+        );
+        let inside = VoxelHit {
+            face: None,
+            ..hit(bottom, Face::PosY, 0.5)
+        };
+        assert_eq!(slab_merge(&registry, bottom, &inside, air), None);
     }
 
     #[test]

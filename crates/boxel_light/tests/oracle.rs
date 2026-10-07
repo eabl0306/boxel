@@ -195,6 +195,39 @@ fn a_lamp_in_the_dark_fades_by_distance() {
     }
 }
 
+/// ADR 0019: in a corridor, a slab lets the lamp's light through at the cost of air, a double
+/// slab stops it like stone.
+#[test]
+fn a_double_slab_stops_light_and_a_slab_does_not() {
+    let (registry, b) = test_registry(false);
+    let tables = LightTables::from_registry(&registry);
+    let state = |name: &str| registry.parse_state(name).unwrap();
+    let roof = SkyTile::uniform(1000, i64::MIN);
+    for (slab, beyond) in [
+        ("boxel:stone_slab[type=bottom]", [14 - 6, 11 - 6, 0]),
+        ("boxel:stone_slab[type=top]", [14 - 6, 11 - 6, 0]),
+        ("boxel:stone_slab[type=double]", [0; 3]),
+    ] {
+        let slab = state(slab);
+        // Stone everywhere but the corridor x in 5..27 at y = z = 16; the lamp at x = 10, the
+        // slab at x = 14.
+        let chunks = scene(&b, |x, y, z| match (x, y, z) {
+            (10, 16, 16) => b.lamps[0],
+            (14, 16, 16) => slab,
+            (5..27, 16, 16) => b.air,
+            _ => b.stone,
+        });
+        let (light, _) = light_of(&chunks, [&roof; 9], &tables);
+        assert_eq!(light.get(13, 16, 16), LightValue::from_rgb([11, 8, 3]));
+        assert_eq!(
+            light.get(16, 16, 16),
+            LightValue::from_rgb(beyond),
+            "{}",
+            registry.state_name(slab)
+        );
+    }
+}
+
 #[test]
 fn a_shaft_gets_full_sky_at_its_bottom() {
     let (registry, b) = test_registry(false);

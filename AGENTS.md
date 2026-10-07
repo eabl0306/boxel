@@ -60,7 +60,7 @@ de GPU, corre también los tests de GPU:
 ## Dónde está cada cosa
 
 - `docs/architecture.md`: arquitectura, mapa de crates y roadmap.
-- `docs/adr/`: decisiones 0001 a 0018.
+- `docs/adr/`: decisiones 0001 a 0019.
 - `docs/planes/`: planes completos de cuevas, luz y físicas.
 - `docs/rendimiento/`: mediciones.
 - `docs/benchmarks.md`: cómo medir.

@@ -8,9 +8,9 @@ use boxel_voxel::{BlockPos, BlockRegistry, BlockState};
 /// `boxel:stone` in `BlockRegistry::default_blocks()`.
 pub const STONE: BlockState = BlockState(1);
 /// `boxel:leaves` (cutout, solid).
-pub const LEAVES: BlockState = BlockState(9);
+pub const LEAVES: BlockState = BlockState(11);
 /// `boxel:water` (translucent fluid, not solid).
-pub const WATER: BlockState = BlockState(10);
+pub const WATER: BlockState = BlockState(12);
 
 /// The collision table of the built-in blocks.
 pub fn table() -> CollisionTable {
