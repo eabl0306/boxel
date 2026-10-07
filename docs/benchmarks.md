@@ -67,6 +67,12 @@ un arena de 24 Mi quads y 65 536 slots; `--arena-quads N` y `--chunk-slots N` lo
 resumen anota el mundo y el arena y los slots que el renderer obtuvo de verdad (los límites del
 dispositivo pueden recortarlos), y `tools/bench_report.py` solo compara corridas del mismo mundo.
 
+`--water Y` llena de agua todo el aire a la altura `Y` o más abajo (lagos y mares) y pone un bloque
+de vidrio en la superficie de una de cada 29 columnas de agua: chunks con quads translúcidos para
+medir el pase translúcido y su orden (ADR 0018). El forest tiene la superficie entre 16 y 112, así
+que `--water 62` cubre más o menos la mitad. El resumen anota el mundo como `forest+water62` y
+`tools/bench_report.py` no lo mezcla con el forest seco.
+
 `--light off` apaga la luz de vóxeles y la oclusión ambiental: el mundo se ve y cuesta como antes
 de la luz (por defecto es `on`). El resumen lo anota y `tools/bench_report.py` no mezcla corridas
 con luz distinta. Las corridas viejas sin el dato cuentan como `on` si anotan la hora (llegó con
