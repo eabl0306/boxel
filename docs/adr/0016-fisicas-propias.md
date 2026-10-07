@@ -81,6 +81,10 @@ Dos datos del código pesan en el diseño:
   pero la luz ya entró (`emission` y `light_opacity`, ADR 0015) sin él. El campo llega con P5
   (losas y escaleras) y rompe `BlockDef` por su cuenta.
   `CollisionShape` es `non_exhaustive` (`Empty`, `Full`; las cajas vienen después).
+  **Nota (2026-10-07, ADR 0018):** llegó `BlockDef::collision` (`None`, `Full` o cajas en
+  dieciseisavos) y `CollisionShape::Boxes`. La tabla guarda además un contorno para apuntar que
+  sale del modelo. El barrido frena en la cara más cercana de las cajas, el raycast pega en la
+  forma real y `PhysicsQuery::state_is_free` chequea un bloque a poner con su forma.
 
 - **5. Chunks sin cargar: congelar.** Una fuente de vóxeles responde el bloque o
   `Probe::Unloaded`. Si un barrido necesita un bloque sin cargar, no mueve nada y devuelve

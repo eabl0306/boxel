@@ -1,7 +1,8 @@
 # ADR 0006: binary greedy meshing y PackedQuad de 8 bytes
 
 - Estado: aceptado (revisado 2026-10-05: 8 buckets, ver ADR 0012; enmendado 2026-10-06 por
-  ADR 0015: `mat` v2 y fork del merge, se aplica en la fase P2)
+  ADR 0015: `mat` v2 y fork del merge, se aplica en la fase P2; nota 2026-10-07 por ADR 0018:
+  código de forma en los flags)
 - Fecha: 2026-10-04
 
 ## Contexto
@@ -48,3 +49,10 @@ Aplicada en la fase P2 de la luz: el código ya usa el formato de esta enmienda.
   lugar del `u16` del vóxel, así que `src/greedy.rs` pasa a ser un fork de
   binary-greedy-meshing 0.5.2 (aviso MIT incluido). El crate queda como dependencia de desarrollo:
   con AO apagado y sin luz, los quads del fork son idénticos byte a byte a los de bgm.
+
+## Nota (2026-10-07, ADR 0018)
+
+Los 3 flags libres de `geo` (bits 29 a 31) son ahora un código de forma: cubo, cubo con textura
+girada (troncos en X o Z), mitad de abajo y mitad de arriba de la celda (losas) y cruz (plantas).
+El quad sigue en 8 bytes. Los bloques que no son cubos no pasan por el greedy: un paso por bloque
+emite sus quads con `w = h = 1`.

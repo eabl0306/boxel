@@ -813,3 +813,11 @@ Tests que lo vigilan:
   de memoria de quads (unos 290 MB contra 145 MB a radio 16 bajo tierra). Solo Low lo paga
   (sección 8), porque no puede leer la paleta de un storage buffer.
 - **Mezcla aditiva de colores**: necesita un BFS por fuente y satura.
+
+### 13. Formas de bloque (2026-10-07, ADR 0018)
+
+- Opacidad de luz: vidrio y plantas 0, losas 1 (no tapan del todo; un valor de 2 a 14 llevaría
+  la inundación a su camino lento en todos los chunks). Solo un cubo `Opaque` exige 15.
+- Una cara de losa usa la misma regla de luz y AO que la cara del cubo en su lugar (las 9 celdas
+  de la capa de enfrente), y el shader mueve `t` con la altura real: la media cara se ve igual
+  que esa parte de la cara del cubo. Una cruz toma la luz de su propia celda, sin AO.

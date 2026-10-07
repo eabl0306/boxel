@@ -46,7 +46,10 @@ just run voxel_world --tier mid
 Controles: clic izquierdo captura el mouse, Escape (o salir de la ventana) lo suelta. WASD para
 moverse, Espacio sube, Shift izquierdo baja, Ctrl izquierdo acelera. Con el mouse capturado, clic
 izquierdo rompe el bloque de la mira y clic derecho pone el bloque elegido (teclas 1 a 9 y 0; las
-lámparas de color van del 7 al 0), a 6 bloques como máximo y nunca donde está el jugador. G
+lámparas de color van del 7 al 0; la rueda del mouse recorre todos, también vidrio, losa de
+piedra, pasto corto, amapola y agua), a 6 bloques como máximo y nunca donde está el jugador. La
+losa queda arriba si el clic toca una cara de abajo o la mitad de arriba de un costado; el tronco
+se acuesta en el eje de la cara clickeada. G
 cambia entre volar y caminar: caminando hay gravedad, WASD camina hacia donde mira la cámara y
 Espacio salta (`--walk` arranca caminando). F3 muestra el overlay de debug (con el bloque
 apuntado, el modo, una línea de física, la luz en el ojo y en la mira, y la hora), F5 cambia el
