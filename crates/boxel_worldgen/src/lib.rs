@@ -16,6 +16,7 @@ use std::ops::RangeInclusive;
 mod forest;
 pub mod noise;
 pub mod overworld;
+mod plants;
 mod trees;
 
 pub use forest::ForestGenerator;
@@ -23,6 +24,7 @@ pub use noise::Frequency;
 pub use overworld::{
     CaveSettings, Caves, Heightmap, OverworldGenerator, OverworldSettings, SurfaceRules,
 };
+pub use plants::{PlantBlocks, PlantKind, Plants};
 pub use trees::{Tree, TreeBlock, Trees};
 
 /// A chunk generator.

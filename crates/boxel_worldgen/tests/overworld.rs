@@ -8,8 +8,8 @@ use boxel_voxel::{
 };
 use boxel_worldgen::overworld::{CaveSettings, Cheese, Fade, Heightmap, SurfaceFade};
 use boxel_worldgen::{
-    Caves, ForestGenerator, OverworldGenerator, OverworldSettings, TerrainGenerator, Tree, Trees,
-    WorldGenerator,
+    Caves, ForestGenerator, OverworldGenerator, OverworldSettings, PlantKind, Plants,
+    TerrainGenerator, Tree, Trees, WorldGenerator,
 };
 
 fn registry() -> BlockRegistry {
@@ -32,6 +32,7 @@ fn with_caves(caves: Option<CaveSettings>, trees: bool) -> OverworldGenerator {
         OverworldSettings {
             caves: caves.map(|settings| Caves { settings }),
             trees: trees.then(Trees::default),
+            plants: trees.then(Plants::default),
             ..OverworldSettings::default()
         },
     )
@@ -333,7 +334,11 @@ fn forest_fingerprint(g: &dyn WorldGenerator, r: &BlockRegistry, x: i64, z: i64)
 
 #[test]
 fn forest_keeps_the_recorded_trees() {
-    let forest = ForestGenerator::default();
+    // The fingerprints predate the plants (ADR 0018): without them, the same chunks.
+    let forest = ForestGenerator {
+        plants: None,
+        ..ForestGenerator::default()
+    };
     let r = registry();
     // Recorded by the former example `Forest` with the i32 coordinates (the last chunks before
     // the old edge included).
@@ -551,9 +556,10 @@ fn every_stage_has_its_own_salt() {
     let r = registry();
     let log = state(&r, "boxel:log");
     let leaves = state(&r, "boxel:leaves");
+    let plants = [state(&r, "boxel:short_grass"), state(&r, "boxel:poppy")];
     let with_trees = OverworldGenerator::default();
     let without = with_caves(Some(CaveSettings::default()), false);
-    // Trees only add logs and leaves over air: every other voxel is the same.
+    // Trees and plants only add logs, leaves and plants over air: every other voxel is the same.
     for (cx, cz) in [(0, 0), (4, -6), (-11, 2)] {
         let s = surface_chunk(&with_trees, cx, cz);
         for dy in -1..=1 {
@@ -562,7 +568,7 @@ fn every_stage_has_its_own_salt() {
             for (i, (&a, &b)) in a.iter().zip(&b).enumerate() {
                 if a != b {
                     assert!(
-                        b == BlockState::AIR && (a == log || a == leaves),
+                        b == BlockState::AIR && (a == log || a == leaves || plants.contains(&a)),
                         "{pos:?} {i}"
                     );
                 }
@@ -675,4 +681,49 @@ fn caves_off_near_the_surface_only_under_the_fades() {
             }
         }
     }
+}
+
+#[test]
+fn plants_grow_on_grass_where_the_column_hash_says() {
+    let forest = ForestGenerator::default();
+    let plants = forest.plants.clone().expect("default plants");
+    let r = registry();
+    let (grass, poppy) = (state(&r, "boxel:short_grass"), state(&r, "boxel:poppy"));
+    let (log, leaves) = (state(&r, "boxel:log"), state(&r, "boxel:leaves"));
+    let s = &forest.terrain.settings;
+    let grows_on = i64::from(s.sand_level) + 1..=i64::from(s.snow_level);
+    let mut counts = [0usize; 2];
+    for (cx, cz) in [
+        (0, 0),
+        (-3, 5),
+        (31_250, -31_250),
+        (-67_108_863, 67_108_860),
+    ] {
+        let mut chunks = std::collections::HashMap::new();
+        for lx in 0..32 {
+            for lz in 0..32 {
+                let (x, z) = (cx * 32 + lx, cz * 32 + lz);
+                let ground = i64::from(forest.terrain.height_at(x, z));
+                let cell = ground + 1;
+                let pos = ChunkPos::new(cx, cell >> 5, cz);
+                let data = chunks
+                    .entry(pos)
+                    .or_insert_with(|| forest.generate(ChunkKey::new(pos), &r));
+                let local = LocalPos::new(lx as u32, (cell & 31) as u32, lz as u32);
+                let got = data.get(local);
+                let want = match plants.plant_at(forest.terrain.seed, x, z) {
+                    _ if got == log || got == leaves => got,
+                    Some(PlantKind::ShortGrass) if grows_on.contains(&ground) => grass,
+                    Some(PlantKind::Flower) if grows_on.contains(&ground) => poppy,
+                    _ => BlockState::AIR,
+                };
+                assert_eq!(got, want, "column ({x}, {z})");
+                counts[0] += usize::from(got == grass);
+                counts[1] += usize::from(got == poppy);
+            }
+        }
+    }
+    // About 12 % and 1.2 % of 4096 columns (fewer where the ground is not grass).
+    assert!((250..=600).contains(&counts[0]), "{counts:?}");
+    assert!((15..=90).contains(&counts[1]), "{counts:?}");
 }

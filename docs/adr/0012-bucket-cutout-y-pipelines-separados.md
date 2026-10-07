@@ -1,6 +1,6 @@
 # ADR 0012: bucket cutout y pipelines opaco y cutout separados
 
-- Estado: aceptado
+- Estado: aceptado (nota 2026-10-07 por ADR 0018: el bucket 7 se dibuja)
 - Fecha: 2026-10-05
 
 ## Contexto
@@ -46,3 +46,10 @@ congelarlo.
   tarde.
 - Un flag por quad y dos draws por chunk sobre el mismo bucket: complica el culling y no ahorra
   memoria frente a un bucket propio.
+
+## Nota (2026-10-07, ADR 0018)
+
+El bucket 7 ya se dibuja: un tercer pipeline por tier (`fs_translucent`, mezcla alfa, sin
+escribir profundidad, sin culling de caras), después del cutout, con los chunks de atrás hacia
+adelante desde una lista en CPU que comparten los tres tiers (High suma un `draw_indexed` por
+chunk translúcido visible). El bucket cutout también lleva las plantas en cruz.

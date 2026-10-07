@@ -51,9 +51,12 @@ pub fn generate_block_textures(specs: &[TextureSpec]) -> BlockTextureData {
     }
 }
 
-/// Whether a procedural layer keeps binary alpha (the `Leaves` pattern).
+/// Whether a procedural layer keeps binary alpha (the `Leaves`, `Plant` and `Flower` patterns).
 pub(crate) fn is_cutout_pattern(spec: &TextureSpec) -> bool {
-    matches!(spec.pattern, TexturePattern::Leaves)
+    matches!(
+        spec.pattern,
+        TexturePattern::Leaves | TexturePattern::Plant | TexturePattern::Flower { .. }
+    )
 }
 
 /// Mip levels of a `size`^2 layer down to 1x1.
@@ -106,6 +109,77 @@ pub(crate) fn synthesize(spec: &TextureSpec) -> [[u8; 4]; BASE_TEXELS] {
                 if i / size % 4 == 3 {
                     for c in &mut texel[..3] {
                         *c = (u16::from(*c) * 7 / 10) as u8;
+                    }
+                }
+            }
+        }
+        TexturePattern::Glass => {
+            // A light frame, two short streaks and an almost clear inside.
+            for (i, texel) in texels.iter_mut().enumerate() {
+                let (x, y) = (i % size, i / size);
+                let frame = x == 0 || y == 0 || x == size - 1 || y == size - 1;
+                let streak = (x + 3 == y + 6 && (3..=7).contains(&x))
+                    || (x + 3 == y && (8..=11).contains(&x));
+                if streak {
+                    *texel = [250, 252, 255, 120];
+                } else {
+                    texel[3] = if frame { 200 } else { 24 };
+                }
+            }
+        }
+        TexturePattern::Liquid { alpha } => {
+            for texel in &mut texels {
+                texel[3] = alpha;
+            }
+        }
+        TexturePattern::Plant => {
+            // Blades of random height from the bottom row, darker near the ground.
+            for texel in &mut texels {
+                texel[3] = 0;
+            }
+            for x in 1..size - 1 {
+                if rng.below(3) == 0 {
+                    continue;
+                }
+                let height = 5 + rng.below(10) as usize;
+                for y in size - height..size {
+                    let t = &mut texels[y * size + x];
+                    t[3] = 255;
+                    if y + 3 >= size {
+                        for c in &mut t[..3] {
+                            *c = (u16::from(*c) * 3 / 4) as u8;
+                        }
+                    }
+                }
+            }
+        }
+        TexturePattern::Flower { color } => {
+            // A stem with two leaves (base color) under a round head of `color` with a light
+            // center.
+            for texel in &mut texels {
+                texel[3] = 0;
+            }
+            let stem = [
+                (7, 8),
+                (7, 9),
+                (7, 10),
+                (7, 11),
+                (7, 12),
+                (7, 13),
+                (7, 14),
+                (7, 15),
+            ];
+            for (x, y) in stem.into_iter().chain([(6, 11), (8, 12), (5, 10), (9, 13)]) {
+                texels[y * size + x][3] = 255;
+            }
+            for y in 3..8usize {
+                for x in 5..10usize {
+                    let (dx, dy) = (x.abs_diff(7), y.abs_diff(5));
+                    if dx + dy <= 3 {
+                        let noise = rng.range_inclusive(-amplitude, amplitude);
+                        let center = dx + dy == 0;
+                        texels[y * size + x] =
+                            with_noise(if center { [240, 220, 90] } else { color }, noise);
                     }
                 }
             }
@@ -313,11 +387,17 @@ mod tests {
         let mut leaves_layers = 0;
         for (i, s) in specs.iter().enumerate() {
             let leaves = matches!(s.pattern, TexturePattern::Leaves);
+            let binary = is_cutout_pattern(s);
+            // Glass and water keep their alpha for blending.
+            let blended = matches!(
+                s.pattern,
+                TexturePattern::Glass | TexturePattern::Liquid { .. }
+            );
             for level in 0..data.mip_levels {
                 for t in mip(&data, i, level) {
-                    if leaves {
+                    if binary {
                         assert!(t[3] == 0 || t[3] == 255, "{} mip {level}: {t:?}", s.name);
-                    } else {
+                    } else if !blended {
                         assert_eq!(t[3], 255, "{} mip {level}", s.name);
                     }
                 }

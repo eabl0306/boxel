@@ -4,9 +4,9 @@
 use boxel_light::box_light::{chunk_index, tile_index};
 use boxel_light::{LightInput, SkyInput, SkyTile};
 use boxel_voxel::{
-    BlockDef, BlockRegistry, BlockRegistryBuilder, BlockState, CHUNK_AREA, CHUNK_SIZE,
-    CHUNK_VOLUME, ChunkData, ChunkPos, FaceTextures, LightTables, LocalPos, Occupancy, RenderShape,
-    TextureId,
+    BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockRegistryBuilder, BlockState,
+    CHUNK_AREA, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, ChunkPos, FaceTextures, LightTables, LocalPos,
+    Occupancy, RenderShape, TextureId,
 };
 
 /// Small deterministic generator (`SplitMix64`).
@@ -59,7 +59,12 @@ pub fn test_registry(heavy: bool) -> (BlockRegistry, Blocks) {
         b.add_block(BlockDef {
             name: format!("test:{name}"),
             shape,
-            solid,
+            model: BlockModel::CUBE,
+            collision: if solid {
+                BlockCollision::Full
+            } else {
+                BlockCollision::None
+            },
             emission,
             light_opacity,
             textures: tex,

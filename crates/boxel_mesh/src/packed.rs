@@ -6,8 +6,9 @@ use std::ops::Range;
 
 /// Bit layout of [`PackedQuad`] v2 (frozen; mirrored by constants in `common.wgsl`).
 ///
-/// `geo`: `x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | flags:4` (flag bits:
-/// [`FLAG_EMISSIVE`](crate::layout::FLAG_EMISSIVE), the other 3 unused)
+/// `geo`: `x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | flags:4` (flag bit 0:
+/// [`FLAG_EMISSIVE`](crate::layout::FLAG_EMISSIVE); bits 1 to 3: the quad's shape code,
+/// [`GEO_SHAPE_SHIFT`](crate::layout::GEO_SHAPE_SHIFT), ADR 0018)
 /// `mat`: `layer:12 | ao:8 (2 bits per corner, 3 = open) | light:12 (palette index)`
 pub mod layout {
     /// Mask of one 5-bit position/extent field.
@@ -28,6 +29,27 @@ pub mod layout {
     /// draws it at the full brightness of its texture (no light, face shading or AO), the way
     /// Minecraft draws glowing blocks. Set by the mesher from `MaterialTable::emissive`.
     pub const FLAG_EMISSIVE: u32 = 1;
+    /// Shift of the 3-bit shape code (flag bits 1 to 3, ADR 0018): how the shader turns the
+    /// quad's cell and face into geometry. Codes other than [`SHAPE_CUBE`] and
+    /// [`SHAPE_TURNED`] come from the per-block path and have `w = h = 1`.
+    pub const GEO_SHAPE_SHIFT: u32 = 29;
+    /// Mask of the shape code (after the shift).
+    pub const GEO_SHAPE_MASK: u32 = 7;
+    /// A cube face (the greedy quads).
+    pub const SHAPE_CUBE: u8 = 0;
+    /// A cube face whose texture is turned a quarter (transposed: its vertical runs along the
+    /// face's u axis), for logs lying along X or Z. Greedy quads too.
+    pub const SHAPE_TURNED: u8 = 1;
+    /// A face of the lower half of the cell (bottom slab): side faces span `y` in `0..0.5`, the
+    /// +Y face lies at `y + 0.5`.
+    pub const SHAPE_LOWER_HALF: u8 = 2;
+    /// A face of the upper half of the cell (top slab): side faces span `y` in `0.5..1`, the -Y
+    /// face lies at `y + 0.5`.
+    pub const SHAPE_UPPER_HALF: u8 = 3;
+    /// A cross plant quad through the cell's diagonal, full height: face `PosX` is the one from
+    /// `(0, 0)` to `(1, 1)` in (x, z), face `PosZ` the one from `(1, 0)` to `(0, 1)`. Drawn from
+    /// both sides (cutout pipeline), without face shading, its light is the block's own cell.
+    pub const SHAPE_CROSS: u8 = 4;
     /// Mask of the texture layer.
     pub const MAT_LAYER_MASK: u32 = 0xFFF;
     /// Shift of the 4x2-bit AO field.
@@ -119,8 +141,8 @@ impl PackedQuad {
             | ((index as u32 & MAT_LIGHT_MASK) << MAT_LIGHT_SHIFT);
         self
     }
-    /// Replaces the 4 flag bits (`0..16`, debug-asserted; [`layout::FLAG_EMISSIVE`] is the only
-    /// one defined).
+    /// Replaces the 4 flag bits (`0..16`, debug-asserted; bit 0 is [`layout::FLAG_EMISSIVE`],
+    /// bits 1 to 3 the shape code).
     pub const fn with_flags(mut self, flags: u8) -> Self {
         use layout::*;
         debug_assert!(flags < 16);
@@ -154,6 +176,18 @@ impl PackedQuad {
     /// The 4 flag bits.
     pub const fn flags(self) -> u8 {
         ((self.geo >> layout::GEO_FLAGS_SHIFT) & 15) as u8
+    }
+    /// Shape code (`layout::SHAPE_*`).
+    pub const fn shape(self) -> u8 {
+        ((self.geo >> layout::GEO_SHAPE_SHIFT) & layout::GEO_SHAPE_MASK) as u8
+    }
+    /// Replaces the shape code (`0..8`, debug-asserted).
+    pub const fn with_shape(mut self, shape: u8) -> Self {
+        use layout::*;
+        debug_assert!((shape as u32) <= GEO_SHAPE_MASK);
+        self.geo = (self.geo & !(GEO_SHAPE_MASK << GEO_SHAPE_SHIFT))
+            | ((shape as u32 & GEO_SHAPE_MASK) << GEO_SHAPE_SHIFT);
+        self
     }
     /// True if the [`layout::FLAG_EMISSIVE`] flag is set.
     pub const fn is_emissive(self) -> bool {

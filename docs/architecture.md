@@ -2,7 +2,7 @@
 
 Documento técnico de referencia. Fecha: 2026-10-05. Estado: aprobado para el milestone M0
 (revisión final, después de tres revisiones adversariales del borrador v1).
-Las decisiones puntuales están en `docs/adr/` (0001 a 0017). Durante M0 hubo además una
+Las decisiones puntuales están en `docs/adr/` (0001 a 0018). Durante M0 hubo además una
 especificación para los agentes implementadores (en inglés, en `.scaffold/`), borrada al cerrar M0;
 este documento queda como referencia.
 
@@ -153,7 +153,7 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_worldgen` | trait `WorldGenerator`; generadores `FlatGenerator`, `TerrainGenerator`, `ForestGenerator` (terreno con árboles) y `OverworldGenerator` (superficie sobre piedra infinita hacia abajo, con cuevas y árboles; etapas en `overworld`: `Heightmap`, `SurfaceRules`, `Caves`, más `Trees`); ruido 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`) | voxel |
 | `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, mensajes (`ChunkMeshEvent`, `BlockChanged`, `ChunkDataEvent`), `ChunkStore`, reloj del mundo (`TimeOfDay`, `DaylightCurve`, `DaylightPlugin`) | app, voxel, mesh, light, worldgen, transform, diagnostic |
 | `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `SceneLight` (luz del cielo, ambiente y curva de brillo del frame), `PresentSettings` (vsync en tiempo de ejecución), texturas procedurales o de un resource pack (`TextureSource`), screenshots | gfx, shaders, world, camera, window, pack |
-| `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::solid`), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas, el integrador de un cuerpo (`step_body`, `predict`), el narrowphase (`shape_contact`) y la grilla del broadphase (`Grid`). Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`; pasos en `FixedPostUpdate`, interpolación en `AfterFixedMainLoop`), `PhysicsQuery` (rayos a vóxeles y cuerpos, cajas, el chequeo para poner bloques), `BodyIndex`, cuerpos (`RigidBody`, `Collider`, `Velocity`, `BodyPosition`, `Contacts`, `Interpolated`, `Teleport`, `Frozen`, `Sleeping`, `ReportContacts`), `CharacterController`, `Projectile` y los mensajes `VoxelImpact`, `CollisionStarted`, `CollisionEnded` y `ProjectileHit`. Los cuerpos quietos se duermen (despiertan con `BlockChanged` y `ChunkDataEvent` del mundo, entre otras cosas) y, con muchos cuerpos despiertos, el paso corre en los hilos de cómputo. Fases P0 a P4 hechas | ecs, app, math, tasks, transform, voxel, world, diagnostic |
+| `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::collision`: cubos y cajas, más un contorno para apuntar, ADR 0018), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas, el integrador de un cuerpo (`step_body`, `predict`), el narrowphase (`shape_contact`) y la grilla del broadphase (`Grid`). Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`; pasos en `FixedPostUpdate`, interpolación en `AfterFixedMainLoop`), `PhysicsQuery` (rayos a vóxeles y cuerpos, cajas, el chequeo para poner bloques), `BodyIndex`, cuerpos (`RigidBody`, `Collider`, `Velocity`, `BodyPosition`, `Contacts`, `Interpolated`, `Teleport`, `Frozen`, `Sleeping`, `ReportContacts`), `CharacterController`, `Projectile` y los mensajes `VoxelImpact`, `CollisionStarted`, `CollisionEnded` y `ProjectileHit`. Los cuerpos quietos se duermen (despiertan con `BlockChanged` y `ChunkDataEvent` del mundo, entre otras cosas) y, con muchos cuerpos despiertos, el paso corre en los hilos de cómputo. Fases P0 a P4 hechas | ecs, app, math, tasks, transform, voxel, world, diagnostic |
 | `boxel_pack` | lector de resource packs de Minecraft Java (formatos ~64 a 120): `pack.mcmeta` con overlays, texturas de bloque PNG a RGBA8 (animaciones `.png.mcmeta`), modelos de bloque con herencia `parent` y variables `#`, blockstates `variants` y `multipart`. Solo datos; `boxel_render` lo usa para las texturas de bloque | (serde, png) |
 | `boxel_facade_check` | solo CI: prueba que los derives resuelven `::boxel::ecs` para un usuario que depende solo de `boxel` | fachada |
 | `vendor/*` (7 crates) | ECS y tareas (fork de Bevy) | - |
@@ -608,13 +608,17 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   los viewers a ese límite. Un chunk de lod k empieza en `pos << (5 + k)`. Detalles en
   ADR 0014.
 - **Registry** de datos: `BlockState(u16)` denso en tiempo de ejecución (0 = aire), nunca se
-  persiste crudo (M1 agrega el IdMap nombre a id). Tablas SoA: nombre, forma (`None`, `Opaque`,
-  `Cutout`, `Translucent`), flags, emisión RGB, opacidad de luz (15 en los opacos, 1 en hojas y
-  agua), texturas por cara. Contenido congelado: aire,
+  persiste crudo (M1 agrega el IdMap nombre a id). Tablas SoA: nombre, capa de dibujo (`None`,
+  `Opaque`, `Cutout`, `Translucent`), modelo (`Cube { axis }`, `Slab`, `Cross`, ADR 0018),
+  colisión (`None`, `Full` o cajas), flags, emisión RGB, opacidad de luz (15 en los cubos opacos,
+  1 en hojas, agua y losas, 0 en vidrio y plantas), texturas por cara. Solo un cubo `Opaque`
+  tapa caras vecinas (`BlockRegistry::occludes`). Contenido congelado: aire,
   piedra, tierra, pasto, arena, grava, nieve, bedrock, tronco, hojas (cutout), agua (translúcida),
   tablones y, desde la fase P6 de la luz, los primeros emisores: lámparas de cubo completo naranja
   (14, 11, 6), roja (14, 2, 2), azul (3, 6, 14) y blanca (15, 15, 15) y una lava provisoria
-  (15, 7, 2), opaca y sólida hasta que haya fluidos (`boxel_voxel::LAMPS`, `LAVA_EMISSION`).
+  (15, 7, 2), opaca y sólida hasta que haya fluidos (`boxel_voxel::LAMPS`, `LAVA_EMISSION`);
+  desde ADR 0018, vidrio, losa de piedra abajo y arriba, pasto corto, amapola y el tronco en X y
+  en Z. Cada variante es un estado propio hasta que haya estados de bloque.
 - **Contenedor de paleta:** `Uniform(state)` | `Packed { palette, bits 1/2/4/8, words }` |
   `Direct(u16)`. Los índices nunca cruzan palabras de 64 bits. `set` agrega a la paleta en el
   lugar mientras entra; se compacta al guardar o en reposo. Medido en un mundo de 512x256x512:
@@ -767,7 +771,8 @@ un `Mesher` thread-local (~0.6 MiB de scratch) y un `LightScratch` (~0.7 MiB).
    de columnas opacas y transparentes, con el centro completo y del vecino solo lo necesario
    (losas de 32x32 en caras, filas en aristas, un vóxel en esquinas). Clase: `Opaque` oculta caras
    vecinas; `Cutout` y `Translucent` son transparentes para bgm (no ocultan, y bgm omite las caras
-   entre dos vóxeles transparentes del mismo material).
+   entre dos vóxeles transparentes del mismo material). Los bloques que no son cubos (losas,
+   plantas) son `Special`: el greedy los ve como aire y una tercera máscara los marca.
 2. **Greedy binario** (`src/greedy.rs`, fork en el repo de bgm 0.5.2 con su aviso MIT): el culling
    de caras de bgm sin cambios y el merge una cara a la vez, comparando una clave por cara en
    lugar del id del vóxel. La clave es el material, el byte de AO y el índice de la paleta de luz
@@ -781,7 +786,11 @@ un `Mesher` thread-local (~0.6 MiB de scratch) y un `LightScratch` (~0.7 MiB).
    así que un quad fusionado es exacto. Los quads salen ya canónicos (esquina mínima, `w` y `h`
    en los ejes u y v de la cara). Validado contra oráculos de fuerza bruta de caras visibles y de
    sombreado.
-4. **Buckets (8, congelados, ADR 0012):** 0 a 5 = caras opacas en orden `Face`; 6 = **cutout**
+4. **Bloques que no son cubos** (ADR 0018): después del greedy, un paso por bloque emite sus
+   quads de `w = h = 1` con un código de forma. Una cara de losa en el borde se oculta contra un
+   cubo opaco o una cara vecina que la cubre, y se sombrea como la cara del cubo en su lugar. Una
+   cruz son dos quads en las diagonales, en el bucket cutout, con la luz de su propia celda.
+5. **Buckets (8, congelados, ADR 0012):** 0 a 5 = caras opacas en orden `Face`; 6 = **cutout**
    (todas las caras de materiales cutout, como las hojas); 7 = translúcido. `ChunkMesh` guarda los
    quads contiguos por bucket, `bucket_counts[8]`, la paleta de luz y un hash de todo. En el arena
    de la GPU la paleta va justo después de los quads del chunk (sección 10.2).
@@ -789,7 +798,7 @@ un `Mesher` thread-local (~0.6 MiB de scratch) y un `LightScratch` (~0.7 MiB).
 **`PackedQuad` (8 bytes):**
 
 ```
-geo: x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | flags:4 (ninguno definido)
+geo: x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | flags:4 (bit 0 emisivo, bits 1 a 3 forma)
 mat: capa:12 | ao:8 (2 bits por esquina, 3 = abierto) | luz:12 (índice en la paleta del chunk)
 ejes (u, v): ±Y -> (X, Z); ±X -> (Z, Y); ±Z -> (X, Y)
 ```
@@ -897,9 +906,13 @@ en M1.
 
 ### 10.3 Pases por tier
 
-Cada tier usa dos pipelines de vóxeles (ADR 0012): **opaco** (`fs_opaque`, sin `discard`, así se
-conserva el early-Z en todo el terreno, `cull_mode: Back`) para los buckets 0 a 5, y **cutout**
-(`fs_cutout`, alpha test, `cull_mode: None`) para el bucket 6, dibujado después.
+Cada tier usa tres pipelines de vóxeles (ADR 0012, ADR 0018): **opaco** (`fs_opaque`, sin
+`discard`, así se conserva el early-Z en todo el terreno, `cull_mode: Back`) para los buckets 0 a
+5, **cutout** (`fs_cutout`, alpha test, `cull_mode: None`) para el bucket 6, dibujado después, y
+**translúcido** (`fs_translucent`, mezcla alfa, test de profundidad sin escritura, `cull_mode:
+None`) para el bucket 7, al final. Los buckets translúcidos salen de una lista en CPU que comparten
+los tres tiers, con los chunks de atrás hacia adelante por distancia (dentro de un chunk los quads
+no se ordenan).
 
 **High** (Vulkan con MDI-count):
 
@@ -911,7 +924,8 @@ conserva el early-Z en todo el terreno, `cull_mode: Back`) para los buckets 0 a 
    first_index: 0, base_vertex: 0, first_instance: s }` y `DrawRef { chunk_slot, quad_start }` en
    la posición `s`. Cada lista tiene capacidad de hasta 65 535 draws (§5.11).
 3. Pase principal: pipeline opaco + `multi_draw_indexed_indirect_count` sobre la lista opaca;
-   pipeline cutout + otro sobre la lista cutout.
+   pipeline cutout + otro sobre la lista cutout; pipeline translúcido + un `draw_indexed` por
+   chunk translúcido visible, con su `DrawRef` en un buffer chico que la CPU escribe cada frame.
 4. Blit a la superficie.
 
 Hi-Z (oclusión en dos fases) queda para M2. Notas para entonces: con reverse-Z la pirámide usa
@@ -924,21 +938,20 @@ tiene compute).
 1. Culling en CPU con los mismos tests que el shader.
 2. Escribe los `DrawRef` del frame en el buffer de instancia.
 3. Pipeline opaco y `draw_indexed(0..n*6, 0, i..i+1)` por bucket de cara visible; después
-   pipeline cutout para los buckets cutout.
+   pipeline cutout para los buckets cutout y pipeline translúcido para los translúcidos.
 4. Blit.
 
 **Low** (GL 3.3, GLES 3.0, Vulkan/GL forzado):
 
 1. Culling en CPU.
-2. Pipeline `vs_instanced` (opaco y luego cutout), arena como buffer de vértices por instancia
+2. Pipeline `vs_instanced` (opaco, cutout y translúcido), arena como buffer de vértices por instancia
    (`Uint32x2` en `@location(0)`, stride 8) y el buffer de luz por quad como segundo buffer por
    instancia (`Uint32x2` en `@location(1)`, mismos offsets: el mismo `first_instance` llega a los
    dos), `TriangleStrip`; por bucket visible: `set_immediates(0, origen del chunk)` y
    `draw(0..4, primer_quad..primer_quad+n)`.
 3. Blit.
 
-El bucket translúcido se genera y se sube pero no se dibuja en M0 (pase translúcido con orden de
-atrás hacia adelante en M1).
+El bucket translúcido se dibuja desde ADR 0018 (agua y vidrio).
 
 ### 10.4 Cómo llega el id de chunk/draw al shader en cada backend
 

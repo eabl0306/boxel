@@ -41,8 +41,9 @@ use crate::components::{
 };
 use crate::core::sweep::effective_eps as sweep_eps;
 use crate::core::{
-    BlockBounds, BodySettings, CollisionLayers, CollisionTable, Contact, Grid, LocalBox,
-    MAX_RAY_DISTANCE, Shape, SweepConfig, box_box_moving, move_box, shape_box, shape_contact,
+    BlockBounds, BodySettings, CollisionLayers, CollisionShape, CollisionTable, Contact, Grid,
+    LocalBox, MAX_RAY_DISTANCE, Shape, SweepConfig, box_box_moving, move_box, shape_box,
+    shape_contact,
 };
 use crate::plugin::PhysicsContent;
 use crate::sleep::{SleeperData, Sleepers, sync_sleepers};
@@ -535,12 +536,21 @@ impl BodyIndex {
     /// there would not end up inside a player, a mob or a crate. Sensors (dropped items) do not
     /// count; whatever the block holds now is not checked.
     pub fn block_is_free(&self, block: BlockPos) -> bool {
-        self.overlapping(
-            WorldPos::from(block),
-            LocalBox::new(DVec3::ZERO, DVec3::ONE),
-            &BodyFilter::default(),
-        )
-        .is_empty()
+        self.shape_is_free(block, CollisionShape::Full)
+    }
+
+    /// The placement check of a shaped block: no solid body overlaps `shape` put at `block`
+    /// (any of its boxes for a slab; always free for a shape without collision, a plant).
+    pub fn shape_is_free(&self, block: BlockPos, shape: CollisionShape<'_>) -> bool {
+        let free = |bx: LocalBox| {
+            self.overlapping(WorldPos::from(block), bx, &BodyFilter::default())
+                .is_empty()
+        };
+        match shape {
+            CollisionShape::Empty => true,
+            CollisionShape::Full => free(LocalBox::new(DVec3::ZERO, DVec3::ONE)),
+            CollisionShape::Boxes(boxes) => boxes.iter().all(|&bx| free(bx)),
+        }
     }
 }
 

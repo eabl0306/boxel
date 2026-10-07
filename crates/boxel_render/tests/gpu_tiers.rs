@@ -23,6 +23,10 @@
 //! - a far scene: a 32x32 slab ~480 voxels away and a second slab of another texture 1 voxel
 //!   behind it (hidden), compared with the front slab alone (depth precision on every backend,
 //!   including GL where reverse-Z loses its precision gain);
+//! - the blocks of ADR 0018, meshed by the real `Mesher` over two chunks: a water pool and a
+//!   glass box (translucent bucket, blended back to front), bottom and top slabs, cross plants
+//!   and logs along X and Z, compared with the same scene without its translucent quads (the
+//!   translucent pass draws);
 //! - a stone floor textured from a tiny generated resource pack (`TextureSource::Pack`, 32x32
 //!   layers): the pack's pixels must show on every tier.
 //!
@@ -35,13 +39,18 @@ use boxel_gfx::{
     gpu_tests_required, read_texture_rgba8, run_in_error_scopes, submit_and_wait, tier_request,
 };
 use boxel_math::{DVec3, I64Vec3, IVec3, UVec2};
-use boxel_mesh::{BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, PackedQuad};
+use boxel_mesh::{
+    BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher,
+    PackedQuad, TRANSLUCENT_BUCKET,
+};
 use boxel_render::{
     DEFAULT_SKY_COLOR, RendererConfig, RendererError, RendererSmokeTest, ViewParams, VoxelRenderer,
     arena_len,
 };
 use boxel_transform::Transform;
-use boxel_voxel::{BlockRegistry, BlockState, Face, RenderShape};
+use boxel_voxel::{
+    BlockRegistry, BlockState, ChunkData, Face, LocalPos, RenderShape, neighbor_index,
+};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -332,6 +341,116 @@ fn hidden_mesh(n: u32) -> ChunkMesh {
     ChunkMesh::from_quads(vec![quad; n as usize], bucket_counts)
 }
 
+/// The blocks of ADR 0018 on a stone floor across chunks (0, 0, 0) and (1, 0, 0): a water pool
+/// in a stone rim, a glass box around a lamp-less stone pillar, bottom and top slabs as steps,
+/// short grass and poppies, and logs along X and Z. Meshed by the real mesher (no light: open
+/// sky). Returns `(chunk, mesh)` for both chunks.
+fn special_scene(registry: &BlockRegistry) -> Vec<(IVec3, ChunkMesh)> {
+    let get = |name: &str| registry.by_name(name).expect(name);
+    let mut dense = [
+        vec![BlockState::AIR; 32 * 32 * 32],
+        vec![BlockState::AIR; 32 * 32 * 32],
+    ];
+    let mut put = |x: i32, y: i32, z: i32, s: BlockState| {
+        let chunk = (x >> 5) as usize;
+        let local = LocalPos::new((x & 31) as u32, y as u32, z as u32);
+        dense[chunk][local.index()] = s;
+    };
+    for x in 0..64 {
+        for z in 0..32 {
+            put(x, 0, z, get("boxel:stone"));
+        }
+    }
+    // The pool: a stone rim around 6x6 water, one deep, on the floor.
+    for x in 3..11 {
+        for z in 3..11 {
+            let rim = x == 3 || x == 10 || z == 3 || z == 10;
+            put(
+                x,
+                1,
+                z,
+                if rim {
+                    get("boxel:stone")
+                } else {
+                    get("boxel:water")
+                },
+            );
+        }
+    }
+    // The glass box: a 4x4x4 shell around a stone pillar, across the chunk border.
+    for x in 30..34 {
+        for y in 1..5 {
+            for z in 5..9 {
+                let shell = x == 30 || x == 33 || y == 4 || z == 5 || z == 8;
+                if shell {
+                    put(x, y, z, get("boxel:glass"));
+                } else if (x, z) == (31, 6) {
+                    put(x, y, z, get("boxel:planks"));
+                }
+            }
+        }
+    }
+    // Steps: bottom slabs, then stone, then top slabs over air.
+    for z in 14..18 {
+        put(14, 1, z, get("boxel:stone_slab"));
+        put(15, 1, z, get("boxel:stone"));
+        put(16, 2, z, get("boxel:stone_slab_top"));
+    }
+    // Plants and logs.
+    for (i, x) in (20..28).enumerate() {
+        let plant = if i % 3 == 0 {
+            "boxel:poppy"
+        } else {
+            "boxel:short_grass"
+        };
+        put(x, 1, 14, get(plant));
+        put(x, 1, 20, get("boxel:log_x"));
+    }
+    for z in 22..28 {
+        put(40, 1, z, get("boxel:log_z"));
+    }
+    let chunks = dense.map(|d| ChunkData::from_dense(&d));
+    let materials = MaterialTable::from_registry(registry);
+    let mut mesher = Mesher::new();
+    let east = neighbor_index(IVec3::X).expect("face neighbor");
+    let west = neighbor_index(IVec3::NEG_X).expect("face neighbor");
+    (0..2)
+        .map(|i| {
+            let mut neighbors = [None; 26];
+            neighbors[if i == 0 { east } else { west }] = Some(&chunks[1 - i]);
+            let input = MeshInput {
+                center: &chunks[i],
+                neighbors,
+                light: None,
+            };
+            let mesh = mesher.mesh_chunk(&input, &materials, MeshOptions::default());
+            (IVec3::new(i as i32, 0, 0), mesh)
+        })
+        .collect()
+}
+
+/// `mesh` without its translucent quads (the last bucket).
+fn without_translucent(mesh: &ChunkMesh) -> ChunkMesh {
+    let mut out = mesh.clone();
+    let n = out.bucket_counts[TRANSLUCENT_BUCKET] as usize;
+    out.quads.truncate(out.quads.len() - n);
+    out.bucket_counts[TRANSLUCENT_BUCKET] = 0;
+    out.hash = out.compute_hash();
+    out
+}
+
+/// Looks at the special scene from the south-west, above the pool.
+fn special_view() -> ViewParams {
+    let eye = DVec3::new(6.0, 14.0, 34.0);
+    let d = (DVec3::new(24.0, 1.0, 12.0) - eye).as_vec3();
+    let yaw = (-d.x).atan2(-d.z);
+    let pitch = d.y.atan2(d.x.hypot(d.z));
+    view_params(
+        &Camera::default(),
+        &Transform::from_yaw_pitch(eye, yaw, pitch),
+    )
+}
+
 fn view_params(camera: &Camera, transform: &Transform) -> ViewParams {
     let view = CameraView::compute(camera, transform, WIDTH as f32 / HEIGHT as f32);
     ViewParams::from_camera(&view, camera, DEFAULT_SKY_COLOR, 0.6)
@@ -412,6 +531,9 @@ struct TierImages {
     far_both: RgbaImage,
     far_front: RgbaImage,
     far_back: RgbaImage,
+    /// The blocks of ADR 0018 ([`special_scene`]), and without their translucent quads.
+    special: RgbaImage,
+    special_opaque: RgbaImage,
     /// Full arena: after a failed grow of `REMOVED_CHUNK` (expected: `heightfield`), after its
     /// in-place shrink to a hidden quad (`minus_chunk`) and after growing it back
     /// (`heightfield`).
@@ -766,6 +888,33 @@ fn render_tier(
         return Err("an empty mesh did not remove the chunk".to_string());
     }
 
+    let special_meshes = special_scene(registry);
+    let upload = |renderer: &mut VoxelRenderer, opaque_only: bool| {
+        for (c, mesh) in &special_meshes {
+            let mesh = if opaque_only {
+                without_translucent(mesh)
+            } else {
+                mesh.clone()
+            };
+            renderer
+                .upsert_chunk(100 + chunk_id(*c), (*c * 32).as_i64vec3(), Arc::new(mesh))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok::<_, String>(())
+    };
+    upload(&mut renderer, false)?;
+    let (special, _) = render(&device, &queue, &mut renderer, &special_view())?;
+    let draws = renderer.stats().draws;
+    upload(&mut renderer, true)?;
+    let (special_opaque, _) = render(&device, &queue, &mut renderer, &special_view())?;
+    let opaque_draws = renderer.stats().draws;
+    // Both chunks have translucent quads: one more draw each on every tier.
+    if draws != opaque_draws + 2 {
+        return Err(format!(
+            "special scene: {draws} draws with the translucent buckets, {opaque_draws} without"
+        ));
+    }
+
     let errors = errors.lock().map(|e| e.clone()).unwrap_or_default();
     if !errors.is_empty() {
         return Err(format!("uncaptured errors: {errors:?}"));
@@ -781,6 +930,8 @@ fn render_tier(
         far_both,
         far_front,
         far_back,
+        special,
+        special_opaque,
         full_arena,
     })
 }
@@ -918,6 +1069,8 @@ fn tiers_render_identically() {
                     (&name("far_both"), &i.far_both),
                     (&name("far_front"), &i.far_front),
                     (&name("far_back"), &i.far_back),
+                    (&name("special"), &i.special),
+                    (&name("special_opaque"), &i.special_opaque),
                     (&name("full_arena_kept"), &i.full_arena[0]),
                     (&name("full_arena_shrunk"), &i.full_arena[1]),
                     (&name("full_arena_regrown"), &i.full_arena[2]),
@@ -937,6 +1090,16 @@ fn tiers_render_identically() {
                 (&name("far_front"), &i.far_front),
                 (&name("far_back"), &i.far_back),
                 0.1,
+            );
+            report.check_range(&name("special"), &i.special, 0.3..=1.0);
+            report.check_differs(
+                &format!(
+                    "{label} {}: special scene without its translucent quads",
+                    i.tier
+                ),
+                (&name("special"), &i.special),
+                (&name("special_opaque"), &i.special_opaque),
+                0.01,
             );
             report.check_differs(
                 &format!("{label} {}: heightfield minus one chunk", i.tier),
@@ -988,6 +1151,8 @@ fn tiers_render_identically() {
                 ("canopy", &best.canopy, &i.canopy),
                 ("minus_chunk", &best.minus_chunk, &i.minus_chunk),
                 ("far_both", &best.far_both, &i.far_both),
+                ("special", &best.special, &i.special),
+                ("special_opaque", &best.special_opaque, &i.special_opaque),
             ] {
                 report.check_same(
                     &format!("{label}: {} vs {} ({scene})", i.tier, best.tier),

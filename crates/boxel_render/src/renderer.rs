@@ -109,7 +109,8 @@ pub struct RenderStats {
     pub chunk_slot_capacity: u32,
     /// Chunks passing CPU culling (Mid/Low; High: 0, culling is on the GPU).
     pub visible_chunks: u32,
-    /// Draw calls recorded (High: 2 multi-draws, opaque + cutout).
+    /// Draw calls recorded (High: 2 multi-draws, opaque + cutout, plus one draw per visible
+    /// chunk with translucent quads).
     pub draws: u32,
     /// Chunks not resident because the arena or the chunk table was full (cumulative). Non-zero
     /// means holes in the world: raise `arena_quads`/`max_chunk_slots` or the view distance is
@@ -449,7 +450,8 @@ impl VoxelRenderer {
     }
     /// Encodes the tier's passes into the main color/depth targets: the chunk changes since the
     /// last call (uploads), clear, (High) cull, opaque buckets with the opaque pipeline, then the
-    /// cutout bucket with the cutout pipeline. Submit `encoder` before the next `render`.
+    /// cutout bucket with the cutout pipeline, then the translucent buckets back to front with
+    /// the translucent pipeline. Submit `encoder` before the next `render`.
     pub fn render(
         &mut self,
         device: &wgpu::Device,

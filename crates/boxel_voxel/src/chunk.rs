@@ -1,6 +1,6 @@
 use crate::{
     BlockRegistry, BlockState, CHUNK_AREA, CHUNK_VOLUME, LightMasks, LightTables, LocalPos,
-    Occupancy, OwnedLightMasks, Paletted, RenderShape,
+    Occupancy, OwnedLightMasks, Paletted,
 };
 use std::sync::OnceLock;
 
@@ -196,13 +196,14 @@ impl ChunkData {
             Paletted::Direct(_) => true,
         }
     }
-    /// Occupancy of voxels whose shape is `Opaque` per `registry` (the render shape; light
-    /// opacity 15 is [`LightMasks::opaque`], which may also hold `Cutout` blocks).
+    /// Occupancy of voxels that hide their neighbors per `registry` ([`BlockRegistry::occludes`],
+    /// an `Opaque` full cube; light opacity 15 is [`LightMasks::opaque`], which may also hold
+    /// `Cutout` blocks).
     ///
     /// Bit `z` of word `y * 32 + x`, so word `k` holds voxels `32 * k .. 32 * k + 32` in
     /// [`LocalPos`] index order.
     pub fn opaque_occupancy(&self, registry: &BlockRegistry) -> Box<Occupancy> {
-        let is_opaque = |s: BlockState| registry.shape(s) == RenderShape::Opaque;
+        let is_opaque = |s: BlockState| registry.occludes(s);
         let mut occupancy: Box<Occupancy> = Box::new([0; CHUNK_AREA]);
         match &self.blocks {
             Paletted::Uniform(s) => {

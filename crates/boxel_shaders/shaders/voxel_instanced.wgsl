@@ -30,3 +30,13 @@ fn fs_cutout(i: VsOut) -> @location(0) vec4<f32> {
   if (!alpha_test_passes(albedo)) { discard; }
   return shade_fragment(albedo, i, view);
 }
+
+// Translucent bucket (pipeline with alpha blending, depth test without depth write, cull_mode
+// None; drawn last, back to front per chunk): the shaded color with the texture's alpha.
+// Fully clear texels (the inside of glass) are dropped.
+@fragment
+fn fs_translucent(i: VsOut) -> @location(0) vec4<f32> {
+  let albedo = textureSample(block_textures, block_sampler, i.uv, i.layer);
+  if (albedo.a <= 0.0) { discard; }
+  return vec4(shade_fragment(albedo, i, view).rgb, albedo.a);
+}

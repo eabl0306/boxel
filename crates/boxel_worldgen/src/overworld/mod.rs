@@ -36,7 +36,7 @@ pub use caves::{
 };
 pub use terrain::{Heightmap, SurfaceBlocks, SurfaceRules};
 
-use crate::{Tree, Trees, WorldGenerator, block};
+use crate::{Plants, Tree, Trees, WorldGenerator, block};
 use boxel_voxel::{
     BlockPos, BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SHIFT, CHUNK_SIZE, CHUNK_VOLUME,
     ChunkData, ChunkKey, LocalPos,
@@ -57,10 +57,13 @@ pub struct OverworldSettings {
     pub caves: Option<Caves>,
     /// Trees (`None`: no trees).
     pub trees: Option<Trees>,
+    /// Short grass and flowers on grass whose top block the caves left solid, after the trees
+    /// (`None`: no plants).
+    pub plants: Option<Plants>,
 }
 
 impl Default for OverworldSettings {
-    /// The default heightmap and surface, the default caves (with openings) and trees.
+    /// The default heightmap and surface, the default caves (with openings), trees and plants.
     fn default() -> Self {
         Self {
             heightmap: Heightmap::default(),
@@ -69,6 +72,7 @@ impl Default for OverworldSettings {
                 settings: CaveSettings::default(),
             }),
             trees: Some(Trees::default()),
+            plants: Some(Plants::default()),
         }
     }
 }
@@ -160,16 +164,31 @@ impl OverworldGenerator {
         match tree {
             Some(crate::TreeBlock::Log) => log,
             Some(crate::TreeBlock::Leaves) => leaves,
-            None => BlockState::AIR,
+            None => self.plant_at(p, h, registry),
         }
     }
 
-    /// Voxels above the surface that trees may reach.
+    /// The plant at `p` (air if none): on the cell above a solid grass top (`h` is the column's
+    /// height).
+    fn plant_at(&self, p: BlockPos, h: i64, registry: &BlockRegistry) -> BlockState {
+        let (Some(plants), Some(blocks)) = (&self.settings.plants, Plants::blocks(registry)) else {
+            return BlockState::AIR;
+        };
+        let grows = p.y == h + 1
+            && self.settings.surface.is_grass(h)
+            && self.is_solid_in(BlockPos::new(p.x, h, p.z), h);
+        match plants.plant_at(self.seed, p.x, p.z) {
+            Some(kind) if grows => blocks.of(kind),
+            _ => BlockState::AIR,
+        }
+    }
+
+    /// Voxels above the surface that trees and plants may reach.
     fn reach_above(&self) -> i64 {
         if self.settings.trees.is_some() {
             Trees::HEIGHT
         } else {
-            0
+            i64::from(self.settings.plants.is_some())
         }
     }
 
@@ -320,6 +339,62 @@ impl OverworldGenerator {
         });
         (found, log, leaves)
     }
+
+    /// Puts the plants of the chunk at `origin` (column heights `heights`) into `dense` (`None`:
+    /// all air; created when a plant goes in), on the air cells above a solid grass top.
+    fn place_plants(
+        &self,
+        origin: BlockPos,
+        heights: &[i64; CHUNK_AREA],
+        dense: &mut Option<Vec<BlockState>>,
+        registry: &BlockRegistry,
+    ) {
+        let (Some(plants), Some(blocks)) = (&self.settings.plants, Plants::blocks(registry)) else {
+            return;
+        };
+        let size = i64::from(CHUNK_SIZE);
+        for lx in 0..size {
+            for lz in 0..size {
+                let ground = heights[((lx << CHUNK_SHIFT) | lz) as usize];
+                let ly = ground + 1 - origin.y;
+                if !(0..size).contains(&ly) || !self.settings.surface.is_grass(ground) {
+                    continue;
+                }
+                let (x, z) = (origin.x + lx, origin.z + lz);
+                let Some(kind) = plants.plant_at(self.seed, x, z) else {
+                    continue;
+                };
+                self.put_plant(origin, [lx, ly, lz], ground, blocks.of(kind), dense);
+            }
+        }
+    }
+
+    /// Puts `plant` at local `[lx, ly, lz]` of the chunk at `origin` if that cell is air and the
+    /// ground block under it (at height `ground`) is solid.
+    fn put_plant(
+        &self,
+        origin: BlockPos,
+        [lx, ly, lz]: [i64; 3],
+        ground: i64,
+        plant: BlockState,
+        dense: &mut Option<Vec<BlockState>>,
+    ) {
+        let index = |ly: i64| LocalPos::new(lx as u32, ly as u32, lz as u32).index();
+        let cell = dense.as_ref().map_or(BlockState::AIR, |d| d[index(ly)]);
+        if cell != BlockState::AIR {
+            return;
+        }
+        let solid = if ly >= 1 {
+            dense
+                .as_ref()
+                .is_some_and(|d| d[index(ly - 1)] != BlockState::AIR)
+        } else {
+            self.is_solid_in(BlockPos::new(origin.x + lx, ground, origin.z + lz), ground)
+        };
+        if solid {
+            dense.get_or_insert_with(|| vec![BlockState::AIR; CHUNK_VOLUME])[index(ly)] = plant;
+        }
+    }
 }
 
 impl WorldGenerator for OverworldGenerator {
@@ -363,6 +438,7 @@ impl WorldGenerator for OverworldGenerator {
             let dense = dense.get_or_insert_with(|| vec![BlockState::AIR; CHUNK_VOLUME]);
             Trees::place_dense(&trees, origin, dense, log, leaves);
         }
+        self.place_plants(origin, &heights, &mut dense, registry);
         dense.map_or_else(
             || ChunkData::uniform(BlockState::AIR),
             |d| ChunkData::from_dense(&d),

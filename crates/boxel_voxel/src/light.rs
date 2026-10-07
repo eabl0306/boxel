@@ -121,7 +121,7 @@ pub(crate) const CLASS_EMITS: u8 = 1 << 2;
 /// Per-state light lookups, built once from a frozen [`BlockRegistry`] (`SoA`, indexed by
 /// `BlockState.0`). States outside the registry read as air: opacity 0, no emission.
 ///
-/// Light only: collision is not here (the physics derives it from `StateFlags::SOLID`).
+/// Light only: collision is not here (the physics derives it from `BlockDef::collision`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LightTables {
     opacity: Vec<u8>,

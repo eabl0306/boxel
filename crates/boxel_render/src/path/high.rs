@@ -1,5 +1,5 @@
 //! High tier: GPU cull + `multi_draw_indexed_indirect_count`.
-use super::{CullPipeline, TierPath, VoxelPipelines};
+use super::{BucketDraw, CullPipeline, TierPath, VoxelPipelines, translucent_draws};
 use crate::chunk_table::ChunkTable;
 use crate::renderer::ViewParams;
 use boxel_shaders::gpu::{DrawIndexedIndirect, DrawRef, bindings};
@@ -25,7 +25,10 @@ pub(crate) struct HighInputs<'a> {
 
 /// GPU-driven path: `cull_chunks` writes two compacted indirect lists (opaque face buckets at
 /// `[0, cap_opaque)`, cutout buckets at `[cap_opaque, cap_opaque + cap_cutout)`) with matching
-/// `DrawRef`s and atomic counts; each list is one `multi_draw_indexed_indirect_count`.
+/// `DrawRef`s and atomic counts; each list is one `multi_draw_indexed_indirect_count`. The
+/// translucent buckets must be drawn back to front, so they come from the CPU as on Mid
+/// ([`translucent_draws`]): one `draw_indexed` per visible chunk with translucent quads, with its
+/// `DrawRef` in a small vertex buffer written every frame.
 pub(crate) struct HighPath {
     voxel: VoxelPipelines,
     cull: wgpu::ComputePipeline,
@@ -37,6 +40,12 @@ pub(crate) struct HighPath {
     draw_counts: wgpu::Buffer,
     cap_opaque: u32,
     cap_cutout: u32,
+    /// `DrawRef`s of the translucent draws (one per slot at most).
+    translucent_refs: wgpu::Buffer,
+    /// This frame's translucent buckets, back to front.
+    translucent: Vec<BucketDraw>,
+    /// `translucent_refs` capacity.
+    translucent_capacity: usize,
 }
 
 impl HighPath {
@@ -94,6 +103,13 @@ impl HighPath {
                 },
             ],
         });
+        let translucent_capacity = inputs.cap_cutout as usize;
+        let translucent_refs = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("boxel translucent draw refs"),
+            size: (translucent_capacity.max(1) * size_of::<DrawRef>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Self {
             voxel,
             cull: cull.pipeline,
@@ -105,12 +121,28 @@ impl HighPath {
             draw_counts,
             cap_opaque: inputs.cap_opaque,
             cap_cutout: inputs.cap_cutout,
+            translucent_refs,
+            translucent: Vec::new(),
+            translucent_capacity,
         }
     }
 }
 
 impl TierPath for HighPath {
-    fn prepare(&mut self, _queue: &wgpu::Queue, _chunks: &ChunkTable, _view: &ViewParams) -> u32 {
+    fn prepare(&mut self, queue: &wgpu::Queue, chunks: &ChunkTable, view: &ViewParams) -> u32 {
+        translucent_draws(chunks, view, &mut self.translucent);
+        self.translucent.truncate(self.translucent_capacity);
+        if !self.translucent.is_empty() {
+            let refs: Vec<DrawRef> = self
+                .translucent
+                .iter()
+                .map(|d| DrawRef {
+                    chunk_slot: d.slot,
+                    quad_start: d.quad_start,
+                })
+                .collect();
+            queue.write_buffer(&self.translucent_refs, 0, bytemuck::cast_slice(&refs));
+        }
         0
     }
 
@@ -148,6 +180,15 @@ impl TierPath for HighPath {
             4,
             self.cap_cutout,
         );
-        2
+        if self.translucent.is_empty() {
+            return 2;
+        }
+        pass.set_pipeline(&self.voxel.translucent);
+        pass.set_vertex_buffer(0, self.translucent_refs.slice(..));
+        for (i, d) in self.translucent.iter().enumerate() {
+            let instance = i as u32;
+            pass.draw_indexed(0..d.count * 6, 0, instance..instance + 1);
+        }
+        2 + self.translucent.len() as u32
     }
 }

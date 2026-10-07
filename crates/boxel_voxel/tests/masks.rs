@@ -52,7 +52,12 @@ fn light_registry() -> BlockRegistry {
         b.add_block(BlockDef {
             name: format!("test:b{i}"),
             shape,
-            solid: i % 2 == 0,
+            model: BlockModel::CUBE,
+            collision: if i % 2 == 0 {
+                BlockCollision::Full
+            } else {
+                BlockCollision::None
+            },
             emission,
             light_opacity: opacity,
             textures: FaceTextures::all(t),
@@ -368,7 +373,8 @@ fn may_emit_is_a_palette_scan() {
         .add_block(BlockDef {
             name: "test:stone".to_string(),
             shape: RenderShape::Opaque,
-            solid: true,
+            model: BlockModel::CUBE,
+            collision: BlockCollision::Full,
             emission: [0; 3],
             light_opacity: 15,
             textures: FaceTextures::all(texture),
@@ -435,7 +441,8 @@ fn registry_light_fields_and_validation() {
     let def = |name: &str, shape, emission, light_opacity| BlockDef {
         name: format!("test:{name}"),
         shape,
-        solid: true,
+        model: BlockModel::CUBE,
+        collision: BlockCollision::Full,
         emission,
         light_opacity,
         textures: FaceTextures::all(tex),
@@ -443,7 +450,7 @@ fn registry_light_fields_and_validation() {
     let lamp = b
         .add_block(def("lamp", RenderShape::Opaque, [14, 11, 6], 15))
         .unwrap();
-    assert_eq!(lamp, BlockState(17));
+    assert_eq!(lamp, BlockState(24));
     // Cutout may stop light; partial opacities and full channels are fine.
     b.add_block(def("dense_leaves", RenderShape::Cutout, [0; 3], 15))
         .unwrap();

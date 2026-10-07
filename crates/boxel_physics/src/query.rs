@@ -9,7 +9,7 @@ use crate::source::ChunkSource;
 use boxel_ecs::prelude::*;
 use boxel_ecs::system::SystemParam;
 use boxel_math::DVec3;
-use boxel_voxel::{BlockPos, WorldPos};
+use boxel_voxel::{BlockPos, BlockState, WorldPos};
 use boxel_world::{ChunkMap, WorldSettings};
 
 /// Physics queries against the world, for any system: voxel raycasts (picking, line of sight),
@@ -193,5 +193,13 @@ impl PhysicsQuery<'_> {
     /// [`PhysicsQuery::probe`].
     pub fn block_is_free(&self, block: BlockPos) -> bool {
         self.index.block_is_free(block)
+    }
+
+    /// The placement check of a block state: no solid body overlaps the collision shape `state`
+    /// would have at `block` (a slab only checks its half; a plant is always free; see
+    /// [`BodyIndex::shape_is_free`]).
+    pub fn state_is_free(&self, block: BlockPos, state: BlockState) -> bool {
+        self.index
+            .shape_is_free(block, self.collision().shape(state))
     }
 }

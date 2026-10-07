@@ -16,8 +16,9 @@ use boxel_mesh::MeshOptions;
 use boxel_tasks::{TaskPool, TaskPoolBuilder};
 use boxel_transform::Transform;
 use boxel_voxel::{
-    BlockDef, BlockPos, BlockRegistry, BlockRegistryBuilder, BlockState, ChunkData, ChunkKey,
-    ChunkPos, FaceTextures, LightValue, LocalPos, RenderShape, TextureId,
+    BlockCollision, BlockDef, BlockModel, BlockPos, BlockRegistry, BlockRegistryBuilder,
+    BlockState, ChunkData, ChunkKey, ChunkPos, FaceTextures, LightValue, LocalPos, RenderShape,
+    TextureId,
 };
 use boxel_worldgen::{OverworldGenerator, WorldGenerator};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -33,7 +34,8 @@ fn lamp_registry() -> (Arc<BlockRegistry>, [BlockState; 2]) {
         b.add_block(BlockDef {
             name: format!("test:{name}"),
             shape: RenderShape::Opaque,
-            solid: true,
+            model: BlockModel::CUBE,
+            collision: BlockCollision::Full,
             emission,
             light_opacity: 15,
             textures: FaceTextures::all(TextureId(0)),
