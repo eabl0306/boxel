@@ -252,7 +252,7 @@ fn translucent_mesh(of: &ChunkMesh, quads: Vec<PackedQuad>) -> ChunkMesh {
 fn faces_away(quad: PackedQuad, eye: DVec3) -> bool {
     let face = quad.face();
     let (n, _, _) = face.axes();
-    let positive = face.index() % 2 == 0;
+    let positive = face.index().is_multiple_of(2);
     let mut plane = f64::from(quad.pos()[n]) + if positive { 1.0 } else { 0.0 };
     if quad.shape() == layout::SHAPE_FLUID_SURFACE && n == 1 && positive {
         plane = f64::from(quad.pos()[1]) + f64::from(layout::FLUID_SURFACE);

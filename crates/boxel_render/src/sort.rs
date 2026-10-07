@@ -925,15 +925,12 @@ mod tests {
             for s in 0..7 {
                 for t in 0..7 {
                     // a point inside the quad, off the grid lines
-                    let mut p = [0.0; 3];
                     let (fs, ft) = ((f64::from(s) + 0.37) / 7.0, (f64::from(t) + 0.61) / 7.0);
                     let mut free = (0..3).filter(|&k| target.min[k] != target.max[k]);
                     let (Some(ka), Some(kb)) = (free.next(), free.next()) else {
                         continue;
                     };
-                    for k in 0..3 {
-                        p[k] = f64::from(target.min[k]);
-                    }
+                    let mut p = target.min.map(f64::from);
                     p[ka] += fs * f64::from(target.max[ka] - target.min[ka]);
                     p[kb] += ft * f64::from(target.max[kb] - target.min[kb]);
                     let dir = [p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]];

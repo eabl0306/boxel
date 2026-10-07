@@ -526,7 +526,7 @@ impl WorldGenerator for WaterGenerator {
                         .rotate_left(29)
                         ^ (wz as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
                     let p = LocalPos::new(x, top, z);
-                    if (h ^ (h >> 31)) % 29 == 0 && data.get(p) == water {
+                    if (h ^ (h >> 31)).is_multiple_of(29) && data.get(p) == water {
                         data.set(p, glass);
                     }
                 }
