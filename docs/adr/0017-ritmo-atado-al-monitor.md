@@ -67,22 +67,46 @@ frame de la RTX cruza por PRIME y el compositor espera su fence (sincronización
 
 ## Consecuencias
 
-Medido en la RTX 5050, bosque radio 16 quieto, Mailbox, 4 corridas de 20 s por versión,
-intercaladas:
+Medido en la RTX 5050 con `stress`, bosque radio 16, Mailbox salvo donde dice vsync, 3 corridas
+de 20 s por caso y versión, intercaladas (antes: 0e92379, que mide sin cambiar el ritmo; ahora:
+3cfdc17). Promedios:
 
-| | Límite 144, antes | 144, ahora | Límite 143, antes | 143, ahora |
+| Caso | Mostrados por segundo | Refrescos salteados | Frames de más de 7.5 ms | Updates sin presentar |
 |---|---:|---:|---:|---:|
-| Frames mostrados por segundo | 137 (136 a 140) | 140 (138 a 143) | 125 (123 a 129) | 142 (139 a 144) |
-| Refrescos salteados en 20 s | 130 (86 a 158) | 74 (8 a 110) | 348 (274 a 392) | 38 (3 a 100) |
-| Frames de más de 7.5 ms | 133 | 107 | 372 | 78 |
-| Updates que corrieron sin presentar | 132 | 2 | 349 | 2 |
+| Quieto, 144 | 139 -> 142 | 105 -> 30 | 107 -> 88 | 106 -> 0 |
+| Vuelo, 144 | 139 -> 142 | 106 -> 34 | 107 -> 75 | 106 -> 2 |
+| Quieto, 143 | 124 -> 141 | 380 -> 57 | 405 -> 96 | 383 -> 2 |
+| Vuelo, 143 | 126 -> 140 | 322 -> 73 | 348 -> 114 | 323 -> 2 |
+| Quieto, 150 | 144 -> 142 | 4 -> 40 | 34 -> 86 | 6 -> 2 |
+| Vuelo, 150 | 141 -> 141 | 63 -> 63 | 93 -> 109 | 66 -> 2 |
+| Quieto, 144, vsync | 107 -> 107 | 730 -> 725 | 731 -> 754 | 733 -> 6 |
+| 10 000 mobs, 144 (2 corridas) | 95 -> 105 | | | |
+| 780M, quieto, 144 | 143.7 -> 143.7 | 3 -> 3 | 4 -> 49 | 5 -> 1 |
+| `voxel_world` (el juego, radio 12), 144 | 140.6 -> 141.9 | | | |
+| `voxel_world`, 143 | 126 -> 142.6 | | | |
 
-- Con 143 se dejan de perder 20 frames por segundo: la grilla ya no barre el ciclo del refresco.
-- Con 144 los frames de 8.7 ms seguidos de 5.2 ms desaparecen. Los refrescos salteados quedan
-  (según el estado de la GPU, de 0.2 a 6 por segundo, cada unos 160 ms en las rachas malas) y se
-  ven como un frame de 13.9 ms. Los frames de más de 7.5 ms que no son refrescos salteados son
-  callbacks que llegaron hasta 1 ms tarde (el jitter del compositor), no tirones.
-
+- Con 143 se dejan de perder unos 16 frames por segundo: la grilla ya no barre el ciclo del
+  refresco.
+- Con 144 desaparecen los frames de 8.7 ms seguidos de uno de 5.2, y el compositor saltea un
+  tercio de los refrescos que salteaba antes. Los que quedan vienen de la GPU (de 0.2 a 6 por
+  segundo según su estado, en rachas de uno cada unos 160 ms) y se ven como un frame de 13.9 ms.
+  Los demás frames de más de 7.5 ms (2 a 3 por segundo) son callbacks que llegaron hasta 1 ms
+  tarde, no tirones: sin contar los refrescos salteados, el desvío del tiempo entre updates baja
+  de 0.47 a 0.25 ms.
+- En la 780M, que maneja el panel, casi no había refrescos salteados: se muestra lo mismo, y los
+  frames de 7.5 a 8 ms que aparecen son ese mismo jitter de los callbacks (desvío de 0.09 a
+  0.25 ms). Es el costo de arrancar en el callback; en la RTX lo paga la mejora de arriba.
+- Con 150 ya se arrancaba en el callback; queda igual dentro del ruido (en vuelo 63 contra 63; en
+  quieto, 4 contra 40, con corridas de 5 a 79).
+- Sin límite no cambia nada: 4570 contra 4535 updates por segundo quieto, 144 mostrados, ningún
+  frame de más de 7.5 ms.
+- Con vsync (Fifo) se muestra lo mismo que antes (unos 107 por segundo); ahora las updates bajan a
+  esa cifra en vez de hacer 144 y no mostrar un cuarto. Arreglarlo pide no esperar los frame
+  callbacks con Fifo, que tiene su propio freno, sin perder la protección de la ventana oculta:
+  queda pendiente.
+- Con menos updates por segundo (vsync, refrescos salteados) el mundo se pone al día más lento
+  después de cruzar un borde, porque su trabajo tiene presupuesto por frame: en vuelo a 144 la
+  puesta al día pasa de 19.5 a 24.2 ms, y con vsync de 17.7 a 29.4 ms.
 - Las updates siguen corriendo en `about_to_wait`, nunca dentro de `RedrawRequested`, y nunca
   esperan un callback sin límite de tiempo, así que la simulación no se congela con la ventana
   oculta. Lo que cambia del contrato de ADR 0008 es que, al seguir al monitor, el callback decide
@@ -90,9 +114,6 @@ intercaladas:
 - Con un límite arriba de la frecuencia del monitor, en Wayland las updates bajan a la del
   monitor: antes se hacían updates de más que no se mostraban. Para correr más updates que el
   monitor queda el límite 0.
-- Los refrescos que saltea el compositor porque la RTX terminó tarde no desaparecen: ahora se ven
-  como un frame de 13.9 ms (lo que vio la pantalla) en vez de uno de 8.7 y otro de 5.2, sin la
-  update de más.
 
 ## Alternativas descartadas
 
