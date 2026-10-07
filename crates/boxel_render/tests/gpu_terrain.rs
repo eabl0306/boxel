@@ -652,22 +652,73 @@ const CRACK_CLEAR_SRGB: [u8; 3] = [255, 0, 255];
 /// sliver; real openings between hills are bigger or touch the sky).
 const MAX_CRACK_PIXELS: usize = 8;
 
-/// The crack views: an eye looking at a target, both relative to the center of the meshed area
-/// at its highest column. Eye coordinates are multiples of 1/64.
-const CRACK_VIEWS: [(&str, [f64; 3], [f64; 3]); 4] = [
+/// Where the y of a crack view's eye (and target) is measured from.
+#[derive(Clone, Copy)]
+enum Base {
+    /// The highest column of the meshed area.
+    Top,
+    /// The top of the ground under the eye (a player standing on it).
+    Ground,
+}
+
+/// Where a crack view looks.
+#[derive(Clone, Copy)]
+enum Aim {
+    /// At a point, placed like the eye.
+    At([f64; 3]),
+    /// Yaw and pitch in degrees, as `Transform::from_yaw_pitch` takes them.
+    Angles(f32, f32),
+}
+
+/// The crack views: an eye, relative to the center of the meshed area in x and z and to its
+/// [`Base`] in y, and where it looks. Eye coordinates are multiples of 1/64.
+const CRACK_VIEWS: [(&str, [f64; 3], Aim, Base); 6] = [
     // Straight down from above the center: only terrain fills the image.
-    ("down", [0.015_625, 20.0, 0.031_25], [0.0, -40.0, 0.0]),
+    (
+        "down",
+        [0.015_625, 20.0, 0.031_25],
+        Aim::At([0.0, -40.0, 0.0]),
+        Base::Top,
+    ),
     // Down at about 70 degrees near the center, toward +x: terrain only.
-    ("steep", [-20.25, 16.5, 4.75], [0.0, -48.0, 4.75]),
+    (
+        "steep",
+        [-20.25, 16.5, 4.75],
+        Aim::At([0.0, -48.0, 4.75]),
+        Base::Top,
+    ),
     // Low and grazing across the surface toward the far edge (the skyline is the edge of the
     // meshed area).
     (
         "across",
         [-94.593_75, 3.406_25, 8.703_125],
-        [0.0, -20.0, 8.703_125],
+        Aim::At([0.0, -20.0, 8.703_125]),
+        Base::Top,
     ),
     // Oblique from above one edge.
-    ("oblique", [-20.5, 25.25, -90.75], [10.0, -20.0, 20.0]),
+    (
+        "oblique",
+        [-20.5, 25.25, -90.75],
+        Aim::At([10.0, -20.0, 20.0]),
+        Base::Top,
+    ),
+    // A player's eye (1.6 above the ground) looking 4 degrees down, 43 degrees off the z axis:
+    // the x and z axes of the ground look almost parallel on screen, so the growth has to close
+    // the cracks across the edges, not along them (a growth of 1/64 of a pixel along each axis
+    // left a crack here, and in 20 of 288 such views).
+    (
+        "standing43",
+        [20.078_125, 1.593_75, -19.953_125],
+        Aim::Angles(43.0, -4.0),
+        Base::Ground,
+    ),
+    // The same, 13 degrees off the x axis.
+    (
+        "standing103",
+        [-19.921_875, 1.593_75, -19.953_125],
+        Aim::Angles(103.0, -4.0),
+        Base::Ground,
+    ),
 ];
 
 /// Pixels of the background islands of `image`: 4-connected areas of exactly `clear` (sRGB
@@ -743,14 +794,24 @@ fn render_cracks(
             .upsert_chunk(chunk_id(*pos), pos.origin().as_i64vec3(), Arc::clone(mesh))
             .map_err(|e| format!("upsert {pos:?}: {e}"))?;
     }
-    let top = DVec3::new(0.0, f64::from(scene.max_height), 0.0);
+    let generator = TerrainGenerator::default();
     let camera = Camera::default();
     let mut images = Vec::new();
-    for (_, eye, target) in CRACK_VIEWS {
-        let eye = top + DVec3::from_array(eye);
-        let d = (top + DVec3::from_array(target) - eye).as_vec3();
-        let yaw = (-d.x).atan2(-d.z);
-        let pitch = d.y.atan2(d.x.hypot(d.z));
+    for (_, eye, aim, base) in CRACK_VIEWS {
+        let y = match base {
+            Base::Top => scene.max_height,
+            // The eye's column: the top block's top face is one above its height.
+            Base::Ground => generator.height_at(eye[0].floor() as i64, eye[2].floor() as i64) + 1,
+        };
+        let base = DVec3::new(0.0, f64::from(y), 0.0);
+        let eye = base + DVec3::from_array(eye);
+        let (yaw, pitch) = match aim {
+            Aim::At(target) => {
+                let d = (base + DVec3::from_array(target) - eye).as_vec3();
+                ((-d.x).atan2(-d.z), d.y.atan2(d.x.hypot(d.z)))
+            }
+            Aim::Angles(yaw, pitch) => (yaw.to_radians(), pitch.to_radians()),
+        };
         let transform = Transform::from_yaw_pitch(eye, yaw, pitch);
         let aspect = CRACK_SIZE.x as f32 / CRACK_SIZE.y as f32;
         let cv = CameraView::compute(&camera, &transform, aspect);
@@ -770,11 +831,13 @@ fn render_cracks(
 
 /// No cracks between faces: greedy quads meet in T-junctions, where the rasterizer could leave
 /// single pixels uncovered that show the background through the hollow inside of the terrain
-/// (before the shaders grew every quad by 1/64 of a pixel: 50 to 55 pixels in these 4 views on
-/// every adapter, about 1 in 50 000 terrain pixels).
-/// Every tier renders the terrain from 4 views at 1280x720 that do not see the sides of the
-/// meshed area (where the staircase of its edge can enclose a background pixel for real) and
-/// must show no island of the background color inside the terrain.
+/// (without the edge growth of the shaders: 50 to 55 pixels in the first 4 views on every
+/// adapter, about 1 in 50 000 terrain pixels, and 20 in the 2 standing views on the GPUs; growing
+/// 1/64 of a pixel along each axis instead of across each edge still left 1 in each standing
+/// view).
+/// Every tier renders the terrain from [`CRACK_VIEWS`] at 1280x720, which do not see the sides of
+/// the meshed area (where the staircase of its edge can enclose a background pixel for real),
+/// and must show no island of the background color inside the terrain.
 #[test]
 fn terrain_has_no_cracks_on_any_tier() {
     let (_instance, adapters) = adapters();
@@ -785,6 +848,7 @@ fn terrain_has_no_cracks_on_any_tier() {
     }
     let scene = terrain_scene();
     let mut report = Report::new();
+    let save_all = std::env::var_os("GPU_TERRAIN_SAVE").is_some();
     let mut rendered = 0;
     for adapter in &adapters {
         let caps = AdapterCaps::from_adapter(adapter);
@@ -808,6 +872,9 @@ fn terrain_has_no_cracks_on_any_tier() {
                     cracks.len()
                 );
                 let name = format!("{label}_{tier}_cracks_{view}");
+                if save_all {
+                    report.save(&[(&name, image)]);
+                }
                 if !cracks.is_empty() {
                     let first: Vec<_> = cracks.iter().take(8).collect();
                     report.fail(

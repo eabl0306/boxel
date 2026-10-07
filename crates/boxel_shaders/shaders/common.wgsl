@@ -153,30 +153,38 @@ fn decode_quad(q: vec2<u32>, light: vec2<u32>, corner_in: u32) -> Decoded {
 // every vertex to its sub-pixel grid on its own, so such a corner can land a fraction of a
 // sub-pixel off that edge, and a pixel center in the sliver between them is covered by neither
 // quad: a one-pixel crack that shows the sky through the hollow inside of the terrain. Every
-// corner moves outward along its quad's two edge directions, in the quad's plane, by the world
-// distance that spans EDGE_GROWTH_PX pixels on screen at that corner, whatever the angle: about
-// 3 times the worst snapping error (about 1/180 of a pixel with 8 sub-pixel bits), far too
-// little to see. It is kept that small because it costs: neighbors overlap by that much, and
-// some of the overlap is shaded twice (on the RTX 5050 growing 1/16 to 1/8 of a pixel cost 5 to
-// 7 % of the GPU frame; at 1/64 only the math below is left, under 3 %). The texture coordinates move with the corner, so the texture inside
-// the quad maps exactly as before; the light coordinates do not (cheaper, and the light inside
-// moves by less than EDGE_GROWTH_PX pixels). Seen almost edge-on a direction needs a long
-// distance for that: it stops at EDGE_GROWTH_MAX voxels (enough for 1/64 of a pixel at 2048
-// voxels in a 720-pixel-high view).
+// corner moves outward along its quad's two edge directions, in the quad's plane, so that each
+// edge moves EDGE_GROWTH_PX pixels on screen across itself (perpendicular to the edge): about 3
+// times the worst snapping error (about 1/180 of a pixel with 8 sub-pixel bits), far too little
+// to see. Across, not along: the corner moves along the other edge's direction, and where the
+// two edges look almost parallel on screen (a player's view of the ground, about 40 degrees off
+// the axes, or anything seen at a grazing angle) only sin(angle) of that move closes the crack,
+// so the move along each direction is EDGE_GROWTH_PX / sin(angle) pixels. It stops at
+// EDGE_GROWTH_LEN pixels, so the corner of a quad seen almost edge-on does not stick out; the
+// gap then still closes by EDGE_GROWTH_LEN * sin(angle). It is kept that small because it costs:
+// neighbors overlap by that much, and some of the overlap is shaded twice (on the RTX 5050
+// growing 1/16 to 1/8 of a pixel cost 5 to 7 % of the GPU frame; at 1/64 only the math below is
+// left, about 3 %). The texture coordinates move with the corner, so the texture inside the quad
+// maps exactly as before; the light coordinates do not (cheaper, and the light inside moves by
+// less than EDGE_GROWTH_LEN pixels).
 const EDGE_GROWTH_PX: f32 = 0.015625;
-const EDGE_GROWTH_MAX: f32 = 0.0625;
+const EDGE_GROWTH_LEN: f32 = 0.25;
 
 // The world distances along two axes whose clip-space steps per voxel are `axis_u` and `axis_v`
-// (columns of view_proj) that move the point at `clip` by EDGE_GROWTH_PX pixels on screen;
-// `half_px` is half the render target size in pixels. Each is at most EDGE_GROWTH_MAX and a
-// quarter of the point's depth (w), so a corner near the eye cannot reach the eye; both are 0 at
-// or behind the eye.
+// (columns of view_proj) that move the edges of a quad at `clip` by EDGE_GROWTH_PX pixels across
+// themselves on screen; `half_px` is half the render target size in pixels. Each moves the point
+// at most EDGE_GROWTH_LEN pixels and a quarter of its depth (w), so a corner near the eye cannot
+// reach the eye; both are 0 at or behind the eye.
 fn edge_growth(clip: vec4<f32>, axis_u: vec4<f32>, axis_v: vec4<f32>, half_px: vec2<f32>) -> vec2<f32> {
-  // d(ndc.xy)/dt = n / w^2 (pixels per voxel), so the distance is EDGE_GROWTH_PX * w^2 / |n|
+  // d(ndc.xy)/dt = n / w^2 (pixels per voxel), so the distance that moves the point L pixels is
+  // L * w^2 / |n|
   let nu = (axis_u.xy * clip.w - clip.xy * axis_u.w) * half_px;
   let nv = (axis_v.xy * clip.w - clip.xy * axis_v.w) * half_px;
-  let n2 = max(vec2(dot(nu, nu), dot(nv, nv)), vec2(1e-20));
-  let t = min((EDGE_GROWTH_PX * clip.w * clip.w) * inverseSqrt(n2), vec2(min(EDGE_GROWTH_MAX, 0.25 * clip.w)));
+  let inv = inverseSqrt(max(vec2(dot(nu, nu), dot(nv, nv)), vec2(1e-20)));
+  // sin of the angle between the two directions on screen
+  let s = abs(nu.x * nv.y - nu.y * nv.x) * inv.x * inv.y;
+  let len = EDGE_GROWTH_PX / max(s, EDGE_GROWTH_PX / EDGE_GROWTH_LEN);
+  let t = min((len * clip.w * clip.w) * inv, vec2(0.25 * clip.w));
   return select(vec2(0.0), t, clip.w > 0.0);
 }
 

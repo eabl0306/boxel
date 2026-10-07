@@ -115,13 +115,15 @@ pub struct WorldSettings {
     pub light_cache_radius: u32,
     /// How long the finished meshes of one edit batch wait for the rest of the batch before
     /// they are published anyway (zero: no wait). A batch is published as soon as its last mesh
-    /// arrives; if some are late, the meshes that arrived in a frame starting at time `t` go out
-    /// in the first frame that starts at `t + edit_batch_hold` or later, and the late ones on
-    /// their own when they arrive. Holding them keeps a frame from showing half of an edit's
-    /// light change. It is a time, not a frame count: without a frame cap a frame can last a
-    /// fraction of a millisecond, less than one mesh job. The default, 16 ms
-    /// ([`WorldSettings::DEFAULT_EDIT_BATCH_HOLD`]), is about two frames at 144 Hz and one at
-    /// 60 Hz; a batch only waits that long when one of its jobs is late.
+    /// arrives. If some are late, the meshes that arrived in frame `N` go out in the first frame
+    /// that is at least `edit_batch_hold` and 2 frames after `N`, and the late ones on their own
+    /// when they arrive. A frame's time is taken when its job step
+    /// ([`WorldSystems::Dispatch`]) starts. Holding them keeps a frame from showing half of an
+    /// edit's light change. It is a time, not only a frame count: without a frame cap a frame
+    /// can last a fraction of a millisecond, less than one mesh job. The default, 16 ms
+    /// ([`WorldSettings::DEFAULT_EDIT_BATCH_HOLD`]), is 3 frames at 144 Hz (two are 13.9 ms) and
+    /// 2 at 60 Hz or less (the frame floor); a batch only waits that long when one of its jobs is
+    /// late.
     pub edit_batch_hold: Duration,
 }
 

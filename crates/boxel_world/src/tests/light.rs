@@ -721,10 +721,11 @@ fn set_clock(app: &mut App, at: Instant) {
 const CORNER: BlockPos = BlockPos::new(31, -1, 31);
 
 /// The meshes of one edit go out in the same frame, even when their jobs finish in different
-/// frames. Results held in a frame of time `t` wait for the rest until the first frame at
-/// `t + hold` or later and go out then at the latest, the rest on their own (the batch is
-/// split). The hold is a time, so very short frames (no frame cap) do not split a batch whose
-/// jobs take a few of them.
+/// frames. Results held in frame `N` of time `t` wait for the rest until the first frame that is
+/// both at `t + hold` or later and 2 frames after `N`, and go out then at the latest, the rest on
+/// their own (the batch is split). The hold is a time, so very short frames (no frame cap) do
+/// not split a batch whose jobs take a few of them, and the 2 frames are a floor, so long frames
+/// (60 Hz and less) still give a late job two more job steps.
 #[test]
 fn an_edit_batch_is_published_in_one_frame() {
     let ms = Duration::from_millis;
@@ -734,12 +735,20 @@ fn an_edit_batch_is_published_in_one_frame() {
         // About 100 fps: the rest within the hold, then late (held 20 ms >= 16 at frame 2).
         (ms(16), ms(10), 2, None),
         (ms(16), ms(10), 3, Some(2)),
+        // 144 Hz: two frames are 13.9 ms, so the third publishes (20.8 ms).
+        (ms(16), Duration::from_micros(6944), 3, None),
+        (ms(16), Duration::from_micros(6944), 4, Some(3)),
         // 1000 fps: 10 frames are still within 16 ms (2 frames were 2 ms).
         (ms(16), ms(1), 10, None),
         (ms(16), ms(1), 20, Some(16)),
-        // A frame longer than the hold: the next frame publishes.
-        (ms(5), ms(33), 1, None),
-        (ms(5), ms(33), 2, Some(1)),
+        // 60 Hz and 30 Hz: the hold runs out in one frame, the floor waits for a second one.
+        (ms(16), ms(17), 2, None),
+        (ms(16), ms(17), 3, Some(2)),
+        (ms(16), ms(33), 2, None),
+        (ms(16), ms(33), 3, Some(2)),
+        // A frame longer than a short hold: the floor too.
+        (ms(5), ms(33), 2, None),
+        (ms(5), ms(33), 3, Some(2)),
     ];
     for (hold, interval, wait, split) in cases {
         let (mut app, executor, lamps) = corner_world(hold);

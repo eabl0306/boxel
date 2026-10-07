@@ -261,11 +261,12 @@ de gameplay.
   de chunk se recorren las cáscaras que entran y salen del radio: las que entran piden su luz,
   las que salen la sueltan. `light_cache_radius` es como mucho 32.
 - **Publicación**: una malla igual a la publicada (mismo hash y mismos bytes) no se envía de
-  nuevo. Las mallas de un mismo lote de ediciones salen en el mismo frame: las que llegan en un
-  frame de tiempo t esperan al resto hasta el primer frame que empieza en t +
-  `edit_batch_hold` (16 ms) o después; si el resto tarda más, salen en ese frame como están
-  (`WorldStats::edit_batches_split`). Hasta el 2026-10-07 la espera era de 2 frames (sección
-  12). Los resultados de un lote se
+  nuevo. Las mallas de un mismo lote de ediciones salen en el mismo frame: las que llegan en el
+  frame N, de tiempo t, esperan al resto hasta el primer frame que es a la vez de t +
+  `edit_batch_hold` (16 ms) o después y N + 2 o después; si el resto tarda más, salen en ese
+  frame como están (`WorldStats::edit_batches_split`). Hasta el 2026-10-07 la espera era solo de
+  2 frames (sección 12). Un lote al que no le llegó ninguna malla se cierra pasados 120 frames y
+  1 s (las dos cosas), y también cuenta como partido. Los resultados de un lote se
   aplican antes que los del streaming, fuera del tope de eventos por frame, y sus jobs (y la
   caminata que una edición manda a repetir) mantienen prioridad 0 aunque el viewer se mueva. Dos
   lotes que tocan el mismo chunk se juntan; si el chunk tenía su malla retenida, esa malla ya es
@@ -411,12 +412,22 @@ los mismos quads que antes.
   varying.
 - **Lotes de ediciones enteros sin tope de fps.** La espera de la sección 7 era de 2 frames. Sin
   tope un frame dura menos de medio ms, menos que un job de malla con luz, y en P7 salían
-  partidos 1 a 3 lotes de 20. Ahora es un tiempo: `WorldSettings::edit_batch_hold`, un
-  `Duration` de 16 ms por defecto (`WorldSettings::DEFAULT_EDIT_BATCH_HOLD`), reemplaza a
-  `edit_batch_hold_frames`. Un lote que se completa antes sale apenas llega su última malla, como
+  partidos 1 a 3 lotes de 20. Ahora es un tiempo con un piso de frames:
+  `WorldSettings::edit_batch_hold`, un `Duration` de 16 ms por defecto
+  (`WorldSettings::DEFAULT_EDIT_BATCH_HOLD`), reemplaza a `edit_batch_hold_frames`, y la espera
+  dura además al menos 2 frames (`MIN_HOLD_FRAMES`), como antes. El piso es para 60 Hz o menos:
+  ahí 16 ms son un solo frame, y a un miembro atrasado le pueden faltar dos pasos de jobs (su job
+  esperaba lugar en el scheduler y recién arranca en el siguiente, o su remallado esperaba la
+  caminata de cielo). Un lote que se completa antes sale apenas llega su última malla, como
   antes, así que con tope 144 no cambia nada: los lotes se completan en 1 o 2 frames, y uno que
-  se atrasa espera como mucho 3 frames (20.8 ms) en vez de 2. El tiempo es el del frame
-  (`WorldJobs::begin_frame`); los tests lo manejan con un reloj manual.
+  se atrasa espera como mucho 3 frames (20.8 ms) en vez de 2. El tiempo de un frame se toma al
+  empezar su paso de jobs (`WorldSystems::Dispatch`, `WorldJobs::begin_frame`); los tests lo
+  manejan con un reloj manual, y el harness de `streaming/tests.rs` avanza 8 ms por frame. El
+  cierre de un lote al que nunca le llegó una malla también pasó a tiempo: 120 frames y 1 s,
+  las dos cosas (sin tope, 120 frames eran 40 ms, menos que una caminata de cielo con la cola
+  llena), y ahora cuenta en `edit_batches_split`, porque sus mallas salen sueltas. Si el único
+  resultado retenido de un lote se va (su chunk se descarga), se lleva el reloj de la espera;
+  antes el lote lo conservaba, y al juntarse con otro lo hacía salir partido antes de tiempo.
 - **Sin puntitos de cielo.** Los quads del greedy se tocan en uniones en T: una esquina de un
   quad cae sobre el borde de otro, en el mismo plano o en la arista de un bloque. El rasterizador
   redondea cada vértice a su grilla de subpíxel por separado (1/256 de píxel con 8 bits), así que
@@ -424,16 +435,35 @@ los mismos quads que antes.
   en esa rendija no lo cubre ningún quad, y se ve el cielo a través del interior hueco del
   terreno. Las posiciones ya eran enteras y exactas, y la luz no influye: con la luz apagada
   salían los mismos puntos. Arreglo: en el vertex shader cada esquina se corre hacia afuera a lo
-  largo de los dos bordes de su quad, en su plano, la distancia que en pantalla mide 1/64 de
-  píxel en esa esquina (`EDGE_GROWTH_PX`), sea cual sea el ángulo. Es unas 3 veces el peor error
-  de redondeo (cerca de 1/180 de píxel) y no se ve. Para caras casi de canto se corta en 1/16 de
-  vóxel (`EDGE_GROWTH_MAX`, que alcanza para 1/64 de píxel a 2048 vóxeles en una vista de 720
-  píxeles de alto) y en un cuarto de la profundidad de la esquina, así una esquina pegada al ojo
-  no lo alcanza. Correrse t vóxeles por un eje mueve el clip t veces la columna de ese eje en
-  `view_proj`, así que no hace falta otra multiplicación de matriz. Las coordenadas de textura se
-  corren igual, y la textura del quad queda exactamente donde estaba; las de luz no (la luz
-  adentro se corre menos de 1/64 de píxel). `ViewUniform` suma `viewport` (el tamaño del destino
-  en píxeles) y pasa de 336 a 352 bytes.
+  largo de los dos bordes de su quad, en su plano, lo justo para que cada borde se corra 1/64 de
+  píxel en pantalla de través, perpendicular a sí mismo (`EDGE_GROWTH_PX`). Es unas 3 veces el
+  peor error de redondeo (cerca de 1/180 de píxel) y no se ve. De través y no a lo largo: la
+  esquina se corre en la dirección del otro borde, y cuando los dos bordes se ven casi paralelos
+  en pantalla (el suelo visto por un jugador de pie, a unos 40 grados de los ejes, o cualquier
+  cara rasante) solo el seno del ángulo entre ellos cierra la rendija. Así que la corrida en cada
+  dirección mide 1/64 de píxel dividido por ese seno, con un tope de 1/4 de píxel
+  (`EDGE_GROWTH_LEN`) para que la punta de un quad visto casi de canto no sobresalga; ahí la
+  rendija se cierra 1/4 de píxel por el seno. También se corta en un cuarto de la profundidad de
+  la esquina, así una esquina pegada al ojo no lo alcanza. La primera versión medía el 1/64 de
+  píxel a lo largo de cada eje y se cortaba además en 1/16 de vóxel (`EDGE_GROWTH_MAX`, ya no
+  está): de frente da lo mismo, pero de pie mirando el suelo dejaba rendijas (mediciones abajo).
+  Correrse t vóxeles por un eje mueve el clip t veces la columna de ese eje en `view_proj`, así
+  que no hace falta otra multiplicación de matriz. Las coordenadas de textura se corren igual, y
+  la textura del quad queda exactamente donde estaba; las de luz no (la luz adentro se corre
+  menos de 1/4 de píxel, y solo en caras rasantes). `ViewUniform` suma `viewport` (el tamaño del
+  destino en píxeles) y pasa de 336 a 352 bytes.
+- **Solape y orden de dibujo.** Con el crecimiento, dos quads vecinos del mismo plano se solapan
+  unos 1/32 de píxel. Un centro de píxel en esa franja lo cubren los dos, con la misma
+  profundidad salvo redondeo, y con `Greater` estricto gana el que se dibuja primero. Dentro de
+  un chunk el orden es fijo; entre chunks, en High, sale de los `atomicAdd` de `cull.wgsl`, que
+  dependen del scheduling de la GPU. Si los dos quads tienen otro material, AO o luz, ese píxel
+  puede salir de uno u otro color, y en principio cambiar entre frames o entre tiers (antes los
+  dos nunca cubrían el mismo centro de píxel). Se acepta: el borde está a 1/64 de píxel de ese
+  centro y cualquiera de los dos colores vale. Medido: 3 vistas renderizadas 31 veces cada una en
+  High, Mid y Low dan siempre los mismos píxeles en la RTX, la 780M y llvmpipe, y High da
+  exactamente lo mismo que Mid y Low en la RTX y la 780M. Si el test de tiers de `gpu_terrain`
+  se vuelve inestable, el arreglo es un orden fijo en High (una posición por slot en vez de
+  `atomicAdd`).
 - **Por qué 1/64 de píxel.** Crecer cuesta, por dos lados: los vecinos se solapan y parte del
   solape se pinta dos veces, y la cuenta del vertex shader corre en cada esquina. En la RTX,
   estático a radio 16 sin tope (unos 2230 fps, la GPU al límite), crecer 1/16 de píxel con el
@@ -466,6 +496,24 @@ Medido el 2026-10-07 (capturas y scripts en `bench-results/pacing-2026-10-07/vis
   publicar: mediana 4 antes, 3 y 4 después; peor 5 en todas. En la 780M (600 fps) no se partía
   ninguno, ni antes ni después. Con tope 144 da lo mismo que antes: 2 frames (13.9 ms) en
   mediana y en el peor caso, 0 lotes partidos.
+
+Revisión del mismo día (capturas y scripts en `bench-results/pacing-2026-10-07/visuals2/`):
+
+- Grietas de pie: 288 vistas del terreno de `gpu_terrain` a 1280x720, desde 16 puntos y en 18
+  direcciones, con el ojo 1.6 sobre el suelo mirando 4 grados abajo. Sin crecimiento, 904
+  píxeles de fondo encerrados en 237 vistas; con 1/64 de píxel a lo largo de cada eje, 21 en 20
+  vistas (los mismos en la RTX y la 780M); de través, 1. Otras 3 tandas de 288 (ojo a 1.6
+  mirando al horizonte, a 4 vóxeles mirando 15 grados abajo, a 12 mirando 25 grados abajo): 35,
+  14 y 5 a lo largo de los ejes; 0, 2 y 1 de través. Las 4 que quedan de través no son uniones
+  en T, están en el borde contra el cielo: una es una rendija de verdad entre dos lomas (está
+  igual sin crecimiento), y en las otras 3 el borde corrido tapó el píxel vecino de uno de
+  cielo, que quedó encerrado. Con tope de 1/8 de píxel quedaban 5 y con 1/16, 8. Dos de esas
+  vistas entraron a `CRACK_VIEWS` (`standing43` y `standing103`): sin crecimiento 3 y 17
+  píxeles, a lo largo de los ejes 1 y 1 en todos los tiers y adaptadores, de través 0.
+- Costo de través contra a lo largo de los ejes (`stress`, overworld a radio 16, sin tope, 3
+  corridas alternadas por versión, estático y de pie mirando el suelo a 40 grados de los ejes):
+  en la RTX 2164 a 2131 fps estático (-1.5 %, dentro de lo que varían las corridas) y 1886 a
+  1872 de pie (-0.7 %); en la 780M 592 a 587 y 560 a 566, ruido.
 
 ### Fases
 
@@ -689,8 +737,8 @@ Tests que lo vigilan:
   límite de la caminata corta un pozo más hondo; una plataforma a +5000 sombrea el suelo y al
   descargarse se lleva la sombra; contenido debajo del piso cierra en el piso las columnas
   abiertas (y al quitarlo vuelven a abrirse); un lote de ediciones sale en un frame, o en partes
-  pasado `edit_batch_hold` (con un reloj manual: frames de 1, 10 y 33 ms; con espera 0 nada se
-  retiene); una segunda edición de un chunk retenido sale en el mismo frame que la primera; las
+  pasado `edit_batch_hold` y 2 frames (con un reloj manual: frames de 1, 6.9, 10, 17 y 33 ms;
+  con espera 0 nada se retiene); una segunda edición de un chunk retenido sale en el mismo frame que la primera; las
   ediciones pasan delante de una cola de mallas del streaming; la caché de luz sigue a un viewer
   que avanza 17 chunks (y cavar allá remalla solo el chunk); los chunks de puro aire cerca del
   viewer guardan su luz; el mismo mundo en x = 2^40, y = -2^40 da los mismos bits.
@@ -698,8 +746,10 @@ Tests que lo vigilan:
   generan nada; una caminata que leyó contenido editado se repite; un chunk editado que se
   descarga devuelve su columna a una caminata; generadores sin tope o vacíos; viewers a 2^35
   capas en las mismas columnas, con bloques bajo el piso y muy arriba, se asientan enseguida.
-  En `streaming/tests.rs`, un remallado fallido no deja luz vieja como actual y los jobs de un
-  lote siguen en prioridad 0 cuando el viewer se mueve. En `sky.rs`, las
+  En `streaming/tests.rs`, un remallado fallido no deja luz vieja como actual, los jobs de un
+  lote siguen en prioridad 0 cuando el viewer se mueve, un resultado retenido que se va del lote
+  se lleva el reloj de la espera, y un lote sin resultados se cierra pasados 120 frames y 1 s
+  (con frames de 1 y 17 ms). En `sky.rs`, las
   reglas según el rango del generador, `padded_chunks` contra fuerza bruta y las caminatas con
   capas capturadas, el vacío y el contenido fuera del generador.
 - `boxel_world/tests/integration.rs`: cada malla del terreno real, también después de editar,
@@ -717,7 +767,8 @@ Tests que lo vigilan:
   del brillo del día; la cueva tiene píxeles rojos y azules; bajo el árbol, el alero y junto a la
   pared la imagen es más oscura que sin luz ni AO. Desde la sección 12, 9 vistas: la cara de la
   lámpara blanca brilla igual al mediodía, a medianoche y sin luz; y un tercer test busca grietas
-  en 4 vistas del terreno a 1280x720 (ninguna en ningún tier). `boxel_mesh/tests/mesher.rs`: los
+  en 6 vistas del terreno a 1280x720, 2 de ellas de pie mirando el suelo de costado (ninguna en
+  ningún tier). `boxel_mesh/tests/mesher.rs`: los
   quads de cada emisor, y solo esos, llevan `FLAG_EMISSIVE`.
 - `boxel_render` (unitarios): el smoke test de cada tier dibuja un quad opaco con luz azul
   (entrada 0) bajo un quad cutout más chico con luz roja (entrada 1), y falla si el centro no

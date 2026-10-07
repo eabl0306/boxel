@@ -126,7 +126,15 @@ pub(crate) mod support {
             self.jobs.lock().expect("lock").len()
         }
         pub(crate) fn run_all(&self) {
-            let jobs = std::mem::take(&mut *self.jobs.lock().expect("lock"));
+            self.run_first(usize::MAX);
+        }
+        /// Runs the first `n` held jobs, in the order they were spawned.
+        pub(crate) fn run_first(&self, n: usize) {
+            let jobs: Vec<_> = {
+                let mut held = self.jobs.lock().expect("lock");
+                let n = n.min(held.len());
+                held.drain(..n).collect()
+            };
             for job in jobs {
                 job();
             }

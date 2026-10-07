@@ -25,7 +25,13 @@ struct Harness {
     content: WorldContent,
     settings: WorldSettings,
     events: Vec<ChunkMeshEvent>,
+    /// How far the world's frame time moves on every [`Harness::collect`] (each one is a frame).
+    frame: Duration,
 }
+
+/// Default [`Harness::frame`]: 8 ms, so the default edit batch hold (16 ms) ends after the 2
+/// frames of its floor.
+const HARNESS_FRAME: Duration = Duration::from_millis(8);
 
 impl Harness {
     /// A world without light (these tests check the streaming rules; [`Harness::lit`] turns it
@@ -53,6 +59,7 @@ impl Harness {
             content,
             settings,
             events: Vec::new(),
+            frame: HARNESS_FRAME,
         }
     }
 
@@ -107,7 +114,11 @@ impl Harness {
         self.with(|jobs, cx, _| jobs.dispatch(cx));
     }
 
+    /// A frame's collect step, [`Harness::frame`] after the last one: the edit batch hold runs
+    /// on that clock as in the world plugin (the in-flight cap stays the harness's).
     fn collect(&mut self) {
+        self.jobs.hold = self.settings.edit_batch_hold;
+        self.jobs.now += self.frame;
         self.with(WorldJobs::collect);
     }
 
@@ -1264,6 +1275,95 @@ fn slot_counters_follow_every_transition() {
     let stats = h.stats();
     assert!(stats.is_settled(), "{stats:?}");
     assert!(stats.mesh_ready > 0 && stats.mesh_empty > 0, "{stats:?}");
+}
+
+/// A settled world of stone under air seen from chunk (0, 0, 0) and (1, 0, 0) (radius 0), then
+/// a hole at the border between their columns: an edit batch of 2 remeshes, (0, -1, 0) and
+/// (1, -1, 0), whose jobs are held.
+fn border_edit(h: &mut Harness, hold: &HoldExecutor) -> [ChunkId; 2] {
+    h.interest(&[(ChunkPos::new(0, 0, 0), 0), (ChunkPos::new(1, 0, 0), 0)]);
+    for _ in 0..20 {
+        h.dispatch();
+        hold.run_all();
+        h.collect();
+    }
+    assert!(h.stats().is_settled(), "{:?}", h.stats());
+    h.edit(BlockPos::new(31, -5, 5), BlockState::AIR);
+    h.dispatch();
+    assert_eq!(hold.held(), 2, "the 2 remeshes");
+    assert_eq!(h.jobs.batches.len(), 1);
+    [h.id(ChunkPos::new(0, -1, 0)), h.id(ChunkPos::new(1, -1, 0))]
+}
+
+/// A batch whose only held result leaves (its chunk unloads, as when a viewer moves away from a
+/// member far from the edit) waits for its other members again without a clock: it is not
+/// published in parts when the hold of the result that left runs out.
+#[test]
+fn a_held_result_that_leaves_takes_the_hold_clock_with_it() {
+    let hold = Arc::new(HoldExecutor::default());
+    let mut h = Harness::new(LayerGen::new(-3..=1), hold.clone(), 64);
+    border_edit(&mut h, &hold);
+    hold.run_first(1);
+    h.collect();
+    let batch = h.jobs.batches.values().next().expect("open batch");
+    assert_eq!((batch.held.len(), batch.members.len()), (1, 1));
+    assert!(batch.hold.is_some());
+    let (left, stays) = (batch.held[0].id, batch.members[0]);
+    h.with(|jobs, cx, _| jobs.unload(cx, left));
+    h.check_stats();
+    let batch = h.jobs.batches.values().next().expect("still open");
+    assert!(batch.held.is_empty() && batch.hold.is_none(), "{batch:?}");
+    // Well past the hold of the result that left: nothing is published in parts.
+    for _ in 0..10 {
+        h.collect();
+    }
+    assert_eq!(h.jobs.light_counts.edit_batches_split, 0);
+    assert!(h.map.slots[stays].batch.is_some(), "still waiting");
+    // Its result arrives stale (the unload bumped its neighbors' epoch): it is remeshed, still
+    // in the batch, once the unloaded neighbor is back.
+    hold.run_all();
+    h.collect();
+    assert_eq!(h.jobs.light_counts.edit_batches_split, 0);
+    assert!(h.map.slots[stays].batch.is_some(), "still waiting");
+}
+
+/// A batch that never gets a result closes after 120 frames and a second, both, so short frames
+/// do not close it sooner; it counts as split (its meshes go out on their own).
+#[test]
+fn a_batch_without_results_closes_after_frames_and_time() {
+    let ms = Duration::from_millis;
+    // (frame interval, frames still open, frames until closed)
+    for (frame, open, closed) in [(ms(1), 999, 1000), (ms(17), 120, 121)] {
+        let hold = Arc::new(HoldExecutor::default());
+        let mut h = Harness::new(LayerGen::new(-3..=1), hold.clone(), 64);
+        let members = border_edit(&mut h, &hold);
+        h.frame = frame;
+        for _ in 0..open {
+            h.collect();
+        }
+        assert_eq!(
+            h.jobs.batches.len(),
+            1,
+            "{frame:?}: open after {open} frames"
+        );
+        for _ in open..closed {
+            h.collect();
+        }
+        assert!(
+            h.jobs.batches.is_empty(),
+            "{frame:?}: closed after {closed}"
+        );
+        assert_eq!(h.jobs.light_counts.edit_batches_split, 1, "{frame:?}");
+        assert_eq!(h.jobs.light_counts.edit_batches_held, 0, "{frame:?}");
+        // The meshes still arrive, each on its own.
+        hold.run_all();
+        h.collect();
+        for id in members {
+            let slot = &h.map.slots[id];
+            assert!(slot.batch.is_none(), "{frame:?}");
+            assert!(matches!(slot.mesh(), MeshState::Ready { .. }), "{frame:?}");
+        }
+    }
 }
 
 mod sky;

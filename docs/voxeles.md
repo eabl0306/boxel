@@ -36,10 +36,11 @@ frames, cruces, GPU y ediciones, en la RTX y la 780M, está en
 
 **Actualización (arreglos de aspecto, 2026-10-07; ADR 0015, sección 12):** las lámparas y la
 lava brillan: el mesher marca sus quads con un flag y el shader las dibuja con su textura a
-brillo pleno. Los lotes de ediciones esperan a sus mallas un tiempo (16 ms), no 2 frames, así
-que sin tope de fps ya no se ven a medias. Y no quedan puntitos de cielo entre caras: venían de
-las uniones en T entre quads del greedy, y el vertex shader agranda cada quad 1/64 de píxel. Las
-mallas tienen los mismos quads que antes.
+brillo pleno. Los lotes de ediciones esperan a sus mallas un tiempo (16 ms, y al menos 2
+frames), no solo 2 frames, así que sin tope de fps ya no se ven a medias. Y no quedan puntitos de
+cielo entre caras: venían de las uniones en T entre quads del greedy, y el vertex shader agranda
+cada quad lo justo para que cada borde se corra 1/64 de píxel en pantalla. Las mallas tienen los
+mismos quads que antes.
 
 ## En resumen
 
@@ -338,8 +339,9 @@ de luz, en la misma copia; `ChunkGpu::light_base` dice dónde empieza la paleta.
 
 Los quads del greedy se tocan en uniones en T (la esquina de uno cae en el borde de otro), y el
 redondeo a subpíxel del rasterizador dejaba ahí un píxel suelto sin cubrir, por donde se veía el
-cielo. El vertex shader corre cada esquina hacia afuera, en el plano del quad, lo que mide 1/64 de
-píxel en pantalla (`common.wgsl`, `edge_growth`; ADR 0015, sección 12). En Low, cada tramo
+cielo. El vertex shader corre cada esquina hacia afuera, en el plano del quad, lo justo para que
+cada borde se corra 1/64 de píxel en pantalla de través, también mirando el suelo de costado
+(`common.wgsl`, `edge_growth`; ADR 0015, sección 12). En Low, cada tramo
 de mallas tiene una segunda copia al buffer de luz por quad, con la entrada de paleta de cada quad
 ya expandida (se arma al escribir el buffer temporal).
 
