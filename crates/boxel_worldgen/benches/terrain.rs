@@ -1,7 +1,9 @@
 //! Worldgen benchmarks: `TerrainGenerator::generate` per chunk (surface and uniform), near the
 //! origin and far from it (`*_far`: voxel `2^40`, where the lattice cells leave `i32`).
 use boxel_voxel::{BlockRegistry, BlockState, ChunkKey, ChunkPos};
-use boxel_worldgen::{FlatGenerator, TerrainGenerator, WorldGenerator};
+use boxel_worldgen::{
+    FlatGenerator, ForestGenerator, OverworldGenerator, TerrainGenerator, WorldGenerator,
+};
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
@@ -77,6 +79,36 @@ fn bench(c: &mut Criterion) {
             sum
         });
     });
+    g.finish();
+
+    // The sea (ADR 0021): the chunk of a lake (the lowest columns near the origin, around
+    // (248, -256)) and the surface chunk at the origin, with and without the sea.
+    let lake = ChunkKey::new(ChunkPos::new(7, 1, -8));
+    let forest = ForestGenerator::default();
+    let dry = ForestGenerator {
+        sea: None,
+        ..ForestGenerator::default()
+    };
+    let overworld = OverworldGenerator::default();
+    let mut overworld_dry = OverworldGenerator::default();
+    overworld_dry.settings.sea = None;
+    let water = registry.by_name("boxel:water").expect("water");
+    let mut lake_dense = vec![BlockState::AIR; boxel_voxel::CHUNK_VOLUME];
+    forest.generate(lake, &registry).to_dense(&mut lake_dense);
+    assert!(lake_dense.contains(&water), "the lake chunk has water");
+    let mut g = c.benchmark_group("sea");
+    for (name, generator, key) in [
+        ("forest_lake", &forest as &dyn WorldGenerator, lake),
+        ("forest_lake_dry", &dry, lake),
+        ("forest_surface", &forest, surface),
+        ("forest_surface_dry", &dry, surface),
+        ("overworld_lake", &overworld, lake),
+        ("overworld_lake_dry", &overworld_dry, lake),
+    ] {
+        g.bench_function(name, |b| {
+            b.iter(|| generator.generate(black_box(key), &registry));
+        });
+    }
     g.finish();
 
     let flat = FlatGenerator::new(vec![

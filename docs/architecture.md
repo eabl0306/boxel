@@ -2,7 +2,7 @@
 
 Documento técnico de referencia. Fecha: 2026-10-05. Estado: aprobado para el milestone M0
 (revisión final, después de tres revisiones adversariales del borrador v1).
-Las decisiones puntuales están en `docs/adr/` (0001 a 0019). Durante M0 hubo además una
+Las decisiones puntuales están en `docs/adr/` (0001 a 0021). Durante M0 hubo además una
 especificación para los agentes implementadores (en inglés, en `.scaffold/`), borrada al cerrar M0;
 este documento queda como referencia.
 
@@ -150,10 +150,10 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_voxel` | coordenadas (`BlockPos`, `ChunkPos`, `WorldPos`: bloque más offset, exacto a cualquier distancia), `Face`, registry (con emisión RGB y opacidad de luz), paleta, `LightValue` y `LightTables`, `ChunkData` con sus máscaras de luz (`LightMasks`) | (glam) |
 | `boxel_mesh` | `PackedQuad`, `ChunkMesh` con su paleta de luz, `PaddedChunk`, `Mesher` (fork de bgm que fusiona por material, AO y luz) | voxel |
 | `boxel_light` | luz de vóxeles en CPU, sin ECS ni GPU (ADR 0015): techos de cielo por columna (`SkyTile`, caminata hacia abajo), luz exacta de un chunk desde una caja de 64³ (cielo y RGB, caminos rápidos para cuevas oscuras y cielo abierto), `PaddedLight`, `ChunkLight`; oráculo global para los tests | voxel |
-| `boxel_worldgen` | trait `WorldGenerator`; generadores `FlatGenerator`, `TerrainGenerator`, `ForestGenerator` (terreno con árboles) y `OverworldGenerator` (superficie sobre piedra infinita hacia abajo, con cuevas y árboles; etapas en `overworld`: `Heightmap`, `SurfaceRules`, `Caves`, más `Trees`); ruido 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`) | voxel |
-| `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, mensajes (`ChunkMeshEvent`, `BlockChanged`, `ChunkDataEvent`), `ChunkStore`, reloj del mundo (`TimeOfDay`, `DaylightCurve`, `DaylightPlugin`) | app, voxel, mesh, light, worldgen, transform, diagnostic |
+| `boxel_worldgen` | trait `WorldGenerator`; generadores `FlatGenerator`, `TerrainGenerator`, `ForestGenerator` (terreno con árboles) y `OverworldGenerator` (superficie sobre piedra infinita hacia abajo, con cuevas y árboles; etapas en `overworld`: `Heightmap`, `SurfaceRules`, `Caves`, más `Trees`); `Sea` (mar y playas en el forest y el overworld, ADR 0021); ruido 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`) | voxel |
+| `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, mensajes (`ChunkMeshEvent`, `BlockChanged`, `ChunkDataEvent`), `ChunkStore`, reloj del mundo (`TimeOfDay`, `DaylightCurve`, `DaylightPlugin`), ticks programados de bloques (`BlockTicks`, `BlockTicksPlugin`) y agua que corre (`FluidPlugin`, ADR 0021) | app, voxel, mesh, light, worldgen, transform, diagnostic |
 | `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `SceneLight` (luz del cielo, ambiente y curva de brillo del frame), `PresentSettings` (vsync en tiempo de ejecución), texturas procedurales o de un resource pack (`TextureSource`), screenshots | gfx, shaders, world, camera, window, pack |
-| `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::collision`: cubos y cajas, más un contorno para apuntar, ADR 0018), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas, el integrador de un cuerpo (`step_body`, `predict`), el narrowphase (`shape_contact`) y la grilla del broadphase (`Grid`). Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`; pasos en `FixedPostUpdate`, interpolación en `AfterFixedMainLoop`), `PhysicsQuery` (rayos a vóxeles y cuerpos, cajas, el chequeo para poner bloques), `BodyIndex`, cuerpos (`RigidBody`, `Collider`, `Velocity`, `BodyPosition`, `Contacts`, `Interpolated`, `Teleport`, `Frozen`, `Sleeping`, `ReportContacts`), `CharacterController`, `Projectile` y los mensajes `VoxelImpact`, `CollisionStarted`, `CollisionEnded` y `ProjectileHit`. Los cuerpos quietos se duermen (despiertan con `BlockChanged` y `ChunkDataEvent` del mundo, entre otras cosas) y, con muchos cuerpos despiertos, el paso corre en los hilos de cómputo. Fases P0 a P4 hechas | ecs, app, math, tasks, transform, voxel, world, diagnostic |
+| `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::collision`: cubos y cajas, más un contorno para apuntar, ADR 0018), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas, el integrador de un cuerpo (`step_body`, `predict`), el narrowphase (`shape_contact`) y la grilla del broadphase (`Grid`). Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`; pasos en `FixedPostUpdate`, interpolación en `AfterFixedMainLoop`), `PhysicsQuery` (rayos a vóxeles y cuerpos, cajas, el chequeo para poner bloques), `BodyIndex`, cuerpos (`RigidBody`, `Collider`, `Velocity`, `BodyPosition`, `Contacts`, `Interpolated`, `Teleport`, `Frozen`, `Sleeping`, `ReportContacts`), `CharacterController`, `Projectile`, nadar (`SwimPlugin`, `Swimmer`, ADR 0021) y los mensajes `VoxelImpact`, `CollisionStarted`, `CollisionEnded` y `ProjectileHit`. Los cuerpos quietos se duermen (despiertan con `BlockChanged` y `ChunkDataEvent` del mundo, entre otras cosas) y, con muchos cuerpos despiertos, el paso corre en los hilos de cómputo. Fases P0 a P4 hechas | ecs, app, math, tasks, transform, voxel, world, diagnostic |
 | `boxel_pack` | lector de resource packs de Minecraft Java (formatos ~64 a 120): `pack.mcmeta` con overlays, texturas de bloque PNG a RGBA8 (animaciones `.png.mcmeta`), modelos de bloque con herencia `parent` y variables `#`, blockstates `variants` y `multipart`. Solo datos; `boxel_render` lo usa para las texturas de bloque | (serde, png) |
 | `boxel_facade_check` | solo CI: prueba que los derives resuelven `::boxel::ecs` para un usuario que depende solo de `boxel` | fachada |
 | `vendor/*` (7 crates) | ECS y tareas (fork de Bevy) | - |
@@ -617,7 +617,8 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   colisión (`None`, `Full` o cajas), flags, emisión RGB, opacidad de luz (15 en los cubos opacos,
   1 en hojas, agua y losas, 0 en vidrio y plantas), texturas por cara. Solo un cubo `Opaque`
   tapa caras vecinas (`BlockRegistry::occludes`). Contenido congelado: aire,
-  piedra, tierra, pasto, arena, grava, nieve, bedrock, tronco, hojas (cutout), agua (translúcida),
+  piedra, tierra, pasto, arena, grava, nieve, bedrock, tronco, hojas (cutout), agua (translúcida,
+  `boxel:water[level=0..15]` desde ADR 0021),
   tablones y, desde la fase P6 de la luz, los primeros emisores: lámparas de cubo completo naranja
   (14, 11, 6), roja (14, 2, 2), azul (3, 6, 14) y blanca (15, 15, 15) y una lava provisoria
   (15, 7, 2), opaca y sólida hasta que haya fluidos (`boxel_voxel::LAMPS`, `LAVA_EMISSION`);
@@ -738,6 +739,12 @@ Sistemas en `Update`, encadenados (`WorldSystems`):
    `Unloaded { id, key }` cuando dejan de poder leerse. El mapa los anota al cambiar el estado de
    un slot (`set_data` y `remove`), así ningún camino del streaming se olvida de avisar.
 
+Con `BlockTicksPlugin` (lo agrega `FluidPlugin`, ADR 0021), entre Interest y Edits corren los
+ticks programados que vencieron, en orden y con un presupuesto de 1 ms. Sus escrituras entran al
+`EditQueue` del mismo frame. Después de Edits, los `BlockChanged` de las demás ediciones programan
+los bloques con tick que están en la posición o al lado. El reloj de ticks (20 por segundo) avanza
+en `FixedUpdate`.
+
 `BlockChanged` y `ChunkDataEvent` son los mensajes que comparten los sistemas que guardan algo
 derivado de los bloques: la física despierta los cuerpos dormidos cerca de un bloque que cambió
 o de un chunk que se cargó (ADR 0016, P4). La luz del mundo no los necesita: la recalcula el
@@ -794,7 +801,12 @@ un `Mesher` thread-local (~0.6 MiB de scratch) y un `LightScratch` (~0.7 MiB).
    quads de `w = h = 1` con un código de forma. Una cara de losa en el borde se oculta contra un
    cubo opaco o una cara vecina que la cubre, y se sombrea como la cara del cubo en su lugar. Una
    cruz son dos quads en las diagonales, en el bucket cutout, con la luz de su propia celda.
-5. **Buckets (8, congelados, ADR 0012):** 0 a 5 = caras opacas en orden `Face`; 6 = **cutout**
+5. **Fluidos** (ADR 0021): todos los niveles de un fluido se mallan como su fuente. Cada celda de
+   superficie calcula la altura de sus 4 esquinas (media pesada de las celdas alrededor, como
+   Minecraft). Si las 4 quedan a 14/16 sigue en el greedy (`SHAPE_FLUID_SURFACE`); si no, sale de
+   las máscaras del greedy y se emite por bloque con `SHAPE_FLUID_SLOPE` y sus alturas en los bits
+   de `w - 1`, `h - 1` y el AO. Validado contra un oráculo de alturas y sin grietas entre chunks.
+6. **Buckets (8, congelados, ADR 0012):** 0 a 5 = caras opacas en orden `Face`; 6 = **cutout**
    (todas las caras de materiales cutout, como las hojas); 7 = translúcido. `ChunkMesh` guarda los
    quads contiguos por bucket, `bucket_counts[8]`, la paleta de luz y un hash de todo. En el arena
    de la GPU la paleta va justo después de los quads del chunk (sección 10.2).
@@ -804,6 +816,8 @@ un `Mesher` thread-local (~0.6 MiB de scratch) y un `LightScratch` (~0.7 MiB).
 ```
 geo: x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | flags:4 (bit 0 emisivo, bits 1 a 3 forma)
 mat: capa:12 | ao:8 (2 bits por esquina, 3 = abierto) | luz:12 (índice en la paleta del chunk)
+forma 7 (agua inclinada, w = h = 1): los bits de w-1 y h-1 llevan las alturas de las esquinas 0 y 1
+  y el byte de AO las de las esquinas 2 y 3 (4 bits cada una, en dieciseisavos menos 1)
 ejes (u, v): ±Y -> (X, Z); ±X -> (Z, Y); ±Z -> (X, Y)
 ```
 

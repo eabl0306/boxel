@@ -121,6 +121,10 @@ completa, así no se ve un hueco debajo de un muelle.
   conserva el techo completo.
 - Queda una ranura de 2/16 donde un agua de altura completa (bajo un bloque) toca de costado un
   agua de superficie. Es raro y se va con los líquidos que fluyen, que tendrán altura por esquina.
+- Revisado por el ADR 0021: el agua tiene `level` y corre. Cada celda de superficie tiene una
+  altura por esquina. Si las 4 quedan a 14/16 sigue siendo un quad greedy como acá; si no, sale
+  por bloque con `SHAPE_FLUID_SLOPE` (código 7) y sus alturas en el quad. La ranura de arriba se
+  fue: la celda llena sube las esquinas de al lado.
 
 ## Consecuencias
 

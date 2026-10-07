@@ -140,10 +140,8 @@ struct Water<'a> {
 impl Water<'_> {
     fn fluid(&self, state: Option<BlockState>) -> Option<Fluid> {
         let state = state?;
-        if !self.states.contains(&state) {
-            return None;
-        }
-        Fluid::of(self.registry, state)
+        let level = self.states.iter().position(|&s| s == state)?;
+        Some(Fluid::from_level(level as u8))
     }
 
     fn state(&self, fluid: Fluid) -> BlockState {

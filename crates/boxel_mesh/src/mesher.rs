@@ -253,19 +253,16 @@ impl MaterialTable {
             layers,
         }
     }
-    /// Mesher voxel value, class and fluid level of a block state. M0 identity map (as
+    /// Mesher voxel value and class of a block state. M0 identity map (as
     /// `BlockRegistry::material`): the table is indexed by material id, and the material id of
-    /// a state with geometry is the state id itself, but every level of a fluid is its source's
-    /// material, with its level (ADR 0021); states without geometry (and ids outside the table)
-    /// become `0` / `Empty`.
+    /// a state with geometry is the state id itself; states without geometry (and ids outside
+    /// the table) become `0` / `Empty`. The levels of a fluid become their source's material
+    /// after the gather ([`remap_fluid_levels`]).
     #[inline]
-    fn resolve(&self, state: BlockState) -> (u16, VoxelClass, u8) {
+    fn resolve(&self, state: BlockState) -> (u16, VoxelClass) {
         match self.class(state.0) {
-            VoxelClass::Empty => (0, VoxelClass::Empty, 0),
-            class => {
-                let (material, level) = self.fluid_level(state.0);
-                (material, class, level)
-            }
+            VoxelClass::Empty => (0, VoxelClass::Empty),
+            class => (state.0, class),
         }
     }
 }
@@ -417,8 +414,34 @@ fn gather_into(
             gather_border([offset.x, offset.y, offset.z], chunk, materials, out);
         }
     }
+    if materials.has_fluid {
+        remap_fluid_levels(materials, out);
+    }
     if materials.marks_fluid_surfaces() {
         mark_fluid_surfaces(materials, out);
+    }
+}
+
+/// Every level of a fluid becomes its source's material, so the levels cull and merge as one
+/// fluid (ADR 0021); the levels other than 0 go to [`PaddedChunk::fluid_levels`]. Visits only
+/// the transparent voxels (fluids are transparent cubes), so a chunk without water pays one read
+/// per column.
+fn remap_fluid_levels(materials: &MaterialTable, out: &mut PaddedChunk) {
+    for y in -1..=CHUNK_SIZE {
+        for x in -1..=CHUNK_SIZE {
+            let mut bits = out.transparent[mask_row(x, y)];
+            while bits != 0 {
+                // Mask bit `b` is padded z `b - 1`.
+                let z = bits.trailing_zeros() as i32 - 1;
+                bits &= bits - 1;
+                let i = PaddedChunk::index(x, y, z);
+                let (source, level) = materials.fluid_level(out.voxels[i]);
+                if level != 0 {
+                    out.voxels[i] = source;
+                    out.fluid_levels.push((i as u32, level));
+                }
+            }
+        }
     }
 }
 
@@ -460,7 +483,8 @@ fn gather_center(
 ) {
     const INNER: Range<i32> = 0..CHUNK_SIZE;
     if let Some(state) = center.as_uniform() {
-        fill_region(out, [INNER, INNER, INNER], materials.resolve(state));
+        let (material, class) = materials.resolve(state);
+        fill_region(out, [INNER, INNER, INNER], material, class);
         return;
     }
     center.to_dense(dense);
@@ -481,7 +505,8 @@ fn gather_border(
 ) {
     let spans = offset.map(border_span);
     if let Some(state) = chunk.as_uniform() {
-        fill_region(out, spans.map(|(range, _)| range), materials.resolve(state));
+        let (material, class) = materials.resolve(state);
+        fill_region(out, spans.map(|(range, _)| range), material, class);
         return;
     }
     let [(xs, sx), (ys, sy), (zs, sz)] = spans;
@@ -497,9 +522,8 @@ fn gather_border(
 }
 
 /// Writes a run of states along z, starting at padded `(x, y, z0)`, into a clear `out`: material
-/// ids through the table, mask bits gathered per run, the levels of flowing fluid cells to
-/// `out.fluid_levels`. Consecutive equal states (common along terrain columns) reuse the
-/// previous table lookup.
+/// ids through the table, mask bits gathered per run. Consecutive equal states (common along
+/// terrain columns) reuse the previous table lookup.
 #[inline]
 fn write_run(
     out: &mut PaddedChunk,
@@ -511,7 +535,6 @@ fn write_run(
 ) {
     let start = PaddedChunk::index(x, y, z0);
     let dst = &mut out.voxels[start..start + states.len()];
-    let out_levels = &mut out.fluid_levels;
     let (mut opaque, mut transparent, mut special) = (0u64, 0u64, 0u64);
     let mut last = BlockState(u16::MAX);
     let mut resolved = materials.resolve(last);
@@ -520,11 +543,8 @@ fn write_run(
             last = state;
             resolved = materials.resolve(state);
         }
-        let (material, class, level) = resolved;
+        let (material, class) = resolved;
         *slot = material;
-        if level != 0 {
-            out_levels.push(((start + z) as u32, level));
-        }
         opaque |= u64::from(class == VoxelClass::Opaque) << z;
         transparent |= u64::from(class == VoxelClass::Transparent) << z;
         special |= u64::from(class == VoxelClass::Special) << z;
@@ -546,13 +566,13 @@ fn border_span(d: i32) -> (Range<i32>, i32) {
     }
 }
 
-/// Fills a padded-space box (`[xs, ys, zs]`, each within -1..=32, non-empty) with one resolved
-/// state (material, class and fluid level). `out` must be clear inside the box (`gather` clears
-/// first), so `Empty` writes nothing.
+/// Fills a padded-space box (`[xs, ys, zs]`, each within -1..=32, non-empty) with one material.
+/// `out` must be clear inside the box (`gather` clears first), so `Empty` writes nothing.
 fn fill_region(
     out: &mut PaddedChunk,
     [xs, ys, zs]: [Range<i32>; 3],
-    (material, class, level): (u16, VoxelClass, u8),
+    material: u16,
+    class: VoxelClass,
 ) {
     let masks = match class {
         VoxelClass::Empty => return,
@@ -568,10 +588,6 @@ fn fill_region(
             masks[mask_row(x, y)] |= bits;
             let start = PaddedChunk::index(x, y, zs.start);
             out.voxels[start..start + len].fill(material);
-            if level != 0 {
-                out.fluid_levels
-                    .extend((start..start + len).map(|i| (i as u32, level)));
-            }
         }
     }
 }
