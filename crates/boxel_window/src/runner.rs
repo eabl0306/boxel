@@ -5,7 +5,9 @@ use crate::window::{
     CursorGrab, CursorOptions, PrimaryWindow, WindowCloseRequested, WindowCreated, WindowFocused,
     WindowMode, WindowOccluded, WindowResized, WindowSettings, WindowState,
 };
-use boxel_app::{App, AppExit, FrameLimit, FramePacer, FrameWait, PluginsState, spin_until};
+use boxel_app::{
+    App, AppExit, FrameDeadline, FrameLimit, FramePacer, FrameWait, PluginsState, spin_until,
+};
 use boxel_ecs::prelude::*;
 use boxel_math::{UVec2, Vec2};
 use std::sync::Arc;
@@ -185,6 +187,7 @@ pub fn winit_runner(mut app: App, event_loop: EventLoop<()>) -> AppExit {
         .unwrap_or_default();
     app.world_mut().init_resource::<WindowState>();
     app.world_mut().init_resource::<FramePacingInfo>();
+    app.world_mut().init_resource::<FrameDeadline>();
     let mut handler = WinitApp::new(app, settings);
     let result = event_loop.run_app(&mut handler);
     // `exiting` normally did this already; it is a no-op then.
@@ -449,6 +452,10 @@ struct RunnerCore {
     /// The callback cadence does not match the reported refresh rate (see
     /// `CADENCE_TOLERANCE_PER_MILLE`).
     cadence_mismatch: bool,
+    /// When the current update started (`None`: none yet).
+    update_started: Option<Instant>,
+    /// How long the previous update took (for [`FrameDeadline`]).
+    last_update: Duration,
 }
 
 impl RunnerCore {
@@ -479,6 +486,8 @@ impl RunnerCore {
             gate_requested_at: None,
             cadence: CallbackCadence::default(),
             cadence_mismatch: false,
+            update_started: None,
+            last_update: Duration::ZERO,
         }
     }
 
@@ -795,7 +804,7 @@ impl RunnerCore {
     }
 
     /// Before an update: publish occlusion (winit's report, the polled minimized state or the
-    /// redraw watchdog) and [`FramePacingInfo`].
+    /// redraw watchdog), [`FramePacingInfo`] and [`FrameDeadline`].
     fn begin_update(&mut self, world: &mut World, now: Instant) {
         let stalled = self
             .redraw_pending_since
@@ -836,6 +845,10 @@ impl RunnerCore {
                 self.pacer.reanchor(opened);
             }
         }
+        self.update_started = Some(now);
+        if let Some(mut deadline) = world.get_resource_mut::<FrameDeadline>() {
+            *deadline = FrameDeadline::after_start(&self.pacer, period, self.last_update);
+        }
     }
 
     /// Fills and publishes [`FramePacingInfo`] for the update that starts at `now`.
@@ -861,6 +874,9 @@ impl RunnerCore {
     /// the pacing (with the [`FrameLimit`] of now: a change made during the update paces the
     /// next one).
     fn end_update(&mut self, world: &World, now: Instant) -> EndOfUpdate {
+        if let Some(started) = self.update_started.take() {
+            self.last_update = now.saturating_duration_since(started);
+        }
         let request_redraw = !frame_ready(world) && self.redraw_pending_since.is_none();
         if request_redraw {
             self.redraw_pending_since = Some(now);
@@ -1040,6 +1056,7 @@ mod tests {
         app.add_plugins(InputPlugin)
             .insert_resource(WindowState::default())
             .init_resource::<FramePacingInfo>()
+            .init_resource::<FrameDeadline>()
             .insert_resource(CursorOptions {
                 grab: CursorGrab::None,
                 visible: true,
@@ -2010,6 +2027,46 @@ mod tests {
             ready_at(&app, &mut core, callback + us(600)),
             callback + panel
         );
+    }
+
+    #[test]
+    fn the_frame_deadline_follows_the_pacing() {
+        let us = Duration::from_micros;
+        let deadline = |app: &App| *app.world().resource::<FrameDeadline>();
+        let period = FrameLimit::new(144).period().expect("limited");
+        let (mut app, mut core, t0) = paced(144);
+        core.begin_update(app.world_mut(), t0);
+        assert_eq!(
+            deadline(&app),
+            FrameDeadline {
+                next: Some(t0 + period),
+                period: Some(period),
+                last_update: Duration::ZERO,
+            }
+        );
+        core.end_update(app.world(), t0 + us(1500));
+        let t1 = t0 + period;
+        core.begin_update(app.world_mut(), t1);
+        assert_eq!(deadline(&app).next, Some(t1 + period));
+        assert_eq!(deadline(&app).last_update, us(1500));
+        // Unlimited: no deadline.
+        app.insert_resource(FrameLimit::UNLIMITED);
+        core.end_update(app.world(), t1 + us(700));
+        core.begin_update(app.world_mut(), t1 + us(800));
+        assert_eq!(
+            deadline(&app),
+            FrameDeadline {
+                next: None,
+                period: None,
+                last_update: us(700),
+            }
+        );
+        // Following the display: the refresh period from the frame callback.
+        let panel = Duration::from_nanos(1_000_000_000_000 / u64::from(PANEL_MHZ));
+        let (mut app, mut core, t0) = display(144);
+        core.begin_update(app.world_mut(), t0);
+        assert_eq!(deadline(&app).next, Some(t0 + panel));
+        assert_eq!(deadline(&app).period, Some(panel));
     }
 
     #[test]

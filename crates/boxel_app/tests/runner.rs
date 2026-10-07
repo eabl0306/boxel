@@ -1,6 +1,6 @@
 //! `ScheduleRunnerPlugin` (headless runner): exit codes, `Shutdown`, pacing and plugin lifecycle.
 use boxel_app::prelude::*;
-use boxel_app::{PluginsState, RunMode};
+use boxel_app::{FrameDeadline, PluginsState, RunMode};
 use boxel_ecs::prelude::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -96,6 +96,49 @@ fn run_loop_paces_frames() {
     // machine may be loaded.
     let elapsed = start.elapsed();
     assert!(elapsed >= Duration::from_millis(40), "{elapsed:?}");
+}
+
+#[test]
+fn run_loop_writes_the_frame_deadline() {
+    let run = |mode: RunMode| {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let mut app = App::new();
+        app.add_plugins(ScheduleRunnerPlugin { run_mode: mode })
+            .add_systems(
+                Update,
+                move |deadline: Res<FrameDeadline>, mut w: MessageWriter<AppExit>| {
+                    let mut seen = record.lock().expect("lock");
+                    seen.push((Instant::now(), *deadline));
+                    if seen.len() == 3 {
+                        w.write(AppExit::Success);
+                    }
+                },
+            );
+        assert_eq!(app.run(), AppExit::Success);
+        Arc::try_unwrap(seen)
+            .expect("app dropped")
+            .into_inner()
+            .expect("lock")
+    };
+    let period = Duration::from_millis(10);
+    let seen = run(RunMode::Loop { wait: Some(period) });
+    for (i, (at, deadline)) in seen.iter().enumerate() {
+        assert_eq!(deadline.period, Some(period), "frame {i}");
+        let next = deadline.next.expect("paced");
+        assert!(
+            next > *at && next - *at <= period,
+            "frame {i}: {deadline:?}"
+        );
+        // The first frame has no previous update.
+        assert_eq!(deadline.last_update.is_zero(), i == 0, "frame {i}");
+    }
+    // Unpaced: no deadline.
+    let seen = run(RunMode::Loop { wait: None });
+    assert!(
+        seen.iter()
+            .all(|(_, d)| d.next.is_none() && d.period.is_none())
+    );
 }
 
 /// Ready only after `polls` calls to `ready`; records the update count seen by `finish` and

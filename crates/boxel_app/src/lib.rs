@@ -23,7 +23,9 @@ mod task_pool;
 mod time;
 
 pub use app::{App, AppExit, PluginsState, RunnerFn};
-pub use frame_limit::{DEFAULT_MAX_FPS, FrameLimit, FramePacer, FrameWait, spin_until};
+pub use frame_limit::{
+    DEFAULT_MAX_FPS, FrameDeadline, FrameLimit, FramePacer, FrameWait, spin_until,
+};
 pub use plugin::{Plugin, Plugins};
 pub use plugin_group::{PluginGroup, PluginGroupBuilder};
 pub use runner::{RunMode, ScheduleRunnerPlugin};

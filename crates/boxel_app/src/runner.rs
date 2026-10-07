@@ -1,4 +1,4 @@
-use crate::{App, AppExit, FrameLimit, FramePacer, Plugin, PluginsState};
+use crate::{App, AppExit, FrameDeadline, FrameLimit, FramePacer, Plugin, PluginsState};
 use boxel_ecs::world::World;
 use std::time::{Duration, Instant};
 
@@ -47,7 +47,7 @@ impl Plugin for ScheduleRunnerPlugin {
 }
 
 /// The headless runner installed by [`ScheduleRunnerPlugin`]. Runs `Shutdown` once before
-/// returning, in both modes.
+/// returning, in both modes. In `Loop` mode it writes [`FrameDeadline`] before every update.
 fn run_headless(mut app: App, mode: RunMode) -> AppExit {
     while app.plugins_state() == PluginsState::Adding {
         std::thread::yield_now();
@@ -61,11 +61,19 @@ fn run_headless(mut app: App, mode: RunMode) -> AppExit {
         }
         RunMode::Loop { wait } => {
             let mut pacer = FramePacer::new();
+            let mut last_update = Duration::ZERO;
             loop {
                 let period = loop_period(app.world(), wait);
                 pacer.block_until_due(period);
-                pacer.start_frame(Instant::now(), period);
+                let start = Instant::now();
+                pacer.start_frame(start, period);
+                app.world_mut().insert_resource(FrameDeadline::after_start(
+                    &pacer,
+                    period,
+                    last_update,
+                ));
                 app.update();
+                last_update = start.elapsed();
                 if let Some(exit) = app.should_exit() {
                     break Some(exit);
                 }

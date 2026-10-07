@@ -561,6 +561,11 @@ al moverse.
   frame y el tope saltaba entre 558 y 3114 de un frame al siguiente; ahora cambia como mucho un
   23 % (medido a radio 32 cargando y caminando).
 - Los chunks que el generador declara de puro aire se crean listos, sin job (sección 9).
+- Con tope de fps los dos topes (`interest_budget` y `job_budget`) crecen hacia la parte ociosa
+  del frame (issue #3). El runner publica cuándo vence el frame siguiente (`FrameDeadline`) y el
+  mundo trabaja hasta medio período antes de ese momento (1.5 ms como mínimo), menos lo que tarda
+  el resto de la update, medido en las anteriores. Nunca bajan de su valor, y sin tope quedan
+  exactamente igual. El mundo que sale es el mismo; solo cambia en cuántos frames.
 
 Medido con `headless_world` en release, terreno por defecto, bucle a 144 Hz (`--hz 144`), que es
 el ritmo del límite de FPS por defecto (ADR 0013). El frame es todo el `App::update` (mundo sin
