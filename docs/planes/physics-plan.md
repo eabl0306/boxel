@@ -453,7 +453,7 @@ Estimate behind these: 25 to 35 probes at about 1 ns, plus a few 6.5 ns lookups,
   - Work: projectiles, sleeping with the shared world messages, the parallel step, the stress runs, results in docs/rendimiento.
   - Exit: an arrow at 60 b/s hits a 0.6-wide mob, the 10k benches pass, and the frame rule holds on both GPUs.
 - **P5, on demand.**
-  - Step-up.
+  - Step-up (done: ADR 0016, section 9c).
   - Non-full shapes through `BlockDef.collision`.
   - Fluids.
   - Per-block friction.

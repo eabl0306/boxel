@@ -23,7 +23,7 @@ use boxel_physics::{
 use boxel_transform::Transform;
 use boxel_voxel::{BlockPos, BlockRegistry, BlockState, Face, MAX_BLOCK_COORD, WorldPos};
 use boxel_world::ChunkMap;
-use common::{STONE, player, table};
+use common::{STONE, bottom_slab, player, table};
 use sim::{FRAME_144, Impacts, STEP, Sim};
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -599,6 +599,11 @@ fn scene(base: I64Vec3, frame: Duration, interpolated: bool, steps: u64) -> Vec<
         for z in -6..=6 {
             sim.edit(sim.block(12, y, z), STONE);
         }
+    }
+    // Two strips of slabs between the walkers: they step up and down.
+    for z in -2..=2 {
+        sim.edit(sim.block(4, 4, z), bottom_slab());
+        sim.edit(sim.block(7, 4, z), bottom_slab());
     }
     let wall = sim.block(12, 5, 6);
     while sim.app.world().resource::<ChunkMap>().block_at(wall) != Some(STONE) {

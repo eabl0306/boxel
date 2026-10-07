@@ -7,8 +7,8 @@ use crate::components::{
 };
 use crate::contacts::{BodyIndex, ObstacleIndex, ObstacleScratch};
 use crate::core::{
-    BodySettings, CollisionTable, LocalBox, MAX_SWEEP_DISTANCE, StepParams, integrate_velocity,
-    move_body,
+    BodySettings, CollisionTable, LocalBox, MAX_SWEEP_DISTANCE, StepParams, StepUp,
+    integrate_velocity, move_body,
 };
 use crate::plugin::PhysicsContent;
 use crate::source::ChunkSource;
@@ -568,6 +568,7 @@ type StepItem<'a> = (
     Mut<'a, Contacts>,
     Mut<'a, PhysicsSync>,
     bool,
+    Option<&'a CharacterController>,
 );
 
 /// One step of one dynamic body (it reads the world and writes only itself).
@@ -582,6 +583,7 @@ fn step_one(stepper: &mut Stepper<'_>, shared: &StepShared<'_>, item: StepItem<'
         mut contacts,
         mut sync,
         was_frozen,
+        controller,
     ) = item;
     if *kind != RigidBody::Dynamic {
         return;
@@ -591,11 +593,26 @@ fn step_one(stepper: &mut Stepper<'_>, shared: &StepShared<'_>, item: StepItem<'
     let shape = collider.map_or(LocalBox::default(), Collider::voxel_box);
     let pos = position.0.normalize();
     let v = integrate_velocity(velocity.0, contacts.on_ground, body, params);
-    // Solid colliders sweep against the static and kinematic solids too.
+    // Characters step up ledges (projectiles never get here).
+    let step = match controller {
+        Some(controller) if controller.step_height > 0.0 => StepUp {
+            height: controller.step_height,
+            grounded: contacts.on_ground,
+        },
+        _ => StepUp::NONE,
+    };
+    // Solid colliders sweep against the static and kinematic solids too, the ones a step-up
+    // could reach included (the box raised by the step height).
     let blockers = match collider {
-        Some(collider) if !collider.is_sensor() && !shared.obstacles.is_empty() => stepper
-            .scratch
-            .gather(shared.obstacles, pos, shape, v * params.dt, collider.layers),
+        Some(collider) if !collider.is_sensor() && !shared.obstacles.is_empty() => {
+            let mut reach = shape;
+            if step.height > 0.0 {
+                reach.max.y += step.height.min(MAX_SWEEP_DISTANCE);
+            }
+            stepper
+                .scratch
+                .gather(shared.obstacles, pos, reach, v * params.dt, collider.layers)
+        }
         _ => &[],
     };
     match move_body(
@@ -607,6 +624,7 @@ fn step_one(stepper: &mut Stepper<'_>, shared: &StepShared<'_>, item: StepItem<'
         blockers,
         body,
         params,
+        step,
     ) {
         Ok(out) => {
             if out.sweep.moved != DVec3::ZERO {
@@ -639,11 +657,11 @@ fn step_one(stepper: &mut Stepper<'_>, shared: &StepShared<'_>, item: StepItem<'
 }
 
 /// [`PhysicsSystems::Step`]: one step of every awake dynamic body ([`crate::step_body`], plus
-/// the static and kinematic solid obstacles for a solid body). A body whose step needs an
-/// unloaded block keeps its state and gets [`Frozen`]. Above
-/// `PhysicsSettings::parallel_threshold` bodies it runs on the compute threads: each body reads
-/// the world and writes only itself, and the outputs are merged in entity order, so the results
-/// are bit-identical to a run on one thread.
+/// the static and kinematic solid obstacles for a solid body, and the step-up of a
+/// [`CharacterController`]). A body whose step needs an unloaded block keeps its state and gets
+/// [`Frozen`]. Above `PhysicsSettings::parallel_threshold` bodies it runs on the compute
+/// threads: each body reads the world and writes only itself, and the outputs are merged in
+/// entity order, so the results are bit-identical to a run on one thread.
 pub(crate) fn step_dynamic(
     mut commands: Commands,
     map: Res<ChunkMap>,
@@ -664,6 +682,7 @@ pub(crate) fn step_dynamic(
             &mut Contacts,
             &mut PhysicsSync,
             Has<Frozen>,
+            Option<&CharacterController>,
         ),
         (Without<Sleeping>, Without<Projectile>),
     >,
