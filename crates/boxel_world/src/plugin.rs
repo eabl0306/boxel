@@ -113,11 +113,18 @@ pub struct WorldSettings {
     /// radius later gets a light job, after the view's mesh jobs. Chunks that leave the radius
     /// drop their light. At most 32 (larger values are clamped).
     pub light_cache_radius: u32,
-    /// Frames the finished meshes of one edit batch wait for the rest of the batch before they
-    /// are published anyway (0: no wait): a mesh that arrives in frame `N` is published by frame
-    /// `N + edit_batch_hold_frames`. Holding them keeps a frame from showing half of an edit's
-    /// light change.
-    pub edit_batch_hold_frames: u32,
+    /// How long the finished meshes of one edit batch wait for the rest of the batch before
+    /// they are published anyway (zero: no wait). A batch is published as soon as its last mesh
+    /// arrives. If some are late, the meshes that arrived in frame `N` go out in the first frame
+    /// that is at least `edit_batch_hold` and 2 frames after `N`, and the late ones on their own
+    /// when they arrive. A frame's time is taken when its job step
+    /// ([`WorldSystems::Dispatch`]) starts. Holding them keeps a frame from showing half of an
+    /// edit's light change. It is a time, not only a frame count: without a frame cap a frame
+    /// can last a fraction of a millisecond, less than one mesh job. The default, 16 ms
+    /// ([`WorldSettings::DEFAULT_EDIT_BATCH_HOLD`]), is 3 frames at 144 Hz (two are 13.9 ms) and
+    /// 2 at 60 Hz or less (the frame floor); a batch only waits that long when one of its jobs is
+    /// late.
+    pub edit_batch_hold: Duration,
 }
 
 impl Default for WorldSettings {
@@ -134,9 +141,14 @@ impl Default for WorldSettings {
             light: true,
             sky_walk_limit: DEFAULT_WALK_LIMIT,
             light_cache_radius: 8,
-            edit_batch_hold_frames: 2,
+            edit_batch_hold: Self::DEFAULT_EDIT_BATCH_HOLD,
         }
     }
+}
+
+impl WorldSettings {
+    /// Default [`WorldSettings::edit_batch_hold`]: 16 ms.
+    pub const DEFAULT_EDIT_BATCH_HOLD: Duration = Duration::from_millis(16);
 }
 
 /// Generator, registry and the derived material table (inserted by [`WorldPlugin`]).
@@ -491,7 +503,8 @@ fn run_jobs(
     settings: Res<WorldSettings>,
     mut writer: MessageWriter<ChunkMeshEvent>,
 ) {
-    jobs.begin_frame(&settings, Instant::now());
+    let now = jobs.clock_now();
+    jobs.begin_frame(&settings, now);
     if !jobs.has_job_work() {
         return;
     }

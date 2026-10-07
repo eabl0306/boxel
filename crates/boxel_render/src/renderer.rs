@@ -488,6 +488,12 @@ impl VoxelRenderer {
             sky_light,
             light_params,
             light_curve,
+            viewport: [
+                self.targets.size.x as f32,
+                self.targets.size.y as f32,
+                0.0,
+                0.0,
+            ],
         };
         queue.write_buffer(&self.view_buffer, 0, bytemuck::bytes_of(&uniform));
         let visible = self.path.prepare(queue, &self.chunks, view);

@@ -697,13 +697,13 @@ fn an_unloaded_platform_takes_its_shadow_with_it() {
 }
 
 /// A world of stone layers under air with a lamp-ready corner, its jobs held on demand.
-fn corner_world(hold: u32) -> (App, Arc<SwitchExecutor>, [BlockState; 2]) {
+fn corner_world(hold: Duration) -> (App, Arc<SwitchExecutor>, [BlockState; 2]) {
     let (registry, lamps) = lamp_registry();
     let executor = Arc::new(SwitchExecutor::default());
     let generator = LayerGen::new(-3..=1);
     let settings = WorldSettings {
         vertical_bounds: Some(generator.vertical.clone()),
-        edit_batch_hold_frames: hold,
+        edit_batch_hold: hold,
         ..small()
     };
     let mut app = lit_app(generator, registry, settings, executor.clone());
@@ -712,17 +712,48 @@ fn corner_world(hold: u32) -> (App, Arc<SwitchExecutor>, [BlockState; 2]) {
     (app, executor, lamps)
 }
 
+/// From now on the world's frames see the time `at` (a manual clock) instead of the real one.
+fn set_clock(app: &mut App, at: Instant) {
+    app.world_mut().resource_mut::<WorldJobs>().manual_clock = Some(at);
+}
+
 /// A lamp on the stone at a chunk corner lights the top faces of 4 chunks.
 const CORNER: BlockPos = BlockPos::new(31, -1, 31);
 
 /// The meshes of one edit go out in the same frame, even when their jobs finish in different
-/// frames. A result held in frame `N` waits for the rest through frame `N + hold` and goes out
-/// then at the latest, the rest on its own (the batch is split).
+/// frames. Results held in frame `N` of time `t` wait for the rest until the first frame that is
+/// both at `t + hold` or later and 2 frames after `N`, and go out then at the latest, the rest on
+/// their own (the batch is split). The hold is a time, so very short frames (no frame cap) do
+/// not split a batch whose jobs take a few of them, and the 2 frames are a floor, so long frames
+/// (60 Hz and less) still give a late job two more job steps.
 #[test]
 fn an_edit_batch_is_published_in_one_frame() {
-    // (hold, wait, split): 2 results arrive in the first frame, the other 2 `wait` frames later.
-    for (hold, wait, split) in [(2, 2, false), (1, 1, false), (2, 3, true), (1, 2, true)] {
+    let ms = Duration::from_millis;
+    // (hold, frame interval, wait, split): 2 results arrive in the first frame, the other 2
+    // `wait` frames later. `split`: the frame (from the first) that publishes the first 2.
+    let cases = [
+        // About 100 fps: the rest within the hold, then late (held 20 ms >= 16 at frame 2).
+        (ms(16), ms(10), 2, None),
+        (ms(16), ms(10), 3, Some(2)),
+        // 144 Hz: two frames are 13.9 ms, so the third publishes (20.8 ms).
+        (ms(16), Duration::from_micros(6944), 3, None),
+        (ms(16), Duration::from_micros(6944), 4, Some(3)),
+        // 1000 fps: 10 frames are still within 16 ms (2 frames were 2 ms).
+        (ms(16), ms(1), 10, None),
+        (ms(16), ms(1), 20, Some(16)),
+        // 60 Hz and 30 Hz: the hold runs out in one frame, the floor waits for a second one.
+        (ms(16), ms(17), 2, None),
+        (ms(16), ms(17), 3, Some(2)),
+        (ms(16), ms(33), 2, None),
+        (ms(16), ms(33), 3, Some(2)),
+        // A frame longer than a short hold: the floor too.
+        (ms(5), ms(33), 2, None),
+        (ms(5), ms(33), 3, Some(2)),
+    ];
+    for (hold, interval, wait, split) in cases {
         let (mut app, executor, lamps) = corner_world(hold);
+        let mut now = Instant::now();
+        set_clock(&mut app, now);
         executor.hold.store(true, Ordering::Relaxed);
         edit(&mut app, &[(CORNER, lamps[0])]);
         app.update();
@@ -733,34 +764,62 @@ fn an_edit_batch_is_published_in_one_frame() {
         executor.run(2);
         let mut frames = Vec::new();
         for _ in 0..wait {
+            now += interval;
+            set_clock(&mut app, now);
             app.update();
             frames.push(drain_events(&mut app).len());
         }
         executor.run(usize::MAX);
+        now += interval;
+        set_clock(&mut app, now);
         app.update();
         frames.push(drain_events(&mut app).len());
         let mut want = vec![0; wait + 1];
-        if split {
-            want[hold as usize] = 2;
-            want[wait] = 2;
-        } else {
-            want[wait] = 4;
+        match split {
+            Some(first) => {
+                want[first] = 2;
+                want[wait] = 2;
+            }
+            None => want[wait] = 4,
         }
-        assert_eq!(frames, want, "hold {hold}, the rest after {wait} frame(s)");
+        let what = format!("hold {hold:?}, frames {interval:?} apart, the rest after {wait}");
+        assert_eq!(frames, want, "{what}");
         let s = stats(&app);
-        assert_eq!(s.edit_batches_held, 1);
-        assert_eq!(s.edit_batches_split, usize::from(split));
+        assert_eq!(s.edit_batches_held, 1, "{what}");
+        assert_eq!(s.edit_batches_split, usize::from(split.is_some()), "{what}");
         executor.hold.store(false, Ordering::Relaxed);
         settle(&mut app);
         assert_matches_reference(&app);
     }
 }
 
+/// With no hold, nothing waits: each mesh of a batch goes out in the frame it arrives.
+#[test]
+fn a_zero_hold_publishes_each_mesh_when_it_arrives() {
+    let (mut app, executor, lamps) = corner_world(Duration::ZERO);
+    executor.hold.store(true, Ordering::Relaxed);
+    edit(&mut app, &[(CORNER, lamps[0])]);
+    app.update();
+    executor.run(2);
+    app.update();
+    assert_eq!(drain_events(&mut app).len(), 2);
+    executor.run(usize::MAX);
+    app.update();
+    assert_eq!(drain_events(&mut app).len(), 2);
+    let s = stats(&app);
+    assert_eq!((s.edit_batches_held, s.edit_batches_split), (0, 0));
+    executor.hold.store(false, Ordering::Relaxed);
+    settle(&mut app);
+    assert_matches_reference(&app);
+}
+
 /// A second edit reaches chunks whose results of the first edit are held: those results are
 /// stale, so they are dropped and the chunks remeshed at once. Both edits go out in one frame.
 #[test]
 fn a_second_edit_of_a_held_chunk_keeps_the_batch_whole() {
-    let (mut app, executor, lamps) = corner_world(2);
+    let (mut app, executor, lamps) = corner_world(WorldSettings::DEFAULT_EDIT_BATCH_HOLD);
+    // The clock stands still: the hold never runs out.
+    set_clock(&mut app, Instant::now());
     executor.hold.store(true, Ordering::Relaxed);
     edit(&mut app, &[(CORNER, lamps[0])]);
     app.update();

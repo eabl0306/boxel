@@ -1,7 +1,7 @@
 //! `#[repr(C)]` mirrors of the WGSL structs (bytemuck `Pod`). Layouts are frozen and tested.
 use bytemuck::{Pod, Zeroable};
 
-/// Uniform `View` (336 bytes, std140-compatible: only vec4/mat4 members).
+/// Uniform `View` (352 bytes, std140-compatible: only vec4/mat4 members).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct ViewUniform {
@@ -29,6 +29,9 @@ pub struct ViewUniform {
     /// Brightness of light levels `0..=15`: level `4k + j` at `[k][j]`, level 15 = 1. The
     /// shader interpolates it linearly between levels.
     pub light_curve: [[f32; 4]; 4],
+    /// xy = render target size in pixels (the voxel shaders grow each quad by a fixed fraction
+    /// of a pixel to close cracks at T-junctions), zw = 0.
+    pub viewport: [f32; 4],
 }
 
 /// Storage `ChunkGpu` (64 bytes) in the chunk table, one per render chunk slot.

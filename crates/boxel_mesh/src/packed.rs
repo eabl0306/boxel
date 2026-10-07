@@ -6,7 +6,8 @@ use std::ops::Range;
 
 /// Bit layout of [`PackedQuad`] v2 (frozen; mirrored by constants in `common.wgsl`).
 ///
-/// `geo`: `x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | flags:4`
+/// `geo`: `x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | flags:4` (flag bits:
+/// [`FLAG_EMISSIVE`](crate::layout::FLAG_EMISSIVE), the other 3 unused)
 /// `mat`: `layer:12 | ao:8 (2 bits per corner, 3 = open) | light:12 (palette index)`
 pub mod layout {
     /// Mask of one 5-bit position/extent field.
@@ -21,8 +22,12 @@ pub mod layout {
     pub const GEO_H_SHIFT: u32 = 20;
     /// Shift of face.
     pub const GEO_FACE_SHIFT: u32 = 25;
-    /// Shift of the 4 flag bits (0 for now).
+    /// Shift of the 4 flag bits.
     pub const GEO_FLAGS_SHIFT: u32 = 28;
+    /// Flag bit (of the 4 at [`GEO_FLAGS_SHIFT`]): the quad's block emits light, so the shader
+    /// draws it at the full brightness of its texture (no light, face shading or AO), the way
+    /// Minecraft draws glowing blocks. Set by the mesher from `MaterialTable::emissive`.
+    pub const FLAG_EMISSIVE: u32 = 1;
     /// Mask of the texture layer.
     pub const MAT_LAYER_MASK: u32 = 0xFFF;
     /// Shift of the 4x2-bit AO field.
@@ -80,7 +85,7 @@ pub struct PackedQuad {
 }
 
 impl PackedQuad {
-    /// New quad with AO fully open (`0xFF`), light palette index 0 and flags 0.
+    /// New quad with AO fully open (`0xFF`), light palette index 0 and no flags.
     /// Debug-asserts `pos < 32`, `1 <= w, h <= 32`, `layer < 4096`.
     pub const fn new(pos: [u32; 3], w: u32, h: u32, face: Face, layer: u16) -> Self {
         debug_assert!(pos[0] < 32 && pos[1] < 32 && pos[2] < 32);
@@ -114,7 +119,8 @@ impl PackedQuad {
             | ((index as u32 & MAT_LIGHT_MASK) << MAT_LIGHT_SHIFT);
         self
     }
-    /// Replaces the 4 flag bits (`0..16`, debug-asserted). No flag is defined yet.
+    /// Replaces the 4 flag bits (`0..16`, debug-asserted; [`layout::FLAG_EMISSIVE`] is the only
+    /// one defined).
     pub const fn with_flags(mut self, flags: u8) -> Self {
         use layout::*;
         debug_assert!(flags < 16);
@@ -148,6 +154,10 @@ impl PackedQuad {
     /// The 4 flag bits.
     pub const fn flags(self) -> u8 {
         ((self.geo >> layout::GEO_FLAGS_SHIFT) & 15) as u8
+    }
+    /// True if the [`layout::FLAG_EMISSIVE`] flag is set.
+    pub const fn is_emissive(self) -> bool {
+        self.flags() as u32 & layout::FLAG_EMISSIVE != 0
     }
     /// Texture layer.
     pub const fn layer(self) -> u16 {

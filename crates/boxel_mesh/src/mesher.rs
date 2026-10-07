@@ -45,13 +45,15 @@ impl MeshOptions {
     }
 }
 
-/// Mesher-side view of the registry: per material id, bgm class, render shape (bucket routing)
-/// and the texture layer of each face. Built once per registry and shared (`Arc`) by mesh jobs.
+/// Mesher-side view of the registry: per material id, bgm class, render shape (bucket routing),
+/// the texture layer of each face and whether it emits light. Built once per registry and shared
+/// (`Arc`) by mesh jobs.
 #[derive(Clone, Debug, Default)]
 pub struct MaterialTable {
     class: Vec<VoxelClass>,
     shape: Vec<RenderShape>,
     layers: Vec<[u16; 6]>,
+    emissive: Vec<bool>,
 }
 
 impl MaterialTable {
@@ -61,6 +63,7 @@ impl MaterialTable {
         let mut class = vec![VoxelClass::Empty; n];
         let mut shape = vec![RenderShape::None; n];
         let mut layers = vec![[0u16; 6]; n];
+        let mut emissive = vec![false; n];
         for i in 0..n {
             let s = BlockState(i as u16);
             let m = registry.material(s) as usize;
@@ -74,11 +77,13 @@ impl MaterialTable {
                 RenderShape::Cutout | RenderShape::Translucent => VoxelClass::Transparent,
             };
             layers[m] = Face::ALL.map(|f| registry.face_texture(s, f).0);
+            emissive[m] = !registry.emission(s).is_dark();
         }
         Self {
             class,
             shape,
             layers,
+            emissive,
         }
     }
     /// Class of a material (out of range -> `Empty`).
@@ -110,8 +115,25 @@ impl MaterialTable {
             .get(material as usize)
             .map_or(0, |l| l[face.index()])
     }
+    /// True if the material's block emits light: its quads get [`layout::FLAG_EMISSIVE`] (out of
+    /// range -> `false`).
+    pub fn emissive(&self, material: u16) -> bool {
+        self.emissive
+            .get(material as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+    /// Marks `material` as emissive or not (tables built with [`MaterialTable::from_parts`]).
+    pub fn set_emissive(&mut self, material: u16, emissive: bool) {
+        let i = material as usize;
+        if self.emissive.len() <= i {
+            self.emissive.resize(i + 1, false);
+        }
+        self.emissive[i] = emissive;
+    }
     /// Test helper: explicit table (`shape[i]` and `layers[i]` for material `i`; the bgm
-    /// class is derived from the shape exactly as in [`MaterialTable::from_registry`]).
+    /// class is derived from the shape exactly as in [`MaterialTable::from_registry`]; no
+    /// material is emissive until [`MaterialTable::set_emissive`]).
     pub fn from_parts(shape: Vec<RenderShape>, layers: Vec<[u16; 6]>) -> Self {
         assert!(shape.len() == layers.len());
         let class = shape
@@ -124,6 +146,7 @@ impl MaterialTable {
             .collect();
         Self {
             class,
+            emissive: vec![false; shape.len()],
             shape,
             layers,
         }
@@ -209,7 +232,8 @@ impl Mesher {
     /// Face culling and greedy merging are binary greedy meshing (an in-repo fork, `greedy.rs`).
     /// Two unit faces merge only if they have the same material, the same AO byte and the same 4
     /// corner lights ([`reference_face_shading`] defines both, per `options.ao`). Each quad gets
-    /// `MaterialTable::layer` of its material and face and is routed to `MaterialTable::bucket`.
+    /// `MaterialTable::layer` of its material and face (and [`layout::FLAG_EMISSIVE`] if
+    /// `MaterialTable::emissive`) and is routed to `MaterialTable::bucket`.
     /// Corner lights go to the palette in first-seen order; past 4096 distinct entries the chunk
     /// is meshed again at the next [`LightQuantization`] level.
     pub fn mesh(
@@ -680,7 +704,10 @@ fn assemble(
         for &quad in quads {
             let key = decode((quad >> 32) as u32);
             let bucket = materials.bucket(key.material, face);
-            let packed = to_packed(quad, face, materials.layer(key.material, face), key);
+            let mut packed = to_packed(quad, face, materials.layer(key.material, face), key);
+            if materials.emissive(key.material) {
+                packed.geo |= layout::FLAG_EMISSIVE << layout::GEO_FLAGS_SHIFT;
+            }
             if cfg!(debug_assertions) {
                 debug_check_merged(packed, out.corner_light(packed));
             }

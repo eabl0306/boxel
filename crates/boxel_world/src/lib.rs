@@ -26,7 +26,7 @@
 //! 4. `Collect`: publish mesh results as [`ChunkMeshEvent`]s, up to
 //!    [`WorldSettings::max_mesh_events_per_frame`]. A mesh identical to the published one is not
 //!    sent again, and the meshes of one edit batch are published together (held up to
-//!    [`WorldSettings::edit_batch_hold_frames`]). Then the frame's [`ChunkDataEvent`]s.
+//!    [`WorldSettings::edit_batch_hold`]). Then the frame's [`ChunkDataEvent`]s.
 //!
 //! Systems that keep state derived from the blocks (physics, gameplay) follow the world through
 //! two messages: [`BlockChanged`] for each edited block (written in `Edits`, from the same

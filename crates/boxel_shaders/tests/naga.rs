@@ -270,6 +270,7 @@ fn wgsl_bit_layout_matches_boxel_mesh() {
         ("GEO_H_SHIFT", l::GEO_H_SHIFT),
         ("GEO_FACE_SHIFT", l::GEO_FACE_SHIFT),
         ("GEO_FLAGS_SHIFT", l::GEO_FLAGS_SHIFT),
+        ("FLAG_EMISSIVE", l::FLAG_EMISSIVE),
         ("MAT_LAYER_MASK", l::MAT_LAYER_MASK),
         ("MAT_AO_SHIFT", l::MAT_AO_SHIFT),
         ("MAT_LIGHT_SHIFT", l::MAT_LIGHT_SHIFT),
@@ -325,7 +326,7 @@ fn gpu_struct_layouts_match_the_rust_mirrors() {
     let (pull, _) = load(ShaderModuleId::VoxelPull);
     let (size, offsets) = struct_layout(&pull, "View");
     assert_eq!(size as usize, size_of::<ViewUniform>());
-    assert_eq!(size, 336);
+    assert_eq!(size, 352);
     let rust = [
         offset_of!(ViewUniform, view_proj),
         offset_of!(ViewUniform, frustum),
@@ -337,9 +338,10 @@ fn gpu_struct_layouts_match_the_rust_mirrors() {
         offset_of!(ViewUniform, sky_light),
         offset_of!(ViewUniform, light_params),
         offset_of!(ViewUniform, light_curve),
+        offset_of!(ViewUniform, viewport),
     ];
     assert_eq!(offsets, rust.map(|o| o as u32));
-    assert_eq!(offsets[7..], [240, 256, 272]);
+    assert_eq!(offsets[7..], [240, 256, 272, 336]);
     let (size, offsets) = struct_layout(&pull, "ChunkGpu");
     assert_eq!((size, size_of::<ChunkGpu>()), (64, 64));
     assert_eq!(offsets[..6], [0, 12, 16, 48, 52, 56]);
