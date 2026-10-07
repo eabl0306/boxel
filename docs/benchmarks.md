@@ -125,7 +125,8 @@ just bench-report --compare carpeta-antes/ carpeta-despues/
 `--compare` muestra cada número, el cambio en % y si mejoró o empeoró. Si antes era 0 no hay %,
 pero igual dice si empeoró (por ejemplo, tirones nuevos). Si las corridas tienen otra
 configuración (radio, GPU, velocidad), lo avisa. Con dos carpetas empareja las corridas del mismo
-escenario, radio, velocidad, límite de fps, backend, tier y GPU.
+mundo, escenario, radio, radio vertical, velocidad, límite de fps, cuerpos (`--bodies`),
+ediciones (`--edits`), backend, tier y GPU. Una hora distinta (`--time`) solo se anota.
 
 Flujo sugerido: `just bench-all` antes del cambio, mover `bench-results/` a otra carpeta,
 aplicar el cambio, `just bench-all` otra vez y comparar las dos carpetas.

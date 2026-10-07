@@ -195,9 +195,15 @@ pub enum ChunkMeshEvent {
 ///
 /// Written from the per-voxel change list the edits keep for the light (ADR 0015): the same
 /// pass sizes each edit's light remesh and moves the sky tops, so every message has its relight
-/// already queued in the frame's edit batch. When the message is read the map holds `new` at
-/// `pos`, but the light around it ([`ChunkMap::light_at`]) and the meshes may still be the old
-/// ones: they change when the batch's remeshes land (usually a few frames later).
+/// already queued in the frame's edit batch. In the frame it is written (after
+/// `WorldSystems::Edits`) the map holds `new` at `pos`, but the light around it
+/// ([`ChunkMap::light_at`]) and the meshes may still be the old ones: they change when the
+/// batch's remeshes land (usually a few frames later).
+///
+/// A reader in a fixed schedule (`FixedUpdate`, `FixedPostUpdate`) gets every message, but
+/// maybe frames later: frames without a fixed step keep them, and their `Update` may edit `pos`
+/// again (a second message) or unload its chunk first. Such a reader reads the map for the
+/// current block instead of trusting `new` (physics only uses `pos`).
 ///
 /// Shared by the systems that keep something derived from the blocks: physics wakes the
 /// sleeping bodies near the block (ADR 0016); the world's light needs no message (it relights

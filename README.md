@@ -75,7 +75,8 @@ sobre un objeto, el jugador lo levanta. F dispara una flecha a 60 bloques/s que 
 bloque que toca y empuja al mob que alcanza, B tira una pelota que rebota hasta quedarse quieta y
 M pone cuatro mobs adelante que caminan solos. Los cuerpos quietos se duermen y casi no cuestan.
 F3 muestra el estado del jugador, la línea de física, los objetos, las cajas, las flechas, las
-pelotas y los mobs (los cuerpos todavía no se dibujan).
+pelotas y los mobs (los cuerpos todavía no se dibujan). La hora queda quieta en `--time HH:MM`
+(12:00 por defecto): el sandbox no tiene teclas de reloj, porque F dispara.
 
 ```bash
 cargo run --release --example physics_sandbox

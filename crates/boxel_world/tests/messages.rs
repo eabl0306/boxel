@@ -1,7 +1,7 @@
 //! The world's messages for systems that keep state derived from the blocks (physics, lighting):
 //! `BlockChanged` for each edited block and `ChunkDataEvent` when a chunk's blocks become
 //! readable or stop being readable.
-use boxel_app::{App, Update};
+use boxel_app::{App, First, FixedPostUpdate, FixedTime, Time, TimePlugin, TimeSystems, Update};
 use boxel_ecs::prelude::*;
 use boxel_math::DVec3;
 use boxel_transform::Transform;
@@ -243,4 +243,149 @@ fn chunk_messages_follow_what_can_be_read() {
             DataState::Ready(_) | DataState::Missing
         ));
     }
+}
+
+/// A synthetic clock: each update advances `Time` by `Clock::next`.
+#[derive(Resource)]
+struct Clock {
+    time: Time,
+    now: Instant,
+    next: Duration,
+}
+
+fn synthetic_time(mut clock: ResMut<Clock>, mut time: ResMut<Time>) {
+    let now = clock.now + clock.next;
+    clock.now = now;
+    clock.time.update_with_instant(now);
+    *time = clock.time.clone();
+}
+
+/// Each `BlockChanged` read in `FixedPostUpdate` (where physics reads them), with the block the
+/// map held at `pos` when it was read.
+#[derive(Resource, Default)]
+struct FixedLog(Vec<(BlockChanged, Option<BlockState>)>);
+
+fn fixed_log(
+    mut blocks: MessageReader<BlockChanged>,
+    map: Res<ChunkMap>,
+    mut log: ResMut<FixedLog>,
+) {
+    for change in blocks.read() {
+        log.0.push((*change, map.block_at(change.pos)));
+    }
+}
+
+/// One update; with `step`, exactly one fixed step runs in it (the accumulator ends empty),
+/// without it none does.
+fn frame(app: &mut App, step: bool) {
+    let fixed = app.world().resource::<FixedTime>();
+    let next = if step {
+        fixed.timestep() - fixed.accumulator()
+    } else {
+        Duration::from_micros(100)
+    };
+    app.world_mut().resource_mut::<Clock>().next = next;
+    app.update();
+    let steps = app.world().resource::<FixedTime>().steps_last_frame();
+    assert_eq!(steps, u32::from(step));
+}
+
+/// The world of [`app`] with the real time plugin (messages wait for a fixed step), a
+/// synthetic clock and [`fixed_log`], settled with one fixed step per update and then read
+/// out.
+fn fixed_app() -> App {
+    let mut app = App::new();
+    app.add_plugins((
+        TimePlugin,
+        WorldPlugin {
+            generator: Arc::new(FlatGenerator::new(vec![
+                ("boxel:stone".to_string(), 3),
+                ("boxel:grass".to_string(), 1),
+            ])),
+            registry: Arc::new(BlockRegistry::default_blocks()),
+            executor: Arc::new(InlineExecutor),
+            ..WorldPlugin::default()
+        },
+    ))
+    .insert_resource(Clock {
+        time: Time::new(Instant::now()),
+        now: Instant::now(),
+        next: Duration::ZERO,
+    })
+    .init_resource::<FixedLog>()
+    .add_systems(First, synthetic_time.after(TimeSystems))
+    .add_systems(FixedPostUpdate, fixed_log);
+    app.world_mut().spawn((
+        Transform::from_translation(DVec3::new(16.0, 4.0, 16.0)),
+        ChunkViewer::new(1).with_vertical_radius(1),
+    ));
+    // The first update has no delta.
+    app.update();
+    let start = Instant::now();
+    loop {
+        frame(&mut app, true);
+        let stats = *app.world().resource::<WorldStats>();
+        if stats.chunks > 0 && stats.is_settled() {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "not settled: {stats:?}"
+        );
+    }
+    frame(&mut app, true);
+    app.world_mut().resource_mut::<FixedLog>().0.clear();
+    app
+}
+
+/// What `BlockChanged` promises a reader in a fixed schedule: every message, in order, even
+/// when frames without a fixed step pass first, but not that the map still holds `new` when it
+/// reads one (the documented caveat: such a reader reads the map).
+#[test]
+fn fixed_readers_get_every_change_but_may_see_later_edits_first() {
+    let mut app = fixed_app();
+    let pos = BlockPos::new(1, 4, 1);
+    let grass = app
+        .world()
+        .resource::<ChunkMap>()
+        .block_at(BlockPos::new(1, 3, 1))
+        .expect("loaded");
+    // Two frames without a fixed step, one edit of the same block in each.
+    edit(&mut app, pos, STONE);
+    frame(&mut app, false);
+    assert_eq!(
+        app.world().resource::<ChunkMap>().block_at(pos),
+        Some(STONE)
+    );
+    edit(&mut app, pos, grass);
+    frame(&mut app, false);
+    assert!(app.world().resource::<FixedLog>().0.is_empty());
+    // The next fixed step reads both; for the first, the map already holds the second's block.
+    frame(&mut app, true);
+    assert_eq!(
+        app.world().resource::<FixedLog>().0,
+        [
+            (
+                BlockChanged {
+                    pos,
+                    old: BlockState::AIR,
+                    new: STONE,
+                },
+                Some(grass)
+            ),
+            (
+                BlockChanged {
+                    pos,
+                    old: STONE,
+                    new: grass,
+                },
+                Some(grass)
+            ),
+        ]
+    );
+    // Read once: the next steps get nothing.
+    app.world_mut().resource_mut::<FixedLog>().0.clear();
+    frame(&mut app, true);
+    frame(&mut app, true);
+    assert!(app.world().resource::<FixedLog>().0.is_empty());
 }

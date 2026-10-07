@@ -732,10 +732,12 @@ Sistemas en `Update`, encadenados (`WorldSystems`):
 `BlockChanged` y `ChunkDataEvent` son los mensajes que comparten los sistemas que guardan algo
 derivado de los bloques: la física despierta los cuerpos dormidos cerca de un bloque que cambió
 o de un chunk que se cargó (ADR 0016, P4). La luz del mundo no los necesita: la recalcula el
-lote de remallas que arma la misma pasada de ediciones. Cuando se lee un `BlockChanged` el mapa
-ya tiene el bloque nuevo, pero la luz guardada (`ChunkMap::light_at`) y las mallas pueden seguir
-siendo las de antes: cambian cuando llegan las remallas del lote (en general unos frames
-después).
+lote de remallas que arma la misma pasada de ediciones. En el frame en que se escribe un
+`BlockChanged` (después de `WorldSystems::Edits`) el mapa ya tiene el bloque nuevo, pero la luz
+guardada (`ChunkMap::light_at`) y las mallas pueden seguir siendo las de antes: cambian cuando
+llegan las remallas del lote (en general unos frames después). Un sistema en un schedule fijo
+(como la física) recibe todos los mensajes, pero quizá frames después, cuando otra edición ya
+cambió el bloque o su chunk se descargó: lee el mapa en vez de confiar en `new`.
 Un chunk que se descarga y se vuelve a cargar puede volver distinto (todavía no se guardan las
 ediciones), por eso quien guarda algo de un chunk lo refresca en `Loaded`.
 
@@ -1127,10 +1129,12 @@ schedule `Shutdown` es el lugar para el `flush` final.
   2 s. Su `fps=` cuenta updates de la App, no frames mostrados.
 - Overlay F3 (`boxel_debug`): frames mostrados por segundo (de `RenderInfo::frames_presented`) y
   updates por segundo por separado, tiempo de frame, límite, vsync y modo de presentación, GPU,
-  cámara y contadores de chunks. Teclas opcionales `FrameKeys` (F5 límite, F6 vsync). Las apps
-  suman líneas propias con `OverlayLines` (`voxel_world` muestra el bloque apuntado, la
-  selección, el modo, con el estado del jugador si camina, y la línea de física) y `Crosshair`
-  dibuja una mira en el centro.
+  cámara, la luz (cielo y RGB) en el vóxel del ojo y en `CrosshairTarget`, la hora de
+  `TimeOfDay` y contadores de chunks. `CrosshairTarget` lo llenan las apps que apuntan bloques
+  (`voxel_world` pone la celda frente a la cara apuntada); sin eso solo sale la luz del ojo.
+  Teclas opcionales `FrameKeys` (F5 límite, F6 vsync). Las apps suman líneas propias con
+  `OverlayLines` (`voxel_world` muestra el bloque apuntado, la selección, el modo, con el estado
+  del jugador si camina, y la línea de física) y `Crosshair` dibuja una mira en el centro.
 - Línea `physics` de `DiagnosticsBoard` (`PhysicsStats`): cuerpos, dinámicos despiertos,
   congelados, dormidos, pares del broadphase, empujes, solapes que avisan, impactos, proyectiles
   y sus impactos, y tiempos del último paso de física (el movimiento y lo de entre cuerpos).

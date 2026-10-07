@@ -496,8 +496,21 @@ enum FrameOp {
     Bounds(Option<(i64, i64)>),
     /// A new unload hysteresis.
     Hysteresis(u32),
+    /// Block edits in one call, to chunks in any state (checked by `Harness::edits`).
+    Edits(Vec<BlockEdit>),
     /// Nothing changes.
     Idle,
+}
+
+/// A block edit near a corner of four chunks (positions repeat; the stone and air layers meet
+/// there) or anywhere around the viewers (loaded, queued, generating or not loaded at all).
+fn block_edit() -> impl Strategy<Value = BlockEdit> {
+    let pos = prop_oneof![
+        (-1i64..=1, -1i64..=1, -1i64..=1).prop_map(|(x, y, z)| BlockPos::new(32 + x, y, z)),
+        (-100i64..100, -80i64..80, -100i64..100).prop_map(|(x, y, z)| BlockPos::new(x, y, z)),
+    ];
+    let state = prop_oneof![Just(BlockState::AIR), Just(STONE)];
+    (pos, state).prop_map(|(pos, state)| BlockEdit { pos, state })
 }
 
 fn frame_op() -> impl Strategy<Value = FrameOp> {
@@ -511,6 +524,7 @@ fn frame_op() -> impl Strategy<Value = FrameOp> {
         ]
         .prop_map(FrameOp::Bounds),
         1 => (0u32..=2).prop_map(FrameOp::Hysteresis),
+        2 => proptest::collection::vec(block_edit(), 1..6).prop_map(FrameOp::Edits),
         2 => Just(FrameOp::Idle),
     ]
 }
@@ -551,10 +565,11 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
     /// One change per frame (viewer moves, jumps, radii, viewers coming and going, vertical
-    /// bounds, hysteresis), each planned on top of the interest work earlier changes left
-    /// pending: the budget is zero (64 positions per frame) and nothing waits for the backlog to
-    /// drain. Jobs run in some frames. The bookkeeping holds after every frame, and once the
-    /// backlog is drained at the end the world matches the from-scratch wanted set.
+    /// bounds, hysteresis, block edits), each planned on top of the interest work earlier
+    /// changes left pending: the budget is zero (64 positions per frame) and nothing waits for
+    /// the backlog to drain. Jobs run in some frames. The bookkeeping holds after every frame,
+    /// each edit call returns the `BlockChanged` a diff of the map gives, and once the backlog
+    /// is drained at the end the world matches the from-scratch wanted set.
     #[test]
     fn changes_on_top_of_pending_work_end_in_the_wanted_set(
         frames in proptest::collection::vec((frame_op(), any::<bool>()), 1..40),
@@ -569,6 +584,9 @@ proptest! {
                 FrameOp::Viewer(op) => apply(&mut viewers, op),
                 FrameOp::Bounds(b) => h.settings.vertical_bounds = b.map(|(lo, hi)| lo..=hi),
                 FrameOp::Hysteresis(n) => h.settings.unload_hysteresis = *n,
+                FrameOp::Edits(edits) => {
+                    h.edits(edits.clone());
+                }
                 FrameOp::Idle => {}
             }
             frame(&mut h, &hold, &viewer_list(&viewers), *run);

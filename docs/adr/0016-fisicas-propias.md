@@ -76,9 +76,10 @@ Dos datos del código pesan en el diseño:
 
 - **4. Cómo choca cada bloque.** `CollisionTable` se deriva del registro: `BlockDef::solid` da
   un cubo lleno, la marca `FLUID` del registro da "fluido" y una forma de render distinta de
-  `None` da "tiene contorno" (para apuntar). No se agrega un campo `collision` a `BlockDef`
-  todavía: el trabajo de luz de colores cambia `BlockDef` en paralelo, y el campo nuevo (para
-  losas y escaleras) entra en el mismo cambio, así el struct se rompe una sola vez.
+  `None` da "tiene contorno" (para apuntar). `BlockDef` no tiene un campo `collision`
+  todavía. El plan era sumarlo junto con la luz de colores, para romper el struct una sola vez,
+  pero la luz ya entró (`emission` y `light_opacity`, ADR 0015) sin él. El campo llega con P5
+  (losas y escaleras) y rompe `BlockDef` por su cuenta.
   `CollisionShape` es `non_exhaustive` (`Empty`, `Full`; las cajas vienen después).
 
 - **5. Chunks sin cargar: congelar.** Una fuente de vóxeles responde el bloque o
@@ -292,9 +293,11 @@ Dos datos del código pesan en el diseño:
     de cambios por vóxel que la luz lleva para medir el alcance de cada edición (antes de unir
     las ramas eran una lista propia de la física): por posición, el estado antes de su primera
     edición y después de la última, en el orden de la primera edición, sin las que quedan como
-    estaban. Cuando se lee el mensaje, el mapa ya tiene el bloque nuevo, pero la luz guardada
-    (`ChunkMap::light_at`) y las mallas pueden ser las de antes hasta que llegan las remallas
-    del lote.
+    estaban. En el frame en que se escribe, el mapa ya tiene el bloque nuevo, pero la luz
+    guardada (`ChunkMap::light_at`) y las mallas pueden ser las de antes hasta que llegan las
+    remallas del lote. La física lo lee en `FixedPostUpdate`: recibe todos los mensajes, pero
+    los de frames sin paso fijo llegan después del `Update` siguiente, que pudo volver a
+    editar el bloque o descargar su chunk. Por eso solo usa `pos` y lee el mapa.
   - **Dormir.** Un cuerpo dinámico se duerme (`Sleeping`) después de `sleep_steps` (32) pasos
     seguidos apoyado (en bloques o sobre otro cuerpo), más lento que `sleep_speed` (0.05
     bloques/s) en cada eje y sin moverse más que eso en el paso, con empujes incluidos. Un
@@ -712,4 +715,5 @@ grilla incremental), y todo P5. Los cuerpos no tienen dibujo: hace falta un rend
 - Solo `Transform` en `f64` absoluto: los contactos se degradan desde unos `2^29` bloques.
 - Tratar lo no cargado como sólido (pisos y techos invisibles, saltos cuando llega el terreno
   real) o como aire (los cuerpos caen al vacío).
-- Agregar `BlockDef::collision` ahora: rompería `BlockDef` dos veces junto con el cambio de luz.
+- Agregar `BlockDef::collision` en P1, sin formas que lo usen: se esperaba a la luz de colores
+  para romper `BlockDef` una vez, pero la luz entró antes. Ahora llega con las formas de P5.

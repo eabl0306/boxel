@@ -17,6 +17,10 @@
 //! impacts, projectiles, step time), the items, the crates and the arrows, balls and mobs.
 //! Bodies have no renderer yet: they show on F3 only.
 //!
+//! The day and night clock (`DaylightPlugin`, in `DefaultPlugins`) stays still at `--time`
+//! (default noon): the sandbox has no clock keys (F shoots), so a long session never gets dark.
+//! `voxel_world` has the keys.
+//!
 //! `--drop-test` drops 100 items from 40 blocks above the ground once the player stands, and
 //! exits 0 when all of them rest on something, or 3 if any still moves after 20 s of simulated
 //! time. `--frames N` exits after N rendered frames.
@@ -24,6 +28,8 @@
 //! Exit codes: 0 success, 1 usage error, 2 no usable GPU, 3 drop test failed, 4 timeout.
 #![expect(clippy::print_stdout, clippy::print_stderr, reason = "CLI output")]
 
+#[path = "shared/clock.rs"]
+mod clock;
 #[path = "shared/player.rs"]
 mod player;
 #[path = "shared/world.rs"]
@@ -50,6 +56,8 @@ usage: physics_sandbox [GPU options] [options]
   --fly                   start flying instead of walking (G switches)
   --seed N                terrain seed
   --view-distance N       mesh radius in chunks (default 8)
+  --time HH[:MM]          clock time of the world, kept still (06:00 sunrise, 12:00 noon,
+                          18:00 sunset, 00:00 midnight); default 12:00
   --debug-overlay         start with the F3 debug overlay visible (F3 toggles it)
   --help                  this text
 keys: WASD walk, Space jump, G fly/walk, Q drop an item, C drop a crate, F shoot an arrow,
@@ -114,6 +122,8 @@ struct Options {
     view_distance: u32,
     world: WorldChoice,
     debug_overlay: bool,
+    /// `--time`, clock hours.
+    time: f64,
 }
 
 impl Options {
@@ -121,6 +131,11 @@ impl Options {
     /// defaults to [`DEFAULT_TIMEOUT`].
     fn automation(&self) -> bool {
         self.frames.is_some() || self.drop_test
+    }
+
+    /// The world clock: at `--time` and paused (no clock keys here; F shoots arrows).
+    fn clock(&self) -> TimeOfDay {
+        clock::start_time(self.time, true)
     }
 }
 
@@ -141,6 +156,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         view_distance: DEFAULT_RADIUS,
         world: WorldChoice::default(),
         debug_overlay: false,
+        time: 12.0,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -172,6 +188,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                     .ok_or_else(|| format!("{flag}: {radius} is not in 1..=64"))?;
             }
             "--debug-overlay" => o.debug_overlay = true,
+            "--time" => o.time = clock::parse_clock(flag, &value()?)?,
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
@@ -851,8 +868,11 @@ fn main() -> AppExit {
     let sandbox = SandboxPlugin {
         drop_test: options.drop_test,
     };
+    let time = options.clock();
     let mut app = App::new();
     app.add_plugins(plugins)
+        // After `DaylightPlugin` (in `DefaultPlugins`), so it replaces the running default.
+        .insert_resource(time)
         .add_plugins((
             LogDiagnosticsPlugin::default(),
             FlyCameraPlugin,
@@ -890,6 +910,16 @@ mod tests {
         let o = parse(&[]).expect("valid").expect("not --help");
         assert!(!o.automation() && !o.fly && o.timeout.is_none());
         assert_eq!(o.world.label(), "forest");
+        // The clock stays still, at noon unless `--time` says otherwise.
+        let noon = o.clock();
+        assert!(noon.paused);
+        assert_eq!(noon.clock_text(), "12:00");
+        let night = parse(&["--time", "21:30"])
+            .expect("valid")
+            .expect("not --help")
+            .clock();
+        assert!(night.paused);
+        assert_eq!(night.clock_text(), "21:30");
         let o = parse(&["--drop-test", "--world", "flat"])
             .expect("valid")
             .expect("not --help");
@@ -908,6 +938,7 @@ mod tests {
             &["--view-distance", "0"],
             &["--bodies", "3"],
             &["--caves", "off"],
+            &["--time", "24:00"],
         ] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }

@@ -1,10 +1,12 @@
 //! The engine's systems are not ambiguous with each other.
 //!
-//! An app with the headless engine plugins, the fly camera, the world (inline jobs) and physics
-//! (with the `physics` feature) runs with `ambiguity_detection: LogLevel::Error` on `First`, `PreUpdate`, `RunFixedMainLoop`,
-//! `FixedPostUpdate`, `Update`, `PostUpdate` and `Last`: building those schedules on the first
-//! `app.update()` panics on any pair of systems with conflicting access and no order between
-//! them. The first update runs one fixed step, so the fixed schedules are built too.
+//! An app with the headless engine plugins, the fly camera, the world (inline jobs) with its day
+//! and night clock, and physics (with the `physics` feature) runs with
+//! `ambiguity_detection: LogLevel::Error` on `First`, `PreUpdate`, `RunFixedMainLoop`,
+//! `FixedUpdate`, `FixedPostUpdate`, `Update`, `PostUpdate` and `Last`: building those schedules
+//! on the first `app.update()` panics on any pair of systems with conflicting access and no
+//! order between them. The first update runs one fixed step, so the fixed schedules are built
+//! too.
 //!
 //! `RunFixedMainLoop` holds the exclusive `run_fixed_main_loop`; systems added there belong in
 //! `RunFixedMainLoopSystems::BeforeFixedMainLoop` or `AfterFixedMainLoop`, which are ordered
@@ -26,8 +28,8 @@
 #![cfg(all(feature = "window", feature = "voxel"))]
 
 use boxel::app::{
-    App, First, FixedPostUpdate, FixedTime, Last, PostUpdate, PreUpdate, RunFixedMainLoop,
-    RunFixedMainLoopSystems, TaskPoolPlugin, TimePlugin, Update,
+    App, First, FixedPostUpdate, FixedTime, FixedUpdate, Last, PostUpdate, PreUpdate,
+    RunFixedMainLoop, RunFixedMainLoopSystems, TaskPoolPlugin, TimePlugin, Update,
 };
 use boxel::camera::{FlyCamera, FlyCameraPlugin, FlyCameraSystems};
 use boxel::diagnostic::FrameStatsPlugin;
@@ -38,7 +40,10 @@ use boxel::transform::Transform;
 use boxel::voxel::{BlockPos, ChunkPos};
 use boxel::window::{ButtonInput, InputPlugin, KeyCode};
 use boxel::world::jobs::InlineExecutor;
-use boxel::world::{ChunkMap, ChunkViewer, Interest, WorldPlugin, WorldStats, WorldSystems};
+use boxel::world::{
+    ChunkMap, ChunkViewer, DaylightPlugin, Interest, TimeOfDay, WorldPlugin, WorldStats,
+    WorldSystems,
+};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
@@ -65,12 +70,14 @@ fn strict_app() -> App {
             executor: Arc::new(InlineExecutor),
             ..WorldPlugin::default()
         },
+        DaylightPlugin,
     ));
     #[cfg(feature = "physics")]
     app.add_plugins(boxel::physics::PhysicsPlugin::default());
     app.edit_schedule(First, strict)
         .edit_schedule(PreUpdate, strict)
         .edit_schedule(RunFixedMainLoop, strict)
+        .edit_schedule(FixedUpdate, strict)
         .edit_schedule(FixedPostUpdate, strict)
         .edit_schedule(Update, strict)
         .edit_schedule(PostUpdate, strict)
@@ -99,12 +106,15 @@ fn spawn_camera_viewer(app: &mut App) -> Entity {
 fn engine_systems_are_not_ambiguous() {
     let mut app = strict_app();
     spawn_camera_viewer(&mut app);
+    let noon = *app.world().resource::<TimeOfDay>();
     for _ in 0..3 {
         app.update();
     }
-    // The systems did run: the world streamed chunks around the viewer.
+    // The systems did run: the world streamed chunks around the viewer, and the clock moved
+    // (the first update runs a fixed step).
     assert!(!app.world().resource::<ChunkMap>().is_empty());
     assert!(app.world().resource::<WorldStats>().chunks > 0);
+    assert!(app.world().resource::<TimeOfDay>().tick > noon.tick);
 }
 
 #[test]
@@ -146,7 +156,7 @@ fn camera_before_interest_is_a_valid_order() {
     );
 }
 
-/// Control: detection is really on in each of the seven schedules (an unordered pair of writers
+/// Control: detection is really on in each of the eight schedules (an unordered pair of writers
 /// of one resource fails the build).
 #[test]
 fn ambiguity_detection_is_active() {
@@ -159,7 +169,7 @@ fn ambiguity_detection_is_active() {
         counter.0 += 2;
     }
 
-    let cases: [(&str, fn(&mut App)); 7] = [
+    let cases: [(&str, fn(&mut App)); 8] = [
         ("First", |app| {
             app.add_systems(First, (bump_a, bump_b));
         }),
@@ -168,6 +178,9 @@ fn ambiguity_detection_is_active() {
         }),
         ("RunFixedMainLoop", |app| {
             app.add_systems(RunFixedMainLoop, (bump_a, bump_b));
+        }),
+        ("FixedUpdate", |app| {
+            app.add_systems(FixedUpdate, (bump_a, bump_b));
         }),
         ("FixedPostUpdate", |app| {
             app.add_systems(FixedPostUpdate, (bump_a, bump_b));
@@ -211,7 +224,7 @@ fn systems_around_the_fixed_loop_are_ordered() {
                     .in_set(RunFixedMainLoopSystems::AfterFixedMainLoop),
             ),
         )
-        .add_systems(boxel::app::FixedUpdate, |mut order: ResMut<Order>| {
+        .add_systems(FixedUpdate, |mut order: ResMut<Order>| {
             order.0.push("step");
         });
     app.update();

@@ -11,6 +11,7 @@ use crate::tests::support::{HoldExecutor, LayerGen, fake_mesh, panicking_mesh};
 use crate::{BlockEdit, WorldStats};
 use boxel_voxel::{BlockPos, CHUNK_VOLUME, ChunkKey, LightValue, neighbor_index};
 use boxel_worldgen::WorldGenerator;
+use std::collections::HashMap;
 
 const STONE: BlockState = BlockState(1);
 
@@ -115,8 +116,51 @@ impl Harness {
         self.collect();
     }
 
-    fn edit(&mut self, pos: BlockPos, state: BlockState) {
-        self.with(|jobs, cx, _| jobs.apply_edits(cx, vec![BlockEdit { pos, state }]));
+    /// One edit, checked as in [`Harness::edits`].
+    fn edit(&mut self, pos: BlockPos, state: BlockState) -> Vec<BlockChanged> {
+        self.edits(vec![BlockEdit { pos, state }])
+    }
+
+    /// Applies `edits` in one call and checks the `BlockChanged` it returns against a diff of
+    /// the map: per position edited, in the order of its first edit, the block before and after
+    /// the call, for the positions whose chunk was `Ready` and whose block changed. Those hold
+    /// their last edit; the others (no slot, `Queued`, `Generating`, `Missing`) are not touched.
+    fn edits(&mut self, edits: Vec<BlockEdit>) -> Vec<BlockChanged> {
+        let ready = |map: &ChunkMap, pos: BlockPos| {
+            let (chunk, local) = pos.split();
+            map.data_at(chunk).map(|data| data.get(local))
+        };
+        // Per position: the block before (if its chunk is `Ready`) and its last edit.
+        let mut order: Vec<(BlockPos, Option<BlockState>, BlockState)> = Vec::new();
+        let mut index: HashMap<BlockPos, usize> = HashMap::new();
+        for edit in &edits {
+            match index.get(&edit.pos) {
+                Some(&i) => order[i].2 = edit.state,
+                None => {
+                    index.insert(edit.pos, order.len());
+                    order.push((edit.pos, ready(&self.map, edit.pos), edit.state));
+                }
+            }
+        }
+        let changed = self.with(|jobs, cx, _| jobs.apply_edits(cx, edits));
+        let mut expected = Vec::new();
+        for (pos, before, last) in order {
+            let after = ready(&self.map, pos);
+            let Some(old) = before else {
+                assert_eq!(after, None, "{pos:?}: a dropped edit");
+                continue;
+            };
+            assert_eq!(after, Some(last), "{pos:?} holds its last edit");
+            if old != last {
+                expected.push(BlockChanged {
+                    pos,
+                    old,
+                    new: last,
+                });
+            }
+        }
+        assert_eq!(changed, expected);
+        changed
     }
 
     fn id(&self, pos: ChunkPos) -> ChunkId {
@@ -482,16 +526,19 @@ fn neighbor_edits_bump_epoch_and_remesh() {
 fn edits_to_chunks_that_are_not_ready_are_dropped() {
     let hold = Arc::new(HoldExecutor::default());
     let mut h = surface_world(hold.clone());
-    h.edit(BlockPos::new(1, -1, 1), BlockState::AIR);
-    assert_eq!(
-        h.map.block_at(BlockPos::new(1, -1, 1)),
-        None,
-        "not generated yet"
-    );
+    let pos = BlockPos::new(1, -1, 1);
+    let chunk = ChunkPos::new(0, -1, 0);
+    // The slot exists but its generation has not started: dropped, and no message.
+    assert!(matches!(h.slot(chunk).data(), DataState::Queued));
+    assert_eq!(h.edit(pos, BlockState::AIR), []);
+    assert_eq!(h.map.block_at(pos), None, "not generated yet");
+    // Generating: the same.
     h.dispatch();
+    assert!(matches!(h.slot(chunk).data(), DataState::Generating));
+    assert_eq!(h.edit(pos, BlockState::AIR), []);
     hold.run_all();
     h.collect();
-    assert_eq!(h.map.block_at(BlockPos::new(1, -1, 1)), Some(STONE));
+    assert_eq!(h.map.block_at(pos), Some(STONE));
     assert_eq!(
         h.map
             .data_at(ChunkPos::new(0, -1, 0))
@@ -731,7 +778,7 @@ fn remesh_to_empty_and_unload_remove_published_meshes() {
             }
         })
         .collect();
-    h.with(|jobs, cx, _| jobs.apply_edits(cx, edits));
+    h.edits(edits);
     h.settle(20);
     let events = h.take_events();
     assert!(
@@ -1011,7 +1058,7 @@ fn empty_mesh_is_redone_after_a_neighbor_reloads() {
             state: STONE,
         })
         .collect();
-    h.with(|jobs, cx, _| jobs.apply_edits(cx, fill));
+    h.edits(fill);
     h.settle(50);
     assert!(matches!(h.map.slots[a].mesh(), MeshState::Empty));
     assert_eq!(removed(&h.take_events()), vec![a]);

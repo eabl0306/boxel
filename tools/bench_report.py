@@ -7,8 +7,8 @@ usage:
 
 RUN, BASE and NEW are summary files (Markdown with a JSON block, or plain JSON) or directories
 (every summary inside, not recursive). Comparing two directories pairs the runs with the same
-world, scenario, radius, speed, fps limit, physics bodies (--bodies), scripted edits (--edits),
-backend, tier and adapter; a different clock time (--time) only gets a note, since day and night
+world, scenario, radius, vertical radius, speed, fps limit, physics bodies (--bodies), scripted
+edits (--edits), backend, tier and adapter; a different clock time (--time) only gets a note, since day and night
 change no mesh. A metric that was 0 in BASE has no percent change ('n/a') but still gets a
 verdict (0 spikes before, 3 after: worse). Runs with --edits also compare the edit latency.
 Output is Markdown, so it can go into docs as is.

@@ -1393,6 +1393,32 @@ fn place_demo_lamps(
     demo.start = None;
 }
 
+/// The clock keys and the `--lamps` demo: inserts the starting [`TimeOfDay`] (over the running
+/// default of `DaylightPlugin`, which must be added first) and the [`LampsDemo`], and adds
+/// [`time_keys`] and [`place_demo_lamps`] to `Update` (the lamps after [`pick_blocks`]: both
+/// write the edit queue, and before the world's systems, so they show the same frame).
+struct DayNightPlugin {
+    time: TimeOfDay,
+    /// `--lamps`: where the demo blocks go around.
+    lamps: Option<DVec3>,
+}
+
+impl Plugin for DayNightPlugin {
+    fn build(&self, app: &mut App) {
+        app.insert_resource(self.time)
+            .insert_resource(LampsDemo { start: self.lamps })
+            .add_systems(
+                Update,
+                (
+                    time_keys,
+                    place_demo_lamps
+                        .after(pick_blocks)
+                        .before(WorldSystems::Interest),
+                ),
+            );
+    }
+}
+
 /// Kills the process if `main` has not returned `limit` after start (the event loop stopped
 /// updating, so the in-app timeout cannot fire). Dropping the returned sender disarms it.
 fn spawn_watchdog(limit: Duration) -> Sender<()> {
@@ -1484,16 +1510,15 @@ fn main() -> AppExit {
 
     let fps_limit = options.fps_limit;
     let vsync = options.vsync;
-    let time = clock::start_time(options.start_hours(), options.automation());
-    let lamps = LampsDemo {
-        start: options
+    // The world clock (DaylightPlugin is in DefaultPlugins): scripted runs keep it still.
+    let day_night = DayNightPlugin {
+        time: clock::start_time(options.start_hours(), options.automation()),
+        lamps: options
             .lamps
             .then(|| DVec3::new(options.camera[0], options.camera[1], options.camera[2])),
     };
     let mut app = App::new();
-    app.add_plugins(plugins);
-    // The world clock (DaylightPlugin is in DefaultPlugins): scripted runs keep it still.
-    app.insert_resource(time).insert_resource(lamps);
+    app.add_plugins(plugins).add_plugins(day_night);
     // After the plugins, so these replace the engine defaults (144 fps, vsync off).
     if let Some(fps) = fps_limit {
         app.insert_resource(FrameLimit::new(fps));
@@ -1521,15 +1546,6 @@ fn main() -> AppExit {
         .init_resource::<FixedSteps>()
         .add_systems(Startup, spawn_camera)
         .add_systems(FixedUpdate, count_fixed_steps)
-        .add_systems(
-            Update,
-            (
-                time_keys,
-                place_demo_lamps
-                    .after(pick_blocks)
-                    .before(WorldSystems::Interest),
-            ),
-        )
         .add_systems(
             Update,
             (
@@ -1630,13 +1646,18 @@ mod tests {
         assert_eq!(interactive.timeout, None, "a plain run has no timeout");
     }
 
-    /// A headless app with the world (stone y 0..=2, grass at y = 3, inline jobs), physics,
-    /// the fly camera, picking and walking, settled; the cursor is free and a fly camera at
-    /// (0.5, 6, 0.5) looks straight down at the grass (top face at y = 4). `Update` is strict
-    /// about ambiguities, so picking must be ordered against the fly camera's grab (both use
-    /// `CursorOptions`), and walking against the camera's moves. Every update is one fixed step
-    /// (a synthetic clock).
+    /// A headless app with the world (stone y 0..=2, grass at y = 3, inline jobs), its clock
+    /// (running from noon) with the clock keys, physics, the fly camera, picking and walking,
+    /// settled; the cursor is free and a fly camera at (0.5, 6, 0.5) looks straight down at the
+    /// grass (top face at y = 4). `Update` is strict about ambiguities, so picking must be
+    /// ordered against the fly camera's grab (both use `CursorOptions`), and walking against the
+    /// camera's moves. Every update is one fixed step (a synthetic clock).
     fn picking_app() -> App {
+        picking_app_with(None)
+    }
+
+    /// [`picking_app`], with the `--lamps` demo around `lamps`.
+    fn picking_app_with(lamps: Option<DVec3>) -> App {
         use boxel::ecs::schedule::{LogLevel, ScheduleBuildSettings};
         use boxel::world::jobs::InlineExecutor;
         use boxel::worldgen::FlatGenerator;
@@ -1653,11 +1674,18 @@ mod tests {
                 executor: std::sync::Arc::new(InlineExecutor),
                 ..WorldPlugin::default()
             },
+            DaylightPlugin,
+            DayNightPlugin {
+                time: clock::start_time(12.0, false),
+                lamps,
+            },
             PhysicsPlugin::default(),
             PickingPlugin,
             WalkPlugin::default(),
         ))
         .init_resource::<OverlayLines>()
+        // As `DebugOverlayPlugin` does: picking fills it.
+        .init_resource::<CrosshairTarget>()
         .edit_schedule(Update, |schedule| {
             schedule.set_build_settings(ScheduleBuildSettings {
                 ambiguity_detection: LogLevel::Error,
@@ -1733,6 +1761,9 @@ mod tests {
         );
         // The f32 camera forward is not exactly -Y.
         assert!((target.t - 2.0).abs() < 1e-6, "{}", target.t);
+        // The F3 light probe: the air cell over the grass, whose light shades its top face.
+        let crosshair = |app: &App| app.world().resource::<CrosshairTarget>().0;
+        assert_eq!(crosshair(&app), Some(BlockPos::new(0, 4, 0)));
         let lines = app.world().resource::<OverlayLines>();
         assert_eq!(
             lines.get("pick target"),
@@ -1755,6 +1786,7 @@ mod tests {
             .target
             .expect("stone below");
         assert_eq!(target.block, BlockPos::new(0, 2, 0));
+        assert_eq!(crosshair(&app), Some(BlockPos::new(0, 3, 0)));
 
         // Key 3 selects grass; right click places it on the stone's top face.
         app.world_mut()
@@ -2030,6 +2062,94 @@ mod tests {
         // No ground within reach: skipped.
         let empty = demo_lamp_cells(start, |_| Some(BlockState::AIR)).expect("loaded");
         assert!(empty.is_empty());
+    }
+
+    /// The clock keys in the app: `]` and `[` move the clock an hour, T pauses it and F speeds
+    /// it up, while G (walking) and the hotbar digits leave it alone and the clock keys leave
+    /// walking and the hotbar alone.
+    #[test]
+    fn clock_keys_move_pause_and_speed_up_the_time() {
+        use player::WALK_KEY;
+        let mut app = picking_app();
+        let time = |app: &App| *app.world().resource::<TimeOfDay>();
+        let selected = |app: &App| app.world().resource::<Picking>().selected;
+        // Running from noon: one tick per fixed step (every update is one).
+        let start = time(&app);
+        assert!(!start.paused && start.speed == 1);
+        app.update();
+        assert_eq!(time(&app).tick, start.tick + 1);
+
+        // T pauses it.
+        tap(&mut app, KeyCode::KeyT);
+        let paused = time(&app);
+        assert!(paused.paused);
+        app.update();
+        assert_eq!(time(&app), paused);
+        // ] and [ move it one hour, still paused.
+        let hour = paused.ticks_per_hour();
+        tap(&mut app, KeyCode::BracketRight);
+        assert_eq!(
+            time(&app),
+            TimeOfDay {
+                tick: paused.tick + hour,
+                ..paused
+            }
+        );
+        tap(&mut app, KeyCode::BracketLeft);
+        assert_eq!(time(&app), paused);
+        // F: 60 times faster; it neither walks nor changes the hotbar.
+        tap(&mut app, KeyCode::KeyF);
+        let fast = TimeOfDay {
+            speed: FAST_TIME,
+            ..paused
+        };
+        assert_eq!(time(&app), fast);
+        assert!(walker(&mut app).is_none());
+        assert_eq!(selected(&app), 0);
+        // G walks and 3 picks grass; the clock stays as it was.
+        tap(&mut app, WALK_KEY);
+        assert!(walker(&mut app).is_some());
+        tap(&mut app, KeyCode::Digit3);
+        assert_eq!(selected(&app), 2);
+        assert_eq!(time(&app), fast);
+        // T again: running at 60 ticks per step. F again: real time.
+        tap(&mut app, KeyCode::KeyT);
+        let running = time(&app);
+        assert!(!running.paused);
+        app.update();
+        assert_eq!(time(&app).tick, running.tick + FAST_TIME);
+        tap(&mut app, KeyCode::KeyF);
+        let normal = time(&app);
+        assert_eq!(normal.speed, 1);
+        app.update();
+        assert_eq!(time(&app).tick, normal.tick + 1);
+        assert!(walker(&mut app).is_some(), "still walking");
+    }
+
+    #[test]
+    fn lamps_demo_places_its_blocks_once_the_ground_is_loaded() {
+        let start = DVec3::new(0.5, 6.0, 0.5);
+        let app = picking_app_with(Some(start));
+        assert_eq!(app.world().resource::<LampsDemo>().start, None, "placed");
+        // On the grass (top at y = 3) of the flat world.
+        let ground = |p: BlockPos| {
+            Some(if p.y <= 3 {
+                BlockState(1)
+            } else {
+                BlockState::AIR
+            })
+        };
+        let cells = demo_lamp_cells(start, ground).expect("loaded");
+        assert_eq!(cells.len(), LAMPS_DEMO_BLOCKS.len());
+        let registry = BlockRegistry::default_blocks();
+        for (pos, name) in cells {
+            assert_eq!(pos.y, 4);
+            assert_eq!(
+                block_at(&app, pos),
+                registry.by_name(name),
+                "{pos:?} {name}"
+            );
+        }
     }
 
     #[test]

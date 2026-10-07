@@ -285,9 +285,12 @@ de gameplay.
     primera edición de cada posición y después de la última) es también la que escribe los
     `BlockChanged { pos, old, new }` del mundo, uno por posición que cambió, en el orden de su
     primera edición. Los lee la física (despierta los cuerpos dormidos cerca, ADR 0016); la luz
-    no los lee, se recalcula con el lote. Al leer uno, el mapa ya tiene el bloque nuevo, pero
-    `ChunkMap::light_at` y las mallas pueden ser los de antes hasta que llegan las remallas del
-    lote.
+    no los lee, se recalcula con el lote. En el frame en que se escribe (después de
+    `WorldSystems::Edits`), el mapa ya tiene el bloque nuevo, pero `ChunkMap::light_at` y las
+    mallas pueden ser los de antes hasta que llegan las remallas del lote. Quien lo lee en un
+    schedule fijo (la física) lo recibe igual, pero quizá frames después: en el medio otra
+    edición puede cambiar el bloque o descargarse el chunk, así que lee el mapa en vez de
+    confiar en `new`.
 - **Coordenadas**: las cuentas de bandas y cajas usan `i64` con resta saturada; los techos se
   comparan relativos a la caja dentro de `boxel_light`. El mismo mundo en x = 2^40 e y = -2^40
   da los mismos bits.
@@ -641,7 +644,14 @@ Tests que lo vigilan:
   ambiente a toda hora.
 - P6: el registry de fábrica fija los estados 12 a 16 y sus emisiones (`contract.rs`,
   `masks.rs`); el overlay muestra la luz del ojo y de la mira y la hora; `voxel_world` y `stress`
-  prueban `--time`, `--lamps` y el guion de `--edits`.
+  prueban `--time`, `--lamps` y el guion de `--edits`. La app sin ventana de `voxel_world`
+  (`Update` estricto, con `DaylightPlugin`) prueba las teclas del reloj junto a G y los dígitos,
+  la celda de `CrosshairTarget` al apuntar y las lámparas de `--lamps` sobre el suelo;
+  `tests/ambiguity.rs` suma `DaylightPlugin` y pone estricto `FixedUpdate`.
+- `BlockChanged`: el harness de `streaming/tests.rs` compara cada llamada a `apply_edits` con
+  una diferencia del mapa (también con chunks en cola o generándose, y en el proptest de
+  `tall.rs`), y `boxel_world/tests/messages.rs` muestra que un lector en un schedule fijo recibe
+  todos los mensajes, aunque el mapa ya tenga otra edición.
 
 ## Alternativas descartadas
 
