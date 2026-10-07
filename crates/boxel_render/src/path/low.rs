@@ -34,7 +34,10 @@ impl TierPath for LowPath {
     }
 
     fn draw(&self, pass: &mut wgpu::RenderPass<'_>, arena: &wgpu::Buffer) -> u32 {
-        if self.cull.opaque.is_empty() && self.cull.cutout.is_empty() {
+        if self.cull.opaque.is_empty()
+            && self.cull.cutout.is_empty()
+            && self.cull.translucent.is_empty()
+        {
             return 0;
         }
         pass.set_vertex_buffer(0, arena.slice(..));
@@ -43,6 +46,7 @@ impl TierPath for LowPath {
         for (pipeline, list) in [
             (&self.voxel.opaque, &self.cull.opaque),
             (&self.voxel.cutout, &self.cull.cutout),
+            (&self.voxel.translucent, &self.cull.translucent),
         ] {
             if list.is_empty() {
                 continue;

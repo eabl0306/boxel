@@ -18,7 +18,7 @@ pub mod shading;
 
 pub use mesher::{
     AoPolicy, MaterialTable, MeshInput, MeshOptions, Mesher, reference_face_shading,
-    reference_visible_faces,
+    reference_face_shading_at, reference_visible_faces,
 };
 pub use packed::{
     ChunkMesh, FULL_SKY_ENTRY, LightQuantization, MAX_PALETTE_ENTRIES, PackedQuad, PaletteEntry,
@@ -31,7 +31,7 @@ pub use shading::FaceShading;
 pub const BUCKET_COUNT: usize = 8;
 /// Index of the cutout bucket (`RenderShape::Cutout`, all six faces; alpha-tested pipeline).
 pub const CUTOUT_BUCKET: usize = 6;
-/// Index of the translucent bucket (`RenderShape::Translucent`; meshed, not drawn in M0).
+/// Index of the translucent bucket (`RenderShape::Translucent`; blended, drawn last).
 pub const TRANSLUCENT_BUCKET: usize = 7;
 /// Max quads in one opaque face bucket of a 32^3 chunk (checkerboard: 32 * 32 * 16).
 pub const MAX_QUADS_PER_FACE_BUCKET: u32 = 16384;

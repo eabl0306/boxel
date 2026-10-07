@@ -7,8 +7,9 @@ use boxel_light::box_light::tile_index;
 use boxel_light::sky_tile::{DEFAULT_WALK_LIMIT, GeneratorTop, walk, walk_floor};
 use boxel_light::{LayerData, LightInput, SkyInput, SkyTile};
 use boxel_voxel::{
-    BlockDef, BlockRegistry, BlockRegistryBuilder, BlockState, CHUNK_VOLUME, ChunkData, ChunkKey,
-    ChunkPos, FaceTextures, LightTables, LocalPos, RenderShape, TextureId,
+    BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockRegistryBuilder, BlockState,
+    CHUNK_VOLUME, ChunkData, ChunkKey, ChunkPos, FaceTextures, LightTables, LocalPos, RenderShape,
+    TextureId,
 };
 use boxel_worldgen::{OverworldGenerator, WorldGenerator};
 
@@ -191,7 +192,8 @@ pub fn lamp_registry() -> (BlockRegistry, [BlockState; 3]) {
         b.add_block(BlockDef {
             name: format!("bench:{name}"),
             shape: RenderShape::Opaque,
-            solid: true,
+            model: BlockModel::CUBE,
+            collision: BlockCollision::Full,
             emission,
             light_opacity: 15,
             textures: FaceTextures::all(TextureId(0)),

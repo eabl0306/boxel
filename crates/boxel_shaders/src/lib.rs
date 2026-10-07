@@ -95,11 +95,13 @@ impl ShaderModuleId {
                 ("vs_pull", Stage::Vertex),
                 ("fs_opaque", Stage::Fragment),
                 ("fs_cutout", Stage::Fragment),
+                ("fs_translucent", Stage::Fragment),
             ],
             ShaderModuleId::VoxelInstanced => &[
                 ("vs_instanced", Stage::Vertex),
                 ("fs_opaque", Stage::Fragment),
                 ("fs_cutout", Stage::Fragment),
+                ("fs_translucent", Stage::Fragment),
             ],
             ShaderModuleId::Cull => &[("cull_chunks", Stage::Compute)],
             ShaderModuleId::Blit => &[

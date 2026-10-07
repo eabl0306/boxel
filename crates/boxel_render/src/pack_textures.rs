@@ -293,6 +293,29 @@ const RECIPES: &[Recipe] = &[
         FaceName::Up,
         &[("block/lava_still", Tint::None)],
     ),
+    // ADR 0018: glass (translucent, its alpha kept), and the cross plants (cutout). Slabs use
+    // the stone layer and the turned logs the log layers.
+    recipe(
+        "boxel:glass",
+        "glass",
+        FaceName::North,
+        &[("block/glass", Tint::None)],
+    ),
+    Recipe {
+        tint: Tint::Grass,
+        ..recipe(
+            "boxel:short_grass",
+            "short_grass",
+            FaceName::North,
+            &[("block/short_grass", Tint::Grass)],
+        )
+    },
+    recipe(
+        "boxel:poppy",
+        "poppy",
+        FaceName::North,
+        &[("block/poppy", Tint::None)],
+    ),
 ];
 
 /// One texture of a layer, composited bottom to top.

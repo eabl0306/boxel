@@ -1,6 +1,7 @@
 //! Tier paths (internal). Each implements the same internal trait, [`TierPath`]:
 //! `prepare` (CPU culling / uploads), `encode_compute` (High cull), `draw` (opaque buckets with
-//! the opaque pipeline, then the cutout bucket with the cutout pipeline).
+//! the opaque pipeline, then the cutout bucket with the cutout pipeline, then the translucent
+//! buckets back to front with the translucent pipeline).
 //!
 //! This module also owns what every tier shares: the frozen bind group layouts (group 0
 //! materials, group 1 view, group 2 geometry on High/Mid, the cull group), the voxel pipeline
@@ -18,7 +19,7 @@ use crate::renderer::ViewParams;
 use crate::{DEPTH_FORMAT, MAIN_COLOR_FORMAT};
 use boxel_gfx::Tier;
 use boxel_math::{Aabb, IVec3, Vec3};
-use boxel_mesh::{CUTOUT_BUCKET, MAX_QUADS_PER_BUCKET};
+use boxel_mesh::{CUTOUT_BUCKET, MAX_QUADS_PER_BUCKET, TRANSLUCENT_BUCKET};
 use boxel_shaders::gpu::{ViewUniform, bindings};
 use boxel_shaders::{ShaderModuleId, create_module};
 
@@ -37,7 +38,8 @@ pub(crate) trait TierPath {
     }
 
     /// Records the draws into the main pass (groups 0 and 1 are already bound): the opaque
-    /// buckets with the opaque pipeline, then the cutout bucket with the cutout pipeline.
+    /// buckets with the opaque pipeline, the cutout bucket with the cutout pipeline, then the
+    /// translucent buckets ([`translucent_draws`], back to front) with the translucent pipeline.
     /// Returns the draw calls recorded.
     fn draw(&self, pass: &mut wgpu::RenderPass<'_>, arena: &wgpu::Buffer) -> u32;
 }
@@ -100,16 +102,19 @@ impl VoxelLayouts {
     }
 }
 
-/// The two voxel pipelines of a tier (ADR 0012).
+/// The three voxel pipelines of a tier (ADR 0012, ADR 0018).
 pub(crate) struct VoxelPipelines {
     /// `fs_opaque`, back faces culled, face buckets 0..6.
     pub opaque: wgpu::RenderPipeline,
     /// `fs_cutout` (alpha test), no face culling, bucket 6.
     pub cutout: wgpu::RenderPipeline,
+    /// `fs_translucent`: alpha blending, depth test without depth write, no face culling (a
+    /// water surface or a glass pane shows from both sides), bucket 7.
+    pub translucent: wgpu::RenderPipeline,
 }
 
 impl VoxelPipelines {
-    /// Builds the opaque and cutout pipelines of `tier` (`VoxelPull` on High/Mid,
+    /// Builds the opaque, cutout and translucent pipelines of `tier` (`VoxelPull` on High/Mid,
     /// `VoxelInstanced` on Low).
     pub fn new(device: &wgpu::Device, tier: Tier, layouts: &VoxelLayouts) -> Self {
         let (module_id, vertex_entry, topology, immediate_size) = match tier {
@@ -159,7 +164,10 @@ impl VoxelPipelines {
             Tier::High | Tier::Mid => vec![Some(instance_step(&slot0))],
             Tier::Low => vec![Some(instance_step(&slot0)), Some(instance_step(&slot1))],
         };
-        let build = |label: &str, fragment_entry: &str, cull_mode: Option<wgpu::Face>| {
+        let build = |label: &str,
+                     fragment_entry: &str,
+                     cull_mode: Option<wgpu::Face>,
+                     blend: Option<wgpu::BlendState>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&layout),
@@ -180,7 +188,8 @@ impl VoxelPipelines {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(true),
+                    // Blended quads test depth but do not write it: the ones behind still show.
+                    depth_write_enabled: Some(blend.is_none()),
                     depth_compare: Some(wgpu::CompareFunction::Greater),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
@@ -192,7 +201,7 @@ impl VoxelPipelines {
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: MAIN_COLOR_FORMAT,
-                        blend: None,
+                        blend,
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                 }),
@@ -201,8 +210,19 @@ impl VoxelPipelines {
             })
         };
         Self {
-            opaque: build("boxel voxel opaque", "fs_opaque", Some(wgpu::Face::Back)),
-            cutout: build("boxel voxel cutout", "fs_cutout", None),
+            opaque: build(
+                "boxel voxel opaque",
+                "fs_opaque",
+                Some(wgpu::Face::Back),
+                None,
+            ),
+            cutout: build("boxel voxel cutout", "fs_cutout", None, None),
+            translucent: build(
+                "boxel voxel translucent",
+                "fs_translucent",
+                None,
+                Some(wgpu::BlendState::ALPHA_BLENDING),
+            ),
         }
     }
 }
@@ -360,6 +380,8 @@ pub(crate) struct CpuCull {
     pub opaque: Vec<BucketDraw>,
     /// Visible non-empty cutout buckets.
     pub cutout: Vec<BucketDraw>,
+    /// Visible non-empty translucent buckets, back to front ([`translucent_draws`]).
+    pub translucent: Vec<BucketDraw>,
     /// Chunks inside the frustum.
     pub visible_chunks: u32,
 }
@@ -368,7 +390,8 @@ impl CpuCull {
     /// Culls every chunk inside the GPU window (the live ones of `cull.wgsl`, about `2^30` voxels
     /// around the camera, see `chunk_table`) with the tests of `cull_chunks`: chunk AABB
     /// `[origin - render_origin, + 32]` against the frustum (p-vertex test), then the per-face
-    /// bucket test with the camera-relative eye; the cutout bucket only needs the frustum.
+    /// bucket test with the camera-relative eye; the cutout bucket only needs the frustum. The
+    /// translucent buckets come from [`translucent_draws`].
     ///
     /// Chunks outside the window are skipped at any view distance: Mid and Low draw with the
     /// wrapped origins too, whose difference is exact only inside it.
@@ -376,6 +399,7 @@ impl CpuCull {
         self.opaque.clear();
         self.cutout.clear();
         self.visible_chunks = 0;
+        translucent_draws(chunks, view, &mut self.translucent);
         for (slot, record) in chunks.iter() {
             if !chunks.in_window(record.origin) {
                 continue;
@@ -412,6 +436,40 @@ impl CpuCull {
             }
         }
     }
+}
+
+/// The visible non-empty translucent buckets, back to front: every tier draws them from this
+/// list, in this order, so blending gives the same pixels on all of them. Same window and
+/// frustum tests as [`CpuCull::run`]; sorted by the squared distance from the eye to the chunk's
+/// center, farthest first, ties by slot. Only the chunks are sorted: inside a bucket the quads
+/// keep the mesher's order (face buckets, then greedy order), so two translucent surfaces of
+/// one chunk can blend in the wrong order (ADR 0018).
+pub(crate) fn translucent_draws(chunks: &ChunkTable, view: &ViewParams, out: &mut Vec<BucketDraw>) {
+    let mut keyed: Vec<(f32, BucketDraw)> = Vec::new();
+    for (slot, record) in chunks.iter_translucent() {
+        if !chunks.in_window(record.origin) {
+            continue;
+        }
+        let min = record.origin.saturating_sub(view.render_origin).as_vec3();
+        let max = min + Vec3::splat(CHUNK_EDGE);
+        if !view.frustum.intersects_aabb(&Aabb::new(min, max)) {
+            continue;
+        }
+        let start = record.alloc.offset + record.counts[..TRANSLUCENT_BUCKET].iter().sum::<u32>();
+        let center = min + Vec3::splat(CHUNK_EDGE / 2.0);
+        keyed.push((
+            (center - view.eye_rel).length_squared(),
+            BucketDraw {
+                slot,
+                origin: record.gpu_origin(),
+                quad_start: start,
+                count: record.counts[TRANSLUCENT_BUCKET].min(MAX_QUADS_PER_BUCKET),
+            },
+        ));
+    }
+    keyed.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.slot.cmp(&b.1.slot)));
+    out.clear();
+    out.extend(keyed.into_iter().map(|(_, d)| d));
 }
 
 /// Chunk-level backface test of `cull.wgsl` (`bucket_visible`): a +Y bucket can only be seen

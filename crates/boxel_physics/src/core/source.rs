@@ -1,8 +1,11 @@
 //! What the sweep and the raycast read: a [`VoxelSource`] answers one block at a time, and the
 //! [`CollisionTable`] says how each block state collides.
 
+use super::shape::LocalBox;
+use boxel_math::DVec3;
 use boxel_voxel::{
-    BlockPos, BlockRegistry, BlockState, ChunkData, ChunkPos, RenderShape, StateFlags,
+    BlockCollision, BlockPos, BlockRegistry, BlockState, ChunkData, ChunkPos, CollisionBox,
+    RenderShape, StateFlags,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -31,16 +34,18 @@ impl<S: VoxelSource + ?Sized> VoxelSource for &mut S {
     }
 }
 
-/// How a block collides. Today every block is a full cube or nothing; shapes made of boxes
-/// (slabs, stairs, fences) are reserved for later, hence `non_exhaustive`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+/// How a block collides (or, for [`CollisionTable::outline`], how it is picked).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[non_exhaustive]
-pub enum CollisionShape {
+pub enum CollisionShape<'a> {
     /// No collision (air, water, flowers).
     #[default]
     Empty,
     /// The whole unit cube.
     Full,
+    /// A union of boxes inside the unit cube, in the block's frame (`0..=1` on every axis; a
+    /// bottom slab is `(0, 0, 0)..(1, 0.5, 1)`).
+    Boxes(&'a [LocalBox]),
 }
 
 /// `CollisionTable` bit: the block collides as a full cube.
@@ -49,37 +54,80 @@ const FULL: u8 = 1;
 const FLUID: u8 = 1 << 1;
 /// `CollisionTable` bit: the block has geometry (picking outline).
 const OUTLINE: u8 = 1 << 2;
+/// `CollisionTable` bit: the block collides with boxes (`collision` range).
+const BOXES: u8 = 1 << 3;
+/// `CollisionTable` bit: the block is picked by boxes (`outline` range), not the full cube.
+const OUTLINE_BOXES: u8 = 1 << 4;
 
-/// Per block state, what physics needs to know: the [`CollisionShape`] and two flags (fluid,
-/// has an outline). Built from a [`BlockRegistry`]: `BlockDef::solid` gives `Full`, the
-/// registry's `FLUID` flag gives the fluid bit and a render shape other than `None` gives the
-/// outline bit. States outside the registry are empty.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Per block state, what physics needs to know: its [`CollisionShape`], its picking outline and
+/// whether it is a fluid. Built from a [`BlockRegistry`] (ADR 0016, ADR 0018):
+/// `BlockDef::collision` gives the shape (a box list that is exactly the unit cube counts as
+/// `Full`, an empty one as `Empty`), the registry's `FLUID` flag gives the fluid bit, and a
+/// render shape other than `None` gives an outline, the model's (`BlockModel::outline`: the
+/// cube, a slab's half, a box around a plant). States outside the registry are empty.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct CollisionTable {
     bits: Vec<u8>,
+    /// Range of each state's collision boxes in `boxes` (states with the `BOXES` bit).
+    collision: Vec<(u32, u32)>,
+    /// Range of each state's outline boxes in `boxes` (states with the `OUTLINE_BOXES` bit).
+    outline: Vec<(u32, u32)>,
+    boxes: Vec<LocalBox>,
+    /// Some state has the `BOXES` bit.
+    any_boxes: bool,
 }
 
 impl CollisionTable {
     /// The table of every state of `registry`.
     pub fn from_registry(registry: &BlockRegistry) -> Self {
-        let bits = (0..registry.len())
-            .map(|i| {
-                let state = BlockState(i as u16);
-                let flags = registry.flags(state);
-                let mut bits = 0;
-                if flags.contains(StateFlags::SOLID) {
-                    bits |= FULL;
+        let mut table = Self::default();
+        for i in 0..registry.len() {
+            let state = BlockState(i as u16);
+            let flags = registry.flags(state);
+            let mut bits = 0;
+            if flags.contains(StateFlags::FLUID) {
+                bits |= FLUID;
+            }
+            let collision = table.push_shape(registry.collision(state));
+            match collision {
+                Pushed::Full => bits |= FULL,
+                Pushed::Boxes(_) => {
+                    bits |= BOXES;
+                    table.any_boxes = true;
                 }
-                if flags.contains(StateFlags::FLUID) {
-                    bits |= FLUID;
-                }
-                if registry.shape(state) != RenderShape::None {
-                    bits |= OUTLINE;
-                }
-                bits
-            })
-            .collect();
-        Self { bits }
+                Pushed::Empty => {}
+            }
+            let outline = if registry.shape(state) == RenderShape::None {
+                Pushed::Empty
+            } else {
+                bits |= OUTLINE;
+                table.push_shape(&registry.model(state).outline())
+            };
+            if let Pushed::Boxes(_) = outline {
+                bits |= OUTLINE_BOXES;
+            }
+            table.bits.push(bits);
+            table.collision.push(collision.range());
+            table.outline.push(outline.range());
+        }
+        table
+    }
+
+    /// Adds the boxes of `collision` (in sixteenths) to `boxes`.
+    fn push_shape(&mut self, collision: &BlockCollision) -> Pushed {
+        match collision {
+            BlockCollision::None => Pushed::Empty,
+            BlockCollision::Full => Pushed::Full,
+            BlockCollision::Boxes(list) if list.is_empty() => Pushed::Empty,
+            BlockCollision::Boxes(list) if list.as_slice() == [CollisionBox::FULL] => Pushed::Full,
+            BlockCollision::Boxes(list) => {
+                let start = self.boxes.len() as u32;
+                let unit = |v: [u8; 3]| DVec3::new(v[0].into(), v[1].into(), v[2].into()) / 16.0;
+                self.boxes
+                    .extend(list.iter().map(|b| LocalBox::new(unit(b.min), unit(b.max))));
+                Pushed::Boxes((start, self.boxes.len() as u32))
+            }
+        }
     }
 
     #[inline]
@@ -87,9 +135,32 @@ impl CollisionTable {
         self.bits.get(state.0 as usize).copied().unwrap_or(0)
     }
 
+    #[inline]
+    fn range(&self, ranges: &[(u32, u32)], state: BlockState) -> &[LocalBox] {
+        let (start, end) = ranges.get(state.0 as usize).copied().unwrap_or((0, 0));
+        &self.boxes[start as usize..end as usize]
+    }
+
     /// How `state` collides.
-    pub fn shape(&self, state: BlockState) -> CollisionShape {
-        if self.is_full(state) {
+    #[inline]
+    pub fn shape(&self, state: BlockState) -> CollisionShape<'_> {
+        let bits = self.bits(state);
+        if bits & FULL != 0 {
+            CollisionShape::Full
+        } else if bits & BOXES != 0 {
+            CollisionShape::Boxes(self.range(&self.collision, state))
+        } else {
+            CollisionShape::Empty
+        }
+    }
+
+    /// The shape `state` is picked by (its outline): `Empty` for blocks without geometry.
+    #[inline]
+    pub fn outline(&self, state: BlockState) -> CollisionShape<'_> {
+        let bits = self.bits(state);
+        if bits & OUTLINE_BOXES != 0 {
+            CollisionShape::Boxes(self.range(&self.outline, state))
+        } else if bits & OUTLINE != 0 {
             CollisionShape::Full
         } else {
             CollisionShape::Empty
@@ -100,6 +171,19 @@ impl CollisionTable {
     #[inline]
     pub fn is_full(&self, state: BlockState) -> bool {
         self.bits(state) & FULL != 0
+    }
+
+    /// `state` collides at all (a full cube or boxes).
+    #[inline]
+    pub fn collides(&self, state: BlockState) -> bool {
+        self.bits(state) & (FULL | BOXES) != 0
+    }
+
+    /// Some state collides with boxes (not a full cube): sweeps then also look at the layer the
+    /// moving box's face is in.
+    #[inline]
+    pub fn has_boxes(&self) -> bool {
+        self.any_boxes
     }
 
     /// `state` is a fluid (water).
@@ -122,6 +206,23 @@ impl CollisionTable {
     /// No states at all (not even air).
     pub fn is_empty(&self) -> bool {
         self.bits.is_empty()
+    }
+}
+
+/// What [`CollisionTable::push_shape`] added.
+#[derive(Clone, Copy)]
+enum Pushed {
+    Empty,
+    Full,
+    Boxes((u32, u32)),
+}
+
+impl Pushed {
+    fn range(self) -> (u32, u32) {
+        match self {
+            Pushed::Boxes(range) => range,
+            Pushed::Empty | Pushed::Full => (0, 0),
+        }
     }
 }
 

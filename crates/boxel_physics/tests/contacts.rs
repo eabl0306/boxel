@@ -15,9 +15,9 @@ use boxel_ecs::prelude::*;
 use boxel_ecs::system::RunSystemOnce;
 use boxel_math::{DVec3, I64Vec3, Vec2};
 use boxel_physics::{
-    BodyFilter, BodyIndex, BodySettings, CharacterController, Collider, CollisionLayers, Contacts,
-    Interpolated, LocalBox, MoveIntent, PhysicsQuery, PhysicsSettings, PhysicsStats, RayFilter,
-    RayHit, ReportContacts, RigidBody, Teleport, Velocity, VoxelFilter,
+    BodyFilter, BodyIndex, BodySettings, CharacterController, Collider, CollisionLayers,
+    CollisionShape, Contacts, Interpolated, LocalBox, MoveIntent, PhysicsQuery, PhysicsSettings,
+    PhysicsStats, RayFilter, RayHit, ReportContacts, RigidBody, Teleport, Velocity, VoxelFilter,
 };
 use boxel_transform::Transform;
 use boxel_voxel::{BlockPos, Face, MAX_BLOCK_COORD, WorldPos};
@@ -652,6 +652,19 @@ fn rays_hit_bodies_and_blocks_in_order_and_queries_find_bodies() {
         index.block_is_free(sim.block(6, 5, 0)),
         "the ball's top only touches"
     );
+    // Shaped blocks (ADR 0018): only their boxes count, and a plant never collides.
+    assert!(index.shape_is_free(sim.block(2, 4, 0), CollisionShape::Empty));
+    assert!(!index.shape_is_free(sim.block(6, 4, 0), CollisionShape::Full));
+    let corner = [LocalBox::new(DVec3::ZERO, DVec3::new(0.25, 0.0625, 0.25))];
+    assert!(
+        index.shape_is_free(sim.block(6, 4, 0), CollisionShape::Boxes(&corner)),
+        "a box in the corner misses the ball"
+    );
+    let middle = [LocalBox::new(
+        DVec3::new(0.0, 0.25, 0.0),
+        DVec3::new(1.0, 0.75, 1.0),
+    )];
+    assert!(!index.shape_is_free(sim.block(6, 4, 0), CollisionShape::Boxes(&middle)));
 }
 
 // ------------------------------------------------------------------------------ determinism

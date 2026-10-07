@@ -1,7 +1,8 @@
 // boxel: shared voxel shader code (all tiers). Prepended to voxel_pull.wgsl, voxel_instanced.wgsl and cull.wgsl.
 //
 // PackedQuad = vec2<u32>(geo, mat), 8 bytes, identical bytes on every tier.
-//   geo: x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | flags:4 (bit 0 = FLAG_EMISSIVE)
+//   geo: x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | flags:4 (bit 0 = FLAG_EMISSIVE, bits 1..3 =
+//        shape code, ADR 0018: cube, turned cube, lower or upper half of the cell, cross)
 //   mat: layer:12 | ao:8 (2 bits per corner, 3 = unoccluded) | light:12 (index into the chunk's
 //        light palette)
 // face: 0=+Y 1=-Y 2=+X 3=-X 4=+Z 5=-Z  (u,v axes: ±Y -> (X,Z), ±X -> (Z,Y), ±Z -> (X,Y))
@@ -37,6 +38,13 @@ const GEO_FACE_SHIFT: u32 = 25u;
 const GEO_FLAGS_SHIFT: u32 = 28u;
 // Flag of a quad whose block emits light: drawn at the full brightness of its texture.
 const FLAG_EMISSIVE: u32 = 1u;
+// Shape code (boxel_mesh::layout::SHAPE_*): how the quad's cell and face become geometry.
+const GEO_SHAPE_SHIFT: u32 = 29u;
+const GEO_SHAPE_MASK: u32 = 7u;
+const SHAPE_TURNED: u32 = 1u;      // cube face, texture transposed (logs along X or Z)
+const SHAPE_LOWER_HALF: u32 = 2u;  // bottom slab face (w = h = 1)
+const SHAPE_UPPER_HALF: u32 = 3u;  // top slab face (w = h = 1)
+const SHAPE_CROSS: u32 = 4u;       // plant quad through the cell's diagonal (w = h = 1)
 const MAT_LAYER_MASK: u32 = 0xFFFu;
 const MAT_AO_SHIFT: u32 = 12u;
 const MAT_LIGHT_SHIFT: u32 = 20u;
@@ -145,6 +153,32 @@ fn decode_quad(q: vec2<u32>, light: vec2<u32>, corner_in: u32) -> Decoded {
   o.ao = (mat >> MAT_AO_SHIFT) & 0xFFu;
   o.flags = (geo >> GEO_FLAGS_SHIFT) & 15u;
   o.grow = vec2(2.0 * cu - 1.0, 2.0 * cv - 1.0);
+  let shape = (geo >> GEO_SHAPE_SHIFT) & GEO_SHAPE_MASK;
+  if (shape == SHAPE_LOWER_HALF || shape == SHAPE_UPPER_HALF) {
+    // Slab: the cell's y range shrinks to [lo, lo + 0.5]. Side faces keep the part of the cube
+    // face they cover: their y, texture row and light/AO coordinate t all follow the real y, so
+    // they shade exactly like that part of the cube face. +Y and -Y faces move to the half's
+    // planes.
+    let lo = select(0.0, 0.5, shape == SHAPE_UPPER_HALF);
+    if (f >= 2u) {
+      let y = lo + 0.5 * cv;
+      o.local.y = p.y + y;
+      o.uv.y = 1.0 - y;
+      o.st.y = y;
+    } else {
+      o.local.y = p.y + select(lo, lo + 0.5, f == 0u);
+    }
+  } else if (shape == SHAPE_CROSS) {
+    // Face 2 (+X) runs from (0, 0) to (1, 1) in (x, z), face 4 (+Z) from (1, 0) to (0, 1); full
+    // height. Drawn from both sides at full face brightness (face 0's shade, as Minecraft draws
+    // plants) and never grown: it meets no other quad.
+    let start = select(vec3(1.0, 0.0, 0.0), vec3(0.0), f == 2u);
+    let along = select(vec3(-1.0, 0.0, 1.0), vec3(1.0, 0.0, 1.0), f == 2u);
+    o.local = p + start + along * cu + vec3(0.0, cv, 0.0);
+    o.uv = vec2(cu, 1.0 - cv);
+    o.face = 0u;
+    o.grow = vec2(0.0);
+  }
   return o;
 }
 
@@ -201,6 +235,8 @@ fn finish_vertex(d: Decoded, chunk_origin: vec3<i32>, view: View) -> VsOut {
   o.clip = clip + axis_u * t.x + axis_v * t.y;
   // side faces: the texture's v points down (decode_quad)
   o.uv = d.uv + vec2(t.x, select(t.y, -t.y, d.face >= 2u));
+  // a turned cube face (logs along X or Z): the texture's vertical runs along u
+  if ((d.flags >> 1u) == SHAPE_TURNED) { o.uv = o.uv.yx; }
   o.layer = d.layer;
   o.face = d.face;
   o.view_dist = length(rel - view.camera_rel.xyz);
@@ -210,7 +246,8 @@ fn finish_vertex(d: Decoded, chunk_origin: vec3<i32>, view: View) -> VsOut {
   return o;
 }
 
-// Opaque buckets never discard (keeps early-Z); cutout buckets use the alpha test below.
+// Opaque buckets never discard (keeps early-Z); cutout buckets use the alpha test below;
+// the translucent bucket blends with the texture's alpha.
 fn alpha_test_passes(albedo: vec4<f32>) -> bool { return albedo.a >= 0.5; }
 
 // Light levels (sky, red, green, blue) of corner k of a light palette entry.

@@ -14,10 +14,14 @@ pub enum VoxelClass {
     Opaque,
     /// Drawn, does not hide neighbors (cutout and translucent).
     Transparent,
+    /// A block that is not a cube (slabs, plants, ADR 0018): meshed one block at a time after
+    /// the greedy pass, which sees it as empty (its neighbors draw their faces against it). Its
+    /// material id stays in `voxels` and it has a bit in the `special` masks.
+    Special,
 }
 
 /// The mesher's padded input: material ids for x, y, z in `-1..=32` plus the two column masks
-/// binary-greedy-meshing needs. Layout = bgm `pad_linearize`: index `(z+1) + (x+1)*34 + (y+1)*34^2`;
+/// binary-greedy-meshing needs and a third one of the non-cube blocks. Layout = bgm `pad_linearize`: index `(z+1) + (x+1)*34 + (y+1)*34^2`;
 /// mask row `(x+1) + (y+1)*34`, bit `z+1`.
 #[derive(Clone, Debug)]
 pub struct PaddedChunk {
@@ -27,6 +31,8 @@ pub struct PaddedChunk {
     pub opaque: Box<[u64]>,
     /// Transparent column masks.
     pub transparent: Box<[u64]>,
+    /// Special (non-cube) column masks.
+    pub special: Box<[u64]>,
 }
 
 impl Default for PaddedChunk {
@@ -42,6 +48,7 @@ impl PaddedChunk {
             voxels: vec![0; PADDED_VOLUME].into_boxed_slice(),
             opaque: vec![0; PADDED_AREA].into_boxed_slice(),
             transparent: vec![0; PADDED_AREA].into_boxed_slice(),
+            special: vec![0; PADDED_AREA].into_boxed_slice(),
         }
     }
     /// Resets to empty.
@@ -49,6 +56,7 @@ impl PaddedChunk {
         self.voxels.fill(0);
         self.opaque.fill(0);
         self.transparent.fill(0);
+        self.special.fill(0);
     }
     /// Linear index of chunk-local `(x, y, z)`, each in `-1..=32`.
     #[inline]
@@ -64,10 +72,12 @@ impl PaddedChunk {
         let bit = 1u64 << (z + 1);
         self.opaque[row] &= !bit;
         self.transparent[row] &= !bit;
+        self.special[row] &= !bit;
         match class {
             VoxelClass::Empty => self.voxels[i] = 0,
             VoxelClass::Opaque => self.opaque[row] |= bit,
             VoxelClass::Transparent => self.transparent[row] |= bit,
+            VoxelClass::Special => self.special[row] |= bit,
         }
     }
     /// Material at `(x, y, z)` in `-1..=32`.

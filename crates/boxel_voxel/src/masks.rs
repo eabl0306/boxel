@@ -98,7 +98,7 @@ impl std::fmt::Debug for MaskRows<'_> {
 #[derive(Clone, Copy, Debug)]
 pub struct LightMasks<'a> {
     /// Voxels with light opacity 15 (light stops). Not the render shape: a `Cutout` block may
-    /// stop light too ([`ChunkData::opaque_occupancy`] is the `RenderShape::Opaque` mask).
+    /// stop light too ([`ChunkData::opaque_occupancy`] is the mask of `Opaque` full cubes).
     pub opaque: MaskRows<'a>,
     /// Voxels with light opacity 1..=14 (leaves, water).
     pub partial: MaskRows<'a>,

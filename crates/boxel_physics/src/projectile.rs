@@ -160,7 +160,7 @@ fn fly(flyer: &mut Flyer<'_>, shared: &Shared<'_>, f: Flight<'_, '_>) {
                 freeze(flyer);
                 return;
             }
-            Probe::Block(state) if shared.table.is_full(state) => {
+            Probe::Block(state) if shared.table.collides(state) => {
                 if f.frozen {
                     flyer.out.unfreeze.push(f.entity);
                 }

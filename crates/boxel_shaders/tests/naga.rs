@@ -275,6 +275,12 @@ fn wgsl_bit_layout_matches_boxel_mesh() {
         ("MAT_AO_SHIFT", l::MAT_AO_SHIFT),
         ("MAT_LIGHT_SHIFT", l::MAT_LIGHT_SHIFT),
         ("MAT_LIGHT_MASK", l::MAT_LIGHT_MASK),
+        ("GEO_SHAPE_SHIFT", l::GEO_SHAPE_SHIFT),
+        ("GEO_SHAPE_MASK", l::GEO_SHAPE_MASK),
+        ("SHAPE_TURNED", u32::from(l::SHAPE_TURNED)),
+        ("SHAPE_LOWER_HALF", u32::from(l::SHAPE_LOWER_HALF)),
+        ("SHAPE_UPPER_HALF", u32::from(l::SHAPE_UPPER_HALF)),
+        ("SHAPE_CROSS", u32::from(l::SHAPE_CROSS)),
     ] {
         assert_eq!(const_u32(&module, name), v, "{name}");
     }

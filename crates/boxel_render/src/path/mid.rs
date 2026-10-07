@@ -5,20 +5,21 @@ use crate::renderer::ViewParams;
 use boxel_shaders::gpu::{DrawRef, bindings};
 
 /// Vertex pulling with CPU culling: the frame's `DrawRef`s (opaque buckets first, then cutout
-/// buckets) go to an instance-step vertex buffer and draw `i` uses `first_instance = i`.
+/// buckets, then translucent ones back to front) go to an instance-step vertex buffer and draw
+/// `i` uses `first_instance = i`.
 pub(crate) struct MidPath {
     voxel: VoxelPipelines,
     geometry: wgpu::BindGroup,
     index: wgpu::Buffer,
     draw_refs: wgpu::Buffer,
-    /// `DrawRef` capacity (7 per slot: 6 face buckets + cutout).
+    /// `DrawRef` capacity (8 per slot: 6 face buckets, cutout and translucent).
     capacity: usize,
     cull: CpuCull,
     refs: Vec<DrawRef>,
 }
 
 impl MidPath {
-    /// Creates the per-frame `DrawRef` buffer (`7 * slots` entries).
+    /// Creates the per-frame `DrawRef` buffer (`8 * slots` entries).
     pub fn new(
         device: &wgpu::Device,
         voxel: VoxelPipelines,
@@ -26,7 +27,7 @@ impl MidPath {
         index: wgpu::Buffer,
         slots: u32,
     ) -> Self {
-        let capacity = 7 * slots as usize;
+        let capacity = 8 * slots as usize;
         let draw_refs = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("boxel draw refs"),
             size: (capacity * size_of::<DrawRef>()) as u64,
@@ -48,17 +49,21 @@ impl MidPath {
 impl TierPath for MidPath {
     fn prepare(&mut self, queue: &wgpu::Queue, chunks: &ChunkTable, view: &ViewParams) -> u32 {
         self.cull.run(chunks, view);
-        // never more than 7 per live slot; the clamp only guards the buffer
+        // never more than 8 per live slot; the clamp only guards the buffer
         self.cull.opaque.truncate(self.capacity);
         self.cull
             .cutout
             .truncate(self.capacity - self.cull.opaque.len());
+        self.cull
+            .translucent
+            .truncate(self.capacity - self.cull.opaque.len() - self.cull.cutout.len());
         self.refs.clear();
         self.refs.extend(
             self.cull
                 .opaque
                 .iter()
                 .chain(&self.cull.cutout)
+                .chain(&self.cull.translucent)
                 .map(|d| DrawRef {
                     chunk_slot: d.slot,
                     quad_start: d.quad_start,
@@ -82,6 +87,7 @@ impl TierPath for MidPath {
         for (pipeline, list) in [
             (&self.voxel.opaque, &self.cull.opaque),
             (&self.voxel.cutout, &self.cull.cutout),
+            (&self.voxel.translucent, &self.cull.translucent),
         ] {
             if list.is_empty() {
                 continue;

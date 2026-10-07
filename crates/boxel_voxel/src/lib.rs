@@ -32,8 +32,9 @@ pub use coords::{
 pub use light::{LightTables, LightValue, MAX_LIGHT, OPAQUE_OPACITY};
 pub use masks::{LightMasks, MaskRows, MaskWords, OwnedLightMasks};
 pub use registry::{
-    BlockDef, BlockRegistry, BlockRegistryBuilder, BlockState, BuiltinLamp, FaceTextures, LAMPS,
-    LAVA_EMISSION, RegistryError, RenderShape, StateFlags, TextureId, TexturePattern, TextureSpec,
+    Axis, BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockRegistryBuilder, BlockState,
+    BuiltinLamp, CollisionBox, FaceTextures, LAMPS, LAVA_EMISSION, RegistryError, RenderShape,
+    SlabHalf, StateFlags, TextureId, TexturePattern, TextureSpec,
 };
 pub use storage::{Occupancy, Paletted};
 

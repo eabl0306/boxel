@@ -13,7 +13,7 @@
 //! contiguous runs instead of one write per change.
 use crate::arena::ArenaAlloc;
 use boxel_math::{I64Vec3, IVec3, wrap_to_i32};
-use boxel_mesh::BUCKET_COUNT;
+use boxel_mesh::{BUCKET_COUNT, TRANSLUCENT_BUCKET};
 use boxel_shaders::gpu::ChunkGpu;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
@@ -79,6 +79,9 @@ impl ChunkRecord {
 pub(crate) struct ChunkTable {
     records: Vec<Option<ChunkRecord>>,
     free: BTreeSet<u32>,
+    /// Live slots with translucent quads (their bucket is sorted and drawn from the CPU on every
+    /// tier, so only these are visited for it).
+    translucent: BTreeSet<u32>,
     by_id: HashMap<u64, u32, foldhash::fast::FixedState>,
     capacity: u32,
     /// Center of the GPU window (a recent render origin).
@@ -99,6 +102,7 @@ impl ChunkTable {
         Self {
             records: Vec::new(),
             free: BTreeSet::new(),
+            translucent: BTreeSet::new(),
             by_id: HashMap::default(),
             capacity,
             window: I64Vec3::ZERO,
@@ -163,6 +167,11 @@ impl ChunkTable {
         if self.in_window(record.origin) {
             self.drawable += 1;
         }
+        if record.counts[TRANSLUCENT_BUCKET] > 0 {
+            self.translucent.insert(slot);
+        } else {
+            self.translucent.remove(&slot);
+        }
         self.by_id.insert(record.id, slot);
         self.mark_stale(slot);
         Some(slot)
@@ -173,6 +182,7 @@ impl ChunkTable {
         let slot = self.by_id.remove(&id)?;
         let record = self.records[slot as usize].take()?;
         self.free.insert(slot);
+        self.translucent.remove(&slot);
         // Its GPU entry must go to zero even past the new `slot_count`: High's cull reads the
         // flags of every slot below `slot_count`, and a slot freed here can be below it again.
         self.mark_stale(slot);
@@ -193,6 +203,7 @@ impl ChunkTable {
         self.mark_all_stale();
         self.records.clear();
         self.free.clear();
+        self.translucent.clear();
         self.by_id.clear();
         self.drawable = 0;
     }
@@ -203,6 +214,16 @@ impl ChunkTable {
             .iter()
             .enumerate()
             .filter_map(|(slot, r)| r.as_ref().map(|r| (slot as u32, r)))
+    }
+
+    /// Live records with translucent quads, in slot order.
+    pub fn iter_translucent(&self) -> impl Iterator<Item = (u32, &ChunkRecord)> {
+        self.translucent.iter().filter_map(|&slot| {
+            self.records
+                .get(slot as usize)
+                .and_then(Option::as_ref)
+                .map(|r| (slot, r))
+        })
     }
 
     /// True if a chunk at `origin` is inside the GPU window (nearer than [`GPU_WINDOW`] to its

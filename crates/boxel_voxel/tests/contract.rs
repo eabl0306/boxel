@@ -53,7 +53,8 @@ fn registry_builder_assigns_dense_states() {
         .add_block(BlockDef {
             name: "test:stone".into(),
             shape: RenderShape::Opaque,
-            solid: true,
+            model: BlockModel::CUBE,
+            collision: BlockCollision::Full,
             emission: [0; 3],
             light_opacity: 15,
             textures: FaceTextures::all(t),
@@ -130,6 +131,13 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
         "boxel:lamp_blue",
         "boxel:lamp_white",
         "boxel:lava",
+        "boxel:glass",
+        "boxel:stone_slab",
+        "boxel:stone_slab_top",
+        "boxel:short_grass",
+        "boxel:poppy",
+        "boxel:log_x",
+        "boxel:log_z",
     ];
     assert_eq!(r.len(), names.len());
     for (i, n) in names.iter().enumerate() {
@@ -143,13 +151,120 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
     assert_eq!(tex(grass, Face::PosY), "boxel:grass_top");
     assert_eq!(tex(grass, Face::NegY), "boxel:dirt");
     assert_eq!(tex(grass, Face::PosX), "boxel:grass_side");
-    assert_eq!(r.textures().len(), 18);
+    assert_eq!(r.textures().len(), 21);
     // The emitters: opaque solid cubes with their own texture.
-    for (i, name) in names.iter().enumerate().skip(12) {
+    for (i, name) in names.iter().enumerate().skip(12).take(5) {
         let s = BlockState(i as u16);
         assert_eq!(r.shape(s), RenderShape::Opaque, "{name}");
         assert_eq!(tex(s, Face::PosX), *name);
     }
+    // ADR 0018: shapes, collision and light of the non-cube blocks and the turned logs.
+    let by = |n: &str| r.by_name(n).unwrap();
+    let glass = by("boxel:glass");
+    assert_eq!(r.shape(glass), RenderShape::Translucent);
+    assert_eq!(r.collision(glass), &BlockCollision::Full);
+    assert_eq!(r.light_opacity(glass), 0);
+    assert!(!r.flags(glass).contains(StateFlags::FLUID));
+    assert!(r.flags(BlockState(10)).contains(StateFlags::FLUID));
+    for (name, half) in [
+        ("boxel:stone_slab", SlabHalf::Bottom),
+        ("boxel:stone_slab_top", SlabHalf::Top),
+    ] {
+        let s = by(name);
+        assert_eq!(r.model(s), BlockModel::Slab(half));
+        assert_eq!(r.shape(s), RenderShape::Opaque);
+        assert!(!r.occludes(s), "a slab hides no neighbor");
+        assert_eq!(
+            r.collision(s),
+            &BlockCollision::Boxes(vec![CollisionBox::slab(half)])
+        );
+        assert_eq!(r.light_opacity(s), 1);
+        assert_eq!(tex(s, Face::PosY), "boxel:stone");
+    }
+    for name in ["boxel:short_grass", "boxel:poppy"] {
+        let s = by(name);
+        assert_eq!(r.model(s), BlockModel::Cross);
+        assert_eq!(r.shape(s), RenderShape::Cutout);
+        assert!(r.collision(s).is_none());
+        assert!(!r.flags(s).contains(StateFlags::SOLID));
+        assert_eq!(r.light_opacity(s), 0);
+        assert_eq!(tex(s, Face::PosX), name);
+    }
+    assert!(r.occludes(BlockState(1)));
+    // Logs: the end texture across the axis, the bark turned on the faces along it.
+    let (log, log_x, log_z) = (BlockState(8), by("boxel:log_x"), by("boxel:log_z"));
+    for face in Face::ALL {
+        let end = |s| tex(s, face) == "boxel:log_top";
+        assert_eq!(
+            end(log),
+            matches!(face, Face::PosY | Face::NegY),
+            "{face:?}"
+        );
+        assert_eq!(
+            end(log_x),
+            matches!(face, Face::PosX | Face::NegX),
+            "{face:?}"
+        );
+        assert_eq!(
+            end(log_z),
+            matches!(face, Face::PosZ | Face::NegZ),
+            "{face:?}"
+        );
+        assert!(!r.model(log).face_turned(face));
+        assert_eq!(r.model(log_x).face_turned(face), !end(log_x), "{face:?}");
+        // Along Z, the faces whose u axis is Z (+-X) turn; +-Y keep the grain along their v.
+        assert_eq!(
+            r.model(log_z).face_turned(face),
+            matches!(face, Face::PosX | Face::NegX),
+            "{face:?}"
+        );
+    }
+}
+
+#[test]
+fn registry_rejects_bad_collision_boxes() {
+    let mut b = BlockRegistryBuilder::new();
+    let t = b
+        .add_texture(TextureSpec {
+            name: "test:t".into(),
+            base_color: [0; 3],
+            noise: 0,
+            pattern: TexturePattern::Noise,
+        })
+        .unwrap();
+    let def = |name: &str, boxes: Vec<CollisionBox>| BlockDef {
+        name: format!("test:{name}"),
+        shape: RenderShape::Opaque,
+        model: BlockModel::Slab(SlabHalf::Bottom),
+        collision: BlockCollision::Boxes(boxes),
+        emission: [0; 3],
+        light_opacity: 1,
+        textures: FaceTextures::all(t),
+    };
+    for (name, bad) in [
+        ("flat", CollisionBox::new([0, 4, 0], [16, 4, 16])),
+        ("out", CollisionBox::new([0, 0, 0], [17, 8, 16])),
+        ("upside", CollisionBox::new([0, 8, 0], [16, 0, 16])),
+    ] {
+        assert_eq!(
+            b.add_block(def(name, vec![CollisionBox::FULL, bad])),
+            Err(RegistryError::InvalidCollision(format!("test:{name}")))
+        );
+    }
+    // A slab may have any partial light opacity; an opaque cube may not.
+    assert!(
+        b.add_block(def("ok", vec![CollisionBox::slab(SlabHalf::Bottom)]))
+            .is_ok()
+    );
+    let cube = BlockDef {
+        name: "test:leaky_cube".into(),
+        model: BlockModel::CUBE,
+        ..def("unused", vec![])
+    };
+    assert_eq!(
+        b.add_block(cube),
+        Err(RegistryError::InvalidLight("test:leaky_cube".into()))
+    );
 }
 
 #[test]
