@@ -607,7 +607,10 @@ fn build_stairs(
     };
     let (Some(stone), Some(slab)) = (
         content.registry.by_name("boxel:stone"),
-        content.registry.by_name("boxel:stone_slab"),
+        content
+            .registry
+            .parse_state("boxel:stone_slab[type=bottom]")
+            .ok(),
     ) else {
         return;
     };

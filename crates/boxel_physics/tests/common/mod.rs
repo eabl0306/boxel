@@ -16,14 +16,14 @@ pub const WATER: BlockState = BlockState(12);
 /// [`top_slab`], so a change in how slab states are named touches one place.
 pub fn bottom_slab() -> BlockState {
     BlockRegistry::default_blocks()
-        .by_name("boxel:stone_slab")
+        .parse_state("boxel:stone_slab[type=bottom]")
         .expect("bottom slab")
 }
 
 /// A stone slab in the upper half of its block (from 0.5 to 1).
 pub fn top_slab() -> BlockState {
     BlockRegistry::default_blocks()
-        .by_name("boxel:stone_slab_top")
+        .parse_state("boxel:stone_slab[type=top]")
         .expect("top slab")
 }
 
