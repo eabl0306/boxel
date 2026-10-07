@@ -28,7 +28,13 @@
 //! must draw exactly the same pixels (software adapters: the tolerance above), the moved scene
 //! the same pixels as near the origin, the cave the same at noon and at midnight (block light
 //! does not follow the sun), the night overview at most half as bright as noon, the cave tinted
-//! by its lamps, and the shadowed views darker than without light and AO.
+//! by its lamps, the shadowed views darker than without light and AO, and the face of a white
+//! lamp glowing: at the full brightness of its texture, the same at noon, at midnight and
+//! without light.
+//!
+//! A third test looks for cracks: views of the terrain at 1280x720 on a magenta background must
+//! show no island of magenta inside the terrain (T-junctions between greedy quads, closed by the
+//! edge growth of `common.wgsl`).
 //!
 //! Failing images are saved under `CARGO_TARGET_TMPDIR/gpu_terrain/` (every image with
 //! `GPU_TERRAIN_SAVE=1`).
@@ -633,6 +639,212 @@ fn real_terrain_renders_identically_on_every_tier() {
     );
 }
 
+// ---------------------------------------------------------------- cracks
+
+/// Size of the crack renders: a crack is a pixel here and there, so a big image finds them.
+const CRACK_SIZE: UVec2 = UVec2::new(1280, 720);
+/// Clear color of the crack renders (linear magenta, exactly (255, 0, 255) in sRGB): no terrain
+/// pixel has it, so every pixel of it shows the background.
+const CRACK_CLEAR: [f32; 4] = [1.0, 0.0, 1.0, 1.0];
+/// [`CRACK_CLEAR`] read back (sRGB bytes).
+const CRACK_CLEAR_SRGB: [u8; 3] = [255, 0, 255];
+/// Largest island of background pixels that counts as a crack (a crack is a pixel or a short
+/// sliver; real openings between hills are bigger or touch the sky).
+const MAX_CRACK_PIXELS: usize = 8;
+
+/// The crack views: an eye looking at a target, both relative to the center of the meshed area
+/// at its highest column. Eye coordinates are multiples of 1/64.
+const CRACK_VIEWS: [(&str, [f64; 3], [f64; 3]); 4] = [
+    // Straight down from above the center: only terrain fills the image.
+    ("down", [0.015_625, 20.0, 0.031_25], [0.0, -40.0, 0.0]),
+    // Down at about 70 degrees near the center, toward +x: terrain only.
+    ("steep", [-20.25, 16.5, 4.75], [0.0, -48.0, 4.75]),
+    // Low and grazing across the surface toward the far edge (the skyline is the edge of the
+    // meshed area).
+    (
+        "across",
+        [-94.593_75, 3.406_25, 8.703_125],
+        [0.0, -20.0, 8.703_125],
+    ),
+    // Oblique from above one edge.
+    ("oblique", [-20.5, 25.25, -90.75], [10.0, -20.0, 20.0]),
+];
+
+/// Pixels of the background islands of `image`: 4-connected areas of exactly `clear` (sRGB
+/// bytes) of at most [`MAX_CRACK_PIXELS`] that do not touch the image border, so terrain
+/// surrounds them. The sky above the horizon is one big area and does not count.
+fn crack_pixels(image: &RgbaImage, clear: [u8; 3]) -> Vec<(u32, u32)> {
+    let (w, h) = (image.width as usize, image.height as usize);
+    let pixels = image.data.as_chunks::<4>().0;
+    let is_clear = |i: usize| pixels[i][..3] == clear;
+    let mut seen = vec![false; w * h];
+    let mut cracks = Vec::new();
+    for start in 0..w * h {
+        if seen[start] || !is_clear(start) {
+            continue;
+        }
+        seen[start] = true;
+        let (mut stack, mut area, mut border) = (vec![start], Vec::new(), false);
+        while let Some(i) = stack.pop() {
+            let (x, y) = (i % w, i / w);
+            area.push((x as u32, y as u32));
+            border |= x == 0 || y == 0 || x == w - 1 || y == h - 1;
+            let mut visit = |j: usize| {
+                if !seen[j] && is_clear(j) {
+                    seen[j] = true;
+                    stack.push(j);
+                }
+            };
+            if x > 0 {
+                visit(i - 1);
+            }
+            if x + 1 < w {
+                visit(i + 1);
+            }
+            if y > 0 {
+                visit(i - w);
+            }
+            if y + 1 < h {
+                visit(i + w);
+            }
+        }
+        if !border && area.len() <= MAX_CRACK_PIXELS {
+            cracks.extend(area);
+        }
+    }
+    cracks
+}
+
+/// Renders every crack view of `scene` on one tier at [`CRACK_SIZE`] with the [`CRACK_CLEAR`]
+/// background.
+fn render_cracks(
+    adapter: &wgpu::Adapter,
+    caps: &AdapterCaps,
+    tier: Tier,
+    scene: &Scene,
+) -> Result<Vec<RgbaImage>, String> {
+    let (device, queue, errors) = device_for(adapter, caps, tier)?;
+    let config = RendererConfig {
+        arena_quads: 1 << 20,
+        max_chunk_slots: 1024,
+    };
+    let mut renderer = VoxelRenderer::new(
+        &device,
+        &queue,
+        tier,
+        &config,
+        scene.registry.textures(),
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        CRACK_SIZE,
+    )
+    .map_err(|e| format!("VoxelRenderer::new: {e}"))?;
+    for (pos, mesh) in &scene.meshes {
+        renderer
+            .upsert_chunk(chunk_id(*pos), pos.origin().as_i64vec3(), Arc::clone(mesh))
+            .map_err(|e| format!("upsert {pos:?}: {e}"))?;
+    }
+    let top = DVec3::new(0.0, f64::from(scene.max_height), 0.0);
+    let camera = Camera::default();
+    let mut images = Vec::new();
+    for (_, eye, target) in CRACK_VIEWS {
+        let eye = top + DVec3::from_array(eye);
+        let d = (top + DVec3::from_array(target) - eye).as_vec3();
+        let yaw = (-d.x).atan2(-d.z);
+        let pitch = d.y.atan2(d.x.hypot(d.z));
+        let transform = Transform::from_yaw_pitch(eye, yaw, pitch);
+        let aspect = CRACK_SIZE.x as f32 / CRACK_SIZE.y as f32;
+        let cv = CameraView::compute(&camera, &transform, aspect);
+        let params = ViewParams {
+            clear_color: CRACK_CLEAR,
+            ..ViewParams::from_camera(&cv, &camera, DEFAULT_SKY_COLOR, 0.6)
+        };
+        let (image, _) = render(&device, &queue, &mut renderer, &params)?;
+        images.push(image);
+    }
+    let errors = errors.lock().map(|e| e.clone()).unwrap_or_default();
+    if !errors.is_empty() {
+        return Err(format!("uncaptured errors: {errors:?}"));
+    }
+    Ok(images)
+}
+
+/// No cracks between faces: greedy quads meet in T-junctions, where the rasterizer could leave
+/// single pixels uncovered that show the background through the hollow inside of the terrain
+/// (before the shaders grew every quad by 1/64 of a pixel: 50 to 55 pixels in these 4 views on
+/// every adapter, about 1 in 50 000 terrain pixels).
+/// Every tier renders the terrain from 4 views at 1280x720 that do not see the sides of the
+/// meshed area (where the staircase of its edge can enclose a background pixel for real) and
+/// must show no island of the background color inside the terrain.
+#[test]
+fn terrain_has_no_cracks_on_any_tier() {
+    let (_instance, adapters) = adapters();
+    if adapters.is_empty() {
+        assert!(!gpu_tests_required(), "BOXEL_REQUIRE_GPU=1 but no adapter");
+        eprintln!("skipping: no adapter");
+        return;
+    }
+    let scene = terrain_scene();
+    let mut report = Report::new();
+    let mut rendered = 0;
+    for adapter in &adapters {
+        let caps = AdapterCaps::from_adapter(adapter);
+        let label = adapter_label(&caps);
+        for tier in allowed_tiers(&caps) {
+            let images = match render_cracks(adapter, &caps, tier, &scene) {
+                Ok(images) => images,
+                Err(e) => {
+                    report.fail(format!("{label} {tier} cracks: {e}"), &[]);
+                    continue;
+                }
+            };
+            rendered += 1;
+            for ((view, ..), image) in CRACK_VIEWS.iter().zip(&images) {
+                let cracks = crack_pixels(image, CRACK_CLEAR_SRGB);
+                let pixels = image.data.as_chunks::<4>().0;
+                let background = pixels.iter().filter(|p| p[..3] == CRACK_CLEAR_SRGB).count();
+                let terrain = 1.0 - background as f64 / pixels.len() as f64;
+                eprintln!(
+                    "gpu_terrain: {label} {tier} cracks {view}: {} pixels, terrain {terrain:.3}",
+                    cracks.len()
+                );
+                let name = format!("{label}_{tier}_cracks_{view}");
+                if !cracks.is_empty() {
+                    let first: Vec<_> = cracks.iter().take(8).collect();
+                    report.fail(
+                        format!(
+                            "{label} {tier} {view}: {} crack pixels {first:?}",
+                            cracks.len()
+                        ),
+                        &[(&name, image)],
+                    );
+                }
+                // The views see mostly terrain (the down and steep views nothing else).
+                let least = if matches!(*view, "down" | "steep") {
+                    1.0
+                } else {
+                    0.4
+                };
+                if terrain < least {
+                    report.fail(
+                        format!("{label} {tier} {view}: terrain covers {terrain:.3} < {least}"),
+                        &[(&name, image)],
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        report.failures.is_empty(),
+        "{} failures:\n{}",
+        report.failures.len(),
+        report.failures.join("\n")
+    );
+    assert!(
+        rendered > 0 || !gpu_tests_required(),
+        "BOXEL_REQUIRE_GPU=1 but no tier could render"
+    );
+}
+
 // ---------------------------------------------------------------- lit scenes
 
 /// Chunk columns of the lit scene, in x and z (voxels -64..64).
@@ -839,7 +1051,7 @@ struct LitView {
 
 /// The lit views, rendered in this order. Eye coordinates are multiples of 1/64 (exact in `f64`
 /// at every shift).
-const LIT_VIEWS: [LitView; 7] = [
+const LIT_VIEWS: [LitView; 9] = [
     LitView {
         name: "tree",
         eye: [-43.75, 2.5, -43.5],
@@ -880,6 +1092,19 @@ const LIT_VIEWS: [LitView; 7] = [
         name: "night",
         eye: [-70.5, 30.25, -68.75],
         target: [0.0, 0.0, 0.0],
+        hours: 0.0,
+    },
+    // The -z face of the white lamp at (-12, 1, 18) fills the whole view.
+    LitView {
+        name: "lamp",
+        eye: [-11.5, 1.5, 17.625],
+        target: [-11.5, 1.5, 19.0],
+        hours: 12.0,
+    },
+    LitView {
+        name: "lamp_midnight",
+        eye: [-11.5, 1.5, 17.625],
+        target: [-11.5, 1.5, 19.0],
         hours: 0.0,
     },
 ];
@@ -1017,6 +1242,29 @@ fn check_light(report: &mut Report, label: &str, lit: &[RgbaImage], unlit: &[Rgb
                 (&format!("{label}_lit_overview"), noon),
                 (&format!("{label}_lit_night"), night),
             ],
+        );
+    }
+    // Emissive blocks glow: the white lamp's face is drawn at the full brightness of its
+    // texture (base color 230, 230, 220 with white speckles; a lit face facing -z would keep
+    // 0.65 of it, a mean level near 195), the same at noon, at midnight and without light.
+    let (i, lamp) = image("lamp");
+    let (_, lamp_midnight) = image("lamp_midnight");
+    for (what, other, name) in [
+        ("midnight", lamp_midnight, "lit_lamp_midnight"),
+        ("without light", &unlit[i], "unlit_lamp"),
+    ] {
+        report.check_identical(
+            &format!("{label}: emissive lamp at noon vs {what}"),
+            (&format!("{label}_lit_lamp"), lamp),
+            (&format!("{label}_{name}"), other),
+        );
+    }
+    let glow = mean_level(lamp);
+    eprintln!("gpu_terrain: {label}: lamp mean level {glow:.1}");
+    if glow < 220.0 {
+        report.fail(
+            format!("{label}: lamp mean level {glow:.1} < 220: not glowing"),
+            &[(&format!("{label}_lit_lamp"), lamp)],
         );
     }
     // Shadows: under the tree, the overhang and against the wall (AO) the lit image is darker

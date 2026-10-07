@@ -190,7 +190,7 @@ pub struct WorldStats {
     /// Edit batches whose meshes were held back so they publish together, since start.
     pub edit_batches_held: usize,
     /// Edit batches published in parts because some meshes took longer than
-    /// `WorldSettings::edit_batch_hold_frames`, since start.
+    /// `WorldSettings::edit_batch_hold`, since start.
     pub edit_batches_split: usize,
     /// Chunks remeshed by edits beyond the chunks whose padded region holds the changed voxel
     /// (light and sky changes), since start.

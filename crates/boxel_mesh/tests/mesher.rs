@@ -301,6 +301,58 @@ fn quads_carry_the_texture_layer_of_their_face() {
 }
 
 #[test]
+fn emissive_blocks_flag_their_quads() {
+    let (registry, table) = registry();
+    let stone = block(&registry, "stone");
+    let emitters: Vec<BlockState> = boxel_voxel::LAMPS
+        .iter()
+        .map(|lamp| block(&registry, lamp.short_name()))
+        .chain([block(&registry, "lava")])
+        .collect();
+    for &s in &emitters {
+        assert!(table.emissive(s.0), "{s:?}");
+    }
+    for name in ["stone", "grass", "leaves", "water", "planks"] {
+        assert!(!table.emissive(block(&registry, name).0), "{name}");
+    }
+    assert!(!table.emissive(0) && !table.emissive(u16::MAX));
+    // A stone floor with one emitter of each kind on it, lit and unlit: the emitters' quads,
+    // and only theirs, carry the flag (verify_mesh checks every unit face).
+    let center = chunk_repr(
+        &dense_from(|x, y, z| match (x, y, z) {
+            (_, 0, _) => stone.0,
+            (x, 1, 8) if (2..2 + emitters.len() as i32 * 3).contains(&x) && x % 3 == 2 => {
+                emitters[(x as usize - 2) / 3].0
+            }
+            _ => 0,
+        }),
+        Repr::Packed,
+    );
+    let padded = gathered(&isolated(&center), &table);
+    let light = common::full_light(|x, y, z| {
+        let d = ((x - 8).abs() + (y - 1).abs() + (z - 8).abs()) as u8;
+        LightValue::new(15, 14u8.saturating_sub(d), 0, 0).0
+    });
+    for light in [None, Some(&light)] {
+        let mut mesh = ChunkMesh::default();
+        Mesher::new().mesh(&padded, light, &table, OPTIONS, &mut mesh);
+        verify_mesh(&padded, &table, &mesh);
+        let flagged = mesh.quads.iter().filter(|q| q.is_emissive()).count();
+        assert_eq!(
+            flagged,
+            5 * emitters.len(),
+            "5 faces per emitter (the floor hides one)"
+        );
+        assert!(mesh.quads.iter().all(|q| q.flags() & !1 == 0));
+    }
+    // A table without emitters (from_parts) flags nothing until set_emissive.
+    let mut parts = test_table();
+    assert!(!parts.emissive(OPAQUE[0]));
+    parts.set_emissive(OPAQUE[0], true);
+    assert!(parts.emissive(OPAQUE[0]) && !parts.emissive(OPAQUE[1]));
+}
+
+#[test]
 fn gather_with_uniform_neighbors() {
     let table = test_table();
     let center = chunk_repr(

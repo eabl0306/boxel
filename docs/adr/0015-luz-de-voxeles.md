@@ -1,6 +1,7 @@
 # ADR 0015: luz de vóxeles
 
-- Estado: aceptado (fases P0 a P6 hechas; P7, medir con la máquina libre, y P8, pendientes)
+- Estado: aceptado (fases P0 a P6 hechas, y los arreglos de aspecto de la sección 12; P7,
+  medir con la máquina libre, y P8, pendientes)
 - Fecha: 2026-10-06
 
 ## Contexto
@@ -184,7 +185,8 @@ no recorre 2^45 capas).
 
 ### 6. Malla: `PackedQuad` v2 con paleta de luz (P2, hecho)
 
-- El quad sigue en 8 bytes. `geo` usa sus 4 bits reservados como flags (bits 28 a 31). `mat`
+- El quad sigue en 8 bytes. `geo` usa sus 4 bits reservados como flags (bits 28 a 31; el bit 0,
+  `FLAG_EMISSIVE`, marca los emisores desde la sección 12). `mat`
   pasa a `capa:12 | ao:8 | índice de paleta de luz:12`. Desaparecen los campos cielo, bloque y
   flags de `mat` (`MAT_SKY_SHIFT`, `MAT_BLOCK_SHIFT`, `MAT_FLAGS_SHIFT`); entran
   `GEO_FLAGS_SHIFT = 28`, `MAT_LIGHT_SHIFT = 20` y `MAT_LIGHT_MASK = 0xFFF`.
@@ -259,9 +261,11 @@ de gameplay.
   de chunk se recorren las cáscaras que entran y salen del radio: las que entran piden su luz,
   las que salen la sueltan. `light_cache_radius` es como mucho 32.
 - **Publicación**: una malla igual a la publicada (mismo hash y mismos bytes) no se envía de
-  nuevo. Las mallas de un mismo lote de ediciones salen en el mismo frame: una que llega en el
-  frame N espera al resto hasta el frame N + `edit_batch_hold_frames` (2); si el resto tarda más,
-  sale en ese frame como está (`WorldStats::edit_batches_split`). Los resultados de un lote se
+  nuevo. Las mallas de un mismo lote de ediciones salen en el mismo frame: las que llegan en un
+  frame de tiempo t esperan al resto hasta el primer frame que empieza en t +
+  `edit_batch_hold` (16 ms) o después; si el resto tarda más, salen en ese frame como están
+  (`WorldStats::edit_batches_split`). Hasta el 2026-10-07 la espera era de 2 frames (sección
+  12). Los resultados de un lote se
   aplican antes que los del streaming, fuera del tope de eventos por frame, y sus jobs (y la
   caminata que una edición manda a repetir) mantienen prioridad 0 aunque el viewer se mueva. Dos
   lotes que tocan el mismo chunk se juntan; si el chunk tenía su malla retenida, esa malla ya es
@@ -316,7 +320,8 @@ de gameplay.
   quads o no): un costo fijo de VRAM. Cada tramo de mallas que sube tiene una segunda copia a ese buffer; la entrada de
   cada quad se arma al escribir el buffer temporal (un índice fuera de la paleta lee cielo
   abierto).
-- `ViewUniform` pasa de 240 a 336 bytes (solo `vec4`, std140): `sky_light` (color del cielo por
+- `ViewUniform` pasa de 240 a 336 bytes (352 desde la sección 12; solo `vec4`, std140):
+  `sky_light` (color del cielo por
   luz del día, y piso de ambiente), `light_params` (fuerza del AO, 0.55 por defecto, igual al
   `mix(0.45, 1, ao)` de antes; ganancia de luz de bloque) y `light_curve` (16 niveles).
 - Fragment (`common.wgsl`: `corner_light`, `level_curve`, `voxel_light`, `ao_factor`,
@@ -367,9 +372,10 @@ La luz de bloque se ve igual al mediodía y a medianoche (lo verifica `gpu_terra
 - Emisores de cubo completo en `BlockRegistry::default_blocks` (estados 12 a 16, después de los
   de antes): lámparas naranja (14, 11, 6), roja (14, 2, 2), azul (3, 6, 14) y blanca
   (15, 15, 15), y la lava provisoria (15, 7, 2), opaca y sólida hasta que haya fluidos
-  (`boxel_voxel::LAMPS`, `LAVA_EMISSION`). Cada uno tiene su textura con puntos brillantes. Su
-  cara se ilumina con la luz del vóxel de enfrente (la emisión menos 1): no hay superficies que
-  brillen solas todavía. Las antorchas esperan a las formas que no son cubos.
+  (`boxel_voxel::LAMPS`, `LAVA_EMISSION`). Cada uno tiene su textura con puntos brillantes, de
+  su color. Hasta el 2026-10-07 su cara se iluminaba con la luz del vóxel de enfrente (la
+  emisión menos 1) y no parecía encendida; ahora brilla (sección 12). Las antorchas esperan a
+  las formas que no son cubos.
 - Overlay F3: la luz (cielo y RGB) del vóxel del ojo y del vóxel al que apunta la mira
   (`boxel_debug::CrosshairTarget`, que las apps con picking llenan con la celda delante de la cara
   apuntada), y la hora del reloj. La luz sale de `ChunkMap::light_at` (dentro de
@@ -387,6 +393,79 @@ La luz de bloque se ve igual al mediodía y a medianoche (lo verifica `gpu_terra
 AO desde ocupación en GPU en High y Mid si el gate G1 o las mediciones lo piden; cascadas de
 sombras del sol en High (profundidad con solo `geo`, el cielo horneado como máscara de
 exterior); luces dinámicas en el shader; vidrio teñido.
+
+### 12. Arreglos de aspecto (2026-10-07)
+
+Tres cosas se veían mal después de P7. Las tres se arreglan sin quads nuevos: las mallas tienen
+los mismos quads que antes.
+
+- **Los emisores brillan.** La cara de una lámpara tomaba la luz de la celda de enfrente por el
+  sombreado de cara, como cualquier bloque: no parecía encendida. Ahora el mesher marca los quads
+  de los bloques con emisión con `FLAG_EMISSIVE` (bit 0 de los flags de `geo`;
+  `MaterialTable::emissive`, `PackedQuad::is_emissive`), y `shade_fragment` dibuja esos quads con
+  su textura a brillo pleno: sin luz, sin sombreado de cara y sin AO, como Minecraft dibuja los
+  bloques que brillan. La niebla sigue. La textura de cada lámpara ya es de su color, así que se
+  ve del color de su emisión, de día y de noche. Los demás bloques hacen la misma cuenta que
+  antes, en el mismo orden. El flag no entra en la clave del merge: sale del material, que ya
+  está. Viaja al fragment en el mismo entero que el AO (`VsOut::ao`, bits 8 a 12), sin otro
+  varying.
+- **Lotes de ediciones enteros sin tope de fps.** La espera de la sección 7 era de 2 frames. Sin
+  tope un frame dura menos de medio ms, menos que un job de malla con luz, y en P7 salían
+  partidos 1 a 3 lotes de 20. Ahora es un tiempo: `WorldSettings::edit_batch_hold`, un
+  `Duration` de 16 ms por defecto (`WorldSettings::DEFAULT_EDIT_BATCH_HOLD`), reemplaza a
+  `edit_batch_hold_frames`. Un lote que se completa antes sale apenas llega su última malla, como
+  antes, así que con tope 144 no cambia nada: los lotes se completan en 1 o 2 frames, y uno que
+  se atrasa espera como mucho 3 frames (20.8 ms) en vez de 2. El tiempo es el del frame
+  (`WorldJobs::begin_frame`); los tests lo manejan con un reloj manual.
+- **Sin puntitos de cielo.** Los quads del greedy se tocan en uniones en T: una esquina de un
+  quad cae sobre el borde de otro, en el mismo plano o en la arista de un bloque. El rasterizador
+  redondea cada vértice a su grilla de subpíxel por separado (1/256 de píxel con 8 bits), así que
+  esa esquina puede quedar una fracción de subpíxel fuera del borde. Un centro de píxel que cae
+  en esa rendija no lo cubre ningún quad, y se ve el cielo a través del interior hueco del
+  terreno. Las posiciones ya eran enteras y exactas, y la luz no influye: con la luz apagada
+  salían los mismos puntos. Arreglo: en el vertex shader cada esquina se corre hacia afuera a lo
+  largo de los dos bordes de su quad, en su plano, la distancia que en pantalla mide 1/64 de
+  píxel en esa esquina (`EDGE_GROWTH_PX`), sea cual sea el ángulo. Es unas 3 veces el peor error
+  de redondeo (cerca de 1/180 de píxel) y no se ve. Para caras casi de canto se corta en 1/16 de
+  vóxel (`EDGE_GROWTH_MAX`, que alcanza para 1/64 de píxel a 2048 vóxeles en una vista de 720
+  píxeles de alto) y en un cuarto de la profundidad de la esquina, así una esquina pegada al ojo
+  no lo alcanza. Correrse t vóxeles por un eje mueve el clip t veces la columna de ese eje en
+  `view_proj`, así que no hace falta otra multiplicación de matriz. Las coordenadas de textura se
+  corren igual, y la textura del quad queda exactamente donde estaba; las de luz no (la luz
+  adentro se corre menos de 1/64 de píxel). `ViewUniform` suma `viewport` (el tamaño del destino
+  en píxeles) y pasa de 336 a 352 bytes.
+- **Por qué 1/64 de píxel.** Crecer cuesta, por dos lados: los vecinos se solapan y parte del
+  solape se pinta dos veces, y la cuenta del vertex shader corre en cada esquina. En la RTX,
+  estático a radio 16 sin tope (unos 2230 fps, la GPU al límite), crecer 1/16 de píxel con el
+  ángulo exacto costaba 6.7 % de los fps, y 1/8 de píxel proporcional a la profundidad (una sola
+  multiplicación) 5.5 %. Con 1/64 de píxel el solape ya no se nota: lo que queda es la cuenta
+  (la misma cuenta con crecimiento 0 cuesta lo mismo). Con la cuenta recortada (las
+  coordenadas de luz no se corren) cuesta 2.8 %: 0.448 a 0.461 ms por frame, 0.013 ms. El
+  crecimiento proporcional a la profundidad se descartó porque de canto se achica en pantalla:
+  para cubrir las rendijas a 2 grados necesita 1/8 de píxel de frente, y eso cuesta más que la
+  cuenta exacta. Partir los quads en las uniones en T también lo arreglaba, pero suma quads.
+
+Medido el 2026-10-07 (capturas y scripts en `bench-results/pacing-2026-10-07/visuals/`):
+
+- Puntos de cielo encerrados por terreno, con `examples/snapshot.rs` en la 780M a 1280x720:
+  superficie sin árboles 11 antes y 0 después; vista rasante 4 y 0; las dos vistas del bosque al
+  mediodía de `bench-results/light-look` pierden 9 y 5 islas. Las que quedan en el bosque son
+  huecos de las hojas (están igual antes y después).
+- `gpu_terrain` (test nuevo `terrain_has_no_cracks_on_any_tier`): 4 vistas del terreno a
+  1280x720 sobre fondo magenta. Sin el arreglo, 50 a 55 píxeles de fondo encerrados por tier en
+  la RTX (Vulkan y GL), la 780M y llvmpipe; con el arreglo, 0. Cambian además algunos píxeles de
+  borde entre quads, casi todos en pocos niveles: es el solape.
+- Lámparas: en `gpu_terrain` la cara de la lámpara blanca da la misma imagen al mediodía, a
+  medianoche y sin luz, con nivel medio 232.8 de 255 en todos los adaptadores (175.5 antes).
+- Costo en GPU (`stress`, estático, overworld a radio 16, sin tope, 3 corridas alternadas por
+  versión): en la RTX 2230 a 2168 fps (2.8 %, 0.013 ms por frame), casi todo del crecimiento; las
+  lámparas solas, 0.9 %. En la 780M 594 a 590 fps, dentro del ruido.
+- Lotes de ediciones (RTX, overworld a radio 16, `stress --edits`, 20 ediciones por corrida):
+  sin tope se partían 1 y 2 lotes en dos corridas, y ahora 0 y 0. Como espera el lote entero, el
+  tiempo hasta publicar sube un poco: mediana 1.7 a 1.9 ms, peor 2.6 a 3.1 ms. Frames hasta
+  publicar: mediana 4 antes, 3 y 4 después; peor 5 en todas. En la 780M (600 fps) no se partía
+  ninguno, ni antes ni después. Con tope 144 da lo mismo que antes: 2 frames (13.9 ms) en
+  mediana y en el peor caso, 0 lotes partidos.
 
 ### Fases
 
@@ -536,14 +615,14 @@ Cambios de API que rompen:
   `heap_bytes` cuenta las máscaras construidas.
 - Nuevo crate `boxel_light` (depende solo de `boxel_voxel`).
 - P3: `WorldSettings` suma `light`, `sky_walk_limit`, `light_cache_radius` y
-  `edit_batch_hold_frames`; `WorldContent` suma `light_tables` y `WorldContent::new`;
-  `WorldStats` suma `light_full`, `light_fast`, `sky_columns`, `sky_walks`,
-  `sky_private_generations`, `waiting_sky`, `edit_batches_held`, `edit_batches_split` y
-  `light_fanout`. Nuevos: el recurso `SkyMap`, `ColumnId`, `ChunkMap::light_at`,
-  `ChunkSlot::light` y el módulo `reference`. En `scheduler`, `JobKind::SkyTile` y los jobs se
-  identifican con `JobId` (`Chunk` o `Column`) en lugar de `ChunkId`. `boxel_light` suma
-  `LayerData::AirUntil`. `boxel_world` depende de `boxel_light`. Una malla igual a la publicada
-  ya no genera un `ChunkMeshEvent::Upsert`.
+  `edit_batch_hold_frames` (desde la sección 12, `edit_batch_hold`); `WorldContent` suma
+  `light_tables` y `WorldContent::new`; `WorldStats` suma `light_full`, `light_fast`,
+  `sky_columns`, `sky_walks`, `sky_private_generations`, `waiting_sky`, `edit_batches_held`,
+  `edit_batches_split` y `light_fanout`. Nuevos: el recurso `SkyMap`, `ColumnId`,
+  `ChunkMap::light_at`, `ChunkSlot::light` y el módulo `reference`. En `scheduler`,
+  `JobKind::SkyTile` y los jobs se identifican con `JobId` (`Chunk` o `Column`) en lugar de
+  `ChunkId`. `boxel_light` suma `LayerData::AirUntil`. `boxel_world` depende de `boxel_light`.
+  Una malla igual a la publicada ya no genera un `ChunkMeshEvent::Upsert`.
 - P4: `RendererConfig::clear_color` desaparece; `ViewParams` suma `clear_color` y `light`
   (`SceneLight`), y `ViewParams::from_camera` toma el color del cielo para el fondo y la niebla.
   Nuevos: `SceneLight`, `light_curve`, `LIGHT_LEVELS`, `DEFAULT_SKY_COLOR` y `arena_len` en
@@ -558,6 +637,11 @@ Cambios de API que rompen:
   por `light_len` y `pad`; `light_cache_radius` se limita a 32. `TimeOfDay::set_clock` toma el
   primer tick en la hora pedida o después, y `clock_text` cuenta minutos enteros, así
   `--time HH:MM` muestra `HH:MM`.
+- Arreglos de aspecto (sección 12): `layout::FLAG_EMISSIVE`, `PackedQuad::is_emissive`,
+  `MaterialTable::emissive` y `MaterialTable::set_emissive`; `WorldSettings::edit_batch_hold`
+  (`Duration`) y `WorldSettings::DEFAULT_EDIT_BATCH_HOLD` reemplazan a `edit_batch_hold_frames`;
+  `ViewUniform` suma `viewport` (352 bytes). En WGSL, `VsOut::ao` lleva también los flags (bits 8
+  a 12), y `Decoded` suma `flags` y `grow`.
 - P5: nuevos en `boxel_world`: `TimeOfDay`, `DaylightCurve`, `Daylight`, `SkyKey`,
   `DaylightPlugin` (en `DefaultPlugins`) y las constantes `DEFAULT_TICKS_PER_DAY`,
   `TICKS_PER_SECOND` y `SUNRISE_HOUR`.
@@ -605,11 +689,11 @@ Tests que lo vigilan:
   límite de la caminata corta un pozo más hondo; una plataforma a +5000 sombrea el suelo y al
   descargarse se lleva la sombra; contenido debajo del piso cierra en el piso las columnas
   abiertas (y al quitarlo vuelven a abrirse); un lote de ediciones sale en un frame, o en partes
-  pasado `edit_batch_hold_frames`; una segunda edición de un chunk retenido sale en el mismo
-  frame que la primera; las ediciones pasan delante de una cola de mallas del streaming; la caché
-  de luz sigue a un viewer que avanza 17 chunks (y cavar allá remalla solo el chunk); los chunks
-  de puro aire cerca del viewer guardan su luz; el mismo mundo en x = 2^40, y = -2^40 da los
-  mismos bits.
+  pasado `edit_batch_hold` (con un reloj manual: frames de 1, 10 y 33 ms; con espera 0 nada se
+  retiene); una segunda edición de un chunk retenido sale en el mismo frame que la primera; las
+  ediciones pasan delante de una cola de mallas del streaming; la caché de luz sigue a un viewer
+  que avanza 17 chunks (y cavar allá remalla solo el chunk); los chunks de puro aire cerca del
+  viewer guardan su luz; el mismo mundo en x = 2^40, y = -2^40 da los mismos bits.
 - `boxel_world/src/streaming/tests/sky.rs`: las caminatas esperan los datos cargados y no
   generan nada; una caminata que leyó contenido editado se repite; un chunk editado que se
   descarga devuelve su columna a una caminata; generadores sin tope o vacíos; viewers a 2^35
@@ -620,7 +704,8 @@ Tests que lo vigilan:
   capas capturadas, el vacío y el contenido fuera del generador.
 - `boxel_world/tests/integration.rs`: cada malla del terreno real, también después de editar,
   igual a la de `Reference`; `light_at` lee la caché.
-- `boxel_shaders/tests/naga.rs` (P4): las constantes de `LightValue` en WGSL, `View` de 336 B,
+- `boxel_shaders/tests/naga.rs` (P4): las constantes de `LightValue` en WGSL, `View` de 336 B
+  (352 desde la sección 12, con `FLAG_EMISSIVE` igual al de `boxel_mesh`),
   `light_base` en el offset 52, Low con dos atributos de instancia `Uint32x2` y un solo uniform
   block; High y Mid con un atributo. `boxel_gfx/tests/policy.rs`: todo tier pide 2 vertex
   buffers y con 1 no clasifica.
@@ -630,7 +715,10 @@ Tests que lo vigilan:
   idénticos en High, Mid y Low y en cada posición de `FAR_SHIFTS`, donde las mallas salen iguales
   byte a byte; la cueva es igual al mediodía y a medianoche; la noche tiene como mucho la mitad
   del brillo del día; la cueva tiene píxeles rojos y azules; bajo el árbol, el alero y junto a la
-  pared la imagen es más oscura que sin luz ni AO.
+  pared la imagen es más oscura que sin luz ni AO. Desde la sección 12, 9 vistas: la cara de la
+  lámpara blanca brilla igual al mediodía, a medianoche y sin luz; y un tercer test busca grietas
+  en 4 vistas del terreno a 1280x720 (ninguna en ningún tier). `boxel_mesh/tests/mesher.rs`: los
+  quads de cada emisor, y solo esos, llevan `FLAG_EMISSIVE`.
 - `boxel_render` (unitarios): el smoke test de cada tier dibuja un quad opaco con luz azul
   (entrada 0) bajo un quad cutout más chico con luz roja (entrada 1), y falla si el centro no
   sale rojo o una esquina no sale azul (así cada quad recibe su entrada también en GL, donde el

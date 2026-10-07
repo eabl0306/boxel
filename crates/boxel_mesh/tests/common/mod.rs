@@ -175,9 +175,9 @@ pub fn class_at(padded: &PaddedChunk, x: i32, y: i32, z: i32) -> VoxelClass {
 }
 
 /// Checks a mesh against its padded input: counts match the quads, opaque buckets hold their
-/// own face, quads stay inside the chunk and never overlap, every unit face has the bucket and
-/// texture layer of the material of its voxel, and the expanded unit faces equal the
-/// brute-force oracle. Returns the number of unit faces.
+/// own face, quads stay inside the chunk and never overlap, every unit face has the bucket,
+/// texture layer and emissive flag of the material of its voxel (no other flag is set), and the
+/// expanded unit faces equal the brute-force oracle. Returns the number of unit faces.
 pub fn verify_mesh(padded: &PaddedChunk, table: &MaterialTable, mesh: &ChunkMesh) -> usize {
     assert_eq!(
         mesh.bucket_counts.iter().sum::<u32>(),
@@ -210,6 +210,12 @@ pub fn verify_mesh(padded: &PaddedChunk, table: &MaterialTable, mesh: &ChunkMesh
                     table.layer(material, face),
                     "unit face {p:?} {face:?} does not carry the layer of material {material}"
                 );
+                assert_eq!(
+                    quad.is_emissive(),
+                    table.emissive(material),
+                    "unit face {p:?} {face:?}: emissive flag of material {material}"
+                );
+                assert_eq!(quad.flags() & !1, 0, "{quad:?}: undefined flag bits");
                 assert!(got.insert((p, face)), "overlapping quads at {p:?} {face:?}");
             }
         }

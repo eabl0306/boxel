@@ -176,8 +176,8 @@ struct EditBatch {
     members: Vec<ChunkId>,
     /// Fresh results waiting for the rest.
     held: Vec<MeshedResult>,
-    /// Frames since the first result was held.
-    held_frames: Option<u32>,
+    /// Frame time ([`WorldJobs::begin_frame`]) of the frame that held the first result.
+    held_since: Option<Instant>,
     /// Frames since the batch was opened.
     age: u32,
 }
@@ -547,8 +547,15 @@ pub(crate) struct WorldJobs {
     mesh_options: MeshOptions,
     /// `WorldSettings::light_cache_radius`, squared (every frame).
     light_cache_sq: u32,
-    /// `WorldSettings::edit_batch_hold_frames` (every frame).
-    hold_frames: u32,
+    /// `WorldSettings::edit_batch_hold` (every frame).
+    hold: Duration,
+    /// Time of the current frame (given to [`WorldJobs::begin_frame`]): the clock of the edit
+    /// batch hold.
+    now: Instant,
+    /// Tests: the time [`WorldJobs::clock_now`] gives the world plugin's frames instead of the
+    /// real clock.
+    #[cfg(test)]
+    pub(crate) manual_clock: Option<Instant>,
     /// Open edit batches by id.
     batches: BTreeMap<u32, EditBatch>,
     /// Id of the next edit batch.
@@ -612,7 +619,10 @@ impl WorldJobs {
             mesh_options: MeshOptions::default(),
             // `WorldSettings::default()` until the first `begin_frame`.
             light_cache_sq: 8 * 8,
-            hold_frames: 2,
+            hold: WorldSettings::DEFAULT_EDIT_BATCH_HOLD,
+            now: Instant::now(),
+            #[cfg(test)]
+            manual_clock: None,
             batches: BTreeMap::new(),
             next_batch: 0,
             light_counts: WorldStats::default(),
@@ -1326,9 +1336,11 @@ impl WorldJobs {
                     }
                     let batch = self.batches.entry(b).or_default();
                     batch.members.extend(merged.members);
-                    if !merged.held.is_empty() {
-                        batch.held_frames = batch.held_frames.max(merged.held_frames);
-                    }
+                    // The batch waits from the oldest held result of the two.
+                    batch.held_since = match (batch.held_since, merged.held_since) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
                     batch.held.extend(merged.held);
                 }
             }
@@ -1383,20 +1395,21 @@ impl WorldJobs {
     }
 
     /// Frame step of the open batches, after the frame's results were applied: a batch whose
-    /// first result was held `edit_batch_hold_frames` frames ago is published as it is (a
-    /// result held in frame `N` waits for the rest through frame `N + hold`, and goes out then
-    /// at the latest); one that never got a result is closed after [`STALE_BATCH_FRAMES`].
+    /// first result was held `edit_batch_hold` or more before this frame's time is published as
+    /// it is (a result held in a frame of time `t` waits for the rest until the first frame at
+    /// `t + hold` or later, and goes out then at the latest); one that never got a result is
+    /// closed after [`STALE_BATCH_FRAMES`]. The hold is a time, not a frame count: without a
+    /// frame cap a frame can last a fraction of a millisecond, less than one mesh job.
     fn age_batches(&mut self, cx: &mut Ctx<'_>) {
-        let hold = self.hold_frames;
+        let (hold, now) = (self.hold, self.now);
         let due: Vec<(u32, bool)> = self
             .batches
             .iter_mut()
             .filter_map(|(&b, batch)| {
                 batch.age += 1;
-                match &mut batch.held_frames {
-                    Some(frames) => {
-                        *frames += 1;
-                        (*frames > hold).then_some((b, true))
+                match batch.held_since {
+                    Some(since) => {
+                        (now.saturating_duration_since(since) >= hold).then_some((b, true))
                     }
                     None => (batch.age > STALE_BATCH_FRAMES).then_some((b, false)),
                 }
@@ -1441,7 +1454,7 @@ impl WorldJobs {
         };
         batch.held.remove(i);
         if batch.held.is_empty() {
-            batch.held_frames = None;
+            batch.held_since = None;
         }
         batch.members.push(id);
         cx.map.set_mesh_and_pending(id, MeshState::Queued, false);
@@ -1743,13 +1756,24 @@ impl WorldJobs {
 
     // ---- Jobs --------------------------------------------------------------------------------
 
+    /// The time of a frame starting now: the real clock, or a test's `manual_clock`.
+    pub(crate) fn clock_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = self.manual_clock {
+            return now;
+        }
+        Instant::now()
+    }
+
     /// Frame bookkeeping before the job step: measures the frame interval, applies the
     /// in-flight cap (`settings.max_jobs_in_flight`, or the automatic one when it is 0) and takes
-    /// the mesher options of the jobs it starts.
+    /// the mesher options of the jobs it starts. `now` is the frame's time: the edit batch hold
+    /// is measured with it.
     pub(crate) fn begin_frame(&mut self, settings: &WorldSettings, now: Instant) {
         self.mesh_options = MeshOptions::with_ao(settings.ao_policy);
         self.light_cache_sq = light_cache_radius(settings).pow(2);
-        self.hold_frames = settings.edit_batch_hold_frames;
+        self.hold = settings.edit_batch_hold;
+        self.now = now;
         self.auto_cap.observe_frame(now);
         let cap = match settings.max_jobs_in_flight {
             0 => self.auto_cap.cap(),
@@ -2491,7 +2515,7 @@ impl WorldJobs {
             return;
         }
         // Part of an edit batch: wait for the rest of it.
-        if self.hold_frames > 0
+        if !self.hold.is_zero()
             && let Some(b) = slot.batch
             && let Some(batch) = self.batches.get_mut(&b)
         {
@@ -2501,7 +2525,7 @@ impl WorldJobs {
             if batch.members.is_empty() {
                 self.flush_batch(cx, b, false);
             } else if first {
-                batch.held_frames = Some(0);
+                batch.held_since = Some(self.now);
                 self.light_counts.edit_batches_held += 1;
             }
             return;

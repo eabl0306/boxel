@@ -1,7 +1,7 @@
 // boxel: shared voxel shader code (all tiers). Prepended to voxel_pull.wgsl, voxel_instanced.wgsl and cull.wgsl.
 //
 // PackedQuad = vec2<u32>(geo, mat), 8 bytes, identical bytes on every tier.
-//   geo: x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | flags:4 (none defined yet)
+//   geo: x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | flags:4 (bit 0 = FLAG_EMISSIVE)
 //   mat: layer:12 | ao:8 (2 bits per corner, 3 = unoccluded) | light:12 (index into the chunk's
 //        light palette)
 // face: 0=+Y 1=-Y 2=+X 3=-X 4=+Z 5=-Z  (u,v axes: ±Y -> (X,Z), ±X -> (Z,Y), ±Z -> (X,Y))
@@ -35,6 +35,8 @@ const GEO_W_SHIFT: u32 = 15u;
 const GEO_H_SHIFT: u32 = 20u;
 const GEO_FACE_SHIFT: u32 = 25u;
 const GEO_FLAGS_SHIFT: u32 = 28u;
+// Flag of a quad whose block emits light: drawn at the full brightness of its texture.
+const FLAG_EMISSIVE: u32 = 1u;
 const MAT_LAYER_MASK: u32 = 0xFFFu;
 const MAT_AO_SHIFT: u32 = 12u;
 const MAT_LIGHT_SHIFT: u32 = 20u;
@@ -59,6 +61,7 @@ struct View {
   sky_light: vec4<f32>,            // rgb = sky light color times the daylight intensity (linear), a = ambient floor
   light_params: vec4<f32>,         // x = AO strength (0.55: the darkest corner keeps 45 %), y = block-light gain, zw = 0
   light_curve: array<vec4<f32>, 4>, // brightness of light levels 0..15 (level 4k + j at [k][j]; level 15 = 1)
+  viewport: vec4<f32>,             // xy = render target size in pixels, zw = 0
 };
 
 struct ChunkGpu {                  // 64 bytes, mirrors boxel_shaders::gpu::ChunkGpu
@@ -79,7 +82,7 @@ struct VsOut {
   @location(3) view_dist: f32,
   @location(4) st: vec2<f32>,                       // quad-local (s, t): corner k sits at (k & 1, k >> 1)
   @location(5) @interpolate(flat) light: vec2<u32>, // the quad's light palette entry (4 corner lights)
-  @location(6) @interpolate(flat) ao: u32,          // the quad's AO byte (corner k at bits 2k..2k+2)
+  @location(6) @interpolate(flat) ao: u32,          // the quad's AO byte (corner k at bits 2k..2k+2), then its 4 flags (bits 8..12; FLAG_EMISSIVE)
 };
 
 struct Decoded {
@@ -90,6 +93,8 @@ struct Decoded {
   layer: u32,
   light: vec2<u32>,
   ao: u32,
+  flags: u32,
+  grow: vec2<f32>,                 // the corner's outward direction along u and v (-1 or 1)
 };
 
 fn face_normal(f: u32) -> vec3<f32> {
@@ -138,21 +143,62 @@ fn decode_quad(q: vec2<u32>, light: vec2<u32>, corner_in: u32) -> Decoded {
   o.layer = mat & MAT_LAYER_MASK;
   o.light = light;
   o.ao = (mat >> MAT_AO_SHIFT) & 0xFFu;
+  o.flags = (geo >> GEO_FLAGS_SHIFT) & 15u;
+  o.grow = vec2(2.0 * cu - 1.0, 2.0 * cv - 1.0);
   return o;
+}
+
+// Edge growth: no cracks at T-junctions. Greedy quads meet in T-junctions (a corner of one quad
+// lies on an edge of another, on the same plane or on the edge of a block). The rasterizer snaps
+// every vertex to its sub-pixel grid on its own, so such a corner can land a fraction of a
+// sub-pixel off that edge, and a pixel center in the sliver between them is covered by neither
+// quad: a one-pixel crack that shows the sky through the hollow inside of the terrain. Every
+// corner moves outward along its quad's two edge directions, in the quad's plane, by the world
+// distance that spans EDGE_GROWTH_PX pixels on screen at that corner, whatever the angle: about
+// 3 times the worst snapping error (about 1/180 of a pixel with 8 sub-pixel bits), far too
+// little to see. It is kept that small because it costs: neighbors overlap by that much, and
+// some of the overlap is shaded twice (on the RTX 5050 growing 1/16 to 1/8 of a pixel cost 5 to
+// 7 % of the GPU frame; at 1/64 only the math below is left, under 3 %). The texture coordinates move with the corner, so the texture inside
+// the quad maps exactly as before; the light coordinates do not (cheaper, and the light inside
+// moves by less than EDGE_GROWTH_PX pixels). Seen almost edge-on a direction needs a long
+// distance for that: it stops at EDGE_GROWTH_MAX voxels (enough for 1/64 of a pixel at 2048
+// voxels in a 720-pixel-high view).
+const EDGE_GROWTH_PX: f32 = 0.015625;
+const EDGE_GROWTH_MAX: f32 = 0.0625;
+
+// The world distances along two axes whose clip-space steps per voxel are `axis_u` and `axis_v`
+// (columns of view_proj) that move the point at `clip` by EDGE_GROWTH_PX pixels on screen;
+// `half_px` is half the render target size in pixels. Each is at most EDGE_GROWTH_MAX and a
+// quarter of the point's depth (w), so a corner near the eye cannot reach the eye; both are 0 at
+// or behind the eye.
+fn edge_growth(clip: vec4<f32>, axis_u: vec4<f32>, axis_v: vec4<f32>, half_px: vec2<f32>) -> vec2<f32> {
+  // d(ndc.xy)/dt = n / w^2 (pixels per voxel), so the distance is EDGE_GROWTH_PX * w^2 / |n|
+  let nu = (axis_u.xy * clip.w - clip.xy * axis_u.w) * half_px;
+  let nv = (axis_v.xy * clip.w - clip.xy * axis_v.w) * half_px;
+  let n2 = max(vec2(dot(nu, nu), dot(nv, nv)), vec2(1e-20));
+  let t = min((EDGE_GROWTH_PX * clip.w * clip.w) * inverseSqrt(n2), vec2(min(EDGE_GROWTH_MAX, 0.25 * clip.w)));
+  return select(vec2(0.0), t, clip.w > 0.0);
 }
 
 fn finish_vertex(d: Decoded, chunk_origin: vec3<i32>, view: View) -> VsOut {
   // wrapping i32 subtraction first: exact for any world position (see the top), then small floats
   let rel = vec3<f32>(chunk_origin - view.render_origin.xyz) + d.local;
+  let clip = view.view_proj * vec4(rel, 1.0);
+  // Edge growth (above). Moving t voxels along a world axis moves clip by t times that axis's
+  // column of view_proj.
+  let axis_u = select(view.view_proj[0], view.view_proj[2], d.face == 2u || d.face == 3u);
+  let axis_v = select(view.view_proj[1], view.view_proj[2], d.face < 2u);
+  let t = d.grow * edge_growth(clip, axis_u, axis_v, 0.5 * view.viewport.xy);
   var o: VsOut;
-  o.clip = view.view_proj * vec4(rel, 1.0);
-  o.uv = d.uv;
+  o.clip = clip + axis_u * t.x + axis_v * t.y;
+  // side faces: the texture's v points down (decode_quad)
+  o.uv = d.uv + vec2(t.x, select(t.y, -t.y, d.face >= 2u));
   o.layer = d.layer;
   o.face = d.face;
   o.view_dist = length(rel - view.camera_rel.xyz);
   o.st = d.st;
   o.light = d.light;
-  o.ao = d.ao;
+  o.ao = d.ao | (d.flags << 8u);
   return o;
 }
 
@@ -205,9 +251,13 @@ fn ao_factor(i: VsOut, view: View) -> f32 {
 }
 
 // albedo * face shade * AO * light, then fog. At sky 15 under a white noon sky with AO open
-// this is albedo * face shade: the look before light.
+// this is albedo * face shade: the look before light. Emissive quads (lamps, lava) glow as in
+// Minecraft: their albedo at full brightness, with no face shade, AO or light, then fog.
 fn shade_fragment(albedo: vec4<f32>, i: VsOut, view: View) -> vec4<f32> {
-  let lit = albedo.rgb * (face_shade(i.face) * ao_factor(i, view)) * voxel_light(i, view);
+  var lit = albedo.rgb;
+  if (((i.ao >> 8u) & FLAG_EMISSIVE) == 0u) {
+    lit = albedo.rgb * (face_shade(i.face) * ao_factor(i, view)) * voxel_light(i, view);
+  }
   let fog = clamp((i.view_dist - view.fog_params.x) / max(view.fog_params.y - view.fog_params.x, 1.0), 0.0, 1.0);
   return vec4(mix(lit, view.fog_color.rgb, fog), 1.0);
 }
