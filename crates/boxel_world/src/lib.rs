@@ -61,6 +61,7 @@ pub(crate) struct NoSpan;
 
 mod budget;
 mod daylight;
+pub mod fluid;
 mod interest;
 mod map;
 mod plugin;
@@ -73,11 +74,13 @@ pub mod jobs;
 pub mod persist;
 pub mod reference;
 pub mod scheduler;
+pub mod ticks;
 
 pub use daylight::{
     DEFAULT_TICKS_PER_DAY, Daylight, DaylightCurve, DaylightPlugin, SUNRISE_HOUR, SkyKey,
     TICKS_PER_SECOND, TimeOfDay,
 };
+pub use fluid::FluidPlugin;
 pub(crate) use map::CachedLight;
 pub use map::{ChunkId, ChunkMap, ChunkSlot, DataState, Interest, MeshState, WorldStats};
 pub use plugin::{
@@ -85,6 +88,10 @@ pub use plugin::{
     WorldPlugin, WorldSettings, WorldSystems,
 };
 pub use sky::{ColumnId, SkyMap};
+pub use ticks::{
+    BlockTickSettings, BlockTickStats, BlockTicks, BlockTicksPlugin, GAME_TICKS_PER_SECOND,
+    TickContext, TickHandler,
+};
 
 /// Common items.
 pub mod prelude {
