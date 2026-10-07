@@ -441,9 +441,8 @@ impl CpuCull {
 /// The visible non-empty translucent buckets, back to front: every tier draws them from this
 /// list, in this order, so blending gives the same pixels on all of them. Same window and
 /// frustum tests as [`CpuCull::run`]; sorted by the squared distance from the eye to the chunk's
-/// center, farthest first, ties by slot. Only the chunks are sorted: inside a bucket the quads
-/// keep the mesher's order (face buckets, then greedy order), so two translucent surfaces of
-/// one chunk can blend in the wrong order (ADR 0018).
+/// center, farthest first, ties by slot. Inside a bucket the quads are drawn in arena order,
+/// which `crate::sort` keeps back to front for the camera (ADR 0018).
 pub(crate) fn translucent_draws(chunks: &ChunkTable, view: &ViewParams, out: &mut Vec<BucketDraw>) {
     let mut keyed: Vec<(f32, BucketDraw)> = Vec::new();
     for (slot, record) in chunks.iter_translucent() {

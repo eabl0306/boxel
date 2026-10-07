@@ -14,8 +14,8 @@
 use crate::overlay::{OverlayDraw, OverlayPass, OverlayRect};
 use crate::{
     BlockTextureData, DEFAULT_SKY_COLOR, RendererConfig, RendererSmokeTest, SceneLight,
-    TextureReport, TextureSource, ViewParams, VoxelRenderer, generate_block_textures, light_curve,
-    load_block_textures,
+    TextureReport, TextureSource, TranslucentSort, ViewParams, VoxelRenderer,
+    generate_block_textures, light_curve, load_block_textures,
 };
 use boxel_app::{App, Last, MainScheduleOrder, Plugin, Shutdown, Time};
 use boxel_camera::{Camera, CameraView};
@@ -103,6 +103,10 @@ pub struct RenderSettings {
     /// Where block texture pixels come from: procedural (the default) or a Minecraft resource
     /// pack directory, read once when the first GPU is selected ([`RenderInfo::textures`]).
     pub textures: TextureSource,
+    /// How the translucent quads inside each chunk are sorted back to front (ADR 0018). Default
+    /// [`TranslucentSort::Background`]: on the async compute pool, applied a frame or so later.
+    /// Read every frame.
+    pub translucent_sort: TranslucentSort,
 }
 
 impl Default for RenderSettings {
@@ -122,6 +126,7 @@ impl Default for RenderSettings {
             max_chunk_slots: 32768,
             render_when_hidden: false,
             textures: TextureSource::Procedural,
+            translucent_sort: TranslucentSort::default(),
         }
     }
 }
@@ -201,6 +206,9 @@ pub struct RenderInfo {
     /// Draw calls recorded last frame (`RenderStats::draws`: Mid/Low one per visible bucket;
     /// High its 2 indirect multi-draws, opaque + cutout).
     pub draws: u32,
+    /// Translucent buckets re-sorted for the camera and uploaded since the renderer was built
+    /// (`RenderStats::translucent_sorts`).
+    pub translucent_sorts: u32,
     /// Device losses recovered from.
     pub recoveries: u32,
     /// `RenderStats::dropped_chunks` (arena or chunk table full; warn-logged).
@@ -577,6 +585,7 @@ struct ExtractedFrame {
     light: SceneLight,
     fog_start_fraction: f32,
     render_when_hidden: bool,
+    translucent_sort: TranslucentSort,
     /// Full resync: `meshes` holds every ready mesh, `renderer.clear_chunks` runs first.
     resync: bool,
     meshes: Vec<MeshOp>,
@@ -917,6 +926,7 @@ fn bootstrap(p: &mut SetupParams) {
     let config = RendererConfig {
         arena_quads: settings.arena_quads,
         max_chunk_slots: settings.max_chunk_slots,
+        translucent_sort: settings.translucent_sort,
     };
     let present = p.present.mode;
     let built = VoxelRenderer::new(
@@ -1246,6 +1256,7 @@ fn extract(
     );
     frame.fog_start_fraction = settings.fog_start_fraction;
     frame.render_when_hidden = settings.render_when_hidden;
+    frame.translucent_sort = settings.translucent_sort;
     frame
         .screenshots
         .extend(screenshots.read().map(|r| r.path.clone()));
@@ -1310,6 +1321,7 @@ fn prepare(
         ready.renderer.clear_chunks();
         ready.resync = false;
     }
+    ready.renderer.set_translucent_sort(frame.translucent_sort);
     for op in frame.meshes.drain(..) {
         let result = match op {
             MeshOp::Upsert { id, origin, mesh } => {
@@ -1589,6 +1601,7 @@ fn cleanup(
             let stats = ready.renderer.stats();
             info.chunks = stats.chunks;
             info.draws = stats.draws;
+            info.translucent_sorts = stats.translucent_sorts;
             info.dropped_chunks = stats.dropped_chunks;
             info.arena_used_quads = stats.arena_used_quads;
             info.arena_capacity_quads = stats.arena_capacity_quads;
@@ -1777,6 +1790,7 @@ mod tests {
             visible_chunks: 2,
             draws: 5,
             dropped_chunks: 1,
+            ..crate::RenderStats::default()
         };
         assert_eq!(
             render_line(Tier::Mid, &stats),

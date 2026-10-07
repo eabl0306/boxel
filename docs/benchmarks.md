@@ -71,7 +71,10 @@ dispositivo pueden recortarlos), y `tools/bench_report.py` solo compara corridas
 de vidrio en la superficie de una de cada 29 columnas de agua: chunks con quads translúcidos para
 medir el pase translúcido y su orden (ADR 0018). El forest tiene la superficie entre 16 y 112, así
 que `--water 62` cubre más o menos la mitad. El resumen anota el mundo como `forest+water62` y
-`tools/bench_report.py` no lo mezcla con el forest seco.
+`tools/bench_report.py` no lo mezcla con el forest seco. `--sort off` deja los quads translúcidos
+de cada chunk en el orden del mesher (`TranslucentSort::Off`); el resumen no lo anota, así que
+conviene ponerlo en `--label`. La corrida imprime cuántos buckets translúcidos reordenó mientras
+medía.
 
 `--light off` apaga la luz de vóxeles y la oclusión ambiental: el mundo se ve y cuesta como antes
 de la luz (por defecto es `on`). El resumen lo anota y `tools/bench_report.py` no mezcla corridas

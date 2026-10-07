@@ -8,9 +8,13 @@
 //! Mid read at `ChunkGpu::light_base`. Low has no storage buffers: there each quad's palette
 //! entry is written, expanded, at the quad's own offset in a second buffer parallel to the arena
 //! (its second instance attribute).
+//!
+//! A re-sorted translucent bucket (`crate::sort`) goes the same way: its permuted quads over the
+//! bucket's own range, after the meshes of the frame (a mesh uploaded in the same frame is
+//! written first), and on Low their expanded light over the same range of the light buffer.
 use crate::arena::QUAD_BYTES;
 use crate::chunk_table::ChunkTable;
-use boxel_mesh::{ChunkMesh, FULL_SKY_ENTRY, PackedQuad, PaletteEntry};
+use boxel_mesh::{ChunkMesh, FULL_SKY_ENTRY, PackedQuad, PaletteEntry, TRANSLUCENT_BUCKET};
 use boxel_shaders::gpu::ChunkGpu;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -73,6 +77,17 @@ impl PendingMesh {
     }
 }
 
+/// A re-sorted translucent bucket waiting for its upload.
+#[derive(Debug)]
+struct PendingSorted {
+    /// First arena quad of the chunk's translucent bucket.
+    offset: u32,
+    /// The mesh the quads come from (its palette lights them on Low).
+    mesh: Arc<ChunkMesh>,
+    /// The bucket's quads, back to front.
+    quads: Vec<PackedQuad>,
+}
+
 /// One copy into the arena, the Low light buffer or the chunk table.
 #[derive(Clone, Debug)]
 enum Piece {
@@ -82,6 +97,10 @@ enum Piece {
     LowLight(Range<usize>),
     /// Chunk table slots.
     Slots(Range<u32>),
+    /// `sorted_pending[i]`: a translucent bucket in its new order.
+    Sorted(usize),
+    /// The light of `sorted_pending[i]` in the Low light buffer.
+    SortedLowLight(usize),
 }
 
 /// The buffers the copies go to.
@@ -102,8 +121,12 @@ pub(crate) struct Uploads {
     /// replaces it: its arena range may belong to another chunk by then. So every pending range
     /// is the current, live range of its chunk, and no two of them overlap.
     meshes: HashMap<u64, PendingMesh, foldhash::fast::FixedState>,
+    /// The newest re-sorted translucent bucket of each chunk id (the same rules as `meshes`).
+    sorted: HashMap<u64, PendingSorted, foldhash::fast::FixedState>,
     /// Scratch: the pending meshes in arena order.
     pending: Vec<PendingMesh>,
+    /// Scratch: the pending sorted buckets in arena order.
+    sorted_pending: Vec<PendingSorted>,
     /// Scratch: stale table runs.
     runs: Vec<Range<u32>>,
     /// Scratch: copies of the frame, with their bytes.
@@ -121,18 +144,35 @@ pub(crate) struct Uploads {
 impl Uploads {
     /// Queues the quads of `mesh` for the arena range starting at quad `offset`, the new range of
     /// chunk `id`.
+    /// A sorted bucket of the chunk's previous mesh no longer applies.
     pub fn mesh(&mut self, id: u64, offset: u32, mesh: Arc<ChunkMesh>) {
         self.meshes.insert(id, PendingMesh { offset, mesh });
+        self.sorted.remove(&id);
+    }
+
+    /// Queues `quads`, the translucent bucket of chunk `id`'s current `mesh` in a new order, for
+    /// the bucket's arena range starting at quad `offset`. Written after any pending mesh.
+    pub fn sorted(&mut self, id: u64, offset: u32, mesh: Arc<ChunkMesh>, quads: Vec<PackedQuad>) {
+        self.sorted.insert(
+            id,
+            PendingSorted {
+                offset,
+                mesh,
+                quads,
+            },
+        );
     }
 
     /// Drops the pending mesh of a removed chunk.
     pub fn forget(&mut self, id: u64) {
         self.meshes.remove(&id);
+        self.sorted.remove(&id);
     }
 
     /// Drops every pending mesh (the arena was reset).
     pub fn clear(&mut self) {
         self.meshes.clear();
+        self.sorted.clear();
     }
 
     /// True once after a flush that could not record all its copies (a staging buffer could not
@@ -163,7 +203,7 @@ impl Uploads {
         if targets.table.is_none() {
             self.runs.clear();
         }
-        if self.meshes.is_empty() && self.runs.is_empty() {
+        if self.meshes.is_empty() && self.sorted.is_empty() && self.runs.is_empty() {
             return;
         }
         debug_assert!(
@@ -174,6 +214,16 @@ impl Uploads {
                 })
             }),
             "a pending mesh is not the current range of a live chunk"
+        );
+        debug_assert!(
+            self.sorted.iter().all(|(&id, sorted)| {
+                chunks.get(id).is_some_and(|(_, r)| {
+                    let start: u32 = r.counts[..TRANSLUCENT_BUCKET].iter().sum();
+                    r.alloc.offset + start == sorted.offset
+                        && r.counts[TRANSLUCENT_BUCKET] as usize == sorted.quads.len()
+                })
+            }),
+            "a pending sorted bucket is not the current translucent range of a live chunk"
         );
         self.pending
             .extend(self.meshes.drain().map(|(_, mesh)| mesh));
@@ -196,6 +246,18 @@ impl Uploads {
             let bytes = u64::from(slots.end - slots.start) * ENTRY_BYTES;
             (Piece::Slots(slots.clone()), bytes)
         }));
+        // After the meshes: a bucket sorted from a mesh uploaded this frame overwrites it.
+        self.sorted_pending
+            .extend(self.sorted.drain().map(|(_, sorted)| sorted));
+        self.sorted_pending
+            .sort_unstable_by_key(|sorted| sorted.offset);
+        for (i, sorted) in self.sorted_pending.iter().enumerate() {
+            let bytes = sorted.quads.len() as u64 * QUAD_BYTES;
+            self.pieces.push((Piece::Sorted(i), bytes));
+            if targets.low_light.is_some() {
+                self.pieces.push((Piece::SortedLowLight(i), bytes));
+            }
+        }
 
         let mut start = 0;
         while start < self.pieces.len() {
@@ -204,6 +266,7 @@ impl Uploads {
             start = end;
         }
         self.pending.clear();
+        self.sorted_pending.clear();
     }
 
     /// One staging buffer with `pieces[batch]`, and their copies.
@@ -268,6 +331,12 @@ impl Uploads {
                             .extend(slots.clone().map(|slot| chunks.gpu_entry_at(slot)));
                         put(bytemuck::cast_slice(&self.entries));
                     }
+                    Piece::Sorted(i) => put(bytemuck::cast_slice(&self.sorted_pending[*i].quads)),
+                    Piece::SortedLowLight(i) => {
+                        let sorted = &self.sorted_pending[*i];
+                        quad_light(&sorted.mesh, &sorted.quads, &mut self.low_words);
+                        put(bytemuck::cast_slice(&self.low_words));
+                    }
                 }
             }
         }
@@ -284,6 +353,14 @@ impl Uploads {
                     u64::from(self.pending[range.start].offset) * QUAD_BYTES,
                 ),
                 Piece::Slots(slots) => (targets.table, u64::from(slots.start) * ENTRY_BYTES),
+                Piece::Sorted(i) => (
+                    Some(targets.arena),
+                    u64::from(self.sorted_pending[*i].offset) * QUAD_BYTES,
+                ),
+                Piece::SortedLowLight(i) => (
+                    targets.low_light,
+                    u64::from(self.sorted_pending[*i].offset) * QUAD_BYTES,
+                ),
             };
             if let Some(dst) = dst {
                 encoder.copy_buffer_to_buffer(&staging, src, dst, offset, *size);
@@ -297,15 +374,21 @@ impl Uploads {
 /// of each quad (open sky for an index outside the palette), then the palette itself (never
 /// drawn; it only keeps the range the same size as in the arena).
 fn expand_light(mesh: &ChunkMesh, out: &mut Vec<PaletteEntry>) {
+    quad_light(mesh, &mesh.quads, out);
+    out.extend_from_slice(uploaded_palette(mesh));
+}
+
+/// Sets `out` to the palette entry of each of `quads` (from `mesh`), open sky for an index
+/// outside the palette.
+fn quad_light(mesh: &ChunkMesh, quads: &[PackedQuad], out: &mut Vec<PaletteEntry>) {
     let palette = uploaded_palette(mesh);
     out.clear();
-    out.extend(mesh.quads.iter().map(|q| {
+    out.extend(quads.iter().map(|q| {
         palette
             .get(usize::from(q.light_index()))
             .copied()
             .unwrap_or(FULL_SKY_ENTRY)
     }));
-    out.extend_from_slice(palette);
 }
 
 /// Appends the copies of `pending` (sorted by offset) to `pieces`: one per run of meshes that
@@ -362,7 +445,7 @@ mod tests {
             .into_iter()
             .map(|(piece, bytes)| match piece {
                 Piece::Meshes(range) => (range, bytes / QUAD_BYTES),
-                Piece::LowLight(_) | Piece::Slots(_) => unreachable!(),
+                _ => unreachable!(),
             })
             .collect()
     }

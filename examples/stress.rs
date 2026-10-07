@@ -21,7 +21,9 @@
 //!
 //! `--water Y` fills every air block at or below world height `Y` with water and puts a glass
 //! block on the surface of about one water column in 29 (see [`WaterGenerator`]): chunks with
-//! translucent quads, for the translucent pass and its sort (ADR 0018).
+//! translucent quads, for the translucent pass and its sort (ADR 0018). `--sort off` keeps the
+//! translucent quads inside each chunk in the mesher's order (`TranslucentSort::Off`); the run
+//! prints how many buckets were re-sorted while measuring.
 //!
 //! `--light off` turns the voxel light and the ambient occlusion off (`WorldSettings::light` and
 //! `ao_policy: AoPolicy::Off`): the look and the cost of the world before light (ADR 0015).
@@ -61,7 +63,7 @@ use boxel::gfx::{CLI_HELP, PresentModePref};
 use boxel::log::span_times::{self, SpanFrame, SpanTimes};
 use boxel::mesh::AoPolicy;
 use boxel::prelude::*;
-use boxel::render::{GpuFailed, TextureSource};
+use boxel::render::{GpuFailed, TextureSource, TranslucentSort};
 use boxel::voxel::{
     BlockPos, BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, LocalPos, MAX_BLOCK_COORD,
 };
@@ -122,6 +124,8 @@ usage: stress [--scenario static|fly|dive|spin] [GPU options] [options]
   --water Y           water in every air block at or below height Y (lakes and seas), with a
                       glass block on about one surface column in 29; the summary's world gets
                       +waterY
+  --sort on|off       sort the translucent quads inside each chunk for the camera (default on, on
+                      the async compute pool); off keeps the mesher's order
   --help              this text
 The run presents with --present immediate unless --vsync, --present or BOXEL_PRESENT is given.
 exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 output not written, 4 timeout";
@@ -221,6 +225,8 @@ struct Options {
     bodies: BodyOptions,
     /// `--water`: the water level.
     water: Option<i64>,
+    /// `--sort`.
+    sort: TranslucentSort,
 }
 
 impl Options {
@@ -265,6 +271,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         textures: TextureSource::Procedural,
         bodies: BodyOptions::default(),
         water: None,
+        sort: TranslucentSort::Background,
     };
     let mut timeout = None;
     let mut it = args.iter();
@@ -398,6 +405,13 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--edits" => o.edits = true,
             "--time" => o.time = clock::parse_clock(flag, &value()?)?,
             "--pack" => o.textures = pack::parse(flag, &value()?)?,
+            "--sort" => {
+                o.sort = match value()?.as_str() {
+                    "on" => TranslucentSort::Background,
+                    "off" => TranslucentSort::Off,
+                    v => return Err(format!("{flag}: {v:?} is not on or off")),
+                };
+            }
             "--water" => {
                 let v = value()?;
                 o.water = Some(
@@ -618,6 +632,8 @@ struct Bench {
     info: RunInfo,
     /// `frames_presented` when the measurement started.
     presented_at_start: u64,
+    /// `translucent_sorts` when the measurement started.
+    sorts_at_start: u32,
     exiting: bool,
 }
 
@@ -855,6 +871,7 @@ fn drive(
         Phase::Warmup { until } if now >= until => {
             bench.phase = Phase::Measuring { start: now };
             bench.presented_at_start = info.frames_presented;
+            bench.sorts_at_start = info.translucent_sorts;
             bench.info.load_start = load_average();
             bench.info.unix_time = unix_time();
             println!(
@@ -868,6 +885,10 @@ fn drive(
             if now.duration_since(start) >= bench.options.duration {
                 bench.info.load_end = load_average();
                 bench.info.frames_presented = info.frames_presented - bench.presented_at_start;
+                println!(
+                    "stress: {} translucent buckets re-sorted while measuring",
+                    info.translucent_sorts - bench.sorts_at_start
+                );
                 bench.phase = Phase::CatchUp {
                     since: now,
                     streak: 0,
@@ -1179,6 +1200,7 @@ fn add_bench(app: &mut App, options: Options, info: RunInfo, recorder: Recorder,
             phase: Phase::Loading { streak: 0 },
             info,
             presented_at_start: 0,
+            sorts_at_start: 0,
             exiting: false,
             options,
         })
@@ -1292,6 +1314,7 @@ fn main() -> AppExit {
                 arena_quads,
                 max_chunk_slots: chunk_slots,
                 textures: options.textures.clone(),
+                translucent_sort: options.sort,
                 ..RenderSettings::default()
             },
         })
@@ -1519,6 +1542,10 @@ mod tests {
     #[test]
     fn water_flag_and_generator() {
         assert_eq!(parse(&[]).expect("valid").expect("not help").water, None);
+        let sort = |args: &[&str]| parse(args).expect("valid").expect("not help").sort;
+        assert_eq!(sort(&[]), TranslucentSort::Background);
+        assert_eq!(sort(&["--sort", "off"]), TranslucentSort::Off);
+        assert!(parse(&["--sort", "maybe"]).is_err());
         let o = parse(&["--water", "-3"]).expect("valid").expect("not help");
         assert_eq!(o.water, Some(-3));
         assert!(parse(&["--water", "sea"]).is_err());

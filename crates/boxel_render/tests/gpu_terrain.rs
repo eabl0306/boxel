@@ -46,7 +46,9 @@ use boxel_gfx::{
 };
 use boxel_math::{Aabb, DVec3, I64Vec3, UVec2, Vec3};
 use boxel_mesh::{AoPolicy, ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher};
-use boxel_render::{DEFAULT_SKY_COLOR, RendererConfig, ViewParams, VoxelRenderer, arena_len};
+use boxel_render::{
+    DEFAULT_SKY_COLOR, RendererConfig, TranslucentSort, ViewParams, VoxelRenderer, arena_len,
+};
 use boxel_transform::Transform;
 use boxel_voxel::{BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, NEIGHBOR_OFFSETS};
 use boxel_worldgen::{TerrainGenerator, WorldGenerator};
@@ -348,6 +350,7 @@ fn render_tier(
     let config = RendererConfig {
         arena_quads: 1 << 20,
         max_chunk_slots: 1024,
+        translucent_sort: TranslucentSort::Inline,
     };
     let mut renderer = VoxelRenderer::new(
         &device,
@@ -778,6 +781,7 @@ fn render_cracks(
     let config = RendererConfig {
         arena_quads: 1 << 20,
         max_chunk_slots: 1024,
+        translucent_sort: TranslucentSort::Inline,
     };
     let mut renderer = VoxelRenderer::new(
         &device,
@@ -1211,6 +1215,7 @@ fn render_lit(
     let config = RendererConfig {
         arena_quads: 1 << 20,
         max_chunk_slots: 256,
+        translucent_sort: TranslucentSort::Inline,
     };
     let mut renderer = VoxelRenderer::new(
         &device,

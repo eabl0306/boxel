@@ -44,6 +44,7 @@ mod textures;
 mod arena;
 mod chunk_table;
 mod path;
+mod sort;
 mod targets;
 mod upload;
 
@@ -61,6 +62,7 @@ pub use renderer::{
     DEFAULT_SKY_COLOR, RenderStats, RendererConfig, RendererError, ViewParams, VoxelRenderer,
 };
 pub use smoke::RendererSmokeTest;
+pub use sort::TranslucentSort;
 pub use textures::{BLOCK_TEXTURE_SIZE, BlockTextureData, generate_block_textures};
 pub use upload::arena_len;
 

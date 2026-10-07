@@ -911,8 +911,9 @@ Cada tier usa tres pipelines de vóxeles (ADR 0012, ADR 0018): **opaco** (`fs_op
 5, **cutout** (`fs_cutout`, alpha test, `cull_mode: None`) para el bucket 6, dibujado después, y
 **translúcido** (`fs_translucent`, mezcla alfa, test de profundidad sin escritura, `cull_mode:
 None`) para el bucket 7, al final. Los buckets translúcidos salen de una lista en CPU que comparten
-los tres tiers, con los chunks de atrás hacia adelante por distancia (dentro de un chunk los quads
-no se ordenan).
+los tres tiers, con los chunks de atrás hacia adelante por distancia. Dentro de un chunk, el
+renderer reordena los quads translúcidos para la cámara en un trabajo aparte y los vuelve a subir
+sobre su rango del arena (ADR 0018, sección 3).
 
 **High** (Vulkan con MDI-count):
 

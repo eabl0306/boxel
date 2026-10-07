@@ -30,6 +30,8 @@ boxel_world.workspace = true
 boxel_pack.workspace = true
 wgpu.workspace = true
 bytemuck.workspace = true
+# Answers of the translucent sort jobs (Send + Sync, unlike std's receiver).
+crossbeam-channel.workspace = true
 foldhash.workspace = true
 offset-allocator.workspace = true
 pollster.workspace = true

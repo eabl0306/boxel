@@ -44,8 +44,8 @@ use boxel_mesh::{
     PackedQuad, TRANSLUCENT_BUCKET,
 };
 use boxel_render::{
-    DEFAULT_SKY_COLOR, RendererConfig, RendererError, RendererSmokeTest, ViewParams, VoxelRenderer,
-    arena_len,
+    DEFAULT_SKY_COLOR, RendererConfig, RendererError, RendererSmokeTest, TranslucentSort,
+    ViewParams, VoxelRenderer, arena_len,
 };
 use boxel_transform::Transform;
 use boxel_voxel::{
@@ -558,6 +558,7 @@ fn full_arena_scenes(
         // slack for the size bins of `offset_allocator`, filled below
         arena_quads: quads + largest.unwrap_or(0) / 4 + 8,
         max_chunk_slots: 256,
+        translucent_sort: TranslucentSort::Inline,
     };
     let mut renderer = VoxelRenderer::new(
         device,
@@ -805,6 +806,7 @@ fn render_tier(
     let config = RendererConfig {
         arena_quads: 1 << 20,
         max_chunk_slots: 256,
+        translucent_sort: TranslucentSort::Inline,
     };
     let mut renderer = VoxelRenderer::new(
         &device,
@@ -1280,6 +1282,7 @@ fn light_indices_past_the_palette_read_open_sky_on_every_tier() {
                 let config = RendererConfig {
                     arena_quads: 1 << 13,
                     max_chunk_slots: 8,
+                    translucent_sort: TranslucentSort::Inline,
                 };
                 let mut renderer = VoxelRenderer::new(
                     &device,
@@ -1412,6 +1415,7 @@ fn pack_textures_render_on_every_tier() {
                 let config = RendererConfig {
                     arena_quads: 1 << 13,
                     max_chunk_slots: 8,
+                    translucent_sort: TranslucentSort::Inline,
                 };
                 let mut renderer = VoxelRenderer::new(
                     &device,

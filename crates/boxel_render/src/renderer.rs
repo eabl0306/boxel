@@ -5,13 +5,14 @@ use crate::path::{
     HighInputs, HighPath, LowPath, MidPath, TierPath, TierPipelines, geometry_bind_group,
     quad_index_buffer,
 };
+use crate::sort::{SortedBucket, TranslucentSort, TranslucentSorter};
 use crate::targets::{Blit, Targets};
 use crate::textures::BlockTextureData;
 use crate::upload::{UploadTargets, Uploads, arena_len, light_entries};
 use boxel_camera::{Camera, CameraView};
 use boxel_gfx::Tier;
 use boxel_math::{Frustum, I64Vec3, Mat4, UVec2, Vec3, wrap_to_i32};
-use boxel_mesh::{BUCKET_COUNT, ChunkMesh};
+use boxel_mesh::{BUCKET_COUNT, ChunkMesh, TRANSLUCENT_BUCKET};
 use boxel_shaders::gpu::{ChunkGpu, ViewUniform, bindings};
 use std::sync::Arc;
 use wgpu::util::DeviceExt as _;
@@ -37,6 +38,9 @@ pub struct RendererConfig {
     /// buckets are visible, High skips arbitrary ones (not the farthest; not counted in
     /// [`RenderStats`]) and logs one warning; Mid and Low draw them all.
     pub max_chunk_slots: u32,
+    /// How the translucent quads inside each chunk are sorted back to front (ADR 0018). Default
+    /// [`TranslucentSort::Background`]; [`VoxelRenderer::set_translucent_sort`] changes it later.
+    pub translucent_sort: TranslucentSort,
 }
 
 impl Default for RendererConfig {
@@ -44,6 +48,7 @@ impl Default for RendererConfig {
         Self {
             arena_quads: 8 << 20,
             max_chunk_slots: 32768,
+            translucent_sort: TranslucentSort::default(),
         }
     }
 }
@@ -117,6 +122,11 @@ pub struct RenderStats {
     /// too large for them (M1 adds arena growth). Buckets skipped by a full High draw list are
     /// not counted (see [`RendererConfig::max_chunk_slots`]).
     pub dropped_chunks: u32,
+    /// Translucent buckets re-sorted for the camera and uploaded (cumulative, see
+    /// [`TranslucentSort`]).
+    pub translucent_sorts: u32,
+    /// Their quads (cumulative).
+    pub translucent_sorted_quads: u64,
 }
 
 /// Renderer errors.
@@ -152,6 +162,10 @@ pub struct VoxelRenderer {
     low_light: Option<wgpu::Buffer>,
     /// Meshes (and, through `chunks`, table entries) waiting for the next `render`.
     uploads: Uploads,
+    /// Keeps each chunk's translucent bucket in back-to-front order for the camera.
+    sorter: TranslucentSorter,
+    /// Scratch: the sorted buckets of a frame.
+    sorted: Vec<SortedBucket>,
     path: Box<dyn TierPath + Send + Sync>,
     targets: Targets,
     blit: Blit,
@@ -334,6 +348,8 @@ impl VoxelRenderer {
             chunk_buffer,
             low_light,
             uploads: Uploads::default(),
+            sorter: TranslucentSorter::new(config.translucent_sort),
+            sorted: Vec::new(),
             path,
             targets,
             blit,
@@ -412,6 +428,7 @@ impl VoxelRenderer {
             self.stats.dropped_chunks += 1;
             return Err(RendererError::ChunkTableFull(self.chunks.capacity()));
         }
+        self.sorter.upsert(id, origin, Arc::clone(&mesh));
         self.uploads.mesh(id, alloc.offset, mesh);
         Ok(())
     }
@@ -422,6 +439,7 @@ impl VoxelRenderer {
         };
         self.arena.alloc.free(record.alloc);
         self.uploads.forget(id);
+        self.sorter.remove(id);
         true
     }
     /// Removes every chunk. Reaches the GPU with the next `render`.
@@ -429,6 +447,16 @@ impl VoxelRenderer {
         self.chunks.clear();
         self.arena.alloc.reset();
         self.uploads.clear();
+        self.sorter.clear();
+    }
+    /// How the translucent quads inside each chunk are sorted ([`RendererConfig::translucent_sort`]).
+    pub fn translucent_sort(&self) -> TranslucentSort {
+        self.sorter.mode()
+    }
+    /// Changes how the translucent quads inside each chunk are sorted. Turning it off keeps the
+    /// order each chunk has on the GPU until its next mesh (the mesher's order).
+    pub fn set_translucent_sort(&mut self, mode: TranslucentSort) {
+        self.sorter.set_mode(mode);
     }
     /// Resident chunks.
     pub fn chunk_count(&self) -> usize {
@@ -449,7 +477,7 @@ impl VoxelRenderer {
         self.uploads.fail_next_batch();
     }
     /// Encodes the tier's passes into the main color/depth targets: the chunk changes since the
-    /// last call (uploads), clear, (High) cull, opaque buckets with the opaque pipeline, then the
+    /// last call and the translucent buckets re-sorted for this camera (uploads), clear, (High) cull, opaque buckets with the opaque pipeline, then the
     /// cutout bucket with the cutout pipeline, then the translucent buckets back to front with
     /// the translucent pipeline. Submit `encoder` before the next `render`.
     pub fn render(
@@ -464,6 +492,26 @@ impl VoxelRenderer {
         // window from the live flags: a move marks every slot stale, so the upload below sends
         // them all again. Mid and Low test the window in `CpuCull`.
         self.chunks.follow(view.render_origin);
+        {
+            let _span = frame_span!("render.sort");
+            self.sorter.update(&self.chunks, view, &mut self.sorted);
+            for sorted in self.sorted.drain(..) {
+                let Some((_, record)) = self.chunks.get(sorted.id) else {
+                    continue;
+                };
+                // A trimmed bucket (malformed mesh) keeps the mesher's order.
+                if record.counts[TRANSLUCENT_BUCKET] as usize != sorted.quads.len() {
+                    continue;
+                }
+                let start: u32 = record.counts[..TRANSLUCENT_BUCKET].iter().sum();
+                self.uploads.sorted(
+                    sorted.id,
+                    record.alloc.offset + start,
+                    sorted.mesh,
+                    sorted.quads,
+                );
+            }
+        }
         {
             let _span = frame_span!("render.upload");
             let targets = UploadTargets {
@@ -541,6 +589,8 @@ impl VoxelRenderer {
             arena_used_quads: self.arena.alloc.used(),
             arena_capacity_quads: self.arena.alloc.capacity(),
             chunk_slot_capacity: self.chunks.capacity(),
+            translucent_sorts: self.sorter.stats().sorts,
+            translucent_sorted_quads: self.sorter.stats().quads,
             ..self.stats
         }
     }
