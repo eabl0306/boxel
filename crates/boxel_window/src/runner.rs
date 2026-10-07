@@ -780,7 +780,11 @@ impl RunnerCore {
         if request_redraw {
             self.redraw_pending_since = Some(now);
         }
-        let (pace, _) = self.plan(world, now);
+        let (pace, held) = self.plan(world, now);
+        if held.is_some() {
+            // The loop may sleep through the whole wait without another `pace`.
+            self.gate_hold = held;
+        }
         let control_flow = match self.settings.update_mode {
             UpdateMode::Continuous => match pace {
                 FrameWait::Sleep { wake } => ControlFlow::WaitUntil(wake),
@@ -1631,6 +1635,16 @@ mod tests {
         assert_eq!(info.gate_wait, panel + panel / 4);
         // The grid restarts there (more than a period late).
         assert_eq!(core.pacer.next_frame(Some(panel)), Some(latest + panel));
+        // Still no callback: the loop sleeps through the next wait without asking again, and
+        // the update still reports it.
+        let end = core.end_update(app.world(), latest + us(800));
+        let due = latest + panel;
+        let latest = due + panel + panel / 4;
+        assert_eq!(end.control_flow, ControlFlow::WaitUntil(latest));
+        core.begin_update(app.world_mut(), latest);
+        let info = pacing(&app);
+        assert!(info.gate_missed);
+        assert_eq!(info.gate_wait, panel + panel / 4);
 
         // A limit under 99 % of the panel keeps its own grid and the short wait.
         app.insert_resource(FrameLimit::new(120));
