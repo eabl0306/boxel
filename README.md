@@ -96,6 +96,20 @@ lista), `--fixed-height` (carga como M0, con el alto fijo del generador; no con 
 `--world flat|terrain|forest|overworld` (`terrain` por defecto), `--caves mc|closed|off` (solo
 con el overworld), `--no-trees`, `--help`.
 
+**snapshot**: capturas sin ventana. Carga el mundo alrededor de una cámara, pone bloques si se
+lo pides y guarda un PNG por cada hora del día, con el renderer real y fuera de pantalla.
+
+```bash
+cargo run --release --example snapshot -- --camera 194,67,-48,12,-30 \
+  --shot 12:00=mediodia.png --shot 00:00=noche.png
+```
+
+Opciones: `--place lamp_red@X,Y,Z` (pone un bloque), `--drop NOMBRE@X,Y,Z` (lo deja en el suelo
+bajo ese punto), `--fill NOMBRE@X,Y,Z:X,Y,Z` (llena una caja; `air` cava), `--light off --ao off`
+(el aspecto de antes de la luz), `--view-distance N`, `--size WxH`, las de mundo (`overworld` por
+defecto) y las de GPU (`--adapter nvidia`), `--help`. Imprime qué hay en el centro de la vista y
+su luz, para apuntar.
+
 **gpu_info**: lista los adaptadores, cómo los clasifica boxel y qué elige.
 
 ```bash

@@ -196,6 +196,13 @@ name = "stress"
 required-features = ["render", "voxel"]
 test = true
 
+# Headless screenshots: the world streamed around a camera, rendered offscreen to PNGs.
+[[example]]
+name = "snapshot"
+required-features = ["render", "voxel", "png"]
+# Runs its option tests with `cargo test`.
+test = true
+
 # Profiles only apply to this workspace's own examples/tests/benches.
 [profile.dev]
 opt-level = 1
