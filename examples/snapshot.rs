@@ -38,8 +38,8 @@ use boxel::log::LogPlugin;
 use boxel::mesh::AoPolicy;
 use boxel::prelude::*;
 use boxel::render::{
-    RenderSettings, RendererConfig, SceneLight, TextureSource, ViewParams, VoxelRenderer,
-    light_curve, load_block_textures,
+    RenderSettings, RendererConfig, SceneLight, TextureSource, TranslucentSort, ViewParams,
+    VoxelRenderer, light_curve, load_block_textures,
 };
 use boxel::voxel::{BlockRegistry, MAX_BLOCK_COORD};
 use boxel::world::{DaylightCurve, WorldStats};
@@ -673,6 +673,8 @@ fn run(
         &RendererConfig {
             arena_quads,
             max_chunk_slots,
+            // the shot is the first frame: sorted in it
+            translucent_sort: TranslucentSort::Inline,
         },
         &textures,
         gpu.output_format,

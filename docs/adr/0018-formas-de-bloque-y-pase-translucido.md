@@ -56,9 +56,29 @@ vidrio y agua visibles. `BlockDef` tenía `solid: bool` y la física solo conoc�
   translúcidos, de atrás hacia adelante por distancia al centro del chunk (empate por slot).
   High la dibuja con un `draw_indexed` por chunk desde un buffer chico de `DrawRef`; Mid y Low
   como sus otros buckets. Así la mezcla da los mismos píxeles en los tres tiers.
-- Límite: dentro de un chunk los quads siguen el orden del mesher, no la distancia. Dos
-  superficies translúcidas del mismo chunk pueden mezclarse en orden equivocado. Con vidrio y
-  agua de alfa baja casi no se nota.
+- Dentro de un chunk los quads translúcidos también van de atrás hacia adelante
+  (`boxel_render::sort`). Un trabajo reordena el bucket translúcido del chunk para la cámara y el
+  renderer sube los quads permutados sobre el mismo rango del arena (en Low, también su luz en el
+  buffer paralelo). Los shaders y los draws no cambian, así que los tres tiers dibujan lo mismo.
+- El orden no es la distancia al centro de cada quad, como en Minecraft. Con quads greedy no
+  alcanza: el centro de una superficie de agua de 32x32 queda lejos aunque su parte cercana tape
+  un vidrio hundido junto a la cámara. Es un orden topológico de "puede tapar": si un quad queda
+  entero de un lado del plano de otro, el lado de la cámara decide cuál va primero. Dos caras en
+  el mismo plano (agua contra vidrio) van primero la que mira hacia afuera de la cámara. Lo que
+  ningún plano separa, y los ciclos (raros), se resuelven por distancia al centro. Es exacto para
+  quads que no se cruzan, y un test lo compara con rayos.
+- Cuándo: el orden depende solo de qué lado de cada plano está la cámara. Se reordena cuando la
+  cámara cruza uno de los planos del chunk. Los chunks a más de 64 vóxeles esperan además a que
+  la cámara se mueva un octavo de su distancia (un quad recién cruzado se ve de canto y de lejos
+  no tapa casi nada). Un chunk de más de 512 quads translúcidos usa solo la distancia al centro
+  (el par a par es cuadrático) y se reordena al cambiar de bloque, con la misma holgura.
+- Costo: los chunks sin quads translúcidos no tienen estado. Los trabajos corren en el pool de
+  cómputo asíncrono (los `JobExecutor` del mundo), los más cercanos y visibles primero, con un
+  tope de 64 Ki quads en vuelo. Las subidas van en el staging del frame, con un tope de 32 Ki
+  quads por frame, y se pierden y se reenvían con el resto en un resync. Un chunk nuevo o
+  remallado se ve un frame en el orden del mesher, hasta que llega su orden.
+- `TranslucentSort` elige `Background` (por defecto), `Inline` (en el mismo frame, para tests y
+  capturas) u `Off`.
 - Las caras entre dos bloques translúcidos iguales se omiten (no hay paredes de agua adentro del
   agua). Entre agua y vidrio se dibujan las dos.
 
@@ -123,5 +143,8 @@ Líquidos que fluyen, escaleras, cercas y antorchas. Los estados de bloque ya es
   el fork de bgm compara caras de cubo enteras.
 - Una extensión de `PackedQuad` a 12 o 16 bytes: todos los tiers pagan más memoria y ancho de
   banda por formas que son pocas.
-- Ordenar los quads translúcidos dentro del chunk por cuadro: costo de CPU y de subida por
-  frame; queda para cuando haya agua en el mundo.
+- Ordenar los quads translúcidos dentro del chunk en cada frame: costo de CPU y de subida por
+  frame. Se reordena solo cuando la cámara cruza un plano (ver la sección 3).
+- Ordenar por distancia al centro de cada quad, como Minecraft: falla con quads greedy grandes.
+- Un buffer de índices por chunk con el orden: Low no tiene storage buffers y los quads ya son
+  atributos de instancia; reescribir el rango del arena sirve igual en los tres tiers.

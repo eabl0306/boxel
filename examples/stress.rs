@@ -19,6 +19,12 @@
 //! `--bodies N --body-kind item|mob --projectiles M` add physics bodies around the start (see
 //! [`bodies`]): what they add to the frame is the physics part of the frame rule (ADR 0016).
 //!
+//! `--water Y` fills every air block at or below world height `Y` with water and puts a glass
+//! block on the surface of about one water column in 29 (see [`WaterGenerator`]): chunks with
+//! translucent quads, for the translucent pass and its sort (ADR 0018). `--sort off` keeps the
+//! translucent quads inside each chunk in the mesher's order (`TranslucentSort::Off`); the run
+//! prints how many buckets were re-sorted while measuring.
+//!
 //! `--light off` turns the voxel light and the ambient occlusion off (`WorldSettings::light` and
 //! `ao_policy: AoPolicy::Off`): the look and the cost of the world before light (ADR 0015).
 //!
@@ -57,8 +63,10 @@ use boxel::gfx::{CLI_HELP, PresentModePref};
 use boxel::log::span_times::{self, SpanFrame, SpanTimes};
 use boxel::mesh::AoPolicy;
 use boxel::prelude::*;
-use boxel::render::{GpuFailed, TextureSource};
-use boxel::voxel::{BlockPos, BlockRegistry, ChunkData, ChunkKey, ChunkPos, MAX_BLOCK_COORD};
+use boxel::render::{GpuFailed, TextureSource, TranslucentSort};
+use boxel::voxel::{
+    BlockPos, BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, LocalPos, MAX_BLOCK_COORD,
+};
 use boxel::window::FramePacingInfo;
 use boxel::world::jobs::{JobExecutor, TaskPoolExecutor};
 use boxel::world::{ChunkId, ChunkMeshEvent, WorldContent, WorldStats, WorldSystems};
@@ -113,6 +121,11 @@ usage: stress [--scenario static|fly|dive|spin] [GPU options] [options]
                       the cost of the world before light
   --pack DIR          block textures from a Minecraft Java resource pack (the directory with
                       pack.mcmeta; default: procedural); the summary records it and its load time
+  --water Y           water in every air block at or below height Y (lakes and seas), with a
+                      glass block on about one surface column in 29; the summary's world gets
+                      +waterY
+  --sort on|off       sort the translucent quads inside each chunk for the camera (default on, on
+                      the async compute pool); off keeps the mesher's order
   --help              this text
 The run presents with --present immediate unless --vsync, --present or BOXEL_PRESENT is given.
 exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 output not written, 4 timeout";
@@ -210,6 +223,10 @@ struct Options {
     textures: TextureSource,
     /// `--bodies`, `--body-kind` and `--projectiles`.
     bodies: BodyOptions,
+    /// `--water`: the water level.
+    water: Option<i64>,
+    /// `--sort`.
+    sort: TranslucentSort,
 }
 
 impl Options {
@@ -253,6 +270,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         light: true,
         textures: TextureSource::Procedural,
         bodies: BodyOptions::default(),
+        water: None,
+        sort: TranslucentSort::Background,
     };
     let mut timeout = None;
     let mut it = args.iter();
@@ -386,6 +405,23 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--edits" => o.edits = true,
             "--time" => o.time = clock::parse_clock(flag, &value()?)?,
             "--pack" => o.textures = pack::parse(flag, &value()?)?,
+            "--sort" => {
+                o.sort = match value()?.as_str() {
+                    "on" => TranslucentSort::Background,
+                    "off" => TranslucentSort::Off,
+                    v => return Err(format!("{flag}: {v:?} is not on or off")),
+                };
+            }
+            "--water" => {
+                let v = value()?;
+                o.water = Some(
+                    v.trim()
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|y| y.unsigned_abs() <= 1 << 20)
+                        .ok_or_else(|| format!("{flag}: {v:?} is not a height in +-2^20"))?,
+                );
+            }
             "--light" => {
                 o.light = match value()?.as_str() {
                     "on" => true,
@@ -440,6 +476,70 @@ impl WorldGenerator for CountingGenerator {
 
     fn vertical_chunks(&self) -> RangeInclusive<i64> {
         self.inner.vertical_chunks()
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+}
+
+/// `--water`: the inner world with water in every air block at or below `level` and a glass
+/// block on the surface of about one water column in 29.
+struct WaterGenerator {
+    inner: Arc<dyn WorldGenerator>,
+    level: i64,
+}
+
+impl WorldGenerator for WaterGenerator {
+    fn generate(&self, key: ChunkKey, registry: &BlockRegistry) -> ChunkData {
+        let mut data = self.inner.generate(key, registry);
+        let origin = key.pos.origin().as_i64vec3();
+        // the level's local y (31 and up: the whole chunk)
+        let top = self.level - origin.y;
+        if top < 0 {
+            return data;
+        }
+        let water = registry.by_name("boxel:water").expect("boxel:water");
+        let glass = registry.by_name("boxel:glass").expect("boxel:glass");
+        match data.as_uniform() {
+            Some(BlockState::AIR) if top > 31 => return ChunkData::uniform(water),
+            Some(state) if state != BlockState::AIR => return data,
+            _ => {}
+        }
+        let top = top.min(31) as u32;
+        for y in 0..=top {
+            for z in 0..32 {
+                for x in 0..32 {
+                    let p = LocalPos::new(x, y, z);
+                    if data.get(p) == BlockState::AIR {
+                        data.set(p, water);
+                    }
+                }
+            }
+        }
+        if self.level - origin.y <= 31 {
+            for z in 0..32u32 {
+                for x in 0..32u32 {
+                    let (wx, wz) = (origin.x + i64::from(x), origin.z + i64::from(z));
+                    let h = (wx as u64)
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        .rotate_left(29)
+                        ^ (wz as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+                    let p = LocalPos::new(x, top, z);
+                    if (h ^ (h >> 31)).is_multiple_of(29) && data.get(p) == water {
+                        data.set(p, glass);
+                    }
+                }
+            }
+        }
+        data.compact();
+        data
+    }
+
+    fn vertical_chunks(&self) -> RangeInclusive<i64> {
+        let range = self.inner.vertical_chunks();
+        let level = self.level >> 5;
+        (*range.start()).min(level)..=(*range.end()).max(level)
     }
 
     fn name(&self) -> &str {
@@ -532,6 +632,8 @@ struct Bench {
     info: RunInfo,
     /// `frames_presented` when the measurement started.
     presented_at_start: u64,
+    /// `translucent_sorts` when the measurement started.
+    sorts_at_start: u32,
     exiting: bool,
 }
 
@@ -769,6 +871,7 @@ fn drive(
         Phase::Warmup { until } if now >= until => {
             bench.phase = Phase::Measuring { start: now };
             bench.presented_at_start = info.frames_presented;
+            bench.sorts_at_start = info.translucent_sorts;
             bench.info.load_start = load_average();
             bench.info.unix_time = unix_time();
             println!(
@@ -782,6 +885,10 @@ fn drive(
             if now.duration_since(start) >= bench.options.duration {
                 bench.info.load_end = load_average();
                 bench.info.frames_presented = info.frames_presented - bench.presented_at_start;
+                println!(
+                    "stress: {} translucent buckets re-sorted while measuring",
+                    info.translucent_sorts - bench.sorts_at_start
+                );
                 bench.phase = Phase::CatchUp {
                     since: now,
                     streak: 0,
@@ -1048,7 +1155,10 @@ fn run_info(options: &Options, present: String) -> RunInfo {
             0.0
         },
         seed: options.seed,
-        world: options.world.label(),
+        world: match options.water {
+            Some(level) => format!("{}+water{level}", options.world.label()),
+            None => options.world.label(),
+        },
         trees: options.world.has_trees(),
         light: if options.light { "on" } else { "off" }.to_string(),
         pack: match &options.textures {
@@ -1090,6 +1200,7 @@ fn add_bench(app: &mut App, options: Options, info: RunInfo, recorder: Recorder,
             phase: Phase::Loading { streak: 0 },
             info,
             presented_at_start: 0,
+            sorts_at_start: 0,
             exiting: false,
             options,
         })
@@ -1177,7 +1288,10 @@ fn main() -> AppExit {
     }
     let generated = Arc::new(AtomicU64::new(0));
     let jobs_done = Arc::new(AtomicU64::new(0));
-    let inner = options.world.generator(options.seed);
+    let mut inner = options.world.generator(options.seed);
+    if let Some(level) = options.water {
+        inner = Arc::new(WaterGenerator { inner, level });
+    }
     let fixed_bounds = options.fixed_height.then(|| inner.vertical_chunks());
     let (arena_quads, chunk_slots) = options.render_capacity();
     let info = run_info(&options, present);
@@ -1200,6 +1314,7 @@ fn main() -> AppExit {
                 arena_quads,
                 max_chunk_slots: chunk_slots,
                 textures: options.textures.clone(),
+                translucent_sort: options.sort,
                 ..RenderSettings::default()
             },
         })
@@ -1263,6 +1378,7 @@ fn main() -> AppExit {
 mod tests {
     use super::*;
     use boxel::mesh::{ChunkMesh, PackedQuad};
+    use boxel::worldgen::FlatGenerator;
 
     fn parse(args: &[&str]) -> Result<Option<Options>, String> {
         let args: Vec<String> = args.iter().map(ToString::to_string).collect();
@@ -1421,6 +1537,43 @@ mod tests {
         assert_eq!((o.edits, o.time), (true, 21.5));
         assert!(parse(&["--time", "7:75"]).is_err());
         assert_eq!(clock::start_time(o.time, true).clock_text(), "21:30");
+    }
+
+    #[test]
+    fn water_flag_and_generator() {
+        assert_eq!(parse(&[]).expect("valid").expect("not help").water, None);
+        let sort = |args: &[&str]| parse(args).expect("valid").expect("not help").sort;
+        assert_eq!(sort(&[]), TranslucentSort::Background);
+        assert_eq!(sort(&["--sort", "off"]), TranslucentSort::Off);
+        assert!(parse(&["--sort", "maybe"]).is_err());
+        let o = parse(&["--water", "-3"]).expect("valid").expect("not help");
+        assert_eq!(o.water, Some(-3));
+        assert!(parse(&["--water", "sea"]).is_err());
+        assert!(parse(&["--water", "9999999"]).is_err());
+        let registry = BlockRegistry::default_blocks();
+        let water = registry.by_name("boxel:water").expect("water");
+        let glass = registry.by_name("boxel:glass").expect("glass");
+        let stone = registry.by_name("boxel:stone").expect("stone");
+        let generator = WaterGenerator {
+            inner: Arc::new(FlatGenerator::new(vec![("boxel:stone".to_string(), 5)])),
+            level: 40,
+        };
+        assert_eq!(generator.vertical_chunks(), 0..=1);
+        let chunk = |y| generator.generate(ChunkKey::new(ChunkPos::new(0, y, 0)), &registry);
+        let ground = chunk(0);
+        assert_eq!(ground.get(LocalPos::new(3, 4, 3)), stone);
+        assert_eq!(ground.get(LocalPos::new(3, 5, 3)), water);
+        assert_eq!(ground.get(LocalPos::new(3, 31, 3)), water);
+        let surface = chunk(1);
+        assert_eq!(surface.get(LocalPos::new(3, 9, 3)), BlockState::AIR);
+        let top: Vec<_> = (0..32 * 32)
+            .map(|i| surface.get(LocalPos::new(i % 32, 8, i / 32)))
+            .collect();
+        let glassy = top.iter().filter(|&&b| b == glass).count();
+        assert_eq!(glassy + top.iter().filter(|&&b| b == water).count(), 1024);
+        assert!((10..80).contains(&glassy), "{glassy} glass blocks");
+        assert_eq!(chunk(2).as_uniform(), Some(BlockState::AIR));
+        assert_eq!(chunk(-1).as_uniform(), Some(water));
     }
 
     #[test]

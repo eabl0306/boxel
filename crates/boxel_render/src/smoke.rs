@@ -1,5 +1,6 @@
 use crate::path::TierPipelines;
 use crate::renderer::{DEFAULT_SKY_COLOR, RendererConfig, ViewParams, VoxelRenderer};
+use crate::sort::TranslucentSort;
 use crate::targets::{Blit, Targets};
 use crate::textures::{generate_block_textures, linear_to_srgb};
 use boxel_camera::{Camera, CameraView};
@@ -67,6 +68,7 @@ fn draw(ctx: &SmokeContext<'_>) -> Result<(), String> {
     let config = RendererConfig {
         arena_quads: 1024,
         max_chunk_slots: 8,
+        translucent_sort: TranslucentSort::Inline,
     };
     let registry = BlockRegistry::default_blocks();
     let mut renderer = VoxelRenderer::new(
