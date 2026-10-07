@@ -12,6 +12,21 @@ pub const LEAVES: BlockState = BlockState(9);
 /// `boxel:water` (translucent fluid, not solid).
 pub const WATER: BlockState = BlockState(10);
 
+/// A stone slab in the lower half of its block (top at 0.5). Slabs are built only here and in
+/// [`top_slab`], so a change in how slab states are named touches one place.
+pub fn bottom_slab() -> BlockState {
+    BlockRegistry::default_blocks()
+        .by_name("boxel:stone_slab")
+        .expect("bottom slab")
+}
+
+/// A stone slab in the upper half of its block (from 0.5 to 1).
+pub fn top_slab() -> BlockState {
+    BlockRegistry::default_blocks()
+        .by_name("boxel:stone_slab_top")
+        .expect("top slab")
+}
+
 /// The collision table of the built-in blocks.
 pub fn table() -> CollisionTable {
     CollisionTable::from_registry(&BlockRegistry::default_blocks())

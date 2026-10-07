@@ -16,6 +16,9 @@
 //! block planes (integers): a box inside a slab is pushed onto the next block plane, not onto
 //! the slab's top.
 //!
+//! [`move_box_stepping`] adds Minecraft's step-up for walking bodies: a move clipped across on
+//! the ground is tried again lifted by the step height and kept if it goes further.
+//!
 //! Accepted artifacts, as in Minecraft: a diagonal move can cut an outer corner by up to one
 //! step of movement, and the result of a move depends on the axis order (frozen by tests).
 
@@ -135,15 +138,65 @@ pub fn move_box<S: VoxelSource + ?Sized>(
     obstacles: &[LocalBox],
     cfg: &SweepConfig,
 ) -> Result<SweepOut, Unloaded> {
+    move_box_stepping(src, table, start, shape, d, obstacles, cfg, StepUp::NONE)
+}
+
+/// Stepping up low ledges while moving, for walking bodies (a character's step-up): see
+/// [`move_box_stepping`]. [`StepUp::NONE`] never steps.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StepUp {
+    /// The highest ledge the box steps onto, in blocks (Minecraft's player: 0.6, so a slab or a
+    /// stair of slabs is climbed and a full block is not). 0, negative or NaN: no step-up.
+    /// Clamped to [`MAX_SWEEP_DISTANCE`].
+    pub height: f64,
+    /// The body ended its previous step on the ground. A step-up also happens when the move
+    /// itself lands; a body in the air never steps up.
+    pub grounded: bool,
+}
+
+impl StepUp {
+    /// No step-up: [`move_box_stepping`] is [`move_box`].
+    pub const NONE: Self = Self {
+        height: 0.0,
+        grounded: false,
+    };
+}
+
+/// [`move_box`] with a step-up: a walking body climbs ledges up to `step.height` high (a slab,
+/// a stair of slabs) without jumping. Minecraft's algorithm, per axis like the rest of the
+/// sweep.
+///
+/// When the plain move is clipped on X or Z, the box did not start inside blocks and it is on
+/// the ground (`step.grounded`, or the plain move landed), the move across is tried again
+/// lifted:
+/// - up by `step.height` (clipped by what is above the box), then across;
+/// - if something above the whole path (the box stretched by the move across) is lower than
+///   that, up only to it, then across. So a body never steps into a ceiling or through a gap it
+///   does not fit in.
+///
+/// The one that goes further across wins (the first on a tie), and only if it goes further
+/// across than the plain move. Then the box goes back down by what it rose plus the plain
+/// move's own vertical part, onto the ledge or wherever it lands, so it never ends higher than
+/// the ledge. The result reports the clips across of the lifted move and the vertical clip of
+/// the way down (it lands on the ledge: `on_ground`). Otherwise the plain move stands. A move
+/// that is not clipped across costs nothing more.
+///
+/// # Errors
+///
+/// [`Unloaded`] when any block the move or the step-up needs is in an unloaded chunk; nothing
+/// moves then.
+pub fn move_box_stepping<S: VoxelSource + ?Sized>(
+    src: &mut S,
+    table: &CollisionTable,
+    start: WorldPos,
+    shape: LocalBox,
+    d: DVec3,
+    obstacles: &[LocalBox],
+    cfg: &SweepConfig,
+    step: StepUp,
+) -> Result<SweepOut, Unloaded> {
     // A hand-built start may be outside the canonical form (a NaN frac, a block past i64 room).
     let start = start.normalize();
-    let clean = |v: f64| {
-        if v.is_finite() {
-            v.clamp(-MAX_SWEEP_DISTANCE, MAX_SWEEP_DISTANCE)
-        } else {
-            0.0
-        }
-    };
     let d = DVec3::new(clean(d.x), clean(d.y), clean(d.z));
     let eps = effective_eps(cfg.eps);
     let shape = usable_shape(shape, eps);
@@ -166,26 +219,17 @@ pub fn move_box<S: VoxelSource + ?Sized>(
         }
         None => false,
     };
-    let mut faces = 0u8;
-    let mut ground = None;
-    let mut blocks = [None; 3];
-    for axis in axis_order(d) {
-        if d[axis] == 0.0 {
-            continue;
-        }
-        let clip = grid.clip_axis(axis, pos, shape, d[axis], obstacles)?;
-        match clip {
-            Clip::Free => pos[axis] += d[axis],
-            Clip::Plane { pos: p, block } => {
-                pos[axis] = p;
-                faces |= 1 << face_of(axis, d[axis] > 0.0).index();
-                blocks[axis] = block;
-                if axis == 1 && d[axis] < 0.0 {
-                    ground = block;
-                }
-            }
-        }
+    let mut out = grid.sweep(pos, shape, d, obstacles)?;
+    // Only a move clipped across, on the ground, steps up (`>` is false for NaN).
+    if step.height > 0.0
+        && out.faces & ACROSS != 0
+        && !depenetrated
+        && (step.grounded || out.faces & LANDED != 0)
+        && let Some(lifted) = grid.step_up(pos, shape, d, obstacles, clean(step.height), &out)?
+    {
+        out = lifted;
     }
+    let pos = out.pos;
     let in_fluid = grid.any_fluid(shape.translate(pos))?;
     let end = WorldPos::from_block(start.block, pos);
     // `end` holds `pos` exactly unless it was clamped at the world limit (or a tiny negative
@@ -198,12 +242,34 @@ pub fn move_box<S: VoxelSource + ?Sized>(
     Ok(SweepOut {
         end,
         moved,
-        faces,
-        ground,
-        blocks,
+        faces: out.faces,
+        ground: out.ground,
+        blocks: out.blocks,
         in_fluid,
         depenetrated,
     })
+}
+
+/// The face bits of the four horizontal faces: a clip across.
+const ACROSS: u8 = (1 << Face::PosX.index())
+    | (1 << Face::NegX.index())
+    | (1 << Face::PosZ.index())
+    | (1 << Face::NegZ.index());
+
+/// The face bit of a landing.
+const LANDED: u8 = 1 << Face::NegY.index();
+
+/// The face bit of a clip moving up.
+const CEILING: u8 = 1 << Face::PosY.index();
+
+/// A displacement component as the sweep uses it: not finite counts as 0, and it is clamped to
+/// [`MAX_SWEEP_DISTANCE`].
+fn clean(v: f64) -> f64 {
+    if v.is_finite() {
+        v.clamp(-MAX_SWEEP_DISTANCE, MAX_SWEEP_DISTANCE)
+    } else {
+        0.0
+    }
 }
 
 /// The contact tolerance [`move_box`] uses for a configured `eps`: clamped to
@@ -281,6 +347,18 @@ enum Clip {
     /// Stopped: the new position on that axis, and the block that stopped it (`None` for an
     /// obstacle).
     Plane { pos: f64, block: Option<BlockPos> },
+}
+
+/// Where the per-axis clips of one move ([`Grid::sweep`]) left the box, in the grid's frame.
+#[derive(Clone, Copy)]
+struct Moved {
+    pos: DVec3,
+    /// As [`SweepOut::faces`].
+    faces: u8,
+    /// As [`SweepOut::ground`].
+    ground: Option<BlockPos>,
+    /// As [`SweepOut::blocks`].
+    blocks: [Option<BlockPos>; 3],
 }
 
 /// The voxel grid seen from the frame of `origin`: block `(x, y, z)` of the frame is world
@@ -593,6 +671,92 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
                 self.world(found)
             },
         )
+    }
+
+    /// The per-axis clips of one move from `pos` by `d` (Y, then the larger of X and Z), in the
+    /// grid's frame: no depenetration, no fluid check.
+    fn sweep(
+        &mut self,
+        pos: DVec3,
+        shape: LocalBox,
+        d: DVec3,
+        obstacles: &[LocalBox],
+    ) -> Result<Moved, Unloaded> {
+        let mut m = Moved {
+            pos,
+            faces: 0,
+            ground: None,
+            blocks: [None; 3],
+        };
+        for axis in axis_order(d) {
+            if d[axis] == 0.0 {
+                continue;
+            }
+            match self.clip_axis(axis, m.pos, shape, d[axis], obstacles)? {
+                Clip::Free => m.pos[axis] += d[axis],
+                Clip::Plane { pos: p, block } => {
+                    m.pos[axis] = p;
+                    m.faces |= 1 << face_of(axis, d[axis] > 0.0).index();
+                    m.blocks[axis] = block;
+                    if axis == 1 && d[axis] < 0.0 {
+                        m.ground = block;
+                    }
+                }
+            }
+        }
+        Ok(m)
+    }
+
+    /// The step-up of [`move_box_stepping`] from `start` (the box's position, free of blocks):
+    /// the lifted move if it goes further across than `plain` (the plain move), else `None`.
+    /// `height` is positive and finite.
+    fn step_up(
+        &mut self,
+        start: DVec3,
+        shape: LocalBox,
+        d: DVec3,
+        obstacles: &[LocalBox],
+        height: f64,
+        plain: &Moved,
+    ) -> Result<Option<Moved>, Unloaded> {
+        // The squared distance across: the same order without a square root.
+        let across = |m: &Moved| {
+            let x = m.pos.x - start.x;
+            let z = m.pos.z - start.z;
+            x * x + z * z
+        };
+        let horizontal = DVec3::new(d.x, 0.0, d.z);
+        // Up (clipped by what is above the box), then across: Y goes first.
+        let mut best = self.sweep(start, shape, DVec3::new(d.x, height, d.z), obstacles)?;
+        // What is above the whole path may be lower than that: up only to it, then across.
+        // When nothing above the path clips the rise, this is the move above; when the move
+        // above went all the way across, nothing beats it.
+        if best.faces & ACROSS != 0 {
+            let path = LocalBox::new(
+                shape.min.min(shape.min + horizontal),
+                shape.max.max(shape.max + horizontal),
+            );
+            let rise = self.sweep(start, path, DVec3::new(0.0, height, 0.0), obstacles)?;
+            if rise.faces & CEILING != 0 {
+                let lifted = DVec3::new(start.x, rise.pos.y, start.z);
+                let low = self.sweep(lifted, shape, horizontal, obstacles)?;
+                if across(&low) > across(&best) {
+                    best = low;
+                }
+            }
+        }
+        if across(&best) <= across(plain) {
+            return Ok(None);
+        }
+        // Back down by what it rose, plus the plain move's own vertical part.
+        let down = d.y - (best.pos.y - start.y);
+        let landed = self.sweep(best.pos, shape, DVec3::new(0.0, down, 0.0), obstacles)?;
+        Ok(Some(Moved {
+            pos: landed.pos,
+            faces: (best.faces & ACROSS) | landed.faces,
+            ground: landed.ground,
+            blocks: [best.blocks[0], landed.blocks[1], best.blocks[2]],
+        }))
     }
 
     /// Pushes a box that overlaps solid blocks out of them: the new position, or `None` when the

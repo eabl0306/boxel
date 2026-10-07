@@ -67,9 +67,9 @@ pub use crate::contacts::{BodyFilter, BodyHit, BodyIndex};
 pub use crate::core::{
     BlockBounds, BodyImpact, BodySettings, BodyStep, CollisionLayers, CollisionShape,
     CollisionTable, Contact, Grid, LocalBox, MAX_RAY_DISTANCE, MAX_SWEEP_DISTANCE, Probe,
-    RayResult, STOP_SPEED, Shape, ShapeHit, StepParams, SweepConfig, SweepOut, TestWorld, Unloaded,
-    VoxelFilter, VoxelHit, VoxelSource, axis_order, integrate_velocity, move_body, move_box,
-    predict, raycast_voxels, shape_contact, step_body,
+    RayResult, STOP_SPEED, Shape, ShapeHit, StepParams, StepUp, SweepConfig, SweepOut, TestWorld,
+    Unloaded, VoxelFilter, VoxelHit, VoxelSource, axis_order, integrate_velocity, move_body,
+    move_box, move_box_stepping, predict, raycast_voxels, shape_contact, step_body,
 };
 pub use boxel_voxel::WorldPos;
 pub use plugin::{PhysicsContent, PhysicsPlugin};

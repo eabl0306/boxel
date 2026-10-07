@@ -513,6 +513,11 @@ impl PhysicsSync {
 /// controller does not steer at all there (with `drag_xz = 0`, no air control; with
 /// `ground_friction = 0`, no walking). A jump sets the vertical velocity to `jump_speed` when the
 /// body is on the ground.
+///
+/// On the ground, the body steps up ledges up to `step_height` high without jumping (a slab, a
+/// stair of slabs; not a full block), as Minecraft's player and mobs do: the step moves it up
+/// within one fixed step (see `boxel_physics::move_box_stepping`). The body's position stays
+/// exact; a camera that follows it may smooth the rise for the eye.
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 #[require(MoveIntent)]
 pub struct CharacterController {
@@ -525,15 +530,19 @@ pub struct CharacterController {
     /// high with gravity 32, the default drag and 64 steps per second (Minecraft's jump is 1.25
     /// blocks), so a jump clears a one-block step.
     pub jump_speed: f64,
+    /// The highest ledge the body steps up onto while walking, blocks (Minecraft: 0.6, so a
+    /// slab of 0.5 is climbed and a full block is not). 0 turns the step-up off.
+    pub step_height: f64,
 }
 
 impl Default for CharacterController {
-    /// Walk 4.317 blocks/s, full air control, jump 9.5 blocks/s.
+    /// Walk 4.317 blocks/s, full air control, jump 9.5 blocks/s, step up 0.6 blocks.
     fn default() -> Self {
         Self {
             walk_speed: 4.317,
             air_control: 1.0,
             jump_speed: 9.5,
+            step_height: 0.6,
         }
     }
 }
