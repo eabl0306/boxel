@@ -1,5 +1,5 @@
 use crate::BUCKET_COUNT;
-use boxel_voxel::{Face, LightValue};
+use boxel_voxel::{Face, LightValue, ModelBox};
 use bytemuck::{Pod, Zeroable};
 use std::hash::{BuildHasher, Hasher};
 use std::ops::Range;
@@ -30,8 +30,8 @@ pub mod layout {
     /// Minecraft draws glowing blocks. Set by the mesher from `MaterialTable::emissive`.
     pub const FLAG_EMISSIVE: u32 = 1;
     /// Shift of the 3-bit shape code (flag bits 1 to 3, ADR 0018): how the shader turns the
-    /// quad's cell and face into geometry. Codes other than [`SHAPE_CUBE`] and
-    /// [`SHAPE_TURNED`] come from the per-block path and have `w = h = 1`.
+    /// quad's cell and face into geometry. [`SHAPE_CROSS`] and [`SHAPE_BOX`] come from the
+    /// per-block path and have `w = h = 1` ([`SHAPE_BOX`] reuses those 10 bits).
     pub const GEO_SHAPE_SHIFT: u32 = 29;
     /// Mask of the shape code (after the shift).
     pub const GEO_SHAPE_MASK: u32 = 7;
@@ -40,12 +40,6 @@ pub mod layout {
     /// A cube face whose texture is turned a quarter (transposed: its vertical runs along the
     /// face's u axis), for logs lying along X or Z. Greedy quads too.
     pub const SHAPE_TURNED: u8 = 1;
-    /// A face of the lower half of the cell (bottom slab): side faces span `y` in `0..0.5`, the
-    /// +Y face lies at `y + 0.5`.
-    pub const SHAPE_LOWER_HALF: u8 = 2;
-    /// A face of the upper half of the cell (top slab): side faces span `y` in `0.5..1`, the -Y
-    /// face lies at `y + 0.5`.
-    pub const SHAPE_UPPER_HALF: u8 = 3;
     /// A cross plant quad through the cell's diagonal, full height: face `PosX` is the one from
     /// `(0, 0)` to `(1, 1)` in (x, z), face `PosZ` the one from `(1, 0)` to `(0, 1)`. Drawn from
     /// both sides (cutout pipeline), without face shading, its light is the block's own cell.
@@ -68,6 +62,24 @@ pub mod layout {
     pub const SHAPE_FLUID_SLOPE: u8 = 7;
     /// Shift of the corner heights in `geo` of a [`SHAPE_FLUID_SLOPE`] quad (corners 0 and 1).
     pub const GEO_FLUID_SHIFT: u32 = GEO_W_SHIFT;
+    /// A face of one box of a block model made of boxes (slabs, stairs, fences, torches; ADR
+    /// 0020): the quad's `w - 1` and `h - 1` bits hold the box's index in the model box table
+    /// (`MaterialTable::model_boxes`, [`GEO_BOX_SHIFT`]), which the shader reads from its view
+    /// uniform. The face lies on the box's side toward the quad's face, spans the box along u
+    /// and v, and shades like that part of the cube face. Codes 2 and 3 (the slab halves of
+    /// ADR 0018) are free: slabs are boxes too.
+    pub const SHAPE_BOX: u8 = 6;
+    /// Shift of the model box index of a [`SHAPE_BOX`] quad (the `w - 1` and `h - 1` fields).
+    pub const GEO_BOX_SHIFT: u32 = GEO_W_SHIFT;
+    /// Mask of the model box index (after the shift): 10 bits.
+    pub const GEO_BOX_MASK: u32 = 1023;
+    /// Bits of the first word of a packed model box ([`pack_model_box`](crate::pack_model_box)):
+    /// min x, y, z then max x, y, z, 5 bits each (sixteenths, `0..=16`).
+    pub const BOX_COORD_BITS: u32 = 5;
+    /// Bits of each texture offset of the second word, biased by [`BOX_OFFSET_BIAS`].
+    pub const BOX_OFFSET_BITS: u32 = 6;
+    /// Bias of a packed texture offset (`-32..32` is stored as `0..64`).
+    pub const BOX_OFFSET_BIAS: i32 = 32;
     /// Mask of the texture layer.
     pub const MAT_LAYER_MASK: u32 = 0xFFF;
     /// Shift of the 4x2-bit AO field.
@@ -250,6 +262,19 @@ impl PackedQuad {
             | ((shape as u32 & GEO_SHAPE_MASK) << GEO_SHAPE_SHIFT);
         self
     }
+    /// The model box index of a [`layout::SHAPE_BOX`] quad (its `w - 1` and `h - 1` bits).
+    pub const fn box_index(self) -> u16 {
+        ((self.geo >> layout::GEO_BOX_SHIFT) & layout::GEO_BOX_MASK) as u16
+    }
+    /// Replaces the model box index (`0..1024`, debug-asserted); for [`layout::SHAPE_BOX`]
+    /// quads, whose `w` and `h` are 1.
+    pub const fn with_box_index(mut self, index: u16) -> Self {
+        use layout::*;
+        debug_assert!((index as u32) <= GEO_BOX_MASK);
+        self.geo = (self.geo & !(GEO_BOX_MASK << GEO_BOX_SHIFT))
+            | ((index as u32 & GEO_BOX_MASK) << GEO_BOX_SHIFT);
+        self
+    }
     /// True if the [`layout::FLAG_EMISSIVE`] flag is set.
     pub const fn is_emissive(self) -> bool {
         self.flags() as u32 & layout::FLAG_EMISSIVE != 0
@@ -286,6 +311,39 @@ impl PackedQuad {
                 (p, face)
             })
         })
+    }
+}
+
+/// A model box as the shaders read it (two words, [`layout::BOX_COORD_BITS`]): word 0 holds the
+/// min and max corners in sixteenths, word 1 the texture offset of each axis biased by
+/// [`layout::BOX_OFFSET_BIAS`]. Debug-asserts a valid box.
+pub fn pack_model_box(b: ModelBox) -> [u32; 2] {
+    use layout::*;
+    debug_assert!(b.is_valid(), "{b:?}");
+    let (min, max) = (b.bounds.min, b.bounds.max);
+    let mut word0 = 0;
+    for (k, &c) in min.iter().chain(&max).enumerate() {
+        word0 |= u32::from(c) << (BOX_COORD_BITS * k as u32);
+    }
+    let mut word1 = 0;
+    for (k, &t) in b.texture_offset.iter().enumerate() {
+        word1 |= ((i32::from(t) + BOX_OFFSET_BIAS) as u32) << (BOX_OFFSET_BITS * k as u32);
+    }
+    [word0, word1]
+}
+
+/// The model box of a packed one ([`pack_model_box`]).
+pub fn unpack_model_box(words: [u32; 2]) -> ModelBox {
+    use layout::*;
+    let coord = |k: u32| ((words[0] >> (BOX_COORD_BITS * k)) & 31) as u8;
+    let offset =
+        |k: u32| (((words[1] >> (BOX_OFFSET_BITS * k)) & 63) as i32 - BOX_OFFSET_BIAS) as i8;
+    ModelBox {
+        bounds: boxel_voxel::CollisionBox::new(
+            [coord(0), coord(1), coord(2)],
+            [coord(3), coord(4), coord(5)],
+        ),
+        texture_offset: [offset(0), offset(1), offset(2)],
     }
 }
 

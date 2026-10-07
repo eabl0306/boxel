@@ -12,8 +12,11 @@ use crate::upload::{UploadTargets, Uploads, arena_len, light_entries};
 use boxel_camera::{Camera, CameraView};
 use boxel_gfx::Tier;
 use boxel_math::{Frustum, I64Vec3, Mat4, UVec2, Vec3, wrap_to_i32};
-use boxel_mesh::{BUCKET_COUNT, ChunkMesh, TRANSLUCENT_BUCKET};
-use boxel_shaders::gpu::{ChunkGpu, ViewUniform, bindings};
+use boxel_mesh::{BUCKET_COUNT, ChunkMesh, TRANSLUCENT_BUCKET, pack_model_box};
+use boxel_shaders::gpu::{
+    ChunkGpu, VIEW_BOX_CAPACITY, VIEW_BOXES_OFFSET, VIEW_BUFFER_SIZE, ViewUniform, bindings,
+};
+use boxel_voxel::ModelBox;
 use std::sync::Arc;
 use wgpu::util::DeviceExt as _;
 
@@ -230,7 +233,7 @@ impl VoxelRenderer {
 
         let view_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("boxel view"),
-            size: size_of::<ViewUniform>() as u64,
+            size: VIEW_BUFFER_SIZE,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -359,6 +362,33 @@ impl VoxelRenderer {
         })
     }
 
+    /// Sets the model box table the `SHAPE_BOX` quads of the meshes index (ADR 0020):
+    /// `boxel_mesh::MaterialTable::model_boxes` of the material table the meshes come from. It
+    /// goes into the view uniform (after the per-frame part), written here once, and to the
+    /// translucent sorter. Until it is set the table is empty: box faces collapse to nothing
+    /// (and sort as cube faces). Boxes past [`VIEW_BOX_CAPACITY`] are dropped with an error
+    /// log (the registry never makes that many).
+    pub fn set_model_boxes(&mut self, queue: &wgpu::Queue, boxes: &[ModelBox]) {
+        let boxes = if boxes.len() > VIEW_BOX_CAPACITY {
+            tracing::error!(
+                "{} model boxes, the view uniform holds {VIEW_BOX_CAPACITY}",
+                boxes.len()
+            );
+            &boxes[..VIEW_BOX_CAPACITY]
+        } else {
+            boxes
+        };
+        let mut words = vec![[0u32; 2]; VIEW_BOX_CAPACITY];
+        for (slot, &b) in words.iter_mut().zip(boxes) {
+            *slot = pack_model_box(b);
+        }
+        queue.write_buffer(
+            &self.view_buffer,
+            VIEW_BOXES_OFFSET,
+            bytemuck::cast_slice(&words),
+        );
+        self.sorter.set_boxes(Arc::from(boxes));
+    }
     /// Active tier.
     pub fn tier(&self) -> Tier {
         self.tier

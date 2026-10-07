@@ -20,7 +20,7 @@ use crate::{DEPTH_FORMAT, MAIN_COLOR_FORMAT};
 use boxel_gfx::Tier;
 use boxel_math::{Aabb, IVec3, Vec3};
 use boxel_mesh::{CUTOUT_BUCKET, MAX_QUADS_PER_BUCKET, TRANSLUCENT_BUCKET};
-use boxel_shaders::gpu::{ViewUniform, bindings};
+use boxel_shaders::gpu::{VIEW_BUFFER_SIZE, bindings};
 use boxel_shaders::{ShaderModuleId, create_module};
 
 /// Edge of a render chunk in voxels (`CHUNK_SIZE` in `common.wgsl`).
@@ -336,7 +336,7 @@ fn uniform_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGrou
         ty: wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Uniform,
             has_dynamic_offset: false,
-            min_binding_size: wgpu::BufferSize::new(size_of::<ViewUniform>() as u64),
+            min_binding_size: wgpu::BufferSize::new(VIEW_BUFFER_SIZE),
         },
         count: None,
     }

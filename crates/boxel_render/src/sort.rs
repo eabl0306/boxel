@@ -53,7 +53,7 @@ use crate::path::CHUNK_EDGE;
 use crate::renderer::ViewParams;
 use boxel_math::{Aabb, DVec3, I64Vec3, Vec3};
 use boxel_mesh::{ChunkMesh, PackedQuad, TRANSLUCENT_BUCKET, layout};
-use boxel_voxel::Face;
+use boxel_voxel::{CollisionBox, Face, ModelBox};
 use boxel_world::jobs::{InlineExecutor, JobExecutor, TaskPoolExecutor};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
@@ -120,24 +120,42 @@ pub(crate) struct QuadBox {
 
 impl QuadBox {
     /// The geometry `common.wgsl` (`decode_quad`) builds for `quad`, without the sub-pixel edge
-    /// growth.
-    pub fn of(quad: PackedQuad) -> Self {
+    /// growth. `boxes` is the model box table a `SHAPE_BOX` quad indexes (a box index outside
+    /// it counts as the cube face).
+    pub fn of(quad: PackedQuad, boxes: &[ModelBox]) -> Self {
         let face = quad.face();
         let (n, u, v) = face.axes();
         let p = quad.pos().map(|c| c as i32 * SUB);
         let positive = face.index().is_multiple_of(2);
         let mut min = p;
         let mut max = p;
+        let surface = (layout::FLUID_SURFACE * SUB as f32) as i32;
+        if quad.shape() == layout::SHAPE_BOX {
+            // One box face (ADR 0020): the box spans its own sixteenths of the cell.
+            let b = boxes
+                .get(usize::from(quad.box_index()))
+                .map_or(CollisionBox::FULL, |b| b.bounds);
+            for a in [u, v] {
+                min[a] = p[a] + i32::from(b.min[a]);
+                max[a] = p[a] + i32::from(b.max[a]);
+            }
+            let at = p[n] + i32::from(if positive { b.max[n] } else { b.min[n] });
+            min[n] = at;
+            max[n] = at;
+            return Self {
+                min,
+                max,
+                plane: Some(Plane {
+                    axis: n,
+                    at,
+                    positive,
+                }),
+            };
+        }
         max[u] += quad.w() as i32 * SUB;
         max[v] += quad.h() as i32 * SUB;
         let mut at = p[n] + if positive { SUB } else { 0 };
-        let half = SUB / 2;
-        let surface = (layout::FLUID_SURFACE * SUB as f32) as i32;
         match quad.shape() {
-            layout::SHAPE_LOWER_HALF if n == 1 => at = p[1] + if positive { half } else { 0 },
-            layout::SHAPE_LOWER_HALF => max[1] = p[1] + half,
-            layout::SHAPE_UPPER_HALF if n == 1 => at = p[1] + if positive { SUB } else { half },
-            layout::SHAPE_UPPER_HALF => min[1] = p[1] + half,
             layout::SHAPE_FLUID_SURFACE if n == 1 && positive => at = p[1] + surface,
             layout::SHAPE_FLUID_SURFACE if n != 1 => max[1] = p[1] + surface,
             layout::SHAPE_FLUID_SLOPE => {
@@ -357,9 +375,13 @@ fn block_cell(eye: [f64; 3]) -> Validity {
 
 /// The back-to-front order of `quads` (indices) for a camera at `eye` (chunk-local voxels), and
 /// the cell where it stays right. See the module docs.
-pub(crate) fn sort_order(quads: &[PackedQuad], eye: DVec3) -> (Vec<u32>, Validity) {
+pub(crate) fn sort_order(
+    quads: &[PackedQuad],
+    model_boxes: &[ModelBox],
+    eye: DVec3,
+) -> (Vec<u32>, Validity) {
     let eye = (eye * f64::from(SUB)).to_array();
-    let boxes: Vec<QuadBox> = quads.iter().map(|&q| QuadBox::of(q)).collect();
+    let boxes: Vec<QuadBox> = quads.iter().map(|&q| QuadBox::of(q, model_boxes)).collect();
     // Squared distances are not negative: their bits order like their values.
     let keys: Vec<u64> = boxes
         .iter()
@@ -435,10 +457,14 @@ fn topo_order(boxes: &[QuadBox], keys: &[u64], eye: [f64; 3]) -> Vec<u32> {
 }
 
 /// A chunk's translucent quads in back-to-front order for `eye` (chunk-local voxels), and the
-/// cell where the order stays right.
-pub(crate) fn sort_bucket(mesh: &ChunkMesh, eye: DVec3) -> (Vec<PackedQuad>, Validity) {
+/// cell where the order stays right; `boxes` is the model box table.
+pub(crate) fn sort_bucket(
+    mesh: &ChunkMesh,
+    boxes: &[ModelBox],
+    eye: DVec3,
+) -> (Vec<PackedQuad>, Validity) {
     let quads = mesh.bucket(TRANSLUCENT_BUCKET);
-    let (order, valid) = sort_order(quads, eye);
+    let (order, valid) = sort_order(quads, boxes, eye);
     (order.iter().map(|&i| quads[i as usize]).collect(), valid)
 }
 
@@ -492,6 +518,7 @@ struct SortTask {
     id: u64,
     ticket: u64,
     mesh: Arc<ChunkMesh>,
+    boxes: Arc<[ModelBox]>,
     eye: DVec3,
 }
 
@@ -520,6 +547,8 @@ pub(crate) struct TranslucentSorter {
     /// Something besides the camera changed since the last scan (a mesh, a result, the budget).
     dirty: bool,
     stats: SortStats,
+    /// The model box table the quads index (`SHAPE_BOX` quads).
+    boxes: Arc<[ModelBox]>,
 }
 
 impl TranslucentSorter {
@@ -537,7 +566,18 @@ impl TranslucentSorter {
             last_eye: None,
             dirty: false,
             stats: SortStats::default(),
+            boxes: Arc::from([]),
         }
+    }
+
+    /// The model box table changed: every chunk sorts again with it.
+    pub fn set_boxes(&mut self, boxes: Arc<[ModelBox]>) {
+        self.boxes = boxes;
+        for state in self.chunks.values_mut() {
+            state.valid = None;
+            state.ticket = None;
+        }
+        self.dirty = true;
     }
 
     /// The mode.
@@ -668,6 +708,7 @@ impl TranslucentSorter {
                 id,
                 ticket,
                 mesh: Arc::clone(&state.mesh),
+                boxes: Arc::clone(&self.boxes),
                 eye: local_eye(view, state.origin),
             });
             if job_quads >= JOB_QUADS {
@@ -687,7 +728,7 @@ impl TranslucentSorter {
         let job = Box::new(move || {
             for task in tasks {
                 let sorted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    sort_bucket(&task.mesh, task.eye)
+                    sort_bucket(&task.mesh, &task.boxes, task.eye)
                 }))
                 .ok();
                 // The receiver lives as long as the renderer; a dropped one needs no answer.
@@ -764,15 +805,22 @@ mod tests {
     use boxel_camera::{Camera, CameraView};
     use boxel_mesh::{BUCKET_COUNT, MaterialTable, MeshInput, MeshOptions, Mesher};
     use boxel_transform::Transform;
-    use boxel_voxel::{BlockRegistry, BlockState, ChunkData, Face, LocalPos};
+    use boxel_voxel::{BlockRegistry, BlockState, ChunkData, Face, LocalPos, ModelBox};
 
     fn quad(pos: [u32; 3], w: u32, h: u32, face: Face) -> PackedQuad {
         PackedQuad::new(pos, w, h, face, 0)
     }
 
+    impl QuadBox {
+        /// [`QuadBox::of`] without model boxes (greedy, fluid and cross quads).
+        fn of_test(quad: PackedQuad) -> Self {
+            Self::of(quad, &[])
+        }
+    }
+
     #[test]
     fn quad_boxes_follow_the_shader_geometry() {
-        let b = QuadBox::of(quad([2, 3, 4], 5, 6, Face::PosY));
+        let b = QuadBox::of_test(quad([2, 3, 4], 5, 6, Face::PosY));
         assert_eq!((b.min, b.max), ([32, 64, 64], [112, 64, 160]));
         assert_eq!(
             b.plane,
@@ -783,21 +831,36 @@ mod tests {
             })
         );
         // -X: plane at x, u = z, v = y
-        let b = QuadBox::of(quad([2, 3, 4], 5, 6, Face::NegX));
+        let b = QuadBox::of_test(quad([2, 3, 4], 5, 6, Face::NegX));
         assert_eq!((b.min, b.max), ([32, 48, 64], [32, 144, 144]));
         // fluid surface: the top drops to 14/16, the sides end there
-        let top =
-            QuadBox::of(quad([0, 3, 0], 4, 4, Face::PosY).with_shape(layout::SHAPE_FLUID_SURFACE));
+        let top = QuadBox::of_test(
+            quad([0, 3, 0], 4, 4, Face::PosY).with_shape(layout::SHAPE_FLUID_SURFACE),
+        );
         assert_eq!(top.plane.map(|p| p.at), Some(3 * 16 + 14));
-        let side =
-            QuadBox::of(quad([0, 3, 0], 4, 1, Face::PosZ).with_shape(layout::SHAPE_FLUID_SURFACE));
+        let side = QuadBox::of_test(
+            quad([0, 3, 0], 4, 1, Face::PosZ).with_shape(layout::SHAPE_FLUID_SURFACE),
+        );
         assert_eq!((side.min[1], side.max[1], side.min[2]), (48, 62, 16));
-        let bottom =
-            QuadBox::of(quad([0, 3, 0], 4, 4, Face::NegY).with_shape(layout::SHAPE_FLUID_SURFACE));
+        let bottom = QuadBox::of_test(
+            quad([0, 3, 0], 4, 4, Face::NegY).with_shape(layout::SHAPE_FLUID_SURFACE),
+        );
         assert_eq!(bottom.plane.map(|p| p.at), Some(48));
-        // slabs
-        let lower = |f| QuadBox::of(quad([0, 3, 0], 1, 1, f).with_shape(layout::SHAPE_LOWER_HALF));
-        let upper = |f| QuadBox::of(quad([0, 3, 0], 1, 1, f).with_shape(layout::SHAPE_UPPER_HALF));
+        // box faces (ADR 0020): the slab halves and a torch stick, from the box table
+        let table = [
+            ModelBox::new([0, 0, 0], [16, 8, 16]),
+            ModelBox::new([0, 8, 0], [16, 16, 16]),
+            ModelBox::new([7, 0, 7], [9, 10, 9]),
+        ];
+        let boxed = |f, index| {
+            QuadBox::of(
+                quad([0, 3, 0], 1, 1, f)
+                    .with_shape(layout::SHAPE_BOX)
+                    .with_box_index(index),
+                &table,
+            )
+        };
+        let (lower, upper) = (|f| boxed(f, 0), |f| boxed(f, 1));
         assert_eq!(lower(Face::PosY).plane.map(|p| p.at), Some(56));
         assert_eq!(lower(Face::NegY).plane.map(|p| p.at), Some(48));
         assert_eq!(upper(Face::PosY).plane.map(|p| p.at), Some(64));
@@ -810,8 +873,14 @@ mod tests {
             (upper(Face::PosX).min[1], upper(Face::PosX).max[1]),
             (56, 64)
         );
+        let stick = boxed(Face::NegX, 2);
+        assert_eq!((stick.min, stick.max), ([7, 48, 7], [7, 58, 9]));
+        assert_eq!(stick.plane.map(|p| (p.axis, p.positive)), Some((0, false)));
+        // an index outside the table counts as the cube face
+        assert_eq!(boxed(Face::PosY, 9).plane.map(|p| p.at), Some(64));
         // a cross covers its cell and has no plane
-        let cross = QuadBox::of(quad([1, 1, 1], 1, 1, Face::PosX).with_shape(layout::SHAPE_CROSS));
+        let cross =
+            QuadBox::of_test(quad([1, 1, 1], 1, 1, Face::PosX).with_shape(layout::SHAPE_CROSS));
         assert_eq!(
             (cross.min, cross.max, cross.plane),
             ([16; 3], [32; 3], None)
@@ -820,7 +889,12 @@ mod tests {
 
     #[test]
     fn sloped_fluid_quads_are_boxes_ordered_by_the_planes_around_them() {
-        let sloped = |f| QuadBox::of(quad([2, 3, 4], 1, 1, f).with_fluid_heights([16, 14, 9, 14]));
+        let sloped = |f| {
+            QuadBox::of(
+                quad([2, 3, 4], 1, 1, f).with_fluid_heights([16, 14, 9, 14]),
+                &[],
+            )
+        };
         // the top: no plane, the cell between its lowest and highest corner
         let top = sloped(Face::PosY);
         assert_eq!(
@@ -828,7 +902,10 @@ mod tests {
             ([32, 57, 64], [48, 64, 80], None)
         );
         // a flat one is a plane again
-        let flat = QuadBox::of(quad([2, 3, 4], 1, 1, Face::PosY).with_fluid_heights([13; 4]));
+        let flat = QuadBox::of(
+            quad([2, 3, 4], 1, 1, Face::PosY).with_fluid_heights([13; 4]),
+            &[],
+        );
         assert_eq!(flat.plane.map(|p| p.at), Some(48 + 13));
         // the sides end at the higher corner of their edge, the bottom is the cube's
         assert_eq!(sloped(Face::PosX).max[1], 48 + 14);
@@ -848,14 +925,14 @@ mod tests {
         ];
         assert_eq!(order_of(&quads, DVec3::new(2.5, 9.0, 4.5)), [1, 0]);
         assert_eq!(order_of(&quads, DVec3::new(2.5, 1.5, 4.5)), [0, 1]);
-        let (_, cell) = sort_order(&quads, DVec3::new(2.5, 9.0, 4.5));
+        let (_, cell) = sort_order(&quads, &[], DVec3::new(2.5, 9.0, 4.5));
         assert_eq!(cell.lo[1], 64.0);
-        let (_, cell) = sort_order(&quads, DVec3::new(2.5, 3.2, 4.5));
+        let (_, cell) = sort_order(&quads, &[], DVec3::new(2.5, 3.2, 4.5));
         assert_eq!((cell.lo[1], cell.hi[1]), (32.0, 57.0));
     }
 
     fn order_of(quads: &[PackedQuad], eye: DVec3) -> Vec<u32> {
-        sort_order(quads, eye).0
+        sort_order(quads, &[], eye).0
     }
 
     #[test]
@@ -880,7 +957,7 @@ mod tests {
         let water = quad([0, 9, 0], 32, 32, Face::PosY);
         let glass = quad([1, 7, 1], 1, 1, Face::PosY);
         let eye = DVec3::new(1.5, 11.0, 1.5);
-        let boxes = [QuadBox::of(water), QuadBox::of(glass)];
+        let boxes = [QuadBox::of_test(water), QuadBox::of_test(glass)];
         let e = (eye * 16.0).to_array();
         assert!(
             boxes[0].center_distance2(e) > boxes[1].center_distance2(e),
@@ -910,7 +987,7 @@ mod tests {
             quad([8, 8, 8], 1, 1, Face::NegY),
         ];
         let eye = DVec3::new(10.0, 10.0, 10.0);
-        let b = quads.map(QuadBox::of);
+        let b = quads.map(QuadBox::of_test);
         let e = (eye * 16.0).to_array();
         assert_eq!(pair_order(&b[0], &b[1], e), Some(true));
         assert_eq!(pair_order(&b[1], &b[2], e), Some(true));
@@ -927,7 +1004,7 @@ mod tests {
             quad([0, 8, 0], 4, 4, Face::PosY),
             quad([5, 0, 0], 1, 1, Face::PosX),
         ];
-        let (_, cell) = sort_order(&quads, DVec3::new(2.0, 5.0, 30.0));
+        let (_, cell) = sort_order(&quads, &[], DVec3::new(2.0, 5.0, 30.0));
         // between the two y planes (3 and 9), below the x plane (6), no z plane
         assert_eq!(cell.lo, [f64::NEG_INFINITY, 48.0, f64::NEG_INFINITY]);
         assert_eq!(cell.hi, [96.0, 144.0, f64::INFINITY]);
@@ -946,12 +1023,12 @@ mod tests {
             quad([6, 2, 2], 1, 1, Face::PosX),
         ];
         // near: every plane crossing counts
-        let (_, near) = sort_order(&quads, DVec3::new(5.0, 20.0, 40.0));
+        let (_, near) = sort_order(&quads, &[], DVec3::new(5.0, 20.0, 40.0));
         assert_eq!(near.slack2, 0.0);
         assert!(!near.contains([7.5 * 16.0, 20.0 * 16.0, 40.0 * 16.0]));
         // 240 voxels away (176 past the exact distance): 22 voxels of slack, then the cell
         let eye = DVec3::new(5.0, 16.0, 256.0);
-        let (_, far) = sort_order(&quads, eye);
+        let (_, far) = sort_order(&quads, &[], eye);
         let at = |x: f64| [x * 16.0, 16.0 * 16.0, 256.0 * 16.0];
         assert!(far.contains(at(26.9)), "crossed x = 7, within the slack");
         assert!(!far.contains(at(27.1)));
@@ -965,10 +1042,10 @@ mod tests {
             .map(|i| quad([(i % 32) as u32, (i / 32) as u32, 0], 1, 1, Face::PosZ))
             .collect();
         let eye = DVec3::new(0.5, 0.5, 10.0);
-        let (order, cell) = sort_order(&quads, eye);
+        let (order, cell) = sort_order(&quads, &[], eye);
         // farthest center first
         let d = |i: u32| {
-            let b = QuadBox::of(quads[i as usize]);
+            let b = QuadBox::of_test(quads[i as usize]);
             b.center_distance2((eye * 16.0).to_array())
         };
         assert!(order.windows(2).all(|w| d(w[0]) >= d(w[1])));
@@ -978,7 +1055,7 @@ mod tests {
         assert_eq!(cell.hi, [16.0, 16.0, 160.0]);
         assert_eq!(cell.slack2, 0.0);
         // far away the order is kept for an eighth of the distance past 64 voxels
-        let (_, far) = sort_order(&quads, DVec3::new(336.0, 16.0, 16.0));
+        let (_, far) = sort_order(&quads, &[], DVec3::new(336.0, 16.0, 16.0));
         assert_eq!(far.slack2.sqrt(), 32.0 * 16.0);
         assert!(far.contains([368.0 * 16.0, 256.0, 256.0]));
         assert!(!far.contains([368.5 * 16.0, 256.0, 256.0]));
@@ -1011,7 +1088,7 @@ mod tests {
     /// of one plane) go away-facing first. Returns the pairs checked, or the first violation.
     fn check_with_rays(quads: &[PackedQuad], order: &[u32], eye: DVec3) -> Result<usize, String> {
         let eye = (eye * 16.0).to_array();
-        let boxes: Vec<QuadBox> = quads.iter().map(|&q| QuadBox::of(q)).collect();
+        let boxes: Vec<QuadBox> = quads.iter().map(|&q| QuadBox::of_test(q)).collect();
         let mut rank = vec![0; quads.len()];
         for (r, &i) in order.iter().enumerate() {
             rank[i as usize] = r;
@@ -1141,7 +1218,7 @@ mod tests {
                 quads.len()
             );
             for eye in eyes {
-                let (order, cell) = sort_order(quads, eye);
+                let (order, cell) = sort_order(quads, &[], eye);
                 let checked =
                     check_with_rays(quads, &order, eye).unwrap_or_else(|e| panic!("{name}: {e}"));
                 assert!(checked > 0, "{name} {eye}: no overlaps checked");
@@ -1164,11 +1241,11 @@ mod tests {
         for (name, mesh) in scenes() {
             let quads = mesh.bucket(TRANSLUCENT_BUCKET);
             let eye = DVec3::new(13.3, 14.2, 25.1);
-            let (_, cell) = sort_order(quads, eye);
+            let (_, cell) = sort_order(quads, &[], eye);
             // another point of the cell, then one across its +z bound if it has one
             let inside = DVec3::new(13.4, 14.25, 25.05);
             assert!(cell.contains((inside * 16.0).to_array()), "{name}");
-            check_with_rays(quads, &sort_order(quads, eye).0, inside)
+            check_with_rays(quads, &sort_order(quads, &[], eye).0, inside)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
         }
     }

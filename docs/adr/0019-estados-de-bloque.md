@@ -126,6 +126,8 @@ El diseño ya cubre la segunda ronda sin cambios de modelo:
   recalculan con `with`. Falta el sistema que actualiza vecinos.
 - Antorchas de pared: `facing`. Agua: `level` 0 a 15, con altura por esquina cuando fluya.
 
+Escaleras, vallas y antorchas ya están hechas (ADR 0020).
+
 ## Consecuencias
 
 - Agregar una variante es agregar un valor a una propiedad, no un bloque nuevo.

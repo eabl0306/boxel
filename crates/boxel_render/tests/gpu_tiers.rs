@@ -25,8 +25,9 @@
 //!   including GL where reverse-Z loses its precision gain);
 //! - the blocks of ADR 0018, meshed by the real `Mesher` over two chunks: a water pool and a
 //!   glass box (translucent bucket, blended back to front), bottom and top slabs, cross plants
-//!   and logs along X and Z, compared with the same scene without its translucent quads (the
-//!   translucent pass draws);
+//!   and logs along X and Z, and the blocks of ADR 0020 (stairs of every kind, a fence run,
+//!   torches), compared with the same scene without its translucent quads (the translucent pass
+//!   draws) and without its model box table (the box faces draw);
 //! - a stone floor textured from a tiny generated resource pack (`TextureSource::Pack`, 32x32
 //!   layers): the pack's pixels must show on every tier.
 //!
@@ -398,6 +399,32 @@ fn special_scene(registry: &BlockRegistry) -> Vec<(IVec3, ChunkMesh)> {
         put(15, 1, z, get("boxel:stone"));
         put(16, 2, z, get("boxel:stone_slab[type=top]"));
     }
+    // ADR 0020: stairs (straight, corners, upside down), a fence run against a stone block, a
+    // torch on the floor and a wall torch on a stone block.
+    for (x, name) in [
+        (10, "boxel:stone_stairs[facing=east]"),
+        (11, "boxel:oak_stairs[facing=east,shape=outer_left]"),
+        (12, "boxel:stone_stairs[facing=north,shape=inner_right]"),
+        (13, "boxel:oak_stairs[facing=west,half=top]"),
+    ] {
+        put(x, 1, 26, get(name));
+    }
+    put(
+        13,
+        2,
+        27,
+        get("boxel:stone_stairs[facing=south,half=top,shape=outer_right]"),
+    );
+    put(15, 1, 24, get("boxel:stone"));
+    put(15, 1, 25, get("boxel:oak_fence[north=true,south=true]"));
+    put(15, 1, 26, get("boxel:oak_fence[north=true,east=true]"));
+    for x in 16..19 {
+        put(x, 1, 26, get("boxel:oak_fence[east=true,west=true]"));
+    }
+    put(19, 1, 26, get("boxel:oak_fence[west=true]"));
+    put(17, 1, 28, get("boxel:torch"));
+    put(21, 1, 27, get("boxel:stone"));
+    put(21, 1, 28, get("boxel:wall_torch[facing=south]"));
     // Plants and logs.
     for (i, x) in (20..28).enumerate() {
         let plant = if i % 3 == 0 {
@@ -411,20 +438,20 @@ fn special_scene(registry: &BlockRegistry) -> Vec<(IVec3, ChunkMesh)> {
     for z in 22..28 {
         put(40, 1, z, get("boxel:log[axis=z]"));
     }
-    // Flowing water: a source at (11, 1, 23) and the levels of its spread around it (sloped
-    // tops), and a source over a falling column at (4, 1..=5, 26).
-    for x in 5..18 {
-        for z in 18..30 {
-            let d = (x - 11i32).abs() + (z - 23i32).abs();
+    // Flowing water: a source at (35, 1, 16) and the levels of its spread around it (sloped
+    // tops, across the chunk border), and a source over a falling column at (46, 1..=5, 12).
+    for x in 29..42 {
+        for z in 10..23 {
+            let d = (x - 35i32).abs() + (z - 16i32).abs();
             if d <= 6 {
                 put(x, 1, z, get(&format!("boxel:water[level={d}]")));
             }
         }
     }
     for y in 1..5 {
-        put(4, y, 26, get("boxel:water[level=8]"));
+        put(46, y, 12, get("boxel:water[level=8]"));
     }
-    put(4, 5, 26, get("boxel:water"));
+    put(46, 5, 12, get("boxel:water"));
     let chunks = dense.map(|d| ChunkData::from_dense(&d));
     let materials = MaterialTable::from_registry(registry);
     let mut mesher = Mesher::new();
@@ -550,6 +577,8 @@ struct TierImages {
     /// The blocks of ADR 0018 ([`special_scene`]), and without their translucent quads.
     special: RgbaImage,
     special_opaque: RgbaImage,
+    /// `special` drawn with an empty model box table (ADR 0020): its box faces vanish.
+    special_no_boxes: RgbaImage,
     /// Full arena: after a failed grow of `REMOVED_CHUNK` (expected: `heightfield`), after its
     /// in-place shrink to a hidden quad (`minus_chunk`) and after growing it back
     /// (`heightfield`).
@@ -915,6 +944,9 @@ fn render_tier(
     if sloped < 40 {
         return Err(format!("special scene: only {sloped} sloped fluid quads"));
     }
+    // The model boxes of the stairs, fences and torches (ADR 0020).
+    let materials = MaterialTable::from_registry(registry);
+    renderer.set_model_boxes(&queue, materials.model_boxes());
     let upload = |renderer: &mut VoxelRenderer, opaque_only: bool| {
         for (c, mesh) in &special_meshes {
             let mesh = if opaque_only {
@@ -934,6 +966,11 @@ fn render_tier(
     upload(&mut renderer, true)?;
     let (special_opaque, _) = render(&device, &queue, &mut renderer, &special_view())?;
     let opaque_draws = renderer.stats().draws;
+    // Control: without the box table the box faces collapse, the picture changes.
+    upload(&mut renderer, false)?;
+    renderer.set_model_boxes(&queue, &[]);
+    let (special_no_boxes, _) = render(&device, &queue, &mut renderer, &special_view())?;
+    renderer.set_model_boxes(&queue, materials.model_boxes());
     // Both chunks have translucent quads: one more draw each on every tier.
     if draws != opaque_draws + 2 {
         return Err(format!(
@@ -958,6 +995,7 @@ fn render_tier(
         far_back,
         special,
         special_opaque,
+        special_no_boxes,
         full_arena,
     })
 }
@@ -1097,6 +1135,7 @@ fn tiers_render_identically() {
                     (&name("far_back"), &i.far_back),
                     (&name("special"), &i.special),
                     (&name("special_opaque"), &i.special_opaque),
+                    (&name("special_no_boxes"), &i.special_no_boxes),
                     (&name("full_arena_kept"), &i.full_arena[0]),
                     (&name("full_arena_shrunk"), &i.full_arena[1]),
                     (&name("full_arena_regrown"), &i.full_arena[2]),
@@ -1125,6 +1164,12 @@ fn tiers_render_identically() {
                 ),
                 (&name("special"), &i.special),
                 (&name("special_opaque"), &i.special_opaque),
+                0.01,
+            );
+            report.check_differs(
+                &format!("{label} {}: special scene without its model boxes", i.tier),
+                (&name("special"), &i.special),
+                (&name("special_no_boxes"), &i.special_no_boxes),
                 0.01,
             );
             report.check_differs(
@@ -1179,6 +1224,11 @@ fn tiers_render_identically() {
                 ("far_both", &best.far_both, &i.far_both),
                 ("special", &best.special, &i.special),
                 ("special_opaque", &best.special_opaque, &i.special_opaque),
+                (
+                    "special_no_boxes",
+                    &best.special_no_boxes,
+                    &i.special_no_boxes,
+                ),
             ] {
                 report.check_same(
                     &format!("{label}: {} vs {} ({scene})", i.tier, best.tier),

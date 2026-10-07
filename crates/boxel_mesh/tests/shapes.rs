@@ -1,78 +1,138 @@
-//! The per-block path of the non-cube blocks (ADR 0018): slabs, cross plants and turned cubes,
-//! against brute-force rules written here, independent of the mesher.
+//! The per-block path of the non-cube blocks (ADR 0018, ADR 0020): models made of boxes (slabs,
+//! stairs, fences, torches), cross plants and turned cubes, against brute-force rules written
+//! here, sixteenth by sixteenth, independent of the mesher.
 
 mod common;
 
 use boxel_mesh::{
     AoPolicy, BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, FaceShading, MaterialTable, MeshOptions,
-    Mesher, PackedQuad, PaddedChunk, VoxelClass, layout, reference_face_shading_at,
+    Mesher, PackedQuad, PaddedChunk, VoxelClass, layout, reference_box_face_shading_at,
     reference_visible_faces,
 };
-use boxel_voxel::{Axis, BlockModel, BlockRegistry, Face, LightValue, RenderShape, SlabHalf};
+use boxel_voxel::{
+    Axis, BlockModel, BlockRegistry, Face, Facing, FenceSides, LightValue, ModelBox, RenderShape,
+    SlabHalf, StairShape,
+};
 use common::{Fill, LIGHT_FILLS, random_light, random_padded, set_material};
 use std::collections::BTreeSet;
 
 /// Materials: 1..=2 opaque cubes, 3 cutout cube, 4 translucent cube, 5 bottom slab, 6 top
 /// slab, 7 a cross (cutout), 8 a cube turned to X, 9 a cube turned to Z, 10 a translucent
-/// bottom slab. Layer of (material, face) is `material * 6 + face`.
+/// bottom slab, 11 and 12 stairs (two of each), 13 and 14 fences, 15 a torch and 16 a wall
+/// torch (cutout). Layer of (material, face) is `material * 6 + face`.
 const BOTTOM: u16 = 5;
 const TOP: u16 = 6;
 const CROSS: u16 = 7;
 const LOG_X: u16 = 8;
 const LOG_Z: u16 = 9;
 const GLASS_SLAB: u16 = 10;
-const ALL: [u16; 10] = [1, 2, 3, 4, BOTTOM, TOP, CROSS, LOG_X, LOG_Z, GLASS_SLAB];
+const STAIRS: u16 = 11;
+const STAIRS_TOP: u16 = 12;
+const FENCE: u16 = 13;
+const FENCE_END: u16 = 14;
+const TORCH: u16 = 15;
+const WALL_TORCH: u16 = 16;
+const ALL: [u16; 16] = [
+    1, 2, 3, 4, BOTTOM, TOP, CROSS, LOG_X, LOG_Z, GLASS_SLAB, STAIRS, STAIRS_TOP, FENCE, FENCE_END,
+    TORCH, WALL_TORCH,
+];
+
+/// The model of a material of [`table`].
+fn model_of(m: u16) -> BlockModel {
+    match m {
+        BOTTOM | GLASS_SLAB => BlockModel::Slab(SlabHalf::Bottom),
+        TOP => BlockModel::Slab(SlabHalf::Top),
+        CROSS => BlockModel::Cross,
+        LOG_X => BlockModel::Cube { axis: Axis::X },
+        LOG_Z => BlockModel::Cube { axis: Axis::Z },
+        STAIRS => BlockModel::Stairs {
+            facing: Facing::East,
+            half: SlabHalf::Bottom,
+            shape: StairShape::Straight,
+        },
+        STAIRS_TOP => BlockModel::Stairs {
+            facing: Facing::North,
+            half: SlabHalf::Top,
+            shape: StairShape::InnerLeft,
+        },
+        FENCE => BlockModel::Fence {
+            sides: FenceSides(0b1111),
+        },
+        FENCE_END => BlockModel::Fence {
+            sides: FenceSides::NONE.with(Facing::West, true),
+        },
+        TORCH => BlockModel::Torch,
+        WALL_TORCH => BlockModel::WallTorch {
+            facing: Facing::South,
+        },
+        _ => BlockModel::CUBE,
+    }
+}
 
 fn table() -> MaterialTable {
-    let shapes = vec![
-        RenderShape::None,
-        RenderShape::Opaque,
-        RenderShape::Opaque,
-        RenderShape::Cutout,
-        RenderShape::Translucent,
-        RenderShape::Opaque,
-        RenderShape::Opaque,
-        RenderShape::Cutout,
-        RenderShape::Opaque,
-        RenderShape::Opaque,
-        RenderShape::Translucent,
-    ];
+    let shapes: Vec<RenderShape> = (0..=16)
+        .map(|m| match m {
+            0 => RenderShape::None,
+            3 | CROSS | TORCH | WALL_TORCH => RenderShape::Cutout,
+            4 | GLASS_SLAB => RenderShape::Translucent,
+            _ => RenderShape::Opaque,
+        })
+        .collect();
     let layers = (0..shapes.len() as u16)
         .map(|m| Face::ALL.map(|f| m * 6 + f.index() as u16))
         .collect();
     let mut t = MaterialTable::from_parts(shapes, layers);
-    t.set_model(BOTTOM, BlockModel::Slab(SlabHalf::Bottom));
-    t.set_model(TOP, BlockModel::Slab(SlabHalf::Top));
-    t.set_model(CROSS, BlockModel::Cross);
-    t.set_model(LOG_X, BlockModel::Cube { axis: Axis::X });
-    t.set_model(LOG_Z, BlockModel::Cube { axis: Axis::Z });
-    t.set_model(GLASS_SLAB, BlockModel::Slab(SlabHalf::Bottom));
+    for m in ALL {
+        t.set_model(m, model_of(m));
+    }
     t
 }
 
-/// The slab half of a material, if it is a slab.
-fn half_of(m: u16) -> Option<SlabHalf> {
-    match m {
-        BOTTOM | GLASS_SLAB => Some(SlabHalf::Bottom),
-        TOP => Some(SlabHalf::Top),
-        _ => None,
-    }
+/// A sixteenth `(u, v)` of a face's plane, in the face's axes.
+fn inside(rect: [u8; 4], u: u8, v: u8) -> bool {
+    (rect[0]..rect[1]).contains(&u) && (rect[2]..rect[3]).contains(&v)
 }
 
-/// Which part of the border of its cell `face` of a slab of `half` covers: `None` inside the
-/// cell, `Some(None)` the whole face, `Some(Some(half))` that half of a side.
-fn border(half: SlabHalf, face: Face) -> Option<Option<SlabHalf>> {
-    match (half, face) {
-        (SlabHalf::Bottom, Face::NegY) | (SlabHalf::Top, Face::PosY) => Some(None),
-        (_, Face::PosY | Face::NegY) => None,
-        (half, _) => Some(Some(half)),
-    }
+/// Plane (sixteenths along the normal) and rectangle (`[u0, u1, v0, v1]`) of `face` of `b`.
+fn face_of(b: ModelBox, face: Face) -> (u8, [u8; 4]) {
+    let (n, u, v) = face.axes();
+    let (min, max) = (b.bounds.min, b.bounds.max);
+    let plane = if face.index().is_multiple_of(2) {
+        max[n]
+    } else {
+        min[n]
+    };
+    (plane, [min[u], max[u], min[v], max[v]])
 }
 
-/// One expected or meshed quad of the per-block path.
-type Special = ([u32; 3], Face, u8, u16, usize, FaceShading);
+/// True if every sixteenth of `rect` is in one of `faces`.
+fn covered(rect: [u8; 4], faces: &[[u8; 4]]) -> bool {
+    (rect[0]..rect[1]).all(|u| (rect[2]..rect[3]).all(|v| faces.iter().any(|f| inside(*f, u, v))))
+}
 
-/// The quads the per-block path must give, from the rules of ADR 0018.
+/// One expected or meshed quad of the per-block path: position, face, code, layer, bucket,
+/// shading and, for box faces, the box.
+type Special = (
+    [u32; 3],
+    Face,
+    u8,
+    u16,
+    usize,
+    FaceShading,
+    Option<ModelBox>,
+);
+
+/// Sort key of a [`Special`].
+fn key(s: &Special) -> ([u32; 3], usize, u8, Option<([u8; 3], [u8; 3], [i8; 3])>) {
+    (
+        s.0,
+        s.1.index(),
+        s.2,
+        s.6.map(|b| (b.bounds.min, b.bounds.max, b.texture_offset)),
+    )
+}
+
+/// The quads the per-block path must give, from the rules of ADR 0018 and 0020.
 fn expected_specials(
     padded: &PaddedChunk,
     table: &MaterialTable,
@@ -86,43 +146,65 @@ fn expected_specials(
         for x in 0..32 {
             for z in 0..32 {
                 let m = padded.get(x, y, z);
+                if !ALL.contains(&m) {
+                    continue;
+                }
                 let p = [x as u32, y as u32, z as u32];
-                if let Some(half) = half_of(m) {
+                let model = model_of(m);
+                let boxes = model.boxes();
+                for &b in &boxes {
                     for face in Face::ALL {
+                        let (plane, rect) = face_of(b, face);
+                        // Covered by the opposite faces of the model's other boxes on the plane.
+                        let others: Vec<[u8; 4]> = boxes
+                            .iter()
+                            .filter(|&&o| o != b)
+                            .map(|&o| face_of(o, face.opposite()))
+                            .filter(|&(p, _)| p == plane)
+                            .map(|(_, r)| r)
+                            .collect();
+                        if covered(rect, &others) {
+                            continue;
+                        }
+                        let border = plane
+                            == if face.index().is_multiple_of(2) {
+                                16
+                            } else {
+                                0
+                            };
                         let n = face.normal();
                         let nm = padded.get(x + n.x, y + n.y, z + n.z);
-                        let hidden = match border(half, face) {
-                            None => false,
-                            Some(mine) => {
-                                table.class(nm) == VoxelClass::Opaque
-                                    || half_of(nm).is_some_and(|nh| {
-                                        match border(nh, face.opposite()) {
-                                            Some(None) => true,
-                                            Some(theirs) => mine.is_some() && theirs == mine,
-                                            None => false,
-                                        }
-                                    })
-                            }
-                        };
+                        let hidden = border
+                            && (table.class(nm) == VoxelClass::Opaque
+                                || (ALL.contains(&nm)
+                                    && (nm == m || table.shape(nm) == RenderShape::Opaque)
+                                    && covered(
+                                        rect,
+                                        &model_of(nm)
+                                            .boxes()
+                                            .iter()
+                                            .map(|&o| face_of(o, face.opposite()))
+                                            .filter(|&(p, _)| p == 16 - plane)
+                                            .map(|(_, r)| r)
+                                            .collect::<Vec<_>>(),
+                                    )));
                         if hidden {
                             continue;
                         }
-                        let code = match half {
-                            SlabHalf::Bottom => layout::SHAPE_LOWER_HALF,
-                            SlabHalf::Top => layout::SHAPE_UPPER_HALF,
-                        };
-                        let shading = reference_face_shading_at(padded, light, policy, p, face)
+                        let shading = reference_box_face_shading_at(padded, light, policy, p, face)
                             .quantized(level, elide);
                         out.push((
                             p,
                             face,
-                            code,
+                            layout::SHAPE_BOX,
                             m * 6 + face.index() as u16,
                             table.bucket(m, face),
                             shading,
+                            Some(b),
                         ));
                     }
-                } else if m == CROSS {
+                }
+                if m == CROSS {
                     let own = light.map_or(LightValue::FULL_SKY, |l| l.get(x, y, z));
                     for face in [Face::PosX, Face::PosZ] {
                         let shading = FaceShading {
@@ -137,19 +219,23 @@ fn expected_specials(
                             m * 6 + Face::PosX.index() as u16,
                             CUTOUT_BUCKET,
                             shading,
+                            None,
                         ));
                     }
                 }
             }
         }
     }
-    out.sort_by_key(|s| (s.0, s.1.index(), s.2));
+    out.sort_by_key(key);
     out
 }
 
 /// Splits a mesh into its greedy unit faces (checking the turned codes of the logs) and its
-/// per-block quads.
-fn split_mesh(mesh: &ChunkMesh) -> (BTreeSet<([u32; 3], Face)>, Vec<Special>) {
+/// per-block quads (box faces resolved through the table's model boxes).
+fn split_mesh(
+    mesh: &ChunkMesh,
+    table: &MaterialTable,
+) -> (BTreeSet<([u32; 3], Face)>, Vec<Special>) {
     let mut cubes = BTreeSet::new();
     let mut specials = Vec::new();
     for bucket in 0..BUCKET_COUNT {
@@ -161,25 +247,40 @@ fn split_mesh(mesh: &ChunkMesh) -> (BTreeSet<([u32; 3], Face)>, Vec<Special>) {
             };
             match quad.shape() {
                 layout::SHAPE_CUBE | layout::SHAPE_TURNED => {
-                    let model = match m {
-                        LOG_X => BlockModel::Cube { axis: Axis::X },
-                        LOG_Z => BlockModel::Cube { axis: Axis::Z },
-                        _ => BlockModel::CUBE,
-                    };
                     let turned = quad.shape() == layout::SHAPE_TURNED;
-                    assert_eq!(turned, model.face_turned(quad.face()), "{quad:?}");
+                    assert_eq!(turned, model_of(m).face_turned(quad.face()), "{quad:?}");
                     for unit in quad.unit_faces() {
                         assert!(cubes.insert(unit), "overlap at {unit:?}");
                     }
                 }
+                layout::SHAPE_BOX => {
+                    let b = table.model_boxes()[usize::from(quad.box_index())];
+                    specials.push((
+                        quad.pos(),
+                        quad.face(),
+                        quad.shape(),
+                        quad.layer(),
+                        bucket,
+                        shading,
+                        Some(b),
+                    ));
+                }
                 code => {
                     assert_eq!((quad.w(), quad.h()), (1, 1), "{quad:?}");
-                    specials.push((quad.pos(), quad.face(), code, quad.layer(), bucket, shading));
+                    specials.push((
+                        quad.pos(),
+                        quad.face(),
+                        code,
+                        quad.layer(),
+                        bucket,
+                        shading,
+                        None,
+                    ));
                 }
             }
         }
     }
-    specials.sort_by_key(|s| (s.0, s.1.index(), s.2));
+    specials.sort_by_key(key);
     (cubes, specials)
 }
 
@@ -204,16 +305,19 @@ fn random_chunks_with_shapes_match_the_rules() {
         let fill = fills[seed as usize % fills.len()];
         // Shapes first in the palette: Terrain puts the first entries on top.
         let palette: Vec<u16> = if seed % 2 == 0 {
-            vec![BOTTOM, CROSS, TOP, 1, LOG_X, 2, GLASS_SLAB, LOG_Z, 3, 4]
+            vec![
+                BOTTOM, STAIRS, CROSS, FENCE, TOP, 1, TORCH, LOG_X, 2, STAIRS_TOP, GLASS_SLAB,
+                LOG_Z, FENCE_END, 3, WALL_TORCH, 4,
+            ]
         } else {
             ALL.to_vec()
         };
         let padded = random_padded(&table, fill, seed, 20 + (seed as u32 * 7) % 60, &palette);
-        let light_fill = LIGHT_FILLS[seed as usize % 5];
+        let light_fill = LIGHT_FILLS[seed as usize % LIGHT_FILLS.len()];
         let light = random_light(light_fill, seed);
         let policy = policies[seed as usize % 3];
         let mesh = mesh(&padded, &table, light.as_ref(), policy);
-        let (cubes, specials) = split_mesh(&mesh);
+        let (cubes, specials) = split_mesh(&mesh, &table);
         assert_eq!(cubes, reference_visible_faces(&padded), "seed {seed}");
         let expected = expected_specials(
             &padded,
@@ -237,9 +341,18 @@ fn random_chunks_with_shapes_match_the_rules() {
         );
     }
     assert!(
-        specials_seen > 10_000,
-        "the fills exercise the per-block path"
+        specials_seen > 50_000,
+        "the fills exercise the per-block path ({specials_seen})"
     );
+}
+
+/// The box faces of the quads at `p`: (face, box).
+fn box_faces(specials: &[Special], p: [u32; 3]) -> Vec<(Face, ModelBox)> {
+    specials
+        .iter()
+        .filter(|s| s.0 == p && s.2 == layout::SHAPE_BOX)
+        .map(|s| (s.1, s.6.unwrap()))
+        .collect()
 }
 
 #[test]
@@ -259,9 +372,9 @@ fn slabs_hide_and_show_the_faces_they_should() {
     put(&mut padded, [4, 1, 2], TOP);
     put(&mut padded, [5, 1, 2], 4);
     let mesh = mesh(&padded, &table, None, AoPolicy::Off);
-    let (cubes, specials) = split_mesh(&mesh);
+    let (cubes, specials) = split_mesh(&mesh, &table);
     let faces =
-        |p: [u32; 3]| -> Vec<Face> { specials.iter().filter(|s| s.0 == p).map(|s| s.1).collect() };
+        |p: [u32; 3]| -> Vec<Face> { box_faces(&specials, p).iter().map(|f| f.0).collect() };
     // The left slab: no bottom (the floor), no +X (the other bottom slab).
     assert_eq!(
         faces([2, 1, 2]),
@@ -277,16 +390,89 @@ fn slabs_hide_and_show_the_faces_they_should() {
     // The floor under the slabs still draws its top (hidden by depth), and the glass its -X.
     assert!(cubes.contains(&([2, 0, 2], Face::PosY)));
     assert!(cubes.contains(&([5, 1, 2], Face::NegX)));
-    // Codes and buckets: opaque slab faces go to their face bucket.
+    // Boxes and buckets: opaque slab faces go to their face bucket.
     for s in &specials {
-        let want = if s.0 == [4, 1, 2] {
-            layout::SHAPE_UPPER_HALF
-        } else {
-            layout::SHAPE_LOWER_HALF
-        };
-        assert_eq!(s.2, want);
+        let want = model_of(if s.0 == [4, 1, 2] { TOP } else { BOTTOM }).boxes()[0];
+        assert_eq!(s.6, Some(want));
         assert_eq!(s.4, s.1.index());
     }
+}
+
+#[test]
+fn stairs_draw_their_boxes_and_hide_like_minecraft() {
+    let table = table();
+    let mut padded = PaddedChunk::new();
+    let put = |padded: &mut PaddedChunk, p: [i32; 3], m| set_material(padded, &table, p, m);
+    // Stairs facing east on a floor, a stone block at their back and a bottom slab in front.
+    for x in 0..8 {
+        for z in 0..8 {
+            put(&mut padded, [x, 0, z], 1);
+        }
+    }
+    put(&mut padded, [3, 1, 3], STAIRS);
+    put(&mut padded, [4, 1, 3], 1);
+    put(&mut padded, [2, 1, 3], BOTTOM);
+    let mesh = mesh(&padded, &table, None, AoPolicy::Off);
+    let (_, specials) = split_mesh(&mesh, &table);
+    let slab = ModelBox::new([0, 0, 0], [16, 8, 16]);
+    let step = ModelBox::new([8, 8, 0], [16, 16, 16]);
+    let mut got = box_faces(&specials, [3, 1, 3]);
+    got.sort_by_key(|(f, b)| (f.index(), b.bounds.min));
+    // The slab: its top (under the step too, as Minecraft draws it) and its two sides; its
+    // bottom lies on the floor, its back on the stone, its front on the bottom slab's side.
+    // The step: its top, its riser and its two sides; its bottom lies on the slab, its back on
+    // the stone.
+    let want = vec![
+        (Face::PosY, slab),
+        (Face::PosY, step),
+        (Face::NegX, step),
+        (Face::PosZ, slab),
+        (Face::PosZ, step),
+        (Face::NegZ, slab),
+        (Face::NegZ, step),
+    ];
+    assert_eq!(got, want);
+    // The bottom slab's +X half face is hidden by the stairs' full lower half.
+    assert!(
+        !box_faces(&specials, [2, 1, 3])
+            .iter()
+            .any(|(f, _)| *f == Face::PosX)
+    );
+}
+
+#[test]
+fn fences_and_torches_hide_only_what_they_cover() {
+    let table = table();
+    let mut padded = PaddedChunk::new();
+    let put = |padded: &mut PaddedChunk, p: [i32; 3], m| set_material(padded, &table, p, m);
+    // Two connected fences (east one an end post open to the west), a torch on stone.
+    put(&mut padded, [5, 5, 5], FENCE);
+    put(&mut padded, [6, 5, 5], FENCE_END);
+    put(&mut padded, [9, 4, 9], 1);
+    put(&mut padded, [9, 5, 9], TORCH);
+    let mesh = mesh(&padded, &table, None, AoPolicy::Off);
+    let (_, specials) = split_mesh(&mesh, &table);
+    let fence = box_faces(&specials, [5, 5, 5]);
+    // The post: 6 faces. Each of the 8 bars: top, bottom, two sides and its outer end, minus
+    // the 2 outer ends against the other fence's bars (the end against the post is never drawn).
+    assert_eq!(fence.len(), 6 + 8 * 5 - 2);
+    assert!(
+        !fence
+            .iter()
+            .any(|(f, b)| *f == Face::PosX && b.bounds.max[0] == 16)
+    );
+    let end = box_faces(&specials, [6, 5, 5]);
+    assert_eq!(end.len(), 6 + 2 * 5 - 2);
+    // The torch: no bottom (on stone), its 5 other faces, in the cutout bucket.
+    let torch = box_faces(&specials, [9, 5, 9]);
+    assert_eq!(torch.len(), 5);
+    assert!(!torch.iter().any(|(f, _)| *f == Face::NegY));
+    assert!(
+        specials
+            .iter()
+            .filter(|s| s.0 == [9, 5, 9])
+            .all(|s| s.4 == CUTOUT_BUCKET)
+    );
 }
 
 #[test]

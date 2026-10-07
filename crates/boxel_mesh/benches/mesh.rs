@@ -15,6 +15,8 @@
 //!
 //! The other `mesh/*`, `gather/*` and `gather_mesh/terrain_*` benches keep the M0 setup (AO
 //! off, no light) to compare with earlier runs; `mesh/terrain_baked` adds AO to every face.
+//! `mesh/shapes` and `gather_mesh/shapes` put stairs, fences, torches and slabs on a quarter of
+//! the terrain's surface cells (ADR 0020).
 #![expect(clippy::print_stderr, reason = "bench scene statistics")]
 
 use boxel_light::{LightScratch, PaddedLight, compute};
@@ -347,6 +349,42 @@ fn bench(c: &mut Criterion) {
             });
         });
     }
+
+    // ADR 0020: the terrain with a block made of boxes on one surface cell in four (stairs of
+    // every shape, fences, torches, slabs): the per-block path at its busiest.
+    let shaped: Vec<u16> = (0..registry.len() as u16)
+        .filter(|&s| !registry.model(BlockState(s)).boxes().is_empty())
+        .collect();
+    let shapes = Scene::new([0, 1, 0], Repr::Packed, |x, y, z| {
+        let h = height(x, z);
+        let k = hash(x, 7, z);
+        if y == h + 1 && h > SEA_LEVEL && k.is_multiple_of(4) && terrain(&b, x, y, z) == 0 {
+            shaped[(k / 4) as usize % shaped.len()]
+        } else {
+            terrain(&b, x, y, z)
+        }
+    });
+    let input = shapes.input();
+    let mesh = mesher.mesh_chunk(&input, &table, OFF);
+    let specials = mesh
+        .quads
+        .iter()
+        .filter(|q| q.shape() == boxel_mesh::layout::SHAPE_BOX)
+        .count();
+    eprintln!(
+        "scene shapes: {} quads, {specials} box faces",
+        mesh.total_quads()
+    );
+    mesher.gather(&input, &table, &mut padded);
+    c.bench_function("mesh/shapes", |bench| {
+        bench.iter(|| {
+            mesher.mesh(black_box(&padded), None, &table, OFF, &mut out);
+            black_box(out.total_quads())
+        });
+    });
+    c.bench_function("gather_mesh/shapes", |bench| {
+        bench.iter(|| black_box(mesher.mesh_chunk(black_box(&input), &table, OFF)));
+    });
 }
 
 criterion_group!(benches, bench);

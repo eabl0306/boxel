@@ -1,7 +1,18 @@
 //! `#[repr(C)]` mirrors of the WGSL structs (bytemuck `Pod`). Layouts are frozen and tested.
 use bytemuck::{Pod, Zeroable};
 
-/// Uniform `View` (352 bytes, std140-compatible: only vec4/mat4 members).
+/// Model boxes the `View` uniform holds after [`ViewUniform`] (`boxel_voxel::MAX_MODEL_BOXES`,
+/// ADR 0020): two `u32` words each, two boxes per `vec4<u32>`.
+pub const VIEW_BOX_CAPACITY: usize = 1024;
+/// Byte offset of the model box table in the `View` uniform buffer, right after the per-frame
+/// [`ViewUniform`].
+pub const VIEW_BOXES_OFFSET: u64 = size_of::<ViewUniform>() as u64;
+/// Bytes of the whole `View` uniform buffer: the per-frame [`ViewUniform`] (written every frame)
+/// and the model box table (written when the blocks change).
+pub const VIEW_BUFFER_SIZE: u64 = VIEW_BOXES_OFFSET + 8 * VIEW_BOX_CAPACITY as u64;
+
+/// The per-frame part of the uniform `View` (352 bytes, std140-compatible: only vec4/mat4
+/// members). The buffer continues with the model box table ([`VIEW_BOXES_OFFSET`]).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct ViewUniform {

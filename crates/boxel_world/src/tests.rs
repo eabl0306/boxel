@@ -21,6 +21,7 @@ use std::sync::atomic::Ordering;
 use support::{CountingExecutor, LayerGen, fake_mesh};
 
 mod light;
+mod neighbors;
 
 /// Fixtures shared with the module-level unit tests.
 pub(crate) mod support {

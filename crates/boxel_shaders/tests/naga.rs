@@ -278,14 +278,23 @@ fn wgsl_bit_layout_matches_boxel_mesh() {
         ("GEO_SHAPE_SHIFT", l::GEO_SHAPE_SHIFT),
         ("GEO_SHAPE_MASK", l::GEO_SHAPE_MASK),
         ("SHAPE_TURNED", u32::from(l::SHAPE_TURNED)),
-        ("SHAPE_LOWER_HALF", u32::from(l::SHAPE_LOWER_HALF)),
-        ("SHAPE_UPPER_HALF", u32::from(l::SHAPE_UPPER_HALF)),
         ("SHAPE_CROSS", u32::from(l::SHAPE_CROSS)),
         ("SHAPE_FLUID_SURFACE", u32::from(l::SHAPE_FLUID_SURFACE)),
         ("SHAPE_FLUID_SLOPE", u32::from(l::SHAPE_FLUID_SLOPE)),
+        ("SHAPE_BOX", u32::from(l::SHAPE_BOX)),
+        ("GEO_BOX_MASK", l::GEO_BOX_MASK),
+        ("BOX_COORD_BITS", l::BOX_COORD_BITS),
+        ("BOX_OFFSET_BITS", l::BOX_OFFSET_BITS),
     ] {
         assert_eq!(const_u32(&module, name), v, "{name}");
     }
+    // The box index sits where w - 1 and h - 1 are, and indexes every model box.
+    assert_eq!(l::GEO_BOX_SHIFT, l::GEO_W_SHIFT);
+    assert_eq!(l::GEO_BOX_MASK as usize + 1, boxel_voxel::MAX_MODEL_BOXES);
+    assert_eq!(
+        boxel_shaders::gpu::VIEW_BOX_CAPACITY,
+        boxel_voxel::MAX_MODEL_BOXES
+    );
 }
 
 #[test]
@@ -333,8 +342,15 @@ fn gpu_struct_layouts_match_the_rust_mirrors() {
     use std::mem::{offset_of, size_of};
     let (pull, _) = load(ShaderModuleId::VoxelPull);
     let (size, offsets) = struct_layout(&pull, "View");
-    assert_eq!(size as usize, size_of::<ViewUniform>());
-    assert_eq!(size, 352);
+    // The per-frame part, then the model box table (ADR 0020).
+    assert_eq!(u64::from(size), boxel_shaders::gpu::VIEW_BUFFER_SIZE);
+    assert_eq!(size, 352 + 8192);
+    assert_eq!(
+        u64::from(offsets[11]),
+        boxel_shaders::gpu::VIEW_BOXES_OFFSET
+    );
+    assert_eq!(size_of::<ViewUniform>(), 352);
+    let offsets = offsets[..11].to_vec();
     let rust = [
         offset_of!(ViewUniform, view_proj),
         offset_of!(ViewUniform, frustum),

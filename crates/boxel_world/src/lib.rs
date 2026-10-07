@@ -11,7 +11,8 @@
 //!    slabs entering and leaving), then create, update and unload slots within
 //!    [`WorldSettings::interest_budget`], nearest first; refresh the stale job priorities a batch
 //!    at a time.
-//! 2. `Edits`: apply [`EditQueue`] (copy-on-write, version bump) and remesh, as one edit batch:
+//! 2. `Edits`: apply [`EditQueue`] (copy-on-write, version bump) and remesh, as one edit batch,
+//!    with the neighbor updates of [`NeighborRules`] (stairs, fences, torches) added to it:
 //!    the center and every neighbor whose padded region holds a changed voxel (edges and corners
 //!    included, for AO), every chunk the light change can reach (up to 8 per voxel, sized from
 //!    the cached light) and the chunks around a column whose sky top moved; their `epoch` is
@@ -64,6 +65,7 @@ mod daylight;
 pub mod fluid;
 mod interest;
 mod map;
+mod neighbor_rules;
 mod plugin;
 mod sky;
 mod streaming;
@@ -83,6 +85,7 @@ pub use daylight::{
 pub use fluid::FluidPlugin;
 pub(crate) use map::CachedLight;
 pub use map::{ChunkId, ChunkMap, ChunkSlot, DataState, Interest, MeshState, WorldStats};
+pub use neighbor_rules::NeighborRules;
 pub use plugin::{
     BlockChanged, BlockEdit, ChunkDataEvent, ChunkMeshEvent, ChunkViewer, EditQueue, WorldContent,
     WorldPlugin, WorldSettings, WorldSystems,

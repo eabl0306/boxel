@@ -6,12 +6,16 @@
 //! cycles the frame limit (30, 60, 144, 240, unlimited) and F6 toggles vsync. While the mouse is
 //! grabbed, left click breaks the block under the crosshair and right click places the selected
 //! block on the face it points at (keys 1 to 9 and 0 select it, lamps on 7 to 0; the mouse wheel
-//! scrolls through those and the rest: glass, the stone slab, short grass, a poppy and water;
+//! scrolls through those and the rest: glass, the stone slab, short grass, a poppy, water, stone
+//! and oak stairs, the oak fence and the torch;
 //! F3 shows the target, the selection and the light at the eye and the crosshair), never where a
 //! solid body is (the walking player: `PhysicsQuery::state_is_free`, against the placed block's
 //! shape). A slab goes in as a top slab when the click hits the bottom of a block or the upper
 //! half of a side, and a log lies along the axis of the clicked face; a slab placed on the free
-//! half of a slab of the same block makes a double slab. F3 shows the target's full state
+//! half of a slab of the same block makes a double slab. Stairs face away from the player and
+//! go upside down like top slabs, and take their corner shape from the stairs next to them; a
+//! fence connects to its neighbors; a torch stands on a top face and hangs on a side face (ADR
+//! 0020). F3 shows the target's full state
 //! (`boxel:log[axis=x]`). Picking is a voxel raycast from the camera (`PhysicsQuery::raycast_voxels`), reach 6 blocks. G switches between flying and
 //! walking: walking is a player body with gravity (`boxel::physics`, a 0.6 x 1.8 x 0.6 box and a
 //! `CharacterController`) that WASD moves along the view and Space makes jump, with the camera at
@@ -55,7 +59,8 @@ use boxel::gfx::{CLI_HELP, DeviceClass, RgbaImage};
 use boxel::physics::{PhysicsPlugin, Probe as VoxelProbe, SwimPlugin};
 use boxel::prelude::*;
 use boxel::render::{DebugDestroyDevice, GpuFailed, GpuReady, SurfaceInfo, TextureSource};
-use boxel::voxel::{Axis, BlockRegistry, MAX_BLOCK_COORD};
+use boxel::voxel::rules;
+use boxel::voxel::{Axis, BlockModel, BlockRegistry, Facing, MAX_BLOCK_COORD, SlabHalf};
 use boxel::window::winit::dpi::PhysicalSize;
 use boxel::window::{PrimaryWindow, WindowResized};
 use boxel::world::{BlockEdit, FluidPlugin, TimeOfDay, WorldContent, WorldStats, WorldSystems};
@@ -1074,7 +1079,7 @@ fn vsync_test(
 const REACH: f64 = 6.0;
 /// The blocks keys 1 to 9 and 0 select for placing (the first ten) and the mouse wheel scrolls
 /// through (all of them; names missing from the registry are skipped).
-const HOTBAR: [&str; 15] = [
+const HOTBAR: [&str; 19] = [
     "boxel:stone",
     "boxel:dirt",
     "boxel:grass",
@@ -1090,6 +1095,10 @@ const HOTBAR: [&str; 15] = [
     "boxel:short_grass",
     "boxel:poppy",
     "boxel:water",
+    "boxel:stone_stairs",
+    "boxel:oak_stairs",
+    "boxel:oak_fence",
+    "boxel:torch",
 ];
 const HOTBAR_KEYS: [KeyCode; 10] = [
     KeyCode::Digit1,
@@ -1201,6 +1210,50 @@ fn placed_state(registry: &BlockRegistry, block: BlockState, hit: &VoxelHit) -> 
     registry
         .with(block, "axis", Axis::of_face(face).name())
         .unwrap_or(block)
+}
+
+/// The state placing `block` on `hit` puts in, looking along `look`, Minecraft's rules for the
+/// blocks of ADR 0020 and [`placed_state`] for the others. Stairs face the way the player looks
+/// (their high side away from the player) and go in upside down when the click hits a bottom
+/// face or the upper half of a side face, like slabs; their shape comes from their neighbors
+/// (the world's neighbor rules). A torch stands on a top face, hangs on a side face as a wall
+/// torch facing away from it, and does not go under a block (`None`). A fence connects by
+/// itself.
+fn placement(
+    registry: &BlockRegistry,
+    block: BlockState,
+    hit: &VoxelHit,
+    look: DVec3,
+) -> Option<BlockState> {
+    let Some(face) = hit.face else {
+        return Some(block);
+    };
+    match registry.model(block) {
+        BlockModel::Stairs { .. } => {
+            let top = match face {
+                Face::NegY => true,
+                Face::PosY => false,
+                _ => hit.point.frac.y >= 0.5,
+            };
+            let half = if top { SlabHalf::Top } else { SlabHalf::Bottom };
+            rules::stairs_with(registry, block, Facing::of_look(look.x, look.z), half)
+        }
+        BlockModel::Torch | BlockModel::WallTorch { .. } => {
+            // `boxel:torch` and `boxel:wall_torch` (Minecraft's naming).
+            let standing =
+                registry.by_name(&registry.name(block).replace("wall_torch", "torch"))?;
+            match face {
+                Face::PosY => Some(standing),
+                Face::NegY => None,
+                side => {
+                    let wall = registry
+                        .by_name(&registry.name(standing).replace("torch", "wall_torch"))?;
+                    registry.with(wall, "facing", Facing::of_face(side)?.name())
+                }
+            }
+        }
+        _ => Some(placed_state(registry, block, hit)),
+    }
 }
 
 /// True for a slab: a `type` property with `bottom`, `top` and `double`.
@@ -1334,6 +1387,12 @@ fn pick_blocks(
         let step = if scroll.delta.y < 0.0 { 1 } else { len - 1 };
         picking.selected = (picking.selected + step) % len;
     }
+    let look = cameras
+        .iter()
+        .find(|(camera, _)| camera.active)
+        .map_or(DVec3::NEG_Z, |(_, transform)| {
+            transform.forward().as_dvec3()
+        });
     let target = cameras
         .iter()
         .find(|(camera, _)| camera.active)
@@ -1379,7 +1438,8 @@ fn pick_blocks(
         // The placement check: never a block inside the player (or any solid body), against the
         // shape the block will have.
         let registry = &content.registry;
-        let block = placed_state(registry, picking.block(), &hit);
+        // Air: this block cannot go on that face (a torch under a block).
+        let block = placement(registry, picking.block(), &hit, look).unwrap_or(BlockState::AIR);
         let free = |pos: BlockPos| match physics.probe(pos) {
             VoxelProbe::Block(state) => {
                 (state.is_air() || physics.collision().is_fluid(state))
@@ -2228,6 +2288,71 @@ mod tests {
         assert_eq!(placed_state(&registry, stone, &hit(Face::PosX, 0.5)), stone);
         let grass = by("boxel:short_grass");
         assert_eq!(placed_state(&registry, grass, &hit(Face::NegY, 0.0)), grass);
+    }
+
+    #[test]
+    fn stairs_and_torches_are_placed_like_minecraft() {
+        let registry = BlockRegistry::default_blocks();
+        let by = |n: &str| registry.parse_state(n).expect("built-in");
+        let hit = |face, y: f64| VoxelHit {
+            block: BlockPos::new(0, 0, 0),
+            face: Some(face),
+            t: 1.0,
+            point: WorldPos::from_dvec3(DVec3::new(0.5, y, 0.0)),
+            state: by("boxel:stone"),
+        };
+        let stairs = by("boxel:oak_stairs");
+        // Looking east: the stairs face east (their high side away from the player).
+        let east = DVec3::new(0.9, -0.3, 0.2);
+        for (face, y, want) in [
+            (Face::PosY, 1.0, "boxel:oak_stairs[facing=east]"),
+            (Face::NegY, 0.0, "boxel:oak_stairs[facing=east,half=top]"),
+            (Face::NegX, 0.75, "boxel:oak_stairs[facing=east,half=top]"),
+            (Face::NegX, 0.25, "boxel:oak_stairs[facing=east]"),
+        ] {
+            assert_eq!(
+                placement(&registry, stairs, &hit(face, y), east),
+                Some(by(want)),
+                "{face:?} {y}"
+            );
+        }
+        let north = DVec3::new(0.1, 0.0, -1.0);
+        assert_eq!(
+            placement(&registry, stairs, &hit(Face::PosY, 1.0), north),
+            Some(by("boxel:oak_stairs[facing=north]"))
+        );
+        // Torches: standing on top, on the wall facing away from it, never underneath.
+        let torch = by("boxel:torch");
+        assert_eq!(
+            placement(&registry, torch, &hit(Face::PosY, 1.0), east),
+            Some(torch)
+        );
+        assert_eq!(
+            placement(&registry, torch, &hit(Face::NegY, 0.0), east),
+            None
+        );
+        for (face, facing) in [
+            (Face::PosX, "east"),
+            (Face::NegX, "west"),
+            (Face::PosZ, "south"),
+            (Face::NegZ, "north"),
+        ] {
+            assert_eq!(
+                placement(&registry, torch, &hit(face, 0.5), east),
+                Some(by(&format!("boxel:wall_torch[facing={facing}]")))
+            );
+        }
+        // Everything else as before.
+        let slab = by("boxel:stone_slab");
+        assert_eq!(
+            placement(&registry, slab, &hit(Face::NegY, 0.0), east),
+            Some(by("boxel:stone_slab[type=top]"))
+        );
+        let fence = by("boxel:oak_fence");
+        assert_eq!(
+            placement(&registry, fence, &hit(Face::PosX, 0.5), east),
+            Some(fence)
+        );
     }
 
     #[test]
