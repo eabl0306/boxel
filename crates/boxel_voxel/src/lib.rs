@@ -9,6 +9,9 @@
 //!   Each state has an RGB emission and a light opacity (ADR 0015).
 //! - [`state`]: block state properties (ADR 0019): `boxel:log[axis=x]`, one dense id per
 //!   combination of values, contiguous per block.
+//! - [`shapes`]: the boxes of the models made of boxes (slabs, stairs, fences, torches; ADR
+//!   0020), and [`rules`]: the states that follow their neighbors (stair shapes, fence sides,
+//!   torches that need a support).
 //! - [`storage`]: Minecraft-style paletted container (Uniform | Packed 1/2/4/8 bits | Direct u16).
 //! - [`light`]: the light value format ([`LightValue`]) and the per-state [`LightTables`]. Light
 //!   itself is derived data, computed by `boxel_light`; chunks do not store it.
@@ -20,6 +23,8 @@
 pub mod coords;
 pub mod light;
 pub mod registry;
+pub mod rules;
+pub mod shapes;
 pub mod state;
 pub mod storage;
 
@@ -37,8 +42,10 @@ pub use masks::{LightMasks, MaskRows, MaskWords, OwnedLightMasks};
 pub use registry::{
     Axis, BlockCollision, BlockDef, BlockId, BlockModel, BlockRegistry, BlockRegistryBuilder,
     BlockState, BuiltinLamp, CollisionBox, FaceTextures, LAMPS, LAVA_EMISSION, MAX_STATES,
-    RegistryError, RenderShape, SlabHalf, StateFlags, TextureId, TexturePattern, TextureSpec,
+    RegistryError, RenderShape, SlabHalf, StateFlags, TORCH_EMISSION, TextureId, TexturePattern,
+    TextureSpec,
 };
+pub use shapes::{Facing, FenceSides, MAX_MODEL_BOXES, ModelBox, StairShape};
 pub use state::{Property, StateName, StateParseError, StateValues};
 pub use storage::{Occupancy, Paletted};
 

@@ -324,6 +324,14 @@ const RECIPES: &[Recipe] = &[
         FaceName::North,
         &[("block/poppy", Tint::None)],
     ),
+    // ADR 0020: the torch (cutout; both torches share it). Stairs use the stone and planks
+    // layers, the fence the planks layer.
+    recipe(
+        "boxel:torch",
+        "torch",
+        FaceName::North,
+        &[("block/torch", Tint::None)],
+    ),
 ];
 
 /// One texture of a layer, composited bottom to top.

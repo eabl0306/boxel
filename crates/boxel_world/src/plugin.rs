@@ -2,6 +2,7 @@ use crate::budget::FrameBudget;
 use crate::interest::Viewer;
 use crate::jobs::{JobExecutor, TaskPoolExecutor};
 use crate::map::DataChange;
+use crate::neighbor_rules::NeighborRules;
 use crate::sky::{SkyMap, SkyRule};
 use crate::streaming::{Ctx, ViewerChunks, WorldJobs};
 use crate::{ChunkId, ChunkMap, WorldStats};
@@ -332,7 +333,8 @@ pub enum WorldSystems {
 }
 
 /// Adds the world: resources (`ChunkMap`, `SkyMap`, `WorldSettings`, `WorldContent`,
-/// `EditQueue`, `WorldStats`, internal job state), the messages `ChunkMeshEvent`,
+/// `EditQueue`, [`NeighborRules`] (the built-in ones of the registry), `WorldStats`, internal
+/// job state), the messages `ChunkMeshEvent`,
 /// [`BlockChanged`] and [`ChunkDataEvent`] and the chained systems in
 /// `Update`. A stats system in `Last` refreshes `WorldStats` and publishes a `"world"` line to
 /// `DiagnosticsBoard` if present. `TaskPoolPlugin` is recommended (pool sizes); without it the
@@ -380,6 +382,7 @@ impl Plugin for WorldPlugin {
         let mut jobs = WorldJobs::new(1, workers, Arc::clone(&self.executor));
         jobs.begin_frame(&self.settings, Instant::now());
         app.insert_resource(self.settings.clone())
+            .insert_resource(NeighborRules::from_registry(&self.registry))
             .insert_resource(content)
             .init_resource::<ChunkMap>()
             .insert_resource(SkyMap::new(rule))
@@ -488,19 +491,26 @@ fn update_interest(
     budget.spend(clock);
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a Bevy-style system: one parameter per resource it reads"
+)]
 fn apply_edits(
     mut queue: ResMut<EditQueue>,
     mut map: ResMut<ChunkMap>,
     mut sky: ResMut<SkyMap>,
     mut jobs: ResMut<WorldJobs>,
     content: Res<WorldContent>,
+    rules: Res<NeighborRules>,
     mut writer: MessageWriter<ChunkMeshEvent>,
     mut changed: MessageWriter<BlockChanged>,
 ) {
     if queue.is_empty() {
         return;
     }
-    let edits = std::mem::take(&mut queue.edits);
+    let mut edits = std::mem::take(&mut queue.edits);
+    // Stairs, fences and torches next to the edits follow them in the same batch (ADR 0020).
+    rules.expand(&content.registry, |p| map.block_at(p), &mut edits);
     let mut events = Vec::new();
     let mut cx = Ctx::new(&mut map, &mut sky, &content, &mut events);
     let changes = jobs.apply_edits(&mut cx, edits);

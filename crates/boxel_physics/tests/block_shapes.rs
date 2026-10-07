@@ -356,3 +356,48 @@ fn random_rays_match_a_brute_force_oracle() {
     }
     assert!(checked > 500);
 }
+
+/// Stairs, fences and torches (ADR 0020): stairs collide and are picked by their boxes (the slab
+/// and the step), a fence by its post and arms a block tall (Minecraft's is 1.5: the voxel
+/// physics keeps boxes inside the cell), a torch not at all but is picked by a small box.
+#[test]
+fn stairs_fences_and_torches_collide_with_their_boxes() {
+    let t = table();
+    let unit = |min: [f64; 3], max: [f64; 3]| {
+        LocalBox::new(DVec3::from_array(min) / 16.0, DVec3::from_array(max) / 16.0)
+    };
+    let stairs = state("boxel:stone_stairs[facing=east,half=top,shape=outer_right]");
+    let boxes = [
+        unit([0.0, 8.0, 0.0], [16.0, 16.0, 16.0]),
+        unit([8.0, 0.0, 8.0], [16.0, 8.0, 16.0]),
+    ];
+    assert_eq!(t.shape(stairs), CollisionShape::Boxes(&boxes));
+    assert_eq!(t.outline(stairs), CollisionShape::Boxes(&boxes));
+    let fence = state("boxel:oak_fence[north=true]");
+    let fence_boxes = [
+        unit([6.0, 0.0, 6.0], [10.0, 16.0, 10.0]),
+        unit([6.0, 0.0, 0.0], [10.0, 16.0, 6.0]),
+    ];
+    assert_eq!(t.shape(fence), CollisionShape::Boxes(&fence_boxes));
+    for name in ["boxel:torch", "boxel:wall_torch[facing=south]"] {
+        let torch = state(name);
+        assert_eq!(t.shape(torch), CollisionShape::Empty);
+        assert!(t.has_outline(torch) && !t.collides(torch));
+    }
+    assert_eq!(
+        t.outline(state("boxel:torch")),
+        CollisionShape::Boxes(&[unit([6.0, 0.0, 6.0], [10.0, 10.0, 10.0])])
+    );
+    // A box falling on bottom stairs facing east lands on the step on the east half and on
+    // the slab on the west half.
+    let base = I64Vec3::new(5, -3, 2_000_000_000);
+    let mut world = TestWorld::new();
+    world.set(at(base, 0, 0, 0), state("boxel:stone_stairs[facing=east]"));
+    let drop = |world: &mut TestWorld, x: f64| {
+        let start = WorldPos::from_block(BlockPos::from_i64vec3(base), DVec3::new(x, 3.0, 0.5));
+        let out = sweep(world, start, DVec3::new(0.0, -5.0, 0.0));
+        (out.end.block.y - base.y) as f64 + out.end.frac.y
+    };
+    assert_eq!(drop(&mut world, 0.875), 1.0);
+    assert_eq!(drop(&mut world, 0.125), 0.5);
+}

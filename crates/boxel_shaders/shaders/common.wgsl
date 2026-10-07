@@ -2,7 +2,8 @@
 //
 // PackedQuad = vec2<u32>(geo, mat), 8 bytes, identical bytes on every tier.
 //   geo: x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | flags:4 (bit 0 = FLAG_EMISSIVE, bits 1..3 =
-//        shape code, ADR 0018: cube, turned cube, lower or upper half of the cell, cross, fluid surface)
+//        shape code, ADR 0018 and 0020: cube, turned cube, cross, fluid surface, model box face;
+//        a box face keeps the index of its box in the View's box table in the (w-1, h-1) bits)
 //   mat: layer:12 | ao:8 (2 bits per corner, 3 = unoccluded) | light:12 (index into the chunk's
 //        light palette)
 // face: 0=+Y 1=-Y 2=+X 3=-X 4=+Z 5=-Z  (u,v axes: ±Y -> (X,Z), ±X -> (Z,Y), ±Z -> (X,Y))
@@ -42,11 +43,14 @@ const FLAG_EMISSIVE: u32 = 1u;
 const GEO_SHAPE_SHIFT: u32 = 29u;
 const GEO_SHAPE_MASK: u32 = 7u;
 const SHAPE_TURNED: u32 = 1u;      // cube face, texture transposed (logs along X or Z)
-const SHAPE_LOWER_HALF: u32 = 2u;  // bottom slab face (w = h = 1)
-const SHAPE_UPPER_HALF: u32 = 3u;  // top slab face (w = h = 1)
 const SHAPE_CROSS: u32 = 4u;       // plant quad through the cell's diagonal (w = h = 1)
 const SHAPE_FLUID_SURFACE: u32 = 5u; // fluid surface cell: its top drops to FLUID_SURFACE (greedy)
 const FLUID_SURFACE: f32 = 0.875;
+const SHAPE_BOX: u32 = 6u;         // a face of one model box (slabs, stairs, fences, torches; w = h = 1)
+const GEO_BOX_MASK: u32 = 1023u;   // the box index of a SHAPE_BOX quad, at GEO_W_SHIFT
+const BOX_COORD_BITS: u32 = 5u;    // packed box word 0: min xyz, max xyz in sixteenths
+const BOX_OFFSET_BITS: u32 = 6u;   // packed box word 1: texture offset xyz, biased by BOX_OFFSET_BIAS
+const BOX_OFFSET_BIAS: i32 = 32;
 const MAT_LAYER_MASK: u32 = 0xFFFu;
 const MAT_AO_SHIFT: u32 = 12u;
 const MAT_LIGHT_SHIFT: u32 = 20u;
@@ -72,6 +76,9 @@ struct View {
   light_params: vec4<f32>,         // x = AO strength (0.55: the darkest corner keeps 45 %), y = block-light gain, zw = 0
   light_curve: array<vec4<f32>, 4>, // brightness of light levels 0..15 (level 4k + j at [k][j]; level 15 = 1)
   viewport: vec4<f32>,             // xy = render target size in pixels, zw = 0
+  // Model box table (ADR 0020), written once per renderer: box k is boxes[k >> 1].xy (k even) or
+  // .zw (k odd), packed as boxel_mesh::pack_model_box. Read only by SHAPE_BOX quads.
+  boxes: array<vec4<u32>, 512>,
 };
 
 struct ChunkGpu {                  // 64 bytes, mirrors boxel_shaders::gpu::ChunkGpu
@@ -156,20 +163,30 @@ fn decode_quad(q: vec2<u32>, light: vec2<u32>, corner_in: u32) -> Decoded {
   o.flags = (geo >> GEO_FLAGS_SHIFT) & 15u;
   o.grow = vec2(2.0 * cu - 1.0, 2.0 * cv - 1.0);
   let shape = (geo >> GEO_SHAPE_SHIFT) & GEO_SHAPE_MASK;
-  if (shape == SHAPE_LOWER_HALF || shape == SHAPE_UPPER_HALF) {
-    // Slab: the cell's y range shrinks to [lo, lo + 0.5]. Side faces keep the part of the cube
-    // face they cover: their y, texture row and light/AO coordinate t all follow the real y, so
-    // they shade exactly like that part of the cube face. +Y and -Y faces move to the half's
-    // planes.
-    let lo = select(0.0, 0.5, shape == SHAPE_UPPER_HALF);
-    if (f >= 2u) {
-      let y = lo + 0.5 * cv;
-      o.local.y = p.y + y;
-      o.uv.y = 1.0 - y;
-      o.st.y = y;
-    } else {
-      o.local.y = p.y + select(lo, lo + 0.5, f == 0u);
-    }
+  if (shape == SHAPE_BOX) {
+    // A face of one model box (ADR 0020): the quad's (w-1, h-1) bits index the View's box
+    // table. The face lies on the box's side toward the face's normal and spans the box along
+    // u and v; its light/AO coordinates (s, t) are its place on the cube face, so it shades like
+    // that part of the cube face. The texture is the part of the cube face's texture under the
+    // box moved by its texture offset (Minecraft's uvlock): every value is a sixteenth, exact.
+    let index = (geo >> GEO_W_SHIFT) & GEO_BOX_MASK;
+    let pair = view.boxes[index >> 1u];
+    let odd = (index & 1u) == 1u;
+    let w0 = select(pair.x, pair.z, odd);
+    let w1 = select(pair.y, pair.w, odd);
+    let lo = vec3<f32>((vec3(w0) >> vec3(0u, BOX_COORD_BITS, 2u * BOX_COORD_BITS)) & vec3(31u)) / 16.0;
+    let hi = vec3<f32>((vec3(w0) >> vec3(3u * BOX_COORD_BITS, 4u * BOX_COORD_BITS, 5u * BOX_COORD_BITS)) & vec3(31u)) / 16.0;
+    let raw = (vec3(w1) >> vec3(0u, BOX_OFFSET_BITS, 2u * BOX_OFFSET_BITS)) & vec3(63u);
+    let shift = vec3<f32>(vec3<i32>(raw) - vec3(BOX_OFFSET_BIAS)) / 16.0;
+    let an = abs(n);
+    let su = select(dot(lo, u), dot(hi, u), (c & 1u) == 1u);
+    let sv = select(dot(lo, v), dot(hi, v), (c >> 1u) == 1u);
+    let depth = select(dot(lo, an), dot(hi, an), (f & 1u) == 0u);
+    o.local = p + an * depth + u * su + v * sv;
+    let tu = su + dot(shift, u);
+    let tv = sv + dot(shift, v);
+    o.uv = select(vec2(tu, tv), vec2(tu, 1.0 - tv), f >= 2u);
+    o.st = vec2(su, sv);
   } else if (shape == SHAPE_FLUID_SURFACE) {
     // Fluid surface (water): the cell's top drops to FLUID_SURFACE. Side faces span y in
     // [0, FLUID_SURFACE] (h = 1: a surface cell has no surface cell of its fluid above or below)

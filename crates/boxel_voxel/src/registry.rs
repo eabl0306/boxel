@@ -3,6 +3,7 @@
 //! assigned in registration order and contiguous per block. Every per-state datum (model,
 //! collision, textures, light) lives in flat arrays indexed by the state id. Frozen before the
 //! world loads and shared as `Arc<BlockRegistry>`.
+use crate::shapes::{self, Facing, FenceSides, MAX_MODEL_BOXES, ModelBox, StairShape};
 use crate::state::{Property, StateName, StateParseError, StateValues, split_state};
 use crate::{Face, LightValue, OPAQUE_OPACITY};
 
@@ -115,6 +116,29 @@ pub enum BlockModel {
     /// the same fluid nor an opaque block (the surface) its top sits 2/16 lower, as in
     /// Minecraft. Lets everything through ([`BlockModel::default_collision`] is `None`).
     Fluid,
+    /// Stairs (ADR 0020): the slab of `half` and a step on the `facing` side, shaped by `shape`
+    /// ([`crate::shapes::stair_boxes`]). Collide and are picked by their boxes.
+    Stairs {
+        /// Toward the high side.
+        facing: Facing,
+        /// Which half the slab part fills.
+        half: SlabHalf,
+        /// Straight or a corner.
+        shape: StairShape,
+    },
+    /// A fence (ADR 0020): a post and bars toward the connected `sides`
+    /// ([`crate::shapes::fence_boxes`]).
+    Fence {
+        /// Connected sides.
+        sides: FenceSides,
+    },
+    /// A standing torch: a 2x10x2 stick ([`crate::shapes::TORCH_BOX`]). No collision.
+    Torch,
+    /// A torch on a wall, pointing toward `facing` (away from the wall). No collision.
+    WallTorch {
+        /// Away from the wall.
+        facing: Facing,
+    },
 }
 
 impl Default for BlockModel {
@@ -159,7 +183,8 @@ impl BlockModel {
     }
 
     /// The box the block is picked by (its outline): the full cell for cubes, the half cell for
-    /// slabs, a smaller box around the stem for crosses.
+    /// slabs, a smaller box around the stem for crosses, the boxes of stairs, the post and arms
+    /// of a fence, a box around a torch's stick.
     pub fn outline(self) -> BlockCollision {
         match self {
             BlockModel::Cube { .. } | BlockModel::Fluid => BlockCollision::Full,
@@ -167,15 +192,47 @@ impl BlockModel {
             BlockModel::Cross => {
                 BlockCollision::Boxes(vec![CollisionBox::new([2, 0, 2], [14, 13, 14])])
             }
+            BlockModel::Stairs { .. } => {
+                BlockCollision::Boxes(self.boxes().iter().map(|b| b.bounds).collect())
+            }
+            BlockModel::Fence { sides } => BlockCollision::Boxes(shapes::fence_collision(sides)),
+            BlockModel::Torch => BlockCollision::Boxes(vec![shapes::TORCH_OUTLINE]),
+            BlockModel::WallTorch { facing } => {
+                BlockCollision::Boxes(vec![shapes::wall_torch_outline(facing)])
+            }
         }
     }
 
-    /// The usual collision of the model: full cubes and slabs collide with their shape, crosses
-    /// and fluids do not collide.
+    /// The usual collision of the model: full cubes, slabs, stairs and fences collide with their
+    /// shape (a fence a block tall, ADR 0020), crosses, fluids and torches do not collide.
     pub fn default_collision(self) -> BlockCollision {
         match self {
-            BlockModel::Cross | BlockModel::Fluid => BlockCollision::None,
+            BlockModel::Cross
+            | BlockModel::Fluid
+            | BlockModel::Torch
+            | BlockModel::WallTorch { .. } => BlockCollision::None,
             other => other.outline(),
+        }
+    }
+
+    /// The boxes the model is drawn with, for the models made of boxes (slabs, stairs, fences
+    /// and torches; ADR 0020). Empty for cubes, crosses and fluids, which the mesher draws its
+    /// own way.
+    pub fn boxes(self) -> Vec<ModelBox> {
+        match self {
+            BlockModel::Cube { .. } | BlockModel::Fluid | BlockModel::Cross => Vec::new(),
+            BlockModel::Slab(half) => vec![ModelBox {
+                bounds: CollisionBox::slab(half),
+                texture_offset: [0; 3],
+            }],
+            BlockModel::Stairs {
+                facing,
+                half,
+                shape,
+            } => shapes::stair_boxes(facing, half, shape),
+            BlockModel::Fence { sides } => shapes::fence_boxes(sides),
+            BlockModel::Torch => vec![shapes::TORCH_BOX],
+            BlockModel::WallTorch { facing } => vec![shapes::wall_torch_box(facing)],
         }
     }
 }
@@ -299,6 +356,9 @@ pub enum TexturePattern {
         /// Petal color.
         color: [u8; 3],
     },
+    /// A torch on a clear background, laid out like Minecraft's: a stick of the base color in
+    /// columns 7 and 8 from row 8 down, under a flame in rows 6 and 7 (binary alpha).
+    Torch,
 }
 
 /// One built-in lamp of [`BlockRegistry::default_blocks`]: an opaque, solid cube that emits
@@ -346,6 +406,10 @@ pub const LAMPS: [BuiltinLamp; 4] = [
 
 /// Emission (red, green, blue) of the built-in lava placeholder, `boxel:lava` (state 16).
 pub const LAVA_EMISSION: [u8; 3] = [15, 7, 2];
+
+/// Emission (red, green, blue) of `boxel:torch` and `boxel:wall_torch`: level 14 like
+/// Minecraft's torch, a warm white.
+pub const TORCH_EMISSION: [u8; 3] = [14, 13, 10];
 
 /// One texture layer description.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -427,7 +491,8 @@ pub enum RegistryError {
     /// Name must be `namespace:path` with `[a-z0-9_]` parts.
     #[error("invalid name {0}")]
     InvalidName(String),
-    /// More than 4096 textures or [`MAX_STATES`] states.
+    /// More than 4096 textures, [`MAX_STATES`] states or [`MAX_MODEL_BOXES`] distinct model
+    /// boxes.
     #[error("registry full: {0}")]
     Full(&'static str),
     /// A property of the block with an invalid name or value, no values, a default that is not
@@ -441,7 +506,8 @@ pub enum RegistryError {
     /// not 15.
     #[error("invalid light values of {0}")]
     InvalidLight(String),
-    /// A collision box outside the cell or empty (`min < max <= 16` on every axis).
+    /// A collision or model box outside the cell or empty (`min < max <= 16` on every axis), or
+    /// a model box texture offset outside `-32..32`.
     #[error("invalid collision box of {0}")]
     InvalidCollision(String),
 }
@@ -483,6 +549,8 @@ pub struct BlockRegistryBuilder {
     /// One per state, in state order.
     states: Vec<BlockDef>,
     blocks: Vec<BlockInfo>,
+    /// The distinct [`ModelBox`]es of the states so far (at most [`MAX_MODEL_BOXES`]).
+    model_boxes: std::collections::HashSet<ModelBox>,
 }
 
 impl BlockRegistryBuilder {
@@ -719,7 +787,115 @@ impl BlockRegistryBuilder {
         ] {
             b.add_block(def).expect("built-in block");
         }
+        b.add_default_shapes(stone, planks);
         b
+    }
+
+    /// The blocks of ADR 0020, after the plants: stone and oak stairs, the oak fence, the torch
+    /// and the wall torch (with its texture, the last layer).
+    fn add_default_shapes(&mut self, stone: TextureId, planks: TextureId) {
+        let torch = self
+            .add_texture(TextureSpec {
+                name: "boxel:torch".to_string(),
+                base_color: [110, 82, 46],
+                noise: 8,
+                pattern: TexturePattern::Torch,
+            })
+            .expect("built-in texture");
+        let facing = || Property::new("facing", Facing::ALL.map(Facing::name));
+        let facing_of = |state: &StateValues<'_>| {
+            state
+                .get("facing")
+                .and_then(Facing::from_name)
+                .unwrap_or_default()
+        };
+        // Stairs let light through like slabs (opacity 1). `waterlogged` is Minecraft's: it
+        // changes nothing until fluids can fill other blocks.
+        for (name, texture) in [("stone_stairs", stone), ("oak_stairs", planks)] {
+            let def = BlockDef {
+                name: format!("boxel:{name}"),
+                shape: RenderShape::Opaque,
+                model: BlockModel::Stairs {
+                    facing: Facing::North,
+                    half: SlabHalf::Bottom,
+                    shape: StairShape::Straight,
+                },
+                collision: BlockCollision::None,
+                emission: [0; 3],
+                light_opacity: 1,
+                textures: FaceTextures::all(texture),
+            };
+            let properties = vec![
+                facing(),
+                Property::new("half", ["bottom", "top"]),
+                Property::new("shape", StairShape::ALL.map(StairShape::name)),
+                Property::boolean("waterlogged"),
+            ];
+            self.add_block_with_states(def, properties, |state, def| {
+                def.model = BlockModel::Stairs {
+                    facing: facing_of(state),
+                    half: state
+                        .get("half")
+                        .and_then(shapes::half_from_name)
+                        .unwrap_or_default(),
+                    shape: state
+                        .get("shape")
+                        .and_then(StairShape::from_name)
+                        .unwrap_or_default(),
+                };
+                def.collision = def.model.default_collision();
+            })
+            .expect("built-in stairs");
+        }
+        // The fence stops no light; its sides follow its neighbors (`boxel_voxel::rules`).
+        let fence = BlockDef {
+            name: "boxel:oak_fence".to_string(),
+            shape: RenderShape::Opaque,
+            model: BlockModel::Fence {
+                sides: FenceSides::NONE,
+            },
+            collision: BlockCollision::None,
+            emission: [0; 3],
+            light_opacity: 0,
+            textures: FaceTextures::all(planks),
+        };
+        let sides = Facing::ALL.map(|f| Property::boolean(f.name())).to_vec();
+        self.add_block_with_states(fence, sides, |state, def| {
+            let mut sides = FenceSides::NONE;
+            for f in Facing::ALL {
+                sides = sides.with(f, state.get(f.name()) == Some("true"));
+            }
+            def.model = BlockModel::Fence { sides };
+            def.collision = def.model.default_collision();
+        })
+        .expect("built-in fence");
+        // Torches: cutout sticks that glow ([`TORCH_EMISSION`]), no collision, no opacity.
+        let torch_def = |name: &str, model: BlockModel| BlockDef {
+            name: format!("boxel:{name}"),
+            shape: RenderShape::Cutout,
+            model,
+            collision: BlockCollision::None,
+            emission: TORCH_EMISSION,
+            light_opacity: 0,
+            textures: FaceTextures::all(torch),
+        };
+        self.add_block(torch_def("torch", BlockModel::Torch))
+            .expect("built-in torch");
+        self.add_block_with_states(
+            torch_def(
+                "wall_torch",
+                BlockModel::WallTorch {
+                    facing: Facing::North,
+                },
+            ),
+            vec![facing()],
+            |state, def| {
+                def.model = BlockModel::WallTorch {
+                    facing: facing_of(state),
+                };
+            },
+        )
+        .expect("built-in wall torch");
     }
 
     /// Registers a texture layer.
@@ -794,6 +970,21 @@ impl BlockRegistryBuilder {
             self.check_state(&state_def)?;
             states.push(state_def);
         }
+        let mut new_boxes = std::collections::HashSet::new();
+        for def in states.iter().filter(|d| d.shape != RenderShape::None) {
+            for b in def.model.boxes() {
+                if !b.is_valid() {
+                    return Err(RegistryError::InvalidCollision(def.name.clone()));
+                }
+                if !self.model_boxes.contains(&b) {
+                    new_boxes.insert(b);
+                }
+            }
+        }
+        if self.model_boxes.len() + new_boxes.len() > MAX_MODEL_BOXES {
+            return Err(RegistryError::Full("model boxes"));
+        }
+        self.model_boxes.extend(new_boxes);
         self.states.extend(states);
         self.blocks.push(BlockInfo {
             name: def.name,
@@ -925,7 +1116,13 @@ impl BlockRegistry {
     /// ADR 0018: 19 `boxel:glass` (Translucent cube, solid, light opacity 0), 20 to 22
     /// `boxel:stone_slab[type=bottom|top|double]` (default 20; the halves are Opaque slabs with
     /// light opacity 1, `double` an Opaque stone cube), 23 `boxel:short_grass` and 24
-    /// `boxel:poppy` (Cutout crosses, no collision, light opacity 0).
+    /// `boxel:poppy` (Cutout crosses, no collision, light opacity 0); then the blocks of
+    /// ADR 0020: 25 to 104 `boxel:stone_stairs` and 105 to 184 `boxel:oak_stairs`
+    /// (`facing`, `half`, `shape`, `waterlogged`; default the first, all values first; Opaque,
+    /// light opacity 1), 185 to 200 `boxel:oak_fence` (`east`, `north`, `south`, `west`;
+    /// default 185, unconnected; Opaque, light opacity 0), 201 `boxel:torch` and 202 to 205
+    /// `boxel:wall_torch[facing=north|south|west|east]` (Cutout, no collision, light opacity 0,
+    /// emission [`TORCH_EMISSION`]).
     pub fn default_blocks() -> BlockRegistry {
         BlockRegistryBuilder::with_default_blocks().build()
     }

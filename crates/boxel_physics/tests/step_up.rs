@@ -798,3 +798,49 @@ fn a_character_steps_onto_a_low_static_box_at_any_frame_rate() {
         assert!(contacts.on_ground && contacts.touched(Face::PosX));
     }
 }
+
+/// Stairs (ADR 0020) are a slab and a step: a walking body climbs a staircase of them half a
+/// block at a time, and their full back stops it.
+#[test]
+fn a_staircase_of_stairs_is_walked_up() {
+    let registry = boxel_voxel::BlockRegistry::default_blocks();
+    let east = registry
+        .parse_state("boxel:stone_stairs[facing=east]")
+        .unwrap();
+    let base = I64Vec3::new(-40, 7, 1000);
+    let mut world = floor(base);
+    for k in 0..3 {
+        world.set(at(base, 1 + k, k, 0), east);
+        fill(&mut world, base, [2 + k, 0, 0], [2 + k, k, 0], STONE);
+    }
+    fill(&mut world, base, [4, 0, -1], [12, 2, 1], STONE);
+    let outs = walk(&mut world, feet(base, 0.5, 0.0, 0.5), WALK, &[], 0.6, 120);
+    let last = outs.last().unwrap();
+    assert_eq!(height(base, last.end), 3.0, "{last:?}");
+    assert!(along(base, last.end) > 5.0);
+    // Every climb was half a block or less.
+    let mut previous = 0.0;
+    for out in &outs {
+        let h = height(base, out.end);
+        assert!(h - previous <= 0.5, "{out:?}");
+        previous = h;
+    }
+    // Back down the other way the stairs' full back faces the body: a block high, no step-up.
+    let mut world = floor(base);
+    world.set(at(base, 1, 0, 0), east);
+    let outs = walk(
+        &mut world,
+        feet(base, 2.5, 0.0, 0.5),
+        DVec3::new(-WALK.x, WALK.y, 0.0),
+        &[],
+        0.6,
+        24,
+    );
+    let last = outs.last().unwrap();
+    assert_eq!(height(base, last.end), 0.0);
+    assert_eq!(
+        along(base, last.end),
+        2.25,
+        "stopped by the back of the stairs"
+    );
+}
