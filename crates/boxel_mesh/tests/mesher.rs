@@ -726,45 +726,51 @@ fn light_reaches_the_palette_and_splits_merges() {
     assert_ne!(unlit.hash, mesh.hash);
 }
 
-/// A 4x4 pool two blocks deep with a stone block over one corner: the top water layer is the
-/// surface (marked, its +Y and side faces drop to `FLUID_SURFACE`) except under the stone, where
-/// it stays full height; the layer below is plain water, and no face lies between the two.
+/// A 4x4 pool two blocks deep in a stone basin with a stone block over one corner: the top
+/// water layer is the surface (marked) except under the stone, where it stays full height; the
+/// layer below is plain water, and no face lies between the two. The flat surface cells are
+/// greedy quads whose top drops to `FLUID_SURFACE`; the three cells around the full one slope
+/// up to it (ADR 0021).
 #[test]
 fn water_surface_cells_drop_their_top() {
     let (registry, table) = registry();
     let (stone, water) = (block(&registry, "stone"), block(&registry, "water"));
     let center = chunk_repr(
         &dense_from(|x, y, z| match (x, y, z) {
-            (0..4, 0, 0..4) | (0, 3, 0) => stone.0,
-            (0..4, 1..=2, 0..4) => water.0,
+            (1..5, 1..=2, 1..5) => water.0,
+            (0..6, 0..=2, 0..6) | (1, 3, 1) => stone.0,
             _ => 0,
         }),
         Repr::Packed,
     );
     let input = isolated(&center);
     let padded = gathered(&input, &table);
-    for (x, z) in (0..4).flat_map(|x| (0..4).map(move |z| (x, z))) {
+    for (x, z) in (1..5).flat_map(|x| (1..5).map(move |z| (x, z))) {
         let marked = |y| padded.get(x, y, z) & FLUID_SURFACE_BIT != 0;
         assert!(!marked(1), "({x}, 1, {z}) has water above");
-        assert_eq!(marked(2), (x, z) != (0, 0), "({x}, 2, {z})");
+        assert_eq!(marked(2), (x, z) != (1, 1), "({x}, 2, {z})");
     }
     let mesh = Mesher::new().mesh_chunk(&input, &table, OPTIONS);
     verify_mesh(&padded, &table, &mesh);
-    let mut tops = 0;
+    let (mut flat, mut sloped) = (0, Vec::new());
     for quad in mesh.bucket(TRANSLUCENT_BUCKET) {
         for (p, face) in quad.unit_faces() {
-            let surface = p[1] == 2 && (p[0], p[2]) != (0, 0) && face != Face::NegY;
-            assert!(
-                !(p[1] == 1 && face == Face::PosY),
-                "face between the layers at {p:?}"
-            );
-            assert_eq!(
-                quad.shape() == layout::SHAPE_FLUID_SURFACE,
-                surface,
-                "{p:?} {face:?}"
-            );
-            tops += usize::from(face == Face::PosY);
+            assert_eq!((p[1], face), (2, Face::PosY), "only the tops show");
+            match quad.shape() {
+                layout::SHAPE_FLUID_SURFACE => flat += 1,
+                layout::SHAPE_FLUID_SLOPE => sloped.push((p, quad.fluid_heights().unwrap())),
+                other => panic!("{p:?}: shape {other}"),
+            }
         }
     }
-    assert_eq!(tops, 15, "every open water top but the one under the stone");
+    assert_eq!(flat, 12, "the open tops away from the full cell");
+    sloped.sort();
+    assert_eq!(
+        sloped,
+        [
+            ([1, 2, 2], [16, 16, 14, 14]),
+            ([2, 2, 1], [16, 14, 16, 14]),
+            ([2, 2, 2], [16, 14, 14, 14]),
+        ]
+    );
 }

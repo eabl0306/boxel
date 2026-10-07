@@ -98,6 +98,25 @@ impl Greedy {
         &self.face_masks[face * CS_2..(face + 1) * CS_2]
     }
 
+    /// Takes the unit faces of inner voxel `pos` out of the face masks (the greedy pass will not
+    /// draw them) and returns which were visible (bit `Face::index`).
+    pub(crate) fn take_faces(&mut self, [x, y, z]: [u32; 3]) -> u8 {
+        let (x, y, z) = (x as usize, y as usize, z as usize);
+        let mut faces = 0;
+        for face in 0..6 {
+            // See `face_rows`.
+            let (row, bit) = match face {
+                0 | 1 => (x + y * CS, z),
+                2 | 3 => (y + x * CS, z),
+                _ => (x + y * CS, z + 1),
+            };
+            let word = &mut self.face_masks[face * CS_2 + row];
+            faces |= (((*word >> bit) & 1) as u8) << face;
+            *word &= !(1 << bit);
+        }
+        faces
+    }
+
     /// Hidden face culling (bgm `fast_face_culling`, unchanged): fills the face masks from the
     /// opaque and transparent column masks; transparent voxels also compare their neighbors'
     /// ids (`voxels`, the bits of `id_mask` only), so two transparent voxels of one material hide

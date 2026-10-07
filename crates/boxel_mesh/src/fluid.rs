@@ -1,0 +1,318 @@
+//! Fluid corner heights (ADR 0021): the top of a fluid surface cell has a height per corner,
+//! the average of the fluid around that corner, as in Minecraft's liquid renderer. A cell whose
+//! 4 corners are all at the flat surface height ([`FLAT`], 14/16) stays in the greedy pass
+//! (`SHAPE_FLUID_SURFACE`), so a calm lake costs what it did; every other surface cell (flowing
+//! water, the edge of a slope) leaves the greedy output and is drawn one block at a time with
+//! `SHAPE_FLUID_SLOPE`, its 4 heights in the quad.
+//!
+//! The rule, per corner of a surface cell, from the heights of the 4 cells around the corner
+//! (in 1/128 of a block):
+//! - A cell of the same fluid with that fluid or an opaque block above it is full (128); a
+//!   source or falling fluid is [`SOURCE`] (112 = 14/16); flowing level `l` (1..=7) is
+//!   `(8 - l) * 14`, Minecraft's `(8 - l) / 9` scaled so that a source sits at 14/16. Air and
+//!   plants are 0; anything else (a solid block, glass) does not count.
+//! - If either side cell is full, the corner is full. The diagonal cell counts only when a side
+//!   cell has fluid (and makes the corner full if it is full).
+//! - The corner is the weighted mean of the counted cells: weight 10 for source and full
+//!   heights, 1 for the others. Rounded to sixteenths, at least 1/16.
+//!
+//! Two fluid cells that share a corner see the same 4 cells there and count the same ones (both
+//! have fluid, so the diagonal counts for both), so their tops meet without cracks; the shared
+//! edge of two cells has the same two corners. Both hold across chunk borders: the padding has
+//! every cell a corner of the inner chunk reads (and the cell above each).
+use crate::greedy::Greedy;
+use crate::mesher::{class_from_masks, front_nb9, mask_row};
+use crate::packed::layout;
+use crate::shading::PaletteFull;
+use crate::{
+    FLUID_SURFACE_BIT, MaterialTable, PADDED_AREA, PADDED_VOLUME, PackedQuad, PaddedChunk,
+    VoxelClass,
+};
+use boxel_voxel::{BlockModel, CHUNK_SIZE, Face};
+use std::collections::BTreeMap;
+
+/// Height of a full fluid cell (fluid or an opaque block above it), in 1/128 of a block.
+const FULL: i32 = 128;
+/// Height of a source (and of falling fluid) at the surface: 14/16.
+const SOURCE: i32 = 112;
+/// A cell that does not count in a corner's mean (solid blocks, glass).
+const IGNORED: i32 = -1;
+/// The corner height of a flat surface, in sixteenths (`SOURCE / 8`).
+pub const FLAT: u8 = 14;
+
+/// A surface cell drawn with its own corner heights.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SlopedCell {
+    /// Inner chunk position.
+    pos: [u32; 3],
+    /// Its fluid's material.
+    material: u16,
+    /// Corner heights in sixteenths (`1..=16`), corner `k` at `(x, z) = (k & 1, k >> 1)`.
+    heights: [u8; 4],
+    /// The faces the greedy culling left visible (bit `Face::index`).
+    faces: u8,
+}
+
+/// Scratch of the fluid pass: the dense levels of the padded chunk (all 0 between meshes) and
+/// the sloped cells of the last mesh.
+pub(crate) struct FluidScratch {
+    levels: Box<[u8]>,
+    pub(crate) cells: Vec<SlopedCell>,
+}
+
+impl FluidScratch {
+    pub(crate) fn new() -> Self {
+        Self {
+            levels: vec![0; PADDED_VOLUME].into_boxed_slice(),
+            cells: Vec::new(),
+        }
+    }
+}
+
+/// The heights of the cells of one padded chunk.
+struct Heights<'a> {
+    padded: &'a PaddedChunk,
+    materials: &'a MaterialTable,
+    levels: &'a [u8],
+}
+
+impl Heights<'_> {
+    /// Height of padded cell `(x, y, z)` (y in `0..32`) seen from fluid `fluid`.
+    fn of(&self, fluid: u16, x: i32, y: i32, z: i32) -> i32 {
+        let i = PaddedChunk::index(x, y, z);
+        let id = self.padded.voxels[i] & !FLUID_SURFACE_BIT;
+        if id == fluid {
+            let above = self.padded.voxels[i + PADDED_AREA] & !FLUID_SURFACE_BIT;
+            if above == fluid || class_from_masks(self.padded, x, y + 1, z) == VoxelClass::Opaque {
+                return FULL;
+            }
+            return match self.levels[i] {
+                0 | 8.. => SOURCE,
+                level => (8 - i32::from(level)) * 14,
+            };
+        }
+        match class_from_masks(self.padded, x, y, z) {
+            VoxelClass::Empty => 0,
+            VoxelClass::Special | VoxelClass::Transparent => match self.materials.model(id) {
+                BlockModel::Cross | BlockModel::Fluid => 0,
+                _ => IGNORED,
+            },
+            VoxelClass::Opaque => IGNORED,
+        }
+    }
+
+    /// Corner `k` (`(x, z) = (k & 1, k >> 1)`) of the top of fluid cell `(x, y, z)`, whose own
+    /// height is `own`, in sixteenths.
+    fn corner(&self, fluid: u16, [x, y, z]: [i32; 3], own: i32, k: usize) -> u8 {
+        let dx = if k & 1 == 1 { 1 } else { -1 };
+        let dz = if k >> 1 == 1 { 1 } else { -1 };
+        let side_x = self.of(fluid, x + dx, y, z);
+        let side_z = self.of(fluid, x, y, z + dz);
+        if side_x >= FULL || side_z >= FULL {
+            return 16;
+        }
+        let (mut sum, mut weight) = (0, 0);
+        let mut add = |h: i32| {
+            if h >= SOURCE {
+                sum += h * 10;
+                weight += 10;
+            } else if h >= 0 {
+                sum += h;
+                weight += 1;
+            }
+        };
+        if side_x > 0 || side_z > 0 {
+            let diagonal = self.of(fluid, x + dx, y, z + dz);
+            if diagonal >= FULL {
+                return 16;
+            }
+            add(diagonal);
+        }
+        add(own);
+        add(side_z);
+        add(side_x);
+        // Rounded to sixteenths (8 units); `weight >= 1`: the own cell always counts.
+        ((sum + 4 * weight) / (8 * weight)).clamp(1, 16) as u8
+    }
+
+    /// The 4 corner heights of surface cell `(x, y, z)` of fluid `fluid`.
+    fn corners(&self, fluid: u16, p: [i32; 3]) -> [u8; 4] {
+        let own = self.of(fluid, p[0], p[1], p[2]);
+        std::array::from_fn(|k| self.corner(fluid, p, own, k))
+    }
+}
+
+/// Finds the surface cells of `padded` whose top is not flat, takes their faces out of the
+/// greedy culling (so the greedy pass does not draw them; their neighbors still cull against
+/// them) and keeps them in `scratch.cells`. Needs the surface marks (`FLUID_SURFACE_BIT`); a
+/// chunk without marks has no sloped cells.
+pub(crate) fn find_sloped(
+    padded: &PaddedChunk,
+    materials: &MaterialTable,
+    greedy: &mut Greedy,
+    scratch: &mut FluidScratch,
+) {
+    scratch.cells.clear();
+    if padded.cull_mask == u16::MAX {
+        return;
+    }
+    for &(i, level) in &padded.fluid_levels {
+        scratch.levels[i as usize] = level;
+    }
+    let heights = Heights {
+        padded,
+        materials,
+        levels: &scratch.levels,
+    };
+    for y in 0..CHUNK_SIZE {
+        for x in 0..CHUNK_SIZE {
+            // Inner voxels only (mask bit of padded z is z + 1).
+            let mut bits = (padded.transparent[mask_row(x, y)] >> 1) & u64::from(u32::MAX);
+            while bits != 0 {
+                let z = bits.trailing_zeros() as i32;
+                bits &= bits - 1;
+                let id = padded.voxels[PaddedChunk::index(x, y, z)];
+                if id & FLUID_SURFACE_BIT == 0 {
+                    continue;
+                }
+                let fluid = id & !FLUID_SURFACE_BIT;
+                let corners = heights.corners(fluid, [x, y, z]);
+                if corners == [FLAT; 4] {
+                    continue;
+                }
+                let pos = [x as u32, y as u32, z as u32];
+                scratch.cells.push(SlopedCell {
+                    pos,
+                    material: fluid,
+                    heights: corners,
+                    faces: greedy.take_faces(pos),
+                });
+            }
+        }
+    }
+    for &(i, _) in &padded.fluid_levels {
+        scratch.levels[i as usize] = 0;
+    }
+}
+
+/// Appends the quads of the sloped cells to `out` with their buckets: one
+/// `SHAPE_FLUID_SLOPE` quad per visible face. `shade(front, face, nb9)` gives the light palette
+/// index (and an AO byte, unused: the heights take its bits) as for the cube face in its place.
+pub(crate) fn emit_sloped(
+    cells: &[SlopedCell],
+    padded: &PaddedChunk,
+    materials: &MaterialTable,
+    out: &mut Vec<(u8, PackedQuad)>,
+    mut shade: impl FnMut(usize, Face, Option<u32>) -> Result<(u8, u16), PaletteFull>,
+) -> Result<(), PaletteFull> {
+    for cell in cells {
+        let [x, y, z] = cell.pos;
+        let m = cell.material;
+        for face in Face::ALL {
+            if cell.faces & (1 << face.index()) == 0 {
+                continue;
+            }
+            let n = face.normal();
+            let front = PaddedChunk::index(x as i32 + n.x, y as i32 + n.y, z as i32 + n.z);
+            let nb9 = front_nb9(face, &padded.opaque, x as usize, y as usize, z as usize);
+            let (_, light) = shade(front, face, Some(nb9))?;
+            let mut quad = PackedQuad::new(cell.pos, 1, 1, face, materials.layer(m, face))
+                .with_light_index(light)
+                .with_fluid_heights(cell.heights);
+            if materials.emissive(m) {
+                quad.geo |= layout::FLAG_EMISSIVE << layout::GEO_FLAGS_SHIFT;
+            }
+            out.push((materials.bucket(m, face) as u8, quad));
+        }
+    }
+    Ok(())
+}
+
+/// Brute-force oracle of the corner heights (ADR 0021): every fluid surface cell of the inner
+/// 32^3 of a gathered chunk (marked with `FLUID_SURFACE_BIT`) and its 4 corner heights in
+/// sixteenths, from Minecraft's rule written out in floating point (heights in blocks, a source
+/// at 14/16, flowing level `l` at `(8 - l) / 8` of that; weights 10 at or above a source, 1
+/// below; a solid neighbor is left out). The mesher draws a cell with `SHAPE_FLUID_SLOPE` and
+/// these heights unless all 4 are 14 (then it stays a greedy `SHAPE_FLUID_SURFACE` cell).
+pub fn reference_fluid_heights(
+    padded: &PaddedChunk,
+    materials: &MaterialTable,
+) -> BTreeMap<[u32; 3], [u8; 4]> {
+    let level_at = |x: i32, y: i32, z: i32| {
+        let i = PaddedChunk::index(x, y, z) as u32;
+        padded
+            .fluid_levels
+            .iter()
+            .rev()
+            .find(|&&(j, _)| j == i)
+            .map_or(0, |&(_, l)| l)
+    };
+    // Height in blocks; `None` does not count.
+    let height = |fluid: u16, x: i32, y: i32, z: i32| -> Option<f64> {
+        let id = padded.get(x, y, z) & !FLUID_SURFACE_BIT;
+        let class = |x, y, z| class_from_masks(padded, x, y, z);
+        if id == fluid {
+            let above = padded.get(x, y + 1, z) & !FLUID_SURFACE_BIT;
+            if above == fluid || class(x, y + 1, z) == VoxelClass::Opaque {
+                return Some(1.0);
+            }
+            let level = level_at(x, y, z);
+            let amount = if level == 0 || level >= 8 {
+                8
+            } else {
+                8 - level
+            };
+            return Some(f64::from(amount) / 8.0 * 0.875);
+        }
+        let model = materials.model(id);
+        match class(x, y, z) {
+            VoxelClass::Empty => Some(0.0),
+            VoxelClass::Special | VoxelClass::Transparent
+                if matches!(model, BlockModel::Cross | BlockModel::Fluid) =>
+            {
+                Some(0.0)
+            }
+            _ => None,
+        }
+    };
+    let mut out = BTreeMap::new();
+    for y in 0..CHUNK_SIZE {
+        for x in 0..CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
+                let id = padded.get(x, y, z);
+                if padded.cull_mask == u16::MAX || id & FLUID_SURFACE_BIT == 0 {
+                    continue;
+                }
+                let fluid = id & !FLUID_SURFACE_BIT;
+                let own = height(fluid, x, y, z).expect("a fluid cell");
+                let corners = std::array::from_fn(|k| {
+                    let (dx, dz) = (
+                        if k & 1 == 1 { 1 } else { -1 },
+                        if k >> 1 == 1 { 1 } else { -1 },
+                    );
+                    let a = height(fluid, x + dx, y, z);
+                    let b = height(fluid, x, y, z + dz);
+                    if a == Some(1.0) || b == Some(1.0) {
+                        return 16;
+                    }
+                    let mut counted = vec![own];
+                    counted.extend(a);
+                    counted.extend(b);
+                    if a.unwrap_or(0.0) > 0.0 || b.unwrap_or(0.0) > 0.0 {
+                        let d = height(fluid, x + dx, y, z + dz);
+                        if d == Some(1.0) {
+                            return 16;
+                        }
+                        counted.extend(d);
+                    }
+                    let weight = |h: f64| if h >= 0.875 { 10.0 } else { 1.0 };
+                    let sum: f64 = counted.iter().map(|&h| h * weight(h)).sum();
+                    let total: f64 = counted.iter().map(|&h| weight(h)).sum();
+                    ((sum / total * 16.0).round() as u8).clamp(1, 16)
+                });
+                out.insert([x as u32, y as u32, z as u32], corners);
+            }
+        }
+    }
+    out
+}

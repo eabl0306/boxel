@@ -14,7 +14,7 @@
 //! distance key then draws after the water. Instead, the order is a topological sort of the
 //! "may cover" relation that the quads' planes give:
 //!
-//! - Every quad lies in an axis-aligned plane. If a quad `b` lies entirely on one side of the
+//! - Almost every quad lies in an axis-aligned plane. If a quad `b` lies entirely on one side of the
 //!   plane of quad `a` (touching allowed), the camera's side of that plane decides: when `b` is
 //!   on the camera's side, `b` may cover `a` and `a` cannot cover `b`, so `a` goes first;
 //!   otherwise `b` goes first. Both planes of a pair are tried; if they disagree, neither quad
@@ -23,6 +23,10 @@
 //!   pixels at the same depth: the one facing away from the camera goes first.
 //! - Pairs that no plane separates (only intersecting quads) and the order among unconstrained
 //!   quads fall back to the distance key: farthest center first, ties by mesher index.
+//! - The sloped top of a flowing water cell (`SHAPE_FLUID_SLOPE`, ADR 0021) has no plane: it
+//!   lies in the horizontal slab between its lowest and highest corner, which orders it against
+//!   what lies wholly above or below the slab (the slab's top or bottom acts as its plane). The
+//!   slab's top and bottom bound the camera cell like planes, so crossing the slope re-sorts.
 //! - A cycle of constraints (possible, rare) is broken by emitting the farthest remaining quad.
 //!
 //! The constraints only depend on which side of each plane the camera is, so the order stays
@@ -49,6 +53,7 @@ use crate::path::CHUNK_EDGE;
 use crate::renderer::ViewParams;
 use boxel_math::{Aabb, DVec3, I64Vec3, Vec3};
 use boxel_mesh::{ChunkMesh, PackedQuad, TRANSLUCENT_BUCKET, layout};
+use boxel_voxel::Face;
 use boxel_world::jobs::{InlineExecutor, JobExecutor, TaskPoolExecutor};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
@@ -69,7 +74,8 @@ pub enum TranslucentSort {
 }
 
 /// Sub-voxel steps of the plane coordinates: every quad plane of a mesh lies on a sixteenth of a
-/// voxel (slabs at 8/16, fluid surfaces at 14/16), so planes are exact integers.
+/// voxel (slabs at 8/16, fluid surfaces at 14/16, fluid corners on sixteenths), so planes are
+/// exact integers.
 const SUB: i32 = 16;
 
 /// Most translucent quads a chunk sorts topologically. The pair test is quadratic: a worst case
@@ -108,7 +114,7 @@ pub(crate) struct QuadBox {
     /// Max corner.
     pub max: [i32; 3],
     /// The quad's plane (`None` for a cross plant quad, which runs along a diagonal: its box is
-    /// its cell).
+    /// its cell, and for the sloped top of a fluid cell: its box spans its corner heights).
     pub plane: Option<Plane>,
 }
 
@@ -134,6 +140,32 @@ impl QuadBox {
             layout::SHAPE_UPPER_HALF => min[1] = p[1] + half,
             layout::SHAPE_FLUID_SURFACE if n == 1 && positive => at = p[1] + surface,
             layout::SHAPE_FLUID_SURFACE if n != 1 => max[1] = p[1] + surface,
+            layout::SHAPE_FLUID_SLOPE => {
+                // Corner heights in sixteenths, corner k at (x, z) = (k & 1, k >> 1).
+                let h = quad.fluid_heights().map_or([SUB; 4], |h| h.map(i32::from));
+                let edge = |a: usize, b: usize| h[a].max(h[b]);
+                let (lo, hi) = (
+                    h[0].min(h[1]).min(h[2]).min(h[3]),
+                    edge(0, 1).max(edge(2, 3)),
+                );
+                match face {
+                    Face::PosY if lo != hi => {
+                        min[1] = p[1] + lo;
+                        max[1] = p[1] + hi;
+                        return Self {
+                            min,
+                            max,
+                            plane: None,
+                        };
+                    }
+                    Face::PosY => at = p[1] + lo,
+                    Face::NegY => {}
+                    Face::PosX => max[1] = p[1] + edge(1, 3),
+                    Face::NegX => max[1] = p[1] + edge(0, 2),
+                    Face::PosZ => max[1] = p[1] + edge(2, 3),
+                    Face::NegZ => max[1] = p[1] + edge(0, 1),
+                }
+            }
             layout::SHAPE_CROSS => {
                 return Self {
                     min: p,
@@ -193,13 +225,33 @@ fn plane_order(plane: Plane, other: &QuadBox, eye: [f64; 3]) -> Option<bool> {
     }
 }
 
+/// Whether the owner of a box without a plane (a sloped fluid top), which lies within the
+/// horizontal slab `min[1]..=max[1]`, goes before `other` (`Some(true)`), after it, or the slab
+/// says nothing (`other` reaches into it). Like [`plane_order`] with the slab's top for what
+/// lies above it and its bottom for what lies below.
+fn slab_order(owner: &QuadBox, other: &QuadBox, eye: [f64; 3]) -> Option<bool> {
+    let (lo, hi) = (owner.min[1], owner.max[1]);
+    if other.min[1] >= hi {
+        Some(eye[1] > f64::from(hi))
+    } else if other.max[1] <= lo {
+        Some(eye[1] <= f64::from(lo))
+    } else {
+        None
+    }
+}
+
+/// What the plane of `a` (or its slab, without a plane) says about `a` before `b`.
+fn owner_order(a: &QuadBox, b: &QuadBox, eye: [f64; 3]) -> Option<bool> {
+    match a.plane {
+        Some(p) => plane_order(p, b, eye),
+        None => slab_order(a, b, eye),
+    }
+}
+
 /// Whether `a` must go before `b` (`Some(true)`), after it (`Some(false)`), or either way.
 pub(crate) fn pair_order(a: &QuadBox, b: &QuadBox, eye: [f64; 3]) -> Option<bool> {
-    let by_a = a.plane.and_then(|p| plane_order(p, b, eye));
-    let by_b = b
-        .plane
-        .and_then(|p| plane_order(p, a, eye))
-        .map(|b_first| !b_first);
+    let by_a = owner_order(a, b, eye);
+    let by_b = owner_order(b, a, eye).map(|b_first| !b_first);
     match (by_a, by_b) {
         // One plane says `a` cannot cover `b`, the other that `b` cannot cover `a`.
         (Some(x), Some(y)) if x != y => None,
@@ -257,13 +309,21 @@ fn far_slack(distance: f64) -> f64 {
 fn plane_cell(boxes: &[QuadBox], eye: [f64; 3]) -> Validity {
     let mut lo = [f64::NEG_INFINITY; 3];
     let mut hi = [f64::INFINITY; 3];
-    for b in boxes {
-        let Some(p) = b.plane else { continue };
-        let at = f64::from(p.at);
-        if at < eye[p.axis] {
-            lo[p.axis] = lo[p.axis].max(at);
+    let mut bound = |axis: usize, at: f64| {
+        if at < eye[axis] {
+            lo[axis] = lo[axis].max(at);
         } else {
-            hi[p.axis] = hi[p.axis].min(at);
+            hi[axis] = hi[axis].min(at);
+        }
+    };
+    for b in boxes {
+        match b.plane {
+            Some(p) => bound(p.axis, f64::from(p.at)),
+            // A sloped fluid top: the bottom and top of its box.
+            None => {
+                bound(1, f64::from(b.min[1]));
+                bound(1, f64::from(b.max[1]));
+            }
         }
     }
     let slack = far_slack(center_distance(eye));
@@ -756,6 +816,42 @@ mod tests {
             (cross.min, cross.max, cross.plane),
             ([16; 3], [32; 3], None)
         );
+    }
+
+    #[test]
+    fn sloped_fluid_quads_are_boxes_ordered_by_the_planes_around_them() {
+        let sloped = |f| QuadBox::of(quad([2, 3, 4], 1, 1, f).with_fluid_heights([16, 14, 9, 14]));
+        // the top: no plane, the cell between its lowest and highest corner
+        let top = sloped(Face::PosY);
+        assert_eq!(
+            (top.min, top.max, top.plane),
+            ([32, 57, 64], [48, 64, 80], None)
+        );
+        // a flat one is a plane again
+        let flat = QuadBox::of(quad([2, 3, 4], 1, 1, Face::PosY).with_fluid_heights([13; 4]));
+        assert_eq!(flat.plane.map(|p| p.at), Some(48 + 13));
+        // the sides end at the higher corner of their edge, the bottom is the cube's
+        assert_eq!(sloped(Face::PosX).max[1], 48 + 14);
+        assert_eq!(sloped(Face::NegX).max[1], 48 + 16);
+        assert_eq!(sloped(Face::PosZ).max[1], 48 + 14);
+        assert_eq!(sloped(Face::NegZ).max[1], 48 + 16);
+        assert_eq!(
+            sloped(Face::NegZ).plane.map(|p| (p.axis, p.at)),
+            Some((2, 64))
+        );
+        assert_eq!(sloped(Face::NegY).plane.map(|p| p.at), Some(48));
+        // A sloped top over a glass top one block down: the glass first from above, last from
+        // below; the camera cell stops at the slope's box.
+        let quads = [
+            quad([2, 3, 4], 1, 1, Face::PosY).with_fluid_heights([16, 14, 9, 14]),
+            quad([2, 1, 4], 1, 1, Face::PosY),
+        ];
+        assert_eq!(order_of(&quads, DVec3::new(2.5, 9.0, 4.5)), [1, 0]);
+        assert_eq!(order_of(&quads, DVec3::new(2.5, 1.5, 4.5)), [0, 1]);
+        let (_, cell) = sort_order(&quads, DVec3::new(2.5, 9.0, 4.5));
+        assert_eq!(cell.lo[1], 64.0);
+        let (_, cell) = sort_order(&quads, DVec3::new(2.5, 3.2, 4.5));
+        assert_eq!((cell.lo[1], cell.hi[1]), (32.0, 57.0));
     }
 
     fn order_of(quads: &[PackedQuad], eye: DVec3) -> Vec<u32> {

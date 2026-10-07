@@ -43,6 +43,10 @@ pub struct PaddedChunk {
     /// them, or all but [`FLUID_SURFACE_BIT`] once the surface cells are marked (a surface cell
     /// and the rest of its fluid hide the faces between them).
     pub cull_mask: u16,
+    /// The fluid cells whose level is not 0 (flowing or falling water, ADR 0021): padded index
+    /// and level. Every level of a fluid has the material of its source in `voxels` (so they
+    /// cull and merge as one fluid); the mesher reads the levels here for the corner heights.
+    pub fluid_levels: Vec<(u32, u8)>,
 }
 
 impl Default for PaddedChunk {
@@ -60,6 +64,7 @@ impl PaddedChunk {
             transparent: vec![0; PADDED_AREA].into_boxed_slice(),
             special: vec![0; PADDED_AREA].into_boxed_slice(),
             cull_mask: u16::MAX,
+            fluid_levels: Vec::new(),
         }
     }
     /// Resets to empty.
@@ -69,6 +74,7 @@ impl PaddedChunk {
         self.transparent.fill(0);
         self.special.fill(0);
         self.cull_mask = u16::MAX;
+        self.fluid_levels.clear();
     }
     /// Linear index of chunk-local `(x, y, z)`, each in `-1..=32`.
     #[inline]
@@ -90,6 +96,25 @@ impl PaddedChunk {
             VoxelClass::Opaque => self.opaque[row] |= bit,
             VoxelClass::Transparent => self.transparent[row] |= bit,
             VoxelClass::Special => self.special[row] |= bit,
+        }
+    }
+    /// Writes a fluid voxel of `level` (`0` = source): `material` is the fluid's material (the
+    /// one of its source) with its class, and a level other than 0 goes to
+    /// [`PaddedChunk::fluid_levels`]. What `gather` does for a fluid state.
+    pub fn set_fluid(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        material: u16,
+        class: VoxelClass,
+        level: u8,
+    ) {
+        self.set(x, y, z, material, class);
+        let i = Self::index(x, y, z) as u32;
+        self.fluid_levels.retain(|&(j, _)| j != i);
+        if level != 0 {
+            self.fluid_levels.push((i, level));
         }
     }
     /// Material at `(x, y, z)` in `-1..=32`.

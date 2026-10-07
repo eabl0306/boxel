@@ -2,7 +2,8 @@
 //
 // PackedQuad = vec2<u32>(geo, mat), 8 bytes, identical bytes on every tier.
 //   geo: x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | flags:4 (bit 0 = FLAG_EMISSIVE, bits 1..3 =
-//        shape code, ADR 0018: cube, turned cube, lower or upper half of the cell, cross, fluid surface)
+//        shape code, ADR 0018: cube, turned cube, lower or upper half of the cell, cross, fluid surface,
+//        and 7 = sloped fluid cell, ADR 0021: w = h = 1 and the extent bits hold corner heights)
 //   mat: layer:12 | ao:8 (2 bits per corner, 3 = unoccluded) | light:12 (index into the chunk's
 //        light palette)
 // face: 0=+Y 1=-Y 2=+X 3=-X 4=+Z 5=-Z  (u,v axes: ±Y -> (X,Z), ±X -> (Z,Y), ±Z -> (X,Y))
@@ -46,6 +47,7 @@ const SHAPE_LOWER_HALF: u32 = 2u;  // bottom slab face (w = h = 1)
 const SHAPE_UPPER_HALF: u32 = 3u;  // top slab face (w = h = 1)
 const SHAPE_CROSS: u32 = 4u;       // plant quad through the cell's diagonal (w = h = 1)
 const SHAPE_FLUID_SURFACE: u32 = 5u; // fluid surface cell: its top drops to FLUID_SURFACE (greedy)
+const SHAPE_FLUID_SLOPE: u32 = 7u; // fluid cell with a height per top corner (w = h = 1, no AO)
 const FLUID_SURFACE: f32 = 0.875;
 const MAT_LAYER_MASK: u32 = 0xFFFu;
 const MAT_AO_SHIFT: u32 = 12u;
@@ -133,9 +135,12 @@ fn face_shade(f: u32) -> f32 {
 fn decode_quad(q: vec2<u32>, light: vec2<u32>, corner_in: u32) -> Decoded {
   let geo = q.x;
   let mat = q.y;
+  let shape = (geo >> GEO_SHAPE_SHIFT) & GEO_SHAPE_MASK;
+  // A sloped fluid quad is one cell: its extent bits and AO byte hold its corner heights.
+  let sloped = shape == SHAPE_FLUID_SLOPE;
   let p = vec3<f32>(f32(geo & GEO_POS_MASK), f32((geo >> GEO_Y_SHIFT) & GEO_POS_MASK), f32((geo >> GEO_Z_SHIFT) & GEO_POS_MASK));
-  let w = f32(((geo >> GEO_W_SHIFT) & GEO_POS_MASK) + 1u);
-  let h = f32(((geo >> GEO_H_SHIFT) & GEO_POS_MASK) + 1u);
+  let w = select(f32(((geo >> GEO_W_SHIFT) & GEO_POS_MASK) + 1u), 1.0, sloped);
+  let h = select(f32(((geo >> GEO_H_SHIFT) & GEO_POS_MASK) + 1u), 1.0, sloped);
   let f = (geo >> GEO_FACE_SHIFT) & 7u;
   let n = face_normal(f);
   let u = face_u(f);
@@ -152,10 +157,9 @@ fn decode_quad(q: vec2<u32>, light: vec2<u32>, corner_in: u32) -> Decoded {
   o.face = f;
   o.layer = mat & MAT_LAYER_MASK;
   o.light = light;
-  o.ao = (mat >> MAT_AO_SHIFT) & 0xFFu;
+  o.ao = select((mat >> MAT_AO_SHIFT) & 0xFFu, 0xFFu, sloped);
   o.flags = (geo >> GEO_FLAGS_SHIFT) & 15u;
   o.grow = vec2(2.0 * cu - 1.0, 2.0 * cv - 1.0);
-  let shape = (geo >> GEO_SHAPE_SHIFT) & GEO_SHAPE_MASK;
   if (shape == SHAPE_LOWER_HALF || shape == SHAPE_UPPER_HALF) {
     // Slab: the cell's y range shrinks to [lo, lo + 0.5]. Side faces keep the part of the cube
     // face they cover: their y, texture row and light/AO coordinate t all follow the real y, so
@@ -182,6 +186,32 @@ fn decode_quad(q: vec2<u32>, light: vec2<u32>, corner_in: u32) -> Decoded {
       o.st.y = y;
     } else if (f == 0u) {
       o.local.y = p.y + FLUID_SURFACE;
+    }
+  } else if (sloped) {
+    // Sloped fluid cell (ADR 0021): corner k of the top, at (x, z) = (k & 1, k >> 1), is
+    // ((heights >> 4k) & 15) + 1 sixteenths high (corners 0 and 1 in the extent bits, 2 and 3
+    // in the AO byte). The +Y face runs through the 4 corners; a side face runs from y = 0 up
+    // to the two corners of its edge, its texture row and light coordinate t following the
+    // real y as on slabs; the -Y face stays.
+    let heights = ((geo >> GEO_W_SHIFT) & 0xFFu) | (((mat >> MAT_AO_SHIFT) & 0xFFu) << 8u);
+    var k = 0u;
+    if (f == 0u) {
+      k = c;
+    } else if (f == 2u || f == 3u) {
+      // u = z: the edge at x = 1 (+X) or 0 (-X)
+      k = select(0u, 1u, f == 2u) + 2u * (c & 1u);
+    } else if (f >= 4u) {
+      // u = x: the edge at z = 1 (+Z) or 0 (-Z)
+      k = (c & 1u) + select(0u, 2u, f == 4u);
+    }
+    let top = f32(((heights >> (4u * k)) & 15u) + 1u) / 16.0;
+    if (f == 0u) {
+      o.local.y = p.y + top;
+    } else if (f >= 2u) {
+      let y = top * cv;
+      o.local.y = p.y + y;
+      o.uv.y = 1.0 - y;
+      o.st.y = y;
     }
   } else if (shape == SHAPE_CROSS) {
     // Face 2 (+X) runs from (0, 0) to (1, 1) in (x, z), face 4 (+Z) from (1, 0) to (0, 1); full

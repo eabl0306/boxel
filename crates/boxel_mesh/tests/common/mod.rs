@@ -178,7 +178,8 @@ pub fn class_at(padded: &PaddedChunk, x: i32, y: i32, z: i32) -> VoxelClass {
 /// Checks a mesh against its padded input: counts match the quads, opaque buckets hold their
 /// own face, quads stay inside the chunk and never overlap, every unit face has the bucket,
 /// texture layer and emissive flag of the material of its voxel and the shape code of its face
-/// (`SHAPE_FLUID_SURFACE` on a marked fluid surface cell but for its -Y face), and the expanded
+/// (`SHAPE_FLUID_SURFACE` on a marked fluid surface cell but for its -Y face, or
+/// `SHAPE_FLUID_SLOPE` on every face of a sloped one), and the expanded
 /// unit faces equal the brute-force oracle. Returns the number of unit faces.
 pub fn verify_mesh(padded: &PaddedChunk, table: &MaterialTable, mesh: &ChunkMesh) -> usize {
     assert_eq!(
@@ -220,7 +221,10 @@ pub fn verify_mesh(padded: &PaddedChunk, table: &MaterialTable, mesh: &ChunkMesh
                     table.emissive(material),
                     "unit face {p:?} {face:?}: emissive flag of material {material}"
                 );
-                let code = if surface && face != Face::NegY {
+                let code = if surface && quad.shape() == layout::SHAPE_FLUID_SLOPE {
+                    // A surface cell with its own corner heights (checked by the fluid tests).
+                    layout::SHAPE_FLUID_SLOPE
+                } else if surface && face != Face::NegY {
                     layout::SHAPE_FLUID_SURFACE
                 } else {
                     table.cube_code(material, face)
@@ -463,10 +467,14 @@ pub fn verify_shading(
             light: mesh.corner_light(*quad),
         };
         for (p, face) in quad.unit_faces() {
-            let want = reference
+            let mut want = reference
                 .get(&(p, face))
                 .unwrap_or_else(|| panic!("{p:?} {face:?} is not a visible face"))
                 .quantized(mesh.light_quantization, elide);
+            if quad.shape() == layout::SHAPE_FLUID_SLOPE {
+                // Sloped fluid quads have no AO: their AO bits hold corner heights.
+                want.ao = 0xFF;
+            }
             assert_eq!(got, want, "{quad:?}: unit face {p:?} {face:?}");
             faces += 1;
         }
