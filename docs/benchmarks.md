@@ -29,6 +29,11 @@ por defecto, es sin límite), por ejemplo para ver cómo se comporta con el lím
 juego. El resumen anota el límite y `tools/bench_report.py` no mezcla corridas con límites
 distintos (las corridas viejas, sin el dato, cuentan como sin límite).
 
+El stress presenta con `--present immediate` (en Wayland sale Mailbox). `--vsync on` pide vsync
+(Fifo) y `--vsync off` el modo por defecto de un juego (Mailbox, si no Immediate). El resumen anota
+el vsync, el modo que quedó y la frecuencia del monitor, y `tools/bench_report.py` no mezcla
+corridas con y sin vsync.
+
 `--edits` agrega ediciones con guion durante la medición, una por segundo cerca del inicio: pone
 una lámpara y la saca, cava un pozo de 24 bloques y lo tapa. El resumen suma una tabla "Edits"
 con los frames que tardó cada una en publicarse (de la edición hasta que el mundo vuelve a estar
@@ -113,6 +118,8 @@ arriba).
 | border catch-up | después de cada cruce, cuánto tardó el mundo en terminar los chunks nuevos. Si no termina antes del próximo cruce, va atrasado. Si la medición corta el último cruce a la mitad, ese no cuenta |
 | catch-up after stop | cuánto tardó en terminar todo después de que la cámara frenó |
 | Worst 5 frames | los 5 peores, con lo que pasó en cada uno (cruce, chunks generados, mallas, cola) y si se presentó |
+| > 7.5 ms | frames que se notan con el límite de 144 (el período es 6.94 ms) |
+| Pacing | el intervalo entre frames, entre frames presentados y entre frame callbacks del compositor (mediana, p99, máximo, desvío y cuántos pasan de 1.5 veces la mediana: con un frame por refresco, cada uno es un refresco sin frame nuevo). También los frames que el runner retuvo esperando la compuerta de presentación y los que se rindieron y corrieron sin presentar |
 | Per second | fps, peor frame y pico de la cola, segundo a segundo |
 
 Los chunks generados y los trabajos terminados se cuentan exactos (stress envuelve el generador
@@ -130,8 +137,9 @@ just bench-report --compare carpeta-antes/ carpeta-despues/
 `--compare` muestra cada número, el cambio en % y si mejoró o empeoró. Si antes era 0 no hay %,
 pero igual dice si empeoró (por ejemplo, tirones nuevos). Si las corridas tienen otra
 configuración (radio, GPU, velocidad), lo avisa. Con dos carpetas empareja las corridas del mismo
-mundo, luz (`--light`), escenario, radio, radio vertical, velocidad, límite de fps, cuerpos
+mundo, luz (`--light`), escenario, radio, radio vertical, velocidad, límite de fps, vsync, cuerpos
 (`--bodies`), ediciones (`--edits`), backend, tier y GPU. Una hora distinta (`--time`) solo se anota.
+Si las corridas tienen los datos de ritmo (Pacing), también los compara.
 
 Flujo sugerido: `just bench-all` antes del cambio, mover `bench-results/` a otra carpeta,
 aplicar el cambio, `just bench-all` otra vez y comparar las dos carpetas.
@@ -142,6 +150,10 @@ Una fila por frame: `frame_ms`, `crossed` (cruzó un borde), `generated`, `meshe
 `queued_jobs`, `in_flight`, los contadores de `WorldStats` y la posición de la cámara.
 `arena_used` son las entradas del arena del render en uso (quads más paletas de luz) y
 `dropped_chunks` los chunks que el render no pudo guardar hasta ese frame (arena o tabla llenos).
+`gate_wait_ms` es lo que el runner retuvo el frame esperando la compuerta de presentación,
+`gate_missed` si se rindió y `gate_ms` cuándo se abrió la compuerta por última vez (el frame
+callback del compositor en Wayland), en ms desde el inicio de la medición. `display_locked` dice
+si el runner marcó el ritmo con el monitor (ADR 0017).
 El resumen anota los dos al final. Sirve para graficar o para buscar qué pasó en un tirón
 puntual.
 

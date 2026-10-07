@@ -59,3 +59,10 @@ sistemas paralelos, que en macOS y Windows es un deadlock.
 - El modo por defecto pasa a ser vsync apagado (`Mailbox`, si no `Immediate`, si no `Fifo`), y se
   puede cambiar en tiempo de ejecución con `PresentSettings`. Ya no hay fps ilimitados en
   laptops: los limita `FrameLimit`.
+
+## Revisión: ritmo atado al monitor (ADR 0017)
+
+- Con el límite en la frecuencia del monitor o más, en Wayland el frame callback decide cuándo
+  corre la update (corre apenas llega, y la espera cubre un refresco salteado).
+  Las updates siguen corriendo en `about_to_wait`, nunca dentro de `RedrawRequested`, y nunca
+  esperan un callback sin límite de tiempo: la simulación no se congela con la ventana oculta.

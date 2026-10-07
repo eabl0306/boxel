@@ -57,6 +57,7 @@ use boxel::mesh::AoPolicy;
 use boxel::prelude::*;
 use boxel::render::GpuFailed;
 use boxel::voxel::{BlockPos, BlockRegistry, ChunkData, ChunkKey, ChunkPos, MAX_BLOCK_COORD};
+use boxel::window::FramePacingInfo;
 use boxel::world::jobs::{JobExecutor, TaskPoolExecutor};
 use boxel::world::{ChunkId, ChunkMeshEvent, WorldContent, WorldStats, WorldSystems};
 use edits::EditScript;
@@ -97,6 +98,8 @@ usage: stress [--scenario static|fly|dive|spin] [GPU options] [options]
   --arena-quads N     renderer quad arena (default 8388608, 25165824 with the overworld)
   --chunk-slots N     renderer chunk table (default 32768, 65536 with the overworld)
   --fps-limit N       at most N updates per second (default 0: unlimited, the uncapped loop)
+  --vsync on|off      vsync: on is --present vsync (Fifo), off is --present novsync (Mailbox,
+                      else Immediate); without it the run presents with --present immediate
   --spans             busy time per system and span in each frame, added to the summary (needs
                       a build with --features trace)
   --spans-csv PATH    also write it per frame (implies --spans)
@@ -107,7 +110,7 @@ usage: stress [--scenario static|fly|dive|spin] [GPU options] [options]
   --light on|off      voxel light and ambient occlusion (default on); off: neither, the look and
                       the cost of the world before light
   --help              this text
-The run presents with --present immediate unless --present or BOXEL_PRESENT is given.
+The run presents with --present immediate unless --vsync, --present or BOXEL_PRESENT is given.
 exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 output not written, 4 timeout";
 
 /// The whole help: [`USAGE`], the physics options and the world options.
@@ -189,6 +192,8 @@ struct Options {
     chunk_slots: Option<u32>,
     /// `--fps-limit` (0: unlimited).
     fps_limit: u32,
+    /// `--vsync` (`None`: not given).
+    vsync: Option<bool>,
     spans: bool,
     spans_csv: Option<PathBuf>,
     /// `--edits`.
@@ -234,6 +239,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         arena_quads: None,
         chunk_slots: None,
         fps_limit: 0,
+        vsync: None,
         spans: false,
         spans_csv: None,
         edits: false,
@@ -357,6 +363,13 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                     .ok()
                     .filter(|n| *n <= 100_000)
                     .ok_or_else(|| format!("{flag}: {n} is not in 0..=100000"))?;
+            }
+            "--vsync" => {
+                o.vsync = Some(match value()?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    v => return Err(format!("{flag}: {v:?} is not on or off")),
+                });
             }
             "--spans" => o.spans = true,
             "--spans-csv" => {
@@ -496,6 +509,11 @@ struct Pending {
     t: Duration,
     crossed: bool,
     camera: (f64, f64, f32),
+    /// `FramePacingInfo` of the frame: gate wait, gate missed, last gate opening.
+    gate_wait: Duration,
+    gate_missed: bool,
+    gate_at: Option<Duration>,
+    display_locked: bool,
 }
 
 #[derive(Resource)]
@@ -655,6 +673,10 @@ fn record(
             draws: info.draws,
             arena_used: info.arena_used_quads,
             dropped_chunks: info.dropped_chunks,
+            gate_wait: p.gate_wait,
+            gate_missed: p.gate_missed,
+            gate_at: p.gate_at,
+            display_locked: p.display_locked,
         };
         rec.log.push(record);
         if let Some(spans) = spans.as_deref_mut() {
@@ -687,10 +709,12 @@ fn drive(
     mut exit: MessageWriter<AppExit>,
     spans: Option<Res<SpanRecorder>>,
     script: Option<Res<EditScript>>,
+    pacing: Option<Res<FramePacingInfo>>,
 ) {
     if bench.exiting {
         return;
     }
+    let pacing = pacing.as_deref().copied().unwrap_or_default();
     let spans = spans.as_deref();
     let script = script.as_deref();
     let now = time.last_update().unwrap_or_else(Instant::now);
@@ -704,7 +728,7 @@ fn drive(
             ),
             Phase::CatchUp { .. } => {
                 // The measurement is complete; only the catch-up time is missing.
-                bench.finish(&rec, &info, spans, script, None, &mut exit);
+                bench.finish(&rec, &info, &pacing, spans, script, None, &mut exit);
                 return;
             }
             _ => eprintln!(
@@ -744,7 +768,7 @@ fn drive(
                 bench.options.scenario.name(),
                 bench.options.duration.as_secs_f64()
             );
-            measure_frame(&bench.options, now, now, &mut rec, &mut cameras);
+            measure_frame(&bench.options, now, now, &pacing, &mut rec, &mut cameras);
         }
         Phase::Measuring { start } => {
             if now.duration_since(start) >= bench.options.duration {
@@ -755,7 +779,7 @@ fn drive(
                     streak: 0,
                 };
             } else {
-                measure_frame(&bench.options, start, now, &mut rec, &mut cameras);
+                measure_frame(&bench.options, start, now, &pacing, &mut rec, &mut cameras);
             }
         }
         Phase::CatchUp { since, streak } => {
@@ -763,9 +787,9 @@ fn drive(
             bench.phase = Phase::CatchUp { since, streak };
             if streak >= SETTLED_FRAMES {
                 let catch_up = Some(now.duration_since(since));
-                bench.finish(&rec, &info, spans, script, catch_up, &mut exit);
+                bench.finish(&rec, &info, &pacing, spans, script, catch_up, &mut exit);
             } else if now.duration_since(since) > CATCH_UP_LIMIT {
-                bench.finish(&rec, &info, spans, script, None, &mut exit);
+                bench.finish(&rec, &info, &pacing, spans, script, None, &mut exit);
             }
         }
         Phase::Warmup { .. } | Phase::Done => {}
@@ -801,6 +825,7 @@ fn measure_frame(
     options: &Options,
     start: Instant,
     now: Instant,
+    pacing: &FramePacingInfo,
     rec: &mut Recorder,
     cameras: &mut Query<&mut Transform, With<Camera>>,
 ) {
@@ -823,16 +848,24 @@ fn measure_frame(
             t,
             crossed: chunk_of(&next) != before,
             camera: (next.translation.x, next.translation.z, yaw),
+            gate_wait: pacing.gate_wait,
+            gate_missed: pacing.gate_missed,
+            gate_at: pacing
+                .gate_opened_at
+                .and_then(|at| at.checked_duration_since(start)),
+            display_locked: pacing.display_locked,
         });
     }
 }
 
 impl Bench {
     /// Writes the outputs, prints the result line and exits (0, or 3 if a file failed).
+    #[expect(clippy::too_many_arguments, reason = "everything a summary needs")]
     fn finish(
         &mut self,
         rec: &Recorder,
         info: &RenderInfo,
+        pacing: &FramePacingInfo,
         spans: Option<&SpanRecorder>,
         script: Option<&EditScript>,
         catch_up: Option<Duration>,
@@ -843,6 +876,10 @@ impl Bench {
         self.info.adapter.clone_from(&info.adapter);
         self.info.backend.clone_from(&info.backend);
         self.info.driver.clone_from(&info.driver);
+        self.info.present_mode = info
+            .present_mode
+            .map_or_else(String::new, |mode| format!("{mode:?}"));
+        self.info.refresh_hz = pacing.refresh_millihertz.map(|mhz| f64::from(mhz) / 1000.0);
         self.info.tier = info
             .tier
             .map_or_else(|| "?".to_string(), |t| format!("{t:?}"));
@@ -985,6 +1022,11 @@ fn world_settings(
 /// renderer capacity asked for and the machine.
 fn run_info(options: &Options, present: String) -> RunInfo {
     let (arena_quads, chunk_slots) = options.render_capacity();
+    let vsync = if present == PresentModePref::Vsync.as_str() {
+        "on"
+    } else {
+        "off"
+    };
     RunInfo {
         scenario: options.scenario.name().to_string(),
         label: options.label.clone(),
@@ -1020,6 +1062,7 @@ fn run_info(options: &Options, present: String) -> RunInfo {
         threads: std::thread::available_parallelism().map_or(0, usize::from),
         time: clock::start_time(options.time, true).clock_text(),
         bodies: options.bodies.label(),
+        vsync: vsync.to_string(),
         ..RunInfo::default()
     }
 }
@@ -1101,6 +1144,13 @@ fn main() -> AppExit {
     };
     let _watchdog = spawn_watchdog(options.timeout.saturating_add(WATCHDOG_GRACE));
 
+    if let Some(on) = options.vsync {
+        if gpu.present_mode.is_some() {
+            eprintln!("stress: give --vsync or --present, not both\n\n{}", usage());
+            return AppExit::from_code(1);
+        }
+        gpu.present_mode = Some(PresentModePref::from_vsync(on));
+    }
     // Uncapped: every update renders (offscreen while the window is covered or between
     // compositor frame callbacks) and presents without waiting for vblank.
     let (present, set) = present_mode(
@@ -1245,7 +1295,7 @@ mod tests {
             ("off", "vsync")
         );
         assert_eq!(info.vertical, "fixed");
-        assert!(report::run_title(&info).ends_with(" light off"));
+        assert!(report::run_title(&info).ends_with(" light off vsync"));
 
         assert!(options(&["--light=on"]).light);
         assert!(usage().contains("--light on|off"));
@@ -1315,6 +1365,14 @@ mod tests {
         assert_eq!(o.fps_limit, 144);
         let o = parse(&["--fps-limit=0"]).expect("valid").expect("not help");
         assert_eq!(FrameLimit::new(o.fps_limit), FrameLimit::UNLIMITED);
+        assert_eq!(o.vsync, None);
+        let o = parse(&["--vsync", "on"]).expect("valid").expect("not help");
+        assert_eq!(o.vsync, Some(true));
+        let o = parse(&["--vsync=off"]).expect("valid").expect("not help");
+        assert_eq!(o.vsync, Some(false));
+        assert!(parse(&["--vsync", "maybe"]).is_err());
+        assert_eq!(run_info(&o, "vsync".to_string()).vsync, "on");
+        assert_eq!(run_info(&o, "novsync".to_string()).vsync, "off");
         let o = parse(&["--timeout", "30", "--scenario", "spin"])
             .expect("valid")
             .expect("not help");

@@ -7,12 +7,14 @@ usage:
 
 RUN, BASE and NEW are summary files (Markdown with a JSON block, or plain JSON) or directories
 (every summary inside, not recursive). Comparing two directories pairs the runs with the same
-world, light (--light), scenario, radius, vertical radius, speed, fps limit, physics bodies
-(--bodies), scripted edits (--edits), backend, tier and adapter; a different clock time (--time)
+world, light (--light), scenario, radius, vertical radius, speed, fps limit, vsync, physics
+bodies (--bodies), scripted edits (--edits), backend, tier and adapter; a different clock time (--time)
 only gets a note, since day and night change no mesh. Light is 'on', 'off' or 'none' (runs from
 before the light render, without a clock, had no voxel light); runs with a clock but from before
 --light had it on. A metric that was 0 in BASE has no percent change ('n/a') but still gets a
-verdict (0 spikes before, 3 after: worse). Runs with --edits also compare the edit latency.
+verdict (0 spikes before, 3 after: worse). Runs with --edits also compare the edit latency, and
+runs that recorded pacing (presented frames, gate waits) compare it too. Runs from before --vsync
+count as vsync on only if they asked for --present vsync.
 Output is Markdown, so it can go into docs as is.
 Exit codes: 0 ok, 1 usage error or a file without a summary, 2 nothing to compare."""
 import json
@@ -55,6 +57,20 @@ EDIT_METRICS = [
     ('light fan-out', ('world', 'edits', 'light_fanout'), 0),
 ]
 
+# Pacing metrics (runs from 2026-10-07 on; compared when either run has them).
+PACING_METRICS = [
+    ('frames > 7.5 ms', ('frames', 'over_7_5ms'), -1),
+    ('frame sd ms', ('frames', 'stddev_ms'), -1),
+    ('presented fps', ('pacing', 'presented_fps'), 1),
+    ('presented p99 ms', ('pacing', 'presented_intervals', 'p99_ms'), -1),
+    ('presented sd ms', ('pacing', 'presented_intervals', 'stddev_ms'), -1),
+    ('presented gaps', ('pacing', 'presented_intervals', 'gaps'), -1),
+    ('gate waits', ('pacing', 'gate_waits'), -1),
+    ('gate misses', ('pacing', 'gate_misses'), -1),
+    ('callback gaps', ('pacing', 'callbacks', 'gaps'), -1),
+    ('frames locked to the display', ('pacing', 'display_locked'), 0),
+]
+
 # Settings that make two runs comparable.
 SETTINGS = [
     ('world', ('run', 'world')),
@@ -64,6 +80,8 @@ SETTINGS = [
     ('vertical', ('run', 'vertical')),
     ('speed', ('run', 'speed')),
     ('fps limit', ('run', 'fps_limit')),
+    ('vsync', ('run', 'vsync')),
+    ('present mode', ('run', 'present_mode')),
     ('bodies', ('run', 'bodies')),
     ('edits', ('run', 'edits')),
     ('clock', ('run', 'time')),
@@ -112,6 +130,9 @@ def load(path):
             run['world'] = 'forest' if run.get('trees', True) else 'terrain'
         # Runs from before --fps-limit were all uncapped.
         run.setdefault('fps_limit', 0)
+        # Runs from before --vsync: on only if they asked for vsync.
+        if not run.get('vsync'):
+            run['vsync'] = 'on' if run.get('present') == 'vsync' else 'off'
         # Runs from before --bodies had no physics bodies.
         run.setdefault('bodies', '')
         # Runs from before --time had no day and night.
@@ -162,6 +183,8 @@ def title(run):
         text += ' light off'
     if r.get('fps_limit'):
         text += f" limit {r['fps_limit']} fps"
+    if r.get('vsync') == 'on':
+        text += ' vsync'
     if r.get('bodies'):
         text += f" bodies {r['bodies']}"
     if r.get('edits'):
@@ -171,11 +194,12 @@ def title(run):
 
 def key(run):
     """Runs with the same key are comparable (same world, light, scenario, radius, height, speed,
-    fps limit, physics bodies, scripted edits and GPU)."""
+    fps limit, vsync, physics bodies, scripted edits and GPU)."""
     r = run['run']
     return (r.get('world', 'forest'), r.get('light', 'none'), r['scenario'], r['radius'],
-            r.get('vertical', 'fixed'), r['speed'], r.get('fps_limit') or 0, r.get('bodies') or '',
-            bool(r.get('edits')), r['backend'], r['tier'], r.get('adapter'))
+            r.get('vertical', 'fixed'), r['speed'], r.get('fps_limit') or 0,
+            r.get('vsync') or 'off', r.get('bodies') or '', bool(r.get('edits')), r['backend'],
+            r['tier'], r.get('adapter'))
 
 
 def fmt(value):
@@ -213,8 +237,9 @@ def change(base, new, direction):
 def table(runs):
     lines = [
         '| run | GPU | frames | avg fps | p50 ms | p99 ms | p99.9 ms | max ms | 1% low fps '
-        '| > 6.94 ms | > 16.7 ms | border max ms | generated/s | queued max | border lag max ms |',
-        '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|',
+        '| > 6.94 ms | > 16.7 ms | border max ms | generated/s | queued max | border lag max ms '
+        '| > 7.5 ms | shown fps |',
+        '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|',
     ]
     for run in runs:
         f, w, r = run['frames'], run['world'], run['run']
@@ -223,6 +248,7 @@ def table(runs):
             f['p99_ms'], f['p999_ms'], f['max_ms'], f['low_1_fps'], f['over_144hz'],
             f['over_60hz'], get(f, ('crossing', 'max_ms')), w['generated_per_s'],
             get(w, ('queued', 'max')), get(w, ('border_catch_up', 'max_ms')),
+            f.get('over_7_5ms'), get(run, ('pacing', 'presented_fps')),
         ]
         lines.append('| ' + ' | '.join(fmt(c) for c in cells) + ' |')
     return '\n'.join(lines)
@@ -241,7 +267,9 @@ def compare(base, new):
     lines += ['| metric | base | new | change | |', '|---|---:|---:|---:|---|']
     metrics = METRICS
     if get(base, ('world', 'edits')) is not None or get(new, ('world', 'edits')) is not None:
-        metrics = METRICS + EDIT_METRICS
+        metrics = metrics + EDIT_METRICS
+    if get(base, ('pacing',)) is not None or get(new, ('pacing',)) is not None:
+        metrics = metrics + PACING_METRICS
     for name, path, direction in metrics:
         b, n = get(base, path), get(new, path)
         pct, verdict = change(b, n, direction)
@@ -273,7 +301,7 @@ def main(argv):
                 matched = [(load(base), load(new))]
             if not matched:
                 print('no runs with the same world, light, scenario, radius, speed, fps limit, '
-                      'bodies, edits, backend, tier and adapter', file=sys.stderr)
+                      'vsync, bodies, edits, backend, tier and adapter', file=sys.stderr)
                 return 2
             print('\n\n'.join(compare(b, n) for b, n in matched))
             return 0

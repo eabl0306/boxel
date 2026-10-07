@@ -5,7 +5,8 @@
 //!
 //! Shown: frames presented per second and app updates per second (they differ: see
 //! `boxel_app::FrameLimit`), the average and worst frame time of the last second, the frame
-//! limit with the vsync state and present mode, the GPU (adapter, backend, tier, device class,
+//! limit with the vsync state and present mode (and `paced by the display` when the runner
+//! follows the monitor, `boxel_window::FramePacingInfo`), the GPU (adapter, backend, tier, device class,
 //! driver), the camera (position, chunk, facing), the voxel light (sky and RGB levels) at the
 //! eye and at the [`CrosshairTarget`], the time of day (`boxel_world::TimeOfDay`) and the chunk
 //! counters of `boxel_world::WorldStats` plus the GPU-side chunk and draw call counts of
@@ -33,7 +34,7 @@ use boxel_math::{DVec3, UVec2};
 use boxel_render::{OverlayDraw, OverlayRect, PresentSettings, RenderInfo, SurfaceInfo};
 use boxel_transform::Transform;
 use boxel_voxel::{BlockPos, LightValue};
-use boxel_window::{ButtonInput, KeyCode};
+use boxel_window::{ButtonInput, FramePacingInfo, KeyCode};
 use boxel_world::{ChunkMap, TimeOfDay, WorldStats};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write;
@@ -378,6 +379,8 @@ pub struct OverlayInputs {
     pub frame_limit: Option<FrameLimit>,
     /// Wanted presentation (`None`: no renderer).
     pub present: Option<PresentSettings>,
+    /// How the runner paced the frame (`None`: no winit runner).
+    pub pacing: Option<FramePacingInfo>,
     /// Frame-settings keys to show a hint for.
     pub frame_keys: Option<FrameKeys>,
     /// Renderer status.
@@ -437,6 +440,12 @@ fn frame_settings_line(inputs: &OverlayInputs) -> String {
             let _ = write!(line, "  vsync {}", on_off(wanted));
         }
         (None, None) => {}
+    }
+    if let Some(pacing) = inputs.pacing.filter(|p| p.display_locked) {
+        line.push_str("  paced by the display");
+        if let Some(mhz) = pacing.refresh_millihertz {
+            let _ = write!(line, " ({:.1} Hz)", f64::from(mhz) / 1000.0);
+        }
     }
     line
 }
@@ -564,6 +573,7 @@ fn build_overlay(
     presented: Res<PresentWindow>,
     limit: Option<Res<FrameLimit>>,
     present: Option<Res<PresentSettings>>,
+    pacing: Option<Res<FramePacingInfo>>,
     render: Option<Res<RenderInfo>>,
     world: Option<Res<WorldStats>>,
     extra: Option<Res<OverlayLines>>,
@@ -607,6 +617,7 @@ fn build_overlay(
         presented_fps: render.is_some().then(|| presented.fps()),
         frame_limit: limit.as_deref().copied(),
         present: present.as_deref().copied(),
+        pacing: pacing.as_deref().copied(),
         frame_keys: overlay.frame_keys,
         render: render.as_deref().cloned(),
         camera,
@@ -929,6 +940,29 @@ mod tests {
         assert_eq!(lines[1], "FPS 120 shown  144 updates/s");
         assert_eq!(lines[2], "Frame 6.94 ms avg  worst 7.10 ms (1 s)");
         assert_eq!(lines[3], "Limit 144 fps  vsync off (Mailbox)");
+        // The runner follows the monitor (ADR 0017).
+        let mut pacing = FramePacingInfo {
+            display_locked: true,
+            refresh_millihertz: Some(144_002),
+            ..FramePacingInfo::default()
+        };
+        let paced = OverlayInputs {
+            pacing: Some(pacing),
+            ..inputs.clone()
+        };
+        assert_eq!(
+            overlay_lines(&paced)[3],
+            "Limit 144 fps  vsync off (Mailbox)  paced by the display (144.0 Hz)"
+        );
+        pacing.display_locked = false;
+        let grid = OverlayInputs {
+            pacing: Some(pacing),
+            ..inputs.clone()
+        };
+        assert_eq!(
+            overlay_lines(&grid)[3],
+            "Limit 144 fps  vsync off (Mailbox)"
+        );
         assert_eq!(lines[4], "Keys F5 fps limit  F6 vsync");
 
         // Vsync off wanted, but the surface only offers Fifo.

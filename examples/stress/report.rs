@@ -10,6 +10,8 @@ use std::time::Duration;
 pub const BUDGET_144HZ: Duration = Duration::from_nanos(1_000_000_000 / 144);
 /// Frame budget at 60 Hz (16.7 ms).
 pub const BUDGET_60HZ: Duration = Duration::from_nanos(1_000_000_000 / 60);
+/// A frame this long at a 144 fps cap is a visible hitch, not timer noise (7.5 ms).
+pub const LATE_144HZ: Duration = Duration::from_micros(7500);
 /// Worst frames listed in the summary.
 pub const WORST_FRAMES: usize = 5;
 /// Version of the JSON layout (bump on incompatible changes).
@@ -56,6 +58,16 @@ pub struct FrameRecord {
     pub arena_used: u32,
     /// Chunks the renderer could not hold so far (`RenderInfo::dropped_chunks`, cumulative).
     pub dropped_chunks: u32,
+    /// How long the runner held the frame past its deadline for the presentation gate
+    /// (`FramePacingInfo::gate_wait`).
+    pub gate_wait: Duration,
+    /// The runner stopped waiting with the gate closed (`FramePacingInfo::gate_missed`).
+    pub gate_missed: bool,
+    /// When the presentation gate last opened before the frame (the compositor's frame
+    /// callback on Wayland), since the measurement started (`None`: before it).
+    pub gate_at: Option<Duration>,
+    /// The runner paced the frame by the display (`FramePacingInfo::display_locked`).
+    pub display_locked: bool,
 }
 
 /// Append-only list of records stored in fixed blocks: pushing never moves earlier records, so
@@ -168,6 +180,13 @@ pub struct RunInfo {
     /// Physics bodies of the run (`--bodies`, `--body-kind`, `--projectiles`): `1000 item, 50
     /// projectiles`, or empty without them (and in runs from before the options).
     pub bodies: String,
+    /// `on` when the requested present mode is vsync (`--vsync on`, `--present vsync`), else
+    /// `off`. Empty in runs from before the option.
+    pub vsync: String,
+    /// The present mode the surface got (`RenderInfo::present_mode`, `Mailbox`, `Fifo`...).
+    pub present_mode: String,
+    /// Refresh rate of the window's monitor in Hz, as the runner saw it (`None`: unknown).
+    pub refresh_hz: Option<f64>,
 }
 
 /// What `--edits` measured: scripted edits (lamp placed and removed, shaft dug and capped) and
@@ -447,6 +466,113 @@ impl WorldTotals {
     }
 }
 
+/// Distribution of a set of intervals.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct IntervalStats {
+    /// Intervals.
+    pub count: usize,
+    /// Median.
+    pub p50: Duration,
+    /// 99th percentile (nearest rank).
+    pub p99: Duration,
+    /// Longest.
+    pub max: Duration,
+    /// Standard deviation (population).
+    pub stddev: Duration,
+    /// Intervals longer than 1.5 times the median: with one interval per display refresh, each
+    /// one is a refresh that showed no new frame.
+    pub gaps: usize,
+}
+
+impl IntervalStats {
+    /// `None` for an empty set.
+    fn of(intervals: impl Iterator<Item = Duration>) -> Option<Self> {
+        let mut v: Vec<Duration> = intervals.collect();
+        if v.is_empty() {
+            return None;
+        }
+        v.sort_unstable();
+        let n = v.len();
+        let p50 = v[n / 2];
+        let rank = |p: usize| v[((n * p).div_ceil(100)).clamp(1, n) - 1];
+        let mean = v.iter().map(Duration::as_secs_f64).sum::<f64>() / n as f64;
+        let var = v
+            .iter()
+            .map(|d| (d.as_secs_f64() - mean).powi(2))
+            .sum::<f64>()
+            / n as f64;
+        Some(Self {
+            count: n,
+            p50,
+            p99: rank(99),
+            max: v[n - 1],
+            stddev: Duration::from_secs_f64(var.sqrt()),
+            gaps: v
+                .iter()
+                .filter(|&&d| d.as_secs_f64() > p50.as_secs_f64() * 1.5)
+                .count(),
+        })
+    }
+}
+
+/// How evenly the frames were paced and presented.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Pacing {
+    /// Frames presented, and per measured second.
+    pub presented: usize,
+    /// See `presented`.
+    pub presented_fps: f64,
+    /// Intervals between the starts of consecutive presented frames (what the screen got).
+    pub presented_intervals: Option<IntervalStats>,
+    /// Frame times (update intervals): their spread.
+    pub frame_intervals: Option<IntervalStats>,
+    /// Frames longer than 7.5 ms.
+    pub over_7_5ms: usize,
+    /// Frames the runner held past their deadline for the presentation gate, the longest hold
+    /// and the total.
+    pub gate_waits: usize,
+    /// See `gate_waits`.
+    pub gate_wait_max: Duration,
+    /// See `gate_waits`.
+    pub gate_wait_total: Duration,
+    /// Frames that stopped waiting with the gate closed (they ran without presenting).
+    pub gate_misses: usize,
+    /// Frames the runner paced by the display (ADR 0017).
+    pub display_locked: usize,
+    /// Intervals between consecutive openings of the gate (frame callbacks on Wayland).
+    pub callbacks: Option<IntervalStats>,
+}
+
+impl Pacing {
+    fn of(records: &[FrameRecord], seconds: f64) -> Self {
+        let presented: Vec<Duration> = records
+            .iter()
+            .filter(|r| r.presented)
+            .map(|r| r.t)
+            .collect();
+        let mut gates: Vec<Duration> = records.iter().filter_map(|r| r.gate_at).collect();
+        gates.dedup();
+        let waits = records.iter().filter(|r| !r.gate_wait.is_zero());
+        Self {
+            presented: presented.len(),
+            presented_fps: if seconds > 0.0 {
+                presented.len() as f64 / seconds
+            } else {
+                0.0
+            },
+            presented_intervals: IntervalStats::of(presented.windows(2).map(|w| w[1] - w[0])),
+            frame_intervals: IntervalStats::of(records.iter().map(|r| r.frame_time)),
+            over_7_5ms: records.iter().filter(|r| r.frame_time > LATE_144HZ).count(),
+            gate_waits: waits.clone().count(),
+            gate_wait_max: waits.clone().map(|r| r.gate_wait).max().unwrap_or_default(),
+            gate_wait_total: waits.map(|r| r.gate_wait).sum(),
+            gate_misses: records.iter().filter(|r| r.gate_missed).count(),
+            display_locked: records.iter().filter(|r| r.display_locked).count(),
+            callbacks: IntervalStats::of(gates.windows(2).map(|w| w[1] - w[0])),
+        }
+    }
+}
+
 /// What the summary reports.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Summary {
@@ -479,6 +605,8 @@ pub struct Summary {
     pub timeline: Vec<SecondStats>,
     /// The last record (final counters).
     pub last: FrameRecord,
+    /// Pacing and presentation.
+    pub pacing: Pacing,
 }
 
 impl Summary {
@@ -514,6 +642,7 @@ impl Summary {
             worst,
             timeline: timeline(records),
             last,
+            pacing: Pacing::of(records, frames.total.as_secs_f64()),
             frames,
         })
     }
@@ -585,7 +714,7 @@ fn rounded(value: f64, decimals: i32) -> f64 {
 pub const CSV_HEADER: &str = "frame,t_ms,frame_ms,presented,crossed,cam_x,cam_z,yaw_deg,\
 generated,jobs_done,meshes,removed,upload_quads,d_data_ready,d_chunks,chunks,data_ready,\
 generating,mesh_ready,mesh_empty,meshing,queued_jobs,in_flight,gpu_chunks,quads,draws,arena_used,\
-dropped_chunks";
+dropped_chunks,gate_wait_ms,gate_missed,gate_ms,display_locked";
 
 /// The CSV text: header plus one row per record.
 pub fn csv(records: &[FrameRecord]) -> String {
@@ -596,7 +725,8 @@ pub fn csv(records: &[FrameRecord]) -> String {
         let w = &r.world;
         let _ = writeln!(
             out,
-            "{i},{:.3},{:.4},{},{},{:.2},{:.2},{:.2},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{i},{:.3},{:.4},{},{},{:.2},{:.2},{:.2},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},\
+             {:.4},{},{},{}",
             ms(r.t),
             ms(r.frame_time),
             u8::from(r.presented),
@@ -624,6 +754,11 @@ pub fn csv(records: &[FrameRecord]) -> String {
             r.draws,
             r.arena_used,
             r.dropped_chunks,
+            ms(r.gate_wait),
+            u8::from(r.gate_missed),
+            r.gate_at
+                .map_or_else(String::new, |at| format!("{:.3}", ms(at))),
+            u8::from(r.display_locked),
         );
     }
     out
@@ -746,6 +881,19 @@ fn subset_json(s: Option<SubsetStats>) -> Json {
     })
 }
 
+fn intervals_json(s: Option<IntervalStats>) -> Json {
+    s.map_or(Json::Null, |s| {
+        Json::Obj(vec![
+            ("count", Json::uint(s.count)),
+            ("p50_ms", Json::ms(s.p50)),
+            ("p99_ms", Json::ms(s.p99)),
+            ("max_ms", Json::ms(s.max)),
+            ("stddev_ms", Json::ms(s.stddev)),
+            ("gaps", Json::uint(s.gaps)),
+        ])
+    })
+}
+
 fn spread_json(s: &Spread) -> Json {
     Json::Obj(vec![
         ("avg", Json::num(s.avg, 1)),
@@ -798,6 +946,9 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
         ("date_utc", Json::Str(utc_date(info.unix_time))),
         ("frames_presented", Json::uint(info.frames_presented)),
         ("time", Json::Str(info.time.clone())),
+        ("vsync", Json::Str(info.vsync.clone())),
+        ("present_mode", Json::Str(info.present_mode.clone())),
+        ("refresh_hz", Json::opt(info.refresh_hz, 3)),
     ]);
     let frames = Json::Obj(vec![
         ("count", Json::uint(f.frames)),
@@ -813,6 +964,13 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
         ("low_1_fps", Json::num(f.low_1_percent_fps, 1)),
         ("over_144hz", Json::uint(s.over_144hz)),
         ("over_60hz", Json::uint(s.over_60hz)),
+        ("over_7_5ms", Json::uint(s.pacing.over_7_5ms)),
+        (
+            "stddev_ms",
+            s.pacing
+                .frame_intervals
+                .map_or(Json::Null, |i| Json::ms(i.stddev)),
+        ),
         ("crossing", subset_json(s.crossing)),
         ("other", subset_json(s.other)),
     ]);
@@ -900,10 +1058,23 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
             ])
         })
         .collect();
+    let p = &s.pacing;
+    let pacing = Json::Obj(vec![
+        ("presented", Json::uint(p.presented)),
+        ("presented_fps", Json::num(p.presented_fps, 2)),
+        ("presented_intervals", intervals_json(p.presented_intervals)),
+        ("gate_waits", Json::uint(p.gate_waits)),
+        ("gate_wait_max_ms", Json::ms(p.gate_wait_max)),
+        ("gate_wait_total_ms", Json::ms(p.gate_wait_total)),
+        ("gate_misses", Json::uint(p.gate_misses)),
+        ("display_locked", Json::uint(p.display_locked)),
+        ("callbacks", intervals_json(p.callbacks)),
+    ]);
     Json::Obj(vec![
         ("format", Json::uint(FORMAT_VERSION)),
         ("run", run),
         ("frames", frames),
+        ("pacing", pacing),
         ("world", world),
         ("worst", Json::Arr(worst)),
         ("timeline", Json::Arr(timeline)),
@@ -933,6 +1104,10 @@ pub fn run_title(info: &RunInfo) -> String {
     }
     if info.fps_limit > 0 {
         title = format!("{title} limit {} fps", info.fps_limit);
+    }
+    // Vsync off (the default) keeps the titles of the earlier runs.
+    if info.vsync == "on" {
+        title = format!("{title} vsync");
     }
     if !info.bodies.is_empty() {
         title = format!("{title} bodies {}", info.bodies);
@@ -964,13 +1139,18 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
     );
     let _ = writeln!(
         out,
-        "- GPU: {}, {} {} ({}), driver `{}`, present {}, fps limit {}, window {}x{}.",
+        "- GPU: {}, {} {} ({}), driver `{}`, present {} ({}), fps limit {}, window {}x{}{}.",
         info.adapter,
         info.backend,
         info.tier,
         info.class,
         info.driver,
         info.present,
+        if info.present_mode.is_empty() {
+            "?"
+        } else {
+            &info.present_mode
+        },
         if info.fps_limit == 0 {
             "none".to_string()
         } else {
@@ -978,6 +1158,8 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
         },
         info.window.0,
         info.window.1,
+        info.refresh_hz
+            .map_or_else(String::new, |hz| format!(", display {hz:.3} Hz")),
     );
     let _ = writeln!(
         out,
@@ -1044,6 +1226,7 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
     let _ = writeln!(out, "|---|---:|---:|---:|---:|");
     let _ = writeln!(out, "{}", subset("crossed a chunk border", s.crossing));
     let _ = writeln!(out, "{}\n", subset("other", s.other));
+    pacing_markdown(&mut out, &s.pacing);
 
     let _ = writeln!(out, "## World\n");
     let _ = writeln!(
@@ -1189,12 +1372,56 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
     out
 }
 
+/// The `## Pacing` section.
+fn pacing_markdown(out: &mut String, p: &Pacing) {
+    let _ = writeln!(out, "## Pacing\n");
+    let _ = writeln!(
+        out,
+        "| intervals | count | p50 ms | p99 ms | max ms | sd ms | over 1.5 x p50 |"
+    );
+    let _ = writeln!(out, "|---|---:|---:|---:|---:|---:|---:|");
+    for (name, i) in [
+        ("frames (updates)", p.frame_intervals),
+        ("presented frames", p.presented_intervals),
+        ("gate openings (frame callbacks)", p.callbacks),
+    ] {
+        let _ = match i {
+            Some(i) => writeln!(
+                out,
+                "| {name} | {} | {:.3} | {:.3} | {:.3} | {:.3} | {} |",
+                i.count,
+                ms(i.p50),
+                ms(i.p99),
+                ms(i.max),
+                ms(i.stddev),
+                i.gaps
+            ),
+            None => writeln!(out, "| {name} | 0 | - | - | - | - | - |"),
+        };
+    }
+    let _ = writeln!(
+        out,
+        "\n{} frames presented ({:.1} per second), {} frames over 7.5 ms. The runner held {} \
+         frames past their deadline for the presentation gate ({:.1} ms in all, {:.2} ms at \
+         most); {} of them gave up and ran without presenting. {} frames followed the display.\n",
+        p.presented,
+        p.presented_fps,
+        p.over_7_5ms,
+        p.gate_waits,
+        ms(p.gate_wait_total),
+        ms(p.gate_wait_max),
+        p.gate_misses,
+        p.display_locked,
+    );
+}
+
 /// One line for the terminal.
 pub fn one_line(info: &RunInfo, s: &Summary) -> String {
     let f = &s.frames;
     format!(
         "stress: {} {} {}: frames={} avg={:.0} fps p50={:.2} p99={:.2} p99.9={:.2} max={:.2} ms \
-         1%low={:.0} fps >6.94ms={} >16.7ms={} generated/s={:.0} queued_max={}",
+         1%low={:.0} fps >6.94ms={} >16.7ms={} generated/s={:.0} queued_max={} >7.5ms={} \
+         shown={:.1}/s gate_waits={} gate_misses={}",
         run_title(info),
         info.backend,
         info.tier,
@@ -1209,6 +1436,10 @@ pub fn one_line(info: &RunInfo, s: &Summary) -> String {
         s.over_60hz,
         s.per_second(s.totals.generated),
         s.queued.max,
+        s.pacing.over_7_5ms,
+        s.pacing.presented_fps,
+        s.pacing.gate_waits,
+        s.pacing.gate_misses,
     )
 }
 
@@ -1530,13 +1761,62 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), records.len() + 1);
         let columns = CSV_HEADER.split(',').count();
-        assert_eq!(columns, 28);
+        assert_eq!(columns, 32);
         assert!(lines.iter().all(|l| l.split(',').count() == columns));
         assert!(
             lines[501].starts_with("500,1000.000,10.0000,0,1,"),
             "{}",
             lines[501]
         );
+    }
+
+    #[test]
+    fn pacing_counts_presented_gaps_gate_waits_and_late_frames() {
+        // 6.95 ms frames, all presented, gate openings every 6.95 ms; frame 10 holds 1.7 ms for
+        // the gate and gives up (8.65 ms, not presented), frame 11 comes back (5.25 ms).
+        let mut records = Vec::new();
+        let mut t = Duration::ZERO;
+        for i in 0..40u32 {
+            let frame_time = match i {
+                10 => Duration::from_micros(8650),
+                11 => Duration::from_micros(5250),
+                _ => Duration::from_micros(6950),
+            };
+            let mut r = FrameRecord {
+                t,
+                frame_time,
+                presented: i != 10,
+                // One callback per presented frame, a little before it starts.
+                gate_at: (i != 10).then(|| t.saturating_sub(Duration::from_micros(100))),
+                ..FrameRecord::default()
+            };
+            if i == 10 {
+                r.gate_wait = Duration::from_micros(1700);
+                r.gate_missed = true;
+                r.gate_at = records.last().and_then(|p: &FrameRecord| p.gate_at);
+            }
+            records.push(r);
+            t += frame_time;
+        }
+        let p = Pacing::of(&records, t.as_secs_f64());
+        assert_eq!(p.presented, 39);
+        assert!((p.presented_fps - 39.0 / t.as_secs_f64()).abs() < 1e-9);
+        let shown = p.presented_intervals.expect("intervals");
+        assert_eq!(
+            (shown.count, shown.gaps),
+            (38, 1),
+            "one refresh without a new frame"
+        );
+        assert_eq!(shown.p50, Duration::from_micros(6950));
+        assert_eq!(shown.max, Duration::from_micros(6950 + 8650));
+        assert_eq!(p.over_7_5ms, 1);
+        assert_eq!((p.gate_waits, p.gate_misses), (1, 1));
+        assert_eq!(p.gate_wait_total, Duration::from_micros(1700));
+        let callbacks = p.callbacks.expect("callbacks");
+        assert_eq!((callbacks.count, callbacks.gaps), (38, 1));
+        let frames = p.frame_intervals.expect("frames");
+        assert!(frames.stddev > Duration::ZERO && frames.stddev < Duration::from_millis(1));
+        assert_eq!(Pacing::of(&[], 0.0), Pacing::default());
     }
 
     #[test]
@@ -1607,6 +1887,13 @@ mod tests {
             "{text}"
         );
         assert!(one_line(&info, &s).contains(">6.94ms=2 >16.7ms=1"));
+        assert!(text.contains("## Pacing"));
+        assert!(data.contains("\"over_7_5ms\": 2"));
+        assert!(
+            data.contains("\"pacing\": {\n    \"presented\": 0,"),
+            "{data}"
+        );
+        assert!(data.contains("\"vsync\": \"\""));
     }
 
     #[test]
@@ -1632,11 +1919,19 @@ mod tests {
         info.light = String::new();
         info.fps_limit = 144;
         assert_eq!(run_title(&info), "static r16 limit 144 fps");
+        info.vsync = "off".to_string();
+        assert_eq!(
+            run_title(&info),
+            "static r16 limit 144 fps",
+            "vsync off keeps the title"
+        );
+        info.vsync = "on".to_string();
+        assert_eq!(run_title(&info), "static r16 limit 144 fps vsync");
         info.bodies = "1000 item, 0 projectiles".to_string();
         info.edits = Some(EditStats::default());
         assert_eq!(
             run_title(&info),
-            "static r16 limit 144 fps bodies 1000 item, 0 projectiles edits"
+            "static r16 limit 144 fps vsync bodies 1000 item, 0 projectiles edits"
         );
     }
 

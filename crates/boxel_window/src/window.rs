@@ -1,4 +1,4 @@
-use crate::runner::{RunnerSettings, UpdateMode, winit_runner};
+use crate::runner::{FramePacingInfo, RunnerSettings, UpdateMode, winit_runner};
 use boxel_app::{App, FrameLimit, Plugin};
 use boxel_ecs::prelude::*;
 use boxel_math::UVec2;
@@ -81,6 +81,7 @@ impl Plugin for WindowPlugin {
         app.insert_resource(DisplayHandle(event_loop.owned_display_handle()))
             .insert_resource(self.primary.clone())
             .insert_resource(WindowState::default())
+            .init_resource::<FramePacingInfo>()
             .insert_resource(CursorOptions {
                 grab: CursorGrab::None,
                 visible: true,

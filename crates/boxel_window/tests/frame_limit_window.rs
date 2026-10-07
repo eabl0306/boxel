@@ -1,6 +1,8 @@
 //! Windowed check of `FrameLimit` with the real winit runner (no renderer): measures the update
 //! rate at 60 and 144 fps, changing the limit at runtime, and checks that 0 is unlimited.
-//! Fails when a measured rate is off by more than 3 %.
+//! Fails when a measured rate is off by more than 3 %, or when the runner paced a phase by the
+//! display: nothing presents here, so the redraws come at once and the limit's grid must govern
+//! even when the limit matches the monitor (ADR 0017).
 //!
 //! Opt-in (`BOXEL_WINDOW_TESTS=1`, or `just test-window`): it opens a window on the desktop
 //! (on Wayland it is never mapped, since nothing is drawn) and its timing needs a machine that
@@ -10,7 +12,7 @@
 
 use boxel_app::{App, AppExit, FrameLimit, Update};
 use boxel_ecs::prelude::*;
-use boxel_window::{WindowPlugin, WindowSettings, WindowState};
+use boxel_window::{FramePacingInfo, WindowPlugin, WindowSettings, WindowState};
 use std::process::ExitCode;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -53,6 +55,8 @@ struct Measured {
     /// Shortest, mean and longest interval between updates.
     intervals: (Duration, Duration, Duration),
     occluded: bool,
+    /// Updates of the phase the runner paced by the display.
+    display_locked: usize,
 }
 
 #[derive(Resource, Default)]
@@ -62,6 +66,9 @@ struct Check {
     /// Update times of the measuring part of the phase.
     times: Vec<Instant>,
     occluded: bool,
+    display_locked: usize,
+    /// The monitor's refresh rate as the runner saw it (millihertz).
+    refresh: Option<u32>,
     results: Vec<Measured>,
 }
 
@@ -69,6 +76,7 @@ fn drive(
     mut check: ResMut<Check>,
     mut limit: ResMut<FrameLimit>,
     mut state: ResMut<WindowState>,
+    pacing: Res<FramePacingInfo>,
     mut exit: MessageWriter<AppExit>,
 ) {
     let now = Instant::now();
@@ -84,8 +92,10 @@ fn drive(
     });
     let elapsed = now - start;
     check.occluded |= state.occluded;
+    check.refresh = check.refresh.or(pacing.refresh_millihertz);
     if elapsed >= phase.warmup {
         check.times.push(now);
+        check.display_locked += usize::from(pacing.display_locked);
     }
     if elapsed >= phase.warmup + phase.measure {
         let times = std::mem::take(&mut check.times);
@@ -101,6 +111,7 @@ fn drive(
                 intervals.iter().copied().max().unwrap_or_default(),
             ),
             occluded: std::mem::take(&mut check.occluded),
+            display_locked: std::mem::take(&mut check.display_locked),
         };
         check.results.push(measured);
         check.phase += 1;
@@ -130,6 +141,12 @@ fn verdict(results: &[Measured]) -> Result<(), String> {
                 ""
             }
         );
+        if m.display_locked > 0 {
+            return Err(format!(
+                "limit {}: {} updates paced by the display, but nothing presents",
+                m.max_fps, m.display_locked
+            ));
+        }
         if m.max_fps > 0 {
             let error = (m.rate - f64::from(m.max_fps)) / f64::from(m.max_fps);
             if error.abs() > TOLERANCE {
@@ -203,13 +220,20 @@ fn main() -> ExitCode {
     .init_resource::<Check>()
     .add_systems(Update, drive);
     // The runner consumes the app: read the results through a `Shutdown` system.
-    let (send, results) = mpsc::channel::<Vec<Measured>>();
+    let (send, results) = mpsc::channel::<(Vec<Measured>, Option<u32>)>();
     app.add_systems(boxel_app::Shutdown, move |mut check: ResMut<Check>| {
-        let _ = send.send(std::mem::take(&mut check.results));
+        let _ = send.send((std::mem::take(&mut check.results), check.refresh));
     });
     let exit = app.run();
     drop(disarm);
-    let results = results.try_recv().unwrap_or_default();
+    let (results, refresh) = results.try_recv().unwrap_or_default();
+    match refresh {
+        Some(mhz) => println!(
+            "frame_limit_window: monitor refresh {:.3} Hz",
+            f64::from(mhz) / 1000.0
+        ),
+        None => println!("frame_limit_window: monitor refresh unknown"),
+    }
     match (exit, verdict(&results)) {
         (AppExit::Success, Ok(())) => {
             println!("frame_limit_window: ok");

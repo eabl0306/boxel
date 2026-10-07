@@ -10,7 +10,9 @@
 //! - Window and device events become messages; [`InputPlugin`] folds them into [`ButtonInput`]
 //!   and accumulated mouse resources in `PreUpdate`.
 //! - Updates are paced by `boxel_app::FrameLimit` (default 144 fps, 0 = unlimited, changeable
-//!   at runtime), see [`UpdateMode`].
+//!   at runtime), see [`UpdateMode`]. On Wayland a limit at or above the monitor's refresh rate
+//!   follows the display: updates run when the compositor asks for a frame (see
+//!   [`winit_runner`]). [`FramePacingInfo`] tells how each update was paced.
 mod input;
 mod runner;
 mod window;
@@ -21,7 +23,7 @@ pub use input::{
     accumulate_mouse_motion_system, accumulate_mouse_scroll_system, keyboard_input_system,
     mouse_button_input_system,
 };
-pub use runner::{UpdateMode, winit_runner};
+pub use runner::{FramePacingInfo, UpdateMode, winit_runner};
 pub use window::{
     CursorGrab, CursorOptions, DisplayHandle, PrimaryWindow, WindowCloseRequested, WindowCreated,
     WindowFocused, WindowMode, WindowOccluded, WindowPlugin, WindowResized, WindowSettings,

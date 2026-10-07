@@ -1,6 +1,7 @@
 # ADR 0013: límite de FPS en los runners y vsync cambiable en tiempo de ejecución
 
-- Estado: aceptado
+- Estado: aceptado; la espera a la compuerta con el límite en la frecuencia del monitor la revisa
+  ADR 0017
 - Fecha: 2026-10-05
 
 ## Contexto
@@ -84,3 +85,14 @@ Medido en la máquina de desarrollo (panel de 144 Hz, Wayland, radio 12, mundo c
   frame llegue tarde; la grilla corrige el promedio pero no cada frame.
 - Vsync encendido por defecto: con la compuerta, en Wayland muestra menos frames que Mailbox y en
   X11 ata las updates al monitor.
+
+## Revisión: el ritmo lo marca el monitor (ADR 0017, 2026-10-07)
+
+- Con el límite en el 99 % de la frecuencia del monitor o más, en Wayland el ritmo lo marca el
+  monitor: cada update corre apenas llega su frame callback y la espera a la compuerta cubre un
+  refresco salteado. Así 143 deja de barrer el ciclo del refresco y un límite arriba del monitor
+  ya no hace updates que no se muestran. La espera corta de esta ADR queda para los límites más
+  bajos.
+- Los frames de 8.7 ms con tope 144 no los causaba la grilla: son refrescos que el compositor
+  saltea porque la RTX termina tarde algunos frames (ADR 0017). Antes se veían como 8.7 + 5.2 ms;
+  ahora como un frame de 13.9 ms, sin la update de más.

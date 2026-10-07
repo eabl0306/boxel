@@ -2,7 +2,7 @@
 
 Documento técnico de referencia. Fecha: 2026-10-05. Estado: aprobado para el milestone M0
 (revisión final, después de tres revisiones adversariales del borrador v1).
-Las decisiones puntuales están en `docs/adr/` (0001 a 0016). Durante M0 hubo además una
+Las decisiones puntuales están en `docs/adr/` (0001 a 0017). Durante M0 hubo además una
 especificación para los agentes implementadores (en inglés, en `.scaffold/`), borrada al cerrar M0;
 este documento queda como referencia.
 
@@ -1070,6 +1070,12 @@ presenta como mucho una vez por refresco del monitor.
   El costo: con render, las updates pueden quedar hasta un 2 % abajo del límite (119 con 120,
   127.5 con 130, 143.6 con 144; 60 y 100 exactos) y los frames mostrados unos pocos por ciento
   abajo aunque el límite esté por debajo del panel (111 a 119 con 120).
+- Con el límite en el 99 % de la frecuencia del monitor o más (ADR 0017), en Wayland el ritmo lo
+  marca el monitor (`MonitorHandle::refresh_rate_millihertz`): cada update corre apenas llega su
+  frame callback, y con la compuerta cerrada lo espera hasta un refresco y un cuarto, lo que tarda
+  el de un refresco que el compositor salteó. Solo si los redraws de verdad esperan al
+  compositor: una ventana sin render sigue con la grilla del límite. `FramePacingInfo` dice en
+  cada update cómo se marcó el ritmo y el overlay F3 muestra `paced by the display`.
 - `PresentSettings { mode }` (recurso de `boxel_render`) cambia el vsync en tiempo de ejecución:
   `Setup` reconfigura la superficie con el mismo dispositivo. Por defecto vsync apagado:
   `Mailbox`, si no `Immediate`, si no `Fifo` con una nota en el log. Así manda el límite.
