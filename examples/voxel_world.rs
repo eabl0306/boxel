@@ -5,9 +5,12 @@
 //! boosts, Escape (or leaving the window) releases the cursor, F3 toggles the debug overlay, F5
 //! cycles the frame limit (30, 60, 144, 240, unlimited) and F6 toggles vsync. While the mouse is
 //! grabbed, left click breaks the block under the crosshair and right click places the selected
-//! block on the face it points at (keys 1 to 9 and 0 select it, lamps on 7 to 0; F3 shows the
-//! target, the selection and the light at the eye and the crosshair), never where a solid body
-//! is (the walking player: `PhysicsQuery::block_is_free`). Picking is a voxel raycast from the
+//! block on the face it points at (keys 1 to 9 and 0 select it, lamps on 7 to 0; the mouse wheel
+//! scrolls through those and the rest: glass, the stone slab, short grass, a poppy and water;
+//! F3 shows the target, the selection and the light at the eye and the crosshair), never where a
+//! solid body is (the walking player: `PhysicsQuery::state_is_free`, against the placed block's
+//! shape). A slab goes in as a top slab when the click hits the bottom of a block or the upper
+//! half of a side, and a log lies along the axis of the clicked face. Picking is a voxel raycast from the
 //! camera (`PhysicsQuery::raycast_voxels`), reach 6 blocks. G switches between flying and
 //! walking: walking is a player body with gravity (`boxel::physics`, a 0.6 x 1.8 x 0.6 box and a
 //! `CharacterController`) that WASD moves along the view and Space makes jump, with the camera at
@@ -47,7 +50,7 @@ use boxel::gfx::{CLI_HELP, DeviceClass, RgbaImage};
 use boxel::physics::{PhysicsPlugin, Probe as VoxelProbe};
 use boxel::prelude::*;
 use boxel::render::{DebugDestroyDevice, GpuFailed, GpuReady, SurfaceInfo, TextureSource};
-use boxel::voxel::{BlockRegistry, MAX_BLOCK_COORD};
+use boxel::voxel::{BlockModel, BlockRegistry, MAX_BLOCK_COORD};
 use boxel::window::winit::dpi::PhysicalSize;
 use boxel::window::{PrimaryWindow, WindowResized};
 use boxel::world::{BlockEdit, TimeOfDay, WorldContent, WorldStats, WorldSystems};
@@ -1064,9 +1067,9 @@ fn vsync_test(
 
 /// How far the camera reaches when picking blocks, in blocks.
 const REACH: f64 = 6.0;
-/// The blocks keys 1 to 9 and 0 select for placing (names missing from the registry are
-/// skipped).
-const HOTBAR: [&str; 10] = [
+/// The blocks keys 1 to 9 and 0 select for placing (the first ten) and the mouse wheel scrolls
+/// through (all of them; names missing from the registry are skipped).
+const HOTBAR: [&str; 15] = [
     "boxel:stone",
     "boxel:dirt",
     "boxel:grass",
@@ -1077,6 +1080,11 @@ const HOTBAR: [&str; 10] = [
     "boxel:lamp_red",
     "boxel:lamp_blue",
     "boxel:lamp_white",
+    "boxel:glass",
+    "boxel:stone_slab",
+    "boxel:short_grass",
+    "boxel:poppy",
+    "boxel:water",
 ];
 const HOTBAR_KEYS: [KeyCode; 10] = [
     KeyCode::Digit1,
@@ -1167,6 +1175,54 @@ fn click_edit(
     }
 }
 
+/// The state that placing `block` on `hit` puts in (ADR 0018, until blocks have state
+/// properties): a slab (`NAME` or `NAME_top`) is a top slab when the click hits a bottom face or
+/// the upper half of a side face, a bottom slab otherwise; a block with turned variants
+/// (`NAME_x`, `NAME_z`, the logs) lies along the axis of the clicked face. Anything else is
+/// `block` itself.
+fn placed_state(registry: &BlockRegistry, block: BlockState, hit: &VoxelHit) -> BlockState {
+    let name = registry.name(block);
+    let Some(face) = hit.face else {
+        return block;
+    };
+    let variant = |name: String| registry.by_name(&name).unwrap_or(block);
+    match registry.model(block) {
+        BlockModel::Slab(_) => {
+            let base = name.strip_suffix("_top").unwrap_or(name);
+            let top = match face {
+                Face::NegY => true,
+                Face::PosY => false,
+                _ => hit.point.frac.y >= 0.5,
+            };
+            variant(if top {
+                format!("{base}_top")
+            } else {
+                base.to_string()
+            })
+        }
+        BlockModel::Cube { .. } => {
+            let base = name
+                .strip_suffix("_x")
+                .or_else(|| name.strip_suffix("_z"))
+                .unwrap_or(name);
+            let turned = match face {
+                Face::PosX | Face::NegX => Some("_x"),
+                Face::PosZ | Face::NegZ => Some("_z"),
+                Face::PosY | Face::NegY => None,
+            };
+            match turned {
+                // Only blocks that have the turned variants turn.
+                Some(suffix) => registry
+                    .by_name(&format!("{base}{suffix}"))
+                    .unwrap_or(block),
+                None if base != name => variant(base.to_string()),
+                None => block,
+            }
+        }
+        BlockModel::Cross => block,
+    }
+}
+
 /// `+Y`, `-X`...
 fn face_name(face: Face) -> &'static str {
     match face {
@@ -1194,8 +1250,8 @@ fn picking_lines(picking: &Picking, registry: &BlockRegistry) -> [String; 2] {
     };
     let place = match picking.hotbar.get(picking.selected) {
         Some((name, _)) => format!(
-            "Place [{}] {name}  (keys 1-9, 0)",
-            (picking.selected + 1) % 10
+            "Place [{}] {name}  (keys 1-9, 0, wheel)",
+            picking.selected + 1
         ),
         None => "Place nothing".to_string(),
     };
@@ -1206,12 +1262,17 @@ fn picking_lines(picking: &Picking, registry: &BlockRegistry) -> [String; 2] {
 /// this frame's click. Runs before the fly camera, so the cursor state is the one the click was
 /// made with, and before the world's systems (`WorldSystems::Interest`, then `Edits`), so it
 /// reads the map unambiguously and the edit shows this frame.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a Bevy-style system: one parameter per resource it reads"
+)]
 fn pick_blocks(
     physics: PhysicsQuery,
     cameras: Query<(&Camera, &Transform)>,
     cursor: Res<CursorOptions>,
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
+    scroll: Option<Res<AccumulatedMouseScroll>>,
     content: Res<WorldContent>,
     mut picking: ResMut<Picking>,
     mut edits: ResMut<EditQueue>,
@@ -1222,6 +1283,15 @@ fn pick_blocks(
         && slot < picking.hotbar.len()
     {
         picking.selected = slot;
+    }
+    // The wheel: down selects the next block, up the previous one, wrapping around.
+    let len = picking.hotbar.len();
+    if let Some(scroll) = scroll
+        && scroll.delta.y != 0.0
+        && len > 0
+    {
+        let step = if scroll.delta.y < 0.0 { 1 } else { len - 1 };
+        picking.selected = (picking.selected + step) % len;
     }
     let target = cameras
         .iter()
@@ -1249,15 +1319,17 @@ fn pick_blocks(
     }
     let click = Click::from_input(&buttons, cursor.grab == CursorGrab::Locked);
     if let (Some(hit), Some(click)) = (target, click) {
-        // The placement check: never a block inside the player (or any solid body).
+        // The placement check: never a block inside the player (or any solid body), against the
+        // shape the block will have.
+        let block = placed_state(&content.registry, picking.block(), &hit);
         let free = |pos: BlockPos| match physics.probe(pos) {
             VoxelProbe::Block(state) => {
                 (state.is_air() || physics.collision().is_fluid(state))
-                    && physics.block_is_free(pos)
+                    && physics.state_is_free(pos, block)
             }
             VoxelProbe::Unloaded => false,
         };
-        if let Some(edit) = click_edit(click, &hit, picking.block(), free) {
+        if let Some(edit) = click_edit(click, &hit, block, free) {
             edits.set_block(edit.pos, edit.state);
         }
     }
@@ -1781,7 +1853,7 @@ mod tests {
         );
         assert_eq!(
             lines.get("pick place"),
-            Some("Place [1] boxel:stone  (keys 1-9, 0)")
+            Some("Place [1] boxel:stone  (keys 1-9, 0, wheel)")
         );
 
         // Left click breaks the grass; the stone under it becomes the target.
@@ -1811,7 +1883,7 @@ mod tests {
         assert_eq!(block_at(&app, BlockPos::new(0, 3, 0)), Some(grass));
         assert_eq!(
             app.world().resource::<OverlayLines>().get("pick place"),
-            Some("Place [3] boxel:grass  (keys 1-9, 0)")
+            Some("Place [3] boxel:grass  (keys 1-9, 0, wheel)")
         );
 
         // Alt-tab frees the cursor; the click that focuses the window again only grabs it.
@@ -1981,6 +2053,56 @@ mod tests {
             .by_name("boxel:stone")
             .expect("built-in");
         assert_eq!(block_at(&app, BlockPos::new(0, 4, 0)), Some(stone));
+    }
+
+    #[test]
+    fn placed_slabs_take_the_clicked_half_and_logs_the_clicked_axis() {
+        let registry = BlockRegistry::default_blocks();
+        let by = |n: &str| registry.by_name(n).expect("built-in");
+        let hit = |face, y: f64| VoxelHit {
+            block: BlockPos::new(0, 0, 0),
+            face: Some(face),
+            t: 1.0,
+            point: WorldPos::from_dvec3(DVec3::new(0.5, y, 0.0)),
+            state: by("boxel:stone"),
+        };
+        let slab = by("boxel:stone_slab");
+        let slab_top = by("boxel:stone_slab_top");
+        for (face, y, want) in [
+            (Face::PosY, 1.0, slab),
+            (Face::NegY, 0.0, slab_top),
+            (Face::PosX, 0.25, slab),
+            (Face::NegZ, 0.75, slab_top),
+            (Face::PosZ, 0.5, slab_top),
+        ] {
+            assert_eq!(
+                placed_state(&registry, slab, &hit(face, y)),
+                want,
+                "{face:?}"
+            );
+            assert_eq!(
+                placed_state(&registry, slab_top, &hit(face, y)),
+                want,
+                "{face:?}"
+            );
+        }
+        let log = by("boxel:log");
+        for (face, want) in [
+            (Face::PosY, log),
+            (Face::NegX, by("boxel:log_x")),
+            (Face::PosZ, by("boxel:log_z")),
+        ] {
+            assert_eq!(
+                placed_state(&registry, log, &hit(face, 0.5)),
+                want,
+                "{face:?}"
+            );
+        }
+        // Blocks without variants stay as they are.
+        let stone = by("boxel:stone");
+        assert_eq!(placed_state(&registry, stone, &hit(Face::PosX, 0.5)), stone);
+        let grass = by("boxel:short_grass");
+        assert_eq!(placed_state(&registry, grass, &hit(Face::NegY, 0.0)), grass);
     }
 
     #[test]
