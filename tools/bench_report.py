@@ -68,6 +68,7 @@ PACING_METRICS = [
     ('gate waits', ('pacing', 'gate_waits'), -1),
     ('gate misses', ('pacing', 'gate_misses'), -1),
     ('callback gaps', ('pacing', 'callbacks', 'gaps'), -1),
+    ('frames locked to the display', ('pacing', 'display_locked'), 0),
 ]
 
 # Settings that make two runs comparable.

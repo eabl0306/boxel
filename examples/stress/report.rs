@@ -66,6 +66,8 @@ pub struct FrameRecord {
     /// When the presentation gate last opened before the frame (the compositor's frame
     /// callback on Wayland), since the measurement started (`None`: before it).
     pub gate_at: Option<Duration>,
+    /// The runner paced the frame by the display (`FramePacingInfo::display_locked`).
+    pub display_locked: bool,
 }
 
 /// Append-only list of records stored in fixed blocks: pushing never moves earlier records, so
@@ -535,6 +537,8 @@ pub struct Pacing {
     pub gate_wait_total: Duration,
     /// Frames that stopped waiting with the gate closed (they ran without presenting).
     pub gate_misses: usize,
+    /// Frames the runner paced by the display (ADR 0017).
+    pub display_locked: usize,
     /// Intervals between consecutive openings of the gate (frame callbacks on Wayland).
     pub callbacks: Option<IntervalStats>,
 }
@@ -563,6 +567,7 @@ impl Pacing {
             gate_wait_max: waits.clone().map(|r| r.gate_wait).max().unwrap_or_default(),
             gate_wait_total: waits.map(|r| r.gate_wait).sum(),
             gate_misses: records.iter().filter(|r| r.gate_missed).count(),
+            display_locked: records.iter().filter(|r| r.display_locked).count(),
             callbacks: IntervalStats::of(gates.windows(2).map(|w| w[1] - w[0])),
         }
     }
@@ -709,7 +714,7 @@ fn rounded(value: f64, decimals: i32) -> f64 {
 pub const CSV_HEADER: &str = "frame,t_ms,frame_ms,presented,crossed,cam_x,cam_z,yaw_deg,\
 generated,jobs_done,meshes,removed,upload_quads,d_data_ready,d_chunks,chunks,data_ready,\
 generating,mesh_ready,mesh_empty,meshing,queued_jobs,in_flight,gpu_chunks,quads,draws,arena_used,\
-dropped_chunks,gate_wait_ms,gate_missed,gate_ms";
+dropped_chunks,gate_wait_ms,gate_missed,gate_ms,display_locked";
 
 /// The CSV text: header plus one row per record.
 pub fn csv(records: &[FrameRecord]) -> String {
@@ -721,7 +726,7 @@ pub fn csv(records: &[FrameRecord]) -> String {
         let _ = writeln!(
             out,
             "{i},{:.3},{:.4},{},{},{:.2},{:.2},{:.2},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},\
-             {:.4},{},{}",
+             {:.4},{},{},{}",
             ms(r.t),
             ms(r.frame_time),
             u8::from(r.presented),
@@ -753,6 +758,7 @@ pub fn csv(records: &[FrameRecord]) -> String {
             u8::from(r.gate_missed),
             r.gate_at
                 .map_or_else(String::new, |at| format!("{:.3}", ms(at))),
+            u8::from(r.display_locked),
         );
     }
     out
@@ -1061,6 +1067,7 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
         ("gate_wait_max_ms", Json::ms(p.gate_wait_max)),
         ("gate_wait_total_ms", Json::ms(p.gate_wait_total)),
         ("gate_misses", Json::uint(p.gate_misses)),
+        ("display_locked", Json::uint(p.display_locked)),
         ("callbacks", intervals_json(p.callbacks)),
     ]);
     Json::Obj(vec![
@@ -1396,7 +1403,7 @@ fn pacing_markdown(out: &mut String, p: &Pacing) {
         out,
         "\n{} frames presented ({:.1} per second), {} frames over 7.5 ms. The runner held {} \
          frames past their deadline for the presentation gate ({:.1} ms in all, {:.2} ms at \
-         most); {} of them gave up and ran without presenting.\n",
+         most); {} of them gave up and ran without presenting. {} frames followed the display.\n",
         p.presented,
         p.presented_fps,
         p.over_7_5ms,
@@ -1404,6 +1411,7 @@ fn pacing_markdown(out: &mut String, p: &Pacing) {
         ms(p.gate_wait_total),
         ms(p.gate_wait_max),
         p.gate_misses,
+        p.display_locked,
     );
 }
 
@@ -1753,7 +1761,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), records.len() + 1);
         let columns = CSV_HEADER.split(',').count();
-        assert_eq!(columns, 31);
+        assert_eq!(columns, 32);
         assert!(lines.iter().all(|l| l.split(',').count() == columns));
         assert!(
             lines[501].starts_with("500,1000.000,10.0000,0,1,"),

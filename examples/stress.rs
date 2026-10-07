@@ -513,6 +513,7 @@ struct Pending {
     gate_wait: Duration,
     gate_missed: bool,
     gate_at: Option<Duration>,
+    display_locked: bool,
 }
 
 #[derive(Resource)]
@@ -675,6 +676,7 @@ fn record(
             gate_wait: p.gate_wait,
             gate_missed: p.gate_missed,
             gate_at: p.gate_at,
+            display_locked: p.display_locked,
         };
         rec.log.push(record);
         if let Some(spans) = spans.as_deref_mut() {
@@ -851,6 +853,7 @@ fn measure_frame(
             gate_at: pacing
                 .gate_opened_at
                 .and_then(|at| at.checked_duration_since(start)),
+            display_locked: pacing.display_locked,
         });
     }
 }

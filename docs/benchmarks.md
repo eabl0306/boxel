@@ -152,7 +152,8 @@ Una fila por frame: `frame_ms`, `crossed` (cruzó un borde), `generated`, `meshe
 `dropped_chunks` los chunks que el render no pudo guardar hasta ese frame (arena o tabla llenos).
 `gate_wait_ms` es lo que el runner retuvo el frame esperando la compuerta de presentación,
 `gate_missed` si se rindió y `gate_ms` cuándo se abrió la compuerta por última vez (el frame
-callback del compositor en Wayland), en ms desde el inicio de la medición.
+callback del compositor en Wayland), en ms desde el inicio de la medición. `display_locked` dice
+si el runner marcó el ritmo con el monitor (ADR 0017).
 El resumen anota los dos al final. Sirve para graficar o para buscar qué pasó en un tirón
 puntual.
 
