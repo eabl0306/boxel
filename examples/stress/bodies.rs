@@ -9,10 +9,12 @@
 //! - `mob`: walkers (player-size solid boxes with a character controller) that change direction
 //!   and sometimes jump every 48 steps, so they never sleep.
 //!
-//! `M` arrows are shot over the same square in seeded directions and shot again from their
-//! start every 2 s (128 steps), so about `M` are in the air at any time. Bodies have no renderer:
-//! they cost CPU only. With bodies or projectiles the app gets `PhysicsPlugin` (which also caps
-//! the fixed steps per frame at 3); without them nothing changes.
+//! `M` arrows are shot over the same square in seeded directions, all at once when the world
+//! settles, and then each one again from its start every 2 s (128 steps), the shots spread
+//! evenly over those 2 s: a flight lasts about 0.6 to 1.25 s, so about half of `M` are in the
+//! air at any time. Bodies have no renderer: they cost CPU only. With bodies or projectiles the
+//! app gets `PhysicsPlugin` (which also caps the fixed steps per frame at 3); without them
+//! nothing changes.
 
 use boxel::physics::{
     BodySettings, CharacterController, Collider, Interpolated, MoveIntent, PhysicsPlugin,
@@ -147,7 +149,8 @@ struct Steps(u64);
 #[derive(Component, Clone, Copy)]
 struct Mob(u64);
 
-/// An arrow: where it is shot from, with what velocity, and the step it was last shot at.
+/// An arrow: where it is shot from, with what velocity, and the step its 2 s period started at
+/// (the arrows' periods are spread over 2 s).
 #[derive(Component, Clone, Copy)]
 struct Shot {
     from: WorldPos,
@@ -191,6 +194,7 @@ fn spawn_when_settled(
     mut commands: Commands,
     mut spawner: ResMut<Spawner>,
     stats: Res<WorldStats>,
+    steps: Res<Steps>,
     query: PhysicsQuery,
 ) {
     if spawner.spawned || stats.chunks == 0 || !stats.is_settled() {
@@ -260,7 +264,8 @@ fn spawn_when_settled(
             Shot {
                 from,
                 velocity,
-                at: 0,
+                // The first shot is now; the next ones are spread over the 2 s.
+                at: steps.0 + i % SHOT_STEPS,
             },
         ));
     }

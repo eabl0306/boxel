@@ -5,17 +5,19 @@
 //! in its grid. The [`Sleepers`] store keeps a copy of each one in its own grid, rebuilt only
 //! when enough bodies fell asleep or woke up since the last rebuild: bodies that fell asleep
 //! since then wait in a short `pending` list (which joins every step's list), and woken ones are
-//! marked dead. Each step the awake bodies that can disturb a sleeper (the "active" ones: awake
-//! dynamic bodies, moving kinematic ones, teleported or changed ones) look up the sleepers their
-//! bounds touch and pull a copy into the step's list, so pushes, events and the wake rules see
-//! them; the rest of the store is never touched.
+//! marked dead (dead pending ones are dropped in one pass when the list next changes). Each
+//! step the awake bodies that can disturb a sleeper (the "active" ones: awake dynamic bodies,
+//! moving kinematic ones, teleported, nudged or changed ones) look up the sleepers their bounds
+//! touch and pull a copy into the step's list, so pushes, events and the wake rules see them;
+//! the rest of the store is never touched. Chunk loads find their sleepers in a chunk index
+//! built with the grid.
 //!
 //! The marker [`Sleeping`] is the truth: its hooks log every change (by physics or by the game,
 //! despawns included) and the store follows the log at the start of the wake and broadphase
 //! systems.
 
 use crate::components::{
-    BodyPosition, Collider, Contacts, Frozen, MoveIntent, PhysicsSettings, PhysicsStats,
+    BodyPosition, Collider, Contacts, Disturbed, Frozen, MoveIntent, PhysicsSettings, PhysicsStats,
     PhysicsSync, Projectile, ReportContacts, RigidBody, SleepLog, Sleeping, Vacated, Velocity,
 };
 use crate::contacts::{BodyIndex, IndexedBody};
@@ -23,7 +25,7 @@ use crate::core::{BlockBounds, BodySettings, Grid, Shape};
 use boxel_app::FixedTime;
 use boxel_ecs::prelude::*;
 use boxel_math::{DVec3, I64Vec3, Vec2};
-use boxel_voxel::{CHUNK_SHIFT, ChunkPos};
+use boxel_voxel::{CHUNK_SHIFT, ChunkPos, WorldPos};
 use boxel_world::{BlockChanged, ChunkDataEvent};
 
 /// Rebuild the store's grid when the bodies that fell asleep or woke up since the last rebuild
@@ -31,6 +33,9 @@ use boxel_world::{BlockChanged, ChunkDataEvent};
 const MIN_REBUILD: usize = 256;
 /// ...and more than the live sleepers divided by this.
 const REBUILD_FRACTION: usize = 8;
+/// A grid sleeper whose bounds (plus one block) reach more chunks than this is not in the
+/// chunk index: chunk events test it on its own.
+const MAX_INDEXED_CHUNKS: u128 = 64;
 
 /// The sleeping bodies (see the module docs).
 #[derive(Default)]
@@ -43,8 +48,20 @@ pub(crate) struct Sleepers {
     stamp: Vec<u32>,
     grid: Grid,
     dead_count: usize,
+    /// The chunks each grid body's bounds plus one block reach, as `(chunk, body)`, sorted:
+    /// chunk events find the bodies they touch without a scan.
+    by_chunk: Vec<(ChunkPos, u32)>,
+    /// Grid bodies that reach too many chunks for `by_chunk`.
+    wide: Vec<u32>,
     /// Fell asleep since the last rebuild: sorted by entity bits, not in the grid.
     pending: Vec<IndexedBody>,
+    /// Per pending body: woke up since (dropped when the list next changes).
+    pending_dead: Vec<bool>,
+    pending_dead_count: usize,
+    /// The next `pending`, while a merge builds it (kept for its buffer).
+    merged: Vec<IndexedBody>,
+    /// The bodies [`sync_sleepers`] adds (kept for its buffer).
+    fresh: Vec<IndexedBody>,
     /// The broadphase step, for the stamps (starts at 1: a stamp of 0 is never current).
     step: u32,
     /// Chunks the live sleepers' bounds (plus one block) reach, `min..=max` (conservative: dead
@@ -62,7 +79,7 @@ enum Slot {
 impl Sleepers {
     /// Sleeping bodies (alive).
     pub(crate) fn len(&self) -> usize {
-        self.bodies.len() - self.dead_count + self.pending.len()
+        self.bodies.len() - self.dead_count + self.pending.len() - self.pending_dead_count
     }
 
     fn find(&self, entity: Entity) -> Option<Slot> {
@@ -77,10 +94,12 @@ impl Sleepers {
         self.pending
             .binary_search_by_key(&key, |b| b.entity.to_bits())
             .ok()
+            .filter(|&i| !self.pending_dead[i])
             .map(Slot::Pending)
     }
 
-    /// Forgets `entity` (it woke up or is gone).
+    /// Forgets `entity` (it woke up or is gone). Constant time apart from the lookup: the
+    /// entry is only marked dead.
     pub(crate) fn remove(&mut self, entity: Entity) {
         match self.find(entity) {
             Some(Slot::Grid(i)) => {
@@ -88,19 +107,50 @@ impl Sleepers {
                 self.dead_count += 1;
             }
             Some(Slot::Pending(i)) => {
-                self.pending.remove(i);
+                self.pending_dead[i] = true;
+                self.pending_dead_count += 1;
             }
             None => {}
         }
     }
 
-    /// Adds a body that fell asleep (replacing what the store had for it).
-    fn insert(&mut self, body: IndexedBody) {
-        self.remove(body.entity);
-        self.widen_chunks(&body);
-        let key = body.entity.to_bits();
-        let at = self.pending.partition_point(|b| b.entity.to_bits() < key);
-        self.pending.insert(at, body);
+    /// Adds bodies that fell asleep, sorted by entity and not in the store (removed first), to
+    /// the pending list: one merge, which also drops the dead pending entries.
+    fn add_pending(&mut self, fresh: &[IndexedBody]) {
+        if fresh.is_empty() && self.pending_dead_count == 0 {
+            return;
+        }
+        for body in fresh {
+            self.widen_chunks(body);
+        }
+        let mut merged = std::mem::take(&mut self.merged);
+        merged.clear();
+        merged.reserve(self.pending.len() + fresh.len());
+        let mut fresh = fresh.iter().copied().peekable();
+        for (body, &dead) in self.pending.iter().zip(&self.pending_dead) {
+            if dead {
+                continue;
+            }
+            while let Some(next) = fresh.next_if(|f| f.entity.to_bits() < body.entity.to_bits()) {
+                merged.push(next);
+            }
+            merged.push(*body);
+        }
+        merged.extend(fresh);
+        self.merged = std::mem::replace(&mut self.pending, merged);
+        self.pending_dead.clear();
+        self.pending_dead.resize(self.pending.len(), false);
+        self.pending_dead_count = 0;
+    }
+
+    /// The live pending sleepers, with their index in `pending`.
+    fn live_pending(&self) -> impl Iterator<Item = (usize, &IndexedBody)> + '_ {
+        self.pending
+            .iter()
+            .zip(&self.pending_dead)
+            .enumerate()
+            .filter(|(_, (_, dead))| !**dead)
+            .map(|(i, (body, _))| (i, body))
     }
 
     fn widen_chunks(&mut self, body: &IndexedBody) {
@@ -115,7 +165,7 @@ impl Sleepers {
     /// when enough changed since the last rebuild, or when the cell size changed.
     pub(crate) fn begin_step(&mut self, shift: u32) {
         self.step = self.step.wrapping_add(1).max(1);
-        let changed = self.pending.len() + self.dead_count;
+        let changed = self.pending.len() - self.pending_dead_count + self.dead_count;
         let rebuild = changed > MIN_REBUILD.max(self.len() / REBUILD_FRACTION)
             || (self.grid.shift() != shift.min(crate::core::MAX_GRID_SHIFT)
                 && !self.bodies.is_empty());
@@ -127,7 +177,13 @@ impl Sleepers {
     fn rebuild(&mut self, shift: u32) {
         let mut bodies = Vec::with_capacity(self.len());
         // Both lists are sorted by entity and hold different entities: a merge keeps the order.
-        let mut pending = std::mem::take(&mut self.pending).into_iter().peekable();
+        let mut pending = self
+            .pending
+            .drain(..)
+            .zip(self.pending_dead.drain(..))
+            .filter(|(_, dead)| !dead)
+            .map(|(body, _)| body)
+            .peekable();
         for (body, dead) in self.bodies.drain(..).zip(self.dead.drain(..)) {
             if dead {
                 continue;
@@ -138,6 +194,7 @@ impl Sleepers {
             bodies.push(body);
         }
         bodies.extend(pending);
+        self.pending_dead_count = 0;
         self.bodies = bodies;
         self.dead = vec![false; self.bodies.len()];
         self.stamp = vec![0; self.bodies.len()];
@@ -150,13 +207,29 @@ impl Sleepers {
         if !self.bodies.is_empty() {
             self.grid.build();
         }
-        let ranges: Vec<_> = self.bodies.iter().map(chunk_range).collect();
-        for (lo, hi) in ranges {
-            self.chunks = Some(match self.chunks {
-                Some((min, max)) => (min.min(lo), max.max(hi)),
+        self.by_chunk.clear();
+        self.wide.clear();
+        let mut chunks = None;
+        for (i, body) in self.bodies.iter().enumerate() {
+            let (lo, hi) = chunk_range(body);
+            chunks = Some(match chunks {
+                Some((min, max)) => (I64Vec3::min(min, lo), I64Vec3::max(max, hi)),
                 None => (lo, hi),
             });
+            if chunk_count(lo, hi) > MAX_INDEXED_CHUNKS {
+                self.wide.push(i as u32);
+                continue;
+            }
+            for x in lo.x..=hi.x {
+                for y in lo.y..=hi.y {
+                    for z in lo.z..=hi.z {
+                        self.by_chunk.push((ChunkPos::new(x, y, z), i as u32));
+                    }
+                }
+            }
         }
+        self.chunks = chunks;
+        self.by_chunk.sort_unstable();
     }
 
     /// Calls `visit` with every live sleeper whose bounds overlap `bounds` (grid ones, then
@@ -171,11 +244,19 @@ impl Sleepers {
                 }
             }
         }
-        for (i, body) in self.pending.iter().enumerate() {
+        for (i, body) in self.live_pending() {
             if body.bounds.overlaps(&bounds) {
                 visit(Slot::Pending(i));
             }
         }
+    }
+
+    /// Where a live sleeper is, as the store keeps it.
+    pub(crate) fn position_of(&self, entity: Entity) -> Option<WorldPos> {
+        Some(match self.find(entity)? {
+            Slot::Grid(i) => self.bodies[i].pos,
+            Slot::Pending(i) => self.pending[i].pos,
+        })
     }
 
     /// The live sleepers whose bounds overlap `bounds`, as entities, into `out` (appended).
@@ -218,7 +299,9 @@ impl Sleepers {
 
     /// The pending sleepers that collide with bodies (they join every step's list).
     pub(crate) fn pending_colliders(&self) -> impl Iterator<Item = &IndexedBody> + '_ {
-        self.pending.iter().filter(|b| b.collides)
+        self.live_pending()
+            .map(|(_, body)| body)
+            .filter(|b| b.collides)
     }
 
     /// The grid sleepers queries must see: alive, colliding with bodies and not pulled into the
@@ -245,35 +328,67 @@ impl Sleepers {
             .zip(&self.dead)
             .filter(|(_, dead)| !**dead)
             .map(|(b, _)| b)
-            .chain(&self.pending)
+            .chain(self.live_pending().map(|(_, body)| body))
     }
 
     /// The live sleepers whose bounds plus one block reach one of the `chunks` (sorted), as
-    /// entities, into `out`.
+    /// entities, into `out` (appended, maybe twice). Grid sleepers are looked up per chunk in
+    /// the chunk index; only the pending ones (and the very wide ones) are tested one by one.
     fn in_chunks(&self, chunks: &[ChunkPos], out: &mut Vec<Entity>) {
         let Some((min, max)) = self.chunks else {
             return;
         };
-        let near = |c: &&ChunkPos| {
+        let inside = |c: &ChunkPos, lo: I64Vec3, hi: I64Vec3| {
             let c = I64Vec3::new(c.x, c.y, c.z);
-            c.cmpge(min).all() && c.cmple(max).all()
+            c.cmpge(lo).all() && c.cmple(hi).all()
         };
-        let chunks: Vec<ChunkPos> = chunks.iter().filter(near).copied().collect();
-        if chunks.is_empty() {
+        let mut any = false;
+        for chunk in chunks.iter().filter(|c| inside(c, min, max)) {
+            any = true;
+            let start = self.by_chunk.partition_point(|(c, _)| c < chunk);
+            for &(_, i) in self.by_chunk[start..]
+                .iter()
+                .take_while(|(c, _)| c == chunk)
+            {
+                if !self.dead[i as usize] {
+                    out.push(self.bodies[i as usize].entity);
+                }
+            }
+        }
+        if !any {
             return;
         }
-        for body in self.all() {
+        for &i in &self.wide {
+            let body = &self.bodies[i as usize];
             let (lo, hi) = chunk_range(body);
-            let touches = (lo.x..=hi.x).any(|x| {
-                (lo.y..=hi.y).any(|y| {
-                    (lo.z..=hi.z).any(|z| chunks.binary_search(&ChunkPos::new(x, y, z)).is_ok())
+            if !self.dead[i as usize] && chunks.iter().any(|c| inside(c, lo, hi)) {
+                out.push(body.entity);
+            }
+        }
+        for (_, body) in self.live_pending() {
+            let (lo, hi) = chunk_range(body);
+            let touches = if chunk_count(lo, hi) > MAX_INDEXED_CHUNKS {
+                chunks.iter().any(|c| inside(c, lo, hi))
+            } else {
+                (lo.x..=hi.x).any(|x| {
+                    (lo.y..=hi.y).any(|y| {
+                        (lo.z..=hi.z).any(|z| chunks.binary_search(&ChunkPos::new(x, y, z)).is_ok())
+                    })
                 })
-            });
+            };
             if touches {
                 out.push(body.entity);
             }
         }
     }
+}
+
+/// How many chunks `lo..=hi` holds (saturating).
+fn chunk_count(lo: I64Vec3, hi: I64Vec3) -> u128 {
+    let span = |a: i64, b: i64| u128::try_from(i128::from(b) - i128::from(a) + 1).unwrap_or(0);
+    span(lo.x, hi.x)
+        .saturating_mul(span(lo.y, hi.y))
+        .saturating_mul(span(lo.z, hi.z))
 }
 
 /// The chunks a body's bounds plus one block reach.
@@ -366,19 +481,24 @@ pub(crate) fn sync_sleepers(
     }
     log.0.sort_unstable_by_key(|e| e.to_bits());
     log.0.dedup();
-    for entity in log.0.drain(..) {
+    for &entity in &log.0 {
         sleepers.remove(entity);
-        if let Ok((kind, collider, position, velocity, contacts, settings, report, projectile)) =
-            data.get(entity)
-        {
-            sleepers.insert(sleeper(
-                entity,
-                (
-                    kind, collider, position, velocity, contacts, settings, report, projectile,
-                ),
-            ));
-        }
     }
+    // Sorted like the log.
+    let mut fresh = std::mem::take(&mut sleepers.fresh);
+    fresh.clear();
+    fresh.extend(log.0.drain(..).filter_map(|entity| {
+        let (kind, collider, position, velocity, contacts, settings, report, projectile) =
+            data.get(entity).ok()?;
+        Some(sleeper(
+            entity,
+            (
+                kind, collider, position, velocity, contacts, settings, report, projectile,
+            ),
+        ))
+    }));
+    sleepers.add_pending(&fresh);
+    sleepers.fresh = fresh;
 }
 
 /// `PhysicsSettings` fields that change how bodies move: a change wakes every sleeper.
@@ -391,73 +511,104 @@ fn motion_settings(s: &PhysicsSettings) -> (DVec3, u32, u64, u64) {
     )
 }
 
+/// What [`wake_bodies`] reads of a sleeping body whose components changed.
+type ChangedSleeper<'a> = (
+    Entity,
+    Ref<'a, Sleeping>,
+    Ref<'a, Velocity>,
+    Ref<'a, RigidBody>,
+    Option<Ref<'a, Collider>>,
+    Ref<'a, BodySettings>,
+);
+
+/// The reused buffers of [`wake_bodies`].
+#[derive(Default)]
+pub(crate) struct WakeScratch {
+    wake: Vec<Entity>,
+    ids: Vec<u32>,
+    loaded: Vec<ChunkPos>,
+}
+
 /// [`crate::PhysicsSystems::Wake`]: wakes the sleeping bodies something disturbed since the
-/// latest step (see [`Sleeping`]): a velocity, collider or settings change, a vacated place
-/// (teleports in `Prepare`, collider changes and despawns through [`Collider`]'s hook), block
-/// changes and chunk loads and unloads, a change of the world-wide settings.
+/// latest step (see [`Sleeping`]): a velocity, or a body, collider or settings change made
+/// after the body fell asleep, a removed collider or [`ReportContacts`], a vacated place
+/// (teleports and nudges in `Prepare`, collider changes and despawns through [`Collider`]'s
+/// hook), block changes and chunk loads, a change of the world-wide settings.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    reason = "a system's parameters"
+)]
 pub(crate) fn wake_bodies(
     mut commands: Commands,
     settings: Res<PhysicsSettings>,
     mut last: Local<Option<(DVec3, u32, u64, u64)>>,
+    mut scratch: Local<WakeScratch>,
     mut index: ResMut<BodyIndex>,
     mut log: ResMut<SleepLog>,
     mut vacated: ResMut<Vacated>,
+    mut disturbed: ResMut<Disturbed>,
     data: Query<SleeperData, With<Sleeping>>,
     changed: Query<
-        (
-            Entity,
-            Ref<Velocity>,
-            Option<Ref<Collider>>,
-            Ref<BodySettings>,
-        ),
-        (
-            With<Sleeping>,
-            Or<(Changed<Velocity>, Changed<Collider>, Changed<BodySettings>)>,
-        ),
+        ChangedSleeper,
+        Or<(
+            Changed<Velocity>,
+            Changed<RigidBody>,
+            Changed<Collider>,
+            Changed<BodySettings>,
+        )>,
     >,
     mut blocks: MessageReader<BlockChanged>,
     mut chunks: MessageReader<ChunkDataEvent>,
     mut stats: ResMut<PhysicsStats>,
 ) {
     let index = &mut *index;
+    let WakeScratch { wake, ids, loaded } = &mut *scratch;
+    wake.clear();
     sync_sleepers(&mut index.sleepers, &mut log, &data);
     let sleepers = &index.sleepers;
-    let mut wake = Vec::new();
     let now = motion_settings(&settings);
     if last.is_some_and(|l| l != now) || settings.sleep_steps == 0 {
         wake.extend(sleepers.all().map(|b| b.entity));
     }
     *last = Some(now);
-    for (entity, velocity, collider, body) in &changed {
+    for (entity, asleep, velocity, kind, collider, body) in &changed {
+        // Changes made with the marker (a body spawned asleep) or before it (the store copy is
+        // taken after them) do not count. Falling asleep zeroes the velocity: any other value
+        // is new.
+        let after = asleep.added();
         if (velocity.is_changed() && velocity.0 != DVec3::ZERO)
-            || collider.is_some_and(|c| c.is_changed())
-            || body.is_changed()
+            || kind.is_changed_after(after)
+            || collider.is_some_and(|c| c.is_changed_after(after))
+            || body.is_changed_after(after)
         {
             wake.push(entity);
         }
     }
-    let mut ids = Vec::new();
+    wake.extend(disturbed.0.drain(..).filter(|&e| data.contains(e)));
     for (pos, bx) in vacated.0.drain(..) {
         let pos = pos.normalize();
-        sleepers.near(grow(BlockBounds::of_box(pos, bx), 1), &mut ids, &mut wake);
+        sleepers.near(grow(BlockBounds::of_box(pos, bx), 1), ids, wake);
     }
     for change in blocks.read() {
-        sleepers.near(
-            grow(BlockBounds::of_block(change.pos), 1),
-            &mut ids,
-            &mut wake,
-        );
+        sleepers.near(grow(BlockBounds::of_block(change.pos), 1), ids, wake);
     }
-    let mut loaded: Vec<ChunkPos> = chunks.read().map(ChunkDataEvent::pos).collect();
+    // Only loads: a sleeping body needs no blocks, so an unload leaves it asleep (it would
+    // only freeze), and the chunk's blocks are read again when it loads.
+    loaded.clear();
+    loaded.extend(chunks.read().filter_map(|event| match event {
+        ChunkDataEvent::Loaded { key, .. } => Some(key.pos),
+        ChunkDataEvent::Unloaded { .. } => None,
+    }));
     if !loaded.is_empty() {
         loaded.sort_unstable();
         loaded.dedup();
-        sleepers.in_chunks(&loaded, &mut wake);
+        sleepers.in_chunks(loaded, wake);
     }
     wake.sort_unstable_by_key(|e| e.to_bits());
     wake.dedup();
     stats.woken = wake.len();
-    for entity in wake {
+    for &entity in wake.iter() {
         index.sleepers.remove(entity);
         commands.entity(entity).try_remove::<Sleeping>();
     }

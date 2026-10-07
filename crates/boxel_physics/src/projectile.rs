@@ -8,14 +8,20 @@
 //! - against the solid bodies in its layers (awake or asleep, not its `ignore` and not other
 //!   projectiles), as a ray against each body's box grown by the projectile's half extents:
 //!   exact for boxes, a sphere counts as its bounding box. A body the segment starts inside or
-//!   touching is not hit (it was hit when the projectile entered it, or the projectile stopped
-//!   against it).
+//!   touching is hit at once in the first step after the projectile was spawned, teleported or
+//!   nudged (a point-blank shot); later it is not (it was hit when the projectile entered it,
+//!   or the projectile stopped against it).
 //!
 //! The earliest hit decides (a body wins a tie with a block): `Stop` on a body leaves the
 //! projectile touching it with velocity 0; `Pass` reports each body it enters and flies on; a
 //! block hit puts the center on the block's face (`eps` outside it) and sticks there
-//! (`OnBlock::Stop`, asleep at once) or bounces. Every hit is a [`ProjectileHit`] (a bounce only
-//! when faster than `PhysicsSettings::impact_speed` along the hit axis).
+//! (`OnBlock::Stop`, asleep at once) or bounces: the motion along the face's axis ends there
+//! and the rest of the step goes on along the face, tested the same way (so a ball that landed
+//! slides on). Every hit is a [`ProjectileHit`] (a bounce only when faster than
+//! `PhysicsSettings::impact_speed` along the hit axis), with the velocity just before it.
+//!
+//! A stuck projectile (`OnBlock::Stop`) sleeps until its block goes, it is moved, or its
+//! velocity is set: then it flies again.
 //!
 //! A projectile whose segment reaches an unloaded chunk freezes, like any body. Each one only
 //! reads the world and writes itself, so the step runs in parallel above
@@ -136,8 +142,9 @@ struct Flight<'a, 'w> {
 fn fly(flyer: &mut Flyer<'_>, shared: &Shared<'_>, f: Flight<'_, '_>) {
     let params = &shared.params;
     let start = f.position.0.normalize();
-    if f.sync.teleported && f.projectile.stuck.is_some() {
-        // Moved away from its block.
+    // Moved away from its block, or launched again by the game (a stuck projectile sleeps with
+    // velocity 0).
+    if f.projectile.stuck.is_some() && (f.sync.teleported || f.velocity.0 != DVec3::ZERO) {
         f.projectile.stuck = None;
     }
     let freeze = |flyer: &mut Flyer<'_>| {
@@ -169,172 +176,188 @@ fn fly(flyer: &mut Flyer<'_>, shared: &Shared<'_>, f: Flight<'_, '_>) {
         Some(c) => (c.offset, c.shape.bounds().max, c.layers),
         None => (DVec3::ZERO, DVec3::ZERO, CollisionLayers::default()),
     };
-    // Everything in the frame of the start's block: the center is `start.frac + offset`.
-    let center = start.frac + offset;
-    let origin = WorldPos::from_block(start.block, center);
-    let (t_end, block_hit) = match raycast_voxels(
-        &mut flyer.voxels,
-        shared.table,
-        origin,
-        d,
-        1.0,
-        VoxelFilter::Collision,
-    ) {
-        RayResult::Hit(hit) => (hit.t, Some(hit)),
-        RayResult::Miss => (1.0, None),
-        RayResult::Unloaded { .. } => {
-            freeze(flyer);
-            return;
-        }
-    };
-    if f.frozen {
-        flyer.out.unfreeze.push(f.entity);
-    }
-    flyer.out.moved += 1;
-
-    // Bodies along the segment up to the block.
-    let reach = d * t_end;
-    let from = LocalBox::from_center_half(center, half);
-    let to = from.translate(reach);
-    let swept = LocalBox::new(from.min.min(to.min), from.max.max(to.max));
-    let frame = WorldPos::from_block(start.block, DVec3::ZERO);
-    flyer.hits.clear();
-    shared.index.near(
-        BlockBounds::of_box(frame, swept),
-        &mut flyer.ids,
-        &mut flyer.near,
-    );
-    for target in &flyer.near {
-        if !target.collides
-            || target.sensor
-            || target.entity == f.entity
-            || Some(target.entity) == f.projectile.ignore
-            || !layers.interacts(target.layers)
-        {
-            continue;
-        }
-        let at = frame.delta_to(&target.pos) + target.offset;
-        let grown = LocalBox::from_center_half(at, target.shape.bounds().max + half);
-        if let Some(hit) = grown.ray(center, d, t_end)
-            && hit.t > 0.0
-        {
-            flyer
-                .hits
-                .push((hit.t, target.entity.to_bits(), target.entity));
-        }
-    }
-    flyer
-        .hits
-        .sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-
     let bits = f.entity.to_bits();
-    let speed = v.length();
     let mut seq = 0u8;
-    let mut report = |flyer: &mut Flyer<'_>, target: ProjectileTarget, point: WorldPos| {
-        flyer.out.hits.push((
-            bits,
-            seq,
-            ProjectileHit {
-                projectile: f.entity,
-                target,
-                point,
-                velocity: v,
-                speed,
-            },
-        ));
-        seq = seq.saturating_add(1);
-    };
+    let mut report =
+        |flyer: &mut Flyer<'_>, target: ProjectileTarget, point: WorldPos, v: DVec3| {
+            flyer.out.hits.push((
+                bits,
+                seq,
+                ProjectileHit {
+                    projectile: f.entity,
+                    target,
+                    point,
+                    velocity: v,
+                    speed: v.length(),
+                },
+            ));
+            seq = seq.saturating_add(1);
+        };
+    // Everything in the frame of the start's block: the position is `frac`, the center
+    // `frac + offset`.
+    let frame = WorldPos::from_block(start.block, DVec3::ZERO);
+    let mut frac = start.frac;
     let mut contacts = Contacts::default();
     let mut vel = v;
-    let mut frac = start.frac + d;
     let mut stuck = false;
-    let entity_hits = std::mem::take(&mut flyer.hits);
-    let stopped = match f.projectile.on_entity {
-        OnEntity::Stop => entity_hits.first().copied(),
-        OnEntity::Pass => {
-            for &(t, _, target) in &entity_hits {
-                let point = WorldPos::from_block(start.block, center + d * t);
-                report(flyer, ProjectileTarget::Entity(target), point);
-            }
-            None
+    // The motion left in this step. A bounce off a face drops the motion along its axis and
+    // goes on along the face with the rest: at most one leg per axis.
+    let mut rem = d;
+    for leg in 0..3 {
+        if rem == DVec3::ZERO {
+            break;
         }
-    };
-    if let Some((t, _, target)) = stopped {
-        let point = WorldPos::from_block(start.block, center + d * t);
-        report(flyer, ProjectileTarget::Entity(target), point);
-        frac = start.frac + d * t;
-        vel = DVec3::ZERO;
-    } else if let Some(hit) = block_hit {
-        let axis = hit.face.map(|face| face.axes().0);
-        match (axis, f.projectile.on_block) {
-            (Some(axis), mode) => {
-                // The center on the face's plane, `eps` back on the side it came from.
-                let positive = d[axis] > 0.0;
-                let plane =
-                    (hit.point.block.as_i64vec3()[axis] - start.block.as_i64vec3()[axis]) as f64;
-                let back = if positive { -shared.eps } else { shared.eps };
-                frac = start.frac + d * hit.t;
-                frac[axis] = plane + back - offset[axis];
-                let face = face_of(axis, positive);
-                contacts.faces = 1 << face.index();
-                if face == Face::NegY {
-                    contacts.on_ground = true;
-                    contacts.ground_block = Some(hit.block);
-                }
-                let along = v[axis].abs();
-                let target = ProjectileTarget::Block {
-                    pos: hit.block,
-                    face: hit.face,
-                    state: hit.state,
-                };
-                let point = WorldPos::from_block(start.block, frac + offset);
-                match mode {
-                    OnBlock::Stop => {
-                        report(flyer, target, point);
-                        vel = DVec3::ZERO;
-                        f.projectile.stuck = Some(hit.block);
-                        stuck = true;
-                    }
-                    OnBlock::Bounce => {
-                        if along > params.impact_speed {
-                            report(flyer, target, point);
-                        }
-                        // As a body's bounce: a clip no faster than one step of gravity (or
-                        // `bounce_min_speed`) stops instead (`max` ignores a NaN side).
-                        let resting =
-                            (params.gravity[axis] * f.body.gravity_scale * params.dt).abs();
-                        let bounced = -v[axis] * f.body.restitution;
-                        vel[axis] = if along > f.body.bounce_min_speed.max(resting)
-                            && bounced != 0.0
-                            && bounced.is_finite()
-                        {
-                            bounced
-                        } else {
-                            0.0
-                        };
-                    }
-                }
+        let center = frac + offset;
+        let origin = WorldPos::from_block(start.block, center);
+        let (t_end, block_hit) = match raycast_voxels(
+            &mut flyer.voxels,
+            shared.table,
+            origin,
+            rem,
+            1.0,
+            VoxelFilter::Collision,
+        ) {
+            RayResult::Hit(hit) => (hit.t, Some(hit)),
+            RayResult::Miss => (1.0, None),
+            RayResult::Unloaded { .. } if leg == 0 => {
+                freeze(flyer);
+                return;
             }
-            (None, _) => {
-                // It started inside a block (spawned there, or a block was placed on it): it
-                // sticks in that block whatever its mode.
-                report(
-                    flyer,
-                    ProjectileTarget::Block {
-                        pos: hit.block,
-                        face: None,
-                        state: hit.state,
-                    },
-                    hit.point,
-                );
-                frac = start.frac;
+            // The slide along a face reaches an unloaded chunk: it ends where the bounce left
+            // it, and the next step freezes it.
+            RayResult::Unloaded { .. } => break,
+        };
+        if leg == 0 && f.frozen {
+            flyer.out.unfreeze.push(f.entity);
+        }
+
+        // Bodies along the leg up to the block. A body it starts inside or touching is only hit
+        // in the first step after it was placed (spawned, teleported or nudged): later it is
+        // one it entered or stopped against already.
+        let fresh = leg == 0 && f.sync.teleported;
+        let reach = rem * t_end;
+        let from = LocalBox::from_center_half(center, half);
+        let to = from.translate(reach);
+        let swept = LocalBox::new(from.min.min(to.min), from.max.max(to.max));
+        flyer.hits.clear();
+        shared.index.near(
+            BlockBounds::of_box(frame, swept),
+            &mut flyer.ids,
+            &mut flyer.near,
+        );
+        for target in &flyer.near {
+            if !target.collides
+                || target.sensor
+                || target.entity == f.entity
+                || Some(target.entity) == f.projectile.ignore
+                || !layers.interacts(target.layers)
+            {
+                continue;
+            }
+            let at = frame.delta_to(&target.pos) + target.offset;
+            let grown = LocalBox::from_center_half(at, target.shape.bounds().max + half);
+            if let Some(hit) = grown.ray(center, rem, t_end)
+                && (hit.t > 0.0 || fresh)
+            {
+                flyer
+                    .hits
+                    .push((hit.t, target.entity.to_bits(), target.entity));
+            }
+        }
+        flyer
+            .hits
+            .sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let entity_hits = std::mem::take(&mut flyer.hits);
+        let stopped = match f.projectile.on_entity {
+            OnEntity::Stop => entity_hits.first().copied(),
+            OnEntity::Pass => {
+                for &(t, _, target) in &entity_hits {
+                    let point = WorldPos::from_block(start.block, center + rem * t);
+                    report(flyer, ProjectileTarget::Entity(target), point, vel);
+                }
+                None
+            }
+        };
+        flyer.hits = entity_hits;
+        if let Some((t, _, target)) = stopped {
+            let point = WorldPos::from_block(start.block, center + rem * t);
+            report(flyer, ProjectileTarget::Entity(target), point, vel);
+            frac += rem * t;
+            vel = DVec3::ZERO;
+            break;
+        }
+        let Some(hit) = block_hit else {
+            frac += rem;
+            break;
+        };
+        let Some(axis) = hit.face.map(|face| face.axes().0) else {
+            // It started inside a block (spawned there, or a block was placed on it): it
+            // sticks in that block whatever its mode.
+            report(
+                flyer,
+                ProjectileTarget::Block {
+                    pos: hit.block,
+                    face: None,
+                    state: hit.state,
+                },
+                hit.point,
+                vel,
+            );
+            vel = DVec3::ZERO;
+            f.projectile.stuck = Some(hit.block);
+            stuck = true;
+            break;
+        };
+        // The center on the face's plane, `eps` back on the side it came from.
+        let positive = rem[axis] > 0.0;
+        let plane = (hit.point.block.as_i64vec3()[axis] - start.block.as_i64vec3()[axis]) as f64;
+        let back = if positive { -shared.eps } else { shared.eps };
+        let along_rem = rem * hit.t;
+        frac += along_rem;
+        frac[axis] = plane + back - offset[axis];
+        let face = face_of(axis, positive);
+        contacts.faces |= 1 << face.index();
+        if face == Face::NegY {
+            contacts.on_ground = true;
+            contacts.ground_block = Some(hit.block);
+        }
+        let along = vel[axis].abs();
+        let target = ProjectileTarget::Block {
+            pos: hit.block,
+            face: hit.face,
+            state: hit.state,
+        };
+        let point = WorldPos::from_block(start.block, frac + offset);
+        match f.projectile.on_block {
+            OnBlock::Stop => {
+                report(flyer, target, point, vel);
                 vel = DVec3::ZERO;
                 f.projectile.stuck = Some(hit.block);
                 stuck = true;
+                break;
+            }
+            OnBlock::Bounce => {
+                if along > params.impact_speed {
+                    report(flyer, target, point, vel);
+                }
+                // As a body's bounce: a clip no faster than one step of gravity (or
+                // `bounce_min_speed`) stops instead (`max` ignores a NaN side).
+                let resting = (params.gravity[axis] * f.body.gravity_scale * params.dt).abs();
+                let bounced = -vel[axis] * f.body.restitution;
+                vel[axis] = if along > f.body.bounce_min_speed.max(resting)
+                    && bounced != 0.0
+                    && bounced.is_finite()
+                {
+                    bounced
+                } else {
+                    0.0
+                };
+                // The rest of the step, along the face.
+                rem -= along_rem;
+                rem[axis] = 0.0;
             }
         }
     }
-    flyer.hits = entity_hits;
     let end = WorldPos::from_block(start.block, frac);
     let moved = frac - start.frac;
     if let Probe::Block(state) = flyer
@@ -343,6 +366,7 @@ fn fly(flyer: &mut Flyer<'_>, shared: &Shared<'_>, f: Flight<'_, '_>) {
     {
         contacts.in_fluid = shared.table.is_fluid(state);
     }
+    flyer.out.moved += 1;
     f.position.set_if_neq(BodyPosition(end));
     f.velocity.set_if_neq(Velocity(vel));
     f.contacts.set_if_neq(contacts);

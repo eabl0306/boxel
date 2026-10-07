@@ -1,7 +1,7 @@
 //! Physics core benches on generated worlds, read through `ChunkSource` like the ECS layer does
 //! (one hash lookup per chunk touched, uniform chunks without decoding).
 //!
-//! Targets (physics plan, phases P1 to P3; dev laptop, one thread):
+//! Targets (physics plan, phases P1 to P4; dev laptop, one thread unless noted):
 //!
 //! | Bench | Target |
 //! |---|---|
@@ -15,17 +15,23 @@
 //! | `frame/1000`, `frame/1000_multi_thread` | no target (per-frame cost, compare the two) |
 //! | `grid/10000` | <= 0.3 ms |
 //! | `grid/1000`, `grid/10000_crowd` | no target (scaling, a dense crowd) |
-//! | `scale/10000_asleep` | <= 0.6 ms |
+//! | `scale/10000_asleep_one_thread` | <= 0.6 ms |
+//! | `scale/10000_asleep` | no target (the same with the parallel step, as a game runs it) |
+//! | `scale/10000_asleep_chunk_events` | no target (one thread, 16 chunk loads a step) |
+//! | `scale/sleep_churn` | no target (one thread, 1000 bodies put to sleep and woken) |
 //! | `scale/10000_awake` (parallel step) | <= 1.5 ms |
 //! | `scale/10000_awake_one_thread` | no target (the same on one thread, to compare) |
-//! | `scale/1000_projectiles` | <= 0.3 ms |
+//! | `scale/1000_projectiles_one_thread` | <= 0.3 ms |
+//! | `scale/1000_projectiles` | no target (the same with the parallel step) |
 //!
 //! The worlds are streamed once by a headless app (`WorldPlugin`, inline jobs) before the
 //! measurements: forest terrain around the origin, a wide sky above it and a line of
 //! underground overworld chunks with caves. A `tick` is one run of `FixedPostUpdate` with
-//! `PhysicsPlugin` (every physics system of a fixed step) on the forest, with that many awake
-//! bodies: 70 % walking characters that turn around every 64 steps (some jump then), 30 % items
-//! dropped from up to 20 blocks, all `Interpolated` as in the examples. A `frame` is one run of
+//! `PhysicsPlugin` (every physics system of a fixed step) on the forest, on one thread
+//! (`PhysicsSettings::parallel_threshold` off, as the targets are), with that many bodies: 70 %
+//! walking characters that turn around every 64 steps (some jump then), 30 % items dropped from
+//! up to 20 blocks (they come to rest and fall asleep), all `Interpolated` as in the examples.
+//! A `frame` is one run of
 //! `RunFixedMainLoop` in a frame without a fixed step (144 fps): the interpolation of the 1000
 //! bodies and the schedule's executor, on the single-threaded executor `PhysicsPlugin` sets and
 //! on the multi-threaded one. `grid/N` builds the broadphase grid of N bodies and lists its
@@ -37,31 +43,39 @@
 //!
 //! `scale/*` (phase P4) run on a wider forest (radius 7) with the bodies as spread as in `tick`
 //! (10 000 on 304 x 304 blocks): `10000_asleep` has 9000 dropped items that came to rest and
-//! fell asleep and 1000 walkers; `10000_awake` has 7000 walkers and 3000 items with sleeping
-//! off, so every body steps, on the compute threads (`PhysicsSettings::parallel_threshold`),
+//! fell asleep and 1000 walkers, with the default parallel step (1000 awake walkers are above
+//! `PhysicsSettings::parallel_threshold`), and `10000_asleep_one_thread` is the same on one
+//! thread. `10000_asleep_chunk_events` adds 16 chunk loads a step (`ChunkDataEvent::Loaded`) in
+//! chunks among the sleepers that none of them reaches: finding that out is the cost.
+//! `sleep_churn` puts 1000 resting crates to sleep by hand and wakes them all again, in turns
+//! (the sleeper store's insertions and removals, without the 32 still steps). `10000_awake` has
+//! 7000 walkers and 3000 items with sleeping off, so every body steps, on the compute threads,
 //! and `10000_awake_one_thread` is the same on one thread. `1000_projectiles` (radius 2) has 100
-//! walkers and 1000 arrows shot over the forest, shot again every 32 steps. Run when the
-//! machine is idle (`tools/wait-idle.sh`).
+//! walkers and 1000 arrows shot over the forest, shot again every 32 steps, with the parallel
+//! step, and `1000_projectiles_one_thread` on one thread. Run when the machine is idle
+//! (`tools/wait-idle.sh`).
 #![expect(clippy::print_stdout, reason = "bench setup output")]
 
 use boxel_app::{App, FixedPostUpdate, FixedTime, RunFixedMainLoop};
 use boxel_ecs::message::Messages;
 use boxel_ecs::prelude::*;
 use boxel_ecs::schedule::MultiThreadedExecutor;
-use boxel_math::{DVec3, Vec2};
+use boxel_math::{DVec3, I64Vec3, Vec2};
 use boxel_physics::{
     BlockBounds, BodyPosition, BodySettings, CharacterController, ChunkSource, Collider,
     CollisionEnded, CollisionLayers, CollisionStarted, CollisionTable, Grid, Interpolated,
     LocalBox, MoveIntent, PhysicsPlugin, PhysicsSettings, PhysicsStats, Projectile, ProjectileHit,
-    RayResult, RigidBody, SweepConfig, Teleport, Velocity, VoxelFilter, VoxelImpact, move_box,
-    raycast_voxels,
+    RayResult, RigidBody, Sleeping, SweepConfig, Teleport, Velocity, VoxelFilter, VoxelImpact,
+    move_box, raycast_voxels,
 };
 use boxel_transform::Transform;
-use boxel_voxel::{BlockRegistry, WorldPos};
+use boxel_voxel::{BlockRegistry, CHUNK_SHIFT, ChunkPos, WorldPos};
 use boxel_world::jobs::InlineExecutor;
-use boxel_world::{ChunkMap, ChunkViewer, WorldPlugin, WorldSettings, WorldStats};
+use boxel_world::{ChunkDataEvent, ChunkMap, ChunkViewer, WorldPlugin, WorldSettings, WorldStats};
 use boxel_worldgen::{ForestGenerator, OverworldGenerator, WorldGenerator};
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::measurement::WallTime;
+use criterion::{BenchmarkGroup, Criterion, criterion_group, criterion_main};
+use std::collections::BTreeSet;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -524,6 +538,10 @@ fn turn(app: &mut App, tick: u64) {
 fn tick_benches(c: &mut Criterion) {
     let table = CollisionTable::from_registry(&BlockRegistry::default_blocks());
     let mut app = physics_app();
+    // The targets are for one thread.
+    app.world_mut()
+        .resource_mut::<PhysicsSettings>()
+        .parallel_threshold = usize::MAX;
     let mut tick = c.benchmark_group("tick");
     let mut spawned = 0;
     for n in [0, 100, 1000] {
@@ -689,6 +707,63 @@ fn breakdown(app: &mut App, name: &str) {
     );
 }
 
+/// Up to `n` loads (`ChunkDataEvent::Loaded`) of loaded chunks among the sleepers (inside the
+/// box of the chunks their bounds plus one block reach) that none of them reaches: such a load
+/// wakes nothing, so a bench of it measures finding that out.
+fn empty_chunk_loads(app: &mut App, n: usize) -> Vec<ChunkDataEvent> {
+    let world = app.world_mut();
+    let mut sleepers = world.query_filtered::<(&BodyPosition, &Collider), With<Sleeping>>();
+    let chunk =
+        |v: I64Vec3| I64Vec3::new(v.x >> CHUNK_SHIFT, v.y >> CHUNK_SHIFT, v.z >> CHUNK_SHIFT);
+    let mut reached = BTreeSet::new();
+    let mut area: Option<(I64Vec3, I64Vec3)> = None;
+    for (position, collider) in sleepers.iter(world) {
+        let bounds = BlockBounds::of_box(position.0.normalize(), collider.voxel_box());
+        let (lo, hi) = (
+            chunk(bounds.min - I64Vec3::ONE),
+            chunk(bounds.max + I64Vec3::ONE),
+        );
+        area = Some(match area {
+            Some((min, max)) => (min.min(lo), max.max(hi)),
+            None => (lo, hi),
+        });
+        for x in lo.x..=hi.x {
+            for y in lo.y..=hi.y {
+                for z in lo.z..=hi.z {
+                    reached.insert(ChunkPos::new(x, y, z));
+                }
+            }
+        }
+    }
+    let Some((lo, hi)) = area else {
+        return Vec::new();
+    };
+    world
+        .resource::<ChunkMap>()
+        .iter()
+        .filter_map(|(id, slot)| {
+            let key = slot.key();
+            let p = I64Vec3::new(key.pos.x, key.pos.y, key.pos.z);
+            (p.cmpge(lo).all() && p.cmple(hi).all() && !reached.contains(&key.pos))
+                .then_some(ChunkDataEvent::Loaded { id, key })
+        })
+        .take(n)
+        .collect()
+}
+
+/// The bench of one step at a time, turning the walkers every 64 steps.
+fn bench_steps(group: &mut BenchmarkGroup<'_, WallTime>, name: &str, app: &mut App, t: &mut u64) {
+    group.bench_function(name, |b| {
+        b.iter(|| {
+            *t += 1;
+            if t.is_multiple_of(64) {
+                turn(app, *t);
+            }
+            app.world_mut().run_schedule(FixedPostUpdate);
+        });
+    });
+}
+
 fn scale_benches(c: &mut Criterion) {
     let table = CollisionTable::from_registry(&BlockRegistry::default_blocks());
     let mut group = c.benchmark_group("scale");
@@ -706,15 +781,49 @@ fn scale_benches(c: &mut Criterion) {
     assert!(stats.sleeping >= 8800, "{stats:?}");
     breakdown(&mut app, "scale/10000_asleep");
     let mut t = 0u64;
-    group.bench_function("10000_asleep", |b| {
+    bench_steps(&mut group, "10000_asleep", &mut app, &mut t);
+    // The target is for one thread.
+    app.world_mut()
+        .resource_mut::<PhysicsSettings>()
+        .parallel_threshold = usize::MAX;
+    breakdown(&mut app, "scale/10000_asleep_one_thread");
+    bench_steps(&mut group, "10000_asleep_one_thread", &mut app, &mut t);
+    let stats = *app.world().resource::<PhysicsStats>();
+    assert!(!stats.parallel && stats.sleeping >= 8800, "{stats:?}");
+
+    // Chunk loads among the sleepers that wake none of them.
+    let loads = empty_chunk_loads(&mut app, 16);
+    println!(
+        "physics bench: scale/10000_asleep_chunk_events: {} loads a step",
+        loads.len()
+    );
+    assert!(
+        !loads.is_empty(),
+        "no chunk among the sleepers is free of them"
+    );
+    group.bench_function("10000_asleep_chunk_events", |b| {
         b.iter(|| {
             t += 1;
             if t.is_multiple_of(64) {
                 turn(&mut app, t);
             }
-            app.world_mut().run_schedule(FixedPostUpdate);
+            let world = app.world_mut();
+            let mut messages = world.resource_mut::<Messages<ChunkDataEvent>>();
+            messages.update();
+            messages.write_batch(loads.iter().copied());
+            world.run_schedule(FixedPostUpdate);
         });
     });
+    {
+        let mut messages = app.world_mut().resource_mut::<Messages<ChunkDataEvent>>();
+        messages.update();
+        messages.update();
+    }
+    let stats = *app.world().resource::<PhysicsStats>();
+    assert!(stats.sleeping >= 8800, "the loads woke nobody: {stats:?}");
+    app.world_mut()
+        .resource_mut::<PhysicsSettings>()
+        .parallel_threshold = PhysicsSettings::default().parallel_threshold;
 
     // 10 000 awake bodies (sleeping off), on the compute threads and on one.
     let bodies: Vec<Entity> = {
@@ -740,26 +849,48 @@ fn scale_benches(c: &mut Criterion) {
     assert!(stats.parallel);
     breakdown(&mut app, "scale/10000_awake");
     let mut t = 0u64;
-    group.bench_function("10000_awake", |b| {
-        b.iter(|| {
-            t += 1;
-            if t.is_multiple_of(64) {
-                turn(&mut app, t);
-            }
-            app.world_mut().run_schedule(FixedPostUpdate);
-        });
-    });
+    bench_steps(&mut group, "10000_awake", &mut app, &mut t);
     app.world_mut()
         .resource_mut::<PhysicsSettings>()
         .parallel_threshold = usize::MAX;
     breakdown(&mut app, "scale/10000_awake_one_thread");
-    group.bench_function("10000_awake_one_thread", |b| {
+    bench_steps(&mut group, "10000_awake_one_thread", &mut app, &mut t);
+    drop(app);
+
+    // 2000 resting crates asleep; 240 of them (fewer than the store rebuilds for, so they stay
+    // in its pending list) put to sleep by hand and woken again, in turns, on one thread.
+    let mut app = physics_app();
+    app.world_mut()
+        .resource_mut::<PhysicsSettings>()
+        .parallel_threshold = usize::MAX;
+    for (_, ground) in ground_places(&app, &table, 2000, 96, 0xC0C0) {
+        app.world_mut().spawn((
+            RigidBody::Dynamic,
+            Collider::standing(0.5, 0.5),
+            Teleport(ground),
+        ));
+    }
+    run_steps(&mut app, 256);
+    let stats = *app.world().resource::<PhysicsStats>();
+    assert!(stats.sleeping >= 1900, "{stats:?}");
+    let churn: Vec<Entity> = {
+        let world = app.world_mut();
+        let mut asleep = world.query_filtered::<Entity, With<Sleeping>>();
+        asleep.iter(world).take(240).collect()
+    };
+    let mut t = 0u64;
+    group.bench_function("sleep_churn", |b| {
         b.iter(|| {
             t += 1;
-            if t.is_multiple_of(64) {
-                turn(&mut app, t);
+            let world = app.world_mut();
+            for &entity in &churn {
+                if t.is_multiple_of(2) {
+                    world.entity_mut(entity).insert(Sleeping);
+                } else {
+                    world.entity_mut(entity).remove::<Sleeping>();
+                }
             }
-            app.world_mut().run_schedule(FixedPostUpdate);
+            world.run_schedule(FixedPostUpdate);
         });
     });
     drop(app);
@@ -810,6 +941,23 @@ fn scale_benches(c: &mut Criterion) {
         });
     });
     println!("physics bench: scale/1000_projectiles: {hits} hits in {t} steps");
+    // The target is for one thread.
+    app.world_mut()
+        .resource_mut::<PhysicsSettings>()
+        .parallel_threshold = usize::MAX;
+    breakdown(&mut app, "scale/1000_projectiles_one_thread");
+    group.bench_function("1000_projectiles_one_thread", |b| {
+        b.iter(|| {
+            t += 1;
+            if t.is_multiple_of(32) {
+                shoot_again(&mut app);
+            }
+            if t.is_multiple_of(64) {
+                turn(&mut app, t);
+            }
+            app.world_mut().run_schedule(FixedPostUpdate);
+        });
+    });
     group.finish();
 }
 

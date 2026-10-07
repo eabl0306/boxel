@@ -67,7 +67,7 @@ suelo: WASD camina, Espacio salta, G vuela, Q tira un objeto que cae y se queda 
 caja dos bloques adelante (las cajas se apilan, se empujan y se puede subir encima). Al caminar
 sobre un objeto, el jugador lo levanta. F dispara una flecha a 60 bloques/s que se clava en el
 bloque que toca y empuja al mob que alcanza, B tira una pelota que rebota hasta quedarse quieta y
-M pone cuatro mobs adelante que caminan solos. Los cuerpos quietos se duermen y no cuestan nada.
+M pone cuatro mobs adelante que caminan solos. Los cuerpos quietos se duermen y casi no cuestan.
 F3 muestra el estado del jugador, la línea de física, los objetos, las cajas, las flechas, las
 pelotas y los mobs (los cuerpos todavía no se dibujan).
 

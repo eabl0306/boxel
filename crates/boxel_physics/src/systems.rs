@@ -5,7 +5,7 @@ use crate::components::{
     PhysicsSettings, PhysicsStats, PhysicsSync, Projectile, RigidBody, Sleeping, Teleport, Vacated,
     Velocity, VoxelImpact,
 };
-use crate::contacts::{ObstacleIndex, ObstacleScratch};
+use crate::contacts::{BodyIndex, ObstacleIndex, ObstacleScratch};
 use crate::core::{
     BodySettings, CollisionTable, LocalBox, MAX_SWEEP_DISTANCE, StepParams, integrate_velocity,
     move_body,
@@ -14,7 +14,9 @@ use crate::plugin::PhysicsContent;
 use crate::source::ChunkSource;
 use boxel_app::FixedTime;
 use boxel_diagnostic::DiagnosticsBoard;
+use boxel_ecs::change_detection::Tick;
 use boxel_ecs::prelude::*;
+use boxel_ecs::system::SystemChangeTick;
 use boxel_math::{DVec2, DVec3};
 use boxel_tasks::{ComputeTaskPool, TaskPool};
 use boxel_transform::Transform;
@@ -34,8 +36,8 @@ use std::time::Instant;
 pub enum PhysicsSystems {
     /// New bodies take their position from `Transform`; teleports (a [`Teleport`], or a
     /// `Transform` that differs from what physics wrote) move [`BodyPosition`], clear
-    /// [`Contacts`] and wake the body; [`Interpolated`] bodies keep their position before the
-    /// step.
+    /// [`Contacts`] and wake the body, and so does a nudge (a [`BodyPosition`] write), without
+    /// clearing [`Contacts`]; [`Interpolated`] bodies keep their position before the step.
     Prepare,
     /// [`CharacterController`]s turn [`MoveIntent`] into [`Velocity`]. After `Prepare`, so a
     /// body teleported this step is in the air for its controller (no jump from the old
@@ -149,11 +151,22 @@ fn clean(d: DVec3) -> DVec3 {
     DVec3::new(axis(d.x), axis(d.y), axis(d.z))
 }
 
+/// The awake bodies that do work in a step, counted by [`prepare_bodies`]: what the parallel
+/// thresholds compare with `PhysicsSettings::parallel_threshold` (static and kinematic bodies,
+/// and sleeping ones, do almost nothing per step).
+#[derive(Resource, Default)]
+pub(crate) struct AwakeCount {
+    /// Awake dynamic bodies, projectiles not included.
+    pub(crate) dynamic: usize,
+    /// Awake dynamic projectiles.
+    pub(crate) projectiles: usize,
+}
+
 /// [`PhysicsSystems::Controller`]: walking and jumping (see [`CharacterController`]). Only
 /// dynamic bodies walk (the others have no drag to level the speed off). Frozen bodies are
 /// skipped (their steps do not happen) and keep the jump latch. A sleeping character that
 /// wants to move gets a velocity, and that wakes it. Each character only writes itself: on the
-/// compute threads above `PhysicsSettings::parallel_threshold`.
+/// compute threads above `PhysicsSettings::parallel_threshold` awake characters.
 pub(crate) fn drive_characters(
     fixed: Res<FixedTime>,
     settings: Res<PhysicsSettings>,
@@ -167,6 +180,14 @@ pub(crate) fn drive_characters(
             &BodySettings,
         ),
         Without<Frozen>,
+    >,
+    awake: Query<
+        (),
+        (
+            With<CharacterController>,
+            Without<Frozen>,
+            Without<Sleeping>,
+        ),
     >,
 ) {
     let dt = timestep(&fixed);
@@ -207,7 +228,7 @@ pub(crate) fn drive_characters(
         }
         velocity.set_if_neq(Velocity(v));
     };
-    if characters.iter().len() > settings.parallel_threshold {
+    if awake.iter().len() > settings.parallel_threshold {
         ensure_compute_pool();
         characters.par_iter_mut().for_each(drive);
     } else {
@@ -218,6 +239,7 @@ pub(crate) fn drive_characters(
 /// What [`prepare_bodies`] reads and writes of a body.
 type PrepareItem<'a> = (
     Entity,
+    &'a RigidBody,
     &'a Transform,
     &'a mut BodyPosition,
     &'a mut Contacts,
@@ -233,11 +255,16 @@ type PrepareItem<'a> = (
 pub(crate) struct Prepared {
     /// Bodies whose `Teleport` was used.
     teleports: Vec<Entity>,
-    /// Sleeping bodies teleported (they wake up).
+    /// Sleeping bodies teleported or nudged (they wake up).
     wake: Vec<Entity>,
     /// Places solid bodies left by a teleport.
     vacated: Vec<(WorldPos, LocalBox)>,
+    /// Nudged solid bodies (the place they left is looked up afterwards), with their box,
+    /// where they were last shown and whether they sleep.
+    nudged: Vec<(Entity, LocalBox, Option<DVec3>, bool)>,
+    /// Awake bodies.
     count: usize,
+    awake: AwakeCount,
 }
 
 impl Merge for Prepared {
@@ -245,41 +272,69 @@ impl Merge for Prepared {
         self.teleports.append(&mut other.teleports);
         self.wake.append(&mut other.wake);
         self.vacated.append(&mut other.vacated);
+        self.nudged.append(&mut other.nudged);
         self.count += std::mem::take(&mut other.count);
+        self.awake.dynamic += std::mem::take(&mut other.awake.dynamic);
+        self.awake.projectiles += std::mem::take(&mut other.awake.projectiles);
     }
 }
 
+/// The tick of the latest [`write_back`]: a [`BodyPosition`] changed after it was written by
+/// gameplay (a nudge), since every physics write comes before it.
+#[derive(Resource, Default)]
+pub(crate) struct WritebackTick(Option<Tick>);
+
 /// [`PhysicsSystems::Prepare`]. A teleport clears [`Contacts`] (the body is not on its old
-/// ground any more: the next step finds the new one), wakes a sleeping body, and records the
-/// place a solid body left (the bodies asleep on it wake up). Sleeping bodies are only looked
-/// at when their `Transform` changed or they have a [`Teleport`]. Each body only writes itself:
-/// the awake ones are prepared on the compute threads above
-/// `PhysicsSettings::parallel_threshold`.
+/// ground any more: the next step finds the new one); a teleport or a nudge (a
+/// [`BodyPosition`] write) wakes a sleeping body and records the place a solid body left (the
+/// bodies asleep on it wake up). A body spawned asleep is placed and stays asleep. Sleeping
+/// bodies are only looked at when their `Transform` or position changed or they have a
+/// [`Teleport`]. Each body only writes itself: the awake ones are prepared on the compute
+/// threads above `PhysicsSettings::parallel_threshold` awake dynamic bodies (as counted in the
+/// previous step).
+#[expect(
+    clippy::type_complexity,
+    clippy::too_many_arguments,
+    reason = "a system's parameters; the sleeping bodies' filter names the changes that matter"
+)]
 pub(crate) fn prepare_bodies(
     mut commands: Commands,
     settings: Res<PhysicsSettings>,
+    written: Res<WritebackTick>,
+    index: Res<BodyIndex>,
     mut awake: Query<PrepareItem, Without<Sleeping>>,
-    mut asleep: Query<PrepareItem, (With<Sleeping>, Or<(Changed<Transform>, With<Teleport>)>)>,
+    mut asleep: Query<
+        PrepareItem,
+        (
+            With<Sleeping>,
+            Or<(Changed<Transform>, Changed<BodyPosition>, With<Teleport>)>,
+        ),
+    >,
     sleeping: Query<(), (With<RigidBody>, With<Sleeping>)>,
     mut vacated: ResMut<Vacated>,
+    mut count: ResMut<AwakeCount>,
     mut stats: ResMut<PhysicsStats>,
 ) {
     let sink = Sink::<Prepared>::default();
-    if awake.iter().len() > settings.parallel_threshold {
+    let since = written.0;
+    if count.dynamic + count.projectiles > settings.parallel_threshold {
         ensure_compute_pool();
         awake.par_iter_mut().for_each_init(
             || Part::new(&sink),
-            |part, item| prepare(&mut part.out, item, false),
+            |part, item| prepare(&mut part.out, item, false, since),
         );
     } else {
         let mut part = Part::new(&sink);
         for item in &mut awake {
-            prepare(&mut part.out, item, false);
+            prepare(&mut part.out, item, false, since);
         }
     }
     let mut out = sink.into_inner();
     for item in &mut asleep {
-        prepare(&mut out, item, true);
+        prepare(&mut out, item, true, since);
+    }
+    if !out.nudged.is_empty() {
+        vacated_by_nudges(&index, &mut out.nudged, &mut out.vacated);
     }
     out.teleports.sort_unstable_by_key(|e| e.to_bits());
     out.wake.sort_unstable_by_key(|e| e.to_bits());
@@ -292,13 +347,44 @@ pub(crate) fn prepare_bodies(
     }
     vacated.0.append(&mut out.vacated);
     stats.bodies = out.count + sleeping.iter().len();
+    *count = out.awake;
 }
 
-/// [`prepare_bodies`] for one body.
+/// The places the nudged bodies left: where the latest step left them, as the index has them
+/// (the sleeper store for a sleeping body, the step's list for an awake one), or, for one the
+/// index does not have yet, where it was last shown.
+fn vacated_by_nudges(
+    index: &BodyIndex,
+    nudged: &mut [(Entity, LocalBox, Option<DVec3>, bool)],
+    vacated: &mut Vec<(WorldPos, LocalBox)>,
+) {
+    nudged.sort_unstable_by_key(|n| n.0.to_bits());
+    let mut found: Vec<Option<WorldPos>> = nudged
+        .iter()
+        .map(|&(entity, _, _, asleep)| asleep.then(|| index.sleepers.position_of(entity)).flatten())
+        .collect();
+    if nudged.iter().any(|n| !n.3) {
+        for (entity, pos) in index.listed() {
+            if let Ok(i) = nudged.binary_search_by_key(&entity.to_bits(), |n| n.0.to_bits())
+                && !nudged[i].3
+            {
+                found[i] = Some(pos);
+            }
+        }
+    }
+    for (&(_, bx, shown, _), from) in nudged.iter().zip(found) {
+        if let Some(from) = from.or(shown.map(WorldPos::from_dvec3)) {
+            vacated.push((from, bx));
+        }
+    }
+}
+
+/// [`prepare_bodies`] for one body. `since` is the tick of the latest `Writeback`.
 fn prepare(
     out: &mut Prepared,
     (
         entity,
+        kind,
         transform,
         mut position,
         mut contacts,
@@ -309,6 +395,7 @@ fn prepare(
         projectile,
     ): (
         Entity,
+        &RigidBody,
         &Transform,
         Mut<BodyPosition>,
         Mut<Contacts>,
@@ -319,9 +406,17 @@ fn prepare(
         bool,
     ),
     asleep: bool,
+    since: Option<Tick>,
 ) {
     if !asleep {
         out.count += 1;
+        if *kind == RigidBody::Dynamic {
+            if projectile {
+                out.awake.projectiles += 1;
+            } else {
+                out.awake.dynamic += 1;
+            }
+        }
         if sync.moved != DVec3::ZERO {
             sync.moved = DVec3::ZERO;
         }
@@ -332,6 +427,8 @@ fn prepare(
             sync.teleported = false;
         }
     }
+    // A body that was never placed (new) has only the default position.
+    let placed = sync.placed;
     let target = if let Some(teleport) = teleport {
         out.teleports.push(entity);
         Some(teleport.0.normalize())
@@ -341,25 +438,53 @@ fn prepare(
     } else {
         None
     };
-    if let Some(target) = target {
-        // Nothing rests on a sensor or a projectile.
+    if asleep && !placed {
+        // Spawned asleep: placed where it was spawned, and it stays asleep. Its `Transform`
+        // stays as written (physics does not write it while the body sleeps).
+        if let Some(target) = target {
+            position.set_if_neq(BodyPosition(target));
+        }
+        sync.last_written = Some(transform.translation);
+        sync.placed = true;
+        if let Some(mut interpolated) = interpolated {
+            interpolated.prev = Some(position.0);
+        }
+        return;
+    }
+    // Gameplay wrote `BodyPosition` since the latest step (physics writes it before
+    // `Writeback`).
+    let nudged =
+        target.is_none() && placed && since.is_some_and(|tick| position.is_changed_after(tick));
+    if target.is_some() || nudged {
+        // The place it left: the sleepers on it wake up (nothing rests on a sensor or a
+        // projectile). A nudge already overwrote it: it is looked up afterwards.
         if let Some(collider) = collider
             && !collider.is_sensor()
             && !projectile
-            && sync.last_written.is_some()
+            && placed
         {
-            out.vacated.push((position.0, collider.voxel_box()));
+            if nudged {
+                out.nudged
+                    .push((entity, collider.voxel_box(), sync.last_written, asleep));
+            } else {
+                out.vacated.push((position.0, collider.voxel_box()));
+            }
         }
-        position.set_if_neq(BodyPosition(target));
-        contacts.set_if_neq(Contacts::default());
+        if let Some(target) = target {
+            position.set_if_neq(BodyPosition(target));
+            contacts.set_if_neq(Contacts::default());
+        }
         sync.teleported = true;
         sync.still = 0;
         if asleep {
             out.wake.push(entity);
         }
     }
+    if !sync.placed {
+        sync.placed = true;
+    }
     if let Some(mut interpolated) = interpolated
-        && (!asleep || target.is_some())
+        && (!asleep || target.is_some() || nudged)
     {
         interpolated.prev = Some(position.0);
     }
@@ -527,6 +652,7 @@ pub(crate) fn step_dynamic(
     settings: Res<PhysicsSettings>,
     fixed: Res<FixedTime>,
     obstacles: Res<ObstacleIndex>,
+    count: Res<AwakeCount>,
     mut bodies: Query<
         (
             Entity,
@@ -558,7 +684,7 @@ pub(crate) fn step_dynamic(
         out: StepOut::default(),
         sink: &sink,
     };
-    let parallel = bodies.iter().len() > settings.parallel_threshold;
+    let parallel = count.dynamic > settings.parallel_threshold;
     if parallel {
         ensure_compute_pool();
         bodies
@@ -611,13 +737,18 @@ pub(crate) fn write_events(
 }
 
 /// [`PhysicsSystems::Writeback`]: `Transform.translation = BodyPosition` (the only rounding of
-/// a position), and [`PhysicsSync`] remembers it. Rotation is never touched. Sleeping bodies
+/// a position), and [`PhysicsSync`] remembers it; its tick tells a later [`BodyPosition`]
+/// write (a nudge) from physics' own. Rotation is never touched. Sleeping bodies
 /// are skipped: falling asleep already put their `Transform` on their position. On the compute
-/// threads above `PhysicsSettings::parallel_threshold` bodies.
+/// threads above `PhysicsSettings::parallel_threshold` awake dynamic bodies.
 pub(crate) fn write_back(
     settings: Res<PhysicsSettings>,
+    count: Res<AwakeCount>,
+    ticks: SystemChangeTick,
+    mut written: ResMut<WritebackTick>,
     mut bodies: Query<(&BodyPosition, &mut Transform, &mut PhysicsSync), Without<Sleeping>>,
 ) {
+    written.0 = Some(ticks.this_run());
     let write =
         |(position, mut transform, mut sync): (&BodyPosition, Mut<Transform>, Mut<PhysicsSync>)| {
             let translation = position.0.to_dvec3();
@@ -628,7 +759,7 @@ pub(crate) fn write_back(
                 sync.last_written = Some(translation);
             }
         };
-    if bodies.iter().len() > settings.parallel_threshold {
+    if count.dynamic + count.projectiles > settings.parallel_threshold {
         ensure_compute_pool();
         bodies.par_iter_mut().for_each(write);
     } else {

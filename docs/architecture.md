@@ -699,7 +699,7 @@ Sistemas en `Update`, encadenados (`WorldSystems`):
 
 `BlockChanged` y `ChunkDataEvent` son los mensajes que comparten los sistemas que guardan algo
 derivado de los bloques: la física despierta los cuerpos dormidos cerca de un bloque que cambió
-o de un chunk que se cargó o se descargó (ADR 0016, P4), y la luz los puede usar para reiluminar.
+o de un chunk que se cargó (ADR 0016, P4), y la luz los puede usar para reiluminar.
 Un chunk que se descarga y se vuelve a cargar puede volver distinto (todavía no se guardan las
 ediciones), por eso quien guarda algo de un chunk lo refresca en `Loaded`.
 

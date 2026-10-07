@@ -2,8 +2,9 @@
 //! ground at y = 4), `PhysicsPlugin` and a synthetic clock.
 //!
 //! Bodies fall asleep after resting `sleep_steps` steps and then cost nothing; they wake on a
-//! velocity, a controller that wants to move, a teleport, a push, a support that moves or goes
-//! away, a block change near them, a chunk unload (then they freeze) and a settings change.
+//! velocity, a controller that wants to move, a teleport or a nudge, a push, a support that moves,
+//! shrinks or goes away, a block change near them, a chunk load and a settings change; a chunk
+//! unload leaves them asleep, and a body spawned asleep stays where it was spawned.
 //! Sleeping bodies keep their sensor overlaps and are still found by queries and rays.
 mod common;
 mod sim;
@@ -13,8 +14,8 @@ use boxel_ecs::prelude::*;
 use boxel_math::{DVec3, I64Vec3, Vec2};
 use boxel_physics::{
     BodyFilter, BodyIndex, BodySettings, CharacterController, Collider, Contacts, Interpolated,
-    LocalBox, MoveIntent, PhysicsQuery, PhysicsStats, RayFilter, RayHit, RigidBody, Sleeping,
-    Teleport, Velocity,
+    LocalBox, MoveIntent, PhysicsQuery, PhysicsStats, RayFilter, RayHit, ReportContacts, RigidBody,
+    Sleeping, Teleport, Velocity,
 };
 use boxel_transform::Transform;
 use boxel_voxel::{BlockState, WorldPos};
@@ -298,7 +299,7 @@ fn block_changes_near_a_sleeper_wake_it_and_far_ones_do_not() {
 }
 
 #[test]
-fn an_unloaded_chunk_wakes_and_freezes_a_sleeper_and_a_reload_lets_it_rest() {
+fn an_unload_leaves_a_sleeper_asleep_and_a_reload_wakes_it_to_rest_again() {
     let mut sim = Sim::new(I64Vec3::ZERO, STEP);
     let body = sim.body(sim.pos(0.5, 4.0, 0.5), crate_box());
     until_asleep(&mut sim, body, 128);
@@ -324,21 +325,29 @@ fn an_unloaded_chunk_wakes_and_freezes_a_sleeper_and_a_reload_lets_it_rest() {
             .block_at(sim.block(0, 3, 0))
             .is_none()
     );
-    assert!(!sim.asleep(body));
-    assert!(sim.frozen(body));
-    assert_eq!(
-        sim.position(body),
-        sim.pos(0.5, 4.0, 0.5),
-        "frozen in place"
-    );
-    // Back: it rests again on the regenerated ground and falls asleep.
+    // It needs no blocks while it sleeps: it costs nothing, and does not freeze.
+    assert!(sim.asleep(body));
+    assert!(!sim.frozen(body));
+    assert_eq!(stats(&sim).dynamic, 0);
+    assert_eq!(sim.position(body), sim.pos(0.5, 4.0, 0.5));
+    // Back: the blocks may have changed, so it wakes, rests on the regenerated ground and falls
+    // asleep again.
     sim.app
         .world_mut()
         .get_mut::<Transform>(viewer)
         .expect("viewer")
         .translation = DVec3::ZERO;
-    sim.settle();
-    until_asleep(&mut sim, body, 128);
+    let mut woke = false;
+    for _ in 0..1024 {
+        sim.steps(1);
+        woke |= !sim.asleep(body);
+        let world = *sim.app.world().resource::<boxel_world::WorldStats>();
+        if woke && sim.asleep(body) && world.is_settled() {
+            break;
+        }
+    }
+    assert!(woke, "a load wakes it");
+    assert!(sim.asleep(body));
     assert!(!sim.frozen(body));
     assert_eq!(sim.position(body), sim.pos(0.5, 4.0, 0.5));
 }
@@ -513,6 +522,248 @@ fn many_sleepers_and_a_trickle_of_wakes_keep_the_index_right() {
         let p = sim.position(c);
         assert_eq!(p.frac.y, 0.0, "back on the ground: {p:?}");
         assert!(!index.block_is_free(p.block));
+    }
+}
+
+#[test]
+fn a_body_spawned_asleep_stays_where_it_was_spawned() {
+    let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    // The chunk loads of the settling world are read (a load would wake the bodies).
+    sim.steps(2);
+    // Positioned by `Transform` (as a loaded save would), and by `Teleport`, both in the air.
+    let by_transform = sim
+        .app
+        .world_mut()
+        .spawn((
+            RigidBody::Dynamic,
+            crate_box(),
+            Transform::from_xyz(3.5, 10.0, 0.5),
+            Interpolated::default(),
+            Sleeping,
+        ))
+        .id();
+    let at = sim.pos(-2.5, 9.0, 0.5);
+    let by_teleport = sim
+        .app
+        .world_mut()
+        .spawn((RigidBody::Dynamic, crate_box(), Teleport(at), Sleeping))
+        .id();
+    sim.steps(16);
+    assert!(sim.asleep(by_transform) && sim.asleep(by_teleport));
+    assert_eq!(sim.position(by_transform), sim.pos(3.5, 10.0, 0.5));
+    assert_eq!(sim.translation(by_transform), DVec3::new(3.5, 10.0, 0.5));
+    assert_eq!(sim.position(by_teleport), at);
+    assert_eq!(sim.translation(by_teleport), at.to_dvec3());
+    assert_eq!(stats(&sim).dynamic, 0);
+    // The index has them there.
+    let index = sim.app.world().resource::<BodyIndex>();
+    assert!(!index.block_is_free(sim.block(3, 10, 0)));
+    assert!(index.block_is_free(sim.block(0, 0, 0)));
+    // Woken, each falls from where it was spawned.
+    set_velocity(&mut sim, by_transform, DVec3::new(0.0, 0.1, 0.0));
+    sim.app
+        .world_mut()
+        .entity_mut(by_teleport)
+        .remove::<Sleeping>();
+    sim.steps(128);
+    assert_eq!(sim.position(by_transform), sim.pos(3.5, 4.0, 0.5));
+    assert_eq!(sim.position(by_teleport), sim.pos(-2.5, 4.0, 0.5));
+}
+
+#[test]
+fn a_position_write_wakes_a_sleeper_and_the_sleepers_it_leaves() {
+    let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    let body = sim.body(sim.pos(0.5, 4.0, 0.5), crate_box());
+    until_asleep(&mut sim, body, 128);
+    // Nudged up in the air: it moves exactly there at once, `Transform` follows, and it falls.
+    let up = sim.pos(0.5, 8.0, 0.5);
+    sim.app
+        .world_mut()
+        .get_mut::<boxel_physics::BodyPosition>(body)
+        .expect("body")
+        .0 = up;
+    sim.steps(1);
+    assert!(!sim.asleep(body));
+    let y = sim.position(body).to_dvec3().y;
+    assert!(y < 8.0 && y > 7.9, "{y}");
+    assert_eq!(sim.translation(body), sim.position(body).to_dvec3());
+    until_asleep(&mut sim, body, 256);
+    assert_eq!(sim.position(body), sim.pos(0.5, 4.0, 0.5));
+
+    // A static platform under a sleeping crate is nudged away: the crate falls.
+    let at = sim.pos(4.5, 4.0, 0.5);
+    let platform = sim
+        .app
+        .world_mut()
+        .spawn((
+            RigidBody::Static,
+            Collider::standing(2.0, 1.0),
+            Teleport(at),
+        ))
+        .id();
+    let crate_ = sim.body(sim.pos(4.5, 6.0, 0.5), crate_box());
+    until_asleep(&mut sim, crate_, 256);
+    assert_eq!(sim.position(crate_), sim.pos(4.5, 5.0, 0.5));
+    let away = sim.pos(4.5, 4.0, 6.5);
+    sim.app
+        .world_mut()
+        .get_mut::<boxel_physics::BodyPosition>(platform)
+        .expect("platform")
+        .0 = away;
+    sim.steps(64);
+    assert_eq!(sim.position(crate_), sim.pos(4.5, 4.0, 0.5), "fell");
+    assert_eq!(sim.translation(platform), away.to_dvec3());
+
+    // Nudged into a sleeping crate's side, the platform pushes it out of its way.
+    let other = sim.body(sim.pos(-4.5, 4.0, 0.5), crate_box());
+    until_asleep(&mut sim, other, 256);
+    let onto = sim.pos(-5.6, 4.0, 0.5);
+    sim.app
+        .world_mut()
+        .get_mut::<boxel_physics::BodyPosition>(platform)
+        .expect("platform")
+        .0 = onto;
+    sim.steps(2);
+    assert!(!sim.asleep(other));
+    let x = sim.position(other).to_dvec3().x;
+    assert!(x >= -4.6 + 0.375 - 1e-9, "pushed off its side: {x}");
+}
+
+#[test]
+fn a_support_that_shrinks_or_turns_into_a_sensor_drops_its_sleepers() {
+    let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    let at = sim.pos(0.5, 4.0, 0.5);
+    let platform = sim
+        .app
+        .world_mut()
+        .spawn((
+            RigidBody::Static,
+            Collider::standing(2.0, 1.0),
+            Teleport(at),
+        ))
+        .id();
+    let crate_ = sim.body(sim.pos(0.5, 6.0, 0.5), crate_box());
+    until_asleep(&mut sim, crate_, 256);
+    assert_eq!(sim.position(crate_), sim.pos(0.5, 5.0, 0.5));
+    // Half as tall: the crate falls onto its new top.
+    sim.app
+        .world_mut()
+        .entity_mut(platform)
+        .insert(Collider::standing(2.0, 0.5));
+    sim.steps(64);
+    assert_eq!(sim.position(crate_), sim.pos(0.5, 4.5, 0.5));
+    // A sensor holds nothing: it falls to the ground.
+    sim.app
+        .world_mut()
+        .entity_mut(platform)
+        .insert(Collider::standing(2.0, 0.5).sensor());
+    sim.steps(64);
+    assert_eq!(sim.position(crate_), sim.pos(0.5, 4.0, 0.5));
+}
+
+#[test]
+fn changes_on_a_sleeper_that_its_queries_cannot_see_wake_it() {
+    let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    // A sleeping item loses its (sensor) collider: it wakes, and queries stop finding it.
+    let item = sim.body(
+        sim.pos(0.5, 4.0, 0.5),
+        (
+            Collider::aabb(DVec3::splat(0.125)).sensor(),
+            BodySettings::item(),
+        ),
+    );
+    until_asleep(&mut sim, item, 256);
+    sim.app.world_mut().entity_mut(item).remove::<Collider>();
+    sim.steps(1);
+    assert!(!sim.asleep(item));
+    let index = sim.app.world().resource::<BodyIndex>();
+    let sensors = BodyFilter::default().with_sensors(true);
+    let near = LocalBox::new(DVec3::splat(-1.0), DVec3::splat(1.0));
+    assert!(
+        index
+            .overlap_box(sim.pos(0.5, 4.5, 0.5), near, &sensors)
+            .is_empty()
+    );
+
+    // `ReportContacts` added to a crate asleep on another: it wakes, and the contact starts.
+    let lower = sim.body(sim.pos(4.5, 4.0, 0.5), crate_box());
+    let upper = sim.body(sim.pos(4.5, 4.75, 0.5), crate_box());
+    sim.steps(64);
+    assert!(sim.asleep(lower) && sim.asleep(upper));
+    std::mem::take(&mut sim.app.world_mut().resource_mut::<Collisions>().0);
+    sim.app.world_mut().entity_mut(upper).insert(ReportContacts);
+    sim.steps(1);
+    assert!(!sim.asleep(upper));
+    let events = std::mem::take(&mut sim.app.world_mut().resource_mut::<Collisions>().0);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(events[0].0);
+    // Its kind changes: it wakes (a static body never sleeps).
+    until_asleep(&mut sim, upper, 256);
+    *sim.app
+        .world_mut()
+        .get_mut::<RigidBody>(upper)
+        .expect("body") = RigidBody::Static;
+    sim.steps(64);
+    assert!(!sim.asleep(upper));
+}
+
+#[test]
+fn a_reload_wakes_every_sleeper_of_its_chunks_and_no_other() {
+    let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    // 300 crates: enough for the store to index them in its grid (and its chunk index).
+    let mut crates = Vec::new();
+    for i in 0..20 {
+        for j in 0..15 {
+            let x = -15.0 + 1.5 * f64::from(i);
+            let z = -10.0 + 1.5 * f64::from(j);
+            crates.push(sim.body(sim.pos(x, 4.0, z), crate_box()));
+        }
+    }
+    sim.steps(96);
+    assert!(crates.iter().all(|&c| sim.asleep(c)));
+    // A block change loads nothing: only the crates next to it wake.
+    sim.edit(sim.block(30, 4, 30), STONE);
+    sim.steps(2);
+    assert!(crates.iter().all(|&c| sim.asleep(c)));
+    // Away and back: every crate wakes once on the reload and sleeps again.
+    let viewer = {
+        let mut viewers = sim
+            .app
+            .world_mut()
+            .query_filtered::<Entity, With<boxel_world::ChunkViewer>>();
+        viewers.single(sim.app.world()).expect("one viewer")
+    };
+    sim.app
+        .world_mut()
+        .get_mut::<Transform>(viewer)
+        .expect("viewer")
+        .translation = DVec3::new(32.0 * 20.0, 4.0, 0.0);
+    sim.settle();
+    sim.steps(2);
+    assert!(
+        crates.iter().all(|&c| sim.asleep(c)),
+        "unloaded, still asleep"
+    );
+    sim.app
+        .world_mut()
+        .get_mut::<Transform>(viewer)
+        .expect("viewer")
+        .translation = DVec3::ZERO;
+    let mut woken = vec![false; crates.len()];
+    for _ in 0..1024 {
+        sim.steps(1);
+        for (w, &c) in woken.iter_mut().zip(&crates) {
+            *w |= !sim.asleep(c);
+        }
+        let world = *sim.app.world().resource::<boxel_world::WorldStats>();
+        if woken.iter().all(|&w| w) && crates.iter().all(|&c| sim.asleep(c)) && world.is_settled() {
+            break;
+        }
+    }
+    assert!(woken.iter().all(|&w| w));
+    assert!(crates.iter().all(|&c| sim.asleep(c)));
+    for &c in &crates {
+        assert_eq!(sim.position(c).frac.y, 0.0);
     }
 }
 

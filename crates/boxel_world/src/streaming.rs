@@ -23,14 +23,14 @@ use crate::interest::{Level, Planner, Viewer};
 use crate::jobs::JobExecutor;
 use crate::scheduler::{JobKind, JobScheduler};
 use crate::{
-    BlockEdit, ChunkId, ChunkMap, ChunkMeshEvent, ChunkSlot, DataState, Interest, MeshState,
-    WorldContent, WorldSettings,
+    BlockChanged, BlockEdit, ChunkId, ChunkMap, ChunkMeshEvent, ChunkSlot, DataState, Interest,
+    MeshState, WorldContent, WorldSettings,
 };
 use boxel_ecs::prelude::*;
 use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, Mesher};
 use boxel_voxel::{
-    BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, Face, LocalPos, NEIGHBOR_OFFSETS,
-    RenderShape, neighbor_index,
+    BlockPos, BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, ChunkKey, ChunkPos, Face,
+    LocalPos, NEIGHBOR_OFFSETS, RenderShape, neighbor_index,
 };
 use crossbeam_channel::{Receiver, Sender};
 use std::cell::RefCell;
@@ -952,12 +952,28 @@ impl WorldJobs {
     /// Applies edits grouped by chunk (copy-on-write, `ChunkData::set` bumps the version);
     /// remeshes each changed chunk and the face neighbors its changed border voxels touch (their
     /// epoch is bumped), all at priority 0. Edits to chunks that are not `Ready` are dropped.
-    pub(crate) fn apply_edits(&mut self, cx: &mut Ctx<'_>, edits: Vec<BlockEdit>) {
-        let mut by_chunk: BTreeMap<ChunkPos, Vec<(LocalPos, BlockState)>> = BTreeMap::new();
-        for edit in edits {
+    ///
+    /// Returns what changed (the `BlockChanged` messages), found while applying: per position,
+    /// the state before its first edit and after its last, in the order positions were first
+    /// edited, without the positions that end as they were.
+    pub(crate) fn apply_edits(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        edits: Vec<BlockEdit>,
+    ) -> Vec<BlockChanged> {
+        let mut by_chunk: BTreeMap<ChunkPos, Vec<(usize, LocalPos, BlockState)>> = BTreeMap::new();
+        for (order, edit) in edits.into_iter().enumerate() {
             let (chunk, local) = edit.pos.split();
-            by_chunk.entry(chunk).or_default().push((local, edit.state));
+            by_chunk
+                .entry(chunk)
+                .or_default()
+                .push((order, local, edit.state));
         }
+        // Each change with the order of its position's first edit.
+        let mut changed: Vec<(usize, BlockChanged)> = Vec::new();
+        // Per voxel of the chunk being applied: its change's index in `changed`, plus one (0:
+        // none yet). Only needed, and allocated, when a chunk gets several edits.
+        let mut first: Vec<u32> = Vec::new();
         for (chunk, changes) in by_chunk {
             let Some(id) = cx.map.id_at(chunk) else {
                 tracing::debug!(
@@ -977,15 +993,42 @@ impl WorldJobs {
             };
             if changes
                 .iter()
-                .all(|&(local, state)| data.get(local) == state)
+                .all(|&(_, local, state)| data.get(local) == state)
             {
                 continue;
             }
             let data = Arc::make_mut(data);
+            let repeated = changes.len() > 1;
+            if repeated && first.is_empty() {
+                first.resize(CHUNK_VOLUME, 0);
+            }
+            let start = changed.len();
             let mut touched = 0u8;
-            for (local, state) in changes {
-                if data.set(local, state) != state {
+            for (order, local, state) in changes {
+                let old = data.set(local, state);
+                if old != state {
                     touched |= local.border_faces();
+                }
+                if repeated {
+                    let slot = &mut first[local.index()];
+                    if *slot != 0 {
+                        changed[*slot as usize - 1].1.new = state;
+                        continue;
+                    }
+                    *slot = u32::try_from(changed.len() + 1).expect("fewer than 2^32 edits");
+                }
+                changed.push((
+                    order,
+                    BlockChanged {
+                        pos: BlockPos::from_parts(chunk, local),
+                        old,
+                        new: state,
+                    },
+                ));
+            }
+            if repeated {
+                for (_, change) in &changed[start..] {
+                    first[change.pos.split().1.index()] = 0;
                 }
             }
             self.request_remesh(cx, id, 0);
@@ -1000,6 +1043,10 @@ impl WorldJobs {
                 }
             }
         }
+        changed.retain(|(_, change)| change.old != change.new);
+        // Each position once: the orders are distinct.
+        changed.sort_unstable_by_key(|&(order, _)| order);
+        changed.into_iter().map(|(_, change)| change).collect()
     }
 
     // ---- Jobs --------------------------------------------------------------------------------

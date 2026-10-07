@@ -348,6 +348,130 @@ fn solid_contacts_report_events_only_with_report_contacts() {
 }
 
 #[test]
+fn contacts_with_static_and_kinematic_solids_are_reported() {
+    let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    // A crate lands on a static platform: the sweep stops it on the platform's top, so the two
+    // only touch. The contact starts once and lasts while it rests there.
+    let at = sim.pos(0.5, 4.0, 0.5);
+    let platform = sim
+        .app
+        .world_mut()
+        .spawn((
+            RigidBody::Static,
+            Collider::standing(2.0, 0.5),
+            Teleport(at),
+        ))
+        .id();
+    let crate_ = sim.body(sim.pos(0.5, 6.0, 0.5), (crate_box(), ReportContacts));
+    sim.steps(128);
+    assert_eq!(sim.position(crate_), sim.pos(0.5, 4.5, 0.5));
+    let (a, b) = pair(platform, crate_);
+    assert_eq!(take_collisions(&mut sim), [(true, a, b)]);
+    // Moved off it: the contact ends.
+    let away = sim.pos(5.5, 4.0, 0.5);
+    sim.app
+        .world_mut()
+        .entity_mut(crate_)
+        .insert(Teleport(away));
+    sim.steps(2);
+    assert_eq!(take_collisions(&mut sim), [(false, a, b)]);
+
+    // A player walking into a kinematic wall (stopped by it, touching) reports it while it
+    // presses.
+    let at = sim.pos(-4.5, 5.0, 0.5);
+    let wall = sim
+        .app
+        .world_mut()
+        .spawn((
+            RigidBody::Kinematic,
+            Collider::aabb(DVec3::new(0.5, 1.0, 2.0)),
+            Teleport(at),
+        ))
+        .id();
+    let walker = sim.spawn(
+        sim.pos(-1.5, 4.0, 0.5),
+        (CharacterController::default(), ReportContacts),
+    );
+    sim.app
+        .world_mut()
+        .get_mut::<MoveIntent>(walker)
+        .expect("intent")
+        .wish = Vec2::NEG_X;
+    sim.steps(64);
+    assert!((local(&sim, sim.position(walker)).x - (-3.7)).abs() < 1e-9);
+    let (a, b) = pair(wall, walker);
+    assert_eq!(take_collisions(&mut sim), [(true, a, b)]);
+    sim.steps(32);
+    assert!(take_collisions(&mut sim).is_empty(), "it lasts");
+}
+
+#[test]
+fn a_contact_lasts_when_the_upper_body_sleeps_on_an_awake_one() {
+    let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    wall(&mut sim, [3, 4, -1], [3, 6, 1]);
+    // A character pressed against a wall never rests (it wants to walk), and a crate with
+    // `ReportContacts` stands on its head: the crate falls asleep there.
+    let walker = sim.spawn(sim.pos(1.5, 4.0, 0.5), CharacterController::default());
+    sim.app
+        .world_mut()
+        .get_mut::<MoveIntent>(walker)
+        .expect("intent")
+        .wish = Vec2::X;
+    let crate_ = sim.body(sim.pos(2.5, 7.0, 0.5), (crate_box(), ReportContacts));
+    for _ in 0..256 {
+        sim.steps(1);
+        if sim.asleep(crate_) {
+            break;
+        }
+    }
+    assert!(sim.asleep(crate_));
+    assert!(!sim.asleep(walker));
+    let (a, b) = pair(walker, crate_);
+    assert_eq!(take_collisions(&mut sim), [(true, a, b)]);
+    // It still rests on the awake character: no `CollisionEnded`.
+    sim.steps(64);
+    assert!(sim.asleep(crate_));
+    assert!(take_collisions(&mut sim).is_empty());
+    assert_eq!(sim.app.world().resource::<PhysicsStats>().overlaps, 1);
+}
+
+#[test]
+fn a_projectile_spawned_without_a_dynamic_body_is_no_obstacle() {
+    let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    // `Collider` alone makes the body static: such a projectile never flies, and must not
+    // block anything either.
+    let at = sim.pos(0.5, 5.0, 0.5);
+    sim.app.world_mut().spawn((
+        boxel_physics::Projectile::arrow(),
+        Collider::aabb(DVec3::new(1.0, 0.25, 1.0)),
+        Teleport(at),
+    ));
+    let crate_ = sim.body(sim.pos(0.5, 7.0, 0.5), crate_box());
+    sim.steps(96);
+    assert_eq!(
+        sim.position(crate_),
+        sim.pos(0.5, 4.0, 0.5),
+        "fell through it"
+    );
+}
+
+#[test]
+fn a_box_query_of_the_whole_world_finds_every_body() {
+    let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    let mut crates: Vec<Entity> = (0..12)
+        .map(|i| sim.body(sim.pos(-9.5 + 1.5 * f64::from(i), 4.0, 0.5), crate_box()))
+        .collect();
+    sim.steps(64);
+    crates.sort_unstable_by_key(|e| e.to_bits());
+    let index = sim.app.world().resource::<BodyIndex>();
+    let everything = LocalBox::new(DVec3::splat(f64::NEG_INFINITY), DVec3::splat(f64::INFINITY));
+    assert_eq!(
+        index.overlap_box(sim.pos(0.0, 0.0, 0.0), everything, &BodyFilter::default()),
+        crates
+    );
+}
+
+#[test]
 fn bodies_in_layers_that_do_not_meet_overlap_freely() {
     let mut sim = Sim::new(I64Vec3::ZERO, STEP);
     let a = sim.body(

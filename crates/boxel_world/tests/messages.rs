@@ -158,6 +158,40 @@ fn edits_send_one_block_changed_per_changed_position() {
     app.world_mut().resource_mut::<Log>().blocks.clear();
     app.update();
     assert!(app.world().resource::<Log>().blocks.is_empty());
+
+    // Edits in two chunks, interleaved, one position edited three times: the messages come in
+    // the order positions were first edited, whatever their chunks.
+    let (d, e, f) = (
+        BlockPos::new(40, 4, 1),
+        BlockPos::new(5, 4, 5),
+        BlockPos::new(-3, 4, 2),
+    );
+    edit(&mut app, d, STONE);
+    edit(&mut app, e, STONE);
+    edit(&mut app, d, BlockState::AIR);
+    edit(&mut app, f, STONE);
+    edit(&mut app, d, grass);
+    app.update();
+    assert_eq!(
+        app.world().resource::<Log>().blocks,
+        [
+            BlockChanged {
+                pos: d,
+                old: BlockState::AIR,
+                new: grass,
+            },
+            BlockChanged {
+                pos: e,
+                old: BlockState::AIR,
+                new: STONE,
+            },
+            BlockChanged {
+                pos: f,
+                old: BlockState::AIR,
+                new: STONE,
+            },
+        ]
+    );
 }
 
 #[test]

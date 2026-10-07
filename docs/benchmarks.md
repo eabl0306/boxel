@@ -33,7 +33,8 @@ Cuerpos de física (ADR 0016): `--bodies N` pone N cuerpos sobre el suelo alrede
 la cámara cuando el mundo terminó de cargar, tan repartidos como en los benches de física (10 000
 en un cuadrado de 304 bloques). `--body-kind item` (por defecto) son objetos tirados que caen y se
 duermen; `--body-kind mob` son caminantes que cambian de rumbo y nunca se duermen.
-`--projectiles M` dispara M flechas sobre la misma zona y las vuelve a disparar cada 2 s. Con
+`--projectiles M` dispara M flechas sobre la misma zona y vuelve a disparar cada una cada 2 s,
+con los disparos repartidos en esos 2 s (cerca de la mitad de M en el aire a la vez). Con
 cuerpos, la app suma `PhysicsPlugin` (y su tope de 3 pasos fijos por frame); sin ellos nada
 cambia. El resumen y `tools/bench_report.py` anotan los cuerpos y no mezclan corridas con cuerpos
 distintos. La regla del plan: `--bodies 1000` y `--bodies 10000` (con objetos dormidos) no deben

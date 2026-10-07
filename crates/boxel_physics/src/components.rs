@@ -73,9 +73,13 @@ pub enum Response {
 ///
 /// A collider without a [`RigidBody`] makes a [`RigidBody::Static`] body (it requires one): a
 /// wall, a trigger zone.
+///
+/// It is immutable: to change a body's collider, insert a new one. Physics then sees the one it
+/// replaces, so the bodies asleep on the old shape wake up (a platform that shrinks or turns
+/// into a sensor drops what rests on it).
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 #[require(RigidBody = RigidBody::Static)]
-#[component(on_discard = collider_replaced)]
+#[component(immutable, on_discard = collider_replaced)]
 pub struct Collider {
     /// The shape, centered on its own origin.
     pub shape: Shape,
@@ -147,10 +151,16 @@ impl Collider {
     }
 }
 
-/// [`Collider`]'s discard hook (a new collider replaces it, it is removed, or a despawn): the place a solid
-/// collider leaves is recorded, so the bodies asleep on it wake up (see [`Sleeping`]).
+/// [`Collider`]'s discard hook (a new collider replaces it, it is removed, or a despawn): the
+/// place a solid collider leaves is recorded, so the bodies asleep on it wake up, and a
+/// sleeping body whose collider goes wakes up itself (see [`Sleeping`]). A body that never
+/// stepped has no place yet.
 fn collider_replaced(mut world: DeferredWorld, context: HookContext) {
     let entity = context.entity;
+    if !placed(&world, entity) {
+        return;
+    }
+    disturb(&mut world, entity);
     let (Some(collider), Some(position)) = (
         world.get::<Collider>(entity).copied(),
         world.get::<BodyPosition>(entity).copied(),
@@ -166,17 +176,53 @@ fn collider_replaced(mut world: DeferredWorld, context: HookContext) {
     }
 }
 
-/// Places that solid bodies left since the latest step (a teleport, a changed or removed
-/// collider, a despawn): the sleeping bodies near them wake up in the next step.
+/// A step placed the body (it read its `Transform` or [`Teleport`]): before that its
+/// [`BodyPosition`] is only the default.
+fn placed(world: &DeferredWorld, entity: Entity) -> bool {
+    world
+        .get::<PhysicsSync>(entity)
+        .is_some_and(|sync| sync.placed)
+}
+
+/// A sleeping body changed in a way the wake rules cannot see from its components (its
+/// collider or [`ReportContacts`] went): it wakes up in the next step.
+fn disturb(world: &mut DeferredWorld, entity: Entity) {
+    if world.get::<Sleeping>(entity).is_some()
+        && let Some(mut disturbed) = world.get_resource_mut::<Disturbed>()
+    {
+        disturbed.0.push(entity);
+    }
+}
+
+/// Places that solid bodies left since the latest step (a teleport, a `BodyPosition` write, a
+/// changed or removed collider, a despawn): the sleeping bodies near them wake up in the next
+/// step.
 #[derive(Resource, Default)]
 pub(crate) struct Vacated(pub(crate) Vec<(WorldPos, LocalBox)>);
 
+/// Sleeping bodies whose collider or [`ReportContacts`] was removed or replaced since the latest
+/// step: they wake up in the next one.
+#[derive(Resource, Default)]
+pub(crate) struct Disturbed(pub(crate) Vec<Entity>);
+
 /// Marker: contacts of this solid body with other solid bodies are reported as
-/// [`CollisionStarted`] and [`CollisionEnded`] too (sensor overlaps always are). A contact is a
-/// step where the two overlapped before being pushed apart: a crate resting on another, a
-/// player walking into a mob.
+/// [`CollisionStarted`] and [`CollisionEnded`] too (sensor overlaps always are). A contact lasts
+/// while the two touch or overlap at the end of a step: a crate resting on another, a player
+/// standing on a static platform or pressed against a mob or a wall body. Boxes touch face to
+/// face, within `PhysicsSettings::eps` (grazing an edge does not count); a static or kinematic
+/// body counts as its box ([`Collider::voxel_box`]), as the sweeps of dynamic bodies see it.
+///
+/// Adding or removing it on a sleeping body wakes the body, so its contacts are tested again.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[component(on_add = report_changed, on_remove = report_changed)]
 pub struct ReportContacts;
+
+/// [`ReportContacts`]' add and remove hook: a sleeping body wakes up (see [`disturb`]).
+fn report_changed(mut world: DeferredWorld, context: HookContext) {
+    if placed(&world, context.entity) {
+        disturb(&mut world, context.entity);
+    }
+}
 
 /// Two colliders started to overlap in the latest fixed step (a sensor pair, or a solid pair
 /// with [`ReportContacts`]). `a < b` by `Entity::to_bits`; each pair is reported once until it
@@ -234,10 +280,11 @@ pub struct Velocity(pub DVec3);
 ///
 /// To move a body somewhere else, use [`Teleport`] or write `Transform` (a teleport). A direct
 /// write is kept too, but it is a nudge, not a teleport: the body moves exactly there and keeps
-/// its velocity and [`Contacts`], and `Transform` follows at the end of the step. Do it in a
-/// fixed step (`FixedUpdate`); written in `Update`, the interpolated view of a frame without a
-/// step would slide toward it. If `Transform` was also written since the last step, `Transform`
-/// wins.
+/// its velocity and [`Contacts`], and `Transform` follows at the end of the step. Like a
+/// teleport, it wakes a sleeping body and the bodies asleep on the place it left, and a nudged
+/// static or kinematic body pushes the bodies it lands on. Do it in a fixed step
+/// (`FixedUpdate`); written in `Update`, the interpolated view of a frame without a step would
+/// slide toward it. If `Transform` was also written since the last step, `Transform` wins.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct BodyPosition(pub WorldPos);
 
@@ -301,28 +348,31 @@ pub struct Frozen;
 ///
 /// It wakes up (physics removes the marker) when:
 /// - its [`Velocity`] is set to something other than 0 (a jump, a knockback, a
-///   [`CharacterController`] that wants to walk), or its [`Collider`] or [`BodySettings`]
-///   change;
-/// - it is teleported ([`Teleport`] or a `Transform` write);
+///   [`CharacterController`] that wants to walk), or its [`RigidBody`], [`Collider`],
+///   [`BodySettings`] or [`ReportContacts`] change after it fell asleep;
+/// - it is teleported ([`Teleport`] or a `Transform` write) or nudged (a [`BodyPosition`]
+///   write);
 /// - an awake body pushes it, or a solid body it touches moves (the crate under it is pushed
-///   away), is despawned, teleported away or loses its collider;
+///   away), is despawned, teleported or nudged away, or loses or changes its collider;
 /// - a block within one block of its box changes (`boxel_world::BlockChanged`), or a chunk its
-///   box (plus one block) touches loads or unloads (`boxel_world::ChunkDataEvent`; an unload
-///   then freezes it);
+///   box (plus one block) touches loads (`boxel_world::ChunkDataEvent::Loaded`: the blocks may
+///   have changed while it was away). An unload leaves it asleep: it does not move, so it needs
+///   no blocks;
 /// - `PhysicsSettings` change (gravity, sleeping turned off).
 ///
 /// Insert it to put a body to sleep yourself (its velocity becomes 0 then), remove it to wake
-/// one. On a kinematic body it
-/// stops it; on a static body it changes nothing. A sleeping body still blocks and is found by
-/// rays, box queries and projectiles, and its sensor overlaps stay as they were (no
-/// `CollisionEnded` while both bodies sleep).
+/// one. A body spawned with it (a body loaded from a save) stays asleep where its `Transform`
+/// or [`Teleport`] puts it. On a kinematic body it stops it; on a static body it changes
+/// nothing. A sleeping body still blocks and is found by rays, box queries and projectiles, and
+/// its sensor overlaps stay as they were (no `CollisionEnded` while both bodies sleep).
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[component(storage = "SparseSet", on_add = fell_asleep, on_remove = woke_up)]
 pub struct Sleeping;
 
 /// [`Sleeping`]'s add hook: a sleeping body does not move, so its velocity becomes exactly 0 and
 /// its `Transform` its position (no interpolation left to do). Physics is told (see
-/// [`woke_up`]).
+/// [`woke_up`]). A body that never stepped (spawned asleep) keeps its `Transform`: the next
+/// step places it there.
 fn fell_asleep(mut world: DeferredWorld, context: HookContext) {
     let entity = context.entity;
     if let Some(mut velocity) = world.get_mut::<Velocity>(entity)
@@ -330,7 +380,9 @@ fn fell_asleep(mut world: DeferredWorld, context: HookContext) {
     {
         velocity.0 = DVec3::ZERO;
     }
-    if let Some(position) = world.get::<BodyPosition>(entity).map(|p| p.0) {
+    if placed(&world, entity)
+        && let Some(position) = world.get::<BodyPosition>(entity).map(|p| p.0)
+    {
         let translation = position.to_dvec3();
         if let Some(mut transform) = world.get_mut::<Transform>(entity)
             && transform.translation != translation
@@ -423,8 +475,12 @@ pub struct PhysicsSync {
     pub(crate) net: DVec3,
     /// Steps in a row the body was still (see [`Sleeping`]).
     pub(crate) still: u32,
-    /// The latest step teleported the body (or it was new).
+    /// The latest step placed the body from outside physics: it was new, teleported or nudged
+    /// (a [`BodyPosition`] write). Such a body can disturb others in that step.
     pub(crate) teleported: bool,
+    /// A step placed the body (it read its `Transform` or [`Teleport`]): before that its
+    /// [`BodyPosition`] is only the default.
+    pub(crate) placed: bool,
 }
 
 impl PhysicsSync {
@@ -514,12 +570,15 @@ pub struct VoxelImpact {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum OnBlock {
     /// It sticks: it stops with its center on the block's face and falls asleep at once. It
-    /// stays there until the block changes (then it falls) or something else wakes it.
+    /// stays there until the block goes (then it falls), it is moved (a [`Teleport`], a
+    /// `Transform` or [`BodyPosition`] write) or its [`Velocity`] is set (it flies again).
     #[default]
     Stop,
     /// It bounces off: the velocity along the hit axis turns around, scaled by
     /// `BodySettings::restitution` (and stops on that axis when it is slower than
-    /// `BodySettings::bounce_min_speed` or one step of gravity, as a body's bounces do).
+    /// `BodySettings::bounce_min_speed` or one step of gravity, as a body's bounces do). The
+    /// rest of the step goes on along the face, so a ball that lands slides on (slowed by its
+    /// ground friction).
     Bounce,
 }
 
@@ -527,7 +586,9 @@ pub enum OnBlock {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum OnEntity {
     /// It stops where it touches the body (velocity 0) and falls from there, unless the game
-    /// removes it. The body is not pushed: apply a knockback yourself on [`ProjectileHit`].
+    /// removes it. The body is not pushed: apply a knockback yourself on [`ProjectileHit`]. A
+    /// body it stopped against does not stop it again (one that stopped on a mob's top falls
+    /// through the mob).
     #[default]
     Stop,
     /// It goes through: each body it enters is hit once, and it flies on.
@@ -538,10 +599,14 @@ pub enum OnEntity {
 /// center along a segment that is tested against the voxels (an exact DDA, at any speed) and
 /// against the solid bodies in its layers (their boxes grown by the projectile's half extents:
 /// exact for boxes, a sphere counts as its bounding box). The earliest hit sends a
-/// [`ProjectileHit`] and ends the step there.
+/// [`ProjectileHit`] and ends the step there. In the step after it is spawned or moved (a
+/// teleport or a nudge), a body it starts inside or touching is hit too, at once: a point-blank
+/// shot into a mob hits it.
 ///
-/// Spawn it on a [`RigidBody::Dynamic`] body. Its [`Collider`] (if any) gives the half extents
-/// (the shape's bounding box), its offset and its layers; a projectile without one is a point.
+/// Spawn it on a [`RigidBody::Dynamic`] body (a [`Collider`] alone makes a static one, and a
+/// projectile of another kind never flies; it is never an obstacle either). Its [`Collider`]
+/// (if any) gives the half extents (the shape's bounding box), its offset and its layers; a
+/// projectile without one is a point.
 /// Gravity and drag come from [`BodySettings`] (`BodySettings::arrow()`), with no speed limit.
 /// Projectiles take no part in collisions between bodies (no pushes, no sensor events, not in
 /// the body queries) and do not hit each other.
@@ -660,8 +725,9 @@ pub struct PhysicsSettings {
     /// 0 turns sleeping off (and wakes the sleeping bodies).
     pub sleep_steps: u32,
     /// The step moves the dynamic bodies (and the projectiles) on the compute threads when
-    /// more of them than this are awake (default 256). Each body only reads the world and
-    /// writes itself, so the results are bit-identical either way.
+    /// more of them than this are awake (default 256; static, kinematic and sleeping bodies do
+    /// not count). Each body only reads the world and writes itself, so the results are
+    /// bit-identical either way.
     pub parallel_threshold: usize,
 }
 
@@ -723,8 +789,8 @@ pub struct PhysicsStats {
     pub pairs: usize,
     /// Pushes between solid bodies in the latest step (one per overlapping pair and pass).
     pub pushes: usize,
-    /// Pairs overlapping at the end of the latest step that report events (sensor pairs and
-    /// solid pairs with [`ReportContacts`]).
+    /// Pairs in contact at the end of the latest step that report events (overlapping sensor
+    /// pairs, and touching or overlapping solid pairs with [`ReportContacts`]).
     pub overlaps: usize,
     /// Impacts of the latest step.
     pub impacts: usize,

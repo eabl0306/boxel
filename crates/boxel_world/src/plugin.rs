@@ -11,7 +11,6 @@ use boxel_tasks::{AsyncComputeTaskPool, TaskPool};
 use boxel_transform::Transform;
 use boxel_voxel::{BlockPos, BlockRegistry, BlockState, ChunkKey, ChunkPos, DimensionId};
 use boxel_worldgen::{TerrainGenerator, WorldGenerator};
-use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -162,7 +161,7 @@ pub struct BlockChanged {
 ///
 /// A chunk that unloads and loads again may come back different (edits are not saved yet), so
 /// systems that keep state about the blocks of a chunk refresh it on `Loaded` (physics wakes the
-/// sleeping bodies there; on `Unloaded` too, so they freeze).
+/// sleeping bodies there).
 #[derive(Message, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChunkDataEvent {
     /// The chunk's blocks can be read: generated, known to be all air, or `Missing` after a
@@ -389,44 +388,11 @@ fn apply_edits(
         return;
     }
     let edits = std::mem::take(&mut queue.edits);
-    // Before the edits apply: the states they replace.
-    let changes = block_changes(&map, &edits);
     let mut events = Vec::new();
     let mut cx = Ctx::new(&mut map, &content, &mut events);
-    jobs.apply_edits(&mut cx, edits);
+    let changes = jobs.apply_edits(&mut cx, edits);
     writer.write_batch(events);
     changed.write_batch(changes);
-}
-
-/// What `edits` change, as `apply_edits` applies them (in order, only in `Ready` chunks; the
-/// others are dropped): per position, the state before the first edit and after the last, in
-/// the order positions are first edited, without the positions that end as they were.
-pub(crate) fn block_changes(map: &ChunkMap, edits: &[BlockEdit]) -> Vec<BlockChanged> {
-    let mut changes: Vec<BlockChanged> = Vec::with_capacity(edits.len());
-    // Only a batch with several edits can edit one position twice.
-    let mut seen: HashMap<BlockPos, usize, foldhash::fast::FixedState> = HashMap::default();
-    for edit in edits {
-        if edits.len() > 1
-            && let Some(&at) = seen.get(&edit.pos)
-        {
-            changes[at].new = edit.state;
-            continue;
-        }
-        let (chunk, local) = edit.pos.split();
-        let Some(data) = map.data_at(chunk) else {
-            continue;
-        };
-        if edits.len() > 1 {
-            seen.insert(edit.pos, changes.len());
-        }
-        changes.push(BlockChanged {
-            pos: edit.pos,
-            old: data.get(local),
-            new: edit.state,
-        });
-    }
-    changes.retain(|change| change.old != change.new);
-    changes
 }
 
 /// Publishes the frame's [`ChunkDataEvent`]s, recorded by the map as slots changed (after

@@ -531,10 +531,16 @@ impl Grid {
         let first = out.len();
         let (qmin, qmax) = query.cells(self.shift);
         let span = qmax.saturating_sub(qmin);
+        // A huge query (an infinite box saturates at the `i64` ends) counts as `u128::MAX`
+        // cells: it scans the bodies.
         let cells = if span.min_element() < 0 {
             u128::MAX
         } else {
-            (span.x as u128 + 1) * (span.y as u128 + 1) * (span.z as u128 + 1)
+            let axis = |s: i64| s as u128 + 1;
+            axis(span.x)
+                .checked_mul(axis(span.y))
+                .and_then(|c| c.checked_mul(axis(span.z)))
+                .unwrap_or(u128::MAX)
         };
         if !self.built || cells.saturating_mul(8) > self.bodies.len() as u128 {
             out.extend((0..self.bodies.len() as u32).filter(|&i| self.bounds(i).overlaps(&query)));

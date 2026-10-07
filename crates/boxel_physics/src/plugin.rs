@@ -1,8 +1,8 @@
 //! [`PhysicsPlugin`] and the physics view of the world's blocks.
 
 use crate::components::{
-    CollisionEnded, CollisionStarted, PhysicsSettings, PhysicsStats, ProjectileHit, SleepLog,
-    Vacated, VoxelImpact,
+    CollisionEnded, CollisionStarted, Disturbed, PhysicsSettings, PhysicsStats, ProjectileHit,
+    SleepLog, Vacated, VoxelImpact,
 };
 use crate::contacts::{
     BodyIndex, ContactSet, ObstacleIndex, broadphase, build_obstacles, solve, write_collisions,
@@ -11,8 +11,8 @@ use crate::core::CollisionTable;
 use crate::projectile::{PendingHits, step_projectiles, write_hits};
 use crate::sleep::{sleep_bodies, wake_bodies};
 use crate::systems::{
-    PendingImpacts, PhysicsSystems, drive_characters, interpolate, move_kinematic, prepare_bodies,
-    publish_stats, step_dynamic, write_back, write_events,
+    AwakeCount, PendingImpacts, PhysicsSystems, WritebackTick, drive_characters, interpolate,
+    move_kinematic, prepare_bodies, publish_stats, step_dynamic, write_back, write_events,
 };
 use boxel_app::{
     App, FixedPostUpdate, FixedTime, Last, Plugin, RunFixedMainLoop, RunFixedMainLoopSystems,
@@ -109,6 +109,9 @@ impl Plugin for PhysicsPlugin {
             .init_resource::<ContactSet>()
             .init_resource::<SleepLog>()
             .init_resource::<Vacated>()
+            .init_resource::<Disturbed>()
+            .init_resource::<AwakeCount>()
+            .init_resource::<WritebackTick>()
             .init_resource::<PendingHits>()
             .add_message::<VoxelImpact>()
             .add_message::<CollisionStarted>()

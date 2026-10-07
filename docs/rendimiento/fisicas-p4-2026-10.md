@@ -19,12 +19,49 @@ Las corridas con ventana de stress (`--bodies`) quedan para la medición.
 | `tick/1000` | 0.5 ms | 0.403 ms | 0.260 ms |
 | `grid/10000` | 0.3 ms | 0.480 ms | 0.479 ms (no llega) |
 
-Dos de los tres objetivos nuevos se cumplen. El de 10 000 cuerpos despiertos no: cuesta 2.06 ms
-y el plan pedía 1.5 ms.
+Ojo: esta tabla se midió con el paso en paralelo (la columna P4 de `10000_asleep`,
+`1000_projectiles` y los `tick`, que pasan los 256 cuerpos despiertos), y los objetivos del plan
+son en un hilo salvo el de 10 000 despiertos. La revisión de abajo repite la medición en un
+hilo: `10000_asleep` no llega en un hilo (0.637 ms), y la baja de `tick/1000` se debía sobre
+todo al paso en paralelo, no a dormir.
 
-Los `tick` bajan porque los objetos tirados ahora se duermen: en `tick/1000` quedan 730 cuerpos
-despiertos de 1000. `tick/0` sube 0.6 µs por los sistemas nuevos (despertar, proyectiles,
-dormir), lejos de su objetivo.
+El de 10 000 cuerpos despiertos no llega: cuesta 2.06 ms y el plan pedía 1.5 ms.
+
+`tick/0` sube 0.6 µs por los sistemas nuevos (despertar, proyectiles, dormir), lejos de su
+objetivo.
+
+## Revisión: en un hilo, como piden los objetivos (2026-10-06)
+
+Después de las correcciones de la revisión de P4 (ver el ADR). Los benches nuevos: las
+variantes `_one_thread`, `10000_asleep_chunk_events` (16 cargas de chunk por paso entre los
+dormidos, en chunks que ninguno alcanza) y `sleep_churn` (240 de 2000 cajas dormidas se duermen
+a mano y se despiertan, un paso cada cosa). Los `tick` ahora corren en un hilo.
+
+| Bench | Objetivo | En un hilo | Con el paso en paralelo |
+|---|---|---|---|
+| `scale/10000_asleep` | 0.6 ms | 0.637 ms (no llega) | 0.447 ms |
+| `scale/10000_asleep_chunk_events` | sin objetivo | 0.650 ms | |
+| `scale/sleep_churn` | sin objetivo | 75 µs | |
+| `scale/1000_projectiles` | 0.3 ms | 0.248 ms | 0.156 ms |
+| `scale/10000_awake` | 1.5 ms (en paralelo) | 4.76 ms | 2.08 ms (no llega) |
+| `tick/0` | 20 µs | 1.52 µs | |
+| `tick/100` | 0.05 ms | 28.5 µs | |
+| `tick/1000` | 0.5 ms | 0.355 ms | |
+
+- `10000_asleep` en un hilo se pasa 6 %: los 1000 caminantes cuestan 0.34 ms de movimiento, lo
+  de entre cuerpos 0.28 ms y el resto 0.11 ms. Con el paso en paralelo, como corre un juego,
+  queda en 0.447 ms. Para cumplirlo en un hilo habría que achicar el movimiento de los
+  caminantes o lo de entre cuerpos; queda para el dueño decidir si el objetivo pasa a ser con el
+  paso en paralelo.
+- `tick/1000` en un hilo baja de 0.403 ms (P3) a 0.355 ms: 12 % menos con 27 % de cuerpos
+  dormidos. Los 0.26 ms de la primera tabla eran con el paso en paralelo.
+- 16 cargas de chunk por paso cuestan unos 13 µs con 9000 dormidos: cada una busca sus
+  dormidos en el índice de chunks en vez de recorrerlos todos.
+- Detectar el empujón a mano (`BodyPosition` escrito por el juego) guardando la última
+  posición en `PhysicsSync` costaba de 3 a 6 % en un hilo (`10000_awake_one_thread`,
+  `1000_projectiles_one_thread`, comparado contra el código anterior en la misma máquina). Se
+  cambió por el tick de cambio y quedó igual que antes: 4.60 contra 4.66 ms y 241.0 contra
+  241.5 µs.
 
 ## Dónde se va el tiempo
 
@@ -81,4 +118,4 @@ indexado. Con 90 % de los cuerpos dormidos, el caso de la regla del frame, el pa
 - AMD Ryzen 7 250 (16 hilos, 7 de cómputo), Rust 1.98.1, gobernador `powersave`.
 - `tools/wait-idle.sh 60` pasó justo antes de la corrida. En la misma corrida,
   `sweep/player_walk` dio 0.153 µs y `raycast/sky_1024` 7.1 µs, como en P1 y P3 con la máquina
-  quieta.
+  quieta. En la de la revisión, 0.162 µs y 6.95 µs.

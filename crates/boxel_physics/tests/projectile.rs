@@ -250,6 +250,62 @@ fn a_bouncing_projectile_bounces_and_comes_to_rest() {
 }
 
 #[test]
+fn a_bouncing_projectile_slides_on_after_it_lands() {
+    let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    // Just above the ground, moving along it: each step its fall is stopped by the ground
+    // right away, and the rest of the step goes on along the face.
+    let from = sim.pos(0.5, 4.001, 0.5);
+    let ball = shoot(
+        &mut sim,
+        from,
+        DVec3::new(4.0, 0.0, 0.0),
+        Projectile::new(OnBlock::Bounce, OnEntity::Stop),
+        BodySettings::ball(),
+        (),
+    );
+    sim.steps(64);
+    let at = local(&sim, sim.position(ball));
+    // Ground friction 2 /s from 4 blocks/s: about 1.7 blocks in a second.
+    assert!(at.x > 1.5 + 0.5, "slid {}", at.x - 0.5);
+    assert_eq!(at.y, 4.0 + 1e-7, "on the ground");
+    assert!(sim.get::<Contacts>(ball).on_ground);
+    assert!(take_hits(&mut sim).is_empty(), "too slow to report");
+}
+
+#[test]
+fn a_stuck_arrow_flies_again_when_its_velocity_is_set() {
+    let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    sim.edit(sim.block(10, 5, 0), STONE);
+    sim.idle_frame();
+    let from = sim.pos(0.5, 5.5, 0.5);
+    let arrow = shoot(
+        &mut sim,
+        from,
+        DVec3::new(200.0, 0.0, 0.0),
+        Projectile::arrow(),
+        straight(),
+        (),
+    );
+    sim.steps(8);
+    assert!(sim.asleep(arrow));
+    assert_eq!(
+        sim.get::<Projectile>(arrow).stuck_in(),
+        Some(sim.block(10, 5, 0))
+    );
+    // Pulled out by the game: it wakes and flies back.
+    sim.app
+        .world_mut()
+        .get_mut::<Velocity>(arrow)
+        .expect("arrow")
+        .0 = DVec3::new(-16.0, 0.0, 0.0);
+    sim.steps(8);
+    assert!(!sim.asleep(arrow));
+    assert_eq!(sim.get::<Projectile>(arrow).stuck_in(), None);
+    assert_eq!(sim.get::<Velocity>(arrow).0, DVec3::new(-16.0, 0.0, 0.0));
+    assert!((local(&sim, sim.position(arrow)).x - (10.0 - 1e-7 - 2.0)).abs() < 1e-9);
+}
+
+#[test]
 fn a_piercing_projectile_hits_each_body_once_in_order() {
     let mut sim = Sim::new(I64Vec3::ZERO, STEP);
     let mobs: Vec<Entity> = [8.5, 4.5, 12.5]
@@ -317,7 +373,7 @@ fn ignore_layers_and_sensors_filter_the_hits() {
     let hits = take_hits(&mut sim);
     assert_eq!(hits.len(), 1, "{hits:?}");
     assert_eq!(hits[0].target, ProjectileTarget::Entity(target));
-    // Without `ignore` the shooter is hit (unless it starts inside it).
+    // Without `ignore` the shooter is hit.
     let behind = sim.pos(-1.5, 5.0, 0.5);
     shoot(
         &mut sim,
@@ -330,19 +386,59 @@ fn ignore_layers_and_sensors_filter_the_hits() {
     sim.steps(8);
     let hits = take_hits(&mut sim);
     assert_eq!(hits[0].target, ProjectileTarget::Entity(shooter));
-    // An arrow that starts inside a body does not hit it.
+    let _ = (ghost, item, arrow);
+}
+
+#[test]
+fn a_point_blank_shot_hits_the_body_it_starts_in_once() {
+    let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    let mob = sim.spawn(sim.pos(2.5, 4.0, 0.5), ());
+    sim.steps(2);
+    // Spawned inside the mob (the sandbox's arrow at the eye plus half a block, into a mob
+    // pressed against the player): hit at once, where it starts.
     let inside = sim.pos(2.5, 5.0, 0.5);
-    shoot(
+    let arrow = shoot(
         &mut sim,
         inside,
         DVec3::new(0.0, 0.0, 40.0),
         Projectile::arrow(),
-        straight(),
+        BodySettings::arrow(),
         (),
     );
     sim.steps(1);
-    assert!(take_hits(&mut sim).is_empty());
-    let _ = (ghost, item, arrow);
+    let hits = take_hits(&mut sim);
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].target, ProjectileTarget::Entity(mob));
+    assert_eq!(hits[0].point, inside);
+    assert_eq!(sim.position(arrow), inside);
+    assert_eq!(sim.get::<Velocity>(arrow).0, DVec3::ZERO);
+    // Stopped inside it, it is not hit again: it falls out of the mob onto the ground.
+    sim.steps(64);
+    assert!(
+        take_hits(&mut sim)
+            .iter()
+            .all(|h| h.target != ProjectileTarget::Entity(mob))
+    );
+    assert!(local(&sim, sim.position(arrow)).y < 4.1);
+    // A piercing one spawned inside reports it once too, and flies on.
+    let pierce = shoot(
+        &mut sim,
+        inside,
+        DVec3::new(0.0, 0.0, 40.0),
+        Projectile::new(OnBlock::Stop, OnEntity::Pass),
+        straight(),
+        (),
+    );
+    sim.steps(4);
+    let hits = take_hits(&mut sim);
+    assert_eq!(
+        hits.iter()
+            .filter(|h| h.target == ProjectileTarget::Entity(mob))
+            .count(),
+        1,
+        "{hits:?}"
+    );
+    assert!(local(&sim, sim.position(pierce)).z > 2.0);
 }
 
 #[test]

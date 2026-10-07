@@ -159,6 +159,62 @@ proptest! {
             .collect();
         prop_assert_eq!(found, brute);
     }
+
+    /// The pieces of the parallel broadphase (`pair_ranges`, `pairs_in` on each range in any
+    /// order, then `large_pairs`) give exactly the pairs of `pairs`, each once.
+    #[test]
+    fn split_pairs_equal_pairs(
+        bodies in prop::collection::vec(arb_body(), 0..160),
+        parts in 1usize..16,
+        shift in 0u32..5,
+        base in arb_base(),
+    ) {
+        let mut grid = grid(&bodies, base, shift);
+        let mut pairs = Vec::new();
+        grid.pairs(&mut pairs);
+        let ranges = grid.pair_ranges(parts);
+        prop_assert!(ranges.len() <= parts);
+        prop_assert!(ranges.windows(2).all(|w| w[0].end == w[1].start));
+        prop_assert!(ranges.first().is_none_or(|r| r.start == 0));
+        let mut split = Vec::new();
+        for range in ranges.into_iter().rev() {
+            grid.pairs_in(range, &mut split);
+        }
+        grid.large_pairs(&mut split);
+        split.sort_unstable();
+        prop_assert_eq!(split, pairs);
+    }
+}
+
+#[test]
+fn a_query_wider_than_the_cells_can_count_scans_the_bodies() {
+    // Whole-world and very wide queries (an infinite box saturates at the `i64` ends): more
+    // cells than a `u128` holds. They scan the bodies instead of walking the cells.
+    let bodies: Vec<Body> = (0..20)
+        .map(|i| Body {
+            pos: DVec3::new(f64::from(i) * 3.0 - 30.0, 0.5, 0.5),
+            half: DVec3::splat(0.4),
+            layers: CollisionLayers::default(),
+            active: true,
+        })
+        .collect();
+    for base in [I64Vec3::ZERO, I64Vec3::splat(MAX_BLOCK_COORD - 64)] {
+        let mut grid = grid(&bodies, base, 2);
+        grid.build();
+        let all: Vec<u32> = (0..bodies.len() as u32).collect();
+        for query in [
+            BlockBounds::new(I64Vec3::splat(i64::MIN), I64Vec3::splat(i64::MAX)),
+            BlockBounds::new(I64Vec3::splat(-(1 << 61)), I64Vec3::splat(1 << 61)),
+            BlockBounds::of_box(
+                WorldPos::from_block(BlockPos::from_i64vec3(base), DVec3::ZERO),
+                LocalBox::new(DVec3::splat(f64::NEG_INFINITY), DVec3::splat(f64::INFINITY)),
+            ),
+        ] {
+            let mut found = Vec::new();
+            grid.query(query, &mut found);
+            assert_eq!(found, all, "{query:?}");
+        }
+    }
 }
 
 #[test]
