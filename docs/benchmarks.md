@@ -72,6 +72,10 @@ de la luz (por defecto es `on`). El resumen lo anota y `tools/bench_report.py` n
 con luz distinta. Las corridas viejas sin el dato cuentan como `on` si anotan la hora (llegó con
 la luz) y como `none` si son de antes de la luz.
 
+`--pack DIR` usa las texturas de un resource pack. El resumen anota el pack (`none` con las
+procedurales, también en corridas viejas) y cuánto tardó en cargar, y `tools/bench_report.py` no
+mezcla corridas con texturas distintas.
+
 Para que los números sirvan:
 
 - Siempre en release (las recetas ya lo hacen).
@@ -137,7 +141,7 @@ just bench-report --compare carpeta-antes/ carpeta-despues/
 `--compare` muestra cada número, el cambio en % y si mejoró o empeoró. Si antes era 0 no hay %,
 pero igual dice si empeoró (por ejemplo, tirones nuevos). Si las corridas tienen otra
 configuración (radio, GPU, velocidad), lo avisa. Con dos carpetas empareja las corridas del mismo
-mundo, luz (`--light`), escenario, radio, radio vertical, velocidad, límite de fps, vsync, cuerpos
+mundo, luz (`--light`), texturas (`--pack`), escenario, radio, radio vertical, velocidad, límite de fps, vsync, cuerpos
 (`--bodies`), ediciones (`--edits`), backend, tier y GPU. Una hora distinta (`--time`) solo se anota.
 Si las corridas tienen los datos de ritmo (Pacing), también los compara.
 
