@@ -36,7 +36,7 @@ pub use caves::{
 };
 pub use terrain::{Heightmap, SurfaceBlocks, SurfaceRules};
 
-use crate::{Plants, Tree, Trees, WorldGenerator, block};
+use crate::{Plants, Sea, Tree, Trees, WorldGenerator, block};
 use boxel_voxel::{
     BlockPos, BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SHIFT, CHUNK_SIZE, CHUNK_VOLUME,
     ChunkData, ChunkKey, LocalPos,
@@ -60,10 +60,14 @@ pub struct OverworldSettings {
     /// Short grass and flowers on grass whose top block the caves left solid, after the trees
     /// (`None`: no plants).
     pub plants: Option<Plants>,
+    /// Water up to a sea level over the low columns, sand beaches, and no cave within
+    /// [`Sea::FLOOR`] blocks under the water (ADR 0021; `None`: dry).
+    pub sea: Option<Sea>,
 }
 
 impl Default for OverworldSettings {
-    /// The default heightmap and surface, the default caves (with openings), trees and plants.
+    /// The default heightmap and surface, the default caves (with openings), trees, plants and
+    /// sea.
     fn default() -> Self {
         Self {
             heightmap: Heightmap::default(),
@@ -73,6 +77,7 @@ impl Default for OverworldSettings {
             }),
             trees: Some(Trees::default()),
             plants: Some(Plants::default()),
+            sea: Some(Sea::default()),
         }
     }
 }
@@ -109,6 +114,28 @@ impl OverworldGenerator {
         Self { seed, settings }
     }
 
+    /// The surface rules with the sea's beaches: sand up to `level + beach`.
+    fn rules(&self) -> SurfaceRules {
+        let mut rules = self.settings.surface.clone();
+        if let Some(sea) = self.settings.sea {
+            rules.sand_level = rules.sand_level.max(sea.level.saturating_add(sea.beach));
+        }
+        rules
+    }
+
+    /// True if the sea keeps the caves out of `y` in a column of height `h`: under water, the
+    /// top [`Sea::FLOOR`] blocks of ground are never carved.
+    fn sea_floor(&self, y: i64, h: i64) -> bool {
+        self.settings
+            .sea
+            .is_some_and(|sea| sea.covers(h) && y > h.saturating_sub(Sea::FLOOR))
+    }
+
+    /// The sea, if `boxel:water` is in `registry`, with its water.
+    fn sea_water(&self, registry: &BlockRegistry) -> Option<(Sea, BlockState)> {
+        Some((self.settings.sea?, registry.by_name("boxel:water")?))
+    }
+
     /// Surface height of column `(x, z)` (before the caves).
     pub fn height_at(&self, x: i64, z: i64) -> i64 {
         self.settings.heightmap.height_at(self.seed, x, z)
@@ -126,10 +153,12 @@ impl OverworldGenerator {
 
     /// True if the caves carve `p`, in a column of height `h` (the spec).
     fn carves(&self, p: BlockPos, h: i64) -> bool {
-        self.settings
-            .caves
-            .as_ref()
-            .is_some_and(|caves| caves.carves(self.seed, p, h, |x, z| self.height_at(x, z)))
+        !self.sea_floor(p.y, h)
+            && self
+                .settings
+                .caves
+                .as_ref()
+                .is_some_and(|caves| caves.carves(self.seed, p, h, |x, z| self.height_at(x, z)))
     }
 
     /// The cave density at voxel `p` (the trilinear sum of its cell's corners in density units;
@@ -146,7 +175,14 @@ impl OverworldGenerator {
         let h = self.height_at(p.x, p.z);
         if p.y <= h && !self.carves(p, h) {
             let blocks = SurfaceBlocks::new(registry, NAME);
-            return self.settings.surface.block_at(&blocks, h, p.y);
+            return self.rules().block_at(&blocks, h, p.y);
+        }
+        if let Some((sea, water)) = self.sea_water(registry)
+            && sea.covers(h)
+            && p.y > h
+            && p.y <= sea.level
+        {
+            return water;
         }
         let (Some(trees), Some(log), Some(leaves)) = (
             &self.settings.trees,
@@ -157,7 +193,7 @@ impl OverworldGenerator {
         };
         let tree = trees.block_at(self.seed, p, |x, z| {
             let ground = self.height_at(x, z);
-            let grows = self.settings.surface.is_grass(ground)
+            let grows = self.rules().is_grass(ground)
                 && self.is_solid_in(BlockPos::new(x, ground, z), ground);
             grows.then_some(ground)
         });
@@ -175,7 +211,7 @@ impl OverworldGenerator {
             return BlockState::AIR;
         };
         let grows = p.y == h + 1
-            && self.settings.surface.is_grass(h)
+            && self.rules().is_grass(h)
             && self.is_solid_in(BlockPos::new(p.x, h, p.z), h);
         match plants.plant_at(self.seed, p.x, p.z) {
             Some(kind) if grows => blocks.of(kind),
@@ -200,18 +236,26 @@ impl OverworldGenerator {
             .caves
             .as_ref()
             .map_or(0, |c| c.settings.surface_reach());
-        caves.max(self.settings.surface.dirt_depth)
+        let sea = if self.settings.sea.is_some() {
+            Sea::FLOOR
+        } else {
+            0
+        };
+        caves.max(sea).max(self.settings.surface.dirt_depth)
     }
 
     /// True if every voxel of the chunk layer starting at `y0` is stone before carving and
     /// under the cave roof in a column of height `lowest` or more (so below every tree too).
     fn under_surface_rules(&self, y0: i64, lowest: i64) -> bool {
         let size = i64::from(CHUNK_SIZE);
-        let roof = self
+        let mut roof = self
             .settings
             .caves
             .as_ref()
             .map_or(i64::MIN, |c| c.settings.surface_fade.roof);
+        if self.settings.sea.is_some() {
+            roof = roof.max(Sea::FLOOR);
+        }
         y0 + size <= lowest.saturating_sub(self.settings.surface.dirt_depth)
             && y0 + size - 1 <= lowest.saturating_sub(roof)
     }
@@ -251,13 +295,22 @@ impl OverworldGenerator {
         let blocks = SurfaceBlocks::new(registry, NAME);
         let y0 = origin.y;
         let mut dense = vec![BlockState::AIR; CHUNK_VOLUME];
+        let rules = self.rules();
+        let sea = self.sea_water(registry);
+        // World y to chunk-local y, clamped to the chunk.
+        let local = |y: i64| (y.saturating_sub(y0)).clamp(0, CHUNK_SIZE.into()) as usize;
         for (column, &h) in heights.iter().enumerate() {
             // `LocalPos` index: y << 10 | x << 5 | z, and `column` is x << 5 | z.
-            self.settings
-                .surface
-                .fill_column(&blocks, h, y0, |ly, state| {
-                    dense[(ly << (2 * CHUNK_SHIFT)) | column] = state;
-                });
+            rules.fill_column(&blocks, h, y0, |ly, state| {
+                dense[(ly << (2 * CHUNK_SHIFT)) | column] = state;
+            });
+            if let Some((sea, water)) = sea
+                && sea.covers(h)
+            {
+                for ly in local(h.saturating_add(1))..local(sea.level.saturating_add(1)) {
+                    dense[(ly << (2 * CHUNK_SHIFT)) | column] = water;
+                }
+            }
         }
         let Some(caves) = &self.settings.caves else {
             return dense;
@@ -284,7 +337,8 @@ impl OverworldGenerator {
                 let lz = carved.trailing_zeros() as usize;
                 carved &= carved - 1;
                 let column = (lx << CHUNK_SHIFT) | lz;
-                if y <= heights[column].saturating_sub(roof) {
+                let h = heights[column];
+                if y <= h.saturating_sub(roof) && !self.sea_floor(y, h) {
                     dense[(ly << (2 * CHUNK_SHIFT)) | column] = BlockState::AIR;
                 }
             }
@@ -294,7 +348,7 @@ impl OverworldGenerator {
 
     /// Ground heights trees may grow on.
     fn tree_grounds(&self) -> RangeInclusive<i64> {
-        let s = &self.settings.surface;
+        let s = self.rules();
         s.sand_level + 1..=s.snow_level.min(self.settings.heightmap.max_height())
     }
 
@@ -321,7 +375,7 @@ impl OverworldGenerator {
             let (lx, lz) = (x - origin.x, z - origin.z);
             let ground = heights[((lx << CHUNK_SHIFT) | lz) as usize];
             // Only trees with a block in this chunk need the (dearer) ground check.
-            if !self.settings.surface.is_grass(ground)
+            if !self.rules().is_grass(ground)
                 || ground + 1 >= origin.y + size
                 || ground + Trees::HEIGHT < origin.y
             {
@@ -357,7 +411,7 @@ impl OverworldGenerator {
             for lz in 0..size {
                 let ground = heights[((lx << CHUNK_SHIFT) | lz) as usize];
                 let ly = ground + 1 - origin.y;
-                if !(0..size).contains(&ly) || !self.settings.surface.is_grass(ground) {
+                if !(0..size).contains(&ly) || !self.rules().is_grass(ground) {
                     continue;
                 }
                 let (x, z) = (origin.x + lx, origin.z + lz);
@@ -402,7 +456,8 @@ impl WorldGenerator for OverworldGenerator {
         let heightmap = &self.settings.heightmap;
         let origin = key.pos.origin();
         let (y0, size) = (origin.y, i64::from(CHUNK_SIZE));
-        if y0 > heightmap.max_height() + self.reach_above() {
+        let sea_top = self.settings.sea.map_or(i64::MIN, |sea| sea.level);
+        if y0 > (heightmap.max_height() + self.reach_above()).max(sea_top) {
             return ChunkData::uniform(BlockState::AIR);
         }
         let stone = || block(registry, "boxel:stone", NAME);
@@ -431,8 +486,8 @@ impl WorldGenerator for OverworldGenerator {
         }
         // Air above the terrain, or the dense path; trees go into the dense voxels before they
         // are encoded once.
-        let mut dense =
-            (y0 <= highest).then(|| self.surface_voxels(origin, &heights, highest, registry));
+        let mut dense = (y0 <= highest.max(sea_top))
+            .then(|| self.surface_voxels(origin, &heights, highest, registry));
         let (trees, log, leaves) = self.trees_in(origin, &heights, dense.as_deref(), registry);
         if !trees.is_empty() {
             let dense = dense.get_or_insert_with(|| vec![BlockState::AIR; CHUNK_VOLUME]);
@@ -448,7 +503,10 @@ impl WorldGenerator for OverworldGenerator {
     /// `i64::MIN ..= (max_height + 1 + tree height) >> 5`: no floor, and air above the highest
     /// possible column and tree.
     fn vertical_chunks(&self) -> RangeInclusive<i64> {
-        let top = self.settings.heightmap.max_height() + 1 + self.reach_above();
+        let mut top = self.settings.heightmap.max_height() + 1 + self.reach_above();
+        if let Some(sea) = self.settings.sea {
+            top = top.max(sea.level);
+        }
         i64::MIN..=top >> CHUNK_SHIFT
     }
 

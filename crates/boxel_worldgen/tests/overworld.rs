@@ -293,9 +293,10 @@ fn heightmap_equals_the_terrain_generator() {
             assert_eq!(h, i64::from(terrain.height_at(cx, cz)));
         }
     }
-    // Without caves and trees the overworld is the terrain without its bedrock floor.
+    // Without caves, trees and sea the overworld is the terrain without its bedrock floor.
     let r = registry();
-    let plain = with_caves(None, false);
+    let mut plain = with_caves(None, false);
+    plain.settings.sea = None;
     for (cx, cz) in [(0, 0), (9, -4), ((1 << 26) - 1, 1 << 35)] {
         for y in -1..=3 {
             let pos = ChunkPos::new(cx, y, cz);
@@ -369,6 +370,7 @@ fn forest_keeps_the_recorded_trees() {
     // The fingerprints predate the plants (ADR 0018): without them, the same chunks.
     let forest = ForestGenerator {
         plants: None,
+        sea: None,
         ..ForestGenerator::default()
     };
     let r = registry();

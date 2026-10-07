@@ -1,6 +1,6 @@
 //! [`ForestGenerator`]: the M0 terrain with trees, the default world of the examples.
 
-use crate::{PlantBlocks, Plants, TerrainGenerator, TerrainSettings, Trees, WorldGenerator};
+use crate::{PlantBlocks, Plants, Sea, TerrainGenerator, TerrainSettings, Trees, WorldGenerator};
 use boxel_voxel::{BlockPos, BlockRegistry, BlockState, CHUNK_SIZE, ChunkData, ChunkKey, LocalPos};
 use std::ops::RangeInclusive;
 
@@ -28,33 +28,43 @@ pub struct ForestGenerator {
     pub trees: Trees,
     /// Short grass and flowers on grass, after the trees (`None`: no plants).
     pub plants: Option<Plants>,
+    /// Water up to a sea level over the low columns, with sand beaches (ADR 0021; `None`: dry,
+    /// the terrain as it was).
+    pub sea: Option<Sea>,
 }
 
 impl Default for ForestGenerator {
-    /// The default terrain with the default trees and plants.
+    /// The default terrain with the default trees, plants and sea.
     fn default() -> Self {
         Self {
             terrain: TerrainGenerator::default(),
             trees: Trees::default(),
             plants: Some(Plants::default()),
+            sea: Some(Sea::default()),
         }
     }
 }
 
 impl ForestGenerator {
-    /// New generator with the default trees and plants.
+    /// New generator with the default trees, plants and sea.
     pub fn new(seed: u64, settings: TerrainSettings) -> Self {
         Self {
             terrain: TerrainGenerator::new(seed, settings),
             trees: Trees::default(),
             plants: Some(Plants::default()),
+            sea: Some(Sea::default()),
         }
     }
 
-    /// Ground heights trees may grow on: grass, `sand_level + 1 ..= snow_level`.
+    /// Ground heights trees may grow on: grass, `sand_level + 1 ..= snow_level`, above the
+    /// beaches of the sea.
     fn grounds(&self) -> RangeInclusive<i64> {
         let s = &self.terrain.settings;
-        i64::from(s.sand_level) + 1..=s.snow_level.into()
+        let mut sand = i64::from(s.sand_level);
+        if let Some(sea) = self.sea {
+            sand = sand.max(sea.level.saturating_add(sea.beach));
+        }
+        sand + 1..=s.snow_level.into()
     }
 
     /// Puts the plants of the chunk at `origin` on the air cells above grass. Only the columns
@@ -93,7 +103,7 @@ impl ForestGenerator {
 
 impl WorldGenerator for ForestGenerator {
     fn generate(&self, key: ChunkKey, registry: &BlockRegistry) -> ChunkData {
-        let mut data = self.terrain.generate(key, registry);
+        let mut data = self.terrain.generate_with(key, registry, self.sea);
         let origin = key.pos.origin();
         if let (Some(log), Some(leaves)) = (
             registry.by_name("boxel:log"),
@@ -115,7 +125,7 @@ impl WorldGenerator for ForestGenerator {
     }
 
     fn vertical_chunks(&self) -> RangeInclusive<i64> {
-        let inner = self.terrain.vertical_chunks();
+        let inner = self.terrain.vertical_chunks_with(self.sea);
         let tree_top = (self.grounds().end() + Trees::HEIGHT) >> 5;
         *inner.start()..=(*inner.end()).max(tree_top)
     }

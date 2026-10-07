@@ -17,6 +17,7 @@ mod forest;
 pub mod noise;
 pub mod overworld;
 mod plants;
+mod sea;
 mod trees;
 
 pub use forest::ForestGenerator;
@@ -25,6 +26,7 @@ pub use overworld::{
     CaveSettings, Caves, Heightmap, OverworldGenerator, OverworldSettings, SurfaceRules,
 };
 pub use plants::{PlantBlocks, PlantKind, Plants};
+pub use sea::Sea;
 pub use trees::{Tree, TreeBlock, Trees};
 
 /// A chunk generator.
@@ -233,15 +235,51 @@ impl WorldGenerator for TerrainGenerator {
     /// `bottom`) or below `bottom` are Uniform air, chunks fully inside the stone layer are
     /// Uniform stone. `key.lod` is ignored (M0 only generates lod 0).
     fn generate(&self, key: ChunkKey, registry: &BlockRegistry) -> ChunkData {
+        self.generate_with(key, registry, None)
+    }
+    /// `(bottom >> 5) ..= ((base_height + ceil(|amplitude|) + 1) >> 5)`; the end never goes below
+    /// the chunk of `bottom` (degenerate settings with the floor above every column).
+    fn vertical_chunks(&self) -> RangeInclusive<i64> {
+        self.vertical_chunks_with(None)
+    }
+    fn name(&self) -> &str {
+        "terrain"
+    }
+}
+
+impl TerrainGenerator {
+    /// [`WorldGenerator::vertical_chunks`] with `sea` (its water may rise above every column).
+    pub(crate) fn vertical_chunks_with(&self, sea: Option<Sea>) -> RangeInclusive<i64> {
+        let bottom = self.settings.bottom;
+        let mut top = self.max_possible_height().saturating_add(1).max(bottom);
+        if let Some(sea) = sea {
+            top = top.max(sea_level_i32(sea));
+        }
+        i64::from(bottom >> CHUNK_SHIFT)..=i64::from(top >> CHUNK_SHIFT)
+    }
+
+    /// [`WorldGenerator::generate`] with `sea`: source water from above each low column up to
+    /// the sea level and sand on the columns of [`Sea::sandy`] (no water without `boxel:water`
+    /// in the registry). `None` is the terrain as it was.
+    pub(crate) fn generate_with(
+        &self,
+        key: ChunkKey,
+        registry: &BlockRegistry,
+        sea: Option<Sea>,
+    ) -> ChunkData {
         let s = &self.settings;
         let origin = key.pos.origin();
+        let water = sea.and_then(|_| registry.by_name("boxel:water"));
+        let sea = sea.filter(|_| water.is_some());
+        // The highest block of any column: its top, or the water over it.
+        let sea_top = sea.map_or(i32::MIN, sea_level_i32);
         let y0 = origin.y;
         let y1 = y0 + i64::from(CHUNK_SIZE - 1);
         // Heights and settings are i32; the chunk's y range is compared in i64.
         let bottom = i64::from(s.bottom);
         // Fast paths that need no heights: above every column, below the floor, and (the rule
         // below with the lowest possible column) fully inside the stone.
-        if y1 < bottom || y0 > i64::from(self.max_possible_height().max(s.bottom)) {
+        if y1 < bottom || y0 > i64::from(self.max_possible_height().max(s.bottom).max(sea_top)) {
             return ChunkData::uniform(BlockState::AIR);
         }
         if y0 > bottom && y1 < i64::from(self.min_possible_height().saturating_sub(s.dirt_depth)) {
@@ -253,7 +291,7 @@ impl WorldGenerator for TerrainGenerator {
             .iter()
             .fold((i32::MAX, i32::MIN), |(lo, hi), &h| (lo.min(h), hi.max(h)));
         // `max(bottom)`: the bedrock floor exists even under (degenerate) terrain below it.
-        if y0 > i64::from(max_h.max(s.bottom)) {
+        if y0 > i64::from(max_h.max(s.bottom).max(sea_top)) {
             return ChunkData::uniform(BlockState::AIR);
         }
         let stone = block(registry, "boxel:stone", "TerrainGenerator");
@@ -265,8 +303,10 @@ impl WorldGenerator for TerrainGenerator {
         let grass = block(registry, "boxel:grass", "TerrainGenerator");
         let sand = block(registry, "boxel:sand", "TerrainGenerator");
         let snow = block(registry, "boxel:snow", "TerrainGenerator");
+        let water = water.unwrap_or(BlockState::AIR);
+        let sandy = |h: i32| sea.is_some_and(|sea| sea.sandy(i64::from(h)));
         let top_block = |h: i32| {
-            if h <= s.sand_level {
+            if h <= s.sand_level || sandy(h) {
                 sand
             } else if h > s.snow_level {
                 snow
@@ -281,13 +321,14 @@ impl WorldGenerator for TerrainGenerator {
             // The column rules as runs: each voxel takes the first run whose end is above it,
             // starting at `bottom` (below is air), so a run that ends below the previous one
             // is empty. Ends: bedrock `bottom + 1`, stone `h - dirt_depth`, dirt `h`, top
-            // `h + 1`; air above.
+            // `h + 1`, sea water `sea level + 1`; air above.
             let mut from = s.bottom;
             for (end, state) in [
                 (s.bottom.saturating_add(1), bedrock),
                 (h.saturating_sub(s.dirt_depth), stone),
                 (h, dirt),
                 (h.saturating_add(1), top_block(h)),
+                (sea_top.saturating_add(1), water),
             ] {
                 let end = end.max(from);
                 for ly in local(from)..local(end) {
@@ -299,16 +340,11 @@ impl WorldGenerator for TerrainGenerator {
         }
         ChunkData::from_dense(&dense)
     }
-    /// `(bottom >> 5) ..= ((base_height + ceil(|amplitude|) + 1) >> 5)`; the end never goes below
-    /// the chunk of `bottom` (degenerate settings with the floor above every column).
-    fn vertical_chunks(&self) -> RangeInclusive<i64> {
-        let bottom = self.settings.bottom;
-        let top = self.max_possible_height().saturating_add(1).max(bottom);
-        i64::from(bottom >> CHUNK_SHIFT)..=i64::from(top >> CHUNK_SHIFT)
-    }
-    fn name(&self) -> &str {
-        "terrain"
-    }
+}
+
+/// The sea level as a terrain height (`i32`, saturating).
+fn sea_level_i32(sea: Sea) -> i32 {
+    sea.level.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
 /// State of block `name`; panics with the name if `registry` lacks it (a programmer error: the
