@@ -149,7 +149,8 @@ trace = [
 trace_tracy = ["trace", "boxel_log/tracy"]
 # Vulkan escape hatch (Windows/Linux only; a no-op elsewhere).
 hal = ["boxel_gfx?/hal"]
-# Minecraft Java resource-pack reader (textures, models, blockstates). Not wired to render yet.
+# Minecraft Java resource-pack reader (textures, models, blockstates). The renderer reads packs
+# through boxel_render::TextureSource either way; this re-exports the reader as boxel::pack.
 pack = ["dep:boxel_pack"]
 
 [dependencies]

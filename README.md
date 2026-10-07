@@ -59,7 +59,8 @@ Opciones útiles: `--fps-limit N` (0 = sin límite), `--vsync on|off`, `--seed N
 `--view-distance N` (en chunks), `--vertical-radius N` (chunks hacia arriba y hacia abajo, 8 por
 defecto), `--size 1280x720`, `--camera x,y,z,yaw,pitch` (ángulos en grados), `--tier high|mid|low`,
 `--time HH:MM` (hora de inicio, 12:00 por defecto), `--lamps` (pone lámparas de color y lava
-alrededor del inicio y empieza de noche), `--help` (lista todo).
+alrededor del inicio y empieza de noche), `--pack DIR` (texturas de un resource pack de Minecraft
+Java, la carpeta con `pack.mcmeta`; sin él son procedurales), `--help` (lista todo).
 `--world overworld` muestra el mundo con cuevas (piedra infinita hacia abajo) en vez del bosque
 de siempre; `--caves mc|closed|off` elige las cuevas y `--no-trees` saca los árboles.
 Para pruebas automáticas usa siempre `--frames N --timeout SEG`: la ventana se cierra sola y el
@@ -112,8 +113,8 @@ cargo run --release --example snapshot -- --camera 194,67,-48,12,-30 \
 
 Opciones: `--place lamp_red@X,Y,Z` (pone un bloque), `--drop NOMBRE@X,Y,Z` (lo deja en el suelo
 bajo ese punto), `--fill NOMBRE@X,Y,Z:X,Y,Z` (llena una caja; `air` cava), `--light off --ao off`
-(el aspecto de antes de la luz), `--view-distance N`, `--size WxH`, las de mundo (`overworld` por
-defecto) y las de GPU (`--adapter nvidia`), `--help`. Imprime qué hay en el centro de la vista y
+(el aspecto de antes de la luz), `--pack DIR` (texturas de un resource pack), `--view-distance N`,
+`--size WxH`, las de mundo (`overworld` por defecto) y las de GPU (`--adapter nvidia`), `--help`. Imprime qué hay en el centro de la vista y
 su luz, para apuntar.
 
 **gpu_info**: lista los adaptadores, cómo los clasifica boxel y qué elige.

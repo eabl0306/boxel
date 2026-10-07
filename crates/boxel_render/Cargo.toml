@@ -26,6 +26,8 @@ boxel_shaders.workspace = true
 boxel_voxel.workspace = true
 boxel_mesh.workspace = true
 boxel_world.workspace = true
+# Block textures from a Minecraft resource pack (TextureSource::Pack).
+boxel_pack.workspace = true
 wgpu.workspace = true
 bytemuck.workspace = true
 foldhash.workspace = true

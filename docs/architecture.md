@@ -152,9 +152,9 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_light` | luz de vóxeles en CPU, sin ECS ni GPU (ADR 0015): techos de cielo por columna (`SkyTile`, caminata hacia abajo), luz exacta de un chunk desde una caja de 64³ (cielo y RGB, caminos rápidos para cuevas oscuras y cielo abierto), `PaddedLight`, `ChunkLight`; oráculo global para los tests | voxel |
 | `boxel_worldgen` | trait `WorldGenerator`; generadores `FlatGenerator`, `TerrainGenerator`, `ForestGenerator` (terreno con árboles) y `OverworldGenerator` (superficie sobre piedra infinita hacia abajo, con cuevas y árboles; etapas en `overworld`: `Heightmap`, `SurfaceRules`, `Caves`, más `Trees`); ruido 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`) | voxel |
 | `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, mensajes (`ChunkMeshEvent`, `BlockChanged`, `ChunkDataEvent`), `ChunkStore`, reloj del mundo (`TimeOfDay`, `DaylightCurve`, `DaylightPlugin`) | app, voxel, mesh, light, worldgen, transform, diagnostic |
-| `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `SceneLight` (luz del cielo, ambiente y curva de brillo del frame), `PresentSettings` (vsync en tiempo de ejecución), texturas procedurales, screenshots | gfx, shaders, world, camera, window |
+| `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `SceneLight` (luz del cielo, ambiente y curva de brillo del frame), `PresentSettings` (vsync en tiempo de ejecución), texturas procedurales o de un resource pack (`TextureSource`), screenshots | gfx, shaders, world, camera, window, pack |
 | `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::solid`), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas, el integrador de un cuerpo (`step_body`, `predict`), el narrowphase (`shape_contact`) y la grilla del broadphase (`Grid`). Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`; pasos en `FixedPostUpdate`, interpolación en `AfterFixedMainLoop`), `PhysicsQuery` (rayos a vóxeles y cuerpos, cajas, el chequeo para poner bloques), `BodyIndex`, cuerpos (`RigidBody`, `Collider`, `Velocity`, `BodyPosition`, `Contacts`, `Interpolated`, `Teleport`, `Frozen`, `Sleeping`, `ReportContacts`), `CharacterController`, `Projectile` y los mensajes `VoxelImpact`, `CollisionStarted`, `CollisionEnded` y `ProjectileHit`. Los cuerpos quietos se duermen (despiertan con `BlockChanged` y `ChunkDataEvent` del mundo, entre otras cosas) y, con muchos cuerpos despiertos, el paso corre en los hilos de cómputo. Fases P0 a P4 hechas | ecs, app, math, tasks, transform, voxel, world, diagnostic |
-| `boxel_pack` | lector de resource packs de Minecraft Java (formatos ~64 a 120): `pack.mcmeta` con overlays, texturas de bloque PNG a RGBA8 (animaciones `.png.mcmeta`), modelos de bloque con herencia `parent` y variables `#`, blockstates `variants` y `multipart`. Solo datos; no conecta al render ni al registro | (serde, png) |
+| `boxel_pack` | lector de resource packs de Minecraft Java (formatos ~64 a 120): `pack.mcmeta` con overlays, texturas de bloque PNG a RGBA8 (animaciones `.png.mcmeta`), modelos de bloque con herencia `parent` y variables `#`, blockstates `variants` y `multipart`. Solo datos; `boxel_render` lo usa para las texturas de bloque | (serde, png) |
 | `boxel_facade_check` | solo CI: prueba que los derives resuelven `::boxel::ecs` para un usuario que depende solo de `boxel` | fachada |
 | `vendor/*` (7 crates) | ECS y tareas (fork de Bevy) | - |
 
@@ -862,10 +862,30 @@ cambia el layout.
 | Luz por quad | buffer `VERTEX | COPY_DST` paralelo al arena y del mismo tamaño, reservado entero al crear el renderer (64 MiB con el arena por defecto, haya quads o no): en el offset de cada quad, su entrada de paleta ya expandida (segundo atributo de instancia) | Low |
 | Tabla CPU | espejo en CPU (origen `i64`, rangos, contadores) para culling en CPU | todos |
 | Índice compartido | u32 `[0,1,2,2,1,3] + 4i` para 98 304 quads (2.36 MB) | High, Mid |
-| Textura de bloques | `texture_2d_array` RGBA8 sRGB 16x16 con mips, procedural en M0 | todos |
+| Textura de bloques | `texture_2d_array` RGBA8 sRGB con mips hasta 1x1; 16x16 procedural, o el tamaño más común de un resource pack (ver abajo) | todos |
 | View uniform | 336 B (std140, solo `vec4`): `view_proj`, 6 planos, origen de render, cámara relativa, niebla, contadores, `sky_light` (color del cielo por la luz del día y piso de ambiente), `light_params` (fuerza del AO, ganancia de la luz de bloque) y `light_curve` (brillo de los 16 niveles) | todos |
 | Color principal | `Rgba8UnormSrgb` (`RENDER_ATTACHMENT | COPY_SRC | TEXTURE_BINDING`), luego blit a la superficie (alfa siempre 1); facilita screenshots | todos |
 | Profundidad | `Depth32Float` | todos |
+
+Texturas de un resource pack (`RenderSettings::textures = TextureSource::Pack(dir)`, `--pack DIR`
+en los ejemplos): el pack solo cambia los píxeles de las capas del registro. Ids, orden, mips,
+sampler y subida son los mismos, así que los tres tiers lo ven igual.
+
+- Cada capa del registro tiene una receta (`boxel_render::pack_textures`): el bloque de Minecraft
+  cuyo blockstate y modelo dan la textura (por ejemplo `cube_column` para tronco arriba y lado), y
+  nombres por defecto si el pack no trae modelo (`block/stone`, `block/grass_block_top`...). Las
+  lámparas usan `glowstone`, `shroomlight`, `sea_lantern` y `redstone_lamp_on`. Una capa que no
+  es del registro de serie prueba `block/<nombre>`.
+- Si falta la textura, la capa queda procedural y se anota un aviso en `RenderInfo::textures`.
+- Tinte fijo de bioma (llanura) horneado en los píxeles: pasto `#91BD59`, follaje `#77AB2F`,
+  agua `#3F76E4`. El lado del pasto compone `grass_block_side_overlay` teñido encima.
+- Tamaño: el ancho más común de las texturas del pack (potencia de dos, máximo 512); las demás se
+  escalan por vecino más cercano. Mips por caja en espacio lineal; las capas cutout guardan alfa
+  binario en cada mip, las opacas alfa 255.
+- Animadas (agua, lava, sea lantern): solo el primer frame. **Pendiente:** animarlas.
+- Se carga una vez al elegir la primera GPU (también en una recuperación por pérdida de
+  dispositivo se reutiliza). Cuesta unos 20 a 50 ms con caché de disco caliente y 200 a 330 ms
+  en frío con los packs de prueba; queda en `RenderInfo::textures::load_time`.
 
 Layouts de bind groups (congelados): grupo 0 estático (textura + sampler), grupo 1 por frame
 (view), grupo 2 geometría (arena + tabla, solo lectura, vertex) en High/Mid. Lo pesado y estático

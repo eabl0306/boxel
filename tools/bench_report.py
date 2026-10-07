@@ -7,8 +7,9 @@ usage:
 
 RUN, BASE and NEW are summary files (Markdown with a JSON block, or plain JSON) or directories
 (every summary inside, not recursive). Comparing two directories pairs the runs with the same
-world, light (--light), scenario, radius, vertical radius, speed, fps limit, vsync, physics
-bodies (--bodies), scripted edits (--edits), backend, tier and adapter; a different clock time (--time)
+world, light (--light), block textures (--pack; runs from before it are 'none', procedural),
+scenario, radius, vertical radius, speed, fps limit, vsync, physics bodies (--bodies), scripted
+edits (--edits), backend, tier and adapter; a different clock time (--time)
 only gets a note, since day and night change no mesh. Light is 'on', 'off' or 'none' (runs from
 before the light render, without a clock, had no voxel light); runs with a clock but from before
 --light had it on. A metric that was 0 in BASE has no percent change ('n/a') but still gets a
@@ -75,6 +76,7 @@ PACING_METRICS = [
 SETTINGS = [
     ('world', ('run', 'world')),
     ('light', ('run', 'light')),
+    ('pack', ('run', 'pack')),
     ('scenario', ('run', 'scenario')),
     ('radius', ('run', 'radius')),
     ('vertical', ('run', 'vertical')),
@@ -141,6 +143,9 @@ def load(path):
         # else from before the light ('none').
         if not run.get('light'):
             run['light'] = 'on' if run['time'] else 'none'
+        # Runs from before --pack used the procedural textures.
+        if not run.get('pack'):
+            run['pack'] = 'none'
         # Whether the run had --edits (the world's edit latency, null without them).
         run['edits'] = get(data, ('world', 'edits')) is not None
     return data
@@ -181,6 +186,8 @@ def title(run):
         text += f" {r['world']}"
     if r.get('light') == 'off':
         text += ' light off'
+    if r.get('pack', 'none') != 'none':
+        text += f" pack {r['pack']}"
     if r.get('fps_limit'):
         text += f" limit {r['fps_limit']} fps"
     if r.get('vsync') == 'on':
@@ -193,10 +200,11 @@ def title(run):
 
 
 def key(run):
-    """Runs with the same key are comparable (same world, light, scenario, radius, height, speed,
-    fps limit, vsync, physics bodies, scripted edits and GPU)."""
+    """Runs with the same key are comparable (same world, light, textures, scenario, radius,
+    height, speed, fps limit, vsync, physics bodies, scripted edits and GPU)."""
     r = run['run']
-    return (r.get('world', 'forest'), r.get('light', 'none'), r['scenario'], r['radius'],
+    return (r.get('world', 'forest'), r.get('light', 'none'), r.get('pack') or 'none',
+            r['scenario'], r['radius'],
             r.get('vertical', 'fixed'), r['speed'], r.get('fps_limit') or 0,
             r.get('vsync') or 'off', r.get('bodies') or '', bool(r.get('edits')), r['backend'],
             r['tier'], r.get('adapter'))
@@ -300,8 +308,9 @@ def main(argv):
             else:
                 matched = [(load(base), load(new))]
             if not matched:
-                print('no runs with the same world, light, scenario, radius, speed, fps limit, '
-                      'vsync, bodies, edits, backend, tier and adapter', file=sys.stderr)
+                print('no runs with the same world, light, pack, scenario, radius, speed, '
+                      'fps limit, vsync, bodies, edits, backend, tier and adapter',
+                      file=sys.stderr)
                 return 2
             print('\n\n'.join(compare(b, n) for b, n in matched))
             return 0

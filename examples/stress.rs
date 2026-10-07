@@ -42,6 +42,8 @@ mod bodies;
 mod clock;
 #[path = "stress/edits.rs"]
 mod edits;
+#[path = "shared/pack.rs"]
+mod pack;
 #[path = "stress/report.rs"]
 mod report;
 #[path = "stress/spans.rs"]
@@ -55,7 +57,7 @@ use boxel::gfx::{CLI_HELP, PresentModePref};
 use boxel::log::span_times::{self, SpanFrame, SpanTimes};
 use boxel::mesh::AoPolicy;
 use boxel::prelude::*;
-use boxel::render::GpuFailed;
+use boxel::render::{GpuFailed, TextureSource};
 use boxel::voxel::{BlockPos, BlockRegistry, ChunkData, ChunkKey, ChunkPos, MAX_BLOCK_COORD};
 use boxel::window::FramePacingInfo;
 use boxel::world::jobs::{JobExecutor, TaskPoolExecutor};
@@ -109,6 +111,8 @@ usage: stress [--scenario static|fly|dive|spin] [GPU options] [options]
   --time HH[:MM]      clock time of the world, kept still (default 12:00)
   --light on|off      voxel light and ambient occlusion (default on); off: neither, the look and
                       the cost of the world before light
+  --pack DIR          block textures from a Minecraft Java resource pack (the directory with
+                      pack.mcmeta; default: procedural); the summary records it and its load time
   --help              this text
 The run presents with --present immediate unless --vsync, --present or BOXEL_PRESENT is given.
 exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 output not written, 4 timeout";
@@ -202,6 +206,8 @@ struct Options {
     time: f64,
     /// `--light`: voxel light and ambient occlusion on (the default) or off.
     light: bool,
+    /// `--pack`.
+    textures: TextureSource,
     /// `--bodies`, `--body-kind` and `--projectiles`.
     bodies: BodyOptions,
 }
@@ -245,6 +251,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         edits: false,
         time: 12.0,
         light: true,
+        textures: TextureSource::Procedural,
         bodies: BodyOptions::default(),
     };
     let mut timeout = None;
@@ -378,6 +385,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             }
             "--edits" => o.edits = true,
             "--time" => o.time = clock::parse_clock(flag, &value()?)?,
+            "--pack" => o.textures = pack::parse(flag, &value()?)?,
             "--light" => {
                 o.light = match value()?.as_str() {
                     "on" => true,
@@ -886,6 +894,9 @@ impl Bench {
         self.info.class = info
             .class
             .map_or_else(|| "?".to_string(), |c| format!("{c:?}"));
+        if info.textures.size > 0 {
+            self.info.texture_load_ms = Some(info.textures.load_time.as_secs_f64() * 1000.0);
+        }
         // What the renderer got: the device's limits may cut the requested arena and table.
         if info.arena_capacity_quads > 0 {
             if (info.arena_capacity_quads, info.chunk_slot_capacity)
@@ -1040,6 +1051,10 @@ fn run_info(options: &Options, present: String) -> RunInfo {
         world: options.world.label(),
         trees: options.world.has_trees(),
         light: if options.light { "on" } else { "off" }.to_string(),
+        pack: match &options.textures {
+            TextureSource::Procedural => "none".to_string(),
+            source => source.label(),
+        },
         arena_quads,
         chunk_slots,
         vertical: if options.fixed_height {
@@ -1184,6 +1199,7 @@ fn main() -> AppExit {
                 render_when_hidden: true,
                 arena_quads,
                 max_chunk_slots: chunk_slots,
+                textures: options.textures.clone(),
                 ..RenderSettings::default()
             },
         })
@@ -1930,6 +1946,8 @@ mod tests {
         );
         assert!(text.contains(", trees on, light off, radius 16,"), "{text}");
         assert!(text.contains("\"light\": \"off\""), "{text}");
+        assert!(text.contains("\"pack\": \"none\""), "{text}");
+        assert!(text.contains("chunk slots, textures procedural."), "{text}");
     }
 
     #[test]

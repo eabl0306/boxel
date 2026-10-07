@@ -354,7 +354,7 @@ fn render_tier(
         &queue,
         tier,
         &config,
-        scene.registry.textures(),
+        &boxel_render::generate_block_textures(scene.registry.textures()),
         wgpu::TextureFormat::Rgba8UnormSrgb,
         UVec2::new(WIDTH, HEIGHT),
     )
@@ -784,7 +784,7 @@ fn render_cracks(
         &queue,
         tier,
         &config,
-        scene.registry.textures(),
+        &boxel_render::generate_block_textures(scene.registry.textures()),
         wgpu::TextureFormat::Rgba8UnormSrgb,
         CRACK_SIZE,
     )
@@ -1217,7 +1217,7 @@ fn render_lit(
         &queue,
         tier,
         &config,
-        scene.registry.textures(),
+        &boxel_render::generate_block_textures(scene.registry.textures()),
         wgpu::TextureFormat::Rgba8UnormSrgb,
         UVec2::new(WIDTH, HEIGHT),
     )

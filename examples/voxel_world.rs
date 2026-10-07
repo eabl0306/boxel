@@ -32,6 +32,8 @@
 
 #[path = "shared/clock.rs"]
 mod clock;
+#[path = "shared/pack.rs"]
+mod pack;
 #[path = "shared/player.rs"]
 mod player;
 #[path = "shared/world.rs"]
@@ -44,7 +46,7 @@ use boxel::gfx::wgpu::PresentMode;
 use boxel::gfx::{CLI_HELP, DeviceClass, RgbaImage};
 use boxel::physics::{PhysicsPlugin, Probe as VoxelProbe};
 use boxel::prelude::*;
-use boxel::render::{DebugDestroyDevice, GpuFailed, GpuReady, SurfaceInfo};
+use boxel::render::{DebugDestroyDevice, GpuFailed, GpuReady, SurfaceInfo, TextureSource};
 use boxel::voxel::{BlockRegistry, MAX_BLOCK_COORD};
 use boxel::window::winit::dpi::PhysicalSize;
 use boxel::window::{PrimaryWindow, WindowResized};
@@ -92,6 +94,8 @@ usage: voxel_world [GPU options] [options]
                           a day lasts 20 minutes); default 12:00, 21:00 with --lamps. Scripted
                           runs (--frames) keep the clock still
   --lamps                 demo: colored lamps and lava on the ground around the start
+  --pack DIR              block textures from a Minecraft Java resource pack (the directory
+                          with pack.mcmeta; default: procedural textures)
   --help                  this text
 exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 check failed, 4 timeout";
 
@@ -171,6 +175,8 @@ struct Options {
     /// `--time`, clock hours.
     time: Option<f64>,
     lamps: bool,
+    /// `--pack`.
+    textures: TextureSource,
 }
 
 impl Options {
@@ -229,6 +235,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         vsync_test: false,
         time: None,
         lamps: false,
+        textures: TextureSource::Procedural,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -249,6 +256,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--help" | "-h" => return Ok(None),
             "--frames" => o.frames = Some(number(flag, &value()?)?),
             "--wait-chunks" => o.wait_chunks = true,
+            "--pack" => o.textures = pack::parse(flag, &value()?)?,
             "--timeout" => o.timeout = Some(Duration::from_secs(number(flag, &value()?)?)),
             "--screenshot" => o.screenshot = Some(PathBuf::from(value()?)),
             "--expect-terrain" => o.expect_terrain = true,
@@ -658,6 +666,7 @@ fn gpu_events(
 ) {
     for event in ready.read() {
         println!("boxel: {}", event.summary);
+        println!("boxel: textures {}", pack::summary(&info.textures));
         let limit = match run.limit.max_fps {
             0 => "unlimited".to_string(),
             fps => format!("{fps} fps"),
@@ -1482,6 +1491,7 @@ fn main() -> AppExit {
                 render_when_hidden: options.frames.is_some(),
                 arena_quads,
                 max_chunk_slots,
+                textures: options.textures.clone(),
                 ..RenderSettings::default()
             },
         })

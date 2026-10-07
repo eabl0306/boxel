@@ -6,14 +6,13 @@ use crate::path::{
     quad_index_buffer,
 };
 use crate::targets::{Blit, Targets};
-use crate::textures::{BLOCK_TEXTURE_SIZE, generate_block_textures, layer_bytes};
+use crate::textures::BlockTextureData;
 use crate::upload::{UploadTargets, Uploads, arena_len, light_entries};
 use boxel_camera::{Camera, CameraView};
 use boxel_gfx::Tier;
 use boxel_math::{Frustum, I64Vec3, Mat4, UVec2, Vec3, wrap_to_i32};
 use boxel_mesh::{BUCKET_COUNT, ChunkMesh};
 use boxel_shaders::gpu::{ChunkGpu, ViewUniform, bindings};
-use boxel_voxel::TextureSpec;
 use std::sync::Arc;
 use wgpu::util::DeviceExt as _;
 
@@ -166,8 +165,8 @@ pub struct VoxelRenderer {
 impl VoxelRenderer {
     /// Creates every GPU resource for `tier` inside Validation/Internal/OOM error scopes
     /// (`boxel_gfx::run_in_error_scopes`, nested scopes are fine): block texture array (from
-    /// `textures`, procedural), sampler, view uniform, quad arena, chunk table (High/Mid) / CPU
-    /// table (all), shared quad index buffer (`[0,1,2,2,1,3] + 4i` for `MAX_QUADS_PER_BUCKET`
+    /// `textures`: [`crate::generate_block_textures`] or [`crate::load_block_textures`]),
+    /// sampler, view uniform, quad arena, chunk table (High/Mid) / CPU table (all), shared quad index buffer (`[0,1,2,2,1,3] + 4i` for `MAX_QUADS_PER_BUCKET`
     /// quads, u32; High/Mid), the tier's opaque and cutout pipelines (+ cull on High), main color
     /// (`MAIN_COLOR_FORMAT`, `RENDER_ATTACHMENT | COPY_SRC | TEXTURE_BINDING`) and depth targets
     /// of `size`, and the blit pipeline for `output_format` (`fs_blit` if sRGB, else
@@ -181,7 +180,7 @@ impl VoxelRenderer {
         queue: &wgpu::Queue,
         tier: Tier,
         config: &RendererConfig,
-        textures: &[TextureSpec],
+        textures: &BlockTextureData,
         output_format: wgpu::TextureFormat,
         size: UVec2,
     ) -> Result<Self, RendererError> {
@@ -207,7 +206,7 @@ impl VoxelRenderer {
         queue: &wgpu::Queue,
         tier: Tier,
         config: &RendererConfig,
-        textures: &[TextureSpec],
+        textures: &BlockTextureData,
         output_format: wgpu::TextureFormat,
         size: UVec2,
     ) -> Result<Self, String> {
@@ -566,23 +565,38 @@ fn trim_counts(mut counts: [u32; BUCKET_COUNT], total: u32) -> [u32; BUCKET_COUN
     counts
 }
 
-/// Block texture array (layer-major upload, 5 mips), its `D2Array` view and the block sampler
-/// (`Repeat`, mag `Nearest`, min and mip `Linear`).
+/// Block texture array (layer-major upload, full mip chain), its `D2Array` view and the block
+/// sampler (`Repeat`, mag `Nearest`, min and mip `Linear`).
 fn block_textures(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    textures: &[TextureSpec],
+    textures: &BlockTextureData,
     limits: &wgpu::Limits,
 ) -> Result<(wgpu::TextureView, wgpu::Sampler), String> {
-    let generated = generate_block_textures(textures);
-    let mut layers = generated.layers;
-    let mut data = generated.data;
+    let mut layers = textures.layers;
+    let layer_bytes = textures.layer_bytes();
+    if textures.data.len() != layers as usize * layer_bytes {
+        return Err(format!(
+            "block texture data has {} bytes, expected {layers} layers of {layer_bytes}",
+            textures.data.len()
+        ));
+    }
+    if textures.size > limits.max_texture_dimension_2d {
+        return Err(format!(
+            "block texture size {} exceeds max_texture_dimension_2d {}",
+            textures.size, limits.max_texture_dimension_2d
+        ));
+    }
+    let mut padded = None;
     // wgpu-hal GL picks the texture target from the layer count: 1 layer -> TEXTURE_2D and a
     // multiple of 6 -> cube map, neither viewable as D2Array. Pad with a copy of the last layer.
     if layers == 1 || layers.is_multiple_of(6) {
-        data.extend_from_within(data.len() - layer_bytes()..);
+        let mut data = textures.data.clone();
+        data.extend_from_within(data.len() - layer_bytes..);
+        padded = Some(data);
         layers += 1;
     }
+    let data = padded.as_deref().unwrap_or(&textures.data);
     if layers > limits.max_texture_array_layers {
         return Err(format!(
             "{layers} block texture layers exceed max_texture_array_layers {}",
@@ -594,11 +608,11 @@ fn block_textures(
         &wgpu::TextureDescriptor {
             label: Some("boxel block textures"),
             size: wgpu::Extent3d {
-                width: BLOCK_TEXTURE_SIZE,
-                height: BLOCK_TEXTURE_SIZE,
+                width: textures.size,
+                height: textures.size,
                 depth_or_array_layers: layers,
             },
-            mip_level_count: generated.mip_levels,
+            mip_level_count: textures.mip_levels,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
@@ -606,7 +620,7 @@ fn block_textures(
             view_formats: &[],
         },
         wgpu::util::TextureDataOrder::LayerMajor,
-        &data,
+        data,
     );
     let view = texture.create_view(&wgpu::TextureViewDescriptor {
         label: Some("boxel block textures"),
