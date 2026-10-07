@@ -1,59 +1,76 @@
 use boxel_voxel::{TexturePattern, TextureSpec};
 
-/// Edge of every block texture layer (texels).
+/// Edge of every procedural block texture layer (texels). A resource pack can give the array
+/// another edge ([`BlockTextureData::size`]).
 pub const BLOCK_TEXTURE_SIZE: u32 = 16;
 
-/// Mip levels of a layer: 16, 8, 4, 2, 1.
-const MIP_LEVELS: u32 = BLOCK_TEXTURE_SIZE.ilog2() + 1;
-/// Texels of mip 0.
+/// Texels of a procedural level 0.
 const BASE_TEXELS: usize = (BLOCK_TEXTURE_SIZE * BLOCK_TEXTURE_SIZE) as usize;
 /// Layer used when the registry has no textures.
 const MAGENTA: [u8; 4] = [255, 0, 255, 255];
 
-/// CPU-side block texture array: `layers` layers of `BLOCK_TEXTURE_SIZE`^2 RGBA8 sRGB texels with
-/// a full mip chain (16, 8, 4, 2, 1), stored layer-major then mip-major
+/// CPU-side block texture array: `layers` layers of `size`^2 RGBA8 sRGB texels with a full mip
+/// chain (`size`, `size / 2`, ..., 1), stored layer-major then mip-major
 /// (`wgpu::util::TextureDataOrder::LayerMajor`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockTextureData {
+    /// Edge of level 0 in texels (a power of two; [`BLOCK_TEXTURE_SIZE`] for procedural layers).
+    pub size: u32,
     /// Layer count (>= 1; a magenta layer is used when `specs` is empty).
     pub layers: u32,
-    /// Mip levels (5).
+    /// Mip levels (`log2(size) + 1`, 5 for 16).
     pub mip_levels: u32,
     /// Texel bytes.
     pub data: Vec<u8>,
 }
 
+impl BlockTextureData {
+    /// Bytes of one layer with its whole mip chain.
+    pub fn layer_bytes(&self) -> usize {
+        layer_bytes(self.size)
+    }
+}
+
 /// Synthesizes the texture array from the registry's specs (deterministic per spec name).
 /// Mips are box-filtered in linear space; `Leaves` alpha is kept binary (0/255) in every mip.
 pub fn generate_block_textures(specs: &[TextureSpec]) -> BlockTextureData {
-    let mut data = Vec::with_capacity(layer_bytes() * specs.len().max(1));
+    let size = BLOCK_TEXTURE_SIZE;
+    let mut data = Vec::with_capacity(layer_bytes(size) * specs.len().max(1));
     if specs.is_empty() {
-        push_layer(&mut data, &[MAGENTA; BASE_TEXELS], false);
+        push_layer(&mut data, &[MAGENTA; BASE_TEXELS], size, false);
     }
     for spec in specs {
         let base = synthesize(spec);
-        push_layer(
-            &mut data,
-            &base,
-            matches!(spec.pattern, TexturePattern::Leaves),
-        );
+        push_layer(&mut data, &base, size, is_cutout_pattern(spec));
     }
     BlockTextureData {
+        size,
         layers: specs.len().max(1) as u32,
-        mip_levels: MIP_LEVELS,
+        mip_levels: mip_levels(size),
         data,
     }
 }
 
-/// Bytes of one layer with its whole mip chain.
-pub(crate) fn layer_bytes() -> usize {
-    (0..MIP_LEVELS)
-        .map(|mip| ((BLOCK_TEXTURE_SIZE >> mip) * (BLOCK_TEXTURE_SIZE >> mip) * 4) as usize)
+/// Whether a procedural layer keeps binary alpha (the `Leaves` pattern).
+pub(crate) fn is_cutout_pattern(spec: &TextureSpec) -> bool {
+    matches!(spec.pattern, TexturePattern::Leaves)
+}
+
+/// Mip levels of a `size`^2 layer down to 1x1.
+pub(crate) fn mip_levels(size: u32) -> u32 {
+    size.ilog2() + 1
+}
+
+/// Bytes of one `size`^2 layer with its whole mip chain.
+pub(crate) fn layer_bytes(size: u32) -> usize {
+    (0..mip_levels(size))
+        .map(|mip| ((size >> mip) * (size >> mip) * 4) as usize)
         .sum()
 }
 
-/// Level 0 of one layer: `BLOCK_TEXTURE_SIZE`^2 sRGB texels, row 0 = top of the image.
-fn synthesize(spec: &TextureSpec) -> [[u8; 4]; BASE_TEXELS] {
+/// Level 0 of one procedural layer: `BLOCK_TEXTURE_SIZE`^2 sRGB texels, row 0 = top of the
+/// image.
+pub(crate) fn synthesize(spec: &TextureSpec) -> [[u8; 4]; BASE_TEXELS] {
     let size = BLOCK_TEXTURE_SIZE as usize;
     let mut rng = SplitMix64(fnv1a64(spec.name.as_bytes()));
     let amplitude = i32::from(spec.noise);
@@ -104,12 +121,14 @@ fn with_noise(color: [u8; 3], noise: i32) -> [u8; 4] {
     [ch(color[0]), ch(color[1]), ch(color[2]), 255]
 }
 
-/// Appends level 0 and its mips (box filter in linear space, alpha-weighted color so transparent
-/// texels do not bleed into the average; `binary_alpha` thresholds alpha at 0.5 in every mip).
-fn push_layer(out: &mut Vec<u8>, base: &[[u8; 4]], binary_alpha: bool) {
+/// Appends level 0 (`size`^2 texels) and its mips (box filter in linear space, alpha-weighted
+/// color so transparent texels do not bleed into the average; `binary_alpha` thresholds alpha at
+/// 0.5 in every mip).
+pub(crate) fn push_layer(out: &mut Vec<u8>, base: &[[u8; 4]], size: u32, binary_alpha: bool) {
+    debug_assert_eq!(base.len(), (size * size) as usize);
     out.extend(base.iter().flatten());
     let mut level: Vec<[f32; 4]> = base.iter().map(|t| decode(*t)).collect();
-    let mut size = BLOCK_TEXTURE_SIZE as usize;
+    let mut size = size as usize;
     while size > 1 {
         level = downsample(&level, size);
         size /= 2;
@@ -242,7 +261,7 @@ mod tests {
     }
 
     fn layer(data: &BlockTextureData, index: usize) -> &[u8] {
-        &data.data[index * layer_bytes()..(index + 1) * layer_bytes()]
+        &data.data[index * data.layer_bytes()..(index + 1) * data.layer_bytes()]
     }
 
     fn mip(data: &BlockTextureData, index: usize, level: u32) -> Vec<[u8; 4]> {
@@ -259,16 +278,17 @@ mod tests {
         let specs = registry.textures();
         let data = generate_block_textures(specs);
         assert_eq!(data.layers as usize, specs.len());
-        assert_eq!(data.mip_levels, 5);
-        assert_eq!(layer_bytes(), 4 * (256 + 64 + 16 + 4 + 1));
-        assert_eq!(data.data.len(), specs.len() * layer_bytes());
+        assert_eq!((data.size, data.mip_levels), (16, 5));
+        assert_eq!(layer_bytes(16), 4 * (256 + 64 + 16 + 4 + 1));
+        assert_eq!(layer_bytes(32), 4 * (1024 + 256 + 64 + 16 + 4 + 1));
+        assert_eq!(data.data.len(), specs.len() * layer_bytes(16));
     }
 
     #[test]
     fn empty_input_gives_one_magenta_layer() {
         let data = generate_block_textures(&[]);
         assert_eq!((data.layers, data.mip_levels), (1, 5));
-        assert_eq!(data.data.len(), layer_bytes());
+        assert_eq!(data.data.len(), layer_bytes(16));
         assert!(data.data.as_chunks::<4>().0.iter().all(|t| *t == MAGENTA));
     }
 

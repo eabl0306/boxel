@@ -22,7 +22,9 @@
 //!   fits keeps its old mesh, a smaller mesh reuses the chunk's own range;
 //! - a far scene: a 32x32 slab ~480 voxels away and a second slab of another texture 1 voxel
 //!   behind it (hidden), compared with the front slab alone (depth precision on every backend,
-//!   including GL where reverse-Z loses its precision gain).
+//!   including GL where reverse-Z loses its precision gain);
+//! - a stone floor textured from a tiny generated resource pack (`TextureSource::Pack`, 32x32
+//!   layers): the pack's pixels must show on every tier.
 //!
 //! Every tier must match the best tier of its adapter within 0.1 % of the pixels. Failing images
 //! are saved under `CARGO_TARGET_TMPDIR/gpu_tiers/` (every image with `GPU_TIERS_SAVE=1`).
@@ -440,7 +442,7 @@ fn full_arena_scenes(
         queue,
         tier,
         &config,
-        registry.textures(),
+        &boxel_render::generate_block_textures(registry.textures()),
         wgpu::TextureFormat::Rgba8UnormSrgb,
         UVec2::new(WIDTH, HEIGHT),
     )
@@ -687,7 +689,7 @@ fn render_tier(
         &queue,
         tier,
         &config,
-        registry.textures(),
+        &boxel_render::generate_block_textures(registry.textures()),
         wgpu::TextureFormat::Rgba8UnormSrgb,
         UVec2::new(WIDTH, HEIGHT),
     )
@@ -1119,7 +1121,7 @@ fn light_indices_past_the_palette_read_open_sky_on_every_tier() {
                     &queue,
                     tier,
                     &config,
-                    registry.textures(),
+                    &boxel_render::generate_block_textures(registry.textures()),
                     wgpu::TextureFormat::Rgba8UnormSrgb,
                     UVec2::new(WIDTH, HEIGHT),
                 )
@@ -1159,6 +1161,167 @@ fn light_indices_past_the_palette_read_open_sky_on_every_tier() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     assert!(
         rendered > 0 || !gpu_tests_required(),
+        "BOXEL_REQUIRE_GPU=1 but no tier could render"
+    );
+}
+
+/// Writes a tiny resource pack of generated PNG files (no third-party content) under
+/// `CARGO_TARGET_TMPDIR`: a 32x32 stone, red on the left half and blue on the right, plus a
+/// 32x32 dirt so 32 is the pack's common size.
+fn synthetic_pack() -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("gpu_tiers_pack");
+    let _ = std::fs::remove_dir_all(&dir);
+    let blocks = dir.join("assets/minecraft/textures/block");
+    std::fs::create_dir_all(&blocks).expect("pack dirs");
+    std::fs::write(
+        dir.join("pack.mcmeta"),
+        r#"{"pack":{"pack_format":34,"description":"boxel gpu test pack"}}"#,
+    )
+    .expect("pack.mcmeta");
+    let png = |name: &str, pixel: &dyn Fn(u32) -> [u8; 4]| {
+        RgbaImage {
+            width: 32,
+            height: 32,
+            data: (0..32 * 32).flat_map(|i| pixel(i % 32)).collect(),
+        }
+        .save_png(&blocks.join(format!("{name}.png")))
+        .expect("png");
+    };
+    png("stone", &|x| {
+        if x < 16 {
+            [220, 30, 30, 255]
+        } else {
+            [30, 30, 220, 255]
+        }
+    });
+    png("dirt", &|_| [90, 60, 30, 255]);
+    dir
+}
+
+/// A pack texture (`TextureSource::Pack`) reaches the screen on every tier: a stone floor
+/// magnified under the camera shows the pack's red and blue halves of each voxel instead of the
+/// procedural gray, and every tier draws the same image.
+#[test]
+fn pack_textures_render_on_every_tier() {
+    let (_instance, adapters) = adapters();
+    if adapters.is_empty() {
+        assert!(!gpu_tests_required(), "BOXEL_REQUIRE_GPU=1 but no adapter");
+        eprintln!("skipping: no adapter");
+        return;
+    }
+    let pack = synthetic_pack();
+    let registry = BlockRegistry::default_blocks();
+    let (textures, report) =
+        boxel_render::load_block_textures(&registry, &boxel_render::TextureSource::Pack(pack))
+            .expect("synthetic pack");
+    assert_eq!((textures.size, report.from_pack), (32, 2), "{report:?}");
+    let stone = registry
+        .textures()
+        .iter()
+        .position(|t| t.name == "boxel:stone")
+        .unwrap_or(0) as u16;
+    // One 16x16 +Y stone quad (open sky, no palette) seen straight down from 4 voxels above its
+    // middle: it fills the image, one voxel is about 30 pixels wide.
+    let mut counts = [0; BUCKET_COUNT];
+    counts[Face::PosY.index()] = 1;
+    let mut mesh = ChunkMesh::from_quads(
+        vec![PackedQuad::new([0, 0, 0], 16, 16, Face::PosY, stone)],
+        counts,
+    );
+    mesh.palette.clear();
+    mesh.hash = mesh.compute_hash();
+    let mesh = Arc::new(mesh);
+    let view = view_params(
+        &Camera::default(),
+        &Transform::from_yaw_pitch(DVec3::new(8.0, 5.0, 8.0), 0.0, -std::f32::consts::FRAC_PI_2),
+    );
+    let mut failures = Vec::new();
+    // (adapter, tier label, image)
+    let mut images: Vec<(String, String, RgbaImage)> = Vec::new();
+    for adapter in &adapters {
+        let caps = AdapterCaps::from_adapter(adapter);
+        let label = adapter_label(&caps);
+        for tier in allowed_tiers(&caps) {
+            let result = (|| {
+                let (device, queue, errors) = device_for(adapter, &caps, tier)?;
+                let config = RendererConfig {
+                    arena_quads: 1 << 13,
+                    max_chunk_slots: 8,
+                };
+                let mut renderer = VoxelRenderer::new(
+                    &device,
+                    &queue,
+                    tier,
+                    &config,
+                    &textures,
+                    wgpu::TextureFormat::Rgba8UnormSrgb,
+                    UVec2::new(WIDTH, HEIGHT),
+                )
+                .map_err(|e| format!("VoxelRenderer::new: {e}"))?;
+                renderer
+                    .upsert_chunk(0, I64Vec3::ZERO, Arc::clone(&mesh))
+                    .map_err(|e| e.to_string())?;
+                let (image, _) = render(&device, &queue, &mut renderer, &view)?;
+                let errors = errors.lock().map(|e| e.clone()).unwrap_or_default();
+                if !errors.is_empty() {
+                    return Err(format!("uncaptured errors {errors:?}"));
+                }
+                Ok(image)
+            })();
+            match result {
+                Ok(image) => images.push((label.clone(), format!("{label} {tier}"), image)),
+                Err(e) => failures.push(format!("{label} {tier}: {e}")),
+            }
+        }
+    }
+    for (_, name, image) in &images {
+        // Count clearly red and clearly blue pixels: both halves must cover a good share.
+        let (mut red, mut blue) = (0, 0);
+        for p in image.data.as_chunks::<4>().0 {
+            let [r, g, b, _] = p.map(u32::from);
+            if r > 3 * g.max(8) && r > 2 * b {
+                red += 1;
+            } else if b > 3 * g.max(8) && b > 2 * r {
+                blue += 1;
+            }
+        }
+        let total = WIDTH * HEIGHT;
+        if red < total / 5 || blue < total / 5 {
+            failures.push(format!(
+                "{name}: {red} red and {blue} blue pixels of {total}"
+            ));
+        }
+        if std::env::var_os("GPU_TIERS_SAVE").is_some() {
+            let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("gpu_tiers");
+            let _ = std::fs::create_dir_all(&dir);
+            let file = name.replace([' ', '(', ')'], "_");
+            let _ = image.save_png(&dir.join(format!("pack_{file}.png")));
+        }
+    }
+    // Pixel-identical across the tiers of each adapter, as the procedural scenes (same
+    // tolerance; the first tier rendered is the adapter's best).
+    for (i, (adapter, name, image)) in images.iter().enumerate() {
+        // The adapter's first image is the reference; skip it.
+        let Some((_, first_name, first)) = images[..i].iter().find(|(a, _, _)| a == adapter) else {
+            continue;
+        };
+        let differing = first
+            .data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(image.data.as_chunks::<4>().0)
+            .filter(|(a, b)| a.iter().zip(b.iter()).any(|(x, y)| x.abs_diff(*y) > 2))
+            .count();
+        if differing as f64 > MAX_TIER_DIFF * f64::from(WIDTH * HEIGHT) {
+            failures.push(format!(
+                "{name}: {differing} pixels differ from {first_name}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(
+        !images.is_empty() || !gpu_tests_required(),
         "BOXEL_REQUIRE_GPU=1 but no tier could render"
     );
 }

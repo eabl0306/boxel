@@ -484,6 +484,7 @@ dependencies = [
  "boxel_light",
  "boxel_math",
  "boxel_mesh",
+ "boxel_pack",
  "boxel_shaders",
  "boxel_transform",
  "boxel_voxel",

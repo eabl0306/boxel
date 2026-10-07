@@ -13,8 +13,9 @@
 
 use crate::overlay::{OverlayDraw, OverlayPass, OverlayRect};
 use crate::{
-    DEFAULT_SKY_COLOR, RendererConfig, RendererSmokeTest, SceneLight, ViewParams, VoxelRenderer,
-    light_curve,
+    BlockTextureData, DEFAULT_SKY_COLOR, RendererConfig, RendererSmokeTest, SceneLight,
+    TextureReport, TextureSource, ViewParams, VoxelRenderer, generate_block_textures, light_curve,
+    load_block_textures,
 };
 use boxel_app::{App, Last, MainScheduleOrder, Plugin, Shutdown, Time};
 use boxel_camera::{Camera, CameraView};
@@ -31,7 +32,7 @@ use boxel_gfx::{
 use boxel_math::{I64Vec3, UVec2};
 use boxel_mesh::ChunkMesh;
 use boxel_transform::Transform;
-use boxel_voxel::{BlockRegistry, TextureSpec};
+use boxel_voxel::BlockRegistry;
 use boxel_window::{DisplayHandle, PrimaryWindow, WindowState};
 use boxel_world::{ChunkMap, ChunkMeshEvent, DaylightCurve, TimeOfDay, WorldContent};
 use std::collections::{HashMap, VecDeque};
@@ -99,6 +100,9 @@ pub struct RenderSettings {
     /// target (no acquire/present) and count it in `RenderInfo::frames_rendered`, so scripted
     /// runs (`voxel_world --frames`) progress on a covered window. Default false.
     pub render_when_hidden: bool,
+    /// Where block texture pixels come from: procedural (the default) or a Minecraft resource
+    /// pack directory, read once when the first GPU is selected ([`RenderInfo::textures`]).
+    pub textures: TextureSource,
 }
 
 impl Default for RenderSettings {
@@ -117,6 +121,7 @@ impl Default for RenderSettings {
             arena_quads: 8 << 20,
             max_chunk_slots: 32768,
             render_when_hidden: false,
+            textures: TextureSource::Procedural,
         }
     }
 }
@@ -209,6 +214,9 @@ pub struct RenderInfo {
     /// Chunk table slots (`RenderStats::chunk_slot_capacity`): the requested
     /// `RenderSettings::max_chunk_slots`, cut to the device's limits. 0 until a renderer exists.
     pub chunk_slot_capacity: u32,
+    /// How the block texture array was built (source, size, layers from a pack, load time,
+    /// warnings). Default until the first GPU selection.
+    pub textures: TextureReport,
 }
 
 impl RenderInfo {
@@ -453,6 +461,8 @@ struct SurfaceCounters {
 struct GpuState {
     stage: GpuStage,
     counters: SurfaceCounters,
+    /// Block texture array, built once from `RenderSettings::textures` (re-selections reuse it).
+    block_textures: Option<Arc<BlockTextureData>>,
 }
 
 impl GpuState {
@@ -707,7 +717,9 @@ fn setup(mut p: SetupParams) {
     let size = p.window_state.as_deref().map(|s| s.physical_size);
     let window = p.window.as_deref().map(|w| Arc::clone(&w.window));
     let wanted_present = p.present.mode;
-    let GpuState { stage, counters } = &mut *p.gpu;
+    let GpuState {
+        stage, counters, ..
+    } = &mut *p.gpu;
     if let GpuStage::Ready(ready) = stage {
         if ready.present != wanted_present {
             change_present_mode(ready, counters, wanted_present);
@@ -901,14 +913,7 @@ fn bootstrap(p: &mut SetupParams) {
             let s = window.inner_size();
             UVec2::new(s.width.max(1), s.height.max(1))
         });
-    let default_registry;
-    let textures: &[TextureSpec] = match p.content.as_deref() {
-        Some(content) => content.registry.textures(),
-        None => {
-            default_registry = BlockRegistry::default_blocks();
-            default_registry.textures()
-        }
-    };
+    let textures = block_texture_data(p);
     let config = RendererConfig {
         arena_quads: settings.arena_quads,
         max_chunk_slots: settings.max_chunk_slots,
@@ -919,7 +924,7 @@ fn bootstrap(p: &mut SetupParams) {
         &ctx.queue,
         ctx.tier,
         &config,
-        textures,
+        &textures,
         ctx.output_format,
         size,
     )
@@ -997,6 +1002,53 @@ fn bootstrap(p: &mut SetupParams) {
         offscreen: VecDeque::new(),
         destroyed_on_purpose: false,
     }));
+}
+
+/// The block texture array, built on the first bootstrap from `RenderSettings::textures` and the
+/// world's registry (re-selections after a device loss reuse it). A pack that fails to open falls
+/// back to the procedural textures with an error log; the outcome lands in `RenderInfo::textures`.
+fn block_texture_data(p: &mut SetupParams) -> Arc<BlockTextureData> {
+    if let Some(data) = &p.gpu.block_textures {
+        return Arc::clone(data);
+    }
+    let default_registry;
+    let registry: &BlockRegistry = match p.content.as_deref() {
+        Some(content) => &content.registry,
+        None => {
+            default_registry = BlockRegistry::default_blocks();
+            &default_registry
+        }
+    };
+    let started = Instant::now();
+    let (data, report) = load_block_textures(registry, &p.settings.textures).unwrap_or_else(|e| {
+        tracing::error!("block textures: {e}; using the procedural textures");
+        let data = generate_block_textures(registry.textures());
+        let report = TextureReport {
+            source: TextureSource::Procedural.label(),
+            size: data.size,
+            layers: data.layers,
+            load_time: started.elapsed(),
+            warnings: vec![e],
+            ..TextureReport::default()
+        };
+        (data, report)
+    });
+    for warning in &report.warnings {
+        tracing::warn!("block textures: {warning}");
+    }
+    tracing::info!(
+        "block textures: {} {}px, {} of {} layers from the pack, {} pack warnings, {:.1} ms",
+        report.source,
+        report.size,
+        report.from_pack,
+        report.layers,
+        report.pack_warnings,
+        report.load_time.as_secs_f64() * 1000.0
+    );
+    p.info.textures = report;
+    let data = Arc::new(data);
+    p.gpu.block_textures = Some(Arc::clone(&data));
+    data
 }
 
 /// Why a selection attempt gave no device.
@@ -1298,7 +1350,9 @@ fn draw(
     mut frame: ResMut<ExtractedFrame>,
     window: Option<NonSend<PrimaryWindow>>,
 ) {
-    let GpuState { stage, counters } = &mut *gpu;
+    let GpuState {
+        stage, counters, ..
+    } = &mut *gpu;
     let GpuStage::Ready(ready) = stage else {
         return;
     };
@@ -1493,7 +1547,9 @@ fn cleanup(
     if frame.rendered {
         info.frames_rendered += 1;
     }
-    let GpuState { stage, counters } = &mut *gpu;
+    let GpuState {
+        stage, counters, ..
+    } = &mut *gpu;
     let mut gpu_errors = counters.retired_gpu_errors;
     match stage {
         GpuStage::Ready(ready) => {

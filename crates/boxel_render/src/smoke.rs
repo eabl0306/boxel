@@ -1,7 +1,7 @@
 use crate::path::TierPipelines;
 use crate::renderer::{DEFAULT_SKY_COLOR, RendererConfig, ViewParams, VoxelRenderer};
 use crate::targets::{Blit, Targets};
-use crate::textures::linear_to_srgb;
+use crate::textures::{generate_block_textures, linear_to_srgb};
 use boxel_camera::{Camera, CameraView};
 use boxel_gfx::{
     SmokeContext, SmokeLevel, SmokeTest, read_texture_rgba8, run_in_error_scopes, submit_and_wait,
@@ -74,7 +74,7 @@ fn draw(ctx: &SmokeContext<'_>) -> Result<(), String> {
         ctx.queue,
         ctx.tier,
         &config,
-        registry.textures(),
+        &generate_block_textures(registry.textures()),
         ctx.output_format,
         UVec2::splat(SIZE),
     )

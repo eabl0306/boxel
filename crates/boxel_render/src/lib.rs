@@ -35,6 +35,7 @@ pub(crate) struct NoSpan;
 
 mod light;
 mod overlay;
+mod pack_textures;
 mod plugin;
 mod renderer;
 mod smoke;
@@ -48,6 +49,10 @@ mod upload;
 
 pub use light::{LIGHT_LEVELS, SceneLight, light_curve};
 pub use overlay::{OverlayDraw, OverlayRect};
+pub use pack_textures::{
+    FOLIAGE_TINT, GRASS_TINT, MAX_PACK_TEXTURE_SIZE, TextureReport, TextureSource, WATER_TINT,
+    load_block_textures,
+};
 pub use plugin::{
     DebugDestroyDevice, GpuFailed, GpuReady, PresentSettings, Render, RenderInfo, RenderPlugin,
     RenderSettings, RenderSystems, RequestScreenshot, ScreenshotSaved, SurfaceInfo,
