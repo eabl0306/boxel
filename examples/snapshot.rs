@@ -42,7 +42,7 @@ use boxel::render::{
     VoxelRenderer, light_curve, load_block_textures,
 };
 use boxel::voxel::{BlockRegistry, MAX_BLOCK_COORD};
-use boxel::world::{DaylightCurve, WorldStats};
+use boxel::world::{DaylightCurve, WorldContent, WorldStats};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::PathBuf;
@@ -606,10 +606,14 @@ fn run(
             queue.set_block(pos, state);
         }
         settle(&mut app, deadline).map_err(timeout)?;
+        // The block counts, not the state: stairs take their shape from their neighbors and
+        // fences their sides (ADR 0020). A torch without a support drops.
         let map = app.world().resource::<ChunkMap>();
         let missing = cells
             .iter()
-            .filter(|&&(pos, state)| map.block_at(pos) != Some(state))
+            .filter(|&&(pos, state)| {
+                map.block_at(pos).and_then(|s| registry.block(s)) != registry.block(state)
+            })
             .count();
         println!(
             "edits: set={} skipped={} not_applied={missing}",
@@ -681,6 +685,9 @@ fn run(
         size,
     )
     .map_err(|e| gpu_err(format!("VoxelRenderer::new: {e}")))?;
+    // The model boxes of slabs, stairs, fences and torches (ADR 0020).
+    let content = app.world().resource::<WorldContent>();
+    renderer.set_model_boxes(&gpu.queue, content.materials.model_boxes());
     for (id, key, mesh) in map.ready_meshes() {
         renderer
             .upsert_chunk(
