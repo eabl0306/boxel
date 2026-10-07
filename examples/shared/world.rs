@@ -19,7 +19,7 @@ pub fn usage(default: World) -> String {
                       over stone that goes down forever, with caves and trees); default {}
   --caves MODE        overworld caves: mc (default, with openings), closed (none reach the
                       surface) or off
-  --no-trees          no trees (forest becomes terrain)",
+  --no-trees          no trees or plants (forest becomes terrain)",
         default.name()
     )
 }
@@ -225,6 +225,7 @@ impl WorldChoice {
                 };
                 if !trees {
                     settings.trees = None;
+                    settings.plants = None;
                 }
                 Arc::new(OverworldGenerator::new(seed, settings))
             }
