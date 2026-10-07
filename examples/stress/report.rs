@@ -103,6 +103,9 @@ pub struct RunInfo {
     pub world: String,
     /// Trees on.
     pub trees: bool,
+    /// Voxel light and ambient occlusion (`--light`): `on`, or `off` (the look and the cost of
+    /// the world before light). Empty in runs from before the option.
+    pub light: String,
     /// Renderer quad arena (quads) and chunk table (slots) the renderer got: the requested ones
     /// (`--arena-quads`, `--chunk-slots` or the world's default) cut to the device's limits.
     pub arena_quads: u32,
@@ -758,6 +761,7 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
         ("seed", Json::Str(info.seed.to_string())),
         ("world", Json::Str(info.world.clone())),
         ("trees", Json::Bool(info.trees)),
+        ("light", Json::Str(info.light.clone())),
         ("arena_quads", Json::uint(info.arena_quads)),
         ("chunk_slots", Json::uint(info.chunk_slots)),
         ("vertical", Json::Str(info.vertical.clone())),
@@ -913,6 +917,10 @@ pub fn run_title(info: &RunInfo) -> String {
     if !info.world.is_empty() && info.world != "forest" {
         title = format!("{title} {}", info.world);
     }
+    // Light on (the default) keeps the titles of the earlier runs.
+    if info.light == "off" {
+        title = format!("{title} light off");
+    }
     if info.fps_limit > 0 {
         title = format!("{title} limit {} fps", info.fps_limit);
     }
@@ -963,8 +971,8 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
     );
     let _ = writeln!(
         out,
-        "- World: {}, seed {}, trees {}, radius {}, settled in {:.2} s with {} chunks; {:.0} s \
-         measured after {:.0} s of warmup. Renderer: {} quads, {} chunk slots.{}\n",
+        "- World: {}, seed {}, trees {}, light {}, radius {}, settled in {:.2} s with {} chunks; \
+         {:.0} s measured after {:.0} s of warmup. Renderer: {} quads, {} chunk slots.{}\n",
         if info.world.is_empty() {
             "?"
         } else {
@@ -972,6 +980,11 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
         },
         info.seed,
         if info.trees { "on" } else { "off" },
+        if info.light.is_empty() {
+            "?"
+        } else {
+            &info.light
+        },
         info.radius,
         info.settle_s,
         info.settle_chunks,
@@ -1565,6 +1578,8 @@ mod tests {
         assert!(data.contains("\"catch_up_s\": 1.5"));
         assert!(data.contains("\"fps_limit\": 0"));
         assert!(text.contains(", fps limit none, window "));
+        assert!(data.contains("\"light\": \"\""), "empty without --light");
+        assert!(text.contains(", trees off, light ?, radius 16,"), "{text}");
         assert!(data.contains("\"presented\": false"));
         assert!(text.contains("| frame | t s | ms | crossed | presented | generated |"));
         assert!(
@@ -1591,6 +1606,11 @@ mod tests {
         assert_eq!(run_title(&info), "static r16 overworld/mc");
         info.world = String::new();
         assert_eq!(run_title(&info), "static r16");
+        info.light = "on".to_string();
+        assert_eq!(run_title(&info), "static r16", "light on keeps the title");
+        info.light = "off".to_string();
+        assert_eq!(run_title(&info), "static r16 light off");
+        info.light = String::new();
         info.fps_limit = 144;
         assert_eq!(run_title(&info), "static r16 limit 144 fps");
         info.bodies = "1000 item, 0 projectiles".to_string();

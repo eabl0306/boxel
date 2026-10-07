@@ -62,6 +62,11 @@ un arena de 24 Mi quads y 65 536 slots; `--arena-quads N` y `--chunk-slots N` lo
 resumen anota el mundo y el arena y los slots que el renderer obtuvo de verdad (los límites del
 dispositivo pueden recortarlos), y `tools/bench_report.py` solo compara corridas del mismo mundo.
 
+`--light off` apaga la luz de vóxeles y la oclusión ambiental: el mundo se ve y cuesta como antes
+de la luz (por defecto es `on`). El resumen lo anota y `tools/bench_report.py` no mezcla corridas
+con luz distinta. Las corridas viejas sin el dato cuentan como `on` si anotan la hora (llegó con
+la luz) y como `none` si son de antes de la luz.
+
 Para que los números sirvan:
 
 - Siempre en release (las recetas ya lo hacen).
@@ -125,8 +130,8 @@ just bench-report --compare carpeta-antes/ carpeta-despues/
 `--compare` muestra cada número, el cambio en % y si mejoró o empeoró. Si antes era 0 no hay %,
 pero igual dice si empeoró (por ejemplo, tirones nuevos). Si las corridas tienen otra
 configuración (radio, GPU, velocidad), lo avisa. Con dos carpetas empareja las corridas del mismo
-mundo, escenario, radio, radio vertical, velocidad, límite de fps, cuerpos (`--bodies`),
-ediciones (`--edits`), backend, tier y GPU. Una hora distinta (`--time`) solo se anota.
+mundo, luz (`--light`), escenario, radio, radio vertical, velocidad, límite de fps, cuerpos
+(`--bodies`), ediciones (`--edits`), backend, tier y GPU. Una hora distinta (`--time`) solo se anota.
 
 Flujo sugerido: `just bench-all` antes del cambio, mover `bench-results/` a otra carpeta,
 aplicar el cambio, `just bench-all` otra vez y comparar las dos carpetas.

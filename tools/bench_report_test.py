@@ -101,6 +101,12 @@ class FormatTest(unittest.TestCase):
         static = copy.deepcopy(SAMPLE)
         static['run']['scenario'] = 'static'
         self.assertEqual(br.title(static), 'static r16')
+        static['run']['light'] = 'on'
+        self.assertEqual(br.title(static), 'static r16', 'light on keeps the title')
+        static['run']['light'] = 'off'
+        self.assertEqual(br.title(static), 'static r16 light off')
+        static['run']['light'] = 'none'
+        self.assertEqual(br.title(static), 'static r16')
         static['run']['fps_limit'] = 60
         self.assertEqual(br.title(static), 'static r16 limit 60 fps')
         static['run']['bodies'] = '10000 item, 0 projectiles'
@@ -293,6 +299,34 @@ class OutputTest(unittest.TestCase):
         self.assertIn('clock  -> 12:00', out)
         self.assertIn('| edit ms p50 | - | 12.50 | - |  |', out)
 
+    def test_compare_directories_keeps_light_apart(self):
+        # No light field: 'on' with a clock (after the light render), 'none' without (before it).
+        lit = copy.deepcopy(SAMPLE)
+        lit['run']['time'] = '12:00'
+        on = copy.deepcopy(lit)
+        on['run']['light'] = 'on'
+        off = copy.deepcopy(lit)
+        off['run']['light'] = 'off'
+        off['frames']['p99_ms'] = 2.5
+        self.write('1-old.md', SAMPLE, 'base')
+        self.write('2-lit.md', lit, 'base')
+        self.write('3-off.md', off, 'base')
+        self.write('4-on.md', on, 'new')
+        self.write('5-off.json', off, 'new')
+        code, out, _ = run_main('--compare', os.path.join(self.dir.name, 'base'),
+                                os.path.join(self.dir.name, 'new'))
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count('### '), 2, 'on with on, off with off, none alone')
+        self.assertIn('2-lit.md -> 4-on.md', out)
+        self.assertIn('### fly r16 32 vox/s light off: 3-off.md -> 5-off.json', out)
+        self.assertNotIn('Note:', out)
+        self.assertEqual(br.load(os.path.join(self.dir.name, 'base', '1-old.md'))['run']['light'],
+                         'none')
+        code, out, _ = run_main('--compare', self.write('a.md', SAMPLE), self.write('b.md', off))
+        self.assertEqual(code, 0)
+        self.assertIn('light none -> off', out)
+        self.assertIn('| p99 ms | 3 | 2.50 | -16.7 % | better |', out)
+
     def test_usage_errors(self):
         self.assertEqual(run_main()[0], 1)
         self.assertEqual(run_main('--help')[0], 0)
@@ -320,6 +354,7 @@ class CommittedSummariesTest(unittest.TestCase):
         self.assertGreaterEqual(len(files), 13, 'the October 2026 baseline')
         for path in files:
             run = br.load(path)
+            self.assertIn(run['run']['light'], ('on', 'off', 'none'), path)
             br.table([run])
             br.compare(run, run)
             for _, keys, _ in br.METRICS + br.EDIT_METRICS:

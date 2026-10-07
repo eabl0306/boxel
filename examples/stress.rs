@@ -19,6 +19,9 @@
 //! `--bodies N --body-kind item|mob --projectiles M` add physics bodies around the start (see
 //! [`bodies`]): what they add to the frame is the physics part of the frame rule (ADR 0016).
 //!
+//! `--light off` turns the voxel light and the ambient occlusion off (`WorldSettings::light` and
+//! `ao_policy: AoPolicy::Off`): the look and the cost of the world before light (ADR 0015).
+//!
 //! Every run waits until the world settled, runs `--warmup` seconds, then measures
 //! `--duration` seconds. Each frame records its wall-clock time (`Time::real_delta`, the whole
 //! loop: world and render) and the work it did: chunks generated and jobs finished (counted by
@@ -50,6 +53,7 @@ use bodies::{BodiesPlugin, BodyOptions};
 use boxel::app::{TaskPoolOptions, TaskPoolThreadAssignmentPolicy};
 use boxel::gfx::{CLI_HELP, PresentModePref};
 use boxel::log::span_times::{self, SpanFrame, SpanTimes};
+use boxel::mesh::AoPolicy;
 use boxel::prelude::*;
 use boxel::render::GpuFailed;
 use boxel::voxel::{BlockPos, BlockRegistry, ChunkData, ChunkKey, ChunkPos, MAX_BLOCK_COORD};
@@ -100,6 +104,8 @@ usage: stress [--scenario static|fly|dive|spin] [GPU options] [options]
                       lamp placed and removed, a shaft dug and capped; the summary gives the
                       frames each one took to publish (meant for --scenario static)
   --time HH[:MM]      clock time of the world, kept still (default 12:00)
+  --light on|off      voxel light and ambient occlusion (default on); off: neither, the look and
+                      the cost of the world before light
   --help              this text
 The run presents with --present immediate unless --present or BOXEL_PRESENT is given.
 exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 output not written, 4 timeout";
@@ -189,6 +195,8 @@ struct Options {
     edits: bool,
     /// `--time`, clock hours.
     time: f64,
+    /// `--light`: voxel light and ambient occlusion on (the default) or off.
+    light: bool,
     /// `--bodies`, `--body-kind` and `--projectiles`.
     bodies: BodyOptions,
 }
@@ -230,6 +238,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         spans_csv: None,
         edits: false,
         time: 12.0,
+        light: true,
         bodies: BodyOptions::default(),
     };
     let mut timeout = None;
@@ -356,6 +365,13 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             }
             "--edits" => o.edits = true,
             "--time" => o.time = clock::parse_clock(flag, &value()?)?,
+            "--light" => {
+                o.light = match value()?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    v => return Err(format!("{flag}: {v:?} is not on or off")),
+                };
+            }
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
@@ -946,6 +962,66 @@ fn present_mode(
     }
 }
 
+/// The world's settings: `vertical_bounds` (`--fixed-height`) and, with `--light off`, no voxel
+/// light and no ambient occlusion (the world before light).
+fn world_settings(
+    options: &Options,
+    vertical_bounds: Option<RangeInclusive<i64>>,
+) -> WorldSettings {
+    let mut settings = WorldSettings {
+        vertical_bounds,
+        ..WorldSettings::default()
+    };
+    if !options.light {
+        settings.light = false;
+        settings.ao_policy = AoPolicy::Off;
+    }
+    settings
+}
+
+/// What the summary says about the run before it starts: the options, the present mode, the
+/// renderer capacity asked for and the machine.
+fn run_info(options: &Options, present: String) -> RunInfo {
+    let (arena_quads, chunk_slots) = options.render_capacity();
+    RunInfo {
+        scenario: options.scenario.name().to_string(),
+        label: options.label.clone(),
+        radius: options.radius,
+        speed: if options.scenario.moves() {
+            options.speed
+        } else {
+            0.0
+        },
+        seed: options.seed,
+        world: options.world.label(),
+        trees: options.world.has_trees(),
+        light: if options.light { "on" } else { "off" }.to_string(),
+        arena_quads,
+        chunk_slots,
+        vertical: if options.fixed_height {
+            "fixed".to_string()
+        } else {
+            options.vertical_radius.to_string()
+        },
+        duration_s: options.duration.as_secs_f64(),
+        warmup_s: options.warmup.as_secs_f64(),
+        present,
+        fps_limit: options.fps_limit,
+        window: options.size,
+        build: if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+        .to_string(),
+        cpu: cpu_name(),
+        threads: std::thread::available_parallelism().map_or(0, usize::from),
+        time: clock::start_time(options.time, true).clock_text(),
+        bodies: options.bodies.label(),
+        ..RunInfo::default()
+    }
+}
+
 /// Adds the bench resources and systems (everything but the engine plugins).
 fn add_bench(app: &mut App, options: Options, info: RunInfo, recorder: Recorder, started: Instant) {
     app.insert_resource(recorder)
@@ -1037,42 +1113,7 @@ fn main() -> AppExit {
     let inner = options.world.generator(options.seed);
     let fixed_bounds = options.fixed_height.then(|| inner.vertical_chunks());
     let (arena_quads, chunk_slots) = options.render_capacity();
-    let info = RunInfo {
-        scenario: options.scenario.name().to_string(),
-        label: options.label.clone(),
-        radius: options.radius,
-        speed: if options.scenario.moves() {
-            options.speed
-        } else {
-            0.0
-        },
-        seed: options.seed,
-        world: options.world.label(),
-        trees: options.world.has_trees(),
-        arena_quads,
-        chunk_slots,
-        vertical: if options.fixed_height {
-            "fixed".to_string()
-        } else {
-            options.vertical_radius.to_string()
-        },
-        duration_s: options.duration.as_secs_f64(),
-        warmup_s: options.warmup.as_secs_f64(),
-        present,
-        fps_limit: options.fps_limit,
-        window: options.size,
-        build: if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        }
-        .to_string(),
-        cpu: cpu_name(),
-        threads: std::thread::available_parallelism().map_or(0, usize::from),
-        time: clock::start_time(options.time, true).clock_text(),
-        bodies: options.bodies.label(),
-        ..RunInfo::default()
-    };
+    let info = run_info(&options, present);
     let mut plugins = DefaultPlugins
         .set(WindowPlugin {
             primary: WindowSettings {
@@ -1102,10 +1143,7 @@ fn main() -> AppExit {
             executor: Arc::new(CountingExecutor {
                 done: Arc::clone(&jobs_done),
             }),
-            settings: WorldSettings {
-                vertical_bounds: fixed_bounds,
-                ..WorldSettings::default()
-            },
+            settings: world_settings(&options, fixed_bounds),
             ..WorldPlugin::default()
         });
     if let Some(threads) = options.async_threads {
@@ -1178,6 +1216,37 @@ mod tests {
         assert_eq!(o.fps_limit, 0, "unlimited");
         assert_eq!((o.csv, o.summary), (None, None));
         assert!(!o.bodies.enabled(), "no physics unless asked");
+        assert!(o.light, "light on unless asked");
+    }
+
+    #[test]
+    fn light_off_turns_off_the_light_and_the_ao() {
+        let on = options(&[]);
+        let settings = world_settings(&on, None);
+        assert!(settings.light);
+        assert_eq!(settings.ao_policy, WorldSettings::default().ao_policy);
+        assert_eq!(run_info(&on, String::new()).light, "on");
+
+        let off = options(&["--light", "off", "--fixed-height"]);
+        assert!(!off.light);
+        let settings = world_settings(&off, Some(0..=5));
+        assert!(!settings.light);
+        assert_eq!(
+            settings.ao_policy,
+            AoPolicy::Off,
+            "the world before light had no AO"
+        );
+        assert_eq!(settings.vertical_bounds, Some(0..=5));
+        let info = run_info(&off, "vsync".to_string());
+        assert_eq!(
+            (info.light.as_str(), info.present.as_str()),
+            ("off", "vsync")
+        );
+        assert_eq!(info.vertical, "fixed");
+        assert!(report::run_title(&info).ends_with(" light off"));
+
+        assert!(options(&["--light=on"]).light);
+        assert!(usage().contains("--light on|off"));
     }
 
     #[test]
@@ -1302,6 +1371,8 @@ mod tests {
             &["--fps-limit"],
             &["--world", "overworld", "--fixed-height"],
             &["--caves", "mc"],
+            &["--light", "yes"],
+            &["--light"],
         ] {
             assert!(parse(args).is_err(), "{args:?} was accepted");
         }
@@ -1569,12 +1640,7 @@ mod tests {
                 generated: Arc::clone(&generated),
             });
         let recorder = Recorder::new(generated, Arc::new(AtomicU64::new(0)), 16);
-        let (arena_quads, chunk_slots) = options.render_capacity();
-        let info = RunInfo {
-            arena_quads,
-            chunk_slots,
-            ..RunInfo::default()
-        };
+        let info = run_info(&options, "immediate".to_string());
         add_bench(&mut app, options, info, recorder, t0);
         app.add_systems(Update, fake_world.after(drive))
             .add_systems(Last, fake_render);
@@ -1777,6 +1843,33 @@ mod tests {
         let bench = app.world().resource::<Bench>();
         assert_eq!(bench.info.catch_up_s, None);
         assert_eq!(app.world().resource::<Recorder>().log.to_vec().len(), 2);
+    }
+
+    #[test]
+    fn the_summary_records_the_light() {
+        let dir = std::env::temp_dir().join(format!("boxel-stress-light-{}", std::process::id()));
+        let path = dir.join("off.md");
+        let o = options(&[
+            "--light=off",
+            "--duration=0.010",
+            "--warmup=0",
+            "--summary",
+            path.to_str().expect("a UTF-8 temp dir"),
+        ]);
+        let t0 = Instant::now();
+        let mut app = bench_app(o, t0, frames(20, 5, SETTLED));
+        assert_eq!(
+            run(&mut app, t0).map(|(exit, _)| exit),
+            Some(AppExit::Success)
+        );
+        let text = std::fs::read_to_string(&path).expect("summary written");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            text.starts_with("# boxel stress: static r16 light off\n"),
+            "{text}"
+        );
+        assert!(text.contains(", trees on, light off, radius 16,"), "{text}");
+        assert!(text.contains("\"light\": \"off\""), "{text}");
     }
 
     #[test]

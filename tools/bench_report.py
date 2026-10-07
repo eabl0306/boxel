@@ -7,9 +7,11 @@ usage:
 
 RUN, BASE and NEW are summary files (Markdown with a JSON block, or plain JSON) or directories
 (every summary inside, not recursive). Comparing two directories pairs the runs with the same
-world, scenario, radius, vertical radius, speed, fps limit, physics bodies (--bodies), scripted
-edits (--edits), backend, tier and adapter; a different clock time (--time) only gets a note, since day and night
-change no mesh. A metric that was 0 in BASE has no percent change ('n/a') but still gets a
+world, light (--light), scenario, radius, vertical radius, speed, fps limit, physics bodies
+(--bodies), scripted edits (--edits), backend, tier and adapter; a different clock time (--time)
+only gets a note, since day and night change no mesh. Light is 'on', 'off' or 'none' (runs from
+before the light render, without a clock, had no voxel light); runs with a clock but from before
+--light had it on. A metric that was 0 in BASE has no percent change ('n/a') but still gets a
 verdict (0 spikes before, 3 after: worse). Runs with --edits also compare the edit latency.
 Output is Markdown, so it can go into docs as is.
 Exit codes: 0 ok, 1 usage error or a file without a summary, 2 nothing to compare."""
@@ -56,6 +58,7 @@ EDIT_METRICS = [
 # Settings that make two runs comparable.
 SETTINGS = [
     ('world', ('run', 'world')),
+    ('light', ('run', 'light')),
     ('scenario', ('run', 'scenario')),
     ('radius', ('run', 'radius')),
     ('vertical', ('run', 'vertical')),
@@ -113,6 +116,10 @@ def load(path):
         run.setdefault('bodies', '')
         # Runs from before --time had no day and night.
         run.setdefault('time', '')
+        # Runs from before --light: on if they had the clock (it came with the light render),
+        # else from before the light ('none').
+        if not run.get('light'):
+            run['light'] = 'on' if run['time'] else 'none'
         # Whether the run had --edits (the world's edit latency, null without them).
         run['edits'] = get(data, ('world', 'edits')) is not None
     return data
@@ -151,6 +158,8 @@ def title(run):
         text += f" {fmt(r['speed'])} vox/s"
     if r.get('world', 'forest') != 'forest':
         text += f" {r['world']}"
+    if r.get('light') == 'off':
+        text += ' light off'
     if r.get('fps_limit'):
         text += f" limit {r['fps_limit']} fps"
     if r.get('bodies'):
@@ -161,12 +170,12 @@ def title(run):
 
 
 def key(run):
-    """Runs with the same key are comparable (same world, scenario, radius, height, speed, fps
-    limit, physics bodies, scripted edits and GPU)."""
+    """Runs with the same key are comparable (same world, light, scenario, radius, height, speed,
+    fps limit, physics bodies, scripted edits and GPU)."""
     r = run['run']
-    return (r.get('world', 'forest'), r['scenario'], r['radius'], r.get('vertical', 'fixed'),
-            r['speed'], r.get('fps_limit') or 0, r.get('bodies') or '', bool(r.get('edits')),
-            r['backend'], r['tier'], r.get('adapter'))
+    return (r.get('world', 'forest'), r.get('light', 'none'), r['scenario'], r['radius'],
+            r.get('vertical', 'fixed'), r['speed'], r.get('fps_limit') or 0, r.get('bodies') or '',
+            bool(r.get('edits')), r['backend'], r['tier'], r.get('adapter'))
 
 
 def fmt(value):
@@ -263,8 +272,8 @@ def main(argv):
             else:
                 matched = [(load(base), load(new))]
             if not matched:
-                print('no runs with the same world, scenario, radius, speed, fps limit, bodies, '
-                      'edits, backend, tier and adapter', file=sys.stderr)
+                print('no runs with the same world, light, scenario, radius, speed, fps limit, '
+                      'bodies, edits, backend, tier and adapter', file=sys.stderr)
                 return 2
             print('\n\n'.join(compare(b, n) for b, n in matched))
             return 0
