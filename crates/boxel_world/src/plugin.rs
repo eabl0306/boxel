@@ -81,10 +81,10 @@ pub struct WorldSettings {
     /// are processed per frame whatever the budget.
     ///
     /// Under a frame cap (the runner publishes a [`FrameDeadline`]) both budgets grow into the
-    /// idle part of the frame, so the world catches up after a chunk-border crossing about as
-    /// fast as uncapped: the steps may run until half a period (at least 1.5 ms) before the next
-    /// frame minus the rest of the update, measured over the previous updates, in the ratio of
-    /// the two budgets. They never shrink below these values, a zero budget stays zero, and
+    /// idle part of the frame: the steps may run until half a period (at least 1.5 ms) before
+    /// the next frame minus the rest of the update, measured over the previous updates, in the
+    /// ratio of the two budgets. At 144 Hz that leaves little room (measured: no faster catch-up,
+    /// `docs/rendimiento/ritmo-2026-10.md`); it helps at lower limits. They never shrink below these values, a zero budget stays zero, and
     /// without a deadline (unlimited) they are exactly these values. The world's results do not
     /// depend on the budgets, only how many frames they take.
     pub interest_budget: Duration,

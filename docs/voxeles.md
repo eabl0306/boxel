@@ -565,7 +565,10 @@ al moverse.
   del frame (issue #3). El runner publica cuándo vence el frame siguiente (`FrameDeadline`) y el
   mundo trabaja hasta medio período antes de ese momento (1.5 ms como mínimo), menos lo que tarda
   el resto de la update, medido en las anteriores. Nunca bajan de su valor, y sin tope quedan
-  exactamente igual. El mundo que sale es el mismo; solo cambia en cuántos frames.
+  exactamente igual. El mundo que sale es el mismo; solo cambia en cuántos frames. A 144 Hz casi
+  no queda lugar y la puesta al día no cambia
+  ([ritmo-2026-10](rendimiento/ritmo-2026-10.md)): lo que la frena es que un resultado que llega
+  tarde espera al frame siguiente.
 
 Medido con `headless_world` en release, terreno por defecto, bucle a 144 Hz (`--hz 144`), que es
 el ritmo del límite de FPS por defecto (ADR 0013). El frame es todo el `App::update` (mundo sin

@@ -114,7 +114,9 @@ de 20 s por caso y versión, intercaladas (antes: 0e92379, que mide sin cambiar 
   queda pendiente.
 - Con menos updates por segundo (vsync, refrescos salteados) el mundo se pone al día más lento
   después de cruzar un borde, porque su trabajo tiene presupuesto por frame: en vuelo a 144 la
-  puesta al día pasa de 19.5 a 24.2 ms, y con vsync de 17.7 a 29.4 ms.
+  puesta al día pasa de 19.5 a 24.2 ms, y con vsync de 17.7 a 29.4 ms. Agrandar ese presupuesto
+  hacia la parte ociosa del frame casi no ayuda a 144 Hz
+  ([ritmo-2026-10](../rendimiento/ritmo-2026-10.md)).
 - Las updates siguen corriendo en `about_to_wait`, nunca dentro de `RedrawRequested`, y nunca
   esperan un callback sin límite de tiempo, así que la simulación no se congela con la ventana
   oculta. Lo que cambia del contrato de ADR 0008 es que, al seguir al monitor, el callback decide
