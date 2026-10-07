@@ -1,4 +1,4 @@
-//! Components, messages and resources of physics bodies (phases P2 and P3 of ADR 0016).
+//! Components, messages and resources of physics bodies (phases P2 to P4 of ADR 0016).
 
 use crate::core::{
     BodySettings, CollisionLayers, DEFAULT_GRID_SHIFT, LocalBox, Shape, StepParams, SweepConfig,
@@ -10,7 +10,7 @@ use boxel_ecs::prelude::*;
 use boxel_ecs::world::DeferredWorld;
 use boxel_math::{DVec3, Vec2};
 use boxel_transform::Transform;
-use boxel_voxel::{BlockPos, Face, WorldPos};
+use boxel_voxel::{BlockPos, BlockState, Face, WorldPos};
 use std::time::Duration;
 
 /// A physics body. Spawn it with a `Transform` (its position) and usually a [`Collider`]:
@@ -75,6 +75,7 @@ pub enum Response {
 /// wall, a trigger zone.
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 #[require(RigidBody = RigidBody::Static)]
+#[component(on_discard = collider_replaced)]
 pub struct Collider {
     /// The shape, centered on its own origin.
     pub shape: Shape,
@@ -145,6 +146,30 @@ impl Collider {
         self.response == Response::Sensor
     }
 }
+
+/// [`Collider`]'s discard hook (a new collider replaces it, it is removed, or a despawn): the place a solid
+/// collider leaves is recorded, so the bodies asleep on it wake up (see [`Sleeping`]).
+fn collider_replaced(mut world: DeferredWorld, context: HookContext) {
+    let entity = context.entity;
+    let (Some(collider), Some(position)) = (
+        world.get::<Collider>(entity).copied(),
+        world.get::<BodyPosition>(entity).copied(),
+    ) else {
+        return;
+    };
+    if collider.is_sensor() || world.get::<Projectile>(entity).is_some() {
+        // Nothing rests on a sensor or a projectile.
+        return;
+    }
+    if let Some(mut vacated) = world.get_resource_mut::<Vacated>() {
+        vacated.0.push((position.0, collider.voxel_box()));
+    }
+}
+
+/// Places that solid bodies left since the latest step (a teleport, a changed or removed
+/// collider, a despawn): the sleeping bodies near them wake up in the next step.
+#[derive(Resource, Default)]
+pub(crate) struct Vacated(pub(crate) Vec<(WorldPos, LocalBox)>);
 
 /// Marker: contacts of this solid body with other solid bodies are reported as
 /// [`CollisionStarted`] and [`CollisionEnded`] too (sensor overlaps always are). A contact is a
@@ -264,6 +289,81 @@ impl Contacts {
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Frozen;
 
+/// Marker: this body is asleep. Physics skips it (no gravity, no sweep, no interpolation) until
+/// something wakes it, so a pile of resting crates or dropped items costs almost nothing.
+///
+/// A dynamic body falls asleep after `PhysicsSettings::sleep_steps` steps (32 by default, half
+/// a second) in a row resting on something ([`Contacts::on_ground`]: on blocks or on another
+/// body), slower than `PhysicsSettings::sleep_speed` on every axis and without being moved by
+/// more than that speed allows (a character whose [`MoveIntent`] wants to walk never counts as
+/// resting). Its velocity is set to exactly 0 and its `Transform` to its
+/// position. A projectile that sticks in a block falls asleep at once.
+///
+/// It wakes up (physics removes the marker) when:
+/// - its [`Velocity`] is set to something other than 0 (a jump, a knockback, a
+///   [`CharacterController`] that wants to walk), or its [`Collider`] or [`BodySettings`]
+///   change;
+/// - it is teleported ([`Teleport`] or a `Transform` write);
+/// - an awake body pushes it, or a solid body it touches moves (the crate under it is pushed
+///   away), is despawned, teleported away or loses its collider;
+/// - a block within one block of its box changes (`boxel_world::BlockChanged`), or a chunk its
+///   box (plus one block) touches loads or unloads (`boxel_world::ChunkDataEvent`; an unload
+///   then freezes it);
+/// - `PhysicsSettings` change (gravity, sleeping turned off).
+///
+/// Insert it to put a body to sleep yourself (its velocity becomes 0 then), remove it to wake
+/// one. On a kinematic body it
+/// stops it; on a static body it changes nothing. A sleeping body still blocks and is found by
+/// rays, box queries and projectiles, and its sensor overlaps stay as they were (no
+/// `CollisionEnded` while both bodies sleep).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[component(storage = "SparseSet", on_add = fell_asleep, on_remove = woke_up)]
+pub struct Sleeping;
+
+/// [`Sleeping`]'s add hook: a sleeping body does not move, so its velocity becomes exactly 0 and
+/// its `Transform` its position (no interpolation left to do). Physics is told (see
+/// [`woke_up`]).
+fn fell_asleep(mut world: DeferredWorld, context: HookContext) {
+    let entity = context.entity;
+    if let Some(mut velocity) = world.get_mut::<Velocity>(entity)
+        && velocity.0 != DVec3::ZERO
+    {
+        velocity.0 = DVec3::ZERO;
+    }
+    if let Some(position) = world.get::<BodyPosition>(entity).map(|p| p.0) {
+        let translation = position.to_dvec3();
+        if let Some(mut transform) = world.get_mut::<Transform>(entity)
+            && transform.translation != translation
+        {
+            transform.translation = translation;
+        }
+        if let Some(mut sync) = world.get_mut::<PhysicsSync>(entity)
+            && sync.last_written != Some(translation)
+        {
+            sync.last_written = Some(translation);
+        }
+        if let Some(mut interpolated) = world.get_mut::<Interpolated>(entity)
+            && interpolated.prev != Some(position)
+        {
+            interpolated.prev = Some(position);
+        }
+    }
+    woke_up(world, context);
+}
+
+/// [`Sleeping`]'s remove hook (and the end of [`fell_asleep`]): physics keeps its sleeping
+/// bodies apart (they are not stepped and not gathered every step), so it is told whenever the
+/// marker comes or goes, by anyone (despawns included).
+fn woke_up(mut world: DeferredWorld, context: HookContext) {
+    if let Some(mut log) = world.get_resource_mut::<SleepLog>() {
+        log.0.push(context.entity);
+    }
+}
+
+/// Entities whose [`Sleeping`] marker came or went since physics last looked.
+#[derive(Resource, Default)]
+pub(crate) struct SleepLog(pub(crate) Vec<Entity>);
+
 /// Opt-in smooth rendering: physics moves bodies at the fixed rate (64 Hz), so at 144 fps a
 /// body would move in steps. With this component, after the fixed steps of every frame
 /// (`RunFixedMainLoopSystems::AfterFixedMainLoop`) its `Transform` is set between its position
@@ -318,6 +418,13 @@ pub struct PhysicsSync {
     /// How far the body moved in the latest step before the solve (the sweep or the kinematic
     /// move): the solve uses it to tell which side another body came from.
     pub(crate) moved: DVec3,
+    /// How far the body moved in the latest step in all: the sweep (or the kinematic move, or
+    /// a projectile's flight) plus the pushes of the solve. Not a teleport.
+    pub(crate) net: DVec3,
+    /// Steps in a row the body was still (see [`Sleeping`]).
+    pub(crate) still: u32,
+    /// The latest step teleported the body (or it was new).
+    pub(crate) teleported: bool,
 }
 
 impl PhysicsSync {
@@ -327,9 +434,15 @@ impl PhysicsSync {
     }
 
     /// How far the body moved in the latest step, before the pushes between bodies (zero for
-    /// static and frozen bodies).
+    /// static, frozen and sleeping bodies).
     pub fn moved(&self) -> DVec3 {
         self.moved
+    }
+
+    /// How far the body moved in the latest step in all, pushes between bodies included (not
+    /// teleports).
+    pub fn net_moved(&self) -> DVec3 {
+        self.net
     }
 }
 
@@ -397,6 +510,127 @@ pub struct VoxelImpact {
     pub speed: f64,
 }
 
+/// What a [`Projectile`] does when it hits a block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum OnBlock {
+    /// It sticks: it stops with its center on the block's face and falls asleep at once. It
+    /// stays there until the block changes (then it falls) or something else wakes it.
+    #[default]
+    Stop,
+    /// It bounces off: the velocity along the hit axis turns around, scaled by
+    /// `BodySettings::restitution` (and stops on that axis when it is slower than
+    /// `BodySettings::bounce_min_speed` or one step of gravity, as a body's bounces do).
+    Bounce,
+}
+
+/// What a [`Projectile`] does when it hits a body.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum OnEntity {
+    /// It stops where it touches the body (velocity 0) and falls from there, unless the game
+    /// removes it. The body is not pushed: apply a knockback yourself on [`ProjectileHit`].
+    #[default]
+    Stop,
+    /// It goes through: each body it enters is hit once, and it flies on.
+    Pass,
+}
+
+/// A fast small body (an arrow, a thrown snowball) that never tunnels: each step moves its
+/// center along a segment that is tested against the voxels (an exact DDA, at any speed) and
+/// against the solid bodies in its layers (their boxes grown by the projectile's half extents:
+/// exact for boxes, a sphere counts as its bounding box). The earliest hit sends a
+/// [`ProjectileHit`] and ends the step there.
+///
+/// Spawn it on a [`RigidBody::Dynamic`] body. Its [`Collider`] (if any) gives the half extents
+/// (the shape's bounding box), its offset and its layers; a projectile without one is a point.
+/// Gravity and drag come from [`BodySettings`] (`BodySettings::arrow()`), with no speed limit.
+/// Projectiles take no part in collisions between bodies (no pushes, no sensor events, not in
+/// the body queries) and do not hit each other.
+///
+/// ```ignore
+/// commands.spawn((
+///     RigidBody::Dynamic,
+///     Projectile::arrow().ignoring(shooter),
+///     Collider::aabb(DVec3::splat(0.05)),
+///     BodySettings::arrow(),
+///     Teleport(eye),
+///     Velocity(aim * 60.0),
+/// ));
+/// ```
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Projectile {
+    /// What a block hit does.
+    pub on_block: OnBlock,
+    /// What a body hit does.
+    pub on_entity: OnEntity,
+    /// A body it never hits (its shooter).
+    pub ignore: Option<Entity>,
+    /// The block it is stuck in (after a [`OnBlock::Stop`] hit).
+    pub(crate) stuck: Option<BlockPos>,
+}
+
+impl Projectile {
+    /// A projectile that does `on_block` and `on_entity`.
+    pub const fn new(on_block: OnBlock, on_entity: OnEntity) -> Self {
+        Self {
+            on_block,
+            on_entity,
+            ignore: None,
+            stuck: None,
+        }
+    }
+
+    /// An arrow: sticks in blocks, stops at bodies.
+    pub const fn arrow() -> Self {
+        Self::new(OnBlock::Stop, OnEntity::Stop)
+    }
+
+    /// The same projectile, never hitting `entity` (its shooter).
+    pub const fn ignoring(self, entity: Entity) -> Self {
+        Self {
+            ignore: Some(entity),
+            ..self
+        }
+    }
+
+    /// The block it is stuck in, if it stuck in one ([`OnBlock::Stop`]).
+    pub const fn stuck_in(&self) -> Option<BlockPos> {
+        self.stuck
+    }
+}
+
+/// What a [`Projectile`] hit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectileTarget {
+    /// A full block.
+    Block {
+        /// The block.
+        pos: BlockPos,
+        /// The face it entered through; `None` when it started inside the block.
+        face: Option<Face>,
+        /// The block's state.
+        state: BlockState,
+    },
+    /// A body.
+    Entity(Entity),
+}
+
+/// A [`Projectile`] hit a block or a body in the latest fixed step. Written at the end of the
+/// step, sorted by projectile and, for one projectile that passes through several bodies, in
+/// the order it hit them. Read them in `Update` like [`VoxelImpact`].
+#[derive(Message, Clone, Copy, Debug, PartialEq)]
+pub struct ProjectileHit {
+    /// The projectile.
+    pub projectile: Entity,
+    /// What it hit.
+    pub target: ProjectileTarget,
+    /// Where the projectile's center was when it hit.
+    pub point: WorldPos,
+    /// Its velocity just before the hit, blocks per second (for a knockback).
+    pub velocity: DVec3,
+    /// Its speed just before the hit, blocks per second.
+    pub speed: f64,
+}
+
 /// World-wide physics settings. Read every step: changes apply to the next one.
 #[derive(Resource, Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
@@ -419,6 +653,16 @@ pub struct PhysicsSettings {
     /// Bodies wider than two cells are tested against every other body, so raise it for big
     /// bodies. At most 16.
     pub grid_shift: u32,
+    /// A body resting on something and slower than this on every axis (blocks per second)
+    /// counts as still (default 0.05; see [`Sleeping`]).
+    pub sleep_speed: f64,
+    /// Steps a body stays still before it falls asleep (default 32: half a second at 64 Hz).
+    /// 0 turns sleeping off (and wakes the sleeping bodies).
+    pub sleep_steps: u32,
+    /// The step moves the dynamic bodies (and the projectiles) on the compute threads when
+    /// more of them than this are awake (default 256). Each body only reads the world and
+    /// writes itself, so the results are bit-identical either way.
+    pub parallel_threshold: usize,
 }
 
 impl Default for PhysicsSettings {
@@ -432,6 +676,9 @@ impl Default for PhysicsSettings {
             impact_speed: step.impact_speed,
             solver_passes: 2,
             grid_shift: DEFAULT_GRID_SHIFT,
+            sleep_speed: 0.05,
+            sleep_steps: 32,
+            parallel_threshold: 256,
         }
     }
 }
@@ -456,12 +703,22 @@ impl PhysicsSettings {
 /// F3 overlay ([`PhysicsStats::summary`]).
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq)]
 pub struct PhysicsStats {
-    /// Bodies (entities with a `RigidBody`).
+    /// Bodies (entities with a `RigidBody`), awake and asleep.
     pub bodies: usize,
-    /// Dynamic bodies.
+    /// Dynamic bodies the latest step moved (awake ones, frozen and projectiles included).
     pub dynamic: usize,
     /// Dynamic bodies that did not move because of unloaded chunks.
     pub frozen: usize,
+    /// Bodies asleep after the latest step ([`Sleeping`]).
+    pub sleeping: usize,
+    /// Bodies woken up in the latest step.
+    pub woken: usize,
+    /// Projectiles the latest step moved.
+    pub projectiles: usize,
+    /// Projectile hits of the latest step.
+    pub hits: usize,
+    /// The latest step moved the bodies on several threads.
+    pub parallel: bool,
     /// Candidate pairs of the broadphase in the latest step.
     pub pairs: usize,
     /// Pushes between solid bodies in the latest step (one per overlapping pair and pass).
@@ -481,19 +738,22 @@ pub struct PhysicsStats {
 }
 
 impl PhysicsStats {
-    /// `bodies=12 dynamic=10 frozen=0 pairs=3 pushes=1 overlaps=2 impacts=1 step=0.012ms
-    /// solve=0.004ms steps=640`.
+    /// `bodies=12 dynamic=10 frozen=0 sleeping=2 pairs=3 pushes=1 overlaps=2 impacts=1
+    /// projectiles=1 hits=0 step=0.012ms solve=0.004ms steps=640`.
     pub fn summary(&self) -> String {
         format!(
-            "bodies={} dynamic={} frozen={} pairs={} pushes={} overlaps={} impacts={} \
-             step={:.3}ms solve={:.3}ms steps={}",
+            "bodies={} dynamic={} frozen={} sleeping={} pairs={} pushes={} overlaps={} \
+             impacts={} projectiles={} hits={} step={:.3}ms solve={:.3}ms steps={}",
             self.bodies,
             self.dynamic,
             self.frozen,
+            self.sleeping,
             self.pairs,
             self.pushes,
             self.overlaps,
             self.impacts,
+            self.projectiles,
+            self.hits,
             self.step_time.as_secs_f64() * 1e3,
             self.solve_time.as_secs_f64() * 1e3,
             self.steps

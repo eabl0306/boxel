@@ -65,8 +65,11 @@ SEG segundos; al salir imprime updates y frames mostrados por segundo y el uso d
 **physics_sandbox**: la física propia (ADR 0016) en un mundo generado. Arranca caminando sobre el
 suelo: WASD camina, Espacio salta, G vuela, Q tira un objeto que cae y se queda quieto, C tira una
 caja dos bloques adelante (las cajas se apilan, se empujan y se puede subir encima). Al caminar
-sobre un objeto, el jugador lo levanta. F3 muestra el estado del jugador, la línea de física, los
-objetos y las cajas (los cuerpos todavía no se dibujan).
+sobre un objeto, el jugador lo levanta. F dispara una flecha a 60 bloques/s que se clava en el
+bloque que toca y empuja al mob que alcanza, B tira una pelota que rebota hasta quedarse quieta y
+M pone cuatro mobs adelante que caminan solos. Los cuerpos quietos se duermen y no cuestan nada.
+F3 muestra el estado del jugador, la línea de física, los objetos, las cajas, las flechas, las
+pelotas y los mobs (los cuerpos todavía no se dibujan).
 
 ```bash
 cargo run --release --example physics_sandbox

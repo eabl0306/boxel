@@ -92,8 +92,9 @@ impl BodySettings {
         }
     }
 
-    /// An arrow: gravity scale 0.625 (20 blocks/s^2), drag 0.2 /s, no bounce. Projectile rules
-    /// (no speed limit, hits on entities) come in phase P4.
+    /// An arrow: gravity scale 0.625 (20 blocks/s^2), drag 0.2 /s, no bounce. Use it with
+    /// `boxel_physics::Projectile` (no speed limit, segment tests against blocks and bodies);
+    /// Minecraft shoots arrows at about 60 blocks/s.
     pub const fn arrow() -> Self {
         Self {
             gravity_scale: 0.625,
@@ -124,7 +125,7 @@ impl BodySettings {
 /// A velocity component slower than this after drag (blocks per second) is set to exactly 0, so
 /// a slide or a drift ends instead of decaying forever through ever smaller floats. At 64 Hz it
 /// moves a body far less than the contact tolerance per step. Not a sleep threshold: sleeping
-/// (phase P4) uses its own, larger one.
+/// uses its own, larger one (`PhysicsSettings::sleep_speed`).
 pub const STOP_SPEED: f64 = 1e-6;
 
 /// The world-wide inputs of one step: gravity, the timestep and the limits.
@@ -140,6 +141,17 @@ pub struct StepParams {
     pub impact_speed: f64,
     /// Sweep tuning (contact tolerance, depenetration).
     pub sweep: SweepConfig,
+}
+
+impl StepParams {
+    /// The same parameters without the speed limit, as projectiles move (`max_speed = 0`). With
+    /// them, [`predict`] matches a projectile's free flight bit for bit.
+    pub const fn without_speed_limit(self) -> Self {
+        Self {
+            max_speed: 0.0,
+            ..self
+        }
+    }
 }
 
 impl Default for StepParams {

@@ -1,7 +1,13 @@
-//! Collisions between bodies (phase P3 of ADR 0016): the obstacle index of static and kinematic
-//! solids, the [`BodyIndex`] (broadphase grid and snapshot for queries), the solve that pushes
-//! solid bodies apart, sensor overlaps and the collision events, and the body queries
-//! ([`BodyIndex::raycast`], [`BodyIndex::overlap_box`], [`BodyIndex::block_is_free`]).
+//! Collisions between bodies (phases P3 and P4 of ADR 0016): the obstacle index of static and
+//! kinematic solids, the [`BodyIndex`] (the step's bodies in the broadphase grid, the store of
+//! sleeping bodies, and the snapshot for queries), the solve that pushes solid bodies apart,
+//! sensor overlaps and the collision events, and the body queries ([`BodyIndex::raycast`],
+//! [`BodyIndex::overlap_box`], [`BodyIndex::block_is_free`]).
+//!
+//! The step's list holds the awake bodies with a collider, plus the sleeping ones that matter
+//! this step: the ones that fell asleep since the sleeper store's last rebuild, and the ones the
+//! active bodies reach (pulled from the store, see [`crate::sleep`]). Sleeping bodies are
+//! inactive in the grid: two of them never form a pair.
 //!
 //! The solve, per fixed step, after the dynamic bodies moved against the voxels and the
 //! obstacles:
@@ -19,14 +25,18 @@
 //!   pushes it at half its speed).
 //! - Each touching face of a dynamic body is set in its `Contacts::faces`; a body pushed up
 //!   off another stands on it (`Contacts::on_ground`).
+//! - A sleeping body that is pushed, or whose velocity changes, wakes up. So does one that
+//!   touches a solid body that moved this step (the crate under it was pushed away).
 //!
 //! Sensor pairs never push: they are tested after the pushes, and the overlapping ones (by more
 //! than the tolerance; touching does not count) join the step's contact set with the solid
-//! pairs that carry `ReportContacts`. The events compare it with the previous step's set.
+//! pairs that carry `ReportContacts`. Pairs of two inactive bodies (two sleepers, a sleeper and
+//! a static body) are not tested: nothing moved, so they keep the state of the previous step.
+//! The events compare the set with the previous step's.
 
 use crate::components::{
     BodyPosition, Collider, CollisionEnded, CollisionStarted, Contacts, Frozen, PhysicsSettings,
-    PhysicsStats, PhysicsSync, ReportContacts, RigidBody, Velocity,
+    PhysicsStats, PhysicsSync, Projectile, ReportContacts, RigidBody, SleepLog, Sleeping, Velocity,
 };
 use crate::core::sweep::effective_eps as sweep_eps;
 use crate::core::{
@@ -34,12 +44,24 @@ use crate::core::{
     MAX_RAY_DISTANCE, Shape, SweepConfig, box_box_moving, move_box, shape_box, shape_contact,
 };
 use crate::plugin::PhysicsContent;
+use crate::sleep::{SleeperData, Sleepers, sync_sleepers};
 use crate::source::ChunkSource;
+use crate::systems::ensure_compute_pool;
+use boxel_app::FixedTime;
 use boxel_ecs::prelude::*;
 use boxel_math::DVec3;
+use boxel_tasks::ComputeTaskPool;
 use boxel_voxel::{BlockPos, Face, WorldPos};
 use boxel_world::{ChunkMap, WorldSettings};
 use std::time::Instant;
+
+/// How close a sleeping body must be to a solid body that moved for it to wake up, in blocks.
+const WAKE_MARGIN: f64 = 1.0 / 64.0;
+
+/// The broadphase splits its per-body work and the pair sweep over the compute threads from
+/// this many bodies in the step's list (and above `PhysicsSettings::parallel_threshold`):
+/// below it the tasks cost more than they save.
+const PARALLEL_GRID_MIN: usize = 4096;
 
 /// A body pushed along a normal whose `y` is above this stands on the other body
 /// (`Contacts::on_ground`): slopes up to about 45 degrees.
@@ -159,39 +181,87 @@ pub(crate) fn build_obstacles(
 
 // ------------------------------------------------------------------------------- body index
 
-/// One body of the [`BodyIndex`].
+/// One body of the [`BodyIndex`] (in the step's list or in the sleeper store).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct IndexedBody {
-    entity: Entity,
-    pos: WorldPos,
-    shape: Shape,
-    offset: DVec3,
-    layers: CollisionLayers,
-    sensor: bool,
-    report: bool,
-    kind: RigidBody,
-    frozen: bool,
-    weight: f64,
+    pub(crate) entity: Entity,
+    pub(crate) pos: WorldPos,
+    pub(crate) shape: Shape,
+    pub(crate) offset: DVec3,
+    pub(crate) layers: CollisionLayers,
+    pub(crate) sensor: bool,
+    pub(crate) report: bool,
+    pub(crate) kind: RigidBody,
+    pub(crate) frozen: bool,
+    pub(crate) weight: f64,
     /// How far it moved in this step before the solve.
-    step: DVec3,
-    vel: DVec3,
-    faces: u8,
-    on_ground: bool,
+    pub(crate) step: DVec3,
+    pub(crate) vel: DVec3,
+    pub(crate) faces: u8,
+    pub(crate) on_ground: bool,
+    /// It is asleep (a copy from the sleeper store).
+    pub(crate) sleeping: bool,
+    /// It can disturb other bodies this step (see [`broadphase`]); pairs need one active body.
+    pub(crate) active: bool,
+    /// It takes part in collisions between bodies (false for sleepers without a collider and
+    /// sleeping projectiles, which the store keeps only to wake them).
+    pub(crate) collides: bool,
     /// The solve changed its velocity or contacts.
-    dirty: bool,
+    pub(crate) dirty: bool,
     /// The solve moved it.
-    moved: bool,
+    pub(crate) moved: bool,
+    /// A sleeping body the solve woke up.
+    pub(crate) woken: bool,
+    /// How far the solve's pushes moved it.
+    pub(crate) pushed: DVec3,
+    /// Its bounds in the grid it is in (see [`IndexedBody::step_bounds`]).
+    pub(crate) bounds: BlockBounds,
 }
 
 impl IndexedBody {
     /// Its voxel box, relative to `pos`.
-    fn bx(&self) -> LocalBox {
+    pub(crate) fn bx(&self) -> LocalBox {
         self.shape.bounds().translate(self.offset)
     }
 
-    /// A dynamic body physics may move (not frozen).
+    /// The blocks its box reaches.
+    pub(crate) fn end_bounds(&self) -> BlockBounds {
+        BlockBounds::of_box(self.pos, self.bx())
+    }
+
+    /// Its bounds in this step's grid: an active body that moved also covers where it came
+    /// from, so the sleepers it left wake up.
+    pub(crate) fn step_bounds(&self) -> BlockBounds {
+        let step = DVec3::new(
+            finite(self.step.x),
+            finite(self.step.y),
+            finite(self.step.z),
+        );
+        if !self.active || step == DVec3::ZERO {
+            return self.end_bounds();
+        }
+        let bx = self.bx();
+        let from = bx.translate(-step);
+        BlockBounds::of_box(
+            self.pos,
+            LocalBox::new(bx.min.min(from.min), bx.max.max(from.max)),
+        )
+    }
+
+    /// The same body with `bounds` set to its end bounds.
+    pub(crate) fn with_end_bounds(mut self) -> Self {
+        self.bounds = self.end_bounds();
+        self
+    }
+
+    /// A dynamic body physics may move (not frozen; a sleeping one wakes up when moved).
     fn free(&self) -> bool {
         self.kind == RigidBody::Dynamic && !self.frozen
+    }
+
+    /// Asleep, and not woken up by this step's solve.
+    fn still_asleep(&self) -> bool {
+        self.sleeping && !self.woken
     }
 
     /// The bottom of its box, exact anywhere: `(block, offset in [0, 1))`.
@@ -202,20 +272,24 @@ impl IndexedBody {
     }
 }
 
-/// Every body with a [`Collider`] as of the end of the latest fixed step (after the pushes), in
-/// the broadphase grid: what the entity raycast, [`BodyIndex::overlap_box`] and
-/// [`BodyIndex::block_is_free`] search (also through [`crate::PhysicsQuery`]). Rebuilt in
-/// `PhysicsSystems::Broadphase` every step and updated by the solve. Bodies spawned, moved or
-/// despawned since the latest step are not seen until the next one. Empty before the first
-/// step.
+/// Every body with a [`Collider`] as of the end of the latest fixed step (after the pushes):
+/// what the entity raycast, [`BodyIndex::overlap_box`] and [`BodyIndex::block_is_free`] search
+/// (also through [`crate::PhysicsQuery`]). The awake bodies are rebuilt in
+/// `PhysicsSystems::Broadphase` every step and updated by the solve; the sleeping ones live in
+/// a store of their own (see [`crate::Sleeping`]). Bodies spawned, moved or despawned since the
+/// latest step are not seen until the next one. Empty before the first step. Projectiles are
+/// not in it.
 #[derive(Resource)]
 pub struct BodyIndex {
+    /// The step's list, sorted by entity bits.
     bodies: Vec<IndexedBody>,
     grid: Grid,
     pairs: Vec<(u32, u32)>,
     eps: f64,
     order: Vec<(i64, f64, u32)>,
     scratch: ObstacleScratch,
+    ids: Vec<u32>,
+    pub(crate) sleepers: Sleepers,
 }
 
 impl Default for BodyIndex {
@@ -227,6 +301,8 @@ impl Default for BodyIndex {
             eps: sweep_eps(SweepConfig::default().eps),
             order: Vec::new(),
             scratch: ObstacleScratch::default(),
+            ids: Vec::new(),
+            sleepers: Sleepers::default(),
         }
     }
 }
@@ -299,23 +375,46 @@ pub struct BodyHit {
     pub normal: DVec3,
 }
 
+/// The best ray hit so far: `(t, entity bits, entity, normal)`.
+type BestHit = Option<(f64, u64, Entity, DVec3)>;
+
 impl BodyIndex {
-    /// Number of bodies.
+    /// Number of bodies, awake and asleep.
     pub fn len(&self) -> usize {
-        self.bodies.len()
+        self.bodies.len() + self.queryable_sleepers().count()
     }
 
     /// No bodies.
     pub fn is_empty(&self) -> bool {
-        self.bodies.is_empty()
+        self.len() == 0
     }
 
-    /// The bodies, sorted by `Entity::to_bits`.
+    /// The sleepers of the store's grid that queries search (the others are in the step's list
+    /// or gone).
+    fn queryable_sleepers(&self) -> impl Iterator<Item = &IndexedBody> + '_ {
+        let sleepers = &self.sleepers;
+        sleepers
+            .grid_bodies()
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| sleepers.queryable(i as u32))
+            .map(|(_, body)| body)
+    }
+
+    /// The bodies, awake and asleep, sorted by `Entity::to_bits`.
     pub fn entities(&self) -> impl Iterator<Item = Entity> + '_ {
-        self.bodies.iter().map(|b| b.entity)
+        let mut all: Vec<Entity> = self
+            .bodies
+            .iter()
+            .chain(self.queryable_sleepers())
+            .map(|b| b.entity)
+            .collect();
+        all.sort_unstable_by_key(|e| e.to_bits());
+        all.into_iter()
     }
 
-    /// The candidate pairs of the latest broadphase, as entities (`a < b` by bits), sorted.
+    /// The candidate pairs of the latest broadphase, as entities (`a < b` by bits), sorted. Two
+    /// sleeping bodies never form a pair.
     pub fn pairs(&self) -> impl Iterator<Item = (Entity, Entity)> + '_ {
         self.pairs.iter().map(|&(a, b)| {
             (
@@ -336,9 +435,6 @@ impl BodyIndex {
         max_t: f64,
         filter: &BodyFilter<'_>,
     ) -> Option<BodyHit> {
-        if self.bodies.is_empty() {
-            return None;
-        }
         let origin = origin.normalize();
         let dir = if dir.is_finite() { dir } else { DVec3::ZERO };
         let max_t = if max_t.is_nan() {
@@ -346,129 +442,212 @@ impl BodyIndex {
         } else {
             max_t.min(MAX_RAY_DISTANCE / dir.abs().max_element())
         };
-        let mut best: Option<(f64, u32, DVec3)> = None;
-        let test = |i: u32, best: &mut Option<(f64, u32, DVec3)>| {
-            let body = &self.bodies[i as usize];
-            if !filter.accepts(body) {
-                return;
-            }
-            let center = origin.delta_to(&body.pos) + body.offset;
-            if let Some(hit) = body.shape.ray(center, DVec3::ZERO, dir, max_t)
-                && best.is_none_or(|(t, j, _)| hit.t < t || (hit.t == t && i < j))
-            {
-                *best = Some((hit.t, i, hit.normal));
-            }
-        };
-        if self.grid.is_built() {
-            for &l in self.grid.large() {
-                test(l, &mut best);
-            }
-            for (cell, enter) in self.grid.cell_ray(origin, dir, max_t) {
-                // A body hit at `t` has the hit point in a cell the ray entered by `t`.
-                if best.is_some_and(|(t, ..)| enter > t) {
-                    break;
-                }
-                for i in self.grid.cell(cell) {
-                    test(i, &mut best);
-                }
-            }
-        } else {
-            for i in 0..self.bodies.len() as u32 {
-                test(i, &mut best);
-            }
-        }
-        best.map(|(t, i, normal)| BodyHit {
-            entity: self.bodies[i as usize].entity,
+        let mut best: BestHit = None;
+        ray_through(
+            &self.bodies,
+            &self.grid,
+            |_| true,
+            origin,
+            dir,
+            max_t,
+            filter,
+            &mut best,
+        );
+        let sleepers = &self.sleepers;
+        ray_through(
+            sleepers.grid_bodies(),
+            sleepers.grid(),
+            |i| sleepers.queryable(i),
+            origin,
+            dir,
+            max_t,
+            filter,
+            &mut best,
+        );
+        best.map(|(t, _, entity, normal)| BodyHit {
+            entity,
             t,
             point: origin.offset(dir * t),
             normal,
         })
     }
 
-    /// Calls `visit` with every body `filter` accepts that overlaps the box `bx` (relative to
-    /// `pos`) by more than the contact tolerance (touching does not count), in entity order.
-    fn for_each_overlap(
-        &self,
-        pos: WorldPos,
-        bx: LocalBox,
-        filter: &BodyFilter<'_>,
-        mut visit: impl FnMut(&IndexedBody) -> bool,
-    ) {
-        if self.bodies.is_empty() {
-            return;
-        }
-        let pos = pos.normalize();
-        let mut ids = Vec::new();
-        self.grid.query(BlockBounds::of_box(pos, bx), &mut ids);
-        for i in ids {
-            let body = &self.bodies[i as usize];
-            if !filter.accepts(body) {
+    /// Every body (awake or asleep) whose bounds overlap `bounds`, into `out` (cleared first),
+    /// unsorted. `ids` is scratch.
+    pub(crate) fn near(&self, bounds: BlockBounds, ids: &mut Vec<u32>, out: &mut Vec<IndexedBody>) {
+        out.clear();
+        for (bodies, grid, sleepers) in [
+            (&self.bodies[..], &self.grid, false),
+            (self.sleepers.grid_bodies(), self.sleepers.grid(), true),
+        ] {
+            if bodies.is_empty() {
                 continue;
             }
-            let center = pos.delta_to(&body.pos) + body.offset;
-            if shape_box(body.shape, center, bx).is_some_and(|c| c.depth > self.eps) && !visit(body)
-            {
-                return;
-            }
+            ids.clear();
+            grid.query(bounds, ids);
+            out.extend(
+                ids.iter()
+                    .filter(|&&i| !sleepers || self.sleepers.queryable(i))
+                    .map(|&i| bodies[i as usize]),
+            );
         }
+    }
+
+    /// The bodies `filter` accepts that overlap the box `bx` (relative to `pos`) by more than
+    /// the contact tolerance, sorted by entity.
+    fn overlapping(&self, pos: WorldPos, bx: LocalBox, filter: &BodyFilter<'_>) -> Vec<Entity> {
+        let pos = pos.normalize();
+        let mut ids = Vec::new();
+        let mut near = Vec::new();
+        self.near(BlockBounds::of_box(pos, bx), &mut ids, &mut near);
+        let mut found: Vec<Entity> = near
+            .iter()
+            .filter(|body| {
+                filter.accepts(body)
+                    && shape_box(body.shape, pos.delta_to(&body.pos) + body.offset, bx)
+                        .is_some_and(|c| c.depth > self.eps)
+            })
+            .map(|body| body.entity)
+            .collect();
+        found.sort_unstable_by_key(|e| e.to_bits());
+        found
     }
 
     /// The bodies `filter` accepts that overlap the box `bx` (relative to `pos`) by more than
     /// the contact tolerance, sorted by entity. Spheres are tested exactly.
     pub fn overlap_box(&self, pos: WorldPos, bx: LocalBox, filter: &BodyFilter<'_>) -> Vec<Entity> {
-        let mut found = Vec::new();
-        self.for_each_overlap(pos, bx, filter, |body| {
-            found.push(body.entity);
-            true
-        });
-        found
+        self.overlapping(pos, bx, filter)
     }
 
     /// No solid body overlaps block `block` (by more than the contact tolerance): a block placed
     /// there would not end up inside a player, a mob or a crate. Sensors (dropped items) do not
     /// count; whatever the block holds now is not checked.
     pub fn block_is_free(&self, block: BlockPos) -> bool {
-        let mut free = true;
-        self.for_each_overlap(
+        self.overlapping(
             WorldPos::from(block),
             LocalBox::new(DVec3::ZERO, DVec3::ONE),
             &BodyFilter::default(),
-            |_| {
-                free = false;
-                false
-            },
-        );
-        free
+        )
+        .is_empty()
     }
 }
 
-/// [`crate::PhysicsSystems::Broadphase`]: the [`BodyIndex`] of every body with a collider, in
-/// entity order, and its candidate pairs.
+/// The ray of [`BodyIndex::raycast`] through one set of bodies and its grid, keeping the best
+/// hit in `best`. `keep` says which grid indices count.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "an internal helper of one method"
+)]
+fn ray_through(
+    bodies: &[IndexedBody],
+    grid: &Grid,
+    keep: impl Fn(u32) -> bool,
+    origin: WorldPos,
+    dir: DVec3,
+    max_t: f64,
+    filter: &BodyFilter<'_>,
+    best: &mut BestHit,
+) {
+    if bodies.is_empty() {
+        return;
+    }
+    let test = |i: u32, best: &mut BestHit| {
+        if !keep(i) {
+            return;
+        }
+        let body = &bodies[i as usize];
+        if !filter.accepts(body) {
+            return;
+        }
+        let center = origin.delta_to(&body.pos) + body.offset;
+        let bits = body.entity.to_bits();
+        if let Some(hit) = body.shape.ray(center, DVec3::ZERO, dir, max_t)
+            && best.is_none_or(|(t, b, ..)| hit.t < t || (hit.t == t && bits < b))
+        {
+            *best = Some((hit.t, bits, body.entity, hit.normal));
+        }
+    };
+    if grid.is_built() {
+        for &l in grid.large() {
+            test(l, best);
+        }
+        for (cell, enter) in grid.cell_ray(origin, dir, max_t) {
+            // A body hit at `t` has the hit point in a cell the ray entered by `t`.
+            if best.is_some_and(|(t, ..)| enter > t) {
+                break;
+            }
+            for i in grid.cell(cell) {
+                test(i, best);
+            }
+        }
+    } else {
+        for i in 0..bodies.len() as u32 {
+            test(i, best);
+        }
+    }
+}
+
+/// A body can disturb others this step (see [`broadphase`]).
+fn is_active(kind: RigidBody, sync: &PhysicsSync, collider_changed: bool, asleep: bool) -> bool {
+    match kind {
+        RigidBody::Dynamic => !asleep,
+        RigidBody::Kinematic => {
+            !asleep && (sync.moved != DVec3::ZERO || sync.teleported || collider_changed)
+        }
+        RigidBody::Static => sync.teleported || collider_changed,
+    }
+}
+
+/// [`crate::PhysicsSystems::Broadphase`]: the step's list of the [`BodyIndex`] (every awake
+/// body with a collider, plus the sleepers that matter this step) and its candidate pairs,
+/// sorted by entity. The list's own order does not matter: everything that follows goes
+/// through the pairs.
+///
+/// Active bodies (they can disturb others this step): awake dynamic bodies (frozen too),
+/// kinematic bodies that moved, and bodies teleported this step or whose collider changed. An
+/// active body that moved is in the grid with the bounds it swept (from where it was to where it
+/// is), and pulls the sleepers those bounds reach out of the store.
 pub(crate) fn broadphase(
     settings: Res<PhysicsSettings>,
     mut index: ResMut<BodyIndex>,
     mut stats: ResMut<PhysicsStats>,
-    bodies: Query<(
-        Entity,
-        &RigidBody,
-        &Collider,
-        &BodyPosition,
-        &Velocity,
-        &Contacts,
-        &BodySettings,
-        &PhysicsSync,
-        Has<Frozen>,
-        Has<ReportContacts>,
-    )>,
+    mut log: ResMut<SleepLog>,
+    sleeper_data: Query<SleeperData, With<Sleeping>>,
+    bodies: Query<
+        (
+            Entity,
+            &RigidBody,
+            Ref<Collider>,
+            &BodyPosition,
+            &Velocity,
+            &Contacts,
+            &BodySettings,
+            &PhysicsSync,
+            Has<Frozen>,
+            Has<ReportContacts>,
+        ),
+        (Without<Sleeping>, Without<Projectile>),
+    >,
 ) {
     let start = Instant::now();
-    let index = &mut *index;
-    index.eps = sweep_eps(settings.eps);
-    index.bodies.clear();
+    let BodyIndex {
+        bodies: list,
+        grid,
+        pairs,
+        eps,
+        sleepers,
+        ids,
+        ..
+    } = &mut *index;
+    sync_sleepers(sleepers, &mut log, &sleeper_data);
+    sleepers.begin_step(settings.grid_shift);
+    *eps = sweep_eps(settings.eps);
+    list.clear();
     for (entity, kind, collider, position, velocity, contacts, body, sync, frozen, report) in
         &bodies
     {
-        index.bodies.push(IndexedBody {
+        let active = is_active(*kind, sync, collider.is_changed(), false);
+        list.push(IndexedBody {
             entity,
             pos: position.0.normalize(),
             shape: collider.shape,
@@ -483,25 +662,89 @@ pub(crate) fn broadphase(
             vel: velocity.0,
             faces: contacts.faces,
             on_ground: contacts.on_ground,
+            sleeping: false,
+            active,
+            collides: true,
             dirty: false,
             moved: false,
+            woken: false,
+            pushed: DVec3::ZERO,
+            bounds: BlockBounds::default(),
         });
     }
-    // Entity order: pairs, pushes and events come out the same on every run.
-    index
-        .bodies
-        .sort_unstable_by_key(|body| body.entity.to_bits());
-    index.grid.reset(settings.grid_shift);
-    for body in &index.bodies {
-        let active = body.kind == RigidBody::Dynamic || body.sensor || body.report;
-        index.grid.insert(
-            BlockBounds::of_box(body.pos, body.bx()),
-            body.layers,
-            active,
-        );
+    // Each body's bounds on its own: on the compute threads for many bodies.
+    let parallel = list.len() > settings.parallel_threshold.max(PARALLEL_GRID_MIN);
+    if parallel {
+        ensure_compute_pool();
+        let pool = ComputeTaskPool::get();
+        let size = list.len().div_ceil(pool.thread_num().max(1) * 2).max(64);
+        pool.scope(|scope| {
+            for chunk in list.chunks_mut(size) {
+                scope.spawn(async move {
+                    for body in chunk {
+                        body.bounds = body.step_bounds();
+                    }
+                });
+            }
+        });
+    } else {
+        for body in list.iter_mut() {
+            body.bounds = body.step_bounds();
+        }
     }
-    index.grid.pairs(&mut index.pairs);
-    stats.pairs = index.pairs.len();
+    // The sleepers the active bodies reach, and the ones that fell asleep since the store's
+    // last rebuild (not in its grid yet).
+    if sleepers.has_grid_bodies() {
+        let awake = list.len();
+        for i in 0..awake {
+            if list[i].active {
+                let bounds = list[i].bounds;
+                sleepers.pull(bounds, ids, list);
+            }
+        }
+    }
+    list.extend(sleepers.pending_colliders().copied());
+    grid.reset(settings.grid_shift);
+    for body in list.iter() {
+        grid.insert(body.bounds, body.layers, body.active);
+    }
+    if parallel {
+        // The cells split into ranges, one task each: the pairs come out sorted below anyway.
+        grid.build();
+        let pool = ComputeTaskPool::get();
+        let grid = &*grid;
+        let ranges = grid.pair_ranges(pool.thread_num().max(1) * 4);
+        let parts = pool.scope(|scope| {
+            for range in ranges {
+                scope.spawn(async move {
+                    let mut found = Vec::new();
+                    grid.pairs_in(range, &mut found);
+                    found
+                });
+            }
+        });
+        pairs.clear();
+        for mut part in parts {
+            pairs.append(&mut part);
+        }
+        grid.large_pairs(pairs);
+    } else {
+        grid.pairs(pairs);
+    }
+    // Entity order (each pair's lower entity first): pairs, pushes and events come out the same
+    // on every run, whatever the order of the list.
+    for pair in pairs.iter_mut() {
+        if list[pair.0 as usize].entity.to_bits() > list[pair.1 as usize].entity.to_bits() {
+            *pair = (pair.1, pair.0);
+        }
+    }
+    pairs.sort_unstable_by_key(|&(a, b)| {
+        (
+            list[a as usize].entity.to_bits(),
+            list[b as usize].entity.to_bits(),
+        )
+    });
+    stats.pairs = pairs.len();
     stats.solve_time = start.elapsed();
 }
 
@@ -583,6 +826,8 @@ impl PushWorld<'_, '_> {
                 body.on_ground |= out.on_ground();
                 body.moved = true;
                 body.dirty = true;
+                body.woken |= body.sleeping;
+                body.pushed += out.moved;
                 out.moved.dot(dir)
             }
             Err(_) => 0.0,
@@ -651,9 +896,11 @@ fn push_pair(
     if approach < 0.0 {
         if a_free {
             a.vel += n * (approach * share_a);
+            a.woken |= a.sleeping;
         }
         if b_free {
             b.vel -= n * (approach * share_b);
+            b.woken |= b.sleeping;
         }
     }
     // A body that takes the whole push lands exactly on the other one's face. With a split,
@@ -679,18 +926,46 @@ fn push_pair(
     true
 }
 
-/// [`crate::PhysicsSystems::Solve`]: pushes solid pairs apart, finds the overlapping pairs that
-/// report events, writes the changed bodies back and refreshes the index for queries.
+/// A sleeping solid body `sleeper` touches (within [`WAKE_MARGIN`]) the solid body `mover`
+/// anywhere between where `mover` started this step and where it ended (the sweep, then the
+/// pushes).
+fn touches_path(sleeper: &IndexedBody, mover: &IndexedBody) -> bool {
+    let rel = sleeper.pos.delta_to(&mover.pos);
+    let end = mover.bx().translate(rel);
+    let net = mover.step + mover.pushed;
+    let mut path = end;
+    for back in [net, mover.pushed] {
+        let at = end.translate(-back);
+        path = LocalBox::new(path.min.min(at.min), path.max.max(at.max));
+    }
+    let margin = DVec3::splat(WAKE_MARGIN);
+    let path = LocalBox::new(path.min - margin, path.max + margin);
+    path.overlaps(sleeper.bx(), 0.0)
+}
+
+/// [`crate::PhysicsSystems::Solve`]: pushes solid pairs apart, wakes the sleepers that were
+/// pushed or lost what they rested on, finds the overlapping pairs that report events, writes
+/// the changed bodies back and refreshes the index for queries.
 pub(crate) fn solve(
+    mut commands: Commands,
     map: Res<ChunkMap>,
     world: Res<WorldSettings>,
     content: Res<PhysicsContent>,
     settings: Res<PhysicsSettings>,
+    fixed: Res<FixedTime>,
     obstacles: Res<ObstacleIndex>,
     mut index: ResMut<BodyIndex>,
     mut contacts: ResMut<ContactSet>,
     mut stats: ResMut<PhysicsStats>,
-    mut writeback: Query<(&mut BodyPosition, &mut Velocity, &mut Contacts)>,
+    mut writeback: Query<(
+        &mut BodyPosition,
+        &mut Velocity,
+        &mut Contacts,
+        &mut PhysicsSync,
+        &RigidBody,
+        Ref<Collider>,
+        Has<Sleeping>,
+    )>,
 ) {
     let start = Instant::now();
     let BodyIndex {
@@ -700,7 +975,11 @@ pub(crate) fn solve(
         eps,
         order,
         scratch,
+        sleepers,
+        ..
     } = &mut *index;
+    // `scratch` holds index pairs taken from the entity-sorted `pairs`, so its entity pairs
+    // come out sorted below.
     let eps = *eps;
     let contacts = &mut *contacts;
     contacts.scratch.clear();
@@ -740,25 +1019,54 @@ pub(crate) fn solve(
     }
     order.sort_unstable_by(|x, y| x.0.cmp(&y.0).then(x.1.total_cmp(&y.1)).then(x.2.cmp(&y.2)));
     let mut pushes = 0;
+    // The bodies the solve may change: the ones of overlapping pairs.
+    let mut touched: Vec<u32> = Vec::new();
     for pass in 0..settings.solver_passes.max(1) {
         for &(_, _, k) in order.iter() {
             let (a, b) = pairs[k as usize];
-            let (mut first, mut second) = (bodies[a as usize], bodies[b as usize]);
-            let Some(contact) = pair_contact(&first, &second, eps).filter(|c| c.depth > eps) else {
+            let Ok([first, second]) = bodies.get_disjoint_mut([a as usize, b as usize]) else {
+                continue;
+            };
+            let Some(contact) = pair_contact(first, second, eps).filter(|c| c.depth > eps) else {
                 continue;
             };
             if pass == 0 && (first.report || second.report) {
                 contacts.scratch.push((a, b));
             }
-            if settings.solver_passes > 0
-                && push_pair(&mut first, &mut second, contact, &mut push_world)
-            {
+            touched.push(a);
+            touched.push(b);
+            if settings.solver_passes > 0 && push_pair(first, second, contact, &mut push_world) {
                 pushes += 1;
             }
-            bodies[a as usize] = first;
-            bodies[b as usize] = second;
         }
     }
+
+    // Sleepers touching a solid body that moved this step (what they rested on may be gone).
+    let still = settings.sleep_speed * fixed.timestep().as_secs_f64();
+    let moved = |body: &IndexedBody| {
+        !body.sensor
+            && !body.still_asleep()
+            && (body.step + body.pushed).abs().max_element() > still
+    };
+    let mut lost_support = Vec::new();
+    for &(a, b) in pairs.iter() {
+        for (s, m) in [(a, b), (b, a)] {
+            let (sleeper, mover) = (&bodies[s as usize], &bodies[m as usize]);
+            if sleeper.still_asleep()
+                && !sleeper.sensor
+                && moved(mover)
+                && touches_path(sleeper, mover)
+            {
+                lost_support.push(s);
+            }
+        }
+    }
+    for s in lost_support {
+        bodies[s as usize].woken = true;
+        touched.push(s);
+    }
+    touched.sort_unstable();
+    touched.dedup();
 
     // Sensor pairs, at the bodies' final places.
     for &(a, b) in pairs.iter() {
@@ -769,7 +1077,6 @@ pub(crate) fn solve(
             contacts.scratch.push((a, b));
         }
     }
-    contacts.scratch.sort_unstable();
     contacts.current.clear();
     contacts.current.extend(
         contacts
@@ -777,15 +1084,47 @@ pub(crate) fn solve(
             .iter()
             .map(|&(a, b)| (bodies[a as usize].entity, bodies[b as usize].entity)),
     );
+    // Pairs of two inactive bodies were not tested: nothing moved them, so they overlap as
+    // they did in the previous step (while both still exist with a collider; projectiles
+    // never pair).
+    let inactive = |entity: Entity| -> bool {
+        writeback
+            .get(entity)
+            .is_ok_and(|(.., sync, kind, collider, asleep)| {
+                !is_active(*kind, sync, collider.is_changed(), asleep)
+            })
+    };
+    for &(a, b) in contacts.previous.iter() {
+        if inactive(a) && inactive(b) {
+            contacts.current.push((a, b));
+        }
+    }
+    // Pairs come with the lower entity first.
+    contacts
+        .current
+        .sort_unstable_by_key(|&(a, b)| (a.to_bits(), b.to_bits()));
+    contacts.current.dedup();
 
     // Write back and refresh the grid for queries.
-    for (i, body) in bodies.iter_mut().enumerate() {
-        if body.dirty
-            && let Ok((mut position, mut velocity, mut body_contacts)) =
+    let mut woken = Vec::new();
+    for &i in &touched {
+        let body = &mut bodies[i as usize];
+        if body.still_asleep() {
+            // Nothing to write: its copy in the list is as the store keeps it, give or take
+            // this step's touching faces.
+            body.dirty = false;
+            continue;
+        }
+        if body.woken {
+            woken.push(body.entity);
+        }
+        if (body.dirty || body.woken)
+            && let Ok((mut position, mut velocity, mut body_contacts, mut sync, ..)) =
                 writeback.get_mut(body.entity)
         {
             if body.moved {
                 position.set_if_neq(BodyPosition(body.pos));
+                sync.net += body.pushed;
             }
             velocity.set_if_neq(Velocity(body.vel));
             let new = Contacts {
@@ -798,11 +1137,17 @@ pub(crate) fn solve(
         body.dirty = false;
         if body.moved {
             body.moved = false;
-            grid.set_bounds(i as u32, BlockBounds::of_box(body.pos, body.bx()));
+            body.bounds = body.end_bounds();
+            grid.set_bounds(i, body.bounds);
         }
     }
     if !grid.is_built() {
         grid.build();
+    }
+    stats.woken += woken.len();
+    for entity in woken {
+        sleepers.remove(entity);
+        commands.entity(entity).try_remove::<Sleeping>();
     }
     stats.pushes = pushes;
     stats.overlaps = contacts.current.len();

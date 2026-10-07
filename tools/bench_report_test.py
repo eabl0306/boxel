@@ -103,6 +103,8 @@ class FormatTest(unittest.TestCase):
         self.assertEqual(br.title(static), 'static r16')
         static['run']['fps_limit'] = 60
         self.assertEqual(br.title(static), 'static r16 limit 60 fps')
+        static['run']['bodies'] = '10000 item, 0 projectiles'
+        self.assertEqual(br.title(static), 'static r16 limit 60 fps bodies 10000 item, 0 projectiles')
         self.assertEqual(br.get(SAMPLE, ('frames', 'crossing', 'max_ms')), 6.5)
         self.assertIsNone(br.get(SAMPLE, ('frames', 'missing', 'max_ms')))
 
@@ -237,6 +239,23 @@ class OutputTest(unittest.TestCase):
         code, out, _ = run_main('--compare', self.write('a.md', SAMPLE), self.write('b.md', capped))
         self.assertEqual(code, 0)
         self.assertIn('Note: the settings differ (fps limit 0 -> 144)', out)
+
+    def test_compare_directories_keeps_bodies_apart(self):
+        # Old runs have no bodies field: they had no physics bodies.
+        crowded = copy.deepcopy(SAMPLE)
+        crowded['run']['bodies'] = '1000 mob, 0 projectiles'
+        self.write('1-fly.md', SAMPLE, 'base')
+        self.write('2-crowded.md', crowded, 'base')
+        self.write('3-fly.md', SAMPLE, 'new')
+        self.write('4-crowded.md', crowded, 'new')
+        code, out, _ = run_main('--compare', os.path.join(self.dir.name, 'base'),
+                                os.path.join(self.dir.name, 'new'))
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count('### '), 2, 'runs without bodies with each other')
+        self.assertIn('2-crowded.md -> 4-crowded.md', out)
+        code, out, _ = run_main('--compare', self.write('a.md', SAMPLE), self.write('b.md', crowded))
+        self.assertEqual(code, 0)
+        self.assertIn("Note: the settings differ (bodies  -> 1000 mob, 0 projectiles)", out)
 
     def test_usage_errors(self):
         self.assertEqual(run_main()[0], 1)

@@ -8,8 +8,8 @@ use boxel_app::{App, First, FixedTime, Time, TimePlugin, TimeSystems, Update};
 use boxel_ecs::prelude::*;
 use boxel_math::{DVec3, I64Vec3};
 use boxel_physics::{
-    BodyPosition, Collider, CollisionEnded, CollisionStarted, Frozen, PhysicsPlugin, RigidBody,
-    Teleport, VoxelImpact,
+    BodyPosition, Collider, CollisionEnded, CollisionStarted, Frozen, PhysicsPlugin,
+    PhysicsSettings, ProjectileHit, RigidBody, Sleeping, Teleport, VoxelImpact,
 };
 use boxel_transform::Transform;
 use boxel_voxel::{BlockPos, BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, WorldPos};
@@ -85,6 +85,14 @@ pub fn log_collisions(
     log.0.extend(ended.read().map(|e| (false, e.a, e.b)));
 }
 
+/// Every `ProjectileHit` read in `Update`.
+#[derive(Resource, Default)]
+pub struct Hits(pub Vec<ProjectileHit>);
+
+pub fn log_hits(mut hits: MessageReader<ProjectileHit>, mut log: ResMut<Hits>) {
+    log.0.extend(hits.read().copied());
+}
+
 /// A settled flat world around `base` and its app.
 pub struct Sim {
     pub app: App,
@@ -119,8 +127,9 @@ impl Sim {
         })
         .init_resource::<Impacts>()
         .init_resource::<Collisions>()
+        .init_resource::<Hits>()
         .add_systems(First, synthetic_time.after(TimeSystems))
-        .add_systems(Update, (log_impacts, log_collisions));
+        .add_systems(Update, (log_impacts, log_collisions, log_hits));
         app.finish();
         app.cleanup();
         let mut sim = Self { app, base };
@@ -219,5 +228,13 @@ impl Sim {
 
     pub fn frozen(&self, entity: Entity) -> bool {
         self.app.world().get::<Frozen>(entity).is_some()
+    }
+
+    pub fn asleep(&self, entity: Entity) -> bool {
+        self.app.world().get::<Sleeping>(entity).is_some()
+    }
+
+    pub fn settings(&mut self) -> Mut<'_, PhysicsSettings> {
+        self.app.world_mut().resource_mut::<PhysicsSettings>()
     }
 }

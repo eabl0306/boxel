@@ -19,7 +19,11 @@
 //!    results keep arriving, within [`WorldSettings::job_budget`]. Stale results are dropped (slot
 //!    generation, data version, neighbor epoch, cancel flag).
 //! 4. `Collect`: publish mesh results as [`ChunkMeshEvent`]s, up to
-//!    [`WorldSettings::max_mesh_events_per_frame`].
+//!    [`WorldSettings::max_mesh_events_per_frame`], then the frame's [`ChunkDataEvent`]s.
+//!
+//! Systems that keep state derived from the blocks (physics, lighting) follow the world through
+//! two messages: [`BlockChanged`] for each edited block (written in `Edits`) and
+//! [`ChunkDataEvent`] when a chunk's blocks become readable or stop being readable.
 
 /// `let _span = frame_span!("name");` opens a tracing span until the end of the scope, for frame
 /// breakdowns (`boxel_log::span_times`, the stress example's `--spans`). Only with feature
@@ -54,8 +58,8 @@ pub mod scheduler;
 
 pub use map::{ChunkId, ChunkMap, ChunkSlot, DataState, Interest, MeshState, WorldStats};
 pub use plugin::{
-    BlockEdit, ChunkMeshEvent, ChunkViewer, EditQueue, WorldContent, WorldPlugin, WorldSettings,
-    WorldSystems,
+    BlockChanged, BlockEdit, ChunkDataEvent, ChunkMeshEvent, ChunkViewer, EditQueue, WorldContent,
+    WorldPlugin, WorldSettings, WorldSystems,
 };
 
 /// Common items.

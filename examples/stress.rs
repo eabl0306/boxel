@@ -12,6 +12,9 @@
 //! - `spin`: the camera turns 360 degrees in place over the measurement (visibility changes,
 //!   no new chunks).
 //!
+//! `--bodies N --body-kind item|mob --projectiles M` add physics bodies around the start (see
+//! [`bodies`]): what they add to the frame is the physics part of the frame rule (ADR 0016).
+//!
 //! Every run waits until the world settled, runs `--warmup` seconds, then measures
 //! `--duration` seconds. Each frame records its wall-clock time (`Time::real_delta`, the whole
 //! loop: world and render) and the work it did: chunks generated and jobs finished (counted by
@@ -26,6 +29,8 @@
 //! written, 4 timeout (the world did not settle, or the run took longer than `--timeout`).
 #![expect(clippy::print_stdout, clippy::print_stderr, reason = "CLI output")]
 
+#[path = "stress/bodies.rs"]
+mod bodies;
 #[path = "stress/report.rs"]
 mod report;
 #[path = "stress/spans.rs"]
@@ -33,6 +38,7 @@ mod spans;
 #[path = "shared/world.rs"]
 mod world;
 
+use bodies::{BodiesPlugin, BodyOptions};
 use boxel::app::{TaskPoolOptions, TaskPoolThreadAssignmentPolicy};
 use boxel::gfx::{CLI_HELP, PresentModePref};
 use boxel::log::span_times::{self, SpanFrame, SpanTimes};
@@ -85,9 +91,13 @@ usage: stress [--scenario static|fly|dive|spin] [GPU options] [options]
 The run presents with --present immediate unless --present or BOXEL_PRESENT is given.
 exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 output not written, 4 timeout";
 
-/// The whole help: [`USAGE`] and the world options.
+/// The whole help: [`USAGE`], the physics options and the world options.
 fn usage() -> String {
-    format!("{USAGE}\nworld options:\n{}", world::usage(World::Forest))
+    format!(
+        "{USAGE}\nphysics options:\n{}\nworld options:\n{}",
+        bodies::USAGE,
+        world::usage(World::Forest)
+    )
 }
 
 /// Consecutive settled frames before the world counts as settled.
@@ -162,6 +172,8 @@ struct Options {
     fps_limit: u32,
     spans: bool,
     spans_csv: Option<PathBuf>,
+    /// `--bodies`, `--body-kind` and `--projectiles`.
+    bodies: BodyOptions,
 }
 
 impl Options {
@@ -199,6 +211,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         fps_limit: 0,
         spans: false,
         spans_csv: None,
+        bodies: BodyOptions::default(),
     };
     let mut timeout = None;
     let mut it = args.iter();
@@ -213,7 +226,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                 .or_else(|| it.next().cloned())
                 .ok_or_else(|| format!("{flag} needs a value"))
         };
-        if o.world.parse_flag(flag, &mut value)? {
+        if o.world.parse_flag(flag, &mut value)? || o.bodies.parse_flag(flag, &mut value)? {
             continue;
         }
         match flag {
@@ -1003,6 +1016,7 @@ fn main() -> AppExit {
         .to_string(),
         cpu: cpu_name(),
         threads: std::thread::available_parallelism().map_or(0, usize::from),
+        bodies: options.bodies.label(),
         ..RunInfo::default()
     };
     let mut plugins = DefaultPlugins
@@ -1056,6 +1070,13 @@ fn main() -> AppExit {
     let fps_limit = FrameLimit::new(options.fps_limit);
     let mut app = App::new();
     app.add_plugins(plugins);
+    if options.bodies.enabled() {
+        let [x, y, z, ..] = options.camera;
+        app.add_plugins(BodiesPlugin {
+            options: options.bodies,
+            center: DVec3::new(x, y, z),
+        });
+    }
     add_bench(
         &mut app,
         options,
@@ -1096,6 +1117,23 @@ mod tests {
         assert_eq!(o.render_capacity(), (8 << 20, 32_768));
         assert_eq!(o.fps_limit, 0, "unlimited");
         assert_eq!((o.csv, o.summary), (None, None));
+        assert!(!o.bodies.enabled(), "no physics unless asked");
+    }
+
+    #[test]
+    fn body_flags() {
+        let o = parse(&[
+            "--bodies=10000",
+            "--body-kind",
+            "item",
+            "--projectiles",
+            "200",
+        ])
+        .expect("valid")
+        .expect("not help");
+        assert_eq!(o.bodies.label(), "10000 item, 200 projectiles");
+        assert!(parse(&["--body-kind", "ghost"]).is_err());
+        assert!(usage().contains("--projectiles M"));
     }
 
     #[test]

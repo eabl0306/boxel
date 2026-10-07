@@ -18,6 +18,7 @@ use super::ray::MAX_RAY_DISTANCE;
 use super::shape::LocalBox;
 use boxel_math::{DVec3, I64Vec3};
 use boxel_voxel::{BlockPos, MAX_BLOCK_COORD, WorldPos};
+use std::ops::Range;
 
 /// Cells of the default grid are `2^2 = 4` blocks wide.
 pub const DEFAULT_GRID_SHIFT: u32 = 2;
@@ -418,8 +419,48 @@ impl Grid {
         if !self.built {
             self.build();
         }
-        let (sorted, bodies, mask, shift) =
-            (&self.sorted, &self.bodies, self.bucket_mask, self.shift);
+        self.pairs_in(0..self.sorted.len(), out);
+        self.large_pairs(out);
+        out.sort_unstable();
+    }
+
+    /// Splits the built grid's cell entries into at most `parts` ranges of about the same size
+    /// that start and end on bucket boundaries: [`Grid::pairs_in`] on each (on any thread, in
+    /// any order) plus [`Grid::large_pairs`] gives every pair of [`Grid::pairs`] once. Empty
+    /// when the grid is not built.
+    pub fn pair_ranges(&self, parts: usize) -> Vec<Range<usize>> {
+        let len = if self.built { self.sorted.len() } else { 0 };
+        let parts = parts.max(1);
+        let mut ranges = Vec::with_capacity(parts);
+        let mut start = 0;
+        while start < len {
+            let mut end = (start + len.div_ceil(parts)).min(len);
+            // Never split a bucket.
+            while end < len
+                && self.sorted[end].key & self.bucket_mask
+                    == self.sorted[end - 1].key & self.bucket_mask
+            {
+                end += 1;
+            }
+            ranges.push(start..end);
+            start = end;
+        }
+        ranges
+    }
+
+    /// The candidate pairs `(a, b)`, `a < b`, of the cells whose entries are in `range` (from
+    /// [`Grid::pair_ranges`]), appended to `out` unsorted. Large bodies are not in cells: see
+    /// [`Grid::large_pairs`]. Nothing when the grid is not built.
+    pub fn pairs_in(&self, range: Range<usize>, out: &mut Vec<(u32, u32)>) {
+        if !self.built {
+            return;
+        }
+        let (sorted, bodies, mask, shift) = (
+            &self.sorted[range],
+            &self.bodies,
+            self.bucket_mask,
+            self.shift,
+        );
         let mut start = 0;
         while start < sorted.len() {
             let bucket = sorted[start].key & mask;
@@ -453,6 +494,10 @@ impl Grid {
             }
             start = end;
         }
+    }
+
+    /// The candidate pairs `(a, b)`, `a < b`, with a large body, appended to `out` unsorted.
+    pub fn large_pairs(&self, out: &mut Vec<(u32, u32)>) {
         for &l in &self.large {
             for (i, body) in self.bodies.iter().enumerate() {
                 let i = i as u32;
@@ -463,7 +508,6 @@ impl Grid {
                 out.push((l.min(i), l.max(i)));
             }
         }
-        out.sort_unstable();
     }
 
     /// The bodies of one cell (none when the grid is not built; large bodies are never in a

@@ -446,6 +446,7 @@ dependencies = [
  "boxel_diagnostic",
  "boxel_ecs",
  "boxel_math",
+ "boxel_tasks",
  "boxel_transform",
  "boxel_voxel",
  "boxel_world",

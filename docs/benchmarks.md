@@ -29,6 +29,17 @@ por defecto, es sin límite), por ejemplo para ver cómo se comporta con el lím
 juego. El resumen anota el límite y `tools/bench_report.py` no mezcla corridas con límites
 distintos (las corridas viejas, sin el dato, cuentan como sin límite).
 
+Cuerpos de física (ADR 0016): `--bodies N` pone N cuerpos sobre el suelo alrededor del inicio de
+la cámara cuando el mundo terminó de cargar, tan repartidos como en los benches de física (10 000
+en un cuadrado de 304 bloques). `--body-kind item` (por defecto) son objetos tirados que caen y se
+duermen; `--body-kind mob` son caminantes que cambian de rumbo y nunca se duermen.
+`--projectiles M` dispara M flechas sobre la misma zona y las vuelve a disparar cada 2 s. Con
+cuerpos, la app suma `PhysicsPlugin` (y su tope de 3 pasos fijos por frame); sin ellos nada
+cambia. El resumen y `tools/bench_report.py` anotan los cuerpos y no mezclan corridas con cuerpos
+distintos. La regla del plan: `--bodies 1000` y `--bodies 10000` (con objetos dormidos) no deben
+sumar ningún frame de más de 6.94 ms contra la misma corrida sin cuerpos, y el p99 sube como mucho
+0.3 ms. Conviene un `--warmup` de 3 s o más, así los objetos llegan a dormirse antes de medir.
+
 `--vertical-radius N` fija cuántos chunks se cargan arriba y abajo de la cámara (8 por defecto).
 `--fixed-height` carga solo las capas del generador, como en M0: úsalo para comparar con corridas
 viejas, que no tienen radio vertical.

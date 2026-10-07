@@ -1,6 +1,6 @@
 # ADR 0016: física propia mínima
 
-- Estado: aceptado (fases P0 a P3 hechas; P4 en adelante, pendientes)
+- Estado: aceptado (fases P0 a P4 hechas; de P4 falta medir con stress en ventana; P5 a pedido)
 - Fecha: 2026-10-06
 
 ## Contexto
@@ -110,7 +110,8 @@ Dos datos del código pesan en el diseño:
   `Vec2`. Desde P3: los cuerpos entran a la grilla en orden de `Entity`, los pares salen
   ordenados, el solve los recorre en un orden fijo (de abajo hacia arriba, desempate por par) y
   los eventos salen ordenados. La grilla usa un hash de celda fijo y no hay mapas que se
-  recorran. El paralelismo (P4) será solo por cuerpo.
+  recorran. El paralelismo (P4) es solo por cuerpo (cada uno lee el mundo y escribe solo lo
+  suyo) o sobre listas que después se ordenan, así que el resultado no depende de los hilos.
 
 - **8. Tiempo y orden.** Los pasos de física corren a 64 Hz en `FixedPostUpdate` (desde P2), así
   el gameplay de `FixedUpdate` no tiene que ordenarse contra ellos. `boxel_app` suma los sets
@@ -265,6 +266,77 @@ Dos datos del código pesan en el diseño:
   - Un `Collider` sin `RigidBody` es un cuerpo estático (lo requiere), como pide el plan. Un
     cuerpo sin `Collider` no participa entre cuerpos.
 
+- **9b. Proyectiles, dormir y escala (P4).**
+
+  - **Mensajes del mundo.** `boxel_world` suma `BlockChanged { pos, old, new }` (uno por bloque
+    que cambió en el frame, escrito en `WorldSystems::Edits`) y `ChunkDataEvent::{Loaded,
+    Unloaded} { id, key }` (cuando los bloques de un chunk se pueden leer o dejan de poder
+    leerse; el mapa los anota al cambiar un slot y se publican al final de `Collect`). Son los
+    mensajes que el plan pedía compartir con la luz; la luz todavía no los usa (calcula la luz en
+    los jobs de malla), pero tienen lo que necesita para reiluminar un bloque o un chunk.
+  - **Dormir.** Un cuerpo dinámico se duerme (`Sleeping`) después de `sleep_steps` (32) pasos
+    seguidos apoyado (en bloques o sobre otro cuerpo), más lento que `sleep_speed` (0.05
+    bloques/s) en cada eje y sin moverse más que eso en el paso, con empujes incluidos. Un
+    personaje que quiere caminar nunca cuenta como quieto (si no, uno que empuja una pared se
+    dormía y despertaba cada 33 pasos). Al dormirse, un hook pone su velocidad en 0 exacto y su
+    `Transform` en su posición. Un cuerpo dormido no se mueve, no se interpola y no entra en la
+    lista del paso.
+
+    Se despierta con: una velocidad distinta de 0 (un salto, un empujón, un controlador que
+    quiere caminar), un cambio de su `Collider` o de sus `BodySettings`, un teletransporte, un
+    empuje de un cuerpo despierto, un cuerpo sólido que toca y que se movió (la caja de abajo
+    se fue), uno que se fue de donde lo tocaba (teletransporte, collider cambiado o quitado,
+    despawn), un `BlockChanged` a un bloque o menos de su caja, un `ChunkDataEvent` de un chunk
+    que toca su caja más un bloque (al descargarse se congela, como cualquier cuerpo) y un cambio
+    de `PhysicsSettings` (gravedad, dormir apagado). El plan pedía despertar con el bloque que
+    cambia, la recarga del chunk, la velocidad, el empuje y el teletransporte; lo de la caja de
+    abajo que se va hizo falta para que una pila no quede flotando.
+
+    Para que dormir ahorre de verdad, los dormidos viven aparte: un almacén con su propia
+    grilla, que se rehace solo cuando se durmieron o despertaron más de `max(256, vivos / 8)`
+    desde la última vez (los nuevos esperan en una lista corta `pending`, los despertados se
+    marcan muertos). Cada paso, los cuerpos activos (dinámicos despiertos, cinemáticos que se
+    movieron, teletransportados o con collider cambiado) buscan en esa grilla los dormidos que
+    alcanzan y traen una copia a la lista del paso; el resto del almacén no se toca. En la
+    grilla, las cajas de los activos que se movieron cubren de dónde vinieron, así un dormido
+    que se apoyaba en ellos aparece aunque ya no se toquen. Los dormidos son inactivos: dos de
+    ellos nunca forman par, y un par de dos inactivos que se solapaba sigue solapado (no hay
+    `CollisionEnded` mientras los dos duermen). La marca `Sleeping` manda: sus hooks avisan
+    cada vez que alguien la pone o la saca (despawns incluidos) y el almacén los sigue. Dormido
+    se puede poner y sacar a mano.
+  - **Proyectiles.** `Projectile { on_block: Stop | Bounce, on_entity: Stop | Pass, ignore }`
+    sobre un cuerpo dinámico. Corren después del solve (los blancos están donde quedaron) en su
+    propio set, `PhysicsSystems::Projectiles`: integran como cualquier cuerpo pero sin tope de
+    velocidad (`StepParams::without_speed_limit`, con lo que `predict` da su vuelo libre bit a
+    bit), y mueven su centro por el segmento del paso: contra los vóxeles con el DDA exacto, y
+    contra los cuerpos sólidos de sus capas como un rayo contra la caja del blanco agrandada en
+    las medias medidas del proyectil (exacto para cajas; una esfera cuenta como su caja). Un
+    blanco donde el segmento empieza adentro o tocando no cuenta (ya se lo golpeó al entrar, o
+    el proyectil se paró contra él). Gana el primer golpe; un cuerpo gana el empate con un
+    bloque. `Stop` en un cuerpo lo deja tocándolo con velocidad 0; `Pass` avisa de cada cuerpo
+    en el que entra, en orden, y sigue; en un bloque el centro queda sobre la cara (a `eps` de
+    ella) y se clava (`Stop`: se duerme en el acto y recuerda el bloque, `Projectile::stuck_in`;
+    si el bloque sigue ahí al despertar, se vuelve a dormir; si se fue, cae) o rebota (`Bounce`,
+    con las reglas de rebote de un cuerpo). Cada golpe es un `ProjectileHit { projectile,
+    target: Block { pos, face, state } | Entity(e), point, velocity, speed }`, ordenado por
+    proyectil (un rebote solo si pasa de `impact_speed`). El plan pedía `speed`; se suma
+    `velocity` para que el juego pueda empujar al blanco. Los proyectiles no están en
+    `BodyIndex`: no empujan, no son empujados, no dan eventos de sensor ni se chocan entre ellos.
+    Un segmento que llega a un chunk sin cargar congela al proyectil.
+  - **Paso en paralelo.** Con más de `parallel_threshold` (256) cuerpos despiertos, el paso de
+    los dinámicos y el de los proyectiles usan `par_iter_mut` en el pool de cómputo: cada
+    cuerpo lee el mundo y escribe solo lo suyo, con su propio caché de chunks por hilo, y las
+    salidas (impactos, golpes, congelados) se juntan y se ordenan por entidad. Lo mismo, porque
+    son por cuerpo, el `Prepare`, el controlador y el `Writeback`. El broadphase calcula los
+    límites de cada cuerpo en tandas por hilo y, desde 4096 cuerpos en la lista, reparte el
+    barrido de pares de la grilla por rangos de celdas (`Grid::pair_ranges`, `pairs_in`,
+    `large_pairs`). Para que el orden de la lista no importe, los pares se ordenan por entidad
+    (antes se ordenaba la lista entera, que con 10 000 cuerpos de casi 300 bytes costaba 0.35
+    ms). El solve sigue en un hilo. Paralelo y en un hilo dan lo mismo bit a bit (test).
+  - **stress.** `--bodies N --body-kind item|mob --projectiles M` ponen cuerpos alrededor del
+    inicio cuando el mundo cargó (ver [benchmarks](../benchmarks.md)). Las corridas con ventana
+    de la regla del frame quedan para la medición.
+
 - **10. Fases.** P0: requisitos (`WorldPos`, sets del bucle fijo, el tope de pasos, este ADR, la
   feature). P1: núcleo y raycast (tabla, fuentes, barrido, DDA, `PhysicsQuery::raycast_voxels`,
   edición de bloques en `voxel_world`). P2: cuerpos (gravedad, arrastre, rebote, congelar,
@@ -273,6 +345,85 @@ Dos datos del código pesan en el diseño:
   por bloque, esfera exacta contra vóxeles.
 
 ## Consecuencias
+
+Hecho (P4):
+
+- `boxel_world`: los mensajes `BlockChanged` y `ChunkDataEvent` (9b) y `DataState::is_readable`.
+- `boxel_physics`: `Sleeping` y su almacén, `Projectile` con `OnBlock` y `OnEntity`,
+  `ProjectileHit` con `ProjectileTarget`, los sets `PhysicsSystems::{Wake, Projectiles,
+  Sleep}`, `PhysicsSettings::{sleep_speed, sleep_steps, parallel_threshold}`,
+  `PhysicsStats::{sleeping, woken, projectiles, hits, parallel}` (la línea `physics` suma
+  `sleeping`, `projectiles` y `hits`), `PhysicsSync::net_moved`,
+  `StepParams::without_speed_limit` y, en la grilla, `pair_ranges`, `pairs_in` y
+  `large_pairs`. El paso, el broadphase, `Prepare`, el controlador y el `Writeback` usan los
+  hilos de cómputo desde 256 cuerpos.
+- `physics_sandbox`: F dispara una flecha a 60 bloques/s (se clava en bloques; un mob al que
+  le pega sale empujado y la flecha desaparece), B tira una pelota que rebota hasta quedarse
+  quieta, M pone cuatro mobs que caminan solos. F3 suma la línea `hunt` (flechas, clavadas,
+  pelotas, mobs, golpes).
+- `stress`: `--bodies N --body-kind item|mob --projectiles M`; el resumen anota los cuerpos y
+  `tools/bench_report.py` no mezcla corridas con cuerpos distintos.
+- Benches nuevos en `crates/boxel_physics/benches/physics.rs`: `scale/10000_asleep`,
+  `scale/10000_awake`, `scale/10000_awake_one_thread` y `scale/1000_projectiles`, con el
+  desglose de cada paso (movimiento, entre cuerpos, resto).
+
+Tests de P4:
+
+- `boxel_world/tests/messages.rs`: un `BlockChanged` por bloque que cambió (dos ediciones del
+  mismo bloque dan uno, las que no cambian nada o caen en chunks sin cargar no dan ninguno), y
+  los `ChunkDataEvent` reproducen exactamente el conjunto de chunks legibles al cargar, al irse
+  el viewer y al volver (con ids nuevos).
+- `boxel_physics/tests/sleep.rs`: una caja se duerme exacta y no se mueve en 500 pasos; una pila
+  de 4 se duerme sin cambiar un bit y sin pares; despiertan una velocidad (y no un 0), un
+  controlador que quiere caminar o saltar, un teletransporte (por `Teleport` y por
+  `Transform`), un jugador que camina contra una caja dormida (la empuja sin meterse), la caja
+  de abajo que sale despedida, se despawnea o pierde el collider (la de arriba cae al suelo),
+  una plataforma cinemática que sube y baja, un bloque a un bloque o menos (uno a tres no la
+  despierta; sacar el bloque de abajo la deja caer), la descarga del chunk (queda congelada) y
+  su vuelta (vuelve a dormirse), dormir apagado, la gravedad cambiada; dormir a mano deja un
+  cuerpo colgado hasta sacarle la marca; los solapes de sensores siguen mientras todos duermen
+  y terminan cuando uno sale; rayos, `overlap_box` y `block_is_free` encuentran dormidos sin
+  despertarlos; un despawn dormido no deja rastro; 400 cajas dormidas que se despiertan de a
+  una dejan el índice exacto; `FixedPostUpdate` sin ambigüedades.
+- `boxel_physics/tests/projectile.rs`: 64 flechas a 60 bloques/s, una por cada 1/64 de paso de
+  fase, pegan las 64 a un mob de 0.6 de ancho y se paran justo en su cara (también con
+  gravedad); una flecha se clava a `eps` de la cara del bloque, se vuelve a dormir si el bloque
+  sigue y cae y se clava arriba de otro cuando se va; una pelota proyectil rebota y descansa;
+  una flecha que atraviesa pega a tres mobs en orden y se clava en la pared; `ignore`, capas y
+  sensores filtran; un vuelo libre es `predict` bit a bit y no tiene tope de velocidad; un chunk
+  sin cargar la congela; un mob dormido recibe el golpe y despierta con el empujón del juego;
+  una ráfaga de 300 proyectiles da lo mismo bit a bit lejos del origen (2^31, 2^52, ±(2^61 -
+  1024)) y en varios hilos.
+- `boxel_physics/tests/contacts.rs`: la escena llena da lo mismo bit a bit con todo el paso en
+  los hilos de cómputo, también lejos del origen. La pila de P3 corre con dormir apagado para
+  seguir contando los empujes de cada paso.
+- `physics_sandbox` (sin ventana): F clava una flecha en una pared, F empuja a un mob y la flecha
+  desaparece, B tira una pelota que rebota y se duerme apoyada, M pone mobs que caminan.
+  `voxel_world`: el jugador quieto se duerme (la línea de física lo dice) y W lo despierta.
+- `stress`: las opciones nuevas, objetos que caen y se duermen todos, mobs que siguen caminando y
+  flechas que vuelven a volar y pegan.
+
+Costo de P4 (detalle en [rendimiento/fisicas-p4-2026-10](../rendimiento/fisicas-p4-2026-10.md)):
+un paso con 10 000 cuerpos, 9000 de ellos dormidos, cuesta 0.465 ms (objetivo 0.6 ms), y uno con
+1000 flechas en vuelo 0.158 ms (objetivo 0.3 ms). Con 10 000 cuerpos despiertos cuesta 2.06 ms en
+los hilos de cómputo (4.76 ms en un hilo) y el objetivo era 1.5 ms: no se cumple. El movimiento
+ya va en paralelo (0.45 ms); lo que queda es lo de entre cuerpos (1.28 ms), casi todo en un hilo:
+juntar los cuerpos, meterlos en la grilla, los empujes y rehacer la grilla. `tick/1000` baja de
+0.40 a 0.26 ms porque los objetos tirados se duermen; `tick/0` sube de 0.86 a 1.47 µs por los
+sistemas nuevos.
+
+Cambios de API de P4:
+
+- `PhysicsSystems` suma `Wake`, `Projectiles` y `Sleep`.
+- `PhysicsStats::summary` suma `sleeping`, `projectiles` y `hits`; `dynamic` cuenta solo los
+  cuerpos despiertos que se movieron (proyectiles incluidos).
+- `PhysicsSettings` suma `sleep_speed`, `sleep_steps` y `parallel_threshold`.
+- `Collider` tiene un hook `on_discard` y `Sleeping` hooks `on_add` y `on_remove`: no se les
+  puede registrar otros.
+- `BodyIndex::entities` y `len` cuentan también los dormidos; `pairs` nunca da dos dormidos.
+- `boxel_physics` depende también de `boxel_tasks`.
+- `boxel_world::WorldPlugin` agrega dos mensajes; `ChunkMap` anota los cambios de datos.
+- El ejemplo `stress` pide la feature `physics`.
 
 Hecho (P3):
 
@@ -479,10 +630,12 @@ Cambios de API de P0 y P1:
 - Un sistema agregado a `RunFixedMainLoop` sin set ahora queda ambiguo con el bucle: va en
   `BeforeFixedMainLoop` o `AfterFixedMainLoop`.
 
-Lo que falta: proyectiles, dormir y paso en paralelo (P4), una grilla incremental o más barata
-para llegar a 0.3 ms con 10 000 cuerpos, y todo P5. Los cuerpos no tienen dibujo: hace falta un
-renderer de entidades. `physics_sandbox` todavía no rompe ni pone bloques. Los mensajes del mundo
-que comparten física y luz (`BlockChanged`, carga y descarga de chunks) se acuerdan antes de P4.
+Lo que falta: medir la regla del frame con stress en ventana (`--bodies 1000` y `10000`, en las
+dos GPU), bajar el paso con 10 000 cuerpos despiertos a 1.5 ms (paralelizar lo que queda del
+broadphase, no rehacer la grilla después de los empujes) y la grilla de 10 000 a 0.3 ms (una
+grilla incremental), y todo P5. Los cuerpos no tienen dibujo: hace falta un renderer de entidades.
+`physics_sandbox` todavía no rompe ni pone bloques. La luz todavía no usa `BlockChanged` ni
+`ChunkDataEvent`.
 
 ## Alternativas descartadas
 

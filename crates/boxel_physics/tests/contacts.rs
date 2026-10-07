@@ -16,8 +16,8 @@ use boxel_ecs::system::RunSystemOnce;
 use boxel_math::{DVec3, I64Vec3, Vec2};
 use boxel_physics::{
     BodyFilter, BodyIndex, BodySettings, CharacterController, Collider, CollisionLayers, Contacts,
-    Interpolated, LocalBox, MoveIntent, PhysicsQuery, PhysicsStats, RayFilter, RayHit,
-    ReportContacts, RigidBody, Teleport, Velocity, VoxelFilter,
+    Interpolated, LocalBox, MoveIntent, PhysicsQuery, PhysicsSettings, PhysicsStats, RayFilter,
+    RayHit, ReportContacts, RigidBody, Teleport, Velocity, VoxelFilter,
 };
 use boxel_transform::Transform;
 use boxel_voxel::{BlockPos, Face, MAX_BLOCK_COORD, WorldPos};
@@ -68,6 +68,11 @@ fn wall(sim: &mut Sim, min: [i64; 3], max: [i64; 3]) {
 #[test]
 fn crates_dropped_on_each_other_stack_and_rest_exactly() {
     let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    // Awake all along: every step pushes each pair (sleeping is tested in `sleep.rs`).
+    sim.app
+        .world_mut()
+        .resource_mut::<PhysicsSettings>()
+        .sleep_steps = 0;
     // Spawned top first: the higher crates have the lower entities, so pair order alone would
     // push the top of the stack first.
     let mut stack: Vec<Entity> = (0..4)
@@ -565,7 +570,19 @@ fn scene(
     interpolated: bool,
     steps: u64,
 ) -> (Vec<BodyState>, Vec<(bool, usize, usize)>) {
+    scene_with(base, frame, interpolated, steps, usize::MAX)
+}
+
+/// [`scene`] with the step on several threads above `parallel_threshold` bodies.
+fn scene_with(
+    base: I64Vec3,
+    frame: Duration,
+    interpolated: bool,
+    steps: u64,
+    parallel_threshold: usize,
+) -> (Vec<BodyState>, Vec<(bool, usize, usize)>) {
     let mut sim = Sim::new(base, frame);
+    sim.settings().parallel_threshold = parallel_threshold;
     sim.app
         .init_resource::<SceneSteps>()
         .add_systems(FixedUpdate, wander);
@@ -699,6 +716,22 @@ fn crowded_runs_are_bit_identical_at_any_frame_rate_with_or_without_interpolatio
         scene(I64Vec3::ZERO, STEP, true, 800),
         reference,
         "interpolated"
+    );
+}
+
+#[test]
+fn the_crowded_scene_on_several_threads_is_bit_identical() {
+    let reference = scene(I64Vec3::ZERO, STEP, true, 800);
+    assert_eq!(
+        scene_with(I64Vec3::ZERO, STEP, true, 800, 0),
+        reference,
+        "every step on the compute threads"
+    );
+    let far = MAX_BLOCK_COORD - 1024;
+    assert_eq!(
+        scene_with(I64Vec3::new(far, -far, far), STEP, true, 800, 0),
+        reference,
+        "far away, on the compute threads"
     );
 }
 

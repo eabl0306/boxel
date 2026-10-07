@@ -1683,8 +1683,9 @@ mod tests {
             line(&app, "move"),
             "Walk (G flies)  on ground  speed 0.00 b/s"
         );
+        // Standing still for half a second, the player body fell asleep (W wakes it).
         assert!(
-            line(&app, "physics").starts_with("Physics bodies=1 dynamic=1 frozen=0"),
+            line(&app, "physics").starts_with("Physics bodies=1 dynamic=0 frozen=0 sleeping=1"),
             "{}",
             line(&app, "physics")
         );

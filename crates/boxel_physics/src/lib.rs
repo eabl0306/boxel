@@ -1,9 +1,10 @@
 //! `boxel_physics`: boxel's own minimal physics (ADR 0016), with no third-party physics engine.
 //!
 //! Scope of the engine: axis-aligned boxes and spheres, gravity, no rotations; bounces;
-//! projectiles later; voxel and entity raycasts; between entities, a per-entity choice of solid
-//! push or sensor events. This crate grows in phases (see ADR 0016); today (P3) it has the voxel
-//! core, the raycast, bodies that move against the voxels, and collisions between bodies.
+//! projectiles; voxel and entity raycasts; between entities, a per-entity choice of solid push
+//! or sensor events. This crate grows in phases (see ADR 0016); today (P4) it has the voxel
+//! core, the raycast, bodies that move against the voxels, collisions between bodies,
+//! projectiles that never tunnel, sleeping bodies and a parallel step.
 //!
 //! Two layers:
 //! - [`core`] is pure (no ECS): the [`CollisionTable`] (how each block state collides, derived
@@ -16,8 +17,9 @@
 //!   [`PhysicsPlugin`], the [`PhysicsQuery`] system param (voxel and entity raycasts, box
 //!   queries, the block placement check) and bodies: [`RigidBody`], [`Collider`],
 //!   [`Velocity`], [`BodyPosition`], [`Contacts`], [`BodySettings`], [`Interpolated`],
-//!   [`Teleport`], [`Frozen`], [`ReportContacts`], [`CharacterController`] with [`MoveIntent`],
-//!   and the messages [`VoxelImpact`], [`CollisionStarted`] and [`CollisionEnded`].
+//!   [`Teleport`], [`Frozen`], [`Sleeping`], [`ReportContacts`], [`CharacterController`] with
+//!   [`MoveIntent`], [`Projectile`], and the messages [`VoxelImpact`], [`CollisionStarted`],
+//!   [`CollisionEnded`] and [`ProjectileHit`].
 //!
 //! Frame structure with physics (see [`PhysicsSystems`]):
 //! 1. `RunFixedMainLoopSystems::BeforeFixedMainLoop`: the game samples input into
@@ -36,22 +38,30 @@
 //!
 //! Determinism: floats only go through `+ - * /`, `sqrt`, `floor`, `ceil`, `abs`, `min` and
 //! `max`, which IEEE 754 defines exactly on every platform. `clippy.toml` in this crate
-//! disallows fused multiply-add and the libm functions. Bodies step in query order, each one
-//! alone (no body reads another, except through the obstacles of the current step), pairs are
-//! sorted by entity and pushed in a fixed order, and messages are sorted by entity.
+//! disallows fused multiply-add and the libm functions. Bodies step each one alone (no body
+//! reads another, except through the obstacles of the current step), so the order they step in,
+//! and the threads of a parallel step, change nothing; pairs are sorted by entity and pushed in
+//! a fixed order, and messages are sorted by entity.
+//!
+//! Scale: bodies that rest fall asleep ([`Sleeping`]) and cost almost nothing until something
+//! wakes them; above `PhysicsSettings::parallel_threshold` awake bodies the step runs on the
+//! compute threads.
 
 mod components;
 mod contacts;
 pub mod core;
 mod plugin;
+mod projectile;
 mod query;
+mod sleep;
 mod source;
 mod systems;
 
 pub use crate::components::{
     BodyPosition, CharacterController, Collider, CollisionEnded, CollisionStarted, Contacts,
-    Frozen, Interpolated, MoveIntent, PhysicsSettings, PhysicsStats, PhysicsSync, ReportContacts,
-    Response, RigidBody, Teleport, Velocity, VoxelImpact,
+    Frozen, Interpolated, MoveIntent, OnBlock, OnEntity, PhysicsSettings, PhysicsStats,
+    PhysicsSync, Projectile, ProjectileHit, ProjectileTarget, ReportContacts, Response, RigidBody,
+    Sleeping, Teleport, Velocity, VoxelImpact,
 };
 pub use crate::contacts::{BodyFilter, BodyHit, BodyIndex};
 pub use crate::core::{
@@ -71,8 +81,9 @@ pub use systems::PhysicsSystems;
 pub mod prelude {
     pub use crate::{
         BodyFilter, BodyPosition, BodySettings, CharacterController, Collider, CollisionEnded,
-        CollisionLayers, CollisionStarted, Contacts, Interpolated, LocalBox, MoveIntent,
-        PhysicsPlugin, PhysicsQuery, PhysicsSystems, RayFilter, RayHit, RayResult, ReportContacts,
-        RigidBody, Shape, Teleport, Velocity, VoxelFilter, VoxelHit, VoxelImpact,
+        CollisionLayers, CollisionStarted, Contacts, Interpolated, LocalBox, MoveIntent, OnBlock,
+        OnEntity, PhysicsPlugin, PhysicsQuery, PhysicsSystems, Projectile, ProjectileHit,
+        ProjectileTarget, RayFilter, RayHit, RayResult, ReportContacts, RigidBody, Shape, Sleeping,
+        Teleport, Velocity, VoxelFilter, VoxelHit, VoxelImpact,
     };
 }

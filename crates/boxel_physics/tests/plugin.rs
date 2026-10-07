@@ -306,12 +306,13 @@ fn a_despawn_applied_before_the_freeze_does_not_panic() {
         }
     }
     let mut sim = Sim::new(I64Vec3::ZERO, STEP);
-    // Between `Prepare` and the step, with no sync point before the step: its despawn and the
-    // step's `Frozen` insert are applied at the same sync point, the despawn first.
+    // Between the kinematic bodies and the step, with no sync point before the step: its
+    // despawn and the step's `Frozen` insert are applied at the same sync point, the despawn
+    // first.
     sim.app.add_systems(
         FixedPostUpdate,
         despawn_doomed
-            .after(PhysicsSystems::Prepare)
+            .after(PhysicsSystems::Kinematic)
             .before_ignore_deferred(PhysicsSystems::Step),
     );
     // Over unloaded chunks: its first step freezes it.

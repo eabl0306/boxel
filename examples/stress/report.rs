@@ -152,6 +152,9 @@ pub struct RunInfo {
     pub unix_time: u64,
     /// Frames presented during the measurement.
     pub frames_presented: u64,
+    /// Physics bodies of the run (`--bodies`, `--body-kind`, `--projectiles`): `1000 item, 50
+    /// projectiles`, or empty without them (and in runs from before the options).
+    pub bodies: String,
 }
 
 /// Frame-time statistics of a subset of frames (for example the frames that crossed a chunk
@@ -716,6 +719,7 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
         ("driver", Json::Str(info.driver.clone())),
         ("present", Json::Str(info.present.clone())),
         ("fps_limit", Json::uint(info.fps_limit)),
+        ("bodies", Json::Str(info.bodies.clone())),
         (
             "window",
             Json::Str(format!("{}x{}", info.window.0, info.window.1)),
@@ -856,6 +860,9 @@ pub fn run_title(info: &RunInfo) -> String {
     }
     if info.fps_limit > 0 {
         title = format!("{title} limit {} fps", info.fps_limit);
+    }
+    if !info.bodies.is_empty() {
+        title = format!("{title} bodies {}", info.bodies);
     }
     title
 }

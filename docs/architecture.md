@@ -153,7 +153,7 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_worldgen` | trait `WorldGenerator`; generadores `FlatGenerator`, `TerrainGenerator`, `ForestGenerator` (terreno con árboles) y `OverworldGenerator` (superficie sobre piedra infinita hacia abajo, con cuevas y árboles; etapas en `overworld`: `Heightmap`, `SurfaceRules`, `Caves`, más `Trees`); ruido 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`) | voxel |
 | `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, eventos, `ChunkStore` | app, voxel, mesh, worldgen, transform, diagnostic |
 | `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `PresentSettings` (vsync en tiempo de ejecución), texturas procedurales, screenshots | gfx, shaders, world, camera, window |
-| `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::solid`), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas, el integrador de un cuerpo (`step_body`, `predict`), el narrowphase (`shape_contact`) y la grilla del broadphase (`Grid`). Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`; pasos en `FixedPostUpdate`, interpolación en `AfterFixedMainLoop`), `PhysicsQuery` (rayos a vóxeles y cuerpos, cajas, el chequeo para poner bloques), `BodyIndex`, cuerpos (`RigidBody`, `Collider`, `Velocity`, `BodyPosition`, `Contacts`, `Interpolated`, `Teleport`, `Frozen`, `ReportContacts`), `CharacterController` y los mensajes `VoxelImpact`, `CollisionStarted` y `CollisionEnded`. Hoy fase P3: proyectiles, dormir y paso en paralelo vienen en P4 | ecs, app, math, transform, voxel, world, diagnostic |
+| `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::solid`), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas, el integrador de un cuerpo (`step_body`, `predict`), el narrowphase (`shape_contact`) y la grilla del broadphase (`Grid`). Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`; pasos en `FixedPostUpdate`, interpolación en `AfterFixedMainLoop`), `PhysicsQuery` (rayos a vóxeles y cuerpos, cajas, el chequeo para poner bloques), `BodyIndex`, cuerpos (`RigidBody`, `Collider`, `Velocity`, `BodyPosition`, `Contacts`, `Interpolated`, `Teleport`, `Frozen`, `Sleeping`, `ReportContacts`), `CharacterController`, `Projectile` y los mensajes `VoxelImpact`, `CollisionStarted`, `CollisionEnded` y `ProjectileHit`. Los cuerpos quietos se duermen (despiertan con `BlockChanged` y `ChunkDataEvent` del mundo, entre otras cosas) y, con muchos cuerpos despiertos, el paso corre en los hilos de cómputo. Fases P0 a P4 hechas | ecs, app, math, tasks, transform, voxel, world, diagnostic |
 | `boxel_facade_check` | solo CI: prueba que los derives resuelven `::boxel::ecs` para un usuario que depende solo de `boxel` | fachada |
 | `vendor/*` (7 crates) | ECS y tareas (fork de Bevy) | - |
 
@@ -584,7 +584,8 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   de la frecuencia fija (medido: 20 de 30 perdidos).
 - Task pools: `TaskPoolPlugin` crea los tres pools globales de `boxel_tasks`. El hilo principal
   también ejecuta sistemas, así que los workers son `paralelismo - 1`: IO 10 % (1 a 2), async
-  compute 40 % (1 a 8, jobs de chunks), compute el resto. Con 16 hilos: 2, 6 y 7.
+  compute 40 % (1 a 8, jobs de chunks), compute el resto. Con 16 hilos: 2, 6 y 7. La física usa
+  compute para su paso en paralelo (`par_iter_mut` desde 256 cuerpos despiertos, ADR 0016).
 - Runners: `ScheduleRunnerPlugin` (headless, `Once` o `Loop`) y el runner winit de
   `boxel_window`. El runner por defecto actualiza una vez. Los dos respetan `FrameLimit` (144 fps
   por defecto, 0 = sin límite, cambiable en tiempo de ejecución) con el mismo `FramePacer`
@@ -673,7 +674,10 @@ Sistemas en `Update`, encadenados (`WorldSystems`):
    saltar, la vieja sigue cargada hasta que se crea la nueva y el mapa no crece a mitad de la
    carga.
 2. **Edits:** aplica `EditQueue` agrupando por chunk: `make_mut`, `set`, sube `version`, pide
-   remesh del chunk y de los vecinos de cara tocados (sube su `epoch`). Prioridad 0.
+   remesh del chunk y de los vecinos de cara tocados (sube su `epoch`). Prioridad 0. Escribe un
+   `BlockChanged { pos, old, new }` por cada bloque que cambió en el frame (dos ediciones del
+   mismo bloque dan un mensaje, del estado de antes al de después; las que no cambian nada o se
+   descartan no dan ninguno).
 3. **Dispatch:** primero vacía el canal de resultados (libera sus lugares en vuelo) y después
    saca jobs mientras `in_flight < tope`; repite mientras lleguen resultados, dentro de
    `job_budget` (2 ms por frame). Antes de sacar un job recalcula las prioridades viejas que
@@ -687,7 +691,17 @@ Sistemas en `Update`, encadenados (`WorldSystems`):
    opacos uniformes en las 6 caras, da `Empty` sin job. Descarta resultados viejos (generación
    del slotmap, `data_version`, `epoch`, `cancel`).
 4. **Collect:** publica `ChunkMeshEvent::Upsert` / `Remove` de las mallas listas, hasta 512 por
-   frame.
+   frame. Después publica los `ChunkDataEvent` del frame, en el orden en que pasaron:
+   `Loaded { id, key }` cuando los bloques de un chunk se pueden leer (`Ready`, o `Missing`, que
+   se lee como aire) y `Unloaded { id, key }` cuando dejan de poder leerse. El mapa los anota al
+   cambiar el estado de un slot (`set_data` y `remove`), así ningún camino del streaming se
+   olvida de avisar.
+
+`BlockChanged` y `ChunkDataEvent` son los mensajes que comparten los sistemas que guardan algo
+derivado de los bloques: la física despierta los cuerpos dormidos cerca de un bloque que cambió
+o de un chunk que se cargó o se descargó (ADR 0016, P4), y la luz los puede usar para reiluminar.
+Un chunk que se descarga y se vuelve a cargar puede volver distinto (todavía no se guardan las
+ediciones), por eso quien guarda algo de un chunk lo refresca en `Loaded`.
 
 **Contrato de resultados:** todo job enviado devuelve **exactamente un** mensaje: `Generated`,
 `Meshed`, `Cancelled` (vio la bandera de cancelación) o `Failed` (con el texto del pánico). El
@@ -1031,9 +1045,9 @@ schedule `Shutdown` es el lugar para el `flush` final.
   suman líneas propias con `OverlayLines` (`voxel_world` muestra el bloque apuntado, la
   selección, el modo, con el estado del jugador si camina, y la línea de física) y `Crosshair`
   dibuja una mira en el centro.
-- Línea `physics` de `DiagnosticsBoard` (`PhysicsStats`): cuerpos, dinámicos, congelados, pares
-  del broadphase, empujes, solapes que avisan, impactos y tiempos del último paso de física (el
-  movimiento y lo de entre cuerpos).
+- Línea `physics` de `DiagnosticsBoard` (`PhysicsStats`): cuerpos, dinámicos despiertos,
+  congelados, dormidos, pares del broadphase, empujes, solapes que avisan, impactos, proyectiles
+  y sus impactos, y tiempos del último paso de física (el movimiento y lo de entre cuerpos).
 - `FrameTimeHistory`: los últimos frames (4096 por defecto, mínimo 1024) con su tiempo real
   (`Time::real_delta`); `summary()` da p50, p95, p99, p99.9, máximo, promedio y 1% low.
 - Tirones mientras se carga el mundo: `examples/stress.rs` y `just bench-*`
