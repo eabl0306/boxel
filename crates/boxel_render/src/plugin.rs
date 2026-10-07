@@ -200,6 +200,9 @@ pub struct RenderInfo {
     pub recoveries: u32,
     /// `RenderStats::dropped_chunks` (arena or chunk table full; warn-logged).
     pub dropped_chunks: u32,
+    /// Arena entries in use (`RenderStats::arena_used_quads`): the quads of every resident chunk
+    /// plus their light palettes. 0 until a renderer exists.
+    pub arena_used_quads: u32,
     /// Quads the arena holds (`RenderStats::arena_capacity_quads`): the requested
     /// `RenderSettings::arena_quads`, cut to the device's limits. 0 until a renderer exists.
     pub arena_capacity_quads: u32,
@@ -1531,6 +1534,7 @@ fn cleanup(
             info.chunks = stats.chunks;
             info.draws = stats.draws;
             info.dropped_chunks = stats.dropped_chunks;
+            info.arena_used_quads = stats.arena_used_quads;
             info.arena_capacity_quads = stats.arena_capacity_quads;
             info.chunk_slot_capacity = stats.chunk_slot_capacity;
             if let Some(mut board) = board {

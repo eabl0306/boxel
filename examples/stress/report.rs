@@ -51,6 +51,11 @@ pub struct FrameRecord {
     pub quads: u64,
     /// Draw calls (`RenderInfo::draws`).
     pub draws: u32,
+    /// Renderer arena entries in use, quads plus light palettes
+    /// (`RenderInfo::arena_used_quads`).
+    pub arena_used: u32,
+    /// Chunks the renderer could not hold so far (`RenderInfo::dropped_chunks`, cumulative).
+    pub dropped_chunks: u32,
 }
 
 /// Append-only list of records stored in fixed blocks: pushing never moves earlier records, so
@@ -579,7 +584,8 @@ fn rounded(value: f64, decimals: i32) -> f64 {
 /// CSV header (one column per [`FrameRecord`] field; world counters spelled out).
 pub const CSV_HEADER: &str = "frame,t_ms,frame_ms,presented,crossed,cam_x,cam_z,yaw_deg,\
 generated,jobs_done,meshes,removed,upload_quads,d_data_ready,d_chunks,chunks,data_ready,\
-generating,mesh_ready,mesh_empty,meshing,queued_jobs,in_flight,gpu_chunks,quads,draws";
+generating,mesh_ready,mesh_empty,meshing,queued_jobs,in_flight,gpu_chunks,quads,draws,arena_used,\
+dropped_chunks";
 
 /// The CSV text: header plus one row per record.
 pub fn csv(records: &[FrameRecord]) -> String {
@@ -590,7 +596,7 @@ pub fn csv(records: &[FrameRecord]) -> String {
         let w = &r.world;
         let _ = writeln!(
             out,
-            "{i},{:.3},{:.4},{},{},{:.2},{:.2},{:.2},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{i},{:.3},{:.4},{},{},{:.2},{:.2},{:.2},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             ms(r.t),
             ms(r.frame_time),
             u8::from(r.presented),
@@ -616,6 +622,8 @@ pub fn csv(records: &[FrameRecord]) -> String {
             r.gpu_chunks,
             r.quads,
             r.draws,
+            r.arena_used,
+            r.dropped_chunks,
         );
     }
     out
@@ -851,6 +859,8 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
                 ("gpu_chunks", Json::uint(s.last.gpu_chunks)),
                 ("quads", Json::uint(s.last.quads)),
                 ("draws", Json::uint(s.last.draws)),
+                ("arena_used", Json::uint(s.last.arena_used)),
+                ("dropped_chunks", Json::uint(s.last.dropped_chunks)),
             ]),
         ),
     ]);
@@ -1076,7 +1086,7 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
         out,
         "\n{border}Queue trend {:+.1} jobs/s (slope over the measurement; clearly above 0: the \
          world falls behind). {catch_up} At the end: {} chunks, {} meshes ({} empty), {} on the \
-         GPU, {} quads, {} draws.\n",
+         GPU, {} quads, {} draws, arena {} of {} entries, {} chunks dropped.\n",
         rounded(s.backlog_trend, 1),
         w.chunks,
         w.mesh_ready,
@@ -1084,6 +1094,9 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
         s.last.gpu_chunks,
         s.last.quads,
         s.last.draws,
+        s.last.arena_used,
+        info.arena_quads,
+        s.last.dropped_chunks,
     );
 
     if let Some(e) = &info.edits {
@@ -1517,7 +1530,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), records.len() + 1);
         let columns = CSV_HEADER.split(',').count();
-        assert_eq!(columns, 26);
+        assert_eq!(columns, 28);
         assert!(lines.iter().all(|l| l.split(',').count() == columns));
         assert!(
             lines[501].starts_with("500,1000.000,10.0000,0,1,"),
@@ -1587,6 +1600,12 @@ mod tests {
             "the crossing at 1 s never settles"
         );
         assert!(data.contains("\"over_144hz\": 2"));
+        assert!(data.contains("\"arena_used\": 0,\n"));
+        assert!(data.contains("\"dropped_chunks\": 0\n"));
+        assert!(
+            text.contains(", arena 0 of 0 entries, 0 chunks dropped."),
+            "{text}"
+        );
         assert!(one_line(&info, &s).contains(">6.94ms=2 >16.7ms=1"));
     }
 

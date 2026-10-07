@@ -26,10 +26,10 @@
 //! `--duration` seconds. Each frame records its wall-clock time (`Time::real_delta`, the whole
 //! loop: world and render) and the work it did: chunks generated and jobs finished (counted by
 //! wrapping the generator and the job executor), meshes sent and removed (`ChunkMeshEvent`),
-//! `WorldStats` (and its change), the GPU chunks and draws (`RenderInfo`), the resident quads
-//! and whether it was presented. The window renders every update even when covered
-//! (`render_when_hidden`), but only about one frame per monitor refresh is presented (the
-//! compositor's frame callback opens the gate); the others render offscreen. It presents with
+//! `WorldStats` (and its change), the GPU chunks, draws, arena use and dropped chunks
+//! (`RenderInfo`), the resident quads and whether it was presented. The window renders every
+//! update even when covered (`render_when_hidden`), but only about one frame per monitor refresh
+//! is presented (the compositor's frame callback opens the gate); the others render offscreen. It presents with
 //! `immediate` unless `--present`/`BOXEL_PRESENT` say otherwise, and closes itself.
 //!
 //! Exit codes: 0 success, 1 usage error, 2 no usable GPU, 3 an output file could not be
@@ -653,6 +653,8 @@ fn record(
             gpu_chunks: info.chunks,
             quads: rec.quads,
             draws: info.draws,
+            arena_used: info.arena_used_quads,
+            dropped_chunks: info.dropped_chunks,
         };
         rec.log.push(record);
         if let Some(spans) = spans.as_deref_mut() {

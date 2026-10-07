@@ -139,8 +139,11 @@ aplicar el cambio, `just bench-all` otra vez y comparar las dos carpetas.
 ## El CSV
 
 Una fila por frame: `frame_ms`, `crossed` (cruzó un borde), `generated`, `meshes`, `removed`,
-`queued_jobs`, `in_flight`, los contadores de `WorldStats` y la posición de la cámara. Sirve para
-graficar o para buscar qué pasó en un tirón puntual.
+`queued_jobs`, `in_flight`, los contadores de `WorldStats` y la posición de la cámara.
+`arena_used` son las entradas del arena del render en uso (quads más paletas de luz) y
+`dropped_chunks` los chunks que el render no pudo guardar hasta ese frame (arena o tabla llenos).
+El resumen anota los dos al final. Sirve para graficar o para buscar qué pasó en un tirón
+puntual.
 
 ## Tiempo por sistema (--spans)
 
