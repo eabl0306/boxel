@@ -24,7 +24,7 @@ edition = "2024"
 # MSRV = stable - 2 (1.99 is current upstream stable). Must stay >= wgpu 30 (1.87) and the ECS fork (1.95).
 rust-version = "1.97"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/OWNER/boxel"
+repository = "https://github.com/eabl0306/boxel"
 
 [workspace.dependencies]
 # ---- boxel crates (path + version so they stay publishable)
