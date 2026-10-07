@@ -124,3 +124,29 @@ fn chunk_mesh_buckets_are_contiguous() {
     assert_eq!(m.bucket_range(2), 1..3);
     assert_eq!(m.bucket(TRANSLUCENT_BUCKET).len(), 1);
 }
+
+/// Model boxes (ADR 0020) pack into the two words the shaders read and back, every coordinate
+/// and texture offset in range; a box face quad keeps its index in the `w - 1`, `h - 1` bits.
+#[test]
+fn model_boxes_pack_and_box_quads_keep_their_index() {
+    use boxel_mesh::{PackedQuad, layout, pack_model_box, unpack_model_box};
+    use boxel_voxel::{BlockRegistry, Face, ModelBox};
+    let registry = BlockRegistry::default_blocks();
+    let table = MaterialTable::from_registry(&registry);
+    let mut boxes: Vec<ModelBox> = table.model_boxes().to_vec();
+    assert!(boxes.len() > 20, "slabs, stairs, fences and torches");
+    let mut extreme = ModelBox::new([0, 0, 0], [16, 16, 16]);
+    extreme.texture_offset = [-32, 31, 0];
+    boxes.push(extreme);
+    for b in boxes {
+        assert_eq!(unpack_model_box(pack_model_box(b)), b);
+    }
+    for index in [0, 1, 517, 1023] {
+        let q = PackedQuad::new([31, 0, 7], 1, 1, Face::NegZ, 9)
+            .with_shape(layout::SHAPE_BOX)
+            .with_box_index(index);
+        assert_eq!(q.box_index(), index);
+        assert_eq!((q.pos(), q.face(), q.layer()), ([31, 0, 7], Face::NegZ, 9));
+        assert_eq!(q.shape(), layout::SHAPE_BOX);
+    }
+}

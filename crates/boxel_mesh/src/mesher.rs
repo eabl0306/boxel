@@ -11,9 +11,9 @@ use crate::{
 use boxel_light::PaddedLight;
 use boxel_voxel::{
     BlockModel, BlockRegistry, BlockState, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, Face, LightValue,
-    LocalPos, NEIGHBOR_OFFSETS, RenderShape, SlabHalf, neighbor_index,
+    LocalPos, MAX_MODEL_BOXES, ModelBox, NEIGHBOR_OFFSETS, RenderShape, neighbor_index,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 
 /// Which faces get ambient occlusion (ADR 0015). AO is part of the greedy-merge key, so every
@@ -59,6 +59,144 @@ pub struct MaterialTable {
     emissive: Vec<bool>,
     /// Some material is a fluid (`BlockModel::Fluid`): gather marks the surface cells.
     has_fluid: bool,
+    /// The models made of boxes (ADR 0020), see [`BoxModels`].
+    box_models: BoxModels,
+}
+
+/// No box shape (`MaterialTable` materials that are not made of boxes).
+const NO_SHAPE: u16 = u16::MAX;
+
+/// The models made of boxes of a material table (slabs, stairs, fences, torches; ADR 0020):
+/// every distinct [`ModelBox`] gets an index (the box index of its `SHAPE_BOX` quads, the
+/// renderer's box table), every distinct model a [`BoxShape`].
+#[derive(Clone, Debug, Default)]
+struct BoxModels {
+    /// [`BoxShape`] index of each material ([`NO_SHAPE`] for the others).
+    shape_of: Vec<u16>,
+    shapes: Vec<BoxShape>,
+    shape_ids: HashMap<BlockModel, u16>,
+    /// Distinct boxes in first-use order: the box table.
+    boxes: Vec<ModelBox>,
+    box_ids: HashMap<ModelBox, u16>,
+}
+
+/// Sixteenths of a cell border face: bit `u` of row `v` (the face's axes, [`Face::axes`]).
+type Cover = [u16; 16];
+
+/// A face rectangle in sixteenths along the face's u and v axes: `[u0, u1, v0, v1]`.
+type Rect = [u8; 4];
+
+/// The bits `rect` covers in a [`Cover`] row.
+fn rect_bits(rect: Rect) -> u16 {
+    ((1u32 << rect[1]) - (1u32 << rect[0])) as u16
+}
+
+/// True if `cover` holds every sixteenth of `rect`.
+fn is_covered(cover: &Cover, rect: Rect) -> bool {
+    let bits = rect_bits(rect);
+    cover[usize::from(rect[2])..usize::from(rect[3])]
+        .iter()
+        .all(|&row| row & bits == bits)
+}
+
+/// Adds `rect` to `cover`.
+fn add_rect(cover: &mut Cover, rect: Rect) {
+    let bits = rect_bits(rect);
+    for row in &mut cover[usize::from(rect[2])..usize::from(rect[3])] {
+        *row |= bits;
+    }
+}
+
+/// One drawn face of one box of a model.
+#[derive(Clone, Copy, Debug)]
+struct BoxFace {
+    face: Face,
+    /// Index of the box in [`BoxModels::boxes`].
+    index: u16,
+    /// Flush with the cell border (a neighbor can hide it).
+    border: bool,
+    /// Where it is on the face's plane.
+    rect: Rect,
+}
+
+/// The faces a model made of boxes draws: every box face that no other box of the model covers
+/// (the bottom of a stair's step on its slab, a fence bar's end on the post), and what its faces
+/// flush with the cell border cover, per face.
+#[derive(Clone, Debug)]
+struct BoxShape {
+    faces: Vec<BoxFace>,
+    covers: [Cover; 6],
+}
+
+impl BoxShape {
+    /// The shape of `boxes`, `index` giving each box's table index.
+    fn new(boxes: &[ModelBox], mut index: impl FnMut(ModelBox) -> u16) -> Self {
+        let mut faces = Vec::new();
+        let mut covers = [[0u16; 16]; 6];
+        for &b in boxes {
+            let (min, max) = (b.bounds.min, b.bounds.max);
+            for face in Face::ALL {
+                let (n, u, v) = face.axes();
+                let positive = face.index().is_multiple_of(2);
+                let plane = if positive { max[n] } else { min[n] };
+                let rect = [min[u], max[u], min[v], max[v]];
+                // The other boxes whose opposite face lies on this plane, touching this box.
+                let mut inner: Cover = [0; 16];
+                for other in boxes.iter().filter(|o| **o != b) {
+                    let (omin, omax) = (other.bounds.min, other.bounds.max);
+                    let opposite = if positive { omin[n] } else { omax[n] };
+                    if opposite == plane {
+                        add_rect(&mut inner, [omin[u], omax[u], omin[v], omax[v]]);
+                    }
+                }
+                if is_covered(&inner, rect) {
+                    continue;
+                }
+                let border = plane == if positive { 16 } else { 0 };
+                if border {
+                    add_rect(&mut covers[face.index()], rect);
+                }
+                faces.push(BoxFace {
+                    face,
+                    index: index(b),
+                    border,
+                    rect,
+                });
+            }
+        }
+        Self { faces, covers }
+    }
+}
+
+impl BoxModels {
+    /// The shape of `model` (made of boxes), interning its boxes and itself.
+    fn intern(&mut self, model: BlockModel) -> u16 {
+        if let Some(&id) = self.shape_ids.get(&model) {
+            return id;
+        }
+        let (boxes, ids) = (&mut self.boxes, &mut self.box_ids);
+        let shape = BoxShape::new(&model.boxes(), |b| {
+            *ids.entry(b).or_insert_with(|| {
+                boxes.push(b);
+                (boxes.len() - 1) as u16
+            })
+        });
+        assert!(
+            self.boxes.len() <= MAX_MODEL_BOXES,
+            "more than {MAX_MODEL_BOXES} model boxes (the registry refuses them)"
+        );
+        let id = self.shapes.len() as u16;
+        self.shapes.push(shape);
+        self.shape_ids.insert(model, id);
+        id
+    }
+
+    /// The shape of material `m`, if it is made of boxes.
+    #[inline]
+    fn of(&self, m: u16) -> Option<&BoxShape> {
+        let id = *self.shape_of.get(usize::from(m))?;
+        self.shapes.get(usize::from(id))
+    }
 }
 
 /// The mesher class of a block drawn as `shape` with `model`.
@@ -94,6 +232,10 @@ impl MaterialTable {
             codes: vec![[0u8; 6]; n],
             emissive: vec![false; n],
             has_fluid: false,
+            box_models: BoxModels {
+                shape_of: vec![NO_SHAPE; n],
+                ..BoxModels::default()
+            },
         };
         for i in 0..n {
             let s = BlockState(i as u16);
@@ -134,6 +276,19 @@ impl MaterialTable {
         self.class[i] = class_of(self.shape[i], model);
         self.codes[i] = cube_codes(model);
         self.has_fluid |= model == BlockModel::Fluid;
+        let made_of_boxes = self.shape[i] != RenderShape::None && !model.boxes().is_empty();
+        self.box_models.shape_of[i] = if made_of_boxes {
+            self.box_models.intern(model)
+        } else {
+            NO_SHAPE
+        };
+    }
+    /// The model box table: every distinct [`ModelBox`] of the materials made of boxes, in the
+    /// order first met (materials in id order). A `SHAPE_BOX` quad's
+    /// [`PackedQuad::box_index`] indexes it; the renderer uploads it packed
+    /// ([`crate::pack_model_box`]). At most [`MAX_MODEL_BOXES`] (the registry checks it).
+    pub fn model_boxes(&self) -> &[ModelBox] {
+        &self.box_models.boxes
     }
     /// True if gather marks fluid surface cells ([`FLUID_SURFACE_BIT`]): some material is a
     /// fluid and every material id is below the bit (else fluids keep a full-height top).
@@ -213,6 +368,10 @@ impl MaterialTable {
             model: vec![BlockModel::CUBE; n],
             codes: vec![[0; 6]; n],
             has_fluid: false,
+            box_models: BoxModels {
+                shape_of: vec![NO_SHAPE; n],
+                ..BoxModels::default()
+            },
             shape,
             layers,
         }
@@ -704,51 +863,20 @@ fn lit_shading(
     (ao, corners)
 }
 
-/// How one face of a non-cube block meets its cell's border.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Cover {
-    /// Not on the border (the top of a bottom slab), or no face there.
-    None,
-    /// The whole border face.
-    Full,
-    /// Its lower half.
-    Lower,
-    /// Its upper half.
-    Upper,
-}
-
-impl Cover {
-    /// A face covering `self` of the border hides a face covering `other` of the same border.
-    fn hides(self, other: Cover) -> bool {
-        self == Cover::Full || (self == other && self != Cover::None)
-    }
-}
-
-/// How `face` of a block of `model` meets the cell border (`None` for cubes and crosses: cube
-/// faces are the greedy pass's, and cross quads never touch the border).
-fn cover_of(model: BlockModel, face: Face) -> Cover {
-    match (model, face) {
-        (BlockModel::Slab(SlabHalf::Bottom), Face::NegY)
-        | (BlockModel::Slab(SlabHalf::Top), Face::PosY) => Cover::Full,
-        (BlockModel::Slab(_), Face::PosY | Face::NegY)
-        | (BlockModel::Cube { .. } | BlockModel::Cross | BlockModel::Fluid, _) => Cover::None,
-        (BlockModel::Slab(SlabHalf::Bottom), _) => Cover::Lower,
-        (BlockModel::Slab(SlabHalf::Top), _) => Cover::Upper,
-    }
-}
-
-/// The quads of the non-cube blocks of the inner 32^3 (ADR 0018), one block at a time, into
-/// `out` with their buckets (cleared first). `shade(cell, face, nb9)` gives a quad's AO byte and
-/// light palette index: for a slab face, `cell` is the padded index of the voxel in front of the
-/// face and `nb9` the opacity of its 3x3 front layer, exactly as for the cube face there (so a
-/// slab face shades like the part of the cube face it covers); for a cross, `cell` is the
-/// block's own voxel and `nb9` is `None`.
+/// The quads of the non-cube blocks of the inner 32^3 (ADR 0018, ADR 0020), one block at a time,
+/// into `out` with their buckets (cleared first). `shade(cell, face, nb9)` gives a quad's AO
+/// byte and light palette index: for a box face, `cell` is the padded index of the voxel whose
+/// layer shades it and `nb9` the opacity of that 3x3 layer ([`box_face_layer`]), as for the
+/// cube face there; for a cross, `cell` is the block's own voxel and `nb9` is `None`.
 ///
-/// A slab face on the cell border is hidden by an opaque cube in front of it or by a non-cube
-/// neighbor whose face there covers it (two bottom slabs side by side); its face inside the cell
-/// is always drawn. Cubes never hide against a slab (the greedy pass sees it as empty), so a cube
-/// face under a bottom slab is drawn and hidden by depth. A cross gives two quads (faces `PosX`
-/// and `PosZ`, see [`layout::SHAPE_CROSS`]) with the texture of its side.
+/// A model made of boxes (slabs, stairs, fences, torches) draws one `SHAPE_BOX` quad per box
+/// face its other boxes do not cover. A face flush with the cell border is hidden by an opaque
+/// cube in front of it, or by a neighbor made of boxes whose faces on that border cover it, if
+/// that neighbor is opaque or the same material (two bottom slabs side by side, a stair's back
+/// against a full stair face). Faces inside the cell are always drawn. Cubes never hide against
+/// a box model (the greedy pass sees it as empty), so a cube face behind a stair's back is drawn
+/// and hidden by depth. A cross gives two quads (faces `PosX` and `PosZ`, see
+/// [`layout::SHAPE_CROSS`]) with the texture of its side.
 fn emit_specials(
     padded: &PaddedChunk,
     materials: &MaterialTable,
@@ -756,17 +884,21 @@ fn emit_specials(
     mut shade: impl FnMut(usize, Face, Option<u32>) -> Result<(u8, u16), PaletteFull>,
 ) -> Result<(), PaletteFull> {
     out.clear();
-    let mut push = |m: u16, pos: [u32; 3], face: Face, layer_face: Face, code: u8, shading| {
-        let (ao, light): (u8, u16) = shading;
-        let mut quad = PackedQuad::new(pos, 1, 1, face, materials.layer(m, layer_face))
-            .with_ao_byte(ao)
-            .with_light_index(light)
-            .with_shape(code);
-        if materials.emissive(m) {
-            quad.geo |= layout::FLAG_EMISSIVE << layout::GEO_FLAGS_SHIFT;
-        }
-        out.push((materials.bucket(m, face) as u8, quad));
-    };
+    // `index`: the model box of a `SHAPE_BOX` quad (0 is `w = h = 1` for the others).
+    let mut push =
+        |m: u16, pos: [u32; 3], face: Face, layer_face: Face, code: u8, index, shading| {
+            let (ao, light): (u8, u16) = shading;
+            let mut quad = PackedQuad::new(pos, 1, 1, face, materials.layer(m, layer_face))
+                .with_ao_byte(ao)
+                .with_light_index(light)
+                .with_shape(code)
+                .with_box_index(index);
+            if materials.emissive(m) {
+                quad.geo |= layout::FLAG_EMISSIVE << layout::GEO_FLAGS_SHIFT;
+            }
+            out.push((materials.bucket(m, face) as u8, quad));
+        };
+    let models = &materials.box_models;
     for y in 0..CHUNK_SIZE {
         for x in 0..CHUNK_SIZE {
             // Inner voxels only (mask bit of padded z is z + 1).
@@ -777,46 +909,90 @@ fn emit_specials(
                 let i = PaddedChunk::index(x, y, z);
                 let m = padded.voxels[i];
                 let pos = [x as u32, y as u32, z as u32];
-                match materials.model(m) {
-                    BlockModel::Slab(half) => {
-                        let code = match half {
-                            SlabHalf::Bottom => layout::SHAPE_LOWER_HALF,
-                            SlabHalf::Top => layout::SHAPE_UPPER_HALF,
-                        };
-                        for face in Face::ALL {
-                            let n = face.normal();
-                            let (nx, ny, nz) = (x + n.x, y + n.y, z + n.z);
-                            let cover = cover_of(BlockModel::Slab(half), face);
-                            let hidden = cover != Cover::None
-                                && match class_from_masks(padded, nx, ny, nz) {
-                                    VoxelClass::Opaque => true,
-                                    VoxelClass::Special => {
-                                        let nm = padded.get(nx, ny, nz);
-                                        cover_of(materials.model(nm), face.opposite()).hides(cover)
-                                    }
-                                    VoxelClass::Empty | VoxelClass::Transparent => false,
-                                };
-                            if hidden {
-                                continue;
+                if let Some(shape) = models.of(m) {
+                    // Each direction shades once per block.
+                    let mut shaded: [Option<(u8, u16)>; 6] = [None; 6];
+                    for bf in &shape.faces {
+                        let face = bf.face;
+                        if bf.border && box_face_hidden(padded, materials, m, [x, y, z], *bf) {
+                            continue;
+                        }
+                        let shading = match shaded[face.index()] {
+                            Some(shading) => shading,
+                            None => {
+                                let (cell, nb9) = box_face_layer(padded, [x, y, z], face);
+                                let shading = shade(cell, face, Some(nb9))?;
+                                shaded[face.index()] = Some(shading);
+                                shading
                             }
-                            let front = PaddedChunk::index(nx, ny, nz);
-                            let nb9 =
-                                front_nb9(face, &padded.opaque, x as usize, y as usize, z as usize);
-                            push(m, pos, face, face, code, shade(front, face, Some(nb9))?);
-                        }
+                        };
+                        push(m, pos, face, face, layout::SHAPE_BOX, bf.index, shading);
                     }
-                    BlockModel::Cross => {
-                        for face in [Face::PosX, Face::PosZ] {
-                            let shading = shade(i, face, None)?;
-                            push(m, pos, face, Face::PosX, layout::SHAPE_CROSS, shading);
-                        }
+                } else if materials.model(m) == BlockModel::Cross {
+                    for face in [Face::PosX, Face::PosZ] {
+                        let shading = shade(i, face, None)?;
+                        push(m, pos, face, Face::PosX, layout::SHAPE_CROSS, 0, shading);
                     }
-                    BlockModel::Cube { .. } | BlockModel::Fluid => {}
                 }
             }
         }
     }
     Ok(())
+}
+
+/// True if the neighbor in front of `bf` (a face of material `m` at inner `p`, flush with the
+/// cell border) hides it: an opaque cube, or a model made of boxes, opaque or of material `m`,
+/// whose faces on that border cover it.
+fn box_face_hidden(
+    padded: &PaddedChunk,
+    materials: &MaterialTable,
+    m: u16,
+    [x, y, z]: [i32; 3],
+    bf: BoxFace,
+) -> bool {
+    let n = bf.face.normal();
+    let (nx, ny, nz) = (x + n.x, y + n.y, z + n.z);
+    match class_from_masks(padded, nx, ny, nz) {
+        VoxelClass::Opaque => true,
+        VoxelClass::Special => {
+            let nm = padded.get(nx, ny, nz);
+            let hides = nm == m || materials.shape(nm) == RenderShape::Opaque;
+            hides
+                && materials.box_models.of(nm).is_some_and(|other| {
+                    is_covered(&other.covers[bf.face.opposite().index()], bf.rect)
+                })
+        }
+        VoxelClass::Empty | VoxelClass::Transparent => false,
+    }
+}
+
+/// The voxel whose layer shades `face` of the box model at inner `p`, and the opacity of that
+/// 3x3 layer (`PaddedChunk::opaque`, bit `(dv + 1) * 3 + (du + 1)`): the voxel in front, as for
+/// the cube face there, unless that voxel is an opaque cube, then the block's own voxel (a fence
+/// post's face against a wall, a stair's step under a block: inside the cell, where light still
+/// reaches, as Minecraft shades faces off the cell border). A face on the border with an opaque
+/// cube in front is hidden, so only inner faces take their own voxel.
+fn box_face_layer(padded: &PaddedChunk, [x, y, z]: [i32; 3], face: Face) -> (usize, u32) {
+    let n = face.normal();
+    let (nx, ny, nz) = (x + n.x, y + n.y, z + n.z);
+    if class_from_masks(padded, nx, ny, nz) == VoxelClass::Opaque {
+        // The block's own layer (rare: read cell by cell).
+        let (_, ua, va) = face.axes();
+        let mut nb9 = 0;
+        for dv in -1..=1 {
+            for du in -1..=1 {
+                let mut c = [x, y, z];
+                c[ua] += du;
+                c[va] += dv;
+                let opaque = class_from_masks(padded, c[0], c[1], c[2]) == VoxelClass::Opaque;
+                nb9 |= u32::from(opaque) << ((dv + 1) * 3 + (du + 1));
+            }
+        }
+        (PaddedChunk::index(x, y, z), nb9)
+    } else {
+        let nb9 = front_nb9(face, &padded.opaque, x as usize, y as usize, z as usize);
+        (PaddedChunk::index(nx, ny, nz), nb9)
+    }
 }
 
 /// [`front_neighborhood`] of a face given at run time.
@@ -1118,8 +1294,7 @@ pub fn reference_face_shading(
 }
 
 /// [`reference_face_shading`] of one unit face: `face` of voxel `p` (inner 32^3), whether it
-/// is visible or not. The faces of the non-cube blocks shade as the cube face in their place
-/// (the oracle of the per-block path, ADR 0018).
+/// is visible or not.
 pub fn reference_face_shading_at(
     padded: &PaddedChunk,
     light: Option<&PaddedLight>,
@@ -1127,11 +1302,41 @@ pub fn reference_face_shading_at(
     p: [u32; 3],
     face: Face,
 ) -> FaceShading {
+    let n = face.normal().to_array();
+    let front: [i32; 3] = std::array::from_fn(|a| p[a] as i32 + n[a]);
+    layer_shading(padded, light, policy, front, face)
+}
+
+/// The oracle of a box face of a model made of boxes (the per-block path, ADR 0018 and 0020):
+/// `face` of the block at `p` shades as the cube face there ([`reference_face_shading_at`]),
+/// unless the voxel in front of it is an opaque cube: then the same rules apply to the block's
+/// own layer (the 4 corner cells around each corner in the plane through `p`).
+pub fn reference_box_face_shading_at(
+    padded: &PaddedChunk,
+    light: Option<&PaddedLight>,
+    policy: AoPolicy,
+    p: [u32; 3],
+    face: Face,
+) -> FaceShading {
+    let n = face.normal().to_array();
+    let front: [i32; 3] = std::array::from_fn(|a| p[a] as i32 + n[a]);
+    let opaque = class_from_masks(padded, front[0], front[1], front[2]) == VoxelClass::Opaque;
+    let layer = if opaque { p.map(|c| c as i32) } else { front };
+    layer_shading(padded, light, policy, layer, face)
+}
+
+/// AO and corner lights of a face of direction `face` whose front layer is the one through
+/// `front` (see [`reference_face_shading`]).
+fn layer_shading(
+    padded: &PaddedChunk,
+    light: Option<&PaddedLight>,
+    policy: AoPolicy,
+    front: [i32; 3],
+    face: Face,
+) -> FaceShading {
     let opaque = |p: [i32; 3]| class_from_masks(padded, p[0], p[1], p[2]) == VoxelClass::Opaque;
     let light_at = |p: [i32; 3]| light.map_or(LightValue::FULL_SKY, |l| l.get(p[0], p[1], p[2]));
     let (_, ua, va) = face.axes();
-    let n = face.normal().to_array();
-    let front: [i32; 3] = std::array::from_fn(|a| p[a] as i32 + n[a]);
     let cell = |du: i32, dv: i32| {
         let mut c = front;
         c[ua] += du;

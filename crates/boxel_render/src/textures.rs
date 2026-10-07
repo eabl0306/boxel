@@ -55,7 +55,10 @@ pub fn generate_block_textures(specs: &[TextureSpec]) -> BlockTextureData {
 pub(crate) fn is_cutout_pattern(spec: &TextureSpec) -> bool {
     matches!(
         spec.pattern,
-        TexturePattern::Leaves | TexturePattern::Plant | TexturePattern::Flower { .. }
+        TexturePattern::Leaves
+            | TexturePattern::Plant
+            | TexturePattern::Flower { .. }
+            | TexturePattern::Torch
     )
 }
 
@@ -194,6 +197,21 @@ pub(crate) fn synthesize(spec: &TextureSpec) -> [[u8; 4]; BASE_TEXELS] {
                         texels[y * size + x] =
                             with_noise(if center { [240, 220, 90] } else { color }, noise);
                     }
+                }
+            }
+        }
+        TexturePattern::Torch => {
+            // Minecraft's layout: a 2 texel stick (columns 7 and 8) from row 8 down, under a
+            // flame in rows 6 and 7. The model boxes of the torches sample exactly these texels
+            // (ADR 0020).
+            for (i, texel) in texels.iter_mut().enumerate() {
+                let (x, y) = (i % size, i / size);
+                if !(7..9).contains(&x) || y < 6 {
+                    texel[3] = 0;
+                } else if y == 6 {
+                    *texel = [255, 248, 200, 255];
+                } else if y == 7 {
+                    *texel = [255, 200, 80, 255];
                 }
             }
         }

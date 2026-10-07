@@ -17,12 +17,12 @@ mod padded;
 pub mod shading;
 
 pub use mesher::{
-    AoPolicy, MaterialTable, MeshInput, MeshOptions, Mesher, reference_face_shading,
-    reference_face_shading_at, reference_visible_faces,
+    AoPolicy, MaterialTable, MeshInput, MeshOptions, Mesher, reference_box_face_shading_at,
+    reference_face_shading, reference_face_shading_at, reference_visible_faces,
 };
 pub use packed::{
     ChunkMesh, FULL_SKY_ENTRY, LightQuantization, MAX_PALETTE_ENTRIES, PackedQuad, PaletteEntry,
-    layout, palette_corners, palette_entry,
+    layout, pack_model_box, palette_corners, palette_entry, unpack_model_box,
 };
 pub use padded::{FLUID_SURFACE_BIT, PADDED, PADDED_AREA, PADDED_VOLUME, PaddedChunk, VoxelClass};
 pub use shading::FaceShading;

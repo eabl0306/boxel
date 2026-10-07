@@ -30,7 +30,7 @@ use boxel_gfx::{
     install_lkg_panic_hook, read_texture_rgba8, select_gpu,
 };
 use boxel_math::{I64Vec3, UVec2};
-use boxel_mesh::ChunkMesh;
+use boxel_mesh::{ChunkMesh, MaterialTable};
 use boxel_transform::Transform;
 use boxel_voxel::BlockRegistry;
 use boxel_window::{DisplayHandle, PrimaryWindow, WindowState};
@@ -945,7 +945,7 @@ fn bootstrap(p: &mut SetupParams) {
             .map(|surface_config| (renderer, surface_config))
             .map_err(|e| format!("surface configuration: {e}"))
     });
-    let (renderer, surface_config) = match built {
+    let (mut renderer, surface_config) = match built {
         Ok(parts) => parts,
         Err(error) => {
             let key = ctx.caps.summary().key();
@@ -972,6 +972,14 @@ fn bootstrap(p: &mut SetupParams) {
             return;
         }
     };
+    // The model box table of the world's meshes (ADR 0020).
+    match p.content.as_deref() {
+        Some(content) => renderer.set_model_boxes(&ctx.queue, content.materials.model_boxes()),
+        None => {
+            let materials = MaterialTable::from_registry(&BlockRegistry::default_blocks());
+            renderer.set_model_boxes(&ctx.queue, materials.model_boxes());
+        }
+    }
 
     // 8. Success.
     let summary = ctx.summary_line();

@@ -141,13 +141,14 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
         "boxel:short_grass",
         "boxel:poppy",
     ];
-    assert_eq!(r.len(), states.len());
+    // ADR 0020 adds 181 states after these (stairs, fence, torches; tests/shapes.rs).
+    assert_eq!(r.len(), states.len() + 181);
     for (i, n) in states.iter().enumerate() {
         let s = BlockState(i as u16);
         assert_eq!(r.parse_state(n), Ok(s), "{n}");
         assert_eq!(r.state_name(s).to_string(), *n);
     }
-    assert_eq!(r.block_count(), 21);
+    assert_eq!(r.block_count(), 26);
     // A plain name is the default state.
     assert_eq!(r.by_name("boxel:log"), Some(BlockState(9)));
     assert_eq!(r.by_name("boxel:stone_slab"), Some(BlockState(20)));
@@ -167,7 +168,7 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
     assert_eq!(tex(grass, Face::PosY), "boxel:grass_top");
     assert_eq!(tex(grass, Face::NegY), "boxel:dirt");
     assert_eq!(tex(grass, Face::PosX), "boxel:grass_side");
-    assert_eq!(r.textures().len(), 21);
+    assert_eq!(r.textures().len(), 22);
     // The emitters: opaque solid cubes with their own texture.
     for (i, name) in states.iter().enumerate().skip(14).take(5) {
         let s = BlockState(i as u16);
