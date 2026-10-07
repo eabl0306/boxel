@@ -23,7 +23,7 @@
 use boxel::app::RunFixedMainLoopSystems;
 use boxel::camera::FlyCameraSystems;
 use boxel::debug_overlay::OverlayLines;
-use boxel::physics::{Frozen, PhysicsStats};
+use boxel::physics::{Frozen, PhysicsStats, Swimmer};
 use boxel::prelude::*;
 use boxel::world::WorldSystems;
 
@@ -129,6 +129,9 @@ pub fn player_body(feet: WorldPos) -> impl Bundle {
         CharacterController::default(),
         Interpolated::default(),
         Teleport(feet),
+        // In water it swims (with `SwimPlugin`): held Space keeps setting the jump latch, which
+        // swims up there.
+        Swimmer::default(),
     )
 }
 

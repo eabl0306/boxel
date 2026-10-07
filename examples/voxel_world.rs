@@ -52,7 +52,7 @@ use boxel::camera::FlyCameraSystems;
 use boxel::debug_overlay::{Crosshair, CrosshairTarget, OverlayLines};
 use boxel::gfx::wgpu::PresentMode;
 use boxel::gfx::{CLI_HELP, DeviceClass, RgbaImage};
-use boxel::physics::{PhysicsPlugin, Probe as VoxelProbe};
+use boxel::physics::{PhysicsPlugin, Probe as VoxelProbe, SwimPlugin};
 use boxel::prelude::*;
 use boxel::render::{DebugDestroyDevice, GpuFailed, GpuReady, SurfaceInfo, TextureSource};
 use boxel::voxel::{Axis, BlockRegistry, MAX_BLOCK_COORD};
@@ -1696,6 +1696,7 @@ fn main() -> AppExit {
             max_steps_per_frame: None,
             ..PhysicsPlugin::default()
         },
+        SwimPlugin,
         PickingPlugin,
         WalkPlugin { start_walking },
     ));
@@ -1840,6 +1841,7 @@ mod tests {
                 lamps,
             },
             PhysicsPlugin::default(),
+            SwimPlugin,
             PickingPlugin,
             WalkPlugin::default(),
         ))

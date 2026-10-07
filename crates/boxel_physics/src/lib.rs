@@ -56,6 +56,7 @@ mod projectile;
 mod query;
 mod sleep;
 mod source;
+mod swim;
 mod systems;
 
 pub use crate::components::{
@@ -76,6 +77,7 @@ pub use boxel_voxel::WorldPos;
 pub use plugin::{PhysicsContent, PhysicsPlugin};
 pub use query::{PhysicsQuery, RayFilter, RayHit};
 pub use source::ChunkSource;
+pub use swim::{SwimIntent, SwimPlugin, SwimSettings, Swimmer, box_touches_fluid, swim_bodies};
 pub use systems::PhysicsSystems;
 
 /// Common items.

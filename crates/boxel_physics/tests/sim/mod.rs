@@ -4,7 +4,7 @@
 //! every run has the same fixed steps). `Update` logs the impacts and the collision events.
 #![allow(dead_code, reason = "each test file uses a different subset")]
 
-use boxel_app::{App, First, FixedTime, Time, TimePlugin, TimeSystems, Update};
+use boxel_app::{App, First, FixedTime, Plugins, Time, TimePlugin, TimeSystems, Update};
 use boxel_ecs::prelude::*;
 use boxel_math::{DVec3, I64Vec3};
 use boxel_physics::{
@@ -103,6 +103,11 @@ impl Sim {
     /// `base` is a multiple of 1024 on every axis, so the viewer's `f64` position is exact up
     /// to the world limit. Frames last `frame`. The viewer at `base` loads one chunk around it.
     pub fn new(base: I64Vec3, frame: Duration) -> Self {
+        Self::with_plugins(base, frame, ())
+    }
+
+    /// [`Sim::new`] with more plugins, added after `PhysicsPlugin`.
+    pub fn with_plugins<M>(base: I64Vec3, frame: Duration, plugins: impl Plugins<M>) -> Self {
         let start = Instant::now();
         let mut app = App::new();
         app.add_plugins((
@@ -120,6 +125,7 @@ impl Sim {
             },
             PhysicsPlugin::default(),
         ))
+        .add_plugins(plugins)
         .insert_resource(Clock {
             time: Time::new(start),
             now: start,
