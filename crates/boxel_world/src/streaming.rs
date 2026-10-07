@@ -2988,10 +2988,7 @@ fn is_enclosed_opaque<'a>(
     data: &ChunkData,
     near: &mut NearData<'a>,
 ) -> bool {
-    let opaque = |d: &ChunkData| {
-        d.as_uniform()
-            .is_some_and(|s| registry.shape(s) == RenderShape::Opaque)
-    };
+    let opaque = |d: &ChunkData| d.as_uniform().is_some_and(|s| registry.occludes(s));
     opaque(data)
         && FACE_NEIGHBORS
             .iter()
