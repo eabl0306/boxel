@@ -346,7 +346,7 @@ fn hidden_mesh(n: u32) -> ChunkMesh {
 /// short grass and poppies, and logs along X and Z. Meshed by the real mesher (no light: open
 /// sky). Returns `(chunk, mesh)` for both chunks.
 fn special_scene(registry: &BlockRegistry) -> Vec<(IVec3, ChunkMesh)> {
-    let get = |name: &str| registry.by_name(name).expect(name);
+    let get = |name: &str| registry.parse_state(name).expect(name);
     let mut dense = [
         vec![BlockState::AIR; 32 * 32 * 32],
         vec![BlockState::AIR; 32 * 32 * 32],
@@ -394,7 +394,7 @@ fn special_scene(registry: &BlockRegistry) -> Vec<(IVec3, ChunkMesh)> {
     for z in 14..18 {
         put(14, 1, z, get("boxel:stone_slab"));
         put(15, 1, z, get("boxel:stone"));
-        put(16, 2, z, get("boxel:stone_slab_top"));
+        put(16, 2, z, get("boxel:stone_slab[type=top]"));
     }
     // Plants and logs.
     for (i, x) in (20..28).enumerate() {
@@ -404,10 +404,10 @@ fn special_scene(registry: &BlockRegistry) -> Vec<(IVec3, ChunkMesh)> {
             "boxel:short_grass"
         };
         put(x, 1, 14, get(plant));
-        put(x, 1, 20, get("boxel:log_x"));
+        put(x, 1, 20, get("boxel:log[axis=x]"));
     }
     for z in 22..28 {
-        put(40, 1, z, get("boxel:log_z"));
+        put(40, 1, z, get("boxel:log[axis=z]"));
     }
     let chunks = dense.map(|d| ChunkData::from_dense(&d));
     let materials = MaterialTable::from_registry(registry);

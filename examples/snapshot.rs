@@ -65,7 +65,8 @@ usage: snapshot --camera X,Y,Z,YAW,PITCH --shot HH:MM=PATH [--shot ...] [options
   --light MODE         on (the default) or off (open sky everywhere)
   --ao MODE            ambient occlusion: off, baked or lit-only (the default); --light off
                        --ao off is the look before light
-  --place NAME@X,Y,Z   set block NAME (boxel:lamp_orange, lamp_red, lava, air...) at X,Y,Z
+  --place NAME@X,Y,Z   set block NAME (boxel:lamp_orange, lamp_red, lava, air...) at X,Y,Z;
+                       NAME may give state properties: stone_slab[type=top], log[axis=x]
   --drop NAME@X,Y,Z    set block NAME on the ground under X,Y,Z, which must be air (searching
                        64 blocks down in the generated world; prints where it landed)
   --fill NAME@X,Y,Z:X,Y,Z  set every block of the box between both corners (inclusive); a
@@ -334,7 +335,7 @@ fn settle(app: &mut App, deadline: Instant) -> Result<(), Box<WorldStats>> {
 
 /// The cells of the edits, with their states, once each: a later edit of a cell replaces an
 /// earlier one (a `--fill` of air inside a `--fill` of stone makes a room). `Err` for an unknown
-/// block name; `--drop` edits whose column has no ground within [`DROP_DEPTH`] (or is not
+/// block, property or value (names are block states, `boxel:stone_slab[type=top]`); `--drop` edits whose column has no ground within [`DROP_DEPTH`] (or is not
 /// loaded) are left out and counted.
 fn edit_cells(
     edits: &[(String, Edit)],
@@ -353,13 +354,7 @@ fn edit_cells(
     };
     let mut skipped = 0;
     for (name, edit) in edits {
-        let state = if name == "boxel:air" {
-            BlockState::AIR
-        } else {
-            registry
-                .by_name(name)
-                .ok_or_else(|| format!("unknown block {name:?}"))?
-        };
+        let state = registry.parse_state(name).map_err(|e| e.to_string())?;
         match *edit {
             Edit::Place(p) => set(BlockPos::new(p.x, p.y, p.z), state),
             Edit::Drop(p) => {
@@ -648,7 +643,7 @@ fn run(
             let state = map.block_at(block).unwrap_or(BlockState::AIR);
             format!(
                 "{} at {},{},{} ({t:.1} voxels), lit by {}",
-                registry.name(state),
+                registry.state_name(state),
                 block.x,
                 block.y,
                 block.z,
@@ -795,6 +790,8 @@ mod tests {
             "boxel:lava@1099511627776,0,5",
             "--fill",
             "air@4,4,4:2,6,3",
+            "--fill",
+            "stone_slab[type=top]@0,1,0:1,1,1",
         ]);
         let o = parse(&args).expect("valid").expect("not help");
         assert_eq!(
@@ -812,7 +809,22 @@ mod tests {
                     "boxel:air".to_string(),
                     Edit::Fill(I64Vec3::new(2, 4, 3), I64Vec3::new(4, 6, 4))
                 ),
+                (
+                    "boxel:stone_slab[type=top]".to_string(),
+                    Edit::Fill(I64Vec3::new(0, 1, 0), I64Vec3::new(1, 1, 1))
+                ),
             ]
+        );
+        // The names are block states of the registry (`edit_cells` parses them).
+        let registry = BlockRegistry::default_blocks();
+        for (name, _) in &o.edits {
+            assert!(registry.parse_state(name).is_ok(), "{name}");
+        }
+        assert_eq!(
+            registry.parse_state("boxel:stone_slab[type=top]"),
+            registry
+                .parse_state("boxel:stone_slab")
+                .map(|s| { registry.with(s, "type", "top").expect("top") })
         );
         for bad in [
             &["--place", "@1,2,3"][..],

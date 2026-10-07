@@ -322,20 +322,69 @@ fn crosses_are_two_cutout_quads_lit_by_their_own_cell() {
 fn the_registry_classes_follow_shape_and_model() {
     let registry = BlockRegistry::default_blocks();
     let table = MaterialTable::from_registry(&registry);
-    let class = |name: &str| table.class(registry.by_name(name).unwrap().0);
+    let id = |name: &str| registry.parse_state(name).unwrap().0;
+    let class = |name: &str| table.class(id(name));
     assert_eq!(class("boxel:stone"), VoxelClass::Opaque);
     assert_eq!(class("boxel:glass"), VoxelClass::Transparent);
     assert_eq!(class("boxel:water"), VoxelClass::Transparent);
-    assert_eq!(class("boxel:stone_slab"), VoxelClass::Special);
-    assert_eq!(class("boxel:stone_slab_top"), VoxelClass::Special);
+    assert_eq!(class("boxel:stone_slab[type=bottom]"), VoxelClass::Special);
+    assert_eq!(class("boxel:stone_slab[type=top]"), VoxelClass::Special);
+    assert_eq!(class("boxel:stone_slab[type=double]"), VoxelClass::Opaque);
     assert_eq!(class("boxel:short_grass"), VoxelClass::Special);
     assert_eq!(class("boxel:poppy"), VoxelClass::Special);
-    assert_eq!(class("boxel:log_x"), VoxelClass::Opaque);
-    let log_x = registry.by_name("boxel:log_x").unwrap().0;
+    assert_eq!(class("boxel:log[axis=x]"), VoxelClass::Opaque);
+    let log_x = id("boxel:log[axis=x]");
     assert_eq!(table.cube_code(log_x, Face::PosX), layout::SHAPE_CUBE);
     assert_eq!(table.cube_code(log_x, Face::PosY), layout::SHAPE_TURNED);
     assert_eq!(
-        table.bucket(registry.by_name("boxel:glass").unwrap().0, Face::PosY),
+        table.bucket(id("boxel:glass"), Face::PosY),
         boxel_mesh::TRANSLUCENT_BUCKET
     );
+}
+
+/// A double slab (ADR 0019) is a plain stone cube to the mesher: the greedy path merges it into
+/// the same quads, with the same layers, as stone in its place.
+#[test]
+fn double_slabs_mesh_like_stone_cubes() {
+    let registry = BlockRegistry::default_blocks();
+    let table = MaterialTable::from_registry(&registry);
+    let stone = registry.parse_state("boxel:stone").unwrap().0;
+    let double = registry
+        .parse_state("boxel:stone_slab[type=double]")
+        .unwrap()
+        .0;
+    let bottom = registry.parse_state("boxel:stone_slab").unwrap().0;
+    // A 4 x 3 x 5 box of `m` with a bottom slab on top of one corner.
+    let build = |m: u16| {
+        let mut padded = PaddedChunk::new();
+        for x in 2..6 {
+            for y in 1..4 {
+                for z in 3..8 {
+                    set_material(&mut padded, &table, [x, y, z], m);
+                }
+            }
+        }
+        set_material(&mut padded, &table, [2, 4, 3], bottom);
+        padded
+    };
+    let ao = AoPolicy::Baked;
+    let with_stone = mesh(&build(stone), &table, None, ao);
+    let with_double = mesh(&build(double), &table, None, ao);
+    for bucket in 0..BUCKET_COUNT {
+        assert_eq!(
+            with_double.bucket(bucket),
+            with_stone.bucket(bucket),
+            "bucket {bucket}"
+        );
+    }
+    // The box is six greedy quads (a cube face is never hidden by a slab), and the slab five
+    // (its bottom lies on the box).
+    let quads: Vec<PackedQuad> = (0..BUCKET_COUNT)
+        .flat_map(|b| with_double.bucket(b).iter().copied())
+        .collect();
+    let cubes = quads
+        .iter()
+        .filter(|q| q.shape() == layout::SHAPE_CUBE)
+        .count();
+    assert_eq!((cubes, quads.len() - cubes), (6, 5));
 }
