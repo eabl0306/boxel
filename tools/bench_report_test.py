@@ -109,6 +109,11 @@ class FormatTest(unittest.TestCase):
         self.assertEqual(br.title(static), 'static r16')
         static['run']['fps_limit'] = 60
         self.assertEqual(br.title(static), 'static r16 limit 60 fps')
+        static['run']['vsync'] = 'off'
+        self.assertEqual(br.title(static), 'static r16 limit 60 fps', 'vsync off keeps the title')
+        static['run']['vsync'] = 'on'
+        self.assertEqual(br.title(static), 'static r16 limit 60 fps vsync')
+        static['run']['vsync'] = 'off'
         static['run']['bodies'] = '10000 item, 0 projectiles'
         self.assertEqual(br.title(static), 'static r16 limit 60 fps bodies 10000 item, 0 projectiles')
         static['run']['edits'] = True
@@ -138,7 +143,8 @@ class OutputTest(unittest.TestCase):
         self.assertEqual(code, 0)
         rows = [line for line in out.splitlines() if line.startswith('| fly r16')]
         self.assertEqual(len(rows), 2)
-        self.assertIn('| 500 | 2 | 3 | 5 | 8 | 200 | 2 | 0 | 6.50 | 100 | 10 | 250 |', rows[0])
+        self.assertIn('| 500 | 2 | 3 | 5 | 8 | 200 | 2 | 0 | 6.50 | 100 | 10 | 250 | - | - |',
+                      rows[0])
 
     def test_directories_skip_other_files(self):
         self.write('run.md', SAMPLE, 'runs')
@@ -248,6 +254,39 @@ class OutputTest(unittest.TestCase):
         code, out, _ = run_main('--compare', self.write('a.md', SAMPLE), self.write('b.md', capped))
         self.assertEqual(code, 0)
         self.assertIn('Note: the settings differ (fps limit 0 -> 144)', out)
+
+    def test_compare_directories_keeps_vsync_apart(self):
+        # Runs from before --vsync count as vsync on only if they asked for --present vsync.
+        old = copy.deepcopy(SAMPLE)
+        old['run']['present'] = 'vsync'
+        new = copy.deepcopy(SAMPLE)
+        new['run']['vsync'] = 'on'
+        off = copy.deepcopy(SAMPLE)
+        off['run']['vsync'] = 'off'
+        self.write('1-old.md', old, 'base')
+        self.write('2-plain.md', SAMPLE, 'base')
+        self.write('3-on.md', new, 'new')
+        self.write('4-off.md', off, 'new')
+        code, out, _ = run_main('--compare', os.path.join(self.dir.name, 'base'),
+                                os.path.join(self.dir.name, 'new'))
+        self.assertEqual(code, 0)
+        self.assertIn('### fly r16 32 vox/s vsync: 1-old.md -> 3-on.md', out)
+        self.assertIn('### fly r16 32 vox/s: 2-plain.md -> 4-off.md', out)
+
+    def test_compare_adds_pacing_metrics_when_recorded(self):
+        paced = copy.deepcopy(SAMPLE)
+        paced['frames']['over_7_5ms'] = 3
+        paced['pacing'] = {
+            'presented_fps': 140.5, 'gate_waits': 10, 'gate_misses': 3,
+            'presented_intervals': {'p99_ms': 13.9, 'stddev_ms': 0.8, 'gaps': 3},
+            'callbacks': {'gaps': 3},
+        }
+        code, out, _ = run_main('--compare', self.write('a.md', SAMPLE), self.write('b.md', paced))
+        self.assertEqual(code, 0)
+        self.assertIn('| presented fps | - | 140 | - |  |', out)
+        self.assertIn('| gate misses | - | 3 | - |  |', out)
+        code, out, _ = run_main('--compare', self.write('c.md', SAMPLE), self.write('d.md', SAMPLE))
+        self.assertNotIn('presented fps', out)
 
     def test_compare_directories_keeps_bodies_apart(self):
         # Old runs have no bodies field: they had no physics bodies.

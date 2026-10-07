@@ -21,7 +21,7 @@ pub use input::{
     accumulate_mouse_motion_system, accumulate_mouse_scroll_system, keyboard_input_system,
     mouse_button_input_system,
 };
-pub use runner::{UpdateMode, winit_runner};
+pub use runner::{FramePacingInfo, UpdateMode, winit_runner};
 pub use window::{
     CursorGrab, CursorOptions, DisplayHandle, PrimaryWindow, WindowCloseRequested, WindowCreated,
     WindowFocused, WindowMode, WindowOccluded, WindowPlugin, WindowResized, WindowSettings,

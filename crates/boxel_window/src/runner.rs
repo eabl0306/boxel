@@ -34,6 +34,27 @@ pub enum UpdateMode {
     },
 }
 
+/// How the winit runner paced the current update, for diagnostics (overlays, benchmarks). The
+/// runner writes it right before each update; `WindowPlugin` inserts it.
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FramePacingInfo {
+    /// How long this update waited past its deadline for the presentation gate (zero: it did
+    /// not wait). See [`winit_runner`].
+    pub gate_wait: Duration,
+    /// This update stopped waiting with the gate still closed, so it runs without presenting.
+    pub gate_missed: bool,
+    /// When the presentation gate last opened (`RedrawRequested`; on Wayland the compositor's
+    /// frame callback for the last presented frame).
+    pub gate_opened_at: Option<Instant>,
+    /// Refresh rate of the window's monitor in millihertz, as winit reports it (`None`:
+    /// unknown). Polled about once per second.
+    pub refresh_millihertz: Option<u32>,
+    /// Updates that waited for the gate, since the window was created.
+    pub gate_waits: u64,
+    /// Updates that gave up waiting for the gate, since the window was created.
+    pub gate_misses: u64,
+}
+
 /// A requested redraw that has not arrived after this long marks the window occluded.
 const REDRAW_TIMEOUT: Duration = Duration::from_millis(100);
 /// Time between updates while the window is occluded (30 Hz).
@@ -44,6 +65,9 @@ const GATE_WAIT_MAX: Duration = Duration::from_millis(2);
 const PLUGINS_POLL: Duration = Duration::from_millis(1);
 /// Time between `Window::is_minimized` polls (X11 only; each poll is a server round trip).
 const MINIMIZED_POLL: Duration = Duration::from_millis(100);
+/// Time between `Window::current_monitor` polls (the refresh rate of the window's display; the
+/// window can move to another monitor).
+const MONITOR_POLL: Duration = Duration::from_secs(1);
 /// Pixel scroll deltas are converted to lines with this factor.
 const PIXELS_PER_LINE: f64 = 32.0;
 
@@ -113,6 +137,7 @@ pub fn winit_runner(mut app: App, event_loop: EventLoop<()>) -> AppExit {
         .copied()
         .unwrap_or_default();
     app.world_mut().init_resource::<WindowState>();
+    app.world_mut().init_resource::<FramePacingInfo>();
     let mut handler = WinitApp::new(app, settings);
     let result = event_loop.run_app(&mut handler);
     // `exiting` normally did this already; it is a no-op then.
@@ -289,6 +314,11 @@ impl ApplicationHandler for WinitApp {
         if self.poll_minimized {
             self.core.poll_minimized(now, || window.is_minimized());
         }
+        self.core.poll_monitor(now, || {
+            window
+                .current_monitor()
+                .and_then(|monitor| monitor.refresh_rate_millihertz())
+        });
         self.core.begin_update(self.app.world_mut(), now);
         self.app.update();
         if let Some(exit) = self.app.should_exit() {
@@ -342,6 +372,14 @@ struct RunnerCore {
     applied_cursor: CursorOptions,
     /// Frame deadlines ([`FrameLimit`]).
     pacer: FramePacer,
+    /// The deadline of a due frame held for its presentation gate (see `gate_wait`).
+    gate_hold: Option<Instant>,
+    /// Refresh rate of the window's monitor in millihertz (`None`: unknown).
+    refresh_millihertz: Option<u32>,
+    /// When the monitor was last polled (`None`: never).
+    monitor_polled_at: Option<Instant>,
+    /// What the runner publishes as [`FramePacingInfo`] (its counters live here).
+    pacing: FramePacingInfo,
 }
 
 impl RunnerCore {
@@ -360,6 +398,10 @@ impl RunnerCore {
                 visible: true,
             },
             pacer: FramePacer::new(),
+            gate_hold: None,
+            refresh_millihertz: None,
+            monitor_polled_at: None,
+            pacing: FramePacingInfo::default(),
         }
     }
 
@@ -379,7 +421,7 @@ impl RunnerCore {
     /// Before an update: whether the frame deadline allows it at `now`. A due frame whose
     /// presentation gate is still closed (the redraw was requested and has not arrived) waits a
     /// little longer for it, see [`RunnerCore::gate_wait`].
-    fn pace(&self, world: &World, now: Instant) -> FrameWait {
+    fn pace(&mut self, world: &World, now: Instant) -> FrameWait {
         let period = self.frame_period(world);
         match self.pacer.wait(now, period) {
             FrameWait::Ready => self.gate_wait(world, now, period),
@@ -403,15 +445,18 @@ impl RunnerCore {
     ///
     /// No wait while unlimited, occluded, or when no redraw is pending (no renderer, or X11,
     /// where the redraw arrives at once).
-    fn gate_wait(&self, world: &World, now: Instant, period: Option<Duration>) -> FrameWait {
+    fn gate_wait(&mut self, world: &World, now: Instant, period: Option<Duration>) -> FrameWait {
         let gate_closed =
             !self.occluded && self.redraw_pending_since.is_some() && !frame_ready(world);
-        let until = period.and_then(|period| {
-            let due = self.pacer.next_frame(Some(period))?;
-            due.checked_add(gate_window(period))
-        });
+        let due = period.and_then(|period| self.pacer.next_frame(Some(period)));
+        let until = due
+            .zip(period)
+            .and_then(|(due, period)| due.checked_add(gate_window(period)));
         match until {
-            Some(until) if gate_closed && now < until => FrameWait::Sleep { wake: until },
+            Some(until) if gate_closed && now < until => {
+                self.gate_hold = due;
+                FrameWait::Sleep { wake: until }
+            }
             _ => FrameWait::Ready,
         }
     }
@@ -550,8 +595,23 @@ impl RunnerCore {
         }
     }
 
+    /// Refreshes the monitor's refresh rate (`None`: unknown) at most every `MONITOR_POLL`.
+    fn poll_monitor(&mut self, now: Instant, refresh_millihertz: impl FnOnce() -> Option<u32>) {
+        let due = self
+            .monitor_polled_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= MONITOR_POLL);
+        if due {
+            self.monitor_polled_at = Some(now);
+            let refresh = refresh_millihertz().filter(|&mhz| mhz > 0);
+            if refresh != self.refresh_millihertz {
+                tracing::debug!("display refresh rate: {refresh:?} mHz");
+                self.refresh_millihertz = refresh;
+            }
+        }
+    }
+
     /// Before an update: publish occlusion (winit's report, the polled minimized state or the
-    /// redraw watchdog).
+    /// redraw watchdog) and [`FramePacingInfo`].
     fn begin_update(&mut self, world: &mut World, now: Instant) {
         let stalled = self
             .redraw_pending_since
@@ -568,6 +628,7 @@ impl RunnerCore {
         }
         let period = self.frame_period(world);
         let due = self.pacer.next_frame(period);
+        self.publish_pacing(world, now);
         self.pacer.start_frame(now, period);
         // Phase lock (see `gate_wait`): the gate opened after the deadline, within the wait
         // window, so this update waited for the frame callback; the grid restarts there.
@@ -577,6 +638,24 @@ impl RunnerCore {
             && frame_ready(world)
         {
             self.pacer.reanchor(opened);
+        }
+    }
+
+    /// Fills and publishes [`FramePacingInfo`] for the update that starts at `now`.
+    fn publish_pacing(&mut self, world: &mut World, now: Instant) {
+        let (gate_wait, gate_missed) = match self.gate_hold.take() {
+            Some(due) => (now.saturating_duration_since(due), !frame_ready(world)),
+            None => (Duration::ZERO, false),
+        };
+        let p = &mut self.pacing;
+        p.gate_wait = gate_wait;
+        p.gate_missed = gate_missed;
+        p.gate_waits += u64::from(!gate_wait.is_zero());
+        p.gate_misses += u64::from(gate_missed);
+        p.gate_opened_at = self.gate_opened_at;
+        p.refresh_millihertz = self.refresh_millihertz;
+        if let Some(mut info) = world.get_resource_mut::<FramePacingInfo>() {
+            *info = *p;
         }
     }
 
@@ -712,6 +791,7 @@ mod tests {
         let mut app = App::new();
         app.add_plugins(InputPlugin)
             .insert_resource(WindowState::default())
+            .init_resource::<FramePacingInfo>()
             .insert_resource(CursorOptions {
                 grab: CursorGrab::None,
                 visible: true,
@@ -1187,6 +1267,91 @@ mod tests {
         core.begin_update(app.world_mut(), due + ms(200));
         let due = core.pacer.next_frame(Some(OCCLUDED_WAIT)).unwrap();
         assert_eq!(core.pace(app.world(), due), FrameWait::Ready);
+    }
+
+    #[test]
+    fn pacing_info_reports_gate_waits_and_misses() {
+        let period = Duration::from_nanos(6_944_444);
+        let pacing = |app: &App| *app.world().resource::<FramePacingInfo>();
+        let (mut app, mut core, t0) = paced(144);
+        core.begin_update(app.world_mut(), t0);
+        assert_eq!(pacing(&app).gate_wait, Duration::ZERO);
+        assert!(!pacing(&app).gate_missed);
+        // Presented: the callback comes 0.3 ms after the deadline.
+        app.world_mut().resource_mut::<WindowState>().frame_ready = false;
+        assert!(core.end_update(app.world(), t0).request_redraw);
+        let due = t0 + period;
+        assert!(matches!(
+            core.pace(app.world(), due),
+            FrameWait::Sleep { .. }
+        ));
+        core.window_event(app.world_mut(), WindowEvent::RedrawRequested);
+        let callback = due + Duration::from_micros(300);
+        core.gate_opened_at = Some(callback);
+        assert_eq!(core.pace(app.world(), callback), FrameWait::Ready);
+        core.begin_update(app.world_mut(), callback);
+        let info = pacing(&app);
+        assert_eq!(info.gate_wait, Duration::from_micros(300));
+        assert!(!info.gate_missed);
+        assert_eq!((info.gate_waits, info.gate_misses), (1, 0));
+        assert_eq!(info.gate_opened_at, Some(callback));
+
+        // No callback: the update gives up at the end of the window.
+        app.world_mut().resource_mut::<WindowState>().frame_ready = false;
+        assert!(core.end_update(app.world(), callback).request_redraw);
+        let due = callback + period;
+        assert!(matches!(
+            core.pace(app.world(), due),
+            FrameWait::Sleep { .. }
+        ));
+        let late = due + period / 4;
+        assert_eq!(core.pace(app.world(), late), FrameWait::Ready);
+        core.begin_update(app.world_mut(), late);
+        let info = pacing(&app);
+        assert_eq!(info.gate_wait, period / 4);
+        assert!(info.gate_missed);
+        assert_eq!((info.gate_waits, info.gate_misses), (2, 1));
+
+        // The callback arrives before the next deadline: no wait.
+        core.window_event(app.world_mut(), WindowEvent::RedrawRequested);
+        let due = due + period;
+        assert_eq!(core.pace(app.world(), due), FrameWait::Ready);
+        core.begin_update(app.world_mut(), due);
+        let info = pacing(&app);
+        assert_eq!((info.gate_wait, info.gate_missed), (Duration::ZERO, false));
+        assert_eq!((info.gate_waits, info.gate_misses), (2, 1));
+    }
+
+    #[test]
+    fn monitor_refresh_is_polled_at_most_every_second() {
+        let mut app = app();
+        let mut core = core();
+        let t0 = Instant::now();
+        let mut polls = 0;
+        core.poll_monitor(t0, || {
+            polls += 1;
+            Some(144_002)
+        });
+        core.poll_monitor(t0 + MONITOR_POLL - Duration::from_millis(1), || {
+            polls += 1;
+            Some(60_000)
+        });
+        core.begin_update(app.world_mut(), t0);
+        assert_eq!(
+            app.world().resource::<FramePacingInfo>().refresh_millihertz,
+            Some(144_002)
+        );
+        // 0 (and `None`) mean unknown.
+        core.poll_monitor(t0 + MONITOR_POLL, || {
+            polls += 1;
+            Some(0)
+        });
+        core.begin_update(app.world_mut(), t0 + MONITOR_POLL);
+        assert_eq!(
+            app.world().resource::<FramePacingInfo>().refresh_millihertz,
+            None
+        );
+        assert_eq!(polls, 2);
     }
 
     #[test]
