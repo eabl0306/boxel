@@ -7,9 +7,11 @@ usage:
 
 RUN, BASE and NEW are summary files (Markdown with a JSON block, or plain JSON) or directories
 (every summary inside, not recursive). Comparing two directories pairs the runs with the same
-world, scenario, radius, speed, fps limit, backend, tier and adapter. A metric that was 0 in BASE has no percent
-change ('n/a') but still gets a verdict (0 spikes before, 3 after: worse). Output is Markdown,
-so it can go into docs as is.
+world, scenario, radius, speed, fps limit, physics bodies (--bodies), scripted edits (--edits),
+backend, tier and adapter; a different clock time (--time) only gets a note, since day and night
+change no mesh. A metric that was 0 in BASE has no percent change ('n/a') but still gets a
+verdict (0 spikes before, 3 after: worse). Runs with --edits also compare the edit latency.
+Output is Markdown, so it can go into docs as is.
 Exit codes: 0 ok, 1 usage error or a file without a summary, 2 nothing to compare."""
 import json
 import os
@@ -41,6 +43,16 @@ METRICS = [
     ('catch-up after stop s', ('world', 'catch_up_s'), -1),
 ]
 
+# Metrics of runs with --edits (compared when either run has them).
+EDIT_METRICS = [
+    ('edit frames p50', ('world', 'edits', 'frames_p50'), -1),
+    ('edit frames max', ('world', 'edits', 'frames_max'), -1),
+    ('edit ms p50', ('world', 'edits', 'ms_p50'), -1),
+    ('edit ms max', ('world', 'edits', 'ms_max'), -1),
+    ('edit batches split', ('world', 'edits', 'batches_split'), -1),
+    ('light fan-out', ('world', 'edits', 'light_fanout'), 0),
+]
+
 # Settings that make two runs comparable.
 SETTINGS = [
     ('world', ('run', 'world')),
@@ -49,6 +61,9 @@ SETTINGS = [
     ('vertical', ('run', 'vertical')),
     ('speed', ('run', 'speed')),
     ('fps limit', ('run', 'fps_limit')),
+    ('bodies', ('run', 'bodies')),
+    ('edits', ('run', 'edits')),
+    ('clock', ('run', 'time')),
     ('seed', ('run', 'seed')),
     ('backend', ('run', 'backend')),
     ('tier', ('run', 'tier')),
@@ -94,6 +109,12 @@ def load(path):
             run['world'] = 'forest' if run.get('trees', True) else 'terrain'
         # Runs from before --fps-limit were all uncapped.
         run.setdefault('fps_limit', 0)
+        # Runs from before --bodies had no physics bodies.
+        run.setdefault('bodies', '')
+        # Runs from before --time had no day and night.
+        run.setdefault('time', '')
+        # Whether the run had --edits (the world's edit latency, null without them).
+        run['edits'] = get(data, ('world', 'edits')) is not None
     return data
 
 
@@ -132,15 +153,20 @@ def title(run):
         text += f" {r['world']}"
     if r.get('fps_limit'):
         text += f" limit {r['fps_limit']} fps"
+    if r.get('bodies'):
+        text += f" bodies {r['bodies']}"
+    if r.get('edits'):
+        text += ' edits'
     return text
 
 
 def key(run):
     """Runs with the same key are comparable (same world, scenario, radius, height, speed, fps
-    limit and GPU)."""
+    limit, physics bodies, scripted edits and GPU)."""
     r = run['run']
     return (r.get('world', 'forest'), r['scenario'], r['radius'], r.get('vertical', 'fixed'),
-            r['speed'], r.get('fps_limit') or 0, r['backend'], r['tier'], r.get('adapter'))
+            r['speed'], r.get('fps_limit') or 0, r.get('bodies') or '', bool(r.get('edits')),
+            r['backend'], r['tier'], r.get('adapter'))
 
 
 def fmt(value):
@@ -204,7 +230,10 @@ def compare(base, new):
     if differ:
         lines += ['Note: the settings differ (' + ', '.join(differ) + ').', '']
     lines += ['| metric | base | new | change | |', '|---|---:|---:|---:|---|']
-    for name, path, direction in METRICS:
+    metrics = METRICS
+    if get(base, ('world', 'edits')) is not None or get(new, ('world', 'edits')) is not None:
+        metrics = METRICS + EDIT_METRICS
+    for name, path, direction in metrics:
         b, n = get(base, path), get(new, path)
         pct, verdict = change(b, n, direction)
         lines.append(f'| {name} | {fmt(b)} | {fmt(n)} | {pct} | {verdict} |')
@@ -234,8 +263,8 @@ def main(argv):
             else:
                 matched = [(load(base), load(new))]
             if not matched:
-                print('no runs with the same scenario, radius, speed, fps limit, backend, tier and '
-                      'adapter', file=sys.stderr)
+                print('no runs with the same world, scenario, radius, speed, fps limit, bodies, '
+                      'edits, backend, tier and adapter', file=sys.stderr)
                 return 2
             print('\n\n'.join(compare(b, n) for b, n in matched))
             return 0

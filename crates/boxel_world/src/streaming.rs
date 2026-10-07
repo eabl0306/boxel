@@ -27,8 +27,8 @@ use crate::sky::{
     ColumnId, SkyMap, SkyRule, SkyState, WalkJob, layer_below, may_block, padded_chunks,
 };
 use crate::{
-    BlockEdit, CachedLight, ChunkId, ChunkMap, ChunkMeshEvent, ChunkSlot, DataState, Interest,
-    MeshState, WorldContent, WorldSettings, WorldStats,
+    BlockChanged, BlockEdit, CachedLight, ChunkId, ChunkMap, ChunkMeshEvent, ChunkSlot, DataState,
+    Interest, MeshState, WorldContent, WorldSettings, WorldStats,
 };
 use boxel_ecs::prelude::*;
 use boxel_light::{
@@ -1550,16 +1550,30 @@ impl WorldJobs {
     ///   chunks around it are remeshed when the new tile lands.
     ///
     /// Edits to chunks that are not `Ready` are dropped.
-    pub(crate) fn apply_edits(&mut self, cx: &mut Ctx<'_>, edits: Vec<BlockEdit>) {
-        let mut by_chunk: BTreeMap<ChunkPos, Vec<(LocalPos, BlockState)>> = BTreeMap::new();
-        for edit in edits {
+    ///
+    /// Returns what changed (the `BlockChanged` messages), from the same per-voxel record the
+    /// light uses: per position, the state before its first edit and after its last, in the
+    /// order positions were first edited, without the positions that end as they were.
+    pub(crate) fn apply_edits(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        edits: Vec<BlockEdit>,
+    ) -> Vec<BlockChanged> {
+        let mut by_chunk: BTreeMap<ChunkPos, Vec<(usize, LocalPos, BlockState)>> = BTreeMap::new();
+        for (order, edit) in edits.into_iter().enumerate() {
             let (chunk, local) = edit.pos.split();
-            by_chunk.entry(chunk).or_default().push((local, edit.state));
+            by_chunk
+                .entry(chunk)
+                .or_default()
+                .push((order, local, edit.state));
         }
         let light_on = cx.sky.rule != SkyRule::Off;
         let tables = Arc::clone(&cx.content.light_tables);
         // 1. What each edit changes, from the content and the light before any of them.
         let mut changes: Vec<(ChunkId, LocalPos, BlockState, BlockState)> = Vec::new();
+        // Per position edited: the order of its first edit and its change so far (`new` is the
+        // state after the earlier edits of this call).
+        let mut changed: Vec<(usize, BlockChanged)> = Vec::new();
         let mut remesh = BTreeSet::new();
         let mut faces = BTreeSet::new();
         for (chunk, edits) in by_chunk {
@@ -1579,14 +1593,26 @@ impl WorldJobs {
                 );
                 continue;
             };
-            // The state each voxel will have after the earlier edits of this call.
-            let mut now: BTreeMap<LocalPos, BlockState> = BTreeMap::new();
-            for (local, state) in edits {
-                let old = now.get(&local).copied().unwrap_or_else(|| data.get(local));
+            // Per voxel of this chunk edited so far: its entry in `changed`.
+            let mut seen: BTreeMap<LocalPos, usize> = BTreeMap::new();
+            for (order, local, state) in edits {
+                let entry = *seen.entry(local).or_insert_with(|| {
+                    let before = data.get(local);
+                    changed.push((
+                        order,
+                        BlockChanged {
+                            pos: BlockPos::from_parts(chunk, local),
+                            old: before,
+                            new: before,
+                        },
+                    ));
+                    changed.len() - 1
+                });
+                let old = changed[entry].1.new;
                 if old == state {
                     continue;
                 }
-                now.insert(local, state);
+                changed[entry].1.new = state;
                 let p = BlockPos::from_parts(chunk, local);
                 box_chunks(p, 0, &mut faces);
                 let reach = if light_on
@@ -1601,8 +1627,12 @@ impl WorldJobs {
                 changes.push((id, local, old, state));
             }
         }
+        changed.retain(|(_, change)| change.old != change.new);
+        // Each position once: the orders are distinct.
+        changed.sort_unstable_by_key(|&(order, _)| order);
+        let changed = changed.into_iter().map(|(_, change)| change).collect();
         if changes.is_empty() {
-            return;
+            return changed;
         }
         // 2. The data.
         for &(id, local, _, state) in &changes {
@@ -1636,6 +1666,7 @@ impl WorldJobs {
         }
         self.light_counts.light_fanout += fanout;
         self.close_if_empty(cx, batch);
+        changed
     }
 
     /// A voxel at `p` now stops direct sky (`placed`) or no longer does: updates the sky top of

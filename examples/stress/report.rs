@@ -157,6 +157,9 @@ pub struct RunInfo {
     pub time: String,
     /// `--edits`: the scripted edits and their latency.
     pub edits: Option<EditStats>,
+    /// Physics bodies of the run (`--bodies`, `--body-kind`, `--projectiles`): `1000 item, 50
+    /// projectiles`, or empty without them (and in runs from before the options).
+    pub bodies: String,
 }
 
 /// What `--edits` measured: scripted edits (lamp placed and removed, shaft dug and capped) and
@@ -769,6 +772,7 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
         ("driver", Json::Str(info.driver.clone())),
         ("present", Json::Str(info.present.clone())),
         ("fps_limit", Json::uint(info.fps_limit)),
+        ("bodies", Json::Str(info.bodies.clone())),
         (
             "window",
             Json::Str(format!("{}x{}", info.window.0, info.window.1)),
@@ -911,6 +915,13 @@ pub fn run_title(info: &RunInfo) -> String {
     }
     if info.fps_limit > 0 {
         title = format!("{title} limit {} fps", info.fps_limit);
+    }
+    if !info.bodies.is_empty() {
+        title = format!("{title} bodies {}", info.bodies);
+    }
+    // Same order as `title` in tools/bench_report.py.
+    if info.edits.is_some() {
+        title = format!("{title} edits");
     }
     title
 }
@@ -1582,6 +1593,12 @@ mod tests {
         assert_eq!(run_title(&info), "static r16");
         info.fps_limit = 144;
         assert_eq!(run_title(&info), "static r16 limit 144 fps");
+        info.bodies = "1000 item, 0 projectiles".to_string();
+        info.edits = Some(EditStats::default());
+        assert_eq!(
+            run_title(&info),
+            "static r16 limit 144 fps bodies 1000 item, 0 projectiles edits"
+        );
     }
 
     #[test]

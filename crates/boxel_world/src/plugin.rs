@@ -1,5 +1,6 @@
 use crate::interest::Viewer;
 use crate::jobs::{JobExecutor, TaskPoolExecutor};
+use crate::map::DataChange;
 use crate::sky::{SkyMap, SkyRule};
 use crate::streaming::{Ctx, ViewerChunks, WorldJobs};
 use crate::{ChunkId, ChunkMap, WorldStats};
@@ -186,6 +187,78 @@ pub enum ChunkMeshEvent {
     },
 }
 
+/// A block changed: an edit of [`EditQueue`] applied in `WorldSystems::Edits`. One message per
+/// position and frame, from the state before the frame's edits to the state after them (two
+/// edits of one block in a frame give one message; edits that leave a block as it was, or that
+/// were dropped because their chunk was not ready, give none), in the order the positions were
+/// first edited.
+///
+/// Written from the per-voxel change list the edits keep for the light (ADR 0015): the same
+/// pass sizes each edit's light remesh and moves the sky tops, so every message has its relight
+/// already queued in the frame's edit batch. When the message is read the map holds `new` at
+/// `pos`, but the light around it ([`ChunkMap::light_at`]) and the meshes may still be the old
+/// ones: they change when the batch's remeshes land (usually a few frames later).
+///
+/// Shared by the systems that keep something derived from the blocks: physics wakes the
+/// sleeping bodies near the block (ADR 0016); the world's light needs no message (it relights
+/// through the edit batch); gameplay can react to it.
+#[derive(Message, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockChanged {
+    /// Position.
+    pub pos: BlockPos,
+    /// State before the change.
+    pub old: BlockState,
+    /// State after the change.
+    pub new: BlockState,
+}
+
+/// A chunk's blocks became readable (`DataState::Ready`, or `Missing`, read as air) or stopped
+/// being readable, written at the end of the world's systems in `Update`
+/// (`WorldSystems::Collect`), in the order it happened that frame.
+///
+/// A chunk that unloads and loads again may come back different (edits are not saved yet), so
+/// systems that keep state about the blocks of a chunk refresh it on `Loaded` (physics wakes the
+/// sleeping bodies there).
+#[derive(Message, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChunkDataEvent {
+    /// The chunk's blocks can be read: generated, known to be all air, or `Missing` after a
+    /// failed generation.
+    Loaded {
+        /// Chunk id.
+        id: ChunkId,
+        /// Key.
+        key: ChunkKey,
+    },
+    /// The chunk was unloaded: its blocks cannot be read any more.
+    Unloaded {
+        /// Chunk id (stale from now on).
+        id: ChunkId,
+        /// Key.
+        key: ChunkKey,
+    },
+}
+
+impl ChunkDataEvent {
+    /// The chunk's id.
+    pub fn id(&self) -> ChunkId {
+        match *self {
+            ChunkDataEvent::Loaded { id, .. } | ChunkDataEvent::Unloaded { id, .. } => id,
+        }
+    }
+
+    /// The chunk's key.
+    pub fn key(&self) -> ChunkKey {
+        match *self {
+            ChunkDataEvent::Loaded { key, .. } | ChunkDataEvent::Unloaded { key, .. } => key,
+        }
+    }
+
+    /// The chunk's position.
+    pub fn pos(&self) -> ChunkPos {
+        self.key().pos
+    }
+}
+
 /// One block change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockEdit {
@@ -231,7 +304,8 @@ pub enum WorldSystems {
 }
 
 /// Adds the world: resources (`ChunkMap`, `SkyMap`, `WorldSettings`, `WorldContent`,
-/// `EditQueue`, `WorldStats`, internal job state), the `ChunkMeshEvent` message and the chained systems in
+/// `EditQueue`, `WorldStats`, internal job state), the messages `ChunkMeshEvent`,
+/// [`BlockChanged`] and [`ChunkDataEvent`] and the chained systems in
 /// `Update`. A stats system in `Last` refreshes `WorldStats` and publishes a `"world"` line to
 /// `DiagnosticsBoard` if present. `TaskPoolPlugin` is recommended (pool sizes); without it the
 /// default executor initializes a default async compute pool.
@@ -286,6 +360,8 @@ impl Plugin for WorldPlugin {
             .init_resource::<ViewerChunks>()
             .insert_resource(jobs)
             .add_message::<ChunkMeshEvent>()
+            .add_message::<BlockChanged>()
+            .add_message::<ChunkDataEvent>()
             .configure_sets(
                 Update,
                 (
@@ -307,7 +383,9 @@ impl Plugin for WorldPlugin {
                         .in_set(WorldSystems::Interest),
                     apply_edits.in_set(WorldSystems::Edits),
                     run_jobs.in_set(WorldSystems::Dispatch),
-                    publish_meshes.in_set(WorldSystems::Collect),
+                    (publish_meshes, publish_data_changes)
+                        .chain()
+                        .in_set(WorldSystems::Collect),
                 ),
             )
             .add_systems(Last, publish_stats);
@@ -372,6 +450,7 @@ fn apply_edits(
     mut jobs: ResMut<WorldJobs>,
     content: Res<WorldContent>,
     mut writer: MessageWriter<ChunkMeshEvent>,
+    mut changed: MessageWriter<BlockChanged>,
 ) {
     if queue.is_empty() {
         return;
@@ -379,8 +458,23 @@ fn apply_edits(
     let edits = std::mem::take(&mut queue.edits);
     let mut events = Vec::new();
     let mut cx = Ctx::new(&mut map, &mut sky, &content, &mut events);
-    jobs.apply_edits(&mut cx, edits);
+    let changes = jobs.apply_edits(&mut cx, edits);
     writer.write_batch(events);
+    changed.write_batch(changes);
+}
+
+/// Publishes the frame's [`ChunkDataEvent`]s, recorded by the map as slots changed (after
+/// every other world system of the frame).
+fn publish_data_changes(mut map: ResMut<ChunkMap>, mut writer: MessageWriter<ChunkDataEvent>) {
+    if !map.has_data_changes() {
+        return;
+    }
+    // Publishing changes nothing the map's readers see.
+    let changes = map.bypass_change_detection().take_data_changes();
+    writer.write_batch(changes.into_iter().map(|change| match change {
+        DataChange::Loaded(id, key) => ChunkDataEvent::Loaded { id, key },
+        DataChange::Unloaded(id, key) => ChunkDataEvent::Unloaded { id, key },
+    }));
 }
 
 fn run_jobs(

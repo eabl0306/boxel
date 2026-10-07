@@ -26,7 +26,14 @@
 //! 4. `Collect`: publish mesh results as [`ChunkMeshEvent`]s, up to
 //!    [`WorldSettings::max_mesh_events_per_frame`]. A mesh identical to the published one is not
 //!    sent again, and the meshes of one edit batch are published together (held up to
-//!    [`WorldSettings::edit_batch_hold_frames`]).
+//!    [`WorldSettings::edit_batch_hold_frames`]). Then the frame's [`ChunkDataEvent`]s.
+//!
+//! Systems that keep state derived from the blocks (physics, gameplay) follow the world through
+//! two messages: [`BlockChanged`] for each edited block (written in `Edits`, from the same
+//! per-voxel change list the light's remeshes come from) and [`ChunkDataEvent`] when a chunk's
+//! blocks become readable or stop being readable. The world's own light needs neither: it is
+//! recomputed by the remeshes the edits and loads start, and reaches the renderer with the
+//! meshes.
 //!
 //! [`DaylightPlugin`] adds the world clock ([`TimeOfDay`], one tick per fixed step, 20-minute
 //! days) and the [`DaylightCurve`] the renderer turns into the scene light: day and night change
@@ -73,8 +80,8 @@ pub use daylight::{
 pub(crate) use map::CachedLight;
 pub use map::{ChunkId, ChunkMap, ChunkSlot, DataState, Interest, MeshState, WorldStats};
 pub use plugin::{
-    BlockEdit, ChunkMeshEvent, ChunkViewer, EditQueue, WorldContent, WorldPlugin, WorldSettings,
-    WorldSystems,
+    BlockChanged, BlockEdit, ChunkDataEvent, ChunkMeshEvent, ChunkViewer, EditQueue, WorldContent,
+    WorldPlugin, WorldSettings, WorldSystems,
 };
 pub use sky::{ColumnId, SkyMap};
 

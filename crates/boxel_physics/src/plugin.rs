@@ -1,17 +1,25 @@
 //! [`PhysicsPlugin`] and the physics view of the world's blocks.
 
-use crate::components::{PhysicsSettings, PhysicsStats, VoxelImpact};
+use crate::components::{
+    CollisionEnded, CollisionStarted, Disturbed, PhysicsSettings, PhysicsStats, ProjectileHit,
+    SleepLog, Vacated, VoxelImpact,
+};
+use crate::contacts::{
+    BodyIndex, ContactSet, ObstacleIndex, broadphase, build_obstacles, solve, write_collisions,
+};
 use crate::core::CollisionTable;
+use crate::projectile::{PendingHits, step_projectiles, write_hits};
+use crate::sleep::{sleep_bodies, wake_bodies};
 use crate::systems::{
-    PendingImpacts, PhysicsSystems, drive_characters, interpolate, move_kinematic, prepare_bodies,
-    publish_stats, step_dynamic, write_back, write_events,
+    AwakeCount, PendingImpacts, PhysicsSystems, WritebackTick, drive_characters, interpolate,
+    move_kinematic, prepare_bodies, publish_stats, step_dynamic, write_back, write_events,
 };
 use boxel_app::{
     App, FixedPostUpdate, FixedTime, Last, Plugin, RunFixedMainLoop, RunFixedMainLoopSystems,
 };
 use boxel_ecs::prelude::*;
 use boxel_ecs::schedule::SingleThreadedExecutor;
-use boxel_world::WorldContent;
+use boxel_world::{BlockChanged, ChunkDataEvent, WorldContent};
 use std::sync::Arc;
 
 /// The physics view of the world's blocks: the [`CollisionTable`] derived from
@@ -29,9 +37,12 @@ pub struct PhysicsContent {
 ///   `FixedPostUpdate`, in the chained [`PhysicsSystems`]; interpolated `Transform`s are written
 ///   after the frame's steps (`RunFixedMainLoopSystems::AfterFixedMainLoop`).
 /// - Resources: [`PhysicsSettings`], [`PhysicsStats`] (a `"physics"` line on `DiagnosticsBoard`,
-///   refreshed in `Last`) and, in `Plugin::finish`, [`PhysicsContent`] from the world's
-///   registry, which [`crate::PhysicsQuery`] and the step read.
-/// - Message: [`VoxelImpact`].
+///   refreshed in `Last`), [`BodyIndex`] (the bodies for entity queries) and, in
+///   `Plugin::finish`, [`PhysicsContent`] from the world's registry, which
+///   [`crate::PhysicsQuery`] and the step read.
+/// - Messages: [`VoxelImpact`], [`CollisionStarted`], [`CollisionEnded`] and
+///   [`ProjectileHit`]. It reads the world's `BlockChanged` and `ChunkDataEvent` to wake
+///   sleeping bodies.
 /// - In `Plugin::finish` it sets `FixedTime::set_max_steps_per_frame` to
 ///   [`PhysicsPlugin::max_steps_per_frame`] (3 by default): after a hitch, a frame runs at most
 ///   that many fixed steps, which bounds the cost of a catch-up frame. The cap is app-wide, see
@@ -93,16 +104,34 @@ impl Plugin for PhysicsPlugin {
         app.init_resource::<PhysicsSettings>()
             .init_resource::<PhysicsStats>()
             .init_resource::<PendingImpacts>()
+            .init_resource::<ObstacleIndex>()
+            .init_resource::<BodyIndex>()
+            .init_resource::<ContactSet>()
+            .init_resource::<SleepLog>()
+            .init_resource::<Vacated>()
+            .init_resource::<Disturbed>()
+            .init_resource::<AwakeCount>()
+            .init_resource::<WritebackTick>()
+            .init_resource::<PendingHits>()
             .add_message::<VoxelImpact>()
+            .add_message::<CollisionStarted>()
+            .add_message::<CollisionEnded>()
+            .add_message::<ProjectileHit>()
+            // The world's (also added by `WorldPlugin`, in any order).
+            .add_message::<BlockChanged>()
+            .add_message::<ChunkDataEvent>()
             .configure_sets(
                 FixedPostUpdate,
                 (
                     PhysicsSystems::Prepare,
                     PhysicsSystems::Controller,
+                    PhysicsSystems::Wake,
                     PhysicsSystems::Kinematic,
                     PhysicsSystems::Step,
                     PhysicsSystems::Broadphase,
                     PhysicsSystems::Solve,
+                    PhysicsSystems::Projectiles,
+                    PhysicsSystems::Sleep,
                     PhysicsSystems::Events,
                     PhysicsSystems::Writeback,
                 )
@@ -113,9 +142,18 @@ impl Plugin for PhysicsPlugin {
                 (
                     prepare_bodies.in_set(PhysicsSystems::Prepare),
                     drive_characters.in_set(PhysicsSystems::Controller),
-                    move_kinematic.in_set(PhysicsSystems::Kinematic),
+                    wake_bodies.in_set(PhysicsSystems::Wake),
+                    (move_kinematic, build_obstacles)
+                        .chain()
+                        .in_set(PhysicsSystems::Kinematic),
                     step_dynamic.in_set(PhysicsSystems::Step),
-                    write_events.in_set(PhysicsSystems::Events),
+                    broadphase.in_set(PhysicsSystems::Broadphase),
+                    solve.in_set(PhysicsSystems::Solve),
+                    step_projectiles.in_set(PhysicsSystems::Projectiles),
+                    sleep_bodies.in_set(PhysicsSystems::Sleep),
+                    (write_events, write_collisions, write_hits)
+                        .chain()
+                        .in_set(PhysicsSystems::Events),
                     write_back.in_set(PhysicsSystems::Writeback),
                 ),
             )

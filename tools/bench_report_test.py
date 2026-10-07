@@ -103,6 +103,11 @@ class FormatTest(unittest.TestCase):
         self.assertEqual(br.title(static), 'static r16')
         static['run']['fps_limit'] = 60
         self.assertEqual(br.title(static), 'static r16 limit 60 fps')
+        static['run']['bodies'] = '10000 item, 0 projectiles'
+        self.assertEqual(br.title(static), 'static r16 limit 60 fps bodies 10000 item, 0 projectiles')
+        static['run']['edits'] = True
+        self.assertEqual(br.title(static),
+                         'static r16 limit 60 fps bodies 10000 item, 0 projectiles edits')
         self.assertEqual(br.get(SAMPLE, ('frames', 'crossing', 'max_ms')), 6.5)
         self.assertIsNone(br.get(SAMPLE, ('frames', 'missing', 'max_ms')))
 
@@ -238,6 +243,56 @@ class OutputTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn('Note: the settings differ (fps limit 0 -> 144)', out)
 
+    def test_compare_directories_keeps_bodies_apart(self):
+        # Old runs have no bodies field: they had no physics bodies.
+        crowded = copy.deepcopy(SAMPLE)
+        crowded['run']['bodies'] = '1000 mob, 0 projectiles'
+        self.write('1-fly.md', SAMPLE, 'base')
+        self.write('2-crowded.md', crowded, 'base')
+        self.write('3-fly.md', SAMPLE, 'new')
+        self.write('4-crowded.md', crowded, 'new')
+        code, out, _ = run_main('--compare', os.path.join(self.dir.name, 'base'),
+                                os.path.join(self.dir.name, 'new'))
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count('### '), 2, 'runs without bodies with each other')
+        self.assertIn('2-crowded.md -> 4-crowded.md', out)
+        code, out, _ = run_main('--compare', self.write('a.md', SAMPLE), self.write('b.md', crowded))
+        self.assertEqual(code, 0)
+        self.assertIn("Note: the settings differ (bodies  -> 1000 mob, 0 projectiles)", out)
+
+    def test_compare_directories_keeps_edits_apart(self):
+        # Old runs have no edits and no clock: no scripted edits, no day and night.
+        edited = copy.deepcopy(SAMPLE)
+        edited['run']['scenario'] = 'static'
+        edited['run']['time'] = '12:00'
+        edited['world']['edits'] = {
+            'steps': 18, 'skipped': 0, 'timed': 16, 'frames_p50': 4, 'frames_max': 9,
+            'ms_p50': 12.5, 'ms_max': 40.0, 'batches_held': 16, 'batches_split': 1,
+            'light_fanout': 40,
+        }
+        still = copy.deepcopy(edited)
+        still['world']['edits'] = None
+        self.write('1-still.md', still, 'base')
+        self.write('2-edited.md', edited, 'base')
+        slower = copy.deepcopy(edited)
+        slower['world']['edits']['frames_max'] = 12
+        slower['run']['time'] = '21:30'
+        self.write('3-still.md', still, 'new')
+        self.write('4-edited.md', slower, 'new')
+        code, out, _ = run_main('--compare', os.path.join(self.dir.name, 'base'),
+                                os.path.join(self.dir.name, 'new'))
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count('### '), 2, 'runs with edits with each other')
+        self.assertIn('### static r16 edits: 2-edited.md -> 4-edited.md', out)
+        self.assertIn('| edit frames max | 9 | 12 | +33.3 % | worse |', out)
+        self.assertIn('Note: the settings differ (clock 12:00 -> 21:30)', out)
+        self.assertEqual(out.count('| edit frames p50 |'), 1, 'only the runs with edits')
+        code, out, _ = run_main('--compare', self.write('a.md', SAMPLE), self.write('b.md', edited))
+        self.assertEqual(code, 0)
+        self.assertIn('edits no -> yes', out)
+        self.assertIn('clock  -> 12:00', out)
+        self.assertIn('| edit ms p50 | - | 12.50 | - |  |', out)
+
     def test_usage_errors(self):
         self.assertEqual(run_main()[0], 1)
         self.assertEqual(run_main('--help')[0], 0)
@@ -267,8 +322,8 @@ class CommittedSummariesTest(unittest.TestCase):
             run = br.load(path)
             br.table([run])
             br.compare(run, run)
-            for _, keys, _ in br.METRICS:
-                optional = {'catch_up_s', 'crossing', 'border_catch_up'}
+            for _, keys, _ in br.METRICS + br.EDIT_METRICS:
+                optional = {'catch_up_s', 'crossing', 'border_catch_up', 'edits'}
                 if not optional.intersection(keys):
                     self.assertIsNotNone(br.get(run, keys), f'{path}: {keys}')
 

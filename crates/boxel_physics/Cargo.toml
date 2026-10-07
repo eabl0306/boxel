@@ -17,6 +17,7 @@ boxel_ecs.workspace = true
 boxel_app.workspace = true
 boxel_diagnostic.workspace = true
 boxel_math.workspace = true
+boxel_tasks.workspace = true
 boxel_transform.workspace = true
 boxel_voxel.workspace = true
 boxel_world.workspace = true

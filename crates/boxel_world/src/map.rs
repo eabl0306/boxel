@@ -32,6 +32,21 @@ pub enum DataState {
     Missing,
 }
 
+impl DataState {
+    /// The chunk's blocks can be read: `Ready`, or `Missing` (read as air).
+    pub fn is_readable(&self) -> bool {
+        matches!(self, DataState::Ready(_) | DataState::Missing)
+    }
+}
+
+/// A chunk's blocks became readable or stopped being readable (the world's
+/// `ChunkDataEvent` message, recorded by the map as its slots change).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DataChange {
+    Loaded(ChunkId, ChunkKey),
+    Unloaded(ChunkId, ChunkKey),
+}
+
 /// Mesh lifecycle.
 #[derive(Clone, Debug)]
 pub enum MeshState {
@@ -329,6 +344,9 @@ pub struct ChunkMap {
     pub(crate) slots: slotmap::SlotMap<ChunkId, ChunkSlot>,
     pub(crate) index: HashMap<ChunkPos, ChunkId, foldhash::fast::FixedState>,
     tally: Tally,
+    /// Slots whose data became readable or stopped being readable, in order, until the world
+    /// plugin publishes them (`ChunkDataEvent`).
+    data_changes: Vec<DataChange>,
 }
 
 impl ChunkMap {
@@ -441,6 +459,9 @@ impl ChunkMap {
         let slot = self.slots.remove(id)?;
         self.index.remove(&slot.pos);
         self.tally.change(slot.tally_bits(), 0);
+        if slot.data.is_readable() {
+            self.data_changes.push(DataChange::Unloaded(id, slot.key()));
+        }
         Some(slot)
     }
     /// Runs `f` on a slot and recounts it. Every change of `data`, `mesh` or `remesh_pending`
@@ -452,9 +473,29 @@ impl ChunkMap {
         self.tally.change(before, slot.tally_bits());
         out
     }
-    /// Sets a slot's data state.
+    /// Sets a slot's data state (and records it when its blocks become readable or stop being
+    /// readable).
     pub(crate) fn set_data(&mut self, id: ChunkId, data: DataState) {
-        self.update(id, |slot| slot.data = data);
+        let change = self.update(id, |slot| {
+            let (before, after) = (slot.data.is_readable(), data.is_readable());
+            slot.data = data;
+            match (before, after) {
+                (false, true) => Some(DataChange::Loaded(id, slot.key())),
+                (true, false) => Some(DataChange::Unloaded(id, slot.key())),
+                _ => None,
+            }
+        });
+        if let Some(change) = change {
+            self.data_changes.push(change);
+        }
+    }
+    /// The recorded data changes, oldest first (cleared).
+    pub(crate) fn take_data_changes(&mut self) -> Vec<DataChange> {
+        std::mem::take(&mut self.data_changes)
+    }
+    /// Data changes are waiting to be published.
+    pub(crate) fn has_data_changes(&self) -> bool {
+        !self.data_changes.is_empty()
     }
     /// Sets a slot's mesh state.
     pub(crate) fn set_mesh(&mut self, id: ChunkId, mesh: MeshState) {

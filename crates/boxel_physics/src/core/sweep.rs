@@ -141,12 +141,7 @@ pub fn move_box<S: VoxelSource + ?Sized>(
         }
     };
     let d = DVec3::new(clean(d.x), clean(d.y), clean(d.z));
-    // `>=` is false for NaN: NaN counts as the minimum.
-    let eps = if cfg.eps >= MIN_EPS {
-        cfg.eps.min(MAX_EPS)
-    } else {
-        MIN_EPS
-    };
+    let eps = effective_eps(cfg.eps);
     let shape = usable_shape(shape, eps);
     let max_depenetration = if cfg.max_depenetration >= 0.0 {
         cfg.max_depenetration.min(MAX_SWEEP_DISTANCE)
@@ -205,6 +200,17 @@ pub fn move_box<S: VoxelSource + ?Sized>(
         in_fluid,
         depenetrated,
     })
+}
+
+/// The contact tolerance [`move_box`] uses for a configured `eps`: clamped to
+/// `2^-32..=1/64`, NaN as `2^-32`. Contacts between bodies use the same tolerance.
+pub(crate) fn effective_eps(eps: f64) -> f64 {
+    // `>=` is false for NaN: NaN counts as the minimum.
+    if eps >= MIN_EPS {
+        eps.min(MAX_EPS)
+    } else {
+        MIN_EPS
+    }
 }
 
 /// `shape` as the sweep uses it (see [`move_box`]): a shape with a non-finite corner becomes a

@@ -1,13 +1,21 @@
-//! Physics sandbox (phase P2 of ADR 0016): walk on a generated world with gravity, jump, and
-//! drop items that fall and come to rest.
+//! Physics sandbox (phases P2 to P4 of ADR 0016): walk on a generated world with gravity, jump,
+//! drop items that fall, come to rest and get picked up, stack crates, shoot arrows, throw
+//! bouncy balls and spawn mobs that wander.
 //!
 //! `cargo run --release --example physics_sandbox -- [GPU options] [options]` (see `--help`).
 //! It starts walking on the ground at the origin. Left click grabs the mouse; WASD walks along
 //! the view, Space jumps (hold it to keep jumping), G switches to flying (the free camera, as in
 //! `voxel_world`) and back, Q drops an item in front of you (a small dynamic sensor box with the
-//! item settings: half gravity, more drag). F3 shows the debug overlay with the player's state, a
-//! physics line (bodies, frozen, impacts, step time) and the items. Bodies have no renderer yet:
-//! items show on F3 only.
+//! item settings: half gravity, more drag), C drops a crate two blocks ahead (a solid box of
+//! 0.75: crates stack, and you can push them and stand on them). Walking into an item picks it up
+//! (the player's `CollisionStarted` with the item's sensor; a thrown item only after a second).
+//! F shoots an arrow along the view at 60 blocks/s (a `Projectile`: it sticks in the block it
+//! hits, and a mob it hits is knocked back and the arrow is gone), B throws a bouncy ball (a
+//! sphere with restitution 0.6 that bounces until it rests), M spawns four mobs ahead (solid
+//! walkers that change direction every few seconds). Bodies that rest fall asleep. F3 shows the
+//! debug overlay with the player's state, a physics line (bodies, sleeping, pairs, pushes,
+//! impacts, projectiles, step time), the items, the crates and the arrows, balls and mobs.
+//! Bodies have no renderer yet: they show on F3 only.
 //!
 //! `--drop-test` drops 100 items from 40 blocks above the ground once the player stands, and
 //! exits 0 when all of them rest on something, or 3 if any still moves after 20 s of simulated
@@ -24,7 +32,7 @@ mod world;
 use boxel::camera::FlyCameraSystems;
 use boxel::debug_overlay::OverlayLines;
 use boxel::gfx::CLI_HELP;
-use boxel::physics::{Frozen, PhysicsStats};
+use boxel::physics::{Frozen, PhysicsStats, ProjectileHit, ProjectileTarget};
 use boxel::prelude::*;
 use boxel::render::GpuFailed;
 use boxel::world::WorldSystems;
@@ -44,7 +52,8 @@ usage: physics_sandbox [GPU options] [options]
   --view-distance N       mesh radius in chunks (default 8)
   --debug-overlay         start with the F3 debug overlay visible (F3 toggles it)
   --help                  this text
-keys: WASD walk, Space jump, G fly/walk, Q drop an item, F3 overlay, Escape frees the mouse
+keys: WASD walk, Space jump, G fly/walk, Q drop an item, C drop a crate, F shoot an arrow,
+  B throw a ball, M spawn mobs, F3 overlay, Escape frees the mouse
 exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 drop test failed, 4 timeout";
 
 /// Default `--timeout` for automation runs.
@@ -55,8 +64,33 @@ const WATCHDOG_GRACE: Duration = Duration::from_secs(15);
 const DEFAULT_RADIUS: u32 = 8;
 /// Drops an item.
 const DROP_KEY: KeyCode = KeyCode::KeyQ;
+/// Drops a crate.
+const CRATE_KEY: KeyCode = KeyCode::KeyC;
+/// Shoots an arrow.
+const ARROW_KEY: KeyCode = KeyCode::KeyF;
+/// Throws a ball.
+const BALL_KEY: KeyCode = KeyCode::KeyB;
+/// Spawns mobs.
+const MOB_KEY: KeyCode = KeyCode::KeyM;
+/// Arrow speed, blocks per second (Minecraft's fully drawn bow).
+const ARROW_SPEED: f64 = 60.0;
+/// Half the edge of an arrow's box, blocks.
+const ARROW_HALF: f64 = 0.05;
+/// A mob hit by an arrow is pushed this fast along the arrow (and up by half that), blocks per
+/// second.
+const KNOCKBACK: f64 = 8.0;
+/// Radius of a ball, blocks.
+const BALL_RADIUS: f64 = 0.25;
+/// Mobs spawned per press of [`MOB_KEY`].
+const MOBS_PER_PRESS: u64 = 4;
+/// Steps between two changes of a mob's direction (3 s).
+const WANDER_STEPS: u64 = 192;
 /// Half the edge of an item's box, blocks (a quarter-block cube, Minecraft's item size).
 const ITEM_HALF: f64 = 0.125;
+/// The edge of a crate, blocks.
+const CRATE_SIZE: f64 = 0.75;
+/// A thrown item can be picked up this many physics steps after it was thrown (1 s).
+const PICKUP_DELAY: u64 = 64;
 /// `--drop-test`: items per side of the square, their spacing and the drop height above the
 /// player's feet, blocks.
 const DROP_GRID: u32 = 10;
@@ -156,13 +190,16 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
 
 /// A dropped item.
 #[derive(Component, Clone, Copy, Debug, Default)]
-struct Item;
+struct Item {
+    /// The physics step (`PhysicsStats::steps`) from which the player can pick it up.
+    pickable_at: u64,
+}
 
-/// An item at `pos` moving at `velocity`: a dynamic sensor box (it lands on blocks and pushes
-/// nothing) with the item settings, interpolated.
-fn item(pos: WorldPos, velocity: DVec3) -> impl Bundle {
+/// An item at `pos` moving at `velocity`, pickable from step `pickable_at`: a dynamic sensor box
+/// (it lands on blocks and pushes nothing) with the item settings, interpolated.
+fn item(pos: WorldPos, velocity: DVec3, pickable_at: u64) -> impl Bundle {
     (
-        Item,
+        Item { pickable_at },
         RigidBody::Dynamic,
         Collider::aabb(DVec3::splat(ITEM_HALF)).sensor(),
         BodySettings::item(),
@@ -170,6 +207,233 @@ fn item(pos: WorldPos, velocity: DVec3) -> impl Bundle {
         Teleport(pos),
         Velocity(velocity),
     )
+}
+
+/// A crate.
+#[derive(Component, Clone, Copy, Debug, Default)]
+struct Crate;
+
+/// A crate standing at `pos`: a solid dynamic box with twice a player's weight (a player pushing
+/// it moves at a third of its speed), interpolated.
+fn crate_body(pos: WorldPos) -> impl Bundle {
+    (
+        Crate,
+        RigidBody::Dynamic,
+        Collider::standing(CRATE_SIZE, CRATE_SIZE),
+        BodySettings {
+            push_weight: 2.0,
+            ..BodySettings::player()
+        },
+        Interpolated::default(),
+        Teleport(pos),
+    )
+}
+
+// ---------------------------------------------------------------------------------------------
+// Arrows, balls and mobs
+
+/// An arrow.
+#[derive(Component, Clone, Copy, Debug, Default)]
+struct Arrow;
+
+/// A ball.
+#[derive(Component, Clone, Copy, Debug, Default)]
+struct Ball;
+
+/// A wandering mob and its seed.
+#[derive(Component, Clone, Copy, Debug, Default)]
+struct Mob(u64);
+
+/// Arrow hits on mobs so far, and mobs spawned (the seeds of the next ones).
+#[derive(Resource, Debug, Default)]
+struct Hunt {
+    mob_hits: u32,
+    spawned: u64,
+}
+
+/// An arrow shot from `from` along `dir` (a unit vector), never hitting `shooter`: a projectile
+/// that sticks in blocks and stops at bodies, with the arrow settings, interpolated.
+fn arrow(from: WorldPos, dir: DVec3, shooter: Option<Entity>) -> impl Bundle {
+    let mut projectile = Projectile::arrow();
+    projectile.ignore = shooter;
+    (
+        Arrow,
+        RigidBody::Dynamic,
+        projectile,
+        Collider::aabb(DVec3::splat(ARROW_HALF)),
+        BodySettings::arrow(),
+        Interpolated::default(),
+        Teleport(from),
+        Velocity(dir * ARROW_SPEED),
+    )
+}
+
+/// A ball thrown from `from` at `velocity`: a bouncy sphere, interpolated.
+fn ball(from: WorldPos, velocity: DVec3) -> impl Bundle {
+    (
+        Ball,
+        RigidBody::Dynamic,
+        Collider::sphere(BALL_RADIUS),
+        BodySettings::ball(),
+        Interpolated::default(),
+        Teleport(from),
+        Velocity(velocity),
+    )
+}
+
+/// A mob standing at `feet`: a player-size solid walker (slower than the player) that wanders.
+fn mob(feet: WorldPos, seed: u64) -> impl Bundle {
+    (
+        Mob(seed),
+        RigidBody::Dynamic,
+        Collider::standing(0.6, 1.8),
+        CharacterController {
+            walk_speed: 2.0,
+            ..CharacterController::default()
+        },
+        Interpolated::default(),
+        Teleport(feet),
+    )
+}
+
+/// `SplitMix64`, for the mobs' wandering.
+fn mix(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// [`ARROW_KEY`] shoots an arrow from the active camera's eye along its view (never hitting
+/// the player).
+fn shoot_arrows(
+    mut commands: Commands,
+    keys: Res<ButtonInput<KeyCode>>,
+    cameras: Query<(&Camera, &Transform, &FlyCamera)>,
+    players: Query<Entity, With<Player>>,
+) {
+    if !keys.just_pressed(ARROW_KEY) {
+        return;
+    }
+    let Some(eye) = active_eye(cameras) else {
+        return;
+    };
+    let forward = eye.forward().as_dvec3();
+    let from = WorldPos::from_dvec3(eye.translation).offset(forward * 0.5);
+    commands.spawn(arrow(from, forward, players.iter().next()));
+}
+
+/// [`BALL_KEY`] throws a ball from the active camera's eye along its view (12 blocks/s forward,
+/// 3 up).
+fn throw_balls(
+    mut commands: Commands,
+    keys: Res<ButtonInput<KeyCode>>,
+    cameras: Query<(&Camera, &Transform, &FlyCamera)>,
+) {
+    if !keys.just_pressed(BALL_KEY) {
+        return;
+    }
+    let Some(eye) = active_eye(cameras) else {
+        return;
+    };
+    let forward = eye.forward().as_dvec3();
+    let from = WorldPos::from_dvec3(eye.translation).offset(forward * 0.6);
+    commands.spawn(ball(from, forward * 12.0 + DVec3::Y * 3.0));
+}
+
+/// [`MOB_KEY`] spawns [`MOBS_PER_PRESS`] mobs in a row four blocks ahead of the active camera,
+/// a block above the eye (they fall to the ground).
+fn spawn_mobs(
+    mut commands: Commands,
+    keys: Res<ButtonInput<KeyCode>>,
+    cameras: Query<(&Camera, &Transform, &FlyCamera)>,
+    mut hunt: ResMut<Hunt>,
+) {
+    if !keys.just_pressed(MOB_KEY) {
+        return;
+    }
+    let Some(eye) = active_eye(cameras) else {
+        return;
+    };
+    let forward = eye.forward().as_dvec3();
+    let ahead = DVec3::new(forward.x, 0.0, forward.z).normalize_or(DVec3::NEG_Z);
+    let side = DVec3::new(-ahead.z, 0.0, ahead.x);
+    let base = WorldPos::from_dvec3(eye.translation).offset(ahead * 4.0 + DVec3::Y);
+    for i in 0..MOBS_PER_PRESS {
+        let across = (i as f64 - (MOBS_PER_PRESS - 1) as f64 * 0.5) * 1.5;
+        hunt.spawned += 1;
+        commands.spawn(mob(base.offset(side * across), mix(hunt.spawned)));
+    }
+}
+
+/// Every [`WANDER_STEPS`] fixed steps each mob picks a new direction (or stands still) from its
+/// seed; sometimes it jumps.
+fn wander(stats: Res<PhysicsStats>, mut mobs: Query<(&Mob, &mut MoveIntent)>) {
+    let step = stats.steps;
+    if !step.is_multiple_of(WANDER_STEPS) {
+        return;
+    }
+    let turn = step / WANDER_STEPS;
+    for (mob, mut intent) in &mut mobs {
+        let r = mix(mob.0 ^ turn.wrapping_mul(0x1000_0001));
+        let unit = |bits: u64| (bits % 2001) as f32 / 1000.0 - 1.0;
+        intent.wish = if r.is_multiple_of(4) {
+            Vec2::ZERO
+        } else {
+            Vec2::new(unit(r >> 8), unit(r >> 24))
+        };
+        if (r >> 40).is_multiple_of(3) {
+            intent.jump = true;
+        }
+    }
+}
+
+/// An arrow that hits a mob knocks it back along the arrow's flight and is gone; one that hits
+/// a block stays stuck in it.
+fn arrow_hits(
+    mut commands: Commands,
+    mut hits: MessageReader<ProjectileHit>,
+    arrows: Query<(), With<Arrow>>,
+    mut mobs: Query<&mut Velocity, With<Mob>>,
+    mut hunt: ResMut<Hunt>,
+) {
+    for hit in hits.read() {
+        if !arrows.contains(hit.projectile) {
+            continue;
+        }
+        if let ProjectileTarget::Entity(target) = hit.target
+            && let Ok(mut velocity) = mobs.get_mut(target)
+        {
+            let along = DVec3::new(hit.velocity.x, 0.0, hit.velocity.z).normalize_or_zero();
+            velocity.0 += along * KNOCKBACK + DVec3::Y * (KNOCKBACK * 0.5);
+            hunt.mob_hits += 1;
+            commands.entity(hit.projectile).despawn();
+        }
+    }
+}
+
+/// The F3 line `arrows` (flying and stuck), balls and mobs (and arrow hits on them).
+fn hunt_line(
+    arrows: Query<&Projectile, With<Arrow>>,
+    balls: Query<(), With<Ball>>,
+    mobs: Query<(), With<Mob>>,
+    hunt: Res<Hunt>,
+    lines: Option<ResMut<OverlayLines>>,
+) {
+    let Some(mut lines) = lines else {
+        return;
+    };
+    let stuck = arrows.iter().filter(|p| p.stuck_in().is_some()).count();
+    let line = format!(
+        "Arrows {}  stuck {stuck}  balls {}  mobs {}  hit {}  (F shoots, B throws, M spawns)",
+        arrows.iter().count(),
+        balls.iter().count(),
+        mobs.iter().count(),
+        hunt.mob_hits
+    );
+    if lines.get("hunt") != Some(line.as_str()) {
+        lines.set("hunt", line);
+    }
 }
 
 /// The item rests on something: on the ground, not frozen and nearly still.
@@ -195,7 +459,19 @@ enum DropTest {
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 struct SandboxSystems;
 
-/// Items ([`DROP_KEY`] drops one), the drop test and the F3 `items` line. Needs `WalkPlugin`.
+/// Items the player touches and how many it picked up.
+#[derive(Resource, Debug, Default)]
+struct Pickup {
+    /// Items overlapping the player (between their `CollisionStarted` and `CollisionEnded`)
+    /// that were too fresh to pick up.
+    touching: Vec<Entity>,
+    /// Items picked up so far.
+    picked: u32,
+}
+
+/// Items ([`DROP_KEY`] drops one, the player picks them up), crates ([`CRATE_KEY`]), arrows
+/// ([`ARROW_KEY`]), balls ([`BALL_KEY`]), mobs ([`MOB_KEY`]), the drop test and the F3 `items`,
+/// `crates` and `hunt` lines. Needs `WalkPlugin`.
 struct SandboxPlugin {
     drop_test: bool,
 }
@@ -207,35 +483,123 @@ impl Plugin for SandboxPlugin {
         } else {
             DropTest::Off
         })
+        .init_resource::<Pickup>()
+        .init_resource::<Hunt>()
         .configure_sets(Update, SandboxSystems.after(follow_player))
         .add_systems(
             Update,
-            (drop_items, drop_test, item_lines)
+            (
+                drop_items,
+                drop_crates,
+                pick_up,
+                drop_test,
+                item_lines,
+                shoot_arrows,
+                throw_balls,
+                spawn_mobs,
+                arrow_hits,
+                hunt_line,
+            )
                 .chain()
                 .in_set(SandboxSystems),
-        );
+        )
+        .add_systems(FixedUpdate, wander);
     }
 }
 
+/// The active camera's eye while the fly camera takes input.
+fn active_eye<'a>(
+    cameras: impl IntoIterator<Item = (&'a Camera, &'a Transform, &'a FlyCamera)>,
+) -> Option<&'a Transform> {
+    cameras
+        .into_iter()
+        .find(|(camera, _, fly)| camera.active && fly.enabled)
+        .map(|(_, eye, _)| eye)
+}
+
 /// [`DROP_KEY`] throws an item from below the active camera's eye along its view, as Minecraft
-/// does (6 blocks/s forward, 2 up).
+/// does (6 blocks/s forward, 2 up). The player can pick it up after [`PICKUP_DELAY`] steps.
 fn drop_items(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
+    stats: Res<PhysicsStats>,
     cameras: Query<(&Camera, &Transform, &FlyCamera)>,
 ) {
     if !keys.just_pressed(DROP_KEY) {
         return;
     }
-    let Some((_, eye, _)) = cameras
-        .iter()
-        .find(|(camera, _, fly)| camera.active && fly.enabled)
-    else {
+    let Some(eye) = active_eye(cameras) else {
         return;
     };
     let forward = eye.forward().as_dvec3();
     let from = WorldPos::from_dvec3(eye.translation).offset(forward * 0.5 - DVec3::Y * 0.3);
-    commands.spawn(item(from, forward * 6.0 + DVec3::Y * 2.0));
+    commands.spawn(item(
+        from,
+        forward * 6.0 + DVec3::Y * 2.0,
+        stats.steps + PICKUP_DELAY,
+    ));
+}
+
+/// [`CRATE_KEY`] drops a crate two blocks ahead of the active camera (along its heading) and a
+/// block above the eye: crates dropped in one place stack.
+fn drop_crates(
+    mut commands: Commands,
+    keys: Res<ButtonInput<KeyCode>>,
+    cameras: Query<(&Camera, &Transform, &FlyCamera)>,
+) {
+    if !keys.just_pressed(CRATE_KEY) {
+        return;
+    }
+    let Some(eye) = active_eye(cameras) else {
+        return;
+    };
+    let forward = eye.forward().as_dvec3();
+    let ahead = DVec3::new(forward.x, 0.0, forward.z).normalize_or(DVec3::NEG_Z);
+    let at = WorldPos::from_dvec3(eye.translation).offset(ahead * 2.0 + DVec3::Y);
+    commands.spawn(crate_body(at));
+}
+
+/// The player picks up the items it touches: a `CollisionStarted` between the player's solid box
+/// and an item's sensor, at once, or once the item is old enough while they still touch.
+fn pick_up(
+    mut commands: Commands,
+    mut started: MessageReader<CollisionStarted>,
+    mut ended: MessageReader<CollisionEnded>,
+    stats: Res<PhysicsStats>,
+    players: Query<Entity, With<Player>>,
+    items: Query<&Item>,
+    mut pickup: ResMut<Pickup>,
+) {
+    let Some(player) = players.iter().next() else {
+        started.clear();
+        ended.clear();
+        pickup.touching.clear();
+        return;
+    };
+    let pickup = &mut *pickup;
+    for event in started.read() {
+        if let Some(other) = event.other(player)
+            && items.contains(other)
+            && !pickup.touching.contains(&other)
+        {
+            pickup.touching.push(other);
+        }
+    }
+    for event in ended.read() {
+        if let Some(other) = event.other(player) {
+            pickup.touching.retain(|&item| item != other);
+        }
+    }
+    let picked = &mut pickup.picked;
+    pickup.touching.retain(|&entity| match items.get(entity) {
+        Ok(item) if stats.steps >= item.pickable_at => {
+            commands.entity(entity).despawn();
+            *picked += 1;
+            false
+        }
+        Ok(_) => true,
+        Err(_) => false,
+    });
 }
 
 /// Drops the test's items once the player stands, then waits for all of them to rest.
@@ -265,7 +629,7 @@ fn drop_test(
                     );
                     dropped.push(
                         commands
-                            .spawn(item(feet.0.offset(offset), DVec3::ZERO))
+                            .spawn(item(feet.0.offset(offset), DVec3::ZERO, 0))
                             .id(),
                     );
                 }
@@ -316,9 +680,12 @@ fn drop_test(
     }
 }
 
-/// The F3 line `items`: how many there are and how many rest.
+/// The F3 lines `items` (how many there are, how many rest, how many were picked up) and
+/// `crates` (how many).
 fn item_lines(
     items: Query<(&Velocity, &Contacts, Has<Frozen>), With<Item>>,
+    crates: Query<(), With<Crate>>,
+    pickup: Res<Pickup>,
     lines: Option<ResMut<OverlayLines>>,
 ) {
     let Some(mut lines) = lines else {
@@ -329,9 +696,15 @@ fn item_lines(
         .iter()
         .filter(|(velocity, contacts, frozen)| at_rest(velocity, contacts, *frozen))
         .count();
-    let line = format!("Items {total}  at rest {resting}  (Q drops)");
-    if lines.get("items") != Some(line.as_str()) {
-        lines.set("items", line);
+    let items_line = format!(
+        "Items {total}  at rest {resting}  picked {}  (Q drops)",
+        pickup.picked
+    );
+    let crates_line = format!("Crates {}  (C drops)", crates.iter().count());
+    for (key, line) in [("items", items_line), ("crates", crates_line)] {
+        if lines.get(key) != Some(line.as_str()) {
+            lines.set(key, line);
+        }
     }
 }
 
@@ -609,8 +982,258 @@ mod tests {
         }
         assert_eq!(
             app.world().resource::<OverlayLines>().get("items"),
-            Some("Items 100  at rest 100  (Q drops)")
+            Some("Items 100  at rest 100  picked 0  (Q drops)")
         );
+    }
+
+    /// Presses or releases `key` (seen by the next update).
+    fn key(app: &mut App, key: KeyCode, pressed: bool) {
+        use boxel::window::{ButtonState, KeyboardInput};
+        let state = if pressed {
+            ButtonState::Pressed
+        } else {
+            ButtonState::Released
+        };
+        app.world_mut()
+            .resource_mut::<Messages<KeyboardInput>>()
+            .write(KeyboardInput {
+                key,
+                state,
+                repeat: false,
+            });
+    }
+
+    /// Taps `k`: pressed for one update, released in the next.
+    fn tap(app: &mut App, k: KeyCode) {
+        key(app, k, true);
+        app.update();
+        key(app, k, false);
+        app.update();
+    }
+
+    fn line(app: &App, key: &str) -> String {
+        app.world()
+            .resource::<OverlayLines>()
+            .get(key)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn crates_dropped_in_one_place_stack() {
+        let mut app = sandbox_app(false);
+        for _ in 0..64 {
+            app.update();
+        }
+        // The player stands at (0.5, 4, 0.5) looking north: each crate falls 2 blocks ahead.
+        for _ in 0..3 {
+            tap(&mut app, CRATE_KEY);
+            for _ in 0..64 {
+                app.update();
+            }
+        }
+        let mut crates = app
+            .world_mut()
+            .query_filtered::<(&BodyPosition, &Velocity, &Contacts), With<Crate>>();
+        let mut stack: Vec<_> = crates
+            .iter(app.world())
+            .map(|(p, v, c)| (p.0, v.0, *c))
+            .collect();
+        stack.sort_by(|a, b| a.0.to_dvec3().y.total_cmp(&b.0.to_dvec3().y));
+        assert_eq!(stack.len(), 3);
+        for (level, (pos, velocity, contacts)) in stack.into_iter().enumerate() {
+            // Exactly on the grass (top at y = 4) and on each other.
+            assert_eq!(
+                pos.to_dvec3(),
+                DVec3::new(0.5, 4.0 + CRATE_SIZE * level as f64, -1.5),
+                "level {level}"
+            );
+            assert_eq!(velocity, DVec3::ZERO);
+            assert!(contacts.on_ground);
+        }
+        assert_eq!(line(&app, "crates"), "Crates 3  (C drops)");
+    }
+
+    #[test]
+    fn walking_into_an_item_picks_it_up() {
+        let mut app = sandbox_app(false);
+        for _ in 0..64 {
+            app.update();
+        }
+        // An item lying 3 blocks north of the player, pickable at once.
+        app.world_mut().spawn(item(
+            WorldPos::from_dvec3(DVec3::new(0.5, 4.0 + ITEM_HALF, -2.5)),
+            DVec3::ZERO,
+            0,
+        ));
+        for _ in 0..8 {
+            app.update();
+        }
+        assert_eq!(items(&mut app).len(), 1);
+        assert_eq!(
+            line(&app, "items"),
+            "Items 1  at rest 1  picked 0  (Q drops)"
+        );
+        // W walks north into it: the player picks it up.
+        key(&mut app, KeyCode::KeyW, true);
+        for _ in 0..64 {
+            app.update();
+        }
+        key(&mut app, KeyCode::KeyW, false);
+        app.update();
+        assert!(items(&mut app).is_empty());
+        assert_eq!(app.world().resource::<Pickup>().picked, 1);
+        assert_eq!(
+            line(&app, "items"),
+            "Items 0  at rest 0  picked 1  (Q drops)"
+        );
+    }
+
+    /// The player stands at (0.5, 4, 0.5) looking north (-Z) after a second.
+    fn standing_app() -> App {
+        let mut app = sandbox_app(false);
+        for _ in 0..64 {
+            app.update();
+        }
+        app
+    }
+
+    fn entities<F: boxel::ecs::query::QueryFilter>(app: &mut App) -> Vec<Entity> {
+        let world = app.world_mut();
+        world.query_filtered::<Entity, F>().iter(world).collect()
+    }
+
+    #[test]
+    fn f_shoots_an_arrow_that_sticks_in_a_wall() {
+        let mut app = standing_app();
+        // A wall across the view, 8 blocks north.
+        {
+            let mut edits = app.world_mut().resource_mut::<EditQueue>();
+            for x in -2..=2 {
+                for y in 4..=7 {
+                    edits.set_block(BlockPos::new(x, y, -8), BlockState(1));
+                }
+            }
+        }
+        for _ in 0..4 {
+            app.update();
+        }
+        tap(&mut app, ARROW_KEY);
+        for _ in 0..32 {
+            app.update();
+        }
+        let arrows = entities::<With<Arrow>>(&mut app);
+        assert_eq!(arrows.len(), 1);
+        let world = app.world();
+        let projectile = world.get::<Projectile>(arrows[0]).expect("arrow");
+        assert_eq!(projectile.stuck_in(), Some(BlockPos::new(0, 5, -8)));
+        assert!(
+            world.get::<Sleeping>(arrows[0]).is_some(),
+            "stuck arrows sleep"
+        );
+        let at = world
+            .get::<BodyPosition>(arrows[0])
+            .expect("arrow")
+            .0
+            .to_dvec3();
+        assert!(
+            (at.z - -7.0).abs() < 1e-6 && (at.x - 0.5).abs() < 1e-9,
+            "{at:?}"
+        );
+        assert_eq!(
+            line(&app, "hunt"),
+            "Arrows 1  stuck 1  balls 0  mobs 0  hit 0  (F shoots, B throws, M spawns)"
+        );
+    }
+
+    #[test]
+    fn an_arrow_knocks_a_mob_back_and_is_gone() {
+        let mut app = standing_app();
+        let target = app
+            .world_mut()
+            .spawn(mob(WorldPos::from_dvec3(DVec3::new(0.5, 4.0, -6.5)), 7))
+            .id();
+        for _ in 0..8 {
+            app.update();
+        }
+        tap(&mut app, ARROW_KEY);
+        // Six blocks at 60 blocks/s: about six steps.
+        for _ in 0..12 {
+            app.update();
+        }
+        assert_eq!(app.world().resource::<Hunt>().mob_hits, 1);
+        assert!(
+            entities::<With<Arrow>>(&mut app).is_empty(),
+            "the arrow is gone"
+        );
+        for _ in 0..32 {
+            app.update();
+        }
+        let z = app
+            .world()
+            .get::<BodyPosition>(target)
+            .expect("mob")
+            .0
+            .to_dvec3()
+            .z;
+        assert!(z < -7.5, "knocked back north: {z}");
+    }
+
+    #[test]
+    fn b_throws_a_ball_that_bounces_then_rests() {
+        let mut app = standing_app();
+        tap(&mut app, BALL_KEY);
+        let balls = entities::<With<Ball>>(&mut app);
+        assert_eq!(balls.len(), 1);
+        let mut bounced = false;
+        let mut was_falling = false;
+        for _ in 0..640 {
+            app.update();
+            let vy = app.world().get::<Velocity>(balls[0]).expect("ball").0.y;
+            bounced |= was_falling && vy > 2.0;
+            was_falling = vy < -2.0;
+            if app.world().get::<Sleeping>(balls[0]).is_some() {
+                break;
+            }
+        }
+        assert!(bounced, "it bounced off the grass");
+        let world = app.world();
+        assert!(world.get::<Sleeping>(balls[0]).is_some(), "it came to rest");
+        let at = world.get::<BodyPosition>(balls[0]).expect("ball").0;
+        assert_eq!((at.block.y, at.frac.y), (4, BALL_RADIUS), "{at:?}");
+    }
+
+    #[test]
+    fn m_spawns_mobs_that_wander() {
+        let mut app = standing_app();
+        tap(&mut app, MOB_KEY);
+        for _ in 0..64 {
+            app.update();
+        }
+        let mobs = entities::<With<Mob>>(&mut app);
+        assert_eq!(mobs.len(), MOBS_PER_PRESS as usize);
+        let at = |app: &App| -> Vec<DVec3> {
+            mobs.iter()
+                .map(|&m| {
+                    app.world()
+                        .get::<BodyPosition>(m)
+                        .expect("mob")
+                        .0
+                        .to_dvec3()
+                })
+                .collect()
+        };
+        let landed = at(&app);
+        assert!(landed.iter().all(|p| p.y == 4.0), "{landed:?}");
+        for _ in 0..(WANDER_STEPS * 2) {
+            app.update();
+        }
+        let moved = at(&app)
+            .iter()
+            .zip(&landed)
+            .filter(|(a, b)| (**a - **b).length() > 0.5)
+            .count();
+        assert!(moved >= 2, "{moved} of {} wandered", mobs.len());
     }
 
     #[test]
@@ -638,6 +1261,7 @@ mod tests {
         for _ in 0..128 {
             app.update();
         }
+        // Thrown away from the player: not picked up.
         let items = items(&mut app);
         assert_eq!(items.len(), 1);
         let (pos, velocity) = items[0];

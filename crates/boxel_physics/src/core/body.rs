@@ -50,8 +50,9 @@ pub struct BodySettings {
     /// the axis never bounces either, whatever this is: otherwise a body resting on the ground
     /// would bounce in place every step and never reach a velocity of 0.
     pub bounce_min_speed: f64,
-    /// Share of a push between two solid bodies (phase P3): a body with twice the weight moves
-    /// half as much. Unused today.
+    /// How two solid dynamic bodies split a push (and the velocity they lose toward each other):
+    /// a body with twice the weight moves half as much. Clamped to `1e-6..=1e6`; NaN counts as
+    /// 1.
     pub push_weight: f64,
 }
 
@@ -91,8 +92,9 @@ impl BodySettings {
         }
     }
 
-    /// An arrow: gravity scale 0.625 (20 blocks/s^2), drag 0.2 /s, no bounce. Projectile rules
-    /// (no speed limit, hits on entities) come in phase P4.
+    /// An arrow: gravity scale 0.625 (20 blocks/s^2), drag 0.2 /s, no bounce. Use it with
+    /// `boxel_physics::Projectile` (no speed limit, segment tests against blocks and bodies);
+    /// Minecraft shoots arrows at about 60 blocks/s.
     pub const fn arrow() -> Self {
         Self {
             gravity_scale: 0.625,
@@ -123,7 +125,7 @@ impl BodySettings {
 /// A velocity component slower than this after drag (blocks per second) is set to exactly 0, so
 /// a slide or a drift ends instead of decaying forever through ever smaller floats. At 64 Hz it
 /// moves a body far less than the contact tolerance per step. Not a sleep threshold: sleeping
-/// (phase P4) uses its own, larger one.
+/// uses its own, larger one (`PhysicsSettings::sleep_speed`).
 pub const STOP_SPEED: f64 = 1e-6;
 
 /// The world-wide inputs of one step: gravity, the timestep and the limits.
@@ -139,6 +141,17 @@ pub struct StepParams {
     pub impact_speed: f64,
     /// Sweep tuning (contact tolerance, depenetration).
     pub sweep: SweepConfig,
+}
+
+impl StepParams {
+    /// The same parameters without the speed limit, as projectiles move (`max_speed = 0`). With
+    /// them, [`predict`] matches a projectile's free flight bit for bit.
+    pub const fn without_speed_limit(self) -> Self {
+        Self {
+            max_speed: 0.0,
+            ..self
+        }
+    }
 }
 
 impl Default for StepParams {
@@ -220,7 +233,8 @@ pub fn integrate_velocity(
 
 /// One step of a dynamic body with the voxel box `shape` (relative to `pos`): gravity, drag,
 /// the speed limit, the sweep against the voxels of `src`, bounces and impacts (see the module
-/// docs). `on_ground` is whether the body ended the previous step on the ground.
+/// docs). `on_ground` is whether the body ended the previous step on the ground. The same as
+/// [`integrate_velocity`] followed by [`move_body`] with no obstacles.
 ///
 /// # Errors
 ///
@@ -236,8 +250,39 @@ pub fn step_body<S: VoxelSource + ?Sized>(
     settings: &BodySettings,
     params: &StepParams,
 ) -> Result<BodyStep, Unloaded> {
-    let mut v = integrate_velocity(vel, on_ground, settings, params);
-    let sweep = move_box(src, table, pos, shape, v * params.dt, &[], &params.sweep)?;
+    let v = integrate_velocity(vel, on_ground, settings, params);
+    move_body(src, table, pos, v, shape, &[], settings, params)
+}
+
+/// Steps 4 and 5 of the integrator: moves a body with the voxel box `shape` (relative to `pos`)
+/// by `vel * dt` against the voxels of `src` and the `obstacles` (boxes in the frame of
+/// `pos.block`: static and kinematic solid bodies), then bounces or stops each clipped axis and
+/// reports the impacts. `vel` is the velocity [`integrate_velocity`] gave for this step. An
+/// obstacle clips like a block but is never an impact (impacts are hits on blocks).
+///
+/// # Errors
+///
+/// [`Unloaded`], as [`step_body`].
+pub fn move_body<S: VoxelSource + ?Sized>(
+    src: &mut S,
+    table: &CollisionTable,
+    pos: WorldPos,
+    vel: DVec3,
+    shape: LocalBox,
+    obstacles: &[LocalBox],
+    settings: &BodySettings,
+    params: &StepParams,
+) -> Result<BodyStep, Unloaded> {
+    let mut v = vel;
+    let sweep = move_box(
+        src,
+        table,
+        pos,
+        shape,
+        v * params.dt,
+        obstacles,
+        &params.sweep,
+    )?;
     let mut impacts = [None; 3];
     for (axis, impact) in impacts.iter_mut().enumerate() {
         let face = face_of(axis, v[axis] > 0.0);

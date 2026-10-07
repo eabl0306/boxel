@@ -6,11 +6,12 @@
 //! cycles the frame limit (30, 60, 144, 240, unlimited) and F6 toggles vsync. While the mouse is
 //! grabbed, left click breaks the block under the crosshair and right click places the selected
 //! block on the face it points at (keys 1 to 9 and 0 select it, lamps on 7 to 0; F3 shows the
-//! target, the selection and the light at the eye and the crosshair). Picking is a voxel raycast
-//! from the camera (`PhysicsQuery::raycast_voxels`), reach 6 blocks. G switches between flying
-//! and walking: walking is a player body with gravity (`boxel::physics`, a 0.6 x 1.8 x 0.6 box
-//! and a `CharacterController`) that WASD moves along the view and Space makes jump, with the
-//! camera at its eye. F3 shows the mode and a physics line (`PhysicsStats`) in both modes.
+//! target, the selection and the light at the eye and the crosshair), never where a solid body
+//! is (the walking player: `PhysicsQuery::block_is_free`). Picking is a voxel raycast from the
+//! camera (`PhysicsQuery::raycast_voxels`), reach 6 blocks. G switches between flying and
+//! walking: walking is a player body with gravity (`boxel::physics`, a 0.6 x 1.8 x 0.6 box and a
+//! `CharacterController`) that WASD moves along the view and Space makes jump, with the camera at
+//! its eye. F3 shows the mode and a physics line (`PhysicsStats`) in both modes.
 //!
 //! Day and night: a day lasts 20 minutes. `[` and `]` move the clock one hour back and forward,
 //! T pauses it and F runs it 60 times faster; `--time HH:MM` sets the start (noon by default).
@@ -1137,7 +1138,8 @@ impl Click {
 
 /// The edit a click makes on `hit`. Breaking sets the block to air. Placing puts `block` in
 /// front of the face the ray entered, if `free` says that cell can take it (air or a fluid,
-/// loaded); a ray that started inside a block has no face and places nothing.
+/// loaded, and no solid body there); a ray that started inside a block has no face and places
+/// nothing.
 fn click_edit(
     click: Click,
     hit: &VoxelHit,
@@ -1238,8 +1240,12 @@ fn pick_blocks(
     }
     let click = Click::from_input(&buttons, cursor.grab == CursorGrab::Locked);
     if let (Some(hit), Some(click)) = (target, click) {
+        // The placement check: never a block inside the player (or any solid body).
         let free = |pos: BlockPos| match physics.probe(pos) {
-            VoxelProbe::Block(state) => state.is_air() || physics.collision().is_fluid(state),
+            VoxelProbe::Block(state) => {
+                (state.is_air() || physics.collision().is_fluid(state))
+                    && physics.block_is_free(pos)
+            }
             VoxelProbe::Unloaded => false,
         };
         if let Some(edit) = click_edit(click, &hit, picking.block(), free) {
@@ -1843,8 +1849,9 @@ mod tests {
             line(&app, "move"),
             "Walk (G flies)  on ground  speed 0.00 b/s"
         );
+        // Standing still for half a second, the player body fell asleep (W wakes it).
         assert!(
-            line(&app, "physics").starts_with("Physics bodies=1 dynamic=1 frozen=0"),
+            line(&app, "physics").starts_with("Physics bodies=1 dynamic=0 frozen=0 sleeping=1"),
             "{}",
             line(&app, "physics")
         );
@@ -1893,6 +1900,45 @@ mod tests {
             app.update();
         }
         assert!(camera_at(&mut app).y > before.y + 2.0);
+    }
+
+    #[test]
+    fn right_click_never_places_a_block_inside_the_player() {
+        use player::WALK_KEY;
+        let mut app = picking_app();
+        // Walking: the player lands on the grass under the camera, which looks straight down
+        // from its eye at the grass under its feet.
+        tap(&mut app, WALK_KEY);
+        for _ in 0..64 {
+            app.update();
+        }
+        assert!(walker(&mut app).is_some());
+        let target = app
+            .world()
+            .resource::<Picking>()
+            .target
+            .expect("grass below");
+        assert_eq!(
+            (target.block, target.face),
+            (BlockPos::new(0, 3, 0), Some(Face::PosY))
+        );
+        // The first click grabs the cursor; the right click would put stone in the player's
+        // feet: refused.
+        click(&mut app, MouseButton::Left);
+        assert_eq!(grab(&app), CursorGrab::Locked);
+        click(&mut app, MouseButton::Right);
+        assert_eq!(
+            block_at(&app, BlockPos::new(0, 4, 0)),
+            Some(BlockState::AIR)
+        );
+        // Flying, the body is gone: the same click places it.
+        tap(&mut app, WALK_KEY);
+        assert!(walker(&mut app).is_none());
+        click(&mut app, MouseButton::Right);
+        let stone = BlockRegistry::default_blocks()
+            .by_name("boxel:stone")
+            .expect("built-in");
+        assert_eq!(block_at(&app, BlockPos::new(0, 4, 0)), Some(stone));
     }
 
     #[test]

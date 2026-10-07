@@ -281,6 +281,13 @@ de gameplay.
   - Descarga: un chunk cuya edición movió un techo se lleva la edición (todavía no hay
     persistencia), así que su columna vuelve a caminar y remalla lo que cambie. Con el
     `ChunkStore` persistente se guardarán los techos editados por columna.
+  - Mensajes: la lista de cambios por vóxel que mide estos alcances (estado antes de la
+    primera edición de cada posición y después de la última) es también la que escribe los
+    `BlockChanged { pos, old, new }` del mundo, uno por posición que cambió, en el orden de su
+    primera edición. Los lee la física (despierta los cuerpos dormidos cerca, ADR 0016); la luz
+    no los lee, se recalcula con el lote. Al leer uno, el mapa ya tiene el bloque nuevo, pero
+    `ChunkMap::light_at` y las mallas pueden ser los de antes hasta que llegan las remallas del
+    lote.
 - **Coordenadas**: las cuentas de bandas y cajas usan `i64` con resta saturada; los techos se
   comparan relativos a la caja dentro de `boxel_light`. El mismo mundo en x = 2^40 e y = -2^40
   da los mismos bits.

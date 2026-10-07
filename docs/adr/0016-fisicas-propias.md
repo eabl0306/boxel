@@ -1,6 +1,6 @@
 # ADR 0016: física propia mínima
 
-- Estado: aceptado (fases P0, P1 y P2 hechas; P3 en adelante, pendientes)
+- Estado: aceptado (fases P0 a P4 hechas; de P4 falta medir con stress en ventana; P5 a pedido)
 - Fecha: 2026-10-06
 
 ## Contexto
@@ -107,9 +107,12 @@ Dos datos del código pesan en el diseño:
   clippy.toml` prohíbe `mul_add` (FMA), `powi` y todas las funciones de libm (`powf`, `exp`,
   `ln`, `sin`, `atan2`, `hypot` y parecidas) para `f64` y `f32`, y lo mismo más los ayudantes de
   ángulos y rotaciones (`angle_between`, `slerp`, `to_angle`...) para `DVec3`, `Vec3`, `DVec2` y
-  `Vec2`. Desde P3: pares y
-  eventos en orden de `Entity`, mapas con `foldhash::FixedState` que nunca se recorren para
-  ordenar, y paralelismo solo por cuerpo.
+  `Vec2`. Desde P3: los pares salen ordenados por `Entity` (en P3 porque los cuerpos entraban a
+  la grilla en ese orden; desde P4 se ordenan los pares y la lista queda en el orden de la
+  query), el solve los recorre en un orden fijo (de abajo hacia arriba, desempate por par) y
+  los eventos salen ordenados. La grilla usa un hash de celda fijo y no hay mapas que se
+  recorran. El paralelismo (P4) es solo por cuerpo (cada uno lee el mundo y escribe solo lo
+  suyo) o sobre listas que después se ordenan, así que el resultado no depende de los hilos.
 
 - **8. Tiempo y orden.** Los pasos de física corren a 64 Hz en `FixedPostUpdate` (desde P2), así
   el gameplay de `FixedUpdate` no tiene que ordenarse contra ellos. `boxel_app` suma los sets
@@ -166,8 +169,8 @@ Dos datos del código pesan en el diseño:
   propio umbral, más grande: `|v| < 0.05` bloques/s durante 32 pasos.
 
   Sets encadenados en `FixedPostUpdate`: `PhysicsSystems::{Prepare, Controller, Kinematic,
-  Step, Broadphase, Solve, Events, Writeback}` (`Broadphase` y `Solve` vacíos hasta P3), e
-  `Interpolate` en `AfterFixedMainLoop`.
+  Step, Broadphase, Solve, Events, Writeback}` (`Broadphase` y `Solve` se llenan en P3, ver 9),
+  e `Interpolate` en `AfterFixedMainLoop`.
   - Prepare: un cuerpo nuevo toma su posición de `Transform`; un `Teleport` la pone exacta y se
     borra; un `Transform` distinto del que escribió la física (`PhysicsSync`) es un
     teletransporte del gameplay. Un teletransporte conserva la velocidad y borra `Contacts`: el
@@ -176,7 +179,13 @@ Dos datos del código pesan en el diseño:
     hook), así que un cuerpo creado solo con `Teleport` no se ve en el origen hasta su primer
     paso. Escribir `BodyPosition` directo en un paso fijo también lo mueve, pero no es un
     teletransporte: conserva velocidad y `Contacts`, y si además se escribió `Transform`, gana
-    `Transform`.
+    `Transform`. Desde la revisión de P4, `Prepare` reconoce ese empujón a mano por el tick de
+    cambio de `BodyPosition`: la física lo escribe siempre antes del `Writeback`, así que un
+    cambio más nuevo que el último `Writeback` vino del juego. Lo trata como un teletransporte
+    para todo lo demás: despierta al cuerpo dormido, despierta a los que dormían sobre el lugar
+    que dejó (lo saca del índice: el almacén de dormidos o la lista del paso) y un estático o
+    cinemático movido así queda activo ese paso y empuja a los que encuentra. Guardar la última
+    posición en `PhysicsSync` costaba de 3 a 6 % del paso en un hilo; el tick no cuesta nada.
   - Controller: va después de Prepare, así un cuerpo teletransportado está en el aire para su
     controlador (antes, uno que estaba apoyado podía saltar en el aire en el destino y frenaba
     con la fricción del suelo un paso). Solo mueve cuerpos dinámicos.
@@ -203,11 +212,174 @@ Dos datos del código pesan en el diseño:
   del movimiento a 64 Hz, 9 bloques/s sube 1.11; 9.5 sube 1.24, el alto de Minecraft, y alcanza
   para subir un escalón de un bloque. Se tomó 9.5.
 
-- **9. Entre entidades (P3).** Grilla uniforme ordenada de celdas de 4 bloques. Los sólidos se
-  separan por posición en todos los ejes, con apilado, y cada empuje pasa por el barrido de
-  vóxeles (las paredes siempre ganan). Los sensores emiten `CollisionStarted` y
-  `CollisionEnded`. Los sólidos estáticos y cinemáticos son obstáculos dentro del barrido:
-  `move_box` ya recibe esas cajas.
+- **9. Entre entidades (P3).** Los sólidos se separan por posición en todos los ejes, con
+  apilado, y cada empuje pasa por el barrido de vóxeles (las paredes siempre ganan). Los
+  sensores avisan con `CollisionStarted` y `CollisionEnded`. Los sólidos estáticos y
+  cinemáticos son obstáculos dentro del barrido de los dinámicos. Por partes:
+
+  - **Broadphase (`core::grid::Grid`).** Grilla uniforme de celdas de `2^grid_shift` bloques
+    (4 por defecto) con coordenadas `i64`. Cada cuerpo guarda sus `BlockBounds` (los bloques que
+    alcanza su caja: `floor(min)..=floor(max)`, calculados en el marco de su bloque) y entra en
+    cada celda que tocan, como mucho dos por eje; uno más ancho va a una lista `large` que se
+    prueba contra todos. Las entradas se ordenan por un hash fijo de la celda con un counting
+    sort (lineal y estable: el orden solo depende del orden de inserción). Un par es candidato si
+    sus capas se aceptan en los dos sentidos, uno de los dos es activo (en P3: dinámico, sensor o
+    con `ReportContacts`; desde P4: dinámico despierto, cinemático que se movió, o cuerpo
+    teletransportado, movido a mano o con collider cambiado en el paso; dos paredes nunca forman
+    par) y sus bloques se tocan; cada par sale solo de su celda "casa", la de `max(celda mínima
+    de a, celda mínima de b)`, así que sale una vez. Los pares se ordenan por `Entity` (en P3 los
+    cuerpos entraban en ese orden; desde P4 se ordenan solo los pares). El plan pedía
+    `sort_unstable` con claves `i64`; el counting sort hace lo mismo en tiempo lineal. La misma
+    grilla responde consultas de caja y rayos (un DDA exacto por celdas, igual al de vóxeles).
+  - **Narrowphase (`core::narrow`).** En `f64`, en el marco del bloque del primer cuerpo, con el
+    otro ubicado por `delta_to`: exacto a cualquier distancia. Caja contra caja por el eje de
+    menor penetración (desempate Y, X, Z); esfera contra esfera por la recta entre centros (+Y si
+    coinciden); esfera contra caja desde el punto más cercano (o la cara más cercana si el
+    centro está adentro). Agregado al plan: dos cajas que se solapan después de un paso se
+    separan hacia el lado del que vino una de ellas en ese paso (`box_box_moving`, con el
+    desplazamiento del paso que guarda `PhysicsSync`). Sin esto, una caja que cae rápido y se
+    hunde más de su altura en otra en un solo paso salía por abajo. Solapar es pasar de `eps` en
+    todos los ejes: rozar un costado no cuenta.
+  - **Solve.** Los pares sólidos con al menos un dinámico se recorren de abajo hacia arriba (por
+    la base del cuerpo más bajo, desempate por par), `solver_passes` veces (2). Un cuerpo que no
+    puede moverse en esa dirección (estático, cinemático, congelado, o dinámico que ya toca algo
+    en la cara hacia la que lo empujarían) no recibe parte, y el otro se lleva todo el empuje:
+    una pila de cajas sobre el suelo descansa sin hundirse. Dos dinámicos libres se reparten el
+    empuje por `push_weight` (el doble de peso, la mitad de movimiento). El que se lleva todo el
+    empuje queda exactamente sobre la cara del otro, calculado en su propio marco: una caja
+    apoyada en otra da la misma posición bit a bit en cada paso. Cada empuje pasa por `move_box`
+    (vóxeles y obstáculos); si el primero se mueve menos que su parte, el segundo se lleva el
+    resto. La velocidad con que se acercan por la normal se quita, repartida igual (un choque
+    inelástico). Cada cara que toca otro cuerpo se marca en `Contacts::faces`, y un empuje hacia
+    arriba pone `on_ground` (se puede parar sobre una caja o un mob, y saltar desde ahí).
+  - **Sensores y eventos.** Un sensor nunca empuja ni es empujado. Después de los empujes, los
+    pares con un sensor que se solapan entran al conjunto de contactos del paso, junto con los
+    pares sólidos con `ReportContacts` que se tocan o se solapan. En P3 contaban los que se
+    solaparon antes de separarse; con eso nunca había eventos contra un estático o un
+    cinemático (el barrido deja al dinámico apenas tocándolo) y un contacto terminaba en falso
+    cuando el de arriba se dormía sobre uno despierto. Tocarse es estar a `eps` en un eje y
+    solaparse más que `eps` en los otros dos (rozar una arista no cuenta); un estático o un
+    cinemático cuenta como su caja, como lo ve el barrido. El conjunto se compara
+    con el del paso anterior (merge de dos listas ordenadas): `CollisionStarted` para los nuevos
+    y `CollisionEnded` para los que faltan, una vez cada uno, con `a < b` por bits de `Entity`.
+    Un despawn da `CollisionEnded` en el paso siguiente. Un dinámico con collider sensor sigue
+    chocando con los vóxeles (así funcionan los objetos tirados).
+  - **Obstáculos.** Después de mover los cinemáticos, los colliders sólidos estáticos y
+    cinemáticos forman otra grilla; cada dinámico sólido barre contra las cajas de los que
+    estén en su camino y en sus capas (las esferas como su caja). Un cinemático que entra en un
+    dinámico lo empuja todo el camino y le pasa su velocidad por la normal: una plataforma que
+    sube lleva la caja encima.
+  - **Capas.** `CollisionLayers { member, mask }`: dos colliders se encuentran si cada uno acepta
+    al otro. Valen para pares, obstáculos y consultas.
+  - **Consultas.** `BodyIndex` guarda los cuerpos con collider como los dejó el último paso
+    (después de los empujes), en la grilla. `PhysicsQuery::raycast` tira el rayo de vóxeles y
+    después busca cuerpos hasta el bloque que pegó (un cuerpo a la misma distancia gana: está
+    delante de la cara); `overlap_box` da los cuerpos que se solapan con una caja;
+    `block_is_free` dice si un bloque está libre de cuerpos sólidos (los sensores no cuentan).
+    `voxel_world` no pone un bloque donde está el jugador.
+  - Un `Collider` sin `RigidBody` es un cuerpo estático (lo requiere), como pide el plan. Un
+    cuerpo sin `Collider` no participa entre cuerpos.
+
+- **9b. Proyectiles, dormir y escala (P4).**
+
+  - **Mensajes del mundo.** `boxel_world` suma `BlockChanged { pos, old, new }` (uno por bloque
+    que cambió en el frame, escrito en `WorldSystems::Edits`) y `ChunkDataEvent::{Loaded,
+    Unloaded} { id, key }` (cuando los bloques de un chunk se pueden leer o dejan de poder
+    leerse; el mapa los anota al cambiar un slot y se publican al final de `Collect`). Son los
+    mensajes que el plan pedía compartir con la luz. La luz no los necesita: calcula la luz en
+    los jobs de malla, y la misma pasada de `apply_edits` que aplica las ediciones arma el lote
+    de remallas que la recalcula (ADR 0015). Los `BlockChanged` salen de esa pasada, de la lista
+    de cambios por vóxel que la luz lleva para medir el alcance de cada edición (antes de unir
+    las ramas eran una lista propia de la física): por posición, el estado antes de su primera
+    edición y después de la última, en el orden de la primera edición, sin las que quedan como
+    estaban. Cuando se lee el mensaje, el mapa ya tiene el bloque nuevo, pero la luz guardada
+    (`ChunkMap::light_at`) y las mallas pueden ser las de antes hasta que llegan las remallas
+    del lote.
+  - **Dormir.** Un cuerpo dinámico se duerme (`Sleeping`) después de `sleep_steps` (32) pasos
+    seguidos apoyado (en bloques o sobre otro cuerpo), más lento que `sleep_speed` (0.05
+    bloques/s) en cada eje y sin moverse más que eso en el paso, con empujes incluidos. Un
+    personaje que quiere caminar nunca cuenta como quieto (si no, uno que empuja una pared se
+    dormía y despertaba cada 33 pasos). Al dormirse, un hook pone su velocidad en 0 exacto y su
+    `Transform` en su posición. Un cuerpo dormido no se mueve, no se interpola y no entra en la
+    lista del paso.
+
+    Se despierta con: una velocidad distinta de 0 (un salto, un empujón, un controlador que
+    quiere caminar), un cambio de su `RigidBody`, `Collider` o `BodySettings` hecho después de
+    dormirse (comparando el tick del cambio con el de la marca: un cuerpo creado ya dormido no
+    se despierta por sus propios componentes nuevos), un `ReportContacts` puesto o sacado, un
+    collider quitado, un teletransporte o un `BodyPosition` escrito a mano, un empuje de un
+    cuerpo despierto, un cuerpo sólido que toca y que se movió (la caja de abajo se fue), uno
+    que se fue de donde lo tocaba (teletransporte, empujón a mano, collider cambiado o quitado,
+    despawn), un `BlockChanged` a un bloque o menos de su caja, la carga de un chunk que toca su
+    caja más un bloque (`ChunkDataEvent::Loaded`: los bloques pueden haber cambiado) y un cambio
+    de `PhysicsSettings` (gravedad, dormir apagado). La descarga no lo despierta: dormido no se
+    mueve y no necesita bloques. Antes de la revisión lo despertaba, el cuerpo se congelaba y
+    ya no volvía a dormirse, así que los objetos que el jugador dejaba atrás costaban como
+    despiertos para siempre. El plan pedía despertar con el bloque que cambia, la recarga del
+    chunk, la velocidad, el empuje y el teletransporte; lo de la caja de abajo que se va hizo
+    falta para que una pila no quede flotando.
+
+    `Collider` es inmutable desde la revisión de P4: para cambiarlo se inserta otro, y su hook
+    `on_discard` ve el que se va. Así una plataforma que se achica, se vuelve sensor o cambia de
+    capas despierta lo que dormía encima; con `&mut Collider` el cambio no pasaba por ningún
+    hook y la caja de arriba quedaba flotando. Un cuerpo creado con `Sleeping` (un objeto
+    cargado de una partida guardada) queda dormido donde lo ponen su `Transform` o su
+    `Teleport`; antes aparecía en el origen.
+
+    Para que dormir ahorre de verdad, los dormidos viven aparte: un almacén con su propia
+    grilla, que se rehace solo cuando se durmieron o despertaron más de `max(256, vivos / 8)`
+    desde la última vez (los nuevos esperan en una lista corta `pending`, los despertados se
+    marcan muertos, en la grilla y en `pending`, que se compacta de una vez al cambiar; antes
+    sacar uno de `pending` corría el resto de la lista y despertar a todos costaba O(k²)). Los
+    eventos de carga buscan sus dormidos en un índice de chunk a cuerpo que se arma con la
+    grilla, en vez de recorrer todos los dormidos. Cada paso, los cuerpos activos (dinámicos
+    despiertos, cinemáticos que se movieron, teletransportados, movidos a mano o con collider
+    cambiado) buscan en esa grilla los dormidos que
+    alcanzan y traen una copia a la lista del paso; el resto del almacén no se toca. En la
+    grilla, las cajas de los activos que se movieron cubren de dónde vinieron, así un dormido
+    que se apoyaba en ellos aparece aunque ya no se toquen. Los dormidos son inactivos: dos de
+    ellos nunca forman par, y un par de dos inactivos que se solapaba sigue solapado (no hay
+    `CollisionEnded` mientras los dos duermen). La marca `Sleeping` manda: sus hooks avisan
+    cada vez que alguien la pone o la saca (despawns incluidos) y el almacén los sigue. Dormido
+    se puede poner y sacar a mano.
+  - **Proyectiles.** `Projectile { on_block: Stop | Bounce, on_entity: Stop | Pass, ignore }`
+    sobre un cuerpo dinámico. Corren después del solve (los blancos están donde quedaron) en su
+    propio set, `PhysicsSystems::Projectiles`: integran como cualquier cuerpo pero sin tope de
+    velocidad (`StepParams::without_speed_limit`, con lo que `predict` da su vuelo libre bit a
+    bit), y mueven su centro por el segmento del paso: contra los vóxeles con el DDA exacto, y
+    contra los cuerpos sólidos de sus capas como un rayo contra la caja del blanco agrandada en
+    las medias medidas del proyectil (exacto para cajas; una esfera cuenta como su caja). Un
+    blanco donde el segmento empieza adentro o tocando cuenta solo en el primer paso después de
+    crear, teletransportar o mover a mano el proyectil (un tiro a quemarropa); después no (ya se
+    lo golpeó al entrar, o el proyectil se paró contra él). Gana el primer golpe; un cuerpo gana
+    el empate con un bloque. `Stop` en un cuerpo lo deja tocándolo con velocidad 0; `Pass` avisa
+    de cada cuerpo en el que entra, en orden, y sigue; en un bloque el centro queda sobre la
+    cara (a `eps` de ella) y se clava (`Stop`: se duerme en el acto y recuerda el bloque,
+    `Projectile::stuck_in`; si el bloque sigue ahí al despertar, se vuelve a dormir; si se fue,
+    cae; si el juego le da una velocidad o lo mueve, vuela de nuevo) o rebota (`Bounce`, con las
+    reglas de rebote de un cuerpo, y el resto del paso sigue a lo largo de la cara, así una
+    pelota que cayó se desliza en vez de frenarse en seco). Cada golpe es un `ProjectileHit { projectile,
+    target: Block { pos, face, state } | Entity(e), point, velocity, speed }`, ordenado por
+    proyectil (un rebote solo si pasa de `impact_speed`). El plan pedía `speed`; se suma
+    `velocity` para que el juego pueda empujar al blanco. Los proyectiles no están en
+    `BodyIndex`: no empujan, no son empujados, no dan eventos de sensor ni se chocan entre ellos.
+    Tampoco son obstáculos aunque su cuerpo no sea dinámico (un `Collider` solo lo haría
+    estático: no vuela, y antes además bloqueaba a los dinámicos). Un segmento que llega a un
+    chunk sin cargar congela al proyectil.
+  - **Paso en paralelo.** Con más de `parallel_threshold` (256) cuerpos dinámicos despiertos
+    (los estáticos, cinemáticos y dormidos no cuentan: casi no trabajan), el paso de
+    los dinámicos y el de los proyectiles usan `par_iter_mut` en el pool de cómputo: cada
+    cuerpo lee el mundo y escribe solo lo suyo, con su propio caché de chunks por hilo, y las
+    salidas (impactos, golpes, congelados) se juntan y se ordenan por entidad. Lo mismo, porque
+    son por cuerpo, el `Prepare`, el controlador y el `Writeback`. El broadphase calcula los
+    límites de cada cuerpo en tandas por hilo y, desde 4096 cuerpos en la lista, reparte el
+    barrido de pares de la grilla por rangos de celdas (`Grid::pair_ranges`, `pairs_in`,
+    `large_pairs`). Para que el orden de la lista no importe, los pares se ordenan por entidad
+    (antes se ordenaba la lista entera, que con 10 000 cuerpos de casi 300 bytes costaba 0.35
+    ms). El solve sigue en un hilo. Paralelo y en un hilo dan lo mismo bit a bit (test).
+  - **stress.** `--bodies N --body-kind item|mob --projectiles M` ponen cuerpos alrededor del
+    inicio cuando el mundo cargó (ver [benchmarks](../benchmarks.md)). Las corridas con ventana
+    de la regla del frame quedan para la medición.
 
 - **10. Fases.** P0: requisitos (`WorldPos`, sets del bucle fijo, el tope de pasos, este ADR, la
   feature). P1: núcleo y raycast (tabla, fuentes, barrido, DDA, `PhysicsQuery::raycast_voxels`,
@@ -217,6 +389,164 @@ Dos datos del código pesan en el diseño:
   por bloque, esfera exacta contra vóxeles.
 
 ## Consecuencias
+
+Hecho (P4):
+
+- `boxel_world`: los mensajes `BlockChanged` y `ChunkDataEvent` (9b) y `DataState::is_readable`.
+- `boxel_physics`: `Sleeping` y su almacén, `Projectile` con `OnBlock` y `OnEntity`,
+  `ProjectileHit` con `ProjectileTarget`, los sets `PhysicsSystems::{Wake, Projectiles,
+  Sleep}`, `PhysicsSettings::{sleep_speed, sleep_steps, parallel_threshold}`,
+  `PhysicsStats::{sleeping, woken, projectiles, hits, parallel}` (la línea `physics` suma
+  `sleeping`, `projectiles` y `hits`), `PhysicsSync::net_moved`,
+  `StepParams::without_speed_limit` y, en la grilla, `pair_ranges`, `pairs_in` y
+  `large_pairs`. El paso, el broadphase, `Prepare`, el controlador y el `Writeback` usan los
+  hilos de cómputo desde 256 cuerpos.
+- `physics_sandbox`: F dispara una flecha a 60 bloques/s (se clava en bloques; un mob al que
+  le pega sale empujado y la flecha desaparece), B tira una pelota que rebota hasta quedarse
+  quieta, M pone cuatro mobs que caminan solos. F3 suma la línea `hunt` (flechas, clavadas,
+  pelotas, mobs, golpes).
+- `stress`: `--bodies N --body-kind item|mob --projectiles M`; el resumen anota los cuerpos y
+  `tools/bench_report.py` no mezcla corridas con cuerpos distintos.
+- Benches nuevos en `crates/boxel_physics/benches/physics.rs`: `scale/10000_asleep`,
+  `scale/10000_awake`, `scale/10000_awake_one_thread` y `scale/1000_projectiles`, con el
+  desglose de cada paso (movimiento, entre cuerpos, resto). En la revisión:
+  `10000_asleep_one_thread` y `1000_projectiles_one_thread` (los de los objetivos),
+  `10000_asleep_chunk_events` y `sleep_churn`; los `tick` corren en un hilo.
+
+Tests de P4:
+
+- `boxel_world/tests/messages.rs`: un `BlockChanged` por bloque que cambió (dos ediciones del
+  mismo bloque dan uno, las que no cambian nada o caen en chunks sin cargar no dan ninguno, en
+  el orden de la primera edición aunque estén en varios chunks), y
+  los `ChunkDataEvent` reproducen exactamente el conjunto de chunks legibles al cargar, al irse
+  el viewer y al volver (con ids nuevos).
+- `boxel_physics/tests/sleep.rs`: una caja se duerme exacta y no se mueve en 500 pasos; una pila
+  de 4 se duerme sin cambiar un bit y sin pares; despiertan una velocidad (y no un 0), un
+  controlador que quiere caminar o saltar, un teletransporte (por `Teleport` y por
+  `Transform`), un jugador que camina contra una caja dormida (la empuja sin meterse), la caja
+  de abajo que sale despedida, se despawnea o pierde el collider (la de arriba cae al suelo),
+  una plataforma cinemática que sube y baja, un bloque a un bloque o menos (uno a tres no la
+  despierta; sacar el bloque de abajo la deja caer), la descarga del chunk (sigue dormida, sin
+  congelarse) y su vuelta (despierta y vuelve a dormirse; con 300 cajas en el índice de chunks
+  también), dormir apagado, la gravedad cambiada; dormir a mano deja un cuerpo colgado hasta
+  sacarle la marca; uno creado ya dormido queda donde lo puso su `Transform` o su `Teleport`;
+  escribir `BodyPosition` despierta al dormido, una plataforma movida así deja caer la caja de
+  arriba y empuja a la que encuentra; una plataforma que se achica o se vuelve sensor deja caer
+  lo que dormía encima; quitar el collider de un sensor dormido, ponerle `ReportContacts` o
+  cambiarle el `RigidBody` lo despierta; los solapes de sensores siguen mientras todos duermen
+  y terminan cuando uno sale; rayos, `overlap_box` y `block_is_free` encuentran dormidos sin
+  despertarlos; un despawn dormido no deja rastro; 400 cajas dormidas que se despiertan de a
+  una dejan el índice exacto; `FixedPostUpdate` sin ambigüedades.
+- `boxel_physics/tests/projectile.rs`: 64 flechas a 60 bloques/s, una por cada 1/64 de paso de
+  fase, pegan las 64 a un mob de 0.6 de ancho y se paran justo en su cara (también con
+  gravedad); una flecha se clava a `eps` de la cara del bloque, se vuelve a dormir si el bloque
+  sigue y cae y se clava arriba de otro cuando se va; una pelota proyectil rebota y descansa;
+  una flecha que atraviesa pega a tres mobs en orden y se clava en la pared; `ignore`, capas y
+  sensores filtran; un vuelo libre es `predict` bit a bit y no tiene tope de velocidad; un chunk
+  sin cargar la congela; un mob dormido recibe el golpe y despierta con el empujón del juego;
+  una ráfaga de 300 proyectiles da lo mismo bit a bit lejos del origen (2^31, 2^52, ±(2^61 -
+  1024)) y en varios hilos. Un tiro a quemarropa (creado dentro del mob) le pega una vez; una
+  flecha clavada vuela de nuevo si se le da velocidad; una pelota que cae se desliza sobre el
+  suelo.
+- `boxel_physics/tests/contacts.rs`: la escena llena da lo mismo bit a bit con todo el paso en
+  los hilos de cómputo, también lejos del origen. La pila de P3 corre con dormir apagado para
+  seguir contando los empujes de cada paso. `ReportContacts` avisa de una caja sobre una
+  plataforma estática y de un jugador contra una pared cinemática, y el contacto sigue cuando la
+  caja se duerme sobre un personaje despierto; un proyectil sin cuerpo dinámico no es
+  obstáculo; una consulta de caja infinita encuentra todos los cuerpos.
+- `boxel_physics/tests/grid.rs`: proptest de las piezas del barrido en paralelo
+  (`pair_ranges`, `pairs_in` en cualquier orden y `large_pairs`) contra `pairs`; consultas más
+  anchas de lo que cuenta un `u128` recorren los cuerpos en vez de desbordar.
+- `physics_sandbox` (sin ventana): F clava una flecha en una pared, F empuja a un mob y la flecha
+  desaparece, B tira una pelota que rebota y se duerme apoyada, M pone mobs que caminan.
+  `voxel_world`: el jugador quieto se duerme (la línea de física lo dice) y W lo despierta.
+- `stress`: las opciones nuevas, objetos que caen y se duermen todos, mobs que siguen caminando y
+  flechas que vuelven a volar y pegan.
+
+Costo de P4 (detalle en [rendimiento/fisicas-p4-2026-10](../rendimiento/fisicas-p4-2026-10.md)),
+medido de nuevo en un hilo después de la revisión, porque los objetivos del plan son en un hilo:
+un paso con 10 000 cuerpos, 9000 de ellos dormidos, cuesta 0.637 ms (objetivo 0.6 ms: no llega
+por 6 %; 0.447 ms con el paso en paralelo), y uno con 1000 flechas en vuelo 0.248 ms (objetivo
+0.3 ms; 0.156 ms en paralelo). Con 10 000 cuerpos despiertos cuesta 2.08 ms en los hilos de
+cómputo (4.76 ms en un hilo) y el objetivo era 1.5 ms: no se cumple. El movimiento ya va en
+paralelo (0.49 ms); lo que queda es lo de entre cuerpos (1.4 ms), casi todo en un hilo: juntar
+los cuerpos, meterlos en la grilla, los empujes y rehacer la grilla. `tick/1000` en un hilo baja
+de 0.403 a 0.355 ms porque los objetos tirados se duermen (los 0.26 ms medidos primero eran con
+el paso en paralelo); `tick/0` sube de 0.86 a 1.5 µs por los sistemas nuevos.
+
+Cambios de API de P4:
+
+- `PhysicsSystems` suma `Wake`, `Projectiles` y `Sleep`.
+- `PhysicsStats::summary` suma `sleeping`, `projectiles` y `hits`; `dynamic` cuenta los cuerpos
+  dinámicos despiertos del paso (congelados y proyectiles incluidos).
+- `PhysicsSettings` suma `sleep_speed`, `sleep_steps` y `parallel_threshold`.
+- `Collider` es inmutable y tiene un hook `on_discard`; `Sleeping` y `ReportContacts` tienen
+  hooks `on_add` y `on_remove`: no se les puede registrar otros.
+- `BodyIndex::entities` y `len` cuentan también los dormidos; `pairs` nunca da dos dormidos.
+- `boxel_physics` depende también de `boxel_tasks`.
+- `boxel_world::WorldPlugin` agrega dos mensajes; `ChunkMap` anota los cambios de datos.
+- El ejemplo `stress` pide la feature `physics`.
+
+Hecho (P3):
+
+- `boxel_physics::core`: `narrow` (`Contact`, `box_box`, `box_box_moving`, `sphere_sphere`,
+  `sphere_box`, `box_sphere`, `shape_contact`, `shape_box`) y `grid` (`Grid`, `BlockBounds`,
+  `CollisionLayers`, `CellRay`). `move_body` es la mitad del integrador que mueve y rebota, con
+  obstáculos (`step_body` la usa sin obstáculos).
+- Capa ECS: `BodyIndex`, `BodyFilter`, `BodyHit`, `RayFilter`, `RayHit`, `ReportContacts`,
+  `CollisionStarted`, `CollisionEnded`; `PhysicsQuery::{raycast, overlap_box, block_is_free,
+  bodies}`; `PhysicsSettings::{solver_passes, grid_shift}`; `PhysicsStats::{pairs, pushes,
+  overlaps, solve_time}` (la línea `physics` los muestra); `PhysicsSync::moved`.
+- `physics_sandbox`: C tira una caja sólida de 0.75 (peso 2) dos bloques adelante, y las cajas
+  se apilan. El jugador levanta los objetos que toca (su `CollisionStarted` con el sensor del
+  objeto; uno tirado con Q, recién después de 1 s). F3 muestra objetos levantados y cajas.
+- `voxel_world`: clic derecho no pone un bloque donde hay un cuerpo sólido (el jugador).
+
+Tests de P3:
+
+- `boxel_physics/tests/shapes.rs`: separación de caja contra caja, esfera contra esfera y esfera
+  contra caja contra respuestas analíticas (desempates, tocar no cuenta, NaN), `box_box_moving`
+  (hundida de más de media altura, apoyada, en diagonal, rozando un costado), y proptests:
+  mover por el vector deja las formas tocándose y nada menos alcanza.
+- `boxel_physics/tests/grid.rs`: proptest de pares contra fuerza bruta O(n²) con cuerpos chicos,
+  anchos y grandes, capas y activos al azar, cualquier tamaño de celda y lejos del origen, antes
+  y después de mover cuerpos; los mismos pares en cualquier lugar del mundo; consultas de caja
+  contra fuerza bruta; el recorrido de celdas de un rayo igual al DDA de vóxeles con celdas de 1
+  bloque, y con celdas de 4 cubre todos los bloques del DDA.
+- `boxel_physics/tests/far_coords.rs`: pares, contactos, rayos y consultas de una escena de
+  cuerpos corrida por 0, ±2^31, 2^40, 2^52 y ±(2^61 - 64): idénticos bit a bit.
+- `boxel_physics/tests/contacts.rs` (una `App` sin ventana): una pila de 4 cajas descansa
+  exacta y no cambia un bit en 1000 pasos; una caja que cae a 60 bloques/s queda encima, no
+  atraviesa; empujes en X y Z repartidos por peso; un empuje nunca mete un cuerpo en una pared;
+  un cinemático empuja una caja todo el camino y una plataforma que sube la lleva; colliders
+  estáticos como obstáculos (y los sensores y otras capas los atraviesan); un sensor avisa una
+  vez al entrar y una al salir, y un despawn termina el contacto; `ReportContacts`; capas que no
+  se aceptan se atraviesan; rayos contra cuerpos y bloques en orden, `max_t`, esferas exactas,
+  empezar adentro, `overlap_box` y `block_is_free`; un índice vacío antes del primer paso. Una
+  escena llena (mobs que deambulan, pilas de cajas, pelotas, objetos, un cinemático, un pilar y
+  una zona sensor entre paredes) da el mismo estado y los mismos eventos bit a bit en dos
+  corridas, a 64 o 144 fps, con o sin interpolación, y corrida por 2^31, 2^40, 2^52 y
+  ±(2^61 - 1024).
+- `physics_sandbox` (sin ventana): tres cajas tiradas en el mismo lugar quedan apiladas exacto, y
+  caminar hasta un objeto lo levanta. `voxel_world`: con el jugador caminando, clic derecho no
+  pone piedra en sus pies; volando, sí.
+- Probado a mano: cambiar `box_box_moving` por `box_box`, el empuje exacto por la profundidad, o
+  el manejo de la casa y de la lista `large` de la grilla hace fallar estos tests.
+
+Costo de P3 (detalle en [rendimiento/fisicas-p3-2026-10](../rendimiento/fisicas-p3-2026-10.md)):
+`tick/1000` sube de 0.23 a 0.40 ms (objetivo 0.5 ms) y `tick/100` de 24 a 33 µs (objetivo 50 µs):
+ahora incluye broadphase, solve y eventos, y los caminantes se empujan entre ellos. La grilla con
+1000 cuerpos cuesta 25 µs. Con 10 000 cuerpos tan repartidos como los del tick cuesta 0.48 ms, y
+el objetivo del plan era 0.3 ms: no se cumple. Con 10 000 apretados en 128 x 128 bloques cuesta
+1.2 ms.
+
+Cambios de API de P3:
+
+- `CollisionLayers` vive en `core::grid` (sigue en la raíz del crate) y suma `new`.
+- `Collider` requiere `RigidBody::Static`.
+- `PhysicsQuery` lee también `BodyIndex`.
+- `PhysicsStats::summary` suma `pairs`, `pushes`, `overlaps` y `solve`.
+- `Contacts::faces` y `on_ground` también cuentan los contactos con otros cuerpos.
 
 Hecho (P2):
 
@@ -362,11 +692,12 @@ Cambios de API de P0 y P1:
 - Un sistema agregado a `RunFixedMainLoop` sin set ahora queda ambiguo con el bucle: va en
   `BeforeFixedMainLoop` o `AfterFixedMainLoop`.
 
-Lo que falta: colisiones entre entidades (P3: grilla, empujes entre sólidos, sensores y sus
-eventos, capas, obstáculos estáticos y cinemáticos, raycast de entidades, `overlap_box` y la
-comprobación de lugar libre), proyectiles, dormir y paso en paralelo (P4), y todo P5. Los cuerpos
-no tienen dibujo: hace falta un renderer de entidades. Los mensajes del mundo que comparten física y luz
-(`BlockChanged`, carga y descarga de chunks) se acuerdan antes de P4.
+Lo que falta: medir la regla del frame con stress en ventana (`--bodies 1000` y `10000`, en las
+dos GPU), bajar el paso con 10 000 cuerpos despiertos a 1.5 ms (paralelizar lo que queda del
+broadphase, no rehacer la grilla después de los empujes) y la grilla de 10 000 a 0.3 ms (una
+grilla incremental), y todo P5. Los cuerpos no tienen dibujo: hace falta un renderer de entidades.
+`physics_sandbox` todavía no rompe ni pone bloques. La luz no usa `BlockChanged` ni
+`ChunkDataEvent` (se recalcula con las remallas), pero el mensaje sale de su lista de cambios.
 
 ## Alternativas descartadas
 

@@ -7,10 +7,10 @@ use crate::reference::Reference;
 use crate::streaming::WorldJobs;
 use crate::tests::support::LayerGen;
 use crate::{
-    ChunkMap, ChunkMeshEvent, ChunkViewer, EditQueue, Interest, MeshState, SkyMap, WorldContent,
-    WorldPlugin, WorldSettings, WorldStats,
+    BlockChanged, ChunkMap, ChunkMeshEvent, ChunkViewer, EditQueue, Interest, MeshState, SkyMap,
+    WorldContent, WorldPlugin, WorldSettings, WorldStats, WorldSystems,
 };
-use boxel_app::App;
+use boxel_app::{App, Update};
 use boxel_ecs::prelude::*;
 use boxel_mesh::MeshOptions;
 use boxel_tasks::{TaskPool, TaskPoolBuilder};
@@ -474,6 +474,80 @@ fn a_shaft_is_lit_to_its_bottom_and_dark_once_capped() {
     assert_eq!(app.world().resource::<SkyMap>().top(5, 6), Some(-1));
     assert_eq!(light_at(&app, bottom), LightValue::DARK);
     assert_eq!(light_at(&app, BlockPos::new(5, -2, 6)), LightValue::DARK);
+    assert_matches_reference(&app);
+}
+
+/// Every `BlockChanged` read in `Update` after the world's systems.
+#[derive(Resource, Default)]
+struct ChangeLog(Vec<BlockChanged>);
+
+fn log_changes(mut changes: MessageReader<BlockChanged>, mut log: ResMut<ChangeLog>) {
+    log.0.extend(changes.read().copied());
+}
+
+/// `BlockChanged` comes from the edits' per-voxel change list, the one that sizes the light's
+/// remeshes and moves the sky tops (ADR 0015, ADR 0016): one message per position that
+/// changed, from its state before the frame's first edit to after its last, in the order of
+/// the first edits whatever the chunks; the light of the result matches a rebuild from scratch.
+#[test]
+fn block_changed_comes_from_the_light_change_list() {
+    let (registry, lamps) = lamp_registry();
+    let generator = LayerGen::new(-3..=1);
+    let settings = WorldSettings {
+        vertical_bounds: Some(generator.vertical.clone()),
+        ..small()
+    };
+    let mut app = lit_app(generator, registry, settings, Arc::new(InlineExecutor));
+    app.init_resource::<ChangeLog>()
+        .add_systems(Update, log_changes.after(WorldSystems::Collect));
+    spawn(&mut app, ChunkPos::new(0, 0, 0), 1, 8);
+    settle(&mut app);
+    app.world_mut().resource_mut::<ChangeLog>().0.clear();
+    // `d`: first edited with what it holds, then stone. `a`: the stone at the sky top, dug (the
+    // top moves down) then a lamp (back up). `b`: stone over the ground in another chunk (the
+    // top moves up). `c`: a lamp in the stone of a third chunk, then stone again (no change).
+    // `e`: a lamp on the ground.
+    let (a, b, c, d, e) = (
+        BlockPos::new(5, -1, 6),
+        BlockPos::new(40, 3, 1),
+        BlockPos::new(-3, -5, 2),
+        BlockPos::new(7, 0, 7),
+        BlockPos::new(8, 0, 8),
+    );
+    edit(
+        &mut app,
+        &[
+            (d, BlockState::AIR),
+            (a, BlockState::AIR),
+            (b, STONE),
+            (c, lamps[0]),
+            (a, lamps[0]),
+            (d, STONE),
+            (c, STONE),
+            (e, lamps[1]),
+        ],
+    );
+    app.update();
+    let change = |pos, old, new| BlockChanged { pos, old, new };
+    assert_eq!(
+        app.world().resource::<ChangeLog>().0,
+        [
+            change(d, BlockState::AIR, STONE),
+            change(a, STONE, lamps[0]),
+            change(b, BlockState::AIR, STONE),
+            change(e, BlockState::AIR, lamps[1]),
+        ]
+    );
+    settle(&mut app);
+    let map = app.world().resource::<ChunkMap>();
+    assert_eq!(
+        [a, b, c, d, e].map(|p| map.block_at(p)),
+        [lamps[0], STONE, STONE, STONE, lamps[1]].map(Some)
+    );
+    let sky = app.world().resource::<SkyMap>();
+    assert_eq!((sky.top(5, 6), sky.top(40, 1)), (Some(-1), Some(3)));
+    // One voxel from the blue lamp (4, 6, 14) and seven from the orange one (14, 11, 6).
+    assert_eq!(light_at(&app, BlockPos::new(9, 0, 8)).rgb(), [7, 5, 13]);
     assert_matches_reference(&app);
 }
 
