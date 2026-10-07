@@ -2,7 +2,7 @@
 
 Documento técnico de referencia. Fecha: 2026-10-05. Estado: aprobado para el milestone M0
 (revisión final, después de tres revisiones adversariales del borrador v1).
-Las decisiones puntuales están en `docs/adr/` (0001 a 0019). Durante M0 hubo además una
+Las decisiones puntuales están en `docs/adr/` (0001 a 0020). Durante M0 hubo además una
 especificación para los agentes implementadores (en inglés, en `.scaffold/`), borrada al cerrar M0;
 este documento queda como referencia.
 
@@ -613,7 +613,8 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   con ids seguidos por bloque, y se escribe `boxel:stone_slab[type=top]` (`parse_state`,
   `state_name`, `property`, `with`). Como mucho `MAX_STATES` = 2^15 estados, así el bit alto del
   material del mesher queda libre. Tablas SoA por estado: nombre, capa de dibujo (`None`,
-  `Opaque`, `Cutout`, `Translucent`), modelo (`Cube { axis }`, `Slab`, `Cross`, ADR 0018),
+  `Opaque`, `Cutout`, `Translucent`), modelo (`Cube { axis }`, `Slab`, `Cross`, ADR 0018;
+  `Stairs`, `Fence`, `Torch`, `WallTorch`, ADR 0020, hechos de cajas en dieciseisavos),
   colisión (`None`, `Full` o cajas), flags, emisión RGB, opacidad de luz (15 en los cubos opacos,
   1 en hojas, agua y losas, 0 en vidrio y plantas), texturas por cara. Solo un cubo `Opaque`
   tapa caras vecinas (`BlockRegistry::occludes`). Contenido congelado: aire,
@@ -622,7 +623,10 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   (14, 11, 6), roja (14, 2, 2), azul (3, 6, 14) y blanca (15, 15, 15) y una lava provisoria
   (15, 7, 2), opaca y sólida hasta que haya fluidos (`boxel_voxel::LAMPS`, `LAVA_EMISSION`);
   desde ADR 0018, vidrio, `boxel:stone_slab[type=bottom|top|double]` (la doble es un cubo de
-  piedra), pasto corto, amapola y `boxel:log[axis=x|y|z]`.
+  piedra), pasto corto, amapola y `boxel:log[axis=x|y|z]`; desde ADR 0020, escaleras de piedra y
+  de roble, la valla de roble y las antorchas (de pie y de pared, emisión 14). La forma de una
+  escalera, los lados de una valla y el soporte de una antorcha siguen a sus vecinos
+  (`boxel_voxel::rules`, aplicadas por `boxel_world::NeighborRules` en cada lote de ediciones).
 - **Contenedor de paleta:** `Uniform(state)` | `Packed { palette, bits 1/2/4/8, words }` |
   `Direct(u16)`. Los índices nunca cruzan palabras de 64 bits. `set` agrega a la paleta en el
   lugar mientras entra; se compacta al guardar o en reposo. Medido en un mundo de 512x256x512:
@@ -790,10 +794,13 @@ un `Mesher` thread-local (~0.6 MiB de scratch) y un `LightScratch` (~0.7 MiB).
    así que un quad fusionado es exacto. Los quads salen ya canónicos (esquina mínima, `w` y `h`
    en los ejes u y v de la cara). Validado contra oráculos de fuerza bruta de caras visibles y de
    sombreado.
-4. **Bloques que no son cubos** (ADR 0018): después del greedy, un paso por bloque emite sus
-   quads de `w = h = 1` con un código de forma. Una cara de losa en el borde se oculta contra un
-   cubo opaco o una cara vecina que la cubre, y se sombrea como la cara del cubo en su lugar. Una
-   cruz son dos quads en las diagonales, en el bucket cutout, con la luz de su propia celda.
+4. **Bloques que no son cubos** (ADR 0018, ADR 0020): después del greedy, un paso por bloque
+   emite sus quads de `w = h = 1` con un código de forma. Losas, escaleras, vallas y antorchas
+   son cajas: una cara de caja (`SHAPE_BOX`) lleva en los bits de `w` y `h` el índice de su caja
+   en la tabla de `MaterialTable::model_boxes`, que el renderer guarda en el uniform `View`. Una
+   cara en el borde se oculta contra un cubo opaco o una cara vecina que la cubre, y se sombrea
+   como la parte de la cara del cubo en su lugar. Una cruz son dos quads en las diagonales, en el
+   bucket cutout, con la luz de su propia celda.
 5. **Buckets (8, congelados, ADR 0012):** 0 a 5 = caras opacas en orden `Face`; 6 = **cutout**
    (todas las caras de materiales cutout, como las hojas); 7 = translúcido. `ChunkMesh` guarda los
    quads contiguos por bucket, `bucket_counts[8]`, la paleta de luz y un hash de todo. En el arena
