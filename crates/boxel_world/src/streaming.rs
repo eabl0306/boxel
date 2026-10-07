@@ -772,19 +772,20 @@ impl WorldJobs {
     }
 
     /// Plans the work of a viewer or settings change, then applies interest work within
-    /// `settings.interest_budget`.
+    /// `budget` (`settings.interest_budget`, or more in a capped frame with time to spare).
     pub(crate) fn update_interest(
         &mut self,
         cx: &mut Ctx<'_>,
         settings: &WorldSettings,
         viewers: &[(u64, Viewer)],
+        budget: Duration,
     ) {
         {
             let _span = frame_span!("world.plan");
             self.plan_interest(cx, settings, viewers);
             self.plan_light(cx, settings, viewers);
         }
-        self.process_interest(cx, settings, settings.interest_budget);
+        self.process_interest(cx, settings, budget);
     }
 
     /// True if the viewers' chunks or the light cache radius changed since the last light plan.
@@ -1852,12 +1853,12 @@ impl WorldJobs {
     }
 
     /// The job step of a frame: collects finished jobs (freeing their in-flight slots) and starts
-    /// queued ones, again and again while results keep arriving, within `settings.job_budget`.
-    /// Collecting first means a slot freed by a job that finished since the last frame is reused
-    /// in this frame, not the next one.
-    pub(crate) fn run_jobs(&mut self, cx: &mut Ctx<'_>, settings: &WorldSettings) {
+    /// queued ones, again and again while results keep arriving, within `budget`
+    /// (`settings.job_budget`, or more in a capped frame with time to spare). Collecting first
+    /// means a slot freed by a job that finished since the last frame is reused in this frame,
+    /// not the next one.
+    pub(crate) fn run_jobs(&mut self, cx: &mut Ctx<'_>, budget: Duration) {
         let start = Instant::now();
-        let budget = settings.job_budget;
         loop {
             let collected = {
                 let _span = frame_span!("world.drain");

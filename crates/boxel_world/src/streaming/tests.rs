@@ -105,7 +105,9 @@ impl Harness {
 
     /// Applies `viewers` (sorted by id) fully.
     fn viewers(&mut self, viewers: &[(u64, Viewer)]) {
-        self.with(|jobs, cx, settings| jobs.update_interest(cx, settings, viewers));
+        self.with(|jobs, cx, settings| {
+            jobs.update_interest(cx, settings, viewers, settings.interest_budget);
+        });
         assert_eq!(self.jobs.interest_backlog(), 0, "unlimited budget");
         assert_eq!(self.jobs.scheduler.stale(), 0);
     }

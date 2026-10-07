@@ -75,6 +75,39 @@ impl FrameLimit {
     }
 }
 
+/// The pacing of the current frame, for systems that size their work to the time left before
+/// the next one (`boxel_world` grows its per-frame budgets into the idle part of a capped
+/// frame). Both runners write it right before each update. Without a limit (or a runner that
+/// paces) `next` is `None`, and such systems keep their fixed budgets.
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameDeadline {
+    /// When the next frame is due (`None`: unlimited, or no pacing runner).
+    pub next: Option<Instant>,
+    /// The period that deadline was set with: the [`FrameLimit`] period, the display's while
+    /// the winit runner follows it, at least 33 ms while the window is hidden (`None` with
+    /// `next`).
+    pub period: Option<Duration>,
+    /// How long the previous update took, start to end (zero before the first).
+    pub last_update: Duration,
+}
+
+impl FrameDeadline {
+    /// The deadline after a frame that `pacer` just started under `period`, following an
+    /// update that took `last_update`.
+    pub fn after_start(
+        pacer: &FramePacer,
+        period: Option<Duration>,
+        last_update: Duration,
+    ) -> Self {
+        let next = pacer.next_frame(period);
+        Self {
+            next,
+            period: next.and(period),
+            last_update,
+        }
+    }
+}
+
 /// What a runner does before the next frame (see [`FramePacer::wait`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameWait {

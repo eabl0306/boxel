@@ -4,6 +4,12 @@
 //! display: nothing presents here, so the redraws come at once and the limit's grid must govern
 //! even when the limit matches the monitor (ADR 0017).
 //!
+//! That last check cannot catch a display lock that should not happen, only document it: on
+//! Wayland the window is never mapped (nothing is drawn), so winit reports no monitor and no
+//! refresh rate, and the redraws come at once; on X11 the gate never follows frame callbacks.
+//! Either way `display_locked` stays false. The display lock itself is covered by the unit
+//! tests of `RunnerCore` in `src/runner.rs`.
+//!
 //! Opt-in (`BOXEL_WINDOW_TESTS=1`, or `just test-window`): it opens a window on the desktop
 //! (on Wayland it is never mapped, since nothing is drawn) and its timing needs a machine that
 //! is not saturated. Without the variable it prints a note and passes. A watchdog thread kills
