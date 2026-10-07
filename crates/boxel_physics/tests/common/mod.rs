@@ -8,9 +8,9 @@ use boxel_voxel::{BlockPos, BlockRegistry, BlockState};
 /// `boxel:stone` in `BlockRegistry::default_blocks()`.
 pub const STONE: BlockState = BlockState(1);
 /// `boxel:leaves` (cutout, solid).
-pub const LEAVES: BlockState = BlockState(9);
+pub const LEAVES: BlockState = BlockState(11);
 /// `boxel:water` (translucent fluid, not solid).
-pub const WATER: BlockState = BlockState(10);
+pub const WATER: BlockState = BlockState(12);
 
 /// A stone slab in the lower half of its block (top at 0.5). Slabs are built only here and in
 /// [`top_slab`], so a change in how slab states are named touches one place.

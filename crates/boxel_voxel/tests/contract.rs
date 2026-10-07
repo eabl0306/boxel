@@ -113,7 +113,8 @@ fn decode_matches_get_for_hand_built_packed() {
 fn default_registry_ids_shapes_and_faces_are_frozen() {
     use boxel_voxel::{BlockRegistry, BlockState, Face, RenderShape};
     let r = BlockRegistry::default_blocks();
-    let names = [
+    // Every state, in id order (ADR 0019: a block's states are contiguous).
+    let states = [
         "boxel:air",
         "boxel:stone",
         "boxel:dirt",
@@ -122,7 +123,9 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
         "boxel:gravel",
         "boxel:snow",
         "boxel:bedrock",
-        "boxel:log",
+        "boxel:log[axis=x]",
+        "boxel:log[axis=y]",
+        "boxel:log[axis=z]",
         "boxel:leaves",
         "boxel:water",
         "boxel:planks",
@@ -132,19 +135,32 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
         "boxel:lamp_white",
         "boxel:lava",
         "boxel:glass",
-        "boxel:stone_slab",
-        "boxel:stone_slab_top",
+        "boxel:stone_slab[type=bottom]",
+        "boxel:stone_slab[type=top]",
+        "boxel:stone_slab[type=double]",
         "boxel:short_grass",
         "boxel:poppy",
-        "boxel:log_x",
-        "boxel:log_z",
     ];
-    assert_eq!(r.len(), names.len());
-    for (i, n) in names.iter().enumerate() {
-        assert_eq!(r.by_name(n), Some(BlockState(i as u16)), "{n}");
+    assert_eq!(r.len(), states.len());
+    for (i, n) in states.iter().enumerate() {
+        let s = BlockState(i as u16);
+        assert_eq!(r.parse_state(n), Ok(s), "{n}");
+        assert_eq!(r.state_name(s).to_string(), *n);
     }
-    assert_eq!(r.shape(BlockState(9)), RenderShape::Cutout);
-    assert_eq!(r.shape(BlockState(10)), RenderShape::Translucent);
+    assert_eq!(r.block_count(), 21);
+    // A plain name is the default state.
+    assert_eq!(r.by_name("boxel:log"), Some(BlockState(9)));
+    assert_eq!(r.by_name("boxel:stone_slab"), Some(BlockState(20)));
+    assert_eq!(
+        r.by_name("boxel:log[axis=x]"),
+        None,
+        "by_name takes a block name"
+    );
+    for gone in ["boxel:log_x", "boxel:log_z", "boxel:stone_slab_top"] {
+        assert_eq!(r.by_name(gone), None, "{gone}");
+    }
+    assert_eq!(r.shape(BlockState(11)), RenderShape::Cutout);
+    assert_eq!(r.shape(BlockState(12)), RenderShape::Translucent);
     assert_eq!(r.shape(BlockState(1)), RenderShape::Opaque);
     let grass = BlockState(3);
     let tex = |s, f| r.textures()[r.face_texture(s, f).0 as usize].name.clone();
@@ -153,22 +169,22 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
     assert_eq!(tex(grass, Face::PosX), "boxel:grass_side");
     assert_eq!(r.textures().len(), 21);
     // The emitters: opaque solid cubes with their own texture.
-    for (i, name) in names.iter().enumerate().skip(12).take(5) {
+    for (i, name) in states.iter().enumerate().skip(14).take(5) {
         let s = BlockState(i as u16);
         assert_eq!(r.shape(s), RenderShape::Opaque, "{name}");
         assert_eq!(tex(s, Face::PosX), *name);
     }
     // ADR 0018: shapes, collision and light of the non-cube blocks and the turned logs.
-    let by = |n: &str| r.by_name(n).unwrap();
+    let by = |n: &str| r.parse_state(n).unwrap();
     let glass = by("boxel:glass");
     assert_eq!(r.shape(glass), RenderShape::Translucent);
     assert_eq!(r.collision(glass), &BlockCollision::Full);
     assert_eq!(r.light_opacity(glass), 0);
     assert!(!r.flags(glass).contains(StateFlags::FLUID));
-    assert!(r.flags(BlockState(10)).contains(StateFlags::FLUID));
+    assert!(r.flags(BlockState(12)).contains(StateFlags::FLUID));
     for (name, half) in [
-        ("boxel:stone_slab", SlabHalf::Bottom),
-        ("boxel:stone_slab_top", SlabHalf::Top),
+        ("boxel:stone_slab[type=bottom]", SlabHalf::Bottom),
+        ("boxel:stone_slab[type=top]", SlabHalf::Top),
     ] {
         let s = by(name);
         assert_eq!(r.model(s), BlockModel::Slab(half));
@@ -181,6 +197,18 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
         assert_eq!(r.light_opacity(s), 1);
         assert_eq!(tex(s, Face::PosY), "boxel:stone");
     }
+    // ADR 0019: the double slab is a stone cube in every respect.
+    let double = by("boxel:stone_slab[type=double]");
+    let stone = BlockState(1);
+    assert_eq!(r.model(double), BlockModel::CUBE);
+    assert_eq!(r.shape(double), RenderShape::Opaque);
+    assert_eq!(r.collision(double), &BlockCollision::Full);
+    assert_eq!(r.light_opacity(double), 15);
+    assert_eq!(r.flags(double), r.flags(stone));
+    assert!(r.occludes(double));
+    for face in Face::ALL {
+        assert_eq!(r.face_texture(double, face), r.face_texture(stone, face));
+    }
     for name in ["boxel:short_grass", "boxel:poppy"] {
         let s = by(name);
         assert_eq!(r.model(s), BlockModel::Cross);
@@ -192,7 +220,13 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
     }
     assert!(r.occludes(BlockState(1)));
     // Logs: the end texture across the axis, the bark turned on the faces along it.
-    let (log, log_x, log_z) = (BlockState(8), by("boxel:log_x"), by("boxel:log_z"));
+    let (log_x, log, log_z) = (BlockState(8), BlockState(9), BlockState(10));
+    for s in [log_x, log, log_z] {
+        assert_eq!(r.shape(s), RenderShape::Opaque);
+        assert!(r.occludes(s));
+        assert_eq!(r.light_opacity(s), 15);
+        assert_eq!(r.collision(s), &BlockCollision::Full);
+    }
     for face in Face::ALL {
         let end = |s| tex(s, face) == "boxel:log_top";
         assert_eq!(

@@ -12,15 +12,20 @@ use boxel_voxel::{BlockPos, BlockRegistry, BlockState, Face, WorldPos};
 use common::{Rng, STONE, WATER, at, fill, table};
 
 fn state(name: &str) -> BlockState {
-    BlockRegistry::default_blocks().by_name(name).unwrap()
+    BlockRegistry::default_blocks().parse_state(name).unwrap()
 }
 
 fn bottom() -> BlockState {
-    state("boxel:stone_slab")
+    state("boxel:stone_slab[type=bottom]")
 }
 
 fn top() -> BlockState {
-    state("boxel:stone_slab_top")
+    state("boxel:stone_slab[type=top]")
+}
+
+/// Both halves (ADR 0019): a full cube.
+fn double() -> BlockState {
+    state("boxel:stone_slab[type=double]")
 }
 
 /// A 0.5 x 1.75 x 0.5 box with its origin at the feet (binary fractions: exact positions).
@@ -53,6 +58,10 @@ fn the_table_follows_the_block_collision_and_model() {
         CollisionShape::Boxes(&[half(0.0, 0.5)])
     );
     assert!(t.collides(bottom()) && !t.is_full(bottom()));
+    // The double slab collides and is picked like stone.
+    assert_eq!(t.shape(double()), CollisionShape::Full);
+    assert_eq!(t.outline(double()), CollisionShape::Full);
+    assert!(t.is_full(double()) && !t.is_fluid(double()));
     for plant in [state("boxel:short_grass"), state("boxel:poppy")] {
         assert_eq!(t.shape(plant), CollisionShape::Empty);
         assert!(!t.collides(plant) && t.has_outline(plant));
@@ -130,17 +139,17 @@ fn a_body_inside_a_slab_is_pushed_out() {
     );
 }
 
-/// A random field of stone, bottom slabs and top slabs in `0..size` (air elsewhere).
+/// A random field of stone, bottom, top and double slabs in `0..size` (air elsewhere).
 fn shaped_field(size: i64, density: f64, seed: u64) -> (TestWorld, Vec<(BlockPos, BlockState)>) {
     let mut world = TestWorld::new();
     let mut rng = Rng(seed);
     let mut blocks = Vec::new();
-    let kinds = [STONE, bottom(), top()];
+    let kinds = [STONE, bottom(), top(), double()];
     for y in 0..size {
         for x in 0..size {
             for z in 0..size {
                 if rng.unit() < density {
-                    let s = kinds[(rng.next() % 3) as usize];
+                    let s = kinds[(rng.next() % kinds.len() as u64) as usize];
                     let p = BlockPos::new(x, y, z);
                     world.set(p, s);
                     blocks.push((p, s));

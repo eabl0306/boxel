@@ -6,7 +6,9 @@
 //!   `(y << 10) | (x << 5) | z` (z fastest), the same order as binary-greedy-meshing's padded
 //!   linearization.
 //! - [`registry`]: data-driven blocks; runtime `BlockState(u16)` is dense and never persisted raw.
-//!   Each block has an RGB emission and a light opacity (ADR 0015).
+//!   Each state has an RGB emission and a light opacity (ADR 0015).
+//! - [`state`]: block state properties (ADR 0019): `boxel:log[axis=x]`, one dense id per
+//!   combination of values, contiguous per block.
 //! - [`storage`]: Minecraft-style paletted container (Uniform | Packed 1/2/4/8 bits | Direct u16).
 //! - [`light`]: the light value format ([`LightValue`]) and the per-state [`LightTables`]. Light
 //!   itself is derived data, computed by `boxel_light`; chunks do not store it.
@@ -18,6 +20,7 @@
 pub mod coords;
 pub mod light;
 pub mod registry;
+pub mod state;
 pub mod storage;
 
 mod chunk;
@@ -32,10 +35,11 @@ pub use coords::{
 pub use light::{LightTables, LightValue, MAX_LIGHT, OPAQUE_OPACITY};
 pub use masks::{LightMasks, MaskRows, MaskWords, OwnedLightMasks};
 pub use registry::{
-    Axis, BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockRegistryBuilder, BlockState,
-    BuiltinLamp, CollisionBox, FaceTextures, LAMPS, LAVA_EMISSION, RegistryError, RenderShape,
-    SlabHalf, StateFlags, TextureId, TexturePattern, TextureSpec,
+    Axis, BlockCollision, BlockDef, BlockId, BlockModel, BlockRegistry, BlockRegistryBuilder,
+    BlockState, BuiltinLamp, CollisionBox, FaceTextures, LAMPS, LAVA_EMISSION, MAX_STATES,
+    RegistryError, RenderShape, SlabHalf, StateFlags, TextureId, TexturePattern, TextureSpec,
 };
+pub use state::{Property, StateName, StateParseError, StateValues};
 pub use storage::{Occupancy, Paletted};
 
 /// Common items.
