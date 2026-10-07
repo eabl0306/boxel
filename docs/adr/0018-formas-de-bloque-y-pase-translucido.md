@@ -1,6 +1,7 @@
 # ADR 0018: formas de bloque y pase translúcido
 
-- Estado: aceptado (primera parte de la issue #38, y la issue #16)
+- Estado: aceptado (primera parte de la issue #38, y la issue #16). Las variantes de tronco y de
+  losa pasaron a ser estados de bloque en el ADR 0019, que cambia los ids de esta parte.
 - Fecha: 2026-10-07
 
 ## Contexto
@@ -132,8 +133,9 @@ completa, así no se ve un hueco debajo de un muelle.
 
 ## Fuera de esta parte
 
-Líquidos que fluyen, escaleras, cercas, antorchas y estados de bloque más allá de eje y mitad
-(hoy cada variante es un estado propio, como `boxel:log_x`).
+Líquidos que fluyen, escaleras, cercas y antorchas. Los estados de bloque ya están hechos
+(ADR 0019): `boxel:log[axis=x|y|z]` reemplaza a `boxel:log_x` y `boxel:log_z`, y
+`boxel:stone_slab[type=bottom|top|double]` a `boxel:stone_slab_top`, con la losa doble.
 
 ## Alternativas descartadas
 

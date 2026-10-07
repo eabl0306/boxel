@@ -311,10 +311,41 @@ fn heightmap_equals_the_terrain_generator() {
     }
 }
 
-/// Fingerprint (log count, FNV-1a of every voxel state) of the 3x3 chunk columns from
-/// `(x, z)`, layers 1..=4.
+/// The state ids of the built-in blocks before block states (ADR 0019), which the recorded
+/// fingerprints hash: a state's index here (the log only upright).
+const RECORDED_IDS: [&str; 17] = [
+    "boxel:air",
+    "boxel:stone",
+    "boxel:dirt",
+    "boxel:grass",
+    "boxel:sand",
+    "boxel:gravel",
+    "boxel:snow",
+    "boxel:bedrock",
+    "boxel:log[axis=y]",
+    "boxel:leaves",
+    "boxel:water",
+    "boxel:planks",
+    "boxel:lamp_orange",
+    "boxel:lamp_red",
+    "boxel:lamp_blue",
+    "boxel:lamp_white",
+    "boxel:lava",
+];
+
+/// Fingerprint (log count, FNV-1a of every voxel state as its [`RECORDED_IDS`] index) of the
+/// 3x3 chunk columns from `(x, z)`, layers 1..=4.
 fn forest_fingerprint(g: &dyn WorldGenerator, r: &BlockRegistry, x: i64, z: i64) -> (usize, u64) {
     let log = r.by_name("boxel:log");
+    let recorded: Vec<Option<u16>> = (0..r.len())
+        .map(|s| {
+            let name = r.state_name(BlockState(s as u16)).to_string();
+            RECORDED_IDS
+                .iter()
+                .position(|n| *n == name)
+                .map(|i| i as u16)
+        })
+        .collect();
     let (mut logs, mut h) = (0, 0xcbf2_9ce4_8422_2325u64);
     for dz in 0..3 {
         for dx in 0..3 {
@@ -322,7 +353,8 @@ fn forest_fingerprint(g: &dyn WorldGenerator, r: &BlockRegistry, x: i64, z: i64)
                 let d = dense(g, r, ChunkPos::new(x + dx, y, z + dz));
                 logs += d.iter().filter(|s| Some(**s) == log).count();
                 for s in &d {
-                    for b in u64::from(s.0).to_le_bytes() {
+                    let id = recorded[usize::from(s.0)].expect("a block of the recording");
+                    for b in u64::from(id).to_le_bytes() {
                         h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
                     }
                 }

@@ -12,7 +12,8 @@
 //! F shoots an arrow along the view at 60 blocks/s (a `Projectile`: it sticks in the block it
 //! hits, and a mob it hits is knocked back and the arrow is gone), B throws a bouncy ball (a
 //! sphere with restitution 0.6 that bounces until it rests), M spawns four mobs ahead (solid
-//! walkers that change direction every few seconds). Bodies that rest fall asleep. F3 shows the
+//! walkers that change direction every few seconds), T builds a stair of slabs ahead (walk up it
+//! without jumping: the step-up). Bodies that rest fall asleep. F3 shows the
 //! debug overlay with the player's state, a physics line (bodies, sleeping, pairs, pushes,
 //! impacts, projectiles, step time), the items, the crates and the arrows, balls and mobs.
 //! Bodies have no renderer yet: they show on F3 only.
@@ -41,8 +42,8 @@ use boxel::gfx::CLI_HELP;
 use boxel::physics::{Frozen, PhysicsStats, ProjectileHit, ProjectileTarget};
 use boxel::prelude::*;
 use boxel::render::GpuFailed;
-use boxel::world::WorldSystems;
-use player::{Player, WalkPlugin, follow_player};
+use boxel::world::{WorldContent, WorldSystems};
+use player::{EYE_HEIGHT, Player, WalkPlugin, follow_player};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 use world::{World, WorldChoice};
@@ -61,7 +62,7 @@ usage: physics_sandbox [GPU options] [options]
   --debug-overlay         start with the F3 debug overlay visible (F3 toggles it)
   --help                  this text
 keys: WASD walk, Space jump, G fly/walk, Q drop an item, C drop a crate, F shoot an arrow,
-  B throw a ball, M spawn mobs, F3 overlay, Escape frees the mouse
+  B throw a ball, M spawn mobs, T build a stair of slabs, F3 overlay, Escape frees the mouse
 exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 drop test failed, 4 timeout";
 
 /// Default `--timeout` for automation runs.
@@ -80,6 +81,11 @@ const ARROW_KEY: KeyCode = KeyCode::KeyF;
 const BALL_KEY: KeyCode = KeyCode::KeyB;
 /// Spawns mobs.
 const MOB_KEY: KeyCode = KeyCode::KeyM;
+/// Builds a stair of slabs ahead.
+const STAIRS_KEY: KeyCode = KeyCode::KeyT;
+/// The stair: steps half a block high, three blocks wide, then a landing of this many blocks.
+const STAIR_STEPS: i64 = 6;
+const STAIR_LANDING: i64 = 3;
 /// Arrow speed, blocks per second (Minecraft's fully drawn bow).
 const ARROW_SPEED: f64 = 60.0;
 /// Half the edge of an arrow's box, blocks.
@@ -487,8 +493,8 @@ struct Pickup {
 }
 
 /// Items ([`DROP_KEY`] drops one, the player picks them up), crates ([`CRATE_KEY`]), arrows
-/// ([`ARROW_KEY`]), balls ([`BALL_KEY`]), mobs ([`MOB_KEY`]), the drop test and the F3 `items`,
-/// `crates` and `hunt` lines. Needs `WalkPlugin`.
+/// ([`ARROW_KEY`]), balls ([`BALL_KEY`]), mobs ([`MOB_KEY`]), stairs ([`STAIRS_KEY`]), the
+/// drop test and the F3 `items`, `crates` and `hunt` lines. Needs `WalkPlugin`.
 struct SandboxPlugin {
     drop_test: bool,
 }
@@ -519,6 +525,13 @@ impl Plugin for SandboxPlugin {
             )
                 .chain()
                 .in_set(SandboxSystems),
+        )
+        // The stair goes in with this frame's edits.
+        .add_systems(
+            Update,
+            build_stairs
+                .after(follow_player)
+                .before(WorldSystems::Edits),
         )
         .add_systems(FixedUpdate, wander);
     }
@@ -574,6 +587,55 @@ fn drop_crates(
     let ahead = DVec3::new(forward.x, 0.0, forward.z).normalize_or(DVec3::NEG_Z);
     let at = WorldPos::from_dvec3(eye.translation).offset(ahead * 2.0 + DVec3::Y);
     commands.spawn(crate_body(at));
+}
+
+/// [`STAIRS_KEY`] builds a stair two blocks ahead of the active camera, along the axis it faces
+/// most: a bottom slab, then a full block, half a block higher each step ([`STAIR_STEPS`]), and
+/// a landing at the top, filled with stone underneath. The player walks up it without jumping
+/// (the step-up of its `CharacterController`).
+fn build_stairs(
+    keys: Res<ButtonInput<KeyCode>>,
+    content: Res<WorldContent>,
+    cameras: Query<(&Camera, &Transform, &FlyCamera)>,
+    mut edits: ResMut<EditQueue>,
+) {
+    if !keys.just_pressed(STAIRS_KEY) {
+        return;
+    }
+    let Some(eye) = active_eye(cameras) else {
+        return;
+    };
+    let (Some(stone), Some(slab)) = (
+        content.registry.by_name("boxel:stone"),
+        content
+            .registry
+            .parse_state("boxel:stone_slab[type=bottom]")
+            .ok(),
+    ) else {
+        return;
+    };
+    let forward = eye.forward().as_dvec3();
+    let (ahead, side) = if forward.x.abs() > forward.z.abs() {
+        (I64Vec3::new(forward.x.signum() as i64, 0, 0), I64Vec3::Z)
+    } else {
+        (I64Vec3::new(0, 0, forward.z.signum() as i64), I64Vec3::X)
+    };
+    let feet = WorldPos::from_dvec3(eye.translation).offset(DVec3::new(0.0, -EYE_HEIGHT, 0.0));
+    let start = feet.block.as_i64vec3() + ahead * 2;
+    for i in 0..STAIR_STEPS + STAIR_LANDING {
+        let top = i.min(STAIR_STEPS - 1) / 2;
+        for w in -1..=1 {
+            let column = start + ahead * i + side * w;
+            for y in 0..=top {
+                let state = if y == top && i % 2 == 0 && i < STAIR_STEPS {
+                    slab
+                } else {
+                    stone
+                };
+                edits.set_block(BlockPos::from_i64vec3(column + I64Vec3::Y * y), state);
+            }
+        }
+    }
 }
 
 /// The player picks up the items it touches: a `CollisionStarted` between the player's solid box
@@ -1301,5 +1363,49 @@ mod tests {
         assert!(pos.to_dvec3().z < -1.0, "{pos:?}");
         assert!((pos.to_dvec3().x - 0.5).abs() < 1e-9, "{pos:?}");
         assert!(velocity.length() < REST_SPEED);
+    }
+
+    #[test]
+    fn t_builds_a_stair_the_player_walks_up_with_a_smooth_eye() {
+        let mut app = standing_app();
+        tap(&mut app, STAIRS_KEY);
+        for _ in 0..4 {
+            app.update();
+        }
+        let heights = |app: &mut App| {
+            let world = app.world_mut();
+            let feet = world
+                .query_filtered::<&Transform, With<Player>>()
+                .single(world)
+                .expect("walking")
+                .translation
+                .y;
+            let eye = world
+                .query_filtered::<&Transform, With<FlyCamera>>()
+                .single(world)
+                .expect("camera")
+                .translation
+                .y;
+            (feet, eye)
+        };
+        // W walks north up the stair without jumping: the eye trails each step by at most the
+        // step, never more, and catches up.
+        key(&mut app, KeyCode::KeyW, true);
+        let mut trailed = false;
+        for _ in 0..128 {
+            app.update();
+            let (feet, eye) = heights(&mut app);
+            let lag = feet + EYE_HEIGHT - eye;
+            assert!((0.0..=0.5).contains(&lag), "{lag}");
+            trailed |= lag > 0.1;
+        }
+        key(&mut app, KeyCode::KeyW, false);
+        for _ in 0..32 {
+            app.update();
+        }
+        assert!(trailed, "the eye smooths the steps");
+        let (feet, eye) = heights(&mut app);
+        assert_eq!(feet, 7.0, "on the landing, three blocks up");
+        assert_eq!(eye, feet + EYE_HEIGHT);
     }
 }

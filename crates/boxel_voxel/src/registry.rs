@@ -1,7 +1,15 @@
-//! Data-driven block registry. M0: one state per block (no properties yet); `BlockState(u16)` is
-//! the dense runtime id (`0` = air), assigned in registration order. Frozen before the world
-//! loads and shared as `Arc<BlockRegistry>`.
+//! Data-driven block registry. A block has state properties (ADR 0019, [`Property`]); every
+//! combination of their values is one `BlockState(u16)`, the dense runtime id (`0` = air),
+//! assigned in registration order and contiguous per block. Every per-state datum (model,
+//! collision, textures, light) lives in flat arrays indexed by the state id. Frozen before the
+//! world loads and shared as `Arc<BlockRegistry>`.
+use crate::state::{Property, StateName, StateParseError, StateValues, split_state};
 use crate::{Face, LightValue, OPAQUE_OPACITY};
+
+/// Most states a registry holds: `2^15`. The mesher's material id is the state id, and its top
+/// bit (`boxel_mesh::FLUID_SURFACE_BIT`) marks fluid surface cells, so every state id must stay
+/// below it.
+pub const MAX_STATES: usize = 1 << 15;
 
 /// Dense runtime block state id. `BlockState::AIR == BlockState(0)`. Never persisted raw
 /// (persistence will store names through an id map, M1).
@@ -46,6 +54,34 @@ pub enum Axis {
     Y,
     /// Z.
     Z,
+}
+
+impl Axis {
+    /// The axes in order.
+    pub const ALL: [Axis; 3] = [Axis::X, Axis::Y, Axis::Z];
+
+    /// The axis a face is across (`PosX` and `NegX` -> `X`).
+    pub const fn of_face(face: Face) -> Axis {
+        match face {
+            Face::PosX | Face::NegX => Axis::X,
+            Face::PosY | Face::NegY => Axis::Y,
+            Face::PosZ | Face::NegZ => Axis::Z,
+        }
+    }
+
+    /// `x`, `y` or `z`: the value of an `axis` state property.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Axis::X => "x",
+            Axis::Y => "y",
+            Axis::Z => "z",
+        }
+    }
+
+    /// The axis named `x`, `y` or `z`.
+    pub fn from_name(name: &str) -> Option<Axis> {
+        Axis::ALL.into_iter().find(|a| a.name() == name)
+    }
 }
 
 /// Which half of its cell a slab fills.
@@ -358,10 +394,12 @@ impl FaceTextures {
     }
 }
 
-/// Block definition.
+/// Block definition: the data of one state. A block with state properties
+/// ([`BlockRegistryBuilder::add_block_with_states`]) starts every state from one `BlockDef` and
+/// a function adjusts it per state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockDef {
-    /// Namespaced unique name (`"boxel:stone"`).
+    /// Namespaced unique name (`"boxel:stone"`), the same for every state of the block.
     pub name: String,
     /// Render layer.
     pub shape: RenderShape,
@@ -389,9 +427,13 @@ pub enum RegistryError {
     /// Name must be `namespace:path` with `[a-z0-9_]` parts.
     #[error("invalid name {0}")]
     InvalidName(String),
-    /// More than 4096 textures or 65535 states.
+    /// More than 4096 textures or [`MAX_STATES`] states.
     #[error("registry full: {0}")]
     Full(&'static str),
+    /// A property of the block with an invalid name or value, no values, a default that is not
+    /// one of them, or a name used twice.
+    #[error("invalid state property of {0}")]
+    InvalidProperty(String),
     /// Texture id not registered.
     #[error("unknown texture id {0}")]
     UnknownTexture(u16),
@@ -404,28 +446,60 @@ pub enum RegistryError {
     InvalidCollision(String),
 }
 
+/// Index of a block (not of a state) in its registry, in registration order (`0` = air).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct BlockId(pub u16);
+
+/// One block of the registry: its name, its properties and where its states are.
+#[derive(Clone, Debug)]
+struct BlockInfo {
+    name: String,
+    /// The first state of the block; its states are `first..first + count`.
+    first: u16,
+    count: u16,
+    /// The default state (every property at its default value).
+    default: u16,
+    /// Sorted by name.
+    properties: Vec<Property>,
+    /// Id step of each property: the last one varies fastest (stride 1).
+    strides: Vec<u16>,
+}
+
+impl BlockInfo {
+    fn values(&self, state: BlockState) -> StateValues<'_> {
+        StateValues {
+            properties: &self.properties,
+            strides: &self.strides,
+            offset: state.0 - self.first,
+        }
+    }
+}
+
 /// Builder; `boxel:air` is pre-registered as `BlockState(0)`.
 #[derive(Debug, Default)]
 pub struct BlockRegistryBuilder {
     textures: Vec<TextureSpec>,
-    blocks: Vec<BlockDef>,
+    /// One per state, in state order.
+    states: Vec<BlockDef>,
+    blocks: Vec<BlockInfo>,
 }
 
 impl BlockRegistryBuilder {
     /// New builder with `boxel:air` (state 0, shape `None`, texture 0 unused).
     pub fn new() -> Self {
-        Self {
-            textures: Vec::new(),
-            blocks: vec![BlockDef {
-                name: "boxel:air".to_string(),
-                shape: RenderShape::None,
-                model: BlockModel::CUBE,
-                collision: BlockCollision::None,
-                emission: [0; 3],
-                light_opacity: 0,
-                textures: FaceTextures::all(TextureId(0)),
-            }],
-        }
+        let mut b = Self::default();
+        b.add_block(BlockDef {
+            name: "boxel:air".to_string(),
+            shape: RenderShape::None,
+            model: BlockModel::CUBE,
+            collision: BlockCollision::None,
+            emission: [0; 3],
+            light_opacity: 0,
+            textures: FaceTextures::all(TextureId(0)),
+        })
+        .expect("air");
+        b
     }
 
     /// A builder with the built-in M0 content of [`BlockRegistry::default_blocks`], to add more
@@ -539,16 +613,27 @@ impl BlockRegistryBuilder {
             block("gravel", opaque, true, all(gravel)),
             block("snow", opaque, true, all(snow)),
             block("bedrock", opaque, true, all(bedrock)),
-            block(
-                "log",
-                opaque,
-                true,
-                FaceTextures {
-                    top: log_top,
-                    bottom: log_top,
-                    side: log_side,
-                },
-            ),
+        ] {
+            b.add_block(def).expect("built-in block");
+        }
+        // The log lies along its `axis` (ADR 0018, 0019): the end texture on the faces across it.
+        let log_textures = FaceTextures {
+            top: log_top,
+            bottom: log_top,
+            side: log_side,
+        };
+        b.add_block_with_states(
+            block("log", opaque, true, log_textures),
+            vec![Property::new("axis", ["x", "y", "z"]).with_default("y")],
+            |state, def| {
+                let axis = state.get("axis").and_then(Axis::from_name);
+                def.model = BlockModel::Cube {
+                    axis: axis.unwrap_or_default(),
+                };
+            },
+        )
+        .expect("built-in log");
+        for def in [
             block("leaves", RenderShape::Cutout, true, all(leaves)),
             BlockDef {
                 model: BlockModel::Fluid,
@@ -572,14 +657,10 @@ impl BlockRegistryBuilder {
             };
             b.add_block(def).expect("built-in emitter");
         }
-        // Non-cube blocks and the turned logs (ADR 0018). Glass is a clear cube: light and sky
-        // pass (opacity 0). Slabs let light through at the cost of leaves (a slab roof is not
-        // dark; opacity 1 keeps the light flood on its fast path). Plants stop nothing.
-        let log_textures = FaceTextures {
-            top: log_top,
-            bottom: log_top,
-            side: log_side,
-        };
+        // Non-cube blocks (ADR 0018). Glass is a clear cube: light and sky pass (opacity 0).
+        // Slabs let light through at the cost of leaves (a slab roof is not dark; opacity 1 keeps
+        // the light flood on its fast path); a double slab is a plain stone cube. Plants stop
+        // nothing.
         let model = |name: &str, shape, model: BlockModel, opacity, textures| BlockDef {
             name: format!("boxel:{name}"),
             shape,
@@ -589,15 +670,15 @@ impl BlockRegistryBuilder {
             light_opacity: opacity,
             textures,
         };
-        let cube_on = |axis| BlockModel::Cube { axis };
-        for def in [
-            model(
-                "glass",
-                RenderShape::Translucent,
-                BlockModel::CUBE,
-                0,
-                all(glass),
-            ),
+        b.add_block(model(
+            "glass",
+            RenderShape::Translucent,
+            BlockModel::CUBE,
+            0,
+            all(glass),
+        ))
+        .expect("built-in glass");
+        b.add_block_with_states(
             model(
                 "stone_slab",
                 opaque,
@@ -605,13 +686,22 @@ impl BlockRegistryBuilder {
                 1,
                 all(stone),
             ),
-            model(
-                "stone_slab_top",
-                opaque,
-                BlockModel::Slab(SlabHalf::Top),
-                1,
-                all(stone),
-            ),
+            vec![Property::new("type", ["bottom", "top", "double"])],
+            |state, def| match state.get("type") {
+                Some("top") => {
+                    def.model = BlockModel::Slab(SlabHalf::Top);
+                    def.collision = def.model.default_collision();
+                }
+                Some("double") => {
+                    def.model = BlockModel::CUBE;
+                    def.collision = BlockCollision::Full;
+                    def.light_opacity = OPAQUE_OPACITY;
+                }
+                _ => {}
+            },
+        )
+        .expect("built-in slab");
+        for def in [
             model(
                 "short_grass",
                 RenderShape::Cutout,
@@ -625,20 +715,6 @@ impl BlockRegistryBuilder {
                 BlockModel::Cross,
                 0,
                 all(poppy),
-            ),
-            model(
-                "log_x",
-                opaque,
-                cube_on(Axis::X),
-                OPAQUE_OPACITY,
-                log_textures,
-            ),
-            model(
-                "log_z",
-                opaque,
-                cube_on(Axis::Z),
-                OPAQUE_OPACITY,
-                log_textures,
             ),
         ] {
             b.add_block(def).expect("built-in block");
@@ -659,26 +735,90 @@ impl BlockRegistryBuilder {
         Ok(TextureId((self.textures.len() - 1) as u16))
     }
 
-    /// Registers a block; returns its state.
+    /// Registers a block without state properties (one state); returns its state.
     pub fn add_block(&mut self, def: BlockDef) -> Result<BlockState, RegistryError> {
+        self.add_block_with_states(def, Vec::new(), |_, _| {})
+    }
+
+    /// Registers a block with state `properties` (ADR 0019); returns its default state. Each
+    /// state starts from a copy of `def` that `state` adjusts for its property values (a model,
+    /// a collision, a light opacity...): the per-state data of all its states comes from one
+    /// function, however many there are. The properties are sorted by name; the states take
+    /// consecutive ids, the last property varying fastest. Every state is checked as
+    /// [`BlockRegistryBuilder::add_block`] checks its one state, and keeps the name of `def`.
+    pub fn add_block_with_states(
+        &mut self,
+        def: BlockDef,
+        mut properties: Vec<Property>,
+        mut state: impl FnMut(&StateValues<'_>, &mut BlockDef),
+    ) -> Result<BlockState, RegistryError> {
         validate_name(&def.name)?;
         if self.blocks.iter().any(|b| b.name == def.name) {
             return Err(RegistryError::Duplicate(def.name));
         }
-        if self.blocks.len() >= u16::MAX as usize {
+        properties.sort_by(|a, b| a.name().cmp(b.name()));
+        let repeated = properties
+            .windows(2)
+            .any(|pair| pair[0].name() == pair[1].name());
+        if repeated || !properties.iter().all(Property::is_valid) {
+            return Err(RegistryError::InvalidProperty(def.name));
+        }
+        // Strides from the last property (1) back; the product is the state count.
+        let mut strides = vec![0u16; properties.len()];
+        let mut count = 1usize;
+        for (stride, property) in strides.iter_mut().zip(&properties).rev() {
+            *stride = u16::try_from(count).map_err(|_| RegistryError::Full("block states"))?;
+            count = count.saturating_mul(property.values().len());
+        }
+        let first = self.states.len();
+        if first + count > MAX_STATES {
             return Err(RegistryError::Full("block states"));
         }
+        let (first, count) = (first as u16, count as u16);
+        let default = first
+            + properties
+                .iter()
+                .zip(&strides)
+                .map(|(p, &stride)| p.default_index() as u16 * stride)
+                .sum::<u16>();
+        let mut states = Vec::with_capacity(usize::from(count));
+        for offset in 0..count {
+            let values = StateValues {
+                properties: &properties,
+                strides: &strides,
+                offset,
+            };
+            let mut state_def = def.clone();
+            state(&values, &mut state_def);
+            state_def.name.clone_from(&def.name);
+            self.check_state(&state_def)?;
+            states.push(state_def);
+        }
+        self.states.extend(states);
+        self.blocks.push(BlockInfo {
+            name: def.name,
+            first,
+            count,
+            default,
+            properties,
+            strides,
+        });
+        Ok(BlockState(default))
+    }
+
+    /// The light, collision and texture checks of one state.
+    fn check_state(&self, def: &BlockDef) -> Result<(), RegistryError> {
         let channels_ok = def.emission.iter().all(|&c| c <= crate::MAX_LIGHT);
         let opaque_cube = def.shape == RenderShape::Opaque && def.model.is_cube();
         let opacity_ok = def.light_opacity <= OPAQUE_OPACITY
             && (!opaque_cube || def.light_opacity == OPAQUE_OPACITY);
         if !channels_ok || !opacity_ok {
-            return Err(RegistryError::InvalidLight(def.name));
+            return Err(RegistryError::InvalidLight(def.name.clone()));
         }
         if let BlockCollision::Boxes(boxes) = &def.collision
             && !boxes.iter().all(|b| b.is_valid())
         {
-            return Err(RegistryError::InvalidCollision(def.name));
+            return Err(RegistryError::InvalidCollision(def.name.clone()));
         }
         if def.shape != RenderShape::None {
             for t in [def.textures.top, def.textures.bottom, def.textures.side] {
@@ -687,24 +827,25 @@ impl BlockRegistryBuilder {
                 }
             }
         }
-        self.blocks.push(def);
-        Ok(BlockState((self.blocks.len() - 1) as u16))
+        Ok(())
     }
 
     /// Freezes the registry (builds the `SoA` lookup tables).
     pub fn build(self) -> BlockRegistry {
         let mut by_name =
             std::collections::HashMap::with_hasher(foldhash::fast::FixedState::default());
+        let mut state_block = Vec::with_capacity(self.states.len());
         for (i, b) in self.blocks.iter().enumerate() {
-            by_name.insert(b.name.clone(), BlockState(i as u16));
+            by_name.insert(b.name.clone(), BlockId(i as u16));
+            state_block.extend(std::iter::repeat_n(i as u16, usize::from(b.count)));
         }
+        let states = &self.states;
         BlockRegistry {
-            names: self.blocks.iter().map(|b| b.name.clone()).collect(),
-            shapes: self.blocks.iter().map(|b| b.shape).collect(),
-            models: self.blocks.iter().map(|b| b.model).collect(),
-            collisions: self.blocks.iter().map(|b| b.collision.clone()).collect(),
-            flags: self
-                .blocks
+            state_block,
+            shapes: states.iter().map(|b| b.shape).collect(),
+            models: states.iter().map(|b| b.model).collect(),
+            collisions: states.iter().map(|b| b.collision.clone()).collect(),
+            flags: states
                 .iter()
                 .map(|b| {
                     let mut f = StateFlags::empty();
@@ -722,14 +863,14 @@ impl BlockRegistryBuilder {
                     f
                 })
                 .collect(),
-            emission: self
-                .blocks
+            emission: states
                 .iter()
                 .map(|b| LightValue::from_rgb(b.emission))
                 .collect(),
-            opacity: self.blocks.iter().map(|b| b.light_opacity).collect(),
-            faces: self.blocks.iter().map(|b| b.textures).collect(),
+            opacity: states.iter().map(|b| b.light_opacity).collect(),
+            faces: states.iter().map(|b| b.textures).collect(),
             textures: self.textures,
+            blocks: self.blocks,
             by_name,
         }
     }
@@ -757,7 +898,8 @@ fn validate_name(name: &str) -> Result<(), RegistryError> {
 /// Frozen registry with `SoA` lookup tables indexed by `BlockState.0`.
 #[derive(Debug, Clone)]
 pub struct BlockRegistry {
-    names: Vec<String>,
+    /// The block (index into `blocks`) of each state.
+    state_block: Vec<u16>,
     shapes: Vec<RenderShape>,
     models: Vec<BlockModel>,
     collisions: Vec<BlockCollision>,
@@ -766,43 +908,151 @@ pub struct BlockRegistry {
     opacity: Vec<u8>,
     faces: Vec<FaceTextures>,
     textures: Vec<TextureSpec>,
-    by_name: std::collections::HashMap<String, BlockState, foldhash::fast::FixedState>,
+    blocks: Vec<BlockInfo>,
+    by_name: std::collections::HashMap<String, BlockId, foldhash::fast::FixedState>,
 }
 
 impl BlockRegistry {
     /// Built-in content ([`BlockRegistryBuilder::with_default_blocks`], built), in this exact
     /// order (state ids are frozen for tests and worldgen): 0 `boxel:air`, 1 `boxel:stone`,
     /// 2 `boxel:dirt`, 3 `boxel:grass`, 4 `boxel:sand`, 5 `boxel:gravel`, 6 `boxel:snow`,
-    /// 7 `boxel:bedrock`, 8 `boxel:log`, 9 `boxel:leaves` (Cutout), 10 `boxel:water`
-    /// (Translucent), 11 `boxel:planks`, then the emitters (opaque, solid, light opacity 15;
-    /// emission red, green, blue): 12 `boxel:lamp_orange` (14, 11, 6), 13 `boxel:lamp_red`
-    /// (14, 2, 2), 14 `boxel:lamp_blue` (3, 6, 14), 15 `boxel:lamp_white` (15, 15, 15) and
-    /// 16 `boxel:lava` (15, 7, 2), a placeholder until fluids exist ([`LAMPS`],
-    /// [`LAVA_EMISSION`]); then the blocks of ADR 0018: 17 `boxel:glass` (Translucent cube,
-    /// solid, light opacity 0), 18 `boxel:stone_slab` and 19 `boxel:stone_slab_top` (Opaque
-    /// slabs, light opacity 1), 20 `boxel:short_grass` and 21 `boxel:poppy` (Cutout crosses, no
-    /// collision, light opacity 0), 22 `boxel:log_x` and 23 `boxel:log_z` (the log turned to
-    /// the X and Z axes).
+    /// 7 `boxel:bedrock`, 8 to 10 `boxel:log[axis=x|y|z]` (default 9, `axis=y`),
+    /// 11 `boxel:leaves` (Cutout), 12 `boxel:water` (Translucent), 13 `boxel:planks`, then the
+    /// emitters (opaque, solid, light opacity 15; emission red, green, blue): 14
+    /// `boxel:lamp_orange` (14, 11, 6), 15 `boxel:lamp_red` (14, 2, 2), 16 `boxel:lamp_blue`
+    /// (3, 6, 14), 17 `boxel:lamp_white` (15, 15, 15) and 18 `boxel:lava` (15, 7, 2), a
+    /// placeholder until fluids exist ([`LAMPS`], [`LAVA_EMISSION`]); then the blocks of
+    /// ADR 0018: 19 `boxel:glass` (Translucent cube, solid, light opacity 0), 20 to 22
+    /// `boxel:stone_slab[type=bottom|top|double]` (default 20; the halves are Opaque slabs with
+    /// light opacity 1, `double` an Opaque stone cube), 23 `boxel:short_grass` and 24
+    /// `boxel:poppy` (Cutout crosses, no collision, light opacity 0).
     pub fn default_blocks() -> BlockRegistry {
         BlockRegistryBuilder::with_default_blocks().build()
     }
     /// Number of states.
     pub fn len(&self) -> usize {
-        self.names.len()
+        self.state_block.len()
     }
     /// True if only air.
     pub fn is_empty(&self) -> bool {
-        self.names.len() <= 1
+        self.state_block.len() <= 1
     }
-    /// State by name.
+    /// The default state of the block named `name` (`boxel:log` -> `boxel:log[axis=y]`). A
+    /// state with properties is [`BlockRegistry::parse_state`].
     pub fn by_name(&self, name: &str) -> Option<BlockState> {
+        self.block_by_name(name).map(|b| self.default_state(b))
+    }
+    /// The block of the name.
+    pub fn block_by_name(&self, name: &str) -> Option<BlockId> {
         self.by_name.get(name).copied()
     }
-    /// Name of a state (`"boxel:unknown"` if out of range).
+    /// Block name of a state (`"boxel:unknown"` if out of range); the same for every state of a
+    /// block. [`BlockRegistry::state_name`] adds the property values.
     pub fn name(&self, s: BlockState) -> &str {
-        self.names
-            .get(s.0 as usize)
-            .map_or("boxel:unknown", String::as_str)
+        self.info(s).map_or("boxel:unknown", |b| b.name.as_str())
+    }
+    /// Number of blocks (air included).
+    pub fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+    /// Every block, in registration order.
+    pub fn blocks(&self) -> impl ExactSizeIterator<Item = BlockId> + use<> {
+        (0..self.blocks.len() as u16).map(BlockId)
+    }
+    /// The block of a state (`None` if out of range).
+    pub fn block(&self, s: BlockState) -> Option<BlockId> {
+        self.state_block.get(usize::from(s.0)).copied().map(BlockId)
+    }
+    fn info(&self, s: BlockState) -> Option<&BlockInfo> {
+        let b = *self.state_block.get(usize::from(s.0))?;
+        self.blocks.get(usize::from(b))
+    }
+    /// Name of a block (`"boxel:unknown"` if out of range).
+    pub fn block_name(&self, b: BlockId) -> &str {
+        self.blocks
+            .get(usize::from(b.0))
+            .map_or("boxel:unknown", |b| b.name.as_str())
+    }
+    /// The default state of a block (air if out of range).
+    pub fn default_state(&self, b: BlockId) -> BlockState {
+        self.blocks
+            .get(usize::from(b.0))
+            .map_or(BlockState::AIR, |b| BlockState(b.default))
+    }
+    /// The states of a block, in id order (none if out of range).
+    pub fn states(&self, b: BlockId) -> impl ExactSizeIterator<Item = BlockState> + use<> {
+        let range = self
+            .blocks
+            .get(usize::from(b.0))
+            .map_or(0..0, |b| b.first..b.first + b.count);
+        range.map(BlockState)
+    }
+    /// The state properties of a block, sorted by name (none if out of range).
+    pub fn properties(&self, b: BlockId) -> &[Property] {
+        self.blocks
+            .get(usize::from(b.0))
+            .map_or(&[], |b| b.properties.as_slice())
+    }
+    /// The property values of a state (none if out of range).
+    pub fn values(&self, s: BlockState) -> StateValues<'_> {
+        self.info(s).map_or(StateValues::EMPTY, |b| b.values(s))
+    }
+    /// The value of property `property` of `s` (`boxel:log[axis=x]`, `axis` -> `x`); `None` if
+    /// the block has no such property.
+    pub fn property(&self, s: BlockState, property: &str) -> Option<&str> {
+        self.values(s).get(property)
+    }
+    /// `s` with `property` set to `value` (the other properties kept); `None` if the block has no
+    /// such property or value.
+    pub fn with(&self, s: BlockState, property: &str, value: &str) -> Option<BlockState> {
+        let b = self.info(s)?;
+        let i = b.properties.iter().position(|p| p.name() == property)?;
+        let new = b.properties[i].index_of(value)? as u16;
+        let old = b.values(s).index(property)? as u16;
+        Some(BlockState(s.0 - old * b.strides[i] + new * b.strides[i]))
+    }
+    /// `s` written as `name[property=value,...]` (`boxel:stone_slab[type=top]`; just the name for
+    /// a block without properties): its `Display` is the inverse of
+    /// [`BlockRegistry::parse_state`].
+    pub fn state_name(&self, s: BlockState) -> StateName<'_> {
+        StateName {
+            name: self.name(s),
+            values: self.values(s),
+        }
+    }
+    /// The state written as `name` (the default state) or `name[property=value,...]`
+    /// (`boxel:stone_slab[type=top]`): properties left out take their default value; an unknown
+    /// block, property or value is an error.
+    pub fn parse_state(&self, text: &str) -> Result<BlockState, StateParseError> {
+        let (name, pairs) = split_state(text)?;
+        let block = self
+            .block_by_name(name)
+            .ok_or_else(|| StateParseError::UnknownBlock(name.to_string()))?;
+        let mut state = self.default_state(block);
+        let mut seen: Vec<&str> = Vec::with_capacity(pairs.len());
+        for (property, value) in pairs {
+            if seen.contains(&property) {
+                return Err(StateParseError::Repeated {
+                    block: name.to_string(),
+                    property: property.to_string(),
+                });
+            }
+            seen.push(property);
+            let Some(known) = self.properties(block).iter().find(|p| p.name() == property) else {
+                return Err(StateParseError::UnknownProperty {
+                    block: name.to_string(),
+                    property: property.to_string(),
+                });
+            };
+            state = self.with(state, known.name(), value).ok_or_else(|| {
+                StateParseError::UnknownValue {
+                    block: name.to_string(),
+                    property: property.to_string(),
+                    value: value.to_string(),
+                }
+            })?;
+        }
+        Ok(state)
     }
     /// Shape (out of range -> `None`).
     pub fn shape(&self, s: BlockState) -> RenderShape {
@@ -849,7 +1099,8 @@ impl BlockRegistry {
     pub fn textures(&self) -> &[TextureSpec] {
         &self.textures
     }
-    /// Mesher voxel value of a state: `0` for `RenderShape::None`, else `s.0` (M0 identity map).
+    /// Mesher voxel value of a state: `0` for `RenderShape::None`, else `s.0` (the identity map;
+    /// below [`MAX_STATES`], so the mesher's top bit stays free).
     pub fn material(&self, s: BlockState) -> u16 {
         if self.shape(s) == RenderShape::None {
             0

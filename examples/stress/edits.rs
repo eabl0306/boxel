@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn the_cycle_places_and_removes_a_lamp_then_digs_and_caps_a_shaft() {
-        let (lamp, cap) = (BlockState(12), BlockState(1));
+        let (lamp, cap) = (BlockState(14), BlockState(1));
         let lg = BlockPos::new(6, 63, 6);
         let sg = BlockPos::new(-6, 60, 6);
         assert_eq!(
@@ -269,7 +269,7 @@ mod tests {
         script.frame(ms(0), true, &content, ground_at, |p, s| {
             applied.push((p, s));
         });
-        assert_eq!(applied, [(BlockPos::new(6, 64, 6), BlockState(12))]);
+        assert_eq!(applied, [(BlockPos::new(6, 64, 6), BlockState(14))]);
         // Busy for two frames, settled in the third: 3 frames, 30 ms.
         for (t, settled) in [(10, false), (20, false), (30, true)] {
             script.frame(ms(t), settled, &content, ground_at, |p, s| {

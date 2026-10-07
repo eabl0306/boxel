@@ -36,4 +36,7 @@ pub use narrow::{
 pub use ray::{MAX_RAY_DISTANCE, RayResult, VoxelFilter, VoxelHit, raycast_voxels};
 pub use shape::{LocalBox, Shape, ShapeHit};
 pub use source::{CollisionShape, CollisionTable, Probe, TestWorld, VoxelSource};
-pub use sweep::{MAX_SWEEP_DISTANCE, SweepConfig, SweepOut, Unloaded, axis_order, move_box};
+pub use sweep::{
+    MAX_SWEEP_DISTANCE, StepUp, SweepConfig, SweepOut, Unloaded, axis_order, move_box,
+    move_box_stepping,
+};

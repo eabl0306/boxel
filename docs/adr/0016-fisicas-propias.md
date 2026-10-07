@@ -1,6 +1,7 @@
 # ADR 0016: física propia mínima
 
-- Estado: aceptado (fases P0 a P4 hechas; de P4 falta medir con stress en ventana; P5 a pedido)
+- Estado: aceptado (fases P0 a P4 hechas; de P4 falta medir con stress en ventana; P5 a pedido,
+  con subir escalones y las formas de bloque hechas)
 - Fecha: 2026-10-06
 
 ## Contexto
@@ -203,7 +204,8 @@ Dos datos del código pesan en el diseño:
     `alpha = overstep_fraction_f64`. `Update` y el render ven la posición interpolada (hasta un
     paso, 15.6 ms, detrás). Un teletransporte mueve las dos puntas: no deja estela.
 
-  Controlador: `CharacterController { walk_speed: 4.317, air_control: 1, jump_speed: 9.5 }`
+  Controlador: `CharacterController { walk_speed: 4.317, air_control: 1, jump_speed: 9.5,
+  step_height: 0.6 }` (`step_height` desde P5, ver 9c)
   convierte `MoveIntent { wish, jump }` en velocidad al principio del paso (set `Controller`):
   acelera `walk_speed * k`, con `k` el arrastre que aplica el paso, así la velocidad tope es
   `walk_speed` con cualquier `BodySettings` de tasas positivas (con `k = 0` no hay velocidad
@@ -388,14 +390,75 @@ Dos datos del código pesan en el diseño:
     inicio cuando el mundo cargó (ver [benchmarks](../benchmarks.md)). Las corridas con ventana
     de la regla del frame quedan para la medición.
 
+- **9c. Subir escalones (P5, issue #15).** Un personaje sube solo un escalón bajo, sin saltar,
+  como en Minecraft: una losa o una escalera de losas sí, un bloque entero no.
+  `CharacterController::step_height` es el escalón más alto (0.6 por defecto, el del jugador y
+  los mobs de Minecraft; 0 lo apaga). El algoritmo es el de Minecraft, por ejes como el resto del
+  barrido (`move_box_stepping` con `StepUp { height, grounded }`):
+  - Solo se intenta si el movimiento normal choca de costado (X o Z), el cuerpo no empezó dentro
+    de bloques y está en el suelo: terminó el paso anterior apoyado o este movimiento aterriza.
+    En el aire nunca sube.
+  - Se prueba el avance levantado de dos formas: sube `step_height` (recortado por lo que tenga
+    encima) y avanza; y si algo sobre todo el camino (la caja estirada por el avance) está más
+    bajo, sube solo hasta ahí y avanza. Así nunca se mete en un techo ni pasa por un hueco
+    donde no entra.
+  - Gana el que más avanza (el primero si empatan), y solo si avanza más que el movimiento
+    normal. Después baja lo que subió, más el movimiento vertical del paso, hasta el escalón o
+    donde aterrice: nunca queda más alto que el escalón. Informa las caras de costado del
+    avance levantado y la de abajo de la bajada (`on_ground` sobre la losa), así que la
+    velocidad de costado no se pierde.
+  - Todo pasa en el marco del bloque de inicio: sigue exacto y bit a bit igual lejos del origen.
+    Los obstáculos (sólidos estáticos y cinemáticos) se juntan sobre la caja subida por
+    `step_height`, así subir a una caja estática ve lo que hay encima.
+  - Solo lo pagan los personajes cuyo movimiento chocó de costado (dos a cuatro barridos más).
+    Los cuerpos sin controlador no suben, y los proyectiles nunca (tienen su propio paso).
+  - Lo demás no cambia: entre dinámicos no hay escalón (el solve los separa como antes), un
+    personaje dormido despierta al querer caminar y sube con los `Contacts` que tenía, y un
+    escalón que necesita un chunk sin cargar congela al cuerpo como cualquier otro paso.
+  - Cámara: el cuerpo sube media losa en un paso fijo (15.6 ms) y la cámara pegada al ojo daba
+    un salto. Los ejemplos (`examples/shared/player.rs`) guardan un `EyeLag`: una subida
+    estando apoyado y sin velocidad vertical deja el ojo abajo esa distancia, que se achica
+    dividiéndola por `1 + 20 dt` cada frame (alcanza en una décima de segundo). Es solo la
+    vista y queda en los ejemplos: el cuerpo sigue exacto y cada juego elige su cámara.
+
 - **10. Fases.** P0: requisitos (`WorldPos`, sets del bucle fijo, el tope de pasos, este ADR, la
   feature). P1: núcleo y raycast (tabla, fuentes, barrido, DDA, `PhysicsQuery::raycast_voxels`,
   edición de bloques en `voxel_world`). P2: cuerpos (gravedad, arrastre, rebote, congelar,
   interpolación, teletransporte, controlador). P3: entre entidades. P4: proyectiles, dormir y
-  paso en paralelo. P5, a pedido: subir escalones, formas de bloque con cajas, fluidos, fricción
-  por bloque, esfera exacta contra vóxeles.
+  paso en paralelo. P5, a pedido: subir escalones (hecho, 9c), formas de bloque con cajas
+  (hecho, ADR 0018), fluidos, fricción por bloque, esfera exacta contra vóxeles.
 
 ## Consecuencias
+
+Hecho (P5, subir escalones, 9c):
+
+- `boxel_physics`: `CharacterController::step_height`, `StepUp` y `move_box_stepping`;
+  `move_body` recibe un `StepUp` (`step_body` no sube). `move_box` no cambia.
+- `physics_sandbox`: T arma una escalera de losas adelante. Los ejemplos que caminan suavizan el
+  ojo en cada escalón (`EyeLag`).
+- Tests (`boxel_physics/tests/step_up.rs`): una losa se sube con todo el avance y queda exacto
+  sobre ella; un bloque entero no (igual bit a bit al barrido sin escalón) y con `step_height`
+  1 sí; una escalera de losas se sube de a medio bloque sin frenar; sin escalón con un techo
+  bajo sobre la losa o sobre la cabeza, y sí con lugar; la segunda forma (subir solo hasta el
+  techo del camino) con bloques y con cajas obstáculo; cajas estáticas de medio bloque se suben
+  y de uno no; en el aire no sube, apoyado en el paso anterior o aterrizando sí; `step_height`
+  0, negativo o NaN es el barrido de siempre; deslizar contra una pared no cambia; un escalón
+  que necesita un chunk sin cargar da `Unloaded`. Una proptest sobre campos de cubos y losas:
+  nunca termina dentro de un bloque, no sube más que el escalón, no avanza más de lo pedido y
+  solo cambia el movimiento si avanza más. Con `App`: un personaje dormido despierta y sube una
+  escalera sin saltar ni frenar, con `step_height` 0 la losa es una pared, bajar de una losa
+  cae con la gravedad como antes, una caja sin controlador y una flecha con controlador no
+  suben, y subir a una caja estática da lo mismo a 64 y a 144 fps. Lejos del origen (±2^31,
+  2^40, 2^52 y el límite del mundo), el barrido y la subida con `App` dan lo mismo bit a bit.
+  La escena de determinismo de `plugin.rs` suma dos tiras de losas. Sacar la segunda forma o la
+  regla del suelo hace fallar estos tests (probado a mano).
+- Costo, en la máquina compartida con otros agentes compilando (3 corridas intercaladas, con
+  ruido): el barrido sin escalón queda igual o hasta 5 % más lento (`sweep/player_walk` de unos
+  225 a 245 ns en las corridas más tranquilas); por eso la subida va fuera de línea (`#[cold]`).
+  `tick/1000` sube de unos 0.47 a 0.49 ms. En `scale/10000_awake_one_thread` el movimiento sube
+  de unos 3.5 a 4.0 ms: los caminantes del bosque chocan con lomas de un bloque casi cada paso y
+  cada choque paga dos barridos más que no suben. Si molesta, el próximo paso es descartar
+  antes los choques contra bloques enteros más altos que el escalón.
 
 Hecho (P4):
 
@@ -702,7 +765,8 @@ Cambios de API de P0 y P1:
 Lo que falta: medir la regla del frame con stress en ventana (`--bodies 1000` y `10000`, en las
 dos GPU), bajar el paso con 10 000 cuerpos despiertos a 1.5 ms (paralelizar lo que queda del
 broadphase, no rehacer la grilla después de los empujes) y la grilla de 10 000 a 0.3 ms (una
-grilla incremental), y todo P5. Los cuerpos no tienen dibujo: hace falta un renderer de entidades.
+grilla incremental), y lo que queda de P5 (fluidos, fricción por bloque, esfera exacta). Los
+cuerpos no tienen dibujo: hace falta un renderer de entidades.
 `physics_sandbox` todavía no rompe ni pone bloques. La luz no usa `BlockChanged` ni
 `ChunkDataEvent` (se recalcula con las remallas), pero el mensaje sale de su lista de cambios.
 

@@ -10,7 +10,8 @@
 //!    step, else [`BodySettings::drag_xz`].
 //! 3. Each component is clamped to `max_speed`, and one slower than [`STOP_SPEED`] becomes
 //!    exactly 0 (drag alone only decays a speed geometrically, so a slide would never end).
-//! 4. The body's box moves by `v * dt` through the voxels ([`move_box`]).
+//! 4. The body's box moves by `v * dt` through the voxels ([`move_box`]; a walking body steps
+//!    up low ledges, [`move_box_stepping`]).
 //! 5. On each clipped axis the velocity bounces (`v = -v * restitution`) if its speed is above
 //!    both [`BodySettings::bounce_min_speed`] and one step of gravity along that axis
 //!    (`|gravity| * gravity_scale * dt`, the speed a body resting on the ground hits it with),
@@ -24,7 +25,9 @@
 
 use super::shape::LocalBox;
 use super::source::{CollisionTable, VoxelSource};
-use super::sweep::{SweepConfig, SweepOut, Unloaded, move_box};
+#[cfg(doc)]
+use super::sweep::move_box;
+use super::sweep::{StepUp, SweepConfig, SweepOut, Unloaded, move_box_stepping};
 use boxel_math::DVec3;
 use boxel_voxel::{BlockPos, Face, WorldPos};
 
@@ -234,7 +237,7 @@ pub fn integrate_velocity(
 /// One step of a dynamic body with the voxel box `shape` (relative to `pos`): gravity, drag,
 /// the speed limit, the sweep against the voxels of `src`, bounces and impacts (see the module
 /// docs). `on_ground` is whether the body ended the previous step on the ground. The same as
-/// [`integrate_velocity`] followed by [`move_body`] with no obstacles.
+/// [`integrate_velocity`] followed by [`move_body`] with no obstacles and no step-up.
 ///
 /// # Errors
 ///
@@ -251,14 +254,26 @@ pub fn step_body<S: VoxelSource + ?Sized>(
     params: &StepParams,
 ) -> Result<BodyStep, Unloaded> {
     let v = integrate_velocity(vel, on_ground, settings, params);
-    move_body(src, table, pos, v, shape, &[], settings, params)
+    move_body(
+        src,
+        table,
+        pos,
+        v,
+        shape,
+        &[],
+        settings,
+        params,
+        StepUp::NONE,
+    )
 }
 
 /// Steps 4 and 5 of the integrator: moves a body with the voxel box `shape` (relative to `pos`)
 /// by `vel * dt` against the voxels of `src` and the `obstacles` (boxes in the frame of
-/// `pos.block`: static and kinematic solid bodies), then bounces or stops each clipped axis and
-/// reports the impacts. `vel` is the velocity [`integrate_velocity`] gave for this step. An
-/// obstacle clips like a block but is never an impact (impacts are hits on blocks).
+/// `pos.block`: static and kinematic solid bodies), stepping up ledges up to `step.height` high
+/// ([`move_box_stepping`]; [`StepUp::NONE`] for bodies that do not walk), then bounces or stops
+/// each clipped axis and reports the impacts. `vel` is the velocity [`integrate_velocity`] gave
+/// for this step. An obstacle clips like a block but is never an impact (impacts are hits on
+/// blocks). A step-up that went over a ledge is not a clip: the velocity across is kept.
 ///
 /// # Errors
 ///
@@ -272,9 +287,10 @@ pub fn move_body<S: VoxelSource + ?Sized>(
     obstacles: &[LocalBox],
     settings: &BodySettings,
     params: &StepParams,
+    step: StepUp,
 ) -> Result<BodyStep, Unloaded> {
     let mut v = vel;
-    let sweep = move_box(
+    let sweep = move_box_stepping(
         src,
         table,
         pos,
@@ -282,6 +298,7 @@ pub fn move_body<S: VoxelSource + ?Sized>(
         v * params.dt,
         obstacles,
         &params.sweep,
+        step,
     )?;
     let mut impacts = [None; 3];
     for (axis, impact) in impacts.iter_mut().enumerate() {
