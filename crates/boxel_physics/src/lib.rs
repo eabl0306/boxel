@@ -4,7 +4,8 @@
 //! projectiles; voxel and entity raycasts; between entities, a per-entity choice of solid push
 //! or sensor events. This crate grows in phases (see ADR 0016); today (P4) it has the voxel
 //! core, the raycast, bodies that move against the voxels, collisions between bodies,
-//! projectiles that never tunnel, sleeping bodies and a parallel step.
+//! projectiles that never tunnel, sleeping bodies and a parallel step; from P5, blocks made of
+//! boxes (slabs) and characters that step up low ledges.
 //!
 //! Two layers:
 //! - [`core`] is pure (no ECS): the [`CollisionTable`] (how each block state collides, derived

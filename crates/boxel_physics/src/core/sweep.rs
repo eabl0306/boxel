@@ -709,7 +709,9 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
 
     /// The step-up of [`move_box_stepping`] from `start` (the box's position, free of blocks):
     /// the lifted move if it goes further across than `plain` (the plain move), else `None`.
-    /// `height` is positive and finite.
+    /// `height` is positive and finite. Out of line: inlined, it slowed every plain sweep.
+    #[cold]
+    #[inline(never)]
     fn step_up(
         &mut self,
         start: DVec3,

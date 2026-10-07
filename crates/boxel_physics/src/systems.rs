@@ -659,10 +659,9 @@ fn step_one(stepper: &mut Stepper<'_>, shared: &StepShared<'_>, item: StepItem<'
 /// [`PhysicsSystems::Step`]: one step of every awake dynamic body ([`crate::step_body`], plus
 /// the static and kinematic solid obstacles for a solid body, and the step-up of a
 /// [`CharacterController`]). A body whose step needs an unloaded block keeps its state and gets
-/// [`Frozen`]. Above
-/// `PhysicsSettings::parallel_threshold` bodies it runs on the compute threads: each body reads
-/// the world and writes only itself, and the outputs are merged in entity order, so the results
-/// are bit-identical to a run on one thread.
+/// [`Frozen`]. Above `PhysicsSettings::parallel_threshold` bodies it runs on the compute
+/// threads: each body reads the world and writes only itself, and the outputs are merged in
+/// entity order, so the results are bit-identical to a run on one thread.
 pub(crate) fn step_dynamic(
     mut commands: Commands,
     map: Res<ChunkMap>,
