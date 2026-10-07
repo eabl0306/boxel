@@ -2,7 +2,7 @@
 
 Documento técnico de referencia. Fecha: 2026-10-05. Estado: aprobado para el milestone M0
 (revisión final, después de tres revisiones adversariales del borrador v1).
-Las decisiones puntuales están en `docs/adr/` (0001 a 0018). Durante M0 hubo además una
+Las decisiones puntuales están en `docs/adr/` (0001 a 0019). Durante M0 hubo además una
 especificación para los agentes implementadores (en inglés, en `.scaffold/`), borrada al cerrar M0;
 este documento queda como referencia.
 
@@ -608,7 +608,11 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   los viewers a ese límite. Un chunk de lod k empieza en `pos << (5 + k)`. Detalles en
   ADR 0014.
 - **Registry** de datos: `BlockState(u16)` denso en tiempo de ejecución (0 = aire), nunca se
-  persiste crudo (M1 agrega el IdMap nombre a id). Tablas SoA: nombre, capa de dibujo (`None`,
+  persiste crudo (M1 agrega el IdMap, que guarda el texto del estado). Un bloque tiene
+  propiedades con valores finitos, como en Minecraft (ADR 0019): cada combinación es un estado,
+  con ids seguidos por bloque, y se escribe `boxel:stone_slab[type=top]` (`parse_state`,
+  `state_name`, `property`, `with`). Como mucho `MAX_STATES` = 2^15 estados, así el bit alto del
+  material del mesher queda libre. Tablas SoA por estado: nombre, capa de dibujo (`None`,
   `Opaque`, `Cutout`, `Translucent`), modelo (`Cube { axis }`, `Slab`, `Cross`, ADR 0018),
   colisión (`None`, `Full` o cajas), flags, emisión RGB, opacidad de luz (15 en los cubos opacos,
   1 en hojas, agua y losas, 0 en vidrio y plantas), texturas por cara. Solo un cubo `Opaque`
@@ -617,8 +621,8 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   tablones y, desde la fase P6 de la luz, los primeros emisores: lámparas de cubo completo naranja
   (14, 11, 6), roja (14, 2, 2), azul (3, 6, 14) y blanca (15, 15, 15) y una lava provisoria
   (15, 7, 2), opaca y sólida hasta que haya fluidos (`boxel_voxel::LAMPS`, `LAVA_EMISSION`);
-  desde ADR 0018, vidrio, losa de piedra abajo y arriba, pasto corto, amapola y el tronco en X y
-  en Z. Cada variante es un estado propio hasta que haya estados de bloque.
+  desde ADR 0018, vidrio, `boxel:stone_slab[type=bottom|top|double]` (la doble es un cubo de
+  piedra), pasto corto, amapola y `boxel:log[axis=x|y|z]`.
 - **Contenedor de paleta:** `Uniform(state)` | `Packed { palette, bits 1/2/4/8, words }` |
   `Direct(u16)`. Los índices nunca cruzan palabras de 64 bits. `set` agrega a la paleta en el
   lugar mientras entra; se compacta al guardar o en reposo. Medido en un mundo de 512x256x512:
@@ -882,7 +886,8 @@ sampler y subida son los mismos, así que los tres tiers lo ven igual.
 
 - Cada capa del registro tiene una receta (`boxel_render::pack_textures`): el bloque de Minecraft
   cuyo blockstate y modelo dan la textura (por ejemplo `cube_column` para tronco arriba y lado), y
-  nombres por defecto si el pack no trae modelo (`block/stone`, `block/grass_block_top`...). Las
+  nombres por defecto si el pack no trae modelo. La variante del blockstate sale de los valores de
+  un estado nuestro (`boxel:log[axis=y]` lee la variante `axis=y`, ADR 0019) (`block/stone`, `block/grass_block_top`...). Las
   lámparas usan `glowstone`, `shroomlight`, `sea_lantern` y `redstone_lamp_on`. Una capa que no
   es del registro de serie prueba `block/<nombre>`.
 - Si falta la textura, la capa queda procedural y se anota un aviso en `RenderInfo::textures`.
