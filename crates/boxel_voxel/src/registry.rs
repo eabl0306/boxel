@@ -6,6 +6,10 @@
 use crate::state::{Property, StateName, StateParseError, StateValues, split_state};
 use crate::{Face, LightValue, OPAQUE_OPACITY};
 
+/// The state property of a fluid's level (Minecraft's `level`, `0..=15`): 0 is a source, 1 to 7
+/// flowing (lower as it grows), 8 to 15 falling (ADR 0021).
+pub const FLUID_LEVEL: &str = "level";
+
 /// Most states a registry holds: `2^15`. The mesher's material id is the state id, and its top
 /// bit (`boxel_mesh::FLUID_SURFACE_BIT`) marks fluid surface cells, so every state id must stay
 /// below it.
@@ -320,7 +324,7 @@ impl BuiltinLamp {
     }
 }
 
-/// The built-in lamps, in state order (states 12 to 15 of [`BlockRegistry::default_blocks`]).
+/// The built-in lamps, in state order (states 29 to 32 of [`BlockRegistry::default_blocks`]).
 pub const LAMPS: [BuiltinLamp; 4] = [
     BuiltinLamp {
         name: "boxel:lamp_orange",
@@ -633,16 +637,23 @@ impl BlockRegistryBuilder {
             },
         )
         .expect("built-in log");
-        for def in [
-            block("leaves", RenderShape::Cutout, true, all(leaves)),
+        b.add_block(block("leaves", RenderShape::Cutout, true, all(leaves)))
+            .expect("built-in leaves");
+        // Water has Minecraft's `level` (ADR 0021): 0 is a source, 1 to 7 flowing water (lower
+        // as the level grows) and 8 to 15 falling water. Every level draws, collides and lets
+        // light through the same way: only the fluid ticks and the mesher's corner heights read
+        // it.
+        b.add_block_with_states(
             BlockDef {
                 model: BlockModel::Fluid,
                 ..block("water", RenderShape::Translucent, false, all(water))
             },
-            block("planks", opaque, true, all(planks)),
-        ] {
-            b.add_block(def).expect("built-in block");
-        }
+            vec![Property::int(FLUID_LEVEL, 0..=15)],
+            |_, _| {},
+        )
+        .expect("built-in water");
+        b.add_block(block("planks", opaque, true, all(planks)))
+            .expect("built-in planks");
         // The first emitters (ADR 0015): full-cube colored lamps and a lava placeholder (an
         // opaque, solid, glowing cube until fluids exist). Torches wait for non-cube shapes.
         let emitters = LAMPS
@@ -917,15 +928,15 @@ impl BlockRegistry {
     /// order (state ids are frozen for tests and worldgen): 0 `boxel:air`, 1 `boxel:stone`,
     /// 2 `boxel:dirt`, 3 `boxel:grass`, 4 `boxel:sand`, 5 `boxel:gravel`, 6 `boxel:snow`,
     /// 7 `boxel:bedrock`, 8 to 10 `boxel:log[axis=x|y|z]` (default 9, `axis=y`),
-    /// 11 `boxel:leaves` (Cutout), 12 `boxel:water` (Translucent), 13 `boxel:planks`, then the
-    /// emitters (opaque, solid, light opacity 15; emission red, green, blue): 14
-    /// `boxel:lamp_orange` (14, 11, 6), 15 `boxel:lamp_red` (14, 2, 2), 16 `boxel:lamp_blue`
-    /// (3, 6, 14), 17 `boxel:lamp_white` (15, 15, 15) and 18 `boxel:lava` (15, 7, 2), a
-    /// placeholder until fluids exist ([`LAMPS`], [`LAVA_EMISSION`]); then the blocks of
-    /// ADR 0018: 19 `boxel:glass` (Translucent cube, solid, light opacity 0), 20 to 22
-    /// `boxel:stone_slab[type=bottom|top|double]` (default 20; the halves are Opaque slabs with
-    /// light opacity 1, `double` an Opaque stone cube), 23 `boxel:short_grass` and 24
-    /// `boxel:poppy` (Cutout crosses, no collision, light opacity 0).
+    /// 11 `boxel:leaves` (Cutout), 12 to 27 `boxel:water[level=0..15]` (Translucent fluid,
+    /// default 12, the source; ADR 0021), 28 `boxel:planks`, then the emitters (opaque, solid,
+    /// light opacity 15; emission red, green, blue): 29 `boxel:lamp_orange` (14, 11, 6), 30
+    /// `boxel:lamp_red` (14, 2, 2), 31 `boxel:lamp_blue` (3, 6, 14), 32 `boxel:lamp_white`
+    /// (15, 15, 15) and 33 `boxel:lava` (15, 7, 2), a placeholder until lava flows ([`LAMPS`],
+    /// [`LAVA_EMISSION`]); then the blocks of ADR 0018: 34 `boxel:glass` (Translucent cube,
+    /// solid, light opacity 0), 35 to 37 `boxel:stone_slab[type=bottom|top|double]` (default
+    /// 35; the halves are Opaque slabs with light opacity 1, `double` an Opaque stone cube), 38
+    /// `boxel:short_grass` and 39 `boxel:poppy` (Cutout crosses, no collision, light opacity 0).
     pub fn default_blocks() -> BlockRegistry {
         BlockRegistryBuilder::with_default_blocks().build()
     }

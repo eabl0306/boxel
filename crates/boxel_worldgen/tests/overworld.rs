@@ -324,7 +324,7 @@ const RECORDED_IDS: [&str; 17] = [
     "boxel:bedrock",
     "boxel:log[axis=y]",
     "boxel:leaves",
-    "boxel:water",
+    "boxel:water[level=0]",
     "boxel:planks",
     "boxel:lamp_orange",
     "boxel:lamp_red",

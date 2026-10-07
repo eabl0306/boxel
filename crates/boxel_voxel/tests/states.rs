@@ -148,10 +148,10 @@ proptest! {
 fn parse_errors_name_the_problem() {
     let r = BlockRegistry::default_blocks();
     let slab = |t: &str| r.parse_state(&format!("boxel:stone_slab{t}"));
-    assert_eq!(slab(""), Ok(BlockState(20)));
-    assert_eq!(slab("[]"), Ok(BlockState(20)));
-    assert_eq!(slab("[type=top]"), Ok(BlockState(21)));
-    assert_eq!(slab("[ type = double ]"), Ok(BlockState(22)));
+    assert_eq!(slab(""), Ok(BlockState(35)));
+    assert_eq!(slab("[]"), Ok(BlockState(35)));
+    assert_eq!(slab("[type=top]"), Ok(BlockState(36)));
+    assert_eq!(slab("[ type = double ]"), Ok(BlockState(37)));
     assert_eq!(
         r.parse_state("boxel:nope[type=top]"),
         Err(StateParseError::UnknownBlock("boxel:nope".into()))
