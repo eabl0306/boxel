@@ -281,7 +281,12 @@ impl Water<'_> {
 
     fn spread_to_sides(&self, cx: &mut TickContext<'_>, pos: BlockPos, fluid: Fluid) {
         let amount = if fluid.falling { 7 } else { fluid.amount - 1 };
-        if amount == 0 {
+        // Nothing to write without an empty neighbor: skip the search for the way down (it
+        // only picks among the neighbors it may write to). Most ticks of standing water end here.
+        let open = HORIZONTAL
+            .iter()
+            .any(|&f| self.can_spread_to(cx.get(offset(pos, f))));
+        if amount == 0 || !open {
             return;
         }
         for (face, new) in self.spread_targets(cx, pos) {

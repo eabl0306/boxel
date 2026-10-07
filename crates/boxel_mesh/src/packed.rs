@@ -53,7 +53,7 @@ pub mod layout {
     pub const FLUID_SURFACE: f32 = 0.875;
     /// A face of a fluid cell whose top is not flat (flowing water, a slope down to a drop;
     /// ADR 0021): the top's 4 corners have their own heights, given in sixteenths of a block by
-    /// the quad ([`PackedQuad::fluid_heights`]). Per-block quads (`w = h = 1`): the 10 bits of
+    /// the quad ([`PackedQuad::fluid_heights`](crate::PackedQuad::fluid_heights)). Per-block quads (`w = h = 1`): the 10 bits of
     /// `w - 1` and `h - 1` hold the heights of corners 0 and 1 (bits 15..19 and 19..23, 4 bits
     /// each, `height - 1`) and the AO byte those of corners 2 and 3 (the quad has no AO). Corner
     /// `k` of the cell's top is at `(x, z) = (k & 1, k >> 1)`. The +Y face is the quad through

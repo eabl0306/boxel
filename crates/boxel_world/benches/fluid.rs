@@ -3,6 +3,8 @@
 //! frame while the queue is behind, the block writes per frame and the frames the flood took.
 //!
 //! `cargo bench -p boxel_world --bench fluid` (release; never while something compiles).
+#![expect(clippy::print_stdout, reason = "the bench prints its result")]
+
 use boxel_app::App;
 use boxel_math::DVec3;
 use boxel_transform::Transform;

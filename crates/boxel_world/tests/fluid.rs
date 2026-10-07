@@ -662,7 +662,7 @@ fn worldgen_water_is_still_until_an_edit_touches_it() {
     assert_eq!(engine.get([0, 0, 7]), Cell::Water(7));
 }
 
-/// SplitMix64.
+/// `SplitMix64`.
 fn mix(mut v: u64) -> u64 {
     v = v.wrapping_add(0x9E37_79B9_7F4A_7C15);
     v = (v ^ (v >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);

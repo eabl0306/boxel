@@ -22,7 +22,8 @@
 //!   frame's `BlockChanged` messages.
 use crate::{BlockChanged, BlockEdit, ChunkDataEvent, ChunkMap, EditQueue, WorldContent};
 use boxel_ecs::prelude::*;
-use boxel_voxel::{BlockId, BlockPos, BlockRegistry, BlockState, ChunkPos, Face};
+use boxel_voxel::{BlockId, BlockPos, BlockRegistry, BlockState, ChunkData, ChunkPos, Face};
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
@@ -257,16 +258,37 @@ pub struct TickContext<'a> {
     ticks: &'a mut BlockTicks,
     /// The tick's due game tick.
     tick: u64,
+    /// The last chunk read (a tick reads many blocks of one or two chunks).
+    cache: ChunkCache<'a>,
+}
+
+/// The last chunk a [`TickContext`] read, so most reads skip the map's hash lookup.
+type ChunkCache<'a> = Cell<Option<(ChunkPos, &'a ChunkData)>>;
+
+/// The block at `pos` in `map` (`None` if its chunk is not loaded), through `cache`.
+#[inline]
+fn map_block<'a>(map: &'a ChunkMap, cache: &ChunkCache<'a>, pos: BlockPos) -> Option<BlockState> {
+    let (chunk, local) = pos.split();
+    let data = match cache.get() {
+        Some((c, data)) if c == chunk => data,
+        _ => {
+            let data: &'a ChunkData = map.data_at(chunk)?;
+            cache.set(Some((chunk, data)));
+            data
+        }
+    };
+    Some(data.get(local))
 }
 
 impl<'a> TickContext<'a> {
     /// The block at `pos` (`None` where the chunk is not loaded: outside the handler's reach).
     pub fn get(&self, pos: BlockPos) -> Option<BlockState> {
-        if let Some(&state) = self.overlay.get(&pos) {
+        if !self.overlay.is_empty()
+            && let Some(&state) = self.overlay.get(&pos)
+        {
             return Some(state);
         }
-        let (chunk, local) = pos.split();
-        self.map.data_at(chunk).map(|data| data.get(local))
+        map_block(self.map, &self.cache, pos)
     }
 
     /// Writes `state` at `pos` (nothing if it is already there) and notifies `pos` and its
@@ -277,12 +299,12 @@ impl<'a> TickContext<'a> {
         }
         self.overlay.insert(pos, state);
         self.writes.push(BlockEdit { pos, state });
-        let (map, overlay) = (self.map, &*self.overlay);
+        let (map, overlay, cache) = (self.map, &*self.overlay, &self.cache);
         let state_at = |p: BlockPos| {
-            overlay.get(&p).copied().or_else(|| {
-                let (chunk, local) = p.split();
-                map.data_at(chunk).map(|data| data.get(local))
-            })
+            overlay
+                .get(&p)
+                .copied()
+                .or_else(|| map_block(map, cache, p))
         };
         self.ticks.notify(pos, self.tick, state_at);
     }
@@ -459,6 +481,7 @@ fn run_ticks(
             writes: &mut writes,
             ticks: &mut *ticks,
             tick: due,
+            cache: Cell::new(None),
         };
         (handler.tick)(&mut cx, pos, state);
     }

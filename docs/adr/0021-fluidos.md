@@ -139,7 +139,7 @@ Las de `FlowingFluid` de Minecraft Java:
   mundo). Además el presupuesto (solo atrasa), los ticks congelados y el agua generada quieta.
 - La malla se prueba contra un oráculo de alturas por esquina, sin grietas entre chunks, y los
   tres tiers dibujan agua inclinada igual píxel a píxel.
-- Rendimiento: ver la tabla de mediciones abajo.
+- Rendimiento: ver las mediciones abajo.
 - Un `BodySettings` cambiado por el juego mientras el cuerpo está en el agua se pierde al salir.
 - Los ticks congelados de un chunk que nunca vuelve quedan en memoria. Hoy los chunks no se
   guardan, así que un chunk que vuelve se genera de nuevo y el tick corre sobre él (si ya no hay
@@ -148,7 +148,32 @@ Las de `FlowingFluid` de Minecraft Java:
 
 ## Mediciones
 
-PENDIENTE
+RTX 5050 (Vulkan, tier High), stress sin tope de fps, radio 16, 3 corridas intercaladas por
+versión. La máquina estaba compartida con otros agentes, así que solo cuentan las diferencias
+grandes y el p50.
+
+| Escena | main (seco) | rama con mar | rama `--no-sea` |
+| --- | --- | --- | --- |
+| fly 32 vóxeles/s, forest: fps | 3448 a 3486 | 3552 a 3575 | 3440 a 3451 |
+| fly, forest: p99 ms | 0.73 a 0.75 | 0.73 a 0.75 | 0.75 a 0.76 |
+| fly, forest: quads al final | 1 136 977 | 1 095 583 | 1 136 977 |
+| fly sobre el lago: p50 ms | 0.246 a 0.247 | 0.230 a 0.235 | 0.239 a 0.243 |
+| quieto mirando el lago: p50 ms | 0.198 a 0.202 | 0.207 a 0.209 | 0.202 a 0.214 |
+
+- El mar no baja los fps: tapa caras de terreno bajo el agua y el mundo tiene un 3.6 % menos de
+  quads. Mirar un lago grande cuesta un poco más (el agua se mezcla encima del fondo), unos
+  0.007 ms por frame. Todos los frames quedan muy por debajo de 6.94 ms.
+- Un lago quieto cuesta los mismos quads que antes: en el bench del mesher el chunk de mar tiene
+  17 quads translúcidos en main y en la rama.
+- Malla de un chunk con superficie de mar (`gather_mesh/terrain_packed`): 98 µs en main, 103 µs
+  en la rama. Un chunk de superficie del overworld: 160.5 contra 163 µs.
+- Generar un chunk de lago (forest): 30.6 µs seco, 39.4 µs con mar; el chunk de superficie en el
+  origen, igual (126 µs). En el overworld, 37.9 contra 44.3 µs.
+- Ticks: unos 200 ticks de agua por cada ms de presupuesto durante una inundación (400 fuentes
+  en un llano con pozos, `cargo bench -p boxel_world --bench fluid`). Con el presupuesto de 1 ms,
+  una inundación grande se atrasa unos frames pero no da tirones.
+- Tests de GPU: los tres tiers dibujan el agua inclinada igual píxel a píxel (Radeon 780M, RTX
+  5050 y llvmpipe por Vulkan).
 
 ## Fuera de esta parte
 

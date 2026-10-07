@@ -24,7 +24,7 @@ fn state(registry: &BlockRegistry, name: &str) -> BlockState {
     registry.parse_state(name).expect("built-in state")
 }
 
-/// SplitMix64 of a world cell and a seed.
+/// `SplitMix64` of a world cell and a seed.
 fn hash(seed: u64, x: i64, y: i64, z: i64) -> u64 {
     let mut v = seed
         ^ (x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)

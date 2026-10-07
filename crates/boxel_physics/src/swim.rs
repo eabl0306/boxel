@@ -47,7 +47,7 @@ impl Default for SwimSettings {
     }
 }
 
-/// A body that swims in fluids (see the [module docs](self)). Needs a [`BodyPosition`] (any
+/// A body that swims in fluids (see [`SwimPlugin`]). Needs a [`BodyPosition`] (any
 /// dynamic body); a [`Collider`] gives its box (a point without one).
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct Swimmer {
@@ -77,8 +77,14 @@ pub struct SwimIntent {
     pub up: bool,
 }
 
-/// Adds swimming: [`swim_bodies`] in each fixed step, before the character controllers. Needs
-/// [`PhysicsPlugin`](crate::PhysicsPlugin) first.
+/// Adds swimming (ADR 0021): [`swim_bodies`] in each fixed step, before the character
+/// controllers. Needs [`PhysicsPlugin`](crate::PhysicsPlugin) first.
+///
+/// A [`Swimmer`] whose box touches a fluid moves as in Minecraft's water: weaker gravity, strong
+/// drag in every direction, slower walking, and it rises while [`SwimIntent::up`] is held or a
+/// jump is pressed. Entering a fluid it keeps its land `BodySettings` and walking speed and gets
+/// the water ones; leaving, it gets them back (so changes to those two made while it is in water
+/// are undone when it leaves).
 pub struct SwimPlugin;
 
 impl Plugin for SwimPlugin {
