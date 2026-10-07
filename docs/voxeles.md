@@ -30,6 +30,10 @@ total). El fragment shader interpola las 4 esquinas y aplica la luz del cielo de
 dura 20 minutos y cambiarlo es un uniform, sin remallar ni subir nada. Hay 17 bloques: los 12 de
 antes, cuatro lámparas de color y una lava provisoria. La sección 5 cuenta la subida.
 
+**Actualización (luz y física medidas, P7):** lo que cuestan la luz y los cuerpos de física en
+frames, cruces, GPU y ediciones, en la RTX y la 780M, está en
+[rendimiento/luz-fisicas-2026-10.md](rendimiento/luz-fisicas-2026-10.md).
+
 ## En resumen
 
 1. Cada chunk de 32³ se guarda comprimido con una paleta. Si es de puro aire, sus vóxeles no
