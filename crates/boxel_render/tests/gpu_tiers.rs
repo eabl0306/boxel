@@ -41,7 +41,7 @@ use boxel_gfx::{
 use boxel_math::{DVec3, I64Vec3, IVec3, UVec2};
 use boxel_mesh::{
     BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher,
-    PackedQuad, TRANSLUCENT_BUCKET,
+    PackedQuad, TRANSLUCENT_BUCKET, layout,
 };
 use boxel_render::{
     DEFAULT_SKY_COLOR, RendererConfig, RendererError, RendererSmokeTest, TranslucentSort,
@@ -343,8 +343,10 @@ fn hidden_mesh(n: u32) -> ChunkMesh {
 
 /// The blocks of ADR 0018 on a stone floor across chunks (0, 0, 0) and (1, 0, 0): a water pool
 /// in a stone rim, a glass box around a lamp-less stone pillar, bottom and top slabs as steps,
-/// short grass and poppies, and logs along X and Z. Meshed by the real mesher (no light: open
-/// sky). Returns `(chunk, mesh)` for both chunks.
+/// short grass and poppies, and logs along X and Z; and flowing water (ADR 0021): a source with
+/// its flowing levels around it (sloped tops, `SHAPE_FLUID_SLOPE`) and a source over a falling
+/// column. Meshed by the real mesher (no light: open sky). Returns `(chunk, mesh)` for both
+/// chunks.
 fn special_scene(registry: &BlockRegistry) -> Vec<(IVec3, ChunkMesh)> {
     let get = |name: &str| registry.parse_state(name).expect(name);
     let mut dense = [
@@ -409,6 +411,20 @@ fn special_scene(registry: &BlockRegistry) -> Vec<(IVec3, ChunkMesh)> {
     for z in 22..28 {
         put(40, 1, z, get("boxel:log[axis=z]"));
     }
+    // Flowing water: a source at (11, 1, 23) and the levels of its spread around it (sloped
+    // tops), and a source over a falling column at (4, 1..=5, 26).
+    for x in 5..18 {
+        for z in 18..30 {
+            let d = (x - 11i32).abs() + (z - 23i32).abs();
+            if d <= 6 {
+                put(x, 1, z, get(&format!("boxel:water[level={d}]")));
+            }
+        }
+    }
+    for y in 1..5 {
+        put(4, y, 26, get("boxel:water[level=8]"));
+    }
+    put(4, 5, 26, get("boxel:water"));
     let chunks = dense.map(|d| ChunkData::from_dense(&d));
     let materials = MaterialTable::from_registry(registry);
     let mut mesher = Mesher::new();
@@ -891,6 +907,14 @@ fn render_tier(
     }
 
     let special_meshes = special_scene(registry);
+    let sloped = special_meshes
+        .iter()
+        .flat_map(|(_, mesh)| &mesh.quads)
+        .filter(|q| q.shape() == layout::SHAPE_FLUID_SLOPE)
+        .count();
+    if sloped < 40 {
+        return Err(format!("special scene: only {sloped} sloped fluid quads"));
+    }
     let upload = |renderer: &mut VoxelRenderer, opaque_only: bool| {
         for (c, mesh) in &special_meshes {
             let mesh = if opaque_only {
