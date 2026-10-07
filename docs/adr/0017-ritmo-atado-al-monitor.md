@@ -48,16 +48,17 @@ frame de la RTX cruza por PRIME y el compositor espera su fence (sincronización
   - `FrameLimit` está en el 99 % de la frecuencia del monitor o más
     (`MonitorHandle::refresh_rate_millihertz`, que el runner consulta una vez por segundo);
   - la ventana está visible.
-- Entonces la grilla usa el período del monitor, y una update con la compuerta cerrada espera su
-  frame callback hasta un refresco y un cuarto después del deadline (lo que tarda el callback de
-  un refresco salteado) y reinicia la grilla ahí, como el enganche de ADR 0013. Si no llega, la
-  update corre sin presentar, como antes, y una ventana oculta baja a 30 Hz por el watchdog de
-  100 ms (ADR 0008).
-- La update no se adelanta cuando el callback llega antes del deadline: la grilla sigue pareja y
-  los frames duran lo mismo. Lo probamos adelantado (correr apenas llega el callback): el
-  compositor salteó lo mismo (74 contra 101 refrescos en 20 s a 144, 38 contra 66 a 143, con
-  rangos de 8 a 110 y de 3 a 146 en los dos), pero los frames heredaban el jitter de los
-  callbacks (desvío de 0.25 ms contra 0.08 sin contar los refrescos salteados).
+- Entonces el reloj es el frame callback: cada update corre apenas llega el suyo (no antes de
+  medio período después del deadline anterior; los deadlines usan el período del monitor), y con
+  la compuerta cerrada lo espera hasta un refresco y un cuarto después del deadline (lo que tarda
+  el callback de un refresco salteado), sin espera activa: el callback despierta el bucle. Si no
+  llega, la update corre sin presentar, como antes, y una ventana oculta baja a 30 Hz por el
+  watchdog de 100 ms (ADR 0008).
+- Arrancar justo en el callback le da al frame el mayor margen antes del límite del compositor.
+  Contra una grilla pareja con el período del monitor, el compositor salteó un tercio menos de
+  refrescos (593 contra 946 en 18 pares de corridas intercaladas, 12 pares a favor y 5 en
+  contra). El costo es que el tiempo entre updates hereda el jitter de los callbacks: desvío de
+  0.25 ms contra 0.08 de la grilla, sin contar los refrescos salteados.
 - Un límite más bajo sigue con la grilla y la espera corta de ADR 0013. Sin límite (0) y en X11,
   nada cambia.
 - `FramePacingInfo` (recurso de `boxel_window`) dice en cada update cuánto esperó la compuerta, si
@@ -71,16 +72,16 @@ intercaladas:
 
 | | Límite 144, antes | 144, ahora | Límite 143, antes | 143, ahora |
 |---|---:|---:|---:|---:|
-| Frames mostrados por segundo | 137 (136 a 140) | 139 (137 a 140) | 125 (123 a 129) | 141 (137 a 144) |
-| Refrescos salteados en 20 s | 130 (86 a 158) | 101 (85 a 130) | 348 (274 a 392) | 66 (4 a 146) |
-| Frames de más de 7.5 ms | 133 | 104 | 372 | 69 |
-| Updates que corrieron sin presentar | 132 | 1 | 349 | 1 |
+| Frames mostrados por segundo | 137 (136 a 140) | 140 (138 a 143) | 125 (123 a 129) | 142 (139 a 144) |
+| Refrescos salteados en 20 s | 130 (86 a 158) | 74 (8 a 110) | 348 (274 a 392) | 38 (3 a 100) |
+| Frames de más de 7.5 ms | 133 | 107 | 372 | 78 |
+| Updates que corrieron sin presentar | 132 | 2 | 349 | 2 |
 
 - Con 143 se dejan de perder 20 frames por segundo: la grilla ya no barre el ciclo del refresco.
 - Con 144 los frames de 8.7 ms seguidos de 5.2 ms desaparecen. Los refrescos salteados quedan
   (según el estado de la GPU, de 0.2 a 6 por segundo, cada unos 160 ms en las rachas malas) y se
-  ven como un frame de 13.9 ms. Sin contarlos, el tiempo entre updates es parejo: desvío de
-  0.08 ms.
+  ven como un frame de 13.9 ms. Los frames de más de 7.5 ms que no son refrescos salteados son
+  callbacks que llegaron hasta 1 ms tarde (el jitter del compositor), no tirones.
 
 - Las updates siguen corriendo en `about_to_wait`, nunca dentro de `RedrawRequested`, y nunca
   esperan un callback sin límite de tiempo, así que la simulación no se congela con la ventana
@@ -101,6 +102,10 @@ intercaladas:
   sí iban a llegar (ADR 0013 lo midió: 113 a 126 mostrados de 144).
 - Correr una update sin presentar en el refresco salteado (lo de antes): la pantalla muestra lo
   mismo, se gasta una update que no se ve, y con frames pesados atrasa la siguiente.
+- Una grilla pareja con el período del monitor que solo espera el callback cuando llega tarde
+  (la versión que medimos primero): frames parejos, pero un tercio más de refrescos salteados, y
+  depende de que winit no informe una frecuencia más baja que la real (si no, la grilla se corre
+  contra el compositor como pasaba con 143).
 - Medir la frecuencia con los callbacks en vez de preguntarle a winit: los callbacks solo llegan
   después de presentar, así que con un límite bajo medirían el límite y no el monitor.
 - Tener la GPU ocupada para que no baje de estado: gasta batería para esconder un problema del

@@ -89,9 +89,10 @@ Medido en la máquina de desarrollo (panel de 144 Hz, Wayland, radio 12, mundo c
 ## Revisión: el ritmo lo marca el monitor (ADR 0017, 2026-10-07)
 
 - Con el límite en el 99 % de la frecuencia del monitor o más, en Wayland el ritmo lo marca el
-  monitor: la grilla usa el período del monitor y la espera a la compuerta cubre un refresco
-  salteado. Así 143 deja de barrer el ciclo del refresco y un límite arriba del monitor ya no hace
-  updates que no se muestran. La espera corta de esta ADR queda para los límites más bajos.
+  monitor: cada update corre apenas llega su frame callback y la espera a la compuerta cubre un
+  refresco salteado. Así 143 deja de barrer el ciclo del refresco y un límite arriba del monitor
+  ya no hace updates que no se muestran. La espera corta de esta ADR queda para los límites más
+  bajos.
 - Los frames de 8.7 ms con tope 144 no los causaba la grilla: son refrescos que el compositor
   saltea porque la RTX termina tarde algunos frames (ADR 0017). Antes se veían como 8.7 + 5.2 ms;
   ahora como un frame de 13.9 ms, sin la update de más.

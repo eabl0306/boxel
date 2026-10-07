@@ -63,6 +63,6 @@ sistemas paralelos, que en macOS y Windows es un deadlock.
 ## Revisión: ritmo atado al monitor (ADR 0017)
 
 - Con el límite en la frecuencia del monitor o más, en Wayland el frame callback decide cuándo
-  corre la update (la grilla usa el período del monitor y la espera cubre un refresco salteado).
+  corre la update (corre apenas llega, y la espera cubre un refresco salteado).
   Las updates siguen corriendo en `about_to_wait`, nunca dentro de `RedrawRequested`, y nunca
   esperan un callback sin límite de tiempo: la simulación no se congela con la ventana oculta.

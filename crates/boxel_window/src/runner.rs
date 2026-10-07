@@ -25,8 +25,8 @@ pub enum UpdateMode {
     /// Update continuously at the [`FrameLimit`] rate (games): `ControlFlow::WaitUntil` for the
     /// coarse part of each wait, a short spin for the last fraction of a millisecond, and
     /// `ControlFlow::Poll` when the limit is 0 (unlimited). On Wayland a limit at or above the
-    /// refresh rate follows the display instead: the deadlines use the refresh period and wait
-    /// for the compositor's frame callbacks (see [`winit_runner`]).
+    /// refresh rate follows the display instead: each update runs when its frame callback
+    /// arrives (see [`winit_runner`]).
     #[default]
     Continuous,
     /// Update when an event arrives or after `wait` (tools), never faster than [`FrameLimit`].
@@ -52,8 +52,8 @@ pub struct FramePacingInfo {
     /// unknown). Polled about once per second.
     pub refresh_millihertz: Option<u32>,
     /// This update follows the display: the gate opens with the compositor's frame callbacks
-    /// and the [`FrameLimit`] is at or above the refresh rate, so the deadlines use the refresh
-    /// period and a closed gate is waited for up to a skipped refresh (see [`winit_runner`]).
+    /// and the [`FrameLimit`] is at or above the refresh rate, so updates run when the
+    /// compositor asks for a frame (see [`winit_runner`]).
     pub display_locked: bool,
     /// Updates that waited for the gate, since the window was created.
     pub gate_waits: u64,
@@ -150,14 +150,15 @@ impl Default for RunnerSettings {
 /// - Display lock (ADR 0017): when the gate follows the compositor's frame callbacks (Wayland,
 ///   and the redraws really wait for the compositor) and [`FrameLimit`] is at or above 99 % of
 ///   the monitor's refresh rate (`MonitorHandle::refresh_rate_millihertz`, polled every
-///   second), updates follow the display: the deadlines use the refresh period, and a due
-///   frame whose gate is closed waits for its frame callback up to a refresh and a quarter
-///   past the deadline (a compositor that skipped a refresh sends it one refresh late) and
-///   restarts the grid there. Without a callback by then the update runs without presenting,
-///   as before; a hidden window falls to 30 Hz through the redraw watchdog. So a limit of 143
-///   no longer drifts against a 143.88 Hz panel, a skipped refresh is one long frame instead
-///   of an update that is never shown, and a limit above the refresh rate no longer runs
-///   updates that cannot be shown.
+///   second), updates follow the display: each one runs as soon as its frame callback arrives
+///   (not before half a refresh period after the previous deadline), and a closed gate is
+///   waited for up to a refresh and a quarter past the deadline (a compositor that skipped a
+///   refresh sends the callback one refresh late). Without a callback by then the update runs
+///   without presenting, as before; a hidden window falls to 30 Hz through the redraw
+///   watchdog. So a limit of 143 no longer drifts against a 143.88 Hz panel, a skipped refresh
+///   is one long frame instead of an update that is never shown, a limit above the refresh
+///   rate no longer runs updates that cannot be shown, and each frame gets the most time
+///   before the compositor's deadline.
 pub fn winit_runner(mut app: App, event_loop: EventLoop<()>) -> AppExit {
     let settings = app
         .world()
@@ -503,13 +504,16 @@ impl RunnerCore {
     /// callback just after the deadline is not missed (measured on a 144 Hz panel at 144 fps
     /// with `Mailbox`: without it 113 to 126 frames shown per second, with it 136 to 143).
     ///
-    /// When updates follow the display ([`RunnerCore::display_period`]) the period is the
-    /// refresh period and the wait window grows by a whole refresh ([`RunnerCore::gate_window`]):
-    /// a compositor that skipped a refresh (for example because the GPU finished the previous
-    /// frame late) sends the callback one refresh late, and running an update without
-    /// presenting in the meantime shows nothing more. The grid itself stays regular (an update
-    /// does not run early when its callback came before the deadline), so frame times stay
-    /// even.
+    /// When updates follow the display ([`RunnerCore::display_period`]) the frame callback is
+    /// the clock: an update runs as soon as a frame callback opens its gate, from half a period
+    /// before its deadline on ([`display_window`]; the deadlines use the refresh period), and
+    /// a closed gate is waited for up to a refresh and a quarter past the deadline, since a
+    /// compositor that skipped a refresh (for example because the GPU finished the previous
+    /// frame late) sends the callback one refresh late and an update run in the meantime would
+    /// not be shown. There is no spin: the callback wakes the loop. Starting right at the
+    /// callback gives the frame the most time before the compositor's next deadline (measured:
+    /// about a third fewer refreshes skipped than a regular grid at the refresh period), at the
+    /// cost of frame times that follow the callbacks' jitter (0.25 ms standard deviation).
     ///
     /// No wait while unlimited, occluded, or when no redraw is pending (no renderer, or X11,
     /// where the redraw arrives at once).
@@ -518,26 +522,28 @@ impl RunnerCore {
         let (Some(period), Some(due)) = (period, self.pacer.next_frame(period)) else {
             return (FrameWait::Ready, None);
         };
+        let hold = |until: Option<Instant>| match until {
+            Some(until) if now < until => (FrameWait::Sleep { wake: until }, Some(due)),
+            _ => (FrameWait::Ready, None),
+        };
+        if self.display_period(world).is_some() {
+            let (earliest, latest) = display_window(due, period);
+            if self.gate_closed(world) {
+                return hold(latest);
+            }
+            if self.gate_was_callback && frame_ready(world) {
+                return match earliest {
+                    Some(earliest) if now < earliest => (FrameWait::Sleep { wake: earliest }, None),
+                    _ => (FrameWait::Ready, None),
+                };
+            }
+            return (self.pacer.wait(now, Some(period)), None);
+        }
         match self.pacer.wait(now, Some(period)) {
             FrameWait::Ready if self.gate_closed(world) => {
-                match due.checked_add(self.gate_window(world, period)) {
-                    Some(until) if now < until => (FrameWait::Sleep { wake: until }, Some(due)),
-                    _ => (FrameWait::Ready, None),
-                }
+                hold(due.checked_add(gate_window(period)))
             }
             wait => (wait, None),
-        }
-    }
-
-    /// How long a due frame may wait for its presentation gate: a quarter of the period, at
-    /// most `GATE_WAIT_MAX`; following the display, a whole refresh more (the frame callback
-    /// of a refresh the compositor skipped).
-    fn gate_window(&self, world: &World, period: Duration) -> Duration {
-        let short = (period / 4).min(GATE_WAIT_MAX);
-        if self.display_period(world).is_some() {
-            period + short
-        } else {
-            short
         }
     }
 
@@ -727,14 +733,23 @@ impl RunnerCore {
         let due = self.pacer.next_frame(period);
         self.publish_pacing(world, now, display);
         self.pacer.start_frame(now, period);
-        // Phase lock (see `plan`): the gate opened after the deadline, within the wait window,
-        // so this update waited for the frame callback; the grid restarts there.
+        // Phase lock (see `plan`): the grid restarts at the frame callback that opened this
+        // update's gate. Following the display, a callback inside the display window; else one
+        // that came after the deadline, within the wait window (this update waited for it).
         if let (Some(due), Some(period), Some(opened)) = (due, period, self.gate_opened_at)
-            && opened > due
-            && opened - due <= self.gate_window(world, period)
             && frame_ready(world)
         {
-            self.pacer.reanchor(opened);
+            let lock = if display {
+                let (earliest, latest) = display_window(due, period);
+                self.gate_was_callback
+                    && earliest.is_none_or(|earliest| opened >= earliest)
+                    && latest.is_some_and(|latest| opened <= latest)
+            } else {
+                opened > due && opened - due <= gate_window(period)
+            };
+            if lock {
+                self.pacer.reanchor(opened);
+            }
         }
     }
 
@@ -790,6 +805,22 @@ impl RunnerCore {
             control_flow,
         }
     }
+}
+
+/// How long a due frame may wait for its presentation gate on the limit's grid: a quarter of
+/// the period, at most `GATE_WAIT_MAX`.
+fn gate_window(period: Duration) -> Duration {
+    (period / 4).min(GATE_WAIT_MAX)
+}
+
+/// While updates follow the display: the earliest an update may run once its frame callback
+/// came (half a period before its deadline) and the latest it waits for one (a refresh and a
+/// quarter after it). `None` where an instant is not representable.
+fn display_window(due: Instant, period: Duration) -> (Option<Instant>, Option<Instant>) {
+    (
+        due.checked_sub(period / 2),
+        due.checked_add(period + gate_window(period)),
+    )
 }
 
 /// The presentation gate (`WindowState::frame_ready`) is open.
@@ -1523,35 +1554,34 @@ mod tests {
     #[test]
     fn display_locked_updates_follow_the_frame_callbacks() {
         let us = Duration::from_micros;
-        let margin = FramePacer::DEFAULT_SPIN_MARGIN;
         let panel = Duration::from_nanos(1_000_000_000_000 / u64::from(PANEL_MHZ));
-        let window = panel + panel / 4;
         let pacing = |app: &App| *app.world().resource::<FramePacingInfo>();
         let (mut app, mut core, t0) = display(144);
         let end = present(&mut app, &mut core, t0);
         assert!(pacing(&app).display_locked);
-        // The deadlines use the panel's period.
+        // The next callback wakes the loop: no deadline wake-up, no spin.
         let due = t0 + panel;
-        assert_eq!(end.control_flow, ControlFlow::WaitUntil(due - margin));
-
-        // The callback comes 0.4 ms before the deadline: the update still runs on the grid, so
-        // frame times stay even.
-        core.gate_opened(app.world_mut(), due - us(400));
+        let latest = due + panel + panel / 4;
+        assert_eq!(end.control_flow, ControlFlow::WaitUntil(latest));
         assert_eq!(
             core.pace(app.world(), due - us(400)),
-            FrameWait::Sleep { wake: due - margin }
+            FrameWait::Sleep { wake: latest }
         );
-        assert_eq!(core.pace(app.world(), due), FrameWait::Ready);
-        present(&mut app, &mut core, due);
+
+        // The callback comes 0.4 ms before the deadline: run at once, the grid follows it.
+        let callback = due - us(400);
+        core.gate_opened(app.world_mut(), callback);
+        assert_eq!(core.pace(app.world(), callback), FrameWait::Ready);
+        present(&mut app, &mut core, callback);
         assert_eq!(pacing(&app).gate_wait, Duration::ZERO);
-        let due = due + panel;
+        let due = callback + panel;
         assert_eq!(core.pacer.next_frame(Some(panel)), Some(due));
 
-        // 0.3 ms after the deadline: it waits, and the grid restarts at the callback.
-        assert_eq!(
+        // 0.3 ms after the deadline: it waited 0.3 ms, presents, and the grid follows.
+        assert!(matches!(
             core.pace(app.world(), due),
-            FrameWait::Sleep { wake: due + window }
-        );
+            FrameWait::Sleep { .. }
+        ));
         let callback = due + us(300);
         core.gate_opened(app.world_mut(), callback);
         assert_eq!(core.pace(app.world(), callback), FrameWait::Ready);
@@ -1559,7 +1589,6 @@ mod tests {
         assert_eq!(pacing(&app).gate_wait, us(300));
         assert!(!pacing(&app).gate_missed);
         let due = callback + panel;
-        assert_eq!(core.pacer.next_frame(Some(panel)), Some(due));
 
         // The compositor skipped a refresh: the callback comes a whole refresh late and the
         // update waits for it instead of running without presenting.
@@ -1574,29 +1603,38 @@ mod tests {
         assert_eq!(pacing(&app).gate_wait, panel + us(100));
         assert!(!pacing(&app).gate_missed);
         let due = callback + panel;
-        assert_eq!(core.pacer.next_frame(Some(panel)), Some(due));
 
-        // No callback at all (hidden window): give up a refresh and a quarter late, and the
-        // grid restarts there (more than a period late).
+        // A callback far too early (after the redraw was requested) waits until half a period
+        // before the deadline.
+        let early = due - panel + us(1500);
+        core.gate_opened(app.world_mut(), early);
+        assert_eq!(
+            core.pace(app.world(), early),
+            FrameWait::Sleep {
+                wake: due - panel / 2
+            }
+        );
+        assert_eq!(core.pace(app.world(), due - panel / 2), FrameWait::Ready);
+        present(&mut app, &mut core, due - panel / 2);
+        let due = due - panel / 2 + panel;
+
+        // No callback at all (hidden window): give up a refresh and a quarter late.
+        let latest = due + panel + panel / 4;
         assert_eq!(
             core.pace(app.world(), due),
-            FrameWait::Sleep { wake: due + window }
+            FrameWait::Sleep { wake: latest }
         );
-        assert_eq!(core.pace(app.world(), due + window), FrameWait::Ready);
-        core.begin_update(app.world_mut(), due + window);
+        assert_eq!(core.pace(app.world(), latest), FrameWait::Ready);
+        core.begin_update(app.world_mut(), latest);
         let info = pacing(&app);
         assert!(info.gate_missed);
-        assert_eq!(info.gate_wait, window);
-        assert_eq!(
-            core.pacer.next_frame(Some(panel)),
-            Some(due + window + panel)
-        );
+        assert_eq!(info.gate_wait, panel + panel / 4);
+        // The grid restarts there (more than a period late).
+        assert_eq!(core.pacer.next_frame(Some(panel)), Some(latest + panel));
 
         // A limit under 99 % of the panel keeps its own grid and the short wait.
         app.insert_resource(FrameLimit::new(120));
         assert!(core.display_period(app.world()).is_none());
-        let period = FrameLimit::new(120).period().expect("limited");
-        assert_eq!(core.gate_window(app.world(), period), GATE_WAIT_MAX);
     }
 
     #[test]
