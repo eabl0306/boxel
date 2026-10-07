@@ -183,6 +183,12 @@ pub struct RunInfo {
     /// `on` when the requested present mode is vsync (`--vsync on`, `--present vsync`), else
     /// `off`. Empty in runs from before the option.
     pub vsync: String,
+    /// Block textures (`--pack`): `none` for the procedural ones, else the pack directory's name.
+    /// Empty in runs from before the option (procedural).
+    pub pack: String,
+    /// Milliseconds the renderer took to read the pack and build the texture array
+    /// (`RenderInfo::textures`; `None` before the GPU was selected).
+    pub texture_load_ms: Option<f64>,
     /// The present mode the surface got (`RenderInfo::present_mode`, `Mailbox`, `Fifo`...).
     pub present_mode: String,
     /// Refresh rate of the window's monitor in Hz, as the runner saw it (`None`: unknown).
@@ -918,6 +924,8 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
         ("world", Json::Str(info.world.clone())),
         ("trees", Json::Bool(info.trees)),
         ("light", Json::Str(info.light.clone())),
+        ("pack", Json::Str(info.pack.clone())),
+        ("texture_load_ms", Json::opt(info.texture_load_ms, 2)),
         ("arena_quads", Json::uint(info.arena_quads)),
         ("chunk_slots", Json::uint(info.chunk_slots)),
         ("vertical", Json::Str(info.vertical.clone())),
@@ -1102,6 +1110,10 @@ pub fn run_title(info: &RunInfo) -> String {
     if info.light == "off" {
         title = format!("{title} light off");
     }
+    // So do the procedural textures.
+    if !info.pack.is_empty() && info.pack != "none" {
+        title = format!("{title} pack {}", info.pack);
+    }
     if info.fps_limit > 0 {
         title = format!("{title} limit {} fps", info.fps_limit);
     }
@@ -1164,7 +1176,8 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
     let _ = writeln!(
         out,
         "- World: {}, seed {}, trees {}, light {}, radius {}, settled in {:.2} s with {} chunks; \
-         {:.0} s measured after {:.0} s of warmup. Renderer: {} quads, {} chunk slots.{}\n",
+         {:.0} s measured after {:.0} s of warmup. Renderer: {} quads, {} chunk slots, textures \
+         {}.{}\n",
         if info.world.is_empty() {
             "?"
         } else {
@@ -1184,6 +1197,11 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
         info.warmup_s,
         info.arena_quads,
         info.chunk_slots,
+        match (info.pack.as_str(), info.texture_load_ms) {
+            ("" | "none", _) => "procedural".to_string(),
+            (pack, Some(ms)) => format!("{pack} (loaded in {ms:.1} ms)"),
+            (pack, None) => pack.to_string(),
+        },
         if info.time.is_empty() {
             String::new()
         } else {

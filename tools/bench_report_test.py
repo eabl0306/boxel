@@ -366,6 +366,27 @@ class OutputTest(unittest.TestCase):
         self.assertIn('light none -> off', out)
         self.assertIn('| p99 ms | 3 | 2.50 | -16.7 % | better |', out)
 
+    def test_compare_directories_keeps_packs_apart(self):
+        # No pack field: the procedural textures ('none').
+        pack = copy.deepcopy(SAMPLE)
+        pack['run']['pack'] = 'BlockPixel'
+        pack['run']['texture_load_ms'] = 41.5
+        self.write('1-old.md', SAMPLE, 'base')
+        self.write('2-pack.md', pack, 'base')
+        self.write('3-none.md', SAMPLE, 'new')
+        self.write('4-pack.json', pack, 'new')
+        code, out, _ = run_main('--compare', os.path.join(self.dir.name, 'base'),
+                                os.path.join(self.dir.name, 'new'))
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count('### '), 2, 'procedural with procedural, pack with pack')
+        self.assertIn('### fly r16 32 vox/s pack BlockPixel: 2-pack.md -> 4-pack.json', out)
+        self.assertIn('1-old.md -> 3-none.md', out)
+        self.assertEqual(br.load(os.path.join(self.dir.name, 'base', '1-old.md'))['run']['pack'],
+                         'none')
+        code, out, _ = run_main('--compare', self.write('a.md', SAMPLE), self.write('b.md', pack))
+        self.assertEqual(code, 0)
+        self.assertIn('pack none -> BlockPixel', out)
+
     def test_usage_errors(self):
         self.assertEqual(run_main()[0], 1)
         self.assertEqual(run_main('--help')[0], 0)

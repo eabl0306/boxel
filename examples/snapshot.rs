@@ -10,10 +10,11 @@
 //! (the meshes keep their baked light, as in the game). Blocks given with `--place`, `--drop` and
 //! `--fill` are set once the area is loaded, and the shots wait for the remeshes they cause.
 //!
-//! Output (stdout): `gpu: <adapter summary>`; with edits, one `drop:` line per `--drop` (where
-//! the block landed) and `edits: set=N skipped=N not_applied=N`; then `world: <world>
-//! chunks=N meshes=N quads=N light=on|off settled_after=S`, `camera: ...` (the light of the
-//! camera's cell, the ground under it and what the center of the view hits, to aim the edits),
+//! Output (stdout): `gpu: <adapter summary>`, `textures: <source, size, pack load time>`; with
+//! edits, one `drop:` line per `--drop` (where the block landed) and `edits: set=N skipped=N
+//! not_applied=N`; then `world: <world> chunks=N meshes=N quads=N light=on|off settled_after=S`,
+//! `camera: ...` (the light of the camera's cell, the ground under it and what the center of the
+//! view hits, to aim the edits),
 //! and one `shot:` line per image with the scene light and the mean sRGB brightness (0 to 255).
 //! The same camera and options give the same pixels on the same GPU and driver.
 //!
@@ -23,6 +24,8 @@
 
 #[path = "shared/clock.rs"]
 mod clock;
+#[path = "shared/pack.rs"]
+mod pack;
 #[path = "shared/world.rs"]
 mod world;
 
@@ -35,7 +38,8 @@ use boxel::log::LogPlugin;
 use boxel::mesh::AoPolicy;
 use boxel::prelude::*;
 use boxel::render::{
-    RenderSettings, RendererConfig, SceneLight, ViewParams, VoxelRenderer, light_curve,
+    RenderSettings, RendererConfig, SceneLight, TextureSource, ViewParams, VoxelRenderer,
+    light_curve, load_block_textures,
 };
 use boxel::voxel::{BlockRegistry, MAX_BLOCK_COORD};
 use boxel::world::{DaylightCurve, WorldStats};
@@ -72,7 +76,8 @@ usage: snapshot --camera X,Y,Z,YAW,PITCH --shot HH:MM=PATH [--shot ...] [options
 /// The whole help: [`USAGE`], the world options and the GPU flags.
 fn usage() -> String {
     format!(
-        "{USAGE}\nworld options:\n{}\n\n{CLI_HELP}",
+        "{USAGE}\n{}\nworld options:\n{}\n\n{CLI_HELP}",
+        pack::USAGE,
         world::usage(World::Overworld)
     )
 }
@@ -120,6 +125,7 @@ struct Options {
     /// (block name, edit), in order.
     edits: Vec<(String, Edit)>,
     timeout: Duration,
+    textures: TextureSource,
 }
 
 /// `Ok(None)` for `--help`.
@@ -136,6 +142,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         ao: AoPolicy::default(),
         edits: Vec::new(),
         timeout: Duration::from_secs(300),
+        textures: TextureSource::Procedural,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -196,6 +203,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                 };
             }
             "--place" | "--drop" | "--fill" => o.edits.push(parse_edit(flag, &value()?)?),
+            "--pack" => o.textures = pack::parse(flag, &value()?)?,
             "--timeout" => {
                 let v = value()?;
                 o.timeout = v
@@ -543,9 +551,17 @@ fn run(
     let gpu = init_headless(&prefs).map_err(|e| gpu_err(e.to_string()))?;
     println!("gpu: {}", gpu.summary_line());
 
+    // Block textures (a resource pack is read here, before the world).
+    let registry = Arc::new(BlockRegistry::default_blocks());
+    let (textures, report) =
+        load_block_textures(&registry, &o.textures).map_err(|e| (EXIT_USAGE, e))?;
+    for w in &report.warnings {
+        eprintln!("snapshot: warning: textures: {w}");
+    }
+    println!("textures: {}", pack::summary(&report));
+
     // The world, loaded around the camera.
     let started = Instant::now();
-    let registry = Arc::new(BlockRegistry::default_blocks());
     let mut app = App::new();
     app.add_plugins((
         LogPlugin {
@@ -663,7 +679,7 @@ fn run(
             arena_quads,
             max_chunk_slots,
         },
-        registry.textures(),
+        &textures,
         gpu.output_format,
         size,
     )
@@ -761,6 +777,7 @@ mod tests {
             &["--camera", "1,2,3"],
             &["--camera", "3e18,0,0,0,0"],
             &["--ao", "on"],
+            &["--pack", "/nonexistent/boxel/pack"],
         ] {
             let mut args = BASE.to_vec();
             args.extend_from_slice(bad);
