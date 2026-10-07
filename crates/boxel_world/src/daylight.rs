@@ -80,11 +80,12 @@ impl TimeOfDay {
         (self.day_fraction() * 24.0 + SUNRISE_HOUR).rem_euclid(24.0)
     }
 
-    /// Moves to clock `hours` of the current day (wrapped to `0..24`).
+    /// Moves to clock `hours` of the current day (wrapped to `0..24`): the first tick at or
+    /// after it, so [`TimeOfDay::clock_text`] shows the minute that was set.
     pub fn set_clock(&mut self, hours: f64) {
         let since_sunrise = (hours - SUNRISE_HOUR).rem_euclid(24.0) / 24.0;
         let len = self.day_len();
-        let tick = ((since_sunrise * len as f64).round() as u64).min(len - 1);
+        let tick = ((since_sunrise * len as f64).ceil() as u64).min(len - 1);
         self.tick = self.day() * len + tick;
     }
 
@@ -114,9 +115,12 @@ impl TimeOfDay {
         (self.day_fraction() * TAU).sin()
     }
 
-    /// `HH:MM` of [`TimeOfDay::clock`].
+    /// `HH:MM` of [`TimeOfDay::clock`], the minute rounded down (exact: integer ticks).
     pub fn clock_text(&self) -> String {
-        let minutes = (self.clock() * 60.0).floor() as u64 % (24 * 60);
+        const DAY_MINUTES: u128 = 24 * 60;
+        let since_sunrise =
+            u128::from(self.tick_of_day()) * DAY_MINUTES / u128::from(self.day_len());
+        let minutes = (since_sunrise + SUNRISE_HOUR as u128 * 60) % DAY_MINUTES;
         format!("{:02}:{:02}", minutes / 60, minutes % 60)
     }
 }
@@ -289,6 +293,17 @@ mod tests {
         }
         assert_eq!(TimeOfDay::at_clock(6.0).tick, 0);
         assert_eq!(noon.ticks_per_hour(), 3200);
+    }
+
+    /// `--time HH:MM` shows `HH:MM`: every minute of the day.
+    #[test]
+    fn every_minute_shows_as_set() {
+        for minute in 0..24 * 60_u32 {
+            let (h, m) = (minute / 60, minute % 60);
+            let time = TimeOfDay::at_clock(f64::from(h) + f64::from(m) / 60.0);
+            assert_eq!(time.clock_text(), format!("{h:02}:{m:02}"));
+            assert!(time.clock() * 60.0 >= f64::from(minute) - 1e-6, "{h}:{m}");
+        }
     }
 
     #[test]

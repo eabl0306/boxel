@@ -7,8 +7,9 @@
 //!   `i` is outside `WorldSettings::vertical_bounds` or has a slot whose data is `Ready` or
 //!   `Missing`. Slots still waiting for their data get their bits when it arrives (nothing reads
 //!   them before).
-//! - A slot has at most one job in flight (generation runs before meshing, and a mesh job is only
-//!   dispatched from `MeshState::Queued`).
+//! - A slot has at most one generation or mesh job in flight (generation runs before meshing,
+//!   and a mesh job is only dispatched from `MeshState::Queued`), plus at most one light job
+//!   (`ChunkSlot::light_job`).
 //! - `WorldJobs::published` holds exactly the chunks whose last event was an `Upsert`, so every
 //!   `Upsert` is eventually followed by a `Remove` (unload, remesh to empty) or a replacing
 //!   `Upsert`.
@@ -22,10 +23,12 @@
 use crate::interest::{Level, Planner, Viewer};
 use crate::jobs::JobExecutor;
 use crate::scheduler::{JobId, JobKind, JobScheduler};
-use crate::sky::{ColumnId, SkyMap, SkyRule, SkyState, WalkJob, may_block, padded_chunks};
+use crate::sky::{
+    ColumnId, SkyMap, SkyRule, SkyState, WalkJob, layer_below, may_block, padded_chunks,
+};
 use crate::{
-    BlockEdit, ChunkId, ChunkMap, ChunkMeshEvent, ChunkSlot, DataState, Interest, MeshState,
-    WorldContent, WorldSettings, WorldStats,
+    BlockEdit, CachedLight, ChunkId, ChunkMap, ChunkMeshEvent, ChunkSlot, DataState, Interest,
+    MeshState, WorldContent, WorldSettings, WorldStats,
 };
 use boxel_ecs::prelude::*;
 use boxel_light::{
@@ -35,7 +38,7 @@ use boxel_light::{
 use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher};
 use boxel_voxel::{
     BlockPos, BlockRegistry, BlockState, CHUNK_SHIFT, ChunkData, ChunkKey, ChunkPos, Face,
-    LightValue, LocalPos, NEIGHBOR_OFFSETS, RenderShape, neighbor_index,
+    LightValue, LocalPos, NEIGHBOR_OFFSETS, OPAQUE_OPACITY, RenderShape, neighbor_index,
 };
 use crossbeam_channel::{Receiver, Sender};
 use std::cell::RefCell;
@@ -69,6 +72,18 @@ const _: () = assert!(
 /// Stale job priorities refreshed per frame whatever the interest budget says (progress), and
 /// the batch size of the refreshes that use the rest of the budget.
 const PRIORITY_BATCH: usize = 256;
+
+/// Added to the priority (squared chunk distance) of light jobs: they run after the mesh jobs
+/// of a view of radius 16 around their viewer, so they fill the light cache when streaming
+/// leaves room, without delaying it.
+const LIGHT_JOB_BIAS: u32 = 16 * 16;
+
+/// Largest `WorldSettings::light_cache_radius` (larger values are clamped): about 137 000
+/// chunks within it, already far more light than is worth keeping (16 to 64 KiB per lit chunk).
+pub(crate) const MAX_LIGHT_CACHE_RADIUS: u32 = 32;
+
+/// Light cache positions checked per frame whatever the interest budget says (progress).
+const MIN_LIGHT_STEPS: usize = 256;
 
 /// Jobs started or priorities refreshed between two checks of the job budget.
 const DISPATCH_CHECK: usize = 16;
@@ -105,9 +120,16 @@ pub(crate) enum JobMessage {
         epoch: u32,
         mesh: ChunkMesh,
         /// The chunk's light, when the job keeps it (within `light_cache_radius`).
-        light: Option<Arc<ChunkLight>>,
+        light: Option<ChunkLight>,
         /// How the light box was computed (`None`: light off).
         path: Option<LightPath>,
+    },
+    /// A light job finished.
+    Lit {
+        id: ChunkId,
+        data_version: u32,
+        epoch: u32,
+        light: ChunkLight,
     },
     /// A sky walk finished.
     Walked {
@@ -143,7 +165,7 @@ struct MeshedResult {
     data_version: u32,
     epoch: u32,
     mesh: ChunkMesh,
-    light: Option<Arc<ChunkLight>>,
+    light: Option<ChunkLight>,
 }
 
 /// The remeshes requested by one call of [`WorldJobs::apply_edits`] (or by the sky tiles it sent
@@ -533,12 +555,24 @@ pub(crate) struct WorldJobs {
     next_batch: u32,
     /// Light counters for [`WorldStats`] (`waiting_sky` is a gauge, the rest add up).
     light_counts: WorldStats,
+    /// Viewer chunks (by viewer id) and light cache radius of the last light cache plan.
+    light_plan: Option<(Vec<(u64, ChunkPos)>, u32)>,
+    /// Positions whose distance to the viewers may have crossed the light cache radius since
+    /// the last plan: their slot fills or drops its cached light.
+    light_backlog: Vec<ChunkPos>,
     /// Mesh jobs started per chunk position (tests: no light ripples).
     #[cfg(test)]
     pub(crate) mesh_jobs: std::collections::HashMap<ChunkPos, u32>,
     /// Mesh results waiting for the event budget (`scheduler.complete()` already called; their
     /// slots stay `InFlight` until applied, so the world is not settled while any wait).
     pending: VecDeque<MeshedResult>,
+    /// Mesh results of slots in an edit batch: applied before `pending`, whatever the event
+    /// budget (a batch is published as a whole anyway), so a streaming backlog never delays an
+    /// edit.
+    batch_pending: Vec<MeshedResult>,
+    /// A slot whose result may wait in `pending` joined an edit batch: `pending` is searched for
+    /// batch results once before the next results are applied.
+    rescan_pending: bool,
     /// Chunks whose last published event was an `Upsert`, with that mesh (an identical new
     /// mesh is not sent again).
     published: std::collections::HashMap<ChunkId, Arc<ChunkMesh>, foldhash::fast::FixedState>,
@@ -582,9 +616,13 @@ impl WorldJobs {
             batches: BTreeMap::new(),
             next_batch: 0,
             light_counts: WorldStats::default(),
+            light_plan: None,
+            light_backlog: Vec::new(),
             #[cfg(test)]
             mesh_jobs: std::collections::HashMap::new(),
             pending: VecDeque::new(),
+            batch_pending: Vec::new(),
+            rescan_pending: false,
             published: std::collections::HashMap::default(),
             planner: Planner::default(),
             auto_cap: AutoCap::new(workers),
@@ -610,7 +648,13 @@ impl WorldJobs {
     /// True if mesh results wait for the event budget, or an edit batch is open (its results
     /// may be held, and it ages every frame).
     pub(crate) fn has_meshes(&self) -> bool {
-        !self.pending.is_empty() || !self.batches.is_empty()
+        !self.pending.is_empty() || !self.batch_pending.is_empty() || !self.batches.is_empty()
+    }
+
+    /// Mesh results waiting to be applied (tests).
+    #[cfg(test)]
+    pub(crate) fn pending_meshes(&self) -> usize {
+        self.pending.len() + self.batch_pending.len()
     }
 
     /// Copies the light counters into `stats`.
@@ -618,6 +662,7 @@ impl WorldJobs {
         let c = &self.light_counts;
         stats.light_full = c.light_full;
         stats.light_fast = c.light_fast;
+        stats.light_jobs = c.light_jobs;
         stats.sky_walks = c.sky_walks;
         stats.sky_private_generations = c.sky_private_generations;
         stats.waiting_sky = c.waiting_sky;
@@ -647,7 +692,7 @@ impl WorldJobs {
     // ---- Interest ----------------------------------------------------------------------------
 
     /// True if the viewers or the interest settings changed since the last plan, or earlier
-    /// interest work (positions, stale priorities) is still pending.
+    /// interest work (positions, stale priorities, light cache positions) is still pending.
     pub(crate) fn interest_pending(
         &self,
         viewers: &[(u64, Viewer)],
@@ -655,6 +700,8 @@ impl WorldJobs {
     ) -> bool {
         self.planner.backlog() > 0
             || self.scheduler.stale() > 0
+            || !self.light_backlog.is_empty()
+            || self.light_plan_changed(viewers, light_cache_radius(settings))
             || self.planner.changed(
                 viewers,
                 settings.unload_hysteresis,
@@ -678,8 +725,113 @@ impl WorldJobs {
         {
             let _span = frame_span!("world.plan");
             self.plan_interest(cx, settings, viewers);
+            self.plan_light(cx, settings, viewers);
         }
         self.process_interest(cx, settings, settings.interest_budget);
+    }
+
+    /// True if the viewers' chunks or the light cache radius changed since the last light plan.
+    fn light_plan_changed(&self, viewers: &[(u64, Viewer)], radius: u32) -> bool {
+        self.light_plan.as_ref().is_none_or(|(centers, r)| {
+            *r != radius
+                || centers.len() != viewers.len()
+                || centers
+                    .iter()
+                    .zip(viewers)
+                    .any(|(&(a, c), &(b, v))| a != b || c != v.center)
+        })
+    }
+
+    /// Lists the positions whose distance to the viewers crossed the light cache radius since
+    /// the last light plan (into a sphere or out of all of them): `refresh_light_cache` then
+    /// fills or drops their light. A move lists two shells, a new viewer or radius whole
+    /// spheres.
+    fn plan_light(&mut self, cx: &Ctx<'_>, settings: &WorldSettings, viewers: &[(u64, Viewer)]) {
+        let radius = light_cache_radius(settings);
+        self.light_cache_sq = radius * radius;
+        if !self.light_plan_changed(viewers, radius) {
+            return;
+        }
+        let new: Vec<(u64, ChunkPos)> = viewers.iter().map(|&(id, v)| (id, v.center)).collect();
+        let (old, old_radius) = self
+            .light_plan
+            .replace((new.clone(), radius))
+            .unwrap_or_default();
+        if cx.sky.rule == SkyRule::Off {
+            return;
+        }
+        let out = &mut self.light_backlog;
+        let centers = |list: &[(u64, ChunkPos)]| list.iter().map(|&(_, c)| c).collect::<Vec<_>>();
+        let (old_centers, new_centers) = (centers(&old), centers(&new));
+        let outside = |p: ChunkPos, centers: &[ChunkPos], r: u32| {
+            centers
+                .iter()
+                .all(|c| p.distance_sq(*c) > u128::from(r) * u128::from(r))
+        };
+        // Viewers paired by id (both lists are sorted by id).
+        let (mut i, mut j) = (0, 0);
+        while i < old.len() || j < new.len() {
+            let (o, n) = (old.get(i), new.get(j));
+            let (from, to) = match (o, n) {
+                (Some(&(a, _)), Some(&(b, _))) if a == b => {
+                    i += 1;
+                    j += 1;
+                    (o.map(|o| o.1), n.map(|n| n.1))
+                }
+                (Some(&(a, _)), Some(&(b, _))) if a < b => {
+                    i += 1;
+                    (o.map(|o| o.1), None)
+                }
+                (Some(_), None) => {
+                    i += 1;
+                    (o.map(|o| o.1), None)
+                }
+                _ => {
+                    j += 1;
+                    (None, n.map(|n| n.1))
+                }
+            };
+            if from == to && radius == old_radius {
+                continue;
+            }
+            if let Some(to) = to {
+                sphere_minus(to, radius, from.map(|f| (f, old_radius)), |p| {
+                    if outside(p, &old_centers, old_radius) {
+                        out.push(p);
+                    }
+                });
+            }
+            if let Some(from) = from {
+                sphere_minus(from, old_radius, to.map(|t| (t, radius)), |p| {
+                    if outside(p, &new_centers, radius) {
+                        out.push(p);
+                    }
+                });
+            }
+        }
+    }
+
+    /// Fills or drops the cached light of the listed positions (at least [`MIN_LIGHT_STEPS`],
+    /// then until `budget` after `start`): a slot within the light cache radius gets a light
+    /// job if its light is not current, one outside it drops its light.
+    fn refresh_light_cache(&mut self, cx: &mut Ctx<'_>, start: Instant, budget: Duration) {
+        let mut steps = 0usize;
+        while let Some(p) = self.light_backlog.pop() {
+            if let Some(id) = cx.map.id_at(p) {
+                if self.planner.priority(p) <= self.light_cache_sq {
+                    self.want_light(cx, id);
+                } else {
+                    cx.map.set_light(id, None);
+                }
+            }
+            steps += 1;
+            if steps >= MIN_LIGHT_STEPS
+                && steps.is_multiple_of(DISPATCH_CHECK)
+                && start.elapsed() >= budget
+            {
+                break;
+            }
+        }
     }
 
     /// Records new viewers or settings: lists the positions to re-evaluate (nothing is applied
@@ -751,8 +903,9 @@ impl WorldJobs {
 
     /// Applies planned interest work for about `budget`: re-evaluates listed positions (at least
     /// [`MIN_INTEREST_STEPS`]), then refreshes stale job priorities (one batch whatever the
-    /// budget, more while it lasts). Positions go first so the refresh drops the jobs of the slots
-    /// they unloaded.
+    /// budget, more while it lasts), then fills or drops the light cache of the positions that
+    /// crossed its radius (at least [`MIN_LIGHT_STEPS`]). Positions go first so the refresh
+    /// drops the jobs of the slots they unloaded.
     pub(crate) fn process_interest(
         &mut self,
         cx: &mut Ctx<'_>,
@@ -825,11 +978,15 @@ impl WorldJobs {
             timer.report();
         }
         self.interest_steps += steps;
-        let _span = frame_span!("world.priorities");
-        self.refresh_priorities(cx, PRIORITY_BATCH);
-        while self.scheduler.stale() > 0 && start.elapsed() < budget {
+        {
+            let _span = frame_span!("world.priorities");
             self.refresh_priorities(cx, PRIORITY_BATCH);
+            while self.scheduler.stale() > 0 && start.elapsed() < budget {
+                self.refresh_priorities(cx, PRIORITY_BATCH);
+            }
         }
+        let _span = frame_span!("world.light_cache");
+        self.refresh_light_cache(cx, start, budget);
     }
 
     /// Recomputes up to `max` stale job priorities for the current viewers (jobs whose slot no
@@ -956,6 +1113,8 @@ impl WorldJobs {
                     }
                     MeshState::Queued | MeshState::InFlight { .. } | MeshState::Empty => {}
                 }
+                // A current mesh near a viewer whose light was not kept.
+                self.want_light(cx, id);
             }
             _ => {}
         }
@@ -1124,7 +1283,7 @@ impl WorldJobs {
     fn column_lost_slot(&mut self, cx: &mut Ctx<'_>, slot: &ChunkSlot, id: ChunkId) {
         let col = slot.column;
         self.walk_data_arrived(cx, col, id);
-        if cx.sky.detach(col) || !slot.sky_edited {
+        if cx.sky.detach(col, slot.pos.y) || !slot.sky_edited {
             return;
         }
         let c = &mut cx.sky.columns[col];
@@ -1223,9 +1382,10 @@ impl WorldJobs {
         }
     }
 
-    /// Frame step of the open batches: a batch holding results for more than
-    /// `edit_batch_hold_frames` is published as it is; one that never got a result is closed
-    /// after [`STALE_BATCH_FRAMES`].
+    /// Frame step of the open batches, after the frame's results were applied: a batch whose
+    /// first result was held `edit_batch_hold_frames` frames ago is published as it is (a
+    /// result held in frame `N` waits for the rest through frame `N + hold`, and goes out then
+    /// at the latest); one that never got a result is closed after [`STALE_BATCH_FRAMES`].
     fn age_batches(&mut self, cx: &mut Ctx<'_>) {
         let hold = self.hold_frames;
         let due: Vec<(u32, bool)> = self
@@ -1248,14 +1408,43 @@ impl WorldJobs {
     }
 
     /// Remeshes slot `id` for edit batch `b`: its light or data changed, so its epoch is bumped
-    /// (a running job read the old content) and the remesh runs first (priority 0).
+    /// (a running job read the old content) and the remesh runs first (priority 0). A result of
+    /// the slot held in an open batch is stale now: it is dropped and the remesh starts at
+    /// once, so the slot stays a member that delivers.
     fn remesh_for_edit(&mut self, cx: &mut Ctx<'_>, id: ChunkId, b: u32) {
         let slot = &mut cx.map.slots[id];
         slot.epoch = slot.epoch.wrapping_add(1);
+        self.drop_held(cx, id);
+        let slot = &cx.map.slots[id];
+        if matches!(slot.mesh(), MeshState::InFlight { .. }) {
+            // Its result may already wait in `pending`.
+            self.rescan_pending = true;
+        }
         if slot.interest.contains(Interest::MESH) {
             self.join_batch(cx, b, id);
         }
         self.request_remesh(cx, id, 0);
+    }
+
+    /// Drops the result of slot `id` held in its batch, if any: the slot goes back to
+    /// `MeshState::Queued` (its job is done) and stays a member of the batch. The batch's hold
+    /// clock restarts with its next held result if this was the only one.
+    fn drop_held(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
+        let Some(b) = cx.map.slots[id].batch else {
+            return;
+        };
+        let Some(batch) = self.batches.get_mut(&b) else {
+            return;
+        };
+        let Some(i) = batch.held.iter().position(|r| r.id == id) else {
+            return;
+        };
+        batch.held.remove(i);
+        if batch.held.is_empty() {
+            batch.held_frames = None;
+        }
+        batch.members.push(id);
+        cx.map.set_mesh_and_pending(id, MeshState::Queued, false);
     }
 
     /// Asks for a new mesh of `id` (its data or a neighbor changed). Slots without
@@ -1285,12 +1474,14 @@ impl WorldJobs {
         }
     }
 
-    /// `MeshState::Empty`, and `Remove` if a mesh was published.
+    /// `MeshState::Empty`, and `Remove` if a mesh was published. A chunk meshed to nothing
+    /// without a job (all air, enclosed, a failed job) gets a light job if it is near a viewer.
     fn set_mesh_empty(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
         self.set_waits_sky(cx, id, false);
         cx.map.set_mesh_and_pending(id, MeshState::Empty, false);
         self.unpublish(cx, id);
         self.leave_batch(cx, id);
+        self.want_light(cx, id);
     }
 
     /// `MeshState::None`, and `Remove` if a mesh was published.
@@ -1332,6 +1523,8 @@ impl WorldJobs {
                 if neighbor.neighbors_ready == ALL_NEIGHBORS {
                     let npos = pos.offset(NEIGHBOR_OFFSETS[i]);
                     self.schedule_mesh(cx, n, self.priority(npos));
+                    // An all-air chunk meshed while a neighbor was missing.
+                    self.want_light(cx, n);
                 }
             }
         }
@@ -1498,11 +1691,11 @@ impl WorldJobs {
             return None;
         }
         // The top was cleared: the next blocker down, in the loaded data.
-        let (x, z, hi) = (c.x, c.z, c.hi);
+        let (x, z, loaded) = (c.x, c.z, &c.layers);
         let map = &*cx.map;
         let found =
             Arc::make_mut(tile).rescan_column(lx, lz, p.y - 1, &cx.content.light_tables, |cy| {
-                rescan_layer(map, (x, z), cy, hi, &layers)
+                rescan_layer(map, (x, z), cy, loaded, &layers)
             });
         match found {
             Rescan::Found(next) => Some(sky_band(p.x, p.z, next, top)),
@@ -1524,9 +1717,7 @@ impl WorldJobs {
     /// the mesher options of the jobs it starts.
     pub(crate) fn begin_frame(&mut self, settings: &WorldSettings, now: Instant) {
         self.mesh_options = MeshOptions::with_ao(settings.ao_policy);
-        self.light_cache_sq = settings
-            .light_cache_radius
-            .saturating_mul(settings.light_cache_radius);
+        self.light_cache_sq = light_cache_radius(settings).pow(2);
         self.hold_frames = settings.edit_batch_hold_frames;
         self.auto_cap.observe_frame(now);
         let cap = match settings.max_jobs_in_flight {
@@ -1586,6 +1777,7 @@ impl WorldJobs {
                     (JobKind::Generate, JobId::Chunk(id)) => self.start_generate(cx, id),
                     (JobKind::Mesh, JobId::Chunk(id)) => self.start_mesh(cx, id),
                     (JobKind::SkyTile, JobId::Column(col)) => self.start_walk(cx, col),
+                    (JobKind::Light, JobId::Chunk(id)) => self.start_light(cx, id),
                     _ => false,
                 };
                 if ok {
@@ -1729,9 +1921,7 @@ impl WorldJobs {
                         data_version,
                         epoch,
                         mesh,
-                        light: light
-                            .keep
-                            .then(|| Arc::new(ChunkLight::from_padded(padded))),
+                        light: light.keep.then(|| ChunkLight::from_padded(padded)),
                         path: Some(path),
                     }
                 })
@@ -1762,9 +1952,11 @@ impl WorldJobs {
             self.land_tile(cx, col, old, open);
             return false;
         };
-        let (x, z, lo, hi) = (c.x, c.z, c.lo, c.hi);
-        let top = hi.min(start >> CHUNK_SHIFT);
-        let floor = lo.max(rule.floor >> CHUNK_SHIFT);
+        // Only the loaded layers are visited: the range can span far more layers than are
+        // loaded (an edit far above, a viewer far below).
+        let (x, z) = (c.x, c.z);
+        let top = c.hi().min(start >> CHUNK_SHIFT);
+        let floor = rule.floor >> CHUNK_SHIFT;
         let map = &*cx.map;
         let wait_from = c
             .waiters
@@ -1774,20 +1966,23 @@ impl WorldJobs {
             .min()
             .map_or(floor, |y| y.max(floor));
         let slot_at = |cy| map.id_at(ChunkPos::new(x, cy, z));
-        for cy in (wait_from..=top).rev() {
-            if let Some(id) = slot_at(cy)
-                && matches!(
+        let waiting = c.layers_in(wait_from, top).iter().rev().find_map(|&cy| {
+            slot_at(cy).filter(|&id| {
+                matches!(
                     map.slots[id].data(),
                     DataState::Queued | DataState::Generating
                 )
-            {
-                c.waiting_for = Some(id);
-                return false;
-            }
+            })
+        });
+        if let Some(id) = waiting {
+            c.waiting_for = Some(id);
+            return false;
         }
-        let captured: Vec<(i64, Option<Arc<ChunkData>>)> = (floor..=top)
+        let captured: Vec<(i64, Option<Arc<ChunkData>>)> = c
+            .layers_in(floor, top)
+            .iter()
             .rev()
-            .filter_map(|cy| match map.slots[slot_at(cy)?].data() {
+            .filter_map(|&cy| match map.slots[slot_at(cy)?].data() {
                 DataState::Ready(data) => Some((cy, Some(Arc::clone(data)))),
                 DataState::Missing => Some((cy, None)),
                 DataState::Queued | DataState::Generating => None,
@@ -1795,7 +1990,7 @@ impl WorldJobs {
             .collect();
         let tables = &cx.content.light_tables;
         let content_below = rule.void_reachable
-            && (lo..floor).any(|cy| {
+            && c.layers_in(i64::MIN, floor - 1).iter().any(|&cy| {
                 map.data_at(ChunkPos::new(x, cy, z))
                     .is_some_and(|d| may_block(d, tables))
             });
@@ -1834,6 +2029,144 @@ impl WorldJobs {
         true
     }
 
+    /// True if slot `id` wants a light job: light is on, the slot has mesh interest, data and a
+    /// current mesh (a mesh job keeps the light of chunks near a viewer), it is within the light
+    /// cache radius, and its cached light is not current.
+    fn light_wanted(&self, cx: &Ctx<'_>, id: ChunkId) -> bool {
+        let Some(slot) = cx.map.get(id) else {
+            return false;
+        };
+        let mesh_current = match (slot.mesh(), slot.data()) {
+            (
+                MeshState::Ready {
+                    data_version,
+                    epoch,
+                    ..
+                },
+                DataState::Ready(data),
+            ) => *data_version == data.version && *epoch == slot.epoch,
+            (MeshState::Empty, DataState::Ready(_)) => true,
+            _ => false,
+        };
+        cx.sky.rule != SkyRule::Off
+            && slot.interest.contains(Interest::MESH)
+            && slot.neighbors_ready == ALL_NEIGHBORS
+            && mesh_current
+            && !slot.remesh_pending()
+            && slot.current_light().is_none()
+            && self.planner.priority(slot.pos) <= self.light_cache_sq
+    }
+
+    /// Queues a light job for slot `id` if it wants one ([`WorldJobs::light_wanted`]) and has
+    /// none queued or running. A uniform chunk of a fully opaque state that emits nothing needs
+    /// no job: no light enters it.
+    fn want_light(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
+        if cx.map.get(id).is_none_or(|s| s.light_job) || !self.light_wanted(cx, id) {
+            return;
+        }
+        let tables = &cx.content.light_tables;
+        let slot = &mut cx.map.slots[id];
+        if let DataState::Ready(data) = slot.data()
+            && let Some(state) = data.as_uniform()
+            && tables.opacity(state) == OPAQUE_OPACITY
+            && tables.emission(state) == LightValue::DARK
+        {
+            let (data_version, epoch) = (data.version, slot.epoch);
+            slot.light = Some(Arc::new(CachedLight {
+                light: ChunkLight::Uniform(LightValue::DARK),
+                data_version,
+                epoch,
+            }));
+            return;
+        }
+        slot.light_job = true;
+        let priority = light_priority(self.planner.priority(slot.pos));
+        self.scheduler.push(id, JobKind::Light, priority);
+    }
+
+    /// Starts the light job of slot `id` if it still wants one, its 26 neighbors are ready and
+    /// the sky tiles around it are walked (else it waits for them, like a mesh).
+    fn start_light(&mut self, cx: &mut Ctx<'_>, id: ChunkId) -> bool {
+        let Some(slot) = cx.map.slots.get_mut(id) else {
+            return false;
+        };
+        slot.light_job = false;
+        if !self.light_wanted(cx, id) {
+            return false;
+        }
+        let tiles = match self.sky_for(cx, id, true) {
+            SkyFor::Waiting => return false,
+            SkyFor::Ready(tiles) => tiles,
+        };
+        let map = &*cx.map;
+        let slot = &map.slots[id];
+        let DataState::Ready(center) = slot.data() else {
+            return false;
+        };
+        let pos = slot.pos;
+        let mut near = NearData::default();
+        let neighbors: [Option<Arc<ChunkData>>; 26] =
+            std::array::from_fn(|i| near.get(map, pos, i).cloned());
+        let center = Arc::clone(center);
+        let (data_version, epoch) = (center.version, slot.epoch);
+        let cancel = Arc::clone(&slot.cancel);
+        let light = LightJob {
+            tables: Arc::clone(&cx.content.light_tables),
+            tiles,
+            keep: true,
+        };
+        cx.map.slots[id].light_job = true;
+        spawn_job(
+            self.executor.as_ref(),
+            &self.tx,
+            JobId::Chunk(id),
+            JobKind::Light,
+            cancel,
+            move || {
+                // The 27 chunks in `boxel_light::box_light::chunk_index` order.
+                let chunks = std::array::from_fn(|i| match i {
+                    13 => Some(&*center),
+                    i if i < 13 => neighbors[i].as_deref(),
+                    i => neighbors[i - 1].as_deref(),
+                });
+                with_light(&light, pos, chunks, |padded, _| JobMessage::Lit {
+                    id,
+                    data_version,
+                    epoch,
+                    light: ChunkLight::from_padded(padded),
+                })
+            },
+        );
+        true
+    }
+
+    /// A light job of slot `id` finished: its light is cached if it is still the light of the
+    /// slot's content and the slot is still near a viewer; else the slot may want another job.
+    fn on_lit(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        id: ChunkId,
+        data_version: u32,
+        epoch: u32,
+        light: ChunkLight,
+    ) {
+        let Some(slot) = cx.map.slots.get_mut(id) else {
+            return;
+        };
+        slot.light_job = false;
+        let current = matches!(slot.data(), DataState::Ready(d) if d.version == data_version)
+            && slot.epoch == epoch;
+        if current && self.planner.priority(slot.pos) <= self.light_cache_sq {
+            slot.light = Some(Arc::new(CachedLight {
+                light,
+                data_version,
+                epoch,
+            }));
+        } else {
+            self.want_light(cx, id);
+        }
+    }
+
     /// Column `col` gets `tile` (it was `old`): every loaded chunk whose light the changed tops
     /// can reach is remeshed (one edit batch: the column's, or a new one), and the meshes that
     /// waited for the tile are scheduled.
@@ -1867,6 +2200,8 @@ impl WorldJobs {
             if let Some(slot) = cx.map.get(w) {
                 let priority = self.priority(slot.pos);
                 self.schedule_mesh(cx, w, priority);
+                // A light job that waited for the tile.
+                self.want_light(cx, w);
             }
         }
     }
@@ -1921,13 +2256,28 @@ impl WorldJobs {
                         }
                         None => {}
                     }
-                    self.pending.push_back(MeshedResult {
+                    let result = MeshedResult {
                         id,
                         data_version,
                         epoch,
                         mesh,
                         light,
-                    });
+                    };
+                    if in_batch(cx.map, id) {
+                        self.batch_pending.push(result);
+                    } else {
+                        self.pending.push_back(result);
+                    }
+                }
+                JobMessage::Lit {
+                    id,
+                    data_version,
+                    epoch,
+                    light,
+                } => {
+                    self.auto_cap.observe_job(busy);
+                    self.light_counts.light_jobs += 1;
+                    self.on_lit(cx, id, data_version, epoch, light);
                 }
                 JobMessage::Walked {
                     column,
@@ -1952,11 +2302,26 @@ impl WorldJobs {
         drained
     }
 
-    /// Applies waiting mesh results within `settings.max_mesh_events_per_frame` events (the
-    /// meshes of an edit batch go out together, whatever the budget), after publishing the edit
-    /// batches that waited long enough.
+    /// Applies waiting mesh results: first every result of an edit batch, whatever the budget
+    /// (the meshes of a batch go out together), then the others within
+    /// `settings.max_mesh_events_per_frame` events. Then publishes the edit batches that waited
+    /// long enough.
     pub(crate) fn apply_meshes(&mut self, cx: &mut Ctx<'_>, settings: &WorldSettings) {
-        self.age_batches(cx);
+        if std::mem::take(&mut self.rescan_pending) && !self.pending.is_empty() {
+            let all = std::mem::take(&mut self.pending);
+            let mut rest = VecDeque::with_capacity(all.len());
+            for result in all {
+                if in_batch(cx.map, result.id) {
+                    self.batch_pending.push(result);
+                } else {
+                    rest.push_back(result);
+                }
+            }
+            self.pending = rest;
+        }
+        for result in std::mem::take(&mut self.batch_pending) {
+            self.apply_meshed(cx, result);
+        }
         let budget = settings.max_mesh_events_per_frame.max(1);
         let first = cx.events.len();
         while cx.events.len() - first < budget {
@@ -1965,6 +2330,7 @@ impl WorldJobs {
             };
             self.apply_meshed(cx, result);
         }
+        self.age_batches(cx);
     }
 
     fn on_generated(&mut self, cx: &mut Ctx<'_>, id: ChunkId, data: ChunkData) {
@@ -2038,13 +2404,17 @@ impl WorldJobs {
                 }
             }
             JobKind::SkyTile => {}
+            JobKind::Light => {
+                // Not retried: it would fail again. The chunk's next mesh job keeps its light.
+                cx.map.slots[id].light_job = false;
+            }
             JobKind::Mesh => {
                 if !matches!(slot.mesh(), MeshState::InFlight { .. }) {
                     return;
                 }
                 if slot.remesh_pending() {
                     // The data changed meanwhile: try again with the new data.
-                    let priority = self.priority(slot.pos);
+                    let priority = mesh_priority(&self.planner, slot);
                     cx.map.set_mesh_and_pending(id, MeshState::Queued, false);
                     self.schedule_mesh(cx, id, priority);
                 } else {
@@ -2084,7 +2454,7 @@ impl WorldJobs {
             && current_version == Some(result.data_version)
             && slot.epoch == result.epoch;
         if !fresh {
-            let priority = self.priority(slot.pos);
+            let priority = mesh_priority(&self.planner, slot);
             cx.map.set_mesh_and_pending(id, MeshState::Queued, false);
             self.schedule_mesh(cx, id, priority);
             return;
@@ -2106,7 +2476,15 @@ impl WorldJobs {
             return;
         }
         self.leave_batch_published(cx, id);
-        cx.map.set_light(id, result.light);
+        let near = self.planner.priority(cx.map.slots[id].pos) <= self.light_cache_sq;
+        let light = result.light.filter(|_| near).map(|light| {
+            Arc::new(CachedLight {
+                light,
+                data_version: result.data_version,
+                epoch: result.epoch,
+            })
+        });
+        cx.map.set_light(id, light);
         if result.mesh.is_empty() {
             self.set_mesh_empty(cx, id);
             return;
@@ -2132,6 +2510,8 @@ impl WorldJobs {
             self.published.insert(id, Arc::clone(&mesh));
             cx.events.push(ChunkMeshEvent::Upsert { id, key, mesh });
         }
+        // The job may have started before the chunk came near a viewer.
+        self.want_light(cx, id);
     }
 
     /// Slot `id` publishes its result on its own (no hold): it leaves its batch, if any.
@@ -2161,16 +2541,44 @@ fn current_priority(
         JobId::Chunk(id) => id,
         JobId::Column(col) => {
             let c = sky.columns.get(col)?;
-            return c.queued.then(|| planner.column_priority(c.x, c.z));
+            // A walk an edit sent the column back to runs first, like the edit's remeshes.
+            let priority = match c.batch {
+                Some(_) => 0,
+                None => planner.column_priority(c.x, c.z),
+            };
+            return c.queued.then_some(priority);
         }
     };
     let slot = map.slots.get(id)?;
-    let queued = match kind {
-        JobKind::Generate => matches!(slot.data(), DataState::Queued),
-        JobKind::Mesh => matches!(slot.mesh(), MeshState::Queued),
-        JobKind::SkyTile => false,
-    };
-    queued.then(|| planner.priority(slot.pos))
+    match kind {
+        JobKind::Generate => {
+            matches!(slot.data(), DataState::Queued).then(|| planner.priority(slot.pos))
+        }
+        JobKind::Mesh => {
+            matches!(slot.mesh(), MeshState::Queued).then(|| mesh_priority(planner, slot))
+        }
+        // Kept until popped (`start_light` clears the flag).
+        JobKind::Light => slot
+            .light_job
+            .then(|| light_priority(planner.priority(slot.pos))),
+        JobKind::SkyTile => None,
+    }
+}
+
+/// Priority of a mesh job of `slot`: 0 for a member of an edit batch (edits run first, also
+/// after a viewer move refreshes the queue), else its distance.
+fn mesh_priority(planner: &Planner, slot: &ChunkSlot) -> u32 {
+    if slot.batch.is_some() {
+        0
+    } else {
+        planner.priority(slot.pos)
+    }
+}
+
+/// Priority of a light job of a chunk at `priority` (its distance): after the mesh jobs of the
+/// view ([`LIGHT_JOB_BIAS`]).
+fn light_priority(priority: u32) -> u32 {
+    priority.saturating_add(LIGHT_JOB_BIAS)
 }
 
 /// The voxels whose light a change of sky tops from `old` to `new` (column `(x, z)`) can reach:
@@ -2212,7 +2620,7 @@ fn reach(lo: i64, hi: i64) -> RangeInclusive<i64> {
 const LIGHT_REACH: u8 = 14;
 
 /// The loaded chunks whose padded region meets the voxel box `band` (x, y, z), into `out`.
-/// Layers are looked up only within each column's loaded range.
+/// Only each column's loaded layers are visited (the band can span `2^56` layers).
 fn band_chunks(
     map: &ChunkMap,
     sky: &SkyMap,
@@ -2225,12 +2633,10 @@ fn band_chunks(
             let Some(col) = sky.id_at(cx, cz) else {
                 continue;
             };
-            let c = &sky.columns[col];
-            for cy in (*ys.start()).max(c.lo)..=(*ys.end()).min(c.hi) {
+            for &cy in sky.columns[col].layers_in(*ys.start(), *ys.end()) {
                 let pos = ChunkPos::new(cx, cy, cz);
-                if map.id_at(pos).is_some() {
-                    out.insert(pos);
-                }
+                debug_assert!(map.id_at(pos).is_some(), "column layer {pos:?} not loaded");
+                out.insert(pos);
             }
         }
     }
@@ -2281,14 +2687,15 @@ fn light_reach(
 }
 
 /// Layer `cy` of column `(x, z)` for a rescan after an edit: loaded data, or air above the
-/// generator's range (an unloaded chunk there lost its edits; `hi`: the column's highest
-/// loaded layer). `None` otherwise: inside the range a walk generates the layer, and under it
-/// a walk decides between air and void from the loaded content below.
+/// generator's range down to the next loaded layer (an unloaded chunk there lost its edits;
+/// `loaded`: the column's loaded layers, ascending). `None` otherwise: inside the range a walk
+/// generates the layer, and under it a walk decides between air and void from the loaded
+/// content below.
 fn rescan_layer<'m>(
     map: &'m ChunkMap,
     (x, z): (i64, i64),
     cy: i64,
-    hi: i64,
+    loaded: &[i64],
     layers: &RangeInclusive<i64>,
 ) -> Option<LayerData<'m>> {
     if layers.is_empty() || cy < *layers.start() {
@@ -2301,15 +2708,55 @@ fn rescan_layer<'m>(
             DataState::Queued | DataState::Generating => {}
         }
     }
-    if !layers.is_empty() && cy > *layers.end() {
-        let next = if cy > hi {
-            hi.max(*layers.end())
-        } else {
-            cy - 1
-        };
+    if cy > *layers.end() {
+        let end = *layers.end();
+        let next = layer_below(loaded, cy).map_or(end, |below| below.max(end));
         return Some(LayerData::AirUntil(next));
     }
     None
+}
+
+/// `WorldSettings::light_cache_radius`, clamped to [`MAX_LIGHT_CACHE_RADIUS`].
+fn light_cache_radius(settings: &WorldSettings) -> u32 {
+    settings.light_cache_radius.min(MAX_LIGHT_CACHE_RADIUS)
+}
+
+/// Calls `f` for every position within `r` chunks of `c` (squared distance at most `r^2`) that
+/// is not within `ro` of `o` (`minus = Some((o, ro))`), column by column: a short move visits
+/// only the new shell.
+fn sphere_minus(c: ChunkPos, r: u32, minus: Option<(ChunkPos, u32)>, mut f: impl FnMut(ChunkPos)) {
+    let r = i64::from(r);
+    for dx in -r..=r {
+        for dz in -r..=r {
+            let h = dx * dx + dz * dz;
+            if h > r * r {
+                continue;
+            }
+            let span = (r * r - h).isqrt();
+            let (x, z) = (c.x + dx, c.z + dz);
+            let (lo, hi) = (c.y - span, c.y + span);
+            // The part of this column inside the other sphere, if it meets it.
+            let cut = minus.and_then(|(o, ro)| {
+                let ro = i128::from(ro);
+                let rest = ro * ro - (i128::from(x - o.x).pow(2) + i128::from(z - o.z).pow(2));
+                // At most `ro`, so it fits.
+                let span = i64::try_from(rest.max(0).isqrt()).ok()?;
+                (rest >= 0).then_some((o.y - span, o.y + span))
+            });
+            let mut visit = |ys: RangeInclusive<i64>| {
+                for y in ys {
+                    f(ChunkPos::new(x, y, z));
+                }
+            };
+            match cut {
+                Some((a, b)) => {
+                    visit(lo..=hi.min(a - 1));
+                    visit(lo.max(b + 1)..=hi);
+                }
+                None => visit(lo..=hi),
+            }
+        }
+    }
 }
 
 /// The highest channel of `v`.
@@ -2357,6 +2804,11 @@ fn own_neighbor_bits(map: &ChunkMap, planner: &Planner, pos: ChunkPos) -> u32 {
         }
     }
     bits
+}
+
+/// True if slot `id` is loaded and a member of an edit batch.
+fn in_batch(map: &ChunkMap, id: ChunkId) -> bool {
+    map.get(id).is_some_and(|s| s.batch.is_some())
 }
 
 /// Uniform chunk of a state without geometry (air): meshes to nothing whatever its neighbors.

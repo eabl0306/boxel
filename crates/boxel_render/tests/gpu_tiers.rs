@@ -1060,3 +1060,105 @@ fn renderer_smoke_test_passes_on_every_tier() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// A quad whose light index is past its chunk's palette (only a malformed mesh has one) is lit
+/// as open sky on every tier, like the quad of the same chunk with a valid index: High and Mid
+/// do not read the arena after the palette, which may hold another chunk's quads.
+#[test]
+fn light_indices_past_the_palette_read_open_sky_on_every_tier() {
+    let (_instance, adapters) = adapters();
+    if adapters.is_empty() {
+        assert!(!gpu_tests_required(), "BOXEL_REQUIRE_GPU=1 but no adapter");
+        eprintln!("skipping: no adapter");
+        return;
+    }
+    let registry = BlockRegistry::default_blocks();
+    let stone = registry
+        .textures()
+        .iter()
+        .position(|t| t.name == "boxel:stone")
+        .unwrap_or(0) as u16;
+    // Two 16x32 +Y quads side by side, no palette (the renderer uploads one open sky entry, and
+    // does not debug-assert the indices of a mesh without one): index 0 is the uploaded entry,
+    // 4000 is past it.
+    let mut counts = [0; BUCKET_COUNT];
+    counts[Face::PosY.index()] = 2;
+    let mut mesh = ChunkMesh::from_quads(
+        vec![
+            PackedQuad::new([0, 0, 0], 16, 32, Face::PosY, stone),
+            PackedQuad::new([16, 0, 0], 16, 32, Face::PosY, stone).with_light_index(4000),
+        ],
+        counts,
+    );
+    mesh.palette.clear();
+    mesh.hash = mesh.compute_hash();
+    let mesh = Arc::new(mesh);
+    // Straight down from 23 voxels: the quads' centers at about x = 115 and x = 205.
+    let view = view_params(
+        &Camera::default(),
+        &Transform::from_yaw_pitch(
+            DVec3::new(16.0, 24.0, 16.0),
+            0.0,
+            -std::f32::consts::FRAC_PI_2,
+        ),
+    );
+    let mut failures = Vec::new();
+    let mut rendered = 0;
+    for adapter in &adapters {
+        let caps = AdapterCaps::from_adapter(adapter);
+        let label = adapter_label(&caps);
+        for tier in allowed_tiers(&caps) {
+            let result = (|| {
+                let (device, queue, errors) = device_for(adapter, &caps, tier)?;
+                let config = RendererConfig {
+                    arena_quads: 1 << 13,
+                    max_chunk_slots: 8,
+                };
+                let mut renderer = VoxelRenderer::new(
+                    &device,
+                    &queue,
+                    tier,
+                    &config,
+                    registry.textures(),
+                    wgpu::TextureFormat::Rgba8UnormSrgb,
+                    UVec2::new(WIDTH, HEIGHT),
+                )
+                .map_err(|e| format!("VoxelRenderer::new: {e}"))?;
+                renderer
+                    .upsert_chunk(0, I64Vec3::ZERO, Arc::clone(&mesh))
+                    .map_err(|e| e.to_string())?;
+                let (image, _) = render(&device, &queue, &mut renderer, &view)?;
+                let errors = errors.lock().map(|e| e.clone()).unwrap_or_default();
+                if !errors.is_empty() {
+                    return Err(format!("uncaptured errors {errors:?}"));
+                }
+                Ok(image)
+            })();
+            let image = match result {
+                Ok(image) => image,
+                Err(e) => {
+                    failures.push(format!("{label} {tier}: {e}"));
+                    continue;
+                }
+            };
+            rendered += 1;
+            let px = |x: u32| {
+                let i = ((HEIGHT / 2 * WIDTH + x) * 4) as usize;
+                [image.data[i], image.data[i + 1], image.data[i + 2]]
+            };
+            let (valid, past) = (px(115), px(205));
+            let same = valid.iter().zip(past).all(|(a, b)| a.abs_diff(b) <= 2);
+            // Stone under a white noon sky: far above the ambient floor.
+            if !same || valid.iter().any(|&c| c < 60) {
+                failures.push(format!(
+                    "{label} {tier}: open sky {valid:?}, index past the palette {past:?}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(
+        rendered > 0 || !gpu_tests_required(),
+        "BOXEL_REQUIRE_GPU=1 but no tier could render"
+    );
+}

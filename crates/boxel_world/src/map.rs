@@ -112,9 +112,24 @@ pub struct ChunkSlot {
     pub cancel: Arc<AtomicBool>,
     /// The chunk column of the slot in the `SkyMap`.
     pub(crate) column: ColumnId,
-    /// The chunk's light as of its published mesh, kept within
-    /// `WorldSettings::light_cache_radius` of a viewer ([`ChunkMap::light_at`]).
-    pub(crate) light: Option<Arc<ChunkLight>>,
+    /// The chunk's light, kept within `WorldSettings::light_cache_radius` of a viewer
+    /// ([`ChunkMap::light_at`]): from its mesh job, or from a light job when the mesh job did not
+    /// keep it (the chunk was farther then, or it is meshed without a job).
+    pub(crate) light: Option<Arc<CachedLight>>,
+    /// A light job for this slot is queued or running (at most one).
+    pub(crate) light_job: bool,
+}
+
+/// A chunk's cached light and the content it was computed from (one allocation, so the slot
+/// stays small).
+#[derive(Clone, Debug)]
+pub(crate) struct CachedLight {
+    pub(crate) light: ChunkLight,
+    /// Center data version of the light box.
+    pub(crate) data_version: u32,
+    /// Slot epoch of the light box (bumped by every change of the neighbors or of the sky tops
+    /// that may change the chunk's light).
+    pub(crate) epoch: u32,
 }
 
 /// World counters. Also an ECS resource, refreshed every frame in `Last` by the world plugin
@@ -140,11 +155,15 @@ pub struct WorldStats {
     /// Viewer changes not applied yet (chunk positions and work lists waiting for the interest
     /// budget); 0 when every wanted chunk has a slot.
     pub interest_backlog: usize,
-    /// Light boxes computed with the floods, since start (ADR 0015).
+    /// Light boxes of mesh jobs computed with the floods, since start (ADR 0015).
     pub light_full: usize,
-    /// Light boxes that took a fast path (uniformly dark or open sky, or below the walk floor),
-    /// since start.
+    /// Light boxes of mesh jobs that took a fast path (uniformly dark or open sky, or below the
+    /// walk floor), since start.
     pub light_fast: usize,
+    /// Light jobs finished, since start: the light of a chunk near a viewer whose mesh job did
+    /// not keep it (chunks meshed without a job, such as all-air ones, and chunks that came
+    /// within `WorldSettings::light_cache_radius` after their mesh job started).
+    pub light_jobs: usize,
     /// Chunk columns with a sky tile slot (one per column with a loaded chunk).
     pub sky_columns: usize,
     /// Sky walks finished, since start.
@@ -206,6 +225,7 @@ impl ChunkSlot {
             cancel: Arc::new(AtomicBool::new(false)),
             column,
             light: None,
+            light_job: false,
         }
     }
     /// The chunk's key, as events, jobs and stores see it.
@@ -228,30 +248,25 @@ impl ChunkSlot {
     pub fn remesh_pending(&self) -> bool {
         self.remesh_pending
     }
-    /// The chunk's light (32^3), as of its published mesh. `None` without a light mesh: outside
-    /// `WorldSettings::light_cache_radius`, before the first mesh, for chunks meshed without a
-    /// job (all air, enclosed) or with light off.
-    pub fn light(&self) -> Option<&Arc<ChunkLight>> {
-        self.light.as_ref()
+    /// The chunk's light (32^3), as of its last mesh or light job. `None` outside
+    /// `WorldSettings::light_cache_radius`, before the chunk's first mesh or light job, or with
+    /// light off. It may lag an edit by a few frames (until the chunk's remesh or light job
+    /// lands).
+    pub fn light(&self) -> Option<&ChunkLight> {
+        self.light.as_deref().map(|c| &c.light)
     }
-    /// The cached light if it is the light of the current content: the mesh it came with is
-    /// still current (no remesh queued or running, same data and neighbors).
+    /// The cached light if it is the light of the current content: computed from the current
+    /// data and epoch, with no remesh requested since.
     pub(crate) fn current_light(&self) -> Option<&ChunkLight> {
-        let current = match (&self.mesh, &self.data) {
-            (
-                MeshState::Ready {
-                    data_version,
-                    epoch,
-                    ..
-                },
-                DataState::Ready(data),
-            ) => *data_version == data.version && *epoch == self.epoch,
-            (MeshState::Empty, _) => true,
-            _ => false,
+        let cached = self.light.as_ref()?;
+        let DataState::Ready(data) = &self.data else {
+            return None;
         };
-        (current && !self.remesh_pending && self.batch.is_none())
-            .then_some(self.light.as_deref())
-            .flatten()
+        (cached.data_version == data.version
+            && cached.epoch == self.epoch
+            && !self.remesh_pending
+            && self.batch.is_none())
+        .then_some(&cached.light)
     }
     /// Which slot counters of [`WorldStats`] this slot counts toward (bits of [`Tally`]).
     fn tally_bits(&self) -> u8 {
@@ -341,11 +356,11 @@ impl ChunkMap {
             DataState::Queued | DataState::Generating => None,
         }
     }
-    /// Light at a world position, as of the chunk's published mesh (see [`ChunkSlot::light`]):
-    /// `None` if the chunk is not loaded or has no cached light.
+    /// Light at a world position, as of the chunk's last mesh or light job (see
+    /// [`ChunkSlot::light`]): `None` if the chunk is not loaded or has no cached light.
     pub fn light_at(&self, p: BlockPos) -> Option<LightValue> {
         let (chunk, local) = p.split();
-        let light = self.slots.get(self.id_at(chunk)?)?.light.as_ref()?;
+        let light = self.slots.get(self.id_at(chunk)?)?.light()?;
         Some(light.get(local))
     }
     /// Number of slots.
@@ -453,7 +468,7 @@ impl ChunkMap {
         });
     }
     /// Sets a slot's cached light.
-    pub(crate) fn set_light(&mut self, id: ChunkId, light: Option<Arc<ChunkLight>>) {
+    pub(crate) fn set_light(&mut self, id: ChunkId, light: Option<Arc<CachedLight>>) {
         self.slots[id].light = light;
     }
     /// Sets a slot's remesh request.

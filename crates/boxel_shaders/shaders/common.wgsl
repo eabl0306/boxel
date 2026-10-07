@@ -44,6 +44,8 @@ const LIGHT_RED_SHIFT: u32 = 8u;
 const LIGHT_GREEN_SHIFT: u32 = 4u;
 const LIGHT_BLUE_SHIFT: u32 = 0u;
 const LIGHT_MAX_LEVEL: f32 = 15.0;
+// A light palette entry with sky 15 at the 4 corners (boxel_mesh::FULL_SKY_ENTRY).
+const FULL_SKY_LIGHT: vec2<u32> = vec2<u32>(0xF000F000u, 0xF000F000u);
 const CHUNK_SIZE: f32 = 32.0;
 
 struct View {
@@ -65,8 +67,8 @@ struct ChunkGpu {                  // 64 bytes, mirrors boxel_shaders::gpu::Chun
   counts: array<u32, 8>,           // [0..6) opaque face buckets, [6] cutout, [7] translucent
   flags: u32,                      // bit0 = live
   light_base: u32,                 // first light palette entry in the quad arena (= quad_base + total quads)
-  pad0: u32,
-  pad1: u32,
+  light_len: u32,                  // light palette entries (>= 1); a quad index not below it reads open sky
+  pad: u32,
 };
 
 struct VsOut {
@@ -172,12 +174,15 @@ fn bilinear(c0: vec4<f32>, c1: vec4<f32>, c2: vec4<f32>, c3: vec4<f32>, st: vec2
   return near + (far - near) * st.y;
 }
 
-// Brightness of a fractional light level (0..15): linear interpolation in View::light_curve.
-fn level_curve(l: f32, curve: ptr<function, array<vec4<f32>, 4>>) -> f32 {
+// Brightness of a fractional light level (0..15): linear interpolation in View::light_curve,
+// indexed in the uniform itself (a function-local copy of the array, dynamically indexed, may
+// live in scratch memory). Every shader that includes this file binds the View uniform as
+// `view`.
+fn level_curve(l: f32) -> f32 {
   let x = clamp(l, 0.0, LIGHT_MAX_LEVEL);
   let i = min(u32(x), 14u);
   let j = i + 1u;
-  return mix((*curve)[i >> 2u][i & 3u], (*curve)[j >> 2u][j & 3u], x - f32(i));
+  return mix(view.light_curve[i >> 2u][i & 3u], view.light_curve[j >> 2u][j & 3u], x - f32(i));
 }
 
 // The light reaching a fragment: the 4 corner lights interpolated per channel at (s, t), each
@@ -185,9 +190,8 @@ fn level_curve(l: f32, curve: ptr<function, array<vec4<f32>, 4>>) -> f32 {
 // block light (times its gain) and the ambient floor.
 fn voxel_light(i: VsOut, view: View) -> vec3<f32> {
   let l = bilinear(corner_light(i.light, 0u), corner_light(i.light, 1u), corner_light(i.light, 2u), corner_light(i.light, 3u), i.st);
-  var curve = view.light_curve;
-  let sky = level_curve(l.x, &curve) * view.sky_light.rgb;
-  let block = vec3(level_curve(l.y, &curve), level_curve(l.z, &curve), level_curve(l.w, &curve)) * view.light_params.y;
+  let sky = level_curve(l.x) * view.sky_light.rgb;
+  let block = vec3(level_curve(l.y), level_curve(l.z), level_curve(l.w)) * view.light_params.y;
   return max(max(sky, block), vec3(view.sky_light.a));
 }
 

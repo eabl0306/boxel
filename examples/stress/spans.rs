@@ -623,6 +623,7 @@ mod tests {
         interest_backlog: 0,
         light_full: 0,
         light_fast: 0,
+        light_jobs: 0,
         sky_columns: 0,
         sky_walks: 0,
         sky_private_generations: 0,

@@ -70,6 +70,7 @@ pub use daylight::{
     DEFAULT_TICKS_PER_DAY, Daylight, DaylightCurve, DaylightPlugin, SUNRISE_HOUR, SkyKey,
     TICKS_PER_SECOND, TimeOfDay,
 };
+pub(crate) use map::CachedLight;
 pub use map::{ChunkId, ChunkMap, ChunkSlot, DataState, Interest, MeshState, WorldStats};
 pub use plugin::{
     BlockEdit, ChunkMeshEvent, ChunkViewer, EditQueue, WorldContent, WorldPlugin, WorldSettings,

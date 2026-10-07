@@ -45,6 +45,8 @@ pub(crate) struct ChunkRecord {
     pub counts: [u32; BUCKET_COUNT],
     /// First light palette entry in the arena: `alloc.offset` + the mesh's quads.
     pub light_base: u32,
+    /// Light palette entries in the arena (at least 1).
+    pub light_len: u32,
 }
 
 impl ChunkRecord {
@@ -62,7 +64,8 @@ impl ChunkRecord {
             counts: self.counts,
             flags: if live { ChunkGpu::FLAG_LIVE } else { 0 },
             light_base: self.light_base,
-            pad: [0; 2],
+            light_len: self.light_len,
+            pad: 0,
         }
     }
 }
@@ -313,6 +316,7 @@ mod tests {
             counts,
             // 3 quads, then 1 palette entry
             light_base: alloc.offset + 3,
+            light_len: 1,
         }
     }
 
@@ -390,7 +394,7 @@ mod tests {
         assert_eq!(gpu.counts, r.counts);
         assert_eq!(gpu.flags, ChunkGpu::FLAG_LIVE);
         assert_eq!(gpu.light_base, r.alloc.offset + 3);
-        assert_eq!(gpu.pad, [0; 2]);
+        assert_eq!((gpu.light_len, gpu.pad), (1, 0));
         assert_eq!(r.gpu(false), ChunkGpu { flags: 0, ..gpu });
     }
 

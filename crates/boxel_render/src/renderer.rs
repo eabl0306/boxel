@@ -7,7 +7,7 @@ use crate::path::{
 };
 use crate::targets::{Blit, Targets};
 use crate::textures::{BLOCK_TEXTURE_SIZE, generate_block_textures, layer_bytes};
-use crate::upload::{UploadTargets, Uploads, arena_len};
+use crate::upload::{UploadTargets, Uploads, arena_len, light_entries};
 use boxel_camera::{Camera, CameraView};
 use boxel_gfx::Tier;
 use boxel_math::{Frustum, I64Vec3, Mat4, UVec2, Vec3, wrap_to_i32};
@@ -362,9 +362,9 @@ impl VoxelRenderer {
     /// origin difference may not be exact). Empty meshes remove the chunk.
     ///
     /// The chunk's arena range holds its quads and then its light palette (High and Mid read it
-    /// there; Low gets each quad's entry in a parallel buffer). Every quad's light index must be
-    /// inside the palette (the mesher guarantees it; debug-asserted); a mesh without a palette is
-    /// lit as open sky.
+    /// there; Low gets each quad's entry in a parallel buffer). Every quad's light index should
+    /// be inside the palette (the mesher guarantees it; debug-asserted). A mesh without a
+    /// palette, or a quad whose index is past it, is lit as open sky on every tier.
     ///
     /// Chunk changes stay on the CPU until the next [`VoxelRenderer::render`], which records all
     /// of them at the start of its encoder (one staging buffer for the whole frame). Until then
@@ -404,6 +404,7 @@ impl VoxelRenderer {
             alloc,
             counts: bucket_counts(&mesh),
             light_base: alloc.offset + mesh.total_quads(),
+            light_len: light_entries(&mesh),
         };
         if self.chunks.insert(record).is_none() {
             // unreachable: `slot_for` succeeded above, so this is a new chunk (no old range)

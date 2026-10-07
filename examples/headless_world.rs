@@ -480,7 +480,7 @@ fn light_line(map: &ChunkMap, ao: AoPolicy) -> String {
 fn sky_line(map: &ChunkMap, sky: &SkyMap, stats: &WorldStats, light: bool) -> String {
     let cache: usize = map
         .iter()
-        .filter_map(|(_, slot)| slot.light().map(|l| l.heap_bytes()))
+        .filter_map(|(_, slot)| Some(slot.light()?.heap_bytes()))
         .sum();
     let mib = |bytes: usize| bytes as f64 / f64::from(1 << 20);
     format!(

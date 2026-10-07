@@ -221,6 +221,31 @@ fn forbidden_draw_builtins_are_never_used() {
     }
 }
 
+/// No shader keeps an array in a function-local variable: dynamically indexed, it may live in
+/// scratch memory on some drivers (the light curve is indexed in the uniform itself).
+#[test]
+fn no_function_local_arrays() {
+    for id in ShaderModuleId::ALL {
+        let (module, _) = load(id);
+        let functions = module
+            .functions
+            .iter()
+            .map(|(_, f)| f)
+            .chain(module.entry_points.iter().map(|ep| &ep.function));
+        for f in functions {
+            for (_, local) in f.local_variables.iter() {
+                assert!(
+                    !matches!(module.types[local.ty].inner, naga::TypeInner::Array { .. }),
+                    "{}: {:?} has a local array {:?}",
+                    id.label(),
+                    f.name,
+                    local.name
+                );
+            }
+        }
+    }
+}
+
 fn const_u32(module: &naga::Module, name: &str) -> u32 {
     let (_, c) = module
         .constants
@@ -317,9 +342,10 @@ fn gpu_struct_layouts_match_the_rust_mirrors() {
     assert_eq!(offsets[7..], [240, 256, 272]);
     let (size, offsets) = struct_layout(&pull, "ChunkGpu");
     assert_eq!((size, size_of::<ChunkGpu>()), (64, 64));
-    assert_eq!(offsets[..5], [0, 12, 16, 48, 52]);
+    assert_eq!(offsets[..6], [0, 12, 16, 48, 52, 56]);
     assert_eq!(offset_of!(ChunkGpu, flags), 48);
     assert_eq!(offset_of!(ChunkGpu, light_base), 52);
+    assert_eq!(offset_of!(ChunkGpu, light_len), 56);
     let (cull, _) = load(ShaderModuleId::Cull);
     assert_eq!(
         struct_layout(&cull, "DrawArgs").0 as usize,

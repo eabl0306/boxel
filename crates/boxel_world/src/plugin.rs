@@ -92,24 +92,30 @@ pub struct WorldSettings {
     pub vertical_bounds: Option<RangeInclusive<i64>>,
     /// Which faces the mesher bakes ambient occlusion into (ADR 0015). The default,
     /// `BakedLitOnly`, skips faces whose 4 corners are dark (most cave faces). A change applies
-    /// to the meshes built after it. With `light` off every face counts as lit.
+    /// to the meshes built after it. With `light` off every face counts as lit, so every face
+    /// gets AO unless this is `AoPolicy::Off`.
     pub ao_policy: AoPolicy,
     /// Voxel light (ADR 0015): sky light from per-column sky tops plus RGB block light, baked
-    /// into each mesh by its job. Off: meshes see open sky everywhere (the look before light)
-    /// and no sky tops are computed. Read when the world starts (a later change does nothing).
+    /// into each mesh by its job. Off: meshes see open sky everywhere and no sky tops are
+    /// computed; the look before light also needs `ao_policy: AoPolicy::Off` (it had no AO).
+    /// Read when the world starts (a later change does nothing).
     pub light: bool,
     /// How deep, in voxels under the generator's top, a column is walked looking for its sky
     /// top. A column still open there (a natural shaft deeper than this) gets its top at that
     /// floor: no direct sky below it. A box under the floor needs no sky tile at all, so deep
     /// viewers walk nothing. Read when the world starts.
     pub sky_walk_limit: u32,
-    /// Chunks (distance to the nearest viewer) within which each mesh job also keeps the
+    /// Chunks (distance to the nearest viewer) within which the world keeps each meshed
     /// chunk's light for gameplay queries ([`ChunkMap::light_at`](crate::ChunkMap::light_at))
-    /// and for sizing edit remeshes (16 to 64 KiB per lit chunk, nothing for uniform light).
+    /// and for sizing edit remeshes (16 to 64 KiB per lit chunk, nothing for uniform light). A
+    /// mesh job keeps it; a chunk without one (all air, enclosed) or that came within the
+    /// radius later gets a light job, after the view's mesh jobs. Chunks that leave the radius
+    /// drop their light. At most 32 (larger values are clamped).
     pub light_cache_radius: u32,
     /// Frames the finished meshes of one edit batch wait for the rest of the batch before they
-    /// are published anyway (0: no wait). Holding them keeps a frame from showing half of an
-    /// edit's light change.
+    /// are published anyway (0: no wait): a mesh that arrives in frame `N` is published by frame
+    /// `N + edit_batch_hold_frames`. Holding them keeps a frame from showing half of an edit's
+    /// light change.
     pub edit_batch_hold_frames: u32,
 }
 

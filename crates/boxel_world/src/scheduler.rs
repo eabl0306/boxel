@@ -13,6 +13,8 @@ pub enum JobKind {
     Mesh,
     /// Walk a chunk column down for its sky tops (ADR 0015).
     SkyTile,
+    /// Compute a chunk's light for the light cache, without a mesh (ADR 0015).
+    Light,
 }
 
 impl JobKind {
@@ -22,13 +24,15 @@ impl JobKind {
             JobKind::Generate => 0,
             JobKind::Mesh => 1,
             JobKind::SkyTile => 2,
+            JobKind::Light => 3,
         }
     }
     const fn from_code(code: u8) -> Self {
         match code {
             0 => JobKind::Generate,
             1 => JobKind::Mesh,
-            _ => JobKind::SkyTile,
+            2 => JobKind::SkyTile,
+            _ => JobKind::Light,
         }
     }
 }
@@ -55,7 +59,8 @@ impl From<ColumnId> for JobId {
 }
 
 /// A queued job. Lower `priority` runs first (squared chunk distance to the nearest viewer;
-/// edit remeshes use 0). Ties: FIFO by `seq`.
+/// edit remeshes use 0, light jobs add a bias that puts them after the view's meshes). Ties:
+/// FIFO by `seq`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QueuedJob {
     /// Priority (lower first).

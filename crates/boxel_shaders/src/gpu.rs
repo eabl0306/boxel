@@ -48,8 +48,11 @@ pub struct ChunkGpu {
     /// First entry of the chunk's light palette in the arena (`quad_base` + total quads): High
     /// and Mid read a quad's 4 corner lights at `light_base` + its palette index.
     pub light_base: u32,
+    /// Entries of the chunk's light palette (at least 1). A quad whose index is not below it is
+    /// lit as open sky, as on Low and on the CPU, instead of reading another chunk's data.
+    pub light_len: u32,
     /// Padding to 64 bytes (WGSL struct alignment 16).
-    pub pad: [u32; 2],
+    pub pad: u32,
 }
 
 impl ChunkGpu {

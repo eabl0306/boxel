@@ -165,3 +165,50 @@ fn generators_without_a_top_or_without_content() {
     assert_eq!(h.sky.top(1, 3), Some(2));
     assert_eq!(h.sky.top(1, 4), Some(i64::MIN), "open forever");
 }
+
+/// Walks, sky bands and rescans visit only the loaded layers of a column: viewers `2^35` layers
+/// apart in the same columns (the walk floor in between, the void reachable), a block under the
+/// floor next to the deepest one, and a block placed and removed far above the ground, all
+/// settle at once.
+#[test]
+fn columns_with_layers_far_apart_settle_at_once() {
+    let mut h = Harness::new(LayerGen::new(-3..=1), Arc::new(InlineExecutor), 256)
+        .tall()
+        .lit();
+    let SkyRule::Walk(rule) = &h.sky.rule else {
+        panic!("walked")
+    };
+    assert!(
+        rule.void_reachable,
+        "loaded layers under the floor are read"
+    );
+    let deep = ChunkPos::new(0, -(1 << 35), 0);
+    let high = ChunkPos::new(0, 1 << 35, 0);
+    h.viewers(&[
+        (0, Viewer::new(ChunkPos::new(0, 0, 0), 1, 1)),
+        (1, Viewer::new(deep, 1, 1)),
+        (2, Viewer::new(high, 1, 1)),
+    ]);
+    h.settle(40);
+    assert_eq!(h.sky.top(3, 4), Some(-1));
+    // Under the floor: the column is walked again and its open columns would close at the
+    // floor (here the stone closes them first).
+    h.edit(BlockPos::new(3, deep.origin().y + 5, 4), STONE);
+    h.settle(40);
+    assert_eq!(h.sky.top(3, 4), Some(-1));
+    // Far above: the band reaches from the ground to the block.
+    let above = BlockPos::new(3, high.origin().y + 5, 4);
+    h.edit(above, STONE);
+    h.settle(40);
+    assert_eq!(h.sky.top(3, 4), Some(above.y));
+    // Removed: the rescan goes down to the ground in a few steps.
+    h.edit(above, BlockState::AIR);
+    h.settle(40);
+    assert_eq!(h.sky.top(3, 4), Some(-1));
+    assert!(
+        h.sky
+            .columns
+            .values()
+            .all(|c| c.layers.is_sorted() && c.layers.len() <= 15)
+    );
+}

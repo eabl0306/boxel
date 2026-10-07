@@ -9,7 +9,7 @@ use crate::interest::MAX_RADIUS;
 use crate::jobs::InlineExecutor;
 use crate::tests::support::{HoldExecutor, LayerGen, fake_mesh, panicking_mesh};
 use crate::{BlockEdit, WorldStats};
-use boxel_voxel::{BlockPos, CHUNK_VOLUME, ChunkKey, neighbor_index};
+use boxel_voxel::{BlockPos, CHUNK_VOLUME, ChunkKey, LightValue, neighbor_index};
 use boxel_worldgen::WorldGenerator;
 
 const STONE: BlockState = BlockState(1);
@@ -612,6 +612,83 @@ fn mesher_panic_marks_the_mesh_empty() {
     assert_eq!(h.jobs.failed, 1);
     assert_eq!(h.jobs.scheduler.in_flight(), 0);
     assert!(h.take_events().is_empty());
+}
+
+/// A mesh job that fails leaves an `Empty` mesh. The chunk's light from before the edit stays
+/// for queries but is not current (an edit next to it would size its remesh from it), and a
+/// light job brings it up to date.
+#[test]
+fn a_failed_remesh_does_not_leave_old_light_current() {
+    let mut h = Harness::new(LayerGen::new(-3..=1), Arc::new(InlineExecutor), 256).lit();
+    h.interest(&origin(1));
+    h.settle(40);
+    let chunk = ChunkPos::new(0, -1, 0);
+    assert!(h.slot(chunk).current_light().is_some());
+    let dug = BlockPos::new(5, -1, 6);
+    assert_eq!(h.map.light_at(dug), Some(LightValue::DARK), "stone");
+    h.jobs.mesh_fn = panicking_mesh;
+    h.edit(dug, BlockState::AIR);
+    h.step();
+    let slot = h.slot(chunk);
+    assert!(matches!(slot.mesh(), MeshState::Empty));
+    assert!(slot.light().is_some(), "the old light stays for queries");
+    assert!(slot.current_light().is_none(), "but it is not current");
+    h.jobs.mesh_fn = fake_mesh;
+    h.settle(20);
+    assert!(h.slot(chunk).current_light().is_some(), "a light job");
+    assert_eq!(h.map.light_at(dug), Some(LightValue::FULL_SKY), "dug open");
+}
+
+/// Remeshes of an edit batch, and a walk an edit sent back, keep priority 0 when a viewer move
+/// refreshes the queued priorities.
+#[test]
+fn edit_jobs_stay_first_when_priorities_are_refreshed() {
+    let mut h = Harness::new(LayerGen::new(-3..=1), Arc::new(InlineExecutor), 256).lit();
+    h.interest(&origin(2));
+    h.settle(40);
+    // Not dispatched, so the remeshes stay queued: a hole deep in the stone at a chunk border
+    // remeshes the two chunks around it (no light or sky change).
+    h.edit(BlockPos::new(31, -40, 5), BlockState::AIR);
+    let queued: Vec<ChunkId> = h
+        .map
+        .iter()
+        .filter(|(_, s)| matches!(s.mesh(), MeshState::Queued))
+        .map(|(id, _)| id)
+        .collect();
+    assert!(queued.len() >= 2, "{queued:?}");
+    h.interest(&[(ChunkPos::new(2, 0, 0), 2)]);
+    for &id in &queued {
+        let slot = &h.map.slots[id];
+        assert!(slot.batch.is_some());
+        let priority = current_priority(
+            &h.map,
+            &h.sky,
+            &h.jobs.planner,
+            JobId::Chunk(id),
+            JobKind::Mesh,
+        );
+        assert_eq!(priority, Some(0), "{:?}", slot.pos);
+    }
+    // A column an edit sent back to a walk.
+    let col = h.sky.id_at(0, 0).expect("column");
+    let c = &mut h.sky.columns[col];
+    c.queued = true;
+    c.batch = Some(0);
+    let priority = |h: &Harness| {
+        current_priority(
+            &h.map,
+            &h.sky,
+            &h.jobs.planner,
+            JobId::Column(col),
+            JobKind::SkyTile,
+        )
+    };
+    assert_eq!(priority(&h), Some(0));
+    h.sky.columns[col].batch = None;
+    assert_eq!(priority(&h), Some(4), "its distance");
+    h.sky.columns[col].queued = false;
+    h.settle(40);
+    assert!(h.map.iter().all(|(_, s)| s.batch.is_none()));
 }
 
 #[test]

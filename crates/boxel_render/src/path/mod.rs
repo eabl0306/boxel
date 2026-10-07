@@ -456,6 +456,7 @@ mod tests {
                 alloc,
                 counts: [1, 1, 1, 1, 1, 1, 2, 1],
                 light_base: alloc.offset + 9,
+                light_len: 1,
             });
         }
         table

@@ -11,7 +11,8 @@ use boxel_math::DVec3;
 use boxel_mesh::{ChunkMesh, MeshOptions};
 use boxel_transform::Transform;
 use boxel_voxel::{
-    BlockPos, BlockRegistry, BlockState, CHUNK_SIZE, ChunkKey, ChunkPos, LocalPos, RenderShape,
+    BlockPos, BlockRegistry, BlockState, CHUNK_SIZE, ChunkKey, ChunkPos, Face, LocalPos,
+    RenderShape,
 };
 use boxel_world::jobs::{InlineExecutor, JobExecutor, TaskPoolExecutor};
 use boxel_world::reference::Reference;
@@ -253,15 +254,16 @@ fn real_terrain_publishes_meshes() {
     assert!(stats.light_full > 0, "{stats:?}");
     assert_eq!(
         stats.light_full + stats.light_fast,
-        stats.mesh_ready + mesh_empty_jobs(map)
+        stats.mesh_ready + mesh_empty_jobs(&app)
     );
     assert!(stats.sky_walks > 0 && stats.sky_walks <= stats.sky_columns);
     assert_eq!(stats.waiting_sky, 0);
     let sky = app.world().resource::<SkyMap>();
     assert_eq!(sky.len(), stats.sky_columns);
     assert_eq!(sky.walked(), stats.sky_walks);
-    // The light near the viewer is cached for gameplay (all-air chunks are meshed without a
-    // job and keep none): some top voxels of surface chunks are direct sky.
+    // The light near the viewer is cached for gameplay (all-air chunks have no mesh job: a
+    // light job each): some top voxels of surface chunks are direct sky.
+    assert!(stats.light_jobs > 0, "{stats:?}");
     let mut open = 0;
     for (_, slot) in map.iter() {
         let Some(light) = slot.light() else {
@@ -283,11 +285,25 @@ fn real_terrain_publishes_meshes() {
     assert_replica_matches(&app, &last_meshes(&events));
 }
 
-/// Empty meshes that came from a mesh job (not from the all-air or enclosed fast paths): the
-/// chunks with a cached light and nothing to draw.
-fn mesh_empty_jobs(map: &ChunkMap) -> usize {
+/// Empty meshes that came from a mesh job: not the fast paths that skip the job (all air, or
+/// uniform opaque with 6 uniform opaque face neighbors).
+fn mesh_empty_jobs(app: &App) -> usize {
+    let map = app.world().resource::<ChunkMap>();
+    let registry = &app.world().resource::<WorldContent>().registry;
+    let uniform = |pos: ChunkPos| {
+        map.data_at(pos)
+            .and_then(|d| d.as_uniform())
+            .map(|s| registry.shape(s))
+    };
     map.iter()
-        .filter(|(_, s)| matches!(s.mesh(), MeshState::Empty) && s.light().is_some())
+        .filter(|(_, s)| matches!(s.mesh(), MeshState::Empty))
+        .filter(|(_, s)| match uniform(s.pos) {
+            Some(RenderShape::None) => false,
+            Some(RenderShape::Opaque) => !Face::ALL
+                .iter()
+                .all(|f| uniform(s.pos.offset(f.normal())) == Some(RenderShape::Opaque)),
+            _ => map.data_at(s.pos).is_some(),
+        })
         .count()
 }
 

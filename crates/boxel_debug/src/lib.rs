@@ -128,7 +128,8 @@ impl OverlayLines {
 pub struct CrosshairTarget(pub Option<BlockPos>);
 
 /// The light the overlay shows: at the eye's voxel and at the [`CrosshairTarget`]. `None` light
-/// means the chunk is not loaded or keeps no light (outside `WorldSettings::light_cache_radius`).
+/// means the chunk is not loaded or keeps no light: outside `WorldSettings::light_cache_radius`,
+/// or within it before the chunk's mesh or light job finished (all-air chunks included).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LightProbe {
     /// Light of the voxel holding the eye.

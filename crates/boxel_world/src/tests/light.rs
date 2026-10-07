@@ -622,30 +622,40 @@ fn an_unloaded_platform_takes_its_shadow_with_it() {
     assert!(assert_matches_reference(&app) > 0);
 }
 
+/// A world of stone layers under air with a lamp-ready corner, its jobs held on demand.
+fn corner_world(hold: u32) -> (App, Arc<SwitchExecutor>, [BlockState; 2]) {
+    let (registry, lamps) = lamp_registry();
+    let executor = Arc::new(SwitchExecutor::default());
+    let generator = LayerGen::new(-3..=1);
+    let settings = WorldSettings {
+        vertical_bounds: Some(generator.vertical.clone()),
+        edit_batch_hold_frames: hold,
+        ..small()
+    };
+    let mut app = lit_app(generator, registry, settings, executor.clone());
+    spawn(&mut app, ChunkPos::new(0, 0, 0), 2, 8);
+    settle(&mut app);
+    (app, executor, lamps)
+}
+
+/// A lamp on the stone at a chunk corner lights the top faces of 4 chunks.
+const CORNER: BlockPos = BlockPos::new(31, -1, 31);
+
 /// The meshes of one edit go out in the same frame, even when their jobs finish in different
-/// frames; held longer than `edit_batch_hold_frames` after they arrive, they go out as they are.
+/// frames. A result held in frame `N` waits for the rest through frame `N + hold` and goes out
+/// then at the latest, the rest on its own (the batch is split).
 #[test]
 fn an_edit_batch_is_published_in_one_frame() {
-    // Results that arrive in frame A wait through `hold` more frames; the rest arriving by then
-    // completes the batch, else the held part goes out alone.
-    for (hold, wait, split) in [(2, 2, false), (1, 3, true)] {
-        let (registry, lamps) = lamp_registry();
-        let executor = Arc::new(SwitchExecutor::default());
-        let generator = LayerGen::new(-3..=1);
-        let settings = WorldSettings {
-            vertical_bounds: Some(generator.vertical.clone()),
-            edit_batch_hold_frames: hold,
-            ..small()
-        };
-        let mut app = lit_app(generator, registry, settings, executor.clone());
-        spawn(&mut app, ChunkPos::new(0, 0, 0), 2, 8);
-        settle(&mut app);
+    // (hold, wait, split): 2 results arrive in the first frame, the other 2 `wait` frames later.
+    for (hold, wait, split) in [(2, 2, false), (1, 1, false), (2, 3, true), (1, 2, true)] {
+        let (mut app, executor, lamps) = corner_world(hold);
         executor.hold.store(true, Ordering::Relaxed);
-        // A lamp on the stone at a chunk corner lights the top faces of 4 chunks.
-        edit(&mut app, &[(BlockPos::new(31, -1, 31), lamps[0])]);
+        edit(&mut app, &[(CORNER, lamps[0])]);
         app.update();
         assert!(drain_events(&mut app).is_empty());
-        assert_eq!(executor.held(), 4, "the 4 stone chunks around the corner");
+        // The 4 stone chunks around the corner first (priority 0), then the light jobs of the 4
+        // air chunks above (their light changed, and they have no mesh job).
+        assert_eq!(executor.held(), 8);
         executor.run(2);
         let mut frames = Vec::new();
         for _ in 0..wait {
@@ -655,23 +665,173 @@ fn an_edit_batch_is_published_in_one_frame() {
         executor.run(usize::MAX);
         app.update();
         frames.push(drain_events(&mut app).len());
+        let mut want = vec![0; wait + 1];
+        if split {
+            want[hold as usize] = 2;
+            want[wait] = 2;
+        } else {
+            want[wait] = 4;
+        }
+        assert_eq!(frames, want, "hold {hold}, the rest after {wait} frame(s)");
         let s = stats(&app);
         assert_eq!(s.edit_batches_held, 1);
-        if split {
-            assert_eq!(
-                frames,
-                [0, 0, 2, 2],
-                "held results go out after {hold} frame(s)"
-            );
-            assert_eq!(s.edit_batches_split, 1);
-        } else {
-            assert_eq!(frames, [0, 0, 4], "one frame shows the whole batch");
-            assert_eq!(s.edit_batches_split, 0);
-        }
+        assert_eq!(s.edit_batches_split, usize::from(split));
         executor.hold.store(false, Ordering::Relaxed);
         settle(&mut app);
         assert_matches_reference(&app);
     }
+}
+
+/// A second edit reaches chunks whose results of the first edit are held: those results are
+/// stale, so they are dropped and the chunks remeshed at once. Both edits go out in one frame.
+#[test]
+fn a_second_edit_of_a_held_chunk_keeps_the_batch_whole() {
+    let (mut app, executor, lamps) = corner_world(2);
+    executor.hold.store(true, Ordering::Relaxed);
+    edit(&mut app, &[(CORNER, lamps[0])]);
+    app.update();
+    executor.run(2);
+    app.update();
+    assert!(drain_events(&mut app).is_empty(), "2 results held");
+    // The same lamp in blue: every chunk of the first edit, the 2 held ones too.
+    edit(&mut app, &[(CORNER, lamps[1])]);
+    executor.hold.store(false, Ordering::Relaxed);
+    executor.run(usize::MAX);
+    let mut frames = Vec::new();
+    for _ in 0..4 {
+        app.update();
+        frames.push(drain_events(&mut app).len());
+    }
+    assert_eq!(frames, [0, 4, 0, 0], "one frame shows both edits");
+    assert_eq!(stats(&app).edit_batches_split, 0);
+    settle(&mut app);
+    assert_matches_reference(&app);
+}
+
+/// The meshes of an edit go out ahead of a streaming backlog: the per-frame event budget only
+/// delays streaming meshes, and the edit's remeshes run first.
+#[test]
+fn edits_jump_the_streaming_backlog() {
+    let (registry, lamps) = lamp_registry();
+    let settings = WorldSettings {
+        max_mesh_events_per_frame: 2,
+        ..small()
+    };
+    let mut app = lit_app(overworld(), registry, settings, Arc::new(InlineExecutor));
+    spawn(&mut app, ChunkPos::new(0, 2, 0), 2, 2);
+    settle(&mut app);
+    // A second viewer far away: its whole view is generated and meshed in one frame, then
+    // published 2 meshes a frame.
+    spawn(&mut app, ChunkPos::new(60, 2, 0), 2, 2);
+    app.update();
+    drain_events(&mut app);
+    let backlog = app.world().resource::<WorldJobs>().pending_meshes();
+    assert!(backlog > 10, "{backlog} meshes waiting");
+    let p = BlockPos::new(9, surface(9, 7) + 2, 7);
+    edit(&mut app, &[(p, lamps[1])]);
+    app.update();
+    let (lamp_chunk, _) = p.split();
+    let events = drain_events(&mut app);
+    let upserts: BTreeSet<ChunkPos> = events
+        .iter()
+        .filter_map(|e| match e {
+            ChunkMeshEvent::Upsert { key, .. } => Some(key.pos),
+            ChunkMeshEvent::Remove { .. } => None,
+        })
+        .collect();
+    assert!(upserts.contains(&lamp_chunk), "{upserts:?}");
+    assert!(
+        app.world().resource::<WorldJobs>().pending_meshes() >= backlog - 2,
+        "the backlog is still there"
+    );
+    settle(&mut app);
+    assert_matches_reference(&app);
+}
+
+/// The light cache follows the viewer: a chunk that comes within `light_cache_radius` after its
+/// mesh job gets a light job, a chunk that leaves it drops its light, and digging far from the
+/// start still remeshes only the dug chunk (its light is current, so the reach is known).
+#[test]
+fn the_light_cache_follows_the_viewer() {
+    let (registry, _) = lamp_registry();
+    let settings = WorldSettings {
+        light_cache_radius: 1,
+        ..small()
+    };
+    let mut app = lit_app(overworld(), registry, settings, Arc::new(InlineExecutor));
+    let mut center = ChunkPos::new(0, -32, 0);
+    let viewer = spawn(&mut app, center, 2, 1);
+    settle(&mut app);
+    for x in 1..=17 {
+        center = ChunkPos::new(x, -32, 0);
+        move_viewer(&mut app, viewer, center);
+        settle(&mut app);
+    }
+    let map = app.world().resource::<ChunkMap>();
+    let mut cached = 0;
+    for (_, slot) in map.iter() {
+        if slot.pos.distance_sq(center) > 1 {
+            assert!(slot.light().is_none(), "{:?}: light dropped", slot.pos);
+        } else if slot.interest.contains(Interest::MESH) {
+            assert!(
+                slot.current_light().is_some(),
+                "{:?}: light cached",
+                slot.pos
+            );
+            cached += 1;
+        }
+    }
+    assert_eq!(cached, 7, "the viewer's chunk and its 6 face neighbors");
+    assert!(stats(&app).light_jobs > 0);
+    // An inner stone voxel of the viewer's chunk.
+    let data = map.data_at(center).expect("loaded");
+    let p = (1..31u32)
+        .flat_map(|y| (1..31u32).flat_map(move |x| (1..31u32).map(move |z| (x, y, z))))
+        .map(|(x, y, z)| LocalPos::new(x, y, z))
+        .find(|&l| data.get(l) == STONE)
+        .map(|l| BlockPos::from_parts(center, l))
+        .expect("a stone voxel");
+    assert_eq!(light_at(&app, p), LightValue::DARK);
+    let before = mesh_jobs(&app);
+    let fanout = stats(&app).light_fanout;
+    edit(&mut app, &[(p, BlockState::AIR)]);
+    settle(&mut app);
+    assert_eq!(
+        remeshed(&before, &mesh_jobs(&app)),
+        BTreeSet::from([center]),
+        "an inner voxel in the dark: its chunk only"
+    );
+    assert_eq!(stats(&app).light_fanout, fanout);
+    assert_matches_reference(&app);
+}
+
+/// All-air chunks near the viewer cache their light too (a light job each, they have no mesh
+/// job): the light at the eye of a viewer flying over the terrain, with a lamp's light in it.
+#[test]
+fn all_air_chunks_near_the_viewer_cache_their_light() {
+    let (registry, lamps) = lamp_registry();
+    let mut app = lit_app(overworld(), registry, small(), Arc::new(InlineExecutor));
+    let center = ChunkPos::new(0, 12, 0);
+    spawn(&mut app, center, 1, 1);
+    settle(&mut app);
+    let eye = BlockPos::new(30, center.origin().y + 16, 16);
+    let map = app.world().resource::<ChunkMap>();
+    let data = map.data_at(center).expect("loaded");
+    assert_eq!(
+        data.as_uniform(),
+        Some(BlockState::AIR),
+        "above the terrain"
+    );
+    assert_eq!(light_at(&app, eye), LightValue::FULL_SKY);
+    // A lamp 3 voxels away, in the next chunk: the eye's chunk is still all air.
+    edit(
+        &mut app,
+        &[(BlockPos::new(eye.x + 3, eye.y, eye.z), lamps[1])],
+    );
+    settle(&mut app);
+    let lit = light_at(&app, eye);
+    assert_eq!((lit.sky(), lit.rgb()), (15, [1, 3, 11]));
+    assert!(stats(&app).light_jobs > 0);
 }
 
 /// The same world 2^40 voxels away in x and -2^40 in y meshes to the same bits, edits too.

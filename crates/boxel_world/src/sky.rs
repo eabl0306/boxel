@@ -132,12 +132,10 @@ pub(crate) struct SkyColumn {
     /// Highest blocker placed by an edit (`i64::MIN`: none). Never lowered: a stale value only
     /// makes a walk start higher, through air.
     pub(crate) edit_top: i64,
-    /// Loaded slots in the column.
-    pub(crate) slots: u32,
-    /// Lowest and highest layer a slot of the column had since it was created (never shrinks:
-    /// the layers a lookup may find).
-    pub(crate) lo: i64,
-    pub(crate) hi: i64,
+    /// Layers of the column's loaded slots, ascending (one entry per slot). Loops over the
+    /// column visit these instead of every layer of a range, which may span `2^56` layers
+    /// (viewers far apart in the same column, or an edit far above or below the others).
+    pub(crate) layers: Vec<i64>,
     /// A walk job is in the scheduler.
     pub(crate) queued: bool,
     /// Mesh slots waiting for this tile (may hold stale or repeated ids; each is checked when
@@ -159,6 +157,16 @@ impl SkyColumn {
             SkyState::Exact(tile) => Some(tile),
             _ => None,
         }
+    }
+    /// The loaded layers in `lo..=hi`, ascending.
+    pub(crate) fn layers_in(&self, lo: i64, hi: i64) -> &[i64] {
+        let start = self.layers.partition_point(|&y| y < lo);
+        let end = self.layers.partition_point(|&y| y <= hi);
+        &self.layers[start..end.max(start)]
+    }
+    /// The highest loaded layer (`i64::MIN` without slots).
+    pub(crate) fn hi(&self) -> i64 {
+        self.layers.last().copied().unwrap_or(i64::MIN)
     }
 }
 
@@ -226,7 +234,13 @@ impl SkyMap {
                 _ => None,
             })
             .sum::<usize>();
+        let layers = self
+            .columns
+            .values()
+            .map(|c| c.layers.capacity() * size_of::<i64>())
+            .sum::<usize>();
         tiles
+            + layers
             + self.columns.capacity() * size_of::<SkyColumn>()
             + self.index.capacity() * size_of::<((i64, i64), ColumnId)>()
     }
@@ -237,10 +251,10 @@ impl SkyMap {
     /// A slot at `pos` was created: its column, created if needed.
     pub(crate) fn attach(&mut self, pos: ChunkPos, dim: DimensionId) -> ColumnId {
         if let Some(id) = self.id_at(pos.x, pos.z) {
-            let c = &mut self.columns[id];
-            c.slots += 1;
-            c.lo = c.lo.min(pos.y);
-            c.hi = c.hi.max(pos.y);
+            let layers = &mut self.columns[id].layers;
+            let i = layers.partition_point(|&y| y < pos.y);
+            debug_assert!(layers.get(i) != Some(&pos.y), "two slots at {pos:?}");
+            layers.insert(i, pos.y);
             return id;
         }
         let id = self.columns.insert(SkyColumn {
@@ -251,9 +265,7 @@ impl SkyMap {
             version: 0,
             edited: false,
             edit_top: i64::MIN,
-            slots: 1,
-            lo: pos.y,
-            hi: pos.y,
+            layers: vec![pos.y],
             queued: false,
             waiters: Vec::new(),
             waiting_for: None,
@@ -263,13 +275,18 @@ impl SkyMap {
         self.index.insert((pos.x, pos.z), id);
         id
     }
-    /// A slot of column `id` was removed; the column goes with its last slot (true).
-    pub(crate) fn detach(&mut self, id: ColumnId) -> bool {
+    /// The slot of column `id` at layer `y` was removed; the column goes with its last slot
+    /// (true).
+    pub(crate) fn detach(&mut self, id: ColumnId, y: i64) -> bool {
         let Some(c) = self.columns.get_mut(id) else {
             return false;
         };
-        c.slots -= 1;
-        if c.slots > 0 {
+        if let Ok(i) = c.layers.binary_search(&y) {
+            c.layers.remove(i);
+        } else {
+            debug_assert!(false, "no slot at layer {y} of column ({}, {})", c.x, c.z);
+        }
+        if !c.layers.is_empty() {
             return false;
         }
         c.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -296,6 +313,12 @@ impl SkyMap {
 /// mesh and its light read) meets voxels `lo..=hi`.
 pub(crate) fn padded_chunks(lo: i64, hi: i64) -> RangeInclusive<i64> {
     (lo.saturating_sub(1) >> CHUNK_SHIFT)..=(hi.saturating_add(1) >> CHUNK_SHIFT)
+}
+
+/// The highest of `layers` (ascending) below `y`.
+pub(crate) fn layer_below(layers: &[i64], y: i64) -> Option<i64> {
+    let i = layers.partition_point(|&l| l < y);
+    i.checked_sub(1).map(|i| layers[i])
 }
 
 /// A captured layer: its data, or air for a chunk whose generation failed.

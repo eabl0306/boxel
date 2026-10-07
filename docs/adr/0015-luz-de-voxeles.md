@@ -228,7 +228,10 @@ de gameplay.
   cargado, creado con su primer slot y borrado con el último. Estado `Pending`, `InFlight
   { version }` o `Exact(Arc<SkyTile>)`, más `version`, `edited` y el bloqueador editado más alto
   (el comienzo `S` de la próxima caminata). Un resultado cuya `version` cambió se descarta y la
-  columna se camina de nuevo.
+  columna se camina de nuevo. Guarda también las capas de sus slots cargados, ordenadas: la
+  caminata, las bandas y la búsqueda del techo siguiente recorren solo esas capas, nunca el rango
+  numérico (un viewer a y = -2^40 en un mundo que llega al vacío, o una edición muy arriba de
+  otro viewer, no recorren 2^35 capas).
 - **Caminata perezosa** (`JobKind::SkyTile`, `JobId::Column`): una columna se camina solo cuando
   una malla la necesita, así que un viewer hondo, con todas sus cajas debajo del piso, no camina
   nada. Comparte el tope de jobs en vuelo y su prioridad es la de su slot más cercano al viewer.
@@ -236,8 +239,9 @@ de gameplay.
   de la malla más baja que la espera), así casi no genera nada por su cuenta: lo que sí genera lo
   cuenta `WorldStats::sky_private_generations`. Las capas cargadas las lee del snapshot (ahí
   están las ediciones).
-- **Regla del mundo** (fija al arrancar): con `light` apagada no hay luz (mallas con cielo 15,
-  como antes). Con un generador sin tope (`GeneratorTop::Unbounded`), luz sin techos: toda
+- **Regla del mundo** (fija al arrancar): con `light` apagada no hay luz (mallas con cielo 15).
+  La imagen de antes necesita además `ao_policy: AoPolicy::Off`: sin luz toda cara cuenta como
+  iluminada y con la política por defecto lleva AO. Con un generador sin tope (`GeneratorTop::Unbounded`), luz sin techos: toda
   columna abierta, con un aviso en el log. Con un generador vacío, solo las ediciones tapan el
   cielo (sin piso). Con tope, el piso es el tope menos `sky_walk_limit`.
 - **`start_mesh`**: si la caja del chunk (su origen más 47) está en el piso o arriba, o si el
@@ -246,10 +250,22 @@ de gameplay.
   usa `SkyInput::BelowFloor`, sin tiles. El job toma un `LightScratch` y un `PaddedLight` por hilo,
   corre `boxel_light::compute` y después malla. Dentro de `light_cache_radius` (8 chunks) guarda
   también el `ChunkLight` del chunk, que lee `ChunkMap::light_at`.
+- **Caché de luz**: la luz guardada lleva la versión de datos y el `epoch` con que se calculó, y
+  solo es actual si siguen iguales (un job de malla fallido ya no deja luz vieja como actual). Un
+  chunk con malla dentro del radio cuyo job de malla no la guardó (todo aire, encerrado, un job
+  fallido, o que entró al radio después de mallarse) recibe un job de luz (`JobKind::Light`,
+  `WorldStats::light_jobs`): calcula solo la luz, con prioridad detrás de las mallas de la vista.
+  Un chunk uniforme de un bloque opaco sin emisión queda oscuro sin job. Cuando un viewer cambia
+  de chunk se recorren las cáscaras que entran y salen del radio: las que entran piden su luz,
+  las que salen la sueltan. `light_cache_radius` es como mucho 32.
 - **Publicación**: una malla igual a la publicada (mismo hash y mismos bytes) no se envía de
-  nuevo. Las mallas de un mismo lote de ediciones salen en el mismo frame: las que llegan antes
-  esperan al resto hasta `edit_batch_hold_frames` (2) frames; si el resto tarda más, salen como
-  están (`WorldStats::edit_batches_split`). Dos lotes que tocan el mismo chunk se juntan.
+  nuevo. Las mallas de un mismo lote de ediciones salen en el mismo frame: una que llega en el
+  frame N espera al resto hasta el frame N + `edit_batch_hold_frames` (2); si el resto tarda más,
+  sale en ese frame como está (`WorldStats::edit_batches_split`). Los resultados de un lote se
+  aplican antes que los del streaming, fuera del tope de eventos por frame, y sus jobs (y la
+  caminata que una edición manda a repetir) mantienen prioridad 0 aunque el viewer se mueva. Dos
+  lotes que tocan el mismo chunk se juntan; si el chunk tenía su malla retenida, esa malla ya es
+  vieja: se descarta y el chunk se remalla enseguida.
 - **Ediciones** (`apply_edits`), por vóxel cambiado `p`, todo en un lote con prioridad 0 y
   `epoch` subido:
   - Caras y AO: todo chunk cuya región acolchada contiene `p` (hasta 8).
@@ -275,7 +291,9 @@ de gameplay.
 
 - La paleta vive en el arena de quads, justo después de los 8 buckets del chunk:
   `light_base = quad_base + total_quads`, en un relleno libre de `ChunkGpu` (offset 52; sigue en
-  64 bytes). High y Mid la leen del mismo storage buffer: ningún binding nuevo. Cada chunk toma
+  64 bytes), y `light_len`, las entradas de la paleta (offset 56). High y Mid la leen del mismo
+  storage buffer: ningún binding nuevo. Un índice que no es menor que `light_len` lee cielo
+  abierto, como en Low y en la CPU, nunca los datos de otro chunk. Cada chunk toma
   `boxel_render::arena_len` entradas de 8 bytes: sus quads más su paleta, con al menos una entrada
   (una malla hecha a mano sin paleta recibe una de cielo abierto, así ningún índice lee otro
   chunk). `RenderStats::arena_used_quads` cuenta esas entradas. La subida escribe los quads y la
@@ -283,8 +301,9 @@ de gameplay.
 - Low recibe la paleta expandida por quad en un segundo vertex buffer por instancia
   (`Uint32x2` en `@location(1)`), paralelo al arena con los mismos offsets: un atributo, no un
   binding, así que la regla de ADR 0011 se mantiene. `boxel_gfx::tier::floors::VERTEX_BUFFERS`
-  pasa de 1 a 2 (en todos los tiers, como el resto de los pisos). Low paga 8 bytes más por quad
-  (16 en total). Cada tramo de mallas que sube tiene una segunda copia a ese buffer; la entrada de
+  pasa de 1 a 2 (en todos los tiers, como el resto de los pisos). Low reserva ese buffer entero
+  al crear el renderer, del tamaño del arena (64 MiB con los 8 Mi de entradas por defecto, haya
+  quads o no): un costo fijo de VRAM. Cada tramo de mallas que sube tiene una segunda copia a ese buffer; la entrada de
   cada quad se arma al escribir el buffer temporal (un índice fuera de la paleta lee cielo
   abierto).
 - `ViewUniform` pasa de 240 a 336 bytes (solo `vec4`, std140): `sky_light` (color del cielo por
@@ -293,7 +312,9 @@ de gameplay.
 - Fragment (`common.wgsl`: `corner_light`, `level_curve`, `voxel_light`, `ao_factor`,
   `shade_fragment`): interpolación bilineal por canal de las 4 esquinas en (s, t) del quad,
   escrita como `a + (b - a) * s` para que 4 esquinas iguales den su valor exacto;
-  `luz = max(curva(cielo) * sky_light.rgb, curva(rgb) * ganancia, ambiente)`;
+  `luz = max(curva(cielo) * sky_light.rgb, curva(rgb) * ganancia, ambiente)`, con la curva
+  indexada en el uniform (una copia local indexada en tiempo de ejecución puede ir a memoria
+  scratch; su costo se mide en P7);
   `color = albedo * sombreado de cara * mix(1 - fuerza_ao, 1, ao / 3) * luz`, con el AO también
   bilineal (antes era lineal por triángulo), después niebla. Con cielo 15 al mediodía y AO
   abierto da la imagen de antes. Igual en todos los tiers. `VsOut` cambia `shade` por la cara,
@@ -342,7 +363,8 @@ La luz de bloque se ve igual al mediodía y a medianoche (lo verifica `gpu_terra
 - Overlay F3: la luz (cielo y RGB) del vóxel del ojo y del vóxel al que apunta la mira
   (`boxel_debug::CrosshairTarget`, que las apps con picking llenan con la celda delante de la cara
   apuntada), y la hora del reloj. La luz sale de `ChunkMap::light_at` (dentro de
-  `light_cache_radius`; afuera muestra `-`).
+  `light_cache_radius`, también en chunks de puro aire; afuera, o mientras su job de luz no
+  termina, muestra `-`).
 - `voxel_world`: las lámparas en las teclas 7 a 0 y `--lamps`, que pone lámparas y lava alrededor
   del inicio y empieza a las 21:00.
 - `stress --edits`: una edición por segundo durante la medición (poner una lámpara y sacarla,
@@ -414,7 +436,8 @@ cielo en la superficie, de bloque en las lámparas) y que la caja de superficie 
 - P0 y P1 no cambiaron nada en pantalla. P2 pasa los quads a v2 y el mundo ya hornea AO, que el
   shader de hoy dibuja. P3 calcula la luz en el mundo (las caras oscuras pierden su AO); la luz se
   ve con P4 (el shader la lee).
-- Riesgos abiertos: Low paga 8 bytes más por quad (16 en total); una paleta con más de 4096
+- Riesgos abiertos: Low reserva un segundo buffer del tamaño del arena (64 MiB por defecto),
+  ocupado o no; una paleta con más de 4096
   entradas pierde precisión en los canales de bloque; las ediciones de luz remallan hasta 8
   chunks, más las bandas de los techos que se mueven; un viewer cuya vista toca los 1024 vóxeles
   bajo el tope camina las columnas generando la superficie (abajo). El AO en la clave del merge
@@ -520,6 +543,11 @@ Cambios de API que rompen:
   `light_curve`. `floors::VERTEX_BUFFERS` pasa a 2: un adaptador con un solo vertex buffer ya no
   entra en ningún tier. En WGSL, `decode_quad` toma la entrada de paleta y `VsOut` cambia `shade`
   por `face`, `st`, `light` y `ao`.
+- Revisión de P2 a P6: `WorldStats` suma `light_jobs`; `ChunkSlot::light` devuelve
+  `Option<&ChunkLight>`; `scheduler` suma `JobKind::Light`; `ChunkGpu` cambia `pad: [u32; 2]`
+  por `light_len` y `pad`; `light_cache_radius` se limita a 32. `TimeOfDay::set_clock` toma el
+  primer tick en la hora pedida o después, y `clock_text` cuenta minutos enteros, así
+  `--time HH:MM` muestra `HH:MM`.
 - P5: nuevos en `boxel_world`: `TimeOfDay`, `DaylightCurve`, `Daylight`, `SkyKey`,
   `DaylightPlugin` (en `DefaultPlugins`) y las constantes `DEFAULT_TICKS_PER_DAY`,
   `TICKS_PER_SECOND` y `SUNRISE_HOUR`.
@@ -567,10 +595,17 @@ Tests que lo vigilan:
   límite de la caminata corta un pozo más hondo; una plataforma a +5000 sombrea el suelo y al
   descargarse se lleva la sombra; contenido debajo del piso cierra en el piso las columnas
   abiertas (y al quitarlo vuelven a abrirse); un lote de ediciones sale en un frame, o en partes
-  pasado `edit_batch_hold_frames`; el mismo mundo en x = 2^40, y = -2^40 da los mismos bits.
+  pasado `edit_batch_hold_frames`; una segunda edición de un chunk retenido sale en el mismo
+  frame que la primera; las ediciones pasan delante de una cola de mallas del streaming; la caché
+  de luz sigue a un viewer que avanza 17 chunks (y cavar allá remalla solo el chunk); los chunks
+  de puro aire cerca del viewer guardan su luz; el mismo mundo en x = 2^40, y = -2^40 da los
+  mismos bits.
 - `boxel_world/src/streaming/tests/sky.rs`: las caminatas esperan los datos cargados y no
   generan nada; una caminata que leyó contenido editado se repite; un chunk editado que se
-  descarga devuelve su columna a una caminata; generadores sin tope o vacíos. En `sky.rs`, las
+  descarga devuelve su columna a una caminata; generadores sin tope o vacíos; viewers a 2^35
+  capas en las mismas columnas, con bloques bajo el piso y muy arriba, se asientan enseguida.
+  En `streaming/tests.rs`, un remallado fallido no deja luz vieja como actual y los jobs de un
+  lote siguen en prioridad 0 cuando el viewer se mueve. En `sky.rs`, las
   reglas según el rango del generador, `padded_chunks` contra fuerza bruta y las caminatas con
   capas capturadas, el vacío y el contenido fuera del generador.
 - `boxel_world/tests/integration.rs`: cada malla del terreno real, también después de editar,
@@ -586,8 +621,11 @@ Tests que lo vigilan:
   byte a byte; la cueva es igual al mediodía y a medianoche; la noche tiene como mucho la mitad
   del brillo del día; la cueva tiene píxeles rojos y azules; bajo el árbol, el alero y junto a la
   pared la imagen es más oscura que sin luz ni AO.
-- `boxel_render` (unitarios): el smoke test de cada tier dibuja quads con luz de bloque roja y
-  falla si el píxel central no sale rojo (así la paleta llega al fragment shader también en GL);
+- `boxel_render` (unitarios): el smoke test de cada tier dibuja un quad opaco con luz azul
+  (entrada 0) bajo un quad cutout más chico con luz roja (entrada 1), y falla si el centro no
+  sale rojo o una esquina no sale azul (así cada quad recibe su entrada también en GL, donde el
+  primer instance del draw cutout se emula por buffer); `gpu_tiers` comprueba que un índice
+  fuera de la paleta da cielo abierto en cada tier;
   la paleta va detrás de los quads en el arena y en Low cada quad recibe su entrada; la escena
   sigue al reloj del mundo. `gpu_tiers` cuenta las entradas de paleta en el arena lleno.
 - `boxel_world/src/daylight.rs` (P5): un día son 76 800 pasos fijos, los ticks son

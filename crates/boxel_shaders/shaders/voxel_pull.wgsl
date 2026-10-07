@@ -12,8 +12,10 @@
 fn vs_pull(@builtin(vertex_index) vi: u32, @location(0) draw: vec2<u32>) -> VsOut {
   let ch = chunks[draw.x];
   let q = quads[draw.y + (vi >> 2u)];
-  // The chunk's light palette follows its quads in the arena (no extra binding).
-  let lw = quads[ch.light_base + ((q.y >> MAT_LIGHT_SHIFT) & MAT_LIGHT_MASK)];
+  // The chunk's light palette follows its quads in the arena (no extra binding). An index past
+  // the palette (only a malformed mesh) reads open sky, as on Low, never another chunk's data.
+  let li = (q.y >> MAT_LIGHT_SHIFT) & MAT_LIGHT_MASK;
+  let lw = select(FULL_SKY_LIGHT, quads[ch.light_base + min(li, ch.light_len - 1u)], li < ch.light_len);
   return finish_vertex(decode_quad(q, lw, vi & 3u), ch.origin, view);
 }
 

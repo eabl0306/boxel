@@ -342,10 +342,18 @@ fn plugin_streams_settles_and_uses_fast_paths() {
         ),
         (21, 0, 21)
     );
+    // The viewer is 8 chunks above layer 1: only (0, 1, 0) is within `light_cache_radius`. It
+    // is all air (no mesh job), so a light job computes its light.
+    assert_eq!(stats.light_jobs, 1);
+    assert_eq!(
+        map.light_at(BlockPos::new(5, 40, 7)),
+        Some(boxel_voxel::LightValue::FULL_SKY)
+    );
+    assert_eq!(map.light_at(BlockPos::new(40, 40, 7)), None, "too far");
     assert_eq!(
         executor.spawned.load(Ordering::Relaxed),
-        expected.len() + exposed.len() + 21,
-        "one job per generation, one per exposed mesh and one per sky walk"
+        expected.len() + exposed.len() + 21 + 1,
+        "one job per generation, one per exposed mesh, one per sky walk and one light job"
     );
     assert_eq!(upserts(&events), exposed);
     assert!(removes(&events).is_empty());
@@ -369,6 +377,7 @@ fn plugin_streams_settles_and_uses_fast_paths() {
             interest_backlog: 0,
             light_full: stats.light_full,
             light_fast: stats.light_fast,
+            light_jobs: 1,
             sky_columns: 21,
             sky_walks: 21,
             sky_private_generations: 0,
@@ -730,9 +739,9 @@ fn task_pool_executor_settles_the_same_world() {
     assert_eq!(upserts(&events), exposed_chunks());
 }
 
-/// The structures every interest step touches keep their size: a slot is 88 bytes (96 in the
-/// slot map, with its version; its key is stored flat, so the small fields fill the padding a
-/// nested `ChunkKey` would leave), an index entry 32.
+/// The structures every interest step touches keep their size: a slot is 112 bytes (its key is
+/// stored flat, so the small fields fill the padding a nested `ChunkKey` would leave), an index
+/// entry 32.
 #[test]
 fn hot_structures_stay_small() {
     assert_eq!(size_of::<crate::ChunkSlot>(), 112, "chunk slot");
@@ -841,9 +850,12 @@ fn jobs_run_back_to_back_within_a_frame() {
     app.update();
     let stats = *app.world().resource::<WorldStats>();
     assert!(stats.is_settled(), "{stats:?}");
+    // The 10 all-air mesh chunks (layers 0 and 1) have no mesh job: a light job each fills
+    // their light cache. The enclosed stone needs none (no light enters it).
+    assert_eq!(stats.light_jobs, 10);
     assert_eq!(
         executor.spawned.load(Ordering::Relaxed),
-        105 + 10 + 21,
-        "every generation, the exposed meshes and a sky walk per column"
+        105 + 10 + 21 + 10,
+        "every generation, the exposed meshes, a sky walk per column and the air chunks' light"
     );
 }
