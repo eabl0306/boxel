@@ -1,0 +1,30 @@
+{
+  "multipart": [
+    { "apply": { "model": "minecraft:block/stone" } },
+    {
+      "when": { "north": "true" },
+      "apply": { "model": "minecraft:block/custom_block", "uvlock": true }
+    },
+    {
+      "when": {
+        "OR": [
+          { "east": "true|false", "north": "true" },
+          { "west": "true", "south": "false" }
+        ]
+      },
+      "apply": [
+        { "model": "minecraft:block/stone", "weight": 1 },
+        { "model": "minecraft:block/cross_plant" }
+      ]
+    },
+    {
+      "when": {
+        "AND": [
+          { "east": "true" },
+          { "west": "true" }
+        ]
+      },
+      "apply": { "model": "minecraft:block/stone" }
+    }
+  ]
+}

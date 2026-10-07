@@ -60,6 +60,9 @@ pub use boxel_worldgen as worldgen;
 #[cfg(feature = "physics")]
 pub use boxel_physics as physics;
 
+#[cfg(feature = "pack")]
+pub use boxel_pack as pack;
+
 use boxel_app::{PluginGroup, PluginGroupBuilder};
 
 /// Everything a typical app needs.
