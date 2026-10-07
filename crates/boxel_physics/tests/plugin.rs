@@ -1,7 +1,5 @@
-//! Bodies in a headless app (phase P2): `WorldPlugin` with inline jobs over a flat test world
-//! (stone at y 0..=2 and grass at y = 3 relative to a base block, so the ground is at y = 4),
-//! `PhysicsPlugin`, and `TimePlugin` on a synthetic clock (frames of a set length, so every run
-//! has the same fixed steps).
+//! Bodies in a headless app (phase P2), on the harness of `sim`: a flat test world (the ground
+//! at y = 4), `PhysicsPlugin` and a synthetic clock.
 //!
 //! Falling onto the exact surface with one impact (the same speed as the pure integrator),
 //! freezing over unloaded chunks, block edits under and into a body, teleports through
@@ -11,215 +9,24 @@
 //! determinism (two runs, 144 vs 64 fps, interpolation on or off) and the same scene far from
 //! the origin.
 mod common;
+mod sim;
 
-use boxel_app::{
-    App, First, FixedPostUpdate, FixedTime, FixedUpdate, Time, TimePlugin, TimeSystems, Update,
-};
+use boxel_app::{FixedPostUpdate, FixedTime, FixedUpdate};
 use boxel_diagnostic::DiagnosticsBoard;
 use boxel_ecs::prelude::*;
 use boxel_math::{DVec3, I64Vec3, Vec2};
 use boxel_physics::{
-    BodyPosition, BodySettings, CharacterController, Collider, Contacts, Frozen, Interpolated,
-    MoveIntent, PhysicsPlugin, PhysicsSettings, PhysicsStats, PhysicsSystems, RigidBody, Teleport,
-    TestWorld, Velocity, VoxelImpact, integrate_velocity, step_body,
+    BodySettings, CharacterController, Collider, Contacts, Interpolated, MoveIntent,
+    PhysicsSettings, PhysicsStats, PhysicsSystems, RigidBody, Teleport, TestWorld, Velocity,
+    integrate_velocity, step_body,
 };
 use boxel_transform::Transform;
-use boxel_voxel::{
-    BlockPos, BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, Face, MAX_BLOCK_COORD,
-    WorldPos,
-};
-use boxel_world::jobs::InlineExecutor;
-use boxel_world::{ChunkMap, ChunkViewer, EditQueue, WorldPlugin, WorldStats};
-use boxel_worldgen::{FlatGenerator, WorldGenerator};
+use boxel_voxel::{BlockPos, BlockRegistry, BlockState, Face, MAX_BLOCK_COORD, WorldPos};
+use boxel_world::ChunkMap;
 use common::{STONE, player, table};
+use sim::{FRAME_144, Impacts, STEP, Sim};
 use std::collections::BTreeSet;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-/// One fixed step at 64 Hz (exactly `FixedTime::timestep()`).
-const STEP: Duration = Duration::from_nanos(15_625_000);
-/// A frame at 144 fps: at most one step each.
-const FRAME_144: Duration = Duration::from_nanos(6_944_444);
-
-/// Flat layers (stone y 0..=2, grass y = 3) moved by whole chunks to `base`.
-struct ShiftedFlat {
-    flat: FlatGenerator,
-    base: ChunkPos,
-}
-
-impl WorldGenerator for ShiftedFlat {
-    fn generate(&self, key: ChunkKey, registry: &BlockRegistry) -> ChunkData {
-        let pos = ChunkPos::new(
-            key.pos.x - self.base.x,
-            key.pos.y - self.base.y,
-            key.pos.z - self.base.z,
-        );
-        self.flat.generate(ChunkKey { pos, ..key }, registry)
-    }
-    fn name(&self) -> &str {
-        "shifted flat"
-    }
-}
-
-/// The synthetic clock: every update advances it by `next`.
-#[derive(Resource)]
-struct Clock {
-    time: Time,
-    now: Instant,
-    next: Duration,
-}
-
-/// Replaces the real clock (runs right after `time_system`).
-fn synthetic_time(mut clock: ResMut<Clock>, mut time: ResMut<Time>) {
-    let now = clock.now + clock.next;
-    clock.now = now;
-    clock.time.update_with_instant(now);
-    *time = clock.time.clone();
-}
-
-/// Every `VoxelImpact` read in `Update`.
-#[derive(Resource, Default)]
-struct Impacts(Vec<VoxelImpact>);
-
-fn log_impacts(mut impacts: MessageReader<VoxelImpact>, mut log: ResMut<Impacts>) {
-    log.0.extend(impacts.read().copied());
-}
-
-/// A settled flat world around `base` and its app.
-struct Sim {
-    app: App,
-    base: I64Vec3,
-}
-
-impl Sim {
-    /// `base` is a multiple of 1024 on every axis, so the viewer's `f64` position is exact up
-    /// to the world limit. Frames last `frame`. The viewer at `base` loads one chunk around it.
-    fn new(base: I64Vec3, frame: Duration) -> Self {
-        let start = Instant::now();
-        let mut app = App::new();
-        app.add_plugins((
-            TimePlugin,
-            WorldPlugin {
-                generator: Arc::new(ShiftedFlat {
-                    flat: FlatGenerator::new(vec![
-                        ("boxel:stone".to_string(), 3),
-                        ("boxel:grass".to_string(), 1),
-                    ]),
-                    base: ChunkPos::containing(BlockPos::from_i64vec3(base)),
-                }),
-                executor: Arc::new(InlineExecutor),
-                ..WorldPlugin::default()
-            },
-            PhysicsPlugin::default(),
-        ))
-        .insert_resource(Clock {
-            time: Time::new(start),
-            now: start,
-            next: frame,
-        })
-        .init_resource::<Impacts>()
-        .add_systems(First, synthetic_time.after(TimeSystems))
-        .add_systems(Update, log_impacts);
-        app.finish();
-        app.cleanup();
-        let mut sim = Self { app, base };
-        sim.viewer(DVec3::ZERO);
-        sim.settle();
-        sim
-    }
-
-    /// A chunk viewer (radius 1) at `base + local`.
-    fn viewer(&mut self, local: DVec3) {
-        self.app.world_mut().spawn((
-            Transform::from_translation(self.base.as_dvec3() + local),
-            ChunkViewer::new(1).with_vertical_radius(1),
-        ));
-    }
-
-    fn settle(&mut self) {
-        let start = Instant::now();
-        loop {
-            self.app.update();
-            let stats = *self.app.world().resource::<WorldStats>();
-            if stats.chunks > 0 && stats.is_settled() {
-                return;
-            }
-            assert!(
-                start.elapsed() < Duration::from_secs(60),
-                "not settled: {stats:?}"
-            );
-        }
-    }
-
-    /// `base + local`, exact.
-    fn pos(&self, x: f64, y: f64, z: f64) -> WorldPos {
-        WorldPos::from_block(BlockPos::from_i64vec3(self.base), DVec3::new(x, y, z))
-    }
-
-    fn block(&self, x: i64, y: i64, z: i64) -> BlockPos {
-        BlockPos::from_i64vec3(self.base + I64Vec3::new(x, y, z))
-    }
-
-    /// A dynamic body placed exactly at `pos` (through `Teleport`), with `bundle`.
-    fn body(&mut self, pos: WorldPos, bundle: impl Bundle) -> Entity {
-        self.app
-            .world_mut()
-            .spawn((RigidBody::Dynamic, Teleport(pos), bundle))
-            .id()
-    }
-
-    /// A dynamic player-size body placed exactly at `pos`, plus `extra`.
-    fn spawn(&mut self, pos: WorldPos, extra: impl Bundle) -> Entity {
-        self.body(pos, (Collider::standing(0.6, 1.8), extra))
-    }
-
-    /// One update of `frame`.
-    fn frame(&mut self, frame: Duration) {
-        self.app.world_mut().resource_mut::<Clock>().next = frame;
-        self.app.update();
-    }
-
-    /// One update that runs no fixed step (shorter than what the accumulator still needs).
-    fn idle_frame(&mut self) {
-        let fixed = self.app.world().resource::<FixedTime>();
-        let room = fixed.timestep() - fixed.accumulator();
-        self.frame(room / 2);
-        assert_eq!(
-            self.app.world().resource::<FixedTime>().steps_last_frame(),
-            0
-        );
-    }
-
-    /// `n` updates of one fixed step each.
-    fn steps(&mut self, n: usize) {
-        for _ in 0..n {
-            self.frame(STEP);
-        }
-    }
-
-    fn edit(&mut self, pos: BlockPos, state: BlockState) {
-        self.app
-            .world_mut()
-            .resource_mut::<EditQueue>()
-            .set_block(pos, state);
-    }
-
-    fn get<T: Component + Copy>(&self, entity: Entity) -> T {
-        *self.app.world().get::<T>(entity).expect("component")
-    }
-
-    fn position(&self, entity: Entity) -> WorldPos {
-        self.get::<BodyPosition>(entity).0
-    }
-
-    fn translation(&self, entity: Entity) -> DVec3 {
-        self.get::<Transform>(entity).translation
-    }
-
-    fn frozen(&self, entity: Entity) -> bool {
-        self.app.world().get::<Frozen>(entity).is_some()
-    }
-}
+use std::time::Duration;
 
 /// The same flat ground as a `TestWorld`, around `(0, 0, 0)`.
 fn test_ground() -> TestWorld {

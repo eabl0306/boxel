@@ -50,8 +50,9 @@ pub struct BodySettings {
     /// the axis never bounces either, whatever this is: otherwise a body resting on the ground
     /// would bounce in place every step and never reach a velocity of 0.
     pub bounce_min_speed: f64,
-    /// Share of a push between two solid bodies (phase P3): a body with twice the weight moves
-    /// half as much. Unused today.
+    /// How two solid dynamic bodies split a push (and the velocity they lose toward each other):
+    /// a body with twice the weight moves half as much. Clamped to `1e-6..=1e6`; NaN counts as
+    /// 1.
     pub push_weight: f64,
 }
 
@@ -220,7 +221,8 @@ pub fn integrate_velocity(
 
 /// One step of a dynamic body with the voxel box `shape` (relative to `pos`): gravity, drag,
 /// the speed limit, the sweep against the voxels of `src`, bounces and impacts (see the module
-/// docs). `on_ground` is whether the body ended the previous step on the ground.
+/// docs). `on_ground` is whether the body ended the previous step on the ground. The same as
+/// [`integrate_velocity`] followed by [`move_body`] with no obstacles.
 ///
 /// # Errors
 ///
@@ -236,8 +238,39 @@ pub fn step_body<S: VoxelSource + ?Sized>(
     settings: &BodySettings,
     params: &StepParams,
 ) -> Result<BodyStep, Unloaded> {
-    let mut v = integrate_velocity(vel, on_ground, settings, params);
-    let sweep = move_box(src, table, pos, shape, v * params.dt, &[], &params.sweep)?;
+    let v = integrate_velocity(vel, on_ground, settings, params);
+    move_body(src, table, pos, v, shape, &[], settings, params)
+}
+
+/// Steps 4 and 5 of the integrator: moves a body with the voxel box `shape` (relative to `pos`)
+/// by `vel * dt` against the voxels of `src` and the `obstacles` (boxes in the frame of
+/// `pos.block`: static and kinematic solid bodies), then bounces or stops each clipped axis and
+/// reports the impacts. `vel` is the velocity [`integrate_velocity`] gave for this step. An
+/// obstacle clips like a block but is never an impact (impacts are hits on blocks).
+///
+/// # Errors
+///
+/// [`Unloaded`], as [`step_body`].
+pub fn move_body<S: VoxelSource + ?Sized>(
+    src: &mut S,
+    table: &CollisionTable,
+    pos: WorldPos,
+    vel: DVec3,
+    shape: LocalBox,
+    obstacles: &[LocalBox],
+    settings: &BodySettings,
+    params: &StepParams,
+) -> Result<BodyStep, Unloaded> {
+    let mut v = vel;
+    let sweep = move_box(
+        src,
+        table,
+        pos,
+        shape,
+        v * params.dt,
+        obstacles,
+        &params.sweep,
+    )?;
     let mut impacts = [None; 3];
     for (axis, impact) in impacts.iter_mut().enumerate() {
         let face = face_of(axis, v[axis] > 0.0);

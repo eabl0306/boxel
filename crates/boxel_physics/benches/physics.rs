@@ -1,7 +1,7 @@
 //! Physics core benches on generated worlds, read through `ChunkSource` like the ECS layer does
 //! (one hash lookup per chunk touched, uniform chunks without decoding).
 //!
-//! Targets (physics plan, phases P1 and P2; dev laptop, one thread):
+//! Targets (physics plan, phases P1 to P3; dev laptop, one thread):
 //!
 //! | Bench | Target |
 //! |---|---|
@@ -13,6 +13,8 @@
 //! | `tick/100` | <= 0.05 ms |
 //! | `tick/1000` | <= 0.5 ms |
 //! | `frame/1000`, `frame/1000_multi_thread` | no target (per-frame cost, compare the two) |
+//! | `grid/10000` | <= 0.3 ms |
+//! | `grid/1000`, `grid/10000_crowd` | no target (scaling, a dense crowd) |
 //!
 //! The worlds are streamed once by a headless app (`WorldPlugin`, inline jobs) before the
 //! measurements: forest terrain around the origin, a wide sky above it and a line of
@@ -22,7 +24,13 @@
 //! dropped from up to 20 blocks, all `Interpolated` as in the examples. A `frame` is one run of
 //! `RunFixedMainLoop` in a frame without a fixed step (144 fps): the interpolation of the 1000
 //! bodies and the schedule's executor, on the single-threaded executor `PhysicsPlugin` sets and
-//! on the multi-threaded one. Run when the machine is idle (`tools/wait-idle.sh`).
+//! on the multi-threaded one. `grid/N` builds the broadphase grid of N bodies and lists its
+//! candidate pairs (what `PhysicsSystems::Broadphase` does every step): player-size bodies
+//! (70 %) and items (30 %) at random, 10 % of them 2 blocks up, as spread as the `tick` bodies
+//! (one per 9.2 blocks of ground: 1000 on 96 x 96 blocks, 10 000 on 304 x 304), with the grid
+//! reused across steps. `grid/10000_crowd` packs the 10 000 on 128 x 128 blocks (one per 1.6
+//! blocks of ground: cells of 4 x 4 blocks hold about 10 bodies). Run when the machine is idle
+//! (`tools/wait-idle.sh`).
 #![expect(clippy::print_stdout, reason = "bench setup output")]
 
 use boxel_app::{App, FixedPostUpdate, FixedTime, RunFixedMainLoop};
@@ -31,9 +39,10 @@ use boxel_ecs::prelude::*;
 use boxel_ecs::schedule::MultiThreadedExecutor;
 use boxel_math::{DVec3, Vec2};
 use boxel_physics::{
-    BodyPosition, BodySettings, CharacterController, ChunkSource, Collider, CollisionTable,
-    Interpolated, LocalBox, MoveIntent, PhysicsPlugin, PhysicsStats, RayResult, RigidBody,
-    SweepConfig, Teleport, Velocity, VoxelFilter, VoxelImpact, move_box, raycast_voxels,
+    BlockBounds, BodyPosition, BodySettings, CharacterController, ChunkSource, Collider,
+    CollisionLayers, CollisionTable, Grid, Interpolated, LocalBox, MoveIntent, PhysicsPlugin,
+    PhysicsStats, RayResult, RigidBody, SweepConfig, Teleport, Velocity, VoxelFilter, VoxelImpact,
+    move_box, raycast_voxels,
 };
 use boxel_transform::Transform;
 use boxel_voxel::{BlockRegistry, WorldPos};
@@ -462,5 +471,60 @@ fn tick_benches(c: &mut Criterion) {
     frame.finish();
 }
 
-criterion_group!(physics, benches, tick_benches);
+/// The bounds of `n` bodies of the grid bench on a square of `side` blocks.
+fn crowd(n: u64, side: u64) -> Vec<BlockBounds> {
+    let half = side as f64 * 0.5;
+    (0..n)
+        .map(|i| {
+            let r = mix(i ^ 0xC0FF_EE00);
+            let x = (r % (side * 100)) as f64 / 100.0 - half;
+            let z = ((r >> 20) % (side * 100)) as f64 / 100.0 - half;
+            let y = if (r >> 32).is_multiple_of(10) {
+                66.0
+            } else {
+                64.0
+            };
+            let shape = if (r >> 40) % 10 < 7 {
+                LocalBox::new(DVec3::new(-0.3, 0.0, -0.3), DVec3::new(0.3, 1.8, 0.3))
+            } else {
+                LocalBox::new(DVec3::splat(-0.125), DVec3::splat(0.125))
+            };
+            BlockBounds::of_box(WorldPos::from_dvec3(DVec3::new(x, y, z)), shape)
+        })
+        .collect()
+}
+
+fn grid_benches(c: &mut Criterion) {
+    let mut group = c.benchmark_group("grid");
+    let mut grid = Grid::default();
+    let mut pairs = Vec::new();
+    for (name, n, side) in [
+        ("1000", 1000, 96),
+        ("10000", 10_000, 304),
+        ("10000_crowd", 10_000, 128),
+    ] {
+        let bodies = crowd(n, side);
+        let run = |grid: &mut Grid, pairs: &mut Vec<(u32, u32)>| {
+            grid.reset(2);
+            for &bounds in &bodies {
+                grid.insert(bounds, CollisionLayers::default(), true);
+            }
+            grid.pairs(pairs);
+        };
+        run(&mut grid, &mut pairs);
+        println!(
+            "physics bench: grid/{name}: {} candidate pairs",
+            pairs.len()
+        );
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                run(&mut grid, &mut pairs);
+                black_box(pairs.len())
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(physics, benches, tick_benches, grid_benches);
 criterion_main!(physics);

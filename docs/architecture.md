@@ -153,7 +153,7 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_worldgen` | trait `WorldGenerator`; generadores `FlatGenerator`, `TerrainGenerator`, `ForestGenerator` (terreno con árboles) y `OverworldGenerator` (superficie sobre piedra infinita hacia abajo, con cuevas y árboles; etapas en `overworld`: `Heightmap`, `SurfaceRules`, `Caves`, más `Trees`); ruido 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`) | voxel |
 | `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, eventos, `ChunkStore` | app, voxel, mesh, worldgen, transform, diagnostic |
 | `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `PresentSettings` (vsync en tiempo de ejecución), texturas procedurales, screenshots | gfx, shaders, world, camera, window |
-| `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::solid`), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas, el integrador de un cuerpo (`step_body`, `predict`). Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`; pasos en `FixedPostUpdate`, interpolación en `AfterFixedMainLoop`), `PhysicsQuery`, cuerpos (`RigidBody`, `Collider`, `Velocity`, `BodyPosition`, `Contacts`, `Interpolated`, `Teleport`, `Frozen`), `CharacterController` y `VoxelImpact`. Hoy fase P2: entre entidades y proyectiles vienen en P3 y P4 | ecs, app, math, transform, voxel, world, diagnostic |
+| `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::solid`), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas, el integrador de un cuerpo (`step_body`, `predict`), el narrowphase (`shape_contact`) y la grilla del broadphase (`Grid`). Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`; pasos en `FixedPostUpdate`, interpolación en `AfterFixedMainLoop`), `PhysicsQuery` (rayos a vóxeles y cuerpos, cajas, el chequeo para poner bloques), `BodyIndex`, cuerpos (`RigidBody`, `Collider`, `Velocity`, `BodyPosition`, `Contacts`, `Interpolated`, `Teleport`, `Frozen`, `ReportContacts`), `CharacterController` y los mensajes `VoxelImpact`, `CollisionStarted` y `CollisionEnded`. Hoy fase P3: proyectiles, dormir y paso en paralelo vienen en P4 | ecs, app, math, transform, voxel, world, diagnostic |
 | `boxel_facade_check` | solo CI: prueba que los derives resuelven `::boxel::ecs` para un usuario que depende solo de `boxel` | fachada |
 | `vendor/*` (7 crates) | ECS y tareas (fork de Bevy) | - |
 
@@ -1031,8 +1031,9 @@ schedule `Shutdown` es el lugar para el `flush` final.
   suman líneas propias con `OverlayLines` (`voxel_world` muestra el bloque apuntado, la
   selección, el modo, con el estado del jugador si camina, y la línea de física) y `Crosshair`
   dibuja una mira en el centro.
-- Línea `physics` de `DiagnosticsBoard` (`PhysicsStats`): cuerpos, dinámicos, congelados,
-  impactos y tiempo del último paso de física.
+- Línea `physics` de `DiagnosticsBoard` (`PhysicsStats`): cuerpos, dinámicos, congelados, pares
+  del broadphase, empujes, solapes que avisan, impactos y tiempos del último paso de física (el
+  movimiento y lo de entre cuerpos).
 - `FrameTimeHistory`: los últimos frames (4096 por defecto, mínimo 1024) con su tiempo real
   (`Time::real_delta`); `summary()` da p50, p95, p99, p99.9, máximo, promedio y 1% low.
 - Tirones mientras se carga el mundo: `examples/stress.rs` y `just bench-*`

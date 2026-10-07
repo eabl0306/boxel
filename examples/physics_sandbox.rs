@@ -1,13 +1,16 @@
-//! Physics sandbox (phase P2 of ADR 0016): walk on a generated world with gravity, jump, and
-//! drop items that fall and come to rest.
+//! Physics sandbox (phases P2 and P3 of ADR 0016): walk on a generated world with gravity, jump,
+//! drop items that fall, come to rest and get picked up, and stack crates.
 //!
 //! `cargo run --release --example physics_sandbox -- [GPU options] [options]` (see `--help`).
 //! It starts walking on the ground at the origin. Left click grabs the mouse; WASD walks along
 //! the view, Space jumps (hold it to keep jumping), G switches to flying (the free camera, as in
 //! `voxel_world`) and back, Q drops an item in front of you (a small dynamic sensor box with the
-//! item settings: half gravity, more drag). F3 shows the debug overlay with the player's state, a
-//! physics line (bodies, frozen, impacts, step time) and the items. Bodies have no renderer yet:
-//! items show on F3 only.
+//! item settings: half gravity, more drag), C drops a crate two blocks ahead (a solid box of
+//! 0.75: crates stack, and you can push them and stand on them). Walking into an item picks it up
+//! (the player's `CollisionStarted` with the item's sensor; a thrown item only after a second).
+//! F3 shows the debug overlay with the player's state, a physics line (bodies, pairs, pushes,
+//! impacts, step time), the items and the crates. Bodies have no renderer yet: items and crates
+//! show on F3 only.
 //!
 //! `--drop-test` drops 100 items from 40 blocks above the ground once the player stands, and
 //! exits 0 when all of them rest on something, or 3 if any still moves after 20 s of simulated
@@ -44,7 +47,8 @@ usage: physics_sandbox [GPU options] [options]
   --view-distance N       mesh radius in chunks (default 8)
   --debug-overlay         start with the F3 debug overlay visible (F3 toggles it)
   --help                  this text
-keys: WASD walk, Space jump, G fly/walk, Q drop an item, F3 overlay, Escape frees the mouse
+keys: WASD walk, Space jump, G fly/walk, Q drop an item, C drop a crate, F3 overlay,
+  Escape frees the mouse
 exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 drop test failed, 4 timeout";
 
 /// Default `--timeout` for automation runs.
@@ -55,8 +59,14 @@ const WATCHDOG_GRACE: Duration = Duration::from_secs(15);
 const DEFAULT_RADIUS: u32 = 8;
 /// Drops an item.
 const DROP_KEY: KeyCode = KeyCode::KeyQ;
+/// Drops a crate.
+const CRATE_KEY: KeyCode = KeyCode::KeyC;
 /// Half the edge of an item's box, blocks (a quarter-block cube, Minecraft's item size).
 const ITEM_HALF: f64 = 0.125;
+/// The edge of a crate, blocks.
+const CRATE_SIZE: f64 = 0.75;
+/// A thrown item can be picked up this many physics steps after it was thrown (1 s).
+const PICKUP_DELAY: u64 = 64;
 /// `--drop-test`: items per side of the square, their spacing and the drop height above the
 /// player's feet, blocks.
 const DROP_GRID: u32 = 10;
@@ -156,19 +166,42 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
 
 /// A dropped item.
 #[derive(Component, Clone, Copy, Debug, Default)]
-struct Item;
+struct Item {
+    /// The physics step (`PhysicsStats::steps`) from which the player can pick it up.
+    pickable_at: u64,
+}
 
-/// An item at `pos` moving at `velocity`: a dynamic sensor box (it lands on blocks and pushes
-/// nothing) with the item settings, interpolated.
-fn item(pos: WorldPos, velocity: DVec3) -> impl Bundle {
+/// An item at `pos` moving at `velocity`, pickable from step `pickable_at`: a dynamic sensor box
+/// (it lands on blocks and pushes nothing) with the item settings, interpolated.
+fn item(pos: WorldPos, velocity: DVec3, pickable_at: u64) -> impl Bundle {
     (
-        Item,
+        Item { pickable_at },
         RigidBody::Dynamic,
         Collider::aabb(DVec3::splat(ITEM_HALF)).sensor(),
         BodySettings::item(),
         Interpolated::default(),
         Teleport(pos),
         Velocity(velocity),
+    )
+}
+
+/// A crate.
+#[derive(Component, Clone, Copy, Debug, Default)]
+struct Crate;
+
+/// A crate standing at `pos`: a solid dynamic box with twice a player's weight (a player pushing
+/// it moves at a third of its speed), interpolated.
+fn crate_body(pos: WorldPos) -> impl Bundle {
+    (
+        Crate,
+        RigidBody::Dynamic,
+        Collider::standing(CRATE_SIZE, CRATE_SIZE),
+        BodySettings {
+            push_weight: 2.0,
+            ..BodySettings::player()
+        },
+        Interpolated::default(),
+        Teleport(pos),
     )
 }
 
@@ -195,7 +228,18 @@ enum DropTest {
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 struct SandboxSystems;
 
-/// Items ([`DROP_KEY`] drops one), the drop test and the F3 `items` line. Needs `WalkPlugin`.
+/// Items the player touches and how many it picked up.
+#[derive(Resource, Debug, Default)]
+struct Pickup {
+    /// Items overlapping the player (between their `CollisionStarted` and `CollisionEnded`)
+    /// that were too fresh to pick up.
+    touching: Vec<Entity>,
+    /// Items picked up so far.
+    picked: u32,
+}
+
+/// Items ([`DROP_KEY`] drops one, the player picks them up), crates ([`CRATE_KEY`]), the drop
+/// test and the F3 `items` and `crates` lines. Needs `WalkPlugin`.
 struct SandboxPlugin {
     drop_test: bool,
 }
@@ -207,35 +251,110 @@ impl Plugin for SandboxPlugin {
         } else {
             DropTest::Off
         })
+        .init_resource::<Pickup>()
         .configure_sets(Update, SandboxSystems.after(follow_player))
         .add_systems(
             Update,
-            (drop_items, drop_test, item_lines)
+            (drop_items, drop_crates, pick_up, drop_test, item_lines)
                 .chain()
                 .in_set(SandboxSystems),
         );
     }
 }
 
+/// The active camera's eye while the fly camera takes input.
+fn active_eye<'a>(
+    cameras: impl IntoIterator<Item = (&'a Camera, &'a Transform, &'a FlyCamera)>,
+) -> Option<&'a Transform> {
+    cameras
+        .into_iter()
+        .find(|(camera, _, fly)| camera.active && fly.enabled)
+        .map(|(_, eye, _)| eye)
+}
+
 /// [`DROP_KEY`] throws an item from below the active camera's eye along its view, as Minecraft
-/// does (6 blocks/s forward, 2 up).
+/// does (6 blocks/s forward, 2 up). The player can pick it up after [`PICKUP_DELAY`] steps.
 fn drop_items(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
+    stats: Res<PhysicsStats>,
     cameras: Query<(&Camera, &Transform, &FlyCamera)>,
 ) {
     if !keys.just_pressed(DROP_KEY) {
         return;
     }
-    let Some((_, eye, _)) = cameras
-        .iter()
-        .find(|(camera, _, fly)| camera.active && fly.enabled)
-    else {
+    let Some(eye) = active_eye(cameras) else {
         return;
     };
     let forward = eye.forward().as_dvec3();
     let from = WorldPos::from_dvec3(eye.translation).offset(forward * 0.5 - DVec3::Y * 0.3);
-    commands.spawn(item(from, forward * 6.0 + DVec3::Y * 2.0));
+    commands.spawn(item(
+        from,
+        forward * 6.0 + DVec3::Y * 2.0,
+        stats.steps + PICKUP_DELAY,
+    ));
+}
+
+/// [`CRATE_KEY`] drops a crate two blocks ahead of the active camera (along its heading) and a
+/// block above the eye: crates dropped in one place stack.
+fn drop_crates(
+    mut commands: Commands,
+    keys: Res<ButtonInput<KeyCode>>,
+    cameras: Query<(&Camera, &Transform, &FlyCamera)>,
+) {
+    if !keys.just_pressed(CRATE_KEY) {
+        return;
+    }
+    let Some(eye) = active_eye(cameras) else {
+        return;
+    };
+    let forward = eye.forward().as_dvec3();
+    let ahead = DVec3::new(forward.x, 0.0, forward.z).normalize_or(DVec3::NEG_Z);
+    let at = WorldPos::from_dvec3(eye.translation).offset(ahead * 2.0 + DVec3::Y);
+    commands.spawn(crate_body(at));
+}
+
+/// The player picks up the items it touches: a `CollisionStarted` between the player's solid box
+/// and an item's sensor, at once, or once the item is old enough while they still touch.
+fn pick_up(
+    mut commands: Commands,
+    mut started: MessageReader<CollisionStarted>,
+    mut ended: MessageReader<CollisionEnded>,
+    stats: Res<PhysicsStats>,
+    players: Query<Entity, With<Player>>,
+    items: Query<&Item>,
+    mut pickup: ResMut<Pickup>,
+) {
+    let Some(player) = players.iter().next() else {
+        started.clear();
+        ended.clear();
+        pickup.touching.clear();
+        return;
+    };
+    let pickup = &mut *pickup;
+    for event in started.read() {
+        if let Some(other) = event.other(player)
+            && items.contains(other)
+            && !pickup.touching.contains(&other)
+        {
+            pickup.touching.push(other);
+        }
+    }
+    for event in ended.read() {
+        if let Some(other) = event.other(player) {
+            pickup.touching.retain(|&item| item != other);
+        }
+    }
+    let picked = &mut pickup.picked;
+    pickup.touching.retain(|&entity| match items.get(entity) {
+        Ok(item) if stats.steps >= item.pickable_at => {
+            commands.entity(entity).despawn();
+            *picked += 1;
+            false
+        }
+        Ok(_) => true,
+        Err(_) => false,
+    });
 }
 
 /// Drops the test's items once the player stands, then waits for all of them to rest.
@@ -265,7 +384,7 @@ fn drop_test(
                     );
                     dropped.push(
                         commands
-                            .spawn(item(feet.0.offset(offset), DVec3::ZERO))
+                            .spawn(item(feet.0.offset(offset), DVec3::ZERO, 0))
                             .id(),
                     );
                 }
@@ -316,9 +435,12 @@ fn drop_test(
     }
 }
 
-/// The F3 line `items`: how many there are and how many rest.
+/// The F3 lines `items` (how many there are, how many rest, how many were picked up) and
+/// `crates` (how many).
 fn item_lines(
     items: Query<(&Velocity, &Contacts, Has<Frozen>), With<Item>>,
+    crates: Query<(), With<Crate>>,
+    pickup: Res<Pickup>,
     lines: Option<ResMut<OverlayLines>>,
 ) {
     let Some(mut lines) = lines else {
@@ -329,9 +451,15 @@ fn item_lines(
         .iter()
         .filter(|(velocity, contacts, frozen)| at_rest(velocity, contacts, *frozen))
         .count();
-    let line = format!("Items {total}  at rest {resting}  (Q drops)");
-    if lines.get("items") != Some(line.as_str()) {
-        lines.set("items", line);
+    let items_line = format!(
+        "Items {total}  at rest {resting}  picked {}  (Q drops)",
+        pickup.picked
+    );
+    let crates_line = format!("Crates {}  (C drops)", crates.iter().count());
+    for (key, line) in [("items", items_line), ("crates", crates_line)] {
+        if lines.get(key) != Some(line.as_str()) {
+            lines.set(key, line);
+        }
     }
 }
 
@@ -609,7 +737,110 @@ mod tests {
         }
         assert_eq!(
             app.world().resource::<OverlayLines>().get("items"),
-            Some("Items 100  at rest 100  (Q drops)")
+            Some("Items 100  at rest 100  picked 0  (Q drops)")
+        );
+    }
+
+    /// Presses or releases `key` (seen by the next update).
+    fn key(app: &mut App, key: KeyCode, pressed: bool) {
+        use boxel::window::{ButtonState, KeyboardInput};
+        let state = if pressed {
+            ButtonState::Pressed
+        } else {
+            ButtonState::Released
+        };
+        app.world_mut()
+            .resource_mut::<Messages<KeyboardInput>>()
+            .write(KeyboardInput {
+                key,
+                state,
+                repeat: false,
+            });
+    }
+
+    /// Taps `k`: pressed for one update, released in the next.
+    fn tap(app: &mut App, k: KeyCode) {
+        key(app, k, true);
+        app.update();
+        key(app, k, false);
+        app.update();
+    }
+
+    fn line(app: &App, key: &str) -> String {
+        app.world()
+            .resource::<OverlayLines>()
+            .get(key)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn crates_dropped_in_one_place_stack() {
+        let mut app = sandbox_app(false);
+        for _ in 0..64 {
+            app.update();
+        }
+        // The player stands at (0.5, 4, 0.5) looking north: each crate falls 2 blocks ahead.
+        for _ in 0..3 {
+            tap(&mut app, CRATE_KEY);
+            for _ in 0..64 {
+                app.update();
+            }
+        }
+        let mut crates = app
+            .world_mut()
+            .query_filtered::<(&BodyPosition, &Velocity, &Contacts), With<Crate>>();
+        let mut stack: Vec<_> = crates
+            .iter(app.world())
+            .map(|(p, v, c)| (p.0, v.0, *c))
+            .collect();
+        stack.sort_by(|a, b| a.0.to_dvec3().y.total_cmp(&b.0.to_dvec3().y));
+        assert_eq!(stack.len(), 3);
+        for (level, (pos, velocity, contacts)) in stack.into_iter().enumerate() {
+            // Exactly on the grass (top at y = 4) and on each other.
+            assert_eq!(
+                pos.to_dvec3(),
+                DVec3::new(0.5, 4.0 + CRATE_SIZE * level as f64, -1.5),
+                "level {level}"
+            );
+            assert_eq!(velocity, DVec3::ZERO);
+            assert!(contacts.on_ground);
+        }
+        assert_eq!(line(&app, "crates"), "Crates 3  (C drops)");
+    }
+
+    #[test]
+    fn walking_into_an_item_picks_it_up() {
+        let mut app = sandbox_app(false);
+        for _ in 0..64 {
+            app.update();
+        }
+        // An item lying 3 blocks north of the player, pickable at once.
+        app.world_mut().spawn(item(
+            WorldPos::from_dvec3(DVec3::new(0.5, 4.0 + ITEM_HALF, -2.5)),
+            DVec3::ZERO,
+            0,
+        ));
+        for _ in 0..8 {
+            app.update();
+        }
+        assert_eq!(items(&mut app).len(), 1);
+        assert_eq!(
+            line(&app, "items"),
+            "Items 1  at rest 1  picked 0  (Q drops)"
+        );
+        // W walks north into it: the player picks it up.
+        key(&mut app, KeyCode::KeyW, true);
+        for _ in 0..64 {
+            app.update();
+        }
+        key(&mut app, KeyCode::KeyW, false);
+        app.update();
+        assert!(items(&mut app).is_empty());
+        assert_eq!(app.world().resource::<Pickup>().picked, 1);
+        assert_eq!(
+            line(&app, "items"),
+            "Items 0  at rest 0  picked 1  (Q drops)"
         );
     }
 
@@ -638,6 +869,7 @@ mod tests {
         for _ in 0..128 {
             app.update();
         }
+        // Thrown away from the player: not picked up.
         let items = items(&mut app);
         assert_eq!(items.len(), 1);
         let (pos, velocity) = items[0];

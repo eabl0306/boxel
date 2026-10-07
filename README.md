@@ -46,7 +46,7 @@ just run voxel_world --tier mid
 Controles: clic izquierdo captura el mouse, Escape (o salir de la ventana) lo suelta. WASD para
 moverse, Espacio sube, Shift izquierdo baja, Ctrl izquierdo acelera. Con el mouse capturado, clic
 izquierdo rompe el bloque de la mira y clic derecho pone el bloque elegido (teclas 1 a 9), a 6
-bloques como máximo. G cambia entre volar y caminar: caminando hay gravedad, WASD camina hacia
+bloques como máximo y nunca donde está el jugador. G cambia entre volar y caminar: caminando hay gravedad, WASD camina hacia
 donde mira la cámara y Espacio salta (`--walk` arranca caminando). F3 muestra el overlay de debug
 (con el bloque apuntado, el modo y una línea de física), F5 cambia el límite de FPS (30, 60, 144,
 240, sin límite) y F6 prende o apaga el vsync.
@@ -63,8 +63,10 @@ Para pruebas automáticas usa siempre `--frames N --timeout SEG`: la ventana se 
 SEG segundos; al salir imprime updates y frames mostrados por segundo y el uso de CPU.
 
 **physics_sandbox**: la física propia (ADR 0016) en un mundo generado. Arranca caminando sobre el
-suelo: WASD camina, Espacio salta, G vuela, Q tira un objeto que cae y se queda quieto. F3 muestra
-el estado del jugador, la línea de física y los objetos (los cuerpos todavía no se dibujan).
+suelo: WASD camina, Espacio salta, G vuela, Q tira un objeto que cae y se queda quieto, C tira una
+caja dos bloques adelante (las cajas se apilan, se empujan y se puede subir encima). Al caminar
+sobre un objeto, el jugador lo levanta. F3 muestra el estado del jugador, la línea de física, los
+objetos y las cajas (los cuerpos todavía no se dibujan).
 
 ```bash
 cargo run --release --example physics_sandbox

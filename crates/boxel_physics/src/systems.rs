@@ -4,7 +4,8 @@ use crate::components::{
     BodyPosition, CharacterController, Collider, Contacts, Frozen, Interpolated, MoveIntent,
     PhysicsSettings, PhysicsStats, PhysicsSync, RigidBody, Teleport, Velocity, VoxelImpact,
 };
-use crate::core::{BodySettings, LocalBox, MAX_SWEEP_DISTANCE, step_body};
+use crate::contacts::{ObstacleIndex, ObstacleScratch};
+use crate::core::{BodySettings, LocalBox, MAX_SWEEP_DISTANCE, integrate_velocity, move_body};
 use crate::plugin::PhysicsContent;
 use crate::source::ChunkSource;
 use boxel_app::FixedTime;
@@ -33,16 +34,20 @@ pub enum PhysicsSystems {
     /// body teleported this step is in the air for its controller (no jump from the old
     /// ground).
     Controller,
-    /// Kinematic bodies move by their velocity.
+    /// Kinematic bodies move by their velocity; then the static and kinematic solid colliders
+    /// are indexed as obstacles for the dynamic bodies.
     Kinematic,
-    /// Dynamic bodies move: gravity, drag, the voxel sweep, bounces, freezing in unloaded
-    /// chunks.
+    /// Dynamic bodies move: gravity, drag, the sweep against the voxels and the obstacles,
+    /// bounces, freezing in unloaded chunks.
     Step,
-    /// Collision pairs between bodies (phase P3; empty today).
+    /// The broadphase: every body with a collider goes into the grid of
+    /// [`crate::BodyIndex`], which gives the candidate pairs.
     Broadphase,
-    /// Pushes between solid bodies (phase P3; empty today).
+    /// Solid bodies are pushed apart; sensor overlaps (and solid contacts with
+    /// [`crate::ReportContacts`]) are collected.
     Solve,
-    /// The step's messages ([`VoxelImpact`]), sorted by entity.
+    /// The step's messages ([`VoxelImpact`], [`crate::CollisionStarted`],
+    /// [`crate::CollisionEnded`]), sorted by entity.
     Events,
     /// `Transform` follows [`BodyPosition`].
     Writeback,
@@ -130,16 +135,20 @@ pub(crate) fn prepare_bodies(
         &Transform,
         &mut BodyPosition,
         &mut Contacts,
-        &PhysicsSync,
+        &mut PhysicsSync,
         Option<&Teleport>,
         Option<&mut Interpolated>,
     )>,
     mut stats: ResMut<PhysicsStats>,
 ) {
     let mut count = 0;
-    for (entity, transform, mut position, mut contacts, sync, teleport, interpolated) in &mut bodies
+    for (entity, transform, mut position, mut contacts, mut sync, teleport, interpolated) in
+        &mut bodies
     {
         count += 1;
+        if sync.moved != DVec3::ZERO {
+            sync.moved = DVec3::ZERO;
+        }
         let teleported = if let Some(teleport) = teleport {
             position.set_if_neq(BodyPosition(teleport.0.normalize()));
             // `try_`: a command of another system may have despawned it at this sync point.
@@ -165,10 +174,10 @@ pub(crate) fn prepare_bodies(
 /// [`PhysicsSystems::Kinematic`]: `position += velocity * dt`, through everything.
 pub(crate) fn move_kinematic(
     fixed: Res<FixedTime>,
-    mut bodies: Query<(&RigidBody, &Velocity, &mut BodyPosition)>,
+    mut bodies: Query<(&RigidBody, &Velocity, &mut BodyPosition, &mut PhysicsSync)>,
 ) {
     let dt = timestep(&fixed);
-    for (kind, velocity, mut position) in &mut bodies {
+    for (kind, velocity, mut position, mut sync) in &mut bodies {
         if *kind != RigidBody::Kinematic {
             continue;
         }
@@ -176,12 +185,14 @@ pub(crate) fn move_kinematic(
         if d != DVec3::ZERO {
             let p = position.0.normalize();
             position.0 = WorldPos::from_block(p.block, p.frac + d);
+            sync.moved = d;
         }
     }
 }
 
-/// [`PhysicsSystems::Step`]: one step of every dynamic body ([`step_body`]). A body whose
-/// step needs an unloaded block keeps its state and gets [`Frozen`].
+/// [`PhysicsSystems::Step`]: one step of every dynamic body ([`crate::step_body`], plus the
+/// static and kinematic solid obstacles for a solid body). A body whose step needs an unloaded
+/// block keeps its state and gets [`Frozen`].
 pub(crate) fn step_dynamic(
     mut commands: Commands,
     map: Res<ChunkMap>,
@@ -189,6 +200,8 @@ pub(crate) fn step_dynamic(
     content: Res<PhysicsContent>,
     settings: Res<PhysicsSettings>,
     fixed: Res<FixedTime>,
+    obstacles: Res<ObstacleIndex>,
+    mut scratch: Local<ObstacleScratch>,
     mut bodies: Query<(
         Entity,
         &RigidBody,
@@ -197,6 +210,7 @@ pub(crate) fn step_dynamic(
         &mut BodyPosition,
         &mut Velocity,
         &mut Contacts,
+        &mut PhysicsSync,
         Has<Frozen>,
     )>,
     mut pending: ResMut<PendingImpacts>,
@@ -207,25 +221,46 @@ pub(crate) fn step_dynamic(
     // One source for every body: consecutive bodies often share chunks.
     let mut voxels = ChunkSource::new(&map, &world);
     let (mut dynamic, mut frozen) = (0, 0);
-    for (entity, kind, collider, body, mut position, mut velocity, mut contacts, was_frozen) in
-        &mut bodies
+    for (
+        entity,
+        kind,
+        collider,
+        body,
+        mut position,
+        mut velocity,
+        mut contacts,
+        mut sync,
+        was_frozen,
+    ) in &mut bodies
     {
         if *kind != RigidBody::Dynamic {
             continue;
         }
         dynamic += 1;
         let shape = collider.map_or(LocalBox::default(), Collider::voxel_box);
-        match step_body(
+        let pos = position.0.normalize();
+        let v = integrate_velocity(velocity.0, contacts.on_ground, body, &params);
+        // Solid colliders sweep against the static and kinematic solids too.
+        let blockers = match collider {
+            Some(collider) if !collider.is_sensor() && !obstacles.is_empty() => {
+                scratch.gather(&obstacles, pos, shape, v * params.dt, collider.layers)
+            }
+            _ => &[],
+        };
+        match move_body(
             &mut voxels,
             &content.collision,
-            position.0,
-            velocity.0,
+            pos,
+            v,
             shape,
-            contacts.on_ground,
+            blockers,
             body,
             &params,
         ) {
             Ok(out) => {
+                if out.sweep.moved != DVec3::ZERO {
+                    sync.moved = out.sweep.moved;
+                }
                 position.set_if_neq(BodyPosition(out.pos));
                 velocity.set_if_neq(Velocity(out.vel));
                 contacts.set_if_neq(Contacts::from_sweep(&out.sweep));

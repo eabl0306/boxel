@@ -1,6 +1,11 @@
 //! [`PhysicsPlugin`] and the physics view of the world's blocks.
 
-use crate::components::{PhysicsSettings, PhysicsStats, VoxelImpact};
+use crate::components::{
+    CollisionEnded, CollisionStarted, PhysicsSettings, PhysicsStats, VoxelImpact,
+};
+use crate::contacts::{
+    BodyIndex, ContactSet, ObstacleIndex, broadphase, build_obstacles, solve, write_collisions,
+};
 use crate::core::CollisionTable;
 use crate::systems::{
     PendingImpacts, PhysicsSystems, drive_characters, interpolate, move_kinematic, prepare_bodies,
@@ -29,9 +34,10 @@ pub struct PhysicsContent {
 ///   `FixedPostUpdate`, in the chained [`PhysicsSystems`]; interpolated `Transform`s are written
 ///   after the frame's steps (`RunFixedMainLoopSystems::AfterFixedMainLoop`).
 /// - Resources: [`PhysicsSettings`], [`PhysicsStats`] (a `"physics"` line on `DiagnosticsBoard`,
-///   refreshed in `Last`) and, in `Plugin::finish`, [`PhysicsContent`] from the world's
-///   registry, which [`crate::PhysicsQuery`] and the step read.
-/// - Message: [`VoxelImpact`].
+///   refreshed in `Last`), [`BodyIndex`] (the bodies for entity queries) and, in
+///   `Plugin::finish`, [`PhysicsContent`] from the world's registry, which
+///   [`crate::PhysicsQuery`] and the step read.
+/// - Messages: [`VoxelImpact`], [`CollisionStarted`] and [`CollisionEnded`].
 /// - In `Plugin::finish` it sets `FixedTime::set_max_steps_per_frame` to
 ///   [`PhysicsPlugin::max_steps_per_frame`] (3 by default): after a hitch, a frame runs at most
 ///   that many fixed steps, which bounds the cost of a catch-up frame. The cap is app-wide, see
@@ -93,7 +99,12 @@ impl Plugin for PhysicsPlugin {
         app.init_resource::<PhysicsSettings>()
             .init_resource::<PhysicsStats>()
             .init_resource::<PendingImpacts>()
+            .init_resource::<ObstacleIndex>()
+            .init_resource::<BodyIndex>()
+            .init_resource::<ContactSet>()
             .add_message::<VoxelImpact>()
+            .add_message::<CollisionStarted>()
+            .add_message::<CollisionEnded>()
             .configure_sets(
                 FixedPostUpdate,
                 (
@@ -113,9 +124,15 @@ impl Plugin for PhysicsPlugin {
                 (
                     prepare_bodies.in_set(PhysicsSystems::Prepare),
                     drive_characters.in_set(PhysicsSystems::Controller),
-                    move_kinematic.in_set(PhysicsSystems::Kinematic),
+                    (move_kinematic, build_obstacles)
+                        .chain()
+                        .in_set(PhysicsSystems::Kinematic),
                     step_dynamic.in_set(PhysicsSystems::Step),
-                    write_events.in_set(PhysicsSystems::Events),
+                    broadphase.in_set(PhysicsSystems::Broadphase),
+                    solve.in_set(PhysicsSystems::Solve),
+                    (write_events, write_collisions)
+                        .chain()
+                        .in_set(PhysicsSystems::Events),
                     write_back.in_set(PhysicsSystems::Writeback),
                 ),
             )

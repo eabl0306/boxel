@@ -1,12 +1,15 @@
 //! Translation invariance: the same scene shifted by an integer vector (the former `i32` edge,
-//! `2^40`, `2^52` and the world limit, per axis and on all axes) gives bit-identical sweeps and
-//! raycasts. Physics never computes with absolute coordinates, so this holds exactly, not
+//! `2^40`, `2^52` and the world limit, per axis and on all axes) gives bit-identical sweeps,
+//! raycasts and contacts between bodies (narrowphase, broadphase pairs, rays and box queries
+//! against shapes). Physics never computes with absolute coordinates, so this holds exactly, not
 //! approximately.
 mod common;
 
 use boxel_math::{DVec3, I64Vec3};
+use boxel_physics::core::box_box_moving;
 use boxel_physics::{
-    RayResult, SweepConfig, TestWorld, Unloaded, VoxelFilter, move_box, raycast_voxels,
+    BlockBounds, CollisionLayers, Grid, LocalBox, RayResult, Shape, SweepConfig, TestWorld,
+    Unloaded, VoxelFilter, move_box, raycast_voxels, shape_contact,
 };
 use boxel_voxel::{BlockPos, ChunkPos, MAX_BLOCK_COORD, WorldPos};
 use common::{STONE, WATER, at, fill, player, table};
@@ -180,5 +183,105 @@ fn raycasts_are_bit_identical_at_any_shift() {
     assert!(reference.iter().any(Option::is_none), "some rays miss");
     for shift in shifts() {
         assert_eq!(ray_course(shift), reference, "shift {shift:?}");
+    }
+}
+
+/// Bodies of the contact course: position (relative to the base) and shape.
+fn bodies() -> Vec<(DVec3, Shape)> {
+    let crate_shape = Shape::Aabb {
+        half: DVec3::splat(0.375),
+    };
+    let ball = Shape::Sphere { radius: 0.3 };
+    vec![
+        (DVec3::new(0.5, 0.375, 0.5), crate_shape),
+        (DVec3::new(0.7, 1.05, 0.45), crate_shape),
+        (DVec3::new(1.1, 0.4, 0.6), ball),
+        (DVec3::new(-3.3, 2.0, 7.9), ball),
+        (DVec3::new(-3.05, 2.2, 8.1), ball),
+        (DVec3::new(-2.6, 1.9, 8.4), crate_shape),
+        (DVec3::new(31.9, -0.2, -31.95), crate_shape),
+        (DVec3::new(32.3, 0.1, -32.2), ball),
+    ]
+}
+
+/// Everything between the bodies at `base`: their pairs, every pair's contact (and the
+/// contact with a step's motion), a ray against each and a box query, relative and as bits.
+fn contact_course(base: I64Vec3) -> Vec<Vec<u64>> {
+    let at = |p: DVec3| WorldPos::from_block(BlockPos::from_i64vec3(base), p);
+    let bodies: Vec<(WorldPos, Shape)> = bodies().into_iter().map(|(p, s)| (at(p), s)).collect();
+    let mut grid = Grid::new(2);
+    for (pos, shape) in &bodies {
+        grid.insert(
+            BlockBounds::of_box(*pos, shape.bounds()),
+            CollisionLayers::default(),
+            true,
+        );
+    }
+    let mut pairs = Vec::new();
+    grid.pairs(&mut pairs);
+    let mut out = vec![
+        pairs
+            .iter()
+            .flat_map(|&(a, b)| [u64::from(a), u64::from(b)])
+            .collect(),
+    ];
+    for &(a, b) in &pairs {
+        let ((pa, sa), (pb, sb)) = (bodies[a as usize], bodies[b as usize]);
+        let rel = pa.delta_to(&pb);
+        let mut row = Vec::new();
+        if let Some(c) = shape_contact(sa, DVec3::ZERO, sb, rel) {
+            row.extend(bits(c.normal));
+            row.push(c.depth.to_bits());
+        }
+        if let (Shape::Aabb { half: ha }, Shape::Aabb { half: hb }) = (sa, sb)
+            && let Some(c) = box_box_moving(
+                LocalBox::from_center_half(DVec3::ZERO, ha),
+                LocalBox::from_center_half(rel, hb),
+                DVec3::new(0.01, -0.3, 0.02),
+                1e-7,
+            )
+        {
+            row.extend(bits(c.normal));
+            row.push(c.depth.to_bits());
+        }
+        out.push(row);
+    }
+    // A ray from a point near each body toward its center, and a query box around it.
+    for (pos, shape) in &bodies {
+        let origin = pos.offset(DVec3::new(-1.3, 0.45, 0.2));
+        let center = origin.delta_to(pos);
+        let hit = shape.ray(center, DVec3::ZERO, center * 1.5, 1.0);
+        let mut row: Vec<u64> = hit
+            .map(|h| {
+                [
+                    h.t.to_bits(),
+                    bits(h.normal)[0],
+                    bits(h.normal)[1],
+                    bits(h.normal)[2],
+                ]
+                .to_vec()
+            })
+            .unwrap_or_default();
+        let mut found = Vec::new();
+        grid.query(
+            BlockBounds::of_box(
+                *pos,
+                LocalBox::from_center_half(DVec3::ZERO, DVec3::splat(1.0)),
+            ),
+            &mut found,
+        );
+        row.extend(found.into_iter().map(u64::from));
+        out.push(row);
+    }
+    out
+}
+
+#[test]
+fn contacts_between_bodies_are_bit_identical_at_any_shift() {
+    let reference = contact_course(I64Vec3::ZERO);
+    assert!(reference[0].len() >= 6, "some pairs: {:?}", reference[0]);
+    assert!(reference[1..].iter().any(|row| !row.is_empty()));
+    for shift in shifts() {
+        assert_eq!(contact_course(shift), reference, "shift {shift:?}");
     }
 }

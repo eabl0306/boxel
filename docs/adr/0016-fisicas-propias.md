@@ -1,6 +1,6 @@
 # ADR 0016: física propia mínima
 
-- Estado: aceptado (fases P0, P1 y P2 hechas; P3 en adelante, pendientes)
+- Estado: aceptado (fases P0 a P3 hechas; P4 en adelante, pendientes)
 - Fecha: 2026-10-06
 
 ## Contexto
@@ -107,9 +107,10 @@ Dos datos del código pesan en el diseño:
   clippy.toml` prohíbe `mul_add` (FMA), `powi` y todas las funciones de libm (`powf`, `exp`,
   `ln`, `sin`, `atan2`, `hypot` y parecidas) para `f64` y `f32`, y lo mismo más los ayudantes de
   ángulos y rotaciones (`angle_between`, `slerp`, `to_angle`...) para `DVec3`, `Vec3`, `DVec2` y
-  `Vec2`. Desde P3: pares y
-  eventos en orden de `Entity`, mapas con `foldhash::FixedState` que nunca se recorren para
-  ordenar, y paralelismo solo por cuerpo.
+  `Vec2`. Desde P3: los cuerpos entran a la grilla en orden de `Entity`, los pares salen
+  ordenados, el solve los recorre en un orden fijo (de abajo hacia arriba, desempate por par) y
+  los eventos salen ordenados. La grilla usa un hash de celda fijo y no hay mapas que se
+  recorran. El paralelismo (P4) será solo por cuerpo.
 
 - **8. Tiempo y orden.** Los pasos de física corren a 64 Hz en `FixedPostUpdate` (desde P2), así
   el gameplay de `FixedUpdate` no tiene que ordenarse contra ellos. `boxel_app` suma los sets
@@ -166,8 +167,8 @@ Dos datos del código pesan en el diseño:
   propio umbral, más grande: `|v| < 0.05` bloques/s durante 32 pasos.
 
   Sets encadenados en `FixedPostUpdate`: `PhysicsSystems::{Prepare, Controller, Kinematic,
-  Step, Broadphase, Solve, Events, Writeback}` (`Broadphase` y `Solve` vacíos hasta P3), e
-  `Interpolate` en `AfterFixedMainLoop`.
+  Step, Broadphase, Solve, Events, Writeback}` (`Broadphase` y `Solve` se llenan en P3, ver 9),
+  e `Interpolate` en `AfterFixedMainLoop`.
   - Prepare: un cuerpo nuevo toma su posición de `Transform`; un `Teleport` la pone exacta y se
     borra; un `Transform` distinto del que escribió la física (`PhysicsSync`) es un
     teletransporte del gameplay. Un teletransporte conserva la velocidad y borra `Contacts`: el
@@ -203,11 +204,66 @@ Dos datos del código pesan en el diseño:
   del movimiento a 64 Hz, 9 bloques/s sube 1.11; 9.5 sube 1.24, el alto de Minecraft, y alcanza
   para subir un escalón de un bloque. Se tomó 9.5.
 
-- **9. Entre entidades (P3).** Grilla uniforme ordenada de celdas de 4 bloques. Los sólidos se
-  separan por posición en todos los ejes, con apilado, y cada empuje pasa por el barrido de
-  vóxeles (las paredes siempre ganan). Los sensores emiten `CollisionStarted` y
-  `CollisionEnded`. Los sólidos estáticos y cinemáticos son obstáculos dentro del barrido:
-  `move_box` ya recibe esas cajas.
+- **9. Entre entidades (P3).** Los sólidos se separan por posición en todos los ejes, con
+  apilado, y cada empuje pasa por el barrido de vóxeles (las paredes siempre ganan). Los
+  sensores avisan con `CollisionStarted` y `CollisionEnded`. Los sólidos estáticos y
+  cinemáticos son obstáculos dentro del barrido de los dinámicos. Por partes:
+
+  - **Broadphase (`core::grid::Grid`).** Grilla uniforme de celdas de `2^grid_shift` bloques
+    (4 por defecto) con coordenadas `i64`. Cada cuerpo guarda sus `BlockBounds` (los bloques que
+    alcanza su caja: `floor(min)..=floor(max)`, calculados en el marco de su bloque) y entra en
+    cada celda que tocan, como mucho dos por eje; uno más ancho va a una lista `large` que se
+    prueba contra todos. Las entradas se ordenan por un hash fijo de la celda con un counting
+    sort (lineal y estable: el orden solo depende del orden de inserción). Un par es candidato si
+    sus capas se aceptan en los dos sentidos, uno de los dos es activo (dinámico, sensor o con
+    `ReportContacts`; dos paredes nunca forman par) y sus bloques se tocan; cada par sale solo de
+    su celda "casa", la de `max(celda mínima de a, celda mínima de b)`, así que sale una vez. Los
+    cuerpos entran en orden de `Entity`, así los pares salen en ese orden. El plan pedía
+    `sort_unstable` con claves `i64`; el counting sort hace lo mismo en tiempo lineal. La misma
+    grilla responde consultas de caja y rayos (un DDA exacto por celdas, igual al de vóxeles).
+  - **Narrowphase (`core::narrow`).** En `f64`, en el marco del bloque del primer cuerpo, con el
+    otro ubicado por `delta_to`: exacto a cualquier distancia. Caja contra caja por el eje de
+    menor penetración (desempate Y, X, Z); esfera contra esfera por la recta entre centros (+Y si
+    coinciden); esfera contra caja desde el punto más cercano (o la cara más cercana si el
+    centro está adentro). Agregado al plan: dos cajas que se solapan después de un paso se
+    separan hacia el lado del que vino una de ellas en ese paso (`box_box_moving`, con el
+    desplazamiento del paso que guarda `PhysicsSync`). Sin esto, una caja que cae rápido y se
+    hunde más de su altura en otra en un solo paso salía por abajo. Solapar es pasar de `eps` en
+    todos los ejes: rozar un costado no cuenta.
+  - **Solve.** Los pares sólidos con al menos un dinámico se recorren de abajo hacia arriba (por
+    la base del cuerpo más bajo, desempate por par), `solver_passes` veces (2). Un cuerpo que no
+    puede moverse en esa dirección (estático, cinemático, congelado, o dinámico que ya toca algo
+    en la cara hacia la que lo empujarían) no recibe parte, y el otro se lleva todo el empuje:
+    una pila de cajas sobre el suelo descansa sin hundirse. Dos dinámicos libres se reparten el
+    empuje por `push_weight` (el doble de peso, la mitad de movimiento). El que se lleva todo el
+    empuje queda exactamente sobre la cara del otro, calculado en su propio marco: una caja
+    apoyada en otra da la misma posición bit a bit en cada paso. Cada empuje pasa por `move_box`
+    (vóxeles y obstáculos); si el primero se mueve menos que su parte, el segundo se lleva el
+    resto. La velocidad con que se acercan por la normal se quita, repartida igual (un choque
+    inelástico). Cada cara que toca otro cuerpo se marca en `Contacts::faces`, y un empuje hacia
+    arriba pone `on_ground` (se puede parar sobre una caja o un mob, y saltar desde ahí).
+  - **Sensores y eventos.** Un sensor nunca empuja ni es empujado. Después de los empujes, los
+    pares con un sensor que se solapan entran al conjunto de contactos del paso, junto con los
+    pares sólidos con `ReportContacts` que se solaparon antes de separarse. El conjunto se compara
+    con el del paso anterior (merge de dos listas ordenadas): `CollisionStarted` para los nuevos
+    y `CollisionEnded` para los que faltan, una vez cada uno, con `a < b` por bits de `Entity`.
+    Un despawn da `CollisionEnded` en el paso siguiente. Un dinámico con collider sensor sigue
+    chocando con los vóxeles (así funcionan los objetos tirados).
+  - **Obstáculos.** Después de mover los cinemáticos, los colliders sólidos estáticos y
+    cinemáticos forman otra grilla; cada dinámico sólido barre contra las cajas de los que
+    estén en su camino y en sus capas (las esferas como su caja). Un cinemático que entra en un
+    dinámico lo empuja todo el camino y le pasa su velocidad por la normal: una plataforma que
+    sube lleva la caja encima.
+  - **Capas.** `CollisionLayers { member, mask }`: dos colliders se encuentran si cada uno acepta
+    al otro. Valen para pares, obstáculos y consultas.
+  - **Consultas.** `BodyIndex` guarda los cuerpos con collider como los dejó el último paso
+    (después de los empujes), en la grilla. `PhysicsQuery::raycast` tira el rayo de vóxeles y
+    después busca cuerpos hasta el bloque que pegó (un cuerpo a la misma distancia gana: está
+    delante de la cara); `overlap_box` da los cuerpos que se solapan con una caja;
+    `block_is_free` dice si un bloque está libre de cuerpos sólidos (los sensores no cuentan).
+    `voxel_world` no pone un bloque donde está el jugador.
+  - Un `Collider` sin `RigidBody` es un cuerpo estático (lo requiere), como pide el plan. Un
+    cuerpo sin `Collider` no participa entre cuerpos.
 
 - **10. Fases.** P0: requisitos (`WorldPos`, sets del bucle fijo, el tope de pasos, este ADR, la
   feature). P1: núcleo y raycast (tabla, fuentes, barrido, DDA, `PhysicsQuery::raycast_voxels`,
@@ -217,6 +273,67 @@ Dos datos del código pesan en el diseño:
   por bloque, esfera exacta contra vóxeles.
 
 ## Consecuencias
+
+Hecho (P3):
+
+- `boxel_physics::core`: `narrow` (`Contact`, `box_box`, `box_box_moving`, `sphere_sphere`,
+  `sphere_box`, `box_sphere`, `shape_contact`, `shape_box`) y `grid` (`Grid`, `BlockBounds`,
+  `CollisionLayers`, `CellRay`). `move_body` es la mitad del integrador que mueve y rebota, con
+  obstáculos (`step_body` la usa sin obstáculos).
+- Capa ECS: `BodyIndex`, `BodyFilter`, `BodyHit`, `RayFilter`, `RayHit`, `ReportContacts`,
+  `CollisionStarted`, `CollisionEnded`; `PhysicsQuery::{raycast, overlap_box, block_is_free,
+  bodies}`; `PhysicsSettings::{solver_passes, grid_shift}`; `PhysicsStats::{pairs, pushes,
+  overlaps, solve_time}` (la línea `physics` los muestra); `PhysicsSync::moved`.
+- `physics_sandbox`: C tira una caja sólida de 0.75 (peso 2) dos bloques adelante, y las cajas
+  se apilan. El jugador levanta los objetos que toca (su `CollisionStarted` con el sensor del
+  objeto; uno tirado con Q, recién después de 1 s). F3 muestra objetos levantados y cajas.
+- `voxel_world`: clic derecho no pone un bloque donde hay un cuerpo sólido (el jugador).
+
+Tests de P3:
+
+- `boxel_physics/tests/shapes.rs`: separación de caja contra caja, esfera contra esfera y esfera
+  contra caja contra respuestas analíticas (desempates, tocar no cuenta, NaN), `box_box_moving`
+  (hundida de más de media altura, apoyada, en diagonal, rozando un costado), y proptests:
+  mover por el vector deja las formas tocándose y nada menos alcanza.
+- `boxel_physics/tests/grid.rs`: proptest de pares contra fuerza bruta O(n²) con cuerpos chicos,
+  anchos y grandes, capas y activos al azar, cualquier tamaño de celda y lejos del origen, antes
+  y después de mover cuerpos; los mismos pares en cualquier lugar del mundo; consultas de caja
+  contra fuerza bruta; el recorrido de celdas de un rayo igual al DDA de vóxeles con celdas de 1
+  bloque, y con celdas de 4 cubre todos los bloques del DDA.
+- `boxel_physics/tests/far_coords.rs`: pares, contactos, rayos y consultas de una escena de
+  cuerpos corrida por 0, ±2^31, 2^40, 2^52 y ±(2^61 - 64): idénticos bit a bit.
+- `boxel_physics/tests/contacts.rs` (una `App` sin ventana): una pila de 4 cajas descansa
+  exacta y no cambia un bit en 1000 pasos; una caja que cae a 60 bloques/s queda encima, no
+  atraviesa; empujes en X y Z repartidos por peso; un empuje nunca mete un cuerpo en una pared;
+  un cinemático empuja una caja todo el camino y una plataforma que sube la lleva; colliders
+  estáticos como obstáculos (y los sensores y otras capas los atraviesan); un sensor avisa una
+  vez al entrar y una al salir, y un despawn termina el contacto; `ReportContacts`; capas que no
+  se aceptan se atraviesan; rayos contra cuerpos y bloques en orden, `max_t`, esferas exactas,
+  empezar adentro, `overlap_box` y `block_is_free`; un índice vacío antes del primer paso. Una
+  escena llena (mobs que deambulan, pilas de cajas, pelotas, objetos, un cinemático, un pilar y
+  una zona sensor entre paredes) da el mismo estado y los mismos eventos bit a bit en dos
+  corridas, a 64 o 144 fps, con o sin interpolación, y corrida por 2^31, 2^40, 2^52 y
+  ±(2^61 - 1024).
+- `physics_sandbox` (sin ventana): tres cajas tiradas en el mismo lugar quedan apiladas exacto, y
+  caminar hasta un objeto lo levanta. `voxel_world`: con el jugador caminando, clic derecho no
+  pone piedra en sus pies; volando, sí.
+- Probado a mano: cambiar `box_box_moving` por `box_box`, el empuje exacto por la profundidad, o
+  el manejo de la casa y de la lista `large` de la grilla hace fallar estos tests.
+
+Costo de P3 (detalle en [rendimiento/fisicas-p3-2026-10](../rendimiento/fisicas-p3-2026-10.md)):
+`tick/1000` sube de 0.23 a 0.40 ms (objetivo 0.5 ms) y `tick/100` de 24 a 33 µs (objetivo 50 µs):
+ahora incluye broadphase, solve y eventos, y los caminantes se empujan entre ellos. La grilla con
+1000 cuerpos cuesta 25 µs. Con 10 000 cuerpos tan repartidos como los del tick cuesta 0.48 ms, y
+el objetivo del plan era 0.3 ms: no se cumple. Con 10 000 apretados en 128 x 128 bloques cuesta
+1.2 ms.
+
+Cambios de API de P3:
+
+- `CollisionLayers` vive en `core::grid` (sigue en la raíz del crate) y suma `new`.
+- `Collider` requiere `RigidBody::Static`.
+- `PhysicsQuery` lee también `BodyIndex`.
+- `PhysicsStats::summary` suma `pairs`, `pushes`, `overlaps` y `solve`.
+- `Contacts::faces` y `on_ground` también cuentan los contactos con otros cuerpos.
 
 Hecho (P2):
 
@@ -362,11 +479,10 @@ Cambios de API de P0 y P1:
 - Un sistema agregado a `RunFixedMainLoop` sin set ahora queda ambiguo con el bucle: va en
   `BeforeFixedMainLoop` o `AfterFixedMainLoop`.
 
-Lo que falta: colisiones entre entidades (P3: grilla, empujes entre sólidos, sensores y sus
-eventos, capas, obstáculos estáticos y cinemáticos, raycast de entidades, `overlap_box` y la
-comprobación de lugar libre), proyectiles, dormir y paso en paralelo (P4), y todo P5. Los cuerpos
-no tienen dibujo: hace falta un renderer de entidades. Los mensajes del mundo que comparten física y luz
-(`BlockChanged`, carga y descarga de chunks) se acuerdan antes de P4.
+Lo que falta: proyectiles, dormir y paso en paralelo (P4), una grilla incremental o más barata
+para llegar a 0.3 ms con 10 000 cuerpos, y todo P5. Los cuerpos no tienen dibujo: hace falta un
+renderer de entidades. `physics_sandbox` todavía no rompe ni pone bloques. Los mensajes del mundo
+que comparten física y luz (`BlockChanged`, carga y descarga de chunks) se acuerdan antes de P4.
 
 ## Alternativas descartadas
 

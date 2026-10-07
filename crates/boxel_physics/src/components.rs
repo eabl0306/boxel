@@ -1,6 +1,9 @@
-//! Components, messages and resources of physics bodies (phase P2 of ADR 0016).
+//! Components, messages and resources of physics bodies (phases P2 and P3 of ADR 0016).
 
-use crate::core::{BodySettings, LocalBox, Shape, StepParams, SweepConfig, SweepOut};
+use crate::core::{
+    BodySettings, CollisionLayers, DEFAULT_GRID_SHIFT, LocalBox, Shape, StepParams, SweepConfig,
+    SweepOut,
+};
 use boxel_ecs::component::{Mutable, StorageType};
 use boxel_ecs::lifecycle::HookContext;
 use boxel_ecs::prelude::*;
@@ -22,14 +25,15 @@ use std::time::Duration;
 ///
 /// Kinds:
 /// - [`RigidBody::Dynamic`]: gravity, drag and collisions with the voxels move it; gameplay
-///   steers it through [`Velocity`].
-/// - [`RigidBody::Kinematic`]: moved only by its [`Velocity`], through everything (phase P3
-///   makes it push dynamic bodies).
-/// - [`RigidBody::Static`]: never moved by physics (phase P3 makes it an obstacle).
+///   steers it through [`Velocity`]. Solid dynamic bodies push each other apart and stand on
+///   each other.
+/// - [`RigidBody::Kinematic`]: moved only by its [`Velocity`], through the voxels. With a solid
+///   collider it is an obstacle for dynamic bodies and pushes them out of its way.
+/// - [`RigidBody::Static`]: never moved by physics. With a solid collider it is an obstacle.
 ///
 /// It requires (and so adds with defaults) `Transform`, [`Velocity`], [`BodyPosition`],
 /// [`Contacts`], [`BodySettings`] and [`PhysicsSync`]. A body without a [`Collider`] collides
-/// with the voxels as a point at its position.
+/// with the voxels as a point at its position and takes no part in collisions between bodies.
 ///
 /// Position: [`BodyPosition`] is the authoritative position, exact at any distance (a
 /// [`WorldPos`]); `Transform` is a view of it that physics writes after every step (or the
@@ -49,56 +53,36 @@ pub enum RigidBody {
     Static,
 }
 
-/// How a body's shape reacts to other bodies (phase P3). Every collider collides with the
-/// voxels, sensors included (a dropped item is a dynamic sensor: it lands on blocks and only
+/// How a body's shape reacts to other bodies. Every collider of a dynamic body collides with
+/// the voxels, sensors included (a dropped item is a dynamic sensor: it lands on blocks and only
 /// reports when a player touches it).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Response {
-    /// Pushes other solid bodies (phase P3).
+    /// Solid: two solid bodies never stay overlapped. Dynamic ones are pushed apart along the
+    /// shortest way out, on every axis (one stands on another), and a dynamic body never
+    /// enters a static or kinematic one. Add [`ReportContacts`] to get events for its contacts.
     #[default]
     Solid,
-    /// Never pushes; reports overlaps (phase P3).
+    /// Never pushes and is never pushed; overlaps with other colliders are reported as
+    /// [`CollisionStarted`] and [`CollisionEnded`].
     Sensor,
 }
 
-/// Which bodies a collider meets (phase P3): two colliders interact when each one's `member`
-/// bits share a bit with the other's `mask`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct CollisionLayers {
-    /// The layers this collider is in.
-    pub member: u32,
-    /// The layers this collider meets.
-    pub mask: u32,
-}
-
-impl Default for CollisionLayers {
-    /// In layer 1, meets every layer.
-    fn default() -> Self {
-        Self {
-            member: 1,
-            mask: u32::MAX,
-        }
-    }
-}
-
-impl CollisionLayers {
-    /// `self` and `other` meet (checked both ways).
-    pub const fn interacts(self, other: CollisionLayers) -> bool {
-        self.member & other.mask != 0 && other.member & self.mask != 0
-    }
-}
-
-/// The shape of a body, placed at `offset` from its position. Against the voxels a sphere
-/// collides as its bounding box (v1).
+/// The shape of a body, placed at `offset` from its position. Against the voxels (and as an
+/// obstacle) a sphere collides as its bounding box (v1); between bodies spheres are exact.
+///
+/// A collider without a [`RigidBody`] makes a [`RigidBody::Static`] body (it requires one): a
+/// wall, a trigger zone.
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
+#[require(RigidBody = RigidBody::Static)]
 pub struct Collider {
     /// The shape, centered on its own origin.
     pub shape: Shape,
     /// Where the shape's center is, relative to the body's position.
     pub offset: DVec3,
-    /// How it reacts to other bodies (phase P3).
+    /// How it reacts to other bodies.
     pub response: Response,
-    /// Which bodies it meets (phase P3).
+    /// Which bodies it meets (and which entity rays and queries find it).
     pub layers: CollisionLayers,
 }
 
@@ -150,9 +134,68 @@ impl Collider {
     }
 
     /// The box this collider uses against the voxels, relative to the body's position: the
-    /// shape's bounding box moved by `offset`.
+    /// shape's bounding box moved by `offset`. Static and kinematic obstacles block dynamic
+    /// bodies with this box too.
     pub fn voxel_box(&self) -> LocalBox {
         self.shape.bounds().translate(self.offset)
+    }
+
+    /// It is a sensor.
+    pub fn is_sensor(&self) -> bool {
+        self.response == Response::Sensor
+    }
+}
+
+/// Marker: contacts of this solid body with other solid bodies are reported as
+/// [`CollisionStarted`] and [`CollisionEnded`] too (sensor overlaps always are). A contact is a
+/// step where the two overlapped before being pushed apart: a crate resting on another, a
+/// player walking into a mob.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReportContacts;
+
+/// Two colliders started to overlap in the latest fixed step (a sensor pair, or a solid pair
+/// with [`ReportContacts`]). `a < b` by `Entity::to_bits`; each pair is reported once until it
+/// ends. Written sorted at the end of each step, like [`VoxelImpact`].
+#[derive(Message, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CollisionStarted {
+    /// The entity with the lower bits.
+    pub a: Entity,
+    /// The entity with the higher bits.
+    pub b: Entity,
+}
+
+/// Two colliders stopped overlapping in the latest fixed step (they moved apart, one was
+/// despawned or lost its collider, or their layers or responses changed). Sent once for every
+/// [`CollisionStarted`].
+#[derive(Message, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CollisionEnded {
+    /// The entity with the lower bits.
+    pub a: Entity,
+    /// The entity with the higher bits.
+    pub b: Entity,
+}
+
+impl CollisionStarted {
+    /// The other entity of the pair, if `entity` is in it.
+    pub fn other(&self, entity: Entity) -> Option<Entity> {
+        other_of(self.a, self.b, entity)
+    }
+}
+
+impl CollisionEnded {
+    /// The other entity of the pair, if `entity` is in it.
+    pub fn other(&self, entity: Entity) -> Option<Entity> {
+        other_of(self.a, self.b, entity)
+    }
+}
+
+fn other_of(a: Entity, b: Entity, entity: Entity) -> Option<Entity> {
+    if entity == a {
+        Some(b)
+    } else if entity == b {
+        Some(a)
+    } else {
+        None
     }
 }
 
@@ -183,10 +226,13 @@ impl Component for BodySettings {
 /// teleport.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Contacts {
-    /// Bit `Face::index()` for each face of the body that a clip stopped in the latest step
-    /// (`Face` order: +Y, -Y, +X, -X, +Z, -Z).
+    /// Bit `Face::index()` for each face of the body that a clip stopped in the latest step, or
+    /// that touched another solid body it was pushed apart from (`Face` order: +Y, -Y, +X, -X,
+    /// +Z, -Z).
     pub faces: u8,
-    /// It landed: a clip stopped it moving down. Ground friction applies in the next step.
+    /// It landed: a clip stopped it moving down, or it was pushed up off another solid body (it
+    /// stands on a crate or a mob). Ground friction applies in the next step, and a
+    /// [`CharacterController`] can jump.
     pub on_ground: bool,
     /// The block it stands on (under the center of its bottom when that block is full).
     pub ground_block: Option<BlockPos>,
@@ -269,12 +315,21 @@ fn show_teleport(mut world: DeferredWorld, context: HookContext) {
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct PhysicsSync {
     pub(crate) last_written: Option<DVec3>,
+    /// How far the body moved in the latest step before the solve (the sweep or the kinematic
+    /// move): the solve uses it to tell which side another body came from.
+    pub(crate) moved: DVec3,
 }
 
 impl PhysicsSync {
     /// The translation physics last wrote.
     pub fn last_written(&self) -> Option<DVec3> {
         self.last_written
+    }
+
+    /// How far the body moved in the latest step, before the pushes between bodies (zero for
+    /// static and frozen bodies).
+    pub fn moved(&self) -> DVec3 {
+        self.moved
     }
 }
 
@@ -356,6 +411,14 @@ pub struct PhysicsSettings {
     pub max_depenetration: f64,
     /// Clips faster than this (blocks per second) send a [`VoxelImpact`] (default 4).
     pub impact_speed: f64,
+    /// Passes over the overlapping solid pairs per step (default 2). Each pass pushes every pair
+    /// that still overlaps; an overlap left after the last pass is fixed in the next steps. 0
+    /// turns pushes off (sensors and events still work).
+    pub solver_passes: u32,
+    /// The broadphase grid's cells are `2^grid_shift` blocks wide (default 2: 4 blocks).
+    /// Bodies wider than two cells are tested against every other body, so raise it for big
+    /// bodies. At most 16.
+    pub grid_shift: u32,
 }
 
 impl Default for PhysicsSettings {
@@ -367,6 +430,8 @@ impl Default for PhysicsSettings {
             max_speed: step.max_speed,
             max_depenetration: step.sweep.max_depenetration,
             impact_speed: step.impact_speed,
+            solver_passes: 2,
+            grid_shift: DEFAULT_GRID_SHIFT,
         }
     }
 }
@@ -397,24 +462,40 @@ pub struct PhysicsStats {
     pub dynamic: usize,
     /// Dynamic bodies that did not move because of unloaded chunks.
     pub frozen: usize,
+    /// Candidate pairs of the broadphase in the latest step.
+    pub pairs: usize,
+    /// Pushes between solid bodies in the latest step (one per overlapping pair and pass).
+    pub pushes: usize,
+    /// Pairs overlapping at the end of the latest step that report events (sensor pairs and
+    /// solid pairs with [`ReportContacts`]).
+    pub overlaps: usize,
     /// Impacts of the latest step.
     pub impacts: usize,
     /// Steps run since startup.
     pub steps: u64,
     /// Time the latest step spent moving dynamic bodies (`PhysicsSystems::Step`).
     pub step_time: Duration,
+    /// Time the latest step spent between bodies: the broadphase and the solve
+    /// (`PhysicsSystems::Broadphase` and `PhysicsSystems::Solve`).
+    pub solve_time: Duration,
 }
 
 impl PhysicsStats {
-    /// `bodies=12 dynamic=10 frozen=0 impacts=1 step=0.012ms steps=640`.
+    /// `bodies=12 dynamic=10 frozen=0 pairs=3 pushes=1 overlaps=2 impacts=1 step=0.012ms
+    /// solve=0.004ms steps=640`.
     pub fn summary(&self) -> String {
         format!(
-            "bodies={} dynamic={} frozen={} impacts={} step={:.3}ms steps={}",
+            "bodies={} dynamic={} frozen={} pairs={} pushes={} overlaps={} impacts={} \
+             step={:.3}ms solve={:.3}ms steps={}",
             self.bodies,
             self.dynamic,
             self.frozen,
+            self.pairs,
+            self.pushes,
+            self.overlaps,
             self.impacts,
             self.step_time.as_secs_f64() * 1e3,
+            self.solve_time.as_secs_f64() * 1e3,
             self.steps
         )
     }
