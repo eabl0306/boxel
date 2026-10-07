@@ -5,8 +5,8 @@ use crate::shading::{
     face_corner_lights, neighborhood8,
 };
 use crate::{
-    BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, PADDED, PADDED_AREA, PADDED_VOLUME, PackedQuad,
-    PaddedChunk, TRANSLUCENT_BUCKET, VoxelClass,
+    BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, FLUID_SURFACE_BIT, PADDED, PADDED_AREA, PADDED_VOLUME,
+    PackedQuad, PaddedChunk, TRANSLUCENT_BUCKET, VoxelClass,
 };
 use boxel_light::PaddedLight;
 use boxel_voxel::{
@@ -57,6 +57,8 @@ pub struct MaterialTable {
     /// Shape code of each cube face (`layout::SHAPE_CUBE` or `SHAPE_TURNED`).
     codes: Vec<[u8; 6]>,
     emissive: Vec<bool>,
+    /// Some material is a fluid (`BlockModel::Fluid`): gather marks the surface cells.
+    has_fluid: bool,
 }
 
 /// The mesher class of a block drawn as `shape` with `model`.
@@ -91,6 +93,7 @@ impl MaterialTable {
             layers: vec![[0u16; 6]; n],
             codes: vec![[0u8; 6]; n],
             emissive: vec![false; n],
+            has_fluid: false,
         };
         for i in 0..n {
             let s = BlockState(i as u16);
@@ -130,6 +133,23 @@ impl MaterialTable {
         self.model[i] = model;
         self.class[i] = class_of(self.shape[i], model);
         self.codes[i] = cube_codes(model);
+        self.has_fluid |= model == BlockModel::Fluid;
+    }
+    /// True if gather marks fluid surface cells ([`FLUID_SURFACE_BIT`]): some material is a
+    /// fluid and every material id is below the bit (else fluids keep a full-height top).
+    fn marks_fluid_surfaces(&self) -> bool {
+        self.has_fluid && self.class.len() <= usize::from(FLUID_SURFACE_BIT)
+    }
+    /// The material of a merge key's voxel id and whether it is a fluid surface cell.
+    #[inline]
+    fn split_surface(&self, material: u16) -> (u16, bool) {
+        if !self.marks_fluid_surfaces() {
+            return (material, false);
+        }
+        (
+            material & !FLUID_SURFACE_BIT,
+            material & FLUID_SURFACE_BIT != 0,
+        )
     }
     /// Shape code of the cube faces of `material` facing `face` (`layout::SHAPE_CUBE` or
     /// `layout::SHAPE_TURNED`; out of range -> `SHAPE_CUBE`).
@@ -192,6 +212,7 @@ impl MaterialTable {
             emissive: vec![false; n],
             model: vec![BlockModel::CUBE; n],
             codes: vec![[0; 6]; n],
+            has_fluid: false,
             shape,
             layers,
         }
@@ -353,6 +374,36 @@ fn gather_into(
             gather_border([offset.x, offset.y, offset.z], chunk, materials, out);
         }
     }
+    if materials.marks_fluid_surfaces() {
+        mark_fluid_surfaces(materials, out);
+    }
+}
+
+/// Marks the fluid surface cells of the inner 32^3 with [`FLUID_SURFACE_BIT`]: the fluid voxels
+/// whose voxel above is neither the same fluid nor opaque. Under an opaque block the fluid stays
+/// full height, so no gap shows under it (its top face is culled there).
+fn mark_fluid_surfaces(materials: &MaterialTable, out: &mut PaddedChunk) {
+    out.cull_mask = !FLUID_SURFACE_BIT;
+    for y in 0..CHUNK_SIZE {
+        for x in 0..CHUNK_SIZE {
+            // Inner voxels only (mask bit of padded z is z + 1).
+            let mut bits = (out.transparent[mask_row(x, y)] >> 1) & u64::from(u32::MAX);
+            let opaque_above = out.opaque[mask_row(x, y + 1)] >> 1;
+            while bits != 0 {
+                let z = bits.trailing_zeros() as i32;
+                bits &= bits - 1;
+                let i = PaddedChunk::index(x, y, z);
+                let m = out.voxels[i];
+                if materials.model(m) != BlockModel::Fluid || opaque_above >> z & 1 != 0 {
+                    continue;
+                }
+                let above = out.voxels[PaddedChunk::index(x, y + 1, z)] & !FLUID_SURFACE_BIT;
+                if above != m {
+                    out.voxels[i] = m | FLUID_SURFACE_BIT;
+                }
+            }
+        }
+    }
 }
 
 /// Copies the inner 32^3 voxels. A uniform chunk fills whole rows; any other is decoded once
@@ -503,8 +554,12 @@ fn mesh_into(
     out: &mut ChunkMesh,
 ) {
     out.clear();
-    s.greedy
-        .cull(&padded.voxels, &padded.opaque, &padded.transparent);
+    s.greedy.cull(
+        &padded.voxels,
+        &padded.opaque,
+        &padded.transparent,
+        padded.cull_mask,
+    );
     let elide = options.ao == AoPolicy::BakedLitOnly;
     let full = match light {
         None => Err(LightValue::FULL_SKY),
@@ -676,7 +731,7 @@ fn cover_of(model: BlockModel, face: Face) -> Cover {
         (BlockModel::Slab(SlabHalf::Bottom), Face::NegY)
         | (BlockModel::Slab(SlabHalf::Top), Face::PosY) => Cover::Full,
         (BlockModel::Slab(_), Face::PosY | Face::NegY)
-        | (BlockModel::Cube { .. } | BlockModel::Cross, _) => Cover::None,
+        | (BlockModel::Cube { .. } | BlockModel::Cross | BlockModel::Fluid, _) => Cover::None,
         (BlockModel::Slab(SlabHalf::Bottom), _) => Cover::Lower,
         (BlockModel::Slab(SlabHalf::Top), _) => Cover::Upper,
     }
@@ -756,7 +811,7 @@ fn emit_specials(
                             push(m, pos, face, Face::PosX, layout::SHAPE_CROSS, shading);
                         }
                     }
-                    BlockModel::Cube { .. } => {}
+                    BlockModel::Cube { .. } | BlockModel::Fluid => {}
                 }
             }
         }
@@ -899,7 +954,8 @@ fn assemble(
     let mut counts = [0u32; BUCKET_COUNT];
     for (face, quads) in Face::ALL.into_iter().zip(&greedy.quads) {
         for &quad in quads {
-            counts[materials.bucket(decode((quad >> 32) as u32).material, face)] += 1;
+            let (material, _) = materials.split_surface(decode((quad >> 32) as u32).material);
+            counts[materials.bucket(material, face)] += 1;
         }
     }
     for &(bucket, _) in specials {
@@ -920,13 +976,19 @@ fn assemble(
     out.quads.resize(total, PackedQuad::default());
     for (face, quads) in Face::ALL.into_iter().zip(&greedy.quads) {
         for &quad in quads {
-            let key = decode((quad >> 32) as u32);
+            let mut key = decode((quad >> 32) as u32);
+            let surface;
+            (key.material, surface) = materials.split_surface(key.material);
             let bucket = materials.bucket(key.material, face);
             let mut packed = to_packed(quad, face, materials.layer(key.material, face), key);
             if materials.emissive(key.material) {
                 packed.geo |= layout::FLAG_EMISSIVE << layout::GEO_FLAGS_SHIFT;
             }
-            let code = materials.cube_code(key.material, face);
+            let code = if surface && face != Face::NegY {
+                layout::SHAPE_FLUID_SURFACE
+            } else {
+                materials.cube_code(key.material, face)
+            };
             if code != layout::SHAPE_CUBE {
                 packed = packed.with_shape(code);
             }
@@ -1012,7 +1074,9 @@ pub fn reference_visible_faces(padded: &PaddedChunk) -> BTreeSet<([u32; 3], Face
                     let (nx, ny, nz) = (x + n.x, y + n.y, z + n.z);
                     let visible = match class(nx, ny, nz) {
                         VoxelClass::Empty | VoxelClass::Special => true,
-                        VoxelClass::Transparent => padded.get(nx, ny, nz) != material,
+                        VoxelClass::Transparent => {
+                            (padded.get(nx, ny, nz) ^ material) & padded.cull_mask != 0
+                        }
                         VoxelClass::Opaque => false,
                     };
                     if visible {

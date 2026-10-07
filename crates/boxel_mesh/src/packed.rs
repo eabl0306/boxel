@@ -50,6 +50,13 @@ pub mod layout {
     /// `(0, 0)` to `(1, 1)` in (x, z), face `PosZ` the one from `(1, 0)` to `(0, 1)`. Drawn from
     /// both sides (cutout pipeline), without face shading, its light is the block's own cell.
     pub const SHAPE_CROSS: u8 = 4;
+    /// A face of a fluid's surface cell (`BlockModel::Fluid`): the cell's top drops to
+    /// [`FLUID_SURFACE`] of a block. The +Y face lies there and the side faces span `y` in
+    /// `0..FLUID_SURFACE`; the -Y face is the cube's. Greedy quads (any `w`; side faces have
+    /// `h = 1`, since a surface cell never has a surface cell of its fluid above or below it).
+    pub const SHAPE_FLUID_SURFACE: u8 = 5;
+    /// Height of a fluid's surface within its cell (14/16, about Minecraft's 8/9).
+    pub const FLUID_SURFACE: f32 = 0.875;
     /// Mask of the texture layer.
     pub const MAT_LAYER_MASK: u32 = 0xFFF;
     /// Shift of the 4x2-bit AO field.

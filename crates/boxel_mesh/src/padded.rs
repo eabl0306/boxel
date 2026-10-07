@@ -20,6 +20,12 @@ pub enum VoxelClass {
     Special,
 }
 
+/// Bit of a voxel id that marks a fluid's surface cell (`BlockModel::Fluid` under neither its own
+/// fluid nor an opaque block): its top sits lower (`layout::SHAPE_FLUID_SURFACE`). Set by the
+/// mesher's gather on the inner voxels when every material id is below it; culling ignores it
+/// ([`PaddedChunk::cull_mask`]), merging does not.
+pub const FLUID_SURFACE_BIT: u16 = 0x8000;
+
 /// The mesher's padded input: material ids for x, y, z in `-1..=32` plus the two column masks
 /// binary-greedy-meshing needs and a third one of the non-cube blocks. Layout = bgm `pad_linearize`: index `(z+1) + (x+1)*34 + (y+1)*34^2`;
 /// mask row `(x+1) + (y+1)*34`, bit `z+1`.
@@ -33,6 +39,10 @@ pub struct PaddedChunk {
     pub transparent: Box<[u64]>,
     /// Special (non-cube) column masks.
     pub special: Box<[u64]>,
+    /// The bits of a voxel id that tell two transparent voxels apart for face culling: all of
+    /// them, or all but [`FLUID_SURFACE_BIT`] once the surface cells are marked (a surface cell
+    /// and the rest of its fluid hide the faces between them).
+    pub cull_mask: u16,
 }
 
 impl Default for PaddedChunk {
@@ -49,6 +59,7 @@ impl PaddedChunk {
             opaque: vec![0; PADDED_AREA].into_boxed_slice(),
             transparent: vec![0; PADDED_AREA].into_boxed_slice(),
             special: vec![0; PADDED_AREA].into_boxed_slice(),
+            cull_mask: u16::MAX,
         }
     }
     /// Resets to empty.
@@ -57,6 +68,7 @@ impl PaddedChunk {
         self.opaque.fill(0);
         self.transparent.fill(0);
         self.special.fill(0);
+        self.cull_mask = u16::MAX;
     }
     /// Linear index of chunk-local `(x, y, z)`, each in `-1..=32`.
     #[inline]

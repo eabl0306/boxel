@@ -2,7 +2,7 @@
 //
 // PackedQuad = vec2<u32>(geo, mat), 8 bytes, identical bytes on every tier.
 //   geo: x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | flags:4 (bit 0 = FLAG_EMISSIVE, bits 1..3 =
-//        shape code, ADR 0018: cube, turned cube, lower or upper half of the cell, cross)
+//        shape code, ADR 0018: cube, turned cube, lower or upper half of the cell, cross, fluid surface)
 //   mat: layer:12 | ao:8 (2 bits per corner, 3 = unoccluded) | light:12 (index into the chunk's
 //        light palette)
 // face: 0=+Y 1=-Y 2=+X 3=-X 4=+Z 5=-Z  (u,v axes: ±Y -> (X,Z), ±X -> (Z,Y), ±Z -> (X,Y))
@@ -45,6 +45,8 @@ const SHAPE_TURNED: u32 = 1u;      // cube face, texture transposed (logs along 
 const SHAPE_LOWER_HALF: u32 = 2u;  // bottom slab face (w = h = 1)
 const SHAPE_UPPER_HALF: u32 = 3u;  // top slab face (w = h = 1)
 const SHAPE_CROSS: u32 = 4u;       // plant quad through the cell's diagonal (w = h = 1)
+const SHAPE_FLUID_SURFACE: u32 = 5u; // fluid surface cell: its top drops to FLUID_SURFACE (greedy)
+const FLUID_SURFACE: f32 = 0.875;
 const MAT_LAYER_MASK: u32 = 0xFFFu;
 const MAT_AO_SHIFT: u32 = 12u;
 const MAT_LIGHT_SHIFT: u32 = 20u;
@@ -167,6 +169,19 @@ fn decode_quad(q: vec2<u32>, light: vec2<u32>, corner_in: u32) -> Decoded {
       o.st.y = y;
     } else {
       o.local.y = p.y + select(lo, lo + 0.5, f == 0u);
+    }
+  } else if (shape == SHAPE_FLUID_SURFACE) {
+    // Fluid surface (water): the cell's top drops to FLUID_SURFACE. Side faces span y in
+    // [0, FLUID_SURFACE] (h = 1: a surface cell has no surface cell of its fluid above or below)
+    // with their texture row and light coordinate t following the real y, as slabs do; the +Y
+    // face moves down to it; the -Y face stays.
+    if (f >= 2u) {
+      let y = FLUID_SURFACE * cv;
+      o.local.y = p.y + y;
+      o.uv.y = 1.0 - y;
+      o.st.y = y;
+    } else if (f == 0u) {
+      o.local.y = p.y + FLUID_SURFACE;
     }
   } else if (shape == SHAPE_CROSS) {
     // Face 2 (+X) runs from (0, 0) to (1, 1) in (x, z), face 4 (+Z) from (1, 0) to (0, 1); full

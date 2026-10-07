@@ -75,6 +75,10 @@ pub enum BlockModel {
     /// Two diagonal quads through the cell (plants), with the side texture, drawn from both
     /// sides. Never hides or is hidden by anything.
     Cross,
+    /// A fluid (water): a cube for meshing and culling, but where the block above is neither
+    /// the same fluid nor an opaque block (the surface) its top sits 2/16 lower, as in
+    /// Minecraft. Lets everything through ([`BlockModel::default_collision`] is `None`).
+    Fluid,
 }
 
 impl Default for BlockModel {
@@ -89,7 +93,7 @@ impl BlockModel {
 
     /// True for the full cube (any axis).
     pub const fn is_cube(self) -> bool {
-        matches!(self, BlockModel::Cube { .. })
+        matches!(self, BlockModel::Cube { .. } | BlockModel::Fluid)
     }
 
     /// The face of the unturned cube whose texture `face` shows: for a cube turned to X or Z,
@@ -122,7 +126,7 @@ impl BlockModel {
     /// slabs, a smaller box around the stem for crosses.
     pub fn outline(self) -> BlockCollision {
         match self {
-            BlockModel::Cube { .. } => BlockCollision::Full,
+            BlockModel::Cube { .. } | BlockModel::Fluid => BlockCollision::Full,
             BlockModel::Slab(half) => BlockCollision::Boxes(vec![CollisionBox::slab(half)]),
             BlockModel::Cross => {
                 BlockCollision::Boxes(vec![CollisionBox::new([2, 0, 2], [14, 13, 14])])
@@ -131,10 +135,10 @@ impl BlockModel {
     }
 
     /// The usual collision of the model: full cubes and slabs collide with their shape, crosses
-    /// do not collide.
+    /// and fluids do not collide.
     pub fn default_collision(self) -> BlockCollision {
         match self {
-            BlockModel::Cross => BlockCollision::None,
+            BlockModel::Cross | BlockModel::Fluid => BlockCollision::None,
             other => other.outline(),
         }
     }
@@ -241,6 +245,9 @@ pub enum TexturePattern {
     Leaves,
     /// Horizontal planks.
     Planks,
+    /// Bark: dark vertical cracks, broken here and there (log sides; a turned log runs them
+    /// along its axis).
+    Bark,
     /// Glass: a clear inside (alpha 0) with a light frame and a few streaks (translucent).
     Glass,
     /// Noise with a constant alpha (water; translucent).
@@ -467,7 +474,7 @@ impl BlockRegistryBuilder {
                 density: 60,
             },
         );
-        let log_side = tex("log_side", [102, 81, 51], 14, P::Planks);
+        let log_side = tex("log_side", [102, 81, 51], 14, P::Bark);
         let log_top = tex("log_top", [156, 127, 78], 10, P::Noise);
         let leaves = tex("leaves", [60, 130, 40], 20, P::Leaves);
         let water = tex("water", [40, 90, 200], 6, P::Liquid { alpha: 160 });
@@ -543,7 +550,10 @@ impl BlockRegistryBuilder {
                 },
             ),
             block("leaves", RenderShape::Cutout, true, all(leaves)),
-            block("water", RenderShape::Translucent, false, all(water)),
+            BlockDef {
+                model: BlockModel::Fluid,
+                ..block("water", RenderShape::Translucent, false, all(water))
+            },
             block("planks", opaque, true, all(planks)),
         ] {
             b.add_block(def).expect("built-in block");

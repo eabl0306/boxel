@@ -281,6 +281,7 @@ fn wgsl_bit_layout_matches_boxel_mesh() {
         ("SHAPE_LOWER_HALF", u32::from(l::SHAPE_LOWER_HALF)),
         ("SHAPE_UPPER_HALF", u32::from(l::SHAPE_UPPER_HALF)),
         ("SHAPE_CROSS", u32::from(l::SHAPE_CROSS)),
+        ("SHAPE_FLUID_SURFACE", u32::from(l::SHAPE_FLUID_SURFACE)),
     ] {
         assert_eq!(const_u32(&module, name), v, "{name}");
     }

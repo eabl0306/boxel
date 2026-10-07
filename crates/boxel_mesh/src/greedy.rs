@@ -100,8 +100,15 @@ impl Greedy {
 
     /// Hidden face culling (bgm `fast_face_culling`, unchanged): fills the face masks from the
     /// opaque and transparent column masks; transparent voxels also compare their neighbors'
-    /// ids (`voxels`), so two transparent voxels of one material hide the faces between them.
-    pub(crate) fn cull(&mut self, voxels: &[u16], opaque_mask: &[u64], trans_mask: &[u64]) {
+    /// ids (`voxels`, the bits of `id_mask` only), so two transparent voxels of one material hide
+    /// the faces between them.
+    pub(crate) fn cull(
+        &mut self,
+        voxels: &[u16],
+        opaque_mask: &[u64],
+        trans_mask: &[u64],
+        id_mask: u16,
+    ) {
         for a in 1..(CS_P - 1) {
             let a_ = a * CS_P;
 
@@ -148,25 +155,25 @@ impl Greedy {
                     let unpadded_c_mask = c_mask >> 1;
                     bits_here &= !(c_mask);
                     let abc = ab_ + c;
-                    let v1 = voxels[abc];
+                    let v1 = voxels[abc] & id_mask;
                     self.face_masks[up_faces] |= not_front_col
                         & unpadded_c_mask
-                        & u64::from(v1 != voxels[abc + CS_P2]) << (c - 1);
+                        & u64::from(v1 != voxels[abc + CS_P2] & id_mask) << (c - 1);
                     self.face_masks[down_faces] |= not_back_col
                         & unpadded_c_mask
-                        & u64::from(v1 != voxels[abc - CS_P2]) << (c - 1);
+                        & u64::from(v1 != voxels[abc - CS_P2] & id_mask) << (c - 1);
 
                     self.face_masks[right_faces] |= not_right_col
                         & unpadded_c_mask
-                        & u64::from(v1 != voxels[abc + CS_P]) << (c - 1);
+                        & u64::from(v1 != voxels[abc + CS_P] & id_mask) << (c - 1);
                     self.face_masks[left_faces] |= not_left_col
                         & unpadded_c_mask
-                        & u64::from(v1 != voxels[abc - CS_P]) << (c - 1);
+                        & u64::from(v1 != voxels[abc - CS_P] & id_mask) << (c - 1);
 
                     self.face_masks[front_faces] |=
-                        not_col_up & c_mask & u64::from(v1 != voxels[abc + 1]) << c;
+                        not_col_up & c_mask & u64::from(v1 != voxels[abc + 1] & id_mask) << c;
                     self.face_masks[back_faces] |=
-                        not_col_down & c_mask & u64::from(v1 != voxels[abc - 1]) << c;
+                        not_col_down & c_mask & u64::from(v1 != voxels[abc - 1] & id_mask) << c;
                 }
             }
         }

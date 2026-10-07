@@ -3,8 +3,9 @@
 
 use boxel_light::{PADDED_VOLUME, PaddedLight};
 use boxel_mesh::{
-    AoPolicy, BUCKET_COUNT, ChunkMesh, FaceShading, MAX_PALETTE_ENTRIES, MaterialTable,
-    PaddedChunk, VoxelClass, reference_face_shading, reference_visible_faces,
+    AoPolicy, BUCKET_COUNT, ChunkMesh, FLUID_SURFACE_BIT, FaceShading, MAX_PALETTE_ENTRIES,
+    MaterialTable, PaddedChunk, VoxelClass, layout, reference_face_shading,
+    reference_visible_faces,
 };
 use boxel_voxel::{
     BlockState, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, Face, LightValue, LocalPos, NEIGHBOR_OFFSETS,
@@ -176,8 +177,9 @@ pub fn class_at(padded: &PaddedChunk, x: i32, y: i32, z: i32) -> VoxelClass {
 
 /// Checks a mesh against its padded input: counts match the quads, opaque buckets hold their
 /// own face, quads stay inside the chunk and never overlap, every unit face has the bucket,
-/// texture layer and emissive flag of the material of its voxel (no other flag is set), and the
-/// expanded unit faces equal the brute-force oracle. Returns the number of unit faces.
+/// texture layer and emissive flag of the material of its voxel and the shape code of its face
+/// (`SHAPE_FLUID_SURFACE` on a marked fluid surface cell but for its -Y face), and the expanded
+/// unit faces equal the brute-force oracle. Returns the number of unit faces.
 pub fn verify_mesh(padded: &PaddedChunk, table: &MaterialTable, mesh: &ChunkMesh) -> usize {
     assert_eq!(
         mesh.bucket_counts.iter().sum::<u32>(),
@@ -199,7 +201,10 @@ pub fn verify_mesh(padded: &PaddedChunk, table: &MaterialTable, mesh: &ChunkMesh
                     p.iter().all(|&c| c < 32),
                     "{quad:?} leaves the chunk at {p:?}"
                 );
-                let material = padded.get(p[0] as i32, p[1] as i32, p[2] as i32);
+                let id = padded.get(p[0] as i32, p[1] as i32, p[2] as i32);
+                let marked = padded.cull_mask != u16::MAX;
+                let surface = marked && id & FLUID_SURFACE_BIT != 0;
+                let material = if marked { id & !FLUID_SURFACE_BIT } else { id };
                 assert_eq!(
                     table.bucket(material, face),
                     bucket,
@@ -215,7 +220,12 @@ pub fn verify_mesh(padded: &PaddedChunk, table: &MaterialTable, mesh: &ChunkMesh
                     table.emissive(material),
                     "unit face {p:?} {face:?}: emissive flag of material {material}"
                 );
-                assert_eq!(quad.flags() & !1, 0, "{quad:?}: undefined flag bits");
+                let code = if surface && face != Face::NegY {
+                    layout::SHAPE_FLUID_SURFACE
+                } else {
+                    table.cube_code(material, face)
+                };
+                assert_eq!(quad.shape(), code, "{quad:?} {face:?}: shape code");
                 assert!(got.insert((p, face)), "overlapping quads at {p:?} {face:?}");
             }
         }

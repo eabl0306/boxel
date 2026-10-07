@@ -113,6 +113,19 @@ pub(crate) fn synthesize(spec: &TextureSpec) -> [[u8; 4]; BASE_TEXELS] {
                 }
             }
         }
+        TexturePattern::Bark => {
+            // Cracks on 5 of the 16 columns (spread unevenly so no grid shows), each a run of
+            // texels at 6/10 brightness with a gap of 1 to 3 texels somewhere along it.
+            for x in [1, 4, 8, 11, 14].map(|x| x * size / 16) {
+                let gap = rng.below(size as u32) as usize;
+                let gap_len = 1 + rng.below(3) as usize;
+                for y in (0..size).filter(|y| (y + size - gap) % size >= gap_len) {
+                    for c in &mut texels[y * size + x][..3] {
+                        *c = (u16::from(*c) * 6 / 10) as u8;
+                    }
+                }
+            }
+        }
         TexturePattern::Glass => {
             // A light frame, two short streaks and an almost clear inside.
             for (i, texel) in texels.iter_mut().enumerate() {

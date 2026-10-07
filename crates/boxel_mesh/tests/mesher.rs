@@ -4,9 +4,9 @@ mod common;
 
 use boxel_light::PaddedLight;
 use boxel_mesh::{
-    AoPolicy, BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, FULL_SKY_ENTRY, LightQuantization,
-    MAX_QUADS_PER_BUCKET, MAX_QUADS_PER_FACE_BUCKET, MaterialTable, MeshInput, MeshOptions, Mesher,
-    PackedQuad, PaddedChunk, TRANSLUCENT_BUCKET, VoxelClass,
+    AoPolicy, BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, FLUID_SURFACE_BIT, FULL_SKY_ENTRY,
+    LightQuantization, MAX_QUADS_PER_BUCKET, MAX_QUADS_PER_FACE_BUCKET, MaterialTable, MeshInput,
+    MeshOptions, Mesher, PackedQuad, PaddedChunk, TRANSLUCENT_BUCKET, VoxelClass, layout,
 };
 use boxel_voxel::{
     BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, Face, LightValue, LocalPos,
@@ -724,4 +724,47 @@ fn light_reaches_the_palette_and_splits_merges() {
     assert_eq!(unlit.bucket(Face::PosY.index()).len(), 1);
     assert_eq!(unlit.palette, vec![FULL_SKY_ENTRY]);
     assert_ne!(unlit.hash, mesh.hash);
+}
+
+/// A 4x4 pool two blocks deep with a stone block over one corner: the top water layer is the
+/// surface (marked, its +Y and side faces drop to `FLUID_SURFACE`) except under the stone, where
+/// it stays full height; the layer below is plain water, and no face lies between the two.
+#[test]
+fn water_surface_cells_drop_their_top() {
+    let (registry, table) = registry();
+    let (stone, water) = (block(&registry, "stone"), block(&registry, "water"));
+    let center = chunk_repr(
+        &dense_from(|x, y, z| match (x, y, z) {
+            (0..4, 0, 0..4) | (0, 3, 0) => stone.0,
+            (0..4, 1..=2, 0..4) => water.0,
+            _ => 0,
+        }),
+        Repr::Packed,
+    );
+    let input = isolated(&center);
+    let padded = gathered(&input, &table);
+    for (x, z) in (0..4).flat_map(|x| (0..4).map(move |z| (x, z))) {
+        let marked = |y| padded.get(x, y, z) & FLUID_SURFACE_BIT != 0;
+        assert!(!marked(1), "({x}, 1, {z}) has water above");
+        assert_eq!(marked(2), (x, z) != (0, 0), "({x}, 2, {z})");
+    }
+    let mesh = Mesher::new().mesh_chunk(&input, &table, OPTIONS);
+    verify_mesh(&padded, &table, &mesh);
+    let mut tops = 0;
+    for quad in mesh.bucket(TRANSLUCENT_BUCKET) {
+        for (p, face) in quad.unit_faces() {
+            let surface = p[1] == 2 && (p[0], p[2]) != (0, 0) && face != Face::NegY;
+            assert!(
+                !(p[1] == 1 && face == Face::PosY),
+                "face between the layers at {p:?}"
+            );
+            assert_eq!(
+                quad.shape() == layout::SHAPE_FLUID_SURFACE,
+                surface,
+                "{p:?} {face:?}"
+            );
+            tops += usize::from(face == Face::PosY);
+        }
+    }
+    assert_eq!(tops, 15, "every open water top but the one under the stone");
 }

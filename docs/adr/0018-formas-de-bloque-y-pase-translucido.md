@@ -83,6 +83,24 @@ vidrio y agua visibles. `BlockDef` tenía `solid: bool` y la física solo conoc�
   además de las teclas 1 a 0). La losa va arriba si el clic toca una cara de abajo o la mitad de
   arriba de un costado. El tronco se acuesta en el eje de la cara clickeada.
 
+### 6. Superficie del agua
+
+El agua usa `BlockModel::Fluid`: para la malla y el culling es un cubo, pero su celda de
+superficie tiene el techo a 14/16 de bloque, como en Minecraft (que usa 8/9). Es superficie el
+agua que no tiene encima ni agua ni un bloque opaco. Bajo un bloque opaco el agua queda a altura
+completa, así no se ve un hueco debajo de un muelle.
+
+- El gather marca la superficie con el bit alto del id de material (`FLUID_SURFACE_BIT`). El
+  culling lo ignora (`PaddedChunk::cull_mask`), así no aparecen caras entre la superficie y el
+  agua de abajo. La fusión greedy sí lo ve, así la capa de superficie forma sus propios quads.
+- Esos quads llevan el código de forma `SHAPE_FLUID_SURFACE`: la cara de arriba baja 2/16 y los
+  costados terminan ahí. La cara de abajo es la del cubo. Siguen siendo quads greedy, así un lago
+  no cuesta más quads que antes (solo se separa la capa de arriba en los costados).
+- Solo se marca si todos los ids de material caben debajo del bit (hasta 32 768). Si no, el agua
+  conserva el techo completo.
+- Queda una ranura de 2/16 donde un agua de altura completa (bajo un bloque) toca de costado un
+  agua de superficie. Es raro y se va con los líquidos que fluyen, que tendrán altura por esquina.
+
 ## Consecuencias
 
 - Costo medido en el RTX 5050 (stress fly r16 a 32 vóxeles/s, sin tope, 2 corridas): main 4614

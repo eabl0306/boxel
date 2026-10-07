@@ -1219,7 +1219,7 @@ fn placed_state(registry: &BlockRegistry, block: BlockState, hit: &VoxelHit) -> 
                 None => block,
             }
         }
-        BlockModel::Cross => block,
+        BlockModel::Cross | BlockModel::Fluid => block,
     }
 }
 
