@@ -34,7 +34,7 @@ no sirve directo para la GPU. Todos los tiers deben compartir los mismos bytes.
 
 ## Enmienda (2026-10-06, ADR 0015)
 
-Se aplica en la fase P2 de la luz; hasta entonces el código sigue con el formato de arriba.
+Aplicada en la fase P2 de la luz: el código ya usa el formato de esta enmienda.
 
 - **`PackedQuad` v2, sigue en 8 bytes.** `geo` usa sus 4 bits reservados como flags (bits 28 a
   31). `mat = capa:12 | ao:8 | índice de paleta de luz:12`: desaparecen cielo, bloque y flags de

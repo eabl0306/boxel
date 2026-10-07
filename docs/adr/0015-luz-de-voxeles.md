@@ -1,6 +1,6 @@
 # ADR 0015: luz de vóxeles
 
-- Estado: aceptado (fases P0 y P1 hechas; P2 en adelante, pendientes)
+- Estado: aceptado (fases P0 a P6 hechas; P7, medir con la máquina libre, y P8, pendientes)
 - Fecha: 2026-10-06
 
 ## Contexto
@@ -76,9 +76,9 @@ mundo.
 - `BlockDef { emission: [u8; 3], light_opacity: u8 }` reemplaza a `light_emission: u8`.
   Validación (`RegistryError::InvalidLight`): cada canal y la opacidad valen como mucho 15, y la
   forma `Opaque` exige opacidad 15. `StateFlags::EMISSIVE` es "algún canal mayor que 0".
-- Contenido de fábrica: bloques opacos 15, hojas y agua 1, aire 0, ningún emisor. Las lámparas de
-  color llegan en P6. `BlockRegistryBuilder::with_default_blocks` permite agregar bloques
-  después de los de fábrica.
+- Contenido de fábrica: bloques opacos 15, hojas y agua 1, aire 0. En P0 no había emisores; P6
+  suma las lámparas de color y la lava provisoria (sección 10).
+  `BlockRegistryBuilder::with_default_blocks` permite agregar bloques después de los de fábrica.
 - `LightValue(u16)`: cielo en los bits 12 a 15, rojo 8 a 11, verde 4 a 7, azul 0 a 3. La emisión
   del registry usa el mismo formato con cielo 0.
 - `LightTables::from_registry`: tablas SoA de opacidad, emisión y clase (opaco, parcial, emite),
@@ -107,7 +107,7 @@ mundo.
   que no si hay uno.
 - Se borraron `ChunkData.light` y `LightStorage`.
 
-### 4. Techo de cielo por columna (P1, hecho; el mundo lo usa en P3)
+### 4. Techo de cielo por columna (P1 y P3, hecho)
 
 `T(x, z)` es el vóxel más alto con opacidad mayor que 0 en el contenido del mundo (generador más
 ediciones), nunca en "lo que está cargado". Por eso el streaming nunca cambia la luz: un chunk que
@@ -139,14 +139,21 @@ en o debajo de todos los techos de sus 9 columnas no tiene cielo directo. Si nin
 mundo llega al vacío dentro del límite (el overworld, o generadores acotados con columnas
 cerradas), eso vale para toda caja debajo del piso, sin pedir ningún tile.
 
+Debajo del rango del generador solo cuenta el contenido: un chunk cargado sin bloqueadores se lee
+igual que uno sin cargar (aire, o vacío si no hay contenido más abajo). Si no, el techo dependería
+de qué chunks de aire están cargados.
+
 Ediciones (P3): poner un bloqueador encima de `T` sube `T` (`SkyTile::raise`). Quitar el bloque de
 `T` busca el siguiente hacia abajo en los datos cargados (`SkyTile::rescan_column`); si la
-búsqueda sale de lo cargado, la columna vuelve a `Pending` y corre una caminata. Queda un caso
-para P3: en un mundo cuyas columnas llegan al vacío (uno de aire), una edición debajo del piso hace
-que una caminata nueva cierre en el piso todas las columnas abiertas del tile, y `raise` solo la
-suya.
+búsqueda sale de lo cargado o baja del rango del generador, la columna vuelve a `Pending` y corre
+una caminata. El caso que quedaba abierto en P1, un mundo cuyas columnas llegan al vacío: ahí el
+contenido debajo del piso decide si las columnas abiertas del tile terminan en el piso o siguen
+abiertas para siempre, así que toda edición de un bloqueador debajo del piso manda la columna a
+caminar de nuevo. Así los techos de un tile editado son siempre los de una caminata nueva.
+`LayerData::AirUntil` salta de una vez un tramo de aire (una plataforma a 2^50 vóxeles de altura
+no recorre 2^45 capas).
 
-### 5. Caja exacta por chunk (P1, hecho; corre dentro del job de malla en P3)
+### 5. Caja exacta por chunk (P1, hecho; corre dentro del job de malla desde P3)
 
 `boxel_light::compute` calcula la luz del chunk acolchado (local -1 a 32, lo que lee el mesher):
 
@@ -175,7 +182,7 @@ suya.
   64 KiB), que el mundo guarda dentro de `light_cache_radius` (8 chunks).
 - `LightScratch` ocupa unos 0.7 MiB por hilo.
 
-### 6. Malla: `PackedQuad` v2 con paleta de luz (P2)
+### 6. Malla: `PackedQuad` v2 con paleta de luz (P2, hecho)
 
 - El quad sigue en 8 bytes. `geo` usa sus 4 bits reservados como flags (bits 28 a 31). `mat`
   pasa a `capa:12 | ao:8 | índice de paleta de luz:12`. Desaparecen los campos cielo, bloque y
@@ -183,8 +190,11 @@ suya.
   `GEO_FLAGS_SHIFT = 28`, `MAT_LIGHT_SHIFT = 20` y `MAT_LIGHT_MASK = 0xFFF`.
 - Paleta por chunk de hasta 4096 entradas de 8 bytes (`[u32; 2]`: las 4 esquinas en
   `LightValue`, en el orden de esquinas del AO y de `common.wgsl`), en orden determinista de
-  primera aparición. Si se pasa de 4096, los canales de bloque del chunk se recuantizan a 3 bits y
-  se cuenta en las estadísticas.
+  primera aparición. Si se pasa de 4096, el chunk se vuelve a mallar con los canales de bloque a
+  3 bits (`LightQuantization::Block3`). Eso tampoco garantiza que entre (quedan 8192 valores por
+  esquina), así que hay un último nivel, `Flat`: cada cara toma una sola luz, el promedio de sus
+  esquinas con el bloque a 2 bits, que siempre entra (1024 valores). `ChunkMesh` guarda el nivel
+  y `headless_world` cuenta las mallas recuantizadas.
 - Luz de esquina: los 4 vóxeles de la capa de enfrente alrededor del vértice, sin los opacos (y
   sin el de la esquina cuando los dos laterales son opacos), promedio redondeado por canal. Depende
   solo del vértice, así que dos caras coplanares visibles que comparten el vértice ven lo mismo: un
@@ -199,30 +209,170 @@ suya.
   falta un fork en el repo de `binary-greedy-meshing` 0.5.2 (aviso MIT incluido) que fusione por
   clave de cara en lugar del `u16` del vóxel. El crate queda como dependencia de desarrollo para
   la prueba de regresión: con `AoPolicy::Off` y sin luz, los quads son idénticos byte a byte.
+- Implementación: `MeshInput.light` (`Option<&PaddedLight>`, `None` es cielo 15 en todo),
+  `MeshOptions { ao: AoPolicy }`, `Mesher::mesh(padded, light, materials, options, out)`. Con luz
+  uniforme la clave es el material (y el AO si va), sin tablas. Con luz completa, cada cara
+  visible lee sus 9 celdas de enfrente y busca su clave (material, AO, 4 esquinas) en una tabla
+  de direccionamiento abierto; la paleta solo se consulta para claves nuevas.
+  `reference_face_shading` es el oráculo de fuerza bruta de AO y luz por cara.
+- La política es `WorldSettings::ao_policy`. Como el AO lee vecinos de arista y esquina, una
+  edición remalla todo chunk cuya región acolchada contiene el vóxel (hasta 8), no solo los
+  vecinos de cara.
 
-### 7. GPU (P4)
+### 7. Mundo (P3, hecho)
+
+`boxel_world` calcula la luz dentro del job de malla. Sin estado nuevo por chunk, salvo la caché
+de gameplay.
+
+- **`SkyMap`** (recurso, `src/sky.rs`): un `SkyColumn` por columna de chunks con algún slot
+  cargado, creado con su primer slot y borrado con el último. Estado `Pending`, `InFlight
+  { version }` o `Exact(Arc<SkyTile>)`, más `version`, `edited` y el bloqueador editado más alto
+  (el comienzo `S` de la próxima caminata). Un resultado cuya `version` cambió se descarta y la
+  columna se camina de nuevo. Guarda también las capas de sus slots cargados, ordenadas: la
+  caminata, las bandas y la búsqueda del techo siguiente recorren solo esas capas, nunca el rango
+  numérico (un viewer a y = -2^40 en un mundo que llega al vacío, o una edición muy arriba de
+  otro viewer, no recorren 2^35 capas).
+- **Caminata perezosa** (`JobKind::SkyTile`, `JobId::Column`): una columna se camina solo cuando
+  una malla la necesita, así que un viewer hondo, con todas sus cajas debajo del piso, no camina
+  nada. Comparte el tope de jobs en vuelo y su prioridad es la de su slot más cercano al viewer.
+  Antes de arrancar espera los datos de las capas cargadas que va a leer (desde `S` hasta abajo
+  de la malla más baja que la espera), así casi no genera nada por su cuenta: lo que sí genera lo
+  cuenta `WorldStats::sky_private_generations`. Las capas cargadas las lee del snapshot (ahí
+  están las ediciones).
+- **Regla del mundo** (fija al arrancar): con `light` apagada no hay luz (mallas con cielo 15).
+  La imagen de antes necesita además `ao_policy: AoPolicy::Off`: sin luz toda cara cuenta como
+  iluminada y con la política por defecto lleva AO. Con un generador sin tope (`GeneratorTop::Unbounded`), luz sin techos: toda
+  columna abierta, con un aviso en el log. Con un generador vacío, solo las ediciones tapan el
+  cielo (sin piso). Con tope, el piso es el tope menos `sky_walk_limit`.
+- **`start_mesh`**: si la caja del chunk (su origen más 47) está en el piso o arriba, o si el
+  mundo puede llegar al vacío, espera que las 9 columnas de alrededor estén `Exact`; la malla
+  queda `Queued` y se agenda cuando llega el tile (`WorldStats::waiting_sky`). Debajo del piso
+  usa `SkyInput::BelowFloor`, sin tiles. El job toma un `LightScratch` y un `PaddedLight` por hilo,
+  corre `boxel_light::compute` y después malla. Dentro de `light_cache_radius` (8 chunks) guarda
+  también el `ChunkLight` del chunk, que lee `ChunkMap::light_at`.
+- **Caché de luz**: la luz guardada lleva la versión de datos y el `epoch` con que se calculó, y
+  solo es actual si siguen iguales (un job de malla fallido ya no deja luz vieja como actual). Un
+  chunk con malla dentro del radio cuyo job de malla no la guardó (todo aire, encerrado, un job
+  fallido, o que entró al radio después de mallarse) recibe un job de luz (`JobKind::Light`,
+  `WorldStats::light_jobs`): calcula solo la luz, con prioridad detrás de las mallas de la vista.
+  Un chunk uniforme de un bloque opaco sin emisión queda oscuro sin job. Cuando un viewer cambia
+  de chunk se recorren las cáscaras que entran y salen del radio: las que entran piden su luz,
+  las que salen la sueltan. `light_cache_radius` es como mucho 32.
+- **Publicación**: una malla igual a la publicada (mismo hash y mismos bytes) no se envía de
+  nuevo. Las mallas de un mismo lote de ediciones salen en el mismo frame: una que llega en el
+  frame N espera al resto hasta el frame N + `edit_batch_hold_frames` (2); si el resto tarda más,
+  sale en ese frame como está (`WorldStats::edit_batches_split`). Los resultados de un lote se
+  aplican antes que los del streaming, fuera del tope de eventos por frame, y sus jobs (y la
+  caminata que una edición manda a repetir) mantienen prioridad 0 aunque el viewer se mueva. Dos
+  lotes que tocan el mismo chunk se juntan; si el chunk tenía su malla retenida, esa malla ya es
+  vieja: se descarta y el chunk se remalla enseguida.
+- **Ediciones** (`apply_edits`), por vóxel cambiado `p`, todo en un lote con prioridad 0 y
+  `epoch` subido:
+  - Caras y AO: todo chunk cuya región acolchada contiene `p` (hasta 8).
+  - Si cambió la opacidad o la emisión: todo chunk cuya región acolchada toca la caja `p ± r`,
+    con `r` el alcance del cambio: el nivel más alto por canal de la luz vieja en `p` y sus 6
+    vecinos, y de la emisión vieja y la nueva, como mucho 14. La luz vieja sale de las cachés,
+    leídas antes de aplicar el lote; si falta una o no es la del contenido actual, `r` es 14.
+    Excavar en una cueva oscura remalla solo el chunk (o los de su región acolchada).
+  - Si se movió el techo: todo chunk cargado cuya región acolchada toca la banda de la columna,
+    14 vóxeles alrededor, desde 14 debajo del techo más bajo hasta 14 encima del más alto. Si la
+    columna vuelve a caminar, el tile nuevo se compara con el viejo y remalla las bandas de las
+    columnas que cambiaron, en el mismo lote.
+  - Descarga: un chunk cuya edición movió un techo se lleva la edición (todavía no hay
+    persistencia), así que su columna vuelve a caminar y remalla lo que cambie. Con el
+    `ChunkStore` persistente se guardarán los techos editados por columna.
+- **Coordenadas**: las cuentas de bandas y cajas usan `i64` con resta saturada; los techos se
+  comparan relativos a la caja dentro de `boxel_light`. El mismo mundo en x = 2^40 e y = -2^40
+  da los mismos bits.
+- **`reference`**: `Reference` recalcula tiles, luz y mallas desde cero (datos cargados y
+  generador, sin cachés ni caminos rápidos). Los tests comparan contra ella.
+
+### 8. GPU (P4, hecho)
 
 - La paleta vive en el arena de quads, justo después de los 8 buckets del chunk:
   `light_base = quad_base + total_quads`, en un relleno libre de `ChunkGpu` (offset 52; sigue en
-  64 bytes). High y Mid la leen del mismo storage buffer: ningún binding nuevo.
+  64 bytes), y `light_len`, las entradas de la paleta (offset 56). High y Mid la leen del mismo
+  storage buffer: ningún binding nuevo. Un índice que no es menor que `light_len` lee cielo
+  abierto, como en Low y en la CPU, nunca los datos de otro chunk. Cada chunk toma
+  `boxel_render::arena_len` entradas de 8 bytes: sus quads más su paleta, con al menos una entrada
+  (una malla hecha a mano sin paleta recibe una de cielo abierto, así ningún índice lee otro
+  chunk). `RenderStats::arena_used_quads` cuenta esas entradas. La subida escribe los quads y la
+  paleta en la misma copia.
 - Low recibe la paleta expandida por quad en un segundo vertex buffer por instancia
   (`Uint32x2` en `@location(1)`), paralelo al arena con los mismos offsets: un atributo, no un
   binding, así que la regla de ADR 0011 se mantiene. `boxel_gfx::tier::floors::VERTEX_BUFFERS`
-  pasa de 1 a 2. Low paga 8 bytes más por quad (16 en total).
+  pasa de 1 a 2 (en todos los tiers, como el resto de los pisos). Low reserva ese buffer entero
+  al crear el renderer, del tamaño del arena (64 MiB con los 8 Mi de entradas por defecto, haya
+  quads o no): un costo fijo de VRAM. Cada tramo de mallas que sube tiene una segunda copia a ese buffer; la entrada de
+  cada quad se arma al escribir el buffer temporal (un índice fuera de la paleta lee cielo
+  abierto).
 - `ViewUniform` pasa de 240 a 336 bytes (solo `vec4`, std140): `sky_light` (color del cielo por
   luz del día, y piso de ambiente), `light_params` (fuerza del AO, 0.55 por defecto, igual al
-  `mix(0.45, 1, ao)` de hoy; ganancia de luz de bloque) y `light_curve` (16 niveles).
-- Fragment: interpolación bilineal por canal de las 4 esquinas en (s, t) del quad;
-  `luz = max(curva(cielo) * sky_light.rgb, curva(rgb) * ganancia, ambiente)`;
-  `color = albedo * sombreado de cara * mix(1 - fuerza_ao, 1, ao / 3) * luz`, después niebla. Con
-  cielo 15 al mediodía y AO abierto da la imagen de hoy. Igual en todos los tiers.
+  `mix(0.45, 1, ao)` de antes; ganancia de luz de bloque) y `light_curve` (16 niveles).
+- Fragment (`common.wgsl`: `corner_light`, `level_curve`, `voxel_light`, `ao_factor`,
+  `shade_fragment`): interpolación bilineal por canal de las 4 esquinas en (s, t) del quad,
+  escrita como `a + (b - a) * s` para que 4 esquinas iguales den su valor exacto;
+  `luz = max(curva(cielo) * sky_light.rgb, curva(rgb) * ganancia, ambiente)`, con la curva
+  indexada en el uniform (una copia local indexada en tiempo de ejecución puede ir a memoria
+  scratch; su costo se mide en P7);
+  `color = albedo * sombreado de cara * mix(1 - fuerza_ao, 1, ao / 3) * luz`, con el AO también
+  bilineal (antes era lineal por triángulo), después niebla. Con cielo 15 al mediodía y AO
+  abierto da la imagen de antes. Igual en todos los tiers. `VsOut` cambia `shade` por la cara,
+  (s, t), la entrada de paleta y el byte de AO (los tres enteros, planos).
+- Rust: `SceneLight` (color del cielo por la luz del día, ambiente, fuerza del AO, ganancia y
+  curva) va en `ViewParams::light`; `ViewParams::clear_color` es el color de fondo del frame (el
+  renderer ya no lo toma de su configuración: `RendererConfig::clear_color` desaparece y
+  `DEFAULT_SKY_COLOR` es el de antes). `light_curve(gamma)` es la curva de Minecraft
+  `f / (4 - 3f)`, llevada hacia `1 - (1 - b)^4` por la gamma; por defecto gamma 0 (la curva
+  "moody"). `RenderSettings` suma `ao_strength`, `block_light_gain` y `light_gamma`; su
+  `clear_color` queda como el cielo de las apps sin reloj.
 
-### 8. Día y noche (P5)
+### 9. Día y noche (P5, hecho)
 
-Solo un uniform: sin remallado y sin subidas. `TimeOfDay` avanza en `FixedUpdate` (64 Hz; un día
-de 20 minutos son 76 800 ticks). La luz de bloque se ve igual al mediodía y a medianoche.
+Solo un uniform: sin remallado y sin subidas.
 
-### 9. Más adelante (P8)
+- `boxel_world::TimeOfDay { tick, ticks_per_day, paused, speed }` avanza `speed` ticks por paso
+  de `FixedUpdate` (64 Hz; un día de 20 minutos son 76 800 ticks), así el reloj no depende de los
+  fps. El tick 0 de cada día es la salida del sol (06:00), un cuarto de día el mediodía y tres
+  cuartos la medianoche. Empieza al mediodía. `scrub` mueve la hora dentro del día.
+- `DaylightCurve` da, según la altura del sol (el seno de la fracción del día), la luz del cielo
+  (tinte por intensidad), el color del cielo (fondo y niebla) y el piso de ambiente: día blanco a
+  1.0 desde que el seno llega a 0.25, atardecer cálido (1.0, 0.75, 0.55) a 0.6 con el sol en el
+  horizonte, noche azul a 0.2 desde -0.2, con smoothstep entre ellos; el amanecer es igual al
+  atardecer. El tinte de noche es el (0.30, 0.35, 0.55) del plan escalado para que su canal más
+  brillante valga 1, así "20 % de brillo" es el brillo real del azul. El ambiente es 0.02 a toda
+  hora.
+- `DaylightPlugin` (en `DefaultPlugins`) agrega los dos recursos y el sistema. El `Extract` del
+  render arma la `SceneLight` y el color del cielo del frame con ellos; sin el plugin queda un
+  mediodía con `RenderSettings::clear_color`.
+- `voxel_world`: `[` y `]` mueven el reloj una hora, T lo pausa, F lo acelera 60 veces (G es
+  caminar) y `--time HH:MM` elige la hora de inicio; las corridas con `--frames` dejan el reloj
+  quieto.
+  `stress --time HH:MM` fija la hora y el reloj queda quieto toda la corrida.
+
+La luz de bloque se ve igual al mediodía y a medianoche (lo verifica `gpu_terrain`).
+
+### 10. Contenido y herramientas (P6, hecho)
+
+- Emisores de cubo completo en `BlockRegistry::default_blocks` (estados 12 a 16, después de los
+  de antes): lámparas naranja (14, 11, 6), roja (14, 2, 2), azul (3, 6, 14) y blanca
+  (15, 15, 15), y la lava provisoria (15, 7, 2), opaca y sólida hasta que haya fluidos
+  (`boxel_voxel::LAMPS`, `LAVA_EMISSION`). Cada uno tiene su textura con puntos brillantes. Su
+  cara se ilumina con la luz del vóxel de enfrente (la emisión menos 1): no hay superficies que
+  brillen solas todavía. Las antorchas esperan a las formas que no son cubos.
+- Overlay F3: la luz (cielo y RGB) del vóxel del ojo y del vóxel al que apunta la mira
+  (`boxel_debug::CrosshairTarget`, que las apps con picking llenan con la celda delante de la cara
+  apuntada), y la hora del reloj. La luz sale de `ChunkMap::light_at` (dentro de
+  `light_cache_radius`, también en chunks de puro aire; afuera, o mientras su job de luz no
+  termina, muestra `-`).
+- `voxel_world`: las lámparas en las teclas 7 a 0 y `--lamps`, que pone lámparas y lava alrededor
+  del inicio y empieza a las 21:00.
+- `stress --edits`: una edición por segundo durante la medición (poner una lámpara y sacarla,
+  cavar un pozo de 24 bloques y taparlo); el resumen da los frames hasta que el mundo vuelve a
+  estar quieto y los lotes retenidos o partidos. `headless_world` suma `arena_entries` a su línea
+  `light:` (quads más paletas).
+
+### 11. Más adelante (P8)
 
 AO desde ocupación en GPU en High y Mid si el gate G1 o las mediciones lo piden; cascadas de
 sombras del sol en High (profundidad con solo `geo`, el cielo horneado como máscara de
@@ -230,10 +380,10 @@ exterior); luces dinámicas en el shader; vidrio teñido.
 
 ### Fases
 
-P0 (datos de bloque, máscaras, este ADR) y P1 (`boxel_light`) están hechas. Siguen P2 (mesher),
-P3 (integración en `boxel_world`: `SkyMap`, jobs de caminata, luz en `start_mesh`, ediciones con
-lotes atómicos), P4 (render), P5 (día y noche), P6 (contenido: lámparas de color y lava
-provisoria), P7 (medir con la máquina libre y decidir) y P8.
+P0 (datos de bloque, máscaras, este ADR), P1 (`boxel_light`), P2 (mesher), P3 (integración en
+`boxel_world`: `SkyMap`, jobs de caminata, luz en `start_mesh`, ediciones con lotes atómicos), P4
+(render), P5 (día y noche) y P6 (lámparas de color, lava provisoria, overlay y herramientas) están
+hechas. Siguen P7 (medir con la máquina libre y decidir) y P8.
 
 ### Valores por defecto (decisiones abiertas del dueño)
 
@@ -283,14 +433,90 @@ cielo en la superficie, de bloque en las lámparas) y que la caja de superficie 
   por chunk no uniforme: a y = -1000 eran unos 155 MiB a radio 16 y 630 MiB a radio 32, encima de
   66 y 244 MiB de vóxeles. En superficie (y = 80) el techo es 8 KiB por chunk con malla: como mucho
   52 MiB a radio 16 y 210 MiB a radio 32, menos en la práctica.
-- Hasta P2 y P4 no cambia nada en pantalla: el mesher y el renderer no se tocaron y los quads
-  siguen en v1.
-- Riesgos abiertos: el AO en la clave del merge infla los quads (gate G1 en P3); Low paga 8 bytes
-  más por quad (16 en total); una paleta con más de 4096 entradas pierde precisión en los canales
-  de bloque; las ediciones de luz remallan hasta 8 chunks.
+- P0 y P1 no cambiaron nada en pantalla. P2 pasa los quads a v2 y el mundo ya hornea AO, que el
+  shader de hoy dibuja. P3 calcula la luz en el mundo (las caras oscuras pierden su AO); la luz se
+  ve con P4 (el shader la lee).
+- Riesgos abiertos: Low reserva un segundo buffer del tamaño del arena (64 MiB por defecto),
+  ocupado o no; una paleta con más de 4096
+  entradas pierde precisión en los canales de bloque; las ediciones de luz remallan hasta 8
+  chunks, más las bandas de los techos que se mueven; un viewer cuya vista toca los 1024 vóxeles
+  bajo el tope camina las columnas generando la superficie (abajo). El AO en la clave del merge
+  pasó el gate G1 (abajo).
+
+**P2 (mesher), medido el 2026-10-06** con criterion (release), cada bench después de
+`tools/wait-idle.sh`, en la máquina compartida con otros builds (load average de 3 a 7): números
+indicativos, se repiten en P7.
+
+| Bench | Medido | Objetivo |
+|---|---|---|
+| `mesh/cave` (AO apagado, sin luz: el camino de bgm) | 19.6 µs | 1.15x de 28.8 µs o menos |
+| `gather_mesh/cave` (luz uniforme oscura, AO solo en caras con luz) | 82.4 µs | 1.1x de 91.5 µs o menos |
+| `gather_mesh/cave_lit` (146 lámparas, luz calculada antes) | 103 µs | 160 µs o menos |
+| `gather_mesh/surface` (luz de cielo y claves de AO, luz calculada antes) | 143 µs | 150 µs o menos |
+
+En la superficie (2993 caras visibles), solo el paso de malla: 19 µs sin AO ni luz, 33 µs con AO
+en todas las caras y 82 µs con la luz. La luz cuesta sobre todo el promedio de las esquinas (cada
+celda se expande una vez a carriles de 16 bits y las 4 esquinas se suman en paralelo) y la
+búsqueda de la clave.
+
+Quads de `headless_world` a radio 16 (sin luz todavía: con `lit-only` toda cara tiene luz, así
+que da lo mismo que `baked`):
+
+| Mundo | `--ao off` | `--ao baked` y `lit-only` |
+|---|---|---|
+| overworld, y = 80 | 4 222 233 | 7 330 180 (1.74x) |
+| overworld, y = -1000 | 8 407 250 | 14 669 107 (1.74x) |
+| forest, y = 80 | 439 764 | 717 965 (1.63x) |
+
+- Hasta P3 el mundo paga el AO en todas las caras, cuevas incluidas: bajo tierra a radio 16 son
+  14.7 M quads en lugar de 8.4 M (con la luz de P3, 8.4 M: abajo). Con la luz de P3 las cuevas oscuras vuelven a fusionarse como
+  con AO apagado (estimado 1.0 a 1.05x); el gate G1 de P3 lo mide.
+- Las paletas son de 1 entrada mientras la luz sea uniforme. En los benches: 74 entradas en la
+  superficie con árboles y 411 en la cueva con lámparas.
+- El fork de bgm fusiona una cara a la vez y saca los quads ya en forma canónica (sin pasar por
+  los vértices de bgm): `mesh/cave` con AO apagado da 19.6 µs contra los 28.8 µs medidos antes.
+- Memoria: el `Mesher` de cada hilo pasa de unos 210 KiB a unos 0.6 MiB (claves de 34³ en `u32`,
+  la paleta y la tabla de claves).
+
+**P3 (mundo), medido el 2026-10-06** con `headless_world` (release, `--hz 0`). Los quads no
+dependen de la carga de la máquina. Gate G1, quads contra hoy (luz apagada y AO apagado), con luz
+y AO `lit-only` (el valor por defecto):
+
+| Vista | Hoy | Con luz | Relación | Límite |
+|---|---|---|---|---|
+| forest, radio 16, y = 80 | 439 764 | 766 460 | 1.74x | 1.9x |
+| overworld, radio 16, y = 80 | 4 222 233 | 4 562 418 | 1.08x | 1.25x |
+| overworld, radio 16, y = -1000 | 8 407 250 | 8 407 250 | 1.00x | 1.10x |
+| overworld, radio 32, y = 80 | 16 690 909 | 18 043 891 | 1.08x | 22 M |
+| overworld, radio 32, y = -1000 | 33 613 075 | 33 613 075 | 1.00x | |
+| forest, radio 32, y = 80 | 1 760 326 | 3 076 455 | 1.75x | |
+
+El forest a y = -1000 no tiene nada (está debajo de su fondo). G1 pasa: queda `BakedLitOnly`.
+
+- AO omitido en caras oscuras contra AO en todas (`--ao baked`), con luz, a radio 16: overworld
+  y = 80, 4.56 M contra 7.38 M; y = -1000, 8.41 M contra 14.67 M; forest igual (todo tiene luz).
+  Sin AO (`--ao off`) la luz sola cuesta 1.03x en el overworld (las claves de luz parten algunas
+  fusiones) y 1.27x en el forest (las sombras de los árboles).
+- Caminos de la luz y caminatas a radio 16: overworld y = 80, 1690 cajas con inundación y 5266
+  rápidas, 933 columnas caminadas con 1 generación privada; forest, 1645 y 1934, 933 caminatas,
+  ninguna privada. A y = -1000 todas las cajas son rápidas, pero las 6 capas más altas de la
+  vista quedan a menos de 1024 vóxeles del tope del generador, así que las 933 columnas se
+  caminan y generan 2540 chunks de superficie que no están cargados (unos 2.7 por columna).
+- Memoria: la caché de luz de gameplay, 4.6 MiB (radio 8); los tiles, 7.4 MiB a radio 16 y
+  27.7 MiB a radio 32. Paletas: p50 1, p99 38, máximo 222, ninguna recuantizada.
+- P3 no suma benches de criterion: el trabajo nuevo de la luz son las funciones medidas en P1.
 
 Cambios de API que rompen:
 
+- `PackedQuad`: se van `with_light`, `sky` y `block_light`; entran `with_light_index`,
+  `light_index`, `with_flags`, `flags`, `with_ao_byte` y `ao_byte`. En `layout` se van
+  `MAT_SKY_SHIFT`, `MAT_BLOCK_SHIFT` y `MAT_FLAGS_SHIFT`; entran `GEO_FLAGS_SHIFT`,
+  `MAT_LIGHT_SHIFT` y `MAT_LIGHT_MASK` (también en `common.wgsl`).
+- `ChunkMesh` suma `palette`, `light_quantization` y `hash` (`ChunkMesh::from_quads` arma una a
+  mano con la paleta de cielo abierto). `MeshInput` suma `light`; `Mesher::mesh` y
+  `Mesher::mesh_chunk` toman la luz y `MeshOptions`. `WorldSettings` suma `ao_policy`.
+- `boxel_mesh` depende de `boxel_light`; `binary-greedy-meshing` queda solo como dependencia de
+  desarrollo.
 - `BlockDef.light_emission` desaparece: `emission: [u8; 3]` y `light_opacity: u8`.
   `BlockRegistry::light_emission` pasa a `emission` (devuelve `LightValue`) y `light_opacity`.
   Nuevos: `RegistryError::InvalidLight` y `BlockRegistryBuilder::with_default_blocks`.
@@ -299,6 +525,36 @@ Cambios de API que rompen:
   `has_cached_light_masks`, los tipos `LightMasks`, `MaskRows` y `OwnedLightMasks`, y
   `heap_bytes` cuenta las máscaras construidas.
 - Nuevo crate `boxel_light` (depende solo de `boxel_voxel`).
+- P3: `WorldSettings` suma `light`, `sky_walk_limit`, `light_cache_radius` y
+  `edit_batch_hold_frames`; `WorldContent` suma `light_tables` y `WorldContent::new`;
+  `WorldStats` suma `light_full`, `light_fast`, `sky_columns`, `sky_walks`,
+  `sky_private_generations`, `waiting_sky`, `edit_batches_held`, `edit_batches_split` y
+  `light_fanout`. Nuevos: el recurso `SkyMap`, `ColumnId`, `ChunkMap::light_at`,
+  `ChunkSlot::light` y el módulo `reference`. En `scheduler`, `JobKind::SkyTile` y los jobs se
+  identifican con `JobId` (`Chunk` o `Column`) en lugar de `ChunkId`. `boxel_light` suma
+  `LayerData::AirUntil`. `boxel_world` depende de `boxel_light`. Una malla igual a la publicada
+  ya no genera un `ChunkMeshEvent::Upsert`.
+- P4: `RendererConfig::clear_color` desaparece; `ViewParams` suma `clear_color` y `light`
+  (`SceneLight`), y `ViewParams::from_camera` toma el color del cielo para el fondo y la niebla.
+  Nuevos: `SceneLight`, `light_curve`, `LIGHT_LEVELS`, `DEFAULT_SKY_COLOR` y `arena_len` en
+  `boxel_render`; `RenderSettings` suma `ao_strength`, `block_light_gain` y `light_gamma`.
+  `RenderStats::arena_used_quads` cuenta quads más paletas. `ChunkGpu` cambia `pad: [u32; 3]`
+  por `light_base` y `pad: [u32; 2]`; `ViewUniform` suma `sky_light`, `light_params` y
+  `light_curve`. `floors::VERTEX_BUFFERS` pasa a 2: un adaptador con un solo vertex buffer ya no
+  entra en ningún tier. En WGSL, `decode_quad` toma la entrada de paleta y `VsOut` cambia `shade`
+  por `face`, `st`, `light` y `ao`.
+- Revisión de P2 a P6: `WorldStats` suma `light_jobs`; `ChunkSlot::light` devuelve
+  `Option<&ChunkLight>`; `scheduler` suma `JobKind::Light`; `ChunkGpu` cambia `pad: [u32; 2]`
+  por `light_len` y `pad`; `light_cache_radius` se limita a 32. `TimeOfDay::set_clock` toma el
+  primer tick en la hora pedida o después, y `clock_text` cuenta minutos enteros, así
+  `--time HH:MM` muestra `HH:MM`.
+- P5: nuevos en `boxel_world`: `TimeOfDay`, `DaylightCurve`, `Daylight`, `SkyKey`,
+  `DaylightPlugin` (en `DefaultPlugins`) y las constantes `DEFAULT_TICKS_PER_DAY`,
+  `TICKS_PER_SECOND` y `SUNRISE_HOUR`.
+- P6: `BlockRegistry::default_blocks` pasa de 12 a 17 estados y de 13 a 18 texturas, y el
+  registry de fábrica ya tiene emisores (`LightTables::any_emitter` es verdadero). Nuevos:
+  `boxel_voxel::{BuiltinLamp, LAMPS, LAVA_EMISSION}`, `boxel_debug::{CrosshairTarget,
+  LightProbe}` y los campos `light` y `time` de `OverlayInputs`.
 
 Tests que lo vigilan:
 
@@ -315,11 +571,70 @@ Tests que lo vigilan:
   15 en el fondo, y una lámpara quitada o fuera de la caja que no impide los caminos rápidos.
 - `boxel_light/tests/far_coords.rs`: el mismo vecindario en 0, ±2^31, ±2^40 y
   `MAX_BLOCK_COORD - 64` da los mismos bits.
+- `boxel_mesh/tests/oracle.rs`: con luz aleatoria (ausente, uniforme, suave con luces de color,
+  en bloques, en banda y ruido) y cada política de AO, cada quad expandido a caras unitarias y
+  leído por la paleta es igual a `reference_face_shading` (al nivel de cuantización de la malla);
+  volver a mallar con un `Mesher` usado da la misma malla, hash incluido. La recuantización
+  forzada: una banda de luz cae en `Block3` y el ruido en `Flat`.
+- `boxel_mesh/tests/bgm_regression.rs`: con AO apagado y sin luz (o luz uniforme, o luz oscura
+  con `BakedLitOnly`) los quads son idénticos byte a byte a los de bgm 0.5.2.
+- `boxel_mesh/tests/mesher.rs`: el AO de un piso junto a una pared sigue la política, las hojas no
+  dan AO, la luz parte las fusiones y la paleta es determinista. En `boxel_world`, una edición en
+  un borde remalla también el vecino de arista (`padded_neighbors`, contra fuerza bruta).
 - `boxel_light/tests/sky_walk.rs`: la caminata igual a un recorrido de fuerza bruta de los chunks
   generados (overworld con árboles y entradas, forest, terrain y flat, cerca y en 2^40), el
   límite, el vacío, la búsqueda después de una edición, una edición 5000 vóxeles arriba que solo
-  cambia su columna (la edición aplicada al tile es igual a una caminata nueva), tiles sin piso y
-  generadores sin tope.
+  cambia su columna (la edición aplicada al tile es igual a una caminata nueva), tiles sin piso,
+  generadores sin tope y `AirUntil` (una plataforma a 2^50 se camina en pocas capas).
+- `boxel_world/src/tests/light.rs` (P3, mesher real; cada caso compara las mallas con
+  `Reference`): las mallas no dependen del camino del viewer (volar, bajar, teletransportarse),
+  del ejecutor ni de los hilos (1 y 6); un mundo en reposo malla cada chunk una vez; ediciones
+  al azar dejan cada malla igual a la de cero y todo chunk que cambió fue remallado; quitar una
+  lámpara es igual a no ponerla; cavar en una cueva oscura remalla solo su chunk, y ahí abajo no
+  se camina ninguna columna; un pozo tiene cielo 15 en el fondo y queda oscuro al taparlo; el
+  límite de la caminata corta un pozo más hondo; una plataforma a +5000 sombrea el suelo y al
+  descargarse se lleva la sombra; contenido debajo del piso cierra en el piso las columnas
+  abiertas (y al quitarlo vuelven a abrirse); un lote de ediciones sale en un frame, o en partes
+  pasado `edit_batch_hold_frames`; una segunda edición de un chunk retenido sale en el mismo
+  frame que la primera; las ediciones pasan delante de una cola de mallas del streaming; la caché
+  de luz sigue a un viewer que avanza 17 chunks (y cavar allá remalla solo el chunk); los chunks
+  de puro aire cerca del viewer guardan su luz; el mismo mundo en x = 2^40, y = -2^40 da los
+  mismos bits.
+- `boxel_world/src/streaming/tests/sky.rs`: las caminatas esperan los datos cargados y no
+  generan nada; una caminata que leyó contenido editado se repite; un chunk editado que se
+  descarga devuelve su columna a una caminata; generadores sin tope o vacíos; viewers a 2^35
+  capas en las mismas columnas, con bloques bajo el piso y muy arriba, se asientan enseguida.
+  En `streaming/tests.rs`, un remallado fallido no deja luz vieja como actual y los jobs de un
+  lote siguen en prioridad 0 cuando el viewer se mueve. En `sky.rs`, las
+  reglas según el rango del generador, `padded_chunks` contra fuerza bruta y las caminatas con
+  capas capturadas, el vacío y el contenido fuera del generador.
+- `boxel_world/tests/integration.rs`: cada malla del terreno real, también después de editar,
+  igual a la de `Reference`; `light_at` lee la caché.
+- `boxel_shaders/tests/naga.rs` (P4): las constantes de `LightValue` en WGSL, `View` de 336 B,
+  `light_base` en el offset 52, Low con dos atributos de instancia `Uint32x2` y un solo uniform
+  block; High y Mid con un atributo. `boxel_gfx/tests/policy.rs`: todo tier pide 2 vertex
+  buffers y con 1 no clasifica.
+- `boxel_render/tests/gpu_terrain.rs` (P4 y P5): una escena iluminada hecha a mano (árbol,
+  alero, pared baja junto a suelo con sol, cueva cerrada con lámparas roja, azul y naranja) con la
+  luz calculada como la calcula el mundo, en 7 vistas (mediodía y medianoche). Los píxeles son
+  idénticos en High, Mid y Low y en cada posición de `FAR_SHIFTS`, donde las mallas salen iguales
+  byte a byte; la cueva es igual al mediodía y a medianoche; la noche tiene como mucho la mitad
+  del brillo del día; la cueva tiene píxeles rojos y azules; bajo el árbol, el alero y junto a la
+  pared la imagen es más oscura que sin luz ni AO.
+- `boxel_render` (unitarios): el smoke test de cada tier dibuja un quad opaco con luz azul
+  (entrada 0) bajo un quad cutout más chico con luz roja (entrada 1), y falla si el centro no
+  sale rojo o una esquina no sale azul (así cada quad recibe su entrada también en GL, donde el
+  primer instance del draw cutout se emula por buffer); `gpu_tiers` comprueba que un índice
+  fuera de la paleta da cielo abierto en cada tier;
+  la paleta va detrás de los quads en el arena y en Low cada quad recibe su entrada; la escena
+  sigue al reloj del mundo. `gpu_tiers` cuenta las entradas de paleta en el arena lleno.
+- `boxel_world/src/daylight.rs` (P5): un día son 76 800 pasos fijos, los ticks son
+  deterministas (pausa y velocidad incluidas), mover la hora da la vuelta dentro del día y la
+  curva da 1.0 blanco al mediodía, 0.2 azul a medianoche, 0.6 cálido en el horizonte y 0.02 de
+  ambiente a toda hora.
+- P6: el registry de fábrica fija los estados 12 a 16 y sus emisiones (`contract.rs`,
+  `masks.rs`); el overlay muestra la luz del ojo y de la mira y la hora; `voxel_world` y `stress`
+  prueban `--time`, `--lamps` y el guion de `--edits`.
 
 ## Alternativas descartadas
 
@@ -340,5 +655,5 @@ Tests que lo vigilan:
   entradas que dan a cavernas.
 - **En High y Mid, un buffer lateral de luz de 8 bytes por quad, o quads de 16 bytes**: el doble
   de memoria de quads (unos 290 MB contra 145 MB a radio 16 bajo tierra). Solo Low lo paga
-  (sección 7), porque no puede leer la paleta de un storage buffer.
+  (sección 8), porque no puede leer la paleta de un storage buffer.
 - **Mezcla aditiva de colores**: necesita un BFS por fuente y satura.

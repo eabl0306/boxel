@@ -40,6 +40,7 @@ boxel_shaders = { path = "crates/boxel_shaders", version = "0.1.0-dev" }
 boxel_render = { path = "crates/boxel_render", version = "0.1.0-dev" }
 boxel_voxel = { path = "crates/boxel_voxel", version = "0.1.0-dev" }
 boxel_mesh = { path = "crates/boxel_mesh", version = "0.1.0-dev" }
+boxel_light = { path = "crates/boxel_light", version = "0.1.0-dev" }
 boxel_worldgen = { path = "crates/boxel_worldgen", version = "0.1.0-dev" }
 boxel_world = { path = "crates/boxel_world", version = "0.1.0-dev" }
 boxel_debug = { path = "crates/boxel_debug", version = "0.1.0-dev" }
@@ -193,6 +194,13 @@ test = true
 [[example]]
 name = "stress"
 required-features = ["render", "voxel"]
+test = true
+
+# Headless screenshots: the world streamed around a camera, rendered offscreen to PNGs.
+[[example]]
+name = "snapshot"
+required-features = ["render", "voxel", "png"]
+# Runs its option tests with `cargo test`.
 test = true
 
 # Profiles only apply to this workspace's own examples/tests/benches.

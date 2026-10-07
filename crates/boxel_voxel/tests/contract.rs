@@ -125,6 +125,11 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
         "boxel:leaves",
         "boxel:water",
         "boxel:planks",
+        "boxel:lamp_orange",
+        "boxel:lamp_red",
+        "boxel:lamp_blue",
+        "boxel:lamp_white",
+        "boxel:lava",
     ];
     assert_eq!(r.len(), names.len());
     for (i, n) in names.iter().enumerate() {
@@ -138,7 +143,13 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
     assert_eq!(tex(grass, Face::PosY), "boxel:grass_top");
     assert_eq!(tex(grass, Face::NegY), "boxel:dirt");
     assert_eq!(tex(grass, Face::PosX), "boxel:grass_side");
-    assert_eq!(r.textures().len(), 13);
+    assert_eq!(r.textures().len(), 18);
+    // The emitters: opaque solid cubes with their own texture.
+    for (i, name) in names.iter().enumerate().skip(12) {
+        let s = BlockState(i as u16);
+        assert_eq!(r.shape(s), RenderShape::Opaque, "{name}");
+        assert_eq!(tex(s, Face::PosX), *name);
+    }
 }
 
 #[test]

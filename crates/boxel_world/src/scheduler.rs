@@ -1,6 +1,6 @@
 //! Priority job queue with a bounded number of jobs in flight (neither rayon nor `boxel_tasks`
 //! have priorities).
-use crate::ChunkId;
+use crate::{ChunkId, ColumnId};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
@@ -9,8 +9,12 @@ use std::collections::BinaryHeap;
 pub enum JobKind {
     /// Generate data.
     Generate,
-    /// Build a mesh.
+    /// Build a mesh (and the chunk's light, ADR 0015).
     Mesh,
+    /// Walk a chunk column down for its sky tops (ADR 0015).
+    SkyTile,
+    /// Compute a chunk's light for the light cache, without a mesh (ADR 0015).
+    Light,
 }
 
 impl JobKind {
@@ -19,26 +23,52 @@ impl JobKind {
         match self {
             JobKind::Generate => 0,
             JobKind::Mesh => 1,
+            JobKind::SkyTile => 2,
+            JobKind::Light => 3,
         }
     }
     const fn from_code(code: u8) -> Self {
         match code {
             0 => JobKind::Generate,
-            _ => JobKind::Mesh,
+            1 => JobKind::Mesh,
+            2 => JobKind::SkyTile,
+            _ => JobKind::Light,
         }
     }
 }
 
+/// What a job works on: a chunk slot (generation, meshing) or a chunk column (sky tops).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum JobId {
+    /// A chunk slot of the `ChunkMap`.
+    Chunk(ChunkId),
+    /// A chunk column of the `SkyMap`.
+    Column(ColumnId),
+}
+
+impl From<ChunkId> for JobId {
+    fn from(id: ChunkId) -> Self {
+        JobId::Chunk(id)
+    }
+}
+
+impl From<ColumnId> for JobId {
+    fn from(id: ColumnId) -> Self {
+        JobId::Column(id)
+    }
+}
+
 /// A queued job. Lower `priority` runs first (squared chunk distance to the nearest viewer;
-/// edit remeshes use 0). Ties: FIFO by `seq`.
+/// edit remeshes use 0, light jobs add a bias that puts them after the view's meshes). Ties:
+/// FIFO by `seq`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QueuedJob {
     /// Priority (lower first).
     pub priority: u32,
     /// Insertion counter.
     pub seq: u64,
-    /// Target chunk.
-    pub id: ChunkId,
+    /// Target chunk or column.
+    pub id: JobId,
     /// Kind.
     pub kind: JobKind,
 }
@@ -59,8 +89,8 @@ pub struct QueuedJob {
 /// a job when no stale job may have to run first.
 #[derive(Debug, Default)]
 pub struct JobScheduler {
-    heap: BinaryHeap<Reverse<(u32, u64, ChunkId, u8)>>,
-    stale: BinaryHeap<Reverse<(u32, u64, ChunkId, u8)>>,
+    heap: BinaryHeap<Reverse<(u32, u64, JobId, u8)>>,
+    stale: BinaryHeap<Reverse<(u32, u64, JobId, u8)>>,
     /// Chunks by which the distance of a stale job to its nearest viewer may have shrunk since its
     /// priority was computed (`u32::MAX`: unknown).
     drift: u32,
@@ -87,10 +117,11 @@ impl JobScheduler {
         }
     }
     /// Queues a job.
-    pub fn push(&mut self, id: ChunkId, kind: JobKind, priority: u32) {
+    pub fn push(&mut self, id: impl Into<JobId>, kind: JobKind, priority: u32) {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        self.heap.push(Reverse((priority, seq, id, kind.code())));
+        self.heap
+            .push(Reverse((priority, seq, id.into(), kind.code())));
     }
     /// Pops the best refreshed job if below the in-flight cap (and counts it as in flight).
     /// Returns `None` while a stale job may have to run before it (or only stale jobs are left):
@@ -131,7 +162,7 @@ impl JobScheduler {
     pub fn refresh_priorities(
         &mut self,
         max: usize,
-        mut f: impl FnMut(ChunkId, JobKind) -> Option<u32>,
+        mut f: impl FnMut(JobId, JobKind) -> Option<u32>,
     ) -> usize {
         let mut done = 0;
         while done < max && self.refresh_one(&mut f) {
@@ -146,7 +177,7 @@ impl JobScheduler {
     pub fn refresh_ahead(
         &mut self,
         max: usize,
-        mut f: impl FnMut(ChunkId, JobKind) -> Option<u32>,
+        mut f: impl FnMut(JobId, JobKind) -> Option<u32>,
     ) -> usize {
         let mut done = 0;
         while done < max && self.stale_may_come_first() && self.refresh_one(&mut f) {
@@ -156,7 +187,7 @@ impl JobScheduler {
     }
     /// Rebuilds every priority at once (`f` returns `None` to drop a job). Insertion order
     /// (`seq`) is kept, so ties stay FIFO.
-    pub fn reprioritize(&mut self, f: impl FnMut(ChunkId, JobKind) -> Option<u32>) {
+    pub fn reprioritize(&mut self, f: impl FnMut(JobId, JobKind) -> Option<u32>) {
         self.invalidate_priorities(u32::MAX);
         self.refresh_priorities(usize::MAX, f);
     }
@@ -170,7 +201,7 @@ impl JobScheduler {
             .is_none_or(|Reverse((best, ..))| lowest_priority(*stale, self.drift) < *best)
     }
     /// Refreshes the nearest stale job under the old priorities. False if none is stale.
-    fn refresh_one(&mut self, f: &mut impl FnMut(ChunkId, JobKind) -> Option<u32>) -> bool {
+    fn refresh_one(&mut self, f: &mut impl FnMut(JobId, JobKind) -> Option<u32>) -> bool {
         let Some(Reverse((_, seq, id, code))) = self.stale.pop() else {
             return false;
         };
@@ -209,16 +240,16 @@ impl JobScheduler {
 mod tests {
     use super::*;
 
-    fn ids(n: usize) -> Vec<ChunkId> {
+    fn ids(n: usize) -> Vec<JobId> {
         let mut slots = slotmap::SlotMap::<ChunkId, ()>::with_key();
-        (0..n).map(|_| slots.insert(())).collect()
+        (0..n).map(|_| JobId::Chunk(slots.insert(()))).collect()
     }
 
     /// Pops every job, refreshing the stale ones that may come first with `f`.
     fn drain_with(
         s: &mut JobScheduler,
-        mut f: impl FnMut(ChunkId, JobKind) -> Option<u32>,
-    ) -> Vec<(ChunkId, JobKind, u32)> {
+        mut f: impl FnMut(JobId, JobKind) -> Option<u32>,
+    ) -> Vec<(JobId, JobKind, u32)> {
         let mut out = Vec::new();
         loop {
             if s.refresh_ahead(usize::MAX, &mut f) > 0 {
@@ -234,7 +265,7 @@ mod tests {
     }
 
     /// Pops every job of a queue without stale priorities.
-    fn drain(s: &mut JobScheduler) -> Vec<(ChunkId, JobKind, u32)> {
+    fn drain(s: &mut JobScheduler) -> Vec<(JobId, JobKind, u32)> {
         drain_with(s, |_, _| unreachable!("nothing is stale"))
     }
 
@@ -268,8 +299,8 @@ mod tests {
         for &i in id.iter().rev() {
             s.push(i, JobKind::Generate, 7);
         }
-        let order: Vec<ChunkId> = drain(&mut s).into_iter().map(|j| j.0).collect();
-        let expected: Vec<ChunkId> = id.iter().rev().copied().collect();
+        let order: Vec<JobId> = drain(&mut s).into_iter().map(|j| j.0).collect();
+        let expected: Vec<JobId> = id.iter().rev().copied().collect();
         assert_eq!(order, expected);
         // Kinds do not break ties either.
         s.push(id[0], JobKind::Mesh, 3);
@@ -347,7 +378,7 @@ mod tests {
         assert_eq!((n, s.queued(), s.stale()), (2, 5, 3));
         // With no drift the stale ones keep their order ahead of the refreshed ones (they are
         // refreshed on the way, here to the same priority).
-        let order: Vec<(ChunkId, u32)> = drain_with(&mut s, |i, _| {
+        let order: Vec<(JobId, u32)> = drain_with(&mut s, |i, _| {
             Some(id.iter().position(|&j| j == i).expect("known") as u32)
         })
         .into_iter()
@@ -372,7 +403,7 @@ mod tests {
         assert_eq!(s.refresh_priorities(usize::MAX, |_, _| Some(0)), 2);
         assert_eq!(s.stale(), 0);
         // FIFO among equal refreshed priorities.
-        let order: Vec<ChunkId> = drain(&mut s).into_iter().map(|j| j.0).collect();
+        let order: Vec<JobId> = drain(&mut s).into_iter().map(|j| j.0).collect();
         assert_eq!(order, vec![id[0], id[1]]);
     }
 
@@ -382,8 +413,8 @@ mod tests {
     #[test]
     fn dispatch_stays_nearest_first_while_priorities_are_stale() {
         let id = ids(60);
-        let x_of = |c: ChunkId| id.iter().position(|&i| i == c).expect("known") as u32;
-        let new_priority = |c: ChunkId| x_of(c).abs_diff(1).pow(2);
+        let x_of = |c: JobId| id.iter().position(|&i| i == c).expect("known") as u32;
+        let new_priority = |c: JobId| x_of(c).abs_diff(1).pow(2);
         let mut s = JobScheduler::new(20);
         for (x, &chunk) in id[..40].iter().enumerate() {
             s.push(chunk, JobKind::Generate, (x as u32).pow(2));
@@ -453,9 +484,9 @@ mod tests {
         s.push(id[2], JobKind::Generate, 1);
         s.invalidate_priorities(u32::MAX);
         s.push(id[1], JobKind::Generate, 1);
-        let new = |c: ChunkId| Some(if c == id[0] { 0 } else { 3 });
+        let new = |c: JobId| Some(if c == id[0] { 0 } else { 3 });
         assert_eq!(s.refresh_ahead(usize::MAX, |c, _| new(c)), 2);
-        let order: Vec<ChunkId> = drain(&mut s).into_iter().map(|j| j.0).collect();
+        let order: Vec<JobId> = drain(&mut s).into_iter().map(|j| j.0).collect();
         assert_eq!(order, vec![id[0], id[1], id[2]]);
     }
 

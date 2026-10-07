@@ -1,12 +1,13 @@
 use crate::BUCKET_COUNT;
-use boxel_voxel::Face;
+use boxel_voxel::{Face, LightValue};
 use bytemuck::{Pod, Zeroable};
+use std::hash::{BuildHasher, Hasher};
 use std::ops::Range;
 
-/// Bit layout of [`PackedQuad`] (frozen; mirrored by constants in `common.wgsl`).
+/// Bit layout of [`PackedQuad`] v2 (frozen; mirrored by constants in `common.wgsl`).
 ///
-/// `geo`: `x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | reserved:4`
-/// `mat`: `layer:12 | ao:8 (2 bits per corner, 3 = open) | sky:4 | block:4 | flags:4`
+/// `geo`: `x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | flags:4`
+/// `mat`: `layer:12 | ao:8 (2 bits per corner, 3 = open) | light:12 (palette index)`
 pub mod layout {
     /// Mask of one 5-bit position/extent field.
     pub const GEO_POS_MASK: u32 = 31;
@@ -20,17 +21,46 @@ pub mod layout {
     pub const GEO_H_SHIFT: u32 = 20;
     /// Shift of face.
     pub const GEO_FACE_SHIFT: u32 = 25;
+    /// Shift of the 4 flag bits (0 for now).
+    pub const GEO_FLAGS_SHIFT: u32 = 28;
     /// Mask of the texture layer.
     pub const MAT_LAYER_MASK: u32 = 0xFFF;
     /// Shift of the 4x2-bit AO field.
     pub const MAT_AO_SHIFT: u32 = 12;
-    /// Shift of sky light.
-    pub const MAT_SKY_SHIFT: u32 = 20;
-    /// Shift of block light.
-    pub const MAT_BLOCK_SHIFT: u32 = 24;
-    /// Shift of flags.
-    pub const MAT_FLAGS_SHIFT: u32 = 28;
+    /// Shift of the light palette index.
+    pub const MAT_LIGHT_SHIFT: u32 = 20;
+    /// Mask of the light palette index (after the shift).
+    pub const MAT_LIGHT_MASK: u32 = 0xFFF;
 }
+
+/// Most entries of one chunk's light palette (the 12-bit index of [`PackedQuad`]).
+pub const MAX_PALETTE_ENTRIES: usize = 4096;
+
+/// One light palette entry: the [`LightValue`] of the 4 corners of a quad, `word0 = c0 | c1 <<
+/// 16`, `word1 = c2 | c3 << 16`. Corner order (u, v): 0 = (0, 0), 1 = (1, 0), 2 = (0, 1),
+/// 3 = (1, 1), the order of the AO field and of `common.wgsl`.
+pub type PaletteEntry = [u32; 2];
+
+/// The palette entry of 4 corner lights.
+pub const fn palette_entry(corners: [LightValue; 4]) -> PaletteEntry {
+    [
+        corners[0].0 as u32 | (corners[1].0 as u32) << 16,
+        corners[2].0 as u32 | (corners[3].0 as u32) << 16,
+    ]
+}
+
+/// The 4 corner lights of a palette entry.
+pub const fn palette_corners(entry: PaletteEntry) -> [LightValue; 4] {
+    [
+        LightValue(entry[0] as u16),
+        LightValue((entry[0] >> 16) as u16),
+        LightValue(entry[1] as u16),
+        LightValue((entry[1] >> 16) as u16),
+    ]
+}
+
+/// Palette entry of open sky everywhere (what a mesh without light uses).
+pub const FULL_SKY_ENTRY: PaletteEntry = palette_entry([LightValue::FULL_SKY; 4]);
 
 /// One greedy quad, 8 bytes, identical on every tier (storage buffer element in High/Mid,
 /// instance-step `Uint32x2` vertex attribute in Low).
@@ -38,7 +68,8 @@ pub mod layout {
 /// Canonical meaning (frozen): `pos` = chunk-local voxel (0..32) of the quad's min corner block;
 /// the quad lies on that block's `face`; it spans `w` voxels along the face's u axis and `h`
 /// along its v axis ([`Face::axes`]). The face plane is at `pos[n] + 1` for positive faces and
-/// `pos[n]` for negative ones (added by the shader).
+/// `pos[n]` for negative ones (added by the shader). The light of its 4 corners is entry
+/// [`PackedQuad::light_index`] of its chunk's [`ChunkMesh::palette`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Pod, Zeroable)]
 pub struct PackedQuad {
@@ -49,7 +80,7 @@ pub struct PackedQuad {
 }
 
 impl PackedQuad {
-    /// New quad with AO fully open (`0xFF`), sky light 15, block light 0, flags 0.
+    /// New quad with AO fully open (`0xFF`), light palette index 0 and flags 0.
     /// Debug-asserts `pos < 32`, `1 <= w, h <= 32`, `layer < 4096`.
     pub const fn new(pos: [u32; 3], w: u32, h: u32, face: Face, layer: u16) -> Self {
         debug_assert!(pos[0] < 32 && pos[1] < 32 && pos[2] < 32);
@@ -61,25 +92,33 @@ impl PackedQuad {
             | (w - 1) << GEO_W_SHIFT
             | (h - 1) << GEO_H_SHIFT
             | (face as u32) << GEO_FACE_SHIFT;
-        let mat = (layer as u32 & MAT_LAYER_MASK) | 0xFF << MAT_AO_SHIFT | 15 << MAT_SKY_SHIFT;
+        let mat = (layer as u32 & MAT_LAYER_MASK) | 0xFF << MAT_AO_SHIFT;
         Self { geo, mat }
     }
-    /// Replaces sky/block light (0..=15 each).
-    pub const fn with_light(mut self, sky: u8, block: u8) -> Self {
+    /// Replaces AO (per corner 0..=3, corner order (u,v) = (0,0), (1,0), (0,1), (1,1)).
+    pub const fn with_ao(self, ao: [u8; 4]) -> Self {
+        let packed = (ao[0] & 3) | (ao[1] & 3) << 2 | (ao[2] & 3) << 4 | (ao[3] & 3) << 6;
+        self.with_ao_byte(packed)
+    }
+    /// Replaces AO with its packed byte (corner `k` at bits `2k..2k+2`).
+    pub const fn with_ao_byte(mut self, ao: u8) -> Self {
         use layout::*;
-        self.mat = (self.mat & !(0xFF << MAT_SKY_SHIFT))
-            | ((sky as u32 & 15) << MAT_SKY_SHIFT)
-            | ((block as u32 & 15) << MAT_BLOCK_SHIFT);
+        self.mat = (self.mat & !(0xFF << MAT_AO_SHIFT)) | (ao as u32) << MAT_AO_SHIFT;
         self
     }
-    /// Replaces AO (per corner 0..=3, corner order (u,v) = (0,0), (1,0), (0,1), (1,1)).
-    pub const fn with_ao(mut self, ao: [u8; 4]) -> Self {
+    /// Replaces the light palette index (`0..4096`, debug-asserted).
+    pub const fn with_light_index(mut self, index: u16) -> Self {
         use layout::*;
-        let packed = (ao[0] as u32 & 3)
-            | (ao[1] as u32 & 3) << 2
-            | (ao[2] as u32 & 3) << 4
-            | (ao[3] as u32 & 3) << 6;
-        self.mat = (self.mat & !(0xFF << MAT_AO_SHIFT)) | packed << MAT_AO_SHIFT;
+        debug_assert!((index as u32) <= MAT_LIGHT_MASK);
+        self.mat = (self.mat & !(MAT_LIGHT_MASK << MAT_LIGHT_SHIFT))
+            | ((index as u32 & MAT_LIGHT_MASK) << MAT_LIGHT_SHIFT);
+        self
+    }
+    /// Replaces the 4 flag bits (`0..16`, debug-asserted). No flag is defined yet.
+    pub const fn with_flags(mut self, flags: u8) -> Self {
+        use layout::*;
+        debug_assert!(flags < 16);
+        self.geo = (self.geo & !(15 << GEO_FLAGS_SHIFT)) | ((flags as u32 & 15) << GEO_FLAGS_SHIFT);
         self
     }
     /// Min-corner voxel.
@@ -106,17 +145,25 @@ impl PackedQuad {
             None => Face::NegZ,
         }
     }
+    /// The 4 flag bits.
+    pub const fn flags(self) -> u8 {
+        ((self.geo >> layout::GEO_FLAGS_SHIFT) & 15) as u8
+    }
     /// Texture layer.
     pub const fn layer(self) -> u16 {
         (self.mat & layout::MAT_LAYER_MASK) as u16
     }
-    /// Sky light.
-    pub const fn sky(self) -> u8 {
-        ((self.mat >> layout::MAT_SKY_SHIFT) & 15) as u8
+    /// AO of corner `k` (0..=3, 3 = open).
+    pub const fn ao(self, k: usize) -> u8 {
+        ((self.mat >> (layout::MAT_AO_SHIFT + 2 * k as u32)) & 3) as u8
     }
-    /// Block light.
-    pub const fn block_light(self) -> u8 {
-        ((self.mat >> layout::MAT_BLOCK_SHIFT) & 15) as u8
+    /// The packed AO byte (corner `k` at bits `2k..2k+2`).
+    pub const fn ao_byte(self) -> u8 {
+        (self.mat >> layout::MAT_AO_SHIFT) as u8
+    }
+    /// Light palette index.
+    pub const fn light_index(self) -> u16 {
+        ((self.mat >> layout::MAT_LIGHT_SHIFT) & layout::MAT_LIGHT_MASK) as u16
     }
     /// Every unit face covered by the quad: (voxel position, face). Test/debug helper.
     pub fn unit_faces(self) -> impl Iterator<Item = ([u32; 3], Face)> {
@@ -133,16 +180,82 @@ impl PackedQuad {
     }
 }
 
-/// A chunk's mesh: quads stored bucket-contiguous (bucket 0 first) + per-bucket counts.
+/// How a mesh's corner lights were quantized to fit [`MAX_PALETTE_ENTRIES`] (a deterministic
+/// fallback, counted in the stats; almost every chunk is [`LightQuantization::Exact`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum LightQuantization {
+    /// Corner lights as computed.
+    #[default]
+    Exact,
+    /// The exact palette overflowed: the block channels (red, green, blue) of every corner keep
+    /// their top 3 bits (`level & 0b1110`); sky is exact.
+    Block3,
+    /// The `Block3` palette overflowed too: each face gets one value for its 4 corners (the
+    /// rounded per-channel mean), with block channels at 2 bits (`level & 0b1100`). At most
+    /// `16 * 4^3 = 1024` entries, so it always fits.
+    Flat,
+}
+
+impl LightQuantization {
+    /// Every level, the order the mesher tries them.
+    pub const ALL: [LightQuantization; 3] = [Self::Exact, Self::Block3, Self::Flat];
+
+    /// `corners` at this level.
+    pub fn apply(self, corners: [LightValue; 4]) -> [LightValue; 4] {
+        match self {
+            Self::Exact => corners,
+            Self::Block3 => corners.map(|c| LightValue(c.0 & 0xFEEE)),
+            Self::Flat => {
+                let mut mean = 0u16;
+                for shift in [12, 8, 4, 0] {
+                    let sum: u16 = corners.iter().map(|c| (c.0 >> shift) & 15).sum();
+                    mean |= ((sum + 2) / 4) << shift;
+                }
+                [LightValue(mean & 0xFCCC); 4]
+            }
+        }
+    }
+}
+
+/// A chunk's mesh: quads stored bucket-contiguous (bucket 0 first), per-bucket counts, the light
+/// palette the quads index and a hash of all of it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChunkMesh {
     /// All quads, bucket order.
     pub quads: Vec<PackedQuad>,
     /// Quads per bucket (`0..6` = opaque `Face` order, `6` = cutout, `7` = translucent).
     pub bucket_counts: [u32; BUCKET_COUNT],
+    /// Light palette (at most [`MAX_PALETTE_ENTRIES`] entries, first-seen order); every quad's
+    /// [`PackedQuad::light_index`] is an index into it.
+    pub palette: Vec<PaletteEntry>,
+    /// How the palette was quantized.
+    pub light_quantization: LightQuantization,
+    /// [`ChunkMesh::compute_hash`] of the content (the mesher sets it; equal meshes have equal
+    /// hashes, so a remesh that changed nothing can be skipped).
+    pub hash: u64,
 }
 
 impl ChunkMesh {
+    /// Seed of [`ChunkMesh::compute_hash`] (fixed: hashes are equal across runs and threads).
+    const HASH_SEED: u64 = 0x6d65_7368_7632;
+
+    /// A mesh from its quads and bucket counts, every quad lit by palette entry 0 = open sky
+    /// (what [`PackedQuad::new`] gives), with its hash. For hand-made meshes (tests, tools).
+    pub fn from_quads(quads: Vec<PackedQuad>, bucket_counts: [u32; BUCKET_COUNT]) -> Self {
+        let palette = if quads.is_empty() {
+            Vec::new()
+        } else {
+            vec![FULL_SKY_ENTRY]
+        };
+        let mut mesh = Self {
+            quads,
+            bucket_counts,
+            palette,
+            ..Self::default()
+        };
+        mesh.hash = mesh.compute_hash();
+        mesh
+    }
     /// No quads.
     pub fn is_empty(&self) -> bool {
         self.quads.is_empty()
@@ -161,9 +274,26 @@ impl ChunkMesh {
         let r = self.bucket_range(b);
         &self.quads[r.start as usize..r.end as usize]
     }
+    /// The 4 corner lights of `quad` (open sky if its index is outside the palette).
+    pub fn corner_light(&self, quad: PackedQuad) -> [LightValue; 4] {
+        self.palette
+            .get(quad.light_index() as usize)
+            .map_or([LightValue::FULL_SKY; 4], |&e| palette_corners(e))
+    }
     /// Clears, keeping capacity.
     pub fn clear(&mut self) {
         self.quads.clear();
         self.bucket_counts = [0; BUCKET_COUNT];
+        self.palette.clear();
+        self.light_quantization = LightQuantization::Exact;
+        self.hash = 0;
+    }
+    /// foldhash with a fixed seed over the quads, the bucket counts and the palette.
+    pub fn compute_hash(&self) -> u64 {
+        let mut h = foldhash::fast::FixedState::with_seed(Self::HASH_SEED).build_hasher();
+        h.write(bytemuck::cast_slice(&self.quads));
+        h.write(bytemuck::cast_slice(&self.bucket_counts));
+        h.write(bytemuck::cast_slice(&self.palette));
+        h.finish()
     }
 }

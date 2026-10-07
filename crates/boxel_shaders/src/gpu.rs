@@ -1,7 +1,7 @@
 //! `#[repr(C)]` mirrors of the WGSL structs (bytemuck `Pod`). Layouts are frozen and tested.
 use bytemuck::{Pod, Zeroable};
 
-/// Uniform `View` (240 bytes, std140-compatible: only vec4/mat4 members).
+/// Uniform `View` (336 bytes, std140-compatible: only vec4/mat4 members).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct ViewUniform {
@@ -21,6 +21,14 @@ pub struct ViewUniform {
     /// list); z = cutout draw-list capacity; w = 0. Capacities are at most
     /// [`bindings::MAX_DRAWS_PER_LIST`].
     pub counts: [u32; 4],
+    /// rgb = sky light color times the daylight intensity (linear), a = ambient floor (no lit
+    /// surface is darker than its albedo times this).
+    pub sky_light: [f32; 4],
+    /// x = AO strength (`1 - x` is what the darkest corner keeps), y = block-light gain, zw = 0.
+    pub light_params: [f32; 4],
+    /// Brightness of light levels `0..=15`: level `4k + j` at `[k][j]`, level 15 = 1. The
+    /// shader interpolates it linearly between levels.
+    pub light_curve: [[f32; 4]; 4],
 }
 
 /// Storage `ChunkGpu` (64 bytes) in the chunk table, one per render chunk slot.
@@ -37,8 +45,14 @@ pub struct ChunkGpu {
     pub counts: [u32; 8],
     /// Bit 0 = [`ChunkGpu::FLAG_LIVE`].
     pub flags: u32,
+    /// First entry of the chunk's light palette in the arena (`quad_base` + total quads): High
+    /// and Mid read a quad's 4 corner lights at `light_base` + its palette index.
+    pub light_base: u32,
+    /// Entries of the chunk's light palette (at least 1). A quad whose index is not below it is
+    /// lit as open sky, as on Low and on the CPU, instead of reading another chunk's data.
+    pub light_len: u32,
     /// Padding to 64 bytes (WGSL struct alignment 16).
-    pub pad: [u32; 3],
+    pub pad: u32,
 }
 
 impl ChunkGpu {

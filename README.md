@@ -45,19 +45,25 @@ just run voxel_world --tier mid
 
 Controles: clic izquierdo captura el mouse, Escape (o salir de la ventana) lo suelta. WASD para
 moverse, Espacio sube, Shift izquierdo baja, Ctrl izquierdo acelera. Con el mouse capturado, clic
-izquierdo rompe el bloque de la mira y clic derecho pone el bloque elegido (teclas 1 a 9), a 6
-bloques como máximo. G cambia entre volar y caminar: caminando hay gravedad, WASD camina hacia
-donde mira la cámara y Espacio salta (`--walk` arranca caminando). F3 muestra el overlay de debug
-(con el bloque apuntado, el modo y una línea de física), F5 cambia el límite de FPS (30, 60, 144,
-240, sin límite) y F6 prende o apaga el vsync.
+izquierdo rompe el bloque de la mira y clic derecho pone el bloque elegido (teclas 1 a 9 y 0; las
+lámparas de color van del 7 al 0), a 6 bloques como máximo. G cambia entre volar y caminar:
+caminando hay gravedad, WASD camina hacia donde mira la cámara y Espacio salta (`--walk` arranca
+caminando). F3 muestra el overlay de debug (con el bloque apuntado, el modo, una línea de física,
+la luz en el ojo y en la mira, y la hora), F5 cambia el límite de FPS (30, 60, 144, 240, sin
+límite) y F6 prende o apaga el vsync.
+
+Día y noche: un día dura 20 minutos. `[` y `]` mueven el reloj una hora, T lo pausa y F lo
+acelera 60 veces.
 
 Opciones útiles: `--fps-limit N` (0 = sin límite), `--vsync on|off`, `--seed N`,
 `--view-distance N` (en chunks), `--vertical-radius N` (chunks hacia arriba y hacia abajo, 8 por
 defecto), `--size 1280x720`, `--camera x,y,z,yaw,pitch` (ángulos en grados), `--tier high|mid|low`,
-`--help` (lista todo).
+`--time HH:MM` (hora de inicio, 12:00 por defecto), `--lamps` (pone lámparas de color y lava
+alrededor del inicio y empieza de noche), `--help` (lista todo).
 `--world overworld` muestra el mundo con cuevas (piedra infinita hacia abajo) en vez del bosque
 de siempre; `--caves mc|closed|off` elige las cuevas y `--no-trees` saca los árboles.
-Para pruebas automáticas usa siempre `--frames N --timeout SEG`: la ventana se cierra sola.
+Para pruebas automáticas usa siempre `--frames N --timeout SEG`: la ventana se cierra sola y el
+reloj queda quieto en `--time`.
 `--wait-chunks` empieza a contar frames cuando el terreno terminó de cargar y
 `--screenshot shot.png` guarda una captura en el frame N. `--duration SEG` corre el juego normal
 SEG segundos; al salir imprime updates y frames mostrados por segundo y el uso de CPU.
@@ -89,6 +95,20 @@ V vóxeles/s y mide los frames), `--jump N` (salta N chunks y mide hasta que la 
 lista), `--fixed-height` (carga como M0, con el alto fijo del generador; no con el overworld),
 `--world flat|terrain|forest|overworld` (`terrain` por defecto), `--caves mc|closed|off` (solo
 con el overworld), `--no-trees`, `--help`.
+
+**snapshot**: capturas sin ventana. Carga el mundo alrededor de una cámara, pone bloques si se
+lo pides y guarda un PNG por cada hora del día, con el renderer real y fuera de pantalla.
+
+```bash
+cargo run --release --example snapshot -- --camera 194,67,-48,12,-30 \
+  --shot 12:00=mediodia.png --shot 00:00=noche.png
+```
+
+Opciones: `--place lamp_red@X,Y,Z` (pone un bloque), `--drop NOMBRE@X,Y,Z` (lo deja en el suelo
+bajo ese punto), `--fill NOMBRE@X,Y,Z:X,Y,Z` (llena una caja; `air` cava), `--light off --ao off`
+(el aspecto de antes de la luz), `--view-distance N`, `--size WxH`, las de mundo (`overworld` por
+defecto) y las de GPU (`--adapter nvidia`), `--help`. Imprime qué hay en el centro de la vista y
+su luz, para apuntar.
 
 **gpu_info**: lista los adaptadores, cómo los clasifica boxel y qué elige.
 

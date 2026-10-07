@@ -3,9 +3,14 @@
 //! range recorded into the frame's encoder before any pass reads them. `Queue::write_buffer`
 //! creates (and later frees) a staging buffer per call, a few microseconds each, and crossing a
 //! chunk border changes a few hundred chunks.
+//!
+//! A chunk's arena range holds its quads and then its light palette (ADR 0015), which High and
+//! Mid read at `ChunkGpu::light_base`. Low has no storage buffers: there each quad's palette
+//! entry is written, expanded, at the quad's own offset in a second buffer parallel to the arena
+//! (its second instance attribute).
 use crate::arena::QUAD_BYTES;
 use crate::chunk_table::ChunkTable;
-use boxel_mesh::{ChunkMesh, PackedQuad};
+use boxel_mesh::{ChunkMesh, FULL_SKY_ENTRY, PackedQuad, PaletteEntry};
 use boxel_shaders::gpu::ChunkGpu;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -32,21 +37,49 @@ struct PendingMesh {
     mesh: Arc<ChunkMesh>,
 }
 
+/// Light palette entries a mesh takes in the arena: its palette, or one open-sky entry when it
+/// has none (a hand-made mesh), so every quad's index 0 reads its own chunk's data.
+pub(crate) fn light_entries(mesh: &ChunkMesh) -> u32 {
+    mesh.palette.len().max(1) as u32
+}
+
+/// The palette a mesh is uploaded with (see [`light_entries`]).
+fn uploaded_palette(mesh: &ChunkMesh) -> &[PaletteEntry] {
+    if mesh.palette.is_empty() {
+        std::slice::from_ref(&FULL_SKY_ENTRY)
+    } else {
+        &mesh.palette
+    }
+}
+
+/// Arena entries (8 bytes each) a chunk mesh takes: its quads plus its light palette (at least
+/// one entry). [`RenderStats::arena_used_quads`](crate::RenderStats) counts these.
+pub fn arena_len(mesh: &ChunkMesh) -> u32 {
+    mesh.total_quads() + light_entries(mesh)
+}
+
 impl PendingMesh {
     fn quads(&self) -> &[PackedQuad] {
         &self.mesh.quads
     }
 
+    /// Arena entries: the quads, then the light palette.
+    fn len(&self) -> u32 {
+        arena_len(&self.mesh)
+    }
+
     fn bytes(&self) -> u64 {
-        self.quads().len() as u64 * QUAD_BYTES
+        u64::from(self.len()) * QUAD_BYTES
     }
 }
 
-/// One copy into the arena or the chunk table.
+/// One copy into the arena, the Low light buffer or the chunk table.
 #[derive(Clone, Debug)]
 enum Piece {
-    /// `pending[range]`, consecutive in the arena.
+    /// `pending[range]`, consecutive in the arena: quads and palettes.
     Meshes(Range<usize>),
+    /// The same range in the Low light buffer: each quad's palette entry, expanded.
+    LowLight(Range<usize>),
     /// Chunk table slots.
     Slots(Range<u32>),
 }
@@ -58,6 +91,8 @@ pub(crate) struct UploadTargets<'a> {
     pub arena: &'a wgpu::Buffer,
     /// The chunk table (High/Mid; Low has none).
     pub table: Option<&'a wgpu::Buffer>,
+    /// The per-quad light buffer parallel to the arena (Low only).
+    pub low_light: Option<&'a wgpu::Buffer>,
 }
 
 /// Changes waiting for the next frame, plus reused scratch space.
@@ -75,6 +110,8 @@ pub(crate) struct Uploads {
     pieces: Vec<(Piece, u64)>,
     /// Scratch: table entries of one run.
     entries: Vec<ChunkGpu>,
+    /// Scratch: the expanded light of one mesh (Low).
+    low_words: Vec<PaletteEntry>,
     /// A flush could not record all its copies since [`Uploads::take_lost`] was last called.
     lost: bool,
     /// The next staging buffer is created invalid (tests, see [`Uploads::fail_next_batch`]).
@@ -112,8 +149,9 @@ impl Uploads {
     }
 
     /// Records into `encoder` the copies that bring the GPU up to date: every pending mesh into
-    /// the arena, and every stale slot of `chunks` into the table (Low has no table: its stale
-    /// slots are just forgotten). Nothing when nothing changed.
+    /// the arena (and on Low its expanded light into the light buffer), and every stale slot of
+    /// `chunks` into the table (Low has no table: its stale slots are just forgotten). Nothing
+    /// when nothing changed.
     pub fn flush(
         &mut self,
         device: &wgpu::Device,
@@ -131,7 +169,8 @@ impl Uploads {
         debug_assert!(
             self.meshes.iter().all(|(&id, mesh)| {
                 chunks.get(id).is_some_and(|(_, r)| {
-                    (r.alloc.offset, r.alloc.size as usize) == (mesh.offset, mesh.quads().len())
+                    (r.alloc.offset, r.alloc.size) == (mesh.offset, mesh.len())
+                        && r.light_base == mesh.offset + mesh.mesh.total_quads()
                 })
             }),
             "a pending mesh is not the current range of a live chunk"
@@ -142,6 +181,17 @@ impl Uploads {
         let limit = device.limits().max_buffer_size.min(STAGING_BYTES);
         self.pieces.clear();
         mesh_pieces(&self.pending, limit, &mut self.pieces);
+        if targets.low_light.is_some() {
+            let low: Vec<(Piece, u64)> = self
+                .pieces
+                .iter()
+                .filter_map(|(piece, bytes)| match piece {
+                    Piece::Meshes(range) => Some((Piece::LowLight(range.clone()), *bytes)),
+                    _ => None,
+                })
+                .collect();
+            self.pieces.extend(low);
+        }
         self.pieces.extend(self.runs.iter().map(|slots| {
             let bytes = u64::from(slots.end - slots.start) * ENTRY_BYTES;
             (Piece::Slots(slots.clone()), bytes)
@@ -203,6 +253,13 @@ impl Uploads {
                     Piece::Meshes(range) => {
                         for mesh in &self.pending[range.clone()] {
                             put(bytemuck::cast_slice(mesh.quads()));
+                            put(bytemuck::cast_slice(uploaded_palette(&mesh.mesh)));
+                        }
+                    }
+                    Piece::LowLight(range) => {
+                        for mesh in &self.pending[range.clone()] {
+                            expand_light(&mesh.mesh, &mut self.low_words);
+                            put(bytemuck::cast_slice(&self.low_words));
                         }
                     }
                     Piece::Slots(slots) => {
@@ -222,6 +279,10 @@ impl Uploads {
                     Some(targets.arena),
                     u64::from(self.pending[range.start].offset) * QUAD_BYTES,
                 ),
+                Piece::LowLight(range) => (
+                    targets.low_light,
+                    u64::from(self.pending[range.start].offset) * QUAD_BYTES,
+                ),
                 Piece::Slots(slots) => (targets.table, u64::from(slots.start) * ENTRY_BYTES),
             };
             if let Some(dst) = dst {
@@ -230,6 +291,21 @@ impl Uploads {
             src += size;
         }
     }
+}
+
+/// Sets `out` to what the Low light buffer holds over `mesh`'s arena range: the palette entry
+/// of each quad (open sky for an index outside the palette), then the palette itself (never
+/// drawn; it only keeps the range the same size as in the arena).
+fn expand_light(mesh: &ChunkMesh, out: &mut Vec<PaletteEntry>) {
+    let palette = uploaded_palette(mesh);
+    out.clear();
+    out.extend(mesh.quads.iter().map(|q| {
+        palette
+            .get(usize::from(q.light_index()))
+            .copied()
+            .unwrap_or(FULL_SKY_ENTRY)
+    }));
+    out.extend_from_slice(palette);
 }
 
 /// Appends the copies of `pending` (sorted by offset) to `pieces`: one per run of meshes that
@@ -241,7 +317,7 @@ fn mesh_pieces(pending: &[PendingMesh], limit: u64, pieces: &mut Vec<(Piece, u64
     for (i, mesh) in pending.iter().enumerate() {
         bytes += mesh.bytes();
         let joined = pending.get(i + 1).is_some_and(|next| {
-            mesh.offset + mesh.quads().len() as u32 == next.offset && bytes + next.bytes() <= limit
+            mesh.offset + mesh.len() == next.offset && bytes + next.bytes() <= limit
         });
         if !joined {
             pieces.push((Piece::Meshes(first..i + 1), bytes));
@@ -268,13 +344,14 @@ fn batch_len(pieces: &[(Piece, u64)], limit: u64) -> usize {
 mod tests {
     use super::*;
 
-    fn pending(offset: u32, quads: usize) -> PendingMesh {
+    /// A pending mesh of `len` arena entries: `len - 1` quads and one palette entry.
+    fn pending(offset: u32, len: usize) -> PendingMesh {
         PendingMesh {
             offset,
-            mesh: Arc::new(ChunkMesh {
-                quads: vec![PackedQuad::default(); quads],
-                ..ChunkMesh::default()
-            }),
+            mesh: Arc::new(ChunkMesh::from_quads(
+                vec![PackedQuad::default(); len - 1],
+                [0; boxel_mesh::BUCKET_COUNT],
+            )),
         }
     }
 
@@ -285,7 +362,7 @@ mod tests {
             .into_iter()
             .map(|(piece, bytes)| match piece {
                 Piece::Meshes(range) => (range, bytes / QUAD_BYTES),
-                Piece::Slots(_) => unreachable!(),
+                Piece::LowLight(_) | Piece::Slots(_) => unreachable!(),
             })
             .collect()
     }
@@ -318,6 +395,37 @@ mod tests {
         // A mesh larger than the limit still goes alone.
         let big = [pending(0, 2), pending(2, 20), pending(22, 2)];
         assert_eq!(mesh_ranges(&big, limit), [(0..1, 2), (1..2, 20), (2..3, 2)]);
+    }
+
+    #[test]
+    fn meshes_take_their_quads_and_their_palette() {
+        let quads = vec![
+            PackedQuad::default().with_light_index(1),
+            PackedQuad::default(),
+            PackedQuad::default().with_light_index(7),
+        ];
+        let lit = [3, 5];
+        let mesh = ChunkMesh {
+            quads: quads.clone(),
+            palette: vec![FULL_SKY_ENTRY, lit],
+            ..ChunkMesh::default()
+        };
+        assert_eq!((light_entries(&mesh), arena_len(&mesh)), (2, 5));
+        let mut low = Vec::new();
+        expand_light(&mesh, &mut low);
+        // per quad, then the palette; an index past the palette reads open sky
+        assert_eq!(
+            low,
+            [lit, FULL_SKY_ENTRY, FULL_SKY_ENTRY, FULL_SKY_ENTRY, lit]
+        );
+        // A hand-made mesh without a palette still gets one open-sky entry.
+        let bare = ChunkMesh {
+            quads,
+            ..ChunkMesh::default()
+        };
+        assert_eq!((light_entries(&bare), arena_len(&bare)), (1, 4));
+        expand_light(&bare, &mut low);
+        assert_eq!(low, [FULL_SKY_ENTRY; 4]);
     }
 
     #[test]

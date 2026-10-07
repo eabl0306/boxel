@@ -1,5 +1,5 @@
 use crate::path::TierPipelines;
-use crate::renderer::{RendererConfig, ViewParams, VoxelRenderer};
+use crate::renderer::{DEFAULT_SKY_COLOR, RendererConfig, ViewParams, VoxelRenderer};
 use crate::targets::{Blit, Targets};
 use crate::textures::linear_to_srgb;
 use boxel_camera::{Camera, CameraView};
@@ -7,9 +7,9 @@ use boxel_gfx::{
     SmokeContext, SmokeLevel, SmokeTest, read_texture_rgba8, run_in_error_scopes, submit_and_wait,
 };
 use boxel_math::{DVec3, I64Vec3, UVec2};
-use boxel_mesh::{BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, PackedQuad};
+use boxel_mesh::{BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, PackedQuad, palette_entry};
 use boxel_transform::Transform;
-use boxel_voxel::{BlockRegistry, Face};
+use boxel_voxel::{BlockRegistry, Face, LightValue};
 use std::sync::Arc;
 
 /// Edge of the smoke test targets.
@@ -18,9 +18,14 @@ const SIZE: u32 = 16;
 /// Smoke test that builds the renderer's *real* pipelines for the candidate tier and the blit
 /// pipeline for `ctx.output_format` (the exact surface format), records one pass and submits
 /// it. With `SmokeLevel::Draw` it builds a real `VoxelRenderer` (1024 quads, 8 slots, 16x16),
-/// draws one opaque and one cutout quad, checks the center pixel against the clear color and
-/// blits into a 16x16 texture of `ctx.output_format`. Passed to `boxel_gfx::select_gpu` by the
-/// render plugin so a tier is only chosen if its actual shaders work on that device.
+/// draws an opaque quad lit only by blue block light (palette entry 0) under a smaller cutout
+/// quad lit only by red block light (entry 1), checks that the center pixel (the cutout quad)
+/// is not the clear color and is lit red and that a corner pixel (the opaque quad alone) is
+/// lit blue, and blits into a 16x16 texture of `ctx.output_format`. So each quad's light entry
+/// reaches the fragment shader on this tier: from the arena on High and Mid, from the second
+/// vertex buffer on Low, offset by the draw's first instance like the quads (the cutout draw
+/// starts at instance 1; GL emulates that offset per buffer). Passed to `boxel_gfx::select_gpu`
+/// by the render plugin so a tier is only chosen if its actual shaders work on that device.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RendererSmokeTest;
 
@@ -62,7 +67,6 @@ fn draw(ctx: &SmokeContext<'_>) -> Result<(), String> {
     let config = RendererConfig {
         arena_quads: 1024,
         max_chunk_slots: 8,
-        ..RendererConfig::default()
     };
     let registry = BlockRegistry::default_blocks();
     let mut renderer = VoxelRenderer::new(
@@ -88,7 +92,7 @@ fn draw(ctx: &SmokeContext<'_>) -> Result<(), String> {
     let view = ViewParams::from_camera(
         &CameraView::compute(&camera, &transform, 1.0),
         &camera,
-        config.clear_color,
+        DEFAULT_SKY_COLOR,
         0.6,
     );
     let mut encoder = ctx
@@ -100,14 +104,31 @@ fn draw(ctx: &SmokeContext<'_>) -> Result<(), String> {
     submit_and_wait(ctx.device, ctx.queue, encoder)?;
 
     let image = read_texture_rgba8(ctx.device, ctx.queue, renderer.main_color())?;
-    let center = (SIZE / 2 * SIZE + SIZE / 2) as usize * 4;
-    let pixel = &image.data[center..center + 4];
-    let clear = config.clear_color.map(linear_to_srgb);
-    if (0..3).all(|c| pixel[c].abs_diff(clear[c]) <= 2) {
+    let at = |x: u32, y: u32| {
+        let i = (y * SIZE + x) as usize * 4;
+        &image.data[i..i + 4]
+    };
+    let (center, corner) = (at(SIZE / 2, SIZE / 2), at(2, 2));
+    let clear = DEFAULT_SKY_COLOR.map(linear_to_srgb);
+    if (0..3).all(|c| center[c].abs_diff(clear[c]) <= 2) {
         return Err(format!(
-            "smoke draw ({} tier): the center pixel {pixel:?} still has the clear color",
+            "smoke draw ({} tier): the center pixel {center:?} still has the clear color",
             ctx.tier
         ));
+    }
+    // No sky light reaches the quads and each one's block light is a pure color, so a working
+    // light path leaves the other channels at the ambient floor (stone: about 125 in its
+    // channel, 13 in the others).
+    for (what, pixel, channel, color) in [
+        ("center pixel (cutout quad)", center, 0, "red"),
+        ("corner pixel (opaque quad)", corner, 2, "blue"),
+    ] {
+        if !lit_by(pixel, channel) {
+            return Err(format!(
+                "smoke draw ({} tier): the {what} {pixel:?} is not lit by its {color} block light",
+                ctx.tier
+            ));
+        }
     }
 
     let output = output_texture(ctx);
@@ -123,7 +144,21 @@ fn draw(ctx: &SmokeContext<'_>) -> Result<(), String> {
     submit_and_wait(ctx.device, ctx.queue, encoder)
 }
 
-/// One 32x32 +Y stone quad on the chunk floor and one 32x32 leaves quad (cutout bucket) above it.
+/// True if `pixel` (sRGB) is clearly lit by light of one color, channel `c` (0 red, 1 green,
+/// 2 blue): that channel at least 40 and more than twice each of the other two.
+fn lit_by(pixel: &[u8], c: usize) -> bool {
+    let rgb = [pixel[0], pixel[1], pixel[2]].map(u16::from);
+    let others = (0..3)
+        .filter(|&i| i != c)
+        .map(|i| rgb[i])
+        .max()
+        .unwrap_or(0);
+    rgb[c] >= 40 && rgb[c] > 2 * others
+}
+
+/// One 32x32 +Y stone quad on the chunk floor lit only by blue block light (palette entry 0),
+/// and a 16x16 stone quad in the cutout bucket above its middle lit only by red block light
+/// (entry 1; stone passes the alpha test everywhere). Sky 0 in both.
 fn smoke_mesh(registry: &BlockRegistry) -> ChunkMesh {
     let layer = |name: &str| {
         registry
@@ -135,13 +170,20 @@ fn smoke_mesh(registry: &BlockRegistry) -> ChunkMesh {
     let mut bucket_counts = [0; BUCKET_COUNT];
     bucket_counts[Face::PosY.index()] = 1;
     bucket_counts[CUTOUT_BUCKET] = 1;
-    ChunkMesh {
-        quads: vec![
-            PackedQuad::new([0, 0, 0], 32, 32, Face::PosY, layer("boxel:stone")),
-            PackedQuad::new([0, 4, 0], 32, 32, Face::PosY, layer("boxel:leaves")),
+    let stone = layer("boxel:stone");
+    let mut mesh = ChunkMesh::from_quads(
+        vec![
+            PackedQuad::new([0, 0, 0], 32, 32, Face::PosY, stone).with_light_index(0),
+            PackedQuad::new([8, 4, 8], 16, 16, Face::PosY, stone).with_light_index(1),
         ],
         bucket_counts,
-    }
+    );
+    mesh.palette = vec![
+        palette_entry([LightValue::from_rgb([0, 0, 15]); 4]),
+        palette_entry([LightValue::from_rgb([15, 0, 0]); 4]),
+    ];
+    mesh.hash = mesh.compute_hash();
+    mesh
 }
 
 /// 16x16 render target of the output format.
@@ -160,4 +202,32 @@ fn output_texture(ctx: &SmokeContext<'_>) -> wgpu::Texture {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_smoke_quads_have_their_own_light_entries() {
+        let registry = BlockRegistry::default_blocks();
+        let mesh = smoke_mesh(&registry);
+        assert_eq!(mesh.palette.len(), 2);
+        // Opaque bucket first (first instance 0), then the cutout one (first instance 1).
+        assert_eq!(mesh.bucket_counts[Face::PosY.index()], 1);
+        assert_eq!(mesh.bucket_counts[CUTOUT_BUCKET], 1);
+        let lights: Vec<_> = mesh.quads.iter().map(|&q| mesh.corner_light(q)).collect();
+        assert_eq!(
+            lights,
+            [
+                [LightValue::from_rgb([0, 0, 15]); 4],
+                [LightValue::from_rgb([15, 0, 0]); 4]
+            ]
+        );
+        assert!(lit_by(&[124, 13, 13, 255], 0));
+        assert!(lit_by(&[13, 13, 124, 255], 2));
+        assert!(!lit_by(&[13, 13, 124, 255], 0), "blue is not red");
+        assert!(!lit_by(&[120, 110, 100, 255], 0), "white light");
+        assert!(!lit_by(&[13, 13, 13, 255], 2), "dark");
+    }
 }

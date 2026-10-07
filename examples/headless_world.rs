@@ -7,7 +7,17 @@
 //! max_update_ms=X p99_update_ms=X`, where `quads` is the sum of the ready mesh quads and the
 //! update times are the longest and 99th percentile `App::update` while loading, and `world:
 //! meshed_fraction=X quads_per_mesh_p50=N p99=N max=N voxel_mib=X`: the share of the meshed
-//! chunks with a non-empty mesh, the quads of those meshes, and the heap bytes of the voxel data.
+//! chunks with a non-empty mesh, the quads of those meshes, and the heap bytes of the voxel data;
+//! `light: ao=MODE palette_p50=N p99=N max=N requantized=N arena_entries=N`: the AO policy
+//! (`--ao`), the light palette entries of the non-empty meshes, how many of them overflowed the
+//! palette and were requantized, and the renderer arena entries they take (quads plus palettes,
+//! at least one palette entry per mesh); and `sky: light=on|off full=N fast=N columns=N
+//! walked=N walks=N private_generations=N cache_mib=X sky_mib=X`: the light boxes that ran the floods or took a
+//! fast path (dark, open sky or under the walk floor), the chunk columns with a sky tile slot
+//! and with a walked tile, the walks run and the chunks they generated because they were not
+//! loaded, and the memory of the gameplay light cache and of the sky tiles. Compare `quads=`
+//! across `--light on|off` and `--ao off|baked|lit-only` for the cost of AO: with `--light off`
+//! every face counts as lit (a worst case for `lit-only`).
 //! Then, in this order and only when asked for:
 //! - `--idle`: `idle: frames=N median_update_ms=X p99_update_ms=X max_update_ms=X` while the
 //!   viewer stands still.
@@ -29,10 +39,11 @@
 mod world;
 
 use boxel::log::LogPlugin;
+use boxel::mesh::{AoPolicy, LightQuantization};
 use boxel::prelude::*;
 use boxel::voxel::{CHUNK_SIZE, MAX_BLOCK_COORD, MAX_CHUNK_COORD};
 use boxel::world::DataState;
-use boxel::world::{WorldStats, WorldSystems};
+use boxel::world::{SkyMap, WorldStats, WorldSystems};
 use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
 use world::{World, WorldChoice};
@@ -45,6 +56,10 @@ usage: headless_world [options]
                        not with the overworld, which has no floor)
   --viewer-y Y         viewer height in voxels (default 80; -1000 is deep in the overworld's
                        caves)
+  --ao MODE            ambient occlusion baked into the meshes: off, baked (every face) or
+                       lit-only (faces with some light; the default)
+  --light MODE         on (the default: sky and block light computed and baked) or off (open
+                       sky everywhere, the look before light)
   --hz N               frames per second of the loop (default 62.5; 0 = no wait between frames)
   --idle S             once settled, stand still for S seconds and report the update times
   --speed V            then move the viewer along +x at V voxels/s
@@ -82,6 +97,8 @@ struct Options {
     /// The terrain unless `--world` says otherwise (the world of the earlier measurements).
     world: WorldChoice,
     viewer_y: f64,
+    ao: AoPolicy,
+    light: bool,
 }
 
 /// `Ok(None)` for `--help`.
@@ -98,6 +115,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         timeout: Duration::from_secs(60),
         world: WorldChoice::with_world(World::Terrain),
         viewer_y: VIEWER.y,
+        ao: AoPolicy::default(),
+        light: true,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -134,6 +153,21 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                     })?;
             }
             "--timeout" => o.timeout = Duration::from_secs_f64(number(flag, &value()?)?),
+            "--ao" => {
+                let v = value()?;
+                o.ao = AO_MODES
+                    .iter()
+                    .find(|(name, _)| *name == v)
+                    .map(|&(_, policy)| policy)
+                    .ok_or_else(|| format!("{flag}: {v:?} is not off, baked or lit-only"))?;
+            }
+            "--light" => {
+                o.light = match value()?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    v => return Err(format!("{flag}: {v:?} is not on or off")),
+                };
+            }
             "--viewer-y" => {
                 let v = value()?;
                 o.viewer_y = v
@@ -149,6 +183,21 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
     }
     o.world.validate(o.fixed_height)?;
     Ok(Some(o))
+}
+
+/// `--ao` values.
+const AO_MODES: [(&str, AoPolicy); 3] = [
+    ("off", AoPolicy::Off),
+    ("baked", AoPolicy::Baked),
+    ("lit-only", AoPolicy::BakedLitOnly),
+];
+
+/// The `--ao` name of a policy.
+fn ao_name(policy: AoPolicy) -> &'static str {
+    AO_MODES
+        .iter()
+        .find(|(_, p)| *p == policy)
+        .map_or("?", |(name, _)| name)
 }
 
 fn radius(flag: &str, value: &str) -> Result<u32, String> {
@@ -268,6 +317,8 @@ fn main() -> AppExit {
     let generator = options.world.generator(TerrainGenerator::default().seed);
     let settings = WorldSettings {
         vertical_bounds: options.fixed_height.then(|| generator.vertical_chunks()),
+        ao_policy: options.ao,
+        light: options.light,
         ..WorldSettings::default()
     };
     let wait = if options.hz > 0.0 {
@@ -397,6 +448,56 @@ fn world_line(map: &ChunkMap) -> String {
     )
 }
 
+/// The `light:` line: AO policy, light palette entries per non-empty mesh and the meshes whose
+/// palette overflowed.
+fn light_line(map: &ChunkMap, ao: AoPolicy) -> String {
+    let mut entries: Vec<usize> = Vec::new();
+    let mut requantized = 0;
+    // What `boxel_render::arena_len` gives (this example has no renderer).
+    let mut arena = 0u64;
+    for (_, _, mesh) in map.ready_meshes() {
+        entries.push(mesh.palette.len());
+        requantized += usize::from(mesh.light_quantization != LightQuantization::Exact);
+        arena += u64::from(mesh.total_quads()) + mesh.palette.len().max(1) as u64;
+    }
+    entries.sort_unstable();
+    let at = |q: usize| {
+        entries
+            .get(entries.len().saturating_sub(1) * q / 100)
+            .copied()
+            .unwrap_or(0)
+    };
+    format!(
+        "light: ao={} palette_p50={} p99={} max={} requantized={requantized} arena_entries={arena}",
+        ao_name(ao),
+        at(50),
+        at(99),
+        entries.last().copied().unwrap_or(0),
+    )
+}
+
+/// The `sky:` line: light paths, sky walks and the memory of the light caches.
+fn sky_line(map: &ChunkMap, sky: &SkyMap, stats: &WorldStats, light: bool) -> String {
+    let cache: usize = map
+        .iter()
+        .filter_map(|(_, slot)| Some(slot.light()?.heap_bytes()))
+        .sum();
+    let mib = |bytes: usize| bytes as f64 / f64::from(1 << 20);
+    format!(
+        "sky: light={} full={} fast={} columns={} walked={} walks={} private_generations={} \
+         cache_mib={:.1} sky_mib={:.1}",
+        if light { "on" } else { "off" },
+        stats.light_full,
+        stats.light_fast,
+        sky.len(),
+        sky.walked(),
+        stats.sky_walks,
+        stats.sky_private_generations,
+        mib(cache),
+        mib(sky.heap_bytes()),
+    )
+}
+
 /// 99th percentile of `values` (0 when empty).
 fn p99(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
@@ -430,6 +531,7 @@ fn drive(
     mut run: ResMut<Run>,
     stats: Res<WorldStats>,
     map: Res<ChunkMap>,
+    sky: Res<SkyMap>,
     settings: Res<WorldSettings>,
     frames: Res<FrameStats>,
     viewers: Query<(&Transform, &ChunkViewer)>,
@@ -462,6 +564,8 @@ fn drive(
                 p99(&run.updates),
             );
             println!("{}", world_line(&map));
+            println!("{}", light_line(&map, settings.ao_policy));
+            println!("{}", sky_line(&map, &sky, &stats, settings.light));
             run.next_phase(Phase::Loading, now, x, &mut exit);
         }
         Phase::Idle { since } if now.duration_since(since) >= run.options.idle => {
@@ -594,6 +698,23 @@ mod tests {
         ] {
             assert!(parse(args).is_err(), "{args:?} was accepted");
         }
+    }
+
+    #[test]
+    fn ao_and_light_modes() {
+        let o = parse(&[]).expect("valid").expect("not help");
+        assert_eq!(o.ao, AoPolicy::BakedLitOnly);
+        for (name, policy) in AO_MODES {
+            let o = parse(&["--ao", name]).expect("valid").expect("not help");
+            assert_eq!((o.ao, ao_name(policy)), (policy, name));
+        }
+        assert!(parse(&["--ao", "on"]).is_err());
+        assert!(o.light);
+        let o = parse(&["--light", "off"])
+            .expect("valid")
+            .expect("not help");
+        assert!(!o.light);
+        assert!(parse(&["--light", "yes"]).is_err());
     }
 
     #[test]

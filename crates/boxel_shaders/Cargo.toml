@@ -14,6 +14,7 @@ bytemuck.workspace = true
 [dev-dependencies]
 naga = { workspace = true, features = ["wgsl-in", "glsl-out", "msl-out", "hlsl-out", "spv-out"] }
 boxel_mesh.workspace = true
+boxel_voxel.workspace = true
 
 [lints]
 workspace = true

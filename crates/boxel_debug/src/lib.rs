@@ -6,8 +6,9 @@
 //! Shown: frames presented per second and app updates per second (they differ: see
 //! `boxel_app::FrameLimit`), the average and worst frame time of the last second, the frame
 //! limit with the vsync state and present mode, the GPU (adapter, backend, tier, device class,
-//! driver), the camera (position, chunk, facing) and the chunk counters of
-//! `boxel_world::WorldStats` plus the GPU-side chunk and draw call counts of
+//! driver), the camera (position, chunk, facing), the voxel light (sky and RGB levels) at the
+//! eye and at the [`CrosshairTarget`], the time of day (`boxel_world::TimeOfDay`) and the chunk
+//! counters of `boxel_world::WorldStats` plus the GPU-side chunk and draw call counts of
 //! `boxel_render::RenderInfo`. Missing resources (no world, no renderer yet) just hide their
 //! lines.
 //!
@@ -31,9 +32,9 @@ use boxel_ecs::prelude::*;
 use boxel_math::{DVec3, UVec2};
 use boxel_render::{OverlayDraw, OverlayRect, PresentSettings, RenderInfo, SurfaceInfo};
 use boxel_transform::Transform;
-use boxel_voxel::BlockPos;
+use boxel_voxel::{BlockPos, LightValue};
 use boxel_window::{ButtonInput, KeyCode};
-use boxel_world::WorldStats;
+use boxel_world::{ChunkMap, TimeOfDay, WorldStats};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write;
 use std::time::{Duration, Instant};
@@ -117,6 +118,34 @@ impl OverlayLines {
     /// The lines, in key order.
     pub fn iter(&self) -> impl Iterator<Item = &str> {
         self.lines.values().map(String::as_str)
+    }
+}
+
+/// The voxel the crosshair points into: apps that pick blocks set it to the cell in front of the
+/// picked face (the light there is what shades that face), `None` when nothing is picked. The
+/// overlay shows its light next to the eye's. Inserted (empty) by [`DebugOverlayPlugin`].
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrosshairTarget(pub Option<BlockPos>);
+
+/// The light the overlay shows: at the eye's voxel and at the [`CrosshairTarget`]. `None` light
+/// means the chunk is not loaded or keeps no light: outside `WorldSettings::light_cache_radius`,
+/// or within it before the chunk's mesh or light job finished (all-air chunks included).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LightProbe {
+    /// Light of the voxel holding the eye.
+    pub eye: Option<LightValue>,
+    /// The crosshair target and its light.
+    pub target: Option<(BlockPos, Option<LightValue>)>,
+}
+
+/// `sky 15 rgb 14 11 6`, or `-` when unknown.
+fn light_text(light: Option<LightValue>) -> String {
+    match light {
+        Some(l) => {
+            let [r, g, b] = l.rgb();
+            format!("sky {} rgb {r} {g} {b}", l.sky())
+        }
+        None => "-".to_string(),
     }
 }
 
@@ -275,6 +304,7 @@ impl Plugin for DebugOverlayPlugin {
         .init_resource::<OverlayDraw>()
         .init_resource::<OverlayLines>()
         .init_resource::<Crosshair>()
+        .init_resource::<CrosshairTarget>()
         .add_systems(Update, (toggle_overlay, frame_keys))
         .add_systems(Last, (track_frames, build_overlay).chain());
     }
@@ -356,6 +386,10 @@ pub struct OverlayInputs {
     pub camera: Option<(DVec3, boxel_math::Vec3)>,
     /// Chunk counters.
     pub world: Option<WorldStats>,
+    /// Voxel light at the eye and the crosshair (`None`: no world).
+    pub light: Option<LightProbe>,
+    /// World clock (`None`: no `DaylightPlugin`).
+    pub time: Option<TimeOfDay>,
     /// Lines added by apps ([`OverlayLines`]), shown last.
     pub extra: Vec<String>,
 }
@@ -465,6 +499,32 @@ pub fn overlay_lines(inputs: &OverlayInputs) -> Vec<String> {
             cardinal(yaw)
         ));
     }
+    if let Some(light) = &inputs.light {
+        lines.push(format!("Light eye {}", light_text(light.eye)));
+        if let Some((pos, value)) = light.target {
+            lines.push(format!(
+                "      target {} {} {}  {}",
+                pos.x,
+                pos.y,
+                pos.z,
+                light_text(value)
+            ));
+        }
+    }
+    if let Some(time) = &inputs.time {
+        let state = if time.paused {
+            "  paused".to_string()
+        } else if time.speed != 1 {
+            format!("  x{}", time.speed)
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "Time {}  day {}{state}",
+            time.clock_text(),
+            time.day()
+        ));
+    }
     if let Some(world) = &inputs.world {
         lines.push(format!(
             "Chunks {} loaded  {} data ready",
@@ -510,6 +570,11 @@ fn build_overlay(
     crosshair: Option<Res<Crosshair>>,
     surface: Option<Res<SurfaceInfo>>,
     cameras: Query<(&Camera, &Transform)>,
+    world_view: (
+        Option<Res<ChunkMap>>,
+        Option<Res<CrosshairTarget>>,
+        Option<Res<TimeOfDay>>,
+    ),
     mut draw: ResMut<OverlayDraw>,
 ) {
     let frame = surface.map(|s| s.size).filter(|s| s.x > 0 && s.y > 0);
@@ -525,6 +590,18 @@ fn build_overlay(
         }
         return;
     }
+    let camera = cameras
+        .iter()
+        .find(|(camera, _)| camera.active)
+        .map(|(_, transform)| (transform.translation, transform.forward()));
+    let (map, target, time) = world_view;
+    let light = map.as_deref().map(|map| LightProbe {
+        eye: camera.and_then(|(eye, _)| map.light_at(BlockPos::from_world(eye))),
+        target: target
+            .as_deref()
+            .and_then(|t| t.0)
+            .map(|pos| (pos, map.light_at(pos))),
+    });
     let inputs = OverlayInputs {
         frames: (window.fps(), window.average(), window.worst()),
         presented_fps: render.is_some().then(|| presented.fps()),
@@ -532,11 +609,10 @@ fn build_overlay(
         present: present.as_deref().copied(),
         frame_keys: overlay.frame_keys,
         render: render.as_deref().cloned(),
-        camera: cameras
-            .iter()
-            .find(|(camera, _)| camera.active)
-            .map(|(_, transform)| (transform.translation, transform.forward())),
+        camera,
         world: world.as_deref().copied(),
+        light,
+        time: time.as_deref().copied(),
         extra: extra
             .as_deref()
             .map(|e| e.iter().map(str::to_string).collect())
@@ -685,6 +761,55 @@ mod tests {
         assert_eq!(cardinal(270.0), "west");
         assert_eq!(cardinal(314.999_999), "north");
         assert_eq!(shorten(&"x".repeat(80)).len(), MAX_NAME);
+    }
+
+    #[test]
+    fn lines_show_the_light_at_the_eye_and_the_crosshair_and_the_time() {
+        let mut time = TimeOfDay::at_clock(18.5);
+        let inputs = OverlayInputs {
+            light: Some(LightProbe {
+                eye: Some(LightValue::new(15, 0, 0, 0)),
+                target: Some((
+                    BlockPos::new(-3, 64, 1 << 40),
+                    Some(LightValue::new(9, 14, 11, 6)),
+                )),
+            }),
+            time: Some(time),
+            ..OverlayInputs::default()
+        };
+        let lines = overlay_lines(&inputs);
+        for want in [
+            "Light eye sky 15 rgb 0 0 0",
+            "      target -3 64 1099511627776  sky 9 rgb 14 11 6",
+            "Time 18:30  day 0",
+        ] {
+            assert!(lines.contains(&want.to_string()), "{want}: {lines:?}");
+        }
+        // Unknown light (not loaded or not cached), no target, a paused or fast clock.
+        time.paused = true;
+        let inputs = OverlayInputs {
+            light: Some(LightProbe::default()),
+            time: Some(time),
+            ..OverlayInputs::default()
+        };
+        let lines = overlay_lines(&inputs);
+        assert!(lines.contains(&"Light eye -".to_string()), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("target")), "{lines:?}");
+        assert!(lines.contains(&"Time 18:30  day 0  paused".to_string()));
+        time.paused = false;
+        time.speed = 60;
+        let inputs = OverlayInputs {
+            time: Some(time),
+            ..OverlayInputs::default()
+        };
+        assert!(overlay_lines(&inputs).contains(&"Time 18:30  day 0  x60".to_string()));
+        // No world, no light lines.
+        let lines = overlay_lines(&OverlayInputs::default());
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("Light") || l.starts_with("Time"))
+        );
     }
 
     #[test]

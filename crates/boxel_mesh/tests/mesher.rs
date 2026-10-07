@@ -2,17 +2,24 @@
 //! texture layers, gather and the `mesh_chunk` fast paths.
 mod common;
 
+use boxel_light::PaddedLight;
 use boxel_mesh::{
-    BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, MAX_QUADS_PER_BUCKET, MAX_QUADS_PER_FACE_BUCKET,
-    MaterialTable, MeshInput, Mesher, PackedQuad, PaddedChunk, TRANSLUCENT_BUCKET, VoxelClass,
+    AoPolicy, BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, FULL_SKY_ENTRY, LightQuantization,
+    MAX_QUADS_PER_BUCKET, MAX_QUADS_PER_FACE_BUCKET, MaterialTable, MeshInput, MeshOptions, Mesher,
+    PackedQuad, PaddedChunk, TRANSLUCENT_BUCKET, VoxelClass,
 };
 use boxel_voxel::{
-    BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, Face, LocalPos, NEIGHBOR_OFFSETS,
+    BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, Face, LightValue, LocalPos,
+    NEIGHBOR_OFFSETS,
 };
 use common::{
     CUTOUT, NO_GEOMETRY, OPAQUE, Repr, TRANSLUCENT, chunk_repr, class_at, dense_from,
     neighbor_slot, set_material, test_table, verify_mesh,
 };
+
+/// The default options (AO baked on lit faces). Without light every face is lit, so these
+/// scenes get AO wherever an opaque voxel touches a face's front layer.
+const OPTIONS: MeshOptions = MeshOptions::with_ao(AoPolicy::BakedLitOnly);
 
 fn registry() -> (BlockRegistry, MaterialTable) {
     let registry = BlockRegistry::default_blocks();
@@ -30,6 +37,7 @@ fn isolated(center: &ChunkData) -> MeshInput<'_> {
     MeshInput {
         center,
         neighbors: [None; 26],
+        light: None,
     }
 }
 
@@ -37,13 +45,14 @@ fn surrounded<'a>(center: &'a ChunkData, neighbor: &'a ChunkData) -> MeshInput<'
     MeshInput {
         center,
         neighbors: [Some(neighbor); 26],
+        light: None,
     }
 }
 
 /// Meshes `padded` with a fresh mesher.
 fn mesh_padded(padded: &PaddedChunk, table: &MaterialTable) -> ChunkMesh {
     let mut out = ChunkMesh::default();
-    Mesher::new().mesh(padded, table, &mut out);
+    Mesher::new().mesh(padded, None, table, OPTIONS, &mut out);
     out
 }
 
@@ -79,7 +88,7 @@ fn single_voxel_gives_six_unit_quads() {
         ([0, 31, 17], Repr::Packed),
     ] {
         let center = single_voxel_chunk(stone, p, repr);
-        let mesh = mesher.mesh_chunk(&isolated(&center), &table);
+        let mesh = mesher.mesh_chunk(&isolated(&center), &table, OPTIONS);
         assert_eq!(
             mesh.bucket_counts,
             [1, 1, 1, 1, 1, 1, 0, 0],
@@ -106,7 +115,7 @@ fn full_chunk_with_empty_neighbors_gives_six_full_quads() {
     let dense = chunk_repr(&dense_from(|_, _, _| stone.0), Repr::Direct);
     let mut mesher = Mesher::new();
     for center in [&uniform, &dense] {
-        let mesh = mesher.mesh_chunk(&isolated(center), &table);
+        let mesh = mesher.mesh_chunk(&isolated(center), &table, OPTIONS);
         assert_eq!(mesh.bucket_counts, [1, 1, 1, 1, 1, 1, 0, 0]);
         let layer = registry.face_texture(stone, Face::PosY).0;
         let expected = [
@@ -134,7 +143,7 @@ fn checkerboard_fills_every_opaque_face_bucket() {
         &dense_from(|x, y, z| if (x + y + z) % 2 == 0 { stone } else { 0 }),
         Repr::Packed,
     );
-    let mesh = Mesher::new().mesh_chunk(&isolated(&center), &table);
+    let mesh = Mesher::new().mesh_chunk(&isolated(&center), &table, OPTIONS);
     for face in Face::ALL {
         assert_eq!(mesh.bucket_counts[face.index()], MAX_QUADS_PER_FACE_BUCKET);
     }
@@ -153,7 +162,7 @@ fn transparent_checkerboards_fill_their_shared_bucket() {
             &dense_from(|x, y, z| if (x + y + z) % 2 == 0 { state } else { 0 }),
             Repr::Direct,
         );
-        let mesh = Mesher::new().mesh_chunk(&isolated(&center), &table);
+        let mesh = Mesher::new().mesh_chunk(&isolated(&center), &table, OPTIONS);
         let mut expected = [0; BUCKET_COUNT];
         expected[bucket] = MAX_QUADS_PER_BUCKET;
         assert_eq!(mesh.bucket_counts, expected, "{name}");
@@ -222,7 +231,7 @@ fn buckets_follow_the_render_shape() {
         }),
         Repr::Packed,
     );
-    let mesh = Mesher::new().mesh_chunk(&isolated(&center), &table);
+    let mesh = Mesher::new().mesh_chunk(&isolated(&center), &table, OPTIONS);
     assert_eq!(mesh.bucket_counts, [1, 1, 1, 1, 1, 1, 6, 6]);
     for face in Face::ALL {
         assert_eq!(mesh.bucket(face.index())[0].pos(), [2, 2, 2]);
@@ -265,7 +274,7 @@ fn quads_carry_the_texture_layer_of_their_face() {
         }),
         Repr::Direct,
     );
-    let mesh = Mesher::new().mesh_chunk(&isolated(&center), &table);
+    let mesh = Mesher::new().mesh_chunk(&isolated(&center), &table, OPTIONS);
     assert_eq!(mesh.total_quads(), 12, "two boxes, six merged quads each");
     for quad in &mesh.quads {
         let state = if quad.pos()[0] >= 20 { log } else { grass };
@@ -312,6 +321,7 @@ fn gather_with_uniform_neighbors() {
     let input = MeshInput {
         center: &center,
         neighbors,
+        light: None,
     };
     let padded = gathered(&input, &table);
     for y in -1..=32 {
@@ -376,7 +386,9 @@ fn missing_and_air_neighbors_expose_borders_and_opaque_neighbors_hide_them() {
         let mut input = surrounded(&stone, &stone);
         input.neighbors[neighbor_slot(open.normal().x, open.normal().y, open.normal().z)] =
             neighbor;
-        let mesh = mesher.mesh_chunk(&input, &table);
+        // AO off: the stone edge neighbors around the open face would shade (and split) its
+        // border rows.
+        let mesh = mesher.mesh_chunk(&input, &table, MeshOptions::with_ao(AoPolicy::Off));
         let mut expected = [0; BUCKET_COUNT];
         if expect_open {
             expected[open.index()] = 1;
@@ -401,7 +413,7 @@ fn mesh_chunk_fast_paths_match_the_slow_path() {
     // Uniform air (and states without geometry) never produce quads.
     for center in [&air, &no_geometry, &out_of_table] {
         for input in [isolated(center), surrounded(center, &stone)] {
-            assert!(mesher.mesh_chunk(&input, &table).is_empty());
+            assert!(mesher.mesh_chunk(&input, &table, OPTIONS).is_empty());
             assert!(slow(&input).is_empty());
         }
     }
@@ -409,19 +421,20 @@ fn mesh_chunk_fast_paths_match_the_slow_path() {
     let mut buried = MeshInput {
         center: &stone,
         neighbors: [None; 26],
+        light: None,
     };
     for face in Face::ALL {
         let n = face.normal();
         buried.neighbors[neighbor_slot(n.x, n.y, n.z)] = Some(&dirt);
     }
-    assert!(mesher.mesh_chunk(&buried, &table).is_empty());
+    assert!(mesher.mesh_chunk(&buried, &table, OPTIONS).is_empty());
     assert!(slow(&buried).is_empty());
     // Uniform water in water: no fast path, still empty (bgm hides same-material faces).
     let flooded = surrounded(&water, &water);
-    assert!(mesher.mesh_chunk(&flooded, &table).is_empty());
+    assert!(mesher.mesh_chunk(&flooded, &table, OPTIONS).is_empty());
     // Not buried: the fast path must not trigger.
     let isolated_stone = isolated(&stone);
-    let mesh = mesher.mesh_chunk(&isolated_stone, &table);
+    let mesh = mesher.mesh_chunk(&isolated_stone, &table, OPTIONS);
     assert_eq!(mesh.total_quads(), 6);
     assert_eq!(mesh, slow(&isolated_stone));
 }
@@ -446,12 +459,16 @@ fn mesher_and_output_are_reusable() {
     for center in &chunks {
         let neighbors: [Option<&ChunkData>; 26] =
             std::array::from_fn(|i| (i % 3 != 0).then_some(&chunks[i % chunks.len()]));
-        let input = MeshInput { center, neighbors };
+        let input = MeshInput {
+            center,
+            neighbors,
+            light: None,
+        };
         mesher.gather(&input, &table, &mut padded);
-        mesher.mesh(&padded, &table, &mut out);
+        mesher.mesh(&padded, None, &table, OPTIONS, &mut out);
         let fresh = mesh_padded(&gathered(&input, &table), &table);
         assert_eq!(out, fresh);
-        assert_eq!(mesher.mesh_chunk(&input, &table), fresh);
+        assert_eq!(mesher.mesh_chunk(&input, &table, OPTIONS), fresh);
         verify_mesh(&padded, &table, &out);
     }
 }
@@ -521,6 +538,7 @@ fn every_neighbor_slot_is_read_from_the_right_place() {
         &MeshInput {
             center: &center,
             neighbors: slots,
+            light: None,
         },
         &table,
     );
@@ -546,4 +564,112 @@ fn every_neighbor_slot_is_read_from_the_right_place() {
             }
         }
     }
+}
+
+/// The face of `mesh` that covers unit face `(p, face)`.
+fn quad_at(mesh: &ChunkMesh, p: [u32; 3], face: Face) -> PackedQuad {
+    *mesh
+        .quads
+        .iter()
+        .find(|q| q.unit_faces().any(|u| u == (p, face)))
+        .unwrap_or_else(|| panic!("no quad covers {p:?} {face:?}"))
+}
+
+#[test]
+fn ao_shades_the_floor_along_a_wall_and_follows_the_policy() {
+    let table = test_table();
+    // A stone floor at y = 0, a stone wall at x = 10 (y 1..=3) and a leaves wall at x = 20.
+    let center = chunk_repr(
+        &dense_from(|x, y, _| match (x, y) {
+            (_, 0) => OPAQUE[0],
+            (10, 1..=3) => OPAQUE[1],
+            (20, 1..=3) => CUTOUT[0],
+            _ => 0,
+        }),
+        Repr::Direct,
+    );
+    let padded = gathered(&isolated(&center), &table);
+    let mesh_with = |light: Option<&PaddedLight>, policy| {
+        let mut out = ChunkMesh::default();
+        Mesher::new().mesh(
+            &padded,
+            light,
+            &table,
+            MeshOptions::with_ao(policy),
+            &mut out,
+        );
+        verify_mesh(&padded, &table, &out);
+        common::verify_shading(&padded, light, policy, &out);
+        out
+    };
+    let dark = PaddedLight::Uniform(LightValue::DARK);
+    // +Y: u = x, v = z. The floor face at x = 9 touches the wall on its +u side: corners 1 and
+    // 3 see the wall as a side and as the diagonal (AO 1); corners 0 and 2 are open.
+    let beside_wall = ([9, 0, 5], Face::PosY);
+    for (light, policy, ao) in [
+        (None, AoPolicy::Baked, 0b01_11_01_11),
+        (None, AoPolicy::BakedLitOnly, 0b01_11_01_11),
+        (Some(&dark), AoPolicy::Baked, 0b01_11_01_11),
+        (Some(&dark), AoPolicy::BakedLitOnly, 0xFF),
+        (None, AoPolicy::Off, 0xFF),
+    ] {
+        let mesh = mesh_with(light, policy);
+        let quad = quad_at(&mesh, beside_wall.0, beside_wall.1);
+        assert_eq!(quad.ao_byte(), ao, "{light:?} {policy:?}");
+        // Leaves cast no AO.
+        assert_eq!(quad_at(&mesh, [19, 0, 5], Face::PosY).ao_byte(), 0xFF);
+        if ao == 0xFF {
+            // Nothing splits the floor but the wall itself: one quad on each side of it.
+            assert_eq!(quad.w() * quad.h(), 10 * 32, "{light:?} {policy:?}");
+        } else {
+            // The shaded strip is its own quad, but for its two ends: past the chunk (no
+            // neighbors) the wall is not a diagonal, so the end corners get AO 2.
+            assert_eq!((quad.pos(), quad.w(), quad.h()), ([9, 0, 1], 1, 30));
+            assert_eq!(
+                quad_at(&mesh, [9, 0, 0], Face::PosY).ao_byte(),
+                0b01_11_10_11
+            );
+        }
+    }
+}
+
+#[test]
+fn light_reaches_the_palette_and_splits_merges() {
+    let table = test_table();
+    let center = chunk_repr(
+        &dense_from(|_, y, _| if y == 0 { OPAQUE[0] } else { 0 }),
+        Repr::Packed,
+    );
+    let input = isolated(&center);
+    let padded = gathered(&input, &table);
+    // Sky 15 everywhere but a red light fading from (16, 1, 16).
+    let light = common::full_light(|x, y, z| {
+        let d = ((x - 16).abs() + (y - 1).abs() + (z - 16).abs()) as u8;
+        LightValue::new(15, 14u8.saturating_sub(d), 0, 0).0
+    });
+    let input = MeshInput {
+        light: Some(&light),
+        ..input
+    };
+    let mut mesher = Mesher::new();
+    let mesh = mesher.mesh_chunk(&input, &table, OPTIONS);
+    verify_mesh(&padded, &table, &mesh);
+    common::verify_shading(&padded, Some(&light), AoPolicy::BakedLitOnly, &mesh);
+    assert_eq!(mesh.light_quantization, LightQuantization::Exact);
+    // The floor top splits where the red changes; the far corners are plain sky.
+    let top = mesh.bucket(Face::PosY.index());
+    assert!(top.len() > 1, "the light did not split the floor");
+    let corner = quad_at(&mesh, [0, 0, 0], Face::PosY);
+    assert_eq!(mesh.corner_light(corner), [LightValue::FULL_SKY; 4]);
+    let lamp = quad_at(&mesh, [16, 0, 16], Face::PosY);
+    assert!(mesh.corner_light(lamp).iter().all(|c| c.red() >= 12));
+    // Same input, same mesh: palette order and hash are deterministic.
+    let again = Mesher::new().mesh_chunk(&input, &table, OPTIONS);
+    assert_eq!(again, mesh);
+    assert_eq!(again.hash, mesh.compute_hash());
+    // Without light the floor top is one quad again.
+    let unlit = mesher.mesh_chunk(&isolated(&center), &table, OPTIONS);
+    assert_eq!(unlit.bucket(Face::PosY.index()).len(), 1);
+    assert_eq!(unlit.palette, vec![FULL_SKY_ENTRY]);
+    assert_ne!(unlit.hash, mesh.hash);
 }

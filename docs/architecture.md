@@ -148,11 +148,11 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_gfx` | política sobre wgpu: preferencias, instancia, tiers, scoring, smoke, selección, LKG, superficie, readback, hal; ejemplo `gpu_info` | (wgpu) |
 | `boxel_shaders` | WGSL embebido, composición, espejos `#[repr(C)]`, tests de naga | (wgpu, bytemuck) |
 | `boxel_voxel` | coordenadas (`BlockPos`, `ChunkPos`, `WorldPos`: bloque más offset, exacto a cualquier distancia), `Face`, registry (con emisión RGB y opacidad de luz), paleta, `LightValue` y `LightTables`, `ChunkData` con sus máscaras de luz (`LightMasks`) | (glam) |
-| `boxel_mesh` | `PackedQuad`, `ChunkMesh`, `PaddedChunk`, `Mesher` (bgm) | voxel |
+| `boxel_mesh` | `PackedQuad`, `ChunkMesh` con su paleta de luz, `PaddedChunk`, `Mesher` (fork de bgm que fusiona por material, AO y luz) | voxel |
 | `boxel_light` | luz de vóxeles en CPU, sin ECS ni GPU (ADR 0015): techos de cielo por columna (`SkyTile`, caminata hacia abajo), luz exacta de un chunk desde una caja de 64³ (cielo y RGB, caminos rápidos para cuevas oscuras y cielo abierto), `PaddedLight`, `ChunkLight`; oráculo global para los tests | voxel |
 | `boxel_worldgen` | trait `WorldGenerator`; generadores `FlatGenerator`, `TerrainGenerator`, `ForestGenerator` (terreno con árboles) y `OverworldGenerator` (superficie sobre piedra infinita hacia abajo, con cuevas y árboles; etapas en `overworld`: `Heightmap`, `SurfaceRules`, `Caves`, más `Trees`); ruido 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`) | voxel |
-| `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, eventos, `ChunkStore` | app, voxel, mesh, worldgen, transform, diagnostic |
-| `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `PresentSettings` (vsync en tiempo de ejecución), texturas procedurales, screenshots | gfx, shaders, world, camera, window |
+| `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, eventos, `ChunkStore`, reloj del mundo (`TimeOfDay`, `DaylightCurve`, `DaylightPlugin`) | app, voxel, mesh, light, worldgen, transform, diagnostic |
+| `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `SceneLight` (luz del cielo, ambiente y curva de brillo del frame), `PresentSettings` (vsync en tiempo de ejecución), texturas procedurales, screenshots | gfx, shaders, world, camera, window |
 | `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::solid`), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas, el integrador de un cuerpo (`step_body`, `predict`). Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`; pasos en `FixedPostUpdate`, interpolación en `AfterFixedMainLoop`), `PhysicsQuery`, cuerpos (`RigidBody`, `Collider`, `Velocity`, `BodyPosition`, `Contacts`, `Interpolated`, `Teleport`, `Frozen`), `CharacterController` y `VoxelImpact`. Hoy fase P2: entre entidades y proyectiles vienen en P3 y P4 | ecs, app, math, transform, voxel, world, diagnostic |
 | `boxel_facade_check` | solo CI: prueba que los derives resuelven `::boxel::ecs` para un usuario que depende solo de `boxel` | fachada |
 | `vendor/*` (7 crates) | ECS y tareas (fork de Bevy) | - |
@@ -268,7 +268,7 @@ pedido de dispositivo no pueden contradecirse:
 
 | Tier | Requisitos (todos) |
 |---|---|
-| Low | backend real; `Features::IMMEDIATES`; `max_immediate_size >= 16`; `max_vertex_buffers >= 1`; `max_texture_array_layers >= 256` |
+| Low | backend real; `Features::IMMEDIATES`; `max_immediate_size >= 16`; `max_vertex_buffers >= 2` (el quad y su luz, ADR 0015); `max_texture_array_layers >= 256` |
 | Mid | Low + `DownlevelFlags::VERTEX_STORAGE`; `max_storage_buffers_per_shader_stage >= 4`; `max_storage_buffer_binding_size >= 128 MiB`; en GL, versión parseada >= 4.3 (ES >= 3.1) |
 | High | Mid + `COMPUTE_SHADERS | INDIRECT_EXECUTION`; `MULTI_DRAW_INDIRECT_COUNT | INDIRECT_FIRST_INSTANCE`; `max_compute_workgroup_size_x >= 64`; `max_compute_invocations_per_workgroup >= 64`; `max_compute_workgroups_per_dimension >= 1024`; backend Vulkan (DX12 solo con `TierPolicy::dx12_high`) |
 
@@ -608,16 +608,20 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
 - **Registry** de datos: `BlockState(u16)` denso en tiempo de ejecución (0 = aire), nunca se
   persiste crudo (M1 agrega el IdMap nombre a id). Tablas SoA: nombre, forma (`None`, `Opaque`,
   `Cutout`, `Translucent`), flags, emisión RGB, opacidad de luz (15 en los opacos, 1 en hojas y
-  agua), texturas por cara. Contenido M0 congelado: aire,
+  agua), texturas por cara. Contenido congelado: aire,
   piedra, tierra, pasto, arena, grava, nieve, bedrock, tronco, hojas (cutout), agua (translúcida),
-  tablones.
+  tablones y, desde la fase P6 de la luz, los primeros emisores: lámparas de cubo completo naranja
+  (14, 11, 6), roja (14, 2, 2), azul (3, 6, 14) y blanca (15, 15, 15) y una lava provisoria
+  (15, 7, 2), opaca y sólida hasta que haya fluidos (`boxel_voxel::LAMPS`, `LAVA_EMISSION`).
 - **Contenedor de paleta:** `Uniform(state)` | `Packed { palette, bits 1/2/4/8, words }` |
   `Direct(u16)`. Los índices nunca cruzan palabras de 64 bits. `set` agrega a la paleta en el
   lugar mientras entra; se compacta al guardar o en reposo. Medido en un mundo de 512x256x512:
   60.6 % de los chunks son aire uniforme; la paleta reduce 128 MiB a 9 MiB (0.14 B/vóxel).
 - **Luz:** no vive en el chunk. Es un dato derivado, función pura de los bloques y de un techo de
-  cielo por columna, que calcula `boxel_light` (ADR 0015). Hasta que el mesher la use (fase P2)
-  todo se dibuja con cielo 15.
+  cielo por columna, que calcula `boxel_light` (ADR 0015) dentro del job de malla; el mesher la
+  hornea por esquina y el fragment shader la interpola (sección 10.7). Los chunks cerca del
+  viewer guardan su luz para gameplay (`ChunkMap::light_at`, que también muestra el overlay F3):
+  la del job de malla o, si ese job no la guardó, la de un job de luz (sección 8).
 - **Máscaras de luz** de 4 KiB (1 bit por vóxel): `LightMasks` (opaca, parcial y emisores). Los
   chunks uniformes y los de 1 bit sin emisores la sirven desde sus propias palabras; los demás la
   construyen la primera vez que se pide y la guardan en caché hasta que cambian sus bloques.
@@ -646,7 +650,24 @@ Estados ortogonales por slot:
 - `Interest`: `DATA`, `MESH`, `PINNED`.
 - `neighbors_ready`: máscara de 26 bits, válida desde que llegan los datos del propio slot (antes
   nadie la lee, y crear un slot no busca a sus vecinos); `epoch`: contador que sube cuando cambia
-  el borde de un vecino; `cancel`: `Arc<AtomicBool>` para cancelación cooperativa.
+  el borde de un vecino o su luz; `cancel`: `Arc<AtomicBool>` para cancelación cooperativa;
+  `light`: la luz del chunk (`ChunkLight`) dentro de `light_cache_radius`, con la versión de
+  datos y el `epoch` con que se calculó (solo vale si siguen iguales).
+
+La caché de luz sigue al viewer: un chunk con malla dentro de `light_cache_radius` (8) cuyo job de
+malla no guardó la luz (todo aire, encerrado, un job fallido, o que entró al radio después de
+mallarse) recibe un job de luz (`JobKind::Light`), que calcula solo la luz y va detrás de las
+mallas de la vista. Un chunk uniforme de un bloque opaco sin emisión queda oscuro sin job. Cuando
+un viewer cambia de chunk se recorren solo las cáscaras que entran y salen del radio: las que
+entran piden su luz, las que salen la sueltan.
+
+`SkyMap` (recurso) guarda un `SkyColumn` por columna de chunks con algún slot: el `SkyTile` con
+el techo de cielo de cada una de sus 32x32 columnas, calculado por un job `SkyTile` que camina la
+columna hacia abajo (ADR 0015). Se crea con el primer slot de la columna y se borra con el último,
+y lleva las capas de sus slots cargados, ordenadas: caminatas, bandas y búsquedas de techo
+recorren solo esas capas, nunca un rango numérico (dos viewers a 2^35 capas en la misma columna
+no cuestan más que dos vecinos). Una columna se camina solo cuando una malla la necesita, y antes
+espera los datos cargados que va a leer.
 
 Cada viewer quiere un cilindro vertical: malla en el círculo `radius` (xz) y en las capas a
 `vertical_radius` o menos (8 por defecto); datos un chunk más en cada dirección (círculo
@@ -672,8 +693,12 @@ Sistemas en `Update`, encadenados (`WorldSystems`):
    recalculan por lotes, las más cercanas primero. El mapa reserva lugar para dos vistas: al
    saltar, la vieja sigue cargada hasta que se crea la nueva y el mapa no crece a mitad de la
    carga.
-2. **Edits:** aplica `EditQueue` agrupando por chunk: `make_mut`, `set`, sube `version`, pide
-   remesh del chunk y de los vecinos de cara tocados (sube su `epoch`). Prioridad 0.
+2. **Edits:** aplica `EditQueue` agrupando por chunk: `make_mut`, `set`, sube `version`, y
+   remalla como un lote (prioridad 0, sube el `epoch`): todo chunk cuya región acolchada contiene
+   un vóxel cambiado (caras, AO y luz de esquina: hasta 8); si cambió la opacidad o la emisión,
+   todo chunk al alcance del cambio de luz (a lo sumo 14 vóxeles, medido con la luz guardada); si
+   se movió el techo de cielo de la columna, los chunks de la banda alrededor de la columna. Un
+   techo que no se resuelve con lo cargado manda la columna a caminar de nuevo.
 3. **Dispatch:** primero vacía el canal de resultados (libera sus lugares en vuelo) y después
    saca jobs mientras `in_flight < tope`; repite mientras lleguen resultados, dentro de
    `job_budget` (2 ms por frame). Antes de sacar un job recalcula las prioridades viejas que
@@ -682,15 +707,22 @@ Sistemas en `Update`, encadenados (`WorldSystems`):
    sale de los hilos de async compute, del costo medido de un job (promedio de cada frame,
    suavizado entre frames) y del intervalo entre frames: trabajo para 1.5 frames (al menos 2 por
    hilo, como mucho 4096). Generación: captura generador, registry y clave. Malla: solo si los 26
-   vecinos están `Ready` o `Missing`; captura el centro y los 26 `Arc`, la tabla de materiales,
-   `data_version` y `epoch`. Atajos: centro aire uniforme, o centro opaco uniforme rodeado de
-   opacos uniformes en las 6 caras, da `Empty` sin job. Descarta resultados viejos (generación
-   del slotmap, `data_version`, `epoch`, `cancel`).
+   vecinos están `Ready` o `Missing` y, si su caja de luz puede tener cielo directo, los techos
+   de sus 3x3 columnas están calculados; captura el centro y los 26 `Arc`, los 9 tiles, la tabla
+   de materiales, `data_version` y `epoch`, y en el hilo calcula la luz y después malla. Atajos:
+   centro aire uniforme, o centro opaco uniforme rodeado de opacos uniformes en las 6 caras, da
+   `Empty` sin job. Descarta resultados viejos (generación del slotmap, `data_version`, `epoch`,
+   `cancel`; en las caminatas, la `version` de la columna).
 4. **Collect:** publica `ChunkMeshEvent::Upsert` / `Remove` de las mallas listas, hasta 512 por
-   frame.
+   frame. Una malla igual a la publicada no se envía. Las mallas de un lote de ediciones salen
+   juntas y antes que las del streaming, fuera de ese tope: una retenida en el frame N espera al
+   resto hasta el frame N + 2 y sale ahí como mucho. Los jobs del lote mantienen prioridad 0
+   aunque el viewer se mueva. Si otra edición toca un chunk con su malla retenida, esa malla se
+   descarta y el chunk se remalla enseguida, en el lote unido.
 
 **Contrato de resultados:** todo job enviado devuelve **exactamente un** mensaje: `Generated`,
-`Meshed`, `Cancelled` (vio la bandera de cancelación) o `Failed` (con el texto del pánico). El
+`Meshed`, `Walked` (una caminata de cielo), `Cancelled` (vio la bandera de cancelación) o
+`Failed` (con el texto del pánico). El
 cuerpo del job corre dentro de `catch_unwind` y el job lleva un token cuyo `Drop` envía `Failed`
 si no se envió nada. Motivo: los hilos de `boxel_tasks` atrapan el pánico de una tarea y siguen;
 sin el contrato, cada job perdido dejaba ocupado un lugar "en vuelo" y tras 16 pérdidas el
@@ -703,7 +735,7 @@ snapshots viejos de un vecino ya no se acepta aunque la versión del centro coin
 Prioridades: ni rayon ni `boxel_tasks` las tienen; por eso `JobScheduler` propio (min-heap por
 `(prioridad, secuencia)`, tope en vuelo). Los jobs corren en `AsyncComputeTaskPool` a través del
 trait `JobExecutor` (`TaskPoolExecutor`; `InlineExecutor` en tests deterministas). Cada hilo usa
-un `Mesher` thread-local (~210 KiB de scratch).
+un `Mesher` thread-local (~0.6 MiB de scratch) y un `LightScratch` (~0.7 MiB).
 
 ---
 
@@ -714,21 +746,29 @@ un `Mesher` thread-local (~210 KiB de scratch).
    (losas de 32x32 en caras, filas en aristas, un vóxel en esquinas). Clase: `Opaque` oculta caras
    vecinas; `Cutout` y `Translucent` son transparentes para bgm (no ocultan, y bgm omite las caras
    entre dos vóxeles transparentes del mismo material).
-2. **bgm** `fast_mesh` (Mesher<32>): ~23 µs por chunk de 32³ en terreno (30 a 48x más rápido que
-   `block-mesh` greedy).
-3. **Conversión** a `PackedQuad` canónico: con `Face::vertices_packed` se toman min y max de los 4
-   vértices; el mínimo es la esquina; `w` y `h` son la extensión en los ejes u y v canónicos de la
-   cara; en caras positivas se resta 1 en el eje normal (bgm ubica el plano en `voxel + 1`).
-   Validado contra un oráculo de fuerza bruta en 32 chunks reales.
+2. **Greedy binario** (`src/greedy.rs`, fork en el repo de bgm 0.5.2 con su aviso MIT): el culling
+   de caras de bgm sin cambios y el merge una cara a la vez, comparando una clave por cara en
+   lugar del id del vóxel. La clave es el material, el byte de AO y el índice de la paleta de luz
+   (ADR 0015); con AO apagado y sin luz es el material y los quads son idénticos byte a byte a los
+   de bgm (prueba de regresión). Unos 20 µs por chunk de 32³ en terreno sin AO ni luz (30 a 48x
+   más rápido que `block-mesh` greedy).
+3. **AO y luz por esquina** (`src/shading.rs`, `AoPolicy`): cada cara visible mira las 9 celdas de
+   la capa de enfrente; el AO sale de una tabla de 256 entradas sobre su opacidad y la luz de cada
+   esquina es el promedio redondeado de sus 4 celdas sin las opacas. Las 4 luces van a la paleta
+   del chunk (hasta 4096 entradas, orden de primera aparición). Ambos dependen solo del vértice,
+   así que un quad fusionado es exacto. Los quads salen ya canónicos (esquina mínima, `w` y `h`
+   en los ejes u y v de la cara). Validado contra oráculos de fuerza bruta de caras visibles y de
+   sombreado.
 4. **Buckets (8, congelados, ADR 0012):** 0 a 5 = caras opacas en orden `Face`; 6 = **cutout**
    (todas las caras de materiales cutout, como las hojas); 7 = translúcido. `ChunkMesh` guarda los
-   quads contiguos por bucket y `bucket_counts[8]`.
+   quads contiguos por bucket, `bucket_counts[8]`, la paleta de luz y un hash de todo. En el arena
+   de la GPU la paleta va justo después de los quads del chunk (sección 10.2).
 
 **`PackedQuad` (8 bytes):**
 
 ```
-geo: x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | reservado:4
-mat: capa:12 | ao:8 (2 bits por esquina) | cielo:4 | bloque:4 | flags:4
+geo: x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | flags:4 (ninguno definido)
+mat: capa:12 | ao:8 (2 bits por esquina, 3 = abierto) | luz:12 (índice en la paleta del chunk)
 ejes (u, v): ±Y -> (X, Z); ±X -> (Z, Y); ±Z -> (X, Y)
 ```
 
@@ -737,9 +777,11 @@ translúcido juntan las seis caras: hasta 98 304 quads con un solo material por 
 que cubre el buffer de índices compartido. Dos materiales cutout (o translúcidos) alternados no se
 tapan entre sí y llegan a 196 608; el registry de M0 tiene uno de cada (riesgo abierto, ver
 `informe-m0.md`). Pasado el límite, los tres tiers dibujan solo los primeros 98 304 quads del
-bucket. AO: bgm no tiene; en M0 todos los quads llevan AO abierto (0xFF). M1 decide entre AO
-en la clave de merge (+36 a +65 % de quads, medido) para Mid/Low y AO en el fragment shader desde
-ocupación en GPU para High.
+bucket. AO: va en la clave del merge en todos los tiers (ADR 0015), por defecto solo en las caras
+con algo de luz (`AoPolicy::BakedLitOnly`). Con la luz del mundo cuesta 1.08x de quads en el
+overworld a y = 80, 1.00x bajo tierra (las cuevas oscuras se fusionan como sin AO) y 1.74x en el
+forest, sin cuevas (gate G1 de P3). El AO en el fragment shader desde ocupación en GPU queda para
+High y Mid si las mediciones lo piden.
 
 Hojas en M0: como bgm omite las caras entre dos hojas vecinas, la copa de un árbol se ve como una
 cáscara texturada (el pipeline cutout no descarta caras traseras, así que por los huecos se ve la
@@ -793,12 +835,13 @@ cambia el layout.
 
 | Recurso | Uso | Tiers |
 |---|---|---|
-| Arena de quads | un buffer `STORAGE | VERTEX | COPY_DST` de `PackedQuad`, sub-asignado con `offset-allocator` (una asignación por chunk con los 8 buckets contiguos); 8 Mi quads = 64 MiB por defecto | todos |
-| Tabla de chunks | storage `array<ChunkGpu>` (64 B: origen i32x3 con los 32 bits bajos del origen `i64`, `quad_base`, 8 contadores, flags con el bit vivo solo dentro de la ventana de la cámara, que lee solo High, relleno) | High, Mid |
+| Arena de quads | un buffer `STORAGE | VERTEX | COPY_DST` de entradas de 8 bytes, sub-asignado con `offset-allocator`: una asignación por chunk con los 8 buckets contiguos y, a continuación, su paleta de luz (`boxel_render::arena_len`: quads más entradas de paleta, al menos una); 8 Mi entradas = 64 MiB por defecto | todos |
+| Tabla de chunks | storage `array<ChunkGpu>` (64 B: origen i32x3 con los 32 bits bajos del origen `i64`, `quad_base`, 8 contadores, flags con el bit vivo solo dentro de la ventana de la cámara, que lee solo High, `light_base` = `quad_base` + quads en el offset 52, `light_len` (entradas de la paleta) en el 56, relleno) | High, Mid |
+| Luz por quad | buffer `VERTEX | COPY_DST` paralelo al arena y del mismo tamaño, reservado entero al crear el renderer (64 MiB con el arena por defecto, haya quads o no): en el offset de cada quad, su entrada de paleta ya expandida (segundo atributo de instancia) | Low |
 | Tabla CPU | espejo en CPU (origen `i64`, rangos, contadores) para culling en CPU | todos |
 | Índice compartido | u32 `[0,1,2,2,1,3] + 4i` para 98 304 quads (2.36 MB) | High, Mid |
 | Textura de bloques | `texture_2d_array` RGBA8 sRGB 16x16 con mips, procedural en M0 | todos |
-| View uniform | 240 B (std140): `view_proj`, 6 planos, origen de render, cámara relativa, niebla, contadores | todos |
+| View uniform | 336 B (std140, solo `vec4`): `view_proj`, 6 planos, origen de render, cámara relativa, niebla, contadores, `sky_light` (color del cielo por la luz del día y piso de ambiente), `light_params` (fuerza del AO, ganancia de la luz de bloque) y `light_curve` (brillo de los 16 niveles) | todos |
 | Color principal | `Rgba8UnormSrgb` (`RENDER_ATTACHMENT | COPY_SRC | TEXTURE_BINDING`), luego blit a la superficie (alfa siempre 1); facilita screenshots | todos |
 | Profundidad | `Depth32Float` | todos |
 
@@ -846,8 +889,10 @@ tiene compute).
 
 1. Culling en CPU.
 2. Pipeline `vs_instanced` (opaco y luego cutout), arena como buffer de vértices por instancia
-   (`Uint32x2`, stride 8), `TriangleStrip`; por bucket visible: `set_immediates(0, origen del
-   chunk)` y `draw(0..4, primer_quad..primer_quad+n)`.
+   (`Uint32x2` en `@location(0)`, stride 8) y el buffer de luz por quad como segundo buffer por
+   instancia (`Uint32x2` en `@location(1)`, mismos offsets: el mismo `first_instance` llega a los
+   dos), `TriangleStrip`; por bucket visible: `set_immediates(0, origen del chunk)` y
+   `draw(0..4, primer_quad..primer_quad+n)`.
 3. Blit.
 
 El bucket translúcido se genera y se sube pero no se dibuja en M0 (pase translúcido con orden de
@@ -911,7 +956,43 @@ Validados en `cargo test` con naga 30.0.1 contra **todos** los backends que wgpu
 escritorio: GLSL en el piso de cada módulo, MSL 2.1 y 2.4, HLSL SM 5.1 (FXC) y SM 6.0 (DXC) y
 SPIR-V, además de layouts y reglas. Así se cubren DX12 y Metal sin hardware. Reglas: niveles de
 mip de `textureLoad` en `i32` (bug wgpu#10037), nada de `enable subgroups;`, `var<immediate>` (no
-`var<push_constant>`). WESL se reevalúa en M2.
+`var<push_constant>`). WESL se reevalúa en M2. Los tests de naga también fijan el layout de
+`View` (336 B) y `ChunkGpu` (`light_base` en el offset 52, `light_len` en el 56), los nibbles de
+`LightValue`, que Low recibe exactamente dos atributos de instancia (el quad y su luz) con un solo
+uniform block y que ningún shader guarda un array en una variable local.
+
+### 10.7 Luz en el fragment shader y día y noche (ADR 0015)
+
+Cada quad lleva el índice de su entrada en la paleta de luz del chunk: las `LightValue` (cielo,
+rojo, verde, azul, 4 bits cada uno) de sus 4 esquinas. High y Mid la leen del arena en
+`ChunkGpu::light_base` más el índice, sin binding nuevo; Low la recibe ya expandida como segundo
+atributo de instancia. Un índice fuera de la paleta (solo en una malla mal hecha) da cielo
+abierto en los tres tiers y en la CPU: High y Mid lo comparan con `ChunkGpu::light_len` y nunca
+leen los datos de otro chunk. El vertex shader pasa la entrada, el byte de AO y la cara como valores
+planos, y (s, t), la posición dentro del quad (la esquina k está en (k & 1, k >> 1)).
+
+El fragment shader, igual en los tres tiers:
+
+1. Interpola bilinealmente cada canal de las 4 esquinas en (s, t) (en la forma `a + (b - a) * s`,
+   exacta cuando las 4 esquinas son iguales) y pasa cada canal por la curva de brillo
+   (`light_curve`, 16 niveles, interpolación lineal, indexada en el uniform sin copiarla).
+2. `luz = max(curva(cielo) * sky_light.rgb, curva(rgb) * ganancia, ambiente)`.
+3. `color = albedo * sombreado de cara * mix(1 - fuerza_ao, 1, ao / 3) * luz`, con el AO también
+   interpolado bilinealmente, y después la niebla.
+
+Con cielo 15 bajo un cielo blanco de mediodía y AO abierto da exactamente la imagen anterior a la
+luz. La curva por defecto es la de Minecraft, `f / (4 - 3f)` con `f = nivel / 15`, con un ajuste
+de gamma (`RenderSettings::light_gamma`); la fuerza del AO (0.55) y la ganancia de la luz de
+bloque (1) también están en `RenderSettings`.
+
+Día y noche no remallan ni suben nada: `boxel_world::DaylightPlugin` (en `DefaultPlugins`) avanza
+`TimeOfDay` un tick por paso fijo (64 Hz; un día de 20 minutos son 76 800 ticks, el tick 0 es la
+salida del sol), y `DaylightCurve` da, según la altura del sol, el color de la luz del cielo (día
+blanco a 1.0, atardecer cálido a 0.6, noche azul a 0.2), el piso de ambiente (0.02 a toda hora:
+las cuevas quedan casi negras) y el color del cielo, que es también el de la niebla. El `Extract`
+del render arma con eso la `SceneLight` del frame; sin el plugin queda un mediodía con
+`RenderSettings::clear_color`. La luz de bloque no depende de la hora: una cueva cerrada se ve
+igual al mediodía y a medianoche (lo verifica `gpu_terrain`).
 
 ---
 
@@ -1072,7 +1153,7 @@ schedule `Shutdown` es el lugar para el `flush` final.
 | **M0 scaffold** | workspace y tooling; fork del ECS; `boxel_app`; ventana con compuerta de presentación e input; detección completa (tiers, scoring, smoke, overrides, LKG de crashes, device lost, catch_unwind); tiers High, Mid y Low con buckets opaco y cutout (High sin Hi-Z); paleta, registry, worldgen, mesher, streaming con jobs; cámara libre; `gpu_info`, `voxel_world`, `headless_world` | compila, tests, clippy y rustdoc limpios; `voxel_world` dibuja terreno en Vulkan High y en GL (Mid y Low); imágenes iguales entre tiers; la simulación no se congela con la ventana minimizada |
 | **M1 mundo jugable** | criterio de entrada: re-fork sobre bevy 0.20.0 final. Pase translúcido; AO; raycast y edición de bloques (hechos: ADR 0016, `voxel_world`); el sistema de ediciones si se recortó; propiedades de bloque e IdMap; `ChunkStore` con redb; crecimiento del arena y presupuesto de subida; caras interiores de hojas (opcional); re-selección en caliente si se recortó; decisión `static-dxc` o DLL en Windows; timestamps de GPU; actualizar a wgpu 31 | editar y guardar un mundo; agua visible |
 | **M2 GPU-driven completo** | Hi-Z en dos fases (High); cave culling por BFS (Mid/Low); pool de ocupación en GPU; `create_shader_module_trusted` con medición; pipeline cache de Vulkan; verificar DX12 High; clip control en GL (upstream); decidir WESL | caída de draws y de tiempo de GPU medida |
-| **M3 escala** | LOD con mips de 32³ y anillos; listas indirectas segmentadas (más de 65 535 draws); render en hilo propio; inicialización de GPU asíncrona (respetando los error scopes por hilo); luz (cielo y bloque) | distancias de vista grandes estables |
+| **M3 escala** | LOD con mips de 32³ y anillos; listas indirectas segmentadas (más de 65 535 draws); render en hilo propio; inicialización de GPU asíncrona (respetando los error scopes por hilo) | distancias de vista grandes estables |
 | **M4 experimental** | ray marching sobre bricks/ocupación; mesh shaders opt-in; evaluar bevy_ecs 0.21 y el núcleo ECS propio | prototipos medidos |
 
 wgpu v31 (milestone con fecha 2026-10-09) trae cambios que tocan el scaffold
@@ -1095,7 +1176,7 @@ actualiza al empezar M1, con `boxel_gfx` como frontera.
 | Fork de `bevy_ecs` sobre un RC | API cambia en 0.20 final, fixes con retraso | re-fork por script (segundos) como criterio de M1, parches upstream, Miri en PRs, superficie curada |
 | `ParamSet` necesita `&'static` | sorpresa para usuarios | documentado en la fachada con el texto exacto del error |
 | glam 0.34.0 salió el mismo día del diseño y rompió API | fricción con crates de terceros | pin `=0.34.0`; volver a 0.33.12 si un crate necesario lo exige (cambio acotado a `boxel_math`) |
-| binary-greedy-meshing: crate chico, MIT, sin AO | dependencia frágil | envoltorio propio y oráculo de tests; fork in-repo en M1 si hace falta |
+| binary-greedy-meshing: crate chico, MIT, sin AO | dependencia frágil | fork en el repo (`boxel_mesh/src/greedy.rs`, ADR 0015) con oráculos y una prueba de regresión byte a byte contra el crate |
 | Arranque lento en laptops híbridos (despertar la dGPU ~1 s) | mala primera impresión | documentado; inicialización asíncrona en M3 |
 | Más de 65 535 buckets visibles en High | huecos, también cerca | aviso; segmentación en M3 |
 | Implementación en paralelo con varios agentes | bloqueos y pisadas | copias privadas por paquete, compuerta de propiedad, elementos transversales ya implementados en el esqueleto, protocolo de bloqueo con el lead |

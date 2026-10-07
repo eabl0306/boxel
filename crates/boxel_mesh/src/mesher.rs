@@ -1,14 +1,49 @@
-use crate::{
-    BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, PADDED, PackedQuad, PaddedChunk, TRANSLUCENT_BUCKET,
-    VoxelClass,
+use crate::greedy::Greedy;
+use crate::packed::{LightQuantization, layout, palette_entry};
+use crate::shading::{
+    AO_OPEN_BYTE, AO_TABLE, FaceKey, FaceShading, KeyTable, LightPalette, PaletteFull, corner_ao,
+    face_corner_lights, neighborhood8,
 };
-use binary_greedy_meshing as bgm;
+use crate::{
+    BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, PADDED, PADDED_AREA, PADDED_VOLUME, PackedQuad,
+    PaddedChunk, TRANSLUCENT_BUCKET, VoxelClass,
+};
+use boxel_light::PaddedLight;
 use boxel_voxel::{
-    BlockRegistry, BlockState, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, Face, LocalPos,
+    BlockRegistry, BlockState, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, Face, LightValue, LocalPos,
     NEIGHBOR_OFFSETS, RenderShape, neighbor_index,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
+
+/// Which faces get ambient occlusion (ADR 0015). AO is part of the greedy-merge key, so every
+/// AO value baked splits merges: it costs quads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum AoPolicy {
+    /// No AO: every face is open, quads merge as by material alone.
+    Off,
+    /// AO on every face.
+    Baked,
+    /// AO on every face with some light at one of its corners. A face whose 4 corner lights are
+    /// all 0 keeps AO open and merges as with `Off`: almost all cave geometry is dark, and AO
+    /// there is invisible at the default ambient floor. To revisit when held lights arrive.
+    #[default]
+    BakedLitOnly,
+}
+
+/// Mesher knobs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct MeshOptions {
+    /// Ambient occlusion policy.
+    pub ao: AoPolicy,
+}
+
+impl MeshOptions {
+    /// Options with this AO policy.
+    pub const fn with_ao(ao: AoPolicy) -> Self {
+        Self { ao }
+    }
+}
 
 /// Mesher-side view of the registry: per material id, bgm class, render shape (bucket routing)
 /// and the texture layer of each face. Built once per registry and shared (`Arc`) by mesh jobs.
@@ -106,18 +141,30 @@ impl MaterialTable {
     }
 }
 
-/// Center chunk plus its 26 neighbors in `boxel_voxel::NEIGHBOR_OFFSETS` order. A `None`
-/// neighbor is treated as empty (air).
+/// Center chunk plus its 26 neighbors in `boxel_voxel::NEIGHBOR_OFFSETS` order, and the light of
+/// the padded chunk. A `None` neighbor is treated as empty (air).
 pub struct MeshInput<'a> {
     /// Chunk to mesh.
     pub center: &'a ChunkData,
     /// Neighbors.
     pub neighbors: [Option<&'a ChunkData>; 26],
+    /// Light of the chunk and its 1-voxel border (`boxel_light::compute`). `None`: open sky
+    /// (sky 15) everywhere.
+    pub light: Option<&'a PaddedLight>,
 }
 
-/// Reusable mesher (one per worker thread; ~210 KiB of scratch plus the bgm quad lists).
+/// Mesh scratch other than the padded input (borrowed apart from it by `mesh_chunk`).
+struct Scratch {
+    greedy: Greedy,
+    /// Merge key per padded voxel, written per face at that face's visible voxels only.
+    keys: Box<[u32]>,
+    palette: LightPalette,
+    key_table: KeyTable,
+}
+
+/// Reusable mesher (one per worker thread; about 0.6 MiB of scratch plus the quad lists).
 pub struct Mesher {
-    inner: bgm::Mesher<32>,
+    scratch: Scratch,
     padded: PaddedChunk,
     /// `ChunkData::to_dense` target for non-uniform center chunks (`CHUNK_VOLUME` states).
     dense: Box<[BlockState]>,
@@ -133,7 +180,12 @@ impl Mesher {
     /// New mesher.
     pub fn new() -> Self {
         Self {
-            inner: bgm::Mesher::new(),
+            scratch: Scratch {
+                greedy: Greedy::new(),
+                keys: vec![0; PADDED_VOLUME].into_boxed_slice(),
+                palette: LightPalette::new(),
+                key_table: KeyTable::new(),
+            },
             padded: PaddedChunk::new(),
             dense: vec![BlockState::AIR; CHUNK_VOLUME].into_boxed_slice(),
         }
@@ -141,6 +193,7 @@ impl Mesher {
 
     /// Fills `out` from the center chunk and the border voxels of its neighbors (face
     /// neighbors: 32x32 slabs, edges: 32 rows, corners: 1 voxel). Uniform chunks take a fast path.
+    /// `input.light` is not read.
     pub fn gather(
         &mut self,
         input: &MeshInput<'_>,
@@ -150,23 +203,48 @@ impl Mesher {
         gather_into(&mut self.dense, input, materials, out);
     }
 
-    /// Meshes a padded chunk: bgm `fast_mesh`, then converts every bgm quad to the canonical
-    /// [`crate::PackedQuad`] (via `Face::vertices_packed` min/max; positive faces subtract 1 on
-    /// the normal axis), assigns `MaterialTable::layer`, routes each quad to
-    /// `MaterialTable::bucket` and writes `out` bucket-contiguous.
-    pub fn mesh(&mut self, padded: &PaddedChunk, materials: &MaterialTable, out: &mut ChunkMesh) {
-        mesh_into(&mut self.inner, padded, materials, out);
+    /// Meshes a padded chunk lit by `light` (`None`: open sky everywhere) and writes `out`
+    /// bucket-contiguous with its light palette and hash.
+    ///
+    /// Face culling and greedy merging are binary greedy meshing (an in-repo fork, `greedy.rs`).
+    /// Two unit faces merge only if they have the same material, the same AO byte and the same 4
+    /// corner lights ([`reference_face_shading`] defines both, per `options.ao`). Each quad gets
+    /// `MaterialTable::layer` of its material and face and is routed to `MaterialTable::bucket`.
+    /// Corner lights go to the palette in first-seen order; past 4096 distinct entries the chunk
+    /// is meshed again at the next [`LightQuantization`] level.
+    pub fn mesh(
+        &mut self,
+        padded: &PaddedChunk,
+        light: Option<&PaddedLight>,
+        materials: &MaterialTable,
+        options: MeshOptions,
+        out: &mut ChunkMesh,
+    ) {
+        mesh_into(&mut self.scratch, padded, light, materials, options, out);
     }
 
     /// `gather` + `mesh`. Fast paths: center uniform air -> empty mesh; center uniform opaque with
     /// all 6 face neighbors uniform opaque -> empty mesh.
-    pub fn mesh_chunk(&mut self, input: &MeshInput<'_>, materials: &MaterialTable) -> ChunkMesh {
+    pub fn mesh_chunk(
+        &mut self,
+        input: &MeshInput<'_>,
+        materials: &MaterialTable,
+        options: MeshOptions,
+    ) -> ChunkMesh {
         let mut out = ChunkMesh::default();
         if trivially_empty(input, materials) {
+            out.hash = out.compute_hash();
             return out;
         }
         gather_into(&mut self.dense, input, materials, &mut self.padded);
-        mesh_into(&mut self.inner, &self.padded, materials, &mut out);
+        mesh_into(
+            &mut self.scratch,
+            &self.padded,
+            input.light,
+            materials,
+            options,
+            &mut out,
+        );
         out
     }
 }
@@ -328,22 +406,261 @@ const fn mask_row(x: i32, y: i32) -> usize {
     (x + 1) as usize + (y + 1) as usize * PADDED
 }
 
-/// [`Mesher::mesh`] body. Borrows only the bgm mesher.
+/// How the merge keys of a mesh decode back to a [`FaceKey`].
+#[derive(Clone, Copy, Debug)]
+enum KeyKind {
+    /// The key is the material (AO open, palette index 0).
+    Material,
+    /// `material << 8 | ao` (palette index 0).
+    MaterialAo,
+    /// A [`KeyTable`] id.
+    Table,
+}
+
+/// [`Mesher::mesh`] body. Borrows only the scratch, so `mesh_chunk` can pass the mesher's own
+/// padded buffer.
 fn mesh_into(
-    inner: &mut bgm::Mesher<32>,
+    s: &mut Scratch,
     padded: &PaddedChunk,
+    light: Option<&PaddedLight>,
     materials: &MaterialTable,
+    options: MeshOptions,
     out: &mut ChunkMesh,
 ) {
-    inner.clear();
-    inner.fast_mesh(&padded.voxels, &padded.opaque, &padded.transparent);
     out.clear();
+    s.greedy
+        .cull(&padded.voxels, &padded.opaque, &padded.transparent);
+    let elide = options.ao == AoPolicy::BakedLitOnly;
+    let full = match light {
+        None => Err(LightValue::FULL_SKY),
+        Some(PaddedLight::Uniform(v)) => Err(*v),
+        Some(PaddedLight::Full(values)) => Ok(&**values),
+    };
+    let kind = match full {
+        // Uniform light: one palette entry, the key is the material and maybe the AO.
+        Err(v) => {
+            s.greedy.clear();
+            let ao = match options.ao {
+                AoPolicy::Off => false,
+                AoPolicy::Baked => true,
+                AoPolicy::BakedLitOnly => !v.is_dark(),
+            };
+            for face in 0..6 {
+                if ao {
+                    let keys = &mut s.keys;
+                    // Never fails: no palette here.
+                    let _ = visit_face(face, &s.greedy, padded, |i, _, nb9| {
+                        let ao = AO_TABLE[neighborhood8(nb9)];
+                        keys[i] = u32::from(padded.voxels[i]) << 8 | u32::from(ao);
+                        Ok(())
+                    });
+                    s.greedy.merge_face(face, &s.keys);
+                } else {
+                    s.greedy.merge_face(face, &padded.voxels);
+                }
+            }
+            if s.greedy.quads.iter().any(|q| !q.is_empty()) {
+                out.palette.push(palette_entry([v; 4]));
+            }
+            if ao {
+                KeyKind::MaterialAo
+            } else {
+                KeyKind::Material
+            }
+        }
+        Ok(values) => {
+            // `Flat` always fits, so some level succeeds.
+            for level in LightQuantization::ALL {
+                s.greedy.clear();
+                s.palette.clear();
+                s.key_table.clear();
+                if mesh_lit(s, padded, values, options.ao, elide, level).is_ok() {
+                    out.light_quantization = level;
+                    break;
+                }
+            }
+            out.palette.extend_from_slice(s.palette.entries());
+            KeyKind::Table
+        }
+    };
+    match kind {
+        KeyKind::Material => assemble(&s.greedy, materials, out, |k| FaceKey {
+            material: k as u16,
+            ao: AO_OPEN_BYTE,
+            light: 0,
+        }),
+        KeyKind::MaterialAo => assemble(&s.greedy, materials, out, |k| FaceKey {
+            material: (k >> 8) as u16,
+            ao: k as u8,
+            light: 0,
+        }),
+        KeyKind::Table => assemble(&s.greedy, materials, out, |k| s.key_table.key(k)),
+    }
+    out.hash = out.compute_hash();
+}
 
+/// Fills the keys and merges every face under full light at quantization `level`. `Err` when
+/// the palette overflows (the caller tries the next level).
+fn mesh_lit(
+    s: &mut Scratch,
+    padded: &PaddedChunk,
+    light: &[u16; PADDED_VOLUME],
+    ao: AoPolicy,
+    elide: bool,
+    level: LightQuantization,
+) -> Result<(), PaletteFull> {
+    for (face, &(su, sv)) in LIGHT_STRIDES.iter().enumerate() {
+        let (keys, palette, table) = (&mut s.keys, &mut s.palette, &mut s.key_table);
+        visit_face(face, &s.greedy, padded, |i, front, nb9| {
+            let ao = match ao {
+                AoPolicy::Off => AO_OPEN_BYTE,
+                AoPolicy::Baked | AoPolicy::BakedLitOnly => AO_TABLE[neighborhood8(nb9)],
+            };
+            // Cell (du, dv) in -1..=1 is `cells[(dv + 1) * 3 + (du + 1)]`.
+            let corner = front - sv - su;
+            let cells: [u16; 9] =
+                std::array::from_fn(|c| light[corner + (c / 3) * sv + (c % 3) * su]);
+            // Equal cells (open sky, dark caves): every corner is that value.
+            let corners = level.apply(if cells.iter().all(|&c| c == cells[4]) {
+                [LightValue(cells[4]); 4]
+            } else {
+                face_corner_lights(&cells, nb9)
+            });
+            let ao = if elide && corners.iter().all(|c| c.is_dark()) {
+                AO_OPEN_BYTE
+            } else {
+                ao
+            };
+            keys[i] = table.id(padded.voxels[i], ao, corners, palette)?;
+            Ok(())
+        })?;
+        s.greedy.merge_face(face, &s.keys);
+    }
+    Ok(())
+}
+
+/// Padded-index strides along the u and v axes of each face ([`Face::axes`]: ±Y -> x, z;
+/// ±X -> z, y; ±Z -> x, y).
+const LIGHT_STRIDES: [(usize, usize); 6] = [
+    (PADDED, 1),
+    (PADDED, 1),
+    (1, PADDED_AREA),
+    (1, PADDED_AREA),
+    (PADDED, PADDED_AREA),
+    (PADDED, PADDED_AREA),
+];
+
+/// Calls `visit(voxel index, front index, nb9)` for every visible unit face of `face` (after
+/// `Greedy::cull`): the padded indices of the voxel and of the voxel in front of the face, and
+/// the opacity (`PaddedChunk::opaque`) of the 3x3 front-layer neighborhood (bit
+/// `(dv + 1) * 3 + (du + 1)`).
+#[inline]
+fn visit_face(
+    face: usize,
+    greedy: &Greedy,
+    padded: &PaddedChunk,
+    visit: impl FnMut(usize, usize, u32) -> Result<(), PaletteFull>,
+) -> Result<(), PaletteFull> {
+    let rows = greedy.face_rows(face);
+    let opaque = &padded.opaque;
+    match face {
+        0 => visit_rows::<0>(rows, opaque, visit),
+        1 => visit_rows::<1>(rows, opaque, visit),
+        2 => visit_rows::<2>(rows, opaque, visit),
+        3 => visit_rows::<3>(rows, opaque, visit),
+        4 => visit_rows::<4>(rows, opaque, visit),
+        _ => visit_rows::<5>(rows, opaque, visit),
+    }
+}
+
+/// [`visit_face`] for face `F`.
+#[inline]
+fn visit_rows<const F: usize>(
+    rows: &[u64],
+    opaque: &[u64],
+    mut visit: impl FnMut(usize, usize, u32) -> Result<(), PaletteFull>,
+) -> Result<(), PaletteFull> {
+    // Padded index offset of the voxel in front.
+    let normal: isize = match F {
+        0 => PADDED_AREA as isize,
+        1 => -(PADDED_AREA as isize),
+        2 => PADDED as isize,
+        3 => -(PADDED as isize),
+        4 => 1,
+        _ => -1,
+    };
+    for (r, &bits) in rows.iter().enumerate() {
+        if bits == 0 {
+            continue;
+        }
+        // Unpadded x and y of the row (see `Greedy::face_rows`).
+        let (x, y) = if F == 2 || F == 3 {
+            (r / 32, r % 32)
+        } else {
+            (r % 32, r / 32)
+        };
+        let mut bits = bits;
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let z = if F >= 4 { bit - 1 } else { bit };
+            let i = (z + 1) + (x + 1) * PADDED + (y + 1) * PADDED_AREA;
+            let front = i.wrapping_add_signed(normal);
+            visit(i, front, front_neighborhood::<F>(opaque, x, y, z))?;
+        }
+    }
+    Ok(())
+}
+
+/// Opacity of the 3x3 front-layer neighborhood of the face `F` of unpadded voxel `(x, y, z)`,
+/// bit `(dv + 1) * 3 + (du + 1)` (see `shading`).
+#[inline]
+fn front_neighborhood<const F: usize>(opaque: &[u64], x: usize, y: usize, z: usize) -> u32 {
+    // Mask row of padded (px, py); bit pz.
+    let row = |px: usize, py: usize| opaque[px + py * PADDED];
+    // Bits j -> 3j (a column of three cells along v).
+    let spread3 = |t: u64| ((t & 1) | (t & 2) << 2 | (t & 4) << 4) as u32;
+    match F {
+        // ±Y: u = x, v = z; the front layer is padded y + 2 (+Y) or y (-Y). The bits of padded
+        // z..z + 2 are the cells dv = -1..=1.
+        0 | 1 => {
+            let py = if F == 0 { y + 2 } else { y };
+            (0..3).fold(0, |nb, du| nb | spread3((row(x + du, py) >> z) & 7) << du)
+        }
+        // ±X: u = z, v = y; the front layer is padded x + 2 (+X) or x (-X).
+        2 | 3 => {
+            let px = if F == 2 { x + 2 } else { x };
+            (0..3).fold(0, |nb, dv| {
+                nb | (((row(px, y + dv) >> z) & 7) as u32) << (3 * dv)
+            })
+        }
+        // ±Z: u = x, v = y; the front layer is padded z + 2 (+Z) or z (-Z).
+        _ => {
+            let pz = if F == 4 { z + 2 } else { z };
+            let mut nb = 0;
+            for dv in 0..3 {
+                for du in 0..3 {
+                    nb |= (((row(x + du, y + dv) >> pz) & 1) as u32) << (3 * dv + du);
+                }
+            }
+            nb
+        }
+    }
+}
+
+/// Converts the merged quads to [`PackedQuad`]s and writes them bucket-contiguous into `out`
+/// (its palette already set), decoding each quad's key with `decode`.
+fn assemble(
+    greedy: &Greedy,
+    materials: &MaterialTable,
+    out: &mut ChunkMesh,
+    decode: impl Fn(u32) -> FaceKey,
+) {
     // Pass 1: bucket sizes, so each bucket is written in place (no second buffer).
     let mut counts = [0u32; BUCKET_COUNT];
-    for (face, quads) in Face::ALL.into_iter().zip(&inner.quads) {
-        for quad in quads {
-            counts[materials.bucket(quad.voxel_id() as u16, face)] += 1;
+    for (face, quads) in Face::ALL.into_iter().zip(&greedy.quads) {
+        for &quad in quads {
+            counts[materials.bucket(decode((quad >> 32) as u32).material, face)] += 1;
         }
     }
     // Bounds: an opaque face bucket holds at most `MAX_QUADS_PER_FACE_BUCKET`. The cutout and
@@ -359,39 +676,64 @@ fn mesh_into(
 
     // Pass 2: convert and scatter.
     out.quads.resize(total, PackedQuad::default());
-    for (face, quads) in Face::ALL.into_iter().zip(&inner.quads) {
-        let bgm_face = bgm::Face::from(face.index() as u8);
+    for (face, quads) in Face::ALL.into_iter().zip(&greedy.quads) {
         for &quad in quads {
-            let material = quad.voxel_id() as u16;
-            let bucket = materials.bucket(material, face);
-            out.quads[cursor[bucket]] =
-                to_packed(bgm_face, quad, face, materials.layer(material, face));
+            let key = decode((quad >> 32) as u32);
+            let bucket = materials.bucket(key.material, face);
+            let packed = to_packed(quad, face, materials.layer(key.material, face), key);
+            if cfg!(debug_assertions) {
+                debug_check_merged(packed, out.corner_light(packed));
+            }
+            out.quads[cursor[bucket]] = packed;
             cursor[bucket] += 1;
         }
     }
     out.bucket_counts = counts;
 }
 
-/// Converts one bgm quad to the canonical [`PackedQuad`]: the min corner of its 4 vertices is
-/// the position, the extents along the face's canonical u/v axes are `w`/`h`, and positive faces
-/// (which bgm puts on the `voxel + 1` plane) move back by one on the normal axis.
+/// The [`PackedQuad`] of a merged quad (`Greedy::quads` format) on `face`, with its texture
+/// layer, AO byte and light palette index.
 #[inline]
-fn to_packed(bgm_face: bgm::Face, quad: bgm::Quad, face: Face, layer: u16) -> PackedQuad {
-    let mut min = [u32::MAX; 3];
-    let mut max = [0u32; 3];
-    for vertex in bgm_face.vertices_packed(quad) {
-        for (axis, c) in vertex.xyz().into_iter().enumerate() {
-            min[axis] = min[axis].min(c);
-            max[axis] = max[axis].max(c);
-        }
+fn to_packed(quad: u64, face: Face, layer: u16, key: FaceKey) -> PackedQuad {
+    use layout::*;
+    PackedQuad {
+        geo: quad as u32 | (face as u32) << GEO_FACE_SHIFT,
+        mat: (u32::from(layer) & MAT_LAYER_MASK)
+            | u32::from(key.ao) << MAT_AO_SHIFT
+            | (u32::from(key.light) & MAT_LIGHT_MASK) << MAT_LIGHT_SHIFT,
     }
-    let (n, u, v) = face.axes();
-    debug_assert_eq!(min[n], max[n], "bgm quad is not planar");
-    let mut pos = min;
-    if face.index().is_multiple_of(2) {
-        pos[n] -= 1;
+}
+
+/// Debug check that a merged quad's AO and corner lights are constant along every axis it
+/// spans more than one voxel on, so interpolating its 4 corners gives exactly what its unit
+/// faces would (holds because both only depend on the vertex).
+fn debug_check_merged(quad: PackedQuad, light: [LightValue; 4]) {
+    let ao = |k| quad.ao(k);
+    if quad.w() > 1 {
+        debug_assert!(
+            light[0] == light[1] && light[2] == light[3] && ao(0) == ao(1) && ao(2) == ao(3),
+            "{quad:?} varies along u: light {light:?}"
+        );
     }
-    PackedQuad::new(pos, max[u] - min[u], max[v] - min[v], face, layer)
+    if quad.h() > 1 {
+        debug_assert!(
+            light[0] == light[2] && light[1] == light[3] && ao(0) == ao(2) && ao(1) == ao(3),
+            "{quad:?} varies along v: light {light:?}"
+        );
+    }
+}
+
+/// Mesher class of padded `(x, y, z)` from the column masks (what face culling reads).
+fn class_from_masks(padded: &PaddedChunk, x: i32, y: i32, z: i32) -> VoxelClass {
+    let row = mask_row(x, y);
+    let bit = 1u64 << (z + 1);
+    if padded.opaque[row] & bit != 0 {
+        VoxelClass::Opaque
+    } else if padded.transparent[row] & bit != 0 {
+        VoxelClass::Transparent
+    } else {
+        VoxelClass::Empty
+    }
 }
 
 /// Brute-force oracle: every visible unit face `(voxel, face)` of the inner 32^3 (a face is
@@ -399,17 +741,7 @@ fn to_packed(bgm_face: bgm::Face, quad: bgm::Quad, face: Face, layer: u16) -> Pa
 /// material). The mesher's output, expanded with `PackedQuad::unit_faces`, must equal this set.
 pub fn reference_visible_faces(padded: &PaddedChunk) -> BTreeSet<([u32; 3], Face)> {
     // Class from the column masks (what bgm reads), material from the voxel ids.
-    let class = |x: i32, y: i32, z: i32| {
-        let row = mask_row(x, y);
-        let bit = 1u64 << (z + 1);
-        if padded.opaque[row] & bit != 0 {
-            VoxelClass::Opaque
-        } else if padded.transparent[row] & bit != 0 {
-            VoxelClass::Transparent
-        } else {
-            VoxelClass::Empty
-        }
-    };
+    let class = |x, y, z| class_from_masks(padded, x, y, z);
     let mut faces = BTreeSet::new();
     for y in 0..CHUNK_SIZE {
         for x in 0..CHUNK_SIZE {
@@ -434,4 +766,71 @@ pub fn reference_visible_faces(padded: &PaddedChunk) -> BTreeSet<([u32; 3], Face
         }
     }
     faces
+}
+
+/// Brute-force oracle of the shading: for every visible unit face ([`reference_visible_faces`]),
+/// its AO byte and the exact light of its 4 corners (no [`LightQuantization`]), straight from
+/// the definitions (ADR 0015):
+/// - The front layer is the layer of voxels the face looks at; the 4 front-layer voxels around
+///   a corner are the one in front of the face, its side along u, its side along v and the
+///   diagonal. Opaque means `PaddedChunk::opaque` (render-opaque).
+/// - Corner light: the rounded per-channel mean `(sum + n / 2) / n` of the light of those 4
+///   voxels, without the opaque ones, and without the diagonal when both sides are opaque.
+///   `light` `None` is sky 15 everywhere.
+/// - AO per corner: 0 when both sides are opaque, else 3 minus the opaque count of the sides
+///   and the diagonal. Always open with [`AoPolicy::Off`]; open on a face whose 4 corner lights
+///   are 0 with [`AoPolicy::BakedLitOnly`].
+pub fn reference_face_shading(
+    padded: &PaddedChunk,
+    light: Option<&PaddedLight>,
+    policy: AoPolicy,
+) -> BTreeMap<([u32; 3], Face), FaceShading> {
+    let opaque = |p: [i32; 3]| class_from_masks(padded, p[0], p[1], p[2]) == VoxelClass::Opaque;
+    let light_at = |p: [i32; 3]| light.map_or(LightValue::FULL_SKY, |l| l.get(p[0], p[1], p[2]));
+    let mut out = BTreeMap::new();
+    for (p, face) in reference_visible_faces(padded) {
+        let (_, ua, va) = face.axes();
+        let n = face.normal().to_array();
+        let front: [i32; 3] = std::array::from_fn(|a| p[a] as i32 + n[a]);
+        let cell = |du: i32, dv: i32| {
+            let mut c = front;
+            c[ua] += du;
+            c[va] += dv;
+            c
+        };
+        let mut ao = 0u8;
+        let mut corners = [LightValue::DARK; 4];
+        for (k, corner) in corners.iter_mut().enumerate() {
+            let su = if k & 1 == 1 { 1 } else { -1 };
+            let sv = if k >> 1 == 1 { 1 } else { -1 };
+            let (side_u, side_v, diagonal) = (cell(su, 0), cell(0, sv), cell(su, sv));
+            let (ou, ov, od) = (opaque(side_u), opaque(side_v), opaque(diagonal));
+            ao |= corner_ao(ou, ov, od) << (2 * k);
+            let mut kept = vec![light_at(front)];
+            if !ou {
+                kept.push(light_at(side_u));
+            }
+            if !ov {
+                kept.push(light_at(side_v));
+            }
+            if !od && !(ou && ov) {
+                kept.push(light_at(diagonal));
+            }
+            let count = kept.len() as u16;
+            let mut value = 0u16;
+            for shift in [12, 8, 4, 0] {
+                let sum: u16 = kept.iter().map(|l| (l.0 >> shift) & 15).sum();
+                value |= ((sum + count / 2) / count) << shift;
+            }
+            *corner = LightValue(value);
+        }
+        let dark = corners.iter().all(|c| c.is_dark());
+        let ao = match policy {
+            AoPolicy::Off => AO_OPEN_BYTE,
+            AoPolicy::BakedLitOnly if dark => AO_OPEN_BYTE,
+            AoPolicy::Baked | AoPolicy::BakedLitOnly => ao,
+        };
+        out.insert((p, face), FaceShading { ao, light: corners });
+    }
+    out
 }

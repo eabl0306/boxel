@@ -324,6 +324,32 @@ fn classify_exactly_at_and_below_every_floor() {
     }
 }
 
+/// Low draws with two instance-step vertex buffers (the quad and its light palette entry, ADR
+/// 0015), so an adapter with a single slot classifies as nothing, on every tier.
+#[test]
+fn every_tier_needs_two_vertex_buffers() {
+    assert_eq!(floors::VERTEX_BUFFERS, 2);
+    for tier in Tier::DESCENDING {
+        let mut caps = at_floor(tier);
+        assert_eq!(caps.limits.max_vertex_buffers, 2);
+        assert_eq!(max(&caps), Some(tier), "{tier} with two vertex buffers");
+        caps.limits.max_vertex_buffers = 1;
+        let c = classify(&caps, TierPolicy::default());
+        assert_eq!(c.max_tier, None, "{tier} with one vertex buffer");
+        assert!(
+            c.reasons
+                .iter()
+                .any(|r| r.starts_with("Low: ") && r.contains("max_vertex_buffers")),
+            "{:?}",
+            c.reasons
+        );
+        // The device request of a classified tier keeps both slots.
+        caps.limits.max_vertex_buffers = 2;
+        let req = boxel_gfx::tier_request(tier, &caps.limits);
+        assert!(req.limits.max_vertex_buffers >= floors::VERTEX_BUFFERS);
+    }
+}
+
 #[test]
 fn score_ordering() {
     let high_perf = wgpu::PowerPreference::HighPerformance;

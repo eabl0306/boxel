@@ -5,12 +5,16 @@
 //! boosts, Escape (or leaving the window) releases the cursor, F3 toggles the debug overlay, F5
 //! cycles the frame limit (30, 60, 144, 240, unlimited) and F6 toggles vsync. While the mouse is
 //! grabbed, left click breaks the block under the crosshair and right click places the selected
-//! block on the face it points at (keys 1 to 9 select it; F3 shows the target and the
-//! selection). Picking is a voxel raycast from the camera (`PhysicsQuery::raycast_voxels`),
-//! reach 6 blocks. G switches between flying and walking: walking is a player body with gravity
-//! (`boxel::physics`, a 0.6 x 1.8 x 0.6 box and a `CharacterController`) that WASD moves along
-//! the view and Space makes jump, with the camera at its eye. F3 shows the mode and a physics
-//! line (`PhysicsStats`) in both modes.
+//! block on the face it points at (keys 1 to 9 and 0 select it, lamps on 7 to 0; F3 shows the
+//! target, the selection and the light at the eye and the crosshair). Picking is a voxel raycast
+//! from the camera (`PhysicsQuery::raycast_voxels`), reach 6 blocks. G switches between flying
+//! and walking: walking is a player body with gravity (`boxel::physics`, a 0.6 x 1.8 x 0.6 box
+//! and a `CharacterController`) that WASD moves along the view and Space makes jump, with the
+//! camera at its eye. F3 shows the mode and a physics line (`PhysicsStats`) in both modes.
+//!
+//! Day and night: a day lasts 20 minutes. `[` and `]` move the clock one hour back and forward,
+//! T pauses it and F runs it 60 times faster; `--time HH:MM` sets the start (noon by default).
+//! `--lamps` places the colored lamps and some lava around the start and begins at night.
 //!
 //! `--frames`, `--duration`, `--screenshot`, `--minimize-test`, `--resize-test`, `--vsync-test`
 //! and the like make it close by itself (`--duration` keeps the interactive path: fly camera
@@ -25,6 +29,8 @@
 //! generator, and `--world overworld` the caves.
 #![expect(clippy::print_stdout, clippy::print_stderr, reason = "CLI output")]
 
+#[path = "shared/clock.rs"]
+mod clock;
 #[path = "shared/player.rs"]
 mod player;
 #[path = "shared/world.rs"]
@@ -32,7 +38,7 @@ mod world;
 
 use boxel::app::{TaskPoolOptions, TaskPoolThreadAssignmentPolicy};
 use boxel::camera::FlyCameraSystems;
-use boxel::debug_overlay::{Crosshair, OverlayLines};
+use boxel::debug_overlay::{Crosshair, CrosshairTarget, OverlayLines};
 use boxel::gfx::wgpu::PresentMode;
 use boxel::gfx::{CLI_HELP, DeviceClass, RgbaImage};
 use boxel::physics::{PhysicsPlugin, Probe as VoxelProbe};
@@ -41,7 +47,7 @@ use boxel::render::{DebugDestroyDevice, GpuFailed, GpuReady, SurfaceInfo};
 use boxel::voxel::{BlockRegistry, MAX_BLOCK_COORD};
 use boxel::window::winit::dpi::PhysicalSize;
 use boxel::window::{PrimaryWindow, WindowResized};
-use boxel::world::{BlockEdit, WorldContent, WorldStats, WorldSystems};
+use boxel::world::{BlockEdit, TimeOfDay, WorldContent, WorldStats, WorldSystems};
 use player::WalkPlugin;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -81,6 +87,10 @@ usage: voxel_world [GPU options] [options]
   --async-threads N       async compute pool size (chunk jobs)
   --debug-overlay         start with the F3 debug overlay visible (F3 toggles it)
   --walk                  start walking on the ground under the camera (G toggles walking)
+  --time HH[:MM]          clock time at the start (06:00 sunrise, 12:00 noon, 00:00 midnight;
+                          a day lasts 20 minutes); default 12:00, 21:00 with --lamps. Scripted
+                          runs (--frames) keep the clock still
+  --lamps                 demo: colored lamps and lava on the ground around the start
   --help                  this text
 exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 check failed, 4 timeout";
 
@@ -157,9 +167,19 @@ struct Options {
     /// `None`: the engine default (`PresentSettings::default()`, vsync off).
     vsync: Option<bool>,
     vsync_test: bool,
+    /// `--time`, clock hours.
+    time: Option<f64>,
+    lamps: bool,
 }
 
 impl Options {
+    /// Clock hours at the start: `--time`, else 21:00 with `--lamps` (they show at night), else
+    /// noon.
+    fn start_hours(&self) -> f64 {
+        self.time
+            .unwrap_or(if self.lamps { LAMPS_DEMO_HOURS } else { 12.0 })
+    }
+
     /// Scripted runs (`--frames`, `--minimize-test`, `--resize-test`): fly-camera input is off
     /// and `--timeout` defaults to [`DEFAULT_TIMEOUT`]. A `--duration` run is not one: it times
     /// the normal interactive path.
@@ -206,6 +226,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         fps_limit: None,
         vsync: None,
         vsync_test: false,
+        time: None,
+        lamps: false,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -326,6 +348,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                 });
             }
             "--vsync-test" => o.vsync_test = true,
+            "--time" => o.time = Some(clock::parse_clock(flag, &value()?)?),
+            "--lamps" => o.lamps = true,
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
@@ -1030,19 +1054,21 @@ fn vsync_test(
 
 /// How far the camera reaches when picking blocks, in blocks.
 const REACH: f64 = 6.0;
-/// The blocks keys 1 to 9 select for placing (names missing from the registry are skipped).
-const HOTBAR: [&str; 9] = [
+/// The blocks keys 1 to 9 and 0 select for placing (names missing from the registry are
+/// skipped).
+const HOTBAR: [&str; 10] = [
     "boxel:stone",
     "boxel:dirt",
     "boxel:grass",
     "boxel:planks",
     "boxel:log",
     "boxel:leaves",
-    "boxel:sand",
-    "boxel:gravel",
-    "boxel:snow",
+    "boxel:lamp_orange",
+    "boxel:lamp_red",
+    "boxel:lamp_blue",
+    "boxel:lamp_white",
 ];
-const HOTBAR_KEYS: [KeyCode; 9] = [
+const HOTBAR_KEYS: [KeyCode; 10] = [
     KeyCode::Digit1,
     KeyCode::Digit2,
     KeyCode::Digit3,
@@ -1052,6 +1078,7 @@ const HOTBAR_KEYS: [KeyCode; 9] = [
     KeyCode::Digit7,
     KeyCode::Digit8,
     KeyCode::Digit9,
+    KeyCode::Digit0,
 ];
 
 /// Block picking: the block under the crosshair and the block to place.
@@ -1155,7 +1182,10 @@ fn picking_lines(picking: &Picking, registry: &BlockRegistry) -> [String; 2] {
         None => format!("Target none (reach {REACH})"),
     };
     let place = match picking.hotbar.get(picking.selected) {
-        Some((name, _)) => format!("Place [{}] {name}  (keys 1-9)", picking.selected + 1),
+        Some((name, _)) => format!(
+            "Place [{}] {name}  (keys 1-9, 0)",
+            (picking.selected + 1) % 10
+        ),
         None => "Place nothing".to_string(),
     };
     [target, place]
@@ -1175,6 +1205,7 @@ fn pick_blocks(
     mut picking: ResMut<Picking>,
     mut edits: ResMut<EditQueue>,
     lines: Option<ResMut<OverlayLines>>,
+    crosshair: Option<ResMut<CrosshairTarget>>,
 ) {
     if let Some(slot) = HOTBAR_KEYS.iter().position(|&key| keys.just_pressed(key))
         && slot < picking.hotbar.len()
@@ -1197,6 +1228,13 @@ fn pick_blocks(
         });
     if picking.target != target {
         picking.target = target;
+    }
+    // The F3 light probe: the cell in front of the picked face (its light shades that face).
+    if let Some(mut crosshair) = crosshair {
+        let cell = target.map(|hit| hit.adjacent().unwrap_or(hit.block));
+        if crosshair.0 != cell {
+            crosshair.0 = cell;
+        }
     }
     let click = Click::from_input(&buttons, cursor.grab == CursorGrab::Locked);
     if let (Some(hit), Some(click)) = (target, click) {
@@ -1237,6 +1275,116 @@ impl Plugin for PickingPlugin {
         let registry = std::sync::Arc::clone(&app.world().resource::<WorldContent>().registry);
         app.insert_resource(Picking::new(&registry));
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Day and night, and the lamps demo
+
+/// `F`: how many times faster than real time the clock runs while toggled.
+const FAST_TIME: u64 = 60;
+/// `--lamps` starts at this clock hour unless `--time` says otherwise.
+const LAMPS_DEMO_HOURS: f64 = 21.0;
+/// `--lamps`: the blocks placed around the start, one every 45 degrees.
+const LAMPS_DEMO_BLOCKS: [&str; 8] = [
+    "boxel:lamp_orange",
+    "boxel:lamp_red",
+    "boxel:lamp_blue",
+    "boxel:lamp_white",
+    "boxel:lava",
+    "boxel:lamp_orange",
+    "boxel:lamp_blue",
+    "boxel:lava",
+];
+/// `--lamps`: distance from the start, in blocks.
+const LAMPS_DEMO_RADIUS: f64 = 9.0;
+/// `--lamps`: how far below the start the ground is searched.
+const LAMPS_DEMO_DEPTH: i64 = 256;
+
+/// Clock keys: `[` and `]` move the time one hour back and forward, T pauses it, F toggles
+/// [`FAST_TIME`] (G is the walk toggle). Each change is logged.
+fn time_keys(keys: Res<ButtonInput<KeyCode>>, mut time: ResMut<TimeOfDay>) {
+    let hour = i64::try_from(time.ticks_per_hour()).unwrap_or(i64::MAX);
+    let mut changed = true;
+    if keys.just_pressed(KeyCode::BracketLeft) {
+        time.scrub(-hour);
+    } else if keys.just_pressed(KeyCode::BracketRight) {
+        time.scrub(hour);
+    } else if keys.just_pressed(KeyCode::KeyT) {
+        time.paused = !time.paused;
+    } else if keys.just_pressed(KeyCode::KeyF) {
+        time.speed = if time.speed == 1 { FAST_TIME } else { 1 };
+    } else {
+        changed = false;
+    }
+    if changed {
+        println!(
+            "boxel: time {} day {}{}{}",
+            time.clock_text(),
+            time.day(),
+            if time.paused { ", paused" } else { "" },
+            if time.speed == 1 {
+                String::new()
+            } else {
+                format!(", x{}", time.speed)
+            }
+        );
+    }
+}
+
+/// `--lamps`: the start position, until the blocks are placed.
+#[derive(Resource, Debug)]
+struct LampsDemo {
+    /// `None` once placed (or without `--lamps`).
+    start: Option<DVec3>,
+}
+
+/// The cells of the `--lamps` blocks around `start`, with their names: on the first non-air
+/// block under the start height of each column. `None` while a column is not loaded down to
+/// its ground (try again next frame); columns without ground within [`LAMPS_DEMO_DEPTH`] are
+/// skipped.
+fn demo_lamp_cells(
+    start: DVec3,
+    block_at: impl Fn(BlockPos) -> Option<BlockState>,
+) -> Option<Vec<(BlockPos, &'static str)>> {
+    let mut cells = Vec::new();
+    for (i, &name) in LAMPS_DEMO_BLOCKS.iter().enumerate() {
+        let angle = i as f64 * std::f64::consts::TAU / LAMPS_DEMO_BLOCKS.len() as f64;
+        let x = (start.x + LAMPS_DEMO_RADIUS * angle.cos()).floor() as i64;
+        let z = (start.z + LAMPS_DEMO_RADIUS * angle.sin()).floor() as i64;
+        let top = start.y.floor() as i64;
+        for y in (top.saturating_sub(LAMPS_DEMO_DEPTH)..=top).rev() {
+            let state = block_at(BlockPos::new(x, y, z))?;
+            if !state.is_air() {
+                cells.push((BlockPos::new(x, y + 1, z), name));
+                break;
+            }
+        }
+    }
+    Some(cells)
+}
+
+/// `--lamps`: places the demo blocks once their columns are loaded.
+fn place_demo_lamps(
+    mut demo: ResMut<LampsDemo>,
+    map: Res<ChunkMap>,
+    content: Res<WorldContent>,
+    mut edits: ResMut<EditQueue>,
+) {
+    let Some(start) = demo.start else {
+        return;
+    };
+    let Some(cells) = demo_lamp_cells(start, |p| map.block_at(p)) else {
+        return;
+    };
+    let mut placed = 0;
+    for (pos, name) in cells {
+        if let Some(state) = content.registry.by_name(name) {
+            edits.set_block(pos, state);
+            placed += 1;
+        }
+    }
+    println!("boxel: --lamps placed {placed} blocks around the start");
+    demo.start = None;
 }
 
 /// Kills the process if `main` has not returned `limit` after start (the event loop stopped
@@ -1330,8 +1478,16 @@ fn main() -> AppExit {
 
     let fps_limit = options.fps_limit;
     let vsync = options.vsync;
+    let time = clock::start_time(options.start_hours(), options.automation());
+    let lamps = LampsDemo {
+        start: options
+            .lamps
+            .then(|| DVec3::new(options.camera[0], options.camera[1], options.camera[2])),
+    };
     let mut app = App::new();
     app.add_plugins(plugins);
+    // The world clock (DaylightPlugin is in DefaultPlugins): scripted runs keep it still.
+    app.insert_resource(time).insert_resource(lamps);
     // After the plugins, so these replace the engine defaults (144 fps, vsync off).
     if let Some(fps) = fps_limit {
         app.insert_resource(FrameLimit::new(fps));
@@ -1359,6 +1515,15 @@ fn main() -> AppExit {
         .init_resource::<FixedSteps>()
         .add_systems(Startup, spawn_camera)
         .add_systems(FixedUpdate, count_fixed_steps)
+        .add_systems(
+            Update,
+            (
+                time_keys,
+                place_demo_lamps
+                    .after(pick_blocks)
+                    .before(WorldSystems::Interest),
+            ),
+        )
         .add_systems(
             Update,
             (
@@ -1569,7 +1734,7 @@ mod tests {
         );
         assert_eq!(
             lines.get("pick place"),
-            Some("Place [1] boxel:stone  (keys 1-9)")
+            Some("Place [1] boxel:stone  (keys 1-9, 0)")
         );
 
         // Left click breaks the grass; the stone under it becomes the target.
@@ -1598,7 +1763,7 @@ mod tests {
         assert_eq!(block_at(&app, BlockPos::new(0, 3, 0)), Some(grass));
         assert_eq!(
             app.world().resource::<OverlayLines>().get("pick place"),
-            Some("Place [3] boxel:grass  (keys 1-9)")
+            Some("Place [3] boxel:grass  (keys 1-9, 0)")
         );
 
         // Alt-tab frees the cursor; the click that focuses the window again only grabs it.
@@ -1778,6 +1943,47 @@ mod tests {
             None,
             "the click that grabs"
         );
+    }
+
+    #[test]
+    fn time_and_lamps_options() {
+        let o = parse(&[]);
+        assert_eq!((o.start_hours(), o.lamps), (12.0, false));
+        assert_eq!(parse(&["--lamps"]).start_hours(), LAMPS_DEMO_HOURS);
+        assert_eq!(parse(&["--lamps", "--time", "06:30"]).start_hours(), 6.5);
+        let args: Vec<String> = ["--time", "25:00"].map(String::from).to_vec();
+        assert!(parse_options(&args).is_err());
+        // Every demo block and every hotbar block exists.
+        let registry = BlockRegistry::default_blocks();
+        for name in LAMPS_DEMO_BLOCKS.iter().chain(&HOTBAR) {
+            assert!(registry.by_name(name).is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn demo_lamps_go_on_the_ground_once_it_is_loaded() {
+        let start = DVec3::new(0.5, 80.0, 0.5);
+        // Ground at y = 63, loaded down to y = 0.
+        let ground = |p: BlockPos| {
+            (p.y >= 0).then_some(if p.y <= 63 {
+                BlockState(1)
+            } else {
+                BlockState::AIR
+            })
+        };
+        let cells = demo_lamp_cells(start, ground).expect("loaded");
+        assert_eq!(cells.len(), LAMPS_DEMO_BLOCKS.len());
+        for (pos, _) in &cells {
+            assert_eq!(pos.y, 64);
+            let d = ((pos.x as f64 + 0.5).hypot(pos.z as f64 + 0.5) - LAMPS_DEMO_RADIUS).abs();
+            assert!(d < 1.5, "{pos:?}");
+        }
+        assert_eq!(cells[0], (BlockPos::new(9, 64, 0), "boxel:lamp_orange"));
+        // Not loaded yet: wait.
+        assert_eq!(demo_lamp_cells(start, |_| None), None);
+        // No ground within reach: skipped.
+        let empty = demo_lamp_cells(start, |_| Some(BlockState::AIR)).expect("loaded");
+        assert!(empty.is_empty());
     }
 
     #[test]

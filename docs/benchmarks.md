@@ -29,6 +29,13 @@ por defecto, es sin límite), por ejemplo para ver cómo se comporta con el lím
 juego. El resumen anota el límite y `tools/bench_report.py` no mezcla corridas con límites
 distintos (las corridas viejas, sin el dato, cuentan como sin límite).
 
+`--edits` agrega ediciones con guion durante la medición, una por segundo cerca del inicio: pone
+una lámpara y la saca, cava un pozo de 24 bloques y lo tapa. El resumen suma una tabla "Edits"
+con los frames que tardó cada una en publicarse (de la edición hasta que el mundo vuelve a estar
+quieto, el frame de la edición incluido) y los lotes de ediciones retenidos o partidos. Sirve con
+`--scenario static`. `--time HH:MM` fija la hora del mundo (12:00 por defecto); el reloj queda
+quieto toda la corrida y el resumen la anota.
+
 `--vertical-radius N` fija cuántos chunks se cargan arriba y abajo de la cámara (8 por defecto).
 `--fixed-height` carga solo las capas del generador, como en M0: úsalo para comparar con corridas
 viejas, que no tienen radio vertical.

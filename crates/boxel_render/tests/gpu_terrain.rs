@@ -19,6 +19,17 @@
 //! pixels again when the camera comes back. Their wrapped origins land exactly under the camera,
 //! and seen in `i64` they lie straight ahead, inside a view distance of `2^34`: neither the
 //! frustum nor the view distance hides them, only the GPU window does, on every tier.
+//!
+//! A second test renders a lit scene built by hand (ADR 0015): a tree, a roof over the ground, a
+//! low wall beside sunlit ground (AO), a closed cave lit by red, blue and orange lamps, and an
+//! overview at noon and at midnight. Its light is computed exactly as the world computes it
+//! (sky tops per column, `boxel_light::compute`, the default AO policy), again at every
+//! [`FAR_SHIFTS`] position, where the meshes must come out byte for byte the same. Every tier
+//! must draw exactly the same pixels (software adapters: the tolerance above), the moved scene
+//! the same pixels as near the origin, the cave the same at noon and at midnight (block light
+//! does not follow the sun), the night overview at most half as bright as noon, the cave tinted
+//! by its lamps, and the shadowed views darker than without light and AO.
+//!
 //! Failing images are saved under `CARGO_TARGET_TMPDIR/gpu_terrain/` (every image with
 //! `GPU_TERRAIN_SAVE=1`).
 #![expect(clippy::print_stderr, reason = "test progress and failure details")]
@@ -28,10 +39,10 @@ use boxel_gfx::{
     run_in_error_scopes, submit_and_wait, tier_request,
 };
 use boxel_math::{Aabb, DVec3, I64Vec3, UVec2, Vec3};
-use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, Mesher};
-use boxel_render::{RendererConfig, ViewParams, VoxelRenderer};
+use boxel_mesh::{AoPolicy, ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher};
+use boxel_render::{DEFAULT_SKY_COLOR, RendererConfig, ViewParams, VoxelRenderer, arena_len};
 use boxel_transform::Transform;
-use boxel_voxel::{BlockRegistry, ChunkData, ChunkKey, ChunkPos, NEIGHBOR_OFFSETS};
+use boxel_voxel::{BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, NEIGHBOR_OFFSETS};
 use boxel_worldgen::{TerrainGenerator, WorldGenerator};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -198,11 +209,13 @@ fn terrain_scene() -> Scene {
         {
             continue;
         }
+        // No light (open sky everywhere) and the default AO policy: AO on every face.
         let input = MeshInput {
             center,
             neighbors: std::array::from_fn(|i| data.get(&pos.offset(NEIGHBOR_OFFSETS[i]))),
+            light: None,
         };
-        let mesh = mesher.mesh_chunk(&input, &materials);
+        let mesh = mesher.mesh_chunk(&input, &materials, MeshOptions::default());
         if !mesh.is_empty() {
             meshes.push((pos, Arc::new(mesh)));
         }
@@ -235,7 +248,7 @@ fn view_params(camera: &Camera, transform: &Transform, shift: I64Vec3) -> ViewPa
     let mut transform = *transform;
     transform.translation += shift.as_dvec3();
     let view = CameraView::compute(camera, &transform, WIDTH as f32 / HEIGHT as f32);
-    ViewParams::from_camera(&view, camera, RendererConfig::default().clear_color, 0.6)
+    ViewParams::from_camera(&view, camera, DEFAULT_SKY_COLOR, 0.6)
 }
 
 /// The default camera with a view distance of `2^34` voxels, past the chunks left behind by a
@@ -329,7 +342,6 @@ fn render_tier(
     let config = RendererConfig {
         arena_quads: 1 << 20,
         max_chunk_slots: 1024,
-        ..RendererConfig::default()
     };
     let mut renderer = VoxelRenderer::new(
         &device,
@@ -355,11 +367,11 @@ fn render_tier(
     };
     upload(&mut renderer)?;
     let stats = renderer.stats();
-    if stats.chunks as usize != scene.meshes.len() || stats.arena_used_quads != scene.quads() {
+    let entries: u32 = scene.meshes.iter().map(|(_, m)| arena_len(m)).sum();
+    if stats.chunks as usize != scene.meshes.len() || stats.arena_used_quads != entries {
         return Err(format!(
-            "stats after upload: {stats:?}, expected {} chunks and {} quads",
+            "stats after upload: {stats:?}, expected {} chunks and {entries} arena entries",
             scene.meshes.len(),
-            scene.quads()
         ));
     }
 
@@ -607,6 +619,535 @@ fn real_terrain_renders_identically_on_every_tier() {
                     (&format!("{label}_{}_{view}", r.tier), &r.images[i]),
                 );
             }
+        }
+    }
+    assert!(
+        report.failures.is_empty(),
+        "{} failures:\n{}",
+        report.failures.len(),
+        report.failures.join("\n")
+    );
+    assert!(
+        rendered > 0 || !gpu_tests_required(),
+        "BOXEL_REQUIRE_GPU=1 but no tier could render"
+    );
+}
+
+// ---------------------------------------------------------------- lit scenes
+
+/// Chunk columns of the lit scene, in x and z (voxels -64..64).
+const LIT_COLUMNS: std::ops::Range<i64> = -2..2;
+/// Chunk layers of the lit scene (voxels -32..32; the ground is at y = 0).
+const LIT_LAYERS: std::ops::RangeInclusive<i64> = -1..=0;
+
+/// The blocks of the lit scene.
+struct LitBlocks {
+    grass: BlockState,
+    dirt: BlockState,
+    stone: BlockState,
+    log: BlockState,
+    leaves: BlockState,
+    /// Red, blue, orange and white lamps.
+    lamps: [BlockState; 4],
+    lava: BlockState,
+}
+
+impl LitBlocks {
+    fn new(registry: &BlockRegistry) -> Self {
+        let s = |name: &str| registry.by_name(name).unwrap_or_else(|| panic!("{name}"));
+        Self {
+            grass: s("boxel:grass"),
+            dirt: s("boxel:dirt"),
+            stone: s("boxel:stone"),
+            log: s("boxel:log"),
+            leaves: s("boxel:leaves"),
+            lamps: [
+                s("boxel:lamp_red"),
+                s("boxel:lamp_blue"),
+                s("boxel:lamp_orange"),
+                s("boxel:lamp_white"),
+            ],
+            lava: s("boxel:lava"),
+        }
+    }
+
+    /// The scene at local voxel `(x, y, z)`: grass ground at y = 0 over dirt and stone; a tree
+    /// at (-40, -40); a wall with an overhanging roof around x = 8..24, z = -48..-24; a low wall
+    /// at z = 24..26 beside sunlit ground (AO) with a white lamp and a lava block in front of it;
+    /// and under the ground a closed cave lit by a red, a blue and an orange lamp.
+    fn at(&self, x: i64, y: i64, z: i64) -> BlockState {
+        let air = BlockState::AIR;
+        // The cave: closed on every side, deep under the ground.
+        if (8..40).contains(&x) && (-24..-14).contains(&y) && (8..40).contains(&z) {
+            return match (x, y, z) {
+                (12, -24, 12) => self.lamps[0],
+                (28, -24, 33) => self.lamps[1],
+                (12, -24, 35) => self.lamps[2],
+                _ => air,
+            };
+        }
+        match (x, y, z) {
+            (-30, 0, 12) => return self.lava,
+            (-12, 1, 18) => return self.lamps[3],
+            (_, ..-2, _) => return self.stone,
+            (_, -2..=-1, _) => return self.dirt,
+            (_, 0, _) => return self.grass,
+            _ => {}
+        }
+        // The tree: a trunk to y = 6 and a 5x5 canopy from y = 4 to 7.
+        let (tx, tz) = (x + 40, z + 40);
+        if tx == 0 && tz == 0 && y <= 6 {
+            return self.log;
+        }
+        if tx.abs() <= 2 && tz.abs() <= 2 && (4..=7).contains(&y) {
+            let corner = tx.abs() == 2 && tz.abs() == 2;
+            return if corner && y == 7 { air } else { self.leaves };
+        }
+        // The wall and its roof, open toward -x.
+        if (-48..-24).contains(&z) {
+            if (20..24).contains(&x) && y < 9 {
+                return self.stone;
+            }
+            if (8..20).contains(&x) && y == 8 {
+                return self.stone;
+            }
+        }
+        // A low wall beside sunlit ground.
+        if (-40..0).contains(&x) && (24..26).contains(&z) && y < 5 {
+            return self.stone;
+        }
+        air
+    }
+}
+
+/// `pos` moved by `by` chunks.
+fn moved(pos: ChunkPos, by: I64Vec3) -> ChunkPos {
+    ChunkPos::new(pos.x + by.x, pos.y + by.y, pos.z + by.z)
+}
+
+/// The lit scene as the world would mesh it: data, exact sky tops, light and meshes.
+struct LitScene {
+    registry: BlockRegistry,
+    /// Non-empty meshes: (chunk position, mesh).
+    meshes: Vec<(ChunkPos, Arc<ChunkMesh>)>,
+}
+
+/// Builds the lit scene moved by `shift` (multiples of 32 on every axis): its chunk data, the
+/// sky tops of its columns (the scene is all there is, so a column without blockers is open
+/// forever), the light of every chunk with `boxel_light::compute` and its mesh with the default
+/// AO policy. Without `light`, every mesh gets open sky and no AO: the look before both.
+fn lit_scene(shift: I64Vec3, light: bool) -> LitScene {
+    use boxel_light::box_light::{chunk_index, tile_index};
+    use boxel_light::{LightInput, LightScratch, PaddedLight, SkyInput, SkyTile};
+    use boxel_voxel::{CHUNK_VOLUME, LightTables, LocalPos};
+
+    let registry = BlockRegistry::default_blocks();
+    let blocks = LitBlocks::new(&registry);
+    let tables = LightTables::from_registry(&registry);
+    let chunk_shift = shift / 32;
+    let mut data: BTreeMap<ChunkPos, ChunkData> = BTreeMap::new();
+    for cy in LIT_LAYERS {
+        for cz in LIT_COLUMNS {
+            for cx in LIT_COLUMNS {
+                let dense: Vec<BlockState> = (0..CHUNK_VOLUME)
+                    .map(|i| {
+                        let l = LocalPos::from_index(i);
+                        blocks.at(
+                            cx * 32 + i64::from(l.x()),
+                            cy * 32 + i64::from(l.y()),
+                            cz * 32 + i64::from(l.z()),
+                        )
+                    })
+                    .collect();
+                let pos = moved(ChunkPos::new(cx, cy, cz), chunk_shift);
+                data.insert(pos, ChunkData::from_dense(&dense));
+            }
+        }
+    }
+    // Sky tops of every chunk column around the scene (outside it: open forever).
+    let mut tiles: BTreeMap<(i64, i64), SkyTile> = BTreeMap::new();
+    for cz in LIT_COLUMNS.start - 1..=LIT_COLUMNS.end {
+        for cx in LIT_COLUMNS.start - 1..=LIT_COLUMNS.end {
+            let tops: Box<[i64; 1024]> = Box::new(std::array::from_fn(|i| {
+                let (x, z) = (cx * 32 + (i >> 5) as i64, cz * 32 + (i & 31) as i64);
+                let inside = LIT_COLUMNS.contains(&cx) && LIT_COLUMNS.contains(&cz);
+                let top = (*LIT_LAYERS.start() * 32..(*LIT_LAYERS.end() + 1) * 32)
+                    .rev()
+                    .find(|&y| inside && tables.blocks_sky(blocks.at(x, y, z)));
+                top.map_or(i64::MIN, |y| y + shift.y)
+            }));
+            tiles.insert(
+                (cx + chunk_shift.x, cz + chunk_shift.z),
+                SkyTile::from_tops(tops, i64::MIN),
+            );
+        }
+    }
+
+    let materials = MaterialTable::from_registry(&registry);
+    let mut mesher = Mesher::new();
+    let mut scratch = LightScratch::new();
+    let mut padded = PaddedLight::default();
+    let mut meshes = Vec::new();
+    for (&pos, center) in &data {
+        let near = |dx: i64, dy: i64, dz: i64| {
+            data.get(&ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz))
+        };
+        if light {
+            let input = LightInput {
+                origin: pos,
+                chunks: std::array::from_fn(|i| {
+                    let (dy, rest) = (i as i64 / 9 - 1, i as i64 % 9);
+                    let (dx, dz) = (rest / 3 - 1, rest % 3 - 1);
+                    debug_assert_eq!(chunk_index(dx as i32, dy as i32, dz as i32), i);
+                    near(dx, dy, dz)
+                }),
+                sky: SkyInput::Tiles(std::array::from_fn(|i| {
+                    let (dx, dz) = (i as i64 / 3 - 1, i as i64 % 3 - 1);
+                    debug_assert_eq!(tile_index(dx as i32, dz as i32), i);
+                    &tiles[&(pos.x + dx, pos.z + dz)]
+                })),
+                tables: &tables,
+            };
+            boxel_light::compute(&input, &mut scratch, &mut padded);
+        }
+        let input = MeshInput {
+            center,
+            neighbors: std::array::from_fn(|i| data.get(&pos.offset(NEIGHBOR_OFFSETS[i]))),
+            light: light.then_some(&padded),
+        };
+        let options = if light {
+            MeshOptions::default()
+        } else {
+            MeshOptions { ao: AoPolicy::Off }
+        };
+        let mesh = mesher.mesh_chunk(&input, &materials, options);
+        if !mesh.is_empty() {
+            meshes.push((pos, Arc::new(mesh)));
+        }
+    }
+    LitScene { registry, meshes }
+}
+
+/// One view of the lit scene: an eye looking at a target, at a clock hour.
+struct LitView {
+    name: &'static str,
+    eye: [f64; 3],
+    target: [f64; 3],
+    /// Clock hour (12 noon, 0 midnight).
+    hours: f64,
+}
+
+/// The lit views, rendered in this order. Eye coordinates are multiples of 1/64 (exact in `f64`
+/// at every shift).
+const LIT_VIEWS: [LitView; 7] = [
+    LitView {
+        name: "tree",
+        eye: [-43.75, 2.5, -43.5],
+        target: [-40.5, 0.75, -40.5],
+        hours: 12.0,
+    },
+    LitView {
+        name: "overhang",
+        eye: [1.5, 5.5, -36.25],
+        target: [16.0, 0.5, -36.0],
+        hours: 12.0,
+    },
+    LitView {
+        name: "wall_ao",
+        eye: [-20.25, 3.5, 21.25],
+        target: [-20.0, 1.0, 24.0],
+        hours: 12.0,
+    },
+    LitView {
+        name: "cave",
+        eye: [10.5, -16.25, 23.75],
+        target: [26.0, -24.5, 24.0],
+        hours: 12.0,
+    },
+    LitView {
+        name: "cave_midnight",
+        eye: [10.5, -16.25, 23.75],
+        target: [26.0, -24.5, 24.0],
+        hours: 0.0,
+    },
+    LitView {
+        name: "overview",
+        eye: [-70.5, 30.25, -68.75],
+        target: [0.0, 0.0, 0.0],
+        hours: 12.0,
+    },
+    LitView {
+        name: "night",
+        eye: [-70.5, 30.25, -68.75],
+        target: [0.0, 0.0, 0.0],
+        hours: 0.0,
+    },
+];
+
+/// The view parameters of `view` moved by `shift`: the scene light and sky color of its hour from
+/// the default `DaylightCurve`, as the render plugin computes them.
+fn lit_view_params(view: &LitView, shift: I64Vec3) -> ViewParams {
+    use boxel_render::SceneLight;
+    use boxel_world::{DaylightCurve, TimeOfDay};
+    let eye = DVec3::from_array(view.eye);
+    let d = (DVec3::from_array(view.target) - eye).as_vec3();
+    let yaw = (-d.x).atan2(-d.z);
+    let pitch = d.y.atan2(d.x.hypot(d.z));
+    let daylight = DaylightCurve::default().at(&TimeOfDay::at_clock(view.hours));
+    let camera = Camera::default();
+    let transform = Transform::from_yaw_pitch(eye + shift.as_dvec3(), yaw, pitch);
+    let cv = CameraView::compute(&camera, &transform, WIDTH as f32 / HEIGHT as f32);
+    ViewParams {
+        light: SceneLight {
+            sky: daylight.sky_light,
+            ambient: daylight.ambient,
+            ..SceneLight::noon()
+        },
+        ..ViewParams::from_camera(&cv, &camera, daylight.sky_color, 0.6)
+    }
+}
+
+/// Uploads `scene` (already moved by `shift`) on one tier and renders every lit view.
+fn render_lit(
+    adapter: &wgpu::Adapter,
+    caps: &AdapterCaps,
+    tier: Tier,
+    scene: &LitScene,
+    shift: I64Vec3,
+) -> Result<Vec<RgbaImage>, String> {
+    let (device, queue, errors) = device_for(adapter, caps, tier)?;
+    let config = RendererConfig {
+        arena_quads: 1 << 20,
+        max_chunk_slots: 256,
+    };
+    let mut renderer = VoxelRenderer::new(
+        &device,
+        &queue,
+        tier,
+        &config,
+        scene.registry.textures(),
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        UVec2::new(WIDTH, HEIGHT),
+    )
+    .map_err(|e| format!("VoxelRenderer::new: {e}"))?;
+    for (pos, mesh) in &scene.meshes {
+        renderer
+            .upsert_chunk(chunk_id(*pos), pos.origin().as_i64vec3(), Arc::clone(mesh))
+            .map_err(|e| format!("upsert {pos:?}: {e}"))?;
+    }
+    let entries: u32 = scene.meshes.iter().map(|(_, m)| arena_len(m)).sum();
+    if renderer.stats().arena_used_quads != entries {
+        return Err(format!(
+            "stats after upload: {:?}, expected {entries} arena entries",
+            renderer.stats()
+        ));
+    }
+    let mut images = Vec::new();
+    for view in &LIT_VIEWS {
+        let params = lit_view_params(view, shift);
+        render(&device, &queue, &mut renderer, &params)?; // warm-up
+        let (image, _) = render(&device, &queue, &mut renderer, &params)?;
+        images.push(image);
+    }
+    let errors = errors.lock().map(|e| e.clone()).unwrap_or_default();
+    if !errors.is_empty() {
+        return Err(format!("uncaptured errors: {errors:?}"));
+    }
+    Ok(images)
+}
+
+/// Mean of the RGB channels over the image (0..255).
+fn mean_level(image: &RgbaImage) -> f64 {
+    let pixels = image.data.as_chunks::<4>().0;
+    let sum: u64 = pixels
+        .iter()
+        .map(|p| u64::from(p[0]) + u64::from(p[1]) + u64::from(p[2]))
+        .sum();
+    sum as f64 / (3 * pixels.len().max(1)) as f64
+}
+
+/// Fraction of pixels where channel `c` is at least 60 and more than twice the other two.
+fn dominant_fraction(image: &RgbaImage, c: usize) -> f64 {
+    let pixels = image.data.as_chunks::<4>().0;
+    let n = pixels
+        .iter()
+        .filter(|p| {
+            let others = (0..3).filter(|&o| o != c).map(|o| u16::from(p[o])).max();
+            u16::from(p[c]) >= 60 && others.is_some_and(|o| u16::from(p[c]) > 2 * o)
+        })
+        .count();
+    n as f64 / pixels.len().max(1) as f64
+}
+
+/// Light checks on one tier's images (`unlit`: the same views without light and AO).
+fn check_light(report: &mut Report, label: &str, lit: &[RgbaImage], unlit: &[RgbaImage]) {
+    let image = |name: &str| {
+        let i = LIT_VIEWS
+            .iter()
+            .position(|v| v.name == name)
+            .unwrap_or_else(|| panic!("{name}"));
+        (i, &lit[i])
+    };
+    // Block light does not depend on the time of day: the closed cave is the same at midnight.
+    let (_, cave) = image("cave");
+    let (_, cave_midnight) = image("cave_midnight");
+    report.check_identical(
+        &format!("{label}: cave at noon vs midnight"),
+        (&format!("{label}_lit_cave"), cave),
+        (&format!("{label}_lit_cave_midnight"), cave_midnight),
+    );
+    // The cave is dark except around its lamps, which tint it red and blue.
+    let (red, blue) = (dominant_fraction(cave, 0), dominant_fraction(cave, 2));
+    eprintln!("gpu_terrain: {label}: cave red {red:.4} blue {blue:.4}");
+    if red < 0.01 || blue < 0.01 {
+        report.fail(
+            format!("{label}: cave lamps: red pixels {red:.4}, blue pixels {blue:.4} (< 0.01)"),
+            &[(&format!("{label}_lit_cave"), cave)],
+        );
+    }
+    // Night is much darker than noon.
+    let (_, noon) = image("overview");
+    let (_, night) = image("night");
+    let (day, dark) = (mean_level(noon), mean_level(night));
+    eprintln!("gpu_terrain: {label}: overview mean level noon {day:.1} night {dark:.1}");
+    if dark > 0.5 * day {
+        report.fail(
+            format!("{label}: night mean level {dark:.1} vs noon {day:.1}"),
+            &[
+                (&format!("{label}_lit_overview"), noon),
+                (&format!("{label}_lit_night"), night),
+            ],
+        );
+    }
+    // Shadows: under the tree, the overhang and against the wall (AO) the lit image is darker
+    // than the same view without light and AO.
+    for name in ["tree", "overhang", "wall_ao"] {
+        let (i, lit_image) = image(name);
+        let (shaded, open) = (mean_level(lit_image), mean_level(&unlit[i]));
+        eprintln!("gpu_terrain: {label}: {name} mean level lit {shaded:.1} unlit {open:.1}");
+        if shaded >= open - 1.0 {
+            report.fail(
+                format!("{label}: {name}: lit mean level {shaded:.1} not below unlit {open:.1}"),
+                &[
+                    (&format!("{label}_lit_{name}"), lit_image),
+                    (&format!("{label}_unlit_{name}"), &unlit[i]),
+                ],
+            );
+        }
+    }
+}
+
+/// The lit scenes (tree, overhang, wall, cave with lamps, night) render exactly the same pixels
+/// on every tier of an adapter and far from the origin, where the light is computed again at the
+/// moved position and must give the same meshes.
+#[test]
+fn lit_scenes_render_identically_on_every_tier_and_far_away() {
+    let (_instance, adapters) = adapters();
+    if adapters.is_empty() {
+        assert!(!gpu_tests_required(), "BOXEL_REQUIRE_GPU=1 but no adapter");
+        eprintln!("skipping: no adapter");
+        return;
+    }
+    let start = Instant::now();
+    let near = lit_scene(I64Vec3::ZERO, true);
+    let unlit = lit_scene(I64Vec3::ZERO, false);
+    let far: Vec<(I64Vec3, LitScene)> = FAR_SHIFTS
+        .iter()
+        .map(|&shift| (shift, lit_scene(shift, true)))
+        .collect();
+    eprintln!(
+        "gpu_terrain: lit scene: {} meshes, {} arena entries ({:.0} ms on the CPU for {} scenes)",
+        near.meshes.len(),
+        near.meshes.iter().map(|(_, m)| arena_len(m)).sum::<u32>(),
+        start.elapsed().as_secs_f64() * 1e3,
+        far.len() + 2,
+    );
+    for (shift, scene) in &far {
+        assert_eq!(scene.meshes.len(), near.meshes.len(), "shift {shift}");
+        for ((a, ma), (b, mb)) in near.meshes.iter().zip(&scene.meshes) {
+            assert_eq!(*b, moved(*a, *shift / 32), "shift {shift}: chunk order");
+            assert_eq!(ma, mb, "shift {shift}: the mesh of {a:?} changed");
+        }
+    }
+    // The light shows: palettes with more than open sky, and some dark faces.
+    let palettes: usize = near.meshes.iter().map(|(_, m)| m.palette.len()).sum();
+    assert!(
+        palettes > 2 * near.meshes.len(),
+        "{palettes} palette entries"
+    );
+
+    let mut report = Report::new();
+    let save_all = std::env::var_os("GPU_TERRAIN_SAVE").is_some();
+    let mut rendered = 0;
+    for adapter in &adapters {
+        let caps = AdapterCaps::from_adapter(adapter);
+        let label = adapter_label(&caps);
+        let mut results: Vec<(Tier, Vec<RgbaImage>)> = Vec::new();
+        for tier in allowed_tiers(&caps) {
+            let images = match render_lit(adapter, &caps, tier, &near, I64Vec3::ZERO) {
+                Ok(images) => images,
+                Err(e) => {
+                    report.fail(format!("{label} {tier} lit: {e}"), &[]);
+                    continue;
+                }
+            };
+            for (shift, scene) in &far {
+                match render_lit(adapter, &caps, tier, scene, *shift) {
+                    Ok(moved) => {
+                        for (view, (a, b)) in LIT_VIEWS.iter().zip(images.iter().zip(&moved)) {
+                            report.check_identical(
+                                &format!("{label}: {tier} lit {} shift {shift}", view.name),
+                                (&format!("{label}_{tier}_lit_{}", view.name), a),
+                                (&format!("{label}_{tier}_lit_{}_shift{shift}", view.name), b),
+                            );
+                        }
+                    }
+                    Err(e) => report.fail(format!("{label} {tier} lit shift {shift}: {e}"), &[]),
+                }
+            }
+            if save_all {
+                for (view, image) in LIT_VIEWS.iter().zip(&images) {
+                    report.save(&[(&format!("{label}_{tier}_lit_{}", view.name), image)]);
+                }
+            }
+            rendered += 1;
+            results.push((tier, images));
+        }
+        let Some(((best_tier, best), rest)) = results.split_first() else {
+            continue;
+        };
+        // Every tier draws the same pixels. Software rasterizers (llvmpipe) round a few
+        // interpolants differently between triangle lists and strips: they get the tolerance of
+        // the terrain test.
+        let software = caps.info.device_type == wgpu::DeviceType::Cpu;
+        for (tier, images) in rest {
+            for (view, (a, b)) in LIT_VIEWS.iter().zip(best.iter().zip(images)) {
+                let what = format!("{label}: lit {} {tier} vs {best_tier}", view.name);
+                let a = (&*format!("{label}_{best_tier}_lit_{}", view.name), a);
+                let b = (&*format!("{label}_{tier}_lit_{}", view.name), b);
+                if software {
+                    report.check_same(&what, a, b);
+                } else {
+                    report.check_identical(&what, a, b);
+                }
+            }
+        }
+        match render_lit(adapter, &caps, *best_tier, &unlit, I64Vec3::ZERO) {
+            Ok(unlit_images) => {
+                if save_all {
+                    for (view, image) in LIT_VIEWS.iter().zip(&unlit_images) {
+                        report
+                            .save(&[(&format!("{label}_{best_tier}_unlit_{}", view.name), image)]);
+                    }
+                }
+                check_light(
+                    &mut report,
+                    &format!("{label}_{best_tier}"),
+                    best,
+                    &unlit_images,
+                );
+            }
+            Err(e) => report.fail(format!("{label} {best_tier} unlit: {e}"), &[]),
         }
     }
     assert!(

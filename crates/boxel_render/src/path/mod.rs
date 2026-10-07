@@ -140,12 +140,25 @@ impl VoxelPipelines {
             bind_group_layouts: &groups,
             immediate_size,
         });
-        // High/Mid: DrawRef per draw; Low: the PackedQuad itself. Both are instance-step Uint32x2.
-        let attributes = [wgpu::VertexAttribute {
-            format: wgpu::VertexFormat::Uint32x2,
-            offset: 0,
-            shader_location: 0,
-        }];
+        // High/Mid: DrawRef per draw; Low: the PackedQuad itself (slot 0) and its light palette
+        // entry (slot 1, a buffer parallel to the arena, ADR 0015). All instance-step Uint32x2.
+        let attribute = |shader_location| {
+            [wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Uint32x2,
+                offset: 0,
+                shader_location,
+            }]
+        };
+        let (slot0, slot1) = (attribute(0), attribute(1));
+        let instance_step = |attributes| wgpu::VertexBufferLayout {
+            array_stride: 8,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes,
+        };
+        let buffers: Vec<Option<wgpu::VertexBufferLayout<'_>>> = match tier {
+            Tier::High | Tier::Mid => vec![Some(instance_step(&slot0))],
+            Tier::Low => vec![Some(instance_step(&slot0)), Some(instance_step(&slot1))],
+        };
         let build = |label: &str, fragment_entry: &str, cull_mode: Option<wgpu::Face>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
@@ -154,11 +167,7 @@ impl VoxelPipelines {
                     module: &module,
                     entry_point: Some(vertex_entry),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[Some(wgpu::VertexBufferLayout {
-                        array_stride: 8,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &attributes,
-                    })],
+                    buffers: &buffers,
                 },
                 primitive: wgpu::PrimitiveState {
                     topology,
@@ -440,11 +449,14 @@ mod tests {
         let mut arena = ArenaAllocator::new(1 << 16, 1024);
         let mut table = ChunkTable::new(64);
         for (i, origin) in origins.iter().enumerate() {
+            let alloc = arena.allocate(10).expect("arena");
             table.insert(ChunkRecord {
                 id: i as u64,
                 origin: *origin,
-                alloc: arena.allocate(9).expect("arena"),
+                alloc,
                 counts: [1, 1, 1, 1, 1, 1, 2, 1],
+                light_base: alloc.offset + 9,
+                light_len: 1,
             });
         }
         table

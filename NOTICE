@@ -20,5 +20,10 @@ replacement for bevy_platform, test-only edits, and the upstream fix bevyengine/
 backported. The exact procedure is tools/refork/refork.sh; vendor/UPSTREAM.md records the
 upstream version. Each vendored crate keeps its LICENSE-MIT and LICENSE-APACHE files.
 
+crates/boxel_mesh/src/greedy.rs is a fork of binary-greedy-meshing 0.5.2
+(https://github.com/Inspirateur/binary-greedy-meshing), Copyright (c) 2024 Teo Orthlieb, licensed
+under MIT. Its merge compares a per-face key instead of the voxel id, and its quads come out in
+boxel's canonical form; the file keeps the MIT notice.
+
 "Bevy" is a trademark of its respective owners; boxel is not affiliated with or endorsed by the
 Bevy project.

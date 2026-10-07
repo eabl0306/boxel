@@ -38,10 +38,15 @@ pub(crate) struct ChunkRecord {
     pub id: u64,
     /// World voxel min corner (`i64`); the culling AABB is `[origin, origin + 32]`.
     pub origin: I64Vec3,
-    /// Quad range of all buckets (bucket 0 first).
+    /// Arena range of the chunk: the quads of all buckets (bucket 0 first), then its light
+    /// palette.
     pub alloc: ArenaAlloc,
     /// Quads per bucket.
     pub counts: [u32; BUCKET_COUNT],
+    /// First light palette entry in the arena: `alloc.offset` + the mesh's quads.
+    pub light_base: u32,
+    /// Light palette entries in the arena (at least 1).
+    pub light_len: u32,
 }
 
 impl ChunkRecord {
@@ -58,7 +63,9 @@ impl ChunkRecord {
             quad_base: self.alloc.offset,
             counts: self.counts,
             flags: if live { ChunkGpu::FLAG_LIVE } else { 0 },
-            pad: [0; 3],
+            light_base: self.light_base,
+            light_len: self.light_len,
+            pad: 0,
         }
     }
 }
@@ -301,11 +308,15 @@ mod tests {
         let mut counts = [0; BUCKET_COUNT];
         counts[0] = 2;
         counts[6] = 1;
+        let alloc = arena.allocate(4).expect("arena");
         ChunkRecord {
             id,
             origin: I64Vec3::new(id as i64 * 32, 0, 0),
-            alloc: arena.allocate(3).expect("arena"),
+            alloc,
             counts,
+            // 3 quads, then 1 palette entry
+            light_base: alloc.offset + 3,
+            light_len: 1,
         }
     }
 
@@ -382,7 +393,8 @@ mod tests {
         assert_eq!(gpu.quad_base, r.alloc.offset);
         assert_eq!(gpu.counts, r.counts);
         assert_eq!(gpu.flags, ChunkGpu::FLAG_LIVE);
-        assert_eq!(gpu.pad, [0; 3]);
+        assert_eq!(gpu.light_base, r.alloc.offset + 3);
+        assert_eq!((gpu.light_len, gpu.pad), (1, 0));
         assert_eq!(r.gpu(false), ChunkGpu { flags: 0, ..gpu });
     }
 

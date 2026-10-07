@@ -706,6 +706,15 @@ impl Planner {
             .min()
             .map_or(u32::MAX, |d| u32::try_from(d).unwrap_or(u32::MAX))
     }
+    /// Priority of a job for chunk column `(x, z)` (a sky walk): its horizontal squared
+    /// distance to the nearest viewer, the priority of its slot nearest to that viewer.
+    pub(crate) fn column_priority(&self, x: i64, z: i64) -> u32 {
+        self.viewers
+            .iter()
+            .map(|(_, v)| ChunkPos::new(x, v.center.y, z).distance_sq_xz(v.center))
+            .min()
+            .map_or(u32::MAX, |d| u32::try_from(d).unwrap_or(u32::MAX))
+    }
 }
 
 /// How many chunks closer to its nearest viewer any position may be with `new` viewers than with

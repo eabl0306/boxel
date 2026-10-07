@@ -221,6 +221,31 @@ fn forbidden_draw_builtins_are_never_used() {
     }
 }
 
+/// No shader keeps an array in a function-local variable: dynamically indexed, it may live in
+/// scratch memory on some drivers (the light curve is indexed in the uniform itself).
+#[test]
+fn no_function_local_arrays() {
+    for id in ShaderModuleId::ALL {
+        let (module, _) = load(id);
+        let functions = module
+            .functions
+            .iter()
+            .map(|(_, f)| f)
+            .chain(module.entry_points.iter().map(|ep| &ep.function));
+        for f in functions {
+            for (_, local) in f.local_variables.iter() {
+                assert!(
+                    !matches!(module.types[local.ty].inner, naga::TypeInner::Array { .. }),
+                    "{}: {:?} has a local array {:?}",
+                    id.label(),
+                    f.name,
+                    local.name
+                );
+            }
+        }
+    }
+}
+
 fn const_u32(module: &naga::Module, name: &str) -> u32 {
     let (_, c) = module
         .constants
@@ -244,14 +269,31 @@ fn wgsl_bit_layout_matches_boxel_mesh() {
         ("GEO_W_SHIFT", l::GEO_W_SHIFT),
         ("GEO_H_SHIFT", l::GEO_H_SHIFT),
         ("GEO_FACE_SHIFT", l::GEO_FACE_SHIFT),
+        ("GEO_FLAGS_SHIFT", l::GEO_FLAGS_SHIFT),
         ("MAT_LAYER_MASK", l::MAT_LAYER_MASK),
         ("MAT_AO_SHIFT", l::MAT_AO_SHIFT),
-        ("MAT_SKY_SHIFT", l::MAT_SKY_SHIFT),
-        ("MAT_BLOCK_SHIFT", l::MAT_BLOCK_SHIFT),
-        ("MAT_FLAGS_SHIFT", l::MAT_FLAGS_SHIFT),
+        ("MAT_LIGHT_SHIFT", l::MAT_LIGHT_SHIFT),
+        ("MAT_LIGHT_MASK", l::MAT_LIGHT_MASK),
     ] {
         assert_eq!(const_u32(&module, name), v, "{name}");
     }
+}
+
+#[test]
+fn wgsl_light_nibbles_match_light_value() {
+    use boxel_voxel::LightValue as L;
+    let (module, _) = load(ShaderModuleId::VoxelPull);
+    for (name, v) in [
+        ("LIGHT_SKY_SHIFT", L::SKY_SHIFT),
+        ("LIGHT_RED_SHIFT", L::RED_SHIFT),
+        ("LIGHT_GREEN_SHIFT", L::GREEN_SHIFT),
+        ("LIGHT_BLUE_SHIFT", L::BLUE_SHIFT),
+    ] {
+        assert_eq!(const_u32(&module, name), v, "{name}");
+    }
+    // A palette entry holds 4 LightValues, 2 per word, as boxel_mesh packs them.
+    let entry = boxel_mesh::palette_entry([L(0x1234), L(0x5678), L(0x9abc), L(0xdef0)]);
+    assert_eq!(entry, [0x5678_1234, 0xdef0_9abc]);
 }
 
 #[test]
@@ -283,7 +325,7 @@ fn gpu_struct_layouts_match_the_rust_mirrors() {
     let (pull, _) = load(ShaderModuleId::VoxelPull);
     let (size, offsets) = struct_layout(&pull, "View");
     assert_eq!(size as usize, size_of::<ViewUniform>());
-    assert_eq!(size, 240);
+    assert_eq!(size, 336);
     let rust = [
         offset_of!(ViewUniform, view_proj),
         offset_of!(ViewUniform, frustum),
@@ -292,12 +334,18 @@ fn gpu_struct_layouts_match_the_rust_mirrors() {
         offset_of!(ViewUniform, fog_color),
         offset_of!(ViewUniform, fog_params),
         offset_of!(ViewUniform, counts),
+        offset_of!(ViewUniform, sky_light),
+        offset_of!(ViewUniform, light_params),
+        offset_of!(ViewUniform, light_curve),
     ];
     assert_eq!(offsets, rust.map(|o| o as u32));
+    assert_eq!(offsets[7..], [240, 256, 272]);
     let (size, offsets) = struct_layout(&pull, "ChunkGpu");
     assert_eq!((size, size_of::<ChunkGpu>()), (64, 64));
-    assert_eq!(offsets[..4], [0, 12, 16, 48]);
+    assert_eq!(offsets[..6], [0, 12, 16, 48, 52, 56]);
     assert_eq!(offset_of!(ChunkGpu, flags), 48);
+    assert_eq!(offset_of!(ChunkGpu, light_base), 52);
+    assert_eq!(offset_of!(ChunkGpu, light_len), 56);
     let (cull, _) = load(ShaderModuleId::Cull);
     assert_eq!(
         struct_layout(&cull, "DrawArgs").0 as usize,
@@ -331,4 +379,45 @@ fn low_tier_has_one_uniform_block_and_one_texture_sampler_pair() {
         }
     }
     assert_eq!((uniforms, textures, samplers), (1, 1, 1));
+}
+
+#[test]
+fn low_tier_takes_the_quad_and_its_light_as_two_instance_attributes() {
+    let (module, _) = load(ShaderModuleId::VoxelInstanced);
+    let vs = module
+        .entry_points
+        .iter()
+        .find(|e| e.name == "vs_instanced")
+        .expect("vs_instanced");
+    let mut locations: Vec<(u32, naga::TypeInner)> = vs
+        .function
+        .arguments
+        .iter()
+        .filter_map(|arg| match arg.binding {
+            Some(naga::Binding::Location { location, .. }) => {
+                Some((location, module.types[arg.ty].inner.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    locations.sort_by_key(|(location, _)| *location);
+    let uint2 = naga::TypeInner::Vector {
+        size: naga::VectorSize::Bi,
+        scalar: naga::Scalar::U32,
+    };
+    assert_eq!(locations, [(0, uint2.clone()), (1, uint2)]);
+    // High and Mid keep one attribute (the DrawRef): the palette is read from the arena.
+    let (module, _) = load(ShaderModuleId::VoxelPull);
+    let vs = module
+        .entry_points
+        .iter()
+        .find(|e| e.name == "vs_pull")
+        .expect("vs_pull");
+    let attributes = vs
+        .function
+        .arguments
+        .iter()
+        .filter(|arg| matches!(arg.binding, Some(naga::Binding::Location { .. })))
+        .count();
+    assert_eq!(attributes, 1);
 }

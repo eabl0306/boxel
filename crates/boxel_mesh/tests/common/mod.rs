@@ -1,12 +1,14 @@
 //! Helpers shared by the meshing test files (each test binary uses a different subset).
 #![allow(dead_code, reason = "each test binary uses a subset of the helpers")]
 
+use boxel_light::{PADDED_VOLUME, PaddedLight};
 use boxel_mesh::{
-    BUCKET_COUNT, ChunkMesh, MaterialTable, PaddedChunk, VoxelClass, reference_visible_faces,
+    AoPolicy, BUCKET_COUNT, ChunkMesh, FaceShading, MAX_PALETTE_ENTRIES, MaterialTable,
+    PaddedChunk, VoxelClass, reference_face_shading, reference_visible_faces,
 };
 use boxel_voxel::{
-    BlockState, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, Face, LocalPos, NEIGHBOR_OFFSETS, Paletted,
-    RenderShape,
+    BlockState, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, Face, LightValue, LocalPos, NEIGHBOR_OFFSETS,
+    Paletted, RenderShape,
 };
 use std::collections::BTreeSet;
 
@@ -223,4 +225,236 @@ pub fn verify_mesh(padded: &PaddedChunk, table: &MaterialTable, mesh: &ChunkMesh
         );
     }
     got.len()
+}
+
+/// How a random padded chunk is filled.
+#[derive(Clone, Copy, Debug)]
+pub enum Fill {
+    /// Independent voxels with probability `density` percent.
+    Noise,
+    /// Overlapping random boxes (large greedy merges, partial overlaps).
+    Boxes,
+    /// Layered heightmap with a liquid level (terrain-like surfaces and borders).
+    Terrain,
+    /// Periodic lattice `(a x + b y + c z) mod m < k` (checkerboards, stripes, slopes).
+    Lattice,
+}
+
+/// Fills the whole padded chunk (inner voxels and the 1-voxel border) from the parameters.
+pub fn random_padded(
+    table: &MaterialTable,
+    fill: Fill,
+    seed: u64,
+    density: u32,
+    palette: &[u16],
+) -> PaddedChunk {
+    let mut rng = Rng::new(seed);
+    let mut padded = PaddedChunk::new();
+    let all =
+        || (-1..=32).flat_map(|y| (-1..=32).flat_map(move |x| (-1..=32).map(move |z| [x, y, z])));
+    match fill {
+        Fill::Noise => {
+            for p in all() {
+                if rng.below(100) < u64::from(density) {
+                    let material = rng.pick(palette);
+                    set_material(&mut padded, table, p, material);
+                }
+            }
+        }
+        Fill::Boxes => {
+            for _ in 0..1 + density / 4 {
+                let material = rng.pick(palette);
+                let lo = [0; 3].map(|_| rng.range(-1, 32));
+                let size = [0; 3].map(|_| rng.range(1, 20));
+                for y in lo[1]..(lo[1] + size[1]).min(33) {
+                    for x in lo[0]..(lo[0] + size[0]).min(33) {
+                        for z in lo[2]..(lo[2] + size[2]).min(33) {
+                            set_material(&mut padded, table, [x, y, z], material);
+                        }
+                    }
+                }
+            }
+        }
+        Fill::Terrain => {
+            let base = density as i32 * 34 / 100 - 1;
+            let (fx, fz) = (rng.range(1, 9) as f32 / 37.0, rng.range(1, 9) as f32 / 29.0);
+            let amplitude = rng.range(0, 12) as f32;
+            let sea = rng.range(-1, 32);
+            let layer = |depth: i32| palette[(depth.clamp(0, 3) as usize).min(palette.len() - 1)];
+            for x in -1..=32 {
+                for z in -1..=32 {
+                    let h =
+                        base + (amplitude * ((x as f32 * fx).sin() + (z as f32 * fz).cos())) as i32;
+                    for y in -1..=32 {
+                        if y <= h {
+                            set_material(&mut padded, table, [x, y, z], layer(h - y));
+                        } else if y <= sea {
+                            let liquid = palette[palette.len() - 1];
+                            set_material(&mut padded, table, [x, y, z], liquid);
+                        }
+                    }
+                }
+            }
+        }
+        Fill::Lattice => {
+            let (a, b, c) = (rng.range(0, 3), rng.range(0, 3), rng.range(0, 3));
+            let m = rng.range(2, 5);
+            let k = rng.range(1, m - 1);
+            for p in all() {
+                let phase = (a * p[0] + b * p[1] + c * p[2]).rem_euclid(m);
+                if phase < k {
+                    let material = palette[phase as usize % palette.len()];
+                    set_material(&mut padded, table, p, material);
+                }
+            }
+        }
+    }
+    padded
+}
+
+/// How a random padded light is made.
+#[derive(Clone, Copy, Debug)]
+pub enum LightFill {
+    /// No light (`None`: open sky everywhere).
+    Absent,
+    /// One random value everywhere (dark and open sky included).
+    Uniform,
+    /// Sky falling off below a random height and a few colored point lights fading by 1 per
+    /// voxel (Manhattan): what real light looks like, smooth with large equal areas.
+    Smooth,
+    /// A few random values in 2x2x2 blocks.
+    Blocky,
+    /// Block channels in a 4-level band (12 to 15) per voxel under constant sky: too many
+    /// exact corner values for the palette, but few enough at 3 bits.
+    Band,
+    /// A random value per voxel: overflows the palette even at 3 bits.
+    Noise,
+}
+
+/// Every [`LightFill`].
+pub const LIGHT_FILLS: [LightFill; 6] = [
+    LightFill::Absent,
+    LightFill::Uniform,
+    LightFill::Smooth,
+    LightFill::Blocky,
+    LightFill::Band,
+    LightFill::Noise,
+];
+
+/// A `Full` padded light from a function of padded `(x, y, z)` (each in -1..=32).
+pub fn full_light(mut f: impl FnMut(i32, i32, i32) -> u16) -> PaddedLight {
+    let mut values = vec![0u16; PADDED_VOLUME];
+    for y in -1..=32 {
+        for x in -1..=32 {
+            for z in -1..=32 {
+                values[PaddedLight::index(x, y, z)] = f(x, y, z);
+            }
+        }
+    }
+    PaddedLight::Full(
+        values
+            .into_boxed_slice()
+            .try_into()
+            .expect("PADDED_VOLUME values"),
+    )
+}
+
+/// A random padded light of kind `fill`.
+pub fn random_light(fill: LightFill, seed: u64) -> Option<PaddedLight> {
+    let mut rng = Rng::new(seed ^ 0x5EED_0F11_8D00);
+    let level = |rng: &mut Rng| rng.below(16) as u16;
+    Some(match fill {
+        LightFill::Absent => return None,
+        LightFill::Uniform => PaddedLight::Uniform(LightValue(match rng.below(3) {
+            0 => 0,
+            1 => 0xF000,
+            _ => rng.next_u64() as u16,
+        })),
+        LightFill::Smooth => {
+            let sky_top = rng.range(-4, 36);
+            let lights: Vec<([i32; 3], [u16; 3])> = (0..rng.range(0, 3))
+                .map(|_| {
+                    let p = [0; 3].map(|_| rng.range(-8, 40));
+                    (p, [0; 3].map(|_| level(&mut rng)))
+                })
+                .collect();
+            full_light(|x, y, z| {
+                let sky = (15 - (sky_top - y).max(0)).max(0) as u16;
+                let mut value = sky << 12;
+                for (p, rgb) in &lights {
+                    let d = ((x - p[0]).abs() + (y - p[1]).abs() + (z - p[2]).abs()) as u16;
+                    let lit = LightValue::new(
+                        0,
+                        rgb[0].saturating_sub(d) as u8,
+                        rgb[1].saturating_sub(d) as u8,
+                        rgb[2].saturating_sub(d) as u8,
+                    );
+                    value = LightValue(value).max(lit).0;
+                }
+                value
+            })
+        }
+        LightFill::Blocky => {
+            let values: Vec<u16> = (0..rng.range(1, 6))
+                .map(|_| rng.next_u64() as u16)
+                .collect();
+            let salt = rng.next_u64();
+            full_light(|x, y, z| {
+                let cell = Rng::new(
+                    salt ^ ((x >> 1) as u64) << 40 ^ ((y >> 1) as u64) << 20 ^ (z >> 1) as u64,
+                )
+                .next_u64();
+                values[(cell % values.len() as u64) as usize]
+            })
+        }
+        LightFill::Band => full_light(|_, _, _| {
+            0xF000
+                | [0; 3]
+                    .iter()
+                    .fold(0, |v, _| v << 4 | (12 + rng.below(4) as u16))
+        }),
+        LightFill::Noise => full_light(|_, _, _| rng.next_u64() as u16),
+    })
+}
+
+/// Checks the shading of a mesh against [`reference_face_shading`]: every unit face of every
+/// quad has the quad's AO byte and palette corners, and those equal the reference at the mesh's
+/// quantization level. Also checks that the palette fits, every quad indexes it and every entry
+/// is used.
+pub fn verify_shading(
+    padded: &PaddedChunk,
+    light: Option<&PaddedLight>,
+    policy: AoPolicy,
+    mesh: &ChunkMesh,
+) {
+    let reference = reference_face_shading(padded, light, policy);
+    let elide = policy == AoPolicy::BakedLitOnly;
+    assert!(
+        mesh.palette.len() <= MAX_PALETTE_ENTRIES,
+        "palette overflow"
+    );
+    let mut used = vec![false; mesh.palette.len()];
+    let mut faces = 0;
+    for quad in &mesh.quads {
+        let index = quad.light_index() as usize;
+        assert!(
+            index < mesh.palette.len(),
+            "{quad:?} indexes past the palette"
+        );
+        used[index] = true;
+        let got = FaceShading {
+            ao: quad.ao_byte(),
+            light: mesh.corner_light(*quad),
+        };
+        for (p, face) in quad.unit_faces() {
+            let want = reference
+                .get(&(p, face))
+                .unwrap_or_else(|| panic!("{p:?} {face:?} is not a visible face"))
+                .quantized(mesh.light_quantization, elide);
+            assert_eq!(got, want, "{quad:?}: unit face {p:?} {face:?}");
+            faces += 1;
+        }
+    }
+    assert_eq!(faces, reference.len(), "unit faces");
+    assert!(used.iter().all(|&u| u), "unused palette entries");
 }

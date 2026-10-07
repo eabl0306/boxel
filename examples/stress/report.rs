@@ -152,6 +152,59 @@ pub struct RunInfo {
     pub unix_time: u64,
     /// Frames presented during the measurement.
     pub frames_presented: u64,
+    /// Clock time of the world (`--time`, kept still during the run); empty in runs from
+    /// before the option, which had no day and night.
+    pub time: String,
+    /// `--edits`: the scripted edits and their latency.
+    pub edits: Option<EditStats>,
+}
+
+/// What `--edits` measured: scripted edits (lamp placed and removed, shaft dug and capped) and
+/// how long the world took to publish each one.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EditStats {
+    /// Steps applied.
+    pub steps: usize,
+    /// Steps skipped (a column without ground in reach).
+    pub skipped: usize,
+    /// Steps that started on a settled world, timed until it settled again.
+    pub timed: usize,
+    /// Frames from a timed step to the world settled again, the step's own frame included:
+    /// median and slowest.
+    pub frames_p50: u32,
+    /// See `frames_p50`.
+    pub frames_max: u32,
+    /// The same in milliseconds.
+    pub ms_p50: f64,
+    /// See `ms_p50`.
+    pub ms_max: f64,
+    /// Edit batches held back so their meshes publish together (`WorldStats`), during the
+    /// measurement.
+    pub batches_held: usize,
+    /// Edit batches published in parts (some meshes took longer than the hold), during the
+    /// measurement.
+    pub batches_split: usize,
+    /// Chunks remeshed by light changes beyond the edited voxels' chunks, during the
+    /// measurement.
+    pub light_fanout: usize,
+}
+
+impl EditStats {
+    /// JSON object.
+    fn json(&self) -> Json {
+        Json::Obj(vec![
+            ("steps", Json::uint(self.steps)),
+            ("skipped", Json::uint(self.skipped)),
+            ("timed", Json::uint(self.timed)),
+            ("frames_p50", Json::uint(self.frames_p50)),
+            ("frames_max", Json::uint(self.frames_max)),
+            ("ms_p50", Json::num(self.ms_p50, 3)),
+            ("ms_max", Json::num(self.ms_max, 3)),
+            ("batches_held", Json::uint(self.batches_held)),
+            ("batches_split", Json::uint(self.batches_split)),
+            ("light_fanout", Json::uint(self.light_fanout)),
+        ])
+    }
 }
 
 /// Frame-time statistics of a subset of frames (for example the frames that crossed a chunk
@@ -728,6 +781,7 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
         ("unix_time", Json::uint(info.unix_time)),
         ("date_utc", Json::Str(utc_date(info.unix_time))),
         ("frames_presented", Json::uint(info.frames_presented)),
+        ("time", Json::Str(info.time.clone())),
     ]);
     let frames = Json::Obj(vec![
         ("count", Json::uint(f.frames)),
@@ -778,6 +832,7 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
             }),
         ),
         ("catch_up_s", Json::opt(info.catch_up_s, 3)),
+        ("edits", info.edits.map_or(Json::Null, |e| e.json())),
         (
             "final",
             Json::Obj(vec![
@@ -898,7 +953,7 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
     let _ = writeln!(
         out,
         "- World: {}, seed {}, trees {}, radius {}, settled in {:.2} s with {} chunks; {:.0} s \
-         measured after {:.0} s of warmup. Renderer: {} quads, {} chunk slots.\n",
+         measured after {:.0} s of warmup. Renderer: {} quads, {} chunk slots.{}\n",
         if info.world.is_empty() {
             "?"
         } else {
@@ -913,6 +968,11 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
         info.warmup_s,
         info.arena_quads,
         info.chunk_slots,
+        if info.time.is_empty() {
+            String::new()
+        } else {
+            format!(" Clock {} (still).", info.time)
+        },
     );
 
     let _ = writeln!(out, "## Frames\n");
@@ -1001,6 +1061,35 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
         s.last.quads,
         s.last.draws,
     );
+
+    if let Some(e) = &info.edits {
+        let _ = writeln!(out, "## Edits\n");
+        let _ = writeln!(
+            out,
+            "| steps | skipped | timed | frames p50 | frames max | ms p50 | ms max | batches held \
+             | batches split | light fan-out |"
+        );
+        let _ = writeln!(out, "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} | {:.2} | {:.2} | {} | {} | {} |\n",
+            e.steps,
+            e.skipped,
+            e.timed,
+            e.frames_p50,
+            e.frames_max,
+            e.ms_p50,
+            e.ms_max,
+            e.batches_held,
+            e.batches_split,
+            e.light_fanout,
+        );
+        let _ = writeln!(
+            out,
+            "A timed step starts on a settled world and ends when it settles again (every remesh \
+             published), its own frame included.\n"
+        );
+    }
 
     let _ = writeln!(out, "## Worst {} frames\n", s.worst.len());
     let _ = writeln!(

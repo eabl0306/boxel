@@ -1,14 +1,27 @@
-//! Meshing benchmarks: gather + mesh of terrain-like, caves and checkerboard chunks, and of a
-//! deep cave chunk of `OverworldGenerator` (`gather_mesh/cave`, 1-bit stone and air with its
-//! 26 neighbors; the quad count is printed).
+//! Meshing benchmarks: gather + mesh of terrain-like, caves and checkerboard chunks, and of
+//! chunks of `OverworldGenerator`: a deep cave chunk (1-bit stone and air with its 26
+//! neighbors), the same kind of cave lit by colored lamps, and the surface chunk near the origin
+//! with trees and a cave entrance (the scenes of the `boxel_light` benches). Quad counts and
+//! palette sizes are printed.
 //!
-//! Targets (informational in M0): `mesh` of a terrain-like padded chunk < 60 us,
-//! gather + mesh < 150 us (release).
+//! Targets (release, idle machine; ADR 0015, phase P2):
+//!
+//! | Bench | Target |
+//! |---|---|
+//! | `mesh/cave` (AO off, no light: the bgm path) | 1.15x of 28.8 us or less |
+//! | `gather_mesh/cave` (dark uniform light, AO on lit faces only) | 1.1x of 91.5 us or less |
+//! | `gather_mesh/cave_lit` (lamps, light computed beforehand) | 160 us or less |
+//! | `gather_mesh/surface` (sky light and AO keys, light computed beforehand) | 150 us or less |
+//!
+//! The other `mesh/*`, `gather/*` and `gather_mesh/terrain_*` benches keep the M0 setup (AO
+//! off, no light) to compare with earlier runs; `mesh/terrain_baked` adds AO to every face.
 #![expect(clippy::print_stderr, reason = "bench scene statistics")]
 
-use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, Mesher, PaddedChunk};
+use boxel_light::{LightScratch, PaddedLight, compute};
+use boxel_mesh::{AoPolicy, ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher, PaddedChunk};
 use boxel_voxel::{
-    BlockRegistry, BlockState, CHUNK_SIZE, ChunkData, ChunkKey, ChunkPos, NEIGHBOR_OFFSETS,
+    BlockRegistry, BlockState, CHUNK_SIZE, ChunkData, ChunkKey, ChunkPos, LightTables, LightValue,
+    NEIGHBOR_OFFSETS,
 };
 use boxel_worldgen::{OverworldGenerator, WorldGenerator};
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -16,8 +29,16 @@ use std::hint::black_box;
 
 #[path = "../tests/common/mod.rs"]
 mod common;
+#[path = "../../boxel_light/benches/scenes/mod.rs"]
+mod scenes;
 
 use common::{Repr, chunk_repr, dense_from};
+use scenes::Neighborhood;
+
+/// AO off: quads as by material alone (the M0 mesher).
+const OFF: MeshOptions = MeshOptions::with_ao(AoPolicy::Off);
+/// The default: AO on faces with some light.
+const LIT_ONLY: MeshOptions = MeshOptions::with_ao(AoPolicy::BakedLitOnly);
 
 /// Block ids of the default registry used by the scenes.
 struct Blocks {
@@ -164,12 +185,35 @@ impl Scene {
         }
     }
 
+    /// The center and its 26 neighbors of a light neighborhood (27 chunks, center at 13).
+    fn from_neighborhood(n: &Neighborhood) -> Self {
+        let mut chunks = n.chunks.clone();
+        let center = chunks.remove(13);
+        Self {
+            center,
+            neighbors: chunks,
+        }
+    }
+
     fn input(&self) -> MeshInput<'_> {
+        self.lit(None)
+    }
+
+    fn lit<'a>(&'a self, light: Option<&'a PaddedLight>) -> MeshInput<'a> {
         MeshInput {
             center: &self.center,
             neighbors: std::array::from_fn(|i| Some(&self.neighbors[i])),
+            light,
         }
     }
+}
+
+/// The light of a neighborhood's center chunk, computed once.
+fn light_of(n: &Neighborhood, tables: &LightTables) -> PaddedLight {
+    let mut out = PaddedLight::default();
+    let path = compute(&n.input(tables), &mut LightScratch::new(), &mut out);
+    eprintln!("light of {:?}: {path:?}", n.origin);
+    out
 }
 
 fn bench(c: &mut Criterion) {
@@ -201,14 +245,19 @@ fn bench(c: &mut Criterion) {
     let mut mesher = Mesher::new();
     let mut padded = PaddedChunk::new();
     let mut out = ChunkMesh::default();
-    for (name, scene) in [
-        ("terrain", &terrain_packed),
-        ("caves", &cave),
-        ("checkerboard", &checker),
-        ("cave", &generated),
+    for (name, scene, options) in [
+        ("terrain", &terrain_packed, OFF),
+        (
+            "terrain_baked",
+            &terrain_packed,
+            MeshOptions::with_ao(AoPolicy::Baked),
+        ),
+        ("caves", &cave, OFF),
+        ("checkerboard", &checker, OFF),
+        ("cave", &generated, OFF),
     ] {
         mesher.gather(&scene.input(), &table, &mut padded);
-        mesher.mesh(&padded, &table, &mut out);
+        mesher.mesh(&padded, None, &table, options, &mut out);
         eprintln!(
             "scene {name}: {} quads, buckets {:?}",
             out.total_quads(),
@@ -216,23 +265,86 @@ fn bench(c: &mut Criterion) {
         );
         c.bench_function(&format!("mesh/{name}"), |bench| {
             bench.iter(|| {
-                mesher.mesh(black_box(&padded), &table, &mut out);
+                mesher.mesh(black_box(&padded), None, &table, options, &mut out);
                 black_box(out.total_quads())
             });
         });
     }
     eprintln!("scene cave: overworld chunk {cave_pos:?}");
-    for (name, scene) in [
-        ("terrain_packed", &terrain_packed),
-        ("terrain_direct", &terrain_direct),
-        ("cave", &generated),
+
+    // Lit scenes: the surface near the origin (trees and a cave entrance) and a cave with
+    // lamps, both with the real light of `boxel_light` (computed once, outside the timing).
+    let (lamp_blocks, lamps) = scenes::lamp_registry();
+    let lamp_table = MaterialTable::from_registry(&lamp_blocks);
+    let tables = LightTables::from_registry(&lamp_blocks);
+    let surface_n = Neighborhood::generate(
+        &overworld,
+        &lamp_blocks,
+        &tables,
+        scenes::surface_origin(&overworld, &lamp_blocks, &tables),
+    );
+    let (cave_n, placed) = scenes::lamp_cave(&overworld, &lamp_blocks, &tables, lamps);
+    eprintln!("scene cave_lit: {placed} lamps around {:?}", cave_n.origin);
+    let surface = Scene::from_neighborhood(&surface_n);
+    let surface_light = light_of(&surface_n, &tables);
+    let cave_lit = Scene::from_neighborhood(&cave_n);
+    let cave_light = light_of(&cave_n, &tables);
+    let dark = PaddedLight::Uniform(LightValue::DARK);
+
+    for (name, scene, light, table, options) in [
+        ("terrain_packed", &terrain_packed, None, &table, OFF),
+        ("terrain_direct", &terrain_direct, None, &table, OFF),
+        ("cave", &generated, Some(&dark), &table, LIT_ONLY),
+        (
+            "cave_lit",
+            &cave_lit,
+            Some(&cave_light),
+            &lamp_table,
+            LIT_ONLY,
+        ),
+        (
+            "surface",
+            &surface,
+            Some(&surface_light),
+            &lamp_table,
+            LIT_ONLY,
+        ),
     ] {
-        let input = scene.input();
+        let input = scene.lit(light);
+        let mesh = mesher.mesh_chunk(&input, table, options);
+        eprintln!(
+            "scene {name}: {} quads, palette {} ({:?})",
+            mesh.total_quads(),
+            mesh.palette.len(),
+            mesh.light_quantization
+        );
         c.bench_function(&format!("gather/{name}"), |bench| {
-            bench.iter(|| mesher.gather(black_box(&input), &table, &mut padded));
+            bench.iter(|| mesher.gather(black_box(&input), table, &mut padded));
         });
         c.bench_function(&format!("gather_mesh/{name}"), |bench| {
-            bench.iter(|| black_box(mesher.mesh_chunk(black_box(&input), &table)));
+            bench.iter(|| black_box(mesher.mesh_chunk(black_box(&input), table, options)));
+        });
+    }
+
+    // The mesh step alone on the surface chunk: without light and AO (the M0 path), with AO on
+    // every face, and lit (the light keys).
+    mesher.gather(&surface.input(), &lamp_table, &mut padded);
+    for (name, light, options) in [
+        ("surface_unlit", None, OFF),
+        ("surface_baked", None, MeshOptions::with_ao(AoPolicy::Baked)),
+        ("surface", Some(&surface_light), LIT_ONLY),
+    ] {
+        mesher.mesh(&padded, light, &lamp_table, options, &mut out);
+        let faces: u32 = out.quads.iter().map(|q| q.w() * q.h()).sum();
+        eprintln!(
+            "scene {name}: {} quads, {faces} unit faces",
+            out.total_quads()
+        );
+        c.bench_function(&format!("mesh/{name}"), |bench| {
+            bench.iter(|| {
+                mesher.mesh(black_box(&padded), light, &lamp_table, options, &mut out);
+                black_box(out.total_quads())
+            });
         });
     }
 }

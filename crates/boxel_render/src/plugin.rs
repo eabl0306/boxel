@@ -12,7 +12,10 @@
 //!   frame results `Cleanup` writes back.
 
 use crate::overlay::{OverlayDraw, OverlayPass, OverlayRect};
-use crate::{RendererConfig, RendererSmokeTest, ViewParams, VoxelRenderer};
+use crate::{
+    DEFAULT_SKY_COLOR, RendererConfig, RendererSmokeTest, SceneLight, ViewParams, VoxelRenderer,
+    light_curve,
+};
 use boxel_app::{App, Last, MainScheduleOrder, Plugin, Shutdown, Time};
 use boxel_camera::{Camera, CameraView};
 use boxel_diagnostic::DiagnosticsBoard;
@@ -30,7 +33,7 @@ use boxel_mesh::ChunkMesh;
 use boxel_transform::Transform;
 use boxel_voxel::{BlockRegistry, TextureSpec};
 use boxel_window::{DisplayHandle, PrimaryWindow, WindowState};
-use boxel_world::{ChunkMap, ChunkMeshEvent, WorldContent};
+use boxel_world::{ChunkMap, ChunkMeshEvent, DaylightCurve, TimeOfDay, WorldContent};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -75,10 +78,19 @@ pub struct RenderSettings {
     pub smoke_level: SmokeLevel,
     /// Tier classification policy.
     pub tier_policy: TierPolicy,
-    /// Sky/clear color (linear RGBA); also the fog color.
+    /// Sky/clear color (linear RGBA), also the fog color, when the app has no world clock. With
+    /// `boxel_world::DaylightPlugin` ([`TimeOfDay`] and [`DaylightCurve`]) the curve gives the sky
+    /// color, the sky light and the ambient floor of the current time instead.
     pub clear_color: [f32; 4],
     /// Fog starts at this fraction of `Camera::view_distance` and ends at the distance.
     pub fog_start_fraction: f32,
+    /// What the most occluded corner loses to ambient occlusion (0.55: it keeps 45 %).
+    pub ao_strength: f32,
+    /// Multiplier of block light (lamps, lava). Default 1.
+    pub block_light_gain: f32,
+    /// Brightness curve of the light levels ([`light_curve`]): 0 (the default) is Minecraft's
+    /// dark "moody" curve, 1 the brightest.
+    pub light_gamma: f32,
     /// Quad arena capacity (8 bytes per quad). Default 8 Mi quads (64 MiB).
     pub arena_quads: u32,
     /// Chunk table capacity (render chunk slots). Default 32768.
@@ -97,8 +109,11 @@ impl Default for RenderSettings {
             gpu_config: None,
             smoke_level: SmokeLevel::Auto,
             tier_policy: TierPolicy::default(),
-            clear_color: [0.30, 0.52, 0.85, 1.0],
+            clear_color: DEFAULT_SKY_COLOR,
             fog_start_fraction: 0.6,
+            ao_strength: SceneLight::DEFAULT_AO_STRENGTH,
+            block_light_gain: 1.0,
+            light_gamma: SceneLight::DEFAULT_GAMMA,
             arena_quads: 8 << 20,
             max_chunk_slots: 32768,
             render_when_hidden: false,
@@ -543,7 +558,10 @@ enum MeshOp {
 struct ExtractedFrame {
     camera: Option<(Camera, Transform)>,
     window: WindowState,
-    clear_color: [f32; 4],
+    /// Clear and fog color of this frame.
+    sky_color: [f32; 4],
+    /// Scene light of this frame.
+    light: SceneLight,
     fog_start_fraction: f32,
     render_when_hidden: bool,
     /// Full resync: `meshes` holds every ready mesh, `renderer.clear_chunks` runs first.
@@ -891,7 +909,6 @@ fn bootstrap(p: &mut SetupParams) {
     let config = RendererConfig {
         arena_quads: settings.arena_quads,
         max_chunk_slots: settings.max_chunk_slots,
-        clear_color: settings.clear_color,
     };
     let present = p.present.mode;
     let built = VoxelRenderer::new(
@@ -1126,6 +1143,26 @@ fn recreate_surface(
 // ---------------------------------------------------------------------------------------------
 // Extract
 
+/// The sky color and scene light of a frame: from the world clock and its curve when the app has
+/// them, else a noon sky of `settings.clear_color`.
+fn scene_light(
+    settings: &RenderSettings,
+    clock: Option<(&TimeOfDay, &DaylightCurve)>,
+) -> ([f32; 4], SceneLight) {
+    let daylight = clock.map(|(time, curve)| curve.at(time));
+    let light = SceneLight {
+        sky: daylight.map_or([1.0; 3], |d| d.sky_light),
+        ambient: daylight.map_or(SceneLight::DEFAULT_AMBIENT, |d| d.ambient),
+        ao_strength: settings.ao_strength,
+        block_gain: settings.block_light_gain,
+        curve: light_curve(settings.light_gamma),
+    };
+    (
+        daylight.map_or(settings.clear_color, |d| d.sky_color),
+        light,
+    )
+}
+
 /// `RenderSystems::Extract`: the only reads of the main world for this frame's rendering.
 fn extract(
     settings: Res<RenderSettings>,
@@ -1133,6 +1170,7 @@ fn extract(
     mut frame: ResMut<ExtractedFrame>,
     window: Option<Res<WindowState>>,
     cameras: Query<(&Camera, &Transform)>,
+    clock: Option<(Res<TimeOfDay>, Res<DaylightCurve>)>,
     chunks: Option<Res<ChunkMap>>,
     mut mesh_events: MessageReader<ChunkMeshEvent>,
     mut screenshots: MessageReader<RequestScreenshot>,
@@ -1147,7 +1185,10 @@ fn extract(
         .find(|(camera, _)| camera.active)
         .map(|(camera, transform)| (*camera, *transform));
     frame.window = window.as_deref().copied().unwrap_or_default();
-    frame.clear_color = settings.clear_color;
+    (frame.sky_color, frame.light) = scene_light(
+        &settings,
+        clock.as_ref().map(|(time, curve)| (&**time, &**curve)),
+    );
     frame.fog_start_fraction = settings.fog_start_fraction;
     frame.render_when_hidden = settings.render_when_hidden;
     frame
@@ -1241,7 +1282,10 @@ fn prepare(
     frame.view = frame.camera.map(|(camera, transform)| {
         let aspect = ready.config.width.max(1) as f32 / ready.config.height.max(1) as f32;
         let view = CameraView::compute(&camera, &transform, aspect);
-        ViewParams::from_camera(&view, &camera, frame.clear_color, frame.fog_start_fraction)
+        ViewParams {
+            light: frame.light,
+            ..ViewParams::from_camera(&view, &camera, frame.sky_color, frame.fog_start_fraction)
+        }
     });
 }
 
@@ -1718,5 +1762,34 @@ mod tests {
             MeshOp::Remove { id } => assert_eq!(id, chunk.to_bits()),
             MeshOp::Upsert { .. } => panic!("expected a remove"),
         }
+    }
+
+    #[test]
+    fn the_scene_light_follows_the_world_clock() {
+        let settings = RenderSettings {
+            clear_color: [0.1, 0.2, 0.3, 1.0],
+            ao_strength: 0.4,
+            block_light_gain: 1.5,
+            light_gamma: 1.0,
+            ..RenderSettings::default()
+        };
+        // Without a clock: a white noon sky of the configured color.
+        let (sky, light) = scene_light(&settings, None);
+        assert_eq!(sky, settings.clear_color);
+        assert_eq!(light.sky, [1.0; 3]);
+        assert_eq!(light.ambient, SceneLight::DEFAULT_AMBIENT);
+        assert_eq!((light.ao_strength, light.block_gain), (0.4, 1.5));
+        assert_eq!(light.curve, light_curve(1.0));
+        // With one: the curve's sky at that time; the shading settings stay.
+        let curve = DaylightCurve::default();
+        let midnight = TimeOfDay::at_clock(0.0);
+        let (sky, night) = scene_light(&settings, Some((&midnight, &curve)));
+        let expected = curve.at(&midnight);
+        assert_eq!((sky, night.sky), (expected.sky_color, expected.sky_light));
+        assert_eq!(night.ambient, expected.ambient);
+        assert_eq!((night.ao_strength, night.block_gain), (0.4, 1.5));
+        let noon = TimeOfDay::at_clock(12.0);
+        let (sky, day) = scene_light(&RenderSettings::default(), Some((&noon, &curve)));
+        assert_eq!((sky, day), (DEFAULT_SKY_COLOR, SceneLight::noon()));
     }
 }
