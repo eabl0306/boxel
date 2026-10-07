@@ -1,0 +1,17 @@
+{
+  "pack": {
+    "description": "boxel pack loader fixture",
+    "min_format": 64,
+    "max_format": 120,
+    "pack_format": 84
+  },
+  "overlays": {
+    "entries": [
+      {
+        "directory": "format_test",
+        "min_format": 80,
+        "max_format": 90
+      }
+    ]
+  }
+}
