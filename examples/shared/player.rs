@@ -3,8 +3,10 @@
 //!
 //! G switches between flying (the free fly camera) and walking. The player is a dynamic box of
 //! 0.6 x 1.8 x 0.6 blocks with gravity: WASD walks along the camera's heading and Space jumps
-//! (held, it jumps again on landing). The camera keeps its mouse look; its own WASD movement is
-//! paused while walking.
+//! (held, it jumps again on landing). It walks up slabs and stairs of slabs without jumping (the
+//! controller's step-up); the body rises within one fixed step, so the eye trails the rise and
+//! catches up in about a tenth of a second ([`EyeLag`], only the view). The camera keeps its
+//! mouse look; its own WASD movement is paused while walking.
 //!
 //! Frame order:
 //! - `RunFixedMainLoopSystems::BeforeFixedMainLoop`: the keys are sampled once per frame into
@@ -34,9 +36,43 @@ pub const WALK_KEY: KeyCode = KeyCode::KeyG;
 /// How far down the first landing looks for ground, blocks.
 const LAND_REACH: f64 = 512.0;
 
+/// How fast the eye catches up with a step-up, per second: the lag shrinks by `1 + rate * dt`
+/// each frame (about a tenth of a second for a slab).
+const EYE_CATCH_UP: f64 = 20.0;
+/// A rise larger than this in one frame is a teleport, not a step: the eye goes there at once.
+const MAX_EYE_LAG: f64 = 1.0;
+
 /// The player body (only while walking).
 #[derive(Component, Clone, Copy, Debug, Default)]
+#[require(EyeLag)]
 pub struct Player;
+
+/// How far the camera's eye is below the player's real eye after a step-up, blocks. The body
+/// climbs a slab within one fixed step (15.6 ms at 64 Hz), which looks like a jolt; the eye
+/// lags and catches up instead. Only the view: the body's position stays exact.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct EyeLag {
+    /// Current lag, blocks (0 or more).
+    pub lag: f64,
+    /// The body's interpolated height last frame.
+    last_y: Option<f64>,
+}
+
+/// The new eye lag after a frame of `dt` seconds in which the body rose by `rise` blocks:
+/// a rise while standing on the ground (a step-up, `stepped`) adds to the lag, then the lag
+/// shrinks toward 0. Anything else (falling, jumping, a lift, a teleport) leaves the eye on the
+/// body.
+pub fn eye_lag(lag: f64, rise: f64, stepped: bool, dt: f64) -> f64 {
+    let lag = if stepped && rise > 0.0 && rise <= MAX_EYE_LAG {
+        (lag + rise).min(MAX_EYE_LAG)
+    } else if rise > MAX_EYE_LAG {
+        0.0
+    } else {
+        lag
+    };
+    let lag = lag / (1.0 + EYE_CATCH_UP * dt.max(0.0));
+    if lag < 1e-3 { 0.0 } else { lag }
+}
 
 /// Walking or flying.
 #[derive(Resource, Clone, Copy, Debug, PartialEq)]
@@ -187,21 +223,35 @@ pub fn sample_input(
     }
 }
 
-/// The active camera at the player's eye (its interpolated `Transform` plus [`EYE_HEIGHT`]),
-/// and the F3 lines `move` (mode, ground, speed) and `physics` (`PhysicsStats`).
+/// The active camera at the player's eye (its interpolated `Transform` plus [`EYE_HEIGHT`],
+/// minus the [`EyeLag`] of a step-up), and the F3 lines `move` (mode, ground, speed) and
+/// `physics` (`PhysicsStats`).
 pub fn follow_player(
+    time: Res<Time>,
     walking: Res<Walking>,
     stats: Res<PhysicsStats>,
-    players: Query<
-        (&Transform, &Velocity, &Contacts, Has<Frozen>),
+    mut players: Query<
+        (&Transform, &Velocity, &Contacts, Has<Frozen>, &mut EyeLag),
         (With<Player>, Without<FlyCamera>),
     >,
     mut cameras: Query<(&Camera, &mut Transform), With<FlyCamera>>,
     lines: Option<ResMut<OverlayLines>>,
 ) {
-    let player = players.iter().next();
-    if let Some((body, ..)) = player {
-        let eye = body.translation + DVec3::new(0.0, EYE_HEIGHT, 0.0);
+    let player = players.iter_mut().next();
+    let player = player.map(|(body, velocity, contacts, frozen, mut eye)| {
+        let y = body.translation.y;
+        let rise = eye.last_y.map_or(0.0, |last| y - last);
+        // A step-up ends on the ground with no vertical speed; a jump or a lift does not.
+        let stepped = contacts.on_ground && velocity.0.y <= 0.0;
+        let lag = eye_lag(eye.lag, rise, stepped, time.delta().as_secs_f64());
+        if eye.lag != lag || eye.last_y != Some(y) {
+            eye.lag = lag;
+            eye.last_y = Some(y);
+        }
+        (*body, *velocity, *contacts, frozen, lag)
+    });
+    if let Some((body, .., lag)) = player {
+        let eye = body.translation + DVec3::new(0.0, EYE_HEIGHT - lag, 0.0);
         for (camera, mut transform) in &mut cameras {
             if camera.active && transform.translation != eye {
                 transform.translation = eye;
@@ -212,7 +262,7 @@ pub fn follow_player(
         return;
     };
     let mode = match player {
-        Some((_, velocity, contacts, frozen)) => {
+        Some((_, velocity, contacts, frozen, _)) => {
             let state = if frozen {
                 "frozen (chunk not loaded)"
             } else if contacts.on_ground {
@@ -231,6 +281,31 @@ pub fn follow_player(
         if lines.get(key) != Some(line.as_str()) {
             lines.set(key, line);
         }
+    }
+}
+
+#[cfg(test)]
+mod eye_tests {
+    use super::eye_lag;
+
+    #[test]
+    fn the_eye_trails_a_step_up_only() {
+        let dt = 1.0 / 144.0;
+        // A step-up: the eye trails by the rise, shrunk by one frame of catching up.
+        let lag = eye_lag(0.0, 0.5, true, dt);
+        assert!(lag > 0.4 && lag < 0.5, "{lag}");
+        // It catches up within a fraction of a second, exactly.
+        let mut l = lag;
+        for _ in 0..72 {
+            l = eye_lag(l, 0.0, true, dt);
+        }
+        assert_eq!(l, 0.0);
+        // A jump, a fall or a lift moves the eye with the body; a teleport up drops the lag.
+        assert_eq!(eye_lag(0.0, 0.5, false, dt), 0.0);
+        assert_eq!(eye_lag(0.0, -0.5, true, dt), 0.0);
+        assert_eq!(eye_lag(0.3, 40.0, true, dt), 0.0);
+        // Steps in a row never trail more than a block.
+        assert!(eye_lag(0.9, 0.5, true, 0.0) <= 1.0);
     }
 }
 
