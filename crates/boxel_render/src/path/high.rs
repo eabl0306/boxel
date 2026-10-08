@@ -1,5 +1,7 @@
 //! High tier: GPU cull + `multi_draw_indexed_indirect_count`.
-use super::{BucketDraw, CullPipeline, TierPath, VoxelPipelines, translucent_draws};
+use super::{
+    BucketDraw, CullPipeline, SlotVisibility, TierPath, VoxelPipelines, translucent_draws,
+};
 use crate::chunk_table::ChunkTable;
 use crate::renderer::ViewParams;
 use boxel_shaders::gpu::{DrawIndexedIndirect, DrawRef, bindings};
@@ -21,6 +23,8 @@ pub(crate) struct HighInputs<'a> {
     pub cap_opaque: u32,
     /// Cutout list capacity.
     pub cap_cutout: u32,
+    /// Chunk slots (the cave culling bits hold one per slot).
+    pub slots: u32,
 }
 
 /// GPU-driven path: `cull_chunks` writes two compacted indirect lists (opaque face buckets at
@@ -37,6 +41,8 @@ pub(crate) struct HighPath {
     index: wgpu::Buffer,
     draw_args: wgpu::Buffer,
     draw_refs: wgpu::Buffer,
+    /// The cull state of `cull.wgsl`: the two draw counts (cleared every frame), then one cave
+    /// culling bit per slot from `bindings::CULL_VISIBLE_OFFSET` (written when they change).
     draw_counts: wgpu::Buffer,
     cap_opaque: u32,
     cap_cutout: u32,
@@ -69,9 +75,10 @@ impl HighPath {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
+        let visible_words = u64::from(inputs.slots.div_ceil(32).max(1));
         let draw_counts = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("boxel draw counts"),
-            size: 8,
+            label: Some("boxel cull state"),
+            size: bindings::CULL_VISIBLE_OFFSET + 4 * visible_words,
             usage: wgpu::BufferUsages::INDIRECT
                 | wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST,
@@ -129,8 +136,25 @@ impl HighPath {
 }
 
 impl TierPath for HighPath {
-    fn prepare(&mut self, queue: &wgpu::Queue, chunks: &ChunkTable, view: &ViewParams) -> u32 {
-        translucent_draws(chunks, view, &mut self.translucent);
+    fn prepare(
+        &mut self,
+        queue: &wgpu::Queue,
+        chunks: &ChunkTable,
+        view: &ViewParams,
+        visibility: Option<SlotVisibility<'_>>,
+    ) -> u32 {
+        // The cull reads the bits only while `View::counts.w` says so (set by the renderer).
+        if let Some(v) = visibility
+            && v.changed
+            && !v.bits.is_empty()
+        {
+            queue.write_buffer(
+                &self.draw_counts,
+                bindings::CULL_VISIBLE_OFFSET,
+                bytemuck::cast_slice(v.bits),
+            );
+        }
+        translucent_draws(chunks, view, visibility, &mut self.translucent);
         self.translucent.truncate(self.translucent_capacity);
         if !self.translucent.is_empty() {
             let refs: Vec<DrawRef> = self
@@ -147,7 +171,7 @@ impl TierPath for HighPath {
     }
 
     fn encode_compute(&self, encoder: &mut wgpu::CommandEncoder, slot_count: u32) {
-        encoder.clear_buffer(&self.draw_counts, 0, None);
+        encoder.clear_buffer(&self.draw_counts, 0, Some(bindings::CULL_VISIBLE_OFFSET));
         if slot_count == 0 {
             return;
         }

@@ -378,6 +378,12 @@ fn gpu_struct_layouts_match_the_rust_mirrors() {
         size_of::<DrawIndexedIndirect>()
     );
     assert_eq!(size_of::<DrawIndexedIndirect>(), 20);
+    // The cave culling bits follow the two draw counts (ADR 0022).
+    let (_, offsets) = struct_layout(&cull, "CullState");
+    assert_eq!(
+        u64::from(offsets[1]),
+        boxel_shaders::gpu::bindings::CULL_VISIBLE_OFFSET
+    );
     let (low, _) = load(ShaderModuleId::VoxelInstanced);
     assert_eq!(
         struct_layout(&low, "ChunkImmediate").0 as usize,

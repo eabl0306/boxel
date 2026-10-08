@@ -2,8 +2,8 @@ use crate::arena::{QUAD_BYTES, QuadArena};
 use crate::chunk_table::{ChunkRecord, ChunkTable};
 use crate::light::SceneLight;
 use crate::path::{
-    HighInputs, HighPath, LowPath, MidPath, TierPath, TierPipelines, geometry_bind_group,
-    quad_index_buffer,
+    HighInputs, HighPath, LowPath, MidPath, SlotVisibility, TierPath, TierPipelines,
+    geometry_bind_group, quad_index_buffer,
 };
 use crate::sort::{SortedBucket, TranslucentSort, TranslucentSorter};
 use crate::targets::{Blit, Targets};
@@ -16,7 +16,8 @@ use boxel_mesh::{BUCKET_COUNT, ChunkMesh, TRANSLUCENT_BUCKET, pack_model_box};
 use boxel_shaders::gpu::{
     ChunkGpu, VIEW_BOX_CAPACITY, VIEW_BOXES_OFFSET, VIEW_BUFFER_SIZE, ViewUniform, bindings,
 };
-use boxel_voxel::ModelBox;
+use boxel_voxel::{CHUNK_SHIFT, ChunkPos, ModelBox};
+use boxel_world::VisibleSet;
 use std::sync::Arc;
 use wgpu::util::DeviceExt as _;
 
@@ -125,6 +126,10 @@ pub struct RenderStats {
     /// too large for them (M1 adds arena growth). Buckets skipped by a full High draw list are
     /// not counted (see [`RendererConfig::max_chunk_slots`]).
     pub dropped_chunks: u32,
+    /// Resident chunks inside the GPU window that cave culling hides this frame (ADR 0022): the
+    /// world's visibility search did not reach them, because they are behind closed rock or
+    /// outside the frustum. 0 without a visible set ([`VoxelRenderer::set_visibility`]).
+    pub occluded_chunks: u32,
     /// Translucent buckets re-sorted for the camera and uploaded (cumulative, see
     /// [`TranslucentSort`]).
     pub translucent_sorts: u32,
@@ -178,6 +183,67 @@ pub struct VoxelRenderer {
     cap_cutout: u32,
     stats: RenderStats,
     warned_list_overflow: bool,
+    /// Cave culling: the visible set of the frame and its bits per slot.
+    occlusion: Occlusion,
+}
+
+/// The cave culling input of the renderer (ADR 0022): the world's visible set and one bit per
+/// chunk slot derived from it, rebuilt when the set or the slots change.
+#[derive(Default)]
+struct Occlusion {
+    set: Option<Arc<VisibleSet>>,
+    /// Bit `slot & 31` of word `slot >> 5`: the slot's chunk may be seen.
+    bits: Vec<u32>,
+    /// `bits` match `set` and this table version.
+    built: Option<u64>,
+    /// The bits changed since the last frame.
+    changed: bool,
+    /// Live slots inside the GPU window whose bit is 0.
+    hidden: u32,
+}
+
+impl Occlusion {
+    /// Replaces the visible set (a different set rebuilds the bits).
+    fn set(&mut self, set: Option<Arc<VisibleSet>>) {
+        let same = match (&self.set, &set) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            self.set = set;
+            self.built = None;
+        }
+    }
+
+    /// Brings the bits up to date with `chunks`; returns them, `None` without a set.
+    fn refresh(&mut self, chunks: &ChunkTable) -> Option<SlotVisibility<'_>> {
+        let Some(set) = &self.set else {
+            self.hidden = 0;
+            return None;
+        };
+        let version = chunks.version();
+        self.changed = self.built != Some(version);
+        if self.changed {
+            self.built = Some(version);
+            self.bits.clear();
+            self.bits
+                .resize(chunks.slot_count().div_ceil(32) as usize, 0);
+            self.hidden = 0;
+            for (slot, record) in chunks.iter() {
+                let pos = ChunkPos::from_i64vec3(record.origin >> CHUNK_SHIFT);
+                if set.is_visible(pos) {
+                    self.bits[slot as usize >> 5] |= 1 << (slot & 31);
+                } else if chunks.in_window(record.origin) {
+                    self.hidden += 1;
+                }
+            }
+        }
+        Some(SlotVisibility {
+            bits: &self.bits,
+            changed: self.changed,
+        })
+    }
 }
 
 impl VoxelRenderer {
@@ -332,6 +398,7 @@ impl VoxelRenderer {
                         index,
                         cap_opaque,
                         cap_cutout,
+                        slots,
                     },
                 )),
                 None => Box::new(MidPath::new(device, voxel, geometry, index, slots)),
@@ -359,7 +426,18 @@ impl VoxelRenderer {
             cap_opaque,
             cap_cutout,
             warned_list_overflow: false,
+            occlusion: Occlusion::default(),
         })
+    }
+
+    /// Sets the chunks the camera may see (cave culling, ADR 0022): from the next
+    /// [`VoxelRenderer::render`] on, every tier skips a resident chunk whose position the set
+    /// does not hold as visible (a chunk outside the set's box is visible). `None` (the default)
+    /// draws every chunk the frustum passes. The set must come from a search for the camera of
+    /// the frames it is used in ([`boxel_world::ChunkVisibility::update`]): a stale set can hide
+    /// a chunk that became visible.
+    pub fn set_visibility(&mut self, set: Option<Arc<VisibleSet>>) {
+        self.occlusion.set(set);
     }
 
     /// Sets the model box table the `SHAPE_BOX` quads of the meshes index (ADR 0020):
@@ -563,7 +641,12 @@ impl VoxelRenderer {
             camera_rel: view.eye_rel.extend(0.0).to_array(),
             fog_color: view.fog_color,
             fog_params: [view.fog_start, view.fog_end, 0.0, 0.0],
-            counts: [slot_count, self.cap_opaque, self.cap_cutout, 0],
+            counts: [
+                slot_count,
+                self.cap_opaque,
+                self.cap_cutout,
+                u32::from(self.occlusion.set.is_some()),
+            ],
             sky_light,
             light_params,
             light_curve,
@@ -575,7 +658,8 @@ impl VoxelRenderer {
             ],
         };
         queue.write_buffer(&self.view_buffer, 0, bytemuck::bytes_of(&uniform));
-        let visible = self.path.prepare(queue, &self.chunks, view);
+        let visibility = self.occlusion.refresh(&self.chunks);
+        let visible = self.path.prepare(queue, &self.chunks, view, visibility);
         self.path.encode_compute(encoder, slot_count);
         let draws = {
             let mut pass = self.targets.begin_main_pass(encoder, view.clear_color);
@@ -585,6 +669,7 @@ impl VoxelRenderer {
         };
         self.stats.visible_chunks = visible;
         self.stats.draws = draws;
+        self.stats.occluded_chunks = self.occlusion.hidden;
         // Only chunks inside the window take draws: the old area still resident after a
         // teleport does not count (it would warn falsely, and only once).
         let drawable = self.chunks.drawable_len() as u64;
@@ -725,6 +810,54 @@ fn block_textures(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn occlusion_bits_follow_the_set_and_the_slots() {
+        use crate::arena::ArenaAllocator;
+        use boxel_math::I64Vec3;
+        use boxel_world::VisibilityView;
+        use boxel_world::visibility::visible_chunks;
+        let mut arena = ArenaAllocator::new(1 << 12, 64);
+        let mut table = ChunkTable::new(64);
+        let mut insert = |table: &mut ChunkTable, id: u64, chunk: I64Vec3| {
+            let alloc = arena.allocate(2).expect("arena");
+            table.insert(ChunkRecord {
+                id,
+                origin: chunk << 5,
+                alloc,
+                counts: [1, 0, 0, 0, 0, 0, 0, 0],
+                light_base: alloc.offset + 1,
+                light_len: 1,
+            });
+        };
+        // A closed world seen from chunk (0, 0, 0): its 6 neighbors are visible, the rest of
+        // the box (radius 3) is not, and chunks outside the box are.
+        insert(&mut table, 1, I64Vec3::new(0, 0, -1));
+        insert(&mut table, 2, I64Vec3::new(0, 0, -2));
+        insert(&mut table, 3, I64Vec3::new(9, 0, 0));
+        let view = VisibilityView::new(I64Vec3::new(16, 16, 16), None, 3, 3);
+        let set = Arc::new(visible_chunks(&view, |_| 0));
+        let mut occlusion = Occlusion::default();
+        assert!(occlusion.refresh(&table).is_none());
+        occlusion.set(Some(Arc::clone(&set)));
+        let v = occlusion.refresh(&table).expect("bits");
+        assert!(v.changed);
+        assert_eq!(
+            (v.visible(0), v.visible(1), v.visible(2)),
+            (true, false, true)
+        );
+        assert_eq!(occlusion.hidden, 1);
+        assert!(!occlusion.refresh(&table).expect("bits").changed);
+        // The same set again changes nothing; a new slot rebuilds the bits.
+        occlusion.set(Some(Arc::clone(&set)));
+        assert!(!occlusion.refresh(&table).expect("bits").changed);
+        insert(&mut table, 4, I64Vec3::new(0, 1, 0));
+        let v = occlusion.refresh(&table).expect("bits");
+        assert!(v.changed && v.visible(3));
+        occlusion.set(None);
+        assert!(occlusion.refresh(&table).is_none());
+        assert_eq!(occlusion.hidden, 0);
+    }
 
     #[test]
     fn renderer_is_send_and_sync() {

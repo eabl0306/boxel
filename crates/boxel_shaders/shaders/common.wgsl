@@ -73,7 +73,7 @@ struct View {
   camera_rel: vec4<f32>,           // xyz = eye position relative to render_origin
   fog_color: vec4<f32>,
   fog_params: vec4<f32>,           // x = fog start, y = fog end (world units)
-  counts: vec4<u32>,               // x = chunk slot count, y = opaque list capacity (= cutout list base), z = cutout list capacity (High)
+  counts: vec4<u32>,               // x = chunk slot count, y = opaque list capacity (= cutout list base), z = cutout list capacity (High), w = 1: cave culling bits in use (High)
   sky_light: vec4<f32>,            // rgb = sky light color times the daylight intensity (linear), a = ambient floor
   light_params: vec4<f32>,         // x = AO strength (0.55: the darkest corner keeps 45 %), y = block-light gain, zw = 0
   light_curve: array<vec4<f32>, 4>, // brightness of light levels 0..15 (level 4k + j at [k][j]; level 15 = 1)

@@ -94,6 +94,9 @@ pub(crate) struct ChunkTable {
     stale_bits: Vec<u64>,
     /// Slots `0..stale_prefix` are all stale (after `clear` or a window move).
     stale_prefix: u32,
+    /// Bumped by every insert, remove and clear (per-slot data derived from the records, such
+    /// as the cave culling bits, is rebuilt when it changes).
+    version: u64,
 }
 
 impl ChunkTable {
@@ -110,7 +113,13 @@ impl ChunkTable {
             stale: Vec::new(),
             stale_bits: vec![0; capacity.div_ceil(64) as usize],
             stale_prefix: 0,
+            version: 0,
         }
+    }
+
+    /// Changes with every insert, remove and clear.
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// Slot capacity.
@@ -156,6 +165,7 @@ impl ChunkTable {
     /// Inserts or replaces the record of `record.id`; returns its slot (`None` if full).
     pub fn insert(&mut self, record: ChunkRecord) -> Option<u32> {
         let slot = self.slot_for(record.id)?;
+        self.version += 1;
         self.free.remove(&slot);
         if slot as usize == self.records.len() {
             self.records.push(None);
@@ -181,6 +191,7 @@ impl ChunkTable {
     pub fn remove(&mut self, id: u64) -> Option<(u32, ChunkRecord)> {
         let slot = self.by_id.remove(&id)?;
         let record = self.records[slot as usize].take()?;
+        self.version += 1;
         self.free.insert(slot);
         self.translucent.remove(&slot);
         // Its GPU entry must go to zero even past the new `slot_count`: High's cull reads the
@@ -200,6 +211,7 @@ impl ChunkTable {
     /// Removes every record (the caller resets the arena). The GPU entries of the old slots go
     /// to zero with the next upload.
     pub fn clear(&mut self) {
+        self.version += 1;
         self.mark_all_stale();
         self.records.clear();
         self.free.clear();

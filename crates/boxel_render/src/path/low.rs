@@ -1,5 +1,5 @@
 //! Low tier: CPU cull + instanced triangle strips + immediates.
-use super::{CpuCull, TierPath, VoxelPipelines};
+use super::{CpuCull, SlotVisibility, TierPath, VoxelPipelines};
 use crate::chunk_table::ChunkTable;
 use crate::renderer::ViewParams;
 use boxel_shaders::gpu::ChunkImmediate;
@@ -28,8 +28,14 @@ impl LowPath {
 }
 
 impl TierPath for LowPath {
-    fn prepare(&mut self, _queue: &wgpu::Queue, chunks: &ChunkTable, view: &ViewParams) -> u32 {
-        self.cull.run(chunks, view);
+    fn prepare(
+        &mut self,
+        _queue: &wgpu::Queue,
+        chunks: &ChunkTable,
+        view: &ViewParams,
+        visibility: Option<SlotVisibility<'_>>,
+    ) -> u32 {
+        self.cull.run(chunks, view, visibility);
         self.cull.visible_chunks
     }
 

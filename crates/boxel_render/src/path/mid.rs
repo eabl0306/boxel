@@ -1,5 +1,5 @@
 //! Mid tier: CPU cull + `draw_indexed` per visible bucket with `DrawRef`.
-use super::{CpuCull, TierPath, VoxelPipelines};
+use super::{CpuCull, SlotVisibility, TierPath, VoxelPipelines};
 use crate::chunk_table::ChunkTable;
 use crate::renderer::ViewParams;
 use boxel_shaders::gpu::{DrawRef, bindings};
@@ -47,8 +47,14 @@ impl MidPath {
 }
 
 impl TierPath for MidPath {
-    fn prepare(&mut self, queue: &wgpu::Queue, chunks: &ChunkTable, view: &ViewParams) -> u32 {
-        self.cull.run(chunks, view);
+    fn prepare(
+        &mut self,
+        queue: &wgpu::Queue,
+        chunks: &ChunkTable,
+        view: &ViewParams,
+        visibility: Option<SlotVisibility<'_>>,
+    ) -> u32 {
+        self.cull.run(chunks, view, visibility);
         // never more than 8 per live slot; the clamp only guards the buffer
         self.cull.opaque.truncate(self.capacity);
         self.cull

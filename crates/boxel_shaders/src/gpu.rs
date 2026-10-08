@@ -29,7 +29,8 @@ pub struct ViewUniform {
     /// x = fog start, y = fog end, zw = 0.
     pub fog_params: [f32; 4],
     /// x = chunk slot count; y = opaque draw-list capacity (also the first index of the cutout
-    /// list); z = cutout draw-list capacity; w = 0. Capacities are at most
+    /// list); z = cutout draw-list capacity; w = 1 when the cave culling bits of the cull state
+    /// are in use (High skips the slots whose bit is 0), else 0. Capacities are at most
     /// [`bindings::MAX_DRAWS_PER_LIST`].
     pub counts: [u32; 4],
     /// rgb = sky light color times the daylight intensity (linear), a = ambient floor (no lit
@@ -119,8 +120,9 @@ pub mod bindings {
     pub const GROUP_VIEW: u32 = 1;
     /// Group 2 (High/Mid): quad arena (binding 0) + chunk table (binding 1), read-only storage. Vertex.
     pub const GROUP_GEOMETRY: u32 = 2;
-    /// Cull pipeline group 0: view (0), chunks (1), draw args (2), draw refs (3), draw counts (4,
-    /// `array<atomic<u32>, 2>`: opaque, cutout).
+    /// Cull pipeline group 0: view (0), chunks (1), draw args (2), draw refs (3), cull state (4:
+    /// the two draw counts, opaque and cutout, as `atomic<u32>`, then one visibility bit per
+    /// chunk slot from byte [`CULL_VISIBLE_OFFSET`], ADR 0022).
     pub const CULL_GROUP: u32 = 0;
     /// Max draws per indirect list and per `multi_draw_indexed_indirect_count` call. wgpu-hal
     /// passes `max_count` to `vkCmdDrawIndexedIndirectCount` without checking
@@ -131,4 +133,7 @@ pub mod bindings {
     pub const LOW_IMMEDIATE_SIZE: u32 = 16;
     /// Workgroup size of `cull_chunks`.
     pub const CULL_WORKGROUP_SIZE: u32 = 64;
+    /// Byte offset of the per-slot visibility bits in the cull state buffer (after the two draw
+    /// counts).
+    pub const CULL_VISIBLE_OFFSET: u64 = 8;
 }
