@@ -27,7 +27,7 @@
 //! the map's changes every frame ([`WorldSystems::Visibility`](crate::WorldSystems)). The
 //! renderer runs the search for its own camera in its extract step, every frame the camera, its
 //! view or the links change, so a chunk that just became visible is never drawn late.
-use boxel_math::{Aabb, Frustum, I64Vec3, Vec3};
+use boxel_math::{Frustum, I64Vec3, Vec3};
 use boxel_voxel::{ALL_LINKS, CHUNK_SHIFT, ChunkFaceInfo, ChunkPos, Face};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -164,34 +164,24 @@ const INCOMING: u8 = 0x3f;
 const QUEUED: u8 = 1 << 6;
 const OUTSIDE: u8 = 1 << 7;
 
-/// The links of the box around the camera, in a grid that wraps around (power-of-two sides, a
-/// position goes to its coordinates modulo the sides), so moving the box only rewrites the
-/// slabs that enter it.
+/// The links of the box around the camera, in box order (the order of the search's state and of
+/// [`VisibleSet`]). Moving the box shifts the cells it keeps and reads only the slabs that
+/// enter it.
 #[derive(Debug, Default)]
 struct LinkGrid {
-    /// Bits of the x, y and z sides.
-    bits: [u32; 3],
     links: Vec<u16>,
+    /// Scratch for a move.
+    spare: Vec<u16>,
     /// The box the cells hold: min corner and size. `None`: nothing valid.
     held: Option<(ChunkPos, [i64; 3])>,
 }
 
 impl LinkGrid {
-    #[inline]
-    fn cell(&self, x: i64, y: i64, z: i64) -> usize {
-        let [bx, by, bz] = self.bits;
-        let mx = (1u64 << bx) - 1;
-        let my = (1u64 << by) - 1;
-        let mz = (1u64 << bz) - 1;
-        (((y as u64 & my) << (bx + bz)) | ((z as u64 & mz) << bx) | (x as u64 & mx)) as usize
-    }
-
     /// Makes the grid hold box `(min, size)`: positions that were not in the held box are read
     /// with `links`. Returns how many were read.
     fn hold(&mut self, min: ChunkPos, size: [i64; 3], links: &impl Fn(ChunkPos) -> u16) -> usize {
-        let need = size.map(|s| (s as u64).next_power_of_two().trailing_zeros());
         let old = match self.held {
-            Some((old_min, old_size)) if old_size == size && need == self.bits => {
+            Some((old_min, old_size)) if old_size == size => {
                 if old_min == min {
                     return 0;
                 }
@@ -199,51 +189,128 @@ impl LinkGrid {
             }
             _ => None,
         };
-        if old.is_none() {
-            self.bits = need;
-            let cells = 1usize << (need[0] + need[1] + need[2]);
-            self.links.clear();
-            self.links.resize(cells, ALL_LINKS);
-        }
-        self.held = Some((min, size));
-        let (x0, x1) = (min.x, min.x + size[0]);
+        let [sx, sy, sz] = size;
+        let cells = (sx * sy * sz) as usize;
+        self.spare.clear();
+        self.spare.resize(cells, ALL_LINKS);
+        // New cell (x, y, z) is old cell (x + dx, y + dy, z + dz).
+        let d = old.map(|o| [min.x - o.x, min.y - o.y, min.z - o.z]);
         let mut read = 0;
-        for y in min.y..min.y + size[1] {
-            for z in min.z..min.z + size[2] {
-                // The x ranges of this row the old box did not hold.
-                let kept = old.filter(|o| {
-                    (o.y..o.y + size[1]).contains(&y) && (o.z..o.z + size[2]).contains(&z)
+        let mut i = 0;
+        for y in 0..sy {
+            for z in 0..sz {
+                let row = i;
+                i += sx as usize;
+                // The x range of this row the old box held, as new x coordinates.
+                let kept = d.and_then(|[dx, dy, dz]| {
+                    let (oy, oz) = (y + dy, z + dz);
+                    let (x0, x1) = ((-dx).max(0), (sx - dx).min(sx));
+                    ((0..sy).contains(&oy) && (0..sz).contains(&oz) && x0 < x1).then(|| {
+                        let from = ((oy * sz + oz) * sx + x0 + dx) as usize;
+                        (x0, x1, from)
+                    })
                 });
-                let ranges = match kept {
-                    Some(o) => [x0..o.x.clamp(x0, x1), (o.x + size[0]).clamp(x0, x1)..x1],
-                    None => [x0..x1, x1..x1],
+                let (x0, x1) = match kept {
+                    Some((x0, x1, from)) => {
+                        let len = (x1 - x0) as usize;
+                        let to = row + x0 as usize;
+                        self.spare[to..to + len].copy_from_slice(&self.links[from..from + len]);
+                        (x0, x1)
+                    }
+                    None => (0, 0),
                 };
-                for x in ranges.into_iter().flatten() {
-                    let i = self.cell(x, y, z);
-                    self.links[i] = links(ChunkPos::new(x, y, z));
+                for x in (0..x0).chain(x1..sx) {
+                    let pos = ChunkPos::new(min.x + x, min.y + y, min.z + z);
+                    self.spare[row + x as usize] = links(pos);
                     read += 1;
                 }
             }
         }
+        std::mem::swap(&mut self.links, &mut self.spare);
+        self.held = Some((min, size));
         read
     }
 
     /// Sets the links of `pos` if the grid holds it. Returns true if they changed.
     fn set(&mut self, pos: ChunkPos, links: u16) -> bool {
-        let Some((min, size)) = self.held else {
+        let Some((min, [sx, sy, sz])) = self.held else {
             return false;
         };
-        let inside = (pos.x.wrapping_sub(min.x) as u64) < size[0] as u64
-            && (pos.y.wrapping_sub(min.y) as u64) < size[1] as u64
-            && (pos.z.wrapping_sub(min.z) as u64) < size[2] as u64;
-        if !inside {
+        let (x, y, z) = (
+            pos.x.wrapping_sub(min.x) as u64,
+            pos.y.wrapping_sub(min.y) as u64,
+            pos.z.wrapping_sub(min.z) as u64,
+        );
+        if x >= sx as u64 || y >= sy as u64 || z >= sz as u64 {
             return false;
         }
-        let i = self.cell(pos.x, pos.y, pos.z);
+        let i = ((y * sz as u64 + z) * sx as u64 + x) as usize;
         let changed = self.links[i] != links;
         self.links[i] = links;
         changed
     }
+}
+
+/// `LINKED_LO[f][b]` and `LINKED_HI[f][b]`: the faces linked to face `f` by the low 8 and the
+/// high 7 bits of a link set ([`ChunkFaceInfo::linked_faces`] in two lookups).
+const LINKED_LO: [[u8; 256]; 6] = linked_table::<256>(0);
+/// See [`LINKED_LO`].
+const LINKED_HI: [[u8; 128]; 6] = linked_table::<128>(8);
+
+const fn linked_table<const N: usize>(shift: u32) -> [[u8; N]; 6] {
+    let mut out = [[0u8; N]; 6];
+    let mut f = 0;
+    while f < 6 {
+        let face = match Face::from_index(f as u8) {
+            Some(face) => face,
+            None => panic!("a face index"),
+        };
+        let mut b = 0;
+        while b < N {
+            out[f][b] = ChunkFaceInfo::linked_faces((b as u16) << shift, face);
+            b += 1;
+        }
+        f += 1;
+    }
+    out
+}
+
+/// A plane of the frustum, prepared for the chunks of the box: chunk `l` (box-local) touches
+/// the inside of the plane when `c + dot(n, l) >= 0`.
+#[derive(Clone, Copy, Debug)]
+struct ChunkPlane {
+    n: Vec3,
+    c: f32,
+}
+
+/// Slack of the search's frustum test, in voxels: it must never reject a chunk the renderer's
+/// test (the same planes, summed in another order) accepts.
+const FRUSTUM_SLACK: f32 = 0.5;
+
+/// The frustum of `view` against the chunks of the box at `min`, or `None` without a frustum.
+fn chunk_planes(view: &VisibilityView, min: ChunkPos) -> Option<[ChunkPlane; 6]> {
+    // The chunk AABBs `[base + 32 l, + 32]` relative to the render origin (in i64 first, as the
+    // renderer culls them): the p-vertex of plane n is base + 32 (l + s) with s = 1 where
+    // n >= 0, so the test is linear in l.
+    let base = (min.as_i64vec3() << CHUNK_SHIFT)
+        .saturating_sub(view.render_origin)
+        .as_vec3();
+    view.frustum.map(|f| {
+        f.planes.map(|p| {
+            let n = p.truncate();
+            let s = Vec3::select(n.cmpge(Vec3::ZERO), Vec3::splat(32.0), Vec3::ZERO);
+            ChunkPlane {
+                n: n * 32.0,
+                c: n.dot(base + s) + p.w + FRUSTUM_SLACK,
+            }
+        })
+    })
+}
+
+/// True if box-local chunk `l` touches the inside of every plane.
+#[inline]
+fn touches(planes: &[ChunkPlane; 6], l: Vec3) -> bool {
+    planes.iter().all(|p| p.c + p.n.dot(l) >= 0.0)
 }
 
 /// The breadth-first search over a [`LinkGrid`] (scratch kept between runs).
@@ -275,8 +342,7 @@ impl Search {
             let e = e as usize;
             (e & 0x3ff, e >> 10 & 0x3ff, e >> 20)
         };
-        // Chunk AABBs relative to the render origin, as the renderer culls them (in i64 first).
-        let base = (min.as_i64vec3() << CHUNK_SHIFT).saturating_sub(view.render_origin);
+        let planes = chunk_planes(view, min);
         let start = local(center[0], center[1], center[2]);
         self.queue.clear();
         self.outside.clear();
@@ -290,14 +356,14 @@ impl Search {
             let out = if i == start {
                 0x3f
             } else {
-                let links =
-                    grid.links[grid.cell(min.x + x as i64, min.y + y as i64, min.z + z as i64)];
-                let incoming = self.state[i] & INCOMING;
+                let links = grid.links[i];
+                let (lo, hi) = (usize::from(links as u8), usize::from(links >> 8));
+                let mut incoming = self.state[i] & INCOMING;
                 let mut out = 0;
-                for f in Face::ALL {
-                    if incoming & (1 << f.index()) != 0 {
-                        out |= ChunkFaceInfo::linked_faces(links, f);
-                    }
+                while incoming != 0 {
+                    let f = incoming.trailing_zeros() as usize;
+                    incoming &= incoming - 1;
+                    out |= LINKED_LO[f][lo] | LINKED_HI[f][hi];
                 }
                 // Never back toward the camera along an axis.
                 let side = |p: usize, c: usize, plus: usize, minus: usize| -> u8 {
@@ -333,10 +399,9 @@ impl Search {
                     let near = nx.abs_diff(center[0]) <= 1
                         && ny.abs_diff(center[1]) <= 1
                         && nz.abs_diff(center[2]) <= 1;
-                    if !near && let Some(frustum) = &view.frustum {
-                        let offset = I64Vec3::new(nx as i64, ny as i64, nz as i64) << CHUNK_SHIFT;
-                        let lo = base.saturating_add(offset).as_vec3();
-                        if !frustum.intersects_aabb(&Aabb::new(lo, lo + Vec3::splat(32.0))) {
+                    if !near && let Some(planes) = &planes {
+                        let l = Vec3::new(nx as f32, ny as f32, nz as f32);
+                        if !touches(planes, l) {
                             self.state[n] = OUTSIDE;
                             self.outside.push(n as u32);
                             continue;

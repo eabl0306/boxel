@@ -66,15 +66,23 @@ fn brute_force(view: &VisibilityView, links: &impl Fn(ChunkPos) -> u16) -> HashS
             c.z + i64::from(d.z),
         )
     };
+    // The search's own chunk-plane test (checked against the renderer's in
+    // `the_frustum_test_never_rejects_what_the_renderer_draws`).
+    let min = ChunkPos::new(c.x - half[0], c.y - half[1], c.z - half[2]);
+    let planes = chunk_planes(view, min);
     let passes = |d: IVec3| {
         if d.abs().max_element() <= 1 {
             return true;
         }
-        let Some(f) = &view.frustum else {
+        let Some(planes) = &planes else {
             return true;
         };
-        let lo = ((pos(d).as_i64vec3() << CHUNK_SHIFT) - view.render_origin).as_vec3();
-        f.intersects_aabb(&Aabb::new(lo, lo + Vec3::splat(32.0)))
+        let l = Vec3::new(
+            (i64::from(d.x) + half[0]) as f32,
+            (i64::from(d.y) + half[1]) as f32,
+            (i64::from(d.z) + half[2]) as f32,
+        );
+        touches(planes, l)
     };
     let mut visible = HashSet::from([IVec3::ZERO]);
     let mut seen = HashSet::new();
@@ -264,6 +272,43 @@ fn the_frustum_only_removes_chunks() {
     assert!(seen.len() < all.len());
     // Nothing behind the camera past the chunks around it.
     assert!(seen.iter().all(|d| d.z <= 1));
+}
+
+#[test]
+fn the_frustum_test_never_rejects_what_the_renderer_draws() {
+    // The renderer's test: chunk AABB relative to the render origin (i64 first), p-vertex.
+    let mut seed = 7u64;
+    let mut checked = 0;
+    for &shift in &shifts() {
+        for k in 0..40 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let a = (seed >> 11) as f32 / (1u64 << 53) as f32 * std::f32::consts::TAU;
+            let b = ((seed >> 20) % 1000) as f32 / 1000.0 * 2.8 - 1.4;
+            let dir = Vec3::new(a.cos() * b.cos(), b.sin(), a.sin() * b.cos());
+            let view = view_at(shift, Some(dir), 6 + k % 3, 4);
+            let half = view.half();
+            let c = view.center;
+            let min = ChunkPos::new(c.x - half[0], c.y - half[1], c.z - half[2]);
+            let planes = chunk_planes(&view, min).expect("frustum");
+            let f = view.frustum.expect("frustum");
+            for y in 0..2 * half[1] + 1 {
+                for z in 0..2 * half[2] + 1 {
+                    for x in 0..2 * half[0] + 1 {
+                        let pos = ChunkPos::new(min.x + x, min.y + y, min.z + z);
+                        let lo = ((pos.as_i64vec3() << CHUNK_SHIFT) - view.render_origin).as_vec3();
+                        let aabb = boxel_math::Aabb::new(lo, lo + Vec3::splat(32.0));
+                        let drawn = f.intersects_aabb(&aabb);
+                        let l = Vec3::new(x as f32, y as f32, z as f32);
+                        assert!(!drawn || touches(&planes, l), "{pos:?} from {view:?}");
+                        checked += usize::from(drawn);
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 10_000);
 }
 
 #[test]
