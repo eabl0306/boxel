@@ -179,44 +179,75 @@ fn fill_runs(seed: u32, mask: u32) -> u32 {
     up(seed, mask) | up(seed.reverse_bits(), mask.reverse_bits()).reverse_bits()
 }
 
+/// Rows on the y and x borders, in seed order: layer y = 0, layer y = 31, column x = 0, column
+/// x = 31 (the z borders are bits 0 and 31 of every row).
+const SIDE_ROWS: [u16; 128] = {
+    let mut out = [0u16; 128];
+    let mut k = 0;
+    while k < 32 {
+        out[k] = k as u16;
+        out[32 + k] = (31 * 32 + k) as u16;
+        out[64 + k] = (k * 32) as u16;
+        out[96 + k] = (k * 32 + 31) as u16;
+        k += 1;
+    }
+    out
+};
+
 /// Flood fill state over the open mask of one chunk.
 struct Flood<'a> {
     open: &'a Occupancy,
+    /// Layers (bit y) with some open voxel.
+    open_layers: u32,
     /// Open voxels some flood already reached.
     visited: Occupancy,
     /// The current flood.
     region: Occupancy,
+    /// Layers of `region` that may hold bits (cleared before the next flood).
+    used: u32,
+    /// Seed scan positions: rows below `z_cursor` have no unvisited open z border voxel, nor
+    /// the side rows below `side_cursor` (visited only grows).
+    z_cursor: usize,
+    side_cursor: usize,
 }
 
 impl<'a> Flood<'a> {
     fn new(open: &'a Occupancy) -> Self {
+        let mut open_layers = 0;
+        for y in 0..32 {
+            if open[y * 32..y * 32 + 32].iter().any(|&w| w != 0) {
+                open_layers |= 1 << y;
+            }
+        }
         Self {
             open,
+            open_layers,
             visited: [0; CHUNK_AREA],
             region: [0; CHUNK_AREA],
+            used: 0,
+            z_cursor: 0,
+            side_cursor: 0,
         }
     }
 
     /// An open border voxel no flood reached yet, as (row, bit), or `None`.
-    fn next_seed(&self) -> Option<(usize, u32)> {
+    fn next_seed(&mut self) -> Option<(usize, u32)> {
         let free = |i: usize| self.open[i] & !self.visited[i];
         // -Z and +Z: bit 0 and bit 31 of every row; then the four side layers and columns.
-        for i in 0..CHUNK_AREA {
-            let f = free(i) & 0x8000_0001;
+        while self.z_cursor < CHUNK_AREA {
+            let f = free(self.z_cursor) & 0x8000_0001;
             if f != 0 {
-                return Some((i, f.isolate_lowest_one()));
+                return Some((self.z_cursor, f.isolate_lowest_one()));
             }
+            self.z_cursor += 1;
         }
-        // Layers y = 0 and y = 31, then columns x = 0 and x = 31.
-        let rows = (0..32)
-            .chain(31 * 32..32 * 32)
-            .chain((0..32).map(|y| y * 32))
-            .chain((0..32).map(|y| y * 32 + 31));
-        for i in rows {
+        while self.side_cursor < SIDE_ROWS.len() {
+            let i = usize::from(SIDE_ROWS[self.side_cursor]);
             let f = free(i);
             if f != 0 {
                 return Some((i, f.isolate_lowest_one()));
             }
+            self.side_cursor += 1;
         }
         None
     }
@@ -224,56 +255,69 @@ impl<'a> Flood<'a> {
     /// Floods the open region holding `seed` (row, bit), adds it to `visited` and returns the
     /// faces it touches (6-bit mask in `Face` order).
     fn fill(&mut self, (row, bit): (usize, u32)) -> u8 {
-        self.region.fill(0);
+        let mut used = self.used;
+        while used != 0 {
+            let y = used.trailing_zeros() as usize;
+            used &= used - 1;
+            self.region[y * 32..y * 32 + 32].fill(0);
+        }
+        let y = row / 32;
         self.region[row] = fill_runs(bit, self.open[row]);
+        self.used = 1 << y;
         // Worklist of y layers to flood again (a neighbor layer changed): the seed's layer and
         // the two it feeds first.
-        let y = row / 32;
-        let mut dirty: u32 = (0b111u64 << y >> 1) as u32;
+        let mut dirty: u32 = (0b111u64 << y >> 1) as u32 & self.open_layers;
+        // Sweeps up and down in turn: a layer that grows during a sweep is followed by the next
+        // one in the same sweep, and the one behind it waits for the sweep back.
+        let mut up = true;
         while dirty != 0 {
-            let y = dirty.trailing_zeros() as usize;
-            dirty &= dirty - 1;
-            if self.flood_layer(y) {
-                if y > 0 {
-                    dirty |= 1 << (y - 1);
+            for k in 0..32 {
+                let y = if up { k } else { 31 - k };
+                if dirty & (1 << y) == 0 {
+                    continue;
                 }
-                if y < 31 {
-                    dirty |= 1 << (y + 1);
+                dirty &= !(1 << y);
+                if self.flood_layer(y) {
+                    self.used |= 1 << y;
+                    dirty |= (0b101u64 << y >> 1) as u32 & self.open_layers;
                 }
             }
+            up = !up;
         }
         let mut touched = 0u8;
         let mut any_z = 0u32;
-        for y in 0..32 {
+        let mut used = self.used;
+        while used != 0 {
+            let y = used.trailing_zeros() as usize;
+            used &= used - 1;
             let layer = &self.region[y * 32..y * 32 + 32];
             let mut any = 0;
-            for &w in layer {
-                any |= w;
+            for (v, &r) in self.visited[y * 32..y * 32 + 32].iter_mut().zip(layer) {
+                any |= r;
+                *v |= r;
             }
-            if any != 0 {
-                if y == 31 {
-                    touched |= 1 << Face::PosY.index();
-                }
-                if y == 0 {
-                    touched |= 1 << Face::NegY.index();
-                }
-                if layer[31] != 0 {
-                    touched |= 1 << Face::PosX.index();
-                }
-                if layer[0] != 0 {
-                    touched |= 1 << Face::NegX.index();
-                }
-                any_z |= any;
+            if any == 0 {
+                continue;
             }
+            if y == 31 {
+                touched |= 1 << Face::PosY.index();
+            }
+            if y == 0 {
+                touched |= 1 << Face::NegY.index();
+            }
+            if layer[31] != 0 {
+                touched |= 1 << Face::PosX.index();
+            }
+            if layer[0] != 0 {
+                touched |= 1 << Face::NegX.index();
+            }
+            any_z |= any;
         }
         if any_z >> 31 != 0 {
             touched |= 1 << Face::PosZ.index();
         }
         if any_z & 1 != 0 {
             touched |= 1 << Face::NegZ.index();
-        }
-        for (v, &r) in self.visited.iter_mut().zip(&self.region) {
-            *v |= r;
         }
         touched
     }
@@ -282,49 +326,65 @@ impl<'a> Flood<'a> {
     /// runs at once). Returns true if the layer grew.
     fn flood_layer(&mut self, y: usize) -> bool {
         let base = y * 32;
+        let open = &self.open[base..base + 32];
+        let (below, rest) = self.region.split_at_mut(base);
+        let (layer, above) = rest.split_at_mut(32);
+        let below = (y > 0).then(|| &below[base - 32..]);
+        let above = (y < 31).then(|| &above[..32]);
         let mut grew = false;
-        // The layers above and below feed this one.
+        // Forward: the layers above and below, and x - 1.
+        let mut prev = 0;
         for x in 0..32 {
-            let i = base + x;
-            let mut s = self.region[i];
-            if y > 0 {
-                s |= self.region[i - 32];
+            let o = open[x];
+            if o == 0 {
+                prev = 0;
+                continue;
             }
-            if y < 31 {
-                s |= self.region[i + 32];
+            let mut s = layer[x] | prev;
+            if let Some(b) = below {
+                s |= b[x];
             }
-            s &= self.open[i];
-            if s != self.region[i] {
-                self.region[i] = fill_runs(s, self.open[i]);
+            if let Some(a) = above {
+                s |= a[x];
+            }
+            s &= o;
+            if s != layer[x] {
+                layer[x] = fill_runs(s, o);
                 grew = true;
             }
+            prev = layer[x];
         }
-        // Then x neighbors, sweeping both ways until stable.
+        // Then x + 1 and x - 1, sweeping both ways until stable.
         loop {
             let mut changed = false;
-            for x in (0..32).chain((0..32).rev()) {
-                let i = base + x;
-                let o = self.open[i];
-                if o == 0 {
-                    continue;
-                }
-                let mut s = self.region[i];
-                if x > 0 {
-                    s |= self.region[i - 1];
-                }
-                if x < 31 {
-                    s |= self.region[i + 1];
-                }
-                s &= o;
-                if s != self.region[i] {
-                    self.region[i] = fill_runs(s, o);
+            let mut next = 0;
+            for x in (0..32).rev() {
+                let o = open[x];
+                let s = (layer[x] | next) & o;
+                if s != layer[x] {
+                    layer[x] = fill_runs(s, o);
                     changed = true;
                 }
+                next = layer[x];
             }
             if !changed {
                 break;
             }
             grew = true;
+            changed = false;
+            let mut prev = 0;
+            for x in 0..32 {
+                let o = open[x];
+                let s = (layer[x] | prev) & o;
+                if s != layer[x] {
+                    layer[x] = fill_runs(s, o);
+                    changed = true;
+                }
+                prev = layer[x];
+            }
+            if !changed {
+                break;
+            }
         }
         grew
     }
@@ -347,6 +407,20 @@ fn occlusion_mask(blocks: &Paletted, registry: &BlockRegistry, out: &mut Occupan
             let mut flags = [false; 256];
             for (f, &s) in flags.iter_mut().zip(palette.iter()) {
                 *f = occludes(s);
+            }
+            if b == 1 {
+                // Each word is two rows of indices 0 and 1: the mask is the word, its complement,
+                // or constant.
+                let flip = if flags[0] { u64::MAX } else { 0 };
+                for (rows, &w) in out.as_chunks_mut::<2>().0.iter_mut().zip(words.iter()) {
+                    let m = match (flags[0], flags[1]) {
+                        (false, false) => 0,
+                        (true, true) => u64::MAX,
+                        _ => w ^ flip,
+                    };
+                    *rows = [m as u32, (m >> 32) as u32];
+                }
+                return;
             }
             // Per byte value: the occluding voxels among its lanes.
             let mut lut = [0u8; 256];

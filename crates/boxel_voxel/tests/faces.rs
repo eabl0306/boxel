@@ -49,7 +49,11 @@ fn test_registry() -> BlockRegistry {
             model,
             collision: BlockCollision::Full,
             emission: [0; 3],
-            light_opacity: if i.is_multiple_of(3) { OPAQUE_OPACITY } else { 1 },
+            light_opacity: if i.is_multiple_of(3) {
+                OPAQUE_OPACITY
+            } else {
+                1
+            },
             textures: FaceTextures::all(t),
         })
         .unwrap();
