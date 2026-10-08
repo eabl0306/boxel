@@ -54,6 +54,7 @@ pub use pack_textures::{
     FOLIAGE_TINT, GRASS_TINT, MAX_PACK_TEXTURE_SIZE, TextureReport, TextureSource, WATER_TINT,
     load_block_textures,
 };
+pub use path::{CullCounts, cull_counts};
 pub use plugin::{
     DebugDestroyDevice, GpuFailed, GpuReady, PresentSettings, Render, RenderInfo, RenderPlugin,
     RenderSettings, RenderSystems, RequestScreenshot, ScreenshotSaved, SurfaceInfo,

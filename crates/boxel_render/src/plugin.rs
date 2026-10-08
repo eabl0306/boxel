@@ -209,6 +209,10 @@ pub struct RenderInfo {
     /// Draw calls recorded last frame (`RenderStats::draws`: Mid/Low one per visible bucket;
     /// High its 2 indirect multi-draws, opaque + cutout).
     pub draws: u32,
+    /// Chunks that passed the CPU cull last frame (`RenderStats::visible_chunks`; Mid/Low).
+    pub visible_chunks: u32,
+    /// Resident chunks cave culling hid last frame (`RenderStats::occluded_chunks`).
+    pub occluded_chunks: u32,
     /// Translucent buckets re-sorted for the camera and uploaded since the renderer was built
     /// (`RenderStats::translucent_sorts`).
     pub translucent_sorts: u32,
@@ -1666,6 +1670,8 @@ fn cleanup(
             let stats = ready.renderer.stats();
             info.chunks = stats.chunks;
             info.draws = stats.draws;
+            info.visible_chunks = stats.visible_chunks;
+            info.occluded_chunks = stats.occluded_chunks;
             info.translucent_sorts = stats.translucent_sorts;
             info.dropped_chunks = stats.dropped_chunks;
             info.arena_used_quads = stats.arena_used_quads;

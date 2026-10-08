@@ -658,7 +658,10 @@ impl VoxelRenderer {
             ],
         };
         queue.write_buffer(&self.view_buffer, 0, bytemuck::bytes_of(&uniform));
-        let visibility = self.occlusion.refresh(&self.chunks);
+        let visibility = {
+            let _span = frame_span!("render.occlusion");
+            self.occlusion.refresh(&self.chunks)
+        };
         let visible = self.path.prepare(queue, &self.chunks, view, visibility);
         self.path.encode_compute(encoder, slot_count);
         let draws = {
@@ -671,8 +674,10 @@ impl VoxelRenderer {
         self.stats.draws = draws;
         self.stats.occluded_chunks = self.occlusion.hidden;
         // Only chunks inside the window take draws: the old area still resident after a
-        // teleport does not count (it would warn falsely, and only once).
-        let drawable = self.chunks.drawable_len() as u64;
+        // teleport does not count (it would warn falsely, and only once), nor do the chunks cave
+        // culling hides.
+        let drawable =
+            (self.chunks.drawable_len() as u64).saturating_sub(u64::from(self.occlusion.hidden));
         if self.tier == Tier::High
             && 6 * drawable > u64::from(self.cap_opaque)
             && !self.warned_list_overflow
