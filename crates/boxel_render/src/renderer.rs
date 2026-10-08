@@ -188,18 +188,24 @@ pub struct VoxelRenderer {
 }
 
 /// The cave culling input of the renderer (ADR 0022): the world's visible set and one bit per
-/// chunk slot derived from it, rebuilt when the set or the slots change.
+/// chunk slot derived from it. A new set (or a cleared table, or a moved window) rebuilds every
+/// bit; otherwise only the slots inserted or removed since the last frame are looked at.
 #[derive(Default)]
 struct Occlusion {
     set: Option<Arc<VisibleSet>>,
     /// Bit `slot & 31` of word `slot >> 5`: the slot's chunk may be seen.
     bits: Vec<u32>,
+    /// Same layout: the slot is live, inside the GPU window, and its bit is 0 (counted in
+    /// `hidden`).
+    hidden_bits: Vec<u32>,
     /// `bits` match `set` and this table version.
     built: Option<u64>,
     /// The bits changed since the last frame.
     changed: bool,
     /// Live slots inside the GPU window whose bit is 0.
     hidden: u32,
+    /// Scratch: the slots touched since the last frame.
+    touched: Vec<u32>,
 }
 
 impl Occlusion {
@@ -217,27 +223,74 @@ impl Occlusion {
     }
 
     /// Brings the bits up to date with `chunks`; returns them, `None` without a set.
-    fn refresh(&mut self, chunks: &ChunkTable) -> Option<SlotVisibility<'_>> {
+    fn refresh(&mut self, chunks: &mut ChunkTable) -> Option<SlotVisibility<'_>> {
         let Some(set) = &self.set else {
+            chunks.take_touched(|_| {});
             self.hidden = 0;
+            self.built = None;
             return None;
         };
+        let words = chunks.slot_count().div_ceil(32) as usize;
         let version = chunks.version();
-        self.changed = self.built != Some(version);
-        if self.changed {
+        self.changed = false;
+        if self.built != Some(version) {
+            chunks.take_touched(|_| {});
             self.built = Some(version);
+            self.changed = true;
             self.bits.clear();
-            self.bits
-                .resize(chunks.slot_count().div_ceil(32) as usize, 0);
+            self.bits.resize(words, 0);
+            self.hidden_bits.clear();
+            self.hidden_bits.resize(words, 0);
             self.hidden = 0;
             for (slot, record) in chunks.iter() {
+                let (word, bit) = (slot as usize >> 5, 1 << (slot & 31));
                 let pos = ChunkPos::from_i64vec3(record.origin >> CHUNK_SHIFT);
                 if set.is_visible(pos) {
-                    self.bits[slot as usize >> 5] |= 1 << (slot & 31);
+                    self.bits[word] |= bit;
                 } else if chunks.in_window(record.origin) {
+                    self.hidden_bits[word] |= bit;
                     self.hidden += 1;
                 }
             }
+        } else {
+            if self.bits.len() < words {
+                self.bits.resize(words, 0);
+                self.hidden_bits.resize(words, 0);
+            }
+            let (bits, hidden_bits, hidden) =
+                (&mut self.bits, &mut self.hidden_bits, &mut self.hidden);
+            let mut changed = false;
+            let touched = &mut self.touched;
+            touched.clear();
+            chunks.take_touched(|slot| touched.push(slot));
+            for &slot in touched.iter() {
+                let (word, bit) = (slot as usize >> 5, 1 << (slot & 31));
+                let Some(w) = bits.get_mut(word) else {
+                    continue;
+                };
+                let (visible, counted) = match chunks.record_at(slot) {
+                    Some(record) => {
+                        let pos = ChunkPos::from_i64vec3(record.origin >> CHUNK_SHIFT);
+                        let visible = set.is_visible(pos);
+                        (visible, !visible && chunks.in_window(record.origin))
+                    }
+                    // A free slot is never drawn; its bit only has to be 0.
+                    None => (false, false),
+                };
+                let before = *w;
+                *w = if visible { *w | bit } else { *w & !bit };
+                changed |= *w != before;
+                let h = &mut hidden_bits[word];
+                if (*h & bit != 0) != counted {
+                    *h ^= bit;
+                    if counted {
+                        *hidden += 1;
+                    } else {
+                        *hidden -= 1;
+                    }
+                }
+            }
+            self.changed = changed;
         }
         Some(SlotVisibility {
             bits: &self.bits,
@@ -660,7 +713,7 @@ impl VoxelRenderer {
         queue.write_buffer(&self.view_buffer, 0, bytemuck::bytes_of(&uniform));
         let visibility = {
             let _span = frame_span!("render.occlusion");
-            self.occlusion.refresh(&self.chunks)
+            self.occlusion.refresh(&mut self.chunks)
         };
         let visible = self.path.prepare(queue, &self.chunks, view, visibility);
         self.path.encode_compute(encoder, slot_count);
@@ -843,24 +896,45 @@ mod tests {
         let view = VisibilityView::new(I64Vec3::new(16, 16, 16), None, 3, 3);
         let set = Arc::new(visible_chunks(&view, |_| 0));
         let mut occlusion = Occlusion::default();
-        assert!(occlusion.refresh(&table).is_none());
+        assert!(occlusion.refresh(&mut table).is_none());
         occlusion.set(Some(Arc::clone(&set)));
-        let v = occlusion.refresh(&table).expect("bits");
+        let v = occlusion.refresh(&mut table).expect("bits");
         assert!(v.changed);
         assert_eq!(
             (v.visible(0), v.visible(1), v.visible(2)),
             (true, false, true)
         );
         assert_eq!(occlusion.hidden, 1);
-        assert!(!occlusion.refresh(&table).expect("bits").changed);
-        // The same set again changes nothing; a new slot rebuilds the bits.
+        assert!(!occlusion.refresh(&mut table).expect("bits").changed);
+        // The same set again changes nothing; a new slot only sets its own bit.
         occlusion.set(Some(Arc::clone(&set)));
-        assert!(!occlusion.refresh(&table).expect("bits").changed);
+        assert!(!occlusion.refresh(&mut table).expect("bits").changed);
         insert(&mut table, 4, I64Vec3::new(0, 1, 0));
-        let v = occlusion.refresh(&table).expect("bits");
+        let v = occlusion.refresh(&mut table).expect("bits");
         assert!(v.changed && v.visible(3));
+        // A hidden chunk comes and goes: the count follows.
+        insert(&mut table, 5, I64Vec3::new(0, -2, 0));
+        occlusion.refresh(&mut table);
+        assert_eq!(occlusion.hidden, 2);
+        let (slot, _) = table.remove(2).expect("hidden chunk");
+        let v = occlusion.refresh(&mut table).expect("bits");
+        assert!(!v.changed, "a removed slot was hidden already");
+        assert_eq!(occlusion.hidden, 1);
+        insert(&mut table, 6, I64Vec3::new(0, -1, 0));
+        let v = occlusion.refresh(&mut table).expect("bits");
+        assert!(
+            v.changed && v.visible(slot),
+            "the freed slot holds a visible chunk now"
+        );
+        assert_eq!(occlusion.hidden, 1);
+        // The incremental bits equal a rebuild.
+        let incremental = occlusion.bits.clone();
+        occlusion.built = None;
+        occlusion.refresh(&mut table);
+        assert_eq!(occlusion.bits, incremental);
+        assert_eq!(occlusion.hidden, 1);
         occlusion.set(None);
-        assert!(occlusion.refresh(&table).is_none());
+        assert!(occlusion.refresh(&mut table).is_none());
         assert_eq!(occlusion.hidden, 0);
     }
 

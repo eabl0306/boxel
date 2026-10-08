@@ -17,7 +17,7 @@ use boxel_voxel::{
     MAX_CHUNK_COORD,
 };
 use boxel_world::jobs::InlineExecutor;
-use boxel_world::visibility::visible_chunks;
+use boxel_world::visibility::{TIGHTEN_DELAY, visible_chunks};
 use boxel_world::{
     ChunkMap, ChunkViewer, ChunkVisibility, DataState, EditQueue, MeshState, VisibilityView,
     WorldPlugin, WorldSettings, WorldStats,
@@ -306,7 +306,8 @@ fn assert_links_match_data(app: &App) -> usize {
     exact
 }
 
-/// The world's incremental visibility agrees with a fresh search over the map.
+/// The world's incremental visibility holds every chunk of a fresh search over the map, and
+/// equals it once links that closed had time to be searched again.
 fn assert_visibility_matches(app: &mut App, view: &VisibilityView) {
     let world = app.world_mut();
     let fresh = {
@@ -315,6 +316,17 @@ fn assert_visibility_matches(app: &mut App, view: &VisibilityView) {
     };
     world.resource_scope(|world, mut vis: boxel_ecs::world::Mut<ChunkVisibility>| {
         let map = world.resource::<ChunkMap>();
+        let got = vis.update(view, |p| map.visibility_links_at(p));
+        let (min, max) = fresh.bounds();
+        for y in min.y..=max.y {
+            for z in min.z..=max.z {
+                for x in min.x..=max.x {
+                    let p = ChunkPos::new(x, y, z);
+                    assert!(!fresh.is_visible(p) || got.is_visible(p), "{p:?}");
+                }
+            }
+        }
+        std::thread::sleep(TIGHTEN_DELAY);
         let got = vis.update(view, |p| map.visibility_links_at(p));
         assert_eq!(*got, fresh);
     });

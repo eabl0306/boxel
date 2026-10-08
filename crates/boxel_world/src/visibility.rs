@@ -25,8 +25,16 @@
 //! [`ChunkVisibility`] keeps the links of the box in a grid that follows the camera (only the
 //! slabs that enter it are read from the map when the camera changes chunk) and is patched by
 //! the map's changes every frame ([`WorldSystems::Visibility`](crate::WorldSystems)). The
-//! renderer runs the search for its own camera in its extract step, every frame the camera, its
-//! view or the links change, so a chunk that just became visible is never drawn late.
+//! renderer asks for the set of its own camera in its extract step, every frame, so a chunk that
+//! just became visible is never drawn late. A set stays valid, and is reused, while nothing can
+//! make more chunks visible:
+//!
+//! - The search tests the frustum with [`MOVE_SLACK`] voxels to spare, so the set holds for any
+//!   eye within that distance in the same chunk, looking the same way: a camera that flies
+//!   straight searches again every few voxels, not every frame. Any turn searches again.
+//! - A link that opens (an edit, a chunk unloaded or remeshed after an edit) searches again at
+//!   once. A link that closes (a chunk whose mesh just settled, which happens every frame while
+//!   the world streams) can only hide more: it waits up to [`TIGHTEN_DELAY`] for the next search.
 use boxel_math::{Frustum, I64Vec3, Vec3};
 use boxel_voxel::{ALL_LINKS, CHUNK_SHIFT, ChunkFaceInfo, ChunkPos, Face};
 use std::sync::Arc;
@@ -231,10 +239,11 @@ impl LinkGrid {
         read
     }
 
-    /// Sets the links of `pos` if the grid holds it. Returns true if they changed.
-    fn set(&mut self, pos: ChunkPos, links: u16) -> bool {
+    /// Sets the links of `pos` if the grid holds it. Returns the links it had (`None`: not
+    /// held).
+    fn set(&mut self, pos: ChunkPos, links: u16) -> Option<u16> {
         let Some((min, [sx, sy, sz])) = self.held else {
-            return false;
+            return None;
         };
         let (x, y, z) = (
             pos.x.wrapping_sub(min.x) as u64,
@@ -242,12 +251,10 @@ impl LinkGrid {
             pos.z.wrapping_sub(min.z) as u64,
         );
         if x >= sx as u64 || y >= sy as u64 || z >= sz as u64 {
-            return false;
+            return None;
         }
         let i = ((y * sz as u64 + z) * sx as u64 + x) as usize;
-        let changed = self.links[i] != links;
-        self.links[i] = links;
-        changed
+        Some(std::mem::replace(&mut self.links[i], links))
     }
 }
 
@@ -283,12 +290,24 @@ struct ChunkPlane {
     c: f32,
 }
 
-/// Slack of the search's frustum test, in voxels: it must never reject a chunk the renderer's
-/// test (the same planes, summed in another order) accepts.
+/// Slack of the search's frustum test, in voxels, against rounding: it must never reject a chunk
+/// the renderer's test (the same planes, summed in another order) accepts.
 const FRUSTUM_SLACK: f32 = 0.5;
 
-/// The frustum of `view` against the chunks of the box at `min`, or `None` without a frustum.
-fn chunk_planes(view: &VisibilityView, min: ChunkPos) -> Option<[ChunkPlane; 6]> {
+/// How far (voxels) every plane of the searched frustum is pushed out, so the set holds while
+/// the eye moves that much without turning (see [`ChunkVisibility::update`]).
+pub const MOVE_SLACK: f32 = 4.0;
+
+/// How long a link that closed (it can only hide more) may wait for the next search.
+pub const TIGHTEN_DELAY: Duration = Duration::from_millis(50);
+
+/// Slack of the searches of [`visible_chunks`] and [`ChunkVisibility`]: [`MOVE_SLACK`] plus
+/// [`FRUSTUM_SLACK`] against rounding.
+const SEARCH_SLACK: f32 = MOVE_SLACK + FRUSTUM_SLACK;
+
+/// The frustum of `view` against the chunks of the box at `min`, or `None` without a frustum,
+/// with every plane pushed out by `slack` voxels.
+fn chunk_planes(view: &VisibilityView, min: ChunkPos, slack: f32) -> Option<[ChunkPlane; 6]> {
     // The chunk AABBs `[base + 32 l, + 32]` relative to the render origin (in i64 first, as the
     // renderer culls them): the p-vertex of plane n is base + 32 (l + s) with s = 1 where
     // n >= 0, so the test is linear in l.
@@ -301,7 +320,7 @@ fn chunk_planes(view: &VisibilityView, min: ChunkPos) -> Option<[ChunkPlane; 6]>
             let s = Vec3::select(n.cmpge(Vec3::ZERO), Vec3::splat(32.0), Vec3::ZERO);
             ChunkPlane {
                 n: n * 32.0,
-                c: n.dot(base + s) + p.w + FRUSTUM_SLACK,
+                c: n.dot(base + s) + p.w + slack,
             }
         })
     })
@@ -323,8 +342,9 @@ struct Search {
 }
 
 impl Search {
-    /// Searches the box the grid holds (centered on `view.center`) and returns the visible set.
-    fn run(&mut self, grid: &LinkGrid, view: &VisibilityView) -> VisibleSet {
+    /// Searches the box the grid holds (centered on `view.center`) with the frustum pushed out
+    /// by `slack` voxels, and returns the visible set.
+    fn run(&mut self, grid: &LinkGrid, view: &VisibilityView, slack: f32) -> VisibleSet {
         let Some((min, size)) = grid.held else {
             unreachable!("the grid holds the view's box");
         };
@@ -342,7 +362,7 @@ impl Search {
             let e = e as usize;
             (e & 0x3ff, e >> 10 & 0x3ff, e >> 20)
         };
-        let planes = chunk_planes(view, min);
+        let planes = chunk_planes(view, min, slack);
         let start = local(center[0], center[1], center[2]);
         self.queue.clear();
         self.outside.clear();
@@ -443,13 +463,27 @@ fn view_box(view: &VisibilityView) -> (ChunkPos, [i64; 3]) {
     )
 }
 
+/// One search from scratch with the frustum pushed out by `slack` voxels (tests).
+#[cfg(test)]
+fn visible_chunks_with_slack(
+    view: &VisibilityView,
+    links: impl Fn(ChunkPos) -> u16,
+    slack: f32,
+) -> VisibleSet {
+    let mut grid = LinkGrid::default();
+    let (min, size) = view_box(view);
+    grid.hold(min, size, &links);
+    Search::default().run(&grid, view, slack)
+}
+
 /// One search from scratch: the chunks `view` may see, with the links of each chunk from
-/// `links` (tests, tools; the world keeps a [`ChunkVisibility`] instead).
+/// `links` (tests, tools; the world keeps a [`ChunkVisibility`] instead). Like the world's, it
+/// tests the frustum with [`MOVE_SLACK`] to spare.
 pub fn visible_chunks(view: &VisibilityView, links: impl Fn(ChunkPos) -> u16) -> VisibleSet {
     let mut grid = LinkGrid::default();
     let (min, size) = view_box(view);
     grid.hold(min, size, &links);
-    Search::default().run(&grid, view)
+    Search::default().run(&grid, view, SEARCH_SLACK)
 }
 
 /// Cave culling state of the world (a resource of [`WorldPlugin`](crate::WorldPlugin)): the
@@ -462,8 +496,10 @@ pub struct ChunkVisibility {
     search: Search,
     /// The view of the last search and its result.
     last: Option<(VisibilityView, Arc<VisibleSet>)>,
-    /// The grid changed since the last search.
-    dirty: bool,
+    /// A link opened since the last search: the next update searches.
+    opened: bool,
+    /// When the first link that closed since the last search did.
+    closed: Option<Instant>,
     stats: VisibilityStats,
 }
 
@@ -471,32 +507,60 @@ impl ChunkVisibility {
     /// Applies the map's changes of [`ChunkSlot::visibility_links`](crate::ChunkSlot) (in
     /// order) to the grid.
     pub(crate) fn apply_changes(&mut self, changes: &[(ChunkPos, u16)]) {
+        self.apply_changes_at(changes, Instant::now());
+    }
+
+    /// [`ChunkVisibility::apply_changes`] at time `now`.
+    pub(crate) fn apply_changes_at(&mut self, changes: &[(ChunkPos, u16)], now: Instant) {
         for &(pos, links) in changes {
-            self.dirty |= self.grid.set(pos, links);
+            match self.grid.set(pos, links) {
+                Some(old) if links & !old != 0 => self.opened = true,
+                Some(old) if links != old => {
+                    self.closed.get_or_insert(now);
+                }
+                _ => {}
+            }
         }
     }
 
-    /// The chunks `view` may see, searching again only if the view or a link of its box
-    /// changed since the last call. `links` gives the links of a position the grid does not
-    /// hold yet (the map's [`ChunkMap::visibility_links_at`](crate::ChunkMap)).
+    /// The chunks `view` may see: the last set while it still holds (the same chunk and box,
+    /// the eye less than [`MOVE_SLACK`] from where it was searched without turning, no link
+    /// opened, no closed link older than [`TIGHTEN_DELAY`]), else a new search. `links` gives
+    /// the links of a position the grid does not hold yet (the map's
+    /// [`ChunkMap::visibility_links_at`](crate::ChunkMap)).
     pub fn update(
         &mut self,
         view: &VisibilityView,
         links: impl Fn(ChunkPos) -> u16,
     ) -> Arc<VisibleSet> {
+        self.update_at(view, links, Instant::now())
+    }
+
+    /// [`ChunkVisibility::update`] at time `now`.
+    pub(crate) fn update_at(
+        &mut self,
+        view: &VisibilityView,
+        links: impl Fn(ChunkPos) -> u16,
+        now: Instant,
+    ) -> Arc<VisibleSet> {
         let start = Instant::now();
         let (min, size) = view_box(view);
         let refilled = self.grid.hold(min, size, &links);
+        let tighten = self
+            .closed
+            .is_some_and(|t| now.saturating_duration_since(t) >= TIGHTEN_DELAY);
         if refilled == 0
-            && !self.dirty
+            && !self.opened
+            && !tighten
             && let Some((last, set)) = &self.last
-            && last == view
+            && still_holds(last, view)
         {
             self.stats.reused += 1;
             return Arc::clone(set);
         }
-        let set = Arc::new(self.search.run(&self.grid, view));
-        self.dirty = false;
+        let set = Arc::new(self.search.run(&self.grid, view, SEARCH_SLACK));
+        self.opened = false;
+        self.closed = None;
         self.last = Some((*view, Arc::clone(&set)));
         self.stats.searches += 1;
         self.stats.last_search = start.elapsed();
@@ -514,6 +578,30 @@ impl ChunkVisibility {
     /// Search counters.
     pub fn stats(&self) -> VisibilityStats {
         self.stats
+    }
+}
+
+/// True if the set searched for `old` holds for `new`: the same chunk and box, and every plane of
+/// the new frustum (in the old frame) at most [`MOVE_SLACK`] outside the old one with the same
+/// normal, which the search's slack covers.
+fn still_holds(old: &VisibilityView, new: &VisibilityView) -> bool {
+    if old.center != new.center
+        || old.radius != new.radius
+        || old.vertical_radius != new.vertical_radius
+    {
+        return false;
+    }
+    match (&old.frustum, &new.frustum) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            // The new planes relative to the old render origin (a few voxels apart: exact).
+            let shift = (new.render_origin - old.render_origin).as_vec3();
+            a.planes.iter().zip(&b.planes).all(|(pa, pb)| {
+                let n = pb.truncate();
+                n == pa.truncate() && pb.w - n.dot(shift) - pa.w <= MOVE_SLACK
+            })
+        }
+        _ => false,
     }
 }
 

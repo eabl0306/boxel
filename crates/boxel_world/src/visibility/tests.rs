@@ -2,11 +2,13 @@
 //! near and far from the origin, with and without a frustum; the incremental
 //! [`ChunkVisibility`] against a search from scratch.
 use super::*;
+use boxel_math::DVec3;
 use boxel_math::projection::{look_to, perspective_infinite_reverse};
 use boxel_math::{IVec3, Mat4};
 use boxel_voxel::{ALL_LINKS, MAX_CHUNK_COORD};
 use proptest::prelude::*;
 use std::collections::HashSet;
+use std::time::Instant;
 
 /// Small deterministic hash of a position relative to the center and a seed: the random links
 /// of a test world, the same at any shift of the world.
@@ -69,7 +71,7 @@ fn brute_force(view: &VisibilityView, links: &impl Fn(ChunkPos) -> u16) -> HashS
     // The search's own chunk-plane test (checked against the renderer's in
     // `the_frustum_test_never_rejects_what_the_renderer_draws`).
     let min = ChunkPos::new(c.x - half[0], c.y - half[1], c.z - half[2]);
-    let planes = chunk_planes(view, min);
+    let planes = chunk_planes(view, min, SEARCH_SLACK);
     let passes = |d: IVec3| {
         if d.abs().max_element() <= 1 {
             return true;
@@ -291,7 +293,8 @@ fn the_frustum_test_never_rejects_what_the_renderer_draws() {
             let half = view.half();
             let c = view.center;
             let min = ChunkPos::new(c.x - half[0], c.y - half[1], c.z - half[2]);
-            let planes = chunk_planes(&view, min).expect("frustum");
+            // Only the slack against rounding: the search never uses less.
+            let planes = chunk_planes(&view, min, FRUSTUM_SLACK).expect("frustum");
             let f = view.frustum.expect("frustum");
             for y in 0..2 * half[1] + 1 {
                 for z in 0..2 * half[2] + 1 {
@@ -320,7 +323,10 @@ fn incremental_updates_match_a_fresh_search() {
     };
     let mut seed = 99u64;
     let mut center = ChunkPos::new(10, -3, -4);
+    // Past the tightening delay at every step: every change is searched at once.
+    let mut now = Instant::now();
     for step in 0..60 {
+        now += TIGHTEN_DELAY * 2;
         seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
         // Move the camera by up to 2 chunks on each axis, sometimes jump.
         let jump = step % 17 == 16;
@@ -343,17 +349,121 @@ fn incremental_updates_match_a_fresh_search() {
             world.insert(p, l);
             changes.push((p, l));
         }
-        vis.apply_changes(&changes);
+        vis.apply_changes_at(&changes, now);
         let dir = (step % 3 != 0).then(|| Vec3::new(d(5) as f32, d(11) as f32 + 0.5, 1.0));
         let view = view_at(center, dir, 4, 2);
-        let got = vis.update(&view, |p| links_of(&world, p));
+        let got = vis.update_at(&view, |p| links_of(&world, p), now);
         let want = visible_chunks(&view, |p| links_of(&world, p));
         assert_eq!(*got, want, "step {step}");
         // Asking again without changes reuses the result.
-        let again = vis.update(&view, |p| links_of(&world, p));
+        let again = vis.update_at(&view, |p| links_of(&world, p), now);
         assert!(Arc::ptr_eq(&got, &again));
     }
     assert!(vis.stats().reused >= 60);
+}
+
+/// A view with the eye at `eye` (world voxels) looking along `dir`.
+fn view_from(eye: DVec3, dir: Vec3, radius: u32, vertical: u32) -> VisibilityView {
+    let render_origin = eye.floor().as_i64vec3();
+    let eye_rel = (eye - render_origin.as_dvec3()).as_vec3();
+    let f = frustum(eye_rel, dir, 32.0 * radius as f32);
+    VisibilityView::new(render_origin, Some(f), radius, vertical)
+}
+
+/// `a` holds every chunk of `b` (the box is the same).
+fn covers(a: &VisibleSet, b: &VisibleSet) -> bool {
+    let (min, max) = b.bounds();
+    (min.y..=max.y).all(|y| {
+        (min.z..=max.z).all(|z| {
+            (min.x..=max.x).all(|x| {
+                let p = ChunkPos::new(x, y, z);
+                !b.is_visible(p) || a.is_visible(p)
+            })
+        })
+    })
+}
+
+#[test]
+fn small_moves_reuse_the_set_and_it_still_covers_the_view() {
+    let links = |p: ChunkPos| random_links(5, IVec3::new(p.x as i32, p.y as i32, p.z as i32), 55);
+    let now = Instant::now();
+    let mut seed = 3u64;
+    for dir in [
+        Vec3::new(1.0, -0.35, 0.1),
+        Vec3::new(-0.3, 0.2, -1.0),
+        Vec3::new(0.05, -1.0, 0.1),
+    ] {
+        let start = DVec3::new(16.25, 20.5, 16.75);
+        let mut vis = ChunkVisibility::default();
+        vis.update_at(&view_from(start, dir, 6, 3), links, now);
+        let searches = vis.stats().searches;
+        for _ in 0..200 {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let r = |k: u32| ((seed >> k) % 1000) as f64 / 1000.0 - 0.5;
+            // Within 0.9 x MOVE_SLACK of the start, inside its chunk.
+            let step = DVec3::new(r(3), r(13), r(23)).normalize_or_zero()
+                * f64::from(MOVE_SLACK)
+                * 0.9
+                * (r(33) + 0.5);
+            let eye = start + step;
+            if ChunkPos::containing(boxel_voxel::BlockPos::from_world(eye))
+                != ChunkPos::containing(boxel_voxel::BlockPos::from_world(start))
+            {
+                continue;
+            }
+            let view = view_from(eye, dir, 6, 3);
+            let got = vis.update_at(&view, links, now);
+            // What the renderer needs for this view: a search with no room to move.
+            let exact = visible_chunks_with_slack(&view, links, FRUSTUM_SLACK);
+            assert!(covers(&got, &exact), "eye {eye}");
+        }
+        assert_eq!(
+            vis.stats().searches,
+            searches,
+            "every small move reused the set"
+        );
+        // Farther than the slack, or turned: a new search.
+        vis.update_at(&view_from(start + DVec3::X * 8.0, dir, 6, 3), links, now);
+        assert_eq!(vis.stats().searches, searches + 1);
+        vis.update_at(&view_from(start, dir + Vec3::Y * 0.01, 6, 3), links, now);
+        assert_eq!(vis.stats().searches, searches + 2);
+    }
+}
+
+#[test]
+fn opened_links_search_at_once_and_closed_ones_wait() {
+    let mut world: std::collections::HashMap<ChunkPos, u16> = std::collections::HashMap::new();
+    let view = view_at(
+        ChunkPos::new(0, 0, 0),
+        Some(Vec3::new(0.0, 0.0, -1.0)),
+        4,
+        2,
+    );
+    let mut vis = ChunkVisibility::default();
+    let now = Instant::now();
+    // Closed rock, with an open chunk between the camera and the wall.
+    world.insert(ChunkPos::new(0, 0, -1), ALL_LINKS);
+    let lookup =
+        |w: &std::collections::HashMap<ChunkPos, u16>, p: ChunkPos| w.get(&p).copied().unwrap_or(0);
+    vis.update_at(&view, |p| lookup(&world, p), now);
+    let searches = vis.stats().searches;
+    // A wall chunk ahead opens: searched at once, and the chunk behind it shows.
+    let wall = ChunkPos::new(0, 0, -2);
+    let behind = ChunkPos::new(0, 0, -3);
+    assert!(!vis.last().expect("set").is_visible(behind));
+    world.insert(wall, ALL_LINKS);
+    vis.apply_changes_at(&[(wall, ALL_LINKS)], now);
+    let set = vis.update_at(&view, |p| lookup(&world, p), now);
+    assert_eq!(vis.stats().searches, searches + 1);
+    assert!(set.is_visible(behind));
+    // It closes again: the open set is kept until the delay passes.
+    world.insert(wall, 0);
+    vis.apply_changes_at(&[(wall, 0)], now);
+    let kept = vis.update_at(&view, |p| lookup(&world, p), now + TIGHTEN_DELAY / 2);
+    assert!(Arc::ptr_eq(&kept, &set));
+    let later = vis.update_at(&view, |p| lookup(&world, p), now + TIGHTEN_DELAY);
+    assert_eq!(vis.stats().searches, searches + 2);
+    assert!(!later.is_visible(behind));
 }
 
 proptest! {

@@ -94,9 +94,13 @@ pub(crate) struct ChunkTable {
     stale_bits: Vec<u64>,
     /// Slots `0..stale_prefix` are all stale (after `clear` or a window move).
     stale_prefix: u32,
-    /// Bumped by every insert, remove and clear (per-slot data derived from the records, such
-    /// as the cave culling bits, is rebuilt when it changes).
+    /// Bumped by every clear and window move: per-slot data derived from the records and the
+    /// window (the cave culling bits) must be rebuilt. Smaller changes go to `touched`.
     version: u64,
+    /// Slots inserted or removed since the last [`ChunkTable::take_touched`], each once.
+    touched: Vec<u32>,
+    /// One bit per slot, set while the slot is in `touched`.
+    touched_bits: Vec<u64>,
 }
 
 impl ChunkTable {
@@ -114,12 +118,34 @@ impl ChunkTable {
             stale_bits: vec![0; capacity.div_ceil(64) as usize],
             stale_prefix: 0,
             version: 0,
+            touched: Vec::new(),
+            touched_bits: vec![0; capacity.div_ceil(64) as usize],
         }
     }
 
-    /// Changes with every insert, remove and clear.
+    /// Changes with every clear and window move (see [`ChunkTable::take_touched`] for the
+    /// rest).
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Calls `f` with every slot inserted or removed since the last call (each once, in no
+    /// order) and forgets them.
+    pub fn take_touched(&mut self, mut f: impl FnMut(u32)) {
+        for &slot in &self.touched {
+            self.touched_bits[slot as usize / 64] &= !(1 << (slot % 64));
+            f(slot);
+        }
+        self.touched.clear();
+    }
+
+    /// Records that `slot` was inserted or removed.
+    fn touch(&mut self, slot: u32) {
+        let (word, bit) = (slot as usize / 64, 1 << (slot % 64));
+        if self.touched_bits[word] & bit == 0 {
+            self.touched_bits[word] |= bit;
+            self.touched.push(slot);
+        }
     }
 
     /// Slot capacity.
@@ -141,6 +167,11 @@ impl ChunkTable {
     /// Highest live slot + 1.
     pub fn slot_count(&self) -> u32 {
         self.records.len() as u32
+    }
+
+    /// Record of the chunk in `slot` (`None` if free).
+    pub fn record_at(&self, slot: u32) -> Option<&ChunkRecord> {
+        self.records.get(slot as usize).and_then(Option::as_ref)
     }
 
     /// Record of `id`.
@@ -165,7 +196,7 @@ impl ChunkTable {
     /// Inserts or replaces the record of `record.id`; returns its slot (`None` if full).
     pub fn insert(&mut self, record: ChunkRecord) -> Option<u32> {
         let slot = self.slot_for(record.id)?;
-        self.version += 1;
+        self.touch(slot);
         self.free.remove(&slot);
         if slot as usize == self.records.len() {
             self.records.push(None);
@@ -191,7 +222,7 @@ impl ChunkTable {
     pub fn remove(&mut self, id: u64) -> Option<(u32, ChunkRecord)> {
         let slot = self.by_id.remove(&id)?;
         let record = self.records[slot as usize].take()?;
-        self.version += 1;
+        self.touch(slot);
         self.free.insert(slot);
         self.translucent.remove(&slot);
         // Its GPU entry must go to zero even past the new `slot_count`: High's cull reads the
@@ -263,6 +294,7 @@ impl ChunkTable {
             || render_origin.y.abs_diff(c.y) > GPU_WINDOW_SLACK
             || render_origin.z.abs_diff(c.z) > GPU_WINDOW_SLACK;
         if moved {
+            self.version += 1;
             self.window = render_origin;
             self.drawable = self
                 .iter()
