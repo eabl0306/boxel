@@ -12,6 +12,8 @@
 //! - [`shapes`]: the boxes of the models made of boxes (slabs, stairs, fences, torches; ADR
 //!   0020), and [`rules`]: the states that follow their neighbors (stair shapes, fence sides,
 //!   torches that need a support).
+//! - [`faces`]: which faces of a chunk see each other through non-occluding voxels
+//!   ([`ChunkFaceInfo`]), for the world's cave culling (ADR 0022).
 //! - [`storage`]: Minecraft-style paletted container (Uniform | Packed 1/2/4/8 bits | Direct u16).
 //! - [`light`]: the light value format ([`LightValue`]) and the per-state [`LightTables`]. Light
 //!   itself is derived data, computed by `boxel_light`; chunks do not store it.
@@ -21,6 +23,7 @@
 //!   never live inline in ECS components.
 
 pub mod coords;
+pub mod faces;
 pub mod light;
 pub mod registry;
 pub mod rules;
@@ -37,6 +40,7 @@ pub use coords::{
     DimensionId, Face, LocalPos, MAX_BLOCK_COORD, MAX_CHUNK_COORD, NEIGHBOR_OFFSETS, WorldPos,
     neighbor_index,
 };
+pub use faces::{ALL_LINKS, ChunkFaceInfo, link_bit};
 pub use light::{LightTables, LightValue, MAX_LIGHT, OPAQUE_OPACITY};
 pub use masks::{LightMasks, MaskRows, MaskWords, OwnedLightMasks};
 pub use registry::{
