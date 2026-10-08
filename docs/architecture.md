@@ -2,7 +2,7 @@
 
 Documento técnico de referencia. Fecha: 2026-10-05. Estado: aprobado para el milestone M0
 (revisión final, después de tres revisiones adversariales del borrador v1).
-Las decisiones puntuales están en `docs/adr/` (0001 a 0021). Durante M0 hubo además una
+Las decisiones puntuales están en `docs/adr/` (0001 a 0022). Durante M0 hubo además una
 especificación para los agentes implementadores (en inglés, en `.scaffold/`), borrada al cerrar M0;
 este documento queda como referencia.
 
@@ -147,12 +147,12 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_camera` | `Camera`, `CameraView` (relativa a cámara), `FlyCamera` | app, transform, window |
 | `boxel_gfx` | política sobre wgpu: preferencias, instancia, tiers, scoring, smoke, selección, LKG, superficie, readback, hal; ejemplo `gpu_info` | (wgpu) |
 | `boxel_shaders` | WGSL embebido, composición, espejos `#[repr(C)]`, tests de naga | (wgpu, bytemuck) |
-| `boxel_voxel` | coordenadas (`BlockPos`, `ChunkPos`, `WorldPos`: bloque más offset, exacto a cualquier distancia), `Face`, registry (con emisión RGB y opacidad de luz), paleta, `LightValue` y `LightTables`, `ChunkData` con sus máscaras de luz (`LightMasks`) | (glam) |
+| `boxel_voxel` | coordenadas (`BlockPos`, `ChunkPos`, `WorldPos`: bloque más offset, exacto a cualquier distancia), `Face`, registry (con emisión RGB y opacidad de luz), paleta, `LightValue` y `LightTables`, `ChunkData` con sus máscaras de luz (`LightMasks`), qué caras de un chunk se ven entre sí (`ChunkFaceInfo`, ADR 0022) | (glam) |
 | `boxel_mesh` | `PackedQuad`, `ChunkMesh` con su paleta de luz, `PaddedChunk`, `Mesher` (fork de bgm que fusiona por material, AO y luz) | voxel |
 | `boxel_light` | luz de vóxeles en CPU, sin ECS ni GPU (ADR 0015): techos de cielo por columna (`SkyTile`, caminata hacia abajo), luz exacta de un chunk desde una caja de 64³ (cielo y RGB, caminos rápidos para cuevas oscuras y cielo abierto), `PaddedLight`, `ChunkLight`; oráculo global para los tests | voxel |
 | `boxel_worldgen` | trait `WorldGenerator`; generadores `FlatGenerator`, `TerrainGenerator`, `ForestGenerator` (terreno con árboles) y `OverworldGenerator` (superficie sobre piedra infinita hacia abajo, con cuevas y árboles; etapas en `overworld`: `Heightmap`, `SurfaceRules`, `Caves`, más `Trees`); `Sea` (mar y playas en el forest y el overworld, ADR 0021); ruido 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`) | voxel |
-| `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, mensajes (`ChunkMeshEvent`, `BlockChanged`, `ChunkDataEvent`), `ChunkStore`, reloj del mundo (`TimeOfDay`, `DaylightCurve`, `DaylightPlugin`), ticks programados de bloques (`BlockTicks`, `BlockTicksPlugin`) y agua que corre (`FluidPlugin`, ADR 0021) | app, voxel, mesh, light, worldgen, transform, diagnostic |
-| `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `SceneLight` (luz del cielo, ambiente y curva de brillo del frame), `PresentSettings` (vsync en tiempo de ejecución), texturas procedurales o de un resource pack (`TextureSource`), screenshots | gfx, shaders, world, camera, window, pack |
+| `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, mensajes (`ChunkMeshEvent`, `BlockChanged`, `ChunkDataEvent`), `ChunkStore`, reloj del mundo (`TimeOfDay`, `DaylightCurve`, `DaylightPlugin`), ticks programados de bloques (`BlockTicks`, `BlockTicksPlugin`), agua que corre (`FluidPlugin`, ADR 0021) y la búsqueda de la ocultación de cuevas (`ChunkVisibility`, `visibility`, ADR 0022) | app, voxel, mesh, light, worldgen, transform, diagnostic |
+| `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `SceneLight` (luz del cielo, ambiente y curva de brillo del frame), `PresentSettings` (vsync en tiempo de ejecución), texturas procedurales o de un resource pack (`TextureSource`), screenshots, ocultación de cuevas en los tres tiers (ADR 0022), conteo de draws en CPU (`cull_counts`) | gfx, shaders, world, camera, window, pack |
 | `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::collision`: cubos y cajas, más un contorno para apuntar, ADR 0018), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas, el integrador de un cuerpo (`step_body`, `predict`), el narrowphase (`shape_contact`) y la grilla del broadphase (`Grid`). Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`; pasos en `FixedPostUpdate`, interpolación en `AfterFixedMainLoop`), `PhysicsQuery` (rayos a vóxeles y cuerpos, cajas, el chequeo para poner bloques), `BodyIndex`, cuerpos (`RigidBody`, `Collider`, `Velocity`, `BodyPosition`, `Contacts`, `Interpolated`, `Teleport`, `Frozen`, `Sleeping`, `ReportContacts`), `CharacterController`, `Projectile`, nadar (`SwimPlugin`, `Swimmer`, ADR 0021) y los mensajes `VoxelImpact`, `CollisionStarted`, `CollisionEnded` y `ProjectileHit`. Los cuerpos quietos se duermen (despiertan con `BlockChanged` y `ChunkDataEvent` del mundo, entre otras cosas) y, con muchos cuerpos despiertos, el paso corre en los hilos de cómputo. Fases P0 a P4 hechas | ecs, app, math, tasks, transform, voxel, world, diagnostic |
 | `boxel_pack` | lector de resource packs de Minecraft Java (formatos ~64 a 120): `pack.mcmeta` con overlays, texturas de bloque PNG a RGBA8 (animaciones `.png.mcmeta`), modelos de bloque con herencia `parent` y variables `#`, blockstates `variants` y `multipart`. Solo datos; `boxel_render` lo usa para las texturas de bloque | (serde, png) |
 | `boxel_facade_check` | solo CI: prueba que los derives resuelven `::boxel::ecs` para un usuario que depende solo de `boxel` | fachada |
@@ -742,6 +742,10 @@ Sistemas en `Update`, encadenados (`WorldSystems`):
    bloques de un chunk se pueden leer (`Ready`, o `Missing`, que se lee como aire) y
    `Unloaded { id, key }` cuando dejan de poder leerse. El mapa los anota al cambiar el estado de
    un slot (`set_data` y `remove`), así ningún camino del streaming se olvida de avisar.
+5. **Visibility:** pasa a `ChunkVisibility` los cambios del frame en los enlaces de caras de los
+   chunks (ADR 0022). Un chunk aporta sus enlaces (calculados por su job de generación, o por su
+   job de malla después de una edición) solo con la malla asentada; si no, cuenta como abierto.
+   La búsqueda la pide el render en su `Extract`, con su cámara.
 
 Con `BlockTicksPlugin` (lo agrega `FluidPlugin`, ADR 0021), entre Interest y Edits corren los
 ticks programados que vencieron, en orden y con un presupuesto de 1 ms. Sus escrituras entran al
@@ -943,8 +947,10 @@ sobre su rango del arena (ADR 0018, sección 3).
 
 **High** (Vulkan con MDI-count):
 
-1. `clear_buffer(draw_counts)` (dos contadores: opaco y cutout).
-2. Compute `cull_chunks` (64 hilos por grupo, un hilo por slot): AABB contra 6 planos; por bucket
+1. `clear_buffer(draw_counts)` (dos contadores: opaco y cutout; los bits de la ocultación de
+   cuevas que siguen en el mismo buffer no se tocan).
+2. Compute `cull_chunks` (64 hilos por grupo, un hilo por slot): salta los slots que la
+   ocultación de cuevas oculta (un bit por slot, ADR 0022); AABB contra 6 planos; por bucket
    de cara, un test de backface a nivel chunk (un bucket +Y solo se ve si la cámara está por
    encima de su `min.y`, etc.); el bucket cutout solo usa el frustum. Por bucket visible:
    `atomicAdd` en su lista y escribe `DrawIndexedIndirect { index_count: n*6, instance_count: 1,
@@ -955,6 +961,13 @@ sobre su rango del arena (ADR 0018, sección 3).
    chunk translúcido visible, con su `DrawRef` en un buffer chico que la CPU escribe cada frame.
 4. Blit a la superficie.
 
+Ocultación de cuevas (ADR 0022, los tres tiers): en su `Extract`, el render busca desde su cámara
+qué chunks se ven a través de espacio abierto (BFS por enlaces de caras, como Minecraft y Sodium)
+y el renderer lo pasa a un bit por slot: High lo lee en `cull_chunks`, Mid y Low en el culling en
+CPU, y los tres en la lista translúcida. Bajo tierra oculta de 38 a 96 % de las caras; desde la
+superficie solo de 15 a 45 % (los enlaces de chunks de 32³ dejan pasar la superficie hacia las
+cuevas).
+
 Hi-Z (oclusión en dos fases) queda para M2. Notas para entonces: con reverse-Z la pirámide usa
 reducción **MIN** (lo lejano es 0); `Depth32Float` se lee como textura de profundidad (no
 filtrable) y se copia a una cadena de mips `R32Float` en storage; solo aplica a High (GL 3.3 no
@@ -962,7 +975,8 @@ tiene compute).
 
 **Mid** (Metal, GL >= 4.3, DX12 por ahora, Vulkan forzado):
 
-1. Culling en CPU con los mismos tests que el shader.
+1. Culling en CPU con los mismos tests que el shader (también los bits de la ocultación de
+   cuevas).
 2. Escribe los `DrawRef` del frame en el buffer de instancia.
 3. Pipeline opaco y `draw_indexed(0..n*6, 0, i..i+1)` por bucket de cara visible; después
    pipeline cutout para los buckets cutout y pipeline translúcido para los translúcidos.
@@ -970,7 +984,7 @@ tiene compute).
 
 **Low** (GL 3.3, GLES 3.0, Vulkan/GL forzado):
 
-1. Culling en CPU.
+1. Culling en CPU (como Mid, con la ocultación de cuevas).
 2. Pipeline `vs_instanced` (opaco, cutout y translúcido), arena como buffer de vértices por instancia
    (`Uint32x2` en `@location(0)`, stride 8) y el buffer de luz por quad como segundo buffer por
    instancia (`Uint32x2` en `@location(1)`, mismos offsets: el mismo `first_instance` llega a los
@@ -1228,9 +1242,9 @@ schedule `Shutdown` es el lugar para el `flush` final.
 |---|---|---|
 | Contrato (esqueleto) | lo que el esqueleto ya implementa: App, tiempo fijo y mensajes, task pools, frustum, registry, `ChunkData`, `tier_request` en los umbrales, superficie, derives por la fachada | `tests/contract.rs`, `tests/derives.rs` |
 | Unitarios | lógica pura de cada crate (paleta, scheduler, preferencias, clasificación con `AdapterCaps` sintéticos, scoring, LKG en directorio temporal, input, plugins) | `cargo test` |
-| Propiedades | paleta contra un array denso, mesher contra el oráculo de fuerza bruta (opaco, cutout, translúcido) | proptest |
+| Propiedades | paleta contra un array denso, mesher contra el oráculo de fuerza bruta (opaco, cutout, translúcido), enlaces de caras y búsqueda de la ocultación de cuevas contra fuerza bruta | proptest |
 | Shaders | naga: parse + validación, GLSL en el piso de cada módulo, MSL, HLSL (FXC y DXC), SPIR-V, builtins prohibidos, constantes, layouts, regla de Low | `boxel_shaders/tests/naga.rs` |
-| GPU | contrato (readback, PNG, scopes, `tier_request` en adaptadores reales); selección headless y smoke por tier; misma escena en todos los tiers de cada adaptador (<= 0.1 % de píxeles distintos), escena lejana de profundidad; terreno real | `tests/gpu_*.rs`; CI con lavapipe y llvmpipe; un hilo por binario |
+| GPU | contrato (readback, PNG, scopes, `tier_request` en adaptadores reales); selección headless y smoke por tier; misma escena en todos los tiers de cada adaptador (<= 0.1 % de píxeles distintos), escena lejana de profundidad; terreno real; los mismos píxeles con y sin ocultación de cuevas | `tests/gpu_*.rs`; CI con lavapipe y llvmpipe; un hilo por binario |
 | Integración | `voxel_world` automatizado (`--frames`, `--timeout`, `--compare-to`, `--minimize-test`, `--resize-test`, pérdida de dispositivo), `window_smoke`, `headless_world`, test de ambigüedades de schedules | plan de verificación |
 | ECS vendorizado | tests de librería y doctests de upstream con lockfile fijo; Miri en PRs del fork y semanal | `vendor/` |
 | Repositorio | superficie del ECS, ningún crate `bevy*`, lockfiles sincronizados, cargo-deny, typos | `just lint`, `just deny`, CI |
@@ -1244,7 +1258,7 @@ schedule `Shutdown` es el lugar para el `flush` final.
 |---|---|---|
 | **M0 scaffold** | workspace y tooling; fork del ECS; `boxel_app`; ventana con compuerta de presentación e input; detección completa (tiers, scoring, smoke, overrides, LKG de crashes, device lost, catch_unwind); tiers High, Mid y Low con buckets opaco y cutout (High sin Hi-Z); paleta, registry, worldgen, mesher, streaming con jobs; cámara libre; `gpu_info`, `voxel_world`, `headless_world` | compila, tests, clippy y rustdoc limpios; `voxel_world` dibuja terreno en Vulkan High y en GL (Mid y Low); imágenes iguales entre tiers; la simulación no se congela con la ventana minimizada |
 | **M1 mundo jugable** | criterio de entrada: re-fork sobre bevy 0.20.0 final. Pase translúcido; AO; raycast y edición de bloques (hechos: ADR 0016, `voxel_world`); el sistema de ediciones si se recortó; propiedades de bloque e IdMap; `ChunkStore` con redb; crecimiento del arena y presupuesto de subida; caras interiores de hojas (opcional); re-selección en caliente si se recortó; decisión `static-dxc` o DLL en Windows; timestamps de GPU; actualizar a wgpu 31 | editar y guardar un mundo; agua visible |
-| **M2 GPU-driven completo** | Hi-Z en dos fases (High); cave culling por BFS (Mid/Low); pool de ocupación en GPU; `create_shader_module_trusted` con medición; pipeline cache de Vulkan; verificar DX12 High; clip control en GL (upstream); decidir WESL | caída de draws y de tiempo de GPU medida |
+| **M2 GPU-driven completo** | Hi-Z en dos fases (High) o enlaces por subceldas de 16³ (el cave culling por BFS ya está en los tres tiers, ADR 0022); pool de ocupación en GPU; `create_shader_module_trusted` con medición; pipeline cache de Vulkan; verificar DX12 High; clip control en GL (upstream); decidir WESL | caída de draws y de tiempo de GPU medida |
 | **M3 escala** | LOD con mips de 32³ y anillos; listas indirectas segmentadas (más de 65 535 draws); render en hilo propio; inicialización de GPU asíncrona (respetando los error scopes por hilo) | distancias de vista grandes estables |
 | **M4 experimental** | ray marching sobre bricks/ocupación; mesh shaders opt-in; evaluar bevy_ecs 0.21 y el núcleo ECS propio | prototipos medidos |
 
@@ -1271,6 +1285,7 @@ actualiza al empezar M1, con `boxel_gfx` como frontera.
 | binary-greedy-meshing: crate chico, MIT, sin AO | dependencia frágil | fork en el repo (`boxel_mesh/src/greedy.rs`, ADR 0015) con oráculos y una prueba de regresión byte a byte contra el crate |
 | Arranque lento en laptops híbridos (despertar la dGPU ~1 s) | mala primera impresión | documentado; inicialización asíncrona en M3 |
 | Más de 65 535 buckets visibles en High | huecos, también cerca | aviso; segmentación en M3 |
+| La ocultación de cuevas deja pasar la superficie hacia las cuevas (enlaces de chunks de 32³) | desde la superficie oculta poco (15 a 45 % de las caras subterráneas) | medido (`docs/rendimiento/cuevas-fase4-2026-10.md`); subceldas de 16³ o Hi-Z en la fase 5 |
 | Implementación en paralelo con varios agentes | bloqueos y pisadas | copias privadas por paquete, compuerta de propiedad, elementos transversales ya implementados en el esqueleto, protocolo de bloqueo con el lead |
 | `/tmp` es tmpfs de 12 GB con cuota | builds que fallan, insumos que desaparecen | target dirs en disco; el diseño se copió al repo durante M0 |
 

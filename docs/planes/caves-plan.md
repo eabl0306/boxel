@@ -158,6 +158,16 @@ Read-only review. I read the code on master and on `perf/border-opt`. Repo root:
 - On the 780M, radius 16 surface fly must pass. Underground on the 780M is recorded; it is expected to fail until phase 4 (extrapolated about 5 ms of GPU for about 10 M resident quads).
 
 ### Phase 4: cave culling on all tiers (brought forward from M2)
+
+**Status (2026-10-08): done, see ADR 0022 and `docs/rendimiento/cuevas-fase4-2026-10.md`.**
+Differences from this plan: the search runs in the render extract with the frame's own camera
+(not in `WorldSystems::Visibility`, which now only feeds it the link changes), and reuses its
+result while the eye moves less than 4 voxels without turning; the links count only once the
+chunk's mesh is settled; on High the bits share the draw-count buffer (4 storage buffers);
+`opaque_faces` and `all_opaque` are computed but `is_enclosed_opaque` is not generalized yet.
+Underground it hides 38-96 % of the faces (62 % on average) and the 780M fly 64 has no frame over
+6.94 ms. **The gate fails:** from the surface at radius 16 it hides only 15-45 % of the
+underground faces (the 32³ leak), so phase 5 should add 16³ sub-cells or Hi-Z.
 - In `boxel_voxel`:
   - `ChunkFaceInfo { links: u16, opaque_faces: u8, all_opaque: bool }`.
   - `face_info(&ChunkData, &BlockRegistry)`: a bit-parallel flood fill over the 1,024 z-rows. Cutout and translucent voxels count as passable.

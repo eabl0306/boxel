@@ -81,6 +81,18 @@ de la luz (por defecto es `on`). El resumen lo anota y `tools/bench_report.py` n
 con luz distinta. Las corridas viejas sin el dato cuentan como `on` si anotan la hora (llegó con
 la luz) y como `none` si son de antes de la luz.
 
+`--cave-culling off` (o `--no-cave-culling`) dibuja todo lo que pasa el frustum, como antes de la
+ocultación de cuevas (ADR 0022; por defecto está encendida). El resumen lo anota (el título dice
+`culling off`) y trae una sección "Cave culling": chunks ocultos, chunks que pasan el culling en
+CPU, draws, y cuántos frames buscaron y cuánto tardaron. `tools/bench_report.py` no separa las
+corridas por esta opción (así una rama con culling se compara con las corridas de main), pero avisa
+si difiere y compara esos números.
+
+Para contar draws y caras con y sin ocultación de cuevas, sin GPU ni ventana y sin ruido:
+`headless_world --world overworld --view-distance 16 --hz 0 --cull --camera X,Y,Z,YAW,PITCH`.
+El costo de la búsqueda y de los enlaces de caras está en
+`cargo bench -p boxel_world --bench cave_culling`.
+
 `--pack DIR` usa las texturas de un resource pack. El resumen anota el pack (`none` con las
 procedurales, también en corridas viejas) y cuánto tardó en cargar, y `tools/bench_report.py` no
 mezcla corridas con texturas distintas.
