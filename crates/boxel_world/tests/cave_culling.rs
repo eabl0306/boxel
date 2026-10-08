@@ -326,7 +326,11 @@ fn assert_visibility_matches(app: &mut App, view: &VisibilityView) {
                 }
             }
         }
-        std::thread::sleep(TIGHTEN_DELAY);
+        // Wait out the delay of the links that closed (no frame to block here).
+        let until = Instant::now() + TIGHTEN_DELAY;
+        while Instant::now() < until {
+            std::thread::yield_now();
+        }
         let got = vis.update(view, |p| map.visibility_links_at(p));
         assert_eq!(*got, fresh);
     });

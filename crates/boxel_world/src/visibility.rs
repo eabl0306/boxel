@@ -242,9 +242,7 @@ impl LinkGrid {
     /// Sets the links of `pos` if the grid holds it. Returns the links it had (`None`: not
     /// held).
     fn set(&mut self, pos: ChunkPos, links: u16) -> Option<u16> {
-        let Some((min, [sx, sy, sz])) = self.held else {
-            return None;
-        };
+        let (min, [sx, sy, sz]) = self.held?;
         let (x, y, z) = (
             pos.x.wrapping_sub(min.x) as u64,
             pos.y.wrapping_sub(min.y) as u64,
@@ -268,9 +266,8 @@ const fn linked_table<const N: usize>(shift: u32) -> [[u8; N]; 6] {
     let mut out = [[0u8; N]; 6];
     let mut f = 0;
     while f < 6 {
-        let face = match Face::from_index(f as u8) {
-            Some(face) => face,
-            None => panic!("a face index"),
+        let Some(face) = Face::from_index(f as u8) else {
+            panic!("a face index")
         };
         let mut b = 0;
         while b < N {

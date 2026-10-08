@@ -518,10 +518,10 @@ pub(crate) fn translucent_draws(
     out.extend(keyed.into_iter().map(|(_, d)| d));
 }
 
-/// What every tier draws for a set of chunks, counted on the CPU with the culling rules of
-/// [`CpuCull`] (the same as `cull.wgsl`): chunks in the frustum, then their non-empty face
-/// buckets that pass the per-face test, their cutout and translucent buckets. With `visible`
-/// (cave culling, ADR 0022), a chunk it does not hold as visible draws nothing.
+/// What every tier draws for a set of chunks, counted on the CPU with the culling rules of Mid
+/// and Low (the same as `cull.wgsl`): chunks in the frustum, then their non-empty face buckets
+/// that pass the per-face test, their cutout and translucent buckets. With `visible` (cave
+/// culling, ADR 0022), a chunk it does not hold as visible draws nothing.
 ///
 /// Deterministic, with no GPU: tools count the draws and faces of a camera with and without cave
 /// culling (`examples/headless_world.rs --cull`).
