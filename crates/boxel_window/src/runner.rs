@@ -963,12 +963,16 @@ impl RunnerCore {
     }
 
     /// Opens an idle slot after an update that ended at `now` and waits until `wake`, if the app
-    /// has `Idle` systems and the slot has room for a step: it ends `IDLE_MARGIN` before the
-    /// earlier of the next deadline's spin margin and `wake`. Following the display, `wake` is
-    /// the latest wait for a closed gate (later than the deadline, so the deadline decides) or
-    /// the earliest start for a callback that came early.
+    /// has `Idle` systems, a [`FrameLimit`] (the 33 ms wait of a hidden window alone is no
+    /// limit) and the slot has room for a step: it ends `IDLE_MARGIN` before the earlier of the
+    /// next deadline's spin margin and `wake`. Following the display, `wake` is the latest wait
+    /// for a closed gate (later than the deadline, so the deadline decides) or the earliest
+    /// start for a callback that came early.
     fn open_idle(&mut self, world: &World, now: Instant, wake: Instant) -> bool {
-        if !self.idle_systems {
+        let limited = world
+            .get_resource::<FrameLimit>()
+            .is_some_and(|limit| limit.period().is_some());
+        if !self.idle_systems || !limited {
             return false;
         }
         let end = self
@@ -2496,6 +2500,33 @@ mod tests {
             ControlFlow::Poll
         );
         assert_eq!(core.idle_end, Some(slot_end(t0 + OCCLUDED_WAIT)));
+    }
+
+    #[test]
+    fn an_occluded_window_without_a_limit_never_idles() {
+        // Hidden updates still wait on the 33 ms grid, but without a limit that wait is not a
+        // frame limit: no slot, the plain wait as before. Minimized, occluded by winit, or a
+        // stalled redraw (the watchdog).
+        for hide in 0..3 {
+            let (mut app, mut core, t0) = paced(144);
+            app.insert_resource(FrameLimit::UNLIMITED);
+            core.idle_systems = true;
+            match hide {
+                0 => core.minimized = true,
+                1 => core.winit_occluded = true,
+                _ => core.redraw_pending_since = Some(t0 - REDRAW_TIMEOUT - 1000 * US),
+            }
+            core.begin_update(app.world_mut(), t0);
+            assert!(core.occluded, "case {hide}");
+            let flow = core.end_update(app.world(), t0 + 500 * US).control_flow;
+            assert_eq!(
+                flow,
+                ControlFlow::WaitUntil(t0 + OCCLUDED_WAIT - FramePacer::DEFAULT_SPIN_MARGIN),
+                "case {hide}"
+            );
+            assert_eq!(core.idle_end, None, "case {hide}");
+            assert_eq!(core.idle_step(t0 + 600 * US, t0 + OCCLUDED_WAIT), None);
+        }
     }
 
     /// What a run of [`simulate`] saw, with instants as times since its start.

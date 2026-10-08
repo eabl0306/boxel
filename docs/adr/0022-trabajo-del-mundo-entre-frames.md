@@ -61,9 +61,10 @@ cielo, mallar, publicar) y cada una puede esperar un frame entero.
   la update corre en la iteración siguiente. Un evento que llega durante un paso se atiende
   cuando el paso termina, hasta 0.5 ms tarde. Como la ventana termina 1 ms antes del deadline,
   eso solo toca a los callbacks que llegan más de 1 ms antes de tiempo.
-- No cambia nada sin sistemas en `Idle` (ninguna iteración de más), sin límite, en modo
-  `Reactive`, ni después de una update que terminó tarde. Con la ventana oculta la ventana de
-  pasos sigue el período de 33 ms.
+- No cambia nada sin sistemas en `Idle` (ninguna iteración de más), sin límite (tampoco con la
+  ventana oculta: la espera de 33 ms no es un límite), en modo `Reactive`, ni después de una
+  update que terminó tarde. Con límite y la ventana oculta, la ventana de pasos sigue el período
+  de 33 ms.
 
 ### Runner headless
 
