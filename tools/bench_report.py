@@ -85,6 +85,8 @@ CULLING_METRICS = [
     ('culling search avg ms', ('culling', 'search_avg_ms'), -1),
     ('culling search p99 ms', ('culling', 'search_p99_ms'), -1),
     ('culling search max ms', ('culling', 'search_max_ms'), -1),
+    ('culling bits p99 ms', ('culling', 'bits_p99_ms'), -1),
+    ('culling bits max ms', ('culling', 'bits_max_ms'), -1),
 ]
 
 # Settings that make two runs comparable.

@@ -122,7 +122,9 @@ depende del chunk del ojo y no de su vóxel. `VisibilityStats::blocked` cuenta e
 
 - El renderer convierte el conjunto en un bit por slot. Lo rearma entero con un conjunto nuevo,
   una tabla vaciada o una ventana de GPU movida; si no, solo mira los slots que entraron o
-  salieron desde el frame anterior.
+  salieron desde el frame anterior. Una búsqueda que encuentra los mismos chunks devuelve el
+  mismo conjunto, así que no rearma nada. Ese tiempo no entra en el de la búsqueda: sale aparte
+  en `RenderStats::occlusion_time` y en el resumen de `stress`.
 - High: `cull.wgsl` lee los bits. Van en el mismo buffer que los dos contadores de draws, después
   de ellos (solo los contadores se limpian cada frame), para que el pase siga con 4 storage
   buffers, el mínimo de Vulkan por etapa y el piso de boxel. `View::counts.w` dice si hay bits.

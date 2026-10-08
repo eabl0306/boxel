@@ -818,6 +818,7 @@ fn record(
             occluded: info.occluded_chunks,
             search: (search.searches > rec.last_searches).then_some(search.last_search),
             unculled: search.blocked > rec.last_blocked,
+            occlusion: info.occlusion_time,
         };
         rec.log.push(record);
         if let Some(spans) = spans.as_deref_mut() {

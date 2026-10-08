@@ -641,7 +641,9 @@ impl ChunkVisibility {
 
     /// The chunks `view` may see: the last set while it still holds (the same chunk and box,
     /// the eye less than [`MOVE_SLACK`] from where it was searched without turning, no link
-    /// opened, no closed link older than [`TIGHTEN_DELAY`]), else a new search. `links` gives
+    /// opened, no closed link older than [`TIGHTEN_DELAY`]), else a new search. A search that
+    /// finds the same chunks returns the same `Arc` (the renderer rebuilds its bits only for a
+    /// new one, [`Arc::ptr_eq`]). `links` gives
     /// the links of a position the grid does not hold yet (the map's
     /// [`ChunkMap::visibility_links_at`](crate::ChunkMap)).
     pub fn update(
@@ -681,7 +683,13 @@ impl ChunkVisibility {
             self.stats.reused += 1;
             return Arc::clone(set);
         }
-        let set = Arc::new(self.search.run(&self.grid, view, SEARCH_SLACK));
+        let found = self.search.run(&self.grid, view, SEARCH_SLACK);
+        // The same chunks as before (a link that closed out of sight, a turn that changed
+        // nothing): the same set, so the renderer keeps its bits.
+        let set = match &self.last {
+            Some((_, last)) if **last == found => Arc::clone(last),
+            _ => Arc::new(found),
+        };
         self.opened = false;
         self.closed = None;
         self.last = Some((*view, Arc::clone(&set)));

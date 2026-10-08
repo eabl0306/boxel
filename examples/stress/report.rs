@@ -78,6 +78,8 @@ pub struct FrameRecord {
     /// Cave culling was on but culled nothing because the eye did not see from open space
     /// (inside rock, or nearer a wall than the near plane; `VisibilityStats::blocked`).
     pub unculled: bool,
+    /// Time the renderer took to update its cave culling bits (`RenderInfo::occlusion_time`).
+    pub occlusion: Duration,
 }
 
 /// Append-only list of records stored in fixed blocks: pushing never moves earlier records, so
@@ -649,22 +651,35 @@ pub struct Culling {
     pub search_p99: Duration,
     /// See `search_avg`.
     pub search_max: Duration,
+    /// The renderer's update of its bits per slot, over every frame: mean, nearest-rank 99th
+    /// percentile and largest.
+    pub bits_avg: Duration,
+    /// See `bits_avg`.
+    pub bits_p99: Duration,
+    /// See `bits_avg`.
+    pub bits_max: Duration,
 }
 
 impl Culling {
     fn of(records: &[FrameRecord]) -> Self {
-        let mut searches: Vec<Duration> = records.iter().filter_map(|r| r.search).collect();
-        searches.sort_unstable();
-        let n = searches.len();
-        let (search_avg, search_p99, search_max) = if n == 0 {
-            Default::default()
-        } else {
-            (
-                searches.iter().sum::<Duration>() / n as u32,
-                searches[(n * 99).div_ceil(100).max(1) - 1],
-                searches[n - 1],
-            )
+        // Mean, nearest-rank 99th percentile and largest (zero when empty).
+        let spread = |mut times: Vec<Duration>| {
+            times.sort_unstable();
+            let n = times.len();
+            if n == 0 {
+                Default::default()
+            } else {
+                (
+                    times.iter().sum::<Duration>() / n as u32,
+                    times[(n * 99).div_ceil(100).max(1) - 1],
+                    times[n - 1],
+                )
+            }
         };
+        let searches: Vec<Duration> = records.iter().filter_map(|r| r.search).collect();
+        let n = searches.len();
+        let (search_avg, search_p99, search_max) = spread(searches);
+        let (bits_avg, bits_p99, bits_max) = spread(records.iter().map(|r| r.occlusion).collect());
         Self {
             visible: Spread::of(records.iter().map(|r| r.visible_chunks as usize)),
             occluded: Spread::of(records.iter().map(|r| r.occluded as usize)),
@@ -674,6 +689,9 @@ impl Culling {
             search_avg,
             search_p99,
             search_max,
+            bits_avg,
+            bits_p99,
+            bits_max,
         }
     }
 }
@@ -785,7 +803,7 @@ pub const CSV_HEADER: &str = "frame,t_ms,frame_ms,presented,crossed,cam_x,cam_z,
 generated,jobs_done,meshes,removed,upload_quads,d_data_ready,d_chunks,chunks,data_ready,\
 generating,mesh_ready,mesh_empty,meshing,queued_jobs,in_flight,gpu_chunks,quads,draws,arena_used,\
 dropped_chunks,gate_wait_ms,gate_missed,gate_ms,display_locked,visible_chunks,occluded,search_ms,\
-unculled";
+unculled,occlusion_ms";
 
 /// The CSV text: header plus one row per record.
 pub fn csv(records: &[FrameRecord]) -> String {
@@ -797,7 +815,7 @@ pub fn csv(records: &[FrameRecord]) -> String {
         let _ = writeln!(
             out,
             "{i},{:.3},{:.4},{},{},{:.2},{:.2},{:.2},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},\
-             {:.4},{},{},{},{},{},{},{}",
+             {:.4},{},{},{},{},{},{},{},{:.4}",
             ms(r.t),
             ms(r.frame_time),
             u8::from(r.presented),
@@ -835,6 +853,7 @@ pub fn csv(records: &[FrameRecord]) -> String {
             r.search
                 .map_or_else(String::new, |d| format!("{:.4}", ms(d))),
             u8::from(r.unculled),
+            ms(r.occlusion),
         );
     }
     out
@@ -1147,6 +1166,9 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
         ("search_avg_ms", Json::ms(c.search_avg)),
         ("search_p99_ms", Json::ms(c.search_p99)),
         ("search_max_ms", Json::ms(c.search_max)),
+        ("bits_avg_ms", Json::ms(c.bits_avg)),
+        ("bits_p99_ms", Json::ms(c.bits_p99)),
+        ("bits_max_ms", Json::ms(c.bits_max)),
     ]);
     let p = &s.pacing;
     let pacing = Json::Obj(vec![
@@ -1414,12 +1436,16 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
         out,
         "\nSearches: {} frames, {:.3} ms on average, p99 {:.3} ms, max {:.3} ms. Frames that \
          culled nothing because the eye saw through rock (inside it, or nearer a wall than the \
-         near plane): {}.\n",
+         near plane): {}. The renderer's bits per slot (not in the search time): {:.3} ms on \
+         average, p99 {:.3} ms, max {:.3} ms.\n",
         c.searches,
         ms(c.search_avg),
         ms(c.search_p99),
         ms(c.search_max),
         c.unculled,
+        ms(c.bits_avg),
+        ms(c.bits_p99),
+        ms(c.bits_max),
     );
 
     if let Some(e) = &info.edits {
@@ -1901,7 +1927,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), records.len() + 1);
         let columns = CSV_HEADER.split(',').count();
-        assert_eq!(columns, 36);
+        assert_eq!(columns, 37);
         assert!(lines.iter().all(|l| l.split(',').count() == columns));
         assert!(
             lines[501].starts_with("500,1000.000,10.0000,0,1,"),

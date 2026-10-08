@@ -20,6 +20,7 @@ use boxel_voxel::{CHUNK_SHIFT, ChunkPos, ModelBox};
 use boxel_world::VisibleSet;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt as _;
 
 /// Upper bound of chunk slots (keeps the allocator node table and the GPU table bounded).
@@ -131,6 +132,11 @@ pub struct RenderStats {
     /// world's visibility search did not reach them, because they are behind closed rock or
     /// outside the frustum. 0 without a visible set ([`VoxelRenderer::set_visibility`]).
     pub occluded_chunks: u32,
+    /// Time the last frame spent bringing the cave culling bits up to date (the
+    /// `render.occlusion` span): a walk of the whole chunk table after a new visible set, a
+    /// cleared table or a moved GPU window, else only the slots that changed. Not part of the
+    /// world's search time (`boxel_world::VisibilityStats::last_search`).
+    pub occlusion_time: Duration,
     /// Translucent buckets re-sorted for the camera and uploaded (cumulative, see
     /// [`TranslucentSort`]).
     pub translucent_sorts: u32,
@@ -792,12 +798,14 @@ impl VoxelRenderer {
         };
         queue.write_buffer(&self.view_buffer, 0, bytemuck::bytes_of(&uniform));
         // Without the set this frame, the bits stay as they are (High keeps the uploaded ones).
+        let refresh_start = Instant::now();
         let visibility = if culled || self.occlusion.set.is_none() {
             let _span = frame_span!("render.occlusion");
             self.occlusion.refresh(&mut self.chunks)
         } else {
             None
         };
+        self.stats.occlusion_time = refresh_start.elapsed();
         let used = visibility.is_some();
         let visible = self.path.prepare(queue, &self.chunks, view, visibility);
         let hidden = if used { self.occlusion.hidden } else { 0 };

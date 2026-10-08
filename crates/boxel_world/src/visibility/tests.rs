@@ -444,8 +444,11 @@ fn opened_links_search_at_once_and_closed_ones_wait() {
     );
     let mut vis = ChunkVisibility::default();
     let now = Instant::now();
-    // Closed rock, with an open chunk between the camera and the wall.
+    // Closed rock, with an open chunk between the camera and the wall, and one behind the
+    // camera that it never reaches.
     world.insert(ChunkPos::new(0, 0, -1), ALL_LINKS);
+    let unseen = ChunkPos::new(3, 1, 3);
+    world.insert(unseen, 0b101);
     let lookup =
         |w: &std::collections::HashMap<ChunkPos, u16>, p: ChunkPos| w.get(&p).copied().unwrap_or(0);
     vis.update_at(&view, |p| lookup(&world, p), now);
@@ -459,6 +462,13 @@ fn opened_links_search_at_once_and_closed_ones_wait() {
     let set = vis.update_at(&view, |p| lookup(&world, p), now);
     assert_eq!(vis.stats().searches, searches + 1);
     assert!(set.is_visible(behind));
+    // A link closes out of sight: searched after the delay, the same chunks, so the same set.
+    world.insert(unseen, 0);
+    vis.apply_changes_at(&[(unseen, 0)], now);
+    let same = vis.update_at(&view, |p| lookup(&world, p), now + TIGHTEN_DELAY);
+    assert_eq!(vis.stats().searches, searches + 2);
+    assert!(Arc::ptr_eq(&same, &set));
+    let searches = searches + 1;
     // It closes again: the open set is kept until the delay passes.
     world.insert(wall, 0);
     vis.apply_changes_at(&[(wall, 0)], now);

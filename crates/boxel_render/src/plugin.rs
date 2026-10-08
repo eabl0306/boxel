@@ -213,6 +213,8 @@ pub struct RenderInfo {
     pub visible_chunks: u32,
     /// Resident chunks cave culling hid last frame (`RenderStats::occluded_chunks`).
     pub occluded_chunks: u32,
+    /// Time last frame took to update the cave culling bits (`RenderStats::occlusion_time`).
+    pub occlusion_time: Duration,
     /// Translucent buckets re-sorted for the camera and uploaded since the renderer was built
     /// (`RenderStats::translucent_sorts`).
     pub translucent_sorts: u32,
@@ -1707,6 +1709,7 @@ fn cleanup(
             info.draws = stats.draws;
             info.visible_chunks = stats.visible_chunks;
             info.occluded_chunks = stats.occluded_chunks;
+            info.occlusion_time = stats.occlusion_time;
             info.translucent_sorts = stats.translucent_sorts;
             info.dropped_chunks = stats.dropped_chunks;
             info.arena_used_quads = stats.arena_used_quads;
