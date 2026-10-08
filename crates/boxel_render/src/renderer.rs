@@ -769,8 +769,8 @@ impl VoxelRenderer {
         let slot_count = self.chunks.slot_count();
         // Cave culling, unless this frame's set reached a chunk whose upload was just refused:
         // the set trusted its links, but the renderer does not show it as the world has it.
-        let culled =
-            self.occlusion.set.is_some() && !self.refused.take_fresh(self.occlusion.set.as_deref());
+        let reached_refused = self.refused.take_fresh(self.occlusion.set.as_deref());
+        let culled = self.occlusion.set.is_some() && !reached_refused;
         let (sky_light, light_params, light_curve) = view.light.uniform();
         let uniform = ViewUniform {
             view_proj: view.view_proj.to_cols_array_2d(),

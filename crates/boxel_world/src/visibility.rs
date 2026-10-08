@@ -655,9 +655,8 @@ impl ChunkVisibility {
     /// the eye less than [`MOVE_SLACK`] from where it was searched without turning, no link
     /// opened, no closed link older than [`TIGHTEN_DELAY`]), else a new search. A search that
     /// finds the same chunks returns the same `Arc` (the renderer rebuilds its bits only for a
-    /// new one, [`Arc::ptr_eq`]). `links` gives
-    /// the links of a position the grid does not hold yet (the map's
-    /// [`ChunkMap::visibility_links_at`](crate::ChunkMap)).
+    /// new one, [`Arc::ptr_eq`]). `links` gives the links of a position the grid does not hold
+    /// yet (the map's [`ChunkMap::visibility_links_at`](crate::ChunkMap)).
     pub fn update(
         &mut self,
         view: &VisibilityView,
