@@ -6,6 +6,7 @@
 //! | Bench | Target |
 //! |---|---|
 //! | `sweep/player_walk`, `sweep/player_land`, `sweep/player_fall` | <= 0.3 us |
+//! | `sweep/step_wall`, `sweep/step_wall_slide` and their `_tried` | no target (the step-up skip) |
 //! | `raycast/pick_6` | <= 0.5 us |
 //! | `raycast/cave_256` | <= 5 us |
 //! | `raycast/sky_1024` | <= 10 us |
@@ -31,6 +32,9 @@
 //! (`PhysicsSettings::parallel_threshold` off, as the targets are), with that many bodies: 70 %
 //! walking characters that turn around every 64 steps (some jump then), 30 % items dropped from
 //! up to 20 blocks (they come to rest and fall asleep), all `Interpolated` as in the examples.
+//! `sweep/step_wall` is one step of a walker (step height 0.6) pushing into a wall one block high
+//! on a small test world, `step_wall_slide` the same sliding along it diagonally, and the
+//! `_tried` variants always try the lifted moves (without the early skip of the step-up).
 //! A `frame` is one run of
 //! `RunFixedMainLoop` in a frame without a fixed step (144 fps): the interpolation of the 1000
 //! bodies and the schedule's executor, on the single-threaded executor `PhysicsPlugin` sets and

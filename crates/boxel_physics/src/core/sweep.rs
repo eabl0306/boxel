@@ -196,6 +196,7 @@ impl StepUp {
     clippy::too_many_arguments,
     reason = "move_box's arguments and the step-up"
 )]
+#[inline(always)]
 pub fn move_box_stepping<S: VoxelSource + ?Sized>(
     src: &mut S,
     table: &CollisionTable,
@@ -894,10 +895,13 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
                 let mut tall = shape;
                 tall.min.y -= margin;
                 tall.max.y += height + margin;
-                if !matches!(
-                    self.clip_axis(axis, at, tall, d[axis], obstacles),
-                    Ok(Clip::Free)
-                ) {
+                // A sweep along this axis alone (it clips that axis only).
+                let mut along = DVec3::ZERO;
+                along[axis] = d[axis];
+                if !self
+                    .sweep(at, tall, along, obstacles)
+                    .is_ok_and(|m| m.faces & ACROSS == 0)
+                {
                     return false;
                 }
             }
