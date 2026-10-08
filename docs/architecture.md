@@ -744,8 +744,10 @@ Sistemas en `Update`, encadenados (`WorldSystems`):
    un slot (`set_data` y `remove`), así ningún camino del streaming se olvida de avisar.
 5. **Visibility:** pasa a `ChunkVisibility` los cambios del frame en los enlaces de caras de los
    chunks (ADR 0022). Un chunk aporta sus enlaces (calculados por su job de generación, o por su
-   job de malla después de una edición) solo con la malla asentada; si no, cuenta como abierto.
-   La búsqueda la pide el render en su `Extract`, con su cámara.
+   job de malla después de una edición) solo si el render lo muestra como es: su malla publicada
+   se hizo con sus bloques y los bordes de sus vecinos de ahora. Un chunk con bloques que no se
+   muestra así se ve a través (la búsqueda ve todo lo que hay detrás); uno sin datos cuenta como
+   abierto. La búsqueda la pide el render en su `Extract`, con su cámara.
 
 Con `BlockTicksPlugin` (lo agrega `FluidPlugin`, ADR 0021), entre Interest y Edits corren los
 ticks programados que vencieron, en orden y con un presupuesto de 1 ms. Sus escrituras entran al
@@ -964,9 +966,9 @@ sobre su rango del arena (ADR 0018, sección 3).
 Ocultación de cuevas (ADR 0022, los tres tiers): en su `Extract`, el render busca desde su cámara
 qué chunks se ven a través de espacio abierto (BFS por enlaces de caras, como Minecraft y Sodium)
 y el renderer lo pasa a un bit por slot: High lo lee en `cull_chunks`, Mid y Low en el culling en
-CPU, y los tres en la lista translúcida. Bajo tierra oculta de 38 a 96 % de las caras; desde la
-superficie solo de 15 a 45 % (los enlaces de chunks de 32³ dejan pasar la superficie hacia las
-cuevas).
+CPU, y los tres en la lista translúcida. Con el ojo en una cueva oculta de 44 a 77 % de las caras;
+desde la superficie solo de 15 a 45 % de las subterráneas (los enlaces de chunks de 32³ dejan
+pasar la superficie hacia las cuevas). Con el ojo dentro de la roca no oculta nada.
 
 Hi-Z (oclusión en dos fases) queda para M2. Notas para entonces: con reverse-Z la pirámide usa
 reducción **MIN** (lo lejano es 0); `Depth32Float` se lee como textura de profundidad (no

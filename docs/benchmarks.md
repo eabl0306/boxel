@@ -88,8 +88,20 @@ CPU, draws, y cuántos frames buscaron y cuánto tardaron. `tools/bench_report.p
 corridas por esta opción (así una rama con culling se compara con las corridas de main), pero avisa
 si difiere y compara esos números.
 
+**Bajo tierra, la ocultación de cuevas se mide con la cámara en una cueva (`--cave`).** La cámara
+de `stress` no choca: con el ojo dentro de la roca el render ve a través de ella y el culling no
+oculta nada (una cámara como `16,-1000,16` está en la piedra). `--cave` (solo en el overworld)
+mueve el inicio al vóxel de aire más cercano a `--camera` con 2 vóxeles de aire alrededor, 16 o
+más bajo la superficie y un camino de 64 vóxeles o más así. Es determinista. El escenario `path`
+(`just bench-path`) sigue ese camino ida y vuelta a `--speed` mirando hacia adelante, sin salir del
+espacio abierto; `fly` y `dive` atraviesan la roca y `--cave` no los acepta. El resumen anota la
+cámara y la cueva (el título termina en `cave`) y avisa si en más de 1 % de los frames el ojo
+estuvo en la roca. Ejemplo:
+`just bench-path --world overworld --cave --camera 656,-1000,16,-90,0 --speed 8`.
+
 Para contar draws y caras con y sin ocultación de cuevas, sin GPU ni ventana y sin ruido:
-`headless_world --world overworld --view-distance 16 --hz 0 --cull --camera X,Y,Z,YAW,PITCH`.
+`headless_world --world overworld --view-distance 16 --hz 0 --cull --camera X,Y,Z,YAW,PITCH`
+(con `--cave` bajo tierra: la línea `cull:` debe decir `open=yes`).
 El costo de la búsqueda y de los enlaces de caras está en
 `cargo bench -p boxel_world --bench cave_culling`.
 
@@ -114,6 +126,7 @@ Para que los números sirvan:
 | `fly` | vuela recto a velocidad fija | los tirones mientras entran chunks nuevos |
 | `dive` | baja en línea recta a velocidad fija | los tirones al entrar capas nuevas por debajo |
 | `spin` | gira 360 grados en su lugar | el costo de que cambie lo que se ve, sin chunks nuevos |
+| `path` | con `--cave`, recorre una cueva ida y vuelta mirando hacia adelante | la ocultación de cuevas mientras se camina bajo tierra |
 
 Todos esperan a que el mundo termine de cargar, corren `--warmup` segundos sin medir y después
 miden `--duration` segundos.
@@ -163,7 +176,8 @@ just bench-report --compare carpeta-antes/ carpeta-despues/
 pero igual dice si empeoró (por ejemplo, tirones nuevos). Si las corridas tienen otra
 configuración (radio, GPU, velocidad), lo avisa. Con dos carpetas empareja las corridas del mismo
 mundo, luz (`--light`), texturas (`--pack`), escenario, radio, radio vertical, velocidad, límite de fps, vsync, cuerpos
-(`--bodies`), ediciones (`--edits`), backend, tier y GPU. Una hora distinta (`--time`) solo se anota.
+(`--bodies`), ediciones (`--edits`), cueva (`--cave`), backend, tier y GPU. Una hora (`--time`) o
+una cámara distinta solo se anota.
 Si las corridas tienen los datos de ritmo (Pacing), también los compara.
 
 Flujo sugerido: `just bench-all` antes del cambio, mover `bench-results/` a otra carpeta,

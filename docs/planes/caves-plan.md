@@ -162,11 +162,12 @@ Read-only review. I read the code on master and on `perf/border-opt`. Repo root:
 **Status (2026-10-08): done, see ADR 0022 and `docs/rendimiento/cuevas-fase4-2026-10.md`.**
 Differences from this plan: the search runs in the render extract with the frame's own camera
 (not in `WorldSystems::Visibility`, which now only feeds it the link changes), and reuses its
-result while the eye moves less than 4 voxels without turning; the links count only once the
-chunk's mesh is settled; on High the bits share the draw-count buffer (4 storage buffers);
-`opaque_faces` and `all_opaque` are computed but `is_enclosed_opaque` is not generalized yet.
-Underground it hides 38-96 % of the faces (62 % on average) and the 780M fly 64 has no frame over
-6.94 ms. **The gate fails:** from the surface at radius 16 it hides only 15-45 % of the
+result while the eye moves less than 4 voxels without turning; the links count only while the
+renderer shows the chunk as its blocks are (a chunk with data and no published mesh, or with a
+mesh built from other blocks, is seen through); nothing is culled with the eye in rock; on High
+the bits share the draw-count buffer (4 storage buffers); `opaque_faces` and `all_opaque` are
+computed but `is_enclosed_opaque` is not generalized yet. With the eye in a cave (`--cave`) it
+hides 44-77 % of the faces at radius 16 (61 % on average). **The gate fails:** from the surface at radius 16 it hides only 15-45 % of the
 underground faces (the 32³ leak), so phase 5 should add 16³ sub-cells or Hi-Z.
 - In `boxel_voxel`:
   - `ChunkFaceInfo { links: u16, opaque_faces: u8, all_opaque: bool }`.
