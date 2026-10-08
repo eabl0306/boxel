@@ -75,10 +75,10 @@ impl FrameLimit {
     }
 }
 
-/// The pacing of the current frame, for systems that size their work to the time left before
-/// the next one (`boxel_world` grows its per-frame budgets into the idle part of a capped
-/// frame). Both runners write it right before each update. Without a limit (or a runner that
-/// paces) `next` is `None`, and such systems keep their fixed budgets.
+/// The pacing of the current frame, for diagnostics (overlays, benchmarks): when the next frame
+/// is due and how long the previous update took. Both runners write it right before each update.
+/// Without a limit (or a runner that paces) `next` is `None`. No engine system reads it: sizing
+/// per-frame work to the time left at 144 Hz did not help the world catch up (issue #3).
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FrameDeadline {
     /// When the next frame is due (`None`: unlimited, or no pacing runner).

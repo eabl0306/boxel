@@ -60,7 +60,6 @@ macro_rules! frame_span {
 #[cfg(not(feature = "trace"))]
 pub(crate) struct NoSpan;
 
-mod budget;
 mod daylight;
 pub mod fluid;
 mod interest;

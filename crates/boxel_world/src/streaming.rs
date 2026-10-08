@@ -772,7 +772,7 @@ impl WorldJobs {
     }
 
     /// Plans the work of a viewer or settings change, then applies interest work within
-    /// `budget` (`settings.interest_budget`, or more in a capped frame with time to spare).
+    /// `budget` (the systems pass `settings.interest_budget`).
     pub(crate) fn update_interest(
         &mut self,
         cx: &mut Ctx<'_>,
@@ -1853,10 +1853,9 @@ impl WorldJobs {
     }
 
     /// The job step of a frame: collects finished jobs (freeing their in-flight slots) and starts
-    /// queued ones, again and again while results keep arriving, within `budget`
-    /// (`settings.job_budget`, or more in a capped frame with time to spare). Collecting first
-    /// means a slot freed by a job that finished since the last frame is reused in this frame,
-    /// not the next one.
+    /// queued ones, again and again while results keep arriving, within `budget` (the systems
+    /// pass `settings.job_budget`). Collecting first means a slot freed by a job that finished
+    /// since the last frame is reused in this frame, not the next one.
     pub(crate) fn run_jobs(&mut self, cx: &mut Ctx<'_>, budget: Duration) {
         let start = Instant::now();
         loop {

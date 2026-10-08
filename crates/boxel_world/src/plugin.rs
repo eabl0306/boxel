@@ -1,4 +1,3 @@
-use crate::budget::FrameBudget;
 use crate::interest::Viewer;
 use crate::jobs::{JobExecutor, TaskPoolExecutor};
 use crate::map::DataChange;
@@ -6,7 +5,7 @@ use crate::neighbor_rules::NeighborRules;
 use crate::sky::{SkyMap, SkyRule};
 use crate::streaming::{Ctx, ViewerChunks, WorldJobs};
 use crate::{ChunkId, ChunkMap, WorldStats};
-use boxel_app::{App, FrameDeadline, Last, Plugin, Update};
+use boxel_app::{App, Last, Plugin, Update};
 use boxel_diagnostic::DiagnosticsBoard;
 use boxel_ecs::prelude::*;
 use boxel_light::sky_tile::DEFAULT_WALK_LIMIT;
@@ -80,18 +79,9 @@ pub struct WorldSettings {
     /// chunk slots, and refreshing queued job priorities. A big change (a jump, a new viewer, a
     /// larger radius) is spread over several frames, nearest chunks first. At least 64 positions
     /// are processed per frame whatever the budget.
-    ///
-    /// Under a frame cap (the runner publishes a [`FrameDeadline`]) both budgets grow into the
-    /// idle part of the frame: the steps may run until half a period (at least 1.5 ms) before
-    /// the next frame minus the rest of the update, measured over the previous updates, in the
-    /// ratio of the two budgets. At 144 Hz that leaves little room (measured: no faster catch-up,
-    /// `docs/rendimiento/ritmo-2026-10.md`); it helps at lower limits. They never shrink below these values, a zero budget stays zero, and
-    /// without a deadline (unlimited) they are exactly these values. The world's results do not
-    /// depend on the budgets, only how many frames they take.
     pub interest_budget: Duration,
     /// Main-thread time per frame for collecting finished jobs and starting new ones (repeated
-    /// while results keep arriving). Grows under a frame cap like
-    /// [`WorldSettings::interest_budget`].
+    /// while results keep arriving).
     pub job_budget: Duration,
     /// Max `ChunkMeshEvent`s published per frame (upload smoothing).
     pub max_mesh_events_per_frame: usize,
@@ -389,7 +379,6 @@ impl Plugin for WorldPlugin {
             .init_resource::<EditQueue>()
             .init_resource::<WorldStats>()
             .init_resource::<ViewerChunks>()
-            .init_resource::<FrameBudget>()
             .insert_resource(jobs)
             .add_message::<ChunkMeshEvent>()
             .add_message::<BlockChanged>()
@@ -410,11 +399,7 @@ impl Plugin for WorldPlugin {
                     // Reads viewer transforms only (into a private resource). Its order relative
                     // to systems that move viewers does not matter (interest lags at most one
                     // frame), and naming them would tie this crate to camera/gameplay crates.
-                    (
-                        begin_frame_budget,
-                        track_viewers.ambiguous_with_all(),
-                        update_interest,
-                    )
+                    (track_viewers.ambiguous_with_all(), update_interest)
                         .chain()
                         .in_set(WorldSystems::Interest),
                     apply_edits.in_set(WorldSystems::Edits),
@@ -460,17 +445,10 @@ fn track_viewers(
     }
 }
 
-/// Starts the frame's world budgets from the runner's [`FrameDeadline`] (see
-/// [`WorldSettings::interest_budget`]).
-fn begin_frame_budget(deadline: Option<Res<FrameDeadline>>, mut budget: ResMut<FrameBudget>) {
-    budget.begin(deadline.as_deref());
-}
-
 fn update_interest(
     mut map: ResMut<ChunkMap>,
     mut sky: ResMut<SkyMap>,
     mut jobs: ResMut<WorldJobs>,
-    mut budget: ResMut<FrameBudget>,
     content: Res<WorldContent>,
     settings: Res<WorldSettings>,
     viewers: Res<ViewerChunks>,
@@ -480,15 +458,10 @@ fn update_interest(
     if !jobs.interest_pending(&viewers.0, &settings) {
         return;
     }
-    let clock = budget.clock();
-    let step = clock.map_or(settings.interest_budget, |now| {
-        budget.interest(&settings, now)
-    });
     let mut events = Vec::new();
     let mut cx = Ctx::new(&mut map, &mut sky, &content, &mut events);
-    jobs.update_interest(&mut cx, &settings, &viewers.0, step);
+    jobs.update_interest(&mut cx, &settings, &viewers.0, settings.interest_budget);
     writer.write_batch(events);
-    budget.spend(clock);
 }
 
 #[expect(
@@ -536,7 +509,6 @@ fn run_jobs(
     mut map: ResMut<ChunkMap>,
     mut sky: ResMut<SkyMap>,
     mut jobs: ResMut<WorldJobs>,
-    mut budget: ResMut<FrameBudget>,
     content: Res<WorldContent>,
     settings: Res<WorldSettings>,
     mut writer: MessageWriter<ChunkMeshEvent>,
@@ -546,13 +518,10 @@ fn run_jobs(
     if !jobs.has_job_work() {
         return;
     }
-    let clock = budget.clock();
-    let step = clock.map_or(settings.job_budget, |now| budget.jobs(&settings, now));
     let mut events = Vec::new();
     let mut cx = Ctx::new(&mut map, &mut sky, &content, &mut events);
-    jobs.run_jobs(&mut cx, step);
+    jobs.run_jobs(&mut cx, settings.job_budget);
     writer.write_batch(events);
-    budget.spend(clock);
 }
 
 fn publish_meshes(
