@@ -18,6 +18,7 @@ use boxel_shaders::gpu::{
 };
 use boxel_voxel::{CHUNK_SHIFT, ChunkPos, ModelBox};
 use boxel_world::VisibleSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use wgpu::util::DeviceExt as _;
 
@@ -185,6 +186,60 @@ pub struct VoxelRenderer {
     warned_list_overflow: bool,
     /// Cave culling: the visible set of the frame and its bits per slot.
     occlusion: Occlusion,
+    /// Chunks whose last upload was refused (cave culling must see through them).
+    refused: Refused,
+}
+
+/// The chunks whose last upload [`VoxelRenderer::upsert_chunk`] refused (chunk table or arena
+/// full). The world takes them for drawn with that mesh, but the renderer shows an older mesh or
+/// nothing there, and where their faces are missing the rock around them shows what lies behind
+/// it: cave culling must see through them (ADR 0022). Their changes go to the world
+/// ([`VoxelRenderer::take_refused`]); until the world searched with them, a frame whose visible
+/// set reached one is drawn without the set.
+#[derive(Debug, Default)]
+struct Refused {
+    /// Refused chunks by id, with their position.
+    by_id: HashMap<u64, ChunkPos>,
+    /// Changes for [`VoxelRenderer::take_refused`], in order: `true` refused, `false` shown as
+    /// the world has it again (or removed).
+    changes: Vec<(ChunkPos, bool)>,
+    /// Positions refused since the last [`VoxelRenderer::render`].
+    fresh: Vec<ChunkPos>,
+}
+
+impl Refused {
+    /// The upload of chunk `id` at `pos` was refused.
+    fn refuse(&mut self, id: u64, pos: ChunkPos) {
+        if self.by_id.insert(id, pos).is_none() {
+            self.changes.push((pos, true));
+            self.fresh.push(pos);
+        }
+    }
+
+    /// Chunk `id` shows what the world sent last: a mesh was uploaded, or it was removed.
+    fn shown(&mut self, id: u64) {
+        if let Some(pos) = self.by_id.remove(&id) {
+            self.changes.push((pos, false));
+        }
+    }
+
+    /// Every chunk was removed.
+    fn clear(&mut self) {
+        self.changes
+            .extend(self.by_id.drain().map(|(_, pos)| (pos, false)));
+    }
+
+    /// True if `set` reached a chunk refused since the last call: it may hide what shows
+    /// through that chunk. Forgets them.
+    fn take_fresh(&mut self, set: Option<&VisibleSet>) -> bool {
+        let reached = set.is_some_and(|set| {
+            self.fresh
+                .iter()
+                .any(|&pos| set.covers(pos) && set.is_visible(pos))
+        });
+        self.fresh.clear();
+        reached
+    }
 }
 
 /// The cave culling input of the renderer (ADR 0022): the world's visible set and one bit per
@@ -480,6 +535,7 @@ impl VoxelRenderer {
             cap_cutout,
             warned_list_overflow: false,
             occlusion: Occlusion::default(),
+            refused: Refused::default(),
         })
     }
 
@@ -487,10 +543,23 @@ impl VoxelRenderer {
     /// [`VoxelRenderer::render`] on, every tier skips a resident chunk whose position the set
     /// does not hold as visible (a chunk outside the set's box is visible). `None` (the default)
     /// draws every chunk the frustum passes. The set must come from a search for the camera of
-    /// the frames it is used in ([`boxel_world::ChunkVisibility::update`]): a stale set can hide
-    /// a chunk that became visible.
+    /// the frames it is used in ([`boxel_world::ChunkVisibility::update`]), told about the
+    /// chunks this renderer refused ([`VoxelRenderer::take_refused`]): a stale set can hide a
+    /// chunk that became visible. A `render` after an upload was refused, whose set reached
+    /// that chunk, draws without the set.
     pub fn set_visibility(&mut self, set: Option<Arc<VisibleSet>>) {
         self.occlusion.set(set);
+    }
+
+    /// Calls `f` with every change since the last call, in order, of the chunks whose last
+    /// upload was refused ([`RendererError::ChunkTableFull`] or [`RendererError::ArenaFull`]):
+    /// `(position, true)` when refused, `(position, false)` when the chunk shows what was sent
+    /// last again (a later upload, a removal, [`VoxelRenderer::clear_chunks`]). Cave culling
+    /// sees through a refused chunk ([`boxel_world::ChunkVisibility::set_unshown`]).
+    pub fn take_refused(&mut self, mut f: impl FnMut(ChunkPos, bool)) {
+        for (pos, refused) in self.refused.changes.drain(..) {
+            f(pos, refused);
+        }
     }
 
     /// Sets the model box table the `SHAPE_BOX` quads of the meshes index (ADR 0020):
@@ -556,8 +625,10 @@ impl VoxelRenderer {
             self.remove_chunk(id);
             return Ok(());
         }
+        let pos = ChunkPos::from_i64vec3(origin >> CHUNK_SHIFT);
         if self.chunks.slot_for(id).is_none() {
             self.stats.dropped_chunks += 1;
+            self.refused.refuse(id, pos);
             return Err(RendererError::ChunkTableFull(self.chunks.capacity()));
         }
         debug_assert!(
@@ -573,6 +644,7 @@ impl VoxelRenderer {
         let Some(alloc) = self.arena.alloc.replace(old, needed) else {
             // Nothing changed: a resident chunk keeps its old mesh (range and slot untouched).
             self.stats.dropped_chunks += 1;
+            self.refused.refuse(id, pos);
             return Err(RendererError::ArenaFull { needed });
         };
         let record = ChunkRecord {
@@ -587,14 +659,17 @@ impl VoxelRenderer {
             // unreachable: `slot_for` succeeded above, so this is a new chunk (no old range)
             self.arena.alloc.free(alloc);
             self.stats.dropped_chunks += 1;
+            self.refused.refuse(id, pos);
             return Err(RendererError::ChunkTableFull(self.chunks.capacity()));
         }
+        self.refused.shown(id);
         self.sorter.upsert(id, origin, Arc::clone(&mesh));
         self.uploads.mesh(id, alloc.offset, mesh);
         Ok(())
     }
     /// Removes a chunk; returns false if unknown. Reaches the GPU with the next `render`.
     pub fn remove_chunk(&mut self, id: u64) -> bool {
+        self.refused.shown(id);
         let Some((_, record)) = self.chunks.remove(id) else {
             return false;
         };
@@ -605,6 +680,7 @@ impl VoxelRenderer {
     }
     /// Removes every chunk. Reaches the GPU with the next `render`.
     pub fn clear_chunks(&mut self) {
+        self.refused.clear();
         self.chunks.clear();
         self.arena.alloc.reset();
         self.uploads.clear();
@@ -685,6 +761,10 @@ impl VoxelRenderer {
         }
         debug_assert!(self.chunks.is_synced());
         let slot_count = self.chunks.slot_count();
+        // Cave culling, unless this frame's set reached a chunk whose upload was just refused:
+        // the set trusted its links, but the renderer does not show it as the world has it.
+        let culled =
+            self.occlusion.set.is_some() && !self.refused.take_fresh(self.occlusion.set.as_deref());
         let (sky_light, light_params, light_curve) = view.light.uniform();
         let uniform = ViewUniform {
             view_proj: view.view_proj.to_cols_array_2d(),
@@ -698,7 +778,7 @@ impl VoxelRenderer {
                 slot_count,
                 self.cap_opaque,
                 self.cap_cutout,
-                u32::from(self.occlusion.set.is_some()),
+                u32::from(culled),
             ],
             sky_light,
             light_params,
@@ -711,11 +791,16 @@ impl VoxelRenderer {
             ],
         };
         queue.write_buffer(&self.view_buffer, 0, bytemuck::bytes_of(&uniform));
-        let visibility = {
+        // Without the set this frame, the bits stay as they are (High keeps the uploaded ones).
+        let visibility = if culled || self.occlusion.set.is_none() {
             let _span = frame_span!("render.occlusion");
             self.occlusion.refresh(&mut self.chunks)
+        } else {
+            None
         };
+        let used = visibility.is_some();
         let visible = self.path.prepare(queue, &self.chunks, view, visibility);
+        let hidden = if used { self.occlusion.hidden } else { 0 };
         self.path.encode_compute(encoder, slot_count);
         let draws = {
             let mut pass = self.targets.begin_main_pass(encoder, view.clear_color);
@@ -725,12 +810,11 @@ impl VoxelRenderer {
         };
         self.stats.visible_chunks = visible;
         self.stats.draws = draws;
-        self.stats.occluded_chunks = self.occlusion.hidden;
+        self.stats.occluded_chunks = hidden;
         // Only chunks inside the window take draws: the old area still resident after a
         // teleport does not count (it would warn falsely, and only once), nor do the chunks cave
         // culling hides.
-        let drawable =
-            (self.chunks.drawable_len() as u64).saturating_sub(u64::from(self.occlusion.hidden));
+        let drawable = (self.chunks.drawable_len() as u64).saturating_sub(u64::from(hidden));
         if self.tier == Tier::High
             && 6 * drawable > u64::from(self.cap_opaque)
             && !self.warned_list_overflow
@@ -936,6 +1020,53 @@ mod tests {
         occlusion.set(None);
         assert!(occlusion.refresh(&mut table).is_none());
         assert_eq!(occlusion.hidden, 0);
+    }
+
+    #[test]
+    fn refused_uploads_are_reported_once_and_released() {
+        use boxel_math::I64Vec3;
+        use boxel_world::VisibilityView;
+        use boxel_world::visibility::visible_chunks;
+        let (a, b) = (ChunkPos::new(0, 0, -1), ChunkPos::new(9, 0, 0));
+        let mut refused = Refused::default();
+        let take = |r: &mut Refused| std::mem::take(&mut r.changes);
+        refused.refuse(1, a);
+        refused.refuse(1, a);
+        refused.refuse(2, b);
+        assert_eq!(take(&mut refused), [(a, true), (b, true)]);
+        // A closed world seen from chunk (0, 0, 0): its neighbor `a` is reached, `b` is outside
+        // the box (never searched).
+        let view = VisibilityView::new(I64Vec3::new(16, 16, 16), None, 3, 3);
+        let set = visible_chunks(&view, |_| 0);
+        assert!(refused.take_fresh(Some(&set)));
+        assert!(!refused.take_fresh(Some(&set)), "only once");
+        refused.refuse(3, ChunkPos::new(0, 0, -2));
+        assert!(
+            !refused.take_fresh(Some(&set)),
+            "not reached: its links were not used"
+        );
+        refused.refuse(4, b);
+        assert!(!refused.take_fresh(Some(&set)), "outside the box");
+        refused.refuse(5, ChunkPos::new(1, 0, 0));
+        assert!(!refused.take_fresh(None));
+        // Shown again by an upload or a removal; unknown ids change nothing.
+        refused.shown(1);
+        refused.shown(1);
+        refused.shown(7);
+        assert_eq!(take(&mut refused)[3..], [(a, false)]);
+        refused.clear();
+        let mut released = take(&mut refused);
+        released.sort_by_key(|(p, _)| (p.x, p.y, p.z));
+        assert_eq!(
+            released,
+            [
+                (ChunkPos::new(0, 0, -2), false),
+                (ChunkPos::new(1, 0, 0), false),
+                (b, false),
+                (b, false),
+            ]
+        );
+        assert!(refused.by_id.is_empty());
     }
 
     #[test]

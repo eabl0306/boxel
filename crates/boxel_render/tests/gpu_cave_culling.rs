@@ -33,8 +33,8 @@ use boxel_voxel::{
     ALL_LINKS, BlockPos, BlockRegistry, BlockState, CHUNK_SHIFT, ChunkData, ChunkFaceInfo,
     ChunkKey, ChunkPos, LocalPos, NEIGHBOR_OFFSETS,
 };
-use boxel_world::VisibilityView;
 use boxel_world::visibility::{eye_in_open, visible_chunks};
+use boxel_world::{ChunkVisibility, VisibilityView};
 use boxel_worldgen::{OverworldGenerator, WorldGenerator};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -676,6 +676,205 @@ fn cave_culling_changes_no_pixel() {
                         ));
                     }
                 }
+            }
+        }
+    }
+    assert!(
+        report.failures.is_empty(),
+        "{} failures:\n{}",
+        report.failures.len(),
+        report.failures.join("\n")
+    );
+    assert!(
+        rendered > 0 || !gpu_tests_required(),
+        "BOXEL_REQUIRE_GPU=1 but no tier could render"
+    );
+}
+
+// ---------------------------------------------------------------- refused uploads
+
+/// Per view, with two chunks ahead of the eye refused by a full chunk table: the image without
+/// culling, the one drawn right after the refusal with a set that trusts their links, the one
+/// with the set of a world told about them, and those with a set that trusts their links or
+/// only opens them (to show what goes wrong without the fix).
+struct RefusedImages {
+    plain: RgbaImage,
+    first: RgbaImage,
+    told: RgbaImage,
+    trusted: RgbaImage,
+    opened: RgbaImage,
+}
+
+/// Two chunks with meshes ahead of the eye of `view` along its main axis.
+fn refused_chunks(scene: &Scene, view: &View) -> Vec<ChunkPos> {
+    let (_, cv) = view_params(view, I64Vec3::ZERO);
+    let eye = ChunkPos::from_i64vec3(cv.render_origin >> CHUNK_SHIFT);
+    let f = cv.forward;
+    let axis = if f.x.abs() >= f.y.abs() && f.x.abs() >= f.z.abs() {
+        I64Vec3::new(f.x.signum() as i64, 0, 0)
+    } else if f.y.abs() >= f.z.abs() {
+        I64Vec3::new(0, f.y.signum() as i64, 0)
+    } else {
+        I64Vec3::new(0, 0, f.z.signum() as i64)
+    };
+    (1..=6)
+        .map(|k| ChunkPos::from_i64vec3(eye.as_i64vec3() + axis * k))
+        .filter(|p| scene.meshes.iter().any(|(m, _)| m == p))
+        .take(2)
+        .collect()
+}
+
+fn render_refused(
+    adapter: &wgpu::Adapter,
+    caps: &AdapterCaps,
+    tier: Tier,
+    scene: &Scene,
+    views: &[(&View, Vec<ChunkPos>)],
+) -> Result<Vec<RefusedImages>, String> {
+    let (device, queue, errors) = device_for(adapter, caps, tier)?;
+    let config = RendererConfig {
+        arena_quads: 1 << 21,
+        max_chunk_slots: scene.meshes.len() as u32 - 2,
+        translucent_sort: TranslucentSort::Inline,
+    };
+    let mut renderer = VoxelRenderer::new(
+        &device,
+        &queue,
+        tier,
+        &config,
+        &boxel_render::generate_block_textures(scene.registry.textures()),
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        UVec2::new(WIDTH, HEIGHT),
+    )
+    .map_err(|e| format!("VoxelRenderer::new: {e}"))?;
+    let links = |p: ChunkPos| scene.links.get(&p).copied().unwrap_or(ALL_LINKS);
+    let mut out = Vec::new();
+    for (view, refused) in views {
+        let (params, cv) = view_params(view, I64Vec3::ZERO);
+        renderer.clear_chunks();
+        renderer.take_refused(|_, _| {});
+        renderer.set_visibility(None);
+        for (pos, mesh) in scene.meshes.iter().filter(|(p, _)| !refused.contains(p)) {
+            renderer
+                .upsert_chunk(chunk_id(*pos), pos.origin().as_i64vec3(), Arc::clone(mesh))
+                .map_err(|e| format!("upsert {pos:?}: {e}"))?;
+        }
+        render(&device, &queue, &mut renderer, &params)?; // warm-up (translucent sort)
+        let plain = render(&device, &queue, &mut renderer, &params)?;
+        for pos in refused {
+            let mesh = scene.meshes.iter().find(|(p, _)| p == pos).expect("mesh");
+            if renderer
+                .upsert_chunk(
+                    chunk_id(*pos),
+                    pos.origin().as_i64vec3(),
+                    Arc::clone(&mesh.1),
+                )
+                .is_ok()
+            {
+                return Err(format!("{pos:?} was not refused"));
+            }
+        }
+        let search = VisibilityView::new(cv.render_origin, Some(cv.frustum), 8, 8);
+        let trusting = visible_chunks(&search, links);
+        // The frame of the refusal: its set did not know.
+        renderer.set_visibility(Some(Arc::new(trusting.clone())));
+        let first = render(&device, &queue, &mut renderer, &params)?;
+        // The next frames: the world knows.
+        let mut vis = ChunkVisibility::default();
+        renderer.take_refused(|pos, refused| vis.set_unshown(pos, refused, links(pos)));
+        renderer.set_visibility(Some(vis.update(&search, links)));
+        let told = render(&device, &queue, &mut renderer, &params)?;
+        // Without the fix: the refused chunks trusted, or only counted as open.
+        renderer.set_visibility(Some(Arc::new(trusting)));
+        let trusted = render(&device, &queue, &mut renderer, &params)?;
+        let opening = visible_chunks(&search, |p| {
+            if refused.contains(&p) {
+                ALL_LINKS
+            } else {
+                links(p)
+            }
+        });
+        renderer.set_visibility(Some(Arc::new(opening)));
+        let opened = render(&device, &queue, &mut renderer, &params)?;
+        out.push(RefusedImages {
+            plain,
+            first,
+            told,
+            trusted,
+            opened,
+        });
+    }
+    let errors = errors.lock().map(|e| e.clone()).unwrap_or_default();
+    if !errors.is_empty() {
+        return Err(format!("uncaptured errors: {errors:?}"));
+    }
+    Ok(out)
+}
+
+/// Chunks whose upload the renderer refused (its chunk table is full) are not drawn, and where
+/// their faces are missing the rock around them shows what lies behind it. Cave culling must
+/// see through them: on the frame of the refusal (the renderer draws without the set when it
+/// reached one) and once the world knows ([`VoxelRenderer::take_refused`],
+/// [`ChunkVisibility::set_unshown`]). Trusting their links, or only counting them as open,
+/// loses pixels.
+#[test]
+fn refused_uploads_hide_nothing() {
+    let (_instance, adapters) = adapters();
+    if adapters.is_empty() {
+        assert!(!gpu_tests_required(), "BOXEL_REQUIRE_GPU=1 but no adapter");
+        eprintln!("skipping: no adapter");
+        return;
+    }
+    let scene = cave_scene();
+    let all = views(&scene);
+    let views: Vec<(&View, Vec<ChunkPos>)> = all
+        .iter()
+        .filter(|v| v.name.starts_with("cave") || v.name.starts_with("surface"))
+        .map(|v| (v, refused_chunks(&scene, v)))
+        .filter(|(_, refused)| refused.len() == 2)
+        .collect();
+    assert!(views.len() >= 4, "too few views: {}", views.len());
+    let mut report = Report {
+        failures: Vec::new(),
+        dir: PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("gpu_cave_culling_refused"),
+    };
+    let mut rendered = 0;
+    for adapter in &adapters {
+        let caps = AdapterCaps::from_adapter(adapter);
+        let label = adapter_label(&caps);
+        for tier in allowed_tiers(&caps) {
+            let images = match render_refused(adapter, &caps, tier, &scene, &views) {
+                Ok(images) => images,
+                Err(e) => {
+                    report.failures.push(format!("{label} {tier}: {e}"));
+                    continue;
+                }
+            };
+            rendered += 1;
+            let (mut trusted_lost, mut opened_lost) = (0, 0);
+            for ((view, _), r) in views.iter().zip(&images) {
+                let name = format!("{label}_{tier}_refused_{}", view.name);
+                let plain = (format!("{name}_plain"), &r.plain);
+                for (what, image) in [("first", &r.first), ("told", &r.told)] {
+                    report.identical(
+                        &format!("{label} {tier} {} refused, {what} frame", view.name),
+                        (&plain.0, plain.1),
+                        (&format!("{name}_{what}"), image),
+                    );
+                }
+                trusted_lost += usize::from(r.plain.compare(&r.trusted, 0).differing_pixels > 0);
+                opened_lost += usize::from(r.plain.compare(&r.opened, 0).differing_pixels > 0);
+            }
+            eprintln!(
+                "gpu_cave_culling: {label} {tier}: of {} views with refused chunks, {trusted_lost} \
+                 lose pixels trusting their links, {opened_lost} counting them only as open",
+                views.len()
+            );
+            if trusted_lost == 0 {
+                report.failures.push(format!(
+                    "{label} {tier}: no view loses pixels trusting refused chunks (the test proves \
+                     nothing)"
+                ));
             }
         }
     }

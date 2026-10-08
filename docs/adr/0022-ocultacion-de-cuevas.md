@@ -47,6 +47,12 @@ subterráneas, el siguiente paso son subceldas de 16³ o Hi-Z.
 - `ChunkSlot::visibility_links` solo confía en los enlaces cuando la malla del chunk está
   asentada (`Ready` o `Empty`). Un chunk sin cargar, sin generar o con la malla pendiente cuenta
   como abierto. Así nunca se oculta algo detrás de bloques que el render todavía no muestra.
+- El render puede rechazar la malla de un chunk (tabla de chunks o arena llenas). Entonces muestra
+  una malla vieja o nada, y donde faltan sus caras la roca de alrededor deja ver lo que hay
+  detrás. El render avisa al mundo (`VoxelRenderer::take_refused`, `ChunkVisibility::set_unshown`)
+  y la búsqueda ve a través de ese chunk hasta que el render lo muestre otra vez. En el frame
+  del rechazo el mundo todavía no lo sabe: si el conjunto de ese frame llegó al chunk, el render
+  dibuja sin ocultar nada.
 - El mapa anota cada cambio de esos enlaces, y el paso nuevo `WorldSystems::Visibility` (después
   de `Collect`) los pasa a `ChunkVisibility`.
 
@@ -56,6 +62,10 @@ Un BFS desde el chunk de la cámara, con las reglas de Minecraft y Sodium:
 
 - Se entra a un chunk por una cara y se sale solo por las caras enlazadas a alguna cara de
   entrada. El chunk de la cámara ve sus 6 vecinos sin mirar sus enlaces.
+- Un chunk que el render no muestra (sección 2) se ve a través: de él se sale por todas las caras
+  que se alejan de la cámara, y lo mismo de todo chunk al que se entra desde uno así. Contarlo
+  solo como abierto no alcanza: una línea de vista sigue por la roca de sus vecinos, donde no hay
+  caras.
 - Nunca se vuelve hacia la cámara en un eje: un chunk del lado `+x` de la cámara solo sale por
   `+x`. Es lo que hace la secuencia de chunks de una línea recta. Cada paso aleja un chunk en
   distancia Manhattan, así la cola procesa los chunks por distancia y, al tomar uno, ya conoce
@@ -149,5 +159,7 @@ depende del chunk del ojo y no de su vóxel. `VisibilityStats::blocked` cuenta e
   reutilización nunca pierde un chunk que el render necesita; `gpu_cave_culling` da los mismos
   píxeles con y sin culling en los tres tiers de cada adaptador, en 29 vistas y lejos del origen,
   y no oculta nada en 15 vistas con el ojo dentro de la roca o a 1/64 de una pared (sin la
-  guarda, esas vistas pierden píxeles en todos los tiers).
+  guarda, esas vistas pierden píxeles en todos los tiers). Con dos chunks rechazados delante del
+  ojo, los píxeles tampoco cambian, ni en el frame del rechazo ni después; confiar en sus enlaces
+  o solo abrirlos pierde píxeles.
 - Mediciones en `docs/rendimiento/cuevas-fase4-2026-10.md`.

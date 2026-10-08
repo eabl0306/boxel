@@ -17,6 +17,8 @@
 //! - A chunk that is not loaded, not generated or whose mesh is not settled yet counts as open
 //!   ([`ChunkSlot::visibility_links`](crate::ChunkSlot::visibility_links)), so a chunk the
 //!   renderer shows is never hidden by blocks it does not show yet.
+//! - A chunk the renderer does not show as the map has it (it refused the chunk's last mesh) is
+//!   seen through, with every chunk past it ([`ChunkVisibility::set_unshown`]).
 //!
 //! The search covers a box around the camera's chunk (the viewer's mesh radius); a chunk
 //! outside it is always visible ([`VisibleSet::is_visible`]). A path cannot leave an
@@ -37,6 +39,7 @@
 //!   the world streams) can only hide more: it waits up to [`TIGHTEN_DELAY`] for the next search.
 use boxel_math::{Frustum, I64Vec3, Vec3};
 use boxel_voxel::{ALL_LINKS, BlockPos, CHUNK_SHIFT, ChunkFaceInfo, ChunkPos, Face};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -169,6 +172,13 @@ pub struct VisibilityStats {
     /// ([`ChunkVisibility::eye_in_open`]).
     pub blocked: u64,
 }
+
+/// Grid links bit (above the 15 links): the renderer does not show the chunk as its data says
+/// (it refused the chunk's last mesh, [`ChunkVisibility::set_unshown`]). Where its faces are
+/// missing, a line of sight goes into the rock around it, where nothing is meshed, and on until
+/// an open voxel shows a face: the search sees every chunk past such a chunk, as if all were
+/// open. Such a chunk counts as open itself.
+pub(crate) const XRAY: u16 = 1 << 15;
 
 /// Bits of the search state of a cell.
 const INCOMING: u8 = 0x3f;
@@ -337,6 +347,9 @@ fn touches(planes: &[ChunkPlane; 6], l: Vec3) -> bool {
 struct Search {
     /// Per box cell: incoming faces, queued, outside the frustum (all zero between runs).
     state: Vec<u8>,
+    /// One bit per box cell: entered from a chunk seen through ([`XRAY`]), so it is seen
+    /// through too (all zero between runs).
+    xray: Vec<u64>,
     queue: Vec<u32>,
     outside: Vec<u32>,
 }
@@ -352,6 +365,7 @@ impl Search {
         let cells = sx * sy * sz;
         if self.state.len() < cells {
             self.state.resize(cells, 0);
+            self.xray.resize(cells.div_ceil(64), 0);
         }
         let half = view.half();
         let center = [half[0] as usize, half[1] as usize, half[2] as usize];
@@ -368,23 +382,19 @@ impl Search {
         self.outside.clear();
         self.queue.push(pack(center[0], center[1], center[2]));
         self.state[start] = QUEUED;
+        // Some chunk was seen through ([`XRAY`]): the bits of `xray` are in use.
+        let mut xray_any = false;
         let mut head = 0;
         while head < self.queue.len() {
             let (x, y, z) = unpack(self.queue[head]);
             head += 1;
             let i = local(x, y, z);
+            let links = grid.links[i];
+            let xray = links & XRAY != 0 || (xray_any && self.xray[i >> 6] >> (i & 63) & 1 != 0);
+            xray_any |= xray;
             let out = if i == start {
                 0x3f
             } else {
-                let links = grid.links[i];
-                let (lo, hi) = (usize::from(links as u8), usize::from(links >> 8));
-                let mut incoming = self.state[i] & INCOMING;
-                let mut out = 0;
-                while incoming != 0 {
-                    let f = incoming.trailing_zeros() as usize;
-                    incoming &= incoming - 1;
-                    out |= LINKED_LO[f][lo] | LINKED_HI[f][hi];
-                }
                 // Never back toward the camera along an axis.
                 let side = |p: usize, c: usize, plus: usize, minus: usize| -> u8 {
                     match p.cmp(&c) {
@@ -393,9 +403,21 @@ impl Search {
                         std::cmp::Ordering::Equal => 1 << plus | 1 << minus,
                     }
                 };
-                out & (side(y, center[1], 0, 1)
-                    | side(x, center[0], 2, 3)
-                    | side(z, center[2], 4, 5))
+                let away =
+                    side(y, center[1], 0, 1) | side(x, center[0], 2, 3) | side(z, center[2], 4, 5);
+                if xray {
+                    away
+                } else {
+                    let (lo, hi) = (usize::from(links as u8), usize::from(links >> 8 & 0x7f));
+                    let mut incoming = self.state[i] & INCOMING;
+                    let mut out = 0;
+                    while incoming != 0 {
+                        let f = incoming.trailing_zeros() as usize;
+                        incoming &= incoming - 1;
+                        out |= LINKED_LO[f][lo] | LINKED_HI[f][hi];
+                    }
+                    out & away
+                }
             };
             for f in Face::ALL {
                 if out & (1 << f.index()) == 0 {
@@ -432,6 +454,9 @@ impl Search {
                 // Entered through the face toward this chunk.
                 let entry = f.opposite().index();
                 self.state[n] |= QUEUED | 1 << entry;
+                if xray {
+                    self.xray[n >> 6] |= 1 << (n & 63);
+                }
             }
         }
         let mut bits = vec![0u64; cells.div_ceil(64)];
@@ -440,6 +465,10 @@ impl Search {
             let i = local(x, y, z);
             bits[i >> 6] |= 1 << (i & 63);
             self.state[i] = 0;
+            if xray_any {
+                // Only queued cells have the bit.
+                self.xray[i >> 6] = 0;
+            }
         }
         for &i in &self.outside {
             self.state[i as usize] = 0;
@@ -543,6 +572,9 @@ pub struct ChunkVisibility {
     opened: bool,
     /// When the first link that closed since the last search did.
     closed: Option<Instant>,
+    /// Chunks the renderer does not show as the map has them ([`ChunkVisibility::set_unshown`]):
+    /// [`XRAY`] in the grid whatever the map says.
+    unshown: HashSet<ChunkPos>,
     stats: VisibilityStats,
 }
 
@@ -556,13 +588,54 @@ impl ChunkVisibility {
     /// [`ChunkVisibility::apply_changes`] at time `now`.
     pub(crate) fn apply_changes_at(&mut self, changes: &[(ChunkPos, u16)], now: Instant) {
         for &(pos, links) in changes {
-            match self.grid.set(pos, links) {
-                Some(old) if links & !old != 0 => self.opened = true,
-                Some(old) if links != old => {
-                    self.closed.get_or_insert(now);
-                }
-                _ => {}
+            if self.unshown.is_empty() || !self.unshown.contains(&pos) {
+                self.set_links(pos, links, now);
             }
+        }
+    }
+
+    /// Sets the grid's links of `pos` (if it holds it) and notes whether they opened or closed.
+    fn set_links(&mut self, pos: ChunkPos, links: u16, now: Instant) {
+        match self.grid.set(pos, links) {
+            Some(old) if links & !old != 0 => self.opened = true,
+            Some(old) if links != old => {
+                self.closed.get_or_insert(now);
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether the renderer shows chunk `pos` as the map has it. `unshown`: it refused the
+    /// chunk's last mesh (its chunk table or arena is full), so it shows an older mesh or
+    /// nothing there, and the rock around may show what lies behind it: the search sees every
+    /// chunk past it ([`XRAY`]), at once. Shown again (`false`, with the map's
+    /// [`ChunkSlot::visibility_links`](crate::ChunkSlot) of `pos` as `links`): its links count
+    /// again, as a link that closed.
+    pub fn set_unshown(&mut self, pos: ChunkPos, unshown: bool, links: u16) {
+        self.set_unshown_at(pos, unshown, links, Instant::now());
+    }
+
+    /// [`ChunkVisibility::set_unshown`] at time `now`.
+    pub(crate) fn set_unshown_at(
+        &mut self,
+        pos: ChunkPos,
+        unshown: bool,
+        links: u16,
+        now: Instant,
+    ) {
+        if unshown && self.unshown.insert(pos) {
+            self.set_links(pos, ALL_LINKS | XRAY, now);
+        } else if !unshown && self.unshown.remove(&pos) {
+            self.set_links(pos, links, now);
+        }
+    }
+
+    /// Every chunk is shown again ([`ChunkVisibility::set_unshown`] with `false`): the renderer
+    /// dropped every chunk (a new renderer, or one that uploads every mesh again).
+    pub fn clear_unshown(&mut self, links: impl Fn(ChunkPos) -> u16) {
+        let now = Instant::now();
+        for pos in std::mem::take(&mut self.unshown) {
+            self.set_links(pos, links(pos), now);
         }
     }
 
@@ -588,7 +661,14 @@ impl ChunkVisibility {
     ) -> Arc<VisibleSet> {
         let start = Instant::now();
         let (min, size) = view_box(view);
-        let refilled = self.grid.hold(min, size, &links);
+        let unshown = &self.unshown;
+        let refilled = self.grid.hold(min, size, &|p| {
+            if !unshown.is_empty() && unshown.contains(&p) {
+                ALL_LINKS | XRAY
+            } else {
+                links(p)
+            }
+        });
         let tighten = self
             .closed
             .is_some_and(|t| now.saturating_duration_since(t) >= TIGHTEN_DELAY);
@@ -624,7 +704,15 @@ impl ChunkVisibility {
         reach: f32,
         occludes: impl Fn(BlockPos) -> Option<bool>,
     ) -> bool {
-        let open = eye_in_open(render_origin, eye_rel, reach, occludes);
+        // The renderer may show other blocks than the map's in a chunk it does not show.
+        let unshown = &self.unshown;
+        let open = eye_in_open(render_origin, eye_rel, reach, |p| {
+            if !unshown.is_empty() && unshown.contains(&ChunkPos::containing(p)) {
+                None
+            } else {
+                occludes(p)
+            }
+        });
         self.stats.blocked += u64::from(!open);
         open
     }

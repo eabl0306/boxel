@@ -50,9 +50,10 @@ fn frustum(eye: Vec3, dir: Vec3, distance: f32) -> Frustum {
     f
 }
 
-/// The visible chunks by brute force: a depth-first search over (chunk, entry face) states with
-/// the same rules (links, never back toward the camera along an axis, the frustum outside the
-/// 27 chunks around the camera), as relative offsets.
+/// The visible chunks by brute force: a depth-first search over (chunk, entry face, seen
+/// through) states with the same rules (links, never back toward the camera along an axis, the
+/// frustum outside the 27 chunks around the camera, every face away from the camera out of a
+/// chunk seen through or entered from one), as relative offsets.
 fn brute_force(view: &VisibilityView, links: &impl Fn(ChunkPos) -> u16) -> HashSet<IVec3> {
     let half = view.half();
     let c = view.center;
@@ -89,18 +90,20 @@ fn brute_force(view: &VisibilityView, links: &impl Fn(ChunkPos) -> u16) -> HashS
     let mut visible = HashSet::from([IVec3::ZERO]);
     let mut seen = HashSet::new();
     let mut stack = Vec::new();
+    let start_xray = links(pos(IVec3::ZERO)) & XRAY != 0;
     for f in Face::ALL {
         let n = f.normal();
         if in_box(n) && passes(n) {
-            stack.push((n, f.opposite()));
+            stack.push((n, f.opposite(), start_xray));
         }
     }
-    while let Some((d, entry)) = stack.pop() {
-        if !seen.insert((d, entry)) {
+    while let Some((d, entry, xray)) = stack.pop() {
+        if !seen.insert((d, entry, xray)) {
             continue;
         }
         visible.insert(d);
         let l = links(pos(d));
+        let xray = xray || l & XRAY != 0;
         for f in Face::ALL {
             let n = f.normal();
             // Away from the camera (or sideways at its coordinate) on the step's axis.
@@ -109,12 +112,12 @@ fn brute_force(view: &VisibilityView, links: &impl Fn(ChunkPos) -> u16) -> HashS
             if along < 0 && axis_offset != 0 {
                 continue;
             }
-            if l & link_bit(entry, f) == 0 {
+            if !xray && l & link_bit(entry, f) == 0 {
                 continue;
             }
             let next = d + n;
             if in_box(next) && passes(next) {
-                stack.push((next, f.opposite()));
+                stack.push((next, f.opposite(), xray));
             }
         }
     }
@@ -513,6 +516,88 @@ fn the_eye_is_in_open_space_only_with_every_voxel_near_it_open() {
     assert_eq!(vis.stats().blocked, 1);
 }
 
+#[test]
+fn chunks_seen_through_show_every_chunk_past_them() {
+    // Closed rock with an open chunk ahead of the camera and, past it, a chunk the renderer
+    // does not show.
+    let view = view_at(ChunkPos::new(0, 0, 0), None, 4, 2);
+    let open = ChunkPos::new(0, 0, -1);
+    let unshown = ChunkPos::new(0, 0, -2);
+    let links = |xray: u16| {
+        move |p: ChunkPos| {
+            if p == open {
+                ALL_LINKS
+            } else if p == unshown {
+                ALL_LINKS | xray
+            } else {
+                0
+            }
+        }
+    };
+    let plain = visible_chunks(&view, links(0));
+    let seen = visible_chunks(&view, links(XRAY));
+    // Open: only its neighbors past it.
+    assert!(plain.is_visible(ChunkPos::new(0, 0, -3)));
+    assert!(!plain.is_visible(ChunkPos::new(0, 0, -4)));
+    assert!(!plain.is_visible(ChunkPos::new(1, 0, -3)));
+    // Seen through: every chunk past it (z <= -2), and nothing more nearer the camera.
+    let (min, max) = seen.bounds();
+    for y in min.y..=max.y {
+        for z in min.z..=max.z {
+            for x in min.x..=max.x {
+                let p = ChunkPos::new(x, y, z);
+                let want = if z <= -2 { true } else { plain.is_visible(p) };
+                assert_eq!(seen.is_visible(p), want, "{p:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn unshown_chunks_are_seen_through_until_shown_again() {
+    let center = ChunkPos::new(3, -40, 9);
+    let at = |d: i64| ChunkPos::new(center.x, center.y, center.z + d);
+    let view = view_at(center, Some(Vec3::new(0.0, 0.0, -1.0)), 4, 2);
+    // Closed rock, with an open chunk between the camera and a wall.
+    let (wall, behind, far) = (at(-2), at(-3), at(-4));
+    let lookup = |p: ChunkPos| if p == at(-1) { ALL_LINKS } else { 0 };
+    let now = Instant::now();
+    // A chunk refused before the grid held it counts from the first search.
+    let mut vis = ChunkVisibility::default();
+    vis.set_unshown_at(wall, true, 0, now);
+    assert!(vis.update_at(&view, lookup, now).is_visible(far));
+    let mut vis = ChunkVisibility::default();
+    let set = vis.update_at(&view, lookup, now);
+    assert!(!set.is_visible(behind));
+    let searches = vis.stats().searches;
+    // The renderer refuses the wall chunk: searched at once, everything past it shows.
+    vis.set_unshown_at(wall, true, 0, now);
+    let set = vis.update_at(&view, lookup, now);
+    assert_eq!(vis.stats().searches, searches + 1);
+    assert!(set.is_visible(behind) && set.is_visible(far));
+    // The map's changes do not undo it.
+    vis.apply_changes_at(&[(wall, 0)], now);
+    let kept = vis.update_at(&view, lookup, now + TIGHTEN_DELAY);
+    assert!(Arc::ptr_eq(&kept, &set));
+    // Shown again: its links count again, as a link that closed.
+    vis.set_unshown_at(wall, false, 0, now);
+    let kept = vis.update_at(&view, lookup, now + TIGHTEN_DELAY / 2);
+    assert!(Arc::ptr_eq(&kept, &set));
+    let later = vis.update_at(&view, lookup, now + TIGHTEN_DELAY);
+    assert!(!later.is_visible(behind));
+    // The blocks of a chunk the renderer does not show are unknown to the eye test.
+    let render_origin = view.render_origin;
+    let eye = Vec3::new(0.5, 0.25, 0.5);
+    assert!(vis.eye_in_open(render_origin, eye, 0.17, |_| Some(false)));
+    vis.set_unshown_at(center, true, 0, now);
+    assert!(!vis.eye_in_open(render_origin, eye, 0.17, |_| Some(false)));
+    // A new renderer shows every chunk again.
+    vis.clear_unshown(lookup);
+    assert!(vis.eye_in_open(render_origin, eye, 0.17, |_| Some(false)));
+    let set = vis.update_at(&view, lookup, now + TIGHTEN_DELAY * 4);
+    assert!(!set.is_visible(behind));
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
@@ -524,12 +609,19 @@ proptest! {
         vertical in 1u32..4,
         dir in (-1.0f32..1.0, -1.0f32..1.0, -1.0f32..1.0),
         frustum_on in any::<bool>(),
+        seen_through in 0u64..3,
     ) {
         let d = Vec3::new(dir.0, dir.1, dir.2);
         let dir = (frustum_on && d.length() > 0.1).then_some(d);
         let view = view_at(ChunkPos::new(-7, 4, 11), dir, radius, vertical);
+        // Up to 1 chunk in 16 the renderer does not show.
         let links = |pos: ChunkPos| {
-            random_links(seed, IVec3::new(pos.x as i32, pos.y as i32, pos.z as i32), p)
+            let d = IVec3::new(pos.x as i32, pos.y as i32, pos.z as i32);
+            if hash(seed ^ 0x5eed, d) % 32 < seen_through {
+                ALL_LINKS | XRAY
+            } else {
+                random_links(seed, d, p)
+            }
         };
         let set = visible_chunks(&view, links);
         prop_assert_eq!(offsets(&set, &view), brute_force(&view, &links));

@@ -1315,12 +1315,15 @@ fn extract(
 /// or of the largest viewer; without viewers nothing is culled. Nothing is culled either while
 /// a voxel within the near plane's reach of the eye occludes or is not loaded
 /// ([`ChunkVisibility::eye_in_open`]): the renderer then shows what lies behind the rock.
+///
+/// First, whatever the setting, the world learns which chunks the renderer refused or shows
+/// again since the last frame ([`VoxelRenderer::take_refused`]): the search sees through them.
 #[expect(
     clippy::too_many_arguments,
     reason = "a Bevy-style system: one parameter per resource it reads"
 )]
 fn extract_visibility(
-    gpu: Res<GpuState>,
+    mut gpu: ResMut<GpuState>,
     mut frame: ResMut<ExtractedFrame>,
     settings: Option<Res<WorldSettings>>,
     content: Option<Res<WorldContent>>,
@@ -1335,6 +1338,15 @@ fn extract_visibility(
     else {
         return;
     };
+    if let GpuStage::Ready(ready) = &mut gpu.stage {
+        ready.renderer.take_refused(|pos, refused| {
+            visibility.set_unshown(pos, refused, map.visibility_links_at(pos));
+        });
+        if frame.resync {
+            // `prepare` drops every chunk first (a new renderer may not know the old refusals).
+            visibility.clear_unshown(|pos| map.visibility_links_at(pos));
+        }
+    }
     if !settings.cave_culling {
         return;
     }
