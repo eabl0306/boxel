@@ -620,7 +620,7 @@ impl ChunkVisibility {
     /// Whether the renderer shows chunk `pos` as the map has it. `unshown`: it refused the
     /// chunk's last mesh (its chunk table or arena is full), so it shows an older mesh or
     /// nothing there, and the rock around may show what lies behind it: the search sees every
-    /// chunk past it ([`XRAY`]), at once. Shown again (`false`, with the map's
+    /// chunk past it, at once. Shown again (`false`, with the map's
     /// [`ChunkSlot::visibility_links`](crate::ChunkSlot) of `pos` as `links`): its links count
     /// again, as a link that closed.
     pub fn set_unshown(&mut self, pos: ChunkPos, unshown: bool, links: u16) {
