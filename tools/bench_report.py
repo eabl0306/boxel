@@ -10,7 +10,8 @@ RUN, BASE and NEW are summary files (Markdown with a JSON block, or plain JSON) 
 world, light (--light), block textures (--pack; runs from before it are 'none', procedural),
 scenario, radius, vertical radius, speed, fps limit, vsync, physics bodies (--bodies), scripted
 edits (--edits), backend, tier and adapter; a different clock time (--time)
-only gets a note, since day and night change no mesh. Light is 'on', 'off' or 'none' (runs from
+or world work between frames (--idle-work: 'on', 'off', or 'none' for runs from before it) only
+gets a note, so the same binary with and without it, or main against a branch, still pair. Light is 'on', 'off' or 'none' (runs from
 before the light render, without a clock, had no voxel light); runs with a clock but from before
 --light had it on. A metric that was 0 in BASE has no percent change ('n/a') but still gets a
 verdict (0 spikes before, 3 after: worse). Runs with --edits also compare the edit latency, and
@@ -44,6 +45,9 @@ METRICS = [
     ('queue trend jobs/s', ('world', 'backlog_trend_per_s'), -1),
     ('border catch-up avg ms', ('world', 'border_catch_up', 'avg_ms'), -1),
     ('border catch-up max ms', ('world', 'border_catch_up', 'max_ms'), -1),
+    ('border catch-up frames avg', ('world', 'border_catch_up', 'frames_avg'), -1),
+    ('border work lag avg ms', ('world', 'border_catch_up', 'work_avg_ms'), -1),
+    ('border work lag max ms', ('world', 'border_catch_up', 'work_max_ms'), -1),
     ('borders finished', ('world', 'border_catch_up', 'finished'), 0),
     ('catch-up after stop s', ('world', 'catch_up_s'), -1),
 ]
@@ -72,6 +76,16 @@ PACING_METRICS = [
     ('frames locked to the display', ('pacing', 'display_locked'), 0),
 ]
 
+# The runner's idle steps between frames (runs with --idle-work and later; compared when either
+# run has them).
+IDLE_METRICS = [
+    ('idle ms per frame', ('idle', 'tail_mean_ms'), 0),
+    ('idle ms per frame p99', ('idle', 'tail_p99_ms'), 0),
+    ('idle steps per frame', ('idle', 'steps_mean'), 0),
+    ('idle steps past their slot', ('idle', 'overruns'), -1),
+    ('idle worst overrun ms', ('idle', 'overrun_max_ms'), -1),
+]
+
 # Settings that make two runs comparable.
 SETTINGS = [
     ('world', ('run', 'world')),
@@ -87,6 +101,7 @@ SETTINGS = [
     ('bodies', ('run', 'bodies')),
     ('edits', ('run', 'edits')),
     ('clock', ('run', 'time')),
+    ('idle work', ('run', 'idle_work')),
     ('seed', ('run', 'seed')),
     ('backend', ('run', 'backend')),
     ('tier', ('run', 'tier')),
@@ -146,6 +161,9 @@ def load(path):
         # Runs from before --pack used the procedural textures.
         if not run.get('pack'):
             run['pack'] = 'none'
+        # Runs from before --idle-work had no world work between frames.
+        if not run.get('idle_work'):
+            run['idle_work'] = 'none'
         # Whether the run had --edits (the world's edit latency, null without them).
         run['edits'] = get(data, ('world', 'edits')) is not None
     return data
@@ -246,8 +264,8 @@ def table(runs):
     lines = [
         '| run | GPU | frames | avg fps | p50 ms | p99 ms | p99.9 ms | max ms | 1% low fps '
         '| > 6.94 ms | > 16.7 ms | border max ms | generated/s | queued max | border lag max ms '
-        '| > 7.5 ms | shown fps |',
-        '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|',
+        '| > 7.5 ms | shown fps | idle work | work lag max ms |',
+        '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|',
     ]
     for run in runs:
         f, w, r = run['frames'], run['world'], run['run']
@@ -256,7 +274,8 @@ def table(runs):
             f['p99_ms'], f['p999_ms'], f['max_ms'], f['low_1_fps'], f['over_144hz'],
             f['over_60hz'], get(f, ('crossing', 'max_ms')), w['generated_per_s'],
             get(w, ('queued', 'max')), get(w, ('border_catch_up', 'max_ms')),
-            f.get('over_7_5ms'), get(run, ('pacing', 'presented_fps')),
+            f.get('over_7_5ms'), get(run, ('pacing', 'presented_fps')), r.get('idle_work'),
+            get(w, ('border_catch_up', 'work_max_ms')),
         ]
         lines.append('| ' + ' | '.join(fmt(c) for c in cells) + ' |')
     return '\n'.join(lines)
@@ -278,6 +297,8 @@ def compare(base, new):
         metrics = metrics + EDIT_METRICS
     if get(base, ('pacing',)) is not None or get(new, ('pacing',)) is not None:
         metrics = metrics + PACING_METRICS
+    if get(base, ('idle',)) is not None or get(new, ('idle',)) is not None:
+        metrics = metrics + IDLE_METRICS
     for name, path, direction in metrics:
         b, n = get(base, path), get(new, path)
         pct, verdict = change(b, n, direction)

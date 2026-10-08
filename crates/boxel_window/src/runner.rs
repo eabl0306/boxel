@@ -2423,7 +2423,10 @@ mod tests {
         let info = *app.world().resource::<IdleInfo>();
         assert_eq!(info.steps, 5);
         assert_eq!(info.tail, (400 + 200 + 300 + 450 + 100) * US);
-        assert_eq!((info.overruns, info.overrun_max), (1, 50 * US));
+        assert_eq!(
+            (info.late, info.overruns, info.overrun_max),
+            (50 * US, 1, 50 * US)
+        );
         // The update after it starts a new gap; overruns add up.
         core.end_update(app.world(), due + 500 * US);
         core.begin_update(app.world_mut(), due + period);

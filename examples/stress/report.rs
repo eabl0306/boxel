@@ -68,6 +68,18 @@ pub struct FrameRecord {
     pub gate_at: Option<Duration>,
     /// The runner paced the frame by the display (`FramePacingInfo::display_locked`).
     pub display_locked: bool,
+    /// Time in the idle steps the runner ran after the frame, before the next one
+    /// (`IdleInfo::tail`).
+    pub idle: Duration,
+    /// Those idle steps (`IdleInfo::steps`).
+    pub idle_steps: u32,
+    /// How far past the end of its slot one of them returned, at worst (`IdleInfo::late`).
+    pub idle_late: Duration,
+    /// How many of them returned past the end of their slot.
+    pub idle_overruns: u64,
+    /// When the latest chunk job had finished by the time the record was taken, since the
+    /// measurement started (`None`: no job yet since then).
+    pub last_job_end: Option<Duration>,
 }
 
 /// Append-only list of records stored in fixed blocks: pushing never moves earlier records, so
@@ -191,6 +203,9 @@ pub struct RunInfo {
     pub texture_load_ms: Option<f64>,
     /// The present mode the surface got (`RenderInfo::present_mode`, `Mailbox`, `Fifo`...).
     pub present_mode: String,
+    /// The world's work between frames (`--idle-work`, ADR 0022): `on` or `off`. Empty in runs
+    /// from before the option (which had none).
+    pub idle_work: String,
     /// Refresh rate of the window's monitor in Hz, as the runner saw it (`None`: unknown).
     pub refresh_hz: Option<f64>,
 }
@@ -327,7 +342,10 @@ pub struct SecondStats {
 }
 
 /// How long the world needed to finish the chunks a border crossing asked for: from the
-/// crossing frame to the first frame with nothing queued, running, generating or meshing.
+/// crossing frame to the first frame with nothing queued, running, generating or meshing. That
+/// is on the frame clock (each frame's start), so under a frame limit it comes in whole
+/// periods; the work lag measures from the crossing frame's start to the end of the last job
+/// the world had run by then, whatever the frames.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BorderCatchUp {
     /// Crossings in the measurement (`cut_off` included).
@@ -341,6 +359,16 @@ pub struct BorderCatchUp {
     pub avg: Duration,
     /// Longest time to finish.
     pub max: Duration,
+    /// Mean work lag over the finished crossings: from the crossing frame's start to the end of
+    /// the latest job when the settled frame was recorded (zero when that job ended before the
+    /// crossing).
+    pub work_avg: Duration,
+    /// Longest work lag.
+    pub work_max: Duration,
+    /// Mean frames from the crossing frame to the settled one (0: the crossing frame itself).
+    pub frames_avg: f64,
+    /// Most frames.
+    pub frames_max: usize,
 }
 
 impl BorderCatchUp {
@@ -351,31 +379,52 @@ impl BorderCatchUp {
         let crossings: Vec<usize> = (0..records.len()).filter(|&i| records[i].crossed).collect();
         let (mut finished, mut cut_off) = (0usize, 0usize);
         let (mut sum, mut max) = (Duration::ZERO, Duration::ZERO);
+        let (mut work_sum, mut work_max) = (Duration::ZERO, Duration::ZERO);
+        let (mut frames_sum, mut frames_max) = (0usize, 0usize);
         for (n, &at) in crossings.iter().enumerate() {
             let next = crossings.get(n + 1).copied();
             let start = records[at].t;
             let until = next.unwrap_or(records.len());
-            match records[at..until].iter().find(|r| r.world.is_settled()) {
-                Some(done) => {
+            match records[at..until].iter().position(|r| r.world.is_settled()) {
+                Some(frames) => {
+                    let done = &records[at + frames];
                     let lag = done.t.saturating_sub(start);
+                    let work = done
+                        .last_job_end
+                        .map_or(Duration::ZERO, |end| end.saturating_sub(start));
                     finished += 1;
                     sum += lag;
                     max = max.max(lag);
+                    work_sum += work;
+                    work_max = work_max.max(work);
+                    frames_sum += frames;
+                    frames_max = frames_max.max(frames);
                 }
                 None if next.is_none() => cut_off = 1,
                 None => {}
             }
         }
+        let mean = |sum: Duration| {
+            if finished == 0 {
+                Duration::ZERO
+            } else {
+                sum / finished as u32
+            }
+        };
         (!crossings.is_empty()).then(|| Self {
             crossings: crossings.len(),
             finished,
             cut_off,
-            avg: if finished == 0 {
-                Duration::ZERO
-            } else {
-                sum / finished as u32
-            },
+            avg: mean(sum),
             max,
+            work_avg: mean(work_sum),
+            work_max,
+            frames_avg: if finished == 0 {
+                0.0
+            } else {
+                frames_sum as f64 / finished as f64
+            },
+            frames_max,
         })
     }
 
@@ -401,9 +450,14 @@ impl BorderCatchUp {
             (finished, judged) => format!(
                 "After a chunk border the world finished the new chunks in {:.0} ms on average, \
                  {:.0} ms at most ({finished} of {judged} borders finished before the next \
-                 one).{cut}",
+                 one), {:.1} frames on average, {} at most; its last job ended {:.1} ms after \
+                 the crossing frame started on average, {:.1} ms at most.{cut}",
                 ms(self.avg),
                 ms(self.max),
+                self.frames_avg,
+                self.frames_max,
+                ms(self.work_avg),
+                ms(self.work_max),
             ),
         }
     }
@@ -579,6 +633,46 @@ impl Pacing {
     }
 }
 
+/// The idle steps the runner ran between frames (ADR 0022).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct IdleStats {
+    /// Mean time in idle steps per frame, and its 99th percentile (nearest rank).
+    pub tail_mean: Duration,
+    /// See `tail_mean`.
+    pub tail_p99: Duration,
+    /// Mean idle steps per frame.
+    pub steps_mean: f64,
+    /// Frames with at least one idle step.
+    pub frames: usize,
+    /// Steps that returned past the end of their slot, and the worst of them.
+    pub overruns: u64,
+    /// See `overruns`.
+    pub overrun_max: Duration,
+}
+
+impl IdleStats {
+    fn of(records: &[FrameRecord]) -> Self {
+        let n = records.len();
+        if n == 0 {
+            return Self::default();
+        }
+        let mut tails: Vec<Duration> = records.iter().map(|r| r.idle).collect();
+        tails.sort_unstable();
+        Self {
+            tail_mean: tails.iter().sum::<Duration>() / n as u32,
+            tail_p99: tails[(n * 99).div_ceil(100).clamp(1, n) - 1],
+            steps_mean: records.iter().map(|r| f64::from(r.idle_steps)).sum::<f64>() / n as f64,
+            frames: records.iter().filter(|r| r.idle_steps > 0).count(),
+            overruns: records.iter().map(|r| r.idle_overruns).sum(),
+            overrun_max: records
+                .iter()
+                .map(|r| r.idle_late)
+                .max()
+                .unwrap_or_default(),
+        }
+    }
+}
+
 /// What the summary reports.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Summary {
@@ -613,6 +707,8 @@ pub struct Summary {
     pub last: FrameRecord,
     /// Pacing and presentation.
     pub pacing: Pacing,
+    /// The idle steps between frames.
+    pub idle: IdleStats,
 }
 
 impl Summary {
@@ -649,6 +745,7 @@ impl Summary {
             timeline: timeline(records),
             last,
             pacing: Pacing::of(records, frames.total.as_secs_f64()),
+            idle: IdleStats::of(records),
             frames,
         })
     }
@@ -720,7 +817,8 @@ fn rounded(value: f64, decimals: i32) -> f64 {
 pub const CSV_HEADER: &str = "frame,t_ms,frame_ms,presented,crossed,cam_x,cam_z,yaw_deg,\
 generated,jobs_done,meshes,removed,upload_quads,d_data_ready,d_chunks,chunks,data_ready,\
 generating,mesh_ready,mesh_empty,meshing,queued_jobs,in_flight,gpu_chunks,quads,draws,arena_used,\
-dropped_chunks,gate_wait_ms,gate_missed,gate_ms,display_locked";
+dropped_chunks,gate_wait_ms,gate_missed,gate_ms,display_locked,idle_ms,idle_steps,idle_late_ms,\
+idle_overruns,job_end_ms";
 
 /// The CSV text: header plus one row per record.
 pub fn csv(records: &[FrameRecord]) -> String {
@@ -732,7 +830,7 @@ pub fn csv(records: &[FrameRecord]) -> String {
         let _ = writeln!(
             out,
             "{i},{:.3},{:.4},{},{},{:.2},{:.2},{:.2},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},\
-             {:.4},{},{},{}",
+             {:.4},{},{},{},{:.4},{},{:.4},{},{}",
             ms(r.t),
             ms(r.frame_time),
             u8::from(r.presented),
@@ -765,6 +863,12 @@ pub fn csv(records: &[FrameRecord]) -> String {
             r.gate_at
                 .map_or_else(String::new, |at| format!("{:.3}", ms(at))),
             u8::from(r.display_locked),
+            ms(r.idle),
+            r.idle_steps,
+            ms(r.idle_late),
+            r.idle_overruns,
+            r.last_job_end
+                .map_or_else(String::new, |at| format!("{:.3}", ms(at))),
         );
     }
     out
@@ -957,6 +1061,7 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
         ("vsync", Json::Str(info.vsync.clone())),
         ("present_mode", Json::Str(info.present_mode.clone())),
         ("refresh_hz", Json::opt(info.refresh_hz, 3)),
+        ("idle_work", Json::Str(info.idle_work.clone())),
     ]);
     let frames = Json::Obj(vec![
         ("count", Json::uint(f.frames)),
@@ -1010,6 +1115,10 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
                     ("cut_off", Json::uint(b.cut_off)),
                     ("avg_ms", Json::ms(b.avg)),
                     ("max_ms", Json::ms(b.max)),
+                    ("frames_avg", Json::num(b.frames_avg, 2)),
+                    ("frames_max", Json::uint(b.frames_max)),
+                    ("work_avg_ms", Json::ms(b.work_avg)),
+                    ("work_max_ms", Json::ms(b.work_max)),
                 ])
             }),
         ),
@@ -1078,11 +1187,21 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
         ("display_locked", Json::uint(p.display_locked)),
         ("callbacks", intervals_json(p.callbacks)),
     ]);
+    let i = &s.idle;
+    let idle = Json::Obj(vec![
+        ("tail_mean_ms", Json::ms(i.tail_mean)),
+        ("tail_p99_ms", Json::ms(i.tail_p99)),
+        ("steps_mean", Json::num(i.steps_mean, 2)),
+        ("frames", Json::uint(i.frames)),
+        ("overruns", Json::uint(i.overruns)),
+        ("overrun_max_ms", Json::ms(i.overrun_max)),
+    ]);
     Json::Obj(vec![
         ("format", Json::uint(FORMAT_VERSION)),
         ("run", run),
         ("frames", frames),
         ("pacing", pacing),
+        ("idle", idle),
         ("world", world),
         ("worst", Json::Arr(worst)),
         ("timeline", Json::Arr(timeline)),
@@ -1245,6 +1364,7 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
     let _ = writeln!(out, "{}", subset("crossed a chunk border", s.crossing));
     let _ = writeln!(out, "{}\n", subset("other", s.other));
     pacing_markdown(&mut out, &s.pacing);
+    idle_markdown(&mut out, info, &s.idle);
 
     let _ = writeln!(out, "## World\n");
     let _ = writeln!(
@@ -1433,13 +1553,35 @@ fn pacing_markdown(out: &mut String, p: &Pacing) {
     );
 }
 
+/// The idle steps between frames (a sentence after `## Pacing`).
+fn idle_markdown(out: &mut String, info: &RunInfo, i: &IdleStats) {
+    let _ = writeln!(
+        out,
+        "Between frames (world work {}): {:.2} ms of idle steps per frame on average, {:.2} ms \
+         at p99, {:.1} steps per frame, in {} frames; {} steps returned past the end of their \
+         slot ({:.3} ms at worst).\n",
+        if info.idle_work.is_empty() {
+            "?"
+        } else {
+            &info.idle_work
+        },
+        ms(i.tail_mean),
+        ms(i.tail_p99),
+        i.steps_mean,
+        i.frames,
+        i.overruns,
+        ms(i.overrun_max),
+    );
+}
+
 /// One line for the terminal.
 pub fn one_line(info: &RunInfo, s: &Summary) -> String {
     let f = &s.frames;
     format!(
         "stress: {} {} {}: frames={} avg={:.0} fps p50={:.2} p99={:.2} p99.9={:.2} max={:.2} ms \
          1%low={:.0} fps >6.94ms={} >16.7ms={} generated/s={:.0} queued_max={} >7.5ms={} \
-         shown={:.1}/s gate_waits={} gate_misses={}",
+         shown={:.1}/s gate_waits={} gate_misses={} catch_up={} idle={:.2}ms/frame \
+         idle_overruns={}",
         run_title(info),
         info.backend,
         info.tier,
@@ -1458,6 +1600,19 @@ pub fn one_line(info: &RunInfo, s: &Summary) -> String {
         s.pacing.presented_fps,
         s.pacing.gate_waits,
         s.pacing.gate_misses,
+        s.border.map_or_else(
+            || "-".to_string(),
+            |b| format!(
+                "{:.1}/{:.1}ms,{:.1}frames,work={:.1}/{:.1}ms",
+                ms(b.avg),
+                ms(b.max),
+                b.frames_avg,
+                ms(b.work_avg),
+                ms(b.work_max)
+            )
+        ),
+        ms(s.idle.tail_mean),
+        s.idle.overruns,
     )
 }
 
@@ -1609,8 +1764,15 @@ mod tests {
         assert_eq!(
             b.text(),
             "After a chunk border the world finished the new chunks in 55 ms on average, 80 ms at \
-             most (2 of 3 borders finished before the next one). The measurement ended before \
-             the world finished the last border, so it is left out."
+             most (2 of 3 borders finished before the next one), 5.5 frames on average, 8 at \
+             most; its last job ended 0.0 ms after the crossing frame started on average, 0.0 ms \
+             at most. The measurement ended before the world finished the last border, so it is \
+             left out."
+        );
+        assert_eq!(
+            (b.frames_avg, b.frames_max),
+            (5.5, 8),
+            "3 frames and 8 frames"
         );
         let none: Vec<FrameRecord> = (0..5u64).map(|i| frame(i, 1.0)).collect();
         assert_eq!(BorderCatchUp::of(&none), None);
@@ -1619,6 +1781,75 @@ mod tests {
         quick[1].crossed = true;
         let b = BorderCatchUp::of(&quick).expect("one crossing");
         assert_eq!((b.finished, b.cut_off, b.max), (1, 0, Duration::ZERO));
+        assert_eq!((b.frames_max, b.work_max), (0, Duration::ZERO));
+    }
+
+    #[test]
+    fn border_work_lag_ends_at_the_last_job_before_the_settled_frame() {
+        // 7 ms frames (a 144 fps cap); crossings at frames 0 and 10, settled at frames 4 and
+        // 12. The jobs of the first ended 22.5 ms in (frame 4 starts at 28 ms); the second's
+        // last job ended before its crossing frame (nothing to do): a lag of 0.
+        let mut records: Vec<FrameRecord> = (0..20u64)
+            .map(|i| {
+                let mut r = frame(i * 7, 7.0);
+                r.crossed = i == 0 || i == 10;
+                r.world.queued_jobs = usize::from(matches!(i, 0..=3 | 10..=11));
+                r
+            })
+            .collect();
+        for r in &mut records[..10] {
+            r.last_job_end = Some(Duration::from_micros(22_500));
+        }
+        for r in &mut records[10..] {
+            r.last_job_end = Some(Duration::from_millis(60));
+        }
+        records[1].last_job_end = None;
+        let b = BorderCatchUp::of(&records).expect("crossings");
+        assert_eq!((b.finished, b.cut_off), (2, 0));
+        assert_eq!(
+            (b.avg, b.max),
+            (Duration::from_millis(21), Duration::from_millis(28))
+        );
+        assert_eq!((b.frames_avg, b.frames_max), (3.0, 4));
+        assert_eq!(b.work_max, Duration::from_micros(22_500));
+        assert_eq!(b.work_avg, Duration::from_micros(11_250));
+        assert!(
+            b.text().contains("its last job ended 11.2 ms after"),
+            "{}",
+            b.text()
+        );
+    }
+
+    #[test]
+    fn idle_stats_sum_the_steps_between_frames() {
+        let mut records: Vec<FrameRecord> = (0..100u64).map(|i| frame(i * 7, 7.0)).collect();
+        for (i, r) in records.iter_mut().enumerate() {
+            r.idle = Duration::from_micros(if i == 50 { 4000 } else { 1000 });
+            r.idle_steps = 4;
+        }
+        records[7].idle_overruns = 2;
+        records[7].idle_late = Duration::from_micros(30);
+        records[9].idle_steps = 0;
+        records[9].idle = Duration::ZERO;
+        let i = IdleStats::of(&records);
+        assert_eq!(i.tail_mean, Duration::from_micros((98 * 1000 + 4000) / 100));
+        assert_eq!(i.tail_p99, Duration::from_micros(1000));
+        assert!((i.steps_mean - 3.96).abs() < 1e-9);
+        assert_eq!((i.frames, i.overruns), (99, 2));
+        assert_eq!(i.overrun_max, Duration::from_micros(30));
+        assert_eq!(IdleStats::of(&[]), IdleStats::default());
+        let s = Summary::compute(&records).expect("records");
+        let info = RunInfo {
+            idle_work: "on".to_string(),
+            ..RunInfo::default()
+        };
+        let text = markdown(&info, &s);
+        assert!(
+            text.contains("Between frames (world work on): 1.02 ms of idle steps per frame"),
+            "{text}"
+        );
+        assert!(text.contains("\"idle_work\": \"on\""));
+        assert!(text.contains("\"overruns\": 2,"));
     }
 
     #[test]
@@ -1779,7 +2010,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), records.len() + 1);
         let columns = CSV_HEADER.split(',').count();
-        assert_eq!(columns, 32);
+        assert_eq!(columns, 37);
         assert!(lines.iter().all(|l| l.split(',').count() == columns));
         assert!(
             lines[501].starts_with("500,1000.000,10.0000,0,1,"),
@@ -1912,6 +2143,15 @@ mod tests {
             "{data}"
         );
         assert!(data.contains("\"vsync\": \"\""));
+        assert!(
+            data.contains("\"idle_work\": \"\""),
+            "empty without --idle-work"
+        );
+        assert!(
+            data.contains("\"idle\": {\n    \"tail_mean_ms\": 0,"),
+            "{data}"
+        );
+        assert!(data.contains("\"work_max_ms\": 0"), "{data}");
     }
 
     #[test]

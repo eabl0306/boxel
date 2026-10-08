@@ -81,12 +81,19 @@ fn idle_info_counts_a_gap_and_keeps_the_overruns() {
         gap.tail,
         300 * US + Duration::from_millis(2) - 500 * US + 40 * US
     );
-    assert_eq!((gap.overruns, gap.overrun_max), (1, 40 * US));
+    assert_eq!(
+        (gap.late, gap.overruns, gap.overrun_max),
+        (40 * US, 1, 40 * US)
+    );
     // The next gap starts empty; the overruns add up.
-    assert_eq!(info.take_gap().steps, 0);
+    let empty = info.take_gap();
+    assert_eq!((empty.steps, empty.late), (0, Duration::ZERO));
     info.record(t0, end + 10 * US, end);
     let gap = info.take_gap();
-    assert_eq!((gap.steps, gap.overruns, gap.overrun_max), (1, 2, 40 * US));
+    assert_eq!(
+        (gap.steps, gap.late, gap.overruns, gap.overrun_max),
+        (1, 10 * US, 2, 40 * US)
+    );
 }
 
 #[test]
@@ -102,7 +109,7 @@ fn run_idle_without_systems_is_done() {
 
 #[derive(Resource, Default)]
 struct Seen {
-    untils: Vec<Instant>,
+    step_ends: Vec<Instant>,
     changed_in_update: Vec<bool>,
 }
 
@@ -118,7 +125,7 @@ fn run_idle_runs_the_schedule_once_with_its_window() {
             Idle,
             (
                 |mut step: ResMut<IdleStep>, mut seen: ResMut<Seen>| {
-                    seen.untils.push(step.until);
+                    seen.step_ends.push(step.until);
                     step.want(IdleWork::Waiting);
                 },
                 |mut step: ResMut<IdleStep>, mut counter: ResMut<Counter>| {
@@ -143,7 +150,7 @@ fn run_idle_runs_the_schedule_once_with_its_window() {
     let until = Instant::now() + Duration::from_millis(3);
     assert_eq!(app.run_idle(until), IdleWork::Waiting);
     assert!(!app.world().contains_resource::<IdleStep>());
-    assert_eq!(app.world().resource::<Seen>().untils, vec![until]);
+    assert_eq!(app.world().resource::<Seen>().step_ends, vec![until]);
     assert_eq!(app.world().resource::<Counter>().0, 1);
     // What the step changed reads as changed in the next update (and only there).
     app.update();

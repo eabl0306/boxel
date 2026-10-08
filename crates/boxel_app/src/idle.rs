@@ -78,6 +78,9 @@ pub struct IdleInfo {
     pub tail: Duration,
     /// Idle steps since the previous update.
     pub steps: u32,
+    /// How far past the end of its slot a step since the previous update returned, at worst
+    /// (zero: none did).
+    pub late: Duration,
     /// Steps that returned after the end of their slot, since the runner started.
     pub overruns: u64,
     /// The worst lateness of those steps.
@@ -91,6 +94,7 @@ impl IdleInfo {
         self.steps = self.steps.saturating_add(1);
         if ended > end {
             self.overruns += 1;
+            self.late = self.late.max(ended - end);
             self.overrun_max = self.overrun_max.max(ended - end);
         }
     }
@@ -100,6 +104,7 @@ impl IdleInfo {
         let gap = *self;
         self.tail = Duration::ZERO;
         self.steps = 0;
+        self.late = Duration::ZERO;
         gap
     }
 }

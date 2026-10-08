@@ -28,6 +28,12 @@
 //! `--light off` turns the voxel light and the ambient occlusion off (`WorldSettings::light` and
 //! `ao_policy: AoPolicy::Off`): the look and the cost of the world before light (ADR 0015).
 //!
+//! `--idle-work off` keeps the world's work in its frame steps under a frame limit
+//! (`WorldSettings::idle_work`, ADR 0022): the same binary with and without the world's work
+//! between frames. Each frame records the idle steps the runner ran after it (`IdleInfo`) and
+//! when the latest chunk job finished, so the summary gives the border catch-up both on the
+//! frame clock and as the work lag (crossing frame start to the last job of the crossing).
+//!
 //! Every run waits until the world settled, runs `--warmup` seconds, then measures
 //! `--duration` seconds. Each frame records its wall-clock time (`Time::real_delta`, the whole
 //! loop: world and render) and the work it did: chunks generated and jobs finished (counted by
@@ -58,7 +64,7 @@ mod spans;
 mod world;
 
 use bodies::{BodiesPlugin, BodyOptions};
-use boxel::app::{TaskPoolOptions, TaskPoolThreadAssignmentPolicy};
+use boxel::app::{IdleInfo, TaskPoolOptions, TaskPoolThreadAssignmentPolicy};
 use boxel::gfx::{CLI_HELP, PresentModePref};
 use boxel::log::span_times::{self, SpanFrame, SpanTimes};
 use boxel::mesh::AoPolicy;
@@ -119,6 +125,8 @@ usage: stress [--scenario static|fly|dive|spin] [GPU options] [options]
   --time HH[:MM]      clock time of the world, kept still (default 12:00)
   --light on|off      voxel light and ambient occlusion (default on); off: neither, the look and
                       the cost of the world before light
+  --idle-work on|off  the world's work between frames under --fps-limit (default on, ADR 0022);
+                      off: in its frame steps only
   --pack DIR          block textures from a Minecraft Java resource pack (the directory with
                       pack.mcmeta; default: procedural); the summary records it and its load time
   --water Y           water in every air block at or below height Y (lakes and seas), with a
@@ -219,6 +227,8 @@ struct Options {
     time: f64,
     /// `--light`: voxel light and ambient occlusion on (the default) or off.
     light: bool,
+    /// `--idle-work`: the world's work between frames on (the default) or off.
+    idle_work: bool,
     /// `--pack`.
     textures: TextureSource,
     /// `--bodies`, `--body-kind` and `--projectiles`.
@@ -268,6 +278,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         edits: false,
         time: 12.0,
         light: true,
+        idle_work: true,
         textures: TextureSource::Procedural,
         bodies: BodyOptions::default(),
         water: None,
@@ -422,19 +433,22 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                         .ok_or_else(|| format!("{flag}: {v:?} is not a height in +-2^20"))?,
                 );
             }
-            "--light" => {
-                o.light = match value()?.as_str() {
-                    "on" => true,
-                    "off" => false,
-                    v => return Err(format!("{flag}: {v:?} is not on or off")),
-                };
-            }
+            "--light" => o.light = on_off(flag, &value()?)?,
+            "--idle-work" => o.idle_work = on_off(flag, &value()?)?,
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
     o.world.validate(o.fixed_height)?;
     o.timeout = timeout.unwrap_or(SETTLE_ALLOWANCE + o.warmup + o.duration);
     Ok(Some(o))
+}
+
+fn on_off(flag: &str, value: &str) -> Result<bool, String> {
+    match value {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        v => Err(format!("{flag}: {v:?} is not on or off")),
+    }
 }
 
 fn number(flag: &str, value: &str) -> Result<u64, String> {
@@ -547,17 +561,49 @@ impl WorldGenerator for WaterGenerator {
     }
 }
 
-/// Runs jobs on the async compute pool (as `TaskPoolExecutor`) and counts the finished ones.
+/// Runs jobs on the async compute pool (as `TaskPoolExecutor`), counts the finished ones and
+/// keeps when the latest one finished.
 struct CountingExecutor {
     done: Arc<AtomicU64>,
+    last: Arc<JobClock>,
+}
+
+/// When the latest chunk job finished, in nanoseconds since `epoch` (0: none yet).
+struct JobClock {
+    epoch: Instant,
+    last_ns: AtomicU64,
+}
+
+impl JobClock {
+    fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            last_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn finished(&self) {
+        let ns = u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.last_ns.fetch_max(ns.max(1), Ordering::Relaxed);
+    }
+
+    /// The latest job end since `start` (`None`: none yet, or before `start`).
+    fn last_since(&self, start: Instant) -> Option<Duration> {
+        let ns = self.last_ns.load(Ordering::Relaxed);
+        (ns > 0)
+            .then(|| self.epoch + Duration::from_nanos(ns))
+            .and_then(|at| at.checked_duration_since(start))
+    }
 }
 
 impl JobExecutor for CountingExecutor {
     fn spawn(&self, job: Box<dyn FnOnce() + Send + 'static>) {
         let done = Arc::clone(&self.done);
+        let last = Arc::clone(&self.last);
         TaskPoolExecutor.spawn(Box::new(move || {
             job();
             done.fetch_add(1, Ordering::Relaxed);
+            last.finished();
         }));
     }
 }
@@ -664,8 +710,14 @@ impl SpanRecorder {
 struct Recorder {
     generated: Arc<AtomicU64>,
     jobs_done: Arc<AtomicU64>,
+    /// When the latest chunk job finished.
+    job_clock: Arc<JobClock>,
+    /// Start of the measurement (the origin of the records' times).
+    measure_start: Option<Instant>,
     last_generated: u64,
     last_jobs: u64,
+    /// `IdleInfo::overruns` seen by the previous `record`.
+    last_overruns: u64,
     last_stats: WorldStats,
     last_presented: u64,
     /// Quads of every mesh sent to the renderer and not removed.
@@ -679,12 +731,20 @@ struct Recorder {
 impl Recorder {
     /// `slots`: the renderer's chunk table, the most meshes resident at once (the quad map is
     /// allocated once so it never rehashes during the measurement).
-    fn new(generated: Arc<AtomicU64>, jobs_done: Arc<AtomicU64>, slots: usize) -> Self {
+    fn new(
+        generated: Arc<AtomicU64>,
+        jobs_done: Arc<AtomicU64>,
+        job_clock: Arc<JobClock>,
+        slots: usize,
+    ) -> Self {
         Self {
             generated,
             jobs_done,
+            job_clock,
+            measure_start: None,
             last_generated: 0,
             last_jobs: 0,
+            last_overruns: 0,
             last_stats: WorldStats::default(),
             last_presented: 0,
             resident: HashMap::with_capacity(slots),
@@ -728,12 +788,14 @@ fn gpu_failed(
 
 /// `PreUpdate`: completes the record of the previous frame. Its `Time::real_delta` (measured
 /// at this frame's `First`) spans that whole frame; `WorldStats` (its `Last`), `RenderInfo` (its
-/// `Render`) and the mesh messages (its `Update`) belong to it too. With `--spans`, so do the
-/// span times the layer closed when this frame's `Main` schedule started.
+/// `Render`), the mesh messages (its `Update` and the idle steps after it) and `IdleInfo` (the
+/// idle steps between it and this frame) belong to it too. With `--spans`, so do the span times
+/// the layer closed when this frame's `Main` schedule started.
 fn record(
     time: Res<Time>,
     stats: Res<WorldStats>,
     info: Res<RenderInfo>,
+    idle: Option<Res<IdleInfo>>,
     mut events: MessageReader<ChunkMeshEvent>,
     mut rec: ResMut<Recorder>,
     mut spans: Option<ResMut<SpanRecorder>>,
@@ -762,6 +824,10 @@ fn record(
     let generated = rec.generated.load(Ordering::Relaxed);
     let jobs = rec.jobs_done.load(Ordering::Relaxed);
     let now = *stats;
+    let idle = idle.as_deref().copied().unwrap_or_default();
+    let last_job_end = rec
+        .measure_start
+        .and_then(|start| rec.job_clock.last_since(start));
     if let Some(p) = rec.pending.take() {
         let delta = |a: usize, b: usize| a as i64 - b as i64;
         let record = FrameRecord {
@@ -787,6 +853,11 @@ fn record(
             gate_missed: p.gate_missed,
             gate_at: p.gate_at,
             display_locked: p.display_locked,
+            idle: idle.tail,
+            idle_steps: idle.steps,
+            idle_late: idle.late,
+            idle_overruns: idle.overruns.saturating_sub(rec.last_overruns),
+            last_job_end,
         };
         rec.log.push(record);
         if let Some(spans) = spans.as_deref_mut() {
@@ -801,6 +872,7 @@ fn record(
     }
     rec.last_generated = generated;
     rec.last_jobs = jobs;
+    rec.last_overruns = idle.overruns;
     rec.last_stats = now;
     rec.last_presented = info.frames_presented;
 }
@@ -945,6 +1017,7 @@ fn measure_frame(
     cameras: &mut Query<&mut Transform, With<Camera>>,
 ) {
     let t = now.duration_since(start);
+    rec.measure_start = Some(start);
     for mut transform in cameras.iter_mut() {
         let before = chunk_of(&transform);
         let next = camera_at(
@@ -1119,14 +1192,15 @@ fn present_mode(
     }
 }
 
-/// The world's settings: `vertical_bounds` (`--fixed-height`) and, with `--light off`, no voxel
-/// light and no ambient occlusion (the world before light).
+/// The world's settings: `vertical_bounds` (`--fixed-height`), `idle_work` (`--idle-work`)
+/// and, with `--light off`, no voxel light and no ambient occlusion (the world before light).
 fn world_settings(
     options: &Options,
     vertical_bounds: Option<RangeInclusive<i64>>,
 ) -> WorldSettings {
     let mut settings = WorldSettings {
         vertical_bounds,
+        idle_work: options.idle_work,
         ..WorldSettings::default()
     };
     if !options.light {
@@ -1161,6 +1235,7 @@ fn run_info(options: &Options, present: String) -> RunInfo {
         },
         trees: options.world.has_trees(),
         light: if options.light { "on" } else { "off" }.to_string(),
+        idle_work: if options.idle_work { "on" } else { "off" }.to_string(),
         pack: match &options.textures {
             TextureSource::Procedural => "none".to_string(),
             source => source.label(),
@@ -1288,6 +1363,7 @@ fn main() -> AppExit {
     }
     let generated = Arc::new(AtomicU64::new(0));
     let jobs_done = Arc::new(AtomicU64::new(0));
+    let job_clock = Arc::new(JobClock::new());
     let mut inner = options.world.generator(options.seed);
     if let Some(level) = options.water {
         inner = Arc::new(WaterGenerator { inner, level });
@@ -1325,6 +1401,7 @@ fn main() -> AppExit {
             }),
             executor: Arc::new(CountingExecutor {
                 done: Arc::clone(&jobs_done),
+                last: Arc::clone(&job_clock),
             }),
             settings: world_settings(&options, fixed_bounds),
             ..WorldPlugin::default()
@@ -1362,7 +1439,7 @@ fn main() -> AppExit {
         &mut app,
         options,
         info,
-        Recorder::new(generated, jobs_done, chunk_slots as usize),
+        Recorder::new(generated, jobs_done, job_clock, chunk_slots as usize),
         Instant::now(),
     );
     if let Some(times) = times {
@@ -1401,6 +1478,37 @@ mod tests {
         assert_eq!((o.csv, o.summary), (None, None));
         assert!(!o.bodies.enabled(), "no physics unless asked");
         assert!(o.light, "light on unless asked");
+        assert!(o.idle_work, "work between frames unless asked");
+    }
+
+    #[test]
+    fn idle_work_flag_reaches_the_world_and_the_summary() {
+        let on = options(&[]);
+        assert!(world_settings(&on, None).idle_work);
+        assert_eq!(run_info(&on, String::new()).idle_work, "on");
+        let off = options(&["--idle-work", "off", "--fps-limit", "144"]);
+        assert!(!world_settings(&off, None).idle_work);
+        assert_eq!(run_info(&off, String::new()).idle_work, "off");
+        assert!(options(&["--idle-work=on"]).idle_work);
+        assert!(parse(&["--idle-work", "maybe"]).is_err());
+        assert!(parse(&["--idle-work"]).is_err());
+        assert!(usage().contains("--idle-work on|off"));
+    }
+
+    #[test]
+    fn the_job_clock_keeps_the_latest_end_since_a_start() {
+        let clock = JobClock::new();
+        let start = Instant::now();
+        assert_eq!(clock.last_since(start), None, "no job yet");
+        clock.finished();
+        let first = clock.last_since(clock.epoch).expect("a job");
+        assert_eq!(clock.last_since(start + Duration::from_secs(60)), None);
+        clock.last_ns.fetch_max(1, Ordering::Relaxed);
+        assert_eq!(
+            clock.last_since(clock.epoch),
+            Some(first),
+            "never goes back"
+        );
     }
 
     #[test]
@@ -1739,9 +1847,12 @@ mod tests {
     #[test]
     fn counting_executor_counts_finished_jobs() {
         let done = Arc::new(AtomicU64::new(0));
+        let clock = Arc::new(JobClock::new());
         let executor = CountingExecutor {
             done: Arc::clone(&done),
+            last: Arc::clone(&clock),
         };
+        let start = Instant::now();
         let (tx, rx) = mpsc::channel();
         for i in 0..4 {
             let tx = tx.clone();
@@ -1755,6 +1866,10 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(done.load(Ordering::Relaxed), 4);
+        let last = clock
+            .last_since(start)
+            .expect("the jobs ended after the start");
+        assert!(last <= start.elapsed());
     }
 
     #[test]
@@ -1868,7 +1983,12 @@ mod tests {
                 frames,
                 generated: Arc::clone(&generated),
             });
-        let recorder = Recorder::new(generated, Arc::new(AtomicU64::new(0)), 16);
+        let recorder = Recorder::new(
+            generated,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(JobClock::new()),
+            16,
+        );
         let info = run_info(&options, "immediate".to_string());
         add_bench(&mut app, options, info, recorder, t0);
         app.add_systems(Update, fake_world.after(drive))
