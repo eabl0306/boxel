@@ -28,6 +28,8 @@
 //!    [`WorldSettings::max_mesh_events_per_frame`]. A mesh identical to the published one is not
 //!    sent again, and the meshes of one edit batch are published together (held up to
 //!    [`WorldSettings::edit_batch_hold`]). Then the frame's [`ChunkDataEvent`]s.
+//! 5. `Visibility`: the frame's changes of the chunks' face links go to [`ChunkVisibility`], the
+//!    cave culling state ([`visibility`], ADR 0022). The renderer searches from its camera.
 //!
 //! Systems that keep state derived from the blocks (physics, gameplay) follow the world through
 //! two messages: [`BlockChanged`] for each edited block (written in `Edits`, from the same
@@ -71,6 +73,7 @@ mod sky;
 mod streaming;
 #[cfg(test)]
 mod tests;
+pub mod visibility;
 
 pub mod jobs;
 pub mod persist;
@@ -95,6 +98,7 @@ pub use ticks::{
     BlockTickSettings, BlockTickStats, BlockTicks, BlockTicksPlugin, GAME_TICKS_PER_SECOND,
     TickContext, TickHandler,
 };
+pub use visibility::{ChunkVisibility, VisibilityStats, VisibilityView, VisibleSet};
 
 /// Common items.
 pub mod prelude {

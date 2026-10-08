@@ -5,7 +5,7 @@ use crate::map::DataChange;
 use crate::neighbor_rules::NeighborRules;
 use crate::sky::{SkyMap, SkyRule};
 use crate::streaming::{Ctx, ViewerChunks, WorldJobs};
-use crate::{ChunkId, ChunkMap, WorldStats};
+use crate::{ChunkId, ChunkMap, ChunkVisibility, WorldStats};
 use boxel_app::{App, FrameDeadline, Last, Plugin, Update};
 use boxel_diagnostic::DiagnosticsBoard;
 use boxel_ecs::prelude::*;
@@ -136,6 +136,10 @@ pub struct WorldSettings {
     /// 2 at 60 Hz or less (the frame floor); a batch only waits that long when one of its jobs is
     /// late.
     pub edit_batch_hold: Duration,
+    /// Cave culling (ADR 0022): the renderer skips the chunks its camera cannot see through
+    /// open space (caves from the surface, the surface from deep caves), found by a search over
+    /// the face links of the chunks ([`ChunkVisibility`]). Read every frame. Default on.
+    pub cave_culling: bool,
 }
 
 impl Default for WorldSettings {
@@ -153,6 +157,7 @@ impl Default for WorldSettings {
             sky_walk_limit: DEFAULT_WALK_LIMIT,
             light_cache_radius: 8,
             edit_batch_hold: Self::DEFAULT_EDIT_BATCH_HOLD,
+            cave_culling: true,
         }
     }
 }
@@ -330,6 +335,9 @@ pub enum WorldSystems {
     Dispatch,
     /// Publish mesh results as `ChunkMeshEvent`s (up to `max_mesh_events_per_frame`).
     Collect,
+    /// Bring [`ChunkVisibility`] up to date with the frame's changes of the chunks' face links
+    /// (cave culling; the renderer searches from its camera later in the frame).
+    Visibility,
 }
 
 /// Adds the world: resources (`ChunkMap`, `SkyMap`, `WorldSettings`, `WorldContent`,
@@ -390,6 +398,7 @@ impl Plugin for WorldPlugin {
             .init_resource::<WorldStats>()
             .init_resource::<ViewerChunks>()
             .init_resource::<FrameBudget>()
+            .init_resource::<ChunkVisibility>()
             .insert_resource(jobs)
             .add_message::<ChunkMeshEvent>()
             .add_message::<BlockChanged>()
@@ -401,6 +410,7 @@ impl Plugin for WorldPlugin {
                     WorldSystems::Edits,
                     WorldSystems::Dispatch,
                     WorldSystems::Collect,
+                    WorldSystems::Visibility,
                 )
                     .chain(),
             )
@@ -422,6 +432,7 @@ impl Plugin for WorldPlugin {
                     (publish_meshes, publish_data_changes)
                         .chain()
                         .in_set(WorldSystems::Collect),
+                    sync_visibility.in_set(WorldSystems::Visibility),
                 ),
             )
             .add_systems(Last, publish_stats);
@@ -530,6 +541,16 @@ fn publish_data_changes(mut map: ResMut<ChunkMap>, mut writer: MessageWriter<Chu
         DataChange::Loaded(id, key) => ChunkDataEvent::Loaded { id, key },
         DataChange::Unloaded(id, key) => ChunkDataEvent::Unloaded { id, key },
     }));
+}
+
+/// Applies the frame's changes of the chunks' face links to [`ChunkVisibility`] (always, so the
+/// map's change list never grows; the search itself runs in the renderer).
+fn sync_visibility(mut map: ResMut<ChunkMap>, mut visibility: ResMut<ChunkVisibility>) {
+    // Taking the changes changes nothing the map's readers see.
+    let changes = map.bypass_change_detection().take_face_changes();
+    if !changes.is_empty() {
+        visibility.apply_changes(&changes);
+    }
 }
 
 fn run_jobs(

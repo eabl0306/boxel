@@ -1,0 +1,335 @@
+//! The search against a brute force over (chunk, entry face) states on small random worlds,
+//! near and far from the origin, with and without a frustum; the incremental
+//! [`ChunkVisibility`] against a search from scratch.
+use super::*;
+use boxel_math::projection::{look_to, perspective_infinite_reverse};
+use boxel_math::{IVec3, Mat4};
+use boxel_voxel::{ALL_LINKS, MAX_CHUNK_COORD};
+use proptest::prelude::*;
+use std::collections::HashSet;
+
+/// Small deterministic hash of a position relative to the center and a seed: the random links
+/// of a test world, the same at any shift of the world.
+fn hash(seed: u64, d: IVec3) -> u64 {
+    let mut h = seed ^ 0x9e37_79b9_7f4a_7c15;
+    for v in [d.x, d.y, d.z] {
+        h = (h ^ v as u64).wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+    }
+    h
+}
+
+/// Random links: each pair present with probability `p_percent`, some chunks fully open or
+/// closed.
+fn random_links(seed: u64, d: IVec3, p_percent: u64) -> u16 {
+    let h = hash(seed, d);
+    match h % 16 {
+        0 => ALL_LINKS,
+        1 => 0,
+        _ => {
+            let mut links = 0;
+            for bit in 0..15 {
+                if hash(h, IVec3::new(bit, 0, 0)) % 100 < p_percent {
+                    links |= 1 << bit;
+                }
+            }
+            links
+        }
+    }
+}
+
+/// A camera at `eye` (relative to the render origin) looking along `dir`.
+fn frustum(eye: Vec3, dir: Vec3, distance: f32) -> Frustum {
+    let up = if dir.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+    let view_proj: Mat4 = perspective_infinite_reverse(70f32.to_radians(), 16.0 / 9.0, 0.1)
+        * look_to(eye, dir.normalize(), up);
+    let mut f = Frustum::from_view_proj_reverse_z(view_proj);
+    f.set_max_distance(eye, dir.normalize(), distance);
+    f
+}
+
+/// The visible chunks by brute force: a depth-first search over (chunk, entry face) states with
+/// the same rules (links, never back toward the camera along an axis, the frustum outside the
+/// 27 chunks around the camera), as relative offsets.
+fn brute_force(view: &VisibilityView, links: &impl Fn(ChunkPos) -> u16) -> HashSet<IVec3> {
+    let half = view.half();
+    let c = view.center;
+    let in_box = |d: IVec3| {
+        i64::from(d.x).abs() <= half[0]
+            && i64::from(d.y).abs() <= half[1]
+            && i64::from(d.z).abs() <= half[2]
+    };
+    let pos = |d: IVec3| {
+        ChunkPos::new(
+            c.x + i64::from(d.x),
+            c.y + i64::from(d.y),
+            c.z + i64::from(d.z),
+        )
+    };
+    let passes = |d: IVec3| {
+        if d.abs().max_element() <= 1 {
+            return true;
+        }
+        let Some(f) = &view.frustum else {
+            return true;
+        };
+        let lo = ((pos(d).as_i64vec3() << CHUNK_SHIFT) - view.render_origin).as_vec3();
+        f.intersects_aabb(&Aabb::new(lo, lo + Vec3::splat(32.0)))
+    };
+    let mut visible = HashSet::from([IVec3::ZERO]);
+    let mut seen = HashSet::new();
+    let mut stack = Vec::new();
+    for f in Face::ALL {
+        let n = f.normal();
+        if in_box(n) && passes(n) {
+            stack.push((n, f.opposite()));
+        }
+    }
+    while let Some((d, entry)) = stack.pop() {
+        if !seen.insert((d, entry)) {
+            continue;
+        }
+        visible.insert(d);
+        let l = links(pos(d));
+        for f in Face::ALL {
+            let n = f.normal();
+            // Away from the camera (or sideways at its coordinate) on the step's axis.
+            let along = n.dot(d);
+            let axis_offset = (n * d).abs().max_element();
+            if along < 0 && axis_offset != 0 {
+                continue;
+            }
+            if l & link_bit(entry, f) == 0 {
+                continue;
+            }
+            let next = d + n;
+            if in_box(next) && passes(next) {
+                stack.push((next, f.opposite()));
+            }
+        }
+    }
+    visible
+}
+
+fn link_bit(a: Face, b: Face) -> u16 {
+    boxel_voxel::link_bit(a, b)
+}
+
+/// The search's set as relative offsets (the box only).
+fn offsets(set: &VisibleSet, view: &VisibilityView) -> HashSet<IVec3> {
+    let half = view.half();
+    let mut out = HashSet::new();
+    for dy in -half[1]..=half[1] {
+        for dz in -half[2]..=half[2] {
+            for dx in -half[0]..=half[0] {
+                let c = view.center;
+                if set.is_visible(ChunkPos::new(c.x + dx, c.y + dy, c.z + dz)) {
+                    out.insert(IVec3::new(dx as i32, dy as i32, dz as i32));
+                }
+            }
+        }
+    }
+    assert_eq!(out.len(), set.visible_count());
+    out
+}
+
+/// A view centered on chunk `center` with the eye at `(16.5, 20.25, 16.5)` voxels inside it.
+fn view_at(center: ChunkPos, dir: Option<Vec3>, radius: u32, vertical: u32) -> VisibilityView {
+    let render_origin = (center.as_i64vec3() << CHUNK_SHIFT) + I64Vec3::new(16, 20, 16);
+    let eye = Vec3::new(0.5, 0.25, 0.5);
+    let frustum = dir.map(|d| frustum(eye, d, 32.0 * radius as f32));
+    let view = VisibilityView::new(render_origin, frustum, radius, vertical);
+    assert_eq!(view.center, center);
+    view
+}
+
+/// Shifts where the world is moved to: the former `i32` edge, `2^40` voxels, and the world
+/// limit (`MAX_CHUNK_COORD` chunks) on every axis, with the box crossing it.
+fn shifts() -> Vec<ChunkPos> {
+    let m = MAX_CHUNK_COORD;
+    vec![
+        ChunkPos::new(0, 0, 0),
+        ChunkPos::new((1 << 26) - 1, -(1 << 26), 1 << 26),
+        ChunkPos::new(-(1 << 35), 1 << 35, (1 << 35) + 3),
+        ChunkPos::new(m, -m, m - 1),
+        ChunkPos::new(-m + 2, m, -m),
+    ]
+}
+
+#[test]
+fn an_open_world_is_all_visible_and_a_closed_one_only_the_neighbors() {
+    let view = view_at(ChunkPos::new(3, -2, 7), None, 4, 2);
+    let open = visible_chunks(&view, |_| ALL_LINKS);
+    assert_eq!(open.visible_count(), 9 * 5 * 9);
+    let closed = visible_chunks(&view, |_| 0);
+    let got = offsets(&closed, &view);
+    let mut want: HashSet<IVec3> = Face::ALL.iter().map(|f| f.normal()).collect();
+    want.insert(IVec3::ZERO);
+    assert_eq!(got, want);
+    // Outside the box: visible.
+    assert!(closed.is_visible(ChunkPos::new(3 + 5, -2, 7)));
+    assert!(closed.is_visible(ChunkPos::new(3, -2 + 3, 7)));
+    assert!(!closed.is_visible(ChunkPos::new(3 + 4, -2, 7)));
+    assert!(!closed.covers(ChunkPos::new(3 - 5, -2, 7)));
+}
+
+#[test]
+fn a_straight_tunnel_is_seen_along_its_axis_only() {
+    // Only +X/-X links: from the camera's chunk the row along x is visible, nothing else past
+    // the 6 neighbors.
+    let view = view_at(ChunkPos::new(0, 0, 0), None, 5, 3);
+    let tunnel = link_bit(Face::PosX, Face::NegX);
+    let set = visible_chunks(&view, |_| tunnel);
+    let got = offsets(&set, &view);
+    let mut want: HashSet<IVec3> = (-5..=5).map(|x| IVec3::new(x, 0, 0)).collect();
+    want.extend(Face::ALL.iter().map(|f| f.normal()));
+    assert_eq!(got, want);
+    // An L bend (enter -X, leave +Z) is followed; a U turn back toward the camera is not.
+    let bend = |p: ChunkPos| match (p.x, p.z) {
+        (1..=2, 0) => tunnel,
+        (3, 0) => link_bit(Face::NegX, Face::PosZ),
+        (3, 1..=5) => link_bit(Face::NegZ, Face::PosZ) | link_bit(Face::NegZ, Face::NegX),
+        _ => 0,
+    };
+    let got = offsets(&visible_chunks(&view, bend), &view);
+    for z in 1..=5 {
+        assert!(got.contains(&IVec3::new(3, 0, z)), "bend at z = {z}");
+        assert!(
+            !got.contains(&IVec3::new(2, 0, z)),
+            "no turn back toward x = 0"
+        );
+    }
+    assert_eq!(got, brute_force(&view, &bend));
+}
+
+#[test]
+fn search_matches_brute_force_far_from_the_origin() {
+    let mut rng_seed = 1u64;
+    for &shift in &shifts() {
+        for dir in [
+            None,
+            Some(Vec3::new(1.0, -0.3, 0.2)),
+            Some(Vec3::new(-0.2, 0.9, -0.4)),
+            Some(Vec3::new(0.0, -1.0, 0.0)),
+        ] {
+            for p in [35, 55, 75] {
+                rng_seed += 1;
+                let seed = rng_seed;
+                let view = view_at(shift, dir, 5, 3);
+                let c = view.center;
+                let links = move |pos: ChunkPos| {
+                    let d = IVec3::new(
+                        (pos.x - c.x) as i32,
+                        (pos.y - c.y) as i32,
+                        (pos.z - c.z) as i32,
+                    );
+                    random_links(seed, d, p)
+                };
+                let set = visible_chunks(&view, links);
+                let got = offsets(&set, &view);
+                assert_eq!(
+                    got,
+                    brute_force(&view, &links),
+                    "shift {shift:?} dir {dir:?}"
+                );
+                // The same world near the origin gives the same set.
+                let near = view_at(ChunkPos::new(0, 0, 0), dir, 5, 3);
+                let near_links = move |pos: ChunkPos| {
+                    random_links(
+                        seed,
+                        IVec3::new(pos.x as i32, pos.y as i32, pos.z as i32),
+                        p,
+                    )
+                };
+                let near_set = visible_chunks(&near, near_links);
+                assert_eq!(offsets(&near_set, &near), got, "shift {shift:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_frustum_only_removes_chunks() {
+    let view = view_at(ChunkPos::new(0, 0, 0), None, 6, 3);
+    let links = |p: ChunkPos| random_links(7, IVec3::new(p.x as i32, p.y as i32, p.z as i32), 60);
+    let all = offsets(&visible_chunks(&view, links), &view);
+    let ahead = view_at(
+        ChunkPos::new(0, 0, 0),
+        Some(Vec3::new(0.3, -0.1, -1.0)),
+        6,
+        3,
+    );
+    let seen = offsets(&visible_chunks(&ahead, links), &ahead);
+    assert!(seen.is_subset(&all));
+    assert!(seen.len() < all.len());
+    // Nothing behind the camera past the chunks around it.
+    assert!(seen.iter().all(|d| d.z <= 1));
+}
+
+#[test]
+fn incremental_updates_match_a_fresh_search() {
+    let mut vis = ChunkVisibility::default();
+    let mut world: std::collections::HashMap<ChunkPos, u16> = std::collections::HashMap::new();
+    let links_of = |world: &std::collections::HashMap<ChunkPos, u16>, p: ChunkPos| {
+        world.get(&p).copied().unwrap_or(ALL_LINKS)
+    };
+    let mut seed = 99u64;
+    let mut center = ChunkPos::new(10, -3, -4);
+    for step in 0..60 {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        // Move the camera by up to 2 chunks on each axis, sometimes jump.
+        let jump = step % 17 == 16;
+        let d = |k: u32| ((seed >> k) % 5) as i64 - 2;
+        center = if jump {
+            ChunkPos::new(center.x + 40, center.y - 9, center.z)
+        } else {
+            ChunkPos::new(center.x + d(3), center.y + d(9), center.z + d(15))
+        };
+        // Change a few links around it, and tell the visibility.
+        let mut changes = Vec::new();
+        for k in 0..6u64 {
+            let h = hash(seed, IVec3::new(k as i32, 0, 0));
+            let p = ChunkPos::new(
+                center.x + (h % 9) as i64 - 4,
+                center.y + (h >> 8) as i64 % 5 - 2,
+                center.z + (h >> 16) as i64 % 9 - 4,
+            );
+            let l = random_links(h, IVec3::ZERO, 50);
+            world.insert(p, l);
+            changes.push((p, l));
+        }
+        vis.apply_changes(&changes);
+        let dir = (step % 3 != 0).then(|| Vec3::new(d(5) as f32, d(11) as f32 + 0.5, 1.0));
+        let view = view_at(center, dir, 4, 2);
+        let got = vis.update(&view, |p| links_of(&world, p));
+        let want = visible_chunks(&view, |p| links_of(&world, p));
+        assert_eq!(*got, want, "step {step}");
+        // Asking again without changes reuses the result.
+        let again = vis.update(&view, |p| links_of(&world, p));
+        assert!(Arc::ptr_eq(&got, &again));
+    }
+    assert!(vis.stats().reused >= 60);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
+    #[test]
+    fn random_worlds_match_brute_force(
+        seed in any::<u64>(),
+        p in 20u64..90,
+        radius in 1u32..6,
+        vertical in 1u32..4,
+        dir in (-1.0f32..1.0, -1.0f32..1.0, -1.0f32..1.0),
+        frustum_on in any::<bool>(),
+    ) {
+        let d = Vec3::new(dir.0, dir.1, dir.2);
+        let dir = (frustum_on && d.length() > 0.1).then_some(d);
+        let view = view_at(ChunkPos::new(-7, 4, 11), dir, radius, vertical);
+        let links = |pos: ChunkPos| {
+            random_links(seed, IVec3::new(pos.x as i32, pos.y as i32, pos.z as i32), p)
+        };
+        let set = visible_chunks(&view, links);
+        prop_assert_eq!(offsets(&set, &view), brute_force(&view, &links));
+    }
+}

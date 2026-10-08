@@ -2,7 +2,10 @@ use crate::ColumnId;
 use boxel_ecs::prelude::*;
 use boxel_light::ChunkLight;
 use boxel_mesh::ChunkMesh;
-use boxel_voxel::{BlockPos, BlockState, ChunkData, ChunkKey, ChunkPos, DimensionId, LightValue};
+use boxel_voxel::{
+    ALL_LINKS, BlockPos, BlockState, ChunkData, ChunkFaceInfo, ChunkKey, ChunkPos, DimensionId,
+    LightValue,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -18,6 +21,9 @@ impl ChunkId {
         slotmap::Key::data(&self).as_ffi()
     }
 }
+
+/// [`ChunkSlot::face_links`] while unknown (links use the low 15 bits).
+const UNKNOWN_LINKS: u16 = 1 << 15;
 
 /// Data lifecycle (orthogonal to [`MeshState`]).
 #[derive(Clone, Debug)]
@@ -104,6 +110,11 @@ pub struct ChunkSlot {
     data: DataState,
     /// Mesh state.
     mesh: MeshState,
+    /// Which faces of the chunk see each other through its open voxels (cave culling, ADR
+    /// 0022): the [`ChunkFaceInfo::links`] of its current data, computed by the generation job,
+    /// cleared by an edit that changes what occludes and computed again by the next mesh job.
+    /// [`UNKNOWN_LINKS`] while unknown (a `u16` keeps the slot at 112 bytes).
+    face_links: u16,
     /// Interest flags.
     pub interest: Interest,
     /// Bit `i` set when neighbor `NEIGHBOR_OFFSETS[i]` is `Ready` or `Missing` (26 bits). Only
@@ -112,14 +123,12 @@ pub struct ChunkSlot {
     pub neighbors_ready: u32,
     /// Bumped when a neighbor's border data changes (closes the neighbor-staleness gap).
     pub epoch: u32,
-    /// A remesh was requested while a job was in flight.
-    remesh_pending: bool,
+    /// [`REMESH_PENDING`], [`SKY_EDITED`] and [`LIGHT_JOB`] (one byte, so the slot stays at
+    /// 112 bytes).
+    bits: u8,
     /// The mesh job is waiting for a sky tile of its 3x3 columns (counted in
     /// [`WorldStats::waiting_sky`]).
     pub(crate) waits_sky: bool,
-    /// An edit changed a voxel that stops direct sky here: unloading the chunk loses the edit
-    /// (no persistence yet), so its column is walked again.
-    pub(crate) sky_edited: bool,
     /// The edit batch whose remesh this slot belongs to (its mesh is published with the rest of
     /// the batch).
     pub(crate) batch: Option<u32>,
@@ -131,9 +140,15 @@ pub struct ChunkSlot {
     /// ([`ChunkMap::light_at`]): from its mesh job, or from a light job when the mesh job did not
     /// keep it (the chunk was farther then, or it is meshed without a job).
     pub(crate) light: Option<Arc<CachedLight>>,
-    /// A light job for this slot is queued or running (at most one).
-    pub(crate) light_job: bool,
 }
+
+/// [`ChunkSlot::bits`]: a remesh was requested while a job was in flight.
+const REMESH_PENDING: u8 = 1;
+/// [`ChunkSlot::bits`]: an edit changed a voxel that stops direct sky here: unloading the chunk
+/// loses the edit (no persistence yet), so its column is walked again.
+const SKY_EDITED: u8 = 1 << 1;
+/// [`ChunkSlot::bits`]: a light job for this slot is queued or running (at most one).
+const LIGHT_JOB: u8 = 1 << 2;
 
 /// A chunk's cached light and the content it was computed from (one allocation, so the slot
 /// stays small).
@@ -231,17 +246,16 @@ impl ChunkSlot {
             lod: key.lod,
             data: DataState::Queued,
             mesh: MeshState::None,
+            face_links: UNKNOWN_LINKS,
             interest: Interest::empty(),
             neighbors_ready: 0,
             epoch: 0,
-            remesh_pending: false,
+            bits: 0,
             waits_sky: false,
-            sky_edited: false,
             batch: None,
             cancel: Arc::new(AtomicBool::new(false)),
             column,
             light: None,
-            light_job: false,
         }
     }
     /// The chunk's key, as events, jobs and stores see it.
@@ -262,7 +276,49 @@ impl ChunkSlot {
     }
     /// A remesh was requested while a job was in flight.
     pub fn remesh_pending(&self) -> bool {
-        self.remesh_pending
+        self.bits & REMESH_PENDING != 0
+    }
+    fn set_bit(&mut self, bit: u8, on: bool) {
+        if on {
+            self.bits |= bit;
+        } else {
+            self.bits &= !bit;
+        }
+    }
+    /// An edit changed a voxel that stops direct sky here: unloading the chunk loses the edit
+    /// (no persistence yet), so its column is walked again.
+    pub(crate) fn sky_edited(&self) -> bool {
+        self.bits & SKY_EDITED != 0
+    }
+    /// Sets [`ChunkSlot::sky_edited`].
+    pub(crate) fn set_sky_edited(&mut self) {
+        self.bits |= SKY_EDITED;
+    }
+    /// A light job for this slot is queued or running (at most one).
+    pub(crate) fn light_job(&self) -> bool {
+        self.bits & LIGHT_JOB != 0
+    }
+    /// Sets [`ChunkSlot::light_job`].
+    pub(crate) fn set_light_job(&mut self, on: bool) {
+        self.set_bit(LIGHT_JOB, on);
+    }
+    /// Which faces of the chunk see each other through its open voxels
+    /// ([`ChunkFaceInfo::links`]), for its current data (`None` while unknown: before
+    /// generation, or after an edit until the next mesh job).
+    pub fn face_links(&self) -> Option<u16> {
+        (self.face_links != UNKNOWN_LINKS).then_some(self.face_links)
+    }
+    /// The face links the visibility search uses for this chunk ([`ChunkFaceInfo::links`]):
+    /// its own once its mesh is settled (`Ready` or `Empty`, so the renderer shows the blocks
+    /// the links were computed from) and its faces are known; otherwise every link
+    /// ([`ALL_LINKS`]: a chunk not loaded, not generated or not meshed yet counts as open).
+    pub fn visibility_links(&self) -> u16 {
+        match (&self.mesh, self.face_links()) {
+            (MeshState::Ready { .. } | MeshState::Empty, Some(links)) if !self.remesh_pending() => {
+                links
+            }
+            _ => ALL_LINKS,
+        }
     }
     /// The chunk's light (32^3), as of its last mesh or light job. `None` outside
     /// `WorldSettings::light_cache_radius`, before the chunk's first mesh or light job, or with
@@ -280,7 +336,7 @@ impl ChunkSlot {
         };
         (cached.data_version == data.version
             && cached.epoch == self.epoch
-            && !self.remesh_pending
+            && !self.remesh_pending()
             && self.batch.is_none())
         .then_some(&cached.light)
     }
@@ -297,7 +353,7 @@ impl ChunkSlot {
             MeshState::None | MeshState::Queued | MeshState::InFlight { .. } => 0,
         };
         // One count per slot (`remesh_pending` is only set while a job is in flight).
-        let meshing = if self.remesh_pending
+        let meshing = if self.remesh_pending()
             || matches!(self.mesh, MeshState::Queued | MeshState::InFlight { .. })
         {
             MESHING
@@ -348,6 +404,9 @@ pub struct ChunkMap {
     /// Slots whose data became readable or stopped being readable, in order, until the world
     /// plugin publishes them (`ChunkDataEvent`).
     data_changes: Vec<DataChange>,
+    /// Positions whose [`ChunkSlot::visibility_links`] changed (a removed slot counts as
+    /// [`ALL_LINKS`]), with the new links, in order, until the visibility system takes them.
+    face_changes: Vec<(ChunkPos, u16)>,
 }
 
 impl ChunkMap {
@@ -358,6 +417,12 @@ impl ChunkMap {
     /// Id at a position.
     pub fn id_at(&self, pos: ChunkPos) -> Option<ChunkId> {
         self.index.get(&pos).copied()
+    }
+    /// [`ChunkSlot::visibility_links`] of the chunk at `pos` ([`ALL_LINKS`] if not loaded).
+    pub fn visibility_links_at(&self, pos: ChunkPos) -> u16 {
+        self.id_at(pos)
+            .and_then(|id| self.slots.get(id))
+            .map_or(ALL_LINKS, ChunkSlot::visibility_links)
     }
     /// Ready data at a position.
     pub fn data_at(&self, pos: ChunkPos) -> Option<&Arc<ChunkData>> {
@@ -433,7 +498,7 @@ impl ChunkMap {
                 MeshState::Empty => stats.mesh_empty += 1,
                 MeshState::None | MeshState::Queued | MeshState::InFlight { .. } => {}
             }
-            if slot.remesh_pending
+            if slot.remesh_pending()
                 || matches!(slot.mesh, MeshState::Queued | MeshState::InFlight { .. })
             {
                 stats.meshing += 1;
@@ -460,6 +525,9 @@ impl ChunkMap {
         let slot = self.slots.remove(id)?;
         self.index.remove(&slot.pos);
         self.tally.change(slot.tally_bits(), 0);
+        if slot.visibility_links() != ALL_LINKS {
+            self.face_changes.push((slot.pos, ALL_LINKS));
+        }
         if slot.data.is_readable() {
             self.data_changes.push(DataChange::Unloaded(id, slot.key()));
         }
@@ -469,9 +537,13 @@ impl ChunkMap {
     /// goes through here. Panics if `id` is not loaded.
     fn update<R>(&mut self, id: ChunkId, f: impl FnOnce(&mut ChunkSlot) -> R) -> R {
         let slot = &mut self.slots[id];
-        let before = slot.tally_bits();
+        let (before, links) = (slot.tally_bits(), slot.visibility_links());
         let out = f(slot);
         self.tally.change(before, slot.tally_bits());
+        let now = slot.visibility_links();
+        if now != links {
+            self.face_changes.push((slot.pos, now));
+        }
         out
     }
     /// Sets a slot's data state (and records it when its blocks become readable or stop being
@@ -498,6 +570,16 @@ impl ChunkMap {
     pub(crate) fn has_data_changes(&self) -> bool {
         !self.data_changes.is_empty()
     }
+    /// Sets a slot's face links ([`ChunkSlot::face_links`]).
+    pub(crate) fn set_faces(&mut self, id: ChunkId, faces: Option<ChunkFaceInfo>) {
+        self.update(id, |slot| {
+            slot.face_links = faces.map_or(UNKNOWN_LINKS, |f| f.links);
+        });
+    }
+    /// The recorded changes of [`ChunkSlot::visibility_links`], oldest first (cleared).
+    pub(crate) fn take_face_changes(&mut self) -> Vec<(ChunkPos, u16)> {
+        std::mem::take(&mut self.face_changes)
+    }
     /// Sets a slot's mesh state.
     pub(crate) fn set_mesh(&mut self, id: ChunkId, mesh: MeshState) {
         self.update(id, |slot| slot.mesh = mesh);
@@ -506,7 +588,7 @@ impl ChunkMap {
     pub(crate) fn set_mesh_and_pending(&mut self, id: ChunkId, mesh: MeshState, pending: bool) {
         self.update(id, |slot| {
             slot.mesh = mesh;
-            slot.remesh_pending = pending;
+            slot.set_bit(REMESH_PENDING, pending);
         });
     }
     /// Sets a slot's cached light.
@@ -515,7 +597,7 @@ impl ChunkMap {
     }
     /// Sets a slot's remesh request.
     pub(crate) fn set_remesh_pending(&mut self, id: ChunkId, pending: bool) {
-        self.update(id, |slot| slot.remesh_pending = pending);
+        self.update(id, |slot| slot.set_bit(REMESH_PENDING, pending));
     }
     /// The data of a `Ready` slot, to edit in place (the slot stays `Ready`, so its counts do
     /// not change). `None` if the slot is not loaded or not `Ready`.
