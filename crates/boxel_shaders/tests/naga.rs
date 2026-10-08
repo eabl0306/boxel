@@ -280,6 +280,7 @@ fn wgsl_bit_layout_matches_boxel_mesh() {
         ("SHAPE_TURNED", u32::from(l::SHAPE_TURNED)),
         ("SHAPE_CROSS", u32::from(l::SHAPE_CROSS)),
         ("SHAPE_FLUID_SURFACE", u32::from(l::SHAPE_FLUID_SURFACE)),
+        ("SHAPE_FLUID_SLOPE", u32::from(l::SHAPE_FLUID_SLOPE)),
         ("SHAPE_BOX", u32::from(l::SHAPE_BOX)),
         ("GEO_BOX_MASK", l::GEO_BOX_MASK),
         ("BOX_COORD_BITS", l::BOX_COORD_BITS),

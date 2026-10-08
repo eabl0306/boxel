@@ -10,12 +10,14 @@
 //! so a merged quad is exact. [`AoPolicy`] says which faces get AO.
 //! No ECS, no GPU.
 
+mod fluid;
 mod greedy;
 mod mesher;
 mod packed;
 mod padded;
 pub mod shading;
 
+pub use fluid::{FLAT as FLUID_FLAT, reference_fluid_heights};
 pub use mesher::{
     AoPolicy, MaterialTable, MeshInput, MeshOptions, Mesher, reference_box_face_shading_at,
     reference_face_shading, reference_face_shading_at, reference_visible_faces,

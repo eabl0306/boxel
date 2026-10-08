@@ -127,7 +127,22 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
         "boxel:log[axis=y]",
         "boxel:log[axis=z]",
         "boxel:leaves",
-        "boxel:water",
+        "boxel:water[level=0]",
+        "boxel:water[level=1]",
+        "boxel:water[level=2]",
+        "boxel:water[level=3]",
+        "boxel:water[level=4]",
+        "boxel:water[level=5]",
+        "boxel:water[level=6]",
+        "boxel:water[level=7]",
+        "boxel:water[level=8]",
+        "boxel:water[level=9]",
+        "boxel:water[level=10]",
+        "boxel:water[level=11]",
+        "boxel:water[level=12]",
+        "boxel:water[level=13]",
+        "boxel:water[level=14]",
+        "boxel:water[level=15]",
         "boxel:planks",
         "boxel:lamp_orange",
         "boxel:lamp_red",
@@ -151,7 +166,10 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
     assert_eq!(r.block_count(), 26);
     // A plain name is the default state.
     assert_eq!(r.by_name("boxel:log"), Some(BlockState(9)));
-    assert_eq!(r.by_name("boxel:stone_slab"), Some(BlockState(20)));
+    assert_eq!(r.by_name("boxel:stone_slab"), Some(BlockState(35)));
+    // Water: the source is the default (ADR 0021).
+    assert_eq!(r.by_name("boxel:water"), Some(BlockState(12)));
+    assert_eq!(r.property(BlockState(19), "level"), Some("7"));
     assert_eq!(
         r.by_name("boxel:log[axis=x]"),
         None,
@@ -170,7 +188,7 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
     assert_eq!(tex(grass, Face::PosX), "boxel:grass_side");
     assert_eq!(r.textures().len(), 22);
     // The emitters: opaque solid cubes with their own texture.
-    for (i, name) in states.iter().enumerate().skip(14).take(5) {
+    for (i, name) in states.iter().enumerate().skip(29).take(5) {
         let s = BlockState(i as u16);
         assert_eq!(r.shape(s), RenderShape::Opaque, "{name}");
         assert_eq!(tex(s, Face::PosX), *name);
@@ -182,7 +200,13 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
     assert_eq!(r.collision(glass), &BlockCollision::Full);
     assert_eq!(r.light_opacity(glass), 0);
     assert!(!r.flags(glass).contains(StateFlags::FLUID));
-    assert!(r.flags(BlockState(12)).contains(StateFlags::FLUID));
+    for level in 12..=27 {
+        let water = BlockState(level);
+        assert!(r.flags(water).contains(StateFlags::FLUID));
+        assert_eq!(r.model(water), BlockModel::Fluid);
+        assert_eq!(r.light_opacity(water), 1);
+        assert_eq!(r.collision(water), &BlockCollision::None);
+    }
     for (name, half) in [
         ("boxel:stone_slab[type=bottom]", SlabHalf::Bottom),
         ("boxel:stone_slab[type=top]", SlabHalf::Top),

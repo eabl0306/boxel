@@ -51,6 +51,17 @@ pub mod layout {
     pub const SHAPE_FLUID_SURFACE: u8 = 5;
     /// Height of a fluid's surface within its cell (14/16, about Minecraft's 8/9).
     pub const FLUID_SURFACE: f32 = 0.875;
+    /// A face of a fluid cell whose top is not flat (flowing water, a slope down to a drop;
+    /// ADR 0021): the top's 4 corners have their own heights, given in sixteenths of a block by
+    /// the quad ([`PackedQuad::fluid_heights`](crate::PackedQuad::fluid_heights)). Per-block quads (`w = h = 1`): the 10 bits of
+    /// `w - 1` and `h - 1` hold the heights of corners 0 and 1 (bits 15..19 and 19..23, 4 bits
+    /// each, `height - 1`) and the AO byte those of corners 2 and 3 (the quad has no AO). Corner
+    /// `k` of the cell's top is at `(x, z) = (k & 1, k >> 1)`. The +Y face is the quad through
+    /// the 4 corners, the side faces run from `y = 0` up to the corners of their edge and the
+    /// -Y face is the cube's.
+    pub const SHAPE_FLUID_SLOPE: u8 = 7;
+    /// Shift of the corner heights in `geo` of a [`SHAPE_FLUID_SLOPE`] quad (corners 0 and 1).
+    pub const GEO_FLUID_SHIFT: u32 = GEO_W_SHIFT;
     /// A face of one box of a block model made of boxes (slabs, stairs, fences, torches; ADR
     /// 0020): the quad's `w - 1` and `h - 1` bits hold the box's index in the model box table
     /// (`MaterialTable::model_boxes`, [`GEO_BOX_SHIFT`]), which the shader reads from its view
@@ -177,13 +188,56 @@ impl PackedQuad {
             (self.geo >> GEO_Z_SHIFT) & GEO_POS_MASK,
         ]
     }
-    /// Extent along u (1..=32).
+    /// Extent along u (1..=32; 1 for a [`layout::SHAPE_FLUID_SLOPE`] quad, whose extent bits
+    /// hold corner heights).
     pub const fn w(self) -> u32 {
+        if self.shape() == layout::SHAPE_FLUID_SLOPE {
+            return 1;
+        }
         ((self.geo >> layout::GEO_W_SHIFT) & layout::GEO_POS_MASK) + 1
     }
-    /// Extent along v (1..=32).
+    /// Extent along v (1..=32; 1 for a [`layout::SHAPE_FLUID_SLOPE`] quad).
     pub const fn h(self) -> u32 {
+        if self.shape() == layout::SHAPE_FLUID_SLOPE {
+            return 1;
+        }
         ((self.geo >> layout::GEO_H_SHIFT) & layout::GEO_POS_MASK) + 1
+    }
+    /// The 4 top corner heights of a [`layout::SHAPE_FLUID_SLOPE`] quad's cell, in sixteenths of
+    /// a block (`1..=16`; corner `k` at `(x, z) = (k & 1, k >> 1)`), or `None` for another shape.
+    pub const fn fluid_heights(self) -> Option<[u8; 4]> {
+        if self.shape() != layout::SHAPE_FLUID_SLOPE {
+            return None;
+        }
+        let low = self.geo >> layout::GEO_FLUID_SHIFT;
+        let high = self.mat >> layout::MAT_AO_SHIFT;
+        Some([
+            (low & 15) as u8 + 1,
+            ((low >> 4) & 15) as u8 + 1,
+            (high & 15) as u8 + 1,
+            ((high >> 4) & 15) as u8 + 1,
+        ])
+    }
+    /// The quad with shape [`layout::SHAPE_FLUID_SLOPE`] and these corner heights (sixteenths,
+    /// `1..=16`, debug-asserted). Debug-asserts `w = h = 1`; replaces the AO byte.
+    pub const fn with_fluid_heights(self, heights: [u8; 4]) -> Self {
+        use layout::*;
+        debug_assert!(self.w() == 1 && self.h() == 1);
+        let mut k = 0;
+        while k < 4 {
+            debug_assert!(heights[k] >= 1 && heights[k] <= 16);
+            k += 1;
+        }
+        let h = [
+            (heights[0].wrapping_sub(1) & 15) as u32,
+            (heights[1].wrapping_sub(1) & 15) as u32,
+            (heights[2].wrapping_sub(1) & 15) as u32,
+            (heights[3].wrapping_sub(1) & 15) as u32,
+        ];
+        let mut quad = self.with_shape(SHAPE_FLUID_SLOPE);
+        quad.geo = (quad.geo & !(0xFF << GEO_FLUID_SHIFT)) | (h[0] | h[1] << 4) << GEO_FLUID_SHIFT;
+        quad.mat = (quad.mat & !(0xFF << MAT_AO_SHIFT)) | (h[2] | h[3] << 4) << MAT_AO_SHIFT;
+        quad
     }
     /// Face (invalid bit patterns map to `NegZ`).
     pub const fn face(self) -> Face {
@@ -229,12 +283,16 @@ impl PackedQuad {
     pub const fn layer(self) -> u16 {
         (self.mat & layout::MAT_LAYER_MASK) as u16
     }
-    /// AO of corner `k` (0..=3, 3 = open).
+    /// AO of corner `k` (0..=3, 3 = open; open for a [`layout::SHAPE_FLUID_SLOPE`] quad).
     pub const fn ao(self, k: usize) -> u8 {
-        ((self.mat >> (layout::MAT_AO_SHIFT + 2 * k as u32)) & 3) as u8
+        (self.ao_byte() >> (2 * k as u32)) & 3
     }
-    /// The packed AO byte (corner `k` at bits `2k..2k+2`).
+    /// The packed AO byte (corner `k` at bits `2k..2k+2`; open, `0xFF`, for a
+    /// [`layout::SHAPE_FLUID_SLOPE`] quad, whose AO bits hold corner heights).
     pub const fn ao_byte(self) -> u8 {
+        if self.shape() == layout::SHAPE_FLUID_SLOPE {
+            return 0xFF;
+        }
         (self.mat >> layout::MAT_AO_SHIFT) as u8
     }
     /// Light palette index.

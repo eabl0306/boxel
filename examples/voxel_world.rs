@@ -21,6 +21,10 @@
 //! `CharacterController`) that WASD moves along the view and Space makes jump, with the camera at
 //! its eye. F3 shows the mode and a physics line (`PhysicsStats`) in both modes.
 //!
+//! Water flows (ADR 0021, `FluidPlugin`): placed water is a source that spreads 7 blocks and
+//! falls, breaking a block next to a lake or the sea lets it flow, and F3 shows the first water
+//! along the view with its level (`boxel:water[level=3]`) and a line of the block ticks.
+//!
 //! Day and night: a day lasts 20 minutes. `[` and `]` move the clock one hour back and forward,
 //! T pauses it and F runs it 60 times faster; `--time HH:MM` sets the start (noon by default).
 //! `--lamps` places the colored lamps and some lava around the start and begins at night.
@@ -52,14 +56,14 @@ use boxel::camera::FlyCameraSystems;
 use boxel::debug_overlay::{Crosshair, CrosshairTarget, OverlayLines};
 use boxel::gfx::wgpu::PresentMode;
 use boxel::gfx::{CLI_HELP, DeviceClass, RgbaImage};
-use boxel::physics::{PhysicsPlugin, Probe as VoxelProbe};
+use boxel::physics::{PhysicsPlugin, Probe as VoxelProbe, SwimPlugin};
 use boxel::prelude::*;
 use boxel::render::{DebugDestroyDevice, GpuFailed, GpuReady, SurfaceInfo, TextureSource};
 use boxel::voxel::rules;
 use boxel::voxel::{Axis, BlockModel, BlockRegistry, Facing, MAX_BLOCK_COORD, SlabHalf};
 use boxel::window::winit::dpi::PhysicalSize;
 use boxel::window::{PrimaryWindow, WindowResized};
-use boxel::world::{BlockEdit, TimeOfDay, WorldContent, WorldStats, WorldSystems};
+use boxel::world::{BlockEdit, FluidPlugin, TimeOfDay, WorldContent, WorldStats, WorldSystems};
 use player::WalkPlugin;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -1311,6 +1315,20 @@ fn face_name(face: Face) -> &'static str {
     }
 }
 
+/// The F3 line of the first fluid along the view (water passes the picking ray).
+fn fluid_line(fluid: Option<VoxelHit>, registry: &BlockRegistry) -> String {
+    match fluid {
+        Some(hit) => format!(
+            "Fluid {} {} {} {}",
+            registry.state_name(hit.state),
+            hit.block.x,
+            hit.block.y,
+            hit.block.z
+        ),
+        None => "Fluid none".to_string(),
+    }
+}
+
 /// The F3 lines of block picking.
 fn picking_lines(picking: &Picking, registry: &BlockRegistry) -> [String; 2] {
     let target = match &picking.target {
@@ -1392,6 +1410,22 @@ fn pick_blocks(
     if picking.target != target {
         picking.target = target;
     }
+    // The first fluid along the view, for F3 (the picking ray goes through water).
+    let fluid = cameras
+        .iter()
+        .find(|(camera, _)| camera.active)
+        .and_then(|(_, transform)| {
+            physics
+                .raycast_voxels(
+                    WorldPos::from_dvec3(transform.translation),
+                    transform.forward().as_dvec3(),
+                    REACH,
+                    VoxelFilter::Outline { fluids: true },
+                )
+                .hit()
+                .copied()
+        })
+        .filter(|hit| physics.collision().is_fluid(hit.state));
     // The F3 light probe: the cell in front of the picked face (its light shades that face).
     if let Some(mut crosshair) = crosshair {
         let cell = target.map(|hit| hit.adjacent().unwrap_or(hit.block));
@@ -1437,6 +1471,10 @@ fn pick_blocks(
         }
         if lines.get("pick place") != Some(place.as_str()) {
             lines.set("pick place", place);
+        }
+        let fluid = fluid_line(fluid, &content.registry);
+        if lines.get("pick fluid") != Some(fluid.as_str()) {
+            lines.set("pick fluid", fluid);
         }
     }
 }
@@ -1697,7 +1735,9 @@ fn main() -> AppExit {
             .then(|| DVec3::new(options.camera[0], options.camera[1], options.camera[2])),
     };
     let mut app = App::new();
-    app.add_plugins(plugins).add_plugins(day_night);
+    // Flowing water (after `WorldPlugin`, in `DefaultPlugins`).
+    app.add_plugins(plugins)
+        .add_plugins((day_night, FluidPlugin));
     // After the plugins, so these replace the engine defaults (144 fps, vsync off).
     if let Some(fps) = fps_limit {
         app.insert_resource(FrameLimit::new(fps));
@@ -1716,6 +1756,7 @@ fn main() -> AppExit {
             max_steps_per_frame: None,
             ..PhysicsPlugin::default()
         },
+        SwimPlugin,
         PickingPlugin,
         WalkPlugin { start_walking },
     ));
@@ -1853,12 +1894,14 @@ mod tests {
                 executor: std::sync::Arc::new(InlineExecutor),
                 ..WorldPlugin::default()
             },
+            FluidPlugin,
             DaylightPlugin,
             DayNightPlugin {
                 time: clock::start_time(12.0, false),
                 lamps,
             },
             PhysicsPlugin::default(),
+            SwimPlugin,
             PickingPlugin,
             WalkPlugin::default(),
         ))
@@ -1991,6 +2034,51 @@ mod tests {
         click(&mut app, MouseButton::Left);
         assert_eq!(grab(&app), CursorGrab::Locked);
         assert_eq!(block_at(&app, BlockPos::new(0, 3, 0)), Some(grass));
+    }
+
+    #[test]
+    fn placed_water_flows_and_f3_shows_its_level() {
+        let mut app = picking_app();
+        let registry = BlockRegistry::default_blocks();
+        let water = |level: u8| {
+            registry
+                .parse_state(&format!("boxel:water[level={level}]"))
+                .expect("built-in")
+        };
+        let slot = HOTBAR
+            .iter()
+            .position(|&n| n == "boxel:water")
+            .expect("water in the hotbar");
+        app.world_mut().resource_mut::<Picking>().selected = slot;
+        // The first click grabs the cursor, the second places a source on the grass.
+        click(&mut app, MouseButton::Left);
+        click(&mut app, MouseButton::Right);
+        assert_eq!(block_at(&app, BlockPos::new(0, 4, 0)), Some(water(0)));
+        // Every update is one fixed step: 20 game ticks are 64 updates, a flow step 16.
+        for _ in 0..200 {
+            app.update();
+        }
+        for d in 1..=7 {
+            assert_eq!(
+                block_at(&app, BlockPos::new(d, 4, 0)),
+                Some(water(d as u8)),
+                "{d} blocks away"
+            );
+        }
+        assert_eq!(
+            block_at(&app, BlockPos::new(8, 4, 0)),
+            Some(BlockState::AIR)
+        );
+        let lines = app.world().resource::<OverlayLines>();
+        assert_eq!(
+            lines.get("pick fluid"),
+            Some("Fluid boxel:water[level=0] 0 4 0")
+        );
+        // Picking goes through the water to the grass.
+        assert_eq!(
+            app.world().resource::<Picking>().target.map(|t| t.block),
+            Some(BlockPos::new(0, 3, 0))
+        );
     }
 
     /// Presses or releases `key` (seen by the next update).

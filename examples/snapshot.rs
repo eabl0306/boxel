@@ -9,6 +9,9 @@
 //! Every shot of one run sees the same world: only the scene light changes with the time of day
 //! (the meshes keep their baked light, as in the game). Blocks given with `--place`, `--drop` and
 //! `--fill` are set once the area is loaded, and the shots wait for the remeshes they cause.
+//! Water flows (`FluidPlugin`, ADR 0021): with `--flow N` the edits get N game ticks (20 per
+//! second) to flow before the shots, run one by one on a stopped clock (the same pixels every
+//! run).
 //!
 //! Output (stdout): `gpu: <adapter summary>`, `textures: <source, size, pack load time>`; with
 //! edits, one `drop:` line per `--drop` (where the block landed) and `edits: set=N skipped=N
@@ -42,7 +45,9 @@ use boxel::render::{
     VoxelRenderer, light_curve, load_block_textures,
 };
 use boxel::voxel::{BlockRegistry, MAX_BLOCK_COORD};
-use boxel::world::{DaylightCurve, WorldContent, WorldStats};
+use boxel::world::{
+    BlockTickSettings, BlockTicks, DaylightCurve, FluidPlugin, WorldContent, WorldStats,
+};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::PathBuf;
@@ -71,6 +76,8 @@ usage: snapshot --camera X,Y,Z,YAW,PITCH --shot HH:MM=PATH [--shot ...] [options
                        64 blocks down in the generated world; prints where it landed)
   --fill NAME@X,Y,Z:X,Y,Z  set every block of the box between both corners (inclusive); a
                        later edit of a cell replaces an earlier one
+  --flow N             let placed water flow for N game ticks (20 a second) before the shots
+                       (default 0)
   --timeout S          wall-clock limit for loading the world, in seconds (default 300)
   --help               this text";
 
@@ -127,6 +134,8 @@ struct Options {
     edits: Vec<(String, Edit)>,
     timeout: Duration,
     textures: TextureSource,
+    /// Game ticks of fluid flow after the edits.
+    flow: u32,
 }
 
 /// `Ok(None)` for `--help`.
@@ -144,6 +153,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         edits: Vec::new(),
         timeout: Duration::from_secs(300),
         textures: TextureSource::Procedural,
+        flow: 0,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -204,6 +214,14 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                 };
             }
             "--place" | "--drop" | "--fill" => o.edits.push(parse_edit(flag, &value()?)?),
+            "--flow" => {
+                let v = value()?;
+                o.flow = v
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|&n| n <= 100_000)
+                    .ok_or_else(|| format!("{flag}: {v:?} is not in 0..=100000"))?;
+            }
             "--pack" => o.textures = pack::parse(flag, &value()?)?,
             "--timeout" => {
                 let v = value()?;
@@ -574,7 +592,10 @@ fn run(
             },
             ..WorldPlugin::default()
         },
+        FluidPlugin,
     ));
+    // The fluid clock only moves in `--flow` (deterministic shots).
+    app.world_mut().resource_mut::<BlockTickSettings>().paused = true;
     app.finish();
     app.cleanup();
     let [x, y, z, yaw, pitch] = o.camera;
@@ -619,6 +640,20 @@ fn run(
             "edits: set={} skipped={} not_applied={missing}",
             cells.len() - missing,
             skipped
+        );
+    }
+    if o.flow > 0 {
+        let mut written = 0;
+        for _ in 0..o.flow {
+            app.world_mut().resource_mut::<BlockTicks>().advance(1);
+            app.update();
+            written += app.world().resource::<BlockTicks>().stats().written;
+        }
+        settle(&mut app, deadline).map_err(timeout)?;
+        let stats = app.world().resource::<BlockTicks>().stats();
+        println!(
+            "flow: ticks={} written={written} queued={} frozen={}",
+            o.flow, stats.queued, stats.frozen
         );
     }
     let map = app.world().resource::<ChunkMap>();

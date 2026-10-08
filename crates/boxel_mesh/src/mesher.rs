@@ -1,3 +1,4 @@
+use crate::fluid::{FluidScratch, emit_sloped, find_sloped};
 use crate::greedy::Greedy;
 use crate::packed::{LightQuantization, layout, palette_entry};
 use crate::shading::{
@@ -10,8 +11,8 @@ use crate::{
 };
 use boxel_light::PaddedLight;
 use boxel_voxel::{
-    BlockModel, BlockRegistry, BlockState, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, Face, LightValue,
-    LocalPos, MAX_MODEL_BOXES, ModelBox, NEIGHBOR_OFFSETS, RenderShape, neighbor_index,
+    BlockModel, BlockRegistry, BlockState, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, FLUID_LEVEL, Face,
+    LightValue, LocalPos, MAX_MODEL_BOXES, ModelBox, NEIGHBOR_OFFSETS, RenderShape, neighbor_index,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
@@ -59,6 +60,10 @@ pub struct MaterialTable {
     emissive: Vec<bool>,
     /// Some material is a fluid (`BlockModel::Fluid`): gather marks the surface cells.
     has_fluid: bool,
+    /// Per state: the material it is meshed as (itself, but the source's material for every
+    /// level of a fluid, ADR 0021) and its fluid level (`0` for sources and non-fluids).
+    fluid_source: Vec<u16>,
+    fluid_level: Vec<u8>,
     /// The models made of boxes (ADR 0020), see [`BoxModels`].
     box_models: BoxModels,
 }
@@ -232,6 +237,8 @@ impl MaterialTable {
             codes: vec![[0u8; 6]; n],
             emissive: vec![false; n],
             has_fluid: false,
+            fluid_source: (0..n as u16).collect(),
+            fluid_level: vec![0; n],
             box_models: BoxModels {
                 shape_of: vec![NO_SHAPE; n],
                 ..BoxModels::default()
@@ -247,8 +254,35 @@ impl MaterialTable {
             table.layers[m] = Face::ALL.map(|f| registry.face_texture(s, f).0);
             table.emissive[m] = !registry.emission(s).is_dark();
             table.set_model(m as u16, registry.model(s));
+            // Every level of a fluid meshes as its source (level 0).
+            if registry.model(s) == BlockModel::Fluid
+                && let Some(level) = registry.values(s).index(FLUID_LEVEL)
+                && let Some(source) = registry.with(s, FLUID_LEVEL, "0")
+            {
+                table.set_fluid_level(m as u16, registry.material(source), level as u8);
+            }
         }
         table
+    }
+    /// Declares `material` as level `level` (`1..=15`; 0 is the source itself) of the fluid
+    /// whose source is `source`: it meshes as `source` and its level shapes the corner heights
+    /// (ADR 0021). Both must be fluids (`BlockModel::Fluid`) of the table.
+    pub fn set_fluid_level(&mut self, material: u16, source: u16, level: u8) {
+        let i = usize::from(material);
+        if i >= self.class.len() || usize::from(source) >= self.class.len() {
+            return;
+        }
+        self.fluid_source[i] = source;
+        self.fluid_level[i] = level;
+    }
+    /// The material `material` meshes as and its fluid level (itself and 0 but for the levels of
+    /// a fluid; out of range -> itself and 0).
+    pub fn fluid_level(&self, material: u16) -> (u16, u8) {
+        let i = usize::from(material);
+        match (self.fluid_source.get(i), self.fluid_level.get(i)) {
+            (Some(&source), Some(&level)) => (source, level),
+            _ => (material, 0),
+        }
     }
     /// Class of a material (out of range -> `Empty`).
     pub fn class(&self, material: u16) -> VoxelClass {
@@ -368,6 +402,8 @@ impl MaterialTable {
             model: vec![BlockModel::CUBE; n],
             codes: vec![[0; 6]; n],
             has_fluid: false,
+            fluid_source: (0..n as u16).collect(),
+            fluid_level: vec![0; n],
             box_models: BoxModels {
                 shape_of: vec![NO_SHAPE; n],
                 ..BoxModels::default()
@@ -379,7 +415,8 @@ impl MaterialTable {
     /// Mesher voxel value and class of a block state. M0 identity map (as
     /// `BlockRegistry::material`): the table is indexed by material id, and the material id of
     /// a state with geometry is the state id itself; states without geometry (and ids outside
-    /// the table) become `0` / `Empty`.
+    /// the table) become `0` / `Empty`. The levels of a fluid become their source's material
+    /// after the gather ([`remap_fluid_levels`]).
     #[inline]
     fn resolve(&self, state: BlockState) -> (u16, VoxelClass) {
         match self.class(state.0) {
@@ -410,6 +447,8 @@ struct Scratch {
     keys: Box<[u32]>,
     palette: LightPalette,
     key_table: KeyTable,
+    /// Fluid surface cells with their own corner heights (ADR 0021).
+    fluid: FluidScratch,
 }
 
 /// Reusable mesher (one per worker thread; about 0.6 MiB of scratch plus the quad lists).
@@ -436,6 +475,7 @@ impl Mesher {
                 keys: vec![0; PADDED_VOLUME].into_boxed_slice(),
                 palette: LightPalette::new(),
                 key_table: KeyTable::new(),
+                fluid: FluidScratch::new(),
             },
             padded: PaddedChunk::new(),
             dense: vec![BlockState::AIR; CHUNK_VOLUME].into_boxed_slice(),
@@ -533,8 +573,34 @@ fn gather_into(
             gather_border([offset.x, offset.y, offset.z], chunk, materials, out);
         }
     }
+    if materials.has_fluid {
+        remap_fluid_levels(materials, out);
+    }
     if materials.marks_fluid_surfaces() {
         mark_fluid_surfaces(materials, out);
+    }
+}
+
+/// Every level of a fluid becomes its source's material, so the levels cull and merge as one
+/// fluid (ADR 0021); the levels other than 0 go to [`PaddedChunk::fluid_levels`]. Visits only
+/// the transparent voxels (fluids are transparent cubes), so a chunk without water pays one read
+/// per column.
+fn remap_fluid_levels(materials: &MaterialTable, out: &mut PaddedChunk) {
+    for y in -1..=CHUNK_SIZE {
+        for x in -1..=CHUNK_SIZE {
+            let mut bits = out.transparent[mask_row(x, y)];
+            while bits != 0 {
+                // Mask bit `b` is padded z `b - 1`.
+                let z = bits.trailing_zeros() as i32 - 1;
+                bits &= bits - 1;
+                let i = PaddedChunk::index(x, y, z);
+                let (source, level) = materials.fluid_level(out.voxels[i]);
+                if level != 0 {
+                    out.voxels[i] = source;
+                    out.fluid_levels.push((i as u32, level));
+                }
+            }
+        }
     }
 }
 
@@ -687,7 +753,7 @@ fn fill_region(
 
 /// Column-mask row of padded `(x, y)` (each in -1..=32).
 #[inline]
-const fn mask_row(x: i32, y: i32) -> usize {
+pub(crate) const fn mask_row(x: i32, y: i32) -> usize {
     (x + 1) as usize + (y + 1) as usize * PADDED
 }
 
@@ -719,6 +785,8 @@ fn mesh_into(
         &padded.transparent,
         padded.cull_mask,
     );
+    // Sloped fluid cells leave the greedy pass (ADR 0021).
+    find_sloped(padded, materials, &mut s.greedy, &mut s.fluid);
     let elide = options.ao == AoPolicy::BakedLitOnly;
     let full = match light {
         None => Err(LightValue::FULL_SKY),
@@ -755,6 +823,13 @@ fn mesh_into(
                     _ => (AO_OPEN_BYTE, 0),
                 })
             });
+            let _ = emit_sloped(
+                &s.fluid.cells,
+                padded,
+                materials,
+                &mut s.specials,
+                |_, _, _| Ok((AO_OPEN_BYTE, 0)),
+            );
             if s.greedy.quads.iter().any(|q| !q.is_empty()) || !s.specials.is_empty() {
                 out.palette.push(palette_entry([v; 4]));
             }
@@ -818,14 +893,22 @@ fn mesh_lit(
         s.greedy.merge_face(face, &s.keys);
     }
     let palette = &mut s.palette;
-    emit_specials(padded, materials, &mut s.specials, |cell, face, nb9| {
+    let mut shade = |cell, face: Face, nb9| {
         let (ao, corners) = match nb9 {
             Some(nb9) => lit_shading(light, cell, face.index(), nb9, ao, elide, level),
             // A cross: the light of its own cell, AO open.
             None => (AO_OPEN_BYTE, level.apply([LightValue(light[cell]); 4])),
         };
         Ok((ao, palette.index(corners)?))
-    })
+    };
+    emit_specials(padded, materials, &mut s.specials, &mut shade)?;
+    emit_sloped(
+        &s.fluid.cells,
+        padded,
+        materials,
+        &mut s.specials,
+        &mut shade,
+    )
 }
 
 /// AO byte and corner lights of a unit face under full light: `front` is the padded index of
@@ -996,7 +1079,7 @@ fn box_face_layer(padded: &PaddedChunk, [x, y, z]: [i32; 3], face: Face) -> (usi
 }
 
 /// [`front_neighborhood`] of a face given at run time.
-fn front_nb9(face: Face, opaque: &[u64], x: usize, y: usize, z: usize) -> u32 {
+pub(crate) fn front_nb9(face: Face, opaque: &[u64], x: usize, y: usize, z: usize) -> u32 {
     match face {
         Face::PosY => front_neighborhood::<0>(opaque, x, y, z),
         Face::NegY => front_neighborhood::<1>(opaque, x, y, z),
@@ -1215,7 +1298,7 @@ fn debug_check_merged(quad: PackedQuad, light: [LightValue; 4]) {
 }
 
 /// Mesher class of padded `(x, y, z)` from the column masks (what face culling reads).
-fn class_from_masks(padded: &PaddedChunk, x: i32, y: i32, z: i32) -> VoxelClass {
+pub(crate) fn class_from_masks(padded: &PaddedChunk, x: i32, y: i32, z: i32) -> VoxelClass {
     let row = mask_row(x, y);
     let bit = 1u64 << (z + 1);
     if padded.opaque[row] & bit != 0 {

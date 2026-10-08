@@ -42,5 +42,9 @@ bench = false
 name = "interest"
 harness = false
 
+[[bench]]
+name = "fluid"
+harness = false
+
 [lints]
 workspace = true

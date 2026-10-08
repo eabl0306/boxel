@@ -41,9 +41,9 @@ pub use light::{LightTables, LightValue, MAX_LIGHT, OPAQUE_OPACITY};
 pub use masks::{LightMasks, MaskRows, MaskWords, OwnedLightMasks};
 pub use registry::{
     Axis, BlockCollision, BlockDef, BlockId, BlockModel, BlockRegistry, BlockRegistryBuilder,
-    BlockState, BuiltinLamp, CollisionBox, FaceTextures, LAMPS, LAVA_EMISSION, MAX_STATES,
-    RegistryError, RenderShape, SlabHalf, StateFlags, TORCH_EMISSION, TextureId, TexturePattern,
-    TextureSpec,
+    BlockState, BuiltinLamp, CollisionBox, FLUID_LEVEL, FaceTextures, LAMPS, LAVA_EMISSION,
+    MAX_STATES, RegistryError, RenderShape, SlabHalf, StateFlags, TORCH_EMISSION, TextureId,
+    TexturePattern, TextureSpec,
 };
 pub use shapes::{Facing, FenceSides, MAX_MODEL_BOXES, ModelBox, StairShape};
 pub use state::{Property, StateName, StateParseError, StateValues};
