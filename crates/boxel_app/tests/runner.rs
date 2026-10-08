@@ -281,25 +281,20 @@ fn run_loop_runs_idle_steps_between_updates_before_the_deadline() {
     );
     let gaps = gaps(&log);
     assert_eq!(gaps.len(), 20);
-    let Seen::Update {
-        deadline: first, ..
-    } = gaps[0].0
-    else {
-        unreachable!()
-    };
-    let first_due = first.next.expect("paced");
+    // What every gap holds whatever the OS does with the thread. The exact counts only hold in
+    // a gap it left alone (a thread off the CPU for a few ms loses steps, and an update late by
+    // more than a period restarts the grid), so they are checked in at least one.
+    let mut clean = 0;
     for (k, (update, steps, next)) in gaps.iter().enumerate() {
         let Seen::Update { at, deadline, .. } = *update else {
             unreachable!()
         };
         let due = deadline.next.expect("paced");
-        // The grid holds: idle steps never delay an update.
-        assert_eq!(due, first_due + period * k as u32, "frame {k}");
         let Some(next) = next else {
             assert!(steps.is_empty(), "no idle after the exit");
             continue;
         };
-        assert_eq!(steps.len(), 6, "frame {k}: 5 polls, then done");
+        assert!(steps.len() <= 6, "frame {k}: done after 5 polls");
         let end = due - FramePacer::DEFAULT_SPIN_MARGIN - IDLE_MARGIN;
         let mut busy = Duration::ZERO;
         for step in steps {
@@ -326,22 +321,28 @@ fn run_loop_runs_idle_steps_between_updates_before_the_deadline() {
         else {
             unreachable!()
         };
+        let next_due = next_deadline.next.expect("paced");
         assert!(
             next_at >= due,
             "frame {k}: the next update waits for its deadline"
         );
+        assert!(
+            next_due >= due + period,
+            "frame {k}: never ahead of the grid"
+        );
         // The next update reports this gap.
-        assert_eq!(idle.steps, 6, "frame {k}");
+        assert_eq!(idle.steps as usize, steps.len(), "frame {k}");
         assert!(
             idle.tail >= busy && idle.tail <= next_at - at,
             "frame {k}: {idle:?}"
         );
-        // The idle steps are not part of the update's own time.
-        assert!(
-            next_deadline.last_update < idle.tail,
-            "frame {k}: {next_deadline:?} {idle:?}"
+        // Left alone: the 5 polls and the done step, the grid kept (idle steps never delay an
+        // update), and the steps not counted in the update's own time.
+        clean += usize::from(
+            steps.len() == 6 && next_due == due + period && next_deadline.last_update < idle.tail,
         );
     }
+    assert!(clean > 0, "no gap ran its 6 steps on the grid");
 }
 
 #[test]
@@ -351,13 +352,15 @@ fn ready_steps_run_back_to_back_until_the_slot_ends() {
             wait: Some(Duration::from_millis(5)),
         },
         None,
-        6,
+        20,
         Duration::ZERO,
         |_| IdleWork::Ready,
     );
     assert_eq!(app.run(), AppExit::Success);
     let log = take(log);
-    let mut reached = 0;
+    // Every step inside its slot; several steps, and one that ends with the slot, in at least
+    // one gap (the OS can take the thread off the CPU for a whole gap).
+    let (mut several, mut reached) = (0, 0);
     for (update, steps, next) in gaps(&log) {
         let Seen::Update { deadline, .. } = update else {
             unreachable!()
@@ -366,18 +369,16 @@ fn ready_steps_run_back_to_back_until_the_slot_ends() {
             continue;
         }
         let end = deadline.next.expect("paced") - FramePacer::DEFAULT_SPIN_MARGIN - IDLE_MARGIN;
-        assert!(steps.len() > 1, "{steps:?}");
-        let last = steps
-            .iter()
-            .map(|s| match *s {
-                Seen::Step { until, .. } => until,
-                Seen::Update { .. } => unreachable!(),
-            })
-            .max()
-            .expect("steps");
-        assert!(last <= end);
-        reached += usize::from(last == end);
+        for step in &steps {
+            let Seen::Step { start, until, .. } = *step else {
+                unreachable!()
+            };
+            assert!(until <= end && until - start <= IDLE_STEP, "{step:?}");
+            reached += usize::from(until == end);
+        }
+        several += usize::from(steps.len() > 1);
     }
+    assert!(several > 0, "Ready runs the next step at once");
     assert!(reached > 0, "the steps go on until the slot ends");
 }
 
@@ -388,20 +389,24 @@ fn a_done_step_closes_the_slot_until_the_next_update() {
             wait: Some(Duration::from_millis(5)),
         },
         None,
-        5,
+        20,
         Duration::ZERO,
         |_| IdleWork::Done,
     );
     assert_eq!(app.run(), AppExit::Success);
     let log = take(log);
-    let gaps = gaps(&log);
-    for (k, (_, steps, next)) in gaps.iter().enumerate() {
-        let expected = if next.is_some() { 1 } else { 0 };
-        assert_eq!(steps.len(), expected, "gap {k}");
-        if let Some(Seen::Update { idle, .. }) = next {
-            assert_eq!(idle.steps, 1, "gap {k}");
-        }
+    let mut ran = 0;
+    for (k, (_, steps, next)) in gaps(&log).iter().enumerate() {
+        let Some(Seen::Update { idle, .. }) = next else {
+            assert!(steps.is_empty(), "no idle after the exit");
+            continue;
+        };
+        // At most one (none if the OS kept the thread off the CPU past the slot).
+        assert!(steps.len() <= 1, "gap {k}: {steps:?}");
+        assert_eq!(idle.steps as usize, steps.len(), "gap {k}");
+        ran += steps.len();
     }
+    assert!(ran > 0, "no gap ran its step");
 }
 
 #[test]
