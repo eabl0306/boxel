@@ -70,7 +70,8 @@ pub struct FrameRecord {
     pub display_locked: bool,
     /// Chunks that passed the CPU cull (`RenderInfo::visible_chunks`; Mid and Low only).
     pub visible_chunks: u32,
-    /// Resident chunks cave culling hid (`RenderInfo::occluded_chunks`).
+    /// Resident chunks outside the cave culling set (`RenderInfo::occluded_chunks`): behind
+    /// closed rock or outside the frustum.
     pub occluded: u32,
     /// How long the cave culling search took, when one ran in the frame
     /// (`VisibilityStats::last_search`).
@@ -641,7 +642,9 @@ pub struct Summary {
 pub struct Culling {
     /// Chunks that passed the CPU cull (0 on High).
     pub visible: Spread,
-    /// Resident chunks hidden by cave culling.
+    /// Resident chunks outside the cave culling set, the frustum's included: from a cave the
+    /// frustum hides most of them, so the mean barely shows cave culling turned off for a while
+    /// (an edit next to the camera). A still camera shows it frame by frame (`occluded` column).
     pub occluded: Spread,
     /// Draw calls.
     pub draws: Spread,
@@ -1457,7 +1460,7 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
         "| per frame | avg | p95 | max | first | last |\n|---|---:|---:|---:|---:|---:|"
     );
     for (name, sp) in [
-        ("chunks hidden by cave culling", &c.occluded),
+        ("chunks hidden (cave culling and frustum)", &c.occluded),
         ("chunks through the CPU cull (Mid, Low)", &c.visible),
         ("draw calls", &c.draws),
     ] {

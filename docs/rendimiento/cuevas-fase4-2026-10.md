@@ -46,8 +46,12 @@ Lo importante:
   entradas. Lo siguiente es la fase 5: enlaces por subceldas de 16³, o Hi-Z en High.
 - Las búsquedas cuestan poco: en una cueva 0.06 a 0.09 ms. Volando se busca en 1 a 5 % de los
   frames (ADR 0022, sección 4); al girar o caminar mirando a otro lado, en casi todos.
-- Las ediciones casi no cambian lo oculto: con 20 ediciones en 20 s junto a la cámara (`--edits`)
-  quedan 11 559 chunks ocultos de media, contra 11 604 sin ediciones.
+- **Cada edición junto a la cámara apaga la ocultación unos 55 ms.** Con 20 ediciones en 20 s
+  (`--edits`, quieta en la cueva), cada una de las 19 que cambian lo que ocluye apagó la ocultación
+  dentro del frustum durante 52 a 59 ms (su malla nueva y `TIGHTEN_DELAY`): del todo en 9, cuando
+  la edición cae en el chunk de la cámara, y en parte en 10. En total, 5 % del tiempo con menos
+  ocultación y 2.5 % sin ninguna. Con 5 ediciones por segundo serían alrededor de un cuarto del
+  tiempo (estimado). Ver abajo cómo se mide.
 
 ## Draws y caras (deterministas)
 
@@ -163,6 +167,27 @@ apagado (ADR 0022, sección 2).
   el ojo pasó 2 548 de 3 981 frames en la roca. Los 2 300 fps de la primera versión salían de
   ocultar cosas que se veían.
 
+## Costo de las ediciones
+
+El promedio de chunks ocultos del resumen de `stress` no muestra este costo: cuenta también los
+chunks que el frustum deja fuera, que desde esta cueva son la mayoría. Con ediciones baja de
+11 604 a 11 559, menos de 1 %, aunque la ocultación de cuevas se apague del todo un rato.
+
+Lo que sirve es la columna `occluded` del CSV, frame a frame, con la cámara quieta. Sin ediciones
+vale siempre 11 604. Con 20 ediciones en 20 s (la corrida `--edits` de arriba) baja en 19 tramos
+de 52 a 59 ms, uno por edición que cambia lo que ocluye, y vuelve a 11 604:
+
+| Estado | Tramos | Chunks ocultos | Ocultos por la cueva dentro del frustum | Tiempo |
+|---|---:|---:|---:|---:|
+| Sin edición pendiente | - | 11 604 | 1 963 de 3 339 (59 %) | 94.9 % |
+| Edición que apaga una parte | 10 | 10 856 | 1 215 (62 % de lo normal) | 2.6 % |
+| Edición que apaga todo | 9 | 9 641 | ninguno | 2.5 % |
+
+En los tramos que apagan todo, la búsqueda ve a través del chunk de la cámara y el conjunto deja
+pasar todo lo que está en el frustum: esos 9 641 son lo que ocultan solos el frustum y la caja de
+búsqueda. La ocultación de cuevas dentro del frustum es el resto. El tiempo cuenta la duración de
+los frames, que en esos tramos son más lentos.
+
 ## Cómo volver a medir (para el dueño)
 
 Todo en release, con la máquina quieta, intercalando con y sin culling, 3 vueltas o más. **Bajo
@@ -191,6 +216,7 @@ CAVE="--world overworld --cave --camera 656,-1000,16,-90,0"
 for round in 1 2 3; do
   for c in on off; do
     just bench-static $CAVE --adapter 780m --cave-culling $c
+    just bench-static $CAVE --edits --adapter 780m --cave-culling $c   # costo: columna occluded del CSV
     just bench-spin   $CAVE --adapter 780m --cave-culling $c
     just bench-path $CAVE --speed 8 --adapter 780m --cave-culling $c
     just bench-path $CAVE --speed 8 --radius 32 --adapter nvidia --cave-culling $c

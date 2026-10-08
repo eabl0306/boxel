@@ -158,7 +158,9 @@ depende del chunk del ojo y no de su vóxel. `VisibilityStats::blocked` cuenta e
   buffers, el mínimo de Vulkan por etapa y el piso de boxel. `View::counts.w` dice si hay bits.
 - Mid y Low: el culling en CPU salta los slots ocultos. Low no cambia de shaders ni de límites.
 - Los tres: la lista de buckets translúcidos también los salta.
-- `RenderStats::occluded_chunks` y `RenderInfo` cuentan los chunks ocultos.
+- `RenderStats::occluded_chunks` y `RenderInfo` cuentan los chunks ocultos, también los que
+  quedan fuera del frustum (casi todos, desde una cueva): no sirven para medir solo la ocultación
+  de cuevas.
   `boxel_render::cull_counts` cuenta en CPU lo que dibujaría cada tier, con y sin el conjunto.
 
 ## Alternativas descartadas
@@ -184,9 +186,12 @@ depende del chunk del ojo y no de su vóxel. `VisibilityStats::blocked` cuenta e
 - Mientras el mundo carga o se publica una edición en partes, se oculta menos: todo lo que hay
   detrás de un chunk que no se muestra como es se dibuja. Una edición que cambia lo que ocluye
   junto a la cámara apaga casi toda la ocultación hasta que se publica su malla y se busca de
-  nuevo (hasta 50 ms después, `TIGHTEN_DELAY`). Medido: con 20 ediciones en 20 s junto a la
-  cámara, el promedio de chunks ocultos baja menos de 1 %. Antes cualquier malla nueva abría el
-  chunk; ahora una malla nueva solo por la luz no lo abre.
+  nuevo (hasta 50 ms después, `TIGHTEN_DELAY`). Medido con 20 ediciones en 20 s junto a la
+  cámara: cada una de las 19 que cambian lo que ocluye apagó la ocultación dentro del frustum,
+  entera o en parte, durante 52 a 59 ms. En total, 5 % del tiempo con menos ocultación y 2.5 %
+  sin ninguna. Crece con las ediciones por segundo: con 5 por segundo serían alrededor de un
+  cuarto del tiempo (estimado). Antes cualquier malla nueva abría el chunk; ahora una malla
+  nueva solo por la luz no lo abre.
 - **La puerta del plan no se cumple en la superficie:** oculta solo 16 a 46 % de las caras
   subterráneas a radio 16 (16 % a radio 32). Es la fuga de los chunks de 32³: en un chunk de
   superficie, el aire del valle y una cueva tocan la misma cara, y el enlace por par de caras las

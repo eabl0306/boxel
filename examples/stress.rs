@@ -38,7 +38,8 @@
 //!
 //! `--cave-culling off` (or `--no-cave-culling`) draws every chunk the frustum passes, as before
 //! cave culling (`WorldSettings::cave_culling`, ADR 0022). The summary has a "Cave culling"
-//! section either way: chunks hidden, chunks through the CPU cull, draws and search times.
+//! section either way: chunks hidden (the frustum's included), chunks through the CPU cull, draws
+//! and search times.
 //!
 //! Every run waits until the world settled, runs `--warmup` seconds, then measures
 //! `--duration` seconds. Each frame records its wall-clock time (`Time::real_delta`, the whole
