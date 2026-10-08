@@ -102,4 +102,5 @@ Medido en la máquina de desarrollo (panel de 144 Hz, Wayland, radio 12, mundo c
 - La espera hasta el deadline ya no es solo dormir: los dos runners corren pasos cortos del
   schedule `Idle` mientras quede tiempo, hasta 1 ms antes del deadline (0.7 ms antes del margen
   de espera activa). El mundo recoge resultados y lanza jobs ahí, así que con tope se pone al día
-  casi tan rápido como sin tope. El deadline y la grilla no cambian.
+  igual o más rápido que sin tope (medido a 144 Hz en la RTX). El deadline y la grilla no
+  cambian.

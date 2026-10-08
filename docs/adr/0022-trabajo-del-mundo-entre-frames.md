@@ -1,6 +1,6 @@
 # ADR 0022: el mundo trabaja entre frames
 
-- Estado: aceptado; falta la medición completa (issue #3)
+- Estado: aceptado (issue #3; medido con la máquina libre, ver "Consecuencias")
 - Fecha: 2026-10-08
 - Revisa: el punto 5 del contrato del runner (ADR 0008) y la espera de ADR 0013 y ADR 0017 (los
   dos runners corren pasos cortos mientras esperan). Quita el crecimiento de presupuestos de
@@ -107,49 +107,48 @@ de 0.25 ms entre pasos `Waiting`. Nada con `RunMode::Once` ni sin ritmo.
 
 ## Consecuencias
 
-Medición rápida en la máquina compartida con otros dos agentes (carga 2 a 7, CPU ocupada 17 a
-40 % antes de varias corridas), detalle en
-[entre-frames-2026-10](../rendimiento/entre-frames-2026-10.md). La medición completa queda para
-otra pasada.
+Medido con la máquina libre, el mismo binario con tope 144 (trabajo entre frames apagado y
+encendido) y sin tope. RTX 5050, radio 16, overworld con cuevas, 3 a 6 corridas por caso. Una
+corrida que se cruzó con una compilación u otro test se repitió. Detalle en
+[entre-frames-2026-10](../rendimiento/entre-frames-2026-10.md).
 
-| Caso (RTX, radio 16, tope 144) | Puesta al día, apagado | Puesta al día, encendido | Retraso del trabajo, apagado -> encendido |
+| Puesta al día, media (rango) | Tope, apagado | Tope, encendido | Sin tope |
 |---|---:|---:|---:|
-| Superficie, vuelo a 64 (4 corridas) | 28.6 a 40.4 ms (media 33.3) | 15.3 a 25.0 ms (media 19.2) | 29.5 -> 16.8 ms |
-| Bajo tierra, vuelo a 64 (2) | 37.1 y 76.4 ms | 31.1 y 40.8 ms | 53.5 -> 32.5 ms |
-| Bajando en picado a 64 (2) | 48.0 y 75.9 ms | 29.6 y 35.7 ms | 57.3 -> 28.5 ms |
+| Superficie, vuelo a 64 | 29.3 ms (25.5 a 32.1) | 16.5 ms (15.1 a 19.4) | 18.3 ms (14.2 a 29.8) |
+| Bajo tierra, vuelo a 64 | 39.0 ms (38.2 a 40.3) | 23.2 ms (22.7 a 23.9) | 25.5 ms (23.9 a 28.2) |
+| Bajando en picado a 64 | 35.0 ms (33.6 a 36.0) | 31.2 ms (29.3 a 34.4) | 36.3 ms (31.6 a 46.7) |
 
-| Salto de 64 chunks, `headless_world`, radio 16 (sin GPU) | Apagado | Encendido |
-|---|---:|---:|
-| 144 Hz | 0.25 a 0.31 s | 0.10 a 0.11 s |
-| 60 Hz | 0.65 a 0.67 s | 0.12 s |
-| Sin límite | 0.10 a 0.14 s | 0.10 a 0.11 s (igual, ruido) |
+| Salto de 64 chunks a y = -1000, `headless_world`, radio 16 | Tope 144, apagado | Tope 144, encendido | Sin límite |
+|---|---:|---:|---:|
+| Hasta que la zona nueva está lista | 0.40 a 0.41 s | 0.38 s | 0.43 a 0.47 s |
 
-- La puesta al día con tope baja a la mitad en la superficie y se acerca a los valores sin tope
-  (12.9 ms en la superficie). Medida en frames sigue redondeada al período: el mundo termina
-  antes, pero el frame que lo registra empieza en la grilla.
-- A 60 Hz gana más: el hueco es de unos 12 ms.
-- Sin límite no cambia nada: ningún runner corre `Idle`.
-- El hilo principal trabaja en un tiempo en el que antes dormía: 0.04 a 0.07 ms por frame en
-  promedio, 1.5 a 2.5 ms en el p99, y de 2 a 7 ms (hasta 14 pasos) en los huecos de los cruces. Es el
-  mismo trabajo, hecho antes.
-- Pasos que terminan después de la ventana: casi siempre de 0.02 a 0.25 ms, que cubre el margen.
-  En 3 de las 8 corridas con la máquina cargada hubo uno de 3.1 a 4.1 ms, que alargó ese frame.
-  En una corrida instrumentada ningún resultado ni arranque de job pasó de 0.15 ms, así que lo
-  más probable es que el sistema operativo haya sacado al hilo de la CPU. La medición completa
-  tiene que mirar `overrun_max` con la máquina libre.
+- Con tope y trabajo entre frames la puesta al día queda igual o por debajo de la misma corrida
+  sin tope en los tres casos. En la superficie la mediana sin tope es 14.7 ms: la de con tope
+  queda 1 ms arriba porque se mide en frames, que empiezan en la grilla de 6.94 ms. El retraso
+  del trabajo, que no se redondea, es 13.8 ms con tope y 18.1 sin tope.
+- Contra los números de la issue: superficie (~17) y bajo tierra (~27) se cumplen. El picado
+  (~25) no, pero sin tope este binario tampoco llega: tarda 36 ms. El mundo pesa más que cuando
+  se midieron esos 25 ms.
+- La primera medición, con la máquina cargada, daba bajo tierra 31 a 41 ms y picado 30 a 36. La
+  carga pegaba más en las corridas con tope: de las 9 primeras, 4 se cruzaron con una compilación
+  de otro agente, y ninguna sin tope. Una corrida con tope deja la CPU casi libre, y ahí arranca
+  el trabajo de los demás.
+- Sin límite no cambia nada: ningún runner corre `Idle`, tampoco con la ventana oculta.
+- Ritmo, apagado contra encendido: los frames mostrados por segundo no cambian (superficie 138.9
+  contra 139.6, bajo tierra 141.5 contra 141.2, picado 140.6 contra 139.7, dentro del ruido). Los
+  frames de más de 7.5 ms ya estaban apagado (de 57 a 142 por corrida de 15 s). En el picado
+  suben de 71 a 125 de media, con rangos que casi se tocan (58 a 93 contra 77 a 181): hay que
+  vigilarlo. Con vsync no se midió.
+- Pasos fuera de la ventana: de 0 a 7 por corrida, el peor de 0.34 ms, dentro del margen de
+  0.7 ms. Ningún paso retrasó una update.
+- El hilo principal trabaja en un tiempo en el que antes dormía: 0.04 a 0.06 ms por frame en
+  promedio y 1.7 a 2.5 ms en el p99 (los huecos de los cruces). Es el mismo trabajo, hecho antes.
 - Las mallas del streaming llegan juntas al `Collect` siguiente (hasta 512 por frame): riesgo de
-  subidas más grandes por frame. Si sube el número de refrescos salteados, probar
+  subidas más grandes por frame. Si el picado confirma más refrescos salteados, probar
   `max_mesh_events_per_frame = 256`.
 - No cambian: el contrato de un mensaje por job, `ResultToken`, el tope automático por frame, la
   lógica del scheduler, el orden de `Main`, `Time` y `FixedTime`, la física (no corre en `Idle`),
   el render (no corre en `Idle`) y lo que dicen los campos que ya tenía `stress`.
-
-### Criterio propuesto para cerrar la issue
-
-Que decida el dueño: con tope y trabajo entre frames, una puesta al día menor o igual que el
-mayor entre la meta de la issue y la misma corrida sin tope más un período, un retraso del
-trabajo parecido al de sin tope, ningún paso fuera de la ventana con la máquina libre, y sin
-empeorar el ritmo, sin tope ni con vsync.
 
 ## Alternativas descartadas
 
@@ -164,6 +163,10 @@ empeorar el ritmo, sin tope ni con vsync.
   suma estado para repartir el tope por frame.
 - Correr el primer paso en la misma iteración de la update: retrasa la marca de un redraw que
   llega enseguida y lo puede confundir con un frame callback.
+- Un tope automático de jobs más chico con tope de fps (medido: el tope calculado para frames de
+  2 ms en vez de 6.94). Con tope, la cola en los workers es mucho más honda que sin tope (370 a
+  880 jobs en vuelo contra 110 a 290), pero achicarla a unos 250 no acelera la puesta al día
+  (superficie 16.5, bajo tierra 23.9, picado 31.4 ms).
 
 ## Pendiente, solo después de medir
 
@@ -172,3 +175,5 @@ empeorar el ritmo, sin tope ni con vsync.
   los cruces suman refrescos salteados.
 - El despertador de resultados, si el retraso del trabajo queda más de 0.5 ms por salto arriba
   del de sin tope.
+- Medir con vsync, a 60 fps y en la 780M. Repetir el picado: si los frames de más de 7.5 ms suben
+  de verdad, probar `max_mesh_events_per_frame = 256`.

@@ -118,7 +118,8 @@ de 20 s por caso y versión, intercaladas (antes: 0e92379, que mide sin cambiar 
   puesta al día pasa de 19.5 a 24.2 ms, y con vsync de 17.7 a 29.4 ms. Agrandar ese presupuesto
   hacia la parte ociosa del frame casi no ayuda a 144 Hz
   ([ritmo-2026-10](../rendimiento/ritmo-2026-10.md)). Desde ADR 0022 el mundo trabaja en la
-  espera entre frames y la puesta al día con tope baja a la mitad.
+  espera entre frames y la puesta al día con tope baja casi a la mitad (superficie de 29 a
+  16.5 ms).
 - Las updates siguen corriendo en `about_to_wait`, nunca dentro de `RedrawRequested`, y nunca
   esperan un callback sin límite de tiempo, así que la simulación no se congela con la ventana
   oculta. Lo que cambia del contrato de ADR 0008 es que, al seguir al monitor, el callback decide

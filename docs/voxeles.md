@@ -568,9 +568,10 @@ al moverse.
   encendido por defecto). Mientras el runner espera el frame siguiente, corre pasos cortos del
   schedule `Idle` hasta 1 ms antes del deadline. Ahí el mundo recoge resultados, lanza jobs y
   sigue con el interés pendiente; cada etapa de un chunk ya no espera un frame entero. Las mallas
-  se siguen publicando en `Collect`, con su tope. Medido rápido en la RTX a radio 16: la puesta al
-  día en la superficie baja de unos 33 a unos 19 ms
-  ([entre-frames-2026-10](rendimiento/entre-frames-2026-10.md)). Sin tope no cambia nada.
+  se siguen publicando en `Collect`, con su tope. Medido en la RTX a radio 16 con tope 144: la
+  puesta al día baja de 29 a 16.5 ms en la superficie y de 39 a 23 bajo tierra, igual o por
+  debajo de sin tope ([entre-frames-2026-10](rendimiento/entre-frames-2026-10.md)). Sin tope no
+  cambia nada.
 
 Medido con `headless_world` en release, terreno por defecto, bucle a 144 Hz (`--hz 144`), que es
 el ritmo del límite de FPS por defecto (ADR 0013). El frame es todo el `App::update` (mundo sin
