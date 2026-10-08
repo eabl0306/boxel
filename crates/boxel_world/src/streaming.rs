@@ -69,7 +69,7 @@ const STALE_BATCH_TIME: Duration = Duration::from_secs(1);
 const MIN_HOLD_FRAMES: u32 = 2;
 
 /// Positions re-evaluated per frame whatever `WorldSettings::interest_budget` says (progress).
-pub(crate) const MIN_INTEREST_STEPS: usize = 64;
+const MIN_INTEREST_STEPS: usize = 64;
 /// Interest positions looked up together before their steps run (the budget is checked between
 /// batches; [`MIN_INTEREST_STEPS`] is a multiple of it).
 const LOOKUP_BATCH: usize = 32;
@@ -98,7 +98,7 @@ pub(crate) const MAX_LIGHT_CACHE_RADIUS: u32 = 32;
 const MIN_LIGHT_STEPS: usize = 256;
 
 /// Jobs started or priorities refreshed between two checks of the job budget.
-pub(crate) const DISPATCH_CHECK: usize = 16;
+const DISPATCH_CHECK: usize = 16;
 
 /// An idle step ([`WorldJobs::idle`]) starts a piece of interest work only with this much time
 /// left: the floors of [`WorldJobs::process_interest`] ([`MIN_INTEREST_STEPS`] positions, one

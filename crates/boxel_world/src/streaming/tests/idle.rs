@@ -1,7 +1,8 @@
 //! The world between frames (ADR 0022) on the state machine: an edit batch whose jobs land in
 //! idle steps still publishes whole and ages in frames only, a member that unloads in a step
-//! closes its batch, and random walks with idle steps between frames end in the same world as
-//! frames alone, also far from the origin.
+//! closes its batch, a step stops by its deadline and starts no interest work it has no time
+//! for, and random walks with idle steps between frames end in the same world as frames alone,
+//! also far from the origin.
 use super::tall::{Op, apply, check_bookkeeping, check_interest, op};
 use super::*;
 use boxel_voxel::MAX_CHUNK_COORD;
@@ -74,6 +75,77 @@ fn a_member_that_unloads_between_frames_closes_its_batch() {
     assert!(!removed(&events).is_empty(), "the old meshes go");
     h.check_published();
     h.check_stats();
+}
+
+/// A harness whose viewer just jumped to a large radius: only planned, every position still in
+/// the interest backlog.
+fn jumped(executor: Arc<dyn JobExecutor>) -> Harness {
+    let mut h = Harness::new(LayerGen::new(-3..=1), executor, 64);
+    let viewers = [(0, Viewer::new(ChunkPos::new(0, 0, 0), 24, MAX_RADIUS))];
+    h.with(|jobs, cx, settings| jobs.plan_interest(cx, settings, &viewers));
+    assert!(h.jobs.interest_backlog() > 0);
+    h
+}
+
+/// One idle step of `h` until `until`.
+fn idle_until(h: &mut Harness, until: Instant) -> IdleWork {
+    h.with(|jobs, cx, settings| jobs.idle(cx, settings, until))
+}
+
+#[test]
+fn idle_steps_stop_by_their_deadline() {
+    // Jobs that finish at once keep every round busy (results to collect, jobs to start, a
+    // backlog): only the deadline ends a step. Steps of 2 ms end close to it and the work takes
+    // many of them. A quarter of the steps, not all: the OS may take the thread off the CPU past
+    // a deadline (measured sharing one CPU with a busy loop: about half the steps 1 to 3 ms
+    // late; without the deadline check every step ran 6 to 19 ms late).
+    let mut h = jumped(Arc::new(InlineExecutor));
+    let mut late = Vec::new();
+    while h.jobs.idle_pending() != IdleWork::Done {
+        let until = Instant::now() + Duration::from_millis(2);
+        let left = idle_until(&mut h, until);
+        late.push(Instant::now().saturating_duration_since(until));
+        assert_eq!(left, h.jobs.idle_pending());
+        assert!(late.len() < 100_000, "no progress");
+    }
+    late.sort_unstable();
+    assert!(late.len() > 3, "{} steps of 2 ms did it all", late.len());
+    assert!(late[late.len() / 4] < Duration::from_millis(1), "{late:?}");
+    assert_eq!(h.jobs.interest_backlog(), 0);
+    assert_eq!(h.jobs.scheduler.in_flight(), 0);
+    h.check_published();
+    h.check_stats();
+}
+
+#[test]
+fn idle_steps_without_time_leave_the_work() {
+    // Only the backlog: a step with less than `IDLE_INTEREST_MIN` left never starts a piece of
+    // it (its floors alone would overrun the step).
+    let hold = Arc::new(HoldExecutor::default());
+    let mut h = jumped(hold.clone());
+    let before = (h.jobs.interest_backlog(), h.jobs.interest_steps);
+    for _ in 0..8 {
+        let until = Instant::now() + IDLE_INTEREST_MIN - Duration::from_micros(50);
+        assert_eq!(idle_until(&mut h, until), IdleWork::Ready);
+    }
+    assert_eq!((h.jobs.interest_backlog(), h.jobs.interest_steps), before);
+    // With the time, the same step goes on with it.
+    idle_until(&mut h, Instant::now() + Duration::from_secs(10));
+    assert_eq!(h.jobs.interest_backlog(), 0);
+    // Results to collect and jobs to start: a step whose deadline passed touches none.
+    hold.run_all();
+    let state = |h: &Harness| {
+        (
+            h.jobs.scheduler.in_flight(),
+            h.jobs.scheduler.queued(),
+            hold.held(),
+            h.jobs.interest_steps,
+        )
+    };
+    let before = state(&h);
+    assert!(before.0 > 0 && before.1 > 0, "{before:?}");
+    assert_eq!(idle_until(&mut h, Instant::now()), IdleWork::Ready);
+    assert_eq!(state(&h), before);
 }
 
 /// What changes in one frame of a walk. No edits while walking: a chunk that one world unloads

@@ -5,7 +5,7 @@
 use super::support::{HoldExecutor, LayerGen};
 use super::{drain_events, loaded, move_viewer, removes, spawn_tall_viewer, tall_world_app};
 use crate::jobs::{InlineExecutor, JobExecutor};
-use crate::streaming::{DISPATCH_CHECK, MIN_INTEREST_STEPS, WorldJobs};
+use crate::streaming::WorldJobs;
 use crate::{ChunkDataEvent, ChunkMap, ChunkMeshEvent, ChunkViewer, WorldSettings, WorldStats};
 use boxel_app::{App, IdleWork, PreUpdate};
 use boxel_ecs::prelude::*;
@@ -280,10 +280,7 @@ fn idle_with_no_time_does_nothing() {
     assert_eq!((hold.held(), jobs(&app).interest_steps), before);
     assert!(drain_events(&mut app).is_empty());
     assert!(!app.world().is_resource_changed::<ChunkMap>());
-    // A step that ends right away does at most one round, without interest work.
-    app.run_idle(Instant::now() + Duration::from_nanos(1));
-    assert!(hold.held() <= before.0 + DISPATCH_CHECK);
-    assert!(jobs(&app).interest_steps <= before.1 + MIN_INTEREST_STEPS);
+    // Steps that end in the middle of the work: `streaming/tests/idle.rs`, on `WorldJobs::idle`.
 }
 
 /// `ChunkDataEvent::Loaded`s read in `PreUpdate`, per frame.
