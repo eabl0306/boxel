@@ -107,7 +107,8 @@ En el juego (`stress`, sección "Cave culling" del resumen), por búsqueda:
 | RTX r32 superficie, vuelo 64 | 384 de 12 920 | 0.81 ms | 1.33 ms | 1.94 ms |
 
 Los enlaces cuestan de 12 a 20 % del job de generación, que es menos de un tercio del trabajo de
-un chunk (malla y luz cuestan más): alrededor de 5 % del total.
+un chunk (malla y luz cuestan más): alrededor de 5 % del total. Se pagan también con el culling
+apagado (ADR 0022, sección 2).
 
 ## Frames con ventana
 

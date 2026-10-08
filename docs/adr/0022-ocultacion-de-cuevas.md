@@ -39,7 +39,10 @@ subterráneas, el siguiente paso son subceldas de 16³ o Hi-Z.
 ### 2. Dónde se calculan y cuándo valen
 
 - El job de generación calcula los enlaces junto con el chunk, fuera del hilo principal. Así todo
-  chunk con datos los tiene, también los que nunca se mallan.
+  chunk con datos los tiene, también los que nunca se mallan. Se calculan aunque
+  `WorldSettings::cave_culling` esté apagado (alrededor de 5 % del trabajo de un chunk): así,
+  encenderlo en plena partida oculta enseguida, sin esperar a que cada chunk cargado se genere o
+  se malle de nuevo.
 - Una edición que cambia lo que ocluye borra los enlaces del chunk. Su próximo job de malla los
   vuelve a calcular. Los atajos uniformes (aire, roca encerrada, datos perdidos) no necesitan job.
 - El slot guarda solo los 15 bits (`ChunkSlot::face_links`). Tres banderas del slot pasaron a un

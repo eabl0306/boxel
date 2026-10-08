@@ -139,6 +139,10 @@ pub struct WorldSettings {
     /// Cave culling (ADR 0022): the renderer skips the chunks its camera cannot see through
     /// open space (caves from the surface, the surface from deep caves), found by a search over
     /// the face links of the chunks ([`ChunkVisibility`]). Read every frame. Default on.
+    ///
+    /// Off only stops the search: the jobs still compute every chunk's face links (about 5 % of
+    /// a chunk's work, on the job threads), so turning it on in the middle of a game culls at
+    /// once instead of waiting for every loaded chunk to be generated or meshed again.
     pub cave_culling: bool,
 }
 
