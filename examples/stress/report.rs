@@ -117,7 +117,7 @@ impl RecordLog {
 /// Everything about a run that is not a per-frame number.
 #[derive(Clone, Debug, Default)]
 pub struct RunInfo {
-    /// `static`, `fly`, `dive` or `spin`.
+    /// `static`, `fly`, `dive`, `spin` or `path`.
     pub scenario: String,
     /// Free text (`--label`).
     pub label: String,
@@ -198,6 +198,10 @@ pub struct RunInfo {
     /// `on` when the requested present mode is vsync (`--vsync on`, `--present vsync`), else
     /// `off`. Empty in runs from before the option.
     pub vsync: String,
+    /// The start pose `x,y,z,yaw,pitch` (after `--cave` moved it). Empty in runs from before.
+    pub camera: String,
+    /// `--cave`: the cave the camera starts in (`eye=... depth=... path=...`); empty without it.
+    pub cave: String,
     /// Block textures (`--pack`): `none` for the procedural ones, else the pack directory's name.
     /// Empty in runs from before the option (procedural).
     pub pack: String,
@@ -1045,6 +1049,8 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
         ("frames_presented", Json::uint(info.frames_presented)),
         ("time", Json::Str(info.time.clone())),
         ("vsync", Json::Str(info.vsync.clone())),
+        ("camera", Json::Str(info.camera.clone())),
+        ("cave", Json::Str(info.cave.clone())),
         ("present_mode", Json::Str(info.present_mode.clone())),
         ("refresh_hz", Json::opt(info.refresh_hz, 3)),
     ]);
@@ -1197,12 +1203,25 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
 // ---------------------------------------------------------------------------------------------
 // Markdown
 
+/// A warning when cave culling was on but culled nothing in more than 1 % of the measured
+/// frames because the eye was in rock: such a run does not measure cave culling.
+pub fn rock_warning(info: &RunInfo, s: &Summary) -> Option<String> {
+    let (unculled, frames) = (s.culling.unculled, s.frames.frames);
+    (info.cave_culling == "on" && unculled * 100 > frames).then(|| {
+        format!(
+            "Warning: in {unculled} of {frames} frames the eye was in rock (or nearer a wall than \
+             the near plane) and cave culling culled nothing: this run does not measure it. Start \
+             in a cave with --cave."
+        )
+    })
+}
+
 /// Heading of the JSON block (`tools/bench_report.py` reads the first JSON code block after it).
 pub const DATA_HEADING: &str = "## Data";
 
 /// Short name of a run: `fly r16 32 vox/s`, `static r12`, `fly r32 64 vox/s limit 144 fps`.
 pub fn run_title(info: &RunInfo) -> String {
-    let mut title = if matches!(info.scenario.as_str(), "fly" | "dive") {
+    let mut title = if matches!(info.scenario.as_str(), "fly" | "dive" | "path") {
         format!("{} r{} {} vox/s", info.scenario, info.radius, info.speed)
     } else {
         format!("{} r{}", info.scenario, info.radius)
@@ -1218,6 +1237,10 @@ pub fn run_title(info: &RunInfo) -> String {
     // So does cave culling on (the default).
     if info.cave_culling == "off" {
         title = format!("{title} culling off");
+    }
+    // A camera in a cave (`--cave`) is not comparable with one in the rock.
+    if !info.cave.is_empty() {
+        title = format!("{title} cave");
     }
     // So do the procedural textures.
     if !info.pack.is_empty() && info.pack != "none" {
@@ -1323,6 +1346,18 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
             format!(" Clock {} (still).", info.time)
         },
     );
+    if !info.camera.is_empty() {
+        let _ = writeln!(
+            out,
+            "- Camera: start {}{}.\n",
+            info.camera,
+            if info.cave.is_empty() {
+                String::new()
+            } else {
+                format!(", in a cave ({})", info.cave)
+            }
+        );
+    }
 
     let _ = writeln!(out, "## Frames\n");
     let _ = writeln!(
@@ -1447,6 +1482,9 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
         ms(c.bits_p99),
         ms(c.bits_max),
     );
+    if let Some(warning) = rock_warning(info, s) {
+        let _ = writeln!(out, "**{warning}**\n");
+    }
 
     if let Some(e) = &info.edits {
         let _ = writeln!(out, "## Edits\n");
@@ -2105,6 +2143,42 @@ mod tests {
             run_title(&info),
             "static r16 limit 144 fps vsync bodies 1000 item, 0 projectiles edits"
         );
+    }
+
+    #[test]
+    fn caves_are_named_and_an_eye_in_rock_is_warned_about() {
+        let mut info = RunInfo {
+            scenario: "path".to_string(),
+            radius: 16,
+            speed: 8.0,
+            world: "overworld/mc".to_string(),
+            cave_culling: "on".to_string(),
+            ..RunInfo::default()
+        };
+        assert_eq!(run_title(&info), "path r16 8 vox/s overworld/mc");
+        info.camera = "1.5,-990.5,2.5,-90,0".to_string();
+        info.cave = "eye=1.5,-990.5,2.5 depth=1100".to_string();
+        assert_eq!(run_title(&info), "path r16 8 vox/s overworld/mc cave");
+        let mut records = sample();
+        let s = Summary::compute(&records).expect("records");
+        assert_eq!(rock_warning(&info, &s), None);
+        let text = markdown(&info, &s);
+        assert!(
+            text.contains("- Camera: start 1.5,-990.5,2.5,-90,0, in a cave (eye=1.5,-990.5,2.5"),
+            "{text}"
+        );
+        assert!(text.contains("\"cave\": \"eye=1.5,-990.5,2.5 depth=1100\""));
+        assert!(!text.contains("Warning"));
+        // Every frame with the eye in rock.
+        for r in &mut records {
+            r.unculled = true;
+        }
+        let s = Summary::compute(&records).expect("records");
+        let warning = rock_warning(&info, &s).expect("a warning");
+        assert!(warning.contains("--cave"));
+        assert!(markdown(&info, &s).contains(&format!("**{warning}**")));
+        info.cave_culling = "off".to_string();
+        assert_eq!(rock_warning(&info, &s), None, "nothing to measure");
     }
 
     #[test]

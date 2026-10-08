@@ -18,6 +18,11 @@
 //! loaded, and the memory of the gameplay light cache and of the sky tiles. Compare `quads=`
 //! across `--light on|off` and `--ao off|baked|lit-only` for the cost of AO: with `--light off`
 //! every face counts as lit (a worst case for `lit-only`).
+//! With `--cave` (overworld), a `cave: eye=X,Y,Z depth=N clearance=N path=N voxels, N chunk
+//! borders` line comes first: the viewer starts in open space in a cave, the air voxel nearest
+//! to `--camera` (or `--viewer-y`) with air on every side and under the surface, and `path` is
+//! the route `stress --scenario path --cave` follows from there (the same search, the same
+//! answer). Cave culling culls nothing with the eye in rock: measure it from a cave.
 //! With `--cull`, three more lines describe cave culling (ADR 0022) for a camera at the viewer
 //! (`--camera` sets where it is and where it looks; view distance = radius x 32, 16:9):
 //! `cull: eye=X,Y,Z yaw=D pitch=D open=yes|no box=N reached=N fresh_ms=X search_ms=X`, the
@@ -46,6 +51,8 @@
 //! filter `warn`).
 #![expect(clippy::print_stdout, clippy::print_stderr, reason = "CLI output")]
 
+#[path = "shared/cave.rs"]
+mod cave;
 #[path = "shared/world.rs"]
 mod world;
 
@@ -78,6 +85,8 @@ usage: headless_world [options]
   --camera X,Y,Z,YAW,PITCH  viewer position and, for --cull, where the camera looks (degrees, as
                        stress: yaw -90 looks along +x); replaces --viewer-y
   --cull               report cave culling for the camera once settled (see the docs above)
+  --cave               start the viewer in open space in a cave near --camera (overworld; see
+                       the docs above): what stress --cave measures
   --ao MODE            ambient occlusion baked into the meshes: off, baked (every face) or
                        lit-only (faces with some light; the default)
   --light MODE         on (the default: sky and block light computed and baked) or off (open
@@ -125,6 +134,8 @@ struct Options {
     camera: Option<[f64; 5]>,
     /// `--cull`.
     cull: bool,
+    /// `--cave`.
+    cave: bool,
 }
 
 /// `Ok(None)` for `--help`.
@@ -145,6 +156,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         light: true,
         camera: None,
         cull: false,
+        cave: false,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -197,6 +209,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                 };
             }
             "--cull" => o.cull = true,
+            "--cave" => o.cave = true,
             "--camera" => {
                 let v = value()?;
                 let parts: Vec<f64> = v
@@ -229,7 +242,31 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         }
     }
     o.world.validate(o.fixed_height)?;
+    if o.cave && o.world.world != World::Overworld {
+        return Err("--cave needs --world overworld (the only world with caves)".to_string());
+    }
     Ok(Some(o))
+}
+
+/// `--cave`: moves the viewer of `o` to the cave found near it (`--camera`'s yaw and pitch stay)
+/// and returns the `cave:` line.
+fn find_cave(o: &mut Options, generator: &dyn WorldGenerator, seed: u64) -> Result<String, String> {
+    let overworld = o
+        .world
+        .overworld(seed)
+        .ok_or("--cave needs --world overworld")?;
+    let [x, y, z, yaw, pitch] = o
+        .camera
+        .unwrap_or([VIEWER.x, o.viewer_y, VIEWER.z, -90.0, 0.0]);
+    let found = cave::find(
+        generator,
+        &BlockRegistry::default_blocks(),
+        |x, z| overworld.height_at(x, z),
+        DVec3::new(x, y, z),
+    )?;
+    o.camera = Some([found.eye.x, found.eye.y, found.eye.z, yaw, pitch]);
+    o.viewer_y = found.eye.y;
+    Ok(format!("cave: {}", found.describe()))
 }
 
 /// `--ao` values.
@@ -350,7 +387,7 @@ fn max(values: &[f64]) -> f64 {
 
 fn main() -> AppExit {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let options = match parse_options(&args) {
+    let mut options = match parse_options(&args) {
         Ok(Some(o)) => o,
         Ok(None) => {
             println!("{}", usage());
@@ -361,7 +398,17 @@ fn main() -> AppExit {
             return AppExit::from_code(1);
         }
     };
-    let generator = options.world.generator(TerrainGenerator::default().seed);
+    let seed = TerrainGenerator::default().seed;
+    let generator = options.world.generator(seed);
+    if options.cave {
+        match find_cave(&mut options, generator.as_ref(), seed) {
+            Ok(line) => println!("{line}"),
+            Err(e) => {
+                eprintln!("headless_world: {e}");
+                return AppExit::from_code(1);
+            }
+        }
+    }
     let settings = WorldSettings {
         vertical_bounds: options.fixed_height.then(|| generator.vertical_chunks()),
         ao_policy: options.ao,
@@ -864,6 +911,22 @@ mod tests {
         for arg in ["72057594037927937", "-9223372036854775808", "1.5", "x"] {
             assert!(parse(&["--jump", arg]).is_err(), "{arg} was accepted");
         }
+    }
+
+    #[test]
+    fn cave_needs_the_overworld() {
+        assert!(parse(&["--cave"]).is_err(), "the terrain has no caves");
+        let o = parse(&[
+            "--world",
+            "overworld",
+            "--cave",
+            "--camera",
+            "16,-1000,16,-90,0",
+        ])
+        .expect("valid")
+        .expect("not help");
+        assert!(o.cave);
+        assert!(usage().contains("--cave"));
     }
 
     #[test]

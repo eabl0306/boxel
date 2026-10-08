@@ -387,6 +387,30 @@ class OutputTest(unittest.TestCase):
         self.assertIn('| culling search avg ms | - | 0.10 | - |  |', out)
         self.assertIn('| frames unculled (eye in rock) | - | 4 | - |  |', out)
 
+    def test_cave_runs_pair_only_with_cave_runs(self):
+        # Old runs have no cave field: their camera may have been in the rock.
+        cave = copy.deepcopy(SAMPLE)
+        cave['run']['scenario'] = 'path'
+        cave['run']['camera'] = '20.5,-990.5,30.5,-90,0'
+        cave['run']['cave'] = 'eye=20.5,-990.5,30.5 depth=1100 clearance=2 path=300 voxels'
+        self.assertEqual(br.title(cave), 'path r16 32 vox/s cave')
+        self.assertNotEqual(br.key(cave), br.key(SAMPLE))
+        self.write('1-rock.md', SAMPLE, 'base')
+        self.write('2-cave.md', cave, 'base')
+        moved = copy.deepcopy(cave)
+        moved['run']['camera'] = '20.5,-990.5,30.5,0,0'
+        self.write('3-rock.md', SAMPLE, 'new')
+        self.write('4-cave.md', moved, 'new')
+        code, out, _ = run_main('--compare', os.path.join(self.dir.name, 'base'),
+                                os.path.join(self.dir.name, 'new'))
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count('### '), 2, 'cave runs with each other')
+        self.assertIn('### path r16 32 vox/s cave: 2-cave.md -> 4-cave.md', out)
+        self.assertIn('Note: the settings differ (camera 20.5,-990.5,30.5,-90,0 -> '
+                      '20.5,-990.5,30.5,0,0)', out)
+        self.assertEqual(br.load(os.path.join(self.dir.name, 'base', '1-rock.md'))['run']['cave'],
+                         '')
+
     def test_compare_directories_keeps_packs_apart(self):
         # No pack field: the procedural textures ('none').
         pack = copy.deepcopy(SAMPLE)

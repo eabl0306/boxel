@@ -104,6 +104,8 @@ SETTINGS = [
     ('present mode', ('run', 'present_mode')),
     ('bodies', ('run', 'bodies')),
     ('edits', ('run', 'edits')),
+    ('camera', ('run', 'camera')),
+    ('cave', ('run', 'cave')),
     ('clock', ('run', 'time')),
     ('seed', ('run', 'seed')),
     ('backend', ('run', 'backend')),
@@ -167,6 +169,9 @@ def load(path):
         # Runs from before cave culling drew every chunk the frustum passed.
         if not run.get('cave_culling'):
             run['cave_culling'] = 'none'
+        # Runs from before --cave: the camera never started in a cave (its start is unknown).
+        run.setdefault('cave', '')
+        run.setdefault('camera', '')
         # Whether the run had --edits (the world's edit latency, null without them).
         run['edits'] = get(data, ('world', 'edits')) is not None
     return data
@@ -201,7 +206,7 @@ def get(data, path):
 def title(run):
     r = run['run']
     text = f"{r['scenario']} r{r['radius']}"
-    if r['scenario'] in ('fly', 'dive'):
+    if r['scenario'] in ('fly', 'dive', 'path'):
         text += f" {fmt(r['speed'])} vox/s"
     if r.get('world', 'forest') != 'forest':
         text += f" {r['world']}"
@@ -209,6 +214,8 @@ def title(run):
         text += ' light off'
     if r.get('cave_culling') == 'off':
         text += ' culling off'
+    if r.get('cave'):
+        text += ' cave'
     if r.get('pack', 'none') != 'none':
         text += f" pack {r['pack']}"
     if r.get('fps_limit'):
@@ -224,13 +231,13 @@ def title(run):
 
 def key(run):
     """Runs with the same key are comparable (same world, light, textures, scenario, radius,
-    height, speed, fps limit, vsync, physics bodies, scripted edits and GPU)."""
+    height, speed, fps limit, vsync, physics bodies, scripted edits, cave and GPU)."""
     r = run['run']
     return (r.get('world', 'forest'), r.get('light', 'none'), r.get('pack') or 'none',
             r['scenario'], r['radius'],
             r.get('vertical', 'fixed'), r['speed'], r.get('fps_limit') or 0,
-            r.get('vsync') or 'off', r.get('bodies') or '', bool(r.get('edits')), r['backend'],
-            r['tier'], r.get('adapter'))
+            r.get('vsync') or 'off', r.get('bodies') or '', bool(r.get('edits')),
+            r.get('cave') or '', r['backend'], r['tier'], r.get('adapter'))
 
 
 def fmt(value):
