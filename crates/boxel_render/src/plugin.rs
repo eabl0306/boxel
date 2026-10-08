@@ -1324,6 +1324,7 @@ fn extract(
 ///
 /// First, whatever the setting, the world learns which chunks the renderer refused or shows
 /// again since the last frame ([`VoxelRenderer::take_refused`]): the search sees through them.
+/// A resync frame culls nothing.
 fn extract_visibility(
     mut gpu: ResMut<GpuState>,
     mut frame: ResMut<ExtractedFrame>,
@@ -1349,7 +1350,10 @@ fn extract_visibility(
             visibility.clear_unshown(|pos| map.visibility_links_at(pos));
         }
     }
-    if !settings.cave_culling {
+    // On a resync frame `prepare` uploads only the settled meshes: a chunk being remeshed draws
+    // nothing although the map says it is shown (the world hears of it next frame,
+    // `ChunkMeshResync`), so this frame culls nothing.
+    if !settings.cave_culling || frame.resync {
         return;
     }
     let (Some(ready), Some((camera, transform))) = (gpu.ready(), frame.camera) else {
