@@ -8,8 +8,10 @@ en línea recta por dentro de la roca. Ahí el render ve a través de la roca, y
 cosas que sí estaban en pantalla. Ahora no se oculta nada mientras el ojo está en la roca (ADR
 0022, sección 5), así que los números con ventana bajo tierra de abajo ya no valen. Los conteos de
 `headless_world` sí: valen para un ojo en espacio abierto del mismo chunk, y la línea `cull:`
-dice ahora `open=no` cuando la cámara está en la roca. El resumen de `stress` cuenta los frames
-sin culling por eso.
+dice ahora `open=no` cuando la cámara está en la roca (así salen las cuatro cámaras bajo tierra de
+la tabla; la de superficie sale `open=yes`). El resumen de `stress` cuenta los frames sin culling
+por eso. Falta medir con ventana bajo tierra con la cámara en una cueva, y con el límite de 144
+fps (ver el final).
 
 **La máquina estaba compartida con otro trabajo largo** (carga de 3.5 a 8). `tools/wait-idle.sh`
 dejó pasar todas las corridas (menos de 15 % de CPU ocupada en el momento de empezar), pero los
@@ -167,8 +169,12 @@ for round in 1 2 3; do
     just bench-fly  --world overworld --speed 64 --radius 32 --camera 16,140,16,-90,-20 --adapter nvidia --cave-culling $c
   done
 done
-# Con el límite del juego (los frames lentos de arriba son de GPU en el bucle sin límite)
-just bench-dive --world overworld --speed 64 --camera 16,-1000,16,-90,0 --adapter 780m --fps-limit 144
+# Bajo tierra con la cámara en una cueva: elegir una posición con `open=yes` en
+# `headless_world --cull --camera ...` (las de vuelo y bajada atraviesan la roca y no ocultan nada)
+just bench-spin --world overworld --camera <x,y,z de una cueva>,-90,0 --adapter 780m --cave-culling $c
+# Con el límite del juego: ¿la búsqueda hace perder refrescos? (presupuesto del mundo, ADR 0022)
+just bench-fly  --world overworld --speed 64 --radius 32 --camera 16,140,16,-90,-20 --adapter nvidia --fps-limit 144
+just bench-dive --world overworld --speed 64 --radius 32 --camera 16,140,16,-90,-20 --adapter nvidia --fps-limit 144
 just bench-report --compare <corrida-off>.md <corrida-on>.md
 ```
 
