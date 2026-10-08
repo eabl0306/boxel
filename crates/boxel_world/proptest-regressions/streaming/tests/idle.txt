@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 771f90f39d77358923ff2b6b0bd814df079b6705cbfd31428527eefb747cc236 # shrinks to frames = [(Viewer(Move(0, 1, 1, 0)), 0, 0), (Viewer(Toggle(1)), 0, 0), (Viewer(Radius(1, 1, 0)), 4, 0), (Viewer(Move(0, 0, 1, -2)), 1, 4), (Viewer(Move(0, 0, 2, 0)), 0, 0), (Viewer(Toggle(1)), 3, 4), (Bounds(Some((-2, 1))), 1, 0)], edits = [(8, -29, 38, true)], origin = 72057594037927932
