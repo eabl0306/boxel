@@ -68,6 +68,13 @@ pub struct FrameRecord {
     pub gate_at: Option<Duration>,
     /// The runner paced the frame by the display (`FramePacingInfo::display_locked`).
     pub display_locked: bool,
+    /// Chunks that passed the CPU cull (`RenderInfo::visible_chunks`; Mid and Low only).
+    pub visible_chunks: u32,
+    /// Resident chunks cave culling hid (`RenderInfo::occluded_chunks`).
+    pub occluded: u32,
+    /// How long the cave culling search took, when one ran in the frame
+    /// (`VisibilityStats::last_search`).
+    pub search: Option<Duration>,
 }
 
 /// Append-only list of records stored in fixed blocks: pushing never moves earlier records, so
@@ -123,6 +130,9 @@ pub struct RunInfo {
     /// Voxel light and ambient occlusion (`--light`): `on`, or `off` (the look and the cost of
     /// the world before light). Empty in runs from before the option.
     pub light: String,
+    /// Cave culling (`--cave-culling`): `on` or `off`. Empty in runs from before it (no
+    /// culling).
+    pub cave_culling: String,
     /// Renderer quad arena (quads) and chunk table (slots) the renderer got: the requested ones
     /// (`--arena-quads`, `--chunk-slots` or the world's default) cut to the device's limits.
     pub arena_quads: u32,
@@ -613,6 +623,53 @@ pub struct Summary {
     pub last: FrameRecord,
     /// Pacing and presentation.
     pub pacing: Pacing,
+    /// Cave culling.
+    pub culling: Culling,
+}
+
+/// What cave culling did over the measurement.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Culling {
+    /// Chunks that passed the CPU cull (0 on High).
+    pub visible: Spread,
+    /// Resident chunks hidden by cave culling.
+    pub occluded: Spread,
+    /// Draw calls.
+    pub draws: Spread,
+    /// Frames in which a search ran.
+    pub searches: usize,
+    /// Search time: mean, nearest-rank 99th percentile and largest (zero without searches).
+    pub search_avg: Duration,
+    /// See `search_avg`.
+    pub search_p99: Duration,
+    /// See `search_avg`.
+    pub search_max: Duration,
+}
+
+impl Culling {
+    fn of(records: &[FrameRecord]) -> Self {
+        let mut searches: Vec<Duration> = records.iter().filter_map(|r| r.search).collect();
+        searches.sort_unstable();
+        let n = searches.len();
+        let (search_avg, search_p99, search_max) = if n == 0 {
+            Default::default()
+        } else {
+            (
+                searches.iter().sum::<Duration>() / n as u32,
+                searches[(n * 99).div_ceil(100).max(1) - 1],
+                searches[n - 1],
+            )
+        };
+        Self {
+            visible: Spread::of(records.iter().map(|r| r.visible_chunks as usize)),
+            occluded: Spread::of(records.iter().map(|r| r.occluded as usize)),
+            draws: Spread::of(records.iter().map(|r| r.draws as usize)),
+            searches: n,
+            search_avg,
+            search_p99,
+            search_max,
+        }
+    }
 }
 
 impl Summary {
@@ -649,6 +706,7 @@ impl Summary {
             timeline: timeline(records),
             last,
             pacing: Pacing::of(records, frames.total.as_secs_f64()),
+            culling: Culling::of(records),
             frames,
         })
     }
@@ -720,7 +778,7 @@ fn rounded(value: f64, decimals: i32) -> f64 {
 pub const CSV_HEADER: &str = "frame,t_ms,frame_ms,presented,crossed,cam_x,cam_z,yaw_deg,\
 generated,jobs_done,meshes,removed,upload_quads,d_data_ready,d_chunks,chunks,data_ready,\
 generating,mesh_ready,mesh_empty,meshing,queued_jobs,in_flight,gpu_chunks,quads,draws,arena_used,\
-dropped_chunks,gate_wait_ms,gate_missed,gate_ms,display_locked";
+dropped_chunks,gate_wait_ms,gate_missed,gate_ms,display_locked,visible_chunks,occluded,search_ms";
 
 /// The CSV text: header plus one row per record.
 pub fn csv(records: &[FrameRecord]) -> String {
@@ -732,7 +790,7 @@ pub fn csv(records: &[FrameRecord]) -> String {
         let _ = writeln!(
             out,
             "{i},{:.3},{:.4},{},{},{:.2},{:.2},{:.2},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},\
-             {:.4},{},{},{}",
+             {:.4},{},{},{},{},{},{}",
             ms(r.t),
             ms(r.frame_time),
             u8::from(r.presented),
@@ -765,6 +823,10 @@ pub fn csv(records: &[FrameRecord]) -> String {
             r.gate_at
                 .map_or_else(String::new, |at| format!("{:.3}", ms(at))),
             u8::from(r.display_locked),
+            r.visible_chunks,
+            r.occluded,
+            r.search
+                .map_or_else(String::new, |d| format!("{:.4}", ms(d))),
         );
     }
     out
@@ -924,6 +986,7 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
         ("world", Json::Str(info.world.clone())),
         ("trees", Json::Bool(info.trees)),
         ("light", Json::Str(info.light.clone())),
+        ("cave_culling", Json::Str(info.cave_culling.clone())),
         ("pack", Json::Str(info.pack.clone())),
         ("texture_load_ms", Json::opt(info.texture_load_ms, 2)),
         ("arena_quads", Json::uint(info.arena_quads)),
@@ -1066,6 +1129,16 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
             ])
         })
         .collect();
+    let c = &s.culling;
+    let culling = Json::Obj(vec![
+        ("visible_chunks", spread_json(&c.visible)),
+        ("occluded", spread_json(&c.occluded)),
+        ("draws", spread_json(&c.draws)),
+        ("searches", Json::uint(c.searches)),
+        ("search_avg_ms", Json::ms(c.search_avg)),
+        ("search_p99_ms", Json::ms(c.search_p99)),
+        ("search_max_ms", Json::ms(c.search_max)),
+    ]);
     let p = &s.pacing;
     let pacing = Json::Obj(vec![
         ("presented", Json::uint(p.presented)),
@@ -1084,6 +1157,7 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
         ("frames", frames),
         ("pacing", pacing),
         ("world", world),
+        ("culling", culling),
         ("worst", Json::Arr(worst)),
         ("timeline", Json::Arr(timeline)),
     ])
@@ -1109,6 +1183,10 @@ pub fn run_title(info: &RunInfo) -> String {
     // Light on (the default) keeps the titles of the earlier runs.
     if info.light == "off" {
         title = format!("{title} light off");
+    }
+    // So does cave culling on (the default).
+    if info.cave_culling == "off" {
+        title = format!("{title} culling off");
     }
     // So do the procedural textures.
     if !info.pack.is_empty() && info.pack != "none" {
@@ -1175,7 +1253,8 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
     );
     let _ = writeln!(
         out,
-        "- World: {}, seed {}, trees {}, light {}, radius {}, settled in {:.2} s with {} chunks; \
+        "- World: {}, seed {}, trees {}, light {}, cave culling {}, radius {}, settled in {:.2} s \
+         with {} chunks; \
          {:.0} s measured after {:.0} s of warmup. Renderer: {} quads, {} chunk slots, textures \
          {}.{}\n",
         if info.world.is_empty() {
@@ -1189,6 +1268,11 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
             "?"
         } else {
             &info.light
+        },
+        if info.cave_culling.is_empty() {
+            "?"
+        } else {
+            &info.cave_culling
         },
         info.radius,
         info.settle_s,
@@ -1298,6 +1382,32 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
         s.last.arena_used,
         info.arena_quads,
         s.last.dropped_chunks,
+    );
+
+    let c = &s.culling;
+    let _ = writeln!(out, "## Cave culling\n");
+    let _ = writeln!(
+        out,
+        "| per frame | avg | p95 | max | first | last |\n|---|---:|---:|---:|---:|---:|"
+    );
+    for (name, sp) in [
+        ("chunks hidden by cave culling", &c.occluded),
+        ("chunks through the CPU cull (Mid, Low)", &c.visible),
+        ("draw calls", &c.draws),
+    ] {
+        let _ = writeln!(
+            out,
+            "| {name} | {:.1} | {} | {} | {} | {} |",
+            sp.avg, sp.p95, sp.max, sp.first, sp.last
+        );
+    }
+    let _ = writeln!(
+        out,
+        "\nSearches: {} frames, {:.3} ms on average, p99 {:.3} ms, max {:.3} ms.\n",
+        c.searches,
+        ms(c.search_avg),
+        ms(c.search_p99),
+        ms(c.search_max),
     );
 
     if let Some(e) = &info.edits {
@@ -1779,7 +1889,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), records.len() + 1);
         let columns = CSV_HEADER.split(',').count();
-        assert_eq!(columns, 32);
+        assert_eq!(columns, 35);
         assert!(lines.iter().all(|l| l.split(',').count() == columns));
         assert!(
             lines[501].starts_with("500,1000.000,10.0000,0,1,"),
@@ -1876,6 +1986,7 @@ mod tests {
         for heading in [
             "## Frames",
             "## World",
+            "## Cave culling",
             "## Worst 5 frames",
             "## Per second",
             DATA_HEADING,
@@ -1890,7 +2001,12 @@ mod tests {
         assert!(data.contains("\"fps_limit\": 0"));
         assert!(text.contains(", fps limit none, window "));
         assert!(data.contains("\"light\": \"\""), "empty without --light");
-        assert!(text.contains(", trees off, light ?, radius 16,"), "{text}");
+        assert!(
+            text.contains(", trees off, light ?, cave culling ?, radius 16,"),
+            "{text}"
+        );
+        assert!(data.contains("\"cave_culling\": \"\""));
+        assert!(data.contains("\"search_avg_ms\": 0"));
         assert!(data.contains("\"presented\": false"));
         assert!(text.contains("| frame | t s | ms | crossed | presented | generated |"));
         assert!(

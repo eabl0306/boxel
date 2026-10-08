@@ -28,6 +28,10 @@
 //! `--light off` turns the voxel light and the ambient occlusion off (`WorldSettings::light` and
 //! `ao_policy: AoPolicy::Off`): the look and the cost of the world before light (ADR 0015).
 //!
+//! `--cave-culling off` (or `--no-cave-culling`) draws every chunk the frustum passes, as before
+//! cave culling (`WorldSettings::cave_culling`, ADR 0022). The summary has a "Cave culling"
+//! section either way: chunks hidden, chunks through the CPU cull, draws and search times.
+//!
 //! Every run waits until the world settled, runs `--warmup` seconds, then measures
 //! `--duration` seconds. Each frame records its wall-clock time (`Time::real_delta`, the whole
 //! loop: world and render) and the work it did: chunks generated and jobs finished (counted by
@@ -69,7 +73,9 @@ use boxel::voxel::{
 };
 use boxel::window::FramePacingInfo;
 use boxel::world::jobs::{JobExecutor, TaskPoolExecutor};
-use boxel::world::{ChunkId, ChunkMeshEvent, WorldContent, WorldStats, WorldSystems};
+use boxel::world::{
+    ChunkId, ChunkMeshEvent, ChunkVisibility, WorldContent, WorldStats, WorldSystems,
+};
 use edits::EditScript;
 use report::{FrameRecord, RecordLog, RunInfo, Summary};
 use spans::{SpanLog, SpanRow};
@@ -119,6 +125,8 @@ usage: stress [--scenario static|fly|dive|spin] [GPU options] [options]
   --time HH[:MM]      clock time of the world, kept still (default 12:00)
   --light on|off      voxel light and ambient occlusion (default on); off: neither, the look and
                       the cost of the world before light
+  --cave-culling on|off  skip the chunks the camera cannot see through open space (default on;
+                      --no-cave-culling is off)
   --pack DIR          block textures from a Minecraft Java resource pack (the directory with
                       pack.mcmeta; default: procedural); the summary records it and its load time
   --water Y           water in every air block at or below height Y (lakes and seas), with a
@@ -219,6 +227,8 @@ struct Options {
     time: f64,
     /// `--light`: voxel light and ambient occlusion on (the default) or off.
     light: bool,
+    /// `--cave-culling`: on (the default) or off.
+    cave_culling: bool,
     /// `--pack`.
     textures: TextureSource,
     /// `--bodies`, `--body-kind` and `--projectiles`.
@@ -268,6 +278,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         edits: false,
         time: 12.0,
         light: true,
+        cave_culling: true,
         textures: TextureSource::Procedural,
         bodies: BodyOptions::default(),
         water: None,
@@ -429,6 +440,14 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                     v => return Err(format!("{flag}: {v:?} is not on or off")),
                 };
             }
+            "--cave-culling" => {
+                o.cave_culling = match value()?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    v => return Err(format!("{flag}: {v:?} is not on or off")),
+                };
+            }
+            "--no-cave-culling" => o.cave_culling = false,
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
@@ -668,6 +687,8 @@ struct Recorder {
     last_jobs: u64,
     last_stats: WorldStats,
     last_presented: u64,
+    /// Cave culling searches run so far (`VisibilityStats::searches`).
+    last_searches: u64,
     /// Quads of every mesh sent to the renderer and not removed.
     resident: HashMap<ChunkId, u32>,
     quads: u64,
@@ -687,6 +708,7 @@ impl Recorder {
             last_jobs: 0,
             last_stats: WorldStats::default(),
             last_presented: 0,
+            last_searches: 0,
             resident: HashMap::with_capacity(slots),
             quads: 0,
             pending: None,
@@ -734,6 +756,7 @@ fn record(
     time: Res<Time>,
     stats: Res<WorldStats>,
     info: Res<RenderInfo>,
+    visibility: Option<Res<ChunkVisibility>>,
     mut events: MessageReader<ChunkMeshEvent>,
     mut rec: ResMut<Recorder>,
     mut spans: Option<ResMut<SpanRecorder>>,
@@ -762,6 +785,7 @@ fn record(
     let generated = rec.generated.load(Ordering::Relaxed);
     let jobs = rec.jobs_done.load(Ordering::Relaxed);
     let now = *stats;
+    let search = visibility.map(|v| v.stats()).unwrap_or_default();
     if let Some(p) = rec.pending.take() {
         let delta = |a: usize, b: usize| a as i64 - b as i64;
         let record = FrameRecord {
@@ -787,6 +811,9 @@ fn record(
             gate_missed: p.gate_missed,
             gate_at: p.gate_at,
             display_locked: p.display_locked,
+            visible_chunks: info.visible_chunks,
+            occluded: info.occluded_chunks,
+            search: (search.searches > rec.last_searches).then_some(search.last_search),
         };
         rec.log.push(record);
         if let Some(spans) = spans.as_deref_mut() {
@@ -803,6 +830,7 @@ fn record(
     rec.last_jobs = jobs;
     rec.last_stats = now;
     rec.last_presented = info.frames_presented;
+    rec.last_searches = search.searches;
 }
 
 /// `Update`, before the world computes interest: phases, the camera script and the exit.
@@ -1127,6 +1155,7 @@ fn world_settings(
 ) -> WorldSettings {
     let mut settings = WorldSettings {
         vertical_bounds,
+        cave_culling: options.cave_culling,
         ..WorldSettings::default()
     };
     if !options.light {
@@ -1161,6 +1190,7 @@ fn run_info(options: &Options, present: String) -> RunInfo {
         },
         trees: options.world.has_trees(),
         light: if options.light { "on" } else { "off" }.to_string(),
+        cave_culling: if options.cave_culling { "on" } else { "off" }.to_string(),
         pack: match &options.textures {
             TextureSource::Procedural => "none".to_string(),
             source => source.label(),
@@ -1434,6 +1464,24 @@ mod tests {
     }
 
     #[test]
+    fn cave_culling_is_on_unless_asked() {
+        let on = options(&[]);
+        assert!(world_settings(&on, None).cave_culling);
+        let info = run_info(&on, String::new());
+        assert_eq!(info.cave_culling, "on");
+        assert!(!report::run_title(&info).contains("culling"));
+        for args in [&["--no-cave-culling"][..], &["--cave-culling", "off"]] {
+            let off = options(args);
+            assert!(!world_settings(&off, None).cave_culling, "{args:?}");
+            let info = run_info(&off, String::new());
+            assert_eq!(info.cave_culling, "off");
+            assert!(report::run_title(&info).ends_with(" culling off"));
+        }
+        assert!(options(&["--cave-culling=on"]).cave_culling);
+        assert!(usage().contains("--cave-culling on|off"));
+    }
+
+    #[test]
     fn body_flags() {
         let o = parse(&[
             "--bodies=10000",
@@ -1602,6 +1650,7 @@ mod tests {
             &["--caves", "mc"],
             &["--light", "yes"],
             &["--light"],
+            &["--cave-culling", "yes"],
         ] {
             assert!(parse(args).is_err(), "{args:?} was accepted");
         }
@@ -2097,7 +2146,10 @@ mod tests {
             text.starts_with("# boxel stress: static r16 light off\n"),
             "{text}"
         );
-        assert!(text.contains(", trees on, light off, radius 16,"), "{text}");
+        assert!(
+            text.contains(", trees on, light off, cave culling on, radius 16,"),
+            "{text}"
+        );
         assert!(text.contains("\"light\": \"off\""), "{text}");
         assert!(text.contains("\"pack\": \"none\""), "{text}");
         assert!(text.contains("chunk slots, textures procedural."), "{text}");

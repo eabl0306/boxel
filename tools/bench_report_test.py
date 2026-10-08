@@ -366,6 +366,26 @@ class OutputTest(unittest.TestCase):
         self.assertIn('light none -> off', out)
         self.assertIn('| p99 ms | 3 | 2.50 | -16.7 % | better |', out)
 
+    def test_cave_culling_pairs_with_older_runs_and_is_compared(self):
+        on = copy.deepcopy(SAMPLE)
+        on['run']['cave_culling'] = 'on'
+        on['culling'] = {'occluded': {'avg': 900.0}, 'visible_chunks': {'avg': 3000.0},
+                         'draws': {'avg': 2.0}, 'searches': 100, 'search_avg_ms': 0.1,
+                         'search_p99_ms': 0.2, 'search_max_ms': 0.3}
+        off = copy.deepcopy(on)
+        off['run']['cave_culling'] = 'off'
+        self.assertEqual(br.title(on), br.title(SAMPLE))
+        self.assertTrue(br.title(off).endswith(' culling off'))
+        self.assertEqual(br.key(on), br.key(off), 'culling does not keep runs apart')
+        self.write('1-old.md', SAMPLE, 'base')
+        self.write('2-on.md', on, 'new')
+        code, out, _ = run_main('--compare', os.path.join(self.dir.name, 'base'),
+                                os.path.join(self.dir.name, 'new'))
+        self.assertEqual(code, 0)
+        self.assertIn('1-old.md -> 2-on.md', out)
+        self.assertIn('cave culling none -> on', out)
+        self.assertIn('| culling search avg ms | - | 0.10 | - |  |', out)
+
     def test_compare_directories_keeps_packs_apart(self):
         # No pack field: the procedural textures ('none').
         pack = copy.deepcopy(SAMPLE)
