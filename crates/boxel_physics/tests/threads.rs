@@ -4,6 +4,11 @@
 //! on one thread (no tasks) and with every part of the step on a compute pool of 1, 3 or 8
 //! threads. The pool is global and set once per process, so each pool size runs in a child
 //! process of this test binary.
+//!
+//! With the default `parallel_threshold` the solve pushes on the threads only when its islands
+//! pay: many small islands that push go on the threads, a pile that is one island and bodies
+//! that touch without pushing stay on one thread. Either way the bodies are the same, bit for
+//! bit, as on one thread.
 mod common;
 mod sim;
 
@@ -11,8 +16,8 @@ use boxel_app::FixedUpdate;
 use boxel_ecs::prelude::*;
 use boxel_math::{DVec3, I64Vec3, Vec2};
 use boxel_physics::{
-    BodySettings, CharacterController, Collider, Contacts, MoveIntent, PhysicsStats,
-    ReportContacts, RigidBody, Teleport, Velocity,
+    BodySettings, CharacterController, Collider, Contacts, MoveIntent, PhysicsSettings,
+    PhysicsStats, ReportContacts, RigidBody, Teleport, Velocity,
 };
 use boxel_tasks::{ComputeTaskPool, TaskPoolBuilder};
 use boxel_world::ChunkMap;
@@ -231,4 +236,126 @@ fn crowd_on_a_compute_pool() {
     assert_eq!(pool.thread_num(), threads);
     let (hash, pushes, woken) = crowd(0, STEPS);
     println!("CROWD {hash} {pushes} {woken}");
+}
+
+/// A crate 0.75 blocks wide and high.
+fn crate_at(sim: &mut Sim, x: f64, y: f64, z: f64) -> Entity {
+    let pos = sim.pos(x, y, z);
+    sim.body(pos, Collider::standing(0.75, 0.75))
+}
+
+/// `n` towers of two crates on the ground (the top one pushes into the bottom one every
+/// step), 2 blocks apart in rows of 16 from `(x, z)`.
+fn towers(sim: &mut Sim, bodies: &mut Vec<Entity>, n: u32, x: f64, z: f64) {
+    for i in 0..n {
+        let (tx, tz) = (x + f64::from(i % 16) * 2.0, z + f64::from(i / 16) * 2.0);
+        for level in 0..2 {
+            bodies.push(crate_at(sim, tx, 4.0 + f64::from(level) * 0.75, tz));
+        }
+    }
+}
+
+/// A brick wall of crates `w` wide and `h` high along x from `(x, z)`: each crate rests on two
+/// of the row below, so the whole wall is one island.
+fn wall(sim: &mut Sim, bodies: &mut Vec<Entity>, w: u32, h: u32, x: f64, z: f64) {
+    for row in 0..h {
+        let shift = f64::from(row % 2) * 0.375;
+        for i in 0..w {
+            let at = x + f64::from(i) * 0.75 + shift;
+            bodies.push(crate_at(sim, at, 4.0 + f64::from(row) * 0.75, z));
+        }
+    }
+}
+
+/// A scene built by `build` on the flat world, sleeping off, run for `steps` steps with
+/// `parallel_threshold`: each step's stats, and the bodies folded into one number.
+fn solve_scene(
+    parallel_threshold: usize,
+    steps: usize,
+    build: impl Fn(&mut Sim, &mut Vec<Entity>),
+) -> (Vec<PhysicsStats>, u64) {
+    let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    sim.settings().parallel_threshold = parallel_threshold;
+    sim.settings().sleep_steps = 0;
+    let mut bodies = Vec::new();
+    build(&mut sim, &mut bodies);
+    let mut stats = Vec::new();
+    for _ in 0..steps {
+        sim.frame(STEP);
+        stats.push(*sim.app.world().resource::<PhysicsStats>());
+    }
+    let mut hash = 0u64;
+    let mut fold = |v: u64| hash = mix(hash ^ v);
+    for &entity in &bodies {
+        let p = sim.position(entity);
+        for v in p.block.as_i64vec3().to_array() {
+            fold(v as u64);
+        }
+        for v in p.frac.to_array() {
+            fold(v.to_bits());
+        }
+        for v in sim.get::<Velocity>(entity).0.to_array() {
+            fold(v.to_bits());
+        }
+        fold(u64::from(sim.get::<Contacts>(entity).faces));
+    }
+    (stats, hash)
+}
+
+#[test]
+fn many_small_islands_that_push_go_on_the_threads() {
+    let build = |sim: &mut Sim, bodies: &mut Vec<Entity>| towers(sim, bodies, 200, -16.0, -16.0);
+    let default = PhysicsSettings::default().parallel_threshold;
+    let (stats, hash) = solve_scene(default, 24, build);
+    // The first step has no pushes before it; from then on every step pushes 200 times.
+    assert_eq!(stats[0].islands, 0, "{:?}", stats[0]);
+    for (step, s) in stats.iter().enumerate().skip(1) {
+        assert!(s.pushes >= 200, "step {step}: {s:?}");
+        assert_eq!(s.islands, 200, "step {step}: one island per tower: {s:?}");
+    }
+    let (_, one_thread) = solve_scene(usize::MAX, 24, build);
+    assert_eq!(hash, one_thread);
+}
+
+#[test]
+fn a_pile_that_is_one_island_stays_on_one_thread() {
+    // 4128 crates: over 4096, where the solve once went on the threads whatever its pairs.
+    let build = |sim: &mut Sim, bodies: &mut Vec<Entity>| {
+        wall(sim, bodies, 96, 43, -28.0, 30.0);
+        towers(sim, bodies, 32, -16.0, -16.0);
+    };
+    let default = PhysicsSettings::default().parallel_threshold;
+    let (stats, hash) = solve_scene(default, 40, build);
+    // The wall pushes thousands of times a step, but it holds most of the pairs: the split
+    // every 17 steps finds that, and the pushes stay on this thread.
+    for (step, s) in stats.iter().enumerate() {
+        assert!(step == 0 || s.pushes >= 1000, "step {step}: {s:?}");
+        assert_eq!(s.islands, 0, "step {step}: {s:?}");
+    }
+    let (_, one_thread) = solve_scene(usize::MAX, 40, build);
+    assert_eq!(hash, one_thread);
+}
+
+#[test]
+fn bodies_that_touch_without_pushing_stay_on_one_thread() {
+    // 4096 small crates side by side (one island): thousands of pairs that touch, none that
+    // pushes.
+    let build = |sim: &mut Sim, bodies: &mut Vec<Entity>| {
+        for i in 0..64 {
+            for j in 0..64 {
+                let pos = sim.pos(
+                    -16.0 + 0.25 + f64::from(i) * 0.5,
+                    4.0,
+                    -16.0 + 0.25 + f64::from(j) * 0.5,
+                );
+                bodies.push(sim.body(pos, Collider::standing(0.5, 0.5)));
+            }
+        }
+    };
+    let default = PhysicsSettings::default().parallel_threshold;
+    let (stats, _) = solve_scene(default, 8, build);
+    for (step, s) in stats.iter().enumerate() {
+        assert!(s.pairs >= 8000, "step {step}: {s:?}");
+        assert_eq!((s.pushes, s.islands), (0, 0), "step {step}: {s:?}");
+    }
 }

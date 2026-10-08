@@ -22,6 +22,7 @@
 //! | `scale/sleep_churn` | no target (one thread, 1000 bodies put to sleep and woken) |
 //! | `scale/10000_awake` (parallel step) | <= 1.5 ms |
 //! | `scale/10000_awake_one_thread` | no target (the same on one thread, to compare) |
+//! | `scale/4096_packed` | no target (a packed crowd: its pairs are one island) |
 //! | `scale/1000_projectiles_one_thread` | <= 0.3 ms |
 //! | `scale/1000_projectiles` | no target (the same with the parallel step) |
 //!
@@ -54,9 +55,12 @@
 //! `sleep_churn` puts 1000 resting crates to sleep by hand and wakes them all again, in turns
 //! (the sleeper store's insertions and removals, without the 32 still steps). `10000_awake` has
 //! 7000 walkers and 3000 items with sleeping off, so every body steps, on the compute threads,
-//! and `10000_awake_one_thread` is the same on one thread. `1000_projectiles` (radius 2) has 100
-//! walkers and 1000 arrows shot over the forest, shot again every 32 steps, with the parallel
-//! step, and `1000_projectiles_one_thread` on one thread. Run when the machine is idle
+//! and `10000_awake_one_thread` is the same on one thread. `4096_packed` has 4096 walkers
+//! packed on 40 x 40 blocks (about one per 0.4 blocks of ground), with the parallel step:
+//! they push each other all the time and their pairs make one island, so the solve's pushes
+//! stay on one thread. `1000_projectiles` (radius 2) has 100 walkers and 1000 arrows shot over
+//! the forest, shot again every 32 steps, with the parallel step, and
+//! `1000_projectiles_one_thread` on one thread. Run when the machine is idle
 //! (`tools/wait-idle.sh`).
 #![expect(clippy::print_stdout, reason = "bench setup output")]
 
@@ -919,6 +923,31 @@ fn scale_benches(c: &mut Criterion) {
         .parallel_threshold = usize::MAX;
     breakdown(&mut app, "scale/10000_awake_one_thread");
     bench_steps(&mut group, "10000_awake_one_thread", &mut app, &mut t);
+
+    // 4096 walkers packed on 40 x 40 blocks (sleeping still off), with the parallel step.
+    let bodies: Vec<Entity> = {
+        let world = app.world_mut();
+        let mut all = world.query_filtered::<Entity, With<RigidBody>>();
+        all.iter(world).collect()
+    };
+    for entity in bodies {
+        app.world_mut().despawn(entity);
+    }
+    app.world_mut()
+        .resource_mut::<PhysicsSettings>()
+        .parallel_threshold = PhysicsSettings::default().parallel_threshold;
+    spawn_spread(&mut app, &table, 4096, 40, 10, 0xC0DE);
+    run_steps(&mut app, 128);
+    let stats = *app.world().resource::<PhysicsStats>();
+    println!(
+        "physics bench: scale/4096_packed: bodies={} dynamic={} frozen={} pairs={} pushes={} \
+         islands={}",
+        stats.bodies, stats.dynamic, stats.frozen, stats.pairs, stats.pushes, stats.islands
+    );
+    assert_eq!((stats.dynamic, stats.sleeping), (4096, 0), "{stats:?}");
+    breakdown(&mut app, "scale/4096_packed");
+    let mut t = 0u64;
+    bench_steps(&mut group, "4096_packed", &mut app, &mut t);
     drop(app);
 
     // 2000 resting crates asleep; 240 of them (fewer than the store rebuilds for, so they stay

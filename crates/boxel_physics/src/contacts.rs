@@ -27,8 +27,9 @@
 //!   off another stands on it (`Contacts::on_ground`).
 //! - A sleeping body that is pushed, or whose velocity changes, wakes up. So does one that
 //!   touches a solid body that moved this step (the crate under it was pushed away).
-//! - With many bodies the pairs are split into islands ([`Islands`]) that run on the compute
-//!   threads: the same pushes, bit for bit.
+//! - With many pushes the pairs are split into islands ([`Islands`]) that run on the compute
+//!   threads: the same pushes, bit for bit. Not when one island holds most of the pairs (a
+//!   packed crowd): it would run alone, slower than on one thread.
 //!
 //! After the pushes, at the bodies' final places, the pairs that report join the step's contact
 //! set: sensor pairs that overlap (by more than the tolerance; touching does not count; sensors
@@ -63,10 +64,23 @@ use std::time::Instant;
 /// How close a sleeping body must be to a solid body that moved for it to wake up, in blocks.
 const WAKE_MARGIN: f64 = 1.0 / 64.0;
 
-/// The broadphase and the solve split their work over the compute threads from this many
-/// bodies in the step's list (see [`parallel_above`]): below it the tasks cost more than they
-/// save.
+/// The broadphase splits its work over the compute threads from this many bodies in the step's
+/// list (see [`parallel_above`]): below it the tasks cost more than they save.
 const PARALLEL_GRID_MIN: usize = 4096;
+
+/// The solve pushes by islands on the compute threads (above
+/// `PhysicsSettings::parallel_threshold` bodies in the step's list) when the previous step
+/// pushed at least this many times and the largest island holds at most half the pairs. The
+/// pushes are the work the threads share: a pair that only touches costs about 25 ns here and
+/// about twice that through the islands (the split, the copies, the tasks). A pile or a packed
+/// crowd is one island, which runs slower alone on a task than here. Measured in
+/// `docs/rendimiento/fisicas-10k-2026-10.md`.
+const PARALLEL_PUSH_MIN: usize = 128;
+
+/// After a split where the largest island held more than half the pairs, the solve stays on one
+/// thread this many steps before it splits again: a packed crowd stays packed, and its split
+/// costs about a tenth of its pushes.
+const DOMINANT_WAIT: u32 = 16;
 
 /// A body pushed along a normal whose `y` is above this stands on the other body
 /// (`Contacts::on_ground`): slopes up to about 45 degrees.
@@ -888,6 +902,8 @@ pub(crate) struct ContactSet {
     ended: Vec<(Entity, Entity)>,
     /// The parallel solve's islands.
     islands: Islands,
+    /// The previous step's pushes (whether the islands pay, see `PARALLEL_PUSH_MIN`).
+    last_pushes: usize,
     /// The bodies the solve writes back, with their places in the list.
     writes: EntityHashMap<u32>,
 }
@@ -1141,17 +1157,19 @@ struct PushShared<'a> {
 /// bodies of its pair, and only the free ones (`IndexedBody::free`; the others are only read),
 /// so pairs that share no free body never affect each other: the islands are the groups of
 /// pairs linked through free bodies. Each island keeps the solve's order (bottom-up) and runs
-/// on its own copy of its bodies, and the free ones are copied back: the same pushes, bit for
-/// bit, as one run over every pair, whatever the threads.
+/// on its own copy of its bodies, and the free ones a push touched are copied back (the others
+/// did not change): the same pushes, bit for bit, as one run over every pair, whatever the
+/// threads.
 #[derive(Default)]
 pub(crate) struct Islands {
-    /// Union-find over the step's list.
+    /// Union-find over the step's list (only the bodies of the order's pairs are set).
     parent: Vec<u32>,
     /// Per root body, its island (`u32::MAX`: none yet).
     island_of: Vec<u32>,
     /// Per pair of the order, its island.
     pair_island: Vec<u32>,
-    /// Island `i`'s pairs are `pairs[starts[i]..starts[i + 1]]` (as indices into its bodies),
+    /// After [`Islands::split`], island `i` has `starts[i]` pairs. After [`Islands::group`],
+    /// island `i`'s pairs are `pairs[starts[i]..starts[i + 1]]` (as indices into its bodies),
     /// its bodies `bodies[body_starts[i]..body_starts[i + 1]]` (as list indices).
     starts: Vec<u32>,
     body_starts: Vec<u32>,
@@ -1163,6 +1181,9 @@ pub(crate) struct Islands {
     /// Per list body, the island it was last copied into (plus one) and its index there.
     stamp: Vec<u32>,
     local: Vec<u32>,
+    /// Steps left before the solve splits again, after a split where one island held most of
+    /// the pairs.
+    wait: u32,
 }
 
 impl Islands {
@@ -1175,11 +1196,32 @@ impl Islands {
         x
     }
 
-    /// Groups `order` (pairs of `pairs` by index, bottom-up) into islands.
-    fn split(&mut self, bodies: &[IndexedBody], pairs: &[(u32, u32)], order: &[(i64, f64, u32)]) {
+    /// Splits `order` (pairs of `pairs` by index, bottom-up) into islands and counts each
+    /// one's pairs; returns how many islands there are and how many pairs the largest has. The
+    /// work follows the pairs, not the list: only the bodies of the order's pairs are read and
+    /// reset.
+    fn split(
+        &mut self,
+        bodies: &[IndexedBody],
+        pairs: &[(u32, u32)],
+        order: &[(i64, f64, u32)],
+    ) -> (usize, usize) {
         let n = bodies.len();
-        self.parent.clear();
-        self.parent.extend(0..n as u32);
+        if self.parent.len() < n {
+            self.parent.resize(n, 0);
+            self.island_of.resize(n, u32::MAX);
+            self.stamp.resize(n, 0);
+            self.local.resize(n, 0);
+        }
+        // Each body of a pair starts as its own root, in no island and copied nowhere.
+        for &(_, _, k) in order {
+            let (a, b) = pairs[k as usize];
+            for g in [a as usize, b as usize] {
+                self.parent[g] = g as u32;
+                self.island_of[g] = u32::MAX;
+                self.stamp[g] = 0;
+            }
+        }
         for &(_, _, k) in order {
             let (a, b) = pairs[k as usize];
             if bodies[a as usize].free() && bodies[b as usize].free() {
@@ -1191,8 +1233,6 @@ impl Islands {
             }
         }
         // Islands numbered by their first pair in the order.
-        self.island_of.clear();
-        self.island_of.resize(n, u32::MAX);
         self.pair_island.clear();
         self.starts.clear();
         for &(_, _, k) in order {
@@ -1207,6 +1247,35 @@ impl Islands {
             self.pair_island.push(island);
             self.starts[island as usize] += 1;
         }
+        let largest = self.starts.iter().copied().max().unwrap_or(0);
+        (self.starts.len(), largest as usize)
+    }
+
+    /// Whether this step's pushes should try the islands: the previous step pushed at least
+    /// [`PARALLEL_PUSH_MIN`] times, and no recent split found one island holding most of the
+    /// pairs (counts down the steps left to wait after one).
+    fn worth_splitting(&mut self, last_pushes: usize) -> bool {
+        if self.wait > 0 {
+            self.wait -= 1;
+            return false;
+        }
+        last_pushes >= PARALLEL_PUSH_MIN
+    }
+
+    /// Whether islands whose largest one has `largest` of the `pairs` pairs are worth the
+    /// threads: not when it holds more than half of them (it would run alone, slower on a task
+    /// than on this thread). Then the next [`DOMINANT_WAIT`] steps do not split.
+    fn balanced(&mut self, largest: usize, pairs: usize) -> bool {
+        let balanced = largest * 2 <= pairs;
+        if !balanced {
+            self.wait = DOMINANT_WAIT;
+        }
+        balanced
+    }
+
+    /// Lays out the islands of the latest [`Islands::split`] (of the same `pairs` and `order`)
+    /// for [`Islands::push_all`].
+    fn group(&mut self, pairs: &[(u32, u32)], order: &[(i64, f64, u32)]) {
         // Counts to starts, then the pairs in order within each island.
         let mut sum = 0;
         for start in &mut self.starts {
@@ -1226,9 +1295,6 @@ impl Islands {
         }
         // Each island's bodies (a body that is only read may be in several) and its pairs as
         // indices into them.
-        self.stamp.clear();
-        self.stamp.resize(n, 0);
-        self.local.resize(n, 0);
         self.bodies.clear();
         self.body_starts.clear();
         self.pairs.clear();
@@ -1259,8 +1325,8 @@ impl Islands {
     }
 
     /// Runs the pushes of every island on the compute threads (see [`push_pairs`]) and copies
-    /// the free bodies back into `bodies`; the touched bodies go into `touched` (as list
-    /// indices, unsorted). Returns how many pushes happened.
+    /// the free bodies they touched back into `bodies`; the touched bodies go into `touched`
+    /// (as list indices, unsorted). Returns how many pushes happened.
     fn push_all(
         &self,
         bodies: &mut [IndexedBody],
@@ -1324,19 +1390,31 @@ impl Islands {
                             &mut touched,
                         );
                         for t in &mut touched[at..] {
-                            *t = self.bodies[b0 + from + *t as usize];
+                            *t += from as u32;
                         }
                     }
-                    (b0, copies, touched, pushes)
+                    // Only the touched bodies can have changed: the free ones go back to the
+                    // list (each once), the others are as the list has them.
+                    let mut back = Vec::new();
+                    let mut seen = vec![false; copies.len()];
+                    for t in &mut touched {
+                        let j = *t as usize;
+                        if !seen[j] {
+                            seen[j] = true;
+                            if copies[j].free() {
+                                back.push((self.bodies[b0 + j], copies[j]));
+                            }
+                        }
+                        *t = self.bodies[b0 + j];
+                    }
+                    (back, touched, pushes)
                 });
             }
         });
         let mut pushes = 0;
-        for (b0, copies, mut found, count) in results {
-            for (copy, &g) in copies.into_iter().zip(&self.bodies[b0..]) {
-                if copy.free() {
-                    bodies[g as usize] = copy;
-                }
+        for (back, mut found, count) in results {
+            for (g, body) in back {
+                bodies[g as usize] = body;
             }
             touched.append(&mut found);
             pushes += count;
@@ -1453,24 +1531,39 @@ pub(crate) fn solve(
     let touched = &mut contacts.touched;
     touched.clear();
     let passes = settings.solver_passes;
-    let pushes = if parallel_above(&settings, bodies.len(), PARALLEL_GRID_MIN) && !order.is_empty()
+    // The pushes go on the compute threads by islands only when that pays (see
+    // `PARALLEL_PUSH_MIN`), and with a `parallel_threshold` of 0 whenever there are pairs. Both
+    // ways give the same pushes, bit for bit.
+    let islands = &mut contacts.islands;
+    let forced = settings.parallel_threshold == 0;
+    let mut threaded = None;
+    if !order.is_empty()
+        && bodies.len() > settings.parallel_threshold
+        && (forced || islands.worth_splitting(contacts.last_pushes))
     {
-        ensure_compute_pool();
-        let islands = &mut contacts.islands;
-        islands.split(bodies, pairs, order);
-        let shared = PushShared {
-            map: &map,
-            world: &world,
-            table: &content.collision,
-            obstacles: &obstacles,
-            cfg: push_world.cfg,
-            eps,
-            passes,
-        };
-        islands.push_all(bodies, &shared, touched)
-    } else {
-        let order = order.iter().map(|&(_, _, k)| pairs[k as usize]);
-        push_pairs(bodies, order, passes, eps, &mut push_world, touched)
+        let (count, largest) = islands.split(bodies, pairs, order);
+        if forced || islands.balanced(largest, order.len()) {
+            ensure_compute_pool();
+            islands.group(pairs, order);
+            let shared = PushShared {
+                map: &map,
+                world: &world,
+                table: &content.collision,
+                obstacles: &obstacles,
+                cfg: push_world.cfg,
+                eps,
+                passes,
+            };
+            threaded = Some((count, islands.push_all(bodies, &shared, touched)));
+        }
+    }
+    stats.islands = threaded.map_or(0, |(count, _)| count);
+    let pushes = match threaded {
+        Some((_, pushes)) => pushes,
+        None => {
+            let order = order.iter().map(|&(_, _, k)| pairs[k as usize]);
+            push_pairs(bodies, order, passes, eps, &mut push_world, touched)
+        }
     };
 
     // Sleepers touching a solid body that moved this step (what they rested on may be gone).
@@ -1613,6 +1706,7 @@ pub(crate) fn solve(
         commands.entity(entity).try_remove::<Sleeping>();
     }
     stats.pushes = pushes;
+    contacts.last_pushes = pushes;
     stats.overlaps = contacts.current.len();
     stats.solve_time += start.elapsed();
 }

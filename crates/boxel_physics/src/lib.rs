@@ -47,7 +47,7 @@
 //!
 //! Scale: bodies that rest fall asleep ([`Sleeping`]) and cost almost nothing until something
 //! wakes them; above `PhysicsSettings::parallel_threshold` awake bodies the step, and with many
-//! bodies the broadphase and the solve, run on the compute threads.
+//! bodies the broadphase and (with many pushes) the solve, run on the compute threads.
 
 mod components;
 mod contacts;
