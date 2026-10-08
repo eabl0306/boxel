@@ -144,6 +144,22 @@ fn bench(c: &mut Criterion) {
                     black_box(state.update(&turned[i], lookup));
                 });
             });
+            // The same with cold caches, as in a game frame that did other work since the last
+            // search: 32 MiB are written between searches (not timed).
+            let mut thrash = vec![0u8; 32 << 20];
+            g.bench_function(format!("r{radius}_{name}_search_cold"), |b| {
+                b.iter_batched(
+                    || {
+                        for (k, v) in thrash.iter_mut().enumerate().step_by(64) {
+                            *v = v.wrapping_add(k as u8);
+                        }
+                        i ^= 1;
+                        i
+                    },
+                    |i| black_box(state.update(&turned[i], lookup)),
+                    criterion::BatchSize::PerIteration,
+                );
+            });
             // A chunk crossing: one slab of the grid is read from the links, then the search.
             let crossed = [v, view(eye + DVec3::X * 32.0, pitch, radius, true)];
             g.bench_function(format!("r{radius}_{name}_cross"), |b| {

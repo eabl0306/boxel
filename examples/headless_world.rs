@@ -503,6 +503,15 @@ fn cull_lines(o: &Options, map: &ChunkMap, transform: &Transform, viewer: ChunkV
         .collect();
     let off = cull_counts(&view, meshes.iter().copied(), None);
     let on = cull_counts(&view, meshes.iter().copied(), Some(&set));
+    // The same search without the frustum (every direction; the renderer still culls by it).
+    let all_ways = VisibilityView {
+        frustum: None,
+        ..search_view(&cv)
+    };
+    let start = Instant::now();
+    let free = visible_chunks(&all_ways, links);
+    let free_ms = start.elapsed().as_secs_f64() * 1e3;
+    let free_on = cull_counts(&view, meshes.iter().copied(), Some(&free));
     let hidden = |a: u64, b: u64| {
         if a == 0 {
             0.0
@@ -532,6 +541,12 @@ fn cull_lines(o: &Options, map: &ChunkMap, transform: &Transform, viewer: ChunkV
         hidden(off.buckets.into(), on.buckets.into()),
         hidden(off.quads, on.quads),
     );
+    out += &format!(
+        "\nno_frustum: reached={} fresh_ms={free_ms:.3} quads={} hidden={:.1}%",
+        free.visible_count(),
+        free_on.quads,
+        hidden(off.quads, free_on.quads)
+    );
     if o.world.world == World::Overworld {
         // Chunks whose top is under the surface of their 4 corner columns and center.
         let heights = OverworldGenerator::default();
@@ -545,11 +560,13 @@ fn cull_lines(o: &Options, map: &ChunkMap, transform: &Transform, viewer: ChunkV
             meshes.iter().copied().filter(|(o, _)| under(*o)).collect();
         let off = cull_counts(&view, deep.iter().copied(), None);
         let on = cull_counts(&view, deep.iter().copied(), Some(&set));
+        let free_on = cull_counts(&view, deep.iter().copied(), Some(&free));
         out += &format!(
-            "\nunderground: off quads={} on quads={} hidden={:.1}%",
+            "\nunderground: off quads={} on quads={} hidden={:.1}% no_frustum hidden={:.1}%",
             off.quads,
             on.quads,
-            hidden(off.quads, on.quads)
+            hidden(off.quads, on.quads),
+            hidden(off.quads, free_on.quads)
         );
     }
     out
