@@ -65,11 +65,12 @@ use boxel_physics::{
     BlockBounds, BodyPosition, BodySettings, CharacterController, ChunkSource, Collider,
     CollisionEnded, CollisionLayers, CollisionStarted, CollisionTable, Grid, Interpolated,
     LocalBox, MoveIntent, PhysicsPlugin, PhysicsSettings, PhysicsStats, Projectile, ProjectileHit,
-    RayResult, RigidBody, Sleeping, SweepConfig, Teleport, Velocity, VoxelFilter, VoxelImpact,
-    move_box, raycast_voxels,
+    RayResult, RigidBody, Sleeping, StepUp, SweepConfig, Teleport, TestWorld, Velocity,
+    VoxelFilter, VoxelImpact, move_box, move_box_stepping, move_box_stepping_unpruned,
+    raycast_voxels,
 };
 use boxel_transform::Transform;
-use boxel_voxel::{BlockRegistry, CHUNK_SHIFT, ChunkPos, WorldPos};
+use boxel_voxel::{BlockPos, BlockRegistry, BlockState, CHUNK_SHIFT, ChunkPos, WorldPos};
 use boxel_world::jobs::InlineExecutor;
 use boxel_world::{ChunkDataEvent, ChunkMap, ChunkViewer, WorldPlugin, WorldSettings, WorldStats};
 use boxel_worldgen::{ForestGenerator, OverworldGenerator, WorldGenerator};
@@ -209,6 +210,65 @@ fn benches(c: &mut Criterion) {
             ))
         });
     });
+    // A walker (step height 0.6) pushing into a wall one block high, straight and sliding along
+    // it diagonally: with the early skip of the step-up, and with the lifted moves tried.
+    let mut wall = TestWorld::new();
+    wall.fill(
+        BlockPos::new(-4, -1, -4),
+        BlockPos::new(4, -1, 4),
+        BlockState(1),
+    );
+    wall.fill(
+        BlockPos::new(1, 0, -4),
+        BlockPos::new(1, 0, 4),
+        BlockState(1),
+    );
+    let touching = WorldPos::from_dvec3(DVec3::new(0.7, 0.0, 0.5));
+    let step = StepUp {
+        height: 0.6,
+        grounded: true,
+    };
+    for (name, d) in [
+        ("step_wall", DVec3::new(4.3 / 64.0, -32.0 / 4096.0, 0.0)),
+        (
+            "step_wall_slide",
+            DVec3::new(3.0 / 64.0, -32.0 / 4096.0, 3.0 / 64.0),
+        ),
+    ] {
+        let skip = move_box_stepping(&mut wall, &table, touching, player(), d, &[], &cfg, step);
+        let tried =
+            move_box_stepping_unpruned(&mut wall, &table, touching, player(), d, &[], &cfg, step);
+        assert_eq!(skip, tried);
+        assert!(skip.is_ok_and(|out| out.touched(boxel_voxel::Face::PosX)));
+        sweep.bench_function(name, |b| {
+            b.iter(|| {
+                black_box(move_box_stepping(
+                    &mut wall,
+                    &table,
+                    black_box(touching),
+                    player(),
+                    black_box(d),
+                    &[],
+                    &cfg,
+                    step,
+                ))
+            });
+        });
+        sweep.bench_function(format!("{name}_tried"), |b| {
+            b.iter(|| {
+                black_box(move_box_stepping_unpruned(
+                    &mut wall,
+                    &table,
+                    black_box(touching),
+                    player(),
+                    black_box(d),
+                    &[],
+                    &cfg,
+                    step,
+                ))
+            });
+        });
+    }
     sweep.finish();
 
     let sky = streamed(
@@ -252,7 +312,7 @@ fn benches(c: &mut Criterion) {
     // whole length is walked (the worst case).
     let deep = WorldPos::from_dvec3(DVec3::new(8.5, -199.5, 16.5));
     let tunnel = DVec3::new(1.0, 0.02, 0.01).normalize();
-    let mut never = |_: boxel_voxel::BlockPos, _: boxel_voxel::BlockState| false;
+    let mut never = |_: BlockPos, _: BlockState| false;
     assert_eq!(
         raycast_voxels(
             &mut caves.source(),
@@ -266,7 +326,7 @@ fn benches(c: &mut Criterion) {
     );
     ray.bench_function("cave_256", |b| {
         b.iter(|| {
-            let mut never = |_: boxel_voxel::BlockPos, _: boxel_voxel::BlockState| false;
+            let mut never = |_: BlockPos, _: BlockState| false;
             black_box(raycast_voxels(
                 &mut caves.source(),
                 &table,
