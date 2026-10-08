@@ -443,25 +443,38 @@ Dos datos del código pesan en el diseño:
 
 - **9d. 10 000 cuerpos despiertos (issue #13).** Con 10 000 mobs despiertos el paso no entraba
   en el frame: el broadphase y el solve iban casi todos en un hilo. Ahora, con más de
-  `parallel_threshold` cuerpos despiertos y desde 4096 en la lista del paso:
-  - Broadphase: cada hilo arma su tramo de la lista y de la grilla (`GridSlot`,
-    `Grid::push_slots`). Cada cuerpo va a su lugar fijo, el de la query, así que la lista, la
-    grilla y los pares son los mismos que en un hilo. Las claves de entidad de los pares se arman
-    una vez antes de ordenarlos.
+  `parallel_threshold` cuerpos despiertos:
+  - Broadphase, desde 4096 cuerpos en la lista del paso: cada hilo arma su tramo de la lista y
+    de la grilla (`GridSlot`, `Grid::push_slots`). Cada cuerpo va a su lugar fijo, el de la
+    query, así que la lista, la grilla y los pares son los mismos que en un hilo. Las claves de
+    entidad de los pares se arman una vez antes de ordenarlos.
   - Solve: los pares sólidos se parten en islas. Un empuje solo cambia los dos cuerpos del par,
     y solo los libres (dinámicos no congelados); los demás solo se leen. Las islas son los grupos
     de pares unidos por cuerpos libres (union-find), numeradas por su primer par. Cada isla
-    conserva el orden de siempre (de abajo hacia arriba, `solver_passes` pasadas), corre en un
-    hilo sobre copias de sus cuerpos y los libres se copian de vuelta: los mismos empujes, bit a
-    bit, que una pasada por todos los pares. Desde 256 cuerpos que cambiaron, la escritura de
-    vuelta a los componentes también va en los hilos (cada cuerpo escribe lo suyo).
+    conserva el orden de siempre (de abajo hacia arriba, `solver_passes` pasadas) y corre en un
+    hilo sobre copias de sus cuerpos. Vuelven a la lista los libres que un empuje tocó (los
+    demás no cambiaron): los mismos empujes, bit a bit, que una pasada por todos los pares.
+    Desde 256 cuerpos que cambiaron, la escritura de vuelta a los componentes también va en los
+    hilos (cada cuerpo escribe lo suyo).
+  - El solve va en los hilos solo cuando paga. Lo que se reparte son los empujes: un par que
+    solo se toca cuesta unos 25 ns en un hilo y casi el doble por islas (partir, copiar, las
+    tareas). Y una pila o una multitud apretada es una sola isla, que en una tarea corre más
+    lento que en el hilo del sistema (de 1.2 a 2.1 veces, medido). Por eso va en los hilos cuando
+    el paso anterior empujó al menos 128 veces y ninguna isla tiene más de la mitad de los
+    pares. Si una la tiene, se queda en un hilo y no vuelve a partir en 16 pasos (partir cuesta
+    cerca de un décimo de los empujes). Antes se elegía por el tamaño de la lista (4096
+    cuerpos), que no mide el trabajo del solve: pocos pares pagaban las tareas, y los empujes
+    de 4096 mobs apretados iban 1.5 veces más lentos que en un hilo. `PhysicsStats::islands`
+    dice cuántas islas fueron a los hilos en el último paso (0: un hilo). Mediciones en
+    [rendimiento/fisicas-10k-2026-10](../rendimiento/fisicas-10k-2026-10.md).
   - Después de los empujes la grilla ya no se rehace entera: un cuerpo que cambió de celdas
     espera en la lista de grandes (se prueba contra todo) hasta el próximo armado, y las consultas
     lo ven en su lugar nuevo. Rehacerla costaba 0.11 ms por paso con 10 000 cuerpos.
   - `parallel_threshold = 0` corre todas las partes en los hilos aunque sean chicas; los tests
     lo usan.
   - Siguen en un hilo: contar y ordenar las celdas de la grilla, el orden de abajo hacia arriba
-    de los pares, partir en islas, los sensores, los eventos y el despertar.
+    de los pares, partir en islas (su trabajo sigue a los pares, no a la lista), los sensores,
+    los eventos y el despertar.
 
 - **10. Fases.** P0: requisitos (`WorldPos`, sets del bucle fijo, el tope de pasos, este ADR, la
   feature). P1: núcleo y raycast (tabla, fuentes, barrido, DDA, `PhysicsQuery::raycast_voxels`,
@@ -478,7 +491,8 @@ Hecho (issue #13, 10 000 cuerpos despiertos, 9c y 9d):
   oculta `move_box_stepping_unpruned` siempre prueba subir, para los tests y los benches);
   `GridSlot`, `Grid::slot`, `Grid::push_slot` y `Grid::push_slots`; `Grid::set_bounds` ya no
   pide rehacer la grilla; el broadphase, el solve (islas) y su escritura de vuelta en los hilos;
-  `parallel_threshold = 0` corre todo en los hilos.
+  el solve elige los hilos por sus empujes y por la isla más grande, y cuenta sus islas en
+  `PhysicsStats::islands`; `parallel_threshold = 0` corre todo en los hilos.
 - Tests: en `step_up.rs`, empujar contra una pared no lee el chunk de arriba (descartado) y sí lo
   lee sin el descarte; una proptest de 512 casos (se corrió también con 20 000) compara el
   barrido con y sin descarte, bit a bit, en campos de piedra, lomas y losas, con obstáculos, con
@@ -489,9 +503,13 @@ Hecho (issue #13, 10 000 cuerpos despiertos, 9c y 9d):
   sensores, pelotas, pilares, un cinemático, lomas y losas) da los mismos cuerpos y eventos bit a
   bit en un hilo y con todo el paso en pools de 1, 3 y 8 hilos (cada uno en un proceso hijo,
   porque el pool es global). Invertir el orden de los pares de una isla lo hace fallar (probado a
-  mano).
+  mano). También en `threads.rs`, con el umbral de siempre: 200 torres de cajas que empujan van
+  en los hilos (una isla por torre), una pared de 4128 cajas (una isla) y 4096 cajas que se tocan
+  sin empujar se quedan en un hilo, y los cuerpos quedan igual bit a bit que en un hilo. Con la
+  elección de antes (por el tamaño de la lista) los tres fallan.
 - Benches nuevos: `sweep/step_wall` y `sweep/step_wall_slide` (un caminante que empuja contra una
-  pared de un bloque, derecho y deslizándose) y sus `_tried` (sin descarte).
+  pared de un bloque, derecho y deslizándose) y sus `_tried` (sin descarte); `scale/4096_packed`
+  (4096 caminantes apretados en 40 x 40 bloques: una sola isla).
 - Costo (detalle en [rendimiento/fisicas-10k-2026-10](../rendimiento/fisicas-10k-2026-10.md); 4
   corridas intercaladas de cada versión con la máquina quieta, medianas): `scale/10000_awake`
   baja de 2.47 a 1.75 ms (29 % menos), `10000_awake_one_thread` de 6.24 a 5.87 ms,
@@ -502,7 +520,9 @@ Hecho (issue #13, 10 000 cuerpos despiertos, 9c y 9d):
   siguen sin llegar a sus objetivos (0.3 y 0.6 ms). El barrido sin escalón queda 4 % más lento
   (`sweep/player_walk` de 0.239 a 0.248 µs), por el reparto del código entre funciones; empujar
   contra una pared cuesta 0.48 µs en vez de 0.94 µs (`sweep/step_wall` contra
-  `sweep/step_wall_tried`).
+  `sweep/step_wall_tried`). Con la elección del solve por empujes, `scale/4096_packed` baja de
+  8.17 a 7.70 ms y `scale/10000_awake` queda igual (4 corridas intercaladas, máquina
+  compartida).
 
 Hecho (P5, subir escalones, 9c):
 

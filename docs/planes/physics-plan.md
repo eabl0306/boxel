@@ -339,7 +339,7 @@ Near the player nothing freezes, because the data region extends one chunk past 
 
   These two messages go in boxel_world and are shared with lighting, which needs both. Agree on their shape before either merges. Polling `ChunkData.version` alone would miss reloads.
 - **Parallel step.** Above 256 awake bodies, the step uses `par_iter_mut`. Each body writes only itself and has its own chunk cache, so the result is identical to the serial run.
-- **Estado (issue #13, 2026-10-08):** con muchos cuerpos el broadphase y el solve también van en los hilos: la lista y la grilla se llenan en el orden de la query, y el solve corre por islas de pares que no comparten cuerpos libres, cada una en el orden de siempre. La grilla ya no se rehace después de los empujes. Los caminantes que empujan contra una loma de un bloque no prueban subir (descarte exacto). Un test compara 1, 3 y 8 hilos bit a bit. Detalle en ADR 0016 (9c y 9d) y en [rendimiento/fisicas-10k-2026-10](../rendimiento/fisicas-10k-2026-10.md).
+- **Estado (issue #13, 2026-10-08):** con muchos cuerpos el broadphase y el solve también van en los hilos: la lista y la grilla se llenan en el orden de la query, y el solve corre por islas de pares que no comparten cuerpos libres, cada una en el orden de siempre, cuando hay bastantes empujes y ninguna isla tiene más de la mitad de los pares (una multitud apretada es una sola isla y va más rápido en un hilo). La grilla ya no se rehace después de los empujes. Los caminantes que empujan contra una loma de un bloque no prueban subir (descarte exacto). Un test compara 1, 3 y 8 hilos bit a bit. Detalle en ADR 0016 (9c y 9d) y en [rendimiento/fisicas-10k-2026-10](../rendimiento/fisicas-10k-2026-10.md).
 
 ### 4.7 Precision and determinism rules
 
