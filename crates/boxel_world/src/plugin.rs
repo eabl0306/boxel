@@ -5,7 +5,7 @@ use crate::neighbor_rules::NeighborRules;
 use crate::sky::{SkyMap, SkyRule};
 use crate::streaming::{Ctx, ViewerChunks, WorldJobs};
 use crate::{ChunkId, ChunkMap, WorldStats};
-use boxel_app::{App, Last, Plugin, Update};
+use boxel_app::{App, Idle, IdleStep, IdleWork, Last, Plugin, Update};
 use boxel_diagnostic::DiagnosticsBoard;
 use boxel_ecs::prelude::*;
 use boxel_light::sky_tile::DEFAULT_WALK_LIMIT;
@@ -78,11 +78,21 @@ pub struct WorldSettings {
     /// Main-thread time per frame for applying viewer changes: creating, updating and unloading
     /// chunk slots, and refreshing queued job priorities. A big change (a jump, a new viewer, a
     /// larger radius) is spread over several frames, nearest chunks first. At least 64 positions
-    /// are processed per frame whatever the budget.
+    /// are processed per frame whatever the budget. Work left over goes on between frames when
+    /// [`WorldSettings::idle_work`] is on.
     pub interest_budget: Duration,
     /// Main-thread time per frame for collecting finished jobs and starting new ones (repeated
-    /// while results keep arriving).
+    /// while results keep arriving). Under a frame limit this goes on between frames too
+    /// ([`WorldSettings::idle_work`]).
     pub job_budget: Duration,
+    /// Under a frame limit, use the wait between frames (ADR 0022): the runner runs the `Idle`
+    /// schedule in short steps after each frame presented, and the world collects finished jobs,
+    /// starts queued ones and goes on with the interest work there, so a job result does not
+    /// wait for the next frame at every stage (generation, sky walk, mesh). Mesh results are
+    /// still published in the next frame's `Collect`. Without a limit no step runs and this
+    /// changes nothing. On by default; off, the world works in its frame steps only. Read every
+    /// step.
+    pub idle_work: bool,
     /// Max `ChunkMeshEvent`s published per frame (upload smoothing).
     pub max_mesh_events_per_frame: usize,
     /// Extra chunks beyond the data region (horizontally and vertically) before unloading.
@@ -135,6 +145,7 @@ impl Default for WorldSettings {
             max_jobs_in_flight: 0,
             interest_budget: Duration::from_millis(1),
             job_budget: Duration::from_millis(2),
+            idle_work: true,
             max_mesh_events_per_frame: 512,
             unload_hysteresis: 2,
             vertical_bounds: None,
@@ -177,7 +188,11 @@ impl WorldContent {
     }
 }
 
-/// Mesh changes for the renderer, written in `WorldSystems::Collect` (and on unload).
+/// Mesh changes for the renderer, written in `WorldSystems::Collect` (and on unload). Between
+/// frames (the `Idle` schedule, [`WorldSettings::idle_work`]) the world writes `Remove`s (unloads,
+/// meshes that became empty or unwanted) and, rarely, the `Upsert`s of an edit batch whose last
+/// missing member left it; new meshes of the streaming wait for `Collect`. Either way the next
+/// frame's readers get them.
 #[derive(Message, Clone, Debug)]
 pub enum ChunkMeshEvent {
     /// New or replaced mesh (never empty).
@@ -233,7 +248,8 @@ pub struct BlockChanged {
 
 /// A chunk's blocks became readable (`DataState::Ready`, or `Missing`, read as air) or stopped
 /// being readable, written at the end of the world's systems in `Update`
-/// (`WorldSystems::Collect`), in the order it happened that frame.
+/// (`WorldSystems::Collect`) and at the end of each idle step between frames
+/// ([`WorldSettings::idle_work`]), in the order it happened. The next frame's readers get them.
 ///
 /// A chunk that unloads and loads again may come back different (edits are not saved yet), so
 /// systems that keep state about the blocks of a chunk refresh it on `Loaded` (physics wakes the
@@ -326,7 +342,8 @@ pub enum WorldSystems {
 /// `EditQueue`, [`NeighborRules`] (the built-in ones of the registry), `WorldStats`, internal
 /// job state), the messages `ChunkMeshEvent`,
 /// [`BlockChanged`] and [`ChunkDataEvent`] and the chained systems in
-/// `Update`. A stats system in `Last` refreshes `WorldStats` and publishes a `"world"` line to
+/// `Update`, and the world's step in `Idle` (between frames, [`WorldSettings::idle_work`]). A
+/// stats system in `Last` refreshes `WorldStats` and publishes a `"world"` line to
 /// `DiagnosticsBoard` if present. `TaskPoolPlugin` is recommended (pool sizes); without it the
 /// default executor initializes a default async compute pool.
 pub struct WorldPlugin {
@@ -409,6 +426,7 @@ impl Plugin for WorldPlugin {
                         .in_set(WorldSystems::Collect),
                 ),
             )
+            .add_systems(Idle, (idle_world, publish_data_changes).chain())
             .add_systems(Last, publish_stats);
     }
 }
@@ -522,6 +540,33 @@ fn run_jobs(
     let mut cx = Ctx::new(&mut map, &mut sky, &content, &mut events);
     jobs.run_jobs(&mut cx, settings.job_budget);
     writer.write_batch(events);
+}
+
+/// `Idle` (between frames, ADR 0022): the world's step within [`IdleStep::until`]. Without work
+/// to do now, or without time, it only reports what is pending, without touching the map (no
+/// change marks).
+fn idle_world(
+    mut step: ResMut<IdleStep>,
+    mut map: ResMut<ChunkMap>,
+    mut sky: ResMut<SkyMap>,
+    mut jobs: ResMut<WorldJobs>,
+    content: Res<WorldContent>,
+    settings: Res<WorldSettings>,
+    mut writer: MessageWriter<ChunkMeshEvent>,
+) {
+    if !settings.idle_work {
+        return;
+    }
+    let pending = jobs.idle_pending();
+    if pending != IdleWork::Ready || Instant::now() >= step.until {
+        step.want(pending);
+        return;
+    }
+    let mut events = Vec::new();
+    let mut cx = Ctx::new(&mut map, &mut sky, &content, &mut events);
+    let left = jobs.idle(&mut cx, &settings, step.until);
+    writer.write_batch(events);
+    step.want(left);
 }
 
 fn publish_meshes(

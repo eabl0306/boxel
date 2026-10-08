@@ -29,6 +29,12 @@
 //!    sent again, and the meshes of one edit batch are published together (held up to
 //!    [`WorldSettings::edit_batch_hold`]). Then the frame's [`ChunkDataEvent`]s.
 //!
+//! Between frames (ADR 0022): under a frame limit the runner runs the `Idle` schedule in short
+//! steps after each frame presented, and the world goes on collecting finished jobs, starting
+//! queued ones and applying the interest work left ([`WorldSettings::idle_work`]), so a result
+//! does not wait a whole frame at every stage. Mesh results still go out in the next `Collect`;
+//! the step's [`ChunkDataEvent`]s (and `Remove`s) reach the next frame's readers.
+//!
 //! Systems that keep state derived from the blocks (physics, gameplay) follow the world through
 //! two messages: [`BlockChanged`] for each edited block (written in `Edits`, from the same
 //! per-voxel change list the light's remeshes come from) and [`ChunkDataEvent`] when a chunk's

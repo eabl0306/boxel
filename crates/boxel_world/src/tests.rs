@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use support::{CountingExecutor, LayerGen, fake_mesh};
 
+mod idle;
 mod light;
 mod neighbors;
 

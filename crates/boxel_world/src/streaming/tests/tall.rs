@@ -43,7 +43,7 @@ fn reference_wanted(h: &Harness, viewers: &[Viewer]) -> BTreeMap<ChunkPos, Inter
 
 /// A slot whose data arrived (`Ready` or `Missing`) has the neighbor bits of the current map.
 /// Slots still waiting for their data get them when it arrives.
-fn check_neighbor_bits(h: &Harness, slot: &ChunkSlot) {
+pub(super) fn check_neighbor_bits(h: &Harness, slot: &ChunkSlot) {
     if matches!(slot.data(), DataState::Ready(_) | DataState::Missing) {
         assert_eq!(
             slot.neighbors_ready,
@@ -55,7 +55,7 @@ fn check_neighbor_bits(h: &Harness, slot: &ChunkSlot) {
 }
 
 /// The interest invariants of a world whose interest backlog is empty.
-fn check_interest(h: &Harness, viewers: &[Viewer]) {
+pub(super) fn check_interest(h: &Harness, viewers: &[Viewer]) {
     let hysteresis = h.settings.unload_hysteresis;
     let bounds = h.settings.vertical_bounds.as_ref();
     assert_eq!(h.jobs.interest_backlog(), 0);
@@ -433,7 +433,7 @@ fn vertical_bounds_can_change_while_generation_is_pending() {
 
 /// What happens between two checks of a random walk.
 #[derive(Clone, Debug)]
-enum Op {
+pub(super) enum Op {
     /// Viewer `i` moves by a small offset.
     Move(u8, i64, i64, i64),
     /// Viewer `i` jumps to a position.
@@ -444,7 +444,7 @@ enum Op {
     Toggle(u8),
 }
 
-fn op() -> impl Strategy<Value = Op> {
+pub(super) fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
         6 => (0u8..2, -2i64..=2, -2i64..=2, -2i64..=2)
             .prop_map(|(i, x, y, z)| Op::Move(i, x, y, z)),
@@ -455,7 +455,7 @@ fn op() -> impl Strategy<Value = Op> {
     ]
 }
 
-fn apply(viewers: &mut [Option<Viewer>; 2], op: &Op) {
+pub(super) fn apply(viewers: &mut [Option<Viewer>; 2], op: &Op) {
     match *op {
         Op::Move(i, x, y, z) => {
             if let Some(v) = &mut viewers[usize::from(i)] {
@@ -553,7 +553,7 @@ fn frame(h: &mut Harness, hold: &HoldExecutor, list: &[(u64, Viewer)], run: bool
 
 /// Bookkeeping that holds after every frame, whatever interest work is pending: neighbor bits
 /// match the map and published meshes match the slots.
-fn check_bookkeeping(h: &Harness) {
+pub(super) fn check_bookkeeping(h: &Harness) {
     for (_, slot) in h.map.iter() {
         check_neighbor_bits(h, slot);
     }

@@ -1368,5 +1368,6 @@ fn a_batch_without_results_closes_after_frames_and_time() {
     }
 }
 
+mod idle;
 mod sky;
 mod tall;
