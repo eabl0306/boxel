@@ -481,9 +481,15 @@ fn track_viewers(
 }
 
 /// Starts the frame's world budgets from the runner's [`FrameDeadline`] (see
-/// [`WorldSettings::interest_budget`]).
-fn begin_frame_budget(deadline: Option<Res<FrameDeadline>>, mut budget: ResMut<FrameBudget>) {
-    budget.begin(deadline.as_deref());
+/// [`WorldSettings::interest_budget`]), with room for a cave culling search.
+fn begin_frame_budget(
+    deadline: Option<Res<FrameDeadline>>,
+    mut visibility: ResMut<ChunkVisibility>,
+    mut budget: ResMut<FrameBudget>,
+) {
+    // The frame's accounting changes nothing the visibility's readers see.
+    let culling = visibility.bypass_change_detection().take_frame_cost();
+    budget.begin(deadline.as_deref(), culling);
 }
 
 /// Applies the renderer's resyncs ([`ChunkMeshResync`]) before anything changes a mesh this

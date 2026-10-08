@@ -37,6 +37,7 @@
 //! - A link that opens (an edit, a chunk unloaded or remeshed after an edit) searches again at
 //!   once. A link that closes (a chunk whose mesh just settled, which happens every frame while
 //!   the world streams) can only hide more: it waits up to [`TIGHTEN_DELAY`] for the next search.
+use crate::budget::CullingCost;
 use boxel_math::{Frustum, I64Vec3, Vec3};
 use boxel_voxel::{ALL_LINKS, BlockPos, CHUNK_SHIFT, ChunkFaceInfo, ChunkPos, Face};
 use std::collections::HashSet;
@@ -311,6 +312,10 @@ pub const MOVE_SLACK: f32 = 4.0;
 /// How long a link that closed (it can only hide more) may wait for the next search.
 pub const TIGHTEN_DELAY: Duration = Duration::from_millis(50);
 
+/// A cheaper frame that searched lowers [`ChunkVisibility`]'s reserve by this fraction of the
+/// gap (a dearer one raises it at once), and so does a frame without cave culling.
+const RESERVE_DECAY: u32 = 8;
+
 /// Slack of the searches of [`visible_chunks`] and [`ChunkVisibility`]: [`MOVE_SLACK`] plus
 /// [`FRUSTUM_SLACK`] against rounding.
 const SEARCH_SLACK: f32 = MOVE_SLACK + FRUSTUM_SLACK;
@@ -575,6 +580,13 @@ pub struct ChunkVisibility {
     /// Chunks the renderer does not show as the map has them ([`ChunkVisibility::set_unshown`]):
     /// [`XRAY`] in the grid whatever the map says.
     unshown: HashSet<ChunkPos>,
+    /// Main-thread time of cave culling in the current frame (updates and the renderer's
+    /// bits), whether it searched and whether culling ran at all (the world's frame budget).
+    frame_spent: Duration,
+    frame_searched: bool,
+    frame_used: bool,
+    /// Peak estimate of a frame that searched ([`CullingCost::reserve`]).
+    reserve: Duration,
     stats: VisibilityStats,
 }
 
@@ -674,6 +686,7 @@ impl ChunkVisibility {
         let tighten = self
             .closed
             .is_some_and(|t| now.saturating_duration_since(t) >= TIGHTEN_DELAY);
+        self.frame_used = true;
         if refilled == 0
             && !self.opened
             && !tighten
@@ -681,6 +694,7 @@ impl ChunkVisibility {
             && still_holds(last, view)
         {
             self.stats.reused += 1;
+            self.frame_spent += start.elapsed();
             return Arc::clone(set);
         }
         let found = self.search.run(&self.grid, view, SEARCH_SLACK);
@@ -695,6 +709,8 @@ impl ChunkVisibility {
         self.last = Some((*view, Arc::clone(&set)));
         self.stats.searches += 1;
         self.stats.last_search = start.elapsed();
+        self.frame_spent += self.stats.last_search;
+        self.frame_searched = true;
         self.stats.reached = set.visible_count();
         self.stats.box_chunks = set.box_len();
         self.stats.refilled = refilled;
@@ -722,7 +738,37 @@ impl ChunkVisibility {
             }
         });
         self.stats.blocked += u64::from(!open);
+        self.frame_used = true;
         open
+    }
+
+    /// Adds main-thread time the renderer spent on this frame's set (its bits per slot,
+    /// `boxel_render::RenderStats::occlusion_time`): the world's frame budget keeps room for it
+    /// with the search.
+    pub fn add_render_time(&mut self, time: Duration) {
+        self.frame_spent += time;
+    }
+
+    /// Ends the frame for the world's budget: the cave culling time it spent, and the time to
+    /// keep free for a search in the next frames (a peak of the frames that searched, which
+    /// fades while culling does not run).
+    pub(crate) fn take_frame_cost(&mut self) -> CullingCost {
+        let spent = std::mem::take(&mut self.frame_spent);
+        if self.frame_searched {
+            self.reserve = if spent >= self.reserve {
+                spent
+            } else {
+                self.reserve - (self.reserve - spent) / RESERVE_DECAY
+            };
+        } else if !self.frame_used {
+            self.reserve -= self.reserve / RESERVE_DECAY;
+        }
+        self.frame_searched = false;
+        self.frame_used = false;
+        CullingCost {
+            spent,
+            reserve: self.reserve,
+        }
     }
 
     /// The result of the last search, if any.

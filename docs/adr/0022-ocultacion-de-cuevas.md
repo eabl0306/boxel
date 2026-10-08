@@ -109,6 +109,12 @@ que acaba de quedar a la vista podría aparecer un frame tarde. El radio de la c
 `ChunkViewer` de la cámara, o el del viewer más grande. Sin viewers no se oculta nada.
 `WorldSettings::cave_culling` (por defecto encendido) lo apaga.
 
+La búsqueda corre después de los pasos del mundo con presupuesto (`FrameBudget`, ADR 0017), que
+aprenden cuánto tarda el resto del frame. Una búsqueda cada pocos frames llegaba cuando esa
+estimación ya había bajado, y el frame terminaba más tarde de lo planeado. Ahora el tiempo de la
+búsqueda y el de los bits del render no cuentan en esa estimación, y cada frame deja libre un pico
+estimado de un frame que busca (`CullingCost::reserve`).
+
 Tampoco se oculta nada si el ojo no ve desde espacio abierto (`eye_in_open`): si un vóxel a
 menos del alcance del plano cercano (`Camera::near_reach`, unos 0.17 vóxeles con la cámara por
 defecto) ocluye o no está cargado. La búsqueda supone que toda línea de vista empieza en un vóxel
