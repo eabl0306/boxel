@@ -6,6 +6,7 @@
 //! | Bench | Target |
 //! |---|---|
 //! | `sweep/player_walk`, `sweep/player_land`, `sweep/player_fall` | <= 0.3 us |
+//! | `sweep/step_wall`, `sweep/step_wall_slide` and their `_tried` | no target (the step-up skip) |
 //! | `raycast/pick_6` | <= 0.5 us |
 //! | `raycast/cave_256` | <= 5 us |
 //! | `raycast/sky_1024` | <= 10 us |
@@ -21,6 +22,7 @@
 //! | `scale/sleep_churn` | no target (one thread, 1000 bodies put to sleep and woken) |
 //! | `scale/10000_awake` (parallel step) | <= 1.5 ms |
 //! | `scale/10000_awake_one_thread` | no target (the same on one thread, to compare) |
+//! | `scale/4096_packed` | no target (a packed crowd: its pairs are one island) |
 //! | `scale/1000_projectiles_one_thread` | <= 0.3 ms |
 //! | `scale/1000_projectiles` | no target (the same with the parallel step) |
 //!
@@ -31,6 +33,9 @@
 //! (`PhysicsSettings::parallel_threshold` off, as the targets are), with that many bodies: 70 %
 //! walking characters that turn around every 64 steps (some jump then), 30 % items dropped from
 //! up to 20 blocks (they come to rest and fall asleep), all `Interpolated` as in the examples.
+//! `sweep/step_wall` is one step of a walker (step height 0.6) pushing into a wall one block high
+//! on a small test world, `step_wall_slide` the same sliding along it diagonally, and the
+//! `_tried` variants always try the lifted moves (without the early skip of the step-up).
 //! A `frame` is one run of
 //! `RunFixedMainLoop` in a frame without a fixed step (144 fps): the interpolation of the 1000
 //! bodies and the schedule's executor, on the single-threaded executor `PhysicsPlugin` sets and
@@ -50,9 +55,12 @@
 //! `sleep_churn` puts 1000 resting crates to sleep by hand and wakes them all again, in turns
 //! (the sleeper store's insertions and removals, without the 32 still steps). `10000_awake` has
 //! 7000 walkers and 3000 items with sleeping off, so every body steps, on the compute threads,
-//! and `10000_awake_one_thread` is the same on one thread. `1000_projectiles` (radius 2) has 100
-//! walkers and 1000 arrows shot over the forest, shot again every 32 steps, with the parallel
-//! step, and `1000_projectiles_one_thread` on one thread. Run when the machine is idle
+//! and `10000_awake_one_thread` is the same on one thread. `4096_packed` has 4096 walkers
+//! packed on 40 x 40 blocks (about one per 0.4 blocks of ground), with the parallel step:
+//! they push each other all the time and their pairs make one island, so the solve's pushes
+//! stay on one thread. `1000_projectiles` (radius 2) has 100 walkers and 1000 arrows shot over
+//! the forest, shot again every 32 steps, with the parallel step, and
+//! `1000_projectiles_one_thread` on one thread. Run when the machine is idle
 //! (`tools/wait-idle.sh`).
 #![expect(clippy::print_stdout, reason = "bench setup output")]
 
@@ -65,11 +73,12 @@ use boxel_physics::{
     BlockBounds, BodyPosition, BodySettings, CharacterController, ChunkSource, Collider,
     CollisionEnded, CollisionLayers, CollisionStarted, CollisionTable, Grid, Interpolated,
     LocalBox, MoveIntent, PhysicsPlugin, PhysicsSettings, PhysicsStats, Projectile, ProjectileHit,
-    RayResult, RigidBody, Sleeping, SweepConfig, Teleport, Velocity, VoxelFilter, VoxelImpact,
-    move_box, raycast_voxels,
+    RayResult, RigidBody, Sleeping, StepUp, SweepConfig, Teleport, TestWorld, Velocity,
+    VoxelFilter, VoxelImpact, move_box, move_box_stepping, move_box_stepping_unpruned,
+    raycast_voxels,
 };
 use boxel_transform::Transform;
-use boxel_voxel::{BlockRegistry, CHUNK_SHIFT, ChunkPos, WorldPos};
+use boxel_voxel::{BlockPos, BlockRegistry, BlockState, CHUNK_SHIFT, ChunkPos, WorldPos};
 use boxel_world::jobs::InlineExecutor;
 use boxel_world::{ChunkDataEvent, ChunkMap, ChunkViewer, WorldPlugin, WorldSettings, WorldStats};
 use boxel_worldgen::{ForestGenerator, OverworldGenerator, WorldGenerator};
@@ -209,6 +218,65 @@ fn benches(c: &mut Criterion) {
             ))
         });
     });
+    // A walker (step height 0.6) pushing into a wall one block high, straight and sliding along
+    // it diagonally: with the early skip of the step-up, and with the lifted moves tried.
+    let mut wall = TestWorld::new();
+    wall.fill(
+        BlockPos::new(-4, -1, -4),
+        BlockPos::new(4, -1, 4),
+        BlockState(1),
+    );
+    wall.fill(
+        BlockPos::new(1, 0, -4),
+        BlockPos::new(1, 0, 4),
+        BlockState(1),
+    );
+    let touching = WorldPos::from_dvec3(DVec3::new(0.7, 0.0, 0.5));
+    let step = StepUp {
+        height: 0.6,
+        grounded: true,
+    };
+    for (name, d) in [
+        ("step_wall", DVec3::new(4.3 / 64.0, -32.0 / 4096.0, 0.0)),
+        (
+            "step_wall_slide",
+            DVec3::new(3.0 / 64.0, -32.0 / 4096.0, 3.0 / 64.0),
+        ),
+    ] {
+        let skip = move_box_stepping(&mut wall, &table, touching, player(), d, &[], &cfg, step);
+        let tried =
+            move_box_stepping_unpruned(&mut wall, &table, touching, player(), d, &[], &cfg, step);
+        assert_eq!(skip, tried);
+        assert!(skip.is_ok_and(|out| out.touched(boxel_voxel::Face::PosX)));
+        sweep.bench_function(name, |b| {
+            b.iter(|| {
+                black_box(move_box_stepping(
+                    &mut wall,
+                    &table,
+                    black_box(touching),
+                    player(),
+                    black_box(d),
+                    &[],
+                    &cfg,
+                    step,
+                ))
+            });
+        });
+        sweep.bench_function(format!("{name}_tried"), |b| {
+            b.iter(|| {
+                black_box(move_box_stepping_unpruned(
+                    &mut wall,
+                    &table,
+                    black_box(touching),
+                    player(),
+                    black_box(d),
+                    &[],
+                    &cfg,
+                    step,
+                ))
+            });
+        });
+    }
     sweep.finish();
 
     let sky = streamed(
@@ -252,7 +320,7 @@ fn benches(c: &mut Criterion) {
     // whole length is walked (the worst case).
     let deep = WorldPos::from_dvec3(DVec3::new(8.5, -199.5, 16.5));
     let tunnel = DVec3::new(1.0, 0.02, 0.01).normalize();
-    let mut never = |_: boxel_voxel::BlockPos, _: boxel_voxel::BlockState| false;
+    let mut never = |_: BlockPos, _: BlockState| false;
     assert_eq!(
         raycast_voxels(
             &mut caves.source(),
@@ -266,7 +334,7 @@ fn benches(c: &mut Criterion) {
     );
     ray.bench_function("cave_256", |b| {
         b.iter(|| {
-            let mut never = |_: boxel_voxel::BlockPos, _: boxel_voxel::BlockState| false;
+            let mut never = |_: BlockPos, _: BlockState| false;
             black_box(raycast_voxels(
                 &mut caves.source(),
                 &table,
@@ -855,6 +923,31 @@ fn scale_benches(c: &mut Criterion) {
         .parallel_threshold = usize::MAX;
     breakdown(&mut app, "scale/10000_awake_one_thread");
     bench_steps(&mut group, "10000_awake_one_thread", &mut app, &mut t);
+
+    // 4096 walkers packed on 40 x 40 blocks (sleeping still off), with the parallel step.
+    let bodies: Vec<Entity> = {
+        let world = app.world_mut();
+        let mut all = world.query_filtered::<Entity, With<RigidBody>>();
+        all.iter(world).collect()
+    };
+    for entity in bodies {
+        app.world_mut().despawn(entity);
+    }
+    app.world_mut()
+        .resource_mut::<PhysicsSettings>()
+        .parallel_threshold = PhysicsSettings::default().parallel_threshold;
+    spawn_spread(&mut app, &table, 4096, 40, 10, 0xC0DE);
+    run_steps(&mut app, 128);
+    let stats = *app.world().resource::<PhysicsStats>();
+    println!(
+        "physics bench: scale/4096_packed: bodies={} dynamic={} frozen={} pairs={} pushes={} \
+         islands={}",
+        stats.bodies, stats.dynamic, stats.frozen, stats.pairs, stats.pushes, stats.islands
+    );
+    assert_eq!((stats.dynamic, stats.sleeping), (4096, 0), "{stats:?}");
+    breakdown(&mut app, "scale/4096_packed");
+    let mut t = 0u64;
+    bench_steps(&mut group, "4096_packed", &mut app, &mut t);
     drop(app);
 
     // 2000 resting crates asleep; 240 of them (fewer than the store rebuilds for, so they stay

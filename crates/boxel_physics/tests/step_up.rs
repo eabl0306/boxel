@@ -10,7 +10,7 @@ use boxel_math::{DVec3, I64Vec3, Vec2};
 use boxel_physics::{
     BodySettings, CharacterController, Collider, Contacts, LocalBox, MoveIntent, OnBlock,
     Projectile, ProjectileTarget, RigidBody, StepUp, SweepConfig, SweepOut, Teleport, TestWorld,
-    Velocity, move_box, move_box_stepping,
+    Velocity, move_box, move_box_stepping, move_box_stepping_unpruned,
 };
 use boxel_voxel::{BlockPos, BlockState, ChunkPos, Face, MAX_BLOCK_COORD, WorldPos};
 use boxel_world::ChunkMap;
@@ -574,6 +574,196 @@ fn step_ups_are_bit_identical_far_from_the_origin() {
             assert_eq!(course(shift), reference, "shift {shift}");
         }
     }
+}
+
+// ------------------------------------------------------------------- the early skip
+
+#[test]
+fn pushing_into_a_wall_skips_the_lifted_moves() {
+    // As in the unloaded test, the lift would reach into the chunk above, but the block ahead is
+    // a full one: pushing into it, no lifted move can get past, so they are not even tried.
+    let base = I64Vec3::new(0, 30, 0);
+    let mut world = floor(base);
+    world.set(at(base, 1, 0, 0), STONE);
+    let above = ChunkPos::containing(at(base, 0, 2, 0));
+    world.set_unloaded(above, true);
+    let step = StepUp {
+        height: 0.6,
+        grounded: true,
+    };
+    // Touching the wall (the box's +X face on x = 1).
+    let start = feet(base, 0.75, 0.0, 0.5);
+    let plain = move_box(
+        &mut world,
+        &table(),
+        start,
+        body(),
+        WALK,
+        &[],
+        &SweepConfig::default(),
+    )
+    .expect("loaded");
+    assert!(plain.touched(Face::PosX));
+    let run = |world: &mut TestWorld, unpruned: bool| {
+        let f = if unpruned {
+            move_box_stepping_unpruned::<TestWorld>
+        } else {
+            move_box_stepping::<TestWorld>
+        };
+        f(
+            world,
+            &table(),
+            start,
+            body(),
+            WALK,
+            &[],
+            &SweepConfig::default(),
+            step,
+        )
+    };
+    assert_eq!(run(&mut world, false), Ok(plain), "skipped: the plain move");
+    let err = run(&mut world, true).expect_err("tried: reads the chunk above");
+    assert_eq!(ChunkPos::containing(err.block), above);
+    // Loaded, both give the plain move.
+    world.set_unloaded(above, false);
+    assert_eq!(run(&mut world, true), Ok(plain));
+    // Not touching it yet (the first hit), the lifted moves are tried: same result.
+    let start = feet(base, 0.7, 0.0, 0.5);
+    let tried = stepping(&mut world, start, WALK, &[], step);
+    assert!(tried.touched(Face::PosX));
+    assert_eq!(height(base, tried.end), 0.0);
+}
+
+/// One random case for the early skip: a field of stone, slabs and one-block hills, maybe
+/// obstacles, and `moves` moves by `d` from `start` (each one from where the one before ended,
+/// so they often push into what stopped them). With and without the skip the moves are the
+/// same, bit for bit (errors too). How many of them were clipped across.
+fn skip_case(
+    seed: u64,
+    start: DVec3,
+    d: DVec3,
+    step: StepUp,
+    obstacles: bool,
+    moves: usize,
+) -> usize {
+    let base = I64Vec3::new(-4, 0, -4);
+    let mut world = TestWorld::new();
+    fill(&mut world, base, [0, -1, 0], [8, -1, 8], STONE);
+    let mut rng = Rng(seed);
+    for x in 0..9 {
+        for z in 0..9 {
+            // Columns of stone (hills one or two blocks high), slabs on the ground or on stone.
+            let r = rng.unit();
+            let stone = if r < 0.25 {
+                1
+            } else if r < 0.35 {
+                2
+            } else {
+                0
+            };
+            fill(&mut world, base, [x, 0, z], [x, stone - 1, z], STONE);
+            let r = rng.unit();
+            if r < 0.15 {
+                world.set(at(base, x, stone, z), bottom_slab());
+            } else if r < 0.2 {
+                world.set(at(base, x, stone + 1, z), top_slab());
+            }
+        }
+    }
+    let y = match rng.next() % 3 {
+        0 => 0.0,
+        1 => 0.5,
+        _ => start.y,
+    };
+    let start = WorldPos::from_block(BlockPos::new(0, 0, 0), DVec3::new(start.x, y, start.z));
+    let bx = body().translate(start.frac);
+    for x in bx.min.x.floor() as i64..=bx.max.x.floor() as i64 {
+        for y in bx.min.y.floor() as i64..=bx.max.y.floor() as i64 {
+            for z in bx.min.z.floor() as i64..=bx.max.z.floor() as i64 {
+                world.set(BlockPos::new(x, y, z), BlockState::AIR);
+            }
+        }
+    }
+    let boxes: Vec<LocalBox> = if obstacles {
+        (0..3)
+            .map(|_| {
+                let min = DVec3::new(
+                    rng.unit() * 6.0 - 3.0,
+                    rng.unit() * 2.0,
+                    rng.unit() * 6.0 - 3.0,
+                );
+                LocalBox::new(min, min + DVec3::new(0.5, 0.25 + rng.unit(), 0.5))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut pos = start;
+    let mut grounded = step.grounded;
+    let mut across = 0;
+    for _ in 0..moves {
+        let shift = (start.block.as_i64vec3() - pos.block.as_i64vec3()).as_dvec3();
+        let local: Vec<LocalBox> = boxes.iter().map(|o| o.translate(shift)).collect();
+        let step = StepUp {
+            height: step.height,
+            grounded,
+        };
+        let cfg = SweepConfig::default();
+        let skip = move_box_stepping(&mut world, &table(), pos, body(), d, &local, &cfg, step);
+        let tried =
+            move_box_stepping_unpruned(&mut world, &table(), pos, body(), d, &local, &cfg, step);
+        assert_eq!(skip, tried, "from {pos:?} by {d:?}, {step:?}");
+        let Ok(out) = skip else {
+            break;
+        };
+        if out.faces & 0b11_1100 != 0 {
+            across += 1;
+        }
+        pos = out.end;
+        grounded = out.on_ground();
+    }
+    across
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    #[test]
+    fn the_early_skip_never_changes_a_move(
+        seed in any::<u64>(),
+        start in (0.0f64..1.0, 0.0f64..1.0, 0.0f64..1.0),
+        d in (-0.2f64..0.2, -0.2f64..0.2, -0.2f64..0.2),
+        axes in 0u8..4,
+        height in prop_oneof![Just(0.6), Just(0.5), Just(1.0), 0.0f64..1.25],
+        grounded in any::<bool>(),
+        obstacles in any::<bool>(),
+    ) {
+        // Straight moves too: one component exactly zero.
+        let d = match axes {
+            0 => DVec3::new(d.0, d.1, 0.0),
+            1 => DVec3::new(0.0, d.1, d.2),
+            _ => DVec3::new(d.0, d.1, d.2),
+        };
+        let start = DVec3::new(start.0, start.1, start.2);
+        skip_case(seed, start, d, StepUp { height, grounded }, obstacles, 4);
+    }
+}
+
+#[test]
+fn walkers_in_random_fields_push_into_walls() {
+    // The proptest above only means something if the moves hit things: make sure they do.
+    let mut rng = Rng(11);
+    let mut across = 0;
+    for _ in 0..500 {
+        let start = DVec3::new(rng.unit(), rng.unit(), rng.unit());
+        let d = DVec3::new(rng.unit() * 0.4 - 0.2, -1.0 / 128.0, rng.unit() * 0.4 - 0.2);
+        let step = StepUp {
+            height: 0.6,
+            grounded: true,
+        };
+        across += skip_case(rng.next(), start, d, step, false, 8);
+    }
+    assert!(across >= 1000, "{across}");
 }
 
 // --------------------------------------------------------------------------- characters

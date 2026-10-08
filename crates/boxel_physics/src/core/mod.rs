@@ -26,7 +26,7 @@ pub use body::{
     predict, step_body,
 };
 pub use grid::{
-    BlockBounds, CellRay, CollisionLayers, DEFAULT_GRID_SHIFT, Grid, MAX_CELLS_PER_AXIS,
+    BlockBounds, CellRay, CollisionLayers, DEFAULT_GRID_SHIFT, Grid, GridSlot, MAX_CELLS_PER_AXIS,
     MAX_GRID_SHIFT,
 };
 pub use narrow::{
@@ -36,6 +36,8 @@ pub use narrow::{
 pub use ray::{MAX_RAY_DISTANCE, RayResult, VoxelFilter, VoxelHit, raycast_voxels};
 pub use shape::{LocalBox, Shape, ShapeHit};
 pub use source::{CollisionShape, CollisionTable, Probe, TestWorld, VoxelSource};
+#[doc(hidden)]
+pub use sweep::move_box_stepping_unpruned;
 pub use sweep::{
     MAX_SWEEP_DISTANCE, StepUp, SweepConfig, SweepOut, Unloaded, axis_order, move_box,
     move_box_stepping,

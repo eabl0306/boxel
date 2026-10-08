@@ -736,7 +736,11 @@ pub struct PhysicsSettings {
     /// The step moves the dynamic bodies (and the projectiles) on the compute threads when
     /// more of them than this are awake (default 256; static, kinematic and sleeping bodies do
     /// not count). Each body only reads the world and writes itself, so the results are
-    /// bit-identical either way.
+    /// bit-identical either way. The broadphase and the solve also go on the threads above it,
+    /// with results that do not depend on the threads either: the broadphase from 4096 bodies
+    /// in the step's list, the solve's pushes when the previous step pushed at least 128 times
+    /// and no island of pairs holds more than half of them (see [`PhysicsStats::islands`]), and
+    /// its write-back from 256 bodies. 0 runs every part on the threads whatever its size.
     pub parallel_threshold: usize,
 }
 
@@ -798,6 +802,9 @@ pub struct PhysicsStats {
     pub pairs: usize,
     /// Pushes between solid bodies in the latest step (one per overlapping pair and pass).
     pub pushes: usize,
+    /// Islands the latest step's solve pushed on the compute threads (0: it pushed on one
+    /// thread).
+    pub islands: usize,
     /// Pairs in contact at the end of the latest step that report events (overlapping sensor
     /// pairs, and touching or overlapping solid pairs with [`ReportContacts`]).
     pub overlaps: usize,

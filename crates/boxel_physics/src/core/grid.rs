@@ -134,6 +134,9 @@ const SPAN_X: u8 = 1;
 const ACTIVE: u8 = 1 << 3;
 /// `GridBody::flags`: wider than [`MAX_CELLS_PER_AXIS`] cells, in the large list.
 const LARGE: u8 = 1 << 4;
+/// `GridBody::flags` (with `LARGE`): moved to other cells by [`Grid::set_bounds`] since the grid
+/// was built. Its cell entries are stale, so it waits in the large list until the next build.
+const DETACHED: u8 = 1 << 5;
 /// `Entry::key`: the bits above this hold the entry's cell offset from its body's first cell
 /// (x, y, z); the bits below, the cell's hash (masked to the bucket).
 const OFFSET_SHIFT: u32 = 29;
@@ -143,8 +146,12 @@ const MAX_BUCKETS: usize = 1 << OFFSET_SHIFT;
 /// A body in the grid, in one cache line: its first cell, its bounds relative to that cell's
 /// first block (they fit `i32`: a body in cells spans at most two of them), layers and flags. A
 /// large body keeps its full bounds apart (`Grid::large_bounds`).
+///
+/// [`Grid::slot`] places a body without changing the grid, so the arithmetic of
+/// [`Grid::insert`] can run on any thread; [`Grid::push_slot`] and [`Grid::push_slots`] add
+/// placed bodies.
 #[derive(Clone, Copy, Debug, Default)]
-struct GridBody {
+pub struct GridSlot {
     cell_min: I64Vec3,
     rel_min: [i32; 3],
     rel_max: [i32; 3],
@@ -152,13 +159,55 @@ struct GridBody {
     flags: u8,
 }
 
-impl GridBody {
+/// The grid's own name for a placed body.
+type GridBody = GridSlot;
+
+impl GridSlot {
+    /// The placement of a body with `bounds` in a grid of cells `2^shift` blocks wide
+    /// ([`Grid::slot`] for a grid with that cell size; `shift` at most [`MAX_GRID_SHIFT`]).
+    pub fn new(shift: u32, bounds: BlockBounds, layers: CollisionLayers, active: bool) -> Self {
+        let shift = shift.min(MAX_GRID_SHIFT);
+        let (min, max) = bounds.cells(shift);
+        let span = max.saturating_sub(min);
+        let mut body = GridBody {
+            cell_min: min,
+            layers,
+            flags: if active { ACTIVE } else { 0 },
+            ..GridBody::default()
+        };
+        if span.max_element() >= MAX_CELLS_PER_AXIS || span.min_element() < 0 {
+            body.flags |= LARGE;
+            return body;
+        }
+        for a in 0..3 {
+            // The first block of the first cell: at most `bounds.min`, so no overflow.
+            let base = min[a] << shift;
+            // `min - base` is below `2^shift`, `max - base` below `2^(shift + 1)`.
+            body.rel_min[a] = (bounds.min[a] - base) as i32;
+            body.rel_max[a] = (bounds.max[a] - base) as i32;
+            if span[a] == 1 {
+                body.flags |= SPAN_X << a;
+            }
+        }
+        body
+    }
+
+    /// Wider than [`MAX_CELLS_PER_AXIS`] cells on some axis: the grid keeps it in its large
+    /// list, with its bounds.
+    pub fn is_large(&self) -> bool {
+        self.large()
+    }
+
     fn active(&self) -> bool {
         self.flags & ACTIVE != 0
     }
 
     fn large(&self) -> bool {
         self.flags & LARGE != 0
+    }
+
+    fn detached(&self) -> bool {
+        self.flags & DETACHED != 0
     }
 }
 
@@ -205,6 +254,8 @@ pub struct Grid {
     cursor: Vec<u32>,
     bucket_mask: u32,
     built: bool,
+    /// Bodies moved to other cells since the grid was built (see `DETACHED`).
+    detached: usize,
 }
 
 impl Default for Grid {
@@ -228,6 +279,7 @@ impl Grid {
             cursor: Vec::new(),
             bucket_mask: 0,
             built: false,
+            detached: 0,
         }
     }
 
@@ -244,6 +296,7 @@ impl Grid {
         self.large_bounds.clear();
         self.entries.clear();
         self.built = false;
+        self.detached = 0;
     }
 
     /// Number of bodies.
@@ -259,15 +312,47 @@ impl Grid {
     /// Adds a body and returns its index (0, 1, 2... in insertion order). Pairs need one active
     /// body (pairs of two inactive bodies, like two walls, are never reported).
     pub fn insert(&mut self, bounds: BlockBounds, layers: CollisionLayers, active: bool) -> u32 {
+        self.push_slot(self.slot(bounds, layers, active), bounds)
+    }
+
+    /// The placement of a body for [`Grid::push_slot`]: [`Grid::insert`] in two halves, so the
+    /// arithmetic can run on other threads. Valid until the grid's cell size changes.
+    pub fn slot(&self, bounds: BlockBounds, layers: CollisionLayers, active: bool) -> GridSlot {
+        self.place(bounds, layers, active)
+    }
+
+    /// Adds a body placed by [`Grid::slot`] with `bounds` (the same ones) and returns its index:
+    /// the same as [`Grid::insert`] with the slot's arguments.
+    pub fn push_slot(&mut self, slot: GridSlot, bounds: BlockBounds) -> u32 {
         let index = u32::try_from(self.bodies.len()).expect("fewer than 2^32 bodies");
-        let body = self.place(bounds, layers, active);
-        if body.large() {
+        if slot.large() {
             self.large.push(index);
             self.large_bounds.push(bounds);
         }
-        self.bodies.push(body);
+        self.bodies.push(slot);
         self.built = false;
         index
+    }
+
+    /// Adds `n` bodies at once: `fill` writes their slots ([`Grid::slot`] of each one, in index
+    /// order; on any threads) and returns the large ones (`GridSlot::is_large`) with their
+    /// bounds, as indices from the first new body, in any order. The same as [`Grid::insert`]
+    /// for each, in order.
+    pub fn push_slots(
+        &mut self,
+        n: usize,
+        fill: impl FnOnce(&mut [GridSlot]) -> Vec<(u32, BlockBounds)>,
+    ) {
+        let first = self.bodies.len();
+        u32::try_from(first + n).expect("fewer than 2^32 bodies");
+        self.bodies.resize(first + n, GridSlot::default());
+        let mut large = fill(&mut self.bodies[first..]);
+        large.sort_unstable_by_key(|&(i, _)| i);
+        for (i, bounds) in large {
+            self.large.push(first as u32 + i);
+            self.large_bounds.push(bounds);
+        }
+        self.built = false;
     }
 
     /// The bounds of body `index`.
@@ -290,13 +375,17 @@ impl Grid {
         BlockBounds::new(base + rel(body.rel_min), base + rel(body.rel_max))
     }
 
-    /// Moves body `index` to `bounds`. When its cells change, the grid needs a new
-    /// [`Grid::build`] before queries see the body at its new place.
+    /// Moves body `index` to `bounds`. On a built grid, a body that changes cells waits in the
+    /// large list (tested against everything, like a large body) until the next
+    /// [`Grid::build`]: queries and pairs see it at its new place at once without a rebuild.
     pub fn set_bounds(&mut self, index: u32, bounds: BlockBounds) {
         let old = self.bodies[index as usize];
-        let body = self.place(bounds, old.layers, old.active());
-        if (body.cell_min, body.flags) != (old.cell_min, old.flags) {
-            self.built = false;
+        let mut body = self.place(bounds, old.layers, old.active());
+        if old.detached() {
+            body.flags |= LARGE | DETACHED;
+        } else if self.built && (body.cell_min, body.flags) != (old.cell_min, old.flags) {
+            body.flags |= LARGE | DETACHED;
+            self.detached += 1;
         }
         let at = self.large.partition_point(|&l| l < index);
         match (old.large(), body.large()) {
@@ -316,33 +405,11 @@ impl Grid {
 
     /// The grid body of `bounds`: its cells, whether it is large, and its relative bounds.
     fn place(&self, bounds: BlockBounds, layers: CollisionLayers, active: bool) -> GridBody {
-        let (min, max) = bounds.cells(self.shift);
-        let span = max.saturating_sub(min);
-        let mut body = GridBody {
-            cell_min: min,
-            layers,
-            flags: if active { ACTIVE } else { 0 },
-            ..GridBody::default()
-        };
-        if span.max_element() >= MAX_CELLS_PER_AXIS || span.min_element() < 0 {
-            body.flags |= LARGE;
-            return body;
-        }
-        let shift = self.shift;
-        for a in 0..3 {
-            // The first block of the first cell: at most `bounds.min`, so no overflow.
-            let base = min[a] << shift;
-            // `min - base` is below `2^shift`, `max - base` below `2^(shift + 1)`.
-            body.rel_min[a] = (bounds.min[a] - base) as i32;
-            body.rel_max[a] = (bounds.max[a] - base) as i32;
-            if span[a] == 1 {
-                body.flags |= SPAN_X << a;
-            }
-        }
-        body
+        GridSlot::new(self.shift, bounds, layers, active)
     }
 
-    /// The indices of the large bodies (wider than [`MAX_CELLS_PER_AXIS`] cells), ascending.
+    /// The indices of the large bodies (wider than [`MAX_CELLS_PER_AXIS`] cells, and the ones
+    /// [`Grid::set_bounds`] moved to other cells since the grid was built), ascending.
     pub fn large(&self) -> &[u32] {
         &self.large
     }
@@ -355,6 +422,9 @@ impl Grid {
     /// Sorts the cell entries (a counting sort by cell hash). [`Grid::pairs`] builds the grid
     /// itself; queries need it built.
     pub fn build(&mut self) {
+        if self.detached > 0 {
+            self.reattach();
+        }
         self.entries.clear();
         for (index, body) in self.bodies.iter().enumerate() {
             if body.large() {
@@ -403,6 +473,30 @@ impl Grid {
         self.built = true;
     }
 
+    /// Puts the bodies [`Grid::set_bounds`] moved since the last build back in their cells
+    /// (out of the large list, unless they are large).
+    fn reattach(&mut self) {
+        let mut kept = 0;
+        for k in 0..self.large.len() {
+            let (index, bounds) = (self.large[k], self.large_bounds[k]);
+            let body = self.bodies[index as usize];
+            if body.detached() {
+                let (layers, active) = (body.layers, body.active());
+                let placed = self.place(bounds, layers, active);
+                self.bodies[index as usize] = placed;
+                if !placed.large() {
+                    continue;
+                }
+            }
+            self.large[kept] = index;
+            self.large_bounds[kept] = bounds;
+            kept += 1;
+        }
+        self.large.truncate(kept);
+        self.large_bounds.truncate(kept);
+        self.detached = 0;
+    }
+
     /// `a` and `b` (indices) are a candidate pair: one active, layers meet, bounds overlap.
     #[inline]
     fn candidate(&self, a: u32, b: u32) -> bool {
@@ -416,7 +510,7 @@ impl Grid {
     /// grid when needed.
     pub fn pairs(&mut self, out: &mut Vec<(u32, u32)>) {
         out.clear();
-        if !self.built {
+        if !self.built || self.detached > 0 {
             self.build();
         }
         self.pairs_in(0..self.sorted.len(), out);
@@ -449,8 +543,9 @@ impl Grid {
     }
 
     /// The candidate pairs `(a, b)`, `a < b`, of the cells whose entries are in `range` (from
-    /// [`Grid::pair_ranges`]), appended to `out` unsorted. Large bodies are not in cells: see
-    /// [`Grid::large_pairs`]. Nothing when the grid is not built.
+    /// [`Grid::pair_ranges`]), appended to `out` unsorted. Large bodies (and bodies moved since
+    /// the build) are not in cells: see [`Grid::large_pairs`]. Nothing when the grid is not
+    /// built.
     pub fn pairs_in(&self, range: Range<usize>, out: &mut Vec<(u32, u32)>) {
         if !self.built {
             return;
@@ -461,6 +556,8 @@ impl Grid {
             self.bucket_mask,
             self.shift,
         );
+        // Bodies moved since the build are in the large list, not in their old cells.
+        let moved = |body: &GridBody| self.detached > 0 && body.detached();
         let mut start = 0;
         while start < sorted.len() {
             let bucket = sorted[start].key & mask;
@@ -487,6 +584,8 @@ impl Grid {
                         && (first.active() || second.active())
                         && first.layers.interacts(second.layers)
                         && overlap_in_cell(first, off_p, second, off_q, shift)
+                        && !moved(first)
+                        && !moved(second)
                     {
                         out.push((ep.body, eq.body));
                     }
@@ -510,8 +609,8 @@ impl Grid {
         }
     }
 
-    /// The bodies of one cell (none when the grid is not built; large bodies are never in a
-    /// cell).
+    /// The bodies of one cell (none when the grid is not built; large bodies, and bodies moved
+    /// since the build, are never in a cell).
     pub fn cell(&self, cell: I64Vec3) -> impl Iterator<Item = u32> + '_ {
         let range = if self.built {
             let bucket = (cell_hash(cell) as u32 & self.bucket_mask) as usize;
@@ -521,7 +620,10 @@ impl Grid {
         };
         self.sorted[range]
             .iter()
-            .filter(move |e| offset_cell(self.bodies[e.body as usize].cell_min, e.offset()) == cell)
+            .filter(move |e| {
+                let body = &self.bodies[e.body as usize];
+                offset_cell(body.cell_min, e.offset()) == cell && !body.detached()
+            })
             .map(|e| e.body)
     }
 
