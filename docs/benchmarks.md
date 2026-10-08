@@ -29,6 +29,12 @@ por defecto, es sin límite), por ejemplo para ver cómo se comporta con el lím
 juego. El resumen anota el límite y `tools/bench_report.py` no mezcla corridas con límites
 distintos (las corridas viejas, sin el dato, cuentan como sin límite).
 
+Con límite, el mundo trabaja también entre frames (ADR 0022). `--idle-work off` lo apaga, para
+comparar el mismo binario con y sin eso. El resumen lo anota (`idle_work`: `on`, `off`, o
+`none` en corridas viejas) y `tools/bench_report.py` solo avisa si cambia: empareja igual las
+corridas, así se puede comparar `off` con `on`, o main con una rama. `headless_world` tiene la
+misma opción.
+
 El stress presenta con `--present immediate` (en Wayland sale Mailbox). `--vsync on` pide vsync
 (Fifo) y `--vsync off` el modo por defecto de un juego (Mailbox, si no Immediate). El resumen anota
 el vsync, el modo que quedó y la frecuencia del monitor, y `tools/bench_report.py` no mezcla
@@ -128,7 +134,9 @@ arriba).
 | generated/s, meshes/s | chunks generados y mallas subidas a la GPU por segundo |
 | jobs queued, in flight | trabajos esperando y trabajos corriendo |
 | queue trend | cuánto crece la cola por segundo, mirando toda la medición. Si es claramente mayor que 0, el mundo se atrasa |
-| border catch-up | después de cada cruce, cuánto tardó el mundo en terminar los chunks nuevos. Si no termina antes del próximo cruce, va atrasado. Si la medición corta el último cruce a la mitad, ese no cuenta |
+| border catch-up | después de cada cruce, cuánto tardó el mundo en terminar los chunks nuevos. Si no termina antes del próximo cruce, va atrasado. Si la medición corta el último cruce a la mitad, ese no cuenta. Se mide con el reloj de los frames (cuándo empieza el frame que ya ve el mundo quieto): con límite sale en períodos enteros. También dice cuántos frames tardó |
+| border work lag | lo mismo, pero hasta que terminó el último job del cruce, sin redondear a frames. Separa lo que tarda el mundo de lo que agrega el ritmo de los frames |
+| Between frames | con límite: tiempo y pasos del schedule `Idle` por frame (media y p99), y los pasos que terminaron después de su ventana (deberían ser 0; el peor se anota) |
 | catch-up after stop | cuánto tardó en terminar todo después de que la cámara frenó |
 | Worst 5 frames | los 5 peores, con lo que pasó en cada uno (cruce, chunks generados, mallas, cola) y si se presentó |
 | > 7.5 ms | frames que se notan con el límite de 144 (el período es 6.94 ms) |
@@ -166,7 +174,10 @@ Una fila por frame: `frame_ms`, `crossed` (cruzó un borde), `generated`, `meshe
 `gate_wait_ms` es lo que el runner retuvo el frame esperando la compuerta de presentación,
 `gate_missed` si se rindió y `gate_ms` cuándo se abrió la compuerta por última vez (el frame
 callback del compositor en Wayland), en ms desde el inicio de la medición. `display_locked` dice
-si el runner marcó el ritmo con el monitor (ADR 0017).
+si el runner marcó el ritmo con el monitor (ADR 0017). `idle_ms` e `idle_steps` son el tiempo y
+los pasos del schedule `Idle` después del frame, `idle_late_ms` cuánto se pasó de su ventana el
+peor de ellos e `idle_overruns` cuántos se pasaron. `job_end_ms` es cuándo terminó el último job
+del mundo hasta ese frame, en ms desde el inicio de la medición.
 El resumen anota los dos al final. Sirve para graficar o para buscar qué pasó en un tirón
 puntual.
 
@@ -208,7 +219,9 @@ Detalles:
 - Sin `--features trace` el flag da error y los spans no existen en el binario. Con la feature
   pero sin `--spans`, los spans igual cuestan (los recibe el log), solo que nadie los suma.
 - Los sistemas que corren en paralelo suman más que el frame. Las filas `schedule` son tiempo
-  real en el hilo principal, y `outside Main` es lo que pasa fuera de `App::update` (winit).
+  real en el hilo principal, y `outside Main` es lo que pasa fuera de `App::update` (winit). Los
+  pasos entre frames caen ahí: su fila es `schedule Idle` (con `world.idle` adentro) y cuentan
+  para el frame que terminó antes de ellos.
 - `RUST_LOG` tiene que dejar pasar spans de nivel `info`. El filtro por defecto lo hace.
 
 ## Para juegos

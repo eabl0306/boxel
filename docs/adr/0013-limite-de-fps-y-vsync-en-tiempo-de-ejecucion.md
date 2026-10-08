@@ -1,7 +1,7 @@
 # ADR 0013: límite de FPS en los runners y vsync cambiable en tiempo de ejecución
 
 - Estado: aceptado; la espera a la compuerta con el límite en la frecuencia del monitor la revisa
-  ADR 0017
+  ADR 0017, y ADR 0022 usa la espera para pasos cortos del schedule `Idle`
 - Fecha: 2026-10-05
 
 ## Contexto
@@ -96,3 +96,10 @@ Medido en la máquina de desarrollo (panel de 144 Hz, Wayland, radio 12, mundo c
 - Los frames de 8.7 ms con tope 144 no los causaba la grilla: son refrescos que el compositor
   saltea porque la RTX termina tarde algunos frames (ADR 0017). Antes se veían como 8.7 + 5.2 ms;
   ahora como un frame de 13.9 ms, sin la update de más.
+
+## Revisión: el tiempo de espera se usa (ADR 0022, 2026-10-08)
+
+- La espera hasta el deadline ya no es solo dormir: los dos runners corren pasos cortos del
+  schedule `Idle` mientras quede tiempo, hasta 1 ms antes del deadline (0.7 ms antes del margen
+  de espera activa). El mundo recoge resultados y lanza jobs ahí, así que con tope se pone al día
+  casi tan rápido como sin tope. El deadline y la grilla no cambian.

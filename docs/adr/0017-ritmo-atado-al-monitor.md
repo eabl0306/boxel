@@ -1,6 +1,7 @@
 # ADR 0017: con el límite en la frecuencia del monitor, el ritmo lo marca el monitor
 
-- Estado: aceptado, con la revisión del 2026-10-07 (issue #2, ver "Revisión")
+- Estado: aceptado, con la revisión del 2026-10-07 (issue #2, ver "Revisión") y los pasos entre
+  frames de ADR 0022
 - Fecha: 2026-10-07
 - Revisa: ADR 0013 (la espera a la compuerta) y el punto 5 del contrato del runner (ADR 0008)
 
@@ -116,7 +117,8 @@ de 20 s por caso y versión, intercaladas (antes: 0e92379, que mide sin cambiar 
   después de cruzar un borde, porque su trabajo tiene presupuesto por frame: en vuelo a 144 la
   puesta al día pasa de 19.5 a 24.2 ms, y con vsync de 17.7 a 29.4 ms. Agrandar ese presupuesto
   hacia la parte ociosa del frame casi no ayuda a 144 Hz
-  ([ritmo-2026-10](../rendimiento/ritmo-2026-10.md)).
+  ([ritmo-2026-10](../rendimiento/ritmo-2026-10.md)). Desde ADR 0022 el mundo trabaja en la
+  espera entre frames y la puesta al día con tope baja a la mitad.
 - Las updates siguen corriendo en `about_to_wait`, nunca dentro de `RedrawRequested`, y nunca
   esperan un callback sin límite de tiempo, así que la simulación no se congela con la ventana
   oculta. Lo que cambia del contrato de ADR 0008 es que, al seguir al monitor, el callback decide
@@ -169,3 +171,15 @@ test sobre `RunnerCore`.
 - El test con ventana (`frame_limit_window`) no puede ver `display_locked` en ningún caso: en
   Wayland la ventana no se mapea y no hay frecuencia, y en X11 la compuerta no sigue callbacks.
   Lo cubren los tests unitarios del runner.
+
+## Revisión: pasos entre frames (ADR 0022, 2026-10-08)
+
+- Mientras espera un frame callback o un deadline, el runner puede correr pasos cortos del
+  schedule `Idle` (0.5 ms como máximo). Al seguir al monitor con la compuerta cerrada, los pasos
+  terminan 1 ms antes del deadline; con un callback temprano, 0.7 ms antes del arranque más
+  temprano. La iteración de la update no corre pasos (pone `Poll`), así que un redraw que llega
+  enseguida se marca antes del primer paso y `QUICK_GATE` lo sigue clasificando igual.
+- Un callback que llega durante un paso se atiende cuando el paso termina, hasta 0.5 ms tarde.
+  Solo pasa con callbacks que llegan más de 1 ms antes de tiempo. Un test con un bucle de eventos
+  simulado da las mismas updates, esperas, decisiones de enganche y muestras de cadencia con y
+  sin pasos.

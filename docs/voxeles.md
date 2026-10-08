@@ -564,6 +564,13 @@ al moverse.
 - Con tope de fps, agrandar estos dos topes hacia la parte ociosa del frame no ayudó a 144 Hz
   (issue #3, [ritmo-2026-10](rendimiento/ritmo-2026-10.md)) y se quitó: lo que frena la puesta al
   día es que un resultado que llega tarde espera al frame siguiente.
+- Por eso, con tope, el mundo sigue trabajando entre frames (ADR 0022, `WorldSettings::idle_work`,
+  encendido por defecto). Mientras el runner espera el frame siguiente, corre pasos cortos del
+  schedule `Idle` hasta 1 ms antes del deadline. Ahí el mundo recoge resultados, lanza jobs y
+  sigue con el interés pendiente; cada etapa de un chunk ya no espera un frame entero. Las mallas
+  se siguen publicando en `Collect`, con su tope. Medido rápido en la RTX a radio 16: la puesta al
+  día en la superficie baja de unos 33 a unos 19 ms
+  ([entre-frames-2026-10](rendimiento/entre-frames-2026-10.md)). Sin tope no cambia nada.
 
 Medido con `headless_world` en release, terreno por defecto, bucle a 144 Hz (`--hz 144`), que es
 el ritmo del límite de FPS por defecto (ADR 0013). El frame es todo el `App::update` (mundo sin

@@ -1,6 +1,6 @@
 # ADR 0008: runner propio sobre winit 0.30 con presentación gobernada por frame callbacks
 
-- Estado: aceptado (revisado 2026-10-05)
+- Estado: aceptado (revisado 2026-10-05, 2026-10-07 y 2026-10-08)
 - Fecha: 2026-10-04
 
 ## Contexto
@@ -66,3 +66,12 @@ sistemas paralelos, que en macOS y Windows es un deadlock.
   corre la update (corre apenas llega, y la espera cubre un refresco salteado).
   Las updates siguen corriendo en `about_to_wait`, nunca dentro de `RedrawRequested`, y nunca
   esperan un callback sin límite de tiempo: la simulación no se congela con la ventana oculta.
+
+## Revisión: el mundo trabaja entre frames (ADR 0022, 2026-10-08)
+
+- La update sigue corriendo en `about_to_wait`. Si la app tiene sistemas en el schedule `Idle` y
+  la update termina con espera, el runner corre pasos cortos de `Idle` (0.5 ms como máximo) en
+  las iteraciones siguientes de esa espera, hasta 1 ms antes del deadline. Nunca en la
+  iteración de la update: esa pone `ControlFlow::Poll` para que el redraw pedido llegue antes del
+  primer paso.
+- Sin sistemas en `Idle`, sin límite o en modo `Reactive`, nada cambia.
