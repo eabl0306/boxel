@@ -736,7 +736,9 @@ pub struct PhysicsSettings {
     /// The step moves the dynamic bodies (and the projectiles) on the compute threads when
     /// more of them than this are awake (default 256; static, kinematic and sleeping bodies do
     /// not count). Each body only reads the world and writes itself, so the results are
-    /// bit-identical either way.
+    /// bit-identical either way. The broadphase and the solve also go on the threads above it,
+    /// from 4096 bodies in the step's list (the solve writes back from 256), with results that
+    /// do not depend on the threads either. 0 runs every part on the threads whatever its size.
     pub parallel_threshold: usize,
 }
 

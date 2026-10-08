@@ -27,6 +27,8 @@
 //!   off another stands on it (`Contacts::on_ground`).
 //! - A sleeping body that is pushed, or whose velocity changes, wakes up. So does one that
 //!   touches a solid body that moved this step (the crate under it was pushed away).
+//! - With many bodies the pairs are split into islands ([`Islands`]) that run on the compute
+//!   threads: the same pushes, bit for bit.
 //!
 //! After the pushes, at the bodies' final places, the pairs that report join the step's contact
 //! set: sensor pairs that overlap (by more than the tolerance; touching does not count; sensors
@@ -50,6 +52,7 @@ use crate::sleep::{SleeperData, Sleepers, sync_sleepers};
 use crate::source::ChunkSource;
 use crate::systems::{ensure_compute_pool, parallel_above};
 use boxel_app::FixedTime;
+use boxel_ecs::entity::EntityHashMap;
 use boxel_ecs::prelude::*;
 use boxel_math::DVec3;
 use boxel_tasks::ComputeTaskPool;
@@ -325,6 +328,8 @@ pub struct BodyIndex {
     parts: Vec<Vec<(u32, u32)>>,
     /// The awake bodies of a parallel broadphase, in query order.
     entities: Vec<Entity>,
+    /// The pairs with their entities' bits, for sorting.
+    keyed: Vec<(u64, u64, u32, u32)>,
     pub(crate) sleepers: Sleepers,
 }
 
@@ -340,6 +345,7 @@ impl Default for BodyIndex {
             ids: Vec::new(),
             parts: Vec::new(),
             entities: Vec::new(),
+            keyed: Vec::new(),
             sleepers: Sleepers::default(),
         }
     }
@@ -747,6 +753,7 @@ pub(crate) fn broadphase(
         ids,
         parts,
         entities,
+        keyed,
         ..
     } = &mut *index;
     sync_sleepers(sleepers, &mut log, &sleeper_data);
@@ -840,18 +847,23 @@ pub(crate) fn broadphase(
         grid.pairs(pairs);
     }
     // Entity order (each pair's lower entity first): pairs, pushes and events come out the same
-    // on every run, whatever the order of the list.
-    for pair in pairs.iter_mut() {
-        if list[pair.0 as usize].entity.to_bits() > list[pair.1 as usize].entity.to_bits() {
-            *pair = (pair.1, pair.0);
-        }
-    }
-    pairs.sort_unstable_by_key(|&(a, b)| {
-        (
+    // on every run, whatever the order of the list. The keys are unique (one pair per two
+    // entities), so any sort gives this order.
+    keyed.clear();
+    keyed.extend(pairs.iter().map(|&(a, b)| {
+        let (ka, kb) = (
             list[a as usize].entity.to_bits(),
             list[b as usize].entity.to_bits(),
-        )
-    });
+        );
+        if ka > kb {
+            (kb, ka, b, a)
+        } else {
+            (ka, kb, a, b)
+        }
+    }));
+    keyed.sort_unstable();
+    pairs.clear();
+    pairs.extend(keyed.iter().map(|&(_, _, a, b)| (a, b)));
     stats.pairs = pairs.len();
     stats.solve_time = start.elapsed();
 }
@@ -876,6 +888,8 @@ pub(crate) struct ContactSet {
     ended: Vec<(Entity, Entity)>,
     /// The parallel solve's islands.
     islands: Islands,
+    /// The bodies the solve writes back, with their places in the list.
+    writes: EntityHashMap<u32>,
 }
 
 /// The face of a box facing direction `d` (its largest component; ties Y, X, Z).
@@ -1348,6 +1362,22 @@ fn touches_path(sleeper: &IndexedBody, mover: &IndexedBody) -> bool {
     path.overlaps(sleeper.bx(), 0.0)
 }
 
+/// What the solve writes back to a body.
+type WritebackItem<'a> = (
+    Entity,
+    Mut<'a, BodyPosition>,
+    Mut<'a, Velocity>,
+    Mut<'a, Contacts>,
+    Mut<'a, PhysicsSync>,
+    &'a RigidBody,
+    Ref<'a, Collider>,
+    bool,
+);
+
+/// The solve writes the bodies back on the compute threads from this many (and above
+/// `PhysicsSettings::parallel_threshold`).
+const PARALLEL_WRITE_MIN: usize = 256;
+
 /// [`crate::PhysicsSystems::Solve`]: pushes solid pairs apart, wakes the sleepers that were
 /// pushed or lost what they rested on, finds the overlapping pairs that report events, writes
 /// the changed bodies back and refreshes the index for queries.
@@ -1363,6 +1393,7 @@ pub(crate) fn solve(
     mut contacts: ResMut<ContactSet>,
     mut stats: ResMut<PhysicsStats>,
     mut writeback: Query<(
+        Entity,
         &mut BodyPosition,
         &mut Velocity,
         &mut Contacts,
@@ -1514,21 +1545,26 @@ pub(crate) fn solve(
     // Write back and refresh the grid for queries.
     let woken = &mut contacts.woken;
     woken.clear();
+    let writes = &mut contacts.writes;
+    writes.clear();
     for &i in contacts.touched.iter() {
-        let body = &mut bodies[i as usize];
+        let body = &bodies[i as usize];
         if body.still_asleep() {
             // Nothing to write: its copy in the list is as the store keeps it, give or take
             // this step's touching faces.
-            body.dirty = false;
             continue;
         }
         if body.woken {
             woken.push(body.entity);
         }
-        if (body.dirty || body.woken)
-            && let Ok((mut position, mut velocity, mut body_contacts, mut sync, ..)) =
-                writeback.get_mut(body.entity)
-        {
+        if body.dirty || body.woken {
+            writes.insert(body.entity, i);
+        }
+    }
+    // Each body writes only its own components: on the compute threads for many of them.
+    let write =
+        |(_, mut position, mut velocity, mut body_contacts, mut sync, ..): WritebackItem<'_>,
+         body: &IndexedBody| {
             if body.moved {
                 position.set_if_neq(BodyPosition(body.pos));
                 sync.net += body.pushed;
@@ -1540,7 +1576,27 @@ pub(crate) fn solve(
                 ..*body_contacts
             };
             body_contacts.set_if_neq(new);
+        };
+    if parallel_above(&settings, writes.len(), PARALLEL_WRITE_MIN) {
+        ensure_compute_pool();
+        let (list, writes) = (&*bodies, &*writes);
+        writeback
+            .par_iter_many_unique_mut(writes.keys())
+            .for_each(|item| {
+                if let Ok(item) = item {
+                    let body = &list[writes[&item.0] as usize];
+                    write(item, body);
+                }
+            });
+    } else {
+        for (&entity, &i) in writes.iter() {
+            if let Ok(item) = writeback.get_mut(entity) {
+                write(item, &bodies[i as usize]);
+            }
         }
+    }
+    for &i in contacts.touched.iter() {
+        let body = &mut bodies[i as usize];
         body.dirty = false;
         if body.moved {
             body.moved = false;

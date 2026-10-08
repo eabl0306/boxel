@@ -182,9 +182,10 @@ impl StepUp {
 /// that is not clipped across costs nothing more.
 ///
 /// A move clipped by a full block that is taller than `step.height` above the box's bottom (a
-/// wall, a hill one block high) and that the box already touches skips the lifted moves: the
-/// result is the plain move without trying them, the same that trying them gives (see
-/// [`Grid::step_up_blocked`]).
+/// wall, a hill one block high) and that the box already touches skips the lifted moves: no
+/// block or box face fits between the box and that block (see
+/// [`CollisionTable::plane_gap`]), so every lifted move would stop at the same place across.
+/// The result is the plain move, the same that trying them gives, bit for bit.
 ///
 /// # Errors
 ///

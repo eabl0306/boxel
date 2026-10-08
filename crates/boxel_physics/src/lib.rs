@@ -42,11 +42,12 @@
 //! disallows fused multiply-add and the libm functions. Bodies step each one alone (no body
 //! reads another, except through the obstacles of the current step), so the order they step in,
 //! and the threads of a parallel step, change nothing; pairs are sorted by entity and pushed in
-//! a fixed order, and messages are sorted by entity.
+//! a fixed order (on the threads, in islands of pairs that share no body the pushes move, each
+//! in that order), and messages are sorted by entity.
 //!
 //! Scale: bodies that rest fall asleep ([`Sleeping`]) and cost almost nothing until something
-//! wakes them; above `PhysicsSettings::parallel_threshold` awake bodies the step runs on the
-//! compute threads.
+//! wakes them; above `PhysicsSettings::parallel_threshold` awake bodies the step, and with many
+//! bodies the broadphase and the solve, run on the compute threads.
 
 mod components;
 mod contacts;
