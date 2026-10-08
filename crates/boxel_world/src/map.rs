@@ -459,7 +459,9 @@ impl ChunkMap {
     pub fn iter(&self) -> impl Iterator<Item = (ChunkId, &ChunkSlot)> {
         self.slots.iter()
     }
-    /// Every non-empty Ready mesh (renderer resync).
+    /// Every non-empty Ready mesh (renderer resync; the renderer then writes
+    /// [`ChunkMeshResync`](crate::ChunkMeshResync), since this misses the chunks being
+    /// remeshed).
     pub fn ready_meshes(&self) -> impl Iterator<Item = (ChunkId, ChunkKey, &Arc<ChunkMesh>)> {
         self.slots.iter().filter_map(|(id, s)| match &s.mesh {
             MeshState::Ready { mesh, .. } => Some((id, s.key(), mesh)),

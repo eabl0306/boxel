@@ -916,6 +916,69 @@ fn removed(events: &[ChunkMeshEvent]) -> Vec<ChunkId> {
         .collect()
 }
 
+/// A renderer that resyncs (lost uploads, a new device or tier) drops every mesh and uploads
+/// [`ChunkMap::ready_meshes`] again, which misses a chunk being remeshed. Its next mesh must
+/// reach the renderer even when it is identical to the one published before.
+#[test]
+fn a_renderer_resync_gets_every_published_mesh_back() {
+    let hold = Arc::new(HoldExecutor::default());
+    let mut h = surface_world(hold.clone());
+    let mut renderer: HashMap<ChunkId, Arc<ChunkMesh>> = HashMap::new();
+    let apply = |renderer: &mut HashMap<ChunkId, Arc<ChunkMesh>>, events: Vec<ChunkMeshEvent>| {
+        for event in events {
+            match event {
+                ChunkMeshEvent::Upsert { id, mesh, .. } => {
+                    renderer.insert(id, mesh);
+                }
+                ChunkMeshEvent::Remove { id, .. } => {
+                    renderer.remove(&id);
+                }
+            }
+        }
+    };
+    for _ in 0..50 {
+        h.dispatch();
+        hold.run_all();
+        h.collect();
+        if h.stats().is_settled() {
+            break;
+        }
+    }
+    assert!(h.stats().is_settled());
+    let events = h.take_events();
+    apply(&mut renderer, events);
+    let center = h.id(ChunkPos::new(0, -1, 0));
+    assert!(renderer.contains_key(&center));
+    // A remesh that will give the same mesh (nothing changed), running during the resync.
+    h.with(|jobs, cx, _| jobs.request_remesh(cx, center, 0));
+    h.dispatch();
+    assert_eq!(hold.held(), 1);
+    renderer = h
+        .map
+        .ready_meshes()
+        .map(|(id, _, mesh)| (id, Arc::clone(mesh)))
+        .collect();
+    assert!(!renderer.contains_key(&center));
+    h.jobs.renderer_resynced(&h.map);
+    h.check_published();
+    hold.run_all();
+    h.collect();
+    let events = h.take_events();
+    apply(&mut renderer, events);
+    h.check_published();
+    // The renderer holds every published mesh again.
+    for (id, slot) in h.map.iter() {
+        if let MeshState::Ready { mesh, .. } = slot.mesh() {
+            assert!(
+                renderer.get(&id).is_some_and(|m| Arc::ptr_eq(m, mesh)),
+                "{:?}",
+                slot.pos
+            );
+        }
+    }
+    assert_eq!(renderer.len(), h.jobs.published.len());
+}
+
 #[test]
 fn losing_mesh_interest_mid_remesh_removes_the_old_mesh() {
     let mut h = Harness::new(LayerGen::new(-1..=0), Arc::new(InlineExecutor), 64);

@@ -53,6 +53,11 @@ subterráneas, el siguiente paso son subceldas de 16³ o Hi-Z.
   y la búsqueda ve a través de ese chunk hasta que el render lo muestre otra vez. En el frame
   del rechazo el mundo todavía no lo sabe: si el conjunto de ese frame llegó al chunk, el render
   dibuja sin ocultar nada.
+- Tras un resync del render (dispositivo o tier nuevo, subidas perdidas), el render vuelve a subir
+  las mallas listas del mapa, que no incluyen las de los chunks a medio remallar. El render lo
+  avisa (`ChunkMeshResync`) y el mundo manda la próxima malla de esos chunks aunque sea igual a
+  la anterior. Antes no la mandaba: el chunk quedaba sin dibujar y la búsqueda confiaba en sus
+  enlaces.
 - El mapa anota cada cambio de esos enlaces, y el paso nuevo `WorldSystems::Visibility` (después
   de `Collect`) los pasa a `ChunkVisibility`.
 

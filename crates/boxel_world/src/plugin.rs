@@ -215,6 +215,13 @@ pub enum ChunkMeshEvent {
     },
 }
 
+/// Written by a renderer that dropped every chunk mesh and uploaded [`ChunkMap::ready_meshes`]
+/// again (a resync: a new renderer, or uploads it lost). That misses the chunks being remeshed,
+/// whose last mesh was published: at the start of its next `Update`, the world forgets those,
+/// so their next mesh is published even when it is identical to that one.
+#[derive(Message, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChunkMeshResync;
+
 /// A block changed: an edit of [`EditQueue`] applied in `WorldSystems::Edits`. One message per
 /// position and frame, from the state before the frame's edits to the state after them (two
 /// edits of one block in a frame give one message; edits that leave a block as it was, or that
@@ -342,7 +349,7 @@ pub enum WorldSystems {
 
 /// Adds the world: resources (`ChunkMap`, `SkyMap`, `WorldSettings`, `WorldContent`,
 /// `EditQueue`, [`NeighborRules`] (the built-in ones of the registry), `WorldStats`, internal
-/// job state), the messages `ChunkMeshEvent`,
+/// job state), the messages `ChunkMeshEvent`, [`ChunkMeshResync`],
 /// [`BlockChanged`] and [`ChunkDataEvent`] and the chained systems in
 /// `Update`. A stats system in `Last` refreshes `WorldStats` and publishes a `"world"` line to
 /// `DiagnosticsBoard` if present. `TaskPoolPlugin` is recommended (pool sizes); without it the
@@ -401,6 +408,7 @@ impl Plugin for WorldPlugin {
             .init_resource::<ChunkVisibility>()
             .insert_resource(jobs)
             .add_message::<ChunkMeshEvent>()
+            .add_message::<ChunkMeshResync>()
             .add_message::<BlockChanged>()
             .add_message::<ChunkDataEvent>()
             .configure_sets(
@@ -422,6 +430,7 @@ impl Plugin for WorldPlugin {
                     // frame), and naming them would tie this crate to camera/gameplay crates.
                     (
                         begin_frame_budget,
+                        renderer_resyncs,
                         track_viewers.ambiguous_with_all(),
                         update_interest,
                     )
@@ -475,6 +484,18 @@ fn track_viewers(
 /// [`WorldSettings::interest_budget`]).
 fn begin_frame_budget(deadline: Option<Res<FrameDeadline>>, mut budget: ResMut<FrameBudget>) {
     budget.begin(deadline.as_deref());
+}
+
+/// Applies the renderer's resyncs ([`ChunkMeshResync`]) before anything changes a mesh this
+/// frame: the chunks remeshing now are the ones it missed.
+fn renderer_resyncs(
+    mut resyncs: MessageReader<ChunkMeshResync>,
+    map: Res<ChunkMap>,
+    mut jobs: ResMut<WorldJobs>,
+) {
+    if resyncs.read().count() > 0 {
+        jobs.renderer_resynced(&map);
+    }
 }
 
 fn update_interest(

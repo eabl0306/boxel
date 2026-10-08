@@ -90,8 +90,8 @@ pub(crate) use map::CachedLight;
 pub use map::{ChunkId, ChunkMap, ChunkSlot, DataState, Interest, MeshState, WorldStats};
 pub use neighbor_rules::NeighborRules;
 pub use plugin::{
-    BlockChanged, BlockEdit, ChunkDataEvent, ChunkMeshEvent, ChunkViewer, EditQueue, WorldContent,
-    WorldPlugin, WorldSettings, WorldSystems,
+    BlockChanged, BlockEdit, ChunkDataEvent, ChunkMeshEvent, ChunkMeshResync, ChunkViewer,
+    EditQueue, WorldContent, WorldPlugin, WorldSettings, WorldSystems,
 };
 pub use sky::{ColumnId, SkyMap};
 pub use ticks::{

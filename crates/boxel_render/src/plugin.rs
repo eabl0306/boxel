@@ -35,8 +35,8 @@ use boxel_transform::Transform;
 use boxel_voxel::BlockRegistry;
 use boxel_window::{DisplayHandle, PrimaryWindow, WindowState};
 use boxel_world::{
-    ChunkMap, ChunkMeshEvent, ChunkViewer, ChunkVisibility, DaylightCurve, TimeOfDay,
-    VisibilityView, VisibleSet, WorldContent, WorldSettings,
+    ChunkMap, ChunkMeshEvent, ChunkMeshResync, ChunkViewer, ChunkVisibility, DaylightCurve,
+    TimeOfDay, VisibilityView, VisibleSet, WorldContent, WorldSettings,
 };
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -335,6 +335,7 @@ impl Plugin for RenderPlugin {
             .add_message::<ScreenshotSaved>()
             .add_message::<DebugDestroyDevice>()
             .add_message::<ChunkMeshEvent>()
+            .add_message::<ChunkMeshResync>()
             // `edit_schedule` keeps systems other plugins already added to `Render`.
             .edit_schedule(Render, |schedule| {
                 schedule.set_executor(SingleThreadedExecutor::new());
@@ -1257,6 +1258,7 @@ fn extract(
     clock: Option<(Res<TimeOfDay>, Res<DaylightCurve>)>,
     chunks: Option<Res<ChunkMap>>,
     mut mesh_events: MessageReader<ChunkMeshEvent>,
+    mut resyncs: MessageWriter<ChunkMeshResync>,
     mut screenshots: MessageReader<RequestScreenshot>,
     mut destroy: MessageReader<DebugDestroyDevice>,
     overlay: Res<OverlayDraw>,
@@ -1289,8 +1291,10 @@ fn extract(
     frame.resync = ready.is_some_and(|r| r.resync);
     frame.meshes.clear();
     if frame.resync {
-        // Everything currently published replaces whatever the events would say.
+        // Everything currently published replaces whatever the events would say. The chunks
+        // being remeshed are missing: the world sends their next mesh even if identical.
         mesh_events.clear();
+        resyncs.write(ChunkMeshResync);
         if let Some(map) = chunks.as_deref() {
             frame
                 .meshes

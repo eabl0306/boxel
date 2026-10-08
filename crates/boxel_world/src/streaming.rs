@@ -14,7 +14,9 @@
 //!   `Upsert` is eventually followed by a `Remove` (unload, remesh to empty) or a replacing
 //!   `Upsert`.
 //! - A published chunk has a `Ready` mesh, or has [`Interest::MESH`] and a remesh `Queued` or
-//!   `InFlight` (so `ChunkMap::ready_meshes()` only misses published chunks during a remesh).
+//!   `InFlight` (so `ChunkMap::ready_meshes()` only misses published chunks during a remesh; a
+//!   renderer that uploads those again after a resync says so with `ChunkMeshResync`, and the
+//!   world forgets the published meshes it missed).
 //! - An `Empty` mesh is never stale: a data change remeshes it, and unloading a neighbor resets
 //!   it (a `Ready` mesh kept in the hysteresis band is checked by epoch when wanted again).
 //! - Once the interest backlog is empty, every slot's interest is what the viewers want
@@ -1555,6 +1557,18 @@ impl WorldJobs {
         } else {
             self.drop_mesh(cx, id);
         }
+    }
+
+    /// A renderer dropped every mesh and uploaded [`ChunkMap::ready_meshes`] again
+    /// ([`ChunkMeshResync`](crate::ChunkMeshResync)): the published meshes of chunks being
+    /// remeshed were not among them. Forgets those (no `Remove`: the renderer does not hold
+    /// them), so their next mesh is published even when it is identical, and an empty or
+    /// unloaded chunk sends nothing.
+    pub(crate) fn renderer_resynced(&mut self, map: &ChunkMap) {
+        self.published.retain(|&id, _| {
+            map.get(id)
+                .is_some_and(|slot| matches!(slot.mesh(), MeshState::Ready { .. }))
+        });
     }
 
     /// `Remove` if the slot's mesh was published (its state is left as is).
