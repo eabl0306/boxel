@@ -39,8 +39,9 @@ use boxel_light::{
 };
 use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher};
 use boxel_voxel::{
-    BlockPos, BlockRegistry, BlockState, CHUNK_SHIFT, ChunkData, ChunkFaceInfo, ChunkKey, ChunkPos,
-    Face, LightValue, LocalPos, NEIGHBOR_OFFSETS, OPAQUE_OPACITY, RenderShape, neighbor_index,
+    BlockPos, BlockRegistry, BlockState, CHUNK_SHIFT, CHUNK_SIZE, ChunkData, ChunkFaceInfo,
+    ChunkKey, ChunkPos, Face, LightValue, LocalPos, NEIGHBOR_OFFSETS, OPAQUE_OPACITY, RenderShape,
+    neighbor_index,
 };
 use crossbeam_channel::{Receiver, Sender};
 use std::cell::RefCell;
@@ -53,6 +54,9 @@ use std::time::{Duration, Instant};
 
 /// `neighbors_ready` with all 26 bits set.
 pub(crate) const ALL_NEIGHBORS: u32 = (1 << 26) - 1;
+
+/// The last local coordinate of a chunk (31).
+const LAST_LOCAL: u32 = CHUNK_SIZE as u32 - 1;
 
 /// An edit batch that never got a result is closed once it is this many frames old and
 /// [`STALE_BATCH_TIME`] has passed since it opened (its members, waiting for neighbors or a sky
@@ -961,7 +965,9 @@ impl WorldJobs {
             }
             slot.neighbors_ready = bits;
             slot.epoch = slot.epoch.wrapping_add(1);
-            if !matches!(slot.mesh(), MeshState::None) {
+            // Its mesh was built with neighbors that are now air, or air that is now a chunk.
+            cx.map.set_shown(id, false);
+            if !matches!(cx.map.slots[id].mesh(), MeshState::None) {
                 let priority = self.priority(pos);
                 self.request_remesh(cx, id, priority);
             }
@@ -1154,7 +1160,10 @@ impl WorldJobs {
                 cx.map.set_remesh_pending(id, false);
                 match cx.map.slots[id].mesh() {
                     MeshState::Queued => self.drop_mesh(cx, id),
-                    MeshState::InFlight { .. } => self.unpublish(cx, id),
+                    MeshState::InFlight { .. } => {
+                        self.unpublish(cx, id);
+                        cx.map.set_shown(id, false);
+                    }
                     MeshState::None | MeshState::Ready { .. } | MeshState::Empty => {}
                 }
             }
@@ -1212,6 +1221,13 @@ impl WorldJobs {
         let outside = !self.planner.in_bounds(slot.pos.y);
         // All 26 lookups first: independent, so their cache misses overlap.
         let near = neighbor_ids(cx.map, slot.pos);
+        // A face neighbor's mesh was built from this chunk's border, which may come back
+        // different (edits are not kept yet): the renderer no longer shows it as its blocks are.
+        for i in FACE_NEIGHBORS {
+            if let Some(n) = near[i] {
+                cx.map.set_shown(n, false);
+            }
+        }
         for (i, &n) in near.iter().enumerate() {
             let Some(n) = n else {
                 continue;
@@ -1251,9 +1267,9 @@ impl WorldJobs {
             return;
         }
         match slot.data() {
-            DataState::Missing => self.set_mesh_empty(cx, id),
+            DataState::Missing => self.set_mesh_empty(cx, id, true),
             DataState::Ready(data) if is_uniform_empty(data, &cx.content.registry) => {
-                self.set_mesh_empty(cx, id);
+                self.set_mesh_empty(cx, id, true);
             }
             DataState::Ready(_) if slot.neighbors_ready == ALL_NEIGHBORS => {
                 if matches!(self.sky_for(cx, id, false), SkyFor::Ready(_)) {
@@ -1564,11 +1580,23 @@ impl WorldJobs {
     /// remeshed were not among them. Forgets those (no `Remove`: the renderer does not hold
     /// them), so their next mesh is published even when it is identical, and an empty or
     /// unloaded chunk sends nothing.
-    pub(crate) fn renderer_resynced(&mut self, map: &ChunkMap) {
+    pub(crate) fn renderer_resynced(&mut self, map: &mut ChunkMap) {
+        let mut lost = Vec::new();
         self.published.retain(|&id, _| {
-            map.get(id)
-                .is_some_and(|slot| matches!(slot.mesh(), MeshState::Ready { .. }))
+            let kept = map
+                .get(id)
+                .is_some_and(|slot| matches!(slot.mesh(), MeshState::Ready { .. }));
+            if !kept {
+                lost.push(id);
+            }
+            kept
         });
+        // The renderer draws nothing for them until their next mesh.
+        for id in lost {
+            if map.get(id).is_some() {
+                map.set_shown(id, false);
+            }
+        }
     }
 
     /// `Remove` if the slot's mesh was published (its state is left as is).
@@ -1581,7 +1609,9 @@ impl WorldJobs {
 
     /// `MeshState::Empty`, and `Remove` if a mesh was published. A chunk meshed to nothing
     /// without a job (all air, enclosed, a failed job) gets a light job if it is near a viewer.
-    fn set_mesh_empty(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
+    /// `shown`: the chunk really has nothing to show ([`ChunkSlot::shown`]); not after a failed
+    /// mesh job, whose blocks the renderer then does not show.
+    fn set_mesh_empty(&mut self, cx: &mut Ctx<'_>, id: ChunkId, shown: bool) {
         self.set_waits_sky(cx, id, false);
         // The empty fast paths (missing data, uniform chunks) need no job to know their faces.
         let slot = &cx.map.slots[id];
@@ -1597,16 +1627,16 @@ impl WorldJobs {
                 cx.map.set_faces(id, faces);
             }
         }
-        cx.map.set_mesh_and_pending(id, MeshState::Empty, false);
+        cx.map.set_mesh_shown(id, MeshState::Empty, shown);
         self.unpublish(cx, id);
         self.leave_batch(cx, id);
         self.want_light(cx, id);
     }
 
-    /// `MeshState::None`, and `Remove` if a mesh was published.
+    /// `MeshState::None`, and `Remove` if a mesh was published (nothing is shown).
     fn drop_mesh(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
         self.set_waits_sky(cx, id, false);
-        cx.map.set_mesh_and_pending(id, MeshState::None, false);
+        cx.map.set_mesh_shown(id, MeshState::None, false);
         self.unpublish(cx, id);
         self.leave_batch(cx, id);
     }
@@ -1754,19 +1784,40 @@ impl WorldJobs {
             return changed;
         }
         // 2. The data. A chunk where what occludes changed needs its face info again (its next
-        // mesh job computes it; until then the visibility search sees it open).
+        // mesh job computes it), and the faces of its occluding cubes change: the renderer does
+        // not show it as it is until its new mesh is published, and the visibility search sees
+        // through it. So does a face neighbor across the border of such a voxel, whose faces
+        // toward it change too (the meshes of an edit batch may be published apart).
         let registry = Arc::clone(&cx.content.registry);
         let mut refaced = BTreeSet::new();
+        let mut border = BTreeSet::new();
         for &(id, local, old, state) in &changes {
             if let Some(data) = cx.map.ready_data_mut(id) {
                 Arc::make_mut(data).set(local, state);
             }
             if registry.occludes(old) != registry.occludes(state) {
                 refaced.insert(id);
+                let pos = cx.map.slots[id].pos;
+                let l = [local.x(), local.y(), local.z()];
+                for face in Face::ALL {
+                    let n = face.normal();
+                    let crosses = [n.x, n.y, n.z]
+                        .iter()
+                        .zip(l)
+                        .any(|(&d, c)| (d < 0 && c == 0) || (d > 0 && c == LAST_LOCAL));
+                    if crosses {
+                        border.insert(pos.offset(n));
+                    }
+                }
             }
         }
         for id in refaced {
-            cx.map.set_faces(id, None);
+            cx.map.forget_faces(id);
+        }
+        for pos in border {
+            if let Some(id) = cx.map.id_at(pos) {
+                cx.map.set_shown(id, false);
+            }
         }
         // 3. The sky tops, from the new data.
         let batch = self.new_batch();
@@ -2010,13 +2061,13 @@ impl WorldJobs {
         let pos = slot.pos;
         let registry = &cx.content.registry;
         if is_uniform_empty(center, registry) {
-            self.set_mesh_empty(cx, id);
+            self.set_mesh_empty(cx, id, true);
             return false;
         }
         // Each neighbor is looked up once: the face neighbors first, for the enclosed check.
         let mut near = NearData::default();
         if is_enclosed_opaque(map, registry, pos, center, &mut near) {
-            self.set_mesh_empty(cx, id);
+            self.set_mesh_empty(cx, id, true);
             return false;
         }
         let center = Arc::clone(center);
@@ -2607,7 +2658,8 @@ impl WorldJobs {
                     cx.map.set_mesh_and_pending(id, MeshState::Queued, false);
                     self.schedule_mesh(cx, id, priority);
                 } else {
-                    self.set_mesh_empty(cx, id);
+                    // Nothing drawn for blocks that may have faces.
+                    self.set_mesh_empty(cx, id, false);
                 }
             }
         }
@@ -2683,7 +2735,7 @@ impl WorldJobs {
         });
         cx.map.set_light(id, light);
         if result.mesh.is_empty() {
-            self.set_mesh_empty(cx, id);
+            self.set_mesh_empty(cx, id, true);
             return;
         }
         let key = cx.map.slots[id].key();
@@ -2695,13 +2747,16 @@ impl WorldJobs {
             .filter(|old| old.hash == result.mesh.hash && ***old == result.mesh)
             .cloned();
         let mesh = unchanged.clone().unwrap_or_else(|| Arc::new(result.mesh));
-        cx.map.set_mesh(
+        // Built from the current blocks of the chunk and of its neighbors' borders (the result
+        // is fresh): the renderer shows them once it is published, this frame.
+        cx.map.set_mesh_shown(
             id,
             MeshState::Ready {
                 mesh: Arc::clone(&mesh),
                 data_version: result.data_version,
                 epoch: result.epoch,
             },
+            true,
         );
         if unchanged.is_none() {
             self.published.insert(id, Arc::clone(&mesh));

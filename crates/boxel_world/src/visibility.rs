@@ -14,11 +14,12 @@
 //! - It only walks chunks that touch the view frustum (a line of sight stays inside it), except
 //!   the 26 around the camera's chunk.
 //! - The camera's chunk sees its 6 neighbors whatever its links.
-//! - A chunk that is not loaded, not generated or whose mesh is not settled yet counts as open
-//!   ([`ChunkSlot::visibility_links`](crate::ChunkSlot::visibility_links)), so a chunk the
-//!   renderer shows is never hidden by blocks it does not show yet.
-//! - A chunk the renderer does not show as the map has it (it refused the chunk's last mesh) is
-//!   seen through, with every chunk past it ([`ChunkVisibility::set_unshown`]).
+//! - A chunk the renderer does not show as its blocks are is seen through ([`XRAY`]), with every
+//!   chunk past it: one whose mesh is not published yet (or not wanted), is being redone after
+//!   an edit that changed what occludes in it or on its border, or whose neighbor unloaded
+//!   ([`ChunkSlot::shown`](crate::ChunkSlot::shown)), and one whose last mesh the renderer
+//!   refused ([`ChunkVisibility::set_unshown`]). A chunk not loaded or not generated yet counts
+//!   as open.
 //!
 //! The search covers a box around the camera's chunk (the viewer's mesh radius); a chunk
 //! outside it is always visible ([`VisibleSet::is_visible`]). A path cannot leave an
@@ -174,12 +175,13 @@ pub struct VisibilityStats {
     pub blocked: u64,
 }
 
-/// Grid links bit (above the 15 links): the renderer does not show the chunk as its data says
-/// (it refused the chunk's last mesh, [`ChunkVisibility::set_unshown`]). Where its faces are
-/// missing, a line of sight goes into the rock around it, where nothing is meshed, and on until
-/// an open voxel shows a face: the search sees every chunk past such a chunk, as if all were
-/// open. Such a chunk counts as open itself.
-pub(crate) const XRAY: u16 = 1 << 15;
+/// Links bit (above the 15 links): the renderer does not show the chunk as its blocks are (no
+/// mesh yet, a mesh built from other blocks, [`ChunkSlot::shown`](crate::ChunkSlot::shown), or
+/// a mesh it refused, [`ChunkVisibility::set_unshown`]). Where the faces of its occluding cubes
+/// are missing, a line of sight goes into the rock around it, where nothing is meshed, and on
+/// until an open voxel shows a face: the search sees every chunk past such a chunk, as if all
+/// were open. Such a chunk counts as open itself.
+pub const XRAY: u16 = 1 << 15;
 
 /// Bits of the search state of a cell.
 const INCOMING: u8 = 0x3f;

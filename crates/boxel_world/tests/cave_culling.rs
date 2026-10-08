@@ -5,8 +5,9 @@
 //!   frustum walk until they hit an occluding voxel; every chunk a ray crosses (the one it hits
 //!   included) must be in the visible set, since any of them may show a face along the ray.
 //! - The world keeps every settled chunk's face info equal to a fresh computation from its data,
-//!   opens the links of an edited chunk at once and has exact links again after its remesh, and
-//!   its incremental [`ChunkVisibility`] agrees with a search from scratch.
+//!   sees through an edited chunk at once and has exact links again after its remesh, and its
+//!   incremental [`ChunkVisibility`] agrees with a search from scratch. (What the renderer draws
+//!   while meshes are missing or stale: `cave_culling_drawn.rs`.)
 #![expect(clippy::print_stderr, reason = "test progress")]
 use boxel_app::App;
 use boxel_math::projection::{look_to, perspective_infinite_reverse};
@@ -17,7 +18,7 @@ use boxel_voxel::{
     MAX_CHUNK_COORD,
 };
 use boxel_world::jobs::InlineExecutor;
-use boxel_world::visibility::{TIGHTEN_DELAY, visible_chunks};
+use boxel_world::visibility::{TIGHTEN_DELAY, XRAY, visible_chunks};
 use boxel_world::{
     ChunkMap, ChunkViewer, ChunkVisibility, DataState, EditQueue, MeshState, VisibilityView,
     WorldPlugin, WorldSettings, WorldStats,
@@ -285,20 +286,26 @@ fn settle(app: &mut App) {
     }
 }
 
-/// Every settled chunk's links are its data's; others are open.
+/// In a settled world every chunk with a settled mesh is shown, and every shown chunk's links
+/// are its data's; a chunk with data the renderer does not show (no mesh: not wanted) is seen
+/// through; others are open.
 fn assert_links_match_data(app: &App) -> usize {
     let map = app.world().resource::<ChunkMap>();
     let registry = BlockRegistry::default_blocks();
     let mut exact = 0;
     for (_, slot) in map.iter() {
         let settled = matches!(slot.mesh(), MeshState::Ready { .. } | MeshState::Empty);
-        match (settled, slot.data()) {
+        assert_eq!(slot.shown(), settled, "{:?}", slot.pos);
+        match (slot.shown(), slot.data()) {
             (true, DataState::Ready(data)) => {
                 let want = ChunkFaceInfo::compute(data, &registry);
                 assert_eq!(slot.face_links(), Some(want.links), "{:?}", slot.pos);
                 assert_eq!(slot.visibility_links(), want.links, "{:?}", slot.pos);
                 assert_eq!(map.visibility_links_at(slot.pos), want.links);
                 exact += 1;
+            }
+            (false, DataState::Ready(_)) => {
+                assert_eq!(slot.visibility_links(), ALL_LINKS | XRAY, "{:?}", slot.pos);
             }
             _ => assert_eq!(slot.visibility_links(), ALL_LINKS, "{:?}", slot.pos),
         }
@@ -355,8 +362,8 @@ fn the_world_keeps_face_info_and_visibility_up_to_date() {
         visible_chunks(&view, |p| map.visibility_links_at(p))
     };
 
-    // Fill the viewer's chunk with stone except the eye: what occludes changes, so its links
-    // open until its remesh lands.
+    // Fill the viewer's chunk with stone except the eye: what occludes changes, so the search
+    // sees through it until its remesh lands.
     let center = view.center;
     let origin = center.origin();
     {
@@ -380,7 +387,8 @@ fn the_world_keeps_face_info_and_visibility_up_to_date() {
         let map = app.world().resource::<ChunkMap>();
         let slot = map.get(map.id_at(center).expect("loaded")).expect("slot");
         assert_eq!(slot.face_links(), None);
-        assert_eq!(slot.visibility_links(), ALL_LINKS);
+        assert!(!slot.shown());
+        assert_eq!(slot.visibility_links(), ALL_LINKS | XRAY);
     }
     assert_visibility_matches(&mut app, &view);
     settle(&mut app);

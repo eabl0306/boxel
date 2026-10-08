@@ -1,4 +1,5 @@
 use crate::ColumnId;
+use crate::visibility::XRAY;
 use boxel_ecs::prelude::*;
 use boxel_light::ChunkLight;
 use boxel_mesh::ChunkMesh;
@@ -123,8 +124,8 @@ pub struct ChunkSlot {
     pub neighbors_ready: u32,
     /// Bumped when a neighbor's border data changes (closes the neighbor-staleness gap).
     pub epoch: u32,
-    /// [`REMESH_PENDING`], [`SKY_EDITED`] and [`LIGHT_JOB`] (one byte, so the slot stays at
-    /// 112 bytes).
+    /// [`REMESH_PENDING`], [`SKY_EDITED`], [`LIGHT_JOB`] and [`SHOWN`] (one byte, so the slot
+    /// stays at 112 bytes).
     bits: u8,
     /// The mesh job is waiting for a sky tile of its 3x3 columns (counted in
     /// [`WorldStats::waiting_sky`]).
@@ -149,6 +150,8 @@ const REMESH_PENDING: u8 = 1;
 const SKY_EDITED: u8 = 1 << 1;
 /// [`ChunkSlot::bits`]: a light job for this slot is queued or running (at most one).
 const LIGHT_JOB: u8 = 1 << 2;
+/// [`ChunkSlot::bits`]: the renderer shows the chunk as its blocks are ([`ChunkSlot::shown`]).
+const SHOWN: u8 = 1 << 3;
 
 /// A chunk's cached light and the content it was computed from (one allocation, so the slot
 /// stays small).
@@ -308,16 +311,34 @@ impl ChunkSlot {
     pub fn face_links(&self) -> Option<u16> {
         (self.face_links != UNKNOWN_LINKS).then_some(self.face_links)
     }
+    /// True if the renderer shows this chunk as its blocks are now (cave culling, ADR 0022):
+    /// the mesh it was sent last was built from the chunk's current blocks and the current
+    /// borders of its 6 face neighbors, or the chunk has nothing to show (a settled `Empty`
+    /// mesh). Only what occludes decides which faces of the occluding cubes a mesh has, so a
+    /// remesh for light alone keeps the chunk shown. It is not shown before its first mesh is
+    /// published (also without mesh interest), after an edit that changes what occludes in it
+    /// or on its border (until its new mesh is published), when its mesh is dropped or lost by
+    /// a renderer resync, or once a face neighbor unloads (its mesh assumed that neighbor's
+    /// blocks). The renderer may still refuse a mesh: `ChunkVisibility::set_unshown` covers that.
+    pub fn shown(&self) -> bool {
+        self.bits & SHOWN != 0
+    }
     /// The face links the visibility search uses for this chunk ([`ChunkFaceInfo::links`]):
-    /// its own once its mesh is settled (`Ready` or `Empty`, so the renderer shows the blocks
-    /// the links were computed from) and its faces are known; otherwise every link
-    /// ([`ALL_LINKS`]: a chunk not loaded, not generated or not meshed yet counts as open).
+    /// its own while it is [`shown`](ChunkSlot::shown) (the renderer draws the blocks the links
+    /// were computed from). A chunk with blocks that is not shown gets every link and
+    /// [`XRAY`]: where the faces of its occluding cubes are missing (no mesh, or one built from
+    /// other blocks) a line of sight goes on into the rock of its neighbors, whose faces
+    /// toward it are not meshed, so the search sees every chunk past it. A chunk without blocks
+    /// yet (or permanently air, `Missing`) counts as open: every link. Its neighbors' meshes
+    /// cannot have been built from blocks it no longer has, since a neighbor that unloads makes
+    /// them not shown.
     pub fn visibility_links(&self) -> u16 {
-        match (&self.mesh, self.face_links()) {
-            (MeshState::Ready { .. } | MeshState::Empty, Some(links)) if !self.remesh_pending() => {
-                links
-            }
-            _ => ALL_LINKS,
+        if self.shown() {
+            self.face_links().unwrap_or(ALL_LINKS)
+        } else if matches!(self.data, DataState::Ready(_)) {
+            ALL_LINKS | XRAY
+        } else {
+            ALL_LINKS
         }
     }
     /// The chunk's light (32^3), as of its last mesh or light job. `None` outside
@@ -578,6 +599,18 @@ impl ChunkMap {
             slot.face_links = faces.map_or(UNKNOWN_LINKS, |f| f.links);
         });
     }
+    /// An edit changed what occludes in a slot: its face links are unknown and the renderer no
+    /// longer shows its blocks ([`ChunkSlot::shown`]) until its next mesh is published.
+    pub(crate) fn forget_faces(&mut self, id: ChunkId) {
+        self.update(id, |slot| {
+            slot.face_links = UNKNOWN_LINKS;
+            slot.set_bit(SHOWN, false);
+        });
+    }
+    /// Sets whether the renderer shows a slot as its blocks are ([`ChunkSlot::shown`]).
+    pub(crate) fn set_shown(&mut self, id: ChunkId, shown: bool) {
+        self.update(id, |slot| slot.set_bit(SHOWN, shown));
+    }
     /// The recorded changes of [`ChunkSlot::visibility_links`], oldest first (cleared).
     pub(crate) fn take_face_changes(&mut self) -> Vec<(ChunkPos, u16)> {
         std::mem::take(&mut self.face_changes)
@@ -591,6 +624,15 @@ impl ChunkMap {
         self.update(id, |slot| {
             slot.mesh = mesh;
             slot.set_bit(REMESH_PENDING, pending);
+        });
+    }
+    /// Sets a slot's mesh state, clears its remesh request and sets whether the renderer shows
+    /// its blocks ([`ChunkSlot::shown`]), in one change.
+    pub(crate) fn set_mesh_shown(&mut self, id: ChunkId, mesh: MeshState, shown: bool) {
+        self.update(id, |slot| {
+            slot.mesh = mesh;
+            slot.set_bit(REMESH_PENDING, false);
+            slot.set_bit(SHOWN, shown);
         });
     }
     /// Sets a slot's cached light.

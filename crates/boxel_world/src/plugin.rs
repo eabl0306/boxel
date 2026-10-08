@@ -500,11 +500,11 @@ fn begin_frame_budget(
 /// frame: the chunks remeshing now are the ones it missed.
 fn renderer_resyncs(
     mut resyncs: MessageReader<ChunkMeshResync>,
-    map: Res<ChunkMap>,
+    mut map: ResMut<ChunkMap>,
     mut jobs: ResMut<WorldJobs>,
 ) {
     if resyncs.read().count() > 0 {
-        jobs.renderer_resynced(&map);
+        jobs.renderer_resynced(&mut map);
     }
 }
 
