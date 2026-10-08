@@ -81,6 +81,7 @@ CULLING_METRICS = [
     ('chunks through CPU cull avg', ('culling', 'visible_chunks', 'avg'), -1),
     ('draws avg', ('culling', 'draws', 'avg'), -1),
     ('culling searches', ('culling', 'searches'), 0),
+    ('frames unculled (eye in rock)', ('culling', 'unculled_frames'), 0),
     ('culling search avg ms', ('culling', 'search_avg_ms'), -1),
     ('culling search p99 ms', ('culling', 'search_p99_ms'), -1),
     ('culling search max ms', ('culling', 'search_max_ms'), -1),

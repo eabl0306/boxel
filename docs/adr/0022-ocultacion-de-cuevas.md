@@ -94,6 +94,15 @@ que acaba de quedar a la vista podría aparecer un frame tarde. El radio de la c
 `ChunkViewer` de la cámara, o el del viewer más grande. Sin viewers no se oculta nada.
 `WorldSettings::cave_culling` (por defecto encendido) lo apaga.
 
+Tampoco se oculta nada si el ojo no ve desde espacio abierto (`eye_in_open`): si un vóxel a
+menos del alcance del plano cercano (`Camera::near_reach`, unos 0.17 vóxeles con la cámara por
+defecto) ocluye o no está cargado. La búsqueda supone que toda línea de vista empieza en un vóxel
+abierto. Con el ojo dentro de la roca (la cámara de vuelo no choca) o pegado a una pared, el
+render muestra lo que hay detrás: las caras entre dos cubos que ocluyen no se mallan y la pared
+cercana de una cueva mira hacia el otro lado. Minecraft hace lo mismo con la cámara dentro de un
+bloque. El conjunto anterior sigue valiendo cuando el ojo vuelve al espacio abierto, porque
+depende del chunk del ojo y no de su vóxel. `VisibilityStats::blocked` cuenta esos frames.
+
 ### 6. En el render, en los tres tiers
 
 - El renderer convierte el conjunto en un bit por slot. Lo rearma entero con un conjunto nuevo,
@@ -122,9 +131,10 @@ que acaba de quedar a la vista podría aparecer un frame tarde. El radio de la c
 ## Consecuencias
 
 - Bajo tierra a radio 16 se dibuja de 1.6 a 25 veces menos (38 a 96 % de las caras ocultas, 62 %
-  de media). En la 780M, vuelo 64 bajo tierra: de 270 a unos 2 300 fps, p99 de 9.3 a 3.4 ms y
-  0 frames de más de 6.94 ms. La bajada queda en 4 a 6 frames lentos por corrida, de GPU, en
-  cavernas grandes que sí se ven.
+  de media) para un ojo en espacio abierto. Las corridas con ventana bajo tierra (vuelo y bajada
+  de `stress`, de 270 a unos 2 300 fps) llevaban la cámara por dentro de la roca, donde parte de
+  lo oculto sí se veía. Con el ojo en la roca ya no se oculta nada, así que esos números no valen
+  y hay que medir de nuevo con la cámara en una cueva.
 - **La puerta del plan no se cumple en la superficie:** oculta solo 16 a 46 % de las caras
   subterráneas a radio 16 (16 % a radio 32). Es la fuga de los chunks de 32³: en un chunk de
   superficie, el aire del valle y una cueva tocan la misma cara, y el enlace por par de caras las
@@ -137,5 +147,7 @@ que acaba de quedar a la vista podría aparecer un frame tarde. El radio de la c
   azar, cerca del origen, en 2^31, 2^40 y el límite del mundo; rayos de vóxeles dentro del
   frustum, en cuevas, en la superficie y lejos del origen, solo cruzan chunks visibles; la
   reutilización nunca pierde un chunk que el render necesita; `gpu_cave_culling` da los mismos
-  píxeles con y sin culling en los tres tiers de cada adaptador, en 29 vistas y lejos del origen.
+  píxeles con y sin culling en los tres tiers de cada adaptador, en 29 vistas y lejos del origen,
+  y no oculta nada en 15 vistas con el ojo dentro de la roca o a 1/64 de una pared (sin la
+  guarda, esas vistas pierden píxeles en todos los tiers).
 - Mediciones en `docs/rendimiento/cuevas-fase4-2026-10.md`.

@@ -3,6 +3,14 @@
 Qué se midió: el cave culling del ADR 0022 en el overworld (`--world overworld`, cuevas `mc`),
 rama del worktree `agent-a0be44c1d5c42b309`, commit 9e3e682 para las corridas con tiempo.
 
+**Corrección posterior:** las corridas con ventana bajo tierra (vuelo y bajada) llevan la cámara
+en línea recta por dentro de la roca. Ahí el render ve a través de la roca, y el culling ocultaba
+cosas que sí estaban en pantalla. Ahora no se oculta nada mientras el ojo está en la roca (ADR
+0022, sección 5), así que los números con ventana bajo tierra de abajo ya no valen. Los conteos de
+`headless_world` sí: valen para un ojo en espacio abierto del mismo chunk, y la línea `cull:`
+dice ahora `open=no` cuando la cámara está en la roca. El resumen de `stress` cuenta los frames
+sin culling por eso.
+
 **La máquina estaba compartida con otro trabajo largo** (carga de 3.5 a 8). `tools/wait-idle.sh`
 dejó pasar todas las corridas (menos de 15 % de CPU ocupada en el momento de empezar), pero los
 tiempos son orientativos: el dueño los vuelve a medir con los comandos del final. Los conteos de

@@ -370,8 +370,8 @@ class OutputTest(unittest.TestCase):
         on = copy.deepcopy(SAMPLE)
         on['run']['cave_culling'] = 'on'
         on['culling'] = {'occluded': {'avg': 900.0}, 'visible_chunks': {'avg': 3000.0},
-                         'draws': {'avg': 2.0}, 'searches': 100, 'search_avg_ms': 0.1,
-                         'search_p99_ms': 0.2, 'search_max_ms': 0.3}
+                         'draws': {'avg': 2.0}, 'searches': 100, 'unculled_frames': 4,
+                         'search_avg_ms': 0.1, 'search_p99_ms': 0.2, 'search_max_ms': 0.3}
         off = copy.deepcopy(on)
         off['run']['cave_culling'] = 'off'
         self.assertEqual(br.title(on), br.title(SAMPLE))
@@ -385,6 +385,7 @@ class OutputTest(unittest.TestCase):
         self.assertIn('1-old.md -> 2-on.md', out)
         self.assertIn('cave culling none -> on', out)
         self.assertIn('| culling search avg ms | - | 0.10 | - |  |', out)
+        self.assertIn('| frames unculled (eye in rock) | - | 4 | - |  |', out)
 
     def test_compare_directories_keeps_packs_apart(self):
         # No pack field: the procedural textures ('none').

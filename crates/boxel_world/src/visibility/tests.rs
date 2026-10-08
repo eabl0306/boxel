@@ -406,8 +406,8 @@ fn small_moves_reuse_the_set_and_it_still_covers_the_view() {
                 * 0.9
                 * (r(33) + 0.5);
             let eye = start + step;
-            if ChunkPos::containing(boxel_voxel::BlockPos::from_world(eye))
-                != ChunkPos::containing(boxel_voxel::BlockPos::from_world(start))
+            if ChunkPos::containing(BlockPos::from_world(eye))
+                != ChunkPos::containing(BlockPos::from_world(start))
             {
                 continue;
             }
@@ -466,6 +466,53 @@ fn opened_links_search_at_once_and_closed_ones_wait() {
     assert!(!later.is_visible(behind));
 }
 
+#[test]
+fn the_eye_is_in_open_space_only_with_every_voxel_near_it_open() {
+    let origin = I64Vec3::new(-(1 << 40) + 16, 70, (1 << 35) - 3);
+    let eye = Vec3::new(0.5, 0.5, 0.5);
+    let stone = |rock: BlockPos| move |p: BlockPos| Some(p == rock);
+    let at = |d: I64Vec3| BlockPos::from_i64vec3(origin + d);
+    // Open all around, the default camera's reach (about 0.17).
+    assert!(eye_in_open(origin, eye, 0.17, |_| Some(false)));
+    // The eye inside a stone voxel.
+    assert!(!eye_in_open(origin, eye, 0.17, stone(at(I64Vec3::ZERO))));
+    // A wall 0.1 away, inside the reach: its face is cut by the near plane.
+    let near_wall = Vec3::new(0.9, 0.5, 0.5);
+    assert!(!eye_in_open(origin, near_wall, 0.17, stone(at(I64Vec3::X))));
+    // The same wall 0.3 away, outside it; and a diagonal neighbor out of reach.
+    assert!(eye_in_open(
+        origin,
+        Vec3::new(0.7, 0.5, 0.5),
+        0.17,
+        stone(at(I64Vec3::X))
+    ));
+    assert!(eye_in_open(
+        origin,
+        near_wall,
+        0.17,
+        stone(at(I64Vec3::new(1, 1, 0)))
+    ));
+    // Near a corner, all 8 voxels around it count.
+    let corner = Vec3::new(0.95, 0.03, 0.97);
+    assert!(!eye_in_open(
+        origin,
+        corner,
+        0.17,
+        stone(at(I64Vec3::new(1, -1, 1)))
+    ));
+    // An unknown voxel, an unbounded or invalid reach: no.
+    assert!(!eye_in_open(origin, eye, 0.17, |p| (p
+        != at(I64Vec3::ZERO))
+    .then_some(false)));
+    assert!(!eye_in_open(origin, eye, MAX_EYE_REACH, |_| Some(false)));
+    assert!(!eye_in_open(origin, eye, f32::NAN, |_| Some(false)));
+    // The world's state counts the frames it culls nothing in.
+    let mut vis = ChunkVisibility::default();
+    assert!(vis.eye_in_open(origin, eye, 0.17, |_| Some(false)));
+    assert!(!vis.eye_in_open(origin, eye, 0.17, stone(at(I64Vec3::ZERO))));
+    assert_eq!(vis.stats().blocked, 1);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
@@ -486,5 +533,36 @@ proptest! {
         };
         let set = visible_chunks(&view, links);
         prop_assert_eq!(offsets(&set, &view), brute_force(&view, &links));
+    }
+
+    #[test]
+    fn an_eye_in_open_space_has_only_open_voxels_within_reach(
+        seed in any::<u64>(),
+        eye in (0.0f32..1.0, 0.0f32..1.0, 0.0f32..1.0),
+        reach in 0.0f32..1.5,
+        far in any::<bool>(),
+    ) {
+        let origin = if far {
+            I64Vec3::new((1 << 31) - 1, -(1 << 40), 5)
+        } else {
+            I64Vec3::new(3, -2, 7)
+        };
+        // About one voxel in five occludes.
+        let occludes = |p: BlockPos| {
+            let d = p.as_i64vec3() - origin;
+            Some(hash(seed, IVec3::new(d.x as i32, d.y as i32, d.z as i32)).is_multiple_of(5))
+        };
+        let eye = Vec3::new(eye.0, eye.1, eye.2);
+        if eye_in_open(origin, eye, reach, occludes) {
+            // Points on spheres around the eye, out to the reach.
+            for i in 0..512u64 {
+                let h = hash(seed ^ i, IVec3::ZERO);
+                let unit = |k: u32| ((h >> k) & 0xffff) as f32 / 65535.0 * 2.0 - 1.0;
+                let dir = Vec3::new(unit(0), unit(16), unit(32)).normalize_or_zero();
+                let point = eye + dir * reach * ((h >> 48) as f32 / 65535.0);
+                let p = BlockPos::from_i64vec3(origin + point.floor().as_i64vec3());
+                prop_assert_eq!(occludes(p), Some(false), "{} from {}", point, eye);
+            }
+        }
     }
 }

@@ -40,6 +40,14 @@ impl Camera {
     pub fn projection(&self, aspect: f32) -> Mat4 {
         boxel_math::projection::perspective_infinite_reverse(self.fov_y_radians, aspect, self.near)
     }
+
+    /// Distance from the eye to the corners of the near plane's rectangle for `aspect` (width /
+    /// height): nothing nearer than the near plane is drawn, so every pixel shows what its view
+    /// ray meets past a point at most this far from the eye.
+    pub fn near_reach(&self, aspect: f32) -> f32 {
+        let t = (self.fov_y_radians * 0.5).tan();
+        self.near * (1.0 + t * t * (1.0 + aspect * aspect)).sqrt()
+    }
 }
 
 /// Camera-relative view for one frame. `render_origin` is the camera position floored to whole

@@ -1312,18 +1312,27 @@ fn extract(
 /// (ADR 0022), when the world has it on ([`WorldSettings::cave_culling`]). It runs here, with
 /// the exact camera and aspect `Prepare` renders with, so a chunk that just became visible is
 /// never drawn late. The searched box is the mesh region of the camera's own [`ChunkViewer`],
-/// or of the largest viewer; without viewers nothing is culled.
+/// or of the largest viewer; without viewers nothing is culled. Nothing is culled either while
+/// a voxel within the near plane's reach of the eye occludes or is not loaded
+/// ([`ChunkVisibility::eye_in_open`]): the renderer then shows what lies behind the rock.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a Bevy-style system: one parameter per resource it reads"
+)]
 fn extract_visibility(
     gpu: Res<GpuState>,
     mut frame: ResMut<ExtractedFrame>,
     settings: Option<Res<WorldSettings>>,
+    content: Option<Res<WorldContent>>,
     chunks: Option<Res<ChunkMap>>,
     visibility: Option<ResMut<ChunkVisibility>>,
     cameras: Query<(&Camera, Option<&ChunkViewer>)>,
     viewers: Query<&ChunkViewer>,
 ) {
     frame.visibility = None;
-    let (Some(settings), Some(map), Some(mut visibility)) = (settings, chunks, visibility) else {
+    let (Some(settings), Some(content), Some(map), Some(mut visibility)) =
+        (settings, content, chunks, visibility)
+    else {
         return;
     };
     if !settings.cave_culling {
@@ -1348,6 +1357,16 @@ fn extract_visibility(
     // The aspect `prepare` uses: the same view, so the same frustum.
     let aspect = ready.config.width.max(1) as f32 / ready.config.height.max(1) as f32;
     let view = CameraView::compute(&camera, &transform, aspect);
+    let registry = &content.registry;
+    let open = visibility.eye_in_open(
+        view.render_origin,
+        view.eye_rel,
+        camera.near_reach(aspect),
+        |p| map.block_at(p).map(|state| registry.occludes(state)),
+    );
+    if !open {
+        return;
+    }
     let search = VisibilityView::new(
         view.render_origin,
         Some(view.frustum),

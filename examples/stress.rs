@@ -689,6 +689,8 @@ struct Recorder {
     last_presented: u64,
     /// Cave culling searches run so far (`VisibilityStats::searches`).
     last_searches: u64,
+    /// Frames cave culling skipped for the eye so far (`VisibilityStats::blocked`).
+    last_blocked: u64,
     /// Quads of every mesh sent to the renderer and not removed.
     resident: HashMap<ChunkId, u32>,
     quads: u64,
@@ -709,6 +711,7 @@ impl Recorder {
             last_stats: WorldStats::default(),
             last_presented: 0,
             last_searches: 0,
+            last_blocked: 0,
             resident: HashMap::with_capacity(slots),
             quads: 0,
             pending: None,
@@ -814,6 +817,7 @@ fn record(
             visible_chunks: info.visible_chunks,
             occluded: info.occluded_chunks,
             search: (search.searches > rec.last_searches).then_some(search.last_search),
+            unculled: search.blocked > rec.last_blocked,
         };
         rec.log.push(record);
         if let Some(spans) = spans.as_deref_mut() {
@@ -831,6 +835,7 @@ fn record(
     rec.last_stats = now;
     rec.last_presented = info.frames_presented;
     rec.last_searches = search.searches;
+    rec.last_blocked = search.blocked;
 }
 
 /// `Update`, before the world computes interest: phases, the camera script and the exit.

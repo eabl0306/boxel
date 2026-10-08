@@ -36,7 +36,7 @@
 //!   once. A link that closes (a chunk whose mesh just settled, which happens every frame while
 //!   the world streams) can only hide more: it waits up to [`TIGHTEN_DELAY`] for the next search.
 use boxel_math::{Frustum, I64Vec3, Vec3};
-use boxel_voxel::{ALL_LINKS, CHUNK_SHIFT, ChunkFaceInfo, ChunkPos, Face};
+use boxel_voxel::{ALL_LINKS, BlockPos, CHUNK_SHIFT, ChunkFaceInfo, ChunkPos, Face};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -165,6 +165,9 @@ pub struct VisibilityStats {
     /// Positions read from the map by the last grid refresh (0 when the camera stayed in its
     /// chunk; the whole box after a jump).
     pub refilled: usize,
+    /// Frames culled nothing because the eye did not see from open space
+    /// ([`ChunkVisibility::eye_in_open`]).
+    pub blocked: u64,
 }
 
 /// Bits of the search state of a cell.
@@ -460,6 +463,49 @@ fn view_box(view: &VisibilityView) -> (ChunkPos, [i64; 3]) {
     )
 }
 
+/// Largest near-plane reach (voxels) [`eye_in_open`] looks around: past it, it says no.
+pub const MAX_EYE_REACH: f32 = 4.0;
+
+/// Slack added to the reach of [`eye_in_open`], against rounding.
+const EYE_SLACK: f32 = 1.0 / 64.0;
+
+/// True if the eye at `render_origin + eye_rel` sees from open space: every voxel within `reach`
+/// of it (the camera's near-plane reach, `boxel_camera::Camera::near_reach`) is known and does
+/// not occlude (`occludes` gives `None` for an unknown voxel). The search is only sound then, so
+/// the renderer culls nothing on a frame where this is false.
+///
+/// The search follows lines of sight that start in an open voxel and walk open voxels. The
+/// renderer draws nothing nearer than the near plane, so a pixel's view ray really starts on it,
+/// up to `reach` from the eye. Inside an occluding cube, that ray crosses the rock unseen (faces
+/// between two occluding cubes are not meshed, and the near wall of a cave faces away) and shows
+/// the far walls of caves the search does not reach: with a camera that flies through rock, or
+/// one less than the near plane from a wall it looks at. Minecraft turns its culling off for a
+/// camera inside a solid block for the same reason.
+pub fn eye_in_open(
+    render_origin: I64Vec3,
+    eye_rel: Vec3,
+    reach: f32,
+    occludes: impl Fn(BlockPos) -> Option<bool>,
+) -> bool {
+    if reach.is_nan() || reach >= MAX_EYE_REACH {
+        return false;
+    }
+    let r = reach.max(0.0) + EYE_SLACK;
+    let lo = (eye_rel - Vec3::splat(r)).floor().as_i64vec3();
+    let hi = (eye_rel + Vec3::splat(r)).floor().as_i64vec3();
+    for y in lo.y..=hi.y {
+        for z in lo.z..=hi.z {
+            for x in lo.x..=hi.x {
+                let p = BlockPos::from_i64vec3(render_origin.saturating_add(I64Vec3::new(x, y, z)));
+                if occludes(p) != Some(false) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// One search from scratch with the frustum pushed out by `slack` voxels (tests).
 #[cfg(test)]
 fn visible_chunks_with_slack(
@@ -565,6 +611,22 @@ impl ChunkVisibility {
         self.stats.box_chunks = set.box_len();
         self.stats.refilled = refilled;
         set
+    }
+
+    /// [`eye_in_open`] for this frame's eye, counting the frames where it is false
+    /// ([`VisibilityStats::blocked`]): the renderer must cull nothing then. The last set stays
+    /// valid for later frames whose eye is back in open space (a set depends on the eye's
+    /// chunk, not on its voxel).
+    pub fn eye_in_open(
+        &mut self,
+        render_origin: I64Vec3,
+        eye_rel: Vec3,
+        reach: f32,
+        occludes: impl Fn(BlockPos) -> Option<bool>,
+    ) -> bool {
+        let open = eye_in_open(render_origin, eye_rel, reach, occludes);
+        self.stats.blocked += u64::from(!open);
+        open
     }
 
     /// The result of the last search, if any.

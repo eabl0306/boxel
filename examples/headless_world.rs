@@ -20,9 +20,11 @@
 //! every face counts as lit (a worst case for `lit-only`).
 //! With `--cull`, three more lines describe cave culling (ADR 0022) for a camera at the viewer
 //! (`--camera` sets where it is and where it looks; view distance = radius x 32, 16:9):
-//! `cull: eye=X,Y,Z yaw=D pitch=D box=N reached=N fresh_ms=X search_ms=X`, the visibility search
-//! (the box around the camera, the chunks it reached, a search that also fills the grid, and one
-//! with the grid already filled, as in a frame where the camera turned); `draws: off chunks=N
+//! `cull: eye=X,Y,Z yaw=D pitch=D open=yes|no box=N reached=N fresh_ms=X search_ms=X`, the
+//! visibility search (whether the eye sees from open space: with `no`, inside rock or nearer a
+//! wall than the near plane, the renderer culls nothing; the box around the camera, the chunks it
+//! reached, a search that also fills the grid, and one with the grid already filled, as in a
+//! frame where the camera turned); `draws: off chunks=N
 //! buckets=N quads=N on chunks=N buckets=N quads=N hidden: chunks=P% buckets=P% quads=P%`, what
 //! every tier draws without and with cave culling (`boxel_render::cull_counts`: frustum, per-face
 //! bucket test; a bucket is one draw call on Mid and Low); and, in the overworld, `underground:
@@ -56,8 +58,10 @@ use boxel::prelude::*;
 use boxel::render::{DEFAULT_SKY_COLOR, ViewParams, cull_counts};
 use boxel::voxel::{CHUNK_SIZE, MAX_BLOCK_COORD, MAX_CHUNK_COORD};
 use boxel::world::DataState;
-use boxel::world::visibility::visible_chunks;
-use boxel::world::{ChunkVisibility, SkyMap, VisibilityView, WorldStats, WorldSystems};
+use boxel::world::visibility::{eye_in_open, visible_chunks};
+use boxel::world::{
+    ChunkVisibility, SkyMap, VisibilityView, WorldContent, WorldStats, WorldSystems,
+};
 use boxel::worldgen::OverworldGenerator;
 use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
@@ -462,7 +466,13 @@ fn missing_around(
 
 /// The `--cull` lines: the visibility search from the camera, and what every tier draws without
 /// and with cave culling (and, in the overworld, for the chunks under the surface).
-fn cull_lines(o: &Options, map: &ChunkMap, transform: &Transform, viewer: ChunkViewer) -> String {
+fn cull_lines(
+    o: &Options,
+    map: &ChunkMap,
+    registry: &BlockRegistry,
+    transform: &Transform,
+    viewer: ChunkViewer,
+) -> String {
     let [_, _, _, yaw, pitch] = o.camera.unwrap_or([0.0, 0.0, 0.0, -90.0, 0.0]);
     let camera = Camera {
         view_distance: viewer.radius as f32 * 32.0,
@@ -478,6 +488,12 @@ fn cull_lines(o: &Options, map: &ChunkMap, transform: &Transform, viewer: ChunkV
     };
     let cv = look(yaw);
     let view = ViewParams::from_camera(&cv, &camera, DEFAULT_SKY_COLOR, 0.6);
+    let open = eye_in_open(
+        cv.render_origin,
+        cv.eye_rel,
+        camera.near_reach(16.0 / 9.0),
+        |p| map.block_at(p).map(|s| registry.occludes(s)),
+    );
     let search_view = |cv: &CameraView| {
         VisibilityView::new(
             cv.render_origin,
@@ -521,12 +537,13 @@ fn cull_lines(o: &Options, map: &ChunkMap, transform: &Transform, viewer: ChunkV
     };
     let eye = transform.translation;
     let mut out = format!(
-        "cull: eye={},{},{} yaw={yaw} pitch={pitch} box={} reached={} fresh_ms={:.3} \
+        "cull: eye={},{},{} yaw={yaw} pitch={pitch} open={} box={} reached={} fresh_ms={:.3} \
          search_ms={:.3}\ndraws: off chunks={} buckets={} quads={} on chunks={} buckets={} \
          quads={} hidden: chunks={:.1}% buckets={:.1}% quads={:.1}%",
         eye.x,
         eye.y,
         eye.z,
+        if open { "yes" } else { "no" },
         set.box_len(),
         set.visible_count(),
         fresh.as_secs_f64() * 1e3,
@@ -693,6 +710,7 @@ fn drive(
     map: Res<ChunkMap>,
     sky: Res<SkyMap>,
     settings: Res<WorldSettings>,
+    content: Res<WorldContent>,
     frames: Res<FrameStats>,
     viewers: Query<(&Transform, &ChunkViewer)>,
     mut exit: MessageWriter<AppExit>,
@@ -729,7 +747,10 @@ fn drive(
             if run.options.cull
                 && let Some((transform, viewer)) = viewers.iter().next()
             {
-                println!("{}", cull_lines(&run.options, &map, transform, *viewer));
+                println!(
+                    "{}",
+                    cull_lines(&run.options, &map, &content.registry, transform, *viewer)
+                );
             }
             run.next_phase(Phase::Loading, now, x, &mut exit);
         }

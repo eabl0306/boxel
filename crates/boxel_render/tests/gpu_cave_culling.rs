@@ -9,11 +9,14 @@
 //!
 //! For every adapter (filtered by `WGPU_BACKEND` / `WGPU_ADAPTER_NAME`) and every tier it can
 //! run, every view is rendered without cave culling and with the visible set of a search from
-//! its camera ([`visible_chunks`]): the two images must be identical, pixel for pixel. The views
-//! cover the surface, the inside of caves, eyes a hair from chunk borders, edges and corners,
-//! and looks through water and through glass. The scene, the views and the links are then moved
-//! far from the origin (the former `i32` edge, `2^40` voxels) and every image with culling must
-//! equal the one near the origin. Most views must hide chunks, or the test would prove nothing.
+//! its camera ([`visible_chunks`]), or none when the eye does not see from open space
+//! ([`eye_in_open`], as the render plugin): the two images must be identical, pixel for pixel.
+//! The views cover the surface, the inside of caves, eyes a hair from chunk borders, edges and
+//! corners, looks through water and through glass, and eyes that see through rock (inside a
+//! stone voxel, and nearer a stone wall than the near plane: those must not be culled at all).
+//! The scene, the views and the links are then moved far from the origin (the former `i32`
+//! edge, `2^40` voxels) and every image with culling must equal the one near the origin. Most
+//! culled views must hide chunks, or the test would prove nothing.
 //!
 //! Failing images are saved under `CARGO_TARGET_TMPDIR/gpu_cave_culling/`.
 #![expect(clippy::print_stderr, reason = "test progress and failure details")]
@@ -31,7 +34,7 @@ use boxel_voxel::{
     ChunkKey, ChunkPos, LocalPos, NEIGHBOR_OFFSETS,
 };
 use boxel_world::VisibilityView;
-use boxel_world::visibility::visible_chunks;
+use boxel_world::visibility::{eye_in_open, visible_chunks};
 use boxel_worldgen::{OverworldGenerator, WorldGenerator};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -159,6 +162,9 @@ impl Scene {
     }
     fn open(&self, p: BlockPos) -> bool {
         self.block(p) == Some(BlockState::AIR)
+    }
+    fn occludes(&self, p: BlockPos) -> Option<bool> {
+        self.block(p).map(|s| self.registry.occludes(s))
     }
 }
 
@@ -346,9 +352,69 @@ fn views(scene: &Scene) -> Vec<View> {
             });
         }
     }
+    out.extend(rock_views(scene));
     for v in &mut out {
         v.eye = DVec3::new(snap(v.eye.x), snap(v.eye.y), snap(v.eye.z));
     }
+    out
+}
+
+/// Views where the renderer sees through rock: the eye inside a stone voxel (a camera that
+/// flies through the ground), and in an open voxel a hair from a stone wall it looks at, closer
+/// than the near plane (0.1). Faces between two stone voxels are not meshed and the near walls
+/// of caves face away, so the far walls of caves behind the rock show. Cave culling must not
+/// hide them.
+fn rock_views(scene: &Scene) -> Vec<View> {
+    let generator = OverworldGenerator::default();
+    let deep = |p: BlockPos| (p.y as f64) < generator.height_at(p.x, p.z) as f64 - 20.0;
+    let mut out = Vec::new();
+    let in_rock = (-80i64..-20)
+        .step_by(9)
+        .flat_map(|y| {
+            (-80i64..80)
+                .step_by(23)
+                .map(move |x| BlockPos::new(x, y, -x / 3))
+        })
+        .filter(|&p| deep(p) && scene.block(p).is_some_and(|s| scene.registry.occludes(s)))
+        .take(3);
+    for (i, p) in in_rock.enumerate() {
+        for (j, (yaw, pitch)) in [(20.0, -15.0), (160.0, 10.0), (275.0, -40.0)]
+            .iter()
+            .enumerate()
+        {
+            out.push(View {
+                name: format!("in_rock{i}_{j}"),
+                eye: p.as_i64vec3().as_dvec3() + DVec3::new(0.5, 0.421_875, 0.5),
+                yaw: *yaw,
+                pitch: *pitch,
+            });
+        }
+    }
+    // Open voxels with stone on their -x side: the eye 1/64 from that face, looking at it.
+    let at_wall = (-80i64..-20)
+        .step_by(7)
+        .flat_map(|y| (-80i64..80).step_by(17).map(move |z| (y, z)))
+        .flat_map(|(y, z)| (-80i64..80).map(move |x| BlockPos::new(x, y, z)))
+        .filter(|&p| {
+            deep(p)
+                && scene.open(p)
+                && scene
+                    .block(BlockPos::new(p.x - 1, p.y, p.z))
+                    .is_some_and(|s| scene.registry.occludes(s))
+        })
+        .step_by(5)
+        .take(3);
+    for (i, p) in at_wall.enumerate() {
+        for (j, (yaw, pitch)) in [(90.0, 0.0), (70.0, -20.0)].iter().enumerate() {
+            out.push(View {
+                name: format!("at_wall{i}_{j}"),
+                eye: p.as_i64vec3().as_dvec3() + DVec3::new(1.0 / 64.0, 0.5, 0.5),
+                yaw: *yaw,
+                pitch: *pitch,
+            });
+        }
+    }
+    assert!(out.len() >= 13, "too few rock views: {}", out.len());
     out
 }
 
@@ -391,6 +457,8 @@ struct Rendered {
     culled: RgbaImage,
     hidden: u32,
     occluded: usize,
+    /// The eye saw from open space ([`eye_in_open`]): the frame was culled.
+    open: bool,
 }
 
 fn render_tier(
@@ -437,19 +505,26 @@ fn render_tier(
         renderer.set_visibility(None);
         render(&device, &queue, &mut renderer, &params)?; // warm-up (translucent sort)
         let plain = render(&device, &queue, &mut renderer, &params)?;
+        // As the render plugin: no culling unless the eye sees from open space.
+        let reach = Camera::default().near_reach(WIDTH as f32 / HEIGHT as f32);
+        let open = eye_in_open(cv.render_origin, cv.eye_rel, reach, |p| {
+            scene.occludes(BlockPos::from_i64vec3(p.as_i64vec3() - shift))
+        });
         let search = VisibilityView::new(cv.render_origin, Some(cv.frustum), 8, 8);
-        let set = visible_chunks(&search, links);
-        let occluded = scene
-            .meshes
-            .iter()
-            .filter(|(pos, _)| {
-                let shifted = ChunkPos::from_i64vec3(pos.as_i64vec3() + chunk_shift);
-                let min = ((shifted.as_i64vec3() << CHUNK_SHIFT) - cv.render_origin).as_vec3();
-                let aabb = Aabb::new(min, min + Vec3::splat(32.0));
-                cv.frustum.intersects_aabb(&aabb) && !set.is_visible(shifted)
-            })
-            .count();
-        renderer.set_visibility(Some(Arc::new(set)));
+        let set = open.then(|| visible_chunks(&search, links));
+        let occluded = set.as_ref().map_or(0, |set| {
+            scene
+                .meshes
+                .iter()
+                .filter(|(pos, _)| {
+                    let shifted = ChunkPos::from_i64vec3(pos.as_i64vec3() + chunk_shift);
+                    let min = ((shifted.as_i64vec3() << CHUNK_SHIFT) - cv.render_origin).as_vec3();
+                    let aabb = Aabb::new(min, min + Vec3::splat(32.0));
+                    cv.frustum.intersects_aabb(&aabb) && !set.is_visible(shifted)
+                })
+                .count()
+        });
+        renderer.set_visibility(set.map(Arc::new));
         let culled = render(&device, &queue, &mut renderer, &params)?;
         let hidden = renderer.stats().occluded_chunks;
         out.push(Rendered {
@@ -457,6 +532,7 @@ fn render_tier(
             culled,
             hidden,
             occluded,
+            open,
         });
     }
     let errors = errors.lock().map(|e| e.clone()).unwrap_or_default();
@@ -526,9 +602,22 @@ fn cave_culling_changes_no_pixel() {
                 }
             };
             rendered += 1;
-            let mut hidden_views = 0;
+            let (mut hidden_views, mut culled_views) = (0, 0);
             for (view, r) in views.iter().zip(&near) {
                 let name = format!("{label}_{tier}_{}", view.name);
+                if view.name.starts_with("in_rock") || view.name.starts_with("at_wall") {
+                    // Without the guard these views lose pixels on every tier. With it they are
+                    // drawn twice with the same input; High on llvmpipe orders its draws
+                    // differently from one frame to the next, which shows on a few pixels where
+                    // the near plane cuts faces, so the images are not compared.
+                    if r.open || r.hidden != 0 {
+                        report.failures.push(format!(
+                            "{label} {tier} {}: culled although the eye sees through rock",
+                            view.name
+                        ));
+                    }
+                    continue;
+                }
                 report.identical(
                     &format!(
                         "{label} {tier} {}: with and without cave culling",
@@ -538,16 +627,17 @@ fn cave_culling_changes_no_pixel() {
                     (&format!("{name}_culled"), &r.culled),
                 );
                 hidden_views += usize::from(r.occluded > 0);
+                culled_views += usize::from(r.open);
             }
             let hidden: Vec<(u32, usize)> = near.iter().map(|r| (r.hidden, r.occluded)).collect();
             eprintln!(
                 "gpu_cave_culling: {label} {tier}: chunks hidden per view (all, in the frustum) \
                  {hidden:?}"
             );
-            if hidden_views < views.len() / 2 {
+            if hidden_views < culled_views / 2 {
                 report.failures.push(format!(
-                    "{label} {tier}: only {hidden_views} of {} views hid a chunk in the frustum",
-                    views.len()
+                    "{label} {tier}: only {hidden_views} of {culled_views} culled views hid a \
+                     chunk in the frustum"
                 ));
             }
             for shift in FAR_SHIFTS {
@@ -562,6 +652,15 @@ fn cave_culling_changes_no_pixel() {
                 };
                 for ((view, n), f) in views.iter().zip(&near).zip(&far) {
                     let name = format!("{label}_{tier}_{}", view.name);
+                    if f.open != n.open {
+                        report.failures.push(format!(
+                            "{label} {tier} {} shift {shift}: open {} at the origin, {}",
+                            view.name, n.open, f.open
+                        ));
+                    }
+                    if !n.open {
+                        continue;
+                    }
                     report.identical(
                         &format!(
                             "{label} {tier} {} shift {shift}: culled vs origin",
