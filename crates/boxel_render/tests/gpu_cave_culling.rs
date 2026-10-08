@@ -19,9 +19,10 @@
 //! culled views must hide chunks, or the test would prove nothing.
 //!
 //! A second scene comes from the world itself (`WorldPlugin`, jobs run when the test says): the
-//! meshes it publishes go to the renderer as the render plugin sends them, and the set is the one
-//! the plugin would search, while chunks are not drawn as their blocks are (no mesh yet, or the
-//! meshes of an edit published apart).
+//! meshes it publishes go to the renderer as the render plugin sends them, and the set is the
+//! plugin's own (`boxel_render::frame_visibility`), while chunks are not drawn as their blocks are
+//! (no mesh yet, the meshes of an edit published apart, a renderer resync while a chunk is
+//! remeshed).
 //!
 //! Failing images are saved under `CARGO_TARGET_TMPDIR/gpu_cave_culling/`.
 #![expect(clippy::print_stderr, reason = "test progress and failure details")]
@@ -41,8 +42,8 @@ use boxel_voxel::{
 };
 use boxel_world::visibility::{XRAY, eye_in_open, visible_chunks};
 use boxel_world::{
-    ChunkMap, ChunkMeshEvent, ChunkViewer, ChunkVisibility, EditQueue, VisibilityView, VisibleSet,
-    WorldPlugin, WorldSettings, WorldStats,
+    ChunkMap, ChunkMeshEvent, ChunkMeshResync, ChunkSlot, ChunkViewer, ChunkVisibility, EditQueue,
+    VisibilityView, VisibleSet, WorldPlugin, WorldSettings, WorldStats,
 };
 use boxel_worldgen::{OverworldGenerator, WorldGenerator};
 use std::collections::HashMap;
@@ -430,12 +431,16 @@ fn rock_views(scene: &Scene) -> Vec<View> {
 
 // ---------------------------------------------------------------- rendering
 
-fn view_params(view: &View, shift: I64Vec3) -> (ViewParams, CameraView) {
-    let transform = Transform::from_yaw_pitch(
+fn view_transform(view: &View, shift: I64Vec3) -> Transform {
+    Transform::from_yaw_pitch(
         view.eye + shift.as_dvec3(),
         view.yaw.to_radians(),
         view.pitch.to_radians(),
-    );
+    )
+}
+
+fn view_params(view: &View, shift: I64Vec3) -> (ViewParams, CameraView) {
+    let transform = view_transform(view, shift);
     let camera = Camera::default();
     let cv = CameraView::compute(&camera, &transform, WIDTH as f32 / HEIGHT as f32);
     (
@@ -982,12 +987,15 @@ impl boxel_world::jobs::JobExecutor for Steps {
 }
 
 /// One state of the world to draw: the mesh events since the previous one, the set the render
-/// plugin would use (`None`: the eye does not see from open space), a fresh search (that set
-/// once the links that closed are searched again, after `TIGHTEN_DELAY`) and the set of a search
-/// that does not see through chunks the renderer does not show as they are (no `XRAY`).
+/// plugin uses (`None`: it culls nothing), a fresh search (that set once the links that closed
+/// are searched again, after `TIGHTEN_DELAY`; on a resync frame, the set without the plugin's
+/// resync guard) and the set of a search that does not see through chunks the renderer does not
+/// show as they are (no `XRAY`).
 struct WorldFrame {
     /// The first state of a world (the renderer starts empty).
     first: bool,
+    /// A renderer resync: the renderer drops every chunk, then `events` are every settled mesh.
+    resync: bool,
     label: String,
     events: Vec<ChunkMeshEvent>,
     set: Option<Arc<VisibleSet>>,
@@ -1068,25 +1076,55 @@ impl TunnelWorld {
         panic!("tunnel world not settled");
     }
 
-    /// Records the current state, as the render plugin would cull it this frame.
+    /// Records the current state, as the render plugin culls it this frame.
     fn record(&mut self, label: String) {
-        let (_, cv) = view_params(&tunnel_view(), I64Vec3::ZERO);
+        self.record_frame(label, false);
+    }
+
+    /// A renderer resync frame, as the render plugin runs it: the mesh events of the frame are
+    /// dropped, the renderer drops every chunk and gets every settled mesh
+    /// (`ChunkMap::ready_meshes`), and the world hears of it next frame (`ChunkMeshResync`).
+    fn resync(&mut self, label: String) {
+        let map = self.app.world().resource::<ChunkMap>();
+        self.pending = map
+            .ready_meshes()
+            .map(|(id, key, mesh)| ChunkMeshEvent::Upsert {
+                id,
+                key,
+                mesh: Arc::clone(mesh),
+            })
+            .collect();
+        self.record_frame(label, true);
+        self.app.world_mut().write_message(ChunkMeshResync);
+    }
+
+    fn record_frame(&mut self, label: String, resync: bool) {
+        let tunnel = tunnel_view();
+        let (_, cv) = view_params(&tunnel, I64Vec3::ZERO);
         let view = VisibilityView::new(cv.render_origin, Some(cv.frustum), self.radius, 1);
-        let reach = Camera::default().near_reach(WIDTH as f32 / HEIGHT as f32);
+        let transform = view_transform(&tunnel, I64Vec3::ZERO);
+        let viewer = ChunkViewer::new(self.radius).with_vertical_radius(1);
         let registry = &self.registry;
         let world = self.app.world_mut();
         let set = world.resource_scope(|world, mut vis: boxel_ecs::world::Mut<ChunkVisibility>| {
             let map = world.resource::<ChunkMap>();
-            let open = vis.eye_in_open(cv.render_origin, cv.eye_rel, reach, |p| {
-                map.block_at(p).map(|s| registry.occludes(s))
-            });
-            open.then(|| vis.update(&view, |p| map.visibility_links_at(p)))
+            boxel_render::frame_visibility(
+                resync,
+                registry,
+                map,
+                &mut vis,
+                &Camera::default(),
+                &transform,
+                viewer,
+                WIDTH as f32 / HEIGHT as f32,
+            )
         });
         let map = self.app.world().resource::<ChunkMap>();
         let fresh = visible_chunks(&view, |p| map.visibility_links_at(p));
         let without_xray = visible_chunks(&view, |p| map.visibility_links_at(p) & !XRAY);
         self.frames.push(WorldFrame {
             first: self.frames.is_empty(),
+            resync,
             label,
             events: std::mem::take(&mut self.pending),
             set,
@@ -1108,8 +1146,11 @@ fn tunnel_view() -> View {
 /// The recorded states of the tunnel world: two viewers with a chunk between them that has data
 /// and no mesh (the tunnel ends in it); the meshes of an edit batch published apart, the newest
 /// job first (the tunnel's last voxel layer closed: the chunk past it loses its end wall before
-/// the edited chunk shows the new one); and the world streaming in with its jobs run in a
-/// scrambled order (recorded when meshes were published or the set changed).
+/// the edited chunk shows the new one); a renderer resync while the chunk of the tunnel's end
+/// wall is remeshed for a change that keeps what occludes (a lamp in the wall: the map still
+/// shows the chunk and trusts its links, but the renderer gets only the settled meshes); and the
+/// world streaming in with its jobs run in a scrambled order (recorded when meshes were
+/// published or the set changed).
 fn tunnel_frames() -> Vec<WorldFrame> {
     let mut out = Vec::new();
     // A box that reaches the pocket from the eye.
@@ -1150,6 +1191,47 @@ fn tunnel_frames() -> Vec<WorldFrame> {
     }
     out.extend(batch.frames);
 
+    let mut resync = TunnelWorld::new(95, Duration::ZERO, &[(TUNNEL_EYE, 5)], 5);
+    resync.settle();
+    resync.record("resync settled".into());
+    let lamp = resync.registry.by_name("boxel:lamp_white").expect("lamp");
+    assert!(
+        resync.registry.occludes(lamp),
+        "the lamp must occlude like stone"
+    );
+    // The middle of the end wall, in chunk (3, 0, 0).
+    resync
+        .app
+        .world_mut()
+        .resource_mut::<EditQueue>()
+        .set_block(BlockPos::new(96, 16, 16), lamp);
+    resync.update();
+    {
+        let map = resync.app.world().resource::<ChunkMap>();
+        let wall = map.id_at(ChunkPos::new(3, 0, 0)).expect("wall chunk");
+        assert!(
+            map.get(wall).is_some_and(ChunkSlot::shown),
+            "a remesh that keeps what occludes keeps the wall chunk shown"
+        );
+        assert!(
+            map.ready_meshes().all(|(id, _, _)| id != wall),
+            "the wall chunk is being remeshed"
+        );
+    }
+    resync.resync("resync frame".into());
+    // The world hears of the resync: the chunks being remeshed are no longer shown.
+    resync.update();
+    resync.record("resync next".into());
+    let mut step = 0;
+    while !resync.settled() {
+        resync.steps.run(None);
+        resync.update();
+        resync.record(format!("resync step {step}"));
+        step += 1;
+        assert!(step < 100, "resync world not settled");
+    }
+    out.extend(resync.frames);
+
     let mut stream = TunnelWorld::new(80, Duration::ZERO, &[(TUNNEL_EYE, 5)], 5);
     let mut rng = 0x9e37_79b9_7f4a_7c15u64;
     let mut last: Option<Arc<VisibleSet>> = None;
@@ -1185,12 +1267,14 @@ fn tunnel_frames() -> Vec<WorldFrame> {
 }
 
 /// The images of one recorded state: without culling, with the culling sets that apply (the
-/// render plugin's and a fresh search's, named) and with the set without `XRAY` (when it differs
-/// from the fresh one).
+/// render plugin's and a fresh search's, named), with the set without `XRAY` (when it differs
+/// from the fresh one) and, on a resync frame, with the fresh search the plugin would use
+/// without its resync guard.
 struct WorldImages {
     plain: RgbaImage,
     culled: Vec<(&'static str, RgbaImage)>,
     without_xray: Option<RgbaImage>,
+    unguarded: Option<RgbaImage>,
 }
 
 /// Renders every recorded state of the tunnel world with the meshes the world published.
@@ -1220,7 +1304,7 @@ fn render_world_frames(
     let (params, _) = view_params(&tunnel_view(), I64Vec3::ZERO);
     let mut out = Vec::new();
     for frame in frames {
-        if frame.first {
+        if frame.first || frame.resync {
             renderer.clear_chunks();
         }
         for event in &frame.events {
@@ -1243,6 +1327,11 @@ fn render_world_frames(
         let plain = render(&device, &queue, &mut renderer, &params)?;
         let mut culled = Vec::new();
         let mut without_xray = None;
+        let mut unguarded = None;
+        if frame.resync {
+            renderer.set_visibility(Some(Arc::new(frame.fresh.clone())));
+            unguarded = Some(render(&device, &queue, &mut renderer, &params)?);
+        }
         if let Some(set) = &frame.set {
             renderer.set_visibility(Some(Arc::clone(set)));
             culled.push(("culled", render(&device, &queue, &mut renderer, &params)?));
@@ -1259,6 +1348,7 @@ fn render_world_frames(
             plain,
             culled,
             without_xray,
+            unguarded,
         });
     }
     let errors = errors.lock().map(|e| e.clone()).unwrap_or_default();
@@ -1270,10 +1360,12 @@ fn render_world_frames(
 
 /// The render plugin's culling over the meshes the world really published, while some are
 /// missing or stale: a chunk with data and no mesh between the eye and drawn chunks, the meshes
-/// of an edit batch published apart, and a world streaming in. Where a chunk is not drawn as its
-/// blocks are, the rock around it shows the far wall of a pocket the face links do not reach.
-/// With the world's links (`XRAY` on such chunks) no pixel changes on any tier; a search that
-/// only opens them loses pixels (the test proves something).
+/// of an edit batch published apart, a renderer resync while a chunk is remeshed, and a world
+/// streaming in. Where a chunk is not drawn as its blocks are, the rock around it shows the far
+/// wall of a pocket the face links do not reach. With the world's links (`XRAY` on such chunks)
+/// and the plugin's set (nothing culled on the resync frame) no pixel changes on any tier; a
+/// search that only opens them, or one on the resync frame, loses pixels (the test proves
+/// something).
 #[test]
 fn chunks_not_drawn_as_they_are_hide_nothing() {
     let (_instance, adapters) = adapters();
@@ -1301,7 +1393,7 @@ fn chunks_not_drawn_as_they_are_hide_nothing() {
                 }
             };
             rendered += 1;
-            let (mut culled, mut lost) = (0, 0);
+            let (mut culled, mut lost, mut unguarded_lost) = (0, 0, 0);
             for (frame, images) in frames.iter().zip(&images) {
                 let name = format!("{label}_{tier}_{}", frame.label);
                 culled += usize::from(!images.culled.is_empty());
@@ -1318,14 +1410,24 @@ fn chunks_not_drawn_as_they_are_hide_nothing() {
                 if let Some(without) = &images.without_xray {
                     lost += usize::from(images.plain.compare(without, 0).differing_pixels > 0);
                 }
+                if let Some(unguarded) = &images.unguarded {
+                    unguarded_lost +=
+                        usize::from(images.plain.compare(unguarded, 0).differing_pixels > 0);
+                }
             }
             eprintln!(
                 "gpu_cave_culling: {label} {tier}: {culled} culled tunnel states, {lost} lose \
-                 pixels without XRAY"
+                 pixels without XRAY, {unguarded_lost} culling on the resync frame"
             );
             if lost == 0 {
                 report.failures.push(format!(
                     "{label} {tier}: no tunnel state loses pixels without XRAY (the test proves \
+                     nothing)"
+                ));
+            }
+            if unguarded_lost == 0 {
+                report.failures.push(format!(
+                    "{label} {tier}: culling on the resync frame loses no pixel (the test proves \
                      nothing)"
                 ));
             }

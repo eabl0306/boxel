@@ -55,6 +55,8 @@ pub use pack_textures::{
     load_block_textures,
 };
 pub use path::{CullCounts, cull_counts};
+#[doc(hidden)]
+pub use plugin::frame_visibility;
 pub use plugin::{
     DebugDestroyDevice, GpuFailed, GpuReady, PresentSettings, Render, RenderInfo, RenderPlugin,
     RenderSettings, RenderSystems, RequestScreenshot, ScreenshotSaved, SurfaceInfo,

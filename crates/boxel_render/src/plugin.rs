@@ -1318,13 +1318,11 @@ fn extract(
 /// (ADR 0022), when the world has it on ([`WorldSettings::cave_culling`]). It runs here, with
 /// the exact camera and aspect `Prepare` renders with, so a chunk that just became visible is
 /// never drawn late. The searched box is the mesh region of the camera's own [`ChunkViewer`],
-/// or of the largest viewer; without viewers nothing is culled. Nothing is culled either while
-/// a voxel within the near plane's reach of the eye occludes or is not loaded
-/// ([`ChunkVisibility::eye_in_open`]): the renderer then shows what lies behind the rock.
+/// or of the largest viewer; without viewers nothing is culled. The set is
+/// [`frame_visibility`]'s.
 ///
 /// First, whatever the setting, the world learns which chunks the renderer refused or shows
 /// again since the last frame ([`VoxelRenderer::take_refused`]): the search sees through them.
-/// A resync frame culls nothing.
 fn extract_visibility(
     mut gpu: ResMut<GpuState>,
     mut frame: ResMut<ExtractedFrame>,
@@ -1350,10 +1348,7 @@ fn extract_visibility(
             visibility.clear_unshown(|pos| map.visibility_links_at(pos));
         }
     }
-    // On a resync frame `prepare` uploads only the settled meshes: a chunk being remeshed draws
-    // nothing although the map says it is shown (the world hears of it next frame,
-    // `ChunkMeshResync`), so this frame culls nothing.
-    if !settings.cave_culling || frame.resync {
+    if !settings.cave_culling {
         return;
     }
     let (Some(ready), Some((camera, transform))) = (gpu.ready(), frame.camera) else {
@@ -1371,11 +1366,48 @@ fn extract_visibility(
     }) else {
         return;
     };
-    let _span = frame_span!("render.visibility");
     // The aspect `prepare` uses: the same view, so the same frustum.
     let aspect = ready.config.width.max(1) as f32 / ready.config.height.max(1) as f32;
-    let view = CameraView::compute(&camera, &transform, aspect);
-    let registry = &content.registry;
+    frame.visibility = frame_visibility(
+        frame.resync,
+        &content.registry,
+        &map,
+        &mut visibility,
+        &camera,
+        &transform,
+        viewer,
+        aspect,
+    );
+}
+
+/// The cave culling set (ADR 0022) of a frame with cave culling on, as the render plugin
+/// computes it: what [`ChunkVisibility::update`] gives for the camera's view at `aspect`, over
+/// `viewer`'s mesh region. `None`, culling nothing, on a renderer resync frame (`resync`), and
+/// while a voxel within the near plane's reach of the eye occludes or is not loaded
+/// ([`ChunkVisibility::eye_in_open`]): the renderer then shows what lies behind the rock.
+///
+/// A resync frame uploads only the settled meshes ([`ChunkMap::ready_meshes`]): a chunk being
+/// remeshed draws nothing, although the map still says the renderer shows it (a remesh for
+/// light alone keeps it shown) and trusts its links. The world hears of the resync only next
+/// frame ([`ChunkMeshResync`]), when it stops showing those chunks.
+///
+/// Public for the GPU tests, which cull with it exactly as the plugin does.
+#[doc(hidden)]
+pub fn frame_visibility(
+    resync: bool,
+    registry: &BlockRegistry,
+    map: &ChunkMap,
+    visibility: &mut ChunkVisibility,
+    camera: &Camera,
+    transform: &Transform,
+    viewer: ChunkViewer,
+    aspect: f32,
+) -> Option<Arc<VisibleSet>> {
+    if resync {
+        return None;
+    }
+    let _span = frame_span!("render.visibility");
+    let view = CameraView::compute(camera, transform, aspect);
     let open = visibility.eye_in_open(
         view.render_origin,
         view.eye_rel,
@@ -1383,7 +1415,7 @@ fn extract_visibility(
         |p| map.block_at(p).map(|state| registry.occludes(state)),
     );
     if !open {
-        return;
+        return None;
     }
     let search = VisibilityView::new(
         view.render_origin,
@@ -1391,7 +1423,7 @@ fn extract_visibility(
         viewer.radius,
         viewer.vertical_radius,
     );
-    frame.visibility = Some(visibility.update(&search, |p| map.visibility_links_at(p)));
+    Some(visibility.update(&search, |p| map.visibility_links_at(p)))
 }
 
 fn mesh_op(event: &ChunkMeshEvent) -> MeshOp {
