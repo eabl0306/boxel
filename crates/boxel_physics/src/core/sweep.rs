@@ -181,10 +181,20 @@ impl StepUp {
 /// the way down (it lands on the ledge: `on_ground`). Otherwise the plain move stands. A move
 /// that is not clipped across costs nothing more.
 ///
+/// A move clipped by a full block that is taller than `step.height` above the box's bottom (a
+/// wall, a hill one block high) and that the box already touches skips the lifted moves: the
+/// result is the plain move without trying them, the same that trying them gives (see
+/// [`Grid::step_up_blocked`]).
+///
 /// # Errors
 ///
 /// [`Unloaded`] when any block the move or the step-up needs is in an unloaded chunk; nothing
-/// moves then.
+/// moves then. A step-up that cannot go further across whatever the unloaded blocks hold is
+/// skipped without reading them.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "move_box's arguments and the step-up"
+)]
 pub fn move_box_stepping<S: VoxelSource + ?Sized>(
     src: &mut S,
     table: &CollisionTable,
@@ -194,6 +204,45 @@ pub fn move_box_stepping<S: VoxelSource + ?Sized>(
     obstacles: &[LocalBox],
     cfg: &SweepConfig,
     step: StepUp,
+) -> Result<SweepOut, Unloaded> {
+    stepping(src, table, start, shape, d, obstacles, cfg, step, true)
+}
+
+/// [`move_box_stepping`] that always tries the lifted moves (no early skip): the reference the
+/// tests compare the skip with. Not for games.
+#[doc(hidden)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "move_box's arguments and the step-up"
+)]
+pub fn move_box_stepping_unpruned<S: VoxelSource + ?Sized>(
+    src: &mut S,
+    table: &CollisionTable,
+    start: WorldPos,
+    shape: LocalBox,
+    d: DVec3,
+    obstacles: &[LocalBox],
+    cfg: &SweepConfig,
+    step: StepUp,
+) -> Result<SweepOut, Unloaded> {
+    stepping(src, table, start, shape, d, obstacles, cfg, step, false)
+}
+
+/// [`move_box_stepping`]; `prune` allows skipping a step-up that cannot win.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "move_box_stepping's arguments and a switch"
+)]
+fn stepping<S: VoxelSource + ?Sized>(
+    src: &mut S,
+    table: &CollisionTable,
+    start: WorldPos,
+    shape: LocalBox,
+    d: DVec3,
+    obstacles: &[LocalBox],
+    cfg: &SweepConfig,
+    step: StepUp,
+    prune: bool,
 ) -> Result<SweepOut, Unloaded> {
     // A hand-built start may be outside the canonical form (a NaN frac, a block past i64 room).
     let start = start.normalize();
@@ -225,6 +274,7 @@ pub fn move_box_stepping<S: VoxelSource + ?Sized>(
         && out.faces & ACROSS != 0
         && !depenetrated
         && (step.grounded || out.faces & LANDED != 0)
+        && !(prune && grid.step_up_blocked(pos, shape, d, obstacles, clean(step.height), &out))
         && let Some(lifted) = grid.step_up(pos, shape, d, obstacles, clean(step.height), &out)?
     {
         out = lifted;
@@ -759,6 +809,100 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
             ground: landed.ground,
             blocks: [best.blocks[0], landed.blocks[1], best.blocks[2]],
         }))
+    }
+
+    /// The step-up from `start` cannot change `plain` (the plain move, clipped across): every
+    /// lifted move of [`Grid::step_up`] ends across exactly where `plain` does, so none goes
+    /// further. Cheap and exact; `false` when it cannot tell (then the step-up is tried).
+    ///
+    /// The lifted moves go across at heights from `eps` under `start` (a rise stopped at once by
+    /// a plane within `eps` above the box) up to `height` above it. Per axis across, in the
+    /// sweep's order, with the box where the plain move had it on the axes before:
+    /// - Clipped in `plain` by a full block (not an obstacle) that is taller than `height` above
+    ///   the box's bottom and starts below its top, at every one of those heights: the block
+    ///   is in the footprint of every lifted move, so they stop at its plane or nearer. The box
+    ///   is within less than half of [`CollisionTable::plane_gap`] of that plane (it touches the
+    ///   wall: the common case, a walker pushing into a hill) and no obstacle face is in between:
+    ///   no block or box face fits there, so they stop exactly at the block's plane.
+    /// - Free in `plain`: a box that covers every one of those heights moves freely too (one
+    ///   clip, usually without reading a block), so every lifted move is free.
+    ///
+    /// Each lifted move then ends at the same place across as `plain`, bit for bit, and the
+    /// step-up keeps `plain`. A block that needs an unloaded chunk gives `false`. Margins of a
+    /// few `eps` keep rounding out of every comparison.
+    #[inline(never)]
+    fn step_up_blocked(
+        &mut self,
+        start: DVec3,
+        shape: LocalBox,
+        d: DVec3,
+        obstacles: &[LocalBox],
+        height: f64,
+        plain: &Moved,
+    ) -> bool {
+        let eps = self.eps;
+        let margin = 4.0 * eps;
+        let bottom = start.y + shape.min.y;
+        let top = start.y + shape.max.y;
+        let [_, first, second] = axis_order(d);
+        let mut at = start;
+        for axis in [first, second] {
+            if d[axis] == 0.0 {
+                continue;
+            }
+            let positive = d[axis] > 0.0;
+            if plain.faces & (1 << face_of(axis, positive).index()) != 0 {
+                let Some(block) = plain.blocks[axis] else {
+                    return false;
+                };
+                let b = [
+                    block.x.wrapping_sub(self.origin.x),
+                    block.y.wrapping_sub(self.origin.y),
+                    block.z.wrapping_sub(self.origin.z),
+                ];
+                if !matches!(self.shape(b), Ok(CollisionShape::Full)) {
+                    return false;
+                }
+                let by = b[1] as f64;
+                if !(bottom + height + margin < by + 1.0 && top - margin > by) {
+                    return false;
+                }
+                let bx = shape.translate(at);
+                let (plane, gap) = if positive {
+                    let plane = b[axis] as f64;
+                    (plane, plane - (bx.max[axis] - eps))
+                } else {
+                    let plane = (b[axis] + 1) as f64;
+                    (plane, (bx.min[axis] + eps) - plane)
+                };
+                let touching = gap < 0.5 * self.table.plane_gap();
+                if !touching {
+                    return false;
+                }
+                let between = |o: &LocalBox| {
+                    if positive {
+                        o.min[axis] >= bx.max[axis] - eps && o.min[axis] < plane
+                    } else {
+                        o.max[axis] <= bx.min[axis] + eps && o.max[axis] > plane
+                    }
+                };
+                if obstacles.iter().any(between) {
+                    return false;
+                }
+            } else {
+                let mut tall = shape;
+                tall.min.y -= margin;
+                tall.max.y += height + margin;
+                if !matches!(
+                    self.clip_axis(axis, at, tall, d[axis], obstacles),
+                    Ok(Clip::Free)
+                ) {
+                    return false;
+                }
+            }
+            at[axis] = plain.pos[axis];
+        }
+        true
     }
 
     /// Pushes a box that overlaps solid blocks out of them: the new position, or `None` when the

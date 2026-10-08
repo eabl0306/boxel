@@ -75,6 +75,9 @@ pub struct CollisionTable {
     boxes: Vec<LocalBox>,
     /// Some state has the `BOXES` bit.
     any_boxes: bool,
+    /// The smallest distance from a box face that is not on a block plane to the block plane
+    /// nearest it (1 without such faces; 0 in a table that was not built from a registry).
+    plane_gap: f64,
 }
 
 impl CollisionTable {
@@ -109,6 +112,15 @@ impl CollisionTable {
             table.bits.push(bits);
             table.collision.push(collision.range());
             table.outline.push(outline.range());
+        }
+        table.plane_gap = 1.0;
+        for bx in &table.boxes {
+            for v in bx.min.to_array().into_iter().chain(bx.max.to_array()) {
+                let f = v - v.floor();
+                if f != 0.0 {
+                    table.plane_gap = table.plane_gap.min(f.min(1.0 - f));
+                }
+            }
         }
         table
     }
@@ -184,6 +196,16 @@ impl CollisionTable {
     #[inline]
     pub fn has_boxes(&self) -> bool {
         self.any_boxes
+    }
+
+    /// How close to a block plane a face of a block's boxes can be without being on it: every
+    /// face of the table's boxes (collision and outline) is on a block plane or at least this far
+    /// from the nearest one (1 when the table has no boxes, 0 for a default table). A sweep's
+    /// step-up uses it to tell, without reading blocks, that no block face fits between a box and
+    /// the plane it touches.
+    #[inline]
+    pub fn plane_gap(&self) -> f64 {
+        self.plane_gap
     }
 
     /// `state` is a fluid (water).

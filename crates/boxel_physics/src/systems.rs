@@ -134,6 +134,14 @@ pub(crate) fn ensure_compute_pool() {
     ComputeTaskPool::get_or_init(TaskPool::default);
 }
 
+/// A part of the step with `work` items runs on the compute threads: above
+/// `PhysicsSettings::parallel_threshold`, and from `min` items (below that the tasks cost more
+/// than they save). A threshold of 0 runs every part on the threads whatever its size (tests use
+/// it to check that the threads change nothing).
+pub(crate) fn parallel_above(settings: &PhysicsSettings, work: usize, min: usize) -> bool {
+    work > settings.parallel_threshold && (settings.parallel_threshold == 0 || work >= min)
+}
+
 /// The fixed timestep in seconds, in `f64` (never through `Time::delta_secs`, which is `f32`).
 fn timestep(fixed: &FixedTime) -> f64 {
     fixed.timestep().as_secs_f64()

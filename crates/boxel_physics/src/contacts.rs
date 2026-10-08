@@ -42,13 +42,13 @@ use crate::components::{
 use crate::core::sweep::effective_eps as sweep_eps;
 use crate::core::{
     BlockBounds, BodySettings, CollisionLayers, CollisionShape, CollisionTable, Contact, Grid,
-    LocalBox, MAX_RAY_DISTANCE, Shape, SweepConfig, box_box_moving, move_box, shape_box,
+    GridSlot, LocalBox, MAX_RAY_DISTANCE, Shape, SweepConfig, box_box_moving, move_box, shape_box,
     shape_contact,
 };
 use crate::plugin::PhysicsContent;
 use crate::sleep::{SleeperData, Sleepers, sync_sleepers};
 use crate::source::ChunkSource;
-use crate::systems::ensure_compute_pool;
+use crate::systems::{ensure_compute_pool, parallel_above};
 use boxel_app::FixedTime;
 use boxel_ecs::prelude::*;
 use boxel_math::DVec3;
@@ -60,9 +60,9 @@ use std::time::Instant;
 /// How close a sleeping body must be to a solid body that moved for it to wake up, in blocks.
 const WAKE_MARGIN: f64 = 1.0 / 64.0;
 
-/// The broadphase splits its per-body work and the pair sweep over the compute threads from
-/// this many bodies in the step's list (and above `PhysicsSettings::parallel_threshold`):
-/// below it the tasks cost more than they save.
+/// The broadphase and the solve split their work over the compute threads from this many
+/// bodies in the step's list (see [`parallel_above`]): below it the tasks cost more than they
+/// save.
 const PARALLEL_GRID_MIN: usize = 4096;
 
 /// A body pushed along a normal whose `y` is above this stands on the other body
@@ -222,6 +222,34 @@ pub(crate) struct IndexedBody {
 }
 
 impl IndexedBody {
+    /// A value for list slots about to be written.
+    fn placeholder() -> Self {
+        Self {
+            entity: Entity::PLACEHOLDER,
+            pos: WorldPos::default(),
+            shape: Shape::Aabb { half: DVec3::ZERO },
+            offset: DVec3::ZERO,
+            layers: CollisionLayers::default(),
+            sensor: false,
+            report: false,
+            kind: RigidBody::Static,
+            frozen: false,
+            weight: 1.0,
+            step: DVec3::ZERO,
+            vel: DVec3::ZERO,
+            faces: 0,
+            on_ground: false,
+            sleeping: false,
+            active: false,
+            collides: false,
+            dirty: false,
+            moved: false,
+            woken: false,
+            pushed: DVec3::ZERO,
+            bounds: BlockBounds::default(),
+        }
+    }
+
     /// Its voxel box, relative to `pos`.
     pub(crate) fn bx(&self) -> LocalBox {
         self.shape.bounds().translate(self.offset)
@@ -295,6 +323,8 @@ pub struct BodyIndex {
     ids: Vec<u32>,
     /// One pair buffer per task of the parallel pair sweep.
     parts: Vec<Vec<(u32, u32)>>,
+    /// The awake bodies of a parallel broadphase, in query order.
+    entities: Vec<Entity>,
     pub(crate) sleepers: Sleepers,
 }
 
@@ -309,6 +339,7 @@ impl Default for BodyIndex {
             scratch: ObstacleScratch::default(),
             ids: Vec::new(),
             parts: Vec::new(),
+            entities: Vec::new(),
             sleepers: Sleepers::default(),
         }
     }
@@ -620,6 +651,53 @@ fn is_active(kind: RigidBody, sync: &PhysicsSync, collider_changed: bool, asleep
     }
 }
 
+/// What the broadphase reads of an awake body.
+type BroadphaseItem<'a> = (
+    Entity,
+    &'a RigidBody,
+    Ref<'a, Collider>,
+    &'a BodyPosition,
+    &'a Velocity,
+    &'a Contacts,
+    &'a BodySettings,
+    &'a PhysicsSync,
+    bool,
+    bool,
+);
+
+/// The step's list entry of an awake body, with its bounds in this step's grid.
+fn listed_body(
+    (entity, kind, collider, position, velocity, contacts, body, sync, frozen, report): BroadphaseItem<'_>,
+) -> IndexedBody {
+    let active = is_active(*kind, sync, collider.is_changed(), false);
+    let mut listed = IndexedBody {
+        entity,
+        pos: position.0.normalize(),
+        shape: collider.shape,
+        offset: collider.offset,
+        layers: collider.layers,
+        sensor: collider.is_sensor(),
+        report,
+        kind: *kind,
+        frozen,
+        weight: body.push_weight,
+        step: sync.moved,
+        vel: velocity.0,
+        faces: contacts.faces,
+        on_ground: contacts.on_ground,
+        sleeping: false,
+        active,
+        collides: true,
+        dirty: false,
+        moved: false,
+        woken: false,
+        pushed: DVec3::ZERO,
+        bounds: BlockBounds::default(),
+    };
+    listed.bounds = listed.step_bounds();
+    listed
+}
+
 /// [`crate::PhysicsSystems::Broadphase`]: the step's list of the [`BodyIndex`] (every awake
 /// body with a collider, plus the sleepers that matter this step) and its candidate pairs,
 /// sorted by entity. The list's own order does not matter: everything that follows goes
@@ -629,6 +707,14 @@ fn is_active(kind: RigidBody, sync: &PhysicsSync, collider_changed: bool, asleep
 /// kinematic bodies that moved, and bodies teleported or nudged this step or whose collider
 /// changed. An active body that moved is in the grid with the bounds it swept (from where it was
 /// to where it is), and pulls the sleepers those bounds reach out of the store.
+///
+/// With many bodies (see [`parallel_above`]) the awake bodies are listed and placed in the grid
+/// on the compute threads, each one into its own slot of the list in query order, and the pair
+/// sweep is split by cells: the list, the grid and the pairs are the same as on one thread.
+#[expect(
+    clippy::type_complexity,
+    reason = "a system's parameters; the query is spelled out as its item type"
+)]
 pub(crate) fn broadphase(
     settings: Res<PhysicsSettings>,
     mut index: ResMut<BodyIndex>,
@@ -660,65 +746,61 @@ pub(crate) fn broadphase(
         sleepers,
         ids,
         parts,
+        entities,
         ..
     } = &mut *index;
     sync_sleepers(sleepers, &mut log, &sleeper_data);
     sleepers.begin_step(settings.grid_shift);
     *eps = sweep_eps(settings.eps);
-    list.clear();
-    for (entity, kind, collider, position, velocity, contacts, body, sync, frozen, report) in
-        &bodies
-    {
-        let active = is_active(*kind, sync, collider.is_changed(), false);
-        list.push(IndexedBody {
-            entity,
-            pos: position.0.normalize(),
-            shape: collider.shape,
-            offset: collider.offset,
-            layers: collider.layers,
-            sensor: collider.is_sensor(),
-            report,
-            kind: *kind,
-            frozen,
-            weight: body.push_weight,
-            step: sync.moved,
-            vel: velocity.0,
-            faces: contacts.faces,
-            on_ground: contacts.on_ground,
-            sleeping: false,
-            active,
-            collides: true,
-            dirty: false,
-            moved: false,
-            woken: false,
-            pushed: DVec3::ZERO,
-            bounds: BlockBounds::default(),
-        });
-    }
-    // Each body's bounds on its own: on the compute threads for many bodies.
-    let parallel = list.len() > settings.parallel_threshold.max(PARALLEL_GRID_MIN);
+    grid.reset(settings.grid_shift);
+    let awake = bodies.iter().len();
+    let parallel = parallel_above(&settings, awake, PARALLEL_GRID_MIN);
     if parallel {
         ensure_compute_pool();
         let pool = ComputeTaskPool::get();
-        let size = list.len().div_ceil(pool.thread_num().max(1) * 2).max(64);
-        pool.scope(|scope| {
-            for chunk in list.chunks_mut(size) {
-                scope.spawn(async move {
-                    for body in chunk {
-                        body.bounds = body.step_bounds();
-                    }
-                });
-            }
+        entities.clear();
+        entities.extend(bodies.iter().map(|item| item.0));
+        // Each body into its own slot of the list and of the grid, in query order. The list
+        // keeps its length from step to step: only a longer one needs placeholders.
+        list.truncate(awake);
+        list.resize(awake, IndexedBody::placeholder());
+        let size = awake.div_ceil(pool.thread_num().max(1) * 2).max(64);
+        let shift = grid.shift();
+        let (bodies, entities, list) = (&bodies, &*entities, &mut *list);
+        grid.push_slots(awake, |slots| {
+            let parts = pool.scope(|scope| {
+                for (k, ((entities, list), slots)) in entities
+                    .chunks(size)
+                    .zip(list.chunks_mut(size))
+                    .zip(slots.chunks_mut(size))
+                    .enumerate()
+                {
+                    scope.spawn(async move {
+                        let mut large = Vec::new();
+                        for (i, ((&entity, body), slot)) in
+                            entities.iter().zip(list).zip(slots).enumerate()
+                        {
+                            if let Ok(item) = bodies.get(entity) {
+                                *body = listed_body(item);
+                                *slot = GridSlot::new(shift, body.bounds, body.layers, body.active);
+                                if slot.is_large() {
+                                    large.push(((k * size + i) as u32, body.bounds));
+                                }
+                            }
+                        }
+                        large
+                    });
+                }
+            });
+            parts.into_iter().flatten().collect()
         });
     } else {
-        for body in list.iter_mut() {
-            body.bounds = body.step_bounds();
-        }
+        list.clear();
+        list.extend(bodies.iter().map(listed_body));
     }
     // The sleepers the active bodies reach, and the ones that fell asleep since the store's
     // last rebuild (not in its grid yet).
     if sleepers.has_grid_bodies() {
-        let awake = list.len();
         for i in 0..awake {
             if list[i].active {
                 let bounds = list[i].bounds;
@@ -727,8 +809,9 @@ pub(crate) fn broadphase(
         }
     }
     list.extend(sleepers.pending_colliders().copied());
-    grid.reset(settings.grid_shift);
-    for body in list.iter() {
+    // The rest of the list (the awake bodies too on one thread).
+    let placed = grid.len();
+    for body in &list[placed..] {
         grid.insert(body.bounds, body.layers, body.active);
     }
     if parallel {
@@ -736,7 +819,7 @@ pub(crate) fn broadphase(
         grid.build();
         let pool = ComputeTaskPool::get();
         let grid = &*grid;
-        let ranges = grid.pair_ranges(pool.thread_num().max(1) * 4);
+        let ranges = grid.pair_ranges(pool.thread_num().max(1) * 2);
         if parts.len() < ranges.len() {
             parts.resize_with(ranges.len(), Vec::new);
         }
@@ -791,6 +874,8 @@ pub(crate) struct ContactSet {
     /// The step's new and ended pairs.
     started: Vec<(Entity, Entity)>,
     ended: Vec<(Entity, Entity)>,
+    /// The parallel solve's islands.
+    islands: Islands,
 }
 
 /// The face of a box facing direction `d` (its largest component; ties Y, X, Z).
@@ -996,6 +1081,256 @@ fn push_pair(
     true
 }
 
+/// The pushes of one group of solid pairs (`pairs`: indices into `bodies`, bottom-up):
+/// `passes` passes (at least one; with 0 nothing is pushed), each pair that overlaps by more
+/// than `eps` pushed apart in turn. The bodies of overlapping pairs go into `touched`; returns
+/// how many pushes happened.
+fn push_pairs(
+    bodies: &mut [IndexedBody],
+    pairs: impl Iterator<Item = (u32, u32)> + Clone,
+    passes: u32,
+    eps: f64,
+    world: &mut PushWorld<'_, '_>,
+    touched: &mut Vec<u32>,
+) -> usize {
+    let mut pushes = 0;
+    for _ in 0..passes.max(1) {
+        for (a, b) in pairs.clone() {
+            let Ok([first, second]) = bodies.get_disjoint_mut([a as usize, b as usize]) else {
+                continue;
+            };
+            let Some(contact) = pair_contact(first, second, eps).filter(|c| c.depth > eps) else {
+                continue;
+            };
+            touched.push(a);
+            touched.push(b);
+            if passes > 0 && push_pair(first, second, contact, world) {
+                pushes += 1;
+            }
+        }
+    }
+    pushes
+}
+
+/// What every task of a parallel solve reads.
+struct PushShared<'a> {
+    map: &'a ChunkMap,
+    world: &'a WorldSettings,
+    table: &'a CollisionTable,
+    obstacles: &'a ObstacleIndex,
+    cfg: SweepConfig,
+    eps: f64,
+    passes: u32,
+}
+
+/// The solve's pairs split into islands for the compute threads. A push only changes the two
+/// bodies of its pair, and only the free ones (`IndexedBody::free`; the others are only read),
+/// so pairs that share no free body never affect each other: the islands are the groups of
+/// pairs linked through free bodies. Each island keeps the solve's order (bottom-up) and runs
+/// on its own copy of its bodies, and the free ones are copied back: the same pushes, bit for
+/// bit, as one run over every pair, whatever the threads.
+#[derive(Default)]
+pub(crate) struct Islands {
+    /// Union-find over the step's list.
+    parent: Vec<u32>,
+    /// Per root body, its island (`u32::MAX`: none yet).
+    island_of: Vec<u32>,
+    /// Per pair of the order, its island.
+    pair_island: Vec<u32>,
+    /// Island `i`'s pairs are `pairs[starts[i]..starts[i + 1]]` (as indices into its bodies),
+    /// its bodies `bodies[body_starts[i]..body_starts[i + 1]]` (as list indices).
+    starts: Vec<u32>,
+    body_starts: Vec<u32>,
+    pairs: Vec<(u32, u32)>,
+    bodies: Vec<u32>,
+    /// The order's pairs grouped by island (a stable counting sort).
+    grouped: Vec<u32>,
+    cursor: Vec<u32>,
+    /// Per list body, the island it was last copied into (plus one) and its index there.
+    stamp: Vec<u32>,
+    local: Vec<u32>,
+}
+
+impl Islands {
+    fn find(&mut self, mut x: u32) -> u32 {
+        while self.parent[x as usize] != x {
+            let up = self.parent[self.parent[x as usize] as usize];
+            self.parent[x as usize] = up;
+            x = up;
+        }
+        x
+    }
+
+    /// Groups `order` (pairs of `pairs` by index, bottom-up) into islands.
+    fn split(&mut self, bodies: &[IndexedBody], pairs: &[(u32, u32)], order: &[(i64, f64, u32)]) {
+        let n = bodies.len();
+        self.parent.clear();
+        self.parent.extend(0..n as u32);
+        for &(_, _, k) in order {
+            let (a, b) = pairs[k as usize];
+            if bodies[a as usize].free() && bodies[b as usize].free() {
+                let (ra, rb) = (self.find(a), self.find(b));
+                // Link the higher root under the lower (any fixed rule works).
+                if ra != rb {
+                    self.parent[ra.max(rb) as usize] = ra.min(rb);
+                }
+            }
+        }
+        // Islands numbered by their first pair in the order.
+        self.island_of.clear();
+        self.island_of.resize(n, u32::MAX);
+        self.pair_island.clear();
+        self.starts.clear();
+        for &(_, _, k) in order {
+            let (a, b) = pairs[k as usize];
+            let key = if bodies[a as usize].free() { a } else { b };
+            let root = self.find(key) as usize;
+            if self.island_of[root] == u32::MAX {
+                self.island_of[root] = self.starts.len() as u32;
+                self.starts.push(0);
+            }
+            let island = self.island_of[root];
+            self.pair_island.push(island);
+            self.starts[island as usize] += 1;
+        }
+        // Counts to starts, then the pairs in order within each island.
+        let mut sum = 0;
+        for start in &mut self.starts {
+            let count = *start;
+            *start = sum;
+            sum += count;
+        }
+        self.starts.push(sum);
+        self.grouped.clear();
+        self.grouped.resize(order.len(), 0);
+        self.cursor.clear();
+        self.cursor.extend_from_slice(&self.starts);
+        for (&(_, _, k), &island) in order.iter().zip(&self.pair_island) {
+            let at = &mut self.cursor[island as usize];
+            self.grouped[*at as usize] = k;
+            *at += 1;
+        }
+        // Each island's bodies (a body that is only read may be in several) and its pairs as
+        // indices into them.
+        self.stamp.clear();
+        self.stamp.resize(n, 0);
+        self.local.resize(n, 0);
+        self.bodies.clear();
+        self.body_starts.clear();
+        self.pairs.clear();
+        for island in 0..self.starts.len() - 1 {
+            let first = self.bodies.len() as u32;
+            self.body_starts.push(first);
+            let mark = island as u32 + 1;
+            let (from, to) = (
+                self.starts[island] as usize,
+                self.starts[island + 1] as usize,
+            );
+            for j in from..to {
+                let (a, b) = pairs[self.grouped[j] as usize];
+                let mut pair = [a, b];
+                for g in &mut pair {
+                    let i = *g as usize;
+                    if self.stamp[i] != mark {
+                        self.stamp[i] = mark;
+                        self.local[i] = self.bodies.len() as u32 - first;
+                        self.bodies.push(*g);
+                    }
+                    *g = self.local[i];
+                }
+                self.pairs.push((pair[0], pair[1]));
+            }
+        }
+        self.body_starts.push(self.bodies.len() as u32);
+    }
+
+    /// Runs the pushes of every island on the compute threads (see [`push_pairs`]) and copies
+    /// the free bodies back into `bodies`; the touched bodies go into `touched` (as list
+    /// indices, unsorted). Returns how many pushes happened.
+    fn push_all(
+        &self,
+        bodies: &mut [IndexedBody],
+        shared: &PushShared<'_>,
+        touched: &mut Vec<u32>,
+    ) -> usize {
+        let pool = ComputeTaskPool::get();
+        let islands = self.starts.len() - 1;
+        // Batches of whole islands with about the same number of pairs.
+        let per_task = self
+            .pairs
+            .len()
+            .div_ceil(pool.thread_num().max(1) * 2)
+            .max(16);
+        let mut batches = Vec::new();
+        let mut first = 0;
+        for island in 0..islands {
+            let size = (self.starts[island + 1] - self.starts[first]) as usize;
+            if size >= per_task || island + 1 == islands {
+                batches.push(first..island + 1);
+                first = island + 1;
+            }
+        }
+        let list: &[IndexedBody] = bodies;
+        let results = pool.scope(|scope| {
+            for batch in batches {
+                scope.spawn(async move {
+                    let (b0, b1) = (
+                        self.body_starts[batch.start] as usize,
+                        self.body_starts[batch.end] as usize,
+                    );
+                    let mut copies: Vec<IndexedBody> = self.bodies[b0..b1]
+                        .iter()
+                        .map(|&g| list[g as usize])
+                        .collect();
+                    let mut voxels = ChunkSource::new(shared.map, shared.world);
+                    let mut scratch = ObstacleScratch::default();
+                    let mut world = PushWorld {
+                        voxels: &mut voxels,
+                        table: shared.table,
+                        obstacles: shared.obstacles,
+                        scratch: &mut scratch,
+                        cfg: shared.cfg,
+                    };
+                    let mut touched = Vec::new();
+                    let mut pushes = 0;
+                    for island in batch {
+                        let (from, to) = (
+                            self.body_starts[island] as usize - b0,
+                            self.body_starts[island + 1] as usize - b0,
+                        );
+                        let pairs = &self.pairs
+                            [self.starts[island] as usize..self.starts[island + 1] as usize];
+                        let at = touched.len();
+                        pushes += push_pairs(
+                            &mut copies[from..to],
+                            pairs.iter().copied(),
+                            shared.passes,
+                            shared.eps,
+                            &mut world,
+                            &mut touched,
+                        );
+                        for t in &mut touched[at..] {
+                            *t = self.bodies[b0 + from + *t as usize];
+                        }
+                    }
+                    (b0, copies, touched, pushes)
+                });
+            }
+        });
+        let mut pushes = 0;
+        for (b0, copies, mut found, count) in results {
+            for (copy, &g) in copies.into_iter().zip(&self.bodies[b0..]) {
+                if copy.free() {
+                    bodies[g as usize] = copy;
+                }
+            }
+            touched.append(&mut found);
+            pushes += count;
+        }
+        pushes
+    }
+}
+
 /// A sleeping solid body `sleeper` touches (within [`WAKE_MARGIN`]) the solid body `mover`
 /// anywhere between where `mover` started this step and where it ended (the sweep, then the
 /// pushes).
@@ -1083,26 +1418,29 @@ pub(crate) fn solve(
         }
     }
     order.sort_unstable_by(|x, y| x.0.cmp(&y.0).then(x.1.total_cmp(&y.1)).then(x.2.cmp(&y.2)));
-    let mut pushes = 0;
     // The bodies the solve may change: the ones of overlapping pairs.
     let touched = &mut contacts.touched;
     touched.clear();
-    for _ in 0..settings.solver_passes.max(1) {
-        for &(_, _, k) in order.iter() {
-            let (a, b) = pairs[k as usize];
-            let Ok([first, second]) = bodies.get_disjoint_mut([a as usize, b as usize]) else {
-                continue;
-            };
-            let Some(contact) = pair_contact(first, second, eps).filter(|c| c.depth > eps) else {
-                continue;
-            };
-            touched.push(a);
-            touched.push(b);
-            if settings.solver_passes > 0 && push_pair(first, second, contact, &mut push_world) {
-                pushes += 1;
-            }
-        }
-    }
+    let passes = settings.solver_passes;
+    let pushes = if parallel_above(&settings, bodies.len(), PARALLEL_GRID_MIN) && !order.is_empty()
+    {
+        ensure_compute_pool();
+        let islands = &mut contacts.islands;
+        islands.split(bodies, pairs, order);
+        let shared = PushShared {
+            map: &map,
+            world: &world,
+            table: &content.collision,
+            obstacles: &obstacles,
+            cfg: push_world.cfg,
+            eps,
+            passes,
+        };
+        islands.push_all(bodies, &shared, touched)
+    } else {
+        let order = order.iter().map(|&(_, _, k)| pairs[k as usize]);
+        push_pairs(bodies, order, passes, eps, &mut push_world, touched)
+    };
 
     // Sleepers touching a solid body that moved this step (what they rested on may be gone).
     let still = settings.sleep_speed * fixed.timestep().as_secs_f64();

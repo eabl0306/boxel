@@ -160,6 +160,73 @@ proptest! {
         prop_assert_eq!(found, brute);
     }
 
+    /// Bodies moved after the build (as the solve moves them) are found at their new place at
+    /// once, without a rebuild: box queries, the bodies of each cell plus the large list, and
+    /// the pair pieces all equal brute force. A rebuild puts them back in their cells.
+    #[test]
+    fn moved_bodies_are_found_without_a_rebuild(
+        mut bodies in prop::collection::vec(arb_body(), 1..80),
+        moves in prop::collection::vec((0usize..80, -6.0..6.0f64, -2.0..2.0f64, -6.0..6.0f64), 1..16),
+        center in (-30.0..30.0f64, -30.0..30.0f64, -30.0..30.0f64),
+        half in (0.0..12.0f64, 0.0..6.0f64, 0.0..6.0f64),
+        shift in 0u32..5,
+        base in arb_base(),
+    ) {
+        let mut grid = grid(&bodies, base, shift);
+        grid.build();
+        for (i, dx, dy, dz) in moves {
+            let i = i % bodies.len();
+            bodies[i].pos += DVec3::new(dx, dy, dz);
+            grid.set_bounds(i as u32, bounds(&bodies[i], base));
+        }
+        prop_assert!(grid.is_built());
+        let query = BlockBounds::of_box(
+            WorldPos::from_block(BlockPos::from_i64vec3(base), DVec3::new(center.0, center.1, center.2)),
+            LocalBox::from_center_half(DVec3::ZERO, DVec3::new(half.0, half.1, half.2)),
+        );
+        let mut found = Vec::new();
+        grid.query(query, &mut found);
+        let brute: Vec<u32> = (0..bodies.len() as u32)
+            .filter(|&i| grid.bounds(i).overlaps(&query))
+            .collect();
+        prop_assert_eq!(found, brute);
+        // Every body is in the cells of its bounds or in the large list, never in a cell it
+        // left.
+        for i in 0..bodies.len() as u32 {
+            let (min, max) = grid.bounds(i).cells(grid.shift());
+            let large = grid.large().contains(&i);
+            for x in min.x - 1..=max.x + 1 {
+                for y in min.y - 1..=max.y + 1 {
+                    for z in min.z - 1..=max.z + 1 {
+                        let cell = I64Vec3::new(x, y, z);
+                        let inside = cell.cmpge(min).all() && cell.cmple(max).all();
+                        let listed = grid.cell(cell).filter(|&b| b == i).count();
+                        prop_assert!(listed <= 1);
+                        prop_assert!(listed == 0 || inside, "body {} in a cell it left", i);
+                        prop_assert!(large || !inside || listed == 1, "body {} missing", i);
+                    }
+                }
+            }
+        }
+        let mut split = Vec::new();
+        for range in grid.pair_ranges(4) {
+            grid.pairs_in(range, &mut split);
+        }
+        grid.large_pairs(&mut split);
+        split.sort_unstable();
+        prop_assert_eq!(&split, &brute_pairs(&grid, &bodies));
+        let mut pairs = Vec::new();
+        grid.pairs(&mut pairs);
+        prop_assert_eq!(&pairs, &split);
+        let large: Vec<u32> = (0..bodies.len() as u32)
+            .filter(|&i| {
+                let (min, max) = grid.bounds(i).cells(grid.shift());
+                (max - min).max_element() >= 2
+            })
+            .collect();
+        prop_assert_eq!(grid.large(), &large[..], "the rebuild put them back");
+    }
+
     /// The pieces of the parallel broadphase (`pair_ranges`, `pairs_in` on each range in any
     /// order, then `large_pairs`) give exactly the pairs of `pairs`, each once.
     #[test]
