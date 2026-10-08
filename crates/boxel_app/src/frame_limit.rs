@@ -249,7 +249,7 @@ pub fn spin_until(deadline: Instant) {
 
 /// Sleeps until `deadline` (returns at once if it passed).
 #[expect(clippy::disallowed_methods, reason = "runner frame pacing")]
-fn sleep_until(deadline: Instant) {
+pub(crate) fn sleep_until(deadline: Instant) {
     let left = deadline.saturating_duration_since(Instant::now());
     if !left.is_zero() {
         std::thread::sleep(left);

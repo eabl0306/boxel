@@ -1,6 +1,10 @@
-//! `ScheduleRunnerPlugin` (headless runner): exit codes, `Shutdown`, pacing and plugin lifecycle.
+//! `ScheduleRunnerPlugin` (headless runner): exit codes, `Shutdown`, pacing, idle steps and plugin
+//! lifecycle.
 use boxel_app::prelude::*;
-use boxel_app::{FrameDeadline, PluginsState, RunMode};
+use boxel_app::{
+    FrameDeadline, FramePacer, IDLE_MARGIN, IDLE_STEP, IdleInfo, IdleStep, IdleWork, PluginsState,
+    RunMode,
+};
 use boxel_ecs::prelude::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -139,6 +143,295 @@ fn run_loop_writes_the_frame_deadline() {
         seen.iter()
             .all(|(_, d)| d.next.is_none() && d.period.is_none())
     );
+}
+
+/// What an app saw: its updates (with the published deadline and idle info) and its idle steps
+/// (with the deadline they ran under), in order.
+#[derive(Clone, Copy, Debug)]
+enum Seen {
+    Update {
+        at: Instant,
+        deadline: FrameDeadline,
+        idle: IdleInfo,
+    },
+    Step {
+        start: Instant,
+        until: Instant,
+        end: Instant,
+        due: Option<Instant>,
+    },
+}
+
+type Log = Arc<std::sync::Mutex<Vec<Seen>>>;
+
+/// Steps of the current gap.
+#[derive(Resource, Default)]
+struct GapSteps(u32);
+
+/// An app that logs `frames` updates under `mode` and `limit`, and idle steps that busy-wait
+/// `spin` (at most until their end) and answer `answer(step of the gap)`.
+fn idle_app(
+    mode: RunMode,
+    limit: Option<FrameLimit>,
+    frames: usize,
+    spin: Duration,
+    answer: fn(u32) -> IdleWork,
+) -> (App, Log) {
+    let log: Log = Arc::default();
+    let (updates, steps) = (log.clone(), log.clone());
+    let mut app = App::new();
+    if let Some(limit) = limit {
+        app.insert_resource(limit);
+    }
+    app.add_plugins(ScheduleRunnerPlugin { run_mode: mode })
+        .init_resource::<GapSteps>()
+        .add_systems(
+            Update,
+            move |deadline: Option<Res<FrameDeadline>>,
+                  idle: Option<Res<IdleInfo>>,
+                  mut gap: ResMut<GapSteps>,
+                  mut w: MessageWriter<AppExit>| {
+                let mut log = updates.lock().expect("lock");
+                log.push(Seen::Update {
+                    at: Instant::now(),
+                    deadline: deadline.as_deref().copied().unwrap_or_default(),
+                    idle: idle.as_deref().copied().unwrap_or_default(),
+                });
+                gap.0 = 0;
+                if log
+                    .iter()
+                    .filter(|s| matches!(s, Seen::Update { .. }))
+                    .count()
+                    == frames
+                {
+                    w.write(AppExit::Success);
+                }
+            },
+        )
+        .add_systems(
+            Idle,
+            move |mut step: ResMut<IdleStep>,
+                  deadline: Res<FrameDeadline>,
+                  mut gap: ResMut<GapSteps>| {
+                let start = Instant::now();
+                let stop = (start + spin).min(step.until);
+                while Instant::now() < stop {
+                    std::hint::spin_loop();
+                }
+                gap.0 += 1;
+                step.want(answer(gap.0));
+                steps.lock().expect("lock").push(Seen::Step {
+                    start,
+                    until: step.until,
+                    end: Instant::now(),
+                    due: deadline.next,
+                });
+            },
+        );
+    (app, log)
+}
+
+fn take(log: Log) -> Vec<Seen> {
+    Arc::try_unwrap(log)
+        .expect("app dropped")
+        .into_inner()
+        .expect("lock")
+}
+
+/// The steps between update `i` and the next one, and that next update.
+fn gaps(log: &[Seen]) -> Vec<(Seen, Vec<Seen>, Option<Seen>)> {
+    let updates: Vec<usize> = (0..log.len())
+        .filter(|&i| matches!(log[i], Seen::Update { .. }))
+        .collect();
+    updates
+        .iter()
+        .enumerate()
+        .map(|(n, &i)| {
+            let next = updates.get(n + 1).copied();
+            let steps = log[i + 1..next.unwrap_or(log.len())].to_vec();
+            (log[i], steps, next.map(|j| log[j]))
+        })
+        .collect()
+}
+
+#[test]
+fn run_loop_runs_idle_steps_between_updates_before_the_deadline() {
+    let period = Duration::from_millis(10);
+    let spin = Duration::from_micros(400);
+    // Waiting 5 times per gap, then done.
+    let answer = |n: u32| {
+        if n <= 5 {
+            IdleWork::Waiting
+        } else {
+            IdleWork::Done
+        }
+    };
+    let (mut app, log) = idle_app(
+        RunMode::Loop { wait: None },
+        Some(FrameLimit::new(100)),
+        20,
+        spin,
+        answer,
+    );
+    assert_eq!(app.run(), AppExit::Success);
+    let log = take(log);
+    assert!(
+        matches!(log[0], Seen::Update { .. }),
+        "no step before the first update"
+    );
+    let gaps = gaps(&log);
+    assert_eq!(gaps.len(), 20);
+    let Seen::Update {
+        deadline: first, ..
+    } = gaps[0].0
+    else {
+        unreachable!()
+    };
+    let first_due = first.next.expect("paced");
+    for (k, (update, steps, next)) in gaps.iter().enumerate() {
+        let Seen::Update { at, deadline, .. } = *update else {
+            unreachable!()
+        };
+        let due = deadline.next.expect("paced");
+        // The grid holds: idle steps never delay an update.
+        assert_eq!(due, first_due + period * k as u32, "frame {k}");
+        let Some(next) = next else {
+            assert!(steps.is_empty(), "no idle after the exit");
+            continue;
+        };
+        assert_eq!(steps.len(), 6, "frame {k}: 5 polls, then done");
+        let end = due - FramePacer::DEFAULT_SPIN_MARGIN - IDLE_MARGIN;
+        let mut busy = Duration::ZERO;
+        for step in steps {
+            let Seen::Step {
+                start,
+                until,
+                end: ended,
+                due: step_due,
+            } = *step
+            else {
+                unreachable!()
+            };
+            assert!(start > at, "frame {k}: after the update");
+            assert_eq!(step_due, Some(due), "frame {k}");
+            assert!(until <= end, "frame {k}: {:?} past the slot", until - end);
+            assert!(until - start <= IDLE_STEP, "frame {k}");
+            busy += ended - start;
+        }
+        let Seen::Update {
+            at: next_at,
+            deadline: next_deadline,
+            idle,
+        } = *next
+        else {
+            unreachable!()
+        };
+        assert!(
+            next_at >= due,
+            "frame {k}: the next update waits for its deadline"
+        );
+        // The next update reports this gap.
+        assert_eq!(idle.steps, 6, "frame {k}");
+        assert!(
+            idle.tail >= busy && idle.tail <= next_at - at,
+            "frame {k}: {idle:?}"
+        );
+        // The idle steps are not part of the update's own time.
+        assert!(
+            next_deadline.last_update < idle.tail,
+            "frame {k}: {next_deadline:?} {idle:?}"
+        );
+    }
+}
+
+#[test]
+fn ready_steps_run_back_to_back_until_the_slot_ends() {
+    let (mut app, log) = idle_app(
+        RunMode::Loop {
+            wait: Some(Duration::from_millis(5)),
+        },
+        None,
+        6,
+        Duration::ZERO,
+        |_| IdleWork::Ready,
+    );
+    assert_eq!(app.run(), AppExit::Success);
+    let log = take(log);
+    let mut reached = 0;
+    for (update, steps, next) in gaps(&log) {
+        let Seen::Update { deadline, .. } = update else {
+            unreachable!()
+        };
+        if next.is_none() {
+            continue;
+        }
+        let end = deadline.next.expect("paced") - FramePacer::DEFAULT_SPIN_MARGIN - IDLE_MARGIN;
+        assert!(steps.len() > 1, "{steps:?}");
+        let last = steps
+            .iter()
+            .map(|s| match *s {
+                Seen::Step { until, .. } => until,
+                Seen::Update { .. } => unreachable!(),
+            })
+            .max()
+            .expect("steps");
+        assert!(last <= end);
+        reached += usize::from(last == end);
+    }
+    assert!(reached > 0, "the steps go on until the slot ends");
+}
+
+#[test]
+fn a_done_step_closes_the_slot_until_the_next_update() {
+    let (mut app, log) = idle_app(
+        RunMode::Loop {
+            wait: Some(Duration::from_millis(5)),
+        },
+        None,
+        5,
+        Duration::ZERO,
+        |_| IdleWork::Done,
+    );
+    assert_eq!(app.run(), AppExit::Success);
+    let log = take(log);
+    let gaps = gaps(&log);
+    for (k, (_, steps, next)) in gaps.iter().enumerate() {
+        let expected = if next.is_some() { 1 } else { 0 };
+        assert_eq!(steps.len(), expected, "gap {k}");
+        if let Some(Seen::Update { idle, .. }) = next {
+            assert_eq!(idle.steps, 1, "gap {k}");
+        }
+    }
+}
+
+#[test]
+fn run_loop_without_a_limit_or_once_never_idles() {
+    let cases = [
+        (RunMode::Loop { wait: None }, None),
+        (
+            RunMode::Loop {
+                wait: Some(Duration::ZERO),
+            },
+            None,
+        ),
+        // The limit replaces `wait`: unlimited.
+        (
+            RunMode::Loop {
+                wait: Some(Duration::from_millis(5)),
+            },
+            Some(FrameLimit::UNLIMITED),
+        ),
+        (RunMode::Once, Some(FrameLimit::new(100))),
+    ];
+    for (mode, limit) in cases {
+        let (mut app, log) = idle_app(mode, limit, 5, Duration::ZERO, |_| IdleWork::Ready);
+        assert_eq!(app.run(), AppExit::Success, "{mode:?}");
+        let log = take(log);
+        assert!(
+            log.iter().all(|s| matches!(s, Seen::Update { .. })),
+            "{mode:?} {limit:?}: {log:?}"
+        );
+    }
 }
 
 /// Ready only after `polls` calls to `ready`; records the update count seen by `finish` and
