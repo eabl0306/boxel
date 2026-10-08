@@ -6,7 +6,8 @@ use crate::window::{
     WindowMode, WindowOccluded, WindowResized, WindowSettings, WindowState,
 };
 use boxel_app::{
-    App, AppExit, FrameDeadline, FrameLimit, FramePacer, FrameWait, PluginsState, spin_until,
+    App, AppExit, FrameDeadline, FrameLimit, FramePacer, FrameWait, IDLE_MARGIN, IDLE_POLL,
+    IdleInfo, IdleWork, MIN_IDLE_STEP, PluginsState, idle_step_end, spin_until,
 };
 use boxel_ecs::prelude::*;
 use boxel_math::{UVec2, Vec2};
@@ -134,6 +135,8 @@ impl Default for RunnerSettings {
 ///    `occluded = winit_occluded || (redraw pending for > 100 ms)` and writes `WindowOccluded` on
 ///    change; runs `app.update()`; if `!frame_ready` and no redraw is pending, calls
 ///    `window.request_redraw()` and records the time; exits the loop on `app.should_exit()`.
+///    The update still runs in `about_to_wait`; idle steps ([`App::run_idle`], ADR 0022) run
+///    in the later iterations of the wait, never in the iteration of the update.
 ///    Control flow: `Continuous` waits for the next [`FrameLimit`] deadline (`WaitUntil` the
 ///    deadline minus the spin margin, then a spin; `Poll` when unlimited); `Reactive` waits
 ///    `WaitUntil(now + wait)` but never runs an update before the limit allows it; while
@@ -179,6 +182,20 @@ impl Default for RunnerSettings {
 ///   is one long frame instead of an update that is never shown, a limit above the refresh
 ///   rate no longer runs updates that cannot be shown, and each frame gets the most time
 ///   before the compositor's deadline.
+/// - Idle steps (ADR 0022): in `Continuous` mode, when the app has `Idle` systems and an update
+///   ends with time to wait, the runner opens an idle slot that ends `IDLE_MARGIN` before the
+///   earlier of the deadline's spin margin and the wait's own wake-up (a refresh plus a quarter
+///   when the gate is closed and updates follow the display, the earliest start when a frame
+///   callback came early). The iteration of the update sets `ControlFlow::Poll` instead of its
+///   wait, so winit flushes the connection and delivers a redraw that answers at once (X11, or a
+///   Wayland window nothing presents to) before the first step, stamped as quick as before. Each
+///   later iteration of the wait runs one step (`App::run_idle`, at most `IDLE_STEP`): `Poll`
+///   again while the systems are `Ready`, a `WaitUntil` of at most `IDLE_POLL` while they are
+///   `Waiting`, the plain wait once they are `Done` or the slot is over. Events, the gate and
+///   the deadline are checked between steps, so an update is never held by one; an event that
+///   arrives during a step (a frame callback more than 1 ms early) is handled when it returns.
+///   `IdleInfo` reports the steps of each gap. Without `Idle` systems, unlimited, in `Reactive`
+///   mode, or when the update ran late, nothing changes.
 pub fn winit_runner(mut app: App, event_loop: EventLoop<()>) -> AppExit {
     let settings = app
         .world()
@@ -188,6 +205,7 @@ pub fn winit_runner(mut app: App, event_loop: EventLoop<()>) -> AppExit {
     app.world_mut().init_resource::<WindowState>();
     app.world_mut().init_resource::<FramePacingInfo>();
     app.world_mut().init_resource::<FrameDeadline>();
+    app.world_mut().init_resource::<IdleInfo>();
     let mut handler = WinitApp::new(app, settings);
     let result = event_loop.run_app(&mut handler);
     // `exiting` normally did this already; it is a no-op then.
@@ -349,8 +367,17 @@ impl ApplicationHandler for WinitApp {
                 // Then ask again: the frame may still wait for its presentation gate.
                 FrameWait::Spin { until } => spin_until(until),
                 FrameWait::Sleep { wake } => {
-                    // Woken early (an event), or waiting for the gate: keep waiting.
-                    event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
+                    // Woken early (an event, an idle poll), or waiting for the gate: an idle
+                    // step if the slot has room for one, then keep waiting.
+                    let now = Instant::now();
+                    let flow = match self.core.idle_step(now, wake) {
+                        Some(until) => {
+                            let work = self.app.run_idle(until);
+                            self.core.after_idle(now, Instant::now(), work, wake)
+                        }
+                        None => ControlFlow::WaitUntil(wake),
+                    };
+                    event_loop.set_control_flow(flow);
                     return;
                 }
             }
@@ -379,6 +406,7 @@ impl ApplicationHandler for WinitApp {
             event_loop.exit();
             return;
         }
+        self.core.idle_systems = self.app.has_idle_systems();
         let end = self.core.end_update(self.app.world(), Instant::now());
         if end.request_redraw {
             window.request_redraw();
@@ -456,6 +484,14 @@ struct RunnerCore {
     update_started: Option<Instant>,
     /// How long the previous update took (for [`FrameDeadline`]).
     last_update: Duration,
+    /// The app has `Idle` systems (refreshed after every update).
+    idle_systems: bool,
+    /// When the open idle slot ends (`None`: no slot).
+    idle_end: Option<Instant>,
+    /// What the `Idle` systems wanted after the latest step.
+    idle_work: IdleWork,
+    /// Idle steps of the current gap, published as [`IdleInfo`] by `begin_update`.
+    idle: IdleInfo,
 }
 
 impl RunnerCore {
@@ -488,6 +524,10 @@ impl RunnerCore {
             cadence_mismatch: false,
             update_started: None,
             last_update: Duration::ZERO,
+            idle_systems: false,
+            idle_end: None,
+            idle_work: IdleWork::Done,
+            idle: IdleInfo::default(),
         }
     }
 
@@ -803,9 +843,16 @@ impl RunnerCore {
         }
     }
 
-    /// Before an update: publish occlusion (winit's report, the polled minimized state or the
-    /// redraw watchdog), [`FramePacingInfo`] and [`FrameDeadline`].
+    /// Before an update: close the idle slot, publish occlusion (winit's report, the polled
+    /// minimized state or the redraw watchdog), [`FramePacingInfo`], [`FrameDeadline`] and
+    /// [`IdleInfo`].
     fn begin_update(&mut self, world: &mut World, now: Instant) {
+        self.idle_end = None;
+        self.idle_work = IdleWork::Done;
+        let idle = self.idle.take_gap();
+        if let Some(mut info) = world.get_resource_mut::<IdleInfo>() {
+            *info = idle;
+        }
         let stalled = self
             .redraw_pending_since
             .is_some_and(|since| now.saturating_duration_since(since) > REDRAW_TIMEOUT);
@@ -872,7 +919,8 @@ impl RunnerCore {
 
     /// After an update: request the next redraw if the presentation gate was consumed, and pick
     /// the pacing (with the [`FrameLimit`] of now: a change made during the update paces the
-    /// next one).
+    /// next one). A wait with room for idle steps opens an idle slot and polls instead
+    /// ([`RunnerCore::open_idle`]).
     fn end_update(&mut self, world: &World, now: Instant) -> EndOfUpdate {
         if let Some(started) = self.update_started.take() {
             self.last_update = now.saturating_duration_since(started);
@@ -886,8 +934,11 @@ impl RunnerCore {
             // The loop may sleep through the whole wait without another `pace`.
             self.gate_hold = held;
         }
+        self.idle_end = None;
+        self.idle_work = IdleWork::Done;
         let control_flow = match self.settings.update_mode {
             UpdateMode::Continuous => match pace {
+                FrameWait::Sleep { wake } if self.open_idle(world, now, wake) => ControlFlow::Poll,
                 FrameWait::Sleep { wake } => ControlFlow::WaitUntil(wake),
                 FrameWait::Ready | FrameWait::Spin { .. } => ControlFlow::Poll,
             },
@@ -908,6 +959,71 @@ impl RunnerCore {
         EndOfUpdate {
             request_redraw,
             control_flow,
+        }
+    }
+
+    /// Opens an idle slot after an update that ended at `now` and waits until `wake`, if the app
+    /// has `Idle` systems and the slot has room for a step: it ends `IDLE_MARGIN` before the
+    /// earlier of the next deadline's spin margin and `wake`. Following the display, `wake` is
+    /// the latest wait for a closed gate (later than the deadline, so the deadline decides) or
+    /// the earliest start for a callback that came early.
+    fn open_idle(&mut self, world: &World, now: Instant, wake: Instant) -> bool {
+        if !self.idle_systems {
+            return false;
+        }
+        let end = self
+            .pacer
+            .idle_end(self.frame_period(world))
+            .zip(wake.checked_sub(IDLE_MARGIN))
+            .map(|(due, wake)| due.min(wake));
+        let room = |end: Instant| now.checked_add(MIN_IDLE_STEP).is_some_and(|t| t <= end);
+        let Some(end) = end.filter(|&end| room(end)) else {
+            return false;
+        };
+        self.idle_end = Some(end);
+        self.idle_work = IdleWork::Ready;
+        true
+    }
+
+    /// The end of the idle slot for a wait until `wake` (it may have moved since the slot
+    /// opened: a frame callback that came early): `None` without a slot.
+    fn idle_slot_end(&self, wake: Instant) -> Option<Instant> {
+        Some(self.idle_end?.min(wake.checked_sub(IDLE_MARGIN)?))
+    }
+
+    /// The end of an idle step at `now` while the loop waits until `wake` (`None`: no slot,
+    /// the systems are done, or too little of the slot is left).
+    fn idle_step(&self, now: Instant, wake: Instant) -> Option<Instant> {
+        if self.idle_work == IdleWork::Done {
+            return None;
+        }
+        idle_step_end(now, self.idle_slot_end(wake)?)
+    }
+
+    /// After an idle step that ran from `started` to `now`: records it and picks the control
+    /// flow: `Poll` for the next step at once, a short wait while the systems wait for work in
+    /// flight (at most `IDLE_POLL`, never past the slot or `wake`), the plain wait once they
+    /// are done.
+    fn after_idle(
+        &mut self,
+        started: Instant,
+        now: Instant,
+        work: IdleWork,
+        wake: Instant,
+    ) -> ControlFlow {
+        let end = self.idle_slot_end(wake).unwrap_or(now);
+        self.idle.record(started, now, end);
+        self.idle_work = work;
+        match work {
+            IdleWork::Ready => ControlFlow::Poll,
+            IdleWork::Waiting => {
+                let poll = now.checked_add(IDLE_POLL).map_or(end, |poll| poll.min(end));
+                ControlFlow::WaitUntil(if poll > now { poll } else { wake })
+            }
+            IdleWork::Done => {
+                self.idle_end = None;
+                ControlFlow::WaitUntil(wake)
+            }
         }
     }
 }
@@ -1057,6 +1173,7 @@ mod tests {
             .insert_resource(WindowState::default())
             .init_resource::<FramePacingInfo>()
             .init_resource::<FrameDeadline>()
+            .init_resource::<IdleInfo>()
             .insert_resource(CursorOptions {
                 grab: CursorGrab::None,
                 visible: true,
@@ -2141,6 +2258,409 @@ mod tests {
                 wake: t0 + ms(100) - margin
             }
         );
+    }
+
+    const US: Duration = Duration::from_micros(1);
+
+    /// The slot end the runner keeps before a deadline `due`: the spin margin plus
+    /// `IDLE_MARGIN` (1 ms at the default spin margin).
+    fn slot_end(due: Instant) -> Instant {
+        due - FramePacer::DEFAULT_SPIN_MARGIN - IDLE_MARGIN
+    }
+
+    #[test]
+    fn end_update_opens_an_idle_slot_on_the_grid() {
+        let period = FrameLimit::new(144).period().expect("limited");
+        let (mut app, mut core, t0) = paced(144);
+        core.idle_systems = true;
+        core.begin_update(app.world_mut(), t0);
+        app.world_mut().resource_mut::<WindowState>().frame_ready = false;
+        let end = core.end_update(app.world(), t0 + 1000 * US);
+        // Poll first: the redraw is requested as before, and the next iteration runs a step.
+        assert!(end.request_redraw);
+        assert_eq!(end.control_flow, ControlFlow::Poll);
+        let due = t0 + period;
+        assert_eq!(core.idle_end, Some(slot_end(due)));
+        assert_eq!(slot_end(due), due - Duration::from_millis(1));
+        let now = t0 + 1100 * US;
+        let FrameWait::Sleep { wake } = core.pace(app.world(), now) else {
+            panic!("the frame is not due yet");
+        };
+        assert_eq!(core.idle_step(now, wake), Some(now + boxel_app::IDLE_STEP));
+        // Near the end of the slot the step stops there; past it there is none.
+        let late = slot_end(due) - 300 * US;
+        assert_eq!(core.idle_step(late, wake), Some(slot_end(due)));
+        assert_eq!(core.idle_step(slot_end(due) - 100 * US, wake), None);
+    }
+
+    #[test]
+    fn the_display_locked_slot_uses_the_callback_due() {
+        let panel = Duration::from_nanos(1_000_000_000_000 / u64::from(PANEL_MHZ));
+        let (mut app, mut core, t0) = display(144);
+        core.idle_systems = true;
+        let end = present(&mut app, &mut core, t0);
+        assert_eq!(end.control_flow, ControlFlow::Poll);
+        // The closed gate waits up to a refresh and a quarter past the deadline; the slot ends
+        // 1 ms before the deadline anyway.
+        let due = t0 + panel;
+        assert_eq!(core.idle_end, Some(slot_end(due)));
+        let now = t0 + 900 * US;
+        let wake = due + panel + panel / 4;
+        assert_eq!(core.pace(app.world(), now), FrameWait::Sleep { wake });
+        assert!(core.idle_step(now, wake).is_some());
+    }
+
+    #[test]
+    fn the_slot_never_reaches_the_runners_own_wake() {
+        let panel = Duration::from_nanos(1_000_000_000_000 / u64::from(PANEL_MHZ));
+        let (mut app, mut core, t0) = display(144);
+        core.idle_systems = true;
+        present(&mut app, &mut core, t0);
+        let due = t0 + panel;
+        // A callback far too early: the update waits for half a period before the deadline,
+        // and the slot ends `IDLE_MARGIN` before that.
+        let early = t0 + 1500 * US;
+        core.gate_opened(app.world_mut(), early);
+        let earliest = due - panel / 2;
+        assert_eq!(
+            core.pace(app.world(), early),
+            FrameWait::Sleep { wake: earliest }
+        );
+        let until = core.idle_step(early, earliest).expect("room for a step");
+        assert!(until <= earliest - IDLE_MARGIN);
+        let mut now = early;
+        while let Some(until) = core.idle_step(now, earliest) {
+            assert!(until <= earliest - IDLE_MARGIN);
+            let flow = core.after_idle(now, until, IdleWork::Ready, earliest);
+            assert_eq!(flow, ControlFlow::Poll);
+            now = until;
+        }
+        assert!(now <= earliest - IDLE_MARGIN);
+        assert_eq!(core.idle.overruns, 0);
+        assert_eq!(core.pace(app.world(), earliest), FrameWait::Ready);
+    }
+
+    #[test]
+    fn no_slot_without_idle_systems_a_limit_or_room() {
+        let period = FrameLimit::new(144).period().expect("limited");
+        let open = |core: &mut RunnerCore, app: &App, at: Instant| {
+            let flow = core.end_update(app.world(), at).control_flow;
+            (core.idle_end.is_some(), flow)
+        };
+        // No `Idle` systems: the plain wait.
+        let (mut app, mut core, t0) = paced(144);
+        core.begin_update(app.world_mut(), t0);
+        let at = t0 + 1000 * US;
+        let wake = t0 + period - FramePacer::DEFAULT_SPIN_MARGIN;
+        assert_eq!(
+            open(&mut core, &app, at),
+            (false, ControlFlow::WaitUntil(wake))
+        );
+        core.idle_systems = true;
+        assert_eq!(open(&mut core, &app, at), (true, ControlFlow::Poll));
+        // An update that ended too close to the slot end, in the spin margin or late.
+        let due = t0 + period;
+        for at in [slot_end(due) - 100 * US, due - 100 * US, due + 100 * US] {
+            assert!(!open(&mut core, &app, at).0, "{:?}", at - t0);
+        }
+        // Unlimited.
+        app.insert_resource(FrameLimit::UNLIMITED);
+        assert_eq!(open(&mut core, &app, at), (false, ControlFlow::Poll));
+        // Reactive mode.
+        let (mut app, _, t0) = paced(144);
+        let mut core = RunnerCore::new(RunnerSettings {
+            update_mode: UpdateMode::Reactive {
+                wait: Duration::from_millis(50),
+            },
+            ..RunnerSettings::default()
+        });
+        core.idle_systems = true;
+        core.begin_update(app.world_mut(), t0);
+        assert!(!open(&mut core, &app, t0 + 1000 * US).0);
+        assert_eq!(core.idle_step(t0 + 1100 * US, t0 + period), None);
+    }
+
+    #[test]
+    fn after_idle_picks_the_control_flow() {
+        let period = FrameLimit::new(144).period().expect("limited");
+        let (mut app, mut core, t0) = paced(144);
+        core.idle_systems = true;
+        core.begin_update(app.world_mut(), t0);
+        core.end_update(app.world(), t0 + 500 * US);
+        let due = t0 + period;
+        let wake = due - FramePacer::DEFAULT_SPIN_MARGIN;
+        let end = slot_end(due);
+        let now = t0 + 1000 * US;
+        assert_eq!(
+            core.after_idle(t0 + 600 * US, now, IdleWork::Ready, wake),
+            ControlFlow::Poll
+        );
+        assert_eq!(
+            core.after_idle(now, now + 200 * US, IdleWork::Waiting, wake),
+            ControlFlow::WaitUntil(now + 200 * US + IDLE_POLL)
+        );
+        // Near the end the poll stops at the end; past it, the plain wait.
+        assert_eq!(
+            core.after_idle(end - 400 * US, end - 100 * US, IdleWork::Waiting, wake),
+            ControlFlow::WaitUntil(end)
+        );
+        assert_eq!(
+            core.after_idle(end - 400 * US, end + 50 * US, IdleWork::Waiting, wake),
+            ControlFlow::WaitUntil(wake)
+        );
+        // Done closes the slot until the next update.
+        assert!(
+            core.idle_step(end - Duration::from_millis(2), wake)
+                .is_some()
+        );
+        assert_eq!(
+            core.after_idle(end - 1500 * US, end - 1400 * US, IdleWork::Done, wake),
+            ControlFlow::WaitUntil(wake)
+        );
+        assert_eq!(core.idle_step(end - Duration::from_millis(1), wake), None);
+        // The next update publishes the gap: 5 steps, one past the slot end by 50 us.
+        core.begin_update(app.world_mut(), due);
+        let info = *app.world().resource::<IdleInfo>();
+        assert_eq!(info.steps, 5);
+        assert_eq!(info.tail, (400 + 200 + 300 + 450 + 100) * US);
+        assert_eq!((info.overruns, info.overrun_max), (1, 50 * US));
+        // The update after it starts a new gap; overruns add up.
+        core.end_update(app.world(), due + 500 * US);
+        core.begin_update(app.world_mut(), due + period);
+        let info = *app.world().resource::<IdleInfo>();
+        assert_eq!(
+            (info.steps, info.tail, info.overruns),
+            (0, Duration::ZERO, 1)
+        );
+    }
+
+    #[test]
+    fn a_quick_redraw_is_stamped_before_the_first_idle_step() {
+        // A Wayland window nothing presents to: its redraw answers at once. The update's
+        // iteration polls, so the answer is handled (and stamped) before any step.
+        let (mut app, mut core, t0) = display(144);
+        core.idle_systems = true;
+        let quick = |core: &RunnerCore| (core.quick_gates, core.gate_was_callback);
+        let mut now = t0;
+        for i in 0..QUICK_GATES_MAX {
+            assert!(core.display_period(app.world()).is_some(), "quick gate {i}");
+            now = ready_at(&app, &mut core, now);
+            let end = present(&mut app, &mut core, now);
+            assert_eq!(end.control_flow, ControlFlow::Poll, "quick gate {i}");
+            let requested = core.redraw_pending_since.expect("requested");
+            core.gate_opened(app.world_mut(), requested + 50 * US);
+            assert_eq!(quick(&core), (i + 1, false), "quick gate {i}");
+            // Then idle steps until the systems are done.
+            now = requested + 50 * US;
+            while let FrameWait::Sleep { wake } = core.pace(app.world(), now)
+                && let Some(until) = core.idle_step(now, wake)
+            {
+                core.after_idle(now, until, IdleWork::Ready, wake);
+                now = until;
+            }
+        }
+        assert_eq!(core.display_period(app.world()), None);
+    }
+
+    #[test]
+    fn a_callback_during_a_poll_runs_the_update_at_once() {
+        let panel = Duration::from_nanos(1_000_000_000_000 / u64::from(PANEL_MHZ));
+        let (mut app, mut core, t0) = display(144);
+        core.idle_systems = true;
+        present(&mut app, &mut core, t0);
+        let due = t0 + panel;
+        let latest = due + panel + panel / 4;
+        let now = slot_end(due) - 300 * US;
+        let flow = core.after_idle(now - 200 * US, now, IdleWork::Waiting, latest);
+        assert_eq!(flow, ControlFlow::WaitUntil(now + IDLE_POLL));
+        // The frame callback wakes the loop before the poll ends: the update runs.
+        let callback = due - 200 * US;
+        core.gate_opened(app.world_mut(), callback);
+        assert_eq!(core.pace(app.world(), callback), FrameWait::Ready);
+        core.begin_update(app.world_mut(), callback);
+        assert_eq!(core.idle_end, None);
+        assert_eq!(app.world().resource::<IdleInfo>().steps, 1);
+    }
+
+    #[test]
+    fn the_occluded_slot_uses_the_occluded_period() {
+        let (mut app, mut core, t0) = paced(144);
+        core.idle_systems = true;
+        core.winit_occluded = true;
+        core.begin_update(app.world_mut(), t0);
+        assert_eq!(
+            core.end_update(app.world(), t0 + 500 * US).control_flow,
+            ControlFlow::Poll
+        );
+        assert_eq!(core.idle_end, Some(slot_end(t0 + OCCLUDED_WAIT)));
+    }
+
+    /// What a run of [`simulate`] saw, with instants as times since its start.
+    #[derive(Debug, Default, PartialEq)]
+    struct Trace {
+        /// Update starts.
+        starts: Vec<Duration>,
+        /// `FramePacingInfo` of each update: gate wait, gate missed, display locked, the
+        /// counters of waits and misses, and the latest gate opening.
+        pacing: Vec<(Duration, bool, bool, u64, u64, Option<Duration>)>,
+        /// Gate classification at the end.
+        gates: (u8, u8, bool),
+        /// Median frame callback interval at the end.
+        cadence: Option<Duration>,
+    }
+
+    /// Runs `updates` updates on a synthetic event loop from `now`: each update takes 0.8 ms
+    /// and presents, and the compositor answers a redraw requested at `r` at `callback(r)`.
+    /// Events are handled between loop iterations, so one that comes during an idle step is
+    /// stamped when the step returns. With `idle`, the `Idle` systems take up to 0.4 ms a step
+    /// and answer `Ready`, then `Waiting` three times, then `Done`. Returns the trace and the
+    /// idle steps run.
+    fn simulate(
+        app: &mut App,
+        core: &mut RunnerCore,
+        mut now: Instant,
+        updates: usize,
+        idle: bool,
+        callback: impl Fn(Instant) -> Instant,
+    ) -> (Trace, u32) {
+        let mut trace = Trace::default();
+        let base = now;
+        let (mut flow, mut pending, mut gap, mut steps) = (ControlFlow::Poll, None, 0, 0);
+        core.idle_systems = idle;
+        while trace.starts.len() < updates {
+            let wake = match flow {
+                ControlFlow::Poll => now,
+                ControlFlow::WaitUntil(at) => at.max(now),
+                ControlFlow::Wait => unreachable!("continuous updates always wake"),
+            };
+            match pending {
+                Some(at) if at <= wake => {
+                    now = now.max(at);
+                    pending = None;
+                    core.gate_opened(app.world_mut(), now);
+                }
+                _ => now = wake,
+            }
+            let waited = loop {
+                match core.pace(app.world(), now) {
+                    FrameWait::Ready => break None,
+                    FrameWait::Spin { until } => now = until,
+                    FrameWait::Sleep { wake } => {
+                        break Some(match core.idle_step(now, wake) {
+                            Some(until) => {
+                                let started = now;
+                                now = (now + 400 * US).min(until);
+                                gap += 1;
+                                steps += 1;
+                                let work = match gap {
+                                    1 => IdleWork::Ready,
+                                    2..=4 => IdleWork::Waiting,
+                                    _ => IdleWork::Done,
+                                };
+                                core.after_idle(started, now, work, wake)
+                            }
+                            None => ControlFlow::WaitUntil(wake),
+                        });
+                    }
+                }
+            };
+            if let Some(waited) = waited {
+                flow = waited;
+                continue;
+            }
+            core.begin_update(app.world_mut(), now);
+            trace.starts.push(now - base);
+            let p = *app.world().resource::<FramePacingInfo>();
+            trace.pacing.push((
+                p.gate_wait,
+                p.gate_missed,
+                p.display_locked,
+                p.gate_waits,
+                p.gate_misses,
+                p.gate_opened_at
+                    .map(|at| at.saturating_duration_since(base)),
+            ));
+            app.world_mut().resource_mut::<WindowState>().frame_ready = false;
+            now += 800 * US;
+            let end = core.end_update(app.world(), now);
+            if end.request_redraw {
+                pending = Some(callback(now));
+            }
+            flow = end.control_flow;
+            gap = 0;
+        }
+        trace.gates = (core.quick_gates, core.slow_gates, core.gate_was_callback);
+        trace.cadence = core.cadence.median();
+        (trace, steps)
+    }
+
+    /// The compositor's frame callbacks from `base`: one every 6.95 ms (the measured cadence
+    /// of the 144.002 Hz panel, ADR 0017) with up to 0.25 ms of jitter, answering the redraws
+    /// committed 0.1 ms before; every 13th refresh is skipped (the callback comes one later).
+    fn compositor(base: Instant) -> impl Fn(Instant) -> Instant {
+        let refresh = Duration::from_micros(6950);
+        move |requested: Instant| {
+            let mut n: u32 = 1;
+            loop {
+                let jitter = i64::from(n * 7919 % 501) - 250;
+                let vblank = base + refresh * n;
+                let vblank = if jitter >= 0 {
+                    vblank + US * jitter.unsigned_abs() as u32
+                } else {
+                    vblank - US * jitter.unsigned_abs() as u32
+                };
+                if vblank > requested + 100 * US && !n.is_multiple_of(13) {
+                    return vblank;
+                }
+                n += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn idle_steps_leave_display_lock_and_cadence_unchanged() {
+        // Following the display: the callbacks come within 0.5 ms of each deadline, after the
+        // slot ends, so every update, wait, lock decision and cadence sample is the same.
+        let run = |idle: bool| {
+            let (mut app, mut core, t0) = display(144);
+            simulate(&mut app, &mut core, t0, 300, idle, compositor(t0))
+        };
+        let (without, none) = run(false);
+        let (with, steps) = run(true);
+        assert_eq!(none, 0);
+        assert!(steps >= 4 * 290, "{steps} idle steps");
+        assert!(with.pacing.iter().all(|p| p.2), "display locked");
+        assert!(
+            with.pacing.iter().any(|p| p.0 > Duration::ZERO),
+            "gate waits"
+        );
+        assert_eq!(with, without);
+
+        // A limit under the refresh rate keeps its grid: callbacks may come during a step and
+        // are stamped late, but the updates and their gate waits are the same.
+        let run = |idle: bool| {
+            let (mut app, mut core, t0) = display(144);
+            app.insert_resource(FrameLimit::new(120));
+            simulate(&mut app, &mut core, t0, 300, idle, compositor(t0))
+        };
+        let (without, _) = run(false);
+        let (with, steps) = run(true);
+        assert!(steps > 0);
+        assert_eq!(with.starts, without.starts);
+        let waits = |t: &Trace| -> Vec<_> { t.pacing.iter().map(|p| (p.0, p.1, p.2)).collect() };
+        assert_eq!(waits(&with), waits(&without));
+
+        // X11: the redraw answers at once, before any step.
+        let run = |idle: bool| {
+            let (mut app, mut core, t0) = paced(144);
+            // `paced` stamps its first gate with the real clock.
+            core.gate_opened_at = Some(t0);
+            simulate(&mut app, &mut core, t0, 100, idle, |requested| requested)
+        };
+        let (without, _) = run(false);
+        let (with, steps) = run(true);
+        assert!(steps > 0);
+        assert_eq!(with, without);
     }
 
     #[test]
