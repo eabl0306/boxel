@@ -1,7 +1,8 @@
 # El mundo entre frames: mediciones (2026-10-08)
 
 Issue #3, ADR 0022. Rama `perf/catchup`. Primero el A/B con la máquina libre, que es el que vale.
-Al final, la primera medición rápida, hecha con la máquina cargada.
+Al final, la primera medición rápida, hecha con la máquina cargada. La comparación completa contra
+main (ritmo, vsync, 60 fps, 780M, spans) está en [puesta-al-dia](puesta-al-dia-2026-10.md).
 
 ## A/B con la máquina libre
 
