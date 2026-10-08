@@ -182,6 +182,11 @@ impl Uploads {
         std::mem::take(&mut self.lost)
     }
 
+    /// True if a flush lost copies since [`Uploads::take_lost`] was last called (kept).
+    pub fn lost(&self) -> bool {
+        self.lost
+    }
+
     /// Makes the next staging buffer fail like one that cannot be created (too large or out of
     /// memory): wgpu reports the error and its copies are lost.
     pub fn fail_next_batch(&mut self) {

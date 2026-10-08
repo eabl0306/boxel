@@ -552,7 +552,8 @@ impl VoxelRenderer {
     /// the frames it is used in ([`boxel_world::ChunkVisibility::update`]), told about the
     /// chunks this renderer refused ([`VoxelRenderer::take_refused`]): a stale set can hide a
     /// chunk that became visible. A `render` after an upload was refused, whose set reached
-    /// that chunk, draws without the set.
+    /// that chunk, draws without the set, and so does one that lost uploads
+    /// ([`VoxelRenderer::take_lost_uploads`]), until they are taken.
     pub fn set_visibility(&mut self, set: Option<Arc<VisibleSet>>) {
         self.occlusion.set(set);
     }
@@ -709,7 +710,8 @@ impl VoxelRenderer {
     /// (a staging buffer could not be created, as when out of memory). The frame itself is valid
     /// and runs without them, so nothing else reports it: the GPU no longer matches the resident
     /// chunks until every chunk is uploaded again ([`VoxelRenderer::clear_chunks`], then
-    /// [`VoxelRenderer::upsert_chunk`] each).
+    /// [`VoxelRenderer::upsert_chunk`] each). Until this is called, frames draw without the
+    /// visible set ([`VoxelRenderer::set_visibility`]).
     pub fn take_lost_uploads(&mut self) -> bool {
         self.uploads.take_lost()
     }
@@ -767,10 +769,13 @@ impl VoxelRenderer {
         }
         debug_assert!(self.chunks.is_synced());
         let slot_count = self.chunks.slot_count();
-        // Cave culling, unless this frame's set reached a chunk whose upload was just refused:
-        // the set trusted its links, but the renderer does not show it as the world has it.
+        // Cave culling, unless this frame's set reached a chunk whose upload was just refused
+        // (the set trusted its links, but the renderer does not show it as the world has it), or
+        // uploads were lost since the caller last asked: the set may trust the links of chunks
+        // whose meshes never reached the GPU (the world shows a chunk from the frame its mesh is
+        // published), and the caller resyncs only after this frame.
         let reached_refused = self.refused.take_fresh(self.occlusion.set.as_deref());
-        let culled = self.occlusion.set.is_some() && !reached_refused;
+        let culled = self.occlusion.set.is_some() && !reached_refused && !self.uploads.lost();
         let (sky_light, light_params, light_curve) = view.light.uniform();
         let uniform = ViewUniform {
             view_proj: view.view_proj.to_cols_array_2d(),

@@ -74,7 +74,12 @@ subterráneas, el siguiente paso son subceldas de 16³ o Hi-Z.
   avisa (`ChunkMeshResync`) y el mundo manda la próxima malla de esos chunks aunque sea igual a
   la anterior, y hasta entonces no los muestra. Antes no la mandaba: el chunk quedaba sin dibujar
   y la búsqueda confiaba en sus enlaces. El frame del resync no oculta nada: el mundo se entera
-  recién en el siguiente.
+  recién en el siguiente (`boxel_render::frame_visibility`).
+- Un frame que pierde sus subidas (no se pudo crear el buffer de staging, como sin memoria)
+  tampoco oculta nada: el mundo ya muestra los chunks que publicó en ese frame y confía en sus
+  enlaces, pero la GPU no tiene sus mallas. El render lo sabe al subir, antes de dibujar, y no
+  usa el conjunto hasta que el plugin recoge la pérdida (`VoxelRenderer::take_lost_uploads`) y
+  pide el resync para el frame siguiente.
 - El mapa anota cada cambio de esos enlaces, y el paso nuevo `WorldSystems::Visibility` (después
   de `Collect`) los pasa a `ChunkVisibility`.
 
@@ -198,10 +203,13 @@ depende del chunk del ojo y no de su vóxel. `VisibilityStats::blocked` cuenta e
   y no oculta nada en 15 vistas con el ojo dentro de la roca o a 1/64 de una pared (sin la
   guarda, esas vistas pierden píxeles en todos los tiers). Con dos chunks rechazados delante del
   ojo, los píxeles tampoco cambian, ni en el frame del rechazo ni después; confiar en sus enlaces
-  o solo abrirlos pierde píxeles. Con mallas que faltan o que son viejas (un chunk con datos y sin
-  malla entre el ojo y chunks dibujados, las mallas de una edición publicadas en partes, un mundo
-  que se carga con sus jobs en cualquier orden), rayos de vóxeles por lo que las mallas publicadas
-  dibujan solo cruzan chunks visibles (`cave_culling_drawn`), y el render da los mismos píxeles
-  con las mallas que el mundo publicó, en los tres tiers; sin `XRAY` pierde píxeles (y los perdía
-  antes del arreglo).
+  o solo abrirlos pierde píxeles. Tampoco cambian en el frame que pierde sus subidas con dos
+  chunks recién publicados delante del ojo; ocultar ese frame pierde píxeles. Con mallas que
+  faltan o que son viejas (un chunk con datos y sin malla entre el ojo y chunks dibujados, las
+  mallas de una edición publicadas en partes, un mundo que se carga con sus jobs en cualquier
+  orden), rayos de vóxeles por lo que las mallas publicadas dibujan solo cruzan chunks visibles
+  (`cave_culling_drawn`), y el render da los mismos píxeles con las mallas que el mundo publicó y
+  el conjunto del plugin, en los tres tiers; sin `XRAY` pierde píxeles (y los perdía antes del
+  arreglo). Lo mismo con un resync del render mientras se remalla un chunk por un cambio que no
+  toca lo que ocluye; ocultar en el frame del resync pierde píxeles.
 - Mediciones en `docs/rendimiento/cuevas-fase4-2026-10.md`.

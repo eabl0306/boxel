@@ -24,6 +24,9 @@
 //! (no mesh yet, the meshes of an edit published apart, a renderer resync while a chunk is
 //! remeshed).
 //!
+//! A third case loses the uploads of the frame that publishes two chunks ahead of the eye (its
+//! staging buffer cannot be created): that frame must cull nothing.
+//!
 //! Failing images are saved under `CARGO_TARGET_TMPDIR/gpu_cave_culling/`.
 #![expect(clippy::print_stderr, reason = "test progress and failure details")]
 use boxel_camera::{Camera, CameraView};
@@ -889,6 +892,194 @@ fn refused_uploads_hide_nothing() {
                 report.failures.push(format!(
                     "{label} {tier}: no view loses pixels trusting refused chunks (the test proves \
                      nothing)"
+                ));
+            }
+        }
+    }
+    assert!(
+        report.failures.is_empty(),
+        "{} failures:\n{}",
+        report.failures.len(),
+        report.failures.join("\n")
+    );
+    assert!(
+        rendered > 0 || !gpu_tests_required(),
+        "BOXEL_REQUIRE_GPU=1 but no tier could render"
+    );
+}
+
+// ---------------------------------------------------------------- lost uploads
+
+/// Per view, with two chunks ahead of the eye uploaded in a frame whose uploads are lost (its
+/// staging buffer cannot be created, as when out of memory): that frame without culling, the
+/// same frame with a set that trusts their links (the world shows a chunk from the frame its
+/// mesh is published), and the next frame with that set, before any resync (what the lost frame
+/// drew before the fix).
+struct LostImages {
+    plain: RgbaImage,
+    culled: RgbaImage,
+    after: RgbaImage,
+}
+
+/// One frame of `renderer` whose uploads are lost (`debug_fail_next_upload`): wgpu reports the
+/// staging buffer (taken off `errors`) and the renderer says so (`take_lost_uploads`).
+fn render_losing_uploads(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    renderer: &mut VoxelRenderer,
+    view: &ViewParams,
+    errors: &Mutex<Vec<String>>,
+) -> Result<RgbaImage, String> {
+    let before = errors.lock().map_err(|e| e.to_string())?.len();
+    renderer.debug_fail_next_upload();
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("gpu_cave_culling lost uploads"),
+    });
+    renderer.render(device, queue, &mut encoder, view);
+    if !renderer.take_lost_uploads() {
+        return Err("the uploads were not lost".to_string());
+    }
+    {
+        let mut errors = errors.lock().map_err(|e| e.to_string())?;
+        if errors.len() == before {
+            return Err("no error for the staging buffer".to_string());
+        }
+        // expected: the tier fails on any other uncaptured error
+        errors.truncate(before);
+    }
+    submit_and_wait(device, queue, encoder)?;
+    read_texture_rgba8(device, queue, renderer.main_color())
+}
+
+fn render_lost(
+    adapter: &wgpu::Adapter,
+    caps: &AdapterCaps,
+    tier: Tier,
+    scene: &Scene,
+    views: &[(&View, Vec<ChunkPos>)],
+) -> Result<Vec<LostImages>, String> {
+    let (device, queue, errors) = device_for(adapter, caps, tier)?;
+    let config = RendererConfig {
+        arena_quads: 1 << 21,
+        max_chunk_slots: 1024,
+        translucent_sort: TranslucentSort::Inline,
+    };
+    let textures = boxel_render::generate_block_textures(scene.registry.textures());
+    let links = |p: ChunkPos| scene.links.get(&p).copied().unwrap_or(ALL_LINKS);
+    let mut out = Vec::new();
+    for (view, lost) in views {
+        let (params, cv) = view_params(view, I64Vec3::ZERO);
+        let search = VisibilityView::new(cv.render_origin, Some(cv.frustum), 8, 8);
+        let trusting = Arc::new(visible_chunks(&search, links));
+        // A new renderer per lost frame: the arena and the table hold the same bytes where the
+        // lost copies should have gone, so the two frames draw the same chunks.
+        let lost_frame = |set: Option<Arc<VisibleSet>>| {
+            let mut renderer = VoxelRenderer::new(
+                &device,
+                &queue,
+                tier,
+                &config,
+                &textures,
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+                UVec2::new(WIDTH, HEIGHT),
+            )
+            .map_err(|e| format!("VoxelRenderer::new: {e}"))?;
+            for (pos, mesh) in scene.meshes.iter().filter(|(p, _)| !lost.contains(p)) {
+                renderer
+                    .upsert_chunk(chunk_id(*pos), pos.origin().as_i64vec3(), Arc::clone(mesh))
+                    .map_err(|e| format!("upsert {pos:?}: {e}"))?;
+            }
+            render(&device, &queue, &mut renderer, &params)?; // warm-up (translucent sort)
+            render(&device, &queue, &mut renderer, &params)?;
+            for pos in lost {
+                let mesh = scene.meshes.iter().find(|(p, _)| p == pos).expect("mesh");
+                renderer
+                    .upsert_chunk(
+                        chunk_id(*pos),
+                        pos.origin().as_i64vec3(),
+                        Arc::clone(&mesh.1),
+                    )
+                    .map_err(|e| format!("upsert {pos:?}: {e}"))?;
+            }
+            renderer.set_visibility(set);
+            let image = render_losing_uploads(&device, &queue, &mut renderer, &params, &errors)?;
+            Ok::<_, String>((renderer, image))
+        };
+        let (_, plain) = lost_frame(None)?;
+        let (mut renderer, culled) = lost_frame(Some(Arc::clone(&trusting)))?;
+        let after = render(&device, &queue, &mut renderer, &params)?;
+        out.push(LostImages {
+            plain,
+            culled,
+            after,
+        });
+    }
+    let errors = errors.lock().map(|e| e.clone()).unwrap_or_default();
+    if !errors.is_empty() {
+        return Err(format!("uncaptured errors: {errors:?}"));
+    }
+    Ok(out)
+}
+
+/// A frame whose chunk uploads are lost (a staging buffer that cannot be created, as when out
+/// of memory) culls nothing: the world already shows the chunks it published that frame and
+/// trusts their links, but the GPU does not hold their meshes, so the rock around them shows
+/// what lies behind it. The render plugin resyncs on the next frame (which culls nothing
+/// either). Culling that frame with the set loses pixels.
+#[test]
+fn lost_uploads_hide_nothing() {
+    let (_instance, adapters) = adapters();
+    if adapters.is_empty() {
+        assert!(!gpu_tests_required(), "BOXEL_REQUIRE_GPU=1 but no adapter");
+        eprintln!("skipping: no adapter");
+        return;
+    }
+    let scene = cave_scene();
+    let all = views(&scene);
+    // The two chunks ahead of the eye of `refused_uploads_hide_nothing`, lost instead.
+    let views: Vec<(&View, Vec<ChunkPos>)> = all
+        .iter()
+        .filter(|v| v.name.starts_with("cave") || v.name.starts_with("surface"))
+        .map(|v| (v, refused_chunks(&scene, v)))
+        .filter(|(_, lost)| lost.len() == 2)
+        .collect();
+    assert!(views.len() >= 4, "too few views: {}", views.len());
+    let mut report = Report {
+        failures: Vec::new(),
+        dir: PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("gpu_cave_culling_lost"),
+    };
+    let mut rendered = 0;
+    for adapter in &adapters {
+        let caps = AdapterCaps::from_adapter(adapter);
+        let label = adapter_label(&caps);
+        for tier in allowed_tiers(&caps) {
+            let images = match render_lost(adapter, &caps, tier, &scene, &views) {
+                Ok(images) => images,
+                Err(e) => {
+                    report.failures.push(format!("{label} {tier}: {e}"));
+                    continue;
+                }
+            };
+            rendered += 1;
+            let mut after_lost = 0;
+            for ((view, _), r) in views.iter().zip(&images) {
+                let name = format!("{label}_{tier}_lost_{}", view.name);
+                report.identical(
+                    &format!("{label} {tier} {} lost uploads, culled frame", view.name),
+                    (&format!("{name}_plain"), &r.plain),
+                    (&format!("{name}_culled"), &r.culled),
+                );
+                after_lost += usize::from(r.plain.compare(&r.after, 0).differing_pixels > 0);
+            }
+            eprintln!(
+                "gpu_cave_culling: {label} {tier}: of {} views with lost uploads, {after_lost} \
+                 lose pixels culling with the set",
+                views.len()
+            );
+            if after_lost == 0 {
+                report.failures.push(format!(
+                    "{label} {tier}: no view loses pixels culling with lost uploads (the test \
+                     proves nothing)"
                 ));
             }
         }
