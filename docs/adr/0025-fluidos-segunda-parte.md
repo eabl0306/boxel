@@ -50,7 +50,7 @@ mar, el agua queda quieta como una pared vertical, porque el agua generada no pr
 
 - Como Minecraft (`LiquidBlock::shouldSpreadLiquid`): una celda de lava con agua arriba o al lado
   se endurece en el acto. Una fuente se vuelve obsidiana y el resto, adoquín. El agua debajo no
-  cuenta.
+  cuenta. Un bloque con agua cuenta como agua.
 - Lava que cae sobre agua la vuelve piedra (`LavaFluid::spreadTo`).
 - Entre fluidos rige `canBeReplacedWith`: el agua solo cede ante lava que cae; la lava solo ante
   agua, si tiene al menos 4/9 de alto. Un fluido puede pasar por celdas del otro al buscar la
@@ -61,26 +61,131 @@ mar, el agua queda quieta como una pared vertical, porque el agua generada no pr
   (jugador, herramientas) corre al principio de los ticks del frame siguiente, antes de cualquier
   tick vencido, a la hora del juego de la edición. Si la reacción cambió el bloque, no se programa
   su tick.
-- Bloques nuevos al final de la lista: `boxel:cobblestone` y `boxel:obsidian`, cubos opacos con
-  textura procedural (un patrón de piedras nuevo, `TexturePattern::Cobble`, y motas violetas) y
-  receta de pack (`block/cobblestone`, `block/obsidian`).
+- Bloques nuevos: `boxel:cobblestone` y `boxel:obsidian`, cubos opacos con textura procedural (un
+  patrón de piedras nuevo, `TexturePattern::Cobble`, y motas violetas) y receta de pack
+  (`block/cobblestone`, `block/obsidian`).
 
-### 4. Ids
+### 4. Bloques con agua (`waterlogged`)
 
-La lava pasa de 1 a 16 estados: los ids después de ella se corren 15 (vidrio 49, losas desde 50,
-plantas 53 y 54, escaleras desde 55, valla desde 215, antorchas desde 231), y adoquín y obsidiana
-quedan en 236 y 237. Los ids no se guardan (la persistencia guardará nombres), así que solo cambian
-tests.
+**Estados.** Las losas (menos la doble), las escaleras y la valla tienen la propiedad
+`waterlogged` de Minecraft (`WATERLOGGED`). En las escaleras ya existía y no hacía nada.
+
+- `StateFlags::WATERLOGGED` marca los estados que guardan una fuente de agua y
+  `StateFlags::WATERLOGGABLE` los que podrían. Un cubo completo (la losa doble) no es ninguna de
+  las dos cosas, diga lo que diga su propiedad.
+- El agua no cambia el modelo, la colisión ni la textura del bloque. La valla con agua corta el
+  cielo directo como el agua (opacidad 1); losas y escaleras ya lo hacían.
+
+**En el fluido** (`boxel_world::fluid`, las reglas de `FlowingFluid` con contenedores):
+
+- Un bloque con agua es una fuente de agua: tiene tick (`BlockTicks::register_state`, sus estados
+  secos no), corre y cuenta como fuente para sus vecinos.
+- Entre dos celdas, un fluido pasa solo donde las caras de colisión de ambas, la de cada una hacia
+  la otra, dejan abierta parte de la cara (`canPassThroughWall`). El agua de una losa de abajo sale
+  por los costados y nunca por el piso.
+- El agua que corre no llena un bloque: lo frena como cualquier sólido. Pero donde el agua haría
+  una fuente nueva (dos fuentes al lado y piso firme), un bloque seco que puede tener agua la toma
+  y queda con agua (`canPlaceLiquid`).
+- El simulador de fuerza bruta de los tests modela todo esto y el motor coincide con él en cada
+  tick de juego, también en terreno al azar con losas y vallas, secas y con agua, y lejos del
+  origen.
+
+**En el juego** (`boxel_voxel::rules`, puras, y `voxel_world`):
+
+- `placed_into`: un bloque que puede tener agua, puesto en una fuente de agua, se la queda; en
+  agua que corre o en aire queda seco. Es el `getStateForPlacement` de Minecraft.
+- `broken`: romper un bloque con agua deja su fuente de agua.
+- `voxel_world` además llena un bloque seco cuando se le pone agua encima (la cubeta de Minecraft
+  sobre un bloque que puede tener agua), y la losa doble siempre queda seca. La lava pasa a la
+  barra de bloques.
+
+**En la malla** (`boxel_mesh`), como la dibuja Minecraft:
+
+- La tabla lee un estado con agua como su agua: el gather pone en la celda la fuente de agua
+  (transparente) y guarda el bloque en `PaddedChunk::waterlogged`, ordenado por índice. Así la celda
+  corta caras, se fusiona y calcula alturas como agua para sus vecinos: una losa en un lago es
+  parte del lago y no hay cara entre ellos.
+- Las cajas del bloque se dibujan como las del bloque seco. Una caja vecina seca se oculta contra
+  él como contra uno seco.
+- Su agua se dibuja sola, como celda inclinada (`SHAPE_FLUID_SLOPE`): en la superficie, con sus
+  alturas por esquina; abajo de otra agua o de un bloque, llena (16/16). No se dibuja la cara del
+  agua contra una cara sólida del propio bloque (el piso de una losa de abajo, el respaldo de una
+  escalera). Las demás caras, menos el techo, van 1/512 de bloque hacia adentro de la celda
+  (`GEO_FLUID_INSET_BIT`, `FLUID_INSET`). Minecraft hace lo mismo con 0.001: así la cara del bloque
+  en el borde siempre queda delante y no pelea en profundidad con la del agua.
+
+### 5. Textura de flujo
+
+- Capas nuevas al final: `boxel:water_flow` y `boxel:lava_flow`. Sin pack son un patrón
+  procedural (`TexturePattern::Flow`: rayas que bajan por las columnas y se repiten cada 8 filas).
+  Con pack salen de `block/water_flow` (con el tinte del agua) y `block/lava_flow`. En Minecraft
+  esos sprites miden el doble que un bloque y una cara muestra un cuarto, así que la capa toma el
+  cuarto de arriba a la izquierda de un cuadro del doble del tamaño de la capa.
+- Son la textura de los costados de los dos fluidos, como en Minecraft. El techo muestra la
+  textura quieta, salvo el de una celda inclinada cuyas esquinas tienen pendiente: ahí el mesher
+  pone la de flujo. La dirección es `fluid_flow`, entera: la diferencia de altura entre los dos
+  lados de la celda en x y en z. Cero es un techo a nivel.
+- Forma nueva `SHAPE_FLUID_CUBE` (código 2, libre desde el ADR 0020): las caras de cubo de las
+  celdas de fluido que no son superficie, para que los costados de una cascada también se animen.
+  Se dibuja como `SHAPE_CUBE`.
+- El shader desplaza la textura de flujo con el tiempo: hacia abajo en los costados, y pendiente
+  abajo en un techo inclinado, girada para que su v siga la dirección de `fluid_flow`, que el
+  shader calcula igual desde las alturas. El agua avanza media textura por segundo y la lava
+  (el fluido emisivo) un cuarto.
+- El tiempo va en `ViewUniform::viewport.z`, una componente que estaba libre: el tier Low sigue con
+  un solo bloque de uniforms. El plugin de render lo toma del tiempo de la app y lo envuelve cada
+  60 s (`FLUID_TIME_PERIOD`): las dos velocidades dan texturas enteras en ese período, así no hay
+  salto y el valor sigue chico para `f32`. `snapshot --fluid-time S` fija el momento de la
+  animación (0 por defecto: las mismas imágenes en cada corrida).
+- Es el mismo código en los tres tiers. El test de tiers dibuja la escena especial, ahora con
+  bloques con agua y lava, en otro momento de la animación, y los tres tiers coinciden píxel a
+  píxel.
+
+### 6. Ejemplos
+
+`snapshot` muestra cada parte (las imágenes del dueño están en `shots/fluids2/`, fuera de git):
+
+- costa: `--camera 236.5,53,147,0,-30` en el overworld. Con `--place air@...` en las 9 celdas
+  que la regla deja sólidas (y = 46, de x 232 a 240) se ve la pared de agua de antes;
+- lava, adoquín, obsidiana y piedra: `--fill stone@0,100,0:22,100,20 --place lava@4,101,15
+  --place water@12,101,15 --place lava@16,101,4 --place water@17,101,4 --flow 400`;
+- textura de flujo: un canal con escalones y fuentes en la cabecera, con `--fluid-time 0` y
+  `--fluid-time 0.5` (la textura avanzó media vuelta) y con `--pack`.
+
+### 7. Ids
+
+- La lava pasa de 1 a 16 estados: los ids después de ella se corren 15.
+- Las losas pasan de 3 a 6 estados y la valla de 16 a 32 por `waterlogged`.
+- Queda así: lava 33 a 48, vidrio 49, losas 50 a 55, plantas 56 y 57, escaleras de piedra desde
+  58 y de roble desde 138, valla 218 a 249, antorchas 250 a 254, adoquín 255 y obsidiana 256.
+- Texturas: adoquín y obsidiana son las capas 22 y 23, y las de flujo de agua y lava, 24 y 25.
+- Los ids no se guardan (la persistencia guarda nombres), así que solo cambian tests.
 
 ## Consecuencias
 
-- Los tests de fluidos corren el motor contra el simulador de fuerza bruta, ahora con lava:
-  distancia 3 con paso 2, la bajada a 2 bloques, el secado, obsidiana, adoquín y piedra, terreno al
-  azar con agua y lava y ediciones, lejos del origen y con presupuesto.
+- Los tests de fluidos corren el motor contra el simulador de fuerza bruta, ahora con lava y
+  bloques con agua: distancia 3 con paso 2, la bajada a 2 bloques, el secado, obsidiana, adoquín y
+  piedra, losas y vallas que sueltan agua por sus caras abiertas, bloques secos que toman una
+  fuente nueva, y terreno al azar con agua, lava y bloques con agua, lejos del origen y con
+  presupuesto.
+- El motor de los tests corre todos los ticks vencidos en su frame. Con la máquina cargada, el
+  presupuesto de 1 ms atrasaba una escena grande y la comparación tick a tick fallaba. El
+  presupuesto tiene su propio test.
 - Una lava sola no se ve como el cubo de antes: su techo baja hacia el aire de alrededor.
+- Una losa o una escalera en un lago cuestan un quad de agua propio arriba (no se fusiona con el
+  greedy del lago) y parten el quad del lago a su alrededor.
 - Rendimiento: hoy no se midió (la máquina estaba ocupada). Tocan caminos calientes la generación
   de chunks cerca del mar (la regla de las costas), los ticks de fluidos (la clasificación de
-  estados y la reacción de la lava) y el mesher. Quedan para la próxima ronda de control.
+  estados, las paredes entre celdas, que leen cajas de colisión, y la reacción de la lava), el
+  gather del mesher (los bloques con agua en la pasada de niveles) y su paso de fluidos. Quedan
+  para la próxima ronda de control.
+
+## Fuera de esta parte
+
+- Nadar dentro de un bloque con agua: la física (`SwimPlugin`) mira solo los estados de agua.
+  Queda para la pista de la física.
+- La animación por cuadros de las texturas quietas (las de los packs muestran su primer cuadro).
+- Guardar los ticks con los chunks (llega con la persistencia).
 
 ## Alternativas descartadas
 
@@ -90,3 +195,10 @@ tests.
   segundo y medio, y el agua podría pasar por encima de la lava en ese tiempo.
 - Un mecanismo de reacción solo para la lava dentro de `fluid`: los ticks programados son del
   motor; una reacción genérica sirve también para otros bloques.
+- Guardar el agua de los bloques en una capa aparte del chunk: Minecraft la guarda en el estado y
+  con eso alcanza; una capa más pediría su propio guardado, sus ediciones y su malla.
+- Dibujar el agua de un bloque con agua en el greedy y recortar sus costados donde el bloque los
+  cubre: pide la altura de abajo de cada costado en el quad, y los bits libres no alcanzan. El
+  desplazamiento hacia adentro es un bit y es lo que hace Minecraft.
+- Guardar la dirección del flujo en el quad: las alturas de las esquinas ya la dan, y el mesher y
+  el shader la calculan igual con enteros.

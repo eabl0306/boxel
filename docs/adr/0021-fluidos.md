@@ -182,6 +182,8 @@ grandes y el p50.
 - `waterlogged` (bloques con agua adentro) y las interacciones agua y lava.
 - Guardar los ticks con los chunks (llega con la persistencia, M1).
 
+Las tres primeras y la pared de agua junto a las cuevas (sección 5) están hechas en el ADR 0025.
+
 ## Alternativas descartadas
 
 - Una tabla de alturas por chunk en el arena: necesita un atributo más en Low (un solo bloque de

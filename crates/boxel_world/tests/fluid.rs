@@ -1175,7 +1175,7 @@ fn two_sources_waterlog_the_dry_block_between_them() {
 #[test]
 fn random_terrain_with_waterlogged_blocks_matches_the_simulator() {
     for seed in 0..4u64 {
-        let mut rng = mix(seed ^ 0x7765_74);
+        let mut rng = mix(seed ^ 0x0077_6574);
         let mut roll = |n: u64| {
             rng = mix(rng);
             rng % n
