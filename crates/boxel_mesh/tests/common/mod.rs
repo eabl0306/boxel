@@ -4,7 +4,7 @@
 use boxel_light::{PADDED_VOLUME, PaddedLight};
 use boxel_mesh::{
     AoPolicy, BUCKET_COUNT, ChunkMesh, FLUID_SURFACE_BIT, FaceShading, MAX_PALETTE_ENTRIES,
-    MaterialTable, PaddedChunk, VoxelClass, layout, reference_face_shading,
+    MaterialTable, PaddedChunk, VoxelClass, fluid_flow, layout, reference_face_shading,
     reference_visible_faces,
 };
 use boxel_voxel::{
@@ -177,7 +177,8 @@ pub fn class_at(padded: &PaddedChunk, x: i32, y: i32, z: i32) -> VoxelClass {
 
 /// Checks a mesh against its padded input: counts match the quads, opaque buckets hold their
 /// own face, quads stay inside the chunk and never overlap, every unit face has the bucket,
-/// texture layer and emissive flag of the material of its voxel and the shape code of its face
+/// texture layer (the flow one on the top of a sloped fluid cell that flows) and emissive flag
+/// of the material of its voxel and the shape code of its face
 /// (`SHAPE_FLUID_SURFACE` on a marked fluid surface cell but for its -Y face, or
 /// `SHAPE_FLUID_SLOPE` on every face of a sloped one), and the expanded
 /// unit faces equal the brute-force oracle. Returns the number of unit faces.
@@ -211,9 +212,17 @@ pub fn verify_mesh(padded: &PaddedChunk, table: &MaterialTable, mesh: &ChunkMesh
                     bucket,
                     "unit face {p:?} {face:?} of material {material} in the wrong bucket"
                 );
+                // The top of a sloped fluid cell that flows shows the flow texture, its side one
+                // (ADR 0025).
+                let texture = match quad.fluid_heights() {
+                    Some(heights) if face == Face::PosY && fluid_flow(heights) != [0, 0] => {
+                        Face::PosX
+                    }
+                    _ => face,
+                };
                 assert_eq!(
                     quad.layer(),
-                    table.layer(material, face),
+                    table.layer(material, texture),
                     "unit face {p:?} {face:?} does not carry the layer of material {material}"
                 );
                 assert_eq!(

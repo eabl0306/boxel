@@ -258,6 +258,18 @@ fn const_u32(module: &naga::Module, name: &str) -> u32 {
     }
 }
 
+fn const_f32(module: &naga::Module, name: &str) -> f32 {
+    let (_, c) = module
+        .constants
+        .iter()
+        .find(|(_, c)| c.name.as_deref() == Some(name))
+        .unwrap_or_else(|| panic!("missing const {name}"));
+    match module.global_expressions[c.init] {
+        naga::Expression::Literal(naga::Literal::F32(v)) => v,
+        ref other => panic!("{name}: unexpected init {other:?}"),
+    }
+}
+
 #[test]
 fn wgsl_bit_layout_matches_boxel_mesh() {
     use boxel_mesh::layout as l;
@@ -278,6 +290,8 @@ fn wgsl_bit_layout_matches_boxel_mesh() {
         ("GEO_SHAPE_SHIFT", l::GEO_SHAPE_SHIFT),
         ("GEO_SHAPE_MASK", l::GEO_SHAPE_MASK),
         ("SHAPE_TURNED", u32::from(l::SHAPE_TURNED)),
+        ("SHAPE_FLUID_CUBE", u32::from(l::SHAPE_FLUID_CUBE)),
+        ("GEO_FLUID_INSET_BIT", l::GEO_FLUID_INSET_BIT),
         ("SHAPE_CROSS", u32::from(l::SHAPE_CROSS)),
         ("SHAPE_FLUID_SURFACE", u32::from(l::SHAPE_FLUID_SURFACE)),
         ("SHAPE_FLUID_SLOPE", u32::from(l::SHAPE_FLUID_SLOPE)),
@@ -287,6 +301,12 @@ fn wgsl_bit_layout_matches_boxel_mesh() {
         ("BOX_OFFSET_BITS", l::BOX_OFFSET_BITS),
     ] {
         assert_eq!(const_u32(&module, name), v, "{name}");
+    }
+    for (name, v) in [
+        ("FLUID_SURFACE", l::FLUID_SURFACE),
+        ("FLUID_INSET", l::FLUID_INSET),
+    ] {
+        assert_eq!(const_f32(&module, name), v, "{name}");
     }
     // The box index sits where w - 1 and h - 1 are, and indexes every model box.
     assert_eq!(l::GEO_BOX_SHIFT, l::GEO_W_SHIFT);

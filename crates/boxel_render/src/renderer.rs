@@ -81,7 +81,16 @@ pub struct ViewParams {
     /// The scene light the baked corner light is multiplied by (sky color, ambient floor, AO
     /// strength, brightness curve).
     pub light: SceneLight,
+    /// Seconds of the fluid animation (ADR 0025): the flow textures scroll with it, at the same
+    /// pixels on every tier. [`ViewParams::from_camera`] sets 0; the render plugin sets the
+    /// app's elapsed time wrapped at [`FLUID_TIME_PERIOD`].
+    pub fluid_time: f32,
 }
+
+/// The fluid animation repeats every this many seconds: the shaders' flow speeds (water half a
+/// texture a second, lava a quarter) scroll whole textures in it, so the time can wrap here
+/// without a jump and stays small for `f32`.
+pub const FLUID_TIME_PERIOD: f64 = 60.0;
 
 impl ViewParams {
     /// From a camera view: fog from `camera.view_distance * fog_start_fraction` to the distance,
@@ -103,6 +112,7 @@ impl ViewParams {
             fog_end: camera.view_distance,
             clear_color: sky_color,
             light: SceneLight::default(),
+            fluid_time: 0.0,
         }
     }
 }
@@ -797,7 +807,7 @@ impl VoxelRenderer {
             viewport: [
                 self.targets.size.x as f32,
                 self.targets.size.y as f32,
-                0.0,
+                view.fluid_time,
                 0.0,
             ],
         };

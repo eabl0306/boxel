@@ -20,8 +20,17 @@
 //! have fluid, so the diagonal counts for both), so their tops meet without cracks; the shared
 //! edge of two cells has the same two corners. Both hold across chunk borders: the padding has
 //! every cell a corner of the inner chunk reads (and the cell above each).
+//!
+//! The water of a waterlogged block (ADR 0025) is a source cell like any other for its
+//! neighbors, but always drawn one block at a time: a surface cell with its corner heights, any
+//! other one full (16/16 corners). Its faces against the block's sturdy faces (a slab's bottom,
+//! the back of stairs) are not drawn and the others carry [`layout::GEO_FLUID_INSET_BIT`].
+//!
+//! Textures (ADR 0025): the side faces show the fluid's flow texture (its side texture), and
+//! so does the top of a cell whose corners slope ([`fluid_flow`]); a level top shows the still
+//! one. The shader scrolls the flow texture with the time.
 use crate::greedy::Greedy;
-use crate::mesher::{class_from_masks, front_nb9, mask_row};
+use crate::mesher::{class_from_masks, front_nb9, mask_row, padded_pos};
 use crate::packed::layout;
 use crate::shading::PaletteFull;
 use crate::{
@@ -39,6 +48,18 @@ const SOURCE: i32 = 112;
 const IGNORED: i32 = -1;
 /// The corner height of a flat surface, in sixteenths (`SOURCE / 8`).
 pub const FLAT: u8 = 14;
+/// The level of a waterlogged block's cell in [`FluidScratch::levels`] while finding the sloped
+/// cells: a source for its neighbors' heights, left to the waterlogged pass by the surface pass.
+const WATERLOGGED: u8 = u8::MAX;
+
+/// The direction the top of a fluid cell with these corner heights flows (sixteenths, corner
+/// `k` at `(x, z) = (k & 1, k >> 1)`): downhill along x and along z, each the height of the low
+/// side's two corners less the high side's. `[0, 0]` for a level top: it shows the still texture,
+/// any other the flow texture scrolled this way (ADR 0025). The shaders compute the same.
+pub const fn fluid_flow(h: [u8; 4]) -> [i32; 2] {
+    let [a, b, c, d] = [h[0] as i32, h[1] as i32, h[2] as i32, h[3] as i32];
+    [(a + c) - (b + d), (a + b) - (c + d)]
+}
 
 /// A surface cell drawn with its own corner heights.
 #[derive(Clone, Copy, Debug)]
@@ -51,6 +72,8 @@ pub(crate) struct SlopedCell {
     heights: [u8; 4],
     /// The faces the greedy culling left visible (bit `Face::index`).
     faces: u8,
+    /// The water of a waterlogged block ([`layout::GEO_FLUID_INSET_BIT`]).
+    inset: bool,
 }
 
 /// Scratch of the fluid pass: the dense levels of the padded chunk (all 0 between meshes) and
@@ -183,6 +206,9 @@ pub(crate) fn find_sloped(
     for &(i, level) in &padded.fluid_levels {
         scratch.levels[i as usize] = level;
     }
+    for &(i, _) in &padded.waterlogged {
+        scratch.levels[i as usize] = WATERLOGGED;
+    }
     let mut heights = Heights {
         padded,
         materials,
@@ -202,8 +228,9 @@ pub(crate) fn find_sloped(
             while bits != 0 {
                 let z = bits.trailing_zeros() as i32;
                 bits &= bits - 1;
-                let id = padded.voxels[PaddedChunk::index(x, y, z)];
-                if id & FLUID_SURFACE_BIT == 0 {
+                let i = PaddedChunk::index(x, y, z);
+                let id = padded.voxels[i];
+                if id & FLUID_SURFACE_BIT == 0 || scratch.levels[i] == WATERLOGGED {
                     continue;
                 }
                 let fluid = id & !FLUID_SURFACE_BIT;
@@ -217,12 +244,38 @@ pub(crate) fn find_sloped(
                     material: fluid,
                     heights: corners,
                     faces: greedy.take_faces(pos),
+                    inset: false,
                 });
             }
         }
     }
+    // The water of the waterlogged blocks, every one (surface or not) by itself.
+    for &(i, block) in &padded.waterlogged {
+        let [x, y, z] = padded_pos(i as usize);
+        if ![x, y, z].iter().all(|c| (0..CHUNK_SIZE).contains(c)) {
+            continue;
+        }
+        let id = padded.voxels[i as usize];
+        let fluid = id & !FLUID_SURFACE_BIT;
+        let corners = if id & FLUID_SURFACE_BIT != 0 {
+            heights.corners(fluid, [x, y, z])
+        } else {
+            [16; 4]
+        };
+        let pos = [x as u32, y as u32, z as u32];
+        scratch.cells.push(SlopedCell {
+            pos,
+            material: fluid,
+            heights: corners,
+            faces: greedy.take_faces(pos) & !materials.sturdy_faces(block),
+            inset: true,
+        });
+    }
     scratch.layer = heights.layer;
     for &(i, _) in &padded.fluid_levels {
+        scratch.levels[i as usize] = 0;
+    }
+    for &(i, _) in &padded.waterlogged {
         scratch.levels[i as usize] = 0;
     }
 }
@@ -308,6 +361,7 @@ pub(crate) fn emit_sloped(
     for cell in cells {
         let [x, y, z] = cell.pos;
         let m = cell.material;
+        let flowing = fluid_flow(cell.heights) != [0, 0];
         for face in Face::ALL {
             if cell.faces & (1 << face.index()) == 0 {
                 continue;
@@ -316,9 +370,18 @@ pub(crate) fn emit_sloped(
             let front = PaddedChunk::index(x as i32 + n.x, y as i32 + n.y, z as i32 + n.z);
             let nb9 = front_nb9(face, &padded.opaque, x as usize, y as usize, z as usize);
             let (_, light) = shade(front, face, Some(nb9))?;
-            let mut quad = PackedQuad::new(cell.pos, 1, 1, face, materials.layer(m, face))
+            // A sloping top shows the flow texture (the fluid's side texture).
+            let texture = if face == Face::PosY && flowing {
+                Face::PosX
+            } else {
+                face
+            };
+            let mut quad = PackedQuad::new(cell.pos, 1, 1, face, materials.layer(m, texture))
                 .with_light_index(light)
                 .with_fluid_heights(cell.heights);
+            if cell.inset {
+                quad = quad.with_fluid_inset();
+            }
             if materials.emissive(m) {
                 quad.geo |= layout::FLAG_EMISSIVE << layout::GEO_FLAGS_SHIFT;
             }

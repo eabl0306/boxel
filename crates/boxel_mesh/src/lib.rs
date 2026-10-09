@@ -17,7 +17,7 @@ mod packed;
 mod padded;
 pub mod shading;
 
-pub use fluid::{FLAT as FLUID_FLAT, reference_fluid_heights};
+pub use fluid::{FLAT as FLUID_FLAT, fluid_flow, reference_fluid_heights};
 pub use mesher::{
     AoPolicy, MaterialTable, MeshInput, MeshOptions, Mesher, reference_box_face_shading_at,
     reference_face_shading, reference_face_shading_at, reference_visible_faces,

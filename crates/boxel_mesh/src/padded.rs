@@ -47,6 +47,10 @@ pub struct PaddedChunk {
     /// and level. Every level of a fluid has the material of its source in `voxels` (so they
     /// cull and merge as one fluid); the mesher reads the levels here for the corner heights.
     pub fluid_levels: Vec<(u32, u8)>,
+    /// The waterlogged blocks (ADR 0025): padded index and the block's material, sorted by
+    /// index. Their cell in `voxels` holds their water (a transparent fluid source), so it culls
+    /// and slopes as water; the mesher draws the block's boxes from here.
+    pub waterlogged: Vec<(u32, u16)>,
 }
 
 impl Default for PaddedChunk {
@@ -65,6 +69,7 @@ impl PaddedChunk {
             special: vec![0; PADDED_AREA].into_boxed_slice(),
             cull_mask: u16::MAX,
             fluid_levels: Vec::new(),
+            waterlogged: Vec::new(),
         }
     }
     /// Resets to empty.
@@ -75,6 +80,7 @@ impl PaddedChunk {
         self.special.fill(0);
         self.cull_mask = u16::MAX;
         self.fluid_levels.clear();
+        self.waterlogged.clear();
     }
     /// Linear index of chunk-local `(x, y, z)`, each in `-1..=32`.
     #[inline]
@@ -116,6 +122,26 @@ impl PaddedChunk {
         if level != 0 {
             self.fluid_levels.push((i, level));
         }
+    }
+    /// Writes a waterlogged block (ADR 0025): `water` (a transparent fluid source material) in
+    /// the cell and `block` in [`PaddedChunk::waterlogged`]. What `gather` does for a
+    /// waterlogged state.
+    pub fn set_waterlogged(&mut self, x: i32, y: i32, z: i32, block: u16, water: u16) {
+        self.set(x, y, z, water, VoxelClass::Transparent);
+        let i = Self::index(x, y, z) as u32;
+        match self.waterlogged.binary_search_by_key(&i, |&(j, _)| j) {
+            Ok(k) => self.waterlogged[k].1 = block,
+            Err(k) => self.waterlogged.insert(k, (i, block)),
+        }
+    }
+    /// The waterlogged block at padded index `i`, if any.
+    #[inline]
+    pub fn waterlogged_at(&self, i: usize) -> Option<u16> {
+        let k = self
+            .waterlogged
+            .binary_search_by_key(&(i as u32), |&(j, _)| j)
+            .ok()?;
+        Some(self.waterlogged[k].1)
     }
     /// Material at `(x, y, z)` in `-1..=32`.
     #[inline]

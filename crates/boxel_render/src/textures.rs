@@ -245,6 +245,26 @@ pub(crate) fn synthesize(spec: &TextureSpec) -> [[u8; 4]; BASE_TEXELS] {
                 }
             }
         }
+        TexturePattern::Flow { alpha } => {
+            // Streaks down every column (ADR 0025): each column has its own phase and a light
+            // dash of 3 texels and a dark one of 2 every 8 rows, so the layer tiles along v and
+            // a scroll along v reads as fluid running.
+            for x in 0..size {
+                let phase = rng.below(8) as usize;
+                for y in 0..size {
+                    let factor = match (y + phase) % 8 {
+                        0..=2 => 125,
+                        4..=5 => 82,
+                        _ => 100,
+                    };
+                    let texel = &mut texels[y * size + x];
+                    for c in &mut texel[..3] {
+                        *c = (u16::from(*c) * factor / 100).min(255) as u8;
+                    }
+                    texel[3] = alpha;
+                }
+            }
+        }
         TexturePattern::Noise | TexturePattern::TopBand { .. } => {}
     }
     texels
@@ -452,7 +472,7 @@ mod tests {
             // Glass and water keep their alpha for blending.
             let blended = matches!(
                 s.pattern,
-                TexturePattern::Glass | TexturePattern::Liquid { .. }
+                TexturePattern::Glass | TexturePattern::Liquid { .. } | TexturePattern::Flow { .. }
             );
             for level in 0..data.mip_levels {
                 for t in mip(&data, i, level) {
@@ -513,6 +533,20 @@ mod tests {
         let texels = mip(&data, 0, 0);
         assert_eq!(texels[3 * 16], [84, 63, 42, 255]);
         assert_eq!(texels[2 * 16], [120, 90, 60, 255]);
+
+        // a flow texture: streaks that repeat every 8 rows, lighter and darker than the base
+        let mut flow = spec("test:flow", TexturePattern::Flow { alpha: 160 });
+        flow.noise = 0;
+        let data = generate_block_textures(&[flow]);
+        let texels = mip(&data, 0, 0);
+        for (i, t) in texels.iter().enumerate() {
+            assert_eq!(t[3], 160);
+            assert_eq!(*t, texels[(i + 8 * 16) % 256], "texel {i}");
+        }
+        for x in 0..16 {
+            let column: Vec<u8> = (0..16).map(|y| texels[y * 16 + x][0]).collect();
+            assert!(column.contains(&150) && column.contains(&98) && column.contains(&120));
+        }
 
         // noise stays within the amplitude
         let noisy = generate_block_textures(&[spec("test:noise", TexturePattern::Noise)]);

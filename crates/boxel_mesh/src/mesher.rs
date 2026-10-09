@@ -61,9 +61,13 @@ pub struct MaterialTable {
     /// Some material is a fluid (`BlockModel::Fluid`): gather marks the surface cells.
     has_fluid: bool,
     /// Per state: the material it is meshed as (itself, but the source's material for every
-    /// level of a fluid, ADR 0021) and its fluid level (`0` for sources and non-fluids).
+    /// level of a fluid, ADR 0021, and the water source's for a waterlogged block, ADR 0025)
+    /// and its fluid level (`0` for sources and non-fluids).
     fluid_source: Vec<u16>,
     fluid_level: Vec<u8>,
+    /// Per state: a waterlogged block (ADR 0025), gathered as its water (`fluid_source`) and
+    /// drawn as its boxes too.
+    waterlogged: Vec<bool>,
     /// The models made of boxes (ADR 0020), see [`BoxModels`].
     box_models: BoxModels,
 }
@@ -216,10 +220,13 @@ fn class_of(shape: RenderShape, model: BlockModel) -> VoxelClass {
     }
 }
 
-/// The shape codes of the 6 faces of a cube of `model` (turned faces for logs).
+/// The shape codes of the 6 faces of a cube of `model` (turned faces for logs, fluid cube
+/// faces for fluids).
 fn cube_codes(model: BlockModel) -> [u8; 6] {
     Face::ALL.map(|f| {
-        if model.face_turned(f) {
+        if model == BlockModel::Fluid {
+            layout::SHAPE_FLUID_CUBE
+        } else if model.face_turned(f) {
             layout::SHAPE_TURNED
         } else {
             layout::SHAPE_CUBE
@@ -241,11 +248,16 @@ impl MaterialTable {
             has_fluid: false,
             fluid_source: (0..n as u16).collect(),
             fluid_level: vec![0; n],
+            waterlogged: vec![false; n],
             box_models: BoxModels {
                 shape_of: vec![NO_SHAPE; n],
                 ..BoxModels::default()
             },
         };
+        let water = registry
+            .by_name("boxel:water")
+            .filter(|&w| registry.model(w) == BlockModel::Fluid)
+            .map(|w| registry.material(w));
         for i in 0..n {
             let s = BlockState(i as u16);
             let m = registry.material(s) as usize;
@@ -263,8 +275,47 @@ impl MaterialTable {
             {
                 table.set_fluid_level(m as u16, registry.material(source), level as u8);
             }
+            if registry.is_waterlogged(s)
+                && let Some(water) = water
+            {
+                table.set_waterlogged(m as u16, water);
+            }
         }
         table
+    }
+    /// Declares `material` (a block made of boxes) as waterlogged, holding a source of fluid
+    /// `water` (ADR 0025): gather puts the water in its cell (it culls, merges and slopes as
+    /// that fluid) and keeps the block in [`PaddedChunk::waterlogged`], whose boxes are drawn
+    /// as for the dry block. The water's faces against the block's sturdy faces are not drawn,
+    /// the others sit [`layout::FLUID_INSET`] inside the cell.
+    pub fn set_waterlogged(&mut self, material: u16, water: u16) {
+        let i = usize::from(material);
+        if i >= self.class.len() || usize::from(water) >= self.class.len() {
+            return;
+        }
+        self.class[i] = VoxelClass::Transparent;
+        self.fluid_source[i] = water;
+        self.fluid_level[i] = 0;
+        self.waterlogged[i] = true;
+        self.has_fluid = true;
+    }
+    /// True if `material` is a waterlogged block ([`MaterialTable::set_waterlogged`]).
+    pub fn is_waterlogged(&self, material: u16) -> bool {
+        self.waterlogged
+            .get(usize::from(material))
+            .copied()
+            .unwrap_or(false)
+    }
+    /// The faces (bit [`Face::index`]) that the boxes of `material` cover whole on the cell
+    /// border (Minecraft's sturdy faces: a slab's bottom, the back of stairs); 0 for a material
+    /// not made of boxes.
+    pub(crate) fn sturdy_faces(&self, material: u16) -> u8 {
+        self.box_models.of(material).map_or(0, |shape| {
+            Face::ALL
+                .iter()
+                .filter(|f| shape.covers[f.index()] == [u16::MAX; 16])
+                .fold(0, |bits, f| bits | 1 << f.index())
+        })
     }
     /// Declares `material` as level `level` (`1..=15`; 0 is the source itself) of the fluid
     /// whose source is `source`: it meshes as `source` and its level shapes the corner heights
@@ -309,7 +360,11 @@ impl MaterialTable {
             return;
         }
         self.model[i] = model;
-        self.class[i] = class_of(self.shape[i], model);
+        self.class[i] = if self.waterlogged[i] {
+            VoxelClass::Transparent
+        } else {
+            class_of(self.shape[i], model)
+        };
         self.codes[i] = cube_codes(model);
         self.has_fluid |= model == BlockModel::Fluid;
         let made_of_boxes = self.shape[i] != RenderShape::None && !model.boxes().is_empty();
@@ -406,6 +461,7 @@ impl MaterialTable {
             has_fluid: false,
             fluid_source: (0..n as u16).collect(),
             fluid_level: vec![0; n],
+            waterlogged: vec![false; n],
             box_models: BoxModels {
                 shape_of: vec![NO_SHAPE; n],
                 ..BoxModels::default()
@@ -584,7 +640,8 @@ fn gather_into(
 }
 
 /// Every level of a fluid becomes its source's material, so the levels cull and merge as one
-/// fluid (ADR 0021); the levels other than 0 go to [`PaddedChunk::fluid_levels`]. Visits only
+/// fluid (ADR 0021); the levels other than 0 go to [`PaddedChunk::fluid_levels`]. A waterlogged
+/// block becomes its water and goes to [`PaddedChunk::waterlogged`] (ADR 0025). Visits only
 /// the transparent voxels (fluids are transparent cubes), so a chunk without water pays one read
 /// per column.
 fn remap_fluid_levels(materials: &MaterialTable, out: &mut PaddedChunk) {
@@ -596,10 +653,15 @@ fn remap_fluid_levels(materials: &MaterialTable, out: &mut PaddedChunk) {
                 let z = bits.trailing_zeros() as i32 - 1;
                 bits &= bits - 1;
                 let i = PaddedChunk::index(x, y, z);
-                let (source, level) = materials.fluid_level(out.voxels[i]);
+                let id = out.voxels[i];
+                let (source, level) = materials.fluid_level(id);
                 if level != 0 {
                     out.voxels[i] = source;
                     out.fluid_levels.push((i as u32, level));
+                } else if source != id && materials.is_waterlogged(id) {
+                    // In index order (y, then x, then z): the list stays sorted.
+                    out.voxels[i] = source;
+                    out.waterlogged.push((i as u32, id));
                 }
             }
         }
@@ -961,7 +1023,8 @@ fn lit_shading(
 /// against a full stair face). Faces inside the cell are always drawn. Cubes never hide against
 /// a box model (the greedy pass sees it as empty), so a cube face behind a stair's back is drawn
 /// and hidden by depth. A cross gives two quads (faces `PosX` and `PosZ`, see
-/// [`layout::SHAPE_CROSS`]) with the texture of its side.
+/// [`layout::SHAPE_CROSS`]) with the texture of its side. The waterlogged blocks of the inner
+/// 32^3 ([`PaddedChunk::waterlogged`], ADR 0025) draw their boxes the same way, after the rest.
 fn emit_specials(
     padded: &PaddedChunk,
     materials: &MaterialTable,
@@ -984,6 +1047,37 @@ fn emit_specials(
             out.push((materials.bucket(m, face) as u8, quad));
         };
     let models = &materials.box_models;
+    // The quads of block `m` at inner `[x, y, z]`.
+    let mut block = |m: u16, [x, y, z]: [i32; 3]| {
+        let pos = [x as u32, y as u32, z as u32];
+        if let Some(shape) = models.of(m) {
+            // Each direction shades once per block.
+            let mut shaded: [Option<(u8, u16)>; 6] = [None; 6];
+            for bf in &shape.faces {
+                let face = bf.face;
+                if bf.border && box_face_hidden(padded, materials, m, [x, y, z], *bf) {
+                    continue;
+                }
+                let shading = match shaded[face.index()] {
+                    Some(shading) => shading,
+                    None => {
+                        let (cell, nb9) = box_face_layer(padded, [x, y, z], face);
+                        let shading = shade(cell, face, Some(nb9))?;
+                        shaded[face.index()] = Some(shading);
+                        shading
+                    }
+                };
+                push(m, pos, face, face, layout::SHAPE_BOX, bf.index, shading);
+            }
+        } else if materials.model(m) == BlockModel::Cross {
+            let i = PaddedChunk::index(x, y, z);
+            for face in [Face::PosX, Face::PosZ] {
+                let shading = shade(i, face, None)?;
+                push(m, pos, face, Face::PosX, layout::SHAPE_CROSS, 0, shading);
+            }
+        }
+        Ok(())
+    };
     for y in 0..CHUNK_SIZE {
         for x in 0..CHUNK_SIZE {
             // Inner voxels only (mask bit of padded z is z + 1).
@@ -991,43 +1085,30 @@ fn emit_specials(
             while bits != 0 {
                 let z = bits.trailing_zeros() as i32;
                 bits &= bits - 1;
-                let i = PaddedChunk::index(x, y, z);
-                let m = padded.voxels[i];
-                let pos = [x as u32, y as u32, z as u32];
-                if let Some(shape) = models.of(m) {
-                    // Each direction shades once per block.
-                    let mut shaded: [Option<(u8, u16)>; 6] = [None; 6];
-                    for bf in &shape.faces {
-                        let face = bf.face;
-                        if bf.border && box_face_hidden(padded, materials, m, [x, y, z], *bf) {
-                            continue;
-                        }
-                        let shading = match shaded[face.index()] {
-                            Some(shading) => shading,
-                            None => {
-                                let (cell, nb9) = box_face_layer(padded, [x, y, z], face);
-                                let shading = shade(cell, face, Some(nb9))?;
-                                shaded[face.index()] = Some(shading);
-                                shading
-                            }
-                        };
-                        push(m, pos, face, face, layout::SHAPE_BOX, bf.index, shading);
-                    }
-                } else if materials.model(m) == BlockModel::Cross {
-                    for face in [Face::PosX, Face::PosZ] {
-                        let shading = shade(i, face, None)?;
-                        push(m, pos, face, Face::PosX, layout::SHAPE_CROSS, 0, shading);
-                    }
-                }
+                block(padded.voxels[PaddedChunk::index(x, y, z)], [x, y, z])?;
             }
+        }
+    }
+    for &(i, m) in &padded.waterlogged {
+        let p = padded_pos(i as usize);
+        if p.iter().all(|c| (0..CHUNK_SIZE).contains(c)) {
+            block(m, p)?;
         }
     }
     Ok(())
 }
 
+/// Padded `(x, y, z)` (each in `-1..=32`) of padded index `i`.
+#[inline]
+pub(crate) const fn padded_pos(i: usize) -> [i32; 3] {
+    let (z, rest) = (i % PADDED, i / PADDED);
+    let (x, y) = (rest % PADDED, rest / PADDED);
+    [x as i32 - 1, y as i32 - 1, z as i32 - 1]
+}
+
 /// True if the neighbor in front of `bf` (a face of material `m` at inner `p`, flush with the
-/// cell border) hides it: an opaque cube, or a model made of boxes, opaque or of material `m`,
-/// whose faces on that border cover it.
+/// cell border) hides it: an opaque cube, or a model made of boxes (dry or waterlogged),
+/// opaque or of material `m`, whose faces on that border cover it.
 fn box_face_hidden(
     padded: &PaddedChunk,
     materials: &MaterialTable,
@@ -1037,18 +1118,21 @@ fn box_face_hidden(
 ) -> bool {
     let n = bf.face.normal();
     let (nx, ny, nz) = (x + n.x, y + n.y, z + n.z);
-    match class_from_masks(padded, nx, ny, nz) {
-        VoxelClass::Opaque => true,
-        VoxelClass::Special => {
-            let nm = padded.get(nx, ny, nz);
-            let hides = nm == m || materials.shape(nm) == RenderShape::Opaque;
-            hides
-                && materials.box_models.of(nm).is_some_and(|other| {
-                    is_covered(&other.covers[bf.face.opposite().index()], bf.rect)
-                })
-        }
-        VoxelClass::Empty | VoxelClass::Transparent => false,
-    }
+    let nm = match class_from_masks(padded, nx, ny, nz) {
+        VoxelClass::Opaque => return true,
+        VoxelClass::Special => padded.get(nx, ny, nz),
+        VoxelClass::Transparent => match padded.waterlogged_at(PaddedChunk::index(nx, ny, nz)) {
+            Some(block) => block,
+            None => return false,
+        },
+        VoxelClass::Empty => return false,
+    };
+    let hides = nm == m || materials.shape(nm) == RenderShape::Opaque;
+    hides
+        && materials
+            .box_models
+            .of(nm)
+            .is_some_and(|other| is_covered(&other.covers[bf.face.opposite().index()], bf.rect))
 }
 
 /// The voxel whose layer shades `face` of the box model at inner `p`, and the opacity of that

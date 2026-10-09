@@ -2,9 +2,10 @@
 //
 // PackedQuad = vec2<u32>(geo, mat), 8 bytes, identical bytes on every tier.
 //   geo: x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | flags:4 (bit 0 = FLAG_EMISSIVE, bits 1..3 =
-//        shape code, ADR 0018, 0020 and 0021: cube, turned cube, cross, fluid surface, model box
-//        face, sloped fluid cell; a box face keeps the index of its box in the View's box table in
-//        the (w-1, h-1) bits, a sloped fluid cell its 4 corner heights there and in the AO bits)
+//        shape code, ADR 0018, 0020, 0021 and 0025: cube, turned cube, fluid cube, cross, fluid
+//        surface, model box face, sloped fluid cell; a box face keeps the index of its box in the
+//        View's box table in the (w-1, h-1) bits, a sloped fluid cell its 4 corner heights there
+//        and in the AO bits, and the bit after the heights for the water of a waterlogged block)
 //   mat: layer:12 | ao:8 (2 bits per corner, 3 = unoccluded) | light:12 (index into the chunk's
 //        light palette)
 // face: 0=+Y 1=-Y 2=+X 3=-X 4=+Z 5=-Z  (u,v axes: ±Y -> (X,Z), ±X -> (Z,Y), ±Z -> (X,Y))
@@ -44,10 +45,19 @@ const FLAG_EMISSIVE: u32 = 1u;
 const GEO_SHAPE_SHIFT: u32 = 29u;
 const GEO_SHAPE_MASK: u32 = 7u;
 const SHAPE_TURNED: u32 = 1u;      // cube face, texture transposed (logs along X or Z)
+const SHAPE_FLUID_CUBE: u32 = 2u;  // cube face of a fluid cell under its fluid or a block (greedy)
 const SHAPE_CROSS: u32 = 4u;       // plant quad through the cell's diagonal (w = h = 1)
 const SHAPE_FLUID_SURFACE: u32 = 5u; // fluid surface cell: its top drops to FLUID_SURFACE (greedy)
 const SHAPE_FLUID_SLOPE: u32 = 7u; // fluid cell with a height per top corner (w = h = 1, no AO)
 const FLUID_SURFACE: f32 = 0.875;
+// The water of a waterlogged block (a sloped fluid cell, ADR 0025): its side and bottom faces
+// sit FLUID_INSET inside the cell, behind the block's own faces on the border.
+const GEO_FLUID_INSET_BIT: u32 = 0x800000u;
+const FLUID_INSET: f32 = 0.001953125; // 1/512
+// The flow texture scrolls this many textures a second (ADR 0025): water, and lava (the
+// emissive fluid) slower. View::viewport.z wraps at a whole number of both periods.
+const WATER_FLOW_SPEED: f32 = 0.5;
+const LAVA_FLOW_SPEED: f32 = 0.25;
 const SHAPE_BOX: u32 = 6u;         // a face of one model box (slabs, stairs, fences, torches; w = h = 1)
 const GEO_BOX_MASK: u32 = 1023u;   // the box index of a SHAPE_BOX quad, at GEO_W_SHIFT
 const BOX_COORD_BITS: u32 = 5u;    // packed box word 0: min xyz, max xyz in sixteenths
@@ -77,7 +87,7 @@ struct View {
   sky_light: vec4<f32>,            // rgb = sky light color times the daylight intensity (linear), a = ambient floor
   light_params: vec4<f32>,         // x = AO strength (0.55: the darkest corner keeps 45 %), y = block-light gain, zw = 0
   light_curve: array<vec4<f32>, 4>, // brightness of light levels 0..15 (level 4k + j at [k][j]; level 15 = 1)
-  viewport: vec4<f32>,             // xy = render target size in pixels, zw = 0
+  viewport: vec4<f32>,             // xy = render target size in pixels, z = fluid animation time in seconds (wraps), w = 0
   // Model box table (ADR 0020), written once per renderer: box k is boxes[k >> 1].xy (k even) or
   // .zw (k odd), packed as boxel_mesh::pack_model_box. Read only by SHAPE_BOX quads.
   boxes: array<vec4<u32>, 512>,
@@ -224,11 +234,25 @@ fn decode_quad(q: vec2<u32>, light: vec2<u32>, corner_in: u32) -> Decoded {
     let top = f32(((heights >> (4u * k)) & 15u) + 1u) / 16.0;
     if (f == 0u) {
       o.local.y = p.y + top;
+      // A sloping top shows the flow texture (the mesher picked it): turned about the cell's
+      // middle so that the texture's v runs down the slope, the integer direction of
+      // boxel_mesh::fluid_flow from the corner heights.
+      let hk = vec4<i32>((vec4(heights) >> vec4(0u, 4u, 8u, 12u)) & vec4(15u));
+      let flow = vec2<f32>(vec2((hk.x + hk.z) - (hk.y + hk.w), (hk.x + hk.y) - (hk.z + hk.w)));
+      if (any(flow != vec2(0.0))) {
+        let along = flow * inverseSqrt(dot(flow, flow));
+        let q = vec2(cu, cv) - vec2(0.5);
+        o.uv = vec2(dot(q, vec2(-along.y, along.x)), dot(q, along)) + vec2(0.5, 0.5 - flow_scroll(o.flags));
+      }
     } else if (f >= 2u) {
       let y = top * cv;
       o.local.y = p.y + y;
       o.uv.y = 1.0 - y;
       o.st.y = y;
+    }
+    // The water of a waterlogged block: its faces but the top inset (ADR 0025).
+    if ((geo & GEO_FLUID_INSET_BIT) != 0u && f != 0u) {
+      o.local = o.local - n * FLUID_INSET;
     }
   } else if (shape == SHAPE_CROSS) {
     // Face 2 (+X) runs from (0, 0) to (1, 1) in (x, z), face 4 (+Z) from (1, 0) to (0, 1); full
@@ -241,7 +265,19 @@ fn decode_quad(q: vec2<u32>, light: vec2<u32>, corner_in: u32) -> Decoded {
     o.face = 0u;
     o.grow = vec2(0.0);
   }
+  // The side faces of a fluid show its flow texture running down (ADR 0025).
+  let fluid = shape == SHAPE_FLUID_CUBE || shape == SHAPE_FLUID_SURFACE || sloped;
+  if (fluid && f >= 2u) {
+    o.uv.y = o.uv.y - flow_scroll(o.flags);
+  }
   return o;
+}
+
+// How far the flow texture of a fluid quad with these flags has scrolled (0..1 of a texture):
+// the time in View::viewport.z at WATER_FLOW_SPEED, or LAVA_FLOW_SPEED for an emissive fluid.
+fn flow_scroll(flags: u32) -> f32 {
+  let speed = select(WATER_FLOW_SPEED, LAVA_FLOW_SPEED, (flags & FLAG_EMISSIVE) != 0u);
+  return fract(view.viewport.z * speed);
 }
 
 // Edge growth: no cracks at T-junctions. Greedy quads meet in T-junctions (a corner of one quad

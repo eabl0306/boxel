@@ -344,10 +344,13 @@ fn emissive_blocks_flag_their_quads() {
             "5 faces per emitter (the floor hides one)"
         );
         // Cube faces, but lava's: an opaque fluid whose top slopes down to the air around it
-        // (ADR 0025), drawn in the opaque face buckets.
-        let lava = table.layer(block(&registry, "lava").0, Face::PosY);
+        // (ADR 0025), drawn in the opaque face buckets, its still texture on the level top
+        // and its flow texture on the sides.
+        let lava = block(&registry, "lava").0;
+        let lava = [Face::PosY, Face::PosX].map(|f| table.layer(lava, f));
+        assert_ne!(lava[0], lava[1]);
         for (b, q) in (0..BUCKET_COUNT).flat_map(|b| mesh.bucket(b).iter().map(move |q| (b, q))) {
-            if q.layer() == lava {
+            if lava.contains(&q.layer()) {
                 assert_eq!(q.shape(), layout::SHAPE_FLUID_SLOPE, "{q:?}");
                 assert_eq!(b, q.face().index(), "{q:?}");
             } else {

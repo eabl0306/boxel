@@ -384,6 +384,13 @@ pub enum TexturePattern {
     /// Cobblestone: rounded stones of the base color, each a little lighter or darker, between
     /// dark joints.
     Cobble,
+    /// A fluid's flow texture (ADR 0025): noise with streaks running down its columns, lighter
+    /// and darker, that tile along v; the shader scrolls it along the flow. Every texel has
+    /// `alpha`.
+    Flow {
+        /// Alpha of every texel.
+        alpha: u8,
+    },
 }
 
 /// One built-in lamp of [`BlockRegistry::default_blocks`]: an opaque, solid cube that emits
@@ -838,7 +845,35 @@ impl BlockRegistryBuilder {
         }
         b.add_default_shapes(stone, planks);
         b.add_fluid_products();
+        b.add_flow_textures(water, lava);
         b
+    }
+
+    /// The flow textures of water and lava (ADR 0025), the last layers: the side faces of both
+    /// fluids show them (Minecraft draws a fluid's sides with its flow sprite), and the mesher
+    /// gives them to the top of a cell that slopes (`boxel_mesh`).
+    fn add_flow_textures(&mut self, water: TextureId, lava: TextureId) {
+        for (name, still) in [("water", water), ("lava", lava)] {
+            let spec = &self.textures[usize::from(still.0)];
+            let alpha = match spec.pattern {
+                TexturePattern::Liquid { alpha } => alpha,
+                _ => 255,
+            };
+            let flow = TextureSpec {
+                name: format!("boxel:{name}_flow"),
+                base_color: spec.base_color,
+                noise: spec.noise,
+                pattern: TexturePattern::Flow { alpha },
+            };
+            let flow = self.add_texture(flow).expect("built-in texture");
+            let fluid = format!("boxel:{name}");
+            if let Some(block) = self.blocks.iter().find(|b| b.name == fluid) {
+                let states = usize::from(block.first)..usize::from(block.first + block.count);
+                for def in &mut self.states[states] {
+                    def.textures.side = flow;
+                }
+            }
+        }
     }
 
     /// The blocks lava makes when it meets water (ADR 0025), after the torches: cobblestone and
@@ -1231,7 +1266,9 @@ impl BlockRegistry {
     /// 254 `boxel:wall_torch[facing=north|south|west|east]` (Cutout, no collision, light opacity
     /// 0, emission [`TORCH_EMISSION`]); then what lava makes with water (ADR 0025): 255
     /// `boxel:cobblestone` and 256 `boxel:obsidian` (Opaque solid cubes). The states whose
-    /// `waterlogged` is `true` hold a water source ([`StateFlags::WATERLOGGED`]).
+    /// `waterlogged` is `true` hold a water source ([`StateFlags::WATERLOGGED`]). The side faces
+    /// of water and lava show their flow textures, `boxel:water_flow` and `boxel:lava_flow` (the
+    /// last two layers, ADR 0025).
     pub fn default_blocks() -> BlockRegistry {
         BlockRegistryBuilder::with_default_blocks().build()
     }

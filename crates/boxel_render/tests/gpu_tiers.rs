@@ -346,8 +346,9 @@ fn hidden_mesh(n: u32) -> ChunkMesh {
 /// in a stone rim, a glass box around a lamp-less stone pillar, bottom and top slabs as steps,
 /// short grass and poppies, and logs along X and Z; and flowing water (ADR 0021): a source with
 /// its flowing levels around it (sloped tops, `SHAPE_FLUID_SLOPE`) and a source over a falling
-/// column. Meshed by the real mesher (no light: open sky). Returns `(chunk, mesh)` for both
-/// chunks.
+/// column; and ADR 0025: a waterlogged slab, stairs and fence in the pool, and lava spread 3
+/// blocks around a source. Meshed by the real mesher (no light: open sky). Returns `(chunk,
+/// mesh)` for both chunks.
 fn special_scene(registry: &BlockRegistry) -> Vec<(IVec3, ChunkMesh)> {
     let get = |name: &str| registry.parse_state(name).expect(name);
     let mut dense = [
@@ -378,6 +379,24 @@ fn special_scene(registry: &BlockRegistry) -> Vec<(IVec3, ChunkMesh)> {
                     get("boxel:water")
                 },
             );
+        }
+    }
+    // ADR 0025: waterlogged blocks in the pool (the stairs' back against the rim).
+    put(5, 1, 5, get("boxel:stone_slab[waterlogged=true]"));
+    put(
+        7,
+        1,
+        4,
+        get("boxel:stone_stairs[facing=north,waterlogged=true]"),
+    );
+    put(8, 1, 8, get("boxel:oak_fence[waterlogged=true]"));
+    // Lava: a source at (44, 1, 24) and its spread, levels 2, 4 and 6.
+    for x in 41..48 {
+        for z in 21..28 {
+            let d = (x - 44i32).abs() + (z - 24i32).abs();
+            if d <= 3 {
+                put(x, 1, z, get(&format!("boxel:lava[level={}]", 2 * d)));
+            }
         }
     }
     // The glass box: a 4x4x4 shell around a stone pillar, across the chunk border.
@@ -579,6 +598,8 @@ struct TierImages {
     special_opaque: RgbaImage,
     /// `special` drawn with an empty model box table (ADR 0020): its box faces vanish.
     special_no_boxes: RgbaImage,
+    /// `special` at another time of the fluid animation (ADR 0025): the flow textures moved.
+    special_flowing: RgbaImage,
     /// Full arena: after a failed grow of `REMOVED_CHUNK` (expected: `heightfield`), after its
     /// in-place shrink to a hidden quad (`minus_chunk`) and after growing it back
     /// (`heightfield`).
@@ -971,6 +992,11 @@ fn render_tier(
     renderer.set_model_boxes(&queue, &[]);
     let (special_no_boxes, _) = render(&device, &queue, &mut renderer, &special_view())?;
     renderer.set_model_boxes(&queue, materials.model_boxes());
+    let flowing = ViewParams {
+        fluid_time: 1.375,
+        ..special_view()
+    };
+    let (special_flowing, _) = render(&device, &queue, &mut renderer, &flowing)?;
     // Both chunks have translucent quads: one more draw each on every tier.
     if draws != opaque_draws + 2 {
         return Err(format!(
@@ -996,6 +1022,7 @@ fn render_tier(
         special,
         special_opaque,
         special_no_boxes,
+        special_flowing,
         full_arena,
     })
 }
@@ -1136,6 +1163,7 @@ fn tiers_render_identically() {
                     (&name("special"), &i.special),
                     (&name("special_opaque"), &i.special_opaque),
                     (&name("special_no_boxes"), &i.special_no_boxes),
+                    (&name("special_flowing"), &i.special_flowing),
                     (&name("full_arena_kept"), &i.full_arena[0]),
                     (&name("full_arena_shrunk"), &i.full_arena[1]),
                     (&name("full_arena_regrown"), &i.full_arena[2]),
@@ -1171,6 +1199,16 @@ fn tiers_render_identically() {
                 (&name("special"), &i.special),
                 (&name("special_no_boxes"), &i.special_no_boxes),
                 0.01,
+            );
+            report.check_differs(
+                &format!(
+                    "{label} {}: special scene later in the fluid animation",
+                    i.tier
+                ),
+                (&name("special"), &i.special),
+                (&name("special_flowing"), &i.special_flowing),
+                // The fluids are small at this size: a few dozen pixels.
+                0.0001,
             );
             report.check_differs(
                 &format!("{label} {}: heightfield minus one chunk", i.tier),
@@ -1229,6 +1267,7 @@ fn tiers_render_identically() {
                     &best.special_no_boxes,
                     &i.special_no_boxes,
                 ),
+                ("special_flowing", &best.special_flowing, &i.special_flowing),
             ] {
                 report.check_same(
                     &format!("{label}: {} vs {} ({scene})", i.tier, best.tier),

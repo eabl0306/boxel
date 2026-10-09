@@ -205,7 +205,8 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
     assert_eq!(tex(grass, Face::PosY), "boxel:grass_top");
     assert_eq!(tex(grass, Face::NegY), "boxel:dirt");
     assert_eq!(tex(grass, Face::PosX), "boxel:grass_side");
-    assert_eq!(r.textures().len(), 24);
+    // The last two: the flow textures of water and lava (ADR 0025).
+    assert_eq!(r.textures().len(), 26);
     // The lamps: opaque solid cubes with their own texture.
     for (i, name) in states.iter().enumerate().skip(29).take(4) {
         let s = BlockState(i as u16);
@@ -229,6 +230,8 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
         assert_eq!(r.collision(lava), &BlockCollision::None);
         assert_eq!(r.light_opacity(lava), 1);
         assert_eq!(tex(lava, Face::PosY), "boxel:lava");
+        assert_eq!(tex(lava, Face::NegY), "boxel:lava");
+        assert_eq!(tex(lava, Face::PosX), "boxel:lava_flow");
     }
     for (state, name) in [(255, "boxel:cobblestone"), (256, "boxel:obsidian")] {
         let s = BlockState(state);
@@ -251,6 +254,17 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
         assert_eq!(r.model(water), BlockModel::Fluid);
         assert_eq!(r.light_opacity(water), 1);
         assert_eq!(r.collision(water), &BlockCollision::None);
+        assert_eq!(tex(water, Face::PosY), "boxel:water");
+        assert_eq!(tex(water, Face::NegZ), "boxel:water_flow");
+    }
+    for (name, flow) in [
+        ("boxel:water", "boxel:water_flow"),
+        ("boxel:lava", "boxel:lava_flow"),
+    ] {
+        let still = r.textures().iter().find(|t| t.name == name).unwrap();
+        let flow = r.textures().iter().find(|t| t.name == flow).unwrap();
+        assert_eq!(flow.base_color, still.base_color);
+        assert!(matches!(flow.pattern, TexturePattern::Flow { .. }));
     }
     for (name, half) in [
         ("boxel:stone_slab[type=bottom]", SlabHalf::Bottom),

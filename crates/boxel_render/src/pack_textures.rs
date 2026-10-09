@@ -145,6 +145,10 @@ struct Recipe {
     tint: Tint,
     /// Texture parts (`block/...`, bottom first) when the pack has no usable model.
     fallback: &'static [(&'static str, Tint)],
+    /// A fluid's flow sprite (ADR 0025): Minecraft's are twice the block size and a face shows
+    /// a quarter of one, so the layer takes the top-left quarter of a frame twice the layer's
+    /// edge (other sizes are scaled whole).
+    quarter: bool,
 }
 
 const fn recipe(
@@ -161,6 +165,7 @@ const fn recipe(
         face,
         tint: Tint::None,
         fallback,
+        quarter: false,
     }
 }
 
@@ -345,6 +350,26 @@ const RECIPES: &[Recipe] = &[
         FaceName::North,
         &[("block/obsidian", Tint::None)],
     ),
+    // ADR 0025: the flow sprites of the fluids (no model names them).
+    Recipe {
+        tint: Tint::Water,
+        quarter: true,
+        ..recipe(
+            "boxel:water_flow",
+            "water",
+            FaceName::North,
+            &[("block/water_flow", Tint::Water)],
+        )
+    },
+    Recipe {
+        quarter: true,
+        ..recipe(
+            "boxel:lava_flow",
+            "lava",
+            FaceName::North,
+            &[("block/lava_flow", Tint::None)],
+        )
+    },
 ];
 
 /// One texture of a layer, composited bottom to top.
@@ -485,7 +510,7 @@ fn pack_layer(
             id: ResourceId::new(ResourceId::DEFAULT_NAMESPACE, format!("block/{path}")),
             tint: Tint::None,
         }];
-        return match compose(pack, &parts, size, warnings) {
+        return match compose(pack, &parts, size, false, warnings) {
             Ok(texels) => Some(texels),
             Err(missing) => {
                 warnings.push(format!("{}: no texture {missing}; procedural", spec.name));
@@ -494,7 +519,7 @@ fn pack_layer(
         };
     };
     if let Some(parts) = model_parts(pack, recipe, &recipe_values(registry, recipe)) {
-        match compose(pack, &parts, size, warnings) {
+        match compose(pack, &parts, size, recipe.quarter, warnings) {
             Ok(texels) => return Some(texels),
             Err(missing) => warnings.push(format!(
                 "{}: model of {} names missing texture {missing}; trying default names",
@@ -510,7 +535,7 @@ fn pack_layer(
             tint,
         })
         .collect();
-    match compose(pack, &parts, size, warnings) {
+    match compose(pack, &parts, size, recipe.quarter, warnings) {
         Ok(texels) => Some(texels),
         Err(missing) => {
             warnings.push(format!("{}: no texture {missing}; procedural", spec.name));
@@ -605,11 +630,13 @@ fn model_parts(
 
 /// Composites `parts` bottom to top at `size`^2 (first frame, nearest scaling, tint baked in,
 /// "over" blending in sRGB like Minecraft's overlay quads). The first part is required (`Err`
-/// names it when missing); a missing later part is a warning.
+/// names it when missing); a missing later part is a warning. `quarter`: a frame of twice
+/// `size` gives its top-left quarter ([`Recipe::quarter`]).
 fn compose(
     pack: &ResourcePack,
     parts: &[Part],
     size: u32,
+    quarter: bool,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<[u8; 4]>, String> {
     let mut out: Option<Vec<[u8; 4]>> = None;
@@ -621,7 +648,13 @@ fn compose(
             warnings.push(format!("overlay {} missing; drawn without it", part.id));
             continue;
         };
-        let (width, height, frame) = first_frame(texture);
+        let (mut width, mut height, mut frame) = first_frame(texture);
+        if quarter && width == 2 * size && height == 2 * size {
+            frame = (0..size * size)
+                .map(|i| frame[((i / size) * width + i % size) as usize])
+                .collect();
+            (width, height) = (size, size);
+        }
         let mut texels = scale_nearest(width, height, &frame, size);
         if let Some(tint) = part.tint.rgb() {
             for t in &mut texels {
@@ -852,6 +885,16 @@ pub(crate) mod tests {
         pack.png("glowstone", 8, 8, |x, y| {
             [x as u8 * 30, y as u8 * 30, 7, 255]
         });
+        // flow sprites (ADR 0025): water's twice the block size, gray in its top-left quarter
+        // only; lava's at the block size, taken whole
+        pack.png("water_flow", 32, 32, |x, y| {
+            if x < 16 && y < 16 {
+                [255, 255, 255, 200]
+            } else {
+                [0, 0, 0, 255]
+            }
+        });
+        pack.png("lava_flow", 16, 16, |x, _| [200, x as u8, 0, 255]);
 
         let registry = BlockRegistry::default_blocks();
         let (data, report) =
@@ -859,7 +902,7 @@ pub(crate) mod tests {
         assert_eq!((data.size, data.mip_levels), (16, 5));
         assert_eq!(data.layers as usize, registry.textures().len());
         assert_eq!(data.data.len(), data.layers as usize * data.layer_bytes());
-        assert_eq!(report.from_pack, 6);
+        assert_eq!(report.from_pack, 8);
 
         let stone = layer_of(&registry, "boxel:stone");
         assert_eq!(texel(&data, stone, 3, 5), [10, 20, 30, 255]);
@@ -880,6 +923,13 @@ pub(crate) mod tests {
         let water = layer_of(&registry, "boxel:water");
         let [r, g, b] = WATER_TINT;
         assert_eq!(texel(&data, water, 0, 15), [r, g, b, 180]);
+        // the flow sprites: the quarter a face shows, tinted; lava's whole
+        let flow = layer_of(&registry, "boxel:water_flow");
+        for (x, y) in [(0, 0), (15, 15), (3, 12)] {
+            assert_eq!(texel(&data, flow, x, y), [r, g, b, 200]);
+        }
+        let lava_flow = layer_of(&registry, "boxel:lava_flow");
+        assert_eq!(texel(&data, lava_flow, 9, 4), [200, 9, 0, 255]);
         // glowstone (orange lamp) 8x8 scaled to 16 by nearest
         let lamp = layer_of(&registry, "boxel:lamp_orange");
         assert_eq!(texel(&data, lamp, 5, 3), [60, 30, 7, 255]);
@@ -969,11 +1019,12 @@ pub(crate) mod tests {
                 .collect::<BTreeMap<_, _>>()
         };
         for (block, mc, want) in [
-            ("boxel:log", "oak_log", ["log_x", "log_y", "log_z"]),
+            ("boxel:log", "oak_log", &["log_x", "log_y", "log_z"][..]),
             (
                 "boxel:stone_slab",
                 "stone_slab",
-                ["slab", "slab_top", "stone"],
+                // each type dry and waterlogged (ADR 0025)
+                &["slab", "slab", "slab_top", "slab_top", "stone", "stone"],
             ),
         ] {
             let block = registry.block_by_name(block).expect("block");

@@ -42,7 +42,8 @@ pub struct ViewUniform {
     /// shader interpolates it linearly between levels.
     pub light_curve: [[f32; 4]; 4],
     /// xy = render target size in pixels (the voxel shaders grow each quad by a fixed fraction
-    /// of a pixel to close cracks at T-junctions), zw = 0.
+    /// of a pixel to close cracks at T-junctions), z = seconds of the fluid animation (the flow
+    /// textures scroll with it, ADR 0025; wrapped by the caller), w = 0.
     pub viewport: [f32; 4],
 }
 

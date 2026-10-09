@@ -62,7 +62,8 @@ pub use plugin::{
     RenderSettings, RenderSystems, RequestScreenshot, ScreenshotSaved, SurfaceInfo,
 };
 pub use renderer::{
-    DEFAULT_SKY_COLOR, RenderStats, RendererConfig, RendererError, ViewParams, VoxelRenderer,
+    DEFAULT_SKY_COLOR, FLUID_TIME_PERIOD, RenderStats, RendererConfig, RendererError, ViewParams,
+    VoxelRenderer,
 };
 pub use smoke::RendererSmokeTest;
 pub use sort::TranslucentSort;
