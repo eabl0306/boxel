@@ -44,14 +44,18 @@ cielo, mallar, publicar) y cada una puede esperar un frame entero.
 - `IdleInfo`: los dos runners lo publican antes de cada update, junto a `FrameDeadline`. Dice el
   tiempo y los pasos del hueco anterior, cuánto se pasó de la ventana el peor paso de ese hueco,
   y cuántos pasos se pasaron desde que arrancó el runner.
+- `IdleWanted` (opcional): los runners lo limpian antes de cada update y abren la ventana solo si
+  un sistema de esa update pidió pasos (`IdleWanted::want`; los pedidos se suman). Sin el
+  recurso, la ventana se abre después de cada update con lugar, como al principio.
 
 ### Runner winit
 
-- Abre la ventana solo si la app tiene sistemas en `Idle`, está en modo `Continuous` y la update
-  termina con espera (`FrameWait::Sleep`). La ventana termina `IDLE_MARGIN` antes de lo que
-  ocurra primero: el deadline menos la espera activa, o la hora a la que el runner se despertaría
-  de todos modos. Siguiendo al monitor con la compuerta cerrada, eso es 1 ms antes del deadline.
-  Si un frame callback llegó temprano, es 0.7 ms antes del arranque más temprano de la update.
+- Abre la ventana solo si la app tiene sistemas en `Idle`, la update pidió pasos (si hay
+  `IdleWanted`), está en modo `Continuous` y la update termina con espera (`FrameWait::Sleep`).
+  La ventana termina `IDLE_MARGIN` antes de lo que ocurra primero: el deadline menos la espera
+  activa, o la hora a la que el runner se despertaría de todos modos. Siguiendo al monitor con la
+  compuerta cerrada, eso es 1 ms antes del deadline. Si un frame callback llegó temprano, es
+  0.7 ms antes del arranque más temprano de la update.
 - **Primero `Poll`.** La iteración de la update no corre ningún paso: pone `ControlFlow::Poll`
   en vez de su espera. Así winit vacía la conexión de Wayland y entrega un `RedrawRequested` que
   llega enseguida (X11, o una ventana de Wayland que no presenta) antes del primer paso, con la
@@ -61,15 +65,15 @@ cielo, mallar, publicar) y cada una puede esperar un frame entero.
   la update corre en la iteración siguiente. Un evento que llega durante un paso se atiende
   cuando el paso termina, hasta 0.5 ms tarde. Como la ventana termina 1 ms antes del deadline,
   eso solo toca a los callbacks que llegan más de 1 ms antes de tiempo.
-- No cambia nada sin sistemas en `Idle` (ninguna iteración de más), sin límite (tampoco con la
-  ventana oculta: la espera de 33 ms no es un límite), en modo `Reactive`, ni después de una
-  update que terminó tarde. Con límite y la ventana oculta, la ventana de pasos sigue el período
-  de 33 ms.
+- No cambia nada sin sistemas en `Idle` o sin pedido (ninguna iteración de más), sin límite
+  (tampoco con la ventana oculta: la espera de 33 ms no es un límite), en modo `Reactive`, ni
+  después de una update que terminó tarde. Con límite y la ventana oculta, la ventana de pasos
+  sigue el período de 33 ms.
 
 ### Runner headless
 
-Igual, después de cada update con ritmo: pasos seguidos mientras contestan `Ready`, y una espera
-de 0.25 ms entre pasos `Waiting`. Nada con `RunMode::Once` ni sin ritmo.
+Igual, después de cada update con ritmo que pidió pasos: pasos seguidos mientras contestan
+`Ready`, y una espera de 0.25 ms entre pasos `Waiting`. Nada con `RunMode::Once` ni sin ritmo.
 
 ### Mundo (`WorldSettings::idle_work`, encendido por defecto)
 
@@ -80,6 +84,9 @@ de 0.25 ms entre pasos `Waiting`. Nada con `RunMode::Once` ni sin ritmo.
   - si quedan al menos 0.3 ms, aplica un trozo del trabajo de interés que dejaron los frames
     (posiciones, prioridades viejas, caché de luz), de 0.25 ms como máximo.
 - Sin trabajo para hacer ya solo lee el canal y el scheduler, sin marcar el mapa como cambiado.
+- Al final de `Collect` pide pasos solo si uno encontraría trabajo: resultados por recoger, jobs
+  por lanzar, trabajo de interés o jobs en vuelo. Entre ese punto y la update siguiente nada más
+  mueve los jobs, así que un frame que no pide solo se ahorra un paso que contestaría `Done`.
 - Lo que queda en el frame, para que el resultado del mundo no dependa de los tiempos:
   - planear los cambios de los viewers;
   - las ediciones y `BlockChanged`;
@@ -92,7 +99,8 @@ de 0.25 ms entre pasos `Waiting`. Nada con `RunMode::Once` ni sin ritmo.
   - los `ChunkDataEvent` de lo que cargó o descargó;
   - rara vez, los `Upsert` de un lote de edición cuyo último miembro pendiente se fue (se
     descargó o quedó sin malla), igual que en un frame.
-- Todo eso lo leen los sistemas del frame siguiente. Apagado, el mundo trabaja como antes.
+- Todo eso lo leen los sistemas del frame siguiente. Apagado, el mundo trabaja como antes y no
+  pide pasos nunca: el runner espera igual que en main (sin `Poll` ni paso), por construcción.
 
 ### Otros
 
@@ -149,6 +157,23 @@ corrida que se cruzó con una compilación u otro test se repitió. Detalle en
 - No cambian: el contrato de un mensaje por job, `ResultToken`, el tope automático por frame, la
   lógica del scheduler, el orden de `Main`, `Time` y `FixedTime`, la física (no corre en `Idle`),
   el render (no corre en `Idle`) y lo que dicen los campos que ya tenía `stress`.
+
+### Ventana solo con trabajo (`IdleWanted`)
+
+- Al principio la ventana se abría después de cada update, también sin nada que hacer: primero
+  `Poll` y después un paso que contesta `Done`. En el bosque (radio 16, vuelo a 32, tope 144,
+  RTX 5050) el ritmo salía un poco peor también con el trabajo apagado.
+- Diagnóstico, 46 rondas emparejadas, apagado contra el mismo binario sin ventana: más corridas
+  en el modo alto de refrescos salteados (30 contra 18, McNemar p = 0.023), +19 salteados por
+  20 s (p = 0.018) y 1 mostrado por segundo menos (p = 0.018). Encendido no se distinguía de
+  main (12 rondas, p = 0.44). El paso cuesta 6.5 us de media: lo que pesa es abrir la ventana.
+  Datos en `bench-results/issue3/diag-forest/` (`pairs.txt`, `modes.txt`).
+- Arreglo: el mundo pide pasos solo cuando le queda trabajo. Apagado ahora es igual a main por
+  construcción (ningún paso, la espera de siempre). Encendido, en el bosque solo el 1 % de los
+  frames abre ventana (antes todos).
+- Prueba rápida (una corrida de 10 s por lado contra 48a0427, ver
+  [puesta-al-dia](../rendimiento/puesta-al-dia-2026-10.md)): sin regresiones, y la puesta al día
+  igual.
 
 ## Alternativas descartadas
 

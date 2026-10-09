@@ -10,8 +10,9 @@ con un solo binario.
   bajo tierra 37.7 -> 22.3, picado 36.2 -> 28.3, bosque 24.8 -> 14.6.
 - A 60 fps gana más: superficie 45.8 -> 16.7 ms (un frame), bajo tierra 55.9 -> 33.4.
 - Sin tope, con vsync, en la 780M y en las ediciones no cambia nada.
-- El ritmo queda igual en la superficie y mejora bajo tierra y en picado. En el bosque sale un poco
-  peor, y lo mismo con el trabajo apagado: no lo causa el trabajo entre frames. Queda abierto.
+- El ritmo queda igual en la superficie y mejora bajo tierra y en picado. En el bosque salía un
+  poco peor, también apagado. La causa era abrir la ventana de pasos sin nada que hacer; ahora el
+  mundo la pide solo con trabajo (ver [Ventana solo con trabajo](#ventana-solo-con-trabajo)).
 - Metas de la issue: superficie y bajo tierra sí. Picado ~25 no (28.3), pero sin tope hoy tarda 31.
 
 ## Cómo se midió
@@ -88,7 +89,7 @@ main / apagado / encendido, medias.
 - Bosque: frames de más de 7.5 ms 83 -> 112 (prueba de permutación, p = 0.07) y salteados 45 -> 68
   (p = 0.17). Apagado da lo mismo que encendido, así que no es el trabajo entre frames. Lo que sí
   corre también apagado es la iteración extra del runner (primero `Poll` y después un paso que
-  contesta `Done`, ADR 0022). Para separarlo hace falta un A/B sin sistemas en `Idle`.
+  contesta `Done`, ADR 0022). El A/B sin ventana lo confirmó: ver abajo.
 
 ## Pasos entre frames (encendido)
 
@@ -163,8 +164,44 @@ el modo de 30 fps: 5 de las 12 primeras cayeron en él, así que se repitió el 
 | Contra sin tope del mismo binario más un período | Sí en los cuatro casos |
 | Retraso del trabajo con tope igual a sin tope | Igual en la superficie, menor bajo tierra y en picado, 1.8 ms mayor en el bosque |
 | Ningún frame cuyo trabajo pase el período | Sí. Pasos fuera de la ventana hasta 0.49 ms, dentro del margen; ningún frame de más de 18 ms |
-| Ritmo no peor que main | Sí en superficie, bajo tierra, picado, vsync y 780M. Bosque dudoso (ver arriba) |
+| Ritmo no peor que main | Sí en superficie, bajo tierra, picado, vsync y 780M. Bosque: era la ventana sin trabajo, arreglado (ver abajo) |
 | Sin cambios sin tope | Sí |
+
+## Ventana solo con trabajo
+
+Diagnóstico del bosque (radio 16, vuelo a 32, tope 144, RTX 5050), 20 s por corrida, en
+`bench-results/issue3/diag-forest/` (`variants.txt`, `pairs.txt`, `modes.txt`). "Sin ventana" es
+48a0427 con un parche de prueba que nunca abre la ventana, con el trabajo apagado.
+
+| Par | Rondas | Salteados | p | Modo alto de salteados | McNemar p |
+|---|---:|---:|---:|---|---:|
+| apagado - sin ventana | 46 | +19.3 | 0.018 | 30 contra 18 | 0.023 |
+| encendido - sin ventana | 30 | +4.8 | 0.65 | 16 contra 13 | 0.63 |
+| encendido - main | 12 | -16.2 | 0.44 | 5 contra 7 | 0.73 |
+
+- Abrir la ventana sin trabajo sube la proporción de corridas en el modo alto (issue #5). El paso
+  en sí cuesta 6.5 us de media.
+- Arreglo (`IdleWanted`, ADR 0022): el mundo pide pasos solo si uno encontraría trabajo. Apagado
+  ahora es igual a main por construcción: ningún paso y la espera de siempre.
+
+Prueba rápida del arreglo (nivel 1): una corrida de 10 s por lado, base 48a0427 (el código de
+849a784, `stress` md5 459a22d8) contra la rama b0fbf23 (md5 db15bfd6). Falla con fps por debajo
+del 85 % de la base o un p99 de más de 1.5 veces el de la base.
+
+| Caso | fps | p99 | Salteados | Frames con pasos | Puesta al día |
+|---|---|---|---|---|---|
+| Bosque, apagado | 142.9 -> 143.1 | 7.54 -> 7.56 ms | 8 -> 6 | 100 -> 0 % | 23.9 -> 22.5 ms |
+| Bosque, encendido | 143.3 -> 141.3 | 7.57 -> 13.90 ms | 5 -> 24 | 100 -> 1 % | 14.0 -> 14.1 ms |
+| Bosque, encendido, repetida | 140.2 -> 143.3 | 14.05 -> 7.51 ms | 35 -> 4 | 100 -> 1 % | 16.2 -> 14.4 ms |
+| Superficie, encendido (solo rama) | 141.1 | 13.92 ms | 26 | 3 % | 18.2 ms |
+
+- El primer par encendido no cumplió el criterio del p99: la rama cayó en el modo alto. Repetido,
+  el que cayó fue la base. Es el ruido de siempre (issue #5), no una regresión.
+- La puesta al día no cambia: bosque 14.1 y 14.4 ms (antes 14.6), superficie 18.2 ms (antes 17.4,
+  de 16.2 a 18.4).
+- `headless_world`, salto de 64 chunks a 144 Hz: los mismos chunks, mallas y quads (17727, 1801,
+  439387), 14 y 15 frames.
+- Datos y scripts en `bench-results/issue3/smoke-want/`.
 
 ## Para repetir
 
