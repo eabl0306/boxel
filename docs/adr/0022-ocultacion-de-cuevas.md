@@ -105,8 +105,10 @@ Un BFS desde el chunk de la cámara, con las reglas de Minecraft y Sodium:
   volver, así que la caja no pierde nada.
 
 Costo medido con la máquina compartida: 22 a 75 µs a radio 16 y 75 a 340 µs a radio 32 con la
-caché caliente; en el juego, por búsqueda, 0.12 a 0.2 ms bajo tierra y unos 0.37 ms en la
-superficie a radio 16, 0.8 ms en la superficie a radio 32.
+caché caliente. En el juego, con la máquina quieta, de media por búsqueda: 0.04 a 0.09 ms en una
+cueva y 0.09 a 0.27 ms en la superficie a radio 16; 0.16 y 0.8 ms a radio 32 (p99 0.5 y 1.6 ms).
+Una búsqueda que recarga varias capas de la grilla (el ojo sale de la roca después de cruzar
+varios chunks) llega a 2 ms a radio 16.
 
 ### 4. Cuándo se busca
 
@@ -121,7 +123,7 @@ conjunto se reusa mientras nada pueda hacer visible algo más:
   malla que se asienta, lo normal mientras el mundo carga) solo puede ocultar más: espera hasta
   50 ms (`TIGHTEN_DELAY`) a la próxima búsqueda.
 
-Volando, se busca en 1 a 4 % de los frames.
+Volando, se busca en 2 a 5 % de los frames.
 
 ### 5. Dónde corre
 
@@ -178,17 +180,28 @@ depende del chunk del ojo y no de su vóxel. `VisibilityStats::blocked` cuenta e
 ## Consecuencias
 
 - Con el ojo en una cueva, a radio 16 se dibuja de 1.8 a 4.4 veces menos (44 a 77 % de las caras
-  ocultas, 61 % de media en 9 cuevas). En la 780M pasa de unos 300 fps a entre 500 y 800, sin
-  frames de más de 6.94 ms quieta o girando; caminando por la cueva quedan unos pocos, de GPU. Las
-  primeras corridas bajo tierra llevaban la cámara por dentro de la roca, donde parte de lo oculto
-  sí se veía: se midió de nuevo con `stress --cave` (una cámara en espacio abierto de una cueva,
-  y el escenario `path` que la recorre). El resumen de `stress` avisa si el ojo pasó por la roca.
+  ocultas, 61 % de media en 9 cuevas). En la 780M pasa de 309 a 338 fps a entre 545 y 856, y de
+  34 a 211 frames de más de 6.94 ms por corrida a ninguno quieta o girando; caminando por la
+  cueva quedó 1 de 7.16 ms en 3 corridas. En la RTX, de 1.5 a 2.8 veces los fps (a radio 32, 1 100
+  contra 436). Las primeras corridas bajo tierra llevaban la cámara por dentro de la roca, donde
+  parte de lo oculto sí se veía: se midió de nuevo con `stress --cave` (una cámara en espacio
+  abierto de una cueva, y el escenario `path` que la recorre). El resumen de `stress` avisa si el
+  ojo pasó por la roca.
+- **El criterio de la issue #19 no se cumple tal como está escrito** (vuelo y bajada a 64 por la
+  roca en la 780M, sin frames de más de 6.94 ms). Con el ojo en la roca (74 y 83 % de esos
+  frames) no se oculta nada, porque se vería lo que hay detrás. Quedan casi igual que sin culling:
+  185 a 420 frames lentos por corrida contra 234 a 421. Un jugador no atraviesa la roca; para él
+  vale la cueva de arriba.
+- Con el tope de 144 de un juego, en la 780M salta 14 a 19 refrescos por corrida en una cueva
+  contra 66 a 79 sin culling. En la RTX a radio 32 salta más con culling (24 a 75 contra 7 a 18),
+  sin más trabajo de CPU en esos frames: probablemente la RTX, con menos trabajo, baja de estado
+  de energía (issue #5). Sin confirmar.
 - Mientras el mundo carga o se publica una edición en partes, se oculta menos: todo lo que hay
   detrás de un chunk que no se muestra como es se dibuja. Una edición que cambia lo que ocluye
   junto a la cámara apaga casi toda la ocultación hasta que se publica su malla y se busca de
   nuevo (hasta 50 ms después, `TIGHTEN_DELAY`). Medido con 20 ediciones en 20 s junto a la
   cámara: cada una de las 19 que cambian lo que ocluye apagó la ocultación dentro del frustum,
-  entera o en parte, durante 52 a 59 ms. En total, 5 % del tiempo con menos ocultación y 2.5 %
+  entera o en parte, durante 51 a 60 ms. En total, 5 % del tiempo con menos ocultación y 2.5 %
   sin ninguna. Crece con las ediciones por segundo: con 5 por segundo serían alrededor de un
   cuarto del tiempo (estimado). Antes cualquier malla nueva abría el chunk; ahora una malla
   nueva solo por la luz no lo abre.
@@ -197,7 +210,7 @@ depende del chunk del ojo y no de su vóxel. `VisibilityStats::blocked` cuenta e
   superficie, el aire del valle y una cueva tocan la misma cara, y el enlace por par de caras las
   junta. Lo siguiente, en la fase 5: subceldas de 16³ para los enlaces, o Hi-Z en High.
 - En la superficie, ocultar ahorra poco GPU (9 a 26 % de los quads) y la búsqueda cuesta más (más
-  chunks abiertos). Con la reutilización queda en un empate dentro del ruido.
+  chunks abiertos). Con la reutilización gana poco: 3 a 15 % más fps, sin frames lentos nuevos.
 - El mundo guarda un `u16` y un bit más por slot (sin crecer el slot) y una grilla de la caja
   (37 KiB a radio 16).
 - Tests: enlaces contra un flood fill vóxel a vóxel; la búsqueda contra fuerza bruta en mundos al
