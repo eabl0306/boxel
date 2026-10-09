@@ -54,7 +54,7 @@ Estado validado antes de escribir este documento:
 
 Entre adaptadores distintos la diferencia máxima medida fue 0.33 % de píxeles. Además, el
 esqueleto del M0 compila y pasa sus tests de contrato, clippy con `-D warnings`, rustdoc,
-cargo-deny, el MSRV 1.97.1 y los tests del ECS vendorizado (961 + 480) con lockfile fijo.
+cargo-deny, el MSRV 1.97.1 y los tests del ECS vendorizado (962 + 480) con lockfile fijo.
 
 ---
 
