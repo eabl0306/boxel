@@ -155,6 +155,41 @@ fn slabs_stairs_and_fences_hold_water() {
 }
 
 #[test]
+fn placing_into_water_keeps_it_and_breaking_leaves_it() {
+    use boxel_voxel::rules::{broken, placed_into};
+    let r = registry();
+    let water = s(&r, "boxel:water");
+    let flowing = s(&r, "boxel:water[level=3]");
+    for name in [
+        "boxel:stone_slab[type=top]",
+        "boxel:oak_stairs[facing=east]",
+        "boxel:oak_fence[north=true]",
+    ] {
+        let dry = s(&r, name);
+        let wet = r.with_water(dry, true).unwrap();
+        assert_eq!(placed_into(&r, dry, water), wet, "{name}");
+        assert_eq!(placed_into(&r, dry, BlockState::AIR), dry, "{name}");
+        assert_eq!(
+            placed_into(&r, dry, flowing),
+            dry,
+            "{name}: flowing water goes"
+        );
+        assert_eq!(placed_into(&r, wet, BlockState::AIR), dry, "{name}");
+        assert_eq!(broken(&r, wet), water, "{name}");
+        assert_eq!(broken(&r, dry), BlockState::AIR, "{name}");
+    }
+    for name in [
+        "boxel:stone",
+        "boxel:stone_slab[type=double]",
+        "boxel:torch",
+    ] {
+        let state = s(&r, name);
+        assert_eq!(placed_into(&r, state, water), state, "{name}");
+        assert_eq!(broken(&r, state), BlockState::AIR, "{name}");
+    }
+}
+
+#[test]
 fn stair_boxes_are_minecrafts() {
     let east = |shape| stair_boxes(Facing::East, SlabHalf::Bottom, shape);
     let slab = ModelBox::new([0, 0, 0], [16, 8, 16]);

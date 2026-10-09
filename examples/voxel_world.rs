@@ -6,8 +6,8 @@
 //! cycles the frame limit (30, 60, 144, 240, unlimited) and F6 toggles vsync. While the mouse is
 //! grabbed, left click breaks the block under the crosshair and right click places the selected
 //! block on the face it points at (keys 1 to 9 and 0 select it, lamps on 7 to 0; the mouse wheel
-//! scrolls through those and the rest: glass, the stone slab, short grass, a poppy, water, stone
-//! and oak stairs, the oak fence and the torch;
+//! scrolls through those and the rest: glass, the stone slab, short grass, a poppy, water, lava,
+//! stone and oak stairs, the oak fence and the torch;
 //! F3 shows the target, the selection and the light at the eye and the crosshair), never where a
 //! solid body is (the walking player: `PhysicsQuery::state_is_free`, against the placed block's
 //! shape). A slab goes in as a top slab when the click hits the bottom of a block or the upper
@@ -23,7 +23,10 @@
 //!
 //! Water flows (ADR 0021, `FluidPlugin`): placed water is a source that spreads 7 blocks and
 //! falls, breaking a block next to a lake or the sea lets it flow, and F3 shows the first water
-//! along the view with its level (`boxel:water[level=3]`) and a line of the block ticks.
+//! along the view with its level (`boxel:water[level=3]`) and a line of the block ticks. Lava
+//! flows 3 blocks and hardens next to water (ADR 0025). A slab, stairs or a fence placed into a
+//! water source keeps it (waterlogged), water placed on a dry one fills it, and breaking a
+//! waterlogged block leaves its water; a double slab is always dry.
 //!
 //! Day and night: a day lasts 20 minutes. `[` and `]` move the clock one hour back and forward,
 //! T pauses it and F runs it 60 times faster; `--time HH:MM` sets the start (noon by default).
@@ -1079,7 +1082,7 @@ fn vsync_test(
 const REACH: f64 = 6.0;
 /// The blocks keys 1 to 9 and 0 select for placing (the first ten) and the mouse wheel scrolls
 /// through (all of them; names missing from the registry are skipped).
-const HOTBAR: [&str; 19] = [
+const HOTBAR: [&str; 20] = [
     "boxel:stone",
     "boxel:dirt",
     "boxel:grass",
@@ -1095,6 +1098,7 @@ const HOTBAR: [&str; 19] = [
     "boxel:short_grass",
     "boxel:poppy",
     "boxel:water",
+    "boxel:lava",
     "boxel:stone_stairs",
     "boxel:oak_stairs",
     "boxel:oak_fence",
@@ -1278,7 +1282,11 @@ fn slab_merge(
         return None;
     }
     let same = |s: BlockState| registry.block(s) == registry.block(held);
-    let double = |s: BlockState| registry.with(s, "type", "double");
+    // A double slab holds no water (ADR 0025).
+    let double = |s: BlockState| {
+        let double = registry.with(s, "type", "double")?;
+        Some(registry.with_water(double, false).unwrap_or(double))
+    };
     let half = |s: BlockState| registry.property(s, "type");
     let inner = matches!(
         (face, half(hit.state)),
@@ -1301,6 +1309,33 @@ fn slab_merge(
         pos,
         state: double(existing)?,
     })
+}
+
+/// Water placed on a dry block that can hold it fills that block (Minecraft's bucket on a
+/// `LiquidBlockContainer`, ADR 0025): the edit that waterlogs the clicked block, or `None` (an
+/// ordinary placement) when `held` is not the water source or the block cannot take it.
+fn water_fill(registry: &BlockRegistry, held: BlockState, hit: &VoxelHit) -> Option<BlockEdit> {
+    hit.face?;
+    let source = registry.by_name("boxel:water")?;
+    let fill = held == source
+        && registry.can_be_waterlogged(hit.state)
+        && !registry.is_waterlogged(hit.state);
+    fill.then(|| BlockEdit {
+        pos: hit.block,
+        state: registry.with_water(hit.state, true).unwrap_or(hit.state),
+    })
+}
+
+/// The water rules of a player's edit (ADR 0025): a block placed into a water source keeps it
+/// ([`rules::placed_into`]), a broken waterlogged block leaves its water ([`rules::broken`]).
+/// `existing` is what the cell holds now.
+fn with_water_rules(registry: &BlockRegistry, edit: BlockEdit, existing: BlockState) -> BlockEdit {
+    let state = if edit.state.is_air() {
+        rules::broken(registry, existing)
+    } else {
+        rules::placed_into(registry, edit.state, existing)
+    };
+    BlockEdit { state, ..edit }
 }
 
 /// `+Y`, `-X`...
@@ -1453,12 +1488,14 @@ fn pick_blocks(
             VoxelProbe::Unloaded => None,
         };
         let merge = match click {
-            Click::Place => slab_merge(registry, picking.block(), &hit, probe),
+            Click::Place => slab_merge(registry, picking.block(), &hit, probe)
+                .or_else(|| water_fill(registry, picking.block(), &hit)),
             Click::Break => None,
         };
         let edit = match merge {
             Some(edit) => physics.state_is_free(edit.pos, edit.state).then_some(edit),
-            None => click_edit(click, &hit, block, free),
+            None => click_edit(click, &hit, block, free)
+                .map(|edit| with_water_rules(registry, edit, probe(edit.pos).unwrap_or_default())),
         };
         if let Some(edit) = edit {
             edits.set_block(edit.pos, edit.state);
@@ -2427,6 +2464,58 @@ mod tests {
             ..hit(bottom, Face::PosY, 0.5)
         };
         assert_eq!(slab_merge(&registry, bottom, &inside, air), None);
+        // A waterlogged slab merges into a dry double slab (ADR 0025).
+        let wet = by("boxel:stone_slab[waterlogged=true]");
+        assert_eq!(
+            slab_merge(&registry, bottom, &hit(wet, Face::PosY, 0.5), air),
+            at_cell(cell)
+        );
+    }
+
+    #[test]
+    fn placed_and_broken_blocks_keep_the_water_they_hold() {
+        let registry = BlockRegistry::default_blocks();
+        let by = |n: &str| registry.parse_state(n).expect("built-in");
+        let (water, flowing) = (by("boxel:water"), by("boxel:water[level=2]"));
+        let (dry, wet) = (
+            by("boxel:oak_fence"),
+            by("boxel:oak_fence[waterlogged=true]"),
+        );
+        let cell = BlockPos::new(-3, 64, 1 << 40);
+        let edit = |state| BlockEdit { pos: cell, state };
+        // Placed into a water source it keeps the water, into flowing water or air it is dry.
+        assert_eq!(with_water_rules(&registry, edit(dry), water), edit(wet));
+        assert_eq!(with_water_rules(&registry, edit(dry), flowing), edit(dry));
+        assert_eq!(
+            with_water_rules(&registry, edit(dry), BlockState::AIR),
+            edit(dry)
+        );
+        let stone = by("boxel:stone");
+        assert_eq!(with_water_rules(&registry, edit(stone), water), edit(stone));
+        // Broken, a waterlogged block leaves its water; a dry one air.
+        let air = edit(BlockState::AIR);
+        assert_eq!(with_water_rules(&registry, air, wet), edit(water));
+        assert_eq!(with_water_rules(&registry, air, dry), air);
+        // Water placed on a dry block that holds water fills it; on anything else (or a wet
+        // one) it goes into the next cell as usual.
+        let hit = |state| VoxelHit {
+            block: cell,
+            face: Some(Face::PosY),
+            t: 1.0,
+            point: WorldPos::from_dvec3(DVec3::new(-2.5, 65.0, 0.5)),
+            state,
+        };
+        let stairs = by("boxel:stone_stairs[facing=west]");
+        assert_eq!(
+            water_fill(&registry, water, &hit(stairs)),
+            Some(edit(registry.with_water(stairs, true).expect("wet")))
+        );
+        assert_eq!(water_fill(&registry, water, &hit(wet)), None);
+        assert_eq!(water_fill(&registry, water, &hit(stone)), None);
+        assert_eq!(water_fill(&registry, flowing, &hit(dry)), None);
+        assert_eq!(water_fill(&registry, stone, &hit(dry)), None);
+        let double = by("boxel:stone_slab[type=double]");
+        assert_eq!(water_fill(&registry, water, &hit(double)), None);
     }
 
     #[test]
