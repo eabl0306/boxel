@@ -50,17 +50,21 @@ de GPU, corre también los tests de GPU:
 
 Medir llevaba más tiempo que las tareas, así que hay dos niveles.
 
-- **En cada tarea, solo el nivel 1.** Primero los números que no tienen ruido: quads, draws y
-  chunks con `headless_world`, y un bench de criterion solo del camino caliente que tocaste (una
-  corrida por lado). Después `just perf-smoke`, de 5 a 10 minutos: una corrida de 10 s por lado
-  contra la base. Solo falla si algo empeoró mucho. Pega su tabla en la PR.
+- **En cada tarea, solo el nivel 1.** Primero los números que no tienen ruido: quads y chunks con
+  `headless_world`, y un bench de criterion solo del camino caliente que tocaste (una corrida por
+  lado). Después `just perf-smoke CASO...` con uno o dos casos que toque tu tarea
+  (`python3 tools/perf/perf.py cases` los lista; sin casos mide superficie y bosque). Las opciones
+  de stress van al final, tras `--`. Tarda de 5 a 10 minutos. Pega su tabla en la PR.
+- **El smoke sale con 0 si pasa**, 1 si algo empeoró mucho o tu binario falló, y 2 si no pudo medir.
+  Un 2 no es un "ok": repítelo con la máquina tranquila.
+- **No lo envuelvas en `tools/quiet.sh`.** Ya compila con él y se niega a correr dentro.
 - **No escribas tu propio harness** ni rondas de corridas intercaladas. Usa `tools/perf/`, y si le
   falta algo, agrégalo ahí con su test.
 - **Nunca estudies refrescos salteados con tope en una tarea.** Salen con mucho ruido por el estado
   de energía de la NVIDIA (issue #5).
-- **La ronda de control** (`just perf-check`, más de una hora) la deciden el dueño o Claude: cada 4
-  o 5 tareas integradas o antes de cerrar un hito. Si algo empeoró, `just perf-bisect` encuentra el
-  merge que lo causó.
+- **La ronda de control** (`just perf-check`, más de una hora) la corre solo quien integra en
+  `main`, sobre `main`: cada 4 o 5 tareas integradas o antes de cerrar un hito. Una tarea nunca la
+  corre. Si algo empeoró, el informe trae el `just perf-bisect` que busca el merge.
 
 Detalle en `docs/benchmarks.md`.
 

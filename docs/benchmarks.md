@@ -10,41 +10,60 @@ tres recetas usan el harness de `tools/perf/`. No escribas otro.
 
 ### Nivel 1: en cada tarea (5 a 10 minutos)
 
-1. Primero los números que no tienen ruido: quads, draws y chunks con `headless_world`, y si
-   tocaste un camino caliente, su bench de criterion (`just bench mesh`, por ejemplo). Una
-   corrida por lado.
-2. Después el smoke:
+1. Primero los números que no tienen ruido: quads y chunks con `headless_world`, y si tocaste un
+   camino caliente, su bench de criterion (`just bench mesh`, por ejemplo). Una corrida por lado.
+   Los draws no salen de `headless_world` (no tiene render): salen del resumen de `stress`, en la
+   línea final del mundo de una corrida de `just bench-static` por lado.
+2. Después el smoke, con uno o dos casos que toque tu tarea (`python3 tools/perf/perf.py cases`
+   los lista):
 
 ```bash
 just perf-smoke                        # superficie y bosque en la RTX, radio 16, sin tope
-just perf-smoke dive cave-path         # otros casos
+just perf-smoke dive cave-path         # los casos que toca la tarea
 just perf-smoke 780m/forest/144        # un caso es gpu/escenario/rN/tope, en cualquier orden
+just perf-smoke forest -- --bodies 10000   # opciones de stress, iguales en los dos lados
 just perf-smoke --base main            # otra base (por defecto, el merge base con main)
 ```
 
 Compila la rama tal como está y toma el binario de la base de `bench-results/bins/<sha>/stress`.
-Si no está, lo compila en un worktree aparte, en `target-perf/` o en `PERF_TARGET_DIR`, que no
-puede ser el target dir de la rama (cargo mezclaría las dos). Corre una vez 10 s por lado cada caso
-y solo falla con un empeoramiento grosero:
+Si no está, lo compila en un worktree aparte, en `target-perf/` o en `PERF_TARGET_DIR`. Cada
+target dir es de un solo árbol: si otro árbol ya compiló ahí con el harness, se niega, porque
+cargo puede tomar el código de un árbol por el del otro. Si la rama cambia mientras compila (un
+commit, una edición), no mide.
+
+Las recetas `perf-*` ya compilan con `tools/quiet.sh`. No las envuelvas en él: se niegan a correr
+dentro de un slot, que además frenaría sus compilaciones.
+
+Corre una vez 10 s por lado cada caso y solo falla con un empeoramiento grosero:
 
 - fps por debajo del 85 % de la base,
 - p99 de más de 1.5 veces la base,
-- frames lentos donde la base no tenía.
+- frames de más de 6.94 ms donde la base no tenía.
 
-Si un caso falla, repite el par una vez y solo cuenta si vuelve a fallar. Al final imprime una
-tabla para pegar en la PR. Sale con 0 si todo va bien, 1 si algo empeoró o la rama falló y 2 si
-no pudo medir.
+Si un caso falla, repite el par una vez y solo cuenta si vuelve a fallar. Con tope 144 la base
+siempre tiene unos 1500 frames de más de 6.94 ms (ver
+[rendimiento/ritmo-2026-10.md](rendimiento/ritmo-2026-10.md)), así que ahí el smoke solo mira fps
+y p99. Los topes van de 50 para arriba: más bajos, no se distinguen del límite de 30 fps del
+compositor.
 
-Frames lentos son los de más de 6.94 ms sin tope y los de más de 7.5 ms con tope: con tope el
-compositor manda los callbacks cada 6.95 ms y la mitad de los frames pasa 6.94 ms por poco (ver
-[rendimiento/ritmo-2026-10.md](rendimiento/ritmo-2026-10.md)).
+Al final imprime una tabla para pegar en la PR, solo con números de corridas que cuentan. Sale
+con:
+
+- 0: todo medido y sin empeoramiento grosero.
+- 1: algo empeoró mucho, o el binario de la rama falló (o perdió un escenario) donde la base
+  corrió.
+- 2: no pudo medir algo. Por ejemplo, falló la base o fallaron los dos lados (sin GPU), una
+  corrida siguió con ruido tras 4 intentos, la máquina no quedó tranquila en 30 minutos
+  (`PERF_MAX_WAIT`) o la base no tiene el escenario. Un 2 no es un "ok": repítelo con la máquina
+  tranquila.
 
 En una tarea no se estudian refrescos salteados con tope. Salen con mucho ruido por el estado de
 energía de la NVIDIA (issue #5).
 
 ### Nivel 2: la ronda de control
 
-La deciden el dueño o Claude, cada 4 o 5 tareas integradas o antes de cerrar un hito.
+La corre solo quien integra en `main` (el dueño, o Claude cuando integra), sobre un commit de
+`main`, cada 4 o 5 tareas integradas o antes de cerrar un hito. Una tarea nunca la corre.
 
 ```bash
 just perf-check --dry-run              # solo el plan y cuánto va a tardar
@@ -54,16 +73,26 @@ just perf-check                        # más de una hora
 Corre una matriz fija (`python3 tools/perf/perf.py cases` la lista): RTX y 780M; superficie,
 cueva abierta (ruta y quieta), bosque y bajada; con tope 144 y sin tope; radio 16, más una cueva
 y una superficie en radio 32 en la RTX. Hace 3 corridas intercaladas de 20 s por caso contra el
-binario guardado de la ronda anterior (`bench-results/control/last`), sin recompilarlo, y mira el
-estado de la NVIDIA (solo lectura). Escribe `docs/rendimiento/control-AAAA-MM-DD.md` y pone el tag
-local `perf-control-N`, que sube el dueño. La primera ronda no tiene contra qué comparar y solo
-guarda los números. Los casos de cueva corren cuando el binario tiene `--cave`.
+binario guardado de la ronda anterior (`bench-results/control/last`, o el tag `perf-control-N`
+más alto si ese archivo se perdió), sin recompilarlo, y mira el estado de la NVIDIA (solo
+lectura). Escribe `docs/rendimiento/control-AAAA-MM-DD.md`. La primera ronda no tiene contra qué
+comparar y solo guarda los números. Los casos de cueva corren cuando el binario tiene `--cave`.
 
-Si algo empeoró, `perf-bisect` busca el merge con el smoke de ese caso. Prueba por mitades los
-commits de primer padre (los merges) entre las dos refs:
+Solo una ronda completa, en la que contaron todas las corridas, pasa a ser la base de la próxima
+y recibe el tag local `perf-control-N`, que sube el dueño. Si falta algo (la RTX no aparece, una
+corrida siguió con ruido), el informe dice "Ronda incompleta" y la base no se mueve;
+`--accept-partial` la acepta igual. Sale con 0 si todo está bien, 1 si algo empeoró o el binario
+nuevo falló o perdió un escenario, y 2 si la ronda quedó incompleta. Fuera de `main` se niega;
+`--off-main` mide igual, deja el informe en `bench-results/` y no toca el tag ni la base.
+
+Si algo empeoró, el informe trae el comando de `perf-bisect` que busca el merge. Prueba por
+mitades los commits de primer padre (los merges) entre las dos refs. Por defecto usa el smoke del
+caso; con `--metric` usa la regla de la ronda para esa métrica (3 corridas de 20 s por lado), que
+encuentra cambios que el smoke no ve, como la puesta al día o el p50:
 
 ```bash
 just perf-bisect rtx/surface/r16/144 perf-control-3 main
+just perf-bisect rtx/surface/r16/uncapped perf-control-3 main --metric catch_up
 ```
 
 ### Cómo se cuida el ruido
@@ -72,9 +101,12 @@ Antes de cada corrida el harness espera a que no compile nada (rustc, cargo, lin
 corra otro binario de boxel y a que `tools/wait-idle.sh` pase. Mira la máquina cada 0.5 s mientras
 corre y repite, hasta 4 veces, las corridas que se cruzaron con una compilación u otro benchmark,
 en las que el resto de la máquina usó más del 15 % de CPU, o en las que el compositor bajó la
-ventana a 30 fps (un segundo con menos de 100 fps o de 50 frames mostrados). Dos harnesses nunca
-miden a la vez. Cada corrida queda en `bench-results/` (smoke, control o bisect) y
-`just bench-report --compare` compara las carpetas `base` y `new`.
+ventana a 30 fps (un segundo con menos de 100 fps o de 50 frames mostrados, o con menos del 70 %
+de un tope más bajo). Una corrida que sigue con ruido tras el cuarto intento no cuenta: no entra
+en ningún veredicto ni en ninguna media, y sus archivos van a `discarded/`. Si la máquina no queda
+tranquila en `PERF_MAX_WAIT` segundos (30 minutos), el smoke no corre los casos que faltan. Dos
+harnesses nunca miden a la vez. Cada corrida queda en `bench-results/` (smoke, control o bisect)
+y `just bench-report --compare` compara las carpetas `base` y `new`.
 
 ## Cómo correrlo
 
@@ -227,9 +259,11 @@ mundo, luz (`--light`), texturas (`--pack`), escenario, radio, radio vertical, v
 (`--bodies`), ediciones (`--edits`), backend, tier y GPU. Una hora distinta (`--time`) solo se anota.
 Si las corridas tienen los datos de ritmo (Pacing), también los compara.
 
-Para una tarea alcanza con `just perf-smoke`. Para investigar a mano: `just bench-all` antes del
-cambio, mover `bench-results/` a otra carpeta, aplicar el cambio, `just bench-all` otra vez y
-comparar las dos carpetas.
+Para una tarea alcanza con `just perf-smoke` de los casos que toca. Para investigar a mano:
+`just bench-all` antes del cambio, mover esas corridas (los `bench-results/*.md` y `*.csv`) a otra
+carpeta, aplicar el cambio, `just bench-all` otra vez y comparar las dos carpetas. No muevas ni
+borres `bench-results/bins/`, `control/`, `smoke/` ni `bisect/`: son del harness, y
+`control/last` dice contra qué compara la próxima ronda de control.
 
 ## El CSV
 
