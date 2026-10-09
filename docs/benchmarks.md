@@ -3,6 +3,78 @@
 Sirve para medir los tirones del frame mientras el mundo carga chunks nuevos, antes y después de
 cada optimización. El programa es `examples/stress.rs`.
 
+## Qué correr y cuándo
+
+Hay dos niveles, porque las campañas largas de stress llevaban más tiempo que las tareas. Las
+tres recetas usan el harness de `tools/perf/`. No escribas otro.
+
+### Nivel 1: en cada tarea (5 a 10 minutos)
+
+1. Primero los números que no tienen ruido: quads, draws y chunks con `headless_world`, y si
+   tocaste un camino caliente, su bench de criterion (`just bench mesh`, por ejemplo). Una
+   corrida por lado.
+2. Después el smoke:
+
+```bash
+just perf-smoke                        # superficie y bosque en la RTX, radio 16, sin tope
+just perf-smoke dive cave-path         # otros casos
+just perf-smoke 780m/forest/144        # un caso es gpu/escenario/rN/tope, en cualquier orden
+just perf-smoke --base main            # otra base (por defecto, el merge base con main)
+```
+
+Compila la rama tal como está y toma el binario de la base de `bench-results/bins/<sha>/stress`.
+Si no está, lo compila en un worktree aparte (`target-perf/src`, o `PERF_TARGET_DIR`). Corre una
+vez 10 s por lado cada caso y solo falla con un empeoramiento grosero:
+
+- fps por debajo del 85 % de la base,
+- p99 de más de 1.5 veces la base,
+- frames lentos donde la base no tenía.
+
+Si un caso falla, repite el par una vez y solo cuenta si vuelve a fallar. Al final imprime una
+tabla para pegar en la PR. Sale con 0 si todo va bien, 1 si algo empeoró o la rama falló y 2 si
+no pudo medir.
+
+Frames lentos son los de más de 6.94 ms sin tope y los de más de 7.5 ms con tope: con tope el
+compositor manda los callbacks cada 6.95 ms y la mitad de los frames pasa 6.94 ms por poco (ver
+[rendimiento/ritmo-2026-10.md](rendimiento/ritmo-2026-10.md)).
+
+En una tarea no se estudian refrescos salteados con tope. Salen con mucho ruido por el estado de
+energía de la NVIDIA (issue #5).
+
+### Nivel 2: la ronda de control
+
+La deciden el dueño o Claude, cada 4 o 5 tareas integradas o antes de cerrar un hito.
+
+```bash
+just perf-check --dry-run              # solo el plan y cuánto va a tardar
+just perf-check                        # más de una hora
+```
+
+Corre una matriz fija (`python3 tools/perf/perf.py cases` la lista): RTX y 780M; superficie,
+cueva abierta (ruta y quieta), bosque y bajada; con tope 144 y sin tope; radio 16, más una cueva
+y una superficie en radio 32 en la RTX. Hace 3 corridas intercaladas de 20 s por caso contra el
+binario guardado de la ronda anterior (`bench-results/control/last`), sin recompilarlo, y mira el
+estado de la NVIDIA (solo lectura). Escribe `docs/rendimiento/control-AAAA-MM-DD.md` y pone el tag
+local `perf-control-N`, que sube el dueño. La primera ronda no tiene contra qué comparar y solo
+guarda los números. Los casos de cueva corren cuando el binario tiene `--cave`.
+
+Si algo empeoró, `perf-bisect` busca el merge con el smoke de ese caso. Prueba por mitades los
+commits de primer padre (los merges) entre las dos refs:
+
+```bash
+just perf-bisect rtx/surface/r16/144 perf-control-3 main
+```
+
+### Cómo se cuida el ruido
+
+Antes de cada corrida el harness espera a que no compile nada (rustc, cargo, linker), a que no
+corra otro binario de boxel y a que `tools/wait-idle.sh` pase. Mira la máquina cada 0.5 s mientras
+corre y repite, hasta 4 veces, las corridas que se cruzaron con una compilación u otro benchmark,
+en las que el resto de la máquina usó más del 15 % de CPU, o en las que el compositor bajó la
+ventana a 30 fps (un segundo con menos de 100 fps o de 50 frames mostrados). Dos harnesses nunca
+miden a la vez. Cada corrida queda en `bench-results/` (smoke, control o bisect) y
+`just bench-report --compare` compara las carpetas `base` y `new`.
+
 ## Cómo correrlo
 
 ```bash
@@ -154,8 +226,9 @@ mundo, luz (`--light`), texturas (`--pack`), escenario, radio, radio vertical, v
 (`--bodies`), ediciones (`--edits`), backend, tier y GPU. Una hora distinta (`--time`) solo se anota.
 Si las corridas tienen los datos de ritmo (Pacing), también los compara.
 
-Flujo sugerido: `just bench-all` antes del cambio, mover `bench-results/` a otra carpeta,
-aplicar el cambio, `just bench-all` otra vez y comparar las dos carpetas.
+Para una tarea alcanza con `just perf-smoke`. Para investigar a mano: `just bench-all` antes del
+cambio, mover `bench-results/` a otra carpeta, aplicar el cambio, `just bench-all` otra vez y
+comparar las dos carpetas.
 
 ## El CSV
 
