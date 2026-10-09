@@ -127,13 +127,15 @@
 - Paridad: los tres tiers usan el mismo pipeline y los mismos vértices, así que dan los mismos
   píxeles. No cuenta en `RenderStats::draws`.
 
-### 6. `voxel_world`
+### 6. `voxel_world` y `physics_sandbox`
 
 - Caminando: Shift se agacha, Ctrl corre y Espacio dos veces en 0,35 s prende o apaga el vuelo
   (Espacio sube, Shift baja, aterrizar lo apaga). Con la cámara libre, Shift y Ctrl siguen bajando
   y acelerando la cámara.
 - F3 suma al modo `flying`, `sneaking` o `sprinting`.
 - El bloque apuntado lleva el contorno, además de la mira.
+- `physics_sandbox` usa el mismo `WalkPlugin`, así que tiene las mismas teclas para caminar,
+  agacharse, correr y volar. Su ayuda (`--help`) y sus docs las nombran.
 
 ## Consecuencias
 
