@@ -608,44 +608,6 @@ fn unshown_chunks_are_seen_through_until_shown_again() {
     assert!(!set.is_visible(behind));
 }
 
-#[test]
-fn the_frame_budget_learns_what_searches_cost() {
-    let links = |p: ChunkPos| random_links(9, IVec3::new(p.x as i32, p.y as i32, p.z as i32), 60);
-    let view = view_at(
-        ChunkPos::new(2, 0, -5),
-        Some(Vec3::new(0.3, -0.2, -1.0)),
-        4,
-        2,
-    );
-    let now = Instant::now();
-    let mut vis = ChunkVisibility::default();
-    assert_eq!(vis.take_frame_cost(), CullingCost::default());
-    // A frame that searched, with 50 ms of the renderer's bits (far more than any search
-    // here, even on a loaded machine): kept free from now on.
-    vis.update_at(&view, links, now);
-    vis.add_render_time(Duration::from_millis(50));
-    let cost = vis.take_frame_cost();
-    assert!(cost.spent >= Duration::from_millis(50));
-    assert_eq!(cost.reserve, cost.spent);
-    let peak = cost.reserve;
-    // A frame that reused the set: the reserve stays.
-    vis.update_at(&view, links, now);
-    assert_eq!(vis.take_frame_cost().reserve, peak);
-    // A frame whose eye was in rock keeps it too; a cheaper search lowers it slowly.
-    vis.eye_in_open(view.render_origin, Vec3::splat(0.5), 0.17, |_| None);
-    assert_eq!(vis.take_frame_cost().reserve, peak);
-    vis.update_at(&view_at(ChunkPos::new(3, 0, -5), None, 4, 2), links, now);
-    let cost = vis.take_frame_cost();
-    assert_eq!(cost.reserve, peak - (peak - cost.spent) / RESERVE_DECAY);
-    // Frames without cave culling let it fade.
-    let reserve = cost.reserve;
-    let cost = vis.take_frame_cost();
-    assert_eq!(
-        (cost.spent, cost.reserve),
-        (Duration::ZERO, reserve - reserve / RESERVE_DECAY)
-    );
-}
-
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 

@@ -32,6 +32,7 @@ use crate::{
     BlockChanged, BlockEdit, CachedLight, ChunkId, ChunkMap, ChunkMeshEvent, ChunkSlot, DataState,
     Interest, MeshState, WorldContent, WorldSettings, WorldStats,
 };
+use boxel_app::IdleWork;
 use boxel_ecs::prelude::*;
 use boxel_light::{
     ChunkLight, LayerData, LightInput, LightPath, LightScratch, PaddedLight, Rescan, SkyInput,
@@ -104,6 +105,14 @@ const MIN_LIGHT_STEPS: usize = 256;
 
 /// Jobs started or priorities refreshed between two checks of the job budget.
 const DISPATCH_CHECK: usize = 16;
+
+/// An idle step ([`WorldJobs::idle`]) starts a piece of interest work only with this much time
+/// left: the floors of [`WorldJobs::process_interest`] ([`MIN_INTEREST_STEPS`] positions, one
+/// [`PRIORITY_BATCH`], [`MIN_LIGHT_STEPS`]) cost about 0.2 ms.
+const IDLE_INTEREST_MIN: Duration = Duration::from_micros(300);
+/// Longest piece of interest work in an idle step (the step goes back to collecting results
+/// after it).
+const IDLE_INTEREST_PIECE: Duration = Duration::from_micros(250);
 
 /// The automatic in-flight cap keeps the workers busy for this many frames.
 const AUTO_FRAMES: f64 = 1.5;
@@ -785,7 +794,7 @@ impl WorldJobs {
     }
 
     /// Plans the work of a viewer or settings change, then applies interest work within
-    /// `budget` (`settings.interest_budget`, or more in a capped frame with time to spare).
+    /// `budget` (the systems pass `settings.interest_budget`).
     pub(crate) fn update_interest(
         &mut self,
         cx: &mut Ctx<'_>,
@@ -1920,6 +1929,74 @@ impl WorldJobs {
         }
     }
 
+    // ---- Between frames ----------------------------------------------------------------------
+
+    /// Interest work planned and not done yet (positions, stale priorities, light cache
+    /// positions). Viewer changes are planned in the frame only.
+    fn interest_left(&self) -> bool {
+        self.planner.backlog() > 0 || self.scheduler.stale() > 0 || !self.light_backlog.is_empty()
+    }
+
+    /// What an idle step would find, without touching the map: [`IdleWork::Ready`] with results
+    /// to collect, jobs to start (queued, below the cap) or interest work left;
+    /// [`IdleWork::Waiting`] with only jobs in flight; [`IdleWork::Done`] when nothing is
+    /// pending.
+    pub(crate) fn idle_pending(&self) -> IdleWork {
+        let startable = self.scheduler.queued() > 0 && !self.scheduler.is_full();
+        if !self.rx.is_empty() || startable || self.interest_left() {
+            IdleWork::Ready
+        } else if self.scheduler.in_flight() > 0 {
+            IdleWork::Waiting
+        } else {
+            IdleWork::Done
+        }
+    }
+
+    /// An idle step between frames (ADR 0023), until `until`: rounds of collecting finished
+    /// jobs, starting queued ones and, with at least [`IDLE_INTEREST_MIN`] left, a piece of the
+    /// interest work the frames left (at most [`IDLE_INTEREST_PIECE`]), while a round finds
+    /// something to do. Returns what is left ([`WorldJobs::idle_pending`]); with `until` already
+    /// past it does nothing.
+    ///
+    /// The frame's own steps stay in the frame: no viewer planning, no edits, no frame
+    /// bookkeeping (the in-flight cap, the frame clock of the edit batch hold and batch ages
+    /// change in the frame only; the cost of jobs collected here counts in the next frame's
+    /// average), and mesh results wait in `pending` for the next `Collect`, within its event
+    /// budget. What it can publish: `Remove` (unloads, meshes that became empty or unwanted) and,
+    /// rarely, the `Upsert`s of an edit batch whose last missing member left it (it unloaded or
+    /// meshed to nothing), as a frame would.
+    pub(crate) fn idle(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        settings: &WorldSettings,
+        until: Instant,
+    ) -> IdleWork {
+        let _span = frame_span!("world.idle");
+        loop {
+            let start = Instant::now();
+            let Some(left) = until.checked_duration_since(start).filter(|l| !l.is_zero()) else {
+                break;
+            };
+            let drained = {
+                let _span = frame_span!("world.drain");
+                self.drain_results(cx, start, left)
+            };
+            let started = {
+                let _span = frame_span!("world.dispatch");
+                self.dispatch_until(cx, start, left)
+            };
+            let left = until.saturating_duration_since(Instant::now());
+            let interest = self.interest_left() && left >= IDLE_INTEREST_MIN;
+            if interest {
+                self.process_interest(cx, settings, left.min(IDLE_INTEREST_PIECE));
+            }
+            if drained == 0 && started == 0 && !interest {
+                break;
+            }
+        }
+        self.idle_pending()
+    }
+
     // ---- Jobs --------------------------------------------------------------------------------
 
     /// The time of a frame starting now: the real clock, or a test's `manual_clock`.
@@ -1949,10 +2026,9 @@ impl WorldJobs {
     }
 
     /// The job step of a frame: collects finished jobs (freeing their in-flight slots) and starts
-    /// queued ones, again and again while results keep arriving, within `budget`
-    /// (`settings.job_budget`, or more in a capped frame with time to spare). Collecting first
-    /// means a slot freed by a job that finished since the last frame is reused in this frame,
-    /// not the next one.
+    /// queued ones, again and again while results keep arriving, within `budget` (the systems
+    /// pass `settings.job_budget`). Collecting first means a slot freed by a job that finished
+    /// since the last frame is reused in this frame, not the next one.
     pub(crate) fn run_jobs(&mut self, cx: &mut Ctx<'_>, budget: Duration) {
         let start = Instant::now();
         loop {

@@ -561,14 +561,17 @@ al moverse.
   frame y el tope saltaba entre 558 y 3114 de un frame al siguiente; ahora cambia como mucho un
   23 % (medido a radio 32 cargando y caminando).
 - Los chunks que el generador declara de puro aire se crean listos, sin job (sección 9).
-- Con tope de fps los dos topes (`interest_budget` y `job_budget`) crecen hacia la parte ociosa
-  del frame (issue #3). El runner publica cuándo vence el frame siguiente (`FrameDeadline`) y el
-  mundo trabaja hasta medio período antes de ese momento (1.5 ms como mínimo), menos lo que tarda
-  el resto de la update, medido en las anteriores. Nunca bajan de su valor, y sin tope quedan
-  exactamente igual. El mundo que sale es el mismo; solo cambia en cuántos frames. A 144 Hz casi
-  no queda lugar y la puesta al día no cambia
-  ([ritmo-2026-10](rendimiento/ritmo-2026-10.md)): lo que la frena es que un resultado que llega
-  tarde espera al frame siguiente.
+- Con tope de fps, agrandar estos dos topes hacia la parte ociosa del frame no ayudó a 144 Hz
+  (issue #3, [ritmo-2026-10](rendimiento/ritmo-2026-10.md)) y se quitó: lo que frena la puesta al
+  día es que un resultado que llega tarde espera al frame siguiente.
+- Por eso, con tope, el mundo sigue trabajando entre frames (ADR 0023, `WorldSettings::idle_work`,
+  encendido por defecto). Mientras el runner espera el frame siguiente, corre pasos cortos del
+  schedule `Idle` hasta 1 ms antes del deadline. Ahí el mundo recoge resultados, lanza jobs y
+  sigue con el interés pendiente; cada etapa de un chunk ya no espera un frame entero. Las mallas
+  se siguen publicando en `Collect`, con su tope. Medido en la RTX a radio 16 con tope 144: la
+  puesta al día baja de 29 a 16.5 ms en la superficie y de 39 a 23 bajo tierra, igual o por
+  debajo de sin tope ([entre-frames-2026-10](rendimiento/entre-frames-2026-10.md)). Sin tope no
+  cambia nada.
 
 Medido con `headless_world` en release, terreno por defecto, bucle a 144 Hz (`--hz 144`), que es
 el ritmo del límite de FPS por defecto (ADR 0013). El frame es todo el `App::update` (mundo sin

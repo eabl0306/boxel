@@ -1567,5 +1567,6 @@ fn chunks_without_a_published_mesh_are_seen_through() {
     h.check_published();
 }
 
+mod idle;
 mod sky;
 mod tall;

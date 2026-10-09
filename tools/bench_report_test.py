@@ -288,6 +288,34 @@ class OutputTest(unittest.TestCase):
         code, out, _ = run_main('--compare', self.write('c.md', SAMPLE), self.write('d.md', SAMPLE))
         self.assertNotIn('presented fps', out)
 
+    def test_idle_work_is_a_column_and_a_note_not_a_key(self):
+        # Runs from before --idle-work read as 'none'; on and off pair, with a note.
+        on = copy.deepcopy(SAMPLE)
+        on['run']['idle_work'] = 'on'
+        on['world']['border_catch_up'].update(frames_avg=2.5, work_avg_ms=9.0, work_max_ms=15.5)
+        on['idle'] = {'tail_mean_ms': 1.2, 'tail_p99_ms': 3.4, 'steps_mean': 4.0,
+                      'frames': 900, 'overruns': 0, 'overrun_max_ms': 0}
+        off = copy.deepcopy(on)
+        off['run']['idle_work'] = 'off'
+        off['world']['border_catch_up']['work_max_ms'] = 30.0
+        code, out, _ = run_main(self.write('old.md', SAMPLE), self.write('on.md', on))
+        self.assertEqual(code, 0)
+        rows = [line for line in out.splitlines() if line.startswith('| fly r16')]
+        self.assertTrue(rows[0].endswith('| none | - |'), rows[0])
+        self.assertTrue(rows[1].endswith('| on | 15.50 |'), rows[1])
+        self.write('1-fly.md', off, 'off')
+        self.write('1-fly.md', on, 'on')
+        code, out, _ = run_main('--compare', os.path.join(self.dir.name, 'off'),
+                                os.path.join(self.dir.name, 'on'))
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count('### '), 1, 'off and on pair')
+        self.assertIn('Note: the settings differ (idle work off -> on)', out)
+        self.assertIn('| border work lag max ms | 30 | 15.50 | -48.3 % | better |', out)
+        self.assertIn('| idle steps past their slot | 0 | 0 | 0 % |  |', out)
+        code, out, _ = run_main('--compare', self.write('a.md', SAMPLE), self.write('b.md', SAMPLE))
+        self.assertNotIn('idle steps', out)
+        self.assertNotIn('Note:', out)
+
     def test_compare_directories_keeps_bodies_apart(self):
         # Old runs have no bodies field: they had no physics bodies.
         crowded = copy.deepcopy(SAMPLE)

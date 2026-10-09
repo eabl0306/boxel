@@ -1683,7 +1683,6 @@ fn cleanup(
     board: Option<ResMut<DiagnosticsBoard>>,
     mut saved: MessageWriter<ScreenshotSaved>,
     time: Option<ResMut<Time>>,
-    visibility: Option<ResMut<ChunkVisibility>>,
 ) {
     let frame = &mut *frame;
     if frame.gate_used
@@ -1743,12 +1742,6 @@ fn cleanup(
             info.visible_chunks = stats.visible_chunks;
             info.occluded_chunks = stats.occluded_chunks;
             info.occlusion_time = stats.occlusion_time;
-            // The world's frame budget keeps room for cave culling, the bits included.
-            if let Some(mut visibility) = visibility {
-                visibility
-                    .bypass_change_detection()
-                    .add_render_time(stats.occlusion_time);
-            }
             info.translucent_sorts = stats.translucent_sorts;
             info.dropped_chunks = stats.dropped_chunks;
             info.arena_used_quads = stats.arena_used_quads;

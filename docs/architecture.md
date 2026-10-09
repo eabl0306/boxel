@@ -2,7 +2,7 @@
 
 Documento técnico de referencia. Fecha: 2026-10-05. Estado: aprobado para el milestone M0
 (revisión final, después de tres revisiones adversariales del borrador v1).
-Las decisiones puntuales están en `docs/adr/` (0001 a 0022). Durante M0 hubo además una
+Las decisiones puntuales están en `docs/adr/` (0001 a 0023). Durante M0 hubo además una
 especificación para los agentes implementadores (en inglés, en `.scaffold/`), borrada al cerrar M0;
 este documento queda como referencia.
 
@@ -138,7 +138,7 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | Crate | Responsabilidad | Depende de (boxel) |
 |---|---|---|
 | `boxel` (raíz) | Fachada: re-exports, `prelude`, `DefaultPlugins`, `MinimalPlugins`, ejemplos | todos |
-| `boxel_app` | `App`, `Plugin`, `PluginGroup`, schedules (`Main`...`Last`, fixed con `RunFixedMainLoopSystems`, `Shutdown`), `Time`, `FixedTime`, `FrameLimit` y `FramePacer`, task pools, runner headless, `AppExit` | ecs, tasks |
+| `boxel_app` | `App`, `Plugin`, `PluginGroup`, schedules (`Main`...`Last`, fixed con `RunFixedMainLoopSystems`, `Shutdown`, `Idle` entre frames), `Time`, `FixedTime`, `FrameLimit` y `FramePacer`, task pools, runner headless, `AppExit` | ecs, tasks |
 | `boxel_log` | Subscriber de `tracing`, puente de `log`, Tracy opcional | app |
 | `boxel_diagnostic` | `FrameStats`, `DiagnosticsBoard`, log periódico | app, ecs |
 | `boxel_math` | re-export de glam, `Aabb`, `Frustum`, proyección reverse-Z | (glam) |
@@ -568,7 +568,11 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   `FixedMain` y `Render` usan el ejecutor single-thread (`Render` lo configura el renderer con
   `edit_schedule`); el resto, el multi-thread del fork. `Shutdown` no es parte del frame: los
   runners lo corren una vez al salir (`App::shutdown`), con la ventana todavía viva, para soltar
-  recursos de GPU y ventana en orden.
+  recursos de GPU y ventana en orden. `Idle` tampoco (ADR 0023, un hilo): con límite, los runners
+  lo corren en pasos cortos mientras esperan el frame siguiente (`App::run_idle`, `IdleStep`,
+  `IdleWork`), hasta 1 ms antes del deadline; el mundo recoge resultados y lanza jobs ahí. Si la
+  app tiene `IdleWanted`, solo después de una update que pidió pasos (el mundo los pide cuando le
+  queda trabajo).
 - Tiempo: `Time` (delta con tope de 250 ms, elapsed, frames) en `First`; `FixedTime` a 64 Hz con
   acumulador y máximo de 8 pasos por frame (`set_max_steps_per_frame` lo cambia); `FixedMain` =
   `FixedPreUpdate`, `FixedUpdate`, `FixedPostUpdate`. Mientras corre `FixedMain`, `Res<Time>` es
@@ -590,7 +594,8 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
 - Runners: `ScheduleRunnerPlugin` (headless, `Once` o `Loop`) y el runner winit de
   `boxel_window`. El runner por defecto actualiza una vez. Los dos respetan `FrameLimit` (144 fps
   por defecto, 0 = sin límite, cambiable en tiempo de ejecución) con el mismo `FramePacer`
-  (§11, ADR 0013); en headless, `FrameLimit` reemplaza el `wait` de `Loop` cuando existe.
+  (§11, ADR 0013); en headless, `FrameLimit` reemplaza el `wait` de `Loop` cuando existe. Los
+  dos corren los pasos de `Idle` en la espera y publican `IdleInfo` (ADR 0023).
 
 ---
 
@@ -1154,6 +1159,12 @@ presenta como mucho una vez por refresco del monitor.
   Solo si los redraws de verdad esperan al compositor (2 callbacks seguidos) y los callbacks
   llegan a la frecuencia que dice winit: una ventana sin render sigue con la grilla del límite. `FramePacingInfo` dice en
   cada update cómo se marcó el ritmo y el overlay F3 muestra `paced by the display`.
+- La espera no es solo dormir (ADR 0023): si la app tiene sistemas en `Idle` y la update pidió
+  pasos (`IdleWanted`), el runner corre pasos de 0.5 ms como máximo en las iteraciones de la
+  espera, hasta 1 ms antes del deadline (o 0.7 ms antes de su propio despertar). La iteración de
+  la update pone `Poll` en vez de correr un paso, así un redraw que llega enseguida se marca
+  antes. Entre pasos se atienden eventos y la compuerta: un paso nunca retiene una update. Sin
+  pedido, la espera es la de siempre.
 - `PresentSettings { mode }` (recurso de `boxel_render`) cambia el vsync en tiempo de ejecución:
   `Setup` reconfigura la superficie con el mismo dispositivo. Por defecto vsync apagado:
   `Mailbox`, si no `Immediate`, si no `Fifo` con una nota en el log. Así manda el límite.

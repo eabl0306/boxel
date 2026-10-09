@@ -7,7 +7,9 @@
 //! inserted with [`MainScheduleOrder::insert_after`] (the renderer inserts `Render` after `Last`).
 //! `RunFixedMainLoop` is split in the chained [`RunFixedMainLoopSystems`]: before the fixed
 //! steps, the steps (`FixedMain` zero or more times, see [`FixedTime`]) and after them.
-//! [`Shutdown`] runs once at exit (runners call [`App::shutdown`]).
+//! [`Shutdown`] runs once at exit (runners call [`App::shutdown`]). [`Idle`] is outside the
+//! frame too: a runner that waits for a frame limit runs it in short steps between updates
+//! (ADR 0023, [`App::run_idle`]).
 //!
 //! Frame rate: [`FrameLimit`] (default 144 fps, 0 = unlimited) is read by the runners before
 //! every frame and can change at any time; [`FramePacer`] is the deadline-based pacing both
@@ -15,6 +17,7 @@
 
 mod app;
 mod frame_limit;
+mod idle;
 mod plugin;
 mod plugin_group;
 mod runner;
@@ -26,13 +29,17 @@ pub use app::{App, AppExit, PluginsState, RunnerFn};
 pub use frame_limit::{
     DEFAULT_MAX_FPS, FrameDeadline, FrameLimit, FramePacer, FrameWait, spin_until,
 };
+pub use idle::{
+    IDLE_MARGIN, IDLE_POLL, IDLE_STEP, IdleInfo, IdleStep, IdleWanted, IdleWork, MIN_IDLE_STEP,
+    idle_step_end,
+};
 pub use plugin::{Plugin, Plugins};
 pub use plugin_group::{PluginGroup, PluginGroupBuilder};
 pub use runner::{RunMode, ScheduleRunnerPlugin};
 pub use schedules::{
-    First, FixedMain, FixedMainScheduleOrder, FixedPostUpdate, FixedPreUpdate, FixedUpdate, Last,
-    Main, MainScheduleOrder, MainSchedulePlugin, PostStartup, PostUpdate, PreStartup, PreUpdate,
-    RunFixedMainLoop, RunFixedMainLoopSystems, Shutdown, Startup, Update,
+    First, FixedMain, FixedMainScheduleOrder, FixedPostUpdate, FixedPreUpdate, FixedUpdate, Idle,
+    Last, Main, MainScheduleOrder, MainSchedulePlugin, PostStartup, PostUpdate, PreStartup,
+    PreUpdate, RunFixedMainLoop, RunFixedMainLoopSystems, Shutdown, Startup, Update,
 };
 pub use task_pool::{TaskPoolOptions, TaskPoolPlugin, TaskPoolThreadAssignmentPolicy};
 pub use time::{
@@ -43,7 +50,7 @@ pub use time::{
 /// Common app items (re-exported by `boxel::prelude`).
 pub mod prelude {
     pub use crate::{
-        App, AppExit, First, FixedPostUpdate, FixedTime, FixedUpdate, FrameLimit, Last, Main,
+        App, AppExit, First, FixedPostUpdate, FixedTime, FixedUpdate, FrameLimit, Idle, Last, Main,
         MainScheduleOrder, Plugin, PluginGroup, PluginGroupBuilder, PostStartup, PostUpdate,
         PreStartup, PreUpdate, RunFixedMainLoop, RunFixedMainLoopSystems, ScheduleRunnerPlugin,
         Shutdown, Startup, TaskPoolOptions, TaskPoolPlugin, Time, TimePlugin, Update,

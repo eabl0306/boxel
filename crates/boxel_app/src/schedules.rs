@@ -43,6 +43,11 @@ labels! {
     /// update, while the window and event loop still exist. Plugins release GPU/window resources
     /// here in a defined order and flush state (last-known-good, future chunk stores).
     Shutdown,
+    /// Not part of the frame: run between updates by a runner that waits for a frame limit,
+    /// after the frame presented, in short steps that end before the next deadline (ADR 0023,
+    /// [`App::run_idle`]). Its systems stop by [`crate::IdleStep::until`], never block, and say
+    /// whether they want another step ([`crate::IdleWork`]). Never runs without a limit.
+    Idle,
 }
 
 /// The three parts of [`RunFixedMainLoop`], chained (Bevy's names). [`crate::TimePlugin`] puts
@@ -168,8 +173,8 @@ fn run_fixed_main(world: &mut World) {
 }
 
 /// Installs `Main`/`FixedMain` (single-threaded facilitator schedules) and their order resources,
-/// and chains the [`RunFixedMainLoopSystems`] sets in [`RunFixedMainLoop`]. Added by
-/// [`App::new`].
+/// the empty single-threaded [`Idle`] schedule, and chains the [`RunFixedMainLoopSystems`] sets
+/// in [`RunFixedMainLoop`]. Added by [`App::new`].
 pub struct MainSchedulePlugin;
 
 impl Plugin for MainSchedulePlugin {
@@ -178,8 +183,12 @@ impl Plugin for MainSchedulePlugin {
         main.set_executor(SingleThreadedExecutor::new());
         let mut fixed_main = Schedule::new(FixedMain);
         fixed_main.set_executor(SingleThreadedExecutor::new());
+        // A few short steps per frame: no worth in waking the compute threads for them.
+        let mut idle = Schedule::new(Idle);
+        idle.set_executor(SingleThreadedExecutor::new());
         app.add_schedule(main)
             .add_schedule(fixed_main)
+            .add_schedule(idle)
             .init_resource::<MainScheduleOrder>()
             .init_resource::<FixedMainScheduleOrder>()
             .add_systems(Main, run_main)

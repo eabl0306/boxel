@@ -1,4 +1,8 @@
-use crate::{App, AppExit, FrameDeadline, FrameLimit, FramePacer, Plugin, PluginsState};
+use crate::frame_limit::sleep_until;
+use crate::{
+    App, AppExit, FrameDeadline, FrameLimit, FramePacer, IDLE_POLL, IdleInfo, IdleWanted, IdleWork,
+    Plugin, PluginsState, idle_step_end,
+};
 use boxel_ecs::world::World;
 use std::time::{Duration, Instant};
 
@@ -9,7 +13,8 @@ pub enum RunMode {
     Once,
     /// Update until an [`AppExit`] is written, starting one frame every `wait` (deadline based,
     /// see [`FramePacer`]). A [`FrameLimit`] resource, when the app has one, replaces `wait`
-    /// and is read before every frame, so it can change at runtime.
+    /// and is read before every frame, so it can change at runtime. While paced, an app with
+    /// [`Idle`](crate::Idle) systems runs idle steps between updates ([`App::run_idle`]).
     Loop {
         /// Target frame period (`None` or zero = no pacing).
         wait: Option<Duration>,
@@ -47,7 +52,10 @@ impl Plugin for ScheduleRunnerPlugin {
 }
 
 /// The headless runner installed by [`ScheduleRunnerPlugin`]. Runs `Shutdown` once before
-/// returning, in both modes. In `Loop` mode it writes [`FrameDeadline`] before every update.
+/// returning, in both modes. In `Loop` mode it writes [`FrameDeadline`] and [`IdleInfo`] before
+/// every update, and, while paced, runs idle steps after each update until the idle slot of the
+/// next deadline ends ([`FramePacer::idle_end`]); with an [`IdleWanted`], only after an update
+/// that asked for them.
 fn run_headless(mut app: App, mode: RunMode) -> AppExit {
     while app.plugins_state() == PluginsState::Adding {
         std::thread::yield_now();
@@ -62,26 +70,58 @@ fn run_headless(mut app: App, mode: RunMode) -> AppExit {
         RunMode::Loop { wait } => {
             let mut pacer = FramePacer::new();
             let mut last_update = Duration::ZERO;
+            let mut idle = IdleInfo::default();
             loop {
                 let period = loop_period(app.world(), wait);
                 pacer.block_until_due(period);
                 let start = Instant::now();
                 pacer.start_frame(start, period);
-                app.world_mut().insert_resource(FrameDeadline::after_start(
-                    &pacer,
-                    period,
-                    last_update,
-                ));
+                let world = app.world_mut();
+                world.insert_resource(FrameDeadline::after_start(&pacer, period, last_update));
+                world.insert_resource(idle.take_gap());
+                IdleWanted::before_update(world);
                 app.update();
                 last_update = start.elapsed();
                 if let Some(exit) = app.should_exit() {
                     break Some(exit);
+                }
+                let period = loop_period(app.world(), wait);
+                if let Some(end) = pacer.idle_end(period)
+                    && app.has_idle_systems()
+                    && IdleWanted::after_update(app.world())
+                {
+                    run_idle_slot(&mut app, end, &mut idle);
                 }
             }
         }
     };
     app.shutdown();
     exit.unwrap_or_default()
+}
+
+/// Idle steps until the slot ends at `end` or the `Idle` systems are done: the next step at once
+/// after [`IdleWork::Ready`], after a short sleep ([`IDLE_POLL`]) after [`IdleWork::Waiting`].
+fn run_idle_slot(app: &mut App, end: Instant, info: &mut IdleInfo) {
+    loop {
+        let now = Instant::now();
+        let Some(until) = idle_step_end(now, end) else {
+            return;
+        };
+        let work = app.run_idle(until);
+        let ended = Instant::now();
+        info.record(now, ended, end);
+        match work {
+            IdleWork::Done => return,
+            IdleWork::Ready => {}
+            IdleWork::Waiting => {
+                sleep_until(
+                    ended
+                        .checked_add(IDLE_POLL)
+                        .map_or(end, |poll| poll.min(end)),
+                );
+            }
+        }
+    }
 }
 
 /// The frame period of the headless loop: the app's [`FrameLimit`] if it has one, else `wait`

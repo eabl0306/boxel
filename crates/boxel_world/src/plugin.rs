@@ -1,4 +1,3 @@
-use crate::budget::FrameBudget;
 use crate::interest::Viewer;
 use crate::jobs::{JobExecutor, TaskPoolExecutor};
 use crate::map::DataChange;
@@ -6,8 +5,9 @@ use crate::neighbor_rules::NeighborRules;
 use crate::sky::{SkyMap, SkyRule};
 use crate::streaming::{Ctx, ViewerChunks, WorldJobs};
 use crate::{ChunkId, ChunkMap, ChunkVisibility, WorldStats};
-use boxel_app::{App, FrameDeadline, Last, Plugin, Update};
+use boxel_app::{App, Idle, IdleStep, IdleWanted, IdleWork, Last, Plugin, Update};
 use boxel_diagnostic::DiagnosticsBoard;
+use boxel_ecs::message::MessageCursor;
 use boxel_ecs::prelude::*;
 use boxel_light::sky_tile::DEFAULT_WALK_LIMIT;
 use boxel_mesh::{AoPolicy, ChunkMesh, MaterialTable};
@@ -79,20 +79,22 @@ pub struct WorldSettings {
     /// Main-thread time per frame for applying viewer changes: creating, updating and unloading
     /// chunk slots, and refreshing queued job priorities. A big change (a jump, a new viewer, a
     /// larger radius) is spread over several frames, nearest chunks first. At least 64 positions
-    /// are processed per frame whatever the budget.
-    ///
-    /// Under a frame cap (the runner publishes a [`FrameDeadline`]) both budgets grow into the
-    /// idle part of the frame: the steps may run until half a period (at least 1.5 ms) before
-    /// the next frame minus the rest of the update, measured over the previous updates, in the
-    /// ratio of the two budgets. At 144 Hz that leaves little room (measured: no faster catch-up,
-    /// `docs/rendimiento/ritmo-2026-10.md`); it helps at lower limits. They never shrink below these values, a zero budget stays zero, and
-    /// without a deadline (unlimited) they are exactly these values. The world's results do not
-    /// depend on the budgets, only how many frames they take.
+    /// are processed per frame whatever the budget. Work left over goes on between frames when
+    /// [`WorldSettings::idle_work`] is on.
     pub interest_budget: Duration,
     /// Main-thread time per frame for collecting finished jobs and starting new ones (repeated
-    /// while results keep arriving). Grows under a frame cap like
-    /// [`WorldSettings::interest_budget`].
+    /// while results keep arriving). Under a frame limit this goes on between frames too
+    /// ([`WorldSettings::idle_work`]).
     pub job_budget: Duration,
+    /// Under a frame limit, use the wait between frames (ADR 0023): the runner runs the `Idle`
+    /// schedule in short steps after each frame presented, and the world collects finished jobs,
+    /// starts queued ones and goes on with the interest work there, so a job result does not
+    /// wait for the next frame at every stage (generation, sky walk, mesh). Mesh results are
+    /// still published in the next frame's `Collect`. Without a limit no step runs and this
+    /// changes nothing. The world asks for steps only after a frame that leaves work for them
+    /// ([`IdleWanted`]). On by default; off, the world works in its frame steps only and never
+    /// asks, so the runner waits as for an app without `Idle` systems. Read every frame and step.
+    pub idle_work: bool,
     /// Max `ChunkMeshEvent`s published per frame (upload smoothing).
     pub max_mesh_events_per_frame: usize,
     /// Extra chunks beyond the data region (horizontally and vertically) before unloading.
@@ -153,6 +155,7 @@ impl Default for WorldSettings {
             max_jobs_in_flight: 0,
             interest_budget: Duration::from_millis(1),
             job_budget: Duration::from_millis(2),
+            idle_work: true,
             max_mesh_events_per_frame: 512,
             unload_hysteresis: 2,
             vertical_bounds: None,
@@ -196,7 +199,11 @@ impl WorldContent {
     }
 }
 
-/// Mesh changes for the renderer, written in `WorldSystems::Collect` (and on unload).
+/// Mesh changes for the renderer, written in `WorldSystems::Collect` (and on unload). Between
+/// frames (the `Idle` schedule, [`WorldSettings::idle_work`]) the world writes `Remove`s (unloads,
+/// meshes that became empty or unwanted) and, rarely, the `Upsert`s of an edit batch whose last
+/// missing member left it; new meshes of the streaming wait for `Collect`. Either way the next
+/// frame's readers get them.
 #[derive(Message, Clone, Debug)]
 pub enum ChunkMeshEvent {
     /// New or replaced mesh (never empty).
@@ -259,7 +266,8 @@ pub struct BlockChanged {
 
 /// A chunk's blocks became readable (`DataState::Ready`, or `Missing`, read as air) or stopped
 /// being readable, written at the end of the world's systems in `Update`
-/// (`WorldSystems::Collect`), in the order it happened that frame.
+/// (`WorldSystems::Collect`) and at the end of each idle step between frames
+/// ([`WorldSettings::idle_work`]), in the order it happened. The next frame's readers get them.
 ///
 /// A chunk that unloads and loads again may come back different (edits are not saved yet), so
 /// systems that keep state about the blocks of a chunk refresh it on `Loaded` (physics wakes the
@@ -344,7 +352,8 @@ pub enum WorldSystems {
     Edits,
     /// Collect finished jobs and start new ones, within `WorldSettings::job_budget`.
     Dispatch,
-    /// Publish mesh results as `ChunkMeshEvent`s (up to `max_mesh_events_per_frame`).
+    /// Publish mesh results as `ChunkMeshEvent`s (up to `max_mesh_events_per_frame`), then ask
+    /// for idle steps if work is left for them ([`IdleWanted`]).
     Collect,
     /// Bring [`ChunkVisibility`] up to date with the frame's changes of the chunks' face links
     /// (cave culling; the renderer searches from its camera later in the frame).
@@ -355,7 +364,9 @@ pub enum WorldSystems {
 /// `EditQueue`, [`NeighborRules`] (the built-in ones of the registry), `WorldStats`, internal
 /// job state), the messages `ChunkMeshEvent`, [`ChunkMeshResync`],
 /// [`BlockChanged`] and [`ChunkDataEvent`] and the chained systems in
-/// `Update`. A stats system in `Last` refreshes `WorldStats` and publishes a `"world"` line to
+/// `Update`, and the world's step in `Idle` (between frames, [`WorldSettings::idle_work`]) with
+/// the [`IdleWanted`] it asks through at the end of `Collect`. A
+/// stats system in `Last` refreshes `WorldStats` and publishes a `"world"` line to
 /// `DiagnosticsBoard` if present. `TaskPoolPlugin` is recommended (pool sizes); without it the
 /// default executor initializes a default async compute pool.
 pub struct WorldPlugin {
@@ -408,8 +419,9 @@ impl Plugin for WorldPlugin {
             .init_resource::<EditQueue>()
             .init_resource::<WorldStats>()
             .init_resource::<ViewerChunks>()
-            .init_resource::<FrameBudget>()
             .init_resource::<ChunkVisibility>()
+            .init_resource::<IdleWanted>()
+            .init_resource::<ResyncCursor>()
             .insert_resource(jobs)
             .add_message::<ChunkMeshEvent>()
             .add_message::<ChunkMeshResync>()
@@ -433,7 +445,6 @@ impl Plugin for WorldPlugin {
                     // to systems that move viewers does not matter (interest lags at most one
                     // frame), and naming them would tie this crate to camera/gameplay crates.
                     (
-                        begin_frame_budget,
                         renderer_resyncs,
                         track_viewers.ambiguous_with_all(),
                         update_interest,
@@ -442,11 +453,15 @@ impl Plugin for WorldPlugin {
                         .in_set(WorldSystems::Interest),
                     apply_edits.in_set(WorldSystems::Edits),
                     run_jobs.in_set(WorldSystems::Dispatch),
-                    (publish_meshes, publish_data_changes)
+                    (publish_meshes, publish_data_changes, want_idle)
                         .chain()
                         .in_set(WorldSystems::Collect),
                     sync_visibility.in_set(WorldSystems::Visibility),
                 ),
+            )
+            .add_systems(
+                Idle,
+                (renderer_resyncs, idle_world, publish_data_changes).chain(),
             )
             .add_systems(Last, publish_stats);
     }
@@ -484,26 +499,24 @@ fn track_viewers(
     }
 }
 
-/// Starts the frame's world budgets from the runner's [`FrameDeadline`] (see
-/// [`WorldSettings::interest_budget`]), with room for a cave culling search.
-fn begin_frame_budget(
-    deadline: Option<Res<FrameDeadline>>,
-    mut visibility: ResMut<ChunkVisibility>,
-    mut budget: ResMut<FrameBudget>,
-) {
-    // The frame's accounting changes nothing the visibility's readers see.
-    let culling = visibility.bypass_change_detection().take_frame_cost();
-    budget.begin(deadline.as_deref(), culling);
-}
+/// The world's read position in the [`ChunkMeshResync`] messages, shared by the frame's
+/// `renderer_resyncs` and the idle step's, so each resync is applied once, by whichever runs
+/// first after the render that wrote it.
+#[derive(Resource, Default)]
+struct ResyncCursor(MessageCursor<ChunkMeshResync>);
 
-/// Applies the renderer's resyncs ([`ChunkMeshResync`]) before anything changes a mesh this
-/// frame: the chunks remeshing now are the ones it missed.
+/// Applies the renderer's resyncs ([`ChunkMeshResync`]) before anything changes a mesh: the
+/// chunks remeshing now are the ones it missed. It runs first in the frame and first in each
+/// idle step, since an idle step after the render can publish the held meshes of an edit batch
+/// (an identical one would stay counted as published while the renderer lacks it).
 fn renderer_resyncs(
-    mut resyncs: MessageReader<ChunkMeshResync>,
+    resyncs: Res<Messages<ChunkMeshResync>>,
+    mut cursor: ResMut<ResyncCursor>,
     mut map: ResMut<ChunkMap>,
     mut jobs: ResMut<WorldJobs>,
 ) {
-    if resyncs.read().count() > 0 {
+    // Reading changes nothing anyone else sees.
+    if cursor.bypass_change_detection().0.read(&resyncs).count() > 0 {
         jobs.renderer_resynced(&mut map);
     }
 }
@@ -512,7 +525,6 @@ fn update_interest(
     mut map: ResMut<ChunkMap>,
     mut sky: ResMut<SkyMap>,
     mut jobs: ResMut<WorldJobs>,
-    mut budget: ResMut<FrameBudget>,
     content: Res<WorldContent>,
     settings: Res<WorldSettings>,
     viewers: Res<ViewerChunks>,
@@ -522,15 +534,10 @@ fn update_interest(
     if !jobs.interest_pending(&viewers.0, &settings) {
         return;
     }
-    let clock = budget.clock();
-    let step = clock.map_or(settings.interest_budget, |now| {
-        budget.interest(&settings, now)
-    });
     let mut events = Vec::new();
     let mut cx = Ctx::new(&mut map, &mut sky, &content, &mut events);
-    jobs.update_interest(&mut cx, &settings, &viewers.0, step);
+    jobs.update_interest(&mut cx, &settings, &viewers.0, settings.interest_budget);
     writer.write_batch(events);
-    budget.spend(clock);
 }
 
 #[expect(
@@ -588,7 +595,6 @@ fn run_jobs(
     mut map: ResMut<ChunkMap>,
     mut sky: ResMut<SkyMap>,
     mut jobs: ResMut<WorldJobs>,
-    mut budget: ResMut<FrameBudget>,
     content: Res<WorldContent>,
     settings: Res<WorldSettings>,
     mut writer: MessageWriter<ChunkMeshEvent>,
@@ -598,13 +604,45 @@ fn run_jobs(
     if !jobs.has_job_work() {
         return;
     }
-    let clock = budget.clock();
-    let step = clock.map_or(settings.job_budget, |now| budget.jobs(&settings, now));
     let mut events = Vec::new();
     let mut cx = Ctx::new(&mut map, &mut sky, &content, &mut events);
-    jobs.run_jobs(&mut cx, step);
+    jobs.run_jobs(&mut cx, settings.job_budget);
     writer.write_batch(events);
-    budget.spend(clock);
+}
+
+/// End of the frame's steps: asks for idle steps when one would find work
+/// ([`WorldJobs::idle_pending`] is not `Done`). Nothing else moves the jobs before the next
+/// update, and the frame's own work (viewer changes, edits) waits for it, so with `Done` here the
+/// first step would answer `Done` at once: without the ask the runner opens no slot.
+fn want_idle(jobs: Res<WorldJobs>, settings: Res<WorldSettings>, mut wanted: ResMut<IdleWanted>) {
+    wanted.want(settings.idle_work && jobs.idle_pending() != IdleWork::Done);
+}
+
+/// `Idle` (between frames, ADR 0023): the world's step within [`IdleStep::until`]. Without work
+/// to do now, or without time, it only reports what is pending, without touching the map (no
+/// change marks).
+fn idle_world(
+    mut step: ResMut<IdleStep>,
+    mut map: ResMut<ChunkMap>,
+    mut sky: ResMut<SkyMap>,
+    mut jobs: ResMut<WorldJobs>,
+    content: Res<WorldContent>,
+    settings: Res<WorldSettings>,
+    mut writer: MessageWriter<ChunkMeshEvent>,
+) {
+    if !settings.idle_work {
+        return;
+    }
+    let pending = jobs.idle_pending();
+    if pending != IdleWork::Ready || Instant::now() >= step.until {
+        step.want(pending);
+        return;
+    }
+    let mut events = Vec::new();
+    let mut cx = Ctx::new(&mut map, &mut sky, &content, &mut events);
+    let left = jobs.idle(&mut cx, &settings, step.until);
+    writer.write_batch(events);
+    step.want(left);
 }
 
 fn publish_meshes(

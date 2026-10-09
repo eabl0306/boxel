@@ -92,6 +92,8 @@ usage: headless_world [options]
   --light MODE         on (the default: sky and block light computed and baked) or off (open
                        sky everywhere, the look before light)
   --hz N               frames per second of the loop (default 62.5; 0 = no wait between frames)
+  --idle-work MODE     on (the default: the world goes on working in the wait between paced
+                       frames, ADR 0023) or off (only in its frame steps)
   --idle S             once settled, stand still for S seconds and report the update times
   --speed V            then move the viewer along +x at V voxels/s
   --duration S         walk duration in seconds with --speed (default 5)
@@ -136,6 +138,8 @@ struct Options {
     cull: bool,
     /// `--cave`.
     cave: bool,
+    /// `--idle-work`: `WorldSettings::idle_work`.
+    idle_work: bool,
 }
 
 /// `Ok(None)` for `--help`.
@@ -157,6 +161,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         camera: None,
         cull: false,
         cave: false,
+        idle_work: true,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -201,13 +206,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                     .map(|&(_, policy)| policy)
                     .ok_or_else(|| format!("{flag}: {v:?} is not off, baked or lit-only"))?;
             }
-            "--light" => {
-                o.light = match value()?.as_str() {
-                    "on" => true,
-                    "off" => false,
-                    v => return Err(format!("{flag}: {v:?} is not on or off")),
-                };
-            }
+            "--light" => o.light = on_off(flag, &value()?)?,
+            "--idle-work" => o.idle_work = on_off(flag, &value()?)?,
             "--cull" => o.cull = true,
             "--cave" => o.cave = true,
             "--camera" => {
@@ -380,6 +380,15 @@ fn median(values: &[f64]) -> f64 {
     sorted.get(sorted.len() / 2).copied().unwrap_or(0.0)
 }
 
+/// `on` or `off` for `flag`.
+fn on_off(flag: &str, value: &str) -> Result<bool, String> {
+    match value {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        v => Err(format!("{flag}: {v:?} is not on or off")),
+    }
+}
+
 /// Longest of `values` (0 when empty).
 fn max(values: &[f64]) -> f64 {
     values.iter().copied().fold(0.0, f64::max)
@@ -413,6 +422,7 @@ fn main() -> AppExit {
         vertical_bounds: options.fixed_height.then(|| generator.vertical_chunks()),
         ao_policy: options.ao,
         light: options.light,
+        idle_work: options.idle_work,
         ..WorldSettings::default()
     };
     let wait = if options.hz > 0.0 {
@@ -981,6 +991,12 @@ mod tests {
             .expect("not help");
         assert!(!o.light);
         assert!(parse(&["--light", "yes"]).is_err());
+        assert!(o.idle_work, "work between frames unless asked");
+        let o = parse(&["--idle-work", "off"])
+            .expect("valid")
+            .expect("not help");
+        assert!(!o.idle_work);
+        assert!(parse(&["--idle-work", "maybe"]).is_err());
     }
 
     #[test]
