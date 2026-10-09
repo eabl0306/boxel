@@ -528,6 +528,37 @@ fn the_world_clock_is_saved() {
     assert_eq!(app.world().resource::<TimeOfDay>().tick, tick, "still");
 }
 
+/// A `WorldStore` serves one `PersistPlugin`. A second one (a clone of the store, in a new app)
+/// would start without the index of saved chunks and save generated copies over them: it
+/// panics. A new app opens the world again.
+#[test]
+#[should_panic(expected = "a WorldStore serves one PersistPlugin")]
+fn a_world_store_serves_one_persist_plugin() {
+    let backend: Arc<dyn ChunkStore> = Arc::new(MemoryStore::new());
+    let registry = BlockRegistry::default_blocks();
+    let app = |store: WorldStore| {
+        let mut app = App::new();
+        app.add_plugins(WorldPlugin {
+            executor: Arc::new(InlineExecutor),
+            ..WorldPlugin::default()
+        })
+        .add_plugins(PersistPlugin {
+            store,
+            executor: Arc::new(InlineExecutor),
+        });
+        app
+    };
+    drop(app(WorldStore::open(
+        Arc::clone(&backend),
+        &registry,
+        "ground",
+    )
+    .unwrap()));
+    let store = WorldStore::open(backend, &registry, "ground").unwrap();
+    drop(app(store.clone()));
+    app(store);
+}
+
 // ------------------------------------------------------------------ damage and change
 
 #[test]

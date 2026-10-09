@@ -145,7 +145,8 @@ struct Inner {
 /// An open world (ADR 0024): its store, its [`IdMap`] and the chunks waiting to be written.
 /// Cheap to clone (one `Arc`), shared by the main thread and the jobs; also a resource once
 /// [`PersistPlugin`](super::PersistPlugin) is added, for game data
-/// ([`WorldStore::meta`], [`WorldStore::put_meta`]).
+/// ([`WorldStore::meta`], [`WorldStore::put_meta`]). It serves one `PersistPlugin`: a new `App`
+/// opens the world again (drop the old store first: a redb file is locked while it is open).
 #[derive(Clone, Resource)]
 pub struct WorldStore {
     inner: Arc<Inner>,

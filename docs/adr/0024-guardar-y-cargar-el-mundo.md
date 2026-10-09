@@ -154,6 +154,9 @@ deterministas.
   `WorldStore` (`open`, `open_dir`, `meta`, `put_meta`, `stats`, `ids`), `PersistPlugin`
   (después de `WorldPlugin`), `PersistSettings`, `PersistStats`, `PersistError`, `IdMap` y
   `format` (claves, registros).
+- Un `WorldStore` sirve a un solo `PersistPlugin`. Una `App` nueva abre el mundo otra vez: un
+  segundo plugin con el mismo store (o un clon) entra en pánico, porque empezaría sin el índice
+  de chunks guardados y guardaría copias generadas encima de ellos (test).
 - `ChunkSlot::dirty`: el chunk tiene ediciones que todavía no se entregaron para guardar.
 - `BlockTicks::pending` y `BlockTicks::restore`.
 - `jobs::IoTaskPoolExecutor`.

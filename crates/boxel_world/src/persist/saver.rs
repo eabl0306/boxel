@@ -91,8 +91,16 @@ pub(crate) struct Persist {
 
 impl Persist {
     /// The saving state of `store`, whose save jobs run on `executor`.
+    ///
+    /// # Panics
+    /// If `store` (or a clone of it) already served one: what it read when the world opened is
+    /// gone, and starting without the index of saved chunks would save generated copies over
+    /// them.
     pub(crate) fn new(store: WorldStore, executor: Arc<dyn JobExecutor>) -> Self {
-        let opened = store.take_opened().unwrap_or_default();
+        let opened = store.take_opened().expect(
+            "a WorldStore serves one PersistPlugin: open the world again (WorldStore::open) for \
+             a new App",
+        );
         let mut saved: HashMap<ColumnKey, Vec<i64>, _> = HashMap::default();
         let inside = |c: i64| (-MAX_CHUNK_COORD..=MAX_CHUNK_COORD).contains(&c);
         for key in opened.keys {

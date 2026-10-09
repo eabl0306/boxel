@@ -57,7 +57,8 @@ impl Default for PersistSettings {
 /// [`PersistSettings::retry_after`]. Adds the [`WorldStore`] and [`PersistSettings`] resources,
 /// and a `"save"` line to `DiagnosticsBoard` when present.
 pub struct PersistPlugin {
-    /// The open world.
+    /// The open world, opened for this app: a [`WorldStore`] serves one `PersistPlugin` (a
+    /// second one panics).
     pub store: WorldStore,
     /// Where save jobs run (tests use `jobs::InlineExecutor`).
     pub executor: Arc<dyn JobExecutor>,
