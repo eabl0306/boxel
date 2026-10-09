@@ -35,6 +35,11 @@ impl Sea {
         h < self.level
     }
 
+    /// True if a column of height `h` holds sea water at height `y`.
+    pub const fn wets(&self, h: i64, y: i64) -> bool {
+        self.covers(h) && y > h && y <= self.level
+    }
+
     /// True if a column of height `h` has sand on top for the sea (under it or on the beach).
     pub const fn sandy(&self, h: i64) -> bool {
         h <= self.level.saturating_add(self.beach)

@@ -151,7 +151,8 @@ impl OverworldGenerator {
         p.y <= h && !self.carves(p, h)
     }
 
-    /// True if the caves carve `p`, in a column of height `h` (the spec).
+    /// True if the caves carve `p`, in a column of height `h` (the spec): not under the sea
+    /// ([`Sea::FLOOR`]) nor beside it ([`OverworldGenerator::beside_sea`]).
     fn carves(&self, p: BlockPos, h: i64) -> bool {
         !self.sea_floor(p.y, h)
             && self
@@ -159,6 +160,30 @@ impl OverworldGenerator {
                 .caves
                 .as_ref()
                 .is_some_and(|caves| caves.carves(self.seed, p, h, |x, z| self.height_at(x, z)))
+            && !self.beside_sea(p)
+    }
+
+    /// True if sea water lies beside `p` (in one of its 4 horizontal neighbors): the caves leave
+    /// such a cell solid, as Minecraft's carvers keep out of the blocks next to a fluid. Water
+    /// never stands next to a generated cave, so no cave opens sideways into the sea as a wall
+    /// of still water (under the sea, [`Sea::FLOOR`] keeps the caves closed). Integer
+    /// comparisons on the neighbors' heights.
+    pub fn beside_sea(&self, p: BlockPos) -> bool {
+        let Some(sea) = self.settings.sea else {
+            return false;
+        };
+        if !self.shore_band(sea).contains(&p.y) {
+            return false;
+        }
+        [(1, 0), (-1, 0), (0, 1), (0, -1)]
+            .into_iter()
+            .any(|(dx, dz)| sea.wets(self.height_at(p.x + dx, p.z + dz), p.y))
+    }
+
+    /// The heights at which a cell can have sea water beside it: from just above the lowest
+    /// possible column up to the sea level.
+    fn shore_band(&self, sea: Sea) -> RangeInclusive<i64> {
+        self.settings.heightmap.min_height().saturating_add(1)..=sea.level
     }
 
     /// The cave density at voxel `p` (the trilinear sum of its cell's corners in density units;
@@ -328,6 +353,7 @@ impl OverworldGenerator {
             CarveMask::Air => Box::new([0; CHUNK_AREA]),
             CarveMask::Mixed(occupancy) => occupancy,
         };
+        let mut shore = Shore::new(self, origin, heights);
         for (i, &word) in solid.iter().enumerate() {
             // Word `ly * 32 + lx`, bit z.
             let (ly, lx) = (i >> CHUNK_SHIFT, i & 31);
@@ -338,12 +364,76 @@ impl OverworldGenerator {
                 carved &= carved - 1;
                 let column = (lx << CHUNK_SHIFT) | lz;
                 let h = heights[column];
-                if y <= h.saturating_sub(roof) && !self.sea_floor(y, h) {
+                if y <= h.saturating_sub(roof) && !self.sea_floor(y, h) && !shore.wet(lx, lz, y) {
                     dense[(ly << (2 * CHUNK_SHIFT)) | column] = BlockState::AIR;
                 }
             }
         }
         dense
+    }
+
+    /// [`OverworldGenerator::carved_stone`] for a chunk under the surface rules of its own
+    /// lowest column (`heights` are its column heights), with the cells beside the sea left
+    /// solid. Its cells lie at least [`Sea::FLOOR`] under every one of its columns, so only the
+    /// columns just outside it can hold water beside them: only its border columns are checked,
+    /// and the heights outside are computed only for a carved border cell low enough.
+    fn carved_stone_ashore(
+        &self,
+        origin: BlockPos,
+        heights: &[i64; CHUNK_AREA],
+        stone: BlockState,
+    ) -> ChunkData {
+        let corners = || {
+            Some(Caves::corner_heights_from(
+                &self.settings.heightmap,
+                self.seed,
+                origin,
+                heights,
+            ))
+        };
+        let Some(sea) = self.settings.sea else {
+            return self.carved_stone(origin, corners, stone);
+        };
+        let Some(caves) = &self.settings.caves else {
+            return ChunkData::uniform(stone);
+        };
+        let band = self.shore_band(sea);
+        let size = i64::from(CHUNK_SIZE);
+        let q = caves.chunk_corners(self.seed, origin, corners().as_ref());
+        let mut solid = match carve_mask(&q) {
+            CarveMask::Solid => return ChunkData::uniform(stone),
+            CarveMask::Air if origin.y > *band.end() || origin.y + size <= *band.start() => {
+                return ChunkData::uniform(BlockState::AIR);
+            }
+            CarveMask::Air => Box::new([0; CHUNK_AREA]),
+            CarveMask::Mixed(occupancy) => occupancy,
+        };
+        let mut shore = Shore::new(self, origin, heights);
+        let last = CHUNK_SIZE as usize - 1;
+        for ly in 0..CHUNK_SIZE as usize {
+            let y = origin.y + ly as i64;
+            if !band.contains(&y) {
+                continue;
+            }
+            for lx in 0..=last {
+                let word = &mut solid[(ly << CHUNK_SHIFT) | lx];
+                // The border columns of this row: every z on the x sides, the two ends otherwise.
+                let border = if lx == 0 || lx == last {
+                    u32::MAX
+                } else {
+                    1 | 1 << last
+                };
+                let mut carved = !*word & border;
+                while carved != 0 {
+                    let lz = carved.trailing_zeros() as usize;
+                    carved &= carved - 1;
+                    if shore.wet(lx, lz, y) {
+                        *word |= 1 << lz;
+                    }
+                }
+            }
+        }
+        ChunkData::from_occupancy(&solid, stone, BlockState::AIR)
     }
 
     /// Ground heights trees may grow on.
@@ -476,13 +566,9 @@ impl WorldGenerator for OverworldGenerator {
             .iter()
             .fold((i64::MAX, i64::MIN), |(lo, hi), &h| (lo.min(h), hi.max(h)));
         if self.under_surface_rules(y0, lowest) {
-            // The same under this chunk's lowest column.
-            let corners = || {
-                Some(Caves::corner_heights_from(
-                    heightmap, self.seed, origin, &heights,
-                ))
-            };
-            return self.carved_stone(origin, corners, stone());
+            // The same under this chunk's lowest column (the columns around it may hold sea
+            // water beside its border cells).
+            return self.carved_stone_ashore(origin, &heights, stone());
         }
         // Air above the terrain, or the dense path; trees go into the dense voxels before they
         // are encoded once.
@@ -512,5 +598,95 @@ impl WorldGenerator for OverworldGenerator {
 
     fn name(&self) -> &str {
         "overworld"
+    }
+}
+
+/// The sea beside the cells of one chunk ([`OverworldGenerator::beside_sea`]), from the heights
+/// of its columns and, computed when a border cell first needs them, of the 4 rows of columns
+/// just outside it.
+struct Shore<'a> {
+    generator: &'a OverworldGenerator,
+    /// The sea and [`OverworldGenerator::shore_band`].
+    sea: Option<(Sea, RangeInclusive<i64>)>,
+    origin: BlockPos,
+    heights: &'a [i64; CHUNK_AREA],
+    /// The columns outside each side, along the side: `-x` and `+x` (by z), `-z` and `+z` (by
+    /// x).
+    outside: [Option<[i64; CHUNK_SIZE as usize]>; 4],
+}
+
+impl<'a> Shore<'a> {
+    fn new(
+        generator: &'a OverworldGenerator,
+        origin: BlockPos,
+        heights: &'a [i64; CHUNK_AREA],
+    ) -> Self {
+        let sea = generator
+            .settings
+            .sea
+            .map(|sea| (sea, generator.shore_band(sea)));
+        Self {
+            generator,
+            sea,
+            origin,
+            heights,
+            outside: [None; 4],
+        }
+    }
+
+    /// True if sea water lies beside local column `(lx, lz)` at height `y`.
+    fn wet(&mut self, lx: usize, lz: usize, y: i64) -> bool {
+        let Some(sea) = self
+            .sea
+            .as_ref()
+            .and_then(|(sea, band)| band.contains(&y).then_some(*sea))
+        else {
+            return false;
+        };
+        let last = CHUNK_SIZE as usize - 1;
+        let heights = self.heights;
+        let inner = |x: usize, z: usize| heights[(x << CHUNK_SHIFT) | z];
+        let mut beside = [0; 4];
+        beside[0] = if lx > 0 {
+            inner(lx - 1, lz)
+        } else {
+            self.side(0)[lz]
+        };
+        beside[1] = if lx < last {
+            inner(lx + 1, lz)
+        } else {
+            self.side(1)[lz]
+        };
+        beside[2] = if lz > 0 {
+            inner(lx, lz - 1)
+        } else {
+            self.side(2)[lx]
+        };
+        beside[3] = if lz < last {
+            inner(lx, lz + 1)
+        } else {
+            self.side(3)[lx]
+        };
+        beside.into_iter().any(|h| sea.wets(h, y))
+    }
+
+    /// The heights of the columns outside side `k` (`-x`, `+x`, `-z`, `+z`).
+    fn side(&mut self, k: usize) -> &[i64; CHUNK_SIZE as usize] {
+        let (generator, origin) = (self.generator, self.origin);
+        self.outside[k].get_or_insert_with(|| {
+            let size = i64::from(CHUNK_SIZE);
+            let along =
+                |o: i64| -> [i64; CHUNK_SIZE as usize] { std::array::from_fn(|i| o + i as i64) };
+            let mut out = [0; CHUNK_SIZE as usize];
+            let heightmap = &generator.settings.heightmap;
+            let seed = generator.seed;
+            match k {
+                0 => heightmap.heights(seed, &[origin.x - 1], &along(origin.z), &mut out),
+                1 => heightmap.heights(seed, &[origin.x + size], &along(origin.z), &mut out),
+                2 => heightmap.heights(seed, &along(origin.x), &[origin.z - 1], &mut out),
+                _ => heightmap.heights(seed, &along(origin.x), &[origin.z + size], &mut out),
+            }
+            out
+        })
     }
 }
