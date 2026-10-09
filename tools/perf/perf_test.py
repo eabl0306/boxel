@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Tests of tools/perf: python3 tools/perf/perf_test.py (or `just test-tools`).
 
-No GPU and no real stress run: `measure` runs a fake stress binary (a Python script that writes
-a summary and a CSV) so the watching, the redo of throttled runs and the metrics are covered."""
+No GPU and no real stress run: the runs go to fake stress binaries (Python scripts that write a
+summary and a CSV, or fail like stress without a GPU), so the watching, the redo of throttled
+runs, the verdicts and the exit codes are covered."""
 import contextlib
 import io
 import json
@@ -12,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -20,6 +22,9 @@ import machine  # noqa: E402
 import perf  # noqa: E402
 import runs  # noqa: E402
 from runs import Case  # noqa: E402
+
+# The tests run the harness in this process: never as if inside a quiet.sh slot.
+os.environ.pop('BOXEL_QUIET_SLOT', None)
 
 
 def summary(fps=1000.0, p99=1.0, slow=0, slow75=0, cap=0, timeline_fps=None, catch_up=20.0):
@@ -42,14 +47,102 @@ def every_refresh(seconds=3, hz=144.0, skip=()):
 
 
 def metrics(fps=1000.0, p99=1.0, slow=0, **more):
-    m = {'fps': fps, 'p50': 0.5, 'p99': p99, 'slow': slow, 'skipped': 0, 'catch_up': 20.0,
-         'pstates': None, 'quads': 100, 'draws': 7, 'gpu_chunks': 50}
+    m = {'fps': fps, 'p50': 0.5, 'p99': p99, 'slow': slow, 'slow75': 0, 'skipped': 0,
+         'catch_up': 20.0, 'pstates': None, 'quads': 100, 'draws': 7, 'gpu_chunks': 50}
     m.update(more)
     return m
 
 
-def run(m=None, error=None, noisy=None):
-    return runs.Run(Case(), 'x', metrics=m, error=error, noisy=noisy)
+def run(m=None, error=None, noisy=None, gave_up=False):
+    return runs.Run(Case(), 'x', metrics=m, error=error, noisy=noisy, gave_up=gave_up)
+
+
+HELP = ('usage: stress [--scenario static|fly|dive|spin|path]\n'
+        '  --cave              start in a cave\n')
+OLD_HELP = 'usage: stress [--scenario static|fly|dive|spin]\n  --caves MODE  cave mode\n'
+
+FAKE_STRESS = r'''#!/usr/bin/env python3
+"""Fake stress: --help prints HELP; a run writes the files a real one writes from SUMMARY (the
+first run of the binary throttled when THROTTLE), or fails like stress without a GPU when FAIL
+is True or appears in the arguments."""
+import json, os, sys
+HELP, SUMMARY, FAIL, THROTTLE = @VALUES@
+args = sys.argv[1:]
+if '--help' in args:
+    print(HELP)
+    sys.exit(0)
+me = os.path.abspath(__file__)
+n = int(open(me + '.count').read()) if os.path.exists(me + '.count') else 0
+open(me + '.count', 'w').write(str(n + 1))
+open(me + '.args', 'a').write(' '.join(args) + '\n')
+if FAIL is True or (FAIL and FAIL in ' '.join(args)):
+    print('stress: no usable GPU', file=sys.stderr)
+    sys.exit(2)
+out = {args[i]: args[i + 1] for i in range(len(args) - 1) if args[i].startswith('--')}
+data = json.loads(SUMMARY)
+if n == 0 and THROTTLE:
+    data['timeline'][1]['fps'] = 30.0
+print('stress: measuring fly for 3 s', flush=True)
+with open(out['--summary'], 'w') as f:
+    f.write('# stress\n\n## Data\n\n```json\n' + json.dumps(data) + '\n```\n')
+with open(out['--csv'], 'w') as f:
+    f.write('frame,t_ms,presented\n')
+    for i in range(3 * 144):
+        f.write(f'{i},{i * 1000 / 144:.3f},1\n')
+'''
+
+
+def fake_stress(folder, name, data=None, fail=False, help_text=HELP, throttle_first=False):
+    """A fake stress binary in `folder`; `data` is its summary (default: summary())."""
+    path = os.path.join(folder, name)
+    values = repr((help_text, json.dumps(data or summary()), fail, throttle_first))
+    with open(path, 'w') as f:
+        f.write(FAKE_STRESS.replace('@VALUES@', values))
+    os.chmod(path, 0o755)
+    return path
+
+
+def calls(path):
+    try:
+        with open(path + '.count') as f:
+            return int(f.read())
+    except OSError:
+        return 0
+
+
+def fake_binary(folder, name, help_text):
+    path = os.path.join(folder, name)
+    with open(path, 'w') as f:
+        f.write(f'#!/bin/sh\ncat <<"EOF"\n{help_text}EOF\n')
+    os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
+    return path
+
+
+class FakeMachine(unittest.TestCase):
+    """A quiet machine: no heavy process, no other CPU, the run lock in a temp dir and the
+    harness's output kept in self.said."""
+
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.dir = d.name
+        self.said = []
+        env = {'XDG_RUNTIME_DIR': self.dir}
+        for patch in (mock.patch.dict(os.environ, env),
+                      mock.patch.object(machine, 'wait_quiet', return_value=True),
+                      mock.patch.object(machine, 'heavy_processes', return_value=[]),
+                      mock.patch.object(machine, 'MAX_OTHER_CPU', 101.0),
+                      mock.patch.object(runs.shutil, 'which', return_value=None),
+                      mock.patch.object(perf, 'say', lambda text='': self.said.append(text))):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def binary(self, name, **kw):
+        path = fake_stress(self.dir, name, **kw)
+        return perf.Binary(path, name, name, name)
+
+    def output(self):
+        return '\n'.join(self.said)
 
 
 class MachineTest(unittest.TestCase):
@@ -94,6 +187,17 @@ class MachineTest(unittest.TestCase):
         self.assertGreaterEqual(result['samples'], 1)
         self.assertNotIn('python3', ' '.join(result['heavy']))
 
+    def test_quiet_sh_marks_its_slot(self):
+        quiet = os.path.join(perf.TREE, 'tools', 'quiet.sh')
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(os.environ, QUIET_LOCK_DIR=d, QUIET_MIN_FREE_GB='0')
+            env.pop('BOXEL_QUIET_SLOT', None)
+            done = subprocess.run([quiet, sys.executable, '-c',
+                                   'import os; print(os.environ.get("BOXEL_QUIET_SLOT"))'],
+                                  env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.strip(), '1')
+
 
 class CaseTest(unittest.TestCase):
     def test_parse(self):
@@ -104,9 +208,22 @@ class CaseTest(unittest.TestCase):
         self.assertEqual(runs.parse_case('dive/uncapped', Case(cap=144)).cap, 0)
         self.assertEqual(runs.parse_case('dive', Case(gpu='780m', radius=8)),
                          Case('780m', 'dive', 8, 0))
-        for bad in ('walk', 'rtx/r0', 'gtx/surface', 'r99'):
+        self.assertEqual(runs.parse_case('forest/60').cap, 60)
+        for bad in ('walk', 'rtx/r0', 'gtx/surface', 'r99', 'forest/30', 'surface/cap40'):
             with self.assertRaises(ValueError):
                 runs.parse_case(bad)
+        with self.assertRaises(ValueError):
+            runs.parse_case('surface', Case(cap=20))
+
+    def test_extra_stress_options(self):
+        case = runs.parse_case('forest', Case(extra=('--bodies', '10000')))
+        self.assertEqual(case.args(10)[-2:], ['--bodies', '10000'])
+        self.assertEqual(str(case), 'rtx/forest/r16/uncapped --bodies 10000')
+        self.assertEqual(case.slug, 'rtx-forest-r16-uncapped-bodies-10000')
+        self.assertIn('--bodies 10000', case.label)
+        for taken in (('--radius', '8'), ('--speed', '8'), ('--summary', 'x'), ('--adapter', 'x')):
+            with self.assertRaises(ValueError):
+                runs.parse_case('forest', Case(extra=taken))
 
     def test_names_round_trip(self):
         for case in perf.MATRIX:
@@ -130,23 +247,13 @@ class CaseTest(unittest.TestCase):
 
     def test_supports_reads_the_help(self):
         with tempfile.TemporaryDirectory() as d:
-            old = fake_binary(d, 'old', 'usage: stress [--scenario static|fly|dive|spin]\n'
-                                        '  --caves MODE  cave mode\n')
-            new = fake_binary(d, 'new', 'usage: stress [--scenario static|fly|dive|spin|path]\n'
-                                        '  --cave              start in a cave\n')
+            old = fake_binary(d, 'old', OLD_HELP)
+            new = fake_binary(d, 'new', HELP)
             self.assertTrue(runs.supports(old, Case(scenario='surface')))
             self.assertFalse(runs.supports(old, Case(scenario='cave-static')))
             self.assertFalse(runs.supports(old, Case(scenario='cave-path')))
             self.assertTrue(runs.supports(new, Case(scenario='cave-static')))
             self.assertTrue(runs.supports(new, Case(scenario='cave-path')))
-
-
-def fake_binary(folder, name, help_text):
-    path = os.path.join(folder, name)
-    with open(path, 'w') as f:
-        f.write(f'#!/bin/sh\ncat <<"EOF"\n{help_text}EOF\n')
-    os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
-    return path
 
 
 class MetricsTest(unittest.TestCase):
@@ -165,13 +272,27 @@ class MetricsTest(unittest.TestCase):
             [2000 + t for t in every_refresh(1)]
         self.assertIn('frames shown (1)', runs.throttled(summary(), shown))
 
+    def test_throttled_with_a_low_cap(self):
+        """A cap of 60 runs at 60 fps every second: that is not the 30 fps throttle."""
+        at_60 = every_refresh(hz=60.0)
+        self.assertIsNone(runs.throttled(summary(cap=60, timeline_fps=[60, 59, 60]), at_60))
+        self.assertIn('under 42 fps',
+                      runs.throttled(summary(cap=60, timeline_fps=[60, 30, 60]), at_60))
+        at_30 = every_refresh(1, 60.0) + [1000 + i * 33.3 for i in range(30)] + \
+            [2000 + t for t in every_refresh(1, 60.0)]
+        self.assertIn('frames shown (1)', runs.throttled(summary(cap=60), at_30))
+        # Capped at 144 the limits stay those of the uncapped runs.
+        self.assertIn('under 100 fps',
+                      runs.throttled(summary(cap=144, timeline_fps=[144, 90, 144]), []))
+
     def test_metrics(self):
         m = runs.metrics(summary(fps=4500, slow=2, slow75=1), every_refresh(), {'P0': 1.0})
         self.assertEqual((m['fps'], m['slow'], m['skipped'], m['catch_up']), (4500, 2, 0, 20.0))
         self.assertEqual(m['pstates'], {'P0': 1.0})
         self.assertEqual(m['quads'], 100)
         capped = runs.metrics(summary(slow=1500, slow75=12, cap=144), [])
-        self.assertEqual(capped['slow'], 12, 'capped runs count the frames over 7.5 ms')
+        self.assertEqual(capped['slow'], 1500, 'the smoke counts frames over 6.94 ms, capped too')
+        self.assertEqual(capped['slow75'], 12)
         self.assertIsNone(capped['skipped'])
 
     def test_nvidia(self):
@@ -183,59 +304,33 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(runs.pstate_share(samples, 2, 5), {'P0': 0.75, 'P2': 0.25})
         self.assertEqual(runs.pstate_share([], 0, 1), {})
 
-
-FAKE_STRESS = r'''#!/usr/bin/env python3
-"""Fake stress: writes the files a run writes. The first run of COUNT is throttled."""
-import json, os, sys
-args = sys.argv[1:]
-out = {args[i]: args[i + 1] for i in range(len(args) - 1) if args[i].startswith('--')}
-count = os.environ['FAKE_COUNT']
-n = int(open(count).read()) if os.path.exists(count) else 0
-open(count, 'w').write(str(n + 1))
-if os.environ.get('FAKE_FAIL'):
-    print('stress: no usable GPU', file=sys.stderr)
-    sys.exit(2)
-data = json.loads(os.environ['FAKE_SUMMARY'])
-if n == 0 and os.environ.get('FAKE_THROTTLE_FIRST'):
-    data['timeline'][1]['fps'] = 30.0
-print('stress: measuring fly for 3 s', flush=True)
-with open(out['--summary'], 'w') as f:
-    f.write('# stress\n\n## Data\n\n```json\n' + json.dumps(data) + '\n```\n')
-with open(out['--csv'], 'w') as f:
-    f.write('frame,t_ms,presented\n')
-    for i in range(3 * 144):
-        f.write(f'{i},{i * 1000 / 144:.3f},1\n')
-'''
+    def test_nvidia_sampler_closes_its_pipe(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = os.path.join(d, 'nvidia-smi')
+            with open(fake, 'w') as f:
+                f.write('#!/bin/sh\nwhile :; do\n'
+                        '  echo "2026/10/08 12:00:00.000, P0, 2400, 8000, 25.10, 47"\n'
+                        '  sleep 0.05\ndone\n')
+            os.chmod(fake, 0o755)
+            with mock.patch.dict(os.environ, {'PATH': d + os.pathsep + os.environ['PATH']}):
+                sampler = runs.NvidiaSampler().start()
+                time.sleep(0.3)
+                samples = sampler.stop()
+        self.assertGreater(len(samples), 0)
+        self.assertTrue(sampler._proc.stdout.closed)
 
 
-class MeasureTest(unittest.TestCase):
-    def setUp(self):
-        d = tempfile.TemporaryDirectory()
-        self.addCleanup(d.cleanup)
-        self.dir = d.name
-        self.binary = os.path.join(self.dir, 'stress')
-        with open(self.binary, 'w') as f:
-            f.write(FAKE_STRESS)
-        os.chmod(self.binary, 0o755)
-        env = {'XDG_RUNTIME_DIR': self.dir, 'FAKE_COUNT': os.path.join(self.dir, 'count'),
-               'FAKE_SUMMARY': json.dumps(summary(fps=900.0))}
-        for patch in (mock.patch.dict(os.environ, env),
-                      mock.patch.object(machine, 'wait_quiet', return_value=True),
-                      mock.patch.object(machine, 'heavy_processes', return_value=[]),
-                      mock.patch.object(machine, 'MAX_OTHER_CPU', 101.0)):
-            patch.start()
-            self.addCleanup(patch.stop)
-        self.said = []
-
-    def measure(self, **kw):
+class MeasureTest(FakeMachine):
+    def measure(self, binary, **kw):
         prefix = os.path.join(self.dir, 'runs', 'case-1')
         os.makedirs(os.path.dirname(prefix), exist_ok=True)
-        return runs.measure(self.binary, Case(), prefix, 'label', 3, say=self.said.append, **kw)
+        return runs.measure(binary, Case(), prefix, 'label', 3, say=self.said.append, **kw)
 
     def test_a_good_run(self):
-        r = self.measure()
+        r = self.measure(fake_stress(self.dir, 'stress', summary(fps=900.0)))
         self.assertIsNone(r.error)
         self.assertIsNone(r.noisy)
+        self.assertTrue(r.counts)
         self.assertEqual((r.metrics['fps'], r.metrics['skipped']), (900.0, 0))
         prefix = os.path.join(self.dir, 'runs', 'case-1')
         for ext in ('.md', '.csv', '.log', '.watch.json'):
@@ -244,27 +339,59 @@ class MeasureTest(unittest.TestCase):
             self.assertIn('--label label', f.read())
 
     def test_a_throttled_run_is_redone(self):
-        with mock.patch.dict(os.environ, {'FAKE_THROTTLE_FIRST': '1'}):
-            r = self.measure()
+        r = self.measure(fake_stress(self.dir, 'stress', throttle_first=True))
         self.assertIsNone(r.noisy)
+        self.assertTrue(r.counts)
         self.assertEqual(len(r.discarded), 1)
         self.assertIn('under 100 fps', self.said[0])
         moved = os.listdir(os.path.join(self.dir, 'runs', 'discarded'))
         self.assertIn('case-1.a1.md', moved)
 
-    def test_noisy_runs_keep_the_last_one(self):
+    def test_a_run_still_noisy_does_not_count(self):
         with mock.patch.object(machine, 'heavy_processes', return_value=['rustc']):
-            r = self.measure(attempts=2)
+            r = self.measure(fake_stress(self.dir, 'stress'), attempts=2)
         self.assertEqual(r.noisy, 'overlapped rustc')
-        self.assertEqual(len(r.discarded), 2)
+        self.assertFalse(r.counts)
+        self.assertTrue(r.ran, 'the binary ran: a failure of the other side is not the machine')
+        self.assertEqual(len(r.discarded), 1, 'one attempt redone, the last one kept as noisy')
         self.assertIsNotNone(r.metrics)
+        # Its files leave the folder, so bench-report on it never sees them.
+        prefix = os.path.join(self.dir, 'runs', 'case-1')
+        self.assertFalse(os.path.exists(prefix + '.md'))
+        self.assertIn('case-1.a2.md', os.listdir(os.path.join(self.dir, 'runs', 'discarded')))
+
+    def test_the_machine_never_got_quiet(self):
+        binary = fake_stress(self.dir, 'stress')
+        with mock.patch.object(machine, 'wait_quiet', return_value=False):
+            r = self.measure(binary)
+        self.assertIsNone(r.error, 'a busy machine is not a failure of the binary')
+        self.assertTrue(r.gave_up)
+        self.assertIn('never got quiet', r.noisy)
+        self.assertFalse(r.counts or r.ran)
+        self.assertEqual(calls(binary), 0)
+
+    def test_the_waits_share_one_deadline(self):
+        waits = []
+
+        def wait(max_wait_s=None, say=None):
+            waits.append(max_wait_s)
+            time.sleep(0.05)
+            return True
+        with mock.patch.dict(os.environ, {'PERF_MAX_WAIT': '100'}), \
+                mock.patch.object(machine, 'wait_quiet', wait), \
+                mock.patch.object(machine, 'heavy_processes', return_value=['rustc']):
+            self.measure(fake_stress(self.dir, 'stress'), attempts=3)
+        self.assertEqual(len(waits), 3)
+        self.assertLessEqual(waits[0], 100)
+        self.assertLess(waits[2], waits[1])
+        self.assertLess(waits[1], waits[0])
 
     def test_a_failed_run(self):
-        with mock.patch.dict(os.environ, {'FAKE_FAIL': '1'}):
-            r = self.measure()
+        r = self.measure(fake_stress(self.dir, 'stress', fail=True))
         self.assertEqual(r.rc, 2)
         self.assertIn('exit code 2', r.error)
         self.assertIn('no usable GPU', r.detail)
+        self.assertFalse(r.counts or r.ran)
 
 
 class SmokeTest(unittest.TestCase):
@@ -273,10 +400,19 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(perf.gross(base, metrics(fps=900, p99=1.4, slow=0)), [])
         self.assertIn('under 85%', perf.gross(base, metrics(fps=800))[0])
         self.assertIn('over 1.5x', perf.gross(base, metrics(p99=1.6))[0])
-        self.assertIn('the base had none', perf.gross(base, metrics(slow=1))[0])
+        self.assertIn('over 6.94 ms, the base had none', perf.gross(base, metrics(slow=1))[0])
         self.assertEqual(perf.gross(metrics(slow=3), metrics(slow=9)), [])
         self.assertEqual(perf.gross(base, metrics(fps=960), fps_min=0.95), [])
         self.assertEqual(len(perf.gross(base, metrics(fps=940), fps_min=0.95)), 1)
+
+    def test_gross_capped_uses_6_94_ms(self):
+        """The policy rule: frames over 6.94 ms where the base had none, capped or not."""
+        capped = [runs.metrics(summary(cap=144, slow=s, slow75=s75), []) for s, s75 in
+                  ((1500, 0), (1500, 3))]
+        self.assertEqual(perf.gross(*capped), [], 'the base had frames over 6.94 ms')
+        none = runs.metrics(summary(cap=144, slow=0, slow75=0), [])
+        some = runs.metrics(summary(cap=144, slow=2, slow75=0), [])
+        self.assertIn('2 frames over 6.94 ms', perf.gross(none, some)[0])
 
     def result(self, *problems, new_error=None, base_error=None):
         r = perf.SmokeResult(Case())
@@ -284,7 +420,8 @@ class SmokeTest(unittest.TestCase):
             r.pairs.append((run(metrics()), run(metrics(fps=500 if p else 1000))))
             r.problems.append(p)
         if new_error or base_error:
-            r.pairs.append((run(error=base_error), run(error=new_error)))
+            r.pairs.append((run(error=base_error) if base_error else run(metrics()),
+                            run(error=new_error) if new_error else run(metrics())))
         return r
 
     def test_status_and_verdict(self):
@@ -296,12 +433,43 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(twice.status, 'worse')
         self.assertEqual(twice.verdict(), 'WORSE: fps 500 under 85% of 1000')
         self.assertEqual(self.result(new_error='exit code 4').status, 'failed')
-        self.assertEqual(self.result(base_error='exit code 2').status, 'broken')
+        self.assertEqual(self.result(base_error='exit code 2').status, 'unmeasured')
         skipped = perf.SmokeResult(Case(), skipped='no cave')
         self.assertEqual((skipped.status, skipped.verdict()), ('skipped', 'skipped: no cave'))
-        noisy = perf.SmokeResult(Case(), pairs=[(run(metrics(), noisy='overlapped rustc'),
-                                                 run(metrics()))], problems=[[]])
-        self.assertIn('noisy: overlapped rustc', noisy.verdict())
+        lost = perf.SmokeResult(Case(), lost='new has no cave-path scenario')
+        self.assertEqual((lost.status, lost.verdict()),
+                         ('failed', 'FAILED: new has no cave-path scenario'))
+
+    def test_a_noisy_run_is_never_ok(self):
+        for b, n in ((run(metrics(), noisy='overlapped rustc'), run(metrics())),
+                     (run(metrics()), run(metrics(), noisy='seconds under 100 fps (0)')),
+                     (run(metrics()), None),
+                     (run(metrics()), run(noisy='never got quiet', gave_up=True))):
+            r = perf.SmokeResult(Case(), pairs=[(b, n)], problems=[[]])
+            self.assertEqual(r.status, 'unmeasured', (b, n))
+            self.assertTrue(r.verdict().startswith('not measured: '), r.verdict())
+            self.assertEqual(perf.exit_code([r]), 2)
+        # A clean first pair that looked worse and a noisy repeat confirm nothing.
+        r = perf.SmokeResult(Case(), pairs=[(run(metrics()), run(metrics(fps=500))),
+                                            (run(metrics()), run(metrics(), noisy='overlapped'))],
+                             problems=[['fps 500 under 85% of 1000']])
+        self.assertEqual(r.status, 'unmeasured')
+        self.assertIn('the first pair looked worse', r.verdict())
+
+    def test_both_sides_failing_is_the_machine(self):
+        """No usable GPU fails both sides: that says nothing about the new binary."""
+        both = self.result(new_error='exit code 2', base_error='exit code 2')
+        self.assertEqual(both.status, 'unmeasured')
+        self.assertIn('base run exit code 2; new run exit code 2', both.verdict())
+        self.assertEqual(perf.exit_code([both]), 2)
+        # The new run failing after a base that did not count is not blamed either.
+        r = perf.SmokeResult(Case(), pairs=[(run(noisy='never got quiet', gave_up=True),
+                                             run(error='exit code 2'))])
+        self.assertEqual(r.status, 'unmeasured')
+        # A noisy base still ran to the end: the new binary's failure is its own.
+        r = perf.SmokeResult(Case(), pairs=[(run(metrics(), noisy='overlapped rustc'),
+                                             run(error='exit code 4'))])
+        self.assertEqual(r.status, 'failed')
 
     def test_exit_code(self):
         ok, worse = self.result([]), self.result(['a'], ['b'])
@@ -309,16 +477,170 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(perf.exit_code([ok, worse]), 1)
         self.assertEqual(perf.exit_code([ok, self.result(base_error='x')]), 2)
         self.assertEqual(perf.exit_code([worse, self.result(base_error='x')]), 1)
-        self.assertEqual(perf.exit_code([perf.SmokeResult(Case(), skipped='x')]), 0)
+        self.assertEqual(perf.exit_code([perf.SmokeResult(Case(), skipped='x')]), 2,
+                         'nothing measured is not ok')
+        self.assertEqual(perf.exit_code([ok, perf.SmokeResult(Case(), skipped='x')]), 2)
+        self.assertEqual(perf.exit_code([perf.SmokeResult(Case(), lost='x')]), 1)
 
     def test_table(self):
+        noisy = perf.SmokeResult(Case(scenario='dive'),
+                                 pairs=[(run(metrics(fps=30)), run(metrics(fps=30),
+                                                                   noisy='seconds under 100 fps'))],
+                                 problems=[[]])
         table = perf.smoke_table([self.result([]), perf.SmokeResult(Case(scenario='cave-path'),
-                                                                     skipped='no cave')])
+                                                                     skipped='no cave'), noisy])
         lines = table.splitlines()
-        self.assertEqual(lines[0], '| case | fps | p99 ms | slow frames | verdict |')
+        self.assertEqual(lines[0], '| case | fps | p99 ms | frames > 6.94 ms | verdict |')
         self.assertEqual(lines[2], '| rtx/surface/r16/uncapped | 1000 -> 1000 (+0.0 %) | '
                                    '1 -> 1 | 0 -> 0 | ok |')
         self.assertEqual(lines[3], '| rtx/cave-path/r16/uncapped | - | - | - | skipped: no cave |')
+        self.assertEqual(lines[4], '| rtx/dive/r16/uncapped | - | - | - | not measured: new run '
+                                   'seconds under 100 fps |', 'no numbers from a noisy run')
+
+    def test_usage_errors(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(perf.main(['smoke', 'walk']), 64)
+            self.assertEqual(perf.main(['nothing']), 64)
+            self.assertEqual(perf.main(['check', '--dry-run', '--', '--bodies', '1']), 64)
+            self.assertEqual(perf.main(['smoke', 'forest', '--', '--radius', '8']), 64)
+            self.assertEqual(perf.main(['cases']), 0)
+        self.assertIn("'walk' is not a GPU", err.getvalue())
+        self.assertIn('already sets --radius', err.getvalue())
+        self.assertIn('rtx/surface/r32/144', out.getvalue())
+
+    def test_refuses_to_run_inside_quiet_sh(self):
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {'BOXEL_QUIET_SLOT': '1'}), \
+                mock.patch.object(perf, 'tree_binary') as build, \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            self.assertEqual(perf.main(['smoke']), 64)
+            self.assertEqual(perf.main(['bisect', 'surface', 'HEAD~1', 'HEAD']), 64)
+        build.assert_not_called()
+        self.assertIn('do not run perf-* through tools/quiet.sh', err.getvalue())
+
+
+class SmokeRunTest(FakeMachine):
+    """smoke_case and cmd_smoke on fake binaries."""
+
+    def smoke(self, base, new, case=Case(), **kw):
+        return perf.smoke_case(case, base, new, os.path.join(self.dir, 'smoke'), 3, **kw)
+
+    def test_a_clean_pair(self):
+        r = self.smoke(self.binary('base'), self.binary('new'))
+        self.assertEqual((r.status, perf.exit_code([r])), ('ok', 0))
+
+    def test_a_throttled_window_on_every_attempt_is_not_ok(self):
+        """Both sides at 30 fps (a hidden window): equal numbers, but nothing was measured."""
+        slow = summary(fps=30, p99=33, slow=300, timeline_fps=[30, 30, 30])
+        r = self.smoke(self.binary('base', data=slow), self.binary('new', data=slow))
+        self.assertEqual(r.status, 'unmeasured')
+        self.assertIn('under 100 fps', r.verdict())
+        self.assertEqual(perf.exit_code([r]), 2)
+
+    def test_a_busy_machine_hides_nothing(self):
+        """A build overlapping every attempt of both sides: never an ok."""
+        base, new = self.binary('base'), self.binary('new', data=summary(fps=800))
+        with mock.patch.object(machine, 'heavy_processes', return_value=['rustc']):
+            r = self.smoke(base, new)
+        self.assertEqual(r.status, 'unmeasured')
+        self.assertEqual(calls(base.path), runs.ATTEMPTS)
+        self.assertEqual(calls(new.path), 0, 'a base that does not count ends the pair')
+
+    def test_no_gpu_on_both_sides_is_not_the_branch(self):
+        r = self.smoke(self.binary('base', fail=True), self.binary('new', fail=True), flip=True)
+        self.assertEqual(r.status, 'unmeasured')
+        self.assertEqual(perf.exit_code([r]), 2)
+
+    def test_the_new_binary_failing_alone(self):
+        base, new = self.binary('base'), self.binary('new', fail=True)
+        r = self.smoke(base, new, flip=True)
+        self.assertEqual(r.status, 'failed')
+        self.assertEqual(calls(base.path), 1, 'the base runs to tell the binary from the machine')
+        self.assertEqual(perf.exit_code([r]), 1)
+
+    def test_a_new_run_that_waited_out_ends_the_pair(self):
+        base, new = self.binary('base'), self.binary('new')
+        with mock.patch.object(machine, 'wait_quiet', return_value=False):
+            r = self.smoke(base, new, flip=True)
+        self.assertEqual(r.status, 'unmeasured')
+        self.assertTrue(r.gave_up)
+        self.assertEqual(calls(base.path) + calls(new.path), 0)
+
+    def test_scenarios_the_base_or_the_new_binary_lack(self):
+        cave = Case(scenario='cave-path')
+        old_base = self.binary('old', help_text=OLD_HELP)
+        r = self.smoke(old_base, self.binary('new'), cave)
+        self.assertEqual((r.status, perf.exit_code([r])), ('skipped', 2))
+        r = self.smoke(self.binary('base'), self.binary('lost', help_text=OLD_HELP), cave)
+        self.assertEqual((r.status, perf.exit_code([r])), ('failed', 1))
+        self.assertIn('lost has no cave-path scenario and the base has it', r.verdict())
+
+    def test_a_gross_regression_repeats_once(self):
+        base, new = self.binary('base'), self.binary('new', data=summary(fps=500))
+        r = self.smoke(base, new)
+        self.assertEqual(r.status, 'worse')
+        self.assertEqual((calls(base.path), calls(new.path)), (2, 2))
+
+    def cmd_smoke(self, cases, base, new, extra=()):
+        a = perf.parser().parse_args(['smoke', *cases, '--duration', '3'])
+        a.extra = list(extra)
+        with mock.patch.object(perf, 'resolve', side_effect=[base, new]), \
+                mock.patch.object(perf, 'root', return_value=self.dir), \
+                mock.patch.object(perf, 'merge_base', return_value='base'):
+            return perf.cmd_smoke(a)
+
+    def test_cmd_smoke_stops_once_the_machine_never_got_quiet(self):
+        base, new = self.binary('base'), self.binary('new')
+        with mock.patch.object(machine, 'wait_quiet', return_value=False) as wait:
+            code = self.cmd_smoke(['surface', 'forest', 'dive'], base, new)
+        self.assertEqual(code, 2)
+        self.assertEqual(wait.call_count, 1, 'one wait out, not one per run')
+        self.assertIn('not run, the machine never got quiet for an earlier case', self.output())
+        self.assertIn('could not measure everything', self.output())
+
+    def test_cmd_smoke_passes_extra_options_to_both_sides(self):
+        base, new = self.binary('base'), self.binary('new')
+        code = self.cmd_smoke(['forest'], base, new, extra=['--bodies', '10000'])
+        self.assertEqual(code, 0, self.output())
+        for b in (base, new):
+            with open(b.path + '.args') as f:
+                self.assertIn(' --bodies 10000 ', f.read())
+        self.assertIn('rtx/forest/r16/uncapped --bodies 10000', self.output())
+
+    def test_cmd_smoke_notes_identical_binaries(self):
+        base = self.binary('base')
+        same = os.path.join(self.dir, 'copy')
+        with open(base.path) as f, open(same, 'w') as g:
+            g.write(f.read())
+        os.chmod(same, 0o755)
+        self.cmd_smoke(['surface'], base, perf.Binary(same, 'copy'))
+        self.assertIn('both binaries are the same', self.output())
+
+
+class TreeBinaryTest(unittest.TestCase):
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.dir = d.name
+        self.target = os.path.join(self.dir, 'target')
+        self.builds = 0
+        for patch in (mock.patch.object(perf, 'root', return_value=self.dir),
+                      mock.patch.object(perf, 'say', lambda text='': None),
+                      mock.patch.dict(os.environ, {'CARGO_TARGET_DIR': self.target,
+                                                   'PERF_TARGET_DIR': os.path.join(self.dir,
+                                                                                   'perf')}),
+                      mock.patch.object(perf, 'cargo_build', self.build)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def build(self, cwd, target, log):
+        self.builds += 1
+        out = os.path.join(target, 'release', 'examples', 'stress')
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, 'w') as f:
+            f.write(f'binary {self.builds}\n')
+        return out
 
     def test_the_tree_never_shares_the_base_target_dir(self):
         with tempfile.TemporaryDirectory() as d, \
@@ -329,14 +651,68 @@ class SmokeTest(unittest.TestCase):
         self.assertIn('PERF_TARGET_DIR', str(e.exception))
         build.assert_not_called()
 
-    def test_usage_errors(self):
-        out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            self.assertEqual(perf.main(['smoke', 'walk']), 64)
-            self.assertEqual(perf.main(['nothing']), 64)
-            self.assertEqual(perf.main(['cases']), 0)
-        self.assertIn("'walk' is not a GPU", err.getvalue())
-        self.assertIn('rtx/surface/r32/144', out.getvalue())
+    def test_a_target_dir_another_tree_built_in_is_refused(self):
+        perf.claim(self.target, '/some/other/worktree')
+        with self.assertRaises(perf.PerfError) as e:
+            perf.tree_binary()
+        self.assertIn('/some/other/worktree', str(e.exception))
+        self.assertEqual(self.builds, 0)
+        perf.claim(os.path.join(self.dir, 'mine'), perf.TREE)
+        perf.claim(os.path.join(self.dir, 'mine'), perf.TREE)
+
+    def test_dirty_builds_never_share_a_path(self):
+        state = ('a' * 40, 'files', True)
+        with mock.patch.object(perf, 'tree_state', return_value=state):
+            first = perf.tree_binary()
+            second = perf.tree_binary()
+        self.assertNotEqual(first.path, second.path)
+        self.assertNotEqual(first.label, second.label)
+        with open(first.path) as f:
+            self.assertEqual(f.read(), 'binary 1\n', 'a later build left the first one alone')
+        self.assertIsNone(first.sha)
+
+    def test_a_tree_that_changes_during_the_build_gives_no_binary(self):
+        states = iter([('a' * 40, 'files', False), ('a' * 40, 'edited', True)])
+        with mock.patch.object(perf, 'tree_state', lambda: next(states)):
+            with self.assertRaises(perf.PerfError) as e:
+                perf.tree_binary()
+        self.assertIn('changed while stress was building', str(e.exception))
+        self.assertFalse(os.path.exists(perf.bench('bins', 'a' * 40, 'stress')))
+        self.assertEqual([n for n in os.listdir(perf.bench('bins'))
+                          if n.startswith('.stage-')], [])
+
+    def test_a_clean_build_is_cached_by_its_commit(self):
+        state = ('b' * 40, 'files', False)
+        with mock.patch.object(perf, 'tree_state', return_value=state):
+            first = perf.tree_binary()
+            again = perf.tree_binary()
+        self.assertEqual(first.path, perf.bench('bins', 'b' * 40, 'stress'))
+        self.assertEqual((again.path, self.builds), (first.path, 1))
+
+    def test_tree_state_sees_edits_and_new_files(self):
+        with tempfile.TemporaryDirectory() as repo:
+            def git(*args):
+                subprocess.run(['git', '-c', 'user.email=t@t', '-c', 'user.name=t', *args],
+                               cwd=repo, check=True, capture_output=True)
+            git('init', '-q')
+            with open(os.path.join(repo, 'a.rs'), 'w') as f:
+                f.write('1\n')
+            git('add', 'a.rs')
+            git('commit', '-qm', 'x')
+            with mock.patch.object(perf, 'TREE', repo):
+                clean = perf.tree_state()
+                self.assertFalse(clean[2])
+                with open(os.path.join(repo, 'b.rs'), 'w') as f:
+                    f.write('new\n')
+                untracked = perf.tree_state()
+                self.assertNotEqual(untracked[1], clean[1])
+                self.assertFalse(untracked[2], 'an untracked file alone keeps the tree clean')
+                with open(os.path.join(repo, 'a.rs'), 'w') as f:
+                    f.write('2\n')
+                edited = perf.tree_state()
+                self.assertTrue(edited[2])
+                self.assertNotEqual(edited[1], untracked[1])
+                self.assertEqual(perf.tree_state(), edited)
 
 
 class CheckTest(unittest.TestCase):
@@ -345,6 +721,16 @@ class CheckTest(unittest.TestCase):
         self.assertEqual(perf.next_number(['perf-control-2', 'perf-control-10', 'perf-control-x']),
                          11)
         self.assertEqual(perf.next_number(['perf-control-2'], {'number': 4}), 5)
+
+    def test_last_checkpoint(self):
+        with mock.patch.object(perf, 'commit', lambda ref: 'sha-of-' + ref):
+            self.assertEqual(perf.last_checkpoint({'sha': 's', 'tag': 'perf-control-3'}, []),
+                             ('s', 'perf-control-3'))
+            self.assertEqual(perf.last_checkpoint(None, ['perf-control-2', 'perf-control-10',
+                                                         'perf-control-x']),
+                             ('sha-of-perf-control-10', 'perf-control-10'),
+                             'a lost control/last falls back to the highest tag')
+            self.assertEqual(perf.last_checkpoint(None, []), (None, None))
 
     def test_schedule(self):
         cases = [Case(scenario='surface'), Case(scenario='forest'), Case(scenario='dive')]
@@ -358,7 +744,7 @@ class CheckTest(unittest.TestCase):
         self.assertEqual([c.scenario for r, c, s in plan if r == 1 and s == 'new'],
                          ['forest', 'dive', 'surface'])
         # Each case runs base first in some rounds and new first in others.
-        firsts = {(r, c) : s for r, c, s in reversed(plan)}
+        firsts = {(r, c): s for r, c, s in reversed(plan)}
         self.assertEqual({firsts[(r, cases[0])] for r in range(3)}, {'base', 'new'})
 
     def test_worse(self):
@@ -373,6 +759,13 @@ class CheckTest(unittest.TestCase):
         self.assertFalse(perf.worse('skipped', [1, 1, 1], [90, 100, 80]), 'never flagged')
         self.assertFalse(perf.worse('catch_up', [None], [30.0]))
 
+    def test_capped_slow_frames_are_over_7_5_ms(self):
+        capped, uncapped = Case(cap=144), Case()
+        base = [metrics(slow=1500, slow75=10)] * 3
+        new = [metrics(slow=1500, slow75=40)] * 3
+        self.assertEqual(perf.flagged_metrics(capped, {'base': base, 'new': new}), ['slow'])
+        self.assertEqual(perf.flagged_metrics(uncapped, {'base': base, 'new': new}), [])
+
     def test_pstates_text(self):
         self.assertEqual(perf.pstates_text([None, {}]), '-')
         self.assertEqual(perf.pstates_text([{'P0': 1.0}, {'P0': 0.8, 'P2': 0.2}]),
@@ -381,9 +774,10 @@ class CheckTest(unittest.TestCase):
 
     def info(self, **more):
         info = {'number': 3, 'date': '2026-10-20', 'tag': 'perf-control-3', 'new': 'a' * 40,
-                'base': 'bbbbbbbb', 'base_tag': 'perf-control-2', 'rounds': 3, 'duration': 20,
-                'skipped': [], 'discarded': 2, 'noisy': 0,
-                'folder': 'bench-results/control/3-2026-10-20'}
+                'base': 'bbbbbbbb', 'base_sha': 'b' * 40, 'base_tag': 'perf-control-2',
+                'rounds': 3, 'duration': 20, 'skipped': [], 'discarded': 2, 'noisy': 0,
+                'folder': 'bench-results/control/3-2026-10-20', 'new_failed': [],
+                'incomplete': [], 'checkpoint': True, 'off_main': False}
         info.update(more)
         return info
 
@@ -393,54 +787,225 @@ class CheckTest(unittest.TestCase):
         same = [metrics(fps=f, pstates={'P0': 1.0}) for f in (1000, 1010, 990)]
         results = {
             rtx: {'base': same, 'new': [metrics(fps=f, pstates={'P0': 0.5, 'P2': 0.5})
-                                        for f in (700, 710, 690)], 'errors': []},
-            cave: {'base': same, 'new': same[:2], 'errors': ['new, ronda 3: exit code 4']},
+                                        for f in (700, 710, 690)], 'errors': [],
+                  'unmeasured': []},
+            cave: {'base': same, 'new': same[:2], 'errors': ['new, ronda 3: exit code 4'],
+                   'unmeasured': []},
         }
-        text = perf.render_report(self.info(skipped=['rtx/cave-path/r32/144 solo ahora']),
-                                  results)
+        text = perf.render_report(self.info(skipped=['rtx/cave-path/r32/144 solo ahora'],
+                                            new_failed=['780m/cave-path/r16/144 (exit code 4)'],
+                                            incomplete=['780m/cave-path/r16/144'],
+                                            checkpoint=False, tag=None), results)
         self.assertTrue(text.startswith('# Ronda de control 3 (2026-10-20)\n'))
         self.assertIn('`bbbbbbbb` (`perf-control-2`)', text)
+        self.assertNotIn('(tag `', text, 'an incomplete round gets no tag')
         self.assertIn('**Resultado:** empeoró en rtx/surface/r16/uncapped. Buscar el merge con '
-                      '`just perf-bisect rtx/surface/r16/uncapped bbbbbbbb aaaaaaaa`.', text)
+                      '`just perf-bisect rtx/surface/r16/uncapped bbbbbbbb aaaaaaaa --metric fps`.',
+                      text)
         self.assertIn('| superficie, vuelo a 64, sin tope | 1000 -> 700 **peor** | 0.50 -> 0.50 |',
                       text)
         self.assertIn('| P0 100 % -> P0 50 %, P2 50 % |', text)
         self.assertIn('## Radeon 780M', text)
         self.assertNotIn('Estado NVIDIA |\n|---|---:|---:|---:|---:|---:|---:|\n| cueva', text)
-        self.assertIn('**Fallaron:** 780m/cave-path/r16/144', text)
+        self.assertIn('**El binario nuevo falló:** 780m/cave-path/r16/144 (exit code 4).', text)
+        self.assertIn('**Ronda incompleta:** faltan corridas de 780m/cave-path/r16/144 (ver las '
+                      'notas).', text)
+        self.assertIn('No cuenta como control', text)
         self.assertIn('- Sin datos: rtx/cave-path/r32/144 solo ahora.', text)
+        self.assertIn('- 780m/cave-path/r16/144 falló: new, ronda 3: exit code 4', text)
         self.assertIn('Corridas descartadas y repetidas: 2', text)
         self.assertNotIn('## Data', text, 'bench_report_test parses docs with a Data section')
-        self.assertNotIn('\u2014', text)
+        self.assertNotIn('—', text)
+
+    def test_report_suggests_the_bisect_of_the_flagged_metric(self):
+        case = Case('rtx', 'surface', 16, 0)
+        base = [metrics(catch_up=c) for c in (20.0, 21.0, 19.0)]
+        new = [metrics(catch_up=c) for c in (30.0, 31.0, 29.0)]
+        text = perf.render_report(self.info(), {case: {'base': base, 'new': new, 'errors': [],
+                                                       'unmeasured': []}})
+        self.assertIn(f'`just perf-bisect {case} bbbbbbbb aaaaaaaa --metric catch_up`', text)
+        self.assertIn('(tag `perf-control-3`)', text)
 
     def test_first_report(self):
-        results = {Case(): {'base': [], 'new': [metrics()], 'errors': []}}
-        text = perf.render_report(self.info(number=1, base=None, base_tag=None), results)
+        results = {Case(): {'base': [], 'new': [metrics()], 'errors': [], 'unmeasured': []}}
+        text = perf.render_report(self.info(number=1, base=None, base_sha=None, base_tag=None),
+                                  results)
         self.assertIn('Primera ronda', text)
-        self.assertIn('**Resultado:** sin empeoramientos claros.', text)
+        self.assertIn('**Resultado:** primera ronda, sin comparación.', text)
         self.assertIn('| superficie, vuelo a 64, sin tope | 1000 | 0.50 | 1 | 0 | 0 | 20 | - |',
                       text)
 
+    def dry_run(self, *args, last=None, tags='', main=True):
+        out, err = io.StringIO(), io.StringIO()
+        real_git = perf.git
+
+        def git(*a, **kw):
+            return tags if a[:2] == ('tag', '--list') else real_git(*a, **kw)
+        with mock.patch.object(perf, 'read_last', return_value=last), \
+                mock.patch.object(perf, 'git', git), \
+                mock.patch.object(perf, 'on_main', return_value=main), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = perf.main(['check', '--dry-run', *args])
+        return code, out.getvalue(), err.getvalue()
+
     def test_dry_run_prints_the_plan(self):
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
-            code = perf.main(['check', '--dry-run', '--no-tag'])
-        self.assertEqual(code, 0, out.getvalue())
-        self.assertIn(f'{len(perf.MATRIX)} cases x 3 rounds', out.getvalue())
-        self.assertIn('dry run, nothing measured', out.getvalue())
+        code, out, _ = self.dry_run('--no-tag')
+        self.assertEqual(code, 0, out)
+        self.assertIn(f'{len(perf.MATRIX)} cases x 3 rounds', out)
+        self.assertIn('dry run, nothing measured', out)
 
     def test_dry_run_against_the_last_checkpoint(self):
         head = perf.commit('HEAD')
-        last = {'number': 41, 'tag': 'perf-control-41', 'sha': head}
-        out = io.StringIO()
-        with mock.patch.object(perf, 'read_last', return_value=last), \
-                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
-            code = perf.main(['check', '--dry-run'])
-        self.assertEqual(code, 0, out.getvalue())
-        text = out.getvalue()
-        self.assertIn('perf-check: round 42 (perf-control-42)', text)
-        self.assertIn('x 3 rounds x 2 sides of 20 s', text)
-        self.assertIn(f'base: {head} (the last checkpoint, perf-control-41;', text)
+        code, out, _ = self.dry_run(last={'number': 41, 'tag': 'perf-control-41', 'sha': head})
+        self.assertEqual(code, 0, out)
+        self.assertIn('perf-check: round 42 (perf-control-42)', out)
+        self.assertIn('x 3 rounds x 2 sides of 20 s', out)
+        self.assertIn(f'base: {head} (the last checkpoint, perf-control-41;', out)
+
+    def test_a_lost_last_file_falls_back_to_the_highest_tag(self):
+        head = perf.commit('HEAD')
+        with mock.patch.object(perf, 'commit', lambda ref: head):
+            code, out, _ = self.dry_run(tags='perf-control-2\nperf-control-7')
+        self.assertEqual(code, 0, out)
+        self.assertIn('round 8 (perf-control-8)', out)
+        self.assertIn(f'base: {head} (the last checkpoint, perf-control-7 '
+                      '(bench-results/control/last is missing)', out)
+        self.assertNotIn('first checkpoint round', out)
+
+    def test_a_commit_off_main_is_refused(self):
+        code, out, err = self.dry_run(main=False)
+        self.assertEqual(code, 2)
+        self.assertIn('is not on main', err)
+        code, out, _ = self.dry_run('--off-main', main=False)
+        self.assertEqual(code, 0, out)
+        self.assertIn('off main: the report stays in', out)
+
+
+class CheckRunTest(FakeMachine):
+    """cmd_check on fake binaries: what moves the base, what tags, what it exits with."""
+
+    MATRIX = [Case('rtx', 'surface', 16, 0), Case('780m', 'forest', 16, 144),
+              Case('rtx', 'cave-path', 16, 0)]
+
+    def setUp(self):
+        super().setUp()
+        self.tags = []
+        self.report = os.path.join(self.dir, 'control.md')
+        real_git = perf.git
+
+        def git(*a, **kw):
+            if a[:2] == ('tag', '--list'):
+                return '\n'.join(self.tags)
+            if a[0] == 'tag':
+                self.tags.append(a[1])
+                return ''
+            return real_git(*a, **kw)
+        self.binaries = {}
+        for patch in (mock.patch.object(perf, 'root', return_value=self.dir),
+                      mock.patch.object(perf, 'MATRIX', self.MATRIX),
+                      mock.patch.object(perf, 'git', git),
+                      mock.patch.object(perf, 'commit', lambda ref: ref),
+                      mock.patch.object(perf, 'subject', lambda sha: sha),
+                      mock.patch.object(perf, 'on_main', return_value=True),
+                      mock.patch.object(perf, 'report_path', lambda date: self.report),
+                      mock.patch.object(perf, 'commit_binary',
+                                        lambda sha, name='': self.binaries[sha])):
+            patch.start()
+            self.addCleanup(patch.stop)
+        os.makedirs(perf.bench('control'))
+        self.write_last('old')
+
+    def write_last(self, sha):
+        with open(perf.bench('control', 'last'), 'w') as f:
+            json.dump({'number': 1, 'tag': 'perf-control-1', 'sha': sha}, f)
+        self.tags = ['perf-control-1']
+
+    def last(self):
+        with open(perf.bench('control', 'last')) as f:
+            return json.load(f)['sha']
+
+    def check(self, old=None, new=None, *args):
+        self.binaries['old'] = self.binary('old', **(old or {}))
+        self.binaries['new'] = self.binary('new', **(new or {}))
+        a = perf.parser().parse_args(['check', '--ref', 'new', '--rounds', '2', '--duration',
+                                      '3', *args])
+        a.extra = []
+        code = perf.cmd_check(a)
+        with open(self.report) as f:
+            return code, f.read()
+
+    def test_a_complete_round_moves_the_base_and_tags(self):
+        code, text = self.check()
+        self.assertEqual(code, 0, self.output())
+        self.assertEqual(self.last(), 'new')
+        self.assertEqual(self.tags, ['perf-control-1', 'perf-control-2'])
+        self.assertIn('**Resultado:** sin empeoramientos claros.', text)
+
+    def test_no_gpu_leaves_the_round_incomplete(self):
+        """The RTX missing fails its cases on both sides: not a checkpoint, and not the binary."""
+        code, text = self.check({'fail': 'nvidia'}, {'fail': 'nvidia'})
+        self.assertEqual(code, 2, self.output())
+        self.assertEqual(self.last(), 'old', 'the base stays')
+        self.assertEqual(self.tags, ['perf-control-1'], 'no tag')
+        self.assertIn('**Ronda incompleta:** faltan corridas de rtx/surface/r16/uncapped, '
+                      'rtx/cave-path/r16/uncapped', text)
+        self.assertNotIn('El binario nuevo falló', text)
+        self.assertIn('INCOMPLETE round', self.output())
+
+    def test_accept_partial(self):
+        code, text = self.check({'fail': 'nvidia'}, {'fail': 'nvidia'}, '--accept-partial')
+        self.assertEqual(code, 2)
+        self.assertEqual(self.last(), 'new')
+        self.assertIn('perf-control-2', self.tags)
+        self.assertIn('Se aceptó igual', text)
+
+    def test_the_new_binary_failing_where_the_old_one_ran(self):
+        code, text = self.check(None, {'fail': 'nvidia'})
+        self.assertEqual(code, 1)
+        self.assertEqual(self.last(), 'old')
+        self.assertIn('**El binario nuevo falló:** rtx/surface/r16/uncapped (exit code 2', text)
+
+    def test_noisy_runs_stay_out_of_the_means(self):
+        throttled = summary(fps=30, timeline_fps=[30, 30, 30])
+        code, text = self.check(None, {'data': throttled})
+        self.assertEqual(code, 2, self.output())
+        self.assertEqual(self.last(), 'old')
+        self.assertIn('| superficie, vuelo a 64, sin tope | sin datos | sin datos |', text)
+        self.assertIn('no cuenta: new, ronda 1: seconds under 100 fps', text)
+        self.assertNotIn(' -> 30', text)
+
+    def test_a_scenario_the_new_binary_lost(self):
+        code, text = self.check(None, {'help_text': OLD_HELP})
+        self.assertEqual(code, 1)
+        self.assertIn('rtx/cave-path/r16/uncapped (el binario nuevo ya no tiene el escenario)',
+                      text)
+        self.assertNotIn('solo ahora', text)
+        self.assertEqual(self.last(), 'old')
+
+    def test_a_scenario_only_the_new_binary_has(self):
+        code, text = self.check({'help_text': OLD_HELP}, None)
+        self.assertEqual(code, 0, self.output())
+        self.assertIn('rtx/cave-path/r16/uncapped solo ahora (el binario de antes no tiene el '
+                      'escenario)', text)
+
+    def test_a_round_off_main_moves_nothing(self):
+        with mock.patch.object(perf, 'on_main', return_value=False):
+            a = perf.parser().parse_args(['check', '--ref', 'new', '--rounds', '1',
+                                          '--duration', '3', '--off-main'])
+            a.extra = []
+            self.binaries['old'] = self.binary('old')
+            self.binaries['new'] = self.binary('new')
+            code = perf.cmd_check(a)
+        self.assertEqual(code, 0, self.output())
+        self.assertEqual(self.last(), 'old')
+        self.assertEqual(self.tags, ['perf-control-1'])
+        self.assertFalse(os.path.exists(self.report), 'no report in docs/rendimiento')
+
+    def test_a_worse_round_says_so(self):
+        code, text = self.check(None, {'data': summary(catch_up=40.0)})
+        self.assertEqual(code, 1)
+        self.assertIn('--metric catch_up', text)
+        self.assertEqual(self.last(), 'new', 'a complete round is the next base')
 
 
 class BisectTest(unittest.TestCase):
@@ -457,6 +1022,72 @@ class BisectTest(unittest.TestCase):
                 self.assertNotIn(count - 1, calls, 'the last one is known to be bad')
 
 
+class BisectRunTest(FakeMachine):
+    """cmd_bisect on fake binaries: commit c0 is GOOD, c1..c4 the merges after it."""
+
+    def setUp(self):
+        super().setUp()
+        self.binaries = {}
+        real_git = perf.git
+
+        def git(*a, **kw):
+            if a[0] == 'rev-list':
+                return 'c1\nc2\nc3\nc4'
+            return real_git(*a, **kw)
+        for patch in (mock.patch.object(perf, 'root', return_value=self.dir),
+                      mock.patch.object(perf, 'git', git),
+                      mock.patch.object(perf, 'commit', lambda ref: ref),
+                      mock.patch.object(perf, 'subject', lambda sha: sha),
+                      mock.patch.object(perf, 'commit_binary',
+                                        lambda sha, name='': self.binaries[sha])):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def bisect(self, *args, **per_commit):
+        for sha in ('c0', 'c1', 'c2', 'c3', 'c4'):
+            self.binaries[sha] = self.binary(sha, **per_commit.get(sha, {}))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = perf.main(['bisect', 'surface', 'c0', 'c4', '--duration', '3', *args])
+        return code, self.output() + err.getvalue()
+
+    def test_no_gpu_is_not_a_bad_commit(self):
+        everyone = {sha: {'fail': True} for sha in ('c0', 'c1', 'c2', 'c3', 'c4')}
+        code, out = self.bisect(**everyone)
+        self.assertEqual(code, 2, out)
+        self.assertNotIn('first bad commit', out)
+        self.assertIn('could not measure c4', out)
+
+    def test_a_busy_machine_is_not_a_bad_commit(self):
+        with mock.patch.object(machine, 'wait_quiet', return_value=False):
+            code, out = self.bisect()
+        self.assertEqual(code, 2, out)
+        self.assertNotIn('first bad commit', out)
+
+    def test_a_gross_regression(self):
+        slow = {'data': summary(fps=500)}
+        code, out = self.bisect(c3=slow, c4=slow)
+        self.assertEqual(code, 1, out)
+        self.assertIn('first bad commit: c3', out)
+
+    def test_a_crash_is_a_bad_commit(self):
+        code, out = self.bisect(c2={'fail': True}, c3={'fail': True}, c4={'fail': True})
+        self.assertEqual(code, 1, out)
+        self.assertIn('first bad commit: c2', out)
+
+    def test_the_checkpoint_rule_of_a_metric(self):
+        """A catch-up regression the smoke check cannot see."""
+        late = {'data': summary(catch_up=30.0)}
+        code, out = self.bisect(c2=late, c3=late, c4=late)
+        self.assertEqual(code, 2, out)
+        self.assertIn('nothing to look for (--metric M', out)
+        self.said.clear()
+        code, out = self.bisect('--metric', 'catch_up', '--rounds', '2', c2=late, c3=late, c4=late)
+        self.assertEqual(code, 1, out)
+        self.assertIn('first bad commit: c2', out)
+        self.assertIn('catch_up: 20 -> 30 WORSE', out)
+
+
 class RecipesTest(unittest.TestCase):
     def test_justfile_has_the_recipes(self):
         path = os.path.join(perf.TREE, 'justfile')
@@ -469,7 +1100,7 @@ class RecipesTest(unittest.TestCase):
     def test_docs_have_no_long_dashes(self):
         for name in ('machine.py', 'runs.py', 'perf.py'):
             with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), name)) as f:
-                self.assertNotIn('\u2014', f.read(), name)
+                self.assertNotIn('—', f.read(), name)
 
 
 if __name__ == '__main__':

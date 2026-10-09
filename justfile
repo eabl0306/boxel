@@ -153,21 +153,22 @@ bench-all *args: (_stress "static" args) (_stress "fly" "--speed 32" args) (_str
 bench-report *args:
     python3 tools/bench_report.py {{ args }}
 
-# How to measure (docs/benchmarks.md): per task only perf-smoke; perf-check is the checkpoint
-# round the owner or Claude decide on. Runs wait for a quiet machine and redo the ones that
-# overlapped a build or another benchmark. See `python3 tools/perf/perf.py --help`.
+# How to measure (docs/benchmarks.md): per task only perf-smoke, of the cases the task touches;
+# perf-check is the checkpoint round, run on main by whoever integrates. Runs wait for a quiet
+# machine and redo the ones that overlapped a build or another benchmark. They build through
+# tools/quiet.sh, so never wrap them in it. See `python3 tools/perf/perf.py --help`.
 [group('bench')]
-[doc('Per task: one 10 s run per side, base vs this tree: just perf-smoke [--base REF|BIN] [CASE...]')]
+[doc('Per task: one 10 s run per side, base vs this tree: just perf-smoke [CASE...] [-- STRESS OPTIONS]')]
 perf-smoke *args:
     python3 tools/perf/perf.py smoke {{ args }}
 
 [group('bench')]
-[doc('Checkpoint round (over an hour): the fixed matrix against the last one. --dry-run: plan')]
+[doc('Checkpoint round on main (over an hour): the fixed matrix against the last one. --dry-run: plan')]
 perf-check *args:
     python3 tools/perf/perf.py check {{ args }}
 
 [group('bench')]
-[doc('First bad merge of a case with the smoke check: just perf-bisect rtx/surface/r16/144 GOOD BAD')]
+[doc('First bad merge of a case: just perf-bisect rtx/surface/r16/144 GOOD BAD [--metric M]')]
 perf-bisect case good bad *args:
     python3 tools/perf/perf.py bisect {{ case }} {{ good }} {{ bad }} {{ args }}
 

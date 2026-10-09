@@ -4,7 +4,9 @@ A case is a GPU, a scenario, a radius and an fps cap, written `rtx/surface/r16/u
 (`gpu/scenario/rN/cap`; any order, missing parts take the defaults, so `surface` or
 `780m/forest/144` work too). `measure` runs a case on a quiet machine and redoes the runs that do
 not count: they overlapped a build or another benchmark, the rest of the machine was busy, or the
-compositor throttled the window to 30 fps (a second under 100 fps or under 50 frames shown).
+compositor throttled the window to 30 fps (a second under 100 fps or under 50 frames shown, or
+under 70 % of a lower cap). A run that still does not count after the last attempt is kept as
+`noisy` and its numbers never feed a verdict.
 """
 import csv
 import dataclasses
@@ -59,9 +61,14 @@ SCENARIOS = {
 # Over this radius the overworld needs a bigger renderer arena and chunk table.
 BIG_RADIUS = 16
 BIG_ARENA = ['--arena-quads', '50331648', '--chunk-slots', '98304']
-# A second under this fps (or with fewer frames shown) is the compositor's 30 fps throttle.
+# A second under this fps (or with fewer frames shown) is the compositor's 30 fps throttle. With a
+# lower cap the limits are this share of the cap, and caps under MIN_CAP would hide the throttle.
 THROTTLE_FPS = 100
 THROTTLE_SHOWN = 50
+THROTTLE_CAP_SHARE = 0.7
+MIN_CAP = 50
+# Flags the harness sets itself: extra stress options must not repeat them.
+HARNESS_FLAGS = ('--label', '--csv', '--summary')
 # Tries of a run before keeping one that does not count (marked noisy).
 ATTEMPTS = 4
 
@@ -72,14 +79,17 @@ class Case:
     scenario: str = 'surface'
     radius: int = 16
     cap: int = 0
+    # Extra stress options, the same on both sides (`just perf-smoke forest -- --bodies 10000`).
+    extra: tuple = ()
 
     def __str__(self):
         cap = str(self.cap) if self.cap else 'uncapped'
-        return f'{self.gpu}/{self.scenario}/r{self.radius}/{cap}'
+        name = f'{self.gpu}/{self.scenario}/r{self.radius}/{cap}'
+        return ' '.join((name, *self.extra))
 
     @property
     def slug(self):
-        return str(self).replace('/', '-')
+        return re.sub(r'[^A-Za-z0-9.]+', '-', str(self)).strip('-')
 
     @property
     def label(self):
@@ -87,7 +97,8 @@ class Case:
         text = SCENARIOS[self.scenario].label
         if self.radius != 16:
             text += f', radio {self.radius}'
-        return text + (f', tope {self.cap}' if self.cap else ', sin tope')
+        text += f', tope {self.cap}' if self.cap else ', sin tope'
+        return text + (f", {' '.join(self.extra)}" if self.extra else '')
 
     def args(self, duration):
         s = SCENARIOS[self.scenario]
@@ -97,7 +108,7 @@ class Case:
                 '--timeout', str(int(duration) + (240 if big else 150))]
         if big and '--world' in s.args:
             args += BIG_ARENA
-        return args
+        return args + list(self.extra)
 
 
 def parse_case(text, default=Case()):
@@ -119,7 +130,17 @@ def parse_case(text, default=Case()):
                              f'({", ".join(SCENARIOS)}), a radius (r16) or a cap (144, uncapped)')
     if not 1 <= fields['radius'] <= 64:
         raise ValueError(f'{text!r}: the radius goes from 1 to 64')
-    return Case(**fields)
+    if fields['cap'] and fields['cap'] < MIN_CAP:
+        raise ValueError(f'{text!r}: caps under {MIN_CAP} hide the compositor\'s 30 fps throttle '
+                         '(use 0 or uncapped, 144, ...)')
+    case = Case(**fields)
+    plain = dataclasses.replace(case, extra=())
+    own = {a for a in plain.args(1) if a.startswith('--')} | set(HARNESS_FLAGS)
+    taken = sorted({a for a in case.extra if a in own})
+    if taken:
+        raise ValueError(f"{text!r}: the case already sets {', '.join(taken)}; say it with the "
+                         'case (gpu/scenario/rN/cap) or leave it out')
+    return case
 
 
 _help = {}
@@ -171,6 +192,7 @@ class NvidiaSampler:
     def __init__(self):
         self.samples = []
         self._proc = None
+        self._thread = None
 
     def start(self):
         if not shutil.which('nvidia-smi'):
@@ -178,7 +200,8 @@ class NvidiaSampler:
         self._proc = subprocess.Popen(
             ['nvidia-smi', '--query-gpu=' + ','.join(NV_FIELDS), '--format=csv,noheader,nounits',
              '-lms', '500'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        threading.Thread(target=self._read, daemon=True).start()
+        self._thread = threading.Thread(target=self._read, daemon=True)
+        self._thread.start()
         return self
 
     def _read(self):
@@ -191,6 +214,8 @@ class NvidiaSampler:
         if self._proc:
             self._proc.terminate()
             self._proc.wait()
+            self._thread.join(timeout=2)
+            self._proc.stdout.close()
         return self.samples
 
 
@@ -211,35 +236,51 @@ def skipped_refreshes(times_ms, refresh_hz=None):
     return sum(max(0, round(g / period) - 1) for g in gaps) if period > 0 else None
 
 
+def throttle_limits(cap):
+    """(fps, frames shown) under which a second is the compositor's 30 fps throttle: 100 and 50
+    uncapped, and at most 70 % of the cap with one."""
+    if not cap:
+        return THROTTLE_FPS, THROTTLE_SHOWN
+    share = THROTTLE_CAP_SHARE * cap
+    return min(THROTTLE_FPS, share), min(THROTTLE_SHOWN, share)
+
+
 def throttled(summary, times_ms):
     """Why the run looks throttled by the compositor (30 fps), or None."""
-    slow = [s['second'] for s in summary.get('timeline') or [] if s.get('fps', 1e9) < THROTTLE_FPS]
+    fps, shown_min = throttle_limits((summary.get('run') or {}).get('fps_limit'))
+    slow = [s['second'] for s in summary.get('timeline') or [] if s.get('fps', 1e9) < fps]
     if slow:
-        return f'seconds under {THROTTLE_FPS} fps ({", ".join(map(str, slow[:5]))})'
+        return f'seconds under {fmt_limit(fps)} fps ({", ".join(map(str, slow[:5]))})'
     if times_ms:
         seconds = int(times_ms[-1] // 1000)
         shown = [0] * (seconds + 1)
         for t in times_ms:
             shown[int(t // 1000)] += 1
-        few = [str(i) for i, n in enumerate(shown[:seconds]) if n < THROTTLE_SHOWN]
+        few = [str(i) for i, n in enumerate(shown[:seconds]) if n < shown_min]
         if few:
-            return f'seconds with under {THROTTLE_SHOWN} frames shown ({", ".join(few[:5])})'
+            return (f'seconds with under {fmt_limit(shown_min)} frames shown '
+                    f'({", ".join(few[:5])})')
     return None
 
 
+def fmt_limit(value):
+    return f'{value:g}' if value == int(value) else f'{value:.1f}'
+
+
 def metrics(summary, times_ms, nv=None):
-    """The numbers the verdicts and the reports use. `slow` counts the frames over 6.94 ms
-    uncapped and over 7.5 ms capped: with a cap the compositor's callbacks come every 6.95 ms,
-    so half the frames pass 6.94 ms by a hair (docs/rendimiento/ritmo-2026-10.md)."""
+    """The numbers the verdicts and the reports use. `slow` counts the frames over 6.94 ms (the
+    smoke rule, capped or not) and `slow75` those over 7.5 ms (the checkpoint's slow frames with
+    a cap: there the compositor's callbacks come every 6.95 ms, so half the frames pass 6.94 ms
+    by a hair, docs/rendimiento/ritmo-2026-10.md)."""
     get = bench_report.get
     run = summary.get('run') or {}
-    capped = bool(run.get('fps_limit'))
     final = get(summary, ('world', 'final')) or {}
     return {
         'fps': get(summary, ('frames', 'avg_fps')),
         'p50': get(summary, ('frames', 'p50_ms')),
         'p99': get(summary, ('frames', 'p99_ms')),
-        'slow': get(summary, ('frames', 'over_7_5ms' if capped else 'over_144hz')),
+        'slow': get(summary, ('frames', 'over_144hz')),
+        'slow75': get(summary, ('frames', 'over_7_5ms')),
         'skipped': skipped_refreshes(times_ms, run.get('refresh_hz')),
         'catch_up': get(summary, ('world', 'border_catch_up', 'avg_ms')),
         'pstates': nv,
@@ -254,8 +295,10 @@ def metrics(summary, times_ms, nv=None):
 
 @dataclasses.dataclass
 class Run:
-    """A finished run. `error` when the binary failed; `noisy` when every attempt was thrown away
-    and this is the last one."""
+    """A finished run. `error`: the binary failed (it exited non-zero or wrote no summary).
+    `noisy`: the run does not count, and why: every attempt overlapped something or was throttled
+    (the last one's numbers stay in `metrics` for the record only), or the machine never got
+    quiet (`gave_up`). `discarded`: why the attempts before the last were thrown away."""
     case: Case
     prefix: str
     rc: int = 0
@@ -263,8 +306,19 @@ class Run:
     error: str = None
     detail: str = ''
     noisy: str = None
+    gave_up: bool = False
     seconds: float = 0.0
     discarded: list = dataclasses.field(default_factory=list)
+
+    @property
+    def counts(self):
+        """Its numbers can feed a verdict."""
+        return self.metrics is not None and not self.error and not self.noisy
+
+    @property
+    def ran(self):
+        """The binary ran to the end, even if the run does not count: the machine can run it."""
+        return self.metrics is not None and not self.error
 
 
 def run_once(binary, case, prefix, label, duration, nvidia=False):
@@ -318,14 +372,19 @@ def _discard(prefix, attempt):
 
 def measure(binary, case, prefix, label, duration, nvidia=False, attempts=None, say=print):
     """A run of `case` that counts: on a quiet machine, redone up to `attempts` times when it
-    overlapped something or was throttled."""
+    overlapped something or was throttled. The waits for a quiet machine share one deadline
+    (PERF_MAX_WAIT)."""
     attempts = attempts or ATTEMPTS
     run = Run(case, prefix)
+    max_wait = machine.default_wait_s()
+    deadline = time.monotonic() + max_wait
     for attempt in range(1, attempts + 1):
+        run.metrics = run.noisy = None
         start = time.monotonic()
         with machine.run_lock(say):
-            if not machine.wait_quiet(say=say):
-                run.error = 'the machine never got quiet (PERF_MAX_WAIT)'
+            if not machine.wait_quiet(max(0.0, deadline - start), say=say):
+                run.noisy = f'the machine never got quiet in {max_wait:g} s (PERF_MAX_WAIT)'
+                run.gave_up = True
                 return run
             rc, watch, measure_at, samples = run_once(binary, case, prefix, label, duration,
                                                       nvidia)
@@ -351,10 +410,12 @@ def measure(binary, case, prefix, label, duration, nvidia=False, attempts=None, 
             run.noisy = None
             return run
         run.noisy = reason
-        run.discarded.append(reason)
+        # Its files go too, so the folder (and bench-report on it) only holds runs that count.
+        _discard(prefix, attempt)
         if attempt < attempts:
+            run.discarded.append(reason)
             say(f'    thrown away ({reason}), redoing')
-            _discard(prefix, attempt)
+    say(f'    still noisy after {attempts} attempts ({run.noisy}): this run does not count')
     return run
 
 

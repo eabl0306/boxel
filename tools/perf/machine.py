@@ -166,12 +166,17 @@ def overlap(watch):
     return None
 
 
+def default_wait_s():
+    """How long a run may wait for a quiet machine: PERF_MAX_WAIT seconds, default 1800."""
+    return float(os.environ.get('PERF_MAX_WAIT', '1800'))
+
+
 def wait_quiet(max_wait_s=None, say=None):
     """Waits until no heavy process runs and tools/wait-idle.sh passes, then checks once more
     after a random 1 to 3 s (another harness may have passed its own check meanwhile). True when
     quiet, False after `max_wait_s` (default PERF_MAX_WAIT, 1800 s)."""
     if max_wait_s is None:
-        max_wait_s = float(os.environ.get('PERF_MAX_WAIT', '1800'))
+        max_wait_s = default_wait_s()
     say = say or (lambda text: print(text, file=sys.stderr, flush=True))
     start = time.monotonic()
     told = -60.0
