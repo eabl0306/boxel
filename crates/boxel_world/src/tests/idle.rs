@@ -408,7 +408,13 @@ fn count_loads(mut reader: MessageReader<ChunkDataEvent>, mut loads: ResMut<Load
 #[test]
 fn data_events_from_idle_reach_the_next_frame() {
     let run = |idle: bool| {
-        let (mut app, hold) = held_world(WorldSettings::default());
+        // The whole interest and every job start in the first frame, even on a busy machine:
+        // both runs then collect the same generations.
+        let (mut app, hold) = held_world(WorldSettings {
+            interest_budget: Duration::from_secs(1),
+            job_budget: Duration::from_secs(1),
+            ..WorldSettings::default()
+        });
         app.init_resource::<Loads>()
             .add_systems(PreUpdate, count_loads);
         // The generations started in the first frame finish; with idle steps they are
