@@ -18,19 +18,54 @@ use crate::chunk_table::ChunkTable;
 use crate::renderer::ViewParams;
 use crate::{DEPTH_FORMAT, MAIN_COLOR_FORMAT};
 use boxel_gfx::Tier;
-use boxel_math::{Aabb, IVec3, Vec3};
-use boxel_mesh::{CUTOUT_BUCKET, MAX_QUADS_PER_BUCKET, TRANSLUCENT_BUCKET};
+use boxel_math::{Aabb, I64Vec3, IVec3, Vec3};
+use boxel_mesh::{CUTOUT_BUCKET, ChunkMesh, MAX_QUADS_PER_BUCKET, TRANSLUCENT_BUCKET};
 use boxel_shaders::gpu::{VIEW_BUFFER_SIZE, bindings};
 use boxel_shaders::{ShaderModuleId, create_module};
+use boxel_voxel::{CHUNK_SHIFT, ChunkPos};
+use boxel_world::VisibleSet;
 
 /// Edge of a render chunk in voxels (`CHUNK_SIZE` in `common.wgsl`).
 pub(crate) const CHUNK_EDGE: f32 = 32.0;
 
+/// The cave culling result per chunk slot (ADR 0022): bit `slot & 31` of word `slot >> 5` set
+/// when the slot may be seen. Slots past the words are visible.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SlotVisibility<'a> {
+    /// The bits.
+    pub bits: &'a [u32],
+    /// They changed since the previous frame (High uploads them again).
+    pub changed: bool,
+}
+
+impl SlotVisibility<'_> {
+    /// True if `slot` may be seen.
+    #[inline]
+    pub fn visible(&self, slot: u32) -> bool {
+        self.bits
+            .get(slot as usize >> 5)
+            .is_none_or(|w| w >> (slot & 31) & 1 != 0)
+    }
+}
+
+/// True if `slot` may be seen (always without cave culling).
+#[inline]
+pub(crate) fn slot_visible(visibility: Option<SlotVisibility<'_>>, slot: u32) -> bool {
+    visibility.is_none_or(|v| v.visible(slot))
+}
+
 /// What a tier does each frame.
 pub(crate) trait TierPath {
     /// CPU work before encoding (culling, per-frame uploads). Returns the chunks that passed
-    /// CPU culling (High culls on the GPU and returns 0).
-    fn prepare(&mut self, queue: &wgpu::Queue, chunks: &ChunkTable, view: &ViewParams) -> u32;
+    /// CPU culling (High culls on the GPU and returns 0). With `visibility` (cave culling), a
+    /// slot whose bit is 0 is never drawn.
+    fn prepare(
+        &mut self,
+        queue: &wgpu::Queue,
+        chunks: &ChunkTable,
+        view: &ViewParams,
+        visibility: Option<SlotVisibility<'_>>,
+    ) -> u32;
 
     /// Compute work recorded before the main pass (High: draw count reset + GPU culling).
     fn encode_compute(&self, encoder: &mut wgpu::CommandEncoder, slot_count: u32) {
@@ -237,7 +272,8 @@ pub(crate) struct CullPipeline {
 
 impl CullPipeline {
     /// Builds `cull_chunks` with its layout: view uniform (0), chunk table (1, read-only), draw
-    /// args (2), draw refs (3) and the two draw counts (4).
+    /// args (2), draw refs (3) and the cull state (4: the two draw counts, then the cave culling
+    /// bits).
     pub fn new(device: &wgpu::Device) -> Self {
         let compute = wgpu::ShaderStages::COMPUTE;
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -388,20 +424,26 @@ pub(crate) struct CpuCull {
 
 impl CpuCull {
     /// Culls every chunk inside the GPU window (the live ones of `cull.wgsl`, about `2^30` voxels
-    /// around the camera, see `chunk_table`) with the tests of `cull_chunks`: chunk AABB
-    /// `[origin - render_origin, + 32]` against the frustum (p-vertex test), then the per-face
-    /// bucket test with the camera-relative eye; the cutout bucket only needs the frustum. The
-    /// translucent buckets come from [`translucent_draws`].
+    /// around the camera, see `chunk_table`) with the tests of `cull_chunks`: the cave culling
+    /// bit of the slot when `visibility` is given, chunk AABB `[origin - render_origin, + 32]`
+    /// against the frustum (p-vertex test), then the per-face bucket test with the
+    /// camera-relative eye; the cutout bucket only needs the frustum. The translucent buckets
+    /// come from [`translucent_draws`].
     ///
     /// Chunks outside the window are skipped at any view distance: Mid and Low draw with the
     /// wrapped origins too, whose difference is exact only inside it.
-    pub fn run(&mut self, chunks: &ChunkTable, view: &ViewParams) {
+    pub fn run(
+        &mut self,
+        chunks: &ChunkTable,
+        view: &ViewParams,
+        visibility: Option<SlotVisibility<'_>>,
+    ) {
         self.opaque.clear();
         self.cutout.clear();
         self.visible_chunks = 0;
-        translucent_draws(chunks, view, &mut self.translucent);
+        translucent_draws(chunks, view, visibility, &mut self.translucent);
         for (slot, record) in chunks.iter() {
-            if !chunks.in_window(record.origin) {
+            if !chunks.in_window(record.origin) || !slot_visible(visibility, slot) {
                 continue;
             }
             // In i64 first, then to f32 (exact for every chunk near the camera). Within the world
@@ -439,14 +481,19 @@ impl CpuCull {
 }
 
 /// The visible non-empty translucent buckets, back to front: every tier draws them from this
-/// list, in this order, so blending gives the same pixels on all of them. Same window and
-/// frustum tests as [`CpuCull::run`]; sorted by the squared distance from the eye to the chunk's
-/// center, farthest first, ties by slot. Inside a bucket the quads are drawn in arena order,
-/// which `crate::sort` keeps back to front for the camera (ADR 0018).
-pub(crate) fn translucent_draws(chunks: &ChunkTable, view: &ViewParams, out: &mut Vec<BucketDraw>) {
+/// list, in this order, so blending gives the same pixels on all of them. Same window, cave
+/// culling and frustum tests as [`CpuCull::run`]; sorted by the squared distance from the eye
+/// to the chunk's center, farthest first, ties by slot. Inside a bucket the quads are drawn in
+/// arena order, which `crate::sort` keeps back to front for the camera (ADR 0018).
+pub(crate) fn translucent_draws(
+    chunks: &ChunkTable,
+    view: &ViewParams,
+    visibility: Option<SlotVisibility<'_>>,
+    out: &mut Vec<BucketDraw>,
+) {
     let mut keyed: Vec<(f32, BucketDraw)> = Vec::new();
     for (slot, record) in chunks.iter_translucent() {
-        if !chunks.in_window(record.origin) {
+        if !chunks.in_window(record.origin) || !slot_visible(visibility, slot) {
             continue;
         }
         let min = record.origin.saturating_sub(view.render_origin).as_vec3();
@@ -469,6 +516,69 @@ pub(crate) fn translucent_draws(chunks: &ChunkTable, view: &ViewParams, out: &mu
     keyed.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.slot.cmp(&b.1.slot)));
     out.clear();
     out.extend(keyed.into_iter().map(|(_, d)| d));
+}
+
+/// What every tier draws for a set of chunks, counted on the CPU with the culling rules of Mid
+/// and Low (the same as `cull.wgsl`): chunks in the frustum, then their non-empty face buckets
+/// that pass the per-face test, their cutout and translucent buckets. With `visible` (cave
+/// culling, ADR 0022), a chunk it does not hold as visible draws nothing.
+///
+/// Deterministic, with no GPU: tools count the draws and faces of a camera with and without cave
+/// culling (`examples/headless_world.rs --cull`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CullCounts {
+    /// Chunks in the frustum (and visible).
+    pub chunks: u32,
+    /// Buckets drawn: one draw call each on Mid and Low.
+    pub buckets: u32,
+    /// Quads of those buckets (each one is drawn in full).
+    pub quads: u64,
+}
+
+impl std::ops::Add for CullCounts {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            chunks: self.chunks + other.chunks,
+            buckets: self.buckets + other.buckets,
+            quads: self.quads + other.quads,
+        }
+    }
+}
+
+/// [`CullCounts`] of `chunks` (world voxel origin and mesh) seen from `view`.
+pub fn cull_counts<'a>(
+    view: &ViewParams,
+    chunks: impl IntoIterator<Item = (I64Vec3, &'a ChunkMesh)>,
+    visible: Option<&VisibleSet>,
+) -> CullCounts {
+    let mut out = CullCounts::default();
+    for (origin, mesh) in chunks {
+        if visible.is_some_and(|v| !v.is_visible(ChunkPos::from_i64vec3(origin >> CHUNK_SHIFT))) {
+            continue;
+        }
+        let min = origin.saturating_sub(view.render_origin).as_vec3();
+        let max = min + Vec3::splat(CHUNK_EDGE);
+        if !view.frustum.intersects_aabb(&Aabb::new(min, max)) {
+            continue;
+        }
+        out.chunks += 1;
+        let counts = &mesh.bucket_counts;
+        for (face, &n) in counts[..6].iter().enumerate() {
+            if n > 0 && bucket_visible(face, min, max, view.eye_rel) {
+                out.buckets += 1;
+                out.quads += u64::from(n.min(MAX_QUADS_PER_BUCKET));
+            }
+        }
+        for n in [counts[CUTOUT_BUCKET], counts[TRANSLUCENT_BUCKET]] {
+            if n > 0 {
+                out.buckets += 1;
+                out.quads += u64::from(n.min(MAX_QUADS_PER_BUCKET));
+            }
+        }
+    }
+    out
 }
 
 /// Chunk-level backface test of `cull.wgsl` (`bucket_visible`): a +Y bucket can only be seen
@@ -572,7 +682,7 @@ mod tests {
         let table = table_with(&[I64Vec3::new(0, 0, 0)]);
         let view = camera_view(DVec3::new(16.5, 80.5, 16.5), 0.0, -89f32.to_radians());
         let mut cull = CpuCull::default();
-        cull.run(&table, &view);
+        cull.run(&table, &view, None);
         assert_eq!(cull.visible_chunks, 1);
         assert_eq!(visible_faces(&cull, &table, 0), [0, 2, 3, 4, 5]);
         assert_eq!(cull.cutout.len(), 1);
@@ -593,11 +703,83 @@ mod tests {
         let table = table_with(&[I64Vec3::new(0, 0, 0), I64Vec3::new(0, 0, 320)]);
         let view = camera_view(DVec3::new(16.5, 16.5, 16.5), 0.0, 0.0);
         let mut cull = CpuCull::default();
-        cull.run(&table, &view);
+        cull.run(&table, &view, None);
         assert_eq!(cull.visible_chunks, 1);
         assert_eq!(visible_faces(&cull, &table, 0), [0, 1, 2, 3, 4, 5]);
         assert_eq!(cull.cutout.iter().map(|d| d.slot).collect::<Vec<_>>(), [0]);
         assert!(cull.opaque.iter().all(|d| d.slot == 0));
+    }
+
+    #[test]
+    fn slots_hidden_by_cave_culling_are_never_drawn() {
+        // Both chunks ahead of the camera; cave culling hides slot 1 (bit 1 clear). Slots past
+        // the bits are visible.
+        let table = table_with(&[I64Vec3::new(0, 0, -32), I64Vec3::new(0, 0, -64)]);
+        let view = camera_view(DVec3::new(16.5, 16.5, 16.5), 0.0, 0.0);
+        let mut cull = CpuCull::default();
+        cull.run(&table, &view, None);
+        let slots = |list: &[BucketDraw]| {
+            let mut s: Vec<u32> = list.iter().map(|d| d.slot).collect();
+            s.dedup();
+            s
+        };
+        assert_eq!(slots(&cull.opaque), [0, 1]);
+        assert_eq!(slots(&cull.translucent), [1, 0]);
+        let bits = [0b01u32];
+        let hidden = SlotVisibility {
+            bits: &bits,
+            changed: true,
+        };
+        cull.run(&table, &view, Some(hidden));
+        assert_eq!(cull.visible_chunks, 1);
+        assert_eq!(slots(&cull.opaque), [0]);
+        assert_eq!(slots(&cull.cutout), [0]);
+        assert_eq!(slots(&cull.translucent), [0]);
+        assert!(hidden.visible(0) && !hidden.visible(1) && hidden.visible(32));
+        let none = SlotVisibility {
+            bits: &[],
+            changed: false,
+        };
+        cull.run(&table, &view, Some(none));
+        assert_eq!(slots(&cull.opaque), [0, 1]);
+    }
+
+    #[test]
+    fn cull_counts_match_the_cpu_cull() {
+        // The chunks of `table_with` as meshes: the same bucket counts.
+        let origins = [
+            I64Vec3::new(0, 0, -32),
+            I64Vec3::new(0, 0, -64),
+            I64Vec3::new(0, 0, 320),
+            I64Vec3::new(-32, -32, -96),
+        ];
+        let table = table_with(&origins);
+        let counts = [1, 1, 1, 1, 1, 1, 2, 1];
+        let mesh = ChunkMesh::from_quads(vec![boxel_mesh::PackedQuad::default(); 9], counts);
+        let view = camera_view(DVec3::new(16.5, 16.5, 16.5), 0.3, -0.1);
+        let mut cull = CpuCull::default();
+        cull.run(&table, &view, None);
+        let got = cull_counts(&view, origins.iter().map(|&o| (o, &mesh)), None);
+        let drawn = cull
+            .opaque
+            .iter()
+            .chain(&cull.cutout)
+            .chain(&cull.translucent);
+        assert_eq!(got.chunks, cull.visible_chunks);
+        assert_eq!(got.buckets as usize, drawn.clone().count());
+        assert_eq!(got.quads, drawn.map(|d| u64::from(d.count)).sum::<u64>());
+        // A visible set that hides the second chunk.
+        let search = boxel_world::VisibilityView::new(I64Vec3::new(16, 16, 16), None, 4, 4);
+        let set = boxel_world::visibility::visible_chunks(&search, |p| {
+            if p.z == -1 { 0 } else { boxel_voxel::ALL_LINKS }
+        });
+        assert!(!set.is_visible(ChunkPos::new(0, 0, -2)));
+        let culled = cull_counts(&view, origins.iter().map(|&o| (o, &mesh)), Some(&set));
+        let shown = origins
+            .iter()
+            .filter(|o| set.is_visible(ChunkPos::from_i64vec3(**o >> CHUNK_SHIFT)));
+        assert_eq!(culled, cull_counts(&view, shown.map(|&o| (o, &mesh)), None));
+        assert!(culled.chunks < got.chunks);
     }
 
     #[test]
@@ -606,14 +788,14 @@ mod tests {
         let table = table_with(&[I64Vec3::new(0, 0, -64), I64Vec3::new(0, 0, -1000)]);
         let view = camera_view(DVec3::new(16.5, 16.5, 16.5), 0.0, 0.0);
         let mut cull = CpuCull::default();
-        cull.run(&table, &view);
+        cull.run(&table, &view, None);
         assert_eq!(cull.visible_chunks, 1);
         assert!(cull.opaque.iter().chain(&cull.cutout).all(|d| d.slot == 0));
         // integer subtraction first: the same result far from the world origin
         let far = 1i64 << 24;
         let table = table_with(&[I64Vec3::new(far, 0, far - 64)]);
         let eye = DVec3::new(far as f64 + 16.5, 16.5, far as f64 + 16.5);
-        cull.run(&table, &camera_view(eye, 0.0, 0.0));
+        cull.run(&table, &camera_view(eye, 0.0, 0.0), None);
         assert_eq!(cull.visible_chunks, 1);
         assert_eq!(visible_faces(&cull, &table, 0), [0, 1, 2, 3, 4]);
     }
@@ -639,7 +821,7 @@ mod tests {
             // As the renderer does every frame before culling.
             table.follow(view.render_origin);
             let mut cull = CpuCull::default();
-            cull.run(&table, &view);
+            cull.run(&table, &view, None);
             let buckets = |list: &[BucketDraw]| -> Vec<(u32, u32, u32)> {
                 list.iter()
                     .map(|d| (d.slot, d.quad_start, d.count))
@@ -709,7 +891,7 @@ mod tests {
                 let in_front = (record.origin - view.render_origin).z < 0;
                 assert_eq!(view.frustum.intersects_aabb(&aabb), in_front, "{eye}");
             }
-            cull.run(&table, &view);
+            cull.run(&table, &view, None);
             let mut slots: Vec<u32> = cull.opaque.iter().map(|d| d.slot).collect();
             slots.dedup();
             assert_eq!(slots, visible, "camera at {eye}");

@@ -18,6 +18,22 @@
 //! loaded, and the memory of the gameplay light cache and of the sky tiles. Compare `quads=`
 //! across `--light on|off` and `--ao off|baked|lit-only` for the cost of AO: with `--light off`
 //! every face counts as lit (a worst case for `lit-only`).
+//! With `--cave` (overworld), a `cave: eye=X,Y,Z depth=N clearance=N path=N voxels, N chunk
+//! borders` line comes first: the viewer starts in open space in a cave, the air voxel nearest
+//! to `--camera` (or `--viewer-y`) with air on every side and under the surface, and `path` is
+//! the route `stress --scenario path --cave` follows from there (the same search, the same
+//! answer). Cave culling culls nothing with the eye in rock: measure it from a cave.
+//! With `--cull`, three more lines describe cave culling (ADR 0022) for a camera at the viewer
+//! (`--camera` sets where it is and where it looks; view distance = radius x 32, 16:9):
+//! `cull: eye=X,Y,Z yaw=D pitch=D open=yes|no box=N reached=N fresh_ms=X search_ms=X`, the
+//! visibility search (whether the eye sees from open space: with `no`, inside rock or nearer a
+//! wall than the near plane, the renderer culls nothing; the box around the camera, the chunks it
+//! reached, a search that also fills the grid, and one with the grid already filled, as in a
+//! frame where the camera turned); `draws: off chunks=N
+//! buckets=N quads=N on chunks=N buckets=N quads=N hidden: chunks=P% buckets=P% quads=P%`, what
+//! every tier draws without and with cave culling (`boxel_render::cull_counts`: frustum, per-face
+//! bucket test; a bucket is one draw call on Mid and Low); and, in the overworld, `underground:
+//! off quads=N on quads=N hidden=P%`, the same for the chunks entirely under the surface.
 //! Then, in this order and only when asked for:
 //! - `--idle`: `idle: frames=N median_update_ms=X p99_update_ms=X max_update_ms=X` while the
 //!   viewer stands still.
@@ -35,15 +51,25 @@
 //! filter `warn`).
 #![expect(clippy::print_stdout, clippy::print_stderr, reason = "CLI output")]
 
+#[path = "shared/cave.rs"]
+mod cave;
 #[path = "shared/world.rs"]
 mod world;
 
+use boxel::camera::{Camera, CameraView};
 use boxel::log::LogPlugin;
+use boxel::math::I64Vec3;
+use boxel::mesh::ChunkMesh;
 use boxel::mesh::{AoPolicy, LightQuantization};
 use boxel::prelude::*;
+use boxel::render::{DEFAULT_SKY_COLOR, ViewParams, cull_counts};
 use boxel::voxel::{CHUNK_SIZE, MAX_BLOCK_COORD, MAX_CHUNK_COORD};
 use boxel::world::DataState;
-use boxel::world::{SkyMap, WorldStats, WorldSystems};
+use boxel::world::visibility::{eye_in_open, visible_chunks};
+use boxel::world::{
+    ChunkVisibility, SkyMap, VisibilityView, WorldContent, WorldStats, WorldSystems,
+};
+use boxel::worldgen::OverworldGenerator;
 use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
 use world::{World, WorldChoice};
@@ -56,6 +82,11 @@ usage: headless_world [options]
                        not with the overworld, which has no floor)
   --viewer-y Y         viewer height in voxels (default 80; -1000 is deep in the overworld's
                        caves)
+  --camera X,Y,Z,YAW,PITCH  viewer position and, for --cull, where the camera looks (degrees, as
+                       stress: yaw -90 looks along +x); replaces --viewer-y
+  --cull               report cave culling for the camera once settled (see the docs above)
+  --cave               start the viewer in open space in a cave near --camera (overworld; see
+                       the docs above): what stress --cave measures
   --ao MODE            ambient occlusion baked into the meshes: off, baked (every face) or
                        lit-only (faces with some light; the default)
   --light MODE         on (the default: sky and block light computed and baked) or off (open
@@ -99,6 +130,12 @@ struct Options {
     viewer_y: f64,
     ao: AoPolicy,
     light: bool,
+    /// `--camera`: x, y, z, yaw, pitch (degrees).
+    camera: Option<[f64; 5]>,
+    /// `--cull`.
+    cull: bool,
+    /// `--cave`.
+    cave: bool,
 }
 
 /// `Ok(None)` for `--help`.
@@ -117,6 +154,9 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         viewer_y: VIEWER.y,
         ao: AoPolicy::default(),
         light: true,
+        camera: None,
+        cull: false,
+        cave: false,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -168,6 +208,26 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                     v => return Err(format!("{flag}: {v:?} is not on or off")),
                 };
             }
+            "--cull" => o.cull = true,
+            "--cave" => o.cave = true,
+            "--camera" => {
+                let v = value()?;
+                let parts: Vec<f64> = v
+                    .split(',')
+                    .map(|p| p.trim().parse::<f64>())
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| format!("{flag}: {v:?} is not x,y,z,yaw,pitch"))?;
+                let camera: [f64; 5] = parts
+                    .try_into()
+                    .map_err(|_| format!("{flag}: {v:?} is not x,y,z,yaw,pitch"))?;
+                if camera.iter().any(|c| !c.is_finite())
+                    || camera[..3].iter().any(|c| c.abs() > MAX_BLOCK_COORD as f64)
+                {
+                    return Err(format!("{flag}: {v:?} is outside the world"));
+                }
+                o.viewer_y = camera[1];
+                o.camera = Some(camera);
+            }
             "--viewer-y" => {
                 let v = value()?;
                 o.viewer_y = v
@@ -182,7 +242,31 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         }
     }
     o.world.validate(o.fixed_height)?;
+    if o.cave && o.world.world != World::Overworld {
+        return Err("--cave needs --world overworld (the only world with caves)".to_string());
+    }
     Ok(Some(o))
+}
+
+/// `--cave`: moves the viewer of `o` to the cave found near it (`--camera`'s yaw and pitch stay)
+/// and returns the `cave:` line.
+fn find_cave(o: &mut Options, generator: &dyn WorldGenerator, seed: u64) -> Result<String, String> {
+    let overworld = o
+        .world
+        .overworld(seed)
+        .ok_or("--cave needs --world overworld")?;
+    let [x, y, z, yaw, pitch] = o
+        .camera
+        .unwrap_or([VIEWER.x, o.viewer_y, VIEWER.z, -90.0, 0.0]);
+    let found = cave::find(
+        generator,
+        &BlockRegistry::default_blocks(),
+        |x, z| overworld.height_at(x, z),
+        DVec3::new(x, y, z),
+    )?;
+    o.camera = Some([found.eye.x, found.eye.y, found.eye.z, yaw, pitch]);
+    o.viewer_y = found.eye.y;
+    Ok(format!("cave: {}", found.describe()))
 }
 
 /// `--ao` values.
@@ -303,7 +387,7 @@ fn max(values: &[f64]) -> f64 {
 
 fn main() -> AppExit {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let options = match parse_options(&args) {
+    let mut options = match parse_options(&args) {
         Ok(Some(o)) => o,
         Ok(None) => {
             println!("{}", usage());
@@ -314,7 +398,17 @@ fn main() -> AppExit {
             return AppExit::from_code(1);
         }
     };
-    let generator = options.world.generator(TerrainGenerator::default().seed);
+    let seed = TerrainGenerator::default().seed;
+    let generator = options.world.generator(seed);
+    if options.cave {
+        match find_cave(&mut options, generator.as_ref(), seed) {
+            Ok(line) => println!("{line}"),
+            Err(e) => {
+                eprintln!("headless_world: {e}");
+                return AppExit::from_code(1);
+            }
+        }
+    }
     let settings = WorldSettings {
         vertical_bounds: options.fixed_height.then(|| generator.vertical_chunks()),
         ao_policy: options.ao,
@@ -365,8 +459,13 @@ fn spawn_viewer(mut commands: Commands, run: Res<Run>) {
     } else {
         o.vertical_radius
     };
+    let at = o
+        .camera
+        .map_or(DVec3::new(VIEWER.x, o.viewer_y, VIEWER.z), |c| {
+            DVec3::new(c[0], c[1], c[2])
+        });
     commands.spawn((
-        Transform::from_translation(DVec3::new(VIEWER.x, o.viewer_y, VIEWER.z)),
+        Transform::from_translation(at),
         ChunkViewer::new(o.radius).with_vertical_radius(vertical),
     ));
 }
@@ -410,6 +509,131 @@ fn missing_around(
         }
     }
     missing
+}
+
+/// The `--cull` lines: the visibility search from the camera, and what every tier draws without
+/// and with cave culling (and, in the overworld, for the chunks under the surface).
+fn cull_lines(
+    o: &Options,
+    map: &ChunkMap,
+    registry: &BlockRegistry,
+    transform: &Transform,
+    viewer: ChunkViewer,
+) -> String {
+    let [_, _, _, yaw, pitch] = o.camera.unwrap_or([0.0, 0.0, 0.0, -90.0, 0.0]);
+    let camera = Camera {
+        view_distance: viewer.radius as f32 * 32.0,
+        ..Camera::default()
+    };
+    let look = |yaw: f64| {
+        let t = Transform::from_yaw_pitch(
+            transform.translation,
+            yaw.to_radians() as f32,
+            pitch.to_radians() as f32,
+        );
+        CameraView::compute(&camera, &t, 16.0 / 9.0)
+    };
+    let cv = look(yaw);
+    let view = ViewParams::from_camera(&cv, &camera, DEFAULT_SKY_COLOR, 0.6);
+    let open = eye_in_open(
+        cv.render_origin,
+        cv.eye_rel,
+        camera.near_reach(16.0 / 9.0),
+        |p| map.block_at(p).map(|s| registry.occludes(s)),
+    );
+    let search_view = |cv: &CameraView| {
+        VisibilityView::new(
+            cv.render_origin,
+            Some(cv.frustum),
+            viewer.radius,
+            viewer.vertical_radius,
+        )
+    };
+    let links = |p: ChunkPos| map.visibility_links_at(p);
+    let start = Instant::now();
+    let set = visible_chunks(&search_view(&cv), links);
+    let fresh = start.elapsed();
+    // A frame where the camera turned half a degree: the grid is filled, only the search runs.
+    let mut state = ChunkVisibility::default();
+    state.update(&search_view(&cv), links);
+    let turned = search_view(&look(yaw + 0.5));
+    let start = Instant::now();
+    state.update(&turned, links);
+    let search = start.elapsed();
+    let meshes: Vec<(I64Vec3, &ChunkMesh)> = map
+        .ready_meshes()
+        .map(|(_, key, mesh)| (key.pos.origin().as_i64vec3(), &**mesh))
+        .collect();
+    let off = cull_counts(&view, meshes.iter().copied(), None);
+    let on = cull_counts(&view, meshes.iter().copied(), Some(&set));
+    // The same search without the frustum (every direction; the renderer still culls by it).
+    let all_ways = VisibilityView {
+        frustum: None,
+        ..search_view(&cv)
+    };
+    let start = Instant::now();
+    let free = visible_chunks(&all_ways, links);
+    let free_ms = start.elapsed().as_secs_f64() * 1e3;
+    let free_on = cull_counts(&view, meshes.iter().copied(), Some(&free));
+    let hidden = |a: u64, b: u64| {
+        if a == 0 {
+            0.0
+        } else {
+            100.0 * (a - b) as f64 / a as f64
+        }
+    };
+    let eye = transform.translation;
+    let mut out = format!(
+        "cull: eye={},{},{} yaw={yaw} pitch={pitch} open={} box={} reached={} fresh_ms={:.3} \
+         search_ms={:.3}\ndraws: off chunks={} buckets={} quads={} on chunks={} buckets={} \
+         quads={} hidden: chunks={:.1}% buckets={:.1}% quads={:.1}%",
+        eye.x,
+        eye.y,
+        eye.z,
+        if open { "yes" } else { "no" },
+        set.box_len(),
+        set.visible_count(),
+        fresh.as_secs_f64() * 1e3,
+        search.as_secs_f64() * 1e3,
+        off.chunks,
+        off.buckets,
+        off.quads,
+        on.chunks,
+        on.buckets,
+        on.quads,
+        hidden(off.chunks.into(), on.chunks.into()),
+        hidden(off.buckets.into(), on.buckets.into()),
+        hidden(off.quads, on.quads),
+    );
+    out += &format!(
+        "\nno_frustum: reached={} fresh_ms={free_ms:.3} quads={} hidden={:.1}%",
+        free.visible_count(),
+        free_on.quads,
+        hidden(off.quads, free_on.quads)
+    );
+    if o.world.world == World::Overworld {
+        // Chunks whose top is under the surface of their 4 corner columns and center.
+        let heights = OverworldGenerator::default();
+        let under = |origin: I64Vec3| {
+            let top = origin.y + 32;
+            [(0, 0), (31, 0), (0, 31), (31, 31), (16, 16)]
+                .iter()
+                .all(|&(dx, dz)| heights.height_at(origin.x + dx, origin.z + dz) >= top)
+        };
+        let deep: Vec<(I64Vec3, &ChunkMesh)> =
+            meshes.iter().copied().filter(|(o, _)| under(*o)).collect();
+        let off = cull_counts(&view, deep.iter().copied(), None);
+        let on = cull_counts(&view, deep.iter().copied(), Some(&set));
+        let free_on = cull_counts(&view, deep.iter().copied(), Some(&free));
+        out += &format!(
+            "\nunderground: off quads={} on quads={} hidden={:.1}% no_frustum hidden={:.1}%",
+            off.quads,
+            on.quads,
+            hidden(off.quads, on.quads),
+            hidden(off.quads, free_on.quads)
+        );
+    }
+    out
 }
 
 /// The `world:` line: meshed fraction, quads per non-empty mesh and voxel memory.
@@ -533,6 +757,7 @@ fn drive(
     map: Res<ChunkMap>,
     sky: Res<SkyMap>,
     settings: Res<WorldSettings>,
+    content: Res<WorldContent>,
     frames: Res<FrameStats>,
     viewers: Query<(&Transform, &ChunkViewer)>,
     mut exit: MessageWriter<AppExit>,
@@ -566,6 +791,14 @@ fn drive(
             println!("{}", world_line(&map));
             println!("{}", light_line(&map, settings.ao_policy));
             println!("{}", sky_line(&map, &sky, &stats, settings.light));
+            if run.options.cull
+                && let Some((transform, viewer)) = viewers.iter().next()
+            {
+                println!(
+                    "{}",
+                    cull_lines(&run.options, &map, &content.registry, transform, *viewer)
+                );
+            }
             run.next_phase(Phase::Loading, now, x, &mut exit);
         }
         Phase::Idle { since } if now.duration_since(since) >= run.options.idle => {
@@ -681,6 +914,22 @@ mod tests {
     }
 
     #[test]
+    fn cave_needs_the_overworld() {
+        assert!(parse(&["--cave"]).is_err(), "the terrain has no caves");
+        let o = parse(&[
+            "--world",
+            "overworld",
+            "--cave",
+            "--camera",
+            "16,-1000,16,-90,0",
+        ])
+        .expect("valid")
+        .expect("not help");
+        assert!(o.cave);
+        assert!(usage().contains("--cave"));
+    }
+
+    #[test]
     fn world_and_viewer_height() {
         let o = parse(&[]).expect("valid").expect("not help");
         assert_eq!((o.world.label(), o.viewer_y), ("terrain".to_string(), 80.0));
@@ -695,6 +944,23 @@ mod tests {
             &["--world", "overworld", "--fixed-height"][..],
             &["--viewer-y", "3e18"],
             &["--viewer-y", "x"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn camera_and_cull() {
+        let o = parse(&["--camera", "16,-1000,16,-90,-20", "--cull"])
+            .expect("valid")
+            .expect("not help");
+        assert_eq!(o.camera, Some([16.0, -1000.0, 16.0, -90.0, -20.0]));
+        assert_eq!(o.viewer_y, -1000.0);
+        assert!(o.cull);
+        for args in [
+            &["--camera", "1,2,3"][..],
+            &["--camera", "0,3e18,0,0,0"],
+            &["--camera", "0,0,0,nan,0"],
         ] {
             assert!(parse(args).is_err(), "{args:?} was accepted");
         }

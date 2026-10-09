@@ -5,7 +5,7 @@ use crate::map::DataChange;
 use crate::neighbor_rules::NeighborRules;
 use crate::sky::{SkyMap, SkyRule};
 use crate::streaming::{Ctx, ViewerChunks, WorldJobs};
-use crate::{ChunkId, ChunkMap, WorldStats};
+use crate::{ChunkId, ChunkMap, ChunkVisibility, WorldStats};
 use boxel_app::{App, FrameDeadline, Last, Plugin, Update};
 use boxel_diagnostic::DiagnosticsBoard;
 use boxel_ecs::prelude::*;
@@ -136,6 +136,14 @@ pub struct WorldSettings {
     /// 2 at 60 Hz or less (the frame floor); a batch only waits that long when one of its jobs is
     /// late.
     pub edit_batch_hold: Duration,
+    /// Cave culling (ADR 0022): the renderer skips the chunks its camera cannot see through
+    /// open space (caves from the surface, the surface from deep caves), found by a search over
+    /// the face links of the chunks ([`ChunkVisibility`]). Read every frame. Default on.
+    ///
+    /// Off only stops the search: the jobs still compute every chunk's face links (about 5 % of
+    /// a chunk's work, on the job threads), so turning it on in the middle of a game culls at
+    /// once instead of waiting for every loaded chunk to be generated or meshed again.
+    pub cave_culling: bool,
 }
 
 impl Default for WorldSettings {
@@ -153,6 +161,7 @@ impl Default for WorldSettings {
             sky_walk_limit: DEFAULT_WALK_LIMIT,
             light_cache_radius: 8,
             edit_batch_hold: Self::DEFAULT_EDIT_BATCH_HOLD,
+            cave_culling: true,
         }
     }
 }
@@ -209,6 +218,13 @@ pub enum ChunkMeshEvent {
         key: ChunkKey,
     },
 }
+
+/// Written by a renderer that dropped every chunk mesh and uploaded [`ChunkMap::ready_meshes`]
+/// again (a resync: a new renderer, or uploads it lost). That misses the chunks being remeshed,
+/// whose last mesh was published: at the start of its next `Update`, the world forgets those,
+/// so their next mesh is published even when it is identical to that one.
+#[derive(Message, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChunkMeshResync;
 
 /// A block changed: an edit of [`EditQueue`] applied in `WorldSystems::Edits`. One message per
 /// position and frame, from the state before the frame's edits to the state after them (two
@@ -330,11 +346,14 @@ pub enum WorldSystems {
     Dispatch,
     /// Publish mesh results as `ChunkMeshEvent`s (up to `max_mesh_events_per_frame`).
     Collect,
+    /// Bring [`ChunkVisibility`] up to date with the frame's changes of the chunks' face links
+    /// (cave culling; the renderer searches from its camera later in the frame).
+    Visibility,
 }
 
 /// Adds the world: resources (`ChunkMap`, `SkyMap`, `WorldSettings`, `WorldContent`,
 /// `EditQueue`, [`NeighborRules`] (the built-in ones of the registry), `WorldStats`, internal
-/// job state), the messages `ChunkMeshEvent`,
+/// job state), the messages `ChunkMeshEvent`, [`ChunkMeshResync`],
 /// [`BlockChanged`] and [`ChunkDataEvent`] and the chained systems in
 /// `Update`. A stats system in `Last` refreshes `WorldStats` and publishes a `"world"` line to
 /// `DiagnosticsBoard` if present. `TaskPoolPlugin` is recommended (pool sizes); without it the
@@ -390,8 +409,10 @@ impl Plugin for WorldPlugin {
             .init_resource::<WorldStats>()
             .init_resource::<ViewerChunks>()
             .init_resource::<FrameBudget>()
+            .init_resource::<ChunkVisibility>()
             .insert_resource(jobs)
             .add_message::<ChunkMeshEvent>()
+            .add_message::<ChunkMeshResync>()
             .add_message::<BlockChanged>()
             .add_message::<ChunkDataEvent>()
             .configure_sets(
@@ -401,6 +422,7 @@ impl Plugin for WorldPlugin {
                     WorldSystems::Edits,
                     WorldSystems::Dispatch,
                     WorldSystems::Collect,
+                    WorldSystems::Visibility,
                 )
                     .chain(),
             )
@@ -412,6 +434,7 @@ impl Plugin for WorldPlugin {
                     // frame), and naming them would tie this crate to camera/gameplay crates.
                     (
                         begin_frame_budget,
+                        renderer_resyncs,
                         track_viewers.ambiguous_with_all(),
                         update_interest,
                     )
@@ -422,6 +445,7 @@ impl Plugin for WorldPlugin {
                     (publish_meshes, publish_data_changes)
                         .chain()
                         .in_set(WorldSystems::Collect),
+                    sync_visibility.in_set(WorldSystems::Visibility),
                 ),
             )
             .add_systems(Last, publish_stats);
@@ -461,9 +485,27 @@ fn track_viewers(
 }
 
 /// Starts the frame's world budgets from the runner's [`FrameDeadline`] (see
-/// [`WorldSettings::interest_budget`]).
-fn begin_frame_budget(deadline: Option<Res<FrameDeadline>>, mut budget: ResMut<FrameBudget>) {
-    budget.begin(deadline.as_deref());
+/// [`WorldSettings::interest_budget`]), with room for a cave culling search.
+fn begin_frame_budget(
+    deadline: Option<Res<FrameDeadline>>,
+    mut visibility: ResMut<ChunkVisibility>,
+    mut budget: ResMut<FrameBudget>,
+) {
+    // The frame's accounting changes nothing the visibility's readers see.
+    let culling = visibility.bypass_change_detection().take_frame_cost();
+    budget.begin(deadline.as_deref(), culling);
+}
+
+/// Applies the renderer's resyncs ([`ChunkMeshResync`]) before anything changes a mesh this
+/// frame: the chunks remeshing now are the ones it missed.
+fn renderer_resyncs(
+    mut resyncs: MessageReader<ChunkMeshResync>,
+    mut map: ResMut<ChunkMap>,
+    mut jobs: ResMut<WorldJobs>,
+) {
+    if resyncs.read().count() > 0 {
+        jobs.renderer_resynced(&mut map);
+    }
 }
 
 fn update_interest(
@@ -530,6 +572,16 @@ fn publish_data_changes(mut map: ResMut<ChunkMap>, mut writer: MessageWriter<Chu
         DataChange::Loaded(id, key) => ChunkDataEvent::Loaded { id, key },
         DataChange::Unloaded(id, key) => ChunkDataEvent::Unloaded { id, key },
     }));
+}
+
+/// Applies the frame's changes of the chunks' face links to [`ChunkVisibility`] (always, so the
+/// map's change list never grows; the search itself runs in the renderer).
+fn sync_visibility(mut map: ResMut<ChunkMap>, mut visibility: ResMut<ChunkVisibility>) {
+    // Taking the changes changes nothing the map's readers see.
+    let changes = map.bypass_change_detection().take_face_changes();
+    if !changes.is_empty() {
+        visibility.apply_changes(&changes);
+    }
 }
 
 fn run_jobs(

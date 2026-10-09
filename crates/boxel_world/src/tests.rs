@@ -140,6 +140,13 @@ pub(crate) mod support {
                 job();
             }
         }
+        /// Runs the newest held job.
+        pub(crate) fn run_last(&self) {
+            let job = self.jobs.lock().expect("lock").pop();
+            if let Some(job) = job {
+                job();
+            }
+        }
         pub(crate) fn drop_all(&self) {
             drop(std::mem::take(&mut *self.jobs.lock().expect("lock")));
         }

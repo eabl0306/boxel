@@ -34,7 +34,10 @@ use boxel_mesh::{ChunkMesh, MaterialTable};
 use boxel_transform::Transform;
 use boxel_voxel::BlockRegistry;
 use boxel_window::{DisplayHandle, PrimaryWindow, WindowState};
-use boxel_world::{ChunkMap, ChunkMeshEvent, DaylightCurve, TimeOfDay, WorldContent};
+use boxel_world::{
+    ChunkMap, ChunkMeshEvent, ChunkMeshResync, ChunkViewer, ChunkVisibility, DaylightCurve,
+    TimeOfDay, VisibilityView, VisibleSet, WorldContent, WorldSettings,
+};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -206,6 +209,12 @@ pub struct RenderInfo {
     /// Draw calls recorded last frame (`RenderStats::draws`: Mid/Low one per visible bucket;
     /// High its 2 indirect multi-draws, opaque + cutout).
     pub draws: u32,
+    /// Chunks that passed the CPU cull last frame (`RenderStats::visible_chunks`; Mid/Low).
+    pub visible_chunks: u32,
+    /// Resident chunks cave culling hid last frame (`RenderStats::occluded_chunks`).
+    pub occluded_chunks: u32,
+    /// Time last frame took to update the cave culling bits (`RenderStats::occlusion_time`).
+    pub occlusion_time: Duration,
     /// Translucent buckets re-sorted for the camera and uploaded since the renderer was built
     /// (`RenderStats::translucent_sorts`).
     pub translucent_sorts: u32,
@@ -328,6 +337,7 @@ impl Plugin for RenderPlugin {
             .add_message::<ScreenshotSaved>()
             .add_message::<DebugDestroyDevice>()
             .add_message::<ChunkMeshEvent>()
+            .add_message::<ChunkMeshResync>()
             // `edit_schedule` keeps systems other plugins already added to `Render`.
             .edit_schedule(Render, |schedule| {
                 schedule.set_executor(SingleThreadedExecutor::new());
@@ -358,7 +368,9 @@ impl Plugin for RenderPlugin {
             Render,
             (
                 setup.in_set(RenderSystems::Setup),
-                extract.in_set(RenderSystems::Extract),
+                (extract, extract_visibility)
+                    .chain()
+                    .in_set(RenderSystems::Extract),
                 prepare.in_set(RenderSystems::Prepare),
                 draw.in_set(RenderSystems::Draw),
                 cleanup.in_set(RenderSystems::Cleanup),
@@ -593,6 +605,8 @@ struct ExtractedFrame {
     screenshots: Vec<PathBuf>,
     /// Copy of `OverlayDraw::rects`.
     overlay: Vec<OverlayRect>,
+    /// The chunks the camera may see this frame (cave culling), `None` when off.
+    visibility: Option<Arc<VisibleSet>>,
     destroy_device: bool,
     /// `Prepare` output.
     view: Option<ViewParams>,
@@ -1246,6 +1260,7 @@ fn extract(
     clock: Option<(Res<TimeOfDay>, Res<DaylightCurve>)>,
     chunks: Option<Res<ChunkMap>>,
     mut mesh_events: MessageReader<ChunkMeshEvent>,
+    mut resyncs: MessageWriter<ChunkMeshResync>,
     mut screenshots: MessageReader<RequestScreenshot>,
     mut destroy: MessageReader<DebugDestroyDevice>,
     overlay: Res<OverlayDraw>,
@@ -1278,8 +1293,10 @@ fn extract(
     frame.resync = ready.is_some_and(|r| r.resync);
     frame.meshes.clear();
     if frame.resync {
-        // Everything currently published replaces whatever the events would say.
+        // Everything currently published replaces whatever the events would say. The chunks
+        // being remeshed are missing: the world sends their next mesh even if identical.
         mesh_events.clear();
+        resyncs.write(ChunkMeshResync);
         if let Some(map) = chunks.as_deref() {
             frame
                 .meshes
@@ -1295,6 +1312,118 @@ fn extract(
         // No renderer: the next selection resyncs from `ChunkMap`.
         mesh_events.clear();
     }
+}
+
+/// `RenderSystems::Extract`, after [`extract`]: the cave culling search for this frame's camera
+/// (ADR 0022), when the world has it on ([`WorldSettings::cave_culling`]). It runs here, with
+/// the exact camera and aspect `Prepare` renders with, so a chunk that just became visible is
+/// never drawn late. The searched box is the mesh region of the camera's own [`ChunkViewer`],
+/// or of the largest viewer; without viewers nothing is culled. The set is
+/// [`frame_visibility`]'s.
+///
+/// First, whatever the setting, the world learns which chunks the renderer refused or shows
+/// again since the last frame ([`VoxelRenderer::take_refused`]): the search sees through them.
+fn extract_visibility(
+    mut gpu: ResMut<GpuState>,
+    mut frame: ResMut<ExtractedFrame>,
+    settings: Option<Res<WorldSettings>>,
+    content: Option<Res<WorldContent>>,
+    chunks: Option<Res<ChunkMap>>,
+    visibility: Option<ResMut<ChunkVisibility>>,
+    cameras: Query<(&Camera, Option<&ChunkViewer>)>,
+    viewers: Query<&ChunkViewer>,
+) {
+    frame.visibility = None;
+    let (Some(settings), Some(content), Some(map), Some(mut visibility)) =
+        (settings, content, chunks, visibility)
+    else {
+        return;
+    };
+    if let GpuStage::Ready(ready) = &mut gpu.stage {
+        ready.renderer.take_refused(|pos, refused| {
+            visibility.set_unshown(pos, refused, map.visibility_links_at(pos));
+        });
+        if frame.resync {
+            // `prepare` drops every chunk first (a new renderer may not know the old refusals).
+            visibility.clear_unshown(|pos| map.visibility_links_at(pos));
+        }
+    }
+    if !settings.cave_culling {
+        return;
+    }
+    let (Some(ready), Some((camera, transform))) = (gpu.ready(), frame.camera) else {
+        return;
+    };
+    let own = cameras
+        .iter()
+        .find(|(camera, _)| camera.active)
+        .and_then(|(_, viewer)| viewer.copied());
+    let Some(viewer) = own.or_else(|| {
+        viewers.iter().copied().reduce(|a, b| ChunkViewer {
+            radius: a.radius.max(b.radius),
+            vertical_radius: a.vertical_radius.max(b.vertical_radius),
+        })
+    }) else {
+        return;
+    };
+    // The aspect `prepare` uses: the same view, so the same frustum.
+    let aspect = ready.config.width.max(1) as f32 / ready.config.height.max(1) as f32;
+    frame.visibility = frame_visibility(
+        frame.resync,
+        &content.registry,
+        &map,
+        &mut visibility,
+        &camera,
+        &transform,
+        viewer,
+        aspect,
+    );
+}
+
+/// The cave culling set (ADR 0022) of a frame with cave culling on, as the render plugin
+/// computes it: what [`ChunkVisibility::update`] gives for the camera's view at `aspect`, over
+/// `viewer`'s mesh region. `None`, culling nothing, on a renderer resync frame (`resync`), and
+/// while a voxel within the near plane's reach of the eye occludes or is not loaded
+/// ([`ChunkVisibility::eye_in_open`]): the renderer then shows what lies behind the rock.
+///
+/// A resync frame uploads only the settled meshes ([`ChunkMap::ready_meshes`]): a chunk being
+/// remeshed draws nothing, although the map still says the renderer shows it (a remesh for
+/// light alone keeps it shown) and trusts its links. The world hears of the resync only next
+/// frame ([`ChunkMeshResync`]), when it stops showing those chunks.
+///
+/// Public for the GPU tests, which cull with it exactly as the plugin does.
+#[doc(hidden)]
+pub fn frame_visibility(
+    resync: bool,
+    registry: &BlockRegistry,
+    map: &ChunkMap,
+    visibility: &mut ChunkVisibility,
+    camera: &Camera,
+    transform: &Transform,
+    viewer: ChunkViewer,
+    aspect: f32,
+) -> Option<Arc<VisibleSet>> {
+    if resync {
+        return None;
+    }
+    let _span = frame_span!("render.visibility");
+    let view = CameraView::compute(camera, transform, aspect);
+    let open = visibility.eye_in_open(
+        view.render_origin,
+        view.eye_rel,
+        camera.near_reach(aspect),
+        |p| map.block_at(p).map(|state| registry.occludes(state)),
+    );
+    if !open {
+        return None;
+    }
+    let search = VisibilityView::new(
+        view.render_origin,
+        Some(view.frustum),
+        viewer.radius,
+        viewer.vertical_radius,
+    );
+    Some(visibility.update(&search, |p| map.visibility_links_at(p)))
 }
 
 fn mesh_op(event: &ChunkMeshEvent) -> MeshOp {
@@ -1330,6 +1459,7 @@ fn prepare(
         ready.resync = false;
     }
     ready.renderer.set_translucent_sort(frame.translucent_sort);
+    ready.renderer.set_visibility(frame.visibility.clone());
     for op in frame.meshes.drain(..) {
         let result = match op {
             MeshOp::Upsert { id, origin, mesh } => {
@@ -1553,6 +1683,7 @@ fn cleanup(
     board: Option<ResMut<DiagnosticsBoard>>,
     mut saved: MessageWriter<ScreenshotSaved>,
     time: Option<ResMut<Time>>,
+    visibility: Option<ResMut<ChunkVisibility>>,
 ) {
     let frame = &mut *frame;
     if frame.gate_used
@@ -1609,6 +1740,15 @@ fn cleanup(
             let stats = ready.renderer.stats();
             info.chunks = stats.chunks;
             info.draws = stats.draws;
+            info.visible_chunks = stats.visible_chunks;
+            info.occluded_chunks = stats.occluded_chunks;
+            info.occlusion_time = stats.occlusion_time;
+            // The world's frame budget keeps room for cave culling, the bits included.
+            if let Some(mut visibility) = visibility {
+                visibility
+                    .bypass_change_detection()
+                    .add_render_time(stats.occlusion_time);
+            }
             info.translucent_sorts = stats.translucent_sorts;
             info.dropped_chunks = stats.dropped_chunks;
             info.arena_used_quads = stats.arena_used_quads;
@@ -1640,13 +1780,14 @@ fn cleanup(
 /// The `"render"` diagnostics line.
 fn render_line(tier: Tier, stats: &crate::RenderStats) -> String {
     format!(
-        "tier={tier} chunks={} quads={}/{} draws={} visible={} dropped={}",
+        "tier={tier} chunks={} quads={}/{} draws={} visible={} dropped={} occluded={}",
         stats.chunks,
         stats.arena_used_quads,
         stats.arena_capacity_quads,
         stats.draws,
         stats.visible_chunks,
-        stats.dropped_chunks
+        stats.dropped_chunks,
+        stats.occluded_chunks
     )
 }
 
@@ -1798,11 +1939,12 @@ mod tests {
             visible_chunks: 2,
             draws: 5,
             dropped_chunks: 1,
+            occluded_chunks: 4,
             ..crate::RenderStats::default()
         };
         assert_eq!(
             render_line(Tier::Mid, &stats),
-            "tier=Mid chunks=3 quads=10/100 draws=5 visible=2 dropped=1"
+            "tier=Mid chunks=3 quads=10/100 draws=5 visible=2 dropped=1 occluded=4"
         );
     }
 

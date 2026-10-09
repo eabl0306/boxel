@@ -11,6 +11,14 @@
 //!   chunks under it all the time; with `--world overworld` it digs into the caves).
 //! - `spin`: the camera turns 360 degrees in place over the measurement (visibility changes,
 //!   no new chunks).
+//! - `path` (with `--cave`): the camera follows a route through a cave at `--speed` voxels per
+//!   second, back and forth, looking where it goes; it never leaves open space.
+//!
+//! `--cave` (overworld) moves the start to open space in a cave: the air voxel nearest to
+//! `--camera` with air on every side, under the surface (see [`cave`]). Cave culling culls nothing
+//! while the eye is in rock, and the flying camera goes through rock: underground runs without
+//! `--cave` (`fly`, `dive`, or a camera in the stone) do not measure it. The summary counts those
+//! frames and warns about them.
 //!
 //! `--edits` adds scripted block edits during the measurement (a lamp placed and removed, a
 //! shaft dug and capped, one per second near the start) and reports how many frames the world
@@ -28,6 +36,11 @@
 //! `--light off` turns the voxel light and the ambient occlusion off (`WorldSettings::light` and
 //! `ao_policy: AoPolicy::Off`): the look and the cost of the world before light (ADR 0015).
 //!
+//! `--cave-culling off` (or `--no-cave-culling`) draws every chunk the frustum passes, as before
+//! cave culling (`WorldSettings::cave_culling`, ADR 0022). The summary has a "Cave culling"
+//! section either way: chunks hidden (the frustum's included), chunks through the CPU cull, draws
+//! and search times.
+//!
 //! Every run waits until the world settled, runs `--warmup` seconds, then measures
 //! `--duration` seconds. Each frame records its wall-clock time (`Time::real_delta`, the whole
 //! loop: world and render) and the work it did: chunks generated and jobs finished (counted by
@@ -44,6 +57,8 @@
 
 #[path = "stress/bodies.rs"]
 mod bodies;
+#[path = "shared/cave.rs"]
+mod cave;
 #[path = "shared/clock.rs"]
 mod clock;
 #[path = "stress/edits.rs"]
@@ -69,7 +84,9 @@ use boxel::voxel::{
 };
 use boxel::window::FramePacingInfo;
 use boxel::world::jobs::{JobExecutor, TaskPoolExecutor};
-use boxel::world::{ChunkId, ChunkMeshEvent, WorldContent, WorldStats, WorldSystems};
+use boxel::world::{
+    ChunkId, ChunkMeshEvent, ChunkVisibility, WorldContent, WorldStats, WorldSystems,
+};
 use edits::EditScript;
 use report::{FrameRecord, RecordLog, RunInfo, Summary};
 use spans::{SpanLog, SpanRow};
@@ -84,8 +101,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use world::{World, WorldChoice};
 
 const USAGE: &str = "\
-usage: stress [--scenario static|fly|dive|spin] [GPU options] [options]
-  --scenario NAME     static (default), fly, dive (straight down) or spin
+usage: stress [--scenario static|fly|dive|spin|path] [GPU options] [options]
+  --scenario NAME     static (default), fly, dive (straight down), spin, or path (with --cave:
+                      a route through the cave, back and forth at --speed)
   --radius N          mesh radius in chunks (default 16)
   --speed V           fly and dive speed in voxels per second (default 32)
   --duration SECS     measured time (default 20)
@@ -100,6 +118,10 @@ usage: stress [--scenario static|fly|dive|spin] [GPU options] [options]
   --camera x,y,z,yaw,pitch  start camera, degrees (default 16,140,16,-90,-20: the middle of a
                       chunk, above the terrain, looking along +X;
                       fly moves along the yaw direction, horizontally)
+  --cave              start in open space in a cave (overworld): the air voxel nearest to
+                      --camera with 2 voxels of air on every side, 16 or more under the surface
+                      (searched within 3 chunks); not with fly or dive, which go through rock.
+                      Underground runs without it measure no cave culling (the eye in rock)
   --size WxH          window size in logical pixels (default 1280x720)
   --async-threads N   async compute pool size (chunk jobs)
   --vertical-radius N chunks loaded above and below the camera (default 8)
@@ -119,6 +141,8 @@ usage: stress [--scenario static|fly|dive|spin] [GPU options] [options]
   --time HH[:MM]      clock time of the world, kept still (default 12:00)
   --light on|off      voxel light and ambient occlusion (default on); off: neither, the look and
                       the cost of the world before light
+  --cave-culling on|off  skip the chunks the camera cannot see through open space (default on;
+                      --no-cave-culling is off)
   --pack DIR          block textures from a Minecraft Java resource pack (the directory with
                       pack.mcmeta; default: procedural); the summary records it and its load time
   --water Y           water in every air block at or below height Y (lakes and seas), with a
@@ -157,14 +181,16 @@ enum Scenario {
     Fly,
     Dive,
     Spin,
+    Path,
 }
 
 impl Scenario {
-    const ALL: [Scenario; 4] = [
+    const ALL: [Scenario; 5] = [
         Scenario::Static,
         Scenario::Fly,
         Scenario::Dive,
         Scenario::Spin,
+        Scenario::Path,
     ];
 
     fn name(self) -> &'static str {
@@ -173,6 +199,7 @@ impl Scenario {
             Scenario::Fly => "fly",
             Scenario::Dive => "dive",
             Scenario::Spin => "spin",
+            Scenario::Path => "path",
         }
     }
 
@@ -182,7 +209,7 @@ impl Scenario {
 
     /// True if the camera moves at `--speed`.
     fn moves(self) -> bool {
-        matches!(self, Scenario::Fly | Scenario::Dive)
+        matches!(self, Scenario::Fly | Scenario::Dive | Scenario::Path)
     }
 }
 
@@ -219,6 +246,8 @@ struct Options {
     time: f64,
     /// `--light`: voxel light and ambient occlusion on (the default) or off.
     light: bool,
+    /// `--cave-culling`: on (the default) or off.
+    cave_culling: bool,
     /// `--pack`.
     textures: TextureSource,
     /// `--bodies`, `--body-kind` and `--projectiles`.
@@ -227,6 +256,11 @@ struct Options {
     water: Option<i64>,
     /// `--sort`.
     sort: TranslucentSort,
+    /// `--cave`.
+    cave: bool,
+    /// The route of the `path` scenario through the cave `--cave` found (empty before
+    /// [`find_cave`] and without `--cave`).
+    path: Vec<DVec3>,
 }
 
 impl Options {
@@ -268,10 +302,13 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         edits: false,
         time: 12.0,
         light: true,
+        cave_culling: true,
         textures: TextureSource::Procedural,
         bodies: BodyOptions::default(),
         water: None,
         sort: TranslucentSort::Background,
+        cave: false,
+        path: Vec::new(),
     };
     let mut timeout = None;
     let mut it = args.iter();
@@ -293,8 +330,9 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--help" | "-h" => return Ok(None),
             "--scenario" => {
                 let v = value()?;
-                o.scenario = Scenario::parse(&v)
-                    .ok_or_else(|| format!("{flag}: {v:?} is not static, fly, dive or spin"))?;
+                o.scenario = Scenario::parse(&v).ok_or_else(|| {
+                    format!("{flag}: {v:?} is not static, fly, dive, spin or path")
+                })?;
             }
             "--radius" => {
                 let r = number(flag, &value()?)?;
@@ -429,10 +467,31 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                     v => return Err(format!("{flag}: {v:?} is not on or off")),
                 };
             }
+            "--cave-culling" => {
+                o.cave_culling = match value()?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    v => return Err(format!("{flag}: {v:?} is not on or off")),
+                };
+            }
+            "--no-cave-culling" => o.cave_culling = false,
+            "--cave" => o.cave = true,
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
     o.world.validate(o.fixed_height)?;
+    if o.cave && o.world.world != World::Overworld {
+        return Err("--cave needs --world overworld (the only world with caves)".to_string());
+    }
+    if o.cave && matches!(o.scenario, Scenario::Fly | Scenario::Dive) {
+        return Err(format!(
+            "--cave with {}: the camera would go straight through the rock (use path)",
+            o.scenario.name()
+        ));
+    }
+    if o.scenario == Scenario::Path && !o.cave {
+        return Err("--scenario path needs --cave (the route goes through a cave)".to_string());
+    }
     o.timeout = timeout.unwrap_or(SETTLE_ALLOWANCE + o.warmup + o.duration);
     Ok(Some(o))
 }
@@ -568,9 +627,17 @@ impl JobExecutor for CountingExecutor {
 /// Camera pose of the scenario `t` seconds into the measurement, from the start pose
 /// `[x, y, z, yaw, pitch]` (degrees): `fly` moves along the horizontal yaw direction (yaw 0
 /// looks along -Z, -90 along +X), `dive` moves straight down (the view keeps its yaw and
-/// pitch), `spin` turns once over `duration` seconds.
-fn camera_at(scenario: Scenario, start: [f64; 5], speed: f64, duration: f64, t: f64) -> Transform {
-    let [x, y, z, yaw, pitch] = start;
+/// pitch), `spin` turns once over `duration` seconds, `path` goes back and forth along `path`
+/// looking where it goes ([`cave::along`], [`cave::look`]).
+fn camera_at(
+    scenario: Scenario,
+    start: [f64; 5],
+    speed: f64,
+    duration: f64,
+    t: f64,
+    path: &[DVec3],
+) -> Transform {
+    let [x, y, z, yaw, mut pitch] = start;
     let mut yaw = yaw.to_radians();
     let mut position = DVec3::new(x, y, z);
     match scenario {
@@ -578,8 +645,38 @@ fn camera_at(scenario: Scenario, start: [f64; 5], speed: f64, duration: f64, t: 
         Scenario::Fly => position += flat_direction(yaw) * (speed * t),
         Scenario::Dive => position.y -= speed * t,
         Scenario::Spin => yaw += TAU * (t / duration).min(1.0),
+        // Without a route (no `--cave`) it stays put.
+        Scenario::Path => {
+            if !path.is_empty() {
+                position = cave::along(path, speed * t).0;
+                let (look_yaw, look_pitch) = cave::look(path, speed * t);
+                yaw = look_yaw.to_radians();
+                pitch = look_pitch;
+            }
+        }
     }
     Transform::from_yaw_pitch(position, yaw as f32, (pitch as f32).to_radians())
+}
+
+/// `--cave`: moves the start of `options` to the cave found near `--camera` with the blocks of
+/// `generator` (its yaw and pitch stay) and keeps the route for `path`. Returns the cave's
+/// description.
+fn find_cave(options: &mut Options, generator: &dyn WorldGenerator) -> Result<String, String> {
+    let overworld = options
+        .world
+        .overworld(options.seed)
+        .ok_or("--cave needs --world overworld")?;
+    let [x, y, z, ..] = options.camera;
+    let found = cave::find(
+        generator,
+        &BlockRegistry::default_blocks(),
+        |x, z| overworld.height_at(x, z),
+        DVec3::new(x, y, z),
+    )?;
+    options.camera[..3].copy_from_slice(&[found.eye.x, found.eye.y, found.eye.z]);
+    let description = found.describe();
+    options.path = found.path;
+    Ok(description)
 }
 
 /// Horizontal unit direction of `yaw` (radians). Components within 1e-12 of zero are zero, so
@@ -668,6 +765,10 @@ struct Recorder {
     last_jobs: u64,
     last_stats: WorldStats,
     last_presented: u64,
+    /// Cave culling searches run so far (`VisibilityStats::searches`).
+    last_searches: u64,
+    /// Frames cave culling skipped for the eye so far (`VisibilityStats::blocked`).
+    last_blocked: u64,
     /// Quads of every mesh sent to the renderer and not removed.
     resident: HashMap<ChunkId, u32>,
     quads: u64,
@@ -687,6 +788,8 @@ impl Recorder {
             last_jobs: 0,
             last_stats: WorldStats::default(),
             last_presented: 0,
+            last_searches: 0,
+            last_blocked: 0,
             resident: HashMap::with_capacity(slots),
             quads: 0,
             pending: None,
@@ -705,7 +808,7 @@ fn spawn_camera(mut commands: Commands, bench: Res<Bench>) {
             view_distance: o.radius as f32 * 32.0,
             ..Camera::default()
         },
-        camera_at(o.scenario, o.camera, o.speed, 1.0, 0.0),
+        camera_at(o.scenario, o.camera, o.speed, 1.0, 0.0, &o.path),
         ChunkViewer::new(o.radius).with_vertical_radius(if o.fixed_height {
             u32::MAX
         } else {
@@ -734,6 +837,7 @@ fn record(
     time: Res<Time>,
     stats: Res<WorldStats>,
     info: Res<RenderInfo>,
+    visibility: Option<Res<ChunkVisibility>>,
     mut events: MessageReader<ChunkMeshEvent>,
     mut rec: ResMut<Recorder>,
     mut spans: Option<ResMut<SpanRecorder>>,
@@ -762,6 +866,7 @@ fn record(
     let generated = rec.generated.load(Ordering::Relaxed);
     let jobs = rec.jobs_done.load(Ordering::Relaxed);
     let now = *stats;
+    let search = visibility.map(|v| v.stats()).unwrap_or_default();
     if let Some(p) = rec.pending.take() {
         let delta = |a: usize, b: usize| a as i64 - b as i64;
         let record = FrameRecord {
@@ -787,6 +892,11 @@ fn record(
             gate_missed: p.gate_missed,
             gate_at: p.gate_at,
             display_locked: p.display_locked,
+            visible_chunks: info.visible_chunks,
+            occluded: info.occluded_chunks,
+            search: (search.searches > rec.last_searches).then_some(search.last_search),
+            unculled: search.blocked > rec.last_blocked,
+            occlusion: info.occlusion_time,
         };
         rec.log.push(record);
         if let Some(spans) = spans.as_deref_mut() {
@@ -803,6 +913,8 @@ fn record(
     rec.last_jobs = jobs;
     rec.last_stats = now;
     rec.last_presented = info.frames_presented;
+    rec.last_searches = search.searches;
+    rec.last_blocked = search.blocked;
 }
 
 /// `Update`, before the world computes interest: phases, the camera script and the exit.
@@ -953,6 +1065,7 @@ fn measure_frame(
             options.speed,
             options.duration.as_secs_f64(),
             t.as_secs_f64(),
+            &options.path,
         );
         // Only a real move marks the transform changed (a static camera stays untouched).
         transform.set_if_neq(next);
@@ -1030,6 +1143,9 @@ impl Bench {
             return;
         };
         println!("{}", report::one_line(&self.info, &summary));
+        if let Some(warning) = report::rock_warning(&self.info, &summary) {
+            eprintln!("stress: {warning}");
+        }
         let mut code = 0;
         if let Some(path) = &self.options.csv
             && let Err(e) = write_file(path, &report::csv(&records))
@@ -1127,6 +1243,7 @@ fn world_settings(
 ) -> WorldSettings {
     let mut settings = WorldSettings {
         vertical_bounds,
+        cave_culling: options.cave_culling,
         ..WorldSettings::default()
     };
     if !options.light {
@@ -1161,6 +1278,7 @@ fn run_info(options: &Options, present: String) -> RunInfo {
         },
         trees: options.world.has_trees(),
         light: if options.light { "on" } else { "off" }.to_string(),
+        cave_culling: if options.cave_culling { "on" } else { "off" }.to_string(),
         pack: match &options.textures {
             TextureSource::Procedural => "none".to_string(),
             source => source.label(),
@@ -1188,6 +1306,12 @@ fn run_info(options: &Options, present: String) -> RunInfo {
         time: clock::start_time(options.time, true).clock_text(),
         bodies: options.bodies.label(),
         vsync: vsync.to_string(),
+        camera: options
+            .camera
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
         ..RunInfo::default()
     }
 }
@@ -1236,7 +1360,7 @@ fn main() -> AppExit {
             return AppExit::from_code(1);
         }
     };
-    let options = match parse_options(&rest) {
+    let mut options = match parse_options(&rest) {
         Ok(Some(options)) => options,
         Ok(None) => {
             println!("{}\n\n{CLI_HELP}", usage());
@@ -1292,9 +1416,26 @@ fn main() -> AppExit {
     if let Some(level) = options.water {
         inner = Arc::new(WaterGenerator { inner, level });
     }
+    let cave = if options.cave {
+        match find_cave(&mut options, inner.as_ref()) {
+            Ok(description) => {
+                println!("stress: cave: {description}");
+                description
+            }
+            Err(e) => {
+                eprintln!("stress: {e}");
+                return AppExit::from_code(1);
+            }
+        }
+    } else {
+        String::new()
+    };
     let fixed_bounds = options.fixed_height.then(|| inner.vertical_chunks());
     let (arena_quads, chunk_slots) = options.render_capacity();
-    let info = run_info(&options, present);
+    let info = RunInfo {
+        cave,
+        ..run_info(&options, present)
+    };
     let mut plugins = DefaultPlugins
         .set(WindowPlugin {
             primary: WindowSettings {
@@ -1431,6 +1572,24 @@ mod tests {
 
         assert!(options(&["--light=on"]).light);
         assert!(usage().contains("--light on|off"));
+    }
+
+    #[test]
+    fn cave_culling_is_on_unless_asked() {
+        let on = options(&[]);
+        assert!(world_settings(&on, None).cave_culling);
+        let info = run_info(&on, String::new());
+        assert_eq!(info.cave_culling, "on");
+        assert!(!report::run_title(&info).contains("culling"));
+        for args in [&["--no-cave-culling"][..], &["--cave-culling", "off"]] {
+            let off = options(args);
+            assert!(!world_settings(&off, None).cave_culling, "{args:?}");
+            let info = run_info(&off, String::new());
+            assert_eq!(info.cave_culling, "off");
+            assert!(report::run_title(&info).ends_with(" culling off"));
+        }
+        assert!(options(&["--cave-culling=on"]).cave_culling);
+        assert!(usage().contains("--cave-culling on|off"));
     }
 
     #[test]
@@ -1602,6 +1761,7 @@ mod tests {
             &["--caves", "mc"],
             &["--light", "yes"],
             &["--light"],
+            &["--cave-culling", "yes"],
         ] {
             assert!(parse(args).is_err(), "{args:?} was accepted");
         }
@@ -1611,7 +1771,7 @@ mod tests {
     #[test]
     fn fly_moves_along_the_yaw_direction() {
         let start = [0.0, 140.0, 0.0, -90.0, -20.0];
-        let t = camera_at(Scenario::Fly, start, 32.0, 20.0, 2.0);
+        let t = camera_at(Scenario::Fly, start, 32.0, 20.0, 2.0, &[]);
         assert_eq!(
             t.translation,
             DVec3::new(64.0, 140.0, 0.0),
@@ -1624,11 +1784,18 @@ mod tests {
             "{forward:?}"
         );
         // Yaw 0 looks along -Z.
-        let t = camera_at(Scenario::Fly, [0.0, 0.0, 0.0, 0.0, 0.0], 10.0, 1.0, 1.0);
+        let t = camera_at(
+            Scenario::Fly,
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+            10.0,
+            1.0,
+            1.0,
+            &[],
+        );
         assert!((t.translation - DVec3::new(0.0, 0.0, -10.0)).length() < 1e-9);
         // Crossing a chunk border: x = 31.9 -> 32.1, and only in x.
-        let a = camera_at(Scenario::Fly, start, 32.0, 20.0, 31.9 / 32.0);
-        let b = camera_at(Scenario::Fly, start, 32.0, 20.0, 32.1 / 32.0);
+        let a = camera_at(Scenario::Fly, start, 32.0, 20.0, 31.9 / 32.0, &[]);
+        let b = camera_at(Scenario::Fly, start, 32.0, 20.0, 32.1 / 32.0, &[]);
         let (ca, cb) = (chunk_of(&a), chunk_of(&b));
         assert_eq!((cb.x - ca.x, cb.y - ca.y, cb.z - ca.z), (1, 0, 0));
         // Past the former i32 edge (2^31 voxels): the crossing is still one chunk in x.
@@ -1639,8 +1806,8 @@ mod tests {
             -90.0,
             -20.0,
         ];
-        let a = camera_at(Scenario::Fly, edge, 32.0, 20.0, 31.0 / 32.0);
-        let b = camera_at(Scenario::Fly, edge, 32.0, 20.0, 33.0 / 32.0);
+        let a = camera_at(Scenario::Fly, edge, 32.0, 20.0, 31.0 / 32.0, &[]);
+        let b = camera_at(Scenario::Fly, edge, 32.0, 20.0, 33.0 / 32.0, &[]);
         let (ca, cb) = (chunk_of(&a), chunk_of(&b));
         assert_eq!((ca.x, cb.x, ca.z), ((1 << 26) - 1, 1 << 26, -(1 << 26) - 1));
         // Far cameras parse.
@@ -1650,7 +1817,7 @@ mod tests {
         assert_eq!(far.camera[..3], [3e9, 80.0, -1e12]);
         // The default start is the middle of a chunk.
         let o = parse(&[]).expect("valid").expect("not help");
-        let begin = camera_at(Scenario::Fly, o.camera, 32.0, 20.0, 0.0);
+        let begin = camera_at(Scenario::Fly, o.camera, 32.0, 20.0, 0.0, &[]);
         let local = begin.translation.rem_euclid(DVec3::splat(32.0));
         assert_eq!((local.x, local.z), (16.0, 16.0));
     }
@@ -1688,23 +1855,23 @@ mod tests {
     #[test]
     fn dive_moves_straight_down() {
         let start = [16.0, 140.0, 16.0, -90.0, -20.0];
-        let t = camera_at(Scenario::Dive, start, 64.0, 20.0, 2.5);
+        let t = camera_at(Scenario::Dive, start, 64.0, 20.0, 2.5, &[]);
         assert_eq!(t.translation, DVec3::new(16.0, -20.0, 16.0));
-        let begin = camera_at(Scenario::Dive, start, 64.0, 20.0, 0.0);
+        let begin = camera_at(Scenario::Dive, start, 64.0, 20.0, 0.0, &[]);
         assert!((t.forward() - begin.forward()).length() < 1e-6, "same view");
         // One layer of chunks every half second at 64 voxels/s.
-        let a = chunk_of(&camera_at(Scenario::Dive, start, 64.0, 20.0, 0.1));
-        let b = chunk_of(&camera_at(Scenario::Dive, start, 64.0, 20.0, 0.6));
+        let a = chunk_of(&camera_at(Scenario::Dive, start, 64.0, 20.0, 0.1, &[]));
+        let b = chunk_of(&camera_at(Scenario::Dive, start, 64.0, 20.0, 0.6, &[]));
         assert_eq!((b.x - a.x, b.y - a.y, b.z - a.z), (0, -1, 0));
     }
 
     #[test]
     fn spin_turns_once_and_static_stays() {
         let start = [5.0, 140.0, 7.0, -90.0, -20.0];
-        let begin = camera_at(Scenario::Spin, start, 32.0, 20.0, 0.0);
-        let half = camera_at(Scenario::Spin, start, 32.0, 20.0, 10.0);
-        let end = camera_at(Scenario::Spin, start, 32.0, 20.0, 20.0);
-        let after = camera_at(Scenario::Spin, start, 32.0, 20.0, 30.0);
+        let begin = camera_at(Scenario::Spin, start, 32.0, 20.0, 0.0, &[]);
+        let half = camera_at(Scenario::Spin, start, 32.0, 20.0, 10.0, &[]);
+        let end = camera_at(Scenario::Spin, start, 32.0, 20.0, 20.0, &[]);
+        let after = camera_at(Scenario::Spin, start, 32.0, 20.0, 30.0, &[]);
         assert_eq!(begin.translation, half.translation);
         assert!(
             (half.forward().x + begin.forward().x).abs() < 1e-5,
@@ -1715,8 +1882,63 @@ mod tests {
             "a full turn"
         );
         assert_eq!(after, end, "never more than one turn");
-        let still = camera_at(Scenario::Static, start, 32.0, 20.0, 15.0);
+        let still = camera_at(Scenario::Static, start, 32.0, 20.0, 15.0, &[]);
         assert_eq!(still, begin);
+    }
+
+    #[test]
+    fn cave_needs_the_overworld_and_no_straight_moves() {
+        let o = options(&["--world", "overworld", "--cave", "--scenario", "path"]);
+        assert!(o.cave && o.scenario.moves());
+        assert!(parse(&["--cave"]).is_err(), "the forest has no caves");
+        for scenario in ["fly", "dive"] {
+            assert!(
+                parse(&["--world", "overworld", "--cave", "--scenario", scenario]).is_err(),
+                "{scenario} goes through the rock"
+            );
+        }
+        assert!(parse(&["--world", "overworld", "--scenario", "path"]).is_err());
+        assert!(usage().contains("--cave"));
+    }
+
+    #[test]
+    fn path_follows_the_route_back_and_forth_looking_ahead() {
+        let path: Vec<DVec3> = (0..40)
+            .map(|i| DVec3::new(0.5 + f64::from(i), -990.5, 2.5))
+            .collect();
+        let start = [0.5, -990.5, 2.5, 0.0, 0.0];
+        let ahead = camera_at(Scenario::Path, start, 8.0, 20.0, 1.0, &path);
+        assert_eq!(ahead.translation, DVec3::new(8.5, -990.5, 2.5));
+        assert!(ahead.forward().x > 0.99, "{:?}", ahead.forward());
+        // 48 voxels: to the end (39) and 9 back.
+        let back = camera_at(Scenario::Path, start, 8.0, 20.0, 6.0, &path);
+        assert_eq!(back.translation, DVec3::new(30.5, -990.5, 2.5));
+        assert!(back.forward().x < -0.99, "{:?}", back.forward());
+        let still = camera_at(Scenario::Path, start, 8.0, 20.0, 3.0, &[]);
+        assert_eq!(still.translation, DVec3::new(0.5, -990.5, 2.5));
+    }
+
+    #[test]
+    fn find_cave_moves_the_start_into_a_cave() {
+        let mut o = options(&[
+            "--world",
+            "overworld",
+            "--cave",
+            "--camera",
+            "16,-1000,16,-90,-10",
+            "--scenario",
+            "path",
+        ]);
+        let generator = o.world.generator(o.seed);
+        let line = find_cave(&mut o, generator.as_ref()).expect("a cave");
+        assert!(line.starts_with("eye="), "{line}");
+        assert_ne!(o.camera[..3], [16.0, -1000.0, 16.0]);
+        assert_eq!(o.camera[3..], [-90.0, -10.0], "the view stays");
+        assert_eq!(o.path[0], DVec3::new(o.camera[0], o.camera[1], o.camera[2]));
+        let info = run_info(&o, String::new());
+        assert!(info.camera.ends_with(",-90,-10"), "{}", info.camera);
+        let begin = camera_at(o.scenario, o.camera, o.speed, 20.0, 0.0, &o.path);
+        assert_eq!(begin.translation, o.path[0]);
     }
 
     #[test]
@@ -2097,7 +2319,10 @@ mod tests {
             text.starts_with("# boxel stress: static r16 light off\n"),
             "{text}"
         );
-        assert!(text.contains(", trees on, light off, radius 16,"), "{text}");
+        assert!(
+            text.contains(", trees on, light off, cave culling on, radius 16,"),
+            "{text}"
+        );
         assert!(text.contains("\"light\": \"off\""), "{text}");
         assert!(text.contains("\"pack\": \"none\""), "{text}");
         assert!(text.contains("chunk slots, textures procedural."), "{text}");

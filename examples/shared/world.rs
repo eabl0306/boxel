@@ -231,24 +231,31 @@ impl WorldChoice {
                 sea: self.sea.then(Sea::default),
                 ..ForestGenerator::new(seed, TerrainSettings::default())
             }),
-            (World::Overworld, trees) => {
-                let mut settings = OverworldSettings {
-                    caves: self
-                        .cave_mode()
-                        .and_then(CaveMode::settings)
-                        .map(|settings| Caves { settings }),
-                    ..OverworldSettings::default()
-                };
-                if !trees {
-                    settings.trees = None;
-                    settings.plants = None;
-                }
-                if !self.sea {
-                    settings.sea = None;
-                }
-                Arc::new(OverworldGenerator::new(seed, settings))
-            }
+            (World::Overworld, _) => Arc::new(self.overworld(seed).expect("the overworld")),
         }
+    }
+
+    /// The overworld generator of this choice (`None` for another world): its surface heights
+    /// (`OverworldGenerator::height_at`) for `--cave`.
+    pub fn overworld(self, seed: u64) -> Option<OverworldGenerator> {
+        if self.world != World::Overworld {
+            return None;
+        }
+        let mut settings = OverworldSettings {
+            caves: self
+                .cave_mode()
+                .and_then(CaveMode::settings)
+                .map(|settings| Caves { settings }),
+            ..OverworldSettings::default()
+        };
+        if !self.trees {
+            settings.trees = None;
+            settings.plants = None;
+        }
+        if !self.sea {
+            settings.sea = None;
+        }
+        Some(OverworldGenerator::new(seed, settings))
     }
 
     /// Default `(arena quads, chunk slots)` of the renderer for this world: the engine defaults

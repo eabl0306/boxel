@@ -8,8 +8,9 @@ use super::*;
 use crate::interest::MAX_RADIUS;
 use crate::jobs::InlineExecutor;
 use crate::tests::support::{HoldExecutor, LayerGen, fake_mesh, panicking_mesh};
+use crate::visibility::XRAY;
 use crate::{BlockEdit, WorldStats};
-use boxel_voxel::{BlockPos, CHUNK_VOLUME, ChunkKey, LightValue, neighbor_index};
+use boxel_voxel::{ALL_LINKS, BlockPos, CHUNK_VOLUME, ChunkKey, LightValue, neighbor_index};
 use boxel_worldgen::WorldGenerator;
 use std::collections::HashMap;
 
@@ -218,9 +219,36 @@ impl Harness {
     }
 
     /// Published chunks are `Ready`, or have mesh interest and a remesh queued or running; every
-    /// `Ready` mesh is published.
+    /// `Ready` mesh is published. A chunk shown as its blocks are ([`ChunkSlot::shown`]) has a
+    /// mesh state and known face links, and, with a published mesh, data in each face neighbor
+    /// inside the bounds (its mesh was built from them; a neighbor that unloads unshows it).
     fn check_published(&self) {
         for (id, slot) in self.map.iter() {
+            if slot.shown() {
+                assert!(
+                    !matches!(slot.mesh(), MeshState::None),
+                    "{:?} shown without a mesh",
+                    slot.pos
+                );
+                assert!(slot.face_links().is_some(), "{:?} shown", slot.pos);
+                assert_eq!(slot.visibility_links() & XRAY, 0, "{:?}", slot.pos);
+                if self.jobs.published.contains_key(&id) {
+                    for face in Face::ALL {
+                        let n = slot.pos.offset(face.normal());
+                        if !self.jobs.planner.in_bounds(n.y) {
+                            continue;
+                        }
+                        let data = self.map.id_at(n).map(|n| self.map.slots[n].data());
+                        assert!(
+                            matches!(data, Some(DataState::Ready(_) | DataState::Missing)),
+                            "{:?} shown with neighbor {n:?} at {data:?}",
+                            slot.pos
+                        );
+                    }
+                }
+            } else if matches!(slot.data(), DataState::Ready(_)) {
+                assert_eq!(slot.visibility_links(), ALL_LINKS | XRAY, "{:?}", slot.pos);
+            }
             let published = self.jobs.published.get(&id);
             if let (Some(published), MeshState::Ready { mesh, .. }) = (published, slot.mesh()) {
                 assert!(
@@ -672,6 +700,9 @@ fn mesher_panic_marks_the_mesh_empty() {
     assert_eq!(h.jobs.failed, 1);
     assert_eq!(h.jobs.scheduler.in_flight(), 0);
     assert!(h.take_events().is_empty());
+    // Nothing is drawn for its stone: cave culling sees through it.
+    assert!(!h.slot(ChunkPos::new(0, -1, 0)).shown());
+    h.check_published();
 }
 
 /// A mesh job that fails leaves an `Empty` mesh. The chunk's light from before the edit stays
@@ -916,6 +947,73 @@ fn removed(events: &[ChunkMeshEvent]) -> Vec<ChunkId> {
         .collect()
 }
 
+/// A renderer that resyncs (lost uploads, a new device or tier) drops every mesh and uploads
+/// [`ChunkMap::ready_meshes`] again, which misses a chunk being remeshed. Its next mesh must
+/// reach the renderer even when it is identical to the one published before.
+#[test]
+fn a_renderer_resync_gets_every_published_mesh_back() {
+    let hold = Arc::new(HoldExecutor::default());
+    let mut h = surface_world(hold.clone());
+    let mut renderer: HashMap<ChunkId, Arc<ChunkMesh>> = HashMap::new();
+    let apply = |renderer: &mut HashMap<ChunkId, Arc<ChunkMesh>>, events: Vec<ChunkMeshEvent>| {
+        for event in events {
+            match event {
+                ChunkMeshEvent::Upsert { id, mesh, .. } => {
+                    renderer.insert(id, mesh);
+                }
+                ChunkMeshEvent::Remove { id, .. } => {
+                    renderer.remove(&id);
+                }
+            }
+        }
+    };
+    for _ in 0..50 {
+        h.dispatch();
+        hold.run_all();
+        h.collect();
+        if h.stats().is_settled() {
+            break;
+        }
+    }
+    assert!(h.stats().is_settled());
+    let events = h.take_events();
+    apply(&mut renderer, events);
+    let center = h.id(ChunkPos::new(0, -1, 0));
+    assert!(renderer.contains_key(&center));
+    // A remesh that will give the same mesh (nothing changed), running during the resync.
+    h.with(|jobs, cx, _| jobs.request_remesh(cx, center, 0));
+    h.dispatch();
+    assert_eq!(hold.held(), 1);
+    renderer = h
+        .map
+        .ready_meshes()
+        .map(|(id, _, mesh)| (id, Arc::clone(mesh)))
+        .collect();
+    assert!(!renderer.contains_key(&center));
+    // A remesh for nothing keeps the chunk shown, until the renderer drops its mesh.
+    assert!(h.map.slots[center].shown());
+    h.jobs.renderer_resynced(&mut h.map);
+    assert!(!h.map.slots[center].shown());
+    h.check_published();
+    hold.run_all();
+    h.collect();
+    let events = h.take_events();
+    apply(&mut renderer, events);
+    assert!(h.map.slots[center].shown());
+    h.check_published();
+    // The renderer holds every published mesh again.
+    for (id, slot) in h.map.iter() {
+        if let MeshState::Ready { mesh, .. } = slot.mesh() {
+            assert!(
+                renderer.get(&id).is_some_and(|m| Arc::ptr_eq(m, mesh)),
+                "{:?}",
+                slot.pos
+            );
+        }
+    }
+    assert_eq!(renderer.len(), h.jobs.published.len());
+}
+
 #[test]
 fn losing_mesh_interest_mid_remesh_removes_the_old_mesh() {
     let mut h = Harness::new(LayerGen::new(-1..=0), Arc::new(InlineExecutor), 64);
@@ -988,6 +1086,7 @@ fn losing_mesh_interest_while_in_flight_removes_the_old_mesh() {
     assert_eq!(h.slot(center).interest, Interest::DATA);
     assert!(matches!(h.slot(center).mesh(), MeshState::InFlight { .. }));
     assert_eq!(removed(&h.take_events()), vec![id]);
+    assert!(!h.slot(center).shown());
     h.check_published();
     run(&mut h);
     assert!(matches!(h.slot(center).mesh(), MeshState::None));
@@ -1081,6 +1180,9 @@ fn empty_mesh_is_redone_after_a_neighbor_reloads() {
     h.settle(50);
     assert_eq!(h.map.id_at(ChunkPos::new(1, 0, 0)), Some(a));
     assert!(h.map.id_at(ChunkPos::new(2, 0, 0)).is_none());
+    // A's empty mesh was built with B's stone: not shown as it is any more.
+    assert!(!h.map.slots[a].shown());
+    h.check_published();
 
     // Back: B is generated as air again, so A has an exposed face again.
     h.interest(&origin(1));
@@ -1366,6 +1468,103 @@ fn a_batch_without_results_closes_after_frames_and_time() {
             assert!(matches!(slot.mesh(), MeshState::Ready { .. }), "{frame:?}");
         }
     }
+}
+
+/// Cave culling sees through a chunk the renderer does not show as its blocks are
+/// ([`ChunkSlot::shown`]): an edit that changes what occludes unshows the edited chunk and the
+/// face neighbors across the border of the voxel until each one's new mesh is published (an edit
+/// batch may be published in parts). Edits that change nothing that occludes, and remeshes for
+/// light, keep them shown with their links.
+#[test]
+fn edits_that_change_what_occludes_unshow_until_published() {
+    let hold = Arc::new(HoldExecutor::default());
+    let mut h = Harness::new(LayerGen::new(-3..=1), hold.clone(), 64);
+    let [west, east] = border_edit(&mut h, &hold);
+    let below = h.id(ChunkPos::new(0, -2, 0));
+    let links = |h: &Harness, id: ChunkId| h.map.slots[id].visibility_links();
+    // The hole at local x = 31 of the west chunk: the east chunk shows its face toward it.
+    assert!(!h.map.slots[west].shown() && !h.map.slots[east].shown());
+    assert_eq!(links(&h, west), ALL_LINKS | XRAY);
+    assert_eq!(links(&h, east), ALL_LINKS | XRAY);
+    assert!(h.map.slots[below].shown(), "not on the border of the voxel");
+    h.check_published();
+    // The east mesh first (the batch is published in parts): the west one is still old.
+    h.settings.edit_batch_hold = Duration::ZERO;
+    hold.run_last();
+    h.collect();
+    assert!(h.map.slots[east].shown());
+    assert!(!h.map.slots[west].shown());
+    assert_eq!(links(&h, west), ALL_LINKS | XRAY);
+    h.check_published();
+    hold.run_all();
+    h.collect();
+    assert!(h.map.slots[west].shown() && h.map.slots[east].shown());
+    let registry = BlockRegistry::default_blocks();
+    for id in [west, east] {
+        let DataState::Ready(data) = h.map.slots[id].data() else {
+            panic!("data");
+        };
+        assert_eq!(links(&h, id), ChunkFaceInfo::compute(data, &registry).links);
+    }
+    h.check_published();
+
+    // Glass in the hole and dirt for the stone next to it: what occludes does not change. The
+    // remeshes keep both shown, with their links.
+    let glass = registry.by_name("boxel:glass").expect("glass");
+    let dirt = registry.by_name("boxel:dirt").expect("dirt");
+    let before = [links(&h, west), links(&h, east)];
+    h.edits(vec![
+        BlockEdit {
+            pos: BlockPos::new(31, -5, 5),
+            state: glass,
+        },
+        BlockEdit {
+            pos: BlockPos::new(32, -5, 5),
+            state: dirt,
+        },
+    ]);
+    h.dispatch();
+    assert_eq!(hold.held(), 2, "the 2 remeshes");
+    assert!(h.map.slots[west].shown() && h.map.slots[east].shown());
+    assert_eq!([links(&h, west), links(&h, east)], before);
+    h.check_published();
+    hold.run_all();
+    h.collect();
+    assert_eq!([links(&h, west), links(&h, east)], before);
+    h.check_published();
+}
+
+/// A chunk with data whose mesh is not published (not meshed yet, or not wanted) is seen
+/// through, and is shown once its mesh is.
+#[test]
+fn chunks_without_a_published_mesh_are_seen_through() {
+    let hold = Arc::new(HoldExecutor::default());
+    let mut h = surface_world(hold.clone());
+    let center = ChunkPos::new(0, -1, 0);
+    let side = ChunkPos::new(1, -1, 0);
+    for _ in 0..20 {
+        h.dispatch();
+        if matches!(h.slot(center).mesh(), MeshState::InFlight { .. }) {
+            break;
+        }
+        hold.run_all();
+        h.collect();
+    }
+    // The center's mesh job is held.
+    assert!(matches!(h.slot(center).data(), DataState::Ready(_)));
+    assert!(matches!(h.slot(center).mesh(), MeshState::InFlight { .. }));
+    assert!(!h.slot(center).shown());
+    assert_eq!(h.slot(center).visibility_links(), ALL_LINKS | XRAY);
+    // Only data around it: nothing drawn for its stone either.
+    assert!(matches!(h.slot(side).mesh(), MeshState::None));
+    assert_eq!(h.slot(side).visibility_links(), ALL_LINKS | XRAY);
+    h.check_published();
+    hold.run_all();
+    h.collect();
+    assert!(h.slot(center).shown());
+    assert_eq!(h.slot(center).visibility_links(), 0, "uniform stone");
+    assert_eq!(upserted(&h.take_events()), vec![center]);
+    h.check_published();
 }
 
 mod sky;

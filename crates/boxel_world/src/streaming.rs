@@ -14,7 +14,9 @@
 //!   `Upsert` is eventually followed by a `Remove` (unload, remesh to empty) or a replacing
 //!   `Upsert`.
 //! - A published chunk has a `Ready` mesh, or has [`Interest::MESH`] and a remesh `Queued` or
-//!   `InFlight` (so `ChunkMap::ready_meshes()` only misses published chunks during a remesh).
+//!   `InFlight` (so `ChunkMap::ready_meshes()` only misses published chunks during a remesh; a
+//!   renderer that uploads those again after a resync says so with `ChunkMeshResync`, and the
+//!   world forgets the published meshes it missed).
 //! - An `Empty` mesh is never stale: a data change remeshes it, and unloading a neighbor resets
 //!   it (a `Ready` mesh kept in the hysteresis band is checked by epoch when wanted again).
 //! - Once the interest backlog is empty, every slot's interest is what the viewers want
@@ -37,8 +39,9 @@ use boxel_light::{
 };
 use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher};
 use boxel_voxel::{
-    BlockPos, BlockRegistry, BlockState, CHUNK_SHIFT, ChunkData, ChunkKey, ChunkPos, Face,
-    LightValue, LocalPos, NEIGHBOR_OFFSETS, OPAQUE_OPACITY, RenderShape, neighbor_index,
+    BlockPos, BlockRegistry, BlockState, CHUNK_SHIFT, CHUNK_SIZE, ChunkData, ChunkFaceInfo,
+    ChunkKey, ChunkPos, Face, LightValue, LocalPos, NEIGHBOR_OFFSETS, OPAQUE_OPACITY, RenderShape,
+    neighbor_index,
 };
 use crossbeam_channel::{Receiver, Sender};
 use std::cell::RefCell;
@@ -51,6 +54,9 @@ use std::time::{Duration, Instant};
 
 /// `neighbors_ready` with all 26 bits set.
 pub(crate) const ALL_NEIGHBORS: u32 = (1 << 26) - 1;
+
+/// The last local coordinate of a chunk (31).
+const LAST_LOCAL: u32 = CHUNK_SIZE as u32 - 1;
 
 /// An edit batch that never got a result is closed once it is this many frames old and
 /// [`STALE_BATCH_TIME`] has passed since it opened (its members, waiting for neighbors or a sky
@@ -122,8 +128,12 @@ pub(crate) const fn opposite_neighbor(i: usize) -> usize {
 /// What a job sends back (exactly one per spawned job; see `jobs::JobExecutor`).
 #[derive(Debug)]
 pub(crate) enum JobMessage {
-    /// Generation finished.
-    Generated { id: ChunkId, data: ChunkData },
+    /// Generation finished, with the chunk's face info (cave culling).
+    Generated {
+        id: ChunkId,
+        data: ChunkData,
+        faces: ChunkFaceInfo,
+    },
     /// Meshing finished (`mesh` may be empty).
     Meshed {
         id: ChunkId,
@@ -134,6 +144,8 @@ pub(crate) enum JobMessage {
         light: Option<ChunkLight>,
         /// How the light box was computed (`None`: light off).
         path: Option<LightPath>,
+        /// The center's face info, when the slot had none (after an edit).
+        faces: Option<ChunkFaceInfo>,
     },
     /// A light job finished.
     Lit {
@@ -177,6 +189,7 @@ struct MeshedResult {
     epoch: u32,
     mesh: ChunkMesh,
     light: Option<ChunkLight>,
+    faces: Option<ChunkFaceInfo>,
 }
 
 /// The remeshes requested by one call of [`WorldJobs::apply_edits`] (or by the sky tiles it sent
@@ -952,7 +965,9 @@ impl WorldJobs {
             }
             slot.neighbors_ready = bits;
             slot.epoch = slot.epoch.wrapping_add(1);
-            if !matches!(slot.mesh(), MeshState::None) {
+            // Its mesh was built with neighbors that are now air, or air that is now a chunk.
+            cx.map.set_shown(id, false);
+            if !matches!(cx.map.slots[id].mesh(), MeshState::None) {
                 let priority = self.priority(pos);
                 self.request_remesh(cx, id, priority);
             }
@@ -1122,6 +1137,7 @@ impl WorldJobs {
         if let Some(near) = near {
             cx.map
                 .set_data(id, DataState::Ready(self.uniform(BlockState::AIR)));
+            cx.map.set_faces(id, Some(ChunkFaceInfo::OPEN));
             self.data_available_near(cx, id, pos, &near);
         } else {
             self.scheduler
@@ -1144,7 +1160,10 @@ impl WorldJobs {
                 cx.map.set_remesh_pending(id, false);
                 match cx.map.slots[id].mesh() {
                     MeshState::Queued => self.drop_mesh(cx, id),
-                    MeshState::InFlight { .. } => self.unpublish(cx, id),
+                    MeshState::InFlight { .. } => {
+                        self.unpublish(cx, id);
+                        cx.map.set_shown(id, false);
+                    }
                     MeshState::None | MeshState::Ready { .. } | MeshState::Empty => {}
                 }
             }
@@ -1202,6 +1221,13 @@ impl WorldJobs {
         let outside = !self.planner.in_bounds(slot.pos.y);
         // All 26 lookups first: independent, so their cache misses overlap.
         let near = neighbor_ids(cx.map, slot.pos);
+        // A face neighbor's mesh was built from this chunk's border, which may come back
+        // different (edits are not kept yet): the renderer no longer shows it as its blocks are.
+        for i in FACE_NEIGHBORS {
+            if let Some(n) = near[i] {
+                cx.map.set_shown(n, false);
+            }
+        }
         for (i, &n) in near.iter().enumerate() {
             let Some(n) = n else {
                 continue;
@@ -1241,9 +1267,9 @@ impl WorldJobs {
             return;
         }
         match slot.data() {
-            DataState::Missing => self.set_mesh_empty(cx, id),
+            DataState::Missing => self.set_mesh_empty(cx, id, true),
             DataState::Ready(data) if is_uniform_empty(data, &cx.content.registry) => {
-                self.set_mesh_empty(cx, id);
+                self.set_mesh_empty(cx, id, true);
             }
             DataState::Ready(_) if slot.neighbors_ready == ALL_NEIGHBORS => {
                 if matches!(self.sky_for(cx, id, false), SkyFor::Ready(_)) {
@@ -1341,7 +1367,7 @@ impl WorldJobs {
     fn column_lost_slot(&mut self, cx: &mut Ctx<'_>, slot: &ChunkSlot, id: ChunkId) {
         let col = slot.column;
         self.walk_data_arrived(cx, col, id);
-        if cx.sky.detach(col, slot.pos.y) || !slot.sky_edited {
+        if cx.sky.detach(col, slot.pos.y) || !slot.sky_edited() {
             return;
         }
         let c = &mut cx.sky.columns[col];
@@ -1549,6 +1575,30 @@ impl WorldJobs {
         }
     }
 
+    /// A renderer dropped every mesh and uploaded [`ChunkMap::ready_meshes`] again
+    /// ([`ChunkMeshResync`](crate::ChunkMeshResync)): the published meshes of chunks being
+    /// remeshed were not among them. Forgets those (no `Remove`: the renderer does not hold
+    /// them), so their next mesh is published even when it is identical, and an empty or
+    /// unloaded chunk sends nothing.
+    pub(crate) fn renderer_resynced(&mut self, map: &mut ChunkMap) {
+        let mut lost = Vec::new();
+        self.published.retain(|&id, _| {
+            let kept = map
+                .get(id)
+                .is_some_and(|slot| matches!(slot.mesh(), MeshState::Ready { .. }));
+            if !kept {
+                lost.push(id);
+            }
+            kept
+        });
+        // The renderer draws nothing for them until their next mesh.
+        for id in lost {
+            if map.get(id).is_some() {
+                map.set_shown(id, false);
+            }
+        }
+    }
+
     /// `Remove` if the slot's mesh was published (its state is left as is).
     fn unpublish(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
         if self.published.remove(&id).is_some() {
@@ -1559,18 +1609,34 @@ impl WorldJobs {
 
     /// `MeshState::Empty`, and `Remove` if a mesh was published. A chunk meshed to nothing
     /// without a job (all air, enclosed, a failed job) gets a light job if it is near a viewer.
-    fn set_mesh_empty(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
+    /// `shown`: the chunk really has nothing to show ([`ChunkSlot::shown`]); not after a failed
+    /// mesh job, whose blocks the renderer then does not show.
+    fn set_mesh_empty(&mut self, cx: &mut Ctx<'_>, id: ChunkId, shown: bool) {
         self.set_waits_sky(cx, id, false);
-        cx.map.set_mesh_and_pending(id, MeshState::Empty, false);
+        // The empty fast paths (missing data, uniform chunks) need no job to know their faces.
+        let slot = &cx.map.slots[id];
+        if slot.face_links().is_none() {
+            let faces = match slot.data() {
+                DataState::Missing => Some(ChunkFaceInfo::OPEN),
+                DataState::Ready(data) => data
+                    .as_uniform()
+                    .map(|s| ChunkFaceInfo::uniform(cx.content.registry.occludes(s))),
+                DataState::Queued | DataState::Generating => None,
+            };
+            if faces.is_some() {
+                cx.map.set_faces(id, faces);
+            }
+        }
+        cx.map.set_mesh_shown(id, MeshState::Empty, shown);
         self.unpublish(cx, id);
         self.leave_batch(cx, id);
         self.want_light(cx, id);
     }
 
-    /// `MeshState::None`, and `Remove` if a mesh was published.
+    /// `MeshState::None`, and `Remove` if a mesh was published (nothing is shown).
     fn drop_mesh(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
         self.set_waits_sky(cx, id, false);
-        cx.map.set_mesh_and_pending(id, MeshState::None, false);
+        cx.map.set_mesh_shown(id, MeshState::None, false);
         self.unpublish(cx, id);
         self.leave_batch(cx, id);
     }
@@ -1717,10 +1783,40 @@ impl WorldJobs {
         if changes.is_empty() {
             return changed;
         }
-        // 2. The data.
-        for &(id, local, _, state) in &changes {
+        // 2. The data. A chunk where what occludes changed needs its face info again (its next
+        // mesh job computes it), and the faces of its occluding cubes change: the renderer does
+        // not show it as it is until its new mesh is published, and the visibility search sees
+        // through it. So does a face neighbor across the border of such a voxel, whose faces
+        // toward it change too (the meshes of an edit batch may be published apart).
+        let registry = Arc::clone(&cx.content.registry);
+        let mut refaced = BTreeSet::new();
+        let mut border = BTreeSet::new();
+        for &(id, local, old, state) in &changes {
             if let Some(data) = cx.map.ready_data_mut(id) {
                 Arc::make_mut(data).set(local, state);
+            }
+            if registry.occludes(old) != registry.occludes(state) {
+                refaced.insert(id);
+                let pos = cx.map.slots[id].pos;
+                let l = [local.x(), local.y(), local.z()];
+                for face in Face::ALL {
+                    let n = face.normal();
+                    let crosses = [n.x, n.y, n.z]
+                        .iter()
+                        .zip(l)
+                        .any(|(&d, c)| (d < 0 && c == 0) || (d > 0 && c == LAST_LOCAL));
+                    if crosses {
+                        border.insert(pos.offset(n));
+                    }
+                }
+            }
+        }
+        for id in refaced {
+            cx.map.forget_faces(id);
+        }
+        for pos in border {
+            if let Some(id) = cx.map.id_at(pos) {
+                cx.map.set_shown(id, false);
             }
         }
         // 3. The sky tops, from the new data.
@@ -1732,7 +1828,7 @@ impl WorldJobs {
                 continue;
             }
             let p = BlockPos::from_parts(cx.map.slots[id].pos, local);
-            cx.map.slots[id].sky_edited = true;
+            cx.map.slots[id].set_sky_edited();
             if let Some(band) = self.sky_edit(cx, p, placed, batch) {
                 band_chunks(cx.map, cx.sky, &band, &mut remesh);
             }
@@ -1939,9 +2035,10 @@ impl WorldJobs {
             JobId::Chunk(id),
             JobKind::Generate,
             cancel,
-            move || JobMessage::Generated {
-                id,
-                data: generator.generate(key, &registry),
+            move || {
+                let data = generator.generate(key, &registry);
+                let faces = ChunkFaceInfo::compute(&data, &registry);
+                JobMessage::Generated { id, data, faces }
             },
         );
         true
@@ -1964,13 +2061,13 @@ impl WorldJobs {
         let pos = slot.pos;
         let registry = &cx.content.registry;
         if is_uniform_empty(center, registry) {
-            self.set_mesh_empty(cx, id);
+            self.set_mesh_empty(cx, id, true);
             return false;
         }
         // Each neighbor is looked up once: the face neighbors first, for the enclosed check.
         let mut near = NearData::default();
         if is_enclosed_opaque(map, registry, pos, center, &mut near) {
-            self.set_mesh_empty(cx, id);
+            self.set_mesh_empty(cx, id, true);
             return false;
         }
         let center = Arc::clone(center);
@@ -1978,6 +2075,11 @@ impl WorldJobs {
             std::array::from_fn(|i| near.get(map, pos, i).cloned());
         let (data_version, epoch) = (center.version, slot.epoch);
         let cancel = Arc::clone(&slot.cancel);
+        // After an edit that changed what occludes, the job computes the face info again.
+        let faces_for = slot
+            .face_links()
+            .is_none()
+            .then(|| Arc::clone(&cx.content.registry));
         // The tiles were walked when the job was queued, but an edit may have sent one back.
         let light = match self.sky_for(cx, id, true) {
             SkyFor::Waiting => return false,
@@ -2011,6 +2113,7 @@ impl WorldJobs {
             move || {
                 let near: [Option<&ChunkData>; 26] =
                     std::array::from_fn(|i| neighbors[i].as_deref());
+                let faces = faces_for.map(|registry| ChunkFaceInfo::compute(&center, &registry));
                 let Some(light) = light else {
                     let input = MeshInput {
                         center: &center,
@@ -2025,6 +2128,7 @@ impl WorldJobs {
                         mesh,
                         light: None,
                         path: None,
+                        faces,
                     };
                 };
                 // The 27 chunks in `boxel_light::box_light::chunk_index` order: the
@@ -2048,6 +2152,7 @@ impl WorldJobs {
                         mesh,
                         light: light.keep.then(|| ChunkLight::from_padded(padded)),
                         path: Some(path),
+                        faces,
                     }
                 })
             },
@@ -2186,7 +2291,7 @@ impl WorldJobs {
     /// none queued or running. A uniform chunk of a fully opaque state that emits nothing needs
     /// no job: no light enters it.
     fn want_light(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
-        if cx.map.get(id).is_none_or(|s| s.light_job) || !self.light_wanted(cx, id) {
+        if cx.map.get(id).is_none_or(ChunkSlot::light_job) || !self.light_wanted(cx, id) {
             return;
         }
         let tables = &cx.content.light_tables;
@@ -2204,7 +2309,7 @@ impl WorldJobs {
             }));
             return;
         }
-        slot.light_job = true;
+        slot.set_light_job(true);
         let priority = light_priority(self.planner.priority(slot.pos));
         self.scheduler.push(id, JobKind::Light, priority);
     }
@@ -2215,7 +2320,7 @@ impl WorldJobs {
         let Some(slot) = cx.map.slots.get_mut(id) else {
             return false;
         };
-        slot.light_job = false;
+        slot.set_light_job(false);
         if !self.light_wanted(cx, id) {
             return false;
         }
@@ -2240,7 +2345,7 @@ impl WorldJobs {
             tiles,
             keep: true,
         };
-        cx.map.slots[id].light_job = true;
+        cx.map.slots[id].set_light_job(true);
         spawn_job(
             self.executor.as_ref(),
             &self.tx,
@@ -2278,7 +2383,7 @@ impl WorldJobs {
         let Some(slot) = cx.map.slots.get_mut(id) else {
             return;
         };
-        slot.light_job = false;
+        slot.set_light_job(false);
         let current = matches!(slot.data(), DataState::Ready(d) if d.version == data_version)
             && slot.epoch == epoch;
         if current && self.planner.priority(slot.pos) <= self.light_cache_sq {
@@ -2361,9 +2466,9 @@ impl WorldJobs {
             self.scheduler.complete();
             drained += 1;
             match message {
-                JobMessage::Generated { id, data } => {
+                JobMessage::Generated { id, data, faces } => {
                     self.auto_cap.observe_job(busy);
-                    self.on_generated(cx, id, data);
+                    self.on_generated(cx, id, data, faces);
                 }
                 JobMessage::Meshed {
                     id,
@@ -2372,6 +2477,7 @@ impl WorldJobs {
                     mesh,
                     light,
                     path,
+                    faces,
                 } => {
                     self.auto_cap.observe_job(busy);
                     match path {
@@ -2387,6 +2493,7 @@ impl WorldJobs {
                         epoch,
                         mesh,
                         light,
+                        faces,
                     };
                     if in_batch(cx.map, id) {
                         self.batch_pending.push(result);
@@ -2458,7 +2565,13 @@ impl WorldJobs {
         self.age_batches(cx);
     }
 
-    fn on_generated(&mut self, cx: &mut Ctx<'_>, id: ChunkId, data: ChunkData) {
+    fn on_generated(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        id: ChunkId,
+        data: ChunkData,
+        faces: ChunkFaceInfo,
+    ) {
         let Some(slot) = cx.map.slots.get(id) else {
             return;
         };
@@ -2467,6 +2580,7 @@ impl WorldJobs {
         }
         let data = self.snapshot(data);
         cx.map.set_data(id, DataState::Ready(data));
+        cx.map.set_faces(id, Some(faces));
         self.data_available(cx, id);
         let col = cx.map.slots[id].column;
         self.walk_data_arrived(cx, col, id);
@@ -2524,6 +2638,7 @@ impl WorldJobs {
                     // Permanently air, like chunks outside the vertical bounds.
                     let col = slot.column;
                     cx.map.set_data(id, DataState::Missing);
+                    cx.map.set_faces(id, Some(ChunkFaceInfo::OPEN));
                     self.data_available(cx, id);
                     self.walk_data_arrived(cx, col, id);
                 }
@@ -2531,7 +2646,7 @@ impl WorldJobs {
             JobKind::SkyTile => {}
             JobKind::Light => {
                 // Not retried: it would fail again. The chunk's next mesh job keeps its light.
-                cx.map.slots[id].light_job = false;
+                cx.map.slots[id].set_light_job(false);
             }
             JobKind::Mesh => {
                 if !matches!(slot.mesh(), MeshState::InFlight { .. }) {
@@ -2543,7 +2658,8 @@ impl WorldJobs {
                     cx.map.set_mesh_and_pending(id, MeshState::Queued, false);
                     self.schedule_mesh(cx, id, priority);
                 } else {
-                    self.set_mesh_empty(cx, id);
+                    // Nothing drawn for blocks that may have faces.
+                    self.set_mesh_empty(cx, id, false);
                 }
             }
         }
@@ -2604,6 +2720,11 @@ impl WorldJobs {
             return;
         }
         self.leave_batch_published(cx, id);
+        // The faces of the data this mesh shows, set with the mesh (the visibility search only
+        // trusts them once the mesh is published).
+        if result.faces.is_some() {
+            cx.map.set_faces(id, result.faces);
+        }
         let near = self.planner.priority(cx.map.slots[id].pos) <= self.light_cache_sq;
         let light = result.light.filter(|_| near).map(|light| {
             Arc::new(CachedLight {
@@ -2614,7 +2735,7 @@ impl WorldJobs {
         });
         cx.map.set_light(id, light);
         if result.mesh.is_empty() {
-            self.set_mesh_empty(cx, id);
+            self.set_mesh_empty(cx, id, true);
             return;
         }
         let key = cx.map.slots[id].key();
@@ -2626,13 +2747,16 @@ impl WorldJobs {
             .filter(|old| old.hash == result.mesh.hash && ***old == result.mesh)
             .cloned();
         let mesh = unchanged.clone().unwrap_or_else(|| Arc::new(result.mesh));
-        cx.map.set_mesh(
+        // Built from the current blocks of the chunk and of its neighbors' borders (the result
+        // is fresh): the renderer shows them once it is published, this frame.
+        cx.map.set_mesh_shown(
             id,
             MeshState::Ready {
                 mesh: Arc::clone(&mesh),
                 data_version: result.data_version,
                 epoch: result.epoch,
             },
+            true,
         );
         if unchanged.is_none() {
             self.published.insert(id, Arc::clone(&mesh));
@@ -2687,7 +2811,7 @@ fn current_priority(
         }
         // Kept until popped (`start_light` clears the flag).
         JobKind::Light => slot
-            .light_job
+            .light_job()
             .then(|| light_priority(planner.priority(slot.pos))),
         JobKind::SkyTile => None,
     }

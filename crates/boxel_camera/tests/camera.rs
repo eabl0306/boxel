@@ -62,6 +62,37 @@ fn frustum_keeps_points_ahead_and_rejects_points_behind() {
     assert!(ndc.z > 0.0 && ndc.z <= 1.0, "{ndc}");
 }
 
+#[test]
+fn near_reach_is_the_distance_to_the_near_plane_corners() {
+    for (camera, aspect) in [
+        (Camera::default(), 16.0 / 9.0),
+        (Camera::default(), 0.5),
+        (
+            Camera {
+                fov_y_radians: 100f32.to_radians(),
+                near: 0.05,
+                ..Camera::default()
+            },
+            21.0 / 9.0,
+        ),
+    ] {
+        // The corners of the near rectangle: clip space (+-1, +-1) at depth 1 (reverse-Z).
+        let inverse = camera.projection(aspect).inverse();
+        let reach = camera.near_reach(aspect);
+        for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+            let corner = inverse * boxel_math::Vec4::new(x, y, 1.0, 1.0);
+            let distance = (corner.truncate() / corner.w).length();
+            assert!(
+                (distance - reach).abs() < reach * 1e-4,
+                "{distance} vs {reach} at aspect {aspect}"
+            );
+        }
+    }
+    // The default camera at 16:9: about 0.17 voxels.
+    let reach = Camera::default().near_reach(16.0 / 9.0);
+    assert!((0.17..0.18).contains(&reach), "{reach}");
+}
+
 // ---- FlyCameraPlugin ----
 
 struct Harness {

@@ -15,7 +15,10 @@ before the light render, without a clock, had no voxel light); runs with a clock
 --light had it on. A metric that was 0 in BASE has no percent change ('n/a') but still gets a
 verdict (0 spikes before, 3 after: worse). Runs with --edits also compare the edit latency, and
 runs that recorded pacing (presented frames, gate waits) compare it too. Runs from before --vsync
-count as vsync on only if they asked for --present vsync.
+count as vsync on only if they asked for --present vsync. Cave culling (--cave-culling) does not
+keep runs apart, so a branch with it pairs with the runs of main from before it ('none'); a
+comparison notes it when it differs and compares the culling numbers (chunks hidden, draws,
+search time) when either run has them.
 Output is Markdown, so it can go into docs as is.
 Exit codes: 0 ok, 1 usage error or a file without a summary, 2 nothing to compare."""
 import json
@@ -72,10 +75,25 @@ PACING_METRICS = [
     ('frames locked to the display', ('pacing', 'display_locked'), 0),
 ]
 
+# Cave culling (runs from ADR 0022 on; compared when either run has them).
+CULLING_METRICS = [
+    ('chunks hidden by culling avg', ('culling', 'occluded', 'avg'), 0),
+    ('chunks through CPU cull avg', ('culling', 'visible_chunks', 'avg'), -1),
+    ('draws avg', ('culling', 'draws', 'avg'), -1),
+    ('culling searches', ('culling', 'searches'), 0),
+    ('frames unculled (eye in rock)', ('culling', 'unculled_frames'), 0),
+    ('culling search avg ms', ('culling', 'search_avg_ms'), -1),
+    ('culling search p99 ms', ('culling', 'search_p99_ms'), -1),
+    ('culling search max ms', ('culling', 'search_max_ms'), -1),
+    ('culling bits p99 ms', ('culling', 'bits_p99_ms'), -1),
+    ('culling bits max ms', ('culling', 'bits_max_ms'), -1),
+]
+
 # Settings that make two runs comparable.
 SETTINGS = [
     ('world', ('run', 'world')),
     ('light', ('run', 'light')),
+    ('cave culling', ('run', 'cave_culling')),
     ('pack', ('run', 'pack')),
     ('scenario', ('run', 'scenario')),
     ('radius', ('run', 'radius')),
@@ -86,6 +104,8 @@ SETTINGS = [
     ('present mode', ('run', 'present_mode')),
     ('bodies', ('run', 'bodies')),
     ('edits', ('run', 'edits')),
+    ('camera', ('run', 'camera')),
+    ('cave', ('run', 'cave')),
     ('clock', ('run', 'time')),
     ('seed', ('run', 'seed')),
     ('backend', ('run', 'backend')),
@@ -146,6 +166,12 @@ def load(path):
         # Runs from before --pack used the procedural textures.
         if not run.get('pack'):
             run['pack'] = 'none'
+        # Runs from before cave culling drew every chunk the frustum passed.
+        if not run.get('cave_culling'):
+            run['cave_culling'] = 'none'
+        # Runs from before --cave: the camera never started in a cave (its start is unknown).
+        run.setdefault('cave', '')
+        run.setdefault('camera', '')
         # Whether the run had --edits (the world's edit latency, null without them).
         run['edits'] = get(data, ('world', 'edits')) is not None
     return data
@@ -180,12 +206,16 @@ def get(data, path):
 def title(run):
     r = run['run']
     text = f"{r['scenario']} r{r['radius']}"
-    if r['scenario'] in ('fly', 'dive'):
+    if r['scenario'] in ('fly', 'dive', 'path'):
         text += f" {fmt(r['speed'])} vox/s"
     if r.get('world', 'forest') != 'forest':
         text += f" {r['world']}"
     if r.get('light') == 'off':
         text += ' light off'
+    if r.get('cave_culling') == 'off':
+        text += ' culling off'
+    if r.get('cave'):
+        text += ' cave'
     if r.get('pack', 'none') != 'none':
         text += f" pack {r['pack']}"
     if r.get('fps_limit'):
@@ -201,13 +231,13 @@ def title(run):
 
 def key(run):
     """Runs with the same key are comparable (same world, light, textures, scenario, radius,
-    height, speed, fps limit, vsync, physics bodies, scripted edits and GPU)."""
+    height, speed, fps limit, vsync, physics bodies, scripted edits, cave and GPU)."""
     r = run['run']
     return (r.get('world', 'forest'), r.get('light', 'none'), r.get('pack') or 'none',
             r['scenario'], r['radius'],
             r.get('vertical', 'fixed'), r['speed'], r.get('fps_limit') or 0,
-            r.get('vsync') or 'off', r.get('bodies') or '', bool(r.get('edits')), r['backend'],
-            r['tier'], r.get('adapter'))
+            r.get('vsync') or 'off', r.get('bodies') or '', bool(r.get('edits')),
+            r.get('cave') or '', r['backend'], r['tier'], r.get('adapter'))
 
 
 def fmt(value):
@@ -278,6 +308,8 @@ def compare(base, new):
         metrics = metrics + EDIT_METRICS
     if get(base, ('pacing',)) is not None or get(new, ('pacing',)) is not None:
         metrics = metrics + PACING_METRICS
+    if get(base, ('culling',)) is not None or get(new, ('culling',)) is not None:
+        metrics = metrics + CULLING_METRICS
     for name, path, direction in metrics:
         b, n = get(base, path), get(new, path)
         pct, verdict = change(b, n, direction)
