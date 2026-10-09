@@ -1217,7 +1217,11 @@ pub trait ChunkStore: Send + Sync + 'static {
 - `WorldStore` es el mundo abierto (store, IdMap, copias pendientes); `PersistPlugin` va después de
   `WorldPlugin`. Un chunk guardado se lee en su job de generación; uno editado que se descarga se
   entrega a una copia en memoria y un job en `IoTaskPool` lo escribe (uno por vez, hasta 256
-  chunks por transacción). Autoguardado cada 60 s y guardado final en `Shutdown`.
+  chunks por transacción). Autoguardado cada 60 s y guardado final en `Shutdown`. Los ticks y el
+  reloj van siempre en la misma transacción que todos los chunks editados: el disco guarda un solo
+  momento del mundo.
+- Si el disco falla, los chunks esperan en memoria y `RedbStore` vuelve a abrir el archivo cuando
+  el disco funciona otra vez.
 - Entidades (cuerpos congelados de la física): todavía no, ver ADR 0024.
 
 ---
