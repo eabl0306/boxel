@@ -224,7 +224,8 @@ impl WorldStore {
             tracing::warn!(
                 saved = name.as_str(),
                 now = %registry.state_name(*state),
-                "a saved block state is not in the registry: it loads as the closest state"
+                "a saved block state is not in the registry as it was saved: it loads as the closest \
+                 state"
             );
         }
         let saved_generator = backend.load_meta(META_GENERATOR)?;

@@ -265,10 +265,12 @@ impl<'a> Reader<'a> {
 /// name in that list. The list only grows, so the ids in saved chunks never change meaning. When
 /// the world opens, every name is resolved against the registry of this run:
 ///
-/// - a name the registry knows is that state;
-/// - a known block with an unknown property or value keeps the properties it still has and takes
-///   the default of the rest (`boxel:fence[north=true,waterlogged=false]` without `waterlogged`
-///   becomes the fence with `north=true`);
+/// - a name the registry knows exactly is that state, and the state's stored id;
+/// - a known block with a property left out, or an unknown property or value, keeps the
+///   properties it still has and takes the default of the rest
+///   (`boxel:fence[north=true,waterlogged=false]` without `waterlogged` becomes the fence with
+///   `north=true`). It is listed in [`IdMap::unknown`], and the state it became saves under its
+///   own exact name, so a later change of a default never changes a saved block;
 /// - an unknown block becomes air.
 ///
 /// Records are never rewritten just because they were read, so a block that comes back in a
@@ -295,18 +297,27 @@ impl IdMap {
         let mut unknown = Vec::new();
         let mut to_stored = vec![u32::MAX; registry.len()];
         for (id, name) in names.iter().enumerate() {
-            match registry.parse_state(name) {
-                Ok(state) => {
+            // Only a state's exact name is its id. Another name that parses (a block that gained
+            // a property: its default fills in) reads as that state but is a fallback, like an
+            // unknown one: a fallback never takes the id of the state it became, or the blocks
+            // saved under it would change when the default changes.
+            let exact = registry
+                .parse_state(name)
+                .ok()
+                .filter(|&s| registry.state_name(s).to_string() == *name);
+            match exact {
+                Some(state) => {
                     to_runtime.push(state);
-                    // The first name of a state is its id (a fallback never takes the id of the
-                    // state it became: that state keeps or gets its own name).
+                    // The first name of a state is its id.
                     let slot = &mut to_stored[usize::from(state.0)];
                     if *slot == u32::MAX {
                         *slot = u32::try_from(id).expect("fewer than 2^32 names");
                     }
                 }
-                Err(_) => {
-                    let state = closest_state(registry, name);
+                None => {
+                    let state = registry
+                        .parse_state(name)
+                        .unwrap_or_else(|_| closest_state(registry, name));
                     unknown.push((name.clone(), state));
                     to_runtime.push(state);
                 }

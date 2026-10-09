@@ -207,6 +207,56 @@ fn ids_survive_a_registry_that_changed_order() {
     assert_eq!(again.names(), ids.names());
 }
 
+/// Only a state's exact name becomes its stored id. A block that gained a property reads its old
+/// bare name as the default state, but saves that state under its exact name: a later change of
+/// the default changes no saved block.
+#[test]
+fn stored_ids_are_exact_names_so_a_new_default_changes_no_saved_block() {
+    let log = |default: &str| {
+        let mut b = BlockRegistryBuilder::new();
+        b.add_block_with_states(
+            plain("test:log"),
+            vec![Property::new("axis", ["x", "y", "z"]).with_default(default)],
+            |_, _| {},
+        )
+        .unwrap();
+        b.build()
+    };
+    // Version 1: a log without properties.
+    let v1 = {
+        let mut b = BlockRegistryBuilder::new();
+        b.add_block(plain("test:log")).unwrap();
+        b.build()
+    };
+    let (ids1, _) = IdMap::resolve(Vec::new(), &v1);
+    // Version 2 adds `axis` (default y): a log along y saved now...
+    let v2 = log("y");
+    let (ids2, grew) = IdMap::resolve(ids1.names().to_vec(), &v2);
+    assert!(grew);
+    let y = v2.parse_state("test:log[axis=y]").unwrap();
+    assert_eq!(
+        ids2.names()[ids2.stored(y).unwrap() as usize],
+        "test:log[axis=y]"
+    );
+    assert!(
+        ids2.unknown()
+            .iter()
+            .any(|(name, s)| name == "test:log" && *s == y)
+    );
+    let mut data = ChunkData::uniform(BlockState::AIR);
+    data.set(LocalPos::new(0, 0, 0), y);
+    let bytes = encode_chunk(&data, &ids2).unwrap();
+    // ...is still along y once version 3 makes x the default.
+    let v3 = log("x");
+    let (ids3, _) = IdMap::resolve(ids2.names().to_vec(), &v3);
+    assert_eq!(
+        decode_chunk(&bytes, &ids3)
+            .unwrap()
+            .get(LocalPos::new(0, 0, 0)),
+        v3.parse_state("test:log[axis=y]").unwrap()
+    );
+}
+
 #[test]
 fn unknown_properties_and_values_keep_the_rest() {
     let registry = BlockRegistry::default_blocks();

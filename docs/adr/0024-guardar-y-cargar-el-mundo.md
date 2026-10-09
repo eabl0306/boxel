@@ -90,9 +90,12 @@ para después:
   crece: al abrir se agregan los estados del registro que faltan, así los ids de los chunks
   guardados nunca cambian de significado aunque el registro cambie de orden. Al abrir, cada nombre
   se resuelve contra el registro de esa partida:
-  - un nombre que el registro conoce es ese estado;
-  - un bloque conocido con una propiedad o un valor que ya no existe conserva las propiedades que
-    sí tiene y toma el valor por defecto del resto;
+  - un nombre que el registro conoce tal cual es ese estado, y su id;
+  - un bloque conocido al que le falta una propiedad, o con una propiedad o un valor que ya no
+    existe, conserva las propiedades que sí tiene y toma el valor por defecto del resto. Ese
+    nombre no pasa a ser el id del estado que resultó: el estado se guarda con su nombre exacto.
+    Si no, un bloque que ganó una propiedad se guardaría con el nombre viejo y cambiaría cuando
+    cambie el valor por defecto (test);
   - un bloque que ya no existe es aire (con un aviso en el log y en `IdMap::unknown`).
 
   Como un registro leído no se reescribe, un bloque que vuelve en una versión posterior reaparece
@@ -196,8 +199,8 @@ Tests (en `crates/boxel_world`):
 
 - `persist/format/tests.rs`: claves ida y vuelta en 0, ±2^31, ±2^40, el límite del mundo y los
   extremos de `i64`, y su orden (proptest); registros de todos los almacenamientos; IdMap con un
-  registro distinto, un bloque que ya no existe, una propiedad y un valor que ya no existen;
-  cualquier bit cambiado o registro cortado es un error, y bytes al azar nunca entran en pánico.
+  registro distinto, un bloque que ya no existe, una propiedad y un valor que ya no existen, y
+  un bloque que ganó una propiedad cuyo valor por defecto cambia después; cualquier bit cambiado o registro cortado es un error, y bytes al azar nunca entran en pánico.
 - `persist/tests.rs`: metadatos de un mundo nuevo, nombres reservados, copias pendientes, el
   índice, el tamaño de los lotes (un job con los ticks lleva todos los chunks) y el orden de los
   ticks; un archivo redb cuyo disco falla y vuelve (guardar y cargar funcionan otra vez y no se
