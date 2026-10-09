@@ -152,6 +152,7 @@ fn shaped_field(size: i64, density: f64, seed: u64) -> (TestWorld, Vec<(BlockPos
         double(),
         state("boxel:oak_fence"),
         state("boxel:oak_fence[east=true,south=true]"),
+        state("boxel:oak_fence[north=true,west=true]"),
     ];
     for y in 0..size {
         for x in 0..size {
@@ -187,8 +188,13 @@ fn single_axis_sweeps_match_a_brute_force_oracle() {
     let t = table();
     let eps = SweepConfig::default().eps;
     let mut checked = 0;
-    for seed in 0..40u64 {
-        let (mut world, blocks) = shaped_field(8, 0.1, seed);
+    // Sparse fields, and more dense ones where blocks of every kind share layers (a stone
+    // block scanned before a fence of its layer must not hide the fence's top).
+    for (density, seed) in [(0.1, 40u64), (0.3, 200)]
+        .into_iter()
+        .flat_map(|(density, seeds)| (0..seeds).map(move |seed| (density, seed)))
+    {
+        let (mut world, blocks) = shaped_field(8, density, seed);
         let boxes = world_boxes(&t, &blocks);
         let mut rng = Rng(seed ^ 0xABCD);
         for _ in 0..80 {
@@ -240,12 +246,13 @@ fn single_axis_sweeps_match_a_brute_force_oracle() {
             let want = start[axis] + (end - lead);
             assert!(
                 (got - want).abs() < 1e-9,
-                "seed {seed}: start {start} axis {axis} by {amount}: got {got}, want {want}"
+                "density {density} seed {seed}: start {start} axis {axis} by {amount}: got {got}, \
+                 want {want}"
             );
             checked += 1;
         }
     }
-    assert!(checked > 1000);
+    assert!(checked > 5000);
 }
 
 #[test]

@@ -369,3 +369,89 @@ fn an_unloaded_chunk_under_a_crossed_cell_stops_a_collision_ray() {
     );
     assert!(out.is_err());
 }
+
+/// No fence box of `world` around `base` overlaps the body at `end` (frame of `base`).
+fn clear_of_fences(world: &mut TestWorld, base: I64Vec3, end: DVec3) {
+    use boxel_physics::{Probe, VoxelSource};
+    let t = table();
+    let me = body().translate(end);
+    for x in -2..=2 {
+        for y in -1..=2 {
+            for z in -2..=2 {
+                let Probe::Block(state) = world.probe(at(base, x, y, z)) else {
+                    continue;
+                };
+                if !t.is_tall(state) {
+                    continue;
+                }
+                let CollisionShape::Boxes(boxes) = t.shape(state) else {
+                    unreachable!()
+                };
+                for b in boxes {
+                    let b = b.translate(DVec3::new(x as f64, y as f64, z as f64));
+                    assert!(!b.overlaps(me, 1e-7), "{end} overlaps {b:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_block_in_the_same_layer_never_hides_a_fence_top() {
+    // A stone block at the walker's level right next to a fence that connects to it (the usual
+    // build), from each side: the stone comes before the fence in the layer scan from two of
+    // them, and the fence's top, half a block higher, must still win.
+    for (axis, sign, side) in [
+        (2, 1.0, "north"),
+        (2, -1.0, "south"),
+        (0, 1.0, "west"),
+        (0, -1.0, "east"),
+    ] {
+        let mut dir = DVec3::ZERO;
+        dir[axis] = sign;
+        // The stone is the fence's neighbor on `side`, the one the walker comes from.
+        let mut stone = [0i64; 3];
+        stone[axis] = -sign as i64;
+        let fence = state(&format!("boxel:oak_fence[{side}=true]"));
+        for base in bases() {
+            let mut world = TestWorld::new();
+            fill(&mut world, base, [-3, -1, -3], [3, -1, 3], STONE);
+            world.set(at(base, stone[0], 0, stone[2]), STONE);
+            world.set(at(base, 0, 0, 0), fence);
+            let center = DVec3::new(0.5, 0.0, 0.5);
+            // On the stone, a quarter block short of the fence's arm, walking toward the fence:
+            // the plain move stops at the arm; the step-up lands with the box over both blocks,
+            // on the fence's top.
+            let start = center - dir + DVec3::Y;
+            let d = 0.5 * dir;
+            let plain = sweep(&mut world, base, start, d, StepUp::NONE);
+            assert_eq!(local(base, plain.end), center - 0.75 * dir + DVec3::Y);
+            let stepped = sweep(&mut world, base, start, d, WALK);
+            let end = center - 0.5 * dir + 1.5 * DVec3::Y;
+            assert_eq!(local(base, stepped.end), end, "{side} at {base}");
+            assert!(stepped.on_ground());
+            assert_eq!(stepped.ground, Some(at(base, 0, 0, 0)));
+            clear_of_fences(&mut world, base, end);
+            // Falling onto the same spot: on the fence's top too.
+            let out = sweep(
+                &mut world,
+                base,
+                end + 2.5 * DVec3::Y,
+                DVec3::new(0.0, -6.0, 0.0),
+                StepUp::NONE,
+            );
+            assert_eq!(local(base, out.end), end, "{side} at {base}");
+            assert_eq!(out.ground, Some(at(base, 0, 0, 0)));
+            // Standing there, one step of gravity keeps it there.
+            let out = sweep(
+                &mut world,
+                base,
+                end,
+                DVec3::new(0.0, -0.078125, 0.0),
+                StepUp::NONE,
+            );
+            assert_eq!(local(base, out.end), end, "{side} at {base}");
+            assert!(out.on_ground());
+        }
+    }
+}

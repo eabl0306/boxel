@@ -572,9 +572,11 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
 
     /// The nearest blocking plane of layer `layer` on `axis` within the footprint `b` x `c` (on
     /// the other two axes, in increasing order) and its block ([`Grid::block_plane`], with
-    /// `below`), scanning `b` then `c` upward: the first block with the nearest plane. A full
-    /// block's plane is the nearest any block of the layer can have, so the scan stops at the
-    /// first one (with only full blocks, this is the first full block of the layer).
+    /// `below`), scanning `b` then `c` upward: the first block with the nearest plane. The scan
+    /// stops at the first block with the nearest plane any block of the layer can have: a full
+    /// block's, except moving down with tall blocks in the table, whose tops reach
+    /// [`CollisionTable::reach`] above it (a fence beside a stone block is the ground, not the
+    /// stone). Without tall blocks this is the first full block of a layer of full blocks.
     #[expect(clippy::too_many_arguments, reason = "an internal helper of clip_axis")]
     fn first_in_layer(
         &mut self,
@@ -588,7 +590,13 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
         below: i64,
     ) -> Result<Option<(f64, [i64; 3])>, Unloaded> {
         let (b_axis, c_axis) = others(axis);
-        let nearest = if positive { layer } else { layer + 1 } as f64;
+        let nearest = if positive {
+            layer as f64
+        } else if axis == 1 {
+            (layer + 1) as f64 + self.table.reach()
+        } else {
+            (layer + 1) as f64
+        };
         let mut best: Option<(f64, [i64; 3])> = None;
         for bi in b.0..=b.1 {
             for ci in c.0..=c.1 {

@@ -43,6 +43,10 @@
   así que "la primera capa con un plano decide" ya no alcanza. Cuando una capa da un plano, se
   mira una capa más si su techo posible (`capa + reach`) lo puede superar. Como `reach` es menor
   que un bloque, es a lo sumo una capa más. El final del recorrido también baja `reach`.
+- **Dentro de una capa**, hacia abajo, pasa lo mismo: un bloque lleno ya no corta la lectura,
+  porque una valla de la misma capa puede tener el techo más alto. Solo corta un techo de
+  `capa + 1 + reach`. Sin esto, con una piedra al lado de una valla, el cuerpo aterrizaba dentro
+  de la valla o no, según de qué lado venía.
 - **Hacia arriba** no cambia: las cajas altas no bajan de su celda.
 - **Salida de un bloque.** `any_solid` mira la misma fila. Un cuerpo dentro de la mitad de arriba
   de una valla (una valla puesta bajo sus pies) sube al plano entero siguiente, como con las
@@ -129,8 +133,9 @@
 - Costo, sin medir (hoy no se mide; va a la próxima ronda de control):
   - Barrido: un movimiento de costado con la base del cuerpo a menos de medio bloque sobre un
     plano entero lee una fila más de bloques. Un caminante sobre el suelo lo hace siempre: una o
-    dos lecturas más por capa recorrida. Camino caliente de `sweep/player_walk`, `tick/*` y
-    `scale/*`.
+    dos lecturas más por capa recorrida. Hacia abajo, la capa donde aterriza se lee entera (de 1
+    a 4 bloques para un jugador) en vez de cortar en el primer bloque lleno. Camino caliente de
+    `sweep/player_walk`, `tick/*` y `scale/*`.
   - Raycast con `Collision`: una lectura más por celda cruzada en su mitad de abajo. Camino
     caliente de los proyectiles (`scale/1000_projectiles`).
   - La guarda de bordes solo corre para quien se agacha en el suelo.
@@ -156,12 +161,14 @@
     mundo): la valla frena a un caminante, con escalón o sin él, y a una caja a 1,4375 de alto (no
     se salta); en 1,5 pasa por arriba y camina sobre la fila sin engancharse. Desde un bloque más
     alto, el techo es un escalón. Se cae sobre el poste a 1,5, un cuerpo dentro sube al plano
-    siguiente. Los rayos de colisión pegan en la mitad de arriba (cara, `t` y punto exactos) y
+    siguiente. Con una piedra al lado de la valla, en la misma capa y desde los cuatro lados, el
+    escalón, la caída y un paso de gravedad terminan en el techo de la valla, sin tocarla. Los rayos de colisión pegan en la mitad de arriba (cara, `t` y punto exactos) y
     los de apuntar no. Un chunk sin cargar bajo la celda corta el rayo y el barrido, salvo
     que el rayo ya haya pegado antes en un bloque. En `sweep.rs`, el test de los obstáculos que
     frenan el recorrido antes de un chunk sin cargar sube la caja medio bloque por esto.
   - `block_shapes.rs`: los oráculos de fuerza bruta (barridos por eje y rayos al azar) ahora
-    tienen vallas en sus campos.
+    tienen vallas en sus campos. El de barridos suma campos densos (densidad 0,3), donde bloques
+    de todo tipo comparten capa.
   - `boxel_physics/tests/player.rs`: la guarda corta en el borde con el margen exacto, no avanza
     ni retrocede desde el margen, corta las dos en una esquina, deja bajar una losa y no un
     bloque, no hace nada sin soporte o sin caída, toma cajas estáticas y techos de valla como
