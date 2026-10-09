@@ -128,7 +128,8 @@ mecanismo del motor que recalcule el estado de un bloque cuando cambia un vecino
   cajas de un bloque están dentro de su celda: la huella de una caja que se mueve, el orden en
   que las capas deciden el plano más cercano, la salida de un bloque y el raycast por celdas.
   Una caja que sale de la celda pide cambios en todos esos lugares del núcleo de la física, que
-  otro trabajo está tocando a la vez. Queda anotado para una issue.
+  otro trabajo está tocando a la vez. Queda anotado para una issue. Resuelto en ADR 0026: la
+  valla choca a 1,5 y se apunta a 1.
 
 ### 7. Ejemplos
 
@@ -162,7 +163,7 @@ mecanismo del motor que recalcule el estado de un bloque cuando cambia un vecino
 
 ## Fuera de esta parte
 
-- Valla de 1,5 bloques de alto (sección 6).
+- Valla de 1,5 bloques de alto (sección 6; hecho en ADR 0026).
 - Antorcha de pared inclinada como en Minecraft.
 - Puertas de valla, paneles, muros, escaleras con agua (`waterlogged`).
 - Que un cubo oculte su cara contra la espalda llena de una escalera: hoy se dibuja y la tapa la
