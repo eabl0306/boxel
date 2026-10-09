@@ -34,7 +34,9 @@ pub type OutlineEdge = [[u8; 3]; 2];
 pub struct BlockOutline {
     /// The block to outline.
     pub block: Option<BlockPos>,
-    /// Line color, linear RGBA, blended over the frame (default: black at 40 %, Minecraft's).
+    /// Line color, linear RGBA, blended over the frame in linear space (the target is sRGB).
+    /// The default, black at 67 %, darkens the picture as Minecraft's black at 40 % does in its
+    /// non-sRGB framebuffer: to 0.6 of each sRGB value, within 4 levels (of 255) from 40 to 240.
     pub color: [f32; 4],
     /// Line width in physical pixels (default 2).
     pub width: f32,
@@ -44,7 +46,7 @@ impl Default for BlockOutline {
     fn default() -> Self {
         Self {
             block: None,
-            color: [0.0, 0.0, 0.0, 0.4],
+            color: [0.0, 0.0, 0.0, 0.67],
             width: 2.0,
         }
     }

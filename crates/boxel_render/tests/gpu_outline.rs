@@ -7,7 +7,9 @@
 //! outline, with the cube outlined, with the fence outlined (its outline boxes: the post, a
 //! block tall) and with a block under the floor outlined. Asserts:
 //!
-//! - an outline shows (enough pixels change) and only darkens the picture (black lines at 40 %);
+//! - an outline shows (enough pixels change) and only darkens the picture;
+//! - with `BlockOutline`'s default color it darkens as much as Minecraft's: to 0.6 of each sRGB
+//!   value (the median over the darkened channels);
 //! - the outline of the hidden block changes nothing (depth tested against the terrain);
 //! - setting the outline back to `None` gives the picture without it again, and the outline is
 //!   not counted in the draw calls;
@@ -25,7 +27,8 @@ use boxel_gfx::{
 use boxel_math::{DVec3, I64Vec3, UVec2};
 use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher};
 use boxel_render::{
-    DEFAULT_SKY_COLOR, Outline, RendererConfig, ViewParams, VoxelRenderer, block_outline_edges,
+    BlockOutline, DEFAULT_SKY_COLOR, Outline, RendererConfig, ViewParams, VoxelRenderer,
+    block_outline_edges,
 };
 use boxel_transform::Transform;
 use boxel_voxel::{BlockRegistry, BlockState, ChunkData, LocalPos};
@@ -38,6 +41,10 @@ const HEIGHT: u32 = 180;
 const MAX_DIFF: f64 = 0.001;
 /// An outline changes at least this many pixels.
 const MIN_OUTLINE_PIXELS: usize = 100;
+/// Minecraft's outline, black at 40 % blended on sRGB values, leaves 0.6 of each one.
+const MINECRAFT_DARKENING: f64 = 0.6;
+/// How far the median darkening of an outline may be from [`MINECRAFT_DARKENING`].
+const DARKENING_TOLERANCE: f64 = 0.04;
 
 // ---------------------------------------------------------------- adapters
 
@@ -179,7 +186,7 @@ fn outline(registry: &BlockRegistry, block: [i64; 3], state: &str) -> Outline {
     Outline {
         block: I64Vec3::from_array(block),
         edges: block_outline_edges(registry, state).into(),
-        color: [0.0, 0.0, 0.0, 0.4],
+        color: BlockOutline::default().color,
         width: 2.0,
     }
 }
@@ -322,7 +329,7 @@ impl Report {
     }
 
     /// `lined` is `plain` with dark lines: at least [`MIN_OUTLINE_PIXELS`] pixels darker, none
-    /// brighter.
+    /// brighter, darkened as Minecraft's are ([`MINECRAFT_DARKENING`]).
     fn check_lines(&mut self, what: &str, plain: (&str, &RgbaImage), lined: (&str, &RgbaImage)) {
         let mut darker = 0;
         let mut brighter = 0;
@@ -337,6 +344,37 @@ impl Report {
         if darker < MIN_OUTLINE_PIXELS || brighter > 0 {
             self.fail(
                 format!("{what}: {darker} pixels darker, {brighter} brighter"),
+                &[plain, lined],
+            );
+        }
+        // How much the lines darken: the median of `lined / plain` over the channels of the
+        // darkened pixels, from a plain value of 64 up (where 8 bits resolve the ratio). The
+        // few pixels where two edges overlap are darker.
+        let mut ratios = Vec::new();
+        for (a, b) in plain.1.data.chunks(4).zip(lined.1.data.chunks(4)) {
+            if (0..3).any(|c| b[c].saturating_add(8) < a[c]) {
+                ratios.extend(
+                    (0..3)
+                        .filter(|&c| a[c] >= 64)
+                        .map(|c| f64::from(b[c]) / f64::from(a[c])),
+                );
+            }
+        }
+        ratios.sort_by(f64::total_cmp);
+        let median = ratios.get(ratios.len() / 2).copied().unwrap_or(f64::NAN);
+        eprintln!(
+            "gpu_outline: {what}: darkened to {median:.3} of the sRGB value ({} channels)",
+            ratios.len()
+        );
+        if ratios.len() < MIN_OUTLINE_PIXELS
+            || (median - MINECRAFT_DARKENING).abs() > DARKENING_TOLERANCE
+        {
+            self.fail(
+                format!(
+                    "{what}: darkened to {median:.3} of the sRGB value over {} channels, \
+                     Minecraft's is {MINECRAFT_DARKENING}",
+                    ratios.len()
+                ),
                 &[plain, lined],
             );
         }

@@ -105,9 +105,13 @@
 
 ### 5. Contorno del bloque apuntado
 
-- Recurso `BlockOutline` (`boxel_render`): `block`, el color (negro al 40 %, el de Minecraft) y
-  el ancho en píxeles (2). El juego pone el bloque apuntado. El plugin lee su estado cada frame,
-  así el contorno sigue al bloque (una valla que se conecta, una losa que pasa a doble).
+- Recurso `BlockOutline` (`boxel_render`): `block`, el color y el ancho en píxeles (2). El juego
+  pone el bloque apuntado. El plugin lee su estado cada frame, así el contorno sigue al bloque
+  (una valla que se conecta, una losa que pasa a doble).
+- El color por defecto es negro al 67 %. Minecraft usa negro al 40 %, pero mezcla sobre valores
+  sRGB y deja 0,6 de cada uno. Acá el destino es sRGB y la mezcla es lineal: con 40 % la línea
+  saldría un tercio más clara, y 67 % da el mismo 0,6 (a 4 niveles de 255 o menos, de 40 a
+  240).
 - Las aristas (`block_outline_edges`) salen del contorno del modelo: la unión de sus cajas en una
   grilla de dieciseisavos, con una arista donde la superficie dobla. Así una escalera se dibuja
   como una sola forma, como en Minecraft. Se guardan por estado.
@@ -184,9 +188,10 @@
     doble corriendo), baja y aterriza, y se apaga. Todo igual bit a bit en cinco bases.
   - `boxel_render`: aristas de un cubo, una escalera (una forma) y una valla; los quads son los
     mismos en cualquier lugar del mundo y se cortan en el plano cercano.
-    `tests/gpu_outline.rs`: en cada tier, el contorno se ve y solo oscurece, el de un bloque
-    tapado no cambia ningún píxel, sacarlo vuelve a la imagen sin él, no cuenta draws, y todos los
-    tiers dan los mismos píxeles (AMD 780M, RTX 5050 en Vulkan y GL, llvmpipe: diferencia 0 %).
+    `tests/gpu_outline.rs`: en cada tier, el contorno se ve y solo oscurece (con el color por
+    defecto, a 0,6 del valor sRGB en la mediana, como en Minecraft), el de un bloque tapado no
+    cambia ningún píxel, sacarlo vuelve a la imagen sin él, no cuenta draws, y todos los tiers
+    dan los mismos píxeles (AMD 780M, RTX 5050 en Vulkan y GL, llvmpipe: diferencia 0 %).
   - `boxel_shaders`: el overlay y el contorno no tienen recursos globales.
   - `voxel_world` (sin ventana): el bloque apuntado se contornea y fuera de alcance no; Ctrl corre
     y Shift se agacha con F3; agachado no cae al pozo y sin agacharse sí; Espacio dos veces vuela,
