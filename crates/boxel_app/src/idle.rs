@@ -7,7 +7,8 @@
 //! schedule once with an [`IdleStep`] that says when it must return; its systems say whether
 //! they want another step at once ([`IdleWork::Ready`]), only after a short poll
 //! ([`IdleWork::Waiting`]) or none before the next update ([`IdleWork::Done`]). Without a limit,
-//! or without `Idle` systems, no step ever runs.
+//! or without `Idle` systems, no step ever runs. An app can also say after each update whether
+//! a step would find work ([`IdleWanted`]); when none would, the runner opens no slot.
 use crate::schedules::Idle;
 use crate::{App, FramePacer};
 use boxel_ecs::prelude::*;
@@ -70,6 +71,48 @@ impl IdleStep {
     }
 }
 
+/// Whether a step after the current update would find work, asked by the update's own systems
+/// so a runner opens no idle slot (no `Poll`, no step) after an update that leaves nothing to do.
+///
+/// Optional. Without this resource a runner opens a slot after every update with room for a
+/// step, and the first step finds out. With it, the runners clear it before every update
+/// ([`IdleWanted::before_update`]) and open a slot only if a system of that update asked for one
+/// ([`IdleWanted::want`], the answers add up), so in an app that has it every plugin with `Idle`
+/// systems must ask when it leaves work. `boxel_world` adds it and asks at the end of its frame
+/// steps.
+///
+/// Why (ADR 0022): a slot whose only step answers [`IdleWork::Done`] costs about 6 us, yet on
+/// the RTX 5050 under PRIME it made the runs that keep skipping refreshes more frequent (issue
+/// #5). Without a slot the wait is the plain one of an app without `Idle` systems.
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IdleWanted(bool);
+
+impl IdleWanted {
+    /// Asks for idle steps after this update when `wanted` (one ask is enough: later answers
+    /// never take it back).
+    pub fn want(&mut self, wanted: bool) {
+        self.0 |= wanted;
+    }
+
+    /// True if a system of this update asked for idle steps.
+    pub fn wanted(self) -> bool {
+        self.0
+    }
+
+    /// For runners, before an update: forgets what the previous update asked.
+    pub fn before_update(world: &mut World) {
+        if let Some(mut wanted) = world.get_resource_mut::<Self>() {
+            wanted.set_if_neq(Self(false));
+        }
+    }
+
+    /// For runners, after an update: whether to open an idle slot. True without an
+    /// `IdleWanted` (the app gives no hint), else whether a system of the update asked.
+    pub fn after_update(world: &World) -> bool {
+        world.get_resource::<Self>().is_none_or(|wanted| wanted.0)
+    }
+}
+
 /// What the runner did between updates, for diagnostics (benchmarks, overlays). Both runners
 /// write it right before each update, next to [`FrameDeadline`](crate::FrameDeadline).
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -127,7 +170,8 @@ impl FramePacer {
 }
 
 impl App {
-    /// True if the [`Idle`] schedule has systems (runners slot idle steps only then).
+    /// True if the [`Idle`] schedule has systems (runners slot idle steps only then, and with an
+    /// [`IdleWanted`] only after an update that asked for them).
     pub fn has_idle_systems(&self) -> bool {
         self.world()
             .get_resource::<Schedules>()

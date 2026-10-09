@@ -30,7 +30,8 @@ pub use frame_limit::{
     DEFAULT_MAX_FPS, FrameDeadline, FrameLimit, FramePacer, FrameWait, spin_until,
 };
 pub use idle::{
-    IDLE_MARGIN, IDLE_POLL, IDLE_STEP, IdleInfo, IdleStep, IdleWork, MIN_IDLE_STEP, idle_step_end,
+    IDLE_MARGIN, IDLE_POLL, IDLE_STEP, IdleInfo, IdleStep, IdleWanted, IdleWork, MIN_IDLE_STEP,
+    idle_step_end,
 };
 pub use plugin::{Plugin, Plugins};
 pub use plugin_group::{PluginGroup, PluginGroupBuilder};

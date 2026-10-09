@@ -1,8 +1,9 @@
-//! Work between frames (ADR 0022): the idle slot and step math on a synthetic clock, and
-//! `App::run_idle`.
+//! Work between frames (ADR 0022): the idle slot and step math on a synthetic clock,
+//! `IdleWanted` and `App::run_idle`.
 use boxel_app::prelude::*;
 use boxel_app::{
-    FramePacer, IDLE_MARGIN, IDLE_STEP, IdleInfo, IdleStep, IdleWork, MIN_IDLE_STEP, idle_step_end,
+    FramePacer, IDLE_MARGIN, IDLE_STEP, IdleInfo, IdleStep, IdleWanted, IdleWork, MIN_IDLE_STEP,
+    idle_step_end,
 };
 use boxel_ecs::prelude::*;
 use boxel_ecs::schedule::ScheduleLabel;
@@ -66,6 +67,28 @@ fn idle_work_keeps_the_most_urgent() {
     step.want(IdleWork::Ready);
     step.want(IdleWork::Waiting);
     assert_eq!(step.work(), IdleWork::Ready);
+}
+
+#[test]
+fn idle_wanted_adds_up_the_asks_of_an_update() {
+    // Without the resource the app gives no hint: a runner opens a slot after every update.
+    let mut app = App::new();
+    assert!(IdleWanted::after_update(app.world()));
+    IdleWanted::before_update(app.world_mut());
+    assert!(!app.world().contains_resource::<IdleWanted>());
+    // With it, only an update that asked opens one; one ask is enough.
+    app.init_resource::<IdleWanted>();
+    assert!(!IdleWanted::after_update(app.world()));
+    let mut wanted = app.world_mut().resource_mut::<IdleWanted>();
+    wanted.want(false);
+    assert!(!wanted.wanted());
+    wanted.want(true);
+    wanted.want(false);
+    assert!(wanted.wanted());
+    assert!(IdleWanted::after_update(app.world()));
+    // The next update starts without an ask.
+    IdleWanted::before_update(app.world_mut());
+    assert!(!IdleWanted::after_update(app.world()));
 }
 
 #[test]

@@ -2,8 +2,8 @@
 //! lifecycle.
 use boxel_app::prelude::*;
 use boxel_app::{
-    FrameDeadline, FramePacer, IDLE_MARGIN, IDLE_STEP, IdleInfo, IdleStep, IdleWork, PluginsState,
-    RunMode,
+    FrameDeadline, FramePacer, IDLE_MARGIN, IDLE_STEP, IdleInfo, IdleStep, IdleWanted, IdleWork,
+    PluginsState, RunMode,
 };
 use boxel_ecs::prelude::*;
 use std::sync::Arc;
@@ -407,6 +407,54 @@ fn a_done_step_closes_the_slot_until_the_next_update() {
         ran += steps.len();
     }
     assert!(ran > 0, "no gap ran its step");
+}
+
+#[test]
+fn idle_steps_follow_only_the_updates_that_asked() {
+    // Updates that found an ask left from the previous one.
+    let stale = Arc::new(AtomicU32::new(0));
+    let seen = stale.clone();
+    let (mut app, log) = idle_app(
+        RunMode::Loop {
+            wait: Some(Duration::from_millis(5)),
+        },
+        None,
+        20,
+        Duration::ZERO,
+        |_| IdleWork::Done,
+    );
+    app.init_resource::<IdleWanted>().add_systems(
+        Update,
+        move |mut updates: Local<u32>, mut wanted: ResMut<IdleWanted>| {
+            *updates += 1;
+            seen.fetch_add(u32::from(wanted.wanted()), Ordering::Relaxed);
+            // Odd updates ask; a later answer of the same update never takes it back.
+            wanted.want(*updates % 2 == 1);
+            wanted.want(false);
+        },
+    );
+    assert_eq!(app.run(), AppExit::Success);
+    assert_eq!(
+        stale.load(Ordering::Relaxed),
+        0,
+        "cleared before each update"
+    );
+    let log = take(log);
+    let mut ran = 0;
+    for (k, (_, steps, next)) in gaps(&log).iter().enumerate() {
+        let Some(Seen::Update { idle, .. }) = next else {
+            continue;
+        };
+        assert_eq!(idle.steps as usize, steps.len(), "gap {k}");
+        if k % 2 == 0 {
+            // At most one (none if the OS kept the thread off the CPU past the slot).
+            assert!(steps.len() <= 1, "gap {k}: {steps:?}");
+            ran += steps.len();
+        } else {
+            assert!(steps.is_empty(), "gap {k}: no ask, no slot: {steps:?}");
+        }
+    }
+    assert!(ran > 0, "no gap that asked ran its step");
 }
 
 #[test]

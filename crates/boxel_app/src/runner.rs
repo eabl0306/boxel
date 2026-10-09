@@ -1,7 +1,7 @@
 use crate::frame_limit::sleep_until;
 use crate::{
-    App, AppExit, FrameDeadline, FrameLimit, FramePacer, IDLE_POLL, IdleInfo, IdleWork, Plugin,
-    PluginsState, idle_step_end,
+    App, AppExit, FrameDeadline, FrameLimit, FramePacer, IDLE_POLL, IdleInfo, IdleWanted, IdleWork,
+    Plugin, PluginsState, idle_step_end,
 };
 use boxel_ecs::world::World;
 use std::time::{Duration, Instant};
@@ -54,7 +54,8 @@ impl Plugin for ScheduleRunnerPlugin {
 /// The headless runner installed by [`ScheduleRunnerPlugin`]. Runs `Shutdown` once before
 /// returning, in both modes. In `Loop` mode it writes [`FrameDeadline`] and [`IdleInfo`] before
 /// every update, and, while paced, runs idle steps after each update until the idle slot of the
-/// next deadline ends ([`FramePacer::idle_end`]).
+/// next deadline ends ([`FramePacer::idle_end`]); with an [`IdleWanted`], only after an update
+/// that asked for them.
 fn run_headless(mut app: App, mode: RunMode) -> AppExit {
     while app.plugins_state() == PluginsState::Adding {
         std::thread::yield_now();
@@ -78,6 +79,7 @@ fn run_headless(mut app: App, mode: RunMode) -> AppExit {
                 let world = app.world_mut();
                 world.insert_resource(FrameDeadline::after_start(&pacer, period, last_update));
                 world.insert_resource(idle.take_gap());
+                IdleWanted::before_update(world);
                 app.update();
                 last_update = start.elapsed();
                 if let Some(exit) = app.should_exit() {
@@ -86,6 +88,7 @@ fn run_headless(mut app: App, mode: RunMode) -> AppExit {
                 let period = loop_period(app.world(), wait);
                 if let Some(end) = pacer.idle_end(period)
                     && app.has_idle_systems()
+                    && IdleWanted::after_update(app.world())
                 {
                     run_idle_slot(&mut app, end, &mut idle);
                 }
