@@ -140,6 +140,16 @@ para después:
   ediciones, los ticks y el reloj. Así un cierre inesperado pierde como mucho eso. Los chunks
   editados se llevan en un conjunto, no se recorre el mapa. El hilo principal solo copia la
   lista de ticks pendientes; el job de guardado la codifica y la comprime.
+- **Un solo momento en el disco.** Los ticks y el reloj se guardan siempre en la misma
+  transacción que todos los chunks con ediciones, cargados o entregados, y de ese mismo frame.
+  Sin esto, un cierre inesperado mezclaba momentos: un chunk guardado al descargarse con agua a
+  medio correr y los ticks del autoguardado anterior, y el agua quedaba trabada (test). Por eso:
+  - esa foto se toma en el frame en que arranca el job, no antes (si hay un job corriendo, el
+    autoguardado espera a que termine);
+  - si hay ticks esperando, un chunk editado que se descarga no sale solo: su job es una foto
+    completa, como el autoguardado (test con el agua en un chunk que sigue cargado);
+  - un job que lleva los ticks lleva todos los chunks entregados, aunque pasen de `max_batch`.
+    Lo mismo al salir.
 - **Salida** (schedule `Shutdown`, que corren los dos runners): espera el job en curso y escribe
   todo lo que queda en el hilo principal, que ya no dibuja.
 
@@ -172,6 +182,10 @@ deterministas.
 - Un mundo guardado ocupa lo que ocupan sus ediciones, no lo que se exploró.
 - Los ticks congelados de chunks que no vuelven siguen en memoria (como antes) y ahora también se
   guardan. Si fueran muchos, convendría guardarlos con su chunk.
+- Mientras haya ticks esperando, cada job que guarda chunks descargados copia la lista de ticks
+  en el hilo principal y vuelve a escribir los chunks cargados con ediciones. Guardar los ticks
+  de cada chunk con su registro lo evitaría, pero cambia cómo `BlockTicks` guarda los ticks
+  congelados.
 - El índice de chunks guardados se lee entero al abrir: con un millón de chunks editados serían
   unos 32 MB de claves y quizá medio segundo. Para mundos así habría que leerlo por regiones.
 - Un bloque que ya no existe se pierde (aire) en cuanto su chunk se edita y se guarda.
@@ -185,13 +199,15 @@ Tests (en `crates/boxel_world`):
   registro distinto, un bloque que ya no existe, una propiedad y un valor que ya no existen;
   cualquier bit cambiado o registro cortado es un error, y bytes al azar nunca entran en pánico.
 - `persist/tests.rs`: metadatos de un mundo nuevo, nombres reservados, copias pendientes, el
-  índice, el tamaño de los lotes y el orden de los ticks; un archivo redb cuyo disco falla y
-  vuelve (guardar y cargar funcionan otra vez y no se pierde nada).
+  índice, el tamaño de los lotes (un job con los ticks lleva todos los chunks) y el orden de los
+  ticks; un archivo redb cuyo disco falla y vuelve (guardar y cargar funcionan otra vez y no se
+  pierde nada).
 - `tests/persist.rs`: editar, descargar, volver y reiniciar la app, cerca del origen, cruzando
   ±2^31, en 2^40 y junto al límite del mundo, comparando los chunks vóxel por vóxel y que solo se
   guardan los editados (una vez más con los pools de tareas del juego, no en línea); guardado al salir y autoguardado; techos de cielo después de reiniciar,
   con un bloque guardado que no está cargado; agua que corre igual con un reinicio en el medio
-  que sin él; el reloj; un registro dañado; otra versión y metadatos dañados; un estado que ya no
+  que sin él, también después de un cierre inesperado tras guardar chunks al descargarlos; el
+  reloj; un registro dañado; otra versión y metadatos dañados; un estado que ya no
   existe; un mundo en redb en un directorio que no existía, un archivo que no es una base y las
   claves lejanas en redb; un chunk que vuelve antes de su escritura; un disco que falla y vuelve;
   un chunk que el disco no puede leer no se genera ni se guarda encima de su registro.
@@ -214,7 +230,8 @@ un `Option`. Con un mundo sin ediciones, el índice está vacío. Para la próxi
   alrededor del origen), volando por encima: el peor frame no debería subir.
 - Cuánto tarda un job de guardado de 256 chunks y cuánto ocupa un mundo de prueba en disco.
 - El frame del autoguardado con mucha agua corriendo: copia la lista de ticks pendientes en el
-  hilo principal (`BlockTicks::pending`), lineal en la cantidad de ticks.
+  hilo principal (`BlockTicks::pending`), lineal en la cantidad de ticks. Lo mismo volando sobre
+  chunks editados con agua corriendo, porque cada job de descarga hace esa copia.
 
 ## Alternativas descartadas
 

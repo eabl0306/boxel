@@ -206,19 +206,45 @@ impl Persist {
         self.meta.push((name, value));
     }
 
-    /// A frame's step: takes the report of the save job that finished, then starts the next one
-    /// (at most `max_batch` chunks) if none runs and something waits. A failed save waits
-    /// `retry_after` before the next try.
+    /// A frame's step: [`Persist::poll`], then [`Persist::start`].
+    #[cfg(test)]
     pub(crate) fn frame(&mut self, now: Instant, max_batch: usize, retry_after: Duration) {
+        self.poll(now, retry_after);
+        self.start(now, max_batch);
+    }
+
+    /// Takes the report of the save job that finished. A failed save waits `retry_after` before
+    /// the next try.
+    pub(crate) fn poll(&mut self, now: Instant, retry_after: Duration) {
         self.retry_after = retry_after;
         while let Ok(report) = self.rx.try_recv() {
             self.on_report(report, now);
         }
-        let wait = self.retry_at.is_some_and(|at| now < at);
-        if self.in_flight || wait || (self.queue.is_empty() && self.meta.is_empty()) {
+    }
+
+    /// A save job can start now: none runs, and no failure waits for its next try.
+    pub(crate) fn can_start(&self, now: Instant) -> bool {
+        !self.in_flight && !self.retry_at.is_some_and(|at| now < at)
+    }
+
+    /// The staged chunks the next job takes: at most `max_batch`, or every one when it writes
+    /// metadata (the ticks and the clock are of the moment the chunks were staged up to: they go
+    /// in the same transaction).
+    fn batch_len(&self, max_batch: usize) -> usize {
+        if self.meta.is_empty() {
+            max_batch.max(1).min(self.queue.len())
+        } else {
+            self.queue.len()
+        }
+    }
+
+    /// Starts the next save job if one can start and something waits (see
+    /// [`Persist::batch_len`]).
+    pub(crate) fn start(&mut self, now: Instant, max_batch: usize) {
+        if !self.can_start(now) || (self.queue.is_empty() && self.meta.is_empty()) {
             return;
         }
-        let n = max_batch.max(1).min(self.queue.len());
+        let n = self.batch_len(max_batch);
         let keys: Vec<ChunkKey> = self.queue.drain(..n).collect();
         for key in &keys {
             self.queued.remove(key);
@@ -290,13 +316,13 @@ impl Persist {
         }
     }
 
-    /// Writes everything staged and the metadata now, on this thread, in batches of
-    /// `max_batch` chunks (exit). Returns the first error; what failed stays in memory.
+    /// Writes everything staged and the metadata now, on this thread, in batches as save jobs
+    /// take them (exit). Returns the first error; what failed stays in memory.
     pub(crate) fn save_now(&mut self, max_batch: usize) -> std::io::Result<()> {
         self.wait();
         let mut first_error = None;
         loop {
-            let n = max_batch.max(1).min(self.queue.len());
+            let n = self.batch_len(max_batch);
             let keys: Vec<ChunkKey> = self.queue.drain(..n).collect();
             for key in &keys {
                 self.queued.remove(key);

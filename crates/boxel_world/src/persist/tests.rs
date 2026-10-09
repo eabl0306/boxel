@@ -223,6 +223,71 @@ fn save_jobs_take_at_most_a_batch() {
     assert_eq!(p.queued(), 0);
 }
 
+/// A memory store that counts its write transactions.
+#[derive(Default)]
+struct Counting {
+    inner: MemoryStore,
+    batches: std::sync::atomic::AtomicUsize,
+}
+
+impl ChunkStore for Counting {
+    fn load(&self, key: ChunkKey) -> std::io::Result<Option<Vec<u8>>> {
+        self.inner.load(key)
+    }
+    fn keys(&self) -> std::io::Result<Vec<ChunkKey>> {
+        self.inner.keys()
+    }
+    fn load_meta(&self, name: &str) -> std::io::Result<Option<Vec<u8>>> {
+        self.inner.load_meta(name)
+    }
+    fn save_batch(&self, batch: &SaveBatch) -> std::io::Result<()> {
+        self.batches.fetch_add(1, Ordering::SeqCst);
+        self.inner.save_batch(batch)
+    }
+}
+
+/// A job that writes the metadata (the ticks and the clock) writes every staged chunk with it, in
+/// one transaction, whatever `max_batch` says; so does the exit.
+#[test]
+fn a_save_with_metadata_takes_every_staged_chunk() {
+    let backend = Arc::new(Counting::default());
+    let store = WorldStore::open(
+        Arc::clone(&backend) as Arc<dyn ChunkStore>,
+        &BlockRegistry::default_blocks(),
+        "test",
+    )
+    .unwrap();
+    let mut p = Persist::new(store, Arc::new(InlineExecutor));
+    let batches = || backend.batches.load(Ordering::SeqCst);
+    for x in 0..10 {
+        p.stage(key(x, 0, 0), stone_chunk());
+    }
+    let (name, value) = store::clock_meta(77);
+    p.set_meta(name, value);
+    let before = batches();
+    p.frame(Instant::now(), 4, Duration::ZERO);
+    assert_eq!((backend.inner.len(), batches()), (10, before + 1));
+    assert_eq!(p.queued(), 0);
+    assert!(backend.load_meta("boxel:clock").unwrap().is_some());
+
+    // At exit.
+    for x in 10..20 {
+        p.stage(key(x, 0, 0), stone_chunk());
+    }
+    let (name, value) = store::clock_meta(78);
+    p.set_meta(name, value);
+    let before = batches();
+    p.save_now(4).unwrap();
+    assert_eq!((backend.inner.len(), batches()), (20, before + 1));
+    // Without metadata, batches of `max_batch`.
+    for x in 20..30 {
+        p.stage(key(x, 0, 0), stone_chunk());
+    }
+    let before = batches();
+    p.save_now(4).unwrap();
+    assert_eq!((backend.inner.len(), batches()), (30, before + 3));
+}
+
 #[test]
 fn pending_ticks_restore_in_order_relative_to_the_clock() {
     let mut ticks = BlockTicks::default();

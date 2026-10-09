@@ -485,6 +485,112 @@ fn flowing_water_goes_on_after_a_restart() {
     }
 }
 
+/// Water whose chunks unload mid flow is saved with its ticks, in the same write: after a crash
+/// (no `Shutdown`, no autosave) it goes on as if nothing happened, never stuck half spread.
+#[test]
+fn water_saved_as_it_unloads_goes_on_after_a_crash() {
+    for o in [origins()[0], origins()[1]] {
+        let source = |registry: &BlockRegistry| {
+            (
+                at(o, 0, 0, 0),
+                registry.parse_state("boxel:water[level=0]").unwrap(),
+            )
+        };
+        let mut setup = Setup::new(Arc::new(MemoryStore::new()), o.y);
+        setup.fluids = true;
+        let (mut uninterrupted, _) = setup.start(o);
+        let (p, s) = source(&setup.registry);
+        uninterrupted
+            .world_mut()
+            .resource_mut::<EditQueue>()
+            .set_block(p, s);
+        uninterrupted.update();
+        for _ in 0..40 {
+            step(&mut uninterrupted);
+        }
+
+        // Unloaded after 12 ticks, mid flow, and saved; then the game dies.
+        let backend: Arc<dyn ChunkStore> = Arc::new(MemoryStore::new());
+        setup.backend = Arc::clone(&backend);
+        let (mut first, viewer) = setup.start(o);
+        first
+            .world_mut()
+            .resource_mut::<EditQueue>()
+            .set_block(p, s);
+        first.update();
+        for _ in 0..12 {
+            step(&mut first);
+        }
+        assert!(first.world().resource::<BlockTicks>().stats().queued > 0);
+        move_viewer(&mut first, viewer, at(o, 1 << 13, 0, 0));
+        assert!(saved_keys(backend.as_ref()).contains(&ChunkPos::containing(p)));
+        drop(first);
+
+        let (mut second, _) = setup.start(o);
+        assert!(
+            second.world().resource::<BlockTicks>().stats().queued > 0,
+            "{o:?}: the ticks were saved with the water"
+        );
+        for _ in 12..40 {
+            step(&mut second);
+        }
+        assert_eq!(water(&second, o), water(&uninterrupted, o), "{o:?}");
+    }
+}
+
+/// While water flows in a loaded chunk, another chunk with edits unloads and is saved: the
+/// water's chunk and its ticks are saved with it, of the same moment. After a crash the water
+/// goes on as if nothing happened.
+#[test]
+fn a_crash_after_an_unload_keeps_loaded_water_and_its_ticks_together() {
+    // The water stays inside chunk x = 0 (and its reach too); the edit is in chunk x = -2.
+    let o = BlockPos::new(16, 0, 16);
+    let mut setup = Setup::new(Arc::new(MemoryStore::new()), o.y);
+    setup.fluids = true;
+    let stone = setup.registry.by_name("boxel:stone").unwrap();
+    let source = (
+        o,
+        setup.registry.parse_state("boxel:water[level=0]").unwrap(),
+    );
+    let elsewhere = at(o, -64, 1, 0);
+    let run = |app: &mut App, from: u32, to: u32| {
+        for _ in from..to {
+            step(app);
+        }
+    };
+    let (mut uninterrupted, _) = setup.start(o);
+    edit(&mut uninterrupted, &[(elsewhere, stone)]);
+    uninterrupted
+        .world_mut()
+        .resource_mut::<EditQueue>()
+        .set_block(source.0, source.1);
+    uninterrupted.update();
+    run(&mut uninterrupted, 0, 40);
+
+    let backend: Arc<dyn ChunkStore> = Arc::new(MemoryStore::new());
+    setup.backend = Arc::clone(&backend);
+    let (mut first, viewer) = setup.start(o);
+    edit(&mut first, &[(elsewhere, stone)]);
+    first
+        .world_mut()
+        .resource_mut::<EditQueue>()
+        .set_block(source.0, source.1);
+    first.update();
+    run(&mut first, 0, 12);
+    // Three chunks east: the edited chunk unloads, the water's stays (within the hysteresis).
+    move_viewer(&mut first, viewer, at(o, 96, 0, 0));
+    let map = first.world().resource::<ChunkMap>();
+    assert!(map.id_at(ChunkPos::containing(elsewhere)).is_none());
+    assert!(map.id_at(ChunkPos::containing(o)).is_some());
+    assert!(saved_keys(backend.as_ref()).contains(&ChunkPos::containing(o)));
+    drop(first);
+
+    let (mut second, _) = setup.start(o);
+    assert_eq!(block(&second, elsewhere), stone);
+    run(&mut second, 12, 40);
+    assert_eq!(water(&second, o), water(&uninterrupted, o));
+}
+
 #[test]
 fn the_world_clock_is_saved() {
     let backend: Arc<dyn ChunkStore> = Arc::new(MemoryStore::new());

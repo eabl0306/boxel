@@ -17,7 +17,9 @@ pub struct PersistSettings {
     /// the world clock are saved (a crash loses at most this much). `None`: only when a chunk
     /// unloads and on exit. Default 60 s.
     pub autosave: Option<Duration>,
-    /// Most chunk records per save job (one write transaction). Default 256.
+    /// Most chunk records per save job (one write transaction). Default 256. A job that also
+    /// writes the pending ticks and the clock writes every chunk handed over with them, in the
+    /// same transaction: what the disk holds is always one moment of the world.
     pub max_batch: usize,
     /// After a save fails, how long until the next try (its chunks stay in memory meanwhile).
     /// Default 1 s.
@@ -48,8 +50,9 @@ impl Default for PersistSettings {
 ///   (the light's sky tops, ADR 0015) reads saved chunks too, so the light of a saved world is
 ///   the light it had.
 /// - The pending block ticks ([`BlockTicks`], flowing water) and the world clock
-///   ([`TimeOfDay`], unless [`PersistSettings::clock`] is off) are saved with the autosave and
-///   on exit, and restored at startup.
+///   ([`TimeOfDay`], unless [`PersistSettings::clock`] is off) are saved with the autosave, on
+///   exit and with chunks that unload while ticks wait, always in one transaction with every
+///   edited chunk (one moment of the world), and restored at startup.
 ///
 /// Disk writes run in save jobs on `executor` (the IO task pool by default), one at a time; a
 /// frame only hands chunks over and starts a job. Loads read the store inside the generation
@@ -140,8 +143,14 @@ fn save_meta(
     }
 }
 
-/// Every frame, after the world's systems: the autosave when due, then the save job (one at a
-/// time; it writes what unloading and the autosave handed over).
+/// Every frame, after the world's systems: the save job (one at a time; it writes what unloading
+/// and the autosave handed over).
+///
+/// The disk always holds one moment of the world: the pending ticks and the clock go with every
+/// edited chunk, loaded or handed over, in one transaction. That snapshot is taken in the frame
+/// its job starts, by the autosave and whenever chunks with edits unloaded while block ticks
+/// wait: their water must never be saved without its ticks (a crash before the next autosave
+/// would leave it stuck half spread), nor the ticks without the water of the loaded chunks.
 fn save_step(
     mut jobs: ResMut<WorldJobs>,
     mut map: ResMut<ChunkMap>,
@@ -154,14 +163,22 @@ fn save_step(
         return;
     };
     let now = Instant::now();
-    if let Some(every) = settings.autosave
-        && now.saturating_duration_since(p.last_autosave) >= every
-    {
-        p.last_autosave = now;
-        p.stage_dirty(map.bypass_change_detection());
-        save_meta(p, &settings, ticks.as_deref(), time.as_deref());
+    p.poll(now, settings.retry_after);
+    if p.can_start(now) {
+        let autosave = settings
+            .autosave
+            .is_some_and(|every| now.saturating_duration_since(p.last_autosave) >= every);
+        let ticking = ticks.as_deref().is_some_and(|t| {
+            let stats = t.stats();
+            stats.queued + stats.frozen > 0
+        });
+        if autosave || (ticking && p.queued() > 0) {
+            p.last_autosave = now;
+            p.stage_dirty(map.bypass_change_detection());
+            save_meta(p, &settings, ticks.as_deref(), time.as_deref());
+        }
     }
-    p.frame(now, settings.max_batch, settings.retry_after);
+    p.start(now, settings.max_batch);
 }
 
 /// `Shutdown`: waits for the running save, then writes every loaded chunk with edits, what is
