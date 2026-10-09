@@ -184,7 +184,7 @@ impl TierPath for HighPath {
         pass.dispatch_workgroups(slot_count.div_ceil(bindings::CULL_WORKGROUP_SIZE), 1, 1);
     }
 
-    fn draw(&self, pass: &mut wgpu::RenderPass<'_>, _arena: &wgpu::Buffer) -> u32 {
+    fn draw_solid(&self, pass: &mut wgpu::RenderPass<'_>, _arena: &wgpu::Buffer) -> u32 {
         pass.set_bind_group(bindings::GROUP_GEOMETRY, &self.geometry, &[]);
         pass.set_vertex_buffer(0, self.draw_refs.slice(..));
         pass.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
@@ -204,8 +204,12 @@ impl TierPath for HighPath {
             4,
             self.cap_cutout,
         );
+        2
+    }
+
+    fn draw_translucent(&self, pass: &mut wgpu::RenderPass<'_>, _arena: &wgpu::Buffer) -> u32 {
         if self.translucent.is_empty() {
-            return 2;
+            return 0;
         }
         pass.set_pipeline(&self.voxel.translucent);
         pass.set_vertex_buffer(0, self.translucent_refs.slice(..));
@@ -213,6 +217,6 @@ impl TierPath for HighPath {
             let instance = i as u32;
             pass.draw_indexed(0..d.count * 6, 0, instance..instance + 1);
         }
-        2 + self.translucent.len() as u32
+        self.translucent.len() as u32
     }
 }

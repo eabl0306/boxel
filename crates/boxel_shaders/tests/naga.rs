@@ -413,6 +413,18 @@ fn low_tier_has_one_uniform_block_and_one_texture_sampler_pair() {
     assert_eq!((uniforms, textures, samplers), (1, 1, 1));
 }
 
+/// The overlay and the block outline (ADR 0026) run on every tier, the Low one included: no
+/// global resources at all (no uniform, texture, sampler or storage buffer), everything comes
+/// in vertex attributes.
+#[test]
+fn overlay_and_outline_bind_nothing() {
+    for id in [ShaderModuleId::Overlay, ShaderModuleId::Outline] {
+        let (module, _) = load(id);
+        assert_eq!(module.global_variables.len(), 0, "{id:?}");
+        assert!(!id.uses_immediates(), "{id:?}");
+    }
+}
+
 #[test]
 fn low_tier_takes_the_quad_and_its_light_as_two_instance_attributes() {
     let (module, _) = load(ShaderModuleId::VoxelInstanced);

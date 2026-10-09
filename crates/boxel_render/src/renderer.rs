@@ -1,6 +1,7 @@
 use crate::arena::{QUAD_BYTES, QuadArena};
 use crate::chunk_table::{ChunkRecord, ChunkTable};
 use crate::light::SceneLight;
+use crate::outline::{Outline, OutlinePass};
 use crate::path::{
     HighInputs, HighPath, LowPath, MidPath, SlotVisibility, TierPath, TierPipelines,
     geometry_bind_group, quad_index_buffer,
@@ -194,6 +195,8 @@ pub struct VoxelRenderer {
     occlusion: Occlusion,
     /// Chunks whose last upload was refused (cave culling must see through them).
     refused: Refused,
+    /// The block outline (ADR 0026).
+    outline: OutlinePass,
 }
 
 /// The chunks whose last upload [`VoxelRenderer::upsert_chunk`] refused (chunk table or arena
@@ -521,6 +524,7 @@ impl VoxelRenderer {
 
         let targets = Targets::new(device, size);
         let blit = Blit::new(device, output_format, &targets.color_view);
+        let outline = OutlinePass::new(device);
         Ok(Self {
             tier,
             materials,
@@ -542,7 +546,16 @@ impl VoxelRenderer {
             warned_list_overflow: false,
             occlusion: Occlusion::default(),
             refused: Refused::default(),
+            outline,
         })
+    }
+
+    /// Sets the block outline drawn by the next [`VoxelRenderer::render`] calls (ADR 0026),
+    /// `None` for none: thin lines along `outline.edges`, in the main pass after the opaque and
+    /// cutout buckets and before the translucent ones, depth tested, the same on every tier.
+    /// [`crate::BlockOutline`] does this from the render plugin.
+    pub fn set_outline(&mut self, outline: Option<Outline>) {
+        self.outline.set(outline);
     }
 
     /// Sets the chunks the camera may see (cave culling, ADR 0022): from the next
@@ -722,9 +735,11 @@ impl VoxelRenderer {
         self.uploads.fail_next_batch();
     }
     /// Encodes the tier's passes into the main color/depth targets: the chunk changes since the
-    /// last call and the translucent buckets re-sorted for this camera (uploads), clear, (High) cull, opaque buckets with the opaque pipeline, then the
-    /// cutout bucket with the cutout pipeline, then the translucent buckets back to front with
-    /// the translucent pipeline. Submit `encoder` before the next `render`.
+    /// last call and the translucent buckets re-sorted for this camera (uploads), clear, (High)
+    /// cull, opaque buckets with the opaque pipeline, then the cutout bucket with the cutout
+    /// pipeline, then the block outline ([`VoxelRenderer::set_outline`]), then the translucent
+    /// buckets back to front with the translucent pipeline. Submit `encoder` before the next
+    /// `render`.
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -814,12 +829,16 @@ impl VoxelRenderer {
         let used = visibility.is_some();
         let visible = self.path.prepare(queue, &self.chunks, view, visibility);
         let hidden = if used { self.occlusion.hidden } else { 0 };
+        self.outline.prepare(device, queue, view, self.targets.size);
         self.path.encode_compute(encoder, slot_count);
         let draws = {
             let mut pass = self.targets.begin_main_pass(encoder, view.clear_color);
             pass.set_bind_group(bindings::GROUP_MATERIALS, &self.materials, &[]);
             pass.set_bind_group(bindings::GROUP_VIEW, &self.view_bind_group, &[]);
-            self.path.draw(&mut pass, self.arena.buffer())
+            let solid = self.path.draw_solid(&mut pass, self.arena.buffer());
+            // Over the solid terrain, under the water (not counted in the draws).
+            self.outline.draw(&mut pass);
+            solid + self.path.draw_translucent(&mut pass, self.arena.buffer())
         };
         self.stats.visible_chunks = visible;
         self.stats.draws = draws;
