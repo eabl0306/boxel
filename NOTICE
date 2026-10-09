@@ -4,13 +4,13 @@ Copyright (c) 2026 boxel contributors. Licensed under MIT OR Apache-2.0.
 This repository contains code derived from the Bevy Engine (https://github.com/bevyengine/bevy),
 Copyright (c) Bevy Engine contributors, licensed under MIT OR Apache-2.0:
 
-- vendor/crates/boxel_ecs             <- bevy_ecs 0.20.0-rc.2
-- vendor/crates/boxel_ecs_macros      <- bevy_ecs_macros 0.20.0-rc.2
-- vendor/crates/boxel_ecs_macro_logic <- bevy_ecs_macro_logic 0.20.0-rc.2
-- vendor/crates/boxel_macro_utils     <- bevy_macro_utils 0.20.0-rc.2
-- vendor/crates/boxel_ptr             <- bevy_ptr 0.20.0-rc.2
-- vendor/crates/boxel_tasks           <- bevy_tasks 0.20.0-rc.2
-- vendor/crates/boxel_utils           <- bevy_utils 0.20.0-rc.2 and parts of bevy_platform 0.20.0-rc.2
+- vendor/crates/boxel_ecs             <- bevy_ecs 0.20.0
+- vendor/crates/boxel_ecs_macros      <- bevy_ecs_macros 0.20.0
+- vendor/crates/boxel_ecs_macro_logic <- bevy_ecs_macro_logic 0.20.0
+- vendor/crates/boxel_macro_utils     <- bevy_macro_utils 0.20.0
+- vendor/crates/boxel_ptr             <- bevy_ptr 0.20.0
+- vendor/crates/boxel_tasks           <- bevy_tasks 0.20.0
+- vendor/crates/boxel_utils           <- bevy_utils 0.20.0 and parts of bevy_platform 0.20.0
                                          (src/platform/cfg.rs, hash.rs, cell/)
 - crates/boxel_app                    <- design inspired by bevy_app 0.20.0-rc.2; the plugin tuple
                                          impl (`Plugins` marker trick) follows bevy_app's plugin.rs
