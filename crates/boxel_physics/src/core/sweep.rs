@@ -318,6 +318,11 @@ const LANDED: u8 = 1 << Face::NegY.index();
 /// The face bit of a clip moving up.
 const CEILING: u8 = 1 << Face::PosY.index();
 
+/// A displacement as the sweep uses it (see [`clean`]).
+pub(crate) fn clean_distance(d: DVec3) -> DVec3 {
+    DVec3::new(clean(d.x), clean(d.y), clean(d.z))
+}
+
 /// A displacement component as the sweep uses it: not finite counts as 0, and it is clamped to
 /// [`MAX_SWEEP_DISTANCE`].
 fn clean(v: f64) -> f64 {
@@ -342,7 +347,7 @@ pub(crate) fn effective_eps(eps: f64) -> f64 {
 /// `shape` as the sweep uses it (see [`move_box`]): a shape with a non-finite corner becomes a
 /// point at the origin, and an axis not larger than `2 * eps` is widened to `4 * eps` around
 /// its center, so the strict footprint of the box is never empty.
-fn usable_shape(shape: LocalBox, eps: f64) -> LocalBox {
+pub(crate) fn usable_shape(shape: LocalBox, eps: f64) -> LocalBox {
     let mut shape = if shape.min.is_finite() && shape.max.is_finite() {
         shape
     } else {

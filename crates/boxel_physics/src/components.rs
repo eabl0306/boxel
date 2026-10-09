@@ -518,6 +518,17 @@ impl PhysicsSync {
 /// stair of slabs; not a full block), as Minecraft's player and mobs do: the step moves it up
 /// within one fixed step (see `boxel_physics::move_box_stepping`). The body's position stays
 /// exact; a camera that follows it may smooth the rise for the eye.
+///
+/// Modes (ADR 0026), from [`MoveIntent`] and [`CharacterController::flying`]:
+/// - Sneaking ([`MoveIntent::sneak`]): `sneak_factor` of the speed, and on the ground it never
+///   walks off a ledge deeper than `step_height` (Minecraft's edge guard,
+///   [`crate::guard_edge`]; only on blocks and static or kinematic bodies).
+/// - Sprinting ([`MoveIntent::sprint`]): `sprint_factor` of the speed; sneaking wins.
+/// - Flying (`flying`, Minecraft's creative flight; the game turns it on): no gravity and no
+///   step-up, `fly_speed` across (twice that sprinting) with the air drag, and
+///   `fly_vertical_speed` up while [`MoveIntent::up`] is held and down while sneaking, with a
+///   strong vertical drag ([`FLIGHT_VERTICAL_DRAG`]: it stops soon). A jump does nothing.
+///   Landing on blocks (or a static or kinematic body) turns it off, as in Minecraft.
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 #[require(MoveIntent)]
 pub struct CharacterController {
@@ -531,21 +542,57 @@ pub struct CharacterController {
     /// blocks), so a jump clears a one-block step.
     pub jump_speed: f64,
     /// The highest ledge the body steps up onto while walking, blocks (Minecraft: 0.6, so a
-    /// slab of 0.5 is climbed and a full block is not). 0 turns the step-up off.
+    /// slab of 0.5 is climbed and a full block is not). 0 turns the step-up off. Sneaking, it is
+    /// also the deepest ledge the body walks down (at least 1/16).
     pub step_height: f64,
+    /// The speed while sneaking, as a fraction of the walking speed (Minecraft: 0.3).
+    pub sneak_factor: f64,
+    /// The speed while sprinting, as a fraction of the walking speed (Minecraft: 1.3).
+    pub sprint_factor: f64,
+    /// Top speed across while flying, blocks per second (Minecraft: 10.92; twice that
+    /// sprinting).
+    pub fly_speed: f64,
+    /// Top speed up or down while flying, blocks per second (Minecraft: 7.5).
+    pub fly_vertical_speed: f64,
+    /// Flying (Minecraft's creative flight): set it to fly; physics clears it when the body
+    /// lands.
+    pub flying: bool,
 }
 
 impl Default for CharacterController {
-    /// Walk 4.317 blocks/s, full air control, jump 9.5 blocks/s, step up 0.6 blocks.
+    /// Walk 4.317 blocks/s, full air control, jump 9.5 blocks/s, step up 0.6 blocks; sneak at
+    /// 0.3 and sprint at 1.3 of the walk; fly at 10.92 across and 7.5 up and down; not flying.
     fn default() -> Self {
         Self {
             walk_speed: 4.317,
             air_control: 1.0,
             jump_speed: 9.5,
             step_height: 0.6,
+            sneak_factor: 0.3,
+            sprint_factor: 1.3,
+            fly_speed: 10.92,
+            fly_vertical_speed: 7.5,
+            flying: false,
         }
     }
 }
+
+impl CharacterController {
+    /// The deepest ledge a sneaking body walks down: its step height, at least 1/16 (with no
+    /// step-up the guard still needs something under the feet to tell an edge).
+    pub fn sneak_drop(&self) -> f64 {
+        // `max` takes the other side of a NaN.
+        self.step_height.max(MIN_SNEAK_DROP)
+    }
+}
+
+/// The least [`CharacterController::sneak_drop`]: 1/16 of a block.
+const MIN_SNEAK_DROP: f64 = 0.0625;
+
+/// The vertical drag of a flying [`CharacterController`], per second: Minecraft keeps 0.6 of
+/// the vertical speed every tick (20 ticks per second), so a flyer stops climbing or sinking
+/// within a fraction of a second after the key is let go.
+pub const FLIGHT_VERTICAL_DRAG: f64 = 40.0 / 3.0;
 
 /// What a [`CharacterController`] wants to do. Sample input into it once per frame, before the
 /// fixed steps (`RunFixedMainLoopSystems::BeforeFixedMainLoop`); AI writes it in `FixedUpdate`.
@@ -558,6 +605,13 @@ pub struct MoveIntent {
     /// fixed step consumes it, jumping if the body is on the ground. So a press in a frame that
     /// runs no step still jumps once, and a frame that runs two steps jumps once.
     pub jump: bool,
+    /// Held: a flying body rises (Minecraft's held jump key). Every step reads it; it is never
+    /// cleared.
+    pub up: bool,
+    /// Held: sneak (slower, never off an edge on the ground; a flying body descends).
+    pub sneak: bool,
+    /// Held: sprint (faster, also flying; sneaking wins).
+    pub sprint: bool,
 }
 
 /// A dynamic body hit a block faster than `PhysicsSettings::impact_speed` (a landing, a wall).
