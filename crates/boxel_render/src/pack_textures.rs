@@ -332,6 +332,19 @@ const RECIPES: &[Recipe] = &[
         FaceName::North,
         &[("block/torch", Tint::None)],
     ),
+    // ADR 0025: what lava makes with water.
+    recipe(
+        "boxel:cobblestone",
+        "cobblestone",
+        FaceName::North,
+        &[("block/cobblestone", Tint::None)],
+    ),
+    recipe(
+        "boxel:obsidian",
+        "obsidian",
+        FaceName::North,
+        &[("block/obsidian", Tint::None)],
+    ),
 ];
 
 /// One texture of a layer, composited bottom to top.

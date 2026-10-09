@@ -48,22 +48,22 @@ fn around(pairs: &[(Face, BlockState)]) -> [BlockState; 6] {
 #[test]
 fn the_new_blocks_have_their_states_and_ids() {
     let r = registry();
-    assert_eq!(r.len(), 221);
+    assert_eq!(r.len(), 238);
     let stone_stairs = r.block_by_name("boxel:stone_stairs").unwrap();
     assert_eq!(r.states(stone_stairs).len(), 80);
-    assert_eq!(r.default_state(stone_stairs), BlockState(40));
+    assert_eq!(r.default_state(stone_stairs), BlockState(55));
     assert_eq!(
-        r.state_name(BlockState(40)).to_string(),
+        r.state_name(BlockState(55)).to_string(),
         "boxel:stone_stairs[facing=north,half=bottom,shape=straight,waterlogged=false]"
     );
-    assert_eq!(r.by_name("boxel:oak_stairs"), Some(BlockState(120)));
-    assert_eq!(r.by_name("boxel:oak_fence"), Some(BlockState(200)));
+    assert_eq!(r.by_name("boxel:oak_stairs"), Some(BlockState(135)));
+    assert_eq!(r.by_name("boxel:oak_fence"), Some(BlockState(215)));
     assert_eq!(
         r.states(r.block_by_name("boxel:oak_fence").unwrap()).len(),
         16
     );
-    assert_eq!(r.by_name("boxel:torch"), Some(BlockState(216)));
-    assert_eq!(r.by_name("boxel:wall_torch"), Some(BlockState(217)));
+    assert_eq!(r.by_name("boxel:torch"), Some(BlockState(231)));
+    assert_eq!(r.by_name("boxel:wall_torch"), Some(BlockState(232)));
     // Every state's model follows its properties.
     for state in r.states(stone_stairs) {
         let BlockModel::Stairs {

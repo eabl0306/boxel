@@ -407,12 +407,9 @@ fn registry_light_fields_and_validation() {
     assert!(!r.flags(BlockState(1)).contains(StateFlags::EMISSIVE));
     let tables = LightTables::from_registry(&r);
     assert_eq!(tables.max_partial_opacity(), 1);
-    // The built-in emitters: four lamps and the lava placeholder, opaque and solid.
-    for (name, emission) in LAMPS
-        .iter()
-        .map(|lamp| (lamp.name, lamp.emission))
-        .chain([("boxel:lava", LAVA_EMISSION)])
-    {
+    // The built-in emitters: four lamps, opaque and solid, and lava (ADR 0025), a fluid that
+    // lets light through like water.
+    for (name, emission) in LAMPS.iter().map(|lamp| (lamp.name, lamp.emission)) {
         let s = r.by_name(name).unwrap();
         assert_eq!(r.emission(s), LightValue::from_rgb(emission), "{name}");
         assert_eq!(r.light_opacity(s), 15, "{name}");
@@ -421,6 +418,13 @@ fn registry_light_fields_and_validation() {
                 .contains(StateFlags::EMISSIVE | StateFlags::SOLID)
         );
         assert!(tables.emits(s) && tables.is_opaque(s), "{name}");
+    }
+    let lava = r.by_name("boxel:lava").unwrap();
+    for level in 0..16 {
+        let s = BlockState(lava.0 + level);
+        assert_eq!(r.emission(s), LightValue::from_rgb(LAVA_EMISSION));
+        assert_eq!(r.light_opacity(s), 1);
+        assert!(tables.emits(s) && !tables.is_opaque(s) && tables.blocks_sky(s));
     }
     assert_eq!(
         r.emission(r.by_name("boxel:lamp_orange").unwrap()),
@@ -450,7 +454,7 @@ fn registry_light_fields_and_validation() {
     let lamp = b
         .add_block(def("lamp", RenderShape::Opaque, [14, 11, 6], 15))
         .unwrap();
-    assert_eq!(lamp, BlockState(221));
+    assert_eq!(lamp, BlockState(238));
     // Cutout may stop light; partial opacities and full channels are fine.
     b.add_block(def("dense_leaves", RenderShape::Cutout, [0; 3], 15))
         .unwrap();

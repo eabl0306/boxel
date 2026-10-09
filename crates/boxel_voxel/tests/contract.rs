@@ -148,7 +148,22 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
         "boxel:lamp_red",
         "boxel:lamp_blue",
         "boxel:lamp_white",
-        "boxel:lava",
+        "boxel:lava[level=0]",
+        "boxel:lava[level=1]",
+        "boxel:lava[level=2]",
+        "boxel:lava[level=3]",
+        "boxel:lava[level=4]",
+        "boxel:lava[level=5]",
+        "boxel:lava[level=6]",
+        "boxel:lava[level=7]",
+        "boxel:lava[level=8]",
+        "boxel:lava[level=9]",
+        "boxel:lava[level=10]",
+        "boxel:lava[level=11]",
+        "boxel:lava[level=12]",
+        "boxel:lava[level=13]",
+        "boxel:lava[level=14]",
+        "boxel:lava[level=15]",
         "boxel:glass",
         "boxel:stone_slab[type=bottom]",
         "boxel:stone_slab[type=top]",
@@ -156,17 +171,18 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
         "boxel:short_grass",
         "boxel:poppy",
     ];
-    // ADR 0020 adds 181 states after these (stairs, fence, torches; tests/shapes.rs).
-    assert_eq!(r.len(), states.len() + 181);
+    // ADR 0020 adds 181 states after these (stairs, fence, torches; tests/shapes.rs), ADR 0025
+    // cobblestone and obsidian.
+    assert_eq!(r.len(), states.len() + 183);
     for (i, n) in states.iter().enumerate() {
         let s = BlockState(i as u16);
         assert_eq!(r.parse_state(n), Ok(s), "{n}");
         assert_eq!(r.state_name(s).to_string(), *n);
     }
-    assert_eq!(r.block_count(), 26);
+    assert_eq!(r.block_count(), 28);
     // A plain name is the default state.
     assert_eq!(r.by_name("boxel:log"), Some(BlockState(9)));
-    assert_eq!(r.by_name("boxel:stone_slab"), Some(BlockState(35)));
+    assert_eq!(r.by_name("boxel:stone_slab"), Some(BlockState(50)));
     // Water: the source is the default (ADR 0021).
     assert_eq!(r.by_name("boxel:water"), Some(BlockState(12)));
     assert_eq!(r.property(BlockState(19), "level"), Some("7"));
@@ -186,12 +202,38 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
     assert_eq!(tex(grass, Face::PosY), "boxel:grass_top");
     assert_eq!(tex(grass, Face::NegY), "boxel:dirt");
     assert_eq!(tex(grass, Face::PosX), "boxel:grass_side");
-    assert_eq!(r.textures().len(), 22);
-    // The emitters: opaque solid cubes with their own texture.
-    for (i, name) in states.iter().enumerate().skip(29).take(5) {
+    assert_eq!(r.textures().len(), 24);
+    // The lamps: opaque solid cubes with their own texture.
+    for (i, name) in states.iter().enumerate().skip(29).take(4) {
         let s = BlockState(i as u16);
         assert_eq!(r.shape(s), RenderShape::Opaque, "{name}");
+        assert!(r.occludes(s), "{name}");
         assert_eq!(tex(s, Face::PosX), *name);
+    }
+    // ADR 0025: lava is an opaque fluid that hides nothing, lets everything through and glows,
+    // its source the default; then cobblestone and obsidian.
+    assert_eq!(r.by_name("boxel:lava"), Some(BlockState(33)));
+    for level in 33..=48 {
+        let lava = BlockState(level);
+        assert_eq!(r.model(lava), BlockModel::Fluid);
+        assert_eq!(r.shape(lava), RenderShape::Opaque);
+        assert!(!r.occludes(lava));
+        assert!(
+            r.flags(lava)
+                .contains(StateFlags::FLUID | StateFlags::EMISSIVE)
+        );
+        assert!(!r.flags(lava).contains(StateFlags::SOLID));
+        assert_eq!(r.collision(lava), &BlockCollision::None);
+        assert_eq!(r.light_opacity(lava), 1);
+        assert_eq!(tex(lava, Face::PosY), "boxel:lava");
+    }
+    for (state, name) in [(236, "boxel:cobblestone"), (237, "boxel:obsidian")] {
+        let s = BlockState(state);
+        assert_eq!(r.by_name(name), Some(s));
+        assert_eq!(r.shape(s), RenderShape::Opaque);
+        assert!(r.occludes(s) && r.flags(s).contains(StateFlags::SOLID));
+        assert_eq!(r.light_opacity(s), 15);
+        assert_eq!(tex(s, Face::PosX), name);
     }
     // ADR 0018: shapes, collision and light of the non-cube blocks and the turned logs.
     let by = |n: &str| r.parse_state(n).unwrap();

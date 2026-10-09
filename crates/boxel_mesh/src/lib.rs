@@ -35,7 +35,9 @@ pub const BUCKET_COUNT: usize = 8;
 pub const CUTOUT_BUCKET: usize = 6;
 /// Index of the translucent bucket (`RenderShape::Translucent`; blended, drawn last).
 pub const TRANSLUCENT_BUCKET: usize = 7;
-/// Max quads in one opaque face bucket of a 32^3 chunk (checkerboard: 32 * 32 * 16).
+/// Max quads in one opaque face bucket of a 32^3 chunk of opaque cubes (checkerboard: 32 * 32 *
+/// 16). An opaque fluid (lava, ADR 0025) hides no neighbor, so scenes with it can reach one face
+/// per cell, still under [`MAX_QUADS_PER_BUCKET`].
 pub const MAX_QUADS_PER_FACE_BUCKET: u32 = 16384;
 /// Max quads in any bucket (the cutout and translucent buckets hold all six faces). The shared
 /// index buffer of the High/Mid tiers covers this many quads.

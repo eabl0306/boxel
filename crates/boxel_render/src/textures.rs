@@ -215,6 +215,36 @@ pub(crate) fn synthesize(spec: &TextureSpec) -> [[u8; 4]; BASE_TEXELS] {
                 }
             }
         }
+        TexturePattern::Cobble => {
+            // Stones around 7 fixed centers (the nearest center, wrapping, so the layer tiles),
+            // each a little lighter or darker and lit toward its middle; dark joints where two
+            // centers are about as near.
+            const CENTERS: [(i32, i32); 7] =
+                [(3, 3), (10, 2), (14, 9), (7, 8), (2, 12), (11, 14), (6, 15)];
+            const TONE: [u16; 7] = [100, 90, 108, 96, 104, 88, 112];
+            let n = size as i32;
+            for (i, texel) in texels.iter_mut().enumerate() {
+                let (x, y) = ((i % size) as i32, (i / size) as i32);
+                let wrap = |d: i32| d.abs().min(n - d.abs());
+                let mut near = [(i32::MAX, 0usize); 2];
+                for (k, &(cx, cy)) in CENTERS.iter().enumerate() {
+                    let d = wrap(x - cx).pow(2) + wrap(y - cy).pow(2);
+                    if d < near[0].0 {
+                        near = [(d, k), near[0]];
+                    } else if d < near[1].0 {
+                        near[1] = (d, k);
+                    }
+                }
+                let factor = if near[1].0 - near[0].0 <= 4 {
+                    55
+                } else {
+                    TONE[near[0].1] + if near[0].0 <= 2 { 8 } else { 0 }
+                };
+                for c in &mut texel[..3] {
+                    *c = (u16::from(*c) * factor / 100).min(255) as u8;
+                }
+            }
+        }
         TexturePattern::Noise | TexturePattern::TopBand { .. } => {}
     }
     texels

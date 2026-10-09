@@ -204,11 +204,13 @@ impl BoxModels {
     }
 }
 
-/// The mesher class of a block drawn as `shape` with `model`.
+/// The mesher class of a block drawn as `shape` with `model`. A fluid is transparent whatever
+/// its shape: it hides no neighbor face, its top sits lower (lava is drawn opaque, ADR 0025).
 fn class_of(shape: RenderShape, model: BlockModel) -> VoxelClass {
     match (shape, model.is_cube()) {
         (RenderShape::None, _) => VoxelClass::Empty,
         (_, false) => VoxelClass::Special,
+        (_, true) if model == BlockModel::Fluid => VoxelClass::Transparent,
         (RenderShape::Opaque, true) => VoxelClass::Opaque,
         (RenderShape::Cutout | RenderShape::Translucent, true) => VoxelClass::Transparent,
     }

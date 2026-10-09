@@ -383,7 +383,7 @@ fn expected_occupancy(states: &[BlockState], registry: &BlockRegistry) -> Vec<u3
         for y in 0..32 {
             for z in 0..32 {
                 let s = states[LocalPos::new(x, y, z).index()];
-                if registry.shape(s) == RenderShape::Opaque && registry.model(s).is_cube() {
+                if registry.shape(s) == RenderShape::Opaque && registry.model(s).is_solid_cube() {
                     occ[(y * 32 + x) as usize] |= 1 << z;
                 }
             }

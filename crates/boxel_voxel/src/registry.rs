@@ -38,7 +38,8 @@ pub enum RenderShape {
     #[default]
     None,
     /// Opaque, no alpha: drawn in the opaque face buckets. A full cube (`BlockModel::Cube`) hides
-    /// the neighbor faces it touches ([`StateFlags::OCCLUDES`]); other models hide nothing.
+    /// the neighbor faces it touches ([`StateFlags::OCCLUDES`]); other models (lava, a
+    /// `BlockModel::Fluid`, too) hide nothing.
     Opaque,
     /// Alpha-tested (leaves, plants): the cutout bucket, drawn after the opaque one with discard.
     /// Does not hide neighbors; faces between two identical cutout cubes are culled.
@@ -116,9 +117,10 @@ pub enum BlockModel {
     /// Two diagonal quads through the cell (plants), with the side texture, drawn from both
     /// sides. Never hides or is hidden by anything.
     Cross,
-    /// A fluid (water): a cube for meshing and culling, but where the block above is neither
-    /// the same fluid nor an opaque block (the surface) its top sits 2/16 lower, as in
-    /// Minecraft. Lets everything through ([`BlockModel::default_collision`] is `None`).
+    /// A fluid (water, lava): a cube for meshing and culling, but where the block above is
+    /// neither the same fluid nor an opaque block (the surface) its top sits 2/16 lower, as in
+    /// Minecraft. Lets everything through ([`BlockModel::default_collision`] is `None`). Hides
+    /// no neighbor face, even when drawn `Opaque` (lava).
     Fluid,
     /// Stairs (ADR 0020): the slab of `half` and a step on the `facing` side, shaped by `shape`
     /// ([`crate::shapes::stair_boxes`]). Collide and are picked by their boxes.
@@ -155,9 +157,15 @@ impl BlockModel {
     /// The unturned full cube.
     pub const CUBE: BlockModel = BlockModel::Cube { axis: Axis::Y };
 
-    /// True for the full cube (any axis).
+    /// True for the full cube (any axis) and for fluids, which mesh and cull as cubes.
     pub const fn is_cube(self) -> bool {
         matches!(self, BlockModel::Cube { .. } | BlockModel::Fluid)
+    }
+
+    /// True for the full cube (any axis) but not a fluid: what an `Opaque` block must be to
+    /// hide its neighbors' faces (an opaque fluid, lava, hides nothing: its top sits lower).
+    pub const fn is_solid_cube(self) -> bool {
+        matches!(self, BlockModel::Cube { .. })
     }
 
     /// The face of the unturned cube whose texture `face` shows: for a cube turned to X or Z,
@@ -312,7 +320,7 @@ bitflags::bitflags! {
         const SOLID = 1;
         /// Hides the neighbor faces it touches: shape `Opaque` with a full cube model.
         const OCCLUDES = 1 << 1;
-        /// Liquid.
+        /// Liquid: a `BlockModel::Fluid` or a `Translucent` block without collision.
         const FLUID = 1 << 2;
         /// Emits light (some `emission` channel above 0).
         const EMISSIVE = 1 << 3;
@@ -363,6 +371,9 @@ pub enum TexturePattern {
     /// A torch on a clear background, laid out like Minecraft's: a stick of the base color in
     /// columns 7 and 8 from row 8 down, under a flame in rows 6 and 7 (binary alpha).
     Torch,
+    /// Cobblestone: rounded stones of the base color, each a little lighter or darker, between
+    /// dark joints.
+    Cobble,
 }
 
 /// One built-in lamp of [`BlockRegistry::default_blocks`]: an opaque, solid cube that emits
@@ -408,7 +419,7 @@ pub const LAMPS: [BuiltinLamp; 4] = [
     },
 ];
 
-/// Emission (red, green, blue) of the built-in lava placeholder, `boxel:lava` (state 16).
+/// Emission (red, green, blue) of `boxel:lava`, every level (red at Minecraft's 15).
 pub const LAVA_EMISSION: [u8; 3] = [15, 7, 2];
 
 /// Emission (red, green, blue) of `boxel:torch` and `boxel:wall_torch`: level 14 like
@@ -722,13 +733,12 @@ impl BlockRegistryBuilder {
         .expect("built-in water");
         b.add_block(block("planks", opaque, true, all(planks)))
             .expect("built-in planks");
-        // The first emitters (ADR 0015): full-cube colored lamps and a lava placeholder (an
-        // opaque, solid, glowing cube until fluids exist). Torches wait for non-cube shapes.
+        // The first emitters (ADR 0015): full-cube colored lamps. Torches wait for non-cube
+        // shapes.
         let emitters = LAMPS
             .iter()
             .zip(lamp_textures)
-            .map(|(lamp, texture)| (lamp.short_name(), lamp.emission, texture))
-            .chain([("lava", LAVA_EMISSION, lava)]);
+            .map(|(lamp, texture)| (lamp.short_name(), lamp.emission, texture));
         for (name, emission, texture) in emitters {
             let def = BlockDef {
                 emission,
@@ -736,6 +746,20 @@ impl BlockRegistryBuilder {
             };
             b.add_block(def).expect("built-in emitter");
         }
+        // Lava flows like water with its own rules (ADR 0025) and the same `level` property. It
+        // glows, is drawn opaque (Minecraft's solid layer) but hides no neighbor face, lets
+        // everything through and lets light through like water (opacity 1, the sky stops).
+        b.add_block_with_states(
+            BlockDef {
+                model: BlockModel::Fluid,
+                emission: LAVA_EMISSION,
+                light_opacity: 1,
+                ..block("lava", opaque, false, all(lava))
+            },
+            vec![Property::int(FLUID_LEVEL, 0..=15)],
+            |_, _| {},
+        )
+        .expect("built-in lava");
         // Non-cube blocks (ADR 0018). Glass is a clear cube: light and sky pass (opacity 0).
         // Slabs let light through at the cost of leaves (a slab roof is not dark; opacity 1 keeps
         // the light flood on its fast path); a double slab is a plain stone cube. Plants stop
@@ -799,7 +823,43 @@ impl BlockRegistryBuilder {
             b.add_block(def).expect("built-in block");
         }
         b.add_default_shapes(stone, planks);
+        b.add_fluid_products();
         b
+    }
+
+    /// The blocks lava makes when it meets water (ADR 0025), after the torches: cobblestone and
+    /// obsidian, opaque solid cubes with their textures (the last layers).
+    fn add_fluid_products(&mut self) {
+        let mut cube = |name: &str, base_color, noise, pattern| {
+            let texture = self
+                .add_texture(TextureSpec {
+                    name: format!("boxel:{name}"),
+                    base_color,
+                    noise,
+                    pattern,
+                })
+                .expect("built-in texture");
+            self.add_block(BlockDef {
+                name: format!("boxel:{name}"),
+                shape: RenderShape::Opaque,
+                model: BlockModel::CUBE,
+                collision: BlockCollision::Full,
+                emission: [0; 3],
+                light_opacity: OPAQUE_OPACITY,
+                textures: FaceTextures::all(texture),
+            })
+            .expect("built-in block");
+        };
+        cube("cobblestone", [122, 122, 122], 14, TexturePattern::Cobble);
+        cube(
+            "obsidian",
+            [20, 16, 31],
+            6,
+            TexturePattern::Speckle {
+                color: [58, 38, 92],
+                density: 40,
+            },
+        );
     }
 
     /// The blocks of ADR 0020, after the plants: stone and oak stairs, the oak fence, the torch
@@ -1011,7 +1071,7 @@ impl BlockRegistryBuilder {
     /// The light, collision and texture checks of one state.
     fn check_state(&self, def: &BlockDef) -> Result<(), RegistryError> {
         let channels_ok = def.emission.iter().all(|&c| c <= crate::MAX_LIGHT);
-        let opaque_cube = def.shape == RenderShape::Opaque && def.model.is_cube();
+        let opaque_cube = def.shape == RenderShape::Opaque && def.model.is_solid_cube();
         let opacity_ok = def.light_opacity <= OPAQUE_OPACITY
             && (!opaque_cube || def.light_opacity == OPAQUE_OPACITY);
         if !channels_ok || !opacity_ok {
@@ -1055,12 +1115,10 @@ impl BlockRegistryBuilder {
                     f.set(StateFlags::SOLID, solid);
                     f.set(
                         StateFlags::OCCLUDES,
-                        b.shape == RenderShape::Opaque && b.model.is_cube(),
+                        b.shape == RenderShape::Opaque && b.model.is_solid_cube(),
                     );
-                    f.set(
-                        StateFlags::FLUID,
-                        b.shape == RenderShape::Translucent && !solid,
-                    );
+                    let fluid = b.shape == RenderShape::Translucent || b.model == BlockModel::Fluid;
+                    f.set(StateFlags::FLUID, fluid && !solid);
                     f.set(StateFlags::EMISSIVE, b.emission != [0; 3]);
                     f
                 })
@@ -1120,20 +1178,22 @@ impl BlockRegistry {
     /// 2 `boxel:dirt`, 3 `boxel:grass`, 4 `boxel:sand`, 5 `boxel:gravel`, 6 `boxel:snow`,
     /// 7 `boxel:bedrock`, 8 to 10 `boxel:log[axis=x|y|z]` (default 9, `axis=y`),
     /// 11 `boxel:leaves` (Cutout), 12 to 27 `boxel:water[level=0..15]` (Translucent fluid,
-    /// default 12, the source; ADR 0021), 28 `boxel:planks`, then the emitters (opaque, solid,
+    /// default 12, the source; ADR 0021), 28 `boxel:planks`, then the lamps (opaque, solid,
     /// light opacity 15; emission red, green, blue): 29 `boxel:lamp_orange` (14, 11, 6), 30
     /// `boxel:lamp_red` (14, 2, 2), 31 `boxel:lamp_blue` (3, 6, 14), 32 `boxel:lamp_white`
-    /// (15, 15, 15) and 33 `boxel:lava` (15, 7, 2), a placeholder until lava flows ([`LAMPS`],
-    /// [`LAVA_EMISSION`]); then the blocks of ADR 0018: 34 `boxel:glass` (Translucent cube,
-    /// solid, light opacity 0), 35 to 37 `boxel:stone_slab[type=bottom|top|double]` (default
-    /// 35; the halves are Opaque slabs with light opacity 1, `double` an Opaque stone cube), 38
-    /// `boxel:short_grass` and 39 `boxel:poppy` (Cutout crosses, no collision, light opacity 0);
-    /// then the blocks of ADR 0020: 40 to 119 `boxel:stone_stairs` and 120 to 199
+    /// (15, 15, 15) ([`LAMPS`]); 33 to 48 `boxel:lava[level=0..15]` (an Opaque fluid with no
+    /// collision, light opacity 1, emission (15, 7, 2), [`LAVA_EMISSION`]; default 33, the
+    /// source; ADR 0025); then the blocks of ADR 0018: 49 `boxel:glass` (Translucent cube,
+    /// solid, light opacity 0), 50 to 52 `boxel:stone_slab[type=bottom|top|double]` (default
+    /// 50; the halves are Opaque slabs with light opacity 1, `double` an Opaque stone cube), 53
+    /// `boxel:short_grass` and 54 `boxel:poppy` (Cutout crosses, no collision, light opacity 0);
+    /// then the blocks of ADR 0020: 55 to 134 `boxel:stone_stairs` and 135 to 214
     /// `boxel:oak_stairs` (`facing`, `half`, `shape`, `waterlogged`; default the first, all
-    /// values first; Opaque, light opacity 1), 200 to 215 `boxel:oak_fence` (`east`, `north`,
-    /// `south`, `west`; default 200, unconnected; Opaque, light opacity 0), 216 `boxel:torch` and
-    /// 217 to 220 `boxel:wall_torch[facing=north|south|west|east]` (Cutout, no collision, light
-    /// opacity 0, emission [`TORCH_EMISSION`]).
+    /// values first; Opaque, light opacity 1), 215 to 230 `boxel:oak_fence` (`east`, `north`,
+    /// `south`, `west`; default 215, unconnected; Opaque, light opacity 0), 231 `boxel:torch` and
+    /// 232 to 235 `boxel:wall_torch[facing=north|south|west|east]` (Cutout, no collision, light
+    /// opacity 0, emission [`TORCH_EMISSION`]); then what lava makes with water (ADR 0025): 236
+    /// `boxel:cobblestone` and 237 `boxel:obsidian` (Opaque solid cubes).
     pub fn default_blocks() -> BlockRegistry {
         BlockRegistryBuilder::with_default_blocks().build()
     }
