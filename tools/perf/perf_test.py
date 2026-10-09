@@ -320,6 +320,15 @@ class SmokeTest(unittest.TestCase):
                                    '1 -> 1 | 0 -> 0 | ok |')
         self.assertEqual(lines[3], '| rtx/cave-path/r16/uncapped | - | - | - | skipped: no cave |')
 
+    def test_the_tree_never_shares_the_base_target_dir(self):
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.dict(os.environ, {'PERF_TARGET_DIR': d, 'CARGO_TARGET_DIR': d}), \
+                mock.patch.object(perf, 'cargo_build') as build:
+            with self.assertRaises(perf.PerfError) as e:
+                perf.tree_binary()
+        self.assertIn('PERF_TARGET_DIR', str(e.exception))
+        build.assert_not_called()
+
     def test_usage_errors(self):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):

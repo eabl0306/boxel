@@ -23,8 +23,9 @@ just perf-smoke --base main            # otra base (por defecto, el merge base c
 ```
 
 Compila la rama tal como está y toma el binario de la base de `bench-results/bins/<sha>/stress`.
-Si no está, lo compila en un worktree aparte (`target-perf/src`, o `PERF_TARGET_DIR`). Corre una
-vez 10 s por lado cada caso y solo falla con un empeoramiento grosero:
+Si no está, lo compila en un worktree aparte, en `target-perf/` o en `PERF_TARGET_DIR`, que no
+puede ser el target dir de la rama (cargo mezclaría las dos). Corre una vez 10 s por lado cada caso
+y solo falla con un empeoramiento grosero:
 
 - fps por debajo del 85 % de la base,
 - p99 de más de 1.5 veces la base,

@@ -178,12 +178,17 @@ def commit_binary(sha, name=''):
 def tree_binary():
     """This checkout as it is: the cached binary of HEAD when the tree is clean, else built in
     place (CARGO_TARGET_DIR or target/) and copied to the cache."""
+    target = os.path.join(TREE, os.environ.get('CARGO_TARGET_DIR') or 'target')
+    if os.path.realpath(target) == os.path.realpath(perf_dir()):
+        # Cargo keys workspace crates by their path inside the workspace and checks them by
+        # mtime, so a file this tree changed before the last base build would count as built.
+        raise PerfError(f'the base builds and this tree share {target}: cargo could reuse the '
+                        "base's crates for this tree; give PERF_TARGET_DIR another directory")
     sha = git('rev-parse', 'HEAD')
     dirty = subprocess.run(['git', 'diff', '--quiet', 'HEAD'], cwd=TREE).returncode != 0
     dest = bench('bins', sha, 'stress')
     if not dirty and os.path.exists(dest):
         return Binary(dest, sha[:8], sha, 'this tree')
-    target = os.path.join(TREE, os.environ.get('CARGO_TARGET_DIR') or 'target')
     name = os.path.basename(TREE)
     built = cargo_build(TREE, target, bench('bins', f'build-{name}.log'))
     if dirty:
