@@ -104,6 +104,10 @@ para después:
   metadatos), versión del registro, banderas, largo y una suma de control FNV-1a de 64 bits del
   contenido. El contenido va comprimido con LZ4 (bloque, `lz4_flex`) cuando eso lo achica.
   Un bit cambiado en cualquier byte o un registro cortado se detecta (test que prueba cada byte).
+  Un largo dañado se rechaza antes de reservar memoria: no puede pasar del registro de chunk más
+  grande ni de 255 veces el contenido comprimido (lo máximo que da LZ4). Los metadatos no tienen
+  otro límite, así lo que se escribe siempre se puede leer (test con una lista de ticks de más de
+  64 MiB).
 - **Registro de chunk**: el almacenamiento compactado (`Paletted::compact`) con ids guardados:
   uniforme (un id), paleta (los ids, los bits por vóxel y las palabras `u64`) o directo (32 768
   ids). Un chunk de piedra con un hueco ocupa menos de 512 bytes.
@@ -200,7 +204,8 @@ Tests (en `crates/boxel_world`):
 - `persist/format/tests.rs`: claves ida y vuelta en 0, ±2^31, ±2^40, el límite del mundo y los
   extremos de `i64`, y su orden (proptest); registros de todos los almacenamientos; IdMap con un
   registro distinto, un bloque que ya no existe, una propiedad y un valor que ya no existen, y
-  un bloque que ganó una propiedad cuyo valor por defecto cambia después; cualquier bit cambiado o registro cortado es un error, y bytes al azar nunca entran en pánico.
+  un bloque que ganó una propiedad cuyo valor por defecto cambia después; una lista de ticks de
+  más de 64 MiB se lee de vuelta; cualquier bit cambiado o registro cortado es un error, y bytes al azar nunca entran en pánico.
 - `persist/tests.rs`: metadatos de un mundo nuevo, nombres reservados, copias pendientes, el
   índice, el tamaño de los lotes (un job con los ticks lleva todos los chunks) y el orden de los
   ticks; un archivo redb cuyo disco falla y vuelve (guardar y cargar funcionan otra vez y no se

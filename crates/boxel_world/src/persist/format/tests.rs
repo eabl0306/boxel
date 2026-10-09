@@ -339,3 +339,25 @@ fn names_ticks_and_clock_round_trip() {
     let (ids, _) = IdMap::resolve(Vec::new(), &registry);
     assert!(decode_chunk(&encode_names(&names), &ids).is_err());
 }
+
+/// Whatever the writer seals the reader opens: a pending tick list past 64 MiB (about 2.7
+/// million ticks) reads back. A damaged length is still refused before anything is allocated
+/// for it.
+#[test]
+fn a_tick_list_past_64_mib_reads_back() {
+    let ticks: Vec<(BlockPos, u64)> = (0..2_700_000)
+        .map(|i| (BlockPos::new(i, -(1 << 40), MAX_CHUNK_COORD << 5), 0))
+        .collect();
+    let blob = encode_ticks(&ticks);
+    let payload = u32::from_le_bytes([blob[6], blob[7], blob[8], blob[9]]);
+    assert!(payload > 64 << 20, "{payload} bytes");
+    assert_eq!(decode_ticks(&blob).unwrap(), ticks);
+    drop(blob);
+    // A length no body this size can give.
+    let mut small = encode_ticks(&ticks[..10]);
+    small[6..10].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(
+        decode_ticks(&small).unwrap_err(),
+        FormatError::Damaged("bad header")
+    );
+}

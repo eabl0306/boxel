@@ -38,10 +38,23 @@ const HEADER_LEN: usize = 18;
 const FLAG_LZ4: u8 = 1;
 /// Payloads up to this size are stored as they are (LZ4 would not pay).
 const COMPRESS_FROM: usize = 64;
-/// Largest payload accepted when reading (64 MiB: a direct chunk is at most `5 * 32768` bytes,
-/// and a million pending ticks take 26 MB). A length over this in a damaged header is refused
-/// before allocating.
-const MAX_PAYLOAD: usize = 1 << 26;
+/// Largest chunk record payload: a direct chunk, its kind and a varint of at most 5 bytes per
+/// voxel.
+const MAX_CHUNK_PAYLOAD: usize = 1 + 5 * CHUNK_VOLUME;
+/// LZ4 gives at most this many bytes per compressed byte (a byte of a match length stands for
+/// at most 255 bytes out): a longer length in a damaged header is refused before allocating.
+const LZ4_MAX_RATIO: usize = 255;
+
+/// Largest payload of a blob with `magic`: a chunk record's size is bounded by its layout; a
+/// metadata blob (a long pending tick list) by the header's `u32` length alone. The reader takes
+/// whatever the writer can seal.
+fn max_payload(magic: [u8; 4]) -> usize {
+    if magic == CHUNK_MAGIC {
+        MAX_CHUNK_PAYLOAD
+    } else {
+        u32::MAX as usize
+    }
+}
 
 /// Payload kinds of a chunk record.
 const KIND_UNIFORM: u8 = 0;
@@ -136,6 +149,10 @@ pub(crate) fn seal(magic: [u8; 4], version: u8, payload: &[u8]) -> Vec<u8> {
         Some(c) => (FLAG_LZ4, c.as_slice()),
         None => (0, payload),
     };
+    debug_assert!(
+        payload.len() <= max_payload(magic),
+        "the reader would refuse it"
+    );
     let len = u32::try_from(payload.len()).expect("payloads are far below 4 GiB");
     let mut out = Vec::with_capacity(HEADER_LEN + body.len());
     out.extend_from_slice(&magic);
@@ -166,10 +183,14 @@ pub(crate) fn open(magic: [u8; 4], version: u8, bytes: &[u8]) -> Result<Vec<u8>,
     let mut sum = [0; 8];
     sum.copy_from_slice(&bytes[10..18]);
     let body = &bytes[HEADER_LEN..];
-    if len > MAX_PAYLOAD || flags & !FLAG_LZ4 != 0 {
+    let compressed = flags & FLAG_LZ4 != 0;
+    if len > max_payload(magic)
+        || (compressed && len > body.len().saturating_mul(LZ4_MAX_RATIO))
+        || flags & !FLAG_LZ4 != 0
+    {
         return Err(FormatError::Damaged("bad header"));
     }
-    let payload = if flags & FLAG_LZ4 != 0 {
+    let payload = if compressed {
         lz4_flex::block::decompress(body, len)
             .map_err(|_| FormatError::Damaged("bad compressed data"))?
     } else {
