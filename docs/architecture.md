@@ -22,7 +22,7 @@ Windows, macOS). Sus piezas:
   decide en tiempo de ejecución qué backend, qué adaptador y qué **tier** de render usar, con
   pruebas de humo que usan los pipelines reales y el formato real de la superficie, fallbacks,
   overrides y una memoria de crashes por dispositivo (LKG).
-- **ECS:** un fork vendorizado y recortado de `bevy_ecs` 0.20.0-rc.2 (crates `boxel_ecs*`, cero
+- **ECS:** un fork vendorizado y recortado de `bevy_ecs` 0.20.0 (crates `boxel_ecs*`, cero
   crates `bevy_*` en el árbol), generado por script, con diff de librería cero comprobado en cada
   regeneración.
 - **App:** `boxel_app` propio (App, Plugin, schedules, tiempo, task pools, runner), inspirado en
@@ -114,7 +114,7 @@ cargo-deny, el MSRV 1.97.1 y los tests del ECS vendorizado (961 + 480) con lockf
  +----------+-----------------------+----------------------------------------------------+
  | wgpu 30.0.1 (Vulkan, DX12, Metal, | vendor/: boxel_ecs, boxel_ecs_macros(+logic),      |
  | GL/EGL)  + escape hatch hal       | boxel_macro_utils, boxel_ptr, boxel_tasks,         |
- |                                   | boxel_utils (fork de bevy_ecs 0.20.0-rc.2)          |
+ |                                   | boxel_utils (fork de bevy_ecs 0.20.0)              |
  +-----------------------------------+----------------------------------------------------+
  | winit 0.30.13, glam 0.34.0, binary-greedy-meshing 0.5.2, offset-allocator, slotmap ... |
  +-----------------------------------------------------------------------------------+
@@ -500,7 +500,7 @@ wgpu-core). M0 incluye solo `with_vulkan_device`. Cualquier uso nuevo requiere A
 ### 6.1 Estrategia: fork vendorizado de `bevy_ecs`
 
 Decisión (ADR 0003): `vendor/` contiene un fork **recortado y renombrado** de `bevy_ecs`
-0.20.0-rc.2 y sus dependencias internas (`boxel_ecs`, `boxel_ecs_macros`,
+0.20.0 y sus dependencias internas (`boxel_ecs`, `boxel_ecs_macros`,
 `boxel_ecs_macro_logic`, `boxel_macro_utils`, `boxel_ptr`, `boxel_tasks`, `boxel_utils`).
 `bevy_platform` se reemplaza por un shim de unas 80 líneas propias más 3 archivos vendorizados.
 Se eliminan `bevy_reflect`, hotpatching y stepping.
@@ -512,8 +512,8 @@ Reglas:
    propios, parches solo de tests, backports). En cada regeneración `check_test_only.py` compara
    el árbol solo-renombrado con el parchado y falla si algún cambio cae fuera de código de test o
    de documentación. Cada archivo `.rs` modificado lleva una línea "boxel: modified by
-   tools/refork" (Apache-2.0 §4(b)). Verificado: 961/961 tests de librería y 480/480 doctests
-   pasan con `--locked`.
+   tools/refork" (Apache-2.0 §4(b)). Verificado sobre 0.20.0: 962/962 tests de librería de
+   `boxel_ecs` y 480/480 doctests pasan con `--locked`.
 2. `vendor/` es **su propio workspace de Cargo** (excluido del raíz): conserva los lints de Bevy y
    tiene su `Cargo.lock` versionado, que el script conserva entre regeneraciones.
    `tools/vendor_lock_sync.py` verifica que coincida con el lockfile raíz en los paquetes
@@ -527,10 +527,10 @@ Reglas:
    `boxel_ecs` completo y los derives de los usuarios expanden a rutas internas (system, query,
    world...); reemplazar el núcleo rompería el código de usuarios que use derives o items fuera
    del prelude.
-5. Re-fork sobre 0.20.0 final apenas salga (tarea disparada; a más tardar, criterio de entrada de
-   M1; si incluye bevy#25940, se borra el backport, y el script avisa si un parche ya está
-   upstream). Después, como máximo una vez al año o por un fix de seguridad; entre re-forks se
-   aplican como parches los PR de Bevy etiquetados unsound/UB.
+5. Re-fork sobre 0.20.0 final: hecho el 2026-10-09 (issue #24, detalle en ADR 0003). 0.20.0 no
+   trae bevy#25940, así que el backport sigue; el script falla pidiendo borrarlo cuando un parche
+   ya está upstream. Próximo re-fork como máximo en un año o por un fix de seguridad; entre
+   re-forks se aplican como parches los PR de Bevy etiquetados unsound/UB.
 6. Miri en un workflow propio: semanal y en cada PR que toca `vendor/**` o `tools/refork/**`
    (`boxel_ecs`, `boxel_ptr`, `boxel_tasks`, nightly fijado, `-Zrandomize-layout`).
 7. Licencias: cada crate vendorizado conserva LICENSE-MIT y LICENSE-APACHE; `NOTICE` en la raíz
@@ -1270,7 +1270,7 @@ schedule `Shutdown` es el lugar para el `flush` final.
 | Milestone | Contenido | Criterio de salida |
 |---|---|---|
 | **M0 scaffold** | workspace y tooling; fork del ECS; `boxel_app`; ventana con compuerta de presentación e input; detección completa (tiers, scoring, smoke, overrides, LKG de crashes, device lost, catch_unwind); tiers High, Mid y Low con buckets opaco y cutout (High sin Hi-Z); paleta, registry, worldgen, mesher, streaming con jobs; cámara libre; `gpu_info`, `voxel_world`, `headless_world` | compila, tests, clippy y rustdoc limpios; `voxel_world` dibuja terreno en Vulkan High y en GL (Mid y Low); imágenes iguales entre tiers; la simulación no se congela con la ventana minimizada |
-| **M1 mundo jugable** | criterio de entrada: re-fork sobre bevy 0.20.0 final. Pase translúcido; AO; raycast y edición de bloques (hechos: ADR 0016, `voxel_world`); el sistema de ediciones si se recortó; propiedades de bloque e IdMap; `ChunkStore` con redb; crecimiento del arena y presupuesto de subida; caras interiores de hojas (opcional); re-selección en caliente si se recortó; decisión `static-dxc` o DLL en Windows; timestamps de GPU; actualizar a wgpu 31 | editar y guardar un mundo; agua visible |
+| **M1 mundo jugable** | criterio de entrada: re-fork sobre bevy 0.20.0 final (hecho el 2026-10-09, issue #24). Pase translúcido; AO; raycast y edición de bloques (hechos: ADR 0016, `voxel_world`); el sistema de ediciones si se recortó; propiedades de bloque e IdMap; `ChunkStore` con redb; crecimiento del arena y presupuesto de subida; caras interiores de hojas (opcional); re-selección en caliente si se recortó; decisión `static-dxc` o DLL en Windows; timestamps de GPU; actualizar a wgpu 31 | editar y guardar un mundo; agua visible |
 | **M2 GPU-driven completo** | Hi-Z en dos fases (High) o enlaces por subceldas de 16³ (el cave culling por BFS ya está en los tres tiers, ADR 0022); pool de ocupación en GPU; `create_shader_module_trusted` con medición; pipeline cache de Vulkan; verificar DX12 High; clip control en GL (upstream); decidir WESL | caída de draws y de tiempo de GPU medida |
 | **M3 escala** | LOD con mips de 32³ y anillos; listas indirectas segmentadas (más de 65 535 draws); render en hilo propio; inicialización de GPU asíncrona (respetando los error scopes por hilo) | distancias de vista grandes estables |
 | **M4 experimental** | ray marching sobre bricks/ocupación; mesh shaders opt-in; evaluar bevy_ecs 0.21 y el núcleo ECS propio | prototipos medidos |
