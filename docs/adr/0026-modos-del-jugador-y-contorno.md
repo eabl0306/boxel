@@ -69,6 +69,9 @@
   antes de ese punto ya pegó en algo, devuelve ese impacto.
 - El punto del impacto sigue exacto sobre el plano, también en el techo de la valla (y = 1,5:
   el bloque de arriba con fracción 0,5).
+- Los proyectiles se apoyan en ese punto, con su fracción. Antes tomaban solo el bloque y
+  quedaban dentro de una losa o medio bloque dentro de una valla, y una pelota se clavaba en vez
+  de rebotar.
 - `VoxelFilter::Outline` (apuntar) no cambia: el contorno de la valla es de un bloque.
 
 ### 4. Modos del controlador
@@ -169,6 +172,9 @@
   - `block_shapes.rs`: los oráculos de fuerza bruta (barridos por eje y rayos al azar) ahora
     tienen vallas en sus campos. El de barridos suma campos densos (densidad 0,3), donde bloques
     de todo tipo comparten capa.
+  - `boxel_physics/tests/projectile.rs`: flechas y pelotas que caen sobre postes de valla y
+    losas quedan en su techo (las pelotas rebotan y descansan ahí, sin clavarse), igual bit a bit
+    en dos bases lejanas.
   - `boxel_physics/tests/player.rs`: la guarda corta en el borde con el margen exacto, no avanza
     ni retrocede desde el margen, corta las dos en una esquina, deja bajar una losa y no un
     bloque, no hace nada sin soporte o sin caída, toma cajas estáticas y techos de valla como
