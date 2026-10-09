@@ -281,7 +281,8 @@ fn a_ray_through_the_air_outside_the_vertical_bounds_ends() {
         );
         assert_eq!(result, RayResult::Miss, "{y} {dir:?}");
     }
-    // Toward the bounds it reaches the unloaded layers.
+    // Toward the bounds it reaches the unloaded layers: half a block above them, where the
+    // collision boxes of a block there could reach (a fence's, ADR 0026).
     let result = raycast_voxels(
         &mut src,
         &table,
@@ -289,6 +290,22 @@ fn a_ray_through_the_air_outside_the_vertical_bounds_ends() {
         DVec3::NEG_Y,
         f64::INFINITY,
         VoxelFilter::Collision,
+    );
+    assert_eq!(
+        result,
+        RayResult::Unloaded {
+            block: BlockPos::new(0, 63, 0),
+            t: 136.0
+        }
+    );
+    // A picking ray only stops at the block itself.
+    let result = raycast_voxels(
+        &mut src,
+        &table,
+        WorldPos::from_dvec3(DVec3::new(0.5, 200.5, 0.5)),
+        DVec3::NEG_Y,
+        f64::INFINITY,
+        VoxelFilter::Outline { fluids: false },
     );
     assert_eq!(
         result,

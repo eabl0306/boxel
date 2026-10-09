@@ -316,15 +316,28 @@ pub fn fence_boxes(sides: FenceSides) -> Vec<ModelBox> {
     boxes
 }
 
-/// The picking and collision boxes of a fence: the post and a 4 wide arm toward each connected
-/// side, all a block tall (Minecraft's fence collision is 1.5 blocks tall; the voxel physics
-/// only takes boxes inside the cell, ADR 0020).
+/// The picking boxes of a fence (its outline): the post and a 4 wide arm toward each connected
+/// side, all a block tall, as Minecraft's fence shape.
+pub fn fence_outline(sides: FenceSides) -> Vec<CollisionBox> {
+    fence_arms(sides, 16)
+}
+
+/// The collision boxes of a fence: [`fence_outline`] 1.5 blocks tall, reaching half a block
+/// into the cell above (Minecraft's fence collision, ADR 0026), so a fence cannot be jumped.
 pub fn fence_collision(sides: FenceSides) -> Vec<CollisionBox> {
-    let mut boxes = vec![CollisionBox::new([6, 0, 6], [10, 16, 10])];
+    fence_arms(sides, crate::MAX_COLLISION_HEIGHT)
+}
+
+/// The post and the arms of a fence, `top` sixteenths tall.
+fn fence_arms(sides: FenceSides, top: u8) -> Vec<CollisionBox> {
+    let mut boxes = vec![CollisionBox::new([6, 0, 6], [10, top, 10])];
     for facing in Facing::ALL {
         if sides.has(facing) {
+            // Written for north (-Z), turned from there (a quarter turn keeps `y`).
             let turns = (facing.turns_from_east() + 1) % 4;
-            boxes.push(ModelBox::new([6, 0, 0], [10, 16, 6]).turned(turns).bounds);
+            let mut arm = ModelBox::new([6, 0, 0], [10, 16, 6]).turned(turns).bounds;
+            arm.max[1] = top;
+            boxes.push(arm);
         }
     }
     boxes

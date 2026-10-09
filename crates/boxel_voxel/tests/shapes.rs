@@ -8,7 +8,8 @@ use boxel_voxel::rules::{
 use boxel_voxel::shapes::{stair_boxes, wall_torch_box};
 use boxel_voxel::{
     BlockCollision, BlockModel, BlockRegistry, BlockState, CollisionBox, Face, Facing, FenceSides,
-    MAX_MODEL_BOXES, ModelBox, RenderShape, SlabHalf, StairShape, TORCH_EMISSION,
+    MAX_COLLISION_HEIGHT, MAX_MODEL_BOXES, ModelBox, RenderShape, SlabHalf, StairShape,
+    TORCH_EMISSION,
 };
 use std::collections::HashSet;
 
@@ -383,4 +384,43 @@ fn the_default_blocks_use_few_model_boxes() {
     // Slabs 2, stairs 2 slabs + 8 steps + 8 quarters (some shared), fences 9, torches 5.
     assert!(boxes.len() < 64, "{}", boxes.len());
     assert!(boxes.iter().all(|b| b.is_valid()));
+}
+
+/// Fences collide 1.5 blocks tall, as in Minecraft (ADR 0026): the post and arms reach half a
+/// block into the cell above, so a fence cannot be jumped. They are picked and drawn a block
+/// tall, and their top still holds a torch.
+#[test]
+fn fences_collide_a_block_and_a_half_tall_and_are_picked_a_block_tall() {
+    let r = registry();
+    for name in [
+        "boxel:oak_fence",
+        "boxel:oak_fence[east=true,north=true]",
+        "boxel:oak_fence[east=true,north=true,south=true,west=true]",
+    ] {
+        let fence = s(&r, name);
+        let BlockCollision::Boxes(collision) = r.collision(fence) else {
+            panic!("{name} collides with boxes");
+        };
+        let BlockCollision::Boxes(outline) = r.model(fence).outline() else {
+            panic!("{name} is picked by boxes");
+        };
+        assert_eq!(collision.len(), outline.len(), "{name}");
+        for (c, o) in collision.iter().zip(&outline) {
+            assert_eq!(c.min, o.min, "{name}");
+            assert_eq!([c.max[0], c.max[2]], [o.max[0], o.max[2]], "{name}");
+            assert_eq!((c.max[1], o.max[1]), (MAX_COLLISION_HEIGHT, 16), "{name}");
+            assert!(c.is_valid_collision() && !c.is_valid() && o.is_valid());
+        }
+        // The part above the cell does not change what the fence's faces hold.
+        assert!(supports_center(&r, fence, Face::PosY), "{name}");
+        for face in [Face::PosX, Face::NegX, Face::PosZ, Face::NegZ, Face::PosY] {
+            assert!(!is_sturdy(&r, fence, face), "{name} {face:?}");
+        }
+    }
+    // Drawn as before: the model boxes stay inside the cell.
+    let all = s(
+        &r,
+        "boxel:oak_fence[east=true,north=true,south=true,west=true]",
+    );
+    assert!(r.model(all).boxes().iter().all(|b| b.is_valid()));
 }

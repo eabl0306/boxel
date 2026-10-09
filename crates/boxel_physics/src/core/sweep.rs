@@ -7,6 +7,10 @@
 //! block (or an obstacle box) clips the move, and the box is snapped exactly onto that plane.
 //! A block made of boxes (a slab, ADR 0018) blocks at the nearest face of its boxes that overlap
 //! the footprint; with such blocks in the table the layer the leading face is in is scanned too.
+//! A box may reach into the cell above (a fence collides 1.5 blocks tall, ADR 0026): a move
+//! across also looks at the row of blocks under the footprint, for the tall blocks there whose
+//! boxes reach it, and a move down scans one layer further, where a tall block's top can be
+//! higher than the tops of the layer above it.
 //! The footprint is strict: a block that only touches the box (within `eps`) is not in it, so a
 //! box sliding along a floor or a wall never snags on the seams between blocks or chunks. The
 //! cost grows linearly with the distance moved; no substeps are needed.
@@ -436,17 +440,37 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
     /// The collision shape of frame block `b`.
     #[inline]
     fn shape(&mut self, b: [i64; 3]) -> Result<CollisionShape<'a>, Unloaded> {
+        self.shape_in(b, false)
+    }
+
+    /// The collision shape of frame block `b`; for a block in the row under a box's footprint
+    /// (`under`), only the boxes of a tall block, the only ones that can reach the box (a full
+    /// block there is the floor under it, not in its way).
+    #[inline]
+    fn shape_in(&mut self, b: [i64; 3], under: bool) -> Result<CollisionShape<'a>, Unloaded> {
         let block = self.world(b);
         match self.src.probe(block) {
+            Probe::Block(state) if under && !self.table.is_tall(state) => Ok(CollisionShape::Empty),
             Probe::Block(state) => Ok(self.table.shape(state)),
             Probe::Unloaded => Err(Unloaded { block }),
         }
     }
 
+    /// The tall blocks of the row under `bx` (frame layer `low - 1`, with `low` the first layer
+    /// of its strict footprint) can reach `bx`: their boxes rise up to the table's reach above
+    /// that row, past the bottom of `bx` (by more than `eps`).
+    #[inline]
+    fn reaches(&self, bx: LocalBox, low: i64) -> bool {
+        let reach = self.table.reach();
+        reach > 0.0 && low as f64 + reach > bx.min.y + self.eps
+    }
+
     /// The plane where frame block `b` stops `bx` moving along `axis` (toward `+` if
     /// `positive`), if it does: for a full block its near face, for boxes the nearest near face
     /// of the ones that overlap `bx` strictly on the other two axes. Only planes ahead of the
-    /// leading face `lead` count (not behind it by more than `eps`).
+    /// leading face `lead` count (not behind it by more than `eps`). A block under the frame
+    /// layer `below` (the row under the footprint of a move across) only counts through the
+    /// boxes of a tall block.
     fn block_plane(
         &mut self,
         b: [i64; 3],
@@ -454,6 +478,7 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
         positive: bool,
         bx: LocalBox,
         lead: f64,
+        below: i64,
     ) -> Result<Option<f64>, Unloaded> {
         let eps = self.eps;
         let ahead = |p: f64| {
@@ -463,7 +488,7 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
                 p <= lead + eps
             }
         };
-        Ok(match self.shape(b)? {
+        Ok(match self.shape_in(b, b[1] < below)? {
             CollisionShape::Empty => None,
             CollisionShape::Full => {
                 let p = if positive { b[axis] } else { b[axis] + 1 } as f64;
@@ -498,13 +523,14 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
     }
 
     /// Some solid block (a full one, or one of its boxes) overlaps `bx` by more than `eps` on
-    /// every axis.
+    /// every axis (the tall blocks of the row under it included).
     fn any_solid(&mut self, bx: LocalBox) -> Result<bool, Unloaded> {
         let ((x0, x1), (y0, y1), (z0, z1)) = (self.span(bx, 0), self.span(bx, 1), self.span(bx, 2));
-        for y in y0..=y1 {
+        let low = if self.reaches(bx, y0) { y0 - 1 } else { y0 };
+        for y in low..=y1 {
             for x in x0..=x1 {
                 for z in z0..=z1 {
-                    let hit = match self.shape([x, y, z])? {
+                    let hit = match self.shape_in([x, y, z], y < y0)? {
                         CollisionShape::Full => true,
                         CollisionShape::Boxes(boxes) => {
                             let at = DVec3::new(x as f64, y as f64, z as f64);
@@ -540,10 +566,10 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
     }
 
     /// The nearest blocking plane of layer `layer` on `axis` within the footprint `b` x `c` (on
-    /// the other two axes, in increasing order) and its block ([`Grid::block_plane`]), scanning
-    /// `b` then `c` upward: the first block with the nearest plane. A full block's plane is the
-    /// nearest any block of the layer can have, so the scan stops at the first one (with only
-    /// full blocks, this is the first full block of the layer).
+    /// the other two axes, in increasing order) and its block ([`Grid::block_plane`], with
+    /// `below`), scanning `b` then `c` upward: the first block with the nearest plane. A full
+    /// block's plane is the nearest any block of the layer can have, so the scan stops at the
+    /// first one (with only full blocks, this is the first full block of the layer).
     #[expect(clippy::too_many_arguments, reason = "an internal helper of clip_axis")]
     fn first_in_layer(
         &mut self,
@@ -554,6 +580,7 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
         lead: f64,
         b: (i64, i64),
         c: (i64, i64),
+        below: i64,
     ) -> Result<Option<(f64, [i64; 3])>, Unloaded> {
         let (b_axis, c_axis) = others(axis);
         let nearest = if positive { layer } else { layer + 1 } as f64;
@@ -564,7 +591,7 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
                 block[axis] = layer;
                 block[b_axis] = bi;
                 block[c_axis] = ci;
-                if let Some(p) = self.block_plane(block, axis, positive, bx, lead)? {
+                if let Some(p) = self.block_plane(block, axis, positive, bx, lead, below)? {
                     if best.is_none_or(|(q, _)| if positive { p < q } else { p > q }) {
                         best = Some((p, block));
                     }
@@ -580,6 +607,11 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
     /// Moves along one axis: the nearest blocking layer or obstacle within `d` clips it. The
     /// nearest obstacle is found first and the layer scan stops at it: blocks behind an
     /// obstacle are never probed (they may be in an unloaded chunk the box never reaches).
+    ///
+    /// Across (X or Z), the footprint also takes the row under it when the tall blocks there
+    /// can reach the box ([`Grid::reaches`]), counting only their boxes. Down, a layer whose
+    /// top is found may still be beaten by a tall block of the layer under it, so the scan goes
+    /// one layer further while that can be ([`CollisionTable::reach`]).
     fn clip_axis(
         &mut self,
         axis: usize,
@@ -591,8 +623,20 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
         let eps = self.eps;
         let bx = shape.translate(pos);
         let (b_axis, c_axis) = others(axis);
-        let b = self.span(bx, b_axis);
-        let c = self.span(bx, c_axis);
+        let mut b = self.span(bx, b_axis);
+        let mut c = self.span(bx, c_axis);
+        // Across, the strict footprint starts at layer `below` on Y; the tall blocks of the row
+        // under it can reach the box.
+        let below = if axis == 1 {
+            i64::MIN
+        } else {
+            let y = if b_axis == 1 { &mut b } else { &mut c };
+            let low = y.0;
+            if self.reaches(bx, low) {
+                y.0 = low - 1;
+            }
+            low
+        };
         // An obstacle is in the way if it overlaps the footprint strictly.
         let across = |o: &&LocalBox| {
             o.min[b_axis] < bx.max[b_axis] - eps
@@ -625,7 +669,9 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
             };
             let mut block = None;
             for layer in start..=last {
-                if let Some((p, found)) = self.first_in_layer(axis, true, layer, bx, lead, b, c)? {
+                if let Some((p, found)) =
+                    self.first_in_layer(axis, true, layer, bx, lead, b, c, below)?
+                {
                     // Planes grow with the layer: the first layer with one decides.
                     if p < plane {
                         plane = p;
@@ -636,7 +682,9 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
             }
             if plane < lead + d {
                 let block = match block {
-                    Some(found) => Some(self.contact_block(axis, true, found, bx, plane, b, c)?),
+                    Some(found) => {
+                        Some(self.contact_block(axis, true, found, bx, plane, b, c, below)?)
+                    }
                     None => None,
                 };
                 return Ok(Clip::Plane {
@@ -653,35 +701,53 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
                 .map(|o| o.max[axis])
                 .filter(|&max| max <= lead + eps)
                 .fold(f64::NEG_INFINITY, f64::max);
+            // Moving down, a tall block's top is up to `reach` above its layer's top.
+            let reach = if axis == 1 { self.table.reach() } else { 0.0 };
             // Layers whose top plane the leading face has not passed, down to the last one the
             // moved face enters, and only those whose top is not below the obstacle (a block
             // flush with it is the one reported as ground).
             let first = (lead + eps).floor() as i64 - 1;
-            let mut last = (lead + d).floor() as i64;
+            let mut last = (lead + d - reach).floor() as i64;
             if plane > f64::NEG_INFINITY {
-                last = last.max(plane.ceil() as i64 - 1);
+                last = last.max((plane - reach).ceil() as i64 - 1);
             }
             let start = if self.table.has_boxes() {
                 first + 1
             } else {
                 first
             };
-            let mut block = None;
+            let mut best: Option<(f64, [i64; 3])> = None;
             let mut layer = start;
             while layer >= last {
-                if let Some((p, found)) = self.first_in_layer(axis, false, layer, bx, lead, b, c)? {
-                    // A full block's top is never below the obstacle here (it wins ties).
-                    if p >= plane {
-                        plane = p;
-                        block = Some(found);
-                    }
+                if let Some((p, found)) =
+                    self.first_in_layer(axis, false, layer, bx, lead, b, c, below)?
+                    && best.is_none_or(|(q, _)| p > q)
+                {
+                    best = Some((p, found));
+                }
+                // Planes fall with the layer: the next layer's tops are at most `reach` above
+                // this layer's bottom, so it can only beat a plane below that (once: `reach` is
+                // under a block).
+                if let Some((q, _)) = best
+                    && layer as f64 + reach <= q
+                {
                     break;
                 }
                 layer -= 1;
             }
+            let mut block = None;
+            // A full block's top is never below the obstacle here (it wins ties).
+            if let Some((p, found)) = best
+                && p >= plane
+            {
+                plane = p;
+                block = Some(found);
+            }
             if plane > lead + d {
                 let block = match block {
-                    Some(found) => Some(self.contact_block(axis, false, found, bx, plane, b, c)?),
+                    Some(found) => {
+                        Some(self.contact_block(axis, false, found, bx, plane, b, c, below)?)
+                    }
                     None => None,
                 };
                 return Ok(Clip::Plane {
@@ -697,7 +763,8 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
     /// line with the center of the box's leading face (clamped to the footprint `b` x `c` on the
     /// other two axes, in increasing order) if it stops the box at the same plane, else `found`
     /// (the first block of the layer with that plane). For a downward clip this is the
-    /// supporting block under the center of the box's bottom.
+    /// supporting block under the center of the box's bottom. `below` as in
+    /// [`Grid::block_plane`].
     #[expect(clippy::too_many_arguments, reason = "an internal helper of clip_axis")]
     fn contact_block(
         &mut self,
@@ -708,6 +775,7 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
         plane: f64,
         b: (i64, i64),
         c: (i64, i64),
+        below: i64,
     ) -> Result<BlockPos, Unloaded> {
         let center = bx.center();
         let (b_axis, c_axis) = others(axis);
@@ -716,7 +784,8 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
         facing[b_axis] = (center[b_axis].floor() as i64).clamp(b.0, b.1);
         facing[c_axis] = (center[c_axis].floor() as i64).clamp(c.0, c.1);
         Ok(
-            if facing != found && self.block_plane(facing, axis, positive, bx, lead)? == Some(plane)
+            if facing != found
+                && self.block_plane(facing, axis, positive, bx, lead, below)? == Some(plane)
             {
                 self.world(facing)
             } else {

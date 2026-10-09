@@ -370,9 +370,18 @@ fn obstacles_stop_the_scan_before_unloaded_chunks() {
         )
     };
     // +X: a crate 0.25 ahead, the unloaded chunk x >= 32 0.375 ahead. The box stops at the
-    // crate and never needs the chunk behind it.
-    let start = WorldPos::from_dvec3(DVec3::new(31.375, 0.0, 0.5));
+    // crate and never needs the chunk behind it. It moves half a block up: lower, a fence in
+    // the unloaded row under it could reach it (ADR 0026), and the move would need that row.
+    let start = WorldPos::from_dvec3(DVec3::new(31.375, 0.5, 0.5));
     let crate_box = LocalBox::new(DVec3::new(31.875, 0.0, 0.0), DVec3::new(32.5, 1.0, 1.0));
+    let low = WorldPos::from_dvec3(DVec3::new(31.375, 0.0, 0.5));
+    assert_eq!(
+        run(&mut world, low, DVec3::new(0.75, 0.0, 0.0), Some(crate_box)).unwrap_err(),
+        Unloaded {
+            block: BlockPos::new(31, -1, 0)
+        },
+        "the row under the box"
+    );
     let d = DVec3::new(0.75, 0.0, 0.0);
     assert_eq!(
         run(&mut world, start, d, None).unwrap_err(),
@@ -384,9 +393,10 @@ fn obstacles_stop_the_scan_before_unloaded_chunks() {
     let out = run(&mut world, start, d, Some(crate_box)).expect("the crate is nearer");
     assert_eq!(out.end.to_dvec3().x, 31.625);
     assert!(out.touched(Face::PosX));
-    // -Y: a crate top at y = 0.25 under the box, the unloaded chunk y < 0 below it.
-    let start = WorldPos::from_dvec3(DVec3::new(0.5, 0.5, 0.5));
-    let crate_box = LocalBox::new(DVec3::new(0.0, -1.0, 0.0), DVec3::new(1.0, 0.25, 1.0));
+    // -Y: a crate top at y = 0.75 under the box, the unloaded chunk y < 0 below it (a fence
+    // there could rise to 0.5, ADR 0026: a crate under that would not spare the chunk).
+    let start = WorldPos::from_dvec3(DVec3::new(0.5, 1.0, 0.5));
+    let crate_box = LocalBox::new(DVec3::new(0.0, -1.0, 0.0), DVec3::new(1.0, 0.75, 1.0));
     let d = DVec3::new(0.0, -1.0, 0.0);
     assert_eq!(
         run(&mut world, start, d, None).unwrap_err(),
@@ -395,14 +405,14 @@ fn obstacles_stop_the_scan_before_unloaded_chunks() {
         }
     );
     let out = run(&mut world, start, d, Some(crate_box)).expect("the crate is nearer");
-    assert_eq!(out.end.to_dvec3().y, 0.25);
+    assert_eq!(out.end.to_dvec3().y, 0.75);
     assert!(out.on_ground());
     assert_eq!(out.ground, None);
     // A block flush with the crate top is still scanned: it is the ground.
     world.set_unloaded(ChunkPos::new(0, -1, 0), false);
     world.set(BlockPos::new(0, -1, 0), STONE);
     let flush = LocalBox::new(DVec3::new(0.0, -1.0, 0.0), DVec3::new(1.0, 0.0, 1.0));
-    let out = run(&mut world, start, d, Some(flush)).expect("loaded");
+    let out = run(&mut world, start, 1.5 * d, Some(flush)).expect("loaded");
     assert_eq!(out.end.to_dvec3().y, 0.0);
     assert_eq!(out.ground, Some(BlockPos::new(0, -1, 0)));
 }

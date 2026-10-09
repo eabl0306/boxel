@@ -139,12 +139,20 @@ fn a_body_inside_a_slab_is_pushed_out() {
     );
 }
 
-/// A random field of stone, bottom, top and double slabs in `0..size` (air elsewhere).
+/// A random field of stone, bottom, top and double slabs, and fences (whose collision reaches
+/// half a block into the cell above, ADR 0026) in `0..size` (air elsewhere).
 fn shaped_field(size: i64, density: f64, seed: u64) -> (TestWorld, Vec<(BlockPos, BlockState)>) {
     let mut world = TestWorld::new();
     let mut rng = Rng(seed);
     let mut blocks = Vec::new();
-    let kinds = [STONE, bottom(), top(), double()];
+    let kinds = [
+        STONE,
+        bottom(),
+        top(),
+        double(),
+        state("boxel:oak_fence"),
+        state("boxel:oak_fence[east=true,south=true]"),
+    ];
     for y in 0..size {
         for x in 0..size {
             for z in 0..size {
@@ -358,8 +366,8 @@ fn random_rays_match_a_brute_force_oracle() {
 }
 
 /// Stairs, fences and torches (ADR 0020): stairs collide and are picked by their boxes (the slab
-/// and the step), a fence by its post and arms a block tall (Minecraft's is 1.5: the voxel
-/// physics keeps boxes inside the cell), a torch not at all but is picked by a small box.
+/// and the step), a fence collides by its post and arms 1.5 blocks tall (ADR 0026) and is
+/// picked by them a block tall, a torch does not collide but is picked by a small box.
 #[test]
 fn stairs_fences_and_torches_collide_with_their_boxes() {
     let t = table();
@@ -375,10 +383,17 @@ fn stairs_fences_and_torches_collide_with_their_boxes() {
     assert_eq!(t.outline(stairs), CollisionShape::Boxes(&boxes));
     let fence = state("boxel:oak_fence[north=true]");
     let fence_boxes = [
+        unit([6.0, 0.0, 6.0], [10.0, 24.0, 10.0]),
+        unit([6.0, 0.0, 0.0], [10.0, 24.0, 6.0]),
+    ];
+    assert_eq!(t.shape(fence), CollisionShape::Boxes(&fence_boxes));
+    let fence_outline = [
         unit([6.0, 0.0, 6.0], [10.0, 16.0, 10.0]),
         unit([6.0, 0.0, 0.0], [10.0, 16.0, 6.0]),
     ];
-    assert_eq!(t.shape(fence), CollisionShape::Boxes(&fence_boxes));
+    assert_eq!(t.outline(fence), CollisionShape::Boxes(&fence_outline));
+    assert!(t.is_tall(fence) && !t.is_tall(stairs) && !t.is_tall(STONE));
+    assert_eq!(t.reach(), 0.5);
     for name in ["boxel:torch", "boxel:wall_torch[facing=south]"] {
         let torch = state(name);
         assert_eq!(t.shape(torch), CollisionShape::Empty);
