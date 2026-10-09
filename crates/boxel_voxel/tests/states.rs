@@ -150,8 +150,9 @@ fn parse_errors_name_the_problem() {
     let slab = |t: &str| r.parse_state(&format!("boxel:stone_slab{t}"));
     assert_eq!(slab(""), Ok(BlockState(50)));
     assert_eq!(slab("[]"), Ok(BlockState(50)));
-    assert_eq!(slab("[type=top]"), Ok(BlockState(51)));
-    assert_eq!(slab("[ type = double ]"), Ok(BlockState(52)));
+    assert_eq!(slab("[type=top]"), Ok(BlockState(52)));
+    assert_eq!(slab("[ type = double ]"), Ok(BlockState(54)));
+    assert_eq!(slab("[waterlogged=true]"), Ok(BlockState(51)));
     assert_eq!(
         r.parse_state("boxel:nope[type=top]"),
         Err(StateParseError::UnknownBlock("boxel:nope".into()))

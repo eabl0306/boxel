@@ -211,6 +211,25 @@ impl BlockTicks {
         }
     }
 
+    /// Registers `handler` for `state` alone (replaces an earlier one): the water of a
+    /// waterlogged block, for instance, ticks while the dry states of its block do not.
+    pub fn register_state(
+        &mut self,
+        registry: &BlockRegistry,
+        state: BlockState,
+        handler: TickHandler,
+    ) {
+        if self.handlers.len() < registry.len() {
+            self.handlers.resize(registry.len(), None);
+        }
+        if let Some(slot) = self.handlers.get_mut(usize::from(state.0)) {
+            *slot = Some(TickHandler {
+                delay: handler.delay.max(1),
+                ..handler
+            });
+        }
+    }
+
     /// The handler of `state`, if any.
     pub fn handler(&self, state: BlockState) -> Option<TickHandler> {
         self.handlers.get(usize::from(state.0)).copied().flatten()

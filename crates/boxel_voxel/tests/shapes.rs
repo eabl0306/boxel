@@ -8,7 +8,7 @@ use boxel_voxel::rules::{
 use boxel_voxel::shapes::{stair_boxes, wall_torch_box};
 use boxel_voxel::{
     BlockCollision, BlockModel, BlockRegistry, BlockState, CollisionBox, Face, Facing, FenceSides,
-    MAX_MODEL_BOXES, ModelBox, RenderShape, SlabHalf, StairShape, TORCH_EMISSION,
+    MAX_MODEL_BOXES, ModelBox, RenderShape, SlabHalf, StairShape, StateFlags, TORCH_EMISSION,
 };
 use std::collections::HashSet;
 
@@ -48,22 +48,22 @@ fn around(pairs: &[(Face, BlockState)]) -> [BlockState; 6] {
 #[test]
 fn the_new_blocks_have_their_states_and_ids() {
     let r = registry();
-    assert_eq!(r.len(), 238);
+    assert_eq!(r.len(), 257);
     let stone_stairs = r.block_by_name("boxel:stone_stairs").unwrap();
     assert_eq!(r.states(stone_stairs).len(), 80);
-    assert_eq!(r.default_state(stone_stairs), BlockState(55));
+    assert_eq!(r.default_state(stone_stairs), BlockState(58));
     assert_eq!(
-        r.state_name(BlockState(55)).to_string(),
+        r.state_name(BlockState(58)).to_string(),
         "boxel:stone_stairs[facing=north,half=bottom,shape=straight,waterlogged=false]"
     );
-    assert_eq!(r.by_name("boxel:oak_stairs"), Some(BlockState(135)));
-    assert_eq!(r.by_name("boxel:oak_fence"), Some(BlockState(215)));
+    assert_eq!(r.by_name("boxel:oak_stairs"), Some(BlockState(138)));
+    assert_eq!(r.by_name("boxel:oak_fence"), Some(BlockState(218)));
     assert_eq!(
         r.states(r.block_by_name("boxel:oak_fence").unwrap()).len(),
-        16
+        32
     );
-    assert_eq!(r.by_name("boxel:torch"), Some(BlockState(231)));
-    assert_eq!(r.by_name("boxel:wall_torch"), Some(BlockState(232)));
+    assert_eq!(r.by_name("boxel:torch"), Some(BlockState(250)));
+    assert_eq!(r.by_name("boxel:wall_torch"), Some(BlockState(251)));
     // Every state's model follows its properties.
     for state in r.states(stone_stairs) {
         let BlockModel::Stairs {
@@ -112,6 +112,46 @@ fn the_new_blocks_have_their_states_and_ids() {
         assert_eq!(r.light_opacity(torch), 0);
     }
     assert_eq!(TORCH_EMISSION[0], 14);
+}
+
+#[test]
+fn slabs_stairs_and_fences_hold_water() {
+    let r = registry();
+    let wet = [
+        "boxel:stone_slab[waterlogged=true]",
+        "boxel:stone_slab[type=top,waterlogged=true]",
+        "boxel:oak_stairs[waterlogged=true]",
+        "boxel:stone_stairs[facing=east,half=top,waterlogged=true]",
+        "boxel:oak_fence[north=true,waterlogged=true]",
+    ];
+    for name in wet {
+        let state = s(&r, name);
+        assert!(r.is_waterlogged(state), "{name}");
+        assert!(r.can_be_waterlogged(state), "{name}");
+        let dry = r.with_water(state, false).unwrap();
+        assert!(!r.is_waterlogged(dry), "{name}");
+        assert!(r.can_be_waterlogged(dry), "{name}");
+        assert_eq!(r.with_water(dry, true), Some(state));
+        // Water changes nothing but the flag: same model, collision and look.
+        assert_eq!(r.model(dry), r.model(state));
+        assert_eq!(r.collision(dry), r.collision(state));
+        assert_eq!(r.shape(dry), r.shape(state));
+        assert!(
+            !r.flags(state).contains(StateFlags::FLUID),
+            "a block, not a fluid cell"
+        );
+        assert_eq!(r.light_opacity(state), 1, "the water cuts direct sky");
+    }
+    assert_eq!(r.light_opacity(s(&r, "boxel:oak_fence")), 0);
+    // A double slab is a full cube: it holds no water whatever its property says.
+    let double = s(&r, "boxel:stone_slab[type=double,waterlogged=true]");
+    assert!(!r.is_waterlogged(double));
+    assert!(!r.can_be_waterlogged(double));
+    for name in ["boxel:stone", "boxel:water", "boxel:torch", "boxel:glass"] {
+        let state = s(&r, name);
+        assert!(!r.is_waterlogged(state) && !r.can_be_waterlogged(state));
+        assert_eq!(r.with_water(state, true), None);
+    }
 }
 
 #[test]
@@ -316,7 +356,7 @@ fn fences_connect_like_minecraft_simplified() {
     ]);
     assert_eq!(
         r.state_name(fence_rule(&r, fence, &n)).to_string(),
-        "boxel:oak_fence[east=true,north=true,south=false,west=false]"
+        "boxel:oak_fence[east=true,north=true,south=false,waterlogged=false,west=false]"
     );
     // Sides go back to false when the neighbor goes.
     let all = s(

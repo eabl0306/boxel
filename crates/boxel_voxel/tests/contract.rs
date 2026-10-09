@@ -165,15 +165,18 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
         "boxel:lava[level=14]",
         "boxel:lava[level=15]",
         "boxel:glass",
-        "boxel:stone_slab[type=bottom]",
-        "boxel:stone_slab[type=top]",
-        "boxel:stone_slab[type=double]",
+        "boxel:stone_slab[type=bottom,waterlogged=false]",
+        "boxel:stone_slab[type=bottom,waterlogged=true]",
+        "boxel:stone_slab[type=top,waterlogged=false]",
+        "boxel:stone_slab[type=top,waterlogged=true]",
+        "boxel:stone_slab[type=double,waterlogged=false]",
+        "boxel:stone_slab[type=double,waterlogged=true]",
         "boxel:short_grass",
         "boxel:poppy",
     ];
-    // ADR 0020 adds 181 states after these (stairs, fence, torches; tests/shapes.rs), ADR 0025
+    // ADR 0020 adds 197 states after these (stairs, fence, torches; tests/shapes.rs), ADR 0025
     // cobblestone and obsidian.
-    assert_eq!(r.len(), states.len() + 183);
+    assert_eq!(r.len(), states.len() + 199);
     for (i, n) in states.iter().enumerate() {
         let s = BlockState(i as u16);
         assert_eq!(r.parse_state(n), Ok(s), "{n}");
@@ -227,7 +230,7 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
         assert_eq!(r.light_opacity(lava), 1);
         assert_eq!(tex(lava, Face::PosY), "boxel:lava");
     }
-    for (state, name) in [(236, "boxel:cobblestone"), (237, "boxel:obsidian")] {
+    for (state, name) in [(255, "boxel:cobblestone"), (256, "boxel:obsidian")] {
         let s = BlockState(state);
         assert_eq!(r.by_name(name), Some(s));
         assert_eq!(r.shape(s), RenderShape::Opaque);

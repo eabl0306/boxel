@@ -2,9 +2,10 @@
 //! simulator written here from Minecraft's rules: one cell at a time on a small grid, every tick
 //! of a game tick in schedule order, no chunks, no budget, no overlay. The engine must match it
 //! cell for cell after every game tick: spread distance, the way down, falling, new sources,
-//! draining, lava's slower and shorter flow, and lava meeting water (obsidian, cobblestone,
-//! stone). Also the tick budget (it only delays), ticks frozen in unloaded chunks, worldgen water
-//! that stays still, and the same scenes far from the origin.
+//! draining, lava's slower and shorter flow, lava meeting water (obsidian, cobblestone, stone),
+//! and waterlogged slabs and fences (sources that flow out through their open faces, never
+//! filled by flowing water, waterlogged by a new source between two others). Also the tick budget (it only delays), ticks frozen in unloaded
+//! chunks, worldgen water that stays still, and the same scenes far from the origin.
 use boxel_app::App;
 use boxel_ecs::prelude::*;
 use boxel_math::DVec3;
@@ -37,6 +38,15 @@ enum Cell {
     Lava(u8),
     Cobble,
     Obsidian,
+    /// A stone slab, its top half or its bottom one, maybe waterlogged (`wet`).
+    Slab {
+        top: bool,
+        wet: bool,
+    },
+    /// An oak fence, maybe waterlogged.
+    Fence {
+        wet: bool,
+    },
 }
 
 /// The fluids.
@@ -108,13 +118,54 @@ fn amounts(level: u8) -> (u8, bool, bool) {
     }
 }
 
-/// The fluid a cell holds: its kind and (amount, source, falling).
+/// The fluid a cell holds: its kind and (amount, source, falling). A waterlogged block holds a
+/// water source.
 fn content(cell: Cell) -> Option<(Kind, (u8, bool, bool))> {
     match cell {
         Cell::Water(l) => Some((Kind::Water, amounts(l))),
         Cell::Lava(l) => Some((Kind::Lava, amounts(l))),
+        Cell::Slab { wet: true, .. } | Cell::Fence { wet: true } => Some((Kind::Water, amounts(0))),
         _ => None,
     }
+}
+
+/// What a cell's collision covers of its face toward `d`: (lower half, upper half), both for
+/// a full face. Slabs cover their half of the sides and their whole bottom or top; a fence
+/// post covers no whole half of any face.
+fn cover(cell: Cell, d: [i64; 3]) -> (bool, bool) {
+    match cell {
+        Cell::Stone | Cell::Cobble | Cell::Obsidian => (true, true),
+        Cell::Slab { top, .. } => match d[1] {
+            0 => (!top, top),
+            -1 => (!top, !top),
+            _ => (top, top),
+        },
+        _ => (false, false),
+    }
+}
+
+/// A dry block that takes a water source (`canPlaceLiquid`), as `kind`.
+fn takes(kind: Kind, cell: Cell) -> bool {
+    kind == Kind::Water
+        && matches!(
+            cell,
+            Cell::Slab { wet: false, .. } | Cell::Fence { wet: false }
+        )
+}
+
+/// The block with its water.
+fn wet(cell: Cell) -> Cell {
+    match cell {
+        Cell::Slab { top, .. } => Cell::Slab { top, wet: true },
+        Cell::Fence { .. } => Cell::Fence { wet: true },
+        other => other,
+    }
+}
+
+/// `canPassThroughWall` from `a` to its neighbor `b` across `d`.
+fn wall_open(a: Cell, b: Cell, d: [i64; 3]) -> bool {
+    let ((al, au), (bl, bu)) = (cover(a, d), cover(b, neg(d)));
+    !((al || bl) && (au || bu))
 }
 
 struct Sim {
@@ -180,7 +231,7 @@ impl Sim {
         };
         let wet = [UP, [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]]
             .iter()
-            .any(|&d| matches!(self.get(add(p, d)), Cell::Water(_)));
+            .any(|&d| content(self.get(add(p, d))).is_some_and(|(k, _)| k == Kind::Water));
         if wet {
             let product = if l == 0 { Cell::Obsidian } else { Cell::Cobble };
             self.write(p, product, at);
@@ -265,51 +316,69 @@ impl Sim {
         }
     }
 
-    fn spreads_to(&self, kind: Kind, cell: Cell, down: bool) -> bool {
-        self.replaceable(kind, cell, down) && self.holds(cell)
+    /// `canHoldFluid` for `new` (flowing when `None`).
+    fn holds_new(&self, kind: Kind, cell: Cell, new: Option<Cell>) -> bool {
+        self.holds(cell) || takes(kind, cell) && new == Some(Cell::Water(0))
+    }
+
+    /// `canSpreadTo` from `from` into its neighbor `to` across `d`, as `new`.
+    fn spreads_to(&self, kind: Kind, from: Cell, to: Cell, d: [i64; 3], new: Option<Cell>) -> bool {
+        self.replaceable(kind, to, d == DOWN)
+            && self.holds_new(kind, to, new)
+            && wall_open(from, to, d)
     }
 
     /// `getNewLiquid`.
     fn new_liquid(&self, kind: Kind, p: [i64; 3]) -> Option<Cell> {
+        let here = self.get(p);
         let mut most = 0;
         let mut sources = 0;
         for d in SIDES {
-            if let Some((amount, source, _)) = self.fluid(kind, self.get(add(p, d))) {
+            let n = self.get(add(p, d));
+            if let Some((amount, source, _)) = self.fluid(kind, n)
+                && wall_open(here, n, d)
+            {
                 most = most.max(amount);
                 sources += u32::from(source);
             }
         }
         let below = self.get(add(p, DOWN));
-        let solid_below = matches!(below, Cell::Stone | Cell::Cobble | Cell::Obsidian);
+        let solid_below = matches!(
+            below,
+            Cell::Stone | Cell::Cobble | Cell::Obsidian | Cell::Slab { .. } | Cell::Fence { .. }
+        );
         if kind == Kind::Water && sources >= 2 && (solid_below || self.source(kind, below)) {
             return Some(Cell::Water(0));
         }
-        if self.fluid(kind, self.get(add(p, UP))).is_some() {
+        let above = self.get(add(p, UP));
+        if self.fluid(kind, above).is_some() && wall_open(here, above, UP) {
             return Some(kind.cell(8));
         }
         let left = most.saturating_sub(kind.drop_off());
         (left > 0).then(|| kind.cell(8 - left))
     }
 
-    fn hole(&self, kind: Kind, below: Cell) -> bool {
-        self.fluid(kind, below).is_some() || self.holds(below)
+    fn hole(&self, kind: Kind, from: Cell, below: Cell) -> bool {
+        (self.fluid(kind, below).is_some() || self.holds(below)) && wall_open(from, below, DOWN)
     }
 
-    fn passes(&self, kind: Kind, cell: Cell) -> bool {
-        !self.source(kind, cell) && self.holds(cell)
+    fn passes(&self, kind: Kind, from: Cell, to: Cell, d: [i64; 3], new: Option<Cell>) -> bool {
+        !self.source(kind, to) && self.holds_new(kind, to, new) && wall_open(from, to, d)
     }
 
     fn slope(&self, kind: Kind, p: [i64; 3], depth: u32, from: [i64; 3]) -> u32 {
+        let here = self.get(p);
         let mut best = 1000;
         for d in SIDES {
             if d == from {
                 continue;
             }
             let q = add(p, d);
-            if !self.passes(kind, self.get(q)) {
+            let to = self.get(q);
+            if !self.passes(kind, here, to, d, None) {
                 continue;
             }
-            if self.hole(kind, self.get(add(q, DOWN))) {
+            if self.hole(kind, to, self.get(add(q, DOWN))) {
                 return depth;
             }
             if depth < kind.slope() {
@@ -319,10 +388,17 @@ impl Sim {
         best
     }
 
-    /// `spreadTo`: lava falling into water makes stone.
+    /// `spreadTo`: lava falling into water makes stone; a dry block takes a water source.
     fn spread_to(&mut self, kind: Kind, q: [i64; 3], new: Option<Cell>, down: bool, due: u64) {
-        if down && kind == Kind::Lava && matches!(self.get(q), Cell::Water(_)) {
+        let cell = self.get(q);
+        if down && kind == Kind::Lava && matches!(cell, Cell::Water(_)) {
             self.write(q, Cell::Stone, due);
+            return;
+        }
+        if takes(kind, cell) {
+            if new == Some(Cell::Water(0)) {
+                self.write(q, wet(cell), due);
+            }
             return;
         }
         if let Some(new) = new {
@@ -339,15 +415,17 @@ impl Sim {
         if left == 0 {
             return;
         }
+        let here = self.get(p);
         let mut best = 1000;
         let mut targets: Vec<([i64; 3], Option<Cell>)> = Vec::new();
         for d in SIDES {
             let q = add(p, d);
-            if !self.passes(kind, self.get(q)) {
+            let to = self.get(q);
+            let new = self.new_liquid(kind, q);
+            if !self.passes(kind, here, to, d, new) {
                 continue;
             }
-            let new = self.new_liquid(kind, q);
-            let distance = if self.hole(kind, self.get(add(q, DOWN))) {
+            let distance = if self.hole(kind, to, self.get(add(q, DOWN))) {
                 0
             } else {
                 self.slope(kind, q, 1, neg(d))
@@ -365,7 +443,7 @@ impl Sim {
                 continue;
             };
             let q = add(p, d);
-            if self.spreads_to(kind, self.get(q), false) {
+            if self.spreads_to(kind, self.get(p), self.get(q), d, new) {
                 self.spread_to(kind, q, new, false, due);
             }
         }
@@ -386,10 +464,11 @@ impl Sim {
                 }
             }
         }
+        let here = self.get(p);
         let below = add(p, DOWN);
         let below_cell = self.get(below);
-        if self.spreads_to(kind, below_cell, true) {
-            let new = self.new_liquid(kind, below);
+        let new = self.new_liquid(kind, below);
+        if self.spreads_to(kind, here, below_cell, DOWN, new) {
             self.spread_to(kind, below, new, true, due);
             let sources = SIDES
                 .iter()
@@ -398,7 +477,7 @@ impl Sim {
             if sources >= 3 {
                 self.sides(kind, p, fluid, due);
             }
-        } else if fluid.1 || !self.hole(kind, below_cell) {
+        } else if fluid.1 || !self.hole(kind, here, below_cell) {
             self.sides(kind, p, fluid, due);
         }
     }
@@ -472,6 +551,12 @@ impl Engine {
             },
         })
         .add_plugins(FluidPlugin);
+        // Every due tick runs in its frame, however slow the machine: the comparisons with the
+        // simulator are per game tick (the budget has its own test).
+        *app.world_mut().resource_mut::<BlockTickSettings>() = BlockTickSettings {
+            min_ticks_per_frame: usize::MAX,
+            ..BlockTickSettings::default()
+        };
         let viewer = app
             .world_mut()
             .spawn((
@@ -548,6 +633,15 @@ fn state_of(registry: &BlockRegistry, cell: Cell) -> BlockState {
             .unwrap(),
         Cell::Cobble => registry.by_name("boxel:cobblestone").unwrap(),
         Cell::Obsidian => registry.by_name("boxel:obsidian").unwrap(),
+        Cell::Slab { top, wet } => registry
+            .parse_state(&format!(
+                "boxel:stone_slab[type={},waterlogged={wet}]",
+                if top { "top" } else { "bottom" }
+            ))
+            .unwrap(),
+        Cell::Fence { wet } => registry
+            .parse_state(&format!("boxel:oak_fence[waterlogged={wet}]"))
+            .unwrap(),
     }
 }
 
@@ -561,6 +655,14 @@ fn cell_of(registry: &BlockRegistry, state: BlockState) -> Cell {
         "boxel:lava" => Cell::Lava(level()),
         "boxel:cobblestone" => Cell::Cobble,
         "boxel:obsidian" => Cell::Obsidian,
+        "boxel:stone_slab" => Cell::Slab {
+            top: registry.property(state, "type") == Some("top"),
+            wet: registry.is_waterlogged(state),
+        },
+        // Any sides: the world connects fences to their neighbors.
+        "boxel:oak_fence" => Cell::Fence {
+            wet: registry.is_waterlogged(state),
+        },
         other => panic!("unexpected {other}"),
     }
 }
@@ -684,6 +786,17 @@ fn the_same_scenes_far_from_the_origin() {
     edits.push(([0, 0, 0], Cell::Water(0)));
     edits.push(([-4, 1, -3], Cell::Water(0)));
     edits.push(([-6, 0, 5], Cell::Lava(0)));
+    // A waterlogged top slab in the air and a dry fence between two sources.
+    edits.push((
+        [6, 2, -6],
+        Cell::Slab {
+            top: true,
+            wet: true,
+        },
+    ));
+    edits.push(([-7, 0, -8], Cell::Water(0)));
+    edits.push(([-7, 0, -7], Cell::Fence { wet: false }));
+    edits.push(([-7, 0, -6], Cell::Water(0)));
     for origin in [
         BlockPos::new((1 << 31) - 2, -(1 << 31) + 3, -(1 << 31) + 1),
         BlockPos::new(1 << 40, 1 << 40, -(1 << 40)),
@@ -950,5 +1063,158 @@ fn random_terrain_with_water_and_lava_matches_the_simulator() {
             (130, vec![([0, -1, 0], Cell::Air), ([-3, 0, -2], Cell::Air)]),
         ];
         run(ORIGIN, &format!("lava seed {seed}"), &edits, &later, 260);
+    }
+}
+
+#[test]
+fn waterlogged_blocks_are_sources_that_flow_out_of_their_open_faces() {
+    let wet_bottom = Cell::Slab {
+        top: false,
+        wet: true,
+    };
+    let wet_top = Cell::Slab {
+        top: true,
+        wet: true,
+    };
+    // A waterlogged bottom slab on the ground: a source, 7 blocks to every side.
+    let (engine, _) = run(ORIGIN, "slab", &[([0, 0, 0], wet_bottom)], &[], 60);
+    assert_eq!(
+        engine.get([0, 0, 0]),
+        wet_bottom,
+        "the slab keeps its water"
+    );
+    for d in 1..=7 {
+        assert_eq!(engine.get([d, 0, 0]), Cell::Water(d as u8), "{d}");
+    }
+    assert_eq!(engine.get([8, 0, 0]), Cell::Air);
+    // Hanging in the air: a bottom slab's water never goes through its closed bottom; a top
+    // slab's falls first and, once the water under it stands, spreads to the sides like any
+    // source over water.
+    let hanging = [([-4, 3, 0], wet_bottom), ([4, 3, 0], wet_top)];
+    let mut engine = Engine::new(ORIGIN, &[]);
+    let mut sim = Sim::new();
+    engine.edit(&hanging);
+    sim.edit(&hanging);
+    for t in 1..=40 {
+        engine.step();
+        sim.step();
+        assert_same(&engine, &sim, "hanging");
+        if t == 5 {
+            assert_eq!(engine.get([-3, 3, 0]), Cell::Water(1), "sideways at once");
+            assert_eq!(engine.get([4, 2, 0]), Cell::Water(8), "down at once");
+            assert_eq!(engine.get([5, 3, 0]), Cell::Air, "not sideways yet");
+        }
+    }
+    assert_eq!(
+        engine.get([-4, 2, 0]),
+        Cell::Air,
+        "nothing under the bottom slab"
+    );
+    assert_eq!(engine.get([5, 3, 0]), Cell::Water(1));
+    // A fence holds water like a slab; its open faces let it out everywhere.
+    let (engine, _) = run(
+        ORIGIN,
+        "fence",
+        &[([0, 2, 0], Cell::Fence { wet: true })],
+        &[],
+        30,
+    );
+    assert_eq!(engine.get([0, 1, 0]), Cell::Water(8));
+}
+
+#[test]
+fn flowing_water_never_fills_a_block_and_lava_hardens_next_to_a_wet_one() {
+    let dry = Cell::Slab {
+        top: false,
+        wet: false,
+    };
+    let edits = [
+        ([0, 0, 0], Cell::Water(0)),
+        ([2, 0, 0], dry),
+        ([0, 0, 2], Cell::Fence { wet: false }),
+        ([-6, 0, 0], Cell::Lava(0)),
+        ([-5, 0, 0], Cell::Fence { wet: true }),
+    ];
+    let (engine, _) = run(ORIGIN, "dry", &edits, &[], 60);
+    assert_eq!(engine.get([2, 0, 0]), dry);
+    assert_eq!(engine.get([0, 0, 2]), Cell::Fence { wet: false });
+    assert_eq!(engine.get([3, 0, 0]), Cell::Water(5), "around the slab");
+    assert_eq!(engine.get([-6, 0, 0]), Cell::Obsidian);
+}
+
+#[test]
+fn two_sources_waterlog_the_dry_block_between_them() {
+    let dry = Cell::Slab {
+        top: false,
+        wet: false,
+    };
+    // Between two sources on the ground a dry slab or fence takes the new source; next to one
+    // source it stays dry, with flowing water around it.
+    let edits = [
+        ([-1, 0, 0], Cell::Water(0)),
+        ([0, 0, 0], dry),
+        ([1, 0, 0], Cell::Water(0)),
+        ([-1, 0, 4], Cell::Water(0)),
+        ([0, 0, 4], Cell::Fence { wet: false }),
+        ([1, 0, 4], Cell::Water(0)),
+        ([0, 0, -6], dry),
+        ([1, 0, -6], Cell::Water(0)),
+    ];
+    let (engine, _) = run(ORIGIN, "two sources", &edits, &[], 30);
+    assert_eq!(
+        engine.get([0, 0, 0]),
+        Cell::Slab {
+            top: false,
+            wet: true
+        }
+    );
+    assert_eq!(engine.get([0, 0, 4]), Cell::Fence { wet: true });
+    assert_eq!(engine.get([0, 0, -6]), dry, "one source is not enough");
+}
+
+#[test]
+fn random_terrain_with_waterlogged_blocks_matches_the_simulator() {
+    for seed in 0..4u64 {
+        let mut rng = mix(seed ^ 0x7765_74);
+        let mut roll = |n: u64| {
+            rng = mix(rng);
+            rng % n
+        };
+        let mut edits = Vec::new();
+        for x in -9..=9 {
+            for z in -9..=9 {
+                let y = roll(3) as i64 - 1;
+                let wet = roll(3) == 0;
+                match roll(100) {
+                    0..10 => edits.push(([x, -1, z], Cell::Air)),
+                    10..16 => edits.push(([x, y, z], Cell::Slab { top: false, wet })),
+                    16..22 => edits.push(([x, y, z], Cell::Slab { top: true, wet })),
+                    22..26 => edits.push(([x, y, z], Cell::Fence { wet })),
+                    26..30 => edits.push(([x, 0, z], Cell::Stone)),
+                    _ => {}
+                }
+            }
+        }
+        for _ in 0..2 {
+            let p = [roll(13) as i64 - 6, roll(3) as i64, roll(13) as i64 - 6];
+            edits.push((p, Cell::Water(0)));
+        }
+        let p = [roll(13) as i64 - 6, 1, roll(13) as i64 - 6];
+        edits.push((p, Cell::Lava(0)));
+        // Later: a waterlogged slab appears, a block breaks.
+        let later = [
+            (
+                40,
+                vec![(
+                    [3, 1, -3],
+                    Cell::Slab {
+                        top: true,
+                        wet: true,
+                    },
+                )],
+            ),
+            (70, vec![([0, -1, 0], Cell::Air), ([-3, 0, -2], Cell::Air)]),
+        ];
+        run(ORIGIN, &format!("wet seed {seed}"), &edits, &later, 140);
     }
 }

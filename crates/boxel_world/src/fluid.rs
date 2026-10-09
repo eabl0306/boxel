@@ -19,6 +19,14 @@
 //!   lava). The fluid may flow into it if what it holds can be replaced: an empty cell always,
 //!   water only by lava falling into it (which turns it to stone), lava only by water where the
 //!   lava is at least 4/9 high. A fluid never replaces its own cells.
+//! - A waterlogged block (a slab, stairs or a fence whose `waterlogged` is `true`, ADR 0025)
+//!   holds a water source: it ticks and spreads like one and counts as one for its neighbors.
+//!   Flowing water never fills a block (it stops movement), but a dry one where water would
+//!   make a new source (two sources beside it) takes it and becomes waterlogged, as in
+//!   Minecraft (`canPlaceLiquid`). Between two cells, a fluid passes only where their collision
+//!   faces toward each other leave part of the face open (Minecraft's `canPassThroughWall`):
+//!   water flows out of the sides of a waterlogged slab but not through the bottom of a bottom
+//!   slab.
 //! - Lava next to water hardens at once (Minecraft's `LiquidBlock::shouldSpreadLiquid`): a lava
 //!   cell with water above it or beside it turns to obsidian if it is a source, to cobblestone
 //!   otherwise. This is the lava's tick reaction ([`TickHandler::react`]), so it happens in the
@@ -32,7 +40,10 @@
 use crate::WorldContent;
 use crate::ticks::{BlockTicks, BlockTicksPlugin, TickContext, TickHandler, offset};
 use boxel_app::{App, Plugin};
-use boxel_voxel::{BlockModel, BlockPos, BlockRegistry, BlockState, FLUID_LEVEL, Face};
+use boxel_voxel::rules::collision_face_cover;
+use boxel_voxel::{
+    BlockCollision, BlockModel, BlockPos, BlockRegistry, BlockState, FLUID_LEVEL, Face,
+};
 
 /// Water's tick delay in game ticks (Minecraft's 5).
 pub const WATER_TICK_DELAY: u32 = FluidRules::WATER.delay;
@@ -122,10 +133,10 @@ impl FluidRules {
     }
 }
 
-/// Adds flowing water and lava: registers the ticks of `boxel:water` and `boxel:lava` (with
-/// [`BlockTicksPlugin`] if it is not there yet), and lava's reaction to water. Needs
-/// [`WorldPlugin`](crate::WorldPlugin) first; a fluid missing from the registry (or without
-/// its 16 `level` values) does not flow.
+/// Adds flowing water and lava: registers the ticks of `boxel:water`, of every waterlogged
+/// state (water's) and of `boxel:lava` (with [`BlockTicksPlugin`] if it is not there yet), and
+/// lava's reaction to water. Needs [`WorldPlugin`](crate::WorldPlugin) first; a fluid missing
+/// from the registry (or without its 16 `level` values) does not flow.
 pub struct FluidPlugin;
 
 impl Plugin for FluidPlugin {
@@ -146,16 +157,22 @@ impl Plugin for FluidPlugin {
                 FluidKind::Water => (water_tick, None),
                 FluidKind::Lava => (lava_tick, Some(lava_react as _)),
             };
-            app.world_mut().resource_mut::<BlockTicks>().register(
-                &registry,
-                block,
-                TickHandler {
-                    delay: rules.delay,
-                    reach: rules.reach(),
-                    tick,
-                    react,
-                },
-            );
+            let handler = TickHandler {
+                delay: rules.delay,
+                reach: rules.reach(),
+                tick,
+                react,
+            };
+            let mut ticks = app.world_mut().resource_mut::<BlockTicks>();
+            ticks.register(&registry, block, handler);
+            if kind == FluidKind::Water {
+                // The water of the waterlogged blocks.
+                for state in (0..registry.len() as u16).map(BlockState) {
+                    if registry.is_waterlogged(state) {
+                        ticks.register_state(&registry, state, handler);
+                    }
+                }
+            }
         }
     }
 }
@@ -263,7 +280,7 @@ impl<'a> Fluids<'a> {
         }
     }
 
-    /// The fluid `state` holds and its kind.
+    /// The fluid `state` holds and its kind (a waterlogged block holds a water source).
     fn content(&self, state: BlockState) -> Option<(FluidKind, Fluid)> {
         for (kind, first) in FluidKind::ALL.into_iter().zip(self.first) {
             if let Some(first) = first
@@ -272,7 +289,31 @@ impl<'a> Fluids<'a> {
                 return Some((kind, Fluid::from_level(level as u8)));
             }
         }
+        if self.first[0].is_some() && self.registry.is_waterlogged(state) {
+            return Some((FluidKind::Water, Fluid::SOURCE));
+        }
         None
+    }
+
+    /// Minecraft's `canPassThroughWall`: a fluid passes from `a` to its neighbor `b` across
+    /// `face` of `a` unless their collision faces there cover the whole face together (a full
+    /// block always does). Cells without collision (air, fluids, plants) never stop it.
+    fn wall_open(&self, a: Option<BlockState>, b: Option<BlockState>, face: Face) -> bool {
+        let (Some(a), Some(b)) = (a, b) else {
+            return true;
+        };
+        let (ca, cb) = (self.registry.collision(a), self.registry.collision(b));
+        if ca.is_none() && cb.is_none() {
+            return true;
+        }
+        if *ca == BlockCollision::Full || *cb == BlockCollision::Full {
+            return false;
+        }
+        let (fa, fb) = (
+            collision_face_cover(ca, face),
+            collision_face_cover(cb, face.opposite()),
+        );
+        fa.iter().zip(&fb).any(|(x, y)| x | y != u16::MAX)
     }
 
     /// The state of `kind` holding `fluid`.
@@ -343,26 +384,70 @@ impl Flow<'_> {
         }
     }
 
-    /// Minecraft's `canSpreadTo`: this fluid may flow into `state` (`down`: from above).
-    fn can_spread_to(&self, state: Option<BlockState>, down: bool) -> bool {
-        self.replaceable(state, down) && self.can_hold(state)
+    /// The wall between `from` and `to` across `face` of `from` ([`Fluids::wall_open`]).
+    fn wall_open(&self, from: Option<BlockState>, to: Option<BlockState>, face: Face) -> bool {
+        self.fluids.wall_open(from, to, face)
     }
 
-    /// Minecraft's `canPassThrough`: not a source of this fluid and able to hold it.
-    fn can_pass_through(&self, state: Option<BlockState>) -> bool {
-        !self.is_source(state) && self.can_hold(state)
+    /// True if `state` is a dry block that would take a water source and this fluid is water
+    /// (Minecraft's `SimpleWaterloggedBlock::canPlaceLiquid`).
+    fn takes_source(&self, state: Option<BlockState>) -> bool {
+        self.kind == FluidKind::Water
+            && state.is_some_and(|s| {
+                let registry = self.registry();
+                registry.can_be_waterlogged(s) && !registry.is_waterlogged(s)
+            })
     }
 
-    /// Minecraft's `isWaterHole`: the cell below holds this fluid or could.
-    fn is_hole(&self, below: Option<BlockState>) -> bool {
-        self.fluid(below).is_some() || self.can_hold(below)
+    /// Minecraft's `canHoldFluid` for the fluid `new`: [`Self::can_hold`], or a dry block that
+    /// takes `new` because it is a water source ([`Self::takes_source`]).
+    fn can_hold_new(&self, state: Option<BlockState>, new: Option<Fluid>) -> bool {
+        self.can_hold(state) || new.is_some_and(|f| f.source) && self.takes_source(state)
+    }
+
+    /// Minecraft's `canSpreadTo`: this fluid, as `new`, may flow from `from` into its neighbor
+    /// `to` across `face` (down when `face` is `NegY`).
+    fn can_spread_to(
+        &self,
+        from: Option<BlockState>,
+        to: Option<BlockState>,
+        face: Face,
+        new: Option<Fluid>,
+    ) -> bool {
+        self.replaceable(to, face == Face::NegY)
+            && self.can_hold_new(to, new)
+            && self.wall_open(from, to, face)
+    }
+
+    /// Minecraft's `canPassThrough`: from `from` across `face` into `to`, not a source of this
+    /// fluid and able to hold it as `new` (flowing fluid when `None`).
+    fn can_pass_through(
+        &self,
+        from: Option<BlockState>,
+        to: Option<BlockState>,
+        face: Face,
+        new: Option<Fluid>,
+    ) -> bool {
+        !self.is_source(to) && self.can_hold_new(to, new) && self.wall_open(from, to, face)
+    }
+
+    /// Minecraft's `isWaterHole`: the cell below `from` holds this fluid or could, through the
+    /// wall between them.
+    fn is_hole(&self, from: Option<BlockState>, below: Option<BlockState>) -> bool {
+        (self.fluid(below).is_some() || self.can_hold(below))
+            && self.wall_open(from, below, Face::NegY)
     }
 
     /// What `pos` would hold given its neighbors (Minecraft's `getNewLiquid`); `None` is empty.
+    /// A neighbor counts through an open wall only.
     fn new_liquid(&self, cx: &TickContext<'_>, pos: BlockPos) -> Option<Fluid> {
+        let here = cx.get(pos);
         let (mut amount, mut sources) = (0, 0);
         for face in HORIZONTAL {
-            if let Some(f) = self.fluid(cx.get(offset(pos, face))) {
+            let neighbor = cx.get(offset(pos, face));
+            if let Some(f) = self.fluid(neighbor)
+                && self.wall_open(here, neighbor, face)
+            {
                 sources += usize::from(f.source);
                 amount = amount.max(f.amount);
             }
@@ -373,7 +458,8 @@ impl Flow<'_> {
                 return Some(Fluid::SOURCE);
             }
         }
-        if self.fluid(cx.get(offset(pos, Face::PosY))).is_some() {
+        let above = cx.get(offset(pos, Face::PosY));
+        if self.fluid(above).is_some() && self.wall_open(here, above, Face::PosY) {
             return Some(Fluid::FALLING);
         }
         let left = amount.saturating_sub(self.rules.drop_off);
@@ -391,16 +477,18 @@ impl Flow<'_> {
     /// Shortest way down from `pos` (reached at `depth` from the cell spreading, coming from
     /// `from`), within the slope distance; 1000 when there is none.
     fn slope_distance(&self, cx: &TickContext<'_>, pos: BlockPos, depth: u32, from: Face) -> u32 {
+        let here = cx.get(pos);
         let mut best = 1000;
         for face in HORIZONTAL {
             if face == from {
                 continue;
             }
             let next = offset(pos, face);
-            if !self.can_pass_through(cx.get(next)) {
+            let state = cx.get(next);
+            if !self.can_pass_through(here, state, face, None) {
                 continue;
             }
-            if self.is_hole(cx.get(offset(next, Face::NegY))) {
+            if self.is_hole(state, cx.get(offset(next, Face::NegY))) {
                 return depth;
             }
             if depth < self.rules.slope_find_distance {
@@ -413,16 +501,22 @@ impl Flow<'_> {
     /// The directions `pos` spreads to and what each neighbor gets (Minecraft's `getSpread`):
     /// those with the shortest way down.
     fn spread_targets(&self, cx: &TickContext<'_>, pos: BlockPos) -> Vec<(Face, Option<Fluid>)> {
+        let here = cx.get(pos);
         let mut min = 1000;
         let mut out = Vec::new();
         for face in HORIZONTAL {
             let next = offset(pos, face);
             let state = cx.get(next);
-            if !self.can_pass_through(state) {
+            // What the neighbor would hold only matters to a dry block that takes a source:
+            // skip working it out for the neighbors that cannot hold this fluid at all.
+            if !self.takes_source(state) && !self.can_pass_through(here, state, face, None) {
                 continue;
             }
             let new = self.new_liquid(cx, next);
-            let distance = if self.is_hole(cx.get(offset(next, Face::NegY))) {
+            if !self.can_pass_through(here, state, face, new) {
+                continue;
+            }
+            let distance = if self.is_hole(state, cx.get(offset(next, Face::NegY))) {
                 0
             } else {
                 self.slope_distance(cx, next, 1, face.opposite())
@@ -446,17 +540,28 @@ impl Flow<'_> {
     }
 
     /// Writes `fluid` into `pos` (empty writes nothing), Minecraft's `spreadTo`: lava falling
-    /// into water turns it to stone instead.
+    /// into water turns it to stone instead, and a dry block that takes a water source keeps
+    /// itself and holds it (`placeLiquid`).
     fn spread_to(&self, cx: &mut TickContext<'_>, pos: BlockPos, fluid: Option<Fluid>, down: bool) {
-        if down && self.kind == FluidKind::Lava && self.fluids.is_water(cx.get(pos)) {
+        let state = cx.get(pos);
+        if down && self.kind == FluidKind::Lava && self.fluids.is_water(state) {
             if let Some(stone) = self.fluids.stone {
                 cx.set(pos, stone);
             }
             return;
         }
-        if let Some(fluid) = fluid {
-            cx.set(pos, self.state(fluid));
+        let Some(fluid) = fluid else {
+            return;
+        };
+        if self.takes_source(state) {
+            if fluid.source
+                && let Some(wet) = state.and_then(|s| self.registry().with_water(s, true))
+            {
+                cx.set(pos, wet);
+            }
+            return;
         }
+        cx.set(pos, self.state(fluid));
     }
 
     fn spread_to_sides(&self, cx: &mut TickContext<'_>, pos: BlockPos, fluid: Fluid) {
@@ -468,30 +573,40 @@ impl Flow<'_> {
         // Nothing to write without a neighbor it may flow into: skip the search for the way
         // down (it only picks among the neighbors it may write to). Most ticks of standing
         // water end here.
-        let open = HORIZONTAL
-            .iter()
-            .any(|&f| self.can_spread_to(cx.get(offset(pos, f)), false));
+        // A dry block that takes a source counts as open: whether it gets one is worked out
+        // with the targets.
+        let here = cx.get(pos);
+        let open = HORIZONTAL.iter().any(|&f| {
+            let next = cx.get(offset(pos, f));
+            self.takes_source(next) || self.can_spread_to(here, next, f, None)
+        });
         if amount == 0 || !open {
             return;
         }
         for (face, new) in self.spread_targets(cx, pos) {
             let next = offset(pos, face);
-            if self.can_spread_to(cx.get(next), false) {
+            if self.can_spread_to(cx.get(pos), cx.get(next), face, new) {
                 self.spread_to(cx, next, new, false);
             }
         }
     }
 
     fn spread(&self, cx: &mut TickContext<'_>, pos: BlockPos, fluid: Fluid) {
+        let here = cx.get(pos);
         let below = offset(pos, Face::NegY);
         let below_state = cx.get(below);
-        if self.can_spread_to(below_state, true) {
-            let new = self.new_liquid(cx, below);
+        // Minecraft works out what the cell below would hold first; it only matters to a dry
+        // block that takes a source.
+        let new = (self.takes_source(below_state)
+            || self.can_spread_to(here, below_state, Face::NegY, None))
+        .then(|| self.new_liquid(cx, below))
+        .flatten();
+        if self.can_spread_to(here, below_state, Face::NegY, new) {
             self.spread_to(cx, below, new, true);
             if self.source_neighbors(cx, pos) >= 3 {
                 self.spread_to_sides(cx, pos, fluid);
             }
-        } else if fluid.source || !self.is_hole(below_state) {
+        } else if fluid.source || !self.is_hole(here, below_state) {
             self.spread_to_sides(cx, pos, fluid);
         }
     }

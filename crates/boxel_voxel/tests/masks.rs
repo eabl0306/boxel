@@ -454,7 +454,7 @@ fn registry_light_fields_and_validation() {
     let lamp = b
         .add_block(def("lamp", RenderShape::Opaque, [14, 11, 6], 15))
         .unwrap();
-    assert_eq!(lamp, BlockState(238));
+    assert_eq!(lamp, BlockState(257));
     // Cutout may stop light; partial opacities and full channels are fine.
     b.add_block(def("dense_leaves", RenderShape::Cutout, [0; 3], 15))
         .unwrap();

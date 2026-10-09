@@ -11,6 +11,10 @@ use crate::{Face, LightValue, OPAQUE_OPACITY};
 /// flowing (lower as it grows), 8 to 15 falling (ADR 0021).
 pub const FLUID_LEVEL: &str = "level";
 
+/// The state property of a block that holds a water source (Minecraft's `waterlogged`, `false`
+/// or `true`; ADR 0025): the states with `true` have [`StateFlags::WATERLOGGED`].
+pub const WATERLOGGED: &str = "waterlogged";
+
 /// Most states a registry holds: `2^15`. The mesher's material id is the state id, and its top
 /// bit (`boxel_mesh::FLUID_SURFACE_BIT`) marks fluid surface cells, so every state id must stay
 /// below it.
@@ -324,6 +328,12 @@ bitflags::bitflags! {
         const FLUID = 1 << 2;
         /// Emits light (some `emission` channel above 0).
         const EMISSIVE = 1 << 3;
+        /// Holds a water source besides itself: its [`WATERLOGGED`] property is `true` (ADR
+        /// 0025).
+        const WATERLOGGED = 1 << 4;
+        /// Could hold a water source: it has the [`WATERLOGGED`] property and is not a full
+        /// cube (ADR 0025).
+        const WATERLOGGABLE = 1 << 5;
     }
 }
 
@@ -781,6 +791,7 @@ impl BlockRegistryBuilder {
             all(glass),
         ))
         .expect("built-in glass");
+        // A slab holds water (`waterlogged`, ADR 0025) unless it is double.
         b.add_block_with_states(
             model(
                 "stone_slab",
@@ -789,7 +800,10 @@ impl BlockRegistryBuilder {
                 1,
                 all(stone),
             ),
-            vec![Property::new("type", ["bottom", "top", "double"])],
+            vec![
+                Property::new("type", ["bottom", "top", "double"]),
+                Property::boolean(WATERLOGGED),
+            ],
             |state, def| match state.get("type") {
                 Some("top") => {
                     def.model = BlockModel::Slab(SlabHalf::Top);
@@ -880,8 +894,8 @@ impl BlockRegistryBuilder {
                 .and_then(Facing::from_name)
                 .unwrap_or_default()
         };
-        // Stairs let light through like slabs (opacity 1). `waterlogged` is Minecraft's: it
-        // changes nothing until fluids can fill other blocks.
+        // Stairs let light through like slabs (opacity 1). `waterlogged` is Minecraft's: the
+        // stairs hold a water source (ADR 0025).
         for (name, texture) in [("stone_stairs", stone), ("oak_stairs", planks)] {
             let def = BlockDef {
                 name: format!("boxel:{name}"),
@@ -900,7 +914,7 @@ impl BlockRegistryBuilder {
                 facing(),
                 Property::new("half", ["bottom", "top"]),
                 Property::new("shape", StairShape::ALL.map(StairShape::name)),
-                Property::boolean("waterlogged"),
+                Property::boolean(WATERLOGGED),
             ];
             self.add_block_with_states(def, properties, |state, def| {
                 def.model = BlockModel::Stairs {
@@ -918,7 +932,8 @@ impl BlockRegistryBuilder {
             })
             .expect("built-in stairs");
         }
-        // The fence stops no light; its sides follow its neighbors (`boxel_voxel::rules`).
+        // The fence stops no light (but direct sky when it holds water); its sides follow its
+        // neighbors (`boxel_voxel::rules`).
         let fence = BlockDef {
             name: "boxel:oak_fence".to_string(),
             shape: RenderShape::Opaque,
@@ -930,14 +945,18 @@ impl BlockRegistryBuilder {
             light_opacity: 0,
             textures: FaceTextures::all(planks),
         };
-        let sides = Facing::ALL.map(|f| Property::boolean(f.name())).to_vec();
-        self.add_block_with_states(fence, sides, |state, def| {
+        let mut properties = Facing::ALL.map(|f| Property::boolean(f.name())).to_vec();
+        properties.push(Property::boolean(WATERLOGGED));
+        self.add_block_with_states(fence, properties, |state, def| {
             let mut sides = FenceSides::NONE;
             for f in Facing::ALL {
                 sides = sides.with(f, state.get(f.name()) == Some("true"));
             }
             def.model = BlockModel::Fence { sides };
             def.collision = def.model.default_collision();
+            if state.get(WATERLOGGED) == Some("true") {
+                def.light_opacity = def.light_opacity.max(1);
+            }
         })
         .expect("built-in fence");
         // Torches: cutout sticks that glow ([`TORCH_EMISSION`]), no collision, no opacity.
@@ -1102,27 +1121,44 @@ impl BlockRegistryBuilder {
             state_block.extend(std::iter::repeat_n(i as u16, usize::from(b.count)));
         }
         let states = &self.states;
+        let mut flags: Vec<StateFlags> = states
+            .iter()
+            .map(|b| {
+                let mut f = StateFlags::empty();
+                let solid = !b.collision.is_none();
+                f.set(StateFlags::SOLID, solid);
+                f.set(
+                    StateFlags::OCCLUDES,
+                    b.shape == RenderShape::Opaque && b.model.is_solid_cube(),
+                );
+                let fluid = b.shape == RenderShape::Translucent || b.model == BlockModel::Fluid;
+                f.set(StateFlags::FLUID, fluid && !solid);
+                f.set(StateFlags::EMISSIVE, b.emission != [0; 3]);
+                f
+            })
+            .collect();
+        for block in &self.blocks {
+            if !block.properties.iter().any(|p| p.name() == WATERLOGGED) {
+                continue;
+            }
+            // A full cube holds no water (a double slab), whatever its property says.
+            for state in block.first..block.first + block.count {
+                if states[usize::from(state)].model.is_solid_cube() {
+                    continue;
+                }
+                let f = &mut flags[usize::from(state)];
+                f.insert(StateFlags::WATERLOGGABLE);
+                if block.values(BlockState(state)).get(WATERLOGGED) == Some("true") {
+                    f.insert(StateFlags::WATERLOGGED);
+                }
+            }
+        }
         BlockRegistry {
             state_block,
             shapes: states.iter().map(|b| b.shape).collect(),
             models: states.iter().map(|b| b.model).collect(),
             collisions: states.iter().map(|b| b.collision.clone()).collect(),
-            flags: states
-                .iter()
-                .map(|b| {
-                    let mut f = StateFlags::empty();
-                    let solid = !b.collision.is_none();
-                    f.set(StateFlags::SOLID, solid);
-                    f.set(
-                        StateFlags::OCCLUDES,
-                        b.shape == RenderShape::Opaque && b.model.is_solid_cube(),
-                    );
-                    let fluid = b.shape == RenderShape::Translucent || b.model == BlockModel::Fluid;
-                    f.set(StateFlags::FLUID, fluid && !solid);
-                    f.set(StateFlags::EMISSIVE, b.emission != [0; 3]);
-                    f
-                })
-                .collect(),
+            flags,
             emission: states
                 .iter()
                 .map(|b| LightValue::from_rgb(b.emission))
@@ -1184,16 +1220,18 @@ impl BlockRegistry {
     /// (15, 15, 15) ([`LAMPS`]); 33 to 48 `boxel:lava[level=0..15]` (an Opaque fluid with no
     /// collision, light opacity 1, emission (15, 7, 2), [`LAVA_EMISSION`]; default 33, the
     /// source; ADR 0025); then the blocks of ADR 0018: 49 `boxel:glass` (Translucent cube,
-    /// solid, light opacity 0), 50 to 52 `boxel:stone_slab[type=bottom|top|double]` (default
-    /// 50; the halves are Opaque slabs with light opacity 1, `double` an Opaque stone cube), 53
-    /// `boxel:short_grass` and 54 `boxel:poppy` (Cutout crosses, no collision, light opacity 0);
-    /// then the blocks of ADR 0020: 55 to 134 `boxel:stone_stairs` and 135 to 214
-    /// `boxel:oak_stairs` (`facing`, `half`, `shape`, `waterlogged`; default the first, all
-    /// values first; Opaque, light opacity 1), 215 to 230 `boxel:oak_fence` (`east`, `north`,
-    /// `south`, `west`; default 215, unconnected; Opaque, light opacity 0), 231 `boxel:torch` and
-    /// 232 to 235 `boxel:wall_torch[facing=north|south|west|east]` (Cutout, no collision, light
-    /// opacity 0, emission [`TORCH_EMISSION`]); then what lava makes with water (ADR 0025): 236
-    /// `boxel:cobblestone` and 237 `boxel:obsidian` (Opaque solid cubes).
+    /// solid, light opacity 0), 50 to 55 `boxel:stone_slab[type=bottom|top|double,
+    /// waterlogged=false|true]` (default 50; the halves are Opaque slabs with light opacity 1,
+    /// `double` an Opaque stone cube), 56 `boxel:short_grass` and 57 `boxel:poppy` (Cutout
+    /// crosses, no collision, light opacity 0); then the blocks of ADR 0020: 58 to 137
+    /// `boxel:stone_stairs` and 138 to 217 `boxel:oak_stairs` (`facing`, `half`, `shape`,
+    /// `waterlogged`; default the first, all values first; Opaque, light opacity 1), 218 to 249
+    /// `boxel:oak_fence` (`east`, `north`, `south`, `waterlogged`, `west`; default 218,
+    /// unconnected and dry; Opaque, light opacity 0, 1 with water), 250 `boxel:torch` and 251 to
+    /// 254 `boxel:wall_torch[facing=north|south|west|east]` (Cutout, no collision, light opacity
+    /// 0, emission [`TORCH_EMISSION`]); then what lava makes with water (ADR 0025): 255
+    /// `boxel:cobblestone` and 256 `boxel:obsidian` (Opaque solid cubes). The states whose
+    /// `waterlogged` is `true` hold a water source ([`StateFlags::WATERLOGGED`]).
     pub fn default_blocks() -> BlockRegistry {
         BlockRegistryBuilder::with_default_blocks().build()
     }
@@ -1340,6 +1378,19 @@ impl BlockRegistry {
     /// [`StateFlags::OCCLUDES`]).
     pub fn occludes(&self, s: BlockState) -> bool {
         self.flags(s).contains(StateFlags::OCCLUDES)
+    }
+    /// True if `s` holds a water source besides itself ([`StateFlags::WATERLOGGED`], ADR 0025).
+    pub fn is_waterlogged(&self, s: BlockState) -> bool {
+        self.flags(s).contains(StateFlags::WATERLOGGED)
+    }
+    /// True if `s` could hold water: its block has the [`WATERLOGGED`] property and it is not a
+    /// full cube (a double slab holds none, as in Minecraft).
+    pub fn can_be_waterlogged(&self, s: BlockState) -> bool {
+        self.flags(s).contains(StateFlags::WATERLOGGABLE)
+    }
+    /// `s` with its [`WATERLOGGED`] property set to `water` (`None` without the property).
+    pub fn with_water(&self, s: BlockState, water: bool) -> Option<BlockState> {
+        self.with(s, WATERLOGGED, if water { "true" } else { "false" })
     }
     /// Flags.
     pub fn flags(&self, s: BlockState) -> StateFlags {
