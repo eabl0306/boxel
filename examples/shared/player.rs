@@ -8,6 +8,11 @@
 //! catches up in about a tenth of a second ([`EyeLag`], only the view). The camera keeps its
 //! mouse look; its own WASD movement is paused while walking.
 //!
+//! The player modes of ADR 0026, as in Minecraft: Shift sneaks (slower, and it never walks off
+//! an edge it would fall from), Ctrl sprints, and Space twice within [`FLY_TAP`] turns creative
+//! flight on or off (no gravity: Space rises, Shift descends; landing ends it). Flying the free
+//! camera (not walking), Shift and Ctrl keep moving it down and boosting it.
+//!
 //! Frame order:
 //! - `RunFixedMainLoopSystems::BeforeFixedMainLoop`: the keys are sampled once per frame into
 //!   the player's `MoveIntent` (the jump is a latch, so a press in a frame without a fixed step
@@ -26,6 +31,7 @@ use boxel::debug_overlay::OverlayLines;
 use boxel::physics::{Frozen, PhysicsStats, Swimmer};
 use boxel::prelude::*;
 use boxel::world::WorldSystems;
+use std::time::Duration;
 
 /// Eye height above the feet, blocks (Minecraft's).
 pub const EYE_HEIGHT: f64 = 1.62;
@@ -35,6 +41,12 @@ pub const PLAYER_SIZE: (f64, f64) = (0.6, 1.8);
 pub const WALK_KEY: KeyCode = KeyCode::KeyG;
 /// How far down the first landing looks for ground, blocks.
 const LAND_REACH: f64 = 512.0;
+/// Sneaks while held.
+pub const SNEAK_KEY: KeyCode = KeyCode::ShiftLeft;
+/// Sprints while held.
+pub const SPRINT_KEY: KeyCode = KeyCode::ControlLeft;
+/// Two presses of Space within this time turn creative flight on or off (Minecraft's 7 ticks).
+pub const FLY_TAP: Duration = Duration::from_millis(350);
 
 /// How fast the eye catches up with a step-up, per second: the lag shrinks by `1 + rate * dt`
 /// each frame (about a tenth of a second for a slab).
@@ -193,35 +205,59 @@ fn axis(keys: &ButtonInput<KeyCode>, positive: KeyCode, negative: KeyCode) -> f3
 }
 
 /// Once per frame, before the fixed steps: WASD along the active camera's heading into the
-/// player's `MoveIntent::wish`, and Space into its jump latch (held, or tapped within this
-/// frame: a press and release in one long frame still jumps). Nothing while the fly camera
-/// takes no input (automation).
+/// player's `MoveIntent::wish`, Space into its jump latch (held, or tapped within this frame: a
+/// press and release in one long frame still jumps) and its `up` (held), Shift into `sneak` and
+/// Ctrl into `sprint`. A second press of Space within [`FLY_TAP`] of the first turns
+/// `CharacterController::flying` on or off. Nothing while the fly camera takes no input
+/// (automation).
 pub fn sample_input(
+    time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     cameras: Query<(&Camera, &FlyCamera)>,
-    mut players: Query<&mut MoveIntent, With<Player>>,
+    mut players: Query<(&mut MoveIntent, &mut CharacterController), With<Player>>,
+    mut last_tap: Local<Option<Duration>>,
 ) {
     let Some((_, fly)) = cameras.iter().find(|(camera, _)| camera.active) else {
         return;
     };
-    let (forward, right, jump) = if fly.enabled {
+    let held = |key: KeyCode| fly.enabled && keys.pressed(key);
+    let (forward, right) = if fly.enabled {
         (
             axis(&keys, KeyCode::KeyW, KeyCode::KeyS),
             axis(&keys, KeyCode::KeyD, KeyCode::KeyA),
-            keys.pressed(KeyCode::Space) || keys.just_pressed(KeyCode::Space),
         )
     } else {
-        (0.0, 0.0, false)
+        (0.0, 0.0)
     };
+    let tapped = fly.enabled && keys.just_pressed(KeyCode::Space);
+    let jump = held(KeyCode::Space) || tapped;
+    // A double tap of Space: the second press toggles the flight (and is not a first tap).
+    let now = time.elapsed();
+    let toggle = tapped && last_tap.is_some_and(|last| now.saturating_sub(last) <= FLY_TAP);
+    if tapped {
+        *last_tap = if toggle { None } else { Some(now) };
+    }
     // The fly camera's heading: -Z and +X turned by the yaw around +Y (x is world X, y world Z).
     let (sin, cos) = fly.yaw.sin_cos();
     let wish = (Vec2::new(-sin, -cos) * forward + Vec2::new(cos, -sin) * right).normalize_or_zero();
-    for mut intent in &mut players {
-        if intent.wish != wish {
-            intent.wish = wish;
+    let wanted = MoveIntent {
+        wish,
+        jump: false,
+        up: held(KeyCode::Space),
+        sneak: held(SNEAK_KEY),
+        sprint: held(SPRINT_KEY),
+    };
+    for (mut intent, mut controller) in &mut players {
+        let latch = intent.jump || jump;
+        let next = MoveIntent {
+            jump: latch,
+            ..wanted
+        };
+        if *intent != next {
+            *intent = next;
         }
-        if jump && !intent.jump {
-            intent.jump = true;
+        if toggle {
+            controller.flying = !controller.flying;
         }
     }
 }
@@ -234,26 +270,41 @@ pub fn follow_player(
     walking: Res<Walking>,
     stats: Res<PhysicsStats>,
     mut players: Query<
-        (&Transform, &Velocity, &Contacts, Has<Frozen>, &mut EyeLag),
+        (
+            &Transform,
+            &Velocity,
+            &Contacts,
+            Has<Frozen>,
+            &mut EyeLag,
+            &CharacterController,
+            &MoveIntent,
+        ),
         (With<Player>, Without<FlyCamera>),
     >,
     mut cameras: Query<(&Camera, &mut Transform), With<FlyCamera>>,
     lines: Option<ResMut<OverlayLines>>,
 ) {
     let player = players.iter_mut().next();
-    let player = player.map(|(body, velocity, contacts, frozen, mut eye)| {
-        let y = body.translation.y;
-        let rise = eye.last_y.map_or(0.0, |last| y - last);
-        // A step-up ends on the ground with no vertical speed; a jump or a lift does not.
-        let stepped = contacts.on_ground && velocity.0.y <= 0.0;
-        let lag = eye_lag(eye.lag, rise, stepped, time.delta().as_secs_f64());
-        if eye.lag != lag || eye.last_y != Some(y) {
-            eye.lag = lag;
-            eye.last_y = Some(y);
-        }
-        (*body, *velocity, *contacts, frozen, lag)
-    });
-    if let Some((body, .., lag)) = player {
+    let player = player.map(
+        |(body, velocity, contacts, frozen, mut eye, controller, intent)| {
+            let y = body.translation.y;
+            let rise = eye.last_y.map_or(0.0, |last| y - last);
+            // A step-up ends on the ground with no vertical speed; a jump or a lift does not.
+            let stepped = contacts.on_ground && velocity.0.y <= 0.0;
+            let lag = eye_lag(eye.lag, rise, stepped, time.delta().as_secs_f64());
+            if eye.lag != lag || eye.last_y != Some(y) {
+                eye.lag = lag;
+                eye.last_y = Some(y);
+            }
+            let modes = Modes {
+                flying: controller.flying,
+                sneaking: intent.sneak,
+                sprinting: intent.sprint,
+            };
+            (*body, *velocity, *contacts, frozen, lag, modes)
+        },
+    );
+    if let Some((body, _, _, _, lag, _)) = player {
         let eye = body.translation + DVec3::new(0.0, EYE_HEIGHT - lag, 0.0);
         for (camera, mut transform) in &mut cameras {
             if camera.active && transform.translation != eye {
@@ -265,16 +316,21 @@ pub fn follow_player(
         return;
     };
     let mode = match player {
-        Some((_, velocity, contacts, frozen, _)) => {
+        Some((_, velocity, contacts, frozen, _, modes)) => {
             let state = if frozen {
                 "frozen (chunk not loaded)"
+            } else if modes.flying {
+                "flying"
             } else if contacts.on_ground {
                 "on ground"
             } else {
                 "in the air"
             };
             let speed = boxel::math::DVec2::new(velocity.0.x, velocity.0.z).length();
-            format!("Walk (G flies)  {state}  speed {speed:.2} b/s")
+            format!(
+                "Walk (G flies)  {state}  speed {speed:.2} b/s{}",
+                modes.suffix()
+            )
         }
         None if walking.on => "Walk (G flies)  waiting for the ground".to_string(),
         None => "Fly (G walks)".to_string(),
@@ -283,6 +339,27 @@ pub fn follow_player(
     for (key, line) in [("move", mode), ("physics", physics)] {
         if lines.get(key) != Some(line.as_str()) {
             lines.set(key, line);
+        }
+    }
+}
+
+/// The player modes F3 shows.
+#[derive(Clone, Copy, Debug, Default)]
+struct Modes {
+    flying: bool,
+    sneaking: bool,
+    sprinting: bool,
+}
+
+impl Modes {
+    /// `"  sneaking"`, `"  sprinting"` or nothing (sneaking wins, as in the controller).
+    fn suffix(self) -> &'static str {
+        if self.sneaking {
+            "  sneaking"
+        } else if self.sprinting {
+            "  sprinting"
+        } else {
+            ""
         }
     }
 }
