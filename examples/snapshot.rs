@@ -11,7 +11,8 @@
 //! `--fill` are set once the area is loaded, and the shots wait for the remeshes they cause.
 //! Water flows (`FluidPlugin`, ADR 0021): with `--flow N` the edits get N game ticks (20 per
 //! second) to flow before the shots, run one by one on a stopped clock (the same pixels every
-//! run).
+//! run). `--world-dir DIR` loads the world saved there and saves it after the shots (ADR 0024):
+//! a run with edits and a later run without them give the same pixels.
 //!
 //! Output (stdout): `gpu: <adapter summary>`, `textures: <source, size, pack load time>`; with
 //! edits, one `drop:` line per `--drop` (where the block landed) and `edits: set=N skipped=N
@@ -45,6 +46,7 @@ use boxel::render::{
     VoxelRenderer, light_curve, load_block_textures,
 };
 use boxel::voxel::{BlockRegistry, MAX_BLOCK_COORD};
+use boxel::world::persist::{PersistPlugin, WorldStore};
 use boxel::world::{
     BlockTickSettings, BlockTicks, DaylightCurve, FluidPlugin, WorldContent, WorldStats,
 };
@@ -78,6 +80,8 @@ usage: snapshot --camera X,Y,Z,YAW,PITCH --shot HH:MM=PATH [--shot ...] [options
                        later edit of a cell replaces an earlier one
   --flow N             let placed water flow for N game ticks (20 a second) before the shots
                        (default 0)
+  --world-dir DIR      load the world saved in DIR (made if missing) and save it there after
+                       the shots, edits included
   --timeout S          wall-clock limit for loading the world, in seconds (default 300)
   --help               this text";
 
@@ -136,6 +140,8 @@ struct Options {
     textures: TextureSource,
     /// Game ticks of fluid flow after the edits.
     flow: u32,
+    /// `--world-dir`: where the world is loaded from and saved.
+    world_dir: Option<PathBuf>,
 }
 
 /// `Ok(None)` for `--help`.
@@ -154,6 +160,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         timeout: Duration::from_secs(300),
         textures: TextureSource::Procedural,
         flow: 0,
+        world_dir: None,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -223,6 +230,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                     .ok_or_else(|| format!("{flag}: {v:?} is not in 0..=100000"))?;
             }
             "--pack" => o.textures = pack::parse(flag, &value()?)?,
+            "--world-dir" => o.world_dir = Some(PathBuf::from(value()?)),
             "--timeout" => {
                 let v = value()?;
                 o.timeout = v
@@ -575,6 +583,14 @@ fn run(
 
     // The world, loaded around the camera.
     let started = Instant::now();
+    let generator = o.world.generator(o.seed);
+    let store = match &o.world_dir {
+        Some(dir) => Some(
+            WorldStore::open_dir(dir, &registry, generator.name())
+                .map_err(|e| (EXIT_USAGE, format!("--world-dir {}: {e}", dir.display())))?,
+        ),
+        None => None,
+    };
     let mut app = App::new();
     app.add_plugins((
         LogPlugin {
@@ -583,7 +599,7 @@ fn run(
         TaskPoolPlugin::default(),
         TimePlugin,
         WorldPlugin {
-            generator: o.world.generator(o.seed),
+            generator,
             registry: Arc::clone(&registry),
             settings: WorldSettings {
                 light: o.light,
@@ -594,6 +610,9 @@ fn run(
         },
         FluidPlugin,
     ));
+    if let Some(store) = store {
+        app.add_plugins(PersistPlugin::new(store));
+    }
     // The fluid clock only moves in `--flow` (deterministic shots).
     app.world_mut().resource_mut::<BlockTickSettings>().paused = true;
     app.finish();
@@ -763,6 +782,8 @@ fn run(
             renderer.stats().chunks,
         );
     }
+    // `--world-dir`: the world is saved by the `Shutdown` schedule (nothing else runs there).
+    app.shutdown();
     Ok(())
 }
 

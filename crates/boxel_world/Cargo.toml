@@ -27,6 +27,8 @@ foldhash.workspace = true
 crossbeam-channel.workspace = true
 bitflags.workspace = true
 tracing.workspace = true
+redb.workspace = true
+lz4_flex.workspace = true
 
 [dev-dependencies]
 # Tests get system/component names in ECS diagnostics (dev-only; users opt in through boxel/debug).

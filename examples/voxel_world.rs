@@ -40,6 +40,11 @@
 //! The world is `ForestGenerator` by default: `TerrainGenerator` plus deterministic trees (log
 //! trunk, leaf canopy) so the cutout pipeline is visible; `--no-trees` gives the plain
 //! generator, and `--world overworld` the caves.
+//!
+//! `--world-dir DIR` saves the world there (ADR 0024): the edits, the flowing water, the clock
+//! and the camera are saved on exit (and edited chunks as they unload, and every minute), and
+//! loaded on the next start with the same `DIR` (`--camera` and `--time` win over the saved
+//! camera and clock).
 #![expect(clippy::print_stdout, clippy::print_stderr, reason = "CLI output")]
 
 #[path = "shared/clock.rs"]
@@ -63,9 +68,11 @@ use boxel::voxel::rules;
 use boxel::voxel::{Axis, BlockModel, BlockRegistry, Facing, MAX_BLOCK_COORD, SlabHalf};
 use boxel::window::winit::dpi::PhysicalSize;
 use boxel::window::{PrimaryWindow, WindowResized};
+use boxel::world::persist::{PersistPlugin, PersistSettings, WorldStore};
 use boxel::world::{BlockEdit, FluidPlugin, TimeOfDay, WorldContent, WorldStats, WorldSystems};
 use player::WalkPlugin;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 use world::{World, WorldChoice};
@@ -109,6 +116,9 @@ usage: voxel_world [GPU options] [options]
   --lamps                 demo: colored lamps and lava on the ground around the start
   --pack DIR              block textures from a Minecraft Java resource pack (the directory
                           with pack.mcmeta; default: procedural textures)
+  --world-dir DIR         save the world in DIR on exit and load it from there on start (made
+                          if missing; the camera and the clock start where they were unless
+                          --camera or --time is given)
   --help                  this text
 exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 check failed, 4 timeout";
 
@@ -190,6 +200,10 @@ struct Options {
     lamps: bool,
     /// `--pack`.
     textures: TextureSource,
+    /// `--world-dir`: where the world is saved.
+    world_dir: Option<PathBuf>,
+    /// `--camera` was given (a saved camera does not replace it).
+    camera_given: bool,
 }
 
 impl Options {
@@ -249,6 +263,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         time: None,
         lamps: false,
         textures: TextureSource::Procedural,
+        world_dir: None,
+        camera_given: false,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -310,7 +326,9 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                     .filter(|&(w, h): &(u32, u32)| w > 0 && h > 0 && w <= 16384 && h <= 16384)
                     .ok_or_else(|| format!("{flag}: {v:?} is not WxH"))?;
             }
+            "--world-dir" => o.world_dir = Some(PathBuf::from(value()?)),
             "--camera" => {
+                o.camera_given = true;
                 let v = value()?;
                 let parts: Vec<f64> = v
                     .split(',')
@@ -1494,7 +1512,7 @@ impl Plugin for PickingPlugin {
     }
 
     fn finish(&self, app: &mut App) {
-        let registry = std::sync::Arc::clone(&app.world().resource::<WorldContent>().registry);
+        let registry = Arc::clone(&app.world().resource::<WorldContent>().registry);
         app.insert_resource(Picking::new(&registry));
     }
 }
@@ -1635,6 +1653,83 @@ impl Plugin for DayNightPlugin {
     }
 }
 
+/// Metadata of a saved world: the world options and seed it was made with.
+const WORLD_META: &str = "voxel_world:world";
+/// Metadata of a saved world: the camera on exit, as `x,y,z,yaw,pitch` (degrees).
+const CAMERA_META: &str = "voxel_world:camera";
+
+/// The world options and seed, as saved with a world (`forest seed 42`).
+fn world_signature(o: &Options) -> String {
+    format!("{} seed {}", o.world.label(), o.seed)
+}
+
+/// `x,y,z,yaw,pitch` with finite numbers inside the world.
+fn parse_camera(text: &str) -> Option<[f64; 5]> {
+    let parts: Vec<f64> = text
+        .split(',')
+        .map(|p| p.trim().parse::<f64>().ok())
+        .collect::<Option<_>>()?;
+    let camera: [f64; 5] = parts.try_into().ok()?;
+    let inside = camera.iter().all(|c| c.is_finite())
+        && camera[..3]
+            .iter()
+            .all(|c| c.abs() <= MAX_BLOCK_COORD as f64);
+    inside.then_some(camera)
+}
+
+/// `--world-dir`: opens the world in `dir` (made if missing). A world made with other world
+/// options or another seed is refused (its saved chunks would not match the generated ones);
+/// the camera starts where it was saved unless `--camera` was given.
+fn open_world(
+    dir: &Path,
+    registry: &BlockRegistry,
+    generator: &str,
+    options: &mut Options,
+) -> Result<WorldStore, String> {
+    let fail = |e: &dyn std::fmt::Display| format!("--world-dir {}: {e}", dir.display());
+    let store = WorldStore::open_dir(dir, registry, generator).map_err(|e| fail(&e))?;
+    let signature = world_signature(options);
+    match store.meta(WORLD_META).map_err(|e| fail(&e))? {
+        Some(saved) if saved != signature.as_bytes() => {
+            return Err(fail(&format!(
+                "the world was made as {:?} and this run asks for {signature:?}: pass the same \
+                 --world, --caves, --no-trees, --no-sea and --seed",
+                String::from_utf8_lossy(&saved)
+            )));
+        }
+        Some(_) => {}
+        None => store
+            .put_meta(WORLD_META, signature.into_bytes())
+            .map_err(|e| fail(&e))?,
+    }
+    let saved_camera = store.meta(CAMERA_META).map_err(|e| fail(&e))?;
+    if !options.camera_given
+        && let Some(camera) = saved_camera.and_then(|b| parse_camera(&String::from_utf8_lossy(&b)))
+    {
+        options.camera = camera;
+    }
+    Ok(store)
+}
+
+/// `--world-dir`, on exit: the camera, saved with the world.
+fn save_camera(store: Res<WorldStore>, cameras: Query<(&Transform, &FlyCamera)>) {
+    let Some((transform, fly)) = cameras.iter().next() else {
+        return;
+    };
+    let p = transform.translation;
+    let text = format!(
+        "{},{},{},{},{}",
+        p.x,
+        p.y,
+        p.z,
+        fly.yaw.to_degrees(),
+        fly.pitch.to_degrees()
+    );
+    if let Err(e) = store.put_meta(CAMERA_META, text.into_bytes()) {
+        eprintln!("boxel: the camera could not be saved: {e}");
+    }
+}
+
 /// Kills the process if `main` has not returned `limit` after start (the event loop stopped
 /// updating, so the in-app timeout cannot fire). Dropping the returned sender disarms it.
 fn spawn_watchdog(limit: Duration) -> Sender<()> {
@@ -1657,7 +1752,7 @@ fn main() -> AppExit {
             return AppExit::from_code(1);
         }
     };
-    let options = match parse_options(&rest) {
+    let mut options = match parse_options(&rest) {
         Ok(Some(options)) => options,
         Ok(None) => {
             println!("{}\n\n{CLI_HELP}", usage());
@@ -1673,6 +1768,17 @@ fn main() -> AppExit {
         .map(|timeout| spawn_watchdog(timeout.saturating_add(WATCHDOG_GRACE)));
 
     let generator = options.world.generator(options.seed);
+    let registry = Arc::new(BlockRegistry::default_blocks());
+    let store = match options.world_dir.clone() {
+        Some(dir) => match open_world(&dir, &registry, generator.name(), &mut options) {
+            Ok(store) => Some(store),
+            Err(message) => {
+                eprintln!("boxel: {message}");
+                return AppExit::from_code(1);
+            }
+        },
+        None => None,
+    };
     let (arena_quads, max_chunk_slots) = options.world.render_capacity();
     let world_settings = WorldSettings {
         vertical_bounds: options.fixed_height.then(|| generator.vertical_chunks()),
@@ -1704,6 +1810,7 @@ fn main() -> AppExit {
         })
         .set(WorldPlugin {
             generator,
+            registry,
             settings: world_settings,
             ..WorldPlugin::default()
         })
@@ -1738,6 +1845,17 @@ fn main() -> AppExit {
     // Flowing water (after `WorldPlugin`, in `DefaultPlugins`).
     app.add_plugins(plugins)
         .add_plugins((day_night, FluidPlugin));
+    if let Some(store) = store {
+        app.add_plugins(PersistPlugin::new(store))
+            .add_systems(Shutdown, save_camera);
+        // `--time` sets the clock: the saved one neither replaces it nor is replaced by it.
+        if options.time.is_some() {
+            app.insert_resource(PersistSettings {
+                clock: false,
+                ..PersistSettings::default()
+            });
+        }
+    }
     // After the plugins, so these replace the engine defaults (144 fps, vsync off).
     if let Some(fps) = fps_limit {
         app.insert_resource(FrameLimit::new(fps));
@@ -1819,6 +1937,41 @@ mod tests {
     }
 
     #[test]
+    fn world_dir_option_and_saved_values() {
+        let o = parse(&["--world-dir", "saves/one", "--seed", "7"]);
+        assert_eq!(o.world_dir, Some(PathBuf::from("saves/one")));
+        assert!(!o.camera_given);
+        assert_eq!(world_signature(&o), "forest seed 7");
+        let o = parse(&[
+            "--world",
+            "overworld",
+            "--caves",
+            "off",
+            "--camera",
+            "1,2,3,4,5",
+        ]);
+        assert!(o.camera_given);
+        assert_eq!(
+            world_signature(&o),
+            format!("overworld/off seed {}", o.seed)
+        );
+        assert_eq!(
+            parse_camera("1.5,-2,3e9,90,-10"),
+            Some([1.5, -2.0, 3e9, 90.0, -10.0])
+        );
+        for bad in [
+            "",
+            "1,2,3,4",
+            "1,2,3,4,5,6",
+            "a,2,3,4,5",
+            "inf,0,0,0,0",
+            "0,0,1e300,0,0",
+        ] {
+            assert_eq!(parse_camera(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
     fn camera_far_away_is_accepted_up_to_the_world_limit() {
         let o = parse(&["--camera", "3e9,80,-1e12,10,-5"]);
         assert_eq!(o.camera, [3e9, 80.0, -1e12, 10.0, -5.0]);
@@ -1887,11 +2040,11 @@ mod tests {
             InputPlugin,
             FlyCameraPlugin,
             WorldPlugin {
-                generator: std::sync::Arc::new(FlatGenerator::new(vec![
+                generator: Arc::new(FlatGenerator::new(vec![
                     ("boxel:stone".to_string(), 3),
                     ("boxel:grass".to_string(), 1),
                 ])),
-                executor: std::sync::Arc::new(InlineExecutor),
+                executor: Arc::new(InlineExecutor),
                 ..WorldPlugin::default()
             },
             FluidPlugin,

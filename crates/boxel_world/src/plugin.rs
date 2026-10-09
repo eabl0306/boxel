@@ -269,7 +269,8 @@ pub struct BlockChanged {
 /// (`WorldSystems::Collect`) and at the end of each idle step between frames
 /// ([`WorldSettings::idle_work`]), in the order it happened. The next frame's readers get them.
 ///
-/// A chunk that unloads and loads again may come back different (edits are not saved yet), so
+/// A chunk that unloads and loads again may come back different (without `PersistPlugin` its
+/// edits are lost; with it, a saved copy that cannot be read is generated again), so
 /// systems that keep state about the blocks of a chunk refresh it on `Loaded` (physics wakes the
 /// sleeping bodies there).
 #[derive(Message, Clone, Copy, Debug, PartialEq, Eq)]

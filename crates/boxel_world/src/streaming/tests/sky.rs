@@ -1,7 +1,7 @@
 //! Sky columns in the state machine (fake mesher): walks wait for the data they read instead of
 //! generating it, a walk that read content an edit changed is discarded, an edited chunk that
-//! unloads sends its column back to a walk (its edits are lost), and generators without a top
-//! or without content.
+//! unloads sends its column back to a walk (its edits are lost) unless the world is saved (then
+//! walks and rescans read the saved chunk), and generators without a top or without content.
 use super::*;
 use crate::sky::SkyRule;
 
@@ -95,7 +95,7 @@ fn a_walk_that_read_edited_content_is_walked_again() {
     assert_eq!(h.sky.top(3, 5), Some(-1));
 }
 
-/// A chunk whose edit moved a sky top unloads: the edit is lost (nothing is persisted yet), so
+/// A chunk whose edit moved a sky top unloads: the edit is lost (no persistence here), so
 /// the column is walked again and the top goes back to the generator's.
 #[test]
 fn an_edited_chunk_that_unloads_takes_its_tops_with_it() {
@@ -116,6 +116,54 @@ fn an_edited_chunk_that_unloads_takes_its_tops_with_it() {
     assert!(h.sky.id_at(0, 0).is_some());
     assert_eq!(h.sky.top(3, 4), Some(-1), "walked again without the edit");
     assert!(light_counts(&h).sky_walks > walks);
+}
+
+/// With persistence (ADR 0024) the edits of a chunk that unloads are saved: its column keeps its
+/// tops without a walk, a later walk reads the saved chunk, and a rescan does not take a saved
+/// chunk that is not loaded for air above the generator.
+#[test]
+fn saved_edits_keep_their_tops() {
+    use crate::persist::{MemoryStore, Persist, WorldStore};
+    // Stone in layers -2 and -1, air in layer 0 (the generator's last), nothing above.
+    let mut h = Harness::new(LayerGen::new(-2..=0), Arc::new(InlineExecutor), 64)
+        .tall()
+        .lit();
+    let store = WorldStore::open(Arc::new(MemoryStore::new()), &h.content.registry, "layers")
+        .expect("opens");
+    h.jobs.persist = Some(Persist::new(store, Arc::new(InlineExecutor)));
+    h.viewers(&one(ChunkPos::new(0, 0, 0), 0, 1));
+    h.settle(20);
+    assert_eq!(h.sky.top(3, 4), Some(-1));
+    h.edit(BlockPos::new(3, 40, 4), STONE);
+    h.settle(20);
+    assert_eq!(h.sky.top(3, 4), Some(40));
+    let walks = light_counts(&h).sky_walks;
+    // Down: layer 1 leaves (saved), the column stays and keeps its tops.
+    h.viewers(&one(ChunkPos::new(0, -4, 0), 0, 1));
+    h.settle(20);
+    assert!(h.map.id_at(ChunkPos::new(0, 1, 0)).is_none(), "unloaded");
+    assert!(h.sky.id_at(0, 0).is_some());
+    assert_eq!(h.sky.top(3, 4), Some(40), "kept");
+    assert_eq!(light_counts(&h).sky_walks, walks, "no walk");
+    // One viewer in the ground (layers -2 to 0) and one above (layers 3 to 5): layers 1 and 2
+    // are not loaded. A new block on top, then removed: the next top down is the saved block in
+    // layer 1, not the ground of layer -1.
+    h.viewers(&[
+        (0, Viewer::new(ChunkPos::new(0, -1, 0), 0, 0)),
+        (1, Viewer::new(ChunkPos::new(0, 4, 0), 0, 0)),
+    ]);
+    h.settle(20);
+    for y in [1, 2] {
+        assert!(h.map.id_at(ChunkPos::new(0, y, 0)).is_none(), "layer {y}");
+    }
+    assert!(h.map.id_at(ChunkPos::new(0, 0, 0)).is_some());
+    assert_eq!(h.sky.top(3, 4), Some(40), "walked from the saved chunk");
+    h.edit(BlockPos::new(3, 130, 4), STONE);
+    h.settle(20);
+    assert_eq!(h.sky.top(3, 4), Some(130));
+    h.edit(BlockPos::new(3, 130, 4), BlockState::AIR);
+    h.settle(20);
+    assert_eq!(h.sky.top(3, 4), Some(40), "the saved block, not the ground");
 }
 
 /// Without a declared top, light runs with every column open; without content, every column
