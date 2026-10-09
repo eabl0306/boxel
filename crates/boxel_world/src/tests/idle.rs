@@ -217,7 +217,12 @@ fn idle_never_applies_streaming_results() {
 
 #[test]
 fn idle_status_matches_the_work() {
-    let (mut app, hold) = held_world(WorldSettings::default());
+    // The whole interest in the first frame, even on a busy machine.
+    let settings = WorldSettings {
+        interest_budget: Duration::from_secs(1),
+        ..WorldSettings::default()
+    };
+    let (mut app, hold) = held_world(settings);
     let map_changed = |app: &App| app.world().is_resource_changed::<ChunkMap>();
     // Only held jobs: waiting, and the map is not touched.
     assert_eq!(jobs(&app).interest_backlog(), 0);
