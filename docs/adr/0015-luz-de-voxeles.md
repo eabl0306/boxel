@@ -283,9 +283,10 @@ de gameplay.
     14 vóxeles alrededor, desde 14 debajo del techo más bajo hasta 14 encima del más alto. Si la
     columna vuelve a caminar, el tile nuevo se compara con el viejo y remalla las bandas de las
     columnas que cambiaron, en el mismo lote.
-  - Descarga: un chunk cuya edición movió un techo se lleva la edición (todavía no hay
-    persistencia), así que su columna vuelve a caminar y remalla lo que cambie. Con el
-    `ChunkStore` persistente se guardarán los techos editados por columna.
+  - Descarga: sin persistencia, un chunk cuya edición movió un techo se lleva la edición, así
+    que su columna vuelve a caminar y remalla lo que cambie. Con `PersistPlugin` (ADR 0024) la
+    edición queda guardada y la columna conserva sus techos; las caminatas leen los chunks
+    guardados, así que no hace falta guardar techos.
   - Mensajes: la lista de cambios por vóxel que mide estos alcances (estado antes de la
     primera edición de cada posición y después de la última) es también la que escribe los
     `BlockChanged { pos, old, new }` del mundo, uno por posición que cambió, en el orden de su
