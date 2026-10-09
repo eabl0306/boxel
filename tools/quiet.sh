@@ -38,6 +38,8 @@ while :; do
         exec {fd}>"$lock_dir/slot$i.lock"
         if flock -n "$fd"; then
             # The lock stays held through exec: fd is inherited by the command and its children.
+            # They can tell they hold a slot (tools/perf refuses to run inside one).
+            export BOXEL_QUIET_SLOT=$i
             prio=(nice -n 10)
             command -v ionice >/dev/null && prio+=(ionice -c2 -n7)
             # --expand-environment=no: otherwise systemd-run rewrites "$VAR" in the arguments.
