@@ -570,7 +570,9 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   runners lo corren una vez al salir (`App::shutdown`), con la ventana todavía viva, para soltar
   recursos de GPU y ventana en orden. `Idle` tampoco (ADR 0022, un hilo): con límite, los runners
   lo corren en pasos cortos mientras esperan el frame siguiente (`App::run_idle`, `IdleStep`,
-  `IdleWork`), hasta 1 ms antes del deadline; el mundo recoge resultados y lanza jobs ahí.
+  `IdleWork`), hasta 1 ms antes del deadline; el mundo recoge resultados y lanza jobs ahí. Si la
+  app tiene `IdleWanted`, solo después de una update que pidió pasos (el mundo los pide cuando le
+  queda trabajo).
 - Tiempo: `Time` (delta con tope de 250 ms, elapsed, frames) en `First`; `FixedTime` a 64 Hz con
   acumulador y máximo de 8 pasos por frame (`set_max_steps_per_frame` lo cambia); `FixedMain` =
   `FixedPreUpdate`, `FixedUpdate`, `FixedPostUpdate`. Mientras corre `FixedMain`, `Res<Time>` es
@@ -1141,11 +1143,12 @@ presenta como mucho una vez por refresco del monitor.
   Solo si los redraws de verdad esperan al compositor (2 callbacks seguidos) y los callbacks
   llegan a la frecuencia que dice winit: una ventana sin render sigue con la grilla del límite. `FramePacingInfo` dice en
   cada update cómo se marcó el ritmo y el overlay F3 muestra `paced by the display`.
-- La espera no es solo dormir (ADR 0022): si la app tiene sistemas en `Idle`, el runner corre
-  pasos de 0.5 ms como máximo en las iteraciones de la espera, hasta 1 ms antes del deadline (o
-  0.7 ms antes de su propio despertar). La iteración de la update pone `Poll` en vez de correr
-  un paso, así un redraw que llega enseguida se marca antes. Entre pasos se atienden eventos y la
-  compuerta: un paso nunca retiene una update.
+- La espera no es solo dormir (ADR 0022): si la app tiene sistemas en `Idle` y la update pidió
+  pasos (`IdleWanted`), el runner corre pasos de 0.5 ms como máximo en las iteraciones de la
+  espera, hasta 1 ms antes del deadline (o 0.7 ms antes de su propio despertar). La iteración de
+  la update pone `Poll` en vez de correr un paso, así un redraw que llega enseguida se marca
+  antes. Entre pasos se atienden eventos y la compuerta: un paso nunca retiene una update. Sin
+  pedido, la espera es la de siempre.
 - `PresentSettings { mode }` (recurso de `boxel_render`) cambia el vsync en tiempo de ejecución:
   `Setup` reconfigura la superficie con el mismo dispositivo. Por defecto vsync apagado:
   `Mailbox`, si no `Immediate`, si no `Fifo` con una nota en el log. Así manda el límite.

@@ -5,7 +5,7 @@ use crate::neighbor_rules::NeighborRules;
 use crate::sky::{SkyMap, SkyRule};
 use crate::streaming::{Ctx, ViewerChunks, WorldJobs};
 use crate::{ChunkId, ChunkMap, WorldStats};
-use boxel_app::{App, Idle, IdleStep, IdleWork, Last, Plugin, Update};
+use boxel_app::{App, Idle, IdleStep, IdleWanted, IdleWork, Last, Plugin, Update};
 use boxel_diagnostic::DiagnosticsBoard;
 use boxel_ecs::prelude::*;
 use boxel_light::sky_tile::DEFAULT_WALK_LIMIT;
@@ -90,8 +90,9 @@ pub struct WorldSettings {
     /// starts queued ones and goes on with the interest work there, so a job result does not
     /// wait for the next frame at every stage (generation, sky walk, mesh). Mesh results are
     /// still published in the next frame's `Collect`. Without a limit no step runs and this
-    /// changes nothing. On by default; off, the world works in its frame steps only. Read every
-    /// step.
+    /// changes nothing. The world asks for steps only after a frame that leaves work for them
+    /// ([`IdleWanted`]). On by default; off, the world works in its frame steps only and never
+    /// asks, so the runner waits as for an app without `Idle` systems. Read every frame and step.
     pub idle_work: bool,
     /// Max `ChunkMeshEvent`s published per frame (upload smoothing).
     pub max_mesh_events_per_frame: usize,
@@ -334,7 +335,8 @@ pub enum WorldSystems {
     Edits,
     /// Collect finished jobs and start new ones, within `WorldSettings::job_budget`.
     Dispatch,
-    /// Publish mesh results as `ChunkMeshEvent`s (up to `max_mesh_events_per_frame`).
+    /// Publish mesh results as `ChunkMeshEvent`s (up to `max_mesh_events_per_frame`), then ask
+    /// for idle steps if work is left for them ([`IdleWanted`]).
     Collect,
 }
 
@@ -342,7 +344,8 @@ pub enum WorldSystems {
 /// `EditQueue`, [`NeighborRules`] (the built-in ones of the registry), `WorldStats`, internal
 /// job state), the messages `ChunkMeshEvent`,
 /// [`BlockChanged`] and [`ChunkDataEvent`] and the chained systems in
-/// `Update`, and the world's step in `Idle` (between frames, [`WorldSettings::idle_work`]). A
+/// `Update`, and the world's step in `Idle` (between frames, [`WorldSettings::idle_work`]) with
+/// the [`IdleWanted`] it asks through at the end of `Collect`. A
 /// stats system in `Last` refreshes `WorldStats` and publishes a `"world"` line to
 /// `DiagnosticsBoard` if present. `TaskPoolPlugin` is recommended (pool sizes); without it the
 /// default executor initializes a default async compute pool.
@@ -396,6 +399,7 @@ impl Plugin for WorldPlugin {
             .init_resource::<EditQueue>()
             .init_resource::<WorldStats>()
             .init_resource::<ViewerChunks>()
+            .init_resource::<IdleWanted>()
             .insert_resource(jobs)
             .add_message::<ChunkMeshEvent>()
             .add_message::<BlockChanged>()
@@ -421,7 +425,7 @@ impl Plugin for WorldPlugin {
                         .in_set(WorldSystems::Interest),
                     apply_edits.in_set(WorldSystems::Edits),
                     run_jobs.in_set(WorldSystems::Dispatch),
-                    (publish_meshes, publish_data_changes)
+                    (publish_meshes, publish_data_changes, want_idle)
                         .chain()
                         .in_set(WorldSystems::Collect),
                 ),
@@ -540,6 +544,14 @@ fn run_jobs(
     let mut cx = Ctx::new(&mut map, &mut sky, &content, &mut events);
     jobs.run_jobs(&mut cx, settings.job_budget);
     writer.write_batch(events);
+}
+
+/// End of the frame's steps: asks for idle steps when one would find work
+/// ([`WorldJobs::idle_pending`] is not `Done`). Nothing else moves the jobs before the next
+/// update, and the frame's own work (viewer changes, edits) waits for it, so with `Done` here the
+/// first step would answer `Done` at once: without the ask the runner opens no slot.
+fn want_idle(jobs: Res<WorldJobs>, settings: Res<WorldSettings>, mut wanted: ResMut<IdleWanted>) {
+    wanted.want(settings.idle_work && jobs.idle_pending() != IdleWork::Done);
 }
 
 /// `Idle` (between frames, ADR 0022): the world's step within [`IdleStep::until`]. Without work

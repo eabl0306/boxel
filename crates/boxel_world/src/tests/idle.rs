@@ -1,13 +1,13 @@
 //! The world between frames (ADR 0022), through the `Idle` schedule as a paced runner runs it:
 //! idle steps finish a border crossing in fewer frames and the world ends the same, streaming
 //! meshes still wait for `Collect`, the step reports what is pending without touching the map,
-//! and its data messages reach the next frame.
+//! its data messages reach the next frame, and a frame asks for steps only when one has work.
 use super::support::{HoldExecutor, LayerGen};
 use super::{drain_events, loaded, move_viewer, removes, spawn_tall_viewer, tall_world_app};
 use crate::jobs::{InlineExecutor, JobExecutor};
 use crate::streaming::WorldJobs;
 use crate::{ChunkDataEvent, ChunkMap, ChunkMeshEvent, ChunkViewer, WorldSettings, WorldStats};
-use boxel_app::{App, IdleWork, PreUpdate};
+use boxel_app::{App, IdleWanted, IdleWork, PreUpdate};
 use boxel_ecs::prelude::*;
 use boxel_light::ChunkLight;
 use boxel_mesh::ChunkMesh;
@@ -261,6 +261,105 @@ fn idle_status_matches_the_work() {
     assert_eq!(jobs(&app).idle_pending(), IdleWork::Ready);
     app.run_idle(far());
     assert_eq!(jobs(&app).interest_backlog(), 0, "a step with time goes on");
+}
+
+/// A frame as a runner runs it: the ask cleared before, read after.
+fn asking_update(app: &mut App) -> bool {
+    IdleWanted::before_update(app.world_mut());
+    app.update();
+    IdleWanted::after_update(app.world())
+}
+
+#[test]
+fn a_frame_with_jobs_in_flight_asks_for_idle_steps() {
+    for idle_work in [true, false] {
+        let settings = WorldSettings {
+            idle_work,
+            // The whole interest in the first frame, even on a busy machine.
+            interest_budget: Duration::from_secs(1),
+            ..WorldSettings::default()
+        };
+        let (mut app, hold) = held_world(settings);
+        // Only held jobs left: a step would wait for them.
+        let wanted = asking_update(&mut app);
+        assert_eq!(jobs(&app).interest_backlog(), 0);
+        assert!(jobs(&app).scheduler.in_flight() > 0);
+        assert_eq!(jobs(&app).idle_pending(), IdleWork::Waiting);
+        assert_eq!(wanted, idle_work, "idle work {idle_work}");
+        // Settled: nothing for a step, no ask.
+        for _ in 0..100 {
+            hold.run_all();
+            asking_update(&mut app);
+            if settled(&app) {
+                break;
+            }
+        }
+        assert!(settled(&app), "idle work {idle_work}");
+        assert!(!asking_update(&mut app), "idle work {idle_work}");
+        assert_eq!(jobs(&app).idle_pending(), IdleWork::Done);
+    }
+}
+
+#[test]
+fn a_frame_asks_for_idle_steps_only_when_one_has_work() {
+    for idle_work in [true, false] {
+        let settings = WorldSettings {
+            idle_work,
+            interest_budget: Duration::ZERO,
+            max_jobs_in_flight: 8,
+            ..WorldSettings::default()
+        };
+        let (mut app, hold) = held_world(settings);
+        let viewer = app
+            .world_mut()
+            .query_filtered::<Entity, With<ChunkViewer>>()
+            .iter(app.world())
+            .next()
+            .expect("one viewer");
+        let (mut asked, mut unasked) = (0, 0);
+        // The first load, a crossing, then frames with the world settled.
+        for (target, extra) in [(ChunkPos::new(0, 0, 0), 0), (ChunkPos::new(1, 0, 0), 3)] {
+            move_viewer(&mut app, viewer, target);
+            let mut left = extra;
+            for frame in 0.. {
+                assert!(frame < 2000, "not settled");
+                let wanted = asking_update(&mut app);
+                let pending = jobs(&app).idle_pending();
+                assert_eq!(
+                    wanted,
+                    idle_work && pending != IdleWork::Done,
+                    "frame {frame}"
+                );
+                if wanted {
+                    asked += 1;
+                    idle_gap(&mut app, &hold, 64);
+                } else {
+                    // Exact: the step it saves would have found nothing.
+                    unasked += 1;
+                    drain_events(&mut app);
+                    assert_eq!(app.run_idle(far()), IdleWork::Done, "frame {frame}");
+                    assert!(!app.world().is_resource_changed::<ChunkMap>());
+                    assert!(drain_events(&mut app).is_empty());
+                    hold.run_all();
+                }
+                if settled(&app) {
+                    if left == 0 {
+                        break;
+                    }
+                    left -= 1;
+                }
+            }
+        }
+        assert!(
+            unasked >= 3,
+            "idle work {idle_work}: settled frames ask for nothing"
+        );
+        if idle_work {
+            assert!(asked > 0, "loading frames ask");
+        } else {
+            assert_eq!(asked, 0, "switched off, never");
+        }
+    }
 }
 
 #[test]

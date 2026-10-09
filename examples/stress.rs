@@ -30,7 +30,8 @@
 //!
 //! `--idle-work off` keeps the world's work in its frame steps under a frame limit
 //! (`WorldSettings::idle_work`, ADR 0022): the same binary with and without the world's work
-//! between frames. Each frame records the idle steps the runner ran after it (`IdleInfo`) and
+//! between frames. Off, the world never asks for idle steps, so the runner waits as it would
+//! without `Idle` systems. Each frame records the idle steps the runner ran after it (`IdleInfo`) and
 //! when the latest chunk job finished, so the summary gives the border catch-up both on the
 //! frame clock and as the work lag (crossing frame start to the last job of the crossing).
 //!
