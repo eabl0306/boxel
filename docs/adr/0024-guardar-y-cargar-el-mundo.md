@@ -118,8 +118,10 @@ para después:
 - **Cargar.** Un chunk del índice no se genera: su job de generación lee el registro y lo
   decodifica (en un hilo de `AsyncComputeTaskPool`, como la generación). Un chunk de una capa que
   el generador declara de aire, que antes se creaba sin job, recibe un job si está guardado. Un
-  registro que no se puede leer se genera, se cuenta en `PersistStats::load_errors` y se deja como
-  está hasta que el chunk se edite.
+  registro dañado se genera, se cuenta en `PersistStats::load_errors` y se deja como está hasta
+  que el chunk se edite. Si lo que falla es el disco y no el registro, el chunk no se genera:
+  queda afuera (aire que no se puede editar) hasta que vuelva a cargarse. Así una copia inventada
+  nunca se guarda encima del registro bueno (test).
 - **Descargar.** Un chunk editado que se descarga se entrega a una copia pendiente en memoria
   (un `Arc` del snapshot y una entrada en un mapa: nada de copiar bloques ni de IO). Las cargas
   leen primero esas copias, así un chunk que vuelve antes de que su escritura termine trae sus
@@ -130,7 +132,10 @@ para después:
   copia más nueva. Por frame, el hilo principal solo entrega chunks y lanza como mucho un job.
 - **Fallas.** Una escritura que falla deja sus chunks en memoria (las cargas los siguen viendo),
   los vuelve a poner en la cola y prueba otra vez después de `retry_after` (1 s). Se cuentan en
-  `PersistStats::save_errors` (test con un disco que falla y vuelve).
+  `PersistStats::save_errors` (test con un disco que falla y vuelve). Después de un error de IO,
+  redb falla en todo hasta que la base se abre de nuevo. Por eso `RedbStore` la cierra, abre el
+  archivo otra vez (redb lo repara) y repite la operación. Mientras el disco sigue fallando lo
+  intenta como mucho una vez por segundo (test con un archivo redb cuyo disco falla y vuelve).
 - **Autoguardado** (`PersistSettings::autosave`, 60 s): entrega los chunks cargados con
   ediciones, los ticks y el reloj. Así un cierre inesperado pierde como mucho eso. Los chunks
   editados se llevan en un conjunto, no se recorre el mapa. El hilo principal solo copia la
@@ -177,14 +182,16 @@ Tests (en `crates/boxel_world`):
   registro distinto, un bloque que ya no existe, una propiedad y un valor que ya no existen;
   cualquier bit cambiado o registro cortado es un error, y bytes al azar nunca entran en pánico.
 - `persist/tests.rs`: metadatos de un mundo nuevo, nombres reservados, copias pendientes, el
-  índice, el tamaño de los lotes y el orden de los ticks.
+  índice, el tamaño de los lotes y el orden de los ticks; un archivo redb cuyo disco falla y
+  vuelve (guardar y cargar funcionan otra vez y no se pierde nada).
 - `tests/persist.rs`: editar, descargar, volver y reiniciar la app, cerca del origen, cruzando
   ±2^31, en 2^40 y junto al límite del mundo, comparando los chunks vóxel por vóxel y que solo se
   guardan los editados (una vez más con los pools de tareas del juego, no en línea); guardado al salir y autoguardado; techos de cielo después de reiniciar,
   con un bloque guardado que no está cargado; agua que corre igual con un reinicio en el medio
   que sin él; el reloj; un registro dañado; otra versión y metadatos dañados; un estado que ya no
   existe; un mundo en redb en un directorio que no existía, un archivo que no es una base y las
-  claves lejanas en redb; un chunk que vuelve antes de su escritura; un disco que falla y vuelve.
+  claves lejanas en redb; un chunk que vuelve antes de su escritura; un disco que falla y vuelve;
+  un chunk que el disco no puede leer no se genera ni se guarda encima de su registro.
 
 Imágenes: `snapshot` con ediciones, agua que corre y `--world-dir`, y después sin ediciones con el
 mismo directorio, da los mismos píxeles de día y de noche, cerca del origen y en x = 2^40,

@@ -858,6 +858,61 @@ fn a_failing_store_keeps_the_edits_in_memory_and_tries_again() {
     assert_eq!(block(&app, at(o, 0, 1, 0)), stone);
 }
 
+/// A store whose loads fail while `fail` is set (a disk that cannot be read for a while).
+#[derive(Default)]
+struct Unreadable {
+    inner: MemoryStore,
+    fail: AtomicBool,
+}
+
+impl ChunkStore for Unreadable {
+    fn load(&self, key: ChunkKey) -> io::Result<Option<Vec<u8>>> {
+        if self.fail.load(Ordering::Relaxed) {
+            return Err(io::Error::other("the disk cannot be read"));
+        }
+        self.inner.load(key)
+    }
+    fn keys(&self) -> io::Result<Vec<ChunkKey>> {
+        self.inner.keys()
+    }
+    fn load_meta(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
+        self.inner.load_meta(name)
+    }
+    fn save_batch(&self, batch: &SaveBatch) -> io::Result<()> {
+        self.inner.save_batch(batch)
+    }
+}
+
+/// A saved chunk the store cannot read is not generated in its place: that copy could be edited
+/// and saved over the good record. It stays out (air nobody can edit) until it loads again.
+#[test]
+fn a_chunk_the_store_cannot_read_is_never_saved_over() {
+    let o = BlockPos::new(0, 0, 0);
+    let disk = Arc::new(Unreadable::default());
+    let setup = Setup::new(Arc::clone(&disk) as Arc<dyn ChunkStore>, o.y);
+    let stone = setup.registry.by_name("boxel:stone").unwrap();
+    // Two blocks of one chunk, above the ground.
+    let (p, q) = (at(o, 2, 3, 2), at(o, 5, 3, 5));
+    let (mut app, _) = setup.start(o);
+    edit(&mut app, &[(p, stone)]);
+    app.shutdown();
+    drop(app);
+
+    disk.fail.store(true, Ordering::Relaxed);
+    let (mut app, _) = setup.start(o);
+    assert_eq!(block(&app, p), BlockState::AIR, "left out");
+    edit(&mut app, &[(q, stone)]);
+    assert_eq!(block(&app, q), BlockState::AIR, "not editable");
+    assert!(app.world().resource::<WorldStore>().stats().load_errors >= 1);
+    app.shutdown();
+    drop(app);
+
+    disk.fail.store(false, Ordering::Relaxed);
+    let (app, _) = setup.start(o);
+    assert_eq!(block(&app, p), stone, "the record is intact");
+    assert_eq!(block(&app, q), BlockState::AIR);
+}
+
 #[test]
 fn redb_keeps_every_bit_of_far_keys() {
     let tmp = TempDir::new("keys");

@@ -83,8 +83,9 @@ pub struct PersistStats {
     pub saved_chunks: usize,
     /// Chunk records read (chunk loads and sky walks).
     pub loaded_chunks: usize,
-    /// Chunk records that could not be read: the chunk was generated instead (and its record
-    /// left as it is until the chunk is edited).
+    /// Chunk records that could not be read. A damaged record: the chunk was generated instead
+    /// (and its record left as it is until the chunk is edited). A store that failed: the chunk
+    /// stays out (air nobody can edit) until it loads again, so its record is never saved over.
     pub load_errors: usize,
     /// Save batches that failed (their chunks stay in memory and are written again later).
     pub save_errors: usize,
@@ -341,28 +342,38 @@ impl WorldStore {
     }
 
     /// The saved blocks of chunk `key`: the copy waiting to be written, else the stored record.
-    /// `None` when there is none, or when the record cannot be read (logged and counted in
-    /// [`PersistStats::load_errors`]): the caller generates the chunk then.
-    pub(crate) fn read_chunk(&self, key: ChunkKey) -> Option<Arc<ChunkData>> {
+    /// `Ok(None)` when there is none, or when the record is damaged (logged and counted in
+    /// [`PersistStats::load_errors`]): the caller generates the chunk then. `Err` when the store
+    /// itself fails (counted too): the record may be fine, so the caller must not make up a copy
+    /// that could be edited and saved over it.
+    pub(crate) fn load_chunk(&self, key: ChunkKey) -> io::Result<Option<Arc<ChunkData>>> {
         if let Some(staged) = self.inner.pending.lock().expect("pending lock").get(&key) {
-            return Some(Arc::clone(&staged.data));
+            return Ok(Some(Arc::clone(&staged.data)));
         }
-        let fail = |what: String| {
+        let bytes = self.inner.backend.load(key).inspect_err(|e| {
             self.inner.load_errors.fetch_add(1, Ordering::Relaxed);
-            tracing::error!(chunk = ?key.pos, "saved chunk is generated again: {what}");
-            None
+            tracing::error!(chunk = ?key.pos, "saved chunk cannot be read now: {e}");
+        })?;
+        let Some(bytes) = bytes else {
+            return Ok(None);
         };
-        match self.inner.backend.load(key) {
-            Ok(Some(bytes)) => match decode_chunk(&bytes, &self.inner.ids) {
-                Ok(data) => {
-                    self.inner.loaded.fetch_add(1, Ordering::Relaxed);
-                    Some(Arc::new(data))
-                }
-                Err(e) => fail(e.to_string()),
-            },
-            Ok(None) => None,
-            Err(e) => fail(e.to_string()),
+        match decode_chunk(&bytes, &self.inner.ids) {
+            Ok(data) => {
+                self.inner.loaded.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(Arc::new(data)))
+            }
+            Err(e) => {
+                self.inner.load_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(chunk = ?key.pos, "saved chunk is generated again: {e}");
+                Ok(None)
+            }
         }
+    }
+
+    /// [`WorldStore::load_chunk`] for a reader that only looks (a sky walk): a store that fails
+    /// reads as no saved copy.
+    pub(crate) fn read_chunk(&self, key: ChunkKey) -> Option<Arc<ChunkData>> {
+        self.load_chunk(key).ok().flatten()
     }
 
     /// Encodes and writes the staged copies of `keys` (those still staged) and `meta` in one

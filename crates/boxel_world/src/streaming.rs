@@ -175,7 +175,7 @@ pub(crate) enum JobMessage {
     },
     /// The job saw the slot's cancel flag and did nothing.
     Cancelled { id: JobId, kind: JobKind },
-    /// The job panicked, or was dropped without running.
+    /// The job panicked, was dropped without running, or could not read its saved chunk.
     Failed {
         id: JobId,
         kind: JobKind,
@@ -2137,7 +2137,9 @@ impl WorldJobs {
         cx.map.set_data(id, DataState::Generating);
         let generator = Arc::clone(&cx.content.generator);
         let registry = Arc::clone(&cx.content.registry);
-        // A saved chunk is read instead (a record that cannot be read is generated).
+        // A saved chunk is read instead (a damaged record is generated). When the store fails,
+        // the job fails: the chunk stays out until it loads again, never a made-up copy that an
+        // edit would save over the record.
         let store = self
             .persist
             .as_ref()
@@ -2150,9 +2152,16 @@ impl WorldJobs {
             JobKind::Generate,
             cancel,
             move || {
-                let data = match store.and_then(|s| s.read_chunk(key)) {
-                    Some(saved) => Arc::unwrap_or_clone(saved),
-                    None => generator.generate(key, &registry),
+                let data = match store.map(|s| s.load_chunk(key)).transpose() {
+                    Ok(Some(Some(saved))) => Arc::unwrap_or_clone(saved),
+                    Ok(_) => generator.generate(key, &registry),
+                    Err(e) => {
+                        return JobMessage::Failed {
+                            id: JobId::Chunk(id),
+                            kind: JobKind::Generate,
+                            panic: format!("the saved chunk cannot be read: {e}"),
+                        };
+                    }
                 };
                 let faces = ChunkFaceInfo::compute(&data, &registry);
                 JobMessage::Generated { id, data, faces }

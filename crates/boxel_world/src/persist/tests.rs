@@ -9,6 +9,7 @@ use boxel_voxel::{
     DimensionId, LocalPos, MAX_CHUNK_COORD,
 };
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 fn key(x: i64, y: i64, z: i64) -> ChunkKey {
@@ -246,4 +247,196 @@ fn pending_ticks_restore_in_order_relative_to_the_clock() {
     assert_eq!(restored.pending(), saved);
     let blob = format::encode_ticks(&saved);
     assert_eq!(format::decode_ticks(&blob).unwrap(), saved);
+}
+
+/// A redb file on a disk that fails while `fail` is set (every read, write, sync and resize),
+/// like a disk that is full or goes away for a moment. Locks go to the file, so a database that
+/// is still open keeps the next one from opening.
+#[derive(Debug)]
+struct FailingDisk {
+    file: redb::backends::FileBackend,
+    fail: Arc<AtomicBool>,
+}
+
+impl FailingDisk {
+    fn check(&self) -> std::io::Result<()> {
+        if self.fail.load(Ordering::SeqCst) {
+            Err(std::io::Error::other("the disk failed"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+type Range = std::ops::Bound<u64>;
+
+impl redb::StorageBackend for FailingDisk {
+    fn len(&self) -> std::io::Result<u64> {
+        self.file.len()
+    }
+    fn read(&self, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+        self.check()?;
+        self.file.read(offset, out)
+    }
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        self.check()?;
+        self.file.set_len(len)
+    }
+    fn sync_data(&self) -> std::io::Result<()> {
+        self.check()?;
+        self.file.sync_data()
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        self.check()?;
+        self.file.write(offset, data)
+    }
+    fn close(&self) -> std::io::Result<()> {
+        self.file.close()
+    }
+    fn try_lock_range(&self, start: Range, end: Range) -> Result<bool, redb::BackendError> {
+        self.file.try_lock_range(start, end)
+    }
+    fn try_lock_shared_range(&self, start: Range, end: Range) -> Result<bool, redb::BackendError> {
+        self.file.try_lock_shared_range(start, end)
+    }
+    fn lock_range(&self, start: Range, end: Range) -> Result<(), redb::BackendError> {
+        self.file.lock_range(start, end)
+    }
+    fn lock_shared_range(&self, start: Range, end: Range) -> Result<(), redb::BackendError> {
+        self.file.lock_shared_range(start, end)
+    }
+    fn unlock_range(&self, start: Range, end: Range) -> Result<(), redb::BackendError> {
+        self.file.unlock_range(start, end)
+    }
+    fn query_lock_range(&self, start: Range, end: Range) -> Result<bool, redb::BackendError> {
+        self.file.query_lock_range(start, end)
+    }
+}
+
+/// A file for a redb test, removed when dropped.
+struct TempFile(std::path::PathBuf);
+
+impl TempFile {
+    fn new(name: &str) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("boxel_persist_{name}_{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Self(path)
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A [`RedbStore`] of `path` on a [`FailingDisk`], without a page cache (every read goes to the
+/// disk) and without a wait between two openings of the file.
+fn failing_redb(path: &std::path::Path, fail: &Arc<AtomicBool>) -> RedbStore {
+    let (path, fail) = (path.to_path_buf(), Arc::clone(fail));
+    RedbStore::with_opener(move || {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        let disk = FailingDisk {
+            file: redb::backends::FileBackend::new(file)?,
+            fail: Arc::clone(&fail),
+        };
+        redb::Database::builder()
+            .set_cache_size(0)
+            .create_with_backend(disk)
+    })
+    .expect("opens")
+    .with_reopen_every(Duration::ZERO)
+}
+
+/// redb fails every operation after one IO error until the database is opened again: the store
+/// opens it again, so saves and loads work once the disk does, and nothing written is lost.
+#[test]
+fn redb_works_again_after_the_disk_fails() {
+    let tmp = TempFile::new("failing_disk");
+    let fail = Arc::new(AtomicBool::new(false));
+    let redb = failing_redb(&tmp.0, &fail);
+    let record = |k: ChunkKey| format!("{:?}", k.pos).into_bytes();
+    let (a, b) = (key(1, 2, 3), key(1 << 40, -(1 << 31), MAX_CHUNK_COORD));
+    let batch = |k: ChunkKey| SaveBatch {
+        chunks: vec![(k, record(k))],
+        meta: Vec::new(),
+    };
+    redb.save_batch(&batch(a)).unwrap();
+
+    fail.store(true, Ordering::SeqCst);
+    assert!(redb.save_batch(&batch(b)).is_err());
+    assert!(redb.load(a).is_err());
+
+    // The disk works again.
+    fail.store(false, Ordering::SeqCst);
+    assert_eq!(redb.load(a).unwrap(), Some(record(a)));
+    redb.save_batch(&batch(b)).unwrap();
+    assert_eq!(redb.load(b).unwrap(), Some(record(b)));
+    drop(redb);
+    let redb = RedbStore::open(&tmp.0).unwrap();
+    assert_eq!(redb.load(a).unwrap(), Some(record(a)));
+    assert_eq!(redb.load(b).unwrap(), Some(record(b)));
+    drop(redb);
+
+    // While the disk keeps failing, the file is not opened again before the wait.
+    let redb = failing_redb(&tmp.0, &fail).with_reopen_every(Duration::from_secs(3600));
+    fail.store(true, Ordering::SeqCst);
+    assert!(redb.load(a).is_err());
+    fail.store(false, Ordering::SeqCst);
+    assert!(redb.load(a).is_err(), "not opened again yet");
+}
+
+/// The saving state on a redb file whose disk fails: the failed save waits in memory (loads read
+/// it) and a later try writes it.
+#[test]
+fn a_failed_redb_save_is_written_once_the_disk_works() {
+    let tmp = TempFile::new("failing_save");
+    let fail = Arc::new(AtomicBool::new(false));
+    let backend: Arc<dyn ChunkStore> = Arc::new(failing_redb(&tmp.0, &fail));
+    let store = WorldStore::open(
+        Arc::clone(&backend),
+        &BlockRegistry::default_blocks(),
+        "test",
+    )
+    .unwrap();
+    let mut p = Persist::new(store, Arc::new(InlineExecutor));
+    let k = key(-5, 7, 1 << 40);
+    p.stage(k, stone_chunk());
+    fail.store(true, Ordering::SeqCst);
+    p.frame(Instant::now(), 256, Duration::ZERO);
+    p.frame(Instant::now(), 256, Duration::ZERO);
+    assert!(p.store.stats().save_errors >= 1);
+    assert_eq!(p.store.stats().pending, 1);
+    assert!(
+        p.store.read_chunk(k).is_some(),
+        "loads read the copy in memory"
+    );
+
+    // The disk works again: the next try writes it.
+    fail.store(false, Ordering::SeqCst);
+    p.frame(Instant::now(), 256, Duration::ZERO);
+    p.frame(Instant::now(), 256, Duration::ZERO);
+    assert_eq!(p.store.stats().pending, 0);
+    p.save_now(256).unwrap();
+    drop(p);
+    drop(backend);
+    let store = WorldStore::open(
+        Arc::new(RedbStore::open(&tmp.0).unwrap()),
+        &BlockRegistry::default_blocks(),
+        "test",
+    )
+    .unwrap();
+    let stone = BlockRegistry::default_blocks()
+        .by_name("boxel:stone")
+        .unwrap();
+    assert_eq!(
+        store.read_chunk(k).unwrap().get(LocalPos::new(4, 5, 6)),
+        stone
+    );
 }
