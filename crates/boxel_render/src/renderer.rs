@@ -203,6 +203,9 @@ pub struct VoxelRenderer {
     block_texture: wgpu::Texture,
     /// Which frame each animated layer shows on the GPU.
     animator: TextureAnimator,
+    /// `ViewUniform::viewport.w`: the flow textures the shaders do not scroll (bit 0 water, bit
+    /// 1 lava; `BlockTextureData::animated_flow`).
+    still_flow: f32,
     view_buffer: wgpu::Buffer,
     /// Group 1: `View` uniform.
     view_bind_group: wgpu::BindGroup,
@@ -572,6 +575,9 @@ impl VoxelRenderer {
             materials,
             block_texture,
             animator,
+            still_flow: f32::from(
+                u8::from(textures.animated_flow[0]) | (u8::from(textures.animated_flow[1]) << 1),
+            ),
             view_buffer,
             view_bind_group,
             stats: RenderStats::default(),
@@ -872,7 +878,7 @@ impl VoxelRenderer {
                 self.targets.size.x as f32,
                 self.targets.size.y as f32,
                 view.fluid_time,
-                0.0,
+                self.still_flow,
             ],
         };
         queue.write_buffer(&self.view_buffer, 0, bytemuck::bytes_of(&uniform));

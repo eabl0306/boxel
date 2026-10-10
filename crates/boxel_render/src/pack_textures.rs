@@ -483,6 +483,11 @@ fn pack_block_textures(
         size,
         layers,
         mip_levels: mip_levels(size),
+        animated_flow: ["boxel:water_flow", "boxel:lava_flow"].map(|name| {
+            animations.iter().any(|a: &LayerAnimation| {
+                specs.get(a.layer as usize).is_some_and(|s| s.name == name)
+            })
+        }),
         data,
         animations: Arc::from(animations),
     };
@@ -1117,6 +1122,8 @@ pub(crate) mod tests {
         let (data, report) =
             load_block_textures(&registry, &TextureSource::Pack(pack.0.clone())).expect("pack");
         assert_eq!(report.animated, 3, "{:?}", data.animations);
+        // the water flow moves by its frames and does not scroll; the pack has no lava flow
+        assert_eq!(data.animated_flow, [true, false]);
         assert_eq!(report.animation_bytes, (4 + 2 + 2) * data.layer_bytes());
         assert!(
             report

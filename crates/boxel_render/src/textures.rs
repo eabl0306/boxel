@@ -29,6 +29,9 @@ pub struct BlockTextureData {
     /// The animated layers (ADR 0028; none for procedural textures). `data` holds the frame
     /// each one shows at tick 0.
     pub animations: Arc<[LayerAnimation]>,
+    /// Whether the flow texture of water (`[0]`) and of lava (`[1]`) is one of `animations`: its
+    /// frames show the fluid running, so the shaders do not scroll it (ADR 0025 and 0028).
+    pub animated_flow: [bool; 2],
 }
 
 impl BlockTextureData {
@@ -56,6 +59,7 @@ pub fn generate_block_textures(specs: &[TextureSpec]) -> BlockTextureData {
         mip_levels: mip_levels(size),
         data,
         animations: Arc::from([]),
+        animated_flow: [false; 2],
     }
 }
 
