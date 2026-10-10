@@ -1,0 +1,26 @@
+[package]
+name = "boxel_demo"
+description = "Example content for boxel: the blocks, textures, fluids, pack recipes and world generators of the examples"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# Example content, not part of the engine's published crates.
+publish = false
+
+[dependencies]
+boxel_voxel.workspace = true
+boxel_worldgen.workspace = true
+boxel_pack.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+# Criterion flags (--quick, --save-baseline) must not reach the lib unit-test harness.
+[lib]
+bench = false
+
+[lints]
+workspace = true
