@@ -263,11 +263,11 @@ class Structure(unittest.TestCase):
         meta = metadata(('boxel_demo', [('boxel_voxel', None), ('boxel_world', None),
                                         ('boxel', None), ('boxel_mesh', 'build')]))
         self.assertEqual([m for _, m in nc.check_structure(meta)], [
-            'boxel_demo depends on boxel_world (normal); only boxel_pack, boxel_voxel, '
+            'boxel_demo depends on boxel_world (normal); only boxel_fog, boxel_pack, boxel_voxel, '
             'boxel_worldgen may be',
-            'boxel_demo depends on boxel (normal); only boxel_pack, boxel_voxel, boxel_worldgen '
+            'boxel_demo depends on boxel (normal); only boxel_fog, boxel_pack, boxel_voxel, boxel_worldgen '
             'may be',
-            'boxel_demo depends on boxel_mesh (build); only boxel_pack, boxel_voxel, '
+            'boxel_demo depends on boxel_mesh (build); only boxel_fog, boxel_pack, boxel_voxel, '
             'boxel_worldgen may be',
         ])
 

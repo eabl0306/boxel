@@ -228,6 +228,9 @@ pub struct RunInfo {
     pub idle_work: String,
     /// Refresh rate of the window's monitor in Hz, as the runner saw it (`None`: unknown).
     pub refresh_hz: Option<f64>,
+    /// The fog (`--fog`, `--fog-res`, ADR 0030): `off`, or the preset and the resolution
+    /// (`valley half`). Empty in runs from before the option (no fog).
+    pub fog: String,
 }
 
 /// What `--edits` measured: scripted edits (lamp placed and removed, shaft dug and capped) and
@@ -1160,6 +1163,7 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
         ("present_mode", Json::Str(info.present_mode.clone())),
         ("refresh_hz", Json::opt(info.refresh_hz, 3)),
         ("idle_work", Json::Str(info.idle_work.clone())),
+        ("fog", Json::Str(info.fog.clone())),
     ]);
     let frames = Json::Obj(vec![
         ("count", Json::uint(f.frames)),

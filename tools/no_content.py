@@ -5,7 +5,7 @@ mechanisms, and the blocks, textures, rules and generators of the example game l
 
 1. Structure (`cargo metadata --locked`): no workspace package but `boxel_demo` depends on
    `boxel_demo` as a normal or build dependency (dev is fine), and `boxel_demo` depends on no
-   engine crate but `boxel_voxel`, `boxel_worldgen` and `boxel_pack` (so engine unit tests that
+   engine crate but `boxel_voxel`, `boxel_worldgen`, `boxel_pack` and `boxel_fog` (so engine unit tests that
    use the demo see one copy of each crate type).
 2. Scan: every `.rs` file under `crates/*/src` (but `boxel_demo` and `boxel_facade_check`) and
    under `src/`. Files named `tests.rs`, paths with a `tests` or `benches` component and the item
@@ -34,7 +34,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 DEMO = 'boxel_demo'
 # The engine crates the demo may depend on (normal and build dependencies).
-DEMO_DEPS = {'boxel_voxel', 'boxel_worldgen', 'boxel_pack'}
+DEMO_DEPS = {'boxel_voxel', 'boxel_worldgen', 'boxel_pack', 'boxel_fog'}
 # Crates under crates/ that are not scanned.
 UNSCANNED = {DEMO, 'boxel_facade_check'}
 

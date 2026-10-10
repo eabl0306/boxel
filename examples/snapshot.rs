@@ -29,6 +29,8 @@
 
 #[path = "shared/clock.rs"]
 mod clock;
+#[path = "shared/fog.rs"]
+mod fog;
 #[path = "shared/pack.rs"]
 mod pack;
 #[path = "shared/world.rs"]
@@ -42,6 +44,7 @@ use boxel::gfx::{
 use boxel::log::LogPlugin;
 use boxel::mesh::AoPolicy;
 use boxel::prelude::*;
+use boxel::render::fog::{FogInput, FogResolution};
 use boxel::render::{
     BlockOutline, FLUID_TIME_PERIOD, Outline, RenderSettings, RendererConfig, SceneLight,
     TextureSource, TranslucentSort, ViewParams, VoxelRenderer, block_outline_edges, light_curve,
@@ -91,14 +94,17 @@ usage: snapshot --camera X,Y,Z,YAW,PITCH --shot HH:MM=PATH [--shot ...] [options
                        targeted block (default color and width)
   --fov DEG            vertical field of view in degrees (default 70; voxel_world widens it
                        1.1 times while sprinting: 77)
+  --fog-tick N         ticks of the fog clock (64 a second) in the shots: where the wind has
+                       taken the cells (default 0)
   --timeout S          wall-clock limit for loading the world, in seconds (default 300)
   --help               this text";
 
 /// The whole help: [`USAGE`], the world options and the GPU flags.
 fn usage() -> String {
     format!(
-        "{USAGE}\n{}\nworld options:\n{}\n\n{CLI_HELP}",
+        "{USAGE}\n{}\n{}\nworld options:\n{}\n\n{CLI_HELP}",
         pack::USAGE,
+        fog::USAGE,
         world::usage(World::Overworld)
     )
 }
@@ -157,6 +163,12 @@ struct Options {
     outline: Option<I64Vec3>,
     /// `--fov`: the vertical field of view, degrees.
     fov: f32,
+    /// `--fog`.
+    fog: fog::FogPreset,
+    /// `--fog-res`.
+    fog_res: FogResolution,
+    /// `--fog-tick`.
+    fog_tick: u64,
 }
 
 /// `Ok(None)` for `--help`.
@@ -180,6 +192,9 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         outline: None,
         // `Camera::default`'s (70 degrees): the same pixels as before the flag.
         fov: 70.0,
+        fog: fog::FogPreset::Off,
+        fog_res: FogResolution::Half,
+        fog_tick: 0,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -257,6 +272,14 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                     .ok_or_else(|| format!("{flag}: {v:?} is not a number of seconds >= 0"))?;
             }
             "--pack" => o.textures = pack::parse(flag, &value()?)?,
+            "--fog" => o.fog = fog::parse(flag, &value()?)?,
+            "--fog-res" => o.fog_res = fog::parse_resolution(flag, &value()?)?,
+            "--fog-tick" => {
+                let v = value()?;
+                o.fog_tick = v
+                    .parse::<u64>()
+                    .map_err(|_| format!("{flag}: {v:?} is not a tick count"))?;
+            }
             "--world-dir" => o.world_dir = Some(PathBuf::from(value()?)),
             "--outline" => o.outline = Some(parse_cell(flag, &value()?)?),
             "--fov" => {
@@ -813,6 +836,17 @@ fn run(
             width: style.width,
         }));
     }
+    // `--fog`: the demo's preset at a fixed tick (the same cells every run).
+    let fog_label = fog::label(o.fog, o.fog_res);
+    if let Some(settings) = o.fog.settings(o.fog_res) {
+        renderer.set_fog(
+            &gpu.device,
+            Some(FogInput {
+                settings: Arc::new(settings),
+                tick: o.fog_tick,
+            }),
+        );
+    }
     let camera = Camera {
         view_distance: o.radius as f32 * 32.0,
         fov_y_radians: o.fov.to_radians(),
@@ -839,12 +873,14 @@ fn run(
             .map_err(|e| gpu_err(format!("{}: {e}", path.display())))?;
         let [r, g, b] = light.sky;
         println!(
-            "shot: {} {} sky_light={r:.3},{g:.3},{b:.3} ambient={:.3} mean={:.1} chunks={}",
+            "shot: {} {} sky_light={r:.3},{g:.3},{b:.3} ambient={:.3} mean={:.1} chunks={} \
+             fog={fog_label} fog_layers={}",
             TimeOfDay::at_clock(*hours).clock_text(),
             path.display(),
             light.ambient,
             mean_brightness(&image),
             renderer.stats().chunks,
+            renderer.stats().fog_layers,
         );
     }
     // `--world-dir`: the world is saved by the `Shutdown` schedule (nothing else runs there).
@@ -867,6 +903,25 @@ mod tests {
         "--shot",
         "12:00=a/noon.png",
     ];
+
+    #[test]
+    fn fog_flags() {
+        let o = parse(&BASE).expect("valid").expect("not help");
+        assert_eq!(
+            (o.fog, o.fog_res, o.fog_tick),
+            (fog::FogPreset::Off, FogResolution::Half, 0)
+        );
+        let mut args = BASE.to_vec();
+        args.extend(["--fog", "sunset", "--fog-res", "full", "--fog-tick", "640"]);
+        let o = parse(&args).expect("valid").expect("not help");
+        assert_eq!(
+            (o.fog, o.fog_res, o.fog_tick),
+            (fog::FogPreset::Sunset, FogResolution::Full, 640)
+        );
+        let mut bad = BASE.to_vec();
+        bad.extend(["--fog-tick", "-1"]);
+        assert!(parse(&bad).is_err());
+    }
 
     #[test]
     fn camera_and_shots_are_required() {

@@ -122,6 +122,7 @@ SETTINGS = [
     ('cave', ('run', 'cave')),
     ('clock', ('run', 'time')),
     ('idle work', ('run', 'idle_work')),
+    ('fog', ('run', 'fog')),
     ('seed', ('run', 'seed')),
     ('backend', ('run', 'backend')),
     ('tier', ('run', 'tier')),
@@ -190,6 +191,9 @@ def load(path):
         # Runs from before --idle-work had no world work between frames.
         if not run.get('idle_work'):
             run['idle_work'] = 'none'
+        # Runs from before --fog had no fog.
+        if not run.get('fog'):
+            run['fog'] = 'off'
         # Whether the run had --edits (the world's edit latency, null without them).
         run['edits'] = get(data, ('world', 'edits')) is not None
     return data

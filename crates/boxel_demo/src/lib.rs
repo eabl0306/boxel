@@ -11,11 +11,13 @@
 //! - [`textures`]: the procedural painter of the demo layers.
 //! - [`worldgen`]: the terrain, forest and overworld generators, the sea and the caves, and
 //!   [`worldgen::DEFAULT_SEED`].
+//! - [`fog`]: the fog and cloud presets (valley fog, clouds, a blanket, dusk).
 //!
 //! Not published: a game copies what it needs, or depends on it by path.
 
 pub mod blocks;
 pub mod fluids;
+pub mod fog;
 pub mod pack;
 pub mod rules;
 pub mod shapes;

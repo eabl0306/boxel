@@ -70,6 +70,8 @@ mod cave;
 mod clock;
 #[path = "stress/edits.rs"]
 mod edits;
+#[path = "shared/fog.rs"]
+mod fog;
 #[path = "shared/pack.rs"]
 mod pack;
 #[path = "stress/report.rs"]
@@ -85,6 +87,7 @@ use boxel::gfx::{CLI_HELP, PresentModePref};
 use boxel::log::span_times::{self, SpanFrame, SpanTimes};
 use boxel::mesh::AoPolicy;
 use boxel::prelude::*;
+use boxel::render::fog::FogResolution;
 use boxel::render::{GpuFailed, TextureSource, TranslucentSort};
 use boxel::voxel::{
     BlockPos, BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, LocalPos, MAX_BLOCK_COORD,
@@ -166,7 +169,8 @@ exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 output not written, 4 timeou
 /// The whole help: [`USAGE`], the physics options and the world options.
 fn usage() -> String {
     format!(
-        "{USAGE}\nphysics options:\n{}\nworld options:\n{}",
+        "{USAGE}\n{}\nphysics options:\n{}\nworld options:\n{}",
+        fog::USAGE,
         bodies::USAGE,
         world::usage(World::Forest)
     )
@@ -269,6 +273,10 @@ struct Options {
     sort: TranslucentSort,
     /// `--cave`.
     cave: bool,
+    /// `--fog`.
+    fog: fog::FogPreset,
+    /// `--fog-res`.
+    fog_res: FogResolution,
     /// The route of the `path` scenario through the cave `--cave` found (empty before
     /// [`find_cave`] and without `--cave`).
     path: Vec<DVec3>,
@@ -320,6 +328,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         water: None,
         sort: TranslucentSort::Background,
         cave: false,
+        fog: fog::FogPreset::Off,
+        fog_res: FogResolution::Half,
         path: Vec::new(),
     };
     let mut timeout = None;
@@ -477,6 +487,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--no-cave-culling" => o.cave_culling = false,
             "--cave" => o.cave = true,
             "--idle-work" => o.idle_work = on_off(flag, &value()?)?,
+            "--fog" => o.fog = fog::parse(flag, &value()?)?,
+            "--fog-res" => o.fog_res = fog::parse_resolution(flag, &value()?)?,
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
@@ -1350,6 +1362,7 @@ fn run_info(options: &Options, present: String) -> RunInfo {
         light: if options.light { "on" } else { "off" }.to_string(),
         cave_culling: if options.cave_culling { "on" } else { "off" }.to_string(),
         idle_work: if options.idle_work { "on" } else { "off" }.to_string(),
+        fog: fog::label(options.fog, options.fog_res),
         pack: match &options.textures {
             TextureSource::Procedural => "none".to_string(),
             source => source.label(),
@@ -1564,6 +1577,10 @@ fn main() -> AppExit {
     if options.edits {
         let [x, y, z, ..] = options.camera;
         app.insert_resource(EditScript::new(DVec3::new(x, y, z)));
+    }
+    // `--fog`: the plugin only when asked (off adds nothing at all).
+    if let Some(settings) = options.fog.settings(options.fog_res) {
+        app.add_plugins(FogPlugin { settings });
     }
     if options.bodies.enabled() {
         let [x, y, z, ..] = options.camera;
@@ -1794,6 +1811,19 @@ mod tests {
     fn edit_and_time_flags() {
         let o = parse(&[]).expect("valid").expect("not help");
         assert_eq!((o.edits, o.time), (false, 12.0));
+        let o = options(&["--fog", "valley", "--fog-res", "full"]);
+        assert_eq!(
+            (o.fog, o.fog_res),
+            (fog::FogPreset::Valley, FogResolution::Full)
+        );
+        let o = options(&[]);
+        assert_eq!(
+            (o.fog, o.fog_res),
+            (fog::FogPreset::Off, FogResolution::Half)
+        );
+        assert!(parse(&["--fog", "mist"]).is_err());
+        assert!(parse(&["--fog-res", "quarter"]).is_err());
+        assert!(parse(&["--fog"]).is_err());
         let o = parse(&["--edits", "--time", "21:30"])
             .expect("valid")
             .expect("not help");
