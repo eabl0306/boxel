@@ -25,7 +25,9 @@ use boxel_pack::{
     BlockState as PackState, LayerRecipe, ResourceId, ResourcePack, Texture, Timeline, VariantList,
     condition_matches, parse_variant_key,
 };
-use boxel_voxel::{BlockModel, BlockRegistry, BlockState, Face, RenderShape, TextureSpec};
+use boxel_voxel::{
+    BlockModel, BlockRegistry, BlockState, FLUID_LEVEL, Face, RenderShape, TextureSpec,
+};
 
 use crate::texture_animation::LayerAnimation;
 use crate::textures::{
@@ -253,7 +255,9 @@ fn pack_block_textures(
 /// Which flow layers are animated ([`BlockTextureData::animated_flow`]): slot 0 for fluids that
 /// emit no light, slot 1 for those that do. That is the key the shaders use, as they pick a fluid
 /// quad's flow speed and still bit by its emissive flag. A fluid's flow layer is its side
-/// texture (the fluid mesher draws its sides and sloping tops with it).
+/// texture (the fluid mesher draws its sides and sloping tops with it). Every level of a fluid
+/// is drawn as its source (level 0, ADR 0021), so the source's emission and side texture count,
+/// whatever its levels say.
 fn animated_flow(registry: &BlockRegistry, animations: &[LayerAnimation]) -> [bool; 2] {
     let mut flow = [false; 2];
     for state in 0..registry.len() {
@@ -261,8 +265,10 @@ fn animated_flow(registry: &BlockRegistry, animations: &[LayerAnimation]) -> [bo
         if registry.model(state) != BlockModel::Fluid {
             continue;
         }
-        let layer = u32::from(registry.face_texture(state, Face::PosX).0);
-        let slot = usize::from(!registry.emission(state).is_dark());
+        // The state the mesher draws (`MaterialTable::from_registry`).
+        let source = registry.with(state, FLUID_LEVEL, "0").unwrap_or(state);
+        let layer = u32::from(registry.face_texture(source, Face::PosX).0);
+        let slot = usize::from(!registry.emission(source).is_dark());
         flow[slot] |= animations.iter().any(|a| a.layer == layer);
     }
     flow
@@ -917,12 +923,13 @@ pub(crate) mod tests {
 
     /// #48: the flow layers that do not scroll are found by fluid, not by name. A fluid's flow
     /// layer is its side texture; slot 0 holds the fluids that emit no light, slot 1 those that
-    /// do (the shaders' key).
+    /// do (the shaders' key). Every level of a fluid is drawn as its source (ADR 0021), so only
+    /// the source counts.
     #[test]
     fn animated_flow_follows_the_fluids_side_texture() {
         use boxel_voxel::{
-            BlockCollision, BlockDef, BlockModel, BlockRegistryBuilder, FaceTextures,
-            TexturePattern,
+            BlockCollision, BlockDef, BlockModel, BlockRegistryBuilder, FLUID_LEVEL, FaceTextures,
+            Property, TexturePattern,
         };
         let mut b = BlockRegistryBuilder::new();
         let mut layer = |name: &str| {
@@ -934,8 +941,26 @@ pub(crate) mod tests {
             })
             .expect("layer")
         };
-        let [goo, goo_side, glow, glow_side, rock] =
-            ["goo", "goo_side", "glow", "glow_side", "rock"].map(&mut layer);
+        const LAYERS: [&str; 8] = [
+            "goo",
+            "goo_side",
+            "glow",
+            "glow_side",
+            "rock",
+            "magma",
+            "magma_side",
+            "crust",
+        ];
+        let [
+            goo,
+            goo_side,
+            glow,
+            glow_side,
+            rock,
+            magma,
+            magma_side,
+            crust,
+        ] = LAYERS.map(&mut layer);
         let fluid = |name: &str, still, side, emission| BlockDef {
             name: format!("game:{name}"),
             shape: RenderShape::Translucent,
@@ -964,11 +989,27 @@ pub(crate) mod tests {
             textures: FaceTextures::all(rock),
         })
         .expect("rock");
+        // An emissive fluid whose levels look otherwise: 8..=11 dark, 12..=15 dark with another
+        // side texture. The mesher draws them all as the emissive source.
+        b.add_block_with_states(
+            fluid("magma", magma, magma_side, [12, 6, 0]),
+            vec![Property::int(FLUID_LEVEL, 0..=15)],
+            |values, def| {
+                let level = values.index(FLUID_LEVEL).expect("level");
+                if level >= 8 {
+                    def.emission = [0; 3];
+                }
+                if level >= 12 {
+                    def.textures.side = crust;
+                }
+            },
+        )
+        .expect("magma");
         let registry = b.build();
 
         let flow_of = |animated: &[&str]| {
             let pack = TempPack::new("flow_by_fluid");
-            for name in ["goo", "goo_side", "glow", "glow_side", "rock"] {
+            for name in LAYERS {
                 pack.png(name, 16, 32, |_, y| [(y * 8) as u8, 0, 0, 255]);
                 if animated.contains(&name) {
                     pack.file(
@@ -987,7 +1028,11 @@ pub(crate) mod tests {
         assert_eq!(flow_of(&["glow_side"]), [false, true]);
         assert_eq!(flow_of(&["goo_side", "glow_side"]), [true, true]);
         // Still layers and non-fluid layers do not count.
-        assert_eq!(flow_of(&["goo", "glow", "rock"]), [false, false]);
+        assert_eq!(flow_of(&["goo", "glow", "rock", "magma"]), [false, false]);
+        // The magma's dark levels and the side texture only they name are never drawn.
+        assert_eq!(flow_of(&["magma_side"]), [false, true]);
+        assert_eq!(flow_of(&["crust"]), [false, false]);
+        assert_eq!(flow_of(&["goo_side", "magma_side"]), [true, true]);
     }
 
     /// ADR 0028: animated pack textures keep the finished layer of each frame they show (tint,
