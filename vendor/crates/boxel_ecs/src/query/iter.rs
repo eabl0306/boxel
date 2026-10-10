@@ -1577,6 +1577,7 @@ impl<'w, 's, D: QueryData, F: QueryFilter, I: Iterator<Item: EntityEquivalent>>
     ///
     /// - If `D` does not impl `ReadOnlyQueryData`, then there must not be any other `Item`s alive for the current entity
     /// - If `D` does not impl `IterQueryData`, then there must not be any other `Item`s alive for *any* entity
+    #[inline(always)]
     unsafe fn fetch_next_aliased_unchecked(
         &mut self,
     ) -> Option<Result<D::Item<'w, 's>, QueryEntityError>> {
@@ -2191,6 +2192,7 @@ impl<'w, 's, D: QueryData, F: QueryFilter, I: DoubleEndedIterator<Item: EntityEq
     ///
     /// - If `D` does not impl `ReadOnlyQueryData`, then there must not be any other `Item`s alive for the current entity
     /// - If `D` does not impl `IterQueryData`, then there must not be any other `Item`s alive for *any* entity
+    #[inline(always)]
     unsafe fn fetch_next_back_aliased_unchecked(
         &mut self,
     ) -> Option<Result<D::Item<'w, 's>, QueryEntityError>> {

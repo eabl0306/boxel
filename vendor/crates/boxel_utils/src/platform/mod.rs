@@ -3,7 +3,7 @@
 //! `boxel_ecs` (written for boxel; template: tools/refork/template/platform/mod.rs).
 //!
 //! Everything maps to `std`, `hashbrown`, `foldhash` and `futures-lite`. `cfg`, `hash` and
-//! `cell` are vendored from the bevy-platform crate version 0.20.0-rc.2
+//! `cell` are vendored from the bevy-platform crate version 0.20.0
 //! (MIT OR Apache-2.0, Bevy Engine contributors); `collections`, `sync`, `future`, `time`,
 //! `thread` and `prelude` are thin re-exports.
 
