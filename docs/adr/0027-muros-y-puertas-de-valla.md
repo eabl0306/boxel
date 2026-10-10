@@ -3,7 +3,8 @@
 - Estado: aceptado
 - Fecha: 2026-10-10
 - Revisa: ADR 0020, sección 5 (las reglas de vecinos ya no se quedan en una vuelta; las vallas
-  se conectan a las puertas) y ADR 0026 (fuera de esa parte quedaban los muros y las puertas)
+  se conectan a las puertas), ADR 0021, sección 3 (una celda sin colisión no siempre puede tener
+  agua: la puerta abierta no) y ADR 0026 (fuera de esa parte quedaban los muros y las puertas)
 
 ## Contexto
 
@@ -17,7 +18,8 @@ cosas nuevas:
   0020 no alcanza.
 - **La puerta se usa.** Un clic derecho la abre o la cierra en vez de poner un bloque. El motor
   no tenía una forma de decir qué hace usar un bloque.
-- **Una puerta abierta no choca**, pero se apunta igual.
+- **Una puerta abierta no choca**, pero se apunta igual y, como en Minecraft, frena el agua y la
+  lava.
 
 ## Decisión
 
@@ -100,10 +102,15 @@ cosas nuevas:
 - `voxel_world`: el clic derecho sobre un bloque que se usa lo usa. Con Shift pone el bloque
   elegido, como en Minecraft. La puerta se pone mirando hacia donde mira el jugador.
 
-### 5. Luz, física, malla y GPU
+### 5. Luz, fluidos, física, malla y GPU
 
 - **Luz**: opacidad 0, como la valla. Un muro con agua tiene 1 (frena el cielo directo).
 - **Cuevas**: no ocultan (no son cubos opacos). La ocultación de cuevas los cuenta abiertos.
+- **Fluidos**: la puerta, abierta o cerrada, frena el agua y la lava y cuenta como sólida debajo
+  de ellas (agua infinita). En Minecraft la puerta es de madera, que `blocksMotion` aunque no
+  choque. Hasta ahora los fluidos miraban la colisión, y el agua borraba la puerta abierta. Ahora
+  el registro tiene una marca aparte, `StateFlags::BLOCKS_MOTION` (choca, o es una puerta), y
+  los fluidos leen esa.
 - **Física**: nada nuevo en el código. Son bloques altos (`TALL`, `reach` sigue en 0,5).
   `plane_gap` baja de 0,375 a 0,25 porque hay caras a 4/16 del plano.
 - **Malla**: nada nuevo. Van por el camino de cajas del ADR 0020: ocultan sus caras contra los
@@ -166,6 +173,7 @@ el mundo plano, un muro con una puerta metida, dos hileras con una antorcha y un
   - En `rules`: `wall_rule`, `wall_shape_of`, `wall_connects`, `gate_connects`, `is_wall`,
     `fence_gate_rule`, `UseRule`, `use_rule_for_model` y `fence_gate_use`.
   - En `boxel_world`: `BlockUses` y `MAX_RULE_UPDATES`.
+  - En `boxel_voxel`: `StateFlags::BLOCKS_MOTION` y `BlockRegistry::blocks_motion`.
   - Un `match` exhaustivo sobre `BlockModel` fuera del motor deja de compilar.
 - Tests:
   - `boxel_voxel/tests/walls.rs`: estados e ids. Las cajas, el contorno y la colisión de todos los
@@ -180,6 +188,9 @@ el mundo plano, un muro con una puerta metida, dos hileras con una antorcha y un
     En cajas al azar de muros, puertas, vallas, piedra y antorchas, después de cada lote toda
     regla queda asentada (sin la propagación, este test falla). En el mundo de verdad, un muro con
     una puerta y una valla se conectan y la antorcha baja los postes.
+  - `boxel_world/tests/fluid.rs`: el agua y la lava rodean la puerta, abierta o cerrada, y no
+    la borran. Dos fuentes sobre una puerta abierta hacen una tercera. El simulador tiene
+    puertas, también en el terreno al azar y lejos del origen.
   - `boxel_mesh/tests/shapes.rs`: muros y puertas en los chunks al azar del oráculo, y un tramo
     con una puerta oculta lo que cubre.
   - `boxel_light/tests/shapes.rs`: pasan el cielo; con agua, lo frenan.

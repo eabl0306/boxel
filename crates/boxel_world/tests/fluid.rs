@@ -4,8 +4,9 @@
 //! cell for cell after every game tick: spread distance, the way down, falling, new sources,
 //! draining, lava's slower and shorter flow, lava meeting water (obsidian, cobblestone, stone),
 //! and waterlogged slabs and fences (sources that flow out through their open faces, never
-//! filled by flowing water, waterlogged by a new source between two others). Also the tick budget (it only delays), ticks frozen in unloaded
-//! chunks, worldgen water that stays still, and the same scenes far from the origin.
+//! filled by flowing water, waterlogged by a new source between two others), and fence gates
+//! that hold fluids back open or closed. Also the tick budget (it only delays), ticks frozen in
+//! unloaded chunks, worldgen water that stays still, and the same scenes far from the origin.
 use boxel_app::App;
 use boxel_ecs::prelude::*;
 use boxel_math::DVec3;
@@ -46,6 +47,12 @@ enum Cell {
     /// An oak fence, maybe waterlogged.
     Fence {
         wet: bool,
+    },
+    /// An oak fence gate, open or closed. It holds no water and, open or closed, stops fluids
+    /// and is solid under them (Minecraft's gates are solid wood: `blocksMotion`), though an
+    /// open one does not collide.
+    Gate {
+        open: bool,
     },
 }
 
@@ -345,7 +352,12 @@ impl Sim {
         let below = self.get(add(p, DOWN));
         let solid_below = matches!(
             below,
-            Cell::Stone | Cell::Cobble | Cell::Obsidian | Cell::Slab { .. } | Cell::Fence { .. }
+            Cell::Stone
+                | Cell::Cobble
+                | Cell::Obsidian
+                | Cell::Slab { .. }
+                | Cell::Fence { .. }
+                | Cell::Gate { .. }
         );
         if kind == Kind::Water && sources >= 2 && (solid_below || self.source(kind, below)) {
             return Some(Cell::Water(0));
@@ -642,6 +654,9 @@ fn state_of(registry: &BlockRegistry, cell: Cell) -> BlockState {
         Cell::Fence { wet } => registry
             .parse_state(&format!("boxel:oak_fence[waterlogged={wet}]"))
             .unwrap(),
+        Cell::Gate { open } => registry
+            .parse_state(&format!("boxel:oak_fence_gate[facing=east,open={open}]"))
+            .unwrap(),
     }
 }
 
@@ -662,6 +677,9 @@ fn cell_of(registry: &BlockRegistry, state: BlockState) -> Cell {
         // Any sides: the world connects fences to their neighbors.
         "boxel:oak_fence" => Cell::Fence {
             wet: registry.is_waterlogged(state),
+        },
+        "boxel:oak_fence_gate" => Cell::Gate {
+            open: registry.property(state, "open") == Some("true"),
         },
         other => panic!("unexpected {other}"),
     }
@@ -797,6 +815,8 @@ fn the_same_scenes_far_from_the_origin() {
     edits.push(([-7, 0, -8], Cell::Water(0)));
     edits.push(([-7, 0, -7], Cell::Fence { wet: false }));
     edits.push(([-7, 0, -6], Cell::Water(0)));
+    // An open fence gate in the flow.
+    edits.push(([2, 0, 2], Cell::Gate { open: true }));
     for origin in [
         BlockPos::new((1 << 31) - 2, -(1 << 31) + 3, -(1 << 31) + 1),
         BlockPos::new(1 << 40, 1 << 40, -(1 << 40)),
@@ -1191,6 +1211,7 @@ fn random_terrain_with_waterlogged_blocks_matches_the_simulator() {
                     16..22 => edits.push(([x, y, z], Cell::Slab { top: true, wet })),
                     22..26 => edits.push(([x, y, z], Cell::Fence { wet })),
                     26..30 => edits.push(([x, 0, z], Cell::Stone)),
+                    30..34 => edits.push(([x, y, z], Cell::Gate { open: !wet })),
                     _ => {}
                 }
             }
@@ -1217,4 +1238,46 @@ fn random_terrain_with_waterlogged_blocks_matches_the_simulator() {
         ];
         run(ORIGIN, &format!("wet seed {seed}"), &edits, &later, 140);
     }
+}
+
+#[test]
+fn fence_gates_hold_fluids_back_open_or_closed() {
+    let closed = Cell::Gate { open: false };
+    let open = Cell::Gate { open: true };
+    // Water beside a closed gate that opens later, and a gate placed open into flowing water:
+    // the water flows around them and never into them (a gate is not lost to the water).
+    let later = [(20, vec![([0, 0, 0], open)]), (40, vec![([0, 0, 3], open)])];
+    let edits = [([1, 0, 0], Cell::Water(0)), ([0, 0, 0], closed)];
+    let (engine, _) = run(ORIGIN, "gate beside water", &edits, &later, 80);
+    assert_eq!(engine.get([0, 0, 0]), open);
+    assert_eq!(engine.get([0, 0, 3]), open);
+    assert!(
+        matches!(engine.get([-1, 0, 0]), Cell::Water(_)),
+        "around it"
+    );
+    // Water on an open gate stays on it; two sources over an open gate in the ground make a
+    // third (the gate is solid under them, Minecraft's `isSolid`).
+    let edits = [
+        ([-4, 0, 0], open),
+        ([-4, 1, 0], Cell::Water(0)),
+        ([4, -1, 0], open),
+        ([3, 0, 0], Cell::Water(0)),
+        ([5, 0, 0], Cell::Water(0)),
+    ];
+    let (engine, _) = run(ORIGIN, "water over gates", &edits, &[], 60);
+    assert_eq!(engine.get([-4, 0, 0]), open);
+    assert_eq!(engine.get([4, -1, 0]), open);
+    assert_eq!(engine.get([4, 0, 0]), Cell::Water(0), "a new source");
+    // Lava beside and over open and closed gates.
+    let edits = [
+        ([0, 0, 0], Cell::Lava(0)),
+        ([1, 0, 0], open),
+        ([-1, 0, 0], closed),
+        ([0, -1, 2], open),
+        ([0, 0, 2], Cell::Lava(0)),
+    ];
+    let (engine, _) = run(ORIGIN, "lava and gates", &edits, &[], 160);
+    assert_eq!(engine.get([1, 0, 0]), open);
+    assert_eq!(engine.get([-1, 0, 0]), closed);
+    assert_eq!(engine.get([0, -1, 2]), open);
 }

@@ -400,6 +400,10 @@ bitflags::bitflags! {
         /// Could hold a water source: it has the [`WATERLOGGED`] property and is not a full
         /// cube (ADR 0025).
         const WATERLOGGABLE = 1 << 5;
+        /// Stops movement (Minecraft's `blocksMotion`): it collides ([`StateFlags::SOLID`]),
+        /// or it is a fence gate, open or closed (Minecraft's gates are solid wood; an open one
+        /// does not collide, ADR 0027). Fluids never flow into it and stand on it.
+        const BLOCKS_MOTION = 1 << 6;
     }
 }
 
@@ -1311,6 +1315,10 @@ impl BlockRegistryBuilder {
                 let solid = !b.collision.is_none();
                 f.set(StateFlags::SOLID, solid);
                 f.set(
+                    StateFlags::BLOCKS_MOTION,
+                    solid || matches!(b.model, BlockModel::FenceGate { .. }),
+                );
+                f.set(
                     StateFlags::OCCLUDES,
                     b.shape == RenderShape::Opaque && b.model.is_solid_cube(),
                 );
@@ -1567,6 +1575,11 @@ impl BlockRegistry {
     /// [`StateFlags::OCCLUDES`]).
     pub fn occludes(&self, s: BlockState) -> bool {
         self.flags(s).contains(StateFlags::OCCLUDES)
+    }
+    /// True if `s` stops movement ([`StateFlags::BLOCKS_MOTION`]): it collides, or it is a fence
+    /// gate, open or closed. What the fluid rules call solid.
+    pub fn blocks_motion(&self, s: BlockState) -> bool {
+        self.flags(s).contains(StateFlags::BLOCKS_MOTION)
     }
     /// True if `s` holds a water source besides itself ([`StateFlags::WATERLOGGED`], ADR 0025).
     pub fn is_waterlogged(&self, s: BlockState) -> bool {

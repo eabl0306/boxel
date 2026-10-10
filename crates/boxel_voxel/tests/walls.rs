@@ -13,7 +13,7 @@ use boxel_voxel::shapes::{
 };
 use boxel_voxel::{
     BlockCollision, BlockModel, BlockRegistry, BlockState, CollisionBox, Face, Facing,
-    MAX_COLLISION_HEIGHT, RenderShape, WallSide, WallSides,
+    MAX_COLLISION_HEIGHT, RenderShape, StateFlags, WallSide, WallSides,
 };
 use std::collections::HashSet;
 
@@ -348,6 +348,35 @@ fn gate_boxes_outline_and_collision_are_minecrafts() {
                 }
             }
         }
+    }
+}
+
+/// Every fence gate stops movement, open or closed (Minecraft's gates are solid wood: fluids
+/// never flow into one), though an open one does not collide.
+#[test]
+fn gates_block_motion_open_or_closed() {
+    let r = registry();
+    let gate = r.block(s(&r, "boxel:oak_fence_gate")).unwrap();
+    for state in r.states(gate) {
+        let open = r.property(state, "open") == Some("true");
+        assert!(r.blocks_motion(state), "{}", r.state_name(state));
+        assert_eq!(
+            r.flags(state).contains(StateFlags::SOLID),
+            !open,
+            "{}",
+            r.state_name(state)
+        );
+    }
+    for name in [
+        "boxel:air",
+        "boxel:water",
+        "boxel:torch",
+        "boxel:short_grass",
+    ] {
+        assert!(!r.blocks_motion(s(&r, name)), "{name}");
+    }
+    for name in ["boxel:stone", "boxel:cobblestone_wall", "boxel:oak_fence"] {
+        assert!(r.blocks_motion(s(&r, name)), "{name}");
     }
 }
 
