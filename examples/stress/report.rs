@@ -228,8 +228,9 @@ pub struct RunInfo {
     pub idle_work: String,
     /// Refresh rate of the window's monitor in Hz, as the runner saw it (`None`: unknown).
     pub refresh_hz: Option<f64>,
-    /// The fog (`--fog`, `--fog-res`, ADR 0030): `off`, or the preset and the resolution
-    /// (`valley half`). Empty in runs from before the option (no fog).
+    /// The fog (`--fog`, `--fog-res`, `--fog-steps`, ADR 0030): `off`, or the preset, the
+    /// resolution and a step budget other than the engine's (`valley half`, `inside full 32
+    /// steps`). Empty in runs from before the option (no fog).
     pub fog: String,
 }
 

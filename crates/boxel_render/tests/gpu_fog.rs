@@ -592,7 +592,7 @@ fn check_against_reference(
                 dir: basis.dir(ndc[0], ndc[1]),
                 depths,
             };
-            let want = texel(&march(&ray, &layers, sky, 64));
+            let want = texel(&march(&ray, &layers, sky, settings.max_steps));
             let got = words[(ty * size.x + tx) as usize];
             compared += 1;
             let mut bad = false;

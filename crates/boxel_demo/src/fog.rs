@@ -100,7 +100,11 @@ mod tests {
             vec![blanket(0, 256, 40.0)],
             sunset(),
         ] {
-            assert_eq!(boxel_fog::validate(&layers, 64), Ok(()), "{layers:?}");
+            assert_eq!(
+                boxel_fog::validate(&layers, boxel_fog::DEFAULT_MAX_STEPS),
+                Ok(()),
+                "{layers:?}"
+            );
         }
     }
 }

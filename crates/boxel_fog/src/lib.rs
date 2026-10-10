@@ -22,8 +22,8 @@ pub mod noise;
 pub mod pack;
 
 pub use config::{
-    DEFAULT_FACE_SHADE, FogError, FogFade, FogLayer, FogNoise, FogResolution, MAX_FOG_DISTANCE,
-    NoiseDims, density_for_visibility, validate,
+    DEFAULT_FACE_SHADE, DEFAULT_MAX_STEPS, FogError, FogFade, FogLayer, FogNoise, FogResolution,
+    MAX_FOG_DISTANCE, NoiseDims, density_for_visibility, validate,
 };
 pub use layer::{LayerParams, RayBasis, TICKS_PER_SECOND, mean_coverage};
 pub use noise::{COVERAGE_ONE, Coverage};

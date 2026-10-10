@@ -2,6 +2,7 @@
 //! demo's fog presets (`boxel_demo::fog`, ADR 0030).
 #![allow(dead_code, reason = "each example uses its own part")]
 
+use boxel::fog::DEFAULT_MAX_STEPS;
 use boxel::render::fog::{FogLayer, FogResolution, FogSettings};
 
 /// Help lines of `--fog`, `--fog-res` and `--fog-steps`.
@@ -11,7 +12,7 @@ pub const USAGE: &str =
                        clouds), inside (a blanket from y 0 to 256, seen 40 blocks through),
                        sunset (valley and clouds tuned for dusk)
   --fog-res half|full  resolution of the fog march (default half)
-  --fog-steps N        cells a fog ray visits at most, 1 to 256 (default 64)";
+  --fog-steps N        cells a fog ray visits at most, 1 to 256 (default 64, the engine's)";
 
 /// A fog preset of the examples.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -120,7 +121,7 @@ pub fn label(preset: FogPreset, resolution: FogResolution, steps: u32) -> String
     };
     match preset {
         FogPreset::Off => "off".to_string(),
-        p if steps == 64 => format!("{} {res}", p.name()),
+        p if steps == DEFAULT_MAX_STEPS => format!("{} {res}", p.name()),
         p => format!("{} {res} {steps} steps", p.name()),
     }
 }
@@ -133,7 +134,7 @@ mod tests {
     fn presets_parse_and_validate() {
         for p in FogPreset::ALL {
             assert_eq!(parse("--fog", p.name()), Ok(p));
-            if let Some(settings) = p.settings(FogResolution::Full, 64) {
+            if let Some(settings) = p.settings(FogResolution::Full, DEFAULT_MAX_STEPS) {
                 assert_eq!(settings.validate(), Ok(()), "{}", p.name());
                 assert_eq!(settings.resolution, FogResolution::Full);
             }
@@ -150,7 +151,7 @@ mod tests {
         assert!(parse_steps("--fog-steps", "0").is_err());
         assert!(parse_steps("--fog-steps", "300").is_err());
         assert_eq!(
-            label(FogPreset::Valley, FogResolution::Half, 64),
+            label(FogPreset::Valley, FogResolution::Half, DEFAULT_MAX_STEPS),
             "valley half"
         );
         assert_eq!(

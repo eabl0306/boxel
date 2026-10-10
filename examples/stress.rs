@@ -332,7 +332,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         cave: false,
         fog: fog::FogPreset::Off,
         fog_res: FogResolution::Half,
-        fog_steps: 64,
+        fog_steps: boxel::fog::DEFAULT_MAX_STEPS,
         path: Vec::new(),
     };
     let mut timeout = None;

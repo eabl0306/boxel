@@ -197,7 +197,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         fog: fog::FogPreset::Off,
         fog_res: FogResolution::Half,
         fog_tick: 0,
-        fog_steps: 64,
+        fog_steps: boxel::fog::DEFAULT_MAX_STEPS,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {

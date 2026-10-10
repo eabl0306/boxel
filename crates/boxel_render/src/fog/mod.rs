@@ -33,19 +33,20 @@ pub struct FogSettings {
     pub layers: Vec<FogLayer>,
     /// Resolution of the march (default half).
     pub resolution: FogResolution,
-    /// Cells a ray visits at most over all layers (1 to 256, default 64); past it each layer
-    /// uses its mean density.
+    /// Cells a ray visits at most over all layers (1 to 256, default
+    /// [`boxel_fog::DEFAULT_MAX_STEPS`]); past it each layer uses its mean density. More shows
+    /// the cubes deeper into thick fog and costs more on weak GPUs.
     pub max_steps: u32,
 }
 
 impl Default for FogSettings {
-    /// Enabled, no layers, half resolution, 64 steps.
+    /// Enabled, no layers, half resolution, [`boxel_fog::DEFAULT_MAX_STEPS`] steps.
     fn default() -> Self {
         Self {
             enabled: true,
             layers: Vec::new(),
             resolution: FogResolution::Half,
-            max_steps: 64,
+            max_steps: boxel_fog::DEFAULT_MAX_STEPS,
         }
     }
 }

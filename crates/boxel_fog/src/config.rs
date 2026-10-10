@@ -13,6 +13,8 @@ pub const MAX_CELL: u32 = 32;
 pub const MAX_SCALE: u32 = 64;
 /// Largest step budget of the march ([`validate`]).
 pub const MAX_STEPS: u32 = 256;
+/// The step budget a game gets unless it picks one ([`validate`], ADR 0030).
+pub const DEFAULT_MAX_STEPS: u32 = 64;
 
 /// One layer of fog or clouds: the cells of `[min_y, max_y)` with one density each.
 ///
