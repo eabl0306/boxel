@@ -54,6 +54,9 @@ const FLUID_SURFACE: f32 = 0.875;
 // sit FLUID_INSET inside the cell, behind the block's own faces on the border.
 const GEO_FLUID_INSET_BIT: u32 = 0x800000u;
 const FLUID_INSET: f32 = 0.001953125; // 1/512
+// A fluid quad's depth is scaled by this (1 - 2^-16, ADR 0025): reverse-Z, so it lands that
+// fraction of its distance farther and loses every depth tie (finish_vertex).
+const FLUID_DEPTH_SCALE: f32 = 0.9999847412109375;
 // The flow texture scrolls this many textures a second (ADR 0025): water, and lava (the
 // emissive fluid) slower. View::viewport.z wraps at a whole number of both periods.
 const WATER_FLOW_SPEED: f32 = 0.5;
@@ -331,6 +334,19 @@ fn finish_vertex(d: Decoded, chunk_origin: vec3<i32>, view: View) -> VsOut {
   let t = d.grow * edge_growth(clip, axis_u, axis_v, 0.5 * view.viewport.xy);
   var o: VsOut;
   o.clip = clip + axis_u * t.x + axis_v * t.y;
+  // Depth ties (ADR 0025): a fluid's faces lie on its cell's border, and so can the faces it
+  // touches: the far side of glass or leaves next to lava, the top of a stair step or a fence
+  // post in water at 16/16. Those are drawn with cull_mode None or after the fluid, all with a
+  // strict Greater test, so on equal depths rounding would pick a winner per pixel (z-fighting).
+  // A fluid's depth (near / w, reverse-Z) is scaled by FLUID_DEPTH_SCALE: 2^-16 of its distance
+  // farther. That is about 100 times the f32 rounding of a depth, and up to 4096 blocks away
+  // (far past any view distance) less than the 1/16 of a block between a fluid face and
+  // anything truly behind it (box faces and fluid heights are sixteenths). Every face on a fluid
+  // face's plane wins. The vertex does not move on screen, so no crack opens.
+  let shape = d.flags >> 1u;
+  if (shape == SHAPE_FLUID_CUBE || shape == SHAPE_FLUID_SURFACE || shape == SHAPE_FLUID_SLOPE) {
+    o.clip.z = o.clip.z * FLUID_DEPTH_SCALE;
+  }
   // side faces: the texture's v points down (decode_quad)
   o.uv = d.uv + vec2(t.x, select(t.y, -t.y, d.face >= 2u));
   // a turned cube face (logs along X or Z): the texture's vertical runs along u

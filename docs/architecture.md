@@ -829,7 +829,9 @@ un `Mesher` thread-local (~0.6 MiB de scratch) y un `LightScratch` (~0.7 MiB).
    Un bloque con agua (ADR 0025) se junta como su agua (`PaddedChunk::waterlogged` guarda el
    bloque, que se dibuja con sus cajas) y su agua va siempre por bloque, con las caras metidas
    1/512 en la celda. Los costados de los fluidos y el techo inclinado llevan la textura de flujo,
-   que el shader desplaza con el tiempo (`viewport.z` del uniform `View`).
+   que el shader desplaza con el tiempo (`viewport.z` del uniform `View`). El shader corre la
+   profundidad de todo fluido 2^-16 de su distancia hacia atrás: pierde los empates con las caras
+   que toca.
 6. **Buckets (8, congelados, ADR 0012):** 0 a 5 = caras opacas en orden `Face`; 6 = **cutout**
    (todas las caras de materiales cutout, como las hojas, y el techo inclinado de un fluido opaco,
    ADR 0025); 7 = translúcido. `ChunkMesh` guarda los quads contiguos por bucket,

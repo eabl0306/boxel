@@ -117,7 +117,9 @@ mar, el agua queda quieta como una pared vertical, porque el agua generada no pr
   agua contra una cara sólida del propio bloque (el piso de una losa de abajo, el respaldo de una
   escalera). Las demás caras, menos el techo, van 1/512 de bloque hacia adentro de la celda
   (`GEO_FLUID_INSET_BIT`, `FLUID_INSET`). Minecraft hace lo mismo con 0.001: así la cara del bloque
-  en el borde siempre queda delante y no pelea en profundidad con la del agua.
+  en el borde siempre queda delante y no pelea en profundidad con la del agua. El techo del agua,
+  que a 16/16 queda en el plano del techo de un escalón o de un poste, pierde ese empate por la
+  sección 6.
 
 ### 5. Textura de flujo
 
@@ -146,7 +148,21 @@ mar, el agua queda quieta como una pared vertical, porque el agua generada no pr
   bloques con agua y lava, en otro momento de la animación, y los tres tiers coinciden píxel a
   píxel.
 
-### 6. Ejemplos
+### 6. Empates de profundidad
+
+- Un fluido puede tocar caras en su mismo plano: el lado de atrás del vidrio o de las hojas junto a
+  la lava, o el techo de un escalón o de un poste cuando el agua de su bloque sube a 16/16. Esas
+  caras se dibujan sin descartar las traseras o después del fluido, con `Greater` estricto, y con
+  profundidades iguales el redondeo elige un ganador por píxel.
+- El shader escala la profundidad de todo quad de fluido por `FLUID_DEPTH_SCALE` (1 - 2^-16):
+  queda esa fracción de su distancia más atrás y pierde todos los empates. Es unas 100 veces el
+  redondeo de `f32` y, hasta 4096 bloques, menos que el 1/16 de bloque que separa una cara de
+  fluido de lo que de verdad está detrás. Los vértices no se mueven en pantalla, así que no abre
+  grietas.
+- `gpu_fluids` lo prueba en los tres tiers, junto con el techo inclinado de la lava visto desde
+  abajo de su chunk.
+
+### 7. Ejemplos
 
 `snapshot` muestra cada parte (las imágenes del dueño están en `shots/fluids2/`, fuera de git):
 
@@ -157,7 +173,7 @@ mar, el agua queda quieta como una pared vertical, porque el agua generada no pr
 - textura de flujo: un canal con escalones y fuentes en la cabecera, con `--fluid-time 0` y
   `--fluid-time 0.5` (la textura avanzó media vuelta) y con `--pack`.
 
-### 7. Ids
+### 8. Ids
 
 - La lava pasa de 1 a 16 estados: los ids después de ella se corren 15.
 - Las losas pasan de 3 a 6 estados y la valla de 16 a 32 por `waterlogged`.
@@ -209,5 +225,10 @@ mar, el agua queda quieta como una pared vertical, porque el agua generada no pr
   desplazamiento hacia adentro es un bit y es lo que hace Minecraft.
 - Guardar la dirección del flujo en el quad: las alturas de las esquinas ya la dan, y el mesher y
   el shader la calculan igual con enteros.
+- Para los empates, meter hacia adentro todas las caras de los fluidos, como Minecraft: en una
+  esquina cóncava las dos caras metidas dejan una rendija por la que se ve el interior de la lava,
+  que no dibuja sus caras traseras.
+- Ocultar la cara del vidrio o de las hojas contra la lava: falla donde la lava no llega arriba de
+  la celda, porque su techo baja.
 - Para el techo inclinado, una marca por chunk que no salte su bucket +Y: cambia el culling de los
   tres tiers.
