@@ -8,6 +8,8 @@
 //!   computes, and a direct `i128` reference of it.
 //! - [`layer`]: a layer reduced to small integers relative to the render origin for one frame
 //!   ([`LayerParams`]), and the camera rays ([`RayBasis`]).
+//! - [`march`]: the shader's march in `f32`, the reference of the GPU tests.
+//! - [`pack`]: how the march stores its result in one texel.
 //!
 //! A cell's density is `density * coverage(cell - wind * time)`: the cells never move, the wind
 //! only changes which ones are full. The time is a tick count of the fixed step (64 a second),
@@ -15,7 +17,9 @@
 
 pub mod config;
 pub mod layer;
+pub mod march;
 pub mod noise;
+pub mod pack;
 
 pub use config::{
     DEFAULT_FACE_SHADE, FogError, FogFade, FogGround, FogLayer, FogNoise, FogResolution,
