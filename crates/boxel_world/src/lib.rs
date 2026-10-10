@@ -12,11 +12,11 @@
 //!    [`WorldSettings::interest_budget`], nearest first; refresh the stale job priorities a batch
 //!    at a time.
 //! 2. `Edits`: apply [`EditQueue`] (copy-on-write, version bump) and remesh, as one edit batch,
-//!    with the neighbor updates of [`NeighborRules`] (stairs, fences, torches) added to it:
-//!    the center and every neighbor whose padded region holds a changed voxel (edges and corners
-//!    included, for AO), every chunk the light change can reach (up to 8 per voxel, sized from
-//!    the cached light) and the chunks around a column whose sky top moved; their `epoch` is
-//!    bumped.
+//!    with the neighbor updates of [`NeighborRules`] (stairs, fences, torches, walls, gates)
+//!    added to it: the center and every neighbor whose padded region holds a changed voxel
+//!    (edges and corners included, for AO), every chunk the light change can reach (up to 8 per
+//!    voxel, sized from the cached light) and the chunks around a column whose sky top moved;
+//!    their `epoch` is bumped. [`BlockUses`] says what using a block does (a gate opens).
 //! 3. `Dispatch`: collect finished jobs, then pop jobs by priority while in-flight < cap and run
 //!    them on the `AsyncComputeTaskPool` through a [`jobs::JobExecutor`] (stale priorities that
 //!    may come first are refreshed on the way, so jobs start nearest first); repeated while
@@ -93,7 +93,7 @@ pub use daylight::{
 pub use fluid::FluidPlugin;
 pub(crate) use map::CachedLight;
 pub use map::{ChunkId, ChunkMap, ChunkSlot, DataState, Interest, MeshState, WorldStats};
-pub use neighbor_rules::NeighborRules;
+pub use neighbor_rules::{BlockUses, MAX_RULE_UPDATES, NeighborRules};
 pub use plugin::{
     BlockChanged, BlockEdit, ChunkDataEvent, ChunkMeshEvent, ChunkMeshResync, ChunkViewer,
     EditQueue, WorldContent, WorldPlugin, WorldSettings, WorldSystems,

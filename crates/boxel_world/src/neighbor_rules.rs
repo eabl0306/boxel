@@ -1,23 +1,34 @@
-//! Blocks whose state follows their neighbors (ADR 0020): the shape of stairs, the sides of a
-//! fence, torches that drop without a support. A block declares a [`NeighborRule`]
-//! (`(registry, state, 6 neighbors) -> state`); when the world applies an edit batch
-//! (`WorldSystems::Edits`), every edited block and its 6 face neighbors that have a rule get
-//! it applied, against the map with the batch's edits in, and a changed state joins the same
-//! batch as one more edit. So placing stairs gives them their shape and turns the stairs next
-//! to them in the same frame, with one remesh and one `BlockChanged` per block.
+//! Blocks whose state follows their neighbors (ADR 0020, ADR 0027): the shape of stairs, the
+//! sides of a fence, torches that drop without a support, the sides and post of a wall, a fence
+//! gate between walls. A block declares a [`NeighborRule`] (`(registry, state, 6 neighbors) ->
+//! state`); when the world applies an edit batch (`WorldSystems::Edits`), every edited block and
+//! its 6 face neighbors that have a rule get it applied, against the map with the batch's edits
+//! in, and a changed state joins the same batch as one more edit. So placing stairs gives them
+//! their shape and turns the stairs next to them in the same frame, with one remesh and one
+//! `BlockChanged` per block.
 //!
-//! One ring only: the cells a rule changed are not looked at again. The built-in rules
-//! (`boxel_voxel::rules`) never need more, because no rule reads what another one changes. A
-//! rule whose block has a neighbor in a chunk that is not readable is skipped (the block keeps
-//! its state, so a chunk border never drops a torch or cuts a fence).
+//! A block a rule changed has its 6 neighbors looked at again (ADR 0027): a wall reads the post
+//! of the wall above it, so breaking the torch on a column of walls lowers every post down the
+//! column, one block per step, in the same batch. The built-in rules end: stairs, fences, torches
+//! and gates read nothing a rule changes (their second look changes nothing), and walls only read
+//! upward. At most [`MAX_RULE_UPDATES`] such second looks per batch, in case a rule added later
+//! never settles. A rule whose block has a neighbor in a chunk that is not readable is skipped
+//! (the block keeps its state, so a chunk border never drops a torch or cuts a fence).
 //!
 //! This runs before the edits are applied and is separate from scheduled block ticks
 //! (fluids): it only sees one edit batch and adds edits to it.
+//!
+//! [`BlockUses`] is the other engine hook of ADR 0027: what using a block does (a gate opens),
+//! for the game to ask before it places a block.
 use crate::BlockEdit;
 use boxel_ecs::prelude::Resource;
-use boxel_voxel::rules::{NeighborRule, rule_for_model};
-use boxel_voxel::{BlockId, BlockPos, BlockRegistry, BlockState, Face};
-use std::collections::{HashMap, HashSet};
+use boxel_voxel::rules::{NeighborRule, UseRule, rule_for_model, use_rule_for_model};
+use boxel_voxel::{BlockId, BlockPos, BlockRegistry, BlockState, Face, Facing};
+use std::collections::{HashMap, HashSet, VecDeque};
+
+/// Most blocks [`NeighborRules::expand`] looks at again around the blocks its rules changed, per
+/// edit batch: far more than a column of walls needs, a stop for a rule that never settles.
+pub const MAX_RULE_UPDATES: usize = 1 << 16;
 
 /// The [`NeighborRule`] of each block of a registry (indexed by [`BlockId`]).
 #[derive(Resource, Clone, Debug, Default)]
@@ -58,8 +69,9 @@ impl NeighborRules {
 
     /// Appends to `edits` the neighbor updates the batch needs: every edited position and its 6
     /// face neighbors whose block has a rule, in the order first met, with the batch's edits
-    /// in (the last edit of a position wins). `read` gives the current block of a position
-    /// (`None`: not readable). A rule that changes nothing adds nothing.
+    /// in (the last edit of a position wins); then, after each block a rule changed, its 6
+    /// neighbors again (up to [`MAX_RULE_UPDATES`]). `read` gives the current block of a
+    /// position (`None`: not readable). A rule that changes nothing adds nothing.
     pub fn expand(
         &self,
         registry: &BlockRegistry,
@@ -73,16 +85,19 @@ impl NeighborRules {
         for e in edits.iter() {
             overlay.insert(e.pos, e.state);
         }
-        let mut seen: HashSet<BlockPos> = HashSet::new();
-        let mut cells = Vec::new();
+        // Cells waiting for a look, each at most once at a time.
+        let mut queued: HashSet<BlockPos> = HashSet::new();
+        let mut queue = VecDeque::new();
         for e in edits.iter() {
             for p in std::iter::once(e.pos).chain(Face::ALL.map(|f| neighbor(e.pos, f))) {
-                if seen.insert(p) {
-                    cells.push(p);
+                if queued.insert(p) {
+                    queue.push_back(p);
                 }
             }
         }
-        for p in cells {
+        let mut updates = 0;
+        while let Some(p) = queue.pop_front() {
+            queued.remove(&p);
             let at = |q: BlockPos| overlay.get(&q).copied().or_else(|| read(q));
             let Some(state) = at(p) else {
                 continue;
@@ -99,11 +114,70 @@ impl NeighborRules {
                 continue;
             }
             let new = rule(registry, state, &around);
-            if new != state {
-                edits.push(BlockEdit { pos: p, state: new });
-                overlay.insert(p, new);
+            if new == state {
+                continue;
+            }
+            edits.push(BlockEdit { pos: p, state: new });
+            overlay.insert(p, new);
+            // Its neighbors may follow it (a wall under a wall), once the first ring is done.
+            for (f, &n) in Face::ALL.iter().zip(&around) {
+                let q = neighbor(p, *f);
+                if updates < MAX_RULE_UPDATES
+                    && self.rule(registry, n).is_some()
+                    && queued.insert(q)
+                {
+                    updates += 1;
+                    queue.push_back(q);
+                }
             }
         }
+    }
+}
+
+/// What using each block of a registry does (ADR 0027, indexed by [`BlockId`]): the
+/// [`UseRule`] of the blocks a player can use (a fence gate opens and closes). The game asks it
+/// before placing a block on a right click ([`BlockUses::use_block`]) and queues the state it
+/// gives as an edit.
+#[derive(Resource, Clone, Debug, Default)]
+pub struct BlockUses {
+    by_block: Vec<Option<UseRule>>,
+}
+
+impl BlockUses {
+    /// The built-in use rules for the blocks of `registry`, by the model of each block's
+    /// default state (`boxel_voxel::rules::use_rule_for_model`): fence gates.
+    pub fn from_registry(registry: &BlockRegistry) -> Self {
+        let by_block = registry
+            .blocks()
+            .map(|b| use_rule_for_model(registry.model(registry.default_state(b))))
+            .collect();
+        Self { by_block }
+    }
+
+    /// Sets (or with `None` removes) the use rule of `block`.
+    pub fn set(&mut self, block: BlockId, rule: Option<UseRule>) {
+        let i = usize::from(block.0);
+        if self.by_block.len() <= i {
+            self.by_block.resize(i + 1, None);
+        }
+        self.by_block[i] = rule;
+    }
+
+    /// The use rule of the block of `state`, if it has one.
+    pub fn rule(&self, registry: &BlockRegistry, state: BlockState) -> Option<UseRule> {
+        let block = registry.block(state)?;
+        self.by_block.get(usize::from(block.0)).copied().flatten()
+    }
+
+    /// The state `state` takes when used by someone looking toward `look` (horizontally), or
+    /// `None` when it is not used that way (the click places a block instead).
+    pub fn use_block(
+        &self,
+        registry: &BlockRegistry,
+        state: BlockState,
+        look: Facing,
+    ) -> Option<BlockState> {
+        self.rule(registry, state)?(registry, state, look)
     }
 }
 
@@ -204,5 +278,188 @@ mod tests {
         assert!(rules.rule(&registry, torch).is_none());
         assert!(!rules.is_empty());
         assert!(NeighborRules::default().is_empty());
+    }
+
+    /// Applies `edits` to `blocks`, the last edit of a position winning.
+    fn apply(blocks: &mut HashMap<BlockPos, BlockState>, edits: &[BlockEdit]) {
+        for e in edits {
+            blocks.insert(e.pos, e.state);
+        }
+    }
+
+    /// Every block of `blocks` with a rule is where its rule leaves it (air outside `blocks`).
+    fn settled(
+        rules: &NeighborRules,
+        registry: &BlockRegistry,
+        blocks: &HashMap<BlockPos, BlockState>,
+    ) -> Result<(), String> {
+        let at = |q: BlockPos| blocks.get(&q).copied().unwrap_or(BlockState::AIR);
+        for (&p, &state) in blocks {
+            let Some(rule) = rules.rule(registry, state) else {
+                continue;
+            };
+            let around = Face::ALL.map(|f| at(neighbor(p, f)));
+            let want = rule(registry, state, &around);
+            if want != state {
+                return Err(format!(
+                    "{p:?} is {} but its rule gives {}",
+                    registry.state_name(state),
+                    registry.state_name(want)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Breaking the torch on a column of walls lowers every post down the column in the same
+    /// batch: the change runs down from wall to wall, past the first ring (ADR 0027).
+    #[test]
+    fn wall_posts_follow_down_a_column() {
+        let registry = BlockRegistry::default_blocks();
+        let rules = NeighborRules::from_registry(&registry);
+        let s = |name: &str| registry.parse_state(name).unwrap();
+        // A straight north-south wall three long and three high, far from the origin, with a
+        // torch on its middle: placed as one batch.
+        let base = BlockPos::new(1 << 40, -(1 << 31), 7);
+        let at = |x: i64, y: i64, z: i64| BlockPos::new(base.x + x, base.y + y, base.z + z);
+        let mut edits = Vec::new();
+        for y in 0..3 {
+            for z in -1..=1 {
+                edits.push(BlockEdit {
+                    pos: at(0, y, z),
+                    state: s("boxel:cobblestone_wall"),
+                });
+            }
+        }
+        let torch = at(0, 3, 0);
+        edits.push(BlockEdit {
+            pos: torch,
+            state: s("boxel:torch"),
+        });
+        let mut blocks = HashMap::new();
+        rules.expand(&registry, |_| Some(BlockState::AIR), &mut edits);
+        apply(&mut blocks, &edits);
+        settled(&rules, &registry, &blocks).unwrap();
+        let name =
+            |blocks: &HashMap<BlockPos, BlockState>, p| registry.state_name(blocks[&p]).to_string();
+        for y in 0..3 {
+            assert_eq!(
+                registry.property(blocks[&at(0, y, 0)], "up"),
+                Some("true"),
+                "{}",
+                name(&blocks, at(0, y, 0))
+            );
+        }
+        // Break the torch: the top wall loses its post, and so does every wall under it.
+        let mut edits = vec![BlockEdit {
+            pos: torch,
+            state: BlockState::AIR,
+        }];
+        let read = {
+            let blocks = blocks.clone();
+            move |p| Some(blocks.get(&p).copied().unwrap_or(BlockState::AIR))
+        };
+        rules.expand(&registry, read, &mut edits);
+        apply(&mut blocks, &edits);
+        settled(&rules, &registry, &blocks).unwrap();
+        for y in 0..3 {
+            assert_eq!(
+                name(&blocks, at(0, y, 0)),
+                format!(
+                    "boxel:cobblestone_wall[east=none,north={side},south={side},up=false,\
+                     waterlogged=false,west=none]",
+                    side = if y == 2 { "low" } else { "tall" }
+                )
+            );
+        }
+        // One edit per wall that changed, after the torch.
+        assert_eq!(edits.len(), 4);
+    }
+
+    /// Random walls, gates, fences, stone and torches in a small box, settled; then random
+    /// edits, one batch each: after every batch, every block with a rule is settled again. A
+    /// brute-force check that the rules and their second looks reach every block they should.
+    #[test]
+    fn every_batch_leaves_the_rules_settled() {
+        let registry = BlockRegistry::default_blocks();
+        let rules = NeighborRules::from_registry(&registry);
+        let s = |name: &str| registry.parse_state(name).unwrap();
+        let palette = [
+            s("boxel:air"),
+            s("boxel:air"),
+            s("boxel:cobblestone_wall"),
+            s("boxel:cobblestone_wall"),
+            s("boxel:cobblestone_wall[waterlogged=true]"),
+            s("boxel:oak_fence_gate[facing=east]"),
+            s("boxel:oak_fence_gate[facing=north,open=true]"),
+            s("boxel:oak_fence"),
+            s("boxel:stone"),
+            s("boxel:torch"),
+            s("boxel:stone_slab[type=top]"),
+            s("boxel:oak_stairs[facing=west]"),
+        ];
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for round in 0..40 {
+            let base = BlockPos::new(-(1 << 31) + round, 1 << 30, (1 << 40) - 3);
+            let cell = |i: usize| {
+                BlockPos::new(
+                    base.x + (i % 4) as i64,
+                    base.y + (i / 4 % 5) as i64,
+                    base.z + (i / 20) as i64,
+                )
+            };
+            // Build the box in one batch and settle it.
+            let mut edits: Vec<BlockEdit> = (0..80)
+                .map(|i| BlockEdit {
+                    pos: cell(i),
+                    state: palette[next(palette.len())],
+                })
+                .collect();
+            let mut blocks = HashMap::new();
+            rules.expand(&registry, |_| Some(BlockState::AIR), &mut edits);
+            apply(&mut blocks, &edits);
+            settled(&rules, &registry, &blocks).unwrap_or_else(|e| panic!("round {round}: {e}"));
+            for step in 0..6 {
+                let mut edits: Vec<BlockEdit> = (0..1 + next(3))
+                    .map(|_| BlockEdit {
+                        pos: cell(next(80)),
+                        state: palette[next(palette.len())],
+                    })
+                    .collect();
+                let read = {
+                    let blocks = blocks.clone();
+                    move |p| Some(blocks.get(&p).copied().unwrap_or(BlockState::AIR))
+                };
+                rules.expand(&registry, read, &mut edits);
+                apply(&mut blocks, &edits);
+                settled(&rules, &registry, &blocks)
+                    .unwrap_or_else(|e| panic!("round {round} step {step}: {e}"));
+            }
+        }
+    }
+
+    #[test]
+    fn gates_are_used_and_other_blocks_are_not() {
+        let registry = BlockRegistry::default_blocks();
+        let mut uses = BlockUses::from_registry(&registry);
+        let s = |name: &str| registry.parse_state(name).unwrap();
+        let gate = s("boxel:oak_fence_gate[facing=north]");
+        assert_eq!(
+            uses.use_block(&registry, gate, Facing::South),
+            Some(s("boxel:oak_fence_gate[facing=south,open=true]"))
+        );
+        assert_eq!(
+            uses.use_block(&registry, s("boxel:stone"), Facing::South),
+            None
+        );
+        uses.set(registry.block(gate).unwrap(), None);
+        assert_eq!(uses.use_block(&registry, gate, Facing::South), None);
+        assert!(BlockUses::default().rule(&registry, gate).is_none());
     }
 }
