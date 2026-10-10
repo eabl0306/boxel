@@ -5,7 +5,7 @@
 #
 # - Refuses to start when the disk is almost full (QUIET_MIN_FREE_GB, default 40).
 # - At most QUIET_SLOTS heavy commands at once (default 2); the rest wait their turn.
-# - Each one gets nproc/QUIET_SLOTS cargo jobs, low CPU and IO priority, and a soft RAM cap
+# - Each one gets nproc/QUIET_SLOTS cargo jobs (at most half the CPUs), low CPU and IO priority, and a soft RAM cap
 #   (QUIET_MEM_HIGH, default 60% of RAM split between the slots) so it never pushes your
 #   apps into swap. Over the cap the command slows down instead of the desktop.
 # - No incremental cache (CARGO_INCREMENTAL=0): it is most of a target dir and one-shot builds
@@ -29,7 +29,12 @@ if (( free_gb < min_free_gb )); then
 fi
 
 export CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-0}
-export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-$(( cpus / slots > 0 ? cpus / slots : 1 ))}
+# Never more than half the CPUs per command, even with one slot: with every core linking test
+# binaries at once, one `cargo test --workspace` alone peaked at 13 GB and systemd-oomd killed it.
+jobs=$(( cpus / slots ))
+(( jobs > cpus / 2 )) && jobs=$(( cpus / 2 ))
+(( jobs < 1 )) && jobs=1
+export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-$jobs}
 
 mkdir -p "$lock_dir"
 waited=0
@@ -46,7 +51,11 @@ while :; do
             scope=(systemd-run --user --scope --quiet --expand-environment=no)
             if command -v systemd-run >/dev/null && "${scope[@]}" true 2>/dev/null; then
                 mem_kb=$(awk '/MemTotal/ { print $2 }' /proc/meminfo)
-                mem_high=${QUIET_MEM_HIGH:-$(( mem_kb * 6 / 10 / slots ))K}
+                # 60 % of RAM split between the slots, but at most 40 % for one command, so the
+                # desktop, the agents and the other slot keep room.
+                mem_kb_high=$(( mem_kb * 6 / 10 / slots ))
+                (( mem_kb_high > mem_kb * 4 / 10 )) && mem_kb_high=$(( mem_kb * 4 / 10 ))
+                mem_high=${QUIET_MEM_HIGH:-${mem_kb_high}K}
                 exec "${scope[@]}" -p "MemoryHigh=$mem_high" -p CPUWeight=20 -- "${prio[@]}" "$@"
             fi
             exec "${prio[@]}" "$@"
