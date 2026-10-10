@@ -57,6 +57,34 @@ def run(m=None, error=None, noisy=None, gave_up=False):
     return runs.Run(Case(), 'x', metrics=m, error=error, noisy=noisy, gave_up=gave_up)
 
 
+# Checkpoint round 1, rtx/surface/r16/uncapped (bench-results/control/1-20261009-200903): fps of
+# each second and mean power of each run. New runs 2 and 3 fell into the NVIDIA's slow state, for
+# the whole run and for its first 9 seconds.
+ROUND1_SURFACE = {
+    'base': [
+        (2303.5, 85.9, [2140, 2147, 2140, 2108, 2136, 2145, 2140, 2189, 2314, 2441, 2418, 2413,
+                        2482, 2553, 2444, 2416, 2427, 2417, 2275, 2326]),
+        (2313.1, 86.1, [2145, 2169, 2154, 2126, 2146, 2157, 2155, 2197, 2298, 2434, 2436, 2413,
+                        2520, 2561, 2445, 2433, 2442, 2413, 2281, 2336]),
+        (2306.2, 86.0, [2077, 2156, 2154, 2124, 2148, 2166, 2151, 2195, 2314, 2434, 2436, 2416,
+                        2501, 2561, 2435, 2435, 2404, 2406, 2276, 2334])],
+    'new': [
+        (2290.6, 85.2, [2108, 2138, 2144, 2119, 2140, 2154, 2142, 2188, 2307, 2410, 2412, 2378,
+                        2488, 2525, 2419, 2400, 2378, 2392, 2255, 2313]),
+        (2042.9, 80.8, [1962, 1855, 1875, 1833, 1861, 1878, 1883, 1936, 2024, 2450, 2170, 2124,
+                        2222, 2270, 2144, 2141, 2121, 2095, 1986, 2029]),
+        (2132.7, 80.5, [1949, 1858, 1868, 1820, 1840, 1871, 1854, 1905, 2006, 2399, 2116, 2337,
+                        2424, 2472, 2385, 2369, 2342, 2349, 2223, 2266])],
+}
+
+
+def round1_surface(**sides):
+    """The metrics of ROUND1_SURFACE (or of the runs given per side), numbered by round."""
+    data = dict(ROUND1_SURFACE, **sides)
+    return {side: [metrics(fps=fps, fps_s=per_s, nv={'power_w': w}, round=i + 1)
+                   for i, (fps, w, per_s) in enumerate(data[side])] for side in ('base', 'new')}
+
+
 HELP = ('usage: stress [--scenario static|fly|dive|spin|path]\n'
         '  --cave              start in a cave\n')
 OLD_HELP = 'usage: stress [--scenario static|fly|dive|spin]\n  --caves MODE  cave mode\n'
@@ -286,9 +314,12 @@ class MetricsTest(unittest.TestCase):
                       runs.throttled(summary(cap=144, timeline_fps=[144, 90, 144]), []))
 
     def test_metrics(self):
-        m = runs.metrics(summary(fps=4500, slow=2, slow75=1), every_refresh(), {'P0': 1.0})
+        m = runs.metrics(summary(fps=4500, slow=2, slow75=1, timeline_fps=[4400, 4600, 4500]),
+                         every_refresh(), {'P0': 1.0}, {'power_w': 80.0})
         self.assertEqual((m['fps'], m['slow'], m['skipped'], m['catch_up']), (4500, 2, 0, 20.0))
         self.assertEqual(m['pstates'], {'P0': 1.0})
+        self.assertEqual(m['fps_s'], [4400, 4600, 4500])
+        self.assertEqual(m['nv'], {'power_w': 80.0})
         self.assertEqual(m['quads'], 100)
         capped = runs.metrics(summary(slow=1500, slow75=12, cap=144), [])
         self.assertEqual(capped['slow'], 1500, 'the smoke counts frames over 6.94 ms, capped too')
@@ -297,27 +328,87 @@ class MetricsTest(unittest.TestCase):
 
     def test_nvidia(self):
         self.assertIsNone(runs.parse_nv('timestamp, pstate', 1.0))
-        s = runs.parse_nv('2026/10/08 12:00:00.000, P0, 2400, 8000, 25.10, 47', 5.0)
+        line = '2026/10/08 12:00:00.000, P0, 2400, 8000, 25.10, 47'
+        self.assertIsNone(runs.parse_nv(line, 1.0), 'NV_FIELDS has 8 columns')
+        s = runs.parse_nv(line, 5.0, runs.NV_BASE)
         self.assertEqual((s['pstate'], s['gr_mhz'], s['unix']), ('P0', '2400', 5.0))
+        s = runs.parse_nv(line + ', 0x0000000000000004, 61', 5.0)
+        self.assertEqual((s['power_w'], s['reasons'], s['temp_c']),
+                         ('25.10', '0x0000000000000004', '61'))
         samples = [{'unix': t, 'pstate': p} for t, p in
                    [(1, 'P8'), (2, 'P0'), (3, 'P0'), (4, 'P2'), (5, 'P0'), (9, 'P8')]]
         self.assertEqual(runs.pstate_share(samples, 2, 5), {'P0': 0.75, 'P2': 0.25})
         self.assertEqual(runs.pstate_share([], 0, 1), {})
 
+    def fake_nvidia_smi(self, folder, fields):
+        """A fake nvidia-smi that knows `fields` only: a query of another field fails, like the
+        real one; one without -lms prints a line, one with it loops."""
+        line = ', '.join(['2026/10/08 12:00:00.000', 'P0', '2400', '8000', '25.10', '47',
+                          '0x0000000000000004', '61'][:len(fields)])
+        path = os.path.join(folder, 'nvidia-smi')
+        with open(path, 'w') as f:
+            f.write(f'#!/bin/sh\ncase "$1" in --query-gpu={",".join(fields)}) ;; *) exit 2 ;; '
+                    f'esac\necho "{line}"\n[ "$3" = -lms ] || exit 0\n'
+                    f'while :; do echo "{line}"; sleep 0.05; done\n')
+        os.chmod(path, 0o755)
+        runs.query_fields.cache_clear()
+        self.addCleanup(runs.query_fields.cache_clear)
+        return mock.patch.dict(os.environ, {'PATH': folder + os.pathsep + os.environ['PATH']})
+
     def test_nvidia_sampler_closes_its_pipe(self):
-        with tempfile.TemporaryDirectory() as d:
-            fake = os.path.join(d, 'nvidia-smi')
-            with open(fake, 'w') as f:
-                f.write('#!/bin/sh\nwhile :; do\n'
-                        '  echo "2026/10/08 12:00:00.000, P0, 2400, 8000, 25.10, 47"\n'
-                        '  sleep 0.05\ndone\n')
-            os.chmod(fake, 0o755)
-            with mock.patch.dict(os.environ, {'PATH': d + os.pathsep + os.environ['PATH']}):
-                sampler = runs.NvidiaSampler().start()
-                time.sleep(0.3)
-                samples = sampler.stop()
+        with tempfile.TemporaryDirectory() as d, self.fake_nvidia_smi(d, runs.NV_FIELDS):
+            sampler = runs.NvidiaSampler().start()
+            time.sleep(0.3)
+            samples = sampler.stop()
+            runs.write_nv(os.path.join(d, 'run.nv.csv'), samples)
+            with open(os.path.join(d, 'run.nv.csv')) as f:
+                rows = f.read().splitlines()
         self.assertGreater(len(samples), 0)
         self.assertTrue(sampler._proc.stdout.closed)
+        self.assertEqual((samples[0]['reasons'], samples[0]['temp_c']), ('0x0000000000000004',
+                                                                         '61'))
+        self.assertIn('cpu_mhz', samples[0], 'the CPU frequency goes with each sample')
+        self.assertEqual(rows[0], 'unix,pstate,clocks.gr,clocks.mem,power.draw,utilization.gpu,'
+                                  'clocks_event_reasons.active,temperature.gpu,cpu_mhz')
+        self.assertTrue(rows[1].split(',', 1)[1].startswith('P0,2400,8000,25.10,47,0x'), rows[1])
+
+    def test_an_older_driver_keeps_the_p_states(self):
+        """A driver without clocks_event_reasons fails a query that names it: sample the base
+        fields then."""
+        with tempfile.TemporaryDirectory() as d, self.fake_nvidia_smi(d, runs.NV_BASE):
+            self.assertEqual(runs.query_fields(), runs.NV_BASE)
+            sampler = runs.NvidiaSampler().start()
+            time.sleep(0.3)
+            samples = sampler.stop()
+        self.assertGreater(len(samples), 0)
+        self.assertEqual(samples[0]['pstate'], 'P0')
+        self.assertNotIn('reasons', samples[0])
+
+    def test_cpu_mhz(self):
+        with tempfile.TemporaryDirectory() as d:
+            paths = [os.path.join(d, str(i)) for i in range(3)]
+            for path, khz in zip(paths, ('3600000\n', '2800000\n', 'x')):
+                with open(path, 'w') as f:
+                    f.write(khz)
+            self.assertEqual(runs.cpu_mhz(paths + [os.path.join(d, 'gone')]), 3200)
+        self.assertIsNone(runs.cpu_mhz([]))
+
+    def test_nv_means(self):
+        samples = [{'unix': t, 'pstate': 'P4', 'gr_mhz': str(c), 'power_w': str(w),
+                    'reasons': r, 'temp_c': '60', 'cpu_mhz': 3000}
+                   for t, c, w, r in [(1, 180, 3.0, '0x0000000000000001'),
+                                      (2, 2750, 80.0, '0x0000000000000004'),
+                                      (3, 2750, 84.0, '0x0000000000000004'),
+                                      (4, 2760, 82.0, '0x0000000000000000'),
+                                      (5, 2740, 86.0, '0x0000000000000004'),
+                                      (9, 180, 3.0, '0x0000000000000001')]]
+        m = runs.nv_means(samples, 2, 5)
+        self.assertEqual((m['gr_mhz'], m['power_w'], m['temp_c'], m['cpu_mhz']),
+                         (2750.0, 83.0, 60.0, 3000.0))
+        self.assertIsNone(m['util'], 'a field nobody sampled')
+        self.assertEqual(m['reasons'], {'0x0': 0.25, '0x4': 0.75})
+        self.assertIsNone(runs.nv_means(samples, 6, 8))
+        self.assertIsNone(runs.nv_means([]))
 
 
 class MeasureTest(FakeMachine):
@@ -772,6 +863,37 @@ class CheckTest(unittest.TestCase):
                          'P0 90 %, P2 10 %')
         self.assertEqual(perf.pstates_text([{'P8': 0.5, 'P10': 0.5}]), 'P8 50 %, P10 50 %')
 
+    def test_slow_runs_of_round_1(self):
+        """Round 1's uncapped surface: the two new runs in the NVIDIA's slow state, and only
+        them."""
+        case = Case('rtx', 'surface', 16, 0)
+        r = round1_surface()
+        found = perf.slow_runs(case, r['base'], r['new'])
+        self.assertEqual([(side, i) for side, i, _, _ in found], [('new', 1), ('new', 2)])
+        self.assertEqual([(slow, seconds) for _, _, slow, seconds in found], [(19, 20), (10, 20)])
+        self.assertEqual(perf.slow_runs(Case('rtx', 'surface', 16, 144), r['base'], r['new']), [],
+                         'capped runs sit at the cap')
+        self.assertEqual(perf.slow_runs(case, [], r['new']), [], 'a first round')
+        self.assertEqual(perf.spread_text(case, r), ' (ahora 2043..2291)')
+        self.assertEqual(perf.spread_text(Case('rtx', 'surface', 16, 144), r), '')
+        # Without the slow runs the base is not slow against the new one either.
+        fast = round1_surface(new=ROUND1_SURFACE['new'][:1])
+        self.assertEqual(perf.slow_runs(case, fast['base'], fast['new']), [])
+        self.assertEqual(perf.spread_text(case, fast), '')
+
+    def test_a_short_dip_is_not_a_slow_run(self):
+        """Two seconds under the other side (a bisect base run had that) are no slow state."""
+        case = Case()
+        base = [metrics(fps=1000, fps_s=[1000] * 20) for _ in range(3)]
+        dip = [1000] * 20
+        dip[3] = dip[11] = 850
+        self.assertEqual(perf.slow_runs(case, base, [metrics(fps_s=dip)]), [])
+        dip[4] = dip[5] = dip[6] = 850
+        self.assertEqual(perf.slow_runs(case, base, [metrics(fps_s=dip)]), [('new', 0, 5, 20)])
+        self.assertEqual(perf.slow_seconds(metrics(fps_s=[900, None]), [metrics(fps_s=[1000])]),
+                         (1, 1), 'the seconds both have')
+        self.assertEqual(perf.slow_seconds(metrics(), base), (0, 0), 'runs from before fps_s')
+
     def info(self, **more):
         info = {'number': 3, 'date': '2026-10-20', 'tag': 'perf-control-3', 'new': 'a' * 40,
                 'base': 'bbbbbbbb', 'base_sha': 'b' * 40, 'base_tag': 'perf-control-2',
@@ -825,6 +947,31 @@ class CheckTest(unittest.TestCase):
                                                        'unmeasured': []}})
         self.assertIn(f'`just perf-bisect {case} bbbbbbbb aaaaaaaa --metric catch_up`', text)
         self.assertIn('(tag `perf-control-3`)', text)
+
+    def test_report_shows_the_slow_runs(self):
+        case = Case('rtx', 'surface', 16, 0)
+        r = dict(round1_surface(), errors=[], unmeasured=[])
+        text = perf.render_report(self.info(), {case: r})
+        self.assertIn('**Resultado:** sin empeoramientos claros.', text, 'the runs overlap')
+        self.assertIn('**Corridas lentas:** rtx/surface/r16/uncapped tiene corridas sin tope',
+                      text)
+        self.assertIn('| superficie, vuelo a 64, sin tope | 2308 -> 2155 (ahora 2043..2291) |',
+                      text)
+        self.assertIn('  - rtx/surface/r16/uncapped: ronda 2 de ahora (19 de 20 s lentos, 80.8 W '
+                      'contra 85.8 W de las demás), ronda 3 de ahora (10 de 20 s lentos, 80.5 W '
+                      'contra 85.8 W de las demás). Media de fps sin ellas: 2308 -> 2291.', text)
+        self.assertIn('[sin-tope-lento-2026-10.md](sin-tope-lento-2026-10.md)', text)
+        self.assertTrue(os.path.exists(os.path.join(perf.TREE, perf.SLOW_DOC)), perf.SLOW_DOC)
+        # Every run of a side slow: that can be the code.
+        slow = round1_surface(new=ROUND1_SURFACE['new'][1:2] * 3)
+        text = perf.render_report(self.info(), {case: dict(slow, errors=[], unmeasured=[])})
+        self.assertIn('Son todas las de ahora: puede que sea el código.', text)
+        self.assertIn('**Resultado:** empeoró en rtx/surface/r16/uncapped.', text)
+        # Nothing slow, nothing said.
+        fast = round1_surface(new=ROUND1_SURFACE['new'][:1])
+        text = perf.render_report(self.info(), {case: dict(fast, errors=[], unmeasured=[])})
+        self.assertNotIn('Corridas lentas', text)
+        self.assertNotIn('..', text.split('## Notas')[0].replace('../', ''))
 
     def test_first_report(self):
         results = {Case(): {'base': [], 'new': [metrics()], 'errors': [], 'unmeasured': []}}
@@ -1082,10 +1229,46 @@ class BisectRunTest(FakeMachine):
         self.assertEqual(code, 2, out)
         self.assertIn('nothing to look for (--metric M', out)
         self.said.clear()
-        code, out = self.bisect('--metric', 'catch_up', '--rounds', '2', c2=late, c3=late, c4=late)
+        with mock.patch.object(runs, 'measure', wraps=runs.measure) as measure:
+            code, out = self.bisect('--metric', 'catch_up', '--rounds', '2', c2=late, c3=late,
+                                    c4=late)
         self.assertEqual(code, 1, out)
         self.assertIn('first bad commit: c2', out)
         self.assertIn('catch_up: 20 -> 30 WORSE', out)
+        self.assertIn('catch_up per run: base 20 / 20, new 30 / 30', out)
+        self.assertTrue(all(c.kwargs['nvidia'] for c in measure.call_args_list),
+                        'the bisect samples the NVIDIA on the RTX, like the round')
+
+    def test_the_metric_rule_refuses_the_smoke_thresholds(self):
+        """--fps-min and --p99-max only set the smoke check: with --metric they did nothing."""
+        for option in (['--fps-min', '0.95'], ['--p99-max', '1.2']):
+            code, out = self.bisect('--metric', 'fps', *option)
+            self.assertEqual(code, 64, out)
+            self.assertIn('--fps-min and --p99-max set the smoke check', out)
+        self.assertEqual(calls(self.binaries['c0'].path), 0, 'nothing ran')
+        self.said.clear()
+        slow = {'data': summary(fps=900)}
+        code, out = self.bisect('--fps-min', '0.95', c3=slow, c4=slow)
+        self.assertEqual(code, 1, out)
+        self.assertIn('first bad commit: c3', out)
+
+    def test_slow_runs_are_named(self):
+        """A run in the NVIDIA's slow state shows in the bisect, with the mean without it."""
+        rounds = [summary(fps=1000, timeline_fps=[1000] * 4)] * 2
+        slow = summary(fps=880, timeline_fps=[880] * 4)
+        sides = {'base': [runs.metrics(s, []) for s in rounds],
+                 'new': [runs.metrics(s, []) for s in (rounds[0], slow)]}
+        lines = perf.slow_lines(Case(), sides)
+        self.assertEqual(lines[0], '    slow run: new 2 is over 8% under the base runs in 4 of 4 s')
+        self.assertIn("without them fps is 1000 -> 1000; a slow run among normal ones is the "
+                      "GPU's slow state, not the code", lines[1])
+        self.assertEqual(perf.slow_lines(Case(cap=144), sides), [])
+
+    def test_smoke_limits(self):
+        a = perf.parser().parse_args(['smoke'])
+        self.assertEqual(perf.smoke_limits(a), (perf.FPS_MIN, perf.P99_MAX))
+        a = perf.parser().parse_args(['smoke', '--fps-min', '0.9', '--p99-max', '1.2'])
+        self.assertEqual(perf.smoke_limits(a), (0.9, 1.2))
 
 
 class RecipesTest(unittest.TestCase):

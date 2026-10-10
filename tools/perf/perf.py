@@ -28,7 +28,8 @@ the plan; --off-main measures another commit without touching the checkpoints.
 bisect (`just perf-bisect CASE GOOD BAD`): the smoke check of CASE against GOOD on the
 first-parent commits (the merges) of GOOD..BAD, by halves, to find the first bad one. With
 --metric M (what the checkpoint report flagged), the checkpoint rule of M on 3 interleaved runs
-of 20 s per side instead.
+of 20 s per side instead; --fps-min and --p99-max belong to the smoke check and are refused with
+it. On the RTX it samples the NVIDIA state like the checkpoint round.
 
 A run that overlapped a build or another benchmark, or that the compositor throttled, is redone;
 one that still does not count after 4 attempts never feeds a verdict. Builds go through
@@ -48,6 +49,7 @@ import json
 import math
 import os
 import shutil
+import statistics
 import subprocess
 import sys
 import time
@@ -550,8 +552,8 @@ def cmd_smoke(a):
                                        'earlier case'))
             say(f'  {c}: {results[-1].verdict()}')
             continue
-        results.append(smoke_case(c, base, new, folder, a.duration, i % 2 == 1, a.fps_min,
-                                  a.p99_max, a.nvidia))
+        results.append(smoke_case(c, base, new, folder, a.duration, i % 2 == 1,
+                                  *smoke_limits(a), a.nvidia))
     code = exit_code(results)
     say()
     say(smoke_table(results))
@@ -672,6 +674,106 @@ def pstates_text(shares):
     return ', '.join(f'{k} {v * 100:.0f} %' for k, v in avg.items() if v >= 0.005)
 
 
+# Uncapped, the NVIDIA sometimes runs a whole stretch about 12 % slower at the same clock and with
+# less power, with either binary (docs/rendimiento/sin-tope-lento-2026-10.md). The path of each
+# scenario is fixed, so runs compare second by second: a run is slow when it is over SLOW_DROP
+# under the other side's median of the same second in SLOW_SHARE of its seconds or more. In
+# checkpoint round 1, one or two such runs in three pulled the uncapped fps of a case down 5 to
+# 7 % and the worse() rule rightly ignored it (the runs overlap); no other run of that round, or
+# of the bisects and smokes after it, had over 2 such seconds in 20. The report shows each side's
+# slowest and fastest run when they spread over SPREAD of the mean.
+SLOW_DROP = 0.08
+SLOW_SHARE = 0.25
+SPREAD = 0.05
+SLOW_DOC = 'docs/rendimiento/sin-tope-lento-2026-10.md'
+
+
+def slow_seconds(run, others):
+    """(seconds of `run` over SLOW_DROP under the median of `others` at the same second,
+    seconds compared), from the fps of each second (metrics `fps_s`)."""
+    mine = run.get('fps_s') or []
+    theirs = [o['fps_s'] for o in others if o.get('fps_s')]
+    if not mine or not theirs:
+        return 0, 0
+    seconds = min(len(mine), *map(len, theirs))
+    slow = 0
+    for i in range(seconds):
+        ref = [t[i] for t in theirs if t[i] is not None]
+        if mine[i] is not None and ref and mine[i] < (1 - SLOW_DROP) * statistics.median(ref):
+            slow += 1
+    return slow, seconds
+
+
+def slow_runs(case, base, new):
+    """The slow runs (see SLOW_DROP) of an uncapped case, against the other side's runs:
+    [(side, index in its side, slow seconds, seconds compared)]."""
+    if case.cap or not base or not new:
+        return []
+    out = []
+    for side, mine, other in (('base', base, new), ('new', new, base)):
+        for i, m in enumerate(mine):
+            slow, seconds = slow_seconds(m, other)
+            if seconds and slow >= SLOW_SHARE * seconds:
+                out.append((side, i, slow, seconds))
+    return out
+
+
+def fps_range(side):
+    """(slowest, fastest) fps of the runs of a side when they spread over SPREAD of the mean."""
+    fps = [m['fps'] for m in side if m.get('fps')]
+    if len(fps) < 2 or max(fps) - min(fps) <= SPREAD * mean(fps):
+        return None
+    return min(fps), max(fps)
+
+
+def watts(side):
+    """Mean NVIDIA power of the runs of a side (metrics `nv`), or None."""
+    return mean([(m.get('nv') or {}).get('power_w') for m in side])
+
+
+def without_slow(r, found):
+    """{side: its runs that are not slow} of a case's results `r` and its slow runs `found`."""
+    marked = {(side, i) for side, i, _, _ in found}
+    return {side: [m for i, m in enumerate(r[side]) if (side, i) not in marked]
+            for side in ('base', 'new')}
+
+
+def spread_text(case, r):
+    """For the fps cell of an uncapped case: each side's slowest and fastest run when they
+    spread over SPREAD, ' (ahora 2043..2291)'."""
+    if case.cap or not r['new']:
+        return ''
+    parts = [f'{name} {fmt(span[0])}..{fmt(span[1])}'
+             for side, name in (('base', 'antes'), ('new', 'ahora'))
+             if (span := fps_range(r[side]))]
+    return f" ({', '.join(parts)})" if parts else ''
+
+
+def slow_note(case, r, found):
+    """The Spanish note on the slow runs `found` of a case: which, how slow, their power, and
+    the mean fps without them."""
+    names = {'base': 'antes', 'new': 'ahora'}
+    rest = without_slow(r, found)
+    normal = watts(rest['base'] + rest['new'])
+    items = []
+    for side, i, slow, seconds in found:
+        m = r[side][i]
+        text = f"ronda {m.get('round', i + 1)} de {names[side]} ({slow} de {seconds} s lentos"
+        power = (m.get('nv') or {}).get('power_w')
+        if power is not None and normal is not None:
+            text += f', {power:.1f} W contra {normal:.1f} W de las demás'
+        items.append(text + ')')
+    text = f"  - {case}: {', '.join(items)}."
+    if rest['base'] and rest['new']:
+        text += (f" Media de fps sin ellas: {fmt(mean(x['fps'] for x in rest['base']))} -> "
+                 f"{fmt(mean(x['fps'] for x in rest['new']))}.")
+    else:
+        side = 'base' if not rest['base'] else 'new'
+        text += (f' Son todas las de {names[side]}: puede que sea el código. Mirar sus .nv.csv '
+                 '(reloj, potencia y clocks_event_reasons).')
+    return text
+
+
 COLUMNS = [('fps', 'fps'), ('p50', 'p50 ms'), ('p99', 'p99 ms'), ('slow', 'Frames lentos'),
            ('skipped', 'Refrescos salteados'), ('catch_up', 'Puesta al día ms')]
 
@@ -732,6 +834,11 @@ def render_report(info, results):
     else:
         partial = ' en lo que se pudo medir' if incomplete or failed else ''
         lines += [f'**Resultado:** sin empeoramientos claros{partial}.', '']
+    slow = {c: found for c, r in results.items() if (found := slow_runs(c, r['base'], r['new']))}
+    if slow:
+        verb = 'tiene' if len(slow) == 1 else 'tienen'
+        lines += [f"**Corridas lentas:** {', '.join(map(str, slow))} {verb} corridas sin tope "
+                  'mucho más lentas que la otra versión, que mueven la media (ver las notas).', '']
     for gpu in ('rtx', '780m'):
         rows = [(c, r) for c, r in results.items() if c.gpu == gpu]
         if not rows:
@@ -742,6 +849,7 @@ def render_report(info, results):
                   '|---|' + '---:|' * len(COLUMNS) + ('---|' if nvidia else '')]
         for case, r in rows:
             cells = [case.label] + [cell(case, m, r['base'], r['new']) for m, _ in COLUMNS]
+            cells[1] += spread_text(case, r)  # the fps column
             if nvidia:
                 ps = [pstates_text(x['pstates'] for x in side) for side in (r['base'], r['new'])]
                 cells.append(f'{ps[0]} -> {ps[1]}' if r['base'] else ps[1])
@@ -763,6 +871,15 @@ def render_report(info, results):
             lines.append(f'- {c} falló: {e}')
         for u in r.get('unmeasured', []):
             lines.append(f'- {c} no cuenta: {u}')
+    if slow:
+        lines.append('- Corridas lentas sin tope: en un cuarto de sus segundos o más van más de '
+                     'un 8 % por debajo de la otra versión en el mismo segundo (el recorrido es '
+                     'fijo). Una entre otras que van bien es un estado lento de la GPU, no el '
+                     'código: en la RTX va al mismo reloj y con menos potencia (ver '
+                     '[sin-tope-lento-2026-10.md](sin-tope-lento-2026-10.md)). Si la corrida más '
+                     'lenta y la más rápida de un lado se separan más de un 5 %, la celda de fps '
+                     'las muestra.')
+        lines += [slow_note(c, results[c], found) for c, found in slow.items()]
     lines += [f"- Corridas descartadas y repetidas: {info['discarded']} (una compilación, otra "
               'carga o el compositor a 30 fps).']
     if info.get('noisy'):
@@ -866,7 +983,7 @@ def cmd_check(a):
         if side == 'base' and run.ran:
             base_ran.add(case)
         if run.counts:
-            results[case][side].append(run.metrics)
+            results[case][side].append(dict(run.metrics, round=r + 1))
         elif run.error:
             results[case]['errors'].append(f'{side}, ronda {r + 1}: {run.error}')
             if side == 'new':
@@ -942,13 +1059,20 @@ def metric_bad(case, base, new, folder, metrics, rounds, duration):
         return True
     pairs = []
     for r in range(rounds):
-        b, n = run_pair(case, base, new, folder, f'-{r + 1}', r % 2 == 1, duration)
+        b, n = run_pair(case, base, new, folder, f'-{r + 1}', r % 2 == 1, duration,
+                        nvidia=case.gpu == 'rtx')
         if new_failed(b, n):
             say(f'    FAILED: new run {n.error}')
             return True
         if not (b and b.counts and n and n.counts):
             raise PerfError(f'could not measure {new}: {unmeasured_reason([(b, n)])}')
         pairs.append((b.metrics, n.metrics))
+    sides = {'base': [p[0] for p in pairs], 'new': [p[1] for p in pairs]}
+    for m in metrics:
+        each = {s: ' / '.join(fmt(v) for v in values(case, m, sides[s])) for s in sides}
+        say(f"    {m} per run: base {each['base']}, new {each['new']}")
+    for line in slow_lines(case, sides):
+        say(line)
     bad = False
     for m in metrics:
         b, n = values(case, m, [p[0] for p in pairs]), values(case, m, [p[1] for p in pairs])
@@ -958,8 +1082,41 @@ def metric_bad(case, base, new, folder, metrics, rounds, duration):
     return bad
 
 
+def slow_lines(case, sides):
+    """What the bisect says of the slow runs (see SLOW_DROP) of an uncapped case."""
+    found = slow_runs(case, sides['base'], sides['new'])
+    if not found:
+        return []
+    other = {'base': 'new', 'new': 'base'}
+    rest = without_slow(sides, found)
+    normal = watts(rest['base'] + rest['new'])
+    out = []
+    for side, i, slow, seconds in found:
+        power = (sides[side][i].get('nv') or {}).get('power_w')
+        text = (f'    slow run: {side} {i + 1} is over {SLOW_DROP:.0%} under the {other[side]} '
+                f'runs in {slow} of {seconds} s')
+        if power is not None and normal is not None:
+            text += f' ({power:.1f} W, the others {normal:.1f} W)'
+        out.append(text)
+    if rest['base'] and rest['new']:
+        out.append(f"    without them fps is {fmt(mean(m['fps'] for m in rest['base']))} -> "
+                   f"{fmt(mean(m['fps'] for m in rest['new']))}; a slow run among normal ones is "
+                   f"the GPU's slow state, not the code ({SLOW_DOC})")
+    return out
+
+
+def smoke_limits(a):
+    """(fps_min, p99_max) of the smoke check: the options, else FPS_MIN and P99_MAX."""
+    return (FPS_MIN if a.fps_min is None else a.fps_min,
+            P99_MAX if a.p99_max is None else a.p99_max)
+
+
 def cmd_bisect(a):
     no_quiet_slot()
+    if a.metric and (a.fps_min is not None or a.p99_max is not None):
+        raise ValueError('--fps-min and --p99-max set the smoke check, and --metric judges with '
+                         'the checkpoint rule instead (fps 10 % worse and no overlap between the '
+                         'runs), so they would do nothing: leave them out, or drop --metric')
     case = runs.parse_case(a.case, Case(extra=tuple(a.extra)))
     good_sha, bad_sha = commit(a.good), commit(a.bad)
     commits = git('rev-list', '--first-parent', '--reverse', f'{good_sha}..{bad_sha}').split()
@@ -986,8 +1143,9 @@ def cmd_bisect(a):
             if a.metric:
                 verdicts[i] = metric_bad(case, good, new, where, a.metric, a.rounds, duration)
             else:
-                result = smoke_case(case, good, new, where, duration, fps_min=a.fps_min,
-                                    p99_max=a.p99_max)
+                fps_min, p99_max = smoke_limits(a)
+                result = smoke_case(case, good, new, where, duration, fps_min=fps_min,
+                                    p99_max=p99_max, nvidia=case.gpu == 'rtx')
                 if result.status in ('unmeasured', 'skipped'):
                     raise PerfError(f'could not measure {sha[:8]}: {result.verdict()}')
                 verdicts[i] = result.status in ('worse', 'failed')
@@ -1023,9 +1181,10 @@ def parser():
     p = argparse.ArgumentParser(prog='perf.py', description=__doc__.split('\n\n')[0])
     sub = p.add_subparsers(dest='command', required=True)
     thresholds = argparse.ArgumentParser(add_help=False)
-    thresholds.add_argument('--fps-min', type=float, default=FPS_MIN,
+    # None: the default (FPS_MIN, P99_MAX), so the bisect can tell when one is given.
+    thresholds.add_argument('--fps-min', type=float,
                             help='fail under this share of the base fps (default 0.85)')
-    thresholds.add_argument('--p99-max', type=float, default=P99_MAX,
+    thresholds.add_argument('--p99-max', type=float,
                             help='fail over this multiple of the base p99 (default 1.5)')
     s = sub.add_parser('smoke', parents=[thresholds], help='level 1: base against this tree')
     s.add_argument('cases', nargs='*', help=f"default: {' '.join(DEFAULT_SMOKE)}")

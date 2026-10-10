@@ -95,6 +95,23 @@ just perf-bisect rtx/surface/r16/144 perf-control-3 main
 just perf-bisect rtx/surface/r16/uncapped perf-control-3 main --metric catch_up
 ```
 
+`--fps-min` y `--p99-max` solo cambian la regla del smoke, así que el bisect con `--metric` los
+rechaza. El bisect muestra los números de cada corrida.
+
+Sin tope, a veces la RTX pasa una corrida entera, o un tramo largo, un 12 % más lenta al mismo
+reloj y con menos potencia, con cualquier binario
+([rendimiento/sin-tope-lento-2026-10.md](rendimiento/sin-tope-lento-2026-10.md)). Una corrida así
+entre otras normales baja la media un 5 a 7 % sin que el código cambie. Como el recorrido de cada
+escenario es fijo, el informe y el bisect comparan cada segundo con el de la otra versión.
+Nombran las corridas que van más de un 8 % por debajo en un cuarto de sus segundos o más, y dan
+la media sin ellas. En el informe, la celda de fps muestra la corrida más lenta y la más rápida
+de un lado cuando se separan más de un 5 %.
+
+En la RTX, la ronda y el bisect (y el smoke con `--nvidia`) dejan el estado de la NVIDIA en el
+`.nv.csv` de cada corrida: P-state, relojes, potencia, uso, `clocks_event_reasons.active` (la
+máscara de motivos por los que la GPU baja su reloj o su trabajo), temperatura y la frecuencia
+media de la CPU.
+
 ### Cómo se cuida el ruido
 
 Antes de cada corrida el harness espera a que no compile nada (rustc, cargo, linker), a que no
