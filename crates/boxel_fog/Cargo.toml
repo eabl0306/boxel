@@ -7,11 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[dependencies]
-# Chunk layout of the sky tiles the ground map reads (CHUNK_SHIFT, 32x32 columns).
-boxel_voxel.workspace = true
-
 [dev-dependencies]
+# The world's limits (MAX_BLOCK_COORD) for the far-from-origin tests (ADR 0014).
+boxel_voxel.workspace = true
 proptest.workspace = true
 
 [lints]

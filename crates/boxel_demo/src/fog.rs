@@ -1,9 +1,9 @@
 //! Fog and cloud presets of the demo world (issue #47, ADR 0030): the look of the example game,
-//! not the engine's. The terrain sits between y = 16 and 112 with the sea at 46
-//! ([`crate::worldgen`]), so the valley fog pools around sea level and the clouds float well
-//! above every hill.
+//! not the engine's. The terrain sits between y = 16 and 112 with the sea's top water block at
+//! 46 ([`crate::worldgen`]), so the valley fog lies on the sea and the low ground and the clouds
+//! float well above every hill.
 
-use boxel_fog::{FogFade, FogGround, FogLayer, FogNoise, NoiseDims, density_for_visibility};
+use boxel_fog::{FogFade, FogLayer, FogNoise, NoiseDims, density_for_visibility};
 
 /// Minecraft-like clouds: flat 12x4x12 blocks at y 192..196, crisp, white, drifting 2 blocks a
 /// second along +x, faded out by 768 blocks.
@@ -29,9 +29,9 @@ pub fn clouds() -> FogLayer {
     }
 }
 
-/// Valley fog: banks of 2-block cubes from y 40 to 64 that pool in the low ground (6 blocks over
-/// the lowest ground within 8 texels), seen about 40 blocks through, taking a third of the sky's
-/// color, drifting slowly.
+/// Valley fog: banks of 2-block cubes from y 48 to 64, just over the sea (its water ends at 47,
+/// so no fog lies under it) and on the low ground around it, seen about 40 blocks through,
+/// taking a third of the sky's color, drifting slowly.
 pub fn valley() -> FogLayer {
     FogLayer {
         cell: [2, 2, 2],
@@ -47,12 +47,8 @@ pub fn valley() -> FogLayer {
         color: [0.92, 0.94, 1.0],
         sky_tint: 0.35,
         wind: [0.6, 0.0, 0.3],
-        ground: FogGround::Pooled {
-            depth: 6,
-            radius: 8,
-        },
         max_distance: 384.0,
-        ..FogLayer::new(40, 64)
+        ..FogLayer::new(48, 64)
     }
 }
 
@@ -104,7 +100,7 @@ mod tests {
             vec![blanket(0, 256, 40.0)],
             sunset(),
         ] {
-            assert_eq!(boxel_fog::validate(&layers, 4, 64), Ok(()), "{layers:?}");
+            assert_eq!(boxel_fog::validate(&layers, 64), Ok(()), "{layers:?}");
         }
     }
 }

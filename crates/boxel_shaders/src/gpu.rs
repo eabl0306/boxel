@@ -51,20 +51,16 @@ pub struct ViewUniform {
 
 /// Layers the fog uniform holds (`boxel_fog::MAX_FOG_LAYERS`).
 pub const FOG_MAX_LAYERS: usize = 4;
-/// `vec4<u32>` words of the fog ground map: 64x64 texels of 16 bits.
-pub const FOG_GROUND_WORDS: usize = 512;
 /// Byte offset of the layers in the fog uniform buffer.
 pub const FOG_LAYERS_OFFSET: u64 = size_of::<FogHeader>() as u64;
-/// Byte offset of the ground map in the fog uniform buffer.
-pub const FOG_GROUND_OFFSET: u64 =
+/// Bytes of the whole fog uniform buffer: header and layers.
+pub const FOG_BUFFER_SIZE: u64 =
     FOG_LAYERS_OFFSET + (FOG_MAX_LAYERS * size_of::<FogLayerGpu>()) as u64;
-/// Bytes of the whole fog uniform buffer: header, layers, ground map.
-pub const FOG_BUFFER_SIZE: u64 = FOG_GROUND_OFFSET + 16 * FOG_GROUND_WORDS as u64;
 // GL 3.3 guarantees 16 KiB per uniform block.
 const _: () = assert!(FOG_BUFFER_SIZE <= 16384);
 
-/// The per-frame header of the uniform `Fog` (`fog.wgsl`, 128 bytes, std140: only vec4
-/// members). The layers ([`FogLayerGpu`]) and the ground map follow it.
+/// The per-frame header of the uniform `Fog` (`fog.wgsl`, 112 bytes, std140: only vec4
+/// members). The layers ([`FogLayerGpu`]) follow it.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct FogHeader {
@@ -81,8 +77,6 @@ pub struct FogHeader {
     pub counts: [u32; 4],
     /// rgb = sky color (where layers fade to), a = 0.
     pub sky: [f32; 4],
-    /// The ground map's placement (reserved).
-    pub ground: [i32; 4],
     /// xyz = first cell of the debug coverage grid (`fs_fog_debug_coverage`), w = 0.
     pub debug: [i32; 4],
 }

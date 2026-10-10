@@ -11,10 +11,6 @@ pub const MAX_FOG_DISTANCE: f32 = 4096.0;
 pub const MAX_CELL: u32 = 32;
 /// Largest noise scale, in cells per lattice step.
 pub const MAX_SCALE: u32 = 64;
-/// Largest ground texel ([`validate`]), in blocks.
-pub const MAX_GROUND_TEXEL: u32 = 16;
-/// Height a ground-mode layer may span, in blocks: the ground map stores heights in a byte.
-pub const MAX_GROUND_SPAN: i64 = 254;
 /// Largest step budget of the march ([`validate`]).
 pub const MAX_STEPS: u32 = 256;
 
@@ -52,8 +48,6 @@ pub struct FogLayer {
     pub face_shade: [f32; 4],
     /// Wind in blocks per second. `y` only moves [`NoiseDims::Volume`] noise.
     pub wind: [f32; 3],
-    /// How the layer meets the terrain.
-    pub ground: FogGround,
     /// The farthest the layer is drawn (blocks along the ray), `(0, 4096]`.
     pub max_distance: f32,
     /// How the layer fades into the sky with distance.
@@ -76,16 +70,9 @@ impl FogLayer {
             sky_tint: 0.0,
             face_shade: DEFAULT_FACE_SHADE,
             wind: [0.0; 3],
-            ground: FogGround::Free,
             max_distance: 512.0,
             fade: FogFade::Scene,
         }
-    }
-
-    /// True if the layer reads the ground map ([`FogGround::AboveGround`] or
-    /// [`FogGround::Pooled`]).
-    pub fn uses_ground(&self) -> bool {
-        !matches!(self.ground, FogGround::Free)
     }
 }
 
@@ -126,26 +113,6 @@ pub enum NoiseDims {
     Flat,
     /// Over x, y and z (fog banks).
     Volume,
-}
-
-/// How a layer meets the terrain. The ground comes from the sky tops of the light (ADR 0015),
-/// never from the blocks: water and leaves are ground.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum FogGround {
-    /// The band as it is: fog fills caves and overhangs inside it too.
-    #[default]
-    Free,
-    /// Only above the ground of each column: nothing under the surface, water or caves.
-    AboveGround,
-    /// Above the ground and only up to a fill level that pools in the valleys: the lowest
-    /// ground within `radius` ground texels plus `depth` blocks (at most `max_y`). One per set
-    /// of layers.
-    Pooled {
-        /// Blocks of fog over the regional floor.
-        depth: u32,
-        /// Radius of the regional floor, in ground texels.
-        radius: u32,
-    },
 }
 
 /// How a layer fades into the sky color with distance.
@@ -201,13 +168,6 @@ pub enum FogError {
     NonFinite(usize),
     /// `max_distance` outside `(0, 4096]`, or a fade range that is empty or negative.
     BadDistance(usize),
-    /// More than one [`FogGround::Pooled`] layer.
-    TwoPooled,
-    /// The layers that read the ground span more than 254 blocks.
-    GroundSpan,
-    /// The ground texel is not a power of two in `1..=16`, or a ground-mode layer's cells along
-    /// x or z do not divide it.
-    GroundTexel,
     /// The step budget is outside `1..=256`.
     BadSteps,
 }
@@ -240,16 +200,6 @@ impl std::fmt::Display for FogError {
                 f,
                 "fog layer {i}: max_distance goes up to {MAX_FOG_DISTANCE} and a fade range must not be empty"
             ),
-            FogError::TwoPooled => write!(f, "at most one pooled fog layer"),
-            FogError::GroundSpan => write!(
-                f,
-                "the fog layers that follow the ground span more than {MAX_GROUND_SPAN} blocks"
-            ),
-            FogError::GroundTexel => write!(
-                f,
-                "the ground texel must be a power of two up to {MAX_GROUND_TEXEL} and a multiple of \
-                 the cells of the layers that follow the ground"
-            ),
             FogError::BadSteps => write!(f, "the fog step budget goes from 1 to {MAX_STEPS}"),
         }
     }
@@ -257,9 +207,8 @@ impl std::fmt::Display for FogError {
 
 impl std::error::Error for FogError {}
 
-/// Checks a set of layers, the ground texel (blocks per ground map texel) and the step budget
-/// against the limits of the march.
-pub fn validate(layers: &[FogLayer], ground_texel: u32, max_steps: u32) -> Result<(), FogError> {
+/// Checks a set of layers and the step budget against the limits of the march.
+pub fn validate(layers: &[FogLayer], max_steps: u32) -> Result<(), FogError> {
     if layers.len() > MAX_FOG_LAYERS {
         return Err(FogError::TooManyLayers(layers.len()));
     }
@@ -275,30 +224,6 @@ pub fn validate(layers: &[FogLayer], ground_texel: u32, max_steps: u32) -> Resul
                 return Err(FogError::Overlapping(i, j));
             }
         }
-    }
-    let pooled = layers
-        .iter()
-        .filter(|l| matches!(l.ground, FogGround::Pooled { .. }))
-        .count();
-    if pooled > 1 {
-        return Err(FogError::TwoPooled);
-    }
-    let ground: Vec<&FogLayer> = layers.iter().filter(|l| l.uses_ground()).collect();
-    if let (Some(lo), Some(hi)) = (
-        ground.iter().map(|l| l.min_y).min(),
-        ground.iter().map(|l| l.max_y).max(),
-    ) && hi.saturating_sub(lo) > MAX_GROUND_SPAN
-    {
-        return Err(FogError::GroundSpan);
-    }
-    if !ground.is_empty()
-        && (!ground_texel.is_power_of_two()
-            || ground_texel > MAX_GROUND_TEXEL
-            || ground.iter().any(|l| {
-                !ground_texel.is_multiple_of(l.cell[0]) || !ground_texel.is_multiple_of(l.cell[2])
-            }))
-    {
-        return Err(FogError::GroundTexel);
     }
     Ok(())
 }
@@ -348,7 +273,7 @@ mod tests {
     use super::*;
 
     fn ok(layers: &[FogLayer]) -> Result<(), FogError> {
-        validate(layers, 4, 64)
+        validate(layers, 64)
     }
 
     #[test]
@@ -440,37 +365,12 @@ mod tests {
         ] {
             assert_eq!(ok(&[with(bad)]), Err(FogError::BadDistance(0)));
         }
-        let pooled = |min, max| {
-            let mut l = FogLayer::new(min, max);
-            l.ground = FogGround::Pooled {
-                depth: 4,
-                radius: 4,
-            };
-            l
-        };
-        assert_eq!(ok(&[pooled(0, 8), pooled(8, 16)]), Err(FogError::TwoPooled));
-        let mut above = FogLayer::new(200, 300);
-        above.ground = FogGround::AboveGround;
-        assert_eq!(ok(&[pooled(0, 8), above]), Err(FogError::GroundSpan));
-        assert_eq!(validate(&[pooled(0, 8)], 3, 64), Err(FogError::GroundTexel));
         assert_eq!(
-            validate(&[pooled(0, 8)], 32, 64),
-            Err(FogError::GroundTexel)
-        );
-        let mut wide = pooled(0, 8);
-        wide.cell = [8, 1, 8];
-        assert_eq!(validate(&[wide], 4, 64), Err(FogError::GroundTexel));
-        assert_eq!(
-            validate(std::slice::from_ref(&base), 3, 64),
-            Ok(()),
-            "the texel only matters with ground layers"
-        );
-        assert_eq!(
-            validate(std::slice::from_ref(&base), 4, 0),
+            validate(std::slice::from_ref(&base), 0),
             Err(FogError::BadSteps)
         );
-        assert_eq!(validate(&[base], 4, 257), Err(FogError::BadSteps));
+        assert_eq!(validate(&[base], 257), Err(FogError::BadSteps));
         // Every error has a message.
-        assert!(FogError::GroundSpan.to_string().contains("254"));
+        assert!(FogError::BadSteps.to_string().contains("256"));
     }
 }

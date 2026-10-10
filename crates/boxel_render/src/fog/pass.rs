@@ -289,7 +289,6 @@ impl FogPass {
                 0,
             ],
             sky: [view.fog_color[0], view.fog_color[1], view.fog_color[2], 0.0],
-            ground: [0; 4],
             debug: [0; 4],
         };
         let mut gpu_layers = [FogLayerGpu::default(); FOG_MAX_LAYERS];

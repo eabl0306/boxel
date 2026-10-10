@@ -488,17 +488,17 @@ fn low_tier_takes_the_quad_and_its_light_as_two_instance_attributes() {
     assert_eq!(attributes, 1);
 }
 
-/// The fog uniform (ADR 0030) as naga lays it out: header, four layers, the ground map, within
-/// the 16 KiB GL 3.3 guarantees for one uniform block.
+/// The fog uniform (ADR 0030) as naga lays it out: header and four layers, within the 16 KiB
+/// GL 3.3 guarantees for one uniform block.
 #[test]
 fn fog_uniform_layout_matches_the_rust_mirrors() {
-    use boxel_shaders::gpu::{FOG_BUFFER_SIZE, FOG_GROUND_OFFSET, FOG_LAYERS_OFFSET};
+    use boxel_shaders::gpu::{FOG_BUFFER_SIZE, FOG_LAYERS_OFFSET};
     use std::mem::{offset_of, size_of};
     let (module, _) = load(ShaderModuleId::Fog);
     let (size, offsets) = struct_layout(&module, "Fog");
     assert_eq!(u64::from(size), FOG_BUFFER_SIZE);
     const { assert!(FOG_BUFFER_SIZE <= 16384) };
-    assert_eq!(size_of::<FogHeader>(), 128);
+    assert_eq!(size_of::<FogHeader>(), 112);
     let header = [
         offset_of!(FogHeader, ray0),
         offset_of!(FogHeader, ray_x),
@@ -506,12 +506,10 @@ fn fog_uniform_layout_matches_the_rust_mirrors() {
         offset_of!(FogHeader, eye),
         offset_of!(FogHeader, counts),
         offset_of!(FogHeader, sky),
-        offset_of!(FogHeader, ground),
         offset_of!(FogHeader, debug),
     ];
-    assert_eq!(offsets[..8], header.map(|o| o as u32));
-    assert_eq!(u64::from(offsets[8]), FOG_LAYERS_OFFSET);
-    assert_eq!(u64::from(offsets[9]), FOG_GROUND_OFFSET);
+    assert_eq!(offsets[..7], header.map(|o| o as u32));
+    assert_eq!(u64::from(offsets[7]), FOG_LAYERS_OFFSET);
     let (size, offsets) = struct_layout(&module, "FogLayer");
     assert_eq!((size as usize, size_of::<FogLayerGpu>()), (208, 208));
     let layer = [

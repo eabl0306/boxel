@@ -16,8 +16,7 @@ pub(crate) use pass::{FogPass, read_words};
 pub use plugin::{FogClock, FogPlugin};
 
 pub use boxel_fog::{
-    FogError, FogFade, FogGround, FogLayer, FogNoise, FogResolution, NoiseDims,
-    density_for_visibility,
+    FogError, FogFade, FogLayer, FogNoise, FogResolution, NoiseDims, density_for_visibility,
 };
 
 use boxel_ecs::prelude::*;
@@ -37,20 +36,16 @@ pub struct FogSettings {
     /// Cells a ray visits at most over all layers (1 to 256, default 64); past it each layer
     /// uses its mean density.
     pub max_steps: u32,
-    /// Blocks per texel of the ground map (a power of two up to 16, default 4: the map reaches
-    /// 128 blocks around the camera).
-    pub ground_texel: u32,
 }
 
 impl Default for FogSettings {
-    /// Enabled, no layers, half resolution, 64 steps, ground texel 4.
+    /// Enabled, no layers, half resolution, 64 steps.
     fn default() -> Self {
         Self {
             enabled: true,
             layers: Vec::new(),
             resolution: FogResolution::Half,
             max_steps: 64,
-            ground_texel: 4,
         }
     }
 }
@@ -64,9 +59,9 @@ impl FogSettings {
         }
     }
 
-    /// Checks the layers, the step budget and the ground texel ([`boxel_fog::validate`]).
+    /// Checks the layers and the step budget ([`boxel_fog::validate`]).
     pub fn validate(&self) -> Result<(), FogError> {
-        boxel_fog::validate(&self.layers, self.ground_texel, self.max_steps)
+        boxel_fog::validate(&self.layers, self.max_steps)
     }
 }
 

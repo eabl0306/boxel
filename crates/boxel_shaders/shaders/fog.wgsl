@@ -57,12 +57,9 @@ struct Fog {
   counts: vec4<u32>,
   // rgb: sky color (the fade target).
   sky: vec4<f32>,
-  // reserved for the ground map.
-  ground: vec4<i32>,
   // xyz: first cell of the debug grid.
   debug: vec4<i32>,
   layers: array<FogLayer, 4>,
-  ground_map: array<vec4<u32>, 512>,
 };
 
 @group(0) @binding(0) var depth_tex: texture_2d<f32>;
