@@ -23,7 +23,13 @@ just perf-smoke dive cave-path         # los casos que toca la tarea
 just perf-smoke 780m/forest/144        # un caso es gpu/escenario/rN/tope, en cualquier orden
 just perf-smoke forest -- --bodies 10000   # opciones de stress, iguales en los dos lados
 just perf-smoke --base main            # otra base (por defecto, el merge base con main)
+just perf-smoke --base HEAD --new-extra '--fog valley' 780m/surface   # solo el lado nuevo
 ```
+
+`--new-extra` le pasa opciones de stress solo al lado nuevo, después de las que van tras `--`.
+Sirve para medir el costo de una opción con el mismo binario: con `--base HEAD` los dos lados son
+el mismo código y solo cambia la opción. La tabla y los nombres de los casos la muestran como
+`[new: ...]`.
 
 Compila la rama tal como está y toma el binario de la base de `bench-results/bins/<sha>/stress`.
 Si no está, lo compila en un worktree aparte, en `target-perf/` o en `PERF_TARGET_DIR`. Cada

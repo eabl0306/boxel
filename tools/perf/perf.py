@@ -2,8 +2,8 @@
 """boxel performance checks: the smoke check of each task, the checkpoint round and the bisect.
 
 usage:
-  perf.py smoke [--base REF|BIN] [--new REF|BIN] [--gpu G] [--radius N] [--cap N] [CASE...]
-                [-- STRESS OPTIONS]
+  perf.py smoke [--base REF|BIN] [--new REF|BIN] [--gpu G] [--radius N] [--cap N]
+                [--new-extra 'OPTIONS'] [CASE...] [-- STRESS OPTIONS]
   perf.py check [--base REF|BIN] [--ref REF] [--rounds N] [--dry-run] [--no-tag]
                 [--accept-partial] [--off-main]
   perf.py bisect CASE GOOD BAD [--metric M]... [-- STRESS OPTIONS]
@@ -17,7 +17,9 @@ fails only on a gross regression: fps under 85 % of the base, p99 over 1.5 times
 frames over 6.94 ms where the base had none. A failing pair is repeated once and only a second
 failure counts. Capped on the RTX, p99 only counts when both runs landed in the same skip mode
 (issue #5). Cases: surface and forest by default, on the RTX, radius 16, uncapped. Options after
-`--` go to stress on both sides (`-- --bodies 10000`).
+`--` go to stress on both sides (`-- --bodies 10000`); --new-extra 'OPTIONS' go to the new side
+only, after them, to price an option against the same binary without it (`--base HEAD
+--new-extra '--fog valley'`).
 
 check (level 2, `just perf-check`): the fixed matrix (`perf.py cases`), 3 interleaved runs of
 20 s per case and side, on a commit of main, against the binary of the last checkpoint
@@ -49,6 +51,7 @@ import hashlib
 import json
 import math
 import os
+import shlex
 import shutil
 import statistics
 import subprocess
@@ -453,7 +456,7 @@ def run_pair(case, base, new, folder, tag, flip, duration, nvidia=False):
         prefix = os.path.join(folder, side, case.slug + tag)
         os.makedirs(os.path.dirname(prefix), exist_ok=True)
         run = runs.measure(binary.path, case, prefix, f'{side}-{binary.label}', duration,
-                           nvidia=nvidia, say=say)
+                           nvidia=nvidia, say=say, side=side)
         done[side] = run
         say(run_line(side, run))
         if not run.counts and (side == 'base' or not run.error):
@@ -544,7 +547,8 @@ def merge_base():
 
 def cmd_smoke(a):
     no_quiet_slot()
-    default = Case(gpu=a.gpu, radius=a.radius, cap=a.cap, extra=tuple(a.extra))
+    default = Case(gpu=a.gpu, radius=a.radius, cap=a.cap, extra=tuple(a.extra),
+                   new_extra=tuple(shlex.split(a.new_extra or '')))
     cases = [runs.parse_case(text, default) for text in (a.cases or DEFAULT_SMOKE)]
     runs_s = sum(2 * runs.estimate_s(c, a.duration) for c in cases)
     say(f'perf-smoke: {len(cases)} cases, {2 * len(cases)} runs of {a.duration:g} s, about '
@@ -553,7 +557,9 @@ def cmd_smoke(a):
     new = resolve(a.new)
     base_md5, new_md5 = md5(base.path), md5(new.path)
     say(f'perf-smoke: base {base} (md5 {base_md5}), new {new} (md5 {new_md5})')
-    if base_md5 == new_md5 and base.path != new.path:
+    if default.new_extra:
+        say(f"perf-smoke: the new side also runs with {' '.join(default.new_extra)}")
+    elif base_md5 == new_md5 and base.path != new.path:
         say('perf-smoke: note: both binaries are the same, so the branch does not change stress '
             '(only docs, tests or tools) or a build reused the other one')
     folder = bench('smoke', stamp())
@@ -1265,7 +1271,8 @@ def cmd_cases(_):
     for name, args in runs.GPUS.items():
         say(f"gpu {name}: {' '.join(args)}")
     say(f"smoke default: {', '.join(DEFAULT_SMOKE)} (rtx, r16, uncapped); pick the cases your "
-        'task touches. Stress options after `--` go to both sides')
+        "task touches. Stress options after `--` go to both sides, --new-extra 'OPTIONS' to the "
+        'new side only')
     say('checkpoint matrix:')
     for case in MATRIX:
         say(f'  {case}')
@@ -1290,6 +1297,8 @@ def parser():
     s.add_argument('--cap', type=int, default=0, help='fps cap (default 0: uncapped)')
     s.add_argument('--duration', type=float, default=SMOKE_S)
     s.add_argument('--nvidia', action='store_true', help='sample the NVIDIA state (read only)')
+    s.add_argument('--new-extra', metavar='OPTIONS',
+                   help="stress options for the new side only, quoted ('--fog valley')")
     c = sub.add_parser('check', help='level 2: the checkpoint round')
     c.add_argument('--base', help='git ref or stress binary (default: the last checkpoint)')
     c.add_argument('--ref', default='HEAD', help='commit of main to measure (default HEAD)')

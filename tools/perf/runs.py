@@ -86,11 +86,16 @@ class Case:
     cap: int = 0
     # Extra stress options, the same on both sides (`just perf-smoke forest -- --bodies 10000`).
     extra: tuple = ()
+    # Extra stress options of the new side only, after `extra` (`perf.py smoke --new-extra
+    # '--fog valley'`): an option the new binary turns on, measured against the same binary
+    # without it (`--base HEAD`).
+    new_extra: tuple = ()
 
     def __str__(self):
         cap = str(self.cap) if self.cap else 'uncapped'
         name = f'{self.gpu}/{self.scenario}/r{self.radius}/{cap}'
-        return ' '.join((name, *self.extra))
+        new = (f"[new: {' '.join(self.new_extra)}]",) if self.new_extra else ()
+        return ' '.join((name, *self.extra, *new))
 
     @property
     def slug(self):
@@ -103,9 +108,11 @@ class Case:
         if self.radius != 16:
             text += f', radio {self.radius}'
         text += f', tope {self.cap}' if self.cap else ', sin tope'
-        return text + (f", {' '.join(self.extra)}" if self.extra else '')
+        text += f", {' '.join(self.extra)}" if self.extra else ''
+        return text + (f", solo el nuevo: {' '.join(self.new_extra)}" if self.new_extra else '')
 
-    def args(self, duration):
+    def args(self, duration, side='base'):
+        """The stress arguments of a run; the new side also gets `new_extra`."""
         s = SCENARIOS[self.scenario]
         big = self.radius > BIG_RADIUS
         args = ['--scenario', s.stress, *s.args, *GPUS[self.gpu], '--radius', str(self.radius),
@@ -113,7 +120,7 @@ class Case:
                 '--timeout', str(int(duration) + (240 if big else 150))]
         if big and '--world' in s.args:
             args += BIG_ARENA
-        return args + list(self.extra)
+        return args + list(self.extra) + (list(self.new_extra) if side == 'new' else [])
 
 
 def parse_case(text, default=Case()):
@@ -139,9 +146,9 @@ def parse_case(text, default=Case()):
         raise ValueError(f'{text!r}: caps under {MIN_CAP} hide the compositor\'s 30 fps throttle '
                          '(use 0 or uncapped, 144, ...)')
     case = Case(**fields)
-    plain = dataclasses.replace(case, extra=())
+    plain = dataclasses.replace(case, extra=(), new_extra=())
     own = {a for a in plain.args(1) if a.startswith('--')} | set(HARNESS_FLAGS)
-    taken = sorted({a for a in case.extra if a in own})
+    taken = sorted({a for a in (*case.extra, *case.new_extra) if a in own})
     if taken:
         raise ValueError(f"{text!r}: the case already sets {', '.join(taken)}; say it with the "
                          'case (gpu/scenario/rN/cap) or leave it out')
@@ -423,10 +430,11 @@ class Run:
         return self.metrics is not None and not self.error
 
 
-def run_once(binary, case, prefix, label, duration, nvidia=False):
-    """One run of `binary` on `case`, watched. Writes PREFIX.{md,csv,log,watch.json} (and
-    .nv.csv). Returns (rc, watch, measure start, nvidia samples)."""
-    args = [binary, *case.args(duration), '--label', label, '--csv', prefix + '.csv',
+def run_once(binary, case, prefix, label, duration, nvidia=False, side='base'):
+    """One run of `binary` on `case`, watched (`side` 'new' adds the case's new_extra). Writes
+    PREFIX.{md,csv,log,watch.json} (and .nv.csv). Returns (rc, watch, measure start, nvidia
+    samples)."""
+    args = [binary, *case.args(duration, side), '--label', label, '--csv', prefix + '.csv',
             '--summary', prefix + '.md']
     sampler = NvidiaSampler().start() if nvidia else None
     measure_at = None
@@ -480,10 +488,11 @@ def _discard(prefix, attempt):
                        os.path.join(folder, f'{os.path.basename(prefix)}.a{attempt}{ext}'))
 
 
-def measure(binary, case, prefix, label, duration, nvidia=False, attempts=None, say=print):
+def measure(binary, case, prefix, label, duration, nvidia=False, attempts=None, say=print,
+            side='base'):
     """A run of `case` that counts: on a quiet machine, redone up to `attempts` times when it
     overlapped something or was throttled. The waits for a quiet machine share one deadline
-    (PERF_MAX_WAIT)."""
+    (PERF_MAX_WAIT). `side` 'new' adds the case's new_extra options."""
     attempts = attempts or ATTEMPTS
     run = Run(case, prefix)
     max_wait = machine.default_wait_s()
@@ -497,7 +506,7 @@ def measure(binary, case, prefix, label, duration, nvidia=False, attempts=None, 
                 run.gave_up = True
                 return run
             rc, watch, measure_at, samples = run_once(binary, case, prefix, label, duration,
-                                                      nvidia)
+                                                      nvidia, side)
         run.seconds = time.monotonic() - start
         run.rc = rc
         if rc != 0:

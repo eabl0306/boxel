@@ -259,6 +259,18 @@ class CaseTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 runs.parse_case('forest', Case(extra=taken))
 
+    def test_new_side_options(self):
+        case = runs.parse_case('780m/surface', Case(extra=('--size', '1920x1080'),
+                                                    new_extra=('--fog', 'valley')))
+        self.assertEqual(case.args(10)[-2:], ['--size', '1920x1080'])
+        self.assertEqual(case.args(10, 'new')[-4:], ['--size', '1920x1080', '--fog', 'valley'])
+        self.assertEqual(str(case), '780m/surface/r16/uncapped --size 1920x1080 [new: --fog valley]')
+        self.assertEqual(case.slug, '780m-surface-r16-uncapped-size-1920x1080-new-fog-valley')
+        self.assertIn('solo el nuevo: --fog valley', case.label)
+        for taken in (('--radius', '8'), ('--csv', 'x'), ('--adapter', 'x')):
+            with self.assertRaises(ValueError):
+                runs.parse_case('forest', Case(new_extra=taken))
+
     def test_names_round_trip(self):
         for case in perf.MATRIX:
             self.assertEqual(runs.parse_case(str(case)), case)
@@ -714,8 +726,8 @@ class SmokeRunTest(FakeMachine):
         self.assertEqual(r.status, 'worse')
         self.assertIn('p99 13.90 ms over 1.5x 7.50 ms', r.verdict())
 
-    def cmd_smoke(self, cases, base, new, extra=()):
-        a = perf.parser().parse_args(['smoke', *cases, '--duration', '3'])
+    def cmd_smoke(self, cases, base, new, extra=(), flags=()):
+        a = perf.parser().parse_args(['smoke', *cases, '--duration', '3', *flags])
         a.extra = list(extra)
         with mock.patch.object(perf, 'resolve', side_effect=[base, new]), \
                 mock.patch.object(perf, 'root', return_value=self.dir), \
@@ -739,6 +751,20 @@ class SmokeRunTest(FakeMachine):
             with open(b.path + '.args') as f:
                 self.assertIn(' --bodies 10000 ', f.read())
         self.assertIn('rtx/forest/r16/uncapped --bodies 10000', self.output())
+
+    def test_cmd_smoke_passes_new_extra_options_to_the_new_side_only(self):
+        base, new = self.binary('base'), self.binary('new')
+        code = self.cmd_smoke(['forest'], base, new, extra=['--bodies', '10'],
+                              flags=['--new-extra', '--fog valley'])
+        self.assertEqual(code, 0, self.output())
+        with open(base.path + '.args') as f:
+            args = f.read()
+            self.assertIn(' --bodies 10 ', args)
+            self.assertNotIn('--fog', args)
+        with open(new.path + '.args') as f:
+            self.assertIn(' --bodies 10 --fog valley ', f.read())
+        self.assertIn('the new side also runs with --fog valley', self.output())
+        self.assertIn('rtx/forest/r16/uncapped --bodies 10 [new: --fog valley]', self.output())
 
     def test_cmd_smoke_notes_identical_binaries(self):
         base = self.binary('base')
