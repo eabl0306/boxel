@@ -139,19 +139,68 @@
 - `snapshot --outline X,Y,Z` dibuja el contorno de ese bloque con el color y el ancho por
   defecto, para ver el contorno en capturas sin ventana.
 
+### 7. Leer abajo solo cerca de bloques altos
+
+Basta con que el registro tenga una valla para que `reach` valga 0,5 en todo el mundo, aunque no
+haya ninguna cerca. Así, cada barrido y cada rayo de colisión pagaban las lecturas de más de las
+secciones 2 y 3 en todos lados (con criterion, contra cf11b4f: `raycast/sky_1024` +79 %,
+`tick/1000` +15 %).
+
+- `ChunkData::may_contain(&StateSet)` mira la paleta del chunk. Puede decir que sí de más (un
+  estado que quedó en la paleta sin uso), nunca que no de más. Guarda la respuesta para el último
+  conjunto preguntado y la borra con cualquier cambio de bloques (`set`, `blocks_mut`,
+  `compact`). No hace falta mantener una marca a mano en cada camino de escritura (generación,
+  ediciones, reglas de vecinos, ticks de bloques, cargas): todos pasan por esos métodos.
+- `VoxelSource::tall_free(chunk, table)`: el chunk está cargado y no tiene bloques altos. Por
+  defecto dice que no y se lee todo, como antes. `ChunkSource` y `TestWorld` responden con
+  `may_contain` y `CollisionTable::tall_states`.
+- **Barrido.** Pregunta una vez por los chunks que puede leer: la caja al inicio, al final y
+  subida por el escalón, más la fila de abajo y unos `eps`. Casi siempre es el chunk del bloque
+  de inicio. Si están libres, corre una copia del código sin bloques altos (`Grid` sin `TALL`),
+  igual a la de antes de las vallas. Si la caja empieza dentro de bloques, la salida la saca de
+  esa zona, así que vuelve a empezar con `TALL`.
+- **Guarda de bordes.** Pregunta por la fila de abajo de su zona.
+- **Rayo de colisión.** Corre el bucle de siempre mientras su celda y el bloque de abajo están
+  en chunks libres. Mira al entrar en otro chunk, en la misma comparación que el límite del
+  mundo, así que no cuesta nada por paso. Si el chunk puede tener bloques altos, sigue con el
+  bucle de la sección 3, que tampoco lee abajo en chunks libres.
+- El resultado es el mismo bit a bit, con vallas o sin ellas.
+
 ## Consecuencias
 
-- Costo, sin medir (hoy no se mide; va a la próxima ronda de control):
+- Costo, solo en chunks que pueden tener bloques altos (sección 7):
   - Barrido: un movimiento de costado con la base del cuerpo a menos de medio bloque sobre un
     plano entero lee una fila más de bloques. Un caminante sobre el suelo lo hace siempre: una o
     dos lecturas más por capa recorrida. Hacia abajo, la capa donde aterriza se lee entera (de 1
-    a 4 bloques para un jugador) en vez de cortar en el primer bloque lleno. Camino caliente de
-    `sweep/player_walk`, `tick/*` y `scale/*`.
-  - Raycast con `Collision`: una lectura más por celda cruzada en su mitad de abajo. Camino
-    caliente de los proyectiles (`scale/1000_projectiles`).
+    a 4 bloques para un jugador) en vez de cortar en el primer bloque lleno.
+  - Raycast con `Collision`: una lectura más por celda cruzada en su mitad de abajo.
+  - En todos lados, cada barrido y cada rayo de colisión miran uno o dos chunks.
   - La guarda de bordes solo corre para quien se agacha en el suelo.
   - El contorno: un draw y unos 100 vértices por frame, armados en CPU.
   - Las mallas no cambian.
+- Medido con criterion, una corrida por lado (µs). cf11b4f es antes de las vallas, main es
+  5e8177a y la rama ya tiene main mezclado:
+
+  | Bench | cf11b4f | main | rama | rama contra cf11b4f |
+  |---|---|---|---|---|
+  | `sweep/player_walk` | 0,241 | 0,270 | 0,280 | +16,5 % |
+  | `sweep/player_land` | 0,166 | 0,175 | 0,187 | +12,7 % |
+  | `sweep/player_fall` | 0,120 | 0,128 | 0,132 | +10,2 % |
+  | `sweep/step_wall` | 0,467 | 0,551 | 0,494 | +5,8 % |
+  | `sweep/step_wall_slide` | 0,714 | 0,837 | 0,745 | +4,3 % |
+  | `raycast/pick_6` | 0,092 | 0,099 | 0,095 | +2,9 % |
+  | `raycast/sky_1024` | 7,05 | 12,34 | 7,24 | +2,7 % |
+  | `tick/1000` | 466 | 515 | 459 | -1,5 % |
+  | `scale/10000_awake` | 1592 | 1720 | 1601 | +0,6 % |
+  | `scale/4096_packed` | 7217 | 7671 | 7105 | -1,6 % |
+  | `scale/1000_projectiles_one_thread` | 251 | 269 | 258 | +2,7 % |
+
+  - Con una valla en cada chunk, lejos del camino (los benches `_fenced`), la rama contra main:
+    barridos de +2,4 a +5,4 %, `sky_1024` +3,1 % y `tick/1000` -2,1 %. Es lo que cuesta mirar
+    los chunks donde no ahorra nada.
+  - Los barridos sueltos en el bosque (`player_*`) cambian hasta un 10 % entre compilaciones del
+    mismo código de físicas: `player_walk` dio 0,255 antes de mezclar main y 0,280 después. Lo
+    estable es el ECS (`tick`, `scale`), que es lo que paga el juego.
 - Chunks sin cargar: un barrido de costado con la base a menos de medio bloque sobre un plano
   entero, o uno hacia abajo que puede llegar a medio bloque de un techo, necesita también la
   fila de abajo. Un cuerpo en el borde de abajo de un chunk cargado, con el de abajo sin cargar,
@@ -160,7 +209,9 @@
   - `CharacterController` y `MoveIntent` tienen campos nuevos: un literal sin `..default()`
     deja de compilar.
   - `CollisionBox::is_valid_collision`, `MAX_COLLISION_HEIGHT`, `shapes::fence_outline`.
-  - `CollisionTable::{is_tall, reach}`, `guard_edge`, `EDGE_MARGIN`, `FLIGHT_VERTICAL_DRAG`.
+  - `CollisionTable::{is_tall, reach, tall_states}`, `VoxelSource::tall_free`, `guard_edge`,
+    `EDGE_MARGIN`, `FLIGHT_VERTICAL_DRAG`.
+  - `boxel_voxel`: `StateSet` y `ChunkData::may_contain`.
   - `RayResult::Unloaded::t` con bloques altos (sección 3).
   - `BlockOutline`, `Outline`, `VoxelRenderer::set_outline`, `outline_edges`,
     `block_outline_edges` y `ShaderModuleId::Outline`.
@@ -177,6 +228,13 @@
     los de apuntar no. Un chunk sin cargar bajo la celda corta el rayo y el barrido, salvo
     que el rayo ya haya pegado antes en un bloque. En `sweep.rs`, el test de los obstáculos que
     frenan el recorrido antes de un chunk sin cargar sube la caja medio bloque por esto.
+  - `boxel_physics/tests/tall_free.rs`: cada barrido, guarda de bordes y rayo se compara bit a
+    bit con la versión que lee siempre abajo, en campos al azar con y sin vallas, cruzando bordes
+    de chunk y chunks sin cargar, en las cinco bases y en el límite del mundo, con `TestWorld` y
+    con un mundo de verdad que se edita. Sin vallas lee menos; con ellas, lo mismo. En
+    `ray.rs`, los puntos donde el rayo mira otro chunk se comparan con avanzar de a un bloque.
+  - `boxel_voxel/tests/contains.rs`: `may_contain` nunca dice que no de más y su respuesta
+    guardada sigue a `set`, `blocks_mut` y `compact`.
   - `block_shapes.rs`: los oráculos de fuerza bruta (barridos por eje y rayos al azar) ahora
     tienen vallas en sus campos. El de barridos suma campos densos (densidad 0,3), donde bloques
     de todo tipo comparten capa.
