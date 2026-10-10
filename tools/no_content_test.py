@@ -234,7 +234,7 @@ class Tree_(unittest.TestCase):
                         'crates/boxel_voxel/src/lib.rs\tboxel:stone\n')
         code, out = self.tree.run()
         self.assertEqual((code, out.strip()), (
-            0, 'no content in engine crates outside the allowlist (2 entries left in '
+            0, 'no content in engine crates outside the allowlist (2 uses left in '
                'tools/no_content_allow/)'))
         # Unlisted: a new offense fails even in a listed file.
         self.tree.write('crates/boxel_voxel/src/lib.rs',
@@ -260,6 +260,33 @@ class Tree_(unittest.TestCase):
         self.assertIn("tools/no_content_allow/boxel.txt:1: not path<TAB>token", out)
         self.assertIn('tools/no_content_allow/boxel.txt:2: crates/boxel_voxel/src/lib.rs is not '
                       'in crate boxel', out)
+
+    def test_a_listed_token_cannot_gain_uses(self):
+        # One line per use: a second use of a listed token in a listed file needs a second line.
+        allow = 'tools/no_content_allow/boxel_voxel.txt'
+        line = 'crates/boxel_voxel/src/lib.rs\tboxel:stone\n'
+        self.tree.write('tools/no_content_allow/boxel.txt', 'src/lib.rs\tTerrainGenerator\n')
+        self.tree.write(allow, line)
+        self.tree.write('crates/boxel_voxel/src/lib.rs',
+                        'pub const A: &str = "boxel:stone";\n'
+                        'pub fn extra() -> &str { "boxel:stone" }\n')
+        code, out = self.tree.run()
+        self.assertEqual(code, 1)
+        self.assertIn('crates/boxel_voxel/src/lib.rs: boxel:stone: 2 uses, 1 listed in '
+                      'tools/no_content_allow/boxel_voxel.txt (lines 1, 2)', out)
+        self.tree.write(allow, line * 2)
+        code, out = self.tree.run()
+        self.assertEqual(code, 0, out)
+        self.assertIn('(3 uses left in tools/no_content_allow/)', out)
+        # A use that goes away leaves a stale line to delete.
+        self.tree.write('crates/boxel_voxel/src/lib.rs', 'pub const A: &str = "boxel:stone";\n')
+        code, out = self.tree.run()
+        self.assertEqual(code, 1)
+        self.assertIn('crates/boxel_voxel/src/lib.rs: stale: boxel:stone (listed 2 times in '
+                      'tools/no_content_allow/boxel_voxel.txt but used 1; delete 1 of those '
+                      'lines)', out)
+        self.tree.write(allow, line)
+        self.assertEqual(self.tree.run()[0], 0)
 
     def test_write_allowlist_creates_the_files(self):
         self.tree.write('tools/no_content_allow/boxel_world.txt', 'old\tentry\n')

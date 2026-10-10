@@ -19,10 +19,12 @@ mechanisms, and the blocks, textures, rules and generators of the example game l
      `game:` examples).
    - `ident`: a content identifier (`IDENTS`) or `BlockModel::<content variant>` in code.
 4. Ratchet: `tools/no_content_allow/<crate>.txt` lists the offenses still allowed, one
-   `path<TAB>token` per line (no line numbers). An offense that is not listed fails, and so does
-   a listed one that no longer occurs (stale). Lanes only delete lines; the last step deletes the
-   directory. `--write-allowlist` writes the files from the current offenses (only to create
-   them).
+   `path<TAB>token` line per use (no line numbers): a file that names a token three times has
+   three equal lines. A token used more often than it is listed fails, and so do lines left
+   over once their uses are gone (stale). So removing a use deletes a line, and a new use of a
+   listed token cannot hide behind the old line. Lanes only delete lines; the last step deletes
+   the directory. `--write-allowlist` writes the files from the current offenses (only to
+   create them).
 
 Prints `path:line: rule: token` per offense and exits 1, or prints `no content in engine
 crates` and exits 0. Standard library only."""
@@ -513,8 +515,26 @@ def cargo_metadata(root):
 # Allowlist
 
 
+def parse_allowlist(rel, text, allowed, errors):
+    """Adds the lines of allowlist file `rel` (`<ALLOW_DIR>/<crate>.txt`, contents `text`) to
+    `allowed` (`{(path, token): lines}`) and its format errors to `errors`."""
+    crate = os.path.basename(rel)[:-len('.txt')]
+    for number, raw in enumerate(text.splitlines(), 1):
+        if not raw.strip() or raw.startswith('#'):
+            continue
+        parts = raw.split('\t')
+        if len(parts) != 2 or not all(parts):
+            errors.append(f'{rel}:{number}: not path<TAB>token: {raw!r}')
+            continue
+        path, token = parts
+        if crate_of(path) != crate:
+            errors.append(f'{rel}:{number}: {path} is not in crate {crate}')
+            continue
+        allowed[(path, token)] = allowed.get((path, token), 0) + 1
+
+
 def read_allowlist(root):
-    """`{(path, token): crate}` from `tools/no_content_allow/*.txt`, plus format errors."""
+    """`{(path, token): lines}` from `tools/no_content_allow/*.txt`, plus format errors."""
     allowed, errors = {}, []
     top = os.path.join(root, ALLOW_DIR)
     if not os.path.isdir(top):
@@ -522,22 +542,8 @@ def read_allowlist(root):
     for name in sorted(os.listdir(top)):
         if not name.endswith('.txt'):
             continue
-        crate = name[:-len('.txt')]
-        rel = f'{ALLOW_DIR}/{name}'
         with open(os.path.join(top, name), encoding='utf-8') as f:
-            for number, raw in enumerate(f, 1):
-                text = raw.rstrip('\n')
-                if not text.strip() or text.startswith('#'):
-                    continue
-                parts = text.split('\t')
-                if len(parts) != 2 or not all(parts):
-                    errors.append(f'{rel}:{number}: not path<TAB>token: {text!r}')
-                    continue
-                path, token = parts
-                if crate_of(path) != crate:
-                    errors.append(f'{rel}:{number}: {path} is not in crate {crate}')
-                    continue
-                allowed[(path, token)] = crate
+            parse_allowlist(f'{ALLOW_DIR}/{name}', f.read(), allowed, errors)
     return allowed, errors
 
 
@@ -549,11 +555,17 @@ def crate_of(path):
     return 'boxel'
 
 
+def allow_file(path):
+    """The allowlist file that lists the offenses of scanned file `path`."""
+    return f'{ALLOW_DIR}/{crate_of(path)}.txt'
+
+
 def write_allowlist(root, offenses):
-    """Writes one file per crate with offenses, and removes the files of crates with none."""
+    """Writes one file per crate with offenses, one line per use, and removes the files of
+    crates with none."""
     by_crate = {}
     for crate, path, _, _, token in offenses:
-        by_crate.setdefault(crate, set()).add((path, token))
+        by_crate.setdefault(crate, []).append((path, token))
     top = os.path.join(root, ALLOW_DIR)
     os.makedirs(top, exist_ok=True)
     for name in os.listdir(top):
@@ -580,21 +592,36 @@ def run(root, metadata, write=False, out=None):
         print(f'wrote {count} entries to {ALLOW_DIR}/', file=out)
     allowed, errors = read_allowlist(root)
     lines += errors
-    seen = set()
+    uses = {}  # (path, token): source lines, in scan order
     for _, path, line, rule, token in offenses:
-        seen.add((path, token))
+        uses.setdefault((path, token), []).append(line)
         if (path, token) not in allowed:
             lines.append(f'{path}:{line}: {rule}: {token}')
-    for (path, token), crate in sorted(allowed.items()):
-        if (path, token) not in seen:
-            lines.append(f'{path}: stale: {token} (listed in {ALLOW_DIR}/{crate}.txt; delete '
-                         'the line)')
+    # One line per use: a listed token used more often than listed fails as a whole, since no
+    # line says which use is the new one.
+    for (path, token), at in uses.items():
+        listed = allowed.get((path, token), 0)
+        if listed and len(at) > listed:
+            lines.append(f'{path}: {token}: {len(at)} uses, {listed} listed in '
+                         f'{allow_file(path)} (lines {", ".join(map(str, at))})')
+    for (path, token), listed in sorted(allowed.items()):
+        used = len(uses.get((path, token), ()))
+        if used >= listed:
+            continue
+        if used == 0 and listed == 1:
+            why = f'listed in {allow_file(path)}; delete the line'
+        elif used == 0:
+            why = f'listed {listed} times in {allow_file(path)}; delete those lines'
+        else:
+            why = (f'listed {listed} times in {allow_file(path)} but used {used}; delete '
+                   f'{listed - used} of those lines')
+        lines.append(f'{path}: stale: {token} ({why})')
     if lines:
         print('\n'.join(lines), file=out)
         print(f'{len(lines)} content problems in engine crates (issue #48)', file=out)
         return 1
     if allowed:
-        print(f'no content in engine crates outside the allowlist ({len(allowed)} entries '
+        print(f'no content in engine crates outside the allowlist ({sum(allowed.values())} uses '
               f'left in {ALLOW_DIR}/)', file=out)
     else:
         print('no content in engine crates', file=out)
