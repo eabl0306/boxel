@@ -2,7 +2,7 @@
 //! for a save job and the job itself. Owned by the world's job state, so the streaming code
 //! stages a chunk as it unloads it and asks the index before generating one.
 use super::entities::EntityIndex;
-use super::store::{META_ENTITIES, MetaValue, WorldStore, entities_meta};
+use super::store::{EntityWrite, META_ENTITIES, MetaValue, WorldStore, entities_meta};
 use crate::jobs::JobExecutor;
 use crate::{ChunkId, ChunkMap, DataState};
 use boxel_voxel::{BlockPos, ChunkData, ChunkKey, ChunkPos, DimensionId, MAX_CHUNK_COORD};
@@ -19,7 +19,7 @@ pub(crate) type ColumnKey = (DimensionId, i64, i64);
 struct SaveReport {
     keys: Vec<ChunkKey>,
     meta: Vec<(String, MetaValue)>,
-    entities: Vec<(ChunkKey, u64)>,
+    entities: Vec<EntityWrite>,
     result: Result<usize, String>,
 }
 
@@ -30,7 +30,7 @@ struct ReportGuard {
     tx: Option<Sender<SaveReport>>,
     keys: Vec<ChunkKey>,
     meta: Vec<(String, MetaValue)>,
-    entities: Vec<(ChunkKey, u64)>,
+    entities: Vec<EntityWrite>,
 }
 
 impl ReportGuard {
@@ -258,10 +258,11 @@ impl Persist {
         }
     }
 
-    /// The entity records and removals for the next job, with the next saved id in `meta` when
-    /// it changed (every job takes all of them: they are small).
-    fn take_entities(&mut self, meta: &mut Vec<(String, MetaValue)>) -> Vec<(ChunkKey, u64)> {
-        let entities = self.entities.take_ops();
+    /// The entity records and removals for the next job, as they are staged now, with the next
+    /// saved id in `meta` when it changed (every job takes all of them: they are small).
+    fn take_entities(&mut self, meta: &mut Vec<(String, MetaValue)>) -> Vec<EntityWrite> {
+        let ops = self.entities.take_ops();
+        let entities = self.store.entity_writes(&ops);
         if let Some(next) = self.entities.take_next_id() {
             let (name, value) = entities_meta(next);
             meta.retain(|(n, _)| *n != name);
@@ -341,7 +342,8 @@ impl Persist {
                         self.meta.push((name, value));
                     }
                 }
-                self.entities.put_back(report.entities);
+                self.entities
+                    .put_back(report.entities.iter().map(|w| (w.chunk, w.id)).collect());
             }
         }
     }

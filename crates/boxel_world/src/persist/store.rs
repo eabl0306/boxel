@@ -137,6 +137,18 @@ struct StagedEntity {
     seq: u64,
 }
 
+/// An entity record (or removal) a save job writes: the staged copy as it was when the job
+/// was made. A job never reads newer copies: a move stages the removal and the new record
+/// together, so a job that took one of them took the other one too.
+#[derive(Clone, Debug)]
+pub(crate) struct EntityWrite {
+    pub(crate) chunk: ChunkKey,
+    pub(crate) id: u64,
+    /// `None`: the record is removed.
+    pub(crate) bytes: Option<Arc<Vec<u8>>>,
+    seq: u64,
+}
+
 /// Entity records waiting to be written, by chunk and saved id.
 type PendingEntities = HashMap<
     ChunkKey,
@@ -446,31 +458,39 @@ impl WorldStore {
         self.load_chunk(key).ok().flatten()
     }
 
+    /// The staged entity records and removals of `ops` as they are now (those still staged),
+    /// for a save job: taken on the main thread when the job is made, so the job writes one
+    /// moment of the entities whatever is staged while it waits to run.
+    pub(crate) fn entity_writes(&self, ops: &[(ChunkKey, u64)]) -> Vec<EntityWrite> {
+        let pending = self.inner.pending_entities.lock().expect("pending lock");
+        ops.iter()
+            .filter_map(|&(chunk, id)| {
+                let s = pending.get(&chunk)?.get(&id)?;
+                Some(EntityWrite {
+                    chunk,
+                    id,
+                    bytes: s.bytes.clone(),
+                    seq: s.seq,
+                })
+            })
+            .collect()
+    }
+
     /// Encodes and writes the staged copies of `keys` (those still staged), `meta` and the
-    /// staged entity records of `entities` in one batch. Once it is durable, a copy is dropped
-    /// unless a newer one of its key was staged meanwhile. On an error nothing is dropped (the
-    /// caller tries again later). Returns the chunks written.
+    /// entity records `entities` ([`WorldStore::entity_writes`]) in one batch. Once it is
+    /// durable, a copy or record is dropped unless a newer one of its key was staged meanwhile.
+    /// On an error nothing is dropped (the caller tries again later). Returns the chunks
+    /// written.
     pub(crate) fn write(
         &self,
         keys: &[ChunkKey],
         meta: &[(String, MetaValue)],
-        entities: &[(ChunkKey, u64)],
+        entities: &[EntityWrite],
     ) -> io::Result<usize> {
         let staged: Vec<(ChunkKey, Arc<ChunkData>, u64)> = {
             let pending = self.inner.pending.lock().expect("pending lock");
             keys.iter()
                 .filter_map(|k| pending.get(k).map(|s| (*k, Arc::clone(&s.data), s.seq)))
-                .collect()
-        };
-        type StagedRecord = (ChunkKey, u64, Option<Arc<Vec<u8>>>, u64);
-        let staged_entities: Vec<StagedRecord> = {
-            let pending = self.inner.pending_entities.lock().expect("pending lock");
-            entities
-                .iter()
-                .filter_map(|&(chunk, id)| {
-                    let s = pending.get(&chunk)?.get(&id)?;
-                    Some((chunk, id, s.bytes.clone(), s.seq))
-                })
                 .collect()
         };
         let mut batch = SaveBatch {
@@ -479,9 +499,9 @@ impl WorldStore {
                 .iter()
                 .map(|(name, value)| (name.clone(), value.encode()))
                 .collect(),
-            entities: staged_entities
+            entities: entities
                 .iter()
-                .map(|(chunk, id, bytes, _)| (*chunk, *id, bytes.as_deref().cloned()))
+                .map(|w| (w.chunk, w.id, w.bytes.as_deref().cloned()))
                 .collect(),
         };
         let mut written = Vec::with_capacity(staged.len());
@@ -507,18 +527,18 @@ impl WorldStore {
         }
         drop(pending);
         let mut pending = self.inner.pending_entities.lock().expect("pending lock");
-        for (chunk, id, _, seq) in &staged_entities {
-            if let Some(records) = pending.get_mut(chunk) {
-                if records.get(id).is_some_and(|s| s.seq == *seq) {
-                    records.remove(id);
+        for w in entities {
+            if let Some(records) = pending.get_mut(&w.chunk) {
+                if records.get(&w.id).is_some_and(|s| s.seq == w.seq) {
+                    records.remove(&w.id);
                 }
                 if records.is_empty() {
-                    pending.remove(chunk);
+                    pending.remove(&w.chunk);
                 }
             }
         }
         drop(pending);
-        let records = staged_entities.iter().filter(|e| e.2.is_some()).count();
+        let records = entities.iter().filter(|w| w.bytes.is_some()).count();
         self.inner
             .saved_entities
             .fetch_add(records, Ordering::Relaxed);

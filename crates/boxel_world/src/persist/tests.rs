@@ -597,10 +597,14 @@ fn staged_entity_records_are_read_until_written() {
     };
     assert_eq!(ids(&store), vec![4, 5]);
     assert_eq!(store.stats().pending_entities, 2);
-    store.write(&[], &[], &[(c, 5)]).unwrap();
+    store
+        .write(&[], &[], &store.entity_writes(&[(c, 5)]))
+        .unwrap();
     assert_eq!(store.stats().pending_entities, 1, "the removal waits");
     assert_eq!(backend.entity_count(), 3);
-    store.write(&[], &[], &[(c, 3)]).unwrap();
+    store
+        .write(&[], &[], &store.entity_writes(&[(c, 3)]))
+        .unwrap();
     assert_eq!(ids(&store), vec![4, 5]);
     assert_eq!(backend.entity_count(), 2);
     assert_eq!(store.stats().pending_entities, 0);
@@ -644,6 +648,60 @@ fn the_entity_index_follows_records_and_ids() {
     assert_eq!(p.entities.at(9), Some(b));
     p.entities.next_id_unsaved();
     assert_eq!(p.entities.take_next_id(), Some(77));
+}
+
+/// Runs jobs when the test says so (a busy IO pool).
+#[derive(Default)]
+struct Held(std::sync::Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>);
+
+impl crate::jobs::JobExecutor for Held {
+    fn spawn(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+        self.0.lock().unwrap().push(job);
+    }
+}
+
+impl Held {
+    fn run(&self) {
+        let jobs = std::mem::take(&mut *self.0.lock().unwrap());
+        for job in jobs {
+            job();
+        }
+    }
+}
+
+/// A job writes the entity records as they were staged when it was made: an entity that moves
+/// while the job waits to run is on the disk once, under its old chunk, until the next job
+/// writes its move (the removal and the new record together).
+#[test]
+fn an_entity_moved_while_its_job_waits_is_never_off_the_disk() {
+    let backend = Arc::new(MemoryStore::new());
+    let held = Arc::new(Held::default());
+    let mut p = Persist::new(
+        open(&backend),
+        Arc::clone(&held) as Arc<dyn crate::jobs::JobExecutor>,
+    );
+    let (c, d, e) = (key(0, 0, 0), key(1, 0, 0), key(1 << 40, -(1 << 31), 2));
+    let keys = || {
+        let mut keys = backend.entity_keys().unwrap();
+        keys.sort_unstable_by_key(|&(c, id)| (format::encode_key(c), id));
+        keys
+    };
+    p.entities.record(&p.store, c, 7, vec![1]);
+    p.frame(Instant::now(), 256, Duration::ZERO);
+    // Moves to d before the job runs, then to e before the next one runs.
+    p.entities.record(&p.store, d, 7, vec![2]);
+    held.run();
+    assert_eq!(keys(), vec![(c, 7)], "the job wrote what it took");
+    p.frame(Instant::now(), 256, Duration::ZERO);
+    p.entities.record(&p.store, e, 7, vec![3]);
+    held.run();
+    assert_eq!(keys(), vec![(d, 7)]);
+    p.frame(Instant::now(), 256, Duration::ZERO);
+    held.run();
+    assert_eq!(keys(), vec![(e, 7)]);
+    p.frame(Instant::now(), 256, Duration::ZERO);
+    assert_eq!(p.store.stats().pending_entities, 0);
+    assert_eq!(p.store.load_entities(e).unwrap(), vec![(7, vec![3])]);
 }
 
 /// A failed save keeps the entity records staged (loads read them) and writes them later.
