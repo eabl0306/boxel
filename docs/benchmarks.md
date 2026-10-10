@@ -23,10 +23,12 @@ just perf-smoke dive cave-path         # los casos que toca la tarea
 just perf-smoke 780m/forest/144        # un caso es gpu/escenario/rN/tope, en cualquier orden
 just perf-smoke forest -- --bodies 10000   # opciones de stress, iguales en los dos lados
 just perf-smoke --base main            # otra base (por defecto, el merge base con main)
-just perf-smoke --base HEAD --new-extra '--fog valley' 780m/surface   # solo el lado nuevo
+just perf-smoke --base HEAD "--new-extra='--fog valley'" 780m/surface   # solo el lado nuevo
 ```
 
 `--new-extra` le pasa opciones de stress solo al lado nuevo, después de las que van tras `--`.
+Con `just` va entre comillas dobles y el valor entre simples, como arriba: `just` vuelve a partir
+los argumentos por los espacios.
 Sirve para medir el costo de una opción con el mismo binario: con `--base HEAD` los dos lados son
 el mismo código y solo cambia la opción. La tabla y los nombres de los casos la muestran como
 `[new: ...]`.
@@ -259,6 +261,24 @@ El costo de la búsqueda y de los enlaces de caras está en
 `--pack DIR` usa las texturas de un resource pack. El resumen anota el pack (`none` con las
 procedurales, también en corridas viejas) y cuánto tardó en cargar, y `tools/bench_report.py` no
 mezcla corridas con texturas distintas.
+
+`--fog PRESET` agrega la niebla y las nubes del ejemplo (ADR 0030) con `FogPlugin`; sin la opción
+(o con `off`) el plugin no está y no hay niebla ni costo. Los presets son los de
+`boxel_demo::fog`:
+
+- `empty`: el plugin sin capas. Mide solo lo que cuesta poder leer la profundidad.
+- `valley`: bancos de cubos de 2 bloques entre y 48 y 64, sobre el mar y las zonas bajas.
+- `clouds`: nubes de 12x4x12 a y 192.
+- `both`: valle y nubes, el preset típico de un juego.
+- `inside`: un manto de y 0 a 256 con la cámara adentro, el peor caso.
+- `sunset`: valle y nubes con más color del cielo.
+
+`--fog-res half|full` elige la resolución de la marcha (media por defecto) y `--fog-steps N` el
+tope de celdas por rayo (64 por defecto, el del motor). El resumen anota la niebla
+(`fog: valley half`, con los pasos si no son los de siempre) y `tools/bench_report.py` empareja
+igual corridas con y sin niebla, así se puede comparar una contra otra; solo avisa que difieren.
+Para medir el costo de la niebla con el mismo binario:
+`just perf-smoke --base HEAD "--new-extra='--fog both'" rtx/surface/r16/uncapped`.
 
 Para que los números sirvan:
 

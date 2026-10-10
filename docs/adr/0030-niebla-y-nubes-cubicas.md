@@ -1,0 +1,255 @@
+# ADR 0030: niebla y nubes cúbicas, un plugin opcional
+
+- Estado: aceptado (issue #47)
+- Fecha: 2026-10-10
+
+## Contexto
+
+La issue #47 pide niebla y nubes con forma de cubos que se mueven con el viento. La visibilidad
+es acumulativa: mientras más niebla cruza la mirada, menos se ve. Hay capas a distintas alturas
+(bancos bajos, niebla de valle, nubes tipo Minecraft de 12x4x12) y no hay interacción con mobs,
+físicas ni jugabilidad.
+
+El dueño decidió (comentario de la issue, 2026-10-10):
+
+- La niebla es opcional: un plugin aparte que el juego agrega solo si la quiere.
+- Sin el plugin no hay pasada extra ni costo alguno.
+- El estilo (tamaño de cubo, capas, colores, densidades, viento) es configuración del juego. Los
+  presets del ejemplo van en `boxel_demo` (ADR 0029).
+
+Restricciones del motor que pesan aquí:
+
+- El tier Low en GL tiene un solo uniform block y una sola unidad de textura (ADR 0011).
+- Las imágenes deben salir iguales en High, Mid y Low.
+- Las coordenadas del mundo son `i64` y todo debe ser exacto lejos del origen (ADR 0014).
+- La meta de 144 fps en la Radeon 780M no se negocia para el motor. La niebla, que es opcional,
+  no la tiene (sección 6).
+
+## Decisión
+
+### 1. Un plugin aparte, sin costo cuando no está
+
+`FogPlugin` (`boxel_render::fog`, en el prelude) no está en `DefaultPlugins`. Al agregarlo:
+
+- inserta `FogSettings` (las capas y cómo se dibujan) y `FogClock` (el reloj del viento);
+- avanza el reloj en `FixedUpdate`, un tick por paso fijo (64 por segundo);
+- en `RenderSystems::Extract` copia los ajustes y el tick al frame. Valida los ajustes solo
+  cuando cambian. Un cambio inválido se avisa una vez en el log y quedan los últimos válidos.
+
+Sin el plugin el frame no trae niebla y el renderer no crea nada de ella: ni pipelines, ni
+target, ni módulo de shader. La profundidad principal conserva su uso de siempre, sin
+`TEXTURE_BINDING`. Un test de GPU lo comprueba con imágenes idénticas byte a byte.
+
+Las apps sin ECS (tests, `snapshot`) usan `VoxelRenderer::set_fog(device, Some(FogInput))`.
+
+Con el plugin, el smoke test de la GPU también dibuja una capa densa y lee el píxel. Si falla, la
+niebla queda apagada en ese dispositivo con un aviso. Nunca cambia el tier.
+
+### 2. El crate `boxel_fog`
+
+Es CPU puro y datos, sin GPU ni ECS:
+
+- `config`: `FogLayer`, `FogNoise`, `NoiseDims`, `FogFade`, `FogResolution`, `validate` y
+  `density_for_visibility`.
+- `noise`: el ruido entero, el mismo bit a bit que el shader, y una referencia directa en `i128`.
+- `layer`: una capa reducida a enteros chicos relativos al origen de render (`LayerParams`) y los
+  rayos de la cámara (`RayBasis`).
+- `march`: la marcha del shader en `f32`, la referencia de los tests de GPU.
+- `pack`: cómo la marcha guarda su resultado en un texel.
+
+Existe porque los presets de `boxel_demo` no pueden usar tipos de `boxel_render`: el render usa
+`boxel_demo` en sus tests, y un tipo duplicado rompería esos tests. `tools/no_content.py` permite
+que `boxel_demo` dependa de `boxel_fog`.
+
+### 3. Cómo se dibuja
+
+Una marcha de rayos a pantalla completa, igual en los tres tiers. Corre dentro de
+`VoxelRenderer::render`, después de todo el pase principal (opaco, cutout, contorno y
+translúcido) y antes de los overlays y el blit.
+
+**Pasada 1, la marcha.** Escribe en un target `Rg32Uint`, a media resolución por defecto (un rayo
+cada 2x2 píxeles) o completa.
+
+- `x`: el color de la niebla por unidad de opacidad, en 11-11-10 bits con raíz cuadrada.
+- `y`: cuatro bytes de opacidad, uno por píxel del bloque de 2x2. Cada píxel usa su propia
+  profundidad, así que los bordes del terreno quedan nítidos aunque el rayo sea uno solo.
+
+Por cada capa, el rayo recorre sus celdas con un DDA (Amanatides y Woo) en `f32` relativo a la
+cámara, hasta la profundidad opaca de sus píxeles. Las bandas de las capas no se solapan, así que
+ordenadas por altura se recorren de adelante hacia atrás. En cada celda:
+
+- la cobertura sale del ruido entero (sección 4) y la extinción es `densidad * cobertura`;
+- la transmitancia baja `exp(-extinción * largo)`;
+- el color es el de la capa iluminada, por el sombreado de la cara por la que el rayo entró al
+  cuerpo de celdas (arriba 1, abajo 0,5, lados 0,8 y 0,65, como los vóxeles), desvanecido hacia
+  el color del cielo con la distancia.
+
+Para no gastar de más:
+
+- sale antes cuando la profundidad óptica pasa de 6 (ya no se ve nada detrás);
+- tiene un tope de celdas por rayo (`max_steps`). Pasado el tope, el resto de cada capa usa su
+  densidad media, sin un muro visible donde se corta;
+- cruza de un paso un tramo entero de la grilla del ruido cuando sus esquinas no dejan cobertura
+  (la cota es conservadora: el ruido de valor nunca sale del rango de sus esquinas);
+- toma de un paso una capa cuyas celdas están todas llenas.
+
+**Pasada 2, la composición.** Un triángulo a pantalla completa sobre el color principal, con
+mezcla `SrcAlpha, OneMinusSrcAlpha` solo en el color. Descarta los píxeles con opacidad 0, así
+que un píxel sin niebla no cambia. La interfaz nunca tiene niebla y las capturas sí la tienen.
+
+**Layout para Low.** Cada pipeline tiene a lo sumo un uniform block y una textura, sin sampler:
+
+- la marcha lee la profundidad como `texture_2d<f32>` no filtrable con `textureLoad` (grupo 0)
+  y el uniform `Fog` (grupo 1);
+- la composición lee solo el target de la marcha (grupo 0).
+
+**Datos por frame.** El uniform `Fog` tiene un encabezado de 112 bytes y 4 capas de 208, 944
+bytes en total, y se escribe cada frame. No se sube ninguna textura ni volumen: la densidad es una
+función de la celda absoluta, el tick y la capa.
+
+### 4. Ruido entero y viento
+
+La CPU hace la cuenta absoluta en `i64` e `i128` y le pasa a la GPU solo enteros chicos relativos
+a la celda del origen de render: el desplazamiento dentro del paso de la grilla, el punto de la
+grilla en dos palabras de 32 bits (baja y alta) y la fracción del viento en 12 bits.
+
+- **Hash.** Por eje, la palabra alta se pliega en la baja (`baja ^ alta * 0x9e3779b1`). Las tres
+  palabras pasan por una cadena de `lowbias32` desde la semilla de la octava. El valor son los 12
+  bits altos.
+- **Interpolación.** Un smoothstep en punto fijo y lerps enteros, trilineales (`Volume`) o
+  bilineales (`Flat`), con cada producto por debajo de 2^26.
+- **Octavas.** Una o dos. La segunda tiene la mitad de escala y un tercio del peso.
+- **Cobertura.** `clamp(ruido + 1 - umbral) * ganancia >> 8`, de 0 a 4096. Con suavidad 0 los
+  cubos son llenos o vacíos.
+- **Viento.** `FogClock::tick` es un `u64`, nunca segundos en `f32`. El desplazamiento es
+  `viento * tick` en q16: celdas enteras más una fracción de 12 bits. Las celdas no se mueven;
+  cambia cuáles están llenas.
+
+La cobertura sale idéntica en el oráculo de CPU, en los tres tiers, en todos los backends y a
+cualquier distancia del origen.
+
+### 5. El estilo es del juego
+
+Cada `FogLayer` es un dato:
+
+- banda `[min_y, max_y)`, múltiplos del alto de celda, sin solaparse con otras capas;
+- celda `[x, y, z]` de 1 a 32 bloques (por ejemplo `[2, 2, 2]` o `[12, 4, 12]`);
+- ruido: escala (potencia de dos de 1 a 64), octavas, `Flat` o `Volume`, semilla;
+- umbral y suavidad;
+- densidad por bloque (`density_for_visibility(V) = 3 / V`: se ve un 5 % a V bloques);
+- color, `sky_tint` (cuánto toma del color del cielo, el tono del atardecer) y sombreado por
+  cara;
+- viento en bloques por segundo;
+- distancia máxima (hasta 4096) y desvanecido (`Scene`, como el terreno, o un rango propio).
+
+`FogSettings` agrega `enabled`, hasta 4 capas, la resolución (media por defecto) y `max_steps`
+(64 por defecto, `DEFAULT_MAX_STEPS`). Se cambia en tiempo de ejecución con `ResMut<FogSettings>`.
+
+```rust
+app.add_plugins(FogPlugin::new(vec![boxel_demo::fog::valley(), boxel_demo::fog::clouds()]));
+```
+
+Los presets del ejemplo están en `boxel_demo::fog`: `clouds()` (nubes de 12x4x12 a 192 bloques),
+`valley()` (bancos de cubos de 2 bloques entre 48 y 64, justo sobre el mar), `blanket()` (un
+manto, el peor caso) y `sunset()` (valle y nubes con más color del cielo).
+
+### 6. Valores por defecto y costo medido
+
+La niebla es para GPUs con margen. El dueño decidió (2026-10-10) que la Radeon 780M solo tiene
+que mover bien el motor: no tiene que entrar en un frame de 144 Hz con la niebla prendida. Por
+eso los valores por defecto se eligieron por cómo se ven y por su costo en la RTX 5050:
+
+- media resolución;
+- 64 celdas por rayo (`DEFAULT_MAX_STEPS`).
+
+`just perf-smoke` del 2026-10-10 sobre bac728d: el mismo binario con la niebla apagada y con
+`--fog both` (valle y nubes, el preset típico), 10 s por lado, radio 16, 1280x720, a las 12:00.
+La superficie es el overworld volando a 64 bloques por segundo; el bosque vuela a 32.
+
+| caso | fps | p50 ms | p99 ms | máx ms | frames > 6.94 ms |
+|---|---:|---:|---:|---:|---:|
+| RTX, superficie, sin tope | 2185 -> 1294 | 0.41 -> 0.67 | 1.00 -> 2.17 | 3.80 -> 5.22 | 0 -> 0 |
+| RTX, bosque, sin tope | 3889 -> 1683 | 0.23 -> 0.55 | 0.68 -> 1.83 | 4.27 -> 4.35 | 0 -> 0 |
+| 780M, superficie, sin tope | 550 -> 359 | 1.74 -> 2.54 | 4.25 -> 6.59 | 5.10 -> 8.12 | 0 -> 12 |
+| 780M, superficie, tope 144 | 143 -> 139 | 6.95 -> 6.95 | 7.69 -> 14.14 | 15.59 -> 16.82 | 725 -> 730 |
+
+En la 780M sin tope el harness repitió el par y dio lo mismo (553 -> 360 fps, 1 -> 9 frames de
+más de 6,94 ms). Con tope 144 la base ya tiene unos 700 frames lentos por el compositor, así que
+ahí cuentan los fps y el p99.
+
+En la RTX la niebla cuesta de 0,26 a 0,32 ms por frame en la mediana y ningún frame pasa de
+6,94 ms. En la 780M cuesta unos 0,8 ms en la mediana y deja de 9 a 12 frames lentos cada 10 s.
+No se ajustó para que entre: queda en una issue de prioridad baja, con estas perillas (todas del
+juego):
+
+- `max_steps`: en mediciones previas de la rama, con una banda de valle de 24 bloques, la 780M
+  pasó de unos 150 frames lentos cada 10 s con 64 celdas a 92 con 32 y a 15 con 16;
+- celdas más grandes (de 4 bloques en vez de 2, la mitad de celdas por rayo);
+- una banda más fina o una `max_distance` más corta;
+- una octava en vez de dos: con una la marcha salta los tramos vacíos de la grilla del ruido,
+  con dos casi nunca puede;
+- la resolución: la media ya es la más barata; un cuarto de resolución sería nuevo.
+
+## Límites conocidos
+
+- **Translúcidos.** La marcha llega hasta la profundidad opaca. La niebla que queda detrás de un
+  vidrio o bajo el agua se pinta encima de esa superficie, y la niebla vista desde abajo del agua
+  no toma su color. El valle del ejemplo empieza en y 48, encima del agua del mar (termina en 47),
+  así que el mar sale exacto. Una banda que baja bajo el agua o queda detrás de un vidrio no.
+- **Sin mapa del suelo.** Las bandas son planas: la niebla también llena las cuevas y los aleros
+  dentro de su banda (el terreno las tapa, salvo en las entradas) y no se junta en los valles que
+  quedan arriba de la banda. Un borrador del mapa del suelo, hecho con los techos de cielo de la
+  luz (ADR 0015) sin leer bloques, quedó en la rama `wip/fog-ground` sin conectar al shader.
+- **Media resolución.** Los bordes de los cubos avanzan de a 2 píxeles y el color es la media del
+  bloque de 2x2. La resolución completa está disponible y cuesta cerca de cuatro veces más.
+- **Tope de celdas.** Pasadas las 64 celdas de un rayo (unos 80 a 120 bloques en cubos de 2), el
+  resto de la capa es una bruma de densidad media. Con menos celdas la bruma empieza antes.
+- **Viento.** Avanza a saltos de 64 por segundo.
+- **Profundidad muestreada.** Con el plugin, la profundidad principal se puede leer como textura.
+  En algunas GPUs eso puede costar su compresión. Sin el plugin no cambia nada.
+
+## Alternativas descartadas
+
+- **Cubos rasterizados como instancias.** Sin salida temprana, decenas de fragmentos mezclados
+  por píxel, rayas en las caras interiores y problemas con el plano cercano.
+- **La niebla como bloques en los chunks.** Habría que volver a mallar todo el tiempo y sería
+  translúcido caro.
+- **Niebla por fragmento en los shaders de vóxeles.** Toca los shaders principales y no pone
+  niebla sobre el cielo vacío.
+- **Upsample bilateral.** Necesita una segunda textura, y Low no la puede ligar.
+- **Partir el pase translúcido** para que la niebla detrás del agua y el vidrio sea exacta.
+  Queda para después, con su propia medición.
+
+## Cómo se probó
+
+- `boxel_fog`: tests unitarios y proptest. El ruido partido como lo ve la GPU contra la cuenta
+  directa en `i128`, con orígenes cerca de 0, ±2^31, 2^40 y el límite del mundo; el viento como
+  traslación exacta; la cota de los tramos vacíos es conservadora; invariantes del DDA; la marcha
+  (exp(-σL) en una losa, salida temprana, la cola del tope sin salto, un sombreado por cuerpo,
+  cámara adentro, corte en la profundidad, capas en los dos sentidos); el empaquetado; cada error
+  de `validate`.
+- `boxel_shaders/tests/naga.rs`: `fog.wgsl` valida y traduce a GLSL 330, ES 300, 430 y ES 310,
+  MSL, HLSL y SPIR-V; el layout del uniform coincide con los espejos de Rust; cada entry point
+  liga lo que Low admite; las constantes del shader son las de `boxel_fog`.
+- `boxel_render/tests/gpu_fog.rs`, en cada tier de cada adaptador:
+  - sin niebla, con `set_fog(None)`, apagada o fuera de alcance, la imagen es idéntica byte a
+    byte y la profundidad no tiene `TEXTURE_BINDING`;
+  - el ruido de la GPU es el oráculo bit a bit, también lejos del origen;
+  - cada tier dibuja la marcha de referencia (texel a texel y la composición) en nubes desde
+    abajo, adentro y arriba, cámara adentro, un banco, el atardecer, una pileta con vidrio y
+    postes finos;
+  - orígenes de render a unos bloques de distancia dan la misma niebla;
+  - el sombreado por cara de una losa;
+  - cambios de tamaño, de resolución y un renderer nuevo;
+  - el smoke de la niebla pasa en cada tier.
+- `just perf-smoke` en la RTX 5050 y la 780M (sección 6).
+
+## Consecuencias
+
+- Un juego agrega niebla y nubes con un plugin y datos. Sin el plugin, el motor es el de antes.
+- `stress --fog PRESET --fog-res half|full --fog-steps N` y `snapshot --fog PRESET --fog-tick N`
+  sirven para medir y para mirar.
+- Pendiente:
+  - el mapa del suelo, para que la niebla siga el terreno y se junte en los valles;
+  - partir el pase translúcido, para la niebla detrás del agua y el vidrio;
+  - un atajo en `voxel_world` para prender y apagar la niebla.
