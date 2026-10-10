@@ -1,4 +1,8 @@
+use std::sync::Arc;
+
 use boxel_voxel::{TexturePattern, TextureSpec};
+
+use crate::texture_animation::LayerAnimation;
 
 /// Edge of every procedural block texture layer (texels). A resource pack can give the array
 /// another edge ([`BlockTextureData::size`]).
@@ -22,6 +26,9 @@ pub struct BlockTextureData {
     pub mip_levels: u32,
     /// Texel bytes.
     pub data: Vec<u8>,
+    /// The animated layers (ADR 0028; none for procedural textures). `data` holds the frame
+    /// each one shows at tick 0.
+    pub animations: Arc<[LayerAnimation]>,
 }
 
 impl BlockTextureData {
@@ -48,6 +55,7 @@ pub fn generate_block_textures(specs: &[TextureSpec]) -> BlockTextureData {
         layers: specs.len().max(1) as u32,
         mip_levels: mip_levels(size),
         data,
+        animations: Arc::from([]),
     }
 }
 

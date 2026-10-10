@@ -8,6 +8,7 @@ use crate::path::{
 };
 use crate::sort::{SortedBucket, TranslucentSort, TranslucentSorter};
 use crate::targets::{Blit, Targets};
+use crate::texture_animation::TextureAnimator;
 use crate::textures::BlockTextureData;
 use crate::upload::{UploadTargets, Uploads, arena_len, light_entries};
 use boxel_camera::{Camera, CameraView};
@@ -86,6 +87,19 @@ pub struct ViewParams {
     /// pixels on every tier. [`ViewParams::from_camera`] sets 0; the render plugin sets the
     /// app's elapsed time wrapped at [`FLUID_TIME_PERIOD`].
     pub fluid_time: f32,
+    /// Game ticks (20 a second) of the animated block textures (ADR 0028): each animated layer
+    /// shows the frame of its Minecraft animation at this tick. Not wrapped (the animations wrap
+    /// it at their own period, exactly). [`ViewParams::from_camera`] sets 0; the render plugin
+    /// sets the app's elapsed time in ticks.
+    pub texture_tick: u64,
+}
+
+/// Game ticks a second: the rate of Minecraft's texture animations ([`ViewParams::texture_tick`]).
+pub const TEXTURE_TICKS_PER_SECOND: f64 = 20.0;
+
+/// The [`ViewParams::texture_tick`] of `seconds` of game time (whole ticks elapsed).
+pub fn texture_tick(seconds: f64) -> u64 {
+    (seconds.max(0.0) * TEXTURE_TICKS_PER_SECOND) as u64
 }
 
 /// The fluid animation repeats every this many seconds: the shaders' flow speeds (water half a
@@ -114,6 +128,7 @@ impl ViewParams {
             clear_color: sky_color,
             light: SceneLight::default(),
             fluid_time: 0.0,
+            texture_tick: 0,
         }
     }
 }
@@ -153,6 +168,13 @@ pub struct RenderStats {
     pub translucent_sorts: u32,
     /// Their quads (cumulative).
     pub translucent_sorted_quads: u64,
+    /// Animated texture layers written to the GPU (cumulative, ADR 0028).
+    pub texture_layer_uploads: u64,
+    /// Their bytes, mip chains included (cumulative).
+    pub texture_upload_bytes: u64,
+    /// Animated layers the last frame left on an older frame because of the upload budget
+    /// ([`VoxelRenderer::set_texture_upload_budget`]).
+    pub textures_behind: u32,
 }
 
 /// Renderer errors.
@@ -177,6 +199,10 @@ pub struct VoxelRenderer {
     tier: Tier,
     /// Group 0: block texture array + sampler.
     materials: wgpu::BindGroup,
+    /// The block texture array (animated layers are written into it).
+    block_texture: wgpu::Texture,
+    /// Which frame each animated layer shows on the GPU.
+    animator: TextureAnimator,
     view_buffer: wgpu::Buffer,
     /// Group 1: `View` uniform.
     view_bind_group: wgpu::BindGroup,
@@ -422,7 +448,13 @@ impl VoxelRenderer {
         size: UVec2,
     ) -> Result<Self, String> {
         let limits = device.limits();
-        let (materials_view, sampler) = block_textures(device, queue, textures, &limits)?;
+        let (block_texture, materials_view, sampler) =
+            block_textures(device, queue, textures, &limits)?;
+        let animator = TextureAnimator::new(
+            Arc::clone(&textures.animations),
+            textures.size,
+            textures.mip_levels,
+        );
 
         let view_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("boxel view"),
@@ -538,6 +570,8 @@ impl VoxelRenderer {
         Ok(Self {
             tier,
             materials,
+            block_texture,
+            animator,
             view_buffer,
             view_bind_group,
             stats: RenderStats::default(),
@@ -744,7 +778,17 @@ impl VoxelRenderer {
     pub fn debug_fail_next_upload(&mut self) {
         self.uploads.fail_next_batch();
     }
-    /// Encodes the tier's passes into the main color/depth targets: the chunk changes since the
+    /// Bytes of animated texture layers [`VoxelRenderer::render`] writes at most in one frame
+    /// (ADR 0028; default [`crate::DEFAULT_TEXTURE_UPLOAD_BUDGET`]). One changed layer is always
+    /// written; the others wait for the next frames, the longest waiting first. `u64::MAX`
+    /// writes every changed layer in the frame (snapshots).
+    pub fn set_texture_upload_budget(&mut self, bytes: u64) {
+        self.animator.set_budget(bytes);
+    }
+
+    /// Encodes the tier's passes into the main color/depth targets: the animated texture layers
+    /// whose frame changed at [`ViewParams::texture_tick`] (written with the queue, within the
+    /// upload budget), the chunk changes since the
     /// last call and the translucent buckets re-sorted for this camera (uploads), clear, (High)
     /// cull, opaque buckets with the opaque pipeline, then the cutout bucket with the cutout
     /// pipeline, then the block outline ([`VoxelRenderer::set_outline`]), then the translucent
@@ -762,6 +806,11 @@ impl VoxelRenderer {
         // window from the live flags: a move marks every slot stale, so the upload below sends
         // them all again. Mid and Low test the window in `CpuCull`.
         self.chunks.follow(view.render_origin);
+        {
+            let _span = frame_span!("render.textures");
+            self.animator
+                .update(queue, &self.block_texture, view.texture_tick);
+        }
         {
             let _span = frame_span!("render.sort");
             self.sorter.update(&self.chunks, view, &mut self.sorted);
@@ -890,6 +939,9 @@ impl VoxelRenderer {
             chunk_slot_capacity: self.chunks.capacity(),
             translucent_sorts: self.sorter.stats().sorts,
             translucent_sorted_quads: self.sorter.stats().quads,
+            texture_layer_uploads: self.animator.counters.layers,
+            texture_upload_bytes: self.animator.counters.bytes,
+            textures_behind: self.animator.counters.behind,
             ..self.stats
         }
     }
@@ -923,7 +975,7 @@ fn block_textures(
     queue: &wgpu::Queue,
     textures: &BlockTextureData,
     limits: &wgpu::Limits,
-) -> Result<(wgpu::TextureView, wgpu::Sampler), String> {
+) -> Result<(wgpu::Texture, wgpu::TextureView, wgpu::Sampler), String> {
     let mut layers = textures.layers;
     let layer_bytes = textures.layer_bytes();
     if textures.data.len() != layers as usize * layer_bytes {
@@ -988,7 +1040,7 @@ fn block_textures(
         mipmap_filter: wgpu::MipmapFilterMode::Linear,
         ..Default::default()
     });
-    Ok((view, sampler))
+    Ok((texture, view, sampler))
 }
 
 #[cfg(test)]
