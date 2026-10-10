@@ -42,8 +42,8 @@ use boxel::log::LogPlugin;
 use boxel::mesh::AoPolicy;
 use boxel::prelude::*;
 use boxel::render::{
-    RenderSettings, RendererConfig, SceneLight, TextureSource, TranslucentSort, ViewParams,
-    VoxelRenderer, light_curve, load_block_textures,
+    FLUID_TIME_PERIOD, RenderSettings, RendererConfig, SceneLight, TextureSource, TranslucentSort,
+    ViewParams, VoxelRenderer, light_curve, load_block_textures,
 };
 use boxel::voxel::{BlockRegistry, MAX_BLOCK_COORD};
 use boxel::world::persist::{PersistPlugin, WorldStore};
@@ -80,6 +80,8 @@ usage: snapshot --camera X,Y,Z,YAW,PITCH --shot HH:MM=PATH [--shot ...] [options
                        later edit of a cell replaces an earlier one
   --flow N             let placed water flow for N game ticks (20 a second) before the shots
                        (default 0)
+  --fluid-time S       seconds of the fluid animation in the shots: how far the flow textures
+                       have scrolled (default 0)
   --world-dir DIR      load the world saved in DIR (made if missing) and save it there after
                        the shots, edits included
   --timeout S          wall-clock limit for loading the world, in seconds (default 300)
@@ -140,6 +142,8 @@ struct Options {
     textures: TextureSource,
     /// Game ticks of fluid flow after the edits.
     flow: u32,
+    /// Seconds of the fluid animation (`ViewParams::fluid_time`).
+    fluid_time: f64,
     /// `--world-dir`: where the world is loaded from and saved.
     world_dir: Option<PathBuf>,
 }
@@ -160,6 +164,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         timeout: Duration::from_secs(300),
         textures: TextureSource::Procedural,
         flow: 0,
+        fluid_time: 0.0,
         world_dir: None,
     };
     let mut it = args.iter();
@@ -228,6 +233,14 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                     .ok()
                     .filter(|&n| n <= 100_000)
                     .ok_or_else(|| format!("{flag}: {v:?} is not in 0..=100000"))?;
+            }
+            "--fluid-time" => {
+                let v = value()?;
+                o.fluid_time = v
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|s| s.is_finite() && *s >= 0.0)
+                    .ok_or_else(|| format!("{flag}: {v:?} is not a number of seconds >= 0"))?;
             }
             "--pack" => o.textures = pack::parse(flag, &value()?)?,
             "--world-dir" => o.world_dir = Some(PathBuf::from(value()?)),
@@ -761,6 +774,7 @@ fn run(
         let (sky_color, light) = scene_light(*hours, &settings);
         let params = ViewParams {
             light,
+            fluid_time: (o.fluid_time % FLUID_TIME_PERIOD) as f32,
             ..ViewParams::from_camera(&view, &camera, sky_color, settings.fog_start_fraction)
         };
         // The first frame uploads; the second draws exactly what a steady game frame draws.
@@ -824,11 +838,18 @@ mod tests {
             "640x360",
             "--light",
             "off",
+            "--fluid-time",
+            "1.25",
         ]);
         let o = parse(&args).expect("valid").expect("not help");
         assert_eq!(o.shots[1], (18.5, PathBuf::from("dusk.png")));
         assert_eq!(o.size, (640, 360));
         assert!(!o.light);
+        assert_eq!(o.fluid_time, 1.25);
+        assert_eq!(
+            parse(&BASE).expect("valid").expect("not help").fluid_time,
+            0.0
+        );
         for bad in [
             &["--shot", "25:00=x.png"][..],
             &["--shot", "12:00="],
@@ -837,6 +858,8 @@ mod tests {
             &["--camera", "1,2,3"],
             &["--camera", "3e18,0,0,0,0"],
             &["--ao", "on"],
+            &["--fluid-time", "-1"],
+            &["--fluid-time", "soon"],
             &["--pack", "/nonexistent/boxel/pack"],
         ] {
             let mut args = BASE.to_vec();

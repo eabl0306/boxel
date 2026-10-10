@@ -4,12 +4,12 @@
 mod common;
 
 use boxel_mesh::{
-    AoPolicy, ChunkMesh, FLUID_FLAT, FLUID_SURFACE_BIT, LightQuantization, MaterialTable,
-    MeshInput, MeshOptions, Mesher, PackedQuad, PaddedChunk, TRANSLUCENT_BUCKET, layout,
-    reference_fluid_heights,
+    AoPolicy, BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, FLUID_FLAT, FLUID_SURFACE_BIT,
+    LightQuantization, MaterialTable, MeshInput, MeshOptions, Mesher, PackedQuad, PaddedChunk,
+    TRANSLUCENT_BUCKET, layout, reference_fluid_heights,
 };
 use boxel_voxel::{BlockRegistry, BlockState, ChunkData, Face, NEIGHBOR_OFFSETS};
-use common::{LIGHT_FILLS, Repr, chunk_repr, dense_from, random_light, verify_mesh};
+use common::{LIGHT_FILLS, Repr, chunk_repr, dense_from, neighbor_slot, random_light, verify_mesh};
 use std::collections::BTreeMap;
 
 const OPTIONS: MeshOptions = MeshOptions::with_ao(AoPolicy::BakedLitOnly);
@@ -314,6 +314,68 @@ fn a_calm_lake_stays_one_greedy_quad_and_a_waterfall_slopes_it() {
     // Own 112 at weight 10 and two air sides at weight 1: 1120 / 12 = 93.3 -> 12/16.
     assert_eq!(sloped[&[10, 6, 10]], [12; 4]);
     assert_eq!(mesh.light_quantization, LightQuantization::Exact);
+}
+
+#[test]
+fn sloping_lava_tops_go_to_the_cutout_bucket() {
+    // Lava spreading on a stone floor in the chunk's bottom layer (a source and levels 2, 4 and
+    // 6), and lava falling onto it from a column: the tops that slope face eyes below the chunk
+    // on their downhill side, where the renderer drops the whole +Y bucket (ADR 0025), so they go
+    // to the cutout bucket. Level tops and every side stay in their face bucket; water's sloping
+    // tops stay translucent.
+    let (registry, table) = registry();
+    let stone = state(&registry, "boxel:stone");
+    let lava = |l: i32| state(&registry, &format!("boxel:lava[level={l}]"));
+    let water = |l: i32| state(&registry, &format!("boxel:water[level={l}]"));
+    let dense = dense_from(|x, y, z| {
+        let d = (x - 8).abs() + (z - 8).abs();
+        let w = (x - 24).abs() + (z - 8).abs();
+        match (x, y, z) {
+            (8, 1..=3, 20) => lava(8),
+            (8, 4, 20) => lava(0),
+            (7..=9, 0, 19..=21) => lava(if (x, z) == (8, 20) { 8 } else { 2 }),
+            _ if y == 0 && d <= 3 => lava(2 * d),
+            _ if y == 0 && w <= 3 => water(w),
+            _ => BlockState::AIR,
+        }
+        .0
+    });
+    let chunk = chunk_repr(&dense, Repr::Packed);
+    let below = ChunkData::uniform(stone);
+    let mut neighbors = [None; 26];
+    neighbors[neighbor_slot(0, -1, 0)] = Some(&below);
+    let input = MeshInput {
+        center: &chunk,
+        neighbors,
+        light: None,
+    };
+    let mut padded = PaddedChunk::new();
+    let mut mesher = Mesher::new();
+    mesher.gather(&input, &table, &mut padded);
+    let mesh = mesher.mesh_chunk(&input, &table, OPTIONS);
+    verify_mesh(&padded, &table, &mesh);
+    let lava_layers = [Face::PosY, Face::PosX].map(|f| table.layer(lava(0).0, f));
+    let (mut sloping, mut level) = (0, 0);
+    for b in 0..BUCKET_COUNT {
+        for q in mesh.bucket(b) {
+            let Some(h) = q.fluid_heights() else {
+                continue;
+            };
+            let flat = h.iter().all(|&c| c == h[0]);
+            if !lava_layers.contains(&q.layer()) {
+                assert_eq!(b, TRANSLUCENT_BUCKET, "{q:?}: water");
+            } else if q.face() == Face::PosY && !flat {
+                assert_eq!(b, CUTOUT_BUCKET, "{q:?}: a sloping lava top");
+                sloping += 1;
+            } else {
+                assert_eq!(b, q.face().index(), "{q:?}");
+                level += usize::from(q.face() == Face::PosY);
+            }
+        }
+    }
+    // The spread's 25 cells slope but the source's (its 4 corners average the same cells), and
+    // the 8 cells around the fall rise to it.
+    assert_eq!((sloping, level), (24 + 8, 2), "sloping and level lava tops");
 }
 
 #[test]

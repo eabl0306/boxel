@@ -35,7 +35,7 @@ use boxel_mesh::{
 };
 use boxel_render::{DEFAULT_SKY_COLOR, RendererConfig, TranslucentSort, ViewParams, VoxelRenderer};
 use boxel_transform::Transform;
-use boxel_voxel::{BlockRegistry, BlockState, ChunkData, LocalPos};
+use boxel_voxel::{BlockRegistry, BlockState, ChunkData, Face, LocalPos};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -260,12 +260,22 @@ fn faces_away(quad: PackedQuad, eye: DVec3) -> bool {
     positive != (eye.to_array()[n] > plane)
 }
 
+/// The block a translucent quad's texture layer belongs to (its top layer): water's side faces
+/// show its flow texture (ADR 0025), another layer of the same block.
+fn block_layer(registry: &BlockRegistry, layer: u16) -> u16 {
+    (0..registry.len() as u16)
+        .map(BlockState)
+        .map(|s| Face::ALL.map(|f| registry.face_texture(s, f).0))
+        .find(|faces| faces.contains(&layer))
+        .map_or(layer, |faces| faces[Face::PosY.index()])
+}
+
 /// The reference groups of a scene of convex blocks (one material each), drawn in this order:
 /// per block, farthest first, its faces looking away from `eye`, then the ones looking at it.
-/// Faces of one group never overlap on screen.
-fn reference_groups(mesh: &ChunkMesh, eye: DVec3) -> Vec<ChunkMesh> {
+/// Faces of one group never overlap on screen. `block` names the block of a texture layer.
+fn reference_groups(mesh: &ChunkMesh, eye: DVec3, block: impl Fn(u16) -> u16) -> Vec<ChunkMesh> {
     let quads = mesh.bucket(TRANSLUCENT_BUCKET);
-    let mut layers: Vec<u16> = quads.iter().map(|q| q.layer()).collect();
+    let mut layers: Vec<u16> = quads.iter().map(|q| block(q.layer())).collect();
     layers.sort_unstable();
     layers.dedup();
     // distance from the eye to each block's center (the mean of its quads' min corners is
@@ -273,7 +283,7 @@ fn reference_groups(mesh: &ChunkMesh, eye: DVec3) -> Vec<ChunkMesh> {
     let center = |layer: u16| {
         let corners: Vec<DVec3> = quads
             .iter()
-            .filter(|q| q.layer() == layer)
+            .filter(|q| block(q.layer()) == layer)
             .map(|q| DVec3::from_array(q.pos().map(f64::from)))
             .collect();
         corners.iter().sum::<DVec3>() / corners.len() as f64
@@ -288,7 +298,7 @@ fn reference_groups(mesh: &ChunkMesh, eye: DVec3) -> Vec<ChunkMesh> {
             let group: Vec<PackedQuad> = quads
                 .iter()
                 .copied()
-                .filter(|&q| q.layer() == layer && faces_away(q, eye) == away)
+                .filter(|&q| block(q.layer()) == layer && faces_away(q, eye) == away)
                 .collect();
             if !group.is_empty() {
                 groups.push(translucent_mesh(mesh, group));
@@ -393,7 +403,8 @@ fn render_tier(
             if scene.blocks {
                 renderer.clear_chunks();
                 renderer.set_translucent_sort(TranslucentSort::Off);
-                for (i, group) in reference_groups(&mesh, eye).into_iter().enumerate() {
+                let block = |layer| block_layer(&registry, layer);
+                for (i, group) in reference_groups(&mesh, eye, block).into_iter().enumerate() {
                     renderer
                         .upsert_chunk(10 + i as u64, I64Vec3::ZERO, Arc::new(group))
                         .map_err(|e| e.to_string())?;

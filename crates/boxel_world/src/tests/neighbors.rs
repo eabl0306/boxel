@@ -94,11 +94,11 @@ fn fences_connect_to_fences_and_full_faces() {
     );
     assert_eq!(
         at(&app, f),
-        "boxel:oak_fence[east=true,north=true,south=false,west=false]"
+        "boxel:oak_fence[east=true,north=true,south=false,waterlogged=false,west=false]"
     );
     assert_eq!(
         at(&app, g),
-        "boxel:oak_fence[east=false,north=false,south=false,west=true]"
+        "boxel:oak_fence[east=false,north=false,south=false,waterlogged=false,west=true]"
     );
     // A bottom slab's side is not a full face; a torch is nothing to connect to.
     edit(
@@ -110,7 +110,39 @@ fn fences_connect_to_fences_and_full_faces() {
     );
     assert_eq!(
         at(&app, f),
-        "boxel:oak_fence[east=true,north=false,south=false,west=false]"
+        "boxel:oak_fence[east=true,north=false,south=false,waterlogged=false,west=false]"
+    );
+}
+
+#[test]
+fn waterlogged_blocks_keep_their_water_when_their_shape_changes() {
+    let mut app = app();
+    let (f, stairs, wall) = (
+        BlockPos::new(8, 0, 8),
+        BlockPos::new(8, 0, 10),
+        BlockPos::new(9, 0, 8),
+    );
+    edit(
+        &mut app,
+        &[
+            (f, "boxel:oak_fence[waterlogged=true]"),
+            (stairs, "boxel:stone_stairs[facing=east,waterlogged=true]"),
+        ],
+    );
+    edit(
+        &mut app,
+        &[
+            (wall, "boxel:stone"),
+            (BlockPos::new(9, 0, 10), "boxel:oak_stairs[facing=north]"),
+        ],
+    );
+    assert_eq!(
+        at(&app, f),
+        "boxel:oak_fence[east=true,north=false,south=false,waterlogged=true,west=false]"
+    );
+    assert_eq!(
+        at(&app, stairs),
+        "boxel:stone_stairs[facing=east,half=bottom,shape=outer_left,waterlogged=true]"
     );
 }
 

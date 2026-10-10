@@ -47,7 +47,7 @@ pub use registry::{
     Axis, BlockCollision, BlockDef, BlockId, BlockModel, BlockRegistry, BlockRegistryBuilder,
     BlockState, BuiltinLamp, CollisionBox, FLUID_LEVEL, FaceTextures, LAMPS, LAVA_EMISSION,
     MAX_STATES, RegistryError, RenderShape, SlabHalf, StateFlags, TORCH_EMISSION, TextureId,
-    TexturePattern, TextureSpec,
+    TexturePattern, TextureSpec, WATERLOGGED,
 };
 pub use shapes::{Facing, FenceSides, MAX_MODEL_BOXES, ModelBox, StairShape};
 pub use state::{Property, StateName, StateParseError, StateValues};

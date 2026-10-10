@@ -141,9 +141,10 @@ Las de `FlowingFluid` de Minecraft Java:
   tres tiers dibujan agua inclinada igual píxel a píxel.
 - Rendimiento: ver las mediciones abajo.
 - Un `BodySettings` cambiado por el juego mientras el cuerpo está en el agua se pierde al salir.
-- Los ticks congelados de un chunk que nunca vuelve quedan en memoria. Hoy los chunks no se
-  guardan, así que un chunk que vuelve se genera de nuevo y el tick corre sobre él (si ya no hay
-  agua, no hace nada).
+- Los ticks congelados de un chunk que nunca vuelve quedan en memoria. Sin persistencia, un
+  chunk que vuelve se genera de nuevo y el tick corre sobre él (si ya no hay agua, no hace nada).
+  Con `PersistPlugin` el chunk editado vuelve tal como se guardó y los ticks pendientes se
+  guardan con el mundo (ADR 0024).
 - En un mundo con límites verticales, un tick que lee fuera de ellos espera para siempre.
 
 ## Mediciones
@@ -181,6 +182,9 @@ grandes y el p50.
 - La lava que corre (la lava sigue siendo un cubo opaco que brilla).
 - `waterlogged` (bloques con agua adentro) y las interacciones agua y lava.
 - Guardar los ticks con los chunks (llega con la persistencia, M1).
+
+Las tres primeras y la pared de agua junto a las cuevas (sección 5) están hechas en el ADR 0025.
+Guardar los ticks está hecho en el ADR 0024.
 
 ## Alternativas descartadas
 

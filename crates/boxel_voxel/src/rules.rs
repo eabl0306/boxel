@@ -6,6 +6,9 @@
 //! A rule only reads what no rule changes (whether a neighbor is stairs and its `facing` and
 //! `half`, whether it is a fence, its collision faces), so one ring of updates around each edit
 //! is enough: a state a rule changed never makes another rule change its answer.
+//!
+//! Also the water of the blocks that hold it when a player places or breaks one (ADR 0025):
+//! [`placed_into`] and [`broken`].
 use crate::shapes::{Facing, StairShape, half_name};
 use crate::{BlockCollision, BlockModel, BlockRegistry, BlockState, Face, RenderShape, SlabHalf};
 
@@ -213,4 +216,37 @@ pub fn stairs_with(
 ) -> Option<BlockState> {
     let s = registry.with(stairs, "facing", facing.name())?;
     registry.with(s, "half", half_name(half))
+}
+
+/// The water source of `registry` (`boxel:water`, its default state: level 0), if it has one.
+fn water_source(registry: &BlockRegistry) -> Option<BlockState> {
+    registry
+        .by_name("boxel:water")
+        .filter(|&w| registry.model(w) == BlockModel::Fluid)
+}
+
+/// The state `placed` takes in a cell that holds `existing` (Minecraft's `getStateForPlacement`
+/// of the blocks that hold water, ADR 0025): a block that can be waterlogged keeps a water
+/// source it is placed into and is dry anywhere else (flowing water is replaced, not kept).
+/// Other blocks are `placed` as it is.
+pub fn placed_into(
+    registry: &BlockRegistry,
+    placed: BlockState,
+    existing: BlockState,
+) -> BlockState {
+    if !registry.can_be_waterlogged(placed) {
+        return placed;
+    }
+    let wet = water_source(registry) == Some(existing);
+    registry.with_water(placed, wet).unwrap_or(placed)
+}
+
+/// What breaking `state` leaves in its cell (Minecraft keeps a block's fluid when it breaks,
+/// ADR 0025): a water source for a waterlogged block, air for anything else.
+pub fn broken(registry: &BlockRegistry, state: BlockState) -> BlockState {
+    if registry.is_waterlogged(state) {
+        water_source(registry).unwrap_or(BlockState::AIR)
+    } else {
+        BlockState::AIR
+    }
 }

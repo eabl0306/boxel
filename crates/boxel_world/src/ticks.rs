@@ -20,6 +20,9 @@
 //!   scheduled `delay` ticks later (Minecraft's neighbor updates and `onPlace`). A tick's own
 //!   writes notify at its due tick; other edits (players, tools) at the current tick, from the
 //!   frame's `BlockChanged` messages.
+//! - A handler may also react at once to those changes ([`TickHandler::react`], lava meeting
+//!   water): right inside the write for a tick's writes, at the start of the next frame's ticks
+//!   for other edits.
 use crate::{BlockChanged, BlockEdit, ChunkDataEvent, ChunkMap, EditQueue, WorldContent};
 use boxel_ecs::prelude::*;
 use boxel_voxel::{BlockId, BlockPos, BlockRegistry, BlockState, ChunkData, ChunkPos, Face};
@@ -35,6 +38,7 @@ const FIXED_STEPS_PER_SECOND: u64 = crate::TICKS_PER_SECOND;
 
 /// What a block does when its tick comes: `tick` runs `delay` game ticks after a change at or
 /// next to the block, reading at most `reach` blocks away (horizontally, and down and up).
+/// `react`, if any, runs at once on such a change, before the tick is scheduled.
 #[derive(Clone, Copy, Debug)]
 pub struct TickHandler {
     /// Game ticks from a change to the tick (at least 1).
@@ -44,6 +48,12 @@ pub struct TickHandler {
     pub reach: [u32; 3],
     /// The update.
     pub tick: fn(&mut TickContext<'_>, BlockPos, BlockState),
+    /// Minecraft's `neighborChanged` (lava turning to stone next to water, ADR 0025): runs when
+    /// the block or one of its 6 neighbors changes, right then for a tick's writes and at the
+    /// start of the next frame's ticks (before any due tick) for other edits. It reads only
+    /// the block's 6 neighbors (`None` where a chunk is not loaded) and may write the block; if
+    /// it does, the old state's tick is not scheduled.
+    pub react: Option<fn(&mut TickContext<'_>, BlockPos, BlockState)>,
 }
 
 /// Knobs of the block ticks. Read every frame.
@@ -161,6 +171,9 @@ pub struct BlockTicks {
     /// The last frame's writes (final state per position), to tell their `BlockChanged`
     /// echoes from other edits.
     echoes: HashMap<BlockPos, BlockState, foldhash::fast::FixedState>,
+    /// Other edits whose blocks or neighbors react ([`TickHandler::react`]), in order, with the
+    /// game tick they happened at: run at the start of the next `run_ticks`.
+    reactions: Vec<(BlockPos, u64)>,
     stats: BlockTickStats,
 }
 
@@ -195,6 +208,25 @@ impl BlockTicks {
         };
         for state in registry.states(block) {
             self.handlers[usize::from(state.0)] = Some(handler);
+        }
+    }
+
+    /// Registers `handler` for `state` alone (replaces an earlier one): the water of a
+    /// waterlogged block, for instance, ticks while the dry states of its block do not.
+    pub fn register_state(
+        &mut self,
+        registry: &BlockRegistry,
+        state: BlockState,
+        handler: TickHandler,
+    ) {
+        if self.handlers.len() < registry.len() {
+            self.handlers.resize(registry.len(), None);
+        }
+        if let Some(slot) = self.handlers.get_mut(usize::from(state.0)) {
+            *slot = Some(TickHandler {
+                delay: handler.delay.max(1),
+                ..handler
+            });
         }
     }
 
@@ -254,19 +286,30 @@ impl BlockTicks {
     }
 
     /// Schedules the blocks at and around `pos` that have a handler, `delay` after `at`, as a
-    /// change at `pos` does. `state_at` reads the blocks.
+    /// change at `pos` does, and keeps `pos` for the reactions of the next frame if one of
+    /// those blocks reacts. `state_at` reads the blocks.
     fn notify(
         &mut self,
         pos: BlockPos,
         at: u64,
         state_at: impl Fn(BlockPos) -> Option<BlockState>,
     ) {
-        for p in std::iter::once(pos).chain(Face::ALL.map(|f| offset(pos, f))) {
+        let mut reacts = false;
+        for p in around(pos) {
             if let Some(handler) = state_at(p).and_then(|s| self.handler(s)) {
+                reacts |= handler.react.is_some();
                 self.queue.schedule(p, at + u64::from(handler.delay));
             }
         }
+        if reacts {
+            self.reactions.push((pos, at));
+        }
     }
+}
+
+/// `pos` and its 6 neighbors, in the order a change notifies them (`Face::ALL`).
+fn around(pos: BlockPos) -> impl Iterator<Item = BlockPos> {
+    std::iter::once(pos).chain(Face::ALL.map(|f| offset(pos, f)))
 }
 
 /// `pos` moved one block across `face`.
@@ -323,21 +366,49 @@ impl<'a> TickContext<'a> {
     }
 
     /// Writes `state` at `pos` (nothing if it is already there) and notifies `pos` and its
-    /// neighbors: those with a tick handler are scheduled their delay after this tick.
+    /// neighbors in order: each one with a tick handler first reacts ([`TickHandler::react`],
+    /// which may write it in turn) and, unless that changed it, is scheduled its delay after
+    /// this tick.
     pub fn set(&mut self, pos: BlockPos, state: BlockState) {
         if self.get(pos) == Some(state) {
             return;
         }
         self.overlay.insert(pos, state);
         self.writes.push(BlockEdit { pos, state });
-        let (map, overlay, cache) = (self.map, &*self.overlay, &self.cache);
-        let state_at = |p: BlockPos| {
-            overlay
-                .get(&p)
-                .copied()
-                .or_else(|| map_block(map, cache, p))
+        for p in around(pos) {
+            self.notify(p, true);
+        }
+    }
+
+    /// A change at or next to `p`: its reaction (if `react`) and the schedule of its tick.
+    fn notify(&mut self, p: BlockPos, react: bool) {
+        let Some(state) = self.get(p) else {
+            return;
         };
-        self.ticks.notify(pos, self.tick, state_at);
+        let Some(handler) = self.ticks.handler(state) else {
+            return;
+        };
+        if let (true, Some(react)) = (react, handler.react) {
+            react(self, p, state);
+            if self.get(p) != Some(state) {
+                return;
+            }
+        }
+        self.ticks
+            .queue
+            .schedule(p, self.tick + u64::from(handler.delay));
+    }
+
+    /// The reactions of a change at `pos` made by another edit (already scheduled).
+    fn react_around(&mut self, pos: BlockPos) {
+        for p in around(pos) {
+            let Some(state) = self.get(p) else {
+                continue;
+            };
+            if let Some(react) = self.ticks.handler(state).and_then(|h| h.react) {
+                react(self, p, state);
+            }
+        }
     }
 
     /// Schedules a tick of `pos` `delay` game ticks after this one (unless one already waits).
@@ -463,11 +534,12 @@ fn run_ticks(
     let now = ticks.now;
     ticks.stats.ran = 0;
     ticks.stats.written = 0;
-    if ticks
-        .queue
-        .ticks
-        .first_key_value()
-        .is_none_or(|(k, _)| k.0 > now)
+    if ticks.reactions.is_empty()
+        && ticks
+            .queue
+            .ticks
+            .first_key_value()
+            .is_none_or(|(k, _)| k.0 > now)
     {
         ticks.stats.behind = 0;
         return;
@@ -476,6 +548,19 @@ fn run_ticks(
     let mut overlay = HashMap::with_hasher(foldhash::fast::FixedState::default());
     let mut writes = Vec::new();
     let mut loaded = HashMap::with_hasher(foldhash::fast::FixedState::default());
+    // The reactions to other edits, at the ticks they happened at, before any due tick.
+    for (pos, at) in std::mem::take(&mut ticks.reactions) {
+        let mut cx = TickContext {
+            map: &map,
+            registry: &content.registry,
+            overlay: &mut overlay,
+            writes: &mut writes,
+            ticks: &mut *ticks,
+            tick: at,
+            cache: Cell::new(None),
+        };
+        cx.react_around(pos);
+    }
     let mut ran = 0usize;
     loop {
         if ran >= settings.min_ticks_per_frame

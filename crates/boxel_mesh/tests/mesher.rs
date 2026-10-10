@@ -343,7 +343,23 @@ fn emissive_blocks_flag_their_quads() {
             5 * emitters.len(),
             "5 faces per emitter (the floor hides one)"
         );
-        assert!(mesh.quads.iter().all(|q| q.flags() & !1 == 0));
+        // Cube faces, but lava's: an opaque fluid whose top slopes down to the air around it
+        // (ADR 0025), drawn in the opaque face buckets, its still texture on the level top
+        // and its flow texture on the sides. A lone lava block's 4 corners are at one height,
+        // so its top stays in the +Y bucket (a sloping one would go to the cutout bucket).
+        let lava = block(&registry, "lava").0;
+        let lava = [Face::PosY, Face::PosX].map(|f| table.layer(lava, f));
+        assert_ne!(lava[0], lava[1]);
+        for (b, q) in (0..BUCKET_COUNT).flat_map(|b| mesh.bucket(b).iter().map(move |q| (b, q))) {
+            if lava.contains(&q.layer()) {
+                assert_eq!(q.shape(), layout::SHAPE_FLUID_SLOPE, "{q:?}");
+                assert_eq!(b, q.face().index(), "{q:?}");
+                let h = q.fluid_heights().expect("a sloped cell");
+                assert!(h.iter().all(|&c| c == h[0]), "{q:?}");
+            } else {
+                assert_eq!(q.shape(), layout::SHAPE_CUBE, "{q:?}");
+            }
+        }
     }
     // A table without emitters (from_parts) flags nothing until set_emissive.
     let mut parts = test_table();

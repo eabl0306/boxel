@@ -40,6 +40,10 @@ pub mod layout {
     /// A cube face whose texture is turned a quarter (transposed: its vertical runs along the
     /// face's u axis), for logs lying along X or Z. Greedy quads too.
     pub const SHAPE_TURNED: u8 = 1;
+    /// A cube face of a fluid cell that is not a surface cell (under its own fluid or an
+    /// opaque block; ADR 0025): drawn as [`SHAPE_CUBE`], but its side faces carry the fluid's
+    /// flow texture, which the shader scrolls down with the time (a waterfall). Greedy quads.
+    pub const SHAPE_FLUID_CUBE: u8 = 2;
     /// A cross plant quad through the cell's diagonal, full height: face `PosX` is the one from
     /// `(0, 0)` to `(1, 1)` in (x, z), face `PosZ` the one from `(1, 0)` to `(0, 1)`. Drawn from
     /// both sides (cutout pipeline), without face shading, its light is the block's own cell.
@@ -48,6 +52,7 @@ pub mod layout {
     /// [`FLUID_SURFACE`] of a block. The +Y face lies there and the side faces span `y` in
     /// `0..FLUID_SURFACE`; the -Y face is the cube's. Greedy quads (any `w`; side faces have
     /// `h = 1`, since a surface cell never has a surface cell of its fluid above or below it).
+    /// The side faces carry the flow texture, scrolled down with the time (ADR 0025).
     pub const SHAPE_FLUID_SURFACE: u8 = 5;
     /// Height of a fluid's surface within its cell (14/16, about Minecraft's 8/9).
     pub const FLUID_SURFACE: f32 = 0.875;
@@ -58,16 +63,26 @@ pub mod layout {
     /// each, `height - 1`) and the AO byte those of corners 2 and 3 (the quad has no AO). Corner
     /// `k` of the cell's top is at `(x, z) = (k & 1, k >> 1)`. The +Y face is the quad through
     /// the 4 corners, the side faces run from `y = 0` up to the corners of their edge and the
-    /// -Y face is the cube's.
+    /// -Y face is the cube's. The side faces carry the fluid's flow texture, and so does the
+    /// top when its corners slope ([`fluid_flow`](crate::fluid_flow) is not zero, ADR 0025):
+    /// the shader scrolls it with the time, down the sides and down the slope on the top.
     pub const SHAPE_FLUID_SLOPE: u8 = 7;
     /// Shift of the corner heights in `geo` of a [`SHAPE_FLUID_SLOPE`] quad (corners 0 and 1).
     pub const GEO_FLUID_SHIFT: u32 = GEO_W_SHIFT;
+    /// Bit of `geo` of a [`SHAPE_FLUID_SLOPE`] quad (the first one after its corner heights):
+    /// the water of a waterlogged block (ADR 0025). Its side and bottom faces sit
+    /// [`FLUID_INSET`] inside the cell, as Minecraft draws them, so the block's own faces on
+    /// the cell border are always in front of them.
+    pub const GEO_FLUID_INSET_BIT: u32 = 1 << (GEO_FLUID_SHIFT + 8);
+    /// How far inside its cell the side and bottom faces of a waterlogged block's water sit:
+    /// 1/512 of a block (Minecraft's is 0.001).
+    pub const FLUID_INSET: f32 = 1.0 / 512.0;
     /// A face of one box of a block model made of boxes (slabs, stairs, fences, torches; ADR
     /// 0020): the quad's `w - 1` and `h - 1` bits hold the box's index in the model box table
     /// (`MaterialTable::model_boxes`, [`GEO_BOX_SHIFT`]), which the shader reads from its view
     /// uniform. The face lies on the box's side toward the quad's face, spans the box along u
-    /// and v, and shades like that part of the cube face. Codes 2 and 3 (the slab halves of
-    /// ADR 0018) are free: slabs are boxes too.
+    /// and v, and shades like that part of the cube face. Code 3 (a slab half of ADR 0018) is
+    /// free: slabs are boxes too.
     pub const SHAPE_BOX: u8 = 6;
     /// Shift of the model box index of a [`SHAPE_BOX`] quad (the `w - 1` and `h - 1` fields).
     pub const GEO_BOX_SHIFT: u32 = GEO_W_SHIFT;
@@ -217,6 +232,18 @@ impl PackedQuad {
             (high & 15) as u8 + 1,
             ((high >> 4) & 15) as u8 + 1,
         ])
+    }
+    /// True for a [`layout::SHAPE_FLUID_SLOPE`] quad of a waterlogged block's water
+    /// ([`layout::GEO_FLUID_INSET_BIT`]).
+    pub const fn fluid_inset(self) -> bool {
+        self.shape() == layout::SHAPE_FLUID_SLOPE && self.geo & layout::GEO_FLUID_INSET_BIT != 0
+    }
+    /// The [`layout::SHAPE_FLUID_SLOPE`] quad with its [`layout::GEO_FLUID_INSET_BIT`] set
+    /// (debug-asserts the shape).
+    pub const fn with_fluid_inset(mut self) -> Self {
+        debug_assert!(self.shape() == layout::SHAPE_FLUID_SLOPE);
+        self.geo |= layout::GEO_FLUID_INSET_BIT;
+        self
     }
     /// The quad with shape [`layout::SHAPE_FLUID_SLOPE`] and these corner heights (sixteenths,
     /// `1..=16`, debug-asserted). Debug-asserts `w = h = 1`; replaces the AO byte.

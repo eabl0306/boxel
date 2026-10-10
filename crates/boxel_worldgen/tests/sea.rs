@@ -169,3 +169,99 @@ fn nothing_grows_under_water_or_on_the_beach() {
         }
     }
 }
+
+/// The overworld's water cells next to a cell they could flow into (air or a plant beside or
+/// below them), in a block of `n` x `n` chunk columns from chunk `(cx, cz)`, layers 0 and 1 (all
+/// the water of the default sea and the cells around it; cells next to the block's sides are left
+/// out). Also returns the cells beside water the caves would have carved without the sea (their
+/// density carves them, they are not under the sea floor).
+fn open_shores(g: &OverworldGenerator, cx: i64, cz: i64, n: i64) -> (Vec<BlockPos>, Vec<BlockPos>) {
+    let r = BlockRegistry::default_blocks();
+    let water = r.by_name("boxel:water").unwrap();
+    let plants = [
+        r.by_name("boxel:short_grass").unwrap(),
+        r.by_name("boxel:poppy").unwrap(),
+    ];
+    let caves = g.settings.caves.as_ref().unwrap();
+    let side = n * 32;
+    let mut cells = vec![BlockState::AIR; (side * side * 64) as usize];
+    let index = |x: i64, y: i64, z: i64| ((y * side + x) * side + z) as usize;
+    for i in 0..n {
+        for j in 0..n {
+            for layer in 0..=1 {
+                let d = dense(g, &r, ChunkPos::new(cx + i, layer, cz + j));
+                for (k, &s) in d.iter().enumerate() {
+                    let l = LocalPos::from_index(k);
+                    let (x, y, z) = (
+                        i * 32 + i64::from(l.x()),
+                        layer * 32 + i64::from(l.y()),
+                        j * 32 + i64::from(l.z()),
+                    );
+                    cells[index(x, y, z)] = s;
+                }
+            }
+        }
+    }
+    let (mut open, mut kept) = (Vec::new(), Vec::new());
+    for y in 1..64 {
+        for x in 1..side - 1 {
+            for z in 1..side - 1 {
+                if cells[index(x, y, z)] != water {
+                    continue;
+                }
+                for (dx, dy, dz) in [(1, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1), (0, -1, 0)] {
+                    let s = cells[index(x + dx, y + dy, z + dz)];
+                    let p = BlockPos::new(cx * 32 + x + dx, y + dy, cz * 32 + z + dz);
+                    if s == BlockState::AIR || plants.contains(&s) {
+                        open.push(p);
+                    } else if s != water {
+                        let h = g.height_at(p.x, p.z);
+                        if p.y <= h.saturating_sub(Sea::FLOOR) || !Sea::default().covers(h) {
+                            let carved = caves.carves(g.seed, p, h, |x, z| g.height_at(x, z));
+                            if carved && g.beside_sea(p) {
+                                kept.push(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    kept.sort_by_key(|p| (p.x, p.y, p.z));
+    kept.dedup();
+    (open, kept)
+}
+
+#[test]
+fn caves_never_open_beside_the_sea() {
+    let g = OverworldGenerator::default();
+    let r = BlockRegistry::default_blocks();
+    // Blocks of 16 x 16 chunk columns near the origin, across +-2^31 voxels, at 2^40 and near
+    // the world limit.
+    let mut kept_near_origin = 0;
+    for (cx, cz) in [
+        (-8, -8),
+        ((1 << 26) - 8, -(1 << 26) - 8),
+        (1 << 35, -(1 << 35)),
+        (MAX_CHUNK_COORD - 40, -MAX_CHUNK_COORD + 40),
+    ] {
+        let (open, kept) = open_shores(&g, cx, cz, 16);
+        assert!(
+            open.is_empty(),
+            "water next to air at {:?}",
+            &open[..open.len().min(8)]
+        );
+        // The point form agrees: a kept cell is solid in `block_at`.
+        for &p in kept.iter().step_by(5) {
+            assert_ne!(g.block_at(p, &r), BlockState::AIR, "{p:?}");
+        }
+        if cx == -8 {
+            kept_near_origin = kept.len();
+        }
+    }
+    // Without the rule, caves near the origin open beside the sea.
+    assert!(
+        kept_near_origin > 0,
+        "no cave reached the sea near the origin"
+    );
+}

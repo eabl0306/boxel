@@ -151,7 +151,7 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_mesh` | `PackedQuad`, `ChunkMesh` con su paleta de luz, `PaddedChunk`, `Mesher` (fork de bgm que fusiona por material, AO y luz) | voxel |
 | `boxel_light` | luz de vóxeles en CPU, sin ECS ni GPU (ADR 0015): techos de cielo por columna (`SkyTile`, caminata hacia abajo), luz exacta de un chunk desde una caja de 64³ (cielo y RGB, caminos rápidos para cuevas oscuras y cielo abierto), `PaddedLight`, `ChunkLight`; oráculo global para los tests | voxel |
 | `boxel_worldgen` | trait `WorldGenerator`; generadores `FlatGenerator`, `TerrainGenerator`, `ForestGenerator` (terreno con árboles) y `OverworldGenerator` (superficie sobre piedra infinita hacia abajo, con cuevas y árboles; etapas en `overworld`: `Heightmap`, `SurfaceRules`, `Caves`, más `Trees`); `Sea` (mar y playas en el forest y el overworld, ADR 0021); ruido 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`) | voxel |
-| `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, mensajes (`ChunkMeshEvent`, `BlockChanged`, `ChunkDataEvent`), guardar y cargar el mundo (`persist`: `ChunkStore`, `RedbStore`, `WorldStore`, `PersistPlugin`, ADR 0024), reloj del mundo (`TimeOfDay`, `DaylightCurve`, `DaylightPlugin`), ticks programados de bloques (`BlockTicks`, `BlockTicksPlugin`), agua que corre (`FluidPlugin`, ADR 0021) y la búsqueda de la ocultación de cuevas (`ChunkVisibility`, `visibility`, ADR 0022) | app, voxel, mesh, light, worldgen, transform, diagnostic |
+| `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, mensajes (`ChunkMeshEvent`, `BlockChanged`, `ChunkDataEvent`), guardar y cargar el mundo (`persist`: `ChunkStore`, `RedbStore`, `WorldStore`, `PersistPlugin`, ADR 0024), reloj del mundo (`TimeOfDay`, `DaylightCurve`, `DaylightPlugin`), ticks programados de bloques (`BlockTicks`, `BlockTicksPlugin`), agua y lava que corren y bloques con agua (`FluidPlugin`, ADR 0021 y 0025) y la búsqueda de la ocultación de cuevas (`ChunkVisibility`, `visibility`, ADR 0022) | app, voxel, mesh, light, worldgen, transform, diagnostic |
 | `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `SceneLight` (luz del cielo, ambiente y curva de brillo del frame), `PresentSettings` (vsync en tiempo de ejecución), texturas procedurales o de un resource pack (`TextureSource`), screenshots, ocultación de cuevas en los tres tiers (ADR 0022), conteo de draws en CPU (`cull_counts`) | gfx, shaders, world, camera, window, pack |
 | `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::collision`: cubos y cajas, más un contorno para apuntar, ADR 0018), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas, el integrador de un cuerpo (`step_body`, `predict`), el narrowphase (`shape_contact`) y la grilla del broadphase (`Grid`). Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`; pasos en `FixedPostUpdate`, interpolación en `AfterFixedMainLoop`), `PhysicsQuery` (rayos a vóxeles y cuerpos, cajas, el chequeo para poner bloques), `BodyIndex`, cuerpos (`RigidBody`, `Collider`, `Velocity`, `BodyPosition`, `Contacts`, `Interpolated`, `Teleport`, `Frozen`, `Sleeping`, `ReportContacts`), `CharacterController`, `Projectile`, nadar (`SwimPlugin`, `Swimmer`, ADR 0021) y los mensajes `VoxelImpact`, `CollisionStarted`, `CollisionEnded` y `ProjectileHit`. Los cuerpos quietos se duermen (despiertan con `BlockChanged` y `ChunkDataEvent` del mundo, entre otras cosas) y, con muchos cuerpos despiertos, el paso corre en los hilos de cómputo. Fases P0 a P4 hechas | ecs, app, math, tasks, transform, voxel, world, diagnostic |
 | `boxel_pack` | lector de resource packs de Minecraft Java (formatos ~64 a 120): `pack.mcmeta` con overlays, texturas de bloque PNG a RGBA8 (animaciones `.png.mcmeta`), modelos de bloque con herencia `parent` y variables `#`, blockstates `variants` y `multipart`. Solo datos; `boxel_render` lo usa para las texturas de bloque | (serde, png) |
@@ -633,6 +633,8 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   de roble, la valla de roble y las antorchas (de pie y de pared, emisión 14). La forma de una
   escalera, los lados de una valla y el soporte de una antorcha siguen a sus vecinos
   (`boxel_voxel::rules`, aplicadas por `boxel_world::NeighborRules` en cada lote de ediciones).
+  Desde ADR 0025, la lava corre (`boxel:lava[level=0..15]`), hay adoquín y obsidiana, y losas,
+  escaleras y vallas guardan agua (`waterlogged`).
 - **Contenedor de paleta:** `Uniform(state)` | `Packed { palette, bits 1/2/4/8, words }` |
   `Direct(u16)`. Los índices nunca cruzan palabras de 64 bits. `set` agrega a la paleta en el
   lugar mientras entra; se compacta al guardar o en reposo. Medido en un mundo de 512x256x512:
@@ -824,10 +826,17 @@ un `Mesher` thread-local (~0.6 MiB de scratch) y un `LightScratch` (~0.7 MiB).
    Minecraft). Si las 4 quedan a 14/16 sigue en el greedy (`SHAPE_FLUID_SURFACE`); si no, sale de
    las máscaras del greedy y se emite por bloque con `SHAPE_FLUID_SLOPE` y sus alturas en los bits
    de `w - 1`, `h - 1` y el AO. Validado contra un oráculo de alturas y sin grietas entre chunks.
+   Un bloque con agua (ADR 0025) se junta como su agua (`PaddedChunk::waterlogged` guarda el
+   bloque, que se dibuja con sus cajas) y su agua va siempre por bloque, con las caras metidas
+   1/512 en la celda. Los costados de los fluidos y el techo inclinado llevan la textura de flujo,
+   que el shader desplaza con el tiempo (`viewport.z` del uniform `View`). El shader corre la
+   profundidad de todo fluido 2^-16 de su distancia hacia atrás: pierde los empates con las caras
+   que toca.
 6. **Buckets (8, congelados, ADR 0012):** 0 a 5 = caras opacas en orden `Face`; 6 = **cutout**
-   (todas las caras de materiales cutout, como las hojas); 7 = translúcido. `ChunkMesh` guarda los
-   quads contiguos por bucket, `bucket_counts[8]`, la paleta de luz y un hash de todo. En el arena
-   de la GPU la paleta va justo después de los quads del chunk (sección 10.2).
+   (todas las caras de materiales cutout, como las hojas, y el techo inclinado de un fluido opaco,
+   ADR 0025); 7 = translúcido. `ChunkMesh` guarda los quads contiguos por bucket,
+   `bucket_counts[8]`, la paleta de luz y un hash de todo. En el arena de la GPU la paleta va justo
+   después de los quads del chunk (sección 10.2).
 
 **`PackedQuad` (8 bytes):**
 
@@ -835,7 +844,9 @@ un `Mesher` thread-local (~0.6 MiB de scratch) y un `LightScratch` (~0.7 MiB).
 geo: x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | flags:4 (bit 0 emisivo, bits 1 a 3 forma)
 mat: capa:12 | ao:8 (2 bits por esquina, 3 = abierto) | luz:12 (índice en la paleta del chunk)
 forma 7 (agua inclinada, w = h = 1): los bits de w-1 y h-1 llevan las alturas de las esquinas 0 y 1
-  y el byte de AO las de las esquinas 2 y 3 (4 bits cada una, en dieciseisavos menos 1)
+  y el byte de AO las de las esquinas 2 y 3 (4 bits cada una, en dieciseisavos menos 1); el bit
+  23 marca el agua de un bloque con agua (caras metidas en la celda)
+forma 2: cara de cubo de una celda de fluido que no es superficie (sus costados se animan)
 ejes (u, v): ±Y -> (X, Z); ±X -> (Z, Y); ±Z -> (X, Y)
 ```
 
