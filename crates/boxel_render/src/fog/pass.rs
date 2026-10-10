@@ -58,10 +58,13 @@ pub fn frame_layers(
 }
 
 /// A layer's color under the frame's light: its color times the sky light (never below the
-/// ambient floor).
+/// ambient floor), then `sky_tint` of the way to the sky color (warm at dusk).
 fn lit_color(layer: &FogLayer, view: &ViewParams) -> [f32; 3] {
     let light = &view.light;
-    std::array::from_fn(|c| layer.color[c] * light.sky[c].max(light.ambient))
+    std::array::from_fn(|c| {
+        let lit = layer.color[c] * light.sky[c].max(light.ambient);
+        lit + (view.fog_color[c] - lit) * layer.sky_tint
+    })
 }
 
 /// The uniform words of one layer.
@@ -698,6 +701,21 @@ mod tests {
         );
         // Lit by the noon sky: white stays white.
         assert_eq!(between[0].lit, [1.0; 3]);
+    }
+
+    #[test]
+    fn the_sky_tint_takes_the_sky_color() {
+        let mut view = view_at(4.5);
+        view.fog_color = [1.0, 0.5, 0.25, 1.0];
+        let lit = |tint: f32| {
+            let mut layer = FogLayer::new(0, 8);
+            layer.color = [0.5; 3];
+            layer.sky_tint = tint;
+            frame_layers(&FogSettings::new(vec![layer]), &[1.0], &view, 0)[0].lit
+        };
+        assert_eq!(lit(0.0), [0.5; 3], "lit by the noon sky");
+        assert_eq!(lit(1.0), [1.0, 0.5, 0.25]);
+        assert_eq!(lit(0.5), [0.75, 0.5, 0.375]);
     }
 
     #[test]
