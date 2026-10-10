@@ -222,7 +222,8 @@ impl BlockModel {
 
     /// The box the block is picked by (its outline): the full cell for cubes, the half cell for
     /// slabs, a smaller box around the stem for crosses, the boxes of stairs, the post and arms
-    /// of a fence, a box around a torch's stick.
+    /// of a fence, a box around a torch's stick, Minecraft's shapes of walls and fence gates (a
+    /// gate is picked the same open or closed).
     pub fn outline(self) -> BlockCollision {
         match self {
             BlockModel::Cube { .. } | BlockModel::Fluid => BlockCollision::Full,
@@ -272,8 +273,8 @@ impl BlockModel {
     }
 
     /// The boxes the model is drawn with, for the models made of boxes (slabs, stairs, fences,
-    /// torches, walls and fence gates; ADR 0020, ADR 0027). Empty for cubes, crosses and fluids, which the mesher draws its
-    /// own way.
+    /// torches, walls and fence gates; ADR 0020, ADR 0027). Empty for cubes, crosses and fluids,
+    /// which the mesher draws its own way.
     pub fn boxes(self) -> Vec<ModelBox> {
         match self {
             BlockModel::Cube { .. } | BlockModel::Fluid | BlockModel::Cross => Vec::new(),

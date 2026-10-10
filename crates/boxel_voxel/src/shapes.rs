@@ -527,7 +527,7 @@ fn wall_shape(post: bool, sides: WallSides, reach: u8, heights: WallHeights) -> 
 /// The render boxes of a wall (Minecraft's `template_wall_post`, `template_wall_side` and
 /// `template_wall_side_tall`, ADR 0027): the 8x16x8 post when `post`, and toward each connected
 /// side a 6 wide bar from the border to the center, 14 tall (low) or 16 (tall). Laid out without
-/// overlaps ([`wall_shape`]): a bar stops at the post, and a straight wall is one box.
+/// overlaps (Minecraft's parts overlap): a bar stops at the post, and a straight wall is one box.
 pub fn wall_boxes(post: bool, sides: WallSides) -> Vec<ModelBox> {
     let heights = WallHeights {
         post: 16,

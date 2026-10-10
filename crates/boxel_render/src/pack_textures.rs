@@ -337,7 +337,9 @@ const RECIPES: &[Recipe] = &[
         FaceName::North,
         &[("block/torch", Tint::None)],
     ),
-    // ADR 0025: what lava makes with water.
+    // ADR 0025: what lava makes with water. ADR 0027: the cobblestone wall uses this layer
+    // (Minecraft's `cobblestone_wall` models take `block/cobblestone`) and the oak fence gate the
+    // planks layer (`oak_fence_gate` takes `block/oak_planks`), as the fence does.
     recipe(
         "boxel:cobblestone",
         "cobblestone",
