@@ -263,7 +263,8 @@ fn unknown_properties_and_values_keep_the_rest() {
     let fence = registry.block_by_name("boxel:oak_fence").unwrap();
     let names = vec![
         // A property this registry lacks: dropped, the others kept.
-        "boxel:oak_fence[east=false,north=true,south=false,waterlogged=true,west=false]"
+        "boxel:oak_fence[east=false,north=true,powered=true,south=false,waterlogged=true,\
+         west=false]"
             .to_string(),
         // A value this registry lacks: that property takes its default.
         "boxel:log[axis=w]".to_string(),
@@ -278,6 +279,7 @@ fn unknown_properties_and_values_keep_the_rest() {
         .collect();
     let north = registry
         .with(registry.default_state(fence), "north", "true")
+        .and_then(|s| registry.with_water(s, true))
         .unwrap();
     assert_eq!(unknown[0].1, north);
     assert_eq!(unknown[1].1, registry.by_name("boxel:log").unwrap());
