@@ -172,6 +172,7 @@ mod tests {
         let mut app = App::new();
         app.add_plugins((
             TimePlugin,
+            InputPlugin,
             WorldPlugin {
                 generator: Arc::new(generator),
                 registry,
