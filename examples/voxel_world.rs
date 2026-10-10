@@ -2664,24 +2664,40 @@ mod tests {
         key(&mut app, SPRINT_KEY, false);
     }
 
+    /// The camera's rotation, and its mouse look's alone (yaw then pitch, no bob).
+    fn turns(app: &mut App) -> (Quat, Quat) {
+        let mut cameras = app.world_mut().query::<(&Transform, &FlyCamera)>();
+        let (transform, fly) = cameras.single(app.world()).expect("camera");
+        let look = Quat::from_rotation_y(fly.yaw) * Quat::from_rotation_x(fly.pitch);
+        (transform.rotation, look)
+    }
+
     #[test]
     fn walking_bobs_the_view_and_v_turns_it_off() {
-        use player::BOB_KEY;
+        use player::{BOB_KEY, WALK_KEY};
         let (mut app, _) = walking_app();
         let bobbed = |app: &mut App| (camera_at(app) - standing_eye(app)).length();
-        // Walking on the grass: the eye sways, at most Minecraft's tenth of a block.
+        // Walking on the grass: the eye sways, at most Minecraft's tenth of a block, and the
+        // view tilts with it.
         key(&mut app, KeyCode::KeyW, true);
         let mut most: f64 = 0.0;
+        let mut tilted = 0;
         for _ in 0..96 {
             app.update();
             most = most.max(bobbed(&mut app));
+            let (rotation, look) = turns(&mut app);
+            tilted += usize::from(rotation != look);
         }
         assert!(most > 0.05 && most < 0.12, "{most}");
-        // V: no bob, the eye stays on the body while it walks.
+        assert!(tilted > 48, "{tilted} of 96 frames tilted");
+        // V: no bob, the eye stays on the body while it walks, and the view is the mouse look's
+        // again at once (no tilt left over).
         tap(&mut app, BOB_KEY);
         for _ in 0..32 {
             app.update();
             assert_eq!(bobbed(&mut app), 0.0);
+            let (rotation, look) = turns(&mut app);
+            assert_eq!(rotation, look);
         }
         tap(&mut app, BOB_KEY);
         key(&mut app, KeyCode::KeyW, false);
@@ -2701,6 +2717,19 @@ mod tests {
             app.update();
             assert_eq!(bobbed(&mut app), 0.0);
         }
+        key(&mut app, KeyCode::KeyW, false);
+        // G while walking: the player goes and the camera keeps no tilt of its last bob.
+        let (mut app, _) = walking_app();
+        key(&mut app, KeyCode::KeyW, true);
+        for _ in 0..32 {
+            app.update();
+        }
+        let (rotation, look) = turns(&mut app);
+        assert_ne!(rotation, look, "tilted while walking");
+        tap(&mut app, WALK_KEY);
+        assert!(walker(&mut app).is_none());
+        let (rotation, look) = turns(&mut app);
+        assert_eq!(rotation, look);
         key(&mut app, KeyCode::KeyW, false);
     }
 

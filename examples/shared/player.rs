@@ -18,8 +18,8 @@
 //!
 //! The view, as Minecraft's first-person camera (only the camera; the body is exact): the eye
 //! eases down and up when crouching or standing up, the field of view widens [`SPRINT_FOV`]
-//! while sprinting, and walking on the ground bobs the view ([`view_bob`]; not flying or in
-//! water). [`BOB_KEY`] turns the bob off and on.
+//! while sprinting, and walking on the ground bobs the view ([`view_bob`]; also wading in
+//! water, not in the air or flying). [`BOB_KEY`] turns the bob off and on.
 //!
 //! Frame order:
 //! - `RunFixedMainLoopSystems::BeforeFixedMainLoop`: the keys are sampled once per frame into
@@ -76,6 +76,12 @@ const VIEW_EASE: f64 = 20.0;
 const BOB_EASE: f64 = 40.0 / 3.0;
 /// The strongest bob, Minecraft's (blocks per tick of walking speed, which it caps at this).
 const MAX_BOB: f64 = 0.1;
+/// How much of its speed across Minecraft's player keeps after a tick on dry ground (the block's
+/// friction 0.6 times 0.91). Its bob reads the speed after that friction, so a body walking at
+/// `v` blocks per tick bobs `v` times this.
+const GROUND_KEEP: f64 = 0.546;
+/// The same in water (Minecraft's water slowdown, on the ground too).
+const WATER_KEEP: f64 = 0.8;
 
 /// The player body (only while walking).
 #[derive(Component, Clone, Copy, Debug, Default)]
@@ -95,8 +101,8 @@ pub struct PlayerView {
     /// Minecraft's walk distance for the bob's phase (0.6 per block walked), kept in `0..2`
     /// (the bob's period).
     pub walked: f64,
-    /// The bob's strength (Minecraft's `bob`): the walking speed on the ground in blocks per
-    /// tick, at most [`MAX_BOB`]; 0 in the air, flying or in water.
+    /// The bob's strength (Minecraft's `bob`): the speed across on the ground in blocks per
+    /// tick after a tick's friction ([`Footing`]), at most [`MAX_BOB`]; 0 in the air or flying.
     pub bob: f64,
     /// The body's interpolated position across last frame.
     last: Option<DVec2>,
@@ -119,6 +125,19 @@ impl Default for PlayerView {
 pub fn ease(value: f64, target: f64, rate: f64, dt: f64) -> f64 {
     let v = target + (value - target) / (1.0 + rate * dt.max(0.0));
     if (v - target).abs() < 1e-4 { target } else { v }
+}
+
+/// Where the player walks, for the bob: Minecraft bobs on the ground (not swimming, a pose
+/// boxel does not have yet), with the speed it keeps after the ground's or the water's
+/// friction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Footing {
+    /// In the air or flying: no bob.
+    Air,
+    /// On dry ground ([`GROUND_KEEP`]).
+    Ground,
+    /// On the ground in water: the bottom of a pool, a waterlogged slab ([`WATER_KEEP`]).
+    Wading,
 }
 
 /// A view bob: where the camera goes and how it turns, in its own frame.
@@ -423,13 +442,19 @@ pub fn follow_player(
                 eye.last_y = Some(y);
             }
             let flying = controller.flying;
-            let wet = swim.is_some_and(|s| s.in_fluid);
+            let footing = if !contacts.on_ground || flying {
+                Footing::Air
+            } else if swim.is_some_and(|s| s.in_fluid) {
+                Footing::Wading
+            } else {
+                Footing::Ground
+            };
             let next = next_view(
                 &view,
                 body.translation,
                 crouch.is_crouching(),
                 controller.sprinting,
-                contacts.on_ground && !flying && !wet,
+                footing,
                 velocity.0,
                 dt,
             );
@@ -524,16 +549,16 @@ pub fn follow_player(
 }
 
 /// The view after a frame of `dt` seconds in which the body was at `at` (interpolated),
-/// `crouching` or not, `sprinting` or not, with `velocity`, and walking on the ground (`walks`:
-/// not flying nor in water) or not: the eye height and the field of view ease toward theirs, the
-/// walk distance grows with the move across (0.6 per block, Minecraft's), and the bob eases
-/// toward the speed across in blocks per tick (at most [`MAX_BOB`]; 0 not walking).
+/// `crouching` or not, `sprinting` or not, with `velocity`, and its `footing`: the eye height and
+/// the field of view ease toward theirs, the walk distance grows with the move across (0.6 per
+/// block, Minecraft's), and the bob eases toward the speed across in blocks per tick, times what
+/// Minecraft keeps of it after a tick on that footing (at most [`MAX_BOB`]; 0 in the air).
 pub fn next_view(
     view: &PlayerView,
     at: DVec3,
     crouching: bool,
     sprinting: bool,
-    walks: bool,
+    footing: Footing,
     velocity: DVec3,
     dt: f64,
 ) -> PlayerView {
@@ -547,11 +572,11 @@ pub fn next_view(
     let moved = view.last.map_or(0.0, |last| across.distance(last));
     // A jump of more than a few blocks in one frame is a teleport, not a walk.
     let moved = if moved < 4.0 { moved } else { 0.0 };
-    let speed = DVec2::new(velocity.x, velocity.z).length();
-    let bob = if walks {
-        (speed / 20.0).min(MAX_BOB)
-    } else {
-        0.0
+    let per_tick = DVec2::new(velocity.x, velocity.z).length() / 20.0;
+    let bob = match footing {
+        Footing::Air => 0.0,
+        Footing::Ground => (per_tick * GROUND_KEEP).min(MAX_BOB),
+        Footing::Wading => (per_tick * WATER_KEEP).min(MAX_BOB),
     };
     PlayerView {
         eye: ease(view.eye, eye, VIEW_EASE, dt),
@@ -590,8 +615,8 @@ impl Modes {
 #[cfg(test)]
 mod eye_tests {
     use super::{
-        Bob, CROUCH_EYE_HEIGHT, EYE_HEIGHT, MAX_BOB, PlayerView, SPRINT_FOV, ease, eye_lag,
-        next_view, view_bob,
+        Bob, CROUCH_EYE_HEIGHT, EYE_HEIGHT, Footing, MAX_BOB, PlayerView, SPRINT_FOV, ease,
+        eye_lag, next_view, view_bob,
     };
     use boxel::prelude::*;
 
@@ -660,13 +685,13 @@ mod eye_tests {
         let mut view = PlayerView::default();
         let at = DVec3::new(0.5, 4.0, 0.5);
         // Standing still: nothing changes.
-        let still = next_view(&view, at, false, false, true, DVec3::ZERO, dt);
+        let still = next_view(&view, at, false, false, Footing::Ground, DVec3::ZERO, dt);
         assert_eq!((still.eye, still.fov, still.bob), (EYE_HEIGHT, 1.0, 0.0));
         // Crouching and sprinting at once (not possible in the game, but each part alone):
         // the eye goes down and the view widens, smoothly, and land exactly.
         let mut frames = 0;
         while view.eye != CROUCH_EYE_HEIGHT || view.fov != SPRINT_FOV {
-            let next = next_view(&view, at, true, true, true, DVec3::ZERO, dt);
+            let next = next_view(&view, at, true, true, Footing::Ground, DVec3::ZERO, dt);
             assert!(next.eye < view.eye || next.eye == CROUCH_EYE_HEIGHT);
             assert!(next.fov > view.fov || next.fov == SPRINT_FOV);
             view = next;
@@ -679,14 +704,14 @@ mod eye_tests {
         let mut p = at;
         for _ in 0..144 {
             p += v * dt;
-            view = next_view(&view, p, false, false, true, v, dt);
+            view = next_view(&view, p, false, false, Footing::Ground, v, dt);
         }
         assert_eq!(view.bob, MAX_BOB);
         let walked = (4.317 * 0.6) % 2.0;
         assert!((view.walked - walked).abs() < 1e-9, "{}", view.walked);
-        // Flying, in the air or in water (`walks` false) it fades out; a teleport is no walk.
+        // Flying or in the air it fades out; a teleport is no walk.
         for _ in 0..144 {
-            view = next_view(&view, p, false, false, false, v, dt);
+            view = next_view(&view, p, false, false, Footing::Air, v, dt);
         }
         assert_eq!(view.bob, 0.0);
         let before = view.walked;
@@ -695,11 +720,42 @@ mod eye_tests {
             p + DVec3::new(100.0, 0.0, 0.0),
             false,
             false,
-            true,
+            Footing::Ground,
             v,
             dt,
         );
         assert_eq!(view.walked, before);
+    }
+
+    #[test]
+    fn the_bob_reads_the_speed_after_a_ticks_friction_as_minecraft() {
+        let dt = 1.0 / 144.0;
+        // The bob a steady speed across (blocks per second) settles at on a footing.
+        let settle = |speed: f64, footing: Footing| {
+            let mut view = PlayerView::default();
+            for _ in 0..288 {
+                view = next_view(
+                    &view,
+                    DVec3::ZERO,
+                    false,
+                    false,
+                    footing,
+                    DVec3::new(speed, 0.0, 0.0),
+                    dt,
+                );
+            }
+            view.bob
+        };
+        // Walking and sprinting reach Minecraft's cap. Sneaking at 1.295 blocks per second:
+        // Minecraft keeps 0.546 of the 0.065 per tick after the ground's friction, 0.035.
+        assert_eq!(settle(4.317, Footing::Ground), MAX_BOB);
+        assert_eq!(settle(4.317 * 1.3, Footing::Ground), MAX_BOB);
+        let sneak = settle(4.317 * 0.3, Footing::Ground);
+        assert!((sneak - 0.035_35).abs() < 1e-4, "{sneak}");
+        // Wading on a pool's bottom (half the walk) it bobs too, with the water's 0.8.
+        let wading = settle(4.317 * 0.5, Footing::Wading);
+        assert!((wading - 0.086_34).abs() < 1e-4, "{wading}");
+        assert_eq!(settle(4.317, Footing::Air), 0.0);
     }
 }
 

@@ -262,8 +262,11 @@ en el agua le devuelve el agua.
 - El balanceo es el `bobView` de Minecraft. Minecraft mueve y gira la escena en el espacio de la
   vista; acá se mueve y gira la cámara, que da lo mismo. Sube hasta `bob` bloques, va
   `bob / 2` a los lados y gira hasta `3 bob` grados sobre su eje y `5 bob` grados hacia abajo.
-  `bob` sigue a la velocidad de costado en bloques por tick, hasta 0,1, y es 0 en el aire,
-  volando o en el agua. La fase crece 0,6 por bloque caminado.
+  `bob` sigue a la velocidad de costado en bloques por tick, hasta 0,1. Minecraft la lee después
+  del roce del tick, así que se multiplica por lo que queda: 0,546 en el suelo seco y 0,8 en el
+  agua. Caminando y corriendo llega a 0,1; agachado, a 0,035. Es 0 en el aire o volando. En el
+  suelo dentro del agua (el fondo de una pileta, una losa con agua) también se balancea, como en
+  Minecraft, que solo lo corta con la pose de nado. La fase crece 0,6 por bloque caminado.
 - La mira apunta con la cámara balanceada: el bloque apuntado es el que está bajo la mira en
   pantalla. En Minecraft la mira se corre un poco del bloque que apunta.
 - V apaga y prende el balanceo (`Walking::view_bob`, prendido por defecto). Es la opción de
@@ -395,10 +398,12 @@ en el agua le devuelve el agua.
     Espacio sube, queda quieto, Shift baja y aterrizar camina, y dos toques en el aire lo apagan.
     Sección 8: con Shift el ojo baja suave hasta 1,27 y vuelve justo a 1,62; con W y Ctrl el
     campo de visión se abre suave hasta 1,1, sigue sin Ctrl y vuelve justo al soltar W, y con G
-    la cámara recupera el suyo; caminando la vista se balancea (hasta una décima de bloque), con
-    V no, y volando tampoco. En `shared/player.rs`: la suavidad cae justo y no se pasa; el
-    balanceo queda en sus límites y se repite cada 2 de distancia; la vista se agacha, se abre y
-    se balancea, y un salto grande no cuenta como caminar.
+    la cámara recupera el suyo; caminando la vista se balancea (hasta una décima de bloque) y se
+    inclina, con V no y la inclinación se va en el mismo frame, volando tampoco, y con G mientras
+    camina la cámara queda sin inclinación. En `shared/player.rs`: la suavidad cae justo y no se
+    pasa; el balanceo queda en sus límites y se repite cada 2 de distancia; la vista se agacha,
+    se abre y se balancea, y un salto grande no cuenta como caminar; el balanceo llega al tope
+    caminando y corriendo, a 0,035 agachado y a 0,086 caminando en el agua.
   - `physics_sandbox` (sin ventana): T agachado arma la escalera en los pies, no un bloque más
     abajo.
 
