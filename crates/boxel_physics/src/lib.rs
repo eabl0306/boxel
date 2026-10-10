@@ -83,7 +83,10 @@ pub use boxel_voxel::WorldPos;
 pub use plugin::{PhysicsContent, PhysicsPlugin};
 pub use query::{PhysicsQuery, RayFilter, RayHit};
 pub use source::ChunkSource;
-pub use swim::{SwimIntent, SwimPlugin, SwimSettings, Swimmer, box_touches_fluid, swim_bodies};
+pub use swim::{
+    FLUID_JUMP_THRESHOLD, SwimIntent, SwimPlugin, SwimSettings, Swimmer, box_touches_fluid,
+    swim_bodies,
+};
 pub use systems::PhysicsSystems;
 
 /// Common items.

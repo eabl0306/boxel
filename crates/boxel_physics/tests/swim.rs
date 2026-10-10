@@ -214,15 +214,52 @@ fn the_water_of_a_waterlogged_block_is_swum_in() {
             sim.get::<CharacterController>(body).walk_speed,
             CharacterController::default().walk_speed * 0.5
         );
-        // Swim up: it rises out of the slab's water and falls back onto the slab.
+        // The water is shallow there (0.39 above the feet, on the ground): swimming up does
+        // nothing, the jump key jumps instead (`a_jump_on_a_waterlogged_slab_is_a_jump`).
         sim.app.world_mut().get_mut::<SwimIntent>(body).unwrap().up = true;
-        sim.steps(1);
-        let v = sim.get::<Velocity>(body).0.y;
-        assert!(v > 2.5 && v <= 3.0, "swims up at {v}");
-        sim.app.world_mut().get_mut::<SwimIntent>(body).unwrap().up = false;
-        sim.steps(128);
+        sim.steps(16);
+        assert_eq!(sim.get::<Velocity>(body).0.y, 0.0);
         assert_eq!(sim.position(body), sim.pos(0.5, 4.5, 0.5));
     }
+}
+
+#[test]
+fn a_jump_on_a_waterlogged_slab_is_a_jump() {
+    // The highest the feet get after a jump press on a floor of `slab`, back on it after.
+    let peak = |base: I64Vec3, slab: BlockState| {
+        let (mut sim, body) = on_slabs(base, slab);
+        sim.app
+            .world_mut()
+            .get_mut::<MoveIntent>(body)
+            .unwrap()
+            .jump = true;
+        let mut top = f64::MIN;
+        for _ in 0..128 {
+            sim.steps(1);
+            let p = sim.position(body);
+            top = top.max((p.block.as_i64vec3() - base).as_dvec3().y + p.frac.y);
+        }
+        assert_eq!(
+            sim.position(body),
+            sim.pos(0.5, 4.5, 0.5),
+            "back on the slab"
+        );
+        top
+    };
+    let dry = peak(I64Vec3::ZERO, bottom_slab());
+    assert!(dry > 5.7, "{dry}");
+    // The slab's water reaches 8/9 of its cell, 0.39 above the feet: not above Minecraft's
+    // 0.4, so on the ground the key jumps as on the dry slab (a swim stroke peaks about 0.64
+    // above it), over a block above the slab.
+    let wet = peak(I64Vec3::ZERO, wet_slab());
+    assert!(
+        wet > 5.5 && (wet - dry).abs() < 0.1,
+        "{wet} against {dry} dry"
+    );
+    assert_eq!(
+        peak(I64Vec3::new(1 << 40, -(1 << 31), 1 << 40), wet_slab()),
+        wet
+    );
 }
 
 /// A flyer in the pool, a block over its bottom: still, up, still again, then the flight off.

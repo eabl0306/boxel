@@ -234,7 +234,13 @@ el deseo si `facing` es cero).
 un fluido o un bloque con agua (`StateFlags::WATERLOGGED`).
 
 - `SwimPlugin` lo usa para saber si el cuerpo está en el agua. Parado sobre una losa con agua,
-  los pies están en su celda: nada, como en Minecraft (el agua de esa celda llega a 8/9).
+  los pies están en su celda: está en el agua, como en Minecraft, y camina a la mitad.
+- Saltar ahí es un salto. Como en Minecraft, un cuerpo en el suelo con el agua a 0,4 o menos
+  sobre los pies (`FLUID_JUMP_THRESHOLD`) salta en vez de nadar hacia arriba. El agua de una celda
+  llega a 8/9, o arriba de todo si la celda de arriba también tiene agua; sobre una losa o el
+  escalón de abajo de una escalera queda a 0,39. `SwimPlugin` deja el salto al controlador, y
+  `SwimIntent::up` no hace nada ahí. Los niveles del agua que corre no se leen: toda celda cuenta
+  como fuente.
 - `Contacts::in_fluid` (el barrido) y el `in_fluid` de los proyectiles también.
 - `is_fluid` sigue siendo solo el bloque fluido: apuntar y poner bloques ven la losa.
 
@@ -323,9 +329,9 @@ en el agua le devuelve el agua.
   - `BlockOutline`, `Outline`, `VoxelRenderer::set_outline`, `outline_edges`,
     `block_outline_edges` y `ShaderModuleId::Outline`.
   - Sección 8: `MoveIntent::facing`, `CharacterController::{sprint_jump_boost, crouch_height,
-    sprinting}`, `Crouch`, `Collider::crouched`, `CollisionTable::is_wet` y `Contacts::ran_into`.
-    `MoveIntent::sprint` ahora empieza el sprint y no lo sostiene. `Contacts::in_fluid` y
-    `Swimmer::in_fluid` también cuentan los bloques con agua.
+    sprinting}`, `Crouch`, `Collider::crouched`, `CollisionTable::is_wet`, `Contacts::ran_into`
+    y `FLUID_JUMP_THRESHOLD`. `MoveIntent::sprint` ahora empieza el sprint y no lo sostiene.
+    `Contacts::in_fluid` y `Swimmer::in_fluid` también cuentan los bloques con agua.
 - Tests:
   - `boxel_voxel`: la valla choca a 24 y se apunta a 16, su techo sostiene una antorcha y ninguna
     cara es firme; el registro acepta 24 y rechaza 25, una caja más ancha que la celda y una que
@@ -371,11 +377,12 @@ en el agua le devuelve el agua.
     con empujón, y a 15 camina y salta sin él. Saltando y corriendo da 7,12 bloques por segundo
     contra 5,61. El recorrido bit a bit en cinco bases suma correr, saltar contra una pared y
     quedar agachado bajo un techo.
-  - `boxel_physics/tests/swim.rs`: parado sobre losas con agua nada (y sube y vuelve a la losa),
-    sobre losas secas no; un volador en el agua no se hunde, sube como en el aire, queda quieto
-    exacto con sus ajustes de tierra, y al apagar el vuelo el agua lo toma; igual bit a bit en
-    tres bases. `block_shapes.rs`: el agua y la losa con agua tienen agua, la losa con agua no es
-    fluido y choca como la seca.
+  - `boxel_physics/tests/swim.rs`: parado sobre losas con agua está en el agua, sobre losas secas
+    no; ahí nadar hacia arriba no lo mueve y saltar llega tan alto como en la losa seca (más de un
+    bloque sobre la losa), igual bit a bit lejos del origen. Un volador en el agua no se hunde,
+    sube como en el aire, queda quieto exacto con sus ajustes de tierra, y al apagar el vuelo el
+    agua lo toma; igual bit a bit en tres bases. `block_shapes.rs`: el agua y la losa con agua
+    tienen agua, la losa con agua no es fluido y choca como la seca.
   - `boxel_render`: aristas de un cubo, una escalera (una forma) y una valla; los quads son los
     mismos en cualquier lugar del mundo y se cortan en el plano cercano.
     `tests/gpu_outline.rs`: en cada tier, el contorno se ve y solo oscurece (con el color por
@@ -400,6 +407,9 @@ en el agua le devuelve el agua.
   el hambre (correr no la pide).
 - Nadar como en Minecraft más allá de subir: correr bajo el agua (la pose de nado de 0,6), que
   Shift baje en el agua, y que correr se corte en la superficie del agua.
+- La brazada de Minecraft es un empujón chico por tick; la nuestra pone 3 bloques por segundo de
+  golpe. Con Espacio mantenido sobre losas con agua, el primer salto sale entero, pero al caer el
+  cuerpo nada en el agua de la losa y flota hasta soltar Espacio. En Minecraft vuelve a saltar.
 - Correr con dos toques de W, y el modo "alternar" de la tecla de correr.
 - El campo de visión al volar (Minecraft lo abre 1,1) y el giro de la cámara al recibir daño.
 
