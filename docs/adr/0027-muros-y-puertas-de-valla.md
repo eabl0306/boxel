@@ -78,9 +78,10 @@ cosas nuevas:
 - **Puerta**: `in_wall` si hay un muro en uno de sus extremos.
 - **Vallas**: ahora también se conectan al extremo de una puerta.
 - **Las reglas se propagan.** `NeighborRules::expand` sigue mirando las ediciones y sus 6
-  vecinos. Además, cuando una regla cambia un bloque, vuelve a mirar sus 6 vecinos en el mismo
-  lote. Como mucho `MAX_RULE_UPDATES` (65 536) de esas miradas por lote, por si alguna regla
-  futura nunca se asienta.
+  vecinos. Además, cuando una regla cambia un bloque, vuelve a mirar en el mismo lote sus vecinos
+  con regla que ya miró (los que todavía no miró van a ver el cambio igual). Como mucho
+  `MAX_RULE_UPDATES` (65 536) de esas miradas por lote, por si alguna regla futura nunca se
+  asienta.
   - Termina: los muros solo leen hacia arriba, así que el cambio baja por la columna y para. Las
     demás reglas no leen nada que una regla cambie, así que mirarlas de nuevo no cambia nada.
   - Sigue siendo un solo lote: un remallado y un `BlockChanged` por bloque.
