@@ -2,9 +2,10 @@
 //!
 //! Two faces of a chunk are linked when a path of face-adjacent voxels that do not occlude
 //! ([`BlockRegistry::occludes`]: an `Opaque` full cube) goes from one to the other inside the
-//! chunk. Water, glass, leaves, slabs, stairs, fences, plants and air are all open: a ray can
-//! cross them. The world's visibility search walks from the camera's chunk through these links
-//! (Minecraft and Sodium do the same); a chunk it never reaches cannot be seen.
+//! chunk. Water, glass, leaves, slabs, stairs, fences, walls, fence gates, plants and air are all
+//! open: a ray can cross them. The world's visibility search walks from the camera's chunk
+//! through these links (Minecraft and Sodium do the same); a chunk it never reaches cannot be
+//! seen.
 //!
 //! [`ChunkFaceInfo::compute`] is a bit-parallel flood fill over the 1024 rows of the chunk's
 //! occlusion mask ([`Occupancy`] layout, `u32` along z): one flood per connected open region that
