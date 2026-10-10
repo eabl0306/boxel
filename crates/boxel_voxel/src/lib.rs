@@ -10,9 +10,9 @@
 //! - [`state`]: block state properties (ADR 0019): `boxel:log[axis=x]`, one dense id per
 //!   combination of values, contiguous per block.
 //! - [`shapes`]: the boxes of the models made of boxes (slabs, stairs, fences, torches; ADR
-//!   0020; walls and fence gates, ADR 0027), and [`rules`]: the states that follow their
-//!   neighbors (stair shapes, fence sides, torches that need a support, wall sides and posts,
-//!   gates between walls) and what using a block does (a gate opens).
+//!   0020; walls and fence gates, ADR 0027), and [`rules`]: the neighbor and use rules a block
+//!   registers (the states that follow their neighbors, what using a block does) and the face
+//!   covers they are written with.
 //! - [`faces`]: which faces of a chunk see each other through non-occluding voxels
 //!   ([`ChunkFaceInfo`]), for the world's cave culling (ADR 0022).
 //! - [`storage`]: Minecraft-style paletted container (Uniform | Packed 1/2/4/8 bits | Direct u16).

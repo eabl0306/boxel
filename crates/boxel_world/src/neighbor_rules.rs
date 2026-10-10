@@ -9,9 +9,9 @@
 //!
 //! A block a rule changed has its 6 neighbors looked at again (ADR 0027): a wall reads the post
 //! of the wall above it, so breaking the torch on a column of walls lowers every post down the
-//! column, one block per step, in the same batch. The built-in rules end: stairs, fences, torches
-//! and gates read nothing a rule changes (their second look changes nothing), and walls only read
-//! upward. At most [`MAX_RULE_UPDATES`] such second looks per batch plus
+//! column, one block per step, in the same batch. Rules that read nothing a rule changes settle
+//! at once (their second look changes nothing), and a rule that reads only upward (walls) ends.
+//! At most [`MAX_RULE_UPDATES`] such second looks per batch plus
 //! [`RULE_UPDATES_PER_CELL`] per cell of its first ring, in case a rule added later never
 //! settles. A rule whose block has a neighbor in a chunk that is not readable is skipped
 //! (the block keeps its state, so a chunk border never drops a torch or cuts a fence).
@@ -23,7 +23,7 @@
 //! for the game to ask before it places a block.
 use crate::BlockEdit;
 use boxel_ecs::prelude::Resource;
-use boxel_voxel::rules::{NeighborRule, UseRule, rule_for_model, use_rule_for_model};
+use boxel_voxel::rules::{NeighborRule, UseRule};
 use boxel_voxel::{BlockId, BlockPos, BlockRegistry, BlockState, Face, Facing};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -46,12 +46,11 @@ pub struct NeighborRules {
 }
 
 impl NeighborRules {
-    /// The built-in rules for the blocks of `registry`, by the model of each block's default
-    /// state (`boxel_voxel::rules::rule_for_model`): stairs, fences, torches and wall torches.
+    /// The rules the blocks of `registry` registered ([`BlockRegistry::neighbor_rule`]).
     pub fn from_registry(registry: &BlockRegistry) -> Self {
         let by_block = registry
             .blocks()
-            .map(|b| rule_for_model(registry.model(registry.default_state(b))))
+            .map(|b| registry.neighbor_rule(b).cloned())
             .collect();
         Self { by_block }
     }
@@ -66,9 +65,9 @@ impl NeighborRules {
     }
 
     /// The rule of the block of `state` in `registry`, if it has one.
-    pub fn rule(&self, registry: &BlockRegistry, state: BlockState) -> Option<NeighborRule> {
+    pub fn rule(&self, registry: &BlockRegistry, state: BlockState) -> Option<&NeighborRule> {
         let block = registry.block(state)?;
-        self.by_block.get(usize::from(block.0)).copied().flatten()
+        self.by_block.get(usize::from(block.0))?.as_ref()
     }
 
     /// No block has a rule.
@@ -141,7 +140,7 @@ impl NeighborRules {
             if !readable {
                 continue;
             }
-            let new = rule(registry, state, &around);
+            let new = rule.apply(registry, state, &around);
             if new == state {
                 continue;
             }
@@ -193,12 +192,11 @@ pub struct BlockUses {
 }
 
 impl BlockUses {
-    /// The built-in use rules for the blocks of `registry`, by the model of each block's
-    /// default state (`boxel_voxel::rules::use_rule_for_model`): fence gates.
+    /// The use rules the blocks of `registry` registered ([`BlockRegistry::use_rule`]).
     pub fn from_registry(registry: &BlockRegistry) -> Self {
         let by_block = registry
             .blocks()
-            .map(|b| use_rule_for_model(registry.model(registry.default_state(b))))
+            .map(|b| registry.use_rule(b).cloned())
             .collect();
         Self { by_block }
     }
@@ -213,9 +211,9 @@ impl BlockUses {
     }
 
     /// The use rule of the block of `state`, if it has one.
-    pub fn rule(&self, registry: &BlockRegistry, state: BlockState) -> Option<UseRule> {
+    pub fn rule(&self, registry: &BlockRegistry, state: BlockState) -> Option<&UseRule> {
         let block = registry.block(state)?;
-        self.by_block.get(usize::from(block.0)).copied().flatten()
+        self.by_block.get(usize::from(block.0))?.as_ref()
     }
 
     /// The state `state` takes when used by someone looking toward `look` (horizontally), or
@@ -226,7 +224,7 @@ impl BlockUses {
         state: BlockState,
         look: Facing,
     ) -> Option<BlockState> {
-        self.rule(registry, state)?(registry, state, look)
+        self.rule(registry, state)?.apply(registry, state, look)
     }
 }
 
@@ -348,7 +346,7 @@ mod tests {
                 continue;
             };
             let around = Face::ALL.map(|f| at(neighbor(p, f)));
-            let want = rule(registry, state, &around);
+            let want = rule.apply(registry, state, &around);
             if want != state {
                 return Err(format!(
                     "{p:?} is {} but its rule gives {}",
@@ -533,12 +531,12 @@ mod tests {
         let registry = boxel_demo::blocks::registry();
         let mut rules = NeighborRules::from_registry(&registry);
         let fence = registry.parse_state("boxel:oak_fence").unwrap();
-        let flip: NeighborRule = |registry, state, _| {
+        let flip = NeighborRule::new(|registry, state, _| {
             let north = registry.property(state, "north") == Some("true");
             registry
                 .with(state, "north", if north { "false" } else { "true" })
                 .unwrap_or(state)
-        };
+        });
         rules.set(registry.block(fence).unwrap(), Some(flip));
         let mut edits: Vec<BlockEdit> = (0..2)
             .map(|x| BlockEdit {

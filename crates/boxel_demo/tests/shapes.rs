@@ -2,10 +2,8 @@
 //! that derive stair shapes, fence sides and torch supports.
 
 use boxel_demo::blocks::TORCH_EMISSION;
-use boxel_voxel::rules::{
-    fence_connects, fence_rule, is_sturdy, stair_shape, stairs_rule, supports_center, torch_rule,
-    wall_torch_rule,
-};
+use boxel_demo::rules::{self as demo, Kinds, torch_rule};
+use boxel_voxel::rules::{is_sturdy, supports_center};
 use boxel_voxel::shapes::{stair_boxes, wall_torch_box};
 use boxel_voxel::{
     BlockCollision, BlockModel, BlockRegistry, BlockState, CollisionBox, Face, Facing, FenceSides,
@@ -19,6 +17,32 @@ fn registry() -> BlockRegistry {
 
 fn s(r: &BlockRegistry, name: &str) -> BlockState {
     r.parse_state(name).unwrap()
+}
+
+/// The demo rules with the kinds of `r` (the rules take them since #48).
+fn stair_shape(
+    r: &BlockRegistry,
+    facing: Facing,
+    half: SlabHalf,
+    n: &[BlockState; 6],
+) -> StairShape {
+    demo::stair_shape(&Kinds::of_registry(r), r, facing, half, n)
+}
+
+fn stairs_rule(r: &BlockRegistry, state: BlockState, n: &[BlockState; 6]) -> BlockState {
+    demo::stairs_rule(&Kinds::of_registry(r), r, state, n)
+}
+
+fn fence_connects(r: &BlockRegistry, neighbor: BlockState, toward: Facing) -> bool {
+    demo::fence_connects(&Kinds::of_registry(r), r, neighbor, toward)
+}
+
+fn fence_rule(r: &BlockRegistry, state: BlockState, n: &[BlockState; 6]) -> BlockState {
+    demo::fence_rule(&Kinds::of_registry(r), r, state, n)
+}
+
+fn wall_torch_rule(r: &BlockRegistry, state: BlockState, n: &[BlockState; 6]) -> BlockState {
+    demo::wall_torch_rule(&Kinds::of_registry(r), r, state, n)
 }
 
 /// Every sixteenth `(x, y, z)` of the cell inside one of `boxes`.
@@ -252,7 +276,7 @@ fn stair_boxes_are_minecrafts() {
 fn stair_shapes_follow_minecrafts_rule() {
     let r = registry();
     let stairs = |facing: Facing, half: SlabHalf| {
-        boxel_voxel::rules::stairs_with(&r, s(&r, "boxel:stone_stairs"), facing, half).unwrap()
+        boxel_demo::rules::stairs_with(&r, s(&r, "boxel:stone_stairs"), facing, half).unwrap()
     };
     for facing in Facing::ALL {
         for half in [SlabHalf::Bottom, SlabHalf::Top] {
@@ -280,7 +304,7 @@ fn stair_shapes_follow_minecrafts_rule() {
                 StairShape::Straight
             );
             let oak =
-                boxel_voxel::rules::stairs_with(&r, s(&r, "boxel:oak_stairs"), ccw, half).unwrap();
+                boxel_demo::rules::stairs_with(&r, s(&r, "boxel:oak_stairs"), ccw, half).unwrap();
             assert_eq!(shape(&[(front, oak)]), StairShape::OuterLeft);
             // On the low side: an inner corner.
             assert_eq!(shape(&[(back, stairs(ccw, half))]), StairShape::InnerLeft);
@@ -333,14 +357,14 @@ fn stair_shapes_follow_minecrafts_rule() {
 #[test]
 fn stair_corners_meet_their_neighbors() {
     let r = registry();
-    let east = boxel_voxel::rules::stairs_with(
+    let east = boxel_demo::rules::stairs_with(
         &r,
         s(&r, "boxel:stone_stairs"),
         Facing::East,
         SlabHalf::Bottom,
     )
     .unwrap();
-    let north = boxel_voxel::rules::stairs_with(
+    let north = boxel_demo::rules::stairs_with(
         &r,
         s(&r, "boxel:stone_stairs"),
         Facing::North,
@@ -376,7 +400,7 @@ fn fences_connect_like_minecraft_simplified() {
         assert!(!connects("boxel:air", toward));
         // Stairs: only by their full high side (toward their facing), turned to the fence.
         let stairs = |facing| {
-            boxel_voxel::rules::stairs_with(&r, s(&r, "boxel:oak_stairs"), facing, SlabHalf::Bottom)
+            boxel_demo::rules::stairs_with(&r, s(&r, "boxel:oak_stairs"), facing, SlabHalf::Bottom)
                 .unwrap()
         };
         assert!(fence_connects(&r, stairs(toward.opposite()), toward));

@@ -21,7 +21,7 @@ fn rule_of(
     s: BlockState,
     n: &[BlockState; 6],
 ) -> Option<BlockState> {
-    rules.rule(r, s).map(|rule| rule(r, s, n))
+    rules.rule(r, s).map(|rule| rule.apply(r, s, n))
 }
 
 /// The registry under test.

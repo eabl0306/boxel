@@ -35,12 +35,16 @@
 //! glass, short grass, poppy), 21 torch, 22 cobblestone, 23 obsidian, 24 `water_flow` and 25
 //! `lava_flow`.
 
+use crate::rules::{self, Kinds};
+use boxel_voxel::rules::{NeighborRule, UseRule};
 use boxel_voxel::shapes::half_from_name;
 use boxel_voxel::{
-    Axis, BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockRegistryBuilder, FLUID_LEVEL,
-    FaceTextures, Facing, FenceSides, OPAQUE_OPACITY, Property, RenderShape, SlabHalf, StairShape,
-    StateValues, TextureId, TexturePattern, TextureSpec, WATERLOGGED, WallSide, WallSides,
+    Axis, BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockRegistryBuilder, BlockState,
+    FLUID_LEVEL, FaceTextures, Facing, FenceSides, OPAQUE_OPACITY, Property, RenderShape, SlabHalf,
+    StairShape, StateValues, TextureId, TexturePattern, TextureSpec, WATERLOGGED, WallSide,
+    WallSides,
 };
+use std::sync::Arc;
 
 /// One demo lamp: an opaque, solid cube that emits colored light.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -435,7 +439,41 @@ pub fn builder() -> BlockRegistryBuilder {
     add_shapes(&mut b, &t);
     add_fluid_products(&mut b, &t);
     add_walls_and_gates(&mut b, &t);
+    add_rules(&mut b);
     b
+}
+
+/// The rules of the demo blocks ([`crate::rules`]), on their blocks: stairs take their shape,
+/// fences, walls and gates follow their neighbors, torches drop without a support, and a gate
+/// opens when used.
+fn add_rules(b: &mut BlockRegistryBuilder) {
+    let kinds = Arc::new(Kinds::of_builder(b));
+    let block = |b: &BlockRegistryBuilder, name: &str| b.block_by_name(name).expect(name);
+    let neighbor =
+        |rule: fn(&Kinds, &BlockRegistry, BlockState, &[BlockState; 6]) -> BlockState| {
+            let kinds = Arc::clone(&kinds);
+            NeighborRule::new(move |registry, state, neighbors| {
+                rule(&kinds, registry, state, neighbors)
+            })
+        };
+    let by_name = [
+        ("boxel:stone_stairs", neighbor(rules::stairs_rule)),
+        ("boxel:oak_stairs", neighbor(rules::stairs_rule)),
+        ("boxel:oak_fence", neighbor(rules::fence_rule)),
+        ("boxel:torch", NeighborRule::new(rules::torch_rule)),
+        ("boxel:wall_torch", neighbor(rules::wall_torch_rule)),
+        ("boxel:cobblestone_wall", neighbor(rules::wall_rule)),
+        ("boxel:oak_fence_gate", neighbor(rules::fence_gate_rule)),
+    ];
+    for (name, rule) in by_name {
+        let id = block(b, name);
+        b.set_neighbor_rule(id, rule).expect("demo rule");
+    }
+    let gate = block(b, "boxel:oak_fence_gate");
+    let gate_use = UseRule::new(move |registry, state, look| {
+        rules::fence_gate_use(&kinds, registry, state, look)
+    });
+    b.set_use_rule(gate, gate_use).expect("demo use rule");
 }
 
 /// The `facing` of a state (north if it has none).
@@ -493,7 +531,7 @@ fn add_shapes(b: &mut BlockRegistryBuilder, t: &Layers) {
         .expect("demo stairs");
     }
     // The fence stops no light (but direct sky when it holds water); its sides follow its
-    // neighbors (`boxel_voxel::rules`).
+    // neighbors ([`crate::rules`]).
     let fence = BlockDef {
         name: "boxel:oak_fence".to_string(),
         shape: RenderShape::Opaque,
@@ -568,7 +606,7 @@ fn add_fluid_products(b: &mut BlockRegistryBuilder, t: &Layers) {
 /// The blocks of ADR 0027, the last ones: the cobblestone wall (with the cobblestone layer) and
 /// the oak fence gate (with the planks layer). Both let light through like a fence (opacity 0,
 /// 1 for a wall that holds water: the sky stops) and follow their neighbors
-/// (`boxel_voxel::rules`): a wall connects and raises its post, a gate drops between walls.
+/// ([`crate::rules`]): a wall connects and raises its post, a gate drops between walls.
 fn add_walls_and_gates(b: &mut BlockRegistryBuilder, t: &Layers) {
     // Minecraft's `cobblestone_wall`: `up` (the post, default true), a side property per
     // direction and `waterlogged` (ADR 0025).

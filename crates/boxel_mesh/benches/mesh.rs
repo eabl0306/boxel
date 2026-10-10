@@ -26,7 +26,7 @@ use boxel_light::{LightScratch, PaddedLight, compute};
 use boxel_mesh::{AoPolicy, ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher, PaddedChunk};
 use boxel_voxel::{
     BlockModel, BlockRegistry, BlockState, CHUNK_SIZE, ChunkData, ChunkKey, ChunkPos, Face,
-    LightTables, LightValue, NEIGHBOR_OFFSETS, rules,
+    LightTables, LightValue, NEIGHBOR_OFFSETS,
 };
 use boxel_worldgen::WorldGenerator;
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -418,14 +418,17 @@ fn bench(c: &mut Criterion) {
     };
     let walls = Scene::new([0, 1, 0], Repr::Packed, |x, y, z| {
         let state = raw(x, y, z);
-        let Some(rule) = rules::rule_for_model(registry.model(state)) else {
+        let Some(rule) = registry
+            .block(state)
+            .and_then(|b| registry.neighbor_rule(b))
+        else {
             return state.0;
         };
         let around = Face::ALL.map(|f| {
             let n = f.normal();
             raw(x + n.x, y + n.y, z + n.z)
         });
-        rule(&registry, state, &around).0
+        rule.apply(&registry, state, &around).0
     });
     let input = walls.input();
     let mesh = mesher.mesh_chunk(&input, &table, OFF);

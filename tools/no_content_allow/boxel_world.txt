@@ -38,9 +38,5 @@ crates/boxel_world/src/fluid.rs	boxel:stone
 crates/boxel_world/src/fluid.rs	boxel:water
 crates/boxel_world/src/fluid.rs	boxel:water
 crates/boxel_world/src/fluid.rs	boxel:water
-crates/boxel_world/src/neighbor_rules.rs	rule_for_model
-crates/boxel_world/src/neighbor_rules.rs	rule_for_model
-crates/boxel_world/src/neighbor_rules.rs	use_rule_for_model
-crates/boxel_world/src/neighbor_rules.rs	use_rule_for_model
 crates/boxel_world/src/persist/format.rs	boxel:fence
 crates/boxel_world/src/persist/format.rs	boxel:log

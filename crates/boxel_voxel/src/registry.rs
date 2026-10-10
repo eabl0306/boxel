@@ -3,6 +3,7 @@
 //! assigned in registration order and contiguous per block. Every per-state datum (model,
 //! collision, textures, light) lives in flat arrays indexed by the state id. Frozen before the
 //! world loads and shared as `Arc<BlockRegistry>`.
+use crate::rules::{NeighborRule, UseRule};
 use crate::shapes::{self, Facing, FenceSides, MAX_MODEL_BOXES, ModelBox, StairShape, WallSides};
 use crate::state::{Property, StateName, StateParseError, StateValues, split_state};
 use crate::{Face, LightValue, OPAQUE_OPACITY};
@@ -561,6 +562,9 @@ pub enum RegistryError {
     /// outside `-32..32`.
     #[error("invalid collision box of {0}")]
     InvalidCollision(String),
+    /// Block id not registered.
+    #[error("unknown block id {0}")]
+    UnknownBlock(u16),
 }
 
 /// Index of a block (not of a state) in its registry, in registration order (`0` = air).
@@ -602,6 +606,10 @@ pub struct BlockRegistryBuilder {
     blocks: Vec<BlockInfo>,
     /// The distinct [`ModelBox`]es of the states so far (at most [`MAX_MODEL_BOXES`]).
     model_boxes: std::collections::HashSet<ModelBox>,
+    /// The neighbor rule of each block (by [`BlockId`]; missing at the end: none).
+    neighbor_rules: Vec<Option<NeighborRule>>,
+    /// The use rule of each block (by [`BlockId`]; missing at the end: none).
+    use_rules: Vec<Option<UseRule>>,
 }
 
 impl BlockRegistryBuilder {
@@ -632,6 +640,43 @@ impl BlockRegistryBuilder {
         }
         self.textures.push(spec);
         Ok(TextureId((self.textures.len() - 1) as u16))
+    }
+
+    /// The block of the name, among those registered so far.
+    pub fn block_by_name(&self, name: &str) -> Option<BlockId> {
+        self.blocks
+            .iter()
+            .position(|b| b.name == name)
+            .map(|i| BlockId(i as u16))
+    }
+
+    /// Sets the [`NeighborRule`] of `block` (replaces an earlier one): the state each of its
+    /// states takes from its 6 face neighbors, applied by the world around every edit.
+    pub fn set_neighbor_rule(
+        &mut self,
+        block: BlockId,
+        rule: NeighborRule,
+    ) -> Result<(), RegistryError> {
+        let i = self.block_index(block)?;
+        set_slot(&mut self.neighbor_rules, i, rule);
+        Ok(())
+    }
+
+    /// Sets the [`UseRule`] of `block` (replaces an earlier one): what using it does.
+    pub fn set_use_rule(&mut self, block: BlockId, rule: UseRule) -> Result<(), RegistryError> {
+        let i = self.block_index(block)?;
+        set_slot(&mut self.use_rules, i, rule);
+        Ok(())
+    }
+
+    /// The index of `block`, if it is registered.
+    fn block_index(&self, block: BlockId) -> Result<usize, RegistryError> {
+        let i = usize::from(block.0);
+        if i < self.blocks.len() {
+            Ok(i)
+        } else {
+            Err(RegistryError::UnknownBlock(block.0))
+        }
     }
 
     /// Registers a block without state properties (one state); returns its state.
@@ -791,6 +836,8 @@ impl BlockRegistryBuilder {
             }
         }
         BlockRegistry {
+            neighbor_rules: per_block(self.neighbor_rules, self.blocks.len()),
+            use_rules: per_block(self.use_rules, self.blocks.len()),
             state_block,
             shapes: states.iter().map(|b| b.shape).collect(),
             models: states.iter().map(|b| b.model).collect(),
@@ -807,6 +854,20 @@ impl BlockRegistryBuilder {
             by_name,
         }
     }
+}
+
+/// Puts `value` at `i` of `slots`, growing it with `None`.
+fn set_slot<T: Clone>(slots: &mut Vec<Option<T>>, i: usize, value: T) {
+    if slots.len() <= i {
+        slots.resize(i + 1, None);
+    }
+    slots[i] = Some(value);
+}
+
+/// `slots` with one per block: `blocks` long, `None` for the missing ones.
+fn per_block<T: Clone>(mut slots: Vec<Option<T>>, blocks: usize) -> Vec<Option<T>> {
+    slots.resize(blocks, None);
+    slots
 }
 
 /// `namespace:path`, both non-empty, `[a-z0-9_]` (path may contain `/`).
@@ -843,6 +904,10 @@ pub struct BlockRegistry {
     textures: Vec<TextureSpec>,
     blocks: Vec<BlockInfo>,
     by_name: std::collections::HashMap<String, BlockId, foldhash::fast::FixedState>,
+    /// The neighbor rule of each block (by [`BlockId`]).
+    neighbor_rules: Vec<Option<NeighborRule>>,
+    /// The use rule of each block (by [`BlockId`]).
+    use_rules: Vec<Option<UseRule>>,
 }
 
 impl BlockRegistry {
@@ -889,6 +954,15 @@ impl BlockRegistry {
         self.blocks
             .get(usize::from(b.0))
             .map_or("boxel:unknown", |b| b.name.as_str())
+    }
+    /// The [`NeighborRule`] of a block, if it has one
+    /// ([`BlockRegistryBuilder::set_neighbor_rule`]).
+    pub fn neighbor_rule(&self, b: BlockId) -> Option<&NeighborRule> {
+        self.neighbor_rules.get(usize::from(b.0))?.as_ref()
+    }
+    /// The [`UseRule`] of a block, if it has one ([`BlockRegistryBuilder::set_use_rule`]).
+    pub fn use_rule(&self, b: BlockId) -> Option<&UseRule> {
+        self.use_rules.get(usize::from(b.0))?.as_ref()
     }
     /// The default state of a block (air if out of range).
     pub fn default_state(&self, b: BlockId) -> BlockState {

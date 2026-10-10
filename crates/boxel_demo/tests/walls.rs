@@ -3,10 +3,8 @@
 //! The rules and shapes are checked against brute-force versions written here, sixteenth by
 //! sixteenth from Minecraft's `WallBlock` and `FenceGateBlock`, independent of the crate's.
 
-use boxel_voxel::rules::{
-    fence_connects, fence_gate_rule, fence_gate_use, fence_rule, is_sturdy, supports_center,
-    torch_rule, use_rule_for_model, wall_rule,
-};
+use boxel_demo::rules::{self as demo, Kinds, torch_rule};
+use boxel_voxel::rules::{is_sturdy, supports_center};
 use boxel_voxel::shapes::{
     fence_gate_boxes, fence_gate_collision, fence_gate_outline, wall_boxes, wall_collision,
     wall_outline,
@@ -24,6 +22,37 @@ fn registry() -> BlockRegistry {
 fn s(r: &BlockRegistry, name: &str) -> BlockState {
     r.parse_state(name)
         .unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+/// The demo rules with the kinds of `r` (the rules take them since #48).
+fn fence_connects(r: &BlockRegistry, neighbor: BlockState, toward: Facing) -> bool {
+    demo::fence_connects(&Kinds::of_registry(r), r, neighbor, toward)
+}
+
+fn wall_connects(r: &BlockRegistry, neighbor: BlockState, toward: Facing) -> bool {
+    demo::wall_connects(&Kinds::of_registry(r), r, neighbor, toward)
+}
+
+fn fence_rule(r: &BlockRegistry, state: BlockState, n: &[BlockState; 6]) -> BlockState {
+    demo::fence_rule(&Kinds::of_registry(r), r, state, n)
+}
+
+fn wall_rule(r: &BlockRegistry, state: BlockState, n: &[BlockState; 6]) -> BlockState {
+    demo::wall_rule(&Kinds::of_registry(r), r, state, n)
+}
+
+fn fence_gate_rule(r: &BlockRegistry, state: BlockState, n: &[BlockState; 6]) -> BlockState {
+    demo::fence_gate_rule(&Kinds::of_registry(r), r, state, n)
+}
+
+fn fence_gate_use(r: &BlockRegistry, state: BlockState, look: Facing) -> Option<BlockState> {
+    demo::fence_gate_use(&Kinds::of_registry(r), r, state, look)
+}
+
+/// True if the block of `state` has a use rule (the rules are registered per block since
+/// #48).
+fn has_use_rule(r: &BlockRegistry, state: BlockState) -> bool {
+    r.block(state).and_then(|b| r.use_rule(b)).is_some()
 }
 
 /// A set of sixteenth cells `(x, y, z)` (`y` up to 24 for collision).
@@ -709,7 +738,7 @@ fn gates_drop_between_walls_and_connect_fences_and_walls() {
                     "{facing:?} {toward:?}"
                 );
                 assert_eq!(
-                    boxel_voxel::rules::wall_connects(&r, gate, toward),
+                    wall_connects(&r, gate, toward),
                     end,
                     "{facing:?} {toward:?}"
                 );
@@ -731,14 +760,14 @@ fn gates_drop_between_walls_and_connect_fences_and_walls() {
 #[test]
 fn using_a_gate_opens_it_away_from_the_user_and_closes_it() {
     let r = registry();
-    assert!(use_rule_for_model(r.model(s(&r, "boxel:oak_fence_gate"))).is_some());
+    assert!(has_use_rule(&r, s(&r, "boxel:oak_fence_gate")));
     for name in [
         "boxel:stone",
         "boxel:oak_fence",
         "boxel:cobblestone_wall",
         "boxel:torch",
     ] {
-        assert!(use_rule_for_model(r.model(s(&r, name))).is_none(), "{name}");
+        assert!(!has_use_rule(&r, s(&r, name)), "{name}");
         assert_eq!(fence_gate_use(&r, s(&r, name), Facing::North), None);
     }
     for facing in Facing::ALL {
