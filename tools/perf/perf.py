@@ -15,8 +15,9 @@ or a binary; its binary comes from bench-results/bins/<sha>/stress, built from a
 the base when missing. The new side is this checkout as it is (built in place), or --new. A case
 fails only on a gross regression: fps under 85 % of the base, p99 over 1.5 times the base, or
 frames over 6.94 ms where the base had none. A failing pair is repeated once and only a second
-failure counts. Cases: surface and forest by default, on the RTX, radius 16, uncapped. Options
-after `--` go to stress on both sides (`-- --bodies 10000`).
+failure counts. Capped on the RTX, p99 only counts when both runs landed in the same skip mode
+(issue #5). Cases: surface and forest by default, on the RTX, radius 16, uncapped. Options after
+`--` go to stress on both sides (`-- --bodies 10000`).
 
 check (level 2, `just perf-check`): the fixed matrix (`perf.py cases`), 3 interleaved runs of
 20 s per case and side, on a commit of main, against the binary of the last checkpoint
@@ -330,13 +331,16 @@ def resolve(spec, name=''):
 # ---------------------------------------------------------------------------------------------
 # Verdicts
 
-def gross(base, new, fps_min=FPS_MIN, p99_max=P99_MAX):
+def gross(base, new, fps_min=FPS_MIN, p99_max=P99_MAX, modes=False):
     """Gross regressions of `new` against `base` (metrics of one run each): the reasons. Slow
-    frames are those over 6.94 ms, capped or not."""
+    frames are those over 6.94 ms, capped or not. With `modes` (a capped NVIDIA case, by_mode)
+    p99 only counts when both runs landed in the same skip mode."""
     out = []
     if base.get('fps') and new.get('fps') is not None and new['fps'] < fps_min * base['fps']:
         out.append(f"fps {fmt(new['fps'])} under {fps_min:.0%} of {fmt(base['fps'])}")
-    if base.get('p99') and new.get('p99') is not None and new['p99'] > p99_max * base['p99']:
+    same_mode = not modes or base.get('mode') == new.get('mode')
+    if (same_mode and base.get('p99') and new.get('p99') is not None
+            and new['p99'] > p99_max * base['p99']):
         out.append(f"p99 {fmt(new['p99'])} ms over {p99_max:g}x {fmt(base['p99'])} ms")
     if base.get('slow') == 0 and new.get('slow'):
         out.append(f"{new['slow']} frames over 6.94 ms, the base had none")
@@ -370,6 +374,8 @@ class SmokeResult:
     lost: str = None
     # Not run at all (the machine never got quiet for an earlier case).
     not_run: str = None
+    # The last pair of a capped NVIDIA case landed in different skip modes: p99 not compared.
+    modes: str = None
 
     @property
     def status(self):
@@ -405,11 +411,12 @@ class SmokeResult:
             if self.problems and self.problems[0]:
                 text += f" (the first pair looked worse: {'; '.join(self.problems[0])})"
             return text
+        note = f' (p99 not compared: skip modes {self.modes})' if self.modes else ''
         if status == 'worse':
-            return 'WORSE: ' + '; '.join(self.problems[-1])
+            return 'WORSE: ' + '; '.join(self.problems[-1]) + note
         if len(self.problems) == 2:
-            return 'ok (the first pair looked worse, the repeat did not)'
-        return 'ok'
+            return 'ok (the first pair looked worse, the repeat did not)' + note
+        return 'ok' + note
 
 
 def fmt(value):
@@ -471,7 +478,9 @@ def smoke_case(case, base, new, folder, duration=SMOKE_S, flip=False, fps_min=FP
         result.pairs.append(pair)
         if result.status != 'ok':
             break
-        problems = gross(pair[0].metrics, pair[1].metrics, fps_min, p99_max)
+        b_mode, n_mode = pair[0].metrics.get('mode'), pair[1].metrics.get('mode')
+        result.modes = f'{b_mode} -> {n_mode}' if by_mode(case) and b_mode != n_mode else None
+        problems = gross(pair[0].metrics, pair[1].metrics, fps_min, p99_max, by_mode(case))
         result.problems.append(problems)
         if not problems:
             break

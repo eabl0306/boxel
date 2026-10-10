@@ -433,6 +433,15 @@ class SmokeTest(unittest.TestCase):
         some = runs.metrics(summary(cap=144, slow=2, slow75=0), [])
         self.assertIn('2 frames over 6.94 ms', perf.gross(none, some)[0])
 
+    def test_gross_compares_p99_within_one_skip_mode(self):
+        """Capped on the NVIDIA, a new run in the high skip mode doubles p99 by itself."""
+        base, high = metrics(p99=7.5, mode='low'), metrics(p99=13.9, mode='high')
+        self.assertIn('over 1.5x', perf.gross(base, high)[0])
+        self.assertEqual(perf.gross(base, high, modes=True), [])
+        self.assertIn('over 1.5x', perf.gross(base, metrics(p99=13.9, mode='low'), modes=True)[0])
+        self.assertIn('under 85%', perf.gross(base, metrics(fps=500, p99=13.9, mode='high'),
+                                               modes=True)[0])
+
     def result(self, *problems, new_error=None, base_error=None):
         r = perf.SmokeResult(Case())
         for p in problems:
@@ -600,6 +609,19 @@ class SmokeRunTest(FakeMachine):
         r = self.smoke(base, new)
         self.assertEqual(r.status, 'worse')
         self.assertEqual((calls(base.path), calls(new.path)), (2, 2))
+
+    def test_a_capped_nvidia_pair_in_different_skip_modes(self):
+        low = {'data': summary(fps=143, p99=7.5, cap=144)}
+        high = {'data': summary(fps=141, p99=13.9, cap=144), 'skip': HIGH_MODE}
+        base, new = self.binary('base', **low), self.binary('new', **high)
+        r = self.smoke(base, new, Case('rtx', 'forest', 16, 144))
+        self.assertEqual(r.status, 'ok', self.output())
+        self.assertEqual(r.verdict(), 'ok (p99 not compared: skip modes low -> high)')
+        self.assertEqual((calls(base.path), calls(new.path)), (1, 1), 'nothing to repeat')
+        # The 780M has no skip modes.
+        r = self.smoke(base, new, Case('780m', 'forest', 16, 144))
+        self.assertEqual(r.status, 'worse')
+        self.assertIn('p99 13.90 ms over 1.5x 7.50 ms', r.verdict())
 
     def cmd_smoke(self, cases, base, new, extra=()):
         a = perf.parser().parse_args(['smoke', *cases, '--duration', '3'])
