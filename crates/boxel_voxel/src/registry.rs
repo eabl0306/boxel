@@ -3,7 +3,9 @@
 //! assigned in registration order and contiguous per block. Every per-state datum (model,
 //! collision, textures, light) lives in flat arrays indexed by the state id. Frozen before the
 //! world loads and shared as `Arc<BlockRegistry>`.
-use crate::shapes::{self, Facing, FenceSides, MAX_MODEL_BOXES, ModelBox, StairShape, WallSides};
+use crate::fluid::{FluidHardening, FluidId, FluidReplace, FluidRules, FluidType, MAX_FLUIDS};
+use crate::rules::{NeighborRule, UseRule};
+use crate::shapes::{MAX_MODEL_BOXES, ModelBox};
 use crate::state::{Property, StateName, StateParseError, StateValues, split_state};
 use crate::{Face, LightValue, OPAQUE_OPACITY};
 
@@ -126,49 +128,11 @@ pub enum BlockModel {
     /// Minecraft. Lets everything through ([`BlockModel::default_collision`] is `None`). Hides
     /// no neighbor face, even when drawn `Opaque` (lava).
     Fluid,
-    /// Stairs (ADR 0020): the slab of `half` and a step on the `facing` side, shaped by `shape`
-    /// ([`crate::shapes::stair_boxes`]). Collide and are picked by their boxes.
-    Stairs {
-        /// Toward the high side.
-        facing: Facing,
-        /// Which half the slab part fills.
-        half: SlabHalf,
-        /// Straight or a corner.
-        shape: StairShape,
-    },
-    /// A fence (ADR 0020): a post and bars toward the connected `sides`
-    /// ([`crate::shapes::fence_boxes`]).
-    Fence {
-        /// Connected sides.
-        sides: FenceSides,
-    },
-    /// A standing torch: a 2x10x2 stick ([`crate::shapes::TORCH_BOX`]). No collision.
-    Torch,
-    /// A torch on a wall, pointing toward `facing` (away from the wall). No collision.
-    WallTorch {
-        /// Away from the wall.
-        facing: Facing,
-    },
-    /// A wall (ADR 0027, Minecraft's `cobblestone_wall`): a post when `post` and a bar toward
-    /// each connected side, low or tall ([`crate::shapes::wall_boxes`]). Collides 1.5 blocks
-    /// tall, like a fence.
-    Wall {
-        /// The post in the middle (Minecraft's `up`).
-        post: bool,
-        /// The sides.
-        sides: WallSides,
-    },
-    /// A fence gate (ADR 0027): two posts and the gate between them, across `facing`
-    /// ([`crate::shapes::fence_gate_boxes`]). Closed it collides 1.5 blocks tall; open, not at
-    /// all.
-    FenceGate {
-        /// The way it opens (the gate runs across it).
-        facing: Facing,
-        /// Open.
-        open: bool,
-        /// Between walls: 3 sixteenths lower.
-        in_wall: bool,
-    },
+    /// A model made of boxes (ADR 0020, ADR 0027): the [`BoxModel`] `id` of its registry, its
+    /// boxes drawn as they are and its outline picked. It collides as its `BlockDef::collision`
+    /// says ([`BlockModel::default_collision`] is `None`). Stairs, fences, torches, walls, fence
+    /// gates, any shape a game gives.
+    Boxes(BoxModelId),
 }
 
 impl Default for BlockModel {
@@ -218,83 +182,81 @@ impl BlockModel {
         }
     }
 
-    /// The box the block is picked by (its outline): the full cell for cubes, the half cell for
-    /// slabs, a smaller box around the stem for crosses, the boxes of stairs, the post and arms
-    /// of a fence, a box around a torch's stick, Minecraft's shapes of walls and fence gates (a
-    /// gate is picked the same open or closed).
-    pub fn outline(self) -> BlockCollision {
-        match self {
-            BlockModel::Cube { .. } | BlockModel::Fluid => BlockCollision::Full,
-            BlockModel::Slab(half) => BlockCollision::Boxes(vec![CollisionBox::slab(half)]),
-            BlockModel::Cross => {
-                BlockCollision::Boxes(vec![CollisionBox::new([2, 0, 2], [14, 13, 14])])
-            }
-            BlockModel::Stairs { .. } => {
-                BlockCollision::Boxes(self.boxes().iter().map(|b| b.bounds).collect())
-            }
-            BlockModel::Fence { sides } => BlockCollision::Boxes(shapes::fence_outline(sides)),
-            BlockModel::Torch => BlockCollision::Boxes(vec![shapes::TORCH_OUTLINE]),
-            BlockModel::WallTorch { facing } => {
-                BlockCollision::Boxes(vec![shapes::wall_torch_outline(facing)])
-            }
-            BlockModel::Wall { post, sides } => {
-                BlockCollision::Boxes(shapes::wall_outline(post, sides))
-            }
-            BlockModel::FenceGate {
-                facing, in_wall, ..
-            } => BlockCollision::Boxes(vec![shapes::fence_gate_outline(facing, in_wall)]),
-        }
-    }
-
-    /// The usual collision of the model: full cubes, slabs and stairs collide with their shape,
-    /// fences, walls and closed fence gates 1.5 blocks tall (Minecraft's, ADR 0026 and 0027:
-    /// they reach into the cell above, so they cannot be jumped), crosses, fluids, torches and
-    /// open fence gates do not collide.
+    /// The usual collision of the model: full cubes and slabs collide with their shape;
+    /// crosses, fluids and models made of boxes do not (the content gives a block made of boxes
+    /// its collision, `BlockDef::collision`).
     pub fn default_collision(self) -> BlockCollision {
         match self {
-            BlockModel::Cross
-            | BlockModel::Fluid
-            | BlockModel::Torch
-            | BlockModel::WallTorch { .. }
-            | BlockModel::FenceGate { open: true, .. } => BlockCollision::None,
-            BlockModel::Fence { sides } => BlockCollision::Boxes(shapes::fence_collision(sides)),
-            BlockModel::Wall { post, sides } => {
-                BlockCollision::Boxes(shapes::wall_collision(post, sides))
-            }
-            BlockModel::FenceGate {
-                facing,
-                open: false,
-                ..
-            } => BlockCollision::Boxes(vec![shapes::fence_gate_collision(facing)]),
-            other => other.outline(),
+            BlockModel::Cube { .. } => BlockCollision::Full,
+            BlockModel::Slab(half) => BlockCollision::Boxes(vec![CollisionBox::slab(half)]),
+            BlockModel::Cross | BlockModel::Fluid | BlockModel::Boxes(_) => BlockCollision::None,
         }
     }
+}
 
-    /// The boxes the model is drawn with, for the models made of boxes (slabs, stairs, fences,
-    /// torches, walls and fence gates; ADR 0020, ADR 0027). Empty for cubes, crosses and fluids,
-    /// which the mesher draws its own way.
-    pub fn boxes(self) -> Vec<ModelBox> {
-        match self {
-            BlockModel::Cube { .. } | BlockModel::Fluid | BlockModel::Cross => Vec::new(),
-            BlockModel::Slab(half) => vec![ModelBox {
-                bounds: CollisionBox::slab(half),
-                texture_offset: [0; 3],
-            }],
-            BlockModel::Stairs {
-                facing,
-                half,
-                shape,
-            } => shapes::stair_boxes(facing, half, shape),
-            BlockModel::Fence { sides } => shapes::fence_boxes(sides),
-            BlockModel::Torch => vec![shapes::TORCH_BOX],
-            BlockModel::WallTorch { facing } => vec![shapes::wall_torch_box(facing)],
-            BlockModel::Wall { post, sides } => shapes::wall_boxes(post, sides),
-            BlockModel::FenceGate {
-                facing,
-                open,
-                in_wall,
-            } => shapes::fence_gate_boxes(facing, open, in_wall),
+/// The id of a [`BoxModel`] in its registry ([`BlockRegistryBuilder::add_box_model`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BoxModelId(pub u16);
+
+/// A model made of boxes ([`BlockModel::Boxes`]): the boxes it is drawn with and the boxes it is
+/// picked by (its outline, often the boxes' bounds, sometimes bigger or simpler, as Minecraft's
+/// shapes: a fence is picked by a post and arms 4 wide, drawn with thin bars).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BoxModel {
+    /// The boxes it is drawn with (each [`ModelBox::is_valid`]; none draws nothing, as a wall
+    /// without a post or sides).
+    pub boxes: Vec<ModelBox>,
+    /// The boxes it is picked by (each [`CollisionBox::is_valid`]: inside the cell).
+    pub outline: Vec<CollisionBox>,
+}
+
+impl BoxModel {
+    /// A model picked by the bounds of the boxes it is drawn with.
+    pub fn from_boxes(boxes: Vec<ModelBox>) -> Self {
+        let outline = boxes.iter().map(|b| b.bounds).collect();
+        Self { boxes, outline }
+    }
+
+    /// Valid boxes and outline boxes.
+    fn is_valid(&self) -> bool {
+        self.boxes.iter().all(|b| b.is_valid()) && self.outline.iter().all(|b| b.is_valid())
+    }
+}
+
+/// The boxes of the two slabs, as [`BlockRegistry::model_boxes`] hands them out.
+static SLAB_BOXES: [[ModelBox; 1]; 2] = [
+    [ModelBox::slab(SlabHalf::Bottom)],
+    [ModelBox::slab(SlabHalf::Top)],
+];
+
+/// The boxes `model` is drawn with, `models` being its registry's box models: a slab's half,
+/// a [`BoxModel`]'s boxes; none for cubes, crosses and fluids (and an unknown box model).
+fn boxes_of(models: &[BoxModel], model: BlockModel) -> &[ModelBox] {
+    match model {
+        BlockModel::Slab(SlabHalf::Bottom) => &SLAB_BOXES[0],
+        BlockModel::Slab(SlabHalf::Top) => &SLAB_BOXES[1],
+        BlockModel::Boxes(id) => models
+            .get(usize::from(id.0))
+            .map_or(&[], |m| m.boxes.as_slice()),
+        BlockModel::Cube { .. } | BlockModel::Cross | BlockModel::Fluid => &[],
+    }
+}
+
+/// The box `model` is picked by (its outline), `models` being its registry's box models: the
+/// full cell for cubes and fluids, the half cell for slabs, a smaller box around the stem for
+/// crosses, a [`BoxModel`]'s outline.
+fn outline_of(models: &[BoxModel], model: BlockModel) -> BlockCollision {
+    match model {
+        BlockModel::Cube { .. } | BlockModel::Fluid => BlockCollision::Full,
+        BlockModel::Slab(half) => BlockCollision::Boxes(vec![CollisionBox::slab(half)]),
+        BlockModel::Cross => {
+            BlockCollision::Boxes(vec![CollisionBox::new([2, 0, 2], [14, 13, 14])])
         }
+        BlockModel::Boxes(id) => models
+            .get(usize::from(id.0))
+            .map_or(BlockCollision::None, |m| {
+                BlockCollision::Boxes(m.outline.clone())
+            }),
     }
 }
 
@@ -388,7 +350,8 @@ bitflags::bitflags! {
         const SOLID = 1;
         /// Hides the neighbor faces it touches: shape `Opaque` with a full cube model.
         const OCCLUDES = 1 << 1;
-        /// Liquid: a `BlockModel::Fluid` or a `Translucent` block without collision.
+        /// Liquid: a `BlockModel::Fluid` without collision (whatever its render layer: a
+        /// clear block without collision is not a liquid).
         const FLUID = 1 << 2;
         /// Emits light (some `emission` channel above 0).
         const EMISSIVE = 1 << 3;
@@ -399,8 +362,9 @@ bitflags::bitflags! {
         /// cube (ADR 0025).
         const WATERLOGGABLE = 1 << 5;
         /// Stops movement (Minecraft's `blocksMotion`): it collides ([`StateFlags::SOLID`]),
-        /// or it is a fence gate, open or closed (Minecraft's gates are solid wood; an open one
-        /// does not collide, ADR 0027). Fluids never flow into it and stand on it.
+        /// or its block was declared to ([`BlockRegistryBuilder::set_blocks_motion`]: a fence
+        /// gate, open or closed, as Minecraft's gates are solid wood; an open one does not
+        /// collide, ADR 0027). Fluids never flow into it and stand on it.
         const BLOCKS_MOTION = 1 << 6;
     }
 }
@@ -541,8 +505,8 @@ pub enum RegistryError {
     /// Name must be `namespace:path` with `[a-z0-9_]` parts.
     #[error("invalid name {0}")]
     InvalidName(String),
-    /// More than 4096 textures, [`MAX_STATES`] states or [`MAX_MODEL_BOXES`] distinct model
-    /// boxes.
+    /// More than 4096 textures, [`MAX_STATES`] states, `u16::MAX` box models,
+    /// [`MAX_MODEL_BOXES`] distinct model boxes or [`MAX_FLUIDS`] fluids.
     #[error("registry full: {0}")]
     Full(&'static str),
     /// A property of the block with an invalid name or value, no values, a default that is not
@@ -557,10 +521,23 @@ pub enum RegistryError {
     #[error("invalid light values of {0}")]
     InvalidLight(String),
     /// A collision or model box outside the cell or empty (`min < max <= 16` on every axis; a
-    /// collision box may reach up to [`MAX_COLLISION_HEIGHT`]), or a model box texture offset
-    /// outside `-32..32`.
+    /// collision box may reach up to [`MAX_COLLISION_HEIGHT`]), a model box texture offset
+    /// outside `-32..32` (in a [`BoxModel`] too).
     #[error("invalid collision box of {0}")]
     InvalidCollision(String),
+    /// Block id not registered.
+    #[error("unknown block id {0}")]
+    UnknownBlock(u16),
+    /// Box model id not registered ([`BlockRegistryBuilder::add_box_model`]).
+    #[error("unknown box model id {0}")]
+    UnknownBoxModel(u16),
+    /// A fluid whose block is not a `BlockModel::Fluid` with exactly the [`FLUID_LEVEL`]
+    /// property `0..=15` (or is a fluid already), or a fluid table naming an unknown state.
+    #[error("invalid fluid {0}")]
+    InvalidFluid(String),
+    /// Fluid id not declared ([`BlockRegistryBuilder::add_fluid`]).
+    #[error("unknown fluid id {0}")]
+    UnknownFluid(u8),
 }
 
 /// Index of a block (not of a state) in its registry, in registration order (`0` = air).
@@ -602,6 +579,19 @@ pub struct BlockRegistryBuilder {
     blocks: Vec<BlockInfo>,
     /// The distinct [`ModelBox`]es of the states so far (at most [`MAX_MODEL_BOXES`]).
     model_boxes: std::collections::HashSet<ModelBox>,
+    /// The neighbor rule of each block (by [`BlockId`]; missing at the end: none).
+    neighbor_rules: Vec<Option<NeighborRule>>,
+    /// The use rule of each block (by [`BlockId`]; missing at the end: none).
+    use_rules: Vec<Option<UseRule>>,
+    /// The box models, by [`BoxModelId`], and the id of each.
+    box_models: Vec<BoxModel>,
+    box_model_ids: std::collections::HashMap<BoxModel, BoxModelId>,
+    /// The blocks that stop movement where they do not collide (by [`BlockId`]).
+    blocks_motion: Vec<bool>,
+    /// The fluids, by [`FluidId`].
+    fluids: Vec<FluidType>,
+    /// The fluid the waterlogged states hold.
+    waterlog_fluid: Option<FluidId>,
 }
 
 impl BlockRegistryBuilder {
@@ -632,6 +622,198 @@ impl BlockRegistryBuilder {
         }
         self.textures.push(spec);
         Ok(TextureId((self.textures.len() - 1) as u16))
+    }
+
+    /// The block of the name, among those registered so far.
+    pub fn block_by_name(&self, name: &str) -> Option<BlockId> {
+        self.blocks
+            .iter()
+            .position(|b| b.name == name)
+            .map(|i| BlockId(i as u16))
+    }
+
+    /// Sets the [`NeighborRule`] of `block` (replaces an earlier one): the state each of its
+    /// states takes from its 6 face neighbors, applied by the world around every edit.
+    pub fn set_neighbor_rule(
+        &mut self,
+        block: BlockId,
+        rule: NeighborRule,
+    ) -> Result<(), RegistryError> {
+        let i = self.block_index(block)?;
+        set_slot(&mut self.neighbor_rules, i, rule);
+        Ok(())
+    }
+
+    /// Sets the [`UseRule`] of `block` (replaces an earlier one): what using it does.
+    pub fn set_use_rule(&mut self, block: BlockId, rule: UseRule) -> Result<(), RegistryError> {
+        let i = self.block_index(block)?;
+        set_slot(&mut self.use_rules, i, rule);
+        Ok(())
+    }
+
+    /// Registers a model made of boxes ([`BlockModel::Boxes`]) and returns its id; a model equal
+    /// to one registered before gets that one's id. Every box must be valid
+    /// ([`ModelBox::is_valid`]) and every outline box inside the cell.
+    pub fn add_box_model(&mut self, model: BoxModel) -> Result<BoxModelId, RegistryError> {
+        if !model.is_valid() {
+            return Err(RegistryError::InvalidCollision("a box model".to_string()));
+        }
+        if let Some(&id) = self.box_model_ids.get(&model) {
+            return Ok(id);
+        }
+        let id = u16::try_from(self.box_models.len())
+            .ok()
+            .filter(|&id| id < u16::MAX)
+            .map(BoxModelId)
+            .ok_or(RegistryError::Full("box models"))?;
+        self.box_model_ids.insert(model.clone(), id);
+        self.box_models.push(model);
+        Ok(id)
+    }
+
+    /// Declares that every state of `block` stops movement ([`StateFlags::BLOCKS_MOTION`]) even
+    /// where it does not collide: fluids neither flow into it nor count it as open (Minecraft's
+    /// fence gates, open or closed).
+    pub fn set_blocks_motion(&mut self, block: BlockId) -> Result<(), RegistryError> {
+        let i = self.block_index(block)?;
+        if self.blocks_motion.len() <= i {
+            self.blocks_motion.resize(i + 1, false);
+        }
+        self.blocks_motion[i] = true;
+        Ok(())
+    }
+
+    /// The default state of the block named `name`, among those registered so far.
+    pub fn by_name(&self, name: &str) -> Option<BlockState> {
+        let block = self.block_by_name(name)?;
+        Some(BlockState(self.blocks[usize::from(block.0)].default))
+    }
+
+    /// Declares `block` a fluid that flows by `rules` and returns its id. The block must be drawn
+    /// as `BlockModel::Fluid` and have exactly one property, [`FLUID_LEVEL`], with the values `0`
+    /// to `15` in order (Minecraft's `level`: its states are its levels, a source first), and
+    /// not be a fluid already.
+    pub fn add_fluid(
+        &mut self,
+        block: BlockId,
+        rules: FluidRules,
+    ) -> Result<FluidId, RegistryError> {
+        let info = &self.blocks[self.block_index(block)?];
+        let first = BlockState(info.first);
+        let levels = match info.properties.as_slice() {
+            [level] => {
+                level.name() == FLUID_LEVEL
+                    && level.values().len() == 16
+                    && level
+                        .values()
+                        .iter()
+                        .enumerate()
+                        .all(|(i, v)| *v == i.to_string())
+            }
+            _ => false,
+        };
+        let states = usize::from(info.first)..usize::from(info.first + info.count);
+        let fluid = self.states[states]
+            .iter()
+            .all(|def| def.model == BlockModel::Fluid);
+        if !levels || !fluid || self.fluids.iter().any(|f| f.block == block) {
+            return Err(RegistryError::InvalidFluid(info.name.clone()));
+        }
+        if self.fluids.len() >= MAX_FLUIDS {
+            return Err(RegistryError::Full("fluids"));
+        }
+        self.fluids.push(FluidType {
+            block,
+            first,
+            rules,
+            replaced_by: Vec::new(),
+            falls_into: Vec::new(),
+            hardens: Vec::new(),
+        });
+        Ok(FluidId((self.fluids.len() - 1) as u8))
+    }
+
+    /// Lets fluid `by` flow into the cells of fluid `target` when `when` says.
+    pub fn fluid_replaced_by(
+        &mut self,
+        target: FluidId,
+        by: FluidId,
+        when: FluidReplace,
+    ) -> Result<(), RegistryError> {
+        self.fluid_index(by)?;
+        let i = self.fluid_index(target)?;
+        self.fluids[i].replaced_by.push((by, when));
+        Ok(())
+    }
+
+    /// A cell of fluid `into` becomes `becomes` when fluid `fluid` falls into it.
+    pub fn fluid_falls_into(
+        &mut self,
+        fluid: FluidId,
+        into: FluidId,
+        becomes: BlockState,
+    ) -> Result<(), RegistryError> {
+        self.fluid_index(into)?;
+        let i = self.fluid_index(fluid)?;
+        self.check_fluid_state(i, becomes)?;
+        self.fluids[i].falls_into.push((into, becomes));
+        Ok(())
+    }
+
+    /// Fluid `fluid` hardens beside another as `hardening` says. A fluid may harden beside
+    /// several: a cell takes the first hardening, in declaration order, whose fluid it meets.
+    pub fn fluid_hardens(
+        &mut self,
+        fluid: FluidId,
+        hardening: FluidHardening,
+    ) -> Result<(), RegistryError> {
+        self.fluid_index(hardening.with)?;
+        let i = self.fluid_index(fluid)?;
+        self.check_fluid_state(i, hardening.source)?;
+        self.check_fluid_state(i, hardening.flowing)?;
+        self.fluids[i].hardens.push(hardening);
+        Ok(())
+    }
+
+    /// Makes `fluid` the one the waterlogged states hold ([`StateFlags::WATERLOGGED`], ADR
+    /// 0025): they tick and spread as its source, and a dry block that can be waterlogged takes
+    /// a source of it.
+    pub fn set_waterlog_fluid(&mut self, fluid: FluidId) -> Result<(), RegistryError> {
+        self.fluid_index(fluid)?;
+        self.waterlog_fluid = Some(fluid);
+        Ok(())
+    }
+
+    /// The index of `fluid`, if it is declared.
+    fn fluid_index(&self, fluid: FluidId) -> Result<usize, RegistryError> {
+        let i = usize::from(fluid.0);
+        if i < self.fluids.len() {
+            Ok(i)
+        } else {
+            Err(RegistryError::UnknownFluid(fluid.0))
+        }
+    }
+
+    /// `state` is a state of the registry, for the tables of fluid `i`.
+    fn check_fluid_state(&self, i: usize, state: BlockState) -> Result<(), RegistryError> {
+        if usize::from(state.0) < self.states.len() {
+            Ok(())
+        } else {
+            let block = self.fluids[i].block;
+            Err(RegistryError::InvalidFluid(
+                self.blocks[usize::from(block.0)].name.clone(),
+            ))
+        }
+    }
+
+    /// The index of `block`, if it is registered.
+    fn block_index(&self, block: BlockId) -> Result<usize, RegistryError> {
+        let i = usize::from(block.0);
+        if i < self.blocks.len() {
+            Ok(i)
+        } else {
+            Err(RegistryError::UnknownBlock(block.0))
+        }
     }
 
     /// Registers a block without state properties (one state); returns its state.
@@ -695,10 +877,7 @@ impl BlockRegistryBuilder {
         }
         let mut new_boxes = std::collections::HashSet::new();
         for def in states.iter().filter(|d| d.shape != RenderShape::None) {
-            for b in def.model.boxes() {
-                if !b.is_valid() {
-                    return Err(RegistryError::InvalidCollision(def.name.clone()));
-                }
+            for &b in boxes_of(&self.box_models, def.model) {
                 if !self.model_boxes.contains(&b) {
                     new_boxes.insert(b);
                 }
@@ -734,6 +913,11 @@ impl BlockRegistryBuilder {
         {
             return Err(RegistryError::InvalidCollision(def.name.clone()));
         }
+        if let BlockModel::Boxes(id) = def.model
+            && usize::from(id.0) >= self.box_models.len()
+        {
+            return Err(RegistryError::UnknownBoxModel(id.0));
+        }
         if def.shape != RenderShape::None {
             for t in [def.textures.top, def.textures.bottom, def.textures.side] {
                 if t.0 as usize >= self.textures.len() {
@@ -756,20 +940,22 @@ impl BlockRegistryBuilder {
         let states = &self.states;
         let mut flags: Vec<StateFlags> = states
             .iter()
-            .map(|b| {
+            .zip(&state_block)
+            .map(|(b, &block)| {
                 let mut f = StateFlags::empty();
                 let solid = !b.collision.is_none();
                 f.set(StateFlags::SOLID, solid);
-                f.set(
-                    StateFlags::BLOCKS_MOTION,
-                    solid || matches!(b.model, BlockModel::FenceGate { .. }),
-                );
+                let declared = self
+                    .blocks_motion
+                    .get(usize::from(block))
+                    .copied()
+                    .unwrap_or(false);
+                f.set(StateFlags::BLOCKS_MOTION, solid || declared);
                 f.set(
                     StateFlags::OCCLUDES,
                     b.shape == RenderShape::Opaque && b.model.is_solid_cube(),
                 );
-                let fluid = b.shape == RenderShape::Translucent || b.model == BlockModel::Fluid;
-                f.set(StateFlags::FLUID, fluid && !solid);
+                f.set(StateFlags::FLUID, b.model == BlockModel::Fluid && !solid);
                 f.set(StateFlags::EMISSIVE, b.emission != [0; 3]);
                 f
             })
@@ -791,9 +977,15 @@ impl BlockRegistryBuilder {
             }
         }
         BlockRegistry {
+            neighbor_rules: per_block(self.neighbor_rules, self.blocks.len()),
+            use_rules: per_block(self.use_rules, self.blocks.len()),
             state_block,
             shapes: states.iter().map(|b| b.shape).collect(),
             models: states.iter().map(|b| b.model).collect(),
+            outlines: states
+                .iter()
+                .map(|b| outline_of(&self.box_models, b.model))
+                .collect(),
             collisions: states.iter().map(|b| b.collision.clone()).collect(),
             flags,
             emission: states
@@ -803,10 +995,27 @@ impl BlockRegistryBuilder {
             opacity: states.iter().map(|b| b.light_opacity).collect(),
             faces: states.iter().map(|b| b.textures).collect(),
             textures: self.textures,
+            box_models: self.box_models,
+            fluids: self.fluids,
+            waterlog_fluid: self.waterlog_fluid,
             blocks: self.blocks,
             by_name,
         }
     }
+}
+
+/// Puts `value` at `i` of `slots`, growing it with `None`.
+fn set_slot<T: Clone>(slots: &mut Vec<Option<T>>, i: usize, value: T) {
+    if slots.len() <= i {
+        slots.resize(i + 1, None);
+    }
+    slots[i] = Some(value);
+}
+
+/// `slots` with one per block: `blocks` long, `None` for the missing ones.
+fn per_block<T: Clone>(mut slots: Vec<Option<T>>, blocks: usize) -> Vec<Option<T>> {
+    slots.resize(blocks, None);
+    slots
 }
 
 /// `namespace:path`, both non-empty, `[a-z0-9_]` (path may contain `/`).
@@ -835,14 +1044,23 @@ pub struct BlockRegistry {
     state_block: Vec<u16>,
     shapes: Vec<RenderShape>,
     models: Vec<BlockModel>,
+    /// The outline of each state ([`BlockRegistry::outline`]).
+    outlines: Vec<BlockCollision>,
     collisions: Vec<BlockCollision>,
     flags: Vec<StateFlags>,
     emission: Vec<LightValue>,
     opacity: Vec<u8>,
     faces: Vec<FaceTextures>,
     textures: Vec<TextureSpec>,
+    box_models: Vec<BoxModel>,
+    fluids: Vec<FluidType>,
+    waterlog_fluid: Option<FluidId>,
     blocks: Vec<BlockInfo>,
     by_name: std::collections::HashMap<String, BlockId, foldhash::fast::FixedState>,
+    /// The neighbor rule of each block (by [`BlockId`]).
+    neighbor_rules: Vec<Option<NeighborRule>>,
+    /// The use rule of each block (by [`BlockId`]).
+    use_rules: Vec<Option<UseRule>>,
 }
 
 impl BlockRegistry {
@@ -889,6 +1107,15 @@ impl BlockRegistry {
         self.blocks
             .get(usize::from(b.0))
             .map_or("boxel:unknown", |b| b.name.as_str())
+    }
+    /// The [`NeighborRule`] of a block, if it has one
+    /// ([`BlockRegistryBuilder::set_neighbor_rule`]).
+    pub fn neighbor_rule(&self, b: BlockId) -> Option<&NeighborRule> {
+        self.neighbor_rules.get(usize::from(b.0))?.as_ref()
+    }
+    /// The [`UseRule`] of a block, if it has one ([`BlockRegistryBuilder::set_use_rule`]).
+    pub fn use_rule(&self, b: BlockId) -> Option<&UseRule> {
+        self.use_rules.get(usize::from(b.0))?.as_ref()
     }
     /// The default state of a block (air if out of range).
     pub fn default_state(&self, b: BlockId) -> BlockState {
@@ -979,6 +1206,45 @@ impl BlockRegistry {
     pub fn model(&self, s: BlockState) -> BlockModel {
         self.models.get(s.0 as usize).copied().unwrap_or_default()
     }
+    /// The fluids, by [`FluidId`] ([`BlockRegistryBuilder::add_fluid`]).
+    pub fn fluids(&self) -> &[FluidType] {
+        &self.fluids
+    }
+    /// A fluid of the registry.
+    pub fn fluid(&self, id: FluidId) -> Option<&FluidType> {
+        self.fluids.get(usize::from(id.0))
+    }
+    /// The fluid `s` is a state of, and its level (`0..=15`). A waterlogged state is not: it
+    /// holds a source of [`BlockRegistry::waterlog_fluid`] besides itself.
+    pub fn fluid_of(&self, s: BlockState) -> Option<(FluidId, u8)> {
+        self.fluids.iter().enumerate().find_map(|(i, f)| {
+            let level = s.0.checked_sub(f.first.0).filter(|&l| l < 16)?;
+            Some((FluidId(i as u8), level as u8))
+        })
+    }
+    /// The fluid the waterlogged states hold, if the registry has one
+    /// ([`BlockRegistryBuilder::set_waterlog_fluid`]).
+    pub fn waterlog_fluid(&self) -> Option<FluidId> {
+        self.waterlog_fluid
+    }
+    /// A box model of the registry ([`BlockModel::Boxes`]).
+    pub fn box_model(&self, id: BoxModelId) -> Option<&BoxModel> {
+        self.box_models.get(usize::from(id.0))
+    }
+    /// The boxes `s` is drawn with, for the models made of boxes: a slab's half, a
+    /// [`BoxModel`]'s boxes (ADR 0020, ADR 0027). Empty for cubes, crosses and fluids, which the
+    /// mesher draws its own way (and out of range).
+    pub fn model_boxes(&self, s: BlockState) -> &[ModelBox] {
+        boxes_of(&self.box_models, self.model(s))
+    }
+    /// The boxes `s` is picked by (its outline): the full cell for cubes and fluids, the half
+    /// cell for slabs, a smaller box around the stem for crosses, a [`BoxModel`]'s outline (out
+    /// of range -> the full cell).
+    pub fn outline(&self, s: BlockState) -> &BlockCollision {
+        self.outlines
+            .get(s.0 as usize)
+            .unwrap_or(&BlockCollision::Full)
+    }
     /// How `s` collides (out of range -> `None`).
     pub fn collision(&self, s: BlockState) -> &BlockCollision {
         self.collisions
@@ -990,8 +1256,9 @@ impl BlockRegistry {
     pub fn occludes(&self, s: BlockState) -> bool {
         self.flags(s).contains(StateFlags::OCCLUDES)
     }
-    /// True if `s` stops movement ([`StateFlags::BLOCKS_MOTION`]): it collides, or it is a fence
-    /// gate, open or closed. What the fluid rules call solid.
+    /// True if `s` stops movement ([`StateFlags::BLOCKS_MOTION`]): it collides, or its block was
+    /// declared to ([`BlockRegistryBuilder::set_blocks_motion`]: a fence gate, open or closed).
+    /// What the fluid rules call solid.
     pub fn blocks_motion(&self, s: BlockState) -> bool {
         self.flags(s).contains(StateFlags::BLOCKS_MOTION)
     }

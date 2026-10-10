@@ -2,14 +2,15 @@
 //! that derive stair shapes, fence sides and torch supports.
 
 use boxel_demo::blocks::TORCH_EMISSION;
-use boxel_voxel::rules::{
-    fence_connects, fence_rule, is_sturdy, stair_shape, stairs_rule, supports_center, torch_rule,
-    wall_torch_rule,
+use boxel_demo::rules::{self as demo, Kinds, torch_rule};
+use boxel_demo::shapes::{
+    FenceSides, StairShape, fence_boxes, fence_outline, stair_boxes, wall_torch_box,
 };
-use boxel_voxel::shapes::{stair_boxes, wall_torch_box};
+use boxel_voxel::rules::{is_sturdy, supports_center};
+use boxel_voxel::shapes::half_from_name;
 use boxel_voxel::{
-    BlockCollision, BlockModel, BlockRegistry, BlockState, CollisionBox, Face, Facing, FenceSides,
-    MAX_COLLISION_HEIGHT, MAX_MODEL_BOXES, ModelBox, RenderShape, SlabHalf, StairShape, StateFlags,
+    BlockCollision, BlockRegistry, BlockState, CollisionBox, Face, Facing, MAX_COLLISION_HEIGHT,
+    MAX_MODEL_BOXES, ModelBox, RenderShape, SlabHalf, StateFlags,
 };
 use std::collections::HashSet;
 
@@ -19,6 +20,42 @@ fn registry() -> BlockRegistry {
 
 fn s(r: &BlockRegistry, name: &str) -> BlockState {
     r.parse_state(name).unwrap()
+}
+
+/// The boxes `state` is drawn with (its model's boxes before #48).
+fn boxes(r: &BlockRegistry, state: BlockState) -> Vec<ModelBox> {
+    r.model_boxes(state).to_vec()
+}
+
+/// The boxes `state` is picked by (its model's outline before #48).
+fn outline(r: &BlockRegistry, state: BlockState) -> BlockCollision {
+    r.outline(state).clone()
+}
+
+/// The demo rules with the kinds of `r` (the rules take them since #48).
+fn stair_shape(
+    r: &BlockRegistry,
+    facing: Facing,
+    half: SlabHalf,
+    n: &[BlockState; 6],
+) -> StairShape {
+    demo::stair_shape(&Kinds::of_registry(r), r, facing, half, n)
+}
+
+fn stairs_rule(r: &BlockRegistry, state: BlockState, n: &[BlockState; 6]) -> BlockState {
+    demo::stairs_rule(&Kinds::of_registry(r), r, state, n)
+}
+
+fn fence_connects(r: &BlockRegistry, neighbor: BlockState, toward: Facing) -> bool {
+    demo::fence_connects(&Kinds::of_registry(r), r, neighbor, toward)
+}
+
+fn fence_rule(r: &BlockRegistry, state: BlockState, n: &[BlockState; 6]) -> BlockState {
+    demo::fence_rule(&Kinds::of_registry(r), r, state, n)
+}
+
+fn wall_torch_rule(r: &BlockRegistry, state: BlockState, n: &[BlockState; 6]) -> BlockState {
+    demo::wall_torch_rule(&Kinds::of_registry(r), r, state, n)
 }
 
 /// Every sixteenth `(x, y, z)` of the cell inside one of `boxes`.
@@ -68,39 +105,31 @@ fn the_new_blocks_have_their_states_and_ids() {
     assert_eq!(r.by_name("boxel:wall_torch"), Some(BlockState(251)));
     // Every state's model follows its properties.
     for state in r.states(stone_stairs) {
-        let BlockModel::Stairs {
-            facing,
-            half,
-            shape,
-        } = r.model(state)
-        else {
-            panic!("stairs");
-        };
-        assert_eq!(r.property(state, "facing"), Some(facing.name()));
-        assert_eq!(
-            r.property(state, "half"),
-            Some(if half == SlabHalf::Top {
-                "top"
-            } else {
-                "bottom"
-            })
-        );
-        assert_eq!(r.property(state, "shape"), Some(shape.name()));
+        let property = |name: &str| r.property(state, name).unwrap();
+        let facing = Facing::from_name(property("facing")).unwrap();
+        let half = half_from_name(property("half")).unwrap();
+        let shape = StairShape::from_name(property("shape")).unwrap();
+        assert_eq!(boxes(&r, state), stair_boxes(facing, half, shape));
+        let bounds = stair_boxes(facing, half, shape)
+            .iter()
+            .map(|b| b.bounds)
+            .collect();
+        assert_eq!(outline(&r, state), BlockCollision::Boxes(bounds));
         assert_eq!(r.shape(state), RenderShape::Opaque);
         assert_eq!(r.light_opacity(state), 1, "stairs pass light like slabs");
         // They collide with the boxes they are drawn with.
-        let boxes: Vec<CollisionBox> = r.model(state).boxes().iter().map(|b| b.bounds).collect();
+        let boxes: Vec<CollisionBox> = boxes(&r, state).iter().map(|b| b.bounds).collect();
         assert_eq!(r.collision(state), &BlockCollision::Boxes(boxes));
         assert!(!r.occludes(state));
     }
     let fence = s(&r, "boxel:oak_fence[north=true,west=true]");
+    let sides = FenceSides::NONE
+        .with(Facing::North, true)
+        .with(Facing::West, true);
+    assert_eq!(boxes(&r, fence), fence_boxes(sides));
     assert_eq!(
-        r.model(fence),
-        BlockModel::Fence {
-            sides: FenceSides::NONE
-                .with(Facing::North, true)
-                .with(Facing::West, true)
-        }
+        outline(&r, fence),
+        BlockCollision::Boxes(fence_outline(sides))
     );
     assert_eq!(r.light_opacity(fence), 0);
     for name in ["boxel:torch", "boxel:wall_torch[facing=west]"] {
@@ -252,7 +281,7 @@ fn stair_boxes_are_minecrafts() {
 fn stair_shapes_follow_minecrafts_rule() {
     let r = registry();
     let stairs = |facing: Facing, half: SlabHalf| {
-        boxel_voxel::rules::stairs_with(&r, s(&r, "boxel:stone_stairs"), facing, half).unwrap()
+        boxel_demo::rules::stairs_with(&r, s(&r, "boxel:stone_stairs"), facing, half).unwrap()
     };
     for facing in Facing::ALL {
         for half in [SlabHalf::Bottom, SlabHalf::Top] {
@@ -280,7 +309,7 @@ fn stair_shapes_follow_minecrafts_rule() {
                 StairShape::Straight
             );
             let oak =
-                boxel_voxel::rules::stairs_with(&r, s(&r, "boxel:oak_stairs"), ccw, half).unwrap();
+                boxel_demo::rules::stairs_with(&r, s(&r, "boxel:oak_stairs"), ccw, half).unwrap();
             assert_eq!(shape(&[(front, oak)]), StairShape::OuterLeft);
             // On the low side: an inner corner.
             assert_eq!(shape(&[(back, stairs(ccw, half))]), StairShape::InnerLeft);
@@ -333,14 +362,14 @@ fn stair_shapes_follow_minecrafts_rule() {
 #[test]
 fn stair_corners_meet_their_neighbors() {
     let r = registry();
-    let east = boxel_voxel::rules::stairs_with(
+    let east = boxel_demo::rules::stairs_with(
         &r,
         s(&r, "boxel:stone_stairs"),
         Facing::East,
         SlabHalf::Bottom,
     )
     .unwrap();
-    let north = boxel_voxel::rules::stairs_with(
+    let north = boxel_demo::rules::stairs_with(
         &r,
         s(&r, "boxel:stone_stairs"),
         Facing::North,
@@ -350,9 +379,9 @@ fn stair_corners_meet_their_neighbors() {
     // `east` with `north` on its east side: an outer left corner whose step sits in the north
     // east quarter, against the north half step of its neighbor.
     let corner = stairs_rule(&r, east, &around(&[(Face::PosX, north)]));
-    let steps: Vec<ModelBox> = r.model(corner).boxes().into_iter().skip(1).collect();
+    let steps: Vec<ModelBox> = boxes(&r, corner).into_iter().skip(1).collect();
     assert_eq!(steps, [ModelBox::new([8, 8, 0], [16, 16, 8])]);
-    let neighbor_step = r.model(north).boxes()[1];
+    let neighbor_step = boxes(&r, north)[1];
     assert_eq!(neighbor_step.bounds.min[0], 0);
     assert_eq!(neighbor_step.bounds.max[2], 8);
 }
@@ -376,7 +405,7 @@ fn fences_connect_like_minecraft_simplified() {
         assert!(!connects("boxel:air", toward));
         // Stairs: only by their full high side (toward their facing), turned to the fence.
         let stairs = |facing| {
-            boxel_voxel::rules::stairs_with(&r, s(&r, "boxel:oak_stairs"), facing, SlabHalf::Bottom)
+            boxel_demo::rules::stairs_with(&r, s(&r, "boxel:oak_stairs"), facing, SlabHalf::Bottom)
                 .unwrap()
         };
         assert!(fence_connects(&r, stairs(toward.opposite()), toward));
@@ -454,13 +483,13 @@ fn the_default_blocks_use_few_model_boxes() {
     let r = registry();
     let mut boxes = HashSet::new();
     for i in 0..r.len() {
-        boxes.extend(r.model(BlockState(i as u16)).boxes());
+        boxes.extend(self::boxes(&r, BlockState(i as u16)));
     }
     assert!(boxes.len() <= MAX_MODEL_BOXES);
     // Slabs 2, stairs 2 slabs + 8 steps + 8 quarters (some shared), fences 9, torches 5; walls
     // and gates add theirs (`walls.rs`).
     let before_walls: HashSet<ModelBox> = (0..257)
-        .flat_map(|i| r.model(BlockState(i)).boxes())
+        .flat_map(|i| self::boxes(&r, BlockState(i)))
         .collect();
     assert!(before_walls.len() < 64, "{}", before_walls.len());
     assert!(boxes.iter().all(|b| b.is_valid()));
@@ -481,7 +510,7 @@ fn fences_collide_a_block_and_a_half_tall_and_are_picked_a_block_tall() {
         let BlockCollision::Boxes(collision) = r.collision(fence) else {
             panic!("{name} collides with boxes");
         };
-        let BlockCollision::Boxes(outline) = r.model(fence).outline() else {
+        let BlockCollision::Boxes(outline) = outline(&r, fence) else {
             panic!("{name} is picked by boxes");
         };
         assert_eq!(collision.len(), outline.len(), "{name}");
@@ -502,5 +531,5 @@ fn fences_collide_a_block_and_a_half_tall_and_are_picked_a_block_tall() {
         &r,
         "boxel:oak_fence[east=true,north=true,south=true,west=true]",
     );
-    assert!(r.model(all).boxes().iter().all(|b| b.is_valid()));
+    assert!(boxes(&r, all).iter().all(|b| b.is_valid()));
 }

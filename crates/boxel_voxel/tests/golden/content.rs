@@ -12,12 +12,12 @@ use std::fmt::Write as _;
 
 /// The boxes `s` is drawn with.
 fn boxes_of(r: &BlockRegistry, s: BlockState) -> Vec<ModelBox> {
-    r.model(s).boxes()
+    r.model_boxes(s).to_vec()
 }
 
 /// The shape `s` is picked by.
 fn outline_of(r: &BlockRegistry, s: BlockState) -> BlockCollision {
-    r.model(s).outline()
+    r.outline(s).clone()
 }
 
 /// The model printed by kind: today's stairs, fences, torches, walls and gates are all `boxes`.

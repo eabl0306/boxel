@@ -4,14 +4,17 @@
 
 mod common;
 
+use boxel_demo::shapes::{
+    FenceSides, StairShape, TORCH_BOX, WallSide, WallSides, fence_boxes, fence_gate_boxes,
+    stair_boxes, wall_boxes, wall_torch_box,
+};
 use boxel_mesh::{
     AoPolicy, BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, FaceShading, MaterialTable, MeshOptions,
     Mesher, PackedQuad, PaddedChunk, VoxelClass, layout, reference_box_face_shading_at,
     reference_visible_faces,
 };
 use boxel_voxel::{
-    Axis, BlockModel, Face, Facing, FenceSides, LightValue, ModelBox, RenderShape, SlabHalf,
-    StairShape, WallSide, WallSides,
+    Axis, BlockModel, BoxModelId, Face, Facing, LightValue, ModelBox, RenderShape, SlabHalf,
 };
 use common::{Fill, LIGHT_FILLS, random_light, random_padded, set_material};
 use std::collections::BTreeSet;
@@ -43,7 +46,8 @@ const ALL: [u16; 20] = [
     TORCH, WALL_TORCH, WALL, WALL_RUN, GATE, GATE_OPEN,
 ];
 
-/// The model of a material of [`table`].
+/// The model of a material of [`table`]: the materials made of boxes of the demo's shapes are
+/// each their own box model (a local id, its material).
 fn model_of(m: u16) -> BlockModel {
     match m {
         BOTTOM | GLASS_SLAB => BlockModel::Slab(SlabHalf::Bottom),
@@ -51,49 +55,37 @@ fn model_of(m: u16) -> BlockModel {
         CROSS => BlockModel::Cross,
         LOG_X => BlockModel::Cube { axis: Axis::X },
         LOG_Z => BlockModel::Cube { axis: Axis::Z },
-        STAIRS => BlockModel::Stairs {
-            facing: Facing::East,
-            half: SlabHalf::Bottom,
-            shape: StairShape::Straight,
-        },
-        STAIRS_TOP => BlockModel::Stairs {
-            facing: Facing::North,
-            half: SlabHalf::Top,
-            shape: StairShape::InnerLeft,
-        },
-        FENCE => BlockModel::Fence {
-            sides: FenceSides(0b1111),
-        },
-        FENCE_END => BlockModel::Fence {
-            sides: FenceSides::NONE.with(Facing::West, true),
-        },
-        TORCH => BlockModel::Torch,
-        WALL_TORCH => BlockModel::WallTorch {
-            facing: Facing::South,
-        },
-        WALL => BlockModel::Wall {
-            post: true,
-            sides: Facing::ALL
+        STAIRS..=GATE_OPEN => BlockModel::Boxes(BoxModelId(m)),
+        _ => BlockModel::CUBE,
+    }
+}
+
+/// The boxes of a material of [`table`] (none for cubes and crosses).
+fn boxes_of(m: u16) -> Vec<ModelBox> {
+    match m {
+        BOTTOM | GLASS_SLAB => vec![ModelBox::slab(SlabHalf::Bottom)],
+        TOP => vec![ModelBox::slab(SlabHalf::Top)],
+        STAIRS => stair_boxes(Facing::East, SlabHalf::Bottom, StairShape::Straight),
+        STAIRS_TOP => stair_boxes(Facing::North, SlabHalf::Top, StairShape::InnerLeft),
+        FENCE => fence_boxes(FenceSides(0b1111)),
+        FENCE_END => fence_boxes(FenceSides::NONE.with(Facing::West, true)),
+        TORCH => vec![TORCH_BOX],
+        WALL_TORCH => vec![wall_torch_box(Facing::South)],
+        WALL => wall_boxes(
+            true,
+            Facing::ALL
                 .into_iter()
                 .fold(WallSides::NONE, |s, f| s.with(f, WallSide::Low)),
-        },
-        WALL_RUN => BlockModel::Wall {
-            post: false,
-            sides: WallSides::NONE
+        ),
+        WALL_RUN => wall_boxes(
+            false,
+            WallSides::NONE
                 .with(Facing::North, WallSide::Tall)
                 .with(Facing::South, WallSide::Tall),
-        },
-        GATE => BlockModel::FenceGate {
-            facing: Facing::East,
-            open: false,
-            in_wall: true,
-        },
-        GATE_OPEN => BlockModel::FenceGate {
-            facing: Facing::North,
-            open: true,
-            in_wall: false,
-        },
-        _ => BlockModel::CUBE,
+        ),
+        GATE => fence_gate_boxes(Facing::East, false, true),
+        GATE_OPEN => fence_gate_boxes(Facing::North, true, false),
+        _ => Vec::new(),
     }
 }
 
@@ -111,7 +103,7 @@ fn table() -> MaterialTable {
         .collect();
     let mut t = MaterialTable::from_parts(shapes, layers);
     for m in ALL {
-        t.set_model(m, model_of(m));
+        t.set_model(m, model_of(m), &boxes_of(m));
     }
     t
 }
@@ -178,8 +170,7 @@ fn expected_specials(
                     continue;
                 }
                 let p = [x as u32, y as u32, z as u32];
-                let model = model_of(m);
-                let boxes = model.boxes();
+                let boxes = boxes_of(m);
                 for &b in &boxes {
                     for face in Face::ALL {
                         let (plane, rect) = face_of(b, face);
@@ -208,8 +199,7 @@ fn expected_specials(
                                     && (nm == m || table.shape(nm) == RenderShape::Opaque)
                                     && covered(
                                         rect,
-                                        &model_of(nm)
-                                            .boxes()
+                                        &boxes_of(nm)
                                             .iter()
                                             .map(|&o| face_of(o, face.opposite()))
                                             .filter(|&(p, _)| p == 16 - plane)
@@ -420,7 +410,7 @@ fn slabs_hide_and_show_the_faces_they_should() {
     assert!(cubes.contains(&([5, 1, 2], Face::NegX)));
     // Boxes and buckets: opaque slab faces go to their face bucket.
     for s in &specials {
-        let want = model_of(if s.0 == [4, 1, 2] { TOP } else { BOTTOM }).boxes()[0];
+        let want = boxes_of(if s.0 == [4, 1, 2] { TOP } else { BOTTOM })[0];
         assert_eq!(s.6, Some(want));
         assert_eq!(s.4, s.1.index());
     }

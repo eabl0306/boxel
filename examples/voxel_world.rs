@@ -81,13 +81,14 @@ use boxel::physics::{PhysicsPlugin, Probe as VoxelProbe, SwimPlugin};
 use boxel::prelude::*;
 use boxel::render::{DebugDestroyDevice, GpuFailed, GpuReady, SurfaceInfo, TextureSource};
 use boxel::voxel::rules;
-use boxel::voxel::{Axis, BlockModel, BlockRegistry, Facing, MAX_BLOCK_COORD, SlabHalf};
+use boxel::voxel::{Axis, BlockRegistry, Facing, MAX_BLOCK_COORD, SlabHalf};
 use boxel::window::winit::dpi::PhysicalSize;
 use boxel::window::{PrimaryWindow, WindowResized};
 use boxel::world::persist::{PersistPlugin, PersistSettings, WorldStore};
 use boxel::world::{
     BlockEdit, BlockUses, FluidPlugin, TimeOfDay, WorldContent, WorldStats, WorldSystems,
 };
+use boxel_demo::rules::{Kind, Kinds};
 use player::WalkPlugin;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1267,34 +1268,32 @@ fn placement(
     let Some(face) = hit.face else {
         return Some(block);
     };
-    match registry.model(block) {
-        BlockModel::Stairs { .. } => {
-            let top = match face {
-                Face::NegY => true,
-                Face::PosY => false,
-                _ => hit.point.frac.y >= 0.5,
-            };
-            let half = if top { SlabHalf::Top } else { SlabHalf::Bottom };
-            boxel_demo::rules::stairs_with(registry, block, Facing::of_look(look.x, look.z), half)
-        }
-        BlockModel::FenceGate { .. } => {
-            registry.with(block, "facing", Facing::of_look(look.x, look.z).name())
-        }
-        BlockModel::Torch | BlockModel::WallTorch { .. } => {
-            // `boxel:torch` and `boxel:wall_torch` (Minecraft's naming).
-            let standing =
-                registry.by_name(&registry.name(block).replace("wall_torch", "torch"))?;
-            match face {
-                Face::PosY => Some(standing),
-                Face::NegY => None,
-                side => {
-                    let wall = registry
-                        .by_name(&registry.name(standing).replace("torch", "wall_torch"))?;
-                    registry.with(wall, "facing", Facing::of_face(side)?.name())
-                }
+    let kinds = Kinds::of_registry(registry);
+    let is = |kind| kinds.is(registry, block, kind);
+    if is(Kind::Stairs) {
+        let top = match face {
+            Face::NegY => true,
+            Face::PosY => false,
+            _ => hit.point.frac.y >= 0.5,
+        };
+        let half = if top { SlabHalf::Top } else { SlabHalf::Bottom };
+        boxel_demo::rules::stairs_with(registry, block, Facing::of_look(look.x, look.z), half)
+    } else if is(Kind::Gate) {
+        registry.with(block, "facing", Facing::of_look(look.x, look.z).name())
+    } else if is(Kind::WallPostOverride) || is(Kind::WallTorch) {
+        // `boxel:torch` and `boxel:wall_torch` (Minecraft's naming).
+        let standing = registry.by_name(&registry.name(block).replace("wall_torch", "torch"))?;
+        match face {
+            Face::PosY => Some(standing),
+            Face::NegY => None,
+            side => {
+                let wall =
+                    registry.by_name(&registry.name(standing).replace("torch", "wall_torch"))?;
+                registry.with(wall, "facing", Facing::of_face(side)?.name())
             }
         }
-        _ => Some(placed_state(registry, block, hit)),
+    } else {
+        Some(placed_state(registry, block, hit))
     }
 }
 

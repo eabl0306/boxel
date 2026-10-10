@@ -3,17 +3,15 @@
 //! The rules and shapes are checked against brute-force versions written here, sixteenth by
 //! sixteenth from Minecraft's `WallBlock` and `FenceGateBlock`, independent of the crate's.
 
-use boxel_voxel::rules::{
-    fence_connects, fence_gate_rule, fence_gate_use, fence_rule, is_sturdy, supports_center,
-    torch_rule, use_rule_for_model, wall_rule,
+use boxel_demo::rules::{self as demo, Kinds, torch_rule};
+use boxel_demo::shapes::{
+    WallSide, WallSides, fence_gate_boxes, fence_gate_collision, fence_gate_outline, wall_boxes,
+    wall_collision, wall_outline,
 };
-use boxel_voxel::shapes::{
-    fence_gate_boxes, fence_gate_collision, fence_gate_outline, wall_boxes, wall_collision,
-    wall_outline,
-};
+use boxel_voxel::rules::{is_sturdy, supports_center};
 use boxel_voxel::{
-    BlockCollision, BlockModel, BlockRegistry, BlockState, CollisionBox, Face, Facing,
-    MAX_COLLISION_HEIGHT, RenderShape, StateFlags, WallSide, WallSides,
+    BlockCollision, BlockRegistry, BlockState, CollisionBox, Face, Facing, MAX_COLLISION_HEIGHT,
+    RenderShape, StateFlags,
 };
 use std::collections::HashSet;
 
@@ -24,6 +22,77 @@ fn registry() -> BlockRegistry {
 fn s(r: &BlockRegistry, name: &str) -> BlockState {
     r.parse_state(name)
         .unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+/// The demo rules with the kinds of `r` (the rules take them since #48).
+fn fence_connects(r: &BlockRegistry, neighbor: BlockState, toward: Facing) -> bool {
+    demo::fence_connects(&Kinds::of_registry(r), r, neighbor, toward)
+}
+
+fn wall_connects(r: &BlockRegistry, neighbor: BlockState, toward: Facing) -> bool {
+    demo::wall_connects(&Kinds::of_registry(r), r, neighbor, toward)
+}
+
+fn fence_rule(r: &BlockRegistry, state: BlockState, n: &[BlockState; 6]) -> BlockState {
+    demo::fence_rule(&Kinds::of_registry(r), r, state, n)
+}
+
+fn wall_rule(r: &BlockRegistry, state: BlockState, n: &[BlockState; 6]) -> BlockState {
+    demo::wall_rule(&Kinds::of_registry(r), r, state, n)
+}
+
+fn fence_gate_rule(r: &BlockRegistry, state: BlockState, n: &[BlockState; 6]) -> BlockState {
+    demo::fence_gate_rule(&Kinds::of_registry(r), r, state, n)
+}
+
+fn fence_gate_use(r: &BlockRegistry, state: BlockState, look: Facing) -> Option<BlockState> {
+    demo::fence_gate_use(&Kinds::of_registry(r), r, state, look)
+}
+
+/// The post and sides of a wall state (its model before #48): read from its properties, and
+/// checked against the boxes it is drawn with and the outline it is picked by.
+fn wall_model(r: &BlockRegistry, state: BlockState) -> Option<(bool, WallSides)> {
+    if r.name(state) != "boxel:cobblestone_wall" {
+        return None;
+    }
+    let post = r.property(state, "up") == Some("true");
+    let mut sides = WallSides::NONE;
+    for f in Facing::ALL {
+        let side = r.property(state, f.name()).and_then(WallSide::from_name)?;
+        sides = sides.with(f, side);
+    }
+    assert_eq!(r.model_boxes(state), wall_boxes(post, sides).as_slice());
+    assert_eq!(
+        r.outline(state),
+        &BlockCollision::Boxes(wall_outline(post, sides))
+    );
+    Some((post, sides))
+}
+
+/// The facing, open and in a wall of a gate state (its model before #48): read from its
+/// properties, and checked against the boxes it is drawn with and the outline it is picked by.
+fn gate_model(r: &BlockRegistry, state: BlockState) -> Option<(Facing, bool, bool)> {
+    if r.name(state) != "boxel:oak_fence_gate" {
+        return None;
+    }
+    let facing = Facing::from_name(r.property(state, "facing")?)?;
+    let open = r.property(state, "open") == Some("true");
+    let in_wall = r.property(state, "in_wall") == Some("true");
+    assert_eq!(
+        r.model_boxes(state),
+        fence_gate_boxes(facing, open, in_wall).as_slice()
+    );
+    assert_eq!(
+        r.outline(state),
+        &BlockCollision::Boxes(vec![fence_gate_outline(facing, in_wall)])
+    );
+    Some((facing, open, in_wall))
+}
+
+/// True if the block of `state` has a use rule (the rules are registered per block since
+/// #48).
+fn has_use_rule(r: &BlockRegistry, state: BlockState) -> bool {
+    r.block(state).and_then(|b| r.use_rule(b)).is_some()
 }
 
 /// A set of sixteenth cells `(x, y, z)` (`y` up to 24 for collision).
@@ -178,7 +247,7 @@ fn walls_and_gates_have_their_states_and_ids() {
     let cobblestone = r.face_texture(s(&r, "boxel:cobblestone"), Face::PosY);
     let planks = r.face_texture(s(&r, "boxel:planks"), Face::PosY);
     for state in r.states(wall) {
-        let BlockModel::Wall { post, sides } = r.model(state) else {
+        let Some((post, sides)) = wall_model(&r, state) else {
             panic!("wall");
         };
         assert_eq!(r.property(state, "up") == Some("true"), post);
@@ -205,12 +274,7 @@ fn walls_and_gates_have_their_states_and_ids() {
         );
     }
     for state in r.states(gate) {
-        let BlockModel::FenceGate {
-            facing,
-            open,
-            in_wall,
-        } = r.model(state)
-        else {
+        let Some((facing, open, in_wall)) = gate_model(&r, state) else {
             panic!("gate");
         };
         assert_eq!(r.property(state, "facing"), Some(facing.name()));
@@ -308,6 +372,7 @@ fn mc_gate_model(facing: Facing, open: bool, in_wall: bool) -> Cells {
 
 #[test]
 fn gate_boxes_outline_and_collision_are_minecrafts() {
+    let r = registry();
     for facing in Facing::ALL {
         for open in [false, true] {
             for in_wall in [false, true] {
@@ -321,23 +386,25 @@ fn gate_boxes_outline_and_collision_are_minecrafts() {
                     mc_gate_model(facing, open, in_wall),
                     "{facing:?} open {open} in_wall {in_wall}"
                 );
-                let m = BlockModel::FenceGate {
-                    facing,
-                    open,
-                    in_wall,
-                };
+                let m = s(
+                    &r,
+                    &format!(
+                        "boxel:oak_fence_gate[facing={},in_wall={in_wall},open={open}]",
+                        facing.name()
+                    ),
+                );
                 // Minecraft's shapes: 4 thick across the facing, the outline the same open or
                 // closed (13 tall between walls), the collision 24 tall when closed.
                 let across = |top: u8| match facing {
                     Facing::North | Facing::South => cells([0, 0, 6], [16, top, 10]),
                     Facing::West | Facing::East => cells([6, 0, 0], [10, top, 16]),
                 };
-                let BlockCollision::Boxes(outline) = m.outline() else {
+                let BlockCollision::Boxes(outline) = r.outline(m).clone() else {
                     panic!("picked by a box");
                 };
                 assert_eq!(union_of(&outline), across(if in_wall { 13 } else { 16 }));
                 assert_eq!(outline, vec![fence_gate_outline(facing, in_wall)]);
-                match m.default_collision() {
+                match r.collision(m).clone() {
                     BlockCollision::None => assert!(open),
                     BlockCollision::Boxes(b) => {
                         assert!(!open);
@@ -578,7 +645,7 @@ fn wall_rule_matches_minecrafts() {
             "neighbors {:?}",
             n.map(|x| r.state_name(x).to_string())
         );
-        let BlockModel::Wall { post, sides } = r.model(got) else {
+        let Some((post, sides)) = wall_model(&r, got) else {
             panic!("a wall stays a wall");
         };
         seen_posts[usize::from(post)] = true;
@@ -709,7 +776,7 @@ fn gates_drop_between_walls_and_connect_fences_and_walls() {
                     "{facing:?} {toward:?}"
                 );
                 assert_eq!(
-                    boxel_voxel::rules::wall_connects(&r, gate, toward),
+                    wall_connects(&r, gate, toward),
                     end,
                     "{facing:?} {toward:?}"
                 );
@@ -731,14 +798,14 @@ fn gates_drop_between_walls_and_connect_fences_and_walls() {
 #[test]
 fn using_a_gate_opens_it_away_from_the_user_and_closes_it() {
     let r = registry();
-    assert!(use_rule_for_model(r.model(s(&r, "boxel:oak_fence_gate"))).is_some());
+    assert!(has_use_rule(&r, s(&r, "boxel:oak_fence_gate")));
     for name in [
         "boxel:stone",
         "boxel:oak_fence",
         "boxel:cobblestone_wall",
         "boxel:torch",
     ] {
-        assert!(use_rule_for_model(r.model(s(&r, name))).is_none(), "{name}");
+        assert!(!has_use_rule(&r, s(&r, name)), "{name}");
         assert_eq!(fence_gate_use(&r, s(&r, name), Facing::North), None);
     }
     for facing in Facing::ALL {
@@ -788,7 +855,7 @@ fn walls_and_gates_collide_a_block_and_a_half_tall() {
         }
         let top = collision.iter().map(|b| b.max[1]).max().unwrap();
         assert_eq!(top, MAX_COLLISION_HEIGHT);
-        let BlockCollision::Boxes(outline) = r.model(state).outline() else {
+        let BlockCollision::Boxes(outline) = r.outline(state).clone() else {
             panic!("picked by boxes");
         };
         assert!(outline.iter().all(|b| b.is_valid() && b.max[1] <= 16));
@@ -797,7 +864,7 @@ fn walls_and_gates_collide_a_block_and_a_half_tall() {
             assert_eq!(is_sturdy(&r, state, face), sturdy(&r, state, face));
         }
         // Every state the rule makes holds a torch (a post, or a bar through the middle).
-        let BlockModel::Wall { post, sides } = r.model(state) else {
+        let Some((post, sides)) = wall_model(&r, state) else {
             panic!("wall");
         };
         let ns = sides.get(Facing::North).is_connected() && sides.get(Facing::South).is_connected();
@@ -835,7 +902,7 @@ fn the_default_blocks_still_fit_the_box_table() {
     let r = registry();
     let mut boxes = HashSet::new();
     for i in 0..r.len() {
-        boxes.extend(r.model(BlockState(i as u16)).boxes());
+        boxes.extend(r.model_boxes(BlockState(i as u16)).iter().copied());
     }
     assert!(boxes.len() <= boxel_voxel::MAX_MODEL_BOXES);
     // Walls: their cut-up bars and posts; gates: 7 or 8 boxes per facing, half again in walls.

@@ -35,12 +35,18 @@
 //! glass, short grass, poppy), 21 torch, 22 cobblestone, 23 obsidian, 24 `water_flow` and 25
 //! `lava_flow`.
 
+use crate::rules::{self, Kinds};
+use crate::shapes::{self, FenceSides, StairShape, WallSide, WallSides};
+use boxel_voxel::rules::{NeighborRule, UseRule};
 use boxel_voxel::shapes::half_from_name;
 use boxel_voxel::{
-    Axis, BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockRegistryBuilder, FLUID_LEVEL,
-    FaceTextures, Facing, FenceSides, OPAQUE_OPACITY, Property, RenderShape, SlabHalf, StairShape,
-    StateValues, TextureId, TexturePattern, TextureSpec, WATERLOGGED, WallSide, WallSides,
+    Axis, BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockRegistryBuilder, BlockState,
+    BoxModel, BoxModelId, CollisionBox, FLUID_LEVEL, FaceTextures, Facing, ModelBox,
+    OPAQUE_OPACITY, Property, RenderShape, SlabHalf, StateValues, TextureId, TexturePattern,
+    TextureSpec, WATERLOGGED,
 };
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// One demo lamp: an opaque, solid cube that emits colored light.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -435,7 +441,57 @@ pub fn builder() -> BlockRegistryBuilder {
     add_shapes(&mut b, &t);
     add_fluid_products(&mut b, &t);
     add_walls_and_gates(&mut b, &t);
+    add_rules(&mut b);
+    crate::fluids::declare(&mut b);
     b
+}
+
+/// The rules of the demo blocks ([`crate::rules`]), on their blocks: stairs take their shape,
+/// fences, walls and gates follow their neighbors, torches drop without a support, and a gate
+/// opens when used.
+fn add_rules(b: &mut BlockRegistryBuilder) {
+    let kinds = Arc::new(Kinds::of_builder(b));
+    let block = |b: &BlockRegistryBuilder, name: &str| b.block_by_name(name).expect(name);
+    let neighbor =
+        |rule: fn(&Kinds, &BlockRegistry, BlockState, &[BlockState; 6]) -> BlockState| {
+            let kinds = Arc::clone(&kinds);
+            NeighborRule::new(move |registry, state, neighbors| {
+                rule(&kinds, registry, state, neighbors)
+            })
+        };
+    let by_name = [
+        ("boxel:stone_stairs", neighbor(rules::stairs_rule)),
+        ("boxel:oak_stairs", neighbor(rules::stairs_rule)),
+        ("boxel:oak_fence", neighbor(rules::fence_rule)),
+        ("boxel:torch", NeighborRule::new(rules::torch_rule)),
+        ("boxel:wall_torch", neighbor(rules::wall_torch_rule)),
+        ("boxel:cobblestone_wall", neighbor(rules::wall_rule)),
+        ("boxel:oak_fence_gate", neighbor(rules::fence_gate_rule)),
+    ];
+    for (name, rule) in by_name {
+        let id = block(b, name);
+        b.set_neighbor_rule(id, rule).expect("demo rule");
+    }
+    let gate = block(b, "boxel:oak_fence_gate");
+    let gate_use = UseRule::new(move |registry, state, look| {
+        rules::fence_gate_use(&kinds, registry, state, look)
+    });
+    b.set_use_rule(gate, gate_use).expect("demo use rule");
+}
+
+/// Registers a demo box model.
+fn box_model(b: &mut BlockRegistryBuilder, model: BoxModel) -> BoxModelId {
+    b.add_box_model(model).expect("demo box model")
+}
+
+/// A collision of the bounds of `boxes`.
+fn bounds(boxes: &[ModelBox]) -> BlockCollision {
+    BlockCollision::Boxes(
+        boxes
+            .iter()
+            .map(|b| b.bounds)
+            .collect::<Vec<CollisionBox>>(),
+    )
 }
 
 /// The `facing` of a state (north if it has none).
@@ -454,17 +510,26 @@ fn facing() -> Property {
 /// The blocks of ADR 0020, after the plants: stone and oak stairs, the oak fence, the torch and
 /// the wall torch.
 fn add_shapes(b: &mut BlockRegistryBuilder, t: &Layers) {
+    // One box model per facing, half and shape of stairs, picked by its boxes.
+    let mut stairs = HashMap::new();
+    for facing in Facing::ALL {
+        for half in [SlabHalf::Bottom, SlabHalf::Top] {
+            for shape in StairShape::ALL {
+                let boxes = shapes::stair_boxes(facing, half, shape);
+                let id = box_model(b, BoxModel::from_boxes(boxes));
+                stairs.insert((facing, half, shape), id);
+            }
+        }
+    }
     // Stairs let light through like slabs (opacity 1). `waterlogged` is Minecraft's: the stairs
     // hold a water source (ADR 0025).
     for (name, texture) in [("stone_stairs", t.stone), ("oak_stairs", t.planks)] {
         let def = BlockDef {
             name: format!("boxel:{name}"),
             shape: RenderShape::Opaque,
-            model: BlockModel::Stairs {
-                facing: Facing::North,
-                half: SlabHalf::Bottom,
-                shape: StairShape::Straight,
-            },
+            model: BlockModel::Boxes(
+                stairs[&(Facing::North, SlabHalf::Bottom, StairShape::Straight)],
+            ),
             collision: BlockCollision::None,
             emission: [0; 3],
             light_opacity: 1,
@@ -477,29 +542,38 @@ fn add_shapes(b: &mut BlockRegistryBuilder, t: &Layers) {
             Property::boolean(WATERLOGGED),
         ];
         b.add_block_with_states(def, properties, |state, def| {
-            def.model = BlockModel::Stairs {
-                facing: facing_of(state),
-                half: state
-                    .get("half")
-                    .and_then(half_from_name)
-                    .unwrap_or_default(),
-                shape: state
-                    .get("shape")
-                    .and_then(StairShape::from_name)
-                    .unwrap_or_default(),
-            };
-            def.collision = def.model.default_collision();
+            let facing = facing_of(state);
+            let half = state
+                .get("half")
+                .and_then(half_from_name)
+                .unwrap_or_default();
+            let shape = state
+                .get("shape")
+                .and_then(StairShape::from_name)
+                .unwrap_or_default();
+            def.model = BlockModel::Boxes(stairs[&(facing, half, shape)]);
+            // Stairs collide with their boxes.
+            def.collision = bounds(&shapes::stair_boxes(facing, half, shape));
         })
         .expect("demo stairs");
     }
+    // One box model per set of connected sides of a fence.
+    let fences: Vec<BoxModelId> = (0..16)
+        .map(|bits| {
+            let sides = FenceSides(bits);
+            let model = BoxModel {
+                boxes: shapes::fence_boxes(sides),
+                outline: shapes::fence_outline(sides),
+            };
+            box_model(b, model)
+        })
+        .collect();
     // The fence stops no light (but direct sky when it holds water); its sides follow its
-    // neighbors (`boxel_voxel::rules`).
+    // neighbors ([`crate::rules`]).
     let fence = BlockDef {
         name: "boxel:oak_fence".to_string(),
         shape: RenderShape::Opaque,
-        model: BlockModel::Fence {
-            sides: FenceSides::NONE,
-        },
+        model: BlockModel::Boxes(fences[0]),
         collision: BlockCollision::None,
         emission: [0; 3],
         light_opacity: 0,
@@ -512,8 +586,8 @@ fn add_shapes(b: &mut BlockRegistryBuilder, t: &Layers) {
         for f in Facing::ALL {
             sides = sides.with(f, state.get(f.name()) == Some("true"));
         }
-        def.model = BlockModel::Fence { sides };
-        def.collision = def.model.default_collision();
+        def.model = BlockModel::Boxes(fences[usize::from(sides.0)]);
+        def.collision = BlockCollision::Boxes(shapes::fence_collision(sides));
         if state.get(WATERLOGGED) == Some("true") {
             def.light_opacity = def.light_opacity.max(1);
         }
@@ -529,20 +603,27 @@ fn add_shapes(b: &mut BlockRegistryBuilder, t: &Layers) {
         light_opacity: 0,
         textures: FaceTextures::all(t.torch),
     };
-    b.add_block(torch_def("torch", BlockModel::Torch))
+    let torch = box_model(
+        b,
+        BoxModel {
+            boxes: vec![shapes::TORCH_BOX],
+            outline: vec![shapes::TORCH_OUTLINE],
+        },
+    );
+    b.add_block(torch_def("torch", BlockModel::Boxes(torch)))
         .expect("demo torch");
+    let wall_torches = Facing::ALL.map(|facing| {
+        let model = BoxModel {
+            boxes: vec![shapes::wall_torch_box(facing)],
+            outline: vec![shapes::wall_torch_outline(facing)],
+        };
+        box_model(b, model)
+    });
     b.add_block_with_states(
-        torch_def(
-            "wall_torch",
-            BlockModel::WallTorch {
-                facing: Facing::North,
-            },
-        ),
+        torch_def("wall_torch", BlockModel::Boxes(wall_torches[0])),
         vec![facing()],
         |state, def| {
-            def.model = BlockModel::WallTorch {
-                facing: facing_of(state),
-            };
+            def.model = BlockModel::Boxes(wall_torches[facing_of(state) as usize]);
         },
     )
     .expect("demo wall torch");
@@ -568,17 +649,33 @@ fn add_fluid_products(b: &mut BlockRegistryBuilder, t: &Layers) {
 /// The blocks of ADR 0027, the last ones: the cobblestone wall (with the cobblestone layer) and
 /// the oak fence gate (with the planks layer). Both let light through like a fence (opacity 0,
 /// 1 for a wall that holds water: the sky stops) and follow their neighbors
-/// (`boxel_voxel::rules`): a wall connects and raises its post, a gate drops between walls.
+/// ([`crate::rules`]): a wall connects and raises its post, a gate drops between walls.
 fn add_walls_and_gates(b: &mut BlockRegistryBuilder, t: &Layers) {
+    // One box model per post and sides of a wall (2 x 3^4).
+    let mut walls = HashMap::new();
+    for post in [false, true] {
+        for bits in 0..=u8::MAX {
+            let sides = WallSides(bits);
+            // Only the sides `with` makes: two bits per side, `3` unused.
+            if Facing::ALL
+                .iter()
+                .any(|&f| (bits >> (f as u8 * 2)) & 3 == 3)
+            {
+                continue;
+            }
+            let model = BoxModel {
+                boxes: shapes::wall_boxes(post, sides),
+                outline: shapes::wall_outline(post, sides),
+            };
+            walls.insert((post, sides), box_model(b, model));
+        }
+    }
     // Minecraft's `cobblestone_wall`: `up` (the post, default true), a side property per
     // direction and `waterlogged` (ADR 0025).
     let wall = BlockDef {
         name: "boxel:cobblestone_wall".to_string(),
         shape: RenderShape::Opaque,
-        model: BlockModel::Wall {
-            post: true,
-            sides: WallSides::NONE,
-        },
+        model: BlockModel::Boxes(walls[&(true, WallSides::NONE)]),
         collision: BlockCollision::None,
         emission: [0; 3],
         light_opacity: 0,
@@ -595,26 +692,33 @@ fn add_walls_and_gates(b: &mut BlockRegistryBuilder, t: &Layers) {
             let side = state.get(f.name()).and_then(WallSide::from_name);
             sides = sides.with(f, side.unwrap_or_default());
         }
-        def.model = BlockModel::Wall {
-            post: state.get("up") == Some("true"),
-            sides,
-        };
-        def.collision = def.model.default_collision();
+        let post = state.get("up") == Some("true");
+        def.model = BlockModel::Boxes(walls[&(post, sides)]);
+        def.collision = BlockCollision::Boxes(shapes::wall_collision(post, sides));
         if state.get(WATERLOGGED) == Some("true") {
             def.light_opacity = def.light_opacity.max(1);
         }
     })
     .expect("demo wall");
+    // One box model per facing, open and in a wall of a gate; picked the same open or closed.
+    let mut gates = HashMap::new();
+    for facing in Facing::ALL {
+        for open in [false, true] {
+            for in_wall in [false, true] {
+                let model = BoxModel {
+                    boxes: shapes::fence_gate_boxes(facing, open, in_wall),
+                    outline: vec![shapes::fence_gate_outline(facing, in_wall)],
+                };
+                gates.insert((facing, open, in_wall), box_model(b, model));
+            }
+        }
+    }
     // Minecraft's `oak_fence_gate` without `powered` (no redstone): `facing` (the way it
     // opens), `in_wall` and `open`. It holds no water, as in Minecraft.
     let gate = BlockDef {
         name: "boxel:oak_fence_gate".to_string(),
         shape: RenderShape::Opaque,
-        model: BlockModel::FenceGate {
-            facing: Facing::North,
-            open: false,
-            in_wall: false,
-        },
+        model: BlockModel::Boxes(gates[&(Facing::North, false, false)]),
         collision: BlockCollision::None,
         emission: [0; 3],
         light_opacity: 0,
@@ -626,12 +730,20 @@ fn add_walls_and_gates(b: &mut BlockRegistryBuilder, t: &Layers) {
         Property::boolean("open"),
     ];
     b.add_block_with_states(gate, properties, |state, def| {
-        def.model = BlockModel::FenceGate {
-            facing: facing_of(state),
-            open: state.get("open") == Some("true"),
-            in_wall: state.get("in_wall") == Some("true"),
+        let facing = facing_of(state);
+        let open = state.get("open") == Some("true");
+        let in_wall = state.get("in_wall") == Some("true");
+        def.model = BlockModel::Boxes(gates[&(facing, open, in_wall)]);
+        // Closed it collides 1.5 blocks tall; open, not at all.
+        def.collision = if open {
+            BlockCollision::None
+        } else {
+            BlockCollision::Boxes(vec![shapes::fence_gate_collision(facing)])
         };
-        def.collision = def.model.default_collision();
     })
     .expect("demo fence gate");
+    // Open or closed, a gate stops movement (Minecraft's gates are solid wood): fluids do not
+    // flow into it.
+    let id = b.block_by_name("boxel:oak_fence_gate").expect("demo gate");
+    b.set_blocks_motion(id).expect("demo gate");
 }

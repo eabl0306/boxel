@@ -1,5 +1,5 @@
 //! The outline of the targeted block (ADR 0026): thin dark lines along the edges of the block's
-//! outline boxes (`BlockModel::outline`: the cube, a slab's half, a fence's post and arms), as in
+//! outline boxes (`BlockRegistry::outline`: the cube, a slab's half, a fence's post and arms), as in
 //! Minecraft. A game sets [`BlockOutline::block`]; the render plugin reads the block's state and
 //! hands its edges to [`VoxelRenderer::set_outline`](crate::VoxelRenderer::set_outline).
 //!
@@ -132,13 +132,13 @@ pub fn outline_edges(boxes: &[[[u8; 3]; 2]]) -> Vec<OutlineEdge> {
     edges
 }
 
-/// The outline edges of `state`: the edges of its model's outline boxes
-/// (`BlockModel::outline`); none for a block without geometry (air, invisible blocks).
+/// The outline edges of `state`: the edges of its outline boxes
+/// ([`BlockRegistry::outline`]); none for a block without geometry (air, invisible blocks).
 pub fn block_outline_edges(registry: &BlockRegistry, state: BlockState) -> Vec<OutlineEdge> {
     if registry.shape(state) == RenderShape::None {
         return Vec::new();
     }
-    match registry.model(state).outline() {
+    match registry.outline(state) {
         BlockCollision::None => Vec::new(),
         BlockCollision::Full => outline_edges(&[[[0; 3], [16; 3]]]),
         BlockCollision::Boxes(boxes) => {
