@@ -84,8 +84,13 @@ cosas nuevas:
 - **Las reglas se propagan.** `NeighborRules::expand` sigue mirando las ediciones y sus 6
   vecinos. Además, cuando una regla cambia un bloque, vuelve a mirar en el mismo lote sus vecinos
   con regla que ya miró (los que todavía no miró van a ver el cambio igual). Como mucho
-  `MAX_RULE_UPDATES` (65 536) de esas miradas por lote, por si alguna regla futura nunca se
-  asienta.
+  `MAX_RULE_UPDATES` (65 536) de esas miradas por lote, más `RULE_UPDATES_PER_CELL` (16) por
+  celda del primer anillo, por si alguna regla futura nunca se asienta. Si llega al tope, deja de
+  mirar y avisa en el log.
+  - El tope crece con el lote porque un lote grande de muros puestos de abajo arriba mira cada
+    muro unas 3 veces: cada muro se mira primero cuando el de arriba todavía no tiene su forma.
+    Un `--fill` de 64x17x64 muros necesita 250 000 miradas. Con un tope fijo, quedaban muros sin
+    asentar.
   - Termina: los muros solo leen hacia arriba, así que el cambio baja por la columna y para. Las
     demás reglas no leen nada que una regla cambie, así que mirarlas de nuevo no cambia nada.
   - Sigue siendo un solo lote: un remallado y un `BlockChanged` por bloque.
@@ -174,7 +179,7 @@ el mundo plano, un muro con una puerta metida, dos hileras con una antorcha y un
     `fence_gate_outline`, `fence_gate_collision` y `GATE_IN_WALL_DROP`.
   - En `rules`: `wall_rule`, `wall_shape_of`, `wall_connects`, `gate_connects`, `is_wall`,
     `fence_gate_rule`, `UseRule`, `use_rule_for_model` y `fence_gate_use`.
-  - En `boxel_world`: `BlockUses` y `MAX_RULE_UPDATES`.
+  - En `boxel_world`: `BlockUses`, `MAX_RULE_UPDATES` y `RULE_UPDATES_PER_CELL`.
   - En `boxel_voxel`: `StateFlags::BLOCKS_MOTION` y `BlockRegistry::blocks_motion`.
   - Un `match` exhaustivo sobre `BlockModel` fuera del motor deja de compilar.
 - Tests:
@@ -188,7 +193,8 @@ el mundo plano, un muro con una puerta metida, dos hileras con una antorcha y un
     cuevas los ve abiertos.
   - `boxel_world`: una columna de muros pierde todos sus postes al romper la antorcha, en un lote.
     En cajas al azar de muros, puertas, vallas, piedra y antorchas, después de cada lote toda
-    regla queda asentada (sin la propagación, este test falla). En el mundo de verdad, un muro con
+    regla queda asentada (sin la propagación, este test falla). Un lote de 69 632 muros queda
+    asentado, y una regla que nunca se asienta para en el tope. En el mundo de verdad, un muro con
     una puerta y una valla se conectan y la antorcha baja los postes.
   - `boxel_world/tests/fluid.rs`: el agua y la lava rodean la puerta, abierta o cerrada, y no
     la borran. Dos fuentes sobre una puerta abierta hacen una tercera. El simulador tiene

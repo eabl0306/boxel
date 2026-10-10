@@ -11,8 +11,9 @@
 //! of the wall above it, so breaking the torch on a column of walls lowers every post down the
 //! column, one block per step, in the same batch. The built-in rules end: stairs, fences, torches
 //! and gates read nothing a rule changes (their second look changes nothing), and walls only read
-//! upward. At most [`MAX_RULE_UPDATES`] such second looks per batch, in case a rule added later
-//! never settles. A rule whose block has a neighbor in a chunk that is not readable is skipped
+//! upward. At most [`MAX_RULE_UPDATES`] such second looks per batch plus
+//! [`RULE_UPDATES_PER_CELL`] per cell of its first ring, in case a rule added later never
+//! settles. A rule whose block has a neighbor in a chunk that is not readable is skipped
 //! (the block keeps its state, so a chunk border never drops a torch or cuts a fence).
 //!
 //! This runs before the edits are applied and is separate from scheduled block ticks
@@ -27,9 +28,16 @@ use boxel_voxel::{BlockId, BlockPos, BlockRegistry, BlockState, Face, Facing};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-/// Most blocks [`NeighborRules::expand`] looks at again around the blocks its rules changed, per
-/// edit batch: far more than a column of walls needs, a stop for a rule that never settles.
+/// Blocks [`NeighborRules::expand`] may look at again around the blocks its rules changed in one
+/// edit batch, besides [`RULE_UPDATES_PER_CELL`] per cell of the batch's first ring: room for a
+/// change to run down a long column of walls from a single edit.
 pub const MAX_RULE_UPDATES: usize = 1 << 16;
+
+/// Second looks per cell of a batch's first ring, on top of [`MAX_RULE_UPDATES`]. A big batch of
+/// walls placed bottom up looks again at each wall about 3 times (each one first sees the wall
+/// above before that one has its shape), so 16 leaves room to spare. Only a rule that never
+/// settles reaches the total; the batch then stops looking again (and logs a warning).
+pub const RULE_UPDATES_PER_CELL: usize = 16;
 
 /// The [`NeighborRule`] of each block of a registry (indexed by [`BlockId`]).
 #[derive(Resource, Clone, Debug, Default)]
@@ -71,8 +79,9 @@ impl NeighborRules {
     /// Appends to `edits` the neighbor updates the batch needs: every edited position and its 6
     /// face neighbors whose block has a rule, in the order first met, with the batch's edits
     /// in (the last edit of a position wins); then, after each block a rule changed, its 6
-    /// neighbors again (up to [`MAX_RULE_UPDATES`]). `read` gives the current block of a
-    /// position (`None`: not readable). A rule that changes nothing adds nothing.
+    /// neighbors again (up to [`MAX_RULE_UPDATES`] plus [`RULE_UPDATES_PER_CELL`] per cell of
+    /// the first ring). `read` gives the current block of a position (`None`: not readable). A
+    /// rule that changes nothing adds nothing.
     pub fn expand(
         &self,
         registry: &BlockRegistry,
@@ -98,10 +107,14 @@ impl NeighborRules {
             }
         }
         // The second looks, after the ring: the neighbors of the blocks a rule changed that the
-        // ring already went past, each waiting at most once at a time.
+        // ring already went past, each waiting at most once at a time. The budget grows with
+        // the batch: a fixed one left big batches of walls unsettled.
         let mut again = VecDeque::new();
         let mut waiting: FastSet<BlockPos> = FastSet::default();
+        let budget =
+            MAX_RULE_UPDATES.saturating_add(RULE_UPDATES_PER_CELL.saturating_mul(cells.len()));
         let mut updates = 0;
+        let mut dropped = false;
         let mut next = 0;
         loop {
             let p = if let Some(&p) = cells.get(next) {
@@ -137,16 +150,26 @@ impl NeighborRules {
             // Its neighbors may follow it (a wall under a wall): those with a rule that the ring
             // went past get a second look.
             for (f, &n) in Face::ALL.iter().zip(&around) {
-                if updates >= MAX_RULE_UPDATES || self.rule(registry, n).is_none() {
+                if self.rule(registry, n).is_none() {
                     continue;
                 }
                 let q = neighbor(p, *f);
                 let ahead = ring.get(&q).is_some_and(|&i| i >= next);
-                if !ahead && waiting.insert(q) {
-                    updates += 1;
-                    again.push_back(q);
+                if updates < budget {
+                    if !ahead && waiting.insert(q) {
+                        updates += 1;
+                        again.push_back(q);
+                    }
+                } else if !ahead && !waiting.contains(&q) {
+                    dropped = true;
                 }
             }
+        }
+        if dropped {
+            tracing::warn!(
+                budget,
+                "neighbor rules did not settle: second looks stopped at the cap"
+            );
         }
     }
 }
@@ -468,6 +491,68 @@ mod tests {
                     .unwrap_or_else(|e| panic!("round {round} step {step}: {e}"));
             }
         }
+    }
+
+    /// A batch far past [`MAX_RULE_UPDATES`]: a solid box of walls 64 by 17 by 64 (69 632, one
+    /// `snapshot --fill`), placed bottom up, settles. Each wall under another is first looked at
+    /// before the one above has its shape, so the batch looks again at each wall about 3 times
+    /// (250 238 second looks here), more than a fixed cap allowed.
+    #[test]
+    fn a_big_batch_of_walls_settles() {
+        let registry = BlockRegistry::default_blocks();
+        let rules = NeighborRules::from_registry(&registry);
+        let s = |name: &str| registry.parse_state(name).unwrap();
+        let base = BlockPos::new((1 << 40) - 32, 1 << 31, -(1 << 31) - 32);
+        let at = |x: i64, y: i64, z: i64| BlockPos::new(base.x + x, base.y + y, base.z + z);
+        let mut edits = Vec::new();
+        for y in 0..17 {
+            for z in 0..64 {
+                for x in 0..64 {
+                    edits.push(BlockEdit {
+                        pos: at(x, y, z),
+                        state: s("boxel:cobblestone_wall"),
+                    });
+                }
+            }
+        }
+        rules.expand(&registry, |_| Some(BlockState::AIR), &mut edits);
+        let mut blocks = HashMap::new();
+        apply(&mut blocks, &edits);
+        settled(&rules, &registry, &blocks).unwrap();
+        // Inside, under the top layer: no post (the wall above has none) and four tall sides.
+        assert_eq!(
+            blocks[&at(20, 3, 40)],
+            s("boxel:cobblestone_wall[east=tall,north=tall,south=tall,up=false,west=tall]")
+        );
+    }
+
+    /// A rule that never settles (two fences that keep turning each other) stops at the cap:
+    /// the batch ends with a bounded number of edits.
+    #[test]
+    fn a_rule_that_never_settles_stops_at_the_cap() {
+        let registry = BlockRegistry::default_blocks();
+        let mut rules = NeighborRules::from_registry(&registry);
+        let fence = registry.parse_state("boxel:oak_fence").unwrap();
+        let flip: NeighborRule = |registry, state, _| {
+            let north = registry.property(state, "north") == Some("true");
+            registry
+                .with(state, "north", if north { "false" } else { "true" })
+                .unwrap_or(state)
+        };
+        rules.set(registry.block(fence).unwrap(), Some(flip));
+        let mut edits: Vec<BlockEdit> = (0..2)
+            .map(|x| BlockEdit {
+                pos: BlockPos::new(x, 0, 0),
+                state: fence,
+            })
+            .collect();
+        rules.expand(&registry, |_| Some(BlockState::AIR), &mut edits);
+        // The two edits, their 2 changes in the ring and one per second look.
+        let ring = 12;
+        assert_eq!(
+            edits.len(),
+            4 + MAX_RULE_UPDATES + RULE_UPDATES_PER_CELL * ring
+        );
     }
 
     #[test]

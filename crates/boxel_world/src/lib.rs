@@ -93,7 +93,7 @@ pub use daylight::{
 pub use fluid::FluidPlugin;
 pub(crate) use map::CachedLight;
 pub use map::{ChunkId, ChunkMap, ChunkSlot, DataState, Interest, MeshState, WorldStats};
-pub use neighbor_rules::{BlockUses, MAX_RULE_UPDATES, NeighborRules};
+pub use neighbor_rules::{BlockUses, MAX_RULE_UPDATES, NeighborRules, RULE_UPDATES_PER_CELL};
 pub use plugin::{
     BlockChanged, BlockEdit, ChunkDataEvent, ChunkMeshEvent, ChunkMeshResync, ChunkViewer,
     EditQueue, WorldContent, WorldPlugin, WorldSettings, WorldSystems,
