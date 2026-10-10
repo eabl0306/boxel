@@ -203,8 +203,8 @@ pub struct VoxelRenderer {
     block_texture: wgpu::Texture,
     /// Which frame each animated layer shows on the GPU.
     animator: TextureAnimator,
-    /// `ViewUniform::viewport.w`: the flow textures the shaders do not scroll (bit 0 water, bit
-    /// 1 lava; `BlockTextureData::animated_flow`).
+    /// `ViewUniform::viewport.w`: the flow textures the shaders do not scroll (bit 0 for fluids
+    /// that emit no light, bit 1 for fluids that emit light; `BlockTextureData::animated_flow`).
     still_flow: f32,
     view_buffer: wgpu::Buffer,
     /// Group 1: `View` uniform.

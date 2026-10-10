@@ -86,8 +86,9 @@ const WET: u8 = 1 << 6;
 /// `BlockDef::collision` gives the shape (a box list that is exactly the unit cube counts as
 /// `Full`, an empty one as `Empty`), the registry's `FLUID` flag gives the fluid bit (and,
 /// with `WATERLOGGED`, the wet bit: a waterlogged block holds a water source, ADR 0025), and a
-/// render shape other than `None` gives an outline, the model's (`BlockModel::outline`: the
-/// cube, a slab's half, a box around a plant). States outside the registry are empty.
+/// render shape other than `None` gives an outline, the model's (`BlockRegistry::outline`: the
+/// cube, a slab's half, a box around a plant, a box model's outline). States outside the
+/// registry are empty.
 ///
 /// A collision box may reach into the cell above (a fence collides 1.5 blocks tall, ADR 0026):
 /// such a block is [`CollisionTable::is_tall`], and the sweep and the collision raycast also
