@@ -14,7 +14,7 @@
 //! [`BlockRegistryBuilder::set_neighbor_rule`]: crate::BlockRegistryBuilder::set_neighbor_rule
 //! [`BlockRegistryBuilder::set_use_rule`]: crate::BlockRegistryBuilder::set_use_rule
 use crate::shapes::Facing;
-use crate::{BlockCollision, BlockModel, BlockRegistry, BlockState, Face};
+use crate::{BlockCollision, BlockRegistry, BlockState, Face};
 use std::sync::Arc;
 
 /// The signature of a neighbor rule: the registry, the state and its 6 face neighbors (indexed
@@ -90,27 +90,6 @@ impl UseRule {
 impl std::fmt::Debug for UseRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("UseRule(..)")
-    }
-}
-
-/// A neighbor rule as a plain function, for code that looked rules up by model before they were
-/// registered per block (#48). Transitional: use [`BlockRegistry::neighbor_rule`]. `Some` for a
-/// model made of boxes other than a slab, and the function applies the rule the registry holds
-/// for the block of the state (keeping the state when there is none); `None` for cubes, slabs,
-/// crosses and fluids.
-pub fn rule_for_model(
-    model: BlockModel,
-) -> Option<fn(&BlockRegistry, BlockState, &[BlockState; 6]) -> BlockState> {
-    match model {
-        BlockModel::Cube { .. } | BlockModel::Slab(_) | BlockModel::Cross | BlockModel::Fluid => {
-            None
-        }
-        BlockModel::Boxes(_) => Some(|registry, state, neighbors| {
-            registry
-                .block(state)
-                .and_then(|b| registry.neighbor_rule(b))
-                .map_or(state, |rule| rule.apply(registry, state, neighbors))
-        }),
     }
 }
 

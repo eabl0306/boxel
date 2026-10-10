@@ -515,8 +515,15 @@ fn special_scene(registry: &BlockRegistry) -> Vec<(IVec3, ChunkMesh)> {
             let n = f.normal();
             block(x + n.x, y + n.y, z + n.z)
         });
-        let rule = boxel_voxel::rules::rule_for_model(registry.model(state)).expect("a rule");
-        assert_eq!(rule(registry, state, &around), state, "({x}, {y}, {z})");
+        let rule = registry
+            .block(state)
+            .and_then(|b| registry.neighbor_rule(b))
+            .expect("a rule");
+        assert_eq!(
+            rule.apply(registry, state, &around),
+            state,
+            "({x}, {y}, {z})"
+        );
     }
     let chunks = dense.map(|d| ChunkData::from_dense(&d));
     let materials = MaterialTable::from_registry(registry);
