@@ -8,11 +8,13 @@
 //!   displacement in 1/4096 cells. Its lattice point is `V >> (12 + l)` and its weight inside
 //!   the lattice step `(V >> l) & 4095`. The second octave has half the step.
 //! - **Hash.** A lattice point's 64-bit coordinates (two's complement) split into a low and a
-//!   high word per axis. The high words go into a seed mix, the low words through a chained
-//!   `lowbias32`; the value is the top 12 bits.
-//! - **Interpolation.** A fixed-point smoothstep of the weight, then integer lerps (bilinear in
-//!   x and z for [`NoiseDims::Flat`], trilinear for `Volume`), each
-//!   product under `2^26`. Two octaves mix as `(2 * v1 + v2) / 3`.
+//!   high word per axis, folded into one word (`lo ^ hi * HI_MIX`), and the three words go
+//!   through a chained `lowbias32` from the octave's seed; the value is the top 12 bits. Flat
+//!   noise has y words 0, so every height of a column has the same corners.
+//! - **Interpolation.** A fixed-point smoothstep of the weight, then seven integer lerps
+//!   (trilinear; for [`NoiseDims::Flat`] the y weight is 0 and both y corners are the same, so
+//!   it is bilinear in x and z), each product under `2^26`. Two octaves mix as
+//!   `(2 * v1 + v2) / 3`.
 //! - **Coverage.** `clamp(n + 1 - threshold, 0, 4095) * gain >> 8`, at most 4096 (one).
 //!
 //! The GPU never sees an absolute coordinate: [`LayerParams`] splits the
@@ -52,16 +54,18 @@ pub const fn seed32_octave2(seed32: u32) -> u32 {
     lowbias32(seed32 ^ OCTAVE2_SALT)
 }
 
-/// The seed mixed with the high words of a lattice point.
-pub const fn seed_mix(seed32: u32, hi: [u32; 3]) -> u32 {
-    lowbias32(lowbias32(lowbias32(seed32 ^ hi[0]) ^ hi[1]) ^ hi[2])
+/// Odd multiplier that folds a coordinate's high word into its low word.
+pub const HI_MIX: u32 = 0x9e37_79b1;
+
+/// One word per axis of a lattice coordinate: `lo ^ hi * HI_MIX`.
+#[inline]
+pub const fn fold(lo: u32, hi: u32) -> u32 {
+    lo ^ hi.wrapping_mul(HI_MIX)
 }
 
-/// The 12-bit value of the lattice point with low words `lo` (`lo[1]` unused when flat).
-pub const fn lattice_value(mix: u32, lo: [u32; 3], volume: bool) -> i32 {
-    let hx = lowbias32(mix ^ lo[0]);
-    let hxy = if volume { lowbias32(hx ^ lo[1]) } else { hx };
-    (lowbias32(hxy ^ lo[2]) >> 20) as i32
+/// The 12-bit value of the lattice point with folded words `v`, from an octave's seed.
+pub const fn lattice_value(seed32: u32, v: [u32; 3]) -> i32 {
+    (lowbias32(lowbias32(lowbias32(seed32 ^ v[0]) ^ v[1]) ^ v[2]) >> 20) as i32
 }
 
 /// Fixed-point smoothstep of a weight in `0..4096`: `t^2 (3 - 2t)` in 1/4096.
@@ -149,33 +153,19 @@ struct Axis {
 }
 
 /// The value noise of one octave from the words of each axis at the cell's lattice point and
-/// the next one (`axes[1]` ignored when flat). `cached` is a seed mix and the high words it
-/// mixes (the GPU's, for corners without a carry); without it every corner mixes its own.
-fn octave(axes: [Axis; 3], seed32: u32, cached: Option<(u32, [u32; 3])>, volume: bool) -> i32 {
-    let value = |cx: usize, cy: usize, cz: usize| {
-        let hi = [axes[0].hi[cx], axes[1].hi[cy], axes[2].hi[cz]];
-        let m = match cached {
-            Some((mix, base)) if base == hi => mix,
-            _ => seed_mix(seed32, hi),
-        };
-        lattice_value(m, [axes[0].lo[cx], axes[1].lo[cy], axes[2].lo[cz]], volume)
-    };
+/// the next one: trilinear over [`corner_values`].
+fn octave(axes: [Axis; 3], seed32: u32) -> i32 {
+    let c = corner_values(axes, seed32);
     let (sx, sy, sz) = (
         smooth(axes[0].weight),
         smooth(axes[1].weight),
         smooth(axes[2].weight),
     );
-    if volume {
-        let a00 = lerp(value(0, 0, 0), value(1, 0, 0), sx);
-        let a10 = lerp(value(0, 1, 0), value(1, 1, 0), sx);
-        let a01 = lerp(value(0, 0, 1), value(1, 0, 1), sx);
-        let a11 = lerp(value(0, 1, 1), value(1, 1, 1), sx);
-        lerp(lerp(a00, a10, sy), lerp(a01, a11, sy), sz)
-    } else {
-        let a0 = lerp(value(0, 0, 0), value(1, 0, 0), sx);
-        let a1 = lerp(value(0, 0, 1), value(1, 0, 1), sx);
-        lerp(a0, a1, sz)
-    }
+    let a00 = lerp(c[0], c[1], sx);
+    let a10 = lerp(c[2], c[3], sx);
+    let a01 = lerp(c[4], c[5], sx);
+    let a11 = lerp(c[6], c[7], sx);
+    lerp(lerp(a00, a10, sy), lerp(a01, a11, sy), sz)
 }
 
 /// The coverage of the cell `d` cells from the render origin's cell, as the GPU computes it
@@ -190,7 +180,6 @@ pub fn coverage(p: &LayerParams, d: [i32; 3]) -> Coverage {
         weight: 0,
     }; 3];
     let mut axes2 = axes1;
-    let mut base_hi2 = [0; 3];
     for a in 0..3 {
         if a == 1 && !volume {
             continue;
@@ -207,7 +196,6 @@ pub fn coverage(p: &LayerParams, d: [i32; 3]) -> Coverage {
         };
         if p.octaves == 2 {
             let (blo, bhi) = double_words(p.lo[a], p.hi[a]);
-            base_hi2[a] = bhi;
             let li = num >> (11 + l);
             let (lo0, hi0) = add_words(blo, bhi, li);
             let (lo1, hi1) = add_words(blo, bhi, li + 1);
@@ -218,9 +206,9 @@ pub fn coverage(p: &LayerParams, d: [i32; 3]) -> Coverage {
             };
         }
     }
-    let v1 = octave(axes1, p.seed32, Some((p.seed_mix, p.hi)), volume);
+    let v1 = octave(axes1, p.seed32);
     let noise = if p.octaves == 2 {
-        let v2 = octave(axes2, p.seed32_2, Some((p.seed_mix2, base_hi2)), volume);
+        let v2 = octave(axes2, p.seed32_2);
         mix_octaves(v1, v2)
     } else {
         v1
@@ -229,6 +217,77 @@ pub fn coverage(p: &LayerParams, d: [i32; 3]) -> Coverage {
         noise,
         coverage: coverage_from_noise(noise, p.threshold, p.gain),
     }
+}
+
+/// The first octave's lattice step around a cell: every cell whose offset lies in `[lo, hi)`
+/// along each axis (unbounded along y for flat noise) interpolates the same corners, and value
+/// noise never leaves the range of its corners, so none of them has more noise than
+/// `max_noise` (with two octaves the second one is bounded by 4095). The march skips a whole
+/// step when even that leaves no coverage ([`StepBound::is_empty`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepBound {
+    /// First cell offset of the step per axis.
+    pub lo: [i32; 3],
+    /// One past its last cell offset per axis.
+    pub hi: [i32; 3],
+    /// The most noise a cell of the step can have.
+    pub max_noise: i32,
+}
+
+impl StepBound {
+    /// True if no cell of the step can have coverage.
+    pub fn is_empty(&self, p: &LayerParams) -> bool {
+        coverage_from_noise(self.max_noise, p.threshold, p.gain) == 0
+    }
+}
+
+/// The [`StepBound`] of the first octave around cell `d` (as `fog.wgsl` computes it from the
+/// corners it caches).
+pub fn step_bound(p: &LayerParams, d: [i32; 3]) -> StepBound {
+    let l = p.log2_scale;
+    let mut lo = [i32::MIN; 3];
+    let mut hi = [i32::MAX; 3];
+    let mut axes = [Axis {
+        lo: [0; 2],
+        hi: [0; 2],
+        weight: 0,
+    }; 3];
+    for a in 0..3 {
+        if a == 1 && !p.volume {
+            continue;
+        }
+        let k = p.m0[a] + d[a];
+        let num = (k << 12) - p.q[a];
+        let li = num >> (12 + l);
+        // Cells k with ((k << 12) - q) >> (12 + l) == li: from L * li (one more with a wind
+        // fraction) for L cells.
+        lo[a] = (li << l) + i32::from(p.q[a] > 0) - p.m0[a];
+        hi[a] = lo[a] + (1 << l);
+        let (lo0, hi0) = add_words(p.lo[a], p.hi[a], li);
+        let (lo1, hi1) = add_words(p.lo[a], p.hi[a], li + 1);
+        axes[a] = Axis {
+            lo: [lo0, lo1],
+            hi: [hi0, hi1],
+            weight: 0,
+        };
+    }
+    let max = corner_values(axes, p.seed32).into_iter().max().unwrap_or(0);
+    StepBound {
+        lo,
+        hi,
+        max_noise: if p.octaves == 2 {
+            mix_octaves(max, 4095)
+        } else {
+            max
+        },
+    }
+}
+
+/// The 8 corner values of a lattice step, x fastest, then y, then z (flat noise: the two y
+/// corners are the same point).
+fn corner_values(axes: [Axis; 3], seed32: u32) -> [i32; 8] {
+    let v: [[u32; 2]; 3] = axes.map(|a| [fold(a.lo[0], a.hi[0]), fold(a.lo[1], a.hi[1])]);
+    std::array::from_fn(|i| lattice_value(seed32, [v[0][i & 1], v[1][(i >> 1) & 1], v[2][i >> 2]]))
 }
 
 /// The coverage of absolute cell `cell` at fixed tick `tick`, computed directly in `i128` from
@@ -269,9 +328,9 @@ pub fn coverage_direct(layer: &FogLayer, cell: [i64; 3], tick: u64) -> Coverage 
             };
         }
     }
-    let v1 = octave(axes1, seed1, None, volume);
+    let v1 = octave(axes1, seed1);
     let noise = if layer.noise.octaves == 2 {
-        let v2 = octave(axes2, seed2, None, volume);
+        let v2 = octave(axes2, seed2);
         mix_octaves(v1, v2)
     } else {
         v1

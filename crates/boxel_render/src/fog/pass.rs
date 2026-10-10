@@ -67,7 +67,8 @@ fn lit_color(layer: &FogLayer, view: &ViewParams) -> [f32; 3] {
 /// The uniform words of one layer.
 fn layer_gpu(m: &MarchLayer) -> FogLayerGpu {
     let p = &m.params;
-    let flags = if p.volume { fog::LAYER_VOLUME } else { 0 };
+    let flags = if p.volume { fog::LAYER_VOLUME } else { 0 }
+        | if m.uniform { fog::LAYER_UNIFORM } else { 0 };
     let [r, g, b] = m.lit;
     FogLayerGpu {
         band: [p.band[0], p.band[1], m.reach(), m.sigma_mean_log2e],
@@ -77,9 +78,9 @@ fn layer_gpu(m: &MarchLayer) -> FogLayerGpu {
         lit: [r, g, b, 0.0],
         face: m.face_shade,
         lattice: [p.m0[0] as u32, p.m0[1] as u32, p.m0[2] as u32, p.log2_scale],
-        base_lo: [p.lo[0], p.lo[1], p.lo[2], p.seed_mix],
+        base_lo: [p.lo[0], p.lo[1], p.lo[2], 0],
         base_hi: [p.hi[0], p.hi[1], p.hi[2], p.seed32],
-        octave2: [p.seed_mix2, p.seed32_2, p.octaves, flags],
+        octave2: [0, p.seed32_2, p.octaves, flags],
         shape: [p.threshold, p.gain, 0, 0],
         wind: [p.q[0], p.q[1], p.q[2], 0],
         cells: [p.band_cells[0], p.band_cells[1], 0, 0],
@@ -707,10 +708,18 @@ mod tests {
         layer.noise.dims = boxel_fog::NoiseDims::Volume;
         layer.noise.octaves = 2;
         layer.noise.scale = 4;
+        layer.threshold = 0.5;
         let m = MarchLayer::new(&layer, [-5, 3, 1 << 40], 99, [0.5; 3], [10.0, 20.0], 0.25);
         let gpu = layer_gpu(&m);
         assert_eq!(gpu.octave2[2], 2);
         assert_eq!(gpu.octave2[3], fog::LAYER_VOLUME);
+        // Every cell full (threshold 0, softness 0): the march takes the layer whole.
+        layer.threshold = 0.0;
+        let full = MarchLayer::new(&layer, [-5, 3, 1 << 40], 99, [0.5; 3], [10.0, 20.0], 1.0);
+        assert_eq!(
+            layer_gpu(&full).octave2[3],
+            fog::LAYER_VOLUME | fog::LAYER_UNIFORM
+        );
         assert_eq!(gpu.lattice[3], 2);
         assert_eq!(gpu.base_hi[0], u32::MAX, "a negative lattice point");
         assert_eq!(gpu.fade[..2], [10.0, 20.0]);

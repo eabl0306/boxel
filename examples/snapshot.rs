@@ -169,6 +169,8 @@ struct Options {
     fog_res: FogResolution,
     /// `--fog-tick`.
     fog_tick: u64,
+    /// `--fog-steps`.
+    fog_steps: u32,
 }
 
 /// `Ok(None)` for `--help`.
@@ -195,6 +197,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         fog: fog::FogPreset::Off,
         fog_res: FogResolution::Half,
         fog_tick: 0,
+        fog_steps: 64,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -274,6 +277,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--pack" => o.textures = pack::parse(flag, &value()?)?,
             "--fog" => o.fog = fog::parse(flag, &value()?)?,
             "--fog-res" => o.fog_res = fog::parse_resolution(flag, &value()?)?,
+            "--fog-steps" => o.fog_steps = fog::parse_steps(flag, &value()?)?,
             "--fog-tick" => {
                 let v = value()?;
                 o.fog_tick = v
@@ -837,8 +841,8 @@ fn run(
         }));
     }
     // `--fog`: the demo's preset at a fixed tick (the same cells every run).
-    let fog_label = fog::label(o.fog, o.fog_res);
-    if let Some(settings) = o.fog.settings(o.fog_res) {
+    let fog_label = fog::label(o.fog, o.fog_res, o.fog_steps);
+    if let Some(settings) = o.fog.settings(o.fog_res, o.fog_steps) {
         renderer.set_fog(
             &gpu.device,
             Some(FogInput {

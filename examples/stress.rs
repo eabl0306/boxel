@@ -277,6 +277,8 @@ struct Options {
     fog: fog::FogPreset,
     /// `--fog-res`.
     fog_res: FogResolution,
+    /// `--fog-steps`.
+    fog_steps: u32,
     /// The route of the `path` scenario through the cave `--cave` found (empty before
     /// [`find_cave`] and without `--cave`).
     path: Vec<DVec3>,
@@ -330,6 +332,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         cave: false,
         fog: fog::FogPreset::Off,
         fog_res: FogResolution::Half,
+        fog_steps: 64,
         path: Vec::new(),
     };
     let mut timeout = None;
@@ -489,6 +492,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--idle-work" => o.idle_work = on_off(flag, &value()?)?,
             "--fog" => o.fog = fog::parse(flag, &value()?)?,
             "--fog-res" => o.fog_res = fog::parse_resolution(flag, &value()?)?,
+            "--fog-steps" => o.fog_steps = fog::parse_steps(flag, &value()?)?,
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
@@ -1362,7 +1366,7 @@ fn run_info(options: &Options, present: String) -> RunInfo {
         light: if options.light { "on" } else { "off" }.to_string(),
         cave_culling: if options.cave_culling { "on" } else { "off" }.to_string(),
         idle_work: if options.idle_work { "on" } else { "off" }.to_string(),
-        fog: fog::label(options.fog, options.fog_res),
+        fog: fog::label(options.fog, options.fog_res, options.fog_steps),
         pack: match &options.textures {
             TextureSource::Procedural => "none".to_string(),
             source => source.label(),
@@ -1579,7 +1583,7 @@ fn main() -> AppExit {
         app.insert_resource(EditScript::new(DVec3::new(x, y, z)));
     }
     // `--fog`: the plugin only when asked (off adds nothing at all).
-    if let Some(settings) = options.fog.settings(options.fog_res) {
+    if let Some(settings) = options.fog.settings(options.fog_res, options.fog_steps) {
         app.add_plugins(FogPlugin { settings });
     }
     if options.bodies.enabled() {

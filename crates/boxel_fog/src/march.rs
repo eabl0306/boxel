@@ -17,6 +17,9 @@
 //! - **Budget.** At most `max_steps` cells over all layers; past it the rest of each chord gets
 //!   the layer's mean extinction with shade 1 (no visible wall where the budget ends).
 //! - **Early exit.** Once the optical depth passes 6 (`log2`: 8.66) nothing behind shows.
+//! - **Skip.** A lattice step of the noise whose corners leave no coverage
+//!   ([`noise::step_bound`]) is crossed in one step, and a layer whose every cell is full
+//!   ([`MarchLayer::uniform`]) is taken in one step without walking its cells.
 
 use crate::config::{FogFade, FogLayer};
 use crate::layer::LayerParams;
@@ -26,6 +29,9 @@ use crate::noise;
 pub const EXIT_TAU_LOG2: f32 = 8.66;
 /// The march treats direction components smaller than this as this (no division by zero).
 pub const MIN_DIR: f32 = 1e-30;
+/// Pieces of a chord through a layer whose every cell is full ([`MarchLayer::uniform`]): each
+/// one fades by its own middle.
+pub const UNIFORM_PIECES: u32 = 8;
 
 /// One layer as the march reads it (the uniform's per-layer data).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -42,6 +48,8 @@ pub struct MarchLayer {
     pub max_distance: f32,
     /// Mean extinction (per block, times `log2(e)`) for the rest of a ray past the budget.
     pub sigma_mean_log2e: f32,
+    /// Every cell is full (threshold 0, softness 0): the march takes each chord whole.
+    pub uniform: bool,
 }
 
 impl MarchLayer {
@@ -68,6 +76,7 @@ impl MarchLayer {
             fade,
             max_distance: layer.max_distance,
             sigma_mean_log2e: params.density_log2e * mean_coverage,
+            uniform: params.threshold == 0 && params.gain == noise::MAX_GAIN,
         }
     }
 
@@ -115,8 +124,10 @@ pub struct Dda {
     pub t_next: [f32; 3],
     inv: [f32; 3],
     eye: [f32; 3],
+    dir: [f32; 3],
     grid: [f32; 3],
     size: [f32; 3],
+    band: [i32; 2],
 }
 
 impl Dda {
@@ -148,8 +159,10 @@ impl Dda {
             t_next: [0.0; 3],
             inv,
             eye,
+            dir,
             grid: params.grid,
             size,
+            band: params.band_cells,
         };
         for a in 0..3 {
             dda.t_next[a] = dda.boundary(a);
@@ -180,6 +193,51 @@ impl Dda {
     pub fn advance(&mut self, axis: usize) {
         self.cell[axis] += self.step[axis];
         self.t_next[axis] = self.boundary(axis);
+    }
+
+    /// The axis the ray leaves the lattice step `bound` through first (x, then y, then z on
+    /// ties; never y when the step is unbounded along it) and its `t`.
+    pub fn step_exit(&self, bound: &noise::StepBound) -> (usize, f32) {
+        let mut best = (0, f32::INFINITY);
+        for a in 0..3 {
+            if bound.lo[a] == i32::MIN {
+                continue;
+            }
+            let edge = if self.step[a] > 0 {
+                bound.hi[a]
+            } else {
+                bound.lo[a]
+            };
+            let t = (self.grid[a] + edge as f32 * self.size[a] - self.eye[a]) * self.inv[a];
+            if t < best.1 {
+                best = (a, t);
+            }
+        }
+        best
+    }
+
+    /// Moves to `t`, just past the lattice step `bound` along `axis`: that axis' first cell
+    /// beyond it, the others where the ray is (kept inside the step).
+    pub fn jump(&mut self, t: f32, axis: usize, bound: &noise::StepBound) {
+        for a in 0..3 {
+            self.cell[a] = if a == axis {
+                if self.step[a] > 0 {
+                    bound.hi[a]
+                } else {
+                    bound.lo[a] - 1
+                }
+            } else {
+                let p = self.eye[a] + t * self.dir[a];
+                (((p - self.grid[a]) / self.size[a]).floor() as i32)
+                    .clamp(bound.lo[a], bound.hi[a].saturating_sub(1))
+            };
+        }
+        if axis != 1 {
+            self.cell[1] = self.cell[1].clamp(self.band[0], self.band[1] - 1);
+        }
+        for a in 0..3 {
+            self.t_next[a] = self.boundary(a);
+        }
     }
 }
 
@@ -350,49 +408,115 @@ pub fn march(ray: &Ray, layers: &[MarchLayer], sky: [f32; 3], max_steps: u32) ->
             continue;
         }
         s.flush(ta);
-        let fade_col = |s0: f32, s1: f32, shade: f32| -> [f32; 3] {
-            let f = layer.fade_at(0.5 * (s0 + s1) * dir_len);
-            std::array::from_fn(|i| layer.lit[i] * shade + (sky[i] - layer.lit[i] * shade) * f)
-        };
-        if s.steps >= max_steps {
-            let col = fade_col(ta, tb, 1.0);
-            s.segment(ta, tb, layer.sigma_mean_log2e * dir_len, col);
-            continue;
+        march_layer(&mut s, layer, ray, ta, tb, sky, max_steps);
+    }
+    s.flush(f32::INFINITY);
+    MarchResult {
+        transmittance: s.out_t,
+        color: s.out_c,
+        steps: s.steps,
+    }
+}
+
+/// One layer's chord `[ta, tb]` of a ray: the cell walk, or the rest of the chord in
+/// [`UNIFORM_PIECES`] pieces for a layer whose every cell is full and past the step budget (the
+/// shader's `march_layer`, segment for segment).
+fn march_layer(
+    s: &mut State,
+    layer: &MarchLayer,
+    ray: &Ray,
+    ta: f32,
+    tb: f32,
+    sky: [f32; 3],
+    max_steps: u32,
+) {
+    let p = &layer.params;
+    let dir = ray.dir;
+    let dir_len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+    let up = dir[1] > 0.0;
+    let fade_col = |s0: f32, s1: f32, shade: f32| -> [f32; 3] {
+        let f = layer.fade_at(0.5 * (s0 + s1) * dir_len);
+        std::array::from_fn(|i| layer.lit[i] * shade + (sky[i] - layer.lit[i] * shade) * f)
+    };
+    let mut dda = Dda::new(ray.eye, dir, p, ta);
+    let mut s0 = ta;
+    let mut shade = 1.0;
+    let mut entry = if ta > 0.0 {
+        layer.face_shade[entry_face(1, if up { 1 } else { -1 })]
+    } else {
+        1.0
+    };
+    let mut prev_full = false;
+    // The rest of the chord from `rest_from`, in pieces of one extinction and shade.
+    let mut rest = None;
+    let mut rest_from = ta;
+    let mut k = 0;
+    if s.steps >= max_steps {
+        rest = Some((layer.sigma_mean_log2e, 1.0));
+    } else if layer.uniform {
+        // One body without inner faces: one step.
+        s.steps += 1;
+        rest = Some((p.density_log2e, entry));
+    }
+    let mut piece = (tb - ta) / UNIFORM_PIECES as f32;
+    loop {
+        if rest.is_none() && s.steps >= max_steps {
+            rest = Some((layer.sigma_mean_log2e, 1.0));
+            rest_from = s0;
+            piece = (tb - s0) / UNIFORM_PIECES as f32;
         }
-        let mut dda = Dda::new(ray.eye, dir, p, ta);
-        let mut s0 = ta;
-        let mut shade = 1.0;
-        let mut entry = if ta > 0.0 {
-            layer.face_shade[entry_face(1, if up { 1 } else { -1 })]
+        let (a, b, s1, sigma, last, axis);
+        if let Some((rest_sigma, rest_shade)) = rest {
+            a = rest_from + k as f32 * piece;
+            k += 1;
+            last = k == UNIFORM_PIECES;
+            b = if last { tb } else { a + piece };
+            s1 = b;
+            sigma = rest_sigma;
+            shade = rest_shade;
+            axis = 2;
         } else {
-            1.0
-        };
-        let mut prev_full = false;
-        loop {
-            if s.steps >= max_steps {
-                let col = fade_col(s0, tb, 1.0);
-                s.segment(s0, tb, layer.sigma_mean_log2e * dir_len, col);
-                break;
-            }
             s.steps += 1;
-            let (axis, t) = dda.exit();
-            let s1 = t.clamp(s0, tb);
-            let cov = noise::coverage(p, dda.cell).coverage;
-            let sigma = p.density_log2e * (cov as f32 / 4096.0);
-            if sigma > 0.0 {
-                if !prev_full {
-                    shade = entry;
-                }
-                let col = fade_col(s0, s1, shade);
-                s.segment(s0, s1, sigma * dir_len, col);
-                if s.done {
+            // A lattice step whose corners leave no coverage is skipped whole (one step).
+            let bound = noise::step_bound(p, dda.cell);
+            if bound.is_empty(p) {
+                let (jump_axis, t) = dda.step_exit(&bound);
+                if t >= tb {
                     break;
                 }
+                let sj = t.max(s0);
+                dda.jump(sj, jump_axis, &bound);
+                entry = layer.face_shade[entry_face(jump_axis, dda.step[jump_axis])];
+                prev_full = false;
+                s0 = sj;
+                if dda.cell[1] < p.band_cells[0] || dda.cell[1] >= p.band_cells[1] {
+                    break;
+                }
+                continue;
+            }
+            let (exit_axis, t) = dda.exit();
+            axis = exit_axis;
+            s1 = t.clamp(s0, tb);
+            a = s0;
+            b = s1;
+            let cov = noise::coverage(p, dda.cell).coverage;
+            sigma = p.density_log2e * (cov as f32 / 4096.0);
+            if sigma > 0.0 && !prev_full {
+                shade = entry;
             }
             prev_full = sigma > 0.0;
-            if t >= tb {
+            last = t >= tb;
+        }
+        if sigma > 0.0 {
+            s.segment(a, b, sigma * dir_len, fade_col(a, b, shade));
+            if s.done {
                 break;
             }
+        }
+        if last {
+            break;
+        }
+        if rest.is_none() {
             dda.advance(axis);
             entry = layer.face_shade[entry_face(axis, dda.step[axis])];
             s0 = s1;
@@ -400,12 +524,6 @@ pub fn march(ray: &Ray, layers: &[MarchLayer], sky: [f32; 3], max_steps: u32) ->
                 break;
             }
         }
-    }
-    s.flush(f32::INFINITY);
-    MarchResult {
-        transmittance: s.out_t,
-        color: s.out_c,
-        steps: s.steps,
     }
 }
 
@@ -448,6 +566,14 @@ mod tests {
 
     fn march_layer(l: &FogLayer, mean: f32) -> MarchLayer {
         MarchLayer::new(l, [0; 3], 0, l.color, [0.0, 1.0], mean)
+    }
+
+    /// The same layer walked cell by cell (as if it were not uniform).
+    fn walked(l: &FogLayer, mean: f32) -> MarchLayer {
+        MarchLayer {
+            uniform: false,
+            ..march_layer(l, mean)
+        }
     }
 
     fn norm(v: [f32; 3]) -> [f32; 3] {
@@ -581,7 +707,7 @@ mod tests {
     #[test]
     fn the_march_stops_at_the_depth_and_exits_early() {
         let layer = slab(0, 10, [1, 1, 1], 0.5);
-        let ml = march_layer(&layer, 1.0);
+        let ml = walked(&layer, 1.0);
         let ray = |d: f32| Ray {
             eye: [0.5, 5.5, 0.5],
             dir: [0.0, 0.0, 1.0],
@@ -599,7 +725,7 @@ mod tests {
     fn the_budget_tail_is_continuous() {
         // A full slab: the mean coverage is 1, so the tail continues the same extinction.
         let layer = slab(0, 10, [1, 1, 1], 0.02);
-        let ml = march_layer(&layer, 1.0);
+        let ml = walked(&layer, 1.0);
         let ray = Ray {
             eye: [0.5, 5.5, 0.5],
             dir: [0.0, 0.0, 1.0],
@@ -607,6 +733,9 @@ mod tests {
         };
         let exact = march(&ray, &[ml], [0.0; 3], 256);
         let capped = march(&ray, &[ml], [0.0; 3], 10);
+        let whole = march(&ray, &[march_layer(&layer, 1.0)], [0.0; 3], 10);
+        assert_eq!(whole.steps, 1, "a uniform layer is one step");
+        assert!((whole.transmittance[0] - exact.transmittance[0]).abs() < 1e-4);
         assert_eq!(capped.steps, 10);
         assert!((exact.transmittance[0] - capped.transmittance[0]).abs() < 1e-4);
         assert!((exact.transmittance[0] - (-2.0f32).exp()).abs() < 1e-3);
@@ -619,7 +748,12 @@ mod tests {
         let mut layer = slab(8, 16, [1, 1, 1], 0.05);
         layer.face_shade = [1.0, 0.5, 0.8, 0.65];
         layer.color = [1.0; 3];
-        let ml = march_layer(&layer, 1.0);
+        for ml in [march_layer(&layer, 1.0), walked(&layer, 1.0)] {
+            check_shades(ml);
+        }
+    }
+
+    fn check_shades(ml: MarchLayer) {
         let shade_of = |eye: [f32; 3], dir: [f32; 3]| {
             let r = march(
                 &Ray {
@@ -688,6 +822,51 @@ mod tests {
             256,
         );
         assert!((r.color[0][0] - (1.0 - (-0.4f32).exp())).abs() < 1e-4);
+    }
+
+    /// The skip of empty lattice steps loses no fog: a sparse layer keeps exactly what the
+    /// cells of a plain walk give.
+    #[test]
+    fn skipping_empty_steps_loses_no_fog() {
+        let mut layer = slab(-16, 16, [2, 2, 2], 0.3);
+        layer.noise.dims = NoiseDims::Volume;
+        layer.noise.scale = 4;
+        layer.threshold = 0.7;
+        layer.max_distance = 200.0;
+        let ml = march_layer(&layer, 0.1);
+        let p = &ml.params;
+        let eye = [0.5, 0.5, 0.5];
+        let mut skipped = false;
+        for dir in [[0.3f32, 0.05, 1.0], [-1.0, -0.2, 0.4], [0.7, 0.3, -1.0]] {
+            let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+            let (t0, t1) = band_chord(eye[1], dir[1], p.band).expect("chord");
+            let t1 = t1.min(ml.reach() / len);
+            let mut tau = 0.0;
+            for v in walk(eye, dir, p, t0, t1, 100_000) {
+                let cov = noise::coverage(p, v.cell).coverage as f32 / 4096.0;
+                tau += p.density_log2e * cov * (v.t1 - v.t0) * len;
+                skipped |= noise::step_bound(p, v.cell).is_empty(p);
+            }
+            let r = march(
+                &Ray {
+                    eye,
+                    dir,
+                    depths: [f32::INFINITY; 4],
+                },
+                &[ml],
+                [0.0; 3],
+                256,
+            );
+            let want = (-tau).exp2();
+            assert!(
+                (r.transmittance[0] - want).abs() < 2e-4
+                    || (want < 0.003 && r.transmittance[0] < 0.003),
+                "{dir:?}: {} vs {want}",
+                r.transmittance[0]
+            );
+            assert!(r.steps < 256, "{dir:?}: {} steps", r.steps);
+        }
+        assert!(skipped, "some ray crosses an empty step");
     }
 
     #[test]

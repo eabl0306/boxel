@@ -30,11 +30,11 @@ struct FogLayer {
   face: vec4<f32>,
   // xyz: offset of the displaced origin cell inside its lattice step; w: log2 of the step.
   lattice: vec4<u32>,
-  // xyz: low words of its lattice point; w: seed mix of the first octave.
+  // xyz: low words of its lattice point.
   base_lo: vec4<u32>,
   // xyz: high words; w: seed of the first octave.
   base_hi: vec4<u32>,
-  // x: seed mix of the second octave; y: its seed; z: octaves; w: flags (LAYER_*).
+  // y: seed of the second octave; z: octaves; w: flags (LAYER_*).
   octave2: vec4<u32>,
   // x: coverage threshold (0..4096); y: coverage gain (q8).
   shape: vec4<u32>,
@@ -71,8 +71,11 @@ struct Fog {
 
 const FLAG_HALF: u32 = 1u;
 const LAYER_VOLUME: u32 = 1u;
+const LAYER_UNIFORM: u32 = 2u;
+const UNIFORM_PIECES: u32 = 8u;
 const EXIT_TAU: f32 = 8.66;
 const MIN_DIR: f32 = 1e-30;
+const HI_MIX: u32 = 0x9e3779b1u;
 const FAR: f32 = 1e30;
 const RECORDS: vec4<u32> = vec4<u32>(0u, 1u, 2u, 3u);
 
@@ -98,10 +101,6 @@ fn lowbias32(v: u32) -> u32 {
   return x;
 }
 
-fn seed_mix(seed: u32, hi: vec3<u32>) -> u32 {
-  return lowbias32(lowbias32(lowbias32(seed ^ hi.x) ^ hi.y) ^ hi.z);
-}
-
 fn smooth_w(w: i32) -> i32 {
   return (((w * w) >> 12u) * (12288 - 2 * w)) >> 12u;
 }
@@ -125,67 +124,52 @@ fn add_words(lo: vec3<u32>, hi: vec3<u32>, li: vec3<i32>) -> Words {
   return w;
 }
 
-// The 12-bit value of a lattice point: its own seed mix only when a carry changed its high words.
-fn corner_value(seed: u32, mix: u32, base_hi: vec3<u32>, lo: vec3<u32>, hi: vec3<u32>, volume: bool) -> i32 {
-  var m = mix;
-  if (any(hi != base_hi)) {
-    m = seed_mix(seed, hi);
-  }
-  var h = lowbias32(m ^ lo.x);
-  if (volume) {
-    h = lowbias32(h ^ lo.y);
-  }
-  return i32(lowbias32(h ^ lo.z) >> 20u);
-}
-
-// Corner values of a lattice step. Volume: a = z0 plane (x0y0, x1y0, x0y1, x1y1), b = z1 plane.
-// Flat: a = (x0z0, x1z0, x0z1, x1z1).
+// Corner values of a lattice step, z0 plane in a (x0y0, x1y0, x0y1, x1y1), z1 plane in b
+// (boxel_fog::noise::corner_values): each axis' words folded into one (lo ^ hi * HI_MIX), then a
+// hash chain from the octave's seed whose first links the corners share (14 hashes). Flat noise
+// has the same y words at both y corners.
 struct Corners { a: vec4<i32>, b: vec4<i32> };
 
-fn corners(w0: Words, w1: Words, base_hi: vec3<u32>, seed: u32, mix: u32, volume: bool) -> Corners {
+fn corners(w0: Words, w1: Words, seed: u32) -> Corners {
+  let v0 = w0.lo ^ (w0.hi * HI_MIX);
+  let v1 = w1.lo ^ (w1.hi * HI_MIX);
+  let hx0 = lowbias32(seed ^ v0.x);
+  let hx1 = lowbias32(seed ^ v1.x);
+  let h00 = lowbias32(hx0 ^ v0.y);
+  let h10 = lowbias32(hx1 ^ v0.y);
+  let h01 = lowbias32(hx0 ^ v1.y);
+  let h11 = lowbias32(hx1 ^ v1.y);
   var c: Corners;
-  if (volume) {
-    c.a = vec4<i32>(
-      corner_value(seed, mix, base_hi, vec3(w0.lo.x, w0.lo.y, w0.lo.z), vec3(w0.hi.x, w0.hi.y, w0.hi.z), true),
-      corner_value(seed, mix, base_hi, vec3(w1.lo.x, w0.lo.y, w0.lo.z), vec3(w1.hi.x, w0.hi.y, w0.hi.z), true),
-      corner_value(seed, mix, base_hi, vec3(w0.lo.x, w1.lo.y, w0.lo.z), vec3(w0.hi.x, w1.hi.y, w0.hi.z), true),
-      corner_value(seed, mix, base_hi, vec3(w1.lo.x, w1.lo.y, w0.lo.z), vec3(w1.hi.x, w1.hi.y, w0.hi.z), true));
-    c.b = vec4<i32>(
-      corner_value(seed, mix, base_hi, vec3(w0.lo.x, w0.lo.y, w1.lo.z), vec3(w0.hi.x, w0.hi.y, w1.hi.z), true),
-      corner_value(seed, mix, base_hi, vec3(w1.lo.x, w0.lo.y, w1.lo.z), vec3(w1.hi.x, w0.hi.y, w1.hi.z), true),
-      corner_value(seed, mix, base_hi, vec3(w0.lo.x, w1.lo.y, w1.lo.z), vec3(w0.hi.x, w1.hi.y, w1.hi.z), true),
-      corner_value(seed, mix, base_hi, vec3(w1.lo.x, w1.lo.y, w1.lo.z), vec3(w1.hi.x, w1.hi.y, w1.hi.z), true));
-  } else {
-    c.a = vec4<i32>(
-      corner_value(seed, mix, base_hi, vec3(w0.lo.x, w0.lo.y, w0.lo.z), vec3(w0.hi.x, w0.hi.y, w0.hi.z), false),
-      corner_value(seed, mix, base_hi, vec3(w1.lo.x, w0.lo.y, w0.lo.z), vec3(w1.hi.x, w0.hi.y, w0.hi.z), false),
-      corner_value(seed, mix, base_hi, vec3(w0.lo.x, w0.lo.y, w1.lo.z), vec3(w0.hi.x, w0.hi.y, w1.hi.z), false),
-      corner_value(seed, mix, base_hi, vec3(w1.lo.x, w0.lo.y, w1.lo.z), vec3(w1.hi.x, w0.hi.y, w1.hi.z), false));
-    c.b = c.a;
-  }
+  c.a = vec4<i32>(
+    i32(lowbias32(h00 ^ v0.z) >> 20u), i32(lowbias32(h10 ^ v0.z) >> 20u),
+    i32(lowbias32(h01 ^ v0.z) >> 20u), i32(lowbias32(h11 ^ v0.z) >> 20u));
+  c.b = vec4<i32>(
+    i32(lowbias32(h00 ^ v1.z) >> 20u), i32(lowbias32(h10 ^ v1.z) >> 20u),
+    i32(lowbias32(h01 ^ v1.z) >> 20u), i32(lowbias32(h11 ^ v1.z) >> 20u));
   return c;
 }
 
-fn interp(c: Corners, w: vec3<i32>, volume: bool) -> i32 {
+// Trilinear (flat noise: the y weight is 0, so the y lerps give their first corner).
+fn interp(c: Corners, w: vec3<i32>) -> i32 {
   let sx = smooth_w(w.x);
+  let sy = smooth_w(w.y);
   let sz = smooth_w(w.z);
-  if (volume) {
-    let sy = smooth_w(w.y);
-    let a00 = lerp_i(c.a.x, c.a.y, sx);
-    let a10 = lerp_i(c.a.z, c.a.w, sx);
-    let a01 = lerp_i(c.b.x, c.b.y, sx);
-    let a11 = lerp_i(c.b.z, c.b.w, sx);
-    return lerp_i(lerp_i(a00, a10, sy), lerp_i(a01, a11, sy), sz);
-  }
-  let a0 = lerp_i(c.a.x, c.a.y, sx);
-  let a1 = lerp_i(c.a.z, c.a.w, sx);
-  return lerp_i(a0, a1, sz);
+  let a00 = lerp_i(c.a.x, c.a.y, sx);
+  let a10 = lerp_i(c.a.z, c.a.w, sx);
+  let a01 = lerp_i(c.b.x, c.b.y, sx);
+  let a11 = lerp_i(c.b.z, c.b.w, sx);
+  return lerp_i(lerp_i(a00, a10, sy), lerp_i(a01, a11, sy), sz);
 }
 
-// The corners of the last lattice step of each octave a ray looked up in one layer.
+// The corners of the last lattice step of each octave a ray looked up in one layer, and the
+// first octave's step bound (boxel_fog::noise::step_bound): its cells [lo1, hi1) and the most
+// noise any of them can have.
 struct NoiseCache {
   key1: vec3<i32>,
   c1: Corners,
+  lo1: vec3<i32>,
+  hi1: vec3<i32>,
+  max1: i32,
   key2: vec3<i32>,
   c2: Corners,
 };
@@ -197,8 +181,9 @@ fn new_cache() -> NoiseCache {
   return c;
 }
 
-// The noise (0..4096) of the cell `d` cells from the origin's cell in layer `li`.
-fn cell_noise(li: u32, d: vec3<i32>, cache: ptr<function, NoiseCache>) -> i32 {
+// The cell `d` cells from the origin's cell in layer `li`: brings the first octave's corners and
+// step bound up to date and returns the cell's position in the lattice (1/4096 cells).
+fn lattice_cell(li: u32, d: vec3<i32>, cache: ptr<function, NoiseCache>) -> vec3<i32> {
   let lat = fog.layers[li].lattice;
   let l = lat.w;
   let volume = (fog.layers[li].octave2.w & LAYER_VOLUME) != 0u;
@@ -206,32 +191,82 @@ fn cell_noise(li: u32, d: vec3<i32>, cache: ptr<function, NoiseCache>) -> i32 {
   if (!volume) {
     k.y = 0;
   }
-  let num = (k << vec3<u32>(12u)) - fog.layers[li].wind.xyz;
+  let q = fog.layers[li].wind.xyz;
+  let num = (k << vec3<u32>(12u)) - q;
   let lattice1 = num >> vec3<u32>(12u + l);
-  let lo = fog.layers[li].base_lo;
-  let hi = fog.layers[li].base_hi;
   if (any(lattice1 != (*cache).key1)) {
     (*cache).key1 = lattice1;
+    let lo = fog.layers[li].base_lo;
+    let hi = fog.layers[li].base_hi;
+    // Flat noise: both y corners at lattice y 0.
+    let up1 = vec3<i32>(1, i32(volume), 1);
     let w0 = add_words(lo.xyz, hi.xyz, lattice1);
-    let w1 = add_words(lo.xyz, hi.xyz, lattice1 + vec3<i32>(1));
-    (*cache).c1 = corners(w0, w1, hi.xyz, hi.w, lo.w, volume);
+    let w1 = add_words(lo.xyz, hi.xyz, lattice1 + up1);
+    let c = corners(w0, w1, hi.w);
+    (*cache).c1 = c;
+    // Cells k of the step: from L * lattice (one more with a wind fraction), L of them.
+    (*cache).lo1 = (lattice1 << vec3<u32>(l)) + vec3<i32>(q > vec3<i32>(0)) - bitcast<vec3<i32>>(lat.xyz);
+    (*cache).hi1 = (*cache).lo1 + vec3<i32>(1 << l);
+    let m = max(max(max(c.a.x, c.a.y), max(c.a.z, c.a.w)), max(max(c.b.x, c.b.y), max(c.b.z, c.b.w)));
+    if (!volume) {
+      // Flat noise: the step has every height. Wide but far from overflowing (the skip adds and
+      // multiplies these; a ray's cells stay within 4097 of the origin's).
+      (*cache).lo1.y = -(1 << 29);
+      (*cache).hi1.y = 1 << 29;
+    }
+    (*cache).max1 = m;
   }
-  var n = interp((*cache).c1, (num >> vec3<u32>(l)) & vec3<i32>(4095), volume);
+  return num;
+}
+
+// The coverage (0..=4096) of the cell at `num` (lattice_cell) in layer `li`: its noise's, but the
+// second octave is only computed when the first one alone cannot decide (coverage grows with
+// the noise, and the second octave moves it by at most 4095 / 3).
+fn cell_coverage(li: u32, num: vec3<i32>, cache: ptr<function, NoiseCache>) -> u32 {
+  let l = fog.layers[li].lattice.w;
+  let volume = (fog.layers[li].octave2.w & LAYER_VOLUME) != 0u;
+  let v1 = interp((*cache).c1, (num >> vec3<u32>(l)) & vec3<i32>(4095));
+  if (fog.layers[li].octave2.z != 2u) {
+    return coverage_of(li, v1);
+  }
+  let low = coverage_of(li, (2 * v1 * 21845) >> 16u);
+  let high = coverage_of(li, ((2 * v1 + 4095) * 21845) >> 16u);
+  if (low == high) {
+    return low;
+  }
+  return coverage_of(li, cell_noise(li, num, cache));
+}
+
+// The noise (0..4096) of the cell at `num` (lattice_cell) in layer `li`.
+fn cell_noise(li: u32, num: vec3<i32>, cache: ptr<function, NoiseCache>) -> i32 {
+  let l = fog.layers[li].lattice.w;
+  let volume = (fog.layers[li].octave2.w & LAYER_VOLUME) != 0u;
+  var n = interp((*cache).c1, (num >> vec3<u32>(l)) & vec3<i32>(4095));
   if (fog.layers[li].octave2.z == 2u) {
     let lattice2 = num >> vec3<u32>(11u + l);
     if (any(lattice2 != (*cache).key2)) {
       (*cache).key2 = lattice2;
+      let lo = fog.layers[li].base_lo;
+      let hi = fog.layers[li].base_hi;
       let lo2 = lo.xyz << vec3<u32>(1u);
       let hi2 = (hi.xyz << vec3<u32>(1u)) | (lo.xyz >> vec3<u32>(31u));
+      let up2 = vec3<i32>(1, i32(volume), 1);
       let w0 = add_words(lo2, hi2, lattice2);
-      let w1 = add_words(lo2, hi2, lattice2 + vec3<i32>(1));
-      let o2 = fog.layers[li].octave2;
-      (*cache).c2 = corners(w0, w1, hi2, o2.y, o2.x, volume);
+      let w1 = add_words(lo2, hi2, lattice2 + up2);
+      (*cache).c2 = corners(w0, w1, fog.layers[li].octave2.y);
     }
-    let v2 = interp((*cache).c2, (num >> vec3<u32>(l - 1u)) & vec3<i32>(4095), volume);
+    let v2 = interp((*cache).c2, (num >> vec3<u32>(l - 1u)) & vec3<i32>(4095));
     n = ((2 * n + v2) * 21845) >> 16u;
   }
   return n;
+}
+
+// The most noise a cell of the cached first-octave step can have (step_bound).
+fn step_max_noise(li: u32, cache: ptr<function, NoiseCache>) -> i32 {
+  if (fog.layers[li].octave2.z == 2u) {
+    return ((2 * (*cache).max1 + 4095) * 21845) >> 16u;
+  }
+  return (*cache).max1;
 }
 
 // Coverage (0..=4096) from the noise.
@@ -333,6 +368,144 @@ fn color_code(v: f32, max: f32) -> u32 {
   return u32(floor(sqrt(clamp(v, 0.0, 1.0)) * max + 0.5));
 }
 
+// One layer of a ray (boxel_fog::march's layer loop): its chord, the walk of its cells and their
+// fog. Every segment goes through one `integrate`: a cell, or a piece of the rest of the chord
+// (a layer whose every cell is full, or past the step budget), which keeps the code small.
+fn march_layer(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, up: bool, t_end: f32,
+               max_steps: u32, st: ptr<function, March>) {
+  let ch = chord(li, eye, dir, dir_len, t_end);
+  let ta = ch.x;
+  let tb = ch.y;
+  if (ta >= tb) { return; }
+  take(st, ta);
+  let safe = select(select(vec3<f32>(MIN_DIR), vec3<f32>(-MIN_DIR), dir < vec3<f32>(0.0)), dir,
+                    abs(dir) >= vec3<f32>(MIN_DIR));
+  let inv = 1.0 / safe;
+  let edge = vec3<i32>(safe > vec3<f32>(0.0));
+  let stepv = edge * 2 - 1;
+  // The walk (boxel_fog::march::Dda).
+  let grid = fog.layers[li].grid.xyz;
+  let size3 = fog.layers[li].size.xyz;
+  let band_cells = fog.layers[li].cells.xy;
+  let density = fog.layers[li].fade.z;
+  let flags = fog.layers[li].octave2.w;
+  let volume_layer = (flags & LAYER_VOLUME) != 0u;
+  var cell = vec3<i32>(floor((eye + ta * dir - grid) / size3));
+  cell.y = clamp(cell.y, band_cells.x, band_cells.y - 1);
+  var t_next = (grid + vec3<f32>(cell + edge) * size3 - eye) * inv;
+  var cache = new_cache();
+  var s0 = ta;
+  var shade = 1.0;
+  var entry = 1.0;
+  if (ta > 0.0) {
+    entry = face_shade(li, 1u, select(-1, 1, up));
+  }
+  var prev_full = false;
+  // The rest of the chord from `rest_from`, in UNIFORM_PIECES pieces (each faded by its own
+  // middle) of one extinction and shade.
+  var rest = false;
+  var rest_sigma = 0.0;
+  var rest_shade = 1.0;
+  var rest_from = ta;
+  var k = 0u;
+  if ((*st).steps >= max_steps) {
+    rest = true;
+    rest_sigma = fog.layers[li].band.w;
+  } else if ((flags & LAYER_UNIFORM) != 0u) {
+    // Every cell full: one body, no inner faces, one step.
+    (*st).steps += 1u;
+    rest = true;
+    rest_sigma = density;
+    rest_shade = entry;
+  }
+  var piece = (tb - ta) / f32(UNIFORM_PIECES);
+  loop {
+    if (!rest && (*st).steps >= max_steps) {
+      rest = true;
+      rest_sigma = fog.layers[li].band.w;
+      rest_shade = 1.0;
+      rest_from = s0;
+      piece = (tb - s0) / f32(UNIFORM_PIECES);
+    }
+    var a = s0;
+    var b = s0;
+    var s1 = s0;
+    var sigma = 0.0;
+    var last = false;
+    var axis = 2u;
+    if (rest) {
+      a = rest_from + f32(k) * piece;
+      k += 1u;
+      last = k == UNIFORM_PIECES;
+      b = select(a + piece, tb, last);
+      sigma = rest_sigma;
+      shade = rest_shade;
+    } else {
+      (*st).steps += 1u;
+      let num = lattice_cell(li, cell, &cache);
+      if (coverage_of(li, step_max_noise(li, &cache)) == 0u) {
+        // The whole lattice step is empty: cross it in one step (Dda::step_exit, Dda::jump).
+        let box_edge = cache.lo1 + (cache.hi1 - cache.lo1) * edge;
+        let tb3 = (grid + vec3<f32>(box_edge) * size3 - eye) * inv;
+        var jump_axis = 0u;
+        var t_box = tb3.x;
+        if (volume_layer && tb3.y < t_box) {
+          jump_axis = 1u;
+          t_box = tb3.y;
+        }
+        if (tb3.z < t_box) {
+          jump_axis = 2u;
+          t_box = tb3.z;
+        }
+        if (t_box >= tb) { break; }
+        let sj = max(t_box, s0);
+        let along = vec3<i32>(vec3<bool>(jump_axis == 0u, jump_axis == 1u, jump_axis == 2u));
+        let past = cache.hi1 * edge + (cache.lo1 - 1) * (1 - edge);
+        let inside = clamp(vec3<i32>(floor((eye + sj * dir - grid) / size3)), cache.lo1, cache.hi1 - 1);
+        cell = past * along + inside * (1 - along);
+        if (jump_axis != 1u) {
+          cell.y = clamp(cell.y, band_cells.x, band_cells.y - 1);
+        }
+        t_next = (grid + vec3<f32>(cell + edge) * size3 - eye) * inv;
+        entry = face_shade(li, jump_axis, stepv[jump_axis]);
+        prev_full = false;
+        s0 = sj;
+        if (cell.y < band_cells.x || cell.y >= band_cells.y) { break; }
+        continue;
+      }
+      var t_exit = t_next.z;
+      if (t_next.x <= t_next.y && t_next.x <= t_next.z) {
+        axis = 0u;
+        t_exit = t_next.x;
+      } else if (t_next.y <= t_next.z) {
+        axis = 1u;
+        t_exit = t_next.y;
+      }
+      s1 = clamp(t_exit, s0, tb);
+      b = s1;
+      sigma = density * (f32(cell_coverage(li, num, &cache)) / 4096.0);
+      if (sigma > 0.0 && !prev_full) {
+        shade = entry;
+      }
+      prev_full = sigma > 0.0;
+      last = t_exit >= tb;
+    }
+    if (sigma > 0.0) {
+      integrate(st, a, b, sigma * dir_len, segment_color(li, a, b, shade, dir_len));
+      if ((*st).done) { break; }
+    }
+    if (last) { break; }
+    if (!rest) {
+      let along = vec3<bool>(axis == 0u, axis == 1u, axis == 2u);
+      cell += stepv * vec3<i32>(along);
+      t_next = select(t_next, (grid + vec3<f32>(cell + edge) * size3 - eye) * inv, along);
+      entry = face_shade(li, axis, stepv[axis]);
+      s0 = s1;
+      if (cell.y < band_cells.x || cell.y >= band_cells.y) { break; }
+    }
+  }
+}
+
 @fragment
 fn fs_fog_march(@builtin(position) frag: vec4<f32>) -> @location(0) vec2<u32> {
   let texel = vec2<i32>(frag.xy);
@@ -387,75 +560,10 @@ fn fs_fog_march(@builtin(position) frag: vec4<f32>) -> @location(0) vec2<u32> {
   st.done = false;
   let max_steps = fog.counts.z;
   let up = dir.y > 0.0;
-  let safe = select(select(vec3<f32>(MIN_DIR), vec3<f32>(-MIN_DIR), dir < vec3<f32>(0.0)), dir,
-                    abs(dir) >= vec3<f32>(MIN_DIR));
-  let inv = 1.0 / safe;
-  let edge = vec3<i32>(safe > vec3<f32>(0.0));
-  let stepv = edge * 2 - 1;
-
+  // Front to back: the bands are disjoint, so upwards for a rising ray, downwards otherwise.
   for (var n = 0u; n < count; n++) {
-    if (st.done) { break; }
-    let li = select(count - 1u - n, n, up);
-    let ch = chord(li, eye, dir, dir_len, t.w);
-    let ta = ch.x;
-    let tb = ch.y;
-    if (ta >= tb) { continue; }
-    take(&st, ta);
-    let sigma_mean = fog.layers[li].band.w * dir_len;
-    if (st.steps >= max_steps) {
-      integrate(&st, ta, tb, sigma_mean, segment_color(li, ta, tb, 1.0, dir_len));
-      continue;
-    }
-    // The walk (boxel_fog::march::Dda).
-    let grid = fog.layers[li].grid.xyz;
-    let size3 = fog.layers[li].size.xyz;
-    let band_cells = fog.layers[li].cells.xy;
-    let p0 = eye + ta * dir;
-    var cell = vec3<i32>(floor((p0 - grid) / size3));
-    cell.y = clamp(cell.y, band_cells.x, band_cells.y - 1);
-    var t_next = (grid + vec3<f32>(cell + edge) * size3 - eye) * inv;
-    let density = fog.layers[li].fade.z;
-    var cache = new_cache();
-    var s0 = ta;
-    var shade = 1.0;
-    var entry = 1.0;
-    if (ta > 0.0) {
-      entry = face_shade(li, 1u, select(-1, 1, up));
-    }
-    var prev_full = false;
-    loop {
-      if (st.steps >= max_steps) {
-        integrate(&st, s0, tb, sigma_mean, segment_color(li, s0, tb, 1.0, dir_len));
-        break;
-      }
-      st.steps += 1u;
-      var axis = 2u;
-      var t_exit = t_next.z;
-      if (t_next.x <= t_next.y && t_next.x <= t_next.z) {
-        axis = 0u;
-        t_exit = t_next.x;
-      } else if (t_next.y <= t_next.z) {
-        axis = 1u;
-        t_exit = t_next.y;
-      }
-      let s1 = clamp(t_exit, s0, tb);
-      let cov = coverage_of(li, cell_noise(li, cell, &cache));
-      let sigma = density * (f32(cov) / 4096.0);
-      if (sigma > 0.0) {
-        if (!prev_full) {
-          shade = entry;
-        }
-        integrate(&st, s0, s1, sigma * dir_len, segment_color(li, s0, s1, shade, dir_len));
-        if (st.done) { break; }
-      }
-      prev_full = sigma > 0.0;
-      if (t_exit >= tb) { break; }
-      let along = vec3<bool>(axis == 0u, axis == 1u, axis == 2u);
-      cell += stepv * vec3<i32>(along);
-      t_next = select(t_next, (grid + vec3<f32>(cell + edge) * size3 - eye) * inv, along);
-      entry = face_shade(li, axis, stepv[axis]);
-      s0 = s1;
-      if (cell.y < band_cells.x || cell.y >= band_cells.y) { break; }
+    if (!st.done) {
+      march_layer(select(count - 1u - n, n, up), eye, dir, dir_len, up, t.w, max_steps, &st);
     }
   }
   take(&st, 3.0e38);
@@ -517,6 +625,6 @@ fn fs_fog_composite_full(@builtin(position) frag: vec4<f32>) -> @location(0) vec
 fn fs_fog_debug_coverage(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<u32> {
   let d = fog.debug.xyz + vec3<i32>(i32(frag.x), 0, i32(frag.y));
   var cache = new_cache();
-  let n = cell_noise(0u, d, &cache);
+  let n = cell_noise(0u, lattice_cell(0u, d, &cache), &cache);
   return vec4<u32>(coverage_of(0u, n), u32(n), 0u, 1u);
 }

@@ -56,11 +56,21 @@ pub fn valley() -> FogLayer {
     }
 }
 
-/// A blanket of 2-block cubes filling `[min_y, max_y)` (both even), seen `visibility` blocks
-/// through: every cell full, so every ray inside walks the most cells (the worst case).
+/// A blanket of 2-block cubes filling `[min_y, max_y)` (both even), seen about `visibility`
+/// blocks through where it is thickest. Every cell has some fog, of a density that varies with
+/// 3D noise, so no lattice step can be skipped and every ray inside walks the most cells: the
+/// worst case. (A blanket of equal cells would be cheap: the march takes it whole.)
 pub fn blanket(min_y: i64, max_y: i64, visibility: f32) -> FogLayer {
     FogLayer {
         cell: [2, 2, 2],
+        noise: FogNoise {
+            scale: 4,
+            octaves: 1,
+            dims: NoiseDims::Volume,
+            seed: 0xb1a2,
+        },
+        threshold: 0.0,
+        softness: 1.0,
         density: density_for_visibility(visibility),
         color: [0.9, 0.9, 0.92],
         ..FogLayer::new(min_y, max_y)

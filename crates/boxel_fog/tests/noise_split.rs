@@ -1,7 +1,7 @@
 //! The GPU's split of the noise ([`LayerParams`] plus a small cell offset, with carries into
 //! the high words) against the direct `i128` computation from the absolute cell, far from the
 //! origin too (ADR 0014): the same coverage, bit for bit.
-use boxel_fog::noise::{coverage, coverage_direct};
+use boxel_fog::noise::{coverage, coverage_direct, step_bound};
 use boxel_fog::{FogLayer, LayerParams, NoiseDims};
 use boxel_voxel::MAX_BLOCK_COORD;
 use proptest::prelude::*;
@@ -110,5 +110,48 @@ fn flat_noise_ignores_the_height() {
             coverage_direct(&layer, [3, y, -9], 77),
             coverage_direct(&layer, [3, 0, -9], 77)
         );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// A lattice step the bound calls empty has no cell with coverage, and every cell in it
+    /// shares the bound (the march skips it whole).
+    #[test]
+    fn the_step_bound_is_conservative(
+        ox in origin_strategy(), oz in origin_strategy(),
+        l in 1u32..=3, two in any::<bool>(), volume in any::<bool>(), seed in any::<u64>(),
+        threshold in 0.3f32..0.9, softness in 0.0f32..0.5,
+        tick in 0u64..100_000,
+        d in prop::array::uniform3(-300i32..=300),
+    ) {
+        let dims = if volume { NoiseDims::Volume } else { NoiseDims::Flat };
+        let mut layer = layer([2, 2, 2], 1 << l, if two { 2 } else { 1 }, dims, seed);
+        layer.threshold = threshold;
+        layer.softness = softness;
+        let p = LayerParams::new(&layer, [ox, 64, oz], tick);
+        let bound = step_bound(&p, d);
+        for (a, &da) in d.iter().enumerate() {
+            if a == 1 && !volume {
+                prop_assert_eq!((bound.lo[a], bound.hi[a]), (i32::MIN, i32::MAX));
+            } else {
+                prop_assert!(bound.lo[a] <= da && da < bound.hi[a]);
+                prop_assert_eq!(bound.hi[a] - bound.lo[a], 1 << l);
+            }
+        }
+        let ys = if volume { bound.lo[1]..bound.hi[1] } else { d[1]..d[1] + 1 };
+        for x in bound.lo[0]..bound.hi[0] {
+            for y in ys.clone() {
+                for z in bound.lo[2]..bound.hi[2] {
+                    let c = coverage(&p, [x, y, z]);
+                    prop_assert!(c.noise <= bound.max_noise, "{:?} over {}", c, bound.max_noise);
+                    if bound.is_empty(&p) {
+                        prop_assert_eq!(c.coverage, 0);
+                    }
+                    prop_assert_eq!(step_bound(&p, [x, y, z]), bound);
+                }
+            }
+        }
     }
 }

@@ -2,9 +2,7 @@
 //! relative to the render origin, computed here in `i64` and `i128` (ADR 0014).
 
 use crate::config::{FogLayer, NoiseDims};
-use crate::noise::{
-    self, COVERAGE_ONE, gain_units, seed_mix, seed32, seed32_octave2, threshold_units,
-};
+use crate::noise::{self, COVERAGE_ONE, gain_units, seed32, seed32_octave2, threshold_units};
 
 /// Fixed steps a second of the fog clock (the app's fixed rate): the wind moves once a tick.
 pub const TICKS_PER_SECOND: u32 = 64;
@@ -57,12 +55,8 @@ pub struct LayerParams {
     pub hi: [u32; 3],
     /// Seed of the first octave.
     pub seed32: u32,
-    /// Seed mix of the first octave for `hi`.
-    pub seed_mix: u32,
     /// Seed of the second octave.
     pub seed32_2: u32,
-    /// Seed mix of the second octave for the high words of `2 * (lo, hi)`.
-    pub seed_mix2: u32,
     /// Coverage threshold, `0..=4096`.
     pub threshold: u32,
     /// Coverage gain (`q8`).
@@ -102,7 +96,6 @@ impl LayerParams {
         }
         let s1 = seed32(layer.noise.seed);
         let s2 = seed32_octave2(s1);
-        let hi2 = std::array::from_fn(|a| noise::double_words(lo[a], hi[a]).1);
         let band_rel = |y: i64| {
             (i128::from(y) - i128::from(render_origin[1]))
                 .clamp(-i128::from(BAND_LIMIT), i128::from(BAND_LIMIT)) as f32
@@ -124,9 +117,7 @@ impl LayerParams {
             lo,
             hi,
             seed32: s1,
-            seed_mix: seed_mix(s1, hi),
             seed32_2: s2,
-            seed_mix2: seed_mix(s2, hi2),
             threshold: threshold_units(layer.threshold),
             gain: gain_units(layer.softness),
             band: [band_rel(layer.min_y), band_rel(layer.max_y)],

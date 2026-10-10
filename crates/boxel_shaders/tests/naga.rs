@@ -543,6 +543,12 @@ fn fog_constants_match_boxel_fog() {
     let (module, _) = load(ShaderModuleId::Fog);
     assert_eq!(const_u32(&module, "FLAG_HALF"), fog::FLAG_HALF);
     assert_eq!(const_u32(&module, "LAYER_VOLUME"), fog::LAYER_VOLUME);
+    assert_eq!(const_u32(&module, "LAYER_UNIFORM"), fog::LAYER_UNIFORM);
+    assert_eq!(const_u32(&module, "HI_MIX"), boxel_fog::noise::HI_MIX);
+    assert_eq!(
+        const_u32(&module, "UNIFORM_PIECES"),
+        boxel_fog::march::UNIFORM_PIECES
+    );
     assert_eq!(
         const_f32(&module, "EXIT_TAU"),
         boxel_fog::march::EXIT_TAU_LOG2

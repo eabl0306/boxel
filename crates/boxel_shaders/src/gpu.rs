@@ -106,12 +106,12 @@ pub struct FogLayerGpu {
     pub face: [f32; 4],
     /// xyz = offset of the displaced origin cell in its lattice step; w = log2 of the step.
     pub lattice: [u32; 4],
-    /// xyz = low words of its lattice point; w = seed mix of the first octave.
+    /// xyz = low words of its lattice point, w = 0.
     pub base_lo: [u32; 4],
     /// xyz = high words; w = seed of the first octave.
     pub base_hi: [u32; 4],
-    /// x = seed mix of the second octave, y = its seed, z = octaves, w = flags
-    /// ([`fog::LAYER_VOLUME`]).
+    /// x = 0, y = seed of the second octave, z = octaves, w = flags
+    /// ([`fog::LAYER_VOLUME`], [`fog::LAYER_UNIFORM`]).
     pub octave2: [u32; 4],
     /// x = coverage threshold (0..=4096), y = coverage gain (q8), zw = 0.
     pub shape: [u32; 4],
@@ -127,6 +127,8 @@ pub mod fog {
     pub const FLAG_HALF: u32 = 1;
     /// [`super::FogLayerGpu::octave2`] w: 3D noise.
     pub const LAYER_VOLUME: u32 = 1;
+    /// [`super::FogLayerGpu::octave2`] w: every cell is full (the march takes a chord whole).
+    pub const LAYER_UNIFORM: u32 = 2;
 }
 
 /// Storage `ChunkGpu` (64 bytes) in the chunk table, one per render chunk slot.
