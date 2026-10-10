@@ -9,8 +9,9 @@ mechanisms, and the blocks, textures, rules and generators of the example game l
    use the demo see one copy of each crate type).
 2. Scan: every `.rs` file under `crates/*/src` (but `boxel_demo` and `boxel_facade_check`) and
    under `src/`. Files named `tests.rs`, paths with a `tests` or `benches` component and the item
-   after `#[cfg(test)]` are skipped. A small lexer tells code from comments, strings, chars and
-   lifetimes, and matches braces.
+   after `#[cfg(test)]` are skipped; an inner `#![cfg(test)]` skips its file when it opens the
+   file, and else only the `{...}` block it sits in. A small lexer tells code from comments,
+   strings, chars and lifetimes, and matches braces.
 3. Rules:
    - `string`: a string literal holding `boxel:` followed by `[a-z0-9_{]` (which also catches
      `format!("boxel:{name}")`), unless that name is reserved (`RESERVED`).
@@ -293,11 +294,49 @@ def _is_cfg_test(attr):
     return False
 
 
+def _enclosing_block(code, k):
+    """The indexes of the `{` that encloses `code[k]` and of its matching `}`, or None at the
+    top level (or when the braces do not match)."""
+    depth, j = 0, k - 1
+    while j >= 0:
+        t = code[j]
+        if t.kind == 'punct' and t.text == '}':
+            depth += 1
+        elif t.kind == 'punct' and t.text == '{':
+            if depth == 0:
+                break
+            depth -= 1
+        j -= 1
+    else:
+        return None
+    opening = j
+    while j < len(code):
+        t = code[j]
+        if t.kind == 'punct' and t.text == '{':
+            depth += 1
+        elif t.kind == 'punct' and t.text == '}':
+            depth -= 1
+            if depth == 0:
+                return opening, j
+        j += 1
+    return None
+
+
 def test_only(tokens):
     """The indexes (into `tokens`) of the tokens inside `#[cfg(test)]` items, the attribute
-    included; all of them when the file starts with `#![cfg(test)]`."""
+    included. An inner `#![cfg(test)]` covers the whole file only among the inner attributes
+    that open it; further down it covers only the `{...}` block it sits in (a module or a
+    function body), so an empty `mod x { #![cfg(test)] }` cannot hide the code around it."""
     code = [k for k, t in enumerate(tokens) if t.kind != 'comment']
     ct = [tokens[k] for k in code]
+    # The end of the inner attributes that open the file.
+    head = 0
+    while head + 1 < len(ct) and ct[head].kind == 'punct' and ct[head].text == '#' \
+            and ct[head + 1].text == '!':
+        end = _attribute_end(ct, head)
+        if end is None:
+            break
+        head = end
     skipped = set()
     pos = 0
     while pos < len(ct):
@@ -314,7 +353,17 @@ def test_only(tokens):
             pos = end
             continue
         if inner:
-            return set(range(len(tokens)))
+            if pos < head:
+                return set(range(len(tokens)))
+            block = _enclosing_block(ct, pos)
+            if block is None:
+                # Not at the top and in no block: rustc rejects it, so it hides nothing.
+                pos = end
+                continue
+            first, last = block
+            skipped.update(range(code[first], code[last] + 1))
+            pos = last + 1
+            continue
         # Further attributes of the same item.
         item = end
         while item < len(ct) and ct[item].text == '#':

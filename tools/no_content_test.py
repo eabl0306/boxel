@@ -156,6 +156,27 @@ class Rules(unittest.TestCase):
 
     def test_an_inner_cfg_test_skips_the_file(self):
         self.assertEqual(found('#![cfg(test)]\nfn f() -> &str { "boxel:stone" }'), [])
+        self.assertEqual(found('//! Docs.\n#![allow(dead_code)]\n#![cfg(test)]\n'
+                               'fn f() -> &str { "boxel:stone" }'), [])
+
+    def test_an_inner_cfg_test_further_down_skips_only_its_block(self):
+        # A module or function body that turns itself off hides its own braces only, not the
+        # engine code around it.
+        src = ('fn engine() -> &str { "boxel:stone" }\n'
+               'mod probe {\n'
+               '    #![cfg(test)]\n'
+               '    const X: &str = "boxel:dirt";\n'
+               '    mod inner { const Y: &str = "}"; }\n'
+               '}\n'
+               'fn body() { #![cfg(test)] let _ = "boxel:sand"; }\n'
+               'fn after() -> FluidKind { todo!() }\n')
+        self.assertEqual(nc.scan_source(src), [
+            (1, 'string', 'boxel:stone'),
+            (8, 'ident', 'FluidKind'),
+        ])
+        # Not at the top of the file and in no block (rustc rejects it): it hides nothing.
+        self.assertEqual(found('fn f() -> &str { "boxel:stone" }\n#![cfg(test)]\n'),
+                         [('string', 'boxel:stone')])
 
     def test_chars_and_lifetimes(self):
         src = ("fn f<'a>(x: &'a str) -> char { let q = '\"'; let b = b'\\''; '\\u{7d}' }\n"
