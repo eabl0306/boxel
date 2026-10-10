@@ -24,6 +24,7 @@ use crate::BlockEdit;
 use boxel_ecs::prelude::Resource;
 use boxel_voxel::rules::{NeighborRule, UseRule, rule_for_model, use_rule_for_model};
 use boxel_voxel::{BlockId, BlockPos, BlockRegistry, BlockState, Face, Facing};
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Most blocks [`NeighborRules::expand`] looks at again around the blocks its rules changed, per
@@ -81,23 +82,37 @@ impl NeighborRules {
         if edits.is_empty() || self.is_empty() {
             return;
         }
-        let mut overlay: HashMap<BlockPos, BlockState> = HashMap::with_capacity(edits.len());
+        let mut overlay: FastMap<BlockPos, BlockState> = fast_map(edits.len());
         for e in edits.iter() {
             overlay.insert(e.pos, e.state);
         }
-        // Cells waiting for a look, each at most once at a time.
-        let mut queued: HashSet<BlockPos> = HashSet::new();
-        let mut queue = VecDeque::new();
+        // The first ring, in the order first met, and each cell's place in it.
+        let mut ring: FastMap<BlockPos, usize> = fast_map(edits.len() * 7);
+        let mut cells = Vec::with_capacity(edits.len() * 7);
         for e in edits.iter() {
             for p in std::iter::once(e.pos).chain(Face::ALL.map(|f| neighbor(e.pos, f))) {
-                if queued.insert(p) {
-                    queue.push_back(p);
+                if let Entry::Vacant(slot) = ring.entry(p) {
+                    slot.insert(cells.len());
+                    cells.push(p);
                 }
             }
         }
+        // The second looks, after the ring: the neighbors of the blocks a rule changed that the
+        // ring already went past, each waiting at most once at a time.
+        let mut again = VecDeque::new();
+        let mut waiting: FastSet<BlockPos> = FastSet::default();
         let mut updates = 0;
-        while let Some(p) = queue.pop_front() {
-            queued.remove(&p);
+        let mut next = 0;
+        loop {
+            let p = if let Some(&p) = cells.get(next) {
+                next += 1;
+                p
+            } else if let Some(p) = again.pop_front() {
+                waiting.remove(&p);
+                p
+            } else {
+                break;
+            };
             let at = |q: BlockPos| overlay.get(&q).copied().or_else(|| read(q));
             let Some(state) = at(p) else {
                 continue;
@@ -119,19 +134,30 @@ impl NeighborRules {
             }
             edits.push(BlockEdit { pos: p, state: new });
             overlay.insert(p, new);
-            // Its neighbors may follow it (a wall under a wall), once the first ring is done.
+            // Its neighbors may follow it (a wall under a wall): those with a rule that the ring
+            // went past get a second look.
             for (f, &n) in Face::ALL.iter().zip(&around) {
+                if updates >= MAX_RULE_UPDATES || self.rule(registry, n).is_none() {
+                    continue;
+                }
                 let q = neighbor(p, *f);
-                if updates < MAX_RULE_UPDATES
-                    && self.rule(registry, n).is_some()
-                    && queued.insert(q)
-                {
+                let ahead = ring.get(&q).is_some_and(|&i| i >= next);
+                if !ahead && waiting.insert(q) {
                     updates += 1;
-                    queue.push_back(q);
+                    again.push_back(q);
                 }
             }
         }
     }
+}
+
+/// A hash map with the fast fixed hasher of the world's maps (`foldhash`).
+type FastMap<K, V> = HashMap<K, V, foldhash::fast::FixedState>;
+/// A hash set with the same hasher.
+type FastSet<K> = HashSet<K, foldhash::fast::FixedState>;
+
+fn fast_map<K, V>(capacity: usize) -> FastMap<K, V> {
+    HashMap::with_capacity_and_hasher(capacity, foldhash::fast::FixedState::default())
 }
 
 /// What using each block of a registry does (ADR 0027, indexed by [`BlockId`]): the
