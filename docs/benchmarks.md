@@ -43,8 +43,9 @@ Corre una vez 10 s por lado cada caso y solo falla con un empeoramiento grosero:
 Si un caso falla, repite el par una vez y solo cuenta si vuelve a fallar. Con tope 144 la base
 siempre tiene unos 1500 frames de más de 6.94 ms (ver
 [rendimiento/ritmo-2026-10.md](rendimiento/ritmo-2026-10.md)), así que ahí el smoke solo mira fps
-y p99. Los topes van de 50 para arriba: más bajos, no se distinguen del límite de 30 fps del
-compositor.
+y p99. En la RTX con tope, el p99 solo cuenta si las dos corridas cayeron en el mismo modo de
+refrescos salteados (ver el nivel 2). Los topes van de 50 para arriba: más bajos, no se distinguen
+del límite de 30 fps del compositor.
 
 Al final imprime una tabla para pegar en la PR, solo con números de corridas que cuentan. Sale
 con:
@@ -84,6 +85,18 @@ corrida siguió con ruido), el informe dice "Ronda incompleta" y la base no se m
 `--accept-partial` la acepta igual. Sale con 0 si todo está bien, 1 si algo empeoró o el binario
 nuevo falló o perdió un escenario, y 2 si la ronda quedó incompleta. Fuera de `main` se niega;
 `--off-main` mide igual, deja el informe en `bench-results/` y no toca el tag ni la base.
+
+Con tope, cada corrida de la RTX cae al azar en un modo con muchos refrescos salteados (unos 5
+por segundo) o en uno con pocos (cerca de 1), por el estado de energía de la NVIDIA (issue #5).
+Una corrida está en el modo alto si saltea refrescos en más del 1 % de sus frames. Ahí su p99 es
+un frame doble (13.9 ms) y sus frames lentos siguen a los salteos. Por eso, en esos casos, p99 y
+frames lentos se comparan solo entre corridas del mismo modo, en un modo con 2 corridas o más de
+cada lado. El informe muestra cuántas cayeron en el modo alto y no marca eso: con 3 corridas por
+lado, ni 0 de 3 contra 3 de 3 se distingue del azar (p = 0.10). Antes de esta regla, el bosque con
+tope se marcó por error justo por eso en la ronda 1
+([rendimiento/control-2026-10-09.md](rendimiento/control-2026-10-09.md)). Si ningún modo junta 2 y
+2, las notas dicen que el caso quedó sin juzgar en esas dos métricas. La tabla sigue con la media
+de todas las corridas, así que un salto se ve aunque no se marque.
 
 Si algo empeoró, el informe trae el comando de `perf-bisect` que busca el merge. Prueba por
 mitades los commits de primer padre (los merges) entre las dos refs. Por defecto usa el smoke del
