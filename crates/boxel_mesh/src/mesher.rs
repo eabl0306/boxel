@@ -178,13 +178,13 @@ impl BoxShape {
 }
 
 impl BoxModels {
-    /// The shape of `model` (made of boxes), interning its boxes and itself.
-    fn intern(&mut self, model: BlockModel) -> u16 {
+    /// The shape of `model`, made of `model_boxes`, interning its boxes and itself.
+    fn intern(&mut self, model: BlockModel, model_boxes: &[ModelBox]) -> u16 {
         if let Some(&id) = self.shape_ids.get(&model) {
             return id;
         }
         let (boxes, ids) = (&mut self.boxes, &mut self.box_ids);
-        let shape = BoxShape::new(&model.boxes(), |b| {
+        let shape = BoxShape::new(model_boxes, |b| {
             *ids.entry(b).or_insert_with(|| {
                 boxes.push(b);
                 (boxes.len() - 1) as u16
@@ -267,7 +267,7 @@ impl MaterialTable {
             table.shape[m] = registry.shape(s);
             table.layers[m] = Face::ALL.map(|f| registry.face_texture(s, f).0);
             table.emissive[m] = !registry.emission(s).is_dark();
-            table.set_model(m as u16, registry.model(s));
+            table.set_model(m as u16, registry.model(s), registry.model_boxes(s));
             // Every level of a fluid meshes as its source (level 0).
             if registry.model(s) == BlockModel::Fluid
                 && let Some(level) = registry.values(s).index(FLUID_LEVEL)
@@ -351,10 +351,12 @@ impl MaterialTable {
             .copied()
             .unwrap_or(BlockModel::CUBE)
     }
-    /// Sets the model of `material` (its class follows from its shape and model; a turned cube
-    /// gets turned textures on its side faces). Tables built with [`MaterialTable::from_parts`]
-    /// start with every material a cube.
-    pub fn set_model(&mut self, material: u16, model: BlockModel) {
+    /// Sets the model of `material` and the boxes it is drawn with (`BlockRegistry::model_boxes`;
+    /// none for cubes, crosses and fluids). Its class follows from its shape and model; a turned
+    /// cube gets turned textures on its side faces. Materials with equal models share the boxes
+    /// of the first one set. Tables built with [`MaterialTable::from_parts`] start with every
+    /// material a cube.
+    pub fn set_model(&mut self, material: u16, model: BlockModel, boxes: &[ModelBox]) {
         let i = material as usize;
         if i >= self.class.len() {
             return;
@@ -367,9 +369,9 @@ impl MaterialTable {
         };
         self.codes[i] = cube_codes(model);
         self.has_fluid |= model == BlockModel::Fluid;
-        let made_of_boxes = self.shape[i] != RenderShape::None && !model.boxes().is_empty();
+        let made_of_boxes = self.shape[i] != RenderShape::None && !boxes.is_empty();
         self.box_models.shape_of[i] = if made_of_boxes {
-            self.box_models.intern(model)
+            self.box_models.intern(model, boxes)
         } else {
             NO_SHAPE
         };

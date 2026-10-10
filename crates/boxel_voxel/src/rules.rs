@@ -104,7 +104,7 @@ pub fn rule_for_model(
         BlockModel::Cube { .. } | BlockModel::Slab(_) | BlockModel::Cross | BlockModel::Fluid => {
             None
         }
-        _ => Some(|registry, state, neighbors| {
+        BlockModel::Boxes(_) => Some(|registry, state, neighbors| {
             registry
                 .block(state)
                 .and_then(|b| registry.neighbor_rule(b))

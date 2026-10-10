@@ -9,8 +9,8 @@
 //!   Each state has an RGB emission and a light opacity (ADR 0015).
 //! - [`state`]: block state properties (ADR 0019): `boxel:log[axis=x]`, one dense id per
 //!   combination of values, contiguous per block.
-//! - [`shapes`]: the boxes of the models made of boxes (slabs, stairs, fences, torches; ADR
-//!   0020; walls and fence gates, ADR 0027), and [`rules`]: the neighbor and use rules a block
+//! - [`shapes`]: the boxes of the models made of boxes (ADR 0020: slabs, and the [`BoxModel`]s a
+//!   game registers, `BlockModel::Boxes`), and [`rules`]: the neighbor and use rules a block
 //!   registers (the states that follow their neighbors, what using a block does) and the face
 //!   covers they are written with.
 //! - [`faces`]: which faces of a chunk see each other through non-occluding voxels
@@ -47,11 +47,11 @@ pub use light::{LightTables, LightValue, MAX_LIGHT, OPAQUE_OPACITY};
 pub use masks::{LightMasks, MaskRows, MaskWords, OwnedLightMasks};
 pub use registry::{
     Axis, BlockCollision, BlockDef, BlockId, BlockModel, BlockRegistry, BlockRegistryBuilder,
-    BlockState, CollisionBox, FLUID_LEVEL, FaceTextures, MAX_COLLISION_HEIGHT, MAX_STATES,
-    RegistryError, RenderShape, SlabHalf, StateFlags, TextureId, TexturePattern, TextureSpec,
-    WATERLOGGED,
+    BlockState, BoxModel, BoxModelId, CollisionBox, FLUID_LEVEL, FaceTextures,
+    MAX_COLLISION_HEIGHT, MAX_STATES, RegistryError, RenderShape, SlabHalf, StateFlags, TextureId,
+    TexturePattern, TextureSpec, WATERLOGGED,
 };
-pub use shapes::{Facing, FenceSides, MAX_MODEL_BOXES, ModelBox, StairShape, WallSide, WallSides};
+pub use shapes::{Facing, MAX_MODEL_BOXES, ModelBox};
 pub use state::{Property, StateName, StateParseError, StateValues};
 pub use storage::{Occupancy, Paletted};
 

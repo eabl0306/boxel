@@ -147,7 +147,7 @@ impl CollisionTable {
                 Pushed::Empty
             } else {
                 bits |= OUTLINE;
-                table.push_shape(&registry.model(state).outline())
+                table.push_shape(registry.outline(state))
             };
             if let Pushed::Boxes(_) = outline {
                 bits |= OUTLINE_BOXES;
