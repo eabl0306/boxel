@@ -138,11 +138,13 @@ pub(crate) const fn opposite_neighbor(i: usize) -> usize {
 /// What a job sends back (exactly one per spawned job; see `jobs::JobExecutor`).
 #[derive(Debug)]
 pub(crate) enum JobMessage {
-    /// Generation finished, with the chunk's face info (cave culling).
+    /// Generation finished, with the chunk's face info (cave culling) and its saved entity
+    /// records (with persistence; usually none).
     Generated {
         id: ChunkId,
         data: ChunkData,
         faces: ChunkFaceInfo,
+        entities: Vec<(u64, Vec<u8>)>,
     },
     /// Meshing finished (`mesh` may be empty).
     Meshed {
@@ -1124,9 +1126,10 @@ impl WorldJobs {
     }
 
     /// New slot at `pos`: data `Queued` with a generation job, or `Ready` air at once if the
-    /// generator declares the layer all air and no copy of the chunk is saved (then its 26
-    /// neighbors are looked up once, for its own bits and for theirs). A `Queued` slot's own
-    /// neighbor bits are not looked up: they are computed when its data arrives.
+    /// generator declares the layer all air and neither a copy of the chunk nor saved entities
+    /// of it are saved (then its 26 neighbors are looked up once, for its own bits and for
+    /// theirs). A `Queued` slot's own neighbor bits are not looked up: they are computed when its
+    /// data arrives.
     pub(crate) fn create_slot(
         &mut self,
         cx: &mut Ctx<'_>,
@@ -1135,10 +1138,14 @@ impl WorldJobs {
         interest: Interest,
     ) -> ChunkId {
         let air = cx.known_air(pos.y)
-            && !self
-                .persist
-                .as_ref()
-                .is_some_and(|p| p.is_saved_at(settings.dimension, pos));
+            && !self.persist.as_ref().is_some_and(|p| {
+                p.is_saved_at(settings.dimension, pos)
+                    || p.has_entities(ChunkKey {
+                        dim: settings.dimension,
+                        lod: 0,
+                        pos,
+                    })
+            });
         let near = air.then(|| neighbor_ids(cx.map, pos));
         let column = cx.sky.attach(pos, settings.dimension);
         let slot = ChunkSlot::new(
@@ -1231,12 +1238,14 @@ impl WorldJobs {
         };
         slot.cancel.store(true, Ordering::Relaxed);
         self.failure_logged.remove(&id);
-        if let Some(p) = &mut self.persist
-            && slot.dirty()
-        {
-            p.dirty.remove(&id);
-            if let DataState::Ready(data) = slot.data() {
-                p.stage(slot.key(), Arc::clone(data));
+        if let Some(p) = &mut self.persist {
+            // The saved entities left in it are put away by the next entity step.
+            p.entities.unloaded = true;
+            if slot.dirty() {
+                p.dirty.remove(&id);
+                if let DataState::Ready(data) = slot.data() {
+                    p.stage(slot.key(), Arc::clone(data));
+                }
             }
         }
         if self.published.remove(&id).is_some() {
@@ -2145,6 +2154,13 @@ impl WorldJobs {
             .as_ref()
             .filter(|p| p.is_saved(key))
             .map(|p| p.store.clone());
+        // Its saved entities are read with it, so they come back with the chunk. A store that
+        // fails leaves them saved for the next load.
+        let entity_store = self
+            .persist
+            .as_ref()
+            .filter(|p| p.has_entities(key))
+            .map(|p| p.store.clone());
         spawn_job(
             self.executor.as_ref(),
             &self.tx,
@@ -2164,7 +2180,15 @@ impl WorldJobs {
                     }
                 };
                 let faces = ChunkFaceInfo::compute(&data, &registry);
-                JobMessage::Generated { id, data, faces }
+                let entities = entity_store
+                    .and_then(|s| s.load_entities(key).ok())
+                    .unwrap_or_default();
+                JobMessage::Generated {
+                    id,
+                    data,
+                    faces,
+                    entities,
+                }
             },
         );
         true
@@ -2630,9 +2654,14 @@ impl WorldJobs {
             self.scheduler.complete();
             drained += 1;
             match message {
-                JobMessage::Generated { id, data, faces } => {
+                JobMessage::Generated {
+                    id,
+                    data,
+                    faces,
+                    entities,
+                } => {
                     self.auto_cap.observe_job(busy);
-                    self.on_generated(cx, id, data, faces);
+                    self.on_generated(cx, id, data, faces, entities);
                 }
                 JobMessage::Meshed {
                     id,
@@ -2735,12 +2764,19 @@ impl WorldJobs {
         id: ChunkId,
         data: ChunkData,
         faces: ChunkFaceInfo,
+        entities: Vec<(u64, Vec<u8>)>,
     ) {
         let Some(slot) = cx.map.slots.get(id) else {
             return;
         };
         if !matches!(slot.data(), DataState::Generating) || slot.cancel.load(Ordering::Relaxed) {
             return;
+        }
+        if !entities.is_empty()
+            && let Some(p) = &mut self.persist
+        {
+            // The entity step brings them back before the next fixed step.
+            p.entities.arrived.push((slot.key(), entities));
         }
         let data = self.snapshot(data);
         cx.map.set_data(id, DataState::Ready(data));

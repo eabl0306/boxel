@@ -9,6 +9,9 @@
 //! - [`PersistPlugin`]: saves the chunks with edits as they unload, with the autosave and on
 //!   exit, loads saved chunks instead of generating them, and keeps the pending block ticks and
 //!   the world clock. Chunks nobody edited are never saved: they come from the seed again.
+//! - [`Saved`] entities: what the registered [`EntityCodec`]s write of them (physics saves its
+//!   bodies) is saved with the chunk they are in, when it unloads (they are despawned then),
+//!   with the autosave and on exit, and they come back when the chunk loads.
 //!
 //! ```no_run
 //! use boxel_app::App;
@@ -31,6 +34,7 @@
 //! .add_plugins(PersistPlugin::new(store));
 //! ```
 mod backend;
+mod entities;
 pub mod format;
 mod plugin;
 mod saver;
@@ -41,7 +45,8 @@ mod tests;
 pub use backend::{
     ChunkStore, MemoryStore, NullChunkStore, REDB_CACHE_BYTES, RedbStore, SaveBatch,
 };
-pub use format::{FORMAT_VERSION, FormatError, IdMap};
+pub use entities::{EntityCodec, EntityCodecs, Saved, SavedId, SavedIds, add_entity_codec};
+pub use format::{EntityPart, FORMAT_VERSION, FormatError, IdMap};
 pub use plugin::{PersistPlugin, PersistSettings};
 pub(crate) use saver::Persist;
 pub use store::{PersistError, PersistStats, WORLD_FILE, WorldStore};

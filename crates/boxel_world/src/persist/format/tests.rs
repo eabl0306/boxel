@@ -84,7 +84,84 @@ proptest! {
         let _ = decode_names(&bytes);
         let _ = decode_ticks(&bytes);
         let _ = decode_clock(&bytes);
+        let _ = decode_entity(&bytes);
     }
+
+    /// Entity keys: a chunk's entities are one range, in id order, between the chunk's
+    /// neighbors in key order.
+    #[test]
+    fn entity_keys_sort_by_chunk_then_id(
+        a in (any::<i64>(), any::<i64>(), any::<i64>(), any::<u64>()),
+        b in (any::<i64>(), any::<i64>(), any::<i64>(), any::<u64>()),
+    ) {
+        let (ka, kb) = (key(0, a.0, a.1, a.2), key(0, b.0, b.1, b.2));
+        prop_assert_eq!(decode_entity_key(&encode_entity_key(ka, a.3)), (ka, a.3));
+        prop_assert_eq!(
+            encode_entity_key(ka, a.3).cmp(&encode_entity_key(kb, b.3)),
+            encode_key(ka).cmp(&encode_key(kb)).then(a.3.cmp(&b.3))
+        );
+    }
+}
+
+#[test]
+fn entity_keys_round_trip_far_from_the_origin() {
+    for &x in &FAR {
+        for &y in &FAR {
+            for &z in &FAR {
+                for id in [1, 2, u64::from(u32::MAX), u64::MAX] {
+                    let k = key(7, x, y, z);
+                    assert_eq!(decode_entity_key(&encode_entity_key(k, id)), (k, id));
+                }
+            }
+        }
+    }
+}
+
+fn parts() -> Vec<EntityPart> {
+    vec![
+        EntityPart {
+            codec: "boxel:body".to_string(),
+            version: 1,
+            bytes: (0..=255).collect(),
+        },
+        EntityPart {
+            codec: "game:crate".to_string(),
+            version: u32::MAX,
+            bytes: Vec::new(),
+        },
+    ]
+}
+
+#[test]
+fn entity_records_round_trip() {
+    for parts in [Vec::new(), parts(), parts()[..1].to_vec()] {
+        assert_eq!(decode_entity(&encode_entity(&parts)).unwrap(), parts);
+    }
+}
+
+#[test]
+fn any_damage_to_an_entity_record_is_an_error() {
+    let good = encode_entity(&parts());
+    for i in 0..good.len() {
+        for bit in 0..8 {
+            let mut bad = good.clone();
+            bad[i] ^= 1 << bit;
+            assert!(decode_entity(&bad).is_err(), "byte {i} bit {bit}");
+        }
+    }
+    for len in 0..good.len() {
+        assert!(decode_entity(&good[..len]).is_err(), "cut at {len}");
+    }
+    // Another record version is refused as such.
+    let mut newer = good.clone();
+    newer[4] = ENTITY_VERSION + 1;
+    assert_eq!(
+        decode_entity(&newer),
+        Err(FormatError::Version {
+            found: ENTITY_VERSION + 1,
+            supported: ENTITY_VERSION
+        })
+    );
 }
 
 /// Every voxel of `data`.

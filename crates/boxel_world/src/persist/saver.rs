@@ -1,7 +1,8 @@
 //! The main thread's side of saving (ADR 0024): the index of saved chunks, the chunks waiting
 //! for a save job and the job itself. Owned by the world's job state, so the streaming code
 //! stages a chunk as it unloads it and asks the index before generating one.
-use super::store::{MetaValue, WorldStore};
+use super::entities::EntityIndex;
+use super::store::{META_ENTITIES, MetaValue, WorldStore, entities_meta};
 use crate::jobs::JobExecutor;
 use crate::{ChunkId, ChunkMap, DataState};
 use boxel_voxel::{BlockPos, ChunkData, ChunkKey, ChunkPos, DimensionId, MAX_CHUNK_COORD};
@@ -18,6 +19,7 @@ pub(crate) type ColumnKey = (DimensionId, i64, i64);
 struct SaveReport {
     keys: Vec<ChunkKey>,
     meta: Vec<(String, MetaValue)>,
+    entities: Vec<(ChunkKey, u64)>,
     result: Result<usize, String>,
 }
 
@@ -28,6 +30,7 @@ struct ReportGuard {
     tx: Option<Sender<SaveReport>>,
     keys: Vec<ChunkKey>,
     meta: Vec<(String, MetaValue)>,
+    entities: Vec<(ChunkKey, u64)>,
 }
 
 impl ReportGuard {
@@ -36,6 +39,7 @@ impl ReportGuard {
             let report = SaveReport {
                 keys: std::mem::take(&mut self.keys),
                 meta: std::mem::take(&mut self.meta),
+                entities: std::mem::take(&mut self.entities),
                 result,
             };
             // Err only if the world is gone.
@@ -50,6 +54,7 @@ impl Drop for ReportGuard {
             let _ = tx.send(SaveReport {
                 keys: std::mem::take(&mut self.keys),
                 meta: std::mem::take(&mut self.meta),
+                entities: std::mem::take(&mut self.entities),
                 result: Err("save job dropped before it ran".to_string()),
             });
         }
@@ -87,6 +92,9 @@ pub(crate) struct Persist {
     /// The pending ticks and the clock read when the world opened, until the startup restores
     /// them.
     pub(crate) restore: Option<(Option<Vec<(BlockPos, u64)>>, Option<u64>)>,
+    /// The saved entities: where each one's record is, the ones alive, the records waiting for
+    /// a save job and the ones chunk loads read (see `super::entities`).
+    pub(crate) entities: EntityIndex,
 }
 
 impl Persist {
@@ -118,6 +126,7 @@ impl Persist {
             layers.sort_unstable();
             layers.dedup();
         }
+        let entities = EntityIndex::new(opened.entities, opened.next_entity);
         let (tx, rx) = crossbeam_channel::unbounded();
         Self {
             store,
@@ -135,7 +144,13 @@ impl Persist {
             retry_after: Duration::from_secs(1),
             last_autosave: Instant::now(),
             restore: Some((opened.ticks, opened.clock)),
+            entities,
         }
+    }
+
+    /// True if chunk `key` has saved entities (stored or staged): its generation job reads them.
+    pub(crate) fn has_entities(&self, key: ChunkKey) -> bool {
+        self.entities.holds(key)
     }
 
     /// True if chunk `key` has a saved (or staged) copy: it is loaded, not generated.
@@ -243,10 +258,24 @@ impl Persist {
         }
     }
 
+    /// The entity records and removals for the next job, with the next saved id in `meta` when
+    /// it changed (every job takes all of them: they are small).
+    fn take_entities(&mut self, meta: &mut Vec<(String, MetaValue)>) -> Vec<(ChunkKey, u64)> {
+        let entities = self.entities.take_ops();
+        if let Some(next) = self.entities.take_next_id() {
+            let (name, value) = entities_meta(next);
+            meta.retain(|(n, _)| *n != name);
+            meta.push((name, value));
+        }
+        entities
+    }
+
     /// Starts the next save job if one can start and something waits (see
     /// [`Persist::batch_len`]).
     pub(crate) fn start(&mut self, now: Instant, max_batch: usize) {
-        if !self.can_start(now) || (self.queue.is_empty() && self.meta.is_empty()) {
+        if !self.can_start(now)
+            || (self.queue.is_empty() && self.meta.is_empty() && !self.entities.has_ops())
+        {
             return;
         }
         let n = self.batch_len(max_batch);
@@ -254,16 +283,20 @@ impl Persist {
         for key in &keys {
             self.queued.remove(key);
         }
-        let meta = std::mem::take(&mut self.meta);
+        let mut meta = std::mem::take(&mut self.meta);
+        let entities = self.take_entities(&mut meta);
         let guard = ReportGuard {
             tx: Some(self.tx.clone()),
             keys,
             meta,
+            entities,
         };
         let store = self.store.clone();
         self.in_flight = true;
         self.executor.spawn(Box::new(move || {
-            let result = catch_unwind(AssertUnwindSafe(|| store.write(&guard.keys, &guard.meta)));
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                store.write(&guard.keys, &guard.meta, &guard.entities)
+            }));
             guard.send(match result {
                 Ok(Ok(n)) => Ok(n),
                 Ok(Err(e)) => Err(e.to_string()),
@@ -300,10 +333,15 @@ impl Persist {
                     }
                 }
                 for (name, value) in report.meta {
-                    if !self.meta.iter().any(|(n, _)| *n == name) {
+                    // The next entity id goes with the next job's entity records, not as a
+                    // snapshot's metadata (which would take every staged chunk).
+                    if name == META_ENTITIES {
+                        self.entities.next_id_unsaved();
+                    } else if !self.meta.iter().any(|(n, _)| *n == name) {
                         self.meta.push((name, value));
                     }
                 }
+                self.entities.put_back(report.entities);
             }
         }
     }
@@ -332,11 +370,12 @@ impl Persist {
             for key in &keys {
                 self.queued.remove(key);
             }
-            let meta = std::mem::take(&mut self.meta);
-            if keys.is_empty() && meta.is_empty() {
+            let mut meta = std::mem::take(&mut self.meta);
+            let entities = self.take_entities(&mut meta);
+            if keys.is_empty() && meta.is_empty() && entities.is_empty() {
                 break;
             }
-            if let Err(e) = self.store.write(&keys, &meta) {
+            if let Err(e) = self.store.write(&keys, &meta, &entities) {
                 let text = e.to_string();
                 first_error.get_or_insert(e);
                 // Back in the queue: still staged, so loads keep reading them.
@@ -344,6 +383,7 @@ impl Persist {
                     SaveReport {
                         keys,
                         meta,
+                        entities,
                         result: Err(text),
                     },
                     Instant::now(),

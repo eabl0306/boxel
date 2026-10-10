@@ -1,10 +1,11 @@
 //! [`PersistPlugin`]: saving and loading a world while it streams (ADR 0024).
+use super::entities::{EntityCodecs, SavedLog, entity_step, entity_work, save_entities_on_exit};
 use super::saver::Persist;
 use super::store::{WorldStore, clock_meta, ticks_meta};
 use crate::jobs::{IoTaskPoolExecutor, JobExecutor};
 use crate::streaming::WorldJobs;
 use crate::{BlockTicks, ChunkMap, TimeOfDay, WorldContent, WorldSystems};
-use boxel_app::{App, Last, Plugin, Shutdown, Startup, Update};
+use boxel_app::{App, Last, Plugin, PreUpdate, Shutdown, Startup, Update};
 use boxel_diagnostic::DiagnosticsBoard;
 use boxel_ecs::prelude::*;
 use std::sync::Arc;
@@ -53,6 +54,10 @@ impl Default for PersistSettings {
 ///   ([`TimeOfDay`], unless [`PersistSettings::clock`] is off) are saved with the autosave, on
 ///   exit and with chunks that unload while ticks wait, always in one transaction with every
 ///   edited chunk (one moment of the world), and restored at startup.
+/// - [`Saved`](super::Saved) entities, through the registered
+///   [`EntityCodec`](super::EntityCodec)s: in `PreUpdate`, the ones whose chunk has no slot
+///   (it unloaded) are saved and despawned, and the ones of the chunks that loaded come back,
+///   before the frame's fixed steps; the autosave and the exit save every one alive.
 ///
 /// Disk writes run in save jobs on `executor` (the IO task pool by default), one at a time; a
 /// frame only hands chunks over and starts a job. Loads read the store inside the generation
@@ -97,11 +102,18 @@ impl Plugin for PersistPlugin {
         jobs.persist = Some(Persist::new(self.store.clone(), Arc::clone(&self.executor)));
         app.insert_resource(self.store.clone())
             .init_resource::<PersistSettings>()
+            .init_resource::<EntityCodecs>()
+            .init_resource::<SavedLog>()
             .add_systems(Startup, restore_saved)
+            // Exclusive (codecs read and spawn entities), and only when there is work.
+            .add_systems(PreUpdate, entity_step.run_if(entity_work))
             .add_systems(Update, save_step.after(WorldSystems::Visibility))
             // Like the other board lines: its order does not matter.
             .add_systems(Last, publish_save_stats.ambiguous_with_all())
-            .add_systems(Shutdown, save_on_exit);
+            .add_systems(
+                Shutdown,
+                (save_entities_on_exit, save_on_exit).chain(),
+            );
     }
 }
 
@@ -225,13 +237,17 @@ fn publish_save_stats(
     board.set(
         "save",
         format!(
-            "saved={} loaded={} queued={} pending={} load_errors={} save_errors={}",
+            "saved={} loaded={} queued={} pending={} load_errors={} save_errors={} \
+             entities_saved={} entities_loaded={} entity_errors={}",
             stats.saved_chunks,
             stats.loaded_chunks,
             queued,
             stats.pending,
             stats.load_errors,
-            stats.save_errors
+            stats.save_errors,
+            stats.saved_entities,
+            stats.loaded_entities,
+            stats.entity_errors
         ),
     );
 }

@@ -27,6 +27,8 @@ pub(crate) const META_GENERATOR: &str = "boxel:generator";
 pub(crate) const META_TICKS: &str = "boxel:ticks";
 /// The world clock (`TimeOfDay::tick`).
 pub(crate) const META_CLOCK: &str = "boxel:clock";
+/// The next saved entity id (ids are never given twice, also after their entity is gone).
+pub(crate) const META_ENTITIES: &str = "boxel:entities";
 /// Prefix of the engine's metadata names.
 const RESERVED: &str = "boxel:";
 
@@ -91,6 +93,15 @@ pub struct PersistStats {
     pub save_errors: usize,
     /// Chunks waiting in memory for a save to write them.
     pub pending: usize,
+    /// Entity records written (removals not counted).
+    pub saved_entities: usize,
+    /// Entities brought back from saved records.
+    pub loaded_entities: usize,
+    /// Entity records that could not be read (damaged, another record version, the store
+    /// failed) or brought back (no codec of this run places them): they stay saved as they are.
+    pub entity_errors: usize,
+    /// Entity records and removals waiting in memory for a save to write them.
+    pub pending_entities: usize,
 }
 
 /// A metadata value waiting for a save: its bytes, or what the save job encodes into them (the
@@ -119,6 +130,20 @@ struct Staged {
     seq: u64,
 }
 
+/// An entity record waiting to be written (`None`: its removal), with the order it was handed
+/// over in.
+struct StagedEntity {
+    bytes: Option<Arc<Vec<u8>>>,
+    seq: u64,
+}
+
+/// Entity records waiting to be written, by chunk and saved id.
+type PendingEntities = HashMap<
+    ChunkKey,
+    HashMap<u64, StagedEntity, foldhash::fast::FixedState>,
+    foldhash::fast::FixedState,
+>;
+
 /// What [`WorldStore::open`] read for the rest of the world: the saved chunk keys (the world's
 /// index), the pending ticks and the clock.
 #[derive(Debug, Default)]
@@ -126,6 +151,10 @@ pub(crate) struct Opened {
     pub(crate) keys: Vec<ChunkKey>,
     pub(crate) ticks: Option<Vec<(BlockPos, u64)>>,
     pub(crate) clock: Option<u64>,
+    /// Every saved entity: the chunk whose record holds it and its saved id.
+    pub(crate) entities: Vec<(ChunkKey, u64)>,
+    /// The next saved entity id: past every id saved and every id given before.
+    pub(crate) next_entity: u64,
 }
 
 struct Inner {
@@ -134,11 +163,16 @@ struct Inner {
     /// Chunks handed over for saving and not written yet, by key: loads read them first, so a
     /// chunk that unloads and comes back before its save lands keeps its edits.
     pending: Mutex<HashMap<ChunkKey, Staged, foldhash::fast::FixedState>>,
+    /// Entity records handed over and not written yet: loads read them over the stored ones.
+    pending_entities: Mutex<PendingEntities>,
     next_seq: AtomicU64,
     saved: AtomicUsize,
     loaded: AtomicUsize,
     load_errors: AtomicUsize,
     save_errors: AtomicUsize,
+    saved_entities: AtomicUsize,
+    loaded_entities: AtomicUsize,
+    entity_errors: AtomicUsize,
     opened: Mutex<Option<Opened>>,
 }
 
@@ -268,17 +302,41 @@ impl WorldStore {
                 .inspect_err(|e| tracing::error!("saved world clock is lost: {e}"))
                 .ok()
         });
+        let entities = backend.entity_keys()?;
+        // Past every saved id, also when the counter is damaged or older than the records.
+        let counter = backend.load_meta(META_ENTITIES)?.and_then(|b| {
+            decode_clock(&b)
+                .inspect_err(|e| tracing::warn!("saved entity id counter is damaged: {e}"))
+                .ok()
+        });
+        let next_entity = entities
+            .iter()
+            .map(|&(_, id)| id.saturating_add(1))
+            .chain(counter)
+            .max()
+            .unwrap_or(1)
+            .max(1);
         Ok(Self {
             inner: Arc::new(Inner {
                 backend,
                 ids,
                 pending: Mutex::default(),
+                pending_entities: Mutex::default(),
                 next_seq: AtomicU64::new(0),
                 saved: AtomicUsize::new(0),
                 loaded: AtomicUsize::new(0),
                 load_errors: AtomicUsize::new(0),
                 save_errors: AtomicUsize::new(0),
-                opened: Mutex::new(Some(Opened { keys, ticks, clock })),
+                saved_entities: AtomicUsize::new(0),
+                loaded_entities: AtomicUsize::new(0),
+                entity_errors: AtomicUsize::new(0),
+                opened: Mutex::new(Some(Opened {
+                    keys,
+                    ticks,
+                    clock,
+                    entities,
+                    next_entity,
+                })),
             }),
         })
     }
@@ -302,6 +360,16 @@ impl WorldStore {
             load_errors: i.load_errors.load(Ordering::Relaxed),
             save_errors: i.save_errors.load(Ordering::Relaxed),
             pending: i.pending.lock().expect("pending lock").len(),
+            saved_entities: i.saved_entities.load(Ordering::Relaxed),
+            loaded_entities: i.loaded_entities.load(Ordering::Relaxed),
+            entity_errors: i.entity_errors.load(Ordering::Relaxed),
+            pending_entities: i
+                .pending_entities
+                .lock()
+                .expect("pending lock")
+                .values()
+                .map(HashMap::len)
+                .sum(),
         }
     }
 
@@ -322,8 +390,8 @@ impl WorldStore {
             ));
         }
         self.inner.backend.save_batch(&SaveBatch {
-            chunks: Vec::new(),
             meta: vec![(name.to_string(), value)],
+            ..SaveBatch::default()
         })
     }
 
@@ -378,14 +446,15 @@ impl WorldStore {
         self.load_chunk(key).ok().flatten()
     }
 
-    /// Encodes and writes the staged copies of `keys` (those still staged) and `meta` in one
-    /// batch. Once it is durable, a copy is dropped unless a newer one of its key was staged
-    /// meanwhile. On an error nothing is dropped (the caller tries again later). Returns the
-    /// chunks written.
+    /// Encodes and writes the staged copies of `keys` (those still staged), `meta` and the
+    /// staged entity records of `entities` in one batch. Once it is durable, a copy is dropped
+    /// unless a newer one of its key was staged meanwhile. On an error nothing is dropped (the
+    /// caller tries again later). Returns the chunks written.
     pub(crate) fn write(
         &self,
         keys: &[ChunkKey],
         meta: &[(String, MetaValue)],
+        entities: &[(ChunkKey, u64)],
     ) -> io::Result<usize> {
         let staged: Vec<(ChunkKey, Arc<ChunkData>, u64)> = {
             let pending = self.inner.pending.lock().expect("pending lock");
@@ -393,11 +462,26 @@ impl WorldStore {
                 .filter_map(|k| pending.get(k).map(|s| (*k, Arc::clone(&s.data), s.seq)))
                 .collect()
         };
+        type StagedRecord = (ChunkKey, u64, Option<Arc<Vec<u8>>>, u64);
+        let staged_entities: Vec<StagedRecord> = {
+            let pending = self.inner.pending_entities.lock().expect("pending lock");
+            entities
+                .iter()
+                .filter_map(|&(chunk, id)| {
+                    let s = pending.get(&chunk)?.get(&id)?;
+                    Some((chunk, id, s.bytes.clone(), s.seq))
+                })
+                .collect()
+        };
         let mut batch = SaveBatch {
             chunks: Vec::with_capacity(staged.len()),
             meta: meta
                 .iter()
                 .map(|(name, value)| (name.clone(), value.encode()))
+                .collect(),
+            entities: staged_entities
+                .iter()
+                .map(|(chunk, id, bytes, _)| (*chunk, *id, bytes.as_deref().cloned()))
                 .collect(),
         };
         let mut written = Vec::with_capacity(staged.len());
@@ -422,14 +506,95 @@ impl WorldStore {
             }
         }
         drop(pending);
+        let mut pending = self.inner.pending_entities.lock().expect("pending lock");
+        for (chunk, id, _, seq) in &staged_entities {
+            if let Some(records) = pending.get_mut(chunk) {
+                if records.get(id).is_some_and(|s| s.seq == *seq) {
+                    records.remove(id);
+                }
+                if records.is_empty() {
+                    pending.remove(chunk);
+                }
+            }
+        }
+        drop(pending);
+        let records = staged_entities.iter().filter(|e| e.2.is_some()).count();
+        self.inner
+            .saved_entities
+            .fetch_add(records, Ordering::Relaxed);
         self.inner.saved.fetch_add(written.len(), Ordering::Relaxed);
         Ok(written.len())
+    }
+
+    /// Hands the record of entity `id` in chunk `chunk` over for saving (`None`: its removal;
+    /// the newest wins): from now on loads of `chunk` read it over the stored records until a
+    /// save job writes it.
+    pub(crate) fn stage_entity(&self, chunk: ChunkKey, id: u64, bytes: Option<Arc<Vec<u8>>>) {
+        let seq = self.inner.next_seq.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .pending_entities
+            .lock()
+            .expect("pending lock")
+            .entry(chunk)
+            .or_default()
+            .insert(id, StagedEntity { bytes, seq });
+    }
+
+    /// The saved entity records of chunk `key`, by id, ascending: the stored ones with the
+    /// records and removals waiting to be written over them. `Err` when the store fails
+    /// (counted in [`PersistStats::entity_errors`]): the records stay as they are.
+    pub(crate) fn load_entities(&self, key: ChunkKey) -> io::Result<Vec<(u64, Vec<u8>)>> {
+        // The staged ones first: a save job that lands between the two reads wrote the same
+        // records, and laying the staged ones over the store again changes nothing.
+        let staged: Vec<(u64, Option<Arc<Vec<u8>>>)> = self
+            .inner
+            .pending_entities
+            .lock()
+            .expect("pending lock")
+            .get(&key)
+            .map(|records| {
+                records
+                    .iter()
+                    .map(|(&id, s)| (id, s.bytes.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let stored = self.inner.backend.load_entities(key).inspect_err(|e| {
+            self.inner.entity_errors.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(chunk = ?key.pos, "saved entities cannot be read now: {e}");
+        })?;
+        let mut records: std::collections::BTreeMap<u64, Vec<u8>> = stored.into_iter().collect();
+        for (id, bytes) in staged {
+            match bytes {
+                Some(bytes) => records.insert(id, Vec::clone(&bytes)),
+                None => records.remove(&id),
+            };
+        }
+        Ok(records.into_iter().collect())
+    }
+
+    /// Counts entities brought back (`loaded`) and records that could not be (`errors`).
+    pub(crate) fn count_entities(&self, loaded: usize, errors: usize) {
+        self.inner
+            .loaded_entities
+            .fetch_add(loaded, Ordering::Relaxed);
+        self.inner
+            .entity_errors
+            .fetch_add(errors, Ordering::Relaxed);
     }
 }
 
 /// The metadata value of the pending ticks (encoded by the save job).
 pub(crate) fn ticks_meta(ticks: Vec<(BlockPos, u64)>) -> (String, MetaValue) {
     (META_TICKS.to_string(), MetaValue::Ticks(Arc::new(ticks)))
+}
+
+/// The metadata value of the next saved entity id.
+pub(crate) fn entities_meta(next: u64) -> (String, MetaValue) {
+    (
+        META_ENTITIES.to_string(),
+        MetaValue::Bytes(format::encode_clock(next)),
+    )
 }
 
 /// The metadata value of the world clock.
