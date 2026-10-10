@@ -530,6 +530,7 @@ dependencies = [
 name = "boxel_shaders"
 version = "0.1.0-dev"
 dependencies = [
+ "boxel_fog",
  "boxel_mesh",
  "boxel_voxel",
  "bytemuck",

@@ -128,10 +128,13 @@ impl Dda {
         let mut step = [1; 3];
         let mut inv = [0.0; 3];
         for a in 0..3 {
-            let d = if dir[a].abs() < MIN_DIR {
-                MIN_DIR.copysign(dir[a])
-            } else {
+            // `-0.0` counts as positive, like the shader's `select`.
+            let d = if dir[a].abs() >= MIN_DIR {
                 dir[a]
+            } else if dir[a] < 0.0 {
+                -MIN_DIR
+            } else {
+                MIN_DIR
             };
             inv[a] = 1.0 / d;
             step[a] = if d > 0.0 { 1 } else { -1 };

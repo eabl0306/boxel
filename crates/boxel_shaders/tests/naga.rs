@@ -1,7 +1,9 @@
 //! naga validation of every frozen shader module (skeleton-implemented contract test).
 //! Runs on any machine (no GPU): WGSL front end, validator, and every backend wgpu uses on
 //! desktop: GLSL (GL tiers), MSL (Metal), HLSL SM 5.1 (FXC) and SM 6.0 (DXC), SPIR-V (Vulkan).
-use boxel_shaders::gpu::{ChunkGpu, ChunkImmediate, DrawIndexedIndirect, ViewUniform};
+use boxel_shaders::gpu::{
+    ChunkGpu, ChunkImmediate, DrawIndexedIndirect, FogHeader, FogLayerGpu, ViewUniform,
+};
 use boxel_shaders::{ShaderModuleId, Stage};
 use naga::back::{glsl, hlsl, msl, spv};
 use naga::valid::{Capabilities, ModuleInfo, ValidationFlags, Validator};
@@ -484,4 +486,118 @@ fn low_tier_takes_the_quad_and_its_light_as_two_instance_attributes() {
         .filter(|arg| matches!(arg.binding, Some(naga::Binding::Location { .. })))
         .count();
     assert_eq!(attributes, 1);
+}
+
+/// The fog uniform (ADR 0030) as naga lays it out: header, four layers, the ground map, within
+/// the 16 KiB GL 3.3 guarantees for one uniform block.
+#[test]
+fn fog_uniform_layout_matches_the_rust_mirrors() {
+    use boxel_shaders::gpu::{FOG_BUFFER_SIZE, FOG_GROUND_OFFSET, FOG_LAYERS_OFFSET};
+    use std::mem::{offset_of, size_of};
+    let (module, _) = load(ShaderModuleId::Fog);
+    let (size, offsets) = struct_layout(&module, "Fog");
+    assert_eq!(u64::from(size), FOG_BUFFER_SIZE);
+    const { assert!(FOG_BUFFER_SIZE <= 16384) };
+    assert_eq!(size_of::<FogHeader>(), 128);
+    let header = [
+        offset_of!(FogHeader, ray0),
+        offset_of!(FogHeader, ray_x),
+        offset_of!(FogHeader, ray_y),
+        offset_of!(FogHeader, eye),
+        offset_of!(FogHeader, counts),
+        offset_of!(FogHeader, sky),
+        offset_of!(FogHeader, ground),
+        offset_of!(FogHeader, debug),
+    ];
+    assert_eq!(offsets[..8], header.map(|o| o as u32));
+    assert_eq!(u64::from(offsets[8]), FOG_LAYERS_OFFSET);
+    assert_eq!(u64::from(offsets[9]), FOG_GROUND_OFFSET);
+    let (size, offsets) = struct_layout(&module, "FogLayer");
+    assert_eq!((size as usize, size_of::<FogLayerGpu>()), (208, 208));
+    let layer = [
+        offset_of!(FogLayerGpu, band),
+        offset_of!(FogLayerGpu, fade),
+        offset_of!(FogLayerGpu, grid),
+        offset_of!(FogLayerGpu, size),
+        offset_of!(FogLayerGpu, lit),
+        offset_of!(FogLayerGpu, face),
+        offset_of!(FogLayerGpu, lattice),
+        offset_of!(FogLayerGpu, base_lo),
+        offset_of!(FogLayerGpu, base_hi),
+        offset_of!(FogLayerGpu, octave2),
+        offset_of!(FogLayerGpu, shape),
+        offset_of!(FogLayerGpu, wind),
+        offset_of!(FogLayerGpu, cells),
+    ];
+    assert_eq!(offsets, layer.map(|o| o as u32));
+    assert_eq!(
+        boxel_shaders::gpu::FOG_MAX_LAYERS,
+        boxel_fog::MAX_FOG_LAYERS
+    );
+}
+
+/// The shader's constants are the reference march's and the uniform's flags.
+#[test]
+fn fog_constants_match_boxel_fog() {
+    use boxel_shaders::gpu::fog;
+    let (module, _) = load(ShaderModuleId::Fog);
+    assert_eq!(const_u32(&module, "FLAG_HALF"), fog::FLAG_HALF);
+    assert_eq!(const_u32(&module, "LAYER_VOLUME"), fog::LAYER_VOLUME);
+    assert_eq!(
+        const_f32(&module, "EXIT_TAU"),
+        boxel_fog::march::EXIT_TAU_LOG2
+    );
+    assert_eq!(const_f32(&module, "MIN_DIR"), boxel_fog::march::MIN_DIR);
+}
+
+/// Per entry point, what the fog pipelines bind: the march one uniform block and one texture,
+/// the composite one texture, the debug grid one uniform block; never a sampler, a storage
+/// buffer or immediates (every tier, the Low one on GL included, ADR 0011). Every resource of
+/// the module has its own group and binding.
+#[test]
+fn fog_entry_points_bind_one_block_and_one_texture_at_most() {
+    let (module, info) = load(ShaderModuleId::Fog);
+    assert!(!ShaderModuleId::Fog.uses_immediates());
+    let mut bindings: Vec<(u32, u32)> = module
+        .global_variables
+        .iter()
+        .filter_map(|(_, g)| g.binding.as_ref().map(|b| (b.group, b.binding)))
+        .collect();
+    let all = bindings.len();
+    bindings.sort_unstable();
+    bindings.dedup();
+    assert_eq!(bindings.len(), all, "two resources share a binding");
+    let mut seen = Vec::new();
+    for (i, ep) in module.entry_points.iter().enumerate() {
+        let ep_info = info.get_entry_point(i);
+        let (mut uniforms, mut textures, mut samplers) = (0, 0, 0);
+        for (handle, g) in module.global_variables.iter() {
+            if ep_info[handle].is_empty() {
+                continue;
+            }
+            match g.space {
+                naga::AddressSpace::Uniform => uniforms += 1,
+                naga::AddressSpace::Storage { .. } => panic!("{}: storage buffer", ep.name),
+                naga::AddressSpace::Immediate => panic!("{}: immediates", ep.name),
+                naga::AddressSpace::Handle => match module.types[g.ty].inner {
+                    naga::TypeInner::Image { .. } => textures += 1,
+                    naga::TypeInner::Sampler { .. } => samplers += 1,
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        seen.push((ep.name.as_str(), (uniforms, textures, samplers)));
+    }
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        [
+            ("fs_fog_composite_full", (0, 1, 0)),
+            ("fs_fog_composite_half", (0, 1, 0)),
+            ("fs_fog_debug_coverage", (1, 0, 0)),
+            ("fs_fog_march", (1, 1, 0)),
+            ("vs_fullscreen", (0, 0, 0)),
+        ]
+    );
 }

@@ -15,6 +15,8 @@ bytemuck.workspace = true
 naga = { workspace = true, features = ["wgsl-in", "glsl-out", "msl-out", "hlsl-out", "spv-out"] }
 boxel_mesh.workspace = true
 boxel_voxel.workspace = true
+# The fog shader's constants against the reference march (fog.wgsl mirrors boxel_fog).
+boxel_fog.workspace = true
 
 [lints]
 workspace = true

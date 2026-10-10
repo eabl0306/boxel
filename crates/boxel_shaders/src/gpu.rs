@@ -49,6 +49,86 @@ pub struct ViewUniform {
     pub viewport: [f32; 4],
 }
 
+/// Layers the fog uniform holds (`boxel_fog::MAX_FOG_LAYERS`).
+pub const FOG_MAX_LAYERS: usize = 4;
+/// `vec4<u32>` words of the fog ground map: 64x64 texels of 16 bits.
+pub const FOG_GROUND_WORDS: usize = 512;
+/// Byte offset of the layers in the fog uniform buffer.
+pub const FOG_LAYERS_OFFSET: u64 = size_of::<FogHeader>() as u64;
+/// Byte offset of the ground map in the fog uniform buffer.
+pub const FOG_GROUND_OFFSET: u64 =
+    FOG_LAYERS_OFFSET + (FOG_MAX_LAYERS * size_of::<FogLayerGpu>()) as u64;
+/// Bytes of the whole fog uniform buffer: header, layers, ground map.
+pub const FOG_BUFFER_SIZE: u64 = FOG_GROUND_OFFSET + 16 * FOG_GROUND_WORDS as u64;
+// GL 3.3 guarantees 16 KiB per uniform block.
+const _: () = assert!(FOG_BUFFER_SIZE <= 16384);
+
+/// The per-frame header of the uniform `Fog` (`fog.wgsl`, 128 bytes, std140: only vec4
+/// members). The layers ([`FogLayerGpu`]) and the ground map follow it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct FogHeader {
+    /// xyz = ray direction at NDC (0, 0), scaled so `dot(dir, forward) = 1`; w = near plane.
+    pub ray0: [f32; 4],
+    /// xyz = change of the direction per NDC unit along x; w = full target width in pixels.
+    pub ray_x: [f32; 4],
+    /// xyz = same along y; w = full target height in pixels.
+    pub ray_y: [f32; 4],
+    /// xyz = eye relative to the render origin, w = 0.
+    pub eye: [f32; 4],
+    /// x = layer count (sorted by height), y = flags ([`fog::FLAG_HALF`]), z = step budget,
+    /// w = 0.
+    pub counts: [u32; 4],
+    /// rgb = sky color (where layers fade to), a = 0.
+    pub sky: [f32; 4],
+    /// The ground map's placement (reserved).
+    pub ground: [i32; 4],
+    /// xyz = first cell of the debug coverage grid (`fs_fog_debug_coverage`), w = 0.
+    pub debug: [i32; 4],
+}
+
+/// One layer of the uniform `Fog` (208 bytes, std140). See `fog.wgsl` for each word.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct FogLayerGpu {
+    /// x, y = band `[min, max)` relative to the render origin's y; z = reach (blocks along the
+    /// ray); w = mean extinction per block (`log2` units).
+    pub band: [f32; 4],
+    /// x, y = fade start and end distance; z = extinction per block of a full cell (`log2`).
+    pub fade: [f32; 4],
+    /// xyz = min corner of the origin's cell relative to the render origin (blocks).
+    pub grid: [f32; 4],
+    /// xyz = cell size in blocks.
+    pub size: [f32; 4],
+    /// rgb = color of a lit cell.
+    pub lit: [f32; 4],
+    /// Face shades: top, bottom, x, z.
+    pub face: [f32; 4],
+    /// xyz = offset of the displaced origin cell in its lattice step; w = log2 of the step.
+    pub lattice: [u32; 4],
+    /// xyz = low words of its lattice point; w = seed mix of the first octave.
+    pub base_lo: [u32; 4],
+    /// xyz = high words; w = seed of the first octave.
+    pub base_hi: [u32; 4],
+    /// x = seed mix of the second octave, y = its seed, z = octaves, w = flags
+    /// ([`fog::LAYER_VOLUME`]).
+    pub octave2: [u32; 4],
+    /// x = coverage threshold (0..=4096), y = coverage gain (q8), zw = 0.
+    pub shape: [u32; 4],
+    /// xyz = the wind's fraction of a cell (1/4096), w = 0.
+    pub wind: [i32; 4],
+    /// x, y = band cells `[first, end)` relative to the origin's cell, zw = 0.
+    pub cells: [i32; 4],
+}
+
+/// Flags of the fog uniform.
+pub mod fog {
+    /// [`super::FogHeader::counts`] y: the march runs at half resolution.
+    pub const FLAG_HALF: u32 = 1;
+    /// [`super::FogLayerGpu::octave2`] w: 3D noise.
+    pub const LAYER_VOLUME: u32 = 1;
+}
+
 /// Storage `ChunkGpu` (64 bytes) in the chunk table, one per render chunk slot.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
@@ -139,4 +219,16 @@ pub mod bindings {
     /// Byte offset of the per-slot visibility bits in the cull state buffer (after the two draw
     /// counts).
     pub const CULL_VISIBLE_OFFSET: u64 = 8;
+    /// Fog march: the main depth (`texture_2d<f32>`, unfilterable) in this group...
+    pub const FOG_GROUP_DEPTH: u32 = 0;
+    /// ... at this binding.
+    pub const FOG_BINDING_DEPTH: u32 = 0;
+    /// Fog composite: the fog target (`texture_2d<u32>`) in this group...
+    pub const FOG_GROUP_TARGET: u32 = 0;
+    /// ... at this binding.
+    pub const FOG_BINDING_TARGET: u32 = 1;
+    /// Fog march and debug: the `Fog` uniform in this group...
+    pub const FOG_GROUP_UNIFORM: u32 = 1;
+    /// ... at this binding.
+    pub const FOG_BINDING_UNIFORM: u32 = 0;
 }
