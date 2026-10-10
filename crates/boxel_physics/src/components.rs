@@ -412,6 +412,16 @@ fn woke_up(mut world: DeferredWorld, context: HookContext) {
     }
 }
 
+/// Marker: the body was just brought back from a saved world ([`crate::BodyCodec`]) with its
+/// whole state, until the end of the next step's `Wake`. That step does not take its new
+/// [`BodyPosition`] for a nudge (it would wake the bodies asleep around it), and the chunk loads
+/// and the places left that it reads (recorded before the body came back, its own put-away
+/// among them) do not wake it: it comes back asleep, as it was saved, with the blocks it was
+/// saved with.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[component(storage = "SparseSet")]
+pub(crate) struct Restored;
+
 /// Entities whose [`Sleeping`] marker came or went since physics last looked.
 #[derive(Resource, Default)]
 pub(crate) struct SleepLog(pub(crate) Vec<Entity>);

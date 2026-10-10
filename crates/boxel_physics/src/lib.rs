@@ -22,7 +22,8 @@
 //!   [`Velocity`], [`BodyPosition`], [`Contacts`], [`BodySettings`], [`Interpolated`],
 //!   [`Teleport`], [`Frozen`], [`Sleeping`], [`ReportContacts`], [`CharacterController`] with
 //!   [`MoveIntent`], [`Projectile`], and the messages [`VoxelImpact`], [`CollisionStarted`],
-//!   [`CollisionEnded`] and [`ProjectileHit`].
+//!   [`CollisionEnded`] and [`ProjectileHit`]. [`BodyCodec`] saves the bodies of
+//!   `boxel_world::persist::Saved` entities with the world (ADR 0024).
 //!
 //! Frame structure with physics (see [`PhysicsSystems`]):
 //! 1. `RunFixedMainLoopSystems::BeforeFixedMainLoop`: the game samples input into
@@ -54,6 +55,7 @@
 mod components;
 mod contacts;
 pub mod core;
+mod persist;
 mod plugin;
 mod projectile;
 mod query;
@@ -80,6 +82,7 @@ pub use crate::core::{
     raycast_voxels, shape_contact, step_body,
 };
 pub use boxel_voxel::WorldPos;
+pub use persist::{BODY_CODEC, BODY_CODEC_VERSION, BodyCodec};
 pub use plugin::{PhysicsContent, PhysicsPlugin};
 pub use query::{PhysicsQuery, RayFilter, RayHit};
 pub use source::ChunkSource;

@@ -18,7 +18,8 @@
 
 use crate::components::{
     BodyPosition, Collider, Contacts, Disturbed, Frozen, MoveIntent, PhysicsSettings, PhysicsStats,
-    PhysicsSync, Projectile, ReportContacts, RigidBody, SleepLog, Sleeping, Vacated, Velocity,
+    PhysicsSync, Projectile, ReportContacts, Restored, RigidBody, SleepLog, Sleeping, Vacated,
+    Velocity,
 };
 use crate::contacts::{BodyIndex, IndexedBody};
 use crate::core::{BlockBounds, BodySettings, Grid, Shape};
@@ -560,6 +561,7 @@ pub(crate) fn wake_bodies(
     >,
     mut blocks: MessageReader<BlockChanged>,
     mut chunks: MessageReader<ChunkDataEvent>,
+    restored: Query<Entity, With<Restored>>,
     mut stats: ResMut<PhysicsStats>,
 ) {
     let index = &mut *index;
@@ -586,12 +588,16 @@ pub(crate) fn wake_bodies(
         }
     }
     wake.extend(disturbed.0.drain(..).filter(|&e| data.contains(e)));
+    for change in blocks.read() {
+        sleepers.near(grow(BlockBounds::of_block(change.pos), 1), ids, wake);
+    }
+    // The places left and the chunk loads since the latest step happened before a body that
+    // came back from a save this step was there (it was put away from such a place itself):
+    // they do not wake it.
+    let from = wake.len();
     for (pos, bx) in vacated.0.drain(..) {
         let pos = pos.normalize();
         sleepers.near(grow(BlockBounds::of_box(pos, bx), 1), ids, wake);
-    }
-    for change in blocks.read() {
-        sleepers.near(grow(BlockBounds::of_block(change.pos), 1), ids, wake);
     }
     // Only loads: a sleeping body needs no blocks, so an unload leaves it asleep (it would
     // only freeze), and the chunk's blocks are read again when it loads.
@@ -604,6 +610,19 @@ pub(crate) fn wake_bodies(
         loaded.sort_unstable();
         loaded.dedup();
         sleepers.in_chunks(loaded, wake);
+    }
+    if !restored.is_empty() {
+        let mut i = from;
+        while i < wake.len() {
+            if restored.contains(wake[i]) {
+                wake.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    for entity in &restored {
+        commands.entity(entity).try_remove::<Restored>();
     }
     wake.sort_unstable_by_key(|e| e.to_bits());
     wake.dedup();

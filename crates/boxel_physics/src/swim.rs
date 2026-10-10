@@ -56,7 +56,7 @@ pub struct Swimmer {
     /// Out: its box touched a fluid at the last fixed step.
     pub in_fluid: bool,
     /// The land settings and walking speed, kept while in a fluid.
-    land: Option<(BodySettings, f64)>,
+    pub(crate) land: Option<(BodySettings, f64)>,
 }
 
 impl Swimmer {
