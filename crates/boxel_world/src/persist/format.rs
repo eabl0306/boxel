@@ -1,5 +1,5 @@
-//! The bytes of a saved world (ADR 0024): keys, chunk records, the id map and the metadata
-//! blobs. Everything here is pure (no IO, no ECS) and never panics on bad input: a damaged
+//! The bytes of a saved world (ADR 0024): keys, chunk records, entity records, the id map and
+//! the metadata blobs. Everything here is pure (no IO, no ECS) and never panics on bad input: a damaged
 //! record is an error, so a save that went wrong regenerates one chunk instead of taking the
 //! game down.
 //!
@@ -27,10 +27,17 @@ pub const KEY_LEN: usize = 27;
 pub(crate) const CHUNK_MAGIC: [u8; 4] = *b"BXCK";
 /// Magic of a metadata blob (the id map, the pending ticks, the clock).
 pub(crate) const META_MAGIC: [u8; 4] = *b"BXMT";
+/// Magic of an entity record.
+pub(crate) const ENTITY_MAGIC: [u8; 4] = *b"BXEN";
 /// Version of the chunk record layout.
 pub(crate) const CHUNK_VERSION: u8 = 1;
 /// Version of the metadata blob layouts.
 pub(crate) const META_VERSION: u8 = 1;
+/// Version of the entity record layout (the codecs' own bytes have their own versions).
+pub(crate) const ENTITY_VERSION: u8 = 1;
+
+/// Bytes of an encoded entity key: its chunk's key ([`KEY_LEN`]) and its saved id (8).
+pub const ENTITY_KEY_LEN: usize = KEY_LEN + 8;
 
 /// Envelope header: magic (4), version (1), flags (1), payload length (4), checksum (8).
 const HEADER_LEN: usize = 18;
@@ -46,8 +53,8 @@ const MAX_CHUNK_PAYLOAD: usize = 1 + 5 * CHUNK_VOLUME;
 const LZ4_MAX_RATIO: usize = 255;
 
 /// Largest payload of a blob with `magic`: a chunk record's size is bounded by its layout; a
-/// metadata blob (a long pending tick list) by the header's `u32` length alone. The reader takes
-/// whatever the writer can seal.
+/// metadata blob (a long pending tick list) or an entity record by the header's `u32` length
+/// alone. The reader takes whatever the writer can seal.
 fn max_payload(magic: [u8; 4]) -> usize {
     if magic == CHUNK_MAGIC {
         MAX_CHUNK_PAYLOAD
@@ -531,6 +538,98 @@ pub fn decode_chunk(bytes: &[u8], ids: &IdMap) -> Result<ChunkData, FormatError>
     Ok(ChunkData::from_paletted(blocks))
 }
 
+// ---- Entities ------------------------------------------------------------------------------
+
+/// The bytes of an entity key: the key of the chunk whose record holds the entity
+/// ([`encode_key`]) and the entity's saved id, big endian. The entities of one chunk are one
+/// range of the table, by id.
+pub fn encode_entity_key(chunk: ChunkKey, id: u64) -> [u8; ENTITY_KEY_LEN] {
+    let mut out = [0; ENTITY_KEY_LEN];
+    out[..KEY_LEN].copy_from_slice(&encode_key(chunk));
+    out[KEY_LEN..].copy_from_slice(&id.to_be_bytes());
+    out
+}
+
+/// The inverse of [`encode_entity_key`].
+pub fn decode_entity_key(bytes: &[u8; ENTITY_KEY_LEN]) -> (ChunkKey, u64) {
+    let mut chunk = [0; KEY_LEN];
+    chunk.copy_from_slice(&bytes[..KEY_LEN]);
+    let mut id = [0; 8];
+    id.copy_from_slice(&bytes[KEY_LEN..]);
+    (decode_key(&chunk), u64::from_be_bytes(id))
+}
+
+/// One codec's part of a saved entity: the codec's stable name, the version of its bytes and
+/// the bytes (see `persist::EntityCodec`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntityPart {
+    /// The codec's name (`boxel:body`).
+    pub codec: String,
+    /// The version of `bytes`, as the codec wrote it.
+    pub version: u32,
+    /// What the codec saved.
+    pub bytes: Vec<u8>,
+}
+
+/// The record of one entity: its parts, in the order given.
+pub fn encode_entity(parts: &[EntityPart]) -> Vec<u8> {
+    seal_entity(&entity_payload(parts))
+}
+
+/// The inverse of [`encode_entity`].
+pub fn decode_entity(bytes: &[u8]) -> Result<Vec<EntityPart>, FormatError> {
+    entity_parts(&open_entity(bytes)?)
+}
+
+/// The content of an entity record before its envelope: what the main thread makes (the save
+/// job seals it, [`seal_entity`]).
+pub(crate) fn entity_payload(parts: &[EntityPart]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    put_varint(&mut payload, parts.len() as u64);
+    for part in parts {
+        put_varint(&mut payload, part.codec.len() as u64);
+        payload.extend_from_slice(part.codec.as_bytes());
+        put_varint(&mut payload, u64::from(part.version));
+        put_varint(&mut payload, part.bytes.len() as u64);
+        payload.extend_from_slice(&part.bytes);
+    }
+    payload
+}
+
+/// An entity record from its content ([`entity_payload`]): the envelope, checksum and LZ4.
+pub(crate) fn seal_entity(payload: &[u8]) -> Vec<u8> {
+    seal(ENTITY_MAGIC, ENTITY_VERSION, payload)
+}
+
+/// The content of an entity record ([`seal_entity`]).
+pub(crate) fn open_entity(bytes: &[u8]) -> Result<Vec<u8>, FormatError> {
+    open(ENTITY_MAGIC, ENTITY_VERSION, bytes)
+}
+
+/// The parts in the content of an entity record ([`entity_payload`]).
+pub(crate) fn entity_parts(payload: &[u8]) -> Result<Vec<EntityPart>, FormatError> {
+    let mut r = Reader::new(payload);
+    let n = r.count(payload.len())?;
+    let mut parts = Vec::with_capacity(n);
+    for _ in 0..n {
+        let len = r.count(payload.len())?;
+        let codec = std::str::from_utf8(r.take(len)?)
+            .map_err(|_| FormatError::Damaged("a codec name is not UTF-8"))?
+            .to_string();
+        let version = u32::try_from(r.varint()?)
+            .map_err(|_| FormatError::Damaged("codec version out of range"))?;
+        let len = r.count(payload.len())?;
+        let bytes = r.take(len)?.to_vec();
+        parts.push(EntityPart {
+            codec,
+            version,
+            bytes,
+        });
+    }
+    r.finish()?;
+    Ok(parts)
+}
+
 // ---- Pending ticks and the clock -----------------------------------------------------------
 
 /// The pending block ticks blob: position and game ticks from the save to the tick, in the order
@@ -561,7 +660,7 @@ pub(crate) fn decode_ticks(bytes: &[u8]) -> Result<Vec<(boxel_voxel::BlockPos, u
     Ok(out)
 }
 
-/// The world clock blob (`TimeOfDay::tick`).
+/// The world clock blob (`TimeOfDay::tick`); also the next saved entity id.
 pub(crate) fn encode_clock(tick: u64) -> Vec<u8> {
     let mut payload = Vec::new();
     put_varint(&mut payload, tick);

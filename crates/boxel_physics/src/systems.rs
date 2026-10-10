@@ -2,8 +2,8 @@
 
 use crate::components::{
     BodyPosition, CharacterController, Collider, Contacts, Crouch, FLIGHT_VERTICAL_DRAG, Frozen,
-    Interpolated, MoveIntent, PhysicsSettings, PhysicsStats, PhysicsSync, Projectile, RigidBody,
-    Sleeping, Teleport, Vacated, Velocity, VoxelImpact,
+    Interpolated, MoveIntent, PhysicsSettings, PhysicsStats, PhysicsSync, Projectile, Restored,
+    RigidBody, Sleeping, Teleport, Vacated, Velocity, VoxelImpact,
 };
 use crate::contacts::{BodyIndex, ObstacleIndex, ObstacleScratch};
 use crate::core::{
@@ -352,6 +352,7 @@ type PrepareItem<'a> = (
     Option<&'a mut Interpolated>,
     Option<&'a Collider>,
     Has<Projectile>,
+    Option<&'a Restored>,
 );
 
 /// What [`prepare_bodies`] collects from the bodies (per thread, then merged).
@@ -497,6 +498,7 @@ fn prepare(
         interpolated,
         collider,
         projectile,
+        restored,
     ): (
         Entity,
         &RigidBody,
@@ -508,6 +510,7 @@ fn prepare(
         Option<Mut<Interpolated>>,
         Option<&Collider>,
         bool,
+        Option<&Restored>,
     ),
     asleep: bool,
     since: Option<Tick>,
@@ -556,9 +559,12 @@ fn prepare(
         return;
     }
     // Gameplay wrote `BodyPosition` since the latest step (physics writes it before
-    // `Writeback`).
-    let nudged =
-        target.is_none() && placed && since.is_some_and(|tick| position.is_changed_after(tick));
+    // `Writeback`). A body brought back from a save was written whole, where it was: only a
+    // write after it came back is a nudge.
+    let nudged = target.is_none()
+        && placed
+        && since.is_some_and(|tick| position.is_changed_after(tick))
+        && restored.is_none_or(|r| position.is_changed_after(r.tick));
     if target.is_some() || nudged {
         // The place it left: the sleepers on it wake up (nothing rests on a sensor or a
         // projectile). A nudge already overwrote it: it is looked up afterwards.

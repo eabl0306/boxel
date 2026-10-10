@@ -25,8 +25,9 @@
 //! toggles creative flight (Space rises, Shift descends, landing ends it); the view bobs while
 //! walking (V turns it off). The fly camera keeps Shift and Ctrl for going down and boosting.
 //! F3 shows the mode (with flying, sneaking, crouching or sprinting) and a physics line
-//! (`PhysicsStats`) in both modes. Fences cannot be
-//! jumped: they collide 1.5 blocks tall.
+//! (`PhysicsStats`) in both modes. Fences cannot be jumped: they collide 1.5 blocks tall. C
+//! drops a crate two blocks ahead (a solid dynamic box; bodies have no renderer yet, so F3
+//! counts them and gives the nearest).
 //!
 //! Water flows (ADR 0021, `FluidPlugin`): placed water is a source that spreads 7 blocks and
 //! falls, breaking a block next to a lake or the sea lets it flow, and F3 shows the first water
@@ -51,14 +52,16 @@
 //! trunk, leaf canopy) so the cutout pipeline is visible; `--no-trees` gives the plain
 //! generator, and `--world overworld` the caves.
 //!
-//! `--world-dir DIR` saves the world there (ADR 0024): the edits, the flowing water, the clock
-//! and the camera are saved on exit (and edited chunks as they unload, and every minute), and
-//! loaded on the next start with the same `DIR` (`--camera` and `--time` win over the saved
-//! camera and clock).
+//! `--world-dir DIR` saves the world there (ADR 0024): the edits, the flowing water, the clock,
+//! the camera and the crates are saved on exit (and edited chunks and crates as their chunks
+//! unload, and every minute), and loaded on the next start with the same `DIR` (`--camera` and
+//! `--time` win over the saved camera and clock).
 #![expect(clippy::print_stdout, clippy::print_stderr, reason = "CLI output")]
 
 #[path = "shared/clock.rs"]
 mod clock;
+#[path = "shared/crates.rs"]
+mod crates;
 #[path = "shared/pack.rs"]
 mod pack;
 #[path = "shared/player.rs"]
@@ -1929,6 +1932,7 @@ fn main() -> AppExit {
         SwimPlugin,
         PickingPlugin,
         WalkPlugin { start_walking },
+        crates::CratesPlugin,
     ));
     // The camera moves first; the world then computes interest from the new position.
     app.configure_sets(Update, FlyCameraSystems.before(WorldSystems::Interest))
@@ -2109,6 +2113,8 @@ mod tests {
             SwimPlugin,
             PickingPlugin,
             WalkPlugin::default(),
+            // Its systems pass the strict ambiguity check too.
+            crates::CratesPlugin,
         ))
         .init_resource::<OverlayLines>()
         // As `DebugOverlayPlugin` does: picking fills it.

@@ -18,8 +18,8 @@
 
 use crate::components::{
     BodyPosition, CharacterController, Collider, Contacts, Crouch, Disturbed, Frozen, MoveIntent,
-    PhysicsSettings, PhysicsStats, PhysicsSync, Projectile, ReportContacts, RigidBody, SleepLog,
-    Sleeping, Vacated, Velocity,
+    PhysicsSettings, PhysicsStats, PhysicsSync, Projectile, ReportContacts, Restored, RigidBody,
+    SleepLog, Sleeping, Vacated, Velocity,
 };
 use crate::contacts::{BodyIndex, IndexedBody};
 use crate::core::{BlockBounds, BodySettings, Grid, Shape};
@@ -528,6 +528,11 @@ pub(crate) struct WakeScratch {
     wake: Vec<Entity>,
     ids: Vec<u32>,
     loaded: Vec<ChunkPos>,
+    /// The chunk loads with their message ids, the loads after one restore and the restored
+    /// bodies those wake (only while bodies that came back from a save wait for their step).
+    loads: Vec<(ChunkPos, usize)>,
+    late: Vec<ChunkPos>,
+    woken: Vec<Entity>,
 }
 
 /// [`crate::PhysicsSystems::Wake`]: wakes the sleeping bodies something disturbed since the
@@ -561,10 +566,18 @@ pub(crate) fn wake_bodies(
     >,
     mut blocks: MessageReader<BlockChanged>,
     mut chunks: MessageReader<ChunkDataEvent>,
+    restored: Query<(Entity, &Restored)>,
     mut stats: ResMut<PhysicsStats>,
 ) {
     let index = &mut *index;
-    let WakeScratch { wake, ids, loaded } = &mut *scratch;
+    let WakeScratch {
+        wake,
+        ids,
+        loaded,
+        loads,
+        late,
+        woken,
+    } = &mut *scratch;
     wake.clear();
     sync_sleepers(&mut index.sleepers, &mut log, &data);
     let sleepers = &index.sleepers;
@@ -587,24 +600,73 @@ pub(crate) fn wake_bodies(
         }
     }
     wake.extend(disturbed.0.drain(..).filter(|&e| data.contains(e)));
-    for (pos, bx) in vacated.0.drain(..) {
-        let pos = pos.normalize();
-        sleepers.near(grow(BlockBounds::of_box(pos, bx), 1), ids, wake);
-    }
     for change in blocks.read() {
         sleepers.near(grow(BlockBounds::of_block(change.pos), 1), ids, wake);
     }
+    // The places left and the chunk loads recorded before a body came back from a save (it was
+    // put away from such a place itself) do not wake it; the ones after it came back do.
+    let any_restored = !restored.is_empty();
+    for (i, (pos, bx)) in vacated.0.drain(..).enumerate() {
+        let from = wake.len();
+        let pos = pos.normalize();
+        sleepers.near(grow(BlockBounds::of_box(pos, bx), 1), ids, wake);
+        if any_restored {
+            retain_from(wake, from, |e| {
+                restored.get(e).ok().is_none_or(|(_, r)| i >= r.vacated)
+            });
+        }
+    }
     // Only loads: a sleeping body needs no blocks, so an unload leaves it asleep (it would
     // only freeze), and the chunk's blocks are read again when it loads.
-    loaded.clear();
-    loaded.extend(chunks.read().filter_map(|event| match event {
-        ChunkDataEvent::Loaded { key, .. } => Some(key.pos),
+    loads.clear();
+    loads.extend(chunks.read_with_id().filter_map(|(event, id)| match event {
+        ChunkDataEvent::Loaded { key, .. } => Some((key.pos, id.id)),
         ChunkDataEvent::Unloaded { .. } => None,
     }));
-    if !loaded.is_empty() {
+    if !loads.is_empty() {
+        loaded.clear();
+        loaded.extend(loads.iter().map(|&(pos, _)| pos));
         loaded.sort_unstable();
         loaded.dedup();
+        let from = wake.len();
         sleepers.in_chunks(loaded, wake);
+        if any_restored && wake.len() > from {
+            // A restored body is woken only by the loads written after it came back: the ones
+            // of each restore (they share their count), looked up again.
+            woken.clear();
+            let mut marks: Vec<usize> = wake[from..]
+                .iter()
+                .filter_map(|&e| restored.get(e).ok().map(|(_, r)| r.chunks))
+                .collect();
+            marks.sort_unstable();
+            marks.dedup();
+            for mark in marks {
+                late.clear();
+                late.extend(loads.iter().filter(|&&(_, id)| id >= mark).map(|&(p, _)| p));
+                late.sort_unstable();
+                late.dedup();
+                let start = woken.len();
+                sleepers.in_chunks(late, woken);
+                let mut i = start;
+                while i < woken.len() {
+                    if restored.get(woken[i]).is_ok_and(|(_, r)| r.chunks == mark) {
+                        i += 1;
+                    } else {
+                        woken.swap_remove(i);
+                    }
+                }
+            }
+            woken.sort_unstable_by_key(|e| e.to_bits());
+            retain_from(wake, from, |e| {
+                restored.get(e).is_err()
+                    || woken
+                        .binary_search_by_key(&e.to_bits(), |w| w.to_bits())
+                        .is_ok()
+            });
+        }
+    }
+    for (entity, _) in &restored {
+        commands.entity(entity).try_remove::<Restored>();
     }
     wake.sort_unstable_by_key(|e| e.to_bits());
     wake.dedup();
@@ -612,6 +674,18 @@ pub(crate) fn wake_bodies(
     for &entity in wake.iter() {
         index.sleepers.remove(entity);
         commands.entity(entity).try_remove::<Sleeping>();
+    }
+}
+
+/// Keeps the entities of `wake` from index `from` on for which `keep` holds (in any order).
+fn retain_from(wake: &mut Vec<Entity>, from: usize, mut keep: impl FnMut(Entity) -> bool) {
+    let mut i = from;
+    while i < wake.len() {
+        if keep(wake[i]) {
+            i += 1;
+        } else {
+            wake.swap_remove(i);
+        }
     }
 }
 

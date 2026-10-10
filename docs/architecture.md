@@ -1233,7 +1233,11 @@ pub trait ChunkStore: Send + Sync + 'static {
   momento del mundo.
 - Si el disco falla, los chunks esperan en memoria y `RedbStore` vuelve a abrir el archivo cuando
   el disco funciona otra vez.
-- Entidades (cuerpos congelados de la física): todavía no, ver ADR 0024.
+- Entidades: las marcadas con `Saved` se guardan con su chunk a través de los `EntityCodec` que
+  registran los plugins (la física guarda sus cuerpos con `BodyCodec`). Se guardan y despawnean
+  cuando su chunk se descarga, y vuelven con él antes del paso de física siguiente. El
+  autoguardado y la salida las guardan en la misma transacción que los chunks con ediciones, los
+  ticks y el reloj, y solo rearman las que cambiaron (ADR 0024 sección 3).
 
 ---
 
@@ -1296,7 +1300,7 @@ pub trait ChunkStore: Send + Sync + 'static {
 | Milestone | Contenido | Criterio de salida |
 |---|---|---|
 | **M0 scaffold** | workspace y tooling; fork del ECS; `boxel_app`; ventana con compuerta de presentación e input; detección completa (tiers, scoring, smoke, overrides, LKG de crashes, device lost, catch_unwind); tiers High, Mid y Low con buckets opaco y cutout (High sin Hi-Z); paleta, registry, worldgen, mesher, streaming con jobs; cámara libre; `gpu_info`, `voxel_world`, `headless_world` | compila, tests, clippy y rustdoc limpios; `voxel_world` dibuja terreno en Vulkan High y en GL (Mid y Low); imágenes iguales entre tiers; la simulación no se congela con la ventana minimizada |
-| **M1 mundo jugable** | criterio de entrada: re-fork sobre bevy 0.20.0 final (hecho el 2026-10-09, issue #24). Pase translúcido; AO; raycast y edición de bloques (hechos: ADR 0016, `voxel_world`); el sistema de ediciones si se recortó; propiedades de bloque e IdMap; `ChunkStore` con redb (hecho: ADR 0024, sin entidades); crecimiento del arena y presupuesto de subida; caras interiores de hojas (opcional); re-selección en caliente si se recortó; decisión `static-dxc` o DLL en Windows; timestamps de GPU; actualizar a wgpu 31 | editar y guardar un mundo; agua visible |
+| **M1 mundo jugable** | criterio de entrada: re-fork sobre bevy 0.20.0 final (hecho el 2026-10-09, issue #24). Pase translúcido; AO; raycast y edición de bloques (hechos: ADR 0016, `voxel_world`); el sistema de ediciones si se recortó; propiedades de bloque e IdMap; `ChunkStore` con redb (hecho: ADR 0024, con entidades); crecimiento del arena y presupuesto de subida; caras interiores de hojas (opcional); re-selección en caliente si se recortó; decisión `static-dxc` o DLL en Windows; timestamps de GPU; actualizar a wgpu 31 | editar y guardar un mundo; agua visible |
 | **M2 GPU-driven completo** | Hi-Z en dos fases (High) o enlaces por subceldas de 16³ (el cave culling por BFS ya está en los tres tiers, ADR 0022); pool de ocupación en GPU; `create_shader_module_trusted` con medición; pipeline cache de Vulkan; verificar DX12 High; clip control en GL (upstream); decidir WESL | caída de draws y de tiempo de GPU medida |
 | **M3 escala** | LOD con mips de 32³ y anillos; listas indirectas segmentadas (más de 65 535 draws); render en hilo propio; inicialización de GPU asíncrona (respetando los error scopes por hilo) | distancias de vista grandes estables |
 | **M4 experimental** | ray marching sobre bricks/ocupación; mesh shaders opt-in; evaluar bevy_ecs 0.21 y el núcleo ECS propio | prototipos medidos |

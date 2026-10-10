@@ -1,6 +1,8 @@
 //! Where saved bytes live: the [`ChunkStore`] trait and its stores (none, memory, redb). A store
 //! keeps bytes by key and knows nothing of their format ([`super::format`] does).
-use super::format::{KEY_LEN, decode_key, encode_key};
+use super::format::{
+    ENTITY_KEY_LEN, KEY_LEN, decode_entity_key, decode_key, encode_entity_key, encode_key,
+};
 use boxel_voxel::ChunkKey;
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -8,19 +10,24 @@ use std::path::Path;
 use std::sync::{Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
-/// What one [`ChunkStore::save_batch`] writes, atomically: chunk records and metadata values.
+/// What one [`ChunkStore::save_batch`] writes, atomically: chunk records, metadata values and
+/// entity records.
 #[derive(Clone, Debug, Default)]
 pub struct SaveBatch {
     /// Chunk records by key (a later entry of the same key wins).
     pub chunks: Vec<(ChunkKey, Vec<u8>)>,
     /// Metadata values by name (a later entry of the same name wins).
     pub meta: Vec<(String, Vec<u8>)>,
+    /// Entity records by the chunk that holds them and the entity's saved id: `Some` writes the
+    /// record, `None` removes it (the entity moved to another chunk's record or is gone). A later
+    /// entry of the same key wins.
+    pub entities: Vec<(ChunkKey, u64, Option<Vec<u8>>)>,
 }
 
 impl SaveBatch {
     /// Nothing to write.
     pub fn is_empty(&self) -> bool {
-        self.chunks.is_empty() && self.meta.is_empty()
+        self.chunks.is_empty() && self.meta.is_empty() && self.entities.is_empty()
     }
 }
 
@@ -36,9 +43,22 @@ pub trait ChunkStore: Send + Sync + 'static {
     fn keys(&self) -> io::Result<Vec<ChunkKey>>;
     /// Loads one metadata value.
     fn load_meta(&self, name: &str) -> io::Result<Option<Vec<u8>>>;
-    /// Saves chunk records and metadata atomically, as one batch: when it returns `Ok` the batch
-    /// is durable (a crash keeps all of it), when it fails nothing of it was written.
+    /// Saves chunk records, metadata and entity records atomically, as one batch: when it
+    /// returns `Ok` the batch is durable (a crash keeps all of it), when it fails nothing of it
+    /// was written.
     fn save_batch(&self, batch: &SaveBatch) -> io::Result<()>;
+    /// The keys of every saved entity: the chunk whose record holds it and its saved id (read
+    /// once, when a world opens). A store that keeps no entities has none (the default); one
+    /// that does implements this, [`ChunkStore::load_entities`] and the `entities` of
+    /// [`SaveBatch`].
+    fn entity_keys(&self) -> io::Result<Vec<(ChunkKey, u64)>> {
+        Ok(Vec::new())
+    }
+    /// The entity records of chunk `key`, by saved id, ascending.
+    fn load_entities(&self, key: ChunkKey) -> io::Result<Vec<(u64, Vec<u8>)>> {
+        let _ = key;
+        Ok(Vec::new())
+    }
     /// Flushes pending writes.
     fn flush(&self) -> io::Result<()> {
         Ok(())
@@ -71,6 +91,7 @@ impl ChunkStore for NullChunkStore {
 pub struct MemoryStore {
     chunks: Mutex<BTreeMap<[u8; KEY_LEN], Vec<u8>>>,
     meta: Mutex<HashMap<String, Vec<u8>>>,
+    entities: Mutex<BTreeMap<[u8; ENTITY_KEY_LEN], Vec<u8>>>,
 }
 
 impl MemoryStore {
@@ -88,6 +109,16 @@ impl MemoryStore {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Saved entity records.
+    pub fn entity_count(&self) -> usize {
+        self.entities.lock().expect("store lock").len()
+    }
+}
+
+/// The range of the entity keys of chunk `key`: every saved id.
+fn entity_range(key: ChunkKey) -> std::ops::RangeInclusive<[u8; ENTITY_KEY_LEN]> {
+    encode_entity_key(key, 0)..=encode_entity_key(key, u64::MAX)
 }
 
 impl ChunkStore for MemoryStore {
@@ -112,16 +143,42 @@ impl ChunkStore for MemoryStore {
         Ok(self.meta.lock().expect("store lock").get(name).cloned())
     }
     fn save_batch(&self, batch: &SaveBatch) -> io::Result<()> {
-        // Both locks at once: a reader never sees half a batch.
+        // Every lock at once: a reader never sees half a batch.
         let mut chunks = self.chunks.lock().expect("store lock");
         let mut meta = self.meta.lock().expect("store lock");
+        let mut entities = self.entities.lock().expect("store lock");
         for (key, bytes) in &batch.chunks {
             chunks.insert(encode_key(*key), bytes.clone());
         }
         for (name, bytes) in &batch.meta {
             meta.insert(name.clone(), bytes.clone());
         }
+        for (key, id, bytes) in &batch.entities {
+            let k = encode_entity_key(*key, *id);
+            match bytes {
+                Some(bytes) => entities.insert(k, bytes.clone()),
+                None => entities.remove(&k),
+            };
+        }
         Ok(())
+    }
+    fn entity_keys(&self) -> io::Result<Vec<(ChunkKey, u64)>> {
+        Ok(self
+            .entities
+            .lock()
+            .expect("store lock")
+            .keys()
+            .map(decode_entity_key)
+            .collect())
+    }
+    fn load_entities(&self, key: ChunkKey) -> io::Result<Vec<(u64, Vec<u8>)>> {
+        Ok(self
+            .entities
+            .lock()
+            .expect("store lock")
+            .range(entity_range(key))
+            .map(|(k, v)| (decode_entity_key(k).1, v.clone()))
+            .collect())
     }
 }
 
@@ -134,6 +191,14 @@ const INDEX: redb::TableDefinition<'static, &[u8; KEY_LEN], ()> =
     redb::TableDefinition::new("index");
 /// Metadata: name to value.
 const META: redb::TableDefinition<'static, &str, &[u8]> = redb::TableDefinition::new("meta");
+/// Entity records: encoded entity key (`format::encode_entity_key`: the chunk, then the saved
+/// id) to record. A world written before entities were saved gets the table when it opens; a
+/// build that does not know it leaves it alone.
+const ENTITIES: redb::TableDefinition<'static, &[u8; ENTITY_KEY_LEN], &[u8]> =
+    redb::TableDefinition::new("entities");
+/// The keys of `ENTITIES` alone, written in the same transactions (like `INDEX`).
+const ENTITY_INDEX: redb::TableDefinition<'static, &[u8; ENTITY_KEY_LEN], ()> =
+    redb::TableDefinition::new("entity_index");
 
 /// Page cache of a [`RedbStore`] (redb's default is 1 GiB): the chunks a game reads again soon
 /// are the ones it just wrote or loaded, and the system's file cache holds the rest.
@@ -145,7 +210,8 @@ pub(crate) const REOPEN_EVERY: Duration = Duration::from_secs(1);
 
 /// A world in one redb file (pure Rust, ACID). Every batch is one write transaction committed
 /// with immediate durability; reads run in their own read transactions, in parallel with a
-/// write. Tables: `chunks` (records by key), `index` (the same keys, to open fast) and `meta`.
+/// write. Tables: `chunks` (records by key), `index` (the same keys, to open fast), `meta`,
+/// `entities` (entity records by chunk and saved id) and `entity_index` (their keys).
 ///
 /// After one IO error redb fails every operation until the database is opened again (it repairs
 /// the file then). So after an error the store closes the database, opens the file again and
@@ -212,6 +278,8 @@ impl RedbStore {
         txn.open_table(CHUNKS).map_err(io_error)?;
         txn.open_table(INDEX).map_err(io_error)?;
         txn.open_table(META).map_err(io_error)?;
+        txn.open_table(ENTITIES).map_err(io_error)?;
+        txn.open_table(ENTITY_INDEX).map_err(io_error)?;
         txn.commit().map_err(io_error)?;
         Ok(Self {
             open: Box::new(open),
@@ -325,10 +393,51 @@ impl ChunkStore for RedbStore {
                 for (name, bytes) in &batch.meta {
                     meta.insert(name.as_str(), bytes.as_slice())?;
                 }
+                let mut entities = txn.open_table(ENTITIES)?;
+                let mut entity_index = txn.open_table(ENTITY_INDEX)?;
+                for (key, id, bytes) in &batch.entities {
+                    let key = encode_entity_key(*key, *id);
+                    match bytes {
+                        Some(bytes) => {
+                            entities.insert(&key, bytes.as_slice())?;
+                            entity_index.insert(&key, ())?;
+                        }
+                        None => {
+                            entities.remove(&key)?;
+                            entity_index.remove(&key)?;
+                        }
+                    }
+                }
             }
             // Dropping an uncommitted transaction aborts it: an error above writes nothing.
             txn.commit()?;
             Ok(())
+        })
+    }
+    fn entity_keys(&self) -> io::Result<Vec<(ChunkKey, u64)>> {
+        use redb::{ReadableDatabase, ReadableTable};
+        self.run(|db| {
+            let txn = db.begin_read()?;
+            let table = txn.open_table(ENTITY_INDEX)?;
+            let mut keys = Vec::new();
+            for entry in table.iter()? {
+                keys.push(decode_entity_key(entry?.0.value()));
+            }
+            Ok(keys)
+        })
+    }
+    fn load_entities(&self, key: ChunkKey) -> io::Result<Vec<(u64, Vec<u8>)>> {
+        use redb::ReadableDatabase;
+        let range = entity_range(key);
+        self.run(|db| {
+            let txn = db.begin_read()?;
+            let table = txn.open_table(ENTITIES)?;
+            let mut out = Vec::new();
+            for entry in table.range::<&[u8; ENTITY_KEY_LEN]>(range.start()..=range.end())? {
+                let (k, v) = entry?;
+                out.push((decode_entity_key(k.value()).1, v.value().to_vec()));
+            }
+            Ok(out)
         })
     }
 }

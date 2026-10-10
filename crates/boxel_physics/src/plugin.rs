@@ -8,6 +8,7 @@ use crate::contacts::{
     BodyIndex, ContactSet, ObstacleIndex, broadphase, build_obstacles, solve, write_collisions,
 };
 use crate::core::CollisionTable;
+use crate::persist::BodyCodec;
 use crate::projectile::{PendingHits, step_projectiles, write_hits};
 use crate::sleep::{sleep_bodies, wake_bodies, wake_to_pose};
 use crate::systems::{
@@ -43,6 +44,9 @@ pub struct PhysicsContent {
 /// - Messages: [`VoxelImpact`], [`CollisionStarted`], [`CollisionEnded`] and
 ///   [`ProjectileHit`]. It reads the world's `BlockChanged` and `ChunkDataEvent` to wake
 ///   sleeping bodies.
+/// - It registers [`BodyCodec`] (`boxel_world::persist::add_entity_codec`): with the world's
+///   `PersistPlugin`, bodies with `boxel_world::persist::Saved` are saved with their chunk and
+///   come back as they were (ADR 0024).
 /// - In `Plugin::finish` it sets `FixedTime::set_max_steps_per_frame` to
 ///   [`PhysicsPlugin::max_steps_per_frame`] (3 by default): after a hitch, a frame runs at most
 ///   that many fixed steps, which bounds the cost of a catch-up frame. The cap is app-wide, see
@@ -101,6 +105,7 @@ impl Plugin for PhysicsPlugin {
             app.edit_schedule(FixedPostUpdate, single)
                 .edit_schedule(RunFixedMainLoop, single);
         }
+        boxel_world::persist::add_entity_codec(app, BodyCodec);
         app.init_resource::<PhysicsSettings>()
             .init_resource::<PhysicsStats>()
             .init_resource::<PendingImpacts>()

@@ -4,6 +4,7 @@ use crate::core::{
     BodySettings, CollisionLayers, DEFAULT_GRID_SHIFT, LocalBox, Shape, StepParams, SweepConfig,
     SweepOut,
 };
+use boxel_ecs::change_detection::Tick;
 use boxel_ecs::component::{Mutable, StorageType};
 use boxel_ecs::lifecycle::HookContext;
 use boxel_ecs::prelude::*;
@@ -439,6 +440,24 @@ fn woke_up(mut world: DeferredWorld, context: HookContext) {
     if let Some(mut log) = world.get_resource_mut::<SleepLog>() {
         log.0.push(context.entity);
     }
+}
+
+/// The body was just brought back from a saved world ([`crate::BodyCodec`]) with its whole
+/// state, until the end of the next step's `Wake`; with what had happened when it came back.
+/// What happened before does not touch it: the [`BodyPosition`] it came back with is not a nudge
+/// (it would wake the bodies asleep around it), and the places left and the chunk loads from
+/// before (its own put-away among them) do not wake it: it comes back asleep, as it was saved,
+/// with the blocks it was saved with. What happens after it came back (frames can pass before
+/// the next step) counts as for any body.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+#[component(storage = "SparseSet")]
+pub(crate) struct Restored {
+    /// The world's change tick when it came back: a `BodyPosition` written later is a nudge.
+    pub(crate) tick: Tick,
+    /// The [`Vacated`] places recorded when it came back.
+    pub(crate) vacated: usize,
+    /// The `boxel_world::ChunkDataEvent`s written when it came back (the id of the next one).
+    pub(crate) chunks: usize,
 }
 
 /// Entities whose [`Sleeping`] marker came or went since physics last looked.

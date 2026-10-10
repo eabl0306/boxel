@@ -684,6 +684,7 @@ fn a_damaged_record_regenerates_its_chunk_and_stays_until_edited() {
         .save_batch(&SaveBatch {
             chunks: vec![(key, garbage.clone())],
             meta: Vec::new(),
+            ..SaveBatch::default()
         })
         .unwrap();
 
@@ -718,6 +719,7 @@ fn worlds_of_another_version_or_with_damaged_metadata_are_refused() {
             .save_batch(&SaveBatch {
                 chunks: Vec::new(),
                 meta: vec![(name.to_string(), value)],
+                ..SaveBatch::default()
             })
             .unwrap();
         WorldStore::open(backend, &registry, "ground")
@@ -742,6 +744,7 @@ fn worlds_of_another_version_or_with_damaged_metadata_are_refused() {
         .save_batch(&SaveBatch {
             chunks: vec![(ChunkKey::new(ChunkPos::new(0, 0, 0)), vec![1, 2, 3])],
             meta: Vec::new(),
+            ..SaveBatch::default()
         })
         .unwrap();
     assert!(matches!(
@@ -1132,6 +1135,7 @@ fn redb_keeps_every_bit_of_far_keys() {
                 .map(|k| (*k, format!("{:?}", k.pos).into_bytes()))
                 .collect(),
             meta: vec![("game:seed".to_string(), b"42".to_vec())],
+            ..SaveBatch::default()
         };
         store.save_batch(&batch).unwrap();
     }
