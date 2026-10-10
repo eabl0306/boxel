@@ -1,7 +1,7 @@
 use crate::interest::Viewer;
 use crate::jobs::{JobExecutor, TaskPoolExecutor};
 use crate::map::DataChange;
-use crate::neighbor_rules::NeighborRules;
+use crate::neighbor_rules::{BlockUses, NeighborRules};
 use crate::sky::{SkyMap, SkyRule};
 use crate::streaming::{Ctx, ViewerChunks, WorldJobs};
 use crate::{ChunkId, ChunkMap, ChunkVisibility, WorldStats};
@@ -362,7 +362,8 @@ pub enum WorldSystems {
 }
 
 /// Adds the world: resources (`ChunkMap`, `SkyMap`, `WorldSettings`, `WorldContent`,
-/// `EditQueue`, [`NeighborRules`] (the built-in ones of the registry), `WorldStats`, internal
+/// `EditQueue`, [`NeighborRules`] and [`BlockUses`] (the built-in ones of the registry),
+/// `WorldStats`, internal
 /// job state), the messages `ChunkMeshEvent`, [`ChunkMeshResync`],
 /// [`BlockChanged`] and [`ChunkDataEvent`] and the chained systems in
 /// `Update`, and the world's step in `Idle` (between frames, [`WorldSettings::idle_work`]) with
@@ -414,6 +415,7 @@ impl Plugin for WorldPlugin {
         jobs.begin_frame(&self.settings, Instant::now());
         app.insert_resource(self.settings.clone())
             .insert_resource(NeighborRules::from_registry(&self.registry))
+            .insert_resource(BlockUses::from_registry(&self.registry))
             .insert_resource(content)
             .init_resource::<ChunkMap>()
             .insert_resource(SkyMap::new(rule))

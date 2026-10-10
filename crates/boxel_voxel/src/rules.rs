@@ -1,15 +1,21 @@
-//! States that follow their neighbors (ADR 0020), as pure functions of the registry, the state
-//! and its 6 face neighbors: the `shape` of stairs, the sides of a fence, and torches that drop
-//! when their support goes. `boxel_world` applies them to the blocks around every edit
-//! (`NeighborRules`); they are plain functions so they can be tested without a world.
+//! States that follow their neighbors (ADR 0020, ADR 0027), as pure functions of the registry,
+//! the state and its 6 face neighbors: the `shape` of stairs, the sides of a fence, torches that
+//! drop when their support goes, the sides and post of a wall and a fence gate between walls.
+//! `boxel_world` applies them to the blocks around every edit (`NeighborRules`), and again
+//! around every block a rule changed; they are plain functions so they can be tested without a
+//! world.
 //!
-//! A rule only reads what no rule changes (whether a neighbor is stairs and its `facing` and
-//! `half`, whether it is a fence, its collision faces), so one ring of updates around each edit
-//! is enough: a state a rule changed never makes another rule change its answer.
+//! Most rules only read what no rule changes (whether a neighbor is stairs and its `facing` and
+//! `half`, whether it is a fence or a wall, the `facing` of a gate, the collision faces of
+//! blocks without rules). A wall also reads the block above it: its collision and, for another
+//! wall, its post. A change runs down a column of walls one block at a time, so the world
+//! applies the rules again around what a rule changed (ADR 0027). Walls only read upward, so
+//! that ends.
 //!
 //! Also the water of the blocks that hold it when a player places or breaks one (ADR 0025):
-//! [`placed_into`] and [`broken`].
-use crate::shapes::{Facing, StairShape, half_name};
+//! [`placed_into`] and [`broken`]; and what using a block does ([`UseRule`], ADR 0027): a fence
+//! gate opens and closes.
+use crate::shapes::{Facing, StairShape, WallSide, WallSides, half_name};
 use crate::{BlockCollision, BlockModel, BlockRegistry, BlockState, Face, RenderShape, SlabHalf};
 
 /// A neighbor rule: the state `state` should have given its 6 face neighbors (indexed by
@@ -18,16 +24,33 @@ pub type NeighborRule = fn(&BlockRegistry, BlockState, &[BlockState; 6]) -> Bloc
 
 /// The rule of the blocks drawn as `model`, if their state depends on their neighbors: stairs
 /// ([`stairs_rule`]), fences ([`fence_rule`]), standing and wall torches ([`torch_rule`],
-/// [`wall_torch_rule`]).
+/// [`wall_torch_rule`]), walls ([`wall_rule`]) and fence gates ([`fence_gate_rule`]).
 pub fn rule_for_model(model: BlockModel) -> Option<NeighborRule> {
     match model {
         BlockModel::Stairs { .. } => Some(stairs_rule),
         BlockModel::Fence { .. } => Some(fence_rule),
         BlockModel::Torch => Some(torch_rule),
         BlockModel::WallTorch { .. } => Some(wall_torch_rule),
+        BlockModel::Wall { .. } => Some(wall_rule),
+        BlockModel::FenceGate { .. } => Some(fence_gate_rule),
         BlockModel::Cube { .. } | BlockModel::Slab(_) | BlockModel::Cross | BlockModel::Fluid => {
             None
         }
+    }
+}
+
+/// What using a block (a player's right click on it) does: the state it takes when used by
+/// someone looking toward `look` (horizontally), or `None` if the block is not used that way
+/// (then the click places a block, as before). Engine level, like [`NeighborRule`]: the world
+/// keeps one per block (`boxel_world::BlockUses`) and the game asks it.
+pub type UseRule = fn(&BlockRegistry, BlockState, Facing) -> Option<BlockState>;
+
+/// The use rule of the blocks drawn as `model`: fence gates open and close
+/// ([`fence_gate_use`]).
+pub fn use_rule_for_model(model: BlockModel) -> Option<UseRule> {
+    match model {
+        BlockModel::FenceGate { .. } => Some(fence_gate_use),
+        _ => None,
     }
 }
 
@@ -147,15 +170,186 @@ pub fn supports_center(registry: &BlockRegistry, state: BlockState, face: Face) 
 }
 
 /// True if a fence connects toward `toward` to `neighbor`, Minecraft's rule simplified: another
-/// fence, or a block whose face toward the fence is sturdy, except cutout blocks (leaves).
+/// fence, a fence gate that runs across `toward` ([`gate_connects`]), or a block whose face
+/// toward the fence is sturdy, except cutout blocks (leaves). Not a wall: its sides are not
+/// sturdy, as in Minecraft.
 pub fn fence_connects(registry: &BlockRegistry, neighbor: BlockState, toward: Facing) -> bool {
     match registry.model(neighbor) {
         BlockModel::Fence { .. } => true,
-        _ => {
-            registry.shape(neighbor) != RenderShape::Cutout
-                && is_sturdy(registry, neighbor, toward.opposite().face())
-        }
+        BlockModel::FenceGate { facing, .. } => gate_connects(facing, toward),
+        _ => sturdy_toward(registry, neighbor, toward),
     }
+}
+
+/// `neighbor`'s face toward a block on its `toward.opposite()` side is sturdy, and it is not a
+/// cutout block (leaves: Minecraft's `isExceptionForConnection`).
+fn sturdy_toward(registry: &BlockRegistry, neighbor: BlockState, toward: Facing) -> bool {
+    registry.shape(neighbor) != RenderShape::Cutout
+        && is_sturdy(registry, neighbor, toward.opposite().face())
+}
+
+/// True if a fence gate facing `gate` connects to a fence or a wall on its `toward.opposite()`
+/// side: the gate runs across its facing, so its ends are on the two sides across it
+/// (Minecraft's `FenceGateBlock::connectsToDirection`). Open or closed.
+pub const fn gate_connects(gate: Facing, toward: Facing) -> bool {
+    !matches!(
+        (gate, toward),
+        (Facing::North | Facing::South, Facing::North | Facing::South)
+            | (Facing::West | Facing::East, Facing::West | Facing::East)
+    )
+}
+
+/// True if a wall connects toward `toward` to `neighbor` (Minecraft's
+/// `WallBlock::connectsTo`): another wall, a fence gate that runs across `toward`
+/// ([`gate_connects`]), or a sturdy face toward the wall, except cutout blocks (leaves). Not a
+/// fence.
+pub fn wall_connects(registry: &BlockRegistry, neighbor: BlockState, toward: Facing) -> bool {
+    match registry.model(neighbor) {
+        BlockModel::Wall { .. } => true,
+        BlockModel::FenceGate { facing, .. } => gate_connects(facing, toward),
+        _ => sturdy_toward(registry, neighbor, toward),
+    }
+}
+
+/// The part of the bottom face of the block above a wall that Minecraft tests to make the wall
+/// tall or raise its post, as `[x0, x1, z0, z1]` in sixteenths: 2 wide through the middle of the
+/// cell, from the middle (`POST_TEST`) to each side (`NORTH_TEST`...).
+const fn wall_test(toward: Option<Facing>) -> [u8; 4] {
+    match toward {
+        None => [7, 9, 7, 9],
+        Some(Facing::North) => [7, 9, 0, 9],
+        Some(Facing::South) => [7, 9, 7, 16],
+        Some(Facing::West) => [0, 9, 7, 9],
+        Some(Facing::East) => [7, 16, 7, 9],
+    }
+}
+
+/// True if `cover` (a bottom face cover, [`collision_face_cover`]: rows along z, bits along x)
+/// holds every sixteenth of `rect` (`[x0, x1, z0, z1]`).
+fn covers(cover: &[u16; 16], rect: [u8; 4]) -> bool {
+    let bits = span_bits(rect[0], rect[1]);
+    cover[usize::from(rect[2])..usize::from(rect[3])]
+        .iter()
+        .all(|&row| row & bits == bits)
+}
+
+/// The post and sides of a wall (Minecraft's `WallBlock::updateShape`), given which sides
+/// connect ([`wall_connects`], indexed by `Facing as usize`) and the block above it. A connected
+/// side is tall when the bottom of the block above covers it (the collision of what is above,
+/// cut at its bottom face: a block, a wall or a fence above), else low. The post stands:
+/// - under a wall with a post;
+/// - else at an end, a corner, a T or alone: when north and south differ in being connected,
+///   east and west differ, or nothing connects;
+/// - else (a straight run or a cross) not when an opposite pair is tall on both sides, and
+///   otherwise when a standing torch is above (Minecraft's `wall_post_override` tag) or the
+///   bottom of the block above covers the middle of the cell.
+pub fn wall_shape_of(
+    registry: &BlockRegistry,
+    connected: [bool; 4],
+    above: BlockState,
+) -> (bool, WallSides) {
+    let cover = collision_face_cover(registry.collision(above), Face::NegY);
+    let mut sides = WallSides::NONE;
+    for f in Facing::ALL {
+        let side = if !connected[f as usize] {
+            WallSide::None
+        } else if covers(&cover, wall_test(Some(f))) {
+            WallSide::Tall
+        } else {
+            WallSide::Low
+        };
+        sides = sides.with(f, side);
+    }
+    let above_model = registry.model(above);
+    let post = if matches!(above_model, BlockModel::Wall { post: true, .. })
+        && registry.shape(above) != RenderShape::None
+    {
+        true
+    } else {
+        let none = |f: Facing| !sides.get(f).is_connected();
+        let tall = |f: Facing| sides.get(f) == WallSide::Tall;
+        let (n, s, w, e) = (Facing::North, Facing::South, Facing::West, Facing::East);
+        let lone = none(n) && none(s) && none(w) && none(e);
+        if lone || none(n) != none(s) || none(w) != none(e) {
+            true
+        } else if (tall(n) && tall(s)) || (tall(w) && tall(e)) {
+            false
+        } else {
+            let torch =
+                above_model == BlockModel::Torch && registry.shape(above) != RenderShape::None;
+            torch || covers(&cover, wall_test(None))
+        }
+    };
+    (post, sides)
+}
+
+/// A wall takes its sides and post from its neighbors ([`wall_connects`], [`wall_shape_of`]);
+/// other states (`waterlogged`) are kept.
+pub fn wall_rule(
+    registry: &BlockRegistry,
+    state: BlockState,
+    neighbors: &[BlockState; 6],
+) -> BlockState {
+    if !matches!(registry.model(state), BlockModel::Wall { .. }) {
+        return state;
+    }
+    // `Facing::ALL` is in `Facing as usize` order.
+    let connected = Facing::ALL.map(|f| wall_connects(registry, neighbors[f.face().index()], f));
+    let (post, sides) = wall_shape_of(registry, connected, neighbors[Face::PosY.index()]);
+    let mut out = registry
+        .with(state, "up", if post { "true" } else { "false" })
+        .unwrap_or(state);
+    for f in Facing::ALL {
+        out = registry
+            .with(out, f.name(), sides.get(f).name())
+            .unwrap_or(out);
+    }
+    out
+}
+
+/// True for a wall (any state of a block drawn as [`BlockModel::Wall`]).
+pub fn is_wall(registry: &BlockRegistry, state: BlockState) -> bool {
+    matches!(registry.model(state), BlockModel::Wall { .. })
+        && registry.shape(state) != RenderShape::None
+}
+
+/// A fence gate is `in_wall` when a wall is at one of its ends, the two sides across its
+/// facing (Minecraft's `FenceGateBlock::updateShape`); other states are kept.
+pub fn fence_gate_rule(
+    registry: &BlockRegistry,
+    state: BlockState,
+    neighbors: &[BlockState; 6],
+) -> BlockState {
+    let BlockModel::FenceGate { facing, .. } = registry.model(state) else {
+        return state;
+    };
+    let wall = |f: Facing| is_wall(registry, neighbors[f.face().index()]);
+    let in_wall = wall(facing.clockwise()) || wall(facing.counterclockwise());
+    registry
+        .with(state, "in_wall", if in_wall { "true" } else { "false" })
+        .unwrap_or(state)
+}
+
+/// Using a fence gate (Minecraft's `FenceGateBlock::useWithoutItem`): an open gate closes; a
+/// closed one opens away from the user, who looks toward `look`, turning it around when it
+/// faces the user.
+pub fn fence_gate_use(
+    registry: &BlockRegistry,
+    state: BlockState,
+    look: Facing,
+) -> Option<BlockState> {
+    let BlockModel::FenceGate { facing, open, .. } = registry.model(state) else {
+        return None;
+    };
+    if open {
+        return registry.with(state, "open", "false");
+    }
+    let turned = if facing == look.opposite() {
+        registry.with(state, "facing", look.name())?
+    } else {
+        state
+    };
+    registry.with(turned, "open", "true")
 }
 
 /// A fence connects its sides to the neighbors [`fence_connects`] accepts (other states are

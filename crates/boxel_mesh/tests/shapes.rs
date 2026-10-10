@@ -1,6 +1,6 @@
-//! The per-block path of the non-cube blocks (ADR 0018, ADR 0020): models made of boxes (slabs,
-//! stairs, fences, torches), cross plants and turned cubes, against brute-force rules written
-//! here, sixteenth by sixteenth, independent of the mesher.
+//! The per-block path of the non-cube blocks (ADR 0018, ADR 0020, ADR 0027): models made of
+//! boxes (slabs, stairs, fences, torches, walls, fence gates), cross plants and turned cubes,
+//! against brute-force rules written here, sixteenth by sixteenth, independent of the mesher.
 
 mod common;
 
@@ -11,7 +11,7 @@ use boxel_mesh::{
 };
 use boxel_voxel::{
     Axis, BlockModel, BlockRegistry, Face, Facing, FenceSides, LightValue, ModelBox, RenderShape,
-    SlabHalf, StairShape,
+    SlabHalf, StairShape, WallSide, WallSides,
 };
 use common::{Fill, LIGHT_FILLS, random_light, random_padded, set_material};
 use std::collections::BTreeSet;
@@ -19,7 +19,9 @@ use std::collections::BTreeSet;
 /// Materials: 1..=2 opaque cubes, 3 cutout cube, 4 translucent cube, 5 bottom slab, 6 top
 /// slab, 7 a cross (cutout), 8 a cube turned to X, 9 a cube turned to Z, 10 a translucent
 /// bottom slab, 11 and 12 stairs (two of each), 13 and 14 fences, 15 a torch and 16 a wall
-/// torch (cutout). Layer of (material, face) is `material * 6 + face`.
+/// torch (cutout), 17 and 18 walls (a post with four low sides, a tall straight run), 19 and 20
+/// fence gates (closed between walls, open). Layer of (material, face) is `material * 6 +
+/// face`.
 const BOTTOM: u16 = 5;
 const TOP: u16 = 6;
 const CROSS: u16 = 7;
@@ -32,9 +34,13 @@ const FENCE: u16 = 13;
 const FENCE_END: u16 = 14;
 const TORCH: u16 = 15;
 const WALL_TORCH: u16 = 16;
-const ALL: [u16; 16] = [
+const WALL: u16 = 17;
+const WALL_RUN: u16 = 18;
+const GATE: u16 = 19;
+const GATE_OPEN: u16 = 20;
+const ALL: [u16; 20] = [
     1, 2, 3, 4, BOTTOM, TOP, CROSS, LOG_X, LOG_Z, GLASS_SLAB, STAIRS, STAIRS_TOP, FENCE, FENCE_END,
-    TORCH, WALL_TORCH,
+    TORCH, WALL_TORCH, WALL, WALL_RUN, GATE, GATE_OPEN,
 ];
 
 /// The model of a material of [`table`].
@@ -65,12 +71,34 @@ fn model_of(m: u16) -> BlockModel {
         WALL_TORCH => BlockModel::WallTorch {
             facing: Facing::South,
         },
+        WALL => BlockModel::Wall {
+            post: true,
+            sides: Facing::ALL
+                .into_iter()
+                .fold(WallSides::NONE, |s, f| s.with(f, WallSide::Low)),
+        },
+        WALL_RUN => BlockModel::Wall {
+            post: false,
+            sides: WallSides::NONE
+                .with(Facing::North, WallSide::Tall)
+                .with(Facing::South, WallSide::Tall),
+        },
+        GATE => BlockModel::FenceGate {
+            facing: Facing::East,
+            open: false,
+            in_wall: true,
+        },
+        GATE_OPEN => BlockModel::FenceGate {
+            facing: Facing::North,
+            open: true,
+            in_wall: false,
+        },
         _ => BlockModel::CUBE,
     }
 }
 
 fn table() -> MaterialTable {
-    let shapes: Vec<RenderShape> = (0..=16)
+    let shapes: Vec<RenderShape> = (0..=GATE_OPEN)
         .map(|m| match m {
             0 => RenderShape::None,
             3 | CROSS | TORCH | WALL_TORCH => RenderShape::Cutout,
@@ -306,8 +334,8 @@ fn random_chunks_with_shapes_match_the_rules() {
         // Shapes first in the palette: Terrain puts the first entries on top.
         let palette: Vec<u16> = if seed % 2 == 0 {
             vec![
-                BOTTOM, STAIRS, CROSS, FENCE, TOP, 1, TORCH, LOG_X, 2, STAIRS_TOP, GLASS_SLAB,
-                LOG_Z, FENCE_END, 3, WALL_TORCH, 4,
+                BOTTOM, STAIRS, CROSS, FENCE, TOP, WALL, 1, TORCH, LOG_X, 2, GATE, STAIRS_TOP,
+                GLASS_SLAB, LOG_Z, WALL_RUN, FENCE_END, 3, WALL_TORCH, GATE_OPEN, 4,
             ]
         } else {
             ALL.to_vec()
@@ -472,6 +500,47 @@ fn fences_and_torches_hide_only_what_they_cover() {
             .iter()
             .filter(|s| s.0 == [9, 5, 9])
             .all(|s| s.4 == CUTOUT_BUCKET)
+    );
+}
+
+/// A wall's bars stop at its post, a straight run is one box whose ends hide against the next
+/// wall, and a gate between walls hides the ends of its posts against them (ADR 0027).
+#[test]
+fn walls_and_gates_hide_what_they_cover() {
+    let table = table();
+    let mut padded = PaddedChunk::new();
+    let put = |padded: &mut PaddedChunk, p: [i32; 3], m| set_material(padded, &table, p, m);
+    // A lone wall with a post and four low sides, in the air.
+    put(&mut padded, [3, 5, 3], WALL);
+    // A run of walls along z with a gate in it (the gate runs along z: it faces east).
+    put(&mut padded, [9, 5, 8], WALL_RUN);
+    put(&mut padded, [9, 5, 9], WALL_RUN);
+    put(&mut padded, [9, 5, 10], GATE);
+    put(&mut padded, [9, 5, 11], WALL_RUN);
+    let mesh = mesh(&padded, &table, None, AoPolicy::Off);
+    let (_, specials) = split_mesh(&mesh, &table);
+    // The post: 6 faces; each bar: top, bottom, two sides and its outer end (the end at the post
+    // is never drawn).
+    assert_eq!(box_faces(&specials, [3, 5, 3]).len(), 6 + 4 * 5);
+    // One box per run piece: top, bottom, two sides, and the open end of the first one.
+    let first = box_faces(&specials, [9, 5, 8]);
+    assert_eq!(first.len(), 5);
+    assert!(first.iter().any(|(f, _)| *f == Face::NegZ));
+    assert_eq!(
+        box_faces(&specials, [9, 5, 9]).len(),
+        4 + 1,
+        "its end at the gate shows"
+    );
+    // The gate's posts end against the walls: no gate face on the cell border along z.
+    let gate = box_faces(&specials, [9, 5, 10]);
+    assert!(!gate.is_empty());
+    assert!(!gate.iter().any(|(f, b)| {
+        (*f == Face::NegZ && b.bounds.min[2] == 0) || (*f == Face::PosZ && b.bounds.max[2] == 16)
+    }));
+    // In the wall: 3 sixteenths lower than Minecraft's free gate (its posts start at 5).
+    assert!(
+        gate.iter()
+            .all(|(_, b)| b.bounds.min[1] >= 2 && b.bounds.max[1] <= 13)
     );
 }
 

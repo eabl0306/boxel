@@ -49,7 +49,8 @@ fn around(pairs: &[(Face, BlockState)]) -> [BlockState; 6] {
 #[test]
 fn the_new_blocks_have_their_states_and_ids() {
     let r = registry();
-    assert_eq!(r.len(), 257);
+    // The blocks of ADR 0027 come after these (`walls.rs`).
+    assert_eq!(r.len(), 597);
     let stone_stairs = r.block_by_name("boxel:stone_stairs").unwrap();
     assert_eq!(r.states(stone_stairs).len(), 80);
     assert_eq!(r.default_state(stone_stairs), BlockState(58));
@@ -456,8 +457,12 @@ fn the_default_blocks_use_few_model_boxes() {
         boxes.extend(r.model(BlockState(i as u16)).boxes());
     }
     assert!(boxes.len() <= MAX_MODEL_BOXES);
-    // Slabs 2, stairs 2 slabs + 8 steps + 8 quarters (some shared), fences 9, torches 5.
-    assert!(boxes.len() < 64, "{}", boxes.len());
+    // Slabs 2, stairs 2 slabs + 8 steps + 8 quarters (some shared), fences 9, torches 5; walls
+    // and gates add theirs (`walls.rs`).
+    let before_walls: HashSet<ModelBox> = (0..257)
+        .flat_map(|i| r.model(BlockState(i)).boxes())
+        .collect();
+    assert!(before_walls.len() < 64, "{}", before_walls.len());
     assert!(boxes.iter().all(|b| b.is_valid()));
 }
 

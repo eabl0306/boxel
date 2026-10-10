@@ -1,5 +1,6 @@
 //! The light of the blocks of ADR 0020: torches glow at level 14 (warm white), stairs pass light
-//! like slabs (they stop direct sky), fences and torches stop nothing.
+//! like slabs (they stop direct sky), fences and torches stop nothing; and of ADR 0027: walls and
+//! fence gates stop nothing either, but a wall holding water stops direct sky.
 
 use boxel_light::oracle::OracleWorld;
 use boxel_voxel::{
@@ -72,4 +73,30 @@ fn stairs_pass_light_like_slabs_and_fences_pass_sky() {
     // Fences and torches stop nothing.
     assert_eq!(light([6, 19, 4]).sky(), 15);
     assert_eq!(light([7, 19, 4]).sky(), 15);
+}
+
+#[test]
+fn walls_and_gates_pass_sky_like_fences() {
+    let registry = BlockRegistry::default_blocks();
+    let light = solve(
+        &registry,
+        &[
+            ([8, 20, 4], "boxel:cobblestone_wall"),
+            (
+                [9, 20, 4],
+                "boxel:cobblestone_wall[east=tall,west=tall,up=false]",
+            ),
+            ([10, 20, 4], "boxel:oak_fence_gate"),
+            (
+                [11, 20, 4],
+                "boxel:oak_fence_gate[facing=east,open=true,in_wall=true]",
+            ),
+            ([12, 20, 4], "boxel:cobblestone_wall[waterlogged=true]"),
+        ],
+    );
+    for x in 8..12 {
+        assert_eq!(light([x, 19, 4]).sky(), 15, "x {x}");
+    }
+    // The water a wall holds stops direct sky, as in a waterlogged fence.
+    assert_eq!(light([12, 19, 4]).sky(), 14);
 }

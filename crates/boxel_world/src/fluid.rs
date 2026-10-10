@@ -16,9 +16,11 @@
 //!   neighbors give it. A falling cell spreads like amount 8. So water reaches 7 blocks and
 //!   lava 3.
 //! - A cell can hold a fluid if nothing in it stops movement (air, plants, torches, water and
-//!   lava). The fluid may flow into it if what it holds can be replaced: an empty cell always,
-//!   water only by lava falling into it (which turns it to stone), lava only by water where the
-//!   lava is at least 4/9 high. A fluid never replaces its own cells.
+//!   lava; a fence gate stops it open or closed, as in Minecraft, though an open one does not
+//!   collide: `BlockRegistry::blocks_motion`). The fluid may flow into it if what it holds can
+//!   be replaced: an empty cell always, water only by lava falling into it (which turns it to
+//!   stone), lava only by water where the lava is at least 4/9 high. A fluid never replaces its
+//!   own cells.
 //! - A waterlogged block (a slab, stairs or a fence whose `waterlogged` is `true`, ADR 0025)
 //!   holds a water source: it ticks and spreads like one and counts as one for its neighbors.
 //!   Flowing water never fills a block (it stops movement), but a dry one where water would
@@ -496,19 +498,21 @@ impl Flow<'_> {
     }
 
     /// Minecraft's `canHoldFluid`: nothing in the cell stops movement (air, plants, torches,
-    /// water and lava), and it is not a fluid this module does not know.
+    /// water and lava; not a fence gate, even open: [`BlockRegistry::blocks_motion`]), and it is
+    /// not a fluid this module does not know.
     fn can_hold(&self, state: Option<BlockState>) -> bool {
         let Some(state) = state else {
             return false;
         };
         let registry = self.registry();
-        registry.collision(state).is_none()
+        !registry.blocks_motion(state)
             && (registry.model(state) != BlockModel::Fluid || self.fluids.content(state).is_some())
     }
 
-    /// Minecraft's `isSolid`: something that collides (not loaded counts as solid).
+    /// Minecraft's `isSolid`: something that stops movement (it collides, or a fence gate, open
+    /// or closed); not loaded counts as solid.
     fn is_solid(&self, state: Option<BlockState>) -> bool {
-        state.is_none_or(|s| !self.registry().collision(s).is_none())
+        state.is_none_or(|s| self.registry().blocks_motion(s))
     }
 
     /// Minecraft's `FluidState::canBeReplacedWith`: what `state` holds gives way to this fluid

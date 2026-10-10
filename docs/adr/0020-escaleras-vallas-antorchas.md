@@ -109,7 +109,9 @@ mecanismo del motor que recalcule el estado de un bloque cuando cambia un vecino
   frame, con un solo remallado y un `BlockChanged` por bloque.
 - Una sola vuelta: lo que cambió una regla no se vuelve a mirar. Las reglas de serie no lo
   necesitan, porque ninguna lee lo que otra cambia (si un vecino es escalera y su `facing` y
-  `half`, si es valla, su colisión). Una regla nueva debe cumplir lo mismo.
+  `half`, si es valla, su colisión). Una regla nueva debe cumplir lo mismo. Revisado en ADR
+  0027: el muro lee el poste del muro de arriba, así que lo que cambia una regla vuelve a mirar
+  sus vecinos.
 - Si un vecino está en un chunk que no se puede leer, el bloque queda como está: un borde de
   chunk no tira antorchas ni corta vallas.
 - Va separado de los ticks programados (los fluidos): no guarda estado entre frames y solo ve un
@@ -165,7 +167,8 @@ mecanismo del motor que recalcule el estado de un bloque cuando cambia un vecino
 
 - Valla de 1,5 bloques de alto (sección 6; hecho en ADR 0026).
 - Antorcha de pared inclinada como en Minecraft.
-- Puertas de valla, paneles, muros, escaleras con agua (`waterlogged`).
+- Puertas de valla, paneles, muros, escaleras con agua (`waterlogged`). Muros y puertas: ADR
+  0027; escaleras con agua: ADR 0025.
 - Que un cubo oculte su cara contra la espalda llena de una escalera: hoy se dibuja y la tapa la
   profundidad, como con las losas.
 

@@ -347,8 +347,10 @@ fn hidden_mesh(n: u32) -> ChunkMesh {
 /// short grass and poppies, and logs along X and Z; and flowing water (ADR 0021): a source with
 /// its flowing levels around it (sloped tops, `SHAPE_FLUID_SLOPE`) and a source over a falling
 /// column; and ADR 0025: a waterlogged slab, stairs and fence in the pool, and lava spread 3
-/// blocks around a source. Meshed by the real mesher (no light: open sky). Returns `(chunk,
-/// mesh)` for both chunks.
+/// blocks around a source; and ADR 0027: a cobblestone wall run with a corner, a post raised by
+/// the wall above it, tall sides under a stone block and a gate dropped into it, an open gate
+/// with a fence at its end, and a waterlogged wall in the pool. Meshed by the real mesher (no
+/// light: open sky). Returns `(chunk, mesh)` for both chunks.
 fn special_scene(registry: &BlockRegistry) -> Vec<(IVec3, ChunkMesh)> {
     let get = |name: &str| registry.parse_state(name).expect(name);
     let mut dense = [
@@ -390,6 +392,7 @@ fn special_scene(registry: &BlockRegistry) -> Vec<(IVec3, ChunkMesh)> {
         get("boxel:stone_stairs[facing=north,waterlogged=true]"),
     );
     put(8, 1, 8, get("boxel:oak_fence[waterlogged=true]"));
+    put(5, 1, 8, get("boxel:cobblestone_wall[waterlogged=true]"));
     // Lava: a source at (44, 1, 24) and its spread, levels 2, 4 and 6.
     for x in 41..48 {
         for z in 21..28 {
@@ -442,6 +445,26 @@ fn special_scene(registry: &BlockRegistry) -> Vec<(IVec3, ChunkMesh)> {
     }
     put(19, 1, 26, get("boxel:oak_fence[west=true]"));
     put(17, 1, 28, get("boxel:torch"));
+    // ADR 0027: the states the neighbor rules give this wall run (`boxel_voxel::rules`).
+    for (x, y, z, name) in [
+        (22, 1, 24, "boxel:cobblestone_wall[east=low]"),
+        (23, 1, 24, "boxel:cobblestone_wall[east=low,west=low]"),
+        (23, 2, 24, "boxel:cobblestone_wall"),
+        (24, 1, 24, "boxel:oak_fence_gate[facing=south,in_wall=true]"),
+        (
+            25,
+            1,
+            24,
+            "boxel:cobblestone_wall[east=tall,west=tall,up=false]",
+        ),
+        (25, 2, 24, "boxel:stone"),
+        (26, 1, 24, "boxel:cobblestone_wall[south=low,west=low]"),
+        (26, 1, 25, "boxel:cobblestone_wall[north=low]"),
+        (28, 1, 24, "boxel:oak_fence_gate[facing=north,open=true]"),
+        (29, 1, 24, "boxel:oak_fence[west=true]"),
+    ] {
+        put(x, y, z, get(name));
+    }
     put(21, 1, 27, get("boxel:stone"));
     put(21, 1, 28, get("boxel:wall_torch[facing=south]"));
     // Plants and logs.
@@ -471,6 +494,30 @@ fn special_scene(registry: &BlockRegistry) -> Vec<(IVec3, ChunkMesh)> {
         put(46, y, 12, get("boxel:water[level=8]"));
     }
     put(46, 5, 12, get("boxel:water"));
+    // The walls and gates are what the rules give (air outside the two chunks).
+    for (x, y, z) in [
+        (22, 1, 24),
+        (23, 1, 24),
+        (24, 1, 24),
+        (25, 1, 24),
+        (26, 1, 24),
+    ] {
+        let block = |x: i32, y: i32, z: i32| {
+            let inside = (0..64).contains(&x) && (0..32).contains(&y) && (0..32).contains(&z);
+            if !inside {
+                return BlockState::AIR;
+            }
+            let local = LocalPos::new((x & 31) as u32, y as u32, z as u32);
+            dense[(x >> 5) as usize][local.index()]
+        };
+        let state = block(x, y, z);
+        let around = Face::ALL.map(|f| {
+            let n = f.normal();
+            block(x + n.x, y + n.y, z + n.z)
+        });
+        let rule = boxel_voxel::rules::rule_for_model(registry.model(state)).expect("a rule");
+        assert_eq!(rule(registry, state, &around), state, "({x}, {y}, {z})");
+    }
     let chunks = dense.map(|d| ChunkData::from_dense(&d));
     let materials = MaterialTable::from_registry(registry);
     let mut mesher = Mesher::new();
@@ -965,7 +1012,7 @@ fn render_tier(
     if sloped < 40 {
         return Err(format!("special scene: only {sloped} sloped fluid quads"));
     }
-    // The model boxes of the stairs, fences and torches (ADR 0020).
+    // The model boxes of the stairs, fences and torches (ADR 0020), walls and gates (ADR 0027).
     let materials = MaterialTable::from_registry(registry);
     renderer.set_model_boxes(&queue, materials.model_boxes());
     let upload = |renderer: &mut VoxelRenderer, opaque_only: bool| {

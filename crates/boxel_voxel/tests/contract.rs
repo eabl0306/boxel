@@ -175,14 +175,15 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
         "boxel:poppy",
     ];
     // ADR 0020 adds 197 states after these (stairs, fence, torches; tests/shapes.rs), ADR 0025
-    // cobblestone and obsidian.
-    assert_eq!(r.len(), states.len() + 199);
+    // cobblestone and obsidian, ADR 0027 the wall's 324 and the fence gate's 16
+    // (tests/walls.rs).
+    assert_eq!(r.len(), states.len() + 199 + 340);
     for (i, n) in states.iter().enumerate() {
         let s = BlockState(i as u16);
         assert_eq!(r.parse_state(n), Ok(s), "{n}");
         assert_eq!(r.state_name(s).to_string(), *n);
     }
-    assert_eq!(r.block_count(), 28);
+    assert_eq!(r.block_count(), 30);
     // A plain name is the default state.
     assert_eq!(r.by_name("boxel:log"), Some(BlockState(9)));
     assert_eq!(r.by_name("boxel:stone_slab"), Some(BlockState(50)));

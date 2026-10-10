@@ -1,5 +1,5 @@
-//! Neighbor rules in the world (ADR 0020): stairs, fences and torches follow the edits around
-//! them in the same edit batch, with one `BlockChanged` per block.
+//! Neighbor rules in the world (ADR 0020, ADR 0027): stairs, fences, torches, walls and gates
+//! follow the edits around them in the same edit batch, with one `BlockChanged` per block.
 use super::{settings, settle, spawn_viewer, world_app};
 use crate::jobs::InlineExecutor;
 use crate::tests::support::LayerGen;
@@ -112,6 +112,67 @@ fn fences_connect_to_fences_and_full_faces() {
         at(&app, f),
         "boxel:oak_fence[east=true,north=false,south=false,waterlogged=false,west=false]"
     );
+}
+
+/// Walls connect and raise their posts, a gate between them drops into the wall, a fence
+/// connects to the gate's other end, and breaking the torch on a two-high wall lowers both
+/// posts in one batch (ADR 0027).
+#[test]
+fn walls_and_gates_follow_their_neighbors() {
+    let mut app = app();
+    let p = |x, y, z| BlockPos::new(x, y, z);
+    edit(
+        &mut app,
+        &[
+            (p(2, 0, 8), "boxel:cobblestone_wall"),
+            (p(3, 0, 8), "boxel:cobblestone_wall"),
+            (p(4, 0, 8), "boxel:oak_fence_gate[facing=south]"),
+            (p(5, 0, 8), "boxel:oak_fence"),
+        ],
+    );
+    assert_eq!(
+        at(&app, p(2, 0, 8)),
+        "boxel:cobblestone_wall[east=low,north=none,south=none,up=true,waterlogged=false,\
+         west=none]"
+    );
+    assert_eq!(
+        at(&app, p(3, 0, 8)),
+        "boxel:cobblestone_wall[east=low,north=none,south=none,up=false,waterlogged=false,\
+         west=low]"
+    );
+    assert_eq!(
+        at(&app, p(4, 0, 8)),
+        "boxel:oak_fence_gate[facing=south,in_wall=true,open=false]"
+    );
+    assert_eq!(
+        at(&app, p(5, 0, 8)),
+        "boxel:oak_fence[east=false,north=false,south=false,waterlogged=false,west=true]"
+    );
+    // A second row on top with a torch: both walls under the torch get posts, the lower one's
+    // sides go tall; breaking the torch takes both posts down in one batch.
+    edit(
+        &mut app,
+        &[
+            (p(2, 1, 8), "boxel:cobblestone_wall"),
+            (p(3, 1, 8), "boxel:cobblestone_wall"),
+            (p(1, 0, 8), "boxel:cobblestone_wall"),
+            (p(1, 1, 8), "boxel:cobblestone_wall"),
+            (p(2, 2, 8), "boxel:torch"),
+        ],
+    );
+    assert_eq!(app_property(&app, p(2, 1, 8), "up"), "true");
+    assert_eq!(app_property(&app, p(2, 0, 8), "up"), "true");
+    assert_eq!(app_property(&app, p(2, 0, 8), "east"), "tall");
+    let changes = edit(&mut app, &[(p(2, 2, 8), "boxel:air")]);
+    assert_eq!(app_property(&app, p(2, 1, 8), "up"), "false");
+    assert_eq!(app_property(&app, p(2, 0, 8), "up"), "false");
+    assert_eq!(changes.len(), 3, "the torch and the two walls under it");
+}
+
+fn app_property(app: &App, pos: BlockPos, property: &str) -> String {
+    let registry = BlockRegistry::default_blocks();
+    let s = app.world().resource::<ChunkMap>().block_at(pos).unwrap();
+    registry.property(s, property).unwrap().to_string()
 }
 
 #[test]

@@ -7,7 +7,7 @@
 //! grabbed, left click breaks the block under the crosshair and right click places the selected
 //! block on the face it points at (keys 1 to 9 and 0 select it, lamps on 7 to 0; the mouse wheel
 //! scrolls through those and the rest: glass, the stone slab, short grass, a poppy, water, lava,
-//! stone and oak stairs, the oak fence and the torch;
+//! stone and oak stairs, the oak fence, the torch, the cobblestone wall and the oak fence gate;
 //! F3 shows the target, the selection and the light at the eye and the crosshair), never where a
 //! solid body is (the walking player: `PhysicsQuery::state_is_free`, against the placed block's
 //! shape). A slab goes in as a top slab when the click hits the bottom of a block or the upper
@@ -15,8 +15,11 @@
 //! half of a slab of the same block makes a double slab. Stairs face away from the player and
 //! go upside down like top slabs, and take their corner shape from the stairs next to them; a
 //! fence connects to its neighbors; a torch stands on a top face and hangs on a side face (ADR
-//! 0020). F3 shows the target's full state (`boxel:log[axis=x]`). Picking is a voxel raycast
-//! from the camera (`PhysicsQuery::raycast_voxels`), reach 6 blocks, and the targeted block gets
+//! 0020). A wall connects and raises its post like Minecraft's, a fence gate faces the way the
+//! player looks and drops into a wall; right click on a gate opens or closes it instead of
+//! placing (with Shift it places, as in Minecraft; `BlockUses`, ADR 0027). F3 shows the
+//! target's full state (`boxel:log[axis=x]`). Picking is a voxel raycast from the camera
+//! (`PhysicsQuery::raycast_voxels`), reach 6 blocks, and the targeted block gets
 //! a thin dark outline (`BlockOutline`, ADR 0026) besides the crosshair. G switches between
 //! flying and walking: walking is a player body with gravity (`boxel::physics`, a 0.6 x 1.8 x
 //! 0.6 box and a `CharacterController`) that WASD moves along the view and Space makes jump,
@@ -25,9 +28,9 @@
 //! toggles creative flight (Space rises, Shift descends, landing ends it); the view bobs while
 //! walking (V turns it off). The fly camera keeps Shift and Ctrl for going down and boosting.
 //! F3 shows the mode (with flying, sneaking, crouching or sprinting) and a physics line
-//! (`PhysicsStats`) in both modes. Fences cannot be jumped: they collide 1.5 blocks tall. C
-//! drops a crate two blocks ahead (a solid dynamic box; bodies have no renderer yet, so F3
-//! counts them and gives the nearest).
+//! (`PhysicsStats`) in both modes. Fences cannot be jumped: they collide 1.5 blocks tall, and
+//! so do walls and closed gates. C drops a crate two blocks ahead (a solid dynamic box; bodies
+//! have no renderer yet, so F3 counts them and gives the nearest).
 //!
 //! Water flows (ADR 0021, `FluidPlugin`): placed water is a source that spreads 7 blocks and
 //! falls, breaking a block next to a lake or the sea lets it flow, and F3 shows the first water
@@ -82,7 +85,9 @@ use boxel::voxel::{Axis, BlockModel, BlockRegistry, Facing, MAX_BLOCK_COORD, Sla
 use boxel::window::winit::dpi::PhysicalSize;
 use boxel::window::{PrimaryWindow, WindowResized};
 use boxel::world::persist::{PersistPlugin, PersistSettings, WorldStore};
-use boxel::world::{BlockEdit, FluidPlugin, TimeOfDay, WorldContent, WorldStats, WorldSystems};
+use boxel::world::{
+    BlockEdit, BlockUses, FluidPlugin, TimeOfDay, WorldContent, WorldStats, WorldSystems,
+};
 use player::WalkPlugin;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1110,7 +1115,7 @@ fn vsync_test(
 const REACH: f64 = 6.0;
 /// The blocks keys 1 to 9 and 0 select for placing (the first ten) and the mouse wheel scrolls
 /// through (all of them; names missing from the registry are skipped).
-const HOTBAR: [&str; 20] = [
+const HOTBAR: [&str; 22] = [
     "boxel:stone",
     "boxel:dirt",
     "boxel:grass",
@@ -1131,6 +1136,8 @@ const HOTBAR: [&str; 20] = [
     "boxel:oak_stairs",
     "boxel:oak_fence",
     "boxel:torch",
+    "boxel:cobblestone_wall",
+    "boxel:oak_fence_gate",
 ];
 const HOTBAR_KEYS: [KeyCode; 10] = [
     KeyCode::Digit1,
@@ -1249,8 +1256,8 @@ fn placed_state(registry: &BlockRegistry, block: BlockState, hit: &VoxelHit) -> 
 /// (their high side away from the player) and go in upside down when the click hits a bottom
 /// face or the upper half of a side face, like slabs; their shape comes from their neighbors
 /// (the world's neighbor rules). A torch stands on a top face, hangs on a side face as a wall
-/// torch facing away from it, and does not go under a block (`None`). A fence connects by
-/// itself.
+/// torch facing away from it, and does not go under a block (`None`). A fence gate faces the way
+/// the player looks (ADR 0027). Fences, walls and gates connect by themselves.
 fn placement(
     registry: &BlockRegistry,
     block: BlockState,
@@ -1269,6 +1276,9 @@ fn placement(
             };
             let half = if top { SlabHalf::Top } else { SlabHalf::Bottom };
             rules::stairs_with(registry, block, Facing::of_look(look.x, look.z), half)
+        }
+        BlockModel::FenceGate { .. } => {
+            registry.with(block, "facing", Facing::of_look(look.x, look.z).name())
         }
         BlockModel::Torch | BlockModel::WallTorch { .. } => {
             // `boxel:torch` and `boxel:wall_torch` (Minecraft's naming).
@@ -1436,6 +1446,7 @@ fn pick_blocks(
     lines: Option<ResMut<OverlayLines>>,
     crosshair: Option<ResMut<CrosshairTarget>>,
     outline: Option<ResMut<BlockOutline>>,
+    uses: Option<Res<BlockUses>>,
 ) {
     if let Some(slot) = HOTBAR_KEYS.iter().position(|&key| keys.just_pressed(key))
         && slot < picking.hotbar.len()
@@ -1528,9 +1539,22 @@ fn pick_blocks(
                 .or_else(|| water_fill(registry, picking.block(), &hit)),
             Click::Break => None,
         };
-        let edit = match merge {
-            Some(edit) => physics.state_is_free(edit.pos, edit.state).then_some(edit),
-            None => click_edit(click, &hit, block, free)
+        // A block that is used takes the right click (a gate opens or closes), unless the player
+        // sneaks: then it places, as in Minecraft (ADR 0027).
+        let sneaking = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+        let used = match (click, uses.as_deref()) {
+            (Click::Place, Some(uses)) if !sneaking => uses
+                .use_block(registry, hit.state, Facing::of_look(look.x, look.z))
+                .map(|state| BlockEdit {
+                    pos: hit.block,
+                    state,
+                }),
+            _ => None,
+        };
+        let edit = match (used, merge) {
+            (Some(edit), _) => Some(edit),
+            (None, Some(edit)) => physics.state_is_free(edit.pos, edit.state).then_some(edit),
+            (None, None) => click_edit(click, &hit, block, free)
                 .map(|edit| with_water_rules(registry, edit, probe(edit.pos).unwrap_or_default())),
         };
         if let Some(edit) = edit {
@@ -2249,6 +2273,57 @@ mod tests {
         assert_eq!(block_at(&app, BlockPos::new(0, 3, 0)), Some(grass));
     }
 
+    /// Right click on a fence gate opens it and closes it instead of placing a block; with Shift
+    /// held it places, as in Minecraft (ADR 0027).
+    #[test]
+    fn right_click_uses_a_gate_and_shift_places_on_it() {
+        let mut app = picking_app();
+        let registry = BlockRegistry::default_blocks();
+        let gate = BlockPos::new(0, 4, 0);
+        app.world_mut().resource_mut::<EditQueue>().set_block(
+            gate,
+            registry.by_name("boxel:oak_fence_gate").expect("gate"),
+        );
+        app.update();
+        app.update();
+        // The first click only grabs the cursor.
+        click(&mut app, MouseButton::Left);
+        assert_eq!(
+            app.world().resource::<Picking>().target.map(|t| t.block),
+            Some(gate)
+        );
+        let open = |app: &App| {
+            let state = block_at(app, gate).expect("loaded");
+            assert_eq!(registry.name(state), "boxel:oak_fence_gate");
+            registry.property(state, "open") == Some("true")
+        };
+        assert!(!open(&app));
+        click(&mut app, MouseButton::Right);
+        assert!(open(&app), "opened, nothing placed");
+        assert_eq!(
+            block_at(&app, BlockPos::new(0, 5, 0)),
+            Some(BlockState::AIR)
+        );
+        click(&mut app, MouseButton::Right);
+        assert!(!open(&app), "closed again");
+        // Sneaking: the selected block (stone) goes on top of the gate, which stays closed. The
+        // fly camera would go down with Shift: hold it still.
+        let mut cameras = app.world_mut().query::<&mut FlyCamera>();
+        for mut camera in cameras.iter_mut(app.world_mut()) {
+            camera.speed = 0.0;
+        }
+        key(&mut app, KeyCode::ShiftLeft, true);
+        app.update();
+        click(&mut app, MouseButton::Right);
+        key(&mut app, KeyCode::ShiftLeft, false);
+        app.update();
+        assert!(!open(&app));
+        assert_eq!(
+            block_at(&app, BlockPos::new(0, 5, 0)),
+            registry.by_name("boxel:stone")
+        );
+    }
+
     #[test]
     fn placed_water_flows_and_f3_shows_its_level() {
         let mut app = picking_app();
@@ -2890,6 +2965,22 @@ mod tests {
         assert_eq!(
             placement(&registry, fence, &hit(Face::PosX, 0.5), east),
             Some(fence)
+        );
+        // ADR 0027: a gate faces the way the player looks; a wall goes in as it is (its rules
+        // connect it).
+        let gate = by("boxel:oak_fence_gate");
+        assert_eq!(
+            placement(&registry, gate, &hit(Face::PosY, 1.0), east),
+            Some(by("boxel:oak_fence_gate[facing=east]"))
+        );
+        assert_eq!(
+            placement(&registry, gate, &hit(Face::NegZ, 0.5), north),
+            Some(by("boxel:oak_fence_gate[facing=north]"))
+        );
+        let wall = by("boxel:cobblestone_wall");
+        assert_eq!(
+            placement(&registry, wall, &hit(Face::PosY, 1.0), east),
+            Some(wall)
         );
     }
 

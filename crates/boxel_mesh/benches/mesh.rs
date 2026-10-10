@@ -16,14 +16,16 @@
 //! The other `mesh/*`, `gather/*` and `gather_mesh/terrain_*` benches keep the M0 setup (AO
 //! off, no light) to compare with earlier runs; `mesh/terrain_baked` adds AO to every face.
 //! `mesh/shapes` and `gather_mesh/shapes` put stairs, fences, torches and slabs on a quarter of
-//! the terrain's surface cells (ADR 0020).
+//! the terrain's surface cells (ADR 0020). `mesh/walls` and `gather_mesh/walls` put cobblestone
+//! walls on the surface every 6 blocks along x and z, with a fence gate in every other run
+//! (ADR 0027), in the states the neighbor rules give them.
 #![expect(clippy::print_stderr, reason = "bench scene statistics")]
 
 use boxel_light::{LightScratch, PaddedLight, compute};
 use boxel_mesh::{AoPolicy, ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher, PaddedChunk};
 use boxel_voxel::{
-    BlockRegistry, BlockState, CHUNK_SIZE, ChunkData, ChunkKey, ChunkPos, LightTables, LightValue,
-    NEIGHBOR_OFFSETS,
+    BlockModel, BlockRegistry, BlockState, CHUNK_SIZE, ChunkData, ChunkKey, ChunkPos, Face,
+    LightTables, LightValue, NEIGHBOR_OFFSETS, rules,
 };
 use boxel_worldgen::{OverworldGenerator, WorldGenerator};
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -351,9 +353,17 @@ fn bench(c: &mut Criterion) {
     }
 
     // ADR 0020: the terrain with a block made of boxes on one surface cell in four (stairs of
-    // every shape, fences, torches, slabs): the per-block path at its busiest.
+    // every shape, fences, torches, slabs): the per-block path at its busiest. The walls and
+    // gates of ADR 0027 are left out, so the scene stays the one measured before them.
     let shaped: Vec<u16> = (0..registry.len() as u16)
-        .filter(|&s| !registry.model(BlockState(s)).boxes().is_empty())
+        .filter(|&s| {
+            let model = registry.model(BlockState(s));
+            !model.boxes().is_empty()
+                && !matches!(
+                    model,
+                    BlockModel::Wall { .. } | BlockModel::FenceGate { .. }
+                )
+        })
         .collect();
     let shapes = Scene::new([0, 1, 0], Repr::Packed, |x, y, z| {
         let h = height(x, z);
@@ -383,6 +393,50 @@ fn bench(c: &mut Criterion) {
         });
     });
     c.bench_function("gather_mesh/shapes", |bench| {
+        bench.iter(|| black_box(mesher.mesh_chunk(black_box(&input), &table, OFF)));
+    });
+
+    // ADR 0027: walls on the surface along x = 0 and z = 0 (mod 6), a gate in the runs along z
+    // at z = 3 (mod 12), each in the state its neighbor rule gives it.
+    let wall = registry
+        .by_name("boxel:cobblestone_wall")
+        .expect("built-in");
+    let gate = registry
+        .parse_state("boxel:oak_fence_gate[facing=east]")
+        .expect("built-in");
+    let raw = |x: i32, y: i32, z: i32| {
+        let on_line = x.rem_euclid(6) == 0 || z.rem_euclid(6) == 0;
+        let free = y == height(x, z) + 1 && terrain(&b, x, y, z) == 0;
+        if !(on_line && free) {
+            BlockState(terrain(&b, x, y, z))
+        } else if x.rem_euclid(6) == 0 && z.rem_euclid(12) == 3 {
+            gate
+        } else {
+            wall
+        }
+    };
+    let walls = Scene::new([0, 1, 0], Repr::Packed, |x, y, z| {
+        let state = raw(x, y, z);
+        let Some(rule) = rules::rule_for_model(registry.model(state)) else {
+            return state.0;
+        };
+        let around = Face::ALL.map(|f| {
+            let n = f.normal();
+            raw(x + n.x, y + n.y, z + n.z)
+        });
+        rule(&registry, state, &around).0
+    });
+    let input = walls.input();
+    let mesh = mesher.mesh_chunk(&input, &table, OFF);
+    eprintln!("scene walls: {} quads", mesh.total_quads());
+    mesher.gather(&input, &table, &mut padded);
+    c.bench_function("mesh/walls", |bench| {
+        bench.iter(|| {
+            mesher.mesh(black_box(&padded), None, &table, OFF, &mut out);
+            black_box(out.total_quads())
+        });
+    });
+    c.bench_function("gather_mesh/walls", |bench| {
         bench.iter(|| black_box(mesher.mesh_chunk(black_box(&input), &table, OFF)));
     });
 }

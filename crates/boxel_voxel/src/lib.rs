@@ -10,8 +10,9 @@
 //! - [`state`]: block state properties (ADR 0019): `boxel:log[axis=x]`, one dense id per
 //!   combination of values, contiguous per block.
 //! - [`shapes`]: the boxes of the models made of boxes (slabs, stairs, fences, torches; ADR
-//!   0020), and [`rules`]: the states that follow their neighbors (stair shapes, fence sides,
-//!   torches that need a support).
+//!   0020; walls and fence gates, ADR 0027), and [`rules`]: the states that follow their
+//!   neighbors (stair shapes, fence sides, torches that need a support, wall sides and posts,
+//!   gates between walls) and what using a block does (a gate opens).
 //! - [`faces`]: which faces of a chunk see each other through non-occluding voxels
 //!   ([`ChunkFaceInfo`]), for the world's cave culling (ADR 0022).
 //! - [`storage`]: Minecraft-style paletted container (Uniform | Packed 1/2/4/8 bits | Direct u16).
@@ -50,7 +51,7 @@ pub use registry::{
     MAX_COLLISION_HEIGHT, MAX_STATES, RegistryError, RenderShape, SlabHalf, StateFlags,
     TORCH_EMISSION, TextureId, TexturePattern, TextureSpec, WATERLOGGED,
 };
-pub use shapes::{Facing, FenceSides, MAX_MODEL_BOXES, ModelBox, StairShape};
+pub use shapes::{Facing, FenceSides, MAX_MODEL_BOXES, ModelBox, StairShape, WallSide, WallSides};
 pub use state::{Property, StateName, StateParseError, StateValues};
 pub use storage::{Occupancy, Paletted};
 

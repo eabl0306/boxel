@@ -3,7 +3,9 @@
 //! assigned in registration order and contiguous per block. Every per-state datum (model,
 //! collision, textures, light) lives in flat arrays indexed by the state id. Frozen before the
 //! world loads and shared as `Arc<BlockRegistry>`.
-use crate::shapes::{self, Facing, FenceSides, MAX_MODEL_BOXES, ModelBox, StairShape};
+use crate::shapes::{
+    self, Facing, FenceSides, MAX_MODEL_BOXES, ModelBox, StairShape, WallSide, WallSides,
+};
 use crate::state::{Property, StateName, StateParseError, StateValues, split_state};
 use crate::{Face, LightValue, OPAQUE_OPACITY};
 
@@ -149,6 +151,26 @@ pub enum BlockModel {
         /// Away from the wall.
         facing: Facing,
     },
+    /// A wall (ADR 0027, Minecraft's `cobblestone_wall`): a post when `post` and a bar toward
+    /// each connected side, low or tall ([`crate::shapes::wall_boxes`]). Collides 1.5 blocks
+    /// tall, like a fence.
+    Wall {
+        /// The post in the middle (Minecraft's `up`).
+        post: bool,
+        /// The sides.
+        sides: WallSides,
+    },
+    /// A fence gate (ADR 0027): two posts and the gate between them, across `facing`
+    /// ([`crate::shapes::fence_gate_boxes`]). Closed it collides 1.5 blocks tall; open, not at
+    /// all.
+    FenceGate {
+        /// The way it opens (the gate runs across it).
+        facing: Facing,
+        /// Open.
+        open: bool,
+        /// Between walls: 3 sixteenths lower.
+        in_wall: bool,
+    },
 }
 
 impl Default for BlockModel {
@@ -200,7 +222,8 @@ impl BlockModel {
 
     /// The box the block is picked by (its outline): the full cell for cubes, the half cell for
     /// slabs, a smaller box around the stem for crosses, the boxes of stairs, the post and arms
-    /// of a fence, a box around a torch's stick.
+    /// of a fence, a box around a torch's stick, Minecraft's shapes of walls and fence gates (a
+    /// gate is picked the same open or closed).
     pub fn outline(self) -> BlockCollision {
         match self {
             BlockModel::Cube { .. } | BlockModel::Fluid => BlockCollision::Full,
@@ -216,26 +239,42 @@ impl BlockModel {
             BlockModel::WallTorch { facing } => {
                 BlockCollision::Boxes(vec![shapes::wall_torch_outline(facing)])
             }
+            BlockModel::Wall { post, sides } => {
+                BlockCollision::Boxes(shapes::wall_outline(post, sides))
+            }
+            BlockModel::FenceGate {
+                facing, in_wall, ..
+            } => BlockCollision::Boxes(vec![shapes::fence_gate_outline(facing, in_wall)]),
         }
     }
 
     /// The usual collision of the model: full cubes, slabs and stairs collide with their shape,
-    /// fences with their post and arms 1.5 blocks tall (Minecraft's, ADR 0026: they reach into
-    /// the cell above, so they cannot be jumped), crosses, fluids and torches do not collide.
+    /// fences, walls and closed fence gates 1.5 blocks tall (Minecraft's, ADR 0026 and 0027:
+    /// they reach into the cell above, so they cannot be jumped), crosses, fluids, torches and
+    /// open fence gates do not collide.
     pub fn default_collision(self) -> BlockCollision {
         match self {
             BlockModel::Cross
             | BlockModel::Fluid
             | BlockModel::Torch
-            | BlockModel::WallTorch { .. } => BlockCollision::None,
+            | BlockModel::WallTorch { .. }
+            | BlockModel::FenceGate { open: true, .. } => BlockCollision::None,
             BlockModel::Fence { sides } => BlockCollision::Boxes(shapes::fence_collision(sides)),
+            BlockModel::Wall { post, sides } => {
+                BlockCollision::Boxes(shapes::wall_collision(post, sides))
+            }
+            BlockModel::FenceGate {
+                facing,
+                open: false,
+                ..
+            } => BlockCollision::Boxes(vec![shapes::fence_gate_collision(facing)]),
             other => other.outline(),
         }
     }
 
-    /// The boxes the model is drawn with, for the models made of boxes (slabs, stairs, fences
-    /// and torches; ADR 0020). Empty for cubes, crosses and fluids, which the mesher draws its
-    /// own way.
+    /// The boxes the model is drawn with, for the models made of boxes (slabs, stairs, fences,
+    /// torches, walls and fence gates; ADR 0020, ADR 0027). Empty for cubes, crosses and fluids,
+    /// which the mesher draws its own way.
     pub fn boxes(self) -> Vec<ModelBox> {
         match self {
             BlockModel::Cube { .. } | BlockModel::Fluid | BlockModel::Cross => Vec::new(),
@@ -251,6 +290,12 @@ impl BlockModel {
             BlockModel::Fence { sides } => shapes::fence_boxes(sides),
             BlockModel::Torch => vec![shapes::TORCH_BOX],
             BlockModel::WallTorch { facing } => vec![shapes::wall_torch_box(facing)],
+            BlockModel::Wall { post, sides } => shapes::wall_boxes(post, sides),
+            BlockModel::FenceGate {
+                facing,
+                open,
+                in_wall,
+            } => shapes::fence_gate_boxes(facing, open, in_wall),
         }
     }
 }
@@ -355,6 +400,10 @@ bitflags::bitflags! {
         /// Could hold a water source: it has the [`WATERLOGGED`] property and is not a full
         /// cube (ADR 0025).
         const WATERLOGGABLE = 1 << 5;
+        /// Stops movement (Minecraft's `blocksMotion`): it collides ([`StateFlags::SOLID`]),
+        /// or it is a fence gate, open or closed (Minecraft's gates are solid wood; an open one
+        /// does not collide, ADR 0027). Fluids never flow into it and stand on it.
+        const BLOCKS_MOTION = 1 << 6;
     }
 }
 
@@ -868,7 +917,88 @@ impl BlockRegistryBuilder {
         b.add_default_shapes(stone, planks);
         b.add_fluid_products();
         b.add_flow_textures(water, lava);
+        b.add_walls_and_gates(planks);
         b
+    }
+
+    /// The blocks of ADR 0027, the last ones: the cobblestone wall (with the cobblestone layer)
+    /// and the oak fence gate (with the planks layer). Both let light through like a fence
+    /// (opacity 0, 1 for a wall that holds water: the sky stops) and follow their neighbors
+    /// (`boxel_voxel::rules`): a wall connects and raises its post, a gate drops between walls.
+    fn add_walls_and_gates(&mut self, planks: TextureId) {
+        let cobblestone = self
+            .textures
+            .iter()
+            .position(|t| t.name == "boxel:cobblestone")
+            .map(|i| TextureId(i as u16))
+            .expect("the cobblestone layer comes first");
+        // Minecraft's `cobblestone_wall`: `up` (the post, default true), a side property per
+        // direction and `waterlogged` (ADR 0025).
+        let wall = BlockDef {
+            name: "boxel:cobblestone_wall".to_string(),
+            shape: RenderShape::Opaque,
+            model: BlockModel::Wall {
+                post: true,
+                sides: WallSides::NONE,
+            },
+            collision: BlockCollision::None,
+            emission: [0; 3],
+            light_opacity: 0,
+            textures: FaceTextures::all(cobblestone),
+        };
+        let mut properties: Vec<Property> = Facing::ALL
+            .map(|f| Property::new(f.name(), WallSide::ALL.map(WallSide::name)))
+            .to_vec();
+        properties.push(Property::boolean("up").with_default("true"));
+        properties.push(Property::boolean(WATERLOGGED));
+        self.add_block_with_states(wall, properties, |state, def| {
+            let mut sides = WallSides::NONE;
+            for f in Facing::ALL {
+                let side = state.get(f.name()).and_then(WallSide::from_name);
+                sides = sides.with(f, side.unwrap_or_default());
+            }
+            def.model = BlockModel::Wall {
+                post: state.get("up") == Some("true"),
+                sides,
+            };
+            def.collision = def.model.default_collision();
+            if state.get(WATERLOGGED) == Some("true") {
+                def.light_opacity = def.light_opacity.max(1);
+            }
+        })
+        .expect("built-in wall");
+        // Minecraft's `oak_fence_gate` without `powered` (no redstone): `facing` (the way it
+        // opens), `in_wall` and `open`. It holds no water, as in Minecraft.
+        let gate = BlockDef {
+            name: "boxel:oak_fence_gate".to_string(),
+            shape: RenderShape::Opaque,
+            model: BlockModel::FenceGate {
+                facing: Facing::North,
+                open: false,
+                in_wall: false,
+            },
+            collision: BlockCollision::None,
+            emission: [0; 3],
+            light_opacity: 0,
+            textures: FaceTextures::all(planks),
+        };
+        let properties = vec![
+            Property::new("facing", Facing::ALL.map(Facing::name)),
+            Property::boolean("in_wall"),
+            Property::boolean("open"),
+        ];
+        self.add_block_with_states(gate, properties, |state, def| {
+            def.model = BlockModel::FenceGate {
+                facing: state
+                    .get("facing")
+                    .and_then(Facing::from_name)
+                    .unwrap_or_default(),
+                open: state.get("open") == Some("true"),
+                in_wall: state.get("in_wall") == Some("true"),
+            };
+            def.collision = def.model.default_collision();
+        })
+        .expect("built-in fence gate");
     }
 
     /// The flow textures of water and lava (ADR 0025), the last layers: the side faces of both
@@ -1185,6 +1315,10 @@ impl BlockRegistryBuilder {
                 let solid = !b.collision.is_none();
                 f.set(StateFlags::SOLID, solid);
                 f.set(
+                    StateFlags::BLOCKS_MOTION,
+                    solid || matches!(b.model, BlockModel::FenceGate { .. }),
+                );
+                f.set(
                     StateFlags::OCCLUDES,
                     b.shape == RenderShape::Opaque && b.model.is_solid_cube(),
                 );
@@ -1290,7 +1424,11 @@ impl BlockRegistry {
     /// `boxel:cobblestone` and 256 `boxel:obsidian` (Opaque solid cubes). The states whose
     /// `waterlogged` is `true` hold a water source ([`StateFlags::WATERLOGGED`]). The side faces
     /// of water and lava show their flow textures, `boxel:water_flow` and `boxel:lava_flow` (the
-    /// last two layers, ADR 0025).
+    /// last two layers, ADR 0025). Then the blocks of ADR 0027: 257 to 580
+    /// `boxel:cobblestone_wall` (`east`, `north`, `south`, `west` each `none | low | tall`, `up`,
+    /// `waterlogged`; default 263, every side `none`, `up=true` and dry; Opaque, light opacity 0,
+    /// 1 with water) and 581 to 596 `boxel:oak_fence_gate` (`facing`, `in_wall`, `open`; default
+    /// 581, facing north, closed; Opaque, light opacity 0; no collision when open).
     pub fn default_blocks() -> BlockRegistry {
         BlockRegistryBuilder::with_default_blocks().build()
     }
@@ -1437,6 +1575,11 @@ impl BlockRegistry {
     /// [`StateFlags::OCCLUDES`]).
     pub fn occludes(&self, s: BlockState) -> bool {
         self.flags(s).contains(StateFlags::OCCLUDES)
+    }
+    /// True if `s` stops movement ([`StateFlags::BLOCKS_MOTION`]): it collides, or it is a fence
+    /// gate, open or closed. What the fluid rules call solid.
+    pub fn blocks_motion(&self, s: BlockState) -> bool {
+        self.flags(s).contains(StateFlags::BLOCKS_MOTION)
     }
     /// True if `s` holds a water source besides itself ([`StateFlags::WATERLOGGED`], ADR 0025).
     pub fn is_waterlogged(&self, s: BlockState) -> bool {

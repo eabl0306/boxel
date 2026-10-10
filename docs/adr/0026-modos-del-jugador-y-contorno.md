@@ -409,9 +409,9 @@ en el agua le devuelve el agua.
 
 ## Fuera de esta parte
 
-- Muros de piedra y puertas de valla (también chocan a 1,5).
-- De la issue #37 queda la interacción con bloques (abrir puertas y similares, cuando existan) y
-  el hambre (correr no la pide).
+- Muros de piedra y puertas de valla (también chocan a 1,5). Hecho en ADR 0027.
+- De la issue #37 queda la interacción con otros bloques (el clic derecho ya abre y cierra las
+  puertas de valla, ADR 0027) y el hambre (correr no la pide).
 - Nadar como en Minecraft más allá de subir: correr bajo el agua (la pose de nado de 0,6), que
   Shift baje en el agua, y que correr se corte en la superficie del agua.
 - La brazada de Minecraft es un empujón chico por tick; la nuestra pone 3 bloques por segundo de

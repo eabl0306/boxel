@@ -145,8 +145,9 @@ fn a_body_inside_a_slab_is_pushed_out() {
     );
 }
 
-/// A random field of stone, bottom, top and double slabs, and fences (whose collision reaches
-/// half a block into the cell above, ADR 0026) in `0..size` (air elsewhere).
+/// A random field of stone, bottom, top and double slabs, fences (whose collision reaches half a
+/// block into the cell above, ADR 0026), walls and fence gates (the same, ADR 0027; an open gate
+/// collides with nothing) in `0..size` (air elsewhere).
 fn shaped_field(size: i64, density: f64, seed: u64) -> (TestWorld, Vec<(BlockPos, BlockState)>) {
     let mut world = TestWorld::new();
     let mut rng = Rng(seed);
@@ -159,6 +160,10 @@ fn shaped_field(size: i64, density: f64, seed: u64) -> (TestWorld, Vec<(BlockPos
         state("boxel:oak_fence"),
         state("boxel:oak_fence[east=true,south=true]"),
         state("boxel:oak_fence[north=true,west=true]"),
+        state("boxel:cobblestone_wall[east=tall,north=low]"),
+        state("boxel:cobblestone_wall[north=low,south=low,up=false]"),
+        state("boxel:oak_fence_gate[facing=east]"),
+        state("boxel:oak_fence_gate[open=true]"),
     ];
     for y in 0..size {
         for x in 0..size {

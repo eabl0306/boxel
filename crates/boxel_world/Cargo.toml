@@ -52,5 +52,9 @@ harness = false
 name = "cave_culling"
 harness = false
 
+[[bench]]
+name = "neighbor_rules"
+harness = false
+
 [lints]
 workspace = true
