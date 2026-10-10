@@ -578,3 +578,129 @@ fn a_pending_placement_is_taken_after_a_restart() {
         }
     }
 }
+
+/// Between a body's restore and its first step (frames with no fixed step), what happens around
+/// it is not what happened before it came back: the crate a restored crate sleeps on despawned
+/// then wakes it, and a `BodyPosition` written then is a nudge (it wakes and falls, and is shown
+/// where it is).
+#[test]
+fn what_happens_after_a_restore_wakes_the_body() {
+    let base = bases()[2];
+    let backend = Arc::new(MemoryStore::new());
+    let mut sim = start(&backend, base);
+    let crate_ = Collider::aabb(DVec3::splat(0.375));
+    for y in [4.375, 5.125] {
+        sim.body(sim.pos(3.5, y, 3.5), (Saved::new(), crate_));
+    }
+    sim.body(sim.pos(9.5, 4.375, 3.5), (Saved::new(), crate_));
+    sim.steps(120);
+    move_viewer(&mut sim, DVec3::new(8192.0, 0.0, 0.0));
+    move_viewer(&mut sim, DVec3::ZERO);
+    // Back, asleep, and no step ran since.
+    let world = sim.app.world_mut();
+    let mut q = world.query_filtered::<(Entity, &BodyPosition), (With<Saved>, With<Sleeping>)>();
+    let mut bodies: Vec<(Entity, WorldPos)> = q.iter(world).map(|(e, p)| (e, p.0)).collect();
+    assert_eq!(bodies.len(), 3, "all asleep");
+    // By x, then height: the pile's bottom and top, then the one alone.
+    bodies.sort_unstable_by_key(|(_, p)| (p.block.x, p.block.y, p.frac.y.to_bits()));
+    let (bottom, top, alone) = (bodies[0].0, bodies[1].0, bodies[2].0);
+    let top_y = sim.position(top).to_dvec3().y;
+    sim.idle_frame();
+    sim.app.world_mut().despawn(bottom);
+    let lifted = sim.pos(9.5, 7.375, 3.5);
+    sim.app
+        .world_mut()
+        .get_mut::<BodyPosition>(alone)
+        .unwrap()
+        .0 = lifted;
+    sim.idle_frame();
+    sim.steps(1);
+    assert!(!sim.asleep(top), "the crate under it went");
+    assert!(!sim.asleep(alone), "nudged");
+    sim.steps(40);
+    assert!(sim.position(top).to_dvec3().y < top_y - 0.5, "it fell");
+    let y = sim.position(alone).to_dvec3().y;
+    assert!(y < lifted.to_dvec3().y - 2.0, "it fell: {y}");
+    assert_eq!(sim.translation(alone).y, y, "shown where it is");
+}
+
+/// A chunk that loads after a body came back from a save (before its first step) wakes it, as it
+/// wakes any sleeper it touches: the blocks there may not be what the body slept on.
+#[test]
+fn a_chunk_loaded_after_a_restore_wakes_the_body() {
+    let base = bases()[0];
+    let backend = Arc::new(MemoryStore::new());
+    let mut sim = start(&backend, base);
+    // At the edge of the loaded data (two chunks around the viewer): one block from chunk 3.
+    let edge = sim.body(
+        sim.pos(95.5, 4.375, 0.5),
+        (Saved::new(), Collider::aabb(DVec3::splat(0.375))),
+    );
+    sim.steps(120);
+    assert!(sim.asleep(edge), "asleep at the edge");
+    move_viewer(&mut sim, DVec3::new(8192.0, 0.0, 0.0));
+    move_viewer(&mut sim, DVec3::ZERO);
+    let world = sim.app.world_mut();
+    let mut q = world.query_filtered::<Entity, (With<Saved>, With<Sleeping>)>();
+    let edge = q.single(world).expect("back asleep");
+    // A second viewer loads chunk 3 before any step (frames of some length: the messages
+    // wait for the step).
+    sim.viewer(DVec3::new(160.0, 0.0, 0.0));
+    let three = ChunkPos::containing(sim.block(96, 4, 0));
+    for _ in 0..100 {
+        let map = sim.app.world().resource::<boxel_world::ChunkMap>();
+        if map
+            .id_at(three)
+            .and_then(|id| map.get(id))
+            .is_some_and(|slot| matches!(slot.data(), boxel_world::DataState::Ready(_)))
+        {
+            break;
+        }
+        sim.idle_frame();
+    }
+    sim.idle_frame();
+    sim.steps(1);
+    assert!(!sim.asleep(edge), "the load after it came back woke it");
+}
+
+/// The chunk loads a sleeping pile came back with do not wake it, also when the frames between
+/// its chunk's load and the next step run no step (the messages wait for that step).
+#[test]
+fn the_loads_a_pile_came_back_with_do_not_wake_it() {
+    let base = bases()[2];
+    let backend = Arc::new(MemoryStore::new());
+    let mut sim = start(&backend, base);
+    let crate_ = Collider::aabb(DVec3::splat(0.375));
+    for y in [4.375, 5.125, 5.875] {
+        sim.body(sim.pos(3.5, y, 3.5), (Saved::new(), crate_));
+    }
+    sim.steps(120);
+    let before = states(&mut sim.app);
+    move_viewer(&mut sim, DVec3::new(8192.0, 0.0, 0.0));
+    // Back with frames of some length that run no step.
+    let mut q = sim
+        .app
+        .world_mut()
+        .query_filtered::<&mut Transform, With<ChunkViewer>>();
+    for mut t in q.iter_mut(sim.app.world_mut()) {
+        t.translation = sim.base.as_dvec3();
+    }
+    for _ in 0..100 {
+        if states(&mut sim.app).len() == before.len() {
+            break;
+        }
+        sim.idle_frame();
+    }
+    sim.idle_frame();
+    assert_eq!(states(&mut sim.app), before, "back");
+    sim.steps(1);
+    assert_eq!(
+        sim.app
+            .world()
+            .resource::<boxel_physics::PhysicsStats>()
+            .woken,
+        0
+    );
+    sim.steps(20);
+    assert_eq!(states(&mut sim.app), before, "asleep where it was");
+}

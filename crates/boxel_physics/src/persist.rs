@@ -14,15 +14,17 @@
 use crate::components::{
     BodyPosition, CharacterController, Collider, Contacts, Frozen, Interpolated, MoveIntent,
     OnBlock, OnEntity, PhysicsSync, Projectile, ReportContacts, Response, Restored, RigidBody,
-    Sleeping, Teleport, Velocity,
+    Sleeping, Teleport, Vacated, Velocity,
 };
 use crate::core::{BodySettings, CollisionLayers, Shape};
 use crate::swim::{SwimIntent, SwimSettings, Swimmer};
 use boxel_ecs::change_detection::{ComponentTicks, Tick};
+use boxel_ecs::message::Messages;
 use boxel_ecs::prelude::*;
 use boxel_math::{DVec3, Vec2};
 use boxel_transform::Transform;
 use boxel_voxel::{BlockPos, WorldPos};
+use boxel_world::ChunkDataEvent;
 use boxel_world::persist::{EntityCodec, SavedId, SavedIds};
 
 /// The name [`BodyCodec`] saves its parts under.
@@ -545,6 +547,13 @@ impl EntityCodec for BodyCodec {
         let translation = position.to_dvec3();
         let placed = !pending.is_some_and(|(new, _)| new);
         let shown = pending.map_or(translation, |(_, at)| at.to_dvec3());
+        let restored = Restored {
+            tick: world.change_tick(),
+            vacated: world.get_resource::<Vacated>().map_or(0, |v| v.0.len()),
+            chunks: world
+                .get_resource::<Messages<ChunkDataEvent>>()
+                .map_or(0, |m| m.oldest_message_count() + m.len()),
+        };
         let mut e = world.entity_mut(entity);
         e.insert((
             (kind, Transform::from_translation(shown)),
@@ -561,7 +570,7 @@ impl EntityCodec for BodyCodec {
                 placed,
                 ..PhysicsSync::default()
             },
-            Restored,
+            restored,
         ));
         if let Some(collider) = collider {
             e.insert(collider);
