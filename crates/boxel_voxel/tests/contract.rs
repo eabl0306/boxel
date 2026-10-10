@@ -363,6 +363,11 @@ fn registry_rejects_bad_collision_boxes() {
         ("flat", CollisionBox::new([0, 4, 0], [16, 4, 16])),
         ("out", CollisionBox::new([0, 0, 0], [17, 8, 16])),
         ("upside", CollisionBox::new([0, 8, 0], [16, 0, 16])),
+        // A collision box may reach half a block into the cell above (ADR 0026), no more, only
+        // upward, and it starts in its own cell.
+        ("too_tall", CollisionBox::new([6, 0, 6], [10, 25, 10])),
+        ("wide", CollisionBox::new([0, 0, 0], [24, 8, 16])),
+        ("above", CollisionBox::new([0, 16, 0], [16, 24, 16])),
     ] {
         assert_eq!(
             b.add_block(def(name, vec![CollisionBox::FULL, bad])),
@@ -374,6 +379,9 @@ fn registry_rejects_bad_collision_boxes() {
         b.add_block(def("ok", vec![CollisionBox::slab(SlabHalf::Bottom)]))
             .is_ok()
     );
+    let tall = CollisionBox::new([6, 0, 6], [10, MAX_COLLISION_HEIGHT, 10]);
+    assert!(tall.is_valid_collision() && !tall.is_valid());
+    assert!(b.add_block(def("tall", vec![tall])).is_ok());
     let cube = BlockDef {
         name: "test:leaky_cube".into(),
         model: BlockModel::CUBE,

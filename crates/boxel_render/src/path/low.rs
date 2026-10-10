@@ -1,5 +1,5 @@
 //! Low tier: CPU cull + instanced triangle strips + immediates.
-use super::{CpuCull, SlotVisibility, TierPath, VoxelPipelines};
+use super::{BucketDraw, CpuCull, SlotVisibility, TierPath, VoxelPipelines};
 use crate::chunk_table::ChunkTable;
 use crate::renderer::ViewParams;
 use boxel_shaders::gpu::ChunkImmediate;
@@ -39,21 +39,43 @@ impl TierPath for LowPath {
         self.cull.visible_chunks
     }
 
-    fn draw(&self, pass: &mut wgpu::RenderPass<'_>, arena: &wgpu::Buffer) -> u32 {
-        if self.cull.opaque.is_empty()
-            && self.cull.cutout.is_empty()
-            && self.cull.translucent.is_empty()
-        {
+    fn draw_solid(&self, pass: &mut wgpu::RenderPass<'_>, arena: &wgpu::Buffer) -> u32 {
+        self.draw_lists(
+            pass,
+            arena,
+            [
+                (&self.voxel.opaque, &self.cull.opaque),
+                (&self.voxel.cutout, &self.cull.cutout),
+            ],
+        )
+    }
+
+    fn draw_translucent(&self, pass: &mut wgpu::RenderPass<'_>, arena: &wgpu::Buffer) -> u32 {
+        self.draw_lists(
+            pass,
+            arena,
+            [(&self.voxel.translucent, &self.cull.translucent)],
+        )
+    }
+}
+
+impl LowPath {
+    /// Draws `lists` (each with its pipeline) in order: binds the arena and the light buffer,
+    /// and sets the chunk origin immediates again for the first draw of every list (a pipeline
+    /// change clears them).
+    fn draw_lists<const N: usize>(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        arena: &wgpu::Buffer,
+        lists: [(&wgpu::RenderPipeline, &Vec<BucketDraw>); N],
+    ) -> u32 {
+        if lists.iter().all(|(_, list)| list.is_empty()) {
             return 0;
         }
         pass.set_vertex_buffer(0, arena.slice(..));
         pass.set_vertex_buffer(1, self.light.slice(..));
         let mut draws = 0;
-        for (pipeline, list) in [
-            (&self.voxel.opaque, &self.cull.opaque),
-            (&self.voxel.cutout, &self.cull.cutout),
-            (&self.voxel.translucent, &self.cull.translucent),
-        ] {
+        for (pipeline, list) in lists {
             if list.is_empty() {
                 continue;
             }

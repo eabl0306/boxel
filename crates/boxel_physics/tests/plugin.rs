@@ -336,6 +336,7 @@ fn a_character_controller_moves_only_dynamic_bodies() {
                 MoveIntent {
                     wish: Vec2::X,
                     jump: true,
+                    ..MoveIntent::default()
                 },
             ))
             .id()

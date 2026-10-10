@@ -2,10 +2,11 @@
 //! ground at y = 4), `PhysicsPlugin` and a synthetic clock.
 //!
 //! An arrow at 60 blocks/s never misses a mob 0.6 wide, whatever the phase of its steps; arrows
-//! stick in blocks (exactly on the face) and fall when the block goes; bouncing projectiles
-//! bounce and come to rest; piercing ones hit each body once, in order; `ignore`, layers and
-//! sensors filter the hits; a free flight equals `predict`; unloaded chunks freeze them; the
-//! results are bit-identical far from the origin and on several threads.
+//! stick in blocks (exactly on the face, also the top of a slab or a fence) and fall when the
+//! block goes; bouncing projectiles bounce and come to rest; piercing ones hit each body once,
+//! in order; `ignore`, layers and sensors filter the hits; a free flight equals `predict`;
+//! unloaded chunks freeze them; the results are bit-identical far from the origin and on several
+//! threads.
 mod common;
 mod sim;
 
@@ -15,7 +16,7 @@ use boxel_physics::{
     BodySettings, Collider, CollisionLayers, Contacts, OnBlock, OnEntity, PhysicsStats, Projectile,
     ProjectileHit, ProjectileTarget, RigidBody, StepParams, Teleport, Velocity, predict,
 };
-use boxel_voxel::{BlockPos, BlockState, Face, MAX_BLOCK_COORD, WorldPos};
+use boxel_voxel::{BlockPos, BlockRegistry, BlockState, Face, MAX_BLOCK_COORD, WorldPos};
 use common::STONE;
 use sim::{Hits, STEP, Sim};
 
@@ -270,6 +271,120 @@ fn a_bouncing_projectile_slides_on_after_it_lands() {
     assert_eq!(at.y, 4.0 + 1e-7, "on the ground");
     assert!(sim.get::<Contacts>(ball).on_ground);
     assert!(take_hits(&mut sim).is_empty(), "too slow to report");
+}
+
+/// Arrows and balls dropped onto the tops of fence posts (1.5 tall, ADR 0026) and bottom
+/// slabs (0.5) around `base`: every final position relative to `base`, after asserting where
+/// each one ended.
+fn onto_box_tops(base: I64Vec3) -> Vec<(I64Vec3, [u64; 3])> {
+    let mut sim = Sim::new(base, STEP);
+    let registry = BlockRegistry::default_blocks();
+    let fence = registry.parse_state("boxel:oak_fence").expect("fence");
+    let slab = registry
+        .parse_state("boxel:stone_slab[type=bottom]")
+        .expect("slab");
+    // The ground is at y = 4: tops at 5.5 (fences) and 4.5 (slabs).
+    let blocks = [
+        (10, fence, 5.5),
+        (12, slab, 4.5),
+        (14, fence, 5.5),
+        (16, slab, 4.5),
+    ];
+    for (x, state, _) in blocks {
+        sim.edit(sim.block(x, 4, 0), state);
+    }
+    sim.idle_frame();
+    sim.idle_frame();
+    // Arrows stop on the first two, balls bounce on the other two.
+    let bodies: Vec<Entity> = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, &(x, _, _))| {
+            let from = sim.pos(f64::from(x as i32) + 0.5, 9.5, 0.5);
+            if i < 2 {
+                shoot(
+                    &mut sim,
+                    from,
+                    DVec3::new(0.0, -200.0, 0.0),
+                    Projectile::arrow(),
+                    straight(),
+                    (),
+                )
+            } else {
+                shoot(
+                    &mut sim,
+                    from,
+                    DVec3::new(0.0, -20.0, 0.0),
+                    Projectile::new(OnBlock::Bounce, OnEntity::Stop),
+                    BodySettings::ball(),
+                    (),
+                )
+            }
+        })
+        .collect();
+    let mut went_up = [false; 2];
+    for _ in 0..600 {
+        sim.steps(1);
+        for (up, &ball) in went_up.iter_mut().zip(&bodies[2..]) {
+            *up |= sim.get::<Velocity>(ball).0.y > 2.0;
+        }
+        if bodies.iter().all(|&b| sim.asleep(b)) {
+            break;
+        }
+    }
+    let hits = take_hits(&mut sim);
+    for (i, (&body, &(x, state, top))) in bodies.iter().zip(&blocks).enumerate() {
+        assert!(sim.asleep(body), "{i}");
+        let at = local(&sim, sim.position(body));
+        // The center on the top face, `eps` above it.
+        assert_eq!(at.y, top + 1e-7, "{i}: {at:?}");
+        let first = hits
+            .iter()
+            .find(|h| h.projectile == body)
+            .unwrap_or_else(|| panic!("{i}: no hit"));
+        assert_eq!(
+            first.target,
+            ProjectileTarget::Block {
+                pos: sim.block(x, 4, 0),
+                face: Some(Face::PosY),
+                state,
+            }
+        );
+        assert_eq!(local(&sim, first.point).y, top + 1e-7, "{i}");
+        if i < 2 {
+            assert_eq!(
+                sim.get::<Projectile>(body).stuck_in(),
+                Some(sim.block(x, 4, 0))
+            );
+        } else {
+            // It bounced off the top, came to rest on it and is not stuck inside the block.
+            assert!(went_up[i - 2], "{i}: it bounced");
+            assert_eq!(sim.get::<Projectile>(body).stuck_in(), None, "{i}");
+            assert!(sim.get::<Contacts>(body).on_ground);
+        }
+    }
+    bodies
+        .iter()
+        .map(|&b| {
+            let p = sim.position(b);
+            (
+                p.block.as_i64vec3() - base,
+                p.frac.to_array().map(f64::to_bits),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn projectiles_stop_on_the_tops_of_slabs_and_fences() {
+    let reference = onto_box_tops(I64Vec3::ZERO);
+    let far = MAX_BLOCK_COORD - 1024;
+    for base in [
+        I64Vec3::new(1 << 52, -(1 << 40), 1 << 31),
+        I64Vec3::new(far, far, far),
+    ] {
+        assert_eq!(onto_box_tops(base), reference, "base {base:?}");
+    }
 }
 
 #[test]

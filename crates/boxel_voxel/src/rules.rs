@@ -97,7 +97,9 @@ pub fn stairs_rule(
 }
 
 /// Which sixteenths of `face` of a block colliding as `collision` its boxes cover, flush with
-/// the cell border: bit `u` of row `v` along the face's axes ([`Face::axes`]).
+/// the cell border: bit `u` of row `v` along the face's axes ([`Face::axes`]). A box that
+/// reaches into the cell above (a fence's 1.5 blocks, ADR 0026) covers the top face with its
+/// cross-section, as Minecraft cuts a shape at the face; the part above the cell is left out.
 pub fn collision_face_cover(collision: &BlockCollision, face: Face) -> [u16; 16] {
     match collision {
         BlockCollision::None => [0; 16],
@@ -108,15 +110,15 @@ pub fn collision_face_cover(collision: &BlockCollision, face: Face) -> [u16; 16]
             let mut rows = [0u16; 16];
             for b in boxes {
                 let flush = if positive {
-                    b.max[n] == 16
+                    b.max[n] >= 16
                 } else {
                     b.min[n] == 0
                 };
                 if !flush {
                     continue;
                 }
-                let bits = span_bits(b.min[u], b.max[u]);
-                for row in &mut rows[usize::from(b.min[v])..usize::from(b.max[v])] {
+                let bits = span_bits(b.min[u], b.max[u].min(16));
+                for row in &mut rows[usize::from(b.min[v])..usize::from(b.max[v].min(16))] {
                     *row |= bits;
                 }
             }

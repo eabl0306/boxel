@@ -43,8 +43,9 @@ pub enum CollisionShape<'a> {
     Empty,
     /// The whole unit cube.
     Full,
-    /// A union of boxes inside the unit cube, in the block's frame (`0..=1` on every axis; a
-    /// bottom slab is `(0, 0, 0)..(1, 0.5, 1)`).
+    /// A union of boxes in the block's frame (`0..=1` on every axis; a bottom slab is
+    /// `(0, 0, 0)..(1, 0.5, 1)`). A collision box may reach above the cell, up to
+    /// [`CollisionTable::reach`] (a fence is 1.5 tall, ADR 0026); outlines stay inside it.
     Boxes(&'a [LocalBox]),
 }
 
@@ -58,6 +59,8 @@ const OUTLINE: u8 = 1 << 2;
 const BOXES: u8 = 1 << 3;
 /// `CollisionTable` bit: the block is picked by boxes (`outline` range), not the full cube.
 const OUTLINE_BOXES: u8 = 1 << 4;
+/// `CollisionTable` bit: some collision box of the block reaches into the cell above.
+const TALL: u8 = 1 << 5;
 
 /// Per block state, what physics needs to know: its [`CollisionShape`], its picking outline and
 /// whether it is a fluid. Built from a [`BlockRegistry`] (ADR 0016, ADR 0018):
@@ -65,6 +68,11 @@ const OUTLINE_BOXES: u8 = 1 << 4;
 /// `Full`, an empty one as `Empty`), the registry's `FLUID` flag gives the fluid bit, and a
 /// render shape other than `None` gives an outline, the model's (`BlockModel::outline`: the
 /// cube, a slab's half, a box around a plant). States outside the registry are empty.
+///
+/// A collision box may reach into the cell above (a fence collides 1.5 blocks tall, ADR 0026):
+/// such a block is [`CollisionTable::is_tall`], and the sweep and the collision raycast also
+/// look at the cell under the ones a box or a ray crosses, up to [`CollisionTable::reach`]
+/// above it. Outlines stay inside the cell.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CollisionTable {
     bits: Vec<u8>,
@@ -78,6 +86,8 @@ pub struct CollisionTable {
     /// The smallest distance from a box face that is not on a block plane to the block plane
     /// nearest it (1 without such faces; 0 in a table that was not built from a registry).
     plane_gap: f64,
+    /// How far above its cell the highest collision box reaches (0 without tall blocks).
+    reach: f64,
 }
 
 impl CollisionTable {
@@ -94,9 +104,15 @@ impl CollisionTable {
             let collision = table.push_shape(registry.collision(state));
             match collision {
                 Pushed::Full => bits |= FULL,
-                Pushed::Boxes(_) => {
+                Pushed::Boxes((start, end)) => {
                     bits |= BOXES;
                     table.any_boxes = true;
+                    for bx in &table.boxes[start as usize..end as usize] {
+                        if bx.max.y > 1.0 {
+                            bits |= TALL;
+                            table.reach = table.reach.max(bx.max.y - 1.0);
+                        }
+                    }
                 }
                 Pushed::Empty => {}
             }
@@ -113,6 +129,9 @@ impl CollisionTable {
             table.collision.push(collision.range());
             table.outline.push(outline.range());
         }
+        // `boxel_voxel::MAX_COLLISION_HEIGHT` keeps it at half a block: sweeps and rays look
+        // at one row under what they cross, never two.
+        debug_assert!(table.reach < 1.0, "collision boxes reach a block up");
         table.plane_gap = 1.0;
         for bx in &table.boxes {
             for v in bx.min.to_array().into_iter().chain(bx.max.to_array()) {
@@ -183,6 +202,21 @@ impl CollisionTable {
     #[inline]
     pub fn is_full(&self, state: BlockState) -> bool {
         self.bits(state) & FULL != 0
+    }
+
+    /// Some collision box of `state` reaches into the cell above (a fence, ADR 0026).
+    #[inline]
+    pub fn is_tall(&self, state: BlockState) -> bool {
+        self.bits(state) & TALL != 0
+    }
+
+    /// How far above its cell the highest collision box of the table reaches, in blocks: 0
+    /// without tall blocks, 0.5 with fences (`boxel_voxel::MAX_COLLISION_HEIGHT` caps it there).
+    /// Sweeps and collision rays look at the cell under the ones they cross only when a box
+    /// there can reach them.
+    #[inline]
+    pub fn reach(&self) -> f64 {
+        self.reach
     }
 
     /// `state` collides at all (a full cube or boxes).

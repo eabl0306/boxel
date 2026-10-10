@@ -72,11 +72,17 @@ pub(crate) trait TierPath {
         let _ = (encoder, slot_count);
     }
 
-    /// Records the draws into the main pass (groups 0 and 1 are already bound): the opaque
-    /// buckets with the opaque pipeline, the cutout bucket with the cutout pipeline, then the
-    /// translucent buckets ([`translucent_draws`], back to front) with the translucent pipeline.
+    /// Records the solid draws into the main pass (groups 0 and 1 are already bound): the opaque
+    /// buckets with the opaque pipeline, then the cutout bucket with the cutout pipeline.
     /// Returns the draw calls recorded.
-    fn draw(&self, pass: &mut wgpu::RenderPass<'_>, arena: &wgpu::Buffer) -> u32;
+    fn draw_solid(&self, pass: &mut wgpu::RenderPass<'_>, arena: &wgpu::Buffer) -> u32;
+
+    /// Records the translucent buckets ([`translucent_draws`], back to front) with the
+    /// translucent pipeline, after [`TierPath::draw_solid`] in the same pass. Something else
+    /// may have been drawn in between (the block outline, ADR 0026): it sets every vertex
+    /// buffer and immediate it uses again (groups 0 to 2 stay bound). Returns the draw calls
+    /// recorded.
+    fn draw_translucent(&self, pass: &mut wgpu::RenderPass<'_>, arena: &wgpu::Buffer) -> u32;
 }
 
 /// Bind group layouts shared by the voxel pipelines of a tier.

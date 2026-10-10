@@ -11,6 +11,7 @@
 //! - `ExtractedFrame`: everything `Prepare` and `Draw` may read, copied by `Extract`, plus the
 //!   frame results `Cleanup` writes back.
 
+use crate::outline::{BlockOutline, Outline, OutlineCache};
 use crate::overlay::{OverlayDraw, OverlayPass, OverlayRect};
 use crate::{
     BlockTextureData, DEFAULT_SKY_COLOR, FLUID_TIME_PERIOD, RendererConfig, RendererSmokeTest,
@@ -326,6 +327,7 @@ impl Plugin for RenderPlugin {
             .init_resource::<RenderInfo>()
             .init_resource::<SurfaceInfo>()
             .init_resource::<OverlayDraw>()
+            .init_resource::<BlockOutline>()
             .init_resource::<GpuState>()
             .init_resource::<InstanceState>()
             .init_resource::<LkgRes>()
@@ -607,6 +609,8 @@ struct ExtractedFrame {
     screenshots: Vec<PathBuf>,
     /// Copy of `OverlayDraw::rects`.
     overlay: Vec<OverlayRect>,
+    /// The block outline of `BlockOutline`, as the world has the block this frame.
+    outline: Option<Outline>,
     /// The chunks the camera may see this frame (cave culling), `None` when off.
     visibility: Option<Arc<VisibleSet>>,
     destroy_device: bool,
@@ -1267,10 +1271,21 @@ fn extract(
     mut destroy: MessageReader<DebugDestroyDevice>,
     overlay: Res<OverlayDraw>,
     time: Option<Res<Time>>,
+    (outline, content, mut outline_cache): (
+        Option<Res<BlockOutline>>,
+        Option<Res<WorldContent>>,
+        Local<OutlineCache>,
+    ),
 ) {
     let frame = &mut *frame;
     frame.overlay.clear();
     frame.overlay.extend_from_slice(&overlay.rects);
+    frame.outline = match (outline.as_deref(), chunks.as_deref(), content.as_deref()) {
+        (Some(outline), Some(map), Some(content)) => {
+            crate::outline::resolve(outline, map, &content.registry, &mut outline_cache)
+        }
+        _ => None,
+    };
     frame.camera = cameras
         .iter()
         .find(|(camera, _)| camera.active)
@@ -1463,6 +1478,7 @@ fn prepare(
         ready.resync = false;
     }
     ready.renderer.set_translucent_sort(frame.translucent_sort);
+    ready.renderer.set_outline(frame.outline.take());
     ready.renderer.set_visibility(frame.visibility.clone());
     for op in frame.meshes.drain(..) {
         let result = match op {

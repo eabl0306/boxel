@@ -211,7 +211,7 @@ impl BlockModel {
             BlockModel::Stairs { .. } => {
                 BlockCollision::Boxes(self.boxes().iter().map(|b| b.bounds).collect())
             }
-            BlockModel::Fence { sides } => BlockCollision::Boxes(shapes::fence_collision(sides)),
+            BlockModel::Fence { sides } => BlockCollision::Boxes(shapes::fence_outline(sides)),
             BlockModel::Torch => BlockCollision::Boxes(vec![shapes::TORCH_OUTLINE]),
             BlockModel::WallTorch { facing } => {
                 BlockCollision::Boxes(vec![shapes::wall_torch_outline(facing)])
@@ -219,14 +219,16 @@ impl BlockModel {
         }
     }
 
-    /// The usual collision of the model: full cubes, slabs, stairs and fences collide with their
-    /// shape (a fence a block tall, ADR 0020), crosses, fluids and torches do not collide.
+    /// The usual collision of the model: full cubes, slabs and stairs collide with their shape,
+    /// fences with their post and arms 1.5 blocks tall (Minecraft's, ADR 0026: they reach into
+    /// the cell above, so they cannot be jumped), crosses, fluids and torches do not collide.
     pub fn default_collision(self) -> BlockCollision {
         match self {
             BlockModel::Cross
             | BlockModel::Fluid
             | BlockModel::Torch
             | BlockModel::WallTorch { .. } => BlockCollision::None,
+            BlockModel::Fence { sides } => BlockCollision::Boxes(shapes::fence_collision(sides)),
             other => other.outline(),
         }
     }
@@ -280,7 +282,7 @@ impl CollisionBox {
         }
     }
 
-    /// `min < max <= 16` on every axis.
+    /// `min < max <= 16` on every axis: a box inside its cell (model boxes, outlines).
     pub const fn is_valid(self) -> bool {
         let mut a = 0;
         while a < 3 {
@@ -291,7 +293,26 @@ impl CollisionBox {
         }
         true
     }
+
+    /// A valid collision box: [`CollisionBox::is_valid`], except that its top may reach into
+    /// the cell above, up to [`MAX_COLLISION_HEIGHT`] (a fence collides 1.5 blocks tall, as in
+    /// Minecraft, ADR 0026). It still starts inside its cell (`min.y < 16`).
+    pub const fn is_valid_collision(self) -> bool {
+        let mut a = 0;
+        while a < 3 {
+            let top = if a == 1 { MAX_COLLISION_HEIGHT } else { 16 };
+            if self.min[a] >= self.max[a] || self.max[a] > top {
+                return false;
+            }
+            a += 1;
+        }
+        self.min[1] < 16
+    }
 }
+
+/// The highest a collision box may reach, in sixteenths of its cell (24: half a block into the
+/// cell above, Minecraft's fences and walls). Model boxes and outlines stay inside the cell.
+pub const MAX_COLLISION_HEIGHT: u8 = 24;
 
 /// How a block collides (ADR 0016): what the physics `CollisionTable` is built from.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -538,8 +559,9 @@ pub enum RegistryError {
     /// not 15.
     #[error("invalid light values of {0}")]
     InvalidLight(String),
-    /// A collision or model box outside the cell or empty (`min < max <= 16` on every axis), or
-    /// a model box texture offset outside `-32..32`.
+    /// A collision or model box outside the cell or empty (`min < max <= 16` on every axis; a
+    /// collision box may reach up to [`MAX_COLLISION_HEIGHT`]), or a model box texture offset
+    /// outside `-32..32`.
     #[error("invalid collision box of {0}")]
     InvalidCollision(String),
 }
@@ -1132,7 +1154,7 @@ impl BlockRegistryBuilder {
             return Err(RegistryError::InvalidLight(def.name.clone()));
         }
         if let BlockCollision::Boxes(boxes) = &def.collision
-            && !boxes.iter().all(|b| b.is_valid())
+            && !boxes.iter().all(|b| b.is_valid_collision())
         {
             return Err(RegistryError::InvalidCollision(def.name.clone()));
         }

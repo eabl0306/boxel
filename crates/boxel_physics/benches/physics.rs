@@ -480,7 +480,10 @@ fn walker(r: u64, ground: WorldPos) -> impl Bundle {
         RigidBody::Dynamic,
         Collider::standing(0.6, 1.8),
         CharacterController::default(),
-        MoveIntent { wish, jump: false },
+        MoveIntent {
+            wish,
+            ..MoveIntent::default()
+        },
         Interpolated::default(),
         Teleport(ground),
         Home(ground),
@@ -555,7 +558,10 @@ fn spawn_bodies(app: &mut App, table: &CollisionTable, n: u64) {
                 RigidBody::Dynamic,
                 Collider::standing(0.6, 1.8),
                 CharacterController::default(),
-                MoveIntent { wish, jump: false },
+                MoveIntent {
+                    wish,
+                    ..MoveIntent::default()
+                },
                 Interpolated::default(),
                 Teleport(ground),
                 Home(ground),

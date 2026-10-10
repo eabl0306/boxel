@@ -1,5 +1,5 @@
 //! Mid tier: CPU cull + `draw_indexed` per visible bucket with `DrawRef`.
-use super::{CpuCull, SlotVisibility, TierPath, VoxelPipelines};
+use super::{BucketDraw, CpuCull, SlotVisibility, TierPath, VoxelPipelines};
 use crate::chunk_table::ChunkTable;
 use crate::renderer::ViewParams;
 use boxel_shaders::gpu::{DrawRef, bindings};
@@ -81,20 +81,45 @@ impl TierPath for MidPath {
         self.cull.visible_chunks
     }
 
-    fn draw(&self, pass: &mut wgpu::RenderPass<'_>, _arena: &wgpu::Buffer) -> u32 {
-        if self.refs.is_empty() {
+    fn draw_solid(&self, pass: &mut wgpu::RenderPass<'_>, _arena: &wgpu::Buffer) -> u32 {
+        self.draw_lists(
+            pass,
+            0,
+            [
+                (&self.voxel.opaque, &self.cull.opaque),
+                (&self.voxel.cutout, &self.cull.cutout),
+            ],
+        )
+    }
+
+    fn draw_translucent(&self, pass: &mut wgpu::RenderPass<'_>, _arena: &wgpu::Buffer) -> u32 {
+        // The refs of the translucent buckets come after the opaque and cutout ones.
+        let first = (self.cull.opaque.len() + self.cull.cutout.len()) as u32;
+        self.draw_lists(
+            pass,
+            first,
+            [(&self.voxel.translucent, &self.cull.translucent)],
+        )
+    }
+}
+
+impl MidPath {
+    /// Draws `lists` (each with its pipeline), whose `DrawRef`s start at `first` in the ref
+    /// buffer, in order. Binds the geometry, the refs and the index buffer first.
+    fn draw_lists<const N: usize>(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        mut first: u32,
+        lists: [(&wgpu::RenderPipeline, &Vec<BucketDraw>); N],
+    ) -> u32 {
+        if lists.iter().all(|(_, list)| list.is_empty()) {
             return 0;
         }
         pass.set_bind_group(bindings::GROUP_GEOMETRY, &self.geometry, &[]);
         pass.set_vertex_buffer(0, self.draw_refs.slice(..));
         pass.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
         let mut draws = 0;
-        let mut first = 0;
-        for (pipeline, list) in [
-            (&self.voxel.opaque, &self.cull.opaque),
-            (&self.voxel.cutout, &self.cull.cutout),
-            (&self.voxel.translucent, &self.cull.translucent),
-        ] {
+        for (pipeline, list) in lists {
             if list.is_empty() {
                 continue;
             }

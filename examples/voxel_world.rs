@@ -15,11 +15,16 @@
 //! half of a slab of the same block makes a double slab. Stairs face away from the player and
 //! go upside down like top slabs, and take their corner shape from the stairs next to them; a
 //! fence connects to its neighbors; a torch stands on a top face and hangs on a side face (ADR
-//! 0020). F3 shows the target's full state
-//! (`boxel:log[axis=x]`). Picking is a voxel raycast from the camera (`PhysicsQuery::raycast_voxels`), reach 6 blocks. G switches between flying and
-//! walking: walking is a player body with gravity (`boxel::physics`, a 0.6 x 1.8 x 0.6 box and a
-//! `CharacterController`) that WASD moves along the view and Space makes jump, with the camera at
-//! its eye. F3 shows the mode and a physics line (`PhysicsStats`) in both modes.
+//! 0020). F3 shows the target's full state (`boxel:log[axis=x]`). Picking is a voxel raycast
+//! from the camera (`PhysicsQuery::raycast_voxels`), reach 6 blocks, and the targeted block gets
+//! a thin dark outline (`BlockOutline`, ADR 0026) besides the crosshair. G switches between
+//! flying and walking: walking is a player body with gravity (`boxel::physics`, a 0.6 x 1.8 x
+//! 0.6 box and a `CharacterController`) that WASD moves along the view and Space makes jump,
+//! with the camera at its eye. Walking, Shift sneaks (slower, never off an edge), Ctrl sprints
+//! and Space twice toggles creative flight (Space rises, Shift descends, landing ends it); the
+//! fly camera keeps Shift and Ctrl for going down and boosting. F3 shows the mode (with flying,
+//! sneaking or sprinting) and a physics line (`PhysicsStats`) in both modes. Fences cannot be
+//! jumped: they collide 1.5 blocks tall.
 //!
 //! Water flows (ADR 0021, `FluidPlugin`): placed water is a source that spreads 7 blocks and
 //! falls, breaking a block next to a lake or the sea lets it flow, and F3 shows the first water
@@ -1425,6 +1430,7 @@ fn pick_blocks(
     mut edits: ResMut<EditQueue>,
     lines: Option<ResMut<OverlayLines>>,
     crosshair: Option<ResMut<CrosshairTarget>>,
+    outline: Option<ResMut<BlockOutline>>,
 ) {
     if let Some(slot) = HOTBAR_KEYS.iter().position(|&key| keys.just_pressed(key))
         && slot < picking.hotbar.len()
@@ -1462,6 +1468,13 @@ fn pick_blocks(
         });
     if picking.target != target {
         picking.target = target;
+    }
+    // The renderer outlines the targeted block (ADR 0026).
+    if let Some(mut outline) = outline {
+        let block = target.map(|hit| hit.block);
+        if outline.block != block {
+            outline.block = block;
+        }
     }
     // The first fluid along the view, for F3 (the picking ray goes through water).
     let fluid = cameras
@@ -2098,6 +2111,8 @@ mod tests {
         .init_resource::<OverlayLines>()
         // As `DebugOverlayPlugin` does: picking fills it.
         .init_resource::<CrosshairTarget>()
+        // As `RenderPlugin` does: picking sets its block.
+        .init_resource::<BlockOutline>()
         .edit_schedule(Update, |schedule| {
             schedule.set_build_settings(ScheduleBuildSettings {
                 ambiguity_detection: LogLevel::Error,
@@ -2389,6 +2404,178 @@ mod tests {
             app.update();
         }
         assert!(camera_at(&mut app).y > before.y + 2.0);
+    }
+
+    #[test]
+    fn the_targeted_block_is_outlined() {
+        let mut app = picking_app();
+        let outline = |app: &App| app.world().resource::<BlockOutline>().block;
+        assert_eq!(outline(&app), Some(BlockPos::new(0, 3, 0)));
+        // Out of reach of everything: no outline.
+        let mut cameras = app
+            .world_mut()
+            .query_filtered::<&mut Transform, With<FlyCamera>>();
+        cameras
+            .single_mut(app.world_mut())
+            .expect("camera")
+            .translation
+            .y = 40.0;
+        app.update();
+        assert_eq!(outline(&app), None);
+    }
+
+    /// Walking on the flat grass (top at y = 4) under the camera, landed and asleep.
+    fn walking_app() -> (App, Entity) {
+        let mut app = picking_app();
+        tap(&mut app, player::WALK_KEY);
+        for _ in 0..64 {
+            app.update();
+        }
+        let body = walker(&mut app).expect("walking");
+        (app, body)
+    }
+
+    fn move_line(app: &App) -> String {
+        app.world()
+            .resource::<OverlayLines>()
+            .get("move")
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn ctrl_sprints_shift_sneaks_and_f3_shows_it() {
+        use boxel::physics::BodyPosition;
+        use player::{SNEAK_KEY, SPRINT_KEY};
+        let (mut app, body) = walking_app();
+        // W with Ctrl: Minecraft's sprint, 1.3 times the walk.
+        key(&mut app, KeyCode::KeyW, true);
+        key(&mut app, SPRINT_KEY, true);
+        for _ in 0..64 {
+            app.update();
+        }
+        assert_eq!(
+            move_line(&app),
+            "Walk (G flies)  on ground  speed 5.61 b/s  sprinting"
+        );
+        key(&mut app, SPRINT_KEY, false);
+        // With Shift: a sneak, 0.3 times the walk (it wins over a sprint).
+        key(&mut app, SNEAK_KEY, true);
+        for _ in 0..64 {
+            app.update();
+        }
+        assert_eq!(
+            move_line(&app),
+            "Walk (G flies)  on ground  speed 1.30 b/s  sneaking"
+        );
+        key(&mut app, KeyCode::KeyW, false);
+        key(&mut app, SNEAK_KEY, false);
+        for _ in 0..64 {
+            app.update();
+        }
+        // A pit three blocks deep just north of the player: sneaking north, it stops at the
+        // edge and never falls in.
+        let feet = |app: &App| app.world().get::<BodyPosition>(body).expect("body").0;
+        let edge = feet(&app).block.z - 1;
+        {
+            let mut edits = app.world_mut().resource_mut::<EditQueue>();
+            for x in -3..=3 {
+                for z in edge - 4..=edge {
+                    for y in 1..=3 {
+                        edits.set_block(BlockPos::new(x, y, z), BlockState::AIR);
+                    }
+                }
+            }
+        }
+        app.update();
+        key(&mut app, KeyCode::KeyW, true);
+        key(&mut app, SNEAK_KEY, true);
+        for _ in 0..192 {
+            app.update();
+            let p = feet(&app).to_dvec3();
+            assert_eq!(p.y, 4.0, "never off the edge");
+        }
+        let p = feet(&app).to_dvec3();
+        // Its back side keeps a sliver of the last row (z = edge + 1 .. edge + 2).
+        let back = p.z + 0.3 - (edge + 1) as f64;
+        assert!(back > 0.0 && back < 0.01, "{p} at the edge of {edge}");
+        // Without the sneak it walks in.
+        key(&mut app, SNEAK_KEY, false);
+        for _ in 0..64 {
+            app.update();
+        }
+        assert_eq!(feet(&app).to_dvec3().y, 1.0);
+    }
+
+    #[test]
+    fn space_twice_flies_shift_descends_and_landing_walks() {
+        use boxel::physics::BodyPosition;
+        use player::SNEAK_KEY;
+        let (mut app, body) = walking_app();
+        let flying = |app: &App| {
+            app.world()
+                .get::<CharacterController>(body)
+                .expect("body")
+                .flying
+        };
+        let feet_y = |app: &App| {
+            app.world()
+                .get::<BodyPosition>(body)
+                .expect("body")
+                .0
+                .to_dvec3()
+                .y
+        };
+        // Two taps of Space: the first jumps, the second turns the flight on.
+        tap(&mut app, KeyCode::Space);
+        assert!(!flying(&app));
+        tap(&mut app, KeyCode::Space);
+        assert!(flying(&app));
+        assert!(move_line(&app).starts_with("Walk (G flies)  flying"));
+        // Held Space rises; let go, it hovers (no gravity).
+        key(&mut app, KeyCode::Space, true);
+        for _ in 0..32 {
+            app.update();
+        }
+        key(&mut app, KeyCode::Space, false);
+        for _ in 0..128 {
+            app.update();
+        }
+        let high = feet_y(&app);
+        assert!(high > 6.0, "{high}");
+        for _ in 0..16 {
+            app.update();
+        }
+        assert_eq!(feet_y(&app), high);
+        assert!(flying(&app));
+        // Shift descends until it lands, which ends the flight.
+        key(&mut app, SNEAK_KEY, true);
+        for _ in 0..256 {
+            app.update();
+            if !flying(&app) {
+                break;
+            }
+        }
+        key(&mut app, SNEAK_KEY, false);
+        assert!(!flying(&app));
+        assert_eq!(feet_y(&app), 4.0);
+        // Up again, and two taps in the air turn it off: it falls back to the grass.
+        tap(&mut app, KeyCode::Space);
+        tap(&mut app, KeyCode::Space);
+        assert!(flying(&app));
+        key(&mut app, KeyCode::Space, true);
+        for _ in 0..32 {
+            app.update();
+        }
+        key(&mut app, KeyCode::Space, false);
+        tap(&mut app, KeyCode::Space);
+        tap(&mut app, KeyCode::Space);
+        assert!(!flying(&app));
+        for _ in 0..128 {
+            app.update();
+        }
+        assert_eq!(feet_y(&app), 4.0);
+        assert_eq!(move_line(&app), "Walk (G flies)  on ground  speed 0.00 b/s");
     }
 
     #[test]

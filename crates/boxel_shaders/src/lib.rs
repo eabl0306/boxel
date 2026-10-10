@@ -24,6 +24,8 @@ pub const CULL_WGSL: &str = include_str!("../shaders/cull.wgsl");
 pub const BLIT_WGSL: &str = include_str!("../shaders/blit.wgsl");
 /// `overlay.wgsl`: screen-space overlay rectangles (`vs_overlay`, `fs_overlay`).
 pub const OVERLAY_WGSL: &str = include_str!("../shaders/overlay.wgsl");
+/// `outline.wgsl`: the targeted block's outline, clip-space quads (`vs_outline`, `fs_outline`).
+pub const OUTLINE_WGSL: &str = include_str!("../shaders/outline.wgsl");
 
 /// Shader stage of an entry point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +51,8 @@ pub enum ShaderModuleId {
     Blit,
     /// overlay rectangles (all tiers).
     Overlay,
+    /// block outline (all tiers).
+    Outline,
 }
 
 static VOXEL_PULL: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{VOXEL_PULL_WGSL}"));
@@ -58,12 +62,13 @@ static CULL: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{CULL_W
 
 impl ShaderModuleId {
     /// All modules.
-    pub const ALL: [ShaderModuleId; 5] = [
+    pub const ALL: [ShaderModuleId; 6] = [
         ShaderModuleId::VoxelPull,
         ShaderModuleId::VoxelInstanced,
         ShaderModuleId::Cull,
         ShaderModuleId::Blit,
         ShaderModuleId::Overlay,
+        ShaderModuleId::Outline,
     ];
 
     /// Debug label.
@@ -74,6 +79,7 @@ impl ShaderModuleId {
             ShaderModuleId::Cull => "boxel cull",
             ShaderModuleId::Blit => "boxel blit",
             ShaderModuleId::Overlay => "boxel overlay",
+            ShaderModuleId::Outline => "boxel outline",
         }
     }
 
@@ -85,6 +91,7 @@ impl ShaderModuleId {
             ShaderModuleId::Cull => CULL.as_str(),
             ShaderModuleId::Blit => BLIT_WGSL,
             ShaderModuleId::Overlay => OVERLAY_WGSL,
+            ShaderModuleId::Outline => OUTLINE_WGSL,
         }
     }
 
@@ -113,6 +120,10 @@ impl ShaderModuleId {
                 ("vs_overlay", Stage::Vertex),
                 ("fs_overlay", Stage::Fragment),
             ],
+            ShaderModuleId::Outline => &[
+                ("vs_outline", Stage::Vertex),
+                ("fs_outline", Stage::Fragment),
+            ],
         }
     }
 
@@ -126,9 +137,10 @@ impl ShaderModuleId {
     pub const fn min_gl(self) -> (u8, u8) {
         match self {
             ShaderModuleId::VoxelPull | ShaderModuleId::Cull => (4, 3),
-            ShaderModuleId::VoxelInstanced | ShaderModuleId::Blit | ShaderModuleId::Overlay => {
-                (3, 3)
-            }
+            ShaderModuleId::VoxelInstanced
+            | ShaderModuleId::Blit
+            | ShaderModuleId::Overlay
+            | ShaderModuleId::Outline => (3, 3),
         }
     }
 }

@@ -476,6 +476,11 @@ Dos datos del código pesan en el diseño:
     de los pares, partir en islas (su trabajo sigue a los pares, no a la lista), los sensores,
     los eventos y el despertar.
 
+- **9e. Vallas de 1,5 y modos del jugador (issues #46 y #37).** Las cajas de colisión pueden
+  subir hasta media celda arriba (la valla choca a 1,5) y el barrido y el raycast las ven desde
+  la celda de arriba. El controlador suma agacharse (sin caerse de los bordes), correr y el vuelo
+  creativo. Detalle en ADR 0026.
+
 - **10. Fases.** P0: requisitos (`WorldPos`, sets del bucle fijo, el tope de pasos, este ADR, la
   feature). P1: núcleo y raycast (tabla, fuentes, barrido, DDA, `PhysicsQuery::raycast_voxels`,
   edición de bloques en `voxel_world`). P2: cuerpos (gravedad, arrastre, rebote, congelar,

@@ -4,10 +4,12 @@
 //!
 //! `cargo run --release --example physics_sandbox -- [GPU options] [options]` (see `--help`).
 //! It starts walking on the ground at the origin. Left click grabs the mouse; WASD walks along
-//! the view, Space jumps (hold it to keep jumping), G switches to flying (the free camera, as in
-//! `voxel_world`) and back, Q drops an item in front of you (a small dynamic sensor box with the
-//! item settings: half gravity, more drag), C drops a crate two blocks ahead (a solid box of
-//! 0.75: crates stack, and you can push them and stand on them). Walking into an item picks it up
+//! the view, Space jumps (hold it to keep jumping), Shift sneaks (slower, never off an edge), Ctrl
+//! sprints and Space twice toggles creative flight (ADR 0026: Space rises, Shift descends,
+//! landing ends it). G switches to flying the free camera (as in `voxel_world`) and back, Q
+//! drops an item in front of you (a small dynamic sensor box with the item settings: half
+//! gravity, more drag), C drops a crate two blocks ahead (a solid box of 0.75: crates stack, and
+//! you can push them and stand on them). Walking into an item picks it up
 //! (the player's `CollisionStarted` with the item's sensor; a thrown item only after a second).
 //! F shoots an arrow along the view at 60 blocks/s (a `Projectile`: it sticks in the block it
 //! hits, and a mob it hits is knocked back and the arrow is gone), B throws a bouncy ball (a
@@ -54,14 +56,15 @@ usage: physics_sandbox [GPU options] [options]
                           rest, 3 if any still moves after 20 s of simulated time
   --frames N              exit after N rendered frames (renders while hidden)
   --timeout SECS          wall-clock limit, exit 4 (default 120 with --drop-test or --frames)
-  --fly                   start flying instead of walking (G switches)
+  --fly                   start flying the free camera instead of walking (G switches)
   --seed N                terrain seed
   --view-distance N       mesh radius in chunks (default 8)
   --time HH[:MM]          clock time of the world, kept still (06:00 sunrise, 12:00 noon,
                           18:00 sunset, 00:00 midnight); default 12:00
   --debug-overlay         start with the F3 debug overlay visible (F3 toggles it)
   --help                  this text
-keys: WASD walk, Space jump, G fly/walk, Q drop an item, C drop a crate, F shoot an arrow,
+keys: WASD walk, Space jump (twice: creative flight, Space rises), Shift sneak (flying:
+  descend), Ctrl sprint, G free camera/walk, Q drop an item, C drop a crate, F shoot an arrow,
   B throw a ball, M spawn mobs, T build a stair of slabs, F3 overlay, Escape frees the mouse
 exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 drop test failed, 4 timeout";
 

@@ -308,9 +308,12 @@ fn fly(flyer: &mut Flyer<'_>, shared: &Shared<'_>, f: Flight<'_, '_>) {
             stuck = true;
             break;
         };
-        // The center on the face's plane, `eps` back on the side it came from.
+        // The center on the face's plane, `eps` back on the side it came from. The plane is the
+        // hit point's coordinate on that axis: a block plane, or a box face inside a cell (a
+        // slab's top, a fence's top half a block above its block: ADR 0026), both exact.
         let positive = rem[axis] > 0.0;
-        let plane = (hit.point.block.as_i64vec3()[axis] - start.block.as_i64vec3()[axis]) as f64;
+        let plane = (hit.point.block.as_i64vec3()[axis] - start.block.as_i64vec3()[axis]) as f64
+            + hit.point.frac[axis];
         let back = if positive { -shared.eps } else { shared.eps };
         let along_rem = rem * hit.t;
         frac += along_rem;

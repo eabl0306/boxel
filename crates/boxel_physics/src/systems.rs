@@ -1,13 +1,13 @@
 //! The per-step systems of physics bodies (phases P2 to P4) and their sets.
 
 use crate::components::{
-    BodyPosition, CharacterController, Collider, Contacts, Frozen, Interpolated, MoveIntent,
-    PhysicsSettings, PhysicsStats, PhysicsSync, Projectile, RigidBody, Sleeping, Teleport, Vacated,
-    Velocity, VoxelImpact,
+    BodyPosition, CharacterController, Collider, Contacts, FLIGHT_VERTICAL_DRAG, Frozen,
+    Interpolated, MoveIntent, PhysicsSettings, PhysicsStats, PhysicsSync, Projectile, RigidBody,
+    Sleeping, Teleport, Vacated, Velocity, VoxelImpact,
 };
 use crate::contacts::{BodyIndex, ObstacleIndex, ObstacleScratch};
 use crate::core::{
-    BodySettings, CollisionTable, LocalBox, MAX_SWEEP_DISTANCE, StepParams, StepUp,
+    BodySettings, CollisionTable, LocalBox, MAX_SWEEP_DISTANCE, StepParams, StepUp, guard_edge,
     integrate_velocity, move_body,
 };
 use crate::plugin::PhysicsContent;
@@ -170,11 +170,12 @@ pub(crate) struct AwakeCount {
     pub(crate) projectiles: usize,
 }
 
-/// [`PhysicsSystems::Controller`]: walking and jumping (see [`CharacterController`]). Only
-/// dynamic bodies walk (the others have no drag to level the speed off). Frozen bodies are
-/// skipped (their steps do not happen) and keep the jump latch. A sleeping character that
-/// wants to move gets a velocity, and that wakes it. Each character only writes itself: on the
-/// compute threads above `PhysicsSettings::parallel_threshold` awake characters.
+/// [`PhysicsSystems::Controller`]: walking, jumping, sneaking, sprinting and flying (see
+/// [`CharacterController`]). Only dynamic bodies walk (the others have no drag to level the
+/// speed off). Frozen bodies are skipped (their steps do not happen) and keep the jump latch. A
+/// sleeping character that wants to move gets a velocity, and that wakes it. Each character
+/// only writes itself: on the compute threads above `PhysicsSettings::parallel_threshold` awake
+/// characters.
 pub(crate) fn drive_characters(
     fixed: Res<FixedTime>,
     settings: Res<PhysicsSettings>,
@@ -218,17 +219,39 @@ pub(crate) fn drive_characters(
         if length_sq > 1.0 {
             wish /= length_sq.sqrt();
         }
-        let (rate, control) = if contacts.on_ground {
+        let flying = controller.flying;
+        // Sneaking slows a walker (a flyer descends instead) and stops a sprint.
+        let speed = if flying {
+            controller.fly_speed * if intent.sprint { 2.0 } else { 1.0 }
+        } else if intent.sneak {
+            controller.walk_speed * controller.sneak_factor
+        } else if intent.sprint {
+            controller.walk_speed * controller.sprint_factor
+        } else {
+            controller.walk_speed
+        };
+        // A flyer is never on the ground for its drag (it lands and stops flying).
+        let (rate, control) = if flying {
+            (body.drag_xz, 1.0)
+        } else if contacts.on_ground {
             (body.ground_friction, 1.0)
         } else {
             (body.drag_xz, controller.air_control)
         };
-        // With drag `rate`, an acceleration `walk_speed * rate` levels off at `walk_speed`.
-        let accel = controller.walk_speed * rate * control * dt;
+        // With drag `rate`, an acceleration `speed * rate` levels off at `speed`.
+        let accel = speed * rate * control * dt;
         let mut v = velocity.0;
         v.x += wish.x * accel;
         v.z += wish.y * accel;
-        if intent.jump {
+        if flying {
+            // Up while `up` is held, down while sneaking: the flight's vertical drag levels it
+            // off at `fly_vertical_speed`. A jump does nothing.
+            let climb = f64::from(i8::from(intent.up) - i8::from(intent.sneak));
+            v.y += climb * controller.fly_vertical_speed * FLIGHT_VERTICAL_DRAG * dt;
+            if intent.jump {
+                intent.jump = false;
+            }
+        } else if intent.jump {
             intent.jump = false;
             if contacts.on_ground {
                 v.y = controller.jump_speed;
@@ -576,7 +599,8 @@ type StepItem<'a> = (
     Mut<'a, Contacts>,
     Mut<'a, PhysicsSync>,
     bool,
-    Option<&'a CharacterController>,
+    Option<Mut<'a, CharacterController>>,
+    Option<&'a MoveIntent>,
 );
 
 /// One step of one dynamic body (it reads the world and writes only itself).
@@ -591,7 +615,8 @@ fn step_one(stepper: &mut Stepper<'_>, shared: &StepShared<'_>, item: StepItem<'
         mut contacts,
         mut sync,
         was_frozen,
-        controller,
+        mut controller,
+        intent,
     ) = item;
     if *kind != RigidBody::Dynamic {
         return;
@@ -600,22 +625,52 @@ fn step_one(stepper: &mut Stepper<'_>, shared: &StepShared<'_>, item: StepItem<'
     let params = &shared.params;
     let shape = collider.map_or(LocalBox::default(), Collider::voxel_box);
     let pos = position.0.normalize();
-    let v = integrate_velocity(velocity.0, contacts.on_ground, body, params);
-    // Characters step up ledges (projectiles never get here).
-    let step = match controller {
-        Some(controller) if controller.step_height > 0.0 => StepUp {
+    // A flyer has no gravity and the flight's vertical drag, and never the ground friction.
+    let flying = controller.as_ref().is_some_and(|c| c.flying);
+    let flight;
+    let body = if flying {
+        flight = BodySettings {
+            gravity_scale: 0.0,
+            drag_y: FLIGHT_VERTICAL_DRAG,
+            ..*body
+        };
+        &flight
+    } else {
+        body
+    };
+    let mut v = integrate_velocity(velocity.0, contacts.on_ground && !flying, body, params);
+    // Characters step up ledges (projectiles never get here); flyers do not.
+    let step = match controller.as_deref() {
+        Some(controller) if !flying && controller.step_height > 0.0 => StepUp {
             height: controller.step_height,
             grounded: contacts.on_ground,
         },
         _ => StepUp::NONE,
     };
+    // A sneaking character walking on the ground (not jumping) keeps away from edges.
+    let sneak_drop = match (controller.as_deref(), intent) {
+        (Some(controller), Some(intent))
+            if intent.sneak
+                && !flying
+                && contacts.on_ground
+                && v.y <= 0.0
+                && (v.x != 0.0 || v.z != 0.0) =>
+        {
+            Some(controller.sneak_drop().min(MAX_SWEEP_DISTANCE))
+        }
+        _ => None,
+    };
     // Solid colliders sweep against the static and kinematic solids too, the ones a step-up
-    // could reach included (the box raised by the step height).
+    // could reach included (the box raised by the step height), and the ones a sneaking
+    // character may stand on (the box lowered by its drop).
     let blockers = match collider {
         Some(collider) if !collider.is_sensor() && !shared.obstacles.is_empty() => {
             let mut reach = shape;
             if step.height > 0.0 {
                 reach.max.y += step.height.min(MAX_SWEEP_DISTANCE);
+            }
+            if let Some(drop) = sneak_drop {
+                reach.min.y -= drop;
             }
             stepper
                 .scratch
@@ -623,18 +678,58 @@ fn step_one(stepper: &mut Stepper<'_>, shared: &StepShared<'_>, item: StepItem<'
         }
         _ => &[],
     };
-    match move_body(
-        &mut stepper.voxels,
-        shared.table,
-        pos,
-        v,
-        shape,
-        blockers,
-        body,
-        params,
-        step,
-    ) {
-        Ok(out) => {
+    // The edge guard cuts the move across; the velocity on a cut axis stops after the step.
+    let mut guarded = [false; 3];
+    let guard = match sneak_drop {
+        Some(drop) => {
+            let d = v * params.dt;
+            guard_edge(
+                &mut stepper.voxels,
+                shared.table,
+                pos,
+                shape,
+                d,
+                blockers,
+                &params.sweep,
+                drop,
+            )
+            .map(|cut| {
+                for axis in [0, 2] {
+                    if cut[axis] != d[axis] {
+                        v[axis] = cut[axis] / params.dt;
+                        guarded[axis] = true;
+                    }
+                }
+            })
+        }
+        None => Ok(()),
+    };
+    match guard.and_then(|()| {
+        move_body(
+            &mut stepper.voxels,
+            shared.table,
+            pos,
+            v,
+            shape,
+            blockers,
+            body,
+            params,
+            step,
+        )
+    }) {
+        Ok(mut out) => {
+            for axis in [0, 2] {
+                if guarded[axis] {
+                    out.vel[axis] = 0.0;
+                }
+            }
+            // Landing ends a flight (Minecraft's creative flight).
+            if flying
+                && out.sweep.on_ground()
+                && let Some(controller) = controller.as_mut()
+            {
+                controller.flying = false;
+            }
             if out.sweep.moved != DVec3::ZERO {
                 sync.moved = out.sweep.moved;
                 sync.net = out.sweep.moved;
@@ -665,11 +760,12 @@ fn step_one(stepper: &mut Stepper<'_>, shared: &StepShared<'_>, item: StepItem<'
 }
 
 /// [`PhysicsSystems::Step`]: one step of every awake dynamic body ([`crate::step_body`], plus
-/// the static and kinematic solid obstacles for a solid body, and the step-up of a
-/// [`CharacterController`]). A body whose step needs an unloaded block keeps its state and gets
-/// [`Frozen`]. Above `PhysicsSettings::parallel_threshold` bodies it runs on the compute
-/// threads: each body reads the world and writes only itself, and the outputs are merged in
-/// entity order, so the results are bit-identical to a run on one thread.
+/// the static and kinematic solid obstacles for a solid body, and the step-up, the sneak edge
+/// guard and the flight of a [`CharacterController`]; a flyer that lands stops flying). A body
+/// whose step needs an unloaded block keeps its state and gets [`Frozen`]. Above
+/// `PhysicsSettings::parallel_threshold` bodies it runs on the compute threads: each body reads
+/// the world and writes only itself, and the outputs are merged in entity order, so the results
+/// are bit-identical to a run on one thread.
 pub(crate) fn step_dynamic(
     mut commands: Commands,
     map: Res<ChunkMap>,
@@ -690,7 +786,8 @@ pub(crate) fn step_dynamic(
             &mut Contacts,
             &mut PhysicsSync,
             Has<Frozen>,
-            Option<&CharacterController>,
+            Option<&mut CharacterController>,
+            Option<&MoveIntent>,
         ),
         (Without<Sleeping>, Without<Projectile>),
     >,

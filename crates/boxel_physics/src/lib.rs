@@ -5,7 +5,9 @@
 //! or sensor events. This crate grows in phases (see ADR 0016); today (P4) it has the voxel
 //! core, the raycast, bodies that move against the voxels, collisions between bodies,
 //! projectiles that never tunnel, sleeping bodies and a parallel step; from P5, blocks made of
-//! boxes (slabs) and characters that step up low ledges.
+//! boxes (slabs) and characters that step up low ledges; from ADR 0026, collision boxes that
+//! reach into the cell above (fences 1.5 blocks tall) and characters that sneak (never off an
+//! edge), sprint and fly.
 //!
 //! Two layers:
 //! - [`core`] is pure (no ECS): the [`CollisionTable`] (how each block state collides, derived
@@ -62,19 +64,20 @@ mod systems;
 
 pub use crate::components::{
     BodyPosition, CharacterController, Collider, CollisionEnded, CollisionStarted, Contacts,
-    Frozen, Interpolated, MoveIntent, OnBlock, OnEntity, PhysicsSettings, PhysicsStats,
-    PhysicsSync, Projectile, ProjectileHit, ProjectileTarget, ReportContacts, Response, RigidBody,
-    Sleeping, Teleport, Velocity, VoxelImpact,
+    FLIGHT_VERTICAL_DRAG, Frozen, Interpolated, MoveIntent, OnBlock, OnEntity, PhysicsSettings,
+    PhysicsStats, PhysicsSync, Projectile, ProjectileHit, ProjectileTarget, ReportContacts,
+    Response, RigidBody, Sleeping, Teleport, Velocity, VoxelImpact,
 };
 pub use crate::contacts::{BodyFilter, BodyHit, BodyIndex};
 #[doc(hidden)]
 pub use crate::core::move_box_stepping_unpruned;
 pub use crate::core::{
     BlockBounds, BodyImpact, BodySettings, BodyStep, CollisionLayers, CollisionShape,
-    CollisionTable, Contact, Grid, GridSlot, LocalBox, MAX_RAY_DISTANCE, MAX_SWEEP_DISTANCE, Probe,
-    RayResult, STOP_SPEED, Shape, ShapeHit, StepParams, StepUp, SweepConfig, SweepOut, TestWorld,
-    Unloaded, VoxelFilter, VoxelHit, VoxelSource, axis_order, integrate_velocity, move_body,
-    move_box, move_box_stepping, predict, raycast_voxels, shape_contact, step_body,
+    CollisionTable, Contact, EDGE_MARGIN, Grid, GridSlot, LocalBox, MAX_RAY_DISTANCE,
+    MAX_SWEEP_DISTANCE, Probe, RayResult, STOP_SPEED, Shape, ShapeHit, StepParams, StepUp,
+    SweepConfig, SweepOut, TestWorld, Unloaded, VoxelFilter, VoxelHit, VoxelSource, axis_order,
+    guard_edge, integrate_velocity, move_body, move_box, move_box_stepping, predict,
+    raycast_voxels, shape_contact, step_body,
 };
 pub use boxel_voxel::WorldPos;
 pub use plugin::{PhysicsContent, PhysicsPlugin};

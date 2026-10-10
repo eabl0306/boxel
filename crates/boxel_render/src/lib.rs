@@ -34,6 +34,7 @@ macro_rules! frame_span {
 pub(crate) struct NoSpan;
 
 mod light;
+mod outline;
 mod overlay;
 mod pack_textures;
 mod plugin;
@@ -49,6 +50,7 @@ mod targets;
 mod upload;
 
 pub use light::{LIGHT_LEVELS, SceneLight, light_curve};
+pub use outline::{BlockOutline, Outline, OutlineEdge, block_outline_edges, outline_edges};
 pub use overlay::{OverlayDraw, OverlayRect};
 pub use pack_textures::{
     FOLIAGE_TINT, GRASS_TINT, MAX_PACK_TEXTURE_SIZE, TextureReport, TextureSource, WATER_TINT,
@@ -78,7 +80,7 @@ pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Common items.
 pub mod prelude {
     pub use crate::{
-        PresentSettings, RenderInfo, RenderPlugin, RenderSettings, RequestScreenshot,
+        BlockOutline, PresentSettings, RenderInfo, RenderPlugin, RenderSettings, RequestScreenshot,
         ScreenshotSaved,
     };
 }

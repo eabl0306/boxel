@@ -5,6 +5,8 @@
 //!   state collides) and [`TestWorld`] (an in-memory source for tests and tools).
 //! - [`shape`]: [`Shape`] (box or sphere), [`LocalBox`] and ray tests against them.
 //! - [`sweep`]: [`move_box`], the per-axis AABB sweep against the voxel grid.
+//! - [`edge`]: [`guard_edge`], Minecraft's sneak edge guard (a sneaking character never walks
+//!   off a ledge).
 //! - [`ray`]: [`raycast_voxels`], the exact DDA voxel raycast.
 //! - [`body`]: [`step_body`], one fixed step of a body (gravity, drag, sweep, bounces), and
 //!   [`predict`].
@@ -14,6 +16,7 @@
 //!   [`CollisionLayers`].
 
 pub mod body;
+pub mod edge;
 pub mod grid;
 pub mod narrow;
 pub mod ray;
@@ -25,6 +28,7 @@ pub use body::{
     BodyImpact, BodySettings, BodyStep, STOP_SPEED, StepParams, integrate_velocity, move_body,
     predict, step_body,
 };
+pub use edge::{EDGE_MARGIN, guard_edge};
 pub use grid::{
     BlockBounds, CellRay, CollisionLayers, DEFAULT_GRID_SHIFT, Grid, GridSlot, MAX_CELLS_PER_AXIS,
     MAX_GRID_SHIFT,
