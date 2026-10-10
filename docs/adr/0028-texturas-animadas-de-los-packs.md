@@ -130,7 +130,7 @@ y la antorcha ganan uno o dos texeles en sus mips chicos.
   (quietas y de flujo) y el sea lantern interpolan, así que suben en cada tick; la antorcha cada 2
   ticks. Son unas 6 capas de 1,4 KB por tick, 5 llamadas a `write_texture` por capa. Con
   BlockPixel, 5 capas y 124 KB (su `water_still` lista el índice 20 en una tira de 20 cuadros: se
-  descarta con aviso, como en Minecraft). Ver la medición abajo.
+  descarta con aviso, como en Minecraft). Ver la medición.
 - `textures.rs` cambió el mip de las capas de recorte para todos, no solo para los packs.
 
 ## Pruebas
@@ -150,6 +150,15 @@ y la antorcha ganan uno o dos texeles en sus mips chicos.
   interpolada, la vuelta del ciclo y un presupuesto de un byte), con la misma imagen en todos los
   tiers. Otro test mira el costado de una fuente de agua: con un flujo quieto se desplaza, con uno
   animado no.
+
+## Medición (nivel 1)
+
+- Sin ruido: con Whimscape, 6 capas animadas suben 110 capas por segundo (5 capas interpoladas
+  a 20 por segundo y la antorcha a 10), unos 150 KB por segundo y 550 llamadas a
+  `write_texture`. Sin pack no se sube nada.
+- `just perf-smoke surface -- --pack assets/Whimscape` (RTX, r16, sin tope, una corrida por
+  lado contra `main`): 1941 a 1939 fps (-0,1 %), p99 de 1,25 a 1,33 ms, 0 frames lentos en los
+  dos lados. Veredicto ok. No aparecieron los frames fijos en 33 ms de la issue.
 
 ## Pendiente de la issue #45
 
