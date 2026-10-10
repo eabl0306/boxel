@@ -385,6 +385,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "boxel_fog"
+version = "0.1.0-dev"
+dependencies = [
+ "boxel_voxel",
+ "proptest",
+]
+
+[[package]]
 name = "boxel_gfx"
 version = "0.1.0-dev"
 dependencies = [

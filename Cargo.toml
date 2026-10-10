@@ -46,6 +46,7 @@ boxel_world = { path = "crates/boxel_world", version = "0.1.0-dev" }
 boxel_debug = { path = "crates/boxel_debug", version = "0.1.0-dev" }
 boxel_physics = { path = "crates/boxel_physics", version = "0.1.0-dev" }
 boxel_pack = { path = "crates/boxel_pack", version = "0.1.0-dev" }
+boxel_fog = { path = "crates/boxel_fog", version = "0.1.0-dev" }
 # Example content (#48): not published, so path only. Engine crates take it as a dev-dependency
 # (cargo strips those on publish); the demo depends on no engine crate but voxel, worldgen, pack.
 boxel_demo = { path = "crates/boxel_demo" }
