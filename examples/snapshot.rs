@@ -45,7 +45,7 @@ use boxel::prelude::*;
 use boxel::render::{
     BlockOutline, FLUID_TIME_PERIOD, Outline, RenderSettings, RendererConfig, SceneLight,
     TextureSource, TranslucentSort, ViewParams, VoxelRenderer, block_outline_edges, light_curve,
-    load_block_textures,
+    load_block_textures, texture_tick,
 };
 use boxel::voxel::{BlockRegistry, MAX_BLOCK_COORD};
 use boxel::world::persist::{PersistPlugin, WorldStore};
@@ -83,7 +83,8 @@ usage: snapshot --camera X,Y,Z,YAW,PITCH --shot HH:MM=PATH [--shot ...] [options
   --flow N             let placed water flow for N game ticks (20 a second) before the shots
                        (default 0)
   --fluid-time S       seconds of the fluid animation in the shots: how far the flow textures
-                       have scrolled (default 0)
+                       have scrolled and which frame animated pack textures show (20 ticks a
+                       second; default 0)
   --world-dir DIR      load the world saved in DIR (made if missing) and save it there after
                        the shots, edits included
   --outline X,Y,Z      draw the outline of the block at X,Y,Z, as voxel_world outlines the
@@ -776,6 +777,8 @@ fn run(
         size,
     )
     .map_err(|e| gpu_err(format!("VoxelRenderer::new: {e}")))?;
+    // Every animated texture layer reaches the GPU in the shot's first frame (ADR 0028).
+    renderer.set_texture_upload_budget(u64::MAX);
     // The model boxes of slabs, stairs, fences and torches (ADR 0020).
     let content = app.world().resource::<WorldContent>();
     renderer.set_model_boxes(&gpu.queue, content.materials.model_boxes());
@@ -822,6 +825,7 @@ fn run(
         let params = ViewParams {
             light,
             fluid_time: (o.fluid_time % FLUID_TIME_PERIOD) as f32,
+            texture_tick: texture_tick(o.fluid_time),
             ..ViewParams::from_camera(&view, &camera, sky_color, settings.fog_start_fraction)
         };
         // The first frame uploads; the second draws exactly what a steady game frame draws.

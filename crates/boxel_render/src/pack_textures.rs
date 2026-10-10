@@ -8,17 +8,24 @@
 //! states (ADR 0019): `boxel:log[axis=y]` reads the pack's `axis=y` variant ([`pack_variant`]). Grayscale textures Minecraft tints by biome (grass, foliage, water) get a
 //! fixed plains tint baked in. Layers the pack cannot fill keep their procedural pixels and add a
 //! warning to the [`TextureReport`].
+//!
+//! A layer whose texture is animated (`.png.mcmeta`, water, lava, the sea lantern...) also keeps
+//! the finished layer of every frame its animation shows ([`LayerAnimation`], ADR 0028); the
+//! array holds the frame of tick 0.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use std::sync::Arc;
+
 use boxel_pack::{
-    BlockState as PackState, FaceName, ResourceId, ResourcePack, Texture, VariantList,
+    BlockState as PackState, FaceName, ResourceId, ResourcePack, Texture, Timeline, VariantList,
     condition_matches, parse_variant_key,
 };
 use boxel_voxel::{BlockRegistry, BlockState, Face, RenderShape, TextureSpec};
 
+use crate::texture_animation::LayerAnimation;
 use crate::textures::{
     BLOCK_TEXTURE_SIZE, BlockTextureData, generate_block_textures, is_cutout_pattern, layer_bytes,
     mip_levels, push_layer, synthesize,
@@ -32,6 +39,10 @@ pub const GRASS_TINT: [u8; 3] = [0x91, 0xBD, 0x59];
 pub const FOLIAGE_TINT: [u8; 3] = [0x77, 0xAB, 0x2F];
 /// Minecraft's default water color (sRGB), baked into the grayscale water texture.
 pub const WATER_TINT: [u8; 3] = [0x3F, 0x76, 0xE4];
+/// Most bytes the frames of animated layers may take ([`LayerAnimation::memory`]); a layer past
+/// it shows its first frame only, with a warning. Every animated layer of a 16 px pack takes a
+/// few hundred KB; a 512 px layer with 32 frames, 45 MB.
+pub const MAX_ANIMATION_BYTES: usize = 64 << 20;
 
 /// Where the pixels of the block texture layers come from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -67,6 +78,10 @@ pub struct TextureReport {
     pub layers: u32,
     /// Layers whose pixels came from the pack.
     pub from_pack: u32,
+    /// Animated layers among them (ADR 0028).
+    pub animated: u32,
+    /// Bytes the frames of the animated layers take.
+    pub animation_bytes: usize,
     /// Wall time of reading the pack and building the array (CPU only, no upload).
     pub load_time: Duration,
     /// Non-fatal warnings of the pack reader itself (skipped assets, odd sizes...).
@@ -97,6 +112,8 @@ pub fn load_block_textures(
         size: data.size,
         layers: data.layers,
         from_pack,
+        animated: data.animations.len() as u32,
+        animation_bytes: data.animations.iter().map(LayerAnimation::memory).sum(),
         load_time: started.elapsed(),
         pack_warnings,
         warnings,
@@ -381,6 +398,13 @@ struct Part {
     tint: Tint,
 }
 
+/// A layer the pack fills: its parts and level 0 at tick 0.
+struct PackLayer {
+    parts: Vec<Part>,
+    quarter: bool,
+    texels: Vec<[u8; 4]>,
+}
+
 /// The array of `registry`'s layers at the pack's most common texture size; returns it and how
 /// many layers came from the pack.
 fn pack_block_textures(
@@ -393,13 +417,52 @@ fn pack_block_textures(
     let shapes = layer_shapes(registry);
     let mut data = Vec::with_capacity(layer_bytes(size) * specs.len().max(1));
     let mut from_pack = 0;
+    let mut animations = Vec::new();
+    let mut animation_bytes = 0;
     for (index, spec) in specs.iter().enumerate() {
         let shape = shapes.get(index).copied().flatten();
         match pack_layer(registry, pack, spec, size, warnings) {
-            Some(mut texels) => {
+            Some(PackLayer {
+                parts,
+                quarter,
+                mut texels,
+            }) => {
                 let cutout = finish_alpha(&mut texels, shape);
                 push_layer(&mut data, &texels, size, cutout);
                 from_pack += 1;
+                if let Some((part, timeline)) = animated_part(pack, &parts, &spec.name, warnings) {
+                    let bytes = timeline.indices().len() * layer_bytes(size);
+                    if animation_bytes + bytes > MAX_ANIMATION_BYTES {
+                        warnings.push(format!(
+                            "{}: animation frames ({bytes} bytes) past the \
+                             {MAX_ANIMATION_BYTES} byte cap; first frame only",
+                            spec.name
+                        ));
+                        continue;
+                    }
+                    animation_bytes += bytes;
+                    let frames = timeline
+                        .indices()
+                        .into_iter()
+                        .map(|frame| {
+                            let pick = |i: usize, texture: &Texture| {
+                                if i == part {
+                                    frame
+                                } else {
+                                    start_index(texture)
+                                }
+                            };
+                            let mut texels =
+                                compose(pack, &parts, size, quarter, &mut Vec::new(), &pick)
+                                    .expect("the layer composed at tick 0");
+                            finish_alpha(&mut texels, shape);
+                            let mut bytes = Vec::with_capacity(layer_bytes(size));
+                            push_layer(&mut bytes, &texels, size, cutout);
+                            (frame, bytes)
+                        })
+                        .collect();
+                    animations.push(LayerAnimation::new(index as u32, timeline, frames));
+                }
             }
             None => {
                 let texels = scale_nearest(
@@ -422,9 +485,65 @@ fn pack_block_textures(
         size,
         layers,
         mip_levels: mip_levels(size),
+        animated_flow: ["boxel:water_flow", "boxel:lava_flow"].map(|name| {
+            animations.iter().any(|a: &LayerAnimation| {
+                specs.get(a.layer as usize).is_some_and(|s| s.name == name)
+            })
+        }),
         data,
+        animations: Arc::from(animations),
     };
     (data, from_pack)
+}
+
+/// The part of `parts` that animates the layer `name` and its timeline: the first part whose
+/// pack texture has a valid animation (warnings name dropped frames). Layers composite one
+/// animation: a later animated part shows its tick 0 frame, with a warning.
+fn animated_part(
+    pack: &ResourcePack,
+    parts: &[Part],
+    name: &str,
+    warnings: &mut Vec<String>,
+) -> Option<(usize, Timeline)> {
+    let mut found: Option<(usize, Timeline)> = None;
+    for (i, part) in parts.iter().enumerate() {
+        let Some(texture) = pack.texture(&part.id) else {
+            continue;
+        };
+        let mut problems = Vec::new();
+        let timeline = timeline(texture, &mut problems);
+        warnings.extend(
+            problems
+                .into_iter()
+                .map(|p| format!("{name}: {}: {p}", part.id)),
+        );
+        if let Some(timeline) = timeline {
+            if found.is_some() {
+                warnings.push(format!(
+                    "{name}: {} is animated too; only the first animated part moves",
+                    part.id
+                ));
+            } else {
+                found = Some((i, timeline));
+            }
+        }
+    }
+    found
+}
+
+/// The animation of `texture` resolved against its strip (`None`: static).
+fn timeline(texture: &Texture, warnings: &mut Vec<String>) -> Option<Timeline> {
+    let anim = texture.animation.as_ref()?;
+    if texture.frames.is_empty() {
+        return None;
+    }
+    anim.timeline(texture.frames.len() as u32, warnings)
+}
+
+/// The strip index `texture` shows at tick 0: its timeline's first frame, else 0 (a static
+/// texture, or an animation Minecraft rejects, shows the top of the strip).
+fn start_index(texture: &Texture) -> u32 {
+    timeline(texture, &mut Vec::new()).map_or(0, |t| t.at(0).current)
 }
 
 /// The most common frame width of the pack's block textures (ties: the smaller one), rounded up
@@ -500,7 +619,7 @@ fn pack_layer(
     spec: &TextureSpec,
     size: u32,
     warnings: &mut Vec<String>,
-) -> Option<Vec<[u8; 4]>> {
+) -> Option<PackLayer> {
     let Some(recipe) = RECIPES.iter().find(|r| r.layer == spec.name) else {
         // Not built in: try the texture named like the layer (`game:copper_ore` ->
         // `minecraft:block/copper_ore`).
@@ -508,12 +627,16 @@ fn pack_layer(
             .name
             .split_once(':')
             .map_or(spec.name.as_str(), |(_, p)| p);
-        let parts = [Part {
+        let parts = vec![Part {
             id: ResourceId::new(ResourceId::DEFAULT_NAMESPACE, format!("block/{path}")),
             tint: Tint::None,
         }];
-        return match compose(pack, &parts, size, false, warnings) {
-            Ok(texels) => Some(texels),
+        return match compose(pack, &parts, size, false, warnings, &tick0) {
+            Ok(texels) => Some(PackLayer {
+                parts,
+                quarter: false,
+                texels,
+            }),
             Err(missing) => {
                 warnings.push(format!("{}: no texture {missing}; procedural", spec.name));
                 None
@@ -521,8 +644,14 @@ fn pack_layer(
         };
     };
     if let Some(parts) = model_parts(pack, recipe, &recipe_values(registry, recipe)) {
-        match compose(pack, &parts, size, recipe.quarter, warnings) {
-            Ok(texels) => return Some(texels),
+        match compose(pack, &parts, size, recipe.quarter, warnings, &tick0) {
+            Ok(texels) => {
+                return Some(PackLayer {
+                    parts,
+                    quarter: recipe.quarter,
+                    texels,
+                });
+            }
             Err(missing) => warnings.push(format!(
                 "{}: model of {} names missing texture {missing}; trying default names",
                 spec.name, recipe.block
@@ -537,8 +666,12 @@ fn pack_layer(
             tint,
         })
         .collect();
-    match compose(pack, &parts, size, recipe.quarter, warnings) {
-        Ok(texels) => Some(texels),
+    match compose(pack, &parts, size, recipe.quarter, warnings, &tick0) {
+        Ok(texels) => Some(PackLayer {
+            parts,
+            quarter: recipe.quarter,
+            texels,
+        }),
         Err(missing) => {
             warnings.push(format!("{}: no texture {missing}; procedural", spec.name));
             None
@@ -630,19 +763,25 @@ fn model_parts(
     (!parts.is_empty()).then_some(parts)
 }
 
-/// Composites `parts` bottom to top at `size`^2 (first frame, nearest scaling, tint baked in,
-/// "over" blending in sRGB like Minecraft's overlay quads). The first part is required (`Err`
-/// names it when missing); a missing later part is a warning. `quarter`: a frame of twice
-/// `size` gives its top-left quarter ([`Recipe::quarter`]).
+/// The strip frame of each part at tick 0 ([`compose`]'s `pick`).
+fn tick0(_: usize, texture: &Texture) -> u32 {
+    start_index(texture)
+}
+
+/// Composites `parts` bottom to top at `size`^2 (part `i` shows strip frame `pick(i, texture)`,
+/// nearest scaling, tint baked in, "over" blending in sRGB like Minecraft's overlay quads). The
+/// first part is required (`Err` names it when missing); a missing later part is a warning.
+/// `quarter`: a frame of twice `size` gives its top-left quarter ([`Recipe::quarter`]).
 fn compose(
     pack: &ResourcePack,
     parts: &[Part],
     size: u32,
     quarter: bool,
     warnings: &mut Vec<String>,
+    pick: &dyn Fn(usize, &Texture) -> u32,
 ) -> Result<Vec<[u8; 4]>, String> {
     let mut out: Option<Vec<[u8; 4]>> = None;
-    for part in parts {
+    for (i, part) in parts.iter().enumerate() {
         let Some(texture) = pack.texture(&part.id) else {
             if out.is_none() {
                 return Err(part.id.to_string());
@@ -650,7 +789,7 @@ fn compose(
             warnings.push(format!("overlay {} missing; drawn without it", part.id));
             continue;
         };
-        let (mut width, mut height, mut frame) = first_frame(texture);
+        let (mut width, mut height, mut frame) = frame_texels(texture, pick(i, texture));
         if quarter && width == 2 * size && height == 2 * size {
             frame = (0..size * size)
                 .map(|i| frame[((i / size) * width + i % size) as usize])
@@ -694,29 +833,24 @@ fn over(top: [u8; 4], base: [u8; 4]) -> [u8; 4] {
     out
 }
 
-/// Frame edge of a texture: the animation's frame size, else a square of its width when it is a
-/// vertical strip, else its size.
+/// Frame edge of a texture: the animation's frame size (Minecraft's rule), else a square of its
+/// width when it is a vertical strip, else its size.
 fn frame_size(texture: &Texture) -> (u32, u32) {
     match &texture.animation {
-        Some(anim) => (
-            anim.width.unwrap_or(texture.width),
-            anim.height.unwrap_or(texture.width),
-        ),
+        Some(anim) => anim.frame_size(texture.width, texture.height),
         None if texture.height > texture.width => (texture.width, texture.width),
         None => (texture.width, texture.height),
     }
 }
 
-/// First displayed frame of a texture (RGBA texels). Animation is a follow-up: animated
-/// textures (water, lava, sea lantern) show this frame only.
-fn first_frame(texture: &Texture) -> (u32, u32, Vec<[u8; 4]>) {
+/// Strip frame `index` of a texture (RGBA texels; the first frame when the strip was not split).
+fn frame_texels(texture: &Texture, index: u32) -> (u32, u32, Vec<[u8; 4]>) {
     let (width, height) = frame_size(texture);
-    let index = texture
-        .animation
-        .as_ref()
-        .and_then(|anim| anim.frames.first())
-        .map_or(0, |frame| frame.index as usize);
-    let bytes = match texture.frames.get(index).or_else(|| texture.frames.first()) {
+    let bytes = match texture
+        .frames
+        .get(index as usize)
+        .or_else(|| texture.frames.first())
+    {
         Some(frame) => frame.as_slice(),
         // No split frames: the top `width` x `height` of the image (the strip's first frame).
         None => {
@@ -947,6 +1081,121 @@ pub(crate) mod tests {
             "{:?}",
             report.warnings
         );
+    }
+
+    /// ADR 0028: animated pack textures keep the finished layer of each frame they show (tint,
+    /// flow quarter and alpha baked in, every mip), picked by Minecraft's rules.
+    #[test]
+    fn animated_textures_keep_every_frame_they_show() {
+        let pack = TempPack::new("animated");
+        let mcmeta = |name: &str, json: &str| {
+            pack.file(&format!("textures/block/{name}.png.mcmeta"), json);
+        };
+        // water: 4 gray frames (0, 60, 120, 180), 2 ticks each, interpolated
+        pack.png("water_still", 16, 64, |_, y| {
+            let v = (y / 16) as u8 * 60;
+            [v, v, v, 200]
+        });
+        mcmeta(
+            "water_still",
+            r#"{"animation":{"frametime":2,"interpolate":true}}"#,
+        );
+        // lava: an explicit list over a 3-frame strip, red channel = frame index * 100
+        pack.png("lava_still", 16, 48, |_, y| {
+            [(y / 16) as u8 * 100, 0, 0, 255]
+        });
+        mcmeta(
+            "lava_still",
+            r#"{"animation":{"frametime":3,"frames":[2,{"index":0,"time":1},2]}}"#,
+        );
+        // water flow: two 32x32 frames, a face shows their top-left quarter
+        pack.png("water_flow", 32, 64, |x, y| {
+            let v = if x < 16 && y % 32 < 16 { 255 } else { 0 };
+            [v, (y / 32) as u8 * 255, 0, 255]
+        });
+        mcmeta("water_flow", r#"{"animation":{}}"#);
+        // sea lantern: every listed frame is invalid, so it stays still on strip frame 0
+        pack.png("sea_lantern", 16, 32, |_, y| {
+            [0, 0, if y < 16 { 50 } else { 250 }, 255]
+        });
+        mcmeta("sea_lantern", r#"{"animation":{"frames":[5,9]}}"#);
+
+        let registry = BlockRegistry::default_blocks();
+        let (data, report) =
+            load_block_textures(&registry, &TextureSource::Pack(pack.0.clone())).expect("pack");
+        assert_eq!(report.animated, 3, "{:?}", data.animations);
+        // the water flow moves by its frames and does not scroll; the pack has no lava flow
+        assert_eq!(data.animated_flow, [true, false]);
+        assert_eq!(report.animation_bytes, (4 + 2 + 2) * data.layer_bytes());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("boxel:lamp_blue") && w.contains("index 5")),
+            "{:?}",
+            report.warnings
+        );
+        let animation = |name: &str| {
+            let layer = layer_of(&registry, name) as u32;
+            data.animations
+                .iter()
+                .find(|a| a.layer == layer)
+                .unwrap_or_else(|| panic!("{name} is not animated"))
+        };
+        let level0 = |bytes: &[u8], x: u32, y: u32| -> [u8; 4] {
+            let i = ((y * data.size + x) * 4) as usize;
+            bytes[i..i + 4].try_into().expect("texel")
+        };
+        let tinted = |v: u8| WATER_TINT.map(|t| ((u32::from(v) * u32::from(t) + 127) / 255) as u8);
+
+        // water: frame k is gray k * 60 tinted; tick 3 blends frame 1 halfway into frame 2
+        let water = animation("boxel:water");
+        assert_eq!(water.timeline().period(), 8);
+        let mut scratch = Vec::new();
+        for (tick, frame) in [(0, 0u8), (2, 1), (4, 2), (6, 3), (8, 0)] {
+            let key = water.key(tick);
+            assert!(!key.blends(), "tick {tick}");
+            let [r, g, b] = tinted(frame * 60);
+            assert_eq!(
+                level0(water.pixels(key, &mut scratch), 5, 5),
+                [r, g, b, 200]
+            );
+        }
+        let (one, two) = (tinted(60), tinted(120));
+        let mixed: Vec<u8> = (0..3)
+            .map(|c| boxel_pack::mix_channel(0.5, one[c], two[c]))
+            .collect();
+        let blended = level0(water.pixels(water.key(3), &mut scratch), 9, 2);
+        assert_eq!(blended, [mixed[0], mixed[1], mixed[2], 200]);
+        // the array holds tick 0
+        let layer = layer_of(&registry, "boxel:water");
+        assert_eq!(texel(&data, layer, 0, 0), level0(water.frame(0), 0, 0));
+        // every mip of a frame is the frame's own chain
+        let mut chain = Vec::new();
+        let gray = tinted(120);
+        let frame2 = vec![[gray[0], gray[1], gray[2], 200]; 256];
+        push_layer(&mut chain, &frame2, 16, false);
+        assert_eq!(water.frame(2), chain.as_slice());
+
+        // lava: frames 2 (3 ticks), 0 (1 tick), 2 (3 ticks); not interpolated
+        let lava = animation("boxel:lava");
+        assert_eq!(lava.timeline().period(), 7);
+        let shown: Vec<u32> = (0..8).map(|t| lava.key(t).current).collect();
+        assert_eq!(shown, [2, 2, 2, 0, 2, 2, 2, 2]);
+        assert_eq!(level0(lava.frame(2), 1, 1), [200, 0, 0, 255]);
+        let lava_layer = layer_of(&registry, "boxel:lava");
+        assert_eq!(texel(&data, lava_layer, 1, 1), [200, 0, 0, 255]);
+
+        // flow: each frame gives its own top-left quarter
+        let flow = animation("boxel:water_flow");
+        let [r, g, b] = WATER_TINT;
+        assert_eq!(level0(flow.frame(0), 15, 15), [r, 0, 0, 255]);
+        assert_eq!(level0(flow.frame(1), 15, 15), [r, g, 0, 255]);
+        let _ = b;
+
+        // the still sea lantern shows strip frame 0
+        let lamp = layer_of(&registry, "boxel:lamp_blue");
+        assert_eq!(texel(&data, lamp, 3, 3), [0, 0, 50, 255]);
     }
 
     #[test]

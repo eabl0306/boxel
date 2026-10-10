@@ -1,4 +1,8 @@
+use std::sync::Arc;
+
 use boxel_voxel::{TexturePattern, TextureSpec};
+
+use crate::texture_animation::LayerAnimation;
 
 /// Edge of every procedural block texture layer (texels). A resource pack can give the array
 /// another edge ([`BlockTextureData::size`]).
@@ -22,6 +26,12 @@ pub struct BlockTextureData {
     pub mip_levels: u32,
     /// Texel bytes.
     pub data: Vec<u8>,
+    /// The animated layers (ADR 0028; none for procedural textures). `data` holds the frame
+    /// each one shows at tick 0.
+    pub animations: Arc<[LayerAnimation]>,
+    /// Whether the flow texture of water (`[0]`) and of lava (`[1]`) is one of `animations`: its
+    /// frames show the fluid running, so the shaders do not scroll it (ADR 0025 and 0028).
+    pub animated_flow: [bool; 2],
 }
 
 impl BlockTextureData {
@@ -48,6 +58,8 @@ pub fn generate_block_textures(specs: &[TextureSpec]) -> BlockTextureData {
         layers: specs.len().max(1) as u32,
         mip_levels: mip_levels(size),
         data,
+        animations: Arc::from([]),
+        animated_flow: [false; 2],
     }
 }
 
@@ -277,18 +289,63 @@ fn with_noise(color: [u8; 3], noise: i32) -> [u8; 4] {
 }
 
 /// Appends level 0 (`size`^2 texels) and its mips (box filter in linear space, alpha-weighted
-/// color so transparent texels do not bleed into the average; `binary_alpha` thresholds alpha at
-/// 0.5 in every mip).
+/// color so transparent texels do not bleed into the average). `binary_alpha` keeps alpha 0 or
+/// 255 in every mip without losing coverage ([`binary_mip_alpha`]).
 pub(crate) fn push_layer(out: &mut Vec<u8>, base: &[[u8; 4]], size: u32, binary_alpha: bool) {
     debug_assert_eq!(base.len(), (size * size) as usize);
     out.extend(base.iter().flatten());
     let mut level: Vec<[f32; 4]> = base.iter().map(|t| decode(*t)).collect();
+    let coverage = level.iter().filter(|t| t[3] >= 0.5).count() as f64 / level.len().max(1) as f64;
     let mut size = size as usize;
     while size > 1 {
         level = downsample(&level, size);
         size /= 2;
-        out.extend(level.iter().flat_map(|t| encode(*t, binary_alpha)));
+        if binary_alpha {
+            let opaque = binary_mip_alpha(&level, size, coverage);
+            out.extend(level.iter().zip(opaque).flat_map(|(t, opaque)| {
+                let mut texel = encode(*t, false);
+                texel[3] = if opaque { 255 } else { 0 };
+                texel
+            }));
+        } else {
+            out.extend(level.iter().flat_map(|t| encode(*t, false)));
+        }
     }
+}
+
+/// Which texels of a binary-alpha mip (`size`^2, alpha = the coverage of level 0 under each one)
+/// are opaque. Those with alpha >= 0.5, unless fewer than `coverage` (level 0's opaque fraction)
+/// of the texels pass: then the `coverage` share of the texels with the most alpha, ties in a
+/// Bayer order, and never one with alpha 0. Thin cutout textures (leaves covering under half,
+/// plants) keep their coverage far away instead of fading out with the 0.5 threshold (issue
+/// #45); textures that keep it at 0.5 mip as before.
+fn binary_mip_alpha(level: &[[f32; 4]], size: usize, coverage: f64) -> Vec<bool> {
+    let at_half: Vec<bool> = level.iter().map(|t| t[3] >= 0.5).collect();
+    let want = (coverage * level.len() as f64).round() as usize;
+    if at_half.iter().filter(|&&o| o).count() >= want {
+        return at_half;
+    }
+    let bits = size.trailing_zeros();
+    let mut order: Vec<usize> = (0..level.len()).filter(|&i| level[i][3] > 0.0).collect();
+    order.sort_by(|&a, &b| {
+        level[b][3]
+            .total_cmp(&level[a][3])
+            .then_with(|| bayer(a % size, a / size, bits).cmp(&bayer(b % size, b / size, bits)))
+    });
+    let mut opaque = vec![false; level.len()];
+    for &i in order.iter().take(want) {
+        opaque[i] = true;
+    }
+    opaque
+}
+
+/// Rank of `(x, y)` in the ordered dither matrix of `2^bits` x `2^bits` texels: consecutive
+/// ranks spread evenly over the area.
+fn bayer(x: usize, y: usize, bits: u32) -> usize {
+    (0..bits).fold(0, |v, i| {
+        let (xi, yi) = ((x >> i) & 1, (y >> i) & 1);
+        (v << 2) | ((xi ^ yi) << 1) | yi
+    })
 }
 
 /// 2x2 box filter of a `size`^2 level (linear RGB + coverage in `[0, 1]`). Cascading it keeps
@@ -490,6 +547,131 @@ mod tests {
             }
         }
         assert_eq!(leaves_layers, 1, "default_blocks has one Leaves texture");
+    }
+
+    /// Mip `level` of a single `size`^2 layer pushed with binary alpha.
+    fn binary_mips(base: &[[u8; 4]], size: u32) -> Vec<Vec<[u8; 4]>> {
+        let mut out = Vec::new();
+        push_layer(&mut out, base, size, true);
+        let texels: Vec<[u8; 4]> = out.as_chunks::<4>().0.to_vec();
+        let mut offset = 0;
+        (0..mip_levels(size))
+            .map(|m| {
+                let n = ((size >> m) * (size >> m)) as usize;
+                offset += n;
+                texels[offset - n..offset].to_vec()
+            })
+            .collect()
+    }
+
+    fn opaque_share(level: &[[u8; 4]]) -> f64 {
+        level.iter().filter(|t| t[3] == 255).count() as f64 / level.len() as f64
+    }
+
+    /// Issue #45: a cutout texture covering under half keeps its coverage in every mip instead of
+    /// vanishing at the 0.5 threshold, never turns a fully transparent area opaque, and one that
+    /// keeps its coverage at 0.5 mips as before.
+    #[test]
+    fn binary_mips_keep_the_coverage() {
+        let leaf = [40, 120, 30, 255];
+        // isolated texels, one per 2x2 block: mip 1 is a uniform 0.25 coverage
+        let dots: Vec<[u8; 4]> = (0..256)
+            .map(|i| {
+                if i % 2 == 0 && (i / 16) % 2 == 0 {
+                    leaf
+                } else {
+                    [0; 4]
+                }
+            })
+            .collect();
+        let mips = binary_mips(&dots, 16);
+        for (m, level) in mips.iter().enumerate().take(4) {
+            assert!((opaque_share(level) - 0.25).abs() < 1e-9, "mip {m}");
+            for t in level.iter().filter(|t| t[3] == 255) {
+                assert_eq!(&t[..3], &leaf[..3], "mip {m}: only the leaf's color");
+            }
+        }
+        // the ties of mip 1 spread out: one opaque texel in every 2x2 block of it
+        let mip1 = &mips[1];
+        for by in 0..4 {
+            for bx in 0..4 {
+                let n = (0..4)
+                    .filter(|k| mip1[(2 * by + k / 2) * 8 + 2 * bx + k % 2][3] == 255)
+                    .count();
+                assert_eq!(n, 1, "block {bx},{by}");
+            }
+        }
+        // an irregular sparse leaf on the right half only: the left half stays clear
+        let sparse: Vec<[u8; 4]> = (0..256u32)
+            .map(|i| {
+                let (x, y) = (i % 16, i / 16);
+                if x >= 8 && (x * 7 + y * 13) % 3 == 0 {
+                    leaf
+                } else {
+                    [0; 4]
+                }
+            })
+            .collect();
+        let base = opaque_share(&sparse);
+        for (m, level) in binary_mips(&sparse, 16).iter().enumerate() {
+            let edge = 16 >> m;
+            let want = (base * (edge * edge) as f64).round() / (edge * edge) as f64;
+            assert!(opaque_share(level) >= want, "mip {m}");
+            for (i, t) in level.iter().enumerate() {
+                if i % edge < edge / 2 {
+                    assert_eq!(t[3], 0, "mip {m} texel {i}");
+                }
+            }
+        }
+        // dense leaves (3 of 4 texels): the plain 0.5 threshold, as before
+        let dense: Vec<[u8; 4]> = (0..256)
+            .map(|i| {
+                if (i * 5 + i / 16) % 4 == 0 {
+                    [0; 4]
+                } else {
+                    leaf
+                }
+            })
+            .collect();
+        let mut out = Vec::new();
+        push_layer(&mut out, &dense, 16, true);
+        let mut level: Vec<[f32; 4]> = dense.iter().map(|t| decode(*t)).collect();
+        let mut offset = 256 * 4;
+        let mut size = 16;
+        while size > 1 {
+            level = downsample(&level, size);
+            size /= 2;
+            for t in &level {
+                assert_eq!(out[offset + 3], encode(*t, true)[3]);
+                offset += 4;
+            }
+        }
+        // the procedural leaves and grass keep their coverage at 0.5: their mips do not change
+        // (the poppy and the torch, thinner, gain a texel or two in their small mips)
+        let registry = BlockRegistry::default_blocks();
+        for spec in registry
+            .textures()
+            .iter()
+            .filter(|s| matches!(s.pattern, TexturePattern::Leaves | TexturePattern::Plant))
+        {
+            let base = synthesize(spec);
+            let mut out = Vec::new();
+            push_layer(&mut out, &base, 16, true);
+            let mut level: Vec<[f32; 4]> = base.iter().map(|t| decode(*t)).collect();
+            let (mut offset, mut size) = (256 * 4, 16);
+            while size > 1 {
+                level = downsample(&level, size);
+                size /= 2;
+                for t in &level {
+                    assert_eq!(out[offset + 3], encode(*t, true)[3], "{}", spec.name);
+                    offset += 4;
+                }
+            }
+        }
+        assert_eq!(bayer(0, 0, 1), 0);
+        assert_eq!(bayer(1, 1, 1), 1);
+        assert_eq!(bayer(1, 0, 1), 2);
+        assert_eq!(bayer(0, 1, 1), 3);
     }
 
     #[test]

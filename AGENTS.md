@@ -82,7 +82,7 @@ Detalle en `docs/benchmarks.md`.
 ## Dónde está cada cosa
 
 - `docs/architecture.md`: arquitectura, mapa de crates y roadmap.
-- `docs/adr/`: decisiones 0001 a 0026.
+- `docs/adr/`: decisiones 0001 a 0028.
 - `docs/planes/`: planes completos de cuevas, luz y físicas.
 - `docs/rendimiento/`: mediciones.
 - `docs/benchmarks.md`: cómo medir. `tools/perf/` tiene el harness de las recetas `perf-*`.

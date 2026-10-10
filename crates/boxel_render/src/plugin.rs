@@ -16,7 +16,7 @@ use crate::overlay::{OverlayDraw, OverlayPass, OverlayRect};
 use crate::{
     BlockTextureData, DEFAULT_SKY_COLOR, FLUID_TIME_PERIOD, RendererConfig, RendererSmokeTest,
     SceneLight, TextureReport, TextureSource, TranslucentSort, ViewParams, VoxelRenderer,
-    generate_block_textures, light_curve, load_block_textures,
+    generate_block_textures, light_curve, load_block_textures, texture_tick,
 };
 use boxel_app::{App, Last, MainScheduleOrder, Plugin, Shutdown, Time};
 use boxel_camera::{Camera, CameraView};
@@ -599,6 +599,8 @@ struct ExtractedFrame {
     light: SceneLight,
     /// Seconds of the fluid animation ([`ViewParams::fluid_time`]).
     fluid_time: f32,
+    /// Game ticks of the texture animations ([`ViewParams::texture_tick`]).
+    texture_tick: u64,
     fog_start_fraction: f32,
     render_when_hidden: bool,
     translucent_sort: TranslucentSort,
@@ -1296,7 +1298,10 @@ fn extract(
         clock.as_ref().map(|(time, curve)| (&**time, &**curve)),
     );
     frame.fog_start_fraction = settings.fog_start_fraction;
-    frame.fluid_time = time.map_or(0.0, |t| (t.elapsed_secs_f64() % FLUID_TIME_PERIOD) as f32);
+    frame.fluid_time = time
+        .as_ref()
+        .map_or(0.0, |t| (t.elapsed_secs_f64() % FLUID_TIME_PERIOD) as f32);
+    frame.texture_tick = time.map_or(0, |t| texture_tick(t.elapsed_secs_f64()));
     frame.render_when_hidden = settings.render_when_hidden;
     frame.translucent_sort = settings.translucent_sort;
     frame
@@ -1510,6 +1515,7 @@ fn prepare(
         ViewParams {
             light: frame.light,
             fluid_time: frame.fluid_time,
+            texture_tick: frame.texture_tick,
             ..ViewParams::from_camera(&view, &camera, frame.sky_color, frame.fog_start_fraction)
         }
     });

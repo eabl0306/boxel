@@ -43,7 +43,9 @@ pub struct ViewUniform {
     pub light_curve: [[f32; 4]; 4],
     /// xy = render target size in pixels (the voxel shaders grow each quad by a fixed fraction
     /// of a pixel to close cracks at T-junctions), z = seconds of the fluid animation (the flow
-    /// textures scroll with it, ADR 0025; wrapped by the caller), w = 0.
+    /// textures scroll with it, ADR 0025; wrapped by the caller), w = the flow textures that do
+    /// not scroll because their resource pack animates them (ADR 0028): bit 0 water, bit 1 lava,
+    /// as a float (0 to 3).
     pub viewport: [f32; 4],
 }
 

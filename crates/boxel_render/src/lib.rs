@@ -40,6 +40,7 @@ mod pack_textures;
 mod plugin;
 mod renderer;
 mod smoke;
+mod texture_animation;
 mod textures;
 
 mod arena;
@@ -53,8 +54,8 @@ pub use light::{LIGHT_LEVELS, SceneLight, light_curve};
 pub use outline::{BlockOutline, Outline, OutlineEdge, block_outline_edges, outline_edges};
 pub use overlay::{OverlayDraw, OverlayRect};
 pub use pack_textures::{
-    FOLIAGE_TINT, GRASS_TINT, MAX_PACK_TEXTURE_SIZE, TextureReport, TextureSource, WATER_TINT,
-    load_block_textures,
+    FOLIAGE_TINT, GRASS_TINT, MAX_ANIMATION_BYTES, MAX_PACK_TEXTURE_SIZE, TextureReport,
+    TextureSource, WATER_TINT, load_block_textures,
 };
 pub use path::{CullCounts, cull_counts};
 #[doc(hidden)]
@@ -64,11 +65,12 @@ pub use plugin::{
     RenderSettings, RenderSystems, RequestScreenshot, ScreenshotSaved, SurfaceInfo,
 };
 pub use renderer::{
-    DEFAULT_SKY_COLOR, FLUID_TIME_PERIOD, RenderStats, RendererConfig, RendererError, ViewParams,
-    VoxelRenderer,
+    DEFAULT_SKY_COLOR, FLUID_TIME_PERIOD, RenderStats, RendererConfig, RendererError,
+    TEXTURE_TICKS_PER_SECOND, ViewParams, VoxelRenderer, texture_tick,
 };
 pub use smoke::RendererSmokeTest;
 pub use sort::TranslucentSort;
+pub use texture_animation::{DEFAULT_TEXTURE_UPLOAD_BUDGET, FrameKey, LayerAnimation};
 pub use textures::{BLOCK_TEXTURE_SIZE, BlockTextureData, generate_block_textures};
 pub use upload::arena_len;
 

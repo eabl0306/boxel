@@ -90,7 +90,7 @@ struct View {
   sky_light: vec4<f32>,            // rgb = sky light color times the daylight intensity (linear), a = ambient floor
   light_params: vec4<f32>,         // x = AO strength (0.55: the darkest corner keeps 45 %), y = block-light gain, zw = 0
   light_curve: array<vec4<f32>, 4>, // brightness of light levels 0..15 (level 4k + j at [k][j]; level 15 = 1)
-  viewport: vec4<f32>,             // xy = render target size in pixels, z = fluid animation time in seconds (wraps), w = 0
+  viewport: vec4<f32>,             // xy = render target size in pixels, z = fluid animation time in seconds (wraps), w = still flow textures (bit 0 water, bit 1 lava; ADR 0028)
   // Model box table (ADR 0020), written once per renderer: box k is boxes[k >> 1].xy (k even) or
   // .zw (k odd), packed as boxel_mesh::pack_model_box. Read only by SHAPE_BOX quads.
   boxes: array<vec4<u32>, 512>,
@@ -278,9 +278,13 @@ fn decode_quad(q: vec2<u32>, light: vec2<u32>, corner_in: u32) -> Decoded {
 
 // How far the flow texture of a fluid quad with these flags has scrolled (0..1 of a texture):
 // the time in View::viewport.z at WATER_FLOW_SPEED, or LAVA_FLOW_SPEED for an emissive fluid.
+// A flow texture its resource pack animates moves by its frames, like Minecraft's, and does not
+// scroll (ADR 0028): bit 0 of View::viewport.w for water, bit 1 for lava.
 fn flow_scroll(flags: u32) -> f32 {
-  let speed = select(WATER_FLOW_SPEED, LAVA_FLOW_SPEED, (flags & FLAG_EMISSIVE) != 0u);
-  return fract(view.viewport.z * speed);
+  let lava = (flags & FLAG_EMISSIVE) != 0u;
+  let speed = select(WATER_FLOW_SPEED, LAVA_FLOW_SPEED, lava);
+  let still = (u32(view.viewport.w) >> select(0u, 1u, lava)) & 1u;
+  return select(fract(view.viewport.z * speed), 0.0, still != 0u);
 }
 
 // Edge growth: no cracks at T-junctions. Greedy quads meet in T-junctions (a corner of one quad

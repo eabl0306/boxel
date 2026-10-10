@@ -20,18 +20,20 @@ pub fn parse(flag: &str, value: &str) -> Result<TextureSource, String> {
 }
 
 /// One line about the block textures: `procedural 16px` or `BlockPixel 16px, 17/18 layers from
-/// the pack, 3 pack warnings, loaded in 41.2 ms`.
+/// the pack, 4 animated (52 KB), 3 pack warnings, loaded in 41.2 ms`.
 pub fn summary(report: &TextureReport) -> String {
     if report.from_pack == 0 && report.pack_warnings == 0 && report.warnings.is_empty() {
         return format!("{} {}px", report.source, report.size);
     }
     format!(
-        "{} {}px, {}/{} layers from the pack, {} pack warnings, {} mapping warnings, loaded in \
-         {:.1} ms",
+        "{} {}px, {}/{} layers from the pack, {} animated ({} KB), {} pack warnings, {} mapping \
+         warnings, loaded in {:.1} ms",
         report.source,
         report.size,
         report.from_pack,
         report.layers,
+        report.animated,
+        report.animation_bytes.div_ceil(1024),
         report.pack_warnings,
         report.warnings.len(),
         report.load_time.as_secs_f64() * 1000.0

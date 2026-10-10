@@ -36,7 +36,9 @@ mod overlay;
 mod pack;
 mod texture;
 
-pub use animation::{Animation, AnimationFrame, split_frames};
+pub use animation::{
+    Animation, AnimationFrame, FrameAt, TimedFrame, Timeline, mix_channel, mix_pixel, split_frames,
+};
 pub use blockstate::{
     BlockState, Condition, MultipartCase, VariantList, VariantModel, condition_matches,
     parse_variant_key,
