@@ -23,5 +23,13 @@ criterion.workspace = true
 [lib]
 bench = false
 
+[[bench]]
+name = "terrain"
+harness = false
+
+[[bench]]
+name = "caves"
+harness = false
+
 [lints]
 workspace = true

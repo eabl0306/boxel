@@ -208,6 +208,10 @@ un arena de 24 Mi quads y 65 536 slots; `--arena-quads N` y `--chunk-slots N` lo
 resumen anota el mundo y el arena y los slots que el renderer obtuvo de verdad (los límites del
 dispositivo pueden recortarlos), y `tools/bench_report.py` solo compara corridas del mismo mundo.
 
+Los generadores de esos mundos (salvo `flat`) son contenido de ejemplo y viven en `boxel_demo`
+(#48). Sus benches de criterion son `cargo bench -p boxel_demo --bench terrain` y
+`cargo bench -p boxel_demo --bench caves` (`just bench terrain` también sirve).
+
 `--water Y` llena de agua todo el aire a la altura `Y` o más abajo (lagos y mares) y pone un bloque
 de vidrio en la superficie de una de cada 29 columnas de agua: chunks con quads translúcidos para
 medir el pase translúcido y su orden (ADR 0018). El forest tiene la superficie entre 16 y 112, así
