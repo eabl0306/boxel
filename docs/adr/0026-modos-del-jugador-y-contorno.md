@@ -163,7 +163,11 @@ secciones 2 y 3 en todos lados (con criterion, contra cf11b4f: `raycast/sky_1024
 - **Rayo de colisión.** Corre el bucle de siempre mientras su celda y el bloque de abajo están
   en chunks libres. Mira al entrar en otro chunk, en la misma comparación que el límite del
   mundo, así que no cuesta nada por paso. Si el chunk puede tener bloques altos, sigue con el
-  bucle de la sección 3, que tampoco lee abajo en chunks libres.
+  bucle de la sección 3, que tampoco lee abajo en chunks libres. También sigue con ese bucle,
+  desde esa celda y con el choque ya guardado, si choca con una caja después de la salida de la
+  celda. Pasa por redondeo: la caja divide y el paso del rayo multiplica por el inverso, así que
+  una cara sobre el plano de salida puede quedar un ulp más allá. La celda siguiente puede tener
+  un choque más cerca (un bloque lleno o un chunk sin cargar) y ese bucle lo encuentra.
 - El resultado es el mismo bit a bit, con vallas o sin ellas.
 
 ## Consecuencias
@@ -231,8 +235,10 @@ secciones 2 y 3 en todos lados (con criterion, contra cf11b4f: `raycast/sky_1024
   - `boxel_physics/tests/tall_free.rs`: cada barrido, guarda de bordes y rayo se compara bit a
     bit con la versión que lee siempre abajo, en campos al azar con y sin vallas, cruzando bordes
     de chunk y chunks sin cargar, en las cinco bases y en el límite del mundo, con `TestWorld` y
-    con un mundo de verdad que se edita. Sin vallas lee menos; con ellas, lo mismo. En
-    `ray.rs`, los puntos donde el rayo mira otro chunk se comparan con avanzar de a un bloque.
+    con un mundo de verdad que se edita. Sin vallas lee menos; con ellas, lo mismo. También
+    rayos apuntados al borde de una losa sobre el plano de salida de su celda, donde la caja
+    queda un ulp después de la salida. En `ray.rs`, los puntos donde el rayo mira otro chunk se
+    comparan con avanzar de a un bloque.
   - `boxel_voxel/tests/contains.rs`: `may_contain` nunca dice que no de más y su respuesta
     guardada sigue a `set`, `blocks_mut` y `compact`.
   - `block_shapes.rs`: los oráculos de fuerza bruta (barridos por eje y rayos al azar) ahora

@@ -13,7 +13,7 @@ use boxel_physics::{
     ChunkSource, CollisionTable, LocalBox, Probe, RayResult, StepUp, SweepConfig, TestWorld,
     VoxelFilter, VoxelSource, guard_edge, move_box_stepping, raycast_voxels,
 };
-use boxel_voxel::{BlockPos, BlockRegistry, BlockState, ChunkPos, MAX_BLOCK_COORD, WorldPos};
+use boxel_voxel::{BlockPos, BlockRegistry, BlockState, ChunkPos, Face, MAX_BLOCK_COORD, WorldPos};
 use boxel_world::{ChunkMap, WorldSettings};
 use common::{Rng, STONE, WATER, at, bottom_slab, table, top_slab};
 use proptest::prelude::*;
@@ -461,4 +461,149 @@ fn chunk_sources_answer_from_the_world_and_follow_its_edits() {
         }
         assert!(reads.guarded < reads.always, "{reads:?}");
     }
+}
+
+/// A collision ray in `world`, guarded and always-reach: the same result (returned), and the
+/// guarded one never reads more.
+fn same_ray(world: &mut TestWorld, origin: WorldPos, dir: DVec3, max_t: f64) -> RayResult {
+    let t = table();
+    let mut hits = [None, None];
+    let probes = [true, false].map(|guarded| {
+        let mut src = Counting::new(&mut *world, guarded);
+        hits[usize::from(!guarded)] = Some(raycast_voxels(
+            &mut src,
+            &t,
+            origin,
+            dir,
+            max_t,
+            VoxelFilter::Collision,
+        ));
+        src.probes
+    });
+    assert_eq!(hits[0], hits[1], "ray from {origin:?} along {dir:?}");
+    assert!(probes[0] <= probes[1], "{probes:?}");
+    hits[0].unwrap()
+}
+
+#[test]
+fn a_box_hit_an_ulp_past_the_cells_exit_waits_for_the_next_cell() {
+    // Rays through the far top edge of a bottom slab. The box test divides and the cell's exit
+    // multiplies by the reciprocal: the slab's top comes an ulp after the cell's exit, so the
+    // always-reach loop goes on to the next cell, entered at that exit, and returns its stone
+    // (or stops at its unloaded chunk).
+    let rays = [
+        (
+            DVec3::new(0.02834747652200631, 0.7163835339525266, 0.5),
+            DVec3::new(2.523718801367622, -0.5620231304372553, 0.0),
+        ),
+        (
+            DVec3::new(0.10839374102141577, 0.8710357839183325, 0.5),
+            DVec3::new(0.7800280977269783, -0.32460330308808055, 0.0),
+        ),
+    ];
+    for base in bases().into_iter().chain([EDGE]) {
+        for (frac, dir) in rays {
+            // The next cell in the same chunk and in the next one, with stone; then unloaded.
+            for (x, unloaded) in [(-3, false), (-1, false), (-1, true)] {
+                let mut world = TestWorld::new();
+                world.set(at(base, x, 0, 0), bottom_slab());
+                let next = at(base, x + 1, 0, 0);
+                if unloaded {
+                    world.set_unloaded(ChunkPos::containing(next), true);
+                } else {
+                    world.set(next, STONE);
+                }
+                let origin = WorldPos::from_block(at(base, x, 0, 0), frac);
+                let result = same_ray(&mut world, origin, dir, 10.0);
+                if base == EDGE {
+                    // Past the world's last block: positions there are clamped.
+                    continue;
+                }
+                match result {
+                    RayResult::Hit(hit) if !unloaded => {
+                        assert_eq!((hit.block, hit.face), (next, Some(Face::NegX)));
+                    }
+                    RayResult::Unloaded { block, .. } if unloaded => assert_eq!(block, next),
+                    other => panic!("{other:?} from {origin:?}"),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn rays_through_box_edges_on_cell_exits_match_the_always_reach_ones() {
+    // Rays aimed at the edge where a slab's half-height face meets the plane the ray leaves the
+    // slab's cell through: from inside the cell (the box is met at exactly t = 1, the exit can
+    // round below it), from the cell before it and from the one above or below it. After the
+    // slab, stone, air, the other slab or an unloaded chunk. A picking ray never reads under a
+    // cell: where its answer differs from the always-reach collision ray, the box hit came
+    // after the cell's exit.
+    let t = table();
+    let mut rng = Rng(0xED6E);
+    let mut past = 0;
+    for i in 0..6000 {
+        let base = bases()[i % 5];
+        let up = rng.next().is_multiple_of(2);
+        let (slab, other) = if up {
+            (top_slab(), bottom_slab())
+        } else {
+            (bottom_slab(), top_slab())
+        };
+        let sign = if rng.next().is_multiple_of(2) { 1 } else { -1 };
+        // Beside a chunk border on X or not.
+        let border = rng.next().is_multiple_of(2);
+        let sx = match (sign, border) {
+            (1, true) => -1,
+            (1, false) => -3,
+            (_, true) => 0,
+            (_, false) => 2,
+        };
+        // The origin's cell, relative to the slab's.
+        let (ox, oy) = match rng.next() % 3 {
+            0 => (0, 0),
+            1 => (-sign, 0),
+            _ => (0, if up { -1 } else { 1 }),
+        };
+        let mut frac = DVec3::new(rng.unit(), rng.unit(), rng.unit());
+        if oy == 0 {
+            // On the side of the slab's face the ray comes from.
+            frac.y = if up { frac.y * 0.5 } else { 0.5 + frac.y * 0.5 };
+        }
+        if sign < 0 && ox == 0 && frac.x == 0.0 {
+            frac.x = 0.5;
+        }
+        let edge = DVec3::new(
+            if sign > 0 { 1.0 } else { 0.0 },
+            0.5,
+            0.05 + rng.unit() * 0.9,
+        );
+        let dir = DVec3::new(
+            edge.x - ox as f64 - frac.x,
+            edge.y - oy as f64 - frac.y,
+            edge.z - frac.z,
+        );
+        let mut world = TestWorld::new();
+        world.set(at(base, sx, 0, 0), slab);
+        let next = at(base, sx + sign, 0, 0);
+        match rng.next() % 4 {
+            0 => world.set(next, STONE),
+            1 => {}
+            2 => world.set(next, other),
+            _ if border => world.set_unloaded(ChunkPos::containing(next), true),
+            _ => world.set(next, STONE),
+        }
+        let origin = WorldPos::from_block(at(base, sx + ox, oy, 0), frac);
+        let reaching = same_ray(&mut world, origin, dir, 4.0);
+        let picking = raycast_voxels(
+            &mut world,
+            &t,
+            origin,
+            dir,
+            4.0,
+            VoxelFilter::Outline { fluids: false },
+        );
+        past += usize::from(picking != reaching);
+    }
+    assert!(past >= 100, "box hits after the cell's exit: {past}");
 }
