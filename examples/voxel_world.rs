@@ -20,10 +20,12 @@
 //! a thin dark outline (`BlockOutline`, ADR 0026) besides the crosshair. G switches between
 //! flying and walking: walking is a player body with gravity (`boxel::physics`, a 0.6 x 1.8 x
 //! 0.6 box and a `CharacterController`) that WASD moves along the view and Space makes jump,
-//! with the camera at its eye. Walking, Shift sneaks (slower, never off an edge), Ctrl sprints
-//! and Space twice toggles creative flight (Space rises, Shift descends, landing ends it); the
-//! fly camera keeps Shift and Ctrl for going down and boosting. F3 shows the mode (with flying,
-//! sneaking or sprinting) and a physics line (`PhysicsStats`) in both modes. Fences cannot be
+//! with the camera at its eye. Walking, Shift sneaks (slower, crouched with a lower eye, never
+//! off an edge), Ctrl sprints (a wider view; a sprint-jump goes further) and Space twice
+//! toggles creative flight (Space rises, Shift descends, landing ends it); the view bobs while
+//! walking (V turns it off). The fly camera keeps Shift and Ctrl for going down and boosting.
+//! F3 shows the mode (with flying, sneaking, crouching or sprinting) and a physics line
+//! (`PhysicsStats`) in both modes. Fences cannot be
 //! jumped: they collide 1.5 blocks tall.
 //!
 //! Water flows (ADR 0021, `FluidPlugin`): placed water is a source that spreads 7 blocks and
@@ -2576,6 +2578,130 @@ mod tests {
         }
         assert_eq!(feet_y(&app), 4.0);
         assert_eq!(move_line(&app), "Walk (G flies)  on ground  speed 0.00 b/s");
+    }
+
+    /// Where the player's eye is (its interpolated feet plus the standing eye height), with no
+    /// bob, crouch or step lag.
+    fn standing_eye(app: &mut App) -> DVec3 {
+        let mut players = app
+            .world_mut()
+            .query_filtered::<&Transform, With<player::Player>>();
+        let feet = players.single(app.world()).expect("walking").translation;
+        feet + DVec3::new(0.0, player::EYE_HEIGHT, 0.0)
+    }
+
+    fn fov(app: &mut App) -> f32 {
+        let mut cameras = app.world_mut().query_filtered::<&Camera, With<FlyCamera>>();
+        cameras.single(app.world()).expect("camera").fov_y_radians
+    }
+
+    #[test]
+    fn shift_lowers_the_eye_smoothly_and_a_sprint_widens_the_view() {
+        use boxel::physics::Crouch;
+        use player::{CROUCH_EYE_HEIGHT, EYE_HEIGHT, SNEAK_KEY, SPRINT_FOV, SPRINT_KEY};
+        let (mut app, body) = walking_app();
+        app.world_mut().resource_mut::<player::Walking>().view_bob = false;
+        // Shift: the body crouches and the eye eases down to Minecraft's 1.27, not at once.
+        key(&mut app, SNEAK_KEY, true);
+        let mut eyes = Vec::new();
+        for _ in 0..64 {
+            app.update();
+            eyes.push(camera_at(&mut app).y);
+        }
+        assert!(
+            app.world()
+                .get::<Crouch>(body)
+                .expect("body")
+                .is_crouching()
+        );
+        assert!(eyes.windows(2).all(|w| w[1] <= w[0]), "{eyes:?}");
+        assert!(eyes[0] > 4.0 + CROUCH_EYE_HEIGHT + 0.1, "{eyes:?}");
+        assert_eq!(eyes[63], 4.0 + CROUCH_EYE_HEIGHT);
+        assert!(move_line(&app).ends_with("sneaking"));
+        // Let go: up again, back exactly at the standing eye.
+        key(&mut app, SNEAK_KEY, false);
+        for _ in 0..64 {
+            app.update();
+        }
+        assert!(
+            !app.world()
+                .get::<Crouch>(body)
+                .expect("body")
+                .is_crouching()
+        );
+        assert_eq!(camera_at(&mut app).y, 4.0 + EYE_HEIGHT);
+        // W with Ctrl: the view widens by a tenth, smoothly; the sprint goes on without Ctrl
+        // and ends with W, and the view comes back exactly.
+        let base = fov(&mut app);
+        let wide = (f64::from(base) * SPRINT_FOV) as f32;
+        key(&mut app, KeyCode::KeyW, true);
+        key(&mut app, SPRINT_KEY, true);
+        app.update();
+        app.update();
+        let first = fov(&mut app);
+        assert!(first > base && first < wide, "{first}");
+        key(&mut app, SPRINT_KEY, false);
+        for _ in 0..64 {
+            app.update();
+        }
+        assert_eq!(fov(&mut app), wide);
+        assert!(move_line(&app).ends_with("sprinting"));
+        key(&mut app, KeyCode::KeyW, false);
+        for _ in 0..64 {
+            app.update();
+        }
+        assert_eq!(fov(&mut app), base);
+        // Sprinting and then flying the free camera (G): its own field of view comes back.
+        key(&mut app, KeyCode::KeyW, true);
+        key(&mut app, SPRINT_KEY, true);
+        for _ in 0..8 {
+            app.update();
+        }
+        assert!(fov(&mut app) > base);
+        tap(&mut app, player::WALK_KEY);
+        assert_eq!(fov(&mut app), base);
+        key(&mut app, KeyCode::KeyW, false);
+        key(&mut app, SPRINT_KEY, false);
+    }
+
+    #[test]
+    fn walking_bobs_the_view_and_v_turns_it_off() {
+        use player::BOB_KEY;
+        let (mut app, _) = walking_app();
+        let bobbed = |app: &mut App| (camera_at(app) - standing_eye(app)).length();
+        // Walking on the grass: the eye sways, at most Minecraft's tenth of a block.
+        key(&mut app, KeyCode::KeyW, true);
+        let mut most: f64 = 0.0;
+        for _ in 0..96 {
+            app.update();
+            most = most.max(bobbed(&mut app));
+        }
+        assert!(most > 0.05 && most < 0.12, "{most}");
+        // V: no bob, the eye stays on the body while it walks.
+        tap(&mut app, BOB_KEY);
+        for _ in 0..32 {
+            app.update();
+            assert_eq!(bobbed(&mut app), 0.0);
+        }
+        tap(&mut app, BOB_KEY);
+        key(&mut app, KeyCode::KeyW, false);
+        // Flying (Space twice) it does not bob either, once the walk's bob has faded.
+        tap(&mut app, KeyCode::Space);
+        tap(&mut app, KeyCode::Space);
+        key(&mut app, KeyCode::Space, true);
+        for _ in 0..16 {
+            app.update();
+        }
+        key(&mut app, KeyCode::Space, false);
+        key(&mut app, KeyCode::KeyW, true);
+        for _ in 0..64 {
+            app.update();
+        }
+        for _ in 0..32 {
+            app.update();
+            assert_eq!(bobbed(&mut app), 0.0);
+        }
+        key(&mut app, KeyCode::KeyW, false);
     }
 
     #[test]

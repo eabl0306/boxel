@@ -1,6 +1,6 @@
 # ADR 0026: vallas de 1,5 bloques, modos del jugador y contorno del bloque apuntado
 
-- Estado: aceptado (issue #46 y la parte del motor de la issue #37)
+- Estado: aceptado (issue #46 y la issue #37; la sección 8 cierra el jugador)
 - Fecha: 2026-10-09
 - Revisa: ADR 0016 (cajas de colisión que suben a la celda de arriba, modos del controlador) y
   ADR 0020, sección 6 (la valla choca a 1,5 bloques, no a 1)
@@ -79,7 +79,8 @@
 - `MoveIntent` suma tres teclas mantenidas, que no son pestillos: `up`, `sneak` y `sprint`.
 - `CharacterController` suma `sneak_factor` (0,3), `sprint_factor` (1,3), `fly_speed` (10,92
   bloques/s), `fly_vertical_speed` (7,5 bloques/s) y `flying`. Son los valores de Minecraft.
-- **Agacharse.** La velocidad es 0,3 de la de caminar y gana a correr. En el suelo y sin saltar,
+- **Agacharse.** La velocidad es 0,3 de la de caminar y gana a correr. La pose agachada (caja
+  de 1,5 de alto) está en la sección 8. En el suelo y sin saltar,
   el paso pasa antes por `guard_edge`, la guarda de bordes de Minecraft
   (`Player::maybeBackOffFromEdge`), pero exacta:
   - Un soporte es lo que la caja tocaría (más que `eps`) si bajara la caída (`sneak_drop`: el
@@ -93,7 +94,7 @@
   - En un eje cortado la velocidad queda en 0 después del paso.
   - Sin soporte donde está (en el aire, o parado sobre un cuerpo dinámico) no hay guarda. Un
     borde de hasta el escalón de alto (una losa) se baja.
-- **Correr.** 1,3 de la velocidad, también en el aire.
+- **Correr.** 1,3 de la velocidad, también en el aire. Cuándo empieza y termina, en la sección 8.
 - **Volar.** Sin gravedad y sin escalón. De costado `fly_speed` (el doble corriendo) con el
   arrastre del aire; `fly_vertical_speed` hacia arriba con `up` y hacia abajo con `sneak`, con un
   arrastre vertical fuerte (`FLIGHT_VERTICAL_DRAG`, 40/3 por segundo: Minecraft conserva 0,6 de
@@ -170,6 +171,95 @@ secciones 2 y 3 en todos lados (con criterion, contra cf11b4f: `raycast/sky_1024
   un choque más cerca (un bloque lleno o un chunk sin cargar) y ese bucle lo encuentra.
 - El resultado es el mismo bit a bit, con vallas o sin ellas.
 
+### 8. El resto del jugador (issue #37)
+
+**Agacharse con la caja.** Como Minecraft desde la 1.14: agachado, el cuerpo mide 1,5 y el ojo
+baja de 1,62 a 1,27.
+
+- `CharacterController::crouch_height` (1,5) y el componente `Crouch`, que el controlador exige
+  (todo personaje lo tiene). `Crouch` guarda el `Collider` de pie mientras el cuerpo está
+  agachado; `is_crouching()` lo dice.
+- La pose cambia en el paso fijo, antes de mover el cuerpo. Es el orden de Minecraft, que la
+  cambia al final del tick anterior (`updatePlayerPose`). Si el personaje se agacha (Shift y sin
+  volar), su caja pasa a `Collider::crouched`: el mismo piso y la misma huella, con el techo a
+  `crouch_height`. Si deja de agacharse, se para solo donde la caja de pie entra: se barre la
+  caja agachada hacia arriba hasta el techo de pie, contra los bloques y los cuerpos estáticos y
+  cinemáticos, y no tiene que chocar ni empezar dentro de algo. Ese movimiento ya usa la caja
+  nueva, y el `Collider` nuevo se inserta después del paso (antes de los choques entre cuerpos,
+  en el punto de sincronización que ya había).
+- Para reunir obstáculos, un cuerpo agachado usa su caja de pie: el barrido de pararse los
+  necesita. Uno de pie no cambia nada.
+- Donde no hay lugar para pararse sigue agachado, y lento, aunque suelte Shift. Así sale de un
+  túnel de 1,5 sin quedar trabado. La guarda de bordes sigue solo con Shift, como en Minecraft
+  (`isShiftKeyDown`).
+- Un volador no se agacha (Shift lo baja). Una esfera, o un `crouch_height` que no está entre 0
+  y la altura de la caja, no se agacha: Shift solo frena y cuida los bordes.
+- Sueño: un cuerpo dormido no da pasos. Si su `MoveIntent` cambia y la pose tiene que cambiar
+  (Shift parado, o soltarlo agachado), `wake_to_pose` lo despierta en ese paso. Un cuerpo agachado
+  sin Shift (esperando lugar) no se duerme: prueba pararse en cada paso. Así se para apenas
+  rompen el bloque de arriba.
+
+**Correr.** `CharacterController::sprinting` es un estado, como `flying`. Es el sprint de
+Minecraft (`LocalPlayer::aiStep`):
+
+- Empieza con `MoveIntent::sprint` mientras el personaje avanza y no está agachado. Sigue
+  aunque se suelte la tecla, como Minecraft con la tecla de correr en modo mantener.
+- Avanzar se mide contra `MoveIntent::facing`, la dirección a la que mira el personaje: el
+  deseo tiene que ir hacia adelante (`hasForwardImpulse`: W, W con A o con D; no A sola ni S).
+  Con `facing` en cero cuenta la dirección del deseo, así una IA que no mira a ningún lado igual
+  corre.
+- Termina si deja de avanzar (para, retrocede o va de costado), si se agacha o si choca de frente.
+  Chocar de frente es un corte de costado en el barrido que deja el movimiento a más de 8 grados
+  del deseo, o casi quieto (menos de 0,063 bloques por segundo). Es el `horizontalCollision &&
+  !minorHorizontalCollision` de Minecraft, con su ángulo. Rozar una pared en un ángulo chico no
+  lo corta. Se calcula con productos escalares, sin `acos` ni `sqrt`.
+- Subir una losa corriendo no es un choque: el escalón la sube.
+- Volando, correr duplica `fly_speed` como antes, con el mismo estado. Bajar con Shift no lo
+  corta, porque un volador no se agacha.
+
+**Salto corriendo.** Un salto con `sprinting` suma `sprint_jump_boost` hacia `facing` (o hacia
+el deseo si `facing` es cero).
+
+- Minecraft suma 0,2 bloques por tick, pero en un tick de suelo: deja 0,546 de eso, y el tick
+  dura 50 ms. Acá el paso en el suelo dura 15,6 ms, así que 4 bloques por segundo (0,2 por 20)
+  daban de más: 8,48 bloques por segundo saltando contra 5,61 corriendo.
+- Por defecto es 2,1, calibrado para dar las velocidades de Minecraft en terreno plano: 7,12
+  bloques por segundo saltando y corriendo contra 5,61 corriendo (Minecraft: 7,127 y 5,612).
+
+**Agua en bloques con agua (ADR 0025).** `CollisionTable::is_wet` dice si un estado tiene agua:
+un fluido o un bloque con agua (`StateFlags::WATERLOGGED`).
+
+- `SwimPlugin` lo usa para saber si el cuerpo está en el agua. Parado sobre una losa con agua,
+  los pies están en su celda: nada, como en Minecraft (el agua de esa celda llega a 8/9).
+- `Contacts::in_fluid` (el barrido) y el `in_fluid` de los proyectiles también.
+- `is_fluid` sigue siendo solo el bloque fluido: apuntar y poner bloques ven la losa.
+
+**Volar en el agua.** En Minecraft el vuelo creativo no siente los fluidos (`Player` devuelve
+`isAffectedByFluids() = !flying`). `SwimPlugin` ahora trata a un volador como seco: no le cambia
+los ajustes ni toma su salto como brazada, y su vuelo sigue igual que en el aire. Apagar el vuelo
+en el agua le devuelve el agua.
+
+**La cámara** (`examples/shared/player.rs`, solo la vista):
+
+- `PlayerView` en el jugador: la altura del ojo, el campo de visión, la distancia caminada y la
+  fuerza del balanceo.
+- El ojo va hacia 1,62 o 1,27 según `Crouch`, suave: la diferencia se divide por `1 + 20 dt`
+  cada frame (Minecraft la parte a la mitad cada tick, que es la misma tasa) y cae justo en el
+  valor al quedar a menos de 1e-4.
+- Corriendo, el campo de visión va hacia 1,1 veces el de la cámara, con la misma suavidad.
+  Minecraft lo abre 1,15 corriendo y 1,1 volando; acá solo corriendo y 1,1. La cámara recupera el
+  suyo cuando el jugador se va (G).
+- El balanceo es el `bobView` de Minecraft. Minecraft mueve y gira la escena en el espacio de la
+  vista; acá se mueve y gira la cámara, que da lo mismo. Sube hasta `bob` bloques, va
+  `bob / 2` a los lados y gira hasta `3 bob` grados sobre su eje y `5 bob` grados hacia abajo.
+  `bob` sigue a la velocidad de costado en bloques por tick, hasta 0,1, y es 0 en el aire,
+  volando o en el agua. La fase crece 0,6 por bloque caminado.
+- La mira apunta con la cámara balanceada: el bloque apuntado es el que está bajo la mira en
+  pantalla. En Minecraft la mira se corre un poco del bloque que apunta.
+- V apaga y prende el balanceo (`Walking::view_bob`, prendido por defecto). Es la opción de
+  video de Minecraft.
+- F3 dice `crouching` cuando el cuerpo sigue agachado sin Shift.
+
 ## Consecuencias
 
 - Costo, solo en chunks que pueden tener bloques altos (sección 7):
@@ -182,6 +272,10 @@ secciones 2 y 3 en todos lados (con criterion, contra cf11b4f: `raycast/sky_1024
   - La guarda de bordes solo corre para quien se agacha en el suelo.
   - El contorno: un draw y unos 100 vértices por frame, armados en CPU.
   - Las mallas no cambian.
+- Costo de la sección 8: un personaje agachado sin Shift hace un barrido corto más por paso
+  (probar pararse) y no se duerme. Agacharse o pararse inserta un `Collider`, que despierta lo
+  que dormía sobre el lugar. El resto son comparaciones por paso. El juego, en el frame: la vista
+  hace unas cuentas en CPU.
 - Medido con criterion, una corrida por lado (µs). cf11b4f es antes de las vallas, main es
   5e8177a y la rama ya tiene main mezclado:
 
@@ -219,6 +313,10 @@ secciones 2 y 3 en todos lados (con criterion, contra cf11b4f: `raycast/sky_1024
   - `RayResult::Unloaded::t` con bloques altos (sección 3).
   - `BlockOutline`, `Outline`, `VoxelRenderer::set_outline`, `outline_edges`,
     `block_outline_edges` y `ShaderModuleId::Outline`.
+  - Sección 8: `MoveIntent::facing`, `CharacterController::{sprint_jump_boost, crouch_height,
+    sprinting}`, `Crouch`, `Collider::crouched` y `CollisionTable::is_wet`. `MoveIntent::sprint`
+    ahora empieza el sprint y no lo sostiene. `Contacts::in_fluid` y `Swimmer::in_fluid` también
+    cuentan los bloques con agua.
 - Tests:
   - `boxel_voxel`: la valla choca a 24 y se apunta a 16, su techo sostiene una antorcha y ninguna
     cara es firme; el registro acepta 24 y rechaza 25, una caja más ancha que la celda y una que
@@ -254,6 +352,20 @@ secciones 2 y 3 en todos lados (con criterion, contra cf11b4f: `raycast/sky_1024
     borde de un pozo de 3 sin bajar nunca y sin agacharse cae; agachado baja a una losa. Volar:
     prendido parado no aterriza, sube a 7,5, frena y queda quieto exacto, cruza al `fly_speed` (el
     doble corriendo), baja y aterriza, y se apaga. Todo igual bit a bit en cinco bases.
+    Sección 8: agachado (despertando de dormido) mide 1,5 con los pies en su lugar y al soltar
+    vuelve el mismo `Collider`; de pie un techo de losas a 1,5 lo frena y agachado pasa abajo;
+    ahí, sin Shift, sigue agachado, lento y despierto, y se para apenas sacan el techo; afuera se
+    para y camina a toda velocidad; un volador con Shift no se agacha. Correr no empieza de
+    costado ni para atrás, empieza hacia adelante (también en diagonal) y sigue sin la tecla;
+    para atrás, al parar, al agacharse y contra una pared termina. Rozando una pared a 5 grados
+    sigue y a 15 termina. Saltando y corriendo da 7,12 bloques por segundo contra 5,61. El
+    recorrido bit a bit en cinco bases suma correr, saltar contra una pared y quedar agachado
+    bajo un techo.
+  - `boxel_physics/tests/swim.rs`: parado sobre losas con agua nada (y sube y vuelve a la losa),
+    sobre losas secas no; un volador en el agua no se hunde, sube como en el aire, queda quieto
+    exacto con sus ajustes de tierra, y al apagar el vuelo el agua lo toma; igual bit a bit en
+    tres bases. `block_shapes.rs`: el agua y la losa con agua tienen agua, la losa con agua no es
+    fluido y choca como la seca.
   - `boxel_render`: aristas de un cubo, una escalera (una forma) y una valla; los quads son los
     mismos en cualquier lugar del mundo y se cortan en el plano cercano.
     `tests/gpu_outline.rs`: en cada tier, el contorno se ve y solo oscurece (con el color por
@@ -264,13 +376,22 @@ secciones 2 y 3 en todos lados (con criterion, contra cf11b4f: `raycast/sky_1024
   - `voxel_world` (sin ventana): el bloque apuntado se contornea y fuera de alcance no; Ctrl corre
     y Shift se agacha con F3; agachado no cae al pozo y sin agacharse sí; Espacio dos veces vuela,
     Espacio sube, queda quieto, Shift baja y aterrizar camina, y dos toques en el aire lo apagan.
+    Sección 8: con Shift el ojo baja suave hasta 1,27 y vuelve justo a 1,62; con W y Ctrl el
+    campo de visión se abre suave hasta 1,1, sigue sin Ctrl y vuelve justo al soltar W, y con G
+    la cámara recupera el suyo; caminando la vista se balancea (hasta una décima de bloque), con
+    V no, y volando tampoco. En `shared/player.rs`: la suavidad cae justo y no se pasa; el
+    balanceo queda en sus límites y se repite cada 2 de distancia; la vista se agacha, se abre y
+    se balancea, y un salto grande no cuenta como caminar.
 
 ## Fuera de esta parte
 
 - Muros de piedra y puertas de valla (también chocan a 1,5).
-- La cámara en primera persona pulida (balanceo, FOV al correr) y la interacción, de la issue #37.
-- Volar en el agua: `SwimPlugin` sigue tomando el pestillo del salto en un fluido.
-- El impulso del salto corriendo, que correr se corte al chocar y el hambre.
+- De la issue #37 queda la interacción con bloques (abrir puertas y similares, cuando existan) y
+  el hambre (correr no la pide).
+- Nadar como en Minecraft más allá de subir: correr bajo el agua (la pose de nado de 0,6), que
+  Shift baje en el agua, y que correr se corte en la superficie del agua.
+- Correr con dos toques de W, y el modo "alternar" de la tecla de correr.
+- El campo de visión al volar (Minecraft lo abre 1,1) y el giro de la cámara al recibir daño.
 
 ## Alternativas descartadas
 
@@ -285,3 +406,10 @@ secciones 2 y 3 en todos lados (con criterion, contra cf11b4f: `raycast/sky_1024
   adelante no lo teñiría y cuesta un pase más.
 - La guarda de bordes de Minecraft con pasos de 0,05: depende de la velocidad y de la frecuencia
   de pasos. La exacta no.
+- Achicar la caja del agachado solo dentro del paso, sin cambiar el `Collider`: los choques
+  entre cuerpos, el nado y las consultas seguirían viendo 1,8.
+- Un sistema aparte, antes del paso, para la pose: no tiene los obstáculos del paso (se arman
+  después del controlador) y el `Collider` nuevo llegaría un paso tarde.
+- El impulso del salto corriendo de 4 bloques por segundo (0,2 por tick sin más): con pasos de
+  15,6 ms en el suelo pierde menos que en el tick de 50 ms de Minecraft y da 8,5 bloques por
+  segundo en vez de 7,1.

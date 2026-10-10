@@ -64,8 +64,9 @@ usage: physics_sandbox [GPU options] [options]
   --debug-overlay         start with the F3 debug overlay visible (F3 toggles it)
   --help                  this text
 keys: WASD walk, Space jump (twice: creative flight, Space rises), Shift sneak (flying:
-  descend), Ctrl sprint, G free camera/walk, Q drop an item, C drop a crate, F shoot an arrow,
-  B throw a ball, M spawn mobs, T build a stair of slabs, F3 overlay, Escape frees the mouse
+  descend), Ctrl sprint, V view bob on/off, G free camera/walk, Q drop an item, C drop a crate,
+  F shoot an arrow, B throw a ball, M spawn mobs, T build a stair of slabs, F3 overlay, Escape
+  frees the mouse
 exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 drop test failed, 4 timeout";
 
 /// Default `--timeout` for automation runs.
@@ -1371,6 +1372,8 @@ mod tests {
     #[test]
     fn t_builds_a_stair_the_player_walks_up_with_a_smooth_eye() {
         let mut app = standing_app();
+        // Only the step's lag: the view bob would move the eye too.
+        app.world_mut().resource_mut::<player::Walking>().view_bob = false;
         tap(&mut app, STAIRS_KEY);
         for _ in 0..4 {
             app.update();
