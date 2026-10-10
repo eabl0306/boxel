@@ -4,8 +4,9 @@
 use crate::FaceName;
 
 /// How one texture layer of a game (`game:grass_side`) is read from a Minecraft resource pack:
-/// the Minecraft block whose blockstate and model name the texture, the model face that shows
-/// it, the biome tint baked into it, and fallback texture names for packs that ship no model.
+/// the block whose blockstate and model name the texture (Minecraft's, or one in the game's own
+/// pack namespace), the model face that shows it, the biome tint baked into it, and fallback
+/// texture names for packs that ship no model.
 ///
 /// A layer without a recipe reads the texture named like it (`game:copper_ore` reads
 /// `minecraft:block/copper_ore`), untinted.
@@ -13,8 +14,8 @@ use crate::FaceName;
 pub struct LayerRecipe {
     /// The game's texture layer name (`game:grass_side`).
     pub layer: String,
-    /// Minecraft block whose blockstate and model are read (`grass_block`, in the `minecraft`
-    /// namespace).
+    /// Block whose blockstate and model are read: `ns:name`, or a bare name in the `minecraft`
+    /// namespace (`grass_block`).
     pub block: String,
     /// A state of the game whose property values pick the blockstate variant
     /// (`game:log[axis=y]`), or `""`. Its properties are named like Minecraft's.
@@ -26,8 +27,8 @@ pub struct LayerRecipe {
     pub face: FaceName,
     /// Biome tint (sRGB) baked into model faces with a `tintindex`, or `None`.
     pub tint: Option<[u8; 3]>,
-    /// Texture parts (`block/...` in the `minecraft` namespace, bottom first, each with its
-    /// tint) when the pack has no usable model.
+    /// Texture parts (`ns:block/...`, or `block/...` in the `minecraft` namespace; bottom first,
+    /// each with its tint) when the pack has no usable model.
     pub fallback: Vec<(String, Option<[u8; 3]>)>,
     /// A fluid's flow sprite: Minecraft's are twice the block size and a face shows a quarter of
     /// one, so the layer takes the top-left quarter of a frame twice the layer's edge (other

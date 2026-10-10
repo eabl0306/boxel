@@ -3,14 +3,15 @@
 //! path stay the ones of the procedural textures, so every tier samples it the same way.
 //!
 //! The game passes a [`LayerRecipe`] per layer with the pack ([`PackSource::recipes`]): the
-//! Minecraft block whose blockstate and model name the texture (`cube_column` end/side, the grass
-//! overlay...), fallback texture names for packs that ship no model, and the biome tint baked
-//! into the grayscale textures Minecraft tints (grass, foliage, water). The blockstate variant is
-//! picked by the property values of one of the game's states (ADR 0019): `game:log[axis=y]` reads
-//! the pack's `axis=y` variant ([`pack_variant`]). A layer without a recipe reads the texture
-//! named like it (`game:copper_ore` -> `minecraft:block/copper_ore`). Layers the pack cannot fill
-//! keep their procedural pixels and add a warning to the [`TextureReport`], as do recipes the
-//! registry cannot use.
+//! block whose blockstate and model name the texture (`cube_column` end/side, the grass
+//! overlay...; Minecraft's, or `ns:name` in the game's own pack namespace), fallback texture
+//! names for packs that ship no model, and the biome tint baked into the grayscale textures
+//! Minecraft tints (grass, foliage, water). The blockstate variant is picked by the property
+//! values of one of the game's states (ADR 0019): `game:log[axis=y]` reads the pack's `axis=y`
+//! variant ([`pack_variant`]). A layer without a recipe reads the texture named like it
+//! (`game:copper_ore` -> `minecraft:block/copper_ore`). Layers the pack cannot fill keep their
+//! procedural pixels and add a warning to the [`TextureReport`], as do recipes the registry
+//! cannot use.
 //!
 //! A layer whose texture is animated (`.png.mcmeta`, water, lava, the sea lantern...) also keeps
 //! the finished layer of every frame its animation shows ([`LayerAnimation`], ADR 0028); the
@@ -467,7 +468,7 @@ fn pack_layer(
         .fallback
         .iter()
         .map(|(path, tint)| Part {
-            id: ResourceId::new(ResourceId::DEFAULT_NAMESPACE, path.as_str()),
+            id: ResourceId::parse(path),
             tint: *tint,
         })
         .collect();
@@ -546,10 +547,7 @@ fn model_parts(
     recipe: &LayerRecipe,
     values: &BTreeMap<String, String>,
 ) -> Option<Vec<Part>> {
-    let state = pack.blockstate(&ResourceId::new(
-        ResourceId::DEFAULT_NAMESPACE,
-        recipe.block.as_str(),
-    ))?;
+    let state = pack.blockstate(&ResourceId::parse(&recipe.block))?;
     let model = pack_variant(state, values)?.0.first()?.model.clone();
     let model = pack.model(&model)?;
     let parts: Vec<Part> = model
@@ -722,7 +720,12 @@ pub(crate) mod tests {
 
         /// Writes `assets/minecraft/<rel>` (parents created).
         pub(crate) fn file(&self, rel: &str, contents: &str) {
-            let path = self.0.join("assets/minecraft").join(rel);
+            self.file_in(ResourceId::DEFAULT_NAMESPACE, rel, contents);
+        }
+
+        /// Writes `assets/<namespace>/<rel>` (parents created).
+        pub(crate) fn file_in(&self, namespace: &str, rel: &str, contents: &str) {
+            let path = self.0.join("assets").join(namespace).join(rel);
             std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
             std::fs::write(path, contents).expect("write");
         }
@@ -735,9 +738,23 @@ pub(crate) mod tests {
             height: u32,
             pixel: impl Fn(u32, u32) -> [u8; 4],
         ) {
+            self.png_in(ResourceId::DEFAULT_NAMESPACE, name, width, height, pixel);
+        }
+
+        /// [`TempPack::png`] in `assets/<namespace>/`.
+        pub(crate) fn png_in(
+            &self,
+            namespace: &str,
+            name: &str,
+            width: u32,
+            height: u32,
+            pixel: impl Fn(u32, u32) -> [u8; 4],
+        ) {
             let path = self
                 .0
-                .join("assets/minecraft/textures/block")
+                .join("assets")
+                .join(namespace)
+                .join("textures/block")
                 .join(format!("{name}.png"));
             std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
             let data = (0..width * height)
@@ -1117,6 +1134,50 @@ pub(crate) mod tests {
             "{:?}",
             report.warnings
         );
+    }
+
+    /// A recipe reaches a game's own pack namespace: `mygame:ruby` reads
+    /// `assets/mygame/blockstates/ruby.json` and `mygame:block/opal` its texture. Bare names stay
+    /// in `minecraft`.
+    #[test]
+    fn recipes_name_blocks_and_textures_in_any_namespace() {
+        let pack = TempPack::new("namespaces");
+        pack.file_in(
+            "mygame",
+            "blockstates/ruby.json",
+            r#"{"variants":{"":{"model":"mygame:block/ruby"}}}"#,
+        );
+        pack.file_in(
+            "mygame",
+            "models/block/ruby.json",
+            r#"{"parent":"minecraft:block/cube_all","textures":{"all":"mygame:block/ruby"}}"#,
+        );
+        pack.png_in("mygame", "ruby", 16, 16, |_, _| [200, 0, 40, 255]);
+        pack.png_in("mygame", "opal", 16, 16, |_, _| [40, 200, 200, 255]);
+        // A `minecraft` texture of the same name as the game's: bare names read it.
+        pack.png("opal", 16, 16, |_, _| [1, 2, 3, 255]);
+        let registry = boxel_demo::blocks::registry();
+        let recipe = |layer: &str, block: &str, fallback: &str| LayerRecipe {
+            layer: layer.to_string(),
+            block: block.to_string(),
+            state: String::new(),
+            variant: String::new(),
+            face: boxel_pack::FaceName::North,
+            tint: None,
+            fallback: vec![(fallback.to_string(), None)],
+            quarter: false,
+        };
+        let source = TextureSource::Pack(PackSource::new(pack.0.clone()).with_recipes(vec![
+            recipe("boxel:stone", "mygame:ruby", "mygame:block/no_such_texture"),
+            recipe("boxel:dirt", "mygame:no_such_block", "mygame:block/opal"),
+            recipe("boxel:sand", "no_such_block", "block/opal"),
+        ]));
+        let (data, report) = load_block_textures(&registry, &source).expect("pack");
+        let texel_of = |layer: &str| texel(&data, layer_of(&registry, layer), 1, 1);
+        assert_eq!(texel_of("boxel:stone"), [200, 0, 40, 255]);
+        assert_eq!(texel_of("boxel:dirt"), [40, 200, 200, 255]);
+        assert_eq!(texel_of("boxel:sand"), [1, 2, 3, 255]);
+        assert_eq!(report.from_pack, 3, "{:?}", report.warnings);
     }
 
     /// ADR 0028: animated pack textures keep the finished layer of each frame they show (tint,
