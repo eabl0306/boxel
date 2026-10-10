@@ -1,8 +1,8 @@
 //! `--pack DIR` of the examples (`voxel_world`, `snapshot`, `stress`): block textures from a
-//! Minecraft Java resource pack instead of the procedural ones.
+//! Minecraft Java resource pack instead of the procedural ones, read with the demo's recipes.
 #![allow(dead_code, reason = "each example uses its own part")]
 
-use boxel::render::{TextureReport, TextureSource};
+use boxel::render::{PackSource, TextureReport, TextureSource};
 use std::path::PathBuf;
 
 /// Help line of `--pack`.
@@ -10,13 +10,16 @@ pub const USAGE: &str =
     "  --pack DIR           block textures from a Minecraft Java resource pack (the directory
                        with pack.mcmeta; default: procedural textures)";
 
-/// `--pack DIR`: the directory must hold a `pack.mcmeta`.
+/// `--pack DIR`: the directory must hold a `pack.mcmeta`. The demo layers read it through
+/// `boxel_demo::pack::recipes`.
 pub fn parse(flag: &str, value: &str) -> Result<TextureSource, String> {
     let path = PathBuf::from(value);
     if !path.join("pack.mcmeta").is_file() {
         return Err(format!("{flag}: {value:?} has no pack.mcmeta"));
     }
-    Ok(TextureSource::Pack(path))
+    Ok(TextureSource::Pack(
+        PackSource::new(path).with_recipes(boxel_demo::pack::recipes()),
+    ))
 }
 
 /// One line about the block textures: `procedural 16px` or `BlockPixel 16px, 17/18 layers from
@@ -53,7 +56,9 @@ mod tests {
         std::fs::write(dir.join("pack.mcmeta"), "{}").expect("pack.mcmeta");
         assert_eq!(
             parse("--pack", dir.to_str().expect("utf-8")),
-            Ok(TextureSource::Pack(dir.clone()))
+            Ok(TextureSource::Pack(
+                PackSource::new(dir.clone()).with_recipes(boxel_demo::pack::recipes())
+            ))
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

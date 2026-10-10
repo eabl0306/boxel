@@ -8,7 +8,9 @@
 mod golden;
 
 use boxel_gfx::RgbaImage;
-use boxel_render::{BlockTextureData, TextureSource, generate_block_textures, load_block_textures};
+use boxel_render::{
+    BlockTextureData, PackSource, TextureSource, generate_block_textures, load_block_textures,
+};
 use boxel_voxel::BlockRegistry;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -20,7 +22,7 @@ fn registry() -> BlockRegistry {
 
 /// The texture source of the pack at `dir`.
 fn pack_source(dir: &Path) -> TextureSource {
-    TextureSource::Pack(dir.to_path_buf())
+    TextureSource::Pack(PackSource::new(dir).with_recipes(boxel_demo::pack::recipes()))
 }
 
 /// A temporary resource pack of generated files (no third-party content), removed on drop.

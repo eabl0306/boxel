@@ -1539,9 +1539,13 @@ fn pack_textures_render_on_every_tier() {
     }
     let pack = synthetic_pack();
     let registry = boxel_demo::blocks::registry();
-    let (textures, report) =
-        boxel_render::load_block_textures(&registry, &boxel_render::TextureSource::Pack(pack))
-            .expect("synthetic pack");
+    let (textures, report) = boxel_render::load_block_textures(
+        &registry,
+        &boxel_render::TextureSource::Pack(
+            boxel_render::PackSource::new(pack).with_recipes(boxel_demo::pack::recipes()),
+        ),
+    )
+    .expect("synthetic pack");
     assert_eq!((textures.size, report.from_pack), (32, 2), "{report:?}");
     let stone = registry
         .textures()
