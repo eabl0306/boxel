@@ -289,14 +289,14 @@ impl<'a> Reader<'a> {
 // ---- Id map --------------------------------------------------------------------------------
 
 /// Stored ids of the block states of one world (ADR 0024): the world keeps the list of state
-/// names it has ever used (`boxel:log[axis=x]`, ADR 0019) and stores a block as the index of its
+/// names it has ever used (`game:log[axis=x]`, ADR 0019) and stores a block as the index of its
 /// name in that list. The list only grows, so the ids in saved chunks never change meaning. When
 /// the world opens, every name is resolved against the registry of this run:
 ///
 /// - a name the registry knows exactly is that state, and the state's stored id;
 /// - a known block with a property left out, or an unknown property or value, keeps the
 ///   properties it still has and takes the default of the rest
-///   (`boxel:fence[north=true,waterlogged=false]` without `waterlogged` becomes the fence with
+///   (`game:fence[north=true,waterlogged=false]` without `waterlogged` becomes the fence with
 ///   `north=true`). It is listed in [`IdMap::unknown`], and the state it became saves under its
 ///   own exact name, so a later change of a default never changes a saved block;
 /// - an unknown block becomes air.

@@ -453,7 +453,7 @@ impl FaceTextures {
 /// a function adjusts it per state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockDef {
-    /// Namespaced unique name (`"boxel:stone"`), the same for every state of the block.
+    /// Namespaced unique name (`"game:stone"`), the same for every state of the block.
     pub name: String,
     /// Render layer.
     pub shape: RenderShape,
@@ -1060,7 +1060,7 @@ impl BlockRegistry {
     pub fn is_empty(&self) -> bool {
         self.state_block.len() <= 1
     }
-    /// The default state of the block named `name` (`boxel:log` -> `boxel:log[axis=y]`). A
+    /// The default state of the block named `name` (`game:log` -> `game:log[axis=y]`). A
     /// state with properties is [`BlockRegistry::parse_state`].
     pub fn by_name(&self, name: &str) -> Option<BlockState> {
         self.block_by_name(name).map(|b| self.default_state(b))
@@ -1129,7 +1129,7 @@ impl BlockRegistry {
     pub fn values(&self, s: BlockState) -> StateValues<'_> {
         self.info(s).map_or(StateValues::EMPTY, |b| b.values(s))
     }
-    /// The value of property `property` of `s` (`boxel:log[axis=x]`, `axis` -> `x`); `None` if
+    /// The value of property `property` of `s` (`game:log[axis=x]`, `axis` -> `x`); `None` if
     /// the block has no such property.
     pub fn property(&self, s: BlockState, property: &str) -> Option<&str> {
         self.values(s).get(property)
@@ -1143,7 +1143,7 @@ impl BlockRegistry {
         let old = b.values(s).index(property)? as u16;
         Some(BlockState(s.0 - old * b.strides[i] + new * b.strides[i]))
     }
-    /// `s` written as `name[property=value,...]` (`boxel:stone_slab[type=top]`; just the name for
+    /// `s` written as `name[property=value,...]` (`game:stone_slab[type=top]`; just the name for
     /// a block without properties): its `Display` is the inverse of
     /// [`BlockRegistry::parse_state`].
     pub fn state_name(&self, s: BlockState) -> StateName<'_> {
@@ -1153,7 +1153,7 @@ impl BlockRegistry {
         }
     }
     /// The state written as `name` (the default state) or `name[property=value,...]`
-    /// (`boxel:stone_slab[type=top]`): properties left out take their default value; an unknown
+    /// (`game:stone_slab[type=top]`): properties left out take their default value; an unknown
     /// block, property or value is an error.
     pub fn parse_state(&self, text: &str) -> Result<BlockState, StateParseError> {
         let (name, pairs) = split_state(text)?;

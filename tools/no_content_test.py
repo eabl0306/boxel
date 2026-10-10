@@ -7,7 +7,6 @@ Rust construct it does not know fails here before it fails CI."""
 import contextlib
 import io
 import os
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -38,22 +37,10 @@ class Tree:
         with open(full, 'w', encoding='utf-8') as f:
             f.write(text)
 
-    def run(self, metadata=None, base=None):
+    def run(self, metadata=None):
         out = io.StringIO()
-        code = nc.run(self.root, metadata, base=base, out=out)
+        code = nc.run(self.root, metadata, out=out)
         return code, out.getvalue()
-
-    def git(self, *args):
-        env = {k: v for k, v in os.environ.items() if k not in nc.GIT_REPO_VARS}
-        subprocess.run(['git', '-c', 'user.name=t', '-c', 'user.email=t@t', '-c',
-                        'commit.gpgsign=false', '-c', 'init.defaultBranch=main', *args],
-                       cwd=self.root, env=env, check=True, capture_output=True)
-
-    def commit(self):
-        if not os.path.isdir(os.path.join(self.root, '.git')):
-            self.git('init', '-q')
-        self.git('add', '-A')
-        self.git('commit', '-q', '--allow-empty', '-m', 'c')
 
     def close(self):
         self.dir.cleanup()
@@ -240,120 +227,15 @@ class Tree_(unittest.TestCase):
             'crates/boxel_voxel/src/lib.rs:1: string: boxel:stone',
         ])
 
-    def test_the_allowlist_ratchet(self):
+    def test_there_is_no_allowlist(self):
+        # A leftover list of the #48 migration excuses nothing, and no flag reads or rewrites one.
         self.tree.write('tools/no_content_allow/boxel.txt', 'src/lib.rs\tTerrainGenerator\n')
-        self.tree.write('tools/no_content_allow/boxel_voxel.txt',
-                        '# phase 1 deletes these\n'
-                        'crates/boxel_voxel/src/lib.rs\tboxel:stone\n')
-        code, out = self.tree.run()
-        self.assertEqual((code, out.strip()), (
-            0, 'no content in engine crates outside the allowlist (2 uses left in '
-               'tools/no_content_allow/)'))
-        # Unlisted: a new offense fails even in a listed file.
-        self.tree.write('crates/boxel_voxel/src/lib.rs',
-                        'pub const A: &str = "boxel:stone";\npub fn f(_: FluidKind) {}\n')
         code, out = self.tree.run()
         self.assertEqual(code, 1)
-        self.assertIn('crates/boxel_voxel/src/lib.rs:2: ident: FluidKind', out)
-        # Stale: a listed offense that is gone fails until its line is deleted.
-        self.tree.write('crates/boxel_voxel/src/lib.rs', 'pub const A: u8 = 1;\n')
-        code, out = self.tree.run()
-        self.assertEqual(code, 1)
-        self.assertIn('crates/boxel_voxel/src/lib.rs: stale: boxel:stone (listed in '
-                      'tools/no_content_allow/boxel_voxel.txt; delete the line)', out)
-        self.tree.write('tools/no_content_allow/boxel_voxel.txt', '')
-        self.assertEqual(self.tree.run()[0], 0)
-
-    def test_bad_allowlist_lines_fail(self):
-        self.tree.write('tools/no_content_allow/boxel.txt',
-                        'src/lib.rs TerrainGenerator\n'
-                        'crates/boxel_voxel/src/lib.rs\tboxel:stone\n')
-        code, out = self.tree.run()
-        self.assertEqual(code, 1)
-        self.assertIn("tools/no_content_allow/boxel.txt:1: not path<TAB>token", out)
-        self.assertIn('tools/no_content_allow/boxel.txt:2: crates/boxel_voxel/src/lib.rs is not '
-                      'in crate boxel', out)
-
-    def test_a_listed_token_cannot_gain_uses(self):
-        # One line per use: a second use of a listed token in a listed file needs a second line.
-        allow = 'tools/no_content_allow/boxel_voxel.txt'
-        line = 'crates/boxel_voxel/src/lib.rs\tboxel:stone\n'
-        self.tree.write('tools/no_content_allow/boxel.txt', 'src/lib.rs\tTerrainGenerator\n')
-        self.tree.write(allow, line)
-        self.tree.write('crates/boxel_voxel/src/lib.rs',
-                        'pub const A: &str = "boxel:stone";\n'
-                        'pub fn extra() -> &str { "boxel:stone" }\n')
-        code, out = self.tree.run()
-        self.assertEqual(code, 1)
-        self.assertIn('crates/boxel_voxel/src/lib.rs: boxel:stone: 2 uses, 1 listed in '
-                      'tools/no_content_allow/boxel_voxel.txt (lines 1, 2)', out)
-        self.tree.write(allow, line * 2)
-        code, out = self.tree.run()
-        self.assertEqual(code, 0, out)
-        self.assertIn('(3 uses left in tools/no_content_allow/)', out)
-        # A use that goes away leaves a stale line to delete.
-        self.tree.write('crates/boxel_voxel/src/lib.rs', 'pub const A: &str = "boxel:stone";\n')
-        code, out = self.tree.run()
-        self.assertEqual(code, 1)
-        self.assertIn('crates/boxel_voxel/src/lib.rs: stale: boxel:stone (listed 2 times in '
-                      'tools/no_content_allow/boxel_voxel.txt but used 1; delete 1 of those '
-                      'lines)', out)
-        self.tree.write(allow, line)
-        self.assertEqual(self.tree.run()[0], 0)
-
-    def test_the_lists_only_lose_lines_against_the_base(self):
-        allow = 'tools/no_content_allow/boxel_voxel.txt'
-        lib = 'crates/boxel_voxel/src/lib.rs'
-        self.tree.write('tools/no_content.py', '')
-        self.tree.write('tools/no_content_allow/boxel.txt', 'src/lib.rs\tTerrainGenerator\n')
-        self.tree.write(allow, f'{lib}\tboxel:stone\n')
-        self.tree.commit()
-        self.assertEqual(self.tree.run(base='HEAD')[0], 0)
-        # New uses listed by hand agree with the tree, but the base never listed them.
-        self.tree.write(lib, 'pub const A: &str = "boxel:stone";\npub fn f(_: FluidKind) {}\n'
-                             'pub const B: &str = "boxel:stone";\n')
-        self.tree.write(allow, f'{lib}\tFluidKind\n' + f'{lib}\tboxel:stone\n' * 2)
-        self.tree.write('tools/no_content_allow/boxel_mesh.txt', '')
-        self.assertEqual(self.tree.run()[0], 0)
-        code, out = self.tree.run(base='HEAD')
-        self.assertEqual(code, 1)
-        self.assertIn(f'{allow}: {lib}: FluidKind: 1 lines, 0 at the base ', out)
-        self.assertIn(f'{allow}: {lib}: boxel:stone: 2 lines, 1 at the base ', out)
-        self.assertIn('(the lists only lose lines)', out)
-        # Deleting lines passes, measured from where the branch left the base: main may have
-        # deleted lines of another crate meanwhile.
-        self.tree.git('checkout', '-q', '-b', 'lane')
-        self.tree.write(lib, 'pub const A: u8 = 1;\n')
-        self.tree.write(allow, '')
-        self.tree.commit()
-        self.tree.git('checkout', '-q', 'main')
-        self.tree.write('src/lib.rs', '\n')
-        self.tree.write('tools/no_content_allow/boxel.txt', '')
-        self.tree.commit()
-        self.tree.git('checkout', '-q', 'lane')
-        code, out = self.tree.run(base='main')
-        self.assertEqual(code, 0, out)
-
-    def test_a_base_without_the_check_has_nothing_to_compare(self):
-        self.tree.commit()
-        self.tree.write('tools/no_content_allow/boxel.txt', 'src/lib.rs\tTerrainGenerator\n')
-        self.tree.write('tools/no_content_allow/boxel_voxel.txt',
-                        'crates/boxel_voxel/src/lib.rs\tboxel:stone\n')
-        code, out = self.tree.run(base='HEAD')
-        self.assertEqual(code, 0, out)
-        self.assertIn('has no tools/no_content.py', out)
-
-    def test_a_base_that_does_not_resolve_fails(self):
-        self.tree.commit()
-        with self.assertRaises(nc.GitError):
-            self.tree.run(base='no-such-ref')
-        with contextlib.redirect_stderr(io.StringIO()):
-            code = nc.main(['--root', self.tree.root, '--no-structure', '--base', 'nope'])
-        self.assertEqual(code, 2)
-
-    def test_there_is_no_flag_that_rewrites_the_lists(self):
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            nc.main(['--root', self.tree.root, '--no-structure', '--write-allowlist'])
+        self.assertIn('src/lib.rs:1: ident: TerrainGenerator', out)
+        for flag in ('--base=main', '--write-allowlist'):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                nc.main(['--root', self.tree.root, '--no-structure', flag])
 
     def test_a_clean_tree_passes(self):
         self.tree.write('src/lib.rs', '//! An engine: `game:stone` blocks.\n')

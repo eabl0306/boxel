@@ -1,7 +1,0 @@
-crates/boxel_voxel/src/registry.rs	boxel:log
-crates/boxel_voxel/src/registry.rs	boxel:log
-crates/boxel_voxel/src/registry.rs	boxel:log
-crates/boxel_voxel/src/registry.rs	boxel:stone
-crates/boxel_voxel/src/registry.rs	boxel:stone_slab
-crates/boxel_voxel/src/registry.rs	boxel:stone_slab
-crates/boxel_voxel/src/state.rs	boxel:stone_slab

@@ -363,7 +363,7 @@ pub enum WorldSystems {
 }
 
 /// Adds the world: resources (`ChunkMap`, `SkyMap`, `WorldSettings`, `WorldContent`,
-/// `EditQueue`, [`NeighborRules`] and [`BlockUses`] (the built-in ones of the registry),
+/// `EditQueue`, [`NeighborRules`] and [`BlockUses`] (the ones the registry holds),
 /// `WorldStats`, internal
 /// job state), the messages `ChunkMeshEvent`, [`ChunkMeshResync`],
 /// [`BlockChanged`] and [`ChunkDataEvent`] and the chained systems in

@@ -156,7 +156,7 @@ impl fmt::Display for StateValues<'_> {
     }
 }
 
-/// Why a block state string (`boxel:stone_slab[type=top]`) did not parse.
+/// Why a block state string (`game:stone_slab[type=top]`) did not parse.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum StateParseError {
     /// Not `name` or `name[property=value,...]`.

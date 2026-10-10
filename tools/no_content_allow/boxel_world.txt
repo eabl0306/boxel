@@ -1,2 +1,0 @@
-crates/boxel_world/src/persist/format.rs	boxel:fence
-crates/boxel_world/src/persist/format.rs	boxel:log

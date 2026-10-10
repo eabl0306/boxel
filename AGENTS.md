@@ -3,7 +3,8 @@
 boxel es un motor vóxel en Rust, estilo Bevy: chunks de 32³ infinitos en todas las direcciones,
 coordenadas `i64`, luz de color tipo Minecraft, físicas propias y render con wgpu en tres tiers
 (High, Mid y Low). Este repositorio es **solo el motor**. El juego que lo usa (un clon de Minecraft)
-va en `game/`, que git ignora.
+va en `game/`, que git ignora. El contenido de los ejemplos (bloques, texturas, fluidos, recetas de
+packs y generadores) vive en `crates/boxel_demo` (ADR 0029).
 
 Antes de empezar, lee la issue #1 del repo ("Contexto para retomar") y la issue que te toque en el
 GitHub Project. Allí están el estado, las decisiones tomadas y los números medidos.
@@ -24,6 +25,10 @@ GitHub Project. Allí están el estado, las decisiones tomadas y los números me
   determinista: no se usan `mul_add` ni funciones de libm.
 - **No edites `vendor/`.** Es un fork del ECS de Bevy con cero cambios de librería (ADR 0003); se
   regenera con `tools/refork/refork.sh`.
+- **El motor no nombra contenido.** Bloques, texturas, formas, reglas, fluidos y generadores
+  concretos van en `crates/boxel_demo`. Los crates del motor usan nombres `game:` en la
+  documentación y `test:` en los tests (`boxel_voxel::testing`). `tools/no_content.py` lo revisa
+  y no tiene lista de excepciones.
 - **No agregues dependencias `bevy_*`.** Para cualquier dependencia nueva, pasa `cargo deny check`.
 - **Nunca subas `assets/`** (texture packs de la comunidad con copyright) ni `game/`.
 - **No corras benchmarks ni `examples/stress`** mientras algo compila, porque los números salen mal.
@@ -40,17 +45,16 @@ tools/quiet.sh cargo test --workspace --locked
 RUSTDOCFLAGS="-D warnings" tools/quiet.sh cargo doc --workspace --no-deps --locked
 typos
 python3 tools/no_bevy.py
-python3 tools/no_content.py --base main
+python3 tools/no_content.py
 ```
 
 `cargo fmt --check` va siempre sin `--all`, porque `--all` reformatearía `vendor/`. Si tocaste algo
 de GPU, corre también los tests de GPU:
 `BOXEL_REQUIRE_GPU=1 tools/quiet.sh cargo test --workspace --locked --test '*gpu*' -- --test-threads=1`.
 
-`tools/no_content.py` falla si un crate del motor nombra contenido concreto (bloques, texturas,
-reglas o generadores del juego de ejemplo, que viven en `crates/boxel_demo`; issue #48). Lo que
-aún queda está en `tools/no_content_allow/`, con una línea por uso. Esas listas solo pierden
-líneas: nunca agregues una. `--base main` falla si alguna ganó líneas.
+`tools/no_content.py` falla si un crate del motor nombra contenido concreto (un nombre `boxel:`
+que no está reservado, o un identificador del juego de ejemplo) o depende de `boxel_demo` fuera de
+los tests.
 
 ## Cómo medir
 
@@ -88,10 +92,12 @@ Detalle en `docs/benchmarks.md`.
 ## Dónde está cada cosa
 
 - `docs/architecture.md`: arquitectura, mapa de crates y roadmap.
-- `docs/adr/`: decisiones 0001 a 0028.
+- `docs/adr/`: decisiones 0001 a 0029.
 - `docs/planes/`: planes completos de cuevas, luz y físicas.
 - `docs/rendimiento/`: mediciones.
 - `docs/benchmarks.md`: cómo medir. `tools/perf/` tiene el harness de las recetas `perf-*`.
+- `crates/boxel_demo`: el contenido de los ejemplos (bloques, texturas, formas, reglas, agua y
+  lava, recetas de packs y generadores). No es parte del motor.
 - `examples/`:
   - `voxel_world`: el mundo jugable. G camina, los clics rompen y ponen bloques, F3 muestra el
     overlay.

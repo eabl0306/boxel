@@ -1,6 +1,6 @@
 //! Block textures from a Minecraft Java resource pack (`boxel_pack`). The pack only replaces the
 //! pixels of the registry's texture layers: layer ids, their order, the mip chain and the upload
-//! path stay the ones of the procedural textures, so every tier samples it the same way.
+//! path stay the ones of the registry's images, so every tier samples it the same way.
 //!
 //! The game passes a [`LayerRecipe`] per layer with the pack ([`PackSource::recipes`]): the
 //! block whose blockstate and model name the texture (`cube_column` end/side, the grass
@@ -9,9 +9,9 @@
 //! Minecraft tints (grass, foliage, water). The blockstate variant is picked by the property
 //! values of one of the game's states (ADR 0019): `game:log[axis=y]` reads the pack's `axis=y`
 //! variant ([`pack_variant`]). A layer without a recipe reads the texture named like it
-//! (`game:copper_ore` -> `minecraft:block/copper_ore`). Layers the pack cannot fill keep their
-//! procedural pixels and add a warning to the [`TextureReport`], as do recipes the registry
-//! cannot use.
+//! (`game:copper_ore` -> `minecraft:block/copper_ore`). Layers the pack cannot fill keep the
+//! registry's image, scaled to the pack's edge, and add a warning to the [`TextureReport`], as do
+//! recipes the registry cannot use.
 //!
 //! A layer whose texture is animated (`.png.mcmeta`, water, lava, the sea lantern...) also keeps
 //! the finished layer of every frame its animation shows ([`LayerAnimation`], ADR 0028); the
@@ -47,7 +47,7 @@ pub const MAX_ANIMATION_BYTES: usize = 64 << 20;
 /// Where the pixels of the block texture layers come from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum TextureSource {
-    /// Synthesized from each [`TextureSpec`] (no files; the default).
+    /// The image of each [`TextureSpec`] (no files; the default).
     #[default]
     Procedural,
     /// A Minecraft Java resource pack, read at startup.
