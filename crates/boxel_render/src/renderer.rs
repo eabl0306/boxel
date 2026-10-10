@@ -794,12 +794,11 @@ impl VoxelRenderer {
 
     /// Encodes the tier's passes into the main color/depth targets: the animated texture layers
     /// whose frame changed at [`ViewParams::texture_tick`] (written with the queue, within the
-    /// upload budget), the chunk changes since the
-    /// last call and the translucent buckets re-sorted for this camera (uploads), clear, (High)
-    /// cull, opaque buckets with the opaque pipeline, then the cutout bucket with the cutout
-    /// pipeline, then the block outline ([`VoxelRenderer::set_outline`]), then the translucent
-    /// buckets back to front with the translucent pipeline. Submit `encoder` before the next
-    /// `render`.
+    /// upload budget), the chunk changes since the last call and the translucent buckets
+    /// re-sorted for this camera (uploads), clear, (High) cull, opaque buckets with the opaque
+    /// pipeline, then the cutout bucket with the cutout pipeline, then the block outline
+    /// ([`VoxelRenderer::set_outline`]), then the translucent buckets back to front with the
+    /// translucent pipeline. Submit `encoder` before the next `render`.
     pub fn render(
         &mut self,
         device: &wgpu::Device,
