@@ -105,8 +105,13 @@ impl Plugin for PersistPlugin {
             .init_resource::<EntityCodecs>()
             .init_resource::<SavedLog>()
             .add_systems(Startup, restore_saved)
-            // Exclusive (codecs read and spawn entities), and only when there is work.
-            .add_systems(PreUpdate, entity_step.run_if(entity_work))
+            // Exclusive (codecs read and spawn entities), and only when there is work. Its order
+            // against the rest of `PreUpdate` (input) does not matter: it only has to come before
+            // the frame's fixed steps.
+            .add_systems(
+                PreUpdate,
+                entity_step.run_if(entity_work).ambiguous_with_all(),
+            )
             .add_systems(Update, save_step.after(WorldSystems::Visibility))
             // Like the other board lines: its order does not matter.
             .add_systems(Last, publish_save_stats.ambiguous_with_all())

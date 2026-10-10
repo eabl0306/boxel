@@ -29,8 +29,16 @@ pub const BODY_CODEC: &str = "boxel:body";
 /// The version of the bytes [`BodyCodec`] writes.
 pub const BODY_CODEC_VERSION: u32 = 1;
 
-/// The physics part of a saved entity (see the [module docs](self)): the body of an entity with
-/// a [`RigidBody`]. [`PhysicsPlugin`](crate::PhysicsPlugin) registers it.
+/// The physics part of a saved entity (ADR 0024): the body of an entity with a [`RigidBody`].
+/// [`PhysicsPlugin`](crate::PhysicsPlugin) registers it, so a body with
+/// [`Saved`](boxel_world::persist::Saved) is saved with its chunk and comes back as it was.
+///
+/// It saves the kind, the exact position, the velocity, the [`BodySettings`], the [`Collider`],
+/// the [`Contacts`] of the latest step, whether the body sleeps and how many steps it has been
+/// still, and when present [`Interpolated`], [`ReportContacts`], the [`CharacterController`]
+/// with its [`MoveIntent`], the [`Projectile`] (its shooter only if the shooter is saved) and
+/// the [`Swimmer`], floats bit for bit: a body that comes back steps exactly as it would have.
+/// A body that comes back is not woken by the chunk loads it came back with.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BodyCodec;
 
