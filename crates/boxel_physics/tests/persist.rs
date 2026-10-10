@@ -504,3 +504,77 @@ fn a_frozen_walker_comes_back_frozen() {
         assert_eq!(run_frozen(base, true, 20), straight, "{base:?}");
     }
 }
+
+/// How gameplay placed a body in the last frame before the exit, before any step took it.
+#[derive(Clone, Copy, Debug)]
+enum Placed {
+    /// A `Teleport` of a sleeping crate into the air.
+    Teleport,
+    /// A `Transform` write of a sleeping crate into the air.
+    Transform,
+    /// A new body spawned with only a `Transform`, awake.
+    NewAwake,
+    /// A new body spawned with only a `Transform`, asleep (it stays where it was spawned).
+    NewAsleep,
+}
+
+/// A crate asleep on the ground, then placed as `how` says; then (with `restart`) the world
+/// exits and opens again before any step; then 60 steps: the states at the end.
+fn run_placed(base: I64Vec3, how: Placed, restart: bool) -> Vec<(SavedId, State)> {
+    let backend = Arc::new(MemoryStore::new());
+    let mut sim = start(&backend, base);
+    let crate_ = Collider::aabb(DVec3::splat(0.375));
+    let resting = sim.body(
+        sim.pos(3.5, 5.0, 3.5),
+        (Saved::new(), crate_, Interpolated::default()),
+    );
+    sim.steps(120);
+    assert!(sim.asleep(resting), "{base:?}");
+    let air = sim.pos(5.5, 9.25, 3.5);
+    let shown = sim.base.as_dvec3() + DVec3::new(5.5, 9.25, 3.5);
+    let world = sim.app.world_mut();
+    match how {
+        Placed::Teleport => {
+            world
+                .entity_mut(resting)
+                .insert(boxel_physics::Teleport(air));
+        }
+        Placed::Transform => world.get_mut::<Transform>(resting).unwrap().translation = shown,
+        Placed::NewAwake | Placed::NewAsleep => {
+            let mut e = world.spawn((
+                Saved::new(),
+                RigidBody::Dynamic,
+                crate_,
+                Transform::from_translation(shown),
+            ));
+            if matches!(how, Placed::NewAsleep) {
+                e.insert(Sleeping);
+            }
+        }
+    }
+    if restart {
+        sim.app.shutdown();
+        drop(sim);
+        sim = start(&backend, base);
+    }
+    sim.steps(60);
+    states(&mut sim.app)
+}
+
+/// A body placed by gameplay (a pending `Teleport`, a `Transform` write, a new body) and saved
+/// before a step took it comes back with that placement still to do: the first step takes it as
+/// it would have (a sleeping crate teleported into the air wakes up and falls), bit for bit.
+#[test]
+fn a_pending_placement_is_taken_after_a_restart() {
+    for base in [bases()[0], bases()[2], bases()[3]] {
+        for how in [
+            Placed::Teleport,
+            Placed::Transform,
+            Placed::NewAwake,
+            Placed::NewAsleep,
+        ] {
+            let straight = run_placed(base, how, false);
+            assert_eq!(run_placed(base, how, true), straight, "{base:?} {how:?}");
+        }
+    }
+}

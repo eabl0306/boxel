@@ -40,7 +40,9 @@ pub const BODY_CODEC_VERSION: u32 = 1;
 /// how many steps it has been still, and when present [`Interpolated`], [`ReportContacts`], the
 /// [`CharacterController`] with its [`MoveIntent`], the [`Projectile`] (its shooter only if the
 /// shooter is saved), the [`Swimmer`] and the [`SwimIntent`], floats bit for bit: a body that
-/// comes back steps exactly as it would have.
+/// comes back steps exactly as it would have. A placement gameplay made that no step took yet (a
+/// pending [`Teleport`], a `Transform` write) is saved too, and the body is filed under the
+/// chunk of that place: the first step after it comes back takes it as it would have.
 /// A body that comes back is not woken by the chunk loads it came back with.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BodyCodec;
@@ -59,23 +61,32 @@ const IN_FLUID: u16 = 1 << 9;
 const GROUND: u16 = 1 << 10;
 const SWIM_INTENT: u16 = 1 << 11;
 const FROZEN: u16 = 1 << 12;
-const KNOWN: u16 = (1 << 13) - 1;
+const PENDING: u16 = 1 << 13;
+const KNOWN: u16 = (1 << 14) - 1;
 
-/// Where a body is for saving: a pending [`Teleport`] or a `Transform` written since the latest
-/// step (a teleport the next step takes), else its [`BodyPosition`].
-fn position_of(world: &World, entity: Entity) -> Option<WorldPos> {
-    let e = world.get_entity(entity).ok()?;
-    e.get::<RigidBody>()?;
+/// Where gameplay placed the body since the latest step, for the next step to take: a pending
+/// [`Teleport`], or a `Transform` written since physics last wrote it (a new body's first one).
+fn pending_of(e: &EntityRef<'_>) -> Option<WorldPos> {
     if let Some(teleport) = e.get::<Teleport>() {
         return Some(teleport.0.normalize());
     }
-    let position = e.get::<BodyPosition>().copied().unwrap_or_default();
     let sync = e.get::<PhysicsSync>().copied().unwrap_or_default();
-    let shown = e.get::<Transform>().map(|t| t.translation);
-    match shown {
-        Some(t) if !sync.placed || sync.last_written != Some(t) => Some(WorldPos::from_dvec3(t)),
-        _ => Some(position.0.normalize()),
-    }
+    let shown = e.get::<Transform>()?.translation;
+    (!sync.placed || sync.last_written != Some(shown)).then(|| WorldPos::from_dvec3(shown))
+}
+
+/// Where a body is for saving: where gameplay placed it ([`pending_of`]: the next step moves it
+/// there), else its [`BodyPosition`].
+fn position_of(world: &World, entity: Entity) -> Option<WorldPos> {
+    let e = world.get_entity(entity).ok()?;
+    e.get::<RigidBody>()?;
+    Some(pending_of(&e).unwrap_or_else(|| {
+        e.get::<BodyPosition>()
+            .copied()
+            .unwrap_or_default()
+            .0
+            .normalize()
+    }))
 }
 
 /// Writes a saved body.
@@ -245,9 +256,18 @@ impl EntityCodec for BodyCodec {
     }
 
     fn save(&self, world: &World, entity: Entity, ids: &SavedIds<'_>) -> Option<Vec<u8>> {
-        let position = position_of(world, entity)?;
         let e = world.get_entity(entity).ok()?;
         let kind = *e.get::<RigidBody>()?;
+        // The body as the latest step left it, and where gameplay placed it since: the record
+        // keeps both, so the first step after it comes back takes that placement as it would
+        // have (it wakes a sleeping body, clears its contacts...).
+        let position = e
+            .get::<BodyPosition>()
+            .copied()
+            .unwrap_or_default()
+            .0
+            .normalize();
+        let pending = pending_of(&e);
         let collider = e.get::<Collider>().copied();
         let contacts = e.get::<Contacts>().copied().unwrap_or_default();
         let sync = e.get::<PhysicsSync>().copied().unwrap_or_default();
@@ -271,6 +291,7 @@ impl EntityCodec for BodyCodec {
             (contacts.ground_block.is_some(), GROUND),
             (swim_intent.is_some(), SWIM_INTENT),
             (e.contains::<Frozen>(), FROZEN),
+            (pending.is_some(), PENDING),
         ] {
             if on {
                 flags |= flag;
@@ -370,6 +391,11 @@ impl EntityCodec for BodyCodec {
         }
         if let Some(intent) = swim_intent {
             w.u8(u8::from(intent.up));
+        }
+        if let Some(at) = pending {
+            // A body no step placed yet has only the default position.
+            w.u8(u8::from(!sync.placed));
+            w.pos(at);
         }
         Some(w.0)
     }
@@ -505,13 +531,23 @@ impl EntityCodec for BodyCodec {
         } else {
             None
         };
+        let pending = if has(PENDING) {
+            let new = r.u8()? != 0;
+            Some((new, r.pos()?))
+        } else {
+            None
+        };
         r.finish()?;
 
-        // Placed already, where it was: the next step neither teleports nor nudges it.
+        // Placed already, where it was: the next step does not take it for a nudge. A placement
+        // gameplay made that no step took yet comes back as a `Teleport` (the step takes it the
+        // same way as a `Transform` write), shown there.
         let translation = position.to_dvec3();
+        let placed = !pending.is_some_and(|(new, _)| new);
+        let shown = pending.map_or(translation, |(_, at)| at.to_dvec3());
         let mut e = world.entity_mut(entity);
         e.insert((
-            (kind, Transform::from_translation(translation)),
+            (kind, Transform::from_translation(shown)),
             (BodyPosition(position), Velocity(velocity), settings),
             Contacts {
                 faces,
@@ -520,9 +556,9 @@ impl EntityCodec for BodyCodec {
                 in_fluid: has(IN_FLUID),
             },
             PhysicsSync {
-                last_written: Some(translation),
+                last_written: placed.then_some(translation),
                 still,
-                placed: true,
+                placed,
                 ..PhysicsSync::default()
             },
             Restored,
@@ -555,6 +591,11 @@ impl EntityCodec for BodyCodec {
         // after it fell asleep).
         if has(SLEEPING) {
             e.insert(Sleeping);
+        }
+        // After the sleeping hook, which shows a placed body where it sleeps: shown at the
+        // placement, as before.
+        if let Some((_, at)) = pending {
+            e.insert(Teleport(at));
         }
         Ok(())
     }
