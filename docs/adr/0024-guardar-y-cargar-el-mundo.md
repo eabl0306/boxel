@@ -352,7 +352,11 @@ un `Option`. Con un mundo sin ediciones, el índice está vacío. Para la próxi
 - El frame del autoguardado con mucha agua corriendo: copia la lista de ticks pendientes en el
   hilo principal (`BlockTicks::pending`), lineal en la cantidad de ticks. Lo mismo volando sobre
   chunks editados con agua corriendo, porque cada job de descarga hace esa copia.
-- Entidades: el paso de entidades con miles de cajas guardadas dormidas cerca, volando para que
+- Entidades, medido (nivel 1, criterion, una corrida por lado, 2026-10-10): el paso de física no
+  cambia con el marcador `Restored`. `scale/10000_awake` 1.809 ms en `main` y 1.786 ms en la
+  rama; `scale/10000_asleep_chunk_events` 781 us y 761 us (ruido). Un registro de caja dormida
+  ocupa como mucho 251 bytes (la parte del cuerpo son 218).
+- Entidades, falta: el paso de entidades con miles de cajas guardadas dormidas cerca, volando para que
   sus chunks se descarguen y vuelvan (recorre las entidades vivas en cada frame con una descarga,
   codifica las que se van y despawnea, y al volver las crea en un solo frame). Si el frame que
   devuelve muchas sube demasiado, repartirlas en varios frames antes de que la física llegue a
