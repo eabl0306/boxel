@@ -348,8 +348,9 @@ fn any_layer(padded: &PaddedChunk, y: i32) -> bool {
     })
 }
 
-/// Appends the quads of the sloped cells to `out` with their buckets: one
-/// `SHAPE_FLUID_SLOPE` quad per visible face. `shade(front, face, nb9)` gives the light palette
+/// Appends the quads of the sloped cells to `out` with their buckets
+/// ([`MaterialTable::sloped_bucket`]): one `SHAPE_FLUID_SLOPE` quad per visible face.
+/// `shade(front, face, nb9)` gives the light palette
 /// index (and an AO byte, unused: the heights take its bits) as for the cube face in its place.
 pub(crate) fn emit_sloped(
     cells: &[SlopedCell],
@@ -385,7 +386,7 @@ pub(crate) fn emit_sloped(
             if materials.emissive(m) {
                 quad.geo |= layout::FLAG_EMISSIVE << layout::GEO_FLAGS_SHIFT;
             }
-            out.push((materials.bucket(m, face) as u8, quad));
+            out.push((materials.sloped_bucket(m, face, cell.heights) as u8, quad));
         }
     }
     Ok(())

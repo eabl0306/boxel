@@ -831,9 +831,10 @@ un `Mesher` thread-local (~0.6 MiB de scratch) y un `LightScratch` (~0.7 MiB).
    1/512 en la celda. Los costados de los fluidos y el techo inclinado llevan la textura de flujo,
    que el shader desplaza con el tiempo (`viewport.z` del uniform `View`).
 6. **Buckets (8, congelados, ADR 0012):** 0 a 5 = caras opacas en orden `Face`; 6 = **cutout**
-   (todas las caras de materiales cutout, como las hojas); 7 = translúcido. `ChunkMesh` guarda los
-   quads contiguos por bucket, `bucket_counts[8]`, la paleta de luz y un hash de todo. En el arena
-   de la GPU la paleta va justo después de los quads del chunk (sección 10.2).
+   (todas las caras de materiales cutout, como las hojas, y el techo inclinado de un fluido opaco,
+   ADR 0025); 7 = translúcido. `ChunkMesh` guarda los quads contiguos por bucket,
+   `bucket_counts[8]`, la paleta de luz y un hash de todo. En el arena de la GPU la paleta va justo
+   después de los quads del chunk (sección 10.2).
 
 **`PackedQuad` (8 bytes):**
 

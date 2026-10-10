@@ -420,6 +420,22 @@ impl MaterialTable {
             RenderShape::Opaque | RenderShape::None => face.index(),
         }
     }
+    /// Bucket of the `face` quad of a sloped fluid cell of `material` whose top corners are
+    /// `heights` high (`SHAPE_FLUID_SLOPE`): [`MaterialTable::bucket`], but the top of an opaque
+    /// fluid (lava) whose corners are not all at one height goes to [`CUTOUT_BUCKET`] (ADR 0025).
+    /// Such a top is not perpendicular to y: it faces eyes below its chunk on its downhill side,
+    /// where the renderer skips the whole +Y bucket (a +Y bucket is only drawn from above the
+    /// chunk's min y). The cutout bucket has no per-face test, and an opaque texture passes its
+    /// alpha test.
+    pub fn sloped_bucket(&self, material: u16, face: Face, heights: [u8; 4]) -> usize {
+        let bucket = self.bucket(material, face);
+        let level = heights.iter().all(|&h| h == heights[0]);
+        if face == Face::PosY && bucket < CUTOUT_BUCKET && !level {
+            CUTOUT_BUCKET
+        } else {
+            bucket
+        }
+    }
     /// Texture layer of `face`.
     pub fn layer(&self, material: u16, face: Face) -> u16 {
         self.layers

@@ -1,8 +1,8 @@
 //! `boxel_mesh`: CPU meshing. Binary greedy meshing (an in-repo fork of `binary-greedy-meshing`
 //! 0.5.2, padded 34^3) into the canonical 8-byte [`PackedQuad`], grouped in 8 buckets: 6 opaque
 //! face buckets (`Face` order), 1 cutout bucket (all faces of cutout materials such as leaves,
-//! drawn with alpha test and no backface culling) and 1 translucent bucket. Same bytes on every
-//! render tier.
+//! and the sloping tops of opaque fluids; drawn with alpha test and no backface culling) and 1
+//! translucent bucket. Same bytes on every render tier.
 //!
 //! Light and ambient occlusion are baked per quad corner (ADR 0015): each quad carries an AO
 //! byte and the index of its 4 corner lights in the chunk's light palette
@@ -31,7 +31,8 @@ pub use shading::FaceShading;
 
 /// Number of buckets per chunk mesh (frozen layout).
 pub const BUCKET_COUNT: usize = 8;
-/// Index of the cutout bucket (`RenderShape::Cutout`, all six faces; alpha-tested pipeline).
+/// Index of the cutout bucket (`RenderShape::Cutout`, all six faces; alpha-tested pipeline). It
+/// also holds the sloping tops of opaque fluids ([`MaterialTable::sloped_bucket`]).
 pub const CUTOUT_BUCKET: usize = 6;
 /// Index of the translucent bucket (`RenderShape::Translucent`; blended, drawn last).
 pub const TRANSLUCENT_BUCKET: usize = 7;

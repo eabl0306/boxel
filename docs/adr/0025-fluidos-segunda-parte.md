@@ -39,6 +39,11 @@ mar, el agua queda quieta como una pared vertical, porque el agua generada no pr
   de opacidad 15 piden un cubo que no sea fluido (`BlockModel::is_solid_cube`), y el mesher trata
   todo fluido como transparente al cortar caras, sea cual sea su forma. La superficie usa las mismas
   alturas por esquina que el agua.
+- El techo de una celda cuyas esquinas no están a la misma altura va al bucket cutout
+  (`MaterialTable::sloped_bucket`). El renderer salta el bucket +Y de un chunk cuando el ojo está
+  por debajo de su min y, y un techo inclinado se ve desde ahí del lado hacia donde baja. El
+  bucket cutout no tiene esa prueba y la textura de la lava pasa su alpha test. Ese techo se dibuja
+  de los dos lados, como el del agua.
 - Reglas (`boxel_world::fluid`), las de `LavaFluid` en el overworld: demora 30 ticks, busca bajada
   a 2 bloques, pierde 2 de cantidad por bloque (niveles 2, 4 y 6: llega 3 bloques) y no hace
   fuentes nuevas. El código es el mismo para los dos fluidos (`FluidRules`); solo cambian esos
@@ -174,6 +179,8 @@ mar, el agua queda quieta como una pared vertical, porque el agua generada no pr
 - Una lava sola no se ve como el cubo de antes: su techo baja hacia el aire de alrededor.
 - Una losa o una escalera en un lago cuestan un quad de agua propio arriba (no se fusiona con el
   greedy del lago) y parten el quad del lago a su alrededor.
+- El techo inclinado de la lava pasa por el alpha test (sin early-Z en sus píxeles) y puede sumar
+  un draw por chunk, el de su bucket cutout.
 - Rendimiento: hoy no se midió (la máquina estaba ocupada). Tocan caminos calientes la generación
   de chunks cerca del mar (la regla de las costas), los ticks de fluidos (la clasificación de
   estados, las paredes entre celdas, que leen cajas de colisión, y la reacción de la lava), el
@@ -202,3 +209,5 @@ mar, el agua queda quieta como una pared vertical, porque el agua generada no pr
   desplazamiento hacia adentro es un bit y es lo que hace Minecraft.
 - Guardar la dirección del flujo en el quad: las alturas de las esquinas ya la dan, y el mesher y
   el shader la calculan igual con enteros.
+- Para el techo inclinado, una marca por chunk que no salte su bucket +Y: cambia el culling de los
+  tres tiers.

@@ -176,7 +176,8 @@ pub fn class_at(padded: &PaddedChunk, x: i32, y: i32, z: i32) -> VoxelClass {
 }
 
 /// Checks a mesh against its padded input: counts match the quads, opaque buckets hold their
-/// own face, quads stay inside the chunk and never overlap, every unit face has the bucket,
+/// own face (and no sloping fluid top), quads stay inside the chunk and never overlap, every
+/// unit face has the bucket (`MaterialTable::sloped_bucket` for a sloped fluid cell's),
 /// texture layer (the flow one on the top of a sloped fluid cell that flows) and emissive flag
 /// of the material of its voxel and the shape code of its face
 /// (`SHAPE_FLUID_SURFACE` on a marked fluid surface cell but for its -Y face, or
@@ -197,6 +198,17 @@ pub fn verify_mesh(padded: &PaddedChunk, table: &MaterialTable, mesh: &ChunkMesh
                     bucket,
                     "opaque bucket holds another face"
                 );
+                // The renderer tests a face bucket against its face's axis (a +Y bucket is
+                // drawn only from above the chunk's min y): only faces perpendicular to it fit,
+                // so a sloping fluid top never lands in one (ADR 0025).
+                if let Some(h) = quad.fluid_heights()
+                    && quad.face() == Face::PosY
+                {
+                    assert!(
+                        h.iter().all(|&c| c == h[0]),
+                        "{quad:?}: a sloping top in an opaque face bucket"
+                    );
+                }
             }
             for (p, face) in quad.unit_faces() {
                 assert!(
@@ -207,9 +219,12 @@ pub fn verify_mesh(padded: &PaddedChunk, table: &MaterialTable, mesh: &ChunkMesh
                 let marked = padded.cull_mask != u16::MAX;
                 let surface = marked && id & FLUID_SURFACE_BIT != 0;
                 let material = if marked { id & !FLUID_SURFACE_BIT } else { id };
+                let expected = match quad.fluid_heights() {
+                    Some(heights) => table.sloped_bucket(material, face, heights),
+                    None => table.bucket(material, face),
+                };
                 assert_eq!(
-                    table.bucket(material, face),
-                    bucket,
+                    expected, bucket,
                     "unit face {p:?} {face:?} of material {material} in the wrong bucket"
                 );
                 // The top of a sloped fluid cell that flows shows the flow texture, its side one
