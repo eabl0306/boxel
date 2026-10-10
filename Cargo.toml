@@ -133,6 +133,7 @@ physics = ["voxel", "dep:boxel_physics"]
 render = [
     "window",
     "voxel",
+    "dep:boxel_fog",
     "dep:boxel_gfx",
     "dep:boxel_shaders",
     "dep:boxel_render",
@@ -181,6 +182,7 @@ boxel_world = { workspace = true, optional = true }
 boxel_debug = { workspace = true, optional = true }
 boxel_physics = { workspace = true, optional = true }
 boxel_pack = { workspace = true, optional = true }
+boxel_fog = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The example content (#48), for tests, benches and examples only.

@@ -11,6 +11,7 @@
 //! - `ExtractedFrame`: everything `Prepare` and `Draw` may read, copied by `Extract`, plus the
 //!   frame results `Cleanup` writes back.
 
+use crate::fog::{FogInput, FogSettings};
 use crate::outline::{BlockOutline, Outline, OutlineCache};
 use crate::overlay::{OverlayDraw, OverlayPass, OverlayRect};
 use crate::{
@@ -441,6 +442,10 @@ struct ReadyGpu {
     offscreen: VecDeque<wgpu::SubmissionIndex>,
     /// [`DebugDestroyDevice`] destroyed this device: the loss is ours, not the driver's.
     destroyed_on_purpose: bool,
+    /// The fog passes passed the smoke test on this device (else the fog stays off on it).
+    fog_ok: bool,
+    /// The fog was refused on this device and that was logged.
+    fog_warned: bool,
 }
 
 impl ReadyGpu {
@@ -590,7 +595,7 @@ enum MeshOp {
 /// The extract boundary: inputs copied from the main world by `Extract`, the view computed by
 /// `Prepare`, and the frame results `Cleanup` writes back.
 #[derive(Resource, Default)]
-struct ExtractedFrame {
+pub(crate) struct ExtractedFrame {
     camera: Option<(Camera, Transform)>,
     window: WindowState,
     /// Clear and fog color of this frame.
@@ -615,6 +620,8 @@ struct ExtractedFrame {
     outline: Option<Outline>,
     /// The chunks the camera may see this frame (cave culling), `None` when off.
     visibility: Option<Arc<VisibleSet>>,
+    /// This frame's fog (`crate::fog::FogPlugin`'s extract), `None` without the plugin.
+    pub(crate) fog: Option<FogInput>,
     destroy_device: bool,
     /// `Prepare` output.
     view: Option<ViewParams>,
@@ -725,6 +732,8 @@ struct SetupParams<'w> {
     info: ResMut<'w, RenderInfo>,
     board: Option<ResMut<'w, DiagnosticsBoard>>,
     time: Option<ResMut<'w, Time>>,
+    /// Present with `crate::fog::FogPlugin`: the smoke test also checks the fog passes.
+    fog: Option<Res<'w, FogSettings>>,
 }
 
 /// `RenderSystems::Setup`. GPU selection and renderer creation are declared as a stall
@@ -889,6 +898,10 @@ fn bootstrap(p: &mut SetupParams) {
     }
 
     // 4-5. New surface + selection (+ the GL second stage of `panic = "abort"` builds).
+    let smoke = RendererSmokeTest {
+        fog: p.fog.is_some(),
+        ..RendererSmokeTest::default()
+    };
     let mut selected = {
         let Some(created) = p.instance.created.as_ref() else {
             return;
@@ -900,6 +913,7 @@ fn bootstrap(p: &mut SetupParams) {
             &settings,
             p.lkg.store.as_mut(),
             &p.losses.exclusions,
+            &smoke,
         )
     };
     if let Err(Selection::NoAdapter(_)) = &selected
@@ -920,6 +934,7 @@ fn bootstrap(p: &mut SetupParams) {
                     &settings,
                     p.lkg.store.as_mut(),
                     &p.losses.exclusions,
+                    &smoke,
                 );
                 p.instance.created = Some(gl);
             }
@@ -1042,6 +1057,8 @@ fn bootstrap(p: &mut SetupParams) {
         frames: 0,
         offscreen: VecDeque::new(),
         destroyed_on_purpose: false,
+        fog_ok: smoke.fog_ok.load(std::sync::atomic::Ordering::Relaxed),
+        fog_warned: false,
     }));
 }
 
@@ -1110,6 +1127,7 @@ fn select(
     settings: &RenderSettings,
     lkg: Option<&mut LkgStore>,
     exclusions: &[Exclusion],
+    smoke: &RendererSmokeTest,
 ) -> Result<(GpuContext, wgpu::Surface<'static>), Selection> {
     let surface = created
         .instance
@@ -1122,7 +1140,7 @@ fn select(
         policy: settings.tier_policy,
         lkg,
         exclusions,
-        smoke: &RendererSmokeTest::default(),
+        smoke,
         smoke_level: settings.smoke_level,
         create_devices: true,
     })
@@ -1488,6 +1506,15 @@ fn prepare(
     ready.renderer.set_translucent_sort(frame.translucent_sort);
     ready.renderer.set_outline(frame.outline.take());
     ready.renderer.set_visibility(frame.visibility.clone());
+    let fog = frame.fog.take();
+    if fog.is_some() && !ready.fog_ok {
+        if !ready.fog_warned {
+            ready.fog_warned = true;
+            tracing::warn!("the fog failed its smoke test on this device: it stays off");
+        }
+    } else {
+        ready.renderer.set_fog(&ready.ctx.device, fog);
+    }
     for op in frame.meshes.drain(..) {
         let result = match op {
             MeshOp::Upsert { id, origin, mesh } => {

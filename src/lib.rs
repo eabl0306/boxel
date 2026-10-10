@@ -16,6 +16,10 @@
 //! - The window is a non-send resource: use `NonSend<PrimaryWindow>` (main thread). Calling
 //!   winit window methods from parallel systems deadlocks on macOS and Windows.
 //!
+//! Fog and clouds (ADR 0030) are optional: add `render::fog::FogPlugin` (in the prelude) with
+//! your layers ([`fog::FogLayer`], plain data) and the renderer marches them after the main pass;
+//! without it nothing of the fog exists.
+//!
 //! Frame rate: [`app::FrameLimit`] (in the prelude) caps updates per second, 144 by default and
 //! 0 for unlimited; `render::PresentSettings` (feature `render`, also in the prelude) switches
 //! vsync, off by default. Both are resources that any system can change at runtime, for
@@ -41,6 +45,8 @@ pub use boxel_window as window;
 
 #[cfg(feature = "render")]
 pub use boxel_debug as debug_overlay;
+#[cfg(feature = "render")]
+pub use boxel_fog as fog;
 #[cfg(feature = "render")]
 pub use boxel_gfx as gfx;
 #[cfg(feature = "render")]

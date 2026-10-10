@@ -82,6 +82,7 @@ pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// Common items.
 pub mod prelude {
+    pub use crate::fog::FogPlugin;
     pub use crate::{
         BlockOutline, PresentSettings, RenderInfo, RenderPlugin, RenderSettings, RequestScreenshot,
         ScreenshotSaved,
