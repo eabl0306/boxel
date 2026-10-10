@@ -408,7 +408,9 @@ un `Option`. Con un mundo sin ediciones, el índice está vacío. Para la próxi
 - Entidades, medido (nivel 1, criterion, una corrida por lado, 2026-10-10): el paso de física no
   cambia con el marcador `Restored`. `scale/10000_awake` 1.809 ms en `main` y 1.786 ms en la
   rama; `scale/10000_asleep_chunk_events` 781 us y 761 us (ruido). Un registro de caja dormida
-  ocupa como mucho 251 bytes (la parte del cuerpo son 218).
+  ocupa como mucho 251 bytes (la parte del cuerpo son 218). Después de las correcciones de la
+  revisión (`Restored` con lo que había pasado al volver), igual: `scale/10000_awake` 1.760 ms en
+  `main` y 1.716 ms en la rama; `scale/10000_asleep_chunk_events` 758 us y 736 us.
 - Entidades, falta: el paso de entidades con miles de cajas guardadas dormidas cerca, volando para que
   sus chunks se descarguen y vuelvan (recorre las entidades vivas en cada frame con una descarga,
   codifica las que se van y cambiaron, y despawnea; al volver las crea en un solo frame). Si el
