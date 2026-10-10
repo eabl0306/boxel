@@ -186,6 +186,8 @@ struct Setup {
     backend: Arc<dyn ChunkStore>,
     level: i64,
     codecs: bool,
+    /// `WorldSettings::vertical_bounds`.
+    bounds: Option<RangeInclusive<i64>>,
 }
 
 impl Setup {
@@ -194,6 +196,7 @@ impl Setup {
             backend,
             level,
             codecs: true,
+            bounds: None,
         }
     }
 
@@ -208,7 +211,10 @@ impl Setup {
             generator: Arc::new(generator),
             registry,
             executor: Arc::new(InlineExecutor),
-            settings: WorldSettings::default(),
+            settings: WorldSettings {
+                vertical_bounds: self.bounds.clone(),
+                ..WorldSettings::default()
+            },
         })
         .add_plugins(PersistPlugin {
             store,
@@ -800,4 +806,45 @@ fn the_autosave_makes_again_only_the_records_that_changed() {
     assert_eq!(made(), scene.len() + 2);
     move_viewer(&mut app, viewer, o);
     assert_eq!(things(&mut app).len(), scene.len(), "all back");
+}
+
+/// With `WorldSettings::vertical_bounds`, the layers outside never load (physics reads them as
+/// air): an entity above the top layer (thrown or shot up there) stays alive while the top
+/// layer of its column is loaded, is saved under it, and comes back with it, near and far.
+#[test]
+fn an_entity_above_the_vertical_bounds_is_kept_with_the_top_layer() {
+    for o in origins() {
+        let top = o.y >> 5;
+        let setup = Setup {
+            bounds: Some(top - 1..=top),
+            ..Setup::new(Arc::new(MemoryStore::new()), o.y)
+        };
+        let (mut app, viewer) = setup.start(o);
+        let high = Thing {
+            at: at(o, 3, 40, 1),
+            value: 1,
+        };
+        let low = Thing {
+            at: at(o, 3, -100, 1),
+            value: 2,
+        };
+        spawn_things(&mut app, &[high, low]);
+        settle(&mut app);
+        assert_eq!(things(&mut app), vec![high, low], "{o:?}: alive");
+        move_viewer(&mut app, viewer, at(o, 1 << 13, 0, 0));
+        assert!(things(&mut app).is_empty(), "{o:?}: put away");
+        let mut keys: Vec<ChunkKey> = records(setup.backend.as_ref())
+            .into_iter()
+            .map(|(c, _, _)| c)
+            .collect();
+        keys.sort_unstable_by_key(|k| k.pos.y);
+        let column = |y: i64| ChunkKey::new(ChunkPos::new(o.x >> 5, y, o.z >> 5));
+        assert_eq!(
+            keys,
+            vec![column(top - 1), column(top)],
+            "{o:?}: under the layers in bounds"
+        );
+        move_viewer(&mut app, viewer, o);
+        assert_eq!(things(&mut app), vec![high, low], "{o:?}: back");
+    }
 }

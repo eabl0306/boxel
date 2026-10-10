@@ -34,6 +34,7 @@ use boxel_ecs::prelude::*;
 use boxel_ecs::world::DeferredWorld;
 use boxel_voxel::{BlockPos, ChunkKey, ChunkPos, DimensionId};
 use std::collections::{HashMap, HashSet};
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 /// Hash maps of the index: fixed seeds, so the bookkeeping is the same in every run.
@@ -62,7 +63,8 @@ impl SavedId {
 ///
 /// - When its chunk unloads, or when it is somewhere with no chunk slot, it is saved and
 ///   despawned; it comes back, as a new entity with the same components, when the chunk loads,
-///   before the next fixed step.
+///   before the next fixed step. Above or below `WorldSettings::vertical_bounds` its chunk is
+///   the nearest layer of the column inside them (the layers outside never load).
 /// - The autosave and the exit save it under the chunk it is in.
 /// - Despawning it (or removing the marker) removes its record. Inserting a new `Saved` makes it
 ///   a new saved entity.
@@ -412,7 +414,8 @@ pub(crate) fn save_entities_on_exit(world: &mut World) {
 
 /// The entity step (see [`entity_step`]); `exit` saves every entity alive.
 fn run(world: &mut World, exit: bool) {
-    let dim = world.resource::<WorldSettings>().dimension;
+    let settings = world.resource::<WorldSettings>();
+    let (dim, bounds) = (settings.dimension, settings.vertical_bounds.clone());
     let log = world
         .get_resource_mut::<SavedLog>()
         .map(|mut log| std::mem::take(&mut *log))
@@ -431,6 +434,7 @@ fn run(world: &mut World, exit: bool) {
             codecs: &codecs,
             p,
             dim,
+            bounds,
         };
         for (chunk, records) in std::mem::take(&mut step.p.entities.arrived) {
             step.restore(chunk, records);
@@ -460,18 +464,29 @@ struct Step<'a> {
     codecs: &'a EntityCodecs,
     p: &'a mut Persist,
     dim: DimensionId,
+    /// `WorldSettings::vertical_bounds`.
+    bounds: Option<RangeInclusive<i64>>,
 }
 
 impl Step<'_> {
+    /// The key of the chunk that holds the entities at `chunk`: that chunk, or the layer of its
+    /// column next to it inside the world's vertical bounds. A layer outside the bounds never
+    /// loads (physics reads it as air, so a body flies or falls through it): an entity there
+    /// stays alive while that layer is loaded, and is saved under it.
     fn key(&self, chunk: ChunkPos) -> ChunkKey {
+        let y = match &self.bounds {
+            Some(b) if !b.is_empty() => chunk.y.clamp(*b.start(), *b.end()),
+            _ => chunk.y,
+        };
         ChunkKey {
             dim: self.dim,
             lod: 0,
-            pos: chunk,
+            pos: ChunkPos::new(chunk.x, y, chunk.z),
         }
     }
 
-    /// The chunk an entity's record goes under: the first codec that places it.
+    /// The chunk an entity's record goes under: the first codec that places it ([`Step::key`]
+    /// of the chunk it is in).
     fn chunk_of(&self, entity: Entity) -> Option<ChunkKey> {
         self.codecs
             .iter()
