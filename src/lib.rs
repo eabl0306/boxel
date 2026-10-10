@@ -95,9 +95,7 @@ pub mod prelude {
     #[cfg(feature = "voxel")]
     pub use boxel_world::prelude::*;
     #[cfg(feature = "voxel")]
-    pub use boxel_worldgen::{
-        ForestGenerator, OverworldGenerator, TerrainGenerator, WorldGenerator,
-    };
+    pub use boxel_worldgen::{FlatGenerator, WorldGenerator};
 
     #[cfg(feature = "physics")]
     pub use boxel_physics::prelude::*;

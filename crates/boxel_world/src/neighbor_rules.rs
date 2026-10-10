@@ -254,7 +254,7 @@ mod tests {
 
     #[test]
     fn rules_follow_the_batch_one_ring_out() {
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let rules = NeighborRules::from_registry(&registry);
         let s = |name: &str| registry.parse_state(name).unwrap();
         let fence = s("boxel:oak_fence");
@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn a_rule_next_to_unreadable_blocks_keeps_its_state() {
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let rules = NeighborRules::from_registry(&registry);
         let torch = registry.parse_state("boxel:torch").unwrap();
         // A torch in the air at the edge of the readable world: its east neighbor is not
@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn rules_can_be_replaced_per_block() {
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let mut rules = NeighborRules::from_registry(&registry);
         let torch = registry.parse_state("boxel:torch").unwrap();
         assert!(rules.rule(&registry, torch).is_some());
@@ -364,7 +364,7 @@ mod tests {
     /// batch: the change runs down from wall to wall, past the first ring (ADR 0027).
     #[test]
     fn wall_posts_follow_down_a_column() {
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let rules = NeighborRules::from_registry(&registry);
         let s = |name: &str| registry.parse_state(name).unwrap();
         // A straight north-south wall three long and three high, far from the origin, with a
@@ -430,7 +430,7 @@ mod tests {
     /// brute-force check that the rules and their second looks reach every block they should.
     #[test]
     fn every_batch_leaves_the_rules_settled() {
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let rules = NeighborRules::from_registry(&registry);
         let s = |name: &str| registry.parse_state(name).unwrap();
         let palette = [
@@ -499,7 +499,7 @@ mod tests {
     /// (250 238 second looks here), more than a fixed cap allowed.
     #[test]
     fn a_big_batch_of_walls_settles() {
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let rules = NeighborRules::from_registry(&registry);
         let s = |name: &str| registry.parse_state(name).unwrap();
         let base = BlockPos::new((1 << 40) - 32, 1 << 31, -(1 << 31) - 32);
@@ -530,7 +530,7 @@ mod tests {
     /// the batch ends with a bounded number of edits.
     #[test]
     fn a_rule_that_never_settles_stops_at_the_cap() {
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let mut rules = NeighborRules::from_registry(&registry);
         let fence = registry.parse_state("boxel:oak_fence").unwrap();
         let flip: NeighborRule = |registry, state, _| {
@@ -557,7 +557,7 @@ mod tests {
 
     #[test]
     fn gates_are_used_and_other_blocks_are_not() {
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let mut uses = BlockUses::from_registry(&registry);
         let s = |name: &str| registry.parse_state(name).unwrap();
         let gate = s("boxel:oak_fence_gate[facing=north]");

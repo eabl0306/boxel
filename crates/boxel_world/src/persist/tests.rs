@@ -5,8 +5,7 @@ use super::*;
 use crate::jobs::InlineExecutor;
 use crate::ticks::BlockTicks;
 use boxel_voxel::{
-    BlockPos, BlockRegistry, BlockRegistryBuilder, BlockState, ChunkData, ChunkKey, ChunkPos,
-    DimensionId, LocalPos, MAX_CHUNK_COORD,
+    BlockPos, BlockState, ChunkData, ChunkKey, ChunkPos, DimensionId, LocalPos, MAX_CHUNK_COORD,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,14 +18,14 @@ fn key(x: i64, y: i64, z: i64) -> ChunkKey {
 fn open(backend: &Arc<MemoryStore>) -> WorldStore {
     WorldStore::open(
         Arc::clone(backend) as Arc<dyn ChunkStore>,
-        &BlockRegistry::default_blocks(),
+        &boxel_demo::blocks::registry(),
         "test",
     )
     .expect("opens")
 }
 
 fn stone_chunk() -> Arc<ChunkData> {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let mut data = ChunkData::uniform(BlockState::AIR);
     data.set(
         LocalPos::new(4, 5, 6),
@@ -56,7 +55,7 @@ fn a_new_world_writes_its_version_id_map_and_generator_once() {
     drop(store);
     let store = WorldStore::open(
         Arc::clone(&backend) as Arc<dyn ChunkStore>,
-        &BlockRegistry::default_blocks(),
+        &boxel_demo::blocks::registry(),
         "another",
     )
     .unwrap();
@@ -66,7 +65,7 @@ fn a_new_world_writes_its_version_id_map_and_generator_once() {
     );
     // A registry with more states adds their names after the old ones.
     drop(store);
-    let mut builder = BlockRegistryBuilder::with_default_blocks();
+    let mut builder = boxel_demo::blocks::builder();
     builder.add_block(plain("test:gem")).unwrap();
     let bigger = builder.build();
     let store =
@@ -148,7 +147,7 @@ fn a_copy_staged_during_its_write_stays_staged() {
     });
     let store = WorldStore::open(
         Arc::clone(&racing) as Arc<dyn ChunkStore>,
-        &BlockRegistry::default_blocks(),
+        &boxel_demo::blocks::registry(),
         "test",
     )
     .unwrap();
@@ -254,7 +253,7 @@ fn a_save_with_metadata_takes_every_staged_chunk() {
     let backend = Arc::new(Counting::default());
     let store = WorldStore::open(
         Arc::clone(&backend) as Arc<dyn ChunkStore>,
-        &BlockRegistry::default_blocks(),
+        &boxel_demo::blocks::registry(),
         "test",
     )
     .unwrap();
@@ -296,7 +295,7 @@ fn a_save_with_entity_records_takes_every_staged_chunk() {
     let backend = Arc::new(Counting::default());
     let store = WorldStore::open(
         Arc::clone(&backend) as Arc<dyn ChunkStore>,
-        &BlockRegistry::default_blocks(),
+        &boxel_demo::blocks::registry(),
         "test",
     )
     .unwrap();
@@ -494,7 +493,7 @@ fn a_failed_redb_save_is_written_once_the_disk_works() {
     let backend: Arc<dyn ChunkStore> = Arc::new(failing_redb(&tmp.0, &fail));
     let store = WorldStore::open(
         Arc::clone(&backend),
-        &BlockRegistry::default_blocks(),
+        &boxel_demo::blocks::registry(),
         "test",
     )
     .unwrap();
@@ -521,11 +520,11 @@ fn a_failed_redb_save_is_written_once_the_disk_works() {
     drop(backend);
     let store = WorldStore::open(
         Arc::new(RedbStore::open(&tmp.0).unwrap()),
-        &BlockRegistry::default_blocks(),
+        &boxel_demo::blocks::registry(),
         "test",
     )
     .unwrap();
-    let stone = BlockRegistry::default_blocks()
+    let stone = boxel_demo::blocks::registry()
         .by_name("boxel:stone")
         .unwrap();
     assert_eq!(
@@ -760,7 +759,7 @@ fn a_failed_entity_save_is_written_once_the_disk_works() {
     let backend: Arc<dyn ChunkStore> = Arc::new(failing_redb(&tmp.0, &fail));
     let store = WorldStore::open(
         Arc::clone(&backend),
-        &BlockRegistry::default_blocks(),
+        &boxel_demo::blocks::registry(),
         "test",
     )
     .unwrap();

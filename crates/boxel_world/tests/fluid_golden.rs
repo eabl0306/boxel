@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 /// The registry under test.
 fn registry() -> BlockRegistry {
-    BlockRegistry::default_blocks()
+    boxel_demo::blocks::registry()
 }
 
 /// The world: grass at y = 63 over dirt, stone and bedrock (the examples' flat world).

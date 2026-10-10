@@ -3,6 +3,7 @@
 mod common;
 
 use boxel_app::App;
+use boxel_demo::worldgen::ForestGenerator;
 use boxel_ecs::system::RunSystemOnce;
 use boxel_math::DVec3;
 use boxel_physics::{
@@ -17,7 +18,7 @@ use boxel_world::jobs::InlineExecutor;
 use boxel_world::{
     ChunkMap, ChunkSlot, ChunkViewer, DataState, WorldPlugin, WorldSettings, WorldStats,
 };
-use boxel_worldgen::{FlatGenerator, ForestGenerator, WorldGenerator};
+use boxel_worldgen::{FlatGenerator, WorldGenerator};
 use common::{STONE, table};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -65,7 +66,7 @@ fn app_with(generator: Arc<dyn WorldGenerator>, settings: WorldSettings) -> App 
             generator,
             settings,
             executor: Arc::new(InlineExecutor),
-            ..WorldPlugin::default()
+            registry: Arc::new(boxel_demo::blocks::registry()),
         },
         PhysicsPlugin::default(),
     ));
@@ -110,7 +111,7 @@ fn chunk_source_reads_ready_missing_and_absent_chunks() {
     );
     spawn_viewer(&mut app, DVec3::new(16.0, 8.0, 16.0), 1, 1);
     settle(&mut app);
-    let grass = BlockRegistry::default_blocks()
+    let grass = boxel_demo::blocks::registry()
         .by_name("boxel:grass")
         .expect("built-in");
     // Ready, packed (stone and grass under air).

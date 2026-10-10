@@ -6,13 +6,13 @@
 //! `boxel_mesh::Mesher` builds from the map's current data and neighbors, and replaying the
 //! `ChunkMeshEvent`s (as a renderer does) gives exactly `ChunkMap::ready_meshes()`.
 use boxel_app::App;
+use boxel_demo::worldgen::TerrainGenerator;
 use boxel_ecs::prelude::*;
 use boxel_math::DVec3;
 use boxel_mesh::{ChunkMesh, MeshOptions};
 use boxel_transform::Transform;
 use boxel_voxel::{
-    BlockPos, BlockRegistry, BlockState, CHUNK_SIZE, ChunkKey, ChunkPos, Face, LocalPos,
-    RenderShape,
+    BlockPos, BlockState, CHUNK_SIZE, ChunkKey, ChunkPos, Face, LocalPos, RenderShape,
 };
 use boxel_world::jobs::{InlineExecutor, JobExecutor, TaskPoolExecutor};
 use boxel_world::reference::Reference;
@@ -20,7 +20,7 @@ use boxel_world::{
     ChunkId, ChunkMap, ChunkMeshEvent, ChunkSlot, ChunkViewer, DataState, EditQueue, MeshState,
     SkyMap, WorldContent, WorldPlugin, WorldSettings, WorldStats,
 };
-use boxel_worldgen::{TerrainGenerator, WorldGenerator};
+use boxel_worldgen::WorldGenerator;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -39,7 +39,7 @@ fn terrain_app_with(executor: Arc<dyn JobExecutor>, settings: WorldSettings) -> 
     let mut app = App::new();
     app.add_plugins(WorldPlugin {
         generator: Arc::new(TerrainGenerator::default()),
-        registry: Arc::new(BlockRegistry::default_blocks()),
+        registry: Arc::new(boxel_demo::blocks::registry()),
         settings,
         executor,
     });
@@ -377,7 +377,7 @@ fn edits_remesh_neighbors() {
     ));
     let events = settle(&mut app);
     let before = last_meshes(&events);
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let solid = |s: Option<BlockState>| s.is_some_and(|s| registry.shape(s) == RenderShape::Opaque);
 
     // A border voxel of chunk A (local x = 31) whose +X neighbor voxel in chunk B is also solid,

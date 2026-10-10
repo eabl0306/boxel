@@ -136,7 +136,7 @@ fn the_guard_does_nothing_without_support_or_drop() {
     assert_eq!(cut, DVec3::new(0.75 - EDGE_MARGIN, 0.0, 0.0));
     // A fence's top (its boxes reach half a block over its cell) holds a walker on it.
     let mut fences = TestWorld::new();
-    let fence = boxel_voxel::BlockRegistry::default_blocks()
+    let fence = boxel_demo::blocks::registry()
         .parse_state("boxel:oak_fence[east=true,west=true]")
         .unwrap();
     fill(&mut fences, base, [-3, -2, 0], [2, -2, 0], fence);

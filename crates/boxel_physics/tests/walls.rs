@@ -8,11 +8,11 @@ use boxel_physics::{
     CollisionShape, LocalBox, RayResult, StepUp, SweepConfig, SweepOut, TestWorld, VoxelFilter,
     move_box_stepping, raycast_voxels,
 };
-use boxel_voxel::{BlockPos, BlockRegistry, BlockState, Face, WorldPos};
+use boxel_voxel::{BlockPos, BlockState, Face, WorldPos};
 use common::{STONE, at, fill, table};
 
 fn state(name: &str) -> BlockState {
-    BlockRegistry::default_blocks().parse_state(name).unwrap()
+    boxel_demo::blocks::registry().parse_state(name).unwrap()
 }
 
 /// A straight wall along X, without a post (its middle bar: `z` from 5/16 to 11/16).

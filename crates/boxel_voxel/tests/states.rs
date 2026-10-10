@@ -146,7 +146,7 @@ proptest! {
 
 #[test]
 fn parse_errors_name_the_problem() {
-    let r = BlockRegistry::default_blocks();
+    let r = boxel_demo::blocks::registry();
     let slab = |t: &str| r.parse_state(&format!("boxel:stone_slab{t}"));
     assert_eq!(slab(""), Ok(BlockState(50)));
     assert_eq!(slab("[]"), Ok(BlockState(50)));
@@ -268,7 +268,7 @@ fn properties_are_sorted_by_name_and_checked() {
 /// sides, water levels.
 #[test]
 fn many_states_come_from_one_function() {
-    let mut b = BlockRegistryBuilder::with_default_blocks();
+    let mut b = boxel_demo::blocks::builder();
     let t = texture(&mut b);
     let stairs = b
         .add_block_with_states(

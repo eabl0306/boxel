@@ -622,7 +622,7 @@ fn extract(scratch: &mut LightScratch, out: &mut PaddedLight) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boxel_voxel::{BlockRegistry, BlockState};
+    use boxel_voxel::BlockState;
 
     fn input<'a>(air: &'a ChunkData, tile: &'a SkyTile, tables: &'a LightTables) -> LightInput<'a> {
         LightInput {
@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn alternating_results_reuse_two_padded_buffers() {
-        let tables = LightTables::from_registry(&BlockRegistry::default_blocks());
+        let tables = LightTables::from_registry(&boxel_demo::blocks::registry());
         let air = ChunkData::uniform(BlockState::AIR);
         // Sky tops 10 voxels into the chunk (a full result) and far above it (uniform dark).
         let mixed = SkyTile::uniform(10, i64::MIN);

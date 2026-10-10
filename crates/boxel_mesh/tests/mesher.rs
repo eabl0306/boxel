@@ -22,7 +22,7 @@ use common::{
 const OPTIONS: MeshOptions = MeshOptions::with_ao(AoPolicy::BakedLitOnly);
 
 fn registry() -> (BlockRegistry, MaterialTable) {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let table = MaterialTable::from_registry(&registry);
     (registry, table)
 }
@@ -304,7 +304,7 @@ fn quads_carry_the_texture_layer_of_their_face() {
 fn emissive_blocks_flag_their_quads() {
     let (registry, table) = registry();
     let stone = block(&registry, "stone");
-    let emitters: Vec<BlockState> = boxel_voxel::LAMPS
+    let emitters: Vec<BlockState> = boxel_demo::blocks::LAMPS
         .iter()
         .map(|lamp| block(&registry, lamp.short_name()))
         .chain([block(&registry, "lava")])

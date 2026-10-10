@@ -6,10 +6,11 @@
 //! The 3D noise against two oracles: its documented definition, written out with no shortcut
 //! (bit-identical anywhere in `i64`), and Ken Perlin's reference improved noise on the same
 //! lattice (equal up to the evaluation order).
+use boxel_demo::worldgen::{TerrainGenerator, TerrainSettings};
+use boxel_worldgen::Frequency;
 use boxel_worldgen::noise::{
     Fbm, Fbm3, Frequency3, fbm_2d, fbm_3d, fbm_3d_grid, gradient_noise_3d, hash3,
 };
-use boxel_worldgen::{Frequency, TerrainGenerator, TerrainSettings};
 
 /// The former noise (`f64` coordinates, saturating `i32` lattice), copied verbatim.
 mod former {

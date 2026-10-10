@@ -69,8 +69,9 @@ use boxel::world::visibility::{eye_in_open, visible_chunks};
 use boxel::world::{
     ChunkVisibility, SkyMap, VisibilityView, WorldContent, WorldStats, WorldSystems,
 };
-use boxel::worldgen::OverworldGenerator;
+use boxel_demo::worldgen::OverworldGenerator;
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use world::{World, WorldChoice};
 
@@ -260,7 +261,7 @@ fn find_cave(o: &mut Options, generator: &dyn WorldGenerator, seed: u64) -> Resu
         .unwrap_or([VIEWER.x, o.viewer_y, VIEWER.z, -90.0, 0.0]);
     let found = cave::find(
         generator,
-        &BlockRegistry::default_blocks(),
+        &boxel_demo::blocks::registry(),
         |x, z| overworld.height_at(x, z),
         DVec3::new(x, y, z),
     )?;
@@ -407,7 +408,7 @@ fn main() -> AppExit {
             return AppExit::from_code(1);
         }
     };
-    let seed = TerrainGenerator::default().seed;
+    let seed = boxel_demo::worldgen::DEFAULT_SEED;
     let generator = options.world.generator(seed);
     if options.cave {
         match find_cave(&mut options, generator.as_ref(), seed) {
@@ -440,6 +441,7 @@ fn main() -> AppExit {
             WorldPlugin {
                 generator,
                 settings,
+                registry: Arc::new(boxel_demo::blocks::registry()),
                 ..WorldPlugin::default()
             },
         ))

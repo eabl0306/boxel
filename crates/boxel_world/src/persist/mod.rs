@@ -18,10 +18,11 @@
 //! use boxel_voxel::BlockRegistry;
 //! use boxel_world::WorldPlugin;
 //! use boxel_world::persist::{PersistPlugin, WorldStore};
-//! use boxel_worldgen::{TerrainGenerator, WorldGenerator};
+//! use boxel_demo::worldgen::TerrainGenerator;
+//! use boxel_worldgen::WorldGenerator;
 //! use std::sync::Arc;
 //!
-//! let registry = Arc::new(BlockRegistry::default_blocks());
+//! let registry = Arc::new(boxel_demo::blocks::registry());
 //! let generator = Arc::new(TerrainGenerator::default());
 //! let store = WorldStore::open_dir("saves/world1", &registry, generator.name())
 //!     .expect("the world opens");

@@ -182,6 +182,8 @@ boxel_physics = { workspace = true, optional = true }
 boxel_pack = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The example content (#48), for tests, benches and examples only.
+boxel_demo.workspace = true
 tracing.workspace = true
 
 [[example]]

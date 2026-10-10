@@ -389,7 +389,7 @@ mod tests {
 
     #[test]
     fn blocks_are_outlined_by_their_model() {
-        let r = BlockRegistry::default_blocks();
+        let r = boxel_demo::blocks::registry();
         let s = |name: &str| r.parse_state(name).expect(name);
         assert_eq!(block_outline_edges(&r, s("boxel:stone")).len(), 12);
         assert_eq!(block_outline_edges(&r, s("boxel:stone_slab")).len(), 12);

@@ -39,6 +39,8 @@ tracing.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# The example content (#48), for tests, benches and examples only.
+boxel_demo.workspace = true
 boxel_gfx = { workspace = true, features = ["png"] }
 boxel_worldgen.workspace = true
 # Lit scenes in tests/gpu_terrain.rs: light computed exactly as the world computes it.

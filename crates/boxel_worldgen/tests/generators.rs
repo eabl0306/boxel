@@ -1,12 +1,13 @@
 //! Behavior tests for the M0 generators (`FlatGenerator`, `TerrainGenerator`).
+use boxel_demo::worldgen::{TerrainGenerator, TerrainSettings};
 use boxel_voxel::{
     BlockPos, BlockRegistry, BlockState, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, ChunkKey, ChunkPos,
     LocalPos, Paletted,
 };
-use boxel_worldgen::{FlatGenerator, Frequency, TerrainGenerator, TerrainSettings, WorldGenerator};
+use boxel_worldgen::{FlatGenerator, Frequency, WorldGenerator};
 
 fn registry() -> BlockRegistry {
-    BlockRegistry::default_blocks()
+    boxel_demo::blocks::registry()
 }
 
 fn state(r: &BlockRegistry, name: &str) -> BlockState {

@@ -1,13 +1,14 @@
 //! The sea (ADR 0021): source water from above every low column up to the sea level, sand on
 //! the beaches, nothing growing under water, caves closed under it, in the forest and the
 //! overworld, near the origin and far from it.
+use boxel_demo::worldgen::{
+    ForestGenerator, OverworldGenerator, OverworldSettings, Sea, TerrainGenerator,
+};
 use boxel_voxel::{
     BlockPos, BlockRegistry, BlockState, CHUNK_VOLUME, ChunkKey, ChunkPos, LocalPos,
     MAX_CHUNK_COORD,
 };
-use boxel_worldgen::{
-    ForestGenerator, OverworldGenerator, OverworldSettings, Sea, TerrainGenerator, WorldGenerator,
-};
+use boxel_worldgen::WorldGenerator;
 
 fn dense(g: &dyn WorldGenerator, r: &BlockRegistry, pos: ChunkPos) -> Vec<BlockState> {
     let mut out = vec![BlockState::AIR; CHUNK_VOLUME];
@@ -44,7 +45,7 @@ fn check_sea(
     sea: Sea,
     floor: bool,
 ) -> usize {
-    let r = BlockRegistry::default_blocks();
+    let r = boxel_demo::blocks::registry();
     let water = r.by_name("boxel:water").unwrap();
     let sand = r.by_name("boxel:sand").unwrap();
     let mut wet = 0;
@@ -109,7 +110,7 @@ fn the_forest_sea_fills_the_low_columns() {
         sea: None,
         ..ForestGenerator::default()
     };
-    let r = BlockRegistry::default_blocks();
+    let r = boxel_demo::blocks::registry();
     let water = r.by_name("boxel:water").unwrap();
     for (cx, cz) in chunk_columns().into_iter().step_by(17) {
         assert!(!dense(&dry, &r, ChunkPos::new(cx, 1, cz)).contains(&water));
@@ -134,7 +135,7 @@ fn the_overworld_sea_keeps_its_caves_closed() {
 
 #[test]
 fn nothing_grows_under_water_or_on_the_beach() {
-    let r = BlockRegistry::default_blocks();
+    let r = boxel_demo::blocks::registry();
     let growing = [
         "boxel:log",
         "boxel:leaves",
@@ -176,7 +177,7 @@ fn nothing_grows_under_water_or_on_the_beach() {
 /// out). Also returns the cells beside water the caves would have carved without the sea (their
 /// density carves them, they are not under the sea floor).
 fn open_shores(g: &OverworldGenerator, cx: i64, cz: i64, n: i64) -> (Vec<BlockPos>, Vec<BlockPos>) {
-    let r = BlockRegistry::default_blocks();
+    let r = boxel_demo::blocks::registry();
     let water = r.by_name("boxel:water").unwrap();
     let plants = [
         r.by_name("boxel:short_grass").unwrap(),
@@ -235,7 +236,7 @@ fn open_shores(g: &OverworldGenerator, cx: i64, cz: i64, n: i64) -> (Vec<BlockPo
 #[test]
 fn caves_never_open_beside_the_sea() {
     let g = OverworldGenerator::default();
-    let r = BlockRegistry::default_blocks();
+    let r = boxel_demo::blocks::registry();
     // Blocks of 16 x 16 chunk columns near the origin, across +-2^31 voxels, at 2^40 and near
     // the world limit.
     let mut kept_near_origin = 0;

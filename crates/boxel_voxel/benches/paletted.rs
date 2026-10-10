@@ -62,7 +62,7 @@ fn bench(c: &mut Criterion) {
         4,
         "terrain-like chunk should be 4-bit"
     );
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let chunk = ChunkData::from_dense(&dense);
     let at = positions(OPS);
 

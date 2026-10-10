@@ -805,7 +805,7 @@ mod tests {
     use boxel_camera::{Camera, CameraView};
     use boxel_mesh::{BUCKET_COUNT, MaterialTable, MeshInput, MeshOptions, Mesher};
     use boxel_transform::Transform;
-    use boxel_voxel::{BlockRegistry, BlockState, ChunkData, Face, LocalPos, ModelBox};
+    use boxel_voxel::{BlockState, ChunkData, Face, LocalPos, ModelBox};
 
     fn quad(pos: [u32; 3], w: u32, h: u32, face: Face) -> PackedQuad {
         PackedQuad::new(pos, w, h, face, 0)
@@ -1145,7 +1145,7 @@ mod tests {
 
     /// The translucent quads the real mesher makes for `blocks` in one chunk (no light).
     fn mesh_scene(blocks: &[((u32, u32, u32), &str)]) -> ChunkMesh {
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let mut dense = vec![BlockState::AIR; 32 * 32 * 32];
         for &((x, y, z), name) in blocks {
             dense[LocalPos::new(x, y, z).index()] = registry.by_name(name).expect(name);

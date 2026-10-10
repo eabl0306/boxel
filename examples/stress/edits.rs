@@ -218,13 +218,13 @@ impl EditScript {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boxel::voxel::BlockRegistry;
+    use boxel_demo::worldgen::TerrainGenerator;
     use std::sync::Arc;
 
     fn content() -> WorldContent {
         WorldContent::new(
             Arc::new(TerrainGenerator::default()),
-            Arc::new(BlockRegistry::default_blocks()),
+            Arc::new(boxel_demo::blocks::registry()),
         )
     }
 

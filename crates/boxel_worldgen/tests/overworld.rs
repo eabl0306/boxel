@@ -2,18 +2,19 @@
 //!
 //! The cave look is not approved yet, so there are no cave goldens: the chunk path is tested
 //! against the point spec (`block_at`) voxel by voxel, and the caves against statistics.
+use boxel_demo::worldgen::overworld::{CaveSettings, Cheese, Fade, Heightmap, SurfaceFade};
+use boxel_demo::worldgen::{
+    Caves, ForestGenerator, OverworldGenerator, OverworldSettings, PlantKind, Plants,
+    TerrainGenerator, Tree, Trees,
+};
 use boxel_voxel::{
     BlockPos, BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, ChunkKey, ChunkPos, LocalPos,
     MAX_CHUNK_COORD, Paletted,
 };
-use boxel_worldgen::overworld::{CaveSettings, Cheese, Fade, Heightmap, SurfaceFade};
-use boxel_worldgen::{
-    Caves, ForestGenerator, OverworldGenerator, OverworldSettings, PlantKind, Plants,
-    TerrainGenerator, Tree, Trees, WorldGenerator,
-};
+use boxel_worldgen::WorldGenerator;
 
 fn registry() -> BlockRegistry {
-    BlockRegistry::default_blocks()
+    boxel_demo::blocks::registry()
 }
 
 fn state(r: &BlockRegistry, name: &str) -> BlockState {

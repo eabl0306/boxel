@@ -263,7 +263,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         max_diff: 0.005,
         minimize_test: false,
         resize_test: false,
-        seed: TerrainGenerator::default().seed,
+        seed: boxel_demo::worldgen::DEFAULT_SEED,
         view_distance: None,
         vertical_radius: ChunkViewer::DEFAULT_VERTICAL_RADIUS,
         fixed_height: false,
@@ -1275,7 +1275,7 @@ fn placement(
                 _ => hit.point.frac.y >= 0.5,
             };
             let half = if top { SlabHalf::Top } else { SlabHalf::Bottom };
-            rules::stairs_with(registry, block, Facing::of_look(look.x, look.z), half)
+            boxel_demo::rules::stairs_with(registry, block, Facing::of_look(look.x, look.z), half)
         }
         BlockModel::FenceGate { .. } => {
             registry.with(block, "facing", Facing::of_look(look.x, look.z).name())
@@ -1847,7 +1847,7 @@ fn main() -> AppExit {
         .map(|timeout| spawn_watchdog(timeout.saturating_add(WATCHDOG_GRACE)));
 
     let generator = options.world.generator(options.seed);
-    let registry = Arc::new(BlockRegistry::default_blocks());
+    let registry = Arc::new(boxel_demo::blocks::registry());
     let store = match options.world_dir.clone() {
         Some(dir) => match open_world(&dir, &registry, generator.name(), &mut options) {
             Ok(store) => Some(store),
@@ -2125,6 +2125,7 @@ mod tests {
                     ("boxel:grass".to_string(), 1),
                 ])),
                 executor: Arc::new(InlineExecutor),
+                registry: Arc::new(boxel_demo::blocks::registry()),
                 ..WorldPlugin::default()
             },
             FluidPlugin,
@@ -2200,7 +2201,7 @@ mod tests {
     fn clicks_break_and_place_the_picked_block() {
         use boxel::window::{ButtonState, KeyboardInput, WindowFocused};
         let mut app = picking_app();
-        let grass = BlockRegistry::default_blocks()
+        let grass = boxel_demo::blocks::registry()
             .by_name("boxel:grass")
             .expect("built-in");
         // The first click only grabs the cursor (the fly camera does it in the same frame,
@@ -2278,7 +2279,7 @@ mod tests {
     #[test]
     fn right_click_uses_a_gate_and_shift_places_on_it() {
         let mut app = picking_app();
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let gate = BlockPos::new(0, 4, 0);
         app.world_mut().resource_mut::<EditQueue>().set_block(
             gate,
@@ -2327,7 +2328,7 @@ mod tests {
     #[test]
     fn placed_water_flows_and_f3_shows_its_level() {
         let mut app = picking_app();
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let water = |level: u8| {
             registry
                 .parse_state(&format!("boxel:water[level={level}]"))
@@ -2847,7 +2848,7 @@ mod tests {
         tap(&mut app, WALK_KEY);
         assert!(walker(&mut app).is_none());
         click(&mut app, MouseButton::Right);
-        let stone = BlockRegistry::default_blocks()
+        let stone = boxel_demo::blocks::registry()
             .by_name("boxel:stone")
             .expect("built-in");
         assert_eq!(block_at(&app, BlockPos::new(0, 4, 0)), Some(stone));
@@ -2855,7 +2856,7 @@ mod tests {
 
     #[test]
     fn placed_slabs_take_the_clicked_half_and_logs_the_clicked_axis() {
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let by = |n: &str| registry.parse_state(n).expect("built-in");
         let hit = |face, y: f64| VoxelHit {
             block: BlockPos::new(0, 0, 0),
@@ -2905,7 +2906,7 @@ mod tests {
 
     #[test]
     fn stairs_and_torches_are_placed_like_minecraft() {
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let by = |n: &str| registry.parse_state(n).expect("built-in");
         let hit = |face, y: f64| VoxelHit {
             block: BlockPos::new(0, 0, 0),
@@ -2986,7 +2987,7 @@ mod tests {
 
     #[test]
     fn a_slab_on_the_free_half_of_a_slab_makes_a_double_slab() {
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let by = |n: &str| registry.parse_state(n).expect("built-in");
         let (bottom, top) = (by("boxel:stone_slab"), by("boxel:stone_slab[type=top]"));
         let double = by("boxel:stone_slab[type=double]");
@@ -3066,7 +3067,7 @@ mod tests {
 
     #[test]
     fn placed_and_broken_blocks_keep_the_water_they_hold() {
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let by = |n: &str| registry.parse_state(n).expect("built-in");
         let (water, flowing) = (by("boxel:water"), by("boxel:water[level=2]"));
         let (dry, wet) = (
@@ -3169,7 +3170,7 @@ mod tests {
         let args: Vec<String> = ["--time", "25:00"].map(String::from).to_vec();
         assert!(parse_options(&args).is_err());
         // Every demo block and every hotbar block exists.
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         for name in LAMPS_DEMO_BLOCKS.iter().chain(&HOTBAR) {
             assert!(registry.by_name(name).is_some(), "{name}");
         }
@@ -3278,7 +3279,7 @@ mod tests {
         };
         let cells = demo_lamp_cells(start, ground).expect("loaded");
         assert_eq!(cells.len(), LAMPS_DEMO_BLOCKS.len());
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         for (pos, name) in cells {
             assert_eq!(pos.y, 4);
             assert_eq!(

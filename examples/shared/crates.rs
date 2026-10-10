@@ -153,7 +153,6 @@ fn crate_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boxel::voxel::BlockRegistry;
     use boxel::world::jobs::InlineExecutor;
     use boxel::world::persist::format::decode_entity;
     use boxel::world::persist::{ChunkStore, MemoryStore, PersistPlugin, WorldStore};
@@ -163,7 +162,7 @@ mod tests {
     /// A headless world on a flat ground (top at y = 4) saved in `backend`, settled around the
     /// origin.
     fn app(backend: &Arc<MemoryStore>) -> App {
-        let registry = Arc::new(BlockRegistry::default_blocks());
+        let registry = Arc::new(boxel_demo::blocks::registry());
         let generator = FlatGenerator::new(vec![
             ("boxel:stone".to_string(), 3),
             ("boxel:grass".to_string(), 1),

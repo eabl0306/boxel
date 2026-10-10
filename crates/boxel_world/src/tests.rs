@@ -13,7 +13,7 @@ use boxel_ecs::prelude::*;
 use boxel_ecs::schedule::{LogLevel, ScheduleBuildSettings};
 use boxel_math::DVec3;
 use boxel_transform::Transform;
-use boxel_voxel::{BlockPos, BlockRegistry, BlockState, CHUNK_SIZE, ChunkPos, MAX_CHUNK_COORD};
+use boxel_voxel::{BlockPos, BlockState, CHUNK_SIZE, ChunkPos, MAX_CHUNK_COORD};
 use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -186,7 +186,7 @@ fn tall_world_app(
     let mut app = App::new();
     app.add_plugins(WorldPlugin {
         generator: Arc::new(generator),
-        registry: Arc::new(BlockRegistry::default_blocks()),
+        registry: Arc::new(boxel_demo::blocks::registry()),
         settings,
         executor,
     });

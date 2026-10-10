@@ -3,9 +3,9 @@
 
 use boxel_math::{DVec3, I64Vec3};
 use boxel_physics::{CollisionTable, LocalBox, TestWorld};
-use boxel_voxel::{BlockPos, BlockRegistry, BlockState};
+use boxel_voxel::{BlockPos, BlockState};
 
-/// `boxel:stone` in `BlockRegistry::default_blocks()`.
+/// `boxel:stone` in `boxel_demo::blocks::registry()`.
 pub const STONE: BlockState = BlockState(1);
 /// `boxel:leaves` (cutout, solid).
 pub const LEAVES: BlockState = BlockState(11);
@@ -15,21 +15,21 @@ pub const WATER: BlockState = BlockState(12);
 /// A stone slab in the lower half of its block (top at 0.5). Slabs are built only here and in
 /// [`top_slab`], so a change in how slab states are named touches one place.
 pub fn bottom_slab() -> BlockState {
-    BlockRegistry::default_blocks()
+    boxel_demo::blocks::registry()
         .parse_state("boxel:stone_slab[type=bottom]")
         .expect("bottom slab")
 }
 
 /// A stone slab in the upper half of its block (from 0.5 to 1).
 pub fn top_slab() -> BlockState {
-    BlockRegistry::default_blocks()
+    boxel_demo::blocks::registry()
         .parse_state("boxel:stone_slab[type=top]")
         .expect("top slab")
 }
 
 /// The collision table of the built-in blocks.
 pub fn table() -> CollisionTable {
-    CollisionTable::from_registry(&BlockRegistry::default_blocks())
+    CollisionTable::from_registry(&boxel_demo::blocks::registry())
 }
 
 /// A player-size box with its origin at the feet: 0.6 x 1.8 x 0.6.

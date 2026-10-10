@@ -42,7 +42,7 @@ impl Harness {
         executor: Arc<dyn JobExecutor>,
         max_in_flight: usize,
     ) -> Self {
-        let registry = Arc::new(BlockRegistry::default_blocks());
+        let registry = Arc::new(boxel_demo::blocks::registry());
         let settings = WorldSettings {
             vertical_bounds: Some(generator.vertical_chunks()),
             interest_budget: Duration::MAX,
@@ -1499,7 +1499,7 @@ fn edits_that_change_what_occludes_unshow_until_published() {
     hold.run_all();
     h.collect();
     assert!(h.map.slots[west].shown() && h.map.slots[east].shown());
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     for id in [west, east] {
         let DataState::Ready(data) = h.map.slots[id].data() else {
             panic!("data");

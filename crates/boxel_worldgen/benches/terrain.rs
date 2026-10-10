@@ -1,14 +1,13 @@
 //! Worldgen benchmarks: `TerrainGenerator::generate` per chunk (surface and uniform), near the
 //! origin and far from it (`*_far`: voxel `2^40`, where the lattice cells leave `i32`).
-use boxel_voxel::{BlockRegistry, BlockState, ChunkKey, ChunkPos};
-use boxel_worldgen::{
-    FlatGenerator, ForestGenerator, OverworldGenerator, TerrainGenerator, WorldGenerator,
-};
+use boxel_demo::worldgen::{ForestGenerator, OverworldGenerator, TerrainGenerator};
+use boxel_voxel::{BlockState, ChunkKey, ChunkPos};
+use boxel_worldgen::{FlatGenerator, WorldGenerator};
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 fn bench(c: &mut Criterion) {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let terrain = TerrainGenerator::default();
     let range = terrain.vertical_chunks();
 

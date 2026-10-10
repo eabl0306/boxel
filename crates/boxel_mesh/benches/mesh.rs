@@ -21,13 +21,14 @@
 //! (ADR 0027), in the states the neighbor rules give them.
 #![expect(clippy::print_stderr, reason = "bench scene statistics")]
 
+use boxel_demo::worldgen::OverworldGenerator;
 use boxel_light::{LightScratch, PaddedLight, compute};
 use boxel_mesh::{AoPolicy, ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher, PaddedChunk};
 use boxel_voxel::{
     BlockModel, BlockRegistry, BlockState, CHUNK_SIZE, ChunkData, ChunkKey, ChunkPos, Face,
     LightTables, LightValue, NEIGHBOR_OFFSETS, rules,
 };
-use boxel_worldgen::{OverworldGenerator, WorldGenerator};
+use boxel_worldgen::WorldGenerator;
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
@@ -221,7 +222,7 @@ fn light_of(n: &Neighborhood, tables: &LightTables) -> PaddedLight {
 }
 
 fn bench(c: &mut Criterion) {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let table = MaterialTable::from_registry(&registry);
     let b = Blocks::new(&registry);
     let surface = [0, 1, 0];

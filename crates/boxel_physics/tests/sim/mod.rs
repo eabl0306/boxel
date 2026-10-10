@@ -121,6 +121,7 @@ impl Sim {
                     base: ChunkPos::containing(BlockPos::from_i64vec3(base)),
                 }),
                 executor: Arc::new(InlineExecutor),
+                registry: Arc::new(boxel_demo::blocks::registry()),
                 ..WorldPlugin::default()
             },
             PhysicsPlugin::default(),

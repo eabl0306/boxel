@@ -138,7 +138,7 @@ fn flood(registry: &Arc<BlockRegistry>, scene: &str) -> Flood {
 }
 
 fn main() {
-    let registry = Arc::new(BlockRegistry::default_blocks());
+    let registry = Arc::new(boxel_demo::blocks::registry());
     let named: Vec<String> = std::env::args()
         .skip(1)
         .filter(|a| SCENES.contains(&a.as_str()))

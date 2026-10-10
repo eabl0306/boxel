@@ -547,7 +547,7 @@ struct Engine {
 impl Engine {
     /// The world around `origin` (the ground's top is `origin.y - 1`) with the viewer there.
     fn new(origin: BlockPos, placed: &[([i64; 3], Cell)]) -> Self {
-        let registry = Arc::new(BlockRegistry::default_blocks());
+        let registry = Arc::new(boxel_demo::blocks::registry());
         let mut app = App::new();
         let placed = placed
             .iter()

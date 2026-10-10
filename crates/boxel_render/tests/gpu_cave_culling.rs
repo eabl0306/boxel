@@ -30,6 +30,7 @@
 //! Failing images are saved under `CARGO_TARGET_TMPDIR/gpu_cave_culling/`.
 #![expect(clippy::print_stderr, reason = "test progress and failure details")]
 use boxel_camera::{Camera, CameraView};
+use boxel_demo::worldgen::OverworldGenerator;
 use boxel_ecs::prelude::Messages;
 use boxel_gfx::{
     AdapterCaps, GlVersion, RgbaImage, Tier, floors, gpu_tests_required, read_texture_rgba8,
@@ -48,7 +49,7 @@ use boxel_world::{
     ChunkMap, ChunkMeshEvent, ChunkMeshResync, ChunkSlot, ChunkViewer, ChunkVisibility, EditQueue,
     VisibilityView, VisibleSet, WorldPlugin, WorldSettings, WorldStats,
 };
-use boxel_worldgen::{OverworldGenerator, WorldGenerator};
+use boxel_worldgen::WorldGenerator;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -184,7 +185,7 @@ impl Scene {
 
 /// Generates, floods the deep caves, puts glass walls in some caves and meshes.
 fn cave_scene() -> Scene {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let generator = OverworldGenerator::default();
     let water = registry.by_name("boxel:water").expect("water");
     let glass = registry.by_name("boxel:glass").expect("glass");
@@ -1211,7 +1212,7 @@ impl TunnelWorld {
         let mut app = boxel_app::App::new();
         app.add_plugins(WorldPlugin {
             generator: Arc::new(Tunnel { end }),
-            registry: Arc::new(BlockRegistry::default_blocks()),
+            registry: Arc::new(boxel_demo::blocks::registry()),
             settings: WorldSettings {
                 max_jobs_in_flight: 4096,
                 interest_budget: Duration::MAX,
@@ -1230,7 +1231,7 @@ impl TunnelWorld {
         Self {
             app,
             steps,
-            registry: BlockRegistry::default_blocks(),
+            registry: boxel_demo::blocks::registry(),
             radius,
             frames: Vec::new(),
             pending: Vec::new(),
@@ -1481,7 +1482,7 @@ fn render_world_frames(
         max_chunk_slots: 4096,
         translucent_sort: TranslucentSort::Inline,
     };
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let mut renderer = VoxelRenderer::new(
         &device,
         &queue,

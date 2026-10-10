@@ -167,7 +167,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         size: (1280, 720),
         radius: 12,
         vertical_radius: ChunkViewer::DEFAULT_VERTICAL_RADIUS,
-        seed: TerrainGenerator::default().seed,
+        seed: boxel_demo::worldgen::DEFAULT_SEED,
         world: WorldChoice::with_world(World::Overworld),
         light: true,
         ao: AoPolicy::default(),
@@ -611,7 +611,7 @@ fn run(
     println!("gpu: {}", gpu.summary_line());
 
     // Block textures (a resource pack is read here, before the world).
-    let registry = Arc::new(BlockRegistry::default_blocks());
+    let registry = Arc::new(boxel_demo::blocks::registry());
     let (textures, report) =
         load_block_textures(&registry, &o.textures).map_err(|e| (EXIT_USAGE, e))?;
     for w in &report.warnings {
@@ -979,7 +979,7 @@ mod tests {
             ]
         );
         // The names are block states of the registry (`edit_cells` parses them).
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         for (name, _) in &o.edits {
             assert!(registry.parse_state(name).is_ok(), "{name}");
         }

@@ -18,7 +18,7 @@ use boxel_voxel::{
 use std::collections::HashSet;
 
 fn registry() -> BlockRegistry {
-    BlockRegistry::default_blocks()
+    boxel_demo::blocks::registry()
 }
 
 fn s(r: &BlockRegistry, name: &str) -> BlockState {

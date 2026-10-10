@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 
 /// The registry under test.
 fn registry() -> BlockRegistry {
-    BlockRegistry::default_blocks()
+    boxel_demo::blocks::registry()
 }
 
 /// Every state of `r` on a grid (the mesh golden's showcase): a sparse grid in the lower half,

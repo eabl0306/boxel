@@ -328,7 +328,7 @@ fn animated_pack_textures_follow_the_tick_on_every_tier() {
         eprintln!("skipping: no adapter");
         return;
     }
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let (textures, report) =
         load_block_textures(&registry, &TextureSource::Pack(animated_pack())).expect("pack");
     assert_eq!((report.from_pack, report.animated), (1, 1), "{report:?}");
@@ -513,7 +513,7 @@ fn an_animated_flow_texture_does_not_scroll_on_any_tier() {
         eprintln!("skipping: no adapter");
         return;
     }
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let mesh = water_block(&registry);
     let packs = [false, true].map(|animated| {
         let (textures, report) =

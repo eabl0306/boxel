@@ -111,8 +111,8 @@ fn decode_matches_get_for_hand_built_packed() {
 
 #[test]
 fn default_registry_ids_shapes_and_faces_are_frozen() {
-    use boxel_voxel::{BlockRegistry, BlockState, Face, RenderShape};
-    let r = BlockRegistry::default_blocks();
+    use boxel_voxel::{BlockState, Face, RenderShape};
+    let r = boxel_demo::blocks::registry();
     // Every state, in id order (ADR 0019: a block's states are contiguous).
     let states = [
         "boxel:air",

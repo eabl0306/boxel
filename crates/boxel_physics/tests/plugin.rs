@@ -21,7 +21,7 @@ use boxel_physics::{
     integrate_velocity, step_body,
 };
 use boxel_transform::Transform;
-use boxel_voxel::{BlockPos, BlockRegistry, BlockState, Face, MAX_BLOCK_COORD, WorldPos};
+use boxel_voxel::{BlockPos, BlockState, Face, MAX_BLOCK_COORD, WorldPos};
 use boxel_world::ChunkMap;
 use common::{STONE, bottom_slab, player, table};
 use sim::{FRAME_144, Impacts, STEP, Sim};
@@ -30,7 +30,7 @@ use std::time::Duration;
 
 /// The same flat ground as a `TestWorld`, around `(0, 0, 0)`.
 fn test_ground() -> TestWorld {
-    let grass = BlockRegistry::default_blocks()
+    let grass = boxel_demo::blocks::registry()
         .by_name("boxel:grass")
         .expect("built-in");
     let mut world = TestWorld::new();

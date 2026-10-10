@@ -2,6 +2,7 @@
 //! force in every storage representation, uniform and 1-bit chunks without emission are served
 //! from their storage (nothing cached), the cache resets on every change, and `may_emit` never
 //! misses an emitter.
+use boxel_demo::blocks::{LAMPS, LAVA_EMISSION};
 use boxel_voxel::*;
 use proptest::prelude::*;
 use std::sync::Arc;
@@ -240,7 +241,7 @@ fn masks_of_every_representation() {
 
 #[test]
 fn uniform_and_one_bit_chunks_need_no_build() {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let tables = LightTables::from_registry(&registry);
     let stone = registry.by_name("boxel:stone").unwrap();
     let full = |m: MaskRows<'_>| m.count() == CHUNK_VOLUME as u32;
@@ -282,7 +283,7 @@ fn uniform_and_one_bit_chunks_need_no_build() {
 
 #[test]
 fn cache_resets_after_set_and_make_mut() {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let tables = LightTables::from_registry(&registry);
     let stone = registry.by_name("boxel:stone").unwrap();
     let dirt = registry.by_name("boxel:dirt").unwrap();
@@ -387,7 +388,7 @@ fn may_emit_is_a_palette_scan() {
 
 #[test]
 fn registry_light_fields_and_validation() {
-    let r = BlockRegistry::default_blocks();
+    let r = boxel_demo::blocks::registry();
     for name in [
         "stone", "dirt", "grass", "sand", "gravel", "snow", "bedrock", "log", "planks",
     ] {
@@ -436,11 +437,11 @@ fn registry_light_fields_and_validation() {
     assert!(!tables.blocks_sky(BlockState::AIR));
     assert_eq!(
         tables.id(),
-        LightTables::from_registry(&BlockRegistry::default_blocks()).id()
+        LightTables::from_registry(&boxel_demo::blocks::registry()).id()
     );
 
     // An emitter appended after the built-in content.
-    let mut b = BlockRegistryBuilder::with_default_blocks();
+    let mut b = boxel_demo::blocks::builder();
     let tex = TextureId(0);
     let def = |name: &str, shape, emission, light_opacity| BlockDef {
         name: format!("test:{name}"),
@@ -477,6 +478,6 @@ fn registry_light_fields_and_validation() {
     assert_eq!(tables.max_partial_opacity(), 9);
     assert_ne!(
         tables.id(),
-        LightTables::from_registry(&BlockRegistry::default_blocks()).id()
+        LightTables::from_registry(&boxel_demo::blocks::registry()).id()
     );
 }

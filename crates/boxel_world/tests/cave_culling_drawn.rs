@@ -19,6 +19,7 @@
 //! chunk on the way is not drawn as it is. Without [`XRAY`] (a search that only opens such a
 //! chunk) rays reach hidden chunks: the tests check that too, so they prove something.
 use boxel_app::App;
+use boxel_demo::worldgen::OverworldGenerator;
 use boxel_ecs::prelude::Messages;
 use boxel_math::projection::{look_to, perspective_infinite_reverse};
 use boxel_math::{DVec3, Frustum, I64Vec3, Vec3};
@@ -32,7 +33,7 @@ use boxel_world::{
     ChunkMap, ChunkMeshEvent, ChunkViewer, ChunkVisibility, DataState, EditQueue, MeshState,
     VisibilityView, VisibleSet, WorldPlugin, WorldSettings, WorldStats,
 };
-use boxel_worldgen::{OverworldGenerator, WorldGenerator};
+use boxel_worldgen::WorldGenerator;
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex};
@@ -357,7 +358,7 @@ impl Rig {
         let mut app = App::new();
         app.add_plugins(WorldPlugin {
             generator: Arc::new(generator),
-            registry: Arc::new(BlockRegistry::default_blocks()),
+            registry: Arc::new(boxel_demo::blocks::registry()),
             settings: WorldSettings {
                 max_jobs_in_flight: 4096,
                 interest_budget: Duration::MAX,
@@ -374,7 +375,7 @@ impl Rig {
             app,
             steps,
             drawn: Drawn::default(),
-            registry: BlockRegistry::default_blocks(),
+            registry: boxel_demo::blocks::registry(),
         }
     }
 
@@ -542,7 +543,7 @@ fn edit_batch_members_published_apart_hide_nothing() {
     let edits: [(&str, BlockState); 2] = [
         (
             "close",
-            BlockRegistry::default_blocks()
+            boxel_demo::blocks::registry()
                 .by_name("boxel:stone")
                 .expect("stone"),
         ),
@@ -643,7 +644,7 @@ fn streaming_in_any_order_hides_nothing() {
 /// scrambled order, from an open voxel deep in a cave, looking along the axes and up and down.
 #[test]
 fn streaming_overworld_caves_hides_nothing() {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let generator = OverworldGenerator::default();
     // An open voxel with open neighbors in chunk (0, -10, 0), a cave chunk deep under the
     // surface (the benches use it).
@@ -703,7 +704,7 @@ fn streaming_overworld_caves_hides_nothing() {
 /// The eye is in the tunnel, which ends where the tests say, and the pocket is closed.
 #[test]
 fn the_scene_is_where_the_tests_think() {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let tunnel = Tunnel { end: 80 };
     let at = |p: BlockPos| {
         let (chunk, local) = p.split();

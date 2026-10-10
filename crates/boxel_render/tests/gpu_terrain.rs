@@ -40,6 +40,7 @@
 //! `GPU_TERRAIN_SAVE=1`).
 #![expect(clippy::print_stderr, reason = "test progress and failure details")]
 use boxel_camera::{Camera, CameraView};
+use boxel_demo::worldgen::TerrainGenerator;
 use boxel_gfx::{
     AdapterCaps, GlVersion, RgbaImage, Tier, floors, gpu_tests_required, read_texture_rgba8,
     run_in_error_scopes, submit_and_wait, tier_request,
@@ -51,7 +52,7 @@ use boxel_render::{
 };
 use boxel_transform::Transform;
 use boxel_voxel::{BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, NEIGHBOR_OFFSETS};
-use boxel_worldgen::{TerrainGenerator, WorldGenerator};
+use boxel_worldgen::WorldGenerator;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -195,7 +196,7 @@ impl Scene {
 
 /// Generates the 8x8 data columns and meshes the inner 6x6 with `boxel_mesh::Mesher`.
 fn terrain_scene() -> Scene {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let generator = TerrainGenerator::default();
     let vertical = generator.vertical_chunks();
     let mut data: BTreeMap<ChunkPos, ChunkData> = BTreeMap::new();
@@ -1024,7 +1025,7 @@ fn lit_scene(shift: I64Vec3, light: bool) -> LitScene {
     use boxel_light::{LightInput, LightScratch, PaddedLight, SkyInput, SkyTile};
     use boxel_voxel::{CHUNK_VOLUME, LightTables, LocalPos};
 
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let blocks = LitBlocks::new(&registry);
     let tables = LightTables::from_registry(&registry);
     let chunk_shift = shift / 32;

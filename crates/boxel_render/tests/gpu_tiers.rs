@@ -160,7 +160,7 @@ fn adapter_label(caps: &AdapterCaps) -> String {
 
 // ---------------------------------------------------------------- scenes
 
-/// Blocks of the test world (`BlockRegistry::default_blocks` ids).
+/// Blocks of the test world (`boxel_demo::blocks::registry` ids).
 struct Blocks {
     stone: BlockState,
     dirt: BlockState,
@@ -1169,7 +1169,7 @@ fn tiers_render_identically() {
         eprintln!("skipping: no adapter");
         return;
     }
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let terrain = heightfield(&registry);
     assert!(terrain.len() >= 20, "{} terrain chunks", terrain.len());
     assert!(
@@ -1401,7 +1401,7 @@ fn light_indices_past_the_palette_read_open_sky_on_every_tier() {
         eprintln!("skipping: no adapter");
         return;
     }
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let stone = registry
         .textures()
         .iter()
@@ -1538,7 +1538,7 @@ fn pack_textures_render_on_every_tier() {
         return;
     }
     let pack = synthetic_pack();
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let (textures, report) =
         boxel_render::load_block_textures(&registry, &boxel_render::TextureSource::Pack(pack))
             .expect("synthetic pack");

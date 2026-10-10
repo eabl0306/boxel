@@ -9,7 +9,7 @@ use proptest::prelude::*;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-static REGISTRY: LazyLock<BlockRegistry> = LazyLock::new(BlockRegistry::default_blocks);
+static REGISTRY: LazyLock<BlockRegistry> = LazyLock::new(boxel_demo::blocks::registry);
 
 /// Blocks in a hash map; the missing ones are not loaded.
 struct World(HashMap<BlockPos, BlockState>);

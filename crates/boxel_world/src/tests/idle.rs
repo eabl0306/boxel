@@ -17,7 +17,7 @@ use boxel_app::{App, IdleWanted, IdleWork, PreUpdate};
 use boxel_ecs::prelude::*;
 use boxel_light::ChunkLight;
 use boxel_mesh::ChunkMesh;
-use boxel_voxel::{BlockPos, BlockRegistry, ChunkPos};
+use boxel_voxel::{BlockPos, ChunkPos};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -466,7 +466,7 @@ fn the_first_idle_step_applies_a_renderer_resync_once() {
     assert!(matches!(slot_at(&app, pos).mesh(), MeshState::Ready { .. }));
     // Dirt for stone: what occludes stays the same, so the chunk stays shown while its remesh
     // is held.
-    let dirt = BlockRegistry::default_blocks()
+    let dirt = boxel_demo::blocks::registry()
         .by_name("boxel:dirt")
         .expect("dirt");
     app.world_mut()

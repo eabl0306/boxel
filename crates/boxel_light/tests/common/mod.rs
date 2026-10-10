@@ -4,9 +4,9 @@
 use boxel_light::box_light::{chunk_index, tile_index};
 use boxel_light::{LightInput, SkyInput, SkyTile};
 use boxel_voxel::{
-    BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockRegistryBuilder, BlockState,
-    CHUNK_AREA, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, ChunkPos, FaceTextures, LightTables, LocalPos,
-    Occupancy, RenderShape, TextureId,
+    BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SIZE,
+    CHUNK_VOLUME, ChunkData, ChunkPos, FaceTextures, LightTables, LocalPos, Occupancy, RenderShape,
+    TextureId,
 };
 
 /// Small deterministic generator (`SplitMix64`).
@@ -53,7 +53,7 @@ pub struct Blocks {
 /// The built-in blocks plus glass, three opaque lamps, two clear emitters and (with `heavy`)
 /// smoke of opacity 5.
 pub fn test_registry(heavy: bool) -> (BlockRegistry, Blocks) {
-    let mut b = BlockRegistryBuilder::with_default_blocks();
+    let mut b = boxel_demo::blocks::builder();
     let tex = FaceTextures::all(TextureId(0));
     let mut add = |name: &str, shape, solid, emission, light_opacity| {
         b.add_block(BlockDef {

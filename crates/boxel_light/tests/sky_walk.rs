@@ -3,15 +3,14 @@
 //! origin and at x = z = 2^40; the limit cap; `i64::MIN` for open columns; the column rescan
 //! after an edit; an edit far above the generator changes only its own column (the floor is
 //! the world's); tiles without a floor; and generators without a top.
+use boxel_demo::worldgen::{ForestGenerator, OverworldGenerator, TerrainGenerator};
 use boxel_light::sky_tile::{DEFAULT_WALK_LIMIT, GeneratorTop, walk, walk_floor};
 use boxel_light::{LayerData, Rescan, SkyTile};
 use boxel_voxel::{
     BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, LightTables, LocalPos,
     MAX_BLOCK_COORD, MAX_CHUNK_COORD,
 };
-use boxel_worldgen::{
-    FlatGenerator, ForestGenerator, OverworldGenerator, TerrainGenerator, WorldGenerator,
-};
+use boxel_worldgen::{FlatGenerator, WorldGenerator};
 use std::collections::HashMap;
 
 /// Generated chunks of one chunk column, by layer.
@@ -107,7 +106,7 @@ fn walk_generated(
 
 /// Walks and brute-forces the tile; returns it.
 fn check(generator: &dyn WorldGenerator, column: (i64, i64), limit: u32) -> SkyTile {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let tables = LightTables::from_registry(&registry);
     let tile = walk_generated(generator, &registry, &tables, column, limit);
     let top = GeneratorTop::of(&generator.vertical_chunks())
@@ -219,7 +218,7 @@ fn open_columns_reach_the_void() {
 
 #[test]
 fn rescan_after_removing_a_top() {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let tables = LightTables::from_registry(&registry);
     let stone = registry.by_name("boxel:stone").unwrap();
     let leaves = registry.by_name("boxel:leaves").unwrap();
@@ -276,7 +275,7 @@ fn rescan_after_removing_a_top() {
 #[test]
 fn an_edit_far_above_changes_only_its_column() {
     let g = OverworldGenerator::default();
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let tables = LightTables::from_registry(&registry);
     let stone = registry.by_name("boxel:stone").unwrap();
     let range = g.vertical_chunks();
@@ -329,7 +328,7 @@ fn an_edit_far_above_changes_only_its_column() {
 #[test]
 fn air_until_skips_long_gaps() {
     let g = ForestGenerator::default();
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let tables = LightTables::from_registry(&registry);
     let stone = registry.by_name("boxel:stone").unwrap();
     let range = g.vertical_chunks();
@@ -390,7 +389,7 @@ fn air_until_skips_long_gaps() {
 
 #[test]
 fn tiles_without_a_floor_rescan_and_walk_to_the_world_bottom() {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let tables = LightTables::from_registry(&registry);
     let stone = registry.by_name("boxel:stone").unwrap();
     // A hand-made tile without a floor, in a positive layer: the top of column (1, 2) at

@@ -202,7 +202,7 @@ impl Setup {
 
     /// Opens the world and starts an app with the viewer at `at`, settled.
     fn start(&self, at: BlockPos) -> (App, Entity) {
-        let registry = Arc::new(BlockRegistry::default_blocks());
+        let registry = Arc::new(boxel_demo::blocks::registry());
         let generator = Ground { level: self.level };
         let store = WorldStore::open(Arc::clone(&self.backend), &registry, generator.name())
             .expect("the world opens");
@@ -686,7 +686,7 @@ fn entities_are_saved_in_the_moment_of_the_chunks_and_ticks() {
     let e = app.world_mut().spawn((Saved::new(), thing)).id();
     settle(&mut app);
     let edited = at(o, 5, 0, 5);
-    let stone = BlockRegistry::default_blocks()
+    let stone = boxel_demo::blocks::registry()
         .by_name("boxel:stone")
         .unwrap();
     app.world_mut()

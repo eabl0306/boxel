@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn the_smoke_quads_have_their_own_light_entries() {
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let mesh = smoke_mesh(&registry);
         assert_eq!(mesh.palette.len(), 2);
         // Opaque bucket first (first instance 0), then the cutout one (first instance 1).

@@ -11,7 +11,7 @@
 //! `cargo bench -p boxel_world --bench neighbor_rules` (release; never while something compiles).
 #![expect(clippy::print_stderr, reason = "bench scene statistics")]
 
-use boxel_voxel::{BlockPos, BlockRegistry, BlockState};
+use boxel_voxel::{BlockPos, BlockState};
 use boxel_world::{BlockEdit, NeighborRules};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -34,7 +34,7 @@ fn batch(cells: impl Fn(i64, i64) -> Vec<(i64, BlockState)>) -> Vec<BlockEdit> {
 }
 
 fn bench(c: &mut Criterion) {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let rules = NeighborRules::from_registry(&registry);
     let s = |name: &str| registry.parse_state(name).expect(name);
     let stone = s("boxel:stone");

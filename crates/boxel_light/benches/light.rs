@@ -15,11 +15,12 @@
 
 mod scenes;
 
+use boxel_demo::worldgen::OverworldGenerator;
 use boxel_light::box_light::tile_index;
 use boxel_light::sky_tile::{DEFAULT_WALK_LIMIT, GeneratorTop, walk, walk_floor};
 use boxel_light::{LayerData, LightPath, LightScratch, PaddedLight, compute};
 use boxel_voxel::{ChunkData, ChunkKey, ChunkPos, LightTables};
-use boxel_worldgen::{OverworldGenerator, WorldGenerator};
+use boxel_worldgen::WorldGenerator;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use scenes::{
     Neighborhood, generated_tile, lamp_cave, lamp_registry, surface_origin, trees_and_entrance,

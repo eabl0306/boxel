@@ -3,15 +3,15 @@
 //! near the origin with trees and a cave entrance, and a cave lit by colored lamps.
 #![allow(dead_code, reason = "each bench uses a subset of the scenes")]
 
+use boxel_demo::worldgen::OverworldGenerator;
 use boxel_light::box_light::tile_index;
 use boxel_light::sky_tile::{DEFAULT_WALK_LIMIT, GeneratorTop, walk, walk_floor};
 use boxel_light::{LayerData, LightInput, SkyInput, SkyTile};
 use boxel_voxel::{
-    BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockRegistryBuilder, BlockState,
-    CHUNK_VOLUME, ChunkData, ChunkKey, ChunkPos, FaceTextures, LightTables, LocalPos, RenderShape,
-    TextureId,
+    BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData,
+    ChunkKey, ChunkPos, FaceTextures, LightTables, LocalPos, RenderShape, TextureId,
 };
-use boxel_worldgen::{OverworldGenerator, WorldGenerator};
+use boxel_worldgen::WorldGenerator;
 
 /// The overworld's sky tile of chunk column `(cx, cz)`, every layer generated privately.
 pub fn generated_tile(
@@ -187,7 +187,7 @@ pub fn surface_origin(
 
 /// The default blocks plus three opaque lamps: orange, red, blue.
 pub fn lamp_registry() -> (BlockRegistry, [BlockState; 3]) {
-    let mut b = BlockRegistryBuilder::with_default_blocks();
+    let mut b = boxel_demo::blocks::builder();
     let mut lamp = |name: &str, emission| {
         b.add_block(BlockDef {
             name: format!("bench:{name}"),

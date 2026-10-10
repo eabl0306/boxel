@@ -72,6 +72,7 @@
 #![expect(clippy::print_stdout, reason = "bench setup output")]
 
 use boxel_app::{App, FixedPostUpdate, FixedTime, RunFixedMainLoop};
+use boxel_demo::worldgen::{ForestGenerator, OverworldGenerator};
 use boxel_ecs::message::Messages;
 use boxel_ecs::prelude::*;
 use boxel_ecs::schedule::MultiThreadedExecutor;
@@ -85,13 +86,13 @@ use boxel_physics::{
     raycast_voxels,
 };
 use boxel_transform::Transform;
-use boxel_voxel::{BlockPos, BlockRegistry, BlockState, CHUNK_SHIFT, ChunkPos, LocalPos, WorldPos};
+use boxel_voxel::{BlockPos, BlockState, CHUNK_SHIFT, ChunkPos, LocalPos, WorldPos};
 use boxel_world::jobs::InlineExecutor;
 use boxel_world::{
     ChunkDataEvent, ChunkMap, ChunkViewer, DataState, EditQueue, WorldPlugin, WorldSettings,
     WorldStats,
 };
-use boxel_worldgen::{ForestGenerator, OverworldGenerator, WorldGenerator};
+use boxel_worldgen::WorldGenerator;
 use criterion::measurement::WallTime;
 use criterion::{BenchmarkGroup, Criterion, criterion_group, criterion_main};
 use std::collections::BTreeSet;
@@ -127,6 +128,7 @@ fn streamed_with(
     app.add_plugins(WorldPlugin {
         generator,
         executor: Arc::new(InlineExecutor),
+        registry: Arc::new(boxel_demo::blocks::registry()),
         ..WorldPlugin::default()
     });
     for &(at, radius, vertical) in viewers {
@@ -170,7 +172,7 @@ fn streamed_with(
 /// diagonal ray at `x = z`).
 fn fence_every_chunk(app: &mut App) {
     let start = Instant::now();
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let fence = registry.parse_state("boxel:oak_fence").expect("fence");
     let table = CollisionTable::from_registry(&registry);
     assert!(table.is_tall(fence));
@@ -229,7 +231,7 @@ fn player() -> LocalBox {
 }
 
 fn benches(c: &mut Criterion) {
-    let table = CollisionTable::from_registry(&BlockRegistry::default_blocks());
+    let table = CollisionTable::from_registry(&boxel_demo::blocks::registry());
     let cfg = SweepConfig::default();
     let forest = streamed(
         Arc::new(ForestGenerator::default()),
@@ -458,6 +460,7 @@ fn physics_app_with(radius: u32) -> App {
         WorldPlugin {
             generator: Arc::new(ForestGenerator::default()),
             executor: Arc::new(InlineExecutor),
+            registry: Arc::new(boxel_demo::blocks::registry()),
             ..WorldPlugin::default()
         },
         PhysicsPlugin::default(),
@@ -679,7 +682,7 @@ fn turn(app: &mut App, tick: u64) {
 }
 
 fn tick_benches(c: &mut Criterion) {
-    let table = CollisionTable::from_registry(&BlockRegistry::default_blocks());
+    let table = CollisionTable::from_registry(&boxel_demo::blocks::registry());
     let mut app = physics_app();
     // The targets are for one thread.
     app.world_mut()
@@ -908,7 +911,7 @@ fn bench_steps(group: &mut BenchmarkGroup<'_, WallTime>, name: &str, app: &mut A
 }
 
 fn scale_benches(c: &mut Criterion) {
-    let table = CollisionTable::from_registry(&BlockRegistry::default_blocks());
+    let table = CollisionTable::from_registry(&boxel_demo::blocks::registry());
     let mut group = c.benchmark_group("scale");
 
     // 10 000 bodies, 9000 of them items that come to rest and sleep.
@@ -1133,9 +1136,9 @@ fn scale_benches(c: &mut Criterion) {
 /// step-up, a collision ray and a tick of 1000 bodies in worlds with a fence in every chunk
 /// (off their paths, [`fence_every_chunk`]), where the cells under what they cross are read.
 fn fenced_benches(c: &mut Criterion) {
-    let table = CollisionTable::from_registry(&BlockRegistry::default_blocks());
+    let table = CollisionTable::from_registry(&boxel_demo::blocks::registry());
     let cfg = SweepConfig::default();
-    let fence = BlockRegistry::default_blocks()
+    let fence = boxel_demo::blocks::registry()
         .parse_state("boxel:oak_fence")
         .expect("fence");
     let forest = streamed_with(

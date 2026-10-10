@@ -5,7 +5,7 @@ use boxel_app::{App, First, FixedPostUpdate, FixedTime, Time, TimePlugin, TimeSy
 use boxel_ecs::prelude::*;
 use boxel_math::DVec3;
 use boxel_transform::Transform;
-use boxel_voxel::{BlockPos, BlockRegistry, BlockState, ChunkPos};
+use boxel_voxel::{BlockPos, BlockState, ChunkPos};
 use boxel_world::jobs::InlineExecutor;
 use boxel_world::{
     BlockChanged, ChunkDataEvent, ChunkMap, ChunkViewer, DataState, EditQueue, WorldPlugin,
@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// `boxel:stone` in `BlockRegistry::default_blocks()`.
+/// `boxel:stone` in `boxel_demo::blocks::registry()`.
 const STONE: BlockState = BlockState(1);
 
 /// Every world message read in `Update` after the world's systems, in order.
@@ -44,7 +44,7 @@ fn app(x: f64, z: f64) -> (App, Entity) {
             ("boxel:stone".to_string(), 3),
             ("boxel:grass".to_string(), 1),
         ])),
-        registry: Arc::new(BlockRegistry::default_blocks()),
+        registry: Arc::new(boxel_demo::blocks::registry()),
         executor: Arc::new(InlineExecutor),
         ..WorldPlugin::default()
     })
@@ -302,7 +302,7 @@ fn fixed_app() -> App {
                 ("boxel:stone".to_string(), 3),
                 ("boxel:grass".to_string(), 1),
             ])),
-            registry: Arc::new(BlockRegistry::default_blocks()),
+            registry: Arc::new(boxel_demo::blocks::registry()),
             executor: Arc::new(InlineExecutor),
             ..WorldPlugin::default()
         },

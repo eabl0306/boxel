@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 const OPTIONS: MeshOptions = MeshOptions::with_ao(AoPolicy::BakedLitOnly);
 
 fn registry() -> (BlockRegistry, MaterialTable) {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let table = MaterialTable::from_registry(&registry);
     (registry, table)
 }

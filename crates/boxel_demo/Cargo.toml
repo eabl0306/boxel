@@ -15,6 +15,7 @@ boxel_worldgen.workspace = true
 boxel_pack.workspace = true
 
 [dev-dependencies]
+glam.workspace = true
 proptest.workspace = true
 criterion.workspace = true
 

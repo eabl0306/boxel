@@ -453,7 +453,6 @@ impl SplitMix64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boxel_voxel::BlockRegistry;
 
     fn spec(name: &str, pattern: TexturePattern) -> TextureSpec {
         TextureSpec {
@@ -486,7 +485,7 @@ mod tests {
 
     #[test]
     fn sizes_match_the_layer_major_mip_chain() {
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let specs = registry.textures();
         let data = generate_block_textures(specs);
         assert_eq!(data.layers as usize, specs.len());
@@ -519,7 +518,7 @@ mod tests {
 
     #[test]
     fn leaves_alpha_is_binary_in_every_mip() {
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let specs = registry.textures();
         let data = generate_block_textures(specs);
         let mut leaves_layers = 0;
@@ -648,7 +647,7 @@ mod tests {
         }
         // the procedural leaves and grass keep their coverage at 0.5: their mips do not change
         // (the poppy and the torch, thinner, gain a texel or two in their small mips)
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         for spec in registry
             .textures()
             .iter()

@@ -302,6 +302,7 @@ pub fn look(path: &[DVec3], t: f64) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boxel_demo::worldgen::OverworldGenerator;
 
     #[test]
     fn erosion_keeps_voxels_with_air_on_every_side() {
@@ -342,7 +343,7 @@ mod tests {
     /// path of face neighbors that all keep the clearance.
     #[test]
     fn the_overworld_has_a_cave_near_the_old_underground_camera() {
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let generator = OverworldGenerator::default();
         let cave = find(
             &generator,

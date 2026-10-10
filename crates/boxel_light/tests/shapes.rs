@@ -2,10 +2,10 @@
 //! like slabs (they stop direct sky), fences and torches stop nothing; and of ADR 0027: walls and
 //! fence gates stop nothing either, but a wall holding water stops direct sky.
 
+use boxel_demo::blocks::TORCH_EMISSION;
 use boxel_light::oracle::OracleWorld;
 use boxel_voxel::{
     BlockRegistry, BlockState, ChunkData, ChunkPos, LightTables, LightValue, LocalPos,
-    TORCH_EMISSION,
 };
 
 /// The solved light of one chunk of air with `blocks`, its column tops from the blocks (sky
@@ -29,7 +29,7 @@ fn solve(registry: &BlockRegistry, blocks: &[([u32; 3], &str)]) -> impl Fn([u32;
 
 #[test]
 fn torches_glow_warm_white_at_level_14() {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     // A torch under a stone roof that covers the whole chunk (no sky below it).
     let mut blocks: Vec<([u32; 3], &str)> = Vec::new();
     for x in 0..32 {
@@ -57,7 +57,7 @@ fn torches_glow_warm_white_at_level_14() {
 
 #[test]
 fn stairs_pass_light_like_slabs_and_fences_pass_sky() {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let light = solve(
         &registry,
         &[
@@ -77,7 +77,7 @@ fn stairs_pass_light_like_slabs_and_fences_pass_sky() {
 
 #[test]
 fn walls_and_gates_pass_sky_like_fences() {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let light = solve(
         &registry,
         &[

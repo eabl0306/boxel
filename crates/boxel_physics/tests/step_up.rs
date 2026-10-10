@@ -993,7 +993,7 @@ fn a_character_steps_onto_a_low_static_box_at_any_frame_rate() {
 /// block at a time, and their full back stops it.
 #[test]
 fn a_staircase_of_stairs_is_walked_up() {
-    let registry = boxel_voxel::BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let east = registry
         .parse_state("boxel:stone_stairs[facing=east]")
         .unwrap();

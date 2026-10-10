@@ -15,13 +15,14 @@
 //!   generator's 6 layers, every layer wanted) with unlimited budgets, comparable with M0's
 //!   full recompute.
 use boxel_app::App;
+use boxel_demo::worldgen::TerrainGenerator;
 use boxel_ecs::prelude::*;
 use boxel_math::DVec3;
 use boxel_transform::Transform;
 use boxel_voxel::CHUNK_SIZE;
 use boxel_world::jobs::{JobExecutor, TaskPoolExecutor};
 use boxel_world::{ChunkViewer, WorldPlugin, WorldSettings, WorldStats};
-use boxel_worldgen::{TerrainGenerator, WorldGenerator};
+use boxel_worldgen::WorldGenerator;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -89,7 +90,7 @@ impl World {
             generator: Arc::new(generator),
             settings,
             executor: jobs.clone(),
-            ..WorldPlugin::default()
+            registry: Arc::new(boxel_demo::blocks::registry()),
         });
         // Chunk (0, 2, 0): the surface layer (y = 64..95).
         let chunk = [0, 2, 0];

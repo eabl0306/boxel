@@ -38,7 +38,6 @@ use boxel::ecs::prelude::*;
 use boxel::ecs::schedule::{LogLevel, ScheduleBuildSettings};
 use boxel::math::DVec3;
 use boxel::transform::Transform;
-use boxel::voxel::BlockRegistry;
 use boxel::voxel::{BlockPos, ChunkPos};
 use boxel::window::{ButtonInput, InputPlugin, KeyCode};
 use boxel::world::jobs::InlineExecutor;
@@ -71,13 +70,15 @@ fn strict_app() -> App {
         FlyCameraPlugin,
         WorldPlugin {
             executor: Arc::new(InlineExecutor),
+            generator: Arc::new(boxel_demo::worldgen::TerrainGenerator::default()),
+            registry: Arc::new(boxel_demo::blocks::registry()),
             ..WorldPlugin::default()
         },
         DaylightPlugin,
     ));
     let store = WorldStore::open(
         Arc::new(MemoryStore::new()),
-        &BlockRegistry::default_blocks(),
+        &boxel_demo::blocks::registry(),
         "terrain",
     )
     .expect("an empty world opens");

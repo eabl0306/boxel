@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 /// The registry under test.
 fn registry() -> BlockRegistry {
-    BlockRegistry::default_blocks()
+    boxel_demo::blocks::registry()
 }
 
 /// The texture source of the pack at `dir`.

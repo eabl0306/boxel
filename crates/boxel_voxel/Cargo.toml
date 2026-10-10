@@ -14,6 +14,8 @@ foldhash.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# The example content (#48), for tests, benches and examples only.
+boxel_demo.workspace = true
 proptest.workspace = true
 criterion.workspace = true
 

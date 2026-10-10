@@ -251,6 +251,7 @@ dependencies = [
  "boxel_app",
  "boxel_camera",
  "boxel_debug",
+ "boxel_demo",
  "boxel_diagnostic",
  "boxel_ecs",
  "boxel_gfx",
@@ -316,6 +317,7 @@ dependencies = [
  "boxel_voxel",
  "boxel_worldgen",
  "criterion",
+ "glam",
  "proptest",
 ]
 
@@ -400,6 +402,7 @@ dependencies = [
 name = "boxel_light"
 version = "0.1.0-dev"
 dependencies = [
+ "boxel_demo",
  "boxel_light",
  "boxel_voxel",
  "boxel_worldgen",
@@ -443,6 +446,7 @@ name = "boxel_mesh"
 version = "0.1.0-dev"
 dependencies = [
  "binary-greedy-meshing",
+ "boxel_demo",
  "boxel_light",
  "boxel_voxel",
  "boxel_worldgen",
@@ -467,6 +471,7 @@ name = "boxel_physics"
 version = "0.1.0-dev"
 dependencies = [
  "boxel_app",
+ "boxel_demo",
  "boxel_diagnostic",
  "boxel_ecs",
  "boxel_math",
@@ -489,6 +494,7 @@ version = "0.1.0-dev"
 dependencies = [
  "boxel_app",
  "boxel_camera",
+ "boxel_demo",
  "boxel_diagnostic",
  "boxel_ecs",
  "boxel_gfx",
@@ -563,6 +569,7 @@ name = "boxel_voxel"
 version = "0.1.0-dev"
 dependencies = [
  "bitflags 2.13.2",
+ "boxel_demo",
  "criterion",
  "foldhash",
  "glam",
@@ -587,6 +594,7 @@ version = "0.1.0-dev"
 dependencies = [
  "bitflags 2.13.2",
  "boxel_app",
+ "boxel_demo",
  "boxel_diagnostic",
  "boxel_ecs",
  "boxel_light",
@@ -610,6 +618,7 @@ dependencies = [
 name = "boxel_worldgen"
 version = "0.1.0-dev"
 dependencies = [
+ "boxel_demo",
  "boxel_voxel",
  "criterion",
 ]

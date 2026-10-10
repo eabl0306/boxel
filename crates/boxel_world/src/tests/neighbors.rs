@@ -6,7 +6,7 @@ use crate::tests::support::LayerGen;
 use crate::{BlockChanged, ChunkMap, EditQueue, NeighborRules};
 use boxel_app::{App, Update};
 use boxel_ecs::prelude::*;
-use boxel_voxel::{BlockPos, BlockRegistry, BlockState, ChunkPos};
+use boxel_voxel::{BlockPos, BlockState, ChunkPos};
 use std::sync::Arc;
 
 /// Every `BlockChanged` read in `Update` after the world's systems.
@@ -32,7 +32,7 @@ fn app() -> App {
 }
 
 fn state(name: &str) -> BlockState {
-    BlockRegistry::default_blocks().parse_state(name).unwrap()
+    boxel_demo::blocks::registry().parse_state(name).unwrap()
 }
 
 fn edit(app: &mut App, edits: &[(BlockPos, &str)]) -> Vec<BlockChanged> {
@@ -48,7 +48,7 @@ fn edit(app: &mut App, edits: &[(BlockPos, &str)]) -> Vec<BlockChanged> {
 }
 
 fn at(app: &App, pos: BlockPos) -> String {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let s = app.world().resource::<ChunkMap>().block_at(pos).unwrap();
     registry.state_name(s).to_string()
 }
@@ -170,7 +170,7 @@ fn walls_and_gates_follow_their_neighbors() {
 }
 
 fn app_property(app: &App, pos: BlockPos, property: &str) -> String {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let s = app.world().resource::<ChunkMap>().block_at(pos).unwrap();
     registry.property(s, property).unwrap().to_string()
 }

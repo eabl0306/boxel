@@ -1,6 +1,7 @@
 //! Stairs, fences and torches (ADR 0020): their states, boxes, collision and the neighbor rules
 //! that derive stair shapes, fence sides and torch supports.
 
+use boxel_demo::blocks::TORCH_EMISSION;
 use boxel_voxel::rules::{
     fence_connects, fence_rule, is_sturdy, stair_shape, stairs_rule, supports_center, torch_rule,
     wall_torch_rule,
@@ -9,12 +10,11 @@ use boxel_voxel::shapes::{stair_boxes, wall_torch_box};
 use boxel_voxel::{
     BlockCollision, BlockModel, BlockRegistry, BlockState, CollisionBox, Face, Facing, FenceSides,
     MAX_COLLISION_HEIGHT, MAX_MODEL_BOXES, ModelBox, RenderShape, SlabHalf, StairShape, StateFlags,
-    TORCH_EMISSION,
 };
 use std::collections::HashSet;
 
 fn registry() -> BlockRegistry {
-    BlockRegistry::default_blocks()
+    boxel_demo::blocks::registry()
 }
 
 fn s(r: &BlockRegistry, name: &str) -> BlockState {

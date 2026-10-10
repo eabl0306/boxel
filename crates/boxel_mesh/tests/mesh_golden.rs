@@ -8,14 +8,14 @@
 #[path = "../../boxel_voxel/tests/golden/mod.rs"]
 mod golden;
 
+use boxel_demo::worldgen::{
+    ForestGenerator, OverworldGenerator, OverworldSettings, TerrainGenerator, TerrainSettings,
+};
 use boxel_mesh::{MaterialTable, MeshInput, MeshOptions, Mesher};
 use boxel_voxel::{
     BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, Face, LocalPos, NEIGHBOR_OFFSETS,
 };
-use boxel_worldgen::{
-    FlatGenerator, ForestGenerator, OverworldGenerator, OverworldSettings, TerrainGenerator,
-    TerrainSettings, WorldGenerator,
-};
+use boxel_worldgen::{FlatGenerator, WorldGenerator};
 use std::fmt::Write as _;
 
 /// The seed of the generated worlds (the examples' default).
@@ -23,7 +23,7 @@ const SEED: u64 = 0x00b0_7e1d;
 
 /// The registry under test.
 fn registry() -> BlockRegistry {
-    BlockRegistry::default_blocks()
+    boxel_demo::blocks::registry()
 }
 
 /// The generators: the examples' flat world, the terrain, the forest and the overworld with its

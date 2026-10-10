@@ -8,11 +8,11 @@ use boxel_physics::{
     CollisionShape, CollisionTable, LocalBox, RayResult, SweepConfig, TestWorld, VoxelFilter,
     move_box, raycast_voxels,
 };
-use boxel_voxel::{BlockPos, BlockRegistry, BlockState, Face, WorldPos};
+use boxel_voxel::{BlockPos, BlockState, Face, WorldPos};
 use common::{Rng, STONE, WATER, at, fill, table};
 
 fn state(name: &str) -> BlockState {
-    BlockRegistry::default_blocks().parse_state(name).unwrap()
+    boxel_demo::blocks::registry().parse_state(name).unwrap()
 }
 
 fn bottom() -> BlockState {

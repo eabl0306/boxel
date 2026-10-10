@@ -10,8 +10,8 @@ use boxel_mesh::{
     reference_visible_faces,
 };
 use boxel_voxel::{
-    Axis, BlockModel, BlockRegistry, Face, Facing, FenceSides, LightValue, ModelBox, RenderShape,
-    SlabHalf, StairShape, WallSide, WallSides,
+    Axis, BlockModel, Face, Facing, FenceSides, LightValue, ModelBox, RenderShape, SlabHalf,
+    StairShape, WallSide, WallSides,
 };
 use common::{Fill, LIGHT_FILLS, random_light, random_padded, set_material};
 use std::collections::BTreeSet;
@@ -575,7 +575,7 @@ fn crosses_are_two_cutout_quads_lit_by_their_own_cell() {
 
 #[test]
 fn the_registry_classes_follow_shape_and_model() {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let table = MaterialTable::from_registry(&registry);
     let id = |name: &str| registry.parse_state(name).unwrap().0;
     let class = |name: &str| table.class(id(name));
@@ -601,7 +601,7 @@ fn the_registry_classes_follow_shape_and_model() {
 /// the same quads, with the same layers, as stone in its place.
 #[test]
 fn double_slabs_mesh_like_stone_cubes() {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let table = MaterialTable::from_registry(&registry);
     let stone = registry.parse_state("boxel:stone").unwrap().0;
     let double = registry

@@ -13,7 +13,7 @@ use boxel_voxel::BlockRegistry;
 
 /// The registry under test.
 fn registry() -> BlockRegistry {
-    BlockRegistry::default_blocks()
+    boxel_demo::blocks::registry()
 }
 
 #[test]

@@ -11,6 +11,8 @@ repository.workspace = true
 boxel_voxel.workspace = true
 
 [dev-dependencies]
+# The example content (#48), for tests, benches and examples only.
+boxel_demo.workspace = true
 criterion.workspace = true
 
 # Criterion flags (--quick, --save-baseline) must not reach the lib unit-test harness.

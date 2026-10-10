@@ -394,7 +394,7 @@ fn expected_occupancy(states: &[BlockState], registry: &BlockRegistry) -> Vec<u3
 
 #[test]
 fn occupancy_bits_follow_opaque_shapes() {
-    let r = BlockRegistry::default_blocks();
+    let r = boxel_demo::blocks::registry();
     let stone = r.by_name("boxel:stone").unwrap();
     let leaves = r.by_name("boxel:leaves").unwrap();
     let water = r.by_name("boxel:water").unwrap();
@@ -469,7 +469,7 @@ fn expand_occupancy(occ: &Occupancy, set: BlockState, clear: BlockState) -> Vec<
 
 #[test]
 fn from_occupancy_equals_from_dense() {
-    let r = BlockRegistry::default_blocks();
+    let r = boxel_demo::blocks::registry();
     let stone = r.by_name("boxel:stone").unwrap();
     let dirt = r.by_name("boxel:dirt").unwrap();
     let mut rng = Rng(91);
@@ -534,7 +534,7 @@ fn heap_bytes_track_the_representation() {
     assert_eq!(blocks, CHUNK_VOLUME / 2 + palette_bytes(c.blocks()));
     assert_eq!(c.heap_bytes(), blocks);
     // Built masks count too; a change of the blocks drops them.
-    let tables = LightTables::from_registry(&BlockRegistry::default_blocks());
+    let tables = LightTables::from_registry(&boxel_demo::blocks::registry());
     c.light_masks(&tables);
     assert!(c.has_cached_light_masks());
     let masks = OwnedLightMasks::compute(&c, &tables).heap_bytes();

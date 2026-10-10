@@ -16,7 +16,7 @@ use boxel_physics::{
     BodySettings, Collider, CollisionLayers, Contacts, OnBlock, OnEntity, PhysicsStats, Projectile,
     ProjectileHit, ProjectileTarget, RigidBody, StepParams, Teleport, Velocity, predict,
 };
-use boxel_voxel::{BlockPos, BlockRegistry, BlockState, Face, MAX_BLOCK_COORD, WorldPos};
+use boxel_voxel::{BlockPos, BlockState, Face, MAX_BLOCK_COORD, WorldPos};
 use common::STONE;
 use sim::{Hits, STEP, Sim};
 
@@ -278,7 +278,7 @@ fn a_bouncing_projectile_slides_on_after_it_lands() {
 /// each one ended.
 fn onto_box_tops(base: I64Vec3) -> Vec<(I64Vec3, [u64; 3])> {
     let mut sim = Sim::new(base, STEP);
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let fence = registry.parse_state("boxel:oak_fence").expect("fence");
     let slab = registry
         .parse_state("boxel:stone_slab[type=bottom]")

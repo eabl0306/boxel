@@ -2,8 +2,9 @@
 //! range bit-identical (values recorded with the `i32` API), has no seam where `i32` used to wrap
 //! (`x, z = +-2^31`), and the integer noise gives the same terrain statistics at any distance (no
 //! flattening, no repetition, no seam where the lattice cells leave `i32`), deterministically.
+use boxel_demo::worldgen::TerrainGenerator;
 use boxel_voxel::{BlockRegistry, BlockState, CHUNK_VOLUME, ChunkKey, ChunkPos, MAX_CHUNK_COORD};
-use boxel_worldgen::{TerrainGenerator, WorldGenerator};
+use boxel_worldgen::WorldGenerator;
 
 /// FNV-1a over the little-endian bytes of each value.
 fn fnv(values: impl IntoIterator<Item = u64>) -> u64 {
@@ -79,7 +80,7 @@ fn heights_inside_i32_are_unchanged() {
 #[test]
 fn chunks_inside_i32_are_unchanged() {
     let g = TerrainGenerator::default();
-    let r = BlockRegistry::default_blocks();
+    let r = boxel_demo::blocks::registry();
     // Surface chunks, the last ones inside the former i32 range included.
     for ((x, y, z), expected) in [
         ((0, 2, 0), 0x236f_33b3_fdfd_8784),
@@ -122,7 +123,7 @@ fn terrain_has_no_seam_at_the_former_i32_edge() {
 #[test]
 fn chunks_past_i32_are_generated_for_their_own_position() {
     let g = TerrainGenerator::default();
-    let r = BlockRegistry::default_blocks();
+    let r = boxel_demo::blocks::registry();
     // Chunk 2^26 used to wrap onto chunk -2^26 (same origin -2^31): now they differ, and a
     // surface chunk past the edge is not air.
     for z in [-3, 7] {
@@ -276,7 +277,7 @@ fn far_terrain_is_deterministic() {
     });
     assert_eq!(fnv(heights), 0x78eb_b2ac_76f4_4765, "window at 2^40");
     // Surface chunks, at the world limit included.
-    let r = BlockRegistry::default_blocks();
+    let r = boxel_demo::blocks::registry();
     let m = MAX_CHUNK_COORD;
     for ((x, y, z), expected) in [
         ((1 << 35, 2, -(1 << 35)), 0xc137_0a68_b44c_3ce5),

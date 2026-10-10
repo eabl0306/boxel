@@ -397,6 +397,7 @@ mod tests {
                     ("boxel:grass".to_string(), 1),
                 ])),
                 executor: Arc::new(InlineExecutor),
+                registry: Arc::new(boxel_demo::blocks::registry()),
                 ..WorldPlugin::default()
             },
             BodiesPlugin {

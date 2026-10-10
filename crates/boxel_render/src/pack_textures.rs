@@ -964,7 +964,7 @@ pub(crate) mod tests {
 
     #[test]
     fn procedural_source_is_the_generated_array() {
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let (data, report) =
             load_block_textures(&registry, &TextureSource::Procedural).expect("procedural");
         assert_eq!(data, generate_block_textures(registry.textures()));
@@ -975,7 +975,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_missing_pack_is_an_error() {
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let source = TextureSource::Pack(PathBuf::from("/nonexistent/boxel/pack"));
         assert!(load_block_textures(&registry, &source).is_err());
         assert_eq!(source.label(), "pack");
@@ -1032,7 +1032,7 @@ pub(crate) mod tests {
         });
         pack.png("lava_flow", 16, 16, |x, _| [200, x as u8, 0, 255]);
 
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let (data, report) =
             load_block_textures(&registry, &TextureSource::Pack(pack.0.clone())).expect("pack");
         assert_eq!((data.size, data.mip_levels), (16, 5));
@@ -1120,7 +1120,7 @@ pub(crate) mod tests {
         });
         mcmeta("sea_lantern", r#"{"animation":{"frames":[5,9]}}"#);
 
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let (data, report) =
             load_block_textures(&registry, &TextureSource::Pack(pack.0.clone())).expect("pack");
         assert_eq!(report.animated, 3, "{:?}", data.animations);
@@ -1213,7 +1213,7 @@ pub(crate) mod tests {
         pack.png("my_bark", 32, 32, |x, _| [x as u8, 0, 0, 255]);
         pack.png("stone", 32, 32, |_, _| [9, 9, 9, 255]);
 
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let (data, report) =
             load_block_textures(&registry, &TextureSource::Pack(pack.0.clone())).expect("pack");
         assert_eq!((data.size, data.mip_levels), (32, 6));
@@ -1255,7 +1255,7 @@ pub(crate) mod tests {
                 {"apply":{"model":"block/fence_post"}}]}"#,
         );
         let pack = ResourcePack::open(&pack.0).expect("pack");
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let model_of = |block: &str, values: &BTreeMap<String, String>| {
             let state = pack
                 .blockstate(&ResourceId::new(ResourceId::DEFAULT_NAMESPACE, block))

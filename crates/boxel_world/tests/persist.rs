@@ -11,9 +11,9 @@ use boxel_ecs::prelude::*;
 use boxel_math::DVec3;
 use boxel_transform::Transform;
 use boxel_voxel::{
-    BlockCollision, BlockDef, BlockModel, BlockPos, BlockRegistry, BlockRegistryBuilder,
-    BlockState, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, ChunkKey, ChunkPos, FaceTextures, LocalPos,
-    MAX_BLOCK_COORD, RenderShape, TextureId,
+    BlockCollision, BlockDef, BlockModel, BlockPos, BlockRegistry, BlockState, CHUNK_SIZE,
+    CHUNK_VOLUME, ChunkData, ChunkKey, ChunkPos, FaceTextures, LocalPos, MAX_BLOCK_COORD,
+    RenderShape, TextureId,
 };
 use boxel_world::jobs::{InlineExecutor, IoTaskPoolExecutor, JobExecutor, TaskPoolExecutor};
 use boxel_world::persist::{
@@ -100,7 +100,7 @@ impl Setup {
     fn new(backend: Arc<dyn ChunkStore>, level: i64) -> Self {
         Self {
             backend,
-            registry: Arc::new(BlockRegistry::default_blocks()),
+            registry: Arc::new(boxel_demo::blocks::registry()),
             level,
             light: false,
             fluids: false,
@@ -417,7 +417,7 @@ fn sky_tops_come_back_from_saved_chunks_even_unloaded() {
 /// Water cells (and their levels) around `o`.
 fn water(app: &App, o: BlockPos) -> Vec<(BlockPos, BlockState)> {
     let map = app.world().resource::<ChunkMap>();
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let mut out = Vec::new();
     for x in -10..=10 {
         for z in -10..=10 {
@@ -605,6 +605,8 @@ fn the_world_clock_is_saved() {
         let store = WorldStore::open(Arc::clone(&backend), &setup.registry, "ground").unwrap();
         app.add_plugins(WorldPlugin {
             executor: Arc::new(InlineExecutor),
+            generator: Arc::new(boxel_demo::worldgen::TerrainGenerator::default()),
+            registry: Arc::new(boxel_demo::blocks::registry()),
             ..WorldPlugin::default()
         })
         .add_plugins(PersistPlugin {
@@ -641,11 +643,13 @@ fn the_world_clock_is_saved() {
 #[should_panic(expected = "a WorldStore serves one PersistPlugin")]
 fn a_world_store_serves_one_persist_plugin() {
     let backend: Arc<dyn ChunkStore> = Arc::new(MemoryStore::new());
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let app = |store: WorldStore| {
         let mut app = App::new();
         app.add_plugins(WorldPlugin {
             executor: Arc::new(InlineExecutor),
+            generator: Arc::new(boxel_demo::worldgen::TerrainGenerator::default()),
+            registry: Arc::new(boxel_demo::blocks::registry()),
             ..WorldPlugin::default()
         })
         .add_plugins(PersistPlugin {
@@ -710,7 +714,7 @@ fn a_damaged_record_regenerates_its_chunk_and_stays_until_edited() {
 
 #[test]
 fn worlds_of_another_version_or_with_damaged_metadata_are_refused() {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     // A world, then damage to one metadata value, then the world again.
     let meta = |name: &str, value: Vec<u8>| {
         let backend: Arc<dyn ChunkStore> = Arc::new(MemoryStore::new());
@@ -761,7 +765,7 @@ fn a_state_that_no_longer_exists_loads_as_air_and_the_rest_stays() {
     let o = BlockPos::new(0, 0, 0);
     let backend: Arc<dyn ChunkStore> = Arc::new(MemoryStore::new());
     let mut setup = Setup::new(Arc::clone(&backend), o.y);
-    let mut builder = BlockRegistryBuilder::with_default_blocks();
+    let mut builder = boxel_demo::blocks::builder();
     let gem = builder.add_block(plain("test:gem")).unwrap();
     setup.registry = Arc::new(builder.build());
     let log = setup.registry.parse_state("boxel:log[axis=z]").unwrap();
@@ -771,7 +775,7 @@ fn a_state_that_no_longer_exists_loads_as_air_and_the_rest_stays() {
     drop(app);
 
     // The next version of the game has no gems.
-    setup.registry = Arc::new(BlockRegistry::default_blocks());
+    setup.registry = Arc::new(boxel_demo::blocks::registry());
     let (app, _) = setup.start(o);
     assert_eq!(block(&app, at(o, 0, 1, 0)), BlockState::AIR);
     assert_eq!(
@@ -806,7 +810,7 @@ fn redb_worlds_round_trip_and_damaged_files_are_refused() {
     let tmp = TempDir::new("redb");
     // A directory that does not exist yet (nor its parent).
     let dir = tmp.0.join("saves").join("world");
-    let registry = Arc::new(BlockRegistry::default_blocks());
+    let registry = Arc::new(boxel_demo::blocks::registry());
     let stone = registry.by_name("boxel:stone").unwrap();
     let o = BlockPos::new(1 << 40, 64, -(1 << 40));
     let start = |dir: &PathBuf| {
@@ -1097,6 +1101,8 @@ fn a_failed_snapshot_is_taken_again_on_the_next_try() {
     .unwrap();
     app.add_plugins(WorldPlugin {
         executor: Arc::new(InlineExecutor),
+        generator: Arc::new(boxel_demo::worldgen::TerrainGenerator::default()),
+        registry: Arc::new(boxel_demo::blocks::registry()),
         ..WorldPlugin::default()
     })
     .add_plugins(PersistPlugin {

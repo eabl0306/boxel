@@ -46,6 +46,7 @@ use boxel::prelude::*;
 use boxel::render::GpuFailed;
 use boxel::world::{WorldContent, WorldSystems};
 use player::{EYE_HEIGHT, Player, WalkPlugin, follow_player};
+use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 use world::{World, WorldChoice};
@@ -162,7 +163,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         drop_test: false,
         timeout: None,
         fly: false,
-        seed: TerrainGenerator::default().seed,
+        seed: boxel_demo::worldgen::DEFAULT_SEED,
         view_distance: DEFAULT_RADIUS,
         world: WorldChoice::default(),
         debug_overlay: false,
@@ -927,6 +928,7 @@ fn main() -> AppExit {
         })
         .set(WorldPlugin {
             generator: options.world.generator(options.seed),
+            registry: Arc::new(boxel_demo::blocks::registry()),
             ..WorldPlugin::default()
         })
         .set(DebugOverlayPlugin {
@@ -1030,6 +1032,7 @@ mod tests {
                     ("boxel:grass".to_string(), 1),
                 ])),
                 executor: Arc::new(InlineExecutor),
+                registry: Arc::new(boxel_demo::blocks::registry()),
                 ..WorldPlugin::default()
             },
             PhysicsPlugin::default(),

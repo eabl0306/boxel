@@ -12,19 +12,20 @@
 //!   grid (a jump); `cross` moves the camera one chunk along x and back (a border crossing: one
 //!   slab of the grid is read again, then the search); `no_frustum` searches every direction.
 #![expect(clippy::print_stderr, reason = "bench notes")]
+use boxel_demo::worldgen::OverworldGenerator;
 use boxel_math::projection::{look_to, perspective_infinite_reverse};
 use boxel_math::{DVec3, Frustum, Vec3};
-use boxel_voxel::{ALL_LINKS, BlockRegistry, ChunkFaceInfo, ChunkKey, ChunkPos};
+use boxel_voxel::{ALL_LINKS, ChunkFaceInfo, ChunkKey, ChunkPos};
 use boxel_world::visibility::visible_chunks;
 use boxel_world::{ChunkVisibility, VisibilityView};
-use boxel_worldgen::{OverworldGenerator, WorldGenerator};
+use boxel_worldgen::WorldGenerator;
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::collections::HashMap;
 use std::hint::black_box;
 
 /// The links of the box around `center` (radius `r`, vertical radius 8), generated on all cores.
 fn box_links(center: ChunkPos, r: i64) -> HashMap<ChunkPos, u16> {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let generator = OverworldGenerator::default();
     let mut positions = Vec::new();
     for y in -8..=8 {
@@ -75,7 +76,7 @@ fn view(eye: DVec3, pitch: f32, radius: u32, frustum_on: bool) -> VisibilityView
 }
 
 fn bench(c: &mut Criterion) {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let generator = OverworldGenerator::default();
     let cave = ChunkPos::new(0, -10, 0);
     let h = generator.height_at(16, 16);

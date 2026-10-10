@@ -10,6 +10,7 @@
 //!   while meshes are missing or stale: `cave_culling_drawn.rs`.)
 #![expect(clippy::print_stderr, reason = "test progress")]
 use boxel_app::App;
+use boxel_demo::worldgen::OverworldGenerator;
 use boxel_math::projection::{look_to, perspective_infinite_reverse};
 use boxel_math::{DVec3, Frustum, I64Vec3, Vec3};
 use boxel_transform::Transform;
@@ -23,7 +24,7 @@ use boxel_world::{
     ChunkMap, ChunkViewer, ChunkVisibility, DataState, EditQueue, MeshState, VisibilityView,
     WorldPlugin, WorldSettings, WorldStats,
 };
-use boxel_worldgen::{OverworldGenerator, WorldGenerator};
+use boxel_worldgen::WorldGenerator;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -65,7 +66,7 @@ struct Region {
 
 impl Region {
     fn generate(center: ChunkPos, r: i64, v: i64) -> Self {
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let generator = OverworldGenerator::default();
         let mut chunks = HashMap::new();
         for y in -v..=v {
@@ -264,7 +265,7 @@ fn overworld_app() -> App {
     let mut app = App::new();
     app.add_plugins(WorldPlugin {
         generator: Arc::new(OverworldGenerator::default()),
-        registry: Arc::new(BlockRegistry::default_blocks()),
+        registry: Arc::new(boxel_demo::blocks::registry()),
         settings: WorldSettings::default(),
         executor: Arc::new(InlineExecutor),
     });
@@ -291,7 +292,7 @@ fn settle(app: &mut App) {
 /// through; others are open.
 fn assert_links_match_data(app: &App) -> usize {
     let map = app.world().resource::<ChunkMap>();
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let mut exact = 0;
     for (_, slot) in map.iter() {
         let settled = matches!(slot.mesh(), MeshState::Ready { .. } | MeshState::Empty);
@@ -368,7 +369,7 @@ fn the_world_keeps_face_info_and_visibility_up_to_date() {
     let origin = center.origin();
     {
         let mut queue = app.world_mut().resource_mut::<EditQueue>();
-        let stone = BlockRegistry::default_blocks()
+        let stone = boxel_demo::blocks::registry()
             .by_name("boxel:stone")
             .expect("stone");
         for y in 0..32 {

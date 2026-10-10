@@ -487,9 +487,10 @@ impl WalkJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boxel_demo::worldgen::{ForestGenerator, OverworldGenerator};
     use boxel_light::sky_tile::DEFAULT_WALK_LIMIT;
-    use boxel_voxel::{BlockRegistry, BlockState, LocalPos};
-    use boxel_worldgen::{FlatGenerator, ForestGenerator, OverworldGenerator};
+    use boxel_voxel::{BlockState, LocalPos};
+    use boxel_worldgen::FlatGenerator;
 
     #[test]
     fn rules_follow_the_generator_range() {
@@ -557,7 +558,7 @@ mod tests {
     #[test]
     fn walk_jobs_read_captured_layers_and_generate_the_rest() {
         let g = ForestGenerator::default();
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let tables = LightTables::from_registry(&registry);
         let SkyRule::Walk(rule) = SkyRule::new(true, g.vertical_chunks(), DEFAULT_WALK_LIMIT)
         else {
@@ -594,7 +595,7 @@ mod tests {
     #[test]
     fn walk_jobs_find_the_void_and_edits_outside_the_generator() {
         let g = FlatGenerator::new(vec![("boxel:stone".to_string(), 4)]);
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let tables = LightTables::from_registry(&registry);
         let stone = registry.by_name("boxel:stone").unwrap();
         let SkyRule::Walk(rule) = SkyRule::new(true, g.vertical_chunks(), DEFAULT_WALK_LIMIT)

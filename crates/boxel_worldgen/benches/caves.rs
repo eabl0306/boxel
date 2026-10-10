@@ -15,9 +15,10 @@
 //! `solid_chunk` 25 us or less, `surface_chunk_caves` 90 us or less.
 #![expect(clippy::print_stderr, reason = "bench scene statistics")]
 
+use boxel_demo::worldgen::OverworldGenerator;
 use boxel_voxel::{BlockRegistry, BlockState, CHUNK_VOLUME, ChunkKey, ChunkPos, Paletted};
 use boxel_worldgen::noise::{Fbm3, Frequency3, fbm_3d, fbm_3d_grid};
-use boxel_worldgen::{Frequency, OverworldGenerator, WorldGenerator};
+use boxel_worldgen::{Frequency, WorldGenerator};
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
@@ -97,7 +98,7 @@ fn find(
 }
 
 fn overworld(c: &mut Criterion) {
-    let r = BlockRegistry::default_blocks();
+    let r = boxel_demo::blocks::registry();
     let g = OverworldGenerator::default();
     let caves = g.settings.caves.clone().expect("default caves");
     let far = 1i64 << 35; // chunks: 2^40 voxels

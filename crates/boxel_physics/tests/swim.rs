@@ -12,7 +12,7 @@ use boxel_physics::{
     BodySettings, CharacterController, Contacts, MoveIntent, SwimIntent, SwimPlugin, SwimSettings,
     Swimmer, Teleport, Velocity,
 };
-use boxel_voxel::{BlockRegistry, BlockState, MAX_BLOCK_COORD, WorldPos};
+use boxel_voxel::{BlockState, MAX_BLOCK_COORD, WorldPos};
 use common::{WATER, bottom_slab};
 use sim::{STEP, Sim};
 
@@ -167,7 +167,7 @@ fn swimming_is_the_same_far_from_the_origin() {
 
 /// A bottom slab with water in it (ADR 0025).
 fn wet_slab() -> BlockState {
-    BlockRegistry::default_blocks()
+    boxel_demo::blocks::registry()
         .parse_state("boxel:stone_slab[type=bottom,waterlogged=true]")
         .expect("waterlogged slab")
 }

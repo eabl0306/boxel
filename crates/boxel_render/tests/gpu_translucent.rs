@@ -343,7 +343,7 @@ fn render_tier(
     scenes: &[Scene],
 ) -> Result<Vec<SceneImages>, String> {
     let (device, queue, errors) = device_for(adapter, caps, tier)?;
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let config = RendererConfig {
         arena_quads: 1 << 16,
         max_chunk_slots: 64,
@@ -489,7 +489,7 @@ fn translucent_quads_are_sorted_inside_chunks_on_every_tier() {
         eprintln!("skipping: no adapter");
         return;
     }
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let scenes = scenes(&registry);
     for scene in &scenes {
         let n = scene.mesh.bucket_counts[TRANSLUCENT_BUCKET];

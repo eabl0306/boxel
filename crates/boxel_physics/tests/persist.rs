@@ -16,7 +16,7 @@ use boxel_physics::{
     Sleeping, SwimIntent, SwimPlugin, SwimSettings, Swimmer, Velocity,
 };
 use boxel_transform::Transform;
-use boxel_voxel::{BlockPos, BlockRegistry, ChunkKey, ChunkPos, MAX_BLOCK_COORD, WorldPos};
+use boxel_voxel::{BlockPos, ChunkKey, ChunkPos, MAX_BLOCK_COORD, WorldPos};
 use boxel_world::ChunkViewer;
 use boxel_world::jobs::InlineExecutor;
 use boxel_world::persist::format::{EntityPart, encode_entity};
@@ -45,7 +45,7 @@ fn bases() -> [I64Vec3; 4] {
 fn start(backend: &Arc<MemoryStore>, base: I64Vec3) -> Sim {
     let store = WorldStore::open(
         Arc::clone(backend) as Arc<dyn ChunkStore>,
-        &BlockRegistry::default_blocks(),
+        &boxel_demo::blocks::registry(),
         "shifted flat",
     )
     .expect("the world opens");

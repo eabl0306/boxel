@@ -297,7 +297,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         csv: None,
         summary: None,
         label: String::new(),
-        seed: TerrainGenerator::default().seed,
+        seed: boxel_demo::worldgen::DEFAULT_SEED,
         camera: [16.0, 140.0, 16.0, -90.0, -20.0],
         size: (1280, 720),
         async_threads: None,
@@ -710,7 +710,7 @@ fn find_cave(options: &mut Options, generator: &dyn WorldGenerator) -> Result<St
     let [x, y, z, ..] = options.camera;
     let found = cave::find(
         generator,
-        &BlockRegistry::default_blocks(),
+        &boxel_demo::blocks::registry(),
         |x, z| overworld.height_at(x, z),
         DVec3::new(x, y, z),
     )?;
@@ -1541,7 +1541,7 @@ fn main() -> AppExit {
                 last: Arc::clone(&job_clock),
             }),
             settings: world_settings(&options, fixed_bounds),
-            ..WorldPlugin::default()
+            registry: Arc::new(boxel_demo::blocks::registry()),
         });
     if let Some(threads) = options.async_threads {
         plugins = plugins.set(TaskPoolPlugin {
@@ -1813,7 +1813,7 @@ mod tests {
         assert_eq!(o.water, Some(-3));
         assert!(parse(&["--water", "sea"]).is_err());
         assert!(parse(&["--water", "9999999"]).is_err());
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let water = registry.by_name("boxel:water").expect("water");
         let glass = registry.by_name("boxel:glass").expect("glass");
         let stone = registry.by_name("boxel:stone").expect("stone");
@@ -2048,12 +2048,13 @@ mod tests {
     #[test]
     fn counting_generator_counts_and_forwards() {
         let generated = Arc::new(AtomicU64::new(0));
-        let inner: Arc<dyn WorldGenerator> = Arc::new(TerrainGenerator::default());
+        let inner: Arc<dyn WorldGenerator> =
+            Arc::new(boxel_demo::worldgen::TerrainGenerator::default());
         let counting = CountingGenerator {
             inner: Arc::clone(&inner),
             generated: Arc::clone(&generated),
         };
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let key = ChunkKey::new(ChunkPos::new(0, 1, 0));
         let data = counting.generate(key, &registry);
         assert!(data == inner.generate(key, &registry));

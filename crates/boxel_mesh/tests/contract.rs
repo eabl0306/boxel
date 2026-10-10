@@ -130,8 +130,8 @@ fn chunk_mesh_buckets_are_contiguous() {
 #[test]
 fn model_boxes_pack_and_box_quads_keep_their_index() {
     use boxel_mesh::{PackedQuad, layout, pack_model_box, unpack_model_box};
-    use boxel_voxel::{BlockRegistry, Face, ModelBox};
-    let registry = BlockRegistry::default_blocks();
+    use boxel_voxel::{Face, ModelBox};
+    let registry = boxel_demo::blocks::registry();
     let table = MaterialTable::from_registry(&registry);
     let mut boxes: Vec<ModelBox> = table.model_boxes().to_vec();
     assert!(boxes.len() > 20, "slabs, stairs, fences and torches");

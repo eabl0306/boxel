@@ -13,14 +13,14 @@ use boxel_physics::{
     ChunkSource, CollisionTable, LocalBox, Probe, RayResult, StepUp, SweepConfig, TestWorld,
     VoxelFilter, VoxelSource, guard_edge, move_box_stepping, raycast_voxels,
 };
-use boxel_voxel::{BlockPos, BlockRegistry, BlockState, ChunkPos, Face, MAX_BLOCK_COORD, WorldPos};
+use boxel_voxel::{BlockPos, BlockState, ChunkPos, Face, MAX_BLOCK_COORD, WorldPos};
 use boxel_world::{ChunkMap, WorldSettings};
 use common::{Rng, STONE, WATER, at, bottom_slab, table, top_slab};
 use proptest::prelude::*;
 use sim::{FRAME_144, STEP, Sim};
 
 fn state(name: &str) -> BlockState {
-    BlockRegistry::default_blocks().parse_state(name).unwrap()
+    boxel_demo::blocks::registry().parse_state(name).unwrap()
 }
 
 /// A source that counts its probes and answers `tall_free` from the source it wraps when

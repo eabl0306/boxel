@@ -6,8 +6,10 @@
 )]
 
 use boxel::prelude::*;
-use boxel::worldgen::overworld::CaveSettings;
-use boxel::worldgen::{Caves, FlatGenerator, OverworldSettings, Sea, TerrainSettings};
+use boxel_demo::worldgen::{
+    CaveSettings, Caves, ForestGenerator, OverworldGenerator, OverworldSettings, Sea,
+    TerrainGenerator, TerrainSettings,
+};
 use std::sync::Arc;
 
 /// Help lines of the world options (two-space indent, flag column of 20), with the example's

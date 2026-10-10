@@ -6,6 +6,7 @@
 //! oracle with brute-force tops capped at the walk floor.
 mod common;
 
+use boxel_demo::worldgen::OverworldGenerator;
 use boxel_light::box_light::{chunk_index, tile_index};
 use boxel_light::oracle::OracleWorld;
 use boxel_light::sky_tile::{DEFAULT_WALK_LIMIT, GeneratorTop, walk, walk_floor};
@@ -13,10 +14,8 @@ use boxel_light::{
     LayerData, LightInput, LightPath, LightScratch, PaddedLight, SkyInput, SkyTile, compute,
     compute_full,
 };
-use boxel_voxel::{
-    BlockRegistry, ChunkData, ChunkKey, ChunkPos, LightTables, LightValue, LocalPos,
-};
-use boxel_worldgen::{OverworldGenerator, WorldGenerator};
+use boxel_voxel::{ChunkData, ChunkKey, ChunkPos, LightTables, LightValue, LocalPos};
+use boxel_worldgen::WorldGenerator;
 use common::{Blocks, World, random_world, test_registry};
 use proptest::prelude::*;
 
@@ -375,7 +374,7 @@ fn a_removed_lamp_or_one_outside_the_box_keeps_the_fast_paths() {
 #[test]
 fn walked_tiles_light_generated_content_exactly() {
     let g = OverworldGenerator::default();
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let tables = LightTables::from_registry(&registry);
     let range = g.vertical_chunks();
     let top = GeneratorTop::of(&range).voxel().unwrap();

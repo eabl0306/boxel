@@ -372,7 +372,7 @@ fn render_tier(
     scenes: &[Scene],
 ) -> Result<Vec<SceneImages>, String> {
     let (device, queue, errors) = device_for(adapter, caps, tier)?;
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let config = RendererConfig {
         arena_quads: 1 << 16,
         max_chunk_slots: 64,
@@ -537,7 +537,7 @@ fn fluids_lose_depth_ties_and_their_sloping_tops_show_on_every_tier() {
         eprintln!("skipping: no adapter");
         return;
     }
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let scenes = scenes(&registry);
     let mut report = Report::new();
     let mut rendered = 0;

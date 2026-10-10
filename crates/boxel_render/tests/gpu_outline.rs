@@ -226,7 +226,7 @@ fn render_tier(
     tier: Tier,
 ) -> Result<TierImages, String> {
     let (device, queue, errors) = device_for(adapter, caps, tier)?;
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let materials = MaterialTable::from_registry(&registry);
     let config = RendererConfig {
         arena_quads: 1 << 16,

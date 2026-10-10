@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 
 /// The registry under test.
 fn registry() -> BlockRegistry {
-    BlockRegistry::default_blocks()
+    boxel_demo::blocks::registry()
 }
 
 fn shape_text(shape: CollisionShape<'_>) -> String {

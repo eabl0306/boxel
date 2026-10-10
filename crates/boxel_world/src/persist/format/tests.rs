@@ -78,7 +78,7 @@ proptest! {
     fn damaged_records_are_errors_not_panics(
         bytes in proptest::collection::vec(any::<u8>(), 0..200)
     ) {
-        let registry = BlockRegistry::default_blocks();
+        let registry = boxel_demo::blocks::registry();
         let (ids, _) = IdMap::resolve(Vec::new(), &registry);
         let _ = decode_chunk(&bytes, &ids);
         let _ = decode_names(&bytes);
@@ -181,7 +181,7 @@ fn chunk_with(registry: &BlockRegistry, n: usize) -> ChunkData {
 
 #[test]
 fn chunk_records_round_trip_every_storage() {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let (ids, grew) = IdMap::resolve(Vec::new(), &registry);
     assert!(grew, "a new world lists every state");
     let stone = registry.by_name("boxel:stone").unwrap();
@@ -206,7 +206,7 @@ fn chunk_records_round_trip_every_storage() {
 #[test]
 fn direct_storage_round_trips() {
     // More than 256 distinct states: a registry with a block of 300 states.
-    let mut builder = BlockRegistryBuilder::with_default_blocks();
+    let mut builder = boxel_demo::blocks::builder();
     builder
         .add_block_with_states(
             plain("test:dial"),
@@ -224,7 +224,7 @@ fn direct_storage_round_trips() {
 
 #[test]
 fn edited_chunks_compress_and_compact() {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let (ids, _) = IdMap::resolve(Vec::new(), &registry);
     let stone = registry.by_name("boxel:stone").unwrap();
     let dirt = registry.by_name("boxel:dirt").unwrap();
@@ -255,7 +255,7 @@ fn edited_chunks_compress_and_compact() {
 fn ids_survive_a_registry_that_changed_order() {
     // Saved with a registry that has one more block.
     let saved_registry = {
-        let mut b = BlockRegistryBuilder::with_default_blocks();
+        let mut b = boxel_demo::blocks::builder();
         b.add_block(plain("test:gem")).unwrap();
         b.build()
     };
@@ -268,7 +268,7 @@ fn ids_survive_a_registry_that_changed_order() {
     let bytes = encode_chunk(&data, &saved_ids).unwrap();
 
     // Loaded with the default registry: the gem is unknown (air), the log keeps its axis.
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let (ids, grew) = IdMap::resolve(saved_ids.names().to_vec(), &registry);
     assert!(!grew, "every default state is already named");
     assert_eq!(ids.unknown().len(), 1);
@@ -336,7 +336,7 @@ fn stored_ids_are_exact_names_so_a_new_default_changes_no_saved_block() {
 
 #[test]
 fn unknown_properties_and_values_keep_the_rest() {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let fence = registry.block_by_name("boxel:oak_fence").unwrap();
     let names = vec![
         // A property this registry lacks: dropped, the others kept.
@@ -368,7 +368,7 @@ fn unknown_properties_and_values_keep_the_rest() {
 
 #[test]
 fn damaged_envelopes_are_refused() {
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let (ids, _) = IdMap::resolve(Vec::new(), &registry);
     let data = chunk_with(&registry, 5);
     let good = encode_chunk(&data, &ids).unwrap();
@@ -414,7 +414,7 @@ fn names_ticks_and_clock_round_trip() {
     assert_eq!(decode_ticks(&encode_ticks(&[])).unwrap(), Vec::new());
     assert_eq!(decode_clock(&encode_clock(123_456)).unwrap(), 123_456);
     // A names blob is not a chunk record.
-    let registry = BlockRegistry::default_blocks();
+    let registry = boxel_demo::blocks::registry();
     let (ids, _) = IdMap::resolve(Vec::new(), &registry);
     assert!(decode_chunk(&encode_names(&names), &ids).is_err());
 }

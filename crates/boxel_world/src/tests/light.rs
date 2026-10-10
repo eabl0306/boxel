@@ -11,16 +11,16 @@ use crate::{
     WorldContent, WorldPlugin, WorldSettings, WorldStats, WorldSystems,
 };
 use boxel_app::{App, Update};
+use boxel_demo::worldgen::OverworldGenerator;
 use boxel_ecs::prelude::*;
 use boxel_mesh::MeshOptions;
 use boxel_tasks::{TaskPool, TaskPoolBuilder};
 use boxel_transform::Transform;
 use boxel_voxel::{
-    BlockCollision, BlockDef, BlockModel, BlockPos, BlockRegistry, BlockRegistryBuilder,
-    BlockState, ChunkData, ChunkKey, ChunkPos, FaceTextures, LightValue, LocalPos, RenderShape,
-    TextureId,
+    BlockCollision, BlockDef, BlockModel, BlockPos, BlockRegistry, BlockState, ChunkData, ChunkKey,
+    ChunkPos, FaceTextures, LightValue, LocalPos, RenderShape, TextureId,
 };
-use boxel_worldgen::{OverworldGenerator, WorldGenerator};
+use boxel_worldgen::WorldGenerator;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 /// The default blocks plus two opaque lamps (orange, blue).
 fn lamp_registry() -> (Arc<BlockRegistry>, [BlockState; 2]) {
-    let mut b = BlockRegistryBuilder::with_default_blocks();
+    let mut b = boxel_demo::blocks::builder();
     let mut lamp = |name: &str, emission| {
         b.add_block(BlockDef {
             name: format!("test:{name}"),
