@@ -1,7 +1,7 @@
 # ADR 0024: guardar y cargar el mundo
 
 - Estado: aceptado (issue #26). Sin mediciones todavía: ver "Lo que falta medir".
-- Fecha: 2026-10-09
+- Fecha: 2026-10-09; la sección 3 (entidades), 2026-10-10.
 - Revisa: la sección 12 de `docs/architecture.md` (el trait `ChunkStore`), el punto de la
   descarga de ADR 0015 sección 7 (una edición que movió un techo ya no se pierde) y "Fuera de
   esta parte" de ADR 0021 (los ticks programados se guardan).
@@ -62,24 +62,101 @@ En cambio la caminata de una columna ve el contenido guardado:
 Resultado: los techos de un mundo reiniciado son iguales a los de antes de cerrar, también los
 que salen de un chunk guardado que no está cargado (test, cerca del origen y en 2^40).
 
-### 3. Entidades: después
+### 3. Entidades
 
-Los cuerpos congelados de la física (ADR 0016) siguen sin guardarse. El motor no tiene todavía
-una forma de serializar componentes, y la física se está cambiando en otra rama. La propuesta
-para después:
+Actualizado el 2026-10-10 (rama `feat/persist-bodies`). Antes los cuerpos congelados de la física
+(ADR 0016) no se guardaban: se perdían al salir y se quedaban vivos, congelados, en los chunks
+descargados. Ahora se guardan con su chunk. `boxel_world` no puede depender de `boxel_physics`,
+así que el mundo trae un mecanismo genérico y la física se engancha a él.
 
-- Un trait `EntityCodec` que pone el juego: qué entidades se guardan (un marcador `Saved`) y cómo
-  pasan a bytes y vuelven.
-- Una tabla nueva `entities` con la misma clave de chunk: al descargarse un chunk se guardan y se
-  despawnean las entidades que están adentro; al cargarse vuelven, dormidas o congeladas como
-  estaban. Una tabla nueva no cambia la versión del formato (los que no la conocen la ignoran).
+**El mecanismo (`boxel_world::persist`).**
+
+- `Saved` marca una entidad que se guarda con el mundo. Al verla por primera vez, el mundo le da
+  un id guardado (`SavedId`, un `u64`) que no se repite nunca, tampoco después de borrarla: el
+  contador va en `meta` como `boxel:entities` y al abrir se toma el mayor entre él y los ids
+  guardados más uno.
+- Un `EntityCodec` es la parte de un plugin: un nombre estable (`boxel:body`), la versión de sus
+  bytes, dónde está la entidad (un bloque), cómo escribe su parte y cómo la lee. Se registra con
+  `add_entity_codec`, antes o después de `PersistPlugin`. Una entidad puede tener partes de
+  varios codecs (la física guarda el cuerpo; un juego, su inventario). La coloca el primer codec
+  que sabe dónde está; una entidad que nadie coloca no se guarda.
+- Los ids de entidad del ECS nunca se guardan: una entidad que vuelve es una entidad nueva. Un
+  codec que guarda una referencia a otra entidad guardada guarda su `SavedId`, y al leerla la
+  busca entre las vivas (`SavedIds`). Las entidades de un chunk vuelven todas antes de que corra
+  ningún codec, así las referencias dentro de un chunk se resuelven. Una referencia a una entidad
+  que no está viva se pierde.
+
+**Qué guarda el disco.** Una tabla nueva `entities` (y `entity_index` con sus claves, como
+`index`), con clave de 35 bytes: la clave del chunk (27, la de siempre) y el id guardado (8, big
+endian). Las entidades de un chunk son un rango de la tabla. Cada entidad tiene un solo registro,
+bajo el chunk en el que estaba al guardarse: una entidad que se movió se escribe bajo su chunk
+nuevo y su registro viejo se borra en la misma transacción. Así el disco nunca tiene una entidad
+dos veces, ni después de un cierre inesperado. Una tabla nueva no cambia la versión del formato:
+una versión del motor que no la conoce la deja como está.
+
+El registro es un sobre como los demás (magia `BXEN`, versión 1, suma de control y LZ4) con la
+lista de partes: el nombre del codec, la versión de sus bytes y los bytes.
+
+**Cuándo se guarda y cuándo vuelve.**
+
+- **Guardar al descargar.** En `PreUpdate`, antes de los pasos fijos del frame, el paso de
+  entidades busca las entidades guardadas cuyo chunk no tiene slot (se descargó, o la entidad
+  quedó donde no hay nada cargado): escribe su registro y las despawnea. La regla mira el estado
+  y no los eventos, y por eso no hay carreras: si un chunk se descarga y vuelve a crearse antes
+  del paso, sus entidades siguen vivas.
+- **Volver al cargar.** El job de generación de un chunk que tiene entidades guardadas (lo dice
+  un índice en memoria, armado al abrir con las claves) lee sus registros junto con los bloques,
+  en el hilo de trabajo. Un chunk de una capa de aire que tiene entidades recibe un job. El paso
+  de entidades del frame siguiente las devuelve, antes de que la física pase por ese chunk.
+- **Nunca dos veces.** Un registro vuelve solo si su id no está vivo y si es el registro más
+  nuevo de ese id (el índice sabe en qué chunk está cada id). Un chunk que se descarga y se
+  vuelve a cargar en la misma partida no duplica nada, aunque el disco todavía tenga un registro
+  viejo de una entidad que se movió.
+- **Autoguardado y salida.** El autoguardado (cada `PersistSettings::autosave`) y la salida
+  escriben todas las entidades guardadas vivas bajo su chunk actual. Solo se escribe un registro
+  que cambió desde la última vez (se compara una huella FNV-1a del registro).
+- **Borrar.** Despawnear una entidad guardada, o quitarle `Saved`, borra su registro.
+- **IO.** Los registros pasan por los jobs de guardado de siempre: cada job lleva todos los
+  registros y borrados que esperan (son pocos bytes), en la misma transacción que sus chunks.
+  Mientras esperan quedan en memoria y las cargas los leen encima del disco, como las copias de
+  chunks. Si el guardado falla, vuelven a la cola.
+- **Registros malos.** Un registro dañado o de otra versión de registro no vuelve, se cuenta en
+  `PersistStats::entity_errors` y queda en el disco como está. Una parte de un codec que no está,
+  o que su codec no puede leer (otra versión), se guarda aparte y se vuelve a escribir tal cual
+  con la entidad. Una entidad que ningún codec coloca no vuelve y su registro queda.
+
+**Los cuerpos (`boxel_physics::BodyCodec`).** `PhysicsPlugin` lo registra siempre: un cuerpo
+con `Saved` se guarda. Guarda el tipo, la posición exacta (`WorldPos`: los `i64` del bloque y el
+desvío), la velocidad, `BodySettings`, el `Collider`, los `Contacts` del último paso, si duerme y
+cuántos pasos lleva quieto, y si los tiene: `Interpolated` (la posición antes del último paso),
+`ReportContacts`, `CharacterController` con su `MoveIntent`, `Projectile` (el tirador como
+`SavedId`, así solo se guarda un tirador guardado) y `Swimmer` (con los ajustes de tierra que
+guarda mientras nada). Los `f64` van bit a bit. Un `Teleport` pendiente, o un `Transform` escrito
+desde el último paso, cuenta como la posición. No se guardan `Frozen` (el paso siguiente lo
+descubre), los contactos entre cuerpos ni los eventos.
+
+Al volver, el cuerpo entra ya colocado con todo su estado y un marcador interno `Restored` que
+dura hasta el final del `Wake` del paso siguiente. Ese paso no toma su posición nueva como un
+empujón (despertaría a los que duermen alrededor), y las cargas de chunks y los lugares que se
+vaciaron desde el paso anterior no lo despiertan: pasaron antes de que volviera (su propio
+despawn al guardarse dejó uno justo ahí). Un cuerpo dormido vuelve dormido y sigue dormido; una
+pila de cajas no se despierta al cargarse.
+
+Resultado: un cuerpo guardado y vuelto a cargar da los mismos pasos, bit a bit, que si nunca se
+hubiera guardado (test con un reinicio a mitad de un salto, un deslizamiento y una caminata,
+cerca del origen, en 2^40 y junto al límite del mundo). Esto vale para cuerpos que no se empujan
+entre sí: los pares se ordenan por entidad y una entidad que vuelve tiene otro id.
+
+`voxel_world`: C deja caer una caja (sin dibujo todavía; F3 cuenta las cajas y da la más cercana).
+Con `--world-dir` las cajas se guardan con el mundo. El ejemplo registra su propio codec para el
+marcador `Crate`, como haría un juego.
 
 ### 4. Formato (versión 1)
 
-- **Archivo**: un directorio por mundo con `world.redb` (`WorldStore::open_dir`). Tres tablas:
+- **Archivo**: un directorio por mundo con `world.redb` (`WorldStore::open_dir`). Tablas:
   `chunks` (clave de 27 bytes, valor el registro), `index` (las mismas claves solas, escritas en
-  la misma transacción: abrir el mundo lee unos bytes por chunk y no todos los registros) y
-  `meta` (nombre, valor). La caché de páginas de redb queda en 64 MiB (su valor por defecto es
+  la misma transacción: abrir el mundo lee unos bytes por chunk y no todos los registros),
+  `meta` (nombre, valor), y `entities` y `entity_index` (sección 3). La caché de páginas de redb queda en 64 MiB (su valor por defecto es
   1 GiB).
 - **Clave de chunk**: dimensión (`u16`), lod (`u8`) y x, z, y como `i64` en big endian con el bit
   de signo invertido (`format::encode_key`). El orden de los bytes es el de `(dim, lod, x, z, y)`:
@@ -115,7 +192,7 @@ para después:
   mundo de otra versión no se abre y no se toca (`PersistError::Version`). Cada tipo de registro
   tiene su propia versión, para poder migrar registro por registro más adelante.
 - **Otros metadatos**: `boxel:generator` (el nombre del generador con que se creó: otro solo da un
-  aviso), `boxel:ticks` y `boxel:clock`.
+  aviso), `boxel:ticks`, `boxel:clock` y `boxel:entities` (el próximo id guardado).
 
 ### 5. Cómo corre sin frenar el frame
 
@@ -179,15 +256,26 @@ deterministas.
 - `ChunkSlot::dirty`: el chunk tiene ediciones que todavía no se entregaron para guardar.
 - `BlockTicks::pending` y `BlockTicks::restore`.
 - `jobs::IoTaskPoolExecutor`.
+- Entidades: `Saved`, `SavedId`, `SavedIds`, `EntityCodec`, `EntityCodecs`, `add_entity_codec`,
+  `format::EntityPart` (y `encode_entity`, `decode_entity`, `encode_entity_key`); en
+  `ChunkStore`, `entity_keys` y `load_entities` (por defecto, un store sin entidades) y
+  `SaveBatch::entities`; en `PersistStats`, `saved_entities`, `loaded_entities`,
+  `entity_errors` y `pending_entities`. En la física, `BodyCodec`.
 - `voxel_world --world-dir DIR`: guarda al salir y carga al arrancar (también la posición de la
   cámara). `--camera` y `--time` mandan sobre la cámara y la hora guardadas. Si el mundo se creó
   con otro `--world` o `--seed`, se niega a abrirlo y dice con cuáles.
 - Línea `save` del `DiagnosticsBoard` (la escribe `LogDiagnosticsPlugin` en el log): guardados,
-  cargados, en cola, pendientes y errores.
+  cargados, en cola, pendientes y errores, también de entidades.
 
 ## Consecuencias
 
-- Editar, salir y volver a entrar deja el mundo igual: bloques, luz, agua que corre y hora.
+- Editar, salir y volver a entrar deja el mundo igual: bloques, luz, agua que corre, hora y
+  cuerpos guardados.
+- El índice de entidades guardadas (dónde está cada id) se arma al abrir con todas las claves y
+  vive en memoria: unos 60 bytes por entidad. Con millones de entidades habría que leerlo por
+  regiones, como el de chunks.
+- Cada frame con una descarga y entidades guardadas vivas recorre esas entidades una vez (una
+  búsqueda de chunk por entidad). Con miles de cuerpos guardados cerca conviene medirlo.
 - Un mundo guardado ocupa lo que ocupan sus ediciones, no lo que se exploró.
 - Los ticks congelados de chunks que no vuelven siguen en memoria (como antes) y ahora también se
   guardan. Si fueran muchos, convendría guardarlos con su chunk.
@@ -222,6 +310,28 @@ Tests (en `crates/boxel_world`):
   claves lejanas en redb; un chunk que vuelve antes de su escritura; un disco que falla y vuelve;
   un chunk que el disco no puede leer no se genera ni se guarda encima de su registro.
 
+Tests de entidades:
+
+- `persist/format/tests.rs`: claves de entidad ida y vuelta lejos del origen y su orden
+  (proptest), registros ida y vuelta, cualquier bit cambiado o registro cortado es un error y otra
+  versión se reconoce.
+- `persist/tests.rs`: los dos stores guardan, leen por chunk y borran registros lejos del origen;
+  los registros en memoria se leen encima del disco hasta que se escriben; el índice al abrir, el
+  contador de ids y un movimiento que borra el registro viejo; un guardado que falla en redb se
+  escribe cuando el disco vuelve.
+- `tests/persist_entities.rs` (con un codec de prueba): las entidades vuelven una sola vez
+  después de descargarse tres veces, cerca del origen, cruzando ±2^31, en 2^40 y junto al límite,
+  también en una capa de aire; vuelven después de reiniciar con los mismos ids y los ids nuevos no
+  repiten; una entidad que se movió queda bajo su chunk nuevo y nada más; una despawneada pierde
+  su registro; una puesta donde no hay nada cargado espera a su chunk; las referencias vuelven;
+  registros dañados, de otra versión, de una versión de codec que no se lee y de un codec que no
+  está quedan como están, también en una partida sin codecs.
+- `boxel_physics/tests/persist.rs`: cuerpos de todo tipo vuelven con todo su estado, una vez,
+  cerca y lejos; los dormidos siguen dormidos; después de reiniciar dan los mismos pasos bit a
+  bit; un cuerpo que cruzó un borde queda bajo su chunk; otra versión del codec o bytes cortados
+  quedan guardados como están.
+- `voxel_world` (`shared/crates.rs`): una caja se guarda con sus dos partes y vuelve.
+
 Imágenes: `snapshot` con ediciones, agua que corre y `--world-dir`, y después sin ediciones con el
 mismo directorio, da los mismos píxeles de día y de noche, cerca del origen y en x = 2^40,
 z = -2^31.
@@ -242,6 +352,11 @@ un `Option`. Con un mundo sin ediciones, el índice está vacío. Para la próxi
 - El frame del autoguardado con mucha agua corriendo: copia la lista de ticks pendientes en el
   hilo principal (`BlockTicks::pending`), lineal en la cantidad de ticks. Lo mismo volando sobre
   chunks editados con agua corriendo, porque cada job de descarga hace esa copia.
+- Entidades: el paso de entidades con miles de cajas guardadas dormidas cerca, volando para que
+  sus chunks se descarguen y vuelvan (recorre las entidades vivas en cada frame con una descarga,
+  codifica las que se van y despawnea, y al volver las crea en un solo frame). Si el frame que
+  devuelve muchas sube demasiado, repartirlas en varios frames antes de que la física llegue a
+  esos chunks. Sin entidades guardadas el paso no corre (una condición sobre el estado).
 
 ## Alternativas descartadas
 
@@ -257,5 +372,15 @@ un `Option`. Con un mundo sin ediciones, el índice está vacío. Para la próxi
   mundo.
 - **postcard o serde para los registros**: el formato propio es corto, no depende de cómo una
   librería codifica sus tipos y se prueba byte a byte.
+- **Un registro por chunk con todas sus entidades** (el plan original): una entidad que se mueve
+  de un chunk descargado a otro, o que se pone donde no hay nada cargado, obliga a leer y mezclar
+  el registro del otro chunk, y una foto completa en cada descarga para no duplicar después de un
+  cierre inesperado. Con un registro por entidad, mover es escribir uno y borrar otro en la misma
+  transacción.
+- **Ids de entidad guardados tal cual**: cambian en cada partida y se reciclan. El `SavedId` es
+  estable y las referencias se guardan con él.
+- **Leer las entidades en un job aparte al cargarse el chunk**: el chunk quedaría cargado un paso
+  o más sin sus cuerpos, y la física pasaría por él. Leerlas en el job de generación las trae con
+  los bloques.
 - **Durabilidad diferida de redb (`Durability::None`)**: menos escrituras al disco, pero un cierre
   inesperado pierde chunks que ya se habían soltado de memoria.
