@@ -65,6 +65,8 @@
 mod clock;
 #[path = "shared/crates.rs"]
 mod crates;
+#[path = "shared/fog.rs"]
+mod fog;
 #[path = "shared/pack.rs"]
 mod pack;
 #[path = "shared/player.rs"]
@@ -143,7 +145,11 @@ exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 check failed, 4 timeout";
 
 /// The whole help: [`USAGE`] and the world options.
 fn usage() -> String {
-    format!("{USAGE}\nworld options:\n{}", world::usage(World::Forest))
+    format!(
+        "{USAGE}\nfog options (F7 cycles the presets while the fog is on):\n{}\nworld options:\n{}",
+        fog::USAGE,
+        world::usage(World::Forest)
+    )
 }
 
 /// Default frames when a flag implies `--frames`.
@@ -219,6 +225,12 @@ struct Options {
     lamps: bool,
     /// `--pack`.
     textures: TextureSource,
+    /// `--fog`.
+    fog: fog::FogPreset,
+    /// `--fog-res`.
+    fog_res: boxel::render::fog::FogResolution,
+    /// `--fog-steps`.
+    fog_steps: u32,
     /// `--world-dir`: where the world is saved.
     world_dir: Option<PathBuf>,
     /// `--camera` was given (a saved camera does not replace it).
@@ -282,6 +294,9 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         time: None,
         lamps: false,
         textures: TextureSource::Procedural,
+        fog: fog::FogPreset::Off,
+        fog_res: boxel::render::fog::FogResolution::Half,
+        fog_steps: boxel::fog::DEFAULT_MAX_STEPS,
         world_dir: None,
         camera_given: false,
     };
@@ -305,6 +320,9 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--frames" => o.frames = Some(number(flag, &value()?)?),
             "--wait-chunks" => o.wait_chunks = true,
             "--pack" => o.textures = pack::parse(flag, &value()?)?,
+            "--fog" => o.fog = fog::parse(flag, &value()?)?,
+            "--fog-res" => o.fog_res = fog::parse_resolution(flag, &value()?)?,
+            "--fog-steps" => o.fog_steps = fog::parse_steps(flag, &value()?)?,
             "--timeout" => o.timeout = Some(Duration::from_secs(number(flag, &value()?)?)),
             "--screenshot" => o.screenshot = Some(PathBuf::from(value()?)),
             "--expect-terrain" => o.expect_terrain = true,
@@ -1923,6 +1941,12 @@ fn main() -> AppExit {
     // Flowing water (after `WorldPlugin`, in `DefaultPlugins`).
     app.add_plugins(plugins)
         .add_plugins((day_night, FluidPlugin));
+    // `--fog`: the plugin only when asked (off adds nothing at all); F7 cycles the presets.
+    if let Some(settings) = options.fog.settings(options.fog_res, options.fog_steps) {
+        app.add_plugins(FogPlugin { settings })
+            .insert_resource(FogCycle(options.fog))
+            .add_systems(Update, cycle_fog);
+    }
     if let Some(store) = store {
         app.add_plugins(PersistPlugin::new(store))
             .add_systems(Shutdown, save_camera);
@@ -3295,4 +3319,24 @@ mod tests {
         assert!(Run::new(parse(&["--duration", "0"])).complete(&info));
         assert!(!Run::new(parse(&["--duration", "3600"])).complete(&info));
     }
+}
+
+/// The fog preset F7 shows (`--fog`; only while the fog plugin is on).
+#[derive(Resource)]
+struct FogCycle(fog::FogPreset);
+
+/// F7: the next fog preset (`off` keeps the plugin with no layers), named in the log.
+fn cycle_fog(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut cycle: ResMut<FogCycle>,
+    mut settings: ResMut<boxel::render::fog::FogSettings>,
+) {
+    if !keys.just_pressed(KeyCode::F7) {
+        return;
+    }
+    let all = fog::FogPreset::ALL;
+    let i = all.iter().position(|p| *p == cycle.0).unwrap_or(0);
+    cycle.0 = all[(i + 1) % all.len()];
+    settings.layers = cycle.0.layers().unwrap_or_default();
+    eprintln!("fog: {}", cycle.0.name());
 }
