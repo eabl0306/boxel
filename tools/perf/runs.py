@@ -10,6 +10,8 @@ under 70 % of a lower cap). A run that still does not count after the last attem
 """
 import csv
 import dataclasses
+import functools
+import glob
 import json
 import os
 import re
@@ -167,26 +169,98 @@ def supports(binary, case):
 # ---------------------------------------------------------------------------------------------
 # NVIDIA state (read only)
 
-NV_FIELDS = ['timestamp', 'pstate', 'clocks.gr', 'clocks.mem', 'power.draw', 'utilization.gpu']
+NV_BASE = ['timestamp', 'pstate', 'clocks.gr', 'clocks.mem', 'power.draw', 'utilization.gpu']
+# Uncapped, the NVIDIA sometimes runs a whole stretch about 12 % slower at the same clock and with
+# less power (docs/rendimiento/sin-tope-lento-2026-10.md): the active clock event reasons (a bit
+# mask, `nvidia-smi --help-query-gpu` names the bits) and the temperature are there to tell why.
+NV_FIELDS = NV_BASE + ['clocks_event_reasons.active', 'temperature.gpu']
+# The key of each field in a sample. Its .nv.csv column keeps the field's name.
+NV_KEYS = {'pstate': 'pstate', 'clocks.gr': 'gr_mhz', 'clocks.mem': 'mem_mhz',
+           'power.draw': 'power_w', 'utilization.gpu': 'util',
+           'clocks_event_reasons.active': 'reasons', 'temperature.gpu': 'temp_c'}
+# Means of a run (nv_means): the numeric fields and the CPU's mean frequency, sampled with them.
+NV_NUMBERS = ('gr_mhz', 'mem_mhz', 'power_w', 'util', 'temp_c', 'cpu_mhz')
+CPU_FREQ = '/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq'
 
 
-def parse_nv(line, when):
-    """One `nvidia-smi --query-gpu` CSV line as a dict, or None."""
+@functools.cache
+def query_fields():
+    """NV_FIELDS when nvidia-smi knows them all, else NV_BASE: a field the driver does not know
+    fails the whole query, and the P-states would go with it. Asked once."""
+    try:
+        done = subprocess.run(['nvidia-smi', '--query-gpu=' + ','.join(NV_FIELDS),
+                               '--format=csv,noheader,nounits'], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return NV_BASE
+    return NV_FIELDS if done.returncode == 0 else NV_BASE
+
+
+def parse_nv(line, when, fields=None):
+    """One `nvidia-smi --query-gpu` CSV line of `fields` (default NV_FIELDS) as a dict, or
+    None."""
+    fields = fields or NV_FIELDS
     cells = [c.strip() for c in line.split(',')]
-    if len(cells) != len(NV_FIELDS) or not re.fullmatch(r'P\d+', cells[1]):
+    if len(cells) != len(fields) or not re.fullmatch(r'P\d+', cells[1]):
         return None
-    return {'unix': when, 'pstate': cells[1], 'gr_mhz': cells[2], 'mem_mhz': cells[3],
-            'power_w': cells[4], 'util': cells[5]}
+    sample = {'unix': when}
+    sample.update((NV_KEYS[f], c) for f, c in zip(fields[1:], cells[1:]))
+    return sample
+
+
+def cpu_mhz(paths):
+    """The mean of the CPU cores' current frequencies (scaling_cur_freq, kHz) in MHz, or None."""
+    values = []
+    for path in paths:
+        try:
+            with open(path) as f:
+                values.append(int(f.read()) / 1000)
+        except (OSError, ValueError):
+            continue
+    return round(sum(values) / len(values)) if values else None
+
+
+def window(samples, start=None, end=None):
+    """The samples between `start` and `end` (unix seconds)."""
+    return [s for s in samples
+            if (start is None or s['unix'] >= start) and (end is None or s['unix'] <= end)]
 
 
 def pstate_share(samples, start=None, end=None):
     """{P-state: share 0..1} of the samples between `start` and `end` (unix seconds)."""
-    inside = [s for s in samples
-              if (start is None or s['unix'] >= start) and (end is None or s['unix'] <= end)]
+    inside = window(samples, start, end)
     counts = {}
     for s in inside:
         counts[s['pstate']] = counts.get(s['pstate'], 0) + 1
     return {k: n / len(inside) for k, n in sorted(counts.items())} if inside else {}
+
+
+def number(text):
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def nv_means(samples, start=None, end=None):
+    """The NVIDIA state of a run, from the samples between `start` and `end`: the mean of each
+    NV_NUMBERS field (None without a value) and `reasons`, {clock event reason mask: share}.
+    None without samples."""
+    inside = window(samples, start, end)
+    if not inside:
+        return None
+    out = {}
+    for key in NV_NUMBERS:
+        values = [v for s in inside if (v := number(s.get(key))) is not None]
+        out[key] = round(sum(values) / len(values), 1) if values else None
+    masks = []
+    for s in inside:
+        try:
+            masks.append(hex(int(s.get('reasons'), 16)))
+        except (TypeError, ValueError):
+            continue
+    out['reasons'] = {m: round(masks.count(m) / len(masks), 3) for m in sorted(set(masks))}
+    return out
 
 
 class NvidiaSampler:
@@ -194,23 +268,29 @@ class NvidiaSampler:
 
     def __init__(self):
         self.samples = []
+        self.fields = NV_FIELDS
+        self._cpus = []
         self._proc = None
         self._thread = None
 
     def start(self):
         if not shutil.which('nvidia-smi'):
             return self
+        self.fields = query_fields()
+        self._cpus = glob.glob(CPU_FREQ)
         self._proc = subprocess.Popen(
-            ['nvidia-smi', '--query-gpu=' + ','.join(NV_FIELDS), '--format=csv,noheader,nounits',
-             '-lms', '500'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            ['nvidia-smi', '--query-gpu=' + ','.join(self.fields),
+             '--format=csv,noheader,nounits', '-lms', '500'],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         self._thread = threading.Thread(target=self._read, daemon=True)
         self._thread.start()
         return self
 
     def _read(self):
         for line in self._proc.stdout:
-            sample = parse_nv(line, time.time())
+            sample = parse_nv(line, time.time(), self.fields)
             if sample:
+                sample['cpu_mhz'] = cpu_mhz(self._cpus)
                 self.samples.append(sample)
 
     def stop(self):
@@ -281,7 +361,7 @@ def fmt_limit(value):
     return f'{value:g}' if value == int(value) else f'{value:.1f}'
 
 
-def metrics(summary, times_ms, nv=None):
+def metrics(summary, times_ms, nv=None, nv_state=None):
     """The numbers the verdicts and the reports use. `slow` counts the frames over 6.94 ms (the
     smoke rule, capped or not) and `slow75` those over 7.5 ms (the checkpoint's slow frames with
     a cap: there the compositor's callbacks come every 6.95 ms, so half the frames pass 6.94 ms
@@ -304,6 +384,11 @@ def metrics(summary, times_ms, nv=None):
         'quads': final.get('quads'),
         'draws': final.get('draws'),
         'gpu_chunks': final.get('gpu_chunks'),
+        # The fps of each second: the path of a scenario is fixed, so runs compare second by
+        # second (perf.slow_runs).
+        'fps_s': [s.get('fps') for s in summary.get('timeline') or []],
+        # The NVIDIA's mean state while measuring (nv_means), None without samples.
+        'nv': nv_state,
     }
 
 
@@ -361,12 +446,20 @@ def run_once(binary, case, prefix, label, duration, nvidia=False):
     with open(prefix + '.watch.json', 'w') as f:
         json.dump(watch, f)
     if samples:
-        with open(prefix + '.nv.csv', 'w') as f:
-            f.write('unix,' + ','.join(NV_FIELDS[1:]) + '\n')
-            for s in samples:
-                f.write(f"{s['unix']:.3f},{s['pstate']},{s['gr_mhz']},{s['mem_mhz']},"
-                        f"{s['power_w']},{s['util']}\n")
+        write_nv(prefix + '.nv.csv', samples)
     return rc, watch, measure_at, samples
+
+
+def write_nv(path, samples):
+    """The NVIDIA samples of a run as CSV: unix time, then a column per field (named as
+    nvidia-smi names it) and cpu_mhz."""
+    names = {key: field for field, key in NV_KEYS.items()}
+    keys = [k for k in samples[0] if k != 'unix']
+    with open(path, 'w') as f:
+        f.write(','.join(['unix', *(names.get(k, k) for k in keys)]) + '\n')
+        for s in samples:
+            cells = ['' if s.get(k) is None else str(s[k]) for k in keys]
+            f.write(','.join([f"{s['unix']:.3f}", *cells]) + '\n')
 
 
 def _log_tail(prefix, lines=6):
@@ -421,7 +514,8 @@ def measure(binary, case, prefix, label, duration, nvidia=False, attempts=None, 
             return run
         end = measure_at + duration if measure_at else None
         share = pstate_share(samples, measure_at, end) if nvidia else None
-        run.metrics = metrics(summary, times, share)
+        state = nv_means(samples, measure_at, end) if nvidia else None
+        run.metrics = metrics(summary, times, share, state)
         reason = machine.overlap(watch) or throttled(summary, times)
         if not reason:
             run.noisy = None
