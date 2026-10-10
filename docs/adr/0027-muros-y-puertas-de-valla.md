@@ -43,7 +43,9 @@ cosas nuevas:
   y girados como Minecraft gira sus modelos. Dos postes de 2x11x2 en los extremos; cerrada, dos
   barras de 2x3 a cada lado y una pieza del medio de 4 de ancho (Minecraft usa dos de 2, que con
   la textura por posición muestran los mismos texeles); abierta, las dos hojas giradas hacia
-  `facing`. Con `in_wall` todo baja 3 dieciseisavos (`template_fence_gate_wall`).
+  `facing`. Con `in_wall` todo baja 3 dieciseisavos (`template_fence_gate_wall`) y muestra los
+  mismos texeles que la puerta suelta, porque Minecraft no cambia las UV de esos modelos. Por eso
+  sus cajas llevan un desplazamiento de textura de 3, como la antorcha de pared.
 - Contorno de la puerta: `[0,0,6]-[16,16,10]` girada, de 13 de alto entre muros, igual abierta o
   cerrada (Minecraft). Colisión: la misma caja a 24 de alto cerrada, también entre muros; abierta,
   ninguna.
@@ -178,7 +180,7 @@ el mundo plano, un muro con una puerta metida, dos hileras con una antorcha y un
 - Tests:
   - `boxel_voxel/tests/walls.rs`: estados e ids. Las cajas, el contorno y la colisión de todos los
     muros (162 combinaciones) son la unión de las partes de Minecraft, sin solapes; las de la
-    puerta, sus modelos girados. La regla del muro contra una versión de fuerza bruta escrita del
+    puerta, sus modelos girados. Entre muros, la puerta muestra los texeles de la puerta suelta. La regla del muro contra una versión de fuerza bruta escrita del
     código de Minecraft, con 10 000 vecindarios al azar, secos y con agua. Los casos a mano
     (extremo, tramo, esquina, cruce, bloque, antorcha y muro arriba). `in_wall` contra fuerza
     bruta. Vallas y muros se conectan a los extremos de la puerta. Usar la puerta la abre hacia

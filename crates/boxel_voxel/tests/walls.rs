@@ -351,6 +351,35 @@ fn gate_boxes_outline_and_collision_are_minecrafts() {
     }
 }
 
+/// A gate between walls is the free gate 3 sixteenths lower and shows the same texels:
+/// Minecraft's `template_fence_gate_wall` models move the elements down and keep the UVs of
+/// `template_fence_gate`. Each box moved by its texture offset is the free gate's box (as the
+/// raised wall torch shows the standing torch's texels).
+#[test]
+fn a_gate_between_walls_shows_the_texels_of_a_free_gate() {
+    for facing in Facing::ALL {
+        for open in [false, true] {
+            let free = fence_gate_boxes(facing, open, false);
+            let in_wall = fence_gate_boxes(facing, open, true);
+            assert_eq!(free.len(), in_wall.len());
+            for (f, w) in free.iter().zip(&in_wall) {
+                let what = format!("{facing:?} open {open}: {w:?}");
+                assert_eq!(f.texture_offset, [0; 3], "{what}");
+                assert!(w.is_valid(), "{what}");
+                let moved = |c: [u8; 3]| {
+                    [0, 1, 2].map(|a| (i16::from(c[a]) + i16::from(w.texture_offset[a])) as u8)
+                };
+                assert_eq!(
+                    CollisionBox::new(moved(w.bounds.min), moved(w.bounds.max)),
+                    f.bounds,
+                    "{what}"
+                );
+                assert_eq!(w.bounds.min[1] + 3, f.bounds.min[1], "{what}");
+            }
+        }
+    }
+}
+
 /// Every fence gate stops movement, open or closed (Minecraft's gates are solid wood: fluids
 /// never flow into one), though an open one does not collide.
 #[test]

@@ -572,10 +572,11 @@ pub const GATE_IN_WALL_DROP: u8 = 3;
 
 /// The render boxes of a fence gate (Minecraft's `template_fence_gate` and
 /// `template_fence_gate_open`, ADR 0027), facing `facing` (the way it opens; the gate runs
-/// across it), `GATE_IN_WALL_DROP` lower when `in_wall`. Two posts 2x11x2 at the ends; closed,
-/// two bars 2x3 between each post and the middle and a 4 wide middle piece (Minecraft's two
-/// 2 wide middle pieces, which show the same texels here); open, the two halves swung toward
-/// `facing`, each two bars and an end piece. Written for south and turned.
+/// across it), `GATE_IN_WALL_DROP` lower when `in_wall`, showing the same texels as when it is
+/// not (the `template_fence_gate_wall` models keep the others' UVs). Two posts 2x11x2 at the
+/// ends; closed, two bars 2x3 between each post and the middle and a 4 wide middle piece
+/// (Minecraft's two 2 wide middle pieces, which show the same texels here); open, the two
+/// halves swung toward `facing`, each two bars and an end piece. Written for south and turned.
 pub fn fence_gate_boxes(facing: Facing, open: bool, in_wall: bool) -> Vec<ModelBox> {
     let closed: [([u8; 3], [u8; 3]); 7] = [
         ([0, 5, 7], [2, 16, 9]),
@@ -602,10 +603,14 @@ pub fn fence_gate_boxes(facing: Facing, open: bool, in_wall: bool) -> Vec<ModelB
     parts
         .iter()
         .map(|&(min, max)| {
-            ModelBox::new(
-                [min[0], min[1] - drop, min[2]],
-                [max[0], max[1] - drop, max[2]],
-            )
+            ModelBox {
+                bounds: CollisionBox::new(
+                    [min[0], min[1] - drop, min[2]],
+                    [max[0], max[1] - drop, max[2]],
+                ),
+                // Lowered, it shows the texture of where it would be (as a wall torch does).
+                texture_offset: [0, drop as i8, 0],
+            }
             .turned(turns)
         })
         .collect()
