@@ -197,11 +197,33 @@ mar, el agua queda quieta como una pared vertical, porque el agua generada no pr
   greedy del lago) y parten el quad del lago a su alrededor.
 - El techo inclinado de la lava pasa por el alpha test (sin early-Z en sus píxeles) y puede sumar
   un draw por chunk, el de su bucket cutout.
-- Rendimiento: hoy no se midió (la máquina estaba ocupada). Tocan caminos calientes la generación
-  de chunks cerca del mar (la regla de las costas), los ticks de fluidos (la clasificación de
-  estados, las paredes entre celdas, que leen cajas de colisión, y la reacción de la lava), el
-  gather del mesher (los bloques con agua en la pasada de niveles) y su paso de fluidos. Quedan
-  para la próxima ronda de control.
+- Rendimiento: al integrar no se midió (la máquina estaba ocupada). Tocan caminos calientes la
+  generación de chunks cerca del mar (la regla de las costas), el gather del mesher (los bloques
+  con agua en la pasada de niveles) y su paso de fluidos. Quedan para la próxima ronda de control.
+- Los ticks de fluidos se midieron después. Ticks por cada ms de presupuesto en una inundación
+  (`cargo bench -p boxel_world --bench fluid`, 10 inundaciones por escena, una corrida por lado):
+
+  | Escena | Antes de esta parte (cf11b4f) | Con esta parte (0313bf2) | Con la memoria |
+  |---|---|---|---|
+  | Agua | 225 | 174 | 398 |
+  | Lava y agua | no existía | 193 | 338 |
+  | Bloques con agua | no existía | 135 | 273 |
+
+  - Esta parte le costó un 23 % al agua común. Un tick que corre pasa casi todo su tiempo
+    buscando la bajada (`getSlopeDistance`): prueba cada camino de hasta 4 bloques y lee las
+    mismas celdas una y otra vez. Las reglas nuevas encarecieron cada paso: lee también la celda
+    de la que sale y revisa la pared entre las dos.
+  - Arreglo: una memoria por búsqueda (`Memo`), como la caché de `getSpread` en Minecraft. Lee
+    cada bloque de la zona una sola vez y guarda, por celda, si el fluido pasa y si cae ahí. La
+    pared solo se revisa al salir de una celda con colisión, y eso solo puede pasar en la
+    primera. Los bloques en que se vuelve la lava se buscan solo cuando hacen falta.
+  - Es exacta: los tests del simulador de fuerza bruta pasan sin cambios, y un test de
+    propiedades compara la búsqueda con memoria con la de siempre en mundos al azar, cerca y
+    lejos del origen.
+  - El bench ahora adelanta el reloj al poner las fuentes. Así la cola sigue atrasada hasta el
+    final y cuenta todos los ticks de la inundación, los mismos en cualquier versión. Antes
+    contaba solo los frames atrasados, que eran menos cuanto más rápida la versión. Tiene además
+    escenas de lava y de bloques con agua.
 
 ## Fuera de esta parte
 
