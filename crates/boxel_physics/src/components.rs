@@ -308,7 +308,8 @@ pub struct Contacts {
     pub on_ground: bool,
     /// The block it stands on (under the center of its bottom when that block is full).
     pub ground_block: Option<BlockPos>,
-    /// It overlaps a fluid block.
+    /// It overlaps a block that holds a fluid: a fluid block or a waterlogged one
+    /// ([`CollisionTable::is_wet`](crate::CollisionTable::is_wet)).
     pub in_fluid: bool,
 }
 

@@ -1,7 +1,9 @@
-//! Swimming (ADR 0021): a [`Swimmer`] body whose box touches a fluid (water) moves as in
-//! Minecraft's water: weaker gravity, strong drag in every direction (it sinks slowly and stops
-//! soon), slower walking, and it rises while the game holds [`SwimIntent::up`] (or presses
-//! jump). Opt in with [`SwimPlugin`].
+//! Swimming (ADR 0021): a [`Swimmer`] body whose box touches a fluid (water, or a block with
+//! water in it, ADR 0025) moves as in Minecraft's water: weaker gravity, strong drag in every
+//! direction (it sinks slowly and stops soon), slower walking, and it rises while the game holds
+//! [`SwimIntent::up`] (or presses jump). Opt in with [`SwimPlugin`]. A flying character
+//! ([`CharacterController::flying`]) is not affected by the fluid, as Minecraft's creative
+//! flight (ADR 0026).
 //!
 //! It works around the body step instead of inside it: before the controllers of each fixed step
 //! ([`PhysicsSystems::Controller`]), a body entering a fluid keeps its land [`BodySettings`] and
@@ -80,11 +82,14 @@ pub struct SwimIntent {
 /// Adds swimming (ADR 0021): [`swim_bodies`] in each fixed step, before the character
 /// controllers. Needs [`PhysicsPlugin`](crate::PhysicsPlugin) first.
 ///
-/// A [`Swimmer`] whose box touches a fluid moves as in Minecraft's water: weaker gravity, strong
-/// drag in every direction, slower walking, and it rises while [`SwimIntent::up`] is held or a
-/// jump is pressed. Entering a fluid it keeps its land `BodySettings` and walking speed and gets
-/// the water ones; leaving, it gets them back (so changes to those two made while it is in water
-/// are undone when it leaves).
+/// A [`Swimmer`] whose box touches a fluid (a fluid block or a waterlogged one,
+/// [`CollisionTable::is_wet`]) moves as in Minecraft's water: weaker gravity, strong drag in
+/// every direction, slower walking, and it rises while [`SwimIntent::up`] is held or a jump is
+/// pressed. Entering a fluid it keeps its land `BodySettings` and walking speed and gets the
+/// water ones; leaving, it gets them back (so changes to those two made while it is in water
+/// are undone when it leaves). A flying character ([`CharacterController::flying`]) is not
+/// affected by the fluid, as in Minecraft's creative flight: it keeps its land settings, and
+/// its jump is not taken for a swim (the controller's flight goes on as in the air).
 pub struct SwimPlugin;
 
 impl Plugin for SwimPlugin {
@@ -98,8 +103,9 @@ impl Plugin for SwimPlugin {
     }
 }
 
-/// True if the box from `min` to `max` (exclusive faces) touches a fluid cell. A cell not loaded
-/// counts as dry.
+/// True if the box from `min` to `max` (exclusive faces) touches a cell that holds a fluid: a
+/// fluid block or a waterlogged one ([`CollisionTable::is_wet`]). A cell not loaded counts as
+/// dry.
 pub fn box_touches_fluid(
     source: &mut impl VoxelSource,
     table: &CollisionTable,
@@ -117,7 +123,7 @@ pub fn box_touches_fluid(
         for z in min.block.z..=hi.z {
             for x in min.block.x..=hi.x {
                 if let Probe::Block(state) = source.probe(BlockPos::new(x, y, z))
-                    && table.is_fluid(state)
+                    && table.is_wet(state)
                 {
                     return true;
                 }
@@ -129,7 +135,8 @@ pub fn box_touches_fluid(
 
 /// Each fixed step: every awake [`Swimmer`] checks its box against the fluids, swaps its land and
 /// water settings when that changes and, in a fluid, rises while [`SwimIntent::up`] is held or
-/// a jump was pressed (the jump latch is used up: no jump off the bottom).
+/// a jump was pressed (the jump latch is used up: no jump off the bottom). A flyer counts as
+/// dry for all of that (it keeps the jump latch), though [`Swimmer::in_fluid`] still tells.
 pub fn swim_bodies(
     content: Res<PhysicsContent>,
     map: Res<ChunkMap>,
@@ -167,7 +174,9 @@ pub fn swim_bodies(
             pos.offset(max),
         );
         let mut controller = controller;
-        if wet && swimmer.land.is_none() {
+        // Minecraft's creative flight is not affected by fluids (`isAffectedByFluids`).
+        let swims = wet && !controller.as_ref().is_some_and(|c| c.flying);
+        if swims && swimmer.land.is_none() {
             let walk = controller.as_ref().map_or(0.0, |c| c.walk_speed);
             swimmer.land = Some((*body, walk));
             let s = swimmer.settings;
@@ -180,7 +189,7 @@ pub fn swim_bodies(
             if let Some(c) = controller.as_mut() {
                 c.walk_speed = walk * s.speed;
             }
-        } else if !wet && let Some((land, walk)) = swimmer.land.take() {
+        } else if !swims && let Some((land, walk)) = swimmer.land.take() {
             *body = land;
             if let Some(c) = controller.as_mut() {
                 c.walk_speed = walk;
@@ -189,7 +198,7 @@ pub fn swim_bodies(
         if swimmer.in_fluid != wet {
             swimmer.in_fluid = wet;
         }
-        if !wet {
+        if !swims {
             continue;
         }
         let mut rise = up.is_some_and(|u| u.up);
