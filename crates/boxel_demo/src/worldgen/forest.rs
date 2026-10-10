@@ -1,7 +1,8 @@
 //! [`ForestGenerator`]: the M0 terrain with trees, the default world of the examples.
 
-use crate::{PlantBlocks, Plants, Sea, TerrainGenerator, TerrainSettings, Trees, WorldGenerator};
+use super::{PlantBlocks, Plants, Sea, TerrainGenerator, TerrainSettings, Trees};
 use boxel_voxel::{BlockPos, BlockRegistry, BlockState, CHUNK_SIZE, ChunkData, ChunkKey, LocalPos};
+use boxel_worldgen::WorldGenerator;
 use std::ops::RangeInclusive;
 
 /// [`TerrainGenerator`] plus [`Trees`] on its grass. Each chunk places the parts of every tree
@@ -18,7 +19,7 @@ use std::ops::RangeInclusive;
 /// on purpose: it is the default world of the stress runs, and the earlier runs (master and the
 /// phase 0 baselines) paid that cost, so a faster path here would show up as an engine gain in
 /// every comparison with them. [`Trees::place_dense`] (as in
-/// [`OverworldGenerator`](crate::OverworldGenerator)) is the fast path; switching to it needs
+/// [`OverworldGenerator`](super::OverworldGenerator)) is the fast path; switching to it needs
 /// new forest baselines.
 #[derive(Clone, Debug)]
 pub struct ForestGenerator {

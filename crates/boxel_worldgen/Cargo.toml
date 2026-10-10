@@ -1,6 +1,6 @@
 [package]
 name = "boxel_worldgen"
-description = "World generation traits and generators (flat, terrain, forest, overworld with caves) for boxel"
+description = "World generation for boxel: the generator trait, a flat generator and exact integer noise"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,21 +11,13 @@ repository.workspace = true
 boxel_voxel.workspace = true
 
 [dev-dependencies]
-# The example content (#48), for tests, benches and examples only.
+# The example content (#48), for tests only.
 boxel_demo.workspace = true
-criterion.workspace = true
 
-# Criterion flags (--quick, --save-baseline) must not reach the lib unit-test harness.
+# Criterion flags (--quick, --save-baseline) from `cargo bench --workspace` must not reach the
+# lib unit-test harness.
 [lib]
 bench = false
-
-[[bench]]
-name = "terrain"
-harness = false
-
-[[bench]]
-name = "caves"
-harness = false
 
 [lints]
 workspace = true

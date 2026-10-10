@@ -1,9 +1,10 @@
 //! The surface stages: [`Heightmap`] (one height per column) and [`SurfaceRules`] (which block
 //! each depth of a column gets).
 
-use crate::noise::{self, Fbm};
-use crate::{Frequency, TerrainSettings};
+use crate::worldgen::TerrainSettings;
 use boxel_voxel::{BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SIZE};
+use boxel_worldgen::Frequency;
+use boxel_worldgen::noise::{self, Fbm};
 
 /// Lacunarity of the height fbm.
 const LACUNARITY: u32 = 2;
@@ -11,8 +12,9 @@ const LACUNARITY: u32 = 2;
 const GAIN: f64 = 0.5;
 
 /// The surface height of every column: `base_height + round(amplitude * fbm_2d(seed, x, z))`
-/// with lacunarity 2 and gain 0.5, the heightmap of [`TerrainGenerator`](crate::TerrainGenerator)
-/// (which uses this type). It never leaves `base_height +- ceil(|amplitude|)`.
+/// with lacunarity 2 and gain 0.5, the heightmap of
+/// [`TerrainGenerator`](crate::worldgen::TerrainGenerator) (which uses this type). It never
+/// leaves `base_height +- ceil(|amplitude|)`.
 ///
 /// The fields keep the types of [`TerrainSettings`], so the arithmetic (`f32` amplitude, `i32`
 /// saturating sum) is the same bit for bit; heights come out as `i64` world coordinates.
@@ -36,7 +38,7 @@ impl Default for Heightmap {
 }
 
 impl Heightmap {
-    /// The heightmap of a [`TerrainGenerator`](crate::TerrainGenerator) with `settings`.
+    /// The heightmap of a [`TerrainGenerator`](crate::worldgen::TerrainGenerator) with `settings`.
     pub fn from_terrain(settings: &TerrainSettings) -> Self {
         Self {
             base_height: settings.base_height,
@@ -125,7 +127,7 @@ impl Heightmap {
 /// Which block each depth of a column gets, from its height `h`: the top block at `h` (sand if
 /// `h <= sand_level`, snow if `h > snow_level`, else grass), dirt for the `dirt_depth` blocks
 /// below it, stone further down, and air above `h`. The rules of
-/// [`TerrainGenerator`](crate::TerrainGenerator) without its bedrock floor.
+/// [`TerrainGenerator`](crate::worldgen::TerrainGenerator) without its bedrock floor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SurfaceRules {
     /// Dirt thickness under the top block.
@@ -144,7 +146,7 @@ impl Default for SurfaceRules {
 }
 
 impl SurfaceRules {
-    /// The rules of a [`TerrainGenerator`](crate::TerrainGenerator) with `settings`.
+    /// The rules of a [`TerrainGenerator`](crate::worldgen::TerrainGenerator) with `settings`.
     pub fn from_terrain(settings: &TerrainSettings) -> Self {
         Self {
             dirt_depth: settings.dirt_depth.into(),
@@ -227,7 +229,7 @@ impl SurfaceBlocks {
     /// The built-in blocks; panics with the name if `registry` lacks one (the generator and the
     /// registry do not match).
     pub fn new(registry: &BlockRegistry, generator: &str) -> Self {
-        let block = |name| crate::block(registry, name, generator);
+        let block = |name| boxel_worldgen::block(registry, name, generator);
         Self {
             stone: block("boxel:stone"),
             dirt: block("boxel:dirt"),

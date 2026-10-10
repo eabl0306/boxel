@@ -3,8 +3,8 @@
 //! neighbor data; a plant goes on the cell above the ground block when that cell is air (trees
 //! win).
 
-use crate::noise::hash2;
 use boxel_voxel::{BlockRegistry, BlockState};
+use boxel_worldgen::noise::hash2;
 
 /// Default salt of the plant hash (independent of the trees').
 const PLANT_SALT: u64 = 0x0091_a275_f10e;

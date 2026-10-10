@@ -620,7 +620,6 @@ version = "0.1.0-dev"
 dependencies = [
  "boxel_demo",
  "boxel_voxel",
- "criterion",
 ]
 
 [[package]]

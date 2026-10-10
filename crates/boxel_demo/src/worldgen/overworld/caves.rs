@@ -1,9 +1,9 @@
 //! The cave stage ([`Caves`], whose docs describe the density model).
 
 use super::terrain::Heightmap;
-use crate::Frequency;
-use crate::noise::{self, Fbm, Fbm3, Frequency3, splitmix64};
 use boxel_voxel::{BlockPos, CHUNK_AREA, CHUNK_SIZE, MAX_BLOCK_COORD, Occupancy};
+use boxel_worldgen::Frequency;
+use boxel_worldgen::noise::{self, Fbm, Fbm3, Frequency3, splitmix64};
 use std::cell::RefCell;
 
 /// Voxels per lattice cell along x, y and z ([`Caves::CELL`]).
@@ -987,7 +987,7 @@ mod tests {
             Noise::EntranceWidth,
         ];
         assert_eq!(noises.len(), NOISE_COUNT);
-        let default_seed = crate::TerrainGenerator::default().seed;
+        let default_seed = crate::worldgen::TerrainGenerator::default().seed;
         let mut seen = std::collections::HashMap::new();
         for world in [
             0,
@@ -1026,7 +1026,7 @@ mod tests {
     #[test]
     fn corner_heights_from_the_chunk_heights_are_the_heights() {
         let heightmap = Heightmap::default();
-        let seed = crate::TerrainGenerator::default().seed;
+        let seed = crate::worldgen::TerrainGenerator::default().seed;
         let limit = MAX_BLOCK_COORD - 32;
         for (x, z) in [(0, 0), (-32, 96), (1 << 40, -(1 << 40)), (limit, -limit)] {
             let origin = BlockPos::new(x, 64, z);

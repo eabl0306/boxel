@@ -1,8 +1,9 @@
 //! Deterministic trees (log trunk, leaf canopy), placed per chunk without neighbor data. Used by
-//! [`ForestGenerator`](crate::ForestGenerator) and [`OverworldGenerator`](crate::OverworldGenerator).
+//! [`ForestGenerator`](super::ForestGenerator) and
+//! [`OverworldGenerator`](super::OverworldGenerator).
 
-use crate::noise::hash2;
 use boxel_voxel::{BlockPos, BlockState, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, LocalPos};
+use boxel_worldgen::noise::hash2;
 use std::ops::RangeInclusive;
 
 /// Columns per side of a tree cell: at most one tree per cell.

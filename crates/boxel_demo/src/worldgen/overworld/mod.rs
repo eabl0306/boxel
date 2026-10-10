@@ -6,7 +6,7 @@
 //! voxels:
 //!
 //! 1. [`Heightmap`]: one surface height per column (the heightmap of
-//!    [`TerrainGenerator`](crate::TerrainGenerator), bit for bit).
+//!    [`TerrainGenerator`](crate::worldgen::TerrainGenerator), bit for bit).
 //! 2. [`SurfaceRules`]: grass, sand or snow on top, dirt under it, stone further down. No
 //!    bedrock: the stone goes on forever.
 //! 3. [`Caves`]: carve the stone ([`Caves`] describes the density model, [`CaveSettings`] the
@@ -36,11 +36,12 @@ pub use caves::{
 };
 pub use terrain::{Heightmap, SurfaceBlocks, SurfaceRules};
 
-use crate::{Plants, Sea, Tree, Trees, WorldGenerator, block};
+use crate::worldgen::{Plants, Sea, Tree, Trees};
 use boxel_voxel::{
     BlockPos, BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SHIFT, CHUNK_SIZE, CHUNK_VOLUME,
     ChunkData, ChunkKey, LocalPos,
 };
+use boxel_worldgen::{WorldGenerator, block};
 use std::ops::RangeInclusive;
 
 /// Name in logs and panics.
@@ -99,10 +100,11 @@ pub struct OverworldGenerator {
 }
 
 impl Default for OverworldGenerator {
-    /// The default settings with the default seed of [`TerrainGenerator`](crate::TerrainGenerator).
+    /// The default settings with the default seed of
+    /// [`TerrainGenerator`](crate::worldgen::TerrainGenerator).
     fn default() -> Self {
         Self::new(
-            crate::TerrainGenerator::default().seed,
+            crate::worldgen::TerrainGenerator::default().seed,
             OverworldSettings::default(),
         )
     }
@@ -223,8 +225,8 @@ impl OverworldGenerator {
             grows.then_some(ground)
         });
         match tree {
-            Some(crate::TreeBlock::Log) => log,
-            Some(crate::TreeBlock::Leaves) => leaves,
+            Some(crate::worldgen::TreeBlock::Log) => log,
+            Some(crate::worldgen::TreeBlock::Leaves) => leaves,
             None => self.plant_at(p, h, registry),
         }
     }
