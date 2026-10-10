@@ -10,7 +10,9 @@ use boxel_gfx::{
 use boxel_math::{DVec3, I64Vec3, UVec2};
 use boxel_mesh::{BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, PackedQuad, palette_entry};
 use boxel_transform::Transform;
-use boxel_voxel::{BlockRegistry, Face, LightValue};
+use boxel_voxel::{
+    BlockRegistry, BlockRegistryBuilder, Face, LightValue, TexturePattern, TextureSpec,
+};
 use std::sync::Arc;
 
 /// Edge of the smoke test targets.
@@ -70,7 +72,7 @@ fn draw(ctx: &SmokeContext<'_>) -> Result<(), String> {
         max_chunk_slots: 8,
         translucent_sort: TranslucentSort::Inline,
     };
-    let registry = BlockRegistry::default_blocks();
+    let registry = smoke_registry();
     let mut renderer = VoxelRenderer::new(
         ctx.device,
         ctx.queue,
@@ -119,8 +121,8 @@ fn draw(ctx: &SmokeContext<'_>) -> Result<(), String> {
         ));
     }
     // No sky light reaches the quads and each one's block light is a pure color, so a working
-    // light path leaves the other channels at the ambient floor (stone: about 125 in its
-    // channel, 13 in the others).
+    // light path leaves the other channels at the ambient floor (the gray layer: about 125 in
+    // its channel, 13 in the others).
     for (what, pixel, channel, color) in [
         ("center pixel (cutout quad)", center, 0, "red"),
         ("corner pixel (opaque quad)", corner, 2, "blue"),
@@ -158,9 +160,27 @@ fn lit_by(pixel: &[u8], c: usize) -> bool {
     rgb[c] >= 40 && rgb[c] > 2 * others
 }
 
-/// One 32x32 +Y stone quad on the chunk floor lit only by blue block light (palette entry 0),
-/// and a 16x16 stone quad in the cutout bucket above its middle lit only by red block light
-/// (entry 1; stone passes the alpha test everywhere). Sky 0 in both.
+/// The registry of the smoke draw: air and one opaque gray texture layer, [`SMOKE_LAYER`] (the
+/// engine has no content of its own, #48).
+fn smoke_registry() -> BlockRegistry {
+    let mut builder = BlockRegistryBuilder::new();
+    builder
+        .add_texture(TextureSpec {
+            name: SMOKE_LAYER.to_string(),
+            base_color: [125, 125, 125],
+            noise: 18,
+            pattern: TexturePattern::Noise,
+        })
+        .expect("the smoke layer");
+    builder.build()
+}
+
+/// The texture layer of the smoke quads: gray noise, opaque everywhere.
+const SMOKE_LAYER: &str = "smoke:gray";
+
+/// One 32x32 +Y gray quad on the chunk floor lit only by blue block light (palette entry 0),
+/// and a 16x16 gray quad in the cutout bucket above its middle lit only by red block light
+/// (entry 1; the gray layer passes the alpha test everywhere). Sky 0 in both.
 fn smoke_mesh(registry: &BlockRegistry) -> ChunkMesh {
     let layer = |name: &str| {
         registry
@@ -172,11 +192,11 @@ fn smoke_mesh(registry: &BlockRegistry) -> ChunkMesh {
     let mut bucket_counts = [0; BUCKET_COUNT];
     bucket_counts[Face::PosY.index()] = 1;
     bucket_counts[CUTOUT_BUCKET] = 1;
-    let stone = layer("boxel:stone");
+    let gray = layer(SMOKE_LAYER);
     let mut mesh = ChunkMesh::from_quads(
         vec![
-            PackedQuad::new([0, 0, 0], 32, 32, Face::PosY, stone).with_light_index(0),
-            PackedQuad::new([8, 4, 8], 16, 16, Face::PosY, stone).with_light_index(1),
+            PackedQuad::new([0, 0, 0], 32, 32, Face::PosY, gray).with_light_index(0),
+            PackedQuad::new([8, 4, 8], 16, 16, Face::PosY, gray).with_light_index(1),
         ],
         bucket_counts,
     );
@@ -212,7 +232,7 @@ mod tests {
 
     #[test]
     fn the_smoke_quads_have_their_own_light_entries() {
-        let registry = boxel_demo::blocks::registry();
+        let registry = smoke_registry();
         let mesh = smoke_mesh(&registry);
         assert_eq!(mesh.palette.len(), 2);
         // Opaque bucket first (first instance 0), then the cutout one (first instance 1).
@@ -231,5 +251,19 @@ mod tests {
         assert!(!lit_by(&[13, 13, 124, 255], 0), "blue is not red");
         assert!(!lit_by(&[120, 110, 100, 255], 0), "white light");
         assert!(!lit_by(&[13, 13, 13, 255], 2), "dark");
+    }
+
+    /// #48: the engine has no blocks of its own, so the smoke draw brings its one texture layer.
+    #[test]
+    fn the_smoke_draw_has_its_own_gray_layer() {
+        let registry = smoke_registry();
+        assert_eq!(registry.len(), 1, "air only");
+        let names: Vec<&str> = registry
+            .textures()
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(names, [SMOKE_LAYER]);
+        assert_eq!(generate_block_textures(registry.textures()).layers, 1);
     }
 }

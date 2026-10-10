@@ -33,7 +33,7 @@ use boxel_gfx::{
 use boxel_math::{I64Vec3, UVec2};
 use boxel_mesh::{ChunkMesh, MaterialTable};
 use boxel_transform::Transform;
-use boxel_voxel::BlockRegistry;
+use boxel_voxel::{BlockRegistry, BlockRegistryBuilder};
 use boxel_window::{DisplayHandle, PrimaryWindow, WindowState};
 use boxel_world::{
     ChunkMap, ChunkMeshEvent, ChunkMeshResync, ChunkViewer, ChunkVisibility, DaylightCurve,
@@ -994,11 +994,12 @@ fn bootstrap(p: &mut SetupParams) {
             return;
         }
     };
-    // The model box table of the world's meshes (ADR 0020).
+    // The model box table of the world's meshes (ADR 0020). Without a world: the air-only
+    // registry's, empty (the engine has no content, #48).
     match p.content.as_deref() {
         Some(content) => renderer.set_model_boxes(&ctx.queue, content.materials.model_boxes()),
         None => {
-            let materials = MaterialTable::from_registry(&BlockRegistry::default_blocks());
+            let materials = MaterialTable::from_registry(&BlockRegistryBuilder::new().build());
             renderer.set_model_boxes(&ctx.queue, materials.model_boxes());
         }
     }
@@ -1054,8 +1055,10 @@ fn block_texture_data(p: &mut SetupParams) -> Arc<BlockTextureData> {
     let default_registry;
     let registry: &BlockRegistry = match p.content.as_deref() {
         Some(content) => &content.registry,
+        // Without a world: the air-only registry, one magenta layer (the engine has no
+        // content, #48).
         None => {
-            default_registry = BlockRegistry::default_blocks();
+            default_registry = BlockRegistryBuilder::new().build();
             &default_registry
         }
     };

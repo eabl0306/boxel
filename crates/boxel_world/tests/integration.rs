@@ -543,3 +543,40 @@ fn fixed_height_streams_every_layer_of_the_generator() {
     assert!(events.is_empty(), "{} mesh events", events.len());
     assert_eq!(app.world().resource::<WorldStats>().chunks, chunks);
 }
+
+/// #48: the engine has no content. The default plugin is an empty world (a generator with no
+/// layers, a registry with air only) that streams air; `WorldPlugin::new` takes the game's.
+#[test]
+fn the_default_world_is_empty_and_new_takes_the_content() {
+    let empty = WorldPlugin::default();
+    assert_eq!(empty.registry.len(), 1, "air only");
+    assert!(empty.generator.vertical_chunks().is_empty());
+    let mut app = App::new();
+    app.add_plugins(WorldPlugin {
+        executor: Arc::new(InlineExecutor),
+        ..WorldPlugin::default()
+    });
+    app.world_mut().spawn((
+        Transform::from_translation(DVec3::new(0.0, 0.0, 0.0)),
+        ChunkViewer::new(1).with_vertical_radius(1),
+    ));
+    let start = Instant::now();
+    loop {
+        app.update();
+        let stats = *app.world().resource::<WorldStats>();
+        if stats.chunks > 0 && stats.is_settled() {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(60), "not settled");
+    }
+    let map = app.world().resource::<ChunkMap>();
+    for p in [BlockPos::new(0, 0, 0), BlockPos::new(-20, -20, 17)] {
+        assert_eq!(map.block_at(p), Some(BlockState::AIR));
+    }
+
+    let registry = Arc::new(boxel_demo::blocks::registry());
+    let generator: Arc<dyn WorldGenerator> = Arc::new(TerrainGenerator::default());
+    let plugin = WorldPlugin::new(Arc::clone(&generator), Arc::clone(&registry));
+    assert!(Arc::ptr_eq(&plugin.registry, &registry));
+    assert_eq!(plugin.generator.name(), generator.name());
+}

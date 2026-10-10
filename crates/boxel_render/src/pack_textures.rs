@@ -186,7 +186,7 @@ const fn recipe(
     }
 }
 
-/// The built-in layers of `BlockRegistry::default_blocks`. Other layers try `block/<path>` of
+/// The layers of the demo content (`boxel_demo::blocks`). Other layers try `block/<path>` of
 /// their name.
 const RECIPES: &[Recipe] = &[
     recipe(

@@ -14,9 +14,10 @@ use boxel_mesh::{AoPolicy, ChunkMesh, MaterialTable};
 use boxel_tasks::{AsyncComputeTaskPool, TaskPool};
 use boxel_transform::Transform;
 use boxel_voxel::{
-    BlockPos, BlockRegistry, BlockState, ChunkKey, ChunkPos, DimensionId, LightTables,
+    BlockPos, BlockRegistry, BlockRegistryBuilder, BlockState, ChunkKey, ChunkPos, DimensionId,
+    LightTables,
 };
-use boxel_worldgen::{TerrainGenerator, WorldGenerator};
+use boxel_worldgen::{FlatGenerator, WorldGenerator};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -382,21 +383,40 @@ pub struct WorldPlugin {
     pub executor: Arc<dyn JobExecutor>,
 }
 
-impl Default for WorldPlugin {
-    /// `TerrainGenerator::default()`, `BlockRegistry::default_blocks()`, default settings,
+impl WorldPlugin {
+    /// A world of `registry`'s blocks made by `generator`, with the default settings and the
     /// `TaskPoolExecutor`.
-    fn default() -> Self {
+    pub fn new(generator: Arc<dyn WorldGenerator>, registry: Arc<BlockRegistry>) -> Self {
         Self {
-            generator: Arc::new(TerrainGenerator::default()),
-            registry: Arc::new(BlockRegistry::default_blocks()),
+            generator,
+            registry,
             settings: WorldSettings::default(),
             executor: Arc::new(TaskPoolExecutor),
         }
     }
 }
 
+impl Default for WorldPlugin {
+    /// An empty world: a [`FlatGenerator`] without layers and a registry with air only (the
+    /// engine has no content, #48; a game passes its own, [`WorldPlugin::new`]), default
+    /// settings, `TaskPoolExecutor`.
+    fn default() -> Self {
+        Self::new(
+            Arc::new(FlatGenerator::new(Vec::new())),
+            Arc::new(BlockRegistryBuilder::new().build()),
+        )
+    }
+}
+
 impl Plugin for WorldPlugin {
     fn build(&self, app: &mut App) {
+        if self.registry.is_empty() {
+            tracing::warn!(
+                generator = self.generator.name(),
+                "the world's registry holds only air: the engine has no content of its own, \
+                 pass the game's registry (WorldPlugin::new)"
+            );
+        }
         let content = WorldContent::new(Arc::clone(&self.generator), Arc::clone(&self.registry));
         let rule = SkyRule::new(
             self.settings.light,
