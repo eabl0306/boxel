@@ -200,6 +200,11 @@ impl Persist {
         }
     }
 
+    /// Metadata waits for a save job: a failed job's, put back (one that just started took it).
+    pub(crate) fn has_meta(&self) -> bool {
+        !self.meta.is_empty()
+    }
+
     /// Metadata for the next save (replaces an earlier value of the same name).
     pub(crate) fn set_meta(&mut self, name: String, value: MetaValue) {
         self.meta.retain(|(n, _)| *n != name);

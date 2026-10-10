@@ -1050,6 +1050,61 @@ fn a_chunk_the_store_cannot_read_is_never_saved_over() {
     assert_eq!(block(&app, q), BlockState::AIR);
 }
 
+/// A snapshot whose save failed is taken again when the save is tried again: the clock saved is
+/// the one of that moment, not the stale one of the failed try.
+#[test]
+fn a_failed_snapshot_is_taken_again_on_the_next_try() {
+    let o = BlockPos::new(0, 0, 0);
+    let flaky = Arc::new(Flaky::default());
+    let setup = Setup::new(Arc::clone(&flaky) as Arc<dyn ChunkStore>, o.y);
+    let (mut app, _) = setup.start(o);
+    let set_clock = |app: &mut App, tick: u64| {
+        let mut time = TimeOfDay::at_clock(6.0);
+        time.tick = tick;
+        app.insert_resource(time);
+    };
+    set_clock(&mut app, 100);
+    flaky.fail.store(true, Ordering::Relaxed);
+    app.insert_resource(PersistSettings {
+        autosave: Some(Duration::ZERO),
+        retry_after: Duration::ZERO,
+        ..PersistSettings::default()
+    });
+    app.update();
+    app.insert_resource(PersistSettings {
+        autosave: None,
+        retry_after: Duration::ZERO,
+        ..PersistSettings::default()
+    });
+    app.update();
+    assert!(app.world().resource::<WorldStore>().stats().save_errors >= 1);
+    // Later, the disk works again.
+    set_clock(&mut app, 200);
+    flaky.fail.store(false, Ordering::Relaxed);
+    app.update();
+    app.update();
+    drop(app);
+
+    let mut app = App::new();
+    let store = WorldStore::open(
+        Arc::clone(&flaky) as Arc<dyn ChunkStore>,
+        &setup.registry,
+        "ground",
+    )
+    .unwrap();
+    app.add_plugins(WorldPlugin {
+        executor: Arc::new(InlineExecutor),
+        ..WorldPlugin::default()
+    })
+    .add_plugins(PersistPlugin {
+        store,
+        executor: Arc::new(InlineExecutor),
+    })
+    .insert_resource(TimeOfDay::at_clock(6.0));
+    app.update();
+    assert_eq!(app.world().resource::<TimeOfDay>().tick, 200);
+}
+
 #[test]
 fn redb_keeps_every_bit_of_far_keys() {
     let tmp = TempDir::new("keys");

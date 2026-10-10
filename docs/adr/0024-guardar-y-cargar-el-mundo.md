@@ -156,7 +156,9 @@ para después:
   - si hay ticks esperando, un chunk editado que se descarga no sale solo: su job es una foto
     completa, como el autoguardado (test con el agua en un chunk que sigue cargado);
   - un job que lleva los ticks lleva todos los chunks entregados, aunque pasen de `max_batch`.
-    Lo mismo al salir.
+    Lo mismo al salir;
+  - si esa escritura falla, al reintentar se toma la foto otra vez: la vieja no se escribe junto
+    a chunks más nuevos (test).
 - **Salida** (schedule `Shutdown`, que corren los dos runners): espera el job en curso y escribe
   todo lo que queda en el hilo principal, que ya no dibuja.
 

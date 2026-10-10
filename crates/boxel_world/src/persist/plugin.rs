@@ -150,7 +150,8 @@ fn save_meta(
 /// edited chunk, loaded or handed over, in one transaction. That snapshot is taken in the frame
 /// its job starts, by the autosave and whenever chunks with edits unloaded while block ticks
 /// wait: their water must never be saved without its ticks (a crash before the next autosave
-/// would leave it stuck half spread), nor the ticks without the water of the loaded chunks.
+/// would leave it stuck half spread), nor the ticks without the water of the loaded chunks. A
+/// failed snapshot is taken again when it is tried again, not written stale with newer chunks.
 fn save_step(
     mut jobs: ResMut<WorldJobs>,
     mut map: ResMut<ChunkMap>,
@@ -172,7 +173,7 @@ fn save_step(
             let stats = t.stats();
             stats.queued + stats.frozen > 0
         });
-        if autosave || (ticking && p.queued() > 0) {
+        if autosave || p.has_meta() || (ticking && p.queued() > 0) {
             p.last_autosave = now;
             p.stage_dirty(map.bypass_change_detection());
             save_meta(p, &settings, ticks.as_deref(), time.as_deref());
