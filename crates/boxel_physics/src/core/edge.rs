@@ -10,7 +10,9 @@
 
 use super::shape::LocalBox;
 use super::source::{CollisionShape, CollisionTable, Probe, VoxelSource};
-use super::sweep::{SweepConfig, Unloaded, clean_distance, effective_eps, usable_shape};
+use super::sweep::{
+    SweepConfig, Unloaded, clean_distance, effective_eps, tall_free_blocks, usable_shape,
+};
 use boxel_math::DVec3;
 use boxel_voxel::{BlockPos, WorldPos};
 
@@ -172,9 +174,14 @@ fn gather<S: VoxelSource + ?Sized>(
     let (x0, x1) = span(region.min.x, region.max.x);
     let (y0, y1) = span(region.min.y, region.max.y);
     let (z0, z1) = span(region.min.z, region.max.z);
-    // The row under the region holds tall blocks whose boxes may reach into it.
+    // The row under the region holds tall blocks whose boxes may reach into it, unless its
+    // chunks have none (then it reads as blocks that are skipped).
     let reach = table.reach();
-    let low = if reach > 0.0 && y0 as f64 + reach > region.min.y + eps {
+    let world = |x: i64, y: i64, z: i64| BlockPos::new(origin.x + x, origin.y + y, origin.z + z);
+    let low = if reach > 0.0
+        && y0 as f64 + reach > region.min.y + eps
+        && !tall_free_blocks(src, table, world(x0, y0 - 1, z0), world(x1, y0 - 1, z1))
+    {
         y0 - 1
     } else {
         y0
@@ -182,7 +189,7 @@ fn gather<S: VoxelSource + ?Sized>(
     for y in low..=y1 {
         for x in x0..=x1 {
             for z in z0..=z1 {
-                let block = BlockPos::new(origin.x + x, origin.y + y, origin.z + z);
+                let block = world(x, y, z);
                 let state = match src.probe(block) {
                     Probe::Block(state) => state,
                     Probe::Unloaded => return Err(Unloaded { block }),

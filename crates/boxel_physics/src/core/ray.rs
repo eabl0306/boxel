@@ -12,12 +12,14 @@
 //!
 //! A collision box may reach into the cell above its block (a fence collides 1.5 blocks tall,
 //! ADR 0026). A collision ray then also tests, in each cell it crosses low enough, the tall
-//! block under that cell, and keeps the nearest hit until no later cell can be nearer.
+//! block under that cell, and keeps the nearest hit until no later cell can be nearer. It skips
+//! that test while the block under the cell is in a loaded chunk without tall blocks
+//! ([`VoxelSource::tall_free`]): the result is the same, and the cost is paid only near them.
 
 use super::shape::LocalBox;
 use super::source::{CollisionShape, CollisionTable, Probe, VoxelSource};
 use boxel_math::DVec3;
-use boxel_voxel::{BlockPos, BlockState, Face, MAX_BLOCK_COORD, WorldPos};
+use boxel_voxel::{BlockPos, BlockState, CHUNK_SHIFT, ChunkPos, Face, MAX_BLOCK_COORD, WorldPos};
 
 /// The farthest [`raycast_voxels`] follows a ray on any axis, in blocks: a larger `max_t` is
 /// shortened to `MAX_RAY_DISTANCE / max(|dir.x|, |dir.y|, |dir.z|)`. A guard against runaway
@@ -397,6 +399,11 @@ impl Dda {
 /// it). A hit is kept until the next cell starts past it: a later cell can only hold a nearer
 /// hit through a tall block's top. With the same blocks and no tall ones in the way, it returns
 /// what the plain loop returns.
+///
+/// The block under the cell is not read while its chunk is loaded and holds no tall block
+/// ([`VoxelSource::tall_free`], asked again only when the ray takes it into another chunk):
+/// it would read as a block that is not tall, which changes nothing.
+#[inline(never)]
 fn raycast_reaching<S: VoxelSource + ?Sized>(
     src: &mut S,
     table: &CollisionTable,
@@ -412,6 +419,10 @@ fn raycast_reaching<S: VoxelSource + ?Sized>(
     let mut cell = origin.block;
     let mut entry = 0.0;
     let mut entered: Option<(Face, usize, i64)> = None;
+    // The block under the cell is in a loaded chunk without tall blocks.
+    let under_chunk =
+        |cell: BlockPos| ChunkPos::containing(BlockPos::new(cell.x, cell.y - 1, cell.z));
+    let mut under_free = src.tall_free(under_chunk(cell), table);
     // The first of the nearest hits.
     let keep = |hit: VoxelHit, best: &mut Option<VoxelHit>| {
         if best.is_none_or(|b| hit.t < b.t) {
@@ -419,7 +430,8 @@ fn raycast_reaching<S: VoxelSource + ?Sized>(
         }
     };
     loop {
-        let exit = dda.next[dda.axis()];
+        let a = dda.axis();
+        let exit = dda.next[a];
         match src.probe(cell) {
             Probe::Unloaded => {
                 return RayResult::Unloaded {
@@ -462,36 +474,39 @@ fn raycast_reaching<S: VoxelSource + ?Sized>(
         {
             return RayResult::Hit(hit);
         }
-        // The lowest the ray gets in this cell, above the cell's bottom (`entry` and `exit` are
-        // its ends; a ray that does not step on Y keeps its height).
-        let bottom = (cell.y - origin.block.y) as f64;
-        let low = if dir.y < 0.0 { exit.min(max_t) } else { entry };
-        let low = dda.frac.y + dir.y * low - bottom;
-        // A small margin: a ray that only grazes the top of a tall box still tests it.
-        if low <= reach + 1e-9 {
-            let under = BlockPos::new(cell.x, cell.y - 1, cell.z);
-            match src.probe(under) {
-                Probe::Unloaded => {
-                    // Where the ray comes within reach of it: what lies past is unknown, what
-                    // the ray met before is not.
-                    let t = if dir.y < 0.0 {
-                        entry.max((bottom + reach - dda.frac.y) / dir.y)
-                    } else {
-                        entry
-                    };
-                    return match best {
-                        Some(hit) if hit.t <= t => RayResult::Hit(hit),
-                        _ => RayResult::Unloaded { block: under, t },
-                    };
-                }
-                Probe::Block(state) if table.is_tall(state) => {
-                    if let CollisionShape::Boxes(boxes) = table.shape(state)
-                        && let Some(hit) = boxes_hit(boxes, origin, dir, max_t, under, None)
-                    {
-                        keep(VoxelHit { state, ..hit }, &mut best);
+        // The tall block under the cell, unless its chunk has none.
+        if !under_free {
+            // The lowest the ray gets in this cell, above the cell's bottom (`entry` and `exit`
+            // are its ends; a ray that does not step on Y keeps its height).
+            let bottom = (cell.y - origin.block.y) as f64;
+            let low = if dir.y < 0.0 { exit.min(max_t) } else { entry };
+            let low = dda.frac.y + dir.y * low - bottom;
+            // A small margin: a ray that only grazes the top of a tall box still tests it.
+            if low <= reach + 1e-9 {
+                let under = BlockPos::new(cell.x, cell.y - 1, cell.z);
+                match src.probe(under) {
+                    Probe::Unloaded => {
+                        // Where the ray comes within reach of it: what lies past is unknown,
+                        // what the ray met before is not.
+                        let t = if dir.y < 0.0 {
+                            entry.max((bottom + reach - dda.frac.y) / dir.y)
+                        } else {
+                            entry
+                        };
+                        return match best {
+                            Some(hit) if hit.t <= t => RayResult::Hit(hit),
+                            _ => RayResult::Unloaded { block: under, t },
+                        };
                     }
+                    Probe::Block(state) if table.is_tall(state) => {
+                        if let CollisionShape::Boxes(boxes) = table.shape(state)
+                            && let Some(hit) = boxes_hit(boxes, origin, dir, max_t, under, None)
+                        {
+                            keep(VoxelHit { state, ..hit }, &mut best);
+                        }
+                    }
+                    Probe::Block(_) => {}
                 }
-                Probe::Block(_) => {}
             }
         }
         // Every later cell starts at `exit` or further.
@@ -503,8 +518,9 @@ fn raycast_reaching<S: VoxelSource + ?Sized>(
         if exit > max_t || exit == f64::INFINITY {
             return best.map_or(RayResult::Miss, RayResult::Hit);
         }
-        let a = dda.axis();
         let crossed = origin.block.as_i64vec3()[a] + dda.plane[a];
+        // The coordinate on `a` of the block under the cell, before and after the step.
+        let under = dda.voxel[a] - i64::from(a == 1);
         dda.voxel[a] += dda.step[a];
         dda.plane[a] += dda.step[a];
         dda.next[a] = (dda.plane[a] as f64 - dda.frac[a]) * dda.inv[a];
@@ -514,6 +530,9 @@ fn raycast_reaching<S: VoxelSource + ?Sized>(
         cell = BlockPos::new(dda.voxel[0], dda.voxel[1], dda.voxel[2]);
         entry = exit;
         entered = Some((entered_face(a, dda.step[a]), a, crossed));
+        if under >> CHUNK_SHIFT != (under + dda.step[a]) >> CHUNK_SHIFT {
+            under_free = src.tall_free(under_chunk(cell), table);
+        }
     }
 }
 

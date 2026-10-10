@@ -10,7 +10,9 @@
 //! A box may reach into the cell above (a fence collides 1.5 blocks tall, ADR 0026): a move
 //! across also looks at the row of blocks under the footprint, for the tall blocks there whose
 //! boxes reach it, and a move down scans one layer further, where a tall block's top can be
-//! higher than the tops of the layer above it.
+//! higher than the tops of the layer above it. A move whose blocks (and the row under them) are
+//! all in loaded chunks without tall blocks ([`VoxelSource::tall_free`]) skips those reads: the
+//! result is the same, and the cost of tall blocks is paid only near them.
 //! The footprint is strict: a block that only touches the box (within `eps`) is not in it, so a
 //! box sliding along a floor or a wall never snags on the seams between blocks or chunks. The
 //! cost grows linearly with the distance moved; no substeps are needed.
@@ -29,7 +31,7 @@
 use super::shape::LocalBox;
 use super::source::{CollisionShape, CollisionTable, Probe, VoxelSource};
 use boxel_math::DVec3;
-use boxel_voxel::{BlockPos, Face, WorldPos};
+use boxel_voxel::{BlockPos, ChunkPos, Face, WorldPos};
 
 /// The largest displacement [`move_box`] accepts per axis, in blocks; larger components are
 /// clamped to it. A guard against runaway values (the scan cost grows with the distance): a body
@@ -265,8 +267,18 @@ fn stepping<S: VoxelSource + ?Sized>(
         table,
         origin: start.block,
         eps,
+        reach: table.reach(),
     };
     let mut pos = start.frac;
+    // Only a body on the ground can step up, but the region is the same for all walkers.
+    let height = if step.height > 0.0 {
+        clean(step.height)
+    } else {
+        0.0
+    };
+    if grid.reach > 0.0 && grid.region_tall_free(pos, shape, d, height) {
+        grid.reach = 0.0;
+    }
     let depenetrated = match grid.depenetrate(pos, shape, max_depenetration)? {
         Some(out) => {
             pos = out;
@@ -401,6 +413,43 @@ fn footprint(min: f64, max: f64, eps: f64) -> (i64, i64) {
     ((min + eps).floor() as i64, (max - eps).ceil() as i64 - 1)
 }
 
+/// The most chunks [`tall_free_blocks`] asks about; a larger box (a move of tens of blocks)
+/// counts as not free.
+const MAX_TALL_FREE_CHUNKS: i64 = 8;
+
+/// Every block of `min..=max` (world blocks, inclusive on every axis) is in a loaded chunk
+/// without tall blocks of `table` ([`VoxelSource::tall_free`], asked once per chunk: usually
+/// one or two). Reading those blocks only for tall boxes then finds nothing and no unloaded
+/// chunk. `false` when the box spans more than [`MAX_TALL_FREE_CHUNKS`] chunks; `true` for an
+/// empty box (a `min` past its `max`).
+pub(crate) fn tall_free_blocks<S: VoxelSource + ?Sized>(
+    src: &mut S,
+    table: &CollisionTable,
+    min: BlockPos,
+    max: BlockPos,
+) -> bool {
+    if min.x > max.x || min.y > max.y || min.z > max.z {
+        return true;
+    }
+    let (lo, hi) = (ChunkPos::containing(min), ChunkPos::containing(max));
+    if lo == hi {
+        return src.tall_free(lo, table);
+    }
+    if (hi.x - lo.x + 1) * (hi.y - lo.y + 1) * (hi.z - lo.z + 1) > MAX_TALL_FREE_CHUNKS {
+        return false;
+    }
+    for y in lo.y..=hi.y {
+        for x in lo.x..=hi.x {
+            for z in lo.z..=hi.z {
+                if !src.tall_free(ChunkPos::new(x, y, z), table) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// How one axis of a move ended.
 enum Clip {
     /// Nothing in the way: the whole displacement.
@@ -429,6 +478,10 @@ struct Grid<'a, S: ?Sized> {
     table: &'a CollisionTable,
     origin: BlockPos,
     eps: f64,
+    /// How far above its cell a box of a block the grid reads can reach: the table's
+    /// [`CollisionTable::reach`], or 0 when no tall block can be where the move reads
+    /// ([`Grid::region_tall_free`]).
+    reach: f64,
 }
 
 impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
@@ -466,8 +519,29 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
     /// that row, past the bottom of `bx` (by more than `eps`).
     #[inline]
     fn reaches(&self, bx: LocalBox, low: i64) -> bool {
-        let reach = self.table.reach();
-        reach > 0.0 && low as f64 + reach > bx.min.y + self.eps
+        self.reach > 0.0 && low as f64 + self.reach > bx.min.y + self.eps
+    }
+
+    /// No block that a move of `shape` from `pos` by `d` (with its step-up up to `height`, 0
+    /// for none) reads only for tall boxes can hold one ([`tall_free_blocks`]): with
+    /// [`Grid::reach`] at 0 the move then reads as without tall blocks, with the same result.
+    ///
+    /// Every box of the move, its lifted moves and the step-up's checks included, stays within
+    /// the hull of the box at `pos`, at `pos + d` and raised by `height` (also at `pos + d`),
+    /// widened by a few `eps` (a clip snaps a box up to `eps` back). Its scans read the blocks
+    /// that hull overlaps and one row under it: the row under a footprint across, and the
+    /// layer a move down reads past its end. A box pushed out of blocks first leaves that
+    /// region: [`Grid::depenetrate`] puts the table's reach back.
+    fn region_tall_free(&mut self, pos: DVec3, shape: LocalBox, d: DVec3, height: f64) -> bool {
+        let margin = 8.0 * self.eps;
+        let mut lo = shape.min + pos + d.min(DVec3::ZERO) - margin;
+        let mut hi = shape.max + pos + d.max(DVec3::ZERO) + margin;
+        hi.y += height;
+        lo.y -= 1.0;
+        let (lo, hi) = (lo.floor(), hi.floor());
+        let min = self.world([lo.x as i64, lo.y as i64, lo.z as i64]);
+        let max = self.world([hi.x as i64, hi.y as i64, hi.z as i64]);
+        tall_free_blocks(self.src, self.table, min, max)
     }
 
     /// The plane where frame block `b` stops `bx` moving along `axis` (toward `+` if
@@ -593,7 +667,7 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
         let nearest = if positive {
             layer as f64
         } else if axis == 1 {
-            (layer + 1) as f64 + self.table.reach()
+            (layer + 1) as f64 + self.reach
         } else {
             (layer + 1) as f64
         };
@@ -715,7 +789,7 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
                 .filter(|&max| max <= lead + eps)
                 .fold(f64::NEG_INFINITY, f64::max);
             // Moving down, a tall block's top is up to `reach` above its layer's top.
-            let reach = if axis == 1 { self.table.reach() } else { 0.0 };
+            let reach = if axis == 1 { self.reach } else { 0.0 };
             // Layers whose top plane the leading face has not passed, down to the last one the
             // moved face enters, and only those whose top is not below the obstacle (a block
             // flush with it is the one reported as ground).
@@ -1003,6 +1077,8 @@ impl<'a, S: VoxelSource + ?Sized> Grid<'a, S> {
         if !self.any_solid(shape.translate(pos))? {
             return Ok(None);
         }
+        // Pushed out, the box leaves the region `region_tall_free` looked at.
+        self.reach = self.table.reach();
         let mut best: Option<(f64, DVec3)> = None;
         for (axis, positive) in [
             (1, true),
