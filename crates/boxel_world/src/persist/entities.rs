@@ -18,11 +18,11 @@
 //! - A record is brought back only if its id is not alive and it is the newest record of its id:
 //!   a chunk that unloads and loads again never brings an entity back twice.
 use super::format::{EntityPart, decode_entity, encode_entity};
-use super::plugin::PersistSettings;
-use super::saver::Persist;
+use super::plugin::{PersistSettings, save_meta};
+use super::saver::{Moment, Persist};
 use super::store::WorldStore;
 use crate::streaming::WorldJobs;
-use crate::{ChunkMap, WorldSettings};
+use crate::{BlockTicks, ChunkMap, TimeOfDay, WorldSettings};
 use boxel_app::App;
 use boxel_ecs::lifecycle::HookContext;
 use boxel_ecs::prelude::*;
@@ -30,7 +30,6 @@ use boxel_ecs::world::DeferredWorld;
 use boxel_voxel::{BlockPos, ChunkKey, ChunkPos, DimensionId};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
 
 /// Hash maps of the index: fixed seeds, so the bookkeeping is the same in every run.
 type Fixed = foldhash::fast::FixedState;
@@ -238,8 +237,6 @@ pub(crate) struct EntityIndex {
     pub(crate) arrived: Vec<(ChunkKey, Vec<(u64, Vec<u8>)>)>,
     /// A chunk unloaded since the entity step last looked.
     pub(crate) unloaded: bool,
-    /// When the entity step last saved every entity alive (the autosave).
-    pub(crate) last_snapshot: Instant,
 }
 
 impl EntityIndex {
@@ -256,7 +253,6 @@ impl EntityIndex {
             queued: HashSet::default(),
             arrived: Vec::new(),
             unloaded: false,
-            last_snapshot: Instant::now(),
         };
         for (chunk, id) in keys {
             if let Some(first) = index.at.get(&id) {
@@ -368,12 +364,8 @@ impl EntityIndex {
 }
 
 /// The entity step must run: records arrived, a chunk unloaded while saved entities are alive,
-/// markers came or went, or the autosave of the entities is due.
-pub(crate) fn entity_work(
-    jobs: Res<WorldJobs>,
-    log: Res<SavedLog>,
-    settings: Res<PersistSettings>,
-) -> bool {
+/// markers came or went, or the save step asked for a snapshot of the world.
+pub(crate) fn entity_work(jobs: Res<WorldJobs>, log: Res<SavedLog>) -> bool {
     let Some(p) = jobs.persist.as_ref() else {
         return false;
     };
@@ -381,15 +373,14 @@ pub(crate) fn entity_work(
     !e.arrived.is_empty()
         || (e.unloaded && !e.live.is_empty())
         || !log.is_empty()
-        || settings
-            .autosave
-            .is_some_and(|every| !e.live.is_empty() && e.last_snapshot.elapsed() >= every)
+        || p.moment == Moment::Asked
 }
 
 /// `PreUpdate`: brings back the entities of the chunks that loaded, follows the markers that
-/// came or went, puts away the saved entities whose chunk has no slot and, with the autosave,
-/// saves every saved entity alive (before the frame's fixed steps: a body comes back before
-/// physics steps its chunk, and goes before physics would freeze it there).
+/// came or went, puts away the saved entities whose chunk has no slot and, when the save step
+/// asked for a snapshot of the world (the autosave), saves every saved entity alive with the
+/// edited chunks, the pending ticks and the clock (before the frame's fixed steps: a body comes
+/// back before physics steps its chunk, and goes before physics would freeze it there).
 pub(crate) fn entity_step(world: &mut World) {
     run(world, false);
 }
@@ -402,9 +393,6 @@ pub(crate) fn save_entities_on_exit(world: &mut World) {
 /// The entity step (see [`entity_step`]); `exit` saves every entity alive.
 fn run(world: &mut World, exit: bool) {
     let dim = world.resource::<WorldSettings>().dimension;
-    let autosave = world
-        .get_resource::<PersistSettings>()
-        .and_then(|s| s.autosave);
     let log = world
         .get_resource_mut::<SavedLog>()
         .map(|mut log| std::mem::take(&mut *log))
@@ -434,10 +422,14 @@ fn run(world: &mut World, exit: bool) {
         if std::mem::take(&mut step.p.entities.unloaded) || fresh {
             step.put_away();
         }
-        let due = autosave.is_some_and(|every| step.p.entities.last_snapshot.elapsed() >= every);
-        if exit || due {
-            step.p.entities.last_snapshot = Instant::now();
+        // On exit the save step that follows stages the rest of the moment.
+        let asked = step.p.moment == Moment::Asked;
+        if exit || asked {
             step.snapshot();
+        }
+        if asked && !exit {
+            step.stage_world();
+            step.p.moment = Moment::Taken;
         }
     });
 }
@@ -635,6 +627,25 @@ impl Step<'_> {
             self.p.entities.live.remove(&id);
             self.world.despawn(entity);
         }
+    }
+
+    /// Stages the rest of the snapshot of the world: the loaded chunks with edits, the pending
+    /// ticks and the clock (what the save step stages when no saved entity is alive).
+    fn stage_world(&mut self) {
+        let settings = self
+            .world
+            .get_resource::<PersistSettings>()
+            .cloned()
+            .unwrap_or_default();
+        let mut map = self.world.resource_mut::<ChunkMap>();
+        // Saving changes nothing the readers of the map see.
+        self.p.stage_dirty(map.bypass_change_detection());
+        save_meta(
+            self.p,
+            &settings,
+            self.world.get_resource::<BlockTicks>(),
+            self.world.get_resource::<TimeOfDay>(),
+        );
     }
 
     /// Saves every saved entity alive under its chunk (only the records that changed).

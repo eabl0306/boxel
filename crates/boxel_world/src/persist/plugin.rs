@@ -1,6 +1,6 @@
 //! [`PersistPlugin`]: saving and loading a world while it streams (ADR 0024).
 use super::entities::{EntityCodecs, SavedLog, entity_step, entity_work, save_entities_on_exit};
-use super::saver::Persist;
+use super::saver::{Moment, Persist};
 use super::store::{WorldStore, clock_meta, ticks_meta};
 use crate::jobs::{IoTaskPoolExecutor, JobExecutor};
 use crate::streaming::WorldJobs;
@@ -57,7 +57,9 @@ impl Default for PersistSettings {
 /// - [`Saved`](super::Saved) entities, through the registered
 ///   [`EntityCodec`](super::EntityCodec)s: in `PreUpdate`, the ones whose chunk has no slot
 ///   (it unloaded) are saved and despawned, and the ones of the chunks that loaded come back,
-///   before the frame's fixed steps; the autosave and the exit save every one alive.
+///   before the frame's fixed steps; the autosave and the exit save every one alive, in the
+///   same moment and transaction as the edited chunks, the ticks and the clock. A job that
+///   writes entity records writes every staged chunk with them.
 ///
 /// Disk writes run in save jobs on `executor` (the IO task pool by default), one at a time; a
 /// frame only hands chunks over and starts a job. Loads read the store inside the generation
@@ -144,7 +146,7 @@ fn restore_saved(
 
 /// The metadata of a save: the pending ticks and the clock, when the app has them (the clock
 /// only with [`PersistSettings::clock`]).
-fn save_meta(
+pub(super) fn save_meta(
     p: &mut Persist,
     settings: &PersistSettings,
     ticks: Option<&BlockTicks>,
@@ -169,6 +171,11 @@ fn save_meta(
 /// wait: their water must never be saved without its ticks (a crash before the next autosave
 /// would leave it stuck half spread), nor the ticks without the water of the loaded chunks. A
 /// failed snapshot is taken again when it is tried again, not written stale with newer chunks.
+///
+/// While saved entities are alive they are part of that moment, and only the entity step can
+/// save them: the snapshot is asked from it ([`Moment`]), it takes the chunks, the ticks, the
+/// clock and the entities in the next `PreUpdate` (no fixed step in between), and the job starts
+/// in the next frame.
 fn save_step(
     mut jobs: ResMut<WorldJobs>,
     mut map: ResMut<ChunkMap>,
@@ -182,6 +189,18 @@ fn save_step(
     };
     let now = Instant::now();
     p.poll(now, settings.retry_after);
+    match p.moment {
+        // The entity step takes it before the next fixed step; nothing starts before.
+        Moment::Asked => return,
+        Moment::Taken => {
+            if p.can_start(now) {
+                p.moment = Moment::None;
+                p.start(now, settings.max_batch);
+            }
+            return;
+        }
+        Moment::None => {}
+    }
     if p.can_start(now) {
         let autosave = settings
             .autosave
@@ -192,6 +211,10 @@ fn save_step(
         });
         if autosave || p.has_meta() || (ticking && p.queued() > 0) {
             p.last_autosave = now;
+            if !p.entities.live.is_empty() {
+                p.moment = Moment::Asked;
+                return;
+            }
             p.stage_dirty(map.bypass_change_detection());
             save_meta(p, &settings, ticks.as_deref(), time.as_deref());
         }

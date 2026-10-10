@@ -289,6 +289,32 @@ fn a_save_with_metadata_takes_every_staged_chunk() {
     assert_eq!((backend.inner.len(), batches()), (30, before + 3));
 }
 
+/// A job that writes entity records writes every staged chunk with them, in one transaction,
+/// whatever `max_batch` says: a body is never on the disk ahead of the blocks it rests on.
+#[test]
+fn a_save_with_entity_records_takes_every_staged_chunk() {
+    let backend = Arc::new(Counting::default());
+    let store = WorldStore::open(
+        Arc::clone(&backend) as Arc<dyn ChunkStore>,
+        &BlockRegistry::default_blocks(),
+        "test",
+    )
+    .unwrap();
+    let mut p = Persist::new(store, Arc::new(InlineExecutor));
+    let batches = || backend.batches.load(Ordering::SeqCst);
+    for x in 0..10 {
+        p.stage(key(x, 0, 0), stone_chunk());
+    }
+    p.entities.record(&p.store, key(9, 0, 0), 1, vec![1]);
+    let before = batches();
+    p.frame(Instant::now(), 4, Duration::ZERO);
+    assert_eq!(
+        (backend.inner.len(), backend.inner.entity_count(), batches()),
+        (10, 1, before + 1)
+    );
+    assert_eq!(p.queued(), 0);
+}
+
 #[test]
 fn pending_ticks_restore_in_order_relative_to_the_clock() {
     let mut ticks = BlockTicks::default();

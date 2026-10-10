@@ -61,6 +61,20 @@ impl Drop for ReportGuard {
     }
 }
 
+/// Where a snapshot of the world stands while saved entities are alive: the edited chunks, the
+/// pending ticks, the clock and the saved entities are one moment of the world, and only the
+/// entity step (an exclusive system) can run the entity codecs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Moment {
+    /// No snapshot waits.
+    #[default]
+    None,
+    /// The save step wants one: the next entity step takes it, whole.
+    Asked,
+    /// The entity step took it: the next save job writes it.
+    Taken,
+}
+
 /// The world's saving state (see the [module docs](self)).
 pub(crate) struct Persist {
     pub(crate) store: WorldStore,
@@ -95,6 +109,8 @@ pub(crate) struct Persist {
     /// The saved entities: where each one's record is, the ones alive, the records waiting for
     /// a save job and the ones chunk loads read (see `super::entities`).
     pub(crate) entities: EntityIndex,
+    /// The snapshot the entity step takes for the save step (see [`Moment`]).
+    pub(crate) moment: Moment,
 }
 
 impl Persist {
@@ -145,6 +161,7 @@ impl Persist {
             last_autosave: Instant::now(),
             restore: Some((opened.ticks, opened.clock)),
             entities,
+            moment: Moment::None,
         }
     }
 
@@ -248,10 +265,11 @@ impl Persist {
     }
 
     /// The staged chunks the next job takes: at most `max_batch`, or every one when it writes
-    /// metadata (the ticks and the clock are of the moment the chunks were staged up to: they go
-    /// in the same transaction).
+    /// metadata or entity records (the ticks, the clock and the entities are of the moment the
+    /// chunks were staged up to: they go in the same transaction, never ahead of the blocks a
+    /// body rests on).
     fn batch_len(&self, max_batch: usize) -> usize {
-        if self.meta.is_empty() {
+        if self.meta.is_empty() && !self.entities.has_ops() {
             max_batch.max(1).min(self.queue.len())
         } else {
             self.queue.len()

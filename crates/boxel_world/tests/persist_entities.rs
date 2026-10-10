@@ -19,10 +19,11 @@ use boxel_world::persist::{
     ChunkStore, EntityCodec, MemoryStore, PersistPlugin, PersistSettings, SaveBatch, Saved,
     SavedId, SavedIds, WorldStore, add_entity_codec,
 };
-use boxel_world::{ChunkViewer, WorldPlugin, WorldSettings, WorldStats};
+use boxel_world::{BlockTicks, ChunkViewer, EditQueue, WorldPlugin, WorldSettings, WorldStats};
 use boxel_worldgen::WorldGenerator;
+use std::io;
 use std::ops::RangeInclusive;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // ------------------------------------------------------------------ the world
@@ -608,4 +609,89 @@ fn bad_records_stay_as_they_are() {
     let (mut app, _) = setup.start(o);
     let values: Vec<u64> = things(&mut app).iter().map(|t| t.value).collect();
     assert_eq!(values, vec![1, 5]);
+}
+
+/// A memory store that keeps a copy of every write transaction.
+#[derive(Default)]
+struct Logged {
+    inner: MemoryStore,
+    batches: Mutex<Vec<SaveBatch>>,
+}
+
+impl ChunkStore for Logged {
+    fn load(&self, key: ChunkKey) -> io::Result<Option<Vec<u8>>> {
+        self.inner.load(key)
+    }
+    fn keys(&self) -> io::Result<Vec<ChunkKey>> {
+        self.inner.keys()
+    }
+    fn load_meta(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
+        self.inner.load_meta(name)
+    }
+    fn save_batch(&self, batch: &SaveBatch) -> io::Result<()> {
+        self.batches.lock().unwrap().push(batch.clone());
+        self.inner.save_batch(batch)
+    }
+    fn entity_keys(&self) -> io::Result<Vec<(ChunkKey, u64)>> {
+        self.inner.entity_keys()
+    }
+    fn load_entities(&self, key: ChunkKey) -> io::Result<Vec<(u64, Vec<u8>)>> {
+        self.inner.load_entities(key)
+    }
+}
+
+/// The saved entities alive are one moment of the world with the edited chunks and the pending
+/// ticks: they are saved in the same transaction, also when that snapshot is taken because an
+/// edited chunk unloaded while block ticks wait (not only by the autosave).
+#[test]
+fn entities_are_saved_in_the_moment_of_the_chunks_and_ticks() {
+    let o = BlockPos::new(0, 0, 0);
+    let backend = Arc::new(Logged::default());
+    let setup = Setup::new(Arc::clone(&backend) as Arc<dyn ChunkStore>, o.y);
+    let (mut app, viewer) = setup.start(o);
+    app.init_resource::<BlockTicks>();
+    // A thing where a second viewer keeps the world loaded, an edit in a chunk that unloads,
+    // and a tick waiting.
+    let thing = Thing {
+        at: at(o, 4096, 0, 1),
+        value: 1,
+    };
+    app.world_mut().spawn((
+        Transform::from_translation(center(thing.at)),
+        ChunkViewer::new(1).with_vertical_radius(1),
+    ));
+    settle(&mut app);
+    let e = app.world_mut().spawn((Saved::new(), thing)).id();
+    settle(&mut app);
+    let edited = at(o, 5, 0, 5);
+    let stone = BlockRegistry::default_blocks()
+        .by_name("boxel:stone")
+        .unwrap();
+    app.world_mut()
+        .resource_mut::<EditQueue>()
+        .set_block(edited, stone);
+    app.world_mut()
+        .resource_mut::<BlockTicks>()
+        .schedule(edited, 100_000);
+    settle(&mut app);
+    app.world_mut().get_mut::<Thing>(e).unwrap().value = 2;
+    move_viewer(&mut app, viewer, at(o, -4096, 0, 0));
+    assert_eq!(things(&mut app).len(), 1, "the thing stayed loaded");
+    let batches = backend.batches.lock().unwrap();
+    let snapshot = batches
+        .iter()
+        .find(|b| b.meta.iter().any(|(n, _)| n == "boxel:ticks"))
+        .expect("the unload saved the ticks");
+    assert!(
+        snapshot.chunks.iter().any(|(k, _)| *k == chunk_key(edited)),
+        "with the edited chunk"
+    );
+    let record = snapshot
+        .entities
+        .iter()
+        .find(|(c, _, _)| *c == chunk_key(thing.at))
+        .and_then(|(_, _, bytes)| bytes.as_ref())
+        .expect("and the thing alive");
+    let part = &decode_entity(record).unwrap()[0];
+    assert_eq!(part.bytes[24..], 2u64.to_le_bytes(), "as it is now");
 }
