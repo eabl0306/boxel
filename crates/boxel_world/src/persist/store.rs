@@ -2,7 +2,7 @@
 use super::backend::{ChunkStore, RedbStore, SaveBatch};
 use super::format::{
     self, FORMAT_VERSION, FormatError, IdMap, decode_chunk, decode_clock, decode_names,
-    decode_ticks, encode_chunk, encode_names,
+    decode_ticks, encode_chunk, encode_names, open_entity, seal_entity,
 };
 use boxel_ecs::prelude::*;
 use boxel_voxel::{BlockPos, BlockRegistry, ChunkData, ChunkKey};
@@ -130,8 +130,9 @@ struct Staged {
     seq: u64,
 }
 
-/// An entity record waiting to be written (`None`: its removal), with the order it was handed
-/// over in.
+/// An entity record waiting to be written, as content without its envelope (the save job
+/// seals it: the checksum and LZ4 stay off the main thread); `None`: its removal. With the order
+/// it was handed over in.
 struct StagedEntity {
     bytes: Option<Arc<Vec<u8>>>,
     seq: u64,
@@ -144,7 +145,7 @@ struct StagedEntity {
 pub(crate) struct EntityWrite {
     pub(crate) chunk: ChunkKey,
     pub(crate) id: u64,
-    /// `None`: the record is removed.
+    /// The record's content, unsealed (the job seals it); `None`: the record is removed.
     pub(crate) bytes: Option<Arc<Vec<u8>>>,
     seq: u64,
 }
@@ -501,7 +502,7 @@ impl WorldStore {
                 .collect(),
             entities: entities
                 .iter()
-                .map(|w| (w.chunk, w.id, w.bytes.as_deref().cloned()))
+                .map(|w| (w.chunk, w.id, w.bytes.as_deref().map(|b| seal_entity(b))))
                 .collect(),
         };
         let mut written = Vec::with_capacity(staged.len());
@@ -546,9 +547,9 @@ impl WorldStore {
         Ok(written.len())
     }
 
-    /// Hands the record of entity `id` in chunk `chunk` over for saving (`None`: its removal;
-    /// the newest wins): from now on loads of `chunk` read it over the stored records until a
-    /// save job writes it.
+    /// Hands the record of entity `id` in chunk `chunk` over for saving, as content without its
+    /// envelope ([`format::entity_payload`]; `None`: its removal; the newest wins): from now on
+    /// loads of `chunk` read it over the stored records until a save job writes it.
     pub(crate) fn stage_entity(&self, chunk: ChunkKey, id: u64, bytes: Option<Arc<Vec<u8>>>) {
         let seq = self.inner.next_seq.fetch_add(1, Ordering::Relaxed);
         self.inner
@@ -560,13 +561,16 @@ impl WorldStore {
             .insert(id, StagedEntity { bytes, seq });
     }
 
-    /// The saved entity records of chunk `key`, by id, ascending: the stored ones with the
-    /// records and removals waiting to be written over them. `Err` when the store fails
-    /// (counted in [`PersistStats::entity_errors`]): the records stay as they are.
+    /// The saved entity records of chunk `key`, by id, ascending, as their content
+    /// ([`format::entity_payload`]): the stored ones with the records and removals waiting to
+    /// be written over them. A stored record that is damaged or of another record version is
+    /// left out (logged and counted in [`PersistStats::entity_errors`]; it stays as it is).
+    /// `Err` when the store fails (counted too): the records stay as they are. Runs in the
+    /// chunk's generation job, so the envelopes are opened off the main thread.
     pub(crate) fn load_entities(&self, key: ChunkKey) -> io::Result<Vec<(u64, Vec<u8>)>> {
         // The staged ones first: a save job that lands between the two reads wrote the same
         // records, and laying the staged ones over the store again changes nothing.
-        let staged: Vec<(u64, Option<Arc<Vec<u8>>>)> = self
+        let staged: HashMap<u64, Option<Arc<Vec<u8>>>, foldhash::fast::FixedState> = self
             .inner
             .pending_entities
             .lock()
@@ -583,7 +587,23 @@ impl WorldStore {
             self.inner.entity_errors.fetch_add(1, Ordering::Relaxed);
             tracing::error!(chunk = ?key.pos, "saved entities cannot be read now: {e}");
         })?;
-        let mut records: std::collections::BTreeMap<u64, Vec<u8>> = stored.into_iter().collect();
+        let mut records: std::collections::BTreeMap<u64, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        for (id, bytes) in stored {
+            // A staged record or removal replaces it: it is not even opened.
+            if staged.contains_key(&id) {
+                continue;
+            }
+            match open_entity(&bytes) {
+                Ok(payload) => {
+                    records.insert(id, payload);
+                }
+                Err(e) => {
+                    self.inner.entity_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(id, chunk = ?key.pos, "a saved entity cannot be read: {e}");
+                }
+            }
+        }
         for (id, bytes) in staged {
             match bytes {
                 Some(bytes) => records.insert(id, Vec::clone(&bytes)),

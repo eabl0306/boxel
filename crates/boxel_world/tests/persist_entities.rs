@@ -6,6 +6,7 @@
 //! references between saved entities come back; damaged records, another record version, a
 //! codec version it cannot read and a codec that is gone leave the records as they are.
 use boxel_app::App;
+use boxel_ecs::change_detection::Tick;
 use boxel_ecs::prelude::*;
 use boxel_math::DVec3;
 use boxel_transform::Transform;
@@ -23,6 +24,7 @@ use boxel_world::{BlockTicks, ChunkViewer, EditQueue, WorldPlugin, WorldSettings
 use boxel_worldgen::WorldGenerator;
 use std::io;
 use std::ops::RangeInclusive;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -82,6 +84,13 @@ impl EntityCodec for ThingCodec {
     fn position(&self, world: &World, entity: Entity) -> Option<BlockPos> {
         world.get::<Thing>(entity).map(|t| t.at)
     }
+    fn changed(&self, world: &World, entity: Entity, since: Tick) -> bool {
+        let now = world.read_change_tick();
+        world
+            .entity(entity)
+            .get_change_ticks::<Thing>()
+            .is_some_and(|t| t.is_changed(since, now))
+    }
     fn save(&self, world: &World, entity: Entity, _ids: &SavedIds<'_>) -> Option<Vec<u8>> {
         let t = world.get::<Thing>(entity)?;
         let mut out = Vec::new();
@@ -137,6 +146,13 @@ impl EntityCodec for LinkCodec {
     }
     fn position(&self, _world: &World, _entity: Entity) -> Option<BlockPos> {
         None
+    }
+    fn changed(&self, world: &World, entity: Entity, since: Tick) -> bool {
+        let now = world.read_change_tick();
+        world
+            .entity(entity)
+            .get_change_ticks::<Link>()
+            .is_some_and(|t| t.is_changed(since, now))
     }
     fn save(&self, world: &World, entity: Entity, ids: &SavedIds<'_>) -> Option<Vec<u8>> {
         let link = world.get::<Link>(entity)?;
@@ -694,4 +710,94 @@ fn entities_are_saved_in_the_moment_of_the_chunks_and_ticks() {
         .expect("and the thing alive");
     let part = &decode_entity(record).unwrap()[0];
     assert_eq!(part.bytes[24..], 2u64.to_le_bytes(), "as it is now");
+}
+
+/// Counts the records made (it saves nothing of its own and never says an entity changed).
+struct Probe(Arc<AtomicUsize>);
+
+impl EntityCodec for Probe {
+    fn name(&self) -> &str {
+        "test:probe"
+    }
+    fn version(&self) -> u32 {
+        1
+    }
+    fn position(&self, _world: &World, _entity: Entity) -> Option<BlockPos> {
+        None
+    }
+    fn changed(&self, _world: &World, _entity: Entity, _since: Tick) -> bool {
+        false
+    }
+    fn save(&self, _world: &World, _entity: Entity, _ids: &SavedIds<'_>) -> Option<Vec<u8>> {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+    fn load(
+        &self,
+        _world: &mut World,
+        _entity: Entity,
+        _version: u32,
+        _bytes: &[u8],
+        _ids: &SavedIds<'_>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// A component nothing saves.
+#[derive(Component)]
+struct Mark;
+
+/// Runs the autosave a few times (every frame it can), then turns it off and settles.
+fn autosaves(app: &mut App) {
+    let settings = |autosave| PersistSettings {
+        autosave,
+        retry_after: Duration::ZERO,
+        ..PersistSettings::default()
+    };
+    app.insert_resource(settings(Some(Duration::ZERO)));
+    for _ in 0..8 {
+        app.update();
+    }
+    app.insert_resource(settings(None));
+    settle(app);
+}
+
+/// The autosave makes the record again only for the entities a codec says changed, or that
+/// gained or lost a component: entities that did not change cost no encoding, however many
+/// are alive. Putting away an entity whose record is current makes nothing either.
+#[test]
+fn the_autosave_makes_again_only_the_records_that_changed() {
+    let o = BlockPos::new(1 << 40, 0, -(1 << 31));
+    let setup = Setup::new(Arc::new(MemoryStore::new()), o.y);
+    let (mut app, viewer) = setup.start(o);
+    let made = Arc::new(AtomicUsize::new(0));
+    add_entity_codec(&mut app, Probe(Arc::clone(&made)));
+    let scene = scene(o);
+    spawn_things(&mut app, &scene);
+    settle(&mut app);
+    let made = || made.load(Ordering::Relaxed);
+    autosaves(&mut app);
+    assert_eq!(made(), scene.len(), "each one once");
+    autosaves(&mut app);
+    assert_eq!(made(), scene.len(), "nothing changed");
+    // One changes, one gains a component.
+    let entity = |app: &mut App, value: u64| {
+        let mut q = app.world_mut().query::<(Entity, &Thing)>();
+        q.iter(app.world())
+            .find(|(_, t)| t.value == value)
+            .unwrap()
+            .0
+    };
+    let (a, b) = (entity(&mut app, 100), entity(&mut app, 101));
+    app.world_mut().get_mut::<Thing>(a).unwrap().value = 1100;
+    app.world_mut().entity_mut(b).insert(Mark);
+    autosaves(&mut app);
+    assert_eq!(made(), scene.len() + 2);
+    // Unloading keeps the current records as they are.
+    move_viewer(&mut app, viewer, at(o, 1 << 13, 0, 0));
+    assert!(things(&mut app).is_empty());
+    assert_eq!(made(), scene.len() + 2);
+    move_viewer(&mut app, viewer, o);
+    assert_eq!(things(&mut app).len(), scene.len(), "all back");
 }

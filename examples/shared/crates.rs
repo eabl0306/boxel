@@ -6,6 +6,7 @@
 //! nearest one.
 use boxel::camera::FlyCameraSystems;
 use boxel::debug_overlay::OverlayLines;
+use boxel::ecs::change_detection::Tick;
 use boxel::physics::{BodyPosition, Teleport};
 use boxel::prelude::*;
 use boxel::voxel::BlockPos;
@@ -34,6 +35,10 @@ impl EntityCodec for CrateCodec {
     fn position(&self, _world: &World, _entity: Entity) -> Option<BlockPos> {
         // Physics places it.
         None
+    }
+    fn changed(&self, _world: &World, _entity: Entity, _since: Tick) -> bool {
+        // A marker: gaining or losing it is a change the world sees itself.
+        false
     }
     fn save(&self, world: &World, entity: Entity, _ids: &SavedIds<'_>) -> Option<Vec<u8>> {
         world.get::<Crate>(entity).map(|_| Vec::new())

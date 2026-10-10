@@ -604,12 +604,20 @@ fn stores_keep_entity_records_by_chunk() {
 }
 
 /// Staged entity records and removals are read over the stored ones until a write lands, and a
-/// write drops only the staged entries it wrote.
+/// write drops only the staged entries it wrote. Records are staged as their content and stored
+/// sealed (the save job seals them, the load opens them); a stored record that cannot be opened
+/// is left out and counted.
 #[test]
 fn staged_entity_records_are_read_until_written() {
     let backend = Arc::new(MemoryStore::new());
     let c = key(3, -2, 1 << 40);
-    backend.save_batch(&entity_batch(c, &[3, 4])).unwrap();
+    let sealed = |id: u64| Some(format::seal_entity(&id.to_le_bytes()));
+    backend
+        .save_batch(&SaveBatch {
+            entities: vec![(c, 3, sealed(3)), (c, 4, sealed(4)), (c, 6, Some(vec![6]))],
+            ..SaveBatch::default()
+        })
+        .unwrap();
     let store = open(&backend);
     store.stage_entity(c, 5, Some(Arc::new(vec![5])));
     store.stage_entity(c, 3, None);
@@ -618,21 +626,35 @@ fn staged_entity_records_are_read_until_written() {
             .load_entities(c)
             .unwrap()
             .into_iter()
-            .map(|(id, _)| id)
+            .map(|(id, bytes)| {
+                let expected = if id == 5 {
+                    vec![5]
+                } else {
+                    id.to_le_bytes().to_vec()
+                };
+                assert_eq!(bytes, expected, "the content of {id}");
+                id
+            })
             .collect()
     };
     assert_eq!(ids(&store), vec![4, 5]);
+    assert_eq!(store.stats().entity_errors, 1, "6 is not sealed");
     assert_eq!(store.stats().pending_entities, 2);
     store
         .write(&[], &[], &store.entity_writes(&[(c, 5)]))
         .unwrap();
     assert_eq!(store.stats().pending_entities, 1, "the removal waits");
-    assert_eq!(backend.entity_count(), 3);
+    assert_eq!(backend.entity_count(), 4);
+    assert_eq!(
+        backend.load_entities(c).unwrap()[2],
+        (5, format::seal_entity(&[5])),
+        "sealed by the write"
+    );
     store
         .write(&[], &[], &store.entity_writes(&[(c, 3)]))
         .unwrap();
     assert_eq!(ids(&store), vec![4, 5]);
-    assert_eq!(backend.entity_count(), 2);
+    assert_eq!(backend.entity_count(), 3);
     assert_eq!(store.stats().pending_entities, 0);
     assert_eq!(store.stats().saved_entities, 1);
 }
@@ -758,5 +780,8 @@ fn a_failed_entity_save_is_written_once_the_disk_works() {
     drop(p);
     drop(backend);
     let redb = RedbStore::open(&tmp.0).unwrap();
-    assert_eq!(redb.load_entities(c).unwrap(), vec![(1, vec![42])]);
+    assert_eq!(
+        redb.load_entities(c).unwrap(),
+        vec![(1, format::seal_entity(&[42]))]
+    );
 }

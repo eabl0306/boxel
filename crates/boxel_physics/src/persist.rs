@@ -18,6 +18,7 @@ use crate::components::{
 };
 use crate::core::{BodySettings, CollisionLayers, Shape};
 use crate::swim::{SwimSettings, Swimmer};
+use boxel_ecs::change_detection::{ComponentTicks, Tick};
 use boxel_ecs::prelude::*;
 use boxel_math::{DVec3, Vec2};
 use boxel_transform::Transform;
@@ -211,6 +212,31 @@ impl EntityCodec for BodyCodec {
 
     fn position(&self, world: &World, entity: Entity) -> Option<BlockPos> {
         position_of(world, entity).map(|p| p.block)
+    }
+
+    /// From the change ticks of what it saves (the markers it saves are components the entity
+    /// gains or loses, which the world sees itself). A sleeping body changes nothing: the
+    /// autosave skips it.
+    fn changed(&self, world: &World, entity: Entity, since: Tick) -> bool {
+        let Ok(e) = world.get_entity(entity) else {
+            return true;
+        };
+        let now = world.read_change_tick();
+        let after = |ticks: Option<ComponentTicks>| ticks.is_some_and(|t| t.is_changed(since, now));
+        after(e.get_change_ticks::<RigidBody>())
+            || after(e.get_change_ticks::<BodyPosition>())
+            || after(e.get_change_ticks::<Transform>())
+            || after(e.get_change_ticks::<Teleport>())
+            || after(e.get_change_ticks::<PhysicsSync>())
+            || after(e.get_change_ticks::<Velocity>())
+            || after(e.get_change_ticks::<BodySettings>())
+            || after(e.get_change_ticks::<Contacts>())
+            || after(e.get_change_ticks::<Collider>())
+            || after(e.get_change_ticks::<Interpolated>())
+            || after(e.get_change_ticks::<CharacterController>())
+            || after(e.get_change_ticks::<MoveIntent>())
+            || after(e.get_change_ticks::<Projectile>())
+            || after(e.get_change_ticks::<Swimmer>())
     }
 
     fn save(&self, world: &World, entity: Entity, ids: &SavedIds<'_>) -> Option<Vec<u8>> {

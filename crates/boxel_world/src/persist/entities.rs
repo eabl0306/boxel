@@ -13,17 +13,22 @@
 //! - A saved entity whose chunk has no slot (it unloaded, or the entity was put where nothing is
 //!   loaded) is put away: saved and despawned. The chunk's generation job reads the records back
 //!   when it loads again, and the entity step brings them back before the next fixed step.
-//! - The autosave and the exit save every saved entity alive, under its current chunk (only the
-//!   ones whose record changed).
+//! - The autosave and the exit save every saved entity alive, under its current chunk: only the
+//!   ones a codec says changed since their record was made ([`EntityCodec::changed`]) or that
+//!   gained or lost a component, and of those only the records that differ. The main thread
+//!   makes the records' content; the save job seals it (checksum and LZ4), and the generation
+//!   job opens the stored ones.
 //! - A record is brought back only if its id is not alive and it is the newest record of its id:
 //!   a chunk that unloads and loads again never brings an entity back twice.
-use super::format::{EntityPart, decode_entity, encode_entity};
+use super::format::{EntityPart, entity_parts, entity_payload};
 use super::plugin::{PersistSettings, save_meta};
 use super::saver::{Moment, Persist};
 use super::store::WorldStore;
 use crate::streaming::WorldJobs;
 use crate::{BlockTicks, ChunkMap, TimeOfDay, WorldSettings};
 use boxel_app::App;
+use boxel_ecs::archetype::ArchetypeId;
+use boxel_ecs::change_detection::Tick;
 use boxel_ecs::lifecycle::HookContext;
 use boxel_ecs::prelude::*;
 use boxel_ecs::world::DeferredWorld;
@@ -155,6 +160,16 @@ pub trait EntityCodec: Send + Sync + 'static {
     fn position(&self, world: &World, entity: Entity) -> Option<BlockPos>;
     /// This codec's part of `entity`, or `None` if the entity has nothing of this codec.
     fn save(&self, world: &World, entity: Entity, ids: &SavedIds<'_>) -> Option<Vec<u8>>;
+    /// Whether what this codec saves of `entity` may have changed since the world's change tick
+    /// `since` (when the entity's record was last made, or read back). The autosave makes the
+    /// record again only for the entities some codec says changed, or that gained or lost a
+    /// component: its cost follows what moved, not how many saved entities are alive. The
+    /// default says yes (the record is always made again); a codec answers from the change
+    /// ticks of the components it saves (`EntityRef::get_change_ticks`).
+    fn changed(&self, world: &World, entity: Entity, since: Tick) -> bool {
+        let _ = (world, entity, since);
+        true
+    }
     /// Puts back on `entity` (a new entity with only [`Saved`]) what [`EntityCodec::save`]
     /// wrote with `version`. Every entity of the chunk exists already, so references resolve
     /// through `ids`. An error keeps the part as it was (written back with the entity).
@@ -206,7 +221,7 @@ pub fn add_entity_codec(app: &mut App, codec: impl EntityCodec) {
         .add(Arc::new(codec));
 }
 
-/// FNV-1a of a record: whether an entity's record changed since it was last staged.
+/// FNV-1a of a record's content: whether an entity's record changed since it was last staged.
 fn fingerprint(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
@@ -226,6 +241,10 @@ pub(crate) struct EntityIndex {
     written: HashMap<u64, u64, Fixed>,
     /// The saved entities alive, by saved id.
     pub(crate) live: HashMap<u64, Entity, Fixed>,
+    /// For the entities alive whose record is current (made or read back): the world's change
+    /// tick then and the entity's archetype. The autosave skips them while no codec says they
+    /// changed and their components are the same ones.
+    made: HashMap<u64, (Tick, ArchetypeId), Fixed>,
     /// The next id to give.
     next_id: u64,
     /// The next id changed since a save job last took it.
@@ -247,6 +266,7 @@ impl EntityIndex {
             per_chunk: HashMap::default(),
             written: HashMap::default(),
             live: HashMap::default(),
+            made: HashMap::default(),
             next_id: next_id.max(1),
             next_unsaved: false,
             queue: Vec::new(),
@@ -459,7 +479,32 @@ impl Step<'_> {
             .map(|block| self.key(ChunkPos::containing(block)))
     }
 
-    /// The record of `entity`: every codec's part, and the kept parts no codec wrote.
+    /// Whether the record of the entity alive `entity` (saved id `id`) is the one made or read
+    /// last: no codec says it changed since, and it has the same components.
+    fn current(&self, id: u64, entity: Entity) -> bool {
+        let Some(&(tick, archetype)) = self.p.entities.made.get(&id) else {
+            return false;
+        };
+        self.world
+            .get_entity(entity)
+            .is_ok_and(|e| e.archetype().id() == archetype)
+            && !self
+                .codecs
+                .iter()
+                .any(|c| c.changed(self.world, entity, tick))
+    }
+
+    /// Notes that the record of the entity alive `entity` (saved id `id`) is current now.
+    fn made(&mut self, id: u64, entity: Entity) {
+        let tick = self.world.change_tick();
+        if let Ok(e) = self.world.get_entity(entity) {
+            let archetype = e.archetype().id();
+            self.p.entities.made.insert(id, (tick, archetype));
+        }
+    }
+
+    /// The content of `entity`'s record (the save job seals it): every codec's part, and the
+    /// kept parts no codec wrote.
     fn encode(&self, entity: Entity) -> Vec<u8> {
         let ids = SavedIds {
             live: &self.p.entities.live,
@@ -482,11 +527,11 @@ impl Step<'_> {
                 }
             }
         }
-        encode_entity(&parts)
+        entity_payload(&parts)
     }
 
-    /// Brings back the entities of `chunk`'s `records` that are its newest records and not
-    /// alive.
+    /// Brings back the entities of `chunk`'s `records` (their content) that are its newest
+    /// records and not alive.
     fn restore(&mut self, chunk: ChunkKey, records: Vec<(u64, Vec<u8>)>) {
         let (mut loaded, mut errors) = (0, 0);
         let mut spawned = Vec::new();
@@ -495,7 +540,7 @@ impl Step<'_> {
             if e.at(id) != Some(chunk) || e.live.contains_key(&id) {
                 continue;
             }
-            match decode_entity(&bytes) {
+            match entity_parts(&bytes) {
                 Ok(parts) => {
                     let entity = self
                         .world
@@ -558,6 +603,7 @@ impl Step<'_> {
             {
                 saved.kept = kept;
             }
+            self.made(id, entity);
             loaded += 1;
         }
         if loaded + errors > 0 {
@@ -570,6 +616,7 @@ impl Step<'_> {
         let e = &mut self.p.entities;
         if e.live.get(&id) == Some(&entity) {
             e.live.remove(&id);
+            e.made.remove(&id);
             e.forget(&self.p.store, id);
         }
     }
@@ -620,11 +667,21 @@ impl Step<'_> {
                     .then_some((id, entity, chunk))
             })
             .collect();
-        // Every record first: references between the entities that go resolve.
-        let records: Vec<Vec<u8>> = away.iter().map(|&(_, e, _)| self.encode(e)).collect();
+        // Every record first: references between the entities that go resolve. A record that
+        // is current under that chunk stays as it is.
+        let records: Vec<Option<Vec<u8>>> = away
+            .iter()
+            .map(|&(id, e, chunk)| {
+                (self.p.entities.at(id) != Some(chunk) || !self.current(id, e))
+                    .then(|| self.encode(e))
+            })
+            .collect();
         for ((id, entity, chunk), bytes) in away.into_iter().zip(records) {
-            self.p.entities.record(&self.p.store, chunk, id, bytes);
+            if let Some(bytes) = bytes {
+                self.p.entities.record(&self.p.store, chunk, id, bytes);
+            }
             self.p.entities.live.remove(&id);
+            self.p.entities.made.remove(&id);
             self.world.despawn(entity);
         }
     }
@@ -648,14 +705,25 @@ impl Step<'_> {
         );
     }
 
-    /// Saves every saved entity alive under its chunk (only the records that changed).
+    /// Saves every saved entity alive under its chunk: the ones whose record is not current
+    /// (see [`EntityCodec::changed`]), and of those only the records that differ.
     fn snapshot(&mut self) {
-        for (id, entity) in self.alive() {
+        let mut stale: Vec<(u64, Entity)> = self
+            .p
+            .entities
+            .live
+            .iter()
+            .map(|(&id, &e)| (id, e))
+            .filter(|&(id, e)| !self.current(id, e))
+            .collect();
+        stale.sort_unstable_by_key(|&(id, _)| id);
+        for (id, entity) in stale {
             let Some(chunk) = self.chunk_of(entity) else {
                 continue;
             };
             let bytes = self.encode(entity);
             self.p.entities.record(&self.p.store, chunk, id, bytes);
+            self.made(id, entity);
         }
     }
 }

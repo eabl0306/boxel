@@ -573,6 +573,17 @@ pub struct EntityPart {
 
 /// The record of one entity: its parts, in the order given.
 pub fn encode_entity(parts: &[EntityPart]) -> Vec<u8> {
+    seal_entity(&entity_payload(parts))
+}
+
+/// The inverse of [`encode_entity`].
+pub fn decode_entity(bytes: &[u8]) -> Result<Vec<EntityPart>, FormatError> {
+    entity_parts(&open_entity(bytes)?)
+}
+
+/// The content of an entity record before its envelope: what the main thread makes (the save
+/// job seals it, [`seal_entity`]).
+pub(crate) fn entity_payload(parts: &[EntityPart]) -> Vec<u8> {
     let mut payload = Vec::new();
     put_varint(&mut payload, parts.len() as u64);
     for part in parts {
@@ -582,13 +593,22 @@ pub fn encode_entity(parts: &[EntityPart]) -> Vec<u8> {
         put_varint(&mut payload, part.bytes.len() as u64);
         payload.extend_from_slice(&part.bytes);
     }
-    seal(ENTITY_MAGIC, ENTITY_VERSION, &payload)
+    payload
 }
 
-/// The inverse of [`encode_entity`].
-pub fn decode_entity(bytes: &[u8]) -> Result<Vec<EntityPart>, FormatError> {
-    let payload = open(ENTITY_MAGIC, ENTITY_VERSION, bytes)?;
-    let mut r = Reader::new(&payload);
+/// An entity record from its content ([`entity_payload`]): the envelope, checksum and LZ4.
+pub(crate) fn seal_entity(payload: &[u8]) -> Vec<u8> {
+    seal(ENTITY_MAGIC, ENTITY_VERSION, payload)
+}
+
+/// The content of an entity record ([`seal_entity`]).
+pub(crate) fn open_entity(bytes: &[u8]) -> Result<Vec<u8>, FormatError> {
+    open(ENTITY_MAGIC, ENTITY_VERSION, bytes)
+}
+
+/// The parts in the content of an entity record ([`entity_payload`]).
+pub(crate) fn entity_parts(payload: &[u8]) -> Result<Vec<EntityPart>, FormatError> {
+    let mut r = Reader::new(payload);
     let n = r.count(payload.len())?;
     let mut parts = Vec::with_capacity(n);
     for _ in 0..n {

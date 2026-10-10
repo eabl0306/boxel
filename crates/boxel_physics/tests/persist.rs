@@ -9,9 +9,9 @@ use boxel_app::App;
 use boxel_ecs::prelude::*;
 use boxel_math::{DVec3, I64Vec3, Vec2};
 use boxel_physics::{
-    BODY_CODEC, BodyPosition, BodySettings, CharacterController, Collider, Contacts, Interpolated,
-    MoveIntent, OnBlock, Projectile, ReportContacts, RigidBody, Sleeping, SwimPlugin, SwimSettings,
-    Swimmer, Velocity,
+    BODY_CODEC, BodyCodec, BodyPosition, BodySettings, CharacterController, Collider, Contacts,
+    Interpolated, MoveIntent, OnBlock, Projectile, ReportContacts, RigidBody, Sleeping, SwimPlugin,
+    SwimSettings, Swimmer, Velocity,
 };
 use boxel_transform::Transform;
 use boxel_voxel::{BlockPos, BlockRegistry, ChunkKey, ChunkPos, MAX_BLOCK_COORD, WorldPos};
@@ -19,7 +19,8 @@ use boxel_world::ChunkViewer;
 use boxel_world::jobs::InlineExecutor;
 use boxel_world::persist::format::{EntityPart, encode_entity};
 use boxel_world::persist::{
-    ChunkStore, MemoryStore, PersistPlugin, PersistSettings, SaveBatch, Saved, SavedId, WorldStore,
+    ChunkStore, EntityCodec, MemoryStore, PersistPlugin, PersistSettings, SaveBatch, Saved,
+    SavedId, WorldStore,
 };
 use sim::Sim;
 use std::sync::Arc;
@@ -406,4 +407,49 @@ fn a_sleeping_pile_comes_back_asleep() {
             .woken,
         0
     );
+}
+
+/// `BodyCodec::changed` (what the autosave asks before making a record again): a sleeping body
+/// changes nothing step after step; a step of an awake body, a velocity set or a teleport does.
+#[test]
+fn a_sleeping_body_does_not_change_for_the_autosave() {
+    let base = bases()[2];
+    let backend = Arc::new(MemoryStore::new());
+    let mut sim = start(&backend, base);
+    let crate_ = sim.body(
+        sim.pos(3.5, 5.0, 3.5),
+        (
+            Saved::new(),
+            Collider::aabb(DVec3::splat(0.375)),
+            Interpolated::default(),
+        ),
+    );
+    let ball = sim.body(
+        sim.pos(9.5, 4.25, 3.5),
+        (
+            Saved::new(),
+            Collider::sphere(0.25),
+            Velocity(DVec3::new(2.0, 0.0, 0.0)),
+        ),
+    );
+    sim.steps(120);
+    assert!(sim.asleep(crate_));
+    let changed =
+        |sim: &mut Sim, entity: Entity, since| BodyCodec.changed(sim.app.world(), entity, since);
+    let since = sim.app.world_mut().change_tick();
+    sim.steps(40);
+    calm(&mut sim);
+    assert!(!changed(&mut sim, crate_, since), "asleep, unchanged");
+    sim.app.world_mut().get_mut::<Velocity>(ball).unwrap().0 = DVec3::new(1.0, 2.0, 0.0);
+    sim.steps(1);
+    assert!(changed(&mut sim, ball, since), "awake and moving");
+    let since = sim.app.world_mut().change_tick();
+    sim.idle_frame();
+    assert!(!changed(&mut sim, crate_, since));
+    let to = sim.pos(3.5, 6.0, 3.5);
+    sim.app
+        .world_mut()
+        .entity_mut(crate_)
+        .insert(boxel_physics::Teleport(to));
+    assert!(changed(&mut sim, crate_, since), "teleported");
 }
