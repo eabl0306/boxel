@@ -9,13 +9,14 @@
 //! picked by the property values of one of the game's states (ADR 0019): `game:log[axis=y]` reads
 //! the pack's `axis=y` variant ([`pack_variant`]). A layer without a recipe reads the texture
 //! named like it (`game:copper_ore` -> `minecraft:block/copper_ore`). Layers the pack cannot fill
-//! keep their procedural pixels and add a warning to the [`TextureReport`].
+//! keep their procedural pixels and add a warning to the [`TextureReport`], as do recipes the
+//! registry cannot use.
 //!
 //! A layer whose texture is animated (`.png.mcmeta`, water, lava, the sea lantern...) also keeps
 //! the finished layer of every frame its animation shows ([`LayerAnimation`], ADR 0028); the
 //! array holds the frame of tick 0.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -110,8 +111,8 @@ pub struct TextureReport {
     pub load_time: Duration,
     /// Non-fatal warnings of the pack reader itself (skipped assets, odd sizes...).
     pub pack_warnings: usize,
-    /// Mapping problems: layers that kept their procedural pixels, missing overlays, a pack that
-    /// failed to open.
+    /// Mapping problems: layers that kept their procedural pixels, missing overlays, recipes the
+    /// registry cannot use, a pack that failed to open.
     pub warnings: Vec<String>,
 }
 
@@ -173,6 +174,7 @@ fn pack_block_textures(
     warnings: &mut Vec<String>,
 ) -> (BlockTextureData, u32) {
     let size = pack_texture_size(pack, warnings);
+    check_recipes(registry, recipes, warnings);
     let specs = registry.textures();
     let shapes = layer_shapes(registry);
     let mut data = Vec::with_capacity(layer_bytes(size) * specs.len().max(1));
@@ -250,6 +252,30 @@ fn pack_block_textures(
         animations: Arc::from(animations),
     };
     (data, from_pack)
+}
+
+/// Warns about the recipes `registry` cannot use (they are the game's input): one for a layer it
+/// lacks, a second one for a layer (the first one counts), and a state that does not parse (the
+/// blockstate variant is then picked without its values).
+fn check_recipes(registry: &BlockRegistry, recipes: &[LayerRecipe], warnings: &mut Vec<String>) {
+    let layers: HashSet<&str> = registry
+        .textures()
+        .iter()
+        .map(|t| t.name.as_str())
+        .collect();
+    let mut seen = HashSet::new();
+    for recipe in recipes {
+        let layer = recipe.layer.as_str();
+        if !layers.contains(layer) {
+            warnings.push(format!("{layer}: recipe for no texture layer; ignored"));
+        } else if !seen.insert(layer) {
+            warnings.push(format!("{layer}: second recipe for the layer; ignored"));
+        } else if !recipe.state.is_empty()
+            && let Err(e) = registry.parse_state(&recipe.state)
+        {
+            warnings.push(format!("{layer}: recipe state {}: {e}", recipe.state));
+        }
+    }
 }
 
 /// Which flow layers are animated ([`BlockTextureData::animated_flow`]): slot 0 for fluids that
@@ -1033,6 +1059,64 @@ pub(crate) mod tests {
         assert_eq!(flow_of(&["magma_side"]), [false, true]);
         assert_eq!(flow_of(&["crust"]), [false, false]);
         assert_eq!(flow_of(&["goo_side", "magma_side"]), [true, true]);
+    }
+
+    /// #48: the recipes are the game's input, so the ones the registry cannot use warn: a layer
+    /// it lacks, a second recipe for a layer (the first one counts) and a state that does not
+    /// parse (the variant is then picked without its values).
+    #[test]
+    fn recipes_the_registry_cannot_use_warn() {
+        let pack = TempPack::new("bad_recipes");
+        pack.png("stone", 16, 16, |_, _| [9, 9, 9, 255]);
+        let registry = boxel_demo::blocks::registry();
+        let recipe = |layer: &str, state: &str| LayerRecipe {
+            layer: layer.to_string(),
+            block: "stone".to_string(),
+            state: state.to_string(),
+            variant: String::new(),
+            face: boxel_pack::FaceName::North,
+            tint: None,
+            fallback: vec![("block/stone".to_string(), None)],
+            quarter: false,
+        };
+        let source = TextureSource::Pack(PackSource::new(pack.0.clone()).with_recipes(vec![
+            recipe("boxel:stone", ""),
+            recipe("boxel:grass_top_typo", ""),
+            recipe("boxel:stone", "boxel:no_such_block"),
+            recipe("boxel:dirt", "boxel:logs[axis=y]"),
+            recipe("boxel:sand", "boxel:log[axis=up]"),
+        ]));
+        let (data, report) = load_block_textures(&registry, &source).expect("pack");
+        let recipe_warnings: Vec<&str> = report
+            .warnings
+            .iter()
+            .map(String::as_str)
+            .filter(|w| w.contains("recipe"))
+            .collect();
+        assert_eq!(
+            recipe_warnings,
+            [
+                "boxel:grass_top_typo: recipe for no texture layer; ignored",
+                "boxel:stone: second recipe for the layer; ignored",
+                "boxel:dirt: recipe state boxel:logs[axis=y]: unknown block boxel:logs",
+                "boxel:sand: recipe state boxel:log[axis=up]: property axis of boxel:log has no \
+                 value up",
+            ]
+        );
+        // The recipes still read their textures.
+        for layer in ["boxel:stone", "boxel:dirt", "boxel:sand"] {
+            assert_eq!(
+                texel(&data, layer_of(&registry, layer), 1, 1),
+                [9, 9, 9, 255]
+            );
+        }
+        // The demo's recipes are all usable.
+        let (_, report) = load_block_textures(&registry, &demo_pack(pack.0.clone())).expect("pack");
+        assert!(
+            report.warnings.iter().all(|w| !w.contains("recipe")),
+            "{:?}",
+            report.warnings
+        );
     }
 
     /// ADR 0028: animated pack textures keep the finished layer of each frame they show (tint,
