@@ -1,5 +1,3 @@
-crates/boxel_render/src/pack_textures.rs	boxel:lava_flow
-crates/boxel_render/src/pack_textures.rs	boxel:water_flow
 crates/boxel_render/src/smoke.rs	TexturePattern
 crates/boxel_render/src/smoke.rs	TexturePattern
 crates/boxel_render/src/textures.rs	TexturePattern
