@@ -1,6 +1,6 @@
 //! [`ChunkSource`]: the world's [`ChunkMap`] as a [`VoxelSource`].
 
-use crate::core::{Probe, VoxelSource};
+use crate::core::{CollisionTable, Probe, VoxelSource};
 use boxel_voxel::{BlockPos, BlockState, ChunkData, ChunkPos};
 use boxel_world::{ChunkMap, DataState, WorldSettings};
 use std::ops::RangeInclusive;
@@ -17,6 +17,10 @@ use std::ops::RangeInclusive;
 /// It keeps the last chunk it looked up: one hash lookup per chunk touched, then a few
 /// nanoseconds per block. Cheap to create; make one per query or per body and drop it (it
 /// borrows the map, so the world cannot change while it lives).
+///
+/// [`VoxelSource::tall_free`] looks the chunk up the same way (it becomes the one kept): a
+/// `Ready` chunk answers from its palette ([`ChunkData::may_contain`], cached in the chunk), a
+/// uniform one from its state, and a chunk that is not loaded is never free.
 pub struct ChunkSource<'a> {
     map: &'a ChunkMap,
     bounds: Option<RangeInclusive<i64>>,
@@ -53,6 +57,15 @@ impl<'a> ChunkSource<'a> {
         }
     }
 
+    /// Makes `chunk` the kept one.
+    #[inline]
+    fn keep(&mut self, chunk: ChunkPos) {
+        if chunk != self.cached {
+            self.entry = self.lookup(chunk);
+            self.cached = chunk;
+        }
+    }
+
     fn lookup(&self, pos: ChunkPos) -> Entry<'a> {
         if let Some(bounds) = &self.bounds
             && !bounds.contains(&pos.y)
@@ -78,14 +91,21 @@ impl VoxelSource for ChunkSource<'_> {
     #[inline]
     fn probe(&mut self, p: BlockPos) -> Probe {
         let (chunk, local) = p.split();
-        if chunk != self.cached {
-            self.entry = self.lookup(chunk);
-            self.cached = chunk;
-        }
+        self.keep(chunk);
         match self.entry {
             Entry::Uniform(state) => Probe::Block(state),
             Entry::Data(data) => Probe::Block(data.get(local)),
             Entry::Unloaded => Probe::Unloaded,
+        }
+    }
+
+    #[inline]
+    fn tall_free(&mut self, chunk: ChunkPos, table: &CollisionTable) -> bool {
+        self.keep(chunk);
+        match self.entry {
+            Entry::Uniform(state) => !table.is_tall(state),
+            Entry::Data(data) => !data.may_contain(table.tall_states()),
+            Entry::Unloaded => false,
         }
     }
 }

@@ -7,6 +7,7 @@
 //! |---|---|
 //! | `sweep/player_walk`, `sweep/player_land`, `sweep/player_fall` | <= 0.3 us |
 //! | `sweep/step_wall`, `sweep/step_wall_slide` and their `_tried` | no target (the step-up skip) |
+//! | `sweep/*_fenced`, `raycast/sky_1024_fenced`, `tick/1000_fenced` | no target (fences, below) |
 //! | `raycast/pick_6` | <= 0.5 us |
 //! | `raycast/cave_256` | <= 5 us |
 //! | `raycast/sky_1024` | <= 10 us |
@@ -60,7 +61,13 @@
 //! they push each other all the time and their pairs make one island, so the solve's pushes
 //! stay on one thread. `1000_projectiles` (radius 2) has 100 walkers and 1000 arrows shot over
 //! the forest, shot again every 32 steps, with the parallel step, and
-//! `1000_projectiles_one_thread` on one thread. Run when the machine is idle
+//! `1000_projectiles_one_thread` on one thread.
+//!
+//! The `_fenced` benches (run last) are `player_walk`, `player_land`, `player_fall`,
+//! `step_wall`, `sky_1024` and `tick/1000` in a copy of their world with a fence in every chunk,
+//! off their paths (the step one with a fence beside the wall): a fence's collision reaches
+//! into the cell above (ADR 0026), so sweeps and collision rays read the cells under what they
+//! cross everywhere there, while elsewhere they skip them. Run when the machine is idle
 //! (`tools/wait-idle.sh`).
 #![expect(clippy::print_stdout, reason = "bench setup output")]
 
@@ -78,9 +85,12 @@ use boxel_physics::{
     raycast_voxels,
 };
 use boxel_transform::Transform;
-use boxel_voxel::{BlockPos, BlockRegistry, BlockState, CHUNK_SHIFT, ChunkPos, WorldPos};
+use boxel_voxel::{BlockPos, BlockRegistry, BlockState, CHUNK_SHIFT, ChunkPos, LocalPos, WorldPos};
 use boxel_world::jobs::InlineExecutor;
-use boxel_world::{ChunkDataEvent, ChunkMap, ChunkViewer, WorldPlugin, WorldSettings, WorldStats};
+use boxel_world::{
+    ChunkDataEvent, ChunkMap, ChunkViewer, DataState, EditQueue, WorldPlugin, WorldSettings,
+    WorldStats,
+};
 use boxel_worldgen::{ForestGenerator, OverworldGenerator, WorldGenerator};
 use criterion::measurement::WallTime;
 use criterion::{BenchmarkGroup, Criterion, criterion_group, criterion_main};
@@ -103,6 +113,15 @@ impl World {
 
 /// Streams `generator` around `viewers` (position, radius, vertical radius) until settled.
 fn streamed(generator: Arc<dyn WorldGenerator>, viewers: &[(DVec3, u32, u32)]) -> World {
+    streamed_with(generator, viewers, false)
+}
+
+/// [`streamed`], with a fence in every chunk when `fenced` ([`fence_every_chunk`]).
+fn streamed_with(
+    generator: Arc<dyn WorldGenerator>,
+    viewers: &[(DVec3, u32, u32)],
+    fenced: bool,
+) -> World {
     let start = Instant::now();
     let mut app = App::new();
     app.add_plugins(WorldPlugin {
@@ -127,6 +146,9 @@ fn streamed(generator: Arc<dyn WorldGenerator>, viewers: &[(DVec3, u32, u32)]) -
             "not settled: {stats:?}"
         );
     }
+    if fenced {
+        fence_every_chunk(&mut app);
+    }
     let map = app
         .world_mut()
         .remove_resource::<ChunkMap>()
@@ -138,6 +160,53 @@ fn streamed(generator: Arc<dyn WorldGenerator>, viewers: &[(DVec3, u32, u32)]) -
         start.elapsed().as_secs_f64()
     );
     World { map, settings }
+}
+
+/// Puts a fence at local `(8, 8, 24)` of every loaded chunk of `app`'s world and updates it until
+/// they are all there and the world settled again. Every chunk then holds a block whose
+/// collision reaches into the cell above (ADR 0026): the sweeps and the collision rays read
+/// the cells under what they cross everywhere, as before they learned to skip them in chunks
+/// without such blocks. The fences are off the benches' paths (never in the column of a
+/// diagonal ray at `x = z`).
+fn fence_every_chunk(app: &mut App) {
+    let start = Instant::now();
+    let registry = BlockRegistry::default_blocks();
+    let fence = registry.parse_state("boxel:oak_fence").expect("fence");
+    let table = CollisionTable::from_registry(&registry);
+    assert!(table.is_tall(fence));
+    let spots: Vec<BlockPos> = app
+        .world()
+        .resource::<ChunkMap>()
+        .iter()
+        .filter(|(_, slot)| matches!(slot.data(), DataState::Ready(_)))
+        .map(|(_, slot)| BlockPos::from_parts(slot.key().pos, LocalPos::new(8, 8, 24)))
+        .collect();
+    let mut queue = app.world_mut().resource_mut::<EditQueue>();
+    for &p in &spots {
+        queue.set_block(p, fence);
+    }
+    loop {
+        app.update();
+        let world = app.world();
+        let map = world.resource::<ChunkMap>();
+        // Neighbor rules may connect a fence to the blocks beside it: still a fence.
+        if world.resource::<WorldStats>().is_settled()
+            && spots
+                .iter()
+                .all(|&p| map.block_at(p).is_some_and(|s| table.is_tall(s)))
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(300),
+            "fences not placed"
+        );
+    }
+    println!(
+        "physics bench: {} fences placed in {:.1} s",
+        spots.len(),
+        start.elapsed().as_secs_f64()
+    );
 }
 
 /// The height of the first full block's top under `(x, z)`, from y = 150 down.
@@ -1060,5 +1129,162 @@ fn scale_benches(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(physics, benches, tick_benches, grid_benches, scale_benches);
+/// Benches with fences, last so that the others set up as before they existed: a sweep, a
+/// step-up, a collision ray and a tick of 1000 bodies in worlds with a fence in every chunk
+/// (off their paths, [`fence_every_chunk`]), where the cells under what they cross are read.
+fn fenced_benches(c: &mut Criterion) {
+    let table = CollisionTable::from_registry(&BlockRegistry::default_blocks());
+    let cfg = SweepConfig::default();
+    let fence = BlockRegistry::default_blocks()
+        .parse_state("boxel:oak_fence")
+        .expect("fence");
+    let forest = streamed_with(
+        Arc::new(ForestGenerator::default()),
+        &[(DVec3::new(0.0, 70.0, 0.0), 2, 2)],
+        true,
+    );
+    let ground = surface(&forest, &table, 0.5, 0.5);
+    let mut sweep = c.benchmark_group("sweep");
+    // As `player_walk`, `player_land` and `player_fall`.
+    let on_ground = WorldPos::from_dvec3(DVec3::new(0.5, ground, 0.5));
+    let walk = DVec3::new(4.3 / 64.0, -32.0 / 4096.0, 1.1 / 64.0);
+    let above = WorldPos::from_dvec3(DVec3::new(0.5, ground + 0.3, 0.5));
+    let high = WorldPos::from_dvec3(DVec3::new(0.5, ground + 10.0, 0.5));
+    let down = DVec3::new(0.0, -0.5, 0.0);
+    for (name, start, d) in [
+        ("player_walk_fenced", on_ground, walk),
+        ("player_land_fenced", above, down),
+        ("player_fall_fenced", high, down),
+    ] {
+        sweep.bench_function(name, |b| {
+            b.iter(|| {
+                black_box(move_box(
+                    &mut forest.source(),
+                    &table,
+                    black_box(start),
+                    player(),
+                    black_box(d),
+                    &[],
+                    &cfg,
+                ))
+            });
+        });
+    }
+    // As `step_wall`, with a fence beside the wall (in its chunk, off the path).
+    let mut wall = TestWorld::new();
+    wall.fill(
+        BlockPos::new(-4, -1, -4),
+        BlockPos::new(4, -1, 4),
+        BlockState(1),
+    );
+    wall.fill(
+        BlockPos::new(1, 0, -4),
+        BlockPos::new(1, 0, 4),
+        BlockState(1),
+    );
+    wall.set(BlockPos::new(4, 0, 4), fence);
+    let touching = WorldPos::from_dvec3(DVec3::new(0.7, 0.0, 0.5));
+    let step = StepUp {
+        height: 0.6,
+        grounded: true,
+    };
+    let d = DVec3::new(4.3 / 64.0, -32.0 / 4096.0, 0.0);
+    assert!(
+        move_box_stepping(&mut wall, &table, touching, player(), d, &[], &cfg, step)
+            .is_ok_and(|out| out.touched(boxel_voxel::Face::PosX))
+    );
+    sweep.bench_function("step_wall_fenced", |b| {
+        b.iter(|| {
+            black_box(move_box_stepping(
+                &mut wall,
+                &table,
+                black_box(touching),
+                player(),
+                black_box(d),
+                &[],
+                &cfg,
+                step,
+            ))
+        });
+    });
+    sweep.finish();
+    drop(forest);
+
+    // As `sky_1024`.
+    let sky = streamed_with(
+        Arc::new(ForestGenerator::default()),
+        &[(DVec3::new(0.0, 200.0, 0.0), 17, 0)],
+        true,
+    );
+    let sky_start = WorldPos::from_dvec3(DVec3::new(-360.5, 205.5, -360.5));
+    let sky_dir = DVec3::new(1.0, 0.03, 1.0).normalize();
+    assert_eq!(
+        raycast_voxels(
+            &mut sky.source(),
+            &table,
+            sky_start,
+            sky_dir,
+            1024.0,
+            VoxelFilter::Collision
+        ),
+        RayResult::Miss,
+        "the fenced sky ray stays in loaded air"
+    );
+    let mut ray = c.benchmark_group("raycast");
+    ray.bench_function("sky_1024_fenced", |b| {
+        b.iter(|| {
+            black_box(raycast_voxels(
+                &mut sky.source(),
+                &table,
+                black_box(sky_start),
+                black_box(sky_dir),
+                1024.0,
+                VoxelFilter::Collision,
+            ))
+        });
+    });
+    ray.finish();
+    drop(sky);
+
+    // As `tick/1000`, after the same settling.
+    let mut app = physics_app();
+    fence_every_chunk(&mut app);
+    app.world_mut()
+        .resource_mut::<PhysicsSettings>()
+        .parallel_threshold = usize::MAX;
+    spawn_bodies(&mut app, &table, 1000);
+    for t in 0..256u64 {
+        if t.is_multiple_of(64) {
+            turn(&mut app, t);
+        }
+        app.world_mut().run_schedule(FixedPostUpdate);
+    }
+    let mut tick = c.benchmark_group("tick");
+    let mut t = 0u64;
+    tick.bench_function("1000_fenced", |b| {
+        b.iter(|| {
+            t += 1;
+            if t.is_multiple_of(64) {
+                turn(&mut app, t);
+            }
+            app.world_mut().run_schedule(FixedPostUpdate);
+        });
+    });
+    tick.finish();
+    let stats = *app.world().resource::<PhysicsStats>();
+    println!(
+        "physics bench: tick/1000_fenced: bodies={} dynamic={} frozen={}",
+        stats.bodies, stats.dynamic, stats.frozen
+    );
+    assert_eq!(stats.frozen, 0, "every body is on loaded ground");
+}
+
+criterion_group!(
+    physics,
+    benches,
+    tick_benches,
+    grid_benches,
+    scale_benches,
+    fenced_benches
+);
 criterion_main!(physics);

@@ -5,9 +5,10 @@ use super::shape::LocalBox;
 use boxel_math::DVec3;
 use boxel_voxel::{
     BlockCollision, BlockPos, BlockRegistry, BlockState, ChunkData, ChunkPos, CollisionBox,
-    RenderShape, StateFlags,
+    RenderShape, StateFlags, StateSet,
 };
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
 
 /// The answer of a [`VoxelSource`] for one block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,12 +26,28 @@ pub enum Probe {
 pub trait VoxelSource {
     /// The block at `p`.
     fn probe(&mut self, p: BlockPos) -> Probe;
+
+    /// `chunk` is loaded and none of its blocks is tall per `table` ([`CollisionTable::is_tall`]:
+    /// no collision box reaches into the cell above). Sweeps and collision rays read some cells
+    /// only for the tall blocks they may hold (ADR 0026); they skip the ones in such a chunk,
+    /// with the same result. `false` when the source cannot tell, the default: they read them.
+    /// A `true` must be exact (a loaded chunk without tall blocks); a `false` may be wrong.
+    #[inline]
+    fn tall_free(&mut self, chunk: ChunkPos, table: &CollisionTable) -> bool {
+        let _ = (chunk, table);
+        false
+    }
 }
 
 impl<S: VoxelSource + ?Sized> VoxelSource for &mut S {
     #[inline]
     fn probe(&mut self, p: BlockPos) -> Probe {
         (**self).probe(p)
+    }
+
+    #[inline]
+    fn tall_free(&mut self, chunk: ChunkPos, table: &CollisionTable) -> bool {
+        (**self).tall_free(chunk, table)
     }
 }
 
@@ -72,7 +89,9 @@ const TALL: u8 = 1 << 5;
 /// A collision box may reach into the cell above (a fence collides 1.5 blocks tall, ADR 0026):
 /// such a block is [`CollisionTable::is_tall`], and the sweep and the collision raycast also
 /// look at the cell under the ones a box or a ray crosses, up to [`CollisionTable::reach`]
-/// above it. Outlines stay inside the cell.
+/// above it, unless the source tells them that chunk holds no tall block
+/// ([`VoxelSource::tall_free`], from [`CollisionTable::tall_states`]). Outlines stay inside the
+/// cell.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CollisionTable {
     bits: Vec<u8>,
@@ -88,6 +107,8 @@ pub struct CollisionTable {
     plane_gap: f64,
     /// How far above its cell the highest collision box reaches (0 without tall blocks).
     reach: f64,
+    /// The states with the `TALL` bit.
+    tall: StateSet,
 }
 
 impl CollisionTable {
@@ -132,6 +153,11 @@ impl CollisionTable {
         // `boxel_voxel::MAX_COLLISION_HEIGHT` keeps it at half a block: sweeps and rays look
         // at one row under what they cross, never two.
         debug_assert!(table.reach < 1.0, "collision boxes reach a block up");
+        table.tall = StateSet::new(
+            (0..table.bits.len())
+                .filter(|&i| table.bits[i] & TALL != 0)
+                .map(|i| BlockState(i as u16)),
+        );
         table.plane_gap = 1.0;
         for bx in &table.boxes {
             for v in bx.min.to_array().into_iter().chain(bx.max.to_array()) {
@@ -219,6 +245,14 @@ impl CollisionTable {
         self.reach
     }
 
+    /// The states that are [`CollisionTable::is_tall`], for [`boxel_voxel::ChunkData::may_contain`]
+    /// (a chunk caches its answer under the set's key): how a [`VoxelSource`] tells that a chunk
+    /// has no tall block ([`VoxelSource::tall_free`]).
+    #[inline]
+    pub fn tall_states(&self) -> &StateSet {
+        &self.tall
+    }
+
     /// `state` collides at all (a full cube or boxes).
     #[inline]
     pub fn collides(&self, state: BlockState) -> bool {
@@ -286,10 +320,19 @@ impl Pushed {
 /// not there is air) plus a set of chunks that read as [`Probe::Unloaded`]. No cache: every
 /// probe is one hash lookup. The ECS layer reads the real world through
 /// [`crate::ChunkSource`].
+///
+/// It answers [`VoxelSource::tall_free`] from the chunk's palette
+/// ([`boxel_voxel::ChunkData::may_contain`]); through `&mut TestWorld` the last few answers are
+/// kept until the world changes, so asking again about the same chunks costs no lookup.
 #[derive(Clone, Debug, Default)]
 pub struct TestWorld {
     chunks: HashMap<ChunkPos, ChunkData>,
     unloaded: HashSet<ChunkPos>,
+    /// The last [`VoxelSource::tall_free`] answers: the chunk, the key of the table's tall
+    /// states ([`StateSet::key`]) and the answer (cleared by every change), and the next one to
+    /// replace.
+    tall_free: [Option<(ChunkPos, NonZeroU64, bool)>; 4],
+    tall_next: usize,
 }
 
 impl TestWorld {
@@ -308,6 +351,7 @@ impl TestWorld {
 
     /// Sets one block.
     pub fn set(&mut self, p: BlockPos, state: BlockState) {
+        self.tall_free = [None; 4];
         let (chunk, local) = p.split();
         self.chunks
             .entry(chunk)
@@ -328,6 +372,7 @@ impl TestWorld {
 
     /// Replaces a whole chunk (any storage: uniform, packed, direct).
     pub fn set_chunk(&mut self, pos: ChunkPos, data: ChunkData) {
+        self.tall_free = [None; 4];
         self.chunks.insert(pos, data);
     }
 
@@ -338,6 +383,7 @@ impl TestWorld {
 
     /// Marks a chunk as unloaded (`true`) or loaded again (`false`); its blocks are kept.
     pub fn set_unloaded(&mut self, pos: ChunkPos, unloaded: bool) {
+        self.tall_free = [None; 4];
         if unloaded {
             self.unloaded.insert(pos);
         } else {
@@ -350,6 +396,22 @@ impl VoxelSource for TestWorld {
     fn probe(&mut self, p: BlockPos) -> Probe {
         let mut view: &TestWorld = self;
         view.probe(p)
+    }
+
+    fn tall_free(&mut self, chunk: ChunkPos, table: &CollisionTable) -> bool {
+        let key = table.tall_states().key();
+        if let Some(&Some((_, _, free))) = self
+            .tall_free
+            .iter()
+            .find(|kept| kept.is_some_and(|(at, of, _)| at == chunk && of == key))
+        {
+            return free;
+        }
+        let mut view: &TestWorld = self;
+        let free = view.tall_free(chunk, table);
+        self.tall_free[self.tall_next] = Some((chunk, key, free));
+        self.tall_next = (self.tall_next + 1) % self.tall_free.len();
+        free
     }
 }
 
@@ -364,5 +426,13 @@ impl VoxelSource for &TestWorld {
                 .get(&chunk)
                 .map_or(BlockState::AIR, |data| data.get(local)),
         )
+    }
+
+    fn tall_free(&mut self, chunk: ChunkPos, table: &CollisionTable) -> bool {
+        !self.unloaded.contains(&chunk)
+            && self.chunks.get(&chunk).map_or_else(
+                || !table.is_tall(BlockState::AIR),
+                |data| !data.may_contain(table.tall_states()),
+            )
     }
 }

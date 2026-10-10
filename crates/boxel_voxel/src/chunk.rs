@@ -2,7 +2,9 @@ use crate::{
     BlockRegistry, BlockState, CHUNK_AREA, CHUNK_VOLUME, LightMasks, LightTables, LocalPos,
     Occupancy, OwnedLightMasks, Paletted,
 };
+use std::num::NonZeroU64;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// One chunk's voxel payload. Shared as `Arc<ChunkData>` snapshots; edit through
 /// `Arc::make_mut` (copy-on-write when a job still holds the old snapshot).
@@ -10,16 +12,122 @@ use std::sync::OnceLock;
 /// Light is not stored here: it is derived data (ADR 0015). The chunk may cache its light masks
 /// ([`ChunkData::light_masks`]): built on first use when the storage cannot serve them as is,
 /// shared by every reader of the snapshot, dropped by every change of the blocks (and not
-/// carried by `clone`).
+/// carried by `clone`). It also caches the answer of [`ChunkData::may_contain`] for one
+/// [`StateSet`], dropped the same way.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChunkData {
-    /// Block states (private so that every change goes through a method that resets the mask
-    /// cache: [`ChunkData::set`], [`ChunkData::blocks_mut`]).
+    /// Block states (private so that every change goes through a method that resets the
+    /// caches: [`ChunkData::set`], [`ChunkData::blocks_mut`], [`ChunkData::compact`]).
     blocks: Paletted,
     /// Bumped by every mutation (mesh results built from an older version are discarded).
     pub version: u32,
     /// Lazily built light masks of `blocks` (only for storage that cannot serve them as is).
     masks: MaskCache,
+    /// The last answer of [`ChunkData::may_contain`] and the set it was for.
+    contains: ContainsCache,
+}
+
+/// A set of block states that a chunk can be asked about ([`ChunkData::may_contain`]: "may you
+/// hold one of these?"), with a process-wide unique key under which chunks cache their answer.
+/// Each [`StateSet::new`] gets its own key; a clone keeps it (it is the same set). Equality
+/// compares the states only.
+#[derive(Clone, Debug)]
+pub struct StateSet {
+    /// Bit `s % 64` of word `s / 64` for each state `s` of the set (no words past the last one).
+    words: Box<[u64]>,
+    /// The cache key: unique per [`StateSet::new`], below `2^63`.
+    key: NonZeroU64,
+}
+
+impl StateSet {
+    /// The set of `states`, with a fresh cache key.
+    pub fn new(states: impl IntoIterator<Item = BlockState>) -> Self {
+        static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
+        let mut words: Vec<u64> = Vec::new();
+        for s in states {
+            let word = usize::from(s.0) / 64;
+            if words.len() <= word {
+                words.resize(word + 1, 0);
+            }
+            words[word] |= 1 << (s.0 % 64);
+        }
+        let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
+        assert!(key < 1 << 63, "StateSet keys ran out");
+        Self {
+            words: words.into_boxed_slice(),
+            key: NonZeroU64::new(key).expect("keys start at 1"),
+        }
+    }
+
+    /// `s` is in the set.
+    #[inline]
+    pub fn contains(&self, s: BlockState) -> bool {
+        self.words
+            .get(usize::from(s.0) / 64)
+            .is_some_and(|w| w & (1 << (s.0 % 64)) != 0)
+    }
+
+    /// No state at all.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+
+    /// The cache key: equal keys mean the same set (a clone), so a caller may keep answers
+    /// about it under the key.
+    #[inline]
+    pub fn key(&self) -> NonZeroU64 {
+        self.key
+    }
+}
+
+impl Default for StateSet {
+    /// The empty set.
+    fn default() -> Self {
+        Self::new([])
+    }
+}
+
+impl PartialEq for StateSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.words == other.words
+    }
+}
+
+/// The cached answer of [`ChunkData::may_contain`]: `key << 1 | answer` of the last set asked
+/// about, 0 when there is none. Atomic so readers of a shared snapshot can fill it; a clone
+/// keeps it (same blocks) and equality ignores it.
+#[derive(Default)]
+struct ContainsCache(AtomicU64);
+
+impl Clone for ContainsCache {
+    fn clone(&self) -> Self {
+        Self(AtomicU64::new(self.0.load(Ordering::Relaxed)))
+    }
+}
+
+impl PartialEq for ContainsCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ContainsCache {}
+
+impl std::fmt::Debug for ContainsCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.load(Ordering::Relaxed) {
+            0 => f.write_str("empty"),
+            v => write!(f, "key {}: {}", v >> 1, v & 1 != 0),
+        }
+    }
+}
+
+impl ContainsCache {
+    /// Forgets the answer (the blocks changed).
+    fn clear(&mut self) {
+        *self.0.get_mut() = 0;
+    }
 }
 
 /// The cached light masks of a chunk. A clone starts empty and equality ignores it: it is a
@@ -63,6 +171,7 @@ impl ChunkData {
             blocks,
             version: 0,
             masks: MaskCache::default(),
+            contains: ContainsCache::default(),
         }
     }
     /// The block storage.
@@ -70,16 +179,19 @@ impl ChunkData {
     pub fn blocks(&self) -> &Paletted {
         &self.blocks
     }
-    /// The block storage, to change it in place. Drops the mask cache; does not bump
-    /// `version` (use [`ChunkData::set`] for edits).
+    /// The block storage, to change it in place. Drops the caches; does not bump `version`
+    /// (use [`ChunkData::set`] for edits).
     pub fn blocks_mut(&mut self) -> &mut Paletted {
         self.masks.0.take();
+        self.contains.clear();
         &mut self.blocks
     }
     /// Compacts the block storage ([`Paletted::compact`]). The voxels stay the same, so the
-    /// version and the mask cache do too.
+    /// version and the mask cache do too; the palette may shrink, so the answer of
+    /// [`ChunkData::may_contain`] is dropped.
     pub fn compact(&mut self) {
         self.blocks.compact();
+        self.contains.clear();
     }
     /// State at `p`.
     #[inline]
@@ -91,7 +203,7 @@ impl ChunkData {
         self.blocks.as_uniform()
     }
     /// Sets `p`, bumps `version` (wrapping) if the state changed, returns the previous state.
-    /// A change drops the mask cache.
+    /// A change drops the caches.
     ///
     /// Frozen behavior: `get`, `version` and the return value. The representation follows
     /// [`Paletted::set`] (the palette grows in place; nothing shrinks until
@@ -101,6 +213,7 @@ impl ChunkData {
         if previous != state {
             self.version = self.version.wrapping_add(1);
             self.masks.0.take();
+            self.contains.clear();
         }
         previous
     }
@@ -193,6 +306,35 @@ impl ChunkData {
         match &self.blocks {
             Paletted::Uniform(s) => tables.emits(*s),
             Paletted::Packed { palette, .. } => palette.iter().any(|&s| tables.emits(s)),
+            Paletted::Direct(_) => true,
+        }
+    }
+    /// True if some voxel may hold a state of `set`: a palette scan, so it may answer yes for a
+    /// chunk whose matching palette entries are no longer used, but never no for a chunk that
+    /// holds one. `Direct` storage answers yes unless `set` is empty.
+    ///
+    /// A `Packed` chunk caches the answer for the last set asked about (by its key) until the
+    /// blocks change, so asking again costs a load. Physics asks with the states whose collision
+    /// reaches into the cell above (ADR 0026) before reading cells only for them.
+    #[inline]
+    pub fn may_contain(&self, set: &StateSet) -> bool {
+        if set.is_empty() {
+            return false;
+        }
+        match &self.blocks {
+            Paletted::Uniform(s) => set.contains(*s),
+            Paletted::Packed { palette, .. } => {
+                let key = set.key.get();
+                let cached = self.contains.0.load(Ordering::Relaxed);
+                if cached >> 1 == key {
+                    return cached & 1 != 0;
+                }
+                let answer = palette.iter().any(|&s| set.contains(s));
+                self.contains
+                    .0
+                    .store(key << 1 | u64::from(answer), Ordering::Relaxed);
+                answer
+            }
             Paletted::Direct(_) => true,
         }
     }

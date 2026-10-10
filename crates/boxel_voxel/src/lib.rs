@@ -19,8 +19,9 @@
 //!   itself is derived data, computed by `boxel_light`; chunks do not store it.
 //! - [`ChunkData`]: one chunk's immutable snapshot payload (shared as `Arc<ChunkData>`; edits use
 //!   `Arc::make_mut` copy-on-write), with its light masks ([`LightMasks`]: opaque, partial,
-//!   emitters; built and cached only when the storage cannot serve them as is). Voxel arrays
-//!   never live inline in ECS components.
+//!   emitters; built and cached only when the storage cannot serve them as is), and
+//!   [`ChunkData::may_contain`], a cached palette scan for a [`StateSet`]. Voxel arrays never
+//!   live inline in ECS components.
 
 pub mod coords;
 pub mod faces;
@@ -34,7 +35,7 @@ pub mod storage;
 mod chunk;
 mod masks;
 
-pub use chunk::ChunkData;
+pub use chunk::{ChunkData, StateSet};
 pub use coords::{
     BlockPos, CHUNK_AREA, CHUNK_MASK, CHUNK_SHIFT, CHUNK_SIZE, CHUNK_VOLUME, ChunkKey, ChunkPos,
     DimensionId, Face, LocalPos, MAX_BLOCK_COORD, MAX_CHUNK_COORD, NEIGHBOR_OFFSETS, WorldPos,
