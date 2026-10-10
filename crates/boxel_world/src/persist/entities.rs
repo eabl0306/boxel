@@ -25,7 +25,7 @@ use super::plugin::{PersistSettings, save_meta};
 use super::saver::{Moment, Persist};
 use super::store::WorldStore;
 use crate::streaming::WorldJobs;
-use crate::{BlockTicks, ChunkMap, TimeOfDay, WorldSettings};
+use crate::{BlockTicks, ChunkMap, ChunkViewer, TimeOfDay, WorldSettings};
 use boxel_app::App;
 use boxel_ecs::archetype::ArchetypeId;
 use boxel_ecs::change_detection::Tick;
@@ -66,6 +66,11 @@ impl SavedId {
 ///   before the next fixed step. Above or below `WorldSettings::vertical_bounds` its chunk is
 ///   the nearest layer of the column inside them (the layers outside never load).
 /// - The autosave and the exit save it under the chunk it is in.
+/// - A [`ChunkViewer`] is never put away: it loads its own chunk, and nothing would load it
+///   again. It is saved by the autosave and on exit only, and no codec saves the viewer itself:
+///   it comes back as a saved entity without it. A game saves its player apart
+///   ([`WorldStore::put_meta`](super::WorldStore::put_meta)), or with a codec of its own that
+///   puts the viewer back once something loads its chunk.
 /// - Despawning it (or removing the marker) removes its record. Inserting a new `Saved` makes it
 ///   a new saved entity.
 ///
@@ -669,13 +674,17 @@ impl Step<'_> {
         alive
     }
 
-    /// Saves and despawns the saved entities whose chunk has no slot.
+    /// Saves and despawns the saved entities whose chunk has no slot (never a [`ChunkViewer`]).
     fn put_away(&mut self) {
         let map = self.world.resource::<ChunkMap>();
         let away: Vec<(u64, Entity, ChunkKey)> = self
             .alive()
             .into_iter()
             .filter_map(|(id, entity)| {
+                // A viewer loads its own chunk: put away, nothing would load it again.
+                if self.world.get::<ChunkViewer>(entity).is_some() {
+                    return None;
+                }
                 let chunk = self.chunk_of(entity)?;
                 map.id_at(chunk.pos)
                     .is_none()

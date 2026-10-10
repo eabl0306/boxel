@@ -848,3 +848,38 @@ fn an_entity_above_the_vertical_bounds_is_kept_with_the_top_layer() {
         assert_eq!(things(&mut app), vec![high, low], "{o:?}: back");
     }
 }
+
+/// A saved entity that is a chunk viewer is never put away (it loads its own chunk, and nothing
+/// would load it again): spawned where nothing is loaded yet, it stays alive, its chunk loads
+/// around it, and the exit saves it there.
+#[test]
+fn a_saved_viewer_is_never_put_away() {
+    let o = BlockPos::new(-(1 << 40), 0, 1 << 31);
+    let setup = Setup::new(Arc::new(MemoryStore::new()), o.y);
+    let (mut app, _) = setup.start(o);
+    let far = Thing {
+        at: at(o, 1 << 13, 2, 0),
+        value: 9,
+    };
+    app.world_mut().spawn((
+        Saved::new(),
+        far,
+        Transform::from_translation(center(far.at)),
+        ChunkViewer::new(1).with_vertical_radius(1),
+    ));
+    settle(&mut app);
+    assert_eq!(things(&mut app), vec![far], "alive");
+    assert!(
+        app.world()
+            .resource::<boxel_world::ChunkMap>()
+            .id_at(chunk_key(far.at).pos)
+            .is_some(),
+        "its chunk loaded"
+    );
+    app.world_mut().run_schedule(boxel_app::Shutdown);
+    settle(&mut app);
+    let saved = records(setup.backend.as_ref());
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].0, chunk_key(far.at), "saved where it is");
+    assert_eq!(things(&mut app), vec![far], "still alive");
+}
