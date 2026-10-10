@@ -13,6 +13,8 @@
 //!   game registers, `BlockModel::Boxes`), and [`rules`]: the neighbor and use rules a block
 //!   registers (the states that follow their neighbors, what using a block does) and the face
 //!   covers they are written with.
+//! - [`fluid`]: the fluid types a registry declares (ADR 0021, ADR 0025): how each flows and
+//!   what it does with the others.
 //! - [`faces`]: which faces of a chunk see each other through non-occluding voxels
 //!   ([`ChunkFaceInfo`]), for the world's cave culling (ADR 0022).
 //! - [`storage`]: Minecraft-style paletted container (Uniform | Packed 1/2/4/8 bits | Direct u16).
@@ -26,6 +28,7 @@
 
 pub mod coords;
 pub mod faces;
+pub mod fluid;
 pub mod light;
 pub mod registry;
 pub mod rules;
@@ -43,6 +46,7 @@ pub use coords::{
     neighbor_index,
 };
 pub use faces::{ALL_LINKS, ChunkFaceInfo, link_bit};
+pub use fluid::{FluidHardening, FluidId, FluidReplace, FluidRules, FluidType, MAX_FLUIDS};
 pub use light::{LightTables, LightValue, MAX_LIGHT, OPAQUE_OPACITY};
 pub use masks::{LightMasks, MaskRows, MaskWords, OwnedLightMasks};
 pub use registry::{

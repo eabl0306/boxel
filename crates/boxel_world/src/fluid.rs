@@ -1,14 +1,15 @@
 //! Flowing fluids, Minecraft Java's rules (`FlowingFluid`, `WaterFluid`, `LavaFluid` and
-//! `LiquidBlock`) on the scheduled block ticks ([`crate::ticks`]): water (ADR 0021) and lava
-//! (ADR 0025).
+//! `LiquidBlock`) on the scheduled block ticks ([`crate::ticks`]), for the fluid types the
+//! registry declares (`BlockRegistryBuilder::add_fluid`; written for water, ADR 0021, and lava,
+//! ADR 0025, whose numbers the examples below give).
 //!
 //! - A fluid cell is a source (`level` 0, amount 8), flowing (`level` 1..=7, amount `8 - level`)
 //!   or falling (`level` 8..=15, amount 8, fed from above).
 //! - A tick of a flowing cell first recomputes it from its neighbors: falling if the same
 //!   fluid is above; for water, a source if two horizontal neighbors are sources and the cell
-//!   below is solid or a source (infinite water); else the largest horizontal amount minus the
-//!   fluid's drop-off (1 for water, 2 for lava), or air when that is 0 or less (so a fluid
-//!   drains once its source is gone).
+//!   below is solid or a source (infinite water, `FluidRules::infinite`); else the largest
+//!   horizontal amount minus the fluid's drop-off (1 for water, 2 for lava), or air when that is
+//!   0 or less (so a fluid drains once its source is gone).
 //! - Then it spreads: down into the cell below if it can (as falling fluid), and to the sides
 //!   only when it cannot fall (or, falling, with 3 or more source neighbors). Sideways it takes
 //!   the directions with the shortest way down within the fluid's slope distance (4 blocks for
@@ -18,21 +19,22 @@
 //! - A cell can hold a fluid if nothing in it stops movement (air, plants, torches, water and
 //!   lava; a fence gate stops it open or closed, as in Minecraft, though an open one does not
 //!   collide: `BlockRegistry::blocks_motion`). The fluid may flow into it if what it holds can
-//!   be replaced: an empty cell always, water only by lava falling into it (which turns it to
-//!   stone), lava only by water where the lava is at least 4/9 high. A fluid never replaces its
-//!   own cells.
+//!   be replaced (`FluidType::replaced_by`): an empty cell always, water only by lava falling
+//!   into it (which turns it to stone, `FluidType::falls_into`), lava only by water where the
+//!   lava is at least 4/9 high. A fluid never replaces its own cells.
 //! - A waterlogged block (a slab, stairs or a fence whose `waterlogged` is `true`, ADR 0025)
-//!   holds a water source: it ticks and spreads like one and counts as one for its neighbors.
+//!   holds a source of the registry's waterlog fluid (water): it ticks and spreads like one and
+//!   counts as one for its neighbors.
 //!   Flowing water never fills a block (it stops movement), but a dry one where water would
 //!   make a new source (two sources beside it) takes it and becomes waterlogged, as in
 //!   Minecraft (`canPlaceLiquid`). Between two cells, a fluid passes only where their collision
 //!   faces toward each other leave part of the face open (Minecraft's `canPassThroughWall`):
 //!   water flows out of the sides of a waterlogged slab but not through the bottom of a bottom
 //!   slab.
-//! - Lava next to water hardens at once (Minecraft's `LiquidBlock::shouldSpreadLiquid`): a lava
-//!   cell with water above it or beside it turns to obsidian if it is a source, to cobblestone
-//!   otherwise. This is the lava's tick reaction ([`TickHandler::react`]), so it happens in the
-//!   write that brings the two together.
+//! - A fluid next to another may harden at once (`FluidType::hardens`, Minecraft's
+//!   `LiquidBlock::shouldSpreadLiquid`): a lava cell with water above it or beside it turns to
+//!   obsidian if it is a source, to cobblestone otherwise. This is the fluid's tick reaction
+//!   ([`TickHandler::react`]), so it happens in the write that brings the two together.
 //! - Every change schedules the cell and its neighbors that are fluid their fluid's delay later
 //!   (water 5 game ticks, 4 updates a second; lava 30). Worldgen fluid schedules nothing: a
 //!   calm lake stays as it is until an edit touches it.
@@ -44,102 +46,19 @@ use crate::ticks::{BlockTicks, BlockTicksPlugin, TickContext, TickHandler, offse
 use boxel_app::{App, Plugin};
 use boxel_voxel::rules::collision_face_cover;
 use boxel_voxel::{
-    BlockCollision, BlockModel, BlockPos, BlockRegistry, BlockState, FLUID_LEVEL, Face,
+    BlockCollision, BlockModel, BlockPos, BlockRegistry, BlockState, FLUID_LEVEL, Face, FluidId,
+    FluidRules, FluidType,
 };
 use std::cell::Cell;
-
-/// Water's tick delay in game ticks (Minecraft's 5).
-pub const WATER_TICK_DELAY: u32 = FluidRules::WATER.delay;
-/// Lava's tick delay in game ticks (Minecraft's 30 in the overworld).
-pub const LAVA_TICK_DELAY: u32 = FluidRules::LAVA.delay;
-/// How far a water cell looks for a way down (Minecraft's slope find distance for water).
-pub const SLOPE_FIND_DISTANCE: u32 = FluidRules::WATER.slope_find_distance;
 
 /// The horizontal directions in Minecraft's order (`Direction.Plane.HORIZONTAL`: north, east,
 /// south, west), which decides the order of a tick's writes and so of the ticks they schedule.
 const HORIZONTAL: [Face; 4] = [Face::NegZ, Face::PosX, Face::PosZ, Face::NegX];
 
-/// Where lava looks for water to harden (Minecraft's `POSSIBLE_FLOW_DIRECTIONS` turned around:
-/// above, north, south, west, east; never below).
-const LAVA_MEETS: [Face; 5] = [Face::PosY, Face::NegZ, Face::PosZ, Face::NegX, Face::PosX];
-
-/// What a tick of water reads: up to 5 blocks to the sides (a neighbor and 4 more for the way
-/// down), 2 down (a cell that would turn into a source below this one checks the block under
-/// it) and 1 up.
-pub const WATER_REACH: [u32; 3] = FluidRules::WATER.reach();
-/// What a tick of lava reads: 3 blocks to the sides, 2 down and 1 up.
-pub const LAVA_REACH: [u32; 3] = FluidRules::LAVA.reach();
-
-/// The fluids that flow.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum FluidKind {
-    /// `boxel:water`.
-    Water,
-    /// `boxel:lava`.
-    Lava,
-}
-
-impl FluidKind {
-    /// Both, in the order [`FluidPlugin`] registers them.
-    pub const ALL: [FluidKind; 2] = [FluidKind::Water, FluidKind::Lava];
-
-    /// The block's name.
-    pub const fn block_name(self) -> &'static str {
-        match self {
-            FluidKind::Water => "boxel:water",
-            FluidKind::Lava => "boxel:lava",
-        }
-    }
-
-    /// Its rules.
-    pub const fn rules(self) -> FluidRules {
-        match self {
-            FluidKind::Water => FluidRules::WATER,
-            FluidKind::Lava => FluidRules::LAVA,
-        }
-    }
-}
-
-/// The numbers that tell one fluid's flow from another's (Minecraft's `FlowingFluid`
-/// overrides).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FluidRules {
-    /// Game ticks from a change to the tick (`getTickDelay`).
-    pub delay: u32,
-    /// How far a cell looks for a way down (`getSlopeFindDistance`).
-    pub slope_find_distance: u32,
-    /// Amount lost per block sideways (`getDropOff`).
-    pub drop_off: u8,
-    /// Two sources over solid ground make a third (`canConvertToSource`).
-    pub infinite: bool,
-}
-
-impl FluidRules {
-    /// Water: delay 5, slope distance 4, drop-off 1, infinite.
-    pub const WATER: FluidRules = FluidRules {
-        delay: 5,
-        slope_find_distance: 4,
-        drop_off: 1,
-        infinite: true,
-    };
-    /// Lava in the overworld: delay 30, slope distance 2, drop-off 2, not infinite.
-    pub const LAVA: FluidRules = FluidRules {
-        delay: 30,
-        slope_find_distance: 2,
-        drop_off: 2,
-        infinite: false,
-    };
-
-    /// What a tick reads: `[slope distance + 1, 2, 1]` (sideways, down, up).
-    pub const fn reach(self) -> [u32; 3] {
-        [self.slope_find_distance + 1, 2, 1]
-    }
-}
-
-/// Adds flowing water and lava: registers the ticks of `boxel:water`, of every waterlogged
-/// state (water's) and of `boxel:lava` (with [`BlockTicksPlugin`] if it is not there yet), and
-/// lava's reaction to water. Needs [`WorldPlugin`](crate::WorldPlugin) first; a fluid missing
-/// from the registry (or without its 16 `level` values) does not flow.
+/// Adds the fluids the registry declares (`BlockRegistry::fluids`): registers the ticks of
+/// each fluid's block and, for the waterlog fluid, of every waterlogged state (with
+/// [`BlockTicksPlugin`] if it is not there yet), and the reaction of each fluid that hardens.
+/// Needs [`WorldPlugin`](crate::WorldPlugin) first; a registry without fluids adds no tick.
 pub struct FluidPlugin;
 
 impl Plugin for FluidPlugin {
@@ -148,28 +67,17 @@ impl Plugin for FluidPlugin {
             app.add_plugins(BlockTicksPlugin);
         }
         let registry = std::sync::Arc::clone(&app.world().resource::<WorldContent>().registry);
-        for kind in FluidKind::ALL {
-            let Some(block) = registry.block_by_name(kind.block_name()) else {
-                continue;
-            };
-            if first_level(&registry, kind).is_none() {
-                continue;
-            }
-            let rules = kind.rules();
-            let (tick, react): (fn(&mut TickContext<'_>, BlockPos, BlockState), _) = match kind {
-                FluidKind::Water => (water_tick, None),
-                FluidKind::Lava => (lava_tick, Some(lava_react as _)),
-            };
+        let mut ticks = app.world_mut().resource_mut::<BlockTicks>();
+        for (i, fluid) in registry.fluids().iter().enumerate() {
             let handler = TickHandler {
-                delay: rules.delay,
-                reach: rules.reach(),
-                tick,
-                react,
+                delay: fluid.rules.delay,
+                reach: fluid.rules.reach(),
+                tick: fluid_tick,
+                react: fluid.hardens.as_ref().map(|_| fluid_react as _),
             };
-            let mut ticks = app.world_mut().resource_mut::<BlockTicks>();
-            ticks.register(&registry, block, handler);
-            if kind == FluidKind::Water {
-                // The water of the waterlogged blocks.
+            ticks.register(&registry, fluid.block, handler);
+            if registry.waterlog_fluid() == Some(FluidId(i as u8)) {
+                // The fluid of the waterlogged blocks.
                 for state in (0..registry.len() as u16).map(BlockState) {
                     if registry.is_waterlogged(state) {
                         ticks.register_state(&registry, state, handler);
@@ -245,56 +153,51 @@ impl Fluid {
     }
 }
 
-/// The first state of `kind`'s block if its states are exactly its 16 levels in order (the
-/// block's only property is `level`, `0..=15`): level `l` is that state plus `l`.
-fn first_level(registry: &BlockRegistry, kind: FluidKind) -> Option<u16> {
-    let block = registry.block_by_name(kind.block_name())?;
-    let [property] = registry.properties(block) else {
-        return None;
-    };
-    let values = property.values();
-    let ordered = property.name() == FLUID_LEVEL
-        && values.len() == 16
-        && values.first().is_some_and(|v| v == "0")
-        && values.last().is_some_and(|v| v == "15");
-    let first = registry.states(block).next()?;
-    (ordered && registry.model(first) == BlockModel::Fluid).then_some(first.0)
-}
-
-/// The fluids of the registry, as one tick sees them: which states are water and lava.
+/// The fluids of the registry, as one tick sees them.
 #[derive(Clone, Copy, Debug)]
 struct Fluids<'a> {
     registry: &'a BlockRegistry,
-    /// The first state (level 0) of water and of lava ([`first_level`]).
-    first: [Option<u16>; 2],
+    /// Its fluid types (`BlockRegistry::fluids`).
+    types: &'a [FluidType],
+    /// The fluid the waterlogged states hold.
+    waterlog: Option<FluidId>,
 }
 
 impl<'a> Fluids<'a> {
     fn new(registry: &'a BlockRegistry) -> Self {
         Self {
             registry,
-            first: FluidKind::ALL.map(|kind| first_level(registry, kind)),
+            types: registry.fluids(),
+            waterlog: registry.waterlog_fluid(),
         }
     }
 
-    /// The block named `name` (what lava turns into), looked up when lava needs it.
-    fn product(&self, name: &str) -> Option<BlockState> {
-        self.registry.by_name(name)
+    /// The type of fluid `id`.
+    fn get(&self, id: FluidId) -> &'a FluidType {
+        &self.types[usize::from(id.0)]
     }
 
-    /// The fluid `state` holds and its kind (a waterlogged block holds a water source).
-    fn content(&self, state: BlockState) -> Option<(FluidKind, Fluid)> {
-        for (kind, first) in FluidKind::ALL.into_iter().zip(self.first) {
-            if let Some(first) = first
-                && let Some(level) = state.0.checked_sub(first).filter(|&l| l < 16)
-            {
-                return Some((kind, Fluid::from_level(level as u8)));
+    /// The fluid `state` holds and its id (a waterlogged block holds a source of the waterlog
+    /// fluid).
+    fn content(&self, state: BlockState) -> Option<(FluidId, Fluid)> {
+        for (i, fluid) in self.types.iter().enumerate() {
+            if let Some(level) = state.0.checked_sub(fluid.first.0).filter(|&l| l < 16) {
+                return Some((FluidId(i as u8), Fluid::from_level(level as u8)));
             }
         }
-        if self.first[0].is_some() && self.registry.is_waterlogged(state) {
-            return Some((FluidKind::Water, Fluid::SOURCE));
+        if let Some(waterlog) = self.waterlog
+            && self.registry.is_waterlogged(state)
+        {
+            return Some((waterlog, Fluid::SOURCE));
         }
         None
+    }
+
+    /// True if `state` holds fluid `id`.
+    fn holds(&self, state: Option<BlockState>, id: FluidId) -> bool {
+        state
+            .and_then(|s| self.content(s))
+            .is_some_and(|(found, _)| found == id)
     }
 
     /// Minecraft's `canPassThroughWall`: a fluid passes from `a` to its neighbor `b` across
@@ -318,17 +221,9 @@ impl<'a> Fluids<'a> {
         fa.iter().zip(&fb).any(|(x, y)| x | y != u16::MAX)
     }
 
-    /// The state of `kind` holding `fluid`.
-    fn state(&self, kind: FluidKind, fluid: Fluid) -> BlockState {
-        let first = self.first[kind as usize].unwrap_or_default();
-        BlockState(first + u16::from(fluid.level()))
-    }
-
-    /// True if `state` holds water.
-    fn is_water(&self, state: Option<BlockState>) -> bool {
-        state
-            .and_then(|s| self.content(s))
-            .is_some_and(|(kind, _)| kind == FluidKind::Water)
+    /// The state of fluid `id` holding `fluid`.
+    fn state(&self, id: FluidId, fluid: Fluid) -> BlockState {
+        BlockState(self.get(id).first.0 + u16::from(fluid.level()))
     }
 }
 
@@ -345,9 +240,11 @@ impl Blocks for TickContext<'_> {
     }
 }
 
-/// How far sideways from the spreading cell a [`Memo`] keeps blocks: as far as water's search
-/// for a way down reads (a neighbor and 4 more).
-const MEMO_REACH: i64 = FluidRules::WATER.slope_find_distance as i64 + 1;
+/// How far sideways from the spreading cell a [`Memo`] keeps blocks: as far as the search for a
+/// way down of a fluid with slope distance 4 (water) reads, a neighbor and 4 more. A fluid that
+/// looks further reads the blocks past it from the world every time, which gives the same
+/// answers.
+const MEMO_REACH: i64 = 5;
 /// Blocks along a side of a [`Memo`] layer.
 const MEMO_SIDE: usize = 2 * MEMO_REACH as usize + 1;
 /// Blocks in a [`Memo`] layer.
@@ -473,7 +370,8 @@ fn target_slot(face: Face) -> usize {
 /// One fluid's view of the world in its tick.
 struct Flow<'a> {
     fluids: Fluids<'a>,
-    kind: FluidKind,
+    /// The fluid.
+    id: FluidId,
     rules: FluidRules,
 }
 
@@ -484,12 +382,12 @@ impl Flow<'_> {
 
     /// This fluid in `state`.
     fn fluid(&self, state: Option<BlockState>) -> Option<Fluid> {
-        let (kind, fluid) = self.fluids.content(state?)?;
-        (kind == self.kind).then_some(fluid)
+        let (id, fluid) = self.fluids.content(state?)?;
+        (id == self.id).then_some(fluid)
     }
 
     fn state(&self, fluid: Fluid) -> BlockState {
-        self.fluids.state(self.kind, fluid)
+        self.fluids.state(self.id, fluid)
     }
 
     /// True for a source of this fluid.
@@ -516,14 +414,20 @@ impl Flow<'_> {
     }
 
     /// Minecraft's `FluidState::canBeReplacedWith`: what `state` holds gives way to this fluid
-    /// flowing into it (`down`: falling into it). An empty cell does; water only to lava
-    /// falling into it; lava only to water, where it is at least 4/9 high (amount 4).
+    /// flowing into it (`down`: falling into it). An empty cell does; a fluid only as its
+    /// `replaced_by` says (water only to lava falling into it; lava only to water, where it is at
+    /// least 4/9 high, amount 4).
     fn replaceable(&self, state: Option<BlockState>, down: bool) -> bool {
-        match state.and_then(|s| self.fluids.content(s)) {
-            None => true,
-            Some((FluidKind::Water, _)) => down && self.kind != FluidKind::Water,
-            Some((FluidKind::Lava, lava)) => self.kind == FluidKind::Water && lava.amount >= 4,
-        }
+        let Some((target, held)) = state.and_then(|s| self.fluids.content(s)) else {
+            return true;
+        };
+        self.fluids
+            .get(target)
+            .replaced_by
+            .iter()
+            .any(|&(by, when)| {
+                by == self.id && (down || !when.only_down) && held.amount >= when.min_amount
+            })
     }
 
     /// The wall between `from` and `to` across `face` of `from` ([`Fluids::wall_open`]).
@@ -531,10 +435,10 @@ impl Flow<'_> {
         self.fluids.wall_open(from, to, face)
     }
 
-    /// True if `state` is a dry block that would take a water source and this fluid is water
-    /// (Minecraft's `SimpleWaterloggedBlock::canPlaceLiquid`).
+    /// True if `state` is a dry block that would take a source of this fluid, the waterlog
+    /// fluid (Minecraft's `SimpleWaterloggedBlock::canPlaceLiquid`).
     fn takes_source(&self, state: Option<BlockState>) -> bool {
-        self.kind == FluidKind::Water
+        self.fluids.waterlog == Some(self.id)
             && state.is_some_and(|s| {
                 let registry = self.registry();
                 registry.can_be_waterlogged(s) && !registry.is_waterlogged(s)
@@ -705,15 +609,20 @@ impl Flow<'_> {
         out
     }
 
-    /// Writes `fluid` into `pos` (empty writes nothing), Minecraft's `spreadTo`: lava falling
-    /// into water turns it to stone instead, and a dry block that takes a water source keeps
-    /// itself and holds it (`placeLiquid`).
+    /// Writes `fluid` into `pos` (empty writes nothing), Minecraft's `spreadTo`: falling into a
+    /// fluid that its `falls_into` names makes that block instead (lava into water, stone), and
+    /// a dry block that takes a source keeps itself and holds it (`placeLiquid`).
     fn spread_to(&self, cx: &mut TickContext<'_>, pos: BlockPos, fluid: Option<Fluid>, down: bool) {
         let state = cx.get(pos);
-        if down && self.kind == FluidKind::Lava && self.fluids.is_water(state) {
-            if let Some(stone) = self.fluids.product("boxel:stone") {
-                cx.set(pos, stone);
-            }
+        if down
+            && let Some(&(_, becomes)) = self
+                .fluids
+                .get(self.id)
+                .falls_into
+                .iter()
+                .find(|&&(into, _)| self.fluids.holds(state, into))
+        {
+            cx.set(pos, becomes);
             return;
         }
         let Some(fluid) = fluid else {
@@ -819,52 +728,41 @@ impl Flow<'_> {
     }
 }
 
-/// The tick of a fluid cell of `kind`.
-fn fluid_tick(kind: FluidKind, cx: &mut TickContext<'_>, pos: BlockPos, state: BlockState) {
+/// The tick of a fluid cell: of the fluid it holds.
+fn fluid_tick(cx: &mut TickContext<'_>, pos: BlockPos, state: BlockState) {
     let fluids = Fluids::new(cx.registry());
-    let Some((found, fluid)) = fluids.content(state) else {
+    let Some((id, fluid)) = fluids.content(state) else {
         return;
     };
-    if found != kind {
-        return;
-    }
     let flow = Flow {
         fluids,
-        kind,
-        rules: kind.rules(),
+        id,
+        rules: fluids.get(id).rules,
     };
     flow.tick(cx, pos, state, fluid);
 }
 
-/// The tick of a water cell.
-fn water_tick(cx: &mut TickContext<'_>, pos: BlockPos, state: BlockState) {
-    fluid_tick(FluidKind::Water, cx, pos, state);
-}
-
-/// The tick of a lava cell.
-fn lava_tick(cx: &mut TickContext<'_>, pos: BlockPos, state: BlockState) {
-    fluid_tick(FluidKind::Lava, cx, pos, state);
-}
-
-/// Lava meeting water (Minecraft's `LiquidBlock::shouldSpreadLiquid`): with water above it or
-/// beside it, a lava source turns to obsidian and other lava to cobblestone.
-fn lava_react(cx: &mut TickContext<'_>, pos: BlockPos, state: BlockState) {
+/// A fluid meeting another it hardens beside (Minecraft's `LiquidBlock::shouldSpreadLiquid`,
+/// `FluidType::hardens`): lava with water above it or beside it, a source turning to obsidian
+/// and other lava to cobblestone.
+fn fluid_react(cx: &mut TickContext<'_>, pos: BlockPos, state: BlockState) {
     let fluids = Fluids::new(cx.registry());
-    let Some((FluidKind::Lava, lava)) = fluids.content(state) else {
+    let Some((id, fluid)) = fluids.content(state) else {
         return;
     };
-    let meets = LAVA_MEETS
-        .iter()
-        .any(|&face| fluids.is_water(cx.get(offset(pos, face))));
-    if !meets {
+    let Some(hardening) = &fluids.get(id).hardens else {
         return;
-    }
-    let product = fluids.product(if lava.source {
-        "boxel:obsidian"
-    } else {
-        "boxel:cobblestone"
-    });
-    if let Some(product) = product {
+    };
+    let meets = hardening
+        .faces
+        .iter()
+        .any(|&face| fluids.holds(cx.get(offset(pos, face)), hardening.with));
+    if meets {
+        let product = if fluid.source {
+            hardening.source
+        } else {
+            hardening.flowing
+        };
         cx.set(pos, product);
     }
 }

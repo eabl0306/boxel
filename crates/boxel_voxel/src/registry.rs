@@ -3,6 +3,7 @@
 //! assigned in registration order and contiguous per block. Every per-state datum (model,
 //! collision, textures, light) lives in flat arrays indexed by the state id. Frozen before the
 //! world loads and shared as `Arc<BlockRegistry>`.
+use crate::fluid::{FluidHardening, FluidId, FluidReplace, FluidRules, FluidType, MAX_FLUIDS};
 use crate::rules::{NeighborRule, UseRule};
 use crate::shapes::{MAX_MODEL_BOXES, ModelBox};
 use crate::state::{Property, StateName, StateParseError, StateValues, split_state};
@@ -503,8 +504,8 @@ pub enum RegistryError {
     /// Name must be `namespace:path` with `[a-z0-9_]` parts.
     #[error("invalid name {0}")]
     InvalidName(String),
-    /// More than 4096 textures, [`MAX_STATES`] states, `u16::MAX` box models or
-    /// [`MAX_MODEL_BOXES`] distinct model boxes.
+    /// More than 4096 textures, [`MAX_STATES`] states, `u16::MAX` box models,
+    /// [`MAX_MODEL_BOXES`] distinct model boxes or [`MAX_FLUIDS`] fluids.
     #[error("registry full: {0}")]
     Full(&'static str),
     /// A property of the block with an invalid name or value, no values, a default that is not
@@ -529,6 +530,13 @@ pub enum RegistryError {
     /// Box model id not registered ([`BlockRegistryBuilder::add_box_model`]).
     #[error("unknown box model id {0}")]
     UnknownBoxModel(u16),
+    /// A fluid whose block is not a `BlockModel::Fluid` with exactly the [`FLUID_LEVEL`]
+    /// property `0..=15` (or is a fluid already), or a fluid table naming an unknown state.
+    #[error("invalid fluid {0}")]
+    InvalidFluid(String),
+    /// Fluid id not declared ([`BlockRegistryBuilder::add_fluid`]).
+    #[error("unknown fluid id {0}")]
+    UnknownFluid(u8),
 }
 
 /// Index of a block (not of a state) in its registry, in registration order (`0` = air).
@@ -579,6 +587,10 @@ pub struct BlockRegistryBuilder {
     box_model_ids: std::collections::HashMap<BoxModel, BoxModelId>,
     /// The blocks that stop movement where they do not collide (by [`BlockId`]).
     blocks_motion: Vec<bool>,
+    /// The fluids, by [`FluidId`].
+    fluids: Vec<FluidType>,
+    /// The fluid the waterlogged states hold.
+    waterlog_fluid: Option<FluidId>,
 }
 
 impl BlockRegistryBuilder {
@@ -668,6 +680,128 @@ impl BlockRegistryBuilder {
         }
         self.blocks_motion[i] = true;
         Ok(())
+    }
+
+    /// The default state of the block named `name`, among those registered so far.
+    pub fn by_name(&self, name: &str) -> Option<BlockState> {
+        let block = self.block_by_name(name)?;
+        Some(BlockState(self.blocks[usize::from(block.0)].default))
+    }
+
+    /// Declares `block` a fluid that flows by `rules` and returns its id. The block must be drawn
+    /// as `BlockModel::Fluid` and have exactly one property, [`FLUID_LEVEL`], with the values `0`
+    /// to `15` in order (Minecraft's `level`: its states are its levels, a source first), and
+    /// not be a fluid already.
+    pub fn add_fluid(
+        &mut self,
+        block: BlockId,
+        rules: FluidRules,
+    ) -> Result<FluidId, RegistryError> {
+        let info = &self.blocks[self.block_index(block)?];
+        let first = BlockState(info.first);
+        let levels = match info.properties.as_slice() {
+            [level] => {
+                level.name() == FLUID_LEVEL
+                    && level.values().len() == 16
+                    && level
+                        .values()
+                        .iter()
+                        .enumerate()
+                        .all(|(i, v)| *v == i.to_string())
+            }
+            _ => false,
+        };
+        let states = usize::from(info.first)..usize::from(info.first + info.count);
+        let fluid = self.states[states]
+            .iter()
+            .all(|def| def.model == BlockModel::Fluid);
+        if !levels || !fluid || self.fluids.iter().any(|f| f.block == block) {
+            return Err(RegistryError::InvalidFluid(info.name.clone()));
+        }
+        if self.fluids.len() >= MAX_FLUIDS {
+            return Err(RegistryError::Full("fluids"));
+        }
+        self.fluids.push(FluidType {
+            block,
+            first,
+            rules,
+            replaced_by: Vec::new(),
+            falls_into: Vec::new(),
+            hardens: None,
+        });
+        Ok(FluidId((self.fluids.len() - 1) as u8))
+    }
+
+    /// Lets fluid `by` flow into the cells of fluid `target` when `when` says.
+    pub fn fluid_replaced_by(
+        &mut self,
+        target: FluidId,
+        by: FluidId,
+        when: FluidReplace,
+    ) -> Result<(), RegistryError> {
+        self.fluid_index(by)?;
+        let i = self.fluid_index(target)?;
+        self.fluids[i].replaced_by.push((by, when));
+        Ok(())
+    }
+
+    /// A cell of fluid `into` becomes `becomes` when fluid `fluid` falls into it.
+    pub fn fluid_falls_into(
+        &mut self,
+        fluid: FluidId,
+        into: FluidId,
+        becomes: BlockState,
+    ) -> Result<(), RegistryError> {
+        self.fluid_index(into)?;
+        let i = self.fluid_index(fluid)?;
+        self.check_fluid_state(i, becomes)?;
+        self.fluids[i].falls_into.push((into, becomes));
+        Ok(())
+    }
+
+    /// Fluid `fluid` hardens beside another as `hardening` says (replaces an earlier one).
+    pub fn fluid_hardens(
+        &mut self,
+        fluid: FluidId,
+        hardening: FluidHardening,
+    ) -> Result<(), RegistryError> {
+        self.fluid_index(hardening.with)?;
+        let i = self.fluid_index(fluid)?;
+        self.check_fluid_state(i, hardening.source)?;
+        self.check_fluid_state(i, hardening.flowing)?;
+        self.fluids[i].hardens = Some(hardening);
+        Ok(())
+    }
+
+    /// Makes `fluid` the one the waterlogged states hold ([`StateFlags::WATERLOGGED`], ADR
+    /// 0025): they tick and spread as its source, and a dry block that can be waterlogged takes
+    /// a source of it.
+    pub fn set_waterlog_fluid(&mut self, fluid: FluidId) -> Result<(), RegistryError> {
+        self.fluid_index(fluid)?;
+        self.waterlog_fluid = Some(fluid);
+        Ok(())
+    }
+
+    /// The index of `fluid`, if it is declared.
+    fn fluid_index(&self, fluid: FluidId) -> Result<usize, RegistryError> {
+        let i = usize::from(fluid.0);
+        if i < self.fluids.len() {
+            Ok(i)
+        } else {
+            Err(RegistryError::UnknownFluid(fluid.0))
+        }
+    }
+
+    /// `state` is a state of the registry, for the tables of fluid `i`.
+    fn check_fluid_state(&self, i: usize, state: BlockState) -> Result<(), RegistryError> {
+        if usize::from(state.0) < self.states.len() {
+            Ok(())
+        } else {
+            let block = self.fluids[i].block;
+            Err(RegistryError::InvalidFluid(
+                self.blocks[usize::from(block.0)].name.clone(),
+            ))
+        }
     }
 
     /// The index of `block`, if it is registered.
@@ -861,6 +995,8 @@ impl BlockRegistryBuilder {
             faces: states.iter().map(|b| b.textures).collect(),
             textures: self.textures,
             box_models: self.box_models,
+            fluids: self.fluids,
+            waterlog_fluid: self.waterlog_fluid,
             blocks: self.blocks,
             by_name,
         }
@@ -916,6 +1052,8 @@ pub struct BlockRegistry {
     faces: Vec<FaceTextures>,
     textures: Vec<TextureSpec>,
     box_models: Vec<BoxModel>,
+    fluids: Vec<FluidType>,
+    waterlog_fluid: Option<FluidId>,
     blocks: Vec<BlockInfo>,
     by_name: std::collections::HashMap<String, BlockId, foldhash::fast::FixedState>,
     /// The neighbor rule of each block (by [`BlockId`]).
@@ -1066,6 +1204,27 @@ impl BlockRegistry {
     /// Geometry (out of range -> the cube).
     pub fn model(&self, s: BlockState) -> BlockModel {
         self.models.get(s.0 as usize).copied().unwrap_or_default()
+    }
+    /// The fluids, by [`FluidId`] ([`BlockRegistryBuilder::add_fluid`]).
+    pub fn fluids(&self) -> &[FluidType] {
+        &self.fluids
+    }
+    /// A fluid of the registry.
+    pub fn fluid(&self, id: FluidId) -> Option<&FluidType> {
+        self.fluids.get(usize::from(id.0))
+    }
+    /// The fluid `s` is a state of, and its level (`0..=15`). A waterlogged state is not: it
+    /// holds a source of [`BlockRegistry::waterlog_fluid`] besides itself.
+    pub fn fluid_of(&self, s: BlockState) -> Option<(FluidId, u8)> {
+        self.fluids.iter().enumerate().find_map(|(i, f)| {
+            let level = s.0.checked_sub(f.first.0).filter(|&l| l < 16)?;
+            Some((FluidId(i as u8), level as u8))
+        })
+    }
+    /// The fluid the waterlogged states hold, if the registry has one
+    /// ([`BlockRegistryBuilder::set_waterlog_fluid`]).
+    pub fn waterlog_fluid(&self) -> Option<FluidId> {
+        self.waterlog_fluid
     }
     /// A box model of the registry ([`BlockModel::Boxes`]).
     pub fn box_model(&self, id: BoxModelId) -> Option<&BoxModel> {

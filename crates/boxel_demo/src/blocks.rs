@@ -442,6 +442,7 @@ pub fn builder() -> BlockRegistryBuilder {
     add_fluid_products(&mut b, &t);
     add_walls_and_gates(&mut b, &t);
     add_rules(&mut b);
+    crate::fluids::declare(&mut b);
     b
 }
 

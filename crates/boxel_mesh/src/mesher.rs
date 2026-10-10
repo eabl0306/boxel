@@ -254,10 +254,11 @@ impl MaterialTable {
                 ..BoxModels::default()
             },
         };
+        // The source of the fluid the waterlogged blocks hold.
         let water = registry
-            .by_name("boxel:water")
-            .filter(|&w| registry.model(w) == BlockModel::Fluid)
-            .map(|w| registry.material(w));
+            .waterlog_fluid()
+            .and_then(|id| registry.fluid(id))
+            .map(|fluid| registry.material(fluid.first));
         for i in 0..n {
             let s = BlockState(i as u16);
             let m = registry.material(s) as usize;

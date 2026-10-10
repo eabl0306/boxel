@@ -7,8 +7,9 @@
 //! game writes them, as closures over what they need, and they can be tested without a world.
 //!
 //! Also the helpers rules are written with: which sixteenths of a face a collision covers
-//! ([`collision_face_cover`], [`is_sturdy`], [`supports_center`]); and the water of the blocks
-//! that hold it when a player places or breaks one (ADR 0025): [`placed_into`] and [`broken`].
+//! ([`collision_face_cover`], [`is_sturdy`], [`supports_center`]); and the fluid of the blocks
+//! that hold one (the registry's waterlog fluid, water) when a player places or breaks one (ADR
+//! 0025): [`placed_into`] and [`broken`].
 //!
 //! [`BlockRegistryBuilder::set_neighbor_rule`]: crate::BlockRegistryBuilder::set_neighbor_rule
 //! [`BlockRegistryBuilder::set_use_rule`]: crate::BlockRegistryBuilder::set_use_rule
@@ -163,16 +164,17 @@ pub fn supports_center(registry: &BlockRegistry, state: BlockState, face: Face) 
     rows[7] & mid == mid && rows[8] & mid == mid
 }
 
-/// The water source of `registry` (`boxel:water`, its default state: level 0), if it has one.
-fn water_source(registry: &BlockRegistry) -> Option<BlockState> {
-    registry
-        .by_name("boxel:water")
-        .filter(|&w| registry.model(w) == BlockModel::Fluid)
+/// The source (`level` 0) of the fluid the waterlogged states of `registry` hold
+/// (`BlockRegistry::waterlog_fluid`), if it has one.
+fn waterlog_source(registry: &BlockRegistry) -> Option<BlockState> {
+    let id = registry.waterlog_fluid()?;
+    registry.fluid(id).map(|fluid| fluid.first)
 }
 
 /// The state `placed` takes in a cell that holds `existing` (Minecraft's `getStateForPlacement`
-/// of the blocks that hold water, ADR 0025): a block that can be waterlogged keeps a water
-/// source it is placed into and is dry anywhere else (flowing water is replaced, not kept).
+/// of the blocks that hold water, ADR 0025): a block that can be waterlogged keeps a source of
+/// the waterlog fluid it is placed into and is dry anywhere else (flowing water is replaced,
+/// not kept).
 /// Other blocks are `placed` as it is.
 pub fn placed_into(
     registry: &BlockRegistry,
@@ -182,15 +184,15 @@ pub fn placed_into(
     if !registry.can_be_waterlogged(placed) {
         return placed;
     }
-    let wet = water_source(registry) == Some(existing);
+    let wet = waterlog_source(registry) == Some(existing);
     registry.with_water(placed, wet).unwrap_or(placed)
 }
 
 /// What breaking `state` leaves in its cell (Minecraft keeps a block's fluid when it breaks,
-/// ADR 0025): a water source for a waterlogged block, air for anything else.
+/// ADR 0025): a source of the waterlog fluid for a waterlogged block, air for anything else.
 pub fn broken(registry: &BlockRegistry, state: BlockState) -> BlockState {
     if registry.is_waterlogged(state) {
-        water_source(registry).unwrap_or(BlockState::AIR)
+        waterlog_source(registry).unwrap_or(BlockState::AIR)
     } else {
         BlockState::AIR
     }
