@@ -154,6 +154,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # HEAD^1 for no_content.py --base: the PR base (HEAD is the merge commit) or the
+          # previous main on a push.
+          fetch-depth: 2
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
@@ -161,7 +164,7 @@ jobs:
       - name: no bevy* crates anywhere (root and vendor graphs)
         run: python3 tools/no_bevy.py
       - name: no content names in engine crates (issue #48, shrinking allowlist)
-        run: python3 tools/no_content.py
+        run: python3 tools/no_content.py --base HEAD^1
       - name: vendor/Cargo.lock agrees with Cargo.lock
         run: python3 tools/vendor_lock_sync.py
 

@@ -23,8 +23,9 @@ mechanisms, and the blocks, textures, rules and generators of the example game l
    three equal lines. A token used more often than it is listed fails, and so do lines left
    over once their uses are gone (stale). So removing a use deletes a line, and a new use of a
    listed token cannot hide behind the old line. Lanes only delete lines; the last step deletes
-   the directory. `--write-allowlist` writes the files from the current offenses (only to
-   create them).
+   the directory. `--base REF` enforces that: it also fails on any line that the lists did not
+   have at the commit where HEAD left REF (CI passes `HEAD^1`, the base of the pull request or
+   the previous `main`; locally use `main`). There is no flag that rewrites the lists.
 
 Prints `path:line: rule: token` per offense and exits 1, or prints `no content in engine
 crates` and exits 0. Standard library only."""
@@ -37,6 +38,11 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ALLOW_DIR = os.path.join('tools', 'no_content_allow')
+# This script, as the base commit names it: a base without it predates the lists.
+SELF = 'tools/no_content.py'
+# Variables that point git at another repository (git sets them inside hooks).
+GIT_REPO_VARS = {'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR',
+                 'GIT_OBJECT_DIRECTORY'}
 
 DEMO = 'boxel_demo'
 # The engine crates the demo may depend on (normal and build dependencies).
@@ -560,38 +566,56 @@ def allow_file(path):
     return f'{ALLOW_DIR}/{crate_of(path)}.txt'
 
 
-def write_allowlist(root, offenses):
-    """Writes one file per crate with offenses, one line per use, and removes the files of
-    crates with none."""
-    by_crate = {}
-    for crate, path, _, _, token in offenses:
-        by_crate.setdefault(crate, []).append((path, token))
-    top = os.path.join(root, ALLOW_DIR)
-    os.makedirs(top, exist_ok=True)
-    for name in os.listdir(top):
-        if name.endswith('.txt') and name[:-len('.txt')] not in by_crate:
-            os.remove(os.path.join(top, name))
-    for crate, entries in sorted(by_crate.items()):
-        with open(os.path.join(top, f'{crate}.txt'), 'w', encoding='utf-8') as f:
-            for path, token in sorted(entries):
-                f.write(f'{path}\t{token}\n')
-    return sum(len(e) for e in by_crate.values())
+class GitError(Exception):
+    pass
+
+
+def git(root, *args):
+    """The output of `git args...` run in `root`; raises GitError when git fails."""
+    env = {k: v for k, v in os.environ.items() if k not in GIT_REPO_VARS}
+    try:
+        done = subprocess.run(['git', *args], cwd=root, env=env, capture_output=True, text=True)
+    except OSError as e:
+        raise GitError(f'git {" ".join(args)}: {e}') from None
+    if done.returncode:
+        raise GitError(f'git {" ".join(args)}: {done.stderr.strip() or done.returncode}')
+    return done.stdout
+
+
+def base_allowlist(root, ref):
+    """The commit where HEAD left `ref`, and its lists as `{(path, token): lines}`, or None when
+    that commit has no `tools/no_content.py` (the lists did not exist yet)."""
+    commit = git(root, 'merge-base', ref, 'HEAD').strip()
+    if not git(root, 'ls-tree', '--name-only', commit, '--', SELF).strip():
+        return commit, None
+    allowed = {}
+    for name in git(root, 'ls-tree', '--name-only', commit, '--', f'{ALLOW_DIR}/').splitlines():
+        if name.endswith('.txt'):
+            parse_allowlist(name, git(root, 'show', f'{commit}:{name}'), allowed, [])
+    return commit, allowed
 
 
 # ---------------------------------------------------------------------------------------------
 
 
-def run(root, metadata, write=False, out=None):
-    """The check; returns the exit code."""
+def run(root, metadata, base=None, out=None):
+    """The check; returns the exit code. `base` is a git ref whose lists may only lose lines."""
     out = out or sys.stdout
     lines = [f'{manifest}: dependency: {message}' for manifest, message in
              check_structure(metadata)] if metadata is not None else []
     offenses = scan_tree(root)
-    if write:
-        count = write_allowlist(root, offenses)
-        print(f'wrote {count} entries to {ALLOW_DIR}/', file=out)
     allowed, errors = read_allowlist(root)
     lines += errors
+    if base is not None:
+        commit, before = base_allowlist(root, base)
+        if before is None:
+            print(f'the base {commit[:12]} has no {SELF}: no lists to compare', file=out)
+        else:
+            for (path, token), listed in sorted(allowed.items()):
+                had = before.get((path, token), 0)
+                if listed > had:
+                    lines.append(f'{allow_file(path)}: {path}: {token}: {listed} lines, {had} at '
+                                 f'the base {commit[:12]} (the lists only lose lines)')
     uses = {}  # (path, token): source lines, in scan order
     for _, path, line, rule, token in offenses:
         uses.setdefault((path, token), []).append(line)
@@ -634,9 +658,9 @@ def main(argv=None):
     parser.add_argument('--metadata', help='cargo metadata JSON file instead of running cargo')
     parser.add_argument('--no-structure', action='store_true',
                         help='skip the dependency check (no cargo)')
-    parser.add_argument('--write-allowlist', action='store_true',
-                        help=f'write {ALLOW_DIR}/ from the current offenses (only to create it; '
-                             'afterwards lines are only deleted)')
+    parser.add_argument('--base', metavar='REF',
+                        help=f'also fail on {ALLOW_DIR}/ lines that the commit where HEAD left '
+                             'REF did not have (CI: HEAD^1; locally: main)')
     args = parser.parse_args(argv)
     if args.no_structure:
         metadata = None
@@ -646,9 +670,12 @@ def main(argv=None):
     else:
         metadata = cargo_metadata(args.root)
     try:
-        return run(args.root, metadata, write=args.write_allowlist)
+        return run(args.root, metadata, base=args.base)
     except LexError as e:
         print(f'no_content: cannot read {e}', file=sys.stderr)
+        return 2
+    except GitError as e:
+        print(f'no_content: cannot read the base lists: {e}', file=sys.stderr)
         return 2
 
 

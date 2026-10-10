@@ -28,7 +28,7 @@ lint:
 deny:
     cargo deny --all-features check
     python3 tools/no_bevy.py
-    python3 tools/no_content.py
+    python3 tools/no_content.py --base main
     python3 tools/vendor_lock_sync.py
 
 [group('quality')]
