@@ -13,6 +13,10 @@ bitflags.workspace = true
 foldhash.workspace = true
 thiserror.workspace = true
 
+[features]
+# boxel_voxel::testing, a minimal `test:` block set for the tests of other engine crates (#48).
+testing = []
+
 [dev-dependencies]
 # The example content (#48), for tests, benches and examples only.
 boxel_demo.workspace = true

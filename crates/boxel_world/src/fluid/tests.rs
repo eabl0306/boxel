@@ -17,7 +17,7 @@ use boxel_math::DVec3;
 use boxel_transform::Transform;
 use boxel_voxel::{
     BlockCollision, BlockDef, BlockRegistryBuilder, FaceTextures, FluidHardening, FluidReplace,
-    MAX_BLOCK_COORD, Property, RenderShape, SlabHalf, TextureId, TexturePattern, TextureSpec,
+    MAX_BLOCK_COORD, Property, RenderShape, SlabHalf, TextureId, TextureImage, TextureSpec,
     WATERLOGGED,
 };
 use boxel_worldgen::FlatGenerator;
@@ -338,9 +338,7 @@ fn slab_builder() -> BlockRegistryBuilder {
     let mut b = BlockRegistryBuilder::new();
     b.add_texture(TextureSpec {
         name: "test:t".into(),
-        base_color: [0; 3],
-        noise: 0,
-        pattern: TexturePattern::Noise,
+        image: TextureImage::solid(16, [0, 0, 0, 255]),
     })
     .unwrap();
     let slab = BlockDef {

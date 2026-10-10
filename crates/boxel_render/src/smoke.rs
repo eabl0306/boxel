@@ -11,7 +11,7 @@ use boxel_math::{DVec3, I64Vec3, UVec2};
 use boxel_mesh::{BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, PackedQuad, palette_entry};
 use boxel_transform::Transform;
 use boxel_voxel::{
-    BlockRegistry, BlockRegistryBuilder, Face, LightValue, TexturePattern, TextureSpec,
+    BlockRegistry, BlockRegistryBuilder, Face, LightValue, TextureImage, TextureSpec,
 };
 use std::sync::Arc;
 
@@ -167,15 +167,13 @@ fn smoke_registry() -> BlockRegistry {
     builder
         .add_texture(TextureSpec {
             name: SMOKE_LAYER.to_string(),
-            base_color: [125, 125, 125],
-            noise: 18,
-            pattern: TexturePattern::Noise,
+            image: TextureImage::solid(16, [125, 125, 125, 255]),
         })
         .expect("the smoke layer");
     builder.build()
 }
 
-/// The texture layer of the smoke quads: gray noise, opaque everywhere.
+/// The texture layer of the smoke quads: flat gray, opaque everywhere.
 const SMOKE_LAYER: &str = "smoke:gray";
 
 /// One 32x32 +Y gray quad on the chunk floor lit only by blue block light (palette entry 0),

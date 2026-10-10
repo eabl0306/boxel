@@ -1,4 +1,5 @@
 //! Contract tests for skeleton-implemented items (frozen behavior).
+use boxel_demo::textures::{Pattern, paint};
 use boxel_voxel::*;
 use glam::IVec3;
 
@@ -44,9 +45,7 @@ fn registry_builder_assigns_dense_states() {
     let t = b
         .add_texture(TextureSpec {
             name: "test:stone".into(),
-            base_color: [128, 128, 128],
-            noise: 10,
-            pattern: TexturePattern::Noise,
+            image: TextureImage::solid(16, [128, 128, 128, 255]),
         })
         .unwrap();
     let stone = b
@@ -64,9 +63,7 @@ fn registry_builder_assigns_dense_states() {
     assert!(
         b.add_texture(TextureSpec {
             name: "Bad Name".into(),
-            base_color: [0; 3],
-            noise: 0,
-            pattern: TexturePattern::Noise
+            image: TextureImage::solid(16, [0, 0, 0, 255])
         })
         .is_err()
     );
@@ -258,14 +255,36 @@ fn default_registry_ids_shapes_and_faces_are_frozen() {
         assert_eq!(tex(water, Face::PosY), "boxel:water");
         assert_eq!(tex(water, Face::NegZ), "boxel:water_flow");
     }
-    for (name, flow) in [
-        ("boxel:water", "boxel:water_flow"),
-        ("boxel:lava", "boxel:lava_flow"),
+    // Each flow layer is the Flow pattern over its still layer's base color and noise (#48:
+    // the layers are images, painted by boxel_demo::textures).
+    for (name, flow, base, noise, still_pattern, alpha) in [
+        (
+            "boxel:water",
+            "boxel:water_flow",
+            [40, 90, 200],
+            6,
+            Pattern::Liquid { alpha: 160 },
+            160,
+        ),
+        (
+            "boxel:lava",
+            "boxel:lava_flow",
+            [207, 78, 16],
+            22,
+            Pattern::Speckle {
+                color: [255, 190, 50],
+                density: 60,
+            },
+            255,
+        ),
     ] {
-        let still = r.textures().iter().find(|t| t.name == name).unwrap();
-        let flow = r.textures().iter().find(|t| t.name == flow).unwrap();
-        assert_eq!(flow.base_color, still.base_color);
-        assert!(matches!(flow.pattern, TexturePattern::Flow { .. }));
+        let still_layer = r.textures().iter().find(|t| t.name == name).unwrap();
+        let flow_layer = r.textures().iter().find(|t| t.name == flow).unwrap();
+        assert_eq!(still_layer.image, paint(name, base, noise, still_pattern));
+        assert_eq!(
+            flow_layer.image,
+            paint(flow, base, noise, Pattern::Flow { alpha })
+        );
     }
     for (name, half) in [
         ("boxel:stone_slab[type=bottom]", SlabHalf::Bottom),
@@ -346,9 +365,7 @@ fn registry_rejects_bad_collision_boxes() {
     let t = b
         .add_texture(TextureSpec {
             name: "test:t".into(),
-            base_color: [0; 3],
-            noise: 0,
-            pattern: TexturePattern::Noise,
+            image: TextureImage::solid(16, [0, 0, 0, 255]),
         })
         .unwrap();
     let def = |name: &str, boxes: Vec<CollisionBox>| BlockDef {

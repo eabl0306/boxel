@@ -33,8 +33,8 @@ use boxel_voxel::{
 
 use crate::texture_animation::LayerAnimation;
 use crate::textures::{
-    BLOCK_TEXTURE_SIZE, BlockTextureData, generate_block_textures, is_cutout_pattern, layer_bytes,
-    mip_levels, push_layer, synthesize,
+    BLOCK_TEXTURE_SIZE, BlockTextureData, generate_block_textures, layer_bytes, mip_levels,
+    push_layer,
 };
 
 /// Largest layer edge taken from a pack (bigger packs are scaled down to it).
@@ -228,13 +228,9 @@ fn pack_block_textures(
                 }
             }
             None => {
-                let texels = scale_nearest(
-                    BLOCK_TEXTURE_SIZE,
-                    BLOCK_TEXTURE_SIZE,
-                    &synthesize(spec),
-                    size,
-                );
-                push_layer(&mut data, &texels, size, is_cutout_pattern(spec));
+                let image = &spec.image;
+                let texels = scale_nearest(image.size, image.size, &image.texels, size);
+                push_layer(&mut data, &texels, size, image.binary_alpha);
             }
         }
     }
@@ -972,15 +968,13 @@ pub(crate) mod tests {
     fn animated_flow_follows_the_fluids_side_texture() {
         use boxel_voxel::{
             BlockCollision, BlockDef, BlockModel, BlockRegistryBuilder, FLUID_LEVEL, FaceTextures,
-            Property, TexturePattern,
+            Property, TextureImage,
         };
         let mut b = BlockRegistryBuilder::new();
         let mut layer = |name: &str| {
             b.add_texture(TextureSpec {
                 name: format!("game:{name}"),
-                base_color: [90, 90, 90],
-                noise: 4,
-                pattern: TexturePattern::Noise,
+                image: TextureImage::solid(16, [90, 90, 90, 255]),
             })
             .expect("layer")
         };

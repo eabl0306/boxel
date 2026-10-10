@@ -7,7 +7,7 @@
 //!   linearization.
 //! - [`registry`]: data-driven blocks; runtime `BlockState(u16)` is dense and never persisted raw.
 //!   Each state has an RGB emission and a light opacity (ADR 0015).
-//! - [`state`]: block state properties (ADR 0019): `boxel:log[axis=x]`, one dense id per
+//! - [`state`]: block state properties (ADR 0019): `game:log[axis=x]`, one dense id per
 //!   combination of values, contiguous per block.
 //! - [`shapes`]: the boxes of the models made of boxes (ADR 0020: slabs, and the [`BoxModel`]s a
 //!   game registers, `BlockModel::Boxes`), and [`rules`]: the neighbor and use rules a block
@@ -25,6 +25,8 @@
 //!   emitters; built and cached only when the storage cannot serve them as is), and
 //!   [`ChunkData::may_contain`], a cached palette scan for a [`StateSet`]. Voxel arrays never
 //!   live inline in ECS components.
+//! - `testing` (with the `testing` feature): a minimal block set with `test:` names for engine
+//!   tests; the engine itself holds no content (#48).
 
 pub mod coords;
 pub mod faces;
@@ -35,6 +37,8 @@ pub mod rules;
 pub mod shapes;
 pub mod state;
 pub mod storage;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 mod chunk;
 mod masks;
@@ -53,7 +57,7 @@ pub use registry::{
     Axis, BlockCollision, BlockDef, BlockId, BlockModel, BlockRegistry, BlockRegistryBuilder,
     BlockState, BoxModel, BoxModelId, CollisionBox, FLUID_LEVEL, FaceTextures,
     MAX_COLLISION_HEIGHT, MAX_STATES, RegistryError, RenderShape, SlabHalf, StateFlags, TextureId,
-    TexturePattern, TextureSpec, WATERLOGGED,
+    TextureImage, TextureSpec, WATERLOGGED,
 };
 pub use shapes::{Facing, MAX_MODEL_BOXES, ModelBox};
 pub use state::{Property, StateName, StateParseError, StateValues};

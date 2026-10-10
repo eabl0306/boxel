@@ -8,6 +8,7 @@ use crate::rules::{NeighborRule, UseRule};
 use crate::shapes::{MAX_MODEL_BOXES, ModelBox};
 use crate::state::{Property, StateName, StateParseError, StateValues, split_state};
 use crate::{Face, LightValue, OPAQUE_OPACITY};
+use std::sync::Arc;
 
 /// The state property of a fluid's level (Minecraft's `level`, `0..=15`): 0 is a source, 1 to 7
 /// flowing (lower as it grows), 8 to 15 falling (ADR 0021).
@@ -369,73 +370,48 @@ bitflags::bitflags! {
     }
 }
 
-/// Procedural texture pattern (M0 has no texture assets; the renderer synthesizes 16x16 layers).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum TexturePattern {
-    /// Base color with per-texel noise of amplitude `noise`.
-    Noise,
-    /// Noise plus a top band of `color` `rows` texels tall (grass side).
-    TopBand {
-        /// Band color.
-        color: [u8; 3],
-        /// Band height in texels (of 16).
-        rows: u8,
-    },
-    /// Noise plus random speckles of `color`.
-    Speckle {
-        /// Speckle color.
-        color: [u8; 3],
-        /// Speckles per 256 texels.
-        density: u8,
-    },
-    /// Leaves: noise with ~25% transparent texels (alpha 0), for cutout tests.
-    Leaves,
-    /// Horizontal planks.
-    Planks,
-    /// Bark: dark vertical cracks, broken here and there (log sides; a turned log runs them
-    /// along its axis).
-    Bark,
-    /// Glass: a clear inside (alpha 0) with a light frame and a few streaks (translucent).
-    Glass,
-    /// Noise with a constant alpha (water; translucent).
-    Liquid {
-        /// Alpha of every texel.
-        alpha: u8,
-    },
-    /// Grass blades on a clear background, for cross plants (binary alpha, like `Leaves`).
-    Plant,
-    /// A flower on a clear background: a stem of the base color and a head of `color` (binary
-    /// alpha).
-    Flower {
-        /// Petal color.
-        color: [u8; 3],
-    },
-    /// A torch on a clear background, laid out like Minecraft's: a stick of the base color in
-    /// columns 7 and 8 from row 8 down, under a flame in rows 6 and 7 (binary alpha).
-    Torch,
-    /// Cobblestone: rounded stones of the base color, each a little lighter or darker, between
-    /// dark joints.
-    Cobble,
-    /// A fluid's flow texture (ADR 0025): noise with streaks running down its columns, lighter
-    /// and darker, that tile along v; the shader scrolls it along the flow. Every texel has
-    /// `alpha`.
-    Flow {
-        /// Alpha of every texel.
-        alpha: u8,
-    },
+/// The texels of one texture layer (#48): `size`^2 sRGB RGBA8 texels, row 0 the top of the
+/// image. The game paints or loads them; the renderer builds their mips (or reads the layer from
+/// a resource pack, scaling this image where the pack has no texture for it).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TextureImage {
+    /// Edge in texels: a power of two, the same for every layer of a registry.
+    pub size: u32,
+    /// The `size * size` texels, row by row from the top.
+    pub texels: Arc<[[u8; 4]]>,
+    /// Whether every mip keeps the alpha binary (0 or 255) and the coverage of level 0: cutout
+    /// layers, drawn with an alpha test. A blended layer averages its alpha like its color.
+    pub binary_alpha: bool,
+}
+
+impl TextureImage {
+    /// A `size`^2 image of one `color`, without binary alpha.
+    pub fn solid(size: u32, color: [u8; 4]) -> Self {
+        let texels = (size as usize).saturating_mul(size as usize);
+        Self {
+            size,
+            texels: vec![color; texels].into(),
+            binary_alpha: false,
+        }
+    }
+
+    /// Whether the edge is a power of two and the texels fill it exactly.
+    pub fn is_valid(&self) -> bool {
+        self.size.is_power_of_two()
+            && usize::try_from(self.size)
+                .ok()
+                .and_then(|n| n.checked_mul(n))
+                .is_some_and(|n| n == self.texels.len())
+    }
 }
 
 /// One texture layer description.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TextureSpec {
-    /// Unique name (`"boxel:grass_top"`).
+    /// Unique name (`"game:grass_top"`).
     pub name: String,
-    /// Base sRGB color.
-    pub base_color: [u8; 3],
-    /// Noise amplitude (0..=64 reasonable).
-    pub noise: u8,
-    /// Pattern.
-    pub pattern: TexturePattern,
+    /// Its texels.
+    pub image: TextureImage,
 }
 
 /// Texture layer index in the block texture array (`0..4096`, fits `PackedQuad`'s 12 bits).
@@ -538,6 +514,10 @@ pub enum RegistryError {
     /// Fluid id not declared ([`BlockRegistryBuilder::add_fluid`]).
     #[error("unknown fluid id {0}")]
     UnknownFluid(u8),
+    /// A texture image whose edge is not a power of two, whose texels do not fill it, or whose
+    /// edge differs from the layers registered before it.
+    #[error("invalid texture size of {0}")]
+    TextureSize(String),
 }
 
 /// Index of a block (not of a state) in its registry, in registration order (`0` = air).
@@ -611,11 +591,19 @@ impl BlockRegistryBuilder {
         b
     }
 
-    /// Registers a texture layer.
+    /// Registers a texture layer. Its image must be valid ([`TextureImage::is_valid`]) and as
+    /// big as the layers registered before it.
     pub fn add_texture(&mut self, spec: TextureSpec) -> Result<TextureId, RegistryError> {
         validate_name(&spec.name)?;
         if self.textures.iter().any(|t| t.name == spec.name) {
             return Err(RegistryError::Duplicate(spec.name));
+        }
+        let same_size = self
+            .textures
+            .first()
+            .is_none_or(|t| t.image.size == spec.image.size);
+        if !spec.image.is_valid() || !same_size {
+            return Err(RegistryError::TextureSize(spec.name));
         }
         if self.textures.len() >= 4096 {
             return Err(RegistryError::Full("textures"));

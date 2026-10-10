@@ -37,13 +37,13 @@
 
 use crate::rules::{self, Kinds};
 use crate::shapes::{self, FenceSides, StairShape, WallSide, WallSides};
+use crate::textures::{self, Pattern};
 use boxel_voxel::rules::{NeighborRule, UseRule};
 use boxel_voxel::shapes::half_from_name;
 use boxel_voxel::{
     Axis, BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockRegistryBuilder, BlockState,
     BoxModel, BoxModelId, CollisionBox, FLUID_LEVEL, FaceTextures, Facing, ModelBox,
-    OPAQUE_OPACITY, Property, RenderShape, SlabHalf, StateValues, TextureId, TexturePattern,
-    TextureSpec, WATERLOGGED,
+    OPAQUE_OPACITY, Property, RenderShape, SlabHalf, StateValues, TextureId, WATERLOGGED,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -131,14 +131,14 @@ struct Layers {
 
 /// Registers the 26 layers in their order.
 fn add_layers(b: &mut BlockRegistryBuilder) -> Layers {
-    use TexturePattern as P;
-    let mut tex = |name: &str, rgb: [u8; 3], noise: u8, pattern: TexturePattern| {
-        b.add_texture(TextureSpec {
-            name: format!("boxel:{name}"),
-            base_color: rgb,
+    use Pattern as P;
+    let mut tex = |name: &str, rgb: [u8; 3], noise: u8, pattern: Pattern| {
+        b.add_texture(textures::spec(
+            &format!("boxel:{name}"),
+            rgb,
             noise,
             pattern,
-        })
+        ))
         .expect("demo texture")
     };
     let stone = tex("stone", [125, 125, 125], 18, P::Noise);

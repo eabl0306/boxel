@@ -32,9 +32,7 @@ fn light_registry() -> BlockRegistry {
     let t = b
         .add_texture(TextureSpec {
             name: "test:t".into(),
-            base_color: [1, 2, 3],
-            noise: 0,
-            pattern: TexturePattern::Noise,
+            image: TextureImage::solid(16, [1, 2, 3, 255]),
         })
         .unwrap();
     for i in 1..STATES {
@@ -365,9 +363,7 @@ fn may_emit_is_a_palette_scan() {
     let texture = plain_registry
         .add_texture(TextureSpec {
             name: "test:stone".to_string(),
-            base_color: [128; 3],
-            noise: 0,
-            pattern: TexturePattern::Noise,
+            image: TextureImage::solid(16, [128, 128, 128, 255]),
         })
         .unwrap();
     plain_registry

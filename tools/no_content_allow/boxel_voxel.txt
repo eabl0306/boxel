@@ -1,8 +1,3 @@
-crates/boxel_voxel/src/lib.rs	TexturePattern
-crates/boxel_voxel/src/lib.rs	boxel:log
-crates/boxel_voxel/src/registry.rs	TexturePattern
-crates/boxel_voxel/src/registry.rs	TexturePattern
-crates/boxel_voxel/src/registry.rs	boxel:grass_top
 crates/boxel_voxel/src/registry.rs	boxel:log
 crates/boxel_voxel/src/registry.rs	boxel:log
 crates/boxel_voxel/src/registry.rs	boxel:log

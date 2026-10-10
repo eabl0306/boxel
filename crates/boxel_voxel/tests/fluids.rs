@@ -5,9 +5,7 @@ use boxel_voxel::*;
 fn texture(b: &mut BlockRegistryBuilder) -> TextureId {
     b.add_texture(TextureSpec {
         name: "test:t".into(),
-        base_color: [0; 3],
-        noise: 0,
-        pattern: TexturePattern::Noise,
+        image: TextureImage::solid(16, [0, 0, 0, 255]),
     })
     .unwrap()
 }
