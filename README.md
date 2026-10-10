@@ -6,6 +6,9 @@ Si algo falla, prueba el siguiente.
 
 Estado: milestone M0, en desarrollo. Solo escritorio (Linux, Windows, macOS).
 
+El motor no trae contenido: un juego registra sus bloques, texturas, fluidos y generadores. Los
+ejemplos usan los de `crates/boxel_demo`, un juego de muestra estilo Minecraft (ADR 0029).
+
 ## Requisitos
 
 - Rust 1.98.1. `rustup` lo instala solo gracias a `rust-toolchain.toml`. Versión mínima: 1.97.

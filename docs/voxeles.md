@@ -702,8 +702,8 @@ sale como mucho cada 5 s con la cuenta acumulada. Si vuelve a salir en pleno jue
   vecinos.
 - `vertical_chunks()` del generador ya no limita el mundo: dice dónde puede haber algo que no sea
   aire. Afuera, los chunks se crean como aire, sin job, y se pueden editar. El generador tiene que
-  contestar rápido a cualquier altura: `TerrainGenerator` devuelve aire o piedra uniforme sin
-  calcular alturas lejos del terreno (probado).
+  contestar rápido a cualquier altura: `TerrainGenerator` (de `boxel_demo`, ADR 0029) devuelve
+  aire o piedra uniforme sin calcular alturas lejos del terreno (probado).
 - Para comparar con M0, `WorldSettings::vertical_bounds` fija un alto. Con el rango del generador
   y un radio vertical grande el mundo carga como antes (`--fixed-height` en los ejemplos).
 
@@ -721,8 +721,8 @@ memoria de vóxeles. Las mallas con quads son las mismas que en M0 (7234 a radio
 **Lo que falta:**
 
 - Aprobar el aspecto de las cuevas y sumar el contenido de profundidad (fase 6 del plan). El
-  generador 3D ya existe: `OverworldGenerator` v1 (`--world overworld` en los ejemplos), con
-  cuevas tipo Minecraft 1.18 y piedra infinita hacia abajo. Costo y carga en
+  generador 3D ya existe: `OverworldGenerator` v1 de `boxel_demo` (`--world overworld` en los
+  ejemplos), con cuevas tipo Minecraft 1.18 y piedra infinita hacia abajo. Costo y carga en
   [rendimiento/cuevas-fase2-2026-10.md](rendimiento/cuevas-fase2-2026-10.md); frames con ventana
   y capturas en [rendimiento/cuevas-v1-2026-10.md](rendimiento/cuevas-v1-2026-10.md).
 - Oclusión (Hi-Z): con cuevas, el descarte por pirámide dibuja mucho bajo tierra.

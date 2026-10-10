@@ -3,6 +3,8 @@
 - Estado: aceptado (tercera parte de la issue #38: líquidos que fluyen)
 - Fecha: 2026-10-07
 - Revisa: ADR 0018 sección 6 (la superficie del agua) y ADR 0019 (ids del contenido de serie)
+- Revisado por: ADR 0029 (el agua es un fluido que declara el juego; el generador `Sea` vive en
+  `boxel_demo`)
 
 ## Contexto
 

@@ -3,6 +3,8 @@
 - Estado: aceptado (issue #45: animación y mips de las hojas)
 - Fecha: 2026-10-10
 - Revisa: ADR 0025, sección 5 (la textura de flujo de un pack animado no se desplaza)
+- Revisado por: ADR 0029 (las recetas de los packs las pasa el juego; el flujo animado se busca por
+  fluido)
 
 ## Contexto
 

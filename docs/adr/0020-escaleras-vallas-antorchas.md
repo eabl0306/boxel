@@ -4,6 +4,8 @@
 - Fecha: 2026-10-07
 - Revisa: ADR 0018 (las losas pasan a ser modelos de cajas y los códigos de forma 2 y 3 quedan
   libres)
+- Revisado por: ADR 0029 (escaleras, vallas y antorchas son contenido de `boxel_demo`; sus reglas se
+  registran por bloque)
 
 ## Contexto
 

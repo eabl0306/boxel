@@ -2,6 +2,8 @@
 
 - Estado: aceptado
 - Fecha: 2026-10-05
+- Revisado por: ADR 0029 (los generadores de terreno y sus tests lejos del origen, como
+  `far_coords.rs`, viven en `boxel_demo`)
 
 ## Contexto
 

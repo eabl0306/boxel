@@ -4,6 +4,8 @@
   losa pasaron a ser estados de bloque en el ADR 0019, que cambia los ids de esta parte. Las
   losas se dibujan como cajas desde el ADR 0020.
 - Fecha: 2026-10-07
+- Revisado por: ADR 0029 (las formas de cajas pasan a `BlockModel::Boxes` y el contenido a
+  `boxel_demo`)
 
 ## Contexto
 

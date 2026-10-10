@@ -4,6 +4,7 @@
 - Fecha: 2026-10-09
 - Revisa: ADR 0021 (fluidos), ADR 0018 sección 6 (la superficie del agua) y ADR 0020 (modelos de
   cajas)
+- Revisado por: ADR 0029 (agua y lava se declaran en el registro, con `boxel_demo::fluids`)
 
 ## Contexto
 

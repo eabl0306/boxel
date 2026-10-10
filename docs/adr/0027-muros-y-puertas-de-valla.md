@@ -5,6 +5,7 @@
 - Revisa: ADR 0020, sección 5 (las reglas de vecinos ya no se quedan en una vuelta; las vallas
   se conectan a las puertas), ADR 0021, sección 3 (una celda sin colisión no siempre puede tener
   agua: la puerta abierta no) y ADR 0026 (fuera de esa parte quedaban los muros y las puertas)
+- Revisado por: ADR 0029 (muros y puertas de valla son contenido de `boxel_demo`)
 
 ## Contexto
 
