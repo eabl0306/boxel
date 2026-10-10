@@ -9,7 +9,7 @@ use crate::contacts::{
 };
 use crate::core::CollisionTable;
 use crate::projectile::{PendingHits, step_projectiles, write_hits};
-use crate::sleep::{sleep_bodies, wake_bodies};
+use crate::sleep::{sleep_bodies, wake_bodies, wake_to_pose};
 use crate::systems::{
     AwakeCount, PendingImpacts, PhysicsSystems, WritebackTick, drive_characters, interpolate,
     move_kinematic, prepare_bodies, publish_stats, step_dynamic, write_back, write_events,
@@ -140,7 +140,9 @@ impl Plugin for PhysicsPlugin {
             .add_systems(
                 FixedPostUpdate,
                 (
-                    prepare_bodies.in_set(PhysicsSystems::Prepare),
+                    (prepare_bodies, wake_to_pose)
+                        .chain()
+                        .in_set(PhysicsSystems::Prepare),
                     drive_characters.in_set(PhysicsSystems::Controller),
                     wake_bodies.in_set(PhysicsSystems::Wake),
                     (move_kinematic, build_obstacles)
