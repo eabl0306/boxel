@@ -399,6 +399,8 @@ en el agua le devuelve el agua.
     V no, y volando tampoco. En `shared/player.rs`: la suavidad cae justo y no se pasa; el
     balanceo queda en sus límites y se repite cada 2 de distancia; la vista se agacha, se abre y
     se balancea, y un salto grande no cuenta como caminar.
+  - `physics_sandbox` (sin ventana): T agachado arma la escalera en los pies, no un bloque más
+    abajo.
 
 ## Fuera de esta parte
 

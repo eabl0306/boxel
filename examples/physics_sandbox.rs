@@ -596,11 +596,13 @@ fn drop_crates(
 /// [`STAIRS_KEY`] builds a stair two blocks ahead of the active camera, along the axis it faces
 /// most: a bottom slab, then a full block, half a block higher each step ([`STAIR_STEPS`]), and
 /// a landing at the top, filled with stone underneath. The player walks up it without jumping
-/// (the step-up of its `CharacterController`).
+/// (the step-up of its `CharacterController`). It starts at the player's feet, or
+/// [`EYE_HEIGHT`] under the free camera (the player's eye is lower while it crouches).
 fn build_stairs(
     keys: Res<ButtonInput<KeyCode>>,
     content: Res<WorldContent>,
     cameras: Query<(&Camera, &Transform, &FlyCamera)>,
+    players: Query<&BodyPosition, With<Player>>,
     mut edits: ResMut<EditQueue>,
 ) {
     if !keys.just_pressed(STAIRS_KEY) {
@@ -624,7 +626,10 @@ fn build_stairs(
     } else {
         (I64Vec3::new(0, 0, forward.z.signum() as i64), I64Vec3::X)
     };
-    let feet = WorldPos::from_dvec3(eye.translation).offset(DVec3::new(0.0, -EYE_HEIGHT, 0.0));
+    let feet = players.iter().next().map_or_else(
+        || WorldPos::from_dvec3(eye.translation).offset(DVec3::new(0.0, -EYE_HEIGHT, 0.0)),
+        |body| body.0,
+    );
     let start = feet.block.as_i64vec3() + ahead * 2;
     for i in 0..STAIR_STEPS + STAIR_LANDING {
         let top = i.min(STAIR_STEPS - 1) / 2;
@@ -1413,5 +1418,40 @@ mod tests {
         let (feet, eye) = heights(&mut app);
         assert_eq!(feet, 7.0, "on the landing, three blocks up");
         assert_eq!(eye, feet + EYE_HEIGHT);
+    }
+
+    #[test]
+    fn t_builds_the_stair_at_the_feet_while_crouched() {
+        use player::{CROUCH_EYE_HEIGHT, SNEAK_KEY};
+        let mut app = standing_app();
+        // Shift: the eye settles at the crouching height, lower than `EYE_HEIGHT`.
+        key(&mut app, SNEAK_KEY, true);
+        for _ in 0..64 {
+            app.update();
+        }
+        let eye = {
+            let world = app.world_mut();
+            world
+                .query_filtered::<&Transform, With<FlyCamera>>()
+                .single(world)
+                .expect("camera")
+                .translation
+                .y
+        };
+        assert_eq!(eye, 4.0 + CROUCH_EYE_HEIGHT);
+        // T: the stair still starts at the feet (y = 4), two blocks north, on the grass.
+        tap(&mut app, STAIRS_KEY);
+        for _ in 0..4 {
+            app.update();
+        }
+        key(&mut app, SNEAK_KEY, false);
+        let registry = &app.world().resource::<WorldContent>().registry;
+        let slab = registry
+            .parse_state("boxel:stone_slab[type=bottom]")
+            .expect("built-in");
+        let grass = registry.by_name("boxel:grass").expect("built-in");
+        let map = app.world().resource::<ChunkMap>();
+        assert_eq!(map.block_at(BlockPos::new(0, 4, -2)), Some(slab));
+        assert_eq!(map.block_at(BlockPos::new(0, 3, -2)), Some(grass));
     }
 }
