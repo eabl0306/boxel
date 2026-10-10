@@ -267,7 +267,7 @@ secciones 2 y 3 en todos lados (con criterion, contra cf11b4f: `raycast/sky_1024
 
 ## Fuera de esta parte
 
-- Muros de piedra y puertas de valla (también chocan a 1,5).
+- Muros de piedra y puertas de valla (también chocan a 1,5). Hecho en ADR 0027.
 - La cámara en primera persona pulida (balanceo, FOV al correr) y la interacción, de la issue #37.
 - Volar en el agua: `SwimPlugin` sigue tomando el pestillo del salto en un fluido.
 - El impulso del salto corriendo, que correr se corte al chocar y el hambre.
