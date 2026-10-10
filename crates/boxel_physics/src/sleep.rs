@@ -17,8 +17,9 @@
 //! systems.
 
 use crate::components::{
-    BodyPosition, Collider, Contacts, Disturbed, Frozen, MoveIntent, PhysicsSettings, PhysicsStats,
-    PhysicsSync, Projectile, ReportContacts, RigidBody, SleepLog, Sleeping, Vacated, Velocity,
+    BodyPosition, CharacterController, Collider, Contacts, Crouch, Disturbed, Frozen, MoveIntent,
+    PhysicsSettings, PhysicsStats, PhysicsSync, Projectile, ReportContacts, RigidBody, SleepLog,
+    Sleeping, Vacated, Velocity,
 };
 use crate::contacts::{BodyIndex, IndexedBody};
 use crate::core::{BlockBounds, BodySettings, Grid, Shape};
@@ -629,6 +630,7 @@ pub(crate) fn sleep_bodies(
             &mut PhysicsSync,
             Has<Frozen>,
             Option<&MoveIntent>,
+            Option<&Crouch>,
         ),
         Without<Sleeping>,
     >,
@@ -643,14 +645,17 @@ pub(crate) fn sleep_bodies(
     let speed = settings.sleep_speed;
     let distance = speed * fixed.timestep().as_secs_f64();
     let mut asleep = 0;
-    for (entity, kind, velocity, contacts, mut sync, frozen, intent) in &mut bodies {
+    for (entity, kind, velocity, contacts, mut sync, frozen, intent, crouch) in &mut bodies {
         if *kind != RigidBody::Dynamic {
             continue;
         }
-        // A character that wants to walk is not resting, even against a wall.
+        // A character that wants to walk is not resting, even against a wall; nor is one
+        // that stays crouched only for want of room to stand up (it tries every step).
         let walking = intent.is_some_and(|i| i.wish != Vec2::ZERO);
+        let rising = crouch.is_some_and(Crouch::is_crouching) && !intent.is_some_and(|i| i.sneak);
         let still = !frozen
             && !walking
+            && !rising
             && contacts.on_ground
             && velocity.0.abs().max_element() <= speed
             && sync.net.abs().max_element() <= distance;
@@ -669,6 +674,23 @@ pub(crate) fn sleep_bodies(
         asleep += 1;
     }
     stats.sleeping += asleep;
+}
+
+/// [`crate::PhysicsSystems::Prepare`]: a sleeping character whose [`MoveIntent`] changed so that
+/// its pose must change (it sneaks standing, or stops sneaking crouched; ADR 0026) wakes up in
+/// this step, so it crouches or stands up without moving.
+pub(crate) fn wake_to_pose(
+    mut disturbed: ResMut<Disturbed>,
+    characters: Query<
+        (Entity, &CharacterController, &MoveIntent, &Crouch),
+        (With<Sleeping>, Changed<MoveIntent>),
+    >,
+) {
+    for (entity, controller, intent, crouch) in &characters {
+        if (intent.sneak && !controller.flying) != crouch.is_crouching() {
+            disturbed.0.push(entity);
+        }
+    }
 }
 
 /// Puts a body to sleep: the [`Sleeping`] marker, whose hook sets the velocity to 0 and the

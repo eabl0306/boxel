@@ -74,6 +74,12 @@ fn the_table_follows_the_block_collision_and_model() {
     let glass = state("boxel:glass");
     assert_eq!(t.shape(glass), CollisionShape::Full);
     assert!(!t.is_fluid(glass) && t.is_fluid(WATER));
+    // Water is wet; a waterlogged slab holds water (ADR 0025) but is picked and collides as its
+    // slab, not as a fluid; a dry one is neither.
+    let wet = state("boxel:stone_slab[type=bottom,waterlogged=true]");
+    assert!(t.is_wet(WATER) && t.is_wet(wet) && !t.is_fluid(wet));
+    assert_eq!(t.shape(wet), t.shape(bottom()));
+    assert!(!t.is_wet(bottom()) && !t.is_wet(glass) && !t.is_wet(BlockState::AIR));
     assert_eq!(t.outline(BlockState::AIR), CollisionShape::Empty);
     assert!(t.has_boxes());
 }

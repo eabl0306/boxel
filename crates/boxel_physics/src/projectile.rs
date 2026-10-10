@@ -367,7 +367,7 @@ fn fly(flyer: &mut Flyer<'_>, shared: &Shared<'_>, f: Flight<'_, '_>) {
         .voxels
         .probe(WorldPos::from_block(end.block, end.frac + offset).block)
     {
-        contacts.in_fluid = shared.table.is_fluid(state);
+        contacts.in_fluid = shared.table.is_wet(state);
     }
     flyer.out.moved += 1;
     f.position.set_if_neq(BodyPosition(end));

@@ -78,11 +78,14 @@ const BOXES: u8 = 1 << 3;
 const OUTLINE_BOXES: u8 = 1 << 4;
 /// `CollisionTable` bit: some collision box of the block reaches into the cell above.
 const TALL: u8 = 1 << 5;
+/// `CollisionTable` bit: the block holds a fluid (a fluid block or a waterlogged one).
+const WET: u8 = 1 << 6;
 
 /// Per block state, what physics needs to know: its [`CollisionShape`], its picking outline and
 /// whether it is a fluid. Built from a [`BlockRegistry`] (ADR 0016, ADR 0018):
 /// `BlockDef::collision` gives the shape (a box list that is exactly the unit cube counts as
-/// `Full`, an empty one as `Empty`), the registry's `FLUID` flag gives the fluid bit, and a
+/// `Full`, an empty one as `Empty`), the registry's `FLUID` flag gives the fluid bit (and,
+/// with `WATERLOGGED`, the wet bit: a waterlogged block holds a water source, ADR 0025), and a
 /// render shape other than `None` gives an outline, the model's (`BlockModel::outline`: the
 /// cube, a slab's half, a box around a plant). States outside the registry are empty.
 ///
@@ -120,7 +123,10 @@ impl CollisionTable {
             let flags = registry.flags(state);
             let mut bits = 0;
             if flags.contains(StateFlags::FLUID) {
-                bits |= FLUID;
+                bits |= FLUID | WET;
+            }
+            if flags.contains(StateFlags::WATERLOGGED) {
+                bits |= WET;
             }
             let collision = table.push_shape(registry.collision(state));
             match collision {
@@ -276,10 +282,19 @@ impl CollisionTable {
         self.plane_gap
     }
 
-    /// `state` is a fluid (water).
+    /// `state` is a fluid (water, lava). A waterlogged block is not (it is picked and placed
+    /// against as its block); see [`CollisionTable::is_wet`].
     #[inline]
     pub fn is_fluid(&self, state: BlockState) -> bool {
         self.bits(state) & FLUID != 0
+    }
+
+    /// `state` holds a fluid: a fluid block, or a block with water in it (a waterlogged slab,
+    /// stair or fence, ADR 0025). A body in its cell is in that fluid: it swims
+    /// ([`crate::SwimPlugin`]) and its [`crate::Contacts::in_fluid`] is set.
+    #[inline]
+    pub fn is_wet(&self, state: BlockState) -> bool {
+        self.bits(state) & WET != 0
     }
 
     /// `state` has geometry, so it can be picked (everything but air and invisible blocks).

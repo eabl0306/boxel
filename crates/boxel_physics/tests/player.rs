@@ -1,19 +1,21 @@
 //! The player modes of `CharacterController` (issue #37, ADR 0026): sneaking (slower, never off
-//! an edge deeper than the step height), sprinting and creative flight (no gravity, up and down
-//! at will, landing ends it). First the pure edge guard (`guard_edge`), then characters in an
-//! `App`; everything bit for bit the same far from the origin.
+//! an edge deeper than the step height, crouching where there is no room to stand), sprinting
+//! (it ends moving backward, crouching or against a wall; the sprint-jump) and creative flight
+//! (no gravity, up and down at will, landing ends it). First the pure edge guard
+//! (`guard_edge`), then characters in an `App`; everything bit for bit the same far from the
+//! origin.
 mod common;
 mod sim;
 
 use boxel_ecs::prelude::*;
 use boxel_math::{DVec3, I64Vec3, Vec2};
 use boxel_physics::{
-    CharacterController, Collider, Contacts, EDGE_MARGIN, LocalBox, MoveIntent, SweepConfig,
-    TestWorld, Velocity, guard_edge,
+    CharacterController, Collider, Contacts, Crouch, EDGE_MARGIN, LocalBox, MoveIntent,
+    SweepConfig, TestWorld, Velocity, guard_edge,
 };
 use boxel_voxel::{BlockPos, BlockState, MAX_BLOCK_COORD, WorldPos};
 use boxel_world::ChunkMap;
-use common::{STONE, bottom_slab, fill, table};
+use common::{STONE, bottom_slab, fill, table, top_slab};
 use sim::{STEP, Sim};
 
 /// A 0.5 x 1.75 x 0.5 box with its origin at the feet (binary fractions: exact positions).
@@ -385,6 +387,327 @@ fn sprinting_doubles_the_flight_speed() {
     );
 }
 
+/// The walker's box height (its collider's, against the voxels).
+fn height(sim: &Sim, body: Entity) -> f64 {
+    let b = sim.get::<Collider>(body).voxel_box();
+    b.max.y - b.min.y
+}
+
+/// A roof of top slabs over the ground from x = 3 to 6 (z -3 to 3): under it there are 1.5
+/// blocks of room, enough to crouch (1.5) and not to stand (1.75).
+fn roof(sim: &mut Sim) {
+    build(sim, [3, 5, -3], [6, 5, 3], top_slab());
+}
+
+#[test]
+fn sneaking_crouches_and_standing_up_needs_room() {
+    let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    roof(&mut sim);
+    let body = walker(&mut sim, 1.5, 4.0, 0.5);
+    let standing = Collider::standing(0.5, 1.75);
+    sim.steps(64);
+    assert!(!sim.get::<Crouch>(body).is_crouching());
+    assert!(sim.asleep(body));
+    // Sneak: the body wakes up and crouches at once, 1.5 tall, its feet where they were.
+    intent(&mut sim, body, |i| i.sneak = true);
+    sim.steps(1);
+    assert!(sim.get::<Crouch>(body).is_crouching());
+    assert_eq!(sim.get::<Crouch>(body).standing(), Some(standing));
+    assert_eq!(height(&sim, body), 1.5);
+    assert_eq!(sim.get::<Collider>(body).voxel_box().min.y, 0.0);
+    assert_eq!(feet(&sim, body), DVec3::new(1.5, 4.0, 0.5));
+    // Crouched and still, it falls asleep; let go in the open: it wakes up and stands up
+    // again, with the very same collider.
+    sim.steps(64);
+    assert!(sim.asleep(body) && sim.get::<Crouch>(body).is_crouching());
+    intent(&mut sim, body, |i| i.sneak = false);
+    sim.steps(1);
+    assert!(!sim.get::<Crouch>(body).is_crouching());
+    assert_eq!(sim.get::<Collider>(body), standing);
+    // Standing, the roof stops it; crouched it walks under (its top flush with the slabs).
+    intent(&mut sim, body, |i| i.wish = Vec2::X);
+    sim.steps(64);
+    assert!(
+        (feet(&sim, body).x - 2.75).abs() < 1e-9,
+        "{}",
+        feet(&sim, body)
+    );
+    intent(&mut sim, body, |i| i.sneak = true);
+    sim.steps(128);
+    assert!(feet(&sim, body).x > 3.5, "{}", feet(&sim, body));
+    // Under the roof, letting go of the sneak keeps it crouched, and slow.
+    intent(&mut sim, body, |i| i.sneak = false);
+    for _ in 0..64 {
+        sim.steps(1);
+        assert!(sim.get::<Crouch>(body).is_crouching());
+        assert_eq!(height(&sim, body), 1.5);
+        assert_eq!(feet(&sim, body).y, 4.0);
+        let v = sim.get::<Velocity>(body).0.x;
+        assert!(
+            v < 0.3 * CharacterController::default().walk_speed + 1e-9,
+            "{v}"
+        );
+    }
+    // Stopped under it, it stays awake, crouched, waiting for room; taking the roof away
+    // stands it up.
+    intent(&mut sim, body, |i| i.wish = Vec2::ZERO);
+    sim.steps(128);
+    assert!(!sim.asleep(body));
+    assert!(sim.get::<Crouch>(body).is_crouching());
+    let x = feet(&sim, body).x.floor() as i64;
+    // (The edits apply in the frame's `Update`, after its step: the next step sees them.)
+    build(&mut sim, [x - 1, 5, -3], [x + 1, 5, 3], BlockState::AIR);
+    sim.steps(2);
+    assert!(!sim.get::<Crouch>(body).is_crouching());
+    assert_eq!(sim.get::<Collider>(body), standing);
+    // Sneaking on, under the rest of the roof and out, then letting go: it stands up and
+    // walks at full speed.
+    intent(&mut sim, body, |i| {
+        i.wish = Vec2::X;
+        i.sneak = true;
+    });
+    sim.steps(320);
+    intent(&mut sim, body, |i| i.sneak = false);
+    sim.steps(64);
+    assert!(feet(&sim, body).x > 7.25, "{}", feet(&sim, body));
+    assert!(!sim.get::<Crouch>(body).is_crouching());
+    assert_eq!(sim.get::<Collider>(body), standing);
+    let v = sim.get::<Velocity>(body).0.x;
+    assert!(
+        (v - CharacterController::default().walk_speed).abs() < 1e-3,
+        "{v}"
+    );
+    // A flyer that sneaks descends and does not crouch.
+    let flyer = walker(&mut sim, -2.5, 4.0, 0.5);
+    controller(&mut sim, flyer).flying = true;
+    intent(&mut sim, flyer, |i| i.up = true);
+    sim.steps(16);
+    intent(&mut sim, flyer, |i| {
+        i.up = false;
+        i.sneak = true;
+    });
+    sim.steps(2);
+    assert!(sim.get::<CharacterController>(flyer).flying);
+    assert!(!sim.get::<Crouch>(flyer).is_crouching());
+}
+
+fn sprinting(sim: &Sim, body: Entity) -> bool {
+    sim.get::<CharacterController>(body).sprinting
+}
+
+#[test]
+fn a_sprint_starts_forward_and_ends_backward_crouching_or_against_a_wall() {
+    let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    let walk = CharacterController::default().walk_speed;
+    let body = walker(&mut sim, 0.5, 4.0, -20.5);
+    // Sideways or backward (the facing is +Z) the key does not start it.
+    for wish in [Vec2::X, Vec2::NEG_X, Vec2::NEG_Y, Vec2::new(0.6, -0.8)] {
+        intent(&mut sim, body, |i| {
+            i.facing = Vec2::Y;
+            i.wish = wish;
+            i.sprint = true;
+        });
+        sim.steps(2);
+        assert!(!sprinting(&sim, body), "{wish}");
+    }
+    // Forward (also forward and to a side) it does, and it goes on after the key is let go.
+    intent(&mut sim, body, |i| i.wish = Vec2::new(0.6, 0.8));
+    sim.steps(1);
+    assert!(sprinting(&sim, body));
+    intent(&mut sim, body, |i| {
+        i.wish = Vec2::Y;
+        i.sprint = false;
+    });
+    sim.steps(96);
+    assert!(sprinting(&sim, body));
+    let v = sim.get::<Velocity>(body).0.z;
+    assert!((v - 1.3 * walk).abs() < 1e-6, "{v}");
+    // Backward ends it, and so does stopping.
+    intent(&mut sim, body, |i| i.wish = Vec2::NEG_Y);
+    sim.steps(1);
+    assert!(!sprinting(&sim, body));
+    intent(&mut sim, body, |i| {
+        i.wish = Vec2::Y;
+        i.sprint = true;
+    });
+    sim.steps(1);
+    intent(&mut sim, body, |i| {
+        i.wish = Vec2::ZERO;
+        i.sprint = false;
+    });
+    sim.steps(1);
+    assert!(!sprinting(&sim, body));
+    // Sneaking ends it, and the key does not start it while sneaking.
+    intent(&mut sim, body, |i| {
+        i.wish = Vec2::Y;
+        i.sprint = true;
+    });
+    sim.steps(1);
+    assert!(sprinting(&sim, body));
+    intent(&mut sim, body, |i| i.sneak = true);
+    sim.steps(4);
+    assert!(!sprinting(&sim, body));
+    intent(&mut sim, body, |i| i.sneak = false);
+    sim.steps(2);
+    assert!(sprinting(&sim, body));
+    // A wall ahead ends it.
+    let z = feet(&sim, body).z.floor() as i64 + 3;
+    build(&mut sim, [-3, 4, z], [3, 5, z], STONE);
+    sim.steps(64);
+    assert!((feet(&sim, body).z - (z as f64 - 0.25)).abs() < 1e-9);
+    assert!(!sprinting(&sim, body));
+}
+
+#[test]
+fn a_sprint_grazing_a_wall_goes_on_and_one_turned_by_it_ends() {
+    let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    // A wall along Z at x = 3.
+    build(&mut sim, [3, 4, -24], [3, 5, 24], STONE);
+    // 5 and 15 degrees off +Z, into the wall (tangents; the wish counts as 1 long).
+    for (tan, goes_on) in [(0.0875f32, true), (0.268, false)] {
+        let body = walker(&mut sim, 2.5, 4.0, -20.5);
+        let wish = Vec2::new(tan, 1.0);
+        intent(&mut sim, body, |i| {
+            i.wish = wish;
+            i.facing = wish;
+            i.sprint = true;
+        });
+        sim.steps(64);
+        assert!((feet(&sim, body).x - 2.75).abs() < 1e-9, "against the wall");
+        assert_eq!(sprinting(&sim, body), goes_on, "{tan}");
+        sim.app.world_mut().despawn(body);
+    }
+}
+
+#[test]
+fn the_sprint_key_held_into_a_wall_does_not_sprint_along_it() {
+    let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    let c = CharacterController::default();
+    // A wall along Z at x = 3.
+    build(&mut sim, [3, 4, -24], [3, 5, 24], STONE);
+    // The key held all along, 5 and 15 degrees into the wall: grazing it, the sprint goes on;
+    // turned by it, the last move's clip ends the sprint before the key starts it again
+    // (Minecraft's `aiStep`), so the body walks along the wall and a jump gets no push.
+    for (tan, sprints) in [(0.0875f32, true), (0.268, false)] {
+        let body = walker(&mut sim, 2.5, 4.0, -20.5);
+        let wish = Vec2::new(tan, 1.0);
+        intent(&mut sim, body, |i| {
+            i.wish = wish;
+            i.facing = wish;
+            i.sprint = true;
+        });
+        sim.steps(160);
+        assert!((feet(&sim, body).x - 2.75).abs() < 1e-9, "against the wall");
+        let along = 1.0 / DVec3::new(f64::from(tan), 0.0, 1.0).length();
+        let factor = if sprints { c.sprint_factor } else { 1.0 };
+        let v = sim.get::<Velocity>(body).0.z;
+        assert!(
+            (v - factor * c.walk_speed * along).abs() < 1e-6,
+            "{tan}: {v} along the wall"
+        );
+        intent(&mut sim, body, |i| i.jump = true);
+        sim.steps(1);
+        let pushed = sim.get::<Velocity>(body).0.z - v;
+        if sprints {
+            assert!(
+                pushed > 0.8 * c.sprint_jump_boost * along,
+                "{tan}: {pushed}"
+            );
+        } else {
+            assert!(pushed.abs() < 1e-6, "{tan}: {pushed}");
+        }
+        sim.app.world_mut().despawn(body);
+    }
+}
+
+#[test]
+fn a_sprint_jump_carries_further() {
+    let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    let c = CharacterController::default();
+    let runners = [false, true].map(|jumps| {
+        let body = walker(&mut sim, if jumps { 4.5 } else { 0.5 }, 4.0, -24.5);
+        intent(&mut sim, body, |i| {
+            i.wish = Vec2::Y;
+            i.sprint = true;
+        });
+        body
+    });
+    sim.steps(64);
+    let start = runners.map(|body| feet(&sim, body).z);
+    // Space held: jump again on every landing.
+    let mut boosted = 0.0;
+    for step in 0..256 {
+        intent(&mut sim, runners[1], |i| i.jump = true);
+        let before = sim.get::<Velocity>(runners[1]).0.z;
+        sim.steps(1);
+        if step == 0 {
+            boosted = sim.get::<Velocity>(runners[1]).0.z - before;
+        }
+    }
+    assert!(runners.iter().all(|&body| sprinting(&sim, body)));
+    // The first jump pushes along the facing by the boost (less the step's ground friction).
+    assert!(
+        boosted > 0.8 * c.sprint_jump_boost && boosted < c.sprint_jump_boost,
+        "{boosted}"
+    );
+    // Over four seconds, about Minecraft's 7.1 blocks per second against its sprint's 5.6.
+    let [run, jump] = [0, 1].map(|k| (feet(&sim, runners[k]).z - start[k]) / 4.0);
+    assert!((run - 1.3 * c.walk_speed).abs() < 1e-3, "{run}");
+    assert!(
+        jump > 1.2 * run && jump < 1.35 * run,
+        "{jump} against {run}"
+    );
+}
+
+/// A walker sprints and sprint-jumps into a wall, then crouches under a roof (as [`roof`], from
+/// x = -13 to -7) and stays crouched there. One record per step.
+fn sprint_and_crouch(sim: &mut Sim) -> Vec<(I64Vec3, [u64; 3], [u64; 3], bool)> {
+    build(sim, [-13, 5, -3], [-7, 5, 3], top_slab());
+    build(sim, [-18, 4, 8], [-12, 5, 8], STONE);
+    let body = walker(sim, -15.5, 4.0, -6.5);
+    let mut records = Vec::new();
+    let record = |sim: &mut Sim, n: usize, jump: bool, records: &mut Vec<_>| {
+        for _ in 0..n {
+            if jump {
+                intent(sim, body, |i| i.jump = true);
+            }
+            sim.steps(1);
+            let p = sim.position(body);
+            records.push((
+                p.block.as_i64vec3() - sim.base,
+                p.frac.to_array().map(f64::to_bits),
+                sim.get::<Velocity>(body).0.to_array().map(f64::to_bits),
+                sim.get::<CharacterController>(body).sprinting,
+            ));
+        }
+    };
+    intent(sim, body, |i| {
+        i.wish = Vec2::new(0.1, 1.0);
+        i.facing = Vec2::Y;
+        i.sprint = true;
+    });
+    record(sim, 160, true, &mut records);
+    assert!(
+        !sim.get::<CharacterController>(body).sprinting,
+        "the wall ends it"
+    );
+    intent(sim, body, |i| {
+        i.wish = Vec2::new(1.0, -0.8);
+        i.facing = Vec2::X;
+        i.sneak = true;
+    });
+    record(sim, 384, false, &mut records);
+    intent(sim, body, |i| i.sneak = false);
+    record(sim, 64, false, &mut records);
+    let p = feet(sim, body);
+    assert!(
+        p.x > -12.75 && p.x < -6.25 && p.z < 3.75 && p.y == 4.0,
+        "under the roof: {p}"
+    );
+    assert!(sim.get::<Crouch>(body).is_crouching());
+    records
+}
+
 #[test]
 fn the_player_modes_are_bit_identical_far_from_the_origin() {
     let run = |base: I64Vec3| {
@@ -408,6 +731,7 @@ fn the_player_modes_are_bit_identical_far_from_the_origin() {
         }
         let (_, flight) = fly(&mut sim);
         records.extend(flight);
+        records.extend(sprint_and_crouch(&mut sim));
         records
     };
     let reference = run(I64Vec3::ZERO);

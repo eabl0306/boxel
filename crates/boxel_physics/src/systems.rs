@@ -1,14 +1,14 @@
 //! The per-step systems of physics bodies (phases P2 to P4) and their sets.
 
 use crate::components::{
-    BodyPosition, CharacterController, Collider, Contacts, FLIGHT_VERTICAL_DRAG, Frozen,
+    BodyPosition, CharacterController, Collider, Contacts, Crouch, FLIGHT_VERTICAL_DRAG, Frozen,
     Interpolated, MoveIntent, PhysicsSettings, PhysicsStats, PhysicsSync, Projectile, RigidBody,
     Sleeping, Teleport, Vacated, Velocity, VoxelImpact,
 };
 use crate::contacts::{BodyIndex, ObstacleIndex, ObstacleScratch};
 use crate::core::{
-    BodySettings, CollisionTable, LocalBox, MAX_SWEEP_DISTANCE, StepParams, StepUp, guard_edge,
-    integrate_velocity, move_body,
+    BodySettings, CollisionTable, LocalBox, MAX_SWEEP_DISTANCE, StepParams, StepUp, SweepOut,
+    guard_edge, integrate_velocity, move_body, move_box,
 };
 use crate::plugin::PhysicsContent;
 use crate::source::ChunkSource;
@@ -17,10 +17,10 @@ use boxel_diagnostic::DiagnosticsBoard;
 use boxel_ecs::change_detection::Tick;
 use boxel_ecs::prelude::*;
 use boxel_ecs::system::SystemChangeTick;
-use boxel_math::{DVec2, DVec3};
+use boxel_math::{DVec2, DVec3, Vec2};
 use boxel_tasks::{ComputeTaskPool, TaskPool};
 use boxel_transform::Transform;
-use boxel_voxel::WorldPos;
+use boxel_voxel::{Face, WorldPos};
 use boxel_world::{ChunkMap, WorldSettings};
 use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
@@ -176,17 +176,22 @@ pub(crate) struct AwakeCount {
 /// sleeping character that wants to move gets a velocity, and that wakes it. Each character
 /// only writes itself: on the compute threads above `PhysicsSettings::parallel_threshold` awake
 /// characters.
+#[expect(
+    clippy::type_complexity,
+    reason = "a system's parameters: the characters and their awake count"
+)]
 pub(crate) fn drive_characters(
     fixed: Res<FixedTime>,
     settings: Res<PhysicsSettings>,
     mut characters: Query<
         (
             &RigidBody,
-            &CharacterController,
+            &mut CharacterController,
             &mut MoveIntent,
             &mut Velocity,
             &Contacts,
             &BodySettings,
+            Option<&Crouch>,
         ),
         Without<Frozen>,
     >,
@@ -200,32 +205,38 @@ pub(crate) fn drive_characters(
     >,
 ) {
     let dt = timestep(&fixed);
-    let drive = |(kind, controller, mut intent, mut velocity, contacts, body): (
+    let drive = |(kind, mut controller, mut intent, mut velocity, contacts, body, crouch): (
         &RigidBody,
-        &CharacterController,
+        Mut<CharacterController>,
         Mut<MoveIntent>,
         Mut<Velocity>,
         &Contacts,
         &BodySettings,
+        Option<&Crouch>,
     )| {
         if *kind != RigidBody::Dynamic {
             return;
         }
-        let mut wish = intent.wish.as_dvec2();
-        if !wish.is_finite() {
-            wish = DVec2::ZERO;
-        }
-        let length_sq = wish.length_squared();
-        if length_sq > 1.0 {
-            wish /= length_sq.sqrt();
-        }
+        let wish = clean_wish(intent.wish);
         let flying = controller.flying;
-        // Sneaking slows a walker (a flyer descends instead) and stops a sprint.
+        // A walker that sneaks or crouches (a flyer descends instead, and never crouches).
+        let crouching = !flying && (intent.sneak || crouch.is_some_and(Crouch::is_crouching));
+        // The sprint starts on the key while moving forward and ends when the character stops
+        // moving forward, crouches or ran into something in the last step (a clip ahead also
+        // ends it in the step). Minecraft's `aiStep` order: the key starts it, then the last
+        // move's collision ends it, so a key held against a wall never sprints along it.
+        let facing = facing_dir(wish, intent.facing);
+        let forward = facing.is_some_and(|dir| wish.dot(dir) > MIN_FORWARD);
+        let sprinting =
+            (controller.sprinting || intent.sprint) && forward && !crouching && !contacts.ran_into;
+        if controller.sprinting != sprinting {
+            controller.sprinting = sprinting;
+        }
         let speed = if flying {
-            controller.fly_speed * if intent.sprint { 2.0 } else { 1.0 }
-        } else if intent.sneak {
+            controller.fly_speed * if sprinting { 2.0 } else { 1.0 }
+        } else if crouching {
             controller.walk_speed * controller.sneak_factor
-        } else if intent.sprint {
+        } else if sprinting {
             controller.walk_speed * controller.sprint_factor
         } else {
             controller.walk_speed
@@ -255,6 +266,12 @@ pub(crate) fn drive_characters(
             intent.jump = false;
             if contacts.on_ground {
                 v.y = controller.jump_speed;
+                // Minecraft's sprint-jump: a push along the facing.
+                if sprinting && let Some(dir) = facing {
+                    let boost = controller.sprint_jump_boost;
+                    v.x += dir.x * boost;
+                    v.z += dir.y * boost;
+                }
             }
         }
         velocity.set_if_neq(Velocity(v));
@@ -265,6 +282,62 @@ pub(crate) fn drive_characters(
     } else {
         characters.iter_mut().for_each(drive);
     }
+}
+
+/// [`MoveIntent::wish`] as the controller uses it: 0 if not finite, at most 1 long.
+fn clean_wish(wish: Vec2) -> DVec2 {
+    let mut wish = wish.as_dvec2();
+    if !wish.is_finite() {
+        wish = DVec2::ZERO;
+    }
+    let length_sq = wish.length_squared();
+    if length_sq > 1.0 {
+        wish /= length_sq.sqrt();
+    }
+    wish
+}
+
+/// How much of a move must go along the facing to count as forward, in units of the full wish
+/// (Minecraft's `hasForwardImpulse`: a forward input above `1e-5`).
+const MIN_FORWARD: f64 = 1e-5;
+
+/// The unit direction a character faces across: `facing` if it is not zero, else the way it
+/// wishes to go (`wish`, at most 1 long); `None` when both are zero (or not finite).
+fn facing_dir(wish: DVec2, facing: Vec2) -> Option<DVec2> {
+    let facing = facing.as_dvec2();
+    let dir = if facing.is_finite() && facing != DVec2::ZERO {
+        facing
+    } else {
+        wish
+    };
+    let length = dir.length();
+    (length > 0.0 && length.is_finite()).then(|| dir / length)
+}
+
+/// The cosine of the largest turn, from the wish to the move, that a clip across may cause
+/// while a sprint goes on: 8 degrees (Minecraft's `isHorizontalCollisionMinor`).
+const SPRINT_GRAZE_COS: f64 = 0.990_268_068_741_570_4;
+
+/// A move across slower than this (blocks per second) after a clip ends a sprint whatever its
+/// direction (Minecraft: `1e-5` squared blocks per tick, about 0.063 blocks per second).
+const SPRINT_GRAZE_MIN_SPEED: f64 = 0.063;
+
+/// A sweep that wanted `wish` (across) and moved `moved` in `dt` seconds ran into something
+/// ahead: a clip across turned the move more than 8 degrees away from the wish, or stopped it
+/// (Minecraft's `horizontalCollision && !minorHorizontalCollision`). Only `+ - * /`.
+fn ran_into(sweep: &SweepOut, wish: DVec2, dt: f64) -> bool {
+    let across = [Face::PosX, Face::NegX, Face::PosZ, Face::NegZ];
+    if !across.iter().any(|&face| sweep.touched(face)) {
+        return false;
+    }
+    let moved = DVec2::new(sweep.moved.x, sweep.moved.z);
+    let (i, j) = (wish.length_squared(), moved.length_squared());
+    let slow = SPRINT_GRAZE_MIN_SPEED * dt;
+    if !(i > 0.0 && j >= slow * slow) {
+        return true;
+    }
+    let k = wish.dot(moved);
+    !(k > 0.0 && k * k > SPRINT_GRAZE_COS * SPRINT_GRAZE_COS * i * j)
 }
 
 /// What [`prepare_bodies`] reads and writes of a body.
@@ -550,6 +623,8 @@ pub(crate) struct StepOut {
     impacts: Vec<VoxelImpact>,
     freeze: Vec<Entity>,
     unfreeze: Vec<Entity>,
+    /// Characters that crouched or stood up, with their new collider.
+    poses: Vec<(Entity, Collider)>,
     dynamic: usize,
     frozen: usize,
 }
@@ -559,6 +634,7 @@ impl StepOut {
         self.impacts.append(&mut other.impacts);
         self.freeze.append(&mut other.freeze);
         self.unfreeze.append(&mut other.unfreeze);
+        self.poses.append(&mut other.poses);
         self.dynamic += other.dynamic;
         self.frozen += other.frozen;
         other.dynamic = 0;
@@ -601,6 +677,7 @@ type StepItem<'a> = (
     bool,
     Option<Mut<'a, CharacterController>>,
     Option<&'a MoveIntent>,
+    Option<Mut<'a, Crouch>>,
 );
 
 /// One step of one dynamic body (it reads the world and writes only itself).
@@ -617,13 +694,18 @@ fn step_one(stepper: &mut Stepper<'_>, shared: &StepShared<'_>, item: StepItem<'
         was_frozen,
         mut controller,
         intent,
+        mut crouch,
     ) = item;
     if *kind != RigidBody::Dynamic {
         return;
     }
     stepper.out.dynamic += 1;
     let params = &shared.params;
-    let shape = collider.map_or(LocalBox::default(), Collider::voxel_box);
+    let mut shape = collider.map_or(LocalBox::default(), Collider::voxel_box);
+    // A crouching character may stand up this step: everything it gathers covers its standing
+    // box too.
+    let standing = crouch.as_ref().and_then(|c| c.standing());
+    let tallest = standing.map_or(shape, |c| c.voxel_box());
     let pos = position.0.normalize();
     // A flyer has no gravity and the flight's vertical drag, and never the ground friction.
     let flying = controller.as_ref().is_some_and(|c| c.flying);
@@ -665,7 +747,7 @@ fn step_one(stepper: &mut Stepper<'_>, shared: &StepShared<'_>, item: StepItem<'
     // character may stand on (the box lowered by its drop).
     let blockers = match collider {
         Some(collider) if !collider.is_sensor() && !shared.obstacles.is_empty() => {
-            let mut reach = shape;
+            let mut reach = tallest;
             if step.height > 0.0 {
                 reach.max.y += step.height.min(MAX_SWEEP_DISTANCE);
             }
@@ -678,6 +760,43 @@ fn step_one(stepper: &mut Stepper<'_>, shared: &StepShared<'_>, item: StepItem<'
         }
         _ => &[],
     };
+    // The pose (ADR 0026), before the move, as Minecraft updates it after the previous one: a
+    // character that sneaks (not flying) crouches; one that does not stands up where the
+    // standing box fits (the crouching box swept up to its top meets nothing). The new collider
+    // is inserted after the step; this move already uses its box.
+    if let (Some(collider), Some(controller), Some(crouch)) =
+        (collider, controller.as_deref(), crouch.as_mut())
+    {
+        let sneaking = intent.is_some_and(|i| i.sneak) && !flying;
+        match standing {
+            None if sneaking => {
+                if let Some(crouched) = collider.crouched(controller.crouch_height) {
+                    crouch.crouch(*collider);
+                    shape = crouched.voxel_box();
+                    stepper.out.poses.push((entity, crouched));
+                }
+            }
+            Some(stand) if !sneaking => {
+                let up = DVec3::new(0.0, stand.voxel_box().max.y - shape.max.y, 0.0);
+                let fits = move_box(
+                    &mut stepper.voxels,
+                    shared.table,
+                    pos,
+                    shape,
+                    up,
+                    blockers,
+                    &params.sweep,
+                )
+                .is_ok_and(|out| !out.depenetrated && !out.touched(Face::PosY));
+                if fits {
+                    crouch.stand();
+                    shape = stand.voxel_box();
+                    stepper.out.poses.push((entity, stand));
+                }
+            }
+            _ => {}
+        }
+    }
     // The edge guard cuts the move across; the velocity on a cut axis stops after the step.
     let mut guarded = [false; 3];
     let guard = match sneak_drop {
@@ -730,13 +849,26 @@ fn step_one(stepper: &mut Stepper<'_>, shared: &StepShared<'_>, item: StepItem<'
             {
                 controller.flying = false;
             }
+            // Running into something ahead ends a sprint, and keeps the key from starting it
+            // again in the next step (`Contacts::ran_into`).
+            let mut touched = Contacts::from_sweep(&out.sweep);
+            if let Some(controller) = controller.as_mut() {
+                touched.ran_into = ran_into(
+                    &out.sweep,
+                    intent.map_or(DVec2::ZERO, |i| clean_wish(i.wish)),
+                    params.dt,
+                );
+                if touched.ran_into && controller.sprinting {
+                    controller.sprinting = false;
+                }
+            }
             if out.sweep.moved != DVec3::ZERO {
                 sync.moved = out.sweep.moved;
                 sync.net = out.sweep.moved;
             }
             position.set_if_neq(BodyPosition(out.pos));
             velocity.set_if_neq(Velocity(out.vel));
-            contacts.set_if_neq(Contacts::from_sweep(&out.sweep));
+            contacts.set_if_neq(touched);
             stepper
                 .out
                 .impacts
@@ -788,6 +920,7 @@ pub(crate) fn step_dynamic(
             Has<Frozen>,
             Option<&mut CharacterController>,
             Option<&MoveIntent>,
+            Option<&mut Crouch>,
         ),
         (Without<Sleeping>, Without<Projectile>),
     >,
@@ -832,6 +965,11 @@ pub(crate) fn step_dynamic(
     }
     for entity in out.unfreeze {
         commands.entity(entity).try_remove::<Frozen>();
+    }
+    // The new colliders of the characters that crouched or stood up (one per body a step).
+    out.poses.sort_unstable_by_key(|(e, _)| e.to_bits());
+    for (entity, collider) in out.poses {
+        commands.entity(entity).try_insert(collider);
     }
     pending.0.append(&mut out.impacts);
     stats.dynamic = out.dynamic;

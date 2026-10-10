@@ -7,7 +7,7 @@
 //! projectiles that never tunnel, sleeping bodies and a parallel step; from P5, blocks made of
 //! boxes (slabs) and characters that step up low ledges; from ADR 0026, collision boxes that
 //! reach into the cell above (fences 1.5 blocks tall) and characters that sneak (never off an
-//! edge), sprint and fly.
+//! edge, crouching where there is no room to stand), sprint (with the sprint-jump) and fly.
 //!
 //! Two layers:
 //! - [`core`] is pure (no ECS): the [`CollisionTable`] (how each block state collides, derived
@@ -21,7 +21,7 @@
 //!   queries, the block placement check) and bodies: [`RigidBody`], [`Collider`],
 //!   [`Velocity`], [`BodyPosition`], [`Contacts`], [`BodySettings`], [`Interpolated`],
 //!   [`Teleport`], [`Frozen`], [`Sleeping`], [`ReportContacts`], [`CharacterController`] with
-//!   [`MoveIntent`], [`Projectile`], and the messages [`VoxelImpact`], [`CollisionStarted`],
+//!   [`MoveIntent`] and [`Crouch`], [`Projectile`], and the messages [`VoxelImpact`], [`CollisionStarted`],
 //!   [`CollisionEnded`] and [`ProjectileHit`].
 //!
 //! Frame structure with physics (see [`PhysicsSystems`]):
@@ -64,9 +64,9 @@ mod systems;
 
 pub use crate::components::{
     BodyPosition, CharacterController, Collider, CollisionEnded, CollisionStarted, Contacts,
-    FLIGHT_VERTICAL_DRAG, Frozen, Interpolated, MoveIntent, OnBlock, OnEntity, PhysicsSettings,
-    PhysicsStats, PhysicsSync, Projectile, ProjectileHit, ProjectileTarget, ReportContacts,
-    Response, RigidBody, Sleeping, Teleport, Velocity, VoxelImpact,
+    Crouch, FLIGHT_VERTICAL_DRAG, Frozen, Interpolated, MoveIntent, OnBlock, OnEntity,
+    PhysicsSettings, PhysicsStats, PhysicsSync, Projectile, ProjectileHit, ProjectileTarget,
+    ReportContacts, Response, RigidBody, Sleeping, Teleport, Velocity, VoxelImpact,
 };
 pub use crate::contacts::{BodyFilter, BodyHit, BodyIndex};
 #[doc(hidden)]
@@ -83,15 +83,18 @@ pub use boxel_voxel::WorldPos;
 pub use plugin::{PhysicsContent, PhysicsPlugin};
 pub use query::{PhysicsQuery, RayFilter, RayHit};
 pub use source::ChunkSource;
-pub use swim::{SwimIntent, SwimPlugin, SwimSettings, Swimmer, box_touches_fluid, swim_bodies};
+pub use swim::{
+    FLUID_JUMP_THRESHOLD, SwimIntent, SwimPlugin, SwimSettings, Swimmer, box_touches_fluid,
+    swim_bodies,
+};
 pub use systems::PhysicsSystems;
 
 /// Common items.
 pub mod prelude {
     pub use crate::{
         BodyFilter, BodyPosition, BodySettings, CharacterController, Collider, CollisionEnded,
-        CollisionLayers, CollisionStarted, Contacts, Interpolated, LocalBox, MoveIntent, OnBlock,
-        OnEntity, PhysicsPlugin, PhysicsQuery, PhysicsSystems, Projectile, ProjectileHit,
+        CollisionLayers, CollisionStarted, Contacts, Crouch, Interpolated, LocalBox, MoveIntent,
+        OnBlock, OnEntity, PhysicsPlugin, PhysicsQuery, PhysicsSystems, Projectile, ProjectileHit,
         ProjectileTarget, RayFilter, RayHit, RayResult, ReportContacts, RigidBody, Shape, Sleeping,
         Teleport, Velocity, VoxelFilter, VoxelHit, VoxelImpact,
     };

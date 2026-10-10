@@ -88,6 +88,8 @@ usage: snapshot --camera X,Y,Z,YAW,PITCH --shot HH:MM=PATH [--shot ...] [options
                        the shots, edits included
   --outline X,Y,Z      draw the outline of the block at X,Y,Z, as voxel_world outlines the
                        targeted block (default color and width)
+  --fov DEG            vertical field of view in degrees (default 70; voxel_world widens it
+                       1.1 times while sprinting: 77)
   --timeout S          wall-clock limit for loading the world, in seconds (default 300)
   --help               this text";
 
@@ -152,6 +154,8 @@ struct Options {
     world_dir: Option<PathBuf>,
     /// `--outline`: the block whose outline the shots draw (ADR 0026).
     outline: Option<I64Vec3>,
+    /// `--fov`: the vertical field of view, degrees.
+    fov: f32,
 }
 
 /// `Ok(None)` for `--help`.
@@ -173,6 +177,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         fluid_time: 0.0,
         world_dir: None,
         outline: None,
+        // `Camera::default`'s (70 degrees): the same pixels as before the flag.
+        fov: 70.0,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -252,6 +258,16 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--pack" => o.textures = pack::parse(flag, &value()?)?,
             "--world-dir" => o.world_dir = Some(PathBuf::from(value()?)),
             "--outline" => o.outline = Some(parse_cell(flag, &value()?)?),
+            "--fov" => {
+                let v = value()?;
+                o.fov = v
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|d| *d > 1.0 && *d < 179.0)
+                    .ok_or_else(|| {
+                        format!("{flag}: {v:?} is not an angle in degrees (1 to 179)")
+                    })?;
+            }
             "--timeout" => {
                 let v = value()?;
                 o.timeout = v
@@ -796,6 +812,7 @@ fn run(
     }
     let camera = Camera {
         view_distance: o.radius as f32 * 32.0,
+        fov_y_radians: o.fov.to_radians(),
         ..Camera::default()
     };
     let view = CameraView::compute(&camera, &transform, size.x as f32 / size.y as f32);
@@ -872,8 +889,12 @@ mod tests {
             "1.25",
             "--outline",
             "3,64,-2",
+            "--fov",
+            "77",
         ]);
         let o = parse(&args).expect("valid").expect("not help");
+        assert_eq!(o.fov, 77.0);
+        assert_eq!(parse(&BASE).expect("valid").expect("not help").fov, 70.0);
         assert_eq!(o.shots[1], (18.5, PathBuf::from("dusk.png")));
         assert_eq!(o.size, (640, 360));
         assert!(!o.light);
@@ -907,6 +928,8 @@ mod tests {
             &["--fluid-time", "-1"],
             &["--fluid-time", "soon"],
             &["--outline", "1,2"],
+            &["--fov", "0"],
+            &["--fov", "wide"],
             &["--outline", "0,9223372036854775807,0"],
             &["--pack", "/nonexistent/boxel/pack"],
         ] {

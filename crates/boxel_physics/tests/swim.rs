@@ -1,17 +1,19 @@
 //! Swimming (ADR 0021) on the harness of `sim`: a pool of still water on the flat test world (the
 //! ground at y = 4). A body sinks slowly in it, rises while it swims up, walks slower on the
 //! bottom, gets its land settings back when it leaves, and does the same far from the origin.
+//! The water of a waterlogged block counts (ADR 0025), and a flying character is not affected by
+//! the water (Minecraft's creative flight, ADR 0026).
 mod common;
 mod sim;
 
 use boxel_ecs::prelude::*;
 use boxel_math::{DVec3, I64Vec3, Vec2};
 use boxel_physics::{
-    BodySettings, CharacterController, MoveIntent, SwimIntent, SwimPlugin, SwimSettings, Swimmer,
-    Teleport, Velocity,
+    BodySettings, CharacterController, Contacts, MoveIntent, SwimIntent, SwimPlugin, SwimSettings,
+    Swimmer, Teleport, Velocity,
 };
-use boxel_voxel::{MAX_BLOCK_COORD, WorldPos};
-use common::WATER;
+use boxel_voxel::{BlockRegistry, BlockState, MAX_BLOCK_COORD, WorldPos};
+use common::{WATER, bottom_slab};
 use sim::{STEP, Sim};
 
 /// A world with a 9x9 pool of water 6 deep standing on the ground (y 4..=9), around `base`.
@@ -160,5 +162,190 @@ fn swimming_is_the_same_far_from_the_origin() {
         ),
     ] {
         assert_eq!(run(base), near, "base {base}");
+    }
+}
+
+/// A bottom slab with water in it (ADR 0025).
+fn wet_slab() -> BlockState {
+    BlockRegistry::default_blocks()
+        .parse_state("boxel:stone_slab[type=bottom,waterlogged=true]")
+        .expect("waterlogged slab")
+}
+
+/// A player-size swimmer standing on a 3x3 floor of `slab` (on the ground at y = 4, so its
+/// feet are at 4.5, inside the slab's cell).
+fn on_slabs(base: I64Vec3, slab: BlockState) -> (Sim, Entity) {
+    let mut sim = Sim::with_plugins(base, STEP, SwimPlugin);
+    for x in -1..=1 {
+        for z in -1..=1 {
+            let pos = sim.block(x, 4, z);
+            sim.edit(pos, slab);
+        }
+    }
+    sim.steps(2);
+    let start = sim.pos(0.5, 4.5, 0.5);
+    let body = sim.spawn(
+        start,
+        (
+            Swimmer::default(),
+            CharacterController::default(),
+            SwimIntent::default(),
+        ),
+    );
+    sim.steps(4);
+    (sim, body)
+}
+
+#[test]
+fn the_water_of_a_waterlogged_block_is_swum_in() {
+    let land = BodySettings::player();
+    let (sim, body) = on_slabs(I64Vec3::ZERO, bottom_slab());
+    assert!(!sim.get::<Swimmer>(body).in_fluid, "a dry slab is dry");
+    assert!(!sim.get::<Contacts>(body).in_fluid);
+    assert_eq!(sim.get::<BodySettings>(body), land);
+    for base in [I64Vec3::ZERO, I64Vec3::new(1 << 40, -(1 << 31), 1 << 40)] {
+        let (mut sim, body) = on_slabs(base, wet_slab());
+        // Standing on it, the feet are in its cell: in the water, as in Minecraft.
+        assert_eq!(sim.position(body), sim.pos(0.5, 4.5, 0.5));
+        assert!(sim.get::<Swimmer>(body).in_fluid);
+        assert!(sim.get::<Contacts>(body).in_fluid);
+        assert_eq!(sim.get::<BodySettings>(body).drag_xz, 3.0);
+        assert_eq!(
+            sim.get::<CharacterController>(body).walk_speed,
+            CharacterController::default().walk_speed * 0.5
+        );
+        // The water is shallow there (0.39 above the feet, on the ground): swimming up does
+        // nothing, the jump key jumps instead (`a_jump_on_a_waterlogged_slab_is_a_jump`).
+        sim.app.world_mut().get_mut::<SwimIntent>(body).unwrap().up = true;
+        sim.steps(16);
+        assert_eq!(sim.get::<Velocity>(body).0.y, 0.0);
+        assert_eq!(sim.position(body), sim.pos(0.5, 4.5, 0.5));
+    }
+}
+
+#[test]
+fn a_jump_on_a_waterlogged_slab_is_a_jump() {
+    // The highest the feet get after a jump press on a floor of `slab`, back on it after.
+    let peak = |base: I64Vec3, slab: BlockState| {
+        let (mut sim, body) = on_slabs(base, slab);
+        sim.app
+            .world_mut()
+            .get_mut::<MoveIntent>(body)
+            .unwrap()
+            .jump = true;
+        let mut top = f64::MIN;
+        for _ in 0..128 {
+            sim.steps(1);
+            let p = sim.position(body);
+            top = top.max((p.block.as_i64vec3() - base).as_dvec3().y + p.frac.y);
+        }
+        assert_eq!(
+            sim.position(body),
+            sim.pos(0.5, 4.5, 0.5),
+            "back on the slab"
+        );
+        top
+    };
+    let dry = peak(I64Vec3::ZERO, bottom_slab());
+    assert!(dry > 5.7, "{dry}");
+    // The slab's water reaches 8/9 of its cell, 0.39 above the feet: not above Minecraft's
+    // 0.4, so on the ground the key jumps as on the dry slab (a swim stroke peaks about 0.64
+    // above it), over a block above the slab.
+    let wet = peak(I64Vec3::ZERO, wet_slab());
+    assert!(
+        wet > 5.5 && (wet - dry).abs() < 0.1,
+        "{wet} against {dry} dry"
+    );
+    assert_eq!(
+        peak(I64Vec3::new(1 << 40, -(1 << 31), 1 << 40), wet_slab()),
+        wet
+    );
+}
+
+/// A flyer in the pool, a block over its bottom: still, up, still again, then the flight off.
+/// One record per step: position relative to the base, velocity, the drag across.
+fn fly_in_water(base: I64Vec3) -> (Sim, Entity, Vec<(I64Vec3, [u64; 3], [u64; 3], u64)>) {
+    let mut sim = pool(base);
+    let start = sim.pos(0.5, 5.0, 0.5);
+    let body = sim.spawn(
+        start,
+        (
+            Swimmer::default(),
+            CharacterController {
+                flying: true,
+                ..CharacterController::default()
+            },
+            SwimIntent::default(),
+        ),
+    );
+    let mut records = Vec::new();
+    let record = |sim: &mut Sim, n: usize, records: &mut Vec<_>| {
+        for _ in 0..n {
+            sim.steps(1);
+            let p = sim.position(body);
+            records.push((
+                p.block.as_i64vec3() - sim.base,
+                p.frac.to_array().map(f64::to_bits),
+                sim.get::<Velocity>(body).0.to_array().map(f64::to_bits),
+                sim.get::<BodySettings>(body).drag_xz.to_bits(),
+            ));
+        }
+    };
+    record(&mut sim, 32, &mut records);
+    // Space held: a flyer rises with `up`; the jump latch is pressed too and stays the
+    // flight's (it does nothing), not a swim stroke.
+    let mut intent = sim.app.world_mut().get_mut::<MoveIntent>(body).unwrap();
+    intent.up = true;
+    intent.jump = true;
+    record(&mut sim, 16, &mut records);
+    sim.app.world_mut().get_mut::<MoveIntent>(body).unwrap().up = false;
+    record(&mut sim, 96, &mut records);
+    sim.app
+        .world_mut()
+        .get_mut::<CharacterController>(body)
+        .unwrap()
+        .flying = false;
+    record(&mut sim, 4, &mut records);
+    (sim, body, records)
+}
+
+#[test]
+fn a_flyer_in_water_flies_as_in_the_air() {
+    let (sim, body, records) = fly_in_water(I64Vec3::ZERO);
+    let land = BodySettings::player();
+    let y = |r: &(I64Vec3, [u64; 3], [u64; 3], u64)| r.0.y as f64 + f64::from_bits(r.1[1]);
+    let vy = |r: &(I64Vec3, [u64; 3], [u64; 3], u64)| f64::from_bits(r.2[1]);
+    let drag = |r: &(I64Vec3, [u64; 3], [u64; 3], u64)| f64::from_bits(r.3);
+    // In the water and flying: no sinking, and the land settings stay.
+    assert!(
+        records[..32]
+            .iter()
+            .all(|r| y(r) == 5.0 && drag(r) == land.drag_xz)
+    );
+    // Up: faster than any swim stroke (3 blocks/s), toward the flight's 7.5.
+    let up = &records[32..48];
+    assert!(up.windows(2).all(|w| y(&w[1]) > y(&w[0])));
+    assert!(vy(&up[15]) > 6.0, "{}", vy(&up[15]));
+    // Let go: it stops and hovers exactly, still in the water (the surface is at y = 10).
+    let hover = &records[48..144];
+    let stopped = hover.iter().position(|r| vy(r) == 0.0).expect("stops");
+    let height = y(&hover[stopped]);
+    assert!(height > 6.0 && height + 1.8 < 10.0, "{height}");
+    assert!(hover[stopped..].iter().all(|r| y(r) == height));
+    assert!(sim.get::<Swimmer>(body).in_fluid);
+    // The flight off: the water takes over (its drag, and it sinks).
+    let swim = &records[144..];
+    assert!(swim.iter().all(|r| drag(r) == SwimSettings::default().drag));
+    assert!(vy(&swim[3]) < 0.0);
+    // The same bit for bit far from the origin.
+    for base in [
+        I64Vec3::new(1 << 31, 0, -(1 << 31)),
+        I64Vec3::new(
+            MAX_BLOCK_COORD - 1024,
+            -MAX_BLOCK_COORD + 1024,
+            MAX_BLOCK_COORD - 1024,
+        ),
+    ] {
+        assert_eq!(fly_in_water(base).2, records, "base {base}");
     }
 }

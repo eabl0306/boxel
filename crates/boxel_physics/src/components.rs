@@ -138,6 +138,28 @@ impl Collider {
         Self { layers, ..self }
     }
 
+    /// A box collider cut to `height` blocks tall from its bottom, with the same footprint (a
+    /// crouching player is `standing(0.6, 1.8).crouched(1.5)`, ADR 0026). `None` for a sphere,
+    /// or when `height` is not between 0 and the box's height.
+    pub fn crouched(&self, height: f64) -> Option<Self> {
+        let Shape::Aabb { half } = self.shape else {
+            return None;
+        };
+        // `>` and `<` are false for NaN.
+        if !(height > 0.0 && height < half.y * 2.0) {
+            return None;
+        }
+        let bottom = self.offset.y - half.y;
+        let half_y = height * 0.5;
+        Some(Self {
+            shape: Shape::Aabb {
+                half: DVec3::new(half.x, half_y, half.z),
+            },
+            offset: DVec3::new(self.offset.x, bottom + half_y, self.offset.z),
+            ..*self
+        })
+    }
+
     /// The box this collider uses against the voxels, relative to the body's position: the
     /// shape's bounding box moved by `offset`. Static and kinematic obstacles block dynamic
     /// bodies with this box too.
@@ -308,18 +330,25 @@ pub struct Contacts {
     pub on_ground: bool,
     /// The block it stands on (under the center of its bottom when that block is full).
     pub ground_block: Option<BlockPos>,
-    /// It overlaps a fluid block.
+    /// It overlaps a block that holds a fluid: a fluid block or a waterlogged one
+    /// ([`CollisionTable::is_wet`](crate::CollisionTable::is_wet)).
     pub in_fluid: bool,
+    /// A [`CharacterController`]'s move ran into something ahead: a clip across turned it more
+    /// than 8 degrees away from [`MoveIntent::wish`], or stopped it (Minecraft's
+    /// `horizontalCollision && !minorHorizontalCollision`). It ends a sprint, and the next step
+    /// does not start one ([`CharacterController::sprinting`]). False for other bodies.
+    pub ran_into: bool,
 }
 
 impl Contacts {
-    /// The contacts a sweep reports.
+    /// The contacts a sweep reports (it does not tell [`Contacts::ran_into`]: false).
     pub fn from_sweep(out: &SweepOut) -> Self {
         Self {
             faces: out.faces,
             on_ground: out.on_ground(),
             ground_block: out.ground,
             in_fluid: out.in_fluid,
+            ran_into: false,
         }
     }
 
@@ -522,15 +551,26 @@ impl PhysicsSync {
 /// Modes (ADR 0026), from [`MoveIntent`] and [`CharacterController::flying`]:
 /// - Sneaking ([`MoveIntent::sneak`]): `sneak_factor` of the speed, and on the ground it never
 ///   walks off a ledge deeper than `step_height` (Minecraft's edge guard,
-///   [`crate::guard_edge`]; only on blocks and static or kinematic bodies).
-/// - Sprinting ([`MoveIntent::sprint`]): `sprint_factor` of the speed; sneaking wins.
+///   [`crate::guard_edge`]; only on blocks and static or kinematic bodies). Not flying, the body
+///   also crouches: its box is cut to `crouch_height` ([`Crouch`]), and it stands up again
+///   when it stops sneaking and the standing box fits. A body that cannot stand up stays
+///   crouched, and slow, until it can.
+/// - Sprinting ([`CharacterController::sprinting`], Minecraft's sprint): `sprint_factor` of the
+///   speed (also in the air). Holding [`MoveIntent::sprint`] starts it while the character
+///   moves forward ([`MoveIntent::facing`]) and does not crouch; it goes on after the key is let
+///   go, and ends when the character stops moving forward, crouches or runs into something
+///   ahead (a clip across that turns its move more than 8 degrees away from the wish, as
+///   Minecraft's `minorHorizontalCollision`; [`Contacts::ran_into`]). After such a clip the key
+///   does not start it again in the next step, so a key held against a wall walks along it. A
+///   jump while sprinting adds `sprint_jump_boost` along the facing.
 /// - Flying (`flying`, Minecraft's creative flight; the game turns it on): no gravity and no
 ///   step-up, `fly_speed` across (twice that sprinting) with the air drag, and
 ///   `fly_vertical_speed` up while [`MoveIntent::up`] is held and down while sneaking, with a
 ///   strong vertical drag ([`FLIGHT_VERTICAL_DRAG`]: it stops soon). A jump does nothing.
-///   Landing on blocks (or a static or kinematic body) turns it off, as in Minecraft.
+///   Landing on blocks (or a static or kinematic body) turns it off, as in Minecraft. A flyer
+///   does not crouch.
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
-#[require(MoveIntent)]
+#[require(MoveIntent, Crouch)]
 pub struct CharacterController {
     /// Top walking speed, blocks per second (Minecraft: 4.317).
     pub walk_speed: f64,
@@ -554,14 +594,28 @@ pub struct CharacterController {
     pub fly_speed: f64,
     /// Top speed up or down while flying, blocks per second (Minecraft: 7.5).
     pub fly_vertical_speed: f64,
+    /// The speed a jump while sprinting adds along [`MoveIntent::facing`], blocks per second.
+    /// Minecraft adds 0.2 blocks per tick, but in a tick of ground friction (it keeps 0.546 of
+    /// it, and a tick is 50 ms); the default 2.1 gives its speeds: 7.13 blocks per second
+    /// sprint-jumping on flat ground against 5.61 sprinting.
+    pub sprint_jump_boost: f64,
+    /// The body's height while crouching, blocks (Minecraft: 1.5 of 1.8): the top of its box
+    /// [`Collider`] comes down to it, the bottom and the footprint stay ([`Collider::crouched`]).
+    /// No crouching (sneaking still slows and guards edges) with a sphere, or when it is not
+    /// between 0 and the collider's height.
+    pub crouch_height: f64,
     /// Flying (Minecraft's creative flight): set it to fly; physics clears it when the body
     /// lands.
     pub flying: bool,
+    /// Sprinting: physics sets it from [`MoveIntent::sprint`] and clears it when the sprint
+    /// ends (see the modes above). Read it for the view (Minecraft widens the field of view).
+    pub sprinting: bool,
 }
 
 impl Default for CharacterController {
     /// Walk 4.317 blocks/s, full air control, jump 9.5 blocks/s, step up 0.6 blocks; sneak at
-    /// 0.3 and sprint at 1.3 of the walk; fly at 10.92 across and 7.5 up and down; not flying.
+    /// 0.3 and sprint at 1.3 of the walk; fly at 10.92 across and 7.5 up and down; a
+    /// sprint-jump adds 2.1 blocks/s; crouch 1.5 blocks tall; not flying nor sprinting.
     fn default() -> Self {
         Self {
             walk_speed: 4.317,
@@ -572,7 +626,10 @@ impl Default for CharacterController {
             sprint_factor: 1.3,
             fly_speed: 10.92,
             fly_vertical_speed: 7.5,
+            sprint_jump_boost: 2.1,
+            crouch_height: 1.5,
             flying: false,
+            sprinting: false,
         }
     }
 }
@@ -588,6 +645,43 @@ impl CharacterController {
 
 /// The least [`CharacterController::sneak_drop`]: 1/16 of a block.
 const MIN_SNEAK_DROP: f64 = 0.0625;
+
+/// The pose of a [`CharacterController`]'s body: standing or crouching (ADR 0026). Every
+/// character has one (the controller requires it) and physics keeps it: a character that
+/// sneaks, not flying, crouches (its [`Collider`] becomes [`Collider::crouched`] at
+/// [`CharacterController::crouch_height`], and the standing one is kept here); one that stops
+/// sneaking stands up again (the standing collider comes back) as soon as the standing box fits
+/// there, against the blocks and the static and kinematic solids. The pose changes in the
+/// fixed step, before the body moves, and the new collider is inserted right after the step.
+///
+/// Do not replace the collider of a crouching body: standing up puts the kept one back.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Crouch {
+    /// The standing collider, while the body crouches.
+    standing: Option<Collider>,
+}
+
+impl Crouch {
+    /// The body crouches (Minecraft's crouching pose: slow, and lower for the eye).
+    pub fn is_crouching(&self) -> bool {
+        self.standing.is_some()
+    }
+
+    /// The collider the body stands up with, while it crouches.
+    pub fn standing(&self) -> Option<Collider> {
+        self.standing
+    }
+
+    /// Crouches, keeping `standing`.
+    pub(crate) fn crouch(&mut self, standing: Collider) {
+        self.standing = Some(standing);
+    }
+
+    /// Stands up.
+    pub(crate) fn stand(&mut self) {
+        self.standing = None;
+    }
+}
 
 /// The vertical drag of a flying [`CharacterController`], per second: Minecraft keeps 0.6 of
 /// the vertical speed every tick (20 ticks per second), so a flyer stops climbing or sinking
@@ -610,8 +704,14 @@ pub struct MoveIntent {
     pub up: bool,
     /// Held: sneak (slower, never off an edge on the ground; a flying body descends).
     pub sneak: bool,
-    /// Held: sprint (faster, also flying; sneaking wins).
+    /// Held: start sprinting (Minecraft's sprint key). The sprint goes on after it is let go,
+    /// until it ends ([`CharacterController::sprinting`]).
     pub sprint: bool,
+    /// The direction the character faces across: `x` along world X, `y` along world Z (any
+    /// length; zero, the default, faces along `wish`). A player's is its view's heading. A
+    /// sprint needs a move forward (`wish` within 90 degrees of it, as Minecraft's forward
+    /// key), and a sprint-jump pushes along it.
+    pub facing: Vec2,
 }
 
 /// A dynamic body hit a block faster than `PhysicsSettings::impact_speed` (a landing, a wall).

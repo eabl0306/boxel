@@ -1,14 +1,17 @@
-//! Swimming (ADR 0021): a [`Swimmer`] body whose box touches a fluid (water) moves as in
-//! Minecraft's water: weaker gravity, strong drag in every direction (it sinks slowly and stops
-//! soon), slower walking, and it rises while the game holds [`SwimIntent::up`] (or presses
-//! jump). Opt in with [`SwimPlugin`].
+//! Swimming (ADR 0021): a [`Swimmer`] body whose box touches a fluid (water, or a block with
+//! water in it, ADR 0025) moves as in Minecraft's water: weaker gravity, strong drag in every
+//! direction (it sinks slowly and stops soon), slower walking, and it rises while the game holds
+//! [`SwimIntent::up`] (or presses jump; on the ground in shallow water, as on a waterlogged slab,
+//! a jump is a jump). Opt in with [`SwimPlugin`]. A flying character
+//! ([`CharacterController::flying`]) is not affected by the fluid, as Minecraft's creative
+//! flight (ADR 0026).
 //!
 //! It works around the body step instead of inside it: before the controllers of each fixed step
 //! ([`PhysicsSystems::Controller`]), a body entering a fluid keeps its land [`BodySettings`] and
 //! [`CharacterController::walk_speed`] and gets the water ones; leaving, it gets them back. So
 //! while a body is in water, changes to those two are undone when it leaves.
 use crate::components::{
-    BodyPosition, CharacterController, Collider, Frozen, MoveIntent, Velocity,
+    BodyPosition, CharacterController, Collider, Contacts, Frozen, MoveIntent, Velocity,
 };
 use crate::core::{BodySettings, CollisionTable, Probe, VoxelSource};
 use crate::plugin::PhysicsContent;
@@ -80,11 +83,16 @@ pub struct SwimIntent {
 /// Adds swimming (ADR 0021): [`swim_bodies`] in each fixed step, before the character
 /// controllers. Needs [`PhysicsPlugin`](crate::PhysicsPlugin) first.
 ///
-/// A [`Swimmer`] whose box touches a fluid moves as in Minecraft's water: weaker gravity, strong
-/// drag in every direction, slower walking, and it rises while [`SwimIntent::up`] is held or a
-/// jump is pressed. Entering a fluid it keeps its land `BodySettings` and walking speed and gets
-/// the water ones; leaving, it gets them back (so changes to those two made while it is in water
-/// are undone when it leaves).
+/// A [`Swimmer`] whose box touches a fluid (a fluid block or a waterlogged one,
+/// [`CollisionTable::is_wet`]) moves as in Minecraft's water: weaker gravity, strong drag in
+/// every direction, slower walking, and it rises while [`SwimIntent::up`] is held or a jump is
+/// pressed, except on the ground with the fluid at most [`FLUID_JUMP_THRESHOLD`] above its feet
+/// (a waterlogged slab or stair), where the controller jumps as on land. Entering a fluid it
+/// keeps its land `BodySettings` and walking speed and gets the
+/// water ones; leaving, it gets them back (so changes to those two made while it is in water
+/// are undone when it leaves). A flying character ([`CharacterController::flying`]) is not
+/// affected by the fluid, as in Minecraft's creative flight: it keeps its land settings, and
+/// its jump is not taken for a swim (the controller's flight goes on as in the air).
 pub struct SwimPlugin;
 
 impl Plugin for SwimPlugin {
@@ -98,26 +106,42 @@ impl Plugin for SwimPlugin {
     }
 }
 
-/// True if the box from `min` to `max` (exclusive faces) touches a fluid cell. A cell not loaded
-/// counts as dry.
+/// Minecraft's `getFluidJumpThreshold`, blocks: a character on the ground whose fluid reaches at
+/// most this far above its feet jumps instead of swimming up (on a waterlogged slab or a stair's
+/// lower step the water reaches 0.39 above the feet).
+pub const FLUID_JUMP_THRESHOLD: f64 = 0.4;
+
+/// How high in its cell a fluid reaches without the same fluid above it, blocks: a source's 8/9
+/// (Minecraft's `getOwnHeight`). Physics does not read the levels of flowing water, so every
+/// fluid cell counts as a source. With a wet cell above, the fluid fills the cell.
+const FLUID_TOP: f64 = 8.0 / 9.0;
+
+/// The last cell a box whose max corner is `max` reaches: a max face on a cell border does not
+/// enter the next cell.
+fn last_cell(max: WorldPos) -> BlockPos {
+    let last = |block: i64, frac: f64| if frac == 0.0 { block - 1 } else { block };
+    BlockPos::new(
+        last(max.block.x, max.frac.x),
+        last(max.block.y, max.frac.y),
+        last(max.block.z, max.frac.z),
+    )
+}
+
+/// True if the box from `min` to `max` (exclusive faces) touches a cell that holds a fluid: a
+/// fluid block or a waterlogged one ([`CollisionTable::is_wet`]). A cell not loaded counts as
+/// dry.
 pub fn box_touches_fluid(
     source: &mut impl VoxelSource,
     table: &CollisionTable,
     min: WorldPos,
     max: WorldPos,
 ) -> bool {
-    // The last cell the box reaches: a max face on a cell border does not enter the next cell.
-    let last = |block: i64, frac: f64| if frac == 0.0 { block - 1 } else { block };
-    let hi = BlockPos::new(
-        last(max.block.x, max.frac.x),
-        last(max.block.y, max.frac.y),
-        last(max.block.z, max.frac.z),
-    );
+    let hi = last_cell(max);
     for y in min.block.y..=hi.y {
         for z in min.block.z..=hi.z {
             for x in min.block.x..=hi.x {
                 if let Probe::Block(state) = source.probe(BlockPos::new(x, y, z))
-                    && table.is_fluid(state)
+                    && table.is_wet(state)
                 {
                     return true;
                 }
@@ -127,9 +151,42 @@ pub fn box_touches_fluid(
     false
 }
 
+/// How far above the bottom of the box from `min` to `max` the fluid of the cells it touches
+/// reaches, blocks (Minecraft's `getFluidHeight`): a wet cell's fluid reaches [`FLUID_TOP`] of
+/// it, or its top with a wet cell above. 0 when no cell is wet; a cell not loaded counts as dry.
+/// Exact far from the origin: whole blocks are counted from the box's bottom cell.
+fn fluid_depth(
+    source: &mut impl VoxelSource,
+    table: &CollisionTable,
+    min: WorldPos,
+    max: WorldPos,
+) -> f64 {
+    let mut wet = |x: i64, y: i64, z: i64| match source.probe(BlockPos::new(x, y, z)) {
+        Probe::Block(state) => table.is_wet(state),
+        _ => false,
+    };
+    let hi = last_cell(max);
+    let mut depth = 0.0f64;
+    for y in min.block.y..=hi.y {
+        for z in min.block.z..=hi.z {
+            for x in min.block.x..=hi.x {
+                if wet(x, y, z) {
+                    let top = if wet(x, y + 1, z) { 1.0 } else { FLUID_TOP };
+                    depth = depth.max((y - min.block.y) as f64 + top - min.frac.y);
+                }
+            }
+        }
+    }
+    depth
+}
+
 /// Each fixed step: every awake [`Swimmer`] checks its box against the fluids, swaps its land and
 /// water settings when that changes and, in a fluid, rises while [`SwimIntent::up`] is held or
-/// a jump was pressed (the jump latch is used up: no jump off the bottom).
+/// a jump was pressed (the jump latch is used up: no jump off the bottom). On the ground with
+/// the fluid at most [`FLUID_JUMP_THRESHOLD`] above its feet (a waterlogged slab or stair) it
+/// does not swim up: the jump latch stays for the controller, which jumps as on land
+/// (Minecraft's `jumpFromGround` there). A flyer counts as dry for all of that (it keeps the
+/// jump latch), though [`Swimmer::in_fluid`] still tells.
 pub fn swim_bodies(
     content: Res<PhysicsContent>,
     map: Res<ChunkMap>,
@@ -144,13 +201,23 @@ pub fn swim_bodies(
             Option<&mut CharacterController>,
             Option<&mut MoveIntent>,
             Option<&SwimIntent>,
+            Option<&Contacts>,
         ),
         Without<Frozen>,
     >,
 ) {
     let mut source = ChunkSource::new(&map, &world);
-    for (mut swimmer, position, collider, mut body, mut velocity, controller, intent, up) in
-        &mut bodies
+    for (
+        mut swimmer,
+        position,
+        collider,
+        mut body,
+        mut velocity,
+        controller,
+        intent,
+        up,
+        contacts,
+    ) in &mut bodies
     {
         let (min, max) = match collider {
             Some(c) => {
@@ -167,7 +234,9 @@ pub fn swim_bodies(
             pos.offset(max),
         );
         let mut controller = controller;
-        if wet && swimmer.land.is_none() {
+        // Minecraft's creative flight is not affected by fluids (`isAffectedByFluids`).
+        let swims = wet && !controller.as_ref().is_some_and(|c| c.flying);
+        if swims && swimmer.land.is_none() {
             let walk = controller.as_ref().map_or(0.0, |c| c.walk_speed);
             swimmer.land = Some((*body, walk));
             let s = swimmer.settings;
@@ -180,7 +249,7 @@ pub fn swim_bodies(
             if let Some(c) = controller.as_mut() {
                 c.walk_speed = walk * s.speed;
             }
-        } else if !wet && let Some((land, walk)) = swimmer.land.take() {
+        } else if !swims && let Some((land, walk)) = swimmer.land.take() {
             *body = land;
             if let Some(c) = controller.as_mut() {
                 c.walk_speed = walk;
@@ -189,13 +258,26 @@ pub fn swim_bodies(
         if swimmer.in_fluid != wet {
             swimmer.in_fluid = wet;
         }
-        if !wet {
+        if !swims {
             continue;
         }
-        let mut rise = up.is_some_and(|u| u.up);
-        if let Some(mut intent) = intent
-            && intent.jump
+        let jump = intent.as_ref().is_some_and(|i| i.jump);
+        let held = up.is_some_and(|u| u.up);
+        // Shallow fluid under a body on the ground: the jump key jumps (Minecraft's
+        // `LivingEntity::aiStep`). Only looked at when a key is down.
+        if (jump || held)
+            && contacts.is_some_and(|c| c.on_ground)
+            && fluid_depth(
+                &mut source,
+                &content.collision,
+                pos.offset(min),
+                pos.offset(max),
+            ) <= FLUID_JUMP_THRESHOLD
         {
+            continue;
+        }
+        let mut rise = held;
+        if jump && let Some(mut intent) = intent {
             intent.jump = false;
             rise = true;
         }

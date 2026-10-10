@@ -88,7 +88,8 @@ pub struct SweepOut {
     /// full, else the first full block found there. `None` when the axis moved freely or an
     /// obstacle box clipped it.
     pub blocks: [Option<BlockPos>; 3],
-    /// The box ends overlapping a fluid block.
+    /// The box ends overlapping a block that holds a fluid ([`CollisionTable::is_wet`]: a
+    /// fluid block or a waterlogged one).
     pub in_fluid: bool,
     /// The box started inside full blocks and was pushed out first.
     pub depenetrated: bool,
@@ -729,7 +730,8 @@ impl<'a, S: VoxelSource + ?Sized, const TALL: bool> Grid<'a, S, TALL> {
         Ok(false)
     }
 
-    /// Some fluid block overlaps `bx` by more than `eps` on every axis.
+    /// Some block that holds a fluid ([`CollisionTable::is_wet`]) overlaps `bx` by more than
+    /// `eps` on every axis.
     fn any_fluid(&mut self, bx: LocalBox) -> Result<bool, Unloaded> {
         let ((x0, x1), (y0, y1), (z0, z1)) = (self.span(bx, 0), self.span(bx, 1), self.span(bx, 2));
         for y in y0..=y1 {
@@ -737,7 +739,7 @@ impl<'a, S: VoxelSource + ?Sized, const TALL: bool> Grid<'a, S, TALL> {
                 for z in z0..=z1 {
                     let block = self.world([x, y, z]);
                     match self.src.probe(block) {
-                        Probe::Block(state) if self.table.is_fluid(state) => return Ok(true),
+                        Probe::Block(state) if self.table.is_wet(state) => return Ok(true),
                         Probe::Block(_) => {}
                         Probe::Unloaded => return Err(Unloaded { block }),
                     }
