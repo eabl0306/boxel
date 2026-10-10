@@ -71,6 +71,9 @@ MIN_CAP = 50
 HARNESS_FLAGS = ('--label', '--csv', '--summary')
 # Tries of a run before keeping one that does not count (marked noisy).
 ATTEMPTS = 4
+# A capped run that skipped refreshes on more than this share of its frames is in the high skip
+# mode (skip_mode).
+HIGH_MODE_SKIPS = 0.01
 
 
 @dataclasses.dataclass(frozen=True)
@@ -236,6 +239,17 @@ def skipped_refreshes(times_ms, refresh_hz=None):
     return sum(max(0, round(g / period) - 1) for g in gaps) if period > 0 else None
 
 
+def skip_mode(skipped, shown):
+    """The skip mode of a capped run: 'high' when it skipped refreshes on more than 1 % of the
+    frames shown, else 'low' (None without frames). Capped runs on the NVIDIA land at random in a
+    high or a low mode, about 5 or about 1 skipped refresh per second, from the power state of
+    the GPU (issue #5, docs/rendimiento/puesta-al-dia-2026-10.md). Past 1 % the p99 frame is one
+    that waited two refreshes (13.9 ms at 144 Hz), so p99 and slow frames follow the mode."""
+    if skipped is None or not shown:
+        return None
+    return 'high' if skipped > HIGH_MODE_SKIPS * shown else 'low'
+
+
 def throttle_limits(cap):
     """(fps, frames shown) under which a second is the compositor's 30 fps throttle: 100 and 50
     uncapped, and at most 70 % of the cap with one."""
@@ -271,17 +285,20 @@ def metrics(summary, times_ms, nv=None):
     """The numbers the verdicts and the reports use. `slow` counts the frames over 6.94 ms (the
     smoke rule, capped or not) and `slow75` those over 7.5 ms (the checkpoint's slow frames with
     a cap: there the compositor's callbacks come every 6.95 ms, so half the frames pass 6.94 ms
-    by a hair, docs/rendimiento/ritmo-2026-10.md)."""
+    by a hair, docs/rendimiento/ritmo-2026-10.md). `mode` is the skip mode of a capped run
+    (skip_mode), None uncapped."""
     get = bench_report.get
     run = summary.get('run') or {}
     final = get(summary, ('world', 'final')) or {}
+    skipped = skipped_refreshes(times_ms, run.get('refresh_hz'))
     return {
         'fps': get(summary, ('frames', 'avg_fps')),
         'p50': get(summary, ('frames', 'p50_ms')),
         'p99': get(summary, ('frames', 'p99_ms')),
         'slow': get(summary, ('frames', 'over_144hz')),
         'slow75': get(summary, ('frames', 'over_7_5ms')),
-        'skipped': skipped_refreshes(times_ms, run.get('refresh_hz')),
+        'skipped': skipped,
+        'mode': skip_mode(skipped, len(times_ms)) if run.get('fps_limit') else None,
         'catch_up': get(summary, ('world', 'border_catch_up', 'avg_ms')),
         'pstates': nv,
         'quads': final.get('quads'),

@@ -57,16 +57,19 @@ def run(m=None, error=None, noisy=None, gave_up=False):
     return runs.Run(Case(), 'x', metrics=m, error=error, noisy=noisy, gave_up=gave_up)
 
 
+# Refreshes a fake run of 3 s skips to land in the high skip mode: 11 of 432, over 1 %.
+HIGH_MODE = tuple(range(5, 430, 40))
+
 HELP = ('usage: stress [--scenario static|fly|dive|spin|path]\n'
         '  --cave              start in a cave\n')
 OLD_HELP = 'usage: stress [--scenario static|fly|dive|spin]\n  --caves MODE  cave mode\n'
 
 FAKE_STRESS = r'''#!/usr/bin/env python3
 """Fake stress: --help prints HELP; a run writes the files a real one writes from SUMMARY (the
-first run of the binary throttled when THROTTLE), or fails like stress without a GPU when FAIL
-is True or appears in the arguments."""
+first run of the binary throttled when THROTTLE, the refreshes in SKIP left out of the CSV), or
+fails like stress without a GPU when FAIL is True or appears in the arguments."""
 import json, os, sys
-HELP, SUMMARY, FAIL, THROTTLE = @VALUES@
+HELP, SUMMARY, FAIL, THROTTLE, SKIP = @VALUES@
 args = sys.argv[1:]
 if '--help' in args:
     print(HELP)
@@ -88,14 +91,17 @@ with open(out['--summary'], 'w') as f:
 with open(out['--csv'], 'w') as f:
     f.write('frame,t_ms,presented\n')
     for i in range(3 * 144):
-        f.write(f'{i},{i * 1000 / 144:.3f},1\n')
+        if i not in SKIP:
+            f.write(f'{i},{i * 1000 / 144:.3f},1\n')
 '''
 
 
-def fake_stress(folder, name, data=None, fail=False, help_text=HELP, throttle_first=False):
-    """A fake stress binary in `folder`; `data` is its summary (default: summary())."""
+def fake_stress(folder, name, data=None, fail=False, help_text=HELP, throttle_first=False,
+                skip=()):
+    """A fake stress binary in `folder`; `data` is its summary (default: summary()), `skip` the
+    refreshes its runs skip."""
     path = os.path.join(folder, name)
-    values = repr((help_text, json.dumps(data or summary()), fail, throttle_first))
+    values = repr((help_text, json.dumps(data or summary()), fail, throttle_first, tuple(skip)))
     with open(path, 'w') as f:
         f.write(FAKE_STRESS.replace('@VALUES@', values))
     os.chmod(path, 0o755)
@@ -263,6 +269,19 @@ class MetricsTest(unittest.TestCase):
         # Without the refresh rate, the median gap is the period.
         self.assertEqual(runs.skipped_refreshes(every_refresh(skip={10})), 1)
         self.assertIsNone(runs.skipped_refreshes([5.0]))
+
+    def test_skip_mode(self):
+        self.assertEqual(runs.skip_mode(0, 2800), 'low')
+        self.assertEqual(runs.skip_mode(28, 2800), 'low', 'exactly 1 %')
+        self.assertEqual(runs.skip_mode(29, 2800), 'high')
+        self.assertIsNone(runs.skip_mode(None, 2800))
+        self.assertIsNone(runs.skip_mode(3, 0))
+        # 432 refreshes in 3 s: 5 skipped of 427 shown is over 1 %, 4 of 428 is not.
+        high = every_refresh(skip={10, 50, 90, 130, 170})
+        low = every_refresh(skip={10, 50, 90, 130})
+        self.assertEqual(runs.metrics(summary(cap=144), high)['mode'], 'high')
+        self.assertEqual(runs.metrics(summary(cap=144), low)['mode'], 'low')
+        self.assertIsNone(runs.metrics(summary(), high)['mode'], 'uncapped runs have no mode')
 
     def test_throttled(self):
         self.assertIsNone(runs.throttled(summary(), every_refresh()))
@@ -761,10 +780,75 @@ class CheckTest(unittest.TestCase):
 
     def test_capped_slow_frames_are_over_7_5_ms(self):
         capped, uncapped = Case(cap=144), Case()
-        base = [metrics(slow=1500, slow75=10)] * 3
-        new = [metrics(slow=1500, slow75=40)] * 3
+        base = [metrics(slow=1500, slow75=10, mode='low')] * 3
+        new = [metrics(slow=1500, slow75=40, mode='low')] * 3
         self.assertEqual(perf.flagged_metrics(capped, {'base': base, 'new': new}), ['slow'])
         self.assertEqual(perf.flagged_metrics(uncapped, {'base': base, 'new': new}), [])
+
+    # rtx/forest/r16/144 of checkpoint round 1: (p99, slow75, mode) of each run.
+    FOREST_BASE = [(13.79, 54, 'high'), (7.49, 27, 'low'), (7.47, 28, 'low')]
+    FOREST_NEW = [(13.91, 77, 'high'), (13.91, 66, 'high'), (13.93, 74, 'high')]
+
+    def runs_of(self, *runs_):
+        return [metrics(p99=p99, slow=1500, slow75=s75, mode=mode) for p99, s75, mode in runs_]
+
+    def test_capped_nvidia_is_judged_within_each_skip_mode(self):
+        r = {'base': self.runs_of(*self.FOREST_BASE), 'new': self.runs_of(*self.FOREST_NEW)}
+        rtx = Case('rtx', 'forest', 16, 144)
+        self.assertEqual(perf.flagged_metrics(rtx, r), [],
+                         'more runs in the high mode is chance, not a regression')
+        self.assertTrue(perf.unjudged(rtx, 'p99', r['base'], r['new']))
+        self.assertFalse(perf.unjudged(rtx, 'fps', r['base'], r['new']))
+        # The 780M has no skip modes: the same numbers there are worse.
+        self.assertEqual(perf.flagged_metrics(Case('780m', 'forest', 16, 144), r), ['p99'])
+        self.assertFalse(perf.unjudged(Case('780m', 'forest', 16, 144), 'p99', r['base'],
+                                       r['new']))
+
+    def test_a_change_within_one_skip_mode_is_still_worse(self):
+        rtx = Case('rtx', 'surface', 16, 144)
+        low = {'base': self.runs_of((7.4, 20, 'low'), (7.5, 25, 'low'), (13.9, 90, 'high')),
+               'new': self.runs_of((9.6, 24, 'low'), (9.8, 22, 'low'), (13.9, 95, 'high'))}
+        self.assertEqual(perf.flagged_metrics(rtx, low), ['p99'])
+        high = {'base': self.runs_of((13.9, 100, 'high'), (14.0, 110, 'high'), (7.4, 20, 'low')),
+                'new': self.runs_of((13.9, 250, 'high'), (14.0, 260, 'high'), (7.4, 21, 'low'))}
+        self.assertEqual(perf.flagged_metrics(rtx, high), ['slow'])
+
+    def test_a_skip_mode_needs_two_runs_per_side(self):
+        rtx = Case('rtx', 'surface', 16, 144)
+        r = {'base': self.runs_of((7.4, 20, 'low'), (13.9, 100, 'high'), (14.0, 110, 'high')),
+             'new': self.runs_of((9.9, 60, 'low'), (13.9, 105, 'high'), (13.95, 100, 'high'))}
+        self.assertEqual(list(perf.mode_groups(r['base'], r['new'])), ['high'])
+        self.assertEqual(perf.flagged_metrics(rtx, r), [], 'one low run per side is a coin toss')
+        self.assertFalse(perf.unjudged(rtx, 'p99', r['base'], r['new']))
+        # Runs without a mode (older results) are never compared.
+        none = {'base': [metrics(p99=7.4)] * 3, 'new': [metrics(p99=13.9)] * 3}
+        self.assertEqual(perf.flagged_metrics(rtx, none), [])
+        self.assertTrue(perf.unjudged(rtx, 'p99', none['base'], none['new']))
+
+    def test_fisher(self):
+        self.assertAlmostEqual(perf.fisher(0, 3, 3, 3), 0.1)
+        self.assertAlmostEqual(perf.fisher(1, 3, 3, 3), 0.4)
+        self.assertAlmostEqual(perf.fisher(2, 3, 2, 3), 1.0)
+        self.assertAlmostEqual(perf.fisher(3, 21, 6, 21), 0.4537, places=4)
+        self.assertEqual(perf.fisher(0, 0, 0, 0), 1.0)
+
+    def test_report_shows_the_skip_modes(self):
+        forest = Case('rtx', 'forest', 16, 144)
+        rows = {forest: {'base': self.runs_of(*self.FOREST_BASE),
+                         'new': self.runs_of(*self.FOREST_NEW), 'errors': [], 'unmeasured': []},
+                Case('rtx', 'forest', 16, 0): {'base': [metrics()] * 3, 'new': [metrics()] * 3,
+                                               'errors': [], 'unmeasured': []}}
+        text = perf.render_report(self.info(), rows)
+        self.assertIn('**Resultado:** sin empeoramientos claros.', text)
+        self.assertIn('| Puesta al día ms | Modo alto | Estado NVIDIA |', text)
+        self.assertIn('| 9.58 -> 13.92 | 36.33 -> 72.33 |', text)
+        self.assertIn('| 1/3 -> 3/3 | - -> - |', text)
+        self.assertIn('| 20 -> 20 | - -> - | - -> - |', text, 'uncapped: no mode')
+        self.assertIn('- p99 y frames lentos sin juzgar, porque las corridas cayeron en modos '
+                      'distintos: rtx/forest/r16/144 (modo alto 1/3 -> 3/3, Fisher p = 0.40).',
+                      text)
+        self.assertNotIn('**peor** |', text)
+        self.assertNotIn('—', text)
 
     def test_pstates_text(self):
         self.assertEqual(perf.pstates_text([None, {}]), '-')
@@ -832,7 +916,7 @@ class CheckTest(unittest.TestCase):
                                   results)
         self.assertIn('Primera ronda', text)
         self.assertIn('**Resultado:** primera ronda, sin comparación.', text)
-        self.assertIn('| superficie, vuelo a 64, sin tope | 1000 | 0.50 | 1 | 0 | 0 | 20 | - |',
+        self.assertIn('| superficie, vuelo a 64, sin tope | 1000 | 0.50 | 1 | 0 | 0 | 20 | - | - |',
                       text)
 
     def dry_run(self, *args, last=None, tags='', main=True):
@@ -1001,6 +1085,19 @@ class CheckRunTest(FakeMachine):
         self.assertEqual(self.tags, ['perf-control-1'])
         self.assertFalse(os.path.exists(self.report), 'no report in docs/rendimiento')
 
+    def test_more_runs_in_the_high_skip_mode_is_not_worse(self):
+        """Capped on the NVIDIA, a new binary whose runs all landed in the high skip mode."""
+        with mock.patch.object(perf, 'MATRIX', [Case('rtx', 'forest', 16, 144)]):
+            code, text = self.check({'data': summary(fps=143, p99=7.5, slow75=20, cap=144)},
+                                    {'data': summary(fps=141, p99=13.9, slow75=70, cap=144),
+                                     'skip': HIGH_MODE})
+        self.assertEqual(code, 0, self.output())
+        self.assertIn('**Resultado:** sin empeoramientos claros.', text)
+        self.assertIn('| 0/2 -> 2/2 |', text)
+        self.assertIn('sin juzgar, porque las corridas cayeron en modos distintos: '
+                      'rtx/forest/r16/144 (modo alto 0/2 -> 2/2', text)
+        self.assertIn('p99 13.90 ms, slow 0, high skip mode', self.output())
+
     def test_a_worse_round_says_so(self):
         code, text = self.check(None, {'data': summary(catch_up=40.0)})
         self.assertEqual(code, 1)
@@ -1043,12 +1140,12 @@ class BisectRunTest(FakeMachine):
             patch.start()
             self.addCleanup(patch.stop)
 
-    def bisect(self, *args, **per_commit):
+    def bisect(self, *args, case='surface', **per_commit):
         for sha in ('c0', 'c1', 'c2', 'c3', 'c4'):
             self.binaries[sha] = self.binary(sha, **per_commit.get(sha, {}))
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            code = perf.main(['bisect', 'surface', 'c0', 'c4', '--duration', '3', *args])
+            code = perf.main(['bisect', case, 'c0', 'c4', '--duration', '3', *args])
         return code, self.output() + err.getvalue()
 
     def test_no_gpu_is_not_a_bad_commit(self):
@@ -1086,6 +1183,22 @@ class BisectRunTest(FakeMachine):
         self.assertEqual(code, 1, out)
         self.assertIn('first bad commit: c2', out)
         self.assertIn('catch_up: 20 -> 30 WORSE', out)
+
+
+    def test_the_checkpoint_rule_compares_capped_nvidia_runs_of_one_skip_mode(self):
+        low = {'data': summary(fps=143, p99=7.5, cap=144)}
+        high = {'data': summary(fps=141, p99=13.9, cap=144), 'skip': HIGH_MODE}
+        commits = {'c0': low, 'c1': low, 'c2': high, 'c3': high, 'c4': high}
+        code, out = self.bisect('--metric', 'p99', '--rounds', '2', case='rtx/forest/r16/144',
+                                **commits)
+        self.assertEqual(code, 2, out)
+        self.assertIn('p99: 7.50 -> 13.90 (not judged: high skip mode 0/2 -> 2/2)', out)
+        self.assertIn('nothing to look for', out)
+        self.said.clear()
+        code, out = self.bisect('--metric', 'p99', '--rounds', '2', case='780m/forest/r16/144',
+                                **commits)
+        self.assertEqual(code, 1, out)
+        self.assertIn('first bad commit: c2', out)
 
 
 class RecipesTest(unittest.TestCase):

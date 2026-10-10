@@ -424,7 +424,10 @@ def run_line(side, run):
         return f'    {side:<4} not measured: {run.noisy}'
     m = run.metrics
     text = (f"    {side:<4} {fmt(m['fps'])} fps, p50 {fmt(m['p50'])} ms, p99 {fmt(m['p99'])} ms, "
-            f"slow {fmt(m['slow'])} ({run.seconds:.0f} s)")
+            f"slow {fmt(m['slow'])}")
+    if by_mode(run.case) and m.get('mode'):
+        text += f", {m['mode']} skip mode"
+    text += f' ({run.seconds:.0f} s)'
     return text + (f' NOISY, does not count: {run.noisy}' if run.noisy else '')
 
 
@@ -626,6 +629,15 @@ def mean(values):
 # power state (issue #5) and get no flag.
 CHECK_RULES = {'fps': (1, 0.10), 'p50': (-1, 0.25), 'p99': (-1, 0.25), 'catch_up': (-1, 0.25),
                'slow': (-1, 1.0)}
+# Capped runs on the NVIDIA land at random in a high or a low skip mode (runs.skip_mode) and their
+# p99 and slow frames follow it, so those two compare runs of one mode, in the modes with MODE_MIN
+# runs or more per side. How many runs landed in each mode is chance and gets no flag: with 3
+# runs per side even 0 of 3 against 3 of 3 has p = 0.10 (Fisher). In checkpoint round 1 the rule
+# over all the runs flagged rtx/forest/r16/144 for 1 of 3 base runs against 3 of 3 new ones in
+# the high mode. Over every split of that round's capped RTX runs into base and new it flagged 4
+# of 140, this one none (docs/rendimiento/control-2026-10-09.md).
+MODE_METRICS = ('p99', 'slow')
+MODE_MIN = 2
 
 
 def check_key(case, metric):
@@ -655,12 +667,65 @@ def worse(metric, base, new):
     return n > b * (1 + rel) and min(new) > max(base)
 
 
+def by_mode(case):
+    """True if `case` compares p99 and slow frames within each skip mode: capped on the NVIDIA."""
+    return case.gpu == 'rtx' and bool(case.cap)
+
+
+def mode_groups(base, new):
+    """{mode: (base runs, new runs)} of the skip modes with MODE_MIN runs or more per side."""
+    out = {}
+    for mode in ('low', 'high'):
+        b = [m for m in base if m.get('mode') == mode]
+        n = [m for m in new if m.get('mode') == mode]
+        if len(b) >= MODE_MIN and len(n) >= MODE_MIN:
+            out[mode] = (b, n)
+    return out
+
+
+def unjudged(case, metric, base, new):
+    """True if the rule of `metric` has no runs to compare because they landed in different skip
+    modes."""
+    return (by_mode(case) and metric in MODE_METRICS and bool(base) and bool(new)
+            and not mode_groups(base, new))
+
+
+def case_worse(case, metric, base, new):
+    """The checkpoint rule of `metric` on the metrics of the runs of `case`: `worse` on every
+    run, or within each skip mode (by_mode)."""
+    if by_mode(case) and metric in MODE_METRICS:
+        return any(worse(metric, values(case, metric, b), values(case, metric, n))
+                   for b, n in mode_groups(base, new).values())
+    return worse(metric, values(case, metric, base), values(case, metric, new))
+
+
 def flagged_metrics(case, r):
     """The checkpoint rules a case breaks, in CHECK_RULES order."""
     if not r['base']:
         return []
-    return [m for m in CHECK_RULES
-            if worse(m, values(case, m, r['base']), values(case, m, r['new']))]
+    return [m for m in CHECK_RULES if case_worse(case, m, r['base'], r['new'])]
+
+
+def high_mode(side):
+    """(runs in the high skip mode, runs with a mode) of the metrics of a side."""
+    modes = [m.get('mode') for m in side if m.get('mode')]
+    return sum(1 for m in modes if m == 'high'), len(modes)
+
+
+def mode_text(side):
+    high, n = high_mode(side)
+    return f'{high}/{n}' if n else '-'
+
+
+def fisher(a, n, b, m):
+    """Two-sided Fisher exact test of `a` of `n` against `b` of `m`."""
+    total = a + b
+
+    def p(x):
+        return math.comb(n, x) * math.comb(m, total - x) / math.comb(n + m, total)
+    seen = p(a)
+    return min(1.0, sum(p(x) for x in range(max(0, total - m), min(n, total) + 1)
+                        if p(x) <= seen * (1 + 1e-9)))
 
 
 def pstates_text(shares):
@@ -681,7 +746,7 @@ def cell(case, metric, base, new):
         return 'sin datos'
     b, n = values(case, metric, base), values(case, metric, new)
     text = fmt(mean(n)) if not base else f'{fmt(mean(b))} -> {fmt(mean(n))}'
-    return text + (' **peor**' if base and worse(metric, b, n) else '')
+    return text + (' **peor**' if base and case_worse(case, metric, base, new) else '')
 
 
 def render_report(info, results):
@@ -737,14 +802,18 @@ def render_report(info, results):
         if not rows:
             continue
         nvidia = gpu == 'rtx'
-        head = ['Caso'] + [name for _, name in COLUMNS] + (['Estado NVIDIA'] if nvidia else [])
+        head = ['Caso'] + [name for _, name in COLUMNS] + (['Modo alto', 'Estado NVIDIA']
+                                                           if nvidia else [])
         lines += [f'## {runs.GPU_NAMES[gpu]}', '', '| ' + ' | '.join(head) + ' |',
-                  '|---|' + '---:|' * len(COLUMNS) + ('---|' if nvidia else '')]
+                  '|---|' + '---:|' * len(COLUMNS) + ('---:|---|' if nvidia else '')]
         for case, r in rows:
             cells = [case.label] + [cell(case, m, r['base'], r['new']) for m, _ in COLUMNS]
             if nvidia:
+                modes = [mode_text(side) if by_mode(case) else '-'
+                         for side in (r['base'], r['new'])]
                 ps = [pstates_text(x['pstates'] for x in side) for side in (r['base'], r['new'])]
-                cells.append(f'{ps[0]} -> {ps[1]}' if r['base'] else ps[1])
+                cells += ([f'{modes[0]} -> {modes[1]}', f'{ps[0]} -> {ps[1]}'] if r['base']
+                          else [modes[1], ps[1]])
             lines.append('| ' + ' | '.join(cells) + ' |')
         lines.append('')
     lines += [
@@ -755,7 +824,21 @@ def render_report(info, results):
         'o los frames lentos se duplican, y ninguna corrida nueva llega a la peor de antes. Los '
         'refrescos salteados dependen del estado de energía de la NVIDIA (issue #5) y no se '
         'marcan.',
+        '- Modo alto: con tope, cada corrida de la RTX cae al azar en un modo con muchos '
+        'refrescos salteados o en uno con pocos (issue #5). Está en el alto si saltea refrescos '
+        'en más del 1 % de sus frames, y entonces su p99 es un frame de dos refrescos (13.9 ms). '
+        'Por eso ahí p99 y frames lentos se comparan solo entre corridas del mismo modo, con 2 o '
+        'más de cada lado. Cuántas caen en cada modo es azar y no se marca.',
     ]
+    blind = []
+    for c, r in results.items():
+        if any(unjudged(c, m, r['base'], r['new']) for m in MODE_METRICS):
+            (hb, nb), (hn, nn) = high_mode(r['base']), high_mode(r['new'])
+            blind.append(f'{c} (modo alto {hb}/{nb} -> {hn}/{nn}, Fisher p = '
+                         f'{fisher(hb, nb, hn, nn):.2f})')
+    if blind:
+        lines.append('- p99 y frames lentos sin juzgar, porque las corridas cayeron en modos '
+                     f"distintos: {'; '.join(blind)}.")
     if info['skipped']:
         lines.append(f"- Sin datos: {'; '.join(info['skipped'])}.")
     for c, r in results.items():
@@ -950,11 +1033,14 @@ def metric_bad(case, base, new, folder, metrics, rounds, duration):
             raise PerfError(f'could not measure {new}: {unmeasured_reason([(b, n)])}')
         pairs.append((b.metrics, n.metrics))
     bad = False
+    base_runs, new_runs = [p[0] for p in pairs], [p[1] for p in pairs]
     for m in metrics:
-        b, n = values(case, m, [p[0] for p in pairs]), values(case, m, [p[1] for p in pairs])
-        is_worse = worse(m, b, n)
+        b, n = values(case, m, base_runs), values(case, m, new_runs)
+        is_worse = case_worse(case, m, base_runs, new_runs)
         bad = bad or is_worse
-        say(f"    {m}: {fmt(mean(b))} -> {fmt(mean(n))}{' WORSE' if is_worse else ''}")
+        note = (f' (not judged: high skip mode {mode_text(base_runs)} -> {mode_text(new_runs)})'
+                if unjudged(case, m, base_runs, new_runs) else '')
+        say(f"    {m}: {fmt(mean(b))} -> {fmt(mean(n))}{' WORSE' if is_worse else ''}{note}")
     return bad
 
 
