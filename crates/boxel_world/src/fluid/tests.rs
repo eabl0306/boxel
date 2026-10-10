@@ -3,15 +3,26 @@
 //! (Minecraft's `getSpread` and `getSlopeDistance` as written: every rule checked in full at
 //! every step, every block read from the world), on random blocks near the origin and far from
 //! it, for every fluid of the registry: water, lava and a third one that looks further for a
-//! way down than the memo keeps. And the fluids of a registry without a waterlog fluid.
+//! way down than the memo keeps. And the fluids of a registry without a waterlog fluid, and
+//! what hardens in a world of test fluids: never a waterlogged block.
 use super::*;
-use boxel_voxel::{
-    BlockCollision, BlockDef, BlockRegistryBuilder, FaceTextures, FluidReplace, MAX_BLOCK_COORD,
-    Property, RenderShape, SlabHalf, TextureId, TexturePattern, TextureSpec, WATERLOGGED,
+use crate::jobs::InlineExecutor;
+use crate::streaming::WorldJobs;
+use crate::tests::support::fake_mesh;
+use crate::{
+    BlockTickSettings, ChunkMap, ChunkViewer, EditQueue, WorldPlugin, WorldSettings, WorldStats,
 };
+use boxel_math::DVec3;
+use boxel_transform::Transform;
+use boxel_voxel::{
+    BlockCollision, BlockDef, BlockRegistryBuilder, FaceTextures, FluidHardening, FluidReplace,
+    MAX_BLOCK_COORD, Property, RenderShape, SlabHalf, TextureId, TexturePattern, TextureSpec,
+    WATERLOGGED,
+};
+use boxel_worldgen::FlatGenerator;
 use proptest::prelude::*;
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 /// The rules of the third fluid: it looks 6 blocks for a way down (past [`MEMO_REACH`]) and
 /// loses 3 per block.
@@ -321,30 +332,36 @@ fn the_third_fluid_finds_a_way_down_6_blocks_away() {
     assert_eq!(fast, [None, None, None, east]);
 }
 
+/// A builder with texture 0 and `test:slab`, a bottom slab that can be waterlogged.
+fn slab_builder() -> BlockRegistryBuilder {
+    let mut b = BlockRegistryBuilder::new();
+    b.add_texture(TextureSpec {
+        name: "test:t".into(),
+        base_color: [0; 3],
+        noise: 0,
+        pattern: TexturePattern::Noise,
+    })
+    .unwrap();
+    let slab = BlockDef {
+        name: "test:slab".into(),
+        shape: RenderShape::Opaque,
+        model: BlockModel::Slab(SlabHalf::Bottom),
+        collision: BlockModel::Slab(SlabHalf::Bottom).default_collision(),
+        emission: [0; 3],
+        light_opacity: 1,
+        textures: FaceTextures::all(TextureId(0)),
+    };
+    b.add_block_with_states(slab, vec![Property::boolean(WATERLOGGED)], |_, _| {})
+        .unwrap();
+    b
+}
+
 /// A registry whose blocks have `waterlogged` but no waterlog fluid: its waterlogged states hold
 /// nothing and its dry ones take no source; with one, they hold and take its source.
 #[test]
 fn the_waterlogged_blocks_hold_the_waterlog_fluid_only() {
     let registry = |waterlog: bool| {
-        let mut b = BlockRegistryBuilder::new();
-        b.add_texture(TextureSpec {
-            name: "test:t".into(),
-            base_color: [0; 3],
-            noise: 0,
-            pattern: TexturePattern::Noise,
-        })
-        .unwrap();
-        let slab = BlockDef {
-            name: "test:slab".into(),
-            shape: RenderShape::Opaque,
-            model: BlockModel::Slab(SlabHalf::Bottom),
-            collision: BlockModel::Slab(SlabHalf::Bottom).default_collision(),
-            emission: [0; 3],
-            light_opacity: 1,
-            textures: FaceTextures::all(TextureId(0)),
-        };
-        b.add_block_with_states(slab, vec![Property::boolean(WATERLOGGED)], |_, _| {})
-            .unwrap();
+        let mut b = slab_builder();
         let block = fluid_block(&mut b, "test:fluid");
         let fluid = b.add_fluid(block, GOO).unwrap();
         if waterlog {
@@ -369,4 +386,132 @@ fn the_waterlogged_blocks_hold_the_waterlog_fluid_only() {
         assert_eq!(flow.takes_source(Some(dry)), waterlog);
         assert!(!flow.takes_source(Some(wet)));
     }
+}
+
+/// The slab, a floor, ice and two fluids: `test:water`, the waterlog fluid, turns to `test:ice`
+/// beside `test:cryo`, which it looks for on every face.
+fn hardening_registry() -> BlockRegistry {
+    let mut b = slab_builder();
+    let solid = |b: &mut BlockRegistryBuilder, name: &str| {
+        b.add_block(BlockDef {
+            name: name.into(),
+            shape: RenderShape::Opaque,
+            model: BlockModel::CUBE,
+            collision: BlockCollision::Full,
+            emission: [0; 3],
+            light_opacity: 15,
+            textures: FaceTextures::all(TextureId(0)),
+        })
+        .unwrap()
+    };
+    solid(&mut b, "test:floor");
+    let ice = solid(&mut b, "test:ice");
+    let mut fluid = |name: &str| {
+        let block = fluid_block(&mut b, name);
+        b.add_fluid(block, GOO).unwrap()
+    };
+    let (water, cryo) = (fluid("test:water"), fluid("test:cryo"));
+    b.set_waterlog_fluid(water).unwrap();
+    let hardening = |with, product| FluidHardening {
+        with,
+        faces: Face::ALL.to_vec(),
+        source: product,
+        flowing: product,
+    };
+    b.fluid_hardens(water, hardening(cryo, ice)).unwrap();
+    b.build()
+}
+
+/// A world of [`hardening_registry`] on one layer of `test:floor` (block y 0), with its game
+/// clock stopped: only the reactions to edits run, no fluid flows.
+struct Reactions {
+    app: App,
+    registry: Arc<BlockRegistry>,
+}
+
+impl Reactions {
+    fn new() -> Self {
+        let registry = Arc::new(hardening_registry());
+        let mut app = App::new();
+        app.add_plugins(WorldPlugin {
+            generator: Arc::new(FlatGenerator::new(vec![("test:floor".into(), 1)])),
+            registry: Arc::clone(&registry),
+            executor: Arc::new(InlineExecutor),
+            settings: WorldSettings {
+                light: false,
+                ..WorldSettings::default()
+            },
+        })
+        .add_plugins(FluidPlugin);
+        app.world_mut().resource_mut::<WorldJobs>().mesh_fn = fake_mesh;
+        app.world_mut().resource_mut::<BlockTickSettings>().paused = true;
+        app.world_mut().spawn((
+            Transform::from_translation(DVec3::new(8.0, 1.0, 8.0)),
+            ChunkViewer::new(1).with_vertical_radius(1),
+        ));
+        let mut world = Self { app, registry };
+        world.settle();
+        world
+    }
+
+    fn settle(&mut self) {
+        for _ in 0..200 {
+            self.app.update();
+            let stats = *self.app.world().resource::<WorldStats>();
+            if stats.chunks > 0 && stats.is_settled() {
+                return;
+            }
+        }
+        panic!("not settled");
+    }
+
+    /// Places the blocks named in `edits` (sources for the fluids), at block y 1, in one batch,
+    /// and lets the world react.
+    fn edit(&mut self, edits: &[([i64; 2], &str)]) {
+        let states: Vec<_> = edits
+            .iter()
+            .map(|&([x, z], name)| (BlockPos::new(x, 1, z), self.state(name)))
+            .collect();
+        let mut queue = self.app.world_mut().resource_mut::<EditQueue>();
+        for (pos, state) in states {
+            queue.set_block(pos, state);
+        }
+        for _ in 0..4 {
+            self.app.update();
+        }
+        self.settle();
+    }
+
+    fn state(&self, name: &str) -> BlockState {
+        self.registry.parse_state(name).expect(name)
+    }
+
+    /// The name of the block at (x, 1, z).
+    fn at(&self, [x, z]: [i64; 2]) -> String {
+        let map = self.app.world().resource::<ChunkMap>();
+        let state = map.block_at(BlockPos::new(x, 1, z)).expect("loaded");
+        self.registry.state_name(state).to_string()
+    }
+}
+
+/// Minecraft hardens only the fluid block itself (`LiquidBlock::shouldSpreadLiquid`): a
+/// waterlogged block holds a source of a fluid that hardens beside cryo, but cryo beside it
+/// leaves it as it is, while a source of that fluid beside cryo turns to ice.
+#[test]
+fn a_waterlogged_block_never_hardens() {
+    let mut world = Reactions::new();
+    let wet = "test:slab[waterlogged=true]";
+    world.edit(&[
+        ([4, 4], wet),
+        ([5, 4], "test:cryo"),
+        ([10, 4], "test:water"),
+        ([11, 4], "test:cryo"),
+    ]);
+    assert_eq!(world.at([4, 4]), wet);
+    assert_eq!(world.at([10, 4]), "test:ice");
+    assert!(world.at([5, 4]).starts_with("test:cryo"));
+    // Cryo arriving later does not harden it either.
+    world.edit(&[([4, 6], wet)]);
+    world.edit(&[([4, 7], "test:cryo")]);
+    assert_eq!(world.at([4, 6]), wet);
 }

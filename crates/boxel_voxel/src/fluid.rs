@@ -51,6 +51,7 @@ pub struct FluidReplace {
 /// What a fluid hardens into where it meets another (Minecraft's
 /// `LiquidBlock::shouldSpreadLiquid`: lava next to water): a cell of the fluid with fluid `with`
 /// across one of `faces` becomes `source` (a source) or `flowing` (any other level), at once.
+/// Only the fluid's own block hardens: a waterlogged block holding the waterlog fluid keeps it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FluidHardening {
     /// The fluid it meets.

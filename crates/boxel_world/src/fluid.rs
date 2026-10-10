@@ -24,7 +24,8 @@
 //!   lava is at least 4/9 high. A fluid never replaces its own cells.
 //! - A waterlogged block (a slab, stairs or a fence whose `waterlogged` is `true`, ADR 0025)
 //!   holds a source of the registry's waterlog fluid (water): it ticks and spreads like one and
-//!   counts as one for its neighbors.
+//!   counts as one for its neighbors, but never hardens (only the fluid's own block does, as in
+//!   Minecraft's `LiquidBlock`).
 //!   Flowing water never fills a block (it stops movement), but a dry one where water would
 //!   make a new source (two sources beside it) takes it and becomes waterlogged, as in
 //!   Minecraft (`canPlaceLiquid`). Between two cells, a fluid passes only where their collision
@@ -57,7 +58,8 @@ const HORIZONTAL: [Face; 4] = [Face::NegZ, Face::PosX, Face::PosZ, Face::NegX];
 
 /// Adds the fluids the registry declares (`BlockRegistry::fluids`): registers the ticks of
 /// each fluid's block and, for the waterlog fluid, of every waterlogged state (with
-/// [`BlockTicksPlugin`] if it is not there yet), and the reaction of each fluid that hardens.
+/// [`BlockTicksPlugin`] if it is not there yet), and the reaction of each fluid that hardens on
+/// its own block (a waterlogged block never hardens).
 /// Needs [`WorldPlugin`](crate::WorldPlugin) first; a registry without fluids adds no tick.
 pub struct FluidPlugin;
 
@@ -77,10 +79,15 @@ impl Plugin for FluidPlugin {
             };
             ticks.register(&registry, fluid.block, handler);
             if registry.waterlog_fluid() == Some(FluidId(i as u8)) {
-                // The fluid of the waterlogged blocks.
+                // The fluid of the waterlogged blocks, without the reaction: only the fluid's
+                // own block hardens, never a block that holds it.
+                let held = TickHandler {
+                    react: None,
+                    ..handler
+                };
                 for state in (0..registry.len() as u16).map(BlockState) {
                     if registry.is_waterlogged(state) {
-                        ticks.register_state(&registry, state, handler);
+                        ticks.register_state(&registry, state, held);
                     }
                 }
             }
