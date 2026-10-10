@@ -405,19 +405,22 @@ fn march_layer(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, up: bool, 
   var rest_shade = 1.0;
   var rest_from = ta;
   var k = 0u;
-  if ((*st).steps >= max_steps) {
+  // The ray's step count, in a local while the layer is walked: counted through the pointer,
+  // lavapipe (Mesa 26.0) never left this loop once a lattice step had been skipped.
+  var steps = (*st).steps;
+  if (steps >= max_steps) {
     rest = true;
     rest_sigma = fog.layers[li].band.w;
   } else if ((flags & LAYER_UNIFORM) != 0u) {
     // Every cell full: one body, no inner faces, one step.
-    (*st).steps += 1u;
+    steps += 1u;
     rest = true;
     rest_sigma = density;
     rest_shade = entry;
   }
   var piece = (tb - ta) / f32(UNIFORM_PIECES);
   loop {
-    if (!rest && (*st).steps >= max_steps) {
+    if (!rest && steps >= max_steps) {
       rest = true;
       rest_sigma = fog.layers[li].band.w;
       rest_shade = 1.0;
@@ -430,6 +433,8 @@ fn march_layer(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, up: bool, 
     var sigma = 0.0;
     var last = false;
     var axis = 2u;
+    // Crossed an empty lattice step this iteration.
+    var skipped = false;
     if (rest) {
       a = rest_from + f32(k) * piece;
       k += 1u;
@@ -438,7 +443,7 @@ fn march_layer(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, up: bool, 
       sigma = rest_sigma;
       shade = rest_shade;
     } else {
-      (*st).steps += 1u;
+      steps += 1u;
       let num = lattice_cell(li, cell, &cache);
       if (coverage_of(li, step_max_noise(li, &cache)) == 0u) {
         // The whole lattice step is empty: cross it in one step (Dda::step_exit, Dda::jump).
@@ -468,31 +473,32 @@ fn march_layer(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, up: bool, 
         prev_full = false;
         s0 = sj;
         if (cell.y < band_cells.x || cell.y >= band_cells.y) { break; }
-        continue;
+        skipped = true;
+      } else {
+        var t_exit = t_next.z;
+        if (t_next.x <= t_next.y && t_next.x <= t_next.z) {
+          axis = 0u;
+          t_exit = t_next.x;
+        } else if (t_next.y <= t_next.z) {
+          axis = 1u;
+          t_exit = t_next.y;
+        }
+        s1 = clamp(t_exit, s0, tb);
+        b = s1;
+        sigma = density * (f32(cell_coverage(li, num, &cache)) / 4096.0);
+        if (sigma > 0.0 && !prev_full) {
+          shade = entry;
+        }
+        prev_full = sigma > 0.0;
+        last = t_exit >= tb;
       }
-      var t_exit = t_next.z;
-      if (t_next.x <= t_next.y && t_next.x <= t_next.z) {
-        axis = 0u;
-        t_exit = t_next.x;
-      } else if (t_next.y <= t_next.z) {
-        axis = 1u;
-        t_exit = t_next.y;
-      }
-      s1 = clamp(t_exit, s0, tb);
-      b = s1;
-      sigma = density * (f32(cell_coverage(li, num, &cache)) / 4096.0);
-      if (sigma > 0.0 && !prev_full) {
-        shade = entry;
-      }
-      prev_full = sigma > 0.0;
-      last = t_exit >= tb;
     }
     if (sigma > 0.0) {
       integrate(st, a, b, sigma * dir_len, segment_color(li, a, b, shade, dir_len));
       if ((*st).done) { break; }
     }
     if (last) { break; }
-    if (!rest) {
+    if (!rest && !skipped) {
       let along = vec3<bool>(axis == 0u, axis == 1u, axis == 2u);
       cell += stepv * vec3<i32>(along);
       t_next = select(t_next, (grid + vec3<f32>(cell + edge) * size3 - eye) * inv, along);
@@ -501,6 +507,7 @@ fn march_layer(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, up: bool, 
       if (cell.y < band_cells.x || cell.y >= band_cells.y) { break; }
     }
   }
+  (*st).steps = steps;
 }
 
 @fragment
