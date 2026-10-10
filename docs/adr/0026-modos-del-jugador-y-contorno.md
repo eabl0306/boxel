@@ -276,6 +276,11 @@ en el agua le devuelve el agua.
   (probar pararse) y no se duerme. Agacharse o pararse inserta un `Collider`, que despierta lo
   que dormía sobre el lugar. El resto son comparaciones por paso. El juego, en el frame: la vista
   hace unas cuentas en CPU.
+- Medido con criterion, `tick/1000` (caminantes y cuerpos que caen), base ecd7c8f contra la rama,
+  una corrida por lado, tres veces porque la máquina estaba compartida con otras compilaciones:
+  657 contra 558 µs, 508 contra 591 y, invirtiendo el orden, 607 contra 524. La segunda corrida
+  de cada par sale más lenta, sea cual sea: no hay diferencia que se vea por encima del ruido.
+  `tick/1000_fenced`: 564 contra 590 y 519 contra 590, con la rama segunda las dos veces.
 - Medido con criterion, una corrida por lado (µs). cf11b4f es antes de las vallas, main es
   5e8177a y la rama ya tiene main mezclado:
 
