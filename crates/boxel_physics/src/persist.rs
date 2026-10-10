@@ -7,8 +7,8 @@
 //! whether it sleeps and how many steps it has been still, and, when the body has them, its
 //! [`Interpolated`] position before the latest step, [`ReportContacts`], the
 //! [`CharacterController`] with its [`MoveIntent`], the [`Projectile`] (the shooter it ignores
-//! is saved by its saved id, so only a saved shooter is kept) and the [`Swimmer`] (with the land
-//! settings it keeps while in a fluid). Floats are saved bit for bit, so a body that comes back
+//! is saved by its saved id, so only a saved shooter is kept), the [`Swimmer`] (with the land
+//! settings it keeps while in a fluid) and its [`SwimIntent`]. Floats are saved bit for bit, so a body that comes back
 //! steps exactly as it would have. Not saved: [`Frozen`](crate::Frozen) (the next step finds it
 //! out), the contacts with other bodies and the events (they start again).
 use crate::components::{
@@ -17,7 +17,7 @@ use crate::components::{
     Teleport, Velocity,
 };
 use crate::core::{BodySettings, CollisionLayers, Shape};
-use crate::swim::{SwimSettings, Swimmer};
+use crate::swim::{SwimIntent, SwimSettings, Swimmer};
 use boxel_ecs::change_detection::{ComponentTicks, Tick};
 use boxel_ecs::prelude::*;
 use boxel_math::{DVec3, Vec2};
@@ -37,8 +37,9 @@ pub const BODY_CODEC_VERSION: u32 = 1;
 /// It saves the kind, the exact position, the velocity, the [`BodySettings`], the [`Collider`],
 /// the [`Contacts`] of the latest step, whether the body sleeps and how many steps it has been
 /// still, and when present [`Interpolated`], [`ReportContacts`], the [`CharacterController`]
-/// with its [`MoveIntent`], the [`Projectile`] (its shooter only if the shooter is saved) and
-/// the [`Swimmer`], floats bit for bit: a body that comes back steps exactly as it would have.
+/// with its [`MoveIntent`], the [`Projectile`] (its shooter only if the shooter is saved), the
+/// [`Swimmer`] and the [`SwimIntent`], floats bit for bit: a body that comes back steps exactly
+/// as it would have.
 /// A body that comes back is not woken by the chunk loads it came back with.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BodyCodec;
@@ -55,7 +56,8 @@ const SWIMMER: u16 = 1 << 7;
 const ON_GROUND: u16 = 1 << 8;
 const IN_FLUID: u16 = 1 << 9;
 const GROUND: u16 = 1 << 10;
-const KNOWN: u16 = (1 << 11) - 1;
+const SWIM_INTENT: u16 = 1 << 11;
+const KNOWN: u16 = (1 << 12) - 1;
 
 /// Where a body is for saving: a pending [`Teleport`] or a `Transform` written since the latest
 /// step (a teleport the next step takes), else its [`BodyPosition`].
@@ -237,6 +239,7 @@ impl EntityCodec for BodyCodec {
             || after(e.get_change_ticks::<MoveIntent>())
             || after(e.get_change_ticks::<Projectile>())
             || after(e.get_change_ticks::<Swimmer>())
+            || after(e.get_change_ticks::<SwimIntent>())
     }
 
     fn save(&self, world: &World, entity: Entity, ids: &SavedIds<'_>) -> Option<Vec<u8>> {
@@ -250,6 +253,7 @@ impl EntityCodec for BodyCodec {
         let controller = e.get::<CharacterController>().copied();
         let projectile = e.get::<Projectile>().copied();
         let swimmer = e.get::<Swimmer>().copied();
+        let swim_intent = e.get::<SwimIntent>().copied();
         let mut flags = 0;
         for (on, flag) in [
             (collider.is_some(), COLLIDER),
@@ -263,6 +267,7 @@ impl EntityCodec for BodyCodec {
             (contacts.on_ground, ON_GROUND),
             (contacts.in_fluid, IN_FLUID),
             (contacts.ground_block.is_some(), GROUND),
+            (swim_intent.is_some(), SWIM_INTENT),
         ] {
             if on {
                 flags |= flag;
@@ -359,6 +364,9 @@ impl EntityCodec for BodyCodec {
                 w.settings(&settings);
                 w.f64(walk);
             }
+        }
+        if let Some(intent) = swim_intent {
+            w.u8(u8::from(intent.up));
         }
         Some(w.0)
     }
@@ -489,6 +497,11 @@ impl EntityCodec for BodyCodec {
         } else {
             None
         };
+        let swim_intent = if has(SWIM_INTENT) {
+            Some(SwimIntent { up: r.u8()? != 0 })
+        } else {
+            None
+        };
         r.finish()?;
 
         // Placed already, where it was: the next step neither teleports nor nudges it.
@@ -528,6 +541,9 @@ impl EntityCodec for BodyCodec {
         }
         if let Some(swimmer) = swimmer {
             e.insert(swimmer);
+        }
+        if let Some(intent) = swim_intent {
+            e.insert(intent);
         }
         // Last: its hook reads the rest (the same change tick, so nothing counts as changed
         // after it fell asleep).

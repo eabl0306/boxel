@@ -2,7 +2,8 @@
 //! put away when their chunk unloads and come back once, with their whole state, when it loads
 //! (near the origin, across ±2^31, at 2^40 and next to the world limit); sleeping bodies come
 //! back asleep and stay so; after a restart the bodies step bit for bit as they would have
-//! without it; a body saved by another codec version, or damaged, stays saved as it is.
+//! without it (also a swimmer holding up, a frozen walker and a body with a pending teleport);
+//! a body saved by another codec version, or damaged, stays saved as it is.
 mod sim;
 
 use boxel_app::App;
@@ -10,8 +11,8 @@ use boxel_ecs::prelude::*;
 use boxel_math::{DVec3, I64Vec3, Vec2};
 use boxel_physics::{
     BODY_CODEC, BodyCodec, BodyPosition, BodySettings, CharacterController, Collider, Contacts,
-    Interpolated, MoveIntent, OnBlock, Projectile, ReportContacts, RigidBody, Sleeping, SwimPlugin,
-    SwimSettings, Swimmer, Velocity,
+    Interpolated, MoveIntent, OnBlock, Projectile, ReportContacts, RigidBody, Sleeping, SwimIntent,
+    SwimPlugin, SwimSettings, Swimmer, Velocity,
 };
 use boxel_transform::Transform;
 use boxel_voxel::{BlockPos, BlockRegistry, ChunkKey, ChunkPos, MAX_BLOCK_COORD, WorldPos};
@@ -106,6 +107,7 @@ struct State {
     intent: Option<MoveIntent>,
     projectile: Option<(OnBlock, Option<BlockPos>, Option<SavedId>)>,
     swimmer: Option<Swimmer>,
+    swim_intent: Option<SwimIntent>,
 }
 
 fn bits(v: DVec3) -> [u64; 3] {
@@ -145,6 +147,7 @@ fn states(app: &mut App) -> Vec<(SavedId, State)> {
                     (p.on_block, p.stuck_in(), shooter)
                 }),
                 swimmer: r.get::<Swimmer>().copied(),
+                swim_intent: r.get::<SwimIntent>().copied(),
             };
             (id, state)
         })
@@ -211,6 +214,7 @@ fn spawn_scene(sim: &mut Sim) {
             Saved::new(),
             Collider::standing(0.6, 1.8),
             Swimmer::new(SwimSettings::default()),
+            SwimIntent { up: true },
         ),
     );
     sim.body(
