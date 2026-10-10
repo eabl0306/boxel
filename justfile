@@ -24,10 +24,11 @@ lint:
     python3 tools/ecs_surface.py
 
 [group('quality')]
-[doc('Dependency policy: advisories, licenses, bans, sources, no bevy* crates, lock sync')]
+[doc('Dependency policy: advisories, licenses, bans, sources, no bevy* crates, no content in engine crates, lock sync')]
 deny:
     cargo deny --all-features check
     python3 tools/no_bevy.py
+    python3 tools/no_content.py
     python3 tools/vendor_lock_sync.py
 
 [group('quality')]
@@ -120,10 +121,12 @@ bench *args:
     cargo bench --workspace --bench '*' {{ args }}
 
 [group('test')]
-[doc('Tests of the Python tools (tools/bench_report.py, tools/perf)')]
+[doc('Tests of the Python tools (tools/bench_report.py, tools/perf, no_content, snapshot_set)')]
 test-tools:
     python3 tools/bench_report_test.py
     python3 tools/perf/perf_test.py
+    python3 tools/no_content_test.py
+    python3 tools/snapshot_set_test.py
 
 # Stress runs (examples/stress.rs, docs/benchmarks.md). Each one opens a window that closes by
 # itself and writes bench-results/<timestamp>-<scenario>.{md,csv} (git-ignored). Extra options

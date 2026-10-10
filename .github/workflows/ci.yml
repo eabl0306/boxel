@@ -160,6 +160,8 @@ jobs:
           arguments: --all-features
       - name: no bevy* crates anywhere (root and vendor graphs)
         run: python3 tools/no_bevy.py
+      - name: no content names in engine crates (issue #48, shrinking allowlist)
+        run: python3 tools/no_content.py
       - name: vendor/Cargo.lock agrees with Cargo.lock
         run: python3 tools/vendor_lock_sync.py
 
@@ -172,6 +174,8 @@ jobs:
           persist-credentials: false
       # Also checks that the committed stress summaries still parse (`just test-tools`).
       - run: python3 tools/bench_report_test.py
+      - run: python3 tools/no_content_test.py
+      - run: python3 tools/snapshot_set_test.py
 
   typos:
     name: typos

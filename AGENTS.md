@@ -40,11 +40,16 @@ tools/quiet.sh cargo test --workspace --locked
 RUSTDOCFLAGS="-D warnings" tools/quiet.sh cargo doc --workspace --no-deps --locked
 typos
 python3 tools/no_bevy.py
+python3 tools/no_content.py
 ```
 
 `cargo fmt --check` va siempre sin `--all`, porque `--all` reformatearía `vendor/`. Si tocaste algo
 de GPU, corre también los tests de GPU:
 `BOXEL_REQUIRE_GPU=1 tools/quiet.sh cargo test --workspace --locked --test '*gpu*' -- --test-threads=1`.
+
+`tools/no_content.py` falla si un crate del motor nombra contenido concreto (bloques, texturas,
+reglas o generadores del juego de ejemplo, que viven en `crates/boxel_demo`; issue #48). Lo que
+aún queda está en `tools/no_content_allow/`, y esas listas solo pierden líneas: nunca agregues una.
 
 ## Cómo medir
 
