@@ -1235,8 +1235,9 @@ pub trait ChunkStore: Send + Sync + 'static {
   el disco funciona otra vez.
 - Entidades: las marcadas con `Saved` se guardan con su chunk a través de los `EntityCodec` que
   registran los plugins (la física guarda sus cuerpos con `BodyCodec`). Se guardan y despawnean
-  cuando su chunk se descarga, y vuelven con él antes del paso de física siguiente (ADR 0024
-  sección 3).
+  cuando su chunk se descarga, y vuelven con él antes del paso de física siguiente. El
+  autoguardado y la salida las guardan en la misma transacción que los chunks con ediciones, los
+  ticks y el reloj, y solo rearman las que cambiaron (ADR 0024 sección 3).
 
 ---
 
