@@ -3,7 +3,7 @@
 //! ([`BlockRegistryBuilder::add_fluid`](crate::BlockRegistryBuilder::add_fluid)), with its
 //! [`FluidRules`] (how fast and how far it flows) and what it does with the other fluids: which
 //! ones may flow into its cells ([`FluidReplace`]), what falling into one makes, and what it
-//! hardens into beside one ([`FluidHardening`]). One fluid may be the one the blocks with a
+//! hardens into beside each one ([`FluidHardening`]). One fluid may be the one the blocks with a
 //! `waterlogged` property hold (`set_waterlog_fluid`). `boxel_world`'s `FluidPlugin` runs them;
 //! the registry only describes them.
 use crate::{BlockId, BlockState, Face};
@@ -79,6 +79,7 @@ pub struct FluidType {
     /// What a cell of another fluid becomes when this one falls into it (lava falling into
     /// water makes stone).
     pub falls_into: Vec<(FluidId, BlockState)>,
-    /// What it hardens into beside another fluid.
-    pub hardens: Option<FluidHardening>,
+    /// What it hardens into beside other fluids, in declaration order: a cell takes the first
+    /// one whose fluid it meets.
+    pub hardens: Vec<FluidHardening>,
 }

@@ -728,7 +728,7 @@ impl BlockRegistryBuilder {
             rules,
             replaced_by: Vec::new(),
             falls_into: Vec::new(),
-            hardens: None,
+            hardens: Vec::new(),
         });
         Ok(FluidId((self.fluids.len() - 1) as u8))
     }
@@ -760,7 +760,8 @@ impl BlockRegistryBuilder {
         Ok(())
     }
 
-    /// Fluid `fluid` hardens beside another as `hardening` says (replaces an earlier one).
+    /// Fluid `fluid` hardens beside another as `hardening` says. A fluid may harden beside
+    /// several: a cell takes the first hardening, in declaration order, whose fluid it meets.
     pub fn fluid_hardens(
         &mut self,
         fluid: FluidId,
@@ -770,7 +771,7 @@ impl BlockRegistryBuilder {
         let i = self.fluid_index(fluid)?;
         self.check_fluid_state(i, hardening.source)?;
         self.check_fluid_state(i, hardening.flowing)?;
-        self.fluids[i].hardens = Some(hardening);
+        self.fluids[i].hardens.push(hardening);
         Ok(())
     }
 

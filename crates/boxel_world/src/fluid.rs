@@ -34,7 +34,8 @@
 //!   slab.
 //! - A fluid next to another may harden at once (`FluidType::hardens`, Minecraft's
 //!   `LiquidBlock::shouldSpreadLiquid`): a lava cell with water above it or beside it turns to
-//!   obsidian if it is a source, to cobblestone otherwise. This is the fluid's tick reaction
+//!   obsidian if it is a source, to cobblestone otherwise. A fluid may harden beside several
+//!   others; the first it meets, in declaration order, wins. This is the fluid's tick reaction
 //!   ([`TickHandler::react`]), so it happens in the write that brings the two together.
 //! - Every change schedules the cell and its neighbors that are fluid their fluid's delay later
 //!   (water 5 game ticks, 4 updates a second; lava 30). Worldgen fluid schedules nothing: a
@@ -75,7 +76,7 @@ impl Plugin for FluidPlugin {
                 delay: fluid.rules.delay,
                 reach: fluid.rules.reach(),
                 tick: fluid_tick,
-                react: fluid.hardens.as_ref().map(|_| fluid_react as _),
+                react: (!fluid.hardens.is_empty()).then_some(fluid_react as _),
             };
             ticks.register(&registry, fluid.block, handler);
             if registry.waterlog_fluid() == Some(FluidId(i as u8)) {
@@ -751,20 +752,19 @@ fn fluid_tick(cx: &mut TickContext<'_>, pos: BlockPos, state: BlockState) {
 
 /// A fluid meeting another it hardens beside (Minecraft's `LiquidBlock::shouldSpreadLiquid`,
 /// `FluidType::hardens`): lava with water above it or beside it, a source turning to obsidian
-/// and other lava to cobblestone.
+/// and other lava to cobblestone. The first hardening it meets, in declaration order, wins.
 fn fluid_react(cx: &mut TickContext<'_>, pos: BlockPos, state: BlockState) {
     let fluids = Fluids::new(cx.registry());
     let Some((id, fluid)) = fluids.content(state) else {
         return;
     };
-    let Some(hardening) = &fluids.get(id).hardens else {
-        return;
-    };
-    let meets = hardening
-        .faces
-        .iter()
-        .any(|&face| fluids.holds(cx.get(offset(pos, face)), hardening.with));
-    if meets {
+    let met = fluids.get(id).hardens.iter().find(|hardening| {
+        hardening
+            .faces
+            .iter()
+            .any(|&face| fluids.holds(cx.get(offset(pos, face)), hardening.with))
+    });
+    if let Some(hardening) = met {
         let product = if fluid.source {
             hardening.source
         } else {

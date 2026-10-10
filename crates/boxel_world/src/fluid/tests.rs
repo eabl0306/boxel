@@ -4,7 +4,8 @@
 //! every step, every block read from the world), on random blocks near the origin and far from
 //! it, for every fluid of the registry: water, lava and a third one that looks further for a
 //! way down than the memo keeps. And the fluids of a registry without a waterlog fluid, and
-//! what hardens in a world of test fluids: never a waterlogged block.
+//! what hardens in a world of test fluids: never a waterlogged block, and a fluid beside each
+//! fluid it hardens with.
 use super::*;
 use crate::jobs::InlineExecutor;
 use crate::streaming::WorldJobs;
@@ -388,8 +389,10 @@ fn the_waterlogged_blocks_hold_the_waterlog_fluid_only() {
     }
 }
 
-/// The slab, a floor, ice and two fluids: `test:water`, the waterlog fluid, turns to `test:ice`
-/// beside `test:cryo`, which it looks for on every face.
+/// The slab, a floor, three solids and three fluids: `test:water`, the waterlog fluid, turns
+/// to `test:ice` beside `test:cryo`; `test:magma` turns to `test:rock` beside water and to
+/// `test:basalt` beside cryo, declared in that order. They look for the other fluid on every
+/// face.
 fn hardening_registry() -> BlockRegistry {
     let mut b = slab_builder();
     let solid = |b: &mut BlockRegistryBuilder, name: &str| {
@@ -406,11 +409,13 @@ fn hardening_registry() -> BlockRegistry {
     };
     solid(&mut b, "test:floor");
     let ice = solid(&mut b, "test:ice");
+    let rock = solid(&mut b, "test:rock");
+    let basalt = solid(&mut b, "test:basalt");
     let mut fluid = |name: &str| {
         let block = fluid_block(&mut b, name);
         b.add_fluid(block, GOO).unwrap()
     };
-    let (water, cryo) = (fluid("test:water"), fluid("test:cryo"));
+    let (water, cryo, magma) = (fluid("test:water"), fluid("test:cryo"), fluid("test:magma"));
     b.set_waterlog_fluid(water).unwrap();
     let hardening = |with, product| FluidHardening {
         with,
@@ -419,6 +424,8 @@ fn hardening_registry() -> BlockRegistry {
         flowing: product,
     };
     b.fluid_hardens(water, hardening(cryo, ice)).unwrap();
+    b.fluid_hardens(magma, hardening(water, rock)).unwrap();
+    b.fluid_hardens(magma, hardening(cryo, basalt)).unwrap();
     b.build()
 }
 
@@ -514,4 +521,23 @@ fn a_waterlogged_block_never_hardens() {
     world.edit(&[([4, 6], wet)]);
     world.edit(&[([4, 7], "test:cryo")]);
     assert_eq!(world.at([4, 6]), wet);
+}
+
+/// Magma declares two hardenings: beside water it turns to rock, beside cryo to basalt, and
+/// beside both the first one declared wins.
+#[test]
+fn a_fluid_hardens_beside_each_fluid_it_declares() {
+    let mut world = Reactions::new();
+    world.edit(&[
+        ([4, 10], "test:magma"),
+        ([5, 10], "test:water"),
+        ([10, 10], "test:magma"),
+        ([11, 10], "test:cryo"),
+        ([15, 10], "test:cryo"),
+        ([16, 10], "test:magma"),
+        ([17, 10], "test:water"),
+    ]);
+    assert_eq!(world.at([4, 10]), "test:rock");
+    assert_eq!(world.at([10, 10]), "test:basalt");
+    assert_eq!(world.at([16, 10]), "test:rock");
 }

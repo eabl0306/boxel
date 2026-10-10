@@ -74,7 +74,7 @@ fn a_fluid_is_a_fluid_block_with_its_16_levels() {
     assert_eq!(fluid.rules, RULES);
     assert_eq!(fluid.rules.reach(), [5, 2, 1]);
     assert!(fluid.replaced_by.is_empty() && fluid.falls_into.is_empty());
-    assert!(fluid.hardens.is_none());
+    assert!(fluid.hardens.is_empty());
     assert!(r.fluid(FluidId(1)).is_none());
     assert_eq!(r.waterlog_fluid(), None);
     // Its states are its levels; nothing else is.
@@ -177,11 +177,18 @@ fn the_tables_between_fluids_name_known_fluids_and_states() {
         ..hardening
     };
     b.fluid_hardens(a, hardening.clone()).unwrap();
+    // A second hardening adds to the first, after it.
+    let below = FluidHardening {
+        faces: vec![Face::NegY],
+        ..hardening.clone()
+    };
+    b.fluid_hardens(a, below.clone()).unwrap();
     b.set_waterlog_fluid(c).unwrap();
     let r = b.build();
     assert_eq!(r.fluids()[0].replaced_by, [(c, when)]);
     assert_eq!(r.fluids()[1].falls_into, [(a, solid)]);
-    assert_eq!(r.fluids()[0].hardens, Some(hardening));
+    assert_eq!(r.fluids()[0].hardens, [hardening, below]);
+    assert!(r.fluids()[1].hardens.is_empty());
     assert_eq!(r.waterlog_fluid(), Some(c));
 }
 
