@@ -4,17 +4,17 @@
 //!
 //! What is saved: the kind, the exact position ([`WorldPos`]: the block's `i64`s and the offset),
 //! the velocity, the [`BodySettings`], the [`Collider`], the [`Contacts`] of the latest step,
-//! whether it sleeps and how many steps it has been still, and, when the body has them, its
-//! [`Interpolated`] position before the latest step, [`ReportContacts`], the
+//! whether it sleeps or is [`Frozen`] and how many steps it has been still, and, when the body
+//! has them, its [`Interpolated`] position before the latest step, [`ReportContacts`], the
 //! [`CharacterController`] with its [`MoveIntent`], the [`Projectile`] (the shooter it ignores
 //! is saved by its saved id, so only a saved shooter is kept), the [`Swimmer`] (with the land
-//! settings it keeps while in a fluid) and its [`SwimIntent`]. Floats are saved bit for bit, so a body that comes back
-//! steps exactly as it would have. Not saved: [`Frozen`](crate::Frozen) (the next step finds it
-//! out), the contacts with other bodies and the events (they start again).
+//! settings it keeps while in a fluid) and its [`SwimIntent`]. Floats are saved bit for bit, so
+//! a body that comes back steps exactly as it would have. Not saved: the contacts with other
+//! bodies and the events (they start again).
 use crate::components::{
-    BodyPosition, CharacterController, Collider, Contacts, Interpolated, MoveIntent, OnBlock,
-    OnEntity, PhysicsSync, Projectile, ReportContacts, Response, Restored, RigidBody, Sleeping,
-    Teleport, Velocity,
+    BodyPosition, CharacterController, Collider, Contacts, Frozen, Interpolated, MoveIntent,
+    OnBlock, OnEntity, PhysicsSync, Projectile, ReportContacts, Response, Restored, RigidBody,
+    Sleeping, Teleport, Velocity,
 };
 use crate::core::{BodySettings, CollisionLayers, Shape};
 use crate::swim::{SwimIntent, SwimSettings, Swimmer};
@@ -35,11 +35,12 @@ pub const BODY_CODEC_VERSION: u32 = 1;
 /// [`Saved`](boxel_world::persist::Saved) is saved with its chunk and comes back as it was.
 ///
 /// It saves the kind, the exact position, the velocity, the [`BodySettings`], the [`Collider`],
-/// the [`Contacts`] of the latest step, whether the body sleeps and how many steps it has been
-/// still, and when present [`Interpolated`], [`ReportContacts`], the [`CharacterController`]
-/// with its [`MoveIntent`], the [`Projectile`] (its shooter only if the shooter is saved), the
-/// [`Swimmer`] and the [`SwimIntent`], floats bit for bit: a body that comes back steps exactly
-/// as it would have.
+/// the [`Contacts`] of the latest step, whether the body sleeps or is [`Frozen`] (a frozen body
+/// comes back frozen: its controller does not run before the step that finds its blocks) and
+/// how many steps it has been still, and when present [`Interpolated`], [`ReportContacts`], the
+/// [`CharacterController`] with its [`MoveIntent`], the [`Projectile`] (its shooter only if the
+/// shooter is saved), the [`Swimmer`] and the [`SwimIntent`], floats bit for bit: a body that
+/// comes back steps exactly as it would have.
 /// A body that comes back is not woken by the chunk loads it came back with.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BodyCodec;
@@ -57,7 +58,8 @@ const ON_GROUND: u16 = 1 << 8;
 const IN_FLUID: u16 = 1 << 9;
 const GROUND: u16 = 1 << 10;
 const SWIM_INTENT: u16 = 1 << 11;
-const KNOWN: u16 = (1 << 12) - 1;
+const FROZEN: u16 = 1 << 12;
+const KNOWN: u16 = (1 << 13) - 1;
 
 /// Where a body is for saving: a pending [`Teleport`] or a `Transform` written since the latest
 /// step (a teleport the next step takes), else its [`BodyPosition`].
@@ -268,6 +270,7 @@ impl EntityCodec for BodyCodec {
             (contacts.in_fluid, IN_FLUID),
             (contacts.ground_block.is_some(), GROUND),
             (swim_intent.is_some(), SWIM_INTENT),
+            (e.contains::<Frozen>(), FROZEN),
         ] {
             if on {
                 flags |= flag;
@@ -544,6 +547,9 @@ impl EntityCodec for BodyCodec {
         }
         if let Some(intent) = swim_intent {
             e.insert(intent);
+        }
+        if has(FROZEN) {
+            e.insert(Frozen);
         }
         // Last: its hook reads the rest (the same change tick, so nothing counts as changed
         // after it fell asleep).

@@ -11,8 +11,8 @@ use boxel_ecs::prelude::*;
 use boxel_math::{DVec3, I64Vec3, Vec2};
 use boxel_physics::{
     BODY_CODEC, BodyCodec, BodyPosition, BodySettings, CharacterController, Collider, Contacts,
-    Interpolated, MoveIntent, OnBlock, Projectile, ReportContacts, RigidBody, Sleeping, SwimIntent,
-    SwimPlugin, SwimSettings, Swimmer, Velocity,
+    Frozen, Interpolated, MoveIntent, OnBlock, Projectile, ReportContacts, RigidBody, Sleeping,
+    SwimIntent, SwimPlugin, SwimSettings, Swimmer, Velocity,
 };
 use boxel_transform::Transform;
 use boxel_voxel::{BlockPos, BlockRegistry, ChunkKey, ChunkPos, MAX_BLOCK_COORD, WorldPos};
@@ -108,6 +108,7 @@ struct State {
     projectile: Option<(OnBlock, Option<BlockPos>, Option<SavedId>)>,
     swimmer: Option<Swimmer>,
     swim_intent: Option<SwimIntent>,
+    frozen: bool,
 }
 
 fn bits(v: DVec3) -> [u64; 3] {
@@ -148,6 +149,7 @@ fn states(app: &mut App) -> Vec<(SavedId, State)> {
                 }),
                 swimmer: r.get::<Swimmer>().copied(),
                 swim_intent: r.get::<SwimIntent>().copied(),
+                frozen: r.contains::<Frozen>(),
             };
             (id, state)
         })
@@ -456,4 +458,49 @@ fn a_sleeping_body_does_not_change_for_the_autosave() {
         .entity_mut(crate_)
         .insert(boxel_physics::Teleport(to));
     assert!(changed(&mut sim, crate_, since), "teleported");
+}
+
+/// A character walking out of the loaded world (data loads two chunks around the viewer here):
+/// it freezes at the edge, holding its velocity and intent. Then (with `restart`) the world is
+/// exited and opened again, and `steps` more steps run: the states at the end.
+fn run_frozen(base: I64Vec3, restart: bool, steps: usize) -> Vec<(SavedId, State)> {
+    let backend = Arc::new(MemoryStore::new());
+    let mut sim = start(&backend, base);
+    let walker = sim.body(
+        sim.pos(93.5, 4.0, 0.5),
+        (
+            Saved::new(),
+            Collider::standing(0.6, 1.8),
+            CharacterController::default(),
+            MoveIntent {
+                wish: Vec2::new(1.0, 0.0),
+                ..MoveIntent::default()
+            },
+        ),
+    );
+    for _ in 0..200 {
+        if sim.frozen(walker) {
+            break;
+        }
+        sim.steps(1);
+    }
+    assert!(sim.frozen(walker), "{base:?}: frozen at the edge");
+    if restart {
+        sim.app.shutdown();
+        drop(sim);
+        sim = start(&backend, base);
+    }
+    sim.steps(steps);
+    states(&mut sim.app)
+}
+
+/// A frozen body is saved frozen: in the step it comes back in, its controller does not run
+/// (a frozen body's does not), so it goes on exactly as if it had never been saved.
+#[test]
+fn a_frozen_walker_comes_back_frozen() {
+    for base in [bases()[0], bases()[2], bases()[3]] {
+        let straight = run_frozen(base, false, 20);
+        assert!(straight[0].1.frozen, "{base:?}");
+        assert_eq!(run_frozen(base, true, 20), straight, "{base:?}");
+    }
 }
