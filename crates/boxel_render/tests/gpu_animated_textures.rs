@@ -34,8 +34,8 @@ use boxel_mesh::{
     BUCKET_COUNT, ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher, PackedQuad,
 };
 use boxel_render::{
-    BlockTextureData, DEFAULT_SKY_COLOR, RendererConfig, TextureSource, TranslucentSort,
-    ViewParams, VoxelRenderer, load_block_textures,
+    BlockTextureData, DEFAULT_SKY_COLOR, PackSource, RendererConfig, TextureSource,
+    TranslucentSort, ViewParams, VoxelRenderer, load_block_textures,
 };
 use boxel_transform::Transform;
 use boxel_voxel::{BlockRegistry, BlockState, ChunkData, Face, LocalPos};
@@ -142,6 +142,11 @@ fn adapter_label(caps: &AdapterCaps) -> String {
 }
 
 // ---------------------------------------------------------------- scene
+
+/// The pack at `dir` read with the demo recipes.
+fn demo_pack(dir: PathBuf) -> TextureSource {
+    TextureSource::Pack(PackSource::new(dir).with_recipes(boxel_demo::pack::recipes()))
+}
 
 /// The pack: stone is a 16x48 strip of the three [`FRAMES`], 4 ticks each, interpolated.
 fn animated_pack() -> PathBuf {
@@ -330,7 +335,7 @@ fn animated_pack_textures_follow_the_tick_on_every_tier() {
     }
     let registry = boxel_demo::blocks::registry();
     let (textures, report) =
-        load_block_textures(&registry, &TextureSource::Pack(animated_pack())).expect("pack");
+        load_block_textures(&registry, &demo_pack(animated_pack())).expect("pack");
     assert_eq!((report.from_pack, report.animated), (1, 1), "{report:?}");
     let mesh = floor(&registry);
     let mut failures = Vec::new();
@@ -517,8 +522,7 @@ fn an_animated_flow_texture_does_not_scroll_on_any_tier() {
     let mesh = water_block(&registry);
     let packs = [false, true].map(|animated| {
         let (textures, report) =
-            load_block_textures(&registry, &TextureSource::Pack(flow_pack(animated)))
-                .expect("pack");
+            load_block_textures(&registry, &demo_pack(flow_pack(animated))).expect("pack");
         assert_eq!(textures.animated_flow, [animated, false], "{report:?}");
         textures
     });

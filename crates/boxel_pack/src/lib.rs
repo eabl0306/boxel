@@ -2,7 +2,9 @@
 //!
 //! Loads `pack.mcmeta` (including overlays), block textures (`PNG` + `.png.mcmeta`
 //! animations), block models (parent inheritance and `#texture` variables) and blockstates
-//! (`variants` / `multipart`). Does **not** talk to the renderer or the block registry.
+//! (`variants` / `multipart`). Does **not** talk to the renderer or the block registry: a
+//! [`LayerRecipe`] is plain data a game hands the renderer, saying which pack textures fill each
+//! of its texture layers.
 //!
 //! Supported pack formats: roughly 64 through 120. Unknown asset kinds (sounds, lang, fonts,
 //! shaders, texts, optifine, emissive, …) are skipped with a [`PackWarning`].
@@ -34,6 +36,7 @@ mod meta;
 mod model;
 mod overlay;
 mod pack;
+mod recipe;
 mod texture;
 
 pub use animation::{
@@ -51,4 +54,5 @@ pub use model::{
     resolve_model,
 };
 pub use pack::ResourcePack;
+pub use recipe::LayerRecipe;
 pub use texture::Texture;

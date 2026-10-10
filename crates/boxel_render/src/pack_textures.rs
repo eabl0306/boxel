@@ -2,12 +2,14 @@
 //! pixels of the registry's texture layers: layer ids, their order, the mip chain and the upload
 //! path stay the ones of the procedural textures, so every tier samples it the same way.
 //!
-//! Each built-in layer has a [`Recipe`]: the Minecraft block whose blockstate and model name the
-//! texture (`cube_column` end/side, the grass overlay...), and fallback texture names for packs
-//! that ship no model. The blockstate variant is picked by the property values of one of our
-//! states (ADR 0019): `boxel:log[axis=y]` reads the pack's `axis=y` variant ([`pack_variant`]). Grayscale textures Minecraft tints by biome (grass, foliage, water) get a
-//! fixed plains tint baked in. Layers the pack cannot fill keep their procedural pixels and add a
-//! warning to the [`TextureReport`].
+//! The game passes a [`LayerRecipe`] per layer with the pack ([`PackSource::recipes`]): the
+//! Minecraft block whose blockstate and model name the texture (`cube_column` end/side, the grass
+//! overlay...), fallback texture names for packs that ship no model, and the biome tint baked
+//! into the grayscale textures Minecraft tints (grass, foliage, water). The blockstate variant is
+//! picked by the property values of one of the game's states (ADR 0019): `game:log[axis=y]` reads
+//! the pack's `axis=y` variant ([`pack_variant`]). A layer without a recipe reads the texture
+//! named like it (`game:copper_ore` -> `minecraft:block/copper_ore`). Layers the pack cannot fill
+//! keep their procedural pixels and add a warning to the [`TextureReport`].
 //!
 //! A layer whose texture is animated (`.png.mcmeta`, water, lava, the sea lantern...) also keeps
 //! the finished layer of every frame its animation shows ([`LayerAnimation`], ADR 0028); the
@@ -20,7 +22,7 @@ use std::time::{Duration, Instant};
 use std::sync::Arc;
 
 use boxel_pack::{
-    BlockState as PackState, FaceName, ResourceId, ResourcePack, Texture, Timeline, VariantList,
+    BlockState as PackState, LayerRecipe, ResourceId, ResourcePack, Texture, Timeline, VariantList,
     condition_matches, parse_variant_key,
 };
 use boxel_voxel::{BlockRegistry, BlockState, Face, RenderShape, TextureSpec};
@@ -33,12 +35,6 @@ use crate::textures::{
 
 /// Largest layer edge taken from a pack (bigger packs are scaled down to it).
 pub const MAX_PACK_TEXTURE_SIZE: u32 = 512;
-/// Minecraft's plains grass color (sRGB), baked into grass textures with a tint index.
-pub const GRASS_TINT: [u8; 3] = [0x91, 0xBD, 0x59];
-/// Minecraft's plains foliage color (sRGB), baked into leaves.
-pub const FOLIAGE_TINT: [u8; 3] = [0x77, 0xAB, 0x2F];
-/// Minecraft's default water color (sRGB), baked into the grayscale water texture.
-pub const WATER_TINT: [u8; 3] = [0x3F, 0x76, 0xE4];
 /// Most bytes the frames of animated layers may take ([`LayerAnimation::memory`]); a layer past
 /// it shows its first frame only, with a warning. Every animated layer of a 16 px pack takes a
 /// few hundred KB; a 512 px layer with 32 frames, 45 MB.
@@ -50,8 +46,8 @@ pub enum TextureSource {
     /// Synthesized from each [`TextureSpec`] (no files; the default).
     #[default]
     Procedural,
-    /// A Minecraft Java resource pack directory (the one holding `pack.mcmeta`), read at startup.
-    Pack(PathBuf),
+    /// A Minecraft Java resource pack, read at startup.
+    Pack(PackSource),
 }
 
 impl TextureSource {
@@ -59,11 +55,37 @@ impl TextureSource {
     pub fn label(&self) -> String {
         match self {
             Self::Procedural => "procedural".to_string(),
-            Self::Pack(path) => path.file_name().map_or_else(
-                || path.display().to_string(),
+            Self::Pack(pack) => pack.dir.file_name().map_or_else(
+                || pack.dir.display().to_string(),
                 |n| n.to_string_lossy().into_owned(),
             ),
         }
+    }
+}
+
+/// A Minecraft Java resource pack and how the game's texture layers read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackSource {
+    /// The pack directory (the one holding `pack.mcmeta`).
+    pub dir: PathBuf,
+    /// The recipe of each layer that has one (the first one naming a layer counts); a layer
+    /// without one reads the texture named like it ([`LayerRecipe`]).
+    pub recipes: Arc<[LayerRecipe]>,
+}
+
+impl PackSource {
+    /// The pack at `dir` with no recipes: every layer reads the texture named like it.
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            recipes: Arc::from([]),
+        }
+    }
+
+    /// The same pack with `recipes` (replacing any earlier ones).
+    pub fn with_recipes(mut self, recipes: impl Into<Arc<[LayerRecipe]>>) -> Self {
+        self.recipes = recipes.into();
+        self
     }
 }
 
@@ -100,10 +122,11 @@ pub fn load_block_textures(
     let started = Instant::now();
     let (data, from_pack, pack_warnings, warnings) = match source {
         TextureSource::Procedural => (generate_block_textures(registry.textures()), 0, 0, vec![]),
-        TextureSource::Pack(path) => {
-            let pack = open_pack(path)?;
+        TextureSource::Pack(source) => {
+            let pack = open_pack(&source.dir)?;
             let mut warnings = Vec::new();
-            let (data, from_pack) = pack_block_textures(registry, &pack, &mut warnings);
+            let (data, from_pack) =
+                pack_block_textures(registry, &pack, &source.recipes, &mut warnings);
             (data, from_pack, pack.warnings().len(), warnings)
         }
     };
@@ -125,277 +148,11 @@ fn open_pack(path: &Path) -> Result<ResourcePack, String> {
     ResourcePack::open(path).map_err(|e| format!("resource pack {}: {e}", path.display()))
 }
 
-/// Biome tint of a texture part.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Tint {
-    None,
-    Grass,
-    Foliage,
-    Water,
-}
-
-impl Tint {
-    fn rgb(self) -> Option<[u8; 3]> {
-        match self {
-            Self::None => None,
-            Self::Grass => Some(GRASS_TINT),
-            Self::Foliage => Some(FOLIAGE_TINT),
-            Self::Water => Some(WATER_TINT),
-        }
-    }
-}
-
-/// How one engine layer finds its pack pixels.
-struct Recipe {
-    /// Engine texture name (`boxel:grass_side`).
-    layer: &'static str,
-    /// Minecraft block whose blockstate and model are read (`grass_block`).
-    block: &'static str,
-    /// Our state whose property values pick the blockstate variant (`boxel:log[axis=y]`), or
-    /// `""`. Its properties are named like Minecraft's.
-    state: &'static str,
-    /// Values of Minecraft properties our block lacks (`snowy=false`), added to the state's.
-    variant: &'static str,
-    /// Model face giving the texture (`North` stands for every side face).
-    face: FaceName,
-    /// Tint of model faces with a `tintindex`.
-    tint: Tint,
-    /// Texture parts (`block/...`, bottom first) when the pack has no usable model.
-    fallback: &'static [(&'static str, Tint)],
-    /// A fluid's flow sprite (ADR 0025): Minecraft's are twice the block size and a face shows
-    /// a quarter of one, so the layer takes the top-left quarter of a frame twice the layer's
-    /// edge (other sizes are scaled whole).
-    quarter: bool,
-}
-
-const fn recipe(
-    layer: &'static str,
-    block: &'static str,
-    face: FaceName,
-    fallback: &'static [(&'static str, Tint)],
-) -> Recipe {
-    Recipe {
-        layer,
-        block,
-        state: "",
-        variant: "",
-        face,
-        tint: Tint::None,
-        fallback,
-        quarter: false,
-    }
-}
-
-/// The layers of the demo content (`boxel_demo::blocks`). Other layers try `block/<path>` of
-/// their name.
-const RECIPES: &[Recipe] = &[
-    recipe(
-        "boxel:stone",
-        "stone",
-        FaceName::North,
-        &[("block/stone", Tint::None)],
-    ),
-    recipe(
-        "boxel:dirt",
-        "dirt",
-        FaceName::North,
-        &[("block/dirt", Tint::None)],
-    ),
-    Recipe {
-        variant: "snowy=false",
-        tint: Tint::Grass,
-        ..recipe(
-            "boxel:grass_top",
-            "grass_block",
-            FaceName::Up,
-            &[("block/grass_block_top", Tint::Grass)],
-        )
-    },
-    Recipe {
-        variant: "snowy=false",
-        tint: Tint::Grass,
-        ..recipe(
-            "boxel:grass_side",
-            "grass_block",
-            FaceName::North,
-            &[
-                ("block/grass_block_side", Tint::None),
-                ("block/grass_block_side_overlay", Tint::Grass),
-            ],
-        )
-    },
-    recipe(
-        "boxel:sand",
-        "sand",
-        FaceName::North,
-        &[("block/sand", Tint::None)],
-    ),
-    recipe(
-        "boxel:gravel",
-        "gravel",
-        FaceName::North,
-        &[("block/gravel", Tint::None)],
-    ),
-    recipe(
-        "boxel:snow",
-        "snow_block",
-        FaceName::North,
-        &[("block/snow", Tint::None)],
-    ),
-    recipe(
-        "boxel:bedrock",
-        "bedrock",
-        FaceName::North,
-        &[("block/bedrock", Tint::None)],
-    ),
-    Recipe {
-        state: "boxel:log[axis=y]",
-        ..recipe(
-            "boxel:log_side",
-            "oak_log",
-            FaceName::North,
-            &[("block/oak_log", Tint::None)],
-        )
-    },
-    Recipe {
-        state: "boxel:log[axis=y]",
-        ..recipe(
-            "boxel:log_top",
-            "oak_log",
-            FaceName::Up,
-            &[("block/oak_log_top", Tint::None)],
-        )
-    },
-    Recipe {
-        tint: Tint::Foliage,
-        ..recipe(
-            "boxel:leaves",
-            "oak_leaves",
-            FaceName::North,
-            &[("block/oak_leaves", Tint::Foliage)],
-        )
-    },
-    Recipe {
-        tint: Tint::Water,
-        ..recipe(
-            "boxel:water",
-            "water",
-            FaceName::Up,
-            &[("block/water_still", Tint::Water)],
-        )
-    },
-    recipe(
-        "boxel:planks",
-        "oak_planks",
-        FaceName::North,
-        &[("block/oak_planks", Tint::None)],
-    ),
-    recipe(
-        "boxel:lamp_orange",
-        "glowstone",
-        FaceName::North,
-        &[("block/glowstone", Tint::None)],
-    ),
-    recipe(
-        "boxel:lamp_red",
-        "shroomlight",
-        FaceName::North,
-        &[("block/shroomlight", Tint::None)],
-    ),
-    recipe(
-        "boxel:lamp_blue",
-        "sea_lantern",
-        FaceName::North,
-        &[("block/sea_lantern", Tint::None)],
-    ),
-    Recipe {
-        variant: "lit=true",
-        ..recipe(
-            "boxel:lamp_white",
-            "redstone_lamp",
-            FaceName::North,
-            &[("block/redstone_lamp_on", Tint::None)],
-        )
-    },
-    recipe(
-        "boxel:lava",
-        "lava",
-        FaceName::Up,
-        &[("block/lava_still", Tint::None)],
-    ),
-    // ADR 0018: glass (translucent, its alpha kept), and the cross plants (cutout). Slabs (all
-    // three types) use the stone layer and the turned logs the log layers.
-    recipe(
-        "boxel:glass",
-        "glass",
-        FaceName::North,
-        &[("block/glass", Tint::None)],
-    ),
-    Recipe {
-        tint: Tint::Grass,
-        ..recipe(
-            "boxel:short_grass",
-            "short_grass",
-            FaceName::North,
-            &[("block/short_grass", Tint::Grass)],
-        )
-    },
-    recipe(
-        "boxel:poppy",
-        "poppy",
-        FaceName::North,
-        &[("block/poppy", Tint::None)],
-    ),
-    // ADR 0020: the torch (cutout; both torches share it). Stairs use the stone and planks
-    // layers, the fence the planks layer.
-    recipe(
-        "boxel:torch",
-        "torch",
-        FaceName::North,
-        &[("block/torch", Tint::None)],
-    ),
-    // ADR 0025: what lava makes with water. ADR 0027: the cobblestone wall uses this layer
-    // (Minecraft's `cobblestone_wall` models take `block/cobblestone`) and the oak fence gate the
-    // planks layer (`oak_fence_gate` takes `block/oak_planks`), as the fence does.
-    recipe(
-        "boxel:cobblestone",
-        "cobblestone",
-        FaceName::North,
-        &[("block/cobblestone", Tint::None)],
-    ),
-    recipe(
-        "boxel:obsidian",
-        "obsidian",
-        FaceName::North,
-        &[("block/obsidian", Tint::None)],
-    ),
-    // ADR 0025: the flow sprites of the fluids (no model names them).
-    Recipe {
-        tint: Tint::Water,
-        quarter: true,
-        ..recipe(
-            "boxel:water_flow",
-            "water",
-            FaceName::North,
-            &[("block/water_flow", Tint::Water)],
-        )
-    },
-    Recipe {
-        quarter: true,
-        ..recipe(
-            "boxel:lava_flow",
-            "lava",
-            FaceName::North,
-            &[("block/lava_flow", Tint::None)],
-        )
-    },
-];
-
-/// One texture of a layer, composited bottom to top.
+/// One texture of a layer, composited bottom to top, with the tint baked into it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Part {
     id: ResourceId,
-    tint: Tint,
+    tint: Option<[u8; 3]>,
 }
 
 /// A layer the pack fills: its parts and level 0 at tick 0.
@@ -405,11 +162,12 @@ struct PackLayer {
     texels: Vec<[u8; 4]>,
 }
 
-/// The array of `registry`'s layers at the pack's most common texture size; returns it and how
-/// many layers came from the pack.
+/// The array of `registry`'s layers at the pack's most common texture size, each read through its
+/// recipe in `recipes`; returns it and how many layers came from the pack.
 fn pack_block_textures(
     registry: &BlockRegistry,
     pack: &ResourcePack,
+    recipes: &[LayerRecipe],
     warnings: &mut Vec<String>,
 ) -> (BlockTextureData, u32) {
     let size = pack_texture_size(pack, warnings);
@@ -421,7 +179,7 @@ fn pack_block_textures(
     let mut animation_bytes = 0;
     for (index, spec) in specs.iter().enumerate() {
         let shape = shapes.get(index).copied().flatten();
-        match pack_layer(registry, pack, spec, size, warnings) {
+        match pack_layer(registry, pack, recipes, spec, size, warnings) {
             Some(PackLayer {
                 parts,
                 quarter,
@@ -616,12 +374,13 @@ fn finish_alpha(texels: &mut [[u8; 4]], shape: Option<RenderShape>) -> bool {
 fn pack_layer(
     registry: &BlockRegistry,
     pack: &ResourcePack,
+    recipes: &[LayerRecipe],
     spec: &TextureSpec,
     size: u32,
     warnings: &mut Vec<String>,
 ) -> Option<PackLayer> {
-    let Some(recipe) = RECIPES.iter().find(|r| r.layer == spec.name) else {
-        // Not built in: try the texture named like the layer (`game:copper_ore` ->
+    let Some(recipe) = recipes.iter().find(|r| r.layer == spec.name) else {
+        // No recipe: try the texture named like the layer (`game:copper_ore` ->
         // `minecraft:block/copper_ore`).
         let path = spec
             .name
@@ -629,7 +388,7 @@ fn pack_layer(
             .map_or(spec.name.as_str(), |(_, p)| p);
         let parts = vec![Part {
             id: ResourceId::new(ResourceId::DEFAULT_NAMESPACE, format!("block/{path}")),
-            tint: Tint::None,
+            tint: None,
         }];
         return match compose(pack, &parts, size, false, warnings, &tick0) {
             Ok(texels) => Some(PackLayer {
@@ -661,9 +420,9 @@ fn pack_layer(
     let parts: Vec<Part> = recipe
         .fallback
         .iter()
-        .map(|&(path, tint)| Part {
-            id: ResourceId::new(ResourceId::DEFAULT_NAMESPACE, path),
-            tint,
+        .map(|(path, tint)| Part {
+            id: ResourceId::new(ResourceId::DEFAULT_NAMESPACE, path.as_str()),
+            tint: *tint,
         })
         .collect();
     match compose(pack, &parts, size, recipe.quarter, warnings, &tick0) {
@@ -681,9 +440,9 @@ fn pack_layer(
 
 /// The property values `recipe` asks the blockstate for: those of its state (when `registry`
 /// has it) and its extra `variant` ones.
-fn recipe_values(registry: &BlockRegistry, recipe: &Recipe) -> BTreeMap<String, String> {
-    let mut values = parse_variant_key(recipe.variant);
-    if let Ok(state) = registry.parse_state(recipe.state) {
+fn recipe_values(registry: &BlockRegistry, recipe: &LayerRecipe) -> BTreeMap<String, String> {
+    let mut values = parse_variant_key(&recipe.variant);
+    if let Ok(state) = registry.parse_state(&recipe.state) {
         for (property, value) in registry.values(state).iter() {
             values.insert(property.to_string(), value.to_string());
         }
@@ -691,8 +450,8 @@ fn recipe_values(registry: &BlockRegistry, recipe: &Recipe) -> BTreeMap<String, 
     values
 }
 
-/// The models a Minecraft blockstate gives the state with property `values` (one of ours, by its
-/// property string: `boxel:stone_slab[type=top]` -> `type=top`). Variants: the key whose
+/// The models a Minecraft blockstate gives the state with property `values` (one of the game's,
+/// by its property string: `game:stone_slab[type=top]` -> `type=top`). Variants: the key whose
 /// conditions all hold and name the most properties (`""` holds always), else the first one.
 /// Multipart: the first case whose condition holds. Properties the key names and `values` lack
 /// do not hold.
@@ -734,16 +493,16 @@ pub(crate) fn pack_variant<'a>(
 /// The textures of `recipe.face` in the pack's model of `recipe.block` (first model of the
 /// variant [`pack_variant`] picks for `values`, every element that has the face, in order).
 /// `None` when the pack ships no blockstate or model for it (vanilla models are not built in),
-/// or the face is missing. Variant rotations and face UVs are ignored: built-in blocks are full
-/// cubes, and a turned log turns its texture itself.
+/// or the face is missing. Variant rotations and face UVs are ignored: a layer is one full face,
+/// and a turned block turns its texture itself.
 fn model_parts(
     pack: &ResourcePack,
-    recipe: &Recipe,
+    recipe: &LayerRecipe,
     values: &BTreeMap<String, String>,
 ) -> Option<Vec<Part>> {
     let state = pack.blockstate(&ResourceId::new(
         ResourceId::DEFAULT_NAMESPACE,
-        recipe.block,
+        recipe.block.as_str(),
     ))?;
     let model = pack_variant(state, values)?.0.first()?.model.clone();
     let model = pack.model(&model)?;
@@ -756,7 +515,7 @@ fn model_parts(
             tint: if face.tintindex.is_some() {
                 recipe.tint
             } else {
-                Tint::None
+                None
             },
         })
         .collect();
@@ -771,7 +530,7 @@ fn tick0(_: usize, texture: &Texture) -> u32 {
 /// Composites `parts` bottom to top at `size`^2 (part `i` shows strip frame `pick(i, texture)`,
 /// nearest scaling, tint baked in, "over" blending in sRGB like Minecraft's overlay quads). The
 /// first part is required (`Err` names it when missing); a missing later part is a warning.
-/// `quarter`: a frame of twice `size` gives its top-left quarter ([`Recipe::quarter`]).
+/// `quarter`: a frame of twice `size` gives its top-left quarter ([`LayerRecipe::quarter`]).
 fn compose(
     pack: &ResourcePack,
     parts: &[Part],
@@ -797,7 +556,7 @@ fn compose(
             (width, height) = (size, size);
         }
         let mut texels = scale_nearest(width, height, &frame, size);
-        if let Some(tint) = part.tint.rgb() {
+        if let Some(tint) = part.tint {
             for t in &mut texels {
                 for c in 0..3 {
                     t[c] = ((u32::from(t[c]) * u32::from(tint[c]) + 127) / 255) as u8;
@@ -887,7 +646,13 @@ fn scale_nearest(width: u32, height: u32, src: &[[u8; 4]], size: u32) -> Vec<[u8
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use boxel_demo::pack::{FOLIAGE_TINT, GRASS_TINT, WATER_TINT};
     use boxel_gfx::RgbaImage;
+
+    /// The pack at `dir` read with the demo recipes.
+    fn demo_pack(dir: impl Into<PathBuf>) -> TextureSource {
+        TextureSource::Pack(PackSource::new(dir).with_recipes(boxel_demo::pack::recipes()))
+    }
 
     /// A temporary resource pack of generated PNG files (no third-party content), removed on drop.
     pub(crate) struct TempPack(pub(crate) PathBuf);
@@ -976,9 +741,62 @@ pub(crate) mod tests {
     #[test]
     fn a_missing_pack_is_an_error() {
         let registry = boxel_demo::blocks::registry();
-        let source = TextureSource::Pack(PathBuf::from("/nonexistent/boxel/pack"));
+        let source = demo_pack("/nonexistent/boxel/pack");
         assert!(load_block_textures(&registry, &source).is_err());
         assert_eq!(source.label(), "pack");
+    }
+
+    /// The recipes are the game's (#48): without any, every layer reads the texture named like
+    /// it, untinted; a recipe the game passes is the one read.
+    #[test]
+    fn layers_read_the_recipes_the_game_passes() {
+        let pack = TempPack::new("recipes");
+        pack.png("stone", 16, 16, |_, _| [9, 9, 9, 255]);
+        pack.png("grass_top", 16, 16, |_, _| [200, 200, 200, 255]);
+        pack.png("gravel", 16, 16, |_, _| [255, 255, 255, 255]);
+        let registry = boxel_demo::blocks::registry();
+        let procedural = generate_block_textures(registry.textures());
+        let (stone, grass, dirt, gravel) = (
+            layer_of(&registry, "boxel:stone"),
+            layer_of(&registry, "boxel:grass_top"),
+            layer_of(&registry, "boxel:dirt"),
+            layer_of(&registry, "boxel:gravel"),
+        );
+
+        let bare = TextureSource::Pack(PackSource::new(pack.0.clone()));
+        let (data, report) = load_block_textures(&registry, &bare).expect("pack");
+        assert_eq!(report.from_pack, 3, "{:?}", report.warnings);
+        assert_eq!(texel(&data, stone, 1, 1), [9, 9, 9, 255]);
+        assert_eq!(texel(&data, grass, 1, 1), [200, 200, 200, 255]);
+        assert_eq!(texel(&data, gravel, 1, 1), [255, 255, 255, 255]);
+        assert_eq!(texel(&data, dirt, 1, 1), texel(&procedural, dirt, 1, 1));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w == "boxel:dirt: no texture minecraft:block/dirt; procedural"),
+            "{:?}",
+            report.warnings
+        );
+
+        // The dirt layer reads the gravel texture, tinted red; the other layers keep their names.
+        let recipe = LayerRecipe {
+            layer: "boxel:dirt".to_string(),
+            block: "no_such_block".to_string(),
+            state: String::new(),
+            variant: String::new(),
+            face: boxel_pack::FaceName::North,
+            tint: None,
+            fallback: vec![("block/gravel".to_string(), Some([255, 0, 0]))],
+            quarter: false,
+        };
+        let source =
+            TextureSource::Pack(PackSource::new(pack.0.clone()).with_recipes(vec![recipe]));
+        let (data, report) = load_block_textures(&registry, &source).expect("pack");
+        assert_eq!(report.from_pack, 4, "{:?}", report.warnings);
+        assert_eq!(texel(&data, dirt, 1, 1), [255, 0, 0, 255]);
+        assert_eq!(texel(&data, gravel, 1, 1), [255, 255, 255, 255]);
+        assert_eq!(source.label(), bare.label());
     }
 
     #[test]
@@ -1034,7 +852,7 @@ pub(crate) mod tests {
 
         let registry = boxel_demo::blocks::registry();
         let (data, report) =
-            load_block_textures(&registry, &TextureSource::Pack(pack.0.clone())).expect("pack");
+            load_block_textures(&registry, &demo_pack(pack.0.clone())).expect("pack");
         assert_eq!((data.size, data.mip_levels), (16, 5));
         assert_eq!(data.layers as usize, registry.textures().len());
         assert_eq!(data.data.len(), data.layers as usize * data.layer_bytes());
@@ -1122,7 +940,7 @@ pub(crate) mod tests {
 
         let registry = boxel_demo::blocks::registry();
         let (data, report) =
-            load_block_textures(&registry, &TextureSource::Pack(pack.0.clone())).expect("pack");
+            load_block_textures(&registry, &demo_pack(pack.0.clone())).expect("pack");
         assert_eq!(report.animated, 3, "{:?}", data.animations);
         // the water flow moves by its frames and does not scroll; the pack has no lava flow
         assert_eq!(data.animated_flow, [true, false]);
@@ -1215,7 +1033,7 @@ pub(crate) mod tests {
 
         let registry = boxel_demo::blocks::registry();
         let (data, report) =
-            load_block_textures(&registry, &TextureSource::Pack(pack.0.clone())).expect("pack");
+            load_block_textures(&registry, &demo_pack(pack.0.clone())).expect("pack");
         assert_eq!((data.size, data.mip_levels), (32, 6));
         assert_eq!(report.from_pack, 3);
         let top = layer_of(&registry, "boxel:log_top");
@@ -1305,7 +1123,8 @@ pub(crate) mod tests {
             Some("minecraft:block/fence_post")
         );
         // The recipes ask with the state's values: the log layers read `axis=y`.
-        let log_top = RECIPES
+        let recipes = boxel_demo::pack::recipes();
+        let log_top = recipes
             .iter()
             .find(|r| r.layer == "boxel:log_top")
             .expect("recipe");
