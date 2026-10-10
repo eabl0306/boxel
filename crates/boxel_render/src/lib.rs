@@ -33,6 +33,7 @@ macro_rules! frame_span {
 #[cfg(not(feature = "trace"))]
 pub(crate) struct NoSpan;
 
+pub mod fog;
 mod light;
 mod outline;
 mod overlay;

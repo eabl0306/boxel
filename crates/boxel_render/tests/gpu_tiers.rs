@@ -1377,7 +1377,7 @@ fn renderer_smoke_test_passes_on_every_tier() {
                         output_format,
                     };
                     let start = Instant::now();
-                    let result = RendererSmokeTest.run(&ctx);
+                    let result = RendererSmokeTest::default().run(&ctx);
                     eprintln!(
                         "gpu_tiers: smoke {label} {tier} {level:?} {output_format:?}: {} ({:.1} ms)",
                         if result.is_ok() { "ok" } else { "FAILED" },

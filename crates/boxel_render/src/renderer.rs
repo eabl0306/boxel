@@ -1,5 +1,6 @@
 use crate::arena::{QUAD_BYTES, QuadArena};
 use crate::chunk_table::{ChunkRecord, ChunkTable};
+use crate::fog::{FogInput, FogPass};
 use crate::light::SceneLight;
 use crate::outline::{Outline, OutlinePass};
 use crate::path::{
@@ -175,6 +176,11 @@ pub struct RenderStats {
     /// Animated layers the last frame left on an older frame because of the upload budget
     /// ([`VoxelRenderer::set_texture_upload_budget`]).
     pub textures_behind: u32,
+    /// Fog passes the last frame recorded: 2 (march and composite) or 0 (no fog, fog off, or no
+    /// layer in reach; ADR 0030).
+    pub fog_passes: u32,
+    /// Fog layers the last frame marched.
+    pub fog_layers: u32,
 }
 
 /// Renderer errors.
@@ -236,6 +242,10 @@ pub struct VoxelRenderer {
     refused: Refused,
     /// The block outline (ADR 0026).
     outline: OutlinePass,
+    /// The fog passes (ADR 0030), from the first [`VoxelRenderer::set_fog`] with input.
+    fog: Option<FogPass>,
+    /// The fog passes could not be created on this device: fog stays off.
+    fog_failed: bool,
 }
 
 /// The chunks whose last upload [`VoxelRenderer::upsert_chunk`] refused (chunk table or arena
@@ -567,7 +577,7 @@ impl VoxelRenderer {
             }
         };
 
-        let targets = Targets::new(device, size);
+        let targets = Targets::new(device, size, false);
         let blit = Blit::new(device, output_format, &targets.color_view);
         let outline = OutlinePass::new(device);
         Ok(Self {
@@ -597,7 +607,84 @@ impl VoxelRenderer {
             occlusion: Occlusion::default(),
             refused: Refused::default(),
             outline,
+            fog: None,
+            fog_failed: false,
         })
+    }
+
+    /// Sets the fog of the next [`VoxelRenderer::render`] calls (ADR 0030), `None` for none.
+    ///
+    /// The first input creates the fog passes (inside error scopes: if they fail, an error is
+    /// logged and the fog stays off on this renderer) and recreates the depth target so the
+    /// march can read it; `None` drops them and gives the depth target its plain usage back.
+    /// Without fog nothing of it exists and frames are what they were before the fog. With it,
+    /// each `render` marches the layers after the main pass and blends them over the main color
+    /// (before overlays and the blit), unless the settings are off or no layer is in reach
+    /// ([`RenderStats::fog_passes`]).
+    pub fn set_fog(&mut self, device: &wgpu::Device, input: Option<FogInput>) {
+        let Some(input) = input else {
+            if self.fog.take().is_some() {
+                self.targets = Targets::new(device, self.targets.size, false);
+                self.blit.rebind(device, &self.targets.color_view);
+            }
+            return;
+        };
+        if self.fog.is_none() {
+            if self.fog_failed {
+                return;
+            }
+            if !self
+                .targets
+                .depth_usage
+                .contains(wgpu::TextureUsages::TEXTURE_BINDING)
+            {
+                self.targets = Targets::new(device, self.targets.size, true);
+                self.blit.rebind(device, &self.targets.color_view);
+            }
+            let mut pass = None;
+            let built = boxel_gfx::run_in_error_scopes(device, || {
+                pass = Some(FogPass::new(device, &self.targets.depth_view));
+                Ok(())
+            });
+            match (built, pass) {
+                (Ok(()), Some(pass)) => self.fog = Some(pass),
+                (result, _) => {
+                    tracing::error!(
+                        "fog passes: {}; the fog stays off",
+                        result.err().unwrap_or_default()
+                    );
+                    self.fog_failed = true;
+                    self.targets = Targets::new(device, self.targets.size, false);
+                    self.blit.rebind(device, &self.targets.color_view);
+                    return;
+                }
+            }
+        }
+        if let Some(fog) = &mut self.fog {
+            fog.set_input(input);
+        }
+    }
+
+    /// Testing: the usages of the main depth target (`TEXTURE_BINDING` only with fog).
+    #[doc(hidden)]
+    pub fn depth_usage(&self) -> wgpu::TextureUsages {
+        self.targets.depth_usage
+    }
+
+    /// Testing: the fog march target of the last frame as texels (`[color, opacities]`, row by
+    /// row) and its size, `None` without one.
+    #[doc(hidden)]
+    pub fn fog_texels(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Option<Result<(UVec2, Vec<[u32; 2]>), String>> {
+        let texture = self.fog.as_ref()?.target()?;
+        let size = UVec2::new(texture.width(), texture.height());
+        Some(
+            crate::fog::read_words(device, queue, texture)
+                .map(|w| (size, w.as_chunks::<2>().0.to_vec())),
+        )
     }
 
     /// Sets the block outline drawn by the next [`VoxelRenderer::render`] calls (ADR 0026),
@@ -668,8 +755,15 @@ impl VoxelRenderer {
         if size.x == 0 || size.y == 0 || size == self.targets.size {
             return;
         }
-        self.targets = Targets::new(device, size);
+        let sampled = self
+            .targets
+            .depth_usage
+            .contains(wgpu::TextureUsages::TEXTURE_BINDING);
+        self.targets = Targets::new(device, size, sampled);
         self.blit.rebind(device, &self.targets.color_view);
+        if let Some(fog) = &mut self.fog {
+            fog.rebind_depth(device, &self.targets.depth_view);
+        }
     }
     /// Uploads (or replaces) a chunk mesh. `id` is any stable `u64` (`ChunkId::to_bits`),
     /// `origin` the chunk's world voxel min corner (`i64`; the chunk table on the GPU keeps its
@@ -798,7 +892,8 @@ impl VoxelRenderer {
     /// re-sorted for this camera (uploads), clear, (High) cull, opaque buckets with the opaque
     /// pipeline, then the cutout bucket with the cutout pipeline, then the block outline
     /// ([`VoxelRenderer::set_outline`]), then the translucent buckets back to front with the
-    /// translucent pipeline. Submit `encoder` before the next `render`.
+    /// translucent pipeline, then the fog march and composite when there is fog
+    /// ([`VoxelRenderer::set_fog`]). Submit `encoder` before the next `render`.
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -903,6 +998,20 @@ impl VoxelRenderer {
             // Over the solid terrain, under the water (not counted in the draws).
             self.outline.draw(&mut pass);
             solid + self.path.draw_translucent(&mut pass, self.arena.buffer())
+        };
+        (self.stats.fog_passes, self.stats.fog_layers) = match &mut self.fog {
+            Some(fog) => {
+                let _span = frame_span!("render.fog");
+                fog.encode(
+                    device,
+                    queue,
+                    encoder,
+                    view,
+                    &self.targets.color_view,
+                    self.targets.size,
+                )
+            }
+            None => (0, 0),
         };
         self.stats.visible_chunks = visible;
         self.stats.draws = draws;

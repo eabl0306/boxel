@@ -601,3 +601,40 @@ fn fog_entry_points_bind_one_block_and_one_texture_at_most() {
         ]
     );
 }
+
+/// No module that runs on GL 3.3 selects between integer or bool vectors: naga writes
+/// `mix(uvec3, uvec3, bvec3)` for it, which GLSL 330 lacks (integer `mix` came with GLSL 4.50)
+/// and NVIDIA's GL compiler rejects as ambiguous (the fog march hit it). Float vectors and
+/// scalars are fine.
+#[test]
+fn no_integer_vector_selects_on_gl_33() {
+    for id in ShaderModuleId::ALL
+        .into_iter()
+        .filter(|id| id.min_gl() == (3, 3))
+    {
+        let (module, info) = load(id);
+        let functions = module.functions.iter().map(|(h, f)| (f, &info[h])).chain(
+            module
+                .entry_points
+                .iter()
+                .enumerate()
+                .map(|(i, ep)| (&ep.function, info.get_entry_point(i))),
+        );
+        for (f, finfo) in functions {
+            for (h, e) in f.expressions.iter() {
+                if !matches!(e, naga::Expression::Select { .. }) {
+                    continue;
+                }
+                let ty = finfo[h].ty.inner_with(&module.types);
+                if let naga::TypeInner::Vector { scalar, .. } = ty {
+                    assert!(
+                        scalar.kind == naga::ScalarKind::Float,
+                        "{}: {:?} selects a {scalar:?} vector",
+                        id.label(),
+                        f.name
+                    );
+                }
+            }
+        }
+    }
+}

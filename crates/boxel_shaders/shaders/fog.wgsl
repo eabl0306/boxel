@@ -113,13 +113,15 @@ fn lerp_i(a: i32, b: i32, s: i32) -> i32 {
 struct Words { lo: vec3<u32>, hi: vec3<u32> };
 
 // (lo, hi) + li per axis, 64-bit two's complement.
+// (Integer vectors are never `select`ed: naga writes mix(uvec3, uvec3, bvec3), which GLSL 330
+// lacks and NVIDIA's GL compiler rejects. Bool vectors convert to 0/1 instead.)
 fn add_words(lo: vec3<u32>, hi: vec3<u32>, li: vec3<i32>) -> Words {
   let n = lo + bitcast<vec3<u32>>(li);
-  let carry = select(vec3<u32>(0u), vec3<u32>(1u), n < lo);
-  let borrow = select(vec3<u32>(0u), vec3<u32>(0xffffffffu), n > lo);
+  let carry = vec3<u32>(n < lo) * vec3<u32>(li >= vec3<i32>(0));
+  let borrow = vec3<u32>(n > lo) * vec3<u32>(li < vec3<i32>(0));
   var w: Words;
   w.lo = n;
-  w.hi = hi + select(borrow, carry, li >= vec3<i32>(0));
+  w.hi = hi + carry - borrow;
   return w;
 }
 
@@ -388,8 +390,8 @@ fn fs_fog_march(@builtin(position) frag: vec4<f32>) -> @location(0) vec2<u32> {
   let safe = select(select(vec3<f32>(MIN_DIR), vec3<f32>(-MIN_DIR), dir < vec3<f32>(0.0)), dir,
                     abs(dir) >= vec3<f32>(MIN_DIR));
   let inv = 1.0 / safe;
-  let stepv = select(vec3<i32>(-1), vec3<i32>(1), safe > vec3<f32>(0.0));
-  let edge = select(vec3<i32>(0), vec3<i32>(1), stepv > vec3<i32>(0));
+  let edge = vec3<i32>(safe > vec3<f32>(0.0));
+  let stepv = edge * 2 - 1;
 
   for (var n = 0u; n < count; n++) {
     if (st.done) { break; }
@@ -449,7 +451,7 @@ fn fs_fog_march(@builtin(position) frag: vec4<f32>) -> @location(0) vec2<u32> {
       prev_full = sigma > 0.0;
       if (t_exit >= tb) { break; }
       let along = vec3<bool>(axis == 0u, axis == 1u, axis == 2u);
-      cell = select(cell, cell + stepv, along);
+      cell += stepv * vec3<i32>(along);
       t_next = select(t_next, (grid + vec3<f32>(cell + edge) * size3 - eye) * inv, along);
       entry = face_shade(li, axis, stepv[axis]);
       s0 = s1;

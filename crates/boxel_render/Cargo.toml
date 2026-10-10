@@ -28,6 +28,8 @@ boxel_mesh.workspace = true
 boxel_world.workspace = true
 # Block textures from a Minecraft resource pack (TextureSource::Pack).
 boxel_pack.workspace = true
+# The fog layers, their noise and the reference march (ADR 0030).
+boxel_fog.workspace = true
 wgpu.workspace = true
 bytemuck.workspace = true
 # Answers of the translucent sort jobs (Send + Sync, unlike std's receiver).

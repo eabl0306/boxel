@@ -11,13 +11,18 @@ pub(crate) struct Targets {
     pub color_view: wgpu::TextureView,
     /// View of the depth target.
     pub depth_view: wgpu::TextureView,
+    /// Usages of the depth target: `RENDER_ATTACHMENT`, plus `TEXTURE_BINDING` when the fog
+    /// samples it.
+    pub depth_usage: wgpu::TextureUsages,
     /// Size in pixels (never 0).
     pub size: UVec2,
 }
 
 impl Targets {
-    /// Creates both targets; each dimension is clamped to `1..=max_texture_dimension_2d`.
-    pub fn new(device: &wgpu::Device, size: UVec2) -> Self {
+    /// Creates both targets; each dimension is clamped to `1..=max_texture_dimension_2d`. With
+    /// `sampled_depth` (only when the fog is on, ADR 0030) the depth can also be bound as a
+    /// texture; without it its usage is exactly `RENDER_ATTACHMENT`.
+    pub fn new(device: &wgpu::Device, size: UVec2, sampled_depth: bool) -> Self {
         let max = device.limits().max_texture_dimension_2d.max(1);
         let size = size.clamp(UVec2::ONE, UVec2::splat(max));
         let extent = wgpu::Extent3d {
@@ -37,6 +42,11 @@ impl Targets {
                 | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
+        let depth_usage = if sampled_depth {
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+        } else {
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+        };
         let depth = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("boxel depth"),
             size: extent,
@@ -44,12 +54,13 @@ impl Targets {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: depth_usage,
             view_formats: &[],
         });
         Self {
             color_view: color.create_view(&wgpu::TextureViewDescriptor::default()),
             depth_view: depth.create_view(&wgpu::TextureViewDescriptor::default()),
+            depth_usage,
             color,
             size,
         }

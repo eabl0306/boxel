@@ -505,6 +505,7 @@ dependencies = [
  "boxel_demo",
  "boxel_diagnostic",
  "boxel_ecs",
+ "boxel_fog",
  "boxel_gfx",
  "boxel_light",
  "boxel_math",

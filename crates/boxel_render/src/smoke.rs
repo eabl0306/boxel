@@ -14,6 +14,7 @@ use boxel_voxel::{
     BlockRegistry, BlockRegistryBuilder, Face, LightValue, TextureImage, TextureSpec,
 };
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Edge of the smoke test targets.
 const SIZE: u32 = 16;
@@ -29,23 +30,65 @@ const SIZE: u32 = 16;
 /// vertex buffer on Low, offset by the draw's first instance like the quads (the cutout draw
 /// starts at instance 1; GL emulates that offset per buffer). Passed to `boxel_gfx::select_gpu`
 /// by the render plugin so a tier is only chosen if its actual shaders work on that device.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct RendererSmokeTest;
+///
+/// With `fog` (the app has the fog plugin, ADR 0030) it also checks the fog passes in their own
+/// error scopes: `Compile` builds them, `Draw` draws a dense fog layer between the camera and
+/// the quads and checks that the center pixel turned to the fog's white. A failure never
+/// rejects the tier: it stores `false` in `fog_ok` (and logs a warning), and the render plugin
+/// then leaves the fog off on that device.
+#[derive(Clone, Debug)]
+pub struct RendererSmokeTest {
+    /// Also check the fog passes.
+    pub fog: bool,
+    /// Set by each run: false if the fog check failed on the last device tested.
+    pub fog_ok: Arc<AtomicBool>,
+}
+
+impl Default for RendererSmokeTest {
+    /// No fog check.
+    fn default() -> Self {
+        Self {
+            fog: false,
+            fog_ok: Arc::new(AtomicBool::new(true)),
+        }
+    }
+}
 
 impl SmokeTest for RendererSmokeTest {
     fn run(&self, ctx: &SmokeContext<'_>) -> Result<(), String> {
+        self.fog_ok.store(true, Ordering::Relaxed);
         // Own scopes too (nested inside the caller's), so direct callers also get errors back.
         run_in_error_scopes(ctx.device, || match ctx.level {
-            SmokeLevel::Draw => draw(ctx),
-            SmokeLevel::Auto | SmokeLevel::Compile => compile(ctx),
+            SmokeLevel::Draw => draw(ctx, self),
+            SmokeLevel::Auto | SmokeLevel::Compile => compile(ctx, self),
         })
     }
 }
 
+/// Records the fog check's outcome: a failure turns the fog off, never the tier.
+fn fog_check(smoke: &RendererSmokeTest, ctx: &SmokeContext<'_>, result: Result<(), String>) {
+    if let Err(e) = result {
+        tracing::warn!(
+            "fog smoke check ({} tier): {e}; the fog stays off on this device",
+            ctx.tier
+        );
+        smoke.fog_ok.store(false, Ordering::Relaxed);
+    }
+}
+
 /// Every pipeline of the tier + the blit for the output format; one main pass and one blit.
-fn compile(ctx: &SmokeContext<'_>) -> Result<(), String> {
+/// With the fog check, the fog passes too (in their own scopes).
+fn compile(ctx: &SmokeContext<'_>, smoke: &RendererSmokeTest) -> Result<(), String> {
+    if smoke.fog {
+        let targets = Targets::new(ctx.device, UVec2::splat(SIZE), true);
+        let result = run_in_error_scopes(ctx.device, || {
+            drop(crate::fog::FogPass::new(ctx.device, &targets.depth_view));
+            Ok(())
+        });
+        fog_check(smoke, ctx, result);
+    }
     let pipelines = TierPipelines::new(ctx.device, ctx.tier);
-    let targets = Targets::new(ctx.device, UVec2::splat(SIZE));
+    let targets = Targets::new(ctx.device, UVec2::splat(SIZE), false);
     let blit = Blit::new(ctx.device, ctx.output_format, &targets.color_view);
     let output = output_texture(ctx);
     let mut encoder = ctx
@@ -66,7 +109,7 @@ fn compile(ctx: &SmokeContext<'_>) -> Result<(), String> {
 }
 
 /// A real renderer drawing one opaque and one cutout quad under a camera looking down.
-fn draw(ctx: &SmokeContext<'_>) -> Result<(), String> {
+fn draw(ctx: &SmokeContext<'_>, smoke: &RendererSmokeTest) -> Result<(), String> {
     let config = RendererConfig {
         arena_quads: 1024,
         max_chunk_slots: 8,
@@ -135,6 +178,11 @@ fn draw(ctx: &SmokeContext<'_>) -> Result<(), String> {
         }
     }
 
+    if smoke.fog {
+        let result = run_in_error_scopes(ctx.device, || fog_draw(ctx, &mut renderer, &view));
+        fog_check(smoke, ctx, result);
+    }
+
     let output = output_texture(ctx);
     let mut encoder = ctx
         .device
@@ -146,6 +194,43 @@ fn draw(ctx: &SmokeContext<'_>) -> Result<(), String> {
         &output.create_view(&wgpu::TextureViewDescriptor::default()),
     );
     submit_and_wait(ctx.device, ctx.queue, encoder)
+}
+
+/// The smoke scene under a dense white fog layer between the camera (y 24) and the quads (y 0
+/// and 4): the center pixel must turn white. Leaves the renderer without fog.
+fn fog_draw(
+    ctx: &SmokeContext<'_>,
+    renderer: &mut VoxelRenderer,
+    view: &ViewParams,
+) -> Result<(), String> {
+    let mut layer = crate::fog::FogLayer::new(8, 16);
+    layer.density = 4.0;
+    let input = crate::fog::FogInput {
+        settings: Arc::new(crate::fog::FogSettings::new(vec![layer])),
+        tick: 0,
+    };
+    renderer.set_fog(ctx.device, Some(input));
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("boxel smoke fog"),
+        });
+    renderer.render(ctx.device, ctx.queue, &mut encoder, view);
+    submit_and_wait(ctx.device, ctx.queue, encoder)?;
+    let passes = renderer.stats().fog_passes;
+    let image = read_texture_rgba8(ctx.device, ctx.queue, renderer.main_color())?;
+    renderer.set_fog(ctx.device, None);
+    if passes != 2 {
+        return Err(format!("{passes} fog passes recorded"));
+    }
+    let i = ((SIZE / 2) * SIZE + SIZE / 2) as usize * 4;
+    let center = &image.data[i..i + 3];
+    if center.iter().any(|&c| c < 240) {
+        return Err(format!(
+            "the center pixel {center:?} is not the white of a dense fog layer"
+        ));
+    }
+    Ok(())
 }
 
 /// True if `pixel` (sRGB) is clearly lit by light of one color, channel `c` (0 red, 1 green,

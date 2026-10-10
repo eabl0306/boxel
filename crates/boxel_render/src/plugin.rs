@@ -1122,7 +1122,7 @@ fn select(
         policy: settings.tier_policy,
         lkg,
         exclusions,
-        smoke: &RendererSmokeTest,
+        smoke: &RendererSmokeTest::default(),
         smoke_level: settings.smoke_level,
         create_devices: true,
     })
