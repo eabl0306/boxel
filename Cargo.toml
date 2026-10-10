@@ -76,6 +76,10 @@ tracing-tracy = "=0.12.0"
 profiling = { version = "1.0.18", default-features = false }
 log = "0.4.34"
 png = "0.18.1"
+# World saves (ADR 0024): an embedded key-value store in pure Rust and LZ4 block compression
+# (no frame format: no twox-hash).
+redb = "4.3.0"
+lz4_flex = { version = "0.14.0", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
 
 # ---- dev-only
 criterion = { version = "0.8.2", features = ["html_reports"] }

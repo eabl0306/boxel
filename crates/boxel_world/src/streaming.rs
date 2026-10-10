@@ -24,6 +24,7 @@
 //!   inside some viewer's keep region with data that was at least started.
 use crate::interest::{Level, Planner, Viewer};
 use crate::jobs::JobExecutor;
+use crate::persist::Persist;
 use crate::scheduler::{JobId, JobKind, JobScheduler};
 use crate::sky::{
     ColumnId, SkyMap, SkyRule, SkyState, WalkJob, layer_below, may_block, padded_chunks,
@@ -174,7 +175,7 @@ pub(crate) enum JobMessage {
     },
     /// The job saw the slot's cancel flag and did nothing.
     Cancelled { id: JobId, kind: JobKind },
-    /// The job panicked, or was dropped without running.
+    /// The job panicked, was dropped without running, or could not read its saved chunk.
     Failed {
         id: JobId,
         kind: JobKind,
@@ -668,6 +669,9 @@ pub(crate) struct WorldJobs {
     pub(crate) failed: usize,
     /// Chunks whose failure was already error-logged.
     failure_logged: HashSet<ChunkId, foldhash::fast::FixedState>,
+    /// Saving and loading (ADR 0024), once `PersistPlugin` is added: edited chunks are staged
+    /// as they unload, saved chunks are loaded instead of generated.
+    pub(crate) persist: Option<Persist>,
 }
 
 impl WorldJobs {
@@ -711,6 +715,7 @@ impl WorldJobs {
             relookups: 0,
             failed: 0,
             failure_logged: HashSet::default(),
+            persist: None,
         }
     }
 
@@ -1119,9 +1124,9 @@ impl WorldJobs {
     }
 
     /// New slot at `pos`: data `Queued` with a generation job, or `Ready` air at once if the
-    /// generator declares the layer all air (then its 26 neighbors are looked up once, for its
-    /// own bits and for theirs). A `Queued` slot's own neighbor bits are not looked up: they are
-    /// computed when its data arrives.
+    /// generator declares the layer all air and no copy of the chunk is saved (then its 26
+    /// neighbors are looked up once, for its own bits and for theirs). A `Queued` slot's own
+    /// neighbor bits are not looked up: they are computed when its data arrives.
     pub(crate) fn create_slot(
         &mut self,
         cx: &mut Ctx<'_>,
@@ -1129,7 +1134,12 @@ impl WorldJobs {
         pos: ChunkPos,
         interest: Interest,
     ) -> ChunkId {
-        let near = cx.known_air(pos.y).then(|| neighbor_ids(cx.map, pos));
+        let air = cx.known_air(pos.y)
+            && !self
+                .persist
+                .as_ref()
+                .is_some_and(|p| p.is_saved_at(settings.dimension, pos));
+        let near = air.then(|| neighbor_ids(cx.map, pos));
         let column = cx.sky.attach(pos, settings.dimension);
         let slot = ChunkSlot::new(
             ChunkKey {
@@ -1206,8 +1216,9 @@ impl WorldJobs {
         }
     }
 
-    /// Removes a slot: cancels its job, publishes `Remove` if its mesh was published, clears its
-    /// bit in the 26 neighbors and bumps their epoch. A neighbor with an `Empty` mesh forgets it
+    /// Removes a slot: cancels its job, hands its blocks over for saving if it has unsaved edits
+    /// (with persistence), publishes `Remove` if its mesh was published, clears its bit in the 26
+    /// neighbors and bumps their epoch. A neighbor with an `Empty` mesh forgets it
     /// (it may have been empty only because of this chunk, which may come back different).
     ///
     /// A slot outside the vertical bounds (left behind by a bounds change) becomes air for its
@@ -1220,6 +1231,14 @@ impl WorldJobs {
         };
         slot.cancel.store(true, Ordering::Relaxed);
         self.failure_logged.remove(&id);
+        if let Some(p) = &mut self.persist
+            && slot.dirty()
+        {
+            p.dirty.remove(&id);
+            if let DataState::Ready(data) = slot.data() {
+                p.stage(slot.key(), Arc::clone(data));
+            }
+        }
         if self.published.remove(&id).is_some() {
             cx.events.push(ChunkMeshEvent::Remove {
                 id,
@@ -1231,7 +1250,8 @@ impl WorldJobs {
         // All 26 lookups first: independent, so their cache misses overlap.
         let near = neighbor_ids(cx.map, slot.pos);
         // A face neighbor's mesh was built from this chunk's border, which may come back
-        // different (edits are not kept yet): the renderer no longer shows it as its blocks are.
+        // different (without persistence edits are lost): the renderer no longer shows it as its
+        // blocks are.
         for i in FACE_NEIGHBORS {
             if let Some(n) = near[i] {
                 cx.map.set_shown(n, false);
@@ -1370,13 +1390,14 @@ impl WorldJobs {
         }
     }
 
-    /// Slot `slot` (id `id`) was removed: its column loses it (and goes with its last slot). A
-    /// chunk whose edits moved a sky top takes them with it (nothing is persisted yet), so its
-    /// column is walked again.
+    /// Slot `slot` (id `id`) was removed: its column loses it (and goes with its last slot).
+    /// Without persistence, a chunk whose edits moved a sky top takes them with it, so its
+    /// column is walked again; with it, the edits are saved and the tile stays as it is (a later
+    /// walk reads the saved chunk).
     fn column_lost_slot(&mut self, cx: &mut Ctx<'_>, slot: &ChunkSlot, id: ChunkId) {
         let col = slot.column;
         self.walk_data_arrived(cx, col, id);
-        if cx.sky.detach(col, slot.pos.y) || !slot.sky_edited() {
+        if cx.sky.detach(col, slot.pos.y) || !slot.sky_edited() || self.persist.is_some() {
             return;
         }
         let c = &mut cx.sky.columns[col];
@@ -1804,6 +1825,13 @@ impl WorldJobs {
             if let Some(data) = cx.map.ready_data_mut(id) {
                 Arc::make_mut(data).set(local, state);
             }
+            if let Some(p) = &mut self.persist {
+                let slot = &mut cx.map.slots[id];
+                if !slot.dirty() {
+                    slot.set_dirty(true);
+                    p.dirty.insert(id);
+                }
+            }
             if registry.occludes(old) != registry.occludes(state) {
                 refaced.insert(id);
                 let pos = cx.map.slots[id].pos;
@@ -1911,10 +1939,14 @@ impl WorldJobs {
         }
         // The top was cleared: the next blocker down, in the loaded data.
         let (x, z, loaded) = (c.x, c.z, &c.layers);
+        let saved = self
+            .persist
+            .as_ref()
+            .map_or(&[][..], |p| p.layers(c.dim, x, z));
         let map = &*cx.map;
         let found =
             Arc::make_mut(tile).rescan_column(lx, lz, p.y - 1, &cx.content.light_tables, |cy| {
-                rescan_layer(map, (x, z), cy, loaded, &layers)
+                rescan_layer(map, (x, z), cy, loaded, saved, &layers)
             });
         match found {
             Rescan::Found(next) => Some(sky_band(p.x, p.z, next, top)),
@@ -2105,6 +2137,14 @@ impl WorldJobs {
         cx.map.set_data(id, DataState::Generating);
         let generator = Arc::clone(&cx.content.generator);
         let registry = Arc::clone(&cx.content.registry);
+        // A saved chunk is read instead (a damaged record is generated). When the store fails,
+        // the job fails: the chunk stays out until it loads again, never a made-up copy that an
+        // edit would save over the record.
+        let store = self
+            .persist
+            .as_ref()
+            .filter(|p| p.is_saved(key))
+            .map(|p| p.store.clone());
         spawn_job(
             self.executor.as_ref(),
             &self.tx,
@@ -2112,7 +2152,17 @@ impl WorldJobs {
             JobKind::Generate,
             cancel,
             move || {
-                let data = generator.generate(key, &registry);
+                let data = match store.map(|s| s.load_chunk(key)).transpose() {
+                    Ok(Some(Some(saved))) => Arc::unwrap_or_clone(saved),
+                    Ok(_) => generator.generate(key, &registry),
+                    Err(e) => {
+                        return JobMessage::Failed {
+                            id: JobId::Chunk(id),
+                            kind: JobKind::Generate,
+                            panic: format!("the saved chunk cannot be read: {e}"),
+                        };
+                    }
+                };
                 let faces = ChunkFaceInfo::compute(&data, &registry);
                 JobMessage::Generated { id, data, faces }
             },
@@ -2252,7 +2302,19 @@ impl WorldJobs {
             return false;
         };
         let old = old.clone();
-        let Some(start) = rule.start(c.edit_top) else {
+        // Saved chunks of the column (ADR 0024): the walk starts at least at the top of the
+        // highest one (an edit above the generator may be in it) and reads those not loaded.
+        let saved = self
+            .persist
+            .as_ref()
+            .map(|p| p.layers(c.dim, c.x, c.z).to_vec())
+            .unwrap_or_default();
+        let saved_top = saved.last().map(|&cy| (cy << CHUNK_SHIFT) + 31);
+        let start = match (rule.start(c.edit_top), saved_top) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        let Some(start) = start else {
             // Nothing in the column: open forever.
             let open = Arc::clone(&cx.sky.open);
             self.land_tile(cx, col, old, open);
@@ -2300,6 +2362,29 @@ impl WorldJobs {
                 map.data_at(ChunkPos::new(x, cy, z))
                     .is_some_and(|d| may_block(d, tables))
             });
+        // The saved layers not captured (not loaded, or still loading under the layers the walk
+        // waited for): the job reads them from the store. Those under the floor only matter
+        // where a column can reach the void (content below it).
+        let uncaptured = |cy: &i64| {
+            map.id_at(ChunkPos::new(x, *cy, z))
+                .is_none_or(|id| !map.slots[id].data().is_readable())
+        };
+        let last = start >> CHUNK_SHIFT;
+        let saved_in: Vec<i64> = saved
+            .iter()
+            .copied()
+            .filter(|cy| (floor..=last).contains(cy) && uncaptured(cy))
+            .collect();
+        let saved_below: Vec<i64> = saved
+            .iter()
+            .copied()
+            .filter(|cy| rule.void_reachable && *cy < floor && uncaptured(cy))
+            .collect();
+        let store = self
+            .persist
+            .as_ref()
+            .filter(|_| !saved_in.is_empty() || !saved_below.is_empty())
+            .map(|p| p.store.clone());
         let version = c.version;
         c.state = SkyState::InFlight { version, old };
         let job = WalkJob {
@@ -2311,6 +2396,9 @@ impl WorldJobs {
             layers: rule.layers,
             captured,
             content_below,
+            saved: saved_in,
+            saved_below,
+            store,
         };
         let cancel = Arc::clone(&c.cancel);
         let generator = Arc::clone(&cx.content.generator);
@@ -3015,15 +3103,17 @@ fn light_reach(
 }
 
 /// Layer `cy` of column `(x, z)` for a rescan after an edit: loaded data, or air above the
-/// generator's range down to the next loaded layer (an unloaded chunk there lost its edits;
-/// `loaded`: the column's loaded layers, ascending). `None` otherwise: inside the range a walk
-/// generates the layer, and under it a walk decides between air and void from the loaded
-/// content below.
+/// generator's range down to the next loaded or saved layer (`loaded` and `saved`: the
+/// column's loaded and saved layers, ascending; without persistence an unloaded chunk there lost
+/// its edits). `None` otherwise: inside the range a walk generates the layer, a saved layer
+/// that is not loaded is read by a walk, and under the range a walk decides between air and
+/// void from the content below.
 fn rescan_layer<'m>(
     map: &'m ChunkMap,
     (x, z): (i64, i64),
     cy: i64,
     loaded: &[i64],
+    saved: &[i64],
     layers: &RangeInclusive<i64>,
 ) -> Option<LayerData<'m>> {
     if layers.is_empty() || cy < *layers.start() {
@@ -3036,9 +3126,13 @@ fn rescan_layer<'m>(
             DataState::Queued | DataState::Generating => {}
         }
     }
+    if saved.binary_search(&cy).is_ok() {
+        return None;
+    }
     if cy > *layers.end() {
         let end = *layers.end();
-        let next = layer_below(loaded, cy).map_or(end, |below| below.max(end));
+        let below = layer_below(loaded, cy).max(layer_below(saved, cy));
+        let next = below.map_or(end, |below| below.max(end));
         return Some(LayerData::AirUntil(next));
     }
     None

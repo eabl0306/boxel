@@ -10,6 +10,7 @@
 //! (`SkyTile::raise`, `SkyTile::rescan_column`) or send the column back to `Pending` for a new
 //! walk; a walk result whose column changed meanwhile (its `version`) is discarded.
 use crate::ChunkId;
+use crate::persist::WorldStore;
 use boxel_ecs::prelude::*;
 use boxel_light::sky_tile::{GeneratorTop, walk, walk_floor};
 use boxel_light::{LayerData, SkyTile};
@@ -351,31 +352,88 @@ pub(crate) struct WalkJob {
     /// A loaded chunk under the walk's range may hold a blocker (only looked at when the walk
     /// can reach the void): layers under the generator's range are then air, not void.
     pub(crate) content_below: bool,
+    /// Saved layers of the walk's range that are not loaded (ADR 0024): read from `store` before
+    /// the walk and walked like `captured` ones.
+    pub(crate) saved: Vec<i64>,
+    /// Saved layers under the walk's range that are not loaded (only where the walk can reach
+    /// the void): one with a blocker counts like `content_below`.
+    pub(crate) saved_below: Vec<i64>,
+    /// The world's store, when `saved` or `saved_below` is not empty.
+    pub(crate) store: Option<WorldStore>,
 }
 
 impl WalkJob {
-    /// Walks the column: loaded layers from `captured`, the rest generated privately (a
-    /// generation that panics reads as air, as a `Missing` chunk does) or known air outside the
-    /// generator's range. Returns the tile and how many chunks were generated.
+    /// Walks the column: loaded layers from `captured`, saved layers from the store, the rest
+    /// generated privately (a generation that panics reads as air, as a `Missing` chunk does)
+    /// or known air outside the generator's range. Returns the tile and how many chunks were
+    /// generated.
     pub(crate) fn run(
-        &self,
+        mut self,
         generator: &dyn WorldGenerator,
         registry: &boxel_voxel::BlockRegistry,
         tables: &LightTables,
     ) -> (SkyTile, u32) {
         let mut generated = 0;
+        self.read_saved(generator, registry, tables, &mut generated);
         let tile = walk(self.start, self.floor, tables, |cy| {
             self.layer(cy, tables, |pos| {
                 generated += 1;
-                let key = ChunkKey {
-                    dim: self.dim,
-                    lod: 0,
-                    pos,
-                };
-                catch_unwind(AssertUnwindSafe(|| generator.generate(key, registry))).ok()
+                self.generate(generator, registry, pos)
             })
         });
         (tile, generated)
+    }
+
+    /// A private generation of the chunk at `pos` (`None` if the generator panics).
+    fn generate(
+        &self,
+        generator: &dyn WorldGenerator,
+        registry: &boxel_voxel::BlockRegistry,
+        pos: ChunkPos,
+    ) -> Option<ChunkData> {
+        let key = ChunkKey {
+            dim: self.dim,
+            lod: 0,
+            pos,
+        };
+        catch_unwind(AssertUnwindSafe(|| generator.generate(key, registry))).ok()
+    }
+
+    /// Reads the saved layers that are not loaded into `captured`, like loaded ones (a record
+    /// that cannot be read is generated, as its load would be), and looks for a blocker in the
+    /// saved layers under the range.
+    fn read_saved(
+        &mut self,
+        generator: &dyn WorldGenerator,
+        registry: &boxel_voxel::BlockRegistry,
+        tables: &LightTables,
+        generated: &mut u32,
+    ) {
+        let Some(store) = self.store.take() else {
+            return;
+        };
+        let key = |cy| ChunkKey {
+            dim: self.dim,
+            lod: 0,
+            pos: ChunkPos::new(self.x, cy, self.z),
+        };
+        for cy in std::mem::take(&mut self.saved) {
+            let data = store.read_chunk(key(cy)).or_else(|| {
+                *generated += 1;
+                self.generate(generator, registry, ChunkPos::new(self.x, cy, self.z))
+                    .map(Arc::new)
+            });
+            self.captured.push((cy, data));
+        }
+        self.captured
+            .sort_unstable_by_key(|(cy, _)| std::cmp::Reverse(*cy));
+        if !self.content_below {
+            self.content_below = std::mem::take(&mut self.saved_below).into_iter().any(|cy| {
+                store
+                    .read_chunk(key(cy))
+                    .is_some_and(|d| may_block(&d, tables))
+            });
+        }
     }
 
     /// Layer `cy` of the column; `generate` makes a chunk that is not loaded. Under the
@@ -515,6 +573,9 @@ mod tests {
             layers: rule.layers.clone(),
             captured,
             content_below: false,
+            saved: Vec::new(),
+            saved_below: Vec::new(),
+            store: None,
         };
         let (plain, generated) = job(Vec::new()).run(&g, &registry, &tables);
         assert!(generated > 0);
@@ -556,6 +617,9 @@ mod tests {
             layers: rule.layers.clone(),
             captured,
             content_below,
+            saved: Vec::new(),
+            saved_below: Vec::new(),
+            store: None,
         };
         let holed = Arc::new(holed);
         let (open, _) = job(vec![(0, Some(Arc::clone(&holed)))], false).run(&g, &registry, &tables);

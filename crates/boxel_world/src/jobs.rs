@@ -1,5 +1,5 @@
 //! Where chunk jobs run.
-use boxel_tasks::{AsyncComputeTaskPool, TaskPool};
+use boxel_tasks::{AsyncComputeTaskPool, IoTaskPool, TaskPool};
 
 /// Runs boxed jobs somewhere. Results come back through channels owned by the world.
 ///
@@ -23,6 +23,20 @@ pub struct TaskPoolExecutor;
 impl JobExecutor for TaskPoolExecutor {
     fn spawn(&self, job: Box<dyn FnOnce() + Send + 'static>) {
         AsyncComputeTaskPool::get_or_init(TaskPool::default)
+            .spawn(async move { job() })
+            .detach();
+    }
+}
+
+/// Runs jobs on `boxel_tasks::IoTaskPool` (detached tasks): jobs that wait on the disk, such as
+/// the world's saves (ADR 0024), so they never hold a chunk worker. Uses
+/// `IoTaskPool::get_or_init(TaskPool::default)`, so it also works without `TaskPoolPlugin`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IoTaskPoolExecutor;
+
+impl JobExecutor for IoTaskPoolExecutor {
+    fn spawn(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+        IoTaskPool::get_or_init(TaskPool::default)
             .spawn(async move { job() })
             .detach();
     }

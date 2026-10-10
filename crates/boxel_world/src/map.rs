@@ -124,8 +124,8 @@ pub struct ChunkSlot {
     pub neighbors_ready: u32,
     /// Bumped when a neighbor's border data changes (closes the neighbor-staleness gap).
     pub epoch: u32,
-    /// [`REMESH_PENDING`], [`SKY_EDITED`], [`LIGHT_JOB`] and [`SHOWN`] (one byte, so the slot
-    /// stays at 112 bytes).
+    /// [`REMESH_PENDING`], [`SKY_EDITED`], [`LIGHT_JOB`], [`SHOWN`] and [`DIRTY`] (one byte, so
+    /// the slot stays at 112 bytes).
     bits: u8,
     /// The mesh job is waiting for a sky tile of its 3x3 columns (counted in
     /// [`WorldStats::waiting_sky`]).
@@ -145,13 +145,16 @@ pub struct ChunkSlot {
 
 /// [`ChunkSlot::bits`]: a remesh was requested while a job was in flight.
 const REMESH_PENDING: u8 = 1;
-/// [`ChunkSlot::bits`]: an edit changed a voxel that stops direct sky here: unloading the chunk
-/// loses the edit (no persistence yet), so its column is walked again.
+/// [`ChunkSlot::bits`]: an edit changed a voxel that stops direct sky here: without
+/// persistence, unloading the chunk loses the edit, so its column is walked again.
 const SKY_EDITED: u8 = 1 << 1;
 /// [`ChunkSlot::bits`]: a light job for this slot is queued or running (at most one).
 const LIGHT_JOB: u8 = 1 << 2;
 /// [`ChunkSlot::bits`]: the renderer shows the chunk as its blocks are ([`ChunkSlot::shown`]).
 const SHOWN: u8 = 1 << 3;
+/// [`ChunkSlot::bits`]: the chunk has edits that were not handed over for saving yet (only with
+/// persistence, ADR 0024).
+const DIRTY: u8 = 1 << 4;
 
 /// A chunk's cached light and the content it was computed from (one allocation, so the slot
 /// stays small).
@@ -288,14 +291,23 @@ impl ChunkSlot {
             self.bits &= !bit;
         }
     }
-    /// An edit changed a voxel that stops direct sky here: unloading the chunk loses the edit
-    /// (no persistence yet), so its column is walked again.
+    /// An edit changed a voxel that stops direct sky here: without persistence, unloading the
+    /// chunk loses the edit, so its column is walked again.
     pub(crate) fn sky_edited(&self) -> bool {
         self.bits & SKY_EDITED != 0
     }
     /// Sets [`ChunkSlot::sky_edited`].
     pub(crate) fn set_sky_edited(&mut self) {
         self.bits |= SKY_EDITED;
+    }
+    /// The chunk has edits that were not handed over for saving yet (only with persistence,
+    /// ADR 0024): it is saved when it unloads, by the autosave or on exit.
+    pub fn dirty(&self) -> bool {
+        self.bits & DIRTY != 0
+    }
+    /// Sets [`ChunkSlot::dirty`].
+    pub(crate) fn set_dirty(&mut self, on: bool) {
+        self.set_bit(DIRTY, on);
     }
     /// A light job for this slot is queued or running (at most one).
     pub(crate) fn light_job(&self) -> bool {

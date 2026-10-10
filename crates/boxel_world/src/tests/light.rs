@@ -657,7 +657,7 @@ fn a_platform_far_above_shadows_the_ground() {
     assert!(assert_matches_reference(&app) > 0);
 }
 
-/// The platform's chunk unloads (no persistence yet: its edits are lost): the columns are
+/// The platform's chunk unloads (no persistence here: its edits are lost): the columns are
 /// walked again, their tops go back down and the ground under them is lit again.
 #[test]
 fn an_unloaded_platform_takes_its_shadow_with_it() {

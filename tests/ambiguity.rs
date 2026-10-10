@@ -1,7 +1,8 @@
 //! The engine's systems are not ambiguous with each other.
 //!
 //! An app with the headless engine plugins, the fly camera, the world (inline jobs) with its day
-//! and night clock, and physics (with the `physics` feature) runs with
+//! and night clock, flowing water and saves (in memory), and physics (with the `physics`
+//! feature) runs with
 //! `ambiguity_detection: LogLevel::Error` on `First`, `PreUpdate`, `RunFixedMainLoop`,
 //! `FixedUpdate`, `FixedPostUpdate`, `Update`, `PostUpdate` and `Last`: building those schedules
 //! on the first `app.update()` panics on any pair of systems with conflicting access and no
@@ -37,12 +38,14 @@ use boxel::ecs::prelude::*;
 use boxel::ecs::schedule::{LogLevel, ScheduleBuildSettings};
 use boxel::math::DVec3;
 use boxel::transform::Transform;
+use boxel::voxel::BlockRegistry;
 use boxel::voxel::{BlockPos, ChunkPos};
 use boxel::window::{ButtonInput, InputPlugin, KeyCode};
 use boxel::world::jobs::InlineExecutor;
+use boxel::world::persist::{MemoryStore, PersistPlugin, WorldStore};
 use boxel::world::{
-    ChunkMap, ChunkViewer, DaylightPlugin, Interest, TimeOfDay, WorldPlugin, WorldStats,
-    WorldSystems,
+    ChunkMap, ChunkViewer, DaylightPlugin, FluidPlugin, Interest, TimeOfDay, WorldPlugin,
+    WorldStats, WorldSystems,
 };
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -71,6 +74,19 @@ fn strict_app() -> App {
             ..WorldPlugin::default()
         },
         DaylightPlugin,
+    ));
+    let store = WorldStore::open(
+        Arc::new(MemoryStore::new()),
+        &BlockRegistry::default_blocks(),
+        "terrain",
+    )
+    .expect("an empty world opens");
+    app.add_plugins((
+        FluidPlugin,
+        PersistPlugin {
+            store,
+            executor: Arc::new(InlineExecutor),
+        },
     ));
     #[cfg(feature = "physics")]
     app.add_plugins(boxel::physics::PhysicsPlugin::default());

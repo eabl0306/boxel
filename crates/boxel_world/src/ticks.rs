@@ -213,6 +213,37 @@ impl BlockTicks {
         self.queue.scheduled.contains_key(&pos)
     }
 
+    /// Every tick waiting, as `(position, game ticks from now)` in the order they run: first
+    /// the ticks frozen until a chunk loads (already due: 0), by chunk and in the order they
+    /// froze, then the queue. What a saved world keeps (ADR 0024, [`BlockTicks::restore`]).
+    pub fn pending(&self) -> Vec<(BlockPos, u64)> {
+        let mut frozen: Vec<(&ChunkPos, &Vec<BlockPos>)> = self.queue.frozen.iter().collect();
+        frozen.sort_unstable_by_key(|(chunk, _)| **chunk);
+        let mut out = Vec::with_capacity(self.queue.ticks.len() + self.queue.frozen_count);
+        out.extend(
+            frozen
+                .into_iter()
+                .flat_map(|(_, list)| list.iter().map(|&pos| (pos, 0))),
+        );
+        out.extend(
+            self.queue
+                .ticks
+                .iter()
+                .map(|(&(due, _), &pos)| (pos, due.saturating_sub(self.now))),
+        );
+        out
+    }
+
+    /// Schedules saved ticks, `(position, game ticks from now)` in the order they run, as
+    /// [`BlockTicks::pending`] gives them: each one that many game ticks after the current one
+    /// (a position that already waits keeps its tick). Those due in chunks that are not loaded
+    /// yet freeze until the chunk loads, like any tick.
+    pub fn restore(&mut self, ticks: impl IntoIterator<Item = (BlockPos, u64)>) {
+        for (pos, delay) in ticks {
+            self.queue.schedule(pos, self.now.saturating_add(delay));
+        }
+    }
+
     /// The counts.
     pub fn stats(&self) -> BlockTickStats {
         BlockTickStats {
@@ -350,7 +381,8 @@ impl boxel_app::Plugin for BlockTicksPlugin {
                         .before(WorldSystems::Dispatch),
                 ),
             )
-            .add_systems(boxel_app::Last, publish_tick_stats);
+            // Like the other board lines: its order does not matter.
+            .add_systems(boxel_app::Last, publish_tick_stats.ambiguous_with_all());
     }
 }
 

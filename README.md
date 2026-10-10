@@ -66,6 +66,9 @@ alrededor del inicio y empieza de noche), `--pack DIR` (texturas de un resource 
 Java, la carpeta con `pack.mcmeta`; sin él son procedurales), `--help` (lista todo).
 `--world overworld` muestra el mundo con cuevas (piedra infinita hacia abajo) en vez del bosque
 de siempre; `--caves mc|closed|off` elige las cuevas y `--no-trees` saca los árboles.
+`--world-dir DIR` guarda el mundo en `DIR` al salir (también los chunks editados al descargarse
+y cada minuto) y lo carga de ahí al arrancar: ediciones, agua que corre, hora y cámara (ADR 0024).
+`--camera` y `--time` mandan sobre la cámara y la hora guardadas.
 Para pruebas automáticas usa siempre `--frames N --timeout SEG`: la ventana se cierra sola y el
 reloj queda quieto en `--time`.
 `--wait-chunks` empieza a contar frames cuando el terreno terminó de cargar y

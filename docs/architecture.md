@@ -2,7 +2,7 @@
 
 Documento técnico de referencia. Fecha: 2026-10-05. Estado: aprobado para el milestone M0
 (revisión final, después de tres revisiones adversariales del borrador v1).
-Las decisiones puntuales están en `docs/adr/` (0001 a 0023). Durante M0 hubo además una
+Las decisiones puntuales están en `docs/adr/` (0001 a 0024). Durante M0 hubo además una
 especificación para los agentes implementadores (en inglés, en `.scaffold/`), borrada al cerrar M0;
 este documento queda como referencia.
 
@@ -151,7 +151,7 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_mesh` | `PackedQuad`, `ChunkMesh` con su paleta de luz, `PaddedChunk`, `Mesher` (fork de bgm que fusiona por material, AO y luz) | voxel |
 | `boxel_light` | luz de vóxeles en CPU, sin ECS ni GPU (ADR 0015): techos de cielo por columna (`SkyTile`, caminata hacia abajo), luz exacta de un chunk desde una caja de 64³ (cielo y RGB, caminos rápidos para cuevas oscuras y cielo abierto), `PaddedLight`, `ChunkLight`; oráculo global para los tests | voxel |
 | `boxel_worldgen` | trait `WorldGenerator`; generadores `FlatGenerator`, `TerrainGenerator`, `ForestGenerator` (terreno con árboles) y `OverworldGenerator` (superficie sobre piedra infinita hacia abajo, con cuevas y árboles; etapas en `overworld`: `Heightmap`, `SurfaceRules`, `Caves`, más `Trees`); `Sea` (mar y playas en el forest y el overworld, ADR 0021); ruido 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`) | voxel |
-| `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, mensajes (`ChunkMeshEvent`, `BlockChanged`, `ChunkDataEvent`), `ChunkStore`, reloj del mundo (`TimeOfDay`, `DaylightCurve`, `DaylightPlugin`), ticks programados de bloques (`BlockTicks`, `BlockTicksPlugin`), agua que corre (`FluidPlugin`, ADR 0021) y la búsqueda de la ocultación de cuevas (`ChunkVisibility`, `visibility`, ADR 0022) | app, voxel, mesh, light, worldgen, transform, diagnostic |
+| `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, mensajes (`ChunkMeshEvent`, `BlockChanged`, `ChunkDataEvent`), guardar y cargar el mundo (`persist`: `ChunkStore`, `RedbStore`, `WorldStore`, `PersistPlugin`, ADR 0024), reloj del mundo (`TimeOfDay`, `DaylightCurve`, `DaylightPlugin`), ticks programados de bloques (`BlockTicks`, `BlockTicksPlugin`), agua que corre (`FluidPlugin`, ADR 0021) y la búsqueda de la ocultación de cuevas (`ChunkVisibility`, `visibility`, ADR 0022) | app, voxel, mesh, light, worldgen, transform, diagnostic |
 | `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `SceneLight` (luz del cielo, ambiente y curva de brillo del frame), `PresentSettings` (vsync en tiempo de ejecución), texturas procedurales o de un resource pack (`TextureSource`), screenshots, ocultación de cuevas en los tres tiers (ADR 0022), conteo de draws en CPU (`cull_counts`) | gfx, shaders, world, camera, window, pack |
 | `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::collision`: cubos y cajas, más un contorno para apuntar, ADR 0018), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas, el integrador de un cuerpo (`step_body`, `predict`), el narrowphase (`shape_contact`) y la grilla del broadphase (`Grid`). Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`; pasos en `FixedPostUpdate`, interpolación en `AfterFixedMainLoop`), `PhysicsQuery` (rayos a vóxeles y cuerpos, cajas, el chequeo para poner bloques), `BodyIndex`, cuerpos (`RigidBody`, `Collider`, `Velocity`, `BodyPosition`, `Contacts`, `Interpolated`, `Teleport`, `Frozen`, `Sleeping`, `ReportContacts`), `CharacterController`, `Projectile`, nadar (`SwimPlugin`, `Swimmer`, ADR 0021) y los mensajes `VoxelImpact`, `CollisionStarted`, `CollisionEnded` y `ProjectileHit`. Los cuerpos quietos se duermen (despiertan con `BlockChanged` y `ChunkDataEvent` del mundo, entre otras cosas) y, con muchos cuerpos despiertos, el paso corre en los hilos de cómputo. Fases P0 a P4 hechas | ecs, app, math, tasks, transform, voxel, world, diagnostic |
 | `boxel_pack` | lector de resource packs de Minecraft Java (formatos ~64 a 120): `pack.mcmeta` con overlays, texturas de bloque PNG a RGBA8 (animaciones `.png.mcmeta`), modelos de bloque con herencia `parent` y variables `#`, blockstates `variants` y `multipart`. Solo datos; `boxel_render` lo usa para las texturas de bloque | (serde, png) |
@@ -1191,23 +1191,38 @@ extract) es M3; la frontera de extract ya existe.
 
 ---
 
-## 12. Persistencia (solo el trait en M0)
+## 12. Persistencia (ADR 0024)
+
+`boxel_world::persist` guarda y carga el mundo mientras se transmite:
 
 ```rust
 pub trait ChunkStore: Send + Sync + 'static {
     fn load(&self, key: ChunkKey) -> std::io::Result<Option<Vec<u8>>>;
-    fn save_batch(&self, items: &[(ChunkKey, Vec<u8>)]) -> std::io::Result<()>;
+    fn keys(&self) -> std::io::Result<Vec<ChunkKey>>;
+    fn load_meta(&self, name: &str) -> std::io::Result<Option<Vec<u8>>>;
+    fn save_batch(&self, batch: &SaveBatch) -> std::io::Result<()>; // chunks y metadatos, atómico
     fn flush(&self) -> std::io::Result<()> { Ok(()) }
 }
 ```
 
-`NullChunkStore` en M0 (el mundo se regenera desde la semilla). Plan M1: redb 4.3 (Rust puro,
-ACID; una transacción de escritura a la vez, así que un hilo de IO que agrupa), clave u128 =
-dim | lod | Morton(x, y, z), blob con cabecera (magic, versión de formato, compresión, largo) y
-payload binario propio (paleta + palabras u64), lz4_flex para guardado en caliente y zstd para
-archivo. Metadatos con postcard. Medido: un mundo de 512x256x512 ocupa 1.76 MiB con lz4 y
-0.81 MiB con zstd(3). Guardar solo chunks modificados (el generador es determinista). El
-schedule `Shutdown` es el lugar para el `flush` final.
+- Stores: `RedbStore` (un archivo `world.redb` por mundo, redb 4.3, Rust puro, ACID),
+  `MemoryStore` (tests y herramientas) y `NullChunkStore` (sin guardar: el mundo de antes).
+- Clave de chunk: dimensión, lod y x, z, y como `i64` en big endian con el signo invertido (27
+  bytes): exacta en todo `i64` y con las capas de una columna juntas.
+- Formato versionado (`FORMAT_VERSION` 1): los bloques se guardan por el nombre de su estado
+  (ADR 0019) a través del IdMap del mundo; registros con magia, versión, suma de control y LZ4.
+- Se guardan solo los chunks editados (el generador rehace el resto), los ticks programados
+  pendientes y el reloj. Los techos de cielo no se guardan: la caminata de una columna lee los
+  chunks guardados.
+- `WorldStore` es el mundo abierto (store, IdMap, copias pendientes); `PersistPlugin` va después de
+  `WorldPlugin`. Un chunk guardado se lee en su job de generación; uno editado que se descarga se
+  entrega a una copia en memoria y un job en `IoTaskPool` lo escribe (uno por vez, hasta 256
+  chunks por transacción). Autoguardado cada 60 s y guardado final en `Shutdown`. Los ticks y el
+  reloj van siempre en la misma transacción que todos los chunks editados: el disco guarda un solo
+  momento del mundo.
+- Si el disco falla, los chunks esperan en memoria y `RedbStore` vuelve a abrir el archivo cuando
+  el disco funciona otra vez.
+- Entidades (cuerpos congelados de la física): todavía no, ver ADR 0024.
 
 ---
 
@@ -1270,7 +1285,7 @@ schedule `Shutdown` es el lugar para el `flush` final.
 | Milestone | Contenido | Criterio de salida |
 |---|---|---|
 | **M0 scaffold** | workspace y tooling; fork del ECS; `boxel_app`; ventana con compuerta de presentación e input; detección completa (tiers, scoring, smoke, overrides, LKG de crashes, device lost, catch_unwind); tiers High, Mid y Low con buckets opaco y cutout (High sin Hi-Z); paleta, registry, worldgen, mesher, streaming con jobs; cámara libre; `gpu_info`, `voxel_world`, `headless_world` | compila, tests, clippy y rustdoc limpios; `voxel_world` dibuja terreno en Vulkan High y en GL (Mid y Low); imágenes iguales entre tiers; la simulación no se congela con la ventana minimizada |
-| **M1 mundo jugable** | criterio de entrada: re-fork sobre bevy 0.20.0 final (hecho el 2026-10-09, issue #24). Pase translúcido; AO; raycast y edición de bloques (hechos: ADR 0016, `voxel_world`); el sistema de ediciones si se recortó; propiedades de bloque e IdMap; `ChunkStore` con redb; crecimiento del arena y presupuesto de subida; caras interiores de hojas (opcional); re-selección en caliente si se recortó; decisión `static-dxc` o DLL en Windows; timestamps de GPU; actualizar a wgpu 31 | editar y guardar un mundo; agua visible |
+| **M1 mundo jugable** | criterio de entrada: re-fork sobre bevy 0.20.0 final (hecho el 2026-10-09, issue #24). Pase translúcido; AO; raycast y edición de bloques (hechos: ADR 0016, `voxel_world`); el sistema de ediciones si se recortó; propiedades de bloque e IdMap; `ChunkStore` con redb (hecho: ADR 0024, sin entidades); crecimiento del arena y presupuesto de subida; caras interiores de hojas (opcional); re-selección en caliente si se recortó; decisión `static-dxc` o DLL en Windows; timestamps de GPU; actualizar a wgpu 31 | editar y guardar un mundo; agua visible |
 | **M2 GPU-driven completo** | Hi-Z en dos fases (High) o enlaces por subceldas de 16³ (el cave culling por BFS ya está en los tres tiers, ADR 0022); pool de ocupación en GPU; `create_shader_module_trusted` con medición; pipeline cache de Vulkan; verificar DX12 High; clip control en GL (upstream); decidir WESL | caída de draws y de tiempo de GPU medida |
 | **M3 escala** | LOD con mips de 32³ y anillos; listas indirectas segmentadas (más de 65 535 draws); render en hilo propio; inicialización de GPU asíncrona (respetando los error scopes por hilo) | distancias de vista grandes estables |
 | **M4 experimental** | ray marching sobre bricks/ocupación; mesh shaders opt-in; evaluar bevy_ecs 0.21 y el núcleo ECS propio | prototipos medidos |
