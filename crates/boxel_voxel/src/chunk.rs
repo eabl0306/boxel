@@ -68,6 +68,7 @@ impl StateSet {
     }
 
     /// No state at all.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.words.is_empty()
     }
@@ -315,6 +316,7 @@ impl ChunkData {
     /// A `Packed` chunk caches the answer for the last set asked about (by its key) until the
     /// blocks change, so asking again costs a load. Physics asks with the states whose collision
     /// reaches into the cell above (ADR 0026) before reading cells only for them.
+    #[inline]
     pub fn may_contain(&self, set: &StateSet) -> bool {
         if set.is_empty() {
             return false;

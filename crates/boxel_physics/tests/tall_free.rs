@@ -13,7 +13,7 @@ use boxel_physics::{
     ChunkSource, CollisionTable, LocalBox, Probe, RayResult, StepUp, SweepConfig, TestWorld,
     VoxelFilter, VoxelSource, guard_edge, move_box_stepping, raycast_voxels,
 };
-use boxel_voxel::{BlockPos, BlockRegistry, BlockState, ChunkPos, WorldPos};
+use boxel_voxel::{BlockPos, BlockRegistry, BlockState, ChunkPos, MAX_BLOCK_COORD, WorldPos};
 use boxel_world::{ChunkMap, WorldSettings};
 use common::{Rng, STONE, WATER, at, bottom_slab, table, top_slab};
 use proptest::prelude::*;
@@ -63,6 +63,11 @@ fn bases() -> [I64Vec3; 5] {
         I64Vec3::new((1 << 61) - 4096, -(1 << 61) + 4096, (1 << 61) - 4096),
     ]
 }
+
+/// A chunk corner on the world limit: on X the field reaches past the world's last block
+/// (`MAX_BLOCK_COORD + 31`, where positions are clamped) and rays leave the world; on Z it
+/// starts at the first one.
+const EDGE: I64Vec3 = I64Vec3::new(MAX_BLOCK_COORD + 32, 0, -MAX_BLOCK_COORD);
 
 /// The eight chunks around `base`: bit `x + 2y + 4z` is the one at `(x, y, z)`, with 0 the side
 /// below the corner and 1 the side above it.
@@ -279,16 +284,17 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
     /// Fields without fences, with fences everywhere, and with fences in some of the eight
-    /// chunks (so moves and rays cross between both kinds), sometimes with an unloaded chunk.
+    /// chunks (so moves and rays cross between both kinds), sometimes with an unloaded chunk,
+    /// at the five bases and on the world limit ([`EDGE`]).
     #[test]
     fn guarded_sweeps_and_rays_match_the_always_reach_ones(
         seed in any::<u64>(),
-        base in 0..5usize,
+        base in 0..6usize,
         density in 0.05..0.45f64,
         fenced in prop_oneof![Just(0u8), Just(u8::MAX), any::<u8>()],
         unloaded in 0..12u8,
     ) {
-        let base = bases()[base];
+        let base = bases().get(base).copied().unwrap_or(EDGE);
         let mut world = field(base, seed, density, fenced, unloaded);
         compare(&mut world, base, seed ^ 0x7A11, 24, &mut Reads::default())?;
     }
