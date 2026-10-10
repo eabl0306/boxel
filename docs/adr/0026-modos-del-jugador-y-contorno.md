@@ -213,6 +213,10 @@ Minecraft (`LocalPlayer::aiStep`):
   del deseo, o casi quieto (menos de 0,063 bloques por segundo). Es el `horizontalCollision &&
   !minorHorizontalCollision` de Minecraft, con su ángulo. Rozar una pared en un ángulo chico no
   lo corta. Se calcula con productos escalares, sin `acos` ni `sqrt`.
+- El choque queda en `Contacts::ran_into` para el paso siguiente. Ahí, como en el `aiStep` de
+  Minecraft, la tecla lo empieza y el choque del movimiento anterior lo corta, antes de calcular
+  la velocidad y el salto. Así, con la tecla apretada contra una pared, el cuerpo camina a lo
+  largo de ella y su salto no suma el empujón.
 - Subir una losa corriendo no es un choque: el escalón la sube.
 - Volando, correr duplica `fly_speed` como antes, con el mismo estado. Bajar con Shift no lo
   corta, porque un volador no se agacha.
@@ -319,9 +323,9 @@ en el agua le devuelve el agua.
   - `BlockOutline`, `Outline`, `VoxelRenderer::set_outline`, `outline_edges`,
     `block_outline_edges` y `ShaderModuleId::Outline`.
   - Sección 8: `MoveIntent::facing`, `CharacterController::{sprint_jump_boost, crouch_height,
-    sprinting}`, `Crouch`, `Collider::crouched` y `CollisionTable::is_wet`. `MoveIntent::sprint`
-    ahora empieza el sprint y no lo sostiene. `Contacts::in_fluid` y `Swimmer::in_fluid` también
-    cuentan los bloques con agua.
+    sprinting}`, `Crouch`, `Collider::crouched`, `CollisionTable::is_wet` y `Contacts::ran_into`.
+    `MoveIntent::sprint` ahora empieza el sprint y no lo sostiene. `Contacts::in_fluid` y
+    `Swimmer::in_fluid` también cuentan los bloques con agua.
 - Tests:
   - `boxel_voxel`: la valla choca a 24 y se apunta a 16, su techo sostiene una antorcha y ninguna
     cara es firme; el registro acepta 24 y rechaza 25, una caja más ancha que la celda y una que
@@ -363,9 +367,10 @@ en el agua le devuelve el agua.
     para y camina a toda velocidad; un volador con Shift no se agacha. Correr no empieza de
     costado ni para atrás, empieza hacia adelante (también en diagonal) y sigue sin la tecla;
     para atrás, al parar, al agacharse y contra una pared termina. Rozando una pared a 5 grados
-    sigue y a 15 termina. Saltando y corriendo da 7,12 bloques por segundo contra 5,61. El
-    recorrido bit a bit en cinco bases suma correr, saltar contra una pared y quedar agachado
-    bajo un techo.
+    sigue y a 15 termina; con la tecla apretada, a 5 grados corre a lo largo de la pared y salta
+    con empujón, y a 15 camina y salta sin él. Saltando y corriendo da 7,12 bloques por segundo
+    contra 5,61. El recorrido bit a bit en cinco bases suma correr, saltar contra una pared y
+    quedar agachado bajo un techo.
   - `boxel_physics/tests/swim.rs`: parado sobre losas con agua nada (y sube y vuelve a la losa),
     sobre losas secas no; un volador en el agua no se hunde, sube como en el aire, queda quieto
     exacto con sus ajustes de tierra, y al apagar el vuelo el agua lo toma; igual bit a bit en

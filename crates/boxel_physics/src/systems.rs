@@ -222,14 +222,13 @@ pub(crate) fn drive_characters(
         // A walker that sneaks or crouches (a flyer descends instead, and never crouches).
         let crouching = !flying && (intent.sneak || crouch.is_some_and(Crouch::is_crouching));
         // The sprint starts on the key while moving forward and ends when the character stops
-        // moving forward or crouches (a clip ahead ends it in the step).
+        // moving forward, crouches or ran into something in the last step (a clip ahead also
+        // ends it in the step). Minecraft's `aiStep` order: the key starts it, then the last
+        // move's collision ends it, so a key held against a wall never sprints along it.
         let facing = facing_dir(wish, intent.facing);
         let forward = facing.is_some_and(|dir| wish.dot(dir) > MIN_FORWARD);
-        let sprinting = if controller.sprinting {
-            forward && !crouching
-        } else {
-            intent.sprint && forward && !crouching
-        };
+        let sprinting =
+            (controller.sprinting || intent.sprint) && forward && !crouching && !contacts.ran_into;
         if controller.sprinting != sprinting {
             controller.sprinting = sprinting;
         }
@@ -850,16 +849,18 @@ fn step_one(stepper: &mut Stepper<'_>, shared: &StepShared<'_>, item: StepItem<'
             {
                 controller.flying = false;
             }
-            // Running into something ahead ends a sprint.
-            if let Some(controller) = controller.as_mut()
-                && controller.sprinting
-                && ran_into(
+            // Running into something ahead ends a sprint, and keeps the key from starting it
+            // again in the next step (`Contacts::ran_into`).
+            let mut touched = Contacts::from_sweep(&out.sweep);
+            if let Some(controller) = controller.as_mut() {
+                touched.ran_into = ran_into(
                     &out.sweep,
                     intent.map_or(DVec2::ZERO, |i| clean_wish(i.wish)),
                     params.dt,
-                )
-            {
-                controller.sprinting = false;
+                );
+                if touched.ran_into && controller.sprinting {
+                    controller.sprinting = false;
+                }
             }
             if out.sweep.moved != DVec3::ZERO {
                 sync.moved = out.sweep.moved;
@@ -867,7 +868,7 @@ fn step_one(stepper: &mut Stepper<'_>, shared: &StepShared<'_>, item: StepItem<'
             }
             position.set_if_neq(BodyPosition(out.pos));
             velocity.set_if_neq(Velocity(out.vel));
-            contacts.set_if_neq(Contacts::from_sweep(&out.sweep));
+            contacts.set_if_neq(touched);
             stepper
                 .out
                 .impacts

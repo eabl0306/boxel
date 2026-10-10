@@ -333,16 +333,22 @@ pub struct Contacts {
     /// It overlaps a block that holds a fluid: a fluid block or a waterlogged one
     /// ([`CollisionTable::is_wet`](crate::CollisionTable::is_wet)).
     pub in_fluid: bool,
+    /// A [`CharacterController`]'s move ran into something ahead: a clip across turned it more
+    /// than 8 degrees away from [`MoveIntent::wish`], or stopped it (Minecraft's
+    /// `horizontalCollision && !minorHorizontalCollision`). It ends a sprint, and the next step
+    /// does not start one ([`CharacterController::sprinting`]). False for other bodies.
+    pub ran_into: bool,
 }
 
 impl Contacts {
-    /// The contacts a sweep reports.
+    /// The contacts a sweep reports (it does not tell [`Contacts::ran_into`]: false).
     pub fn from_sweep(out: &SweepOut) -> Self {
         Self {
             faces: out.faces,
             on_ground: out.on_ground(),
             ground_block: out.ground,
             in_fluid: out.in_fluid,
+            ran_into: false,
         }
     }
 
@@ -554,8 +560,9 @@ impl PhysicsSync {
 ///   moves forward ([`MoveIntent::facing`]) and does not crouch; it goes on after the key is let
 ///   go, and ends when the character stops moving forward, crouches or runs into something
 ///   ahead (a clip across that turns its move more than 8 degrees away from the wish, as
-///   Minecraft's `minorHorizontalCollision`). A jump while sprinting adds `sprint_jump_boost`
-///   along the facing.
+///   Minecraft's `minorHorizontalCollision`; [`Contacts::ran_into`]). After such a clip the key
+///   does not start it again in the next step, so a key held against a wall walks along it. A
+///   jump while sprinting adds `sprint_jump_boost` along the facing.
 /// - Flying (`flying`, Minecraft's creative flight; the game turns it on): no gravity and no
 ///   step-up, `fly_speed` across (twice that sprinting) with the air drag, and
 ///   `fly_vertical_speed` up while [`MoveIntent::up`] is held and down while sneaking, with a

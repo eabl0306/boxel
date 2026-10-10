@@ -580,6 +580,47 @@ fn a_sprint_grazing_a_wall_goes_on_and_one_turned_by_it_ends() {
 }
 
 #[test]
+fn the_sprint_key_held_into_a_wall_does_not_sprint_along_it() {
+    let mut sim = Sim::new(I64Vec3::ZERO, STEP);
+    let c = CharacterController::default();
+    // A wall along Z at x = 3.
+    build(&mut sim, [3, 4, -24], [3, 5, 24], STONE);
+    // The key held all along, 5 and 15 degrees into the wall: grazing it, the sprint goes on;
+    // turned by it, the last move's clip ends the sprint before the key starts it again
+    // (Minecraft's `aiStep`), so the body walks along the wall and a jump gets no push.
+    for (tan, sprints) in [(0.0875f32, true), (0.268, false)] {
+        let body = walker(&mut sim, 2.5, 4.0, -20.5);
+        let wish = Vec2::new(tan, 1.0);
+        intent(&mut sim, body, |i| {
+            i.wish = wish;
+            i.facing = wish;
+            i.sprint = true;
+        });
+        sim.steps(160);
+        assert!((feet(&sim, body).x - 2.75).abs() < 1e-9, "against the wall");
+        let along = 1.0 / DVec3::new(f64::from(tan), 0.0, 1.0).length();
+        let factor = if sprints { c.sprint_factor } else { 1.0 };
+        let v = sim.get::<Velocity>(body).0.z;
+        assert!(
+            (v - factor * c.walk_speed * along).abs() < 1e-6,
+            "{tan}: {v} along the wall"
+        );
+        intent(&mut sim, body, |i| i.jump = true);
+        sim.steps(1);
+        let pushed = sim.get::<Velocity>(body).0.z - v;
+        if sprints {
+            assert!(
+                pushed > 0.8 * c.sprint_jump_boost * along,
+                "{tan}: {pushed}"
+            );
+        } else {
+            assert!(pushed.abs() < 1e-6, "{tan}: {pushed}");
+        }
+        sim.app.world_mut().despawn(body);
+    }
+}
+
+#[test]
 fn a_sprint_jump_carries_further() {
     let mut sim = Sim::new(I64Vec3::ZERO, STEP);
     let c = CharacterController::default();
