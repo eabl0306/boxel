@@ -202,3 +202,32 @@ fn a_registry_holds_at_most_16_fluids() {
         }
     }
 }
+
+/// Only the fluid model makes a liquid ([`StateFlags::FLUID`]): a clear block without collision
+/// is not one, and a fluid that collides is not either.
+#[test]
+fn only_the_fluid_model_is_a_liquid() {
+    let mut b = BlockRegistryBuilder::new();
+    let t = texture(&mut b);
+    let mist = b.add_block(def("test:mist", BlockModel::CUBE, t)).unwrap();
+    let liquid = b
+        .add_block(def("test:liquid", BlockModel::Fluid, t))
+        .unwrap();
+    let opaque = b
+        .add_block(BlockDef {
+            shape: RenderShape::Opaque,
+            ..def("test:magma", BlockModel::Fluid, t)
+        })
+        .unwrap();
+    let hard = b
+        .add_block(BlockDef {
+            collision: BlockCollision::Full,
+            ..def("test:ice", BlockModel::Fluid, t)
+        })
+        .unwrap();
+    let r = b.build();
+    let fluid = |s| r.flags(s).contains(StateFlags::FLUID);
+    assert!(!fluid(mist), "a translucent cube without collision");
+    assert!(fluid(liquid) && fluid(opaque));
+    assert!(!fluid(hard), "a fluid model that collides");
+}

@@ -350,7 +350,8 @@ bitflags::bitflags! {
         const SOLID = 1;
         /// Hides the neighbor faces it touches: shape `Opaque` with a full cube model.
         const OCCLUDES = 1 << 1;
-        /// Liquid: a `BlockModel::Fluid` or a `Translucent` block without collision.
+        /// Liquid: a `BlockModel::Fluid` without collision (whatever its render layer: a
+        /// clear block without collision is not a liquid).
         const FLUID = 1 << 2;
         /// Emits light (some `emission` channel above 0).
         const EMISSIVE = 1 << 3;
@@ -953,8 +954,7 @@ impl BlockRegistryBuilder {
                     StateFlags::OCCLUDES,
                     b.shape == RenderShape::Opaque && b.model.is_solid_cube(),
                 );
-                let fluid = b.shape == RenderShape::Translucent || b.model == BlockModel::Fluid;
-                f.set(StateFlags::FLUID, fluid && !solid);
+                f.set(StateFlags::FLUID, b.model == BlockModel::Fluid && !solid);
                 f.set(StateFlags::EMISSIVE, b.emission != [0; 3]);
                 f
             })
