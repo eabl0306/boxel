@@ -5,7 +5,7 @@
 #
 # - Refuses to start when the disk is almost full (QUIET_MIN_FREE_GB, default 40).
 # - At most QUIET_SLOTS heavy commands at once (default 2); the rest wait their turn.
-# - Each one gets nproc/QUIET_SLOTS cargo jobs (at most half the CPUs), low CPU and IO priority, and a soft RAM cap
+# - Each one gets nproc/QUIET_SLOTS cargo jobs (at most a quarter of the CPUs), low CPU and IO priority, and a soft RAM cap
 #   (QUIET_MEM_HIGH, default 60% of RAM split between the slots) so it never pushes your
 #   apps into swap. Over the cap the command slows down instead of the desktop.
 # - No incremental cache (CARGO_INCREMENTAL=0): it is most of a target dir and one-shot builds
@@ -29,10 +29,12 @@ if (( free_gb < min_free_gb )); then
 fi
 
 export CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-0}
-# Never more than half the CPUs per command, even with one slot: with every core linking test
-# binaries at once, one `cargo test --workspace` alone peaked at 13 GB and systemd-oomd killed it.
+# Never more than a quarter of the CPUs per command, even with one slot: with many jobs linking
+# test binaries at once, one `cargo test --workspace` peaked at 13 GB, and capped at 8 GB it was
+# throttled into the memory pressure that makes systemd-oomd kill it. Fewer parallel links keep
+# the peak low instead.
 jobs=$(( cpus / slots ))
-(( jobs > cpus / 2 )) && jobs=$(( cpus / 2 ))
+(( jobs > cpus / 4 )) && jobs=$(( cpus / 4 ))
 (( jobs < 1 )) && jobs=1
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-$jobs}
 

@@ -217,6 +217,9 @@ test = true
 # Profiles only apply to this workspace's own examples/tests/benches.
 [profile.dev]
 opt-level = 1
+# Line tables only (file and line in backtraces, no variable info): full debug info made each test
+# binary 300+ MB, and linking several at once pushed a test build past 13 GB on a 22 GB laptop.
+debug = "line-tables-only"
 [profile.dev.package."*"]
 opt-level = 3
 [profile.release]
