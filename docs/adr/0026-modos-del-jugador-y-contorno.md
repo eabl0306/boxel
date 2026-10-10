@@ -136,6 +136,8 @@
 - El bloque apuntado lleva el contorno, además de la mira.
 - `physics_sandbox` usa el mismo `WalkPlugin`, así que tiene las mismas teclas para caminar,
   agacharse, correr y volar. Su ayuda (`--help`) y sus docs las nombran.
+- `snapshot --outline X,Y,Z` dibuja el contorno de ese bloque con el color y el ancho por
+  defecto, para ver el contorno en capturas sin ventana.
 
 ## Consecuencias
 

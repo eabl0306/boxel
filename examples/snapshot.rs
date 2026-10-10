@@ -12,7 +12,8 @@
 //! Water flows (`FluidPlugin`, ADR 0021): with `--flow N` the edits get N game ticks (20 per
 //! second) to flow before the shots, run one by one on a stopped clock (the same pixels every
 //! run). `--world-dir DIR` loads the world saved there and saves it after the shots (ADR 0024):
-//! a run with edits and a later run without them give the same pixels.
+//! a run with edits and a later run without them give the same pixels. `--outline X,Y,Z` draws
+//! the outline of that block, as `voxel_world` outlines the targeted block (ADR 0026).
 //!
 //! Output (stdout): `gpu: <adapter summary>`, `textures: <source, size, pack load time>`; with
 //! edits, one `drop:` line per `--drop` (where the block landed) and `edits: set=N skipped=N
@@ -42,8 +43,9 @@ use boxel::log::LogPlugin;
 use boxel::mesh::AoPolicy;
 use boxel::prelude::*;
 use boxel::render::{
-    FLUID_TIME_PERIOD, RenderSettings, RendererConfig, SceneLight, TextureSource, TranslucentSort,
-    ViewParams, VoxelRenderer, light_curve, load_block_textures,
+    BlockOutline, FLUID_TIME_PERIOD, Outline, RenderSettings, RendererConfig, SceneLight,
+    TextureSource, TranslucentSort, ViewParams, VoxelRenderer, block_outline_edges, light_curve,
+    load_block_textures,
 };
 use boxel::voxel::{BlockRegistry, MAX_BLOCK_COORD};
 use boxel::world::persist::{PersistPlugin, WorldStore};
@@ -84,6 +86,8 @@ usage: snapshot --camera X,Y,Z,YAW,PITCH --shot HH:MM=PATH [--shot ...] [options
                        have scrolled (default 0)
   --world-dir DIR      load the world saved in DIR (made if missing) and save it there after
                        the shots, edits included
+  --outline X,Y,Z      draw the outline of the block at X,Y,Z, as voxel_world outlines the
+                       targeted block (default color and width)
   --timeout S          wall-clock limit for loading the world, in seconds (default 300)
   --help               this text";
 
@@ -146,6 +150,8 @@ struct Options {
     fluid_time: f64,
     /// `--world-dir`: where the world is loaded from and saved.
     world_dir: Option<PathBuf>,
+    /// `--outline`: the block whose outline the shots draw (ADR 0026).
+    outline: Option<I64Vec3>,
 }
 
 /// `Ok(None)` for `--help`.
@@ -166,6 +172,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         flow: 0,
         fluid_time: 0.0,
         world_dir: None,
+        outline: None,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -244,6 +251,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             }
             "--pack" => o.textures = pack::parse(flag, &value()?)?,
             "--world-dir" => o.world_dir = Some(PathBuf::from(value()?)),
+            "--outline" => o.outline = Some(parse_cell(flag, &value()?)?),
             "--timeout" => {
                 let v = value()?;
                 o.timeout = v
@@ -764,6 +772,28 @@ fn run(
             )
             .map_err(|e| gpu_err(format!("upload {:?}: {e}", key.pos)))?;
     }
+    // `--outline`: what the render plugin hands the renderer for a `BlockOutline` there.
+    if let Some(block) = o.outline {
+        let state = map
+            .block_at(BlockPos::from_i64vec3(block))
+            .unwrap_or(BlockState::AIR);
+        let edges = block_outline_edges(&registry, state);
+        println!(
+            "outline: {} at {},{},{} edges={}",
+            registry.state_name(state),
+            block.x,
+            block.y,
+            block.z,
+            edges.len()
+        );
+        let style = BlockOutline::default();
+        renderer.set_outline((!edges.is_empty()).then(|| Outline {
+            block,
+            edges: edges.into(),
+            color: style.color,
+            width: style.width,
+        }));
+    }
     let camera = Camera {
         view_distance: o.radius as f32 * 32.0,
         ..Camera::default()
@@ -840,12 +870,28 @@ mod tests {
             "off",
             "--fluid-time",
             "1.25",
+            "--outline",
+            "3,64,-2",
         ]);
         let o = parse(&args).expect("valid").expect("not help");
         assert_eq!(o.shots[1], (18.5, PathBuf::from("dusk.png")));
         assert_eq!(o.size, (640, 360));
         assert!(!o.light);
         assert_eq!(o.fluid_time, 1.25);
+        assert_eq!(o.outline, Some(I64Vec3::new(3, 64, -2)));
+        assert_eq!(
+            parse(&BASE).expect("valid").expect("not help").outline,
+            None
+        );
+        // Far from the origin (ADR 0014): exact cells up to the world limit.
+        let far = I64Vec3::new(1 << 40, -(1 << 31), MAX_BLOCK_COORD);
+        let cell = format!("{},{},{}", far.x, far.y, far.z);
+        let mut args = BASE.to_vec();
+        args.extend(["--outline", &cell]);
+        assert_eq!(
+            parse(&args).expect("valid").expect("not help").outline,
+            Some(far)
+        );
         assert_eq!(
             parse(&BASE).expect("valid").expect("not help").fluid_time,
             0.0
@@ -860,6 +906,8 @@ mod tests {
             &["--ao", "on"],
             &["--fluid-time", "-1"],
             &["--fluid-time", "soon"],
+            &["--outline", "1,2"],
+            &["--outline", "0,9223372036854775807,0"],
             &["--pack", "/nonexistent/boxel/pack"],
         ] {
             let mut args = BASE.to_vec();
