@@ -2810,6 +2810,10 @@ enum Step {
     Resync,
     /// The eye moves by (16 x, 8 y, 16 z) blocks.
     Move(i8, i8, i8),
+    /// Chunk `n` of the near set is edited (its debounce ends at once: a pyramid job, then the
+    /// nodes it reaches are built again), or, `false`, stops being edited (it unloaded without
+    /// persistence: the nodes go back to the source).
+    Edit(u16, bool),
 }
 
 fn step() -> impl Strategy<Value = Step> {
@@ -2822,6 +2826,7 @@ fn step() -> impl Strategy<Value = Step> {
         1 => Just(Step::Room),
         1 => Just(Step::Resync),
         2 => (-3i8..=3, -1i8..=1, -3i8..=3).prop_map(|(x, y, z)| Step::Move(x, y, z)),
+        2 => (any::<u16>(), any::<bool>()).prop_map(|(n, on)| Step::Edit(n, on)),
     ]
 }
 
@@ -2873,8 +2878,9 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(24))]
 
     /// The core property (ADR 0031): for random coverage changes, job completion orders,
-    /// refusals, resyncs and eye moves, every chunk is drawn by at most one of full detail and
-    /// the LOD levels, every frame (a lost child's parent may draw over full detail); with
+    /// refusals, resyncs, eye moves and edits (nodes built again while the renderer keeps the
+    /// old ones, bands that grow and shrink), every chunk is drawn by at most one of full detail
+    /// and the LOD levels, every frame (a lost child's parent may draw over full detail); with
     /// everything available, exactly one (or none where nothing is there).
     #[test]
     fn full_detail_and_the_lod_levels_never_draw_the_same_chunk(
@@ -2889,6 +2895,7 @@ proptest! {
             levels: 3,
             in_flight_busy: 8,
             in_flight_settled: 8,
+            edit_debounce: Duration::ZERO,
             ..small()
         };
         let mut app = focus_app(Steps::new(20), settings, lod.clone(), start);
@@ -2935,6 +2942,21 @@ proptest! {
                     let to = eye + I64Vec3::new(i64::from(x) * 16, i64::from(y) * 8, i64::from(z) * 16);
                     eye = I64Vec3::new(to.x.clamp(-64, 64), to.y.clamp(20, 100), to.z.clamp(-64, 64));
                     app.world_mut().resource_mut::<LodFocus>().origin = eye;
+                }
+                Step::Edit(n, on) => {
+                    let key = ChunkKey::new(near_chunk(n));
+                    app.world_mut().resource_scope(|world, mut lod: Mut<LodWorld>| {
+                        let cov = world.resource::<LodCoverage>().coverage();
+                        if on {
+                            lod.edits.changed(key, Instant::now());
+                        } else if let (true, waiting) = lod.edits.remove(key) {
+                            // As the edits step does for an unload without persistence.
+                            lod.mark_dirty(key, cov);
+                            for c in waiting {
+                                lod.queue(c, false, cov);
+                            }
+                        }
+                    });
                 }
             }
             frame(&mut app, &mut model);
