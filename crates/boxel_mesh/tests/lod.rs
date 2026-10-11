@@ -1,7 +1,8 @@
 //! Far level of detail meshing (ADR 0031): the LOD material table and the post-passes (octant
 //! splits, skirts, fluid walls), on `test:` blocks.
 use boxel_mesh::lod::{
-    LodMaterials, add_fluid_walls, add_skirts, fits, mesh_node, octant_of, split_octants,
+    LOD_PALETTE, LodMaterials, Seam, add_fluid_walls, add_skirts, fits, mesh_node, octant_of,
+    seam_counts, seam_of, split_octants,
 };
 use boxel_mesh::{
     AoPolicy, ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher, PADDED_VOLUME, PackedQuad,
@@ -444,16 +445,35 @@ proptest! {
         split_octants(&mut plain);
         let mut full = ChunkMesh::default();
         mesh_node(&mut Mesher::new(), &padded, &m, 1, &mut full);
-        // Opaque cubes only, each in the bucket of its face.
+        // Opaque cubes only, each in the bucket of its face, the mesher's faces first, then the
+        // post-pass quads on a node face, then those on a middle plane (and those planes only),
+        // which `seam_counts` finds; open sky only.
         prop_assert_eq!(full.bucket_counts[6] + full.bucket_counts[7], 0);
-        for b in 0..6 {
-            for &q in full.bucket(b) {
+        for (b, seams) in seam_counts(&full).into_iter().enumerate() {
+            let quads = full.bucket(b);
+            for &q in quads {
                 prop_assert_eq!(q.face().index(), b);
                 prop_assert_eq!(q.shape(), boxel_mesh::layout::SHAPE_CUBE);
-                prop_assert_eq!(q.light_index(), 0);
+                let (na, _, _) = q.face().axes();
+                let n = q.pos()[na];
+                match seam_of(q) {
+                    Seam::None => {}
+                    Seam::Face => prop_assert!(n == 0 || n == 31, "{q:?}"),
+                    Seam::Middle => prop_assert!(n == 15 || n == 16, "{q:?}"),
+                }
             }
+            prop_assert!(quads.windows(2).all(|w| seam_of(w[0]) <= seam_of(w[1])));
+            let count = |seam| quads.iter().filter(|&&q| seam_of(q) == seam).count() as u32;
+            prop_assert_eq!(seams, [count(Seam::Face), count(Seam::Middle)]);
+            prop_assert_eq!(
+                quads.len() as u32 - seams[0] - seams[1],
+                plain.bucket_counts[b],
+                "the post-passes add only seam quads"
+            );
         }
-        prop_assert_eq!(full.palette.len(), usize::from(!full.quads.is_empty()));
+        prop_assert!(plain.quads.iter().all(|&q| seam_of(q) == Seam::None));
+        let palette: &[_] = if full.quads.is_empty() { &[] } else { &LOD_PALETTE };
+        prop_assert_eq!(&full.palette[..], palette);
         let (a, b) = (
             rects(&plain, [0.0; 3], 1.0, |_| false),
             rects(&full, [0.0; 3], 1.0, |_| false),

@@ -15,12 +15,14 @@
 //!    fluid's or ground's side instead of the sky.
 //!
 //! Every visible state is an opaque cube at a distance, fluids too ([`LodMaterials`]): a node's
-//! quads land in the 6 opaque face buckets, cubes only.
+//! quads land in the 6 opaque face buckets, cubes only. The quads of post-passes 2 and 3 come
+//! last in their bucket, marked by their plane ([`Seam`]), so the renderer can leave out those
+//! nothing needs ([`seam_counts`]).
 use crate::packed::layout;
 use crate::{
     AoPolicy, BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, FULL_SKY_ENTRY, MAX_QUADS_PER_BUCKET,
     MAX_QUADS_PER_FACE_BUCKET, MaterialTable, MeshOptions, Mesher, PADDED, PADDED_AREA,
-    PADDED_VOLUME, PackedQuad, PaddedChunk, VoxelClass,
+    PADDED_VOLUME, PackedQuad, PaddedChunk, PaletteEntry, VoxelClass,
 };
 use boxel_voxel::lod::{LodClass, LodClasses};
 use boxel_voxel::{BlockRegistry, BlockState, Face, RenderShape};
@@ -152,8 +154,62 @@ pub const fn octant_of(quad: PackedQuad) -> u8 {
     (((g >> 4) & 1) | (((g >> 9) & 1) << 1) | (((g >> 14) & 1) << 2)) as u8
 }
 
+/// Where a LOD quad lies: a face the mesher found, or a quad of post-pass 2 or 3
+/// ([`add_skirts`], [`add_fluid_walls`]) on one of the node's 6 faces or on a middle plane (cell
+/// 16 of an axis). Those close the seam with other detail across their plane, and only such a
+/// seam shows them: where this node or a neighbor of its level draws the cells across, they lie
+/// between solid cells, behind the faces of the surface.
+///
+/// LOD meshes have no light, so a quad's light palette index holds its seam: a LOD mesh's palette
+/// is [`LOD_PALETTE`] (open sky three times) and a quad's entry is `seam as u16`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Seam {
+    /// A face of the mesher, always drawn.
+    None = 0,
+    /// On a node face (plane 0 or 32): needed where the node across is not of this level, or
+    /// does not draw its cells by the plane.
+    Face = 1,
+    /// On a middle plane (16): needed where the octant across is hidden and this one is not.
+    Middle = 2,
+}
+
+/// The light palette of a non-empty LOD mesh: one open-sky entry per [`Seam`].
+pub const LOD_PALETTE: [PaletteEntry; 3] = [FULL_SKY_ENTRY; 3];
+
+/// The [`Seam`] of a LOD quad (its light palette index).
+pub const fn seam_of(quad: PackedQuad) -> Seam {
+    match quad.light_index() {
+        0 => Seam::None,
+        1 => Seam::Face,
+        _ => Seam::Middle,
+    }
+}
+
+/// Per face bucket of a LOD mesh, `[on a node face, on a middle plane]`: the quads at the end of
+/// the bucket marked [`Seam::Middle`], and the ones marked [`Seam::Face`] right before them, the
+/// order [`mesh_node`] gives. The renderer may leave those out (each run, or the middle one
+/// alone); anything else counts as a face of the mesher, always drawn.
+pub fn seam_counts(mesh: &ChunkMesh) -> [[u32; 2]; 6] {
+    std::array::from_fn(|b| {
+        let quads = mesh.bucket(b);
+        let middle = quads
+            .iter()
+            .rev()
+            .take_while(|&&q| seam_of(q) == Seam::Middle)
+            .count();
+        let face = quads[..quads.len() - middle]
+            .iter()
+            .rev()
+            .take_while(|&&q| seam_of(q) == Seam::Face)
+            .count();
+        [face as u32, middle as u32]
+    })
+}
+
 /// Meshes a LOD node: `padded` filled by [`LodMaterials::fill`], meshed without light and AO,
-/// then [`split_octants`], [`add_skirts`] and, at `level` 1, [`add_fluid_walls`].
+/// then [`split_octants`], [`add_skirts`] and, at `level` 1, [`add_fluid_walls`]. In each bucket
+/// the mesher's faces come first, then the quads on a node face, then those on a middle plane
+/// ([`seam_counts`]).
 pub fn mesh_node(
     mesher: &mut Mesher,
     padded: &PaddedChunk,
@@ -202,7 +258,8 @@ pub fn split_octants(mesh: &mut ChunkMesh) {
 /// cells (Chebyshev, inside the padded grid) gets a face toward the plane, in its own material
 /// (fluid cells too: a coarser fluid top stands up to a cell above a finer one). Skirts merge
 /// greedily per plane, material and octant; each goes into the bucket of its face, a cube face
-/// of its cell's octant. `padded` is the node as [`LodMaterials::fill`] wrote it.
+/// of its cell's octant, after the quads there before it and marked with its plane's [`Seam`].
+/// `padded` is the node as [`LodMaterials::fill`] wrote it.
 pub fn add_skirts(padded: &PaddedChunk, materials: &LodMaterials, mesh: &mut ChunkMesh) {
     let near_air = near_air(padded);
     let mut extra = Vec::new();
@@ -216,7 +273,7 @@ pub fn add_skirts(padded: &PaddedChunk, materials: &LodMaterials, mesh: &mut Chu
             },
             padded,
         );
-        merge_grid(&grid, face, n, materials.table(), &mut extra);
+        merge_grid(&grid, face, n, materials.table(), seam(n), &mut extra);
     }
     append(mesh, extra);
 }
@@ -228,7 +285,8 @@ pub fn add_skirts(padded: &PaddedChunk, materials: &LodMaterials, mesh: &mut Chu
 /// with air across, which the mesher drew). A ray that enters the translucent full-detail fluid
 /// next to a level-1 node and crosses under its surface into the node meets a side there
 /// instead of the sky, even where the cell rule rounded the cell across up to ground; where the
-/// node draws the cells across, the walls lie inside them and are never seen.
+/// node draws the cells across, the walls lie inside them and are never seen. Ordered and
+/// marked like the skirts.
 pub fn add_fluid_walls(
     padded: &PaddedChunk,
     materials: &LodMaterials,
@@ -252,7 +310,7 @@ pub fn add_fluid_walls(
             },
             padded,
         );
-        merge_grid(&grid, face, n, materials.table(), &mut extra);
+        merge_grid(&grid, face, n, materials.table(), seam(n), &mut extra);
     }
     append(mesh, extra);
 }
@@ -274,6 +332,16 @@ fn plane_faces() -> impl Iterator<Item = (Face, i32)> {
             up.into_iter().chain(down)
         })
     })
+}
+
+/// The [`Seam`] of the quads of [`plane_faces`] at normal coordinate `n`: the cells by a middle
+/// plane are 15 and 16.
+fn seam(n: i32) -> Seam {
+    if n == OCTANT_CELLS as i32 - 1 || n == OCTANT_CELLS as i32 {
+        Seam::Middle
+    } else {
+        Seam::Face
+    }
 }
 
 /// The cell offset across `face`.
@@ -311,12 +379,13 @@ fn face_grid(
 }
 
 /// Greedy rectangles of equal material in `grid` (0 = none), never across an octant border
-/// (cell 16 of u or v), as quads of `face` at normal coordinate `n`.
+/// (cell 16 of u or v), as quads of `face` at normal coordinate `n` marked `seam`.
 fn merge_grid(
     grid: &[[u16; 32]; 32],
     face: Face,
     n: i32,
     table: &MaterialTable,
+    seam: Seam,
     out: &mut Vec<PackedQuad>,
 ) {
     let (na, ua, va) = face.axes();
@@ -361,7 +430,8 @@ fn merge_grid(
                 face,
                 table.layer(m, face),
             )
-            .with_flags(flags | layout::SHAPE_CUBE << 1);
+            .with_flags(flags | layout::SHAPE_CUBE << 1)
+            .with_light_index(seam as u16);
             out.push(quad);
             u0 = u1;
         }
@@ -471,7 +541,8 @@ fn reshaped(q: PackedQuad, pos: [u32; 3], w: u32, h: u32) -> PackedQuad {
     }
 }
 
-/// Adds `extra` cube quads (open sky, palette entry 0) to `mesh`, each in the bucket of its face.
+/// Adds `extra` cube quads (open sky, marked with their [`Seam`]) to `mesh`, each in the bucket
+/// of its face, every bucket in [`Seam`] order (stable: the quads of a seam keep theirs).
 fn append(mesh: &mut ChunkMesh, extra: Vec<PackedQuad>) {
     if extra.is_empty() {
         return;
@@ -483,14 +554,17 @@ fn append(mesh: &mut ChunkMesh, extra: Vec<PackedQuad>) {
     for q in extra {
         buckets[q.face().index()].push(q);
     }
+    for quads in &mut buckets {
+        quads.sort_by_key(|&q| seam_of(q));
+    }
     set_buckets(mesh, buckets);
 }
 
-/// Writes `buckets` into `mesh` bucket-contiguous, with an open-sky palette entry 0 (what the
-/// mesher gives a mesh without light) and a new hash.
+/// Writes `buckets` into `mesh` bucket-contiguous, with the palette [`LOD_PALETTE`] (open sky:
+/// what the mesher gives a mesh without light, once per [`Seam`]) and a new hash.
 fn set_buckets(mesh: &mut ChunkMesh, buckets: [Vec<PackedQuad>; BUCKET_COUNT]) {
     debug_assert!(
-        mesh.palette.is_empty() || mesh.palette[0] == FULL_SKY_ENTRY,
+        mesh.palette.iter().all(|&e| e == FULL_SKY_ENTRY),
         "LOD meshes have no light"
     );
     mesh.quads.clear();
@@ -498,8 +572,9 @@ fn set_buckets(mesh: &mut ChunkMesh, buckets: [Vec<PackedQuad>; BUCKET_COUNT]) {
         mesh.bucket_counts[b] = quads.len() as u32;
         mesh.quads.extend_from_slice(quads);
     }
-    if !mesh.quads.is_empty() && mesh.palette.is_empty() {
-        mesh.palette.push(FULL_SKY_ENTRY);
+    mesh.palette.clear();
+    if !mesh.quads.is_empty() {
+        mesh.palette.extend_from_slice(&LOD_PALETTE);
     }
     mesh.hash = mesh.compute_hash();
 }
