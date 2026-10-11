@@ -15,13 +15,17 @@
 //! ([`KeepExtent`]) by two lod-1 nodes, so every chunk the main renderer may still draw lies
 //! inside a wanted lod-1 node, and `T_k = max(32 R 2^k, T_(k-1) + 2 e_k)`: every ring is at least
 //! two of its nodes wide, and the horizon stays the preset's `32 R 2^K` unless the keep region
-//! reaches it. When `T_1` itself passes the preset's horizon (a huge vertical radius without
-//! vertical bounds, an eye kilometers above a fixed-height world), the guard turns the LOD off.
+//! reaches it. When the keep region shrinks (a smaller radius), the chunks it left stay published
+//! until the world unloads them, a budget at a time: `T_1` keeps its reach until it covers them
+//! all again ([`reaches_published`]). When `T_1` itself passes the preset's horizon (a huge
+//! vertical radius without vertical bounds, an eye kilometers above a fixed-height world), the
+//! guard turns the LOD off.
 //!
 //! The set of wanted layers of a column is an interval (the distance to a box grows with its
 //! vertical gap), so the walk is per column: [`plan`] keeps one wanted interval per column and
 //! level, and for `k >= 2` the refined part of it, whose children columns want twice its layers.
 
+use super::coverage::ChunkCoverage;
 use crate::interest::Viewer;
 use boxel_math::{DVec3, I64Vec3, Vec3};
 use boxel_voxel::{BlockPos, ChunkKey, ChunkPos, DimensionId, MAX_CHUNK_COORD};
@@ -170,6 +174,40 @@ impl Thresholds {
     pub fn guard_holds(&self) -> bool {
         self.t[1] > self.preset - 2.0 * node_edge(1) as f64
     }
+}
+
+/// True if every published chunk of `cov` lies in a lod-1 node that a plan under `th` from `eye`
+/// wants: its level-2 parent is nearer than `T_1` (refined whatever the hysteresis; its own
+/// ancestors are nearer still than their thresholds), or with one level the node itself is
+/// nearer than the horizon. Chunks above `ceiling >> 1` lie in nodes no plan wants (all air at
+/// the generator's level). A walk over the coverage: called only while `T_1` would shrink.
+pub(crate) fn reaches_published(
+    eye: &Eye,
+    th: &Thresholds,
+    ceiling: Option<i64>,
+    cov: &ChunkCoverage,
+) -> bool {
+    let t1 = th.level(1);
+    cov.positions().all(|p| {
+        if cov.get(p).published == 0 || ceiling.is_some_and(|c| p.y > c >> 1) {
+            return true;
+        }
+        let lod1 = ChunkKey {
+            dim: DimensionId(0),
+            lod: 1,
+            pos: p,
+        };
+        let key = if th.levels() >= 2 {
+            ChunkKey {
+                lod: 2,
+                pos: ChunkPos::new(p.x >> 1, p.y >> 1, p.z >> 1),
+                ..lod1
+            }
+        } else {
+            lod1
+        };
+        eye.distance(key) < t1
+    })
 }
 
 /// The eye of the LOD in blocks: an integer block and the fraction inside it, so distances to

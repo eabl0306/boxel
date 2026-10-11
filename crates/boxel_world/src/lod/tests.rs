@@ -757,8 +757,7 @@ fn fill(app: &mut App, model: &mut Model, max: usize) -> usize {
     );
 }
 
-/// The incremental covered bits equal a from-scratch walk (bits of parents known to be uniform
-/// are never read and may be stale).
+/// The incremental covered bits equal a from-scratch walk.
 fn assert_bits_from_scratch(app: &App) {
     let lod = app.world().resource::<LodWorld>();
     let cov = app.world().resource::<LodCoverage>().coverage().clone();
@@ -1417,6 +1416,79 @@ fn a_high_eye_over_a_fixed_height_world_wants_no_air_layers() {
         2 * high <= 3 * ground,
         "{high} columns at y 3000, {ground} at y 80"
     );
+}
+
+/// Every chunk the main renderer draws.
+fn published_chunks(app: &App) -> Vec<ChunkPos> {
+    let cov = app.world().resource::<LodCoverage>().coverage();
+    cov.positions()
+        .flat_map(|p| (0..8).map(move |o| chunk_of_octant(p, o)))
+        .filter(|&c| cov.published(c))
+        .collect()
+}
+
+/// A smaller radius leaves published chunks past the new keep region until the world unloads
+/// them, a budget at a time. Meanwhile `T_1` keeps its reach: every published chunk stays inside a
+/// wanted lod-1 node (else its level-2 parent would hide the octant of a touched child nobody
+/// builds, and the sky would show through the unpublished ground there).
+#[test]
+fn shrinking_the_radius_keeps_every_published_chunk_inside_a_wanted_lod1_node() {
+    let mut app = app(Steps::new(20), small());
+    let viewer = app
+        .world_mut()
+        .spawn((
+            Transform::from_translation(DVec3::new(10.0, 60.0, 10.0)),
+            ChunkViewer::new(20).with_vertical_radius(1),
+        ))
+        .id();
+    let mut model = Model::default();
+    for i in 0.. {
+        frame(&mut app, &mut model);
+        let stats = app.world().resource::<WorldStats>();
+        if i > 1 && stats.chunks > 0 && stats.is_settled() {
+            break;
+        }
+        assert!(i < 600, "the world did not settle");
+    }
+    fill(&mut app, &mut model, 600);
+    let t1 = |app: &App| {
+        app.world()
+            .resource::<LodWorld>()
+            .planned
+            .expect("planned")
+            .th
+            .level(1)
+    };
+    assert!(t1(&app) > 576.0, "{}", t1(&app));
+    // The unloads take many frames.
+    app.world_mut()
+        .resource_mut::<WorldSettings>()
+        .interest_budget = Duration::from_nanos(1);
+    app.world_mut()
+        .entity_mut(viewer)
+        .get_mut::<ChunkViewer>()
+        .expect("viewer")
+        .radius = 2;
+    let (mut held, mut frames) = (0, 0);
+    while t1(&app) > 512.0 {
+        frame(&mut app, &mut model);
+        let lod = app.world().resource::<LodWorld>();
+        for c in published_chunks(&app) {
+            let (key, _) = node_of_chunk(c, 1);
+            assert!(
+                lod.tree.wanted(key),
+                "frame {frames}: {c:?} published outside the wanted lod-1 nodes (T_1 {})",
+                t1(&app)
+            );
+        }
+        assert_published_hidden(&app, &model);
+        held += usize::from(t1(&app) > 512.0);
+        frames += 1;
+        assert!(frames < 400, "T_1 still {} after {frames} frames", t1(&app));
+    }
+    assert!(held > 10, "T_1 held for {held} frames");
+    fill(&mut app, &mut model, 300);
+    assert_bits_from_scratch(&app);
 }
 
 #[test]

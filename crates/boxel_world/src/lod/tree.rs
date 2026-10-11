@@ -404,12 +404,14 @@ impl Tree {
             .get_mut(&key.pos.y)
     }
 
-    /// True if `key` lies outside its column's known band (uniform, no record).
+    /// True if `key` is wanted and lies outside its column's known band (uniform, no record).
+    /// Only wanted layers count: an unwanted column is dropped with its band, and its layers'
+    /// covered state must not change then (nothing would tell their parents).
     pub(crate) fn known_uniform(&self, key: ChunkKey) -> bool {
-        self.columns
-            .get(&ColumnKey::of(key))
-            .and_then(|c| c.band)
-            .is_some_and(|b| b.uniform_at(key.pos.y).is_some())
+        self.columns.get(&ColumnKey::of(key)).is_some_and(|c| {
+            contains(c.plan.wanted, key.pos.y)
+                && c.band.is_some_and(|b| b.uniform_at(key.pos.y).is_some())
+        })
     }
 
     /// True if node `key` is wanted.

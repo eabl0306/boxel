@@ -500,6 +500,9 @@ pub(crate) struct LodWorld {
     settings: Option<LodSettings>,
     error: Option<LodSettingsError>,
     planned: Option<Planned>,
+    /// The keep extent the last thresholds followed (held while published chunks lie past a
+    /// smaller one: [`plan::reaches_published`]).
+    keep: Option<KeepExtent>,
     /// The wanted tree the nodes follow.
     plan: Plan,
     /// The eye each level was last planned from (`level_eyes[k]`).
@@ -531,6 +534,7 @@ impl LodWorld {
             settings: None,
             error: None,
             planned: None,
+            keep: None,
             plan: Plan::default(),
             level_eyes: [None; MAX_LEVELS as usize + 1],
             view: View {
@@ -657,6 +661,24 @@ impl LodWorld {
             world.unload_hysteresis,
             world.vertical_bounds.as_ref(),
         );
+        // A smaller keep region leaves published chunks behind until the world unloads them:
+        // `T_1` keeps its reach until it covers them again (else a level-2 node would hide the
+        // octant of a touched child nobody builds, and the sky would show through the ground).
+        let keep = match self.keep {
+            Some(held)
+                if settings.thresholds(keep).level(1) < settings.thresholds(held).level(1)
+                    && !plan::reaches_published(
+                        &eye,
+                        &settings.thresholds(keep),
+                        self.ceiling,
+                        cov,
+                    ) =>
+            {
+                held
+            }
+            _ => keep,
+        };
+        self.keep = Some(keep);
         let th = settings.thresholds(keep);
         if th.guard() || (self.off == Some(LodOff::Guard) && th.guard_holds()) {
             self.turn_off(LodOff::Guard, generator);
