@@ -866,6 +866,18 @@ fn lod_gpu_path_matches_its_mirrors() {
         .find(|e| e.name == "cull_lod")
         .expect("cull_lod");
     assert_eq!(ep.workgroup_size, [b::CULL_WORKGROUP_SIZE, 1, 1]);
+    // The occlusion test keeps a margin over the edge growth, and the pyramid's workgroups are
+    // what the renderer dispatches.
+    let (hiz, _) = load(ShaderModuleId::LodHiz);
+    let reduce = hiz
+        .entry_points
+        .iter()
+        .find(|e| e.name == "hiz_reduce")
+        .expect("hiz_reduce");
+    let e = b::HIZ_WORKGROUP_EDGE;
+    assert_eq!(reduce.workgroup_size, [e, e, 1]);
+    let margin = const_f32(&cull, "LOD_HIZ_MARGIN");
+    assert!(margin > 1.001 && margin < 1.01, "{margin}");
     // vs_lod_pull reads the View (group 1) and the LOD geometry (its own group), nothing else.
     let i = pull
         .entry_points

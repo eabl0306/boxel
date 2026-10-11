@@ -686,8 +686,7 @@ impl VoxelRenderer {
     pub fn set_fog(&mut self, device: &wgpu::Device, input: Option<FogInput>) {
         let Some(input) = input else {
             if self.fog.take().is_some() {
-                self.targets = Targets::new(device, self.targets.size, false);
-                self.blit.rebind(device, &self.targets.color_view);
+                self.sample_depth(device);
             }
             return;
         };
@@ -716,8 +715,7 @@ impl VoxelRenderer {
                         result.err().unwrap_or_default()
                     );
                     self.fog_failed = true;
-                    self.targets = Targets::new(device, self.targets.size, false);
-                    self.blit.rebind(device, &self.targets.color_view);
+                    self.sample_depth(device);
                     return;
                 }
             }
@@ -767,7 +765,9 @@ impl VoxelRenderer {
     /// [`ViewParams::fog_end`] (the fog layers keep those).
     pub fn set_lod(&mut self, device: &wgpu::Device, input: Option<LodInput>) {
         let Some(input) = input else {
-            self.lod = None;
+            if self.lod.take().is_some() {
+                self.sample_depth(device);
+            }
             return;
         };
         if self.lod_failed {
@@ -807,7 +807,11 @@ impl VoxelRenderer {
                 Ok(())
             });
             match (built, pass) {
-                (Ok(()), Some(pass)) => self.lod = Some(pass),
+                (Ok(()), Some(pass)) => {
+                    // The GPU-driven path reads the depth of the solid terrain (its pyramid).
+                    self.lod = Some(pass);
+                    self.sample_depth(device);
+                }
                 (result, _) => {
                     tracing::error!(
                         "far LOD pass: {}; the LOD stays off",
@@ -820,6 +824,24 @@ impl VoxelRenderer {
         }
         if let Some(lod) = &mut self.lod {
             lod.apply(input);
+        }
+    }
+
+    /// Makes the depth target again if whether it can be bound as a texture changed: it can while
+    /// the fog marches it or the far LOD's GPU-driven path builds its pyramid from it; else its
+    /// usage is exactly `RENDER_ATTACHMENT`, as without them.
+    fn sample_depth(&mut self, device: &wgpu::Device) {
+        let want = self.fog.is_some() || self.lod.as_ref().is_some_and(LodPass::gpu_driven);
+        let has = self
+            .targets
+            .depth_usage
+            .contains(wgpu::TextureUsages::TEXTURE_BINDING);
+        if want != has {
+            self.targets = Targets::new(device, self.targets.size, want);
+            self.blit.rebind(device, &self.targets.color_view);
+            if let Some(fog) = &mut self.fog {
+                fog.rebind_depth(device, &self.targets.depth_view);
+            }
         }
     }
 
@@ -860,6 +882,13 @@ impl VoxelRenderer {
             self.lod_gpu_driven = on;
             self.lod = None;
         }
+    }
+
+    /// Testing (High, GPU-driven LOD): the draws the last frame's LOD cull wrote (waits for the
+    /// GPU); `None` without that path.
+    #[doc(hidden)]
+    pub fn debug_lod_gpu_draws(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Option<u32> {
+        self.lod.as_ref()?.read_gpu_draws(device, queue)
     }
 
     /// True if the far LOD pass draws through the GPU-driven path (High).
@@ -1223,7 +1252,29 @@ impl VoxelRenderer {
             lod.prepare(device, queue, encoder, cull_view, sealed);
         }
         self.path.encode_compute(encoder, slot_count);
-        let draws = {
+        let draws = if let Some(lod) = self.lod.as_mut().filter(|l| l.culls_after_solid()) {
+            // High with LOD to draw: the main pass ends after the opaque and cutout terrain, the
+            // LOD is culled against the depth pyramid of what they wrote, and the pass goes on.
+            let solid = {
+                let mut pass = self.targets.begin_main_pass(encoder, view.clear_color);
+                pass.set_bind_group(bindings::GROUP_MATERIALS, &self.materials, &[]);
+                pass.set_bind_group(bindings::GROUP_VIEW, &self.view_bind_group, &[]);
+                self.path.draw_solid(&mut pass, self.arena.buffer())
+            };
+            {
+                let _span = frame_span!("render.lod");
+                lod.cull_after_solid(device, encoder, &self.targets);
+            }
+            let mut pass = self.targets.continue_main_pass(encoder);
+            pass.set_bind_group(bindings::GROUP_MATERIALS, &self.materials, &[]);
+            pass.set_bind_group(bindings::GROUP_VIEW, &self.view_bind_group, &[]);
+            {
+                let _span = frame_span!("render.lod");
+                lod.draw(&mut pass);
+            }
+            self.outline.draw(&mut pass);
+            solid + self.path.draw_translucent(&mut pass, self.arena.buffer())
+        } else {
             let mut pass = self.targets.begin_main_pass(encoder, view.clear_color);
             pass.set_bind_group(bindings::GROUP_MATERIALS, &self.materials, &[]);
             pass.set_bind_group(bindings::GROUP_VIEW, &self.view_bind_group, &[]);

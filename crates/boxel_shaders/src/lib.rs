@@ -37,6 +37,9 @@ pub const LOD_WGSL: &str = include_str!("../shaders/lod.wgsl");
 pub const LOD_PULL_WGSL: &str = include_str!("../shaders/lod_pull.wgsl");
 /// `lod_cull.wgsl`: High GPU culling of the far LOD nodes (`cull_lod`, ADR 0031).
 pub const LOD_CULL_WGSL: &str = include_str!("../shaders/lod_cull.wgsl");
+/// `lod_hiz.wgsl`: the depth pyramid the far LOD's High cull tests against (`hiz_reduce`,
+/// ADR 0031).
+pub const LOD_HIZ_WGSL: &str = include_str!("../shaders/lod_hiz.wgsl");
 
 /// Shader stage of an entry point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +78,8 @@ pub enum ShaderModuleId {
     /// common + `lod_cull`: GPU culling of the far LOD nodes (tier High, only with the LOD
     /// plugin).
     LodCull,
+    /// `lod_hiz`: the depth pyramid of the far LOD's cull (tier High, only with the LOD plugin).
+    LodHiz,
 }
 
 static VOXEL_PULL: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{VOXEL_PULL_WGSL}"));
@@ -89,7 +94,7 @@ static LOD_CULL: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{LO
 
 impl ShaderModuleId {
     /// All modules.
-    pub const ALL: [ShaderModuleId; 10] = [
+    pub const ALL: [ShaderModuleId; 11] = [
         ShaderModuleId::VoxelPull,
         ShaderModuleId::VoxelInstanced,
         ShaderModuleId::Cull,
@@ -100,6 +105,7 @@ impl ShaderModuleId {
         ShaderModuleId::Lod,
         ShaderModuleId::LodPull,
         ShaderModuleId::LodCull,
+        ShaderModuleId::LodHiz,
     ];
 
     /// Debug label.
@@ -115,6 +121,7 @@ impl ShaderModuleId {
             ShaderModuleId::Lod => "boxel lod",
             ShaderModuleId::LodPull => "boxel lod_pull",
             ShaderModuleId::LodCull => "boxel lod_cull",
+            ShaderModuleId::LodHiz => "boxel lod_hiz",
         }
     }
 
@@ -131,6 +138,7 @@ impl ShaderModuleId {
             ShaderModuleId::Lod => LOD.as_str(),
             ShaderModuleId::LodPull => LOD_PULL.as_str(),
             ShaderModuleId::LodCull => LOD_CULL.as_str(),
+            ShaderModuleId::LodHiz => LOD_HIZ_WGSL,
         }
     }
 
@@ -175,6 +183,7 @@ impl ShaderModuleId {
                 &[("vs_lod_pull", Stage::Vertex), ("fs_lod", Stage::Fragment)]
             }
             ShaderModuleId::LodCull => &[("cull_lod", Stage::Compute)],
+            ShaderModuleId::LodHiz => &[("hiz_reduce", Stage::Compute)],
         }
     }
 
@@ -190,7 +199,8 @@ impl ShaderModuleId {
             ShaderModuleId::VoxelPull
             | ShaderModuleId::Cull
             | ShaderModuleId::LodPull
-            | ShaderModuleId::LodCull => (4, 3),
+            | ShaderModuleId::LodCull
+            | ShaderModuleId::LodHiz => (4, 3),
             ShaderModuleId::VoxelInstanced
             | ShaderModuleId::Blit
             | ShaderModuleId::Overlay

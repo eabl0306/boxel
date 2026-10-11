@@ -78,10 +78,10 @@ pub(crate) trait TierPath {
     fn draw_solid(&self, pass: &mut wgpu::RenderPass<'_>, arena: &wgpu::Buffer) -> u32;
 
     /// Records the translucent buckets ([`translucent_draws`], back to front) with the
-    /// translucent pipeline, after [`TierPath::draw_solid`] in the same pass. Something else
-    /// may have been drawn in between (the block outline, ADR 0026): it sets every vertex
-    /// buffer and immediate it uses again (groups 0 to 2 stay bound). Returns the draw calls
-    /// recorded.
+    /// translucent pipeline, after [`TierPath::draw_solid`]. Something else may have been drawn
+    /// in between (the block outline, ADR 0026; the far LOD, ADR 0031), even in a new pass with
+    /// only groups 0 and 1 bound: it sets every other group, buffer and immediate it uses again.
+    /// Returns the draw calls recorded.
     fn draw_translucent(&self, pass: &mut wgpu::RenderPass<'_>, arena: &wgpu::Buffer) -> u32;
 }
 

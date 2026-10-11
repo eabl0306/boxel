@@ -9,6 +9,12 @@
 // has at most 6 * LOD_SEGMENT_SLOTS <= 65535 draws (Vulkan's minimum maxDrawIndirectCount), so no
 // list can overflow and every draw is written. The *_count path is NOT validated by wgpu: index
 // counts stay within the shared index buffer (MAX_QUADS_PER_BUCKET quads).
+//
+// The cull runs after the opaque and cutout terrain is drawn, with its depth pyramid
+// (lod_hiz.wgsl): a node whose nearest point lies behind the farthest full-detail depth over its
+// whole screen rectangle (a pixel of margin for the edge growth of finish_vertex) would lose
+// every depth test, so it is not drawn. Underground, where the rock in front covers the screen,
+// nothing of the LOD is.
 struct DrawArgs { index_count: u32, instance_count: u32, first_index: u32, base_vertex: i32, first_instance: u32 };
 struct LodNodeGpu { node: vec4<i32>, quad_base: u32, counts: array<u32, 3> };
 
@@ -17,6 +23,7 @@ struct LodNodeGpu { node: vec4<i32>, quad_base: u32, counts: array<u32, 3> };
 @group(0) @binding(2) var<storage, read_write> draw_args: array<DrawArgs>;
 @group(0) @binding(3) var<storage, read_write> draw_refs: array<vec2<u32>>;
 @group(0) @binding(4) var<storage, read_write> counts: array<atomic<u32>>;
+@group(0) @binding(5) var hiz: texture_2d<f32>;
 
 const LOD_LEVEL_MASK: u32 = 15u;
 const LOD_HIDDEN_MASK: u32 = 0xFFu;
@@ -24,6 +31,8 @@ const LOD_LIVE_BIT: u32 = 0x4000u;
 // Slots per segment, and the draws its list holds (boxel_shaders::gpu::lod, checked by a naga test).
 const LOD_SEGMENT_SLOTS: u32 = 10922u;
 const LOD_SEGMENT_DRAWS: u32 = 65532u;
+// A node's nearest depth is taken this much nearer before the occlusion test (occluded).
+const LOD_HIZ_MARGIN: f32 = 1.004;
 // Quads covered by the shared index buffer (boxel_mesh::MAX_QUADS_PER_BUCKET).
 const MAX_QUADS_PER_BUCKET: u32 = 98304u;
 
@@ -48,6 +57,46 @@ fn bucket_visible(f: u32, mn: vec3<f32>, mx: vec3<f32>, cam: vec3<f32>) -> bool 
   }
 }
 
+// True if the box [mn, mx] (relative to the render origin) lies behind full detail over its
+// whole screen rectangle. Never for a box reaching the camera's plane.
+fn occluded(mn: vec3<f32>, mx: vec3<f32>) -> bool {
+  var lo = vec2(1.0e9);
+  var hi = vec2(-1.0e9);
+  var nearest = 0.0;
+  for (var c = 0u; c < 8u; c++) {
+    let p = select(mn, mx, vec3((c & 1u) != 0u, (c & 2u) != 0u, (c & 4u) != 0u));
+    let clip = view.view_proj * vec4(p, 1.0);
+    if (clip.w <= 1.0e-3) { return false; }
+    let ndc = clip.xyz / clip.w;
+    lo = min(lo, ndc.xy);
+    hi = max(hi, ndc.xy);
+    nearest = max(nearest, ndc.z);
+  }
+  let size = view.viewport.xy;
+  // NDC to pixels (y down), a pixel of margin, clamped to the target.
+  let p0 = clamp(vec2(lo.x * 0.5 + 0.5, 0.5 - hi.y * 0.5) * size - 1.0, vec2(0.0), size - 1.0);
+  let p1 = clamp(vec2(hi.x * 0.5 + 0.5, 0.5 - lo.y * 0.5) * size + 1.0, vec2(0.0), size - 1.0);
+  // The level whose texels (2^(m+1) pixels) are at least the rectangle's size: it touches at
+  // most 2 x 2 of them.
+  let extent = max(p1.x - p0.x, p1.y - p0.y);
+  // The pyramid halves its level 0 (rounding down) until its longer side is 1: its last level
+  // is floor(log2(longer side)).
+  let side = textureDimensions(hiz, 0);
+  let top = i32(firstLeadingBit(max(side.x, side.y)));
+  let m = clamp(i32(ceil(log2(max(extent, 1.0)))) - 1, 0, top);
+  let texel = f32(2 << u32(m));
+  let last = vec2<i32>(textureDimensions(hiz, m)) - 1;
+  let t0 = min(vec2<i32>(floor(p0 / texel)), last);
+  let t1 = min(vec2<i32>(floor(p1 / texel)), last);
+  let farthest = min(
+    min(textureLoad(hiz, t0, m).r, textureLoad(hiz, vec2(t1.x, t0.y), m).r),
+    min(textureLoad(hiz, vec2(t0.x, t1.y), m).r, textureLoad(hiz, t1, m).r),
+  );
+  // The edge growth of finish_vertex moves a vertex by up to half a pixel, which can bring it
+  // nearer than the box by about that much: 0.07 % of its distance. A margin of 0.4 % covers it.
+  return nearest * LOD_HIZ_MARGIN < farthest;
+}
+
 @compute @workgroup_size(64)
 fn cull_lod(@builtin(global_invocation_id) gid: vec3<u32>) {
   let slot = gid.x;
@@ -60,7 +109,7 @@ fn cull_lod(@builtin(global_invocation_id) gid: vec3<u32>) {
   let origin = vec3(n.node.x & ~i32(LOD_LEVEL_MASK), n.node.y, n.node.z);
   let mn = vec3<f32>(origin - view.render_origin.xyz);
   let mx = mn + vec3(f32(32u << k));
-  if (!in_frustum(mn, mx)) { return; }
+  if (!in_frustum(mn, mx) || occluded(mn, mx)) { return; }
   let seg = slot / LOD_SEGMENT_SLOTS;
   let first = seg * LOD_SEGMENT_DRAWS;
   var start = n.quad_base;

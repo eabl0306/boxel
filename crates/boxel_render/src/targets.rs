@@ -1,6 +1,10 @@
 //! Main color + depth targets and the blit pipeline.
 use crate::{DEPTH_FORMAT, MAIN_COLOR_FORMAT};
 use boxel_math::UVec2;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Source of [`Targets::generation`].
+static GENERATION: AtomicU64 = AtomicU64::new(1);
 use boxel_shaders::{ShaderModuleId, create_module};
 
 /// Main color (`MAIN_COLOR_FORMAT`) and depth (`DEPTH_FORMAT`) of one size.
@@ -16,6 +20,9 @@ pub(crate) struct Targets {
     pub depth_usage: wgpu::TextureUsages,
     /// Size in pixels (never 0).
     pub size: UVec2,
+    /// Unique per pair of targets created: what holds views of them (the far LOD's depth
+    /// pyramid) knows when to make them again.
+    pub generation: u64,
 }
 
 impl Targets {
@@ -63,6 +70,7 @@ impl Targets {
             depth_usage,
             color,
             size,
+            generation: GENERATION.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -72,6 +80,37 @@ impl Targets {
         encoder: &'e mut wgpu::CommandEncoder,
         clear: [f32; 4],
     ) -> wgpu::RenderPass<'e> {
+        self.main_pass(encoder, Some(clear))
+    }
+
+    /// Begins the rest of a main pass that was ended to read its depth (the far LOD's depth
+    /// pyramid on High): color and depth are loaded as they are.
+    pub fn continue_main_pass<'e>(
+        &self,
+        encoder: &'e mut wgpu::CommandEncoder,
+    ) -> wgpu::RenderPass<'e> {
+        self.main_pass(encoder, None)
+    }
+
+    /// The main pass, cleared to `clear` (and depth 0), or loading both without it.
+    fn main_pass<'e>(
+        &self,
+        encoder: &'e mut wgpu::CommandEncoder,
+        clear: Option<[f32; 4]>,
+    ) -> wgpu::RenderPass<'e> {
+        let color = match clear {
+            Some(c) => wgpu::LoadOp::Clear(wgpu::Color {
+                r: f64::from(c[0]),
+                g: f64::from(c[1]),
+                b: f64::from(c[2]),
+                a: f64::from(c[3]),
+            }),
+            None => wgpu::LoadOp::Load,
+        };
+        let depth = match clear {
+            Some(_) => wgpu::LoadOp::Clear(0.0),
+            None => wgpu::LoadOp::Load,
+        };
         encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("boxel main"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -79,19 +118,14 @@ impl Targets {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: f64::from(clear[0]),
-                        g: f64::from(clear[1]),
-                        b: f64::from(clear[2]),
-                        a: f64::from(clear[3]),
-                    }),
+                    load: color,
                     store: wgpu::StoreOp::Store,
                 },
             })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &self.depth_view,
                 depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(0.0),
+                    load: depth,
                     store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,

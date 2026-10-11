@@ -211,6 +211,10 @@ impl TierPath for HighPath {
         if self.translucent.is_empty() {
             return 0;
         }
+        // Set again: the pass may be a new one (the far LOD's pyramid ends the first after the
+        // solid buckets), or the LOD bound its own geometry group.
+        pass.set_bind_group(bindings::GROUP_GEOMETRY, &self.geometry, &[]);
+        pass.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
         pass.set_pipeline(&self.voxel.translucent);
         pass.set_vertex_buffer(0, self.translucent_refs.slice(..));
         for (i, d) in self.translucent.iter().enumerate() {

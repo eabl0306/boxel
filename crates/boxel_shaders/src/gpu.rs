@@ -283,6 +283,8 @@ pub mod lod {
     pub const GROUP_GEOMETRY: u32 = 3;
     /// Workgroup size of `cull_lod`.
     pub const CULL_WORKGROUP_SIZE: u32 = 64;
+    /// Workgroup edge of `hiz_reduce` (8 x 8).
+    pub const HIZ_WORKGROUP_EDGE: u32 = 8;
 }
 
 const _: () = assert!(lod::SEGMENT_DRAWS <= bindings::MAX_DRAWS_PER_LIST);

@@ -29,6 +29,7 @@ use crate::arena::{ArenaAlloc, ArenaAllocator, QUAD_BYTES};
 use crate::chunk_table::{GPU_WINDOW, GPU_WINDOW_SLACK};
 use crate::path::bucket_visible;
 use crate::renderer::ViewParams;
+use crate::targets::Targets;
 use crate::{DEPTH_FORMAT, MAIN_COLOR_FORMAT};
 use boxel_math::{Aabb, I64Vec3, Vec3, wrap_to_i32};
 use boxel_mesh::{ChunkMesh, MAX_QUADS_PER_FACE_BUCKET};
@@ -260,6 +261,60 @@ impl LodPass {
                     segments,
                 );
             }
+        }
+    }
+
+    /// Testing (High): the draws the last frame's GPU cull wrote, every segment's together
+    /// (waits for the GPU); `None` on the instanced path or before any cull.
+    pub fn read_gpu_draws(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Option<u32> {
+        let gpu = self.gpu.as_ref()?;
+        let lists = gpu.lists.as_ref()?;
+        if gpu.segments == 0 {
+            return Some(0);
+        }
+        let bytes = 4 * u64::from(gpu.segments);
+        let read = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("boxel lod draw counts read"),
+            size: bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("boxel lod draw counts read"),
+        });
+        encoder.copy_buffer_to_buffer(&lists.counts, 0, &read, 0, bytes);
+        queue.submit([encoder.finish()]);
+        let slice = read.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+        rx.recv().ok()?.ok()?;
+        let mapped = slice.get_mapped_range().ok()?;
+        let draws = bytemuck::cast_slice::<u8, u32>(&mapped).iter().sum();
+        drop(mapped);
+        read.unmap();
+        Some(draws)
+    }
+
+    /// True if this frame's LOD is culled on the GPU after the opaque and cutout terrain (High,
+    /// with something to draw): the renderer then ends the main pass after them, calls
+    /// [`LodPass::cull_after_solid`] and draws the LOD and the rest in a second pass.
+    pub fn culls_after_solid(&self) -> bool {
+        self.gpu.as_ref().is_some_and(|g| g.segments > 0)
+    }
+
+    /// Records the cull of [`LodPass::culls_after_solid`]: the depth pyramid of `targets`
+    /// (holding the opaque and cutout terrain) and the node cull against it.
+    pub fn cull_after_solid(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        targets: &Targets,
+    ) {
+        if let Some(gpu) = &mut self.gpu {
+            gpu.cull_after_solid(device, encoder, targets);
         }
     }
 
@@ -872,6 +927,14 @@ fn copy(
     Ok(())
 }
 
+/// A bind group entry of all of `buffer`.
+fn buffer_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry {
+        binding,
+        resource: buffer.as_entire_binding(),
+    }
+}
+
 /// Bytes of one indirect draw.
 const ARGS_BYTES: u64 = size_of::<DrawIndexedIndirect>() as u64;
 
@@ -881,11 +944,29 @@ struct GpuDriven {
     cull_layout: wgpu::BindGroupLayout,
     pull: wgpu::RenderPipeline,
     geometry_layout: wgpu::BindGroupLayout,
+    hiz_pipeline: wgpu::ComputePipeline,
+    hiz_layout: wgpu::BindGroupLayout,
     inputs: GpuInputs,
     /// Sized for some segments, rebuilt larger when the slots pass them.
     lists: Option<GpuLists>,
-    /// Segments to draw this frame (0: none).
+    /// The depth pyramid of the main targets it was made for.
+    hiz: Option<HiZ>,
+    /// The cull's bind group over `lists` and `hiz` (made again when either is).
+    cull_group: Option<wgpu::BindGroup>,
+    /// Segments to draw this frame (0: none); their cull is recorded after the solid terrain.
     segments: u32,
+    /// Node slots the cull looks at this frame.
+    slots: u32,
+}
+
+/// The depth pyramid (`lod_hiz.wgsl`) of one pair of main targets.
+struct HiZ {
+    /// [`crate::targets::Targets::generation`] of the targets.
+    generation: u64,
+    /// Every level, for the cull.
+    view: wgpu::TextureView,
+    /// Level `m` from level `m - 1` (the depth for level 0), and its size.
+    levels: Vec<(wgpu::BindGroup, [u32; 2])>,
 }
 
 /// The node table and the draw lists, for `segments` segments.
@@ -896,7 +977,6 @@ struct GpuLists {
     refs: wgpu::Buffer,
     /// One draw count per segment (cleared before every cull).
     counts: wgpu::Buffer,
-    cull_group: wgpu::BindGroup,
     /// Group [`bits::GROUP_GEOMETRY`] of the pull pipeline: the LOD arena and the table.
     geometry: wgpu::BindGroup,
 }
@@ -908,6 +988,16 @@ impl GpuDriven {
         view: &wgpu::BindGroupLayout,
         inputs: GpuInputs,
     ) -> Self {
+        let texture = |binding, visibility| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
         let storage = |binding, read_only| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -935,6 +1025,7 @@ impl GpuDriven {
                 storage(2, false),
                 storage(3, false),
                 storage(4, false),
+                texture(5, wgpu::ShaderStages::COMPUTE),
             ],
         });
         let module = create_module(device, ShaderModuleId::LodCull);
@@ -965,14 +1056,110 @@ impl GpuDriven {
             label: Some("boxel lod geometry"),
             entries: &[vertex_storage(0), vertex_storage(1)],
         });
+        let hiz_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("boxel lod hiz"),
+            entries: &[
+                texture(0, wgpu::ShaderStages::COMPUTE),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::R32Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let module = create_module(device, ShaderModuleId::LodHiz);
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(ShaderModuleId::LodHiz.label()),
+            bind_group_layouts: &[Some(&hiz_layout)],
+            immediate_size: 0,
+        });
+        let hiz_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("boxel lod hiz"),
+            layout: Some(&layout),
+            module: &module,
+            entry_point: Some("hiz_reduce"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
         Self {
             cull,
             cull_layout,
             pull: pull_pipeline(device, materials, view, &geometry_layout),
             geometry_layout,
+            hiz_pipeline,
+            hiz_layout,
             inputs,
             lists: None,
+            hiz: None,
+            cull_group: None,
             segments: 0,
+            slots: 0,
+        }
+    }
+
+    /// The depth pyramid of `targets`: level 0 half their size, each level half the one below
+    /// (rounded down, as the texture's mips), until the longer side is 1.
+    fn hiz(&self, device: &wgpu::Device, targets: &Targets) -> HiZ {
+        let base = [(targets.size.x / 2).max(1), (targets.size.y / 2).max(1)];
+        let count = base[0].max(base[1]).ilog2() + 1;
+        let sizes: Vec<[u32; 2]> = (0..count)
+            .map(|m| [(base[0] >> m).max(1), (base[1] >> m).max(1)])
+            .collect();
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("boxel lod hiz"),
+            size: wgpu::Extent3d {
+                width: sizes[0][0],
+                height: sizes[0][1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: sizes.len() as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let level = |m: usize| {
+            texture.create_view(&wgpu::TextureViewDescriptor {
+                base_mip_level: m as u32,
+                mip_level_count: Some(1),
+                ..wgpu::TextureViewDescriptor::default()
+            })
+        };
+        let levels = (0..sizes.len())
+            .map(|m| {
+                let source = if m == 0 {
+                    targets.depth_view.clone()
+                } else {
+                    level(m - 1)
+                };
+                let target = level(m);
+                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("boxel lod hiz"),
+                    layout: &self.hiz_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&source),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&target),
+                        },
+                    ],
+                });
+                (group, sizes[m])
+            })
+            .collect();
+        HiZ {
+            generation: targets.generation,
+            view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            levels,
         }
     }
 
@@ -1008,29 +1195,13 @@ impl GpuDriven {
             4 * u64::from(segments),
             wgpu::BufferUsages::INDIRECT
                 | wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST,
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
         );
-        fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
-            wgpu::BindGroupEntry {
-                binding,
-                resource: buffer.as_entire_binding(),
-            }
-        }
-        let cull_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("boxel lod cull"),
-            layout: &self.cull_layout,
-            entries: &[
-                entry(0, &self.inputs.view),
-                entry(1, &table),
-                entry(2, &args),
-                entry(3, &refs),
-                entry(4, &counts),
-            ],
-        });
         let geometry = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("boxel lod geometry"),
             layout: &self.geometry_layout,
-            entries: &[entry(0, arena), entry(1, &table)],
+            entries: &[buffer_entry(0, arena), buffer_entry(1, &table)],
         });
         GpuLists {
             segments,
@@ -1038,13 +1209,12 @@ impl GpuDriven {
             args,
             refs,
             counts,
-            cull_group,
             geometry,
         }
     }
 
-    /// Writes the changed table entries and records the cull of `segments` segments (none: no
-    /// cull, nothing drawn).
+    /// Writes the changed table entries and clears the draw counts of `segments` segments (none:
+    /// no cull, nothing drawn); [`GpuDriven::cull_after_solid`] records the cull.
     fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -1058,6 +1228,7 @@ impl GpuDriven {
         let fresh = self.lists.as_ref().is_none_or(|l| l.segments < needed);
         if fresh {
             self.lists = Some(self.lists(device, arena, needed));
+            self.cull_group = None;
         }
         let Some(lists) = &self.lists else {
             return;
@@ -1071,18 +1242,67 @@ impl GpuDriven {
             );
         }
         self.segments = segments.min(lists.segments);
+        self.slots = (nodes.slots.len() as u32).min(capacity);
+        if self.segments > 0 {
+            encoder.clear_buffer(&lists.counts, 0, None);
+        }
+    }
+
+    /// Records, after the opaque and cutout terrain is drawn into `targets`, the depth pyramid
+    /// of their depth and the cull of the frame's segments (none: nothing).
+    fn cull_after_solid(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        targets: &Targets,
+    ) {
         if self.segments == 0 {
             return;
         }
-        encoder.clear_buffer(&lists.counts, 0, None);
+        if self
+            .hiz
+            .as_ref()
+            .is_none_or(|h| h.generation != targets.generation)
+        {
+            self.hiz = Some(self.hiz(device, targets));
+            self.cull_group = None;
+        }
+        let (Some(lists), Some(hiz)) = (&self.lists, &self.hiz) else {
+            return;
+        };
+        let cull_group = self.cull_group.get_or_insert_with(|| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("boxel lod cull"),
+                layout: &self.cull_layout,
+                entries: &[
+                    buffer_entry(0, &self.inputs.view),
+                    buffer_entry(1, &lists.table),
+                    buffer_entry(2, &lists.args),
+                    buffer_entry(3, &lists.refs),
+                    buffer_entry(4, &lists.counts),
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&hiz.view),
+                    },
+                ],
+            })
+        });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("boxel lod cull"),
             timestamp_writes: None,
         });
+        pass.set_pipeline(&self.hiz_pipeline);
+        for (group, [w, h]) in &hiz.levels {
+            pass.set_bind_group(0, group, &[]);
+            pass.dispatch_workgroups(
+                w.div_ceil(bits::HIZ_WORKGROUP_EDGE),
+                h.div_ceil(bits::HIZ_WORKGROUP_EDGE),
+                1,
+            );
+        }
         pass.set_pipeline(&self.cull);
-        pass.set_bind_group(0, &lists.cull_group, &[]);
-        let slots = (nodes.slots.len() as u32).min(capacity);
-        pass.dispatch_workgroups(slots.div_ceil(bits::CULL_WORKGROUP_SIZE), 1, 1);
+        pass.set_bind_group(0, &*cull_group, &[]);
+        pass.dispatch_workgroups(self.slots.div_ceil(bits::CULL_WORKGROUP_SIZE), 1, 1);
     }
 
     /// See [`LodPass::draw`].

@@ -26,6 +26,9 @@
 //!   it draws what a fresh pass draws, with no refusal.
 //! - **Lost uploads:** a frame whose LOD staging buffer cannot be created draws none of those
 //!   nodes (never stale quads), and the next frame uploads and draws them.
+//! - **High, GPU-driven:** the GPU-culled lists draw what the instanced path draws, more than
+//!   one segment of them included; nodes behind a wall of full detail get no draw (the depth
+//!   pyramid); a cave culling search that never reaches its border draws no LOD on any tier.
 //!
 //! Failing images are saved under `CARGO_TARGET_TMPDIR/gpu_lod/` (every image with
 //! `GPU_LOD_SAVE=1`).
@@ -1773,6 +1776,53 @@ fn a_sealed_search_draws_no_lod() {
                 return Err(format!("open: the LOD does not show: {:?}", shots[2].1));
             }
             Ok(())
+        };
+        if let Err(e) = run() {
+            report.fail(format!("{} {}: {e}", gpu.label, gpu.tier), &[]);
+        }
+    })
+    .finish();
+}
+
+/// High culls the LOD against the depth pyramid of the solid terrain (ADR 0031, M3): behind a
+/// stone wall that fills the view no LOD draw is written, and the image is the instanced path's;
+/// without the wall the nodes are drawn.
+#[test]
+fn nodes_behind_full_detail_are_not_drawn_on_high() {
+    let wall = mesh_chunk(|_, _, _| "boxel:stone");
+    let mut walled = full_detail();
+    for x in -2..3 {
+        for y in 2..5 {
+            walled.push((I64Vec3::new(x, y, -1), wall.clone()));
+        }
+    }
+    let view = scene_view(I64Vec3::ZERO);
+    for_every_tier(|gpu, report| {
+        if gpu.tier != Tier::High || gpu.gl() {
+            return;
+        }
+        let mut run = || -> Result<(), String> {
+            let mut draws = Vec::new();
+            let mut shots = Vec::new();
+            for (chunks, gpu_driven) in [(&walled, true), (&walled, false), (&full_detail(), true)]
+            {
+                let mut renderer = new_renderer(gpu)?;
+                renderer.debug_set_lod_gpu_driven(gpu_driven);
+                load_world(&mut renderer, chunks, I64Vec3::ZERO)?;
+                renderer.set_lod(gpu.device, Some(lod_input(settings(1 << 20), lod_nodes())));
+                let image = render(gpu, &mut renderer, &view)?;
+                draws.push(renderer.debug_lod_gpu_draws(gpu.device, gpu.queue));
+                shots.push(image);
+            }
+            report.check_identical(
+                &format!("{} High: behind a wall", gpu.label),
+                (&gpu.name("wall_instanced"), &shots[1]),
+                (&gpu.name("wall_gpu_driven"), &shots[0]),
+            );
+            match (draws[0], draws[1], draws[2]) {
+                (Some(0), None, Some(open)) if open > 0 => Ok(()),
+                other => Err(format!("LOD draws (walled, instanced, open): {other:?}")),
+            }
         };
         if let Err(e) = run() {
             report.fail(format!("{} {}: {e}", gpu.label, gpu.tier), &[]);
