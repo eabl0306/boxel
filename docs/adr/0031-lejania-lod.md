@@ -374,6 +374,15 @@ Dónde va ese tiempo: la misma superficie con `--features trace --spans` (frames
 - En el lado del mundo, al cruzar un borde de chunk se suman por cruce unos 0,7 ms de
   `lod_plan` y 0,6 ms de `lod_coverage`, repartidos en unos 8 frames.
 
+**M2.** Las ediciones no cambian el costo de un mundo sin ediciones. `just perf-smoke --base
+stress-7efef4b rtx/surface/r16/uncapped rtx/forest/r16/uncapped -- --lod far` del 2026-10-11 (el
+binario de antes del M2 contra a5ac6b6, los dos con `--lod far`, la máquina tranquila):
+
+| caso | fps | p99 ms | frames > 6,94 ms |
+|---|---:|---:|---:|
+| RTX, superficie, sin tope | 959 -> 958 | 2,53 -> 2,58 | 0 -> 0 |
+| RTX, bosque, sin tope | 1185 -> 1172 | 2,16 -> 2,17 | 0 -> 0 |
+
 ## Desvíos del plan
 
 El plan se siguió en lo esencial. Donde el código pidió otra cosa, se siguió el código y la
