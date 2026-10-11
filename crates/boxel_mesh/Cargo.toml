@@ -15,6 +15,8 @@ bytemuck.workspace = true
 foldhash.workspace = true
 
 [dev-dependencies]
+# The `test:` blocks of engine tests (#48).
+boxel_voxel = { workspace = true, features = ["testing"] }
 # The example content (#48), for tests, benches and examples only.
 boxel_demo.workspace = true
 # The merge is an in-repo fork (src/greedy.rs); the original is the reference of the

@@ -8,10 +8,14 @@
 //! byte and the index of its 4 corner lights in the chunk's light palette
 //! ([`ChunkMesh::palette`]). Both are part of the merge key, and both only depend on the vertex,
 //! so a merged quad is exact. [`AoPolicy`] says which faces get AO.
+//!
+//! [`lod`] meshes the far level of detail's nodes (ADR 0031) with the same mesher: coarse cells
+//! as opaque cubes, then octant splits, skirts and fluid walls.
 //! No ECS, no GPU.
 
 mod fluid;
 mod greedy;
+pub mod lod;
 mod mesher;
 mod packed;
 mod padded;
