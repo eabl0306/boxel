@@ -295,7 +295,12 @@ subidos por frame, arena usada y trabajos; `bench_report.py --compare` los compa
 sin tirones (`just perf-smoke --base HEAD "--new-extra='--lod far'" rtx/boost/r16/144`).
 
 Los números sin ruido del LOD salen de `headless_world --world forest --lod PRESET` (sin GPU):
-nodos y quads por nivel, los del piso aparte, tiempos de los trabajos y del llenado. `snapshot
+nodos y quads por nivel, los del piso aparte, tiempos de los trabajos y del llenado. Con `--jump
+1000` mide también el update más lento de un salto, y en un binario `--features trace`,
+`--spans` dice qué spans pesaron en el update más lento de cada fase (arranque, salto); los del
+LOD se llaman `lod.*` (`lod.plan_level`, `lod.mesh_events`, `lod.read_data`...). En la 780M el
+precio se mide con `near`, su preset (`"--new-extra='--lod near'" 780m/surface/r16/uncapped`).
+Los números finales de la rama están en `docs/rendimiento/lod-2026-10.md`. `snapshot
 --lod PRESET` espera el llenado antes de las capturas; `--lod-tint` tiñe los niveles y
 `--fixed-height` carga como `voxel_world --fixed-height`. Para mirar el borde en vuelo, `stress
 --screenshot PATH` guarda el frame donde termina la medición (la cámara para ahí) y

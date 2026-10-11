@@ -1,8 +1,9 @@
 # ADR 0031: lejanía con LOD, un plugin opcional
 
 - Estado: borrador. El M1, el M3 y parte del M5 (en las rondas de optimización) y el M2
-  (ediciones y respaldo) están hechos en la rama `feat/lod` (sobre `feat/fog`); falta la prueba
-  del dueño (al final, "Pendiente").
+  (ediciones y respaldo) están hechos en la rama `feat/lod` (sobre `feat/fog`), con los números
+  finales medidos sobre 3506990. Falta la prueba del dueño ("Qué mirar en el vuelo del dueño",
+  al final).
 - Fecha: 2026-10-11
 
 ## Contexto
@@ -346,14 +347,79 @@ juntan resultados, y no piden otro paso si no hay nada que juntar.
 
 ## Números medidos
 
-La campaña completa (RTX y 780M, r16 y r32, con y sin tope, boost, cuevas, spans) está en
-[rendimiento/lod-2026-10.md](../rendimiento/lod-2026-10.md), con los problemas por orden.
+La campaña completa (RTX y 780M, r16 y r32, con y sin tope, boost, cuevas, spans, cada ronda)
+está en [rendimiento/lod-2026-10.md](../rendimiento/lod-2026-10.md).
 
-**Después de las tres rondas de optimización** (RTX, `--lod far`, el mismo binario sin y con
-LOD): el LOD cuesta de 0,53 a 0,65 ms de GPU (era 1,07 a 1,16), `render.lod` 0,006 ms de media
-sin tope y 0,025 con tope, y ningún frame pasa de 6,94 ms por el LOD. El llenado tarda de 1,1 a
-1,7 s (la superficie a r32, 2,3 s, y la bajada a r32, 3,1 s: esperan que el mundo se asiente).
-En la 780M `far` cuesta de 1,07 a 1,14 ms. Las tablas de abajo son del M1, antes de optimizar.
+### Finales
+
+Medidos el 2026-10-11 sobre 3506990 (la rama terminada), con el mismo binario sin y con `--lod`,
+la máquina tranquila y nada compilando. La cadena de `perf-smoke` se corrió dos veces y repitió
+los pares dudosos: de 2 a 6 pares por caso en la RTX, 4 en la 780M con `far`.
+
+`just perf-smoke --base HEAD "--new-extra='--lod far'" rtx/surface/r16/uncapped
+rtx/forest/r16/uncapped` y el resto de los casos (costo = media del frame con LOD menos sin LOD):
+
+| caso, sin tope | fps | p99 ms | costo | frames > 6,94 ms | llenado |
+|---|---:|---:|---:|---:|---:|
+| RTX, superficie r16 | 2172 a 2204 -> 952 a 964 | 0,99 a 1,09 -> 2,50 a 2,52 | 0,58 a 0,59 ms | 0 -> 0 | 1,2 a 1,3 s |
+| RTX, bosque r16 | 3905 a 3931 -> 1173 a 1189 | 0,67 a 0,71 -> 2,14 a 2,17 | 0,59 a 0,60 ms | 0 -> 0 | 1,1 a 1,2 s |
+| RTX, boost r16 | 3825 a 3863 -> 1176 a 1185 | 0,73 a 0,75 -> 2,15 a 2,23 | 0,58 a 0,59 ms | 0 -> 0 | 1,1 s |
+| RTX, cueva con ruta r16 | 2748 a 2765 -> 2408 a 2420 | 0,83 -> 0,86 a 0,87 | 0,05 ms | 0 -> 0 | 1,3 a 1,4 s |
+| RTX, bajada r16 | 1351 a 1533 -> 1288 a 1289 | 1,79 a 1,98 -> 2,09 a 2,11 | 0,04 a 0,12 ms | 0 a 1 -> 0 | 1,4 s |
+| RTX, superficie r32 | 743 a 746 -> 530 a 532 | 3,16 a 3,22 -> 4,68 a 4,70 | 0,54 ms | 0 -> 0 | 2,2 s |
+| RTX, bosque r32 | 1699 a 1710 -> 865 a 868 | 1,59 a 1,62 -> 2,68 a 2,73 | 0,56 a 0,57 ms | 0 -> 0 | 1,6 s |
+| RTX, bajada r32 | 369 -> 352 a 354 | 6,23 -> 6,53 a 6,64 | 0,12 a 0,13 ms | 1 a 2 -> 1 a 3 | 3,1 s |
+| RTX, `near`, superficie r16 | 2167 a 2181 -> 1365 a 1528 | 1,02 a 1,05 -> 1,80 a 2,04 | 0,19 a 0,27 ms | 0 -> 0 | 0,85 s |
+| RTX, `near`, bosque r16 | 3854 -> 2198 | 0,71 -> 0,98 | 0,20 ms | 0 -> 0 | 0,76 s |
+| RTX, `extreme`, superficie r16 | 2085 a 2185 -> 734 | 1,04 a 1,09 -> 3,21 a 3,23 | 0,88 a 0,91 ms | 0 -> 0 | 1,6 a 1,7 s |
+| RTX, `extreme`, bosque r16 | 3872 a 3903 -> 866 a 867 | 0,69 a 0,70 -> 2,70 a 2,71 | 0,90 ms | 0 -> 0 | 1,5 a 1,6 s |
+| 780M, `far`, superficie r16 | 530 a 548 -> 335 a 342 | 4,22 a 4,55 -> 7,14 a 7,26 | 1,04 a 1,14 ms | 0 -> 59 a 85 | 1,5 s |
+| 780M, `far`, bosque r16 | 914 a 927 -> 459 a 479 | 2,56 a 2,64 -> 5,17 a 5,42 | 1,00 a 1,10 ms | 0 -> 0 a 1 | 1,1 a 1,2 s |
+| 780M, `near`, superficie r16 | 531 -> 444 | 4,40 -> 5,38 | 0,37 ms | 0 -> 0 | 0,8 s |
+| 780M, `near`, bosque r16 | 931 -> 655 | 2,60 -> 3,80 | 0,45 ms | 0 -> 0 | 0,6 s |
+
+- **La compuerta del plan en la RTX:** ningún frame de más de 6,94 ms con `far` (se cumple en
+  todos los casos) y el p99 dentro de 1,5 veces (no se cumple a r16: 2,3 a 3,2 veces; a r32, de
+  1,44 a 1,71). El smoke sale con 1 por la regla del 85 % de fps y por ese p99: es el precio del
+  plugin, como la niebla (ADR 0030). Sin tope la GPU limita: el frame sin LOD es de 0,26 a
+  0,46 ms y el LOD suma 0,6 ms de triángulos que se ven. `near` en el bosque queda en 1,37 veces.
+- **Con tope 144** (solo pares en el mismo modo de salteo de la NVIDIA, issue #5; 3 pares por
+  caso): a r16 y en el bosque a r32 el LOD no cambia los frames de más de 7,5 ms (bosque r32:
+  5 -> 13, 9 -> 8, 12 -> 9). La superficie r32 suma unos 14 (30 -> 44) y la bajada r32 de 0 a 11
+  (138 -> 137, 140 -> 151, 143 -> 149). Con LOD la superficie r32 cae en el modo alto en las 3
+  corridas (sin LOD, en 1). Son refrescos salteados en los frames de la puesta al día.
+- **Hilo principal** (`stress --spans`, frames normales): `render.lod` 0,007 ms de media sin
+  tope y 0,026 con tope 144 a r32 (0,16 en la puesta al día); `world::lod_coverage` 0,009 y
+  0,05 ms; `world::lod_collect` 0,003 y 0,018 ms; `world::lod_edits` 0,001 ms. Por borde, unos
+  1,6 ms en total repartidos en unos 9 frames. La puesta al día del mundo por borde queda dentro
+  de 1 ms de sin LOD sin tope.
+- **La 780M** no tiene que pasar (decisión del dueño). `near` no deja frames de más de 6,94 ms;
+  `far` cuesta 1,0 a 1,14 ms y su p99 queda justo en 7,1 a 7,3 ms.
+
+`headless_world --world forest --lod PRESET` (sin GPU, tres corridas; entre paréntesis sin LOD):
+
+| corrida | nodos | quads | dibujados | llenado | trabajo p50 / p99 |
+|---|---:|---:|---:|---:|---:|
+| `far`, r16 | 8.841 | 8,33 M | 7.095 | 0,91 a 0,94 s | 260 a 270 / 630 a 690 us |
+| `far`, r32 | 8.841 | 8,33 M | 6.139 | 1,31 a 1,34 s | 270 a 280 / 630 a 690 us |
+| `far`, r16 `--fixed-height` | 8.841 | 8,33 M | 7.095 | 0,91 s | 260 / 590 us |
+| `far`, r16 `--fixed-height`, ojo a y 3.000 | 7.894 | 7,15 M | 6.392 | 0,83 s | 270 / 600 us |
+| `near`, r16 | 3.191 | 2,91 M | 2.449 | 0,43 a 0,45 s | 240 a 250 / 600 a 820 us |
+| `extreme`, r16 | 12.713 | 11,89 M | 9.999 | 1,25 a 1,28 s | 280 a 290 / 620 a 680 us |
+
+- Update más lento al arrancar: r16 1,88 a 2,45 ms (1,87 a 2,17); r32 3,55 a 4,00 ms (2,56 a
+  3,33). En un salto de 1.000 chunks: r16 3,36 a 4,06 ms (2,36 a 2,99); r32 4,28 a 4,43 ms
+  (3,76 a 4,03). Volando a 100 bloques/s a r16, p99 del update 1,95 a 2,06 ms (1,42 a 1,59).
+- Los nodos del piso son 0 en los mundos del ejemplo. En el terreno sin árboles son 8.551 nodos y
+  3,39 M quads: los árboles son más de la mitad.
+- Criterion `lod/column` (bosque, sin cambios desde la ronda 3): 256 us en el nivel 1 (la fuente
+  sola, 65 us) y 227 us en el nivel 4.
+
+### Antes de optimizar (M1)
+
+Las tablas de esta parte son del M1, antes de las rondas de optimización: sirven para ver qué
+cambió (`render.lod` de 0,29 a 0,007 ms, el costo de GPU de 1,1 a 0,6 ms, el llenado de 2,4 a
+1,1 s).
 
 `headless_world --world forest --lod PRESET` del 2026-10-11 sobre la rama (sin GPU: solo el lado
 del mundo; la máquina tranquila). Los nodos del piso son 0 en todas las corridas.
@@ -388,9 +454,9 @@ con unos 2.100 a 2.200 draws del LOD por frame.
 
 `just perf-smoke --base HEAD "--new-extra='--lod far'" rtx/surface/r16/uncapped
 rtx/forest/r16/uncapped` del 2026-10-11 sobre 7e2557c (y lo mismo con `780m/surface/r16/uncapped`):
-el mismo binario sin y con el LOD, 10 s por lado, radio 16, sin tope. El harness repitió cada par y dio lo mismo. El llenado terminó a los 2,6
-a 2,7 s (`lod_fill_s`), antes de empezar a medir (el mundo se asentó a los 0,7 s y hay 2 s de
-calentamiento).
+el mismo binario sin y con el LOD, 10 s por lado, radio 16, sin tope. El harness repitió cada
+par y dio lo mismo. El llenado terminó a los 2,6 a 2,7 s (`lod_fill_s`), antes de empezar a medir
+(el mundo se asentó a los 0,7 s y hay 2 s de calentamiento).
 
 | caso | fps | p50 ms | p99 ms | frames > 6,94 ms |
 |---|---:|---:|---:|---:|
@@ -424,7 +490,9 @@ Dónde va ese tiempo: la misma superficie con `--features trace --spans` (frames
 - En el lado del mundo, al cruzar un borde de chunk se suman por cruce unos 0,7 ms de
   `lod_plan` y 0,6 ms de `lod_coverage`, repartidos en unos 8 frames.
 
-**M2.** Las ediciones no cambian el costo de un mundo sin ediciones. `just perf-smoke --base
+### Ediciones (M2)
+
+Las ediciones no cambian el costo de un mundo sin ediciones. `just perf-smoke --base
 stress-7efef4b rtx/surface/r16/uncapped rtx/forest/r16/uncapped -- --lod far` del 2026-10-11 (el
 binario de antes del M2 contra a5ac6b6, los dos con `--lod far`, la máquina tranquila):
 
@@ -669,11 +737,12 @@ intención del plan:
 - **Árboles en los niveles 5 y 6.** Se mira uno de cada 4 y de cada 16 lugares de árbol.
 - **p99 sin tope.** En la RTX a r16 queda de 2,3 a 3,2 veces el de sin LOD (a r32, de 1,4 a 1,7):
   son los triángulos que de verdad se ven. Es el precio del plugin, como la niebla.
-- **Con tope 144** la superficie a r32, con la NVIDIA en su modo alto, suma unos 20 frames de más
-  de 7,5 ms por corrida: refrescos salteados en los frames de la puesta al día (issue #5).
+- **Con tope 144** la superficie a r32, con la NVIDIA en su modo alto, suma unos 14 frames de más
+  de 7,5 ms por corrida, y la bajada a r32 hasta 11: refrescos salteados en los frames de la
+  puesta al día (issue #5). Con el LOD la NVIDIA cae más seguido en ese modo.
 - **Costo en el hilo de render.** En High casi nada (una lista indirecta por segmento). En Mid,
   Low y las GPU integradas, una llamada por tramo de baldes visibles de cada nodo visible.
-- **El llenado** tarda de 1,1 a 1,7 s; en la superficie a r32, 2,3 s, y en la bajada a r32,
+- **El llenado** tarda de 1,1 a 1,7 s; en la superficie a r32, 2,2 s, y en la bajada a r32,
   3,1 s, porque espera que el mundo se asiente.
 - **Rearmados por ediciones.** Un nodo cuyo vecino del mismo nivel espera rearmarse sigue con su
   malla vieja hasta que llegan los dos, a lo sumo 2 s.
@@ -788,19 +857,16 @@ intención del plan:
 
 ## Para la prueba del dueño
 
-Lo que yo pude mirar (capturas con `snapshot --lod far` y `voxel_world --lod far --frames`, en la
-RTX): el bosque con relieve hasta el horizonte, lagos azules, playas de arena, de día y de noche,
-sin anillo ni costura visibles desde 250 bloques de altura; sobre el mar a la altura del ojo, el
-agua cercana translúcida y la lejana opaca (el escalón de la decisión 5).
+Lo que miré yo en su lugar, con capturas en la RTX (`snapshot --lod far`, `stress --screenshot`
+y `voxel_world --frames`): 34 imágenes en `bench-results/lod-look/` (fuera de git), cada una con
+su leyenda en `leeme.txt` y su comando en `comandos.sh`, tomadas de nuevo con el binario final.
+Tu pose a r12, r16 y r32, la diagonal, 200 bloques arriba, el mar en el borde, overworld, noche,
+atardecer, el tinte, `near` (también en la 780M), `extreme`, `--fixed-height` (también a 3000
+bloques), la niebla, el frame donde para un vuelo de 10 s a 100 bloques/s mirando adelante y
+atrás, y la torre del M2 vista a 2 km desde un mundo guardado. En ninguna hay cielo bajo el
+horizonte, grietas entre niveles ni terreno doble.
 
-Después hice un vuelo propio con 30 capturas en `bench-results/lod-look/` (fuera de git; cada una
-con su leyenda en `leeme.txt` y su comando en `comandos.sh`): tu pose a r12, r16 y r32, la
-diagonal, 200 bloques arriba, el mar en el borde, overworld, noche, atardecer, el tinte, `near`
-(también en la 780M), `extreme`, `--fixed-height` (también a 3000 bloques) y la niebla. Con
-`stress --screenshot` miré el frame donde termina un vuelo de 10 s a 100 bloques/s, hacia
-adelante y girando 180 grados: hacia atrás, en diagonal, desde 200 bloques y a r32. En ninguna
-captura hay cielo bajo el horizonte, grietas entre niveles ni terreno doble. No tuve que corregir
-nada del LOD. Tres cosas que se ven y son esperables:
+Tres cosas que se ven y son esperables:
 
 - Desde 200 bloques, el centro de un lago cercano hondo se ve azul opaco con un borde claro: esa
   capa de chunks queda fuera del radio vertical, así que la dibuja el LOD, con su agua opaca.
@@ -809,47 +875,38 @@ nada del LOD. Tres cosas que se ven y son esperables:
 - Desde muy alto (1500 bloques), el bosque del nivel 2 se ve más tupido que el del nivel 1: con
   "cualquier sólido gana" cada copa ocupa celdas enteras (decisión 4).
 
-Para el M2 hice la prueba de la torre con `snapshot` (imágenes 31 a 34 en
-`bench-results/lod-look/`, comandos al final de `comandos.sh`): una torre de 30 bloques y una
-plataforma de 20 x 20 puestas con `--fill` en un mundo guardado; después ese mundo abierto de
-nuevo a 2 km, donde los chunks de la torre nunca cargan. Con 8 grados de campo de visión se ven la
-torre y la plataforma en el nivel 2, leídas del mundo guardado; la misma vista en un mundo sin
-ellas solo cambia en esos píxeles.
-
-Lo que falta mirar volando:
+### Qué mirar en el vuelo del dueño
 
 ```bash
-cargo run --release --example voxel_world -- --lod far --timeout 900
-cargo run --release --example voxel_world -- --lod far --view-distance 16 --timeout 900
-cargo run --release --example voxel_world -- --lod far --world overworld --timeout 900
-cargo run --release --example voxel_world -- --lod far --fog valley --timeout 900
-cargo run --release --example voxel_world -- --lod far --fixed-height --timeout 900
-cargo run --release --example voxel_world -- --lod near --adapter radeon --timeout 900
+cargo run --release --example voxel_world -- --adapter nvidia --lod far --timeout 1800
+cargo run --release --example voxel_world -- --adapter nvidia --lod far --view-distance 16 --timeout 1800
+cargo run --release --example voxel_world -- --adapter nvidia --lod far --world overworld --timeout 1800
+cargo run --release --example voxel_world -- --adapter nvidia --lod far --fog valley --timeout 1800
+cargo run --release --example voxel_world -- --adapter nvidia --lod far --fixed-height --timeout 1800
+cargo run --release --example voxel_world -- --adapter nvidia --lod far --world-dir /tmp/mundo-lod --timeout 1800
+cargo run --release --example voxel_world -- --adapter radeon --lod near --timeout 1800
 ```
 
-- El horizonte aparece en unos 2 s, sin anillo vacío al arrancar.
-- Volando con boost (Ctrl), girando, mirando en diagonal y desde 200 bloques mirando abajo: sin
-  cielo en el borde del detalle completo.
-- Mares poco profundos azules y playas de arena lejos; sin franja pálida donde el mar cruza el
-  borde; sin terreno doble ni z-fighting en la costura.
-- De día y de noche (`[` y `]` mueven la hora).
-- F8 (también de far a extreme, que rearma la arena y rellena), F9 (tinte por nivel) y la línea
-  `LOD` de F3.
-- `--fog valley` se ve como antes cerca de la cámara.
-- M2, con `--world-dir` desde el principio: construir una torre de 30 bloques y una plataforma de
-  20 x 20, volar 2 km y verlas; reiniciar con el mismo `--world-dir` y verlas otra vez. Sin
-  `--world-dir`, la torre desaparece de lejos cuando su chunk se descarga (así está pensado).
-
-```bash
-cargo run --release --example voxel_world -- --lod far --world-dir /tmp/mundo-lod --timeout 900
-```
+1. Al arrancar, el horizonte aparece en 1 a 2 s, sin anillo vacío.
+2. Con boost (Ctrl), girando, en diagonal y desde 200 bloques mirando abajo: sin cielo en el
+   borde del detalle completo.
+3. El mar lejano azul y las playas de arena. ¿Molesta el escalón del agua opaca en el borde
+   (decisión 5) o el bosque más tupido desde muy alto (decisión 4)? Eso sería el M4.
+4. F8 recorre far, extreme, oculto y near (el cambio de arena rellena en unos segundos); F9 tiñe
+   los niveles; F3 muestra la línea `LOD`; `[` y `]` mueven la hora.
+5. `--fog valley` se ve como antes cerca de la cámara.
+6. Con `--world-dir`: una torre de 30 bloques y una plataforma de 20 x 20, volar 2 km y verlas;
+   reiniciar con el mismo directorio y verlas otra vez.
+7. En la 780M con `near`: que se vea bien; no tiene que ir a 144 fps.
+8. Decidir el precio en la RTX: el p99 sin tope queda de 2,3 a 3,2 veces a r16 (sin frames de
+   más de 6,94 ms). Con tope 144 el LOD no se nota a r16.
 
 ## Pendiente
 
 - Decidir con el dueño el p99 sin tope de la RTX: a r16 queda de 2,3 a 3,2 veces el de sin LOD
   (sin frames de más de 6,94 ms), casi todo trabajo de GPU. Las palancas del plan (baldes por
-  cara y Hi-Z) ya están; lo que queda es el preset `near` o menos triángulos.
-- La prueba del M2 volando (abajo, "Para la prueba del dueño").
+  cara y Hi-Z) ya están; lo que queda es el preset `near` (1,37 a 2 veces) o menos triángulos.
+- La prueba del dueño volando, también la del M2 ("Qué mirar en el vuelo del dueño").
 - M4, según la prueba del dueño: agua translúcida lejana, niebla que se adelgaza sobre el LOD,
   `textureSample` en el nivel 1 para packs de alta resolución, hojas más oscuras.
 - Posibles mejoras de costo: agrupar los eventos de la cobertura por posición de nivel 1,
