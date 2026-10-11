@@ -1,7 +1,8 @@
 # ADR 0031: lejanía con LOD, un plugin opcional
 
-- Estado: borrador. El M1 está hecho en la rama `feat/lod` (sobre `feat/fog`); falta la prueba
-  del dueño (al final, "Pendiente").
+- Estado: borrador. El M1, el M3 (en las rondas de optimización) y el M2 (ediciones y respaldo)
+  están hechos en la rama `feat/lod` (sobre `feat/fog`); falta la prueba del dueño (al final,
+  "Pendiente").
 - Fecha: 2026-10-11
 
 ## Contexto
@@ -111,6 +112,9 @@ generador (el ejemplo cambia el mar después de `new()`). Por columna:
   uno de cada 4 y de cada 16 lugares de árbol;
 - mar con su cláusula de agua sobre suelo, y playas de arena;
 - las cuevas y las plantas se ignoran; bajo el piso del mundo todo es piedra.
+
+`FlatGenerator` tiene una fuente exacta: sus capas son planas, así que cada celda mira solo sus
+filas de bloques. Es el oráculo de los tests del motor.
 
 ### 4. La regla de la celda
 
@@ -256,11 +260,45 @@ profundidad ni z-fighting.
   llenado), para separar los frames del llenado.
 - `snapshot --lod PRESET`: espera el llenado y lo dibuja; imprime una línea `lod:`.
   `--lod-tint` tiñe los niveles y `--fixed-height` carga como en `voxel_world`.
+- `snapshot` con `--fill` o `--world-dir` muestra las ediciones lejos; la línea `lod:` dice
+  cuántos chunks editados dibuja el LOD (`edited_chunks`).
 - `stress --screenshot PATH [--screenshot-yaw GRADOS]`: la captura del frame donde para el vuelo,
   girada si se pide, para mirar el borde que avanza y la banda que queda atrás.
 - `headless_world --lod PRESET`: nodos y quads por nivel, nodos del piso aparte, tiempos de los
   trabajos y del llenado, sin GPU.
 - `tools/bench_report.py` cuenta `lod` entre los ajustes; las corridas viejas valen `off`.
+
+### 11. Ediciones a distancia y respaldo (M2)
+
+El generador no sabe lo que construyó el jugador. El LOD guarda el conjunto de chunks editados
+(`boxel_world::lod::edits`):
+
+- todo chunk que nombra un `BlockChanged` y, con `PersistPlugin`, todo chunk guardado (se listan
+  una vez al arrancar, con un accesor nuevo en `persist/saver.rs`);
+- de cada uno, una **pirámide**: sus celdas en los niveles 1 a 5 con la regla exacta, leídas de
+  sus bloques (el chunk cargado, si no el guardado, si no el del generador). En esos niveles una
+  celda cae en un solo chunk. Unos 9,4 KiB por chunk, en una caché de 2.048 (la menos usada sale);
+- un trabajo de columna pone las pirámides de los chunks editados que toca sobre las celdas de la
+  fuente, bordes incluidos, y agranda la banda de la columna hasta sus capas: una torre más alta
+  que el terreno tiene su nodo.
+
+Un chunk que cambia espera `edit_debounce` (500 ms) desde su último cambio; después un trabajo de
+pirámide lee sus bloques y los nodos cuyas celdas acolchadas llegan a él quedan **viejos**. Se
+rearman con su prioridad de siempre. Mientras tanto el renderer sigue dibujando lo que tenía de
+ellos (su malla vieja, o nada si estaba vacío) y la malla nueva lo reemplaza en las ops del mismo
+frame: una edición nunca abre un hueco.
+
+Sin persistencia, un chunk editado que se descarga vuelve generado, así que sale del conjunto y
+sus nodos vuelven a las celdas del generador. Con persistencia queda (está guardado) y su
+pirámide se lee del disco cuando hace falta. El nivel 6 (`extreme`) no muestra ediciones: ahí una
+celda abarca 8 chunks.
+
+**Respaldo.** Un generador sin `lod()` tiene solo el nivel 1 (`fallback_max_level`, 0 lo apaga),
+armado desde sus chunks reales con la regla exacta (`boxel_world::lod::fallback`): el chunk
+cargado, si no el guardado, si no el del generador (los generados se guardan por hilo, 64). Un
+trabajo arma un nodo y hay uno en vuelo: cada nodo lee hasta 64 chunks. La banda sale de
+`vertical_chunks`, que debe estar acotado (64 capas como mucho); si no, el LOD queda apagado
+(`NoSource`). El horizonte es `T_1`: 1.536 bloques con `far`.
 
 ## Números medidos
 
@@ -462,12 +500,46 @@ intención del plan:
 - La pose alta del test de costura usa un radio de 12 chunks: con radio 4 los chunks que la
   búsqueda vieja perdía quedaban debajo de la imagen.
 
+**Ediciones y respaldo (M2)**
+
+- Las pirámides arman el nivel 1 desde los bloques y cada nivel de arriba mezclando los 8 de
+  abajo (`CellPartial::merge`), no cada nivel desde los bloques. Es exacto con un solo fluido por
+  celda; con dos, la mezcla conserva el de más bloques, como en el M1.
+- Una columna cuyos chunks editados no tienen la pirámide en caché espera fuera de la cola a un
+  trabajo de pirámide, en vez de dibujar primero lo del generador y corregirlo después. El "8
+  chunks editados por trabajo" del plan quedó en los trabajos de pirámide (leen 8 chunks como
+  mucho, 2 en vuelo, fuera del tope de las columnas); una columna pone todas las pirámides que
+  toca, que ya están calculadas.
+- Las bandas cambian con las ediciones: una columna crece hasta las capas que alcanzan sus chunks
+  editados (una torre sobre la banda de la fuente) y vuelve a achicarse cuando la edición se va.
+  Las capas que entran tenían nada dibujado: entran como nodos vacíos y se rearman. El plan
+  suponía celdas dentro de la banda.
+- Un nodo viejo que el renderer tiene se reemplaza en las ops del frame en que llega su malla
+  nueva, fuera del tope de envíos por frame (son pocos y chicos). Un nodo vacío que gana malla
+  sale enseguida si su cadena de padres está disponible.
+- Un trabajo en vuelo de una columna cuyos bloques cambiaron se cancela: leyó bloques viejos.
+- `BlockChanged` no trae dimensión: las ediciones son de la dimensión actual del mundo.
+- El respaldo lee 4 chunks por eje (64 por nodo), no 3: el borde de una celda de 2 bloques cae en
+  el chunk vecino. Un nodo por trabajo, uno en vuelo y sin pasarlos a los hilos de antemano: el
+  trabajo copia los chunks cargados al crearse, solo en `Update` (no en los pasos `Idle`). Los
+  chunks fuera de `vertical_chunks` son aire, como los hace el mundo, y el piso real queda a la
+  vista (la fuente del ejemplo lo cuenta como piedra).
+- El respaldo es el preset con `levels` recortado a `fallback_max_level`: el horizonte es `T_1`.
+- `FlatGenerator::lod()` devuelve su fuente exacta, así que un mundo plano también tiene LOD.
+- `LodStats` ganó `edited_chunks`, `pyramids` y `fallback`.
+- Un error que encontró el test del respaldo: el LOD se daba por lleno con columnas marcadas para
+  rearmar que nadie había puesto en la cola. Ahora esas columnas cuentan como trabajo pendiente.
+
 ## Límites conocidos
 
-- **Ediciones.** En el M1 las construcciones del jugador solo se ven en detalle completo; el LOD
-  muestra lo que generó el generador (M2).
-- **Generadores sin fuente.** Un generador sin `lod()` no tiene LOD (`LodStats.off = NoSource`).
-  El respaldo desde chunks reales, solo en el nivel 1, es del M2.
+- **Ediciones.** Se ven hasta el nivel 5; en el 6 (`extreme`) no. En la costura entre una celda
+  editada y una generada puede haber una celda de diferencia. La fuente del ejemplo emite como
+  piedra uniforme un nodo sin aire ni fluido (desvío del M1): si una edición cava en él, las
+  paredes del pozo que caen fuera del chunk editado se ven de piedra, no de tierra.
+- **Muchas ediciones juntas.** Una columna que toca más chunks editados que la mitad de la caché
+  (1.024) no espera las pirámides que faltan: se arma con las que hay.
+- **Generadores sin fuente.** Solo el nivel 1, y solo con `vertical_chunks` acotado. Muestra el
+  piso real del mundo (sus caras de abajo) donde la fuente del ejemplo pone piedra.
 - **Agua opaca.** El mar lejano es un color opaco: en un mar calmo se ve un escalón de color en el
   borde del detalle completo (decisión 5; las caras translúcidas serían M4).
 - **Capas de niebla.** Una capa que se desvanece al color del cielo en su propio alcance deja una
@@ -581,6 +653,22 @@ intención del plan:
   - subidas perdidas: un frame sin staging no dibuja esos nodos (la imagen sin nodos) y el
     siguiente los sube y dibuja la escena entera.
 - Las suites de GPU existentes siguen verdes sin cambios.
+- M2, `boxel_worldgen`: la fuente de `FlatGenerator` es la regla exacta sobre sus propios chunks
+  en los niveles 1 a 5 (capas de todas las clases, mar sobre suelo, dos fluidos, lejos del
+  origen); sin la cláusula del agua el test falla.
+- M2, `boxel_world::lod` (ejecutor en línea, `MemoryStore`): las pirámides son la regla aplicada
+  a los bloques en cada nivel; la superposición pone las celdas de su chunk, bordes incluidos,
+  también lejos del origen; qué nodos tocan un chunk contra una búsqueda de fuerza bruta; la caché
+  saca la menos usada; una columna espera las pirámides que faltan y sigue si el trabajo falla.
+  En un mundo que corre: **una torre de un bloque de ancho se ve hasta el nivel 5**, con las celdas
+  exactas (la regla sobre los bloques editados) y distinta de la del generador, y los nodos que la
+  dibujaban siguen en el renderer en cada frame hasta que llegan los nuevos; sin persistencia, al
+  descargarse la torre sus nodos vuelven a los del generador y la capa de aire que había crecido
+  se va; con `MemoryStore`, después de descargarse y de vaciar la caché las pirámides salen del
+  disco, y después de reiniciar la app lejos de la torre (sus chunks nunca cargan) los chunks
+  guardados son editados desde el primer frame y la torre está igual; el respaldo arma solo el
+  nivel 1, igual a la fuente exacta del terreno, y muestra una edición.
+
 
 ## Para la prueba del dueño
 
@@ -605,6 +693,13 @@ nada del LOD. Tres cosas que se ven y son esperables:
 - Desde muy alto (1500 bloques), el bosque del nivel 2 se ve más tupido que el del nivel 1: con
   "cualquier sólido gana" cada copa ocupa celdas enteras (decisión 4).
 
+Para el M2 hice la prueba de la torre con `snapshot` (imágenes 31 a 34 en
+`bench-results/lod-look/`, comandos al final de `comandos.sh`): una torre de 30 bloques y una
+plataforma de 20 x 20 puestas con `--fill` en un mundo guardado; después ese mundo abierto de
+nuevo a 2 km, donde los chunks de la torre nunca cargan. Con 8 grados de campo de visión se ven la
+torre y la plataforma en el nivel 2, leídas del mundo guardado; la misma vista en un mundo sin
+ellas solo cambia en esos píxeles.
+
 Lo que falta mirar volando:
 
 ```bash
@@ -625,6 +720,13 @@ cargo run --release --example voxel_world -- --lod near --adapter radeon --timeo
 - F8 (también de far a extreme, que rearma la arena y rellena), F9 (tinte por nivel) y la línea
   `LOD` de F3.
 - `--fog valley` se ve como antes cerca de la cámara.
+- M2, con `--world-dir` desde el principio: construir una torre de 30 bloques y una plataforma de
+  20 x 20, volar 2 km y verlas; reiniciar con el mismo `--world-dir` y verlas otra vez. Sin
+  `--world-dir`, la torre desaparece de lejos cuando su chunk se descarga (así está pensado).
+
+```bash
+cargo run --release --example voxel_world -- --lod far --world-dir /tmp/mundo-lod --timeout 900
+```
 
 ## Pendiente
 
@@ -632,9 +734,7 @@ cargo run --release --example voxel_world -- --lod near --adapter radeon --timeo
   frames de más de 6,94 ms), casi todo trabajo de GPU. Palancas: el preset `near`, dibujar solo
   los baldes de caras que pueden verse (más draws, menos vértices; hoy un draw por nodo con sus 6
   baldes), o Hi-Z (M5).
-- M2: ediciones (pirámides por chunk editado, superposición, guardado), el respaldo de nivel 1
-  para generadores sin fuente y la fuente exacta de `FlatGenerator`.
-- M3: el camino de GPU de High (un multi-draw indirecto por segmento) y saltar el LOD bajo tierra.
+- La prueba del M2 volando (abajo, "Para la prueba del dueño").
 - M4, según la prueba del dueño: agua translúcida lejana, niebla que se adelgaza sobre el LOD,
   `textureSample` en el nivel 1 para packs de alta resolución, hojas más oscuras.
 - Posibles mejoras de costo: repartir el primer plan en varios frames, agrupar los eventos de la

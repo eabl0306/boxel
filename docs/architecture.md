@@ -1157,6 +1157,11 @@ los de antes, byte a byte.
   arma una columna de un nivel y malla sus nodos con el mallador de siempre (todo cubo opaco, sin
   luz ni AO) más cortes por octante, faldones y, en el nivel 1, paredes de agua. La regla de la
   celda: gana cualquier sólido, salvo agua sobre el suelo.
+- **Ediciones.** Los chunks editados (y, con `PersistPlugin`, los guardados) tienen sus celdas de
+  los niveles 1 a 5 calculadas desde sus bloques (una pirámide por chunk) y puestas sobre las del
+  generador; el nodo viejo se dibuja hasta que llega el nuevo. Sin persistencia, un chunk editado
+  que se descarga vuelve a ser el del generador. Un generador sin `lod()` tiene solo el nivel 1,
+  armado desde sus chunks reales.
 - **Cobertura.** Cada nodo lleva una máscara de octantes ocultos donde dibuja el detalle completo
   o un nivel más fino, sacada de los `ChunkMeshEvent` leídos completos cada frame: el LOD y el
   detalle completo nunca dibujan el mismo volumen y cambian en el mismo frame.
@@ -1364,7 +1369,7 @@ pub trait ChunkStore: Send + Sync + 'static {
 | **M0 scaffold** | workspace y tooling; fork del ECS; `boxel_app`; ventana con compuerta de presentación e input; detección completa (tiers, scoring, smoke, overrides, LKG de crashes, device lost, catch_unwind); tiers High, Mid y Low con buckets opaco y cutout (High sin Hi-Z); paleta, registry, worldgen, mesher, streaming con jobs; cámara libre; `gpu_info`, `voxel_world`, `headless_world` | compila, tests, clippy y rustdoc limpios; `voxel_world` dibuja terreno en Vulkan High y en GL (Mid y Low); imágenes iguales entre tiers; la simulación no se congela con la ventana minimizada |
 | **M1 mundo jugable** | criterio de entrada: re-fork sobre bevy 0.20.0 final (hecho el 2026-10-09, issue #24). Motor sin contenido, con el de los ejemplos en `boxel_demo` (hecho: ADR 0029, issue #48). Niebla y nubes cúbicas como plugin opcional (hecho: ADR 0030, issue #47; falta el mapa del suelo). Pase translúcido; AO; raycast y edición de bloques (hechos: ADR 0016, `voxel_world`); el sistema de ediciones si se recortó; propiedades de bloque e IdMap; `ChunkStore` con redb (hecho: ADR 0024, con entidades); crecimiento del arena y presupuesto de subida; caras interiores de hojas (opcional); re-selección en caliente si se recortó; decisión `static-dxc` o DLL en Windows; timestamps de GPU; actualizar a wgpu 31 | editar y guardar un mundo; agua visible |
 | **M2 GPU-driven completo** | Hi-Z en dos fases (High) o enlaces por subceldas de 16³ (el cave culling por BFS ya está en los tres tiers, ADR 0022); pool de ocupación en GPU; `create_shader_module_trusted` con medición; pipeline cache de Vulkan; verificar DX12 High; clip control en GL (upstream); decidir WESL | caída de draws y de tiempo de GPU medida |
-| **M3 escala** | LOD por anillos 3D con el generador muestreando cada nivel (M1 del LOD hecho: ADR 0031; faltan ediciones, respaldo sin fuente y el camino de GPU de High); listas indirectas segmentadas (más de 65 535 draws); render en hilo propio; inicialización de GPU asíncrona (respetando los error scopes por hilo) | distancias de vista grandes estables |
+| **M3 escala** | LOD por anillos 3D con el generador muestreando cada nivel (M1, M2 y M3 del LOD hechos: ADR 0031; falta la prueba del dueño); listas indirectas segmentadas (más de 65 535 draws); render en hilo propio; inicialización de GPU asíncrona (respetando los error scopes por hilo) | distancias de vista grandes estables |
 | **M4 experimental** | ray marching sobre bricks/ocupación; mesh shaders opt-in; evaluar bevy_ecs 0.21 y el núcleo ECS propio | prototipos medidos |
 
 wgpu v31 (milestone con fecha 2026-10-09) trae cambios que tocan el scaffold
