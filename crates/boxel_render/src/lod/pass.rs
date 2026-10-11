@@ -2,11 +2,15 @@
 //!
 //! Every node is one allocation of its face buckets in the LOD arena (a `VERTEX | COPY_DST`
 //! buffer, sub-allocated like the main arena), so LOD can never take room from full detail. Its
-//! quads reach the GPU at the start of the next frame (one staging buffer per frame, one copy per
-//! node). Each frame the nodes inside the frustum (the node box, then the box-level back-face
-//! test of each face bucket, as `cull.wgsl` does for chunks) and with an octant left to draw
-//! become one instanced draw each: `draw(0..4, first..first + n)` over the arena, the node in the
-//! immediates ([`LodImmediate`]). Level 1 is drawn first, then the coarser ones (roughly front to
+//! quads reach the GPU at the start of the next frame drawn (one staging buffer per frame, one
+//! copy per node), at most [`UPLOAD_FRAMES`] frames of the world side's sends a frame: after
+//! frames that were not drawn (a hidden window) the backlog goes up over a few frames, not in
+//! one hitch. A node is drawn only once its quads are up; uploads that could not be recorded (no
+//! staging buffer: out of memory) wait for the next frame. Each frame the nodes inside the
+//! frustum (the node box, then the box-level back-face test of each face bucket, as `cull.wgsl`
+//! does for chunks) and with an octant left to draw become one instanced draw each:
+//! `draw(0..4, first..first + n)` over the arena, the node in the immediates
+//! ([`LodImmediate`]). Level 1 is drawn first, then the coarser ones (roughly front to
 //! back, for early-Z).
 use super::{LodInput, LodReport, far};
 use crate::arena::{ArenaAlloc, ArenaAllocator, QUAD_BYTES};
@@ -28,6 +32,10 @@ pub(crate) const MAX_LOD_NODES: u32 = 1 << 16;
 const LEVELS: usize = bits::LEVEL_MASK as usize + 1;
 /// Largest staging buffer of a frame's uploads (more go in several).
 const STAGING_BYTES: u64 = 64 << 20;
+/// A frame uploads at most this many frames of the world side's sends
+/// (`LodSettings::upload_bytes_per_frame`), and at least one node: more than it sends while
+/// every frame is drawn.
+pub(crate) const UPLOAD_FRAMES: u64 = 4;
 /// A node is drawn while its origin is less than this many blocks from the render origin on every
 /// axis: its wrapped `i32` origin difference is exact there (the GPU window of `chunk_table`).
 const WINDOW: i64 = 1 << 30;
@@ -44,7 +52,7 @@ struct LodDraw {
     faces: [u32; 6],
     /// Hidden octants (bit `x | y << 1 | z << 2`).
     mask: u8,
-    /// The mesh until its quads are uploaded.
+    /// The mesh until its quads are uploaded: the node is not drawn until then.
     pending: Option<Arc<ChunkMesh>>,
     /// Its index in `LodPass::levels[level]`.
     at: u32,
@@ -84,6 +92,10 @@ pub(crate) struct LodPass {
     pipeline: wgpu::RenderPipeline,
     arena: wgpu::Buffer,
     nodes: LodNodes,
+    /// The next staging buffer is created invalid (tests: [`LodPass::fail_next_upload`]).
+    fail_next: bool,
+    /// Uploads were lost since the last recorded one (logged once).
+    failing: bool,
 }
 
 impl LodPass {
@@ -111,7 +123,15 @@ impl LodPass {
             pipeline: pipeline(device, materials, view),
             arena,
             nodes: LodNodes::new(quads, arena_quads, color_mip),
+            fail_next: false,
+            failing: false,
         }
+    }
+
+    /// Testing: the next staging buffer of the LOD uploads cannot be created, as when out of
+    /// memory (wgpu reports an error): those nodes are not drawn and go up the next frame.
+    pub fn fail_next_upload(&mut self) {
+        self.fail_next = true;
     }
 
     /// `LodSettings::arena_quads` the pass was built for.
@@ -146,16 +166,29 @@ impl LodPass {
     }
 
     /// The frame's work before the main pass: the waiting quads copied into the arena (recorded
-    /// into `encoder`: one staging buffer of at most [`STAGING_BYTES`], one copy per node), then
-    /// the draw list for `view` (the renderer's cull view, its far plane at the horizon).
+    /// into `encoder`: staging buffers of at most [`STAGING_BYTES`], one copy per node; at most
+    /// the frame's upload budget, module docs), then the draw list for `view` (the renderer's
+    /// cull view, its far plane at the horizon). A batch whose staging buffer cannot be created
+    /// waits for the next frame, its nodes not drawn meanwhile.
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         view: &ViewParams,
     ) {
-        for (batch, bytes) in self.nodes.take_uploads(STAGING_BYTES) {
-            copy(device, encoder, &self.arena, &batch, bytes);
+        let budget = self.nodes.upload_budget;
+        for (batch, bytes) in self.nodes.take_uploads(STAGING_BYTES, budget) {
+            let fail = std::mem::take(&mut self.fail_next);
+            match copy(device, encoder, &self.arena, &batch, bytes, fail) {
+                Ok(()) => self.failing = false,
+                Err(e) => {
+                    // wgpu reported why (out of memory); the device stays usable.
+                    if !std::mem::replace(&mut self.failing, true) {
+                        tracing::error!("far LOD uploads delayed: {e}; tried again next frame");
+                    }
+                    self.nodes.restore(batch);
+                }
+            }
         }
         self.nodes.cull(view);
     }
@@ -178,8 +211,15 @@ impl LodPass {
     }
 }
 
-/// A node's quads waiting for their upload: the mesh, its first arena quad and its quads.
-type Upload = (Arc<ChunkMesh>, u32, u32);
+/// A node's quads on their way up.
+struct Upload {
+    /// The node's slot.
+    slot: u32,
+    mesh: Arc<ChunkMesh>,
+    /// Its first arena quad and its quads.
+    offset: u32,
+    quads: u32,
+}
 
 /// The CPU side of the pass (no GPU, unit-tested): the arena allocator, the node records, the
 /// waiting uploads and the draw list.
@@ -196,6 +236,8 @@ struct LodNodes {
     levels: [Vec<u32>; LEVELS],
     /// Slots whose quads wait for the next upload.
     pending: Vec<u32>,
+    /// Bytes of quads a frame uploads at most (module docs; at least one node).
+    upload_budget: u64,
     /// Refused since the last report.
     refused: Vec<ChunkKey>,
     warned_full: bool,
@@ -219,6 +261,7 @@ impl LodNodes {
             free: Vec::new(),
             levels: Default::default(),
             pending: Vec::new(),
+            upload_budget: u64::MAX,
             refused: Vec::new(),
             warned_full: false,
             far: None,
@@ -241,6 +284,8 @@ impl LodNodes {
         self.far = far(&input.settings, input.horizon);
         self.fade_start = input.settings.fade_start.clamp(0.0, 1.0);
         self.tint = input.settings.debug_tint;
+        self.upload_budget =
+            (input.settings.upload_bytes_per_frame as u64).saturating_mul(UPLOAD_FRAMES);
         if input.resync {
             self.clear();
         }
@@ -405,30 +450,63 @@ fn face_counts(mesh: &ChunkMesh) -> [u32; 6] {
 }
 
 impl LodNodes {
-    /// Takes the waiting uploads in batches of at most `limit` bytes (a single larger node goes
-    /// alone), with their bytes.
-    fn take_uploads(&mut self, limit: u64) -> Vec<(Vec<Upload>, u64)> {
+    /// Takes the waiting uploads, oldest first, up to `budget` bytes (at least one node; the
+    /// rest wait for the next frame), in batches of at most `limit` bytes (a single larger node
+    /// goes alone), with their bytes.
+    fn take_uploads(&mut self, limit: u64, budget: u64) -> Vec<(Vec<Upload>, u64)> {
         let mut out = Vec::new();
-        let (mut batch, mut bytes) = (Vec::new(), 0u64);
-        for slot in std::mem::take(&mut self.pending) {
+        let (mut batch, mut bytes, mut total) = (Vec::new(), 0u64, 0u64);
+        let waiting = std::mem::take(&mut self.pending);
+        for (i, &slot) in waiting.iter().enumerate() {
             let Some(node) = self.slots.get_mut(slot as usize).and_then(Option::as_mut) else {
                 continue;
             };
+            if node.pending.is_none() {
+                continue;
+            }
+            let size = u64::from(node.alloc.size) * QUAD_BYTES;
+            if total > 0 && total + size > budget {
+                self.pending.extend_from_slice(&waiting[i..]);
+                break;
+            }
             let Some(mesh) = node.pending.take() else {
                 continue;
             };
-            let size = u64::from(node.alloc.size) * QUAD_BYTES;
             if bytes > 0 && bytes + size > limit {
                 out.push((std::mem::take(&mut batch), bytes));
                 bytes = 0;
             }
             bytes += size;
-            batch.push((mesh, node.alloc.offset, node.alloc.size));
+            total += size;
+            batch.push(Upload {
+                slot,
+                mesh,
+                offset: node.alloc.offset,
+                quads: node.alloc.size,
+            });
         }
         if bytes > 0 {
             out.push((batch, bytes));
         }
         out
+    }
+
+    /// Uploads that could not be recorded wait for the next frame (their nodes, if still the
+    /// same allocation, are not drawn until then).
+    fn restore(&mut self, batch: Vec<Upload>) {
+        for up in batch {
+            let Some(node) = self
+                .slots
+                .get_mut(up.slot as usize)
+                .and_then(Option::as_mut)
+            else {
+                continue;
+            };
+            if node.pending.is_none() && node.alloc.offset == up.offset {
+                node.pending = Some(up.mesh);
+                self.pending.push(up.slot);
+            }
+        }
     }
 
     /// The draw list for `view` (module docs). Empty while the last input does not draw LOD.
@@ -446,7 +524,8 @@ impl LodNodes {
                 let Some(node) = self.slots[slot as usize].as_ref() else {
                     continue;
                 };
-                if node.mask == 0xFF {
+                // Fully hidden, or its quads are not in the arena yet.
+                if node.mask == 0xFF || node.pending.is_some() {
                     continue;
                 }
                 self.stats.drawn += 1;
@@ -487,45 +566,47 @@ impl LodNodes {
     }
 }
 
-/// Copies `batch` (meshes with their arena offset and quads) into `arena` through one staging
-/// buffer of `bytes`.
+/// Copies `batch` into `arena` through one staging buffer of `bytes`. `Err` if the staging buffer
+/// could not be created (out of memory, a lost device: wgpu reported it; `fail` makes it so,
+/// for tests): nothing is recorded.
 fn copy(
     device: &wgpu::Device,
     encoder: &mut wgpu::CommandEncoder,
     arena: &wgpu::Buffer,
     batch: &[Upload],
     bytes: u64,
-) {
+    fail: bool,
+) -> Result<(), wgpu::MapRangeError> {
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("boxel lod uploads"),
-        size: bytes,
+        // Over every `max_buffer_size` (and unaligned): `fail`.
+        size: if fail { u64::MAX } else { bytes },
         usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: true,
     });
     {
-        let mut view = match staging.slice(..).get_mapped_range_mut() {
-            Ok(view) => view,
-            Err(e) => {
-                // wgpu reported why (out of memory, a lost device); those nodes show garbage or
-                // nothing until they are sent again (the device loss path resyncs everything).
-                tracing::error!("far LOD uploads lost: {e}");
-                return;
-            }
-        };
+        let mut view = staging.slice(..).get_mapped_range_mut()?;
         let mut at = 0;
-        for (mesh, _, n) in batch {
-            let data: &[u8] = bytemuck::cast_slice(&mesh.quads[..*n as usize]);
+        for up in batch {
+            let data: &[u8] = bytemuck::cast_slice(&up.mesh.quads[..up.quads as usize]);
             view.slice(at..at + data.len()).copy_from_slice(data);
             at += data.len();
         }
     }
     staging.unmap();
     let mut src = 0;
-    for (_, offset, n) in batch {
-        let size = u64::from(*n) * QUAD_BYTES;
-        encoder.copy_buffer_to_buffer(&staging, src, arena, u64::from(*offset) * QUAD_BYTES, size);
+    for up in batch {
+        let size = u64::from(up.quads) * QUAD_BYTES;
+        encoder.copy_buffer_to_buffer(
+            &staging,
+            src,
+            arena,
+            u64::from(up.offset) * QUAD_BYTES,
+            size,
+        );
         src += size;
     }
+    Ok(())
 }
 
 /// The LOD pipeline: `vs_lod` and `fs_lod` (module `Lod`), layout `[materials, view]` and 16
@@ -695,10 +776,10 @@ mod tests {
             Some(0xF0)
         );
         // The waiting uploads hold each node's newest mesh once, never a removed node's.
-        let uploads = nodes.take_uploads(u64::MAX);
-        let sent: Vec<u32> = uploads[0].0.iter().map(|(_, _, n)| *n).collect();
+        let uploads = nodes.take_uploads(u64::MAX, u64::MAX);
+        let sent: Vec<u32> = uploads[0].0.iter().map(|u| u.quads).collect();
         assert_eq!(sent, [2, 6]);
-        assert!(nodes.take_uploads(u64::MAX).is_empty());
+        assert!(nodes.take_uploads(u64::MAX, u64::MAX).is_empty());
         // An empty mesh removes the node; a resync drops everything before its ops.
         nodes.apply(input(vec![upsert(a, mesh([0; 6]), 0)]));
         check(&nodes);
@@ -719,7 +800,7 @@ mod tests {
             .map(|i| upsert(key(1, i, 0, 0), mesh([10, 0, 0, 0, 0, 0]), 0))
             .collect();
         nodes.apply(input(ops));
-        let batches = nodes.take_uploads(25 * QUAD_BYTES);
+        let batches = nodes.take_uploads(25 * QUAD_BYTES, u64::MAX);
         let sizes: Vec<(usize, u64)> = batches.iter().map(|(b, n)| (b.len(), *n)).collect();
         assert_eq!(sizes, [(2, 160), (2, 160), (1, 80)]);
         // A node larger than the limit goes alone.
@@ -728,9 +809,79 @@ mod tests {
             mesh([40, 0, 0, 0, 0, 0]),
             0,
         )]));
-        let batches = nodes.take_uploads(25 * QUAD_BYTES);
+        let batches = nodes.take_uploads(25 * QUAD_BYTES, u64::MAX);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].1, 40 * QUAD_BYTES);
+    }
+
+    /// After frames that drew nothing (a hidden window: `Prepare` applied their ops, no
+    /// `render` uploaded), a frame uploads at most its budget, oldest first; a node is drawn
+    /// only once its quads are up.
+    #[test]
+    fn a_backlog_of_uploads_goes_up_over_frames() {
+        let mut nodes = LodNodes::new(1 << 12, 1 << 12, 4);
+        let view = camera_view(DVec3::new(0.0, 100.0, 0.0), 0.0, -0.3);
+        let mut settings = input(Vec::new());
+        // 10 quads a frame from the world side: 40 quads (4 nodes) uploaded a frame.
+        settings.settings.upload_bytes_per_frame = 10 * QUAD_BYTES as usize;
+        for i in 0..10 {
+            let mut frame = settings.clone();
+            frame.ops = vec![upsert(key(1, 0, 0, -3 - i), mesh([10, 0, 0, 0, 0, 0]), 0)];
+            nodes.apply(frame);
+        }
+        assert_eq!(nodes.upload_budget, 40 * QUAD_BYTES);
+        for (up, drawn) in [(40, 4), (40, 8), (20, 10)] {
+            let batches = nodes.take_uploads(STAGING_BYTES, nodes.upload_budget);
+            let quads: u32 = batches.iter().flat_map(|(b, _)| b).map(|u| u.quads).sum();
+            assert_eq!(quads, up, "a frame's uploads");
+            nodes.cull(&view);
+            assert_eq!(nodes.draws.len(), drawn, "the nodes up are drawn");
+        }
+        assert!(
+            nodes
+                .take_uploads(STAGING_BYTES, nodes.upload_budget)
+                .is_empty()
+        );
+        // One node over the budget still goes up, alone.
+        nodes.apply(LodInput {
+            ops: vec![upsert(key(1, 1, 0, -3), mesh([200, 0, 0, 0, 0, 0]), 0)],
+            ..settings
+        });
+        let batches = nodes.take_uploads(STAGING_BYTES, nodes.upload_budget);
+        assert_eq!(batches.iter().map(|(b, _)| b.len()).sum::<usize>(), 1);
+        check(&nodes);
+    }
+
+    /// Uploads whose staging buffer could not be created wait for the next frame: their nodes are
+    /// not drawn meanwhile (their range holds nothing yet, or another node's old quads), and go
+    /// up again as they are. A node removed or replaced meanwhile is not restored.
+    #[test]
+    fn lost_uploads_go_up_the_next_frame() {
+        let mut nodes = LodNodes::new(1 << 12, 1 << 12, 4);
+        let view = camera_view(DVec3::new(0.0, 100.0, 0.0), 0.0, -0.3);
+        let (a, b, c) = (key(1, -1, 0, -3), key(1, 0, 0, -3), key(1, 1, 0, -3));
+        nodes.apply(input(vec![
+            upsert(a, mesh([4, 0, 0, 0, 0, 0]), 0),
+            upsert(b, mesh([5, 0, 0, 0, 0, 0]), 0),
+            upsert(c, mesh([6, 0, 0, 0, 0, 0]), 0),
+        ]));
+        let lost = nodes.take_uploads(STAGING_BYTES, u64::MAX);
+        // Meanwhile `b` is removed and `c` gets a new mesh.
+        nodes.apply(input(vec![
+            LodOp::Remove { key: b },
+            upsert(c, mesh([7, 0, 0, 0, 0, 0]), 0),
+        ]));
+        for (batch, _) in lost {
+            nodes.restore(batch);
+        }
+        nodes.cull(&view);
+        assert!(nodes.draws.is_empty(), "nothing is up yet");
+        let again = nodes.take_uploads(STAGING_BYTES, u64::MAX);
+        let quads: Vec<u32> = again.iter().flat_map(|(b, _)| b).map(|u| u.quads).collect();
+        assert_eq!(quads, [7, 4], "c's new mesh, a again; b is gone");
+        nodes.cull(&view);
+        assert_eq!(nodes.draws.len(), 2);
+        check(&nodes);
     }
 
     #[test]
@@ -805,6 +956,7 @@ mod tests {
             upsert(hidden, mesh([1; 6]), 0xFF),
             upsert(far_away, mesh([1; 6]), 0),
         ]));
+        nodes.take_uploads(STAGING_BYTES, u64::MAX);
         nodes.cull(&view);
         let drawn: Vec<(i32, u32)> = nodes
             .draws
@@ -868,6 +1020,7 @@ mod tests {
                 upsert(k(2, -1, -2), mesh([2; 6]), 0),
                 upsert(k(1, 3, 3), mesh([1; 6]), 0),
             ]));
+            nodes.take_uploads(STAGING_BYTES, u64::MAX);
             nodes.cull(&view);
             let drawn: Vec<u32> = nodes.draws.iter().map(|d| d.quads).collect();
             assert_eq!(drawn, [6, 12], "shift {shift}");

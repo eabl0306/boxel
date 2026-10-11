@@ -812,6 +812,16 @@ impl VoxelRenderer {
         self.lod.as_ref().and_then(LodPass::far)
     }
 
+    /// Testing: the next [`VoxelRenderer::render`] cannot create the staging buffer of its far
+    /// LOD uploads, as when out of memory (wgpu reports an error): those nodes are not drawn in
+    /// that frame and go up in the next one.
+    #[doc(hidden)]
+    pub fn debug_fail_next_lod_upload(&mut self) {
+        if let Some(lod) = &mut self.lod {
+            lod.fail_next_upload();
+        }
+    }
+
     /// The LOD stays off on this renderer: a GL backend, or its pass failed to build.
     pub(crate) fn lod_failed(&self) -> bool {
         self.lod_failed

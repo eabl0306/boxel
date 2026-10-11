@@ -24,6 +24,8 @@
 //!   turns the LOD off and keeps the tier.
 //! - **Presets:** switching the arena size (far, extreme, near) rebuilds the LOD pass; refilled,
 //!   it draws what a fresh pass draws, with no refusal.
+//! - **Lost uploads:** a frame whose LOD staging buffer cannot be created draws none of those
+//!   nodes (never stale quads), and the next frame uploads and draws them.
 //!
 //! Failing images are saved under `CARGO_TARGET_TMPDIR/gpu_lod/` (every image with
 //! `GPU_LOD_SAVE=1`).
@@ -1022,6 +1024,67 @@ fn switching_presets_rebuilds_the_pass_and_refills_it() {
                     (&gpu.name(&format!("{name}_switched")), &image),
                 );
             }
+            Ok(())
+        };
+        if let Err(e) = run() {
+            report.fail(format!("{} {}: {e}", gpu.label, gpu.tier), &[]);
+        }
+    })
+    .finish();
+}
+
+/// A frame whose LOD uploads cannot get a staging buffer (as when out of memory: wgpu reports
+/// it) draws none of those nodes, never what their ranges held: the image is the one without
+/// nodes. The next frame uploads them and draws what a renderer that never lost them draws.
+#[test]
+fn lost_lod_uploads_go_up_the_next_frame() {
+    let chunks = full_detail();
+    let view = scene_view(I64Vec3::ZERO);
+    for_every_tier(|gpu, report| {
+        if gpu.gl() {
+            return;
+        }
+        let mut run = || -> Result<(), String> {
+            let (want, _) = render_scene(gpu, I64Vec3::ZERO)?;
+            let mut renderer = new_renderer(gpu)?;
+            load_world(&mut renderer, &chunks, I64Vec3::ZERO)?;
+            renderer.set_lod(
+                gpu.device,
+                Some(LodInput::new(settings(1 << 20), Some(HORIZON))),
+            );
+            let empty = render(gpu, &mut renderer, &view)?;
+            renderer.set_lod(gpu.device, Some(lod_input(settings(1 << 20), lod_nodes())));
+            renderer.debug_fail_next_lod_upload();
+            let caught = run_in_error_scopes(gpu.device, || {
+                let mut encoder =
+                    gpu.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("gpu_lod lost uploads"),
+                        });
+                renderer.render(gpu.device, gpu.queue, &mut encoder, &view);
+                submit_and_wait(gpu.device, gpu.queue, encoder)
+            });
+            if caught.is_ok() {
+                return Err("no error for the staging buffer".into());
+            }
+            if renderer.stats().lod_draws != 0 {
+                return Err(format!(
+                    "nodes drawn before their upload: {:?}",
+                    renderer.stats()
+                ));
+            }
+            let lost = read_texture_rgba8(gpu.device, gpu.queue, renderer.main_color())?;
+            report.check_identical(
+                &format!("{} {}: lost uploads draw no node", gpu.label, gpu.tier),
+                (&gpu.name("lost_empty"), &empty),
+                (&gpu.name("lost"), &lost),
+            );
+            let again = render(gpu, &mut renderer, &view)?;
+            report.check_identical(
+                &format!("{} {}: uploaded the next frame", gpu.label, gpu.tier),
+                (&gpu.name("lost_want"), &want),
+                (&gpu.name("lost_again"), &again),
+            );
             Ok(())
         };
         if let Err(e) = run() {
