@@ -22,8 +22,10 @@
 //! guard turns the LOD off.
 //!
 //! The set of wanted layers of a column is an interval (the distance to a box grows with its
-//! vertical gap), so the walk is per column: [`plan`] keeps one wanted interval per column and
-//! level, and for `k >= 2` the refined part of it, whose children columns want twice its layers.
+//! vertical gap), so the walk is per column: [`plan_level`] keeps one wanted interval per column
+//! and level, and for `k >= 2` the refined part of it, whose children columns want twice its
+//! layers. A replan makes the levels one after another, coarse first, and the LOD applies each
+//! a budgeted run of columns a frame ([`LevelPlan::two_windows`]).
 
 use super::coverage::ChunkCoverage;
 use crate::interest::Viewer;
@@ -72,17 +74,21 @@ impl KeepExtent {
             [Viewer::new(eye, radius, vertical)],
             hysteresis,
             bounds,
+            u64::MAX,
         )
     }
 
     /// The keep extent of `viewers` seen from the eye in chunk `eye`. Viewers' radii are already
     /// clamped ([`Viewer::new`]); the hysteresis is clamped the same way. A viewer whose keep
-    /// layers miss the bounds keeps nothing.
+    /// layers miss the bounds keeps nothing, and so does one more than `away` columns from the
+    /// eye: it is somewhere else (another viewer, or the world's record of a viewer that just
+    /// jumped, a frame late), and the LOD refines around the eye only.
     pub(crate) fn of_viewers(
         eye: ChunkPos,
         viewers: impl IntoIterator<Item = Viewer>,
         hysteresis: u32,
         bounds: Option<&RangeInclusive<i64>>,
+        away: u64,
     ) -> Self {
         let h = u64::from(hysteresis.min(crate::interest::MAX_RADIUS));
         let mut out = Self::default();
@@ -100,6 +106,9 @@ impl KeepExtent {
             let dx = eye.x.abs_diff(v.center.x) as f64;
             let dz = eye.z.abs_diff(v.center.z) as f64;
             let off = dx.hypot(dz).ceil() as u64;
+            if off > away || eye.y.abs_diff(v.center.y) > away {
+                continue;
+            }
             let columns = off.saturating_add(u64::from(v.radius) + 1 + h + 1);
             out.columns = out.columns.max(columns);
             out.layers = out.layers.max(dy.saturating_add(1));
@@ -490,17 +499,18 @@ impl LevelPlan {
         })
     }
 
-    /// The columns of the windows of `a` and `b` together, row by row.
-    pub(crate) fn union_columns(a: &Self, b: &Self) -> impl Iterator<Item = [i64; 2]> + use<> {
-        let (lo, hi) = match (a.bounds(), b.bounds()) {
-            (Some((a_min, a_max)), Some((b_min, b_max))) => (
-                [a_min[0].min(b_min[0]), a_min[1].min(b_min[1])],
-                [a_max[0].max(b_max[0]), a_max[1].max(b_max[1])],
-            ),
-            (Some(w), None) | (None, Some(w)) => w,
-            (None, None) => ([0, 0], [-1, -1]),
+    /// The columns of the windows of `after` and `before`, row by row, `after`'s first:
+    /// [`TwoWindows::column`] `0..len` (a column in both comes twice).
+    pub(crate) fn two_windows(after: &Self, before: &Self) -> TwoWindows {
+        let window = |l: &Self| {
+            l.bounds()
+                .map_or(([0, 0], 0, 0), |(lo, _)| (lo, l.size[0], l.cells.len()))
         };
-        (lo[1]..=hi[1]).flat_map(move |z| (lo[0]..=hi[0]).map(move |x| [x, z]))
+        let (a, b) = (window(after), window(before));
+        TwoWindows {
+            windows: [a, b],
+            len: a.2 + b.2,
+        }
     }
 
     /// Every wanted column with its plan.
@@ -511,6 +521,32 @@ impl LevelPlan {
             .enumerate()
             .filter(|(_, c)| c.wanted.is_some())
             .map(move |(i, c)| ([o[0] + (i % w) as i64, o[1] + (i / w) as i64], c))
+    }
+}
+
+/// The columns of two level windows ([`LevelPlan::two_windows`]), by index, so walking them can
+/// stop and go on later.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TwoWindows {
+    /// Each window's lowest column, width and columns.
+    windows: [([i64; 2], usize, usize); 2],
+    /// Columns in both.
+    pub(crate) len: usize,
+}
+
+impl TwoWindows {
+    /// Column `i` (below `len`).
+    pub(crate) fn column(&self, i: usize) -> [i64; 2] {
+        let [first, second] = self.windows;
+        let ((origin, width, _), i) = if i < first.2 {
+            (first, i)
+        } else {
+            (second, i - first.2)
+        };
+        [
+            origin[0] + (i % width) as i64,
+            origin[1] + (i / width) as i64,
+        ]
     }
 }
 
@@ -543,12 +579,15 @@ pub(crate) fn cadence(k: u8) -> f64 {
 /// Plans the wanted tree for `eye` under `th`, keeping levels above `redo` as they are in `old`
 /// (moved out of it: the eye has not crossed an eighth of their bands since they were made) and
 /// making levels `redo` and below again, with the hysteresis of their spans in `old`. `redo` is
-/// clamped to `1..=K`; an `old` with another number of levels counts as empty.
+/// clamped to `1..=K`; an `old` with another number of levels counts as empty. The same as
+/// [`plan_level`] level after level, coarse first, at once (tests; the LOD goes a budgeted part
+/// a frame).
 ///
 /// `ceiling` is the generator's highest chunk layer (`vertical_chunks().end()`, `None` without
 /// one): a level-`k` layer above `ceiling >> k` holds only air, so it is never wanted (no job, no
 /// record). Over a fixed-height world a high eye then wants the columns that reach the ground,
 /// not a disc as wide as `T_1` at its own height.
+#[cfg(test)]
 pub(crate) fn plan(
     eye: &Eye,
     th: &Thresholds,
@@ -557,11 +596,6 @@ pub(crate) fn plan(
     ceiling: Option<i64>,
 ) -> Plan {
     let top = th.levels();
-    // The layers of level `k` that may hold more than air, inside the world limit.
-    let layers = |k: u8| {
-        let limit = world_limit(k);
-        Some((-limit, ceiling.map_or(limit, |c| (c >> k).min(limit))))
-    };
     if old.levels.len() != usize::from(top) {
         old.levels = vec![LevelPlan::default(); usize::from(top)];
     }
@@ -575,6 +609,38 @@ pub(crate) fn plan(
             }
         })
         .collect();
+    for k in (1..=redo).rev() {
+        let (finer, coarser) = levels.split_at_mut(usize::from(k));
+        let parents = (k < top).then(|| &coarser[0]);
+        finer[usize::from(k) - 1] = plan_level(
+            eye,
+            th,
+            k,
+            &old.levels[usize::from(k) - 1],
+            parents,
+            ceiling,
+        );
+    }
+    Plan { levels }
+}
+
+/// Plans level `k` of the wanted tree for `eye` under `th` (see [`plan`]): the top level from
+/// the horizon, a finer one from the refined layers of `parents` (level `k + 1`, `None` for the
+/// top), with the hysteresis of `prev` (level `k` as planned before).
+pub(crate) fn plan_level(
+    eye: &Eye,
+    th: &Thresholds,
+    k: u8,
+    prev: &LevelPlan,
+    parents: Option<&LevelPlan>,
+    ceiling: Option<i64>,
+) -> LevelPlan {
+    let top = th.levels();
+    // The layers of level `k` that may hold more than air, inside the world limit.
+    let layers = |k: u8| {
+        let limit = world_limit(k);
+        Some((-limit, ceiling.map_or(limit, |c| (c >> k).min(limit))))
+    };
     // The refined layers of a level-`k` column (`k >= 2`): nearer than `T_(k-1)`, kept until
     // past it by `e_(k-1)`.
     let refine = |at: &EyeLayer, k: u8, gap2: f64, wanted: Span, old: Option<&ColumnPlan>| {
@@ -587,7 +653,7 @@ pub(crate) fn plan(
             Some(wanted),
         )
     };
-    if redo == top {
+    let Some(parents) = parents.filter(|_| k < top) else {
         // Top level: every column nearer than the horizon (plus its hysteresis).
         let at = EyeLayer::new(eye, top);
         let e = node_edge(top);
@@ -598,7 +664,6 @@ pub(crate) fn plan(
         let (cx, cz) = (eye.block[0].div_euclid(e), eye.block[2].div_euclid(e));
         let min = [(cx - reach).max(-limit), (cz - reach).max(-limit)];
         let max = [(cx + reach).min(limit), (cz + reach).min(limit)];
-        let prev = &old.levels[usize::from(top) - 1];
         let mut map = LevelPlan::new(min, max);
         for z in min[1]..=max[1] {
             for x in min[0]..=max[0] {
@@ -626,62 +691,55 @@ pub(crate) fn plan(
                 map.set(x, z, ColumnPlan { wanted, refined });
             }
         }
-        levels[usize::from(top) - 1] = map;
-    }
-    // Finer levels: the children of the refined layers.
-    for k in (1..redo.min(top - 1) + 1).rev() {
-        let (finer, coarser) = levels.split_at_mut(usize::from(k));
-        let parents = &coarser[0];
-        let limit = world_limit(k);
-        // The window: twice the refined parents' bounds.
-        let mut bounds: Option<([i64; 2], [i64; 2])> = None;
-        for ([px, pz], parent) in parents.iter() {
-            if parent.refined.is_some() {
-                let (lo, hi) = bounds.get_or_insert(([px, pz], [px, pz]));
-                *lo = [lo[0].min(px), lo[1].min(pz)];
-                *hi = [hi[0].max(px), hi[1].max(pz)];
-            }
+        return map;
+    };
+    // A finer level: the children of the refined layers.
+    let limit = world_limit(k);
+    // The window: twice the refined parents' bounds.
+    let mut bounds: Option<([i64; 2], [i64; 2])> = None;
+    for ([px, pz], parent) in parents.iter() {
+        if parent.refined.is_some() {
+            let (lo, hi) = bounds.get_or_insert(([px, pz], [px, pz]));
+            *lo = [lo[0].min(px), lo[1].min(pz)];
+            *hi = [hi[0].max(px), hi[1].max(pz)];
         }
-        let Some((lo, hi)) = bounds else {
-            finer[usize::from(k) - 1] = LevelPlan::default();
+    }
+    let Some((lo, hi)) = bounds else {
+        return LevelPlan::default();
+    };
+    let clip = |v: i64| v.clamp(-limit, limit);
+    let mut map = LevelPlan::new(
+        [clip(lo[0] * 2), clip(lo[1] * 2)],
+        [clip(hi[0] * 2 + 1), clip(hi[1] * 2 + 1)],
+    );
+    let at = EyeLayer::new(eye, k);
+    for ([px, pz], parent) in parents.iter() {
+        let Some((a, b)) = parent.refined else {
             continue;
         };
-        let clip = |v: i64| v.clamp(-limit, limit);
-        let mut map = LevelPlan::new(
-            [clip(lo[0] * 2), clip(lo[1] * 2)],
-            [clip(hi[0] * 2 + 1), clip(hi[1] * 2 + 1)],
-        );
-        let prev = &old.levels[usize::from(k) - 1];
-        let at = EyeLayer::new(eye, k);
-        for ([px, pz], parent) in parents.iter() {
-            let Some((a, b)) = parent.refined else {
+        let Some(wanted) = intersect(Some((a * 2, b * 2 + 1)), layers(k)) else {
+            continue;
+        };
+        for (dx, dz) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            let (x, z) = (px * 2 + dx, pz * 2 + dz);
+            if x.abs() > limit || z.abs() > limit {
                 continue;
-            };
-            let Some(wanted) = intersect(Some((a * 2, b * 2 + 1)), layers(k)) else {
-                continue;
-            };
-            for (dx, dz) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                let (x, z) = (px * 2 + dx, pz * 2 + dz);
-                if x.abs() > limit || z.abs() > limit {
-                    continue;
-                }
-                let refined = if k >= 2 {
-                    let gap2 = eye.column_gap2(k, [x, z]);
-                    refine(&at, k, gap2, wanted, prev.get(x, z))
-                } else {
-                    None
-                };
-                map.set(
-                    x,
-                    z,
-                    ColumnPlan {
-                        wanted: Some(wanted),
-                        refined,
-                    },
-                );
             }
+            let refined = if k >= 2 {
+                let gap2 = eye.column_gap2(k, [x, z]);
+                refine(&at, k, gap2, wanted, prev.get(x, z))
+            } else {
+                None
+            };
+            map.set(
+                x,
+                z,
+                ColumnPlan {
+                    wanted: Some(wanted),
+                    refined,
+                },
+            );
         }
-        finer[usize::from(k) - 1] = map;
     }
-    Plan { levels }
+    map
 }

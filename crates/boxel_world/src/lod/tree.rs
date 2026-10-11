@@ -25,7 +25,7 @@
 //! marks masks dirty and queues sends; [`Tree::collect`] turns them into ops in the frame.
 use super::coverage::ChunkCoverage;
 use super::jobs::Built;
-use super::plan::{ColumnKey, ColumnPlan, LevelPlan, Plan, Span, contains, intersect};
+use super::plan::{ColumnKey, ColumnPlan, LevelPlan, Span, contains, intersect};
 use super::{LevelStats, LodOp};
 use boxel_mesh::ChunkMesh;
 use boxel_voxel::{ChunkKey, ChunkPos, DimensionId};
@@ -740,26 +740,29 @@ impl Tree {
         }
     }
 
-    /// Applies plan `new` over `old` (the plan the tree follows; only levels `redo` and below
-    /// differ): wanted intervals, departures, new records, uniform layers whose active state
-    /// changed. Coarse levels first.
-    pub(crate) fn apply_plan(&mut self, old: &Plan, new: &Plan, redo: u8, cov: &ChunkCoverage) {
-        let empty = LevelPlan::default();
-        for k in (1..=redo.min(self.levels)).rev() {
-            let i = usize::from(k) - 1;
-            let before = old.levels.get(i).unwrap_or(&empty);
-            let after = new.levels.get(i).unwrap_or(&empty);
-            for [x, z] in LevelPlan::union_columns(before, after) {
-                let plan = after.get(x, z);
-                if before.get(x, z) != plan {
-                    let c = ColumnKey { level: k, x, z };
-                    self.set_plan(c, plan.copied().unwrap_or_default(), cov);
-                }
-            }
+    /// Applies column `[x, z]` of level `k` of a plan, `after`, over `before`: its wanted
+    /// interval (departures, new records, uniform layers whose active state changed), if it
+    /// changed. A replan applies its levels coarse first, every column of both windows
+    /// ([`LevelPlan::two_windows`]; a column seen twice changes once).
+    pub(crate) fn apply_column(
+        &mut self,
+        k: u8,
+        [x, z]: [i64; 2],
+        before: &LevelPlan,
+        after: &LevelPlan,
+        cov: &ChunkCoverage,
+    ) {
+        if k > self.levels {
+            return;
+        }
+        let plan = after.get(x, z);
+        if before.get(x, z) != plan {
+            let c = ColumnKey { level: k, x, z };
+            self.set_plan(c, plan.copied().unwrap_or_default(), cov);
         }
     }
 
-    /// Sets the plan of column `c` (see [`Tree::apply_plan`]).
+    /// Sets the plan of column `c` (see [`Tree::apply_column`]).
     fn set_plan(&mut self, c: ColumnKey, new: ColumnPlan, cov: &ChunkCoverage) {
         let col = self.columns.entry(c).or_default();
         let old = col.plan;

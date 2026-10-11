@@ -1086,6 +1086,118 @@ fn a_busy_world_runs_only_class_0_columns() {
     assert!(!state.jobs.handed_off_columns().contains(&(c, 2)));
 }
 
+/// A replan goes level by level, coarse first, a budgeted run of columns a frame (with a budget
+/// of a nanosecond, 16): a first plan or a jump never lands in one frame. Done, it is the plan
+/// made at once. A jump while one is under way starts it over from the top, once the level
+/// being applied is done.
+#[test]
+fn replans_go_level_by_level_coarse_first() {
+    let settings = LodSettings {
+        ring_radius: 8,
+        levels: 3,
+        frame_budget: Duration::from_nanos(1),
+        ..LodSettings::default()
+    };
+    let mut app = focus_app(
+        Steps::new(20),
+        settings.clone(),
+        Arc::new(InlineExecutor),
+        I64Vec3::new(0, 60, 0),
+    );
+    let levels_planned = |app: &App| {
+        let lod = app.world().resource::<LodWorld>();
+        (1..=3u8)
+            .filter(|&k| lod.tree.columns.keys().any(|c| c.level == k))
+            .collect::<Vec<_>>()
+    };
+    let mut seen = Vec::new();
+    for _ in 0..1000 {
+        app.update();
+        let levels = levels_planned(&app);
+        if !levels.is_empty() && seen.last() != Some(&levels) {
+            seen.push(levels);
+        }
+        if app.world().resource::<LodWorld>().replan.is_none() && !seen.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(seen, [vec![3], vec![2, 3], vec![1, 2, 3]], "coarse first");
+    let lod = app.world().resource::<LodWorld>();
+    assert!(lod.replan.is_none());
+    let eye = lod.planned.expect("planned").eye;
+    let th = lod.planned.expect("planned").th;
+    let mut empty = Plan::default();
+    let once = plan::plan(&eye, &th, &mut empty, 3, lod.ceiling);
+    for k in 1..=3u8 {
+        let i = usize::from(k) - 1;
+        let staged: Vec<_> = lod.plan.levels[i].iter().map(|(c, p)| (c, *p)).collect();
+        let whole: Vec<_> = once.levels[i].iter().map(|(c, p)| (c, *p)).collect();
+        assert_eq!(staged, whole, "level {k}");
+    }
+    assert_bits_from_scratch(&app);
+    // Two jumps, the second while the first's replan is under way: the tree ends at the second.
+    let jump = |app: &mut App, x: i64| {
+        app.world_mut().resource_mut::<LodFocus>().origin = I64Vec3::new(x, 60, 0);
+    };
+    jump(&mut app, 1 << 20);
+    app.update();
+    assert!(app.world().resource::<LodWorld>().replan.is_some());
+    jump(&mut app, 1 << 22);
+    let mut frames = 0;
+    while frames < 5000 {
+        app.update();
+        frames += 1;
+        let lod = app.world().resource::<LodWorld>();
+        if lod.replan.is_none() && lod.planned.expect("planned").eye.block[0] == 1 << 22 {
+            break;
+        }
+    }
+    assert!(frames > 3 && frames < 5000, "{frames} frames");
+    let lod = app.world().resource::<LodWorld>();
+    assert!(
+        lod.tree
+            .columns
+            .keys()
+            .all(|c| (c.x << (5 + c.level)) > (1 << 22) - 20_000),
+        "nothing of the old places is left"
+    );
+    assert_bits_from_scratch(&app);
+}
+
+#[test]
+fn a_viewer_far_from_the_eye_never_turns_the_guard_on() {
+    let mut app = focus_app(
+        Steps::new(20),
+        small(),
+        Arc::new(InlineExecutor),
+        I64Vec3::new(0, 60, 0),
+    );
+    spawn(&mut app, DVec3::new(10.0, 60.0, 10.0));
+    let far = spawn(&mut app, DVec3::new(1.0e6, 60.0, 0.0));
+    let mut model = Model::default();
+    fill(&mut app, &mut model, 300);
+    for _ in 0..5 {
+        frame(&mut app, &mut model);
+        assert_eq!(app.world().resource::<LodStats>().off, None);
+    }
+    // Near the eye it counts again: T_1 reaches it.
+    app.world_mut()
+        .entity_mut(far)
+        .get_mut::<Transform>()
+        .expect("viewer")
+        .translation
+        .x = 600.0;
+    frame(&mut app, &mut model);
+    let keep = app.world().resource::<LodWorld>().keep.expect("keep");
+    assert!(keep.columns >= 600 / 32, "{keep:?}");
+    // Every viewer within the preset's horizon counts; past it, none.
+    let eye = ChunkPos::new(0, 2, 0);
+    let viewer = |x: i64| Viewer::new(ChunkPos::new(x, 2, 0), 4, 2);
+    let at = |x: i64| KeepExtent::of_viewers(eye, [viewer(0), viewer(x)], 2, None, 100);
+    assert_eq!(at(100).columns, 100 + 4 + 1 + 2 + 1);
+    assert_eq!(at(101), at(0));
+}
+
 #[test]
 fn a_panicking_source_fails_its_column_once() {
     let steps = Steps {

@@ -73,6 +73,9 @@ const STALE_TURN_DEGREES: f64 = 15.0;
 const REFRESH_PER_FRAME: usize = 256;
 /// Results and dispatches between two looks at the clock.
 const CLOCK_EVERY: usize = 16;
+/// A replan under way starts over from the top when the eye moved this many top-level cadences
+/// away from where it began (a jump).
+const JUMP_CADENCES: f64 = 4.0;
 /// Jobs handed off to the workers per in-flight slot ([`jobs`] module docs): enough to keep a
 /// worker busy for about a millisecond between two dispatches of the main thread.
 const HANDOFF_PER_SLOT: usize = 4;
@@ -107,7 +110,8 @@ pub struct LodSettings {
     /// goes, alone).
     pub upload_bytes_per_frame: usize,
     /// Main-thread time per frame for collecting finished jobs and starting new ones, and between
-    /// frames per idle step. Reading the renderer's messages is not counted.
+    /// frames per idle step; a replan goes on to its next level while under it (one level per
+    /// frame at least, coarse first). Reading the renderer's messages is not counted.
     pub frame_budget: Duration,
     /// How long an edited chunk waits before its LOD nodes are rebuilt (milestone 2).
     pub edit_debounce: Duration,
@@ -494,6 +498,19 @@ struct Planned {
     th: Thresholds,
 }
 
+/// A replan going level by level ([`LodWorld::plan`]).
+#[derive(Debug)]
+struct Replan {
+    eye: Eye,
+    th: Thresholds,
+    /// The next level to plan (down to 1).
+    next: u8,
+    /// Level `next` while it is applied, column by column: its new plan, the columns to walk
+    /// (the new window's, then the old one's) and how many are done. The old plan stays in
+    /// `LodWorld::plan` until it is.
+    level: Option<(plan::LevelPlan, plan::TwoWindows, usize)>,
+}
+
 /// Where the eye looks, for the priority classes.
 #[derive(Clone, Copy, Debug)]
 struct View {
@@ -519,6 +536,10 @@ pub(crate) struct LodWorld {
     keep: Option<KeepExtent>,
     /// The wanted tree the nodes follow.
     plan: Plan,
+    /// The replan under way: its levels above `next` are done.
+    replan: Option<Replan>,
+    /// Columns whose work changed, not queued yet ([`LodWorld::queue_work`]).
+    work_left: Vec<ColumnKey>,
     /// The eye each level was last planned from (`level_eyes[k]`).
     level_eyes: [Option<Eye>; MAX_LEVELS as usize + 1],
     view: View,
@@ -552,6 +573,8 @@ impl LodWorld {
             planned: None,
             keep: None,
             plan: Plan::default(),
+            replan: None,
+            work_left: Vec::new(),
             level_eyes: [None; MAX_LEVELS as usize + 1],
             view: View {
                 forward: None,
@@ -628,6 +651,8 @@ impl LodWorld {
         self.off = Some(why);
         self.planned = None;
         self.plan = Plan::default();
+        self.replan = None;
+        self.work_left.clear();
         self.level_eyes = [None; MAX_LEVELS as usize + 1];
         self.refreshed = None;
         self.refresh.clear();
@@ -657,6 +682,8 @@ impl LodWorld {
             self.ceiling = (ceiling != i64::MAX).then_some(ceiling);
             self.planned = None;
             self.plan = Plan::default();
+            self.replan = None;
+            self.work_left.clear();
             self.level_eyes = [None; MAX_LEVELS as usize + 1];
             self.refreshed = None;
             self.refresh.clear();
@@ -678,11 +705,15 @@ impl LodWorld {
         let Some(settings) = &self.settings else {
             return;
         };
+        // Viewers past the preset's horizon are elsewhere (after a jump the world's record of
+        // the viewer is a frame late): they would turn the horizon guard on and drop every node.
+        let away = (settings.preset_horizon() / 32.0) as u64;
         let keep = KeepExtent::of_viewers(
             eye.chunk(),
             viewers.iter().map(|(_, v)| *v),
             world.unload_hysteresis,
             world.vertical_bounds.as_ref(),
+            away,
         );
         // A smaller keep region leaves published chunks behind until the world unloads them:
         // `T_1` keeps its reach until it covers them again (else a level-2 node would hide the
@@ -710,28 +741,37 @@ impl LodWorld {
         self.off = None;
         self.view = view;
         // The coarsest level due: all of them after a threshold changed, else the coarsest whose
-        // eye moved past its cadence (finer levels follow it).
+        // eye moved past its cadence (finer levels follow it). A replan goes one level per frame,
+        // coarse first (more while it is cheap): a first plan or a jump never lands in one
+        // frame. One under way starts over from the top when the thresholds change or the eye
+        // jumps.
+        let top = th.levels();
+        let budget = settings.frame_budget;
         let fresh = self.planned.is_none_or(|p| p.th != th);
-        let redo = (1..=th.levels())
-            .rev()
-            .find(|&k| {
-                fresh
-                    || self.level_eyes[usize::from(k)]
+        // A level half applied is finished first (its columns follow the old or the new plan,
+        // nothing else).
+        let restart = self.replan.as_ref().is_some_and(|r| {
+            r.level.is_none()
+                && (r.th != th || r.eye.distance_to(&eye) >= plan::cadence(top) * JUMP_CADENCES)
+        });
+        if restart || fresh && self.replan.is_none() {
+            self.start_replan(eye, th, top);
+        } else if self.replan.is_none() {
+            let redo = (1..=top)
+                .rev()
+                .find(|&k| {
+                    self.level_eyes[usize::from(k)]
                         .is_none_or(|e| e.distance_to(&eye) >= plan::cadence(k))
-            })
-            .unwrap_or(0);
-        if redo > 0 {
-            let redo = if fresh { th.levels() } else { redo };
-            let mut old = std::mem::take(&mut self.plan);
-            let new = plan::plan(&eye, &th, &mut old, redo, self.ceiling);
-            self.tree.apply_plan(&old, &new, redo, cov);
-            self.plan = new;
-            for e in &mut self.level_eyes[1..=usize::from(redo)] {
-                *e = Some(eye);
+                })
+                .unwrap_or(0);
+            if redo > 0 {
+                self.start_replan(eye, th, redo);
             }
-            self.planned = Some(Planned { eye, th });
-            self.started.get_or_insert_with(Instant::now);
-            self.queue_work(cov);
+        }
+        if self.replan.is_some() {
+            let until = Instant::now() + budget;
+            self.replan_step(cov, until);
+            self.queue_work(cov, Some(until));
         }
         // Stale priorities: a batch per frame after the eye moved or turned enough.
         let turned = |a: Option<DVec3>, b: Option<DVec3>| match (a, b) {
@@ -760,10 +800,82 @@ impl LodWorld {
         }
     }
 
-    /// Queues every column whose work may have changed.
-    fn queue_work(&mut self, cov: &ChunkCoverage) {
-        for c in self.tree.take_work() {
+    /// Starts a replan of levels `redo` down to 1 from `eye` under `th`.
+    fn start_replan(&mut self, eye: Eye, th: Thresholds, redo: u8) {
+        let top = th.levels();
+        if self.plan.levels.len() != usize::from(top) {
+            self.plan.levels = vec![plan::LevelPlan::default(); usize::from(top)];
+        }
+        self.replan = Some(Replan {
+            eye,
+            th,
+            next: redo.clamp(1, top),
+            level: None,
+        });
+        self.planned = Some(Planned { eye, th });
+        self.started.get_or_insert_with(Instant::now);
+    }
+
+    /// Goes on with the replan under way until `until` (checked every [`CLOCK_EVERY`] columns,
+    /// at least that many done): plans its next level, then applies it column by column, coarse
+    /// levels first. False once it is done.
+    fn replan_step(&mut self, cov: &ChunkCoverage, until: Instant) -> bool {
+        let Some(mut r) = self.replan.take() else {
+            return false;
+        };
+        loop {
+            let k = r.next;
+            let i = usize::from(k) - 1;
+            let (new, window, mut at) = match r.level.take() {
+                Some(level) => level,
+                None => {
+                    let prev = &self.plan.levels[i];
+                    let parents = self.plan.levels.get(i + 1);
+                    let new = plan::plan_level(&r.eye, &r.th, k, prev, parents, self.ceiling);
+                    let window = plan::LevelPlan::two_windows(&new, prev);
+                    (new, window, 0)
+                }
+            };
+            while at < window.len {
+                let column = window.column(at);
+                self.tree
+                    .apply_column(k, column, &self.plan.levels[i], &new, cov);
+                at += 1;
+                if at % CLOCK_EVERY == 0 && at < window.len && Instant::now() >= until {
+                    r.level = Some((new, window, at));
+                    self.replan = Some(r);
+                    return true;
+                }
+            }
+            self.plan.levels[i] = new;
+            self.level_eyes[usize::from(k)] = Some(r.eye);
+            if k == 1 {
+                return false;
+            }
+            r.next = k - 1;
+            if Instant::now() >= until {
+                self.replan = Some(r);
+                return true;
+            }
+        }
+    }
+
+    /// Queues the columns whose work may have changed, until `until` (checked every
+    /// [`CLOCK_EVERY`] columns; the rest wait for the next call), or all of them.
+    fn queue_work(&mut self, cov: &ChunkCoverage, until: Option<Instant>) {
+        let mut work = self.tree.take_work();
+        if self.work_left.is_empty() {
+            self.work_left = work;
+        } else {
+            self.work_left.append(&mut work);
+        }
+        let mut done = 0;
+        while let Some(c) = self.work_left.pop() {
             self.queue(c, false, cov);
+            done += 1;
+            if done % CLOCK_EVERY == 0 && until.is_some_and(|t| Instant::now() >= t) {
+                return;
+            }
         }
     }
 
@@ -903,7 +1015,7 @@ impl LodWorld {
                     return;
                 }
             }
-            self.queue_work(cov);
+            self.queue_work(cov, Some(until));
             let mut spawned = 0;
             while self.off.is_none() && self.jobs.has_room() {
                 if !self.jobs.start_handed_off() {
@@ -1060,6 +1172,8 @@ impl LodWorld {
             && self.jobs.in_flight == 0
             && self.jobs.queue.is_empty()
             && self.jobs.handed_off() == 0
+            && self.work_left.is_empty()
+            && self.replan.is_none()
             && self.tree.sends_waiting() == 0
             && !self.tree.has_refused()
     }
@@ -1103,7 +1217,7 @@ impl LodWorld {
 
     /// True if jobs run or wait.
     fn has_job_work(&self) -> bool {
-        self.jobs.in_flight > 0 || !self.jobs.queue.is_empty()
+        self.jobs.in_flight > 0 || !self.jobs.queue.is_empty() || !self.work_left.is_empty()
     }
 }
 
