@@ -352,7 +352,8 @@ impl LodPass {
     }
 
     /// Records the frame's draws into the main pass (groups 0 and 1 are bound): the LOD pipeline,
-    /// vertex buffer 0 = the LOD arena, one instanced draw per node; on High the pull pipeline,
+    /// vertex buffer 0 = the LOD arena, one instanced draw per run of a node's face buckets (its
+    /// immediates set once); on High the pull pipeline,
     /// its geometry in group [`bits::GROUP_GEOMETRY`], vertex buffer 0 = its draw refs, the
     /// shared quad index buffer, one indirect draw per segment. Binds no group 2, and no index
     /// buffer but the main path's own. Returns the draw calls recorded.

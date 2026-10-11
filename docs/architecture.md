@@ -1160,9 +1160,13 @@ los de antes, byte a byte.
 - **Cobertura.** Cada nodo lleva una máscara de octantes ocultos donde dibuja el detalle completo
   o un nivel más fino, sacada de los `ChunkMeshEvent` leídos completos cada frame: el LOD y el
   detalle completo nunca dibujan el mismo volumen y cambian en el mismo frame.
-- **Dibujo.** `LodPass` en `VoxelRenderer`, con su propia arena: un pipeline igual en los tres
-  tiers (`lod.wgsl`, el quad instanciado del Low), una llamada por nodo, justo después de lo opaco
-  y cutout. Con el LOD dibujando, el plano lejano del recorte de chunks y de la búsqueda de cuevas
+- **Dibujo.** `LodPass` en `VoxelRenderer`, con su propia arena, justo después de lo opaco y
+  cutout. En High, desde la GPU: una tabla de nodos, un compute que descarta nodos y caras que no
+  se ven (y, cuando sirve, los que tapa el terreno cercano) y una lista indirecta por segmento.
+  En Mid, Low y las GPUs integradas, instanciado (`lod.wgsl`), una llamada por tramo de caras
+  que miran a la cámara. Los faldones y las paredes de agua solo se dibujan donde hay una
+  costura con otro nivel o con el detalle completo. Las mismas imágenes en los dos caminos. Con
+  el LOD dibujando, el plano lejano del recorte de chunks y de la búsqueda de cuevas
   pasa a `H` (los chunks publicados llegan más allá de la distancia de vista) y la niebla del
   terreno va de `0,5 H` a `H`; las capas de `FogPlugin` conservan su alcance. Apagado en GL.
 

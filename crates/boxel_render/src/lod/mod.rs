@@ -2,9 +2,11 @@
 //! full-detail view distance, like the Distant Horizons mod. The world side
 //! ([`boxel_world::lod`]) plans the nodes, builds their meshes and decides which octants of each
 //! node finer detail draws; the renderer keeps them in an arena of its own and draws them in the
-//! main pass, right after the opaque and cutout terrain: on Mid and Low one instanced draw per
-//! visible node (`lod.wgsl`), on High from lists the GPU culls (`lod_cull.wgsl`, against the
-//! depth of the terrain drawn before it, and `lod_pull.wgsl`), with the same pixels.
+//! main pass, right after the opaque and cutout terrain: on Mid and Low (and integrated GPUs)
+//! one instanced draw per run of the face buckets of a visible node that can face the camera
+//! (`lod.wgsl`), on High from lists the GPU culls (`lod_cull.wgsl`, against the depth of the
+//! terrain drawn before it while that hides something, and `lod_pull.wgsl`), with the same
+//! pixels. Both leave out the skirts no seam shows.
 //!
 //! Without LOD input the renderer creates none of it (no pipeline, no arena) and every frame is
 //! what it was before. With it ([`crate::VoxelRenderer::set_lod`]) and the LOD on, the main
