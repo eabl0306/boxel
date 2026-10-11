@@ -660,7 +660,12 @@ impl Edits {
                 None => missing.push(key),
             }
         }
-        if missing.is_empty() {
+        // A column reaching more edited chunks than half the cache would wait for ever (the
+        // pyramids it waits for evict the ones it has): it goes on with the cached ones.
+        if missing.is_empty() || overlays.len() + missing.len() > self.cap / 2 {
+            for key in missing {
+                self.ask(key, false);
+            }
             return ForColumn::Ready {
                 overlays,
                 layers: all,

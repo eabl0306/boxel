@@ -732,3 +732,34 @@ fn a_generator_without_a_source_gets_level_1_from_its_chunks() {
         Some(LodOff::NoSource)
     );
 }
+
+#[test]
+fn a_column_reaching_more_edits_than_half_the_cache_does_not_wait() {
+    // Three edited chunks in one level-1 column and room for four pyramids: waiting for all of
+    // them could evict the ones it has, so the column goes on with the cached ones (none here)
+    // and their pyramids are still asked for.
+    let key = |y: i64| ChunkKey::new(ChunkPos::new(0, y, 0));
+    let mut e = Edits::new(4);
+    for y in 0..3 {
+        e.insert(key(y));
+    }
+    let c = ColumnKey {
+        level: 1,
+        x: 0,
+        z: 0,
+    };
+    assert!(matches!(
+        e.for_column(c, (0, 1), DimensionId(0)),
+        ForColumn::Ready { ref overlays, layers: Some((-1, 1)) } if overlays.is_empty()
+    ));
+    assert_eq!(e.next_job(1).map(|v| v.len()), Some(3));
+    // With room for six, the same column waits for them.
+    let mut e = Edits::new(6);
+    for y in 0..3 {
+        e.insert(key(y));
+    }
+    assert!(matches!(
+        e.for_column(c, (0, 1), DimensionId(0)),
+        ForColumn::Wait
+    ));
+}
