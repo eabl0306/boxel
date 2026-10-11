@@ -238,22 +238,22 @@ fn lattice_cell(li: u32, d: vec3<i32>, cache: ptr<function, NoiseCache>) -> vec3
   return num;
 }
 
-// The coverage (0..=4096) of the cell at `num` (lattice_cell) in layer `li` at threshold `thr`:
-// its noise's, but the second octave is only computed when the first one alone cannot decide
+// The coverage (0..=4096) of the cell at `num` (lattice_cell) in layer `li` at `threshold`: its
+// noise's, but the second octave is only computed when the first one alone cannot decide
 // (the ramp never falls as the noise grows, and the second octave moves the noise by at most
 // 4095 / 3).
-fn cell_coverage(li: u32, num: vec3<i32>, thr: u32, cache: ptr<function, NoiseCache>) -> u32 {
+fn cell_coverage(li: u32, num: vec3<i32>, threshold: u32, cache: ptr<function, NoiseCache>) -> u32 {
   let l = fog.layers[li].lattice.w;
   let v1 = interp((*cache).c1, (num >> vec3<u32>(l)) & vec3<i32>(4095));
   if (fog.layers[li].octave2.z != 2u) {
-    return coverage_of(li, v1, thr);
+    return coverage_of(li, v1, threshold);
   }
-  let low = ramp_of(li, (2 * v1 * 21845) >> 16u, thr);
-  let high = ramp_of(li, ((2 * v1 + 4095) * 21845) >> 16u, thr);
+  let low = ramp_of(li, (2 * v1 * 21845) >> 16u, threshold);
+  let high = ramp_of(li, ((2 * v1 + 4095) * 21845) >> 16u, threshold);
   if (low == high) {
     return smooth_ramp(low);
   }
-  return coverage_of(li, cell_noise(li, num, cache), thr);
+  return coverage_of(li, cell_noise(li, num, cache), threshold);
 }
 
 // The noise (0..4096) of the cell at `num` (lattice_cell) in layer `li`.
@@ -288,9 +288,9 @@ fn step_max_noise(li: u32, cache: ptr<function, NoiseCache>) -> i32 {
   return (*cache).max1;
 }
 
-// The linear part of the coverage (0..=4096) of the noise at threshold `thr` (noise::ramp).
-fn ramp_of(li: u32, n: i32, thr: u32) -> u32 {
-  let d = u32(clamp(n + 1 - i32(thr), 0, 4095));
+// The linear part of the coverage (0..=4096) of the noise at `threshold` (noise::ramp).
+fn ramp_of(li: u32, n: i32, threshold: u32) -> u32 {
+  let d = u32(clamp(n + 1 - i32(threshold), 0, 4095));
   return min((d * fog.layers[li].shape.y) >> 8u, 4096u);
 }
 
@@ -299,14 +299,14 @@ fn smooth_ramp(w: u32) -> u32 {
   return (((w * w) >> 12u) * (12288u - 2u * w)) >> 12u;
 }
 
-// Coverage (0..=4096) from the noise at threshold `thr`.
-fn coverage_of(li: u32, n: i32, thr: u32) -> u32 {
-  return smooth_ramp(ramp_of(li, n, thr));
+// Coverage (0..=4096) from the noise at `threshold`.
+fn coverage_of(li: u32, n: i32, threshold: u32) -> u32 {
+  return smooth_ramp(ramp_of(li, n, threshold));
 }
 
-// The threshold at height h (1/4096 of the band): thr + rise * h^2 (noise::threshold_at).
-fn threshold_at(thr: u32, rise: u32, h: u32) -> u32 {
-  return thr + ((rise * ((h * h) >> 12u)) >> 12u);
+// The threshold at height h (1/4096 of the band): threshold + rise * h^2 (noise::threshold_at).
+fn threshold_at(threshold: u32, rise: u32, h: u32) -> u32 {
+  return threshold + ((rise * ((h * h) >> 12u)) >> 12u);
 }
 
 // The threshold of the cells `dy` rows above the origin's cell (noise::row_threshold).
@@ -327,13 +327,13 @@ fn soft_coverage(li: u32, pos: vec3<f32>, cache: ptr<function, NoiseCache>) -> f
   let num = lattice_point(li, vec3<i32>(f), vec3<i32>((u - f) * 4096.0));
   load_lattice(li, num, cache);
   let shape = fog.layers[li].shape;
-  var thr = shape.x;
+  var threshold = shape.x;
   if (shape.z != 0u) {
     let band = fog.layers[li].band;
     let h = clamp((pos.y - band.x) / max(band.y - band.x, 1.0), 0.0, 1.0);
-    thr = threshold_at(shape.x, shape.z, u32(h * 4096.0));
+    threshold = threshold_at(shape.x, shape.z, u32(h * 4096.0));
   }
-  return f32(coverage_of(li, cell_noise(li, num, cache), thr)) / 4096.0;
+  return f32(coverage_of(li, cell_noise(li, num, cache), threshold)) / 4096.0;
 }
 
 // How soft the fog is (0 to 1) at `dist` blocks (MarchLayer::soft_weight).

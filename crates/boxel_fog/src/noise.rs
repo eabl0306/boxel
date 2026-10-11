@@ -481,9 +481,9 @@ mod tests {
     #[test]
     fn the_coverage_ramp_is_smooth() {
         for gain in [256, 300, 1024, MAX_GAIN] {
-            for thr in [0, 100, 2048, 4096, 8192] {
+            for threshold in [0, 100, 2048, 4096, 8192] {
                 for n in 1..4096 {
-                    assert!(ramp(n, thr, gain) >= ramp(n - 1, thr, gain));
+                    assert!(ramp(n, threshold, gain) >= ramp(n - 1, threshold, gain));
                 }
             }
         }
