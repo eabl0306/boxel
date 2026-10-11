@@ -9,6 +9,14 @@
 //!   LOD) and LOD nodes of levels 1 to 4 looks the same on every tier of an adapter.
 //! - **Octant masks:** a node with some octants hidden draws exactly what the node without their
 //!   quads draws, with full-detail chunks in those octants.
+//! - **Seam:** a real forest world and its LOD, run by `WorldPlugin` and `LodWorldPlugin` until
+//!   both settle, drawn as a renderer holds them after every op, with cave culling on and the
+//!   search of the render plugin (`frame_visibility_with` and the LOD's horizon), cleared to
+//!   magenta: no magenta pixel where a ray meets the ground, at eye level over a sea more than 8
+//!   blocks deep across the seam, looking diagonally over the keep band, and 200 blocks up
+//!   pitched 20 degrees down. With the camera's own far plane in the search, holes show.
+//! - **Far plane and fog:** a chunk past the view distance is culled without LOD and drawn with
+//!   it; the demo's valley fog layer over full detail draws the same with and without LOD.
 //! - **Origins:** the scene moved far from the origin, across the `i32` edges, draws the same
 //!   pixels.
 //! - **GL:** on GL backends the LOD stays off and the image is the one without LOD.
@@ -1014,6 +1022,540 @@ fn switching_presets_rebuilds_the_pass_and_refills_it() {
                     (&gpu.name(&format!("{name}_switched")), &image),
                 );
             }
+            Ok(())
+        };
+        if let Err(e) = run() {
+            report.fail(format!("{} {}: {e}", gpu.label, gpu.tier), &[]);
+        }
+    })
+    .finish();
+}
+
+// ---------------------------------------------------------------- the seam with a real world
+
+/// The full-detail radius of the seam worlds at eye level, in chunks (12 for the eye 200 blocks
+/// up, whose search box then reaches past the view distance on screen, as at `voxel_world`'s
+/// default), and their vertical radius (`voxel_world`'s default: the high eye still has the
+/// ground in its box).
+const SEAM_RADIUS: u32 = 4;
+const SEAM_VERTICAL: u32 = 8;
+/// The clear color of the seam test: the sky shows as magenta.
+const MAGENTA: [f32; 4] = [1.0, 0.0, 1.0, 1.0];
+/// A ray meeting `y = SEAM_FLOOR` (the lowest top of the demo terrain) within this share of the
+/// horizon meets drawn terrain first.
+const SEAM_REACH: f64 = 0.7;
+const SEAM_FLOOR: f64 = 16.0;
+/// The full-detail edge of the seam worlds along -x: chunk column `x = -105` is the last one
+/// drawn in full detail (its west face, `x = -3360`, has a sea more than 8 blocks deep across it
+/// for `z` in 1282..1310, the spot of `boxel_demo`'s crack ray test) and the eye's chunk is
+/// `SEAM_RADIUS` columns east of it.
+const SEAM_X: i64 = -105 * 32;
+const SEAM_EYE: [f64; 2] = [((-105 + SEAM_RADIUS as i64) * 32) as f64 + 16.5, 1296.5];
+
+/// A forest world and its far LOD as the plugins run them (inline jobs), settled around one
+/// viewer, and what a renderer holds after applying every op.
+struct SeamWorld {
+    app: boxel_app::App,
+    viewer: boxel_ecs::prelude::Entity,
+    /// The viewer's radius, in chunks.
+    radius: u32,
+    /// The renderer's LOD nodes: mesh and hidden octants.
+    nodes: std::collections::HashMap<ChunkKey, (Arc<ChunkMesh>, u8)>,
+}
+
+impl SeamWorld {
+    fn new(at: DVec3, radius: u32) -> Self {
+        use boxel_world::lod::LodWorldPlugin;
+        use boxel_world::{ChunkViewer, WorldPlugin, WorldSettings};
+        let forest = ForestGenerator::default();
+        let mut app = boxel_app::App::new();
+        app.add_plugins(WorldPlugin {
+            settings: WorldSettings {
+                interest_budget: std::time::Duration::MAX,
+                job_budget: std::time::Duration::MAX,
+                max_jobs_in_flight: 4096,
+                ..WorldSettings::default()
+            },
+            executor: Arc::new(boxel_world::jobs::InlineExecutor),
+            ..WorldPlugin::new(Arc::new(forest), Arc::new(boxel_demo::blocks::registry()))
+        });
+        app.add_plugins(LodWorldPlugin {
+            settings: seam_settings(),
+            executor: Arc::new(boxel_world::jobs::InlineExecutor),
+        });
+        let viewer = app
+            .world_mut()
+            .spawn((
+                Transform::from_translation(at),
+                ChunkViewer::new(radius).with_vertical_radius(SEAM_VERTICAL),
+            ))
+            .id();
+        let mut world = Self {
+            app,
+            viewer,
+            radius,
+            nodes: std::collections::HashMap::new(),
+        };
+        world.settle();
+        world
+    }
+
+    /// Moves the viewer and settles again: the chunks it leaves in its keep band stay drawn.
+    fn move_to(&mut self, at: DVec3) {
+        self.app
+            .world_mut()
+            .get_mut::<Transform>(self.viewer)
+            .expect("viewer")
+            .translation = at;
+        self.settle();
+    }
+
+    /// Runs frames until the world is settled and the LOD filled, applying the ops.
+    fn settle(&mut self) {
+        use boxel_world::WorldStats;
+        use boxel_world::lod::{LodOps, LodStats};
+        for frame in 0..2000 {
+            self.app.update();
+            let ops = self.app.world_mut().resource_mut::<LodOps>().take();
+            self.apply(ops);
+            let world = self.app.world();
+            let stats = world.resource::<WorldStats>();
+            let lod = world.resource::<LodStats>();
+            if frame > 2
+                && stats.chunks > 0
+                && stats.is_settled()
+                && lod.off.is_none()
+                && lod.fill >= 1.0
+                && lod.sends_waiting == 0
+            {
+                return;
+            }
+        }
+        panic!("the seam world did not settle");
+    }
+
+    fn apply(&mut self, ops: Vec<LodOp>) {
+        for op in ops {
+            match op {
+                LodOp::Upsert { key, mesh, mask } => {
+                    self.nodes.insert(key, (mesh, mask));
+                }
+                LodOp::Mask { key, mask } => {
+                    self.nodes.get_mut(&key).expect("a mask for a node sent").1 = mask;
+                }
+                LodOp::Remove { key } => {
+                    self.nodes.remove(&key).expect("a node sent");
+                }
+            }
+        }
+    }
+
+    fn horizon(&self) -> f32 {
+        self.app
+            .world()
+            .resource::<boxel_world::lod::LodStats>()
+            .horizon as f32
+    }
+
+    /// One input that puts every node on a fresh renderer.
+    fn lod_input(&self) -> LodInput {
+        LodInput {
+            ops: self
+                .nodes
+                .iter()
+                .map(|(key, (mesh, mask))| LodOp::Upsert {
+                    key: *key,
+                    mesh: Arc::clone(mesh),
+                    mask: *mask,
+                })
+                .collect(),
+            ..LodInput::new(seam_settings(), Some(self.horizon()))
+        }
+    }
+
+    /// The published chunks, `(world block origin, mesh)`.
+    fn chunks(&self) -> Vec<(I64Vec3, Arc<ChunkMesh>)> {
+        self.app
+            .world()
+            .resource::<boxel_world::ChunkMap>()
+            .ready_meshes()
+            .map(|(_, key, mesh)| (key.pos.origin().as_i64vec3(), Arc::clone(mesh)))
+            .collect()
+    }
+
+    /// The cave culling set of the render plugin for `camera` at `transform`, with the search's
+    /// far plane at `far` (the LOD's horizon), or at the camera's view distance.
+    fn visible(
+        &mut self,
+        camera: &Camera,
+        transform: &Transform,
+        far: Option<f32>,
+    ) -> Arc<boxel_world::VisibleSet> {
+        let registry = Arc::clone(
+            &self
+                .app
+                .world()
+                .resource::<boxel_world::WorldContent>()
+                .registry,
+        );
+        let map = self.app.world().resource::<boxel_world::ChunkMap>();
+        boxel_render::frame_visibility_with(
+            false,
+            &registry,
+            map,
+            &mut boxel_world::ChunkVisibility::default(),
+            camera,
+            transform,
+            boxel_world::ChunkViewer::new(self.radius).with_vertical_radius(SEAM_VERTICAL),
+            WIDTH as f32 / HEIGHT as f32,
+            far,
+        )
+        .expect("the eye sees from open space")
+    }
+}
+
+/// The seam worlds' LOD: `R = 8`, `K = 2` (a horizon of 1,024 blocks), every job and send at
+/// once.
+fn seam_settings() -> LodSettings {
+    LodSettings {
+        ring_radius: 8,
+        levels: 2,
+        frame_budget: std::time::Duration::from_secs(1),
+        publish_per_frame: 1 << 16,
+        upload_bytes_per_frame: 1 << 30,
+        ..LodSettings::default()
+    }
+}
+
+/// A seam pose: the viewer settles at `from`, then moves to the eye; the camera looks along
+/// `yaw` and `pitch` (degrees).
+struct SeamPose {
+    name: &'static str,
+    /// The viewer's radius, in chunks (the camera's view distance is as far).
+    radius: u32,
+    from: DVec3,
+    eye: DVec3,
+    yaw: f32,
+    pitch: f32,
+    /// The camera's far plane in the search loses chunks here.
+    loses: bool,
+}
+
+/// The seam poses at [`SEAM_EYE`], over the ground there (above the trees).
+fn seam_poses() -> Vec<SeamPose> {
+    let forest = ForestGenerator::default();
+    let [x, z] = SEAM_EYE;
+    let ground = f64::from(forest.terrain.height_at(x as i64, z as i64)).max(46.0);
+    let low = DVec3::new(x, ground + 12.0, z);
+    let high = DVec3::new(x, ground + 200.0, z);
+    // The diagonal view comes back from two chunks ahead, so its keep band holds chunks past the
+    // view distance inside the searched box.
+    let ahead = low + DVec3::new(-64.0, 0.0, -64.0);
+    vec![
+        SeamPose {
+            name: "eye_level",
+            radius: SEAM_RADIUS,
+            from: low,
+            eye: low,
+            yaw: 90.0,
+            pitch: -6.0,
+            loses: false,
+        },
+        SeamPose {
+            name: "diagonal",
+            radius: SEAM_RADIUS,
+            from: ahead,
+            eye: low,
+            yaw: 45.0,
+            pitch: -6.0,
+            loses: true,
+        },
+        SeamPose {
+            name: "high",
+            radius: 12,
+            from: high,
+            eye: high,
+            yaw: 90.0,
+            pitch: -20.0,
+            loses: true,
+        },
+    ]
+}
+
+/// Pixels whose ray meets `y = SEAM_FLOOR` within `reach` blocks (horizontally) of the eye: drawn
+/// terrain must cover them.
+fn ground_pixels(transform: &Transform, camera: &Camera, reach: f64) -> Vec<bool> {
+    let (f, r, u) = (
+        transform.forward().as_dvec3(),
+        transform.right().as_dvec3(),
+        transform.up().as_dvec3(),
+    );
+    let tan = f64::from(camera.fov_y_radians / 2.0).tan();
+    let aspect = f64::from(WIDTH) / f64::from(HEIGHT);
+    let eye = transform.translation;
+    let mut out = Vec::with_capacity((WIDTH * HEIGHT) as usize);
+    for py in 0..HEIGHT {
+        for px in 0..WIDTH {
+            let nx = (f64::from(px) + 0.5) / f64::from(WIDTH) * 2.0 - 1.0;
+            let ny = 1.0 - (f64::from(py) + 0.5) / f64::from(HEIGHT) * 2.0;
+            let d = f + r * (nx * tan * aspect) + u * (ny * tan);
+            let hit = d.y < 0.0 && {
+                let t = (eye.y - SEAM_FLOOR) / -d.y;
+                t * d.x.hypot(d.z) <= reach
+            };
+            out.push(hit);
+        }
+    }
+    out
+}
+
+/// Pixels of `image` that must show terrain (`ground`) but show the magenta sky.
+fn holes(image: &RgbaImage, ground: &[bool]) -> usize {
+    image
+        .data
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(ground)
+        .filter(|(p, g)| **g && p[0] >= 253 && p[1] <= 2 && p[2] >= 253)
+        .count()
+}
+
+/// Everything a seam pose draws: the world's chunks and nodes and the camera.
+struct SeamScene {
+    name: &'static str,
+    chunks: Vec<(I64Vec3, Arc<ChunkMesh>)>,
+    lod: LodInput,
+    view: ViewParams,
+    /// The search with the LOD's far plane, and with the camera's.
+    with_lod: Arc<boxel_world::VisibleSet>,
+    without: Arc<boxel_world::VisibleSet>,
+    ground: Vec<bool>,
+    loses: bool,
+}
+
+/// The seam scenes, built once: one world per pose.
+fn seam_scenes() -> &'static [SeamScene] {
+    static SCENES: OnceLock<Vec<SeamScene>> = OnceLock::new();
+    SCENES.get_or_init(|| {
+        let forest = ForestGenerator::default();
+        let sea = forest.sea.expect("the forest has a sea").level;
+        // The deep sea across the seam, as `boxel_demo`'s crack ray test found it.
+        assert!(
+            (1282..1310).any(|z| [SEAM_X - 1, SEAM_X]
+                .iter()
+                .all(|&x| sea - i64::from(forest.terrain.height_at(x, z)) > 8)),
+            "no deep sea across the seam"
+        );
+        seam_poses()
+            .into_iter()
+            .map(|pose| {
+                let camera = Camera {
+                    view_distance: (pose.radius * 32) as f32,
+                    ..Camera::default()
+                };
+                let mut world = SeamWorld::new(pose.from, pose.radius);
+                if pose.from != pose.eye {
+                    world.move_to(pose.eye);
+                }
+                let transform = Transform::from_yaw_pitch(
+                    pose.eye,
+                    pose.yaw.to_radians(),
+                    pose.pitch.to_radians(),
+                );
+                let horizon = world.horizon();
+                let cv = CameraView::compute(&camera, &transform, WIDTH as f32 / HEIGHT as f32);
+                let scene = SeamScene {
+                    name: pose.name,
+                    chunks: world.chunks(),
+                    lod: world.lod_input(),
+                    view: ViewParams::from_camera(&cv, &camera, MAGENTA, 0.6),
+                    with_lod: world.visible(&camera, &transform, Some(horizon)),
+                    without: world.visible(&camera, &transform, None),
+                    ground: ground_pixels(&transform, &camera, SEAM_REACH * f64::from(horizon)),
+                    loses: pose.loses,
+                };
+                eprintln!(
+                    "gpu_lod: seam {}: {} chunks, {} LOD nodes, horizon {horizon}, {} ground \
+                     pixels",
+                    scene.name,
+                    scene.chunks.len(),
+                    scene.lod.ops.len(),
+                    scene.ground.iter().filter(|g| **g).count()
+                );
+                scene
+            })
+            .collect()
+    })
+}
+
+/// Renders a seam scene with the visible set `set`.
+fn render_seam(
+    gpu: &Gpu<'_>,
+    scene: &SeamScene,
+    set: &Arc<boxel_world::VisibleSet>,
+) -> Result<RgbaImage, String> {
+    let config = RendererConfig {
+        arena_quads: 1 << 21,
+        max_chunk_slots: 4096,
+        translucent_sort: TranslucentSort::Inline,
+    };
+    let mut renderer = VoxelRenderer::new(
+        gpu.device,
+        gpu.queue,
+        gpu.tier,
+        &config,
+        &boxel_render::generate_block_textures(registry().textures()),
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        UVec2::new(WIDTH, HEIGHT),
+    )
+    .map_err(|e| format!("VoxelRenderer::new: {e}"))?;
+    for (i, (origin, mesh)) in scene.chunks.iter().enumerate() {
+        renderer
+            .upsert_chunk(i as u64, *origin, Arc::clone(mesh))
+            .map_err(|e| e.to_string())?;
+    }
+    renderer.set_lod(gpu.device, Some(scene.lod.clone()));
+    renderer.set_visibility(Some(Arc::clone(set)));
+    let image = render(gpu, &mut renderer, &scene.view)?;
+    let report = renderer.take_lod_report().ok_or("no LOD pass")?;
+    if !report.refused.is_empty() {
+        return Err(format!("{} LOD nodes refused", report.refused.len()));
+    }
+    Ok(image)
+}
+
+/// Full detail and LOD meet without a hole: no ray that meets the ground shows the sky, at the
+/// seam over a deep sea, looking diagonally over the keep band and from high up pitched down
+/// (cave culling on, searched as the render plugin does with the LOD on). Searched with the
+/// camera's far plane instead, the last two poses show holes: the search must reach the horizon.
+#[test]
+fn full_detail_and_lod_meet_without_holes() {
+    let mut scenes: Option<&[SeamScene]> = None;
+    for_every_tier(|gpu, report| {
+        if gpu.gl() {
+            return;
+        }
+        let scenes = *scenes.get_or_insert_with(seam_scenes);
+        for scene in scenes {
+            let what = format!("{} {}: seam {}", gpu.label, gpu.tier, scene.name);
+            let images = render_seam(gpu, scene, &scene.with_lod).and_then(|with_lod| {
+                render_seam(gpu, scene, &scene.without).map(|without| (with_lod, without))
+            });
+            let (with_lod, without) = match images {
+                Ok(images) => images,
+                Err(e) => {
+                    report.fail(format!("{what}: {e}"), &[]);
+                    continue;
+                }
+            };
+            let name = gpu.name(&format!("seam_{}", scene.name));
+            let lost = format!("{name}_camera_far_plane");
+            report.keep(&[(&name, &with_lod), (&lost, &without)]);
+            let (found, found_without) = (
+                holes(&with_lod, &scene.ground),
+                holes(&without, &scene.ground),
+            );
+            eprintln!(
+                "gpu_lod: {what}: {found} holes, {found_without} with the camera's far plane"
+            );
+            if found > 0 {
+                report.fail(
+                    format!("{what}: {found} sky pixels on the ground"),
+                    &[(&name, &with_lod)],
+                );
+            }
+            if scene.loses && found_without == 0 {
+                report.fail(
+                    format!("{what}: the camera's far plane in the search shows no hole"),
+                    &[(&lost, &without)],
+                );
+            }
+        }
+    })
+    .finish();
+}
+
+// ---------------------------------------------------------------- far plane and fog
+
+/// While the LOD draws, a chunk past the camera's view distance is drawn (the world side counts
+/// it as drawn and hides its octant); without LOD it is culled, as before. And the demo's valley
+/// fog over full detail near the camera (inside the old terrain fog) draws exactly the same with
+/// and without LOD: the fog layers keep their own range.
+#[test]
+fn the_lod_moves_the_far_plane_and_keeps_the_fog_layers() {
+    use boxel_render::fog::{FogInput, FogSettings};
+    let near = full_detail();
+    let mut far = near.clone();
+    // A floor chunk 160 to 192 blocks ahead, past the 128-block view distance.
+    far.push((I64Vec3::new(0, 2, -6), near[0].1.clone()));
+    // A 128-block view distance for the far chunk, and the default 384 for the fog: the floor
+    // then lies inside the old terrain fog's start (230 blocks), which the LOD moves out.
+    let view_at = |view_distance| {
+        let camera = Camera {
+            view_distance,
+            ..Camera::default()
+        };
+        let transform = Transform::from_yaw_pitch(DVec3::new(16.5, 100.0, 20.5), 0.0, -0.25);
+        let cv = CameraView::compute(&camera, &transform, WIDTH as f32 / HEIGHT as f32);
+        ViewParams::from_camera(&cv, &camera, DEFAULT_SKY_COLOR, 0.6)
+    };
+    let (view_far, view_fog) = (view_at(128.0), view_at(384.0));
+    let fog = FogInput {
+        settings: Arc::new(FogSettings::new(vec![boxel_demo::fog::valley()])),
+        time: 7u64.into(),
+    };
+    let empty_lod = || Some(LodInput::new(settings(1 << 20), Some(HORIZON)));
+    for_every_tier(|gpu, report| {
+        if gpu.gl() {
+            return;
+        }
+        let mut run = || -> Result<(), String> {
+            let draw = |chunks: &[(I64Vec3, ChunkMesh)],
+                        lod: Option<LodInput>,
+                        fog: Option<FogInput>|
+             -> Result<RgbaImage, String> {
+                let mut renderer = new_renderer(gpu)?;
+                load_world(&mut renderer, chunks, I64Vec3::ZERO)?;
+                renderer.set_lod(gpu.device, lod);
+                let view = if fog.is_some() { &view_fog } else { &view_far };
+                renderer.set_fog(gpu.device, fog);
+                render(gpu, &mut renderer, view)
+            };
+            let what = format!("{} {}", gpu.label, gpu.tier);
+            // Without LOD the far chunk is culled: the image without it.
+            let culled = draw(&far, None, None)?;
+            let none = draw(&near, None, None)?;
+            report.check_identical(
+                &format!("{what}: a chunk past the view distance without LOD"),
+                (&gpu.name("far_chunk_no_lod"), &culled),
+                (&gpu.name("no_far_chunk_no_lod"), &none),
+            );
+            // With LOD it is drawn.
+            let drawn = draw(&far, empty_lod(), None)?;
+            let without = draw(&near, empty_lod(), None)?;
+            let changed = drawn.compare(&without, 0).differing_pixels;
+            report.keep(&[(&gpu.name("far_chunk_lod"), &drawn)]);
+            if changed < 50 {
+                report.fail(
+                    format!("{what}: the chunk past the view distance changed {changed} pixels"),
+                    &[(&gpu.name("far_chunk_lod"), &drawn)],
+                );
+            }
+            // The valley fog near the camera, with and without LOD.
+            let fogged = draw(&near, None, Some(fog.clone()))?;
+            let fogged_lod = draw(&near, empty_lod(), Some(fog.clone()))?;
+            let mut clear = new_renderer(gpu)?;
+            load_world(&mut clear, &near, I64Vec3::ZERO)?;
+            if fogged.data == render(gpu, &mut clear, &view_fog)?.data {
+                return Err("the valley fog drew nothing".into());
+            }
+            report.keep(&[(&gpu.name("valley"), &fogged)]);
+            report.check_identical(
+                &format!("{what}: the valley fog with LOD"),
+                (&gpu.name("valley"), &fogged),
+                (&gpu.name("valley_lod"), &fogged_lod),
+            );
             Ok(())
         };
         if let Err(e) = run() {
