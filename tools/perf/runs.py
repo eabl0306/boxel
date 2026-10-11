@@ -52,6 +52,8 @@ class Scenario:
 SCENARIOS = {
     'surface': Scenario('fly', (*OVERWORLD, '--speed', '64'), 'superficie, vuelo a 64'),
     'forest': Scenario('fly', ('--speed', '32'), 'bosque, vuelo a 32'),
+    # The fly camera's boost (20 voxels/s times 5): what a player flies at to cross the world.
+    'boost': Scenario('fly', ('--speed', '100'), 'bosque, vuelo a 100 (boost)'),
     'dive': Scenario('dive', (*OVERWORLD, '--speed', '64', '--camera', '16,-1000,16,-90,0'),
                      'bajada a 64 desde y = -1000'),
     'cave-path': Scenario('path', (*OVERWORLD, '--cave', *CAVE_CAMERA, '--speed', '8'),

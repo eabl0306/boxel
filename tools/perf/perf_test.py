@@ -290,6 +290,10 @@ class CaseTest(unittest.TestCase):
         self.assertEqual(big[big.index('--arena-quads') + 1], '50331648')
         self.assertEqual(big[big.index('--timeout') + 1], '260')
         self.assertNotIn('--arena-quads', Case('rtx', 'forest', 32, 0).args(20))
+        boost = runs.parse_case('rtx/boost/r16/144').args(10)
+        self.assertEqual(boost[:2], ['--scenario', 'fly'])
+        self.assertEqual(boost[boost.index('--speed') + 1], '100')
+        self.assertNotIn('--world', boost, 'the forest, like the forest case')
 
     def test_supports_reads_the_help(self):
         with tempfile.TemporaryDirectory() as d:

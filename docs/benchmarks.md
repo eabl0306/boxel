@@ -289,6 +289,10 @@ terminó el primer llenado, contado desde el arranque como `settle_s`. Los frame
 los trabajos y las subidas del llenado. `tools/bench_report.py` empareja igual corridas con y sin
 LOD y avisa que difieren. Para medir su costo con el mismo binario:
 `just perf-smoke --base HEAD "--new-extra='--lod far'" rtx/surface/r16/uncapped rtx/forest/r16/uncapped`.
+Con LOD el resumen trae además una sección y un objeto `lod`: draws, quads dibujados, quads
+subidos por frame, arena usada y trabajos; `bench_report.py --compare` los compara. El caso
+`boost` es el bosque a 100 bloques/s, el boost de la cámara: sirve para ver si el LOD se rellena
+sin tirones (`just perf-smoke --base HEAD "--new-extra='--lod far'" rtx/boost/r16/144`).
 
 Los números sin ruido del LOD salen de `headless_world --world forest --lod PRESET` (sin GPU):
 nodos y quads por nivel, los del piso aparte, tiempos de los trabajos y del llenado. `snapshot
