@@ -5,6 +5,9 @@
 //! integer noise ([`noise`], [`Frequency`]) that stays exact at any `i64` coordinate, and
 //! [`block`] to resolve block names. The terrains of a game (heightmaps, caves, trees) are its
 //! content: they implement [`WorldGenerator`] on top of this crate.
+//!
+//! [`lod`] is the far level of detail's side of a generator (ADR 0031): a [`LodSource`] samples
+//! coarse cells level by level, for terrain far beyond the full-detail view distance.
 
 use boxel_voxel::{
     BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SHIFT, CHUNK_SIZE, CHUNK_VOLUME, ChunkData,
@@ -12,8 +15,10 @@ use boxel_voxel::{
 };
 use std::ops::RangeInclusive;
 
+pub mod lod;
 pub mod noise;
 
+pub use lod::LodSource;
 pub use noise::Frequency;
 
 /// A chunk generator.
@@ -34,6 +39,12 @@ pub trait WorldGenerator: Send + Sync + 'static {
     /// `i64::MIN..=i64::MAX`, promises nothing.
     fn vertical_chunks(&self) -> RangeInclusive<i64> {
         i64::MIN..=i64::MAX
+    }
+    /// Far level of detail (ADR 0031): this generator's coarse source, `None` (the default) if
+    /// it has none. A generator that has one usually implements [`LodSource`] itself and returns
+    /// `Some(self)`, so the source reads its current settings.
+    fn lod(&self) -> Option<&dyn LodSource> {
+        None
     }
     /// Name for logs.
     fn name(&self) -> &str;
