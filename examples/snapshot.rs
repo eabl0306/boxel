@@ -773,8 +773,11 @@ fn run(
         app.add_plugins(PersistPlugin::new(store));
     }
     // `--lod`: the world side only (no render plugin here); the eye is the viewer, the camera.
+    // A shot is one frame: every node goes up in it (the renderer's upload budget is per frame,
+    // and with it most nodes of a fresh renderer would wait for later frames, not drawn).
     let lod_settings = o.lod.settings().map(|settings| LodSettings {
         debug_tint: o.lod_tint,
+        upload_bytes_per_frame: usize::MAX,
         ..settings
     });
     if let Some(settings) = &lod_settings {
