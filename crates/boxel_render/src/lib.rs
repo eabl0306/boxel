@@ -60,12 +60,12 @@ pub use pack_textures::{
     load_block_textures,
 };
 pub use path::{CullCounts, cull_counts};
-#[doc(hidden)]
-pub use plugin::frame_visibility;
 pub use plugin::{
     DebugDestroyDevice, GpuFailed, GpuReady, PresentSettings, Render, RenderInfo, RenderPlugin,
     RenderSettings, RenderSystems, RequestScreenshot, ScreenshotSaved, SurfaceInfo,
 };
+#[doc(hidden)]
+pub use plugin::{frame_visibility, frame_visibility_with};
 pub use renderer::{
     DEFAULT_SKY_COLOR, FLUID_TIME_PERIOD, RenderStats, RendererConfig, RendererError,
     TEXTURE_TICKS_PER_SECOND, ViewParams, VoxelRenderer, texture_tick,
@@ -84,6 +84,7 @@ pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Common items.
 pub mod prelude {
     pub use crate::fog::FogPlugin;
+    pub use crate::lod::{LodPlugin, LodSettings};
     pub use crate::{
         BlockOutline, PresentSettings, RenderInfo, RenderPlugin, RenderSettings, RequestScreenshot,
         ScreenshotSaved,

@@ -45,6 +45,8 @@ thiserror.workspace = true
 boxel_demo.workspace = true
 boxel_gfx = { workspace = true, features = ["png"] }
 boxel_worldgen.workspace = true
+# The `test:` blocks of boxel_voxel::testing (the LOD plugin's unit tests).
+boxel_voxel = { workspace = true, features = ["testing"] }
 # Lit scenes in tests/gpu_terrain.rs: light computed exactly as the world computes it.
 boxel_light.workspace = true
 # Tests get system/component names in ECS diagnostics (dev-only; users opt in through boxel/debug).

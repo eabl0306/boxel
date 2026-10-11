@@ -801,6 +801,16 @@ impl VoxelRenderer {
         self.lod.as_ref().and_then(LodPass::far)
     }
 
+    /// The LOD stays off on this renderer: a GL backend, or its pass failed to build.
+    pub(crate) fn lod_failed(&self) -> bool {
+        self.lod_failed
+    }
+
+    /// The `arena_quads` the LOD pass was built with, `None` without one.
+    pub(crate) fn lod_arena_quads(&self) -> Option<u32> {
+        self.lod.as_ref().map(LodPass::requested_quads)
+    }
+
     /// Sets the block outline drawn by the next [`VoxelRenderer::render`] calls (ADR 0026),
     /// `None` for none: thin lines along `outline.edges`, in the main pass after the opaque and
     /// cutout buckets and before the translucent ones, depth tested, the same on every tier.

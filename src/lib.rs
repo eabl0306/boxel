@@ -20,6 +20,11 @@
 //! your layers ([`fog::FogLayer`], plain data) and the renderer marches them after the main pass;
 //! without it nothing of the fog exists.
 //!
+//! Terrain to the horizon (ADR 0031, like the Distant Horizons mod) is optional too: add
+//! `render::lod::LodPlugin` (in the prelude, with `LodSettings`) after the world and the
+//! renderer, and coarse terrain from the generator ([`worldgen::WorldGenerator::lod`]) is drawn
+//! past the view distance; without it nothing of the LOD exists.
+//!
 //! Frame rate: [`app::FrameLimit`] (in the prelude) caps updates per second, 144 by default and
 //! 0 for unlimited; `render::PresentSettings` (feature `render`, also in the prelude) switches
 //! vsync, off by default. Both are resources that any system can change at runtime, for

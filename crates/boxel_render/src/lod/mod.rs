@@ -10,15 +10,22 @@
 //! frustum's far plane and the terrain fog move out to the horizon, so full detail and LOD fade
 //! together into the sky; the fog layers keep their own ranges.
 //!
+//! - [`LodPlugin`]: the far LOD of an app, world side included (not in any default set of
+//!   plugins).
 //! - [`LodInput`]: one frame of LOD for the renderer: the settings, the horizon and the world
 //!   side's [`LodOp`]s.
 //! - [`LodReport`]: what the renderer sends back (refused meshes and the free arena).
 
 mod pass;
+mod plugin;
 
 pub(crate) use pass::LodPass;
+pub use plugin::LodPlugin;
+pub(crate) use plugin::{LodRenderer, lod_far};
 
-pub use boxel_world::lod::{LodFeedback, LodOp, LodResync, LodSettings, LodStats};
+pub use boxel_world::lod::{
+    LodFeedback, LodFocus, LodOp, LodOps, LodResync, LodSettings, LodStats, LodSystems,
+};
 
 use boxel_voxel::ChunkKey;
 

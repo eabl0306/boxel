@@ -12,6 +12,7 @@
 //!   frame results `Cleanup` writes back.
 
 use crate::fog::{FogInput, FogSettings};
+use crate::lod::{LodFeedback, LodInput, LodRenderer, LodSettings, lod_far};
 use crate::outline::{BlockOutline, Outline, OutlineCache};
 use crate::overlay::{OverlayDraw, OverlayPass, OverlayRect};
 use crate::{
@@ -34,7 +35,7 @@ use boxel_gfx::{
 use boxel_math::{I64Vec3, UVec2};
 use boxel_mesh::{ChunkMesh, MaterialTable};
 use boxel_transform::Transform;
-use boxel_voxel::{BlockRegistry, BlockRegistryBuilder};
+use boxel_voxel::{BlockRegistry, BlockRegistryBuilder, ChunkPos};
 use boxel_window::{DisplayHandle, PrimaryWindow, WindowState};
 use boxel_world::{
     ChunkMap, ChunkMeshEvent, ChunkMeshResync, ChunkViewer, ChunkVisibility, DaylightCurve,
@@ -236,6 +237,12 @@ pub struct RenderInfo {
     /// How the block texture array was built (source, size, layers from a pack, load time,
     /// warnings). Default until the first GPU selection.
     pub textures: TextureReport,
+    /// Far LOD nodes on the GPU (`RenderStats::lod_nodes`; 0 without `crate::lod::LodPlugin`).
+    pub lod_nodes: u32,
+    /// LOD draw calls last frame (`RenderStats::lod_draws`, not in `draws`).
+    pub lod_draws: u32,
+    /// Quads of those draws (`RenderStats::lod_quads`).
+    pub lod_quads: u64,
 }
 
 impl RenderInfo {
@@ -446,6 +453,10 @@ struct ReadyGpu {
     fog_ok: bool,
     /// The fog was refused on this device and that was logged.
     fog_warned: bool,
+    /// The far LOD passed the smoke test on this device (else it stays off on it).
+    lod_ok: bool,
+    /// The LOD was refused on this device and that was logged.
+    lod_warned: bool,
 }
 
 impl ReadyGpu {
@@ -485,7 +496,7 @@ struct SurfaceCounters {
 
 /// See [`GpuStage`].
 #[derive(Resource, Default)]
-struct GpuState {
+pub(crate) struct GpuState {
     stage: GpuStage,
     counters: SurfaceCounters,
     /// Block texture array, built once from `RenderSettings::textures` (re-selections reuse it).
@@ -610,7 +621,7 @@ pub(crate) struct ExtractedFrame {
     render_when_hidden: bool,
     translucent_sort: TranslucentSort,
     /// Full resync: `meshes` holds every ready mesh, `renderer.clear_chunks` runs first.
-    resync: bool,
+    pub(crate) resync: bool,
     meshes: Vec<MeshOp>,
     /// Pending screenshot paths (kept until a frame exists to read).
     screenshots: Vec<PathBuf>,
@@ -622,6 +633,11 @@ pub(crate) struct ExtractedFrame {
     visibility: Option<Arc<VisibleSet>>,
     /// This frame's fog (`crate::fog::FogPlugin`'s extract), `None` without the plugin.
     pub(crate) fog: Option<FogInput>,
+    /// This frame's far LOD (`crate::lod::LodPlugin`'s extract), `None` without the plugin.
+    pub(crate) lod: Option<LodInput>,
+    /// The renderer as the LOD's extract sees it, `None` without a ready renderer (none yet, or
+    /// its device is lost).
+    pub(crate) lod_renderer: Option<LodRenderer>,
     destroy_device: bool,
     /// `Prepare` output.
     view: Option<ViewParams>,
@@ -734,6 +750,8 @@ struct SetupParams<'w> {
     time: Option<ResMut<'w, Time>>,
     /// Present with `crate::fog::FogPlugin`: the smoke test also checks the fog passes.
     fog: Option<Res<'w, FogSettings>>,
+    /// Present with `crate::lod::LodPlugin`: the smoke test also checks the LOD pass.
+    lod: Option<Res<'w, LodSettings>>,
 }
 
 /// `RenderSystems::Setup`. GPU selection and renderer creation are declared as a stall
@@ -900,6 +918,7 @@ fn bootstrap(p: &mut SetupParams) {
     // 4-5. New surface + selection (+ the GL second stage of `panic = "abort"` builds).
     let smoke = RendererSmokeTest {
         fog: p.fog.is_some(),
+        lod: p.lod.is_some(),
         ..RendererSmokeTest::default()
     };
     let mut selected = {
@@ -1059,6 +1078,8 @@ fn bootstrap(p: &mut SetupParams) {
         destroyed_on_purpose: false,
         fog_ok: smoke.fog_ok.load(std::sync::atomic::Ordering::Relaxed),
         fog_warned: false,
+        lod_ok: smoke.lod_ok.load(std::sync::atomic::Ordering::Relaxed),
+        lod_warned: false,
     }));
 }
 
@@ -1280,7 +1301,7 @@ fn scene_light(
 }
 
 /// `RenderSystems::Extract`: the only reads of the main world for this frame's rendering.
-fn extract(
+pub(crate) fn extract(
     settings: Res<RenderSettings>,
     gpu: Res<GpuState>,
     mut frame: ResMut<ExtractedFrame>,
@@ -1336,6 +1357,10 @@ fn extract(
 
     let ready = gpu.ready().filter(|r| !r.ctx.health.is_lost());
     frame.resync = ready.is_some_and(|r| r.resync);
+    frame.lod_renderer = ready.map(|r| LodRenderer {
+        drawable: r.lod_ok && crate::lod::supported(&r.ctx.caps.info) && !r.renderer.lod_failed(),
+        arena_quads: r.renderer.lod_arena_quads(),
+    });
     frame.meshes.clear();
     if frame.resync {
         // Everything currently published replaces whatever the events would say. The chunks
@@ -1359,22 +1384,26 @@ fn extract(
     }
 }
 
-/// `RenderSystems::Extract`, after [`extract`]: the cave culling search for this frame's camera
-/// (ADR 0022), when the world has it on ([`WorldSettings::cave_culling`]). It runs here, with
-/// the exact camera and aspect `Prepare` renders with, so a chunk that just became visible is
-/// never drawn late. The searched box is the mesh region of the camera's own [`ChunkViewer`],
-/// or of the largest viewer; without viewers nothing is culled. The set is
-/// [`frame_visibility`]'s.
+/// `RenderSystems::Extract`, after [`extract`] (and the far LOD's extract): the cave culling
+/// search for this frame's camera (ADR 0022), when the world has it on
+/// ([`WorldSettings::cave_culling`]). It runs here, with the exact camera and aspect `Prepare`
+/// renders with, so a chunk that just became visible is never drawn late. The searched box is
+/// the mesh region of the camera's own [`ChunkViewer`], or of the largest viewer; without viewers
+/// nothing is culled. The set is [`frame_visibility_with`]'s, with the far plane at the LOD's
+/// horizon while the far LOD draws this frame (ADR 0031: the renderer then draws every chunk out
+/// to it).
 ///
 /// First, whatever the setting, the world learns which chunks the renderer refused or shows
-/// again since the last frame ([`VoxelRenderer::take_refused`]): the search sees through them.
-fn extract_visibility(
+/// again since the last frame ([`VoxelRenderer::take_refused`]): the search sees through them,
+/// and the far LOD draws over them ([`forward_refused`]).
+pub(crate) fn extract_visibility(
     mut gpu: ResMut<GpuState>,
     mut frame: ResMut<ExtractedFrame>,
     settings: Option<Res<WorldSettings>>,
     content: Option<Res<WorldContent>>,
     chunks: Option<Res<ChunkMap>>,
     visibility: Option<ResMut<ChunkVisibility>>,
+    mut lod_feedback: Option<ResMut<LodFeedback>>,
     cameras: Query<(&Camera, Option<&ChunkViewer>)>,
     viewers: Query<&ChunkViewer>,
 ) {
@@ -1386,7 +1415,13 @@ fn extract_visibility(
     };
     if let GpuStage::Ready(ready) = &mut gpu.stage {
         ready.renderer.take_refused(|pos, refused| {
-            visibility.set_unshown(pos, refused, map.visibility_links_at(pos));
+            forward_refused(
+                pos,
+                refused,
+                &mut visibility,
+                &map,
+                lod_feedback.as_deref_mut(),
+            );
         });
         if frame.resync {
             // `prepare` drops every chunk first (a new renderer may not know the old refusals).
@@ -1413,7 +1448,7 @@ fn extract_visibility(
     };
     // The aspect `prepare` uses: the same view, so the same frustum.
     let aspect = ready.config.width.max(1) as f32 / ready.config.height.max(1) as f32;
-    frame.visibility = frame_visibility(
+    frame.visibility = frame_visibility_with(
         frame.resync,
         &content.registry,
         &map,
@@ -1422,7 +1457,25 @@ fn extract_visibility(
         &transform,
         viewer,
         aspect,
+        lod_far(&frame),
     );
+}
+
+/// One change of the main renderer's refusals ([`VoxelRenderer::take_refused`]): to the cave
+/// culling, and with the far LOD to its coverage too ([`LodFeedback::chunks`]: a refused chunk is
+/// not drawn, so the LOD draws its octant). `ChunkVisibility` keeps its refused set to itself,
+/// and a second `take_refused` call would steal the changes from it.
+fn forward_refused(
+    pos: ChunkPos,
+    refused: bool,
+    visibility: &mut ChunkVisibility,
+    map: &ChunkMap,
+    lod: Option<&mut LodFeedback>,
+) {
+    visibility.set_unshown(pos, refused, map.visibility_links_at(pos));
+    if let Some(lod) = lod {
+        lod.chunks.push((pos, refused));
+    }
 }
 
 /// The cave culling set (ADR 0022) of a frame with cave culling on, as the render plugin
@@ -1448,11 +1501,39 @@ pub fn frame_visibility(
     viewer: ChunkViewer,
     aspect: f32,
 ) -> Option<Arc<VisibleSet>> {
+    frame_visibility_with(
+        resync, registry, map, visibility, camera, transform, viewer, aspect, None,
+    )
+}
+
+/// [`frame_visibility`] with the search's far plane at `far` blocks along the view (the camera's
+/// view distance with `None`, as there). While the far LOD draws (ADR 0031) the renderer culls
+/// chunks with its far plane at the LOD's horizon, and the LOD hides its octants over every chunk
+/// the world publishes, so the search must walk out there too: published chunks reach past the
+/// view distance (the keep band, and the corners of the searched box), and a chunk the search
+/// never walks is hidden on every tier, which would leave a hole where the LOD stepped aside.
+///
+/// Public for the GPU tests, which cull with it exactly as the plugin does.
+#[doc(hidden)]
+pub fn frame_visibility_with(
+    resync: bool,
+    registry: &BlockRegistry,
+    map: &ChunkMap,
+    visibility: &mut ChunkVisibility,
+    camera: &Camera,
+    transform: &Transform,
+    viewer: ChunkViewer,
+    aspect: f32,
+    far: Option<f32>,
+) -> Option<Arc<VisibleSet>> {
     if resync {
         return None;
     }
     let _span = frame_span!("render.visibility");
-    let view = CameraView::compute(camera, transform, aspect);
+    let mut view = CameraView::compute(camera, transform, aspect);
+    if let Some(far) = far {
+        crate::renderer::far_plane_at(&mut view.frustum, view.eye_rel, far);
+    }
     let open = visibility.eye_in_open(
         view.render_origin,
         view.eye_rel,
@@ -1514,6 +1595,16 @@ fn prepare(
         }
     } else {
         ready.renderer.set_fog(&ready.ctx.device, fog);
+    }
+    let lod = frame.lod.take();
+    if lod.is_some() && !ready.lod_ok {
+        if !ready.lod_warned {
+            ready.lod_warned = true;
+            tracing::warn!("the far LOD failed its smoke test on this device: it stays off");
+        }
+        ready.renderer.set_lod(&ready.ctx.device, None);
+    } else {
+        ready.renderer.set_lod(&ready.ctx.device, lod);
     }
     for op in frame.meshes.drain(..) {
         let result = match op {
@@ -1740,6 +1831,7 @@ fn cleanup(
     board: Option<ResMut<DiagnosticsBoard>>,
     mut saved: MessageWriter<ScreenshotSaved>,
     time: Option<ResMut<Time>>,
+    lod_feedback: Option<ResMut<LodFeedback>>,
 ) {
     let frame = &mut *frame;
     if frame.gate_used
@@ -1793,6 +1885,13 @@ fn cleanup(
                 ready.ctx.device.destroy();
                 let _ = ready.ctx.device.poll(wgpu::PollType::Poll);
             }
+            // The LOD pass's refusals reach the world side before its next `Update`.
+            if let Some(mut feedback) = lod_feedback
+                && let Some(report) = ready.renderer.take_lod_report()
+            {
+                feedback.refused.extend(report.refused);
+                feedback.arena_free_quads = Some(report.arena_free_quads);
+            }
             let stats = ready.renderer.stats();
             info.chunks = stats.chunks;
             info.draws = stats.draws;
@@ -1804,6 +1903,9 @@ fn cleanup(
             info.arena_used_quads = stats.arena_used_quads;
             info.arena_capacity_quads = stats.arena_capacity_quads;
             info.chunk_slot_capacity = stats.chunk_slot_capacity;
+            info.lod_nodes = stats.lod_nodes;
+            info.lod_draws = stats.lod_draws;
+            info.lod_quads = stats.lod_quads;
             if let Some(mut board) = board {
                 board.set("render", render_line(ready.ctx.tier, &stats));
             }
@@ -2019,7 +2121,7 @@ mod tests {
         // `ChunkId` is a slotmap key; without a slotmap dependency the null key is the only one
         // this crate can build, which is enough to check the id and origin conversion.
         let chunk = boxel_world::ChunkId::default();
-        let key = boxel_voxel::ChunkKey::new(boxel_voxel::ChunkPos::new(1, -2, 3));
+        let key = boxel_voxel::ChunkKey::new(ChunkPos::new(1, -2, 3));
         let mesh = Arc::new(ChunkMesh::default());
         match mesh_op(&ChunkMeshEvent::Upsert {
             id: chunk,
@@ -2065,5 +2167,51 @@ mod tests {
         let noon = TimeOfDay::at_clock(12.0);
         let (sky, day) = scene_light(&RenderSettings::default(), Some((&noon, &curve)));
         assert_eq!((sky, day), (DEFAULT_SKY_COLOR, SceneLight::noon()));
+    }
+
+    /// A refusal change of the main renderer reaches the cave culling (its next update searches
+    /// again, the refused chunk now see-through) and, with the far LOD, its coverage.
+    #[test]
+    fn refusals_reach_the_cave_culling_and_the_lod() {
+        let map = ChunkMap::default();
+        let view = VisibilityView::new(I64Vec3::ZERO, None, 2, 2);
+        for lod in [true, false] {
+            let mut visibility = ChunkVisibility::default();
+            let mut feedback = LodFeedback::default();
+            visibility.update(&view, |_| 0);
+            visibility.update(&view, |_| 0);
+            assert_eq!(
+                visibility.stats().searches,
+                1,
+                "the second update reuses the first"
+            );
+            let pos = ChunkPos::new(1, 0, 0);
+            forward_refused(
+                pos,
+                true,
+                &mut visibility,
+                &map,
+                lod.then_some(&mut feedback),
+            );
+            visibility.update(&view, |_| 0);
+            assert_eq!(
+                visibility.stats().searches,
+                2,
+                "a refused chunk opens its links"
+            );
+            forward_refused(
+                pos,
+                false,
+                &mut visibility,
+                &map,
+                lod.then_some(&mut feedback),
+            );
+            let forwarded = if lod {
+                vec![(pos, true), (pos, false)]
+            } else {
+                vec![]
+            };
+            assert_eq!(feedback.chunks, forwarded);
+        }
     }
 }
