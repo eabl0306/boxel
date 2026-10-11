@@ -36,20 +36,37 @@ const SIZE: u32 = 16;
 /// the quads and checks that the center pixel turned to the fog's white. A failure never
 /// rejects the tier: it stores `false` in `fog_ok` (and logs a warning), and the render plugin
 /// then leaves the fog off on that device.
+///
+/// With `lod` (the app has the far LOD plugin, ADR 0031) it checks the LOD pass the same way:
+/// `Compile` builds it, `Draw` draws one level-2 quad between the camera and the quads (its
+/// center pixel must turn to the flat color of open sky, not the colored block light) and then
+/// the same node with that octant hidden (the cutout quad shows again). A failure stores `false`
+/// in `lod_ok` and never rejects the tier. On GL backends the renderer keeps the LOD off, so
+/// there is nothing to check (`lod_ok` stays true).
 #[derive(Clone, Debug)]
 pub struct RendererSmokeTest {
     /// Also check the fog passes.
     pub fog: bool,
     /// Set by each run: false if the fog check failed on the last device tested.
     pub fog_ok: Arc<AtomicBool>,
+    /// Also check the far LOD pass.
+    pub lod: bool,
+    /// Set by each run: false if the LOD check failed on the last device tested.
+    pub lod_ok: Arc<AtomicBool>,
+    /// Testing: the LOD check fails on purpose.
+    #[doc(hidden)]
+    pub debug_fail_lod: bool,
 }
 
 impl Default for RendererSmokeTest {
-    /// No fog check.
+    /// No fog or LOD check.
     fn default() -> Self {
         Self {
             fog: false,
             fog_ok: Arc::new(AtomicBool::new(true)),
+            lod: false,
+            lod_ok: Arc::new(AtomicBool::new(true)),
+            debug_fail_lod: false,
         }
     }
 }
@@ -57,6 +74,7 @@ impl Default for RendererSmokeTest {
 impl SmokeTest for RendererSmokeTest {
     fn run(&self, ctx: &SmokeContext<'_>) -> Result<(), String> {
         self.fog_ok.store(true, Ordering::Relaxed);
+        self.lod_ok.store(true, Ordering::Relaxed);
         // Own scopes too (nested inside the caller's), so direct callers also get errors back.
         run_in_error_scopes(ctx.device, || match ctx.level {
             SmokeLevel::Draw => draw(ctx, self),
@@ -76,6 +94,30 @@ fn fog_check(smoke: &RendererSmokeTest, ctx: &SmokeContext<'_>, result: Result<(
     }
 }
 
+/// True if the LOD is checked on this device: asked for, and not a GL backend (where the
+/// renderer keeps it off).
+fn checks_lod(smoke: &RendererSmokeTest, ctx: &SmokeContext<'_>) -> bool {
+    smoke.lod && crate::lod::supported(&ctx.caps.info)
+}
+
+/// Records the LOD check's outcome: a failure turns the LOD off, never the tier.
+fn lod_check(smoke: &RendererSmokeTest, ctx: &SmokeContext<'_>, result: Result<(), String>) {
+    let result = result.and_then(|()| {
+        if smoke.debug_fail_lod {
+            Err("a failure on purpose (debug_fail_lod)".to_string())
+        } else {
+            Ok(())
+        }
+    });
+    if let Err(e) = result {
+        tracing::warn!(
+            "far LOD smoke check ({} tier): {e}; the LOD stays off on this device",
+            ctx.tier
+        );
+        smoke.lod_ok.store(false, Ordering::Relaxed);
+    }
+}
+
 /// Every pipeline of the tier + the blit for the output format; one main pass and one blit.
 /// With the fog check, the fog passes too (in their own scopes).
 fn compile(ctx: &SmokeContext<'_>, smoke: &RendererSmokeTest) -> Result<(), String> {
@@ -88,6 +130,19 @@ fn compile(ctx: &SmokeContext<'_>, smoke: &RendererSmokeTest) -> Result<(), Stri
         fog_check(smoke, ctx, result);
     }
     let pipelines = TierPipelines::new(ctx.device, ctx.tier);
+    if checks_lod(smoke, ctx) {
+        let result = run_in_error_scopes(ctx.device, || {
+            drop(crate::lod::LodPass::new(
+                ctx.device,
+                &pipelines.layouts.materials,
+                &pipelines.layouts.view,
+                1024,
+                0,
+            ));
+            Ok(())
+        });
+        lod_check(smoke, ctx, result);
+    }
     let targets = Targets::new(ctx.device, UVec2::splat(SIZE), false);
     let blit = Blit::new(ctx.device, ctx.output_format, &targets.color_view);
     let output = output_texture(ctx);
@@ -182,6 +237,10 @@ fn draw(ctx: &SmokeContext<'_>, smoke: &RendererSmokeTest) -> Result<(), String>
         let result = run_in_error_scopes(ctx.device, || fog_draw(ctx, &mut renderer, &view));
         fog_check(smoke, ctx, result);
     }
+    if checks_lod(smoke, ctx) {
+        let result = run_in_error_scopes(ctx.device, || lod_draw(ctx, &mut renderer, &view));
+        lod_check(smoke, ctx, result);
+    }
 
     let output = output_texture(ctx);
     let mut encoder = ctx
@@ -229,6 +288,82 @@ fn fog_draw(
         return Err(format!(
             "the center pixel {center:?} is not the white of a dense fog layer"
         ));
+    }
+    Ok(())
+}
+
+/// The smoke scene with a level-2 LOD node holding one +Y quad of 16x16 cells at y = 12 (between
+/// the camera at y 24 and the quads at y 0 and 4), lit as open sky: the center pixel must turn
+/// gray (the layer's mean under a white noon sky). Then the node's octant 0 is hidden: the red
+/// cutout quad shows again. Leaves the renderer without LOD.
+fn lod_draw(
+    ctx: &SmokeContext<'_>,
+    renderer: &mut VoxelRenderer,
+    view: &ViewParams,
+) -> Result<(), String> {
+    use crate::lod::{LodInput, LodOp, LodSettings};
+    let key = boxel_voxel::ChunkKey {
+        dim: boxel_voxel::DimensionId(0),
+        lod: 2,
+        pos: boxel_voxel::ChunkPos::new(0, 0, 0),
+    };
+    let mut bucket_counts = [0; BUCKET_COUNT];
+    bucket_counts[Face::PosY.index()] = 1;
+    let mut mesh = ChunkMesh::from_quads(
+        vec![PackedQuad::new([0, 2, 0], 16, 16, Face::PosY, 0)],
+        bucket_counts,
+    );
+    mesh.hash = mesh.compute_hash();
+    let settings = LodSettings {
+        arena_quads: 1 << 20,
+        ..LodSettings::default()
+    };
+    let center = |renderer: &mut VoxelRenderer, ops: Vec<LodOp>| -> Result<[u8; 3], String> {
+        renderer.set_lod(
+            ctx.device,
+            Some(LodInput {
+                ops,
+                ..LodInput::new(settings.clone(), Some(4096.0))
+            }),
+        );
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("boxel smoke lod"),
+            });
+        renderer.render(ctx.device, ctx.queue, &mut encoder, view);
+        submit_and_wait(ctx.device, ctx.queue, encoder)?;
+        let image = read_texture_rgba8(ctx.device, ctx.queue, renderer.main_color())?;
+        let i = ((SIZE / 2) * SIZE + SIZE / 2) as usize * 4;
+        Ok([image.data[i], image.data[i + 1], image.data[i + 2]])
+    };
+    let drawn = center(
+        renderer,
+        vec![LodOp::Upsert {
+            key,
+            mesh: Arc::new(mesh),
+            mask: 0,
+        }],
+    );
+    let hidden = drawn.and_then(|drawn| {
+        center(renderer, vec![LodOp::Mask { key, mask: 1 }]).map(|hidden| (drawn, hidden))
+    });
+    let draws = renderer.stats().lod_draws;
+    renderer.set_lod(ctx.device, None);
+    let (drawn, hidden) = hidden?;
+    // The gray layer under a white noon sky: about 125 in every channel.
+    if drawn.iter().any(|&c| c.abs_diff(drawn[0]) > 3) || drawn[0] < 90 {
+        return Err(format!(
+            "the center pixel {drawn:?} is not the gray of the LOD quad"
+        ));
+    }
+    if !lit_by(&hidden, 0) {
+        return Err(format!(
+            "with its octant hidden the center pixel {hidden:?} is not the red cutout quad"
+        ));
+    }
+    if draws != 1 {
+        return Err(format!("{draws} LOD draws, want 1"));
     }
     Ok(())
 }

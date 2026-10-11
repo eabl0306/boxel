@@ -35,6 +35,7 @@ pub(crate) struct NoSpan;
 
 pub mod fog;
 mod light;
+pub mod lod;
 mod outline;
 mod overlay;
 mod pack_textures;

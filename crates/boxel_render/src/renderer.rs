@@ -2,6 +2,7 @@ use crate::arena::{QUAD_BYTES, QuadArena};
 use crate::chunk_table::{ChunkRecord, ChunkTable};
 use crate::fog::{FogInput, FogPass};
 use crate::light::SceneLight;
+use crate::lod::{LodInput, LodPass, LodReport};
 use crate::outline::{Outline, OutlinePass};
 use crate::path::{
     HighInputs, HighPath, LowPath, MidPath, SlotVisibility, TierPath, TierPipelines,
@@ -181,6 +182,18 @@ pub struct RenderStats {
     pub fog_passes: u32,
     /// Fog layers the last frame marched.
     pub fog_layers: u32,
+    /// Far LOD nodes resident in the LOD arena (ADR 0031; 0 without LOD).
+    pub lod_nodes: u32,
+    /// LOD nodes with an octant left to draw (finer detail draws none of it), in view or not,
+    /// last frame (0 while the LOD draws nothing).
+    pub lod_drawn: u32,
+    /// LOD draw calls of the last frame: one per drawn node inside the frustum. Not counted in
+    /// [`RenderStats::draws`].
+    pub lod_draws: u32,
+    /// Quads of those draws.
+    pub lod_quads: u64,
+    /// LOD node meshes refused because the LOD arena or its node table was full (cumulative).
+    pub lod_refused: u32,
 }
 
 /// Renderer errors.
@@ -246,6 +259,18 @@ pub struct VoxelRenderer {
     fog: Option<FogPass>,
     /// The fog passes could not be created on this device: fog stays off.
     fog_failed: bool,
+    /// Group 0 and 1 layouts of the voxel pipelines (the LOD pipeline is built with them, so the
+    /// bind groups above work for it too).
+    materials_layout: wgpu::BindGroupLayout,
+    view_layout: wgpu::BindGroupLayout,
+    /// The mip level of the block textures that is 1x1 (the far LOD's colors).
+    color_mip: u32,
+    /// The far LOD (ADR 0031), from the first [`VoxelRenderer::set_lod`] with input.
+    lod: Option<LodPass>,
+    /// The far LOD cannot run on this device (a GL backend, or its pass failed): it stays off.
+    lod_failed: bool,
+    /// The per-frame part of the View uniform the last frame wrote.
+    view_uniform: ViewUniform,
 }
 
 /// The chunks whose last upload [`VoxelRenderer::upsert_chunk`] refused (chunk table or arena
@@ -609,6 +634,12 @@ impl VoxelRenderer {
             outline,
             fog: None,
             fog_failed: false,
+            materials_layout: layouts.materials,
+            view_layout: layouts.view,
+            color_mip: textures.mip_levels.saturating_sub(1),
+            lod: None,
+            lod_failed: false,
+            view_uniform: ViewUniform::default(),
         })
     }
 
@@ -685,6 +716,89 @@ impl VoxelRenderer {
             crate::fog::read_words(device, queue, texture)
                 .map(|w| (size, w.as_chunks::<2>().0.to_vec())),
         )
+    }
+
+    /// Sets the far LOD of the next [`VoxelRenderer::render`] calls (ADR 0031), `None` for none.
+    ///
+    /// The first input creates the LOD pass (its pipeline and an arena of
+    /// `settings.arena_quads` quads, inside error scopes: if that fails, an error is logged and
+    /// the LOD stays off on this renderer); an input with another `arena_quads` builds it again,
+    /// empty. Each input applies its ops (meshes and their quads reach the GPU with the next
+    /// `render`); [`VoxelRenderer::take_lod_report`] then gives the refused meshes. `None` drops
+    /// the pass and every node. On a GL backend the LOD stays off (no clip control: far depth
+    /// z-fights; one warning).
+    ///
+    /// Without LOD nothing of it exists and frames are what they were before. With it and the
+    /// input drawing ([`LodInput::far`]), each `render` draws the nodes right after the opaque
+    /// and cutout terrain, culls the chunks (and High's GPU cull) with the far plane at the
+    /// horizon instead of the view's, and fades the terrain into the fog color from
+    /// `fade_start` of the horizon to the horizon instead of [`ViewParams::fog_start`] to
+    /// [`ViewParams::fog_end`] (the fog layers keep those).
+    pub fn set_lod(&mut self, device: &wgpu::Device, input: Option<LodInput>) {
+        let Some(input) = input else {
+            self.lod = None;
+            return;
+        };
+        if self.lod_failed {
+            return;
+        }
+        if self
+            .lod
+            .as_ref()
+            .is_some_and(|lod| lod.requested_quads() != input.settings.arena_quads)
+        {
+            self.lod = None;
+        }
+        if self.lod.is_none() {
+            if !crate::lod::supported(&device.adapter_info()) {
+                tracing::warn!("far LOD: off on GL backends (no clip control: far depth z-fights)");
+                self.lod_failed = true;
+                return;
+            }
+            let mut pass = None;
+            let built = boxel_gfx::run_in_error_scopes(device, || {
+                pass = Some(LodPass::new(
+                    device,
+                    &self.materials_layout,
+                    &self.view_layout,
+                    input.settings.arena_quads,
+                    self.color_mip,
+                ));
+                Ok(())
+            });
+            match (built, pass) {
+                (Ok(()), Some(pass)) => self.lod = Some(pass),
+                (result, _) => {
+                    tracing::error!(
+                        "far LOD pass: {}; the LOD stays off",
+                        result.err().unwrap_or_default()
+                    );
+                    self.lod_failed = true;
+                    return;
+                }
+            }
+        }
+        if let Some(lod) = &mut self.lod {
+            lod.apply(input);
+        }
+    }
+
+    /// Testing: the per-frame part of the View uniform the last [`VoxelRenderer::render`] wrote.
+    #[doc(hidden)]
+    pub fn debug_view_uniform(&self) -> ViewUniform {
+        self.view_uniform
+    }
+
+    /// The far LOD's report since the last call (refused meshes and the free LOD arena), `None`
+    /// without a LOD pass.
+    pub fn take_lod_report(&mut self) -> Option<LodReport> {
+        self.lod.as_mut().map(LodPass::report)
+    }
+
+    /// The horizon while the far LOD draws (a LOD pass whose last input draws), else `None`:
+    /// then frames are what they are without LOD.
+    pub fn lod_far(&self) -> Option<f32> {
+        self.lod.as_ref().and_then(LodPass::far)
     }
 
     /// Sets the block outline drawn by the next [`VoxelRenderer::render`] calls (ADR 0026),
@@ -906,6 +1020,17 @@ impl VoxelRenderer {
         // window from the live flags: a move marks every slot stale, so the upload below sends
         // them all again. Mid and Low test the window in `CpuCull`.
         self.chunks.follow(view.render_origin);
+        // While the far LOD draws, chunks are culled with the far plane at its horizon: the world
+        // side counts every published chunk as drawn and hides its LOD octant, and published
+        // chunks reach past the view distance (the keep band, ADR 0031). Without LOD this is
+        // `view` itself.
+        let lod_far = self.lod_far();
+        let cull_view = lod_far.map(|h| {
+            let mut v = *view;
+            far_plane_at(&mut v.frustum, v.eye_rel, h);
+            v
+        });
+        let cull_view = cull_view.as_ref().unwrap_or(view);
         {
             let _span = frame_span!("render.textures");
             self.animator
@@ -913,7 +1038,8 @@ impl VoxelRenderer {
         }
         {
             let _span = frame_span!("render.sort");
-            self.sorter.update(&self.chunks, view, &mut self.sorted);
+            self.sorter
+                .update(&self.chunks, cull_view, &mut self.sorted);
             for sorted in self.sorted.drain(..) {
                 let Some((_, record)) = self.chunks.get(sorted.id) else {
                     continue;
@@ -953,12 +1079,18 @@ impl VoxelRenderer {
         let (sky_light, light_params, light_curve) = view.light.uniform();
         let uniform = ViewUniform {
             view_proj: view.view_proj.to_cols_array_2d(),
-            frustum: view.frustum.to_array(),
+            frustum: cull_view.frustum.to_array(),
             // Low 32 bits, like the chunk origins (the shaders subtract them with wrapping).
             render_origin: wrap_to_i32(view.render_origin).extend(0).to_array(),
             camera_rel: view.eye_rel.extend(0.0).to_array(),
             fog_color: view.fog_color,
-            fog_params: [view.fog_start, view.fog_end, 0.0, 0.0],
+            // With the far LOD, full detail and LOD fade together toward its horizon.
+            fog_params: self.lod.as_ref().and_then(LodPass::fog_params).unwrap_or([
+                view.fog_start,
+                view.fog_end,
+                0.0,
+                0.0,
+            ]),
             counts: [
                 slot_count,
                 self.cap_opaque,
@@ -976,6 +1108,7 @@ impl VoxelRenderer {
             ],
         };
         queue.write_buffer(&self.view_buffer, 0, bytemuck::bytes_of(&uniform));
+        self.view_uniform = uniform;
         // Without the set this frame, the bits stay as they are (High keeps the uploaded ones).
         let refresh_start = Instant::now();
         let visibility = if culled || self.occlusion.set.is_none() {
@@ -986,15 +1119,27 @@ impl VoxelRenderer {
         };
         self.stats.occlusion_time = refresh_start.elapsed();
         let used = visibility.is_some();
-        let visible = self.path.prepare(queue, &self.chunks, view, visibility);
+        let visible = self
+            .path
+            .prepare(queue, &self.chunks, cull_view, visibility);
         let hidden = if used { self.occlusion.hidden } else { 0 };
         self.outline.prepare(device, queue, view, self.targets.size);
+        if let Some(lod) = &mut self.lod {
+            let _span = frame_span!("render.lod");
+            lod.prepare(device, encoder, cull_view);
+        }
         self.path.encode_compute(encoder, slot_count);
         let draws = {
             let mut pass = self.targets.begin_main_pass(encoder, view.clear_color);
             pass.set_bind_group(bindings::GROUP_MATERIALS, &self.materials, &[]);
             pass.set_bind_group(bindings::GROUP_VIEW, &self.view_bind_group, &[]);
             let solid = self.path.draw_solid(&mut pass, self.arena.buffer());
+            // The far LOD right after the near terrain (early-Z rejects it behind hills) and
+            // before the water, which writes no depth (counted apart, in `lod_draws`).
+            if let Some(lod) = &self.lod {
+                let _span = frame_span!("render.lod");
+                lod.draw(&mut pass);
+            }
             // Over the solid terrain, under the water (not counted in the draws).
             self.outline.draw(&mut pass);
             solid + self.path.draw_translucent(&mut pass, self.arena.buffer())
@@ -1056,9 +1201,36 @@ impl VoxelRenderer {
             texture_layer_uploads: self.animator.counters.layers,
             texture_upload_bytes: self.animator.counters.bytes,
             textures_behind: self.animator.counters.behind,
-            ..self.stats
+            ..self.lod_stats(self.stats)
         }
     }
+
+    /// `stats` with the LOD pass's counters.
+    fn lod_stats(&self, stats: RenderStats) -> RenderStats {
+        let Some(lod) = &self.lod else {
+            return stats;
+        };
+        let s = lod.stats();
+        RenderStats {
+            lod_nodes: s.nodes,
+            lod_drawn: s.drawn,
+            lod_draws: s.draws,
+            lod_quads: s.quads,
+            lod_refused: s.refused,
+            ..stats
+        }
+    }
+}
+
+/// Moves the far plane of `frustum` (camera-relative, eye at `eye`) to `distance` along its
+/// normal, as `Frustum::set_max_distance` places it; an infinite far plane stays infinite.
+pub(crate) fn far_plane_at(frustum: &mut Frustum, eye: Vec3, distance: f32) {
+    let plane = frustum.planes[5];
+    let forward = -plane.truncate();
+    if forward == Vec3::ZERO {
+        return;
+    }
+    frustum.set_max_distance(eye, forward, distance);
 }
 
 /// Bucket counts of `mesh` (see [`trim_counts`]).
