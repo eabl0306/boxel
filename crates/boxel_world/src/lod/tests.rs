@@ -414,6 +414,43 @@ fn replan(mut p: Plan, eye: &Eye, th: &Thresholds) -> Plan {
 }
 
 #[test]
+fn a_level_planned_a_row_a_step_is_the_level_planned_at_once() {
+    // From a plan at one eye, the next eye's plan made at once and made a row per step (the
+    // clock always past, as in a frame out of budget): the same columns, wanted and refined.
+    let at = |p: DVec3| Eye::from_world(p);
+    for (from, to) in [
+        (DVec3::new(0.5, 70.0, 0.5), DVec3::new(300.0, 90.0, -200.0)),
+        (
+            DVec3::new(-1000.3, -77.7, 333.3),
+            DVec3::new(-1100.0, 2000.0, 300.0),
+        ),
+    ] {
+        let (a, b) = (at(from), at(to));
+        let th = small_thresholds(&b);
+        let old = plan::plan(&a, &th, &mut Plan::default(), th.levels(), None);
+        let whole = replan(old.clone(), &b, &th);
+        let top = th.levels();
+        let mut levels = vec![plan::LevelPlan::default(); usize::from(top)];
+        for k in (1..=top).rev() {
+            let i = usize::from(k) - 1;
+            let parents = levels.get(i + 1).cloned().filter(|_| k < top);
+            let prev = &old.levels[i];
+            let mut planner = plan::LevelPlanner::new(b, th, k, parents.as_ref(), None);
+            let mut steps = 1;
+            while !planner.step(prev, parents.as_ref(), Some(Instant::now())) {
+                steps += 1;
+            }
+            assert!(steps > 1, "level {k} planned in one step");
+            levels[i] = planner.finish();
+        }
+        for (i, (rows, once)) in levels.iter().zip(&whole.levels).enumerate() {
+            let cells = |l: &plan::LevelPlan| l.iter().map(|(c, p)| (c, *p)).collect::<Vec<_>>();
+            assert_eq!(cells(rows), cells(once), "level {}", i + 1);
+        }
+    }
+}
+
+#[test]
 fn moving_back_and_forth_inside_the_band_flips_nothing() {
     let a = Eye::from_world(DVec3::new(100.0, 70.0, 100.0));
     let b = Eye::from_world(DVec3::new(130.0, 75.0, 90.0));

@@ -32,6 +32,7 @@ use crate::interest::Viewer;
 use boxel_math::{DVec3, I64Vec3, Vec3};
 use boxel_voxel::{BlockPos, ChunkKey, ChunkPos, DimensionId, MAX_CHUNK_COORD};
 use std::ops::RangeInclusive;
+use std::time::Instant;
 
 /// Most LOD levels the settings allow (`k = 1..=6`). The GPU side keeps 4 bits, room for 15.
 pub const MAX_LEVELS: u8 = 6;
@@ -626,7 +627,9 @@ pub(crate) fn plan(
 
 /// Plans level `k` of the wanted tree for `eye` under `th` (see [`plan`]): the top level from
 /// the horizon, a finer one from the refined layers of `parents` (level `k + 1`, `None` for the
-/// top), with the hysteresis of `prev` (level `k` as planned before).
+/// top), with the hysteresis of `prev` (level `k` as planned before). At once: the LOD goes a
+/// few rows a frame ([`LevelPlanner`]).
+#[cfg(test)]
 pub(crate) fn plan_level(
     eye: &Eye,
     th: &Thresholds,
@@ -635,111 +638,215 @@ pub(crate) fn plan_level(
     parents: Option<&LevelPlan>,
     ceiling: Option<i64>,
 ) -> LevelPlan {
-    let top = th.levels();
-    // The layers of level `k` that may hold more than air, inside the world limit.
-    let layers = |k: u8| {
+    let mut planner = LevelPlanner::new(*eye, *th, k, parents, ceiling);
+    while !planner.step(prev, parents, None) {}
+    planner.finish()
+}
+
+/// [`plan_level`] a row at a time, so a frame can stop between rows and go on in the next one.
+/// `prev` and `parents` must be the same at every step (the replan keeps them until the level
+/// is applied).
+#[derive(Debug)]
+pub(crate) struct LevelPlanner {
+    eye: Eye,
+    th: Thresholds,
+    k: u8,
+    ceiling: Option<i64>,
+    /// The level's new window.
+    map: LevelPlan,
+    /// The top level: the window's rows (z); a finer level: the rows of the parents' window.
+    rows: std::ops::Range<i64>,
+    top: bool,
+}
+
+impl LevelPlanner {
+    /// Starts planning level `k` (see [`plan_level`]).
+    pub(crate) fn new(
+        eye: Eye,
+        th: Thresholds,
+        k: u8,
+        parents: Option<&LevelPlan>,
+        ceiling: Option<i64>,
+    ) -> Self {
+        let top = th.levels();
+        let Some(parents) = parents.filter(|_| k < top) else {
+            // Top level: every column nearer than the horizon (plus its hysteresis).
+            let e = node_edge(top);
+            let stay = th.horizon() + e as f64;
+            let reach = (stay / e as f64).ceil() as i64 + 1;
+            let limit = world_limit(top);
+            let (cx, cz) = (eye.block[0].div_euclid(e), eye.block[2].div_euclid(e));
+            let min = [(cx - reach).max(-limit), (cz - reach).max(-limit)];
+            let max = [(cx + reach).min(limit), (cz + reach).min(limit)];
+            return Self {
+                eye,
+                th,
+                k: top,
+                ceiling,
+                map: LevelPlan::new(min, max),
+                rows: min[1]..max[1] + 1,
+                top: true,
+            };
+        };
+        // A finer level: the children of the refined layers. The window: twice the refined
+        // parents' bounds.
         let limit = world_limit(k);
-        Some((-limit, ceiling.map_or(limit, |c| (c >> k).min(limit))))
-    };
-    // The refined layers of a level-`k` column (`k >= 2`): nearer than `T_(k-1)`, kept until
-    // past it by `e_(k-1)`.
-    let refine = |at: &EyeLayer, k: u8, gap2: f64, wanted: Span, old: Option<&ColumnPlan>| {
+        let mut bounds: Option<([i64; 2], [i64; 2])> = None;
+        for ([px, pz], parent) in parents.iter() {
+            if parent.refined.is_some() {
+                let (lo, hi) = bounds.get_or_insert(([px, pz], [px, pz]));
+                *lo = [lo[0].min(px), lo[1].min(pz)];
+                *hi = [hi[0].max(px), hi[1].max(pz)];
+            }
+        }
+        let clip = |v: i64| v.clamp(-limit, limit);
+        let map = bounds.map_or_else(LevelPlan::default, |(lo, hi)| {
+            LevelPlan::new(
+                [clip(lo[0] * 2), clip(lo[1] * 2)],
+                [clip(hi[0] * 2 + 1), clip(hi[1] * 2 + 1)],
+            )
+        });
+        let rows = if bounds.is_some() {
+            0..parents.size[1] as i64
+        } else {
+            0..0
+        };
+        Self {
+            eye,
+            th,
+            k,
+            ceiling,
+            map,
+            rows,
+            top: false,
+        }
+    }
+
+    /// The layers of level `k` that may hold more than air, inside the world limit.
+    fn layers(&self, k: u8) -> Option<Span> {
+        let limit = world_limit(k);
+        Some((-limit, self.ceiling.map_or(limit, |c| (c >> k).min(limit))))
+    }
+
+    /// The refined layers of a level-`k` column (`k >= 2`) at `gap2` from the eye: nearer than
+    /// `T_(k-1)`, kept until past it by `e_(k-1)`.
+    fn refine(
+        &self,
+        at: &EyeLayer,
+        k: u8,
+        gap2: f64,
+        wanted: Span,
+        old: Option<&ColumnPlan>,
+    ) -> Option<Span> {
         let below = k - 1;
-        let t = th.level(below);
+        let t = self.th.level(below);
         let enter = at.span(gap2, t);
         let stay = at.span(gap2, t + node_edge(below) as f64);
         intersect(
             hysteresis(old.and_then(|o| o.refined), enter, stay),
             Some(wanted),
         )
-    };
-    let Some(parents) = parents.filter(|_| k < top) else {
-        // Top level: every column nearer than the horizon (plus its hysteresis).
-        let at = EyeLayer::new(eye, top);
-        let e = node_edge(top);
-        let h = th.horizon();
-        let stay = h + e as f64;
-        let reach = (stay / e as f64).ceil() as i64 + 1;
-        let limit = world_limit(top);
-        let (cx, cz) = (eye.block[0].div_euclid(e), eye.block[2].div_euclid(e));
-        let min = [(cx - reach).max(-limit), (cz - reach).max(-limit)];
-        let max = [(cx + reach).min(limit), (cz + reach).min(limit)];
-        let mut map = LevelPlan::new(min, max);
-        for z in min[1]..=max[1] {
-            for x in min[0]..=max[0] {
-                let gap2 = eye.column_gap2(top, [x, z]);
-                if gap2 >= stay * stay {
-                    continue;
-                }
-                let before = prev.get(x, z);
-                let wanted = intersect(
-                    hysteresis(
-                        before.and_then(|o| o.wanted),
-                        at.span(gap2, h),
-                        at.span(gap2, stay),
-                    ),
-                    layers(top),
-                );
-                let Some(span) = wanted else {
-                    continue;
-                };
-                let refined = if top >= 2 {
-                    refine(&at, top, gap2, span, before)
-                } else {
-                    None
-                };
-                map.set(x, z, ColumnPlan { wanted, refined });
+    }
+
+    /// Plans rows until they are all done (true) or `until` passed (checked after each row).
+    pub(crate) fn step(
+        &mut self,
+        prev: &LevelPlan,
+        parents: Option<&LevelPlan>,
+        until: Option<Instant>,
+    ) -> bool {
+        while let Some(row) = self.rows.next() {
+            if self.top {
+                self.top_row(row, prev);
+            } else if let Some(parents) = parents {
+                self.finer_row(row, prev, parents);
+            }
+            if until.is_some_and(|t| Instant::now() >= t) {
+                break;
             }
         }
-        return map;
-    };
-    // A finer level: the children of the refined layers.
-    let limit = world_limit(k);
-    // The window: twice the refined parents' bounds.
-    let mut bounds: Option<([i64; 2], [i64; 2])> = None;
-    for ([px, pz], parent) in parents.iter() {
-        if parent.refined.is_some() {
-            let (lo, hi) = bounds.get_or_insert(([px, pz], [px, pz]));
-            *lo = [lo[0].min(px), lo[1].min(pz)];
-            *hi = [hi[0].max(px), hi[1].max(pz)];
-        }
+        self.rows.is_empty()
     }
-    let Some((lo, hi)) = bounds else {
-        return LevelPlan::default();
-    };
-    let clip = |v: i64| v.clamp(-limit, limit);
-    let mut map = LevelPlan::new(
-        [clip(lo[0] * 2), clip(lo[1] * 2)],
-        [clip(hi[0] * 2 + 1), clip(hi[1] * 2 + 1)],
-    );
-    let at = EyeLayer::new(eye, k);
-    for ([px, pz], parent) in parents.iter() {
-        let Some((a, b)) = parent.refined else {
-            continue;
+
+    /// The new plan (every row planned).
+    pub(crate) fn finish(self) -> LevelPlan {
+        debug_assert!(self.rows.is_empty(), "a level planned in part");
+        self.map
+    }
+
+    /// Row `z` of the top level's window.
+    fn top_row(&mut self, z: i64, prev: &LevelPlan) {
+        let top = self.k;
+        let at = EyeLayer::new(&self.eye, top);
+        let h = self.th.horizon();
+        let stay = h + node_edge(top) as f64;
+        let Some((min, max)) = self.map.bounds() else {
+            return;
         };
-        let Some(wanted) = intersect(Some((a * 2, b * 2 + 1)), layers(k)) else {
-            continue;
-        };
-        for (dx, dz) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-            let (x, z) = (px * 2 + dx, pz * 2 + dz);
-            if x.abs() > limit || z.abs() > limit {
+        for x in min[0]..=max[0] {
+            let gap2 = self.eye.column_gap2(top, [x, z]);
+            if gap2 >= stay * stay {
                 continue;
             }
-            let refined = if k >= 2 {
-                let gap2 = eye.column_gap2(k, [x, z]);
-                refine(&at, k, gap2, wanted, prev.get(x, z))
+            let before = prev.get(x, z);
+            let wanted = intersect(
+                hysteresis(
+                    before.and_then(|o| o.wanted),
+                    at.span(gap2, h),
+                    at.span(gap2, stay),
+                ),
+                self.layers(top),
+            );
+            let Some(span) = wanted else {
+                continue;
+            };
+            let refined = if top >= 2 {
+                self.refine(&at, top, gap2, span, before)
             } else {
                 None
             };
-            map.set(
-                x,
-                z,
-                ColumnPlan {
-                    wanted: Some(wanted),
-                    refined,
-                },
-            );
+            self.map.set(x, z, ColumnPlan { wanted, refined });
         }
     }
-    map
+
+    /// The children of row `row` of the parents' window.
+    fn finer_row(&mut self, row: i64, prev: &LevelPlan, parents: &LevelPlan) {
+        let k = self.k;
+        let limit = world_limit(k);
+        let at = EyeLayer::new(&self.eye, k);
+        let w = parents.size[0];
+        let pz = parents.origin[1] + row;
+        for dx in 0..w {
+            let px = parents.origin[0] + dx as i64;
+            let Some(parent) = parents.get(px, pz) else {
+                continue;
+            };
+            let Some((a, b)) = parent.refined else {
+                continue;
+            };
+            let Some(wanted) = intersect(Some((a * 2, b * 2 + 1)), self.layers(k)) else {
+                continue;
+            };
+            for (cx, cz) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let (x, z) = (px * 2 + cx, pz * 2 + cz);
+                if x.abs() > limit || z.abs() > limit {
+                    continue;
+                }
+                let refined = if k >= 2 {
+                    let gap2 = self.eye.column_gap2(k, [x, z]);
+                    self.refine(&at, k, gap2, wanted, prev.get(x, z))
+                } else {
+                    None
+                };
+                self.map.set(
+                    x,
+                    z,
+                    ColumnPlan {
+                        wanted: Some(wanted),
+                        refined,
+                    },
+                );
+            }
+        }
+    }
 }

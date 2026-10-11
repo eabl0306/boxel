@@ -520,6 +520,8 @@ struct Replan {
     th: Thresholds,
     /// The next level to plan (down to 1).
     next: u8,
+    /// Level `next` while it is planned, a few rows a frame; nothing is applied yet.
+    planning: Option<plan::LevelPlanner>,
     /// Level `next` while it is applied, column by column: its new plan, the columns to walk
     /// (the new window's, then the old one's) and how many are done. The old plan stays in
     /// `LodWorld::plan` until it is.
@@ -835,15 +837,17 @@ impl LodWorld {
             eye,
             th,
             next: redo.clamp(1, top),
+            planning: None,
             level: None,
         });
         self.planned = Some(Planned { eye, th });
         self.started.get_or_insert_with(Instant::now);
     }
 
-    /// Goes on with the replan under way until `until` (checked every [`CLOCK_EVERY`] columns,
-    /// at least that many done): plans its next level, then applies it column by column, coarse
-    /// levels first. False once it is done.
+    /// Goes on with the replan under way until `until`: plans its next level a row at a time
+    /// (the clock checked after each row), then applies it column by column (checked every
+    /// [`CLOCK_EVERY`] columns, at least that many done), coarse levels first. False once it is
+    /// done.
     fn replan_step(&mut self, cov: &ChunkCoverage, until: Instant) -> bool {
         let Some(mut r) = self.replan.take() else {
             return false;
@@ -857,7 +861,15 @@ impl LodWorld {
                     let prev = &self.plan.levels[i];
                     let parents = self.plan.levels.get(i + 1);
                     let _span = frame_span!("lod.plan_level");
-                    let new = plan::plan_level(&r.eye, &r.th, k, prev, parents, self.ceiling);
+                    let mut planner = r.planning.take().unwrap_or_else(|| {
+                        plan::LevelPlanner::new(r.eye, r.th, k, parents, self.ceiling)
+                    });
+                    if !planner.step(prev, parents, Some(until)) {
+                        r.planning = Some(planner);
+                        self.replan = Some(r);
+                        return true;
+                    }
+                    let new = planner.finish();
                     let window = plan::LevelPlan::two_windows(&new, prev);
                     (new, window, 0)
                 }
@@ -1296,6 +1308,7 @@ fn lod_coverage(
     mut data: MessageReader<ChunkDataEvent>,
     stats: Res<WorldStats>,
     viewers: Res<ViewerChunks>,
+    settings: Res<LodSettings>,
 ) {
     if !ops.ops.is_empty() {
         ops.ops.clear();
@@ -1335,10 +1348,11 @@ fn lod_coverage(
                 coverage.data_event(event.pos(), event.id(), loaded);
             }
         }
+        // The last valid settings (`Plan` checks them), or before the first check these.
         let budget = lod
             .settings
             .as_ref()
-            .map_or(Duration::ZERO, |s| s.frame_budget);
+            .map_or(settings.frame_budget, |s| s.frame_budget);
         // A busy world catching up gets the main thread first, as it gets the workers.
         let budget = if world_settled(&stats, &viewers) {
             budget
