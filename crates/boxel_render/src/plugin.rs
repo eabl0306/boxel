@@ -1394,8 +1394,11 @@ pub(crate) fn extract(
 /// to it).
 ///
 /// First, whatever the setting, the world learns which chunks the renderer refused or shows
-/// again since the last frame ([`VoxelRenderer::take_refused`]): the search sees through them,
-/// and the far LOD draws over them ([`forward_refused`]).
+/// again since the last frame ([`VoxelRenderer::take_refused`]): the search sees through them
+/// ([`forward_refused`]); and the far LOD draws over those that left nothing drawn
+/// ([`VoxelRenderer::take_undrawn`]).
+///
+/// [`VoxelRenderer::take_undrawn`]: crate::VoxelRenderer::take_undrawn
 pub(crate) fn extract_visibility(
     mut gpu: ResMut<GpuState>,
     mut frame: ResMut<ExtractedFrame>,
@@ -1415,13 +1418,13 @@ pub(crate) fn extract_visibility(
     };
     if let GpuStage::Ready(ready) = &mut gpu.stage {
         ready.renderer.take_refused(|pos, refused| {
-            forward_refused(
-                pos,
-                refused,
-                &mut visibility,
-                &map,
-                lod_feedback.as_deref_mut(),
-            );
+            forward_refused(pos, refused, &mut visibility, &map);
+        });
+        // Taken whatever the LOD: the renderer keeps them until then.
+        ready.renderer.take_undrawn(|pos, undrawn| {
+            if let Some(lod) = lod_feedback.as_deref_mut() {
+                lod.chunks.push((pos, undrawn));
+            }
         });
         if frame.resync {
             // `prepare` drops every chunk first (a new renderer may not know the old refusals).
@@ -1461,21 +1464,15 @@ pub(crate) fn extract_visibility(
     );
 }
 
-/// One change of the main renderer's refusals ([`VoxelRenderer::take_refused`]): to the cave
-/// culling, and with the far LOD to its coverage too ([`LodFeedback::chunks`]: a refused chunk is
-/// not drawn, so the LOD draws its octant). `ChunkVisibility` keeps its refused set to itself,
-/// and a second `take_refused` call would steal the changes from it.
-fn forward_refused(
-    pos: ChunkPos,
-    refused: bool,
-    visibility: &mut ChunkVisibility,
-    map: &ChunkMap,
-    lod: Option<&mut LodFeedback>,
-) {
+/// One change of the main renderer's refusals ([`VoxelRenderer::take_refused`]) to the cave
+/// culling: a refused chunk shows an older mesh or nothing, so the search sees through it.
+/// `ChunkVisibility` keeps its refused set to itself. The far LOD hears of the refusals that
+/// leave nothing drawn apart ([`VoxelRenderer::take_undrawn`] into [`LodFeedback::chunks`]): a
+/// refused chunk that keeps its older mesh is still drawn there.
+///
+/// [`VoxelRenderer::take_undrawn`]: crate::VoxelRenderer::take_undrawn
+fn forward_refused(pos: ChunkPos, refused: bool, visibility: &mut ChunkVisibility, map: &ChunkMap) {
     visibility.set_unshown(pos, refused, map.visibility_links_at(pos));
-    if let Some(lod) = lod {
-        lod.chunks.push((pos, refused));
-    }
 }
 
 /// The cave culling set (ADR 0022) of a frame with cave culling on, as the render plugin
@@ -2169,49 +2166,28 @@ mod tests {
         assert_eq!((sky, day), (DEFAULT_SKY_COLOR, SceneLight::noon()));
     }
 
-    /// A refusal change of the main renderer reaches the cave culling (its next update searches
-    /// again, the refused chunk now see-through) and, with the far LOD, its coverage.
+    /// A refusal change of the main renderer reaches the cave culling: its next update searches
+    /// again, the refused chunk now see-through.
     #[test]
-    fn refusals_reach_the_cave_culling_and_the_lod() {
+    fn refusals_reach_the_cave_culling() {
         let map = ChunkMap::default();
         let view = VisibilityView::new(I64Vec3::ZERO, None, 2, 2);
-        for lod in [true, false] {
-            let mut visibility = ChunkVisibility::default();
-            let mut feedback = LodFeedback::default();
-            visibility.update(&view, |_| 0);
-            visibility.update(&view, |_| 0);
-            assert_eq!(
-                visibility.stats().searches,
-                1,
-                "the second update reuses the first"
-            );
-            let pos = ChunkPos::new(1, 0, 0);
-            forward_refused(
-                pos,
-                true,
-                &mut visibility,
-                &map,
-                lod.then_some(&mut feedback),
-            );
-            visibility.update(&view, |_| 0);
-            assert_eq!(
-                visibility.stats().searches,
-                2,
-                "a refused chunk opens its links"
-            );
-            forward_refused(
-                pos,
-                false,
-                &mut visibility,
-                &map,
-                lod.then_some(&mut feedback),
-            );
-            let forwarded = if lod {
-                vec![(pos, true), (pos, false)]
-            } else {
-                vec![]
-            };
-            assert_eq!(feedback.chunks, forwarded);
-        }
+        let mut visibility = ChunkVisibility::default();
+        visibility.update(&view, |_| 0);
+        visibility.update(&view, |_| 0);
+        assert_eq!(
+            visibility.stats().searches,
+            1,
+            "the second update reuses the first"
+        );
+        let pos = ChunkPos::new(1, 0, 0);
+        forward_refused(pos, true, &mut visibility, &map);
+        visibility.update(&view, |_| 0);
+        assert_eq!(
+            visibility.stats().searches,
+            2,
+            "a refused chunk opens its links"
+        );
+        forward_refused(pos, false, &mut visibility, &map);
     }
 }

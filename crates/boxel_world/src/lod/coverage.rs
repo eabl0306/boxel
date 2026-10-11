@@ -2,8 +2,11 @@
 //! lod-1 node position (one bit per octant: a lod-1 octant is exactly one chunk).
 //!
 //! - `published`: the chunk's last `ChunkMeshEvent` was an `Upsert` (written in `Collect` or
-//!   between frames: the next `Update` reads both), and the main renderer does not hold it as
-//!   refused ([`LodFeedback::chunks`](super::LodFeedback::chunks)).
+//!   between frames: the next `Update` reads both), and the main renderer did not refuse that
+//!   upload leaving nothing drawn ([`LodFeedback::chunks`](super::LodFeedback::chunks)). An
+//!   upsert counts as drawn from its frame on, as the renderer applies it in that frame; its
+//!   refusal comes back two frames later, so a refusal read in the frame after an upsert is
+//!   older than it and changes nothing.
 //! - `covered`: published, or the chunk draws nothing at full detail either (an `Empty` mesh, or
 //!   data that is all air or `Missing`), so the LOD must not draw its coarse rounding there.
 //!   Never [`ChunkSlot::shown`](crate::ChunkSlot::shown): it goes false after an edit while the
@@ -204,6 +207,9 @@ impl ChunkCoverage {
 pub struct LodCoverage {
     coverage: ChunkCoverage,
     changed: HashSet<ChunkPos>,
+    /// Chunks upserted in this frame's mesh events, and in the last frame's (module docs).
+    upserted_now: HashSet<ChunkPos>,
+    upserted_last: HashSet<ChunkPos>,
     /// Watched chunks, polled round robin from `cursor`.
     watch: Vec<ChunkPos>,
     watched: HashSet<ChunkPos>,
@@ -242,9 +248,20 @@ impl LodCoverage {
         }
     }
 
-    /// An `Upsert` of chunk `c`.
+    /// An `Upsert` of chunk `c`: drawn from this frame on, an older refusal included (module
+    /// docs).
     pub(crate) fn upserted(&mut self, c: ChunkPos) {
-        self.update(c, |b, bit| put(&mut b.upserted, bit, true));
+        self.upserted_now.insert(c);
+        self.update(c, |b, bit| {
+            put(&mut b.upserted, bit, true);
+            put(&mut b.refused, bit, false);
+        });
+    }
+
+    /// The frame's mesh events are read: this frame's upserts become the last frame's.
+    pub(crate) fn end_frame(&mut self) {
+        std::mem::swap(&mut self.upserted_now, &mut self.upserted_last);
+        self.upserted_now.clear();
     }
 
     /// A `Remove` of chunk `c`: no longer published; it may draw nothing now (an `Empty` mesh).
@@ -288,9 +305,13 @@ impl LodCoverage {
         }
     }
 
-    /// The main renderer refused chunk `c`'s upload (`true`) or shows what the world sent it
-    /// again (`false`).
+    /// The main renderer refused chunk `c`'s upload, leaving nothing drawn (`true`), or shows
+    /// what the world sent it again (`false`). A refusal of a chunk upserted in the last frame
+    /// is of the upload before that upsert: it changes nothing (module docs).
     pub(crate) fn refused(&mut self, c: ChunkPos, refused: bool) {
+        if refused && self.upserted_last.contains(&c) {
+            return;
+        }
         self.update(c, |b, bit| put(&mut b.refused, bit, refused));
     }
 

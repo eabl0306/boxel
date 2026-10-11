@@ -1976,6 +1976,8 @@ fn a_main_refusal_stops_counting_as_published_and_showing_again_restores_it() {
     app.world_mut().write_message(upsert(c));
     frame(&mut app, &mut model);
     assert_eq!(model.nodes[&key].0, 0b100);
+    // The refusal of that upload comes back two frames after its upsert.
+    frame(&mut app, &mut model);
     app.world_mut()
         .resource_mut::<LodFeedback>()
         .chunks
@@ -2341,6 +2343,48 @@ fn placeholders_under_full_detail_go_last_and_holes_first() {
     set(&mut app, 0x0F);
     frame(&mut app, &mut model);
     assert_eq!(queued_class(&app, c), 0, "a hole next to full detail");
+}
+
+/// The main renderer refused a chunk; the world sends its mesh again: the LOD counts it as drawn
+/// in that frame, as any upsert (no frame of LOD over it while the refusal is taken back). A
+/// refusal older than that upsert (of the upload before it) changes nothing; the refusal of the
+/// new upload, a frame later, counts.
+#[test]
+fn a_refused_chunk_sent_again_counts_as_drawn_at_once() {
+    let mut app = app(Steps::new(20), small());
+    spawn(&mut app, DVec3::new(10.0, 60.0, 10.0));
+    let mut model = Model::default();
+    fill(&mut app, &mut model, 300);
+    let key = free_lod1(&app, &model);
+    let c = chunk_of_octant(key.pos, 0b010);
+    let refuse = |app: &mut App| {
+        app.world_mut()
+            .resource_mut::<LodFeedback>()
+            .chunks
+            .push((c, true));
+    };
+    app.world_mut().write_message(upsert(c));
+    frame(&mut app, &mut model);
+    frame(&mut app, &mut model);
+    refuse(&mut app);
+    frame(&mut app, &mut model);
+    assert_eq!(model.nodes[&key].0, 0, "refused: the LOD draws it");
+    app.world_mut().write_message(upsert(c));
+    frame(&mut app, &mut model);
+    assert_eq!(
+        model.nodes[&key].0, 0b100,
+        "sent again: drawn at full detail"
+    );
+    refuse(&mut app);
+    frame(&mut app, &mut model);
+    assert_eq!(
+        model.nodes[&key].0, 0b100,
+        "a refusal older than the upsert"
+    );
+    refuse(&mut app);
+    frame(&mut app, &mut model);
+    assert_eq!(model.nodes[&key].0, 0, "the new upload refused");
+    assert_bits_from_scratch(&app);
 }
 
 /// Frames running every held job until the LOD is filled.

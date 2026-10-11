@@ -278,7 +278,8 @@ pub struct VoxelRenderer {
 /// nothing there, and where their faces are missing the rock around them shows what lies behind
 /// it: cave culling must see through them (ADR 0022). Their changes go to the world
 /// ([`VoxelRenderer::take_refused`]); until the world searched with them, a frame whose visible
-/// set reached one is drawn without the set.
+/// set reached one is drawn without the set. The far LOD hears only of the refusals that leave
+/// nothing drawn ([`VoxelRenderer::take_undrawn`]).
 #[derive(Debug, Default)]
 struct Refused {
     /// Refused chunks by id, with their position.
@@ -286,16 +287,23 @@ struct Refused {
     /// Changes for [`VoxelRenderer::take_refused`], in order: `true` refused, `false` shown as
     /// the world has it again (or removed).
     changes: Vec<(ChunkPos, bool)>,
+    /// For [`VoxelRenderer::take_undrawn`], the last change of each position: `true` refused
+    /// with no older mesh resident (every such refusal, since the far LOD counts each upsert as
+    /// drawn until told otherwise), `false` shown as the world has it again.
+    undrawn: HashMap<ChunkPos, bool>,
     /// Positions refused since the last [`VoxelRenderer::render`].
     fresh: Vec<ChunkPos>,
 }
 
 impl Refused {
-    /// The upload of chunk `id` at `pos` was refused.
-    fn refuse(&mut self, id: u64, pos: ChunkPos) {
+    /// The upload of chunk `id` at `pos` was refused; `resident`: its older mesh stays drawn.
+    fn refuse(&mut self, id: u64, pos: ChunkPos, resident: bool) {
         if self.by_id.insert(id, pos).is_none() {
             self.changes.push((pos, true));
             self.fresh.push(pos);
+        }
+        if !resident {
+            self.undrawn.insert(pos, true);
         }
     }
 
@@ -303,13 +311,16 @@ impl Refused {
     fn shown(&mut self, id: u64) {
         if let Some(pos) = self.by_id.remove(&id) {
             self.changes.push((pos, false));
+            self.undrawn.insert(pos, false);
         }
     }
 
     /// Every chunk was removed.
     fn clear(&mut self) {
-        self.changes
-            .extend(self.by_id.drain().map(|(_, pos)| (pos, false)));
+        for (_, pos) in self.by_id.drain() {
+            self.changes.push((pos, false));
+            self.undrawn.insert(pos, false);
+        }
     }
 
     /// True if `set` reached a chunk refused since the last call: it may hide what shows
@@ -843,6 +854,18 @@ impl VoxelRenderer {
         }
     }
 
+    /// Calls `f` with the last change since the last call of each chunk position where a refused
+    /// upload changes what is drawn (the far LOD's view, ADR 0031): `(position, true)` when the
+    /// renderer draws nothing there (the upload was refused and no older mesh of the chunk is
+    /// resident; reported on every such refusal), `(position, false)` when the chunk shows what
+    /// was sent last again. A refused chunk that keeps its older mesh is still drawn: it is
+    /// never reported `true`.
+    pub fn take_undrawn(&mut self, mut f: impl FnMut(ChunkPos, bool)) {
+        for (pos, undrawn) in self.refused.undrawn.drain() {
+            f(pos, undrawn);
+        }
+    }
+
     /// Sets the model box table the `SHAPE_BOX` quads of the meshes index (ADR 0020):
     /// `boxel_mesh::MaterialTable::model_boxes` of the material table the meshes come from. It
     /// goes into the view uniform (after the per-frame part), written here once, and to the
@@ -916,7 +939,7 @@ impl VoxelRenderer {
         let pos = ChunkPos::from_i64vec3(origin >> CHUNK_SHIFT);
         if self.chunks.slot_for(id).is_none() {
             self.stats.dropped_chunks += 1;
-            self.refused.refuse(id, pos);
+            self.refused.refuse(id, pos, false);
             return Err(RendererError::ChunkTableFull(self.chunks.capacity()));
         }
         debug_assert!(
@@ -930,9 +953,10 @@ impl VoxelRenderer {
         let needed = arena_len(&mesh);
         let old = self.chunks.get(id).map(|(_, r)| r.alloc);
         let Some(alloc) = self.arena.alloc.replace(old, needed) else {
-            // Nothing changed: a resident chunk keeps its old mesh (range and slot untouched).
+            // Nothing changed: a resident chunk keeps its old mesh (range and slot untouched),
+            // and goes on drawing it.
             self.stats.dropped_chunks += 1;
-            self.refused.refuse(id, pos);
+            self.refused.refuse(id, pos, old.is_some());
             return Err(RendererError::ArenaFull { needed });
         };
         let record = ChunkRecord {
@@ -947,7 +971,7 @@ impl VoxelRenderer {
             // unreachable: `slot_for` succeeded above, so this is a new chunk (no old range)
             self.arena.alloc.free(alloc);
             self.stats.dropped_chunks += 1;
-            self.refused.refuse(id, pos);
+            self.refused.refuse(id, pos, false);
             return Err(RendererError::ChunkTableFull(self.chunks.capacity()));
         }
         self.refused.shown(id);
@@ -1420,9 +1444,9 @@ mod tests {
         let (a, b) = (ChunkPos::new(0, 0, -1), ChunkPos::new(9, 0, 0));
         let mut refused = Refused::default();
         let take = |r: &mut Refused| std::mem::take(&mut r.changes);
-        refused.refuse(1, a);
-        refused.refuse(1, a);
-        refused.refuse(2, b);
+        refused.refuse(1, a, false);
+        refused.refuse(1, a, false);
+        refused.refuse(2, b, false);
         assert_eq!(take(&mut refused), [(a, true), (b, true)]);
         // A closed world seen from chunk (0, 0, 0): its neighbor `a` is reached, `b` is outside
         // the box (never searched).
@@ -1430,14 +1454,14 @@ mod tests {
         let set = visible_chunks(&view, |_| 0);
         assert!(refused.take_fresh(Some(&set)));
         assert!(!refused.take_fresh(Some(&set)), "only once");
-        refused.refuse(3, ChunkPos::new(0, 0, -2));
+        refused.refuse(3, ChunkPos::new(0, 0, -2), false);
         assert!(
             !refused.take_fresh(Some(&set)),
             "not reached: its links were not used"
         );
-        refused.refuse(4, b);
+        refused.refuse(4, b, false);
         assert!(!refused.take_fresh(Some(&set)), "outside the box");
-        refused.refuse(5, ChunkPos::new(1, 0, 0));
+        refused.refuse(5, ChunkPos::new(1, 0, 0), false);
         assert!(!refused.take_fresh(None));
         // Shown again by an upload or a removal; unknown ids change nothing.
         refused.shown(1);
@@ -1457,6 +1481,41 @@ mod tests {
             ]
         );
         assert!(refused.by_id.is_empty());
+    }
+
+    /// The far LOD hears of the refusals that leave nothing drawn, each of them (it counts every
+    /// upsert as drawn until told otherwise), and of the chunks shown again; not of a chunk that
+    /// keeps its older mesh.
+    #[test]
+    fn refusals_that_leave_nothing_drawn_reach_the_lod() {
+        let (a, b) = (ChunkPos::new(0, 0, -1), ChunkPos::new(9, 0, 0));
+        let mut refused = Refused::default();
+        let take = |r: &mut Refused| {
+            let mut v: Vec<(ChunkPos, bool)> = r.undrawn.drain().collect();
+            v.sort_by_key(|(p, _)| (p.x, p.y, p.z));
+            v
+        };
+        refused.refuse(1, a, false);
+        refused.refuse(2, b, true);
+        assert_eq!(take(&mut refused), [(a, true)], "b keeps its older mesh");
+        refused.refuse(1, a, false);
+        assert_eq!(take(&mut refused), [(a, true)], "every refusal");
+        assert_eq!(
+            refused.changes.len(),
+            2,
+            "cave culling hears each chunk once"
+        );
+        refused.refuse(1, a, false);
+        refused.shown(1);
+        refused.shown(2);
+        assert_eq!(
+            take(&mut refused),
+            [(a, false), (b, false)],
+            "the last change"
+        );
+        refused.refuse(3, a, false);
+        refused.clear();
+        assert_eq!(take(&mut refused), [(a, false)]);
     }
 
     #[test]

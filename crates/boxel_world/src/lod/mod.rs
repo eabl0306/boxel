@@ -461,9 +461,11 @@ pub struct LodFeedback {
     pub refused: Vec<ChunkKey>,
     /// Free quads in the LOD arena after the frame's uploads (`None`: no report yet).
     pub arena_free_quads: Option<u64>,
-    /// Full-detail chunks the main renderer refused (`true`) or shows as the world sent them
-    /// again (`false`), forwarded from its own refusals, in order: the coverage counts a refused
-    /// chunk as not drawn. Read before this frame's `ChunkMeshResync`, which clears them all.
+    /// Full-detail chunks the main renderer draws nothing for after refusing their upload
+    /// (`true`: no older mesh of the chunk is resident; a refused chunk that keeps its older mesh
+    /// is still drawn and never named) or shows as the world sent them again (`false`),
+    /// forwarded from its own refusals: the coverage counts such a chunk as not drawn until it
+    /// is sent again. Read before this frame's `ChunkMeshResync`, which clears them all.
     pub chunks: Vec<(ChunkPos, bool)>,
 }
 
@@ -1138,6 +1140,7 @@ fn lod_coverage(
         lod.tree.chunks_changed(p, cov);
     }
     lod.requeue_covered(cov);
+    coverage.end_frame();
 }
 
 /// The first viewer's position (by entity), the eye when there is no [`LodFocus`].
