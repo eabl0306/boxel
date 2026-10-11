@@ -73,6 +73,8 @@ struct LodDraw {
     pending: Option<Arc<ChunkMesh>>,
     /// Its index in `LodPass::levels[level]`.
     at: u32,
+    /// Its quads counted in [`LodNodes::live`] (0: not counted): uploaded with an octant left.
+    counted: u32,
 }
 
 impl LodDraw {
@@ -380,6 +382,9 @@ struct LodNodes {
     tint: bool,
     draws: Vec<NodeDraw>,
     stats: LodPassStats,
+    /// Uploaded nodes with an octant left to draw and their quads, kept as nodes change (the
+    /// High frame reads them instead of walking every slot).
+    live: (u32, u64),
     /// High: the GPU node table's CPU side (which entries to write).
     table: Option<GpuTable>,
 }
@@ -404,7 +409,32 @@ impl LodNodes {
             tint: false,
             draws: Vec::new(),
             stats: LodPassStats::default(),
+            live: (0, 0),
             table: None,
+        }
+    }
+
+    /// Brings `slot`'s share of [`LodNodes::live`] up to date after it changed.
+    fn recount(&mut self, slot: u32) {
+        let Some(node) = self.slots.get_mut(slot as usize).and_then(Option::as_mut) else {
+            return;
+        };
+        let now = if node.mask != 0xFF && node.pending.is_none() {
+            node.alloc.size.max(1)
+        } else {
+            0
+        };
+        if now != node.counted {
+            let (n, q) = &mut self.live;
+            if node.counted > 0 {
+                *n -= 1;
+                *q -= u64::from(node.counted);
+            }
+            if now > 0 {
+                *n += 1;
+                *q += u64::from(now);
+            }
+            node.counted = now;
         }
     }
 
@@ -436,6 +466,7 @@ impl LodNodes {
                         && let Some(node) = self.slots[slot as usize].as_mut()
                     {
                         node.mask = mask;
+                        self.recount(slot);
                         self.touch(slot);
                     }
                 }
@@ -495,6 +526,7 @@ impl LodNodes {
             node.mask = mask;
             node.pending = Some(mesh);
             self.pending.push(slot);
+            self.recount(slot);
             self.touch(slot);
             return;
         }
@@ -512,6 +544,7 @@ impl LodNodes {
             mask,
             pending: Some(mesh),
             at,
+            counted: 0,
         });
         self.by_key.insert(key, slot);
         self.pending.push(slot);
@@ -522,6 +555,11 @@ impl LodNodes {
         let Some(slot) = self.by_key.remove(&key) else {
             return;
         };
+        if let Some(node) = self.slots[slot as usize].as_mut() {
+            // Not drawn any more: out of the live count.
+            node.mask = 0xFF;
+        }
+        self.recount(slot);
         let Some(node) = self.slots[slot as usize].take() else {
             return;
         };
@@ -563,6 +601,7 @@ impl LodNodes {
         self.pending.clear();
         self.alloc.reset();
         self.stats.nodes = 0;
+        self.live = (0, 0);
         self.touch_all();
     }
 
@@ -654,6 +693,13 @@ impl LodNodes {
         if bytes > 0 {
             out.push((batch, bytes));
         }
+        let uploaded: Vec<u32> = out
+            .iter()
+            .flat_map(|(batch, _)| batch.iter().map(|up| up.slot))
+            .collect();
+        for slot in uploaded {
+            self.recount(slot);
+        }
         out
     }
 
@@ -671,6 +717,7 @@ impl LodNodes {
             if node.pending.is_none() && node.alloc.offset == up.offset {
                 node.pending = Some(up.mesh);
                 self.pending.push(up.slot);
+                self.recount(up.slot);
                 if let Some(table) = &mut self.table {
                     table.touch(up.slot);
                 }
@@ -755,12 +802,7 @@ impl LodNodes {
         if self.far.is_none() || sealed {
             return 0;
         }
-        for node in self.slots.iter().flatten() {
-            if node.mask != 0xFF && node.pending.is_none() {
-                self.stats.drawn += 1;
-                self.stats.quads += u64::from(node.alloc.size);
-            }
-        }
+        (self.stats.drawn, self.stats.quads) = self.live;
         if self.stats.drawn == 0 {
             return 0;
         }
@@ -1510,6 +1552,16 @@ mod tests {
         assert_eq!(nodes.stats.nodes as usize, nodes.by_key.len());
         assert_eq!(nodes.stats.arena_used, held);
         assert_eq!(nodes.stats.arena_capacity, nodes.alloc.capacity());
+        // The live count kept as nodes change is the walk over every slot.
+        let live = nodes
+            .slots
+            .iter()
+            .flatten()
+            .filter(|n| n.mask != 0xFF && n.pending.is_none())
+            .fold((0, 0), |(n, q), node| {
+                (n + 1, q + u64::from(node.alloc.size))
+            });
+        assert_eq!(nodes.live, live);
     }
 
     #[test]
