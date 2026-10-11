@@ -1,0 +1,917 @@
+//! The resident LOD tree (ADR 0031): per column and level what the planner wants, what the
+//! source reported (the band) and one record per non-uniform node; availability, the octant
+//! masks and the ops for the renderer.
+//!
+//! - A node is *available* when the renderer has it or it has nothing to draw: a sent mesh, a
+//!   node built blank, or a layer outside its column's band (uniform: no record at all).
+//! - A node is *active* when it is available and wanted, or when it left the wanted tree but its
+//!   parent is wanted and not available yet (kept until replaced).
+//! - A node is *covered* when it is active or its 8 children are covered; a lod-1 node's children
+//!   are full-detail chunks ([`ChunkCoverage`]).
+//! - A node hides its covered octants (its mask). Covered children bits are kept per node
+//!   position, for nodes with a record or with an unknown band, and updated incrementally: a
+//!   change walks up at most `K` ancestors.
+//!
+//! Ops never leave between frames: whatever changes (a result in an idle step, a replan) only
+//! marks masks dirty and queues sends; [`Tree::collect`] turns them into ops in the frame.
+use super::coverage::ChunkCoverage;
+use super::jobs::Built;
+use super::plan::{ColumnKey, ColumnPlan, Plan, Span, contains, intersect};
+use super::{LevelStats, LodOp};
+use boxel_mesh::ChunkMesh;
+use boxel_voxel::{ChunkKey, ChunkPos, DimensionId};
+use boxel_worldgen::lod::LodColumn;
+use foldhash::{HashMap, HashSet};
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+/// How long a node the renderer refused waits before it is sent again (and only once the arena
+/// reports room for it).
+pub(crate) const REFUSED_RETRY: Duration = Duration::from_secs(1);
+
+/// A node record's state.
+#[derive(Clone, Debug)]
+pub(crate) enum NodeState {
+    /// Waiting for a job.
+    Pending,
+    /// Built: nothing to draw (emitted uniform inside the band, or meshed to nothing).
+    Blank,
+    /// Built with quads.
+    Ready {
+        mesh: Arc<ChunkMesh>,
+        /// The renderer has it (its `Upsert` went out and was not refused).
+        sent: bool,
+        /// Refused by the renderer: not sent again before this.
+        retry: Option<Instant>,
+    },
+    /// Lost: the job failed or a face bucket was too big. Its parent draws its octant.
+    Failed,
+}
+
+/// A non-uniform node of a column.
+#[derive(Clone, Debug)]
+pub(crate) struct Node {
+    pub(crate) state: NodeState,
+    /// In the wanted tree; false: departed, kept until its parent is available.
+    pub(crate) wanted: bool,
+    /// The hidden octants, as last computed (and sent, for a sent node).
+    pub(crate) mask: u8,
+}
+
+impl Node {
+    fn pending() -> Self {
+        Self {
+            state: NodeState::Pending,
+            wanted: true,
+            mask: 0,
+        }
+    }
+
+    /// Sent or blank.
+    pub(crate) fn available(&self) -> bool {
+        match self.state {
+            NodeState::Blank => true,
+            NodeState::Ready { sent, .. } => sent,
+            NodeState::Pending | NodeState::Failed => false,
+        }
+    }
+
+    /// Sent to the renderer.
+    pub(crate) fn sent(&self) -> bool {
+        matches!(self.state, NodeState::Ready { sent: true, .. })
+    }
+}
+
+/// The job of a column in flight.
+#[derive(Debug)]
+pub(crate) struct InFlight {
+    pub(crate) id: u64,
+    pub(crate) cancel: Arc<AtomicBool>,
+}
+
+/// A column of one level.
+#[derive(Debug, Default)]
+pub(crate) struct Column {
+    /// What the planner wants (both `None`: unwanted, kept for departed nodes).
+    pub(crate) plan: ColumnPlan,
+    /// The band the source reported, once known.
+    pub(crate) band: Option<LodColumn>,
+    /// Records of the non-uniform nodes, by layer.
+    pub(crate) nodes: BTreeMap<i64, Node>,
+    pub(crate) job: Option<InFlight>,
+    /// The ticket of its queue entry (other entries are stale).
+    pub(crate) ticket: Option<u32>,
+    /// A job panicked: no more jobs for it.
+    pub(crate) failed: bool,
+}
+
+/// What a column's next job asks for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Work {
+    pub(crate) layers: Span,
+    /// Mesh only these layers; `None`: all of `layers` (the band is not known yet).
+    pub(crate) only: Option<Vec<i64>>,
+}
+
+impl Column {
+    /// The next job of this column, if it needs one.
+    pub(crate) fn work(&self) -> Option<Work> {
+        if self.failed || self.job.is_some() {
+            return None;
+        }
+        let wanted = self.plan.wanted?;
+        if self.band.is_none() {
+            return Some(Work {
+                layers: wanted,
+                only: None,
+            });
+        }
+        let only: Vec<i64> = self
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.wanted && matches!(n.state, NodeState::Pending))
+            .map(|(&y, _)| y)
+            .collect();
+        let (&lo, &hi) = (only.first()?, only.last()?);
+        Some(Work {
+            layers: (lo, hi),
+            only: Some(only),
+        })
+    }
+
+    /// The layer of its next job nearest to `eye_layer` (for its priority).
+    pub(crate) fn nearest(&self, work: &Work, eye_layer: i64) -> i64 {
+        match &work.only {
+            None => eye_layer.clamp(work.layers.0, work.layers.1),
+            Some(only) => only
+                .iter()
+                .copied()
+                .min_by_key(|y| y.abs_diff(eye_layer))
+                .unwrap_or(work.layers.0),
+        }
+    }
+
+    /// Cancels its job in flight (its result will be dropped).
+    fn cancel(&mut self) {
+        if let Some(job) = self.job.take() {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The parent of node `key` (level + 1).
+pub(crate) fn parent(key: ChunkKey) -> ChunkKey {
+    ChunkKey {
+        dim: key.dim,
+        lod: key.lod + 1,
+        pos: ChunkPos::new(key.pos.x >> 1, key.pos.y >> 1, key.pos.z >> 1),
+    }
+}
+
+/// The octant bit of node `key` in its parent.
+pub(crate) fn octant_bit(key: ChunkKey) -> u8 {
+    let p = key.pos;
+    1 << ((p.x & 1) | ((p.y & 1) << 1) | ((p.z & 1) << 2))
+}
+
+/// The layers of `a` not in `b` (up to two intervals).
+fn minus(a: Option<Span>, b: Option<Span>) -> [Option<Span>; 2] {
+    let Some(a) = a else {
+        return [None, None];
+    };
+    let Some(b) = intersect(Some(a), b) else {
+        return [Some(a), None];
+    };
+    let below = (a.0 < b.0).then_some((a.0, b.0 - 1));
+    let above = (b.1 < a.1).then_some((b.1 + 1, a.1));
+    [below, above]
+}
+
+/// The resident tree (module docs).
+#[derive(Debug)]
+pub(crate) struct Tree {
+    pub(crate) dim: DimensionId,
+    /// `K`: the top level.
+    pub(crate) levels: u8,
+    pub(crate) columns: HashMap<ColumnKey, Column>,
+    /// Covered children bits by node position (module docs).
+    children: HashMap<ChunkKey, u8>,
+    /// Records whose mask may have changed.
+    dirty: HashSet<ChunkKey>,
+    /// Departed records waiting for their parent.
+    departed: HashSet<ChunkKey>,
+    /// Ready nodes to send, in order.
+    sends: VecDeque<ChunkKey>,
+    /// Refused nodes waiting to be sent again.
+    refused: Vec<ChunkKey>,
+    /// Ops for the next `Collect`.
+    ops: Vec<LodOp>,
+    /// Columns whose work may have changed (to queue).
+    work: Vec<ColumnKey>,
+    /// Refusals since start.
+    pub(crate) refusals: usize,
+    /// Nodes lost to a too-big bucket, since start.
+    pub(crate) too_big: usize,
+}
+
+impl Tree {
+    pub(crate) fn new(dim: DimensionId, levels: u8) -> Self {
+        Self {
+            dim,
+            levels,
+            columns: HashMap::default(),
+            children: HashMap::default(),
+            dirty: HashSet::default(),
+            departed: HashSet::default(),
+            sends: VecDeque::new(),
+            refused: Vec::new(),
+            ops: Vec::new(),
+            work: Vec::new(),
+            refusals: 0,
+            too_big: 0,
+        }
+    }
+
+    /// The record of node `key`.
+    pub(crate) fn node(&self, key: ChunkKey) -> Option<&Node> {
+        self.columns.get(&ColumnKey::of(key))?.nodes.get(&key.pos.y)
+    }
+
+    fn node_mut(&mut self, key: ChunkKey) -> Option<&mut Node> {
+        self.columns
+            .get_mut(&ColumnKey::of(key))?
+            .nodes
+            .get_mut(&key.pos.y)
+    }
+
+    /// True if `key` lies outside its column's known band (uniform, no record).
+    pub(crate) fn known_uniform(&self, key: ChunkKey) -> bool {
+        self.columns
+            .get(&ColumnKey::of(key))
+            .and_then(|c| c.band)
+            .is_some_and(|b| b.uniform_at(key.pos.y).is_some())
+    }
+
+    /// True if node `key` is wanted.
+    pub(crate) fn wanted(&self, key: ChunkKey) -> bool {
+        self.columns
+            .get(&ColumnKey::of(key))
+            .is_some_and(|c| contains(c.plan.wanted, key.pos.y))
+    }
+
+    /// True if node `key` is available (module docs).
+    pub(crate) fn available(&self, key: ChunkKey) -> bool {
+        let Some(col) = self.columns.get(&ColumnKey::of(key)) else {
+            return false;
+        };
+        match col.nodes.get(&key.pos.y) {
+            Some(node) => node.available(),
+            None => col.band.is_some_and(|b| b.uniform_at(key.pos.y).is_some()),
+        }
+    }
+
+    /// True if node `key` is active (module docs). A departed record is kept only while it is
+    /// needed, so every available record is active.
+    pub(crate) fn active(&self, key: ChunkKey) -> bool {
+        let Some(col) = self.columns.get(&ColumnKey::of(key)) else {
+            return false;
+        };
+        match col.nodes.get(&key.pos.y) {
+            Some(node) => node.available(),
+            None => {
+                contains(col.plan.wanted, key.pos.y)
+                    && col.band.is_some_and(|b| b.uniform_at(key.pos.y).is_some())
+            }
+        }
+    }
+
+    /// The covered children bits of node `key`.
+    pub(crate) fn children_bits(&self, key: ChunkKey, cov: &ChunkCoverage) -> u8 {
+        if key.lod == 1 {
+            cov.get(key.pos).covered
+        } else {
+            self.children.get(&key).copied().unwrap_or(0)
+        }
+    }
+
+    /// True if node `key` is covered (module docs).
+    pub(crate) fn covered(&self, key: ChunkKey, cov: &ChunkCoverage) -> bool {
+        self.active(key) || (!self.known_uniform(key) && self.children_bits(key, cov) == 0xFF)
+    }
+
+    /// The hidden octants of node `key`.
+    pub(crate) fn mask(&self, key: ChunkKey, cov: &ChunkCoverage) -> u8 {
+        self.children_bits(key, cov)
+    }
+
+    fn mark_dirty(&mut self, key: ChunkKey) {
+        if self.node(key).is_some() {
+            self.dirty.insert(key);
+        }
+    }
+
+    /// Node `key`'s covered state may have changed: brings its parent's bit up to date, and on
+    /// up while the parents' states change.
+    pub(crate) fn touch(&mut self, mut key: ChunkKey, cov: &ChunkCoverage) {
+        while key.lod < self.levels {
+            let up = parent(key);
+            let bit = octant_bit(key);
+            let now = self.covered(key, cov);
+            let had = self.children.get(&up).is_some_and(|b| b & bit != 0);
+            if now == had {
+                return;
+            }
+            if now && self.known_uniform(up) {
+                // A uniform parent's covered state is its own: its bits are never read.
+                return;
+            }
+            let before = self.covered(up, cov);
+            let bits = self.children.entry(up).or_insert(0);
+            if now {
+                *bits |= bit;
+            } else {
+                *bits &= !bit;
+            }
+            if *bits == 0 {
+                self.children.remove(&up);
+            }
+            self.mark_dirty(up);
+            if self.covered(up, cov) == before {
+                return;
+            }
+            key = up;
+        }
+    }
+
+    /// A lod-1 position's full-detail coverage changed: its mask and its parents.
+    pub(crate) fn chunks_changed(&mut self, lod1: ChunkPos, cov: &ChunkCoverage) {
+        let key = ChunkKey {
+            dim: self.dim,
+            lod: 1,
+            pos: lod1,
+        };
+        self.mark_dirty(key);
+        self.touch(key, cov);
+    }
+
+    /// Touches every layer of `span` in column `c` that has no record (uniform layers whose
+    /// active state changed).
+    fn touch_uniform(&mut self, c: ColumnKey, span: Option<Span>, cov: &ChunkCoverage) {
+        let Some((lo, hi)) = span else {
+            return;
+        };
+        let Some(band) = self.columns.get(&c).and_then(|col| col.band) else {
+            return;
+        };
+        // Only layers outside the band are uniform; the band's own layers have records.
+        for part in [
+            intersect(Some((lo, hi)), Some((i64::MIN, band.lo - 1))),
+            intersect(Some((lo, hi)), Some((band.hi, i64::MAX))),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for y in part.0..=part.1 {
+                self.touch(c.node(self.dim, y), cov);
+            }
+        }
+    }
+
+    /// Records a column whose work may have changed.
+    fn note_work(&mut self, c: ColumnKey) {
+        self.work.push(c);
+    }
+
+    /// The columns whose work may have changed since the last call.
+    pub(crate) fn take_work(&mut self) -> Vec<ColumnKey> {
+        std::mem::take(&mut self.work)
+    }
+
+    /// Removes the record of `key` (an op if the renderer has it) and updates its parent. The
+    /// column stays (the caller drops it once done with it: [`Tree::drop_if_idle`]).
+    fn remove_node(&mut self, key: ChunkKey, cov: &ChunkCoverage) {
+        let c = ColumnKey::of(key);
+        let Some(col) = self.columns.get_mut(&c) else {
+            return;
+        };
+        let Some(node) = col.nodes.remove(&key.pos.y) else {
+            return;
+        };
+        if node.sent() {
+            self.ops.push(LodOp::Remove { key });
+        }
+        self.departed.remove(&key);
+        self.dirty.remove(&key);
+        self.touch(key, cov);
+    }
+
+    /// Drops column `c` if nothing keeps it: unwanted, no record, no job.
+    fn drop_if_idle(&mut self, c: ColumnKey) {
+        if let Some(col) = self.columns.get(&c)
+            && col.plan.wanted.is_none()
+            && col.nodes.is_empty()
+            && col.job.is_none()
+        {
+            self.columns.remove(&c);
+        }
+    }
+
+    /// Node `key` left the wanted tree: kept while it is sent and its parent is wanted and not
+    /// available, else removed.
+    fn depart(&mut self, key: ChunkKey, cov: &ChunkCoverage) {
+        let keep = self.node(key).is_some_and(Node::available)
+            && key.lod < self.levels
+            && self.wanted(parent(key))
+            && !self.available(parent(key));
+        if keep {
+            if let Some(node) = self.node_mut(key) {
+                node.wanted = false;
+            }
+            self.departed.insert(key);
+        } else {
+            self.remove_node(key, cov);
+        }
+    }
+
+    /// Applies a new plan: wanted intervals, departures, new records, uniform layers whose
+    /// active state changed. Coarse levels first, so departures see their parents' new plan.
+    pub(crate) fn apply_plan(&mut self, plan: &Plan, cov: &ChunkCoverage) {
+        let mut keys: Vec<ColumnKey> = self.columns.keys().copied().collect();
+        for (i, level) in plan.levels.iter().enumerate() {
+            let k = i as u8 + 1;
+            keys.extend(
+                level
+                    .keys()
+                    .filter(|&&[x, z]| !self.columns.contains_key(&ColumnKey { level: k, x, z }))
+                    .map(|&[x, z]| ColumnKey { level: k, x, z }),
+            );
+        }
+        keys.sort_unstable_by_key(|c| std::cmp::Reverse(c.level));
+        for c in keys {
+            let new = plan.get(c).unwrap_or_default();
+            self.set_plan(c, new, cov);
+        }
+    }
+
+    /// Sets the plan of column `c` (see [`Tree::apply_plan`]).
+    fn set_plan(&mut self, c: ColumnKey, new: ColumnPlan, cov: &ChunkCoverage) {
+        let col = self.columns.entry(c).or_default();
+        let old = col.plan;
+        if old == new {
+            return;
+        }
+        col.plan = new;
+        if new.wanted.is_none() {
+            col.cancel();
+        }
+        let band = col.band;
+        // Leaving layers: records depart, uniform layers stop being active.
+        for span in minus(old.wanted, new.wanted).into_iter().flatten() {
+            let leaving: Vec<i64> = self.columns[&c]
+                .nodes
+                .range(span.0..=span.1)
+                .filter(|(_, n)| n.wanted)
+                .map(|(&y, _)| y)
+                .collect();
+            for y in leaving {
+                self.depart(c.node(self.dim, y), cov);
+            }
+            self.touch_uniform(c, Some(span), cov);
+        }
+        // Entering layers: records inside a known band, uniform layers active.
+        for span in minus(new.wanted, old.wanted).into_iter().flatten() {
+            match band {
+                None => self.note_work(c),
+                Some(band) => {
+                    if let Some(inside) = intersect(Some(span), Some((band.lo, band.hi - 1))) {
+                        for y in inside.0..=inside.1 {
+                            self.want_record(c, y);
+                        }
+                        self.note_work(c);
+                    }
+                    self.touch_uniform(c, Some(span), cov);
+                }
+            }
+        }
+        self.drop_if_idle(c);
+    }
+
+    /// Wants the record of `c` at layer `y` (a new pending one, or a departed one back).
+    fn want_record(&mut self, c: ColumnKey, y: i64) {
+        let key = c.node(self.dim, y);
+        let col = self.columns.entry(c).or_default();
+        match col.nodes.get_mut(&y) {
+            Some(node) => {
+                node.wanted = true;
+                self.departed.remove(&key);
+                if matches!(node.state, NodeState::Ready { sent: false, .. }) {
+                    self.sends.push_back(key);
+                }
+            }
+            None => {
+                col.nodes.insert(y, Node::pending());
+            }
+        }
+    }
+
+    /// Starts job `id` for column `c`.
+    pub(crate) fn start_job(&mut self, c: ColumnKey, id: u64, cancel: Arc<AtomicBool>) {
+        if let Some(col) = self.columns.get_mut(&c) {
+            col.ticket = None;
+            col.job = Some(InFlight { id, cancel });
+        }
+    }
+
+    /// The column waiting for job `id`, if any (a result counts only then).
+    fn column_of_job(&self, c: ColumnKey, id: u64) -> bool {
+        self.columns
+            .get(&c)
+            .and_then(|col| col.job.as_ref())
+            .is_some_and(|j| j.id == id)
+    }
+
+    /// Job `id` of column `c` ended without a result (cancelled, or no source): it may be
+    /// queued again.
+    pub(crate) fn job_ended(&mut self, c: ColumnKey, id: u64) {
+        if self.column_of_job(c, id) {
+            if let Some(col) = self.columns.get_mut(&c) {
+                col.job = None;
+            }
+            self.note_work(c);
+            self.drop_if_idle(c);
+        }
+    }
+
+    /// Job `id` of column `c` failed: no more jobs for the column, its waiting nodes are lost.
+    pub(crate) fn job_failed(&mut self, c: ColumnKey, id: u64) {
+        if !self.column_of_job(c, id) {
+            return;
+        }
+        if let Some(col) = self.columns.get_mut(&c) {
+            col.job = None;
+            col.failed = true;
+            for node in col.nodes.values_mut() {
+                if matches!(node.state, NodeState::Pending) {
+                    node.state = NodeState::Failed;
+                }
+            }
+        }
+        self.drop_if_idle(c);
+    }
+
+    /// Applies job `id`'s result for column `c` (dropped unless the column still waits for it).
+    /// Returns the number of nodes lost to a too-big bucket.
+    pub(crate) fn apply_built(
+        &mut self,
+        c: ColumnKey,
+        id: u64,
+        band: LodColumn,
+        nodes: Vec<(i64, Built)>,
+        cov: &ChunkCoverage,
+    ) -> usize {
+        if !self.column_of_job(c, id) {
+            return 0;
+        }
+        let dim = self.dim;
+        let col = self
+            .columns
+            .get_mut(&c)
+            .expect("the column waits for the job");
+        col.job = None;
+        let first = col.band.is_none();
+        col.band = Some(band);
+        let wanted = col.plan.wanted;
+        // Records outside the band were pending guesses: they are uniform.
+        col.nodes
+            .retain(|&y, n| band.uniform_at(y).is_none() || n.available());
+        if first && let Some(inside) = intersect(wanted, Some((band.lo, band.hi - 1))) {
+            for y in inside.0..=inside.1 {
+                self.want_record(c, y);
+            }
+        }
+        let mut too_big = 0;
+        for (y, built) in nodes {
+            let key = c.node(dim, y);
+            let Some(node) = self.node_mut(key) else {
+                continue;
+            };
+            if !matches!(node.state, NodeState::Pending) {
+                continue;
+            }
+            let (blank, ready) = (
+                matches!(built, Built::Uniform | Built::Blank),
+                matches!(built, Built::Mesh(_)),
+            );
+            node.state = match built {
+                Built::Uniform | Built::Blank => NodeState::Blank,
+                Built::Mesh(mesh) => NodeState::Ready {
+                    mesh,
+                    sent: false,
+                    retry: None,
+                },
+                Built::TooBig => {
+                    too_big += 1;
+                    NodeState::Failed
+                }
+            };
+            let wanted = node.wanted;
+            if blank {
+                self.touch(key, cov);
+            } else if ready && wanted {
+                self.sends.push_back(key);
+            }
+        }
+        self.too_big += too_big;
+        if first {
+            // The uniform layers of the wanted interval are active now.
+            self.touch_uniform(c, wanted, cov);
+        }
+        self.note_work(c);
+        too_big
+    }
+
+    /// The renderer refused node `key`'s mesh (its arena is full): unavailable from now on,
+    /// sent again after [`REFUSED_RETRY`] once the arena has room.
+    pub(crate) fn refuse(&mut self, key: ChunkKey, now: Instant, cov: &ChunkCoverage) {
+        let Some(node) = self.node_mut(key) else {
+            return;
+        };
+        let NodeState::Ready { sent, retry, .. } = &mut node.state else {
+            return;
+        };
+        *sent = false;
+        *retry = Some(now + REFUSED_RETRY);
+        self.refusals += 1;
+        self.refused.push(key);
+        self.touch(key, cov);
+    }
+
+    /// The renderer lost every node (a resync): nothing is available until it is sent again,
+    /// the coarsest level first.
+    pub(crate) fn resync(&mut self, cov: &ChunkCoverage) {
+        let mut sent = Vec::new();
+        for (&c, col) in &mut self.columns {
+            for (&y, node) in &mut col.nodes {
+                if let NodeState::Ready { sent: s @ true, .. } = &mut node.state {
+                    *s = false;
+                    sent.push(c.node(self.dim, y));
+                }
+            }
+        }
+        for &key in &sent {
+            self.touch(key, cov);
+        }
+        // Every unsent wanted node, coarse to fine (the top level is the fill-first class).
+        let dim = self.dim;
+        let mut all: Vec<ChunkKey> = self
+            .columns
+            .iter()
+            .flat_map(|(&c, col)| {
+                col.nodes
+                    .iter()
+                    .filter(|(_, n)| {
+                        n.wanted && matches!(n.state, NodeState::Ready { sent: false, .. })
+                    })
+                    .map(move |(&y, _)| c.node(dim, y))
+            })
+            .collect();
+        all.sort_unstable_by_key(|k| (std::cmp::Reverse(k.lod), *k));
+        self.sends = all.into();
+        // Departed nodes are not available any more: they go now.
+        let departed: Vec<ChunkKey> = self.departed.iter().copied().collect();
+        for key in departed {
+            self.remove_node(key, cov);
+            self.drop_if_idle(ColumnKey::of(key));
+        }
+    }
+
+    /// The frame's ops: sends (at most `max_nodes` and `max_bytes` of quads, at least one),
+    /// refused nodes due again, departures whose parent is ready, then the masks that changed.
+    pub(crate) fn collect(
+        &mut self,
+        max_nodes: usize,
+        max_bytes: usize,
+        arena_free: Option<u64>,
+        now: Instant,
+        cov: &ChunkCoverage,
+    ) -> Vec<LodOp> {
+        // Refused nodes due again, once the arena reports room for them.
+        let mut i = 0;
+        while i < self.refused.len() {
+            let key = self.refused[i];
+            let due = match self.node(key) {
+                Some(Node {
+                    state: NodeState::Ready { retry, mesh, .. },
+                    ..
+                }) => Some(
+                    retry.is_none_or(|t| now >= t)
+                        && arena_free.is_none_or(|f| f >= u64::from(mesh.total_quads())),
+                ),
+                _ => None,
+            };
+            match due {
+                None => {
+                    self.refused.swap_remove(i);
+                }
+                Some(true) => {
+                    self.refused.swap_remove(i);
+                    if let Some(Node {
+                        state: NodeState::Ready { retry, .. },
+                        ..
+                    }) = self.node_mut(key)
+                    {
+                        *retry = None;
+                    }
+                    self.sends.push_back(key);
+                }
+                Some(false) => i += 1,
+            }
+        }
+        let (mut nodes, mut bytes) = (0, 0);
+        while let Some(key) = self.sends.pop_front() {
+            let size = match self.node(key) {
+                Some(Node {
+                    state:
+                        NodeState::Ready {
+                            mesh,
+                            sent: false,
+                            retry: None,
+                        },
+                    wanted: true,
+                    ..
+                }) => mesh.quads.len() * size_of::<boxel_mesh::PackedQuad>(),
+                _ => continue,
+            };
+            if nodes > 0 && (nodes >= max_nodes || bytes + size > max_bytes) {
+                self.sends.push_front(key);
+                break;
+            }
+            let mask = self.mask(key, cov);
+            let node = self.node_mut(key).expect("checked above");
+            node.mask = mask;
+            let NodeState::Ready { mesh, sent, .. } = &mut node.state else {
+                unreachable!("checked above");
+            };
+            *sent = true;
+            let mesh = Arc::clone(mesh);
+            self.ops.push(LodOp::Upsert { key, mesh, mask });
+            nodes += 1;
+            bytes += size;
+            self.touch(key, cov);
+        }
+        // Departed nodes whose parent is ready, or no longer wanted.
+        let departed: Vec<ChunkKey> = self.departed.iter().copied().collect();
+        for key in departed {
+            let up = parent(key);
+            if !self.wanted(up) || self.available(up) {
+                self.remove_node(key, cov);
+                self.drop_if_idle(ColumnKey::of(key));
+            }
+        }
+        // Masks.
+        let dirty: Vec<ChunkKey> = self.dirty.drain().collect();
+        for key in dirty {
+            let mask = self.mask(key, cov);
+            let Some(node) = self.node_mut(key) else {
+                continue;
+            };
+            if node.mask != mask {
+                node.mask = mask;
+                if node.sent() {
+                    self.ops.push(LodOp::Mask { key, mask });
+                }
+            }
+        }
+        std::mem::take(&mut self.ops)
+    }
+
+    /// Ready nodes waiting to be sent.
+    pub(crate) fn sends_waiting(&self) -> usize {
+        self.sends.len()
+    }
+
+    /// Drops everything: removes every node the renderer has and cancels every job.
+    pub(crate) fn clear(&mut self) -> Vec<LodOp> {
+        let mut ops = std::mem::take(&mut self.ops);
+        for (&c, col) in &mut self.columns {
+            col.cancel();
+            for (&y, node) in &col.nodes {
+                if node.sent() {
+                    ops.push(LodOp::Remove {
+                        key: c.node(self.dim, y),
+                    });
+                }
+            }
+        }
+        *self = Self::new(self.dim, self.levels);
+        ops
+    }
+
+    /// Per-level counts, and the wanted columns and those done (band known, every wanted node
+    /// built and sent, or lost). `floor` is the layer of each level that holds the generator's
+    /// floor (its nodes are counted apart too).
+    pub(crate) fn count(
+        &self,
+        floor: impl Fn(u8) -> Option<i64>,
+    ) -> (Vec<LevelStats>, usize, usize) {
+        let mut levels = vec![LevelStats::default(); usize::from(self.levels)];
+        let (mut wanted, mut done) = (0, 0);
+        for (c, col) in &self.columns {
+            let Some(level) = levels.get_mut(usize::from(c.level) - 1) else {
+                continue;
+            };
+            if col.plan.wanted.is_some() {
+                level.columns += 1;
+                wanted += 1;
+                let finished = col.failed
+                    || (col.band.is_some()
+                        && col.nodes.values().all(|n| {
+                            !n.wanted
+                                || matches!(n.state, NodeState::Blank | NodeState::Failed)
+                                || n.sent()
+                        }));
+                done += usize::from(finished);
+            }
+            let floor = floor(c.level);
+            for (&y, node) in &col.nodes {
+                match &node.state {
+                    NodeState::Ready { mesh, sent, .. } => {
+                        let quads = u64::from(mesh.total_quads());
+                        level.nodes += 1;
+                        level.quads += quads;
+                        if Some(y) == floor {
+                            level.floor_nodes += 1;
+                            level.floor_quads += quads;
+                        }
+                        if *sent && node.mask != 0xFF {
+                            level.drawn += 1;
+                        }
+                    }
+                    NodeState::Blank => level.blank += 1,
+                    NodeState::Failed => level.failed += 1,
+                    NodeState::Pending => level.pending += 1,
+                }
+            }
+        }
+        (levels, wanted, done)
+    }
+
+    /// Recomputes every covered bit from scratch (the reference for tests): the children map a
+    /// plain walk gives for the current records, bands and plans.
+    #[cfg(test)]
+    pub(crate) fn children_from_scratch(&self, cov: &ChunkCoverage) -> HashMap<ChunkKey, u8> {
+        // Covered state of every node position that may matter, bottom-up.
+        let mut covered: HashMap<ChunkKey, bool> = HashMap::default();
+        let mut out: HashMap<ChunkKey, u8> = HashMap::default();
+        for k in 1..self.levels {
+            // Candidate nodes: every wanted layer and record of level k, and every node whose
+            // children have bits.
+            let mut nodes: Vec<ChunkKey> = Vec::new();
+            for (c, col) in self.columns.iter().filter(|(c, _)| c.level == k) {
+                if let Some((lo, hi)) = col.plan.wanted {
+                    nodes.extend((lo..=hi).map(|y| c.node(self.dim, y)));
+                }
+                nodes.extend(col.nodes.keys().map(|&y| c.node(self.dim, y)));
+            }
+            nodes.extend(out.keys().filter(|key| key.lod == k).copied());
+            nodes.sort_unstable();
+            nodes.dedup();
+            for key in nodes {
+                let bits = if k == 1 {
+                    cov.get(key.pos).covered
+                } else {
+                    out.get(&key).copied().unwrap_or(0)
+                };
+                let is = self.active(key) || (!self.known_uniform(key) && bits == 0xFF);
+                covered.insert(key, is);
+                let up = parent(key);
+                if is && !self.known_uniform(up) {
+                    *out.entry(up).or_insert(0) |= octant_bit(key);
+                }
+            }
+        }
+        out
+    }
+
+    /// Ends the back-off of every refused node (tests: as if [`REFUSED_RETRY`] went by).
+    #[cfg(test)]
+    pub(crate) fn expire_refusals(&mut self) {
+        for key in self.refused.clone() {
+            if let Some(Node {
+                state: NodeState::Ready { retry, .. },
+                ..
+            }) = self.node_mut(key)
+            {
+                *retry = None;
+            }
+        }
+    }
+
+    /// The incremental children map (for tests against [`Tree::children_from_scratch`]).
+    #[cfg(test)]
+    pub(crate) fn children(&self) -> &HashMap<ChunkKey, u8> {
+        &self.children
+    }
+}

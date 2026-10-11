@@ -81,6 +81,7 @@ mod tests;
 pub mod visibility;
 
 pub mod jobs;
+pub mod lod;
 pub mod persist;
 pub mod reference;
 pub mod scheduler;

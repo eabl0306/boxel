@@ -33,6 +33,8 @@ lz4_flex.workspace = true
 [dev-dependencies]
 # The example content (#48), for tests, benches and examples only.
 boxel_demo.workspace = true
+# The `test:` blocks of boxel_voxel::testing (the LOD's unit tests).
+boxel_voxel = { workspace = true, features = ["testing"] }
 # Tests get system/component names in ECS diagnostics (dev-only; users opt in through boxel/debug).
 boxel_ecs = { workspace = true, features = ["debug"] }
 proptest.workspace = true
