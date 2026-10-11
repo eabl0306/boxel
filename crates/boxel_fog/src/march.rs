@@ -983,4 +983,186 @@ mod tests {
         let color = crate::pack::decode_color(c);
         assert!((color[0] - 1.0).abs() < 1e-3);
     }
+
+    /// One ray's transmittance and color per unit opacity, to the sky.
+    fn look(ml: &MarchLayer, eye: [f32; 3], dir: [f32; 3]) -> (f32, f32) {
+        let r = march(
+            &Ray {
+                eye,
+                dir,
+                depths: [f32::INFINITY; 4],
+            },
+            std::slice::from_ref(ml),
+            [0.0; 3],
+            256,
+        );
+        (
+            r.transmittance[0],
+            r.color[0][0] / (1.0 - r.transmittance[0]),
+        )
+    }
+
+    /// A plain layer has no face shading: a slab looks the same from above, below and inside.
+    #[test]
+    fn fog_has_no_faces_by_default() {
+        let layer = slab(8, 16, [1, 1, 1], 0.05);
+        for ml in [march_layer(&layer, 1.0), walked(&layer, 1.0)] {
+            for (eye, dir) in [
+                ([0.5, 30.5, 0.5], [0.1, -1.0, 0.0]),
+                ([0.5, 0.5, 0.5], [0.1, 1.0, 0.05]),
+                ([-20.5, 12.5, 0.5], [1.0, 0.01, 0.3]),
+            ] {
+                let (t, shade) = look(&ml, eye, dir);
+                assert!(t < 0.9, "{eye:?}: some fog");
+                assert!((shade - 1.0).abs() < 1e-4, "{eye:?}: shade {shade}");
+            }
+        }
+    }
+
+    /// The height shade goes from the bottom's brightness to the top's: a horizontal ray along
+    /// a row sees the brightness of its height.
+    #[test]
+    fn the_height_shades_the_band() {
+        let mut layer = slab(8, 16, [1, 1, 1], 0.2);
+        layer.height_shade = [0.5, 1.0];
+        for ml in [march_layer(&layer, 1.0), walked(&layer, 1.0)] {
+            for y in [8.5f32, 12.0, 15.5] {
+                let (_, shade) = look(&ml, [0.5, y, 0.5], [0.0, 0.0, 1.0]);
+                let want = 0.5 + 0.5 * (y - 8.0) / 8.0;
+                assert!((shade - want).abs() < 1e-4, "y {y}: {shade} vs {want}");
+            }
+        }
+    }
+
+    /// A soft noisy layer for the soft fog tests.
+    fn soft_bank(soft: f32) -> FogLayer {
+        let mut l = slab(-16, 16, [2, 2, 2], 0.3);
+        l.noise.dims = NoiseDims::Volume;
+        l.noise.scale = 4;
+        l.noise.octaves = 2;
+        l.threshold = 0.3;
+        l.softness = 0.5;
+        l.soft_distance = soft;
+        l
+    }
+
+    /// The middle of a cell reads the cell's own coverage: the soft fog is the cells' field
+    /// read between their middles.
+    #[test]
+    fn a_cell_middle_reads_its_cell() {
+        let ml = march_layer(&soft_bank(8.0), 0.5);
+        let p = &ml.params;
+        for x in -20..20 {
+            for (y, z) in [(-3, 5), (0, -7), (2, 0)] {
+                let d = [x, y, z];
+                let pos = std::array::from_fn(|a| p.grid[a] + (d[a] as f32 + 0.5) * 2.0);
+                assert_eq!(
+                    ml.soft_coverage(pos),
+                    noise::coverage(p, d).coverage as f32 / 4096.0,
+                    "{d:?}"
+                );
+            }
+        }
+    }
+
+    /// Inside the soft distance the march integrates the noise read along the ray: it matches
+    /// a fine numerical integral of [`MarchLayer::soft_coverage`], cell edges and all.
+    #[test]
+    fn the_soft_fog_integrates_the_noise_along_the_ray() {
+        let ml = march_layer(&soft_bank(16.0), 0.5);
+        let eye = [0.3, 0.7, 0.2];
+        let mut least = 1.0f32;
+        for dir in [
+            [0.3f32, 0.1, 1.0],
+            [-1.0, -0.2, 0.4],
+            [0.2, 0.9, -0.3],
+            [0.7, -0.4, -0.6],
+        ] {
+            let dir = norm(dir);
+            let depth = 12.0;
+            let r = march(
+                &Ray {
+                    eye,
+                    dir,
+                    depths: [depth; 4],
+                },
+                &[ml],
+                [0.0; 3],
+                256,
+            );
+            let n = 12_000;
+            let dt = depth / n as f32;
+            let tau: f32 = (0..n)
+                .map(|i| {
+                    let t = (i as f32 + 0.5) * dt;
+                    let pos = std::array::from_fn(|a| eye[a] + t * dir[a]);
+                    ml.params.density_log2e * ml.soft_coverage(pos) * dt
+                })
+                .sum();
+            let want = (-tau).exp2();
+            assert!(
+                (r.transmittance[0] - want).abs() < 3e-3,
+                "{dir:?}: {} vs {want}",
+                r.transmittance[0]
+            );
+            least = least.min(want);
+        }
+        assert!(least < 0.8, "some ray crosses fog ({least})");
+    }
+
+    /// Past the soft distance and its blend the fog is the cells' again, bit for bit.
+    #[test]
+    fn the_soft_fog_ends_past_its_blend() {
+        let soft = march_layer(&soft_bank(8.0), 0.5);
+        let cubic = march_layer(&soft_bank(0.0), 0.5);
+        assert_eq!(soft.soft, [8.0, 12.0]);
+        assert_eq!(cubic.soft, [0.0; 2]);
+        // From 30 blocks above the band: it starts more than 12 blocks away.
+        let ray = Ray {
+            eye: [0.5, 46.0, 0.5],
+            dir: [0.3, -1.0, 0.6],
+            depths: [f32::INFINITY, 40.0, 50.0, 70.0],
+        };
+        let a = march(&ray, &[soft], [0.2, 0.3, 0.9], 256);
+        let b = march(&ray, &[cubic], [0.2, 0.3, 0.9], 256);
+        assert_eq!(a, b);
+        // From inside, the soft fog changes what the near cells give.
+        let near = Ray {
+            eye: [0.5, 0.5, 0.5],
+            ..ray
+        };
+        assert_ne!(
+            march(&near, &[soft], [0.0; 3], 256),
+            march(&near, &[cubic], [0.0; 3], 256)
+        );
+    }
+
+    /// The soft fog's pieces are bounded: a ray that crosses the whole soft zone of a dense
+    /// noisy layer costs at most its cells plus a piece per block.
+    #[test]
+    fn the_soft_fog_is_bounded() {
+        let mut layer = soft_bank(32.0);
+        layer.density = 0.001;
+        let ml = march_layer(&layer, 0.5);
+        let r = march(
+            &Ray {
+                eye: [0.5, 0.5, 0.5],
+                dir: norm([0.6, 0.0, 0.8]),
+                depths: [f32::INFINITY; 4],
+            },
+            &[ml],
+            [0.0; 3],
+            40,
+        );
+        assert_eq!(r.steps, 40, "the budget counts cells, not pieces");
+    }
+
+    /// A rising threshold is never a uniform layer, even with threshold and softness 0.
+    #[test]
+    fn a_rise_is_not_uniform() {
+        let mut layer = slab(0, 16, [2, 2, 2], 0.3);
+        assert!(march_layer(&layer, 1.0).uniform);
+        layer.threshold_rise = 0.25;
+        assert!(!march_layer(&layer, 1.0).uniform);
+    }
 }
