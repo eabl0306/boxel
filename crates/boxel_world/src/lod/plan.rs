@@ -25,7 +25,6 @@
 use crate::interest::Viewer;
 use boxel_math::{DVec3, I64Vec3, Vec3};
 use boxel_voxel::{BlockPos, ChunkKey, ChunkPos, DimensionId, MAX_CHUNK_COORD};
-use foldhash::HashMap;
 use std::ops::RangeInclusive;
 
 /// Most LOD levels the settings allow (`k = 1..=6`). The GPU side keeps 4 bits, room for 15.
@@ -268,28 +267,45 @@ impl Eye {
         };
         DVec3::new(d(0), d(1), d(2)).length()
     }
+}
 
-    /// The layers of a level-`k` column with squared horizontal gap `gap2` whose nodes lie
-    /// nearer than `t`, clipped to the world limit.
-    pub(crate) fn layers_within(&self, k: u8, gap2: f64, t: f64) -> Option<Span> {
+/// The eye seen from the layers of one level: its layer and its height inside it, computed once
+/// per level of a plan.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EyeLayer {
+    layer: i64,
+    /// In `[0, e)`.
+    r: f64,
+    e: f64,
+    limit: i64,
+}
+
+impl EyeLayer {
+    pub(crate) fn new(eye: &Eye, k: u8) -> Self {
+        let e = node_edge(k);
+        Self {
+            layer: eye.block[1].div_euclid(e),
+            r: eye.block[1].rem_euclid(e) as f64 + eye.frac[1],
+            e: e as f64,
+            limit: world_limit(k),
+        }
+    }
+
+    /// The layers of a column with squared horizontal gap `gap2` whose nodes lie nearer than
+    /// `t`, clipped to the world limit.
+    pub(crate) fn span(&self, gap2: f64, t: f64) -> Option<Span> {
         let rest = t * t - gap2;
         if rest <= 0.0 {
             return None;
         }
         let g = rest.sqrt();
-        let e = node_edge(k);
-        // The eye's layer and its height inside it, in [0, e).
-        let layer = self.block[1].div_euclid(e);
-        let r = self.block[1].rem_euclid(e) as f64 + self.frac[1];
-        let ef = e as f64;
         // Layer `layer + j` spans [j e - r, (j + 1) e - r) from the eye: nearer than `g` when
         // `j e - r < g` and `(j + 1) e - r > -g`.
-        let lo = ((r - g) / ef).floor() as i64;
-        let hi = ((r + g) / ef).ceil() as i64 - 1;
-        let limit = world_limit(k);
+        let lo = ((self.r - g) / self.e).floor() as i64;
+        let hi = ((self.r + g) / self.e).ceil() as i64 - 1;
         let span = (
-            layer.saturating_add(lo).max(-limit),
-            layer.saturating_add(hi).min(limit),
+            self.layer.saturating_add(lo).max(-self.limit),
+            self.layer.saturating_add(hi).min(self.limit),
         );
         (span.0 <= span.1).then_some(span)
     }
@@ -366,95 +382,242 @@ impl ColumnKey {
     }
 }
 
-/// The wanted tree: one map of columns per level (`levels[k - 1]`).
-#[derive(Debug, Default)]
+/// The columns of one level of the wanted tree: a dense window of column plans (unwanted
+/// columns have no wanted layers), so lookups are an index and diffs a walk over two windows.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LevelPlan {
+    /// The window's lowest column `[x, z]`.
+    origin: [i64; 2],
+    /// Columns along x and z.
+    size: [usize; 2],
+    cells: Vec<ColumnPlan>,
+}
+
+impl LevelPlan {
+    /// A window over columns `min..=max` (empty if `min` passes `max` on an axis).
+    fn new(min: [i64; 2], max: [i64; 2]) -> Self {
+        if min[0] > max[0] || min[1] > max[1] {
+            return Self::default();
+        }
+        let size = [
+            (max[0] - min[0] + 1) as usize,
+            (max[1] - min[1] + 1) as usize,
+        ];
+        Self {
+            origin: min,
+            size,
+            cells: vec![ColumnPlan::default(); size[0] * size[1]],
+        }
+    }
+
+    fn index(&self, x: i64, z: i64) -> Option<usize> {
+        let dx = usize::try_from(x.checked_sub(self.origin[0])?).ok()?;
+        let dz = usize::try_from(z.checked_sub(self.origin[1])?).ok()?;
+        (dx < self.size[0] && dz < self.size[1]).then_some(dz * self.size[0] + dx)
+    }
+
+    /// The plan of column `[x, z]` if it is wanted.
+    pub(crate) fn get(&self, x: i64, z: i64) -> Option<&ColumnPlan> {
+        self.index(x, z)
+            .map(|i| &self.cells[i])
+            .filter(|c| c.wanted.is_some())
+    }
+
+    /// Sets column `[x, z]`, which lies in the window.
+    fn set(&mut self, x: i64, z: i64, plan: ColumnPlan) {
+        let i = self
+            .index(x, z)
+            .expect("a column inside the level's window");
+        self.cells[i] = plan;
+    }
+
+    /// The lowest and highest columns of the window (`None`: empty).
+    fn bounds(&self) -> Option<([i64; 2], [i64; 2])> {
+        (!self.cells.is_empty()).then(|| {
+            let o = self.origin;
+            (
+                o,
+                [
+                    o[0] + self.size[0] as i64 - 1,
+                    o[1] + self.size[1] as i64 - 1,
+                ],
+            )
+        })
+    }
+
+    /// The columns of the windows of `a` and `b` together, row by row.
+    pub(crate) fn union_columns(a: &Self, b: &Self) -> impl Iterator<Item = [i64; 2]> + use<> {
+        let (lo, hi) = match (a.bounds(), b.bounds()) {
+            (Some((a_min, a_max)), Some((b_min, b_max))) => (
+                [a_min[0].min(b_min[0]), a_min[1].min(b_min[1])],
+                [a_max[0].max(b_max[0]), a_max[1].max(b_max[1])],
+            ),
+            (Some(w), None) | (None, Some(w)) => w,
+            (None, None) => ([0, 0], [-1, -1]),
+        };
+        (lo[1]..=hi[1]).flat_map(move |z| (lo[0]..=hi[0]).map(move |x| [x, z]))
+    }
+
+    /// Every wanted column with its plan.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = ([i64; 2], &ColumnPlan)> + '_ {
+        let (o, w) = (self.origin, self.size[0].max(1));
+        self.cells
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.wanted.is_some())
+            .map(move |(i, c)| ([o[0] + (i % w) as i64, o[1] + (i / w) as i64], c))
+    }
+}
+
+/// The wanted tree: one window of columns per level (`levels[k - 1]`).
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Plan {
-    pub(crate) levels: Vec<HashMap<[i64; 2], ColumnPlan>>,
+    pub(crate) levels: Vec<LevelPlan>,
 }
 
 impl Plan {
     /// The plan of column `c` (`None`: unwanted).
+    #[cfg(test)]
     pub(crate) fn get(&self, c: ColumnKey) -> Option<ColumnPlan> {
         self.levels
             .get(usize::from(c.level).wrapping_sub(1))?
-            .get(&[c.x, c.z])
+            .get(c.x, c.z)
             .copied()
     }
 }
 
-/// Plans the wanted tree for `eye` under `th`; `old` gives each column's previous plan (for the
-/// hysteresis; `None` for a fresh plan).
-pub(crate) fn plan(
-    eye: &Eye,
-    th: &Thresholds,
-    old: impl Fn(ColumnKey) -> Option<ColumnPlan>,
-) -> Plan {
+/// How far the eye moves before level `k`'s plan is made again: an eighth of the hysteresis
+/// band of its own thresholds (`e_(k-1)` for the refinement, which is narrower than the top
+/// level's `e_K`), at least [`super::REPLAN_DISTANCE`]. Level 1 has no threshold of its own: it
+/// follows level 2's refinement.
+pub(crate) fn cadence(k: u8) -> f64 {
+    let band = node_edge(k.max(2) - 1) as f64;
+    (band / 8.0).max(super::REPLAN_DISTANCE)
+}
+
+/// Plans the wanted tree for `eye` under `th`, keeping levels above `redo` as they are in `old`
+/// (moved out of it: the eye has not crossed an eighth of their bands since they were made) and
+/// making levels `redo` and below again, with the hysteresis of their spans in `old`. `redo` is
+/// clamped to `1..=K`; an `old` with another number of levels counts as empty.
+pub(crate) fn plan(eye: &Eye, th: &Thresholds, old: &mut Plan, redo: u8) -> Plan {
     let top = th.levels();
-    let mut levels: Vec<HashMap<[i64; 2], ColumnPlan>> =
-        (0..top).map(|_| HashMap::default()).collect();
-    let refine = |key: ColumnKey, gap2: f64, wanted: Option<Span>, old: Option<ColumnPlan>| {
-        if key.level < 2 {
-            return None;
-        }
-        let below = key.level - 1;
+    if old.levels.len() != usize::from(top) {
+        old.levels = vec![LevelPlan::default(); usize::from(top)];
+    }
+    let redo = redo.clamp(1, top);
+    let mut levels: Vec<LevelPlan> = (1..=top)
+        .map(|k| {
+            if k > redo {
+                std::mem::take(&mut old.levels[usize::from(k) - 1])
+            } else {
+                LevelPlan::default()
+            }
+        })
+        .collect();
+    // The refined layers of a level-`k` column (`k >= 2`): nearer than `T_(k-1)`, kept until
+    // past it by `e_(k-1)`.
+    let refine = |at: &EyeLayer, k: u8, gap2: f64, wanted: Span, old: Option<&ColumnPlan>| {
+        let below = k - 1;
         let t = th.level(below);
-        let enter = eye.layers_within(key.level, gap2, t);
-        let stay = eye.layers_within(key.level, gap2, t + node_edge(below) as f64);
-        intersect(hysteresis(old.and_then(|o| o.refined), enter, stay), wanted)
+        let enter = at.span(gap2, t);
+        let stay = at.span(gap2, t + node_edge(below) as f64);
+        intersect(
+            hysteresis(old.and_then(|o| o.refined), enter, stay),
+            Some(wanted),
+        )
     };
-    // Top level: every column nearer than the horizon (plus its hysteresis).
-    let e = node_edge(top);
-    let h = th.horizon();
-    let stay = h + e as f64;
-    let reach = (stay / e as f64).ceil() as i64 + 1;
-    let limit = world_limit(top);
-    let (cx, cz) = (eye.block[0].div_euclid(e), eye.block[2].div_euclid(e));
-    let top_map = &mut levels[usize::from(top) - 1];
-    for z in (cz - reach).max(-limit)..=(cz + reach).min(limit) {
-        for x in (cx - reach).max(-limit)..=(cx + reach).min(limit) {
-            let key = ColumnKey { level: top, x, z };
-            let gap2 = eye.column_gap2(top, [x, z]);
-            if gap2 >= stay * stay {
-                continue;
+    if redo == top {
+        // Top level: every column nearer than the horizon (plus its hysteresis).
+        let at = EyeLayer::new(eye, top);
+        let e = node_edge(top);
+        let h = th.horizon();
+        let stay = h + e as f64;
+        let reach = (stay / e as f64).ceil() as i64 + 1;
+        let limit = world_limit(top);
+        let (cx, cz) = (eye.block[0].div_euclid(e), eye.block[2].div_euclid(e));
+        let min = [(cx - reach).max(-limit), (cz - reach).max(-limit)];
+        let max = [(cx + reach).min(limit), (cz + reach).min(limit)];
+        let prev = &old.levels[usize::from(top) - 1];
+        let mut map = LevelPlan::new(min, max);
+        for z in min[1]..=max[1] {
+            for x in min[0]..=max[0] {
+                let gap2 = eye.column_gap2(top, [x, z]);
+                if gap2 >= stay * stay {
+                    continue;
+                }
+                let before = prev.get(x, z);
+                let wanted = hysteresis(
+                    before.and_then(|o| o.wanted),
+                    at.span(gap2, h),
+                    at.span(gap2, stay),
+                );
+                let Some(span) = wanted else {
+                    continue;
+                };
+                let refined = if top >= 2 {
+                    refine(&at, top, gap2, span, before)
+                } else {
+                    None
+                };
+                map.set(x, z, ColumnPlan { wanted, refined });
             }
-            let prev = old(key);
-            let wanted = hysteresis(
-                prev.and_then(|o| o.wanted),
-                eye.layers_within(top, gap2, h),
-                eye.layers_within(top, gap2, stay),
-            );
-            if wanted.is_none() {
-                continue;
-            }
-            let refined = refine(key, gap2, wanted, prev);
-            top_map.insert([x, z], ColumnPlan { wanted, refined });
         }
+        levels[usize::from(top) - 1] = map;
     }
     // Finer levels: the children of the refined layers.
-    for k in (1..top).rev() {
+    for k in (1..redo.min(top - 1) + 1).rev() {
         let (finer, coarser) = levels.split_at_mut(usize::from(k));
         let parents = &coarser[0];
-        let map = &mut finer[usize::from(k) - 1];
         let limit = world_limit(k);
-        for (&[px, pz], parent) in parents {
+        // The window: twice the refined parents' bounds.
+        let mut bounds: Option<([i64; 2], [i64; 2])> = None;
+        for ([px, pz], parent) in parents.iter() {
+            if parent.refined.is_some() {
+                let (lo, hi) = bounds.get_or_insert(([px, pz], [px, pz]));
+                *lo = [lo[0].min(px), lo[1].min(pz)];
+                *hi = [hi[0].max(px), hi[1].max(pz)];
+            }
+        }
+        let Some((lo, hi)) = bounds else {
+            finer[usize::from(k) - 1] = LevelPlan::default();
+            continue;
+        };
+        let clip = |v: i64| v.clamp(-limit, limit);
+        let mut map = LevelPlan::new(
+            [clip(lo[0] * 2), clip(lo[1] * 2)],
+            [clip(hi[0] * 2 + 1), clip(hi[1] * 2 + 1)],
+        );
+        let prev = &old.levels[usize::from(k) - 1];
+        let at = EyeLayer::new(eye, k);
+        for ([px, pz], parent) in parents.iter() {
             let Some((a, b)) = parent.refined else {
                 continue;
             };
-            let wanted = intersect(Some((a * 2, b * 2 + 1)), Some((-limit, limit)));
+            let Some(wanted) = intersect(Some((a * 2, b * 2 + 1)), Some((-limit, limit))) else {
+                continue;
+            };
             for (dx, dz) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                let key = ColumnKey {
-                    level: k,
-                    x: px * 2 + dx,
-                    z: pz * 2 + dz,
-                };
-                if key.x.abs() > limit || key.z.abs() > limit || wanted.is_none() {
+                let (x, z) = (px * 2 + dx, pz * 2 + dz);
+                if x.abs() > limit || z.abs() > limit {
                     continue;
                 }
-                let gap2 = eye.column_gap2(k, [key.x, key.z]);
-                let refined = refine(key, gap2, wanted, old(key));
-                map.insert([key.x, key.z], ColumnPlan { wanted, refined });
+                let refined = if k >= 2 {
+                    let gap2 = eye.column_gap2(k, [x, z]);
+                    refine(&at, k, gap2, wanted, prev.get(x, z))
+                } else {
+                    None
+                };
+                map.set(
+                    x,
+                    z,
+                    ColumnPlan {
+                        wanted: Some(wanted),
+                        refined,
+                    },
+                );
             }
         }
+        finer[usize::from(k) - 1] = map;
     }
     Plan { levels }
 }

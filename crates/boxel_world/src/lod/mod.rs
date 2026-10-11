@@ -14,9 +14,10 @@
 //! Per frame (in `Update`, after the world's systems, chained [`LodSystems`]):
 //! 1. `Coverage`: the renderer's resyncs ([`LodResync`]) and feedback ([`LodFeedback`]), and the
 //!    full-detail coverage changes ([`LodCoverage`]).
-//! 2. `Plan`: the eye ([`LodFocus`], or the first [`ChunkViewer`](crate::ChunkViewer) without
-//!    one) and the thresholds; a new wanted tree after the eye moved 8 blocks or a threshold
-//!    changed; stale job priorities refreshed a batch at a time.
+//! 2. `Plan`: the eye ([`LodFocus`], or the first [`ChunkViewer`] without one) and the
+//!    thresholds; the wanted tree made again from the coarsest level whose eye moved an eighth of
+//!    its hysteresis band (8 blocks for level 2, 16 for level 3, ...), or all of it after a
+//!    threshold changed; stale job priorities refreshed a batch at a time.
 //! 3. `Dispatch`: finished jobs collected and new ones started by priority, within
 //!    [`LodSettings::frame_budget`] and the in-flight caps (fewer while the world is busy, so
 //!    near chunks come first).
@@ -55,7 +56,7 @@ use jobs::{JobInput, LodJobs, LodMessage};
 use plan::{ColumnKey, Eye, Plan};
 use tree::{Column, Tree};
 
-/// How far the eye moves before the wanted tree is planned again, in blocks.
+/// How far the eye moves at least before a level of the wanted tree is planned again, in blocks.
 pub const REPLAN_DISTANCE: f64 = 8.0;
 /// How far the eye moves, or how much it turns, before queued job priorities are refreshed.
 const STALE_DISTANCE: f64 = 32.0;
@@ -280,7 +281,7 @@ impl Plugin for LodWorldPlugin {
 
 /// Where the LOD looks from: the active camera's render origin and the eye's offset from it,
 /// its forward direction and its field of view. Written by the renderer's focus system before
-/// [`LodSystems`]; without it the eye is the first [`ChunkViewer`](crate::ChunkViewer) and every
+/// [`LodSystems`]; without it the eye is the first [`ChunkViewer`] and every
 /// direction counts as in view.
 #[derive(Resource, Clone, Copy, Debug, PartialEq)]
 pub struct LodFocus {
@@ -336,7 +337,8 @@ pub struct LevelStats {
     pub floor_quads: u64,
 }
 
-/// The LOD's counters, refreshed in `Collect` when something changed.
+/// The LOD's counters, refreshed every frame in `Collect` (the per-level counts are kept as nodes
+/// change, never by a walk).
 #[derive(Resource, Clone, Debug, Default, PartialEq)]
 pub struct LodStats {
     /// Why it draws nothing (`None`: it works).
@@ -345,7 +347,7 @@ pub struct LodStats {
     pub horizon: f64,
     /// Per level (`levels[k - 1]`).
     pub levels: Vec<LevelStats>,
-    /// Columns queued for a job.
+    /// Entries in the job queue (a few may be stale).
     pub queued_jobs: usize,
     /// Jobs running.
     pub in_flight: usize,
@@ -357,7 +359,8 @@ pub struct LodStats {
     pub job_p50: Duration,
     /// See `job_p50`.
     pub job_p99: Duration,
-    /// Share of the wanted columns built and sent (1: everything wanted is drawn).
+    /// Share of the wanted columns built at least once, at most 0.99 until every wanted node is
+    /// built and sent: 1 then.
     pub fill: f32,
     /// From the first plan to the first full fill.
     pub filled_after: Option<Duration>,
@@ -476,6 +479,10 @@ pub(crate) struct LodWorld {
     settings: Option<LodSettings>,
     error: Option<LodSettingsError>,
     planned: Option<Planned>,
+    /// The wanted tree the nodes follow.
+    plan: Plan,
+    /// The eye each level was last planned from (`level_eyes[k]`).
+    level_eyes: [Option<Eye>; MAX_LEVELS as usize + 1],
     view: View,
     /// Where priorities were last refreshed from.
     refreshed: Option<(Eye, Option<DVec3>)>,
@@ -490,18 +497,19 @@ pub(crate) struct LodWorld {
     arena_free: Option<u64>,
     started: Option<Instant>,
     filled_after: Option<Duration>,
-    changed: bool,
 }
 
 impl LodWorld {
     fn new(executor: Arc<dyn JobExecutor>) -> Self {
         Self {
-            tree: Tree::new(DimensionId(0), 1),
+            tree: Tree::new(DimensionId(0), 1, None),
             jobs: LodJobs::new(executor),
             jobs_of: HashMap::default(),
             settings: None,
             error: None,
             planned: None,
+            plan: Plan::default(),
+            level_eyes: [None; MAX_LEVELS as usize + 1],
             view: View {
                 forward: None,
                 half_angle: std::f64::consts::PI,
@@ -515,7 +523,6 @@ impl LodWorld {
             arena_free: None,
             started: None,
             filled_after: None,
-            changed: true,
         }
     }
 }
@@ -570,11 +577,12 @@ impl LodWorld {
         self.jobs.queue.clear();
         self.off = Some(why);
         self.planned = None;
+        self.plan = Plan::default();
+        self.level_eyes = [None; MAX_LEVELS as usize + 1];
         self.refreshed = None;
         self.refresh.clear();
         self.started = None;
         self.filled_after = None;
-        self.changed = true;
     }
 
     /// Starts over when the content (generator, registry), the dimension or the levels changed.
@@ -592,13 +600,15 @@ impl LodWorld {
         if !same || self.tree.dim != dim || self.tree.levels != levels {
             self.outbox.extend(self.tree.clear());
             self.jobs.queue.clear();
-            self.tree = Tree::new(dim, levels);
+            let floor = *content.generator.vertical_chunks().start();
+            self.tree = Tree::new(dim, levels, (floor != i64::MIN).then_some(floor));
             self.planned = None;
+            self.plan = Plan::default();
+            self.level_eyes = [None; MAX_LEVELS as usize + 1];
             self.refreshed = None;
             self.refresh.clear();
             self.started = None;
             self.filled_after = None;
-            self.changed = true;
         }
     }
 
@@ -628,13 +638,29 @@ impl LodWorld {
         }
         self.off = None;
         self.view = view;
-        let due = self
-            .planned
-            .is_none_or(|p| p.th != th || p.eye.distance_to(&eye) >= REPLAN_DISTANCE);
-        if due {
-            let tree = &self.tree;
-            let plan = plan::plan(&eye, &th, |c| tree.columns.get(&c).map(|col| col.plan));
-            self.apply_plan(&plan, eye, th, cov);
+        // The coarsest level due: all of them after a threshold changed, else the coarsest whose
+        // eye moved past its cadence (finer levels follow it).
+        let fresh = self.planned.is_none_or(|p| p.th != th);
+        let redo = (1..=th.levels())
+            .rev()
+            .find(|&k| {
+                fresh
+                    || self.level_eyes[usize::from(k)]
+                        .is_none_or(|e| e.distance_to(&eye) >= plan::cadence(k))
+            })
+            .unwrap_or(0);
+        if redo > 0 {
+            let redo = if fresh { th.levels() } else { redo };
+            let mut old = std::mem::take(&mut self.plan);
+            let new = plan::plan(&eye, &th, &mut old, redo);
+            self.tree.apply_plan(&old, &new, redo, cov);
+            self.plan = new;
+            for e in &mut self.level_eyes[1..=usize::from(redo)] {
+                *e = Some(eye);
+            }
+            self.planned = Some(Planned { eye, th });
+            self.started.get_or_insert_with(Instant::now);
+            self.queue_work();
         }
         // Stale priorities: a batch per frame after the eye moved or turned enough.
         let turned = |a: Option<DVec3>, b: Option<DVec3>| match (a, b) {
@@ -661,15 +687,6 @@ impl LodWorld {
             };
             self.queue(c, true);
         }
-    }
-
-    /// Applies `plan` (made from `eye` under `th`).
-    fn apply_plan(&mut self, plan: &Plan, eye: Eye, th: Thresholds, cov: &ChunkCoverage) {
-        self.tree.apply_plan(plan, cov);
-        self.planned = Some(Planned { eye, th });
-        self.started.get_or_insert_with(Instant::now);
-        self.changed = true;
-        self.queue_work();
     }
 
     /// Queues every column whose work may have changed.
@@ -784,7 +801,6 @@ impl LodWorld {
         let Some(c) = self.jobs_of.remove(&id) else {
             return;
         };
-        self.changed = true;
         match report.message {
             LodMessage::Built { column, nodes, .. } => {
                 let lost = self.tree.apply_built(c, id, column, nodes, cov);
@@ -875,42 +891,42 @@ impl LodWorld {
             let (nodes, bytes) = (s.publish_per_frame, s.upload_bytes_per_frame);
             ops.extend(self.tree.collect(nodes, bytes, self.arena_free, now, cov));
         }
-        if !ops.is_empty() {
-            self.changed = true;
-        }
         ops
     }
 
-    /// Fresh stats if something changed; `floor` is the generator's lowest chunk layer.
-    fn stats(&mut self, floor: Option<i64>, now: Instant) -> Option<LodStats> {
-        if !self.changed {
-            return None;
-        }
-        self.changed = false;
-        let (levels, wanted, done) = self.tree.count(|k| floor.map(|f| f >> k));
-        let fill = if wanted == 0 {
-            0.0
-        } else {
-            done as f32 / wanted as f32
-        };
-        if done == wanted
-            && wanted > 0
+    /// True if the LOD is on and has nothing left to do: no job queued or running, no mesh
+    /// waiting to be sent. Every wanted node is then built and sent (or lost).
+    fn filled(&self) -> bool {
+        self.off.is_none()
+            && self.planned.is_some()
+            && self.jobs.in_flight == 0
+            && self.jobs.queue.is_empty()
+            && self.tree.sends_waiting() == 0
+            && !self.tree.has_refused()
+    }
+
+    /// This frame's stats.
+    fn stats(&mut self, now: Instant) -> LodStats {
+        let filled = self.filled();
+        if filled
             && self.filled_after.is_none()
             && let Some(started) = self.started
         {
             self.filled_after = Some(now.saturating_duration_since(started));
         }
-        let queued = self
-            .tree
-            .columns
-            .values()
-            .filter(|c| c.ticket.is_some())
-            .count();
-        Some(LodStats {
+        let (wanted, known) = self.tree.columns_known();
+        let fill = if filled {
+            1.0
+        } else if wanted == 0 {
+            0.0
+        } else {
+            (known as f32 / wanted as f32).min(0.99)
+        };
+        LodStats {
             off: self.off,
             horizon: self.planned.map_or(0.0, |p| p.th.horizon()),
-            levels,
-            queued_jobs: queued,
+            levels: self.tree.counts().to_vec(),
+            queued_jobs: self.jobs.queue.len(),
             in_flight: self.jobs.in_flight,
             jobs_done: self.jobs.times.count(),
             jobs_failed: self.jobs.failed,
@@ -920,7 +936,7 @@ impl LodWorld {
             filled_after: self.filled_after,
             sends_waiting: self.tree.sends_waiting(),
             refused: self.tree.refusals,
-        })
+        }
     }
 
     /// True if jobs run or wait.
@@ -975,7 +991,6 @@ fn lod_coverage(
     let cov = coverage.coverage();
     if resyncs.read().count() > 0 {
         lod.tree.resync(cov);
-        lod.changed = true;
     }
     if !feedback.refused.is_empty() || feedback.arena_free_quads.is_some() {
         for key in std::mem::take(&mut feedback.refused) {
@@ -984,7 +999,6 @@ fn lod_coverage(
         if let Some(free) = feedback.arena_free_quads.take() {
             lod.arena_free = Some(free);
         }
-        lod.changed = true;
     }
     for p in changed {
         lod.tree.chunks_changed(p, cov);
@@ -1080,7 +1094,6 @@ fn lod_collect(
     mut ops: ResMut<LodOps>,
     coverage: Res<LodCoverage>,
     mut stats: ResMut<LodStats>,
-    content: Res<WorldContent>,
     world: Res<WorldSettings>,
     wanted: Option<ResMut<IdleWanted>>,
 ) {
@@ -1089,11 +1102,8 @@ fn lod_collect(
     if !out.is_empty() {
         ops.ops.extend(out);
     }
-    let start = *content.generator.vertical_chunks().start();
-    let floor = (start != i64::MIN).then_some(start);
-    if let Some(fresh) = lod.stats(floor, now) {
-        stats.set_if_neq(fresh);
-    }
+    let fresh = lod.stats(now);
+    stats.set_if_neq(fresh);
     if let Some(mut wanted) = wanted {
         wanted.want(world.idle_work && lod.has_job_work());
     }

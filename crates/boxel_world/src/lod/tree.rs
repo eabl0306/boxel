@@ -16,7 +16,7 @@
 //! marks masks dirty and queues sends; [`Tree::collect`] turns them into ops in the frame.
 use super::coverage::ChunkCoverage;
 use super::jobs::Built;
-use super::plan::{ColumnKey, ColumnPlan, Plan, Span, contains, intersect};
+use super::plan::{ColumnKey, ColumnPlan, LevelPlan, Plan, Span, contains, intersect};
 use super::{LevelStats, LodOp};
 use boxel_mesh::ChunkMesh;
 use boxel_voxel::{ChunkKey, ChunkPos, DimensionId};
@@ -214,10 +214,56 @@ pub(crate) struct Tree {
     pub(crate) refusals: usize,
     /// Nodes lost to a too-big bucket, since start.
     pub(crate) too_big: usize,
+    /// Per-level counts (`counts[k - 1]`), kept as records and plans change.
+    counts: Vec<LevelStats>,
+    /// Wanted columns whose band is known.
+    known: usize,
+    /// The generator's lowest chunk layer (its floor): level `k`'s floor layer is `floor >> k`.
+    floor: Option<i64>,
+}
+
+/// Adds (`add`) or takes away node `key`'s share of the per-level counts.
+fn tally(counts: &mut [LevelStats], floor: Option<i64>, key: ChunkKey, node: &Node, add: bool) {
+    let Some(l) = counts.get_mut(usize::from(key.lod).wrapping_sub(1)) else {
+        return;
+    };
+    let n = |v: &mut usize| {
+        if add {
+            *v += 1;
+        } else {
+            *v -= 1;
+        }
+    };
+    let q = |v: &mut u64, by: u64| {
+        if add {
+            *v += by;
+        } else {
+            *v -= by;
+        }
+    };
+    match &node.state {
+        NodeState::Ready { mesh, sent, .. } => {
+            let quads = u64::from(mesh.total_quads());
+            n(&mut l.nodes);
+            q(&mut l.quads, quads);
+            if floor.is_some_and(|f| f >> key.lod == key.pos.y) {
+                n(&mut l.floor_nodes);
+                q(&mut l.floor_quads, quads);
+            }
+            if *sent && node.mask != 0xFF {
+                n(&mut l.drawn);
+            }
+        }
+        NodeState::Blank => n(&mut l.blank),
+        NodeState::Pending => n(&mut l.pending),
+        NodeState::Failed => n(&mut l.failed),
+    }
 }
 
 impl Tree {
-    pub(crate) fn new(dim: DimensionId, levels: u8) -> Self {
+    /// An empty tree of `levels` levels in `dim`; `floor` is the generator's lowest chunk layer
+    /// (for the counts).
+    pub(crate) fn new(dim: DimensionId, levels: u8, floor: Option<i64>) -> Self {
         Self {
             dim,
             levels,
@@ -231,7 +277,33 @@ impl Tree {
             work: Vec::new(),
             refusals: 0,
             too_big: 0,
+            counts: vec![LevelStats::default(); usize::from(levels)],
+            known: 0,
+            floor,
         }
+    }
+
+    /// The per-level counts.
+    pub(crate) fn counts(&self) -> &[LevelStats] {
+        &self.counts
+    }
+
+    /// Wanted columns, and those whose band is known.
+    pub(crate) fn columns_known(&self) -> (usize, usize) {
+        (self.counts.iter().map(|l| l.columns).sum(), self.known)
+    }
+
+    /// Changes the record of `key` through `f`, keeping the counts.
+    fn update_node<R>(&mut self, key: ChunkKey, f: impl FnOnce(&mut Node) -> R) -> Option<R> {
+        let node = self
+            .columns
+            .get_mut(&ColumnKey::of(key))?
+            .nodes
+            .get_mut(&key.pos.y)?;
+        tally(&mut self.counts, self.floor, key, node, false);
+        let r = f(node);
+        tally(&mut self.counts, self.floor, key, node, true);
+        Some(r)
     }
 
     /// The record of node `key`.
@@ -399,6 +471,7 @@ impl Tree {
         let Some(node) = col.nodes.remove(&key.pos.y) else {
             return;
         };
+        tally(&mut self.counts, self.floor, key, &node, false);
         if node.sent() {
             self.ops.push(LodOp::Remove { key });
         }
@@ -435,23 +508,22 @@ impl Tree {
         }
     }
 
-    /// Applies a new plan: wanted intervals, departures, new records, uniform layers whose
-    /// active state changed. Coarse levels first, so departures see their parents' new plan.
-    pub(crate) fn apply_plan(&mut self, plan: &Plan, cov: &ChunkCoverage) {
-        let mut keys: Vec<ColumnKey> = self.columns.keys().copied().collect();
-        for (i, level) in plan.levels.iter().enumerate() {
-            let k = i as u8 + 1;
-            keys.extend(
-                level
-                    .keys()
-                    .filter(|&&[x, z]| !self.columns.contains_key(&ColumnKey { level: k, x, z }))
-                    .map(|&[x, z]| ColumnKey { level: k, x, z }),
-            );
-        }
-        keys.sort_unstable_by_key(|c| std::cmp::Reverse(c.level));
-        for c in keys {
-            let new = plan.get(c).unwrap_or_default();
-            self.set_plan(c, new, cov);
+    /// Applies plan `new` over `old` (the plan the tree follows; only levels `redo` and below
+    /// differ): wanted intervals, departures, new records, uniform layers whose active state
+    /// changed. Coarse levels first, so departures see their parents' new plan.
+    pub(crate) fn apply_plan(&mut self, old: &Plan, new: &Plan, redo: u8, cov: &ChunkCoverage) {
+        let empty = LevelPlan::default();
+        for k in (1..=redo.min(self.levels)).rev() {
+            let i = usize::from(k) - 1;
+            let before = old.levels.get(i).unwrap_or(&empty);
+            let after = new.levels.get(i).unwrap_or(&empty);
+            for [x, z] in LevelPlan::union_columns(before, after) {
+                let plan = after.get(x, z);
+                if before.get(x, z) != plan {
+                    let c = ColumnKey { level: k, x, z };
+                    self.set_plan(c, plan.copied().unwrap_or_default(), cov);
+                }
+            }
         }
     }
 
@@ -467,6 +539,17 @@ impl Tree {
             col.cancel();
         }
         let band = col.band;
+        if old.wanted.is_some() != new.wanted.is_some() {
+            let level = &mut self.counts[usize::from(c.level) - 1].columns;
+            let known = usize::from(band.is_some());
+            if new.wanted.is_some() {
+                *level += 1;
+                self.known += known;
+            } else {
+                *level -= 1;
+                self.known -= known;
+            }
+        }
         // Leaving layers: records depart, uniform layers stop being active.
         for span in minus(old.wanted, new.wanted).into_iter().flatten() {
             let leaving: Vec<i64> = self.columns[&c]
@@ -511,7 +594,9 @@ impl Tree {
                 }
             }
             None => {
-                col.nodes.insert(y, Node::pending());
+                let node = Node::pending();
+                tally(&mut self.counts, self.floor, key, &node, true);
+                col.nodes.insert(y, node);
             }
         }
     }
@@ -552,9 +637,12 @@ impl Tree {
         if let Some(col) = self.columns.get_mut(&c) {
             col.job = None;
             col.failed = true;
-            for node in col.nodes.values_mut() {
+            for (&y, node) in &mut col.nodes {
                 if matches!(node.state, NodeState::Pending) {
+                    let key = c.node(self.dim, y);
+                    tally(&mut self.counts, self.floor, key, node, false);
                     node.state = NodeState::Failed;
+                    tally(&mut self.counts, self.floor, key, node, true);
                 }
             }
         }
@@ -584,8 +672,20 @@ impl Tree {
         col.band = Some(band);
         let wanted = col.plan.wanted;
         // Records outside the band were pending guesses: they are uniform.
-        col.nodes
-            .retain(|&y, n| band.uniform_at(y).is_none() || n.available());
+        let outside: Vec<i64> = col
+            .nodes
+            .iter()
+            .filter(|&(&y, n)| band.uniform_at(y).is_some() && !n.available())
+            .map(|(&y, _)| y)
+            .collect();
+        for y in outside {
+            if let Some(node) = col.nodes.remove(&y) {
+                tally(&mut self.counts, self.floor, c.node(dim, y), &node, false);
+            }
+        }
+        if first && wanted.is_some() {
+            self.known += 1;
+        }
         if first && let Some(inside) = intersect(wanted, Some((band.lo, band.hi - 1))) {
             for y in inside.0..=inside.1 {
                 self.want_record(c, y);
@@ -594,29 +694,32 @@ impl Tree {
         let mut too_big = 0;
         for (y, built) in nodes {
             let key = c.node(dim, y);
-            let Some(node) = self.node_mut(key) else {
-                continue;
-            };
-            if !matches!(node.state, NodeState::Pending) {
+            if !self
+                .node(key)
+                .is_some_and(|n| matches!(n.state, NodeState::Pending))
+            {
                 continue;
             }
             let (blank, ready) = (
                 matches!(built, Built::Uniform | Built::Blank),
                 matches!(built, Built::Mesh(_)),
             );
-            node.state = match built {
+            too_big += usize::from(matches!(built, Built::TooBig));
+            let state = match built {
                 Built::Uniform | Built::Blank => NodeState::Blank,
                 Built::Mesh(mesh) => NodeState::Ready {
                     mesh,
                     sent: false,
                     retry: None,
                 },
-                Built::TooBig => {
-                    too_big += 1;
-                    NodeState::Failed
-                }
+                Built::TooBig => NodeState::Failed,
             };
-            let wanted = node.wanted;
+            let wanted = self
+                .update_node(key, |node| {
+                    node.state = state;
+                    node.wanted
+                })
+                .unwrap_or(false);
             if blank {
                 self.touch(key, cov);
             } else if ready && wanted {
@@ -635,14 +738,17 @@ impl Tree {
     /// The renderer refused node `key`'s mesh (its arena is full): unavailable from now on,
     /// sent again after [`REFUSED_RETRY`] once the arena has room.
     pub(crate) fn refuse(&mut self, key: ChunkKey, now: Instant, cov: &ChunkCoverage) {
-        let Some(node) = self.node_mut(key) else {
+        let refused = self.update_node(key, |node| {
+            let NodeState::Ready { sent, retry, .. } = &mut node.state else {
+                return false;
+            };
+            *sent = false;
+            *retry = Some(now + REFUSED_RETRY);
+            true
+        });
+        if refused != Some(true) {
             return;
-        };
-        let NodeState::Ready { sent, retry, .. } = &mut node.state else {
-            return;
-        };
-        *sent = false;
-        *retry = Some(now + REFUSED_RETRY);
+        }
         self.refusals += 1;
         self.refused.push(key);
         self.touch(key, cov);
@@ -654,9 +760,14 @@ impl Tree {
         let mut sent = Vec::new();
         for (&c, col) in &mut self.columns {
             for (&y, node) in &mut col.nodes {
-                if let NodeState::Ready { sent: s @ true, .. } = &mut node.state {
-                    *s = false;
-                    sent.push(c.node(self.dim, y));
+                if node.sent() {
+                    let key = c.node(self.dim, y);
+                    tally(&mut self.counts, self.floor, key, node, false);
+                    if let NodeState::Ready { sent: s, .. } = &mut node.state {
+                        *s = false;
+                    }
+                    tally(&mut self.counts, self.floor, key, node, true);
+                    sent.push(key);
                 }
             }
         }
@@ -749,13 +860,16 @@ impl Tree {
                 break;
             }
             let mask = self.mask(key, cov);
-            let node = self.node_mut(key).expect("checked above");
-            node.mask = mask;
-            let NodeState::Ready { mesh, sent, .. } = &mut node.state else {
-                unreachable!("checked above");
-            };
-            *sent = true;
-            let mesh = Arc::clone(mesh);
+            let mesh = self
+                .update_node(key, |node| {
+                    node.mask = mask;
+                    let NodeState::Ready { mesh, sent, .. } = &mut node.state else {
+                        unreachable!("checked above");
+                    };
+                    *sent = true;
+                    Arc::clone(mesh)
+                })
+                .expect("checked above");
             self.ops.push(LodOp::Upsert { key, mesh, mask });
             nodes += 1;
             bytes += size;
@@ -774,14 +888,15 @@ impl Tree {
         let dirty: Vec<ChunkKey> = self.dirty.drain().collect();
         for key in dirty {
             let mask = self.mask(key, cov);
-            let Some(node) = self.node_mut(key) else {
+            if self.node(key).is_none_or(|n| n.mask == mask) {
                 continue;
-            };
-            if node.mask != mask {
+            }
+            let sent = self.update_node(key, |node| {
                 node.mask = mask;
-                if node.sent() {
-                    self.ops.push(LodOp::Mask { key, mask });
-                }
+                node.sent()
+            });
+            if sent == Some(true) {
+                self.ops.push(LodOp::Mask { key, mask });
             }
         }
         std::mem::take(&mut self.ops)
@@ -790,6 +905,11 @@ impl Tree {
     /// Ready nodes waiting to be sent.
     pub(crate) fn sends_waiting(&self) -> usize {
         self.sends.len()
+    }
+
+    /// True if refused nodes wait to be sent again.
+    pub(crate) fn has_refused(&self) -> bool {
+        !self.refused.is_empty()
     }
 
     /// Drops everything: removes every node the renderer has and cancels every job.
@@ -805,57 +925,26 @@ impl Tree {
                 }
             }
         }
-        *self = Self::new(self.dim, self.levels);
+        *self = Self::new(self.dim, self.levels, self.floor);
         ops
     }
 
-    /// Per-level counts, and the wanted columns and those done (band known, every wanted node
-    /// built and sent, or lost). `floor` is the layer of each level that holds the generator's
-    /// floor (its nodes are counted apart too).
-    pub(crate) fn count(
-        &self,
-        floor: impl Fn(u8) -> Option<i64>,
-    ) -> (Vec<LevelStats>, usize, usize) {
+    /// The per-level counts and the wanted columns with a known band from a walk over every
+    /// record (the reference for tests against [`Tree::counts`] and [`Tree::columns_known`]).
+    #[cfg(test)]
+    pub(crate) fn count_from_scratch(&self) -> (Vec<LevelStats>, usize) {
         let mut levels = vec![LevelStats::default(); usize::from(self.levels)];
-        let (mut wanted, mut done) = (0, 0);
+        let mut known = 0;
         for (c, col) in &self.columns {
-            let Some(level) = levels.get_mut(usize::from(c.level) - 1) else {
-                continue;
-            };
             if col.plan.wanted.is_some() {
-                level.columns += 1;
-                wanted += 1;
-                let finished = col.failed
-                    || (col.band.is_some()
-                        && col.nodes.values().all(|n| {
-                            !n.wanted
-                                || matches!(n.state, NodeState::Blank | NodeState::Failed)
-                                || n.sent()
-                        }));
-                done += usize::from(finished);
+                levels[usize::from(c.level) - 1].columns += 1;
+                known += usize::from(col.band.is_some());
             }
-            let floor = floor(c.level);
             for (&y, node) in &col.nodes {
-                match &node.state {
-                    NodeState::Ready { mesh, sent, .. } => {
-                        let quads = u64::from(mesh.total_quads());
-                        level.nodes += 1;
-                        level.quads += quads;
-                        if Some(y) == floor {
-                            level.floor_nodes += 1;
-                            level.floor_quads += quads;
-                        }
-                        if *sent && node.mask != 0xFF {
-                            level.drawn += 1;
-                        }
-                    }
-                    NodeState::Blank => level.blank += 1,
-                    NodeState::Failed => level.failed += 1,
-                    NodeState::Pending => level.pending += 1,
-                }
+                tally(&mut levels, self.floor, c.node(self.dim, y), node, true);
             }
         }
-        (levels, wanted, done)
+        (levels, known)
     }
 
     /// Recomputes every covered bit from scratch (the reference for tests): the children map a

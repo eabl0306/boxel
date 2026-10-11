@@ -198,6 +198,11 @@ fn the_guard_turns_off_a_huge_vertical_radius_without_bounds() {
     assert!(!Thresholds::new(24, 4, keep).guard());
 }
 
+/// A plan with no history (no hysteresis).
+fn fresh_plan(eye: &Eye, th: &Thresholds) -> Plan {
+    plan::plan(eye, th, &mut Plan::default(), th.levels())
+}
+
 /// Wanted nodes whose layer meets blocks `-64..128` (the toy terrain's band), over every level.
 fn nodes_near_ground(p: &Plan) -> usize {
     p.levels
@@ -208,8 +213,8 @@ fn nodes_near_ground(p: &Plan) -> usize {
             let e = node_edge(k);
             let band = Some(((-64i64).div_euclid(e), 127i64.div_euclid(e)));
             level
-                .values()
-                .filter_map(|c| plan::intersect(c.wanted, band))
+                .iter()
+                .filter_map(|(_, c)| plan::intersect(c.wanted, band))
                 .map(|(lo, hi)| (hi - lo + 1) as usize)
                 .sum::<usize>()
         })
@@ -224,7 +229,7 @@ fn a_high_eye_over_a_fixed_height_world_plans_at_most_twice_the_nodes() {
         let keep = KeepExtent::around(12, u32::MAX, 2, eye.chunk().y, Some(&bounds));
         let th = Thresholds::new(24, 4, keep);
         assert!(!th.guard(), "y {y}");
-        (th, plan::plan(&eye, &th, |_| None))
+        (th, fresh_plan(&eye, &th))
     };
     let (ground_th, ground) = at(80.0);
     let (high_th, high) = at(3000.0);
@@ -273,7 +278,7 @@ proptest! {
         for k in 2..=4 {
             prop_assert!(th.level(k) >= th.level(k - 1) + 2.0 * node_edge(k) as f64);
         }
-        let p = plan::plan(&eye, &th, |_| None);
+        let p = fresh_plan(&eye, &th);
         // The keep region: columns within r + 1 + h, layers within v + 1 + h, clipped.
         let c = eye.chunk();
         let reach = i64::from(r) + 1 + i64::from(h);
@@ -366,7 +371,7 @@ fn brute_force(eye: &Eye, th: &Thresholds) -> BTreeSet<ChunkKey> {
 fn wanted_nodes(p: &Plan) -> BTreeSet<ChunkKey> {
     let mut out = BTreeSet::new();
     for (i, level) in p.levels.iter().enumerate() {
-        for (&[x, z], c) in level {
+        for ([x, z], c) in level.iter() {
             if let Some((lo, hi)) = c.wanted {
                 for y in lo..=hi {
                     out.insert(ChunkKey {
@@ -394,14 +399,14 @@ fn a_fresh_plan_is_the_brute_force_tree() {
     ] {
         let eye = Eye::from_world(at);
         let th = small_thresholds(&eye);
-        let p = plan::plan(&eye, &th, |_| None);
+        let p = fresh_plan(&eye, &th);
         assert_eq!(wanted_nodes(&p), brute_force(&eye, &th), "eye at {at}");
     }
 }
 
 /// The plan after `p`, from `eye` (hysteresis from `p`).
-fn replan(p: &Plan, eye: &Eye, th: &Thresholds) -> Plan {
-    plan::plan(eye, th, |c| p.get(c))
+fn replan(mut p: Plan, eye: &Eye, th: &Thresholds) -> Plan {
+    plan::plan(eye, th, &mut p, th.levels())
 }
 
 #[test]
@@ -409,17 +414,17 @@ fn moving_back_and_forth_inside_the_band_flips_nothing() {
     let a = Eye::from_world(DVec3::new(100.0, 70.0, 100.0));
     let b = Eye::from_world(DVec3::new(130.0, 75.0, 90.0));
     let th = small_thresholds(&a);
-    let mut p = plan::plan(&a, &th, |_| None);
+    let mut p = fresh_plan(&a, &th);
     // One round trip settles the hysteresis; after it, nothing changes.
-    p = replan(&p, &b, &th);
-    p = replan(&p, &a, &th);
+    p = replan(p, &b, &th);
+    p = replan(p, &a, &th);
     let at_a = wanted_nodes(&p);
-    p = replan(&p, &b, &th);
+    p = replan(p, &b, &th);
     let at_b = wanted_nodes(&p);
     for _ in 0..3 {
-        p = replan(&p, &a, &th);
+        p = replan(p, &a, &th);
         assert_eq!(wanted_nodes(&p), at_a);
-        p = replan(&p, &b, &th);
+        p = replan(p, &b, &th);
         assert_eq!(wanted_nodes(&p), at_b);
     }
 }
@@ -429,11 +434,11 @@ fn nothing_is_wanted_past_the_horizon_and_ancestors_stay() {
     let th0 = small_thresholds(&Eye::from_world(DVec3::ZERO));
     let limit = th0.horizon() + node_edge(th0.levels()) as f64;
     let mut eye = Eye::from_world(DVec3::new(3.0, 70.0, -5.0));
-    let mut p = plan::plan(&eye, &th0, |_| None);
+    let mut p = fresh_plan(&eye, &th0);
     // Walk away in steps; check after each replan.
     for step in 0..40 {
         let next = Eye::from_world(DVec3::new(3.0 + 37.0 * f64::from(step), 70.0, -5.0));
-        p = replan(&p, &next, &th0);
+        p = replan(p, &next, &th0);
         eye = next;
         for key in wanted_nodes(&p) {
             assert!(eye.distance(key) < limit, "{key:?} past H + e_K");
@@ -459,7 +464,7 @@ fn plans_far_from_the_origin_are_the_same_tree_moved() {
     let base = DVec3::new(37.25, 70.5, -12.75);
     let reference = {
         let eye = Eye::from_world(base);
-        wanted_nodes(&plan::plan(&eye, &small_thresholds(&eye), |_| None))
+        wanted_nodes(&fresh_plan(&eye, &small_thresholds(&eye)))
     };
     let top = 3u8;
     // Offsets that keep the top level's grid: multiples of its node edge.
@@ -469,7 +474,7 @@ fn plans_far_from_the_origin_are_the_same_tree_moved() {
             block: [base.x.floor() as i64 + shift, 70, -13 + shift],
             frac: [0.25, 0.5, 0.25],
         };
-        let p = plan::plan(&eye, &small_thresholds(&eye), |_| None);
+        let p = fresh_plan(&eye, &small_thresholds(&eye));
         let moved: BTreeSet<ChunkKey> = wanted_nodes(&p)
             .into_iter()
             .map(|k| {
@@ -494,7 +499,7 @@ fn no_node_is_wanted_past_the_world_limit() {
             DVec3::splat(MAX_BLOCK_COORD as f64),
         ] {
             let eye = Eye::from_world(corner);
-            let p = plan::plan(&eye, &th, |_| None);
+            let p = fresh_plan(&eye, &th);
             assert!(!wanted_nodes(&p).is_empty());
             for key in wanted_nodes(&p) {
                 let limit = MAX_CHUNK_COORD >> key.lod;
@@ -687,6 +692,20 @@ fn assert_bits_from_scratch(app: &App) {
         .filter(|(k, _)| !lod.tree.known_uniform(**k))
         .map(|(k, v)| (*k, *v))
         .collect();
+    for (c, col) in &lod.tree.columns {
+        assert_eq!(
+            col.plan,
+            lod.plan.get(*c).unwrap_or_default(),
+            "{c:?}: the tree follows its plan"
+        );
+    }
+    let (levels, known) = lod.tree.count_from_scratch();
+    assert_eq!(lod.tree.counts(), &levels[..], "incremental counts");
+    assert_eq!(
+        lod.tree.columns_known().1,
+        known,
+        "columns with a known band"
+    );
     let scratch = lod.tree.children_from_scratch(&cov);
     let mut keys: Vec<ChunkKey> = incremental.keys().chain(scratch.keys()).copied().collect();
     keys.sort_unstable();
@@ -1370,4 +1389,43 @@ fn chunk_coverage_from_a_map_matches_the_published_meshes() {
         assert!(cov.get(p).published & bit != 0 && cov.get(p).covered & bit != 0);
     }
     assert!(!cov.is_empty());
+}
+
+#[test]
+fn each_level_is_planned_again_after_an_eighth_of_its_band() {
+    let mut app = app(
+        Steps::new(20),
+        LodSettings {
+            levels: 3,
+            ..small()
+        },
+    );
+    let viewer = spawn(&mut app, DVec3::new(10.0, 60.0, 10.0));
+    let mut model = Model::default();
+    fill(&mut app, &mut model, 400);
+    let eyes = |app: &App| app.world().resource::<LodWorld>().level_eyes;
+    let start = eyes(&app);
+    assert_eq!(plan::cadence(2), 8.0);
+    assert_eq!(plan::cadence(3), 16.0);
+    let walk = |app: &mut App, model: &mut Model, dx: f64| {
+        app.world_mut()
+            .entity_mut(viewer)
+            .get_mut::<Transform>()
+            .expect("viewer")
+            .translation
+            .x += dx;
+        frame(app, model);
+        assert_bits_from_scratch(app);
+    };
+    // 10 blocks: levels 1 and 2 again, level 3 (cadence 16) as it was.
+    walk(&mut app, &mut model, 10.0);
+    let now = eyes(&app);
+    assert_ne!(now[2], start[2]);
+    assert_eq!(now[1], now[2]);
+    assert_eq!(now[3], start[3]);
+    // 10 more: 20 from level 3's eye, so every level.
+    walk(&mut app, &mut model, 10.0);
+    let later = eyes(&app);
+    assert_ne!(later[3], start[3]);
+    assert!(later[1..=3].iter().all(|e| *e == later[3]));
 }
