@@ -18,10 +18,12 @@
 //!   bumps at every level.
 //! - Cells, by the cell rule of [`boxel_worldgen::lod`] on those columns: a cell holding ground
 //!   (up to `t`) or tree is water if the sea lies on its ground (`t` under the sea level and
-//!   below the cell's top: the water then covers every column of the cell); else, in the cell
-//!   holding `h` or over it, a tree block as high as `h` (leaves over a log), and otherwise the
-//!   surface block of a column of height `h` at `min(top of the cell, h)`, with the sand of the
-//!   beaches. A cell without either is water if the sea fills half of it, else air.
+//!   below the cell's top: the water then covers every column of the cell) and stands over its
+//!   tree blocks (a canopy hanging over a sea column from the shore, at levels 1 and 2, is
+//!   leaves); else, in the cell holding `h` or over it, a tree block as high as `h` (leaves over
+//!   a log), and otherwise the surface block of a column of height `h` at
+//!   `min(top of the cell, h)`, with the sand of the beaches. A cell without either is water if
+//!   the sea fills half of it, else air.
 //!
 //! Left out: caves (the ground is solid down to `i64::MIN`), cave openings and plants (Empty at
 //! a distance anyway). The world floor of the forest and the terrain (bedrock with air under it)
@@ -328,8 +330,13 @@ impl Surface<'_> {
                 _ => BlockState::AIR,
             };
         }
-        // The sea over the ground, one block deep over every column at least.
-        if sea.is_some() && t < y1 {
+        // The sea over the ground, one block deep over every column at least, and over the tree
+        // blocks of the cell: a canopy hanging over a sea column above the water is leaves.
+        if let Some(sea) = sea
+            && t < y1
+            && sea.level >= y0
+            && tree.is_none_or(|top| top < sea.level.min(y1))
+        {
             return b.water;
         }
         // The surface block follows the corners' height. In the cell holding that height or
@@ -651,6 +658,36 @@ mod tests {
                 }
                 assert_eq!(cells.0.len(), LOD_PADDED_VOLUME);
             }
+        }
+    }
+
+    /// A canopy hanging over a sea column (a tree on a steep shore, its leaves crossing into the
+    /// next cell column at levels 1 and 2) is leaves where it stands above the water, as the cell
+    /// rule says: no water floats in the air. The sea surface under it stays water.
+    #[test]
+    fn a_canopy_over_the_sea_is_leaves() {
+        let registry = crate::blocks::registry();
+        let (forest, overworld, terrain) = (
+            ForestGenerator::default(),
+            OverworldGenerator::default(),
+            TerrainGenerator::default(),
+        );
+        let [surface, ..] = surfaces(&forest, &overworld, &terrain, &registry);
+        let sea = surface.sea.expect("the forest's sea");
+        // Ground 45 under the sea (46), leaves 52..=57 from a tree next to it.
+        let c = Column {
+            height: 44,
+            ground: 45,
+            leaves: (52, 57),
+            logs: NO_RUN,
+        };
+        assert!(sea.covers(c.ground) && sea.level == 46);
+        let b = &surface.blocks;
+        for s in [2, 4] {
+            assert_eq!(surface.cell(&c, 52, s), b.leaves, "cell size {s}");
+            assert_eq!(surface.cell(&c, 56, s), b.leaves, "cell size {s}");
+            assert_eq!(surface.cell(&c, 48, s), BlockState::AIR, "cell size {s}");
+            assert_eq!(surface.cell(&c, 46 / s * s, s), b.water, "cell size {s}");
         }
     }
 
