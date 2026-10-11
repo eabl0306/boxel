@@ -186,23 +186,23 @@ eso los valores por defecto se eligieron por cómo se ven y por su costo en la R
 - media resolución;
 - 64 celdas por rayo (`DEFAULT_MAX_STEPS`).
 
-`just perf-smoke` del 2026-10-10 sobre bac728d: el mismo binario con la niebla apagada y con
-`--fog both` (valle y nubes, el preset típico), 10 s por lado, radio 16, 1280x720, a las 12:00.
-La superficie es el overworld volando a 64 bloques por segundo; el bosque vuela a 32.
+`just perf-smoke` del 2026-10-10 sobre 62b83e5, con los presets suaves y las nubes volumétricas:
+el mismo binario con la niebla apagada y con `--fog both` (valle y nubes, el preset típico), 10 s
+por lado, radio 16, 1280x720, a las 12:00. La superficie es el overworld volando a 64 bloques por
+segundo; el bosque vuela a 32. El harness repitió cada par y dio lo mismo.
 
-| caso | fps | p50 ms | p99 ms | máx ms | frames > 6.94 ms |
-|---|---:|---:|---:|---:|---:|
-| RTX, superficie, sin tope | 2185 -> 1294 | 0.41 -> 0.67 | 1.00 -> 2.17 | 3.80 -> 5.22 | 0 -> 0 |
-| RTX, bosque, sin tope | 3889 -> 1683 | 0.23 -> 0.55 | 0.68 -> 1.83 | 4.27 -> 4.35 | 0 -> 0 |
-| 780M, superficie, sin tope | 550 -> 359 | 1.74 -> 2.54 | 4.25 -> 6.59 | 5.10 -> 8.12 | 0 -> 12 |
-| 780M, superficie, tope 144 | 143 -> 139 | 6.95 -> 6.95 | 7.69 -> 14.14 | 15.59 -> 16.82 | 725 -> 730 |
+| caso | fps | p50 ms | p99 ms | frames > 6.94 ms |
+|---|---:|---:|---:|---:|
+| RTX, superficie, sin tope | 1939 -> 947 | 0.48 -> 0.94 | 1.40 -> 2.72 | 0 -> 0 |
+| RTX, bosque, sin tope | 3903 -> 1146 | 0.23 -> 0.78 | 0.68 -> 2.34 | 0 -> 0 |
 
-En la 780M sin tope el harness repitió el par y dio lo mismo (553 -> 360 fps, 1 -> 9 frames de
-más de 6,94 ms). Con tope 144 la base ya tiene unos 700 frames lentos por el compositor, así que
-ahí cuentan los fps y el p99.
+En la RTX la niebla cuesta ahora de 0,46 a 0,55 ms por frame en la mediana y ningún frame pasa de
+6,94 ms. Antes de los cambios (bac728d, nubes planas de una octava, sin niebla suave) costaba de
+0,26 a 0,32 ms. Lo más probable es que la diferencia venga de las nubes: ruido 3D de dos octavas,
+casi sin tramos vacíos que saltar, y una banda de 32 bloques en vez de 4. Sobre bac728d la 780M
+pasaba de 550 a 359 fps sin tope (unos 0,8 ms en la mediana, de 9 a 12 frames lentos cada
+10 s); no se volvió a medir.
 
-En la RTX la niebla cuesta de 0,26 a 0,32 ms por frame en la mediana y ningún frame pasa de
-6,94 ms. En la 780M cuesta unos 0,8 ms en la mediana y deja de 9 a 12 frames lentos cada 10 s.
 No se ajustó para que entre: queda en una issue de prioridad baja, con estas perillas (todas del
 juego):
 
