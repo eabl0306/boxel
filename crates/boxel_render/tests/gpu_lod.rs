@@ -1,0 +1,1024 @@
+//! The far LOD of ADR 0031 on every tier, with nodes built by hand from the demo forest's own LOD
+//! source (`boxel_mesh::lod`, as the world side's column jobs build them). Self-skips without an
+//! adapter unless `BOXEL_REQUIRE_GPU=1`; run with `--test-threads=1` like the other GPU tests.
+//!
+//! - **Zero cost:** a renderer without LOD input, with LOD that is off, without a horizon, with
+//!   no node, and after the LOD is dropped draws the same pixels and (but with no node, where the
+//!   far plane and the fog move) writes the same View uniform; no LOD draw.
+//! - **Tiers:** a scene of full-detail chunks (a stone floor and a water wall, drawn after the
+//!   LOD) and LOD nodes of levels 1 to 4 looks the same on every tier of an adapter.
+//! - **Octant masks:** a node with some octants hidden draws exactly what the node without their
+//!   quads draws, with full-detail chunks in those octants.
+//! - **Origins:** the scene moved far from the origin, across the `i32` edges, draws the same
+//!   pixels.
+//! - **GL:** on GL backends the LOD stays off and the image is the one without LOD.
+//! - **Smoke:** `RendererSmokeTest { lod: true }` passes on every tier at both levels; a failure
+//!   turns the LOD off and keeps the tier.
+//! - **Presets:** switching the arena size (far, extreme, near) rebuilds the LOD pass; refilled,
+//!   it draws what a fresh pass draws, with no refusal.
+//!
+//! Failing images are saved under `CARGO_TARGET_TMPDIR/gpu_lod/` (every image with
+//! `GPU_LOD_SAVE=1`).
+#![expect(clippy::print_stderr, reason = "test progress and failure details")]
+use boxel_camera::{Camera, CameraView};
+use boxel_demo::worldgen::ForestGenerator;
+use boxel_gfx::{
+    AdapterCaps, GlVersion, RgbaImage, SmokeContext, SmokeLevel, SmokeTest, Tier, floors,
+    gpu_tests_required, read_texture_rgba8, run_in_error_scopes, submit_and_wait, tier_request,
+};
+use boxel_math::{DVec3, I64Vec3, UVec2};
+use boxel_mesh::lod::{LodMaterials, mesh_node, octant_of};
+use boxel_mesh::{
+    BUCKET_COUNT, ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher, PaddedChunk,
+};
+use boxel_render::lod::{LodInput, LodOp, LodSettings};
+use boxel_render::{
+    DEFAULT_SKY_COLOR, RendererConfig, RendererSmokeTest, TranslucentSort, ViewParams,
+    VoxelRenderer,
+};
+use boxel_transform::Transform;
+use boxel_voxel::{
+    BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, DimensionId, LocalPos,
+};
+use boxel_worldgen::WorldGenerator;
+use boxel_worldgen::lod::{LodNode, LodRequest, LodScratch};
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, OnceLock};
+
+const WIDTH: u32 = 320;
+const HEIGHT: u32 = 180;
+/// Pixels may differ between tiers in at most this fraction (channel tolerance 2).
+const MAX_TIER_DIFF: f64 = 0.001;
+/// The horizon the tests draw to.
+const HORIZON: f32 = 4096.0;
+/// The level-4 node edge: the scene moves in whole nodes of every level.
+const TOP_EDGE: i64 = 512;
+/// `gpu_terrain.rs`'s far shifts cut to whole level-4 nodes: across `+-2^31` in x, z and y, past
+/// it, and `2^40` away.
+const FAR_SHIFTS: [I64Vec3; 5] = [
+    I64Vec3::new((1 << 31) - TOP_EDGE, 0, -(1 << 31) + TOP_EDGE),
+    I64Vec3::new((1 << 31) + (1 << 20), 0, -(1 << 31) - (1 << 20)),
+    I64Vec3::new(
+        (1 << 40) + (1 << 31) - TOP_EDGE,
+        0,
+        -(1 << 40) - (1 << 31) + TOP_EDGE,
+    ),
+    I64Vec3::new(-(1 << 35), (1 << 31) - TOP_EDGE, 1 << 35),
+    I64Vec3::new(1 << 31, -(1 << 31) - TOP_EDGE, 0),
+];
+
+// ---------------------------------------------------------------- adapters (as gpu_fog.rs)
+
+/// Headless instance (`WGPU_BACKEND` or Vulkan + GL) and its adapters filtered by
+/// `WGPU_ADAPTER_NAME` (case-insensitive substring).
+fn adapters() -> (wgpu::Instance, Vec<wgpu::Adapter>) {
+    let instance = wgpu::Instance::new({
+        let mut d = wgpu::InstanceDescriptor::new_without_display_handle();
+        d.flags = wgpu::InstanceFlags::empty();
+        d.backends = wgpu::Backends::from_env()
+            .filter(|b| !b.is_empty())
+            .unwrap_or(wgpu::Backends::VULKAN | wgpu::Backends::GL);
+        d
+    });
+    let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+    let wanted = std::env::var("WGPU_ADAPTER_NAME")
+        .ok()
+        .map(|n| n.to_lowercase())
+        .filter(|n| !n.is_empty());
+    let adapters = adapters
+        .into_iter()
+        .filter(|a| {
+            wanted
+                .as_ref()
+                .is_none_or(|n| a.get_info().name.to_lowercase().contains(n))
+        })
+        .collect();
+    (instance, adapters)
+}
+
+/// The tiers of `gpu_tiers.rs::allowed_tiers`.
+fn allowed_tiers(caps: &AdapterCaps) -> Vec<Tier> {
+    let mut tiers = Vec::new();
+    let high = wgpu::Features::MULTI_DRAW_INDIRECT_COUNT | wgpu::Features::INDIRECT_FIRST_INSTANCE;
+    let storage = caps
+        .downlevel
+        .flags
+        .contains(wgpu::DownlevelFlags::VERTEX_STORAGE)
+        && caps.limits.max_storage_buffers_per_shader_stage >= floors::STORAGE_BUFFERS_PER_STAGE
+        && (caps.info.backend != wgpu::Backend::Gl
+            || caps
+                .gl_version
+                .is_some_and(GlVersion::supports_storage_and_compute));
+    if storage
+        && caps.features.contains(high)
+        && caps
+            .downlevel
+            .flags
+            .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
+        && caps.info.backend == wgpu::Backend::Vulkan
+    {
+        tiers.push(Tier::High);
+    }
+    if storage {
+        tiers.push(Tier::Mid);
+    }
+    if caps.features.contains(wgpu::Features::IMMEDIATES)
+        && caps.limits.max_immediate_size >= floors::IMMEDIATE_SIZE
+    {
+        tiers.push(Tier::Low);
+    }
+    tiers
+}
+
+type Errors = Arc<Mutex<Vec<String>>>;
+
+/// A device shaped like the one selection would create for `tier`, collecting uncaptured
+/// errors.
+fn device_for(
+    adapter: &wgpu::Adapter,
+    caps: &AdapterCaps,
+    tier: Tier,
+) -> Result<(wgpu::Device, wgpu::Queue, Errors), String> {
+    let request = tier_request(tier, &caps.limits);
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("gpu_lod"),
+        required_features: request.features,
+        required_limits: request.limits,
+        ..Default::default()
+    }))
+    .map_err(|e| format!("request_device: {e}"))?;
+    let errors = Arc::new(Mutex::new(Vec::new()));
+    let sink = errors.clone();
+    device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
+        if let Ok(mut errors) = sink.lock() {
+            errors.push(e.to_string());
+        }
+    }));
+    Ok((device, queue, errors))
+}
+
+fn adapter_label(caps: &AdapterCaps) -> String {
+    format!("{} ({:?})", caps.info.name, caps.info.backend)
+}
+
+fn take_errors(errors: &Errors) -> Result<(), String> {
+    let errors = errors.lock().map(|e| e.clone()).unwrap_or_default();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("uncaptured errors: {errors:?}"))
+    }
+}
+
+/// One tier of one adapter.
+struct Gpu<'a> {
+    label: &'a str,
+    tier: Tier,
+    device: &'a wgpu::Device,
+    queue: &'a wgpu::Queue,
+    caps: &'a AdapterCaps,
+}
+
+impl Gpu<'_> {
+    /// True if the renderer keeps the LOD off here (a GL backend).
+    fn gl(&self) -> bool {
+        self.caps.info.backend == wgpu::Backend::Gl
+    }
+
+    fn name(&self, what: &str) -> String {
+        format!("{}_{}_{what}", self.label, self.tier)
+    }
+}
+
+/// Runs `check` on every tier of every adapter (in tier order, High first); returns the report.
+/// Panics with every failure at `finish`.
+fn for_every_tier(mut check: impl FnMut(&Gpu<'_>, &mut Report)) -> Report {
+    let (_instance, adapters) = adapters();
+    let mut report = Report::new();
+    if adapters.is_empty() {
+        assert!(!gpu_tests_required(), "BOXEL_REQUIRE_GPU=1 but no adapter");
+        eprintln!("skipping: no adapter");
+        return report;
+    }
+    for adapter in &adapters {
+        let caps = AdapterCaps::from_adapter(adapter);
+        let label = adapter_label(&caps);
+        for tier in allowed_tiers(&caps) {
+            let (device, queue, errors) = match device_for(adapter, &caps, tier) {
+                Ok(d) => d,
+                Err(e) => {
+                    report.fail(format!("{label} {tier}: {e}"), &[]);
+                    continue;
+                }
+            };
+            let gpu = Gpu {
+                label: &label,
+                tier,
+                device: &device,
+                queue: &queue,
+                caps: &caps,
+            };
+            check(&gpu, &mut report);
+            if let Err(e) = take_errors(&errors) {
+                report.fail(format!("{label} {tier}: {e}"), &[]);
+            }
+            report.tiers += 1;
+        }
+    }
+    report
+}
+
+// ---------------------------------------------------------------- scenes
+
+fn registry() -> &'static BlockRegistry {
+    static REGISTRY: OnceLock<BlockRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(boxel_demo::blocks::registry)
+}
+
+/// The real mesher's mesh of one chunk whose blocks `block(local)` gives (air around it).
+fn mesh_chunk(block: impl Fn(u32, u32, u32) -> &'static str) -> ChunkMesh {
+    let registry = registry();
+    let mut dense = vec![BlockState::AIR; 32 * 32 * 32];
+    for x in 0..32 {
+        for y in 0..32 {
+            for z in 0..32 {
+                let name = block(x, y, z);
+                if name != "air" {
+                    dense[LocalPos::new(x, y, z).index()] = registry.by_name(name).expect(name);
+                }
+            }
+        }
+    }
+    let chunk = ChunkData::from_dense(&dense);
+    let input = MeshInput {
+        center: &chunk,
+        neighbors: [None; 26],
+        light: None,
+    };
+    Mesher::new().mesh_chunk(
+        &input,
+        &MaterialTable::from_registry(registry),
+        MeshOptions::default(),
+    )
+}
+
+/// Full-detail chunks near the camera, `(chunk position, mesh)`: a stone floor (top at y 68)
+/// under it and a free-standing water wall 40 blocks ahead (blocks y 96..120, z -42..-40), drawn
+/// after the LOD with the LOD behind it.
+fn full_detail() -> Vec<(I64Vec3, ChunkMesh)> {
+    let floor = mesh_chunk(|_, y, _| if y < 4 { "boxel:stone" } else { "air" });
+    let mut out = Vec::new();
+    for cx in -1..=0 {
+        for cz in -2..=0 {
+            out.push((I64Vec3::new(cx, 2, cz), floor.clone()));
+        }
+    }
+    let wall = mesh_chunk(|_, y, z| {
+        if y < 24 && (22..24).contains(&z) {
+            "boxel:water"
+        } else {
+            "air"
+        }
+    });
+    out.push((I64Vec3::new(0, 3, -2), wall));
+    out
+}
+
+/// The node of `key` from the demo forest's LOD source, meshed as a column job does.
+struct NodeBuilder {
+    forest: ForestGenerator,
+    materials: LodMaterials,
+    scratch: LodScratch,
+    padded: PaddedChunk,
+    mesher: Mesher,
+}
+
+impl NodeBuilder {
+    fn new() -> Self {
+        Self {
+            forest: ForestGenerator::default(),
+            materials: LodMaterials::from_registry(registry()),
+            scratch: LodScratch::default(),
+            padded: PaddedChunk::new(),
+            mesher: Mesher::new(),
+        }
+    }
+
+    /// Every non-empty node of column `[x, z]` of `level`.
+    fn column(&mut self, level: u8, x: i64, z: i64, out: &mut Vec<(ChunkKey, Arc<ChunkMesh>)>) {
+        let source = self.forest.lod().expect("the forest has a LOD source");
+        let req = LodRequest {
+            dim: DimensionId(0),
+            level,
+            column: [x, z],
+            layers: -2..=4,
+        };
+        let (materials, padded, mesher) = (&self.materials, &mut self.padded, &mut self.mesher);
+        source.column(&req, registry(), &mut self.scratch, &mut |y, node| {
+            if let LodNode::Cells(cells) = node {
+                let mut mesh = ChunkMesh::default();
+                materials.fill(&cells.0[..], padded);
+                mesh_node(mesher, padded, materials, level, &mut mesh);
+                if !mesh.is_empty() {
+                    out.push((req.key(y), Arc::new(mesh)));
+                }
+            }
+        });
+    }
+}
+
+/// LOD nodes of levels 1 to 4 in disjoint bands ahead of the camera (along -z), none in the
+/// full-detail chunks: level `k` covers x in `[-2 e, 2 e)` and z in `[-4 e, -2 e)` with
+/// `e = 32 * 2^k` (level 1: z from -256 to -128; level 4: from -2048 to -1024).
+fn lod_nodes() -> &'static [(ChunkKey, Arc<ChunkMesh>)] {
+    static NODES: OnceLock<Vec<(ChunkKey, Arc<ChunkMesh>)>> = OnceLock::new();
+    NODES.get_or_init(|| {
+        let mut builder = NodeBuilder::new();
+        let mut out = Vec::new();
+        for level in 1..=4u8 {
+            for x in -2..2 {
+                for z in -4..-2 {
+                    builder.column(level, x, z, &mut out);
+                }
+            }
+        }
+        for level in 1..=4u8 {
+            assert!(
+                out.iter().any(|(k, _)| k.lod == level),
+                "no level-{level} node"
+            );
+        }
+        let quads: u32 = out.iter().map(|(_, m)| m.total_quads()).sum();
+        eprintln!("gpu_lod: {} LOD nodes, {quads} quads", out.len());
+        out
+    })
+}
+
+/// `nodes` moved by `shift` blocks (whole level-4 nodes).
+fn shifted(
+    nodes: &[(ChunkKey, Arc<ChunkMesh>)],
+    shift: I64Vec3,
+) -> Vec<(ChunkKey, Arc<ChunkMesh>)> {
+    nodes
+        .iter()
+        .map(|(k, m)| {
+            let b = 5 + u32::from(k.lod);
+            let pos = ChunkPos::new(
+                k.pos.x + (shift.x >> b),
+                k.pos.y + (shift.y >> b),
+                k.pos.z + (shift.z >> b),
+            );
+            (ChunkKey { pos, ..*k }, Arc::clone(m))
+        })
+        .collect()
+}
+
+/// A camera at `eye` looking at `target`, for a `WIDTH x HEIGHT` target.
+fn look(eye: DVec3, target: DVec3) -> ViewParams {
+    let d = (target - eye).as_vec3();
+    let yaw = (-d.x).atan2(-d.z);
+    let pitch = d.y.atan2(d.x.hypot(d.z));
+    let camera = Camera::default();
+    let transform = Transform::from_yaw_pitch(eye, yaw, pitch);
+    let view = CameraView::compute(&camera, &transform, WIDTH as f32 / HEIGHT as f32);
+    ViewParams::from_camera(&view, &camera, DEFAULT_SKY_COLOR, 0.6)
+}
+
+/// The scene's camera, moved by `shift`: over the floor, through the water wall, toward the
+/// LOD bands.
+fn scene_view(shift: I64Vec3) -> ViewParams {
+    let s = shift.as_dvec3();
+    look(
+        DVec3::new(16.5, 110.0, 20.5) + s,
+        DVec3::new(16.0, 50.0, -600.0) + s,
+    )
+}
+
+/// The default settings with an arena of `arena_quads`.
+fn settings(arena_quads: u32) -> LodSettings {
+    LodSettings {
+        arena_quads,
+        ..LodSettings::default()
+    }
+}
+
+/// An input upserting `nodes` (no octant hidden), drawing to [`HORIZON`].
+fn lod_input(settings: LodSettings, nodes: &[(ChunkKey, Arc<ChunkMesh>)]) -> LodInput {
+    LodInput {
+        ops: nodes
+            .iter()
+            .map(|(key, mesh)| LodOp::Upsert {
+                key: *key,
+                mesh: Arc::clone(mesh),
+                mask: 0,
+            })
+            .collect(),
+        ..LodInput::new(settings, Some(HORIZON))
+    }
+}
+
+// ---------------------------------------------------------------- rendering
+
+fn new_renderer(gpu: &Gpu<'_>) -> Result<VoxelRenderer, String> {
+    let registry = registry();
+    let config = RendererConfig {
+        arena_quads: 1 << 18,
+        max_chunk_slots: 256,
+        translucent_sort: TranslucentSort::Inline,
+    };
+    VoxelRenderer::new(
+        gpu.device,
+        gpu.queue,
+        gpu.tier,
+        &config,
+        &boxel_render::generate_block_textures(registry.textures()),
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        UVec2::new(WIDTH, HEIGHT),
+    )
+    .map_err(|e| format!("VoxelRenderer::new: {e}"))
+}
+
+/// Uploads `chunks` moved by `shift` blocks (whole chunks).
+fn load_world(
+    renderer: &mut VoxelRenderer,
+    chunks: &[(I64Vec3, ChunkMesh)],
+    shift: I64Vec3,
+) -> Result<(), String> {
+    renderer.clear_chunks();
+    for (i, (pos, mesh)) in chunks.iter().enumerate() {
+        renderer
+            .upsert_chunk(i as u64, *pos * 32 + shift, Arc::new(mesh.clone()))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Renders one frame and reads the main color back.
+fn render(
+    gpu: &Gpu<'_>,
+    renderer: &mut VoxelRenderer,
+    view: &ViewParams,
+) -> Result<RgbaImage, String> {
+    run_in_error_scopes(gpu.device, || {
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("gpu_lod"),
+            });
+        renderer.render(gpu.device, gpu.queue, &mut encoder, view);
+        submit_and_wait(gpu.device, gpu.queue, encoder)
+    })?;
+    read_texture_rgba8(gpu.device, gpu.queue, renderer.main_color())
+}
+
+/// The scene moved by `shift`: full detail, then the LOD nodes in one input.
+fn render_scene(gpu: &Gpu<'_>, shift: I64Vec3) -> Result<(RgbaImage, VoxelRenderer), String> {
+    let mut renderer = new_renderer(gpu)?;
+    load_world(&mut renderer, &full_detail(), shift)?;
+    renderer.set_lod(
+        gpu.device,
+        Some(lod_input(settings(1 << 20), &shifted(lod_nodes(), shift))),
+    );
+    let image = render(gpu, &mut renderer, &scene_view(shift))?;
+    Ok((image, renderer))
+}
+
+// ---------------------------------------------------------------- reports
+
+/// Collects failures and saves the images involved.
+struct Report {
+    failures: Vec<String>,
+    dir: PathBuf,
+    tiers: u32,
+}
+
+impl Report {
+    fn new() -> Self {
+        Self {
+            failures: Vec::new(),
+            dir: PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("gpu_lod"),
+            tiers: 0,
+        }
+    }
+
+    fn save(&self, images: &[(&str, &RgbaImage)]) {
+        let _ = std::fs::create_dir_all(&self.dir);
+        for (name, image) in images {
+            let file: String = name
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            let path = self.dir.join(format!("{file}.png"));
+            match image.save_png(&path) {
+                Ok(()) => eprintln!("gpu_lod: saved {}", path.display()),
+                Err(e) => eprintln!("gpu_lod: cannot save {}: {e}", path.display()),
+            }
+        }
+    }
+
+    /// Saves `images` when `GPU_LOD_SAVE` is set.
+    fn keep(&self, images: &[(&str, &RgbaImage)]) {
+        if std::env::var_os("GPU_LOD_SAVE").is_some() {
+            self.save(images);
+        }
+    }
+
+    fn fail(&mut self, message: String, images: &[(&str, &RgbaImage)]) {
+        eprintln!("gpu_lod: FAIL {message}");
+        self.save(images);
+        self.failures.push(message);
+    }
+
+    /// Fails if more than `max` of the pixels differ by more than `tolerance`.
+    fn check_close(
+        &mut self,
+        what: &str,
+        a: (&str, &RgbaImage),
+        b: (&str, &RgbaImage),
+        tolerance: u8,
+        max: f64,
+    ) {
+        let diff = a.1.compare(b.1, tolerance);
+        eprintln!(
+            "gpu_lod: {what}: {:.4} % of pixels differ, max channel {}",
+            diff.fraction() * 100.0,
+            diff.max_channel_diff
+        );
+        if diff.fraction() > max {
+            self.fail(
+                format!(
+                    "{what}: {} of {} pixels differ ({:.4} %)",
+                    diff.differing_pixels,
+                    diff.total_pixels,
+                    diff.fraction() * 100.0
+                ),
+                &[a, b],
+            );
+        }
+    }
+
+    fn check_identical(&mut self, what: &str, a: (&str, &RgbaImage), b: (&str, &RgbaImage)) {
+        if a.1.data != b.1.data {
+            let diff = a.1.compare(b.1, 0);
+            self.fail(
+                format!(
+                    "{what}: {} pixels changed (max channel {})",
+                    diff.differing_pixels, diff.max_channel_diff
+                ),
+                &[a, b],
+            );
+        }
+    }
+
+    fn finish(self) {
+        assert!(
+            self.failures.is_empty(),
+            "{} failures:\n{}",
+            self.failures.len(),
+            self.failures.join("\n")
+        );
+        assert!(
+            self.tiers > 0 || !gpu_tests_required(),
+            "BOXEL_REQUIRE_GPU=1 but no tier could run"
+        );
+    }
+}
+
+// ---------------------------------------------------------------- tests
+
+/// Without LOD input, with LOD off (nodes resident), without a horizon, and after the LOD is
+/// dropped: the same pixels and the same View uniform, no LOD draw. With no node but a horizon
+/// the far plane and the terrain fog move out (the uniform changes) and a scene well inside the
+/// old ones looks the same.
+#[test]
+fn lod_costs_nothing_when_absent_off_or_empty() {
+    let chunks = full_detail();
+    let nodes = lod_nodes();
+    let view = scene_view(I64Vec3::ZERO);
+    for_every_tier(|gpu, report| {
+        let mut run = || -> Result<(), String> {
+            let mut renderer = new_renderer(gpu)?;
+            load_world(&mut renderer, &chunks, I64Vec3::ZERO)?;
+            let plain = render(gpu, &mut renderer, &view)?;
+            let uniform = renderer.debug_view_uniform();
+            if renderer.take_lod_report().is_some() || renderer.lod_far().is_some() {
+                return Err("a LOD pass without LOD input".into());
+            }
+            let mut off = lod_input(settings(1 << 20), nodes);
+            off.settings.enabled = false;
+            let no_horizon = LodInput::new(settings(1 << 20), None);
+            for (what, input) in [("off", off), ("no horizon", no_horizon)] {
+                renderer.set_lod(gpu.device, Some(input));
+                let image = render(gpu, &mut renderer, &view)?;
+                let stats = renderer.stats();
+                if stats.lod_draws != 0 || stats.lod_drawn != 0 || renderer.lod_far().is_some() {
+                    return Err(format!("{what}: the LOD draws: {stats:?}"));
+                }
+                if !gpu.gl() && stats.lod_nodes as usize != nodes.len() {
+                    return Err(format!("{what}: {} nodes resident", stats.lod_nodes));
+                }
+                report.check_identical(
+                    &format!("{} {}: lod {what}", gpu.label, gpu.tier),
+                    (&gpu.name("plain"), &plain),
+                    (&gpu.name(what), &image),
+                );
+                if renderer.debug_view_uniform() != uniform {
+                    return Err(format!("{what}: the View uniform changed"));
+                }
+            }
+            // No node, a horizon: the uniform moves to the LOD's far plane and fog only.
+            renderer.set_lod(gpu.device, None);
+            renderer.set_lod(
+                gpu.device,
+                Some(LodInput::new(settings(1 << 20), Some(HORIZON))),
+            );
+            let empty = render(gpu, &mut renderer, &view)?;
+            let moved = renderer.debug_view_uniform();
+            report.check_identical(
+                &format!("{} {}: lod without nodes", gpu.label, gpu.tier),
+                (&gpu.name("plain"), &plain),
+                (&gpu.name("empty"), &empty),
+            );
+            let want_fog = if gpu.gl() {
+                uniform.fog_params
+            } else {
+                [0.5 * HORIZON, HORIZON, 0.0, 0.0]
+            };
+            if moved.fog_params != want_fog {
+                return Err(format!("fog params {:?}", moved.fog_params));
+            }
+            let same = |a: &boxel_shaders::gpu::ViewUniform,
+                        b: &boxel_shaders::gpu::ViewUniform| {
+                let (mut a, b) = (*a, *b);
+                a.fog_params = b.fog_params;
+                a.frustum[5] = b.frustum[5];
+                a == b
+            };
+            if !same(&moved, &uniform) || (moved.frustum[5] == uniform.frustum[5]) != gpu.gl() {
+                return Err("the LOD changes more than the far plane and the fog".into());
+            }
+            if renderer.stats().lod_draws != 0 {
+                return Err("draws without nodes".into());
+            }
+            renderer.set_lod(gpu.device, None);
+            let dropped = render(gpu, &mut renderer, &view)?;
+            report.check_identical(
+                &format!("{} {}: lod dropped", gpu.label, gpu.tier),
+                (&gpu.name("plain"), &plain),
+                (&gpu.name("dropped"), &dropped),
+            );
+            let stats = renderer.stats();
+            if renderer.debug_view_uniform() != uniform || stats.lod_nodes != 0 {
+                return Err(format!("after the LOD: {stats:?}"));
+            }
+            Ok(())
+        };
+        if let Err(e) = run() {
+            report.fail(format!("{} {}: {e}", gpu.label, gpu.tier), &[]);
+        }
+    })
+    .finish();
+}
+
+/// Full detail (a floor and a water wall drawn after the LOD) and LOD nodes of levels 1 to 4,
+/// at noon, with the levels tinted and at night: every tier of an adapter draws what its best
+/// tier draws. The LOD shows (it changes the image), with one draw per node in view and no
+/// refusal; the tint and the night change it.
+#[test]
+fn every_tier_draws_the_lod_scene_alike() {
+    let chunks = full_detail();
+    let view = scene_view(I64Vec3::ZERO);
+    let mut night = view;
+    night.light.sky = [0.08, 0.08, 0.16];
+    night.fog_color = [0.02, 0.02, 0.05, 1.0];
+    night.clear_color = night.fog_color;
+    let mut images: Vec<(String, Tier, Vec<(&str, RgbaImage)>)> = Vec::new();
+    let mut report = for_every_tier(|gpu, report| {
+        let run = || -> Result<Vec<(&str, RgbaImage)>, String> {
+            let mut plain = new_renderer(gpu)?;
+            load_world(&mut plain, &chunks, I64Vec3::ZERO)?;
+            let without = render(gpu, &mut plain, &view)?;
+            let (image, mut renderer) = render_scene(gpu, I64Vec3::ZERO)?;
+            let stats = renderer.stats();
+            let refused = renderer.take_lod_report().map(|r| r.refused);
+            let mut tinted = settings(1 << 20);
+            tinted.debug_tint = true;
+            renderer.set_lod(gpu.device, Some(LodInput::new(tinted, Some(HORIZON))));
+            let tint = render(gpu, &mut renderer, &view)?;
+            renderer.set_lod(
+                gpu.device,
+                Some(LodInput::new(settings(1 << 20), Some(HORIZON))),
+            );
+            let dark = render(gpu, &mut renderer, &night)?;
+            report.keep(&[
+                (&gpu.name("scene"), &image),
+                (&gpu.name("plain"), &without),
+                (&gpu.name("tint"), &tint),
+                (&gpu.name("night"), &dark),
+            ]);
+            let out = vec![("scene", image), ("tint", tint), ("night", dark)];
+            if gpu.gl() {
+                return Ok(out);
+            }
+            if stats.lod_draws == 0 || stats.lod_refused != 0 || refused != Some(Vec::new()) {
+                return Err(format!("LOD stats {stats:?}, refused {refused:?}"));
+            }
+            if stats.lod_draws > stats.lod_drawn || stats.lod_quads == 0 {
+                return Err(format!("LOD stats {stats:?}"));
+            }
+            let changed = |a: &RgbaImage, b: &RgbaImage| a.compare(b, 2).fraction();
+            if changed(&out[0].1, &without) < 0.05 || changed(&out[0].1, &out[1].1) < 0.05 {
+                return Err("the LOD or its tint changed less than 5 % of the image".into());
+            }
+            Ok(out)
+        };
+        match run() {
+            Ok(out) => images.push((gpu.label.to_string(), gpu.tier, out)),
+            Err(e) => report.fail(format!("{} {}: {e}", gpu.label, gpu.tier), &[]),
+        }
+    });
+    // The best tier of each adapter comes first.
+    for (i, (label, tier, shots)) in images.iter().enumerate() {
+        let Some((_, best_tier, best)) = images[..i].iter().find(|(l, _, _)| l == label) else {
+            continue;
+        };
+        for ((what, image), (_, want)) in shots.iter().zip(best) {
+            report.check_close(
+                &format!("{label}: {what}: {tier} vs {best_tier}"),
+                (&format!("{label}_{best_tier}_{what}"), want),
+                (&format!("{label}_{tier}_{what}"), image),
+                2,
+                MAX_TIER_DIFF,
+            );
+        }
+    }
+    report.finish();
+}
+
+/// `mesh` without the quads of the octants in `mask`.
+fn without_octants(mesh: &ChunkMesh, mask: u8) -> ChunkMesh {
+    let mut quads = Vec::new();
+    let mut counts = [0; BUCKET_COUNT];
+    for (b, count) in counts.iter_mut().enumerate() {
+        for &q in mesh.bucket(b) {
+            if mask >> octant_of(q) & 1 == 0 {
+                quads.push(q);
+                *count += 1;
+            }
+        }
+    }
+    let mut out = ChunkMesh::from_quads(quads, counts);
+    out.palette.clone_from(&mesh.palette);
+    out
+}
+
+/// A level-1 node with three of its octants hidden, full-detail chunks in those octants (one
+/// lod-1 octant is one chunk): exactly the pixels of the node without those octants' quads,
+/// and not those of the whole node.
+#[test]
+fn hidden_octants_draw_nothing() {
+    // The level-1 node with quads in the most octants, and three of them to hide.
+    let (key, mesh) = lod_nodes()
+        .iter()
+        .filter(|(k, _)| k.lod == 1)
+        .max_by_key(|(_, m)| {
+            let octants: u8 = m.quads.iter().fold(0, |a, &q| a | 1 << octant_of(q));
+            (octants.count_ones(), m.total_quads())
+        })
+        .expect("a level-1 node");
+    let octants: u8 = mesh.quads.iter().fold(0, |a, &q| a | 1 << octant_of(q));
+    assert!(octants.count_ones() >= 4, "octants {octants:08b}");
+    let mut mask = 0u8;
+    for o in 0..8 {
+        if octants >> o & 1 != 0 && mask.count_ones() < 3 {
+            mask |= 1 << o;
+        }
+    }
+    let floor = mesh_chunk(|_, y, _| if y < 2 { "boxel:stone" } else { "air" });
+    let chunks: Vec<(I64Vec3, ChunkMesh)> = (0..8)
+        .filter(|o| mask >> o & 1 != 0)
+        .map(|o| {
+            let pos = I64Vec3::new(key.pos.x, key.pos.y, key.pos.z) * 2
+                + I64Vec3::new(o & 1, o >> 1 & 1, o >> 2 & 1);
+            (pos, floor.clone())
+        })
+        .collect();
+    let center = (I64Vec3::new(key.pos.x, key.pos.y, key.pos.z) * 64 + 32).as_dvec3();
+    let views = [
+        look(center + DVec3::new(70.5, 60.0, 90.5), center),
+        look(center + DVec3::new(-80.5, 20.0, -50.5), center),
+    ];
+    let filtered = Arc::new(without_octants(mesh, mask));
+    for_every_tier(|gpu, report| {
+        if gpu.gl() {
+            return;
+        }
+        let mut run = || -> Result<(), String> {
+            let draw = |node: &Arc<ChunkMesh>, mask: u8, view: &ViewParams| {
+                let mut renderer = new_renderer(gpu)?;
+                load_world(&mut renderer, &chunks, I64Vec3::ZERO)?;
+                let mut input = LodInput::new(settings(1 << 20), Some(HORIZON));
+                input.ops.push(LodOp::Upsert {
+                    key: *key,
+                    mesh: Arc::clone(node),
+                    mask,
+                });
+                renderer.set_lod(gpu.device, Some(input));
+                render(gpu, &mut renderer, view)
+            };
+            for (i, view) in views.iter().enumerate() {
+                let masked = draw(mesh, mask, view)?;
+                let reference = draw(&filtered, 0, view)?;
+                let whole = draw(mesh, 0, view)?;
+                report.keep(&[
+                    (&gpu.name(&format!("masked{i}")), &masked),
+                    (&gpu.name(&format!("whole{i}")), &whole),
+                ]);
+                report.check_identical(
+                    &format!("{} {}: view {i}: hidden octants", gpu.label, gpu.tier),
+                    (&gpu.name(&format!("masked{i}")), &masked),
+                    (&gpu.name(&format!("filtered{i}")), &reference),
+                );
+                if whole.data == masked.data {
+                    report.fail(
+                        format!("{} {}: view {i}: the mask hid nothing", gpu.label, gpu.tier),
+                        &[(&gpu.name(&format!("whole{i}")), &whole)],
+                    );
+                }
+            }
+            Ok(())
+        };
+        if let Err(e) = run() {
+            report.fail(format!("{} {}: {e}", gpu.label, gpu.tier), &[]);
+        }
+    })
+    .finish();
+}
+
+/// The scene and its camera moved far from the origin (across the `i32` edges, `2^40` away) draw
+/// exactly the pixels they draw near it: node origins are `i64` on the CPU and wrapped to 32
+/// bits for the GPU.
+#[test]
+fn render_origins_far_away_draw_the_same_lod() {
+    for_every_tier(|gpu, report| {
+        let near = match render_scene(gpu, I64Vec3::ZERO) {
+            Ok((image, _)) => image,
+            Err(e) => {
+                report.fail(format!("{} {}: {e}", gpu.label, gpu.tier), &[]);
+                return;
+            }
+        };
+        for shift in FAR_SHIFTS {
+            match render_scene(gpu, shift) {
+                Ok((far, renderer)) => {
+                    if !gpu.gl() && renderer.stats().lod_draws == 0 {
+                        report.fail(
+                            format!("{} {} shift {shift}: no LOD draw", gpu.label, gpu.tier),
+                            &[],
+                        );
+                    }
+                    report.check_identical(
+                        &format!("{} {}: shift {shift}", gpu.label, gpu.tier),
+                        (&gpu.name("near"), &near),
+                        (&gpu.name(&format!("shift{shift}")), &far),
+                    );
+                }
+                Err(e) => report.fail(
+                    format!("{} {} shift {shift}: {e}", gpu.label, gpu.tier),
+                    &[],
+                ),
+            }
+        }
+    })
+    .finish();
+}
+
+/// On GL backends (no clip control: far depth z-fights) the LOD stays off on every tier: no
+/// pass, no report, the image without LOD.
+#[test]
+fn gl_adapters_keep_the_lod_off() {
+    let chunks = full_detail();
+    let view = scene_view(I64Vec3::ZERO);
+    let mut gl_tiers = 0;
+    for_every_tier(|gpu, report| {
+        if !gpu.gl() {
+            return;
+        }
+        gl_tiers += 1;
+        let mut run = || -> Result<(), String> {
+            let mut renderer = new_renderer(gpu)?;
+            load_world(&mut renderer, &chunks, I64Vec3::ZERO)?;
+            let plain = render(gpu, &mut renderer, &view)?;
+            let uniform = renderer.debug_view_uniform();
+            renderer.set_lod(gpu.device, Some(lod_input(settings(1 << 20), lod_nodes())));
+            let image = render(gpu, &mut renderer, &view)?;
+            let stats = renderer.stats();
+            if renderer.lod_far().is_some()
+                || renderer.take_lod_report().is_some()
+                || stats.lod_nodes != 0
+                || stats.lod_draws != 0
+                || renderer.debug_view_uniform() != uniform
+            {
+                return Err(format!("the LOD is on: {stats:?}"));
+            }
+            report.check_identical(
+                &format!("{} {}: GL", gpu.label, gpu.tier),
+                (&gpu.name("plain"), &plain),
+                (&gpu.name("lod"), &image),
+            );
+            Ok(())
+        };
+        if let Err(e) = run() {
+            report.fail(format!("{} {}: {e}", gpu.label, gpu.tier), &[]);
+        }
+    })
+    .finish();
+    eprintln!("gpu_lod: {gl_tiers} GL tiers checked");
+}
+
+/// `RendererSmokeTest { lod: true }` passes on every tier at both levels; a failing LOD check
+/// turns the LOD off (`lod_ok` false) and keeps the tier. GL backends are not checked: the
+/// renderer keeps the LOD off there.
+#[test]
+fn the_lod_smoke_check_passes_on_every_tier() {
+    for_every_tier(|gpu, report| {
+        for level in [SmokeLevel::Compile, SmokeLevel::Draw] {
+            for fail in [false, true] {
+                let smoke = RendererSmokeTest {
+                    lod: true,
+                    debug_fail_lod: fail,
+                    ..RendererSmokeTest::default()
+                };
+                let ctx = SmokeContext {
+                    device: gpu.device,
+                    queue: gpu.queue,
+                    tier: gpu.tier,
+                    caps: gpu.caps,
+                    level,
+                    output_format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                };
+                let what = format!("{} {} {level:?} fail {fail}", gpu.label, gpu.tier);
+                if let Err(e) = smoke.run(&ctx) {
+                    report.fail(format!("{what}: the tier failed: {e}"), &[]);
+                }
+                let ok = smoke.lod_ok.load(Ordering::Relaxed);
+                if ok != (!fail || gpu.gl()) {
+                    report.fail(format!("{what}: lod_ok {ok}"), &[]);
+                }
+            }
+        }
+    })
+    .finish();
+}
+
+/// The presets' arenas one after the other (far, extreme, near): each change builds the LOD
+/// pass again, empty, and the same input refills it. It then draws exactly what a fresh pass of
+/// that size draws, with no refusal.
+#[test]
+fn switching_presets_rebuilds_the_pass_and_refills_it() {
+    let chunks = full_detail();
+    let view = scene_view(I64Vec3::ZERO);
+    let nodes = lod_nodes();
+    let quads: u64 = nodes.iter().map(|(_, m)| u64::from(m.total_quads())).sum();
+    for_every_tier(|gpu, report| {
+        if gpu.gl() {
+            return;
+        }
+        let mut run = || -> Result<(), String> {
+            let mut switched = new_renderer(gpu)?;
+            load_world(&mut switched, &chunks, I64Vec3::ZERO)?;
+            for (name, arena) in [
+                ("far", 12u32 << 20),
+                ("extreme", 16 << 20),
+                ("near", 4 << 20),
+            ] {
+                switched.set_lod(gpu.device, Some(lod_input(settings(arena), nodes)));
+                let image = render(gpu, &mut switched, &view)?;
+                let report_after = switched.take_lod_report().ok_or("no LOD pass")?;
+                let limit = gpu.device.limits().max_buffer_size / 8;
+                let capacity = u64::from(arena).min(limit);
+                if !report_after.refused.is_empty()
+                    || report_after.arena_free_quads != capacity - quads
+                    || switched.stats().lod_refused != 0
+                {
+                    return Err(format!("{name}: {report_after:?}, {:?}", switched.stats()));
+                }
+                let mut fresh = new_renderer(gpu)?;
+                load_world(&mut fresh, &chunks, I64Vec3::ZERO)?;
+                fresh.set_lod(gpu.device, Some(lod_input(settings(arena), nodes)));
+                let want = render(gpu, &mut fresh, &view)?;
+                report.check_identical(
+                    &format!("{} {}: {name} after switching", gpu.label, gpu.tier),
+                    (&gpu.name(&format!("{name}_fresh")), &want),
+                    (&gpu.name(&format!("{name}_switched")), &image),
+                );
+            }
+            Ok(())
+        };
+        if let Err(e) = run() {
+            report.fail(format!("{} {}: {e}", gpu.label, gpu.tier), &[]);
+        }
+    })
+    .finish();
+}
