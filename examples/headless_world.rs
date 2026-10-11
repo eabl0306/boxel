@@ -46,6 +46,16 @@
 //!   World coordinates are `i64`: `--jump 70000000` (past the former `i32` edge of voxels,
 //!   `2^26` chunks) or `--jump -40000000000` (past `2^40` voxels) stream at the true position.
 //!
+//! - `--lod PRESET`: once the world is settled, the far LOD (ADR 0031, world side only: no GPU)
+//!   is filled too, the full-detail coverage is taken from the settled chunks, and `lod:
+//!   preset=P horizon=H columns=N nodes=N quads=N drawn=N floor_nodes=N floor_quads=N
+//!   filled_after=S jobs=N job_p50_us=N job_p99_us=N failed=N update_p99_ms=X
+//!   update_max_ms=X` follows, then one `lod_level:` line per level with the same counts and
+//!   the nodes built blank. `nodes` are the nodes with a mesh, `floor_*` those in the layer of
+//!   the generator's floor (expected 0), `drawn` those with an octant not covered by finer
+//!   nodes or full detail, `filled_after` the time from the first plan to the full fill, and
+//!   the update times those of the frames between the world's settling and the fill.
+//!
 //! Exit codes: 0 settled, 1 usage error, 4 not settled within the timeout, 5 the world settled
 //! somewhere else than around the viewer after a jump. Set `RUST_LOG` for more logging (default
 //! filter `warn`).
@@ -53,6 +63,8 @@
 
 #[path = "shared/cave.rs"]
 mod cave;
+#[path = "shared/lod.rs"]
+mod lod;
 #[path = "shared/world.rs"]
 mod world;
 
@@ -65,11 +77,13 @@ use boxel::prelude::*;
 use boxel::render::{DEFAULT_SKY_COLOR, ViewParams, cull_counts};
 use boxel::voxel::{CHUNK_SIZE, MAX_BLOCK_COORD, MAX_CHUNK_COORD};
 use boxel::world::DataState;
+use boxel::world::lod::{ChunkCoverage, LodCoverage, LodStats, LodWorldPlugin};
 use boxel::world::visibility::{eye_in_open, visible_chunks};
 use boxel::world::{
     ChunkVisibility, SkyMap, VisibilityView, WorldContent, WorldStats, WorldSystems,
 };
 use boxel_demo::worldgen::OverworldGenerator;
+use lod::LodPreset;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -103,9 +117,13 @@ usage: headless_world [options]
   --timeout S          wall-clock limit in seconds (default 60), exit 4 past it
   --help               this text";
 
-/// The whole help: [`USAGE`] and the world options.
+/// The whole help: [`USAGE`], `--lod` and the world options.
 fn usage() -> String {
-    format!("{USAGE}\nworld options:\n{}", world::usage(World::Terrain))
+    format!(
+        "{USAGE}\n{}\nworld options:\n{}",
+        lod::USAGE,
+        world::usage(World::Terrain)
+    )
 }
 
 /// Exit code for a timeout.
@@ -141,6 +159,8 @@ struct Options {
     cave: bool,
     /// `--idle-work`: `WorldSettings::idle_work`.
     idle_work: bool,
+    /// `--lod`.
+    lod: LodPreset,
 }
 
 /// `Ok(None)` for `--help`.
@@ -163,6 +183,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         cull: false,
         cave: false,
         idle_work: true,
+        lod: LodPreset::Off,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -209,6 +230,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             }
             "--light" => o.light = on_off(flag, &value()?)?,
             "--idle-work" => o.idle_work = on_off(flag, &value()?)?,
+            "--lod" => o.lod = lod::parse(flag, &value()?)?,
             "--cull" => o.cull = true,
             "--cave" => o.cave = true,
             "--camera" => {
@@ -314,6 +336,11 @@ enum Phase {
     CatchingUp { since: Instant, behind: usize },
     /// Teleported at `since`; waiting for the new area.
     Jumping { since: Instant },
+    /// `--lod`: the world is settled; waiting for the LOD's fill.
+    LodFilling,
+    /// `--lod`: filled, the coverage replaced; the report comes next frame. The update times
+    /// (p99 and max, ms) of the frames that waited for the fill.
+    LodCovered { p99: f64, max: f64 },
 }
 
 #[derive(Resource)]
@@ -343,7 +370,7 @@ impl Run {
     fn next_phase(&mut self, done: Phase, now: Instant, x: f64, exit: &mut MessageWriter<AppExit>) {
         let o = &self.options;
         let rank = |p: &Phase| match p {
-            Phase::Loading => 0,
+            Phase::Loading | Phase::LodFilling | Phase::LodCovered { .. } => 0,
             Phase::Idle { .. } => 1,
             Phase::Walking { .. } | Phase::CatchingUp { .. } => 2,
             Phase::Jumping { .. } => 3,
@@ -431,37 +458,44 @@ fn main() -> AppExit {
     } else {
         Duration::ZERO
     };
-    App::new()
-        .add_plugins((
-            LogPlugin {
-                filter: "warn".to_string(),
-            },
-            MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(wait)),
-            FrameStatsPlugin,
-            WorldPlugin {
-                generator,
-                settings,
-                registry: Arc::new(boxel_demo::blocks::registry()),
-                ..WorldPlugin::default()
-            },
-        ))
-        .insert_resource(Run {
-            options,
-            started: Instant::now(),
-            phase: Phase::Loading,
-            update_start: None,
-            updates: Vec::new(),
-            max_update: 0.0,
-            walk_from: VIEWER.x,
-            walk_report: None,
-            teleport: None,
-        })
-        .add_systems(Startup, spawn_viewer)
-        .add_systems(First, start_update)
-        .add_systems(PreUpdate, drive)
-        .add_systems(Update, move_viewer.before(WorldSystems::Interest))
-        .add_systems(Last, end_update)
-        .run()
+    let lod_settings = options.lod.settings();
+    let mut app = App::new();
+    app.add_plugins((
+        LogPlugin {
+            filter: "warn".to_string(),
+        },
+        MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(wait)),
+        FrameStatsPlugin,
+        WorldPlugin {
+            generator,
+            settings,
+            registry: Arc::new(boxel_demo::blocks::registry()),
+            ..WorldPlugin::default()
+        },
+    ));
+    if let Some(settings) = lod_settings {
+        app.add_plugins(LodWorldPlugin {
+            settings,
+            ..LodWorldPlugin::default()
+        });
+    }
+    app.insert_resource(Run {
+        options,
+        started: Instant::now(),
+        phase: Phase::Loading,
+        update_start: None,
+        updates: Vec::new(),
+        max_update: 0.0,
+        walk_from: VIEWER.x,
+        walk_report: None,
+        teleport: None,
+    })
+    .add_systems(Startup, spawn_viewer)
+    .add_systems(First, start_update)
+    .add_systems(PreUpdate, (drive, drive_lod).chain())
+    .add_systems(Update, move_viewer.before(WorldSystems::Interest))
+    .add_systems(Last, end_update)
+    .run()
 }
 
 fn spawn_viewer(mut commands: Commands, run: Res<Run>) {
@@ -811,7 +845,12 @@ fn drive(
                     cull_lines(&run.options, &map, &content.registry, transform, *viewer)
                 );
             }
-            run.next_phase(Phase::Loading, now, x, &mut exit);
+            if run.options.lod == LodPreset::Off {
+                run.next_phase(Phase::Loading, now, x, &mut exit);
+            } else {
+                run.updates.clear();
+                run.phase = Phase::LodFilling;
+            }
         }
         Phase::Idle { since } if now.duration_since(since) >= run.options.idle => {
             println!(
@@ -898,6 +937,81 @@ fn drive(
         );
         run.exit(EXIT_TIMEOUT, &mut exit);
     }
+}
+
+/// `--lod`, after [`drive`]: waits for the LOD's fill once the world is settled, takes the
+/// full-detail coverage from the settled chunks (as the renderer's meshes would give it), and
+/// reports a frame later, when the masks and the counts are up to date.
+fn drive_lod(
+    mut run: ResMut<Run>,
+    stats: Option<Res<LodStats>>,
+    coverage: Option<ResMut<LodCoverage>>,
+    map: Res<ChunkMap>,
+    viewers: Query<&Transform, With<ChunkViewer>>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    let (Some(stats), Some(mut coverage)) = (stats, coverage) else {
+        return;
+    };
+    match run.phase {
+        Phase::LodFilling
+            if stats.fill >= 1.0 && stats.in_flight == 0 && stats.sends_waiting == 0 =>
+        {
+            run.phase = Phase::LodCovered {
+                p99: p99(&run.updates),
+                max: max(&run.updates),
+            };
+            coverage.replace(ChunkCoverage::from_map(&map));
+        }
+        Phase::LodCovered { p99, max } => {
+            println!("{}", lod_lines(&run, &stats, p99, max));
+            let x = viewers.iter().next().map_or(VIEWER.x, |t| t.translation.x);
+            run.next_phase(Phase::Loading, Instant::now(), x, &mut exit);
+        }
+        _ => {}
+    }
+}
+
+/// The `lod:` and `lod_level:` lines (`p99` and `max`: the fill's update times).
+fn lod_lines(run: &Run, stats: &LodStats, p99: f64, max: f64) -> String {
+    let sum =
+        |f: fn(&boxel::world::lod::LevelStats) -> u64| -> u64 { stats.levels.iter().map(f).sum() };
+    let mut out = format!(
+        "lod: preset={} horizon={} columns={} nodes={} quads={} drawn={} floor_nodes={} \
+         floor_quads={} filled_after={:.3}s jobs={} job_p50_us={} job_p99_us={} failed={} \
+         update_p99_ms={:.2} update_max_ms={:.2}",
+        run.options.lod.name(),
+        stats.horizon,
+        stats.columns(),
+        stats.nodes(),
+        stats.quads(),
+        stats.drawn(),
+        sum(|l| l.floor_nodes as u64),
+        sum(|l| l.floor_quads),
+        stats.filled_after.map_or(f64::NAN, |d| d.as_secs_f64()),
+        stats.jobs_done,
+        stats.job_p50.as_micros(),
+        stats.job_p99.as_micros(),
+        stats.jobs_failed,
+        p99,
+        max,
+    );
+    for (i, l) in stats.levels.iter().enumerate() {
+        out.push_str(&format!(
+            "\nlod_level: k={} columns={} nodes={} quads={} drawn={} blank={} floor_nodes={} \
+             floor_quads={} quads_per_node={}",
+            i + 1,
+            l.columns,
+            l.nodes,
+            l.quads,
+            l.drawn,
+            l.blank,
+            l.floor_nodes,
+            l.floor_quads,
+            l.quads.checked_div(l.nodes as u64).unwrap_or(0),
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -999,6 +1113,19 @@ mod tests {
             .expect("not help");
         assert!(!o.idle_work);
         assert!(parse(&["--idle-work", "maybe"]).is_err());
+    }
+
+    #[test]
+    fn lod_presets() {
+        let o = parse(&[]).expect("valid").expect("not help");
+        assert_eq!(o.lod, LodPreset::Off, "no LOD unless asked");
+        let o = parse(&["--lod", "far", "--fixed-height"])
+            .expect("valid")
+            .expect("not help");
+        assert_eq!(o.lod, LodPreset::Far);
+        assert!(o.fixed_height);
+        assert!(parse(&["--lod", "everything"]).is_err());
+        assert!(usage().contains("--lod PRESET"));
     }
 
     #[test]
