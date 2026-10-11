@@ -2,7 +2,7 @@
 
 Documento técnico de referencia. Fecha: 2026-10-05. Estado: aprobado para el milestone M0
 (revisión final, después de tres revisiones adversariales del borrador v1).
-Las decisiones puntuales están en `docs/adr/` (0001 a 0030). Durante M0 hubo además una
+Las decisiones puntuales están en `docs/adr/` (0001 a 0031). Durante M0 hubo además una
 especificación para los agentes implementadores (en inglés, en `.scaffold/`), borrada al cerrar M0;
 este documento queda como referencia.
 
@@ -152,16 +152,16 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_camera` | `Camera`, `CameraView` (relativa a cámara), `FlyCamera` | app, transform, window |
 | `boxel_gfx` | política sobre wgpu: preferencias, instancia, tiers, scoring, smoke, selección, LKG, superficie, readback, hal; ejemplo `gpu_info` | (wgpu) |
 | `boxel_shaders` | WGSL embebido, composición, espejos `#[repr(C)]`, tests de naga | (wgpu, bytemuck) |
-| `boxel_voxel` | coordenadas (`BlockPos`, `ChunkPos`, `WorldPos`: bloque más offset, exacto a cualquier distancia), `Face`, registry (con emisión RGB y opacidad de luz), paleta, `LightValue` y `LightTables`, `ChunkData` con sus máscaras de luz (`LightMasks`), qué caras de un chunk se ven entre sí (`ChunkFaceInfo`, ADR 0022) | (glam) |
-| `boxel_mesh` | `PackedQuad`, `ChunkMesh` con su paleta de luz, `PaddedChunk`, `Mesher` (fork de bgm que fusiona por material, AO y luz) | voxel |
+| `boxel_voxel` | coordenadas (`BlockPos`, `ChunkPos`, `WorldPos`: bloque más offset, exacto a cualquier distancia), `Face`, registry (con emisión RGB y opacidad de luz), paleta, `LightValue` y `LightTables`, `ChunkData` con sus máscaras de luz (`LightMasks`), qué caras de un chunk se ven entre sí (`ChunkFaceInfo`, ADR 0022), clases de LOD y la regla de la celda lejana (`lod`, ADR 0031) | (glam) |
+| `boxel_mesh` | `PackedQuad`, `ChunkMesh` con su paleta de luz, `PaddedChunk`, `Mesher` (fork de bgm que fusiona por material, AO y luz), mallado de los nodos lejanos (`lod`: materiales, cortes por octante, faldones y paredes de agua, ADR 0031) | voxel |
 | `boxel_light` | luz de vóxeles en CPU, sin ECS ni GPU (ADR 0015): techos de cielo por columna (`SkyTile`, caminata hacia abajo), luz exacta de un chunk desde una caja de 64³ (cielo y RGB, caminos rápidos para cuevas oscuras y cielo abierto), `PaddedLight`, `ChunkLight`; oráculo global para los tests | voxel |
-| `boxel_worldgen` | trait `WorldGenerator`, `FlatGenerator` y ruido entero exacto 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`, `splitmix64`, `Frequency`) | voxel |
-| `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, mensajes (`ChunkMeshEvent`, `BlockChanged`, `ChunkDataEvent`), guardar y cargar el mundo (`persist`: `ChunkStore`, `RedbStore`, `WorldStore`, `PersistPlugin`, ADR 0024), reloj del mundo (`TimeOfDay`, `DaylightCurve`, `DaylightPlugin`), ticks programados de bloques (`BlockTicks`, `BlockTicksPlugin`), agua y lava que corren y bloques con agua (`FluidPlugin`, ADR 0021 y 0025), las reglas de vecinos (`NeighborRules`, ADR 0020 y 0027), qué hace usar un bloque (`BlockUses`, una puerta que se abre, ADR 0027) y la búsqueda de la ocultación de cuevas (`ChunkVisibility`, `visibility`, ADR 0022) | app, voxel, mesh, light, worldgen, transform, diagnostic |
-| `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `SceneLight` (luz del cielo, ambiente y curva de brillo del frame), `PresentSettings` (vsync en tiempo de ejecución), texturas de las imágenes del registro o de un resource pack con las recetas que pasa el juego (`TextureSource`, `PackSource`), screenshots, ocultación de cuevas en los tres tiers (ADR 0022), contorno del bloque apuntado (`BlockOutline`, ADR 0026), texturas animadas de los packs (`LayerAnimation`, ADR 0028), conteo de draws en CPU (`cull_counts`), niebla y nubes cúbicas opcionales (`fog`: `FogPlugin`, `FogSettings`, `FogClock`, ADR 0030) | gfx, shaders, world, camera, window, pack, fog |
+| `boxel_worldgen` | trait `WorldGenerator` (con `lod()`, la fuente del terreno lejano: `LodSource`, ADR 0031), `FlatGenerator` y ruido entero exacto 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`, `splitmix64`, `Frequency`) | voxel |
+| `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, mensajes (`ChunkMeshEvent`, `BlockChanged`, `ChunkDataEvent`), guardar y cargar el mundo (`persist`: `ChunkStore`, `RedbStore`, `WorldStore`, `PersistPlugin`, ADR 0024), reloj del mundo (`TimeOfDay`, `DaylightCurve`, `DaylightPlugin`), ticks programados de bloques (`BlockTicks`, `BlockTicksPlugin`), agua y lava que corren y bloques con agua (`FluidPlugin`, ADR 0021 y 0025), las reglas de vecinos (`NeighborRules`, ADR 0020 y 0027), qué hace usar un bloque (`BlockUses`, una puerta que se abre, ADR 0027), la búsqueda de la ocultación de cuevas (`ChunkVisibility`, `visibility`, ADR 0022) y el lado del mundo del LOD lejano (`lod`: `LodWorldPlugin`, planificador, cobertura, trabajos, ADR 0031) | app, voxel, mesh, light, worldgen, transform, diagnostic |
+| `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `SceneLight` (luz del cielo, ambiente y curva de brillo del frame), `PresentSettings` (vsync en tiempo de ejecución), texturas de las imágenes del registro o de un resource pack con las recetas que pasa el juego (`TextureSource`, `PackSource`), screenshots, ocultación de cuevas en los tres tiers (ADR 0022), contorno del bloque apuntado (`BlockOutline`, ADR 0026), texturas animadas de los packs (`LayerAnimation`, ADR 0028), conteo de draws en CPU (`cull_counts`), niebla y nubes cúbicas opcionales (`fog`: `FogPlugin`, `FogSettings`, `FogClock`, ADR 0030), terreno lejano opcional (`lod`: `LodPlugin`, `LodPass`, ADR 0031) | gfx, shaders, world, camera, window, pack, fog |
 | `boxel_fog` | niebla y nubes cúbicas sin GPU ni ECS (ADR 0030): las capas (`FogLayer`, `validate`), el ruido entero que el shader repite bit a bit, cada capa en enteros chicos relativos al origen de render (`LayerParams`), la marcha de referencia de los tests y el empaquetado del texel | - |
 | `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::collision`: cubos y cajas que pueden subir media celda, como la valla de 1,5 bloques, más un contorno para apuntar, ADR 0018 y 0026), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas, el integrador de un cuerpo (`step_body`, `predict`), el narrowphase (`shape_contact`) y la grilla del broadphase (`Grid`). Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`; pasos en `FixedPostUpdate`, interpolación en `AfterFixedMainLoop`), `PhysicsQuery` (rayos a vóxeles y cuerpos, cajas, el chequeo para poner bloques), `BodyIndex`, cuerpos (`RigidBody`, `Collider`, `Velocity`, `BodyPosition`, `Contacts`, `Interpolated`, `Teleport`, `Frozen`, `Sleeping`, `ReportContacts`), `CharacterController` (caminar, agacharse con el borde protegido y la caja de 1,5 (`Crouch`), correr con el salto corriendo y el vuelo creativo, ADR 0026), `Projectile`, nadar (`SwimPlugin`, `Swimmer`, ADR 0021; también en bloques con agua, y el vuelo no lo siente) y los mensajes `VoxelImpact`, `CollisionStarted`, `CollisionEnded` y `ProjectileHit`. Los cuerpos quietos se duermen (despiertan con `BlockChanged` y `ChunkDataEvent` del mundo, entre otras cosas) y, con muchos cuerpos despiertos, el paso corre en los hilos de cómputo. Fases P0 a P4 hechas | ecs, app, math, tasks, transform, voxel, world, diagnostic |
 | `boxel_pack` | lector de resource packs de Minecraft Java (formatos ~64 a 120): `pack.mcmeta` con overlays, texturas de bloque PNG a RGBA8 (animaciones `.png.mcmeta`), modelos de bloque con herencia `parent` y variables `#`, blockstates `variants` y `multipart`. Solo datos; `boxel_render` lo usa para las texturas de bloque | (serde, png) |
-| `boxel_demo` | contenido de los ejemplos, fuera del motor (ADR 0029, `publish = false`): bloques y capas (`blocks::registry`, `blocks::builder`), pintor procedural (`textures`), formas y reglas de escaleras, vallas, antorchas, muros y puertas (`shapes`, `rules`), agua y lava (`fluids`), recetas y tintes de packs (`pack`), generadores `TerrainGenerator`, `ForestGenerator` y `OverworldGenerator` con `Sea` y las cuevas (`worldgen`), presets de niebla y nubes (`fog`, ADR 0030) | voxel, worldgen, pack, fog |
+| `boxel_demo` | contenido de los ejemplos, fuera del motor (ADR 0029, `publish = false`): bloques y capas (`blocks::registry`, `blocks::builder`), pintor procedural (`textures`), formas y reglas de escaleras, vallas, antorchas, muros y puertas (`shapes`, `rules`), agua y lava (`fluids`), recetas y tintes de packs (`pack`), generadores `TerrainGenerator`, `ForestGenerator` y `OverworldGenerator` con `Sea`, las cuevas y su fuente de LOD (`worldgen`, ADR 0031), presets de niebla y nubes (`fog`, ADR 0030) | voxel, worldgen, pack, fog |
 | `boxel_facade_check` | solo CI: prueba que los derives resuelven `::boxel::ecs` para un usuario que depende solo de `boxel` | fachada |
 | `vendor/*` (7 crates) | ECS y tareas (fork de Bevy) | - |
 
@@ -1144,6 +1144,28 @@ Cada pipeline liga a lo sumo un uniform block y una textura, sin sampler (ADR 00
 viento) es del juego; los presets del ejemplo están en `boxel_demo::fog`. La niebla detrás del
 agua o del vidrio se pinta encima de esa superficie (límite conocido).
 
+### 10.9 Terreno lejano: LOD por anillos (ADR 0031)
+
+Opcional, como la niebla: solo existe si el juego agrega `LodPlugin` (fuera de `DefaultPlugins`).
+Sin el plugin no hay recursos, sistemas, trabajos, pipeline ni módulo de shader, y los frames son
+los de antes, byte a byte.
+
+- **Nodos.** Un nodo de nivel `k` (1 a K) son 32³ celdas de `2^k` bloques, con la `ChunkKey` de
+  siempre (`lod = k`). Un octree 3D con el mismo radio `R` en cada nivel arma anillos hasta el
+  horizonte `H` (12.288 bloques en el preset `far`: `R = 24`, `K = 4`).
+- **Datos.** El generador muestrea cada nivel (`WorldGenerator::lod`, `LodSource`): un trabajo
+  arma una columna de un nivel y malla sus nodos con el mallador de siempre (todo cubo opaco, sin
+  luz ni AO) más cortes por octante, faldones y, en el nivel 1, paredes de agua. La regla de la
+  celda: gana cualquier sólido, salvo agua sobre el suelo.
+- **Cobertura.** Cada nodo lleva una máscara de octantes ocultos donde dibuja el detalle completo
+  o un nivel más fino, sacada de los `ChunkMeshEvent` leídos completos cada frame: el LOD y el
+  detalle completo nunca dibujan el mismo volumen y cambian en el mismo frame.
+- **Dibujo.** `LodPass` en `VoxelRenderer`, con su propia arena: un pipeline igual en los tres
+  tiers (`lod.wgsl`, el quad instanciado del Low), una llamada por nodo, justo después de lo opaco
+  y cutout. Con el LOD dibujando, el plano lejano del recorte de chunks y de la búsqueda de cuevas
+  pasa a `H` (los chunks publicados llegan más allá de la distancia de vista) y la niebla del
+  terreno va de `0,5 H` a `H`; las capas de `FogPlugin` conservan su alcance. Apagado en GL.
+
 ---
 
 ## 11. Modelo de hilos y presentación
@@ -1338,7 +1360,7 @@ pub trait ChunkStore: Send + Sync + 'static {
 | **M0 scaffold** | workspace y tooling; fork del ECS; `boxel_app`; ventana con compuerta de presentación e input; detección completa (tiers, scoring, smoke, overrides, LKG de crashes, device lost, catch_unwind); tiers High, Mid y Low con buckets opaco y cutout (High sin Hi-Z); paleta, registry, worldgen, mesher, streaming con jobs; cámara libre; `gpu_info`, `voxel_world`, `headless_world` | compila, tests, clippy y rustdoc limpios; `voxel_world` dibuja terreno en Vulkan High y en GL (Mid y Low); imágenes iguales entre tiers; la simulación no se congela con la ventana minimizada |
 | **M1 mundo jugable** | criterio de entrada: re-fork sobre bevy 0.20.0 final (hecho el 2026-10-09, issue #24). Motor sin contenido, con el de los ejemplos en `boxel_demo` (hecho: ADR 0029, issue #48). Niebla y nubes cúbicas como plugin opcional (hecho: ADR 0030, issue #47; falta el mapa del suelo). Pase translúcido; AO; raycast y edición de bloques (hechos: ADR 0016, `voxel_world`); el sistema de ediciones si se recortó; propiedades de bloque e IdMap; `ChunkStore` con redb (hecho: ADR 0024, con entidades); crecimiento del arena y presupuesto de subida; caras interiores de hojas (opcional); re-selección en caliente si se recortó; decisión `static-dxc` o DLL en Windows; timestamps de GPU; actualizar a wgpu 31 | editar y guardar un mundo; agua visible |
 | **M2 GPU-driven completo** | Hi-Z en dos fases (High) o enlaces por subceldas de 16³ (el cave culling por BFS ya está en los tres tiers, ADR 0022); pool de ocupación en GPU; `create_shader_module_trusted` con medición; pipeline cache de Vulkan; verificar DX12 High; clip control en GL (upstream); decidir WESL | caída de draws y de tiempo de GPU medida |
-| **M3 escala** | LOD con mips de 32³ y anillos; listas indirectas segmentadas (más de 65 535 draws); render en hilo propio; inicialización de GPU asíncrona (respetando los error scopes por hilo) | distancias de vista grandes estables |
+| **M3 escala** | LOD por anillos 3D con el generador muestreando cada nivel (M1 del LOD hecho: ADR 0031; faltan ediciones, respaldo sin fuente y el camino de GPU de High); listas indirectas segmentadas (más de 65 535 draws); render en hilo propio; inicialización de GPU asíncrona (respetando los error scopes por hilo) | distancias de vista grandes estables |
 | **M4 experimental** | ray marching sobre bricks/ocupación; mesh shaders opt-in; evaluar bevy_ecs 0.21 y el núcleo ECS propio | prototipos medidos |
 
 wgpu v31 (milestone con fecha 2026-10-09) trae cambios que tocan el scaffold

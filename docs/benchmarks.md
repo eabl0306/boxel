@@ -281,6 +281,19 @@ igual corridas con y sin niebla, así se puede comparar una contra otra; solo av
 Para medir el costo de la niebla con el mismo binario:
 `just perf-smoke --base HEAD "--new-extra='--fog both'" rtx/surface/r16/uncapped`.
 
+`--lod near|far|extreme` agrega el terreno lejano (ADR 0031) con `LodPlugin`; sin la opción (o con
+`off`) el plugin no está y no cuesta nada. Los presets son los de `examples/shared/lod.rs`:
+`near` llega a 4.096 bloques, `far` a 12.288 y `extreme` a 49.152. El resumen anota el preset
+(`lod: far (R 24, K 4, 12288 blocks)`; las corridas viejas valen `off`) y `lod_fill_s`: cuándo
+terminó el primer llenado, contado desde el arranque como `settle_s`. Los frames de antes cargan
+los trabajos y las subidas del llenado. `tools/bench_report.py` empareja igual corridas con y sin
+LOD y avisa que difieren. Para medir su costo con el mismo binario:
+`just perf-smoke --base HEAD "--new-extra='--lod far'" rtx/surface/r16/uncapped rtx/forest/r16/uncapped`.
+
+Los números sin ruido del LOD salen de `headless_world --world forest --lod PRESET` (sin GPU):
+nodos y quads por nivel, los del piso aparte, tiempos de los trabajos y del llenado. `snapshot
+--lod PRESET` espera el llenado antes de las capturas.
+
 Para que los números sirvan:
 
 - Siempre en release (las recetas ya lo hacen).
