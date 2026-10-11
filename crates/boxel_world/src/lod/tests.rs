@@ -2387,6 +2387,32 @@ fn a_refused_chunk_sent_again_counts_as_drawn_at_once() {
     assert_bits_from_scratch(&app);
 }
 
+/// A renderer that cannot draw the LOD (a GL backend, a failed smoke check or LOD pass) turns
+/// the world side off: no node kept, no job; it comes back, from scratch, once one can.
+#[test]
+fn a_renderer_that_cannot_draw_turns_the_lod_off() {
+    let mut app = app(Steps::new(20), small());
+    spawn(&mut app, DVec3::new(10.0, 60.0, 10.0));
+    let mut model = Model::default();
+    fill(&mut app, &mut model, 300);
+    let n = model.nodes.len();
+    app.world_mut().resource_mut::<LodFeedback>().cannot_draw = true;
+    for _ in 0..5 {
+        frame(&mut app, &mut model);
+    }
+    let stats = app.world().resource::<LodStats>();
+    assert_eq!(stats.off, Some(LodOff::Unsupported));
+    assert!(model.nodes.is_empty());
+    assert_eq!(
+        (stats.nodes(), stats.columns(), stats.queued_jobs),
+        (0, 0, 0)
+    );
+    assert!(!app.world().resource::<LodWorld>().has_job_work());
+    app.world_mut().resource_mut::<LodFeedback>().cannot_draw = false;
+    fill(&mut app, &mut model, 300);
+    assert_eq!(model.nodes.len(), n);
+}
+
 /// Frames running every held job until the LOD is filled.
 fn fill_held(app: &mut App, lod: &Hold, model: &mut Model) {
     for _ in 0..1000 {

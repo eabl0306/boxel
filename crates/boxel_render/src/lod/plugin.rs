@@ -9,13 +9,15 @@
 //!   search: the ops become the frame's [`LodInput`]. A frame without a renderer (none yet, a
 //!   lost device) drops them; a resync frame, which every new renderer starts with, or a new LOD
 //!   arena drops the renderer's nodes and writes [`LodResync`]: the world side sends every node
-//!   again, coarse first.
+//!   again, coarse first. A renderer that cannot draw the LOD (a GL backend, a failed smoke check
+//!   or LOD pass) turns the world side off ([`LodFeedback::cannot_draw`]), so no job runs and no
+//!   node is kept for nothing.
 //! - The render plugin does the rest: `Prepare` hands the input to the renderer (unless the LOD
 //!   failed its smoke check on this device), the cave culling search reaches the horizon while
 //!   the LOD draws ([`lod_far`]), and the refusals of the main renderer and of the LOD pass go
 //!   back through [`LodFeedback`](super::LodFeedback).
 
-use super::{LodInput, LodOp, LodResync, LodSettings, LodStats};
+use super::{LodFeedback, LodInput, LodOp, LodResync, LodSettings, LodStats};
 use crate::plugin::{ExtractedFrame, Render, RenderSystems, extract, extract_visibility};
 use boxel_app::{App, Plugin, Update};
 use boxel_camera::{Camera, CameraView};
@@ -149,11 +151,13 @@ pub(crate) struct Extracted {
 }
 
 /// `RenderSystems::Extract`, after the render plugin's `extract` and before its cave culling
-/// search: the frame's [`LodInput`] ([`frame_input`]).
+/// search: the frame's [`LodInput`] ([`frame_input`]), and whether the renderer can draw the LOD
+/// at all ([`LodFeedback::cannot_draw`]; unchanged while there is no renderer).
 pub(crate) fn extract_lod(
     settings: Res<LodSettings>,
     stats: Res<LodStats>,
     mut ops: ResMut<LodOps>,
+    mut feedback: ResMut<LodFeedback>,
     frame: Option<ResMut<ExtractedFrame>>,
     mut resyncs: MessageWriter<LodResync>,
     mut state: Local<Extracted>,
@@ -165,6 +169,11 @@ pub(crate) fn extract_lod(
     let Some(mut frame) = frame else {
         return;
     };
+    if let Some(renderer) = frame.lod_renderer
+        && feedback.cannot_draw == renderer.drawable
+    {
+        feedback.cannot_draw = !renderer.drawable;
+    }
     let horizon = stats.off.is_none().then_some(stats.horizon as f32);
     let (input, resync) = frame_input(
         frame.lod_renderer,
@@ -290,7 +299,7 @@ mod tests {
         assert_eq!(world.resource::<LodSettings>(), &LodSettings::default());
         assert!(world.contains_resource::<LodStats>());
         assert!(world.contains_resource::<LodOps>());
-        assert!(world.contains_resource::<super::super::LodFeedback>());
+        assert!(world.contains_resource::<LodFeedback>());
         // No window, so no renderer: nothing for one.
         assert!(world.resource::<ExtractedFrame>().lod.is_none());
         assert!(world.resource::<ExtractedFrame>().lod_renderer.is_none());
@@ -393,6 +402,7 @@ mod tests {
         world.insert_resource(LodOps {
             ops: vec![remove(1)],
         });
+        world.init_resource::<LodFeedback>();
         let mut frame = ExtractedFrame::default();
         frame.lod_renderer = renderer(true, Some(LodSettings::default().arena_quads));
         world.insert_resource(frame);
@@ -448,6 +458,18 @@ mod tests {
             .expect("input");
         assert!(input.resync && input.ops.is_empty());
         assert_eq!(resyncs(&mut world), 1);
+        assert!(!world.resource::<LodFeedback>().cannot_draw);
+
+        // A renderer that cannot draw the LOD (GL, a failed smoke check or pass) turns the
+        // world side off; a frame without a renderer changes nothing; one that can turns it on.
+        let mut cannot = |world: &mut World, renderer| {
+            world.resource_mut::<ExtractedFrame>().lod_renderer = renderer;
+            schedule.run(world);
+            world.resource::<LodFeedback>().cannot_draw
+        };
+        assert!(cannot(&mut world, renderer(false, None)));
+        assert!(cannot(&mut world, None));
+        assert!(!cannot(&mut world, renderer(true, None)));
     }
 
     /// `lod_far` is `Some` exactly when `prepare` draws the LOD: an input that draws (enabled,

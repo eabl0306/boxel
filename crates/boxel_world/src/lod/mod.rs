@@ -318,6 +318,9 @@ pub enum LodOff {
     NoSource,
     /// No eye: no [`LodFocus`] and no viewer.
     NoEye,
+    /// The renderer cannot draw the LOD ([`LodFeedback::cannot_draw`]: a GL backend, a failed
+    /// smoke check or LOD pass).
+    Unsupported,
 }
 
 /// Counts of one level.
@@ -467,6 +470,10 @@ pub struct LodFeedback {
     /// forwarded from its own refusals: the coverage counts such a chunk as not drawn until it
     /// is sent again. Read before this frame's `ChunkMeshResync`, which clears them all.
     pub chunks: Vec<(ChunkPos, bool)>,
+    /// The renderer cannot draw the LOD (a GL backend, a failed smoke check or LOD pass): the
+    /// world side turns off ([`LodOff::Unsupported`]), keeps no node and starts no job, until a
+    /// renderer that can draw it clears this (it fills again from scratch).
+    pub cannot_draw: bool,
 }
 
 /// Written by a renderer that dropped its LOD nodes (a resync, which every new device starts
@@ -523,6 +530,8 @@ pub(crate) struct LodWorld {
     warned: Vec<LodOff>,
     outbox: Vec<LodOp>,
     arena_free: Option<u64>,
+    /// The renderer cannot draw the LOD ([`LodFeedback::cannot_draw`]).
+    cannot_draw: bool,
     started: Option<Instant>,
     filled_after: Option<Duration>,
 }
@@ -551,6 +560,7 @@ impl LodWorld {
             warned: Vec::new(),
             outbox: Vec::new(),
             arena_free: None,
+            cannot_draw: false,
             started: None,
             filled_after: None,
         }
@@ -599,6 +609,10 @@ impl LodWorld {
                 LodOff::NoSource => tracing::warn!(
                     generator,
                     "LOD off: the generator has no LOD source (WorldGenerator::lod)"
+                ),
+                LodOff::Unsupported => tracing::warn!(
+                    "LOD off: the renderer cannot draw it (a GL backend, or its smoke check or \
+                     pass failed)"
                 ),
                 LodOff::InvalidSettings | LodOff::NoEye | LodOff::Disabled => {}
             }
@@ -1131,6 +1145,7 @@ fn lod_coverage(
     if let Some(free) = feedback.arena_free_quads.take() {
         lod.arena_free = Some(free);
     }
+    lod.cannot_draw = feedback.cannot_draw;
     if resyncs.read().count() > 0 {
         lod.tree.resync(cov);
         lod.outbox.clear();
@@ -1188,6 +1203,10 @@ fn lod_plan(
     lod.check_content(&content, world.dimension, valid.levels);
     if !valid.enabled {
         lod.turn_off(LodOff::Disabled, name);
+        return;
+    }
+    if lod.cannot_draw {
+        lod.turn_off(LodOff::Unsupported, name);
         return;
     }
     if content.generator.lod().is_none() {
