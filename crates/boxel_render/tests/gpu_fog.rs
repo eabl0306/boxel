@@ -6,15 +6,17 @@
 //!   untouched (the composite discards); dropping the fog gives the plain depth back.
 //! - **Noise:** `fs_fog_debug_coverage` gives the CPU oracle's coverage and noise bit for bit,
 //!   at origins 0, `2^31 - 5`, `-2^40` and near the world limit, at cell corners and points
-//!   inside cells (the soft fog), across the rows of a rising threshold, between ticks.
+//!   inside cells (the soft fog), across the rows of a rising threshold and of the edges next to
+//!   the band's planes, between ticks; and the soft fog's edge weight at a column of heights.
 //! - **March:** on scenes whose depth is known exactly (a wide floor and the sky), each texel of
 //!   the march equals the reference march of `boxel_fog::march` (opacity bytes within 3, color
 //!   within 0.02, 0.5 % of the texels may differ where a ray grazes a cell edge), and each pixel
 //!   equals the reference composite of its texel over the fog-free pixel (2 / 255).
-//! - **Tiers:** every tier draws the scenes (flat clouds and volumetric clouds from below,
-//!   inside and above, a camera inside a blanket and inside a soft bank, a noisy bank over the
-//!   floor, fog over water, fog behind glass, dusk) like the best tier of its adapter, at half
-//!   and full resolution (0.1 % of the pixels, tolerance 2).
+//! - **Tiers:** every tier draws the scenes (flat clouds and volumetric clouds with edges from
+//!   below, just under them, inside and above, a camera inside a blanket and inside a soft bank,
+//!   an edged bank seen from its top's height, a noisy bank over the floor, fog over water, fog
+//!   behind glass, dusk) like the best tier of its adapter, at half and full resolution (0.1 %
+//!   of the pixels, tolerance 2).
 //! - **Origins:** the same camera with render origins a few blocks apart draws the same image,
 //!   with cubic and soft fog.
 //! - **Half resolution:** thin posts in front of dense fog look the same at half and full
@@ -333,10 +335,11 @@ fn soft_bank() -> FogLayer {
     l
 }
 
-/// Volumetric clouds: 6-block cells in a 24-block band over 3D noise, a rising threshold, a
-/// gray base and a lit top, soft within 10 blocks.
+/// Volumetric clouds: 6-block cells in a 36-block band over 3D noise, a rising threshold, uneven
+/// bottoms and tops (edges of 6 and 12 blocks), a gray base and a lit top, soft within 10
+/// blocks.
 fn cumulus() -> FogLayer {
-    let mut l = FogLayer::new(24, 48);
+    let mut l = FogLayer::new(24, 60);
     l.cell = [6, 6, 6];
     l.noise.dims = NoiseDims::Volume;
     l.noise.scale = 4;
@@ -344,6 +347,7 @@ fn cumulus() -> FogLayer {
     l.noise.seed = 31;
     l.threshold = 0.5;
     l.threshold_rise = 0.35;
+    (l.edge_bottom, l.edge_top) = (6, 12);
     l.softness = 0.2;
     l.density = 0.35;
     l.height_shade = [0.6, 1.0];
@@ -354,6 +358,15 @@ fn cumulus() -> FogLayer {
         start: 250.0,
         end: 400.0,
     };
+    l
+}
+
+/// The soft bank from y 2 to 18 with a top edge of half its height and a bottom edge of a cell:
+/// an uneven skyline of cubes instead of a plane at y 18.
+fn edged_bank() -> FogLayer {
+    let mut l = soft_bank();
+    (l.min_y, l.max_y) = (2, 18);
+    (l.edge_bottom, l.edge_top) = (2, 8);
     l
 }
 
@@ -416,6 +429,13 @@ fn shots() -> Vec<Shot> {
             true,
         ),
         shot(
+            "cumulus_under",
+            World::Floor,
+            look(DVec3::new(0.5, 22.0, 0.5), DVec3::new(50.0, 30.0, 80.0)),
+            vec![cumulus()],
+            true,
+        ),
+        shot(
             "cumulus_inside",
             World::Floor,
             look(DVec3::new(3.3, 35.5, 2.7), DVec3::new(60.0, 30.0, 70.0)),
@@ -434,6 +454,13 @@ fn shots() -> Vec<Shot> {
             World::Floor,
             look(DVec3::new(10.3, 7.5, 6.7), DVec3::new(40.0, 6.0, 40.0)),
             vec![soft_bank()],
+            true,
+        ),
+        shot(
+            "bank_top",
+            World::Floor,
+            look(DVec3::new(0.5, 18.0, 0.5), DVec3::new(60.0, 17.0, 80.0)),
+            vec![edged_bank()],
             true,
         ),
         shot(
@@ -609,7 +636,7 @@ fn check_against_reference(
     report: &mut Report,
 ) {
     let settings = FogSettings::new(shot.layers.clone());
-    let means: Vec<f32> = settings
+    let means: Vec<_> = settings
         .layers
         .iter()
         .map(boxel_fog::mean_coverage)
@@ -885,15 +912,16 @@ fn fog_costs_nothing_when_absent_off_or_out_of_reach() {
 
 /// `fs_fog_debug_coverage` equals the CPU oracle bit for bit, far from the origin too: at the
 /// cells' corners and at points inside them (what the soft fog reads), on rows below, inside
-/// and above a band whose threshold rises, at whole ticks and between them.
+/// and above a band whose threshold rises and on the rows of its edges, at whole ticks and
+/// between them; and the soft fog's edge weight over a column of heights through the band.
 #[test]
 fn the_gpu_noise_is_the_oracle_bit_for_bit() {
     let mut layers = Vec::new();
-    for (cell, scale, octaves, dims, rise) in [
-        ([1, 1, 1], 1, 1, NoiseDims::Flat, 0.0),
-        ([12, 4, 12], 4, 1, NoiseDims::Flat, 0.5),
-        ([2, 2, 2], 8, 2, NoiseDims::Volume, 0.0),
-        ([3, 5, 7], 64, 2, NoiseDims::Volume, 0.35),
+    for (cell, scale, octaves, dims, rise, edges) in [
+        ([1, 1, 1], 1, 1, NoiseDims::Flat, 0.0, (0, 0)),
+        ([12, 4, 12], 4, 1, NoiseDims::Flat, 0.5, (6, 10)),
+        ([2, 2, 2], 8, 2, NoiseDims::Volume, 0.0, (0, 3)),
+        ([3, 5, 7], 64, 2, NoiseDims::Volume, 0.35, (5, 17)),
     ] {
         let mut l = FogLayer::new(0, i64::from(cell[1]) * 8);
         l.cell = cell;
@@ -903,6 +931,7 @@ fn the_gpu_noise_is_the_oracle_bit_for_bit() {
         l.noise.seed = 0x5eed_0000_0000_0001 + u64::from(scale);
         l.threshold = 0.4;
         l.threshold_rise = rise;
+        (l.edge_bottom, l.edge_top) = edges;
         l.softness = 0.25;
         l.wind = [2.5, -0.75, -9.0];
         layers.push(l);
@@ -924,10 +953,20 @@ fn the_gpu_noise_is_the_oracle_bit_for_bit() {
     for_every_tier(|label, _tier, device, queue, _, report| {
         for (li, layer) in layers.iter().enumerate() {
             for origin in origins {
-                for (time, row, sub) in probes {
+                // The rows along the band's planes and the next ones in.
+                let band = LayerParams::new(layer, origin, 0).band_cells;
+                let edge_probes = [
+                    (FogTime::new(9, 123), band[1] - 1, 0),
+                    (FogTime::new(9, 123), band[1] - 2, 2048),
+                    (FogTime::new(9, 123), band[0], 0),
+                    (FogTime::new(9, 123), band[0] + 1, 4095),
+                ];
+                for (time, row, sub) in probes.into_iter().chain(edge_probes) {
                     let first = [-32, row, -24];
+                    let params = LayerParams::new(layer, origin, time);
+                    let y0 = (params.band[0] - 4.0).clamp(-1.0e6, 1.0e6);
                     let got = match debug_coverage(
-                        device, queue, layer, origin, time, first, sub, size,
+                        device, queue, layer, origin, time, first, sub, y0, size,
                     ) {
                         Ok(g) => g,
                         Err(e) => {
@@ -935,15 +974,12 @@ fn the_gpu_noise_is_the_oracle_bit_for_bit() {
                             return;
                         }
                     };
-                    let params = LayerParams::new(layer, origin, time);
                     let mut bad = 0;
                     for (i, g) in got.iter().enumerate() {
-                        let d = [
-                            first[0] + (i as u32 % size[0]) as i32,
-                            first[1],
-                            first[2] + (i as u32 / size[0]) as i32,
-                        ];
+                        let (x, z) = (i as u32 % size[0], i as u32 / size[0]);
+                        let d = [first[0] + x as i32, first[1], first[2] + z as i32];
                         let n = boxel_fog::noise::noise_at(&params, d, [sub; 3]);
+                        let y = y0 + (x + 64 * z) as f32 * 0.0625;
                         let want = [
                             boxel_fog::noise::coverage_from_noise(
                                 n,
@@ -951,6 +987,7 @@ fn the_gpu_noise_is_the_oracle_bit_for_bit() {
                                 params.gain,
                             ),
                             n as u32,
+                            boxel_fog::noise::point_edge(&params, y),
                         ];
                         if *g != want {
                             if bad == 0 {
