@@ -68,6 +68,9 @@ pub(crate) struct Node {
     pub(crate) state: NodeState,
     /// The hidden octants, as last computed (and sent, for a sent node).
     pub(crate) mask: u8,
+    /// Built from blocks that changed since (an edit): built again, while the renderer keeps
+    /// what it has of it.
+    pub(crate) stale: bool,
 }
 
 impl Node {
@@ -75,6 +78,7 @@ impl Node {
         Self {
             state: NodeState::Pending,
             mask: 0,
+            stale: false,
         }
     }
 
@@ -198,7 +202,7 @@ impl Column {
         let only: Vec<i64> = self
             .nodes
             .iter()
-            .filter(|(_, n)| matches!(n.state, NodeState::Pending))
+            .filter(|(_, n)| matches!(n.state, NodeState::Pending) || n.stale)
             .map(|(&y, _)| y)
             .collect();
         let (&lo, &hi) = (only.first()?, only.last()?);
@@ -757,6 +761,11 @@ impl Tree {
         self.work.push(c);
     }
 
+    /// True if columns whose work may have changed wait to be queued.
+    pub(crate) fn has_work(&self) -> bool {
+        !self.work.is_empty()
+    }
+
     /// The columns whose work may have changed since the last call.
     pub(crate) fn take_work(&mut self) -> Vec<ColumnKey> {
         std::mem::take(&mut self.work)
@@ -1006,71 +1015,26 @@ impl Tree {
             .expect("the column waits for the job");
         col.job = None;
         let first = col.band.is_none();
-        col.band = Some(band);
         let wanted = col.plan.wanted;
-        // Records outside the band were pending guesses: they are uniform.
-        let outside: Vec<i64> = col
-            .nodes
-            .iter()
-            .filter(|&(&y, n)| band.uniform_at(y).is_some() && !n.available())
-            .map(|(&y, _)| y)
-            .collect();
-        for y in outside {
-            if let Some(node) = col.nodes.remove(&y) {
-                tally(&mut self.counts, self.floor, c.node(dim, y), &node, false);
+        if first {
+            col.band = Some(band);
+            if wanted.is_some() {
+                self.known += 1;
+                // Uniform layers are available now.
+                self.chain_changed = true;
             }
-        }
-        if first && wanted.is_some() {
-            self.known += 1;
-            // Uniform layers are available now.
-            self.chain_changed = true;
-        }
-        if first && let Some(inside) = intersect(wanted, Some((band.lo, band.hi - 1))) {
-            for y in inside.0..=inside.1 {
-                self.want_record(c, y, false);
+            if let Some(inside) = intersect(wanted, Some((band.lo, band.hi - 1))) {
+                for y in inside.0..=inside.1 {
+                    self.want_record(c, y, false);
+                }
             }
+        } else {
+            // Edits came or went (`edits`): the band grows to their layers or shrinks back.
+            self.set_band(c, band, true, cov);
         }
         let mut too_big = 0;
         for (y, built) in nodes {
-            let key = c.node(dim, y);
-            if !self
-                .node(key)
-                .is_some_and(|n| matches!(n.state, NodeState::Pending))
-            {
-                continue;
-            }
-            let state = match built {
-                Built::Uniform | Built::Blank => NodeState::Blank,
-                Built::Mesh(mesh, octants) => {
-                    if c.level == 1 {
-                        self.lod1_quads.push((key.pos, octants));
-                        self.lod1_octants.insert(key.pos, octants);
-                    }
-                    NodeState::Ready {
-                        mesh,
-                        octants,
-                        sent: false,
-                        retry: None,
-                    }
-                }
-                Built::TooBig => {
-                    too_big += 1;
-                    NodeState::Failed
-                }
-            };
-            let (blank, ready) = (
-                matches!(state, NodeState::Blank),
-                matches!(state, NodeState::Ready { .. }),
-            );
-            self.update_node(key, |node| node.state = state);
-            if blank {
-                self.chain_changed = true;
-                self.touch(key, cov);
-            } else if ready {
-                self.sends.push_back(key);
-            } else {
-                self.lost_changed(key);
-            }
+            too_big += usize::from(self.apply_node(c.node(dim, y), built, cov));
         }
         self.too_big += too_big;
         if first {
@@ -1079,6 +1043,213 @@ impl Tree {
         }
         self.note_work(c);
         too_big
+    }
+
+    /// Applies what a job built of node `key` if it waits for it (pending, or stale). A stale
+    /// node the renderer has (a mesh, or nothing for a blank one) is replaced in this frame's
+    /// ops, so it stays available: no hole while it is built again. True if it is lost to a
+    /// too-big bucket.
+    fn apply_node(&mut self, key: ChunkKey, built: Built, cov: &ChunkCoverage) -> bool {
+        let Some(node) = self.node(key) else {
+            return false;
+        };
+        if !matches!(node.state, NodeState::Pending) && !node.stale {
+            return false;
+        }
+        let (was_available, was_lost, was_sent) = (node.available(), node.lost(), node.sent());
+        let was_blank = matches!(node.state, NodeState::Blank);
+        let retry = match node.state {
+            NodeState::Ready { retry, .. } => retry,
+            _ => None,
+        };
+        let too_big = matches!(built, Built::TooBig);
+        let mut replace = false;
+        let state = match built {
+            Built::Uniform | Built::Blank => NodeState::Blank,
+            Built::Mesh(mesh, octants) => {
+                if key.lod == 1 {
+                    self.lod1_quads.push((key.pos, octants));
+                    self.lod1_octants.insert(key.pos, octants);
+                }
+                replace = was_sent || (was_blank && self.chain_available(key));
+                NodeState::Ready {
+                    mesh,
+                    octants,
+                    sent: replace,
+                    retry: if replace { None } else { retry },
+                }
+            }
+            Built::TooBig => NodeState::Failed,
+        };
+        if key.lod == 1 && !matches!(state, NodeState::Ready { .. }) {
+            self.lod1_octants.remove(&key.pos);
+        }
+        let sendable = matches!(
+            state,
+            NodeState::Ready {
+                sent: false,
+                retry: None,
+                ..
+            }
+        );
+        self.update_node(key, |node| {
+            node.state = state;
+            node.stale = false;
+        });
+        if replace {
+            let mask = self.mask(key, cov);
+            let mesh = self
+                .update_node(key, |node| {
+                    node.mask = mask;
+                    match &node.state {
+                        NodeState::Ready { mesh, .. } => Arc::clone(mesh),
+                        _ => unreachable!("set above"),
+                    }
+                })
+                .expect("the record");
+            self.ops.push(LodOp::Upsert { key, mesh, mask });
+        } else if was_sent {
+            // Blank or lost now: the renderer drops the old mesh.
+            self.ops.push(LodOp::Remove { key });
+        }
+        if sendable {
+            self.sends.push_back(key);
+        }
+        let node = self.node(key).expect("the record");
+        let (now_available, now_lost) = (node.available(), node.lost());
+        if was_available && !now_available && key.lod >= 2 {
+            self.unsend_below(key, cov);
+        }
+        if was_available != now_available {
+            self.touch(key, cov);
+            if now_available {
+                self.chain_changed = true;
+            }
+        }
+        if was_lost != now_lost {
+            self.lost_changed(key);
+        }
+        too_big
+    }
+
+    /// Changes the known band of column `c` to `band` (edits grew it, or their removal shrinks
+    /// it). Records outside it go: their layers are uniform, so they stay available. Wanted
+    /// layers that enter it were uniform: they get blank records (the renderer had nothing of
+    /// them), `stale` if they are to be built.
+    pub(crate) fn set_band(
+        &mut self,
+        c: ColumnKey,
+        band: LodColumn,
+        stale: bool,
+        cov: &ChunkCoverage,
+    ) {
+        let Some(col) = self.columns.get_mut(&c) else {
+            return;
+        };
+        let Some(old) = col.band.replace(band) else {
+            return;
+        };
+        if old == band {
+            return;
+        }
+        let wanted = col.plan.wanted;
+        let outside: Vec<i64> = col
+            .nodes
+            .keys()
+            .copied()
+            .filter(|&y| band.uniform_at(y).is_some())
+            .collect();
+        for y in outside {
+            self.drop_to_uniform(c.node(self.dim, y), cov);
+        }
+        let Some(inside) = intersect(wanted, Some((band.lo, band.hi - 1))) else {
+            return;
+        };
+        for y in inside.0..=inside.1 {
+            if old.uniform_at(y).is_none() || self.columns[&c].nodes.contains_key(&y) {
+                continue;
+            }
+            let key = c.node(self.dim, y);
+            let node = Node {
+                state: NodeState::Blank,
+                mask: 0,
+                stale,
+            };
+            tally(&mut self.counts, self.floor, key, &node, true);
+            self.columns
+                .get_mut(&c)
+                .expect("the column")
+                .nodes
+                .insert(y, node);
+            self.recount_children(key, cov);
+            self.touch(key, cov);
+        }
+    }
+
+    /// Removes the record of `key`, whose layer is uniform now (an op if the renderer has it):
+    /// the layer stays available, so its descendants stay.
+    fn drop_to_uniform(&mut self, key: ChunkKey, cov: &ChunkCoverage) {
+        let Some(node) = self
+            .columns
+            .get_mut(&ColumnKey::of(key))
+            .and_then(|col| col.nodes.remove(&key.pos.y))
+        else {
+            return;
+        };
+        tally(&mut self.counts, self.floor, key, &node, false);
+        if node.sent() {
+            self.ops.push(LodOp::Remove { key });
+        }
+        if key.lod == 1 {
+            self.lod1_octants.remove(&key.pos);
+        }
+        self.dirty.remove(&key);
+        if !node.available() {
+            self.chain_changed = true;
+        }
+        self.touch(key, cov);
+        self.lost_changed(key);
+    }
+
+    /// Recomputes the covered children bits of node `key` (level 2 and up), which were not kept
+    /// while its layer was uniform.
+    fn recount_children(&mut self, key: ChunkKey, cov: &ChunkCoverage) {
+        if key.lod < 2 {
+            return;
+        }
+        let mut bits = 0u8;
+        for o in 0..8u8 {
+            let c = child(key, o);
+            if self.state(c).covered(self.children_bits(c, cov)) {
+                bits |= 1 << o;
+            }
+        }
+        if bits == 0 {
+            self.children.remove(&key);
+        } else {
+            self.children.insert(key, bits);
+        }
+        self.dirty.insert(key);
+    }
+
+    /// The blocks under layers `layers` of column `c` changed (an edit): a job running for the
+    /// column read the old ones (it is cancelled), the band grows to hold the layers (`edits`),
+    /// and their records are stale: built again, the old ones drawn meanwhile. A column whose
+    /// band is not known yet sees the edits in its first job.
+    pub(crate) fn mark_stale(&mut self, c: ColumnKey, layers: Span, cov: &ChunkCoverage) {
+        let Some(col) = self.columns.get_mut(&c) else {
+            return;
+        };
+        col.cancel();
+        if let Some(band) = col.band {
+            let grown = super::edits::widen(band, Some(layers));
+            self.set_band(c, grown, false, cov);
+            let col = self.columns.get_mut(&c).expect("the column");
+            for (_, node) in col.nodes.range_mut(layers.0..=layers.1) {
+                node.stale = true;
+            }
+        }
+        self.note_work(c);
     }
 
     /// Takes the sent descendants of node `key` off the renderer (`key` is no longer

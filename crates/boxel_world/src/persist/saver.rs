@@ -189,6 +189,12 @@ impl Persist {
         self.saved.get(&(dim, x, z)).map_or(&[], Vec::as_slice)
     }
 
+    /// Every saved (or staged) chunk column, in no order: with [`Persist::layers`] the far LOD
+    /// lists the saved chunks, whose cells it builds from their blocks (ADR 0031).
+    pub(crate) fn saved_columns(&self) -> impl Iterator<Item = ColumnKey> + '_ {
+        self.saved.keys().copied()
+    }
+
     /// Chunks staged and not handed to a save job yet.
     pub(crate) fn queued(&self) -> usize {
         self.queue.len()

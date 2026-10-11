@@ -600,7 +600,7 @@ fn settings_validate_their_ranges() {
 // The plugin, the tree and the jobs
 
 /// Small rings for fast tests: `R = 8`, `K = 2` (a horizon of 1,024 blocks), no frame budget.
-fn small() -> LodSettings {
+pub(super) fn small() -> LodSettings {
     LodSettings {
         ring_radius: 8,
         levels: 2,
@@ -611,7 +611,7 @@ fn small() -> LodSettings {
 
 /// A world of `steps` (bounds -2..=3, `test:` blocks) with the LOD on `executor`; the world's
 /// own jobs on `world_executor`.
-fn app_with(
+pub(super) fn app_with(
     steps: Steps,
     settings: LodSettings,
     executor: Arc<dyn JobExecutor>,
@@ -631,7 +631,7 @@ fn app_with(
     app
 }
 
-fn app(steps: Steps, settings: LodSettings) -> App {
+pub(super) fn app(steps: Steps, settings: LodSettings) -> App {
     app_with(
         steps,
         settings,
@@ -640,7 +640,7 @@ fn app(steps: Steps, settings: LodSettings) -> App {
     )
 }
 
-fn spawn(app: &mut App, at: DVec3) -> Entity {
+pub(super) fn spawn(app: &mut App, at: DVec3) -> Entity {
     app.world_mut()
         .spawn((
             Transform::from_translation(at),
@@ -651,9 +651,9 @@ fn spawn(app: &mut App, at: DVec3) -> Entity {
 
 /// What a renderer holds after applying the ops in order: each node's mask and quads.
 #[derive(Default)]
-struct Model {
-    nodes: HashMap<ChunkKey, (u8, u32)>,
-    upserts: Vec<ChunkKey>,
+pub(super) struct Model {
+    pub(super) nodes: HashMap<ChunkKey, (u8, u32)>,
+    pub(super) upserts: Vec<ChunkKey>,
 }
 
 impl Model {
@@ -698,7 +698,7 @@ impl Model {
 }
 
 /// One frame: update, take the ops into `model`, check it.
-fn frame(app: &mut App, model: &mut Model) {
+pub(super) fn frame(app: &mut App, model: &mut Model) {
     app.update();
     let ops = app.world_mut().resource_mut::<LodOps>().take();
     model.apply(ops);
@@ -709,7 +709,7 @@ fn frame(app: &mut App, model: &mut Model) {
 /// is in one frame), every node there has its parent chain available (the chain rule), its mask
 /// is the tree's mask for the coverage of this frame, and every octant it hides is drawn by
 /// something else or holds nothing (module docs of `tree`).
-fn check_model(app: &App, model: &Model) {
+pub(super) fn check_model(app: &App, model: &Model) {
     let lod = app.world().resource::<LodWorld>();
     let cov = app.world().resource::<LodCoverage>().coverage();
     let tree = &lod.tree;
@@ -780,7 +780,7 @@ fn children_hidden(model: &Model, tree: &Tree, cov: &ChunkCoverage, key: ChunkKe
 }
 
 /// Frames until the LOD is filled (panics after `max` frames).
-fn fill(app: &mut App, model: &mut Model, max: usize) -> usize {
+pub(super) fn fill(app: &mut App, model: &mut Model, max: usize) -> usize {
     for i in 0..max {
         frame(app, model);
         let stats = app.world().resource::<LodStats>();
@@ -795,7 +795,7 @@ fn fill(app: &mut App, model: &mut Model, max: usize) -> usize {
 }
 
 /// The incremental covered bits equal a from-scratch walk.
-fn assert_bits_from_scratch(app: &App) {
+pub(super) fn assert_bits_from_scratch(app: &App) {
     let lod = app.world().resource::<LodWorld>();
     let cov = app.world().resource::<LodCoverage>().coverage().clone();
     let incremental: HashMap<ChunkKey, u8> = lod
@@ -1114,6 +1114,9 @@ fn a_busy_world_runs_only_class_0_columns() {
         },
         only: None,
         cancel: Arc::new(AtomicBool::new(false)),
+        overlays: Vec::new(),
+        edit_layers: None,
+        fallback: None,
     };
     state.jobs.hand_off(job, 2);
     assert!(state.jobs.handed_off_columns().contains(&(c, 2)));
@@ -1739,11 +1742,16 @@ fn shrinking_the_radius_keeps_every_published_chunk_inside_a_wanted_lod1_node() 
 
 #[test]
 fn a_generator_without_a_source_turns_the_lod_off() {
+    // Without the fallback (`fallback` has its own tests).
     let steps = Steps {
         no_lod: true,
         ..Steps::new(20)
     };
-    let mut app = app(steps, small());
+    let settings = LodSettings {
+        fallback_max_level: 0,
+        ..small()
+    };
+    let mut app = app(steps, settings);
     spawn(&mut app, DVec3::new(10.0, 60.0, 10.0));
     for _ in 0..3 {
         app.update();
@@ -1924,6 +1932,9 @@ fn lod_jobs_hand_the_mesher_cells_from_the_source() {
         },
         only: None,
         cancel: Arc::new(AtomicBool::new(false)),
+        overlays: Vec::new(),
+        edit_layers: None,
+        fallback: None,
     };
     let LodMessage::Built { id, column, nodes } = jobs::run_column(&input) else {
         panic!("a built column");

@@ -1,7 +1,10 @@
 //! LOD jobs (ADR 0031): one job builds one column of one level. It asks the generator's
-//! [`LodSource`] for the column's layers, then for each node with cells fills a
-//! [`PaddedChunk`], meshes it with the ordinary mesher (no light, no AO) and runs the LOD
-//! post-passes ([`mesh_node`]).
+//! [`LodSource`] for the column's layers, lays the pyramids of the edited chunks its nodes touch
+//! over their cells (`edits`), then for each node with cells fills a [`PaddedChunk`], meshes it
+//! with the ordinary mesher (no light, no AO) and runs the LOD post-passes ([`mesh_node`]). A
+//! generator without a source gets level-1 cells from its real chunks instead (`fallback`).
+//!
+//! Pyramid jobs (`edits`) share the result channel and its contract, outside the in-flight cap.
 //!
 //! The jobs copy the world's result contract (`crate::jobs`) without sharing its state: every
 //! spawned job sends EXACTLY ONE message, the body runs under `catch_unwind`, a token whose `Drop`
@@ -17,12 +20,15 @@
 //! that finishes a job starts the first of them while fewer than the in-flight cap run. So the
 //! workers stay busy between frames, at any frame rate, and a handed-off job is spawned at the
 //! back of the pool's queue, behind whatever the world queued meanwhile.
+use super::edits::{self, Pyramid, nodes_touching};
+use super::fallback::{self, FallbackInput};
+use super::plan::Span;
 use crate::jobs::JobExecutor;
 use boxel_mesh::lod::{LodMaterials, fits, mesh_node, octant_of};
 use boxel_mesh::{ChunkMesh, Mesher, PaddedChunk};
-use boxel_voxel::BlockRegistry;
+use boxel_voxel::{BlockRegistry, BlockState, ChunkKey, ChunkPos};
 use boxel_worldgen::WorldGenerator;
-use boxel_worldgen::lod::{LodColumn, LodNode, LodRequest, LodScratch};
+use boxel_worldgen::lod::{LodCells, LodColumn, LodNode, LodRequest, LodScratch};
 use crossbeam_channel::{Receiver, Sender};
 use std::cell::RefCell;
 use std::cmp::Ordering as CmpOrdering;
@@ -48,6 +54,12 @@ pub(crate) struct JobInput {
     /// Mesh only these layers (a second job for the nodes a first one left); `None`: all.
     pub(crate) only: Option<Vec<i64>>,
     pub(crate) cancel: Arc<AtomicBool>,
+    /// The pyramids of the edited chunks the requested layers touch (chunk position, pyramid).
+    pub(crate) overlays: Vec<(ChunkPos, Arc<Pyramid>)>,
+    /// The layers every edited chunk of the column reaches: the band grows to hold them.
+    pub(crate) edit_layers: Option<Span>,
+    /// The fallback's input, for a generator without a source.
+    pub(crate) fallback: Option<FallbackInput>,
 }
 
 /// One node of a finished job.
@@ -75,6 +87,11 @@ pub(crate) enum LodMessage {
     },
     /// The generator has no LOD source.
     NoSource { id: u64 },
+    /// A pyramid job's pyramids.
+    Pyramids {
+        id: u64,
+        pyramids: Vec<(ChunkKey, Arc<Pyramid>)>,
+    },
     /// The job saw its cancel flag.
     Cancelled { id: u64 },
     /// The job panicked or was dropped.
@@ -87,6 +104,7 @@ impl LodMessage {
         match *self {
             LodMessage::Built { id, .. }
             | LodMessage::NoSource { id }
+            | LodMessage::Pyramids { id, .. }
             | LodMessage::Cancelled { id }
             | LodMessage::Failed { id, .. } => id,
         }
@@ -132,6 +150,8 @@ impl Drop for ResultToken {
 #[derive(Default)]
 struct Scratch {
     source: LodScratch,
+    /// A node's cells with the edits laid over them, or the fallback's.
+    cells: LodCells,
     padded: PaddedChunk,
     mesher: Mesher,
     mesh: ChunkMesh,
@@ -153,69 +173,187 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// One node's cells meshed (no light, no AO, the LOD post-passes).
+pub(crate) fn mesh_cells(
+    materials: &LodMaterials,
+    level: u8,
+    cells: &[BlockState],
+    padded: &mut PaddedChunk,
+    mesher: &mut Mesher,
+    mesh: &mut ChunkMesh,
+) -> Built {
+    materials.fill(cells, padded);
+    mesh_node(mesher, padded, materials, level, mesh);
+    if mesh.is_empty() {
+        Built::Blank
+    } else if !fits(mesh) {
+        Built::TooBig
+    } else {
+        let octants = mesh.quads.iter().fold(0u8, |o, &q| o | 1 << octant_of(q));
+        Built::Mesh(Arc::new(mesh.clone()), octants)
+    }
+}
+
+/// What a job builds of its nodes: the nodes, how many it meshed (at most `max`; the rest wait
+/// for another job) and whether it saw its cancel flag.
+struct Nodes<'a> {
+    input: &'a JobInput,
+    nodes: Vec<(i64, Built)>,
+    meshed: usize,
+    max: usize,
+    cancelled: bool,
+}
+
+impl Nodes<'_> {
+    /// Builds node `layer` from `cells`: uniform, or meshed if the job may mesh one more.
+    fn build(
+        &mut self,
+        layer: i64,
+        cells: &LodCells,
+        padded: &mut PaddedChunk,
+        mesher: &mut Mesher,
+        mesh: &mut ChunkMesh,
+    ) {
+        if self.cancelled {
+            return;
+        }
+        if cells.uniform().is_some() {
+            self.nodes.push((layer, Built::Uniform));
+            return;
+        }
+        if self.input.cancel.load(Ordering::Relaxed) {
+            self.cancelled = true;
+            return;
+        }
+        if self.meshed == self.max {
+            return;
+        }
+        self.meshed += 1;
+        let level = self.input.request.level;
+        let built = mesh_cells(
+            &self.input.materials,
+            level,
+            &cells.0[..],
+            padded,
+            mesher,
+            mesh,
+        );
+        self.nodes.push((layer, built));
+    }
+}
+
 /// The column job (module docs).
 pub(crate) fn run_column(input: &JobInput) -> LodMessage {
     let id = input.id;
-    let Some(source) = input.generator.lod() else {
+    let source = input.generator.lod();
+    if source.is_none() && input.fallback.is_none() {
         return LodMessage::NoSource { id };
-    };
+    }
     SCRATCH.with(|cell| {
         let mut slot = cell.borrow_mut();
         let s = slot.get_or_insert_with(Box::default);
         let Scratch {
             source: scratch,
+            cells,
             padded,
             mesher,
             mesh,
         } = &mut **s;
-        let level = input.request.level;
-        let mut nodes = Vec::new();
-        let mut meshed = 0;
-        let mut cancelled = false;
-        let column = source.column(
-            &input.request,
-            &input.registry,
-            scratch,
-            &mut |layer, node| {
-                if cancelled
-                    || input
-                        .only
-                        .as_ref()
-                        .is_some_and(|only| !only.contains(&layer))
-                {
-                    return;
-                }
-                match node {
-                    LodNode::Uniform(_) => nodes.push((layer, Built::Uniform)),
-                    LodNode::Cells(cells) => {
-                        if input.cancel.load(Ordering::Relaxed) {
-                            cancelled = true;
+        let req = &input.request;
+        let level = req.level;
+        let wanted = |layer: i64| input.only.as_ref().is_none_or(|only| only.contains(&layer));
+        // The layers the edits' pyramids reach.
+        let reach: Vec<Span> = input
+            .overlays
+            .iter()
+            .map(|(c, _)| nodes_touching(c.y, level))
+            .collect();
+        let edited = |layer: i64| reach.iter().any(|&(lo, hi)| lo <= layer && layer <= hi);
+        let mut out = Nodes {
+            input,
+            nodes: Vec::new(),
+            meshed: 0,
+            max: if input.fallback.is_some() {
+                fallback::NODES_PER_JOB
+            } else {
+                MAX_NODES_PER_JOB
+            },
+            cancelled: false,
+        };
+        let column = match (source, &input.fallback) {
+            (Some(source), _) => {
+                let mut emitted = Vec::new();
+                let from_source =
+                    source.column(req, &input.registry, scratch, &mut |layer, node| {
+                        if out.cancelled || !wanted(layer) {
                             return;
                         }
-                        if meshed == MAX_NODES_PER_JOB {
+                        emitted.push(layer);
+                        if edited(layer) {
+                            match node {
+                                LodNode::Uniform(state) => cells.fill(state),
+                                LodNode::Cells(c) => cells.0.copy_from_slice(&c.0[..]),
+                            }
+                            edits::overlay(cells, level, req.key(layer).pos, &input.overlays);
+                            out.build(layer, cells, padded, mesher, mesh);
                             return;
                         }
-                        meshed += 1;
-                        input.materials.fill(&cells.0[..], padded);
-                        mesh_node(mesher, padded, &input.materials, level, mesh);
-                        let built = if mesh.is_empty() {
-                            Built::Blank
-                        } else if !fits(mesh) {
-                            Built::TooBig
-                        } else {
-                            let octants =
-                                mesh.quads.iter().fold(0u8, |o, &q| o | 1 << octant_of(q));
-                            Built::Mesh(Arc::new(mesh.clone()), octants)
-                        };
-                        nodes.push((layer, built));
+                        match node {
+                            LodNode::Uniform(_) => out.nodes.push((layer, Built::Uniform)),
+                            LodNode::Cells(c) => out.build(layer, c, padded, mesher, mesh),
+                        }
+                    });
+                // The layers the edits added to the band, which the source left out.
+                let band = edits::widen(from_source, input.edit_layers);
+                let first = (*req.layers.start()).max(band.lo);
+                let last = (*req.layers.end()).min(band.hi - 1);
+                for layer in first..=last {
+                    if out.cancelled || !wanted(layer) || emitted.contains(&layer) {
+                        continue;
+                    }
+                    if edited(layer) {
+                        cells.fill(from_source.uniform_at(layer).unwrap_or(BlockState::AIR));
+                        edits::overlay(cells, level, req.key(layer).pos, &input.overlays);
+                        out.build(layer, cells, padded, mesher, mesh);
+                    } else {
+                        out.nodes.push((layer, Built::Uniform));
                     }
                 }
-            },
-        );
-        if cancelled {
+                band
+            }
+            (None, Some(fb)) => {
+                let band = fb.band;
+                let first = (*req.layers.start()).max(band.lo);
+                let last = (*req.layers.end()).min(band.hi - 1);
+                for layer in first..=last {
+                    if out.cancelled || out.meshed == out.max {
+                        break;
+                    }
+                    if !wanted(layer) {
+                        continue;
+                    }
+                    fallback::fill(
+                        fb,
+                        req.dim,
+                        req.key(layer).pos,
+                        &*input.generator,
+                        &input.registry,
+                        cells,
+                    );
+                    out.build(layer, cells, padded, mesher, mesh);
+                }
+                band
+            }
+            (None, None) => unreachable!("checked above"),
+        };
+        if out.cancelled {
             LodMessage::Cancelled { id }
         } else {
-            LodMessage::Built { id, column, nodes }
+            LodMessage::Built {
+                id,
+                column,
+                nodes: out.nodes,
+            }
         }
     })
 }
@@ -500,6 +638,31 @@ impl LodJobs {
         }
     }
 
+    /// Spawns a job outside the in-flight cap (a pyramid job): `body` under the result contract
+    /// (module docs) on the executor, sending exactly one message for `id`.
+    pub(crate) fn spawn_free(
+        &mut self,
+        id: u64,
+        body: impl FnOnce() -> LodMessage + Send + 'static,
+    ) {
+        self.in_flight += 1;
+        let token = ResultToken {
+            id,
+            tx: Some(self.tx.clone()),
+        };
+        self.shared.executor.spawn(Box::new(move || {
+            let start = Instant::now();
+            let message = match catch_unwind(AssertUnwindSafe(body)) {
+                Ok(message) => message,
+                Err(payload) => LodMessage::Failed {
+                    id,
+                    panic: panic_text(payload.as_ref()),
+                },
+            };
+            token.send(message, start.elapsed());
+        }));
+    }
+
     /// Hands `input` off to the workers, last in line.
     pub(crate) fn hand_off(&mut self, input: JobInput, class: u8) {
         let job = self.job(input, class);
@@ -567,7 +730,7 @@ impl LodJobs {
             LodMessage::Failed { .. } => self.failed += 1,
             LodMessage::Cancelled { .. } => self.cancelled += 1,
             LodMessage::Built { .. } => self.times.record(report.busy),
-            LodMessage::NoSource { .. } => {}
+            LodMessage::NoSource { .. } | LodMessage::Pyramids { .. } => {}
         }
         Some(report)
     }

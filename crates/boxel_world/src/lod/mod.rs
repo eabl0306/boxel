@@ -11,7 +11,13 @@
 //! [`LodOp`]s through [`LodOps`]: meshes, removals, and the octants each node hides because
 //! finer nodes or full-detail chunks draw them ([`coverage`]).
 //!
+//! Player edits show at a distance: the cells of edited (and saved) chunks come from their
+//! blocks, laid over the source's (the `edits` module, levels 1 to 5). A generator without a
+//! source gets level 1 only, from its real chunks (the `fallback` module).
+//!
 //! Per frame (in `Update`, after the world's systems, chained [`LodSystems`]):
+//! 0. `Edits`: the frame's block changes and unloads into the edited set; the changes whose
+//!    debounce ended ask for pyramid jobs, whose results mark the nodes they reach stale.
 //! 1. `Coverage`: the world's mesh events and the main renderer's resyncs and refusals, read in
 //!    full whatever the budget, feed the full-detail coverage ([`LodCoverage`]); the renderer's
 //!    own resyncs ([`LodResync`]) and refusals ([`LodFeedback`]) make nodes unavailable. The
@@ -33,12 +39,14 @@
 //! writes ops (finished meshes wait for `Collect`).
 use crate::interest::Viewer;
 use crate::jobs::{JobExecutor, TaskPoolExecutor};
+use crate::persist::WorldStore;
 use crate::streaming::ViewerChunks;
+use crate::streaming::WorldJobs;
 use crate::{
-    ChunkDataEvent, ChunkMap, ChunkMeshEvent, ChunkMeshResync, ChunkViewer, WorldContent,
-    WorldSettings, WorldStats, WorldSystems,
+    BlockChanged, ChunkDataEvent, ChunkMap, ChunkMeshEvent, ChunkMeshResync, ChunkViewer,
+    WorldContent, WorldSettings, WorldStats, WorldSystems,
 };
-use boxel_app::{App, Idle, IdleStep, IdleWanted, IdleWork, Plugin, Update};
+use boxel_app::{App, Idle, IdleStep, IdleWanted, IdleWork, Plugin, Startup, Update};
 use boxel_ecs::prelude::*;
 use boxel_math::{DVec3, I64Vec3, Vec3};
 use boxel_mesh::ChunkMesh;
@@ -52,10 +60,14 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 pub mod coverage;
+mod edits;
+mod fallback;
 mod jobs;
 mod plan;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_edits;
 mod tree;
 
 pub use coverage::{
@@ -63,6 +75,8 @@ pub use coverage::{
 };
 pub use plan::{KeepExtent, MAX_LEVELS, Thresholds, node_edge, world_limit};
 
+use edits::{ChunkSource, Edits, ForColumn};
+use fallback::FallbackInput;
 use jobs::{JobInput, LodJobs, LodMessage};
 use plan::{ColumnKey, Eye, Plan};
 use tree::{Column, Tree};
@@ -121,10 +135,11 @@ pub struct LodSettings {
     /// few hundred at least); and, between frames, per idle step. Reading the mesh events and the
     /// renderer's messages is not counted.
     pub frame_budget: Duration,
-    /// How long an edited chunk waits before its LOD nodes are rebuilt (milestone 2).
+    /// How long a changed chunk waits after its last change before its LOD nodes are built
+    /// again (`edits`).
     pub edit_debounce: Duration,
-    /// Up to which level a generator without a LOD source is drawn from its real chunks
-    /// (0..=1; milestone 2).
+    /// Up to which level a generator without a LOD source is drawn from its real chunks (0..=1;
+    /// 0: no LOD for it). Its vertical chunks must be bounded (64 layers at most).
     pub fallback_max_level: u8,
     /// Tints each level with its own color. Read by the renderer.
     pub debug_tint: bool,
@@ -254,7 +269,7 @@ impl Default for LodWorldPlugin {
 /// The LOD's system sets, chained in `Update` after [`WorldSystems::Visibility`].
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LodSystems {
-    /// Player edits (milestone 2).
+    /// Player edits: block changes, unloads and pyramid jobs (`edits`).
     Edits,
     /// Resyncs, the renderer's feedback and the full-detail coverage.
     Coverage,
@@ -292,12 +307,16 @@ impl Plugin for LodWorldPlugin {
                     .chain()
                     .after(WorldSystems::Visibility),
             )
+            // Its order against the persistence's startup does not matter: it only lists the
+            // saved chunks.
+            .add_systems(Startup, lod_seed_saved.ambiguous_with_all())
             .add_systems(
                 Update,
                 (
                     track_viewer_eye
                         .ambiguous_with_all()
                         .before(LodSystems::Plan),
+                    lod_edits.in_set(LodSystems::Edits),
                     lod_coverage.in_set(LodSystems::Coverage),
                     lod_plan.in_set(LodSystems::Plan),
                     lod_dispatch.in_set(LodSystems::Dispatch),
@@ -337,7 +356,8 @@ pub enum LodOff {
     Disabled,
     /// The keep region of the viewers reaches the preset's horizon ([`Thresholds::guard`]).
     Guard,
-    /// The generator has no LOD source (the fallback from real chunks is milestone 2).
+    /// The generator has no LOD source, and no fallback ([`LodSettings::fallback_max_level`] 0,
+    /// or its vertical chunks are not bounded: `fallback`).
     NoSource,
     /// No eye: no [`LodFocus`] and no viewer.
     NoEye,
@@ -409,6 +429,12 @@ pub struct LodStats {
     pub covered_chunks: usize,
     /// Loaded chunks watched for an empty mesh.
     pub watched_chunks: usize,
+    /// Chunks edited by the player or saved: their cells come from their blocks.
+    pub edited_chunks: usize,
+    /// Their cells kept (one pyramid of levels 1 to 5 per chunk).
+    pub pyramids: usize,
+    /// The generator has no coarse source: level 1 only, from the real chunks.
+    pub fallback: bool,
 }
 
 impl LodStats {
@@ -544,9 +570,17 @@ pub(crate) struct LodWorld {
     jobs: LodJobs,
     /// Columns of the jobs in flight.
     jobs_of: HashMap<u64, ColumnKey>,
-    /// The last valid settings, and the last error logged.
+    /// The settings the LOD follows: the last valid ones, at level 1 only for the fallback.
     settings: Option<LodSettings>,
+    /// The last valid settings, and the last error logged.
+    validated: Option<LodSettings>,
     error: Option<LodSettingsError>,
+    /// The generator has no coarse source: level-1 cells come from its chunks (`fallback`).
+    fallback: bool,
+    /// Edited chunks and their pyramids (`edits`).
+    edits: Edits,
+    /// The world's store, with persistence (edited chunks are read from it once unloaded).
+    store: Option<WorldStore>,
     planned: Option<Planned>,
     /// The keep extent the last thresholds followed (held while published chunks lie past a
     /// smaller one: [`plan::reaches_published`]).
@@ -588,7 +622,11 @@ impl LodWorld {
             jobs: LodJobs::new(executor),
             jobs_of: HashMap::default(),
             settings: None,
+            validated: None,
             error: None,
+            fallback: false,
+            edits: Edits::default(),
+            store: None,
             planned: None,
             keep: None,
             plan: Plan::default(),
@@ -619,17 +657,17 @@ impl LodWorld {
     /// Checks the settings when they changed (or never were): a valid change replaces the
     /// settings, an invalid one is logged once and the last valid ones stay.
     fn check_settings(&mut self, settings: &LodSettings, changed: bool) {
-        if !changed && (self.settings.is_some() || self.error.is_some()) {
+        if !changed && (self.validated.is_some() || self.error.is_some()) {
             return;
         }
         match settings.validate() {
             Ok(()) => {
-                self.settings = Some(settings.clone());
+                self.validated = Some(settings.clone());
                 self.error = None;
             }
             Err(e) => {
                 if self.error.as_ref() != Some(&e) {
-                    let kept = if self.settings.is_some() {
+                    let kept = if self.validated.is_some() {
                         "keeping the last valid settings"
                     } else {
                         "no LOD"
@@ -656,7 +694,9 @@ impl LodWorld {
                 ),
                 LodOff::NoSource => tracing::warn!(
                     generator,
-                    "LOD off: the generator has no LOD source (WorldGenerator::lod)"
+                    "LOD off: the generator has no LOD source (WorldGenerator::lod), and no \
+                     fallback (LodSettings::fallback_max_level 0, or its vertical_chunks are \
+                     not bounded)"
                 ),
                 LodOff::Unsupported => tracing::warn!(
                     "LOD off: the renderer cannot draw it (a GL backend, or its smoke check or \
@@ -692,6 +732,8 @@ impl LodWorld {
         if !same {
             let materials = Arc::new(LodMaterials::from_registry(&content.registry));
             self.content = Some((generator, registry, materials));
+            // Pyramids follow the registry's classes (and a new generator's blocks).
+            self.edits.forget_pyramids();
         }
         if !same || self.tree.dim != dim || self.tree.levels != levels {
             self.outbox.extend(self.tree.clear());
@@ -1016,10 +1058,12 @@ impl LodWorld {
         angle - (radius / dist).asin() < self.view.half_angle
     }
 
-    /// The in-flight cap.
+    /// The in-flight cap (one for the fallback, whose jobs read dozens of chunks each).
     fn cap(&self, settled: bool) -> usize {
         self.settings.as_ref().map_or(0, |s| {
-            if settled {
+            if self.fallback {
+                1
+            } else if settled {
                 s.in_flight_settled
             } else {
                 s.in_flight_busy
@@ -1031,7 +1075,8 @@ impl LodWorld {
     /// ones to the workers ([`HANDOFF_PER_SLOT`] per slot), until `until` (checked every
     /// [`CLOCK_EVERY`] results and dispatches), again while results keep arriving. While the
     /// world is `busy`, only class-0 columns start (handed-off ones of other classes are taken
-    /// back).
+    /// back). Fallback jobs read the loaded chunks when they are made: without `map` (an idle
+    /// step) none starts.
     fn run_jobs(
         &mut self,
         until: Instant,
@@ -1039,6 +1084,7 @@ impl LodWorld {
         busy: bool,
         content: &WorldContent,
         cov: &ChunkCoverage,
+        map: Option<&ChunkMap>,
     ) {
         self.jobs.set_cap(cap);
         if busy {
@@ -1055,9 +1101,10 @@ impl LodWorld {
             }
             self.queue_work(cov, Some(until));
             let mut spawned = 0;
-            while self.off.is_none() && self.jobs.has_room() {
+            let may_start = self.off.is_none() && (!self.fallback || map.is_some());
+            while may_start && self.jobs.has_room() {
                 if !self.jobs.start_handed_off() {
-                    let Some((input, class)) = self.next_job(content, busy) else {
+                    let Some((input, class)) = self.next_job(content, busy, map) else {
                         break;
                     };
                     self.jobs.spawn(input, class);
@@ -1067,8 +1114,9 @@ impl LodWorld {
                     return;
                 }
             }
-            while self.off.is_none() && self.jobs.handed_off() < HANDOFF_PER_SLOT * cap {
-                let Some((input, class)) = self.next_job(content, busy) else {
+            // The fallback hands nothing off: its jobs copy the loaded chunks when made.
+            while may_start && !self.fallback && self.jobs.handed_off() < HANDOFF_PER_SLOT * cap {
+                let Some((input, class)) = self.next_job(content, busy, map) else {
                     break;
                 };
                 self.jobs.hand_off(input, class);
@@ -1086,6 +1134,28 @@ impl LodWorld {
     /// Applies one job's report.
     fn apply(&mut self, report: jobs::LodReport, cov: &ChunkCoverage, generator: &str) {
         let id = report.message.id();
+        if self.edits.is_job(id) {
+            let pyramids = match report.message {
+                LodMessage::Pyramids { pyramids, .. } => pyramids,
+                LodMessage::Failed { panic, .. } => {
+                    tracing::warn!(
+                        generator,
+                        "a LOD pyramid job failed: {panic}; those edited chunks show the \
+                         generator's cells at a distance"
+                    );
+                    Vec::new()
+                }
+                _ => Vec::new(),
+            };
+            let (changed, ready) = self.edits.done(id, pyramids);
+            for key in changed {
+                self.mark_dirty(key, cov);
+            }
+            for c in ready {
+                self.queue(c, false, cov);
+            }
+            return;
+        }
         let Some(c) = self.jobs_of.remove(&id) else {
             return;
         };
@@ -1103,7 +1173,9 @@ impl LodWorld {
                     );
                 }
             }
-            LodMessage::NoSource { .. } | LodMessage::Cancelled { .. } => {
+            LodMessage::NoSource { .. }
+            | LodMessage::Cancelled { .. }
+            | LodMessage::Pyramids { .. } => {
                 self.tree.job_ended(c, id);
             }
             LodMessage::Failed { panic, .. } => {
@@ -1121,9 +1193,17 @@ impl LodWorld {
 
     /// Takes the best queued column (stale entries are skipped) and starts its job's
     /// bookkeeping; the caller spawns or hands off the job. `None` if none is left, or if the
-    /// world is `busy` and the best is not of class 0.
-    fn next_job(&mut self, content: &WorldContent, busy: bool) -> Option<(JobInput, u8)> {
+    /// world is `busy` and the best is not of class 0. A column whose edited chunks lack their
+    /// pyramids waits for them, out of the queue (`edits`). A fallback job copies where each
+    /// loaded chunk of its footprint reads from `map`.
+    fn next_job(
+        &mut self,
+        content: &WorldContent,
+        busy: bool,
+        map: Option<&ChunkMap>,
+    ) -> Option<(JobInput, u8)> {
         let materials = Arc::clone(&self.content.as_ref()?.2);
+        let dim = self.tree.dim;
         while let Some(&entry) = self.jobs.queue.peek() {
             let c = entry.column;
             let current = self
@@ -1145,6 +1225,43 @@ impl LodWorld {
             let Some(work) = col.work() else {
                 continue;
             };
+            let mut request = work.layers;
+            let (overlays, edit_layers, fallback) = if self.fallback {
+                let edited = self.edits.layers(c, dim);
+                let vertical = content.generator.vertical_chunks();
+                let (Some(band), Some(map)) = (fallback::band(&vertical, edited), map) else {
+                    continue;
+                };
+                // Only the band's layers read chunks (the others are air).
+                let span = plan::intersect(Some(work.layers), Some((band.lo, band.hi - 1)));
+                let mut chunks = HashMap::default();
+                if let Some(span) = span {
+                    request = span;
+                    for pos in fallback::footprint([c.x, c.z], span) {
+                        match ChunkSource::of(map, pos) {
+                            ChunkSource::Unloaded => {}
+                            source => {
+                                chunks.insert(pos, source);
+                            }
+                        }
+                    }
+                } else {
+                    // Nothing to build: the job only reports the band.
+                    request = (band.hi, band.hi - 1);
+                }
+                let input = FallbackInput {
+                    band,
+                    chunks,
+                    store: self.store.clone(),
+                    materials: Arc::clone(&materials),
+                };
+                (Vec::new(), None, Some(input))
+            } else {
+                match self.edits.for_column(c, work.layers, dim) {
+                    ForColumn::Wait => continue,
+                    ForColumn::Ready { overlays, layers } => (overlays, layers, None),
+                }
+            };
             let id = self.jobs.next_id();
             let cancel = Arc::new(AtomicBool::new(false));
             self.tree.start_job(c, id, Arc::clone(&cancel));
@@ -1158,10 +1275,13 @@ impl LodWorld {
                     dim: self.tree.dim,
                     level: c.level,
                     column: [c.x, c.z],
-                    layers: work.layers.0..=work.layers.1,
+                    layers: request.0..=request.1,
                 },
                 only: work.only,
                 cancel,
+                overlays,
+                edit_layers,
+                fallback,
             };
             return Some((input, entry.class));
         }
@@ -1211,9 +1331,11 @@ impl LodWorld {
             && self.jobs.queue.is_empty()
             && self.jobs.handed_off() == 0
             && self.work_left.is_empty()
+            && !self.tree.has_work()
             && self.replan.is_none()
             && self.tree.sends_waiting() == 0
             && !self.tree.has_refused()
+            && !self.edits.busy()
     }
 
     /// This frame's stats.
@@ -1250,12 +1372,76 @@ impl LodWorld {
             published_chunks: coverage.coverage().published_chunks(),
             covered_chunks: coverage.coverage().covered_chunks(),
             watched_chunks: coverage.watched(),
+            edited_chunks: self.edits.len(),
+            pyramids: self.edits.cached(),
+            fallback: self.fallback,
         }
     }
 
     /// True if jobs run or wait.
     fn has_job_work(&self) -> bool {
-        self.jobs.in_flight > 0 || !self.jobs.queue.is_empty() || !self.work_left.is_empty()
+        self.jobs.in_flight > 0
+            || !self.jobs.queue.is_empty()
+            || !self.work_left.is_empty()
+            || self.tree.has_work()
+            || self.edits.busy()
+    }
+
+    /// The blocks of edited chunk `key` changed (or went back to the generator's): every node
+    /// whose padded cells reach into it, at levels 1 to 5, is built again (`edits`).
+    fn mark_dirty(&mut self, key: ChunkKey, cov: &ChunkCoverage) {
+        if key.dim != self.tree.dim || key.lod != 0 {
+            return;
+        }
+        let top = self.tree.levels.min(edits::PYRAMID_LEVELS);
+        for level in 1..=top {
+            let (x0, x1) = edits::nodes_touching(key.pos.x, level);
+            let (z0, z1) = edits::nodes_touching(key.pos.z, level);
+            let layers = edits::nodes_touching(key.pos.y, level);
+            for x in x0..=x1 {
+                for z in z0..=z1 {
+                    self.tree.mark_stale(ColumnKey { level, x, z }, layers, cov);
+                }
+            }
+        }
+    }
+
+    /// Starts pyramid jobs for the chunks whose pyramids are asked for (`edits`), reading the
+    /// loaded ones from `map` now.
+    fn start_pyramid_jobs(&mut self, content: &WorldContent, map: &ChunkMap, dim: DimensionId) {
+        if !self.edits.wants_jobs() {
+            return;
+        }
+        let Some(materials) = self.content.as_ref().map(|c| Arc::clone(&c.2)) else {
+            return;
+        };
+        loop {
+            let id = self.jobs.next_id();
+            let Some(chunks) = self.edits.next_job(id) else {
+                return;
+            };
+            let input = edits::PyramidInput {
+                chunks: chunks
+                    .into_iter()
+                    .map(|key| {
+                        let source = if key.dim == dim {
+                            ChunkSource::of(map, key.pos)
+                        } else {
+                            ChunkSource::Unloaded
+                        };
+                        (key, source)
+                    })
+                    .collect(),
+                store: self.store.clone(),
+                generator: Arc::clone(&content.generator),
+                registry: Arc::clone(&content.registry),
+                materials: Arc::clone(&materials),
+            };
+            self.jobs.spawn_free(id, move || LodMessage::Pyramids {
+                id,
+                pyramids: edits::run_pyramids(&input),
+            });
+        }
     }
 }
 
@@ -1398,6 +1584,86 @@ fn lod_coverage(
     coverage.end_frame();
 }
 
+/// `Startup`: with persistence, every saved chunk is edited (its cells come from its blocks).
+fn lod_seed_saved(jobs: Res<WorldJobs>, mut lod: ResMut<LodWorld>) {
+    let Some(persist) = jobs.persist.as_ref() else {
+        return;
+    };
+    if std::mem::replace(&mut lod.edits.seeded, true) {
+        return;
+    }
+    for (dim, x, z) in persist.saved_columns() {
+        for &y in persist.layers(dim, x, z) {
+            lod.edits.insert(ChunkKey {
+                dim,
+                lod: 0,
+                pos: ChunkPos::new(x, y, z),
+            });
+        }
+    }
+}
+
+/// `LodSystems::Edits`: the frame's block changes and unloads into the edited set (`edits`),
+/// the changes whose debounce ended, and pyramid jobs for the pyramids asked for.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a Bevy-style system: one parameter per resource it reads"
+)]
+fn lod_edits(
+    mut lod: ResMut<LodWorld>,
+    mut changes: MessageReader<BlockChanged>,
+    mut data: MessageReader<ChunkDataEvent>,
+    map: Res<ChunkMap>,
+    content: Res<WorldContent>,
+    world: Res<WorldSettings>,
+    store: Option<Res<WorldStore>>,
+    coverage: Res<LodCoverage>,
+) {
+    let lod = &mut *lod;
+    let dim = world.dimension;
+    let now = Instant::now();
+    if lod.store.is_none() != store.is_none() {
+        lod.store = store.map(|s| s.clone());
+    }
+    // Edits come by chunk: one look per run of changes in the same chunk.
+    let mut last = None;
+    for change in changes.read() {
+        let pos = ChunkPos::containing(change.pos);
+        if last != Some(pos) {
+            last = Some(pos);
+            lod.edits.changed(ChunkKey { dim, lod: 0, pos }, now);
+        }
+    }
+    let cov = coverage.coverage();
+    for event in data.read() {
+        // Without persistence an edited chunk that unloads comes back as the generator has it.
+        if let ChunkDataEvent::Unloaded { key, .. } = *event
+            && lod.store.is_none()
+        {
+            let (was, waiting) = lod.edits.remove(key);
+            if was {
+                lod.mark_dirty(key, cov);
+                for c in waiting {
+                    lod.queue(c, false, cov);
+                }
+            }
+        }
+    }
+    let debounce = lod
+        .settings
+        .as_ref()
+        .map_or(Duration::ZERO, |s| s.edit_debounce);
+    for key in lod.edits.debounced(now, debounce) {
+        if lod.fallback {
+            // The fallback reads the blocks themselves.
+            lod.mark_dirty(key, cov);
+        } else {
+            lod.edits.ask(key, true);
+        }
+    }
+    lod.start_pyramid_jobs(&content, &map, dim);
+}
+
 /// The first viewer's position (by entity), the eye when there is no [`LodFocus`].
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq)]
 struct ViewerEye(Option<DVec3>);
@@ -1436,10 +1702,29 @@ fn lod_plan(
     let lod = &mut *lod;
     let name = content.generator.name();
     lod.check_settings(&settings, settings.is_changed());
-    let Some(valid) = lod.settings.clone() else {
+    let Some(mut valid) = lod.validated.clone() else {
         lod.turn_off(LodOff::InvalidSettings, name);
         return;
     };
+    // A generator without a coarse source gets level 1 from its real chunks, if it can.
+    let source = content.generator.lod().is_some();
+    let fallback = !source
+        && valid.fallback_max_level > 0
+        && fallback::serves(&content.generator.vertical_chunks());
+    if fallback {
+        valid.levels = valid.levels.min(valid.fallback_max_level);
+        if !lod.fallback {
+            tracing::warn!(
+                generator = name,
+                "the generator has no LOD source (WorldGenerator::lod): the LOD draws level 1 \
+                 only, from its real chunks"
+            );
+        }
+    }
+    lod.fallback = fallback;
+    if lod.settings.as_ref() != Some(&valid) {
+        lod.settings = Some(valid.clone());
+    }
     lod.check_content(&content, world.dimension, &valid);
     if !valid.enabled {
         lod.turn_off(LodOff::Disabled, name);
@@ -1449,7 +1734,7 @@ fn lod_plan(
         lod.turn_off(LodOff::Unsupported, name);
         return;
     }
-    if content.generator.lod().is_none() {
+    if !source && !fallback {
         lod.turn_off(LodOff::NoSource, name);
         return;
     }
@@ -1475,6 +1760,7 @@ fn lod_dispatch(
     viewers: Res<ViewerChunks>,
     content: Res<WorldContent>,
     coverage: Res<LodCoverage>,
+    map: Res<ChunkMap>,
 ) {
     if !lod.has_job_work() && !lod.jobs.has_results() {
         return;
@@ -1490,7 +1776,14 @@ fn lod_dispatch(
         _ => Instant::now() + budget,
     };
     let cap = lod.cap(settled);
-    lod.run_jobs(until, cap, !settled, &content, coverage.coverage());
+    lod.run_jobs(
+        until,
+        cap,
+        !settled,
+        &content,
+        coverage.coverage(),
+        Some(&map),
+    );
 }
 
 /// `LodSystems::Collect`: the world's data events within what is left of the budget, the
@@ -1557,6 +1850,13 @@ fn lod_idle(
         step.want(pending);
         return;
     }
-    lod.run_jobs(step.until, cap, !settled, &content, coverage.coverage());
+    lod.run_jobs(
+        step.until,
+        cap,
+        !settled,
+        &content,
+        coverage.coverage(),
+        None,
+    );
     step.want(lod.idle_pending(!settled));
 }
