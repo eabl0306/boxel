@@ -151,9 +151,18 @@ Umbrales en bloques (`e_k` es el lado de un nodo de nivel `k`):
 - `T_1` cubre toda la región que el renderer principal todavía puede dibujar: la región de
   conservación 3D de los viewers (radio, radio vertical y la histéresis de descarga, recortada a
   `vertical_bounds`) más un nodo. Nunca baja de `64 R`.
+- Si la región se achica (un radio menor), los chunks que quedan afuera siguen publicados hasta
+  que el mundo los descarga, de a poco. `T_1` conserva su alcance hasta que todos esos chunks
+  vuelven a caer en nodos de nivel 1 queridos; si no, un nodo de nivel 2 ocultaría ese octante
+  sin que nadie arme el hijo.
 - `T_k = max(32 R 2^k, T_(k-1) + 2 e_k)`, y el horizonte `H = T_K`.
 - Si `T_1` pasa el horizonte del preset (un radio vertical enorme sin límites), el LOD avisa una
-  vez y no dibuja nada (`LodStats.off`).
+  vez y no dibuja nada (`LodStats.off`). Vuelve recién cuando `T_1` queda 128 bloques debajo, así
+  un ojo que sube y baja sobre la línea no vacía y rellena el LOD cada vez.
+- Ninguna capa por encima de la última capa de chunks del generador
+  (`vertical_chunks().end() >> k`) se quiere: ahí todo es aire. Sin esto, un ojo alto sobre un
+  mundo de altura fija pedía un disco de aire tan ancho como `T_1` a su propia altura (a y 3.000,
+  casi el doble de columnas que en el suelo).
 
 Un nodo de nivel `k` se refina mientras su caja está a menos de `T_(k-1)` del ojo, con una
 histéresis de un nodo hijo. Cada nivel es una ventana densa de columnas, y un nivel se vuelve a
@@ -173,7 +182,9 @@ profundidad ni z-fighting.
 - En el nivel 1 un octante es exactamente un chunk.
 - En el nivel 2 y más, un octante se oculta si su hijo está cubierto, o si su hijo tiene chunks
   publicados y todavía no está listo (un hueco corto antes que una superposición). Un hijo
-  perdido (falló, o fue rechazado y espera) no oculta: su padre dibuja.
+  perdido (falló, o fue rechazado y espera) no oculta: su padre dibuja. En una columna cuyo
+  trabajo falló, las capas que vuelven a entrar quedan perdidas enseguida, no esperando un
+  trabajo que nunca corre.
 - **La regla de la cadena:** un nodo se envía solo si todos sus ancestros están en el renderer, y
   un nodo rechazado retira a sus descendientes.
 - Los nodos de nivel 1 bajo el detalle completo siguen armados: tapan el borde mientras cargan
@@ -182,8 +193,11 @@ profundidad ni z-fighting.
   renderer nuevo empieza con un frame de resync; en ese frame, y cuando cambia la arena, el
   renderer tira sus nodos y `extract_lod` escribe `LodResync`: todo nodo deja de estar
   disponible y se vuelve a enviar, del nivel más grueso al más fino.
-- Los rechazos del renderer principal llegan por `LodFeedback.chunks`: `extract_visibility` ya
-  vacía `take_refused` una vez por frame y ahora también los reenvía.
+- Los rechazos del renderer principal llegan por `LodFeedback.chunks`, pero solo los que dejan el
+  chunk sin dibujar (`take_undrawn`): un chunk residente que no entra en la arena llena conserva
+  su malla vieja y sigue dibujado. Un `Upsert` cuenta como dibujado desde su frame, como un chunk
+  nuevo; un rechazo leído el frame después de un `Upsert` es de la subida anterior y no cambia
+  nada.
 
 ### 8. Trabajos y presupuesto
 
@@ -192,9 +206,10 @@ profundidad ni z-fighting.
 - Corren en el pool de cómputo asíncrono con un ejecutor propio (el del mundo es privado).
 - A lo sumo 2 en vuelo mientras el mundo carga y 5 cuando se asentó: un chunk cercano espera a
   lo sumo un trabajo del LOD por hilo.
-- Prioridades: clase 0 el nivel más grueso (el horizonte aparece primero) y los nodos de nivel 1
-  con chunks publicados; clase 1 lo que se ve; clase 2 el resto; clase 3 los nodos de nivel 1
-  tapados por el detalle completo.
+- Prioridades: clase 0 el nivel más grueso (el horizonte aparece primero) y los nodos que cierran
+  un hueco (un nodo de nivel 1 con chunks publicados que el detalle completo no cubre entero, y
+  sus ancestros); clase 1 lo que se ve; clase 2 el resto; clase 3 los nodos de nivel 1 bajo el
+  detalle completo que no cierran ningún hueco.
 - El hilo principal gasta a lo sumo 0,3 ms por frame en juntar y lanzar trabajos, y envía a lo
   sumo 64 nodos y 2 MiB por frame. Entre frames (ADR 0023) un paso `Idle` sigue juntando y
   lanzando, sin escribir ops.
@@ -203,7 +218,10 @@ profundidad ni z-fighting.
 
 - `LodPass` dentro de `VoxelRenderer`: su propia arena (`VERTEX | COPY_DST`, sub-asignada como la
   principal), así el LOD nunca le quita lugar al detalle completo. Las subidas van en un buffer
-  de staging por frame.
+  de staging por frame, a lo sumo 4 frames de envíos del mundo por frame: después de frames sin
+  dibujar (ventana oculta) lo atrasado sube en varios frames, sin un tirón. Un nodo se dibuja
+  solo con sus quads arriba; si no se puede crear el staging (sin memoria), esos nodos esperan
+  al frame siguiente en vez de dibujar basura.
 - Un pipeline igual en los tres tiers (`lod.wgsl`, módulo nuevo): el quad instanciado del Low, un
   uniform block (`View`), una textura (la mip de 1x1 de cada capa, el color medio), 16 bytes de
   immediates (origen, nivel, máscara, mip, tinte). Una llamada de dibujo por nodo, después del
@@ -223,7 +241,10 @@ profundidad ni z-fighting.
   LOD se funden juntos con el cielo. `ViewParams` no cambia, así que las capas de `FogPlugin`
   conservan su alcance.
 - En GL el LOD queda apagado (sin clip control la profundidad lejana pelea). `voxel_world` lo
-  apaga en adaptadores de software, sea cual sea el radio.
+  apaga en adaptadores de software, sea cual sea el radio. Si el renderer no puede dibujar el LOD
+  (GL, el smoke falló o la pasada no se pudo crear), `extract_lod` lo avisa en
+  `LodFeedback::cannot_draw` y el lado del mundo también se apaga (`LodOff::Unsupported`): ni
+  trabajos ni mallas para nada.
 - F9 tiñe cada nivel con un color fijo (rojo, verde, azul, amarillo, magenta, cian).
 
 ### 10. Ejemplos y herramientas
@@ -256,9 +277,10 @@ del mundo; la máquina tranquila). Los nodos del piso son 0 en todas las corrida
 
 - La compuerta del plan (antes de escribir código de GPU) pedía menos de 14.000 nodos y 10 M de
   quads en `far` a r16: se cumple, así que `R` sigue en 24.
-- Por nivel en `far` a r16: el nivel 1 tiene 2.795 nodos (306 quads por nodo, 374 vacíos), el 2
-  tiene 1.936 (513), el 3 tiene 1.936 (421) y el 4 tiene 1.884 (383). En el terreno sin árboles
-  son 3,39 M quads: los árboles son más de la mitad.
+- Por nivel en `far` a r16 (el bosque de la tabla): el nivel 1 tiene 3.085 nodos (543 quads por
+  nodo, 357 vacíos), el 2 tiene 1.936 (1.033), el 3 tiene 1.936 (1.418) y el 4 tiene 1.884
+  (1.009). En el terreno sin árboles (`--world terrain`) son 8.551 nodos y 3,39 M quads: los
+  árboles son más de la mitad.
 - El llenado tarda unos 2,4 s y no 1 s como estimaba el plan. El límite es la cadencia del paso
   `Idle` entre frames (cada paso dura unos 0,9 ms en este portátil: el `sleep` de 250 us del
   runner se pasa), no los trabajos. El nivel más grueso, el horizonte, llega primero.
@@ -391,14 +413,17 @@ intención del plan:
   columnas cuya banda se conoce, tope 0,99 hasta que todo está armado y enviado.
 - Ops que nadie toma en el `Update` siguiente se descartan (herramientas sin renderer).
 - Clases de prioridad: la clase 0 es el nivel más grueso y toda columna cuyo trabajo arma un nodo
-  tocado, de cualquier nivel (los ancestros de los nodos tocados de nivel 1 vienen con ellos,
-  como pide la regla de la cadena). La prioridad es por columna.
+  que cierra un hueco, de cualquier nivel (los ancestros vienen con él, como pide la regla de la
+  cadena). Un nodo de nivel 1 solo tocado, con todos sus chunks cubiertos, es clase 3. La
+  prioridad es por columna.
 - Apagar el LOD (desactivado, la guarda, sin fuente, ajustes inválidos, sin ojo) quita todos los
   nodos y cancela los trabajos; prenderlo otra vez llena desde cero.
 - Un árbol nuevo (primer plan, cambio de contenido, LOD prendido otra vez) lee toda la cobertura
   una vez. Si no, un LOD prendido sobre un mundo ya cargado dibujaría encima.
-- Orden del resync: primero los nodos tocados de nivel 1 con sus ancestros, después el resto,
-  cada parte del más grueso al más fino.
+- Orden del resync: primero los nodos de nivel 1 que cierran un hueco con sus ancestros, después
+  el resto, cada parte del más grueso al más fino.
+- Una capa uniforme cuenta como conocida solo mientras su columna la quiere. Antes, al soltar una
+  columna se olvidaba su banda y el estado de cubierto de sus capas cambiaba sin avisar al padre.
 
 **Render (`boxel_render`, `boxel_shaders`)**
 
@@ -454,9 +479,12 @@ intención del plan:
 - **Varios viewers.** El LOD se refina alrededor de la cámara: otro viewer lejos queda como una
   isla con huecos cortos en su borde. `voxel_world` tiene uno solo.
 - **Huecos cortos.** Un octante de nivel 2 o más con chunks publicados espera a su hijo de nivel 1:
-  unos frames de cielo al arrancar o después de un salto. Un chunk que el renderer principal
-  rechaza (arena llena, ya un modo de falla avisado) deja un hueco de dos frames; un chunk viejo
-  que sigue dibujado con la arena llena se superpone con el LOD.
+  unos frames de cielo al arrancar o después de un salto. Después de un salto dentro del
+  horizonte, el borde de la zona vieja también muestra cielo hasta que el mundo la descarga
+  (menos de un segundo): esos chunks quedan lejos de `T_1` y nadie arma sus nodos de nivel 1.
+  Un chunk sin dibujar porque el renderer principal lo rechazó (arena llena, ya un modo de falla
+  avisado) deja un hueco de dos frames. Un nodo cuya subida no entra en el frame (ventana recién
+  mostrada) o falla (sin memoria) deja su hueco hasta el frame en que sube.
 - **Vigilancia de chunks vacíos.** Los chunks vacíos en octantes sin quads del LOD no se buscan:
   no cambian lo que se dibuja, pero no cuentan como cubiertos.
 - **Árboles en los niveles 5 y 6.** Se mira uno de cada 4 y de cada 16 lugares de árbol.
@@ -499,7 +527,7 @@ intención del plan:
 - `boxel_worldgen`: el `lod()` por defecto es `None`; el orden acolchado; orígenes de nodo hasta
   el límite del mundo.
 - `boxel_demo`: el llenado por filas igual a la regla por celda; capas fuera de la banda
-  uniformes en todo su bloque; cimas gruesas contra la regla exacta en chunks reales (512
+  uniformes en todo su bloque; una copa sobre una columna de mar es hojas, no agua; cimas gruesas contra la regla exacta en chunks reales (512
   columnas por nivel, niveles 1 a 3, bosque y overworld); acuerdo de bordes lejos del origen;
   mares de 3 y 10 bloques siguen siendo agua en los niveles 2 a 4; playas de arena; un bosque sin
   mar no tiene agua y un mar subido después de `new()` aparece; el piso; determinismo; las pruebas
@@ -514,12 +542,19 @@ intención del plan:
   completo o un nivel del LOD, y con todo listo exactamente uno), y quitar la regla de los tocados
   o la de la cadena lo rompe; la alimentación de la cobertura contra `ChunkCoverage::from_map`;
   5.000 eventos en un frame con presupuesto de 1 ns; streaming real del bosque con un viewer que
-  vuela, también con `--fixed-height`.
+  vuela, también con `--fixed-height`. Después de la revisión: bajar el radio de 20 a 2 deja
+  cada chunk publicado dentro de un nodo de nivel 1 querido en cada frame de la descarga; las
+  capas que vuelven a una columna fallada quedan perdidas; la guarda vuelve solo pasado su
+  margen; un ojo a y 3.000 sobre un mundo de altura fija no quiere capas de aire; las clases 0 y
+  3; un chunk rechazado que se vuelve a enviar cuenta enseguida y un rechazo viejo no; un
+  renderer que no puede dibujar apaga el LOD.
 - `boxel_shaders/tests/naga.rs`: `lod.wgsl` valida y traduce a GLSL 330 y ES 300, MSL, HLSL y
   SPIR-V; un uniform block y una textura, sin sampler; el layout de `LodImmediate`; las constantes
   iguales a las de Rust y a `octant_of`; las mips de `textureLoad` en `i32` en todos los módulos.
 - `boxel_render` sin GPU: las reglas de `extract_lod` (ops en orden; sin renderer se descartan
-  sin `LodResync`; `LodResync` en el frame de resync del renderer nuevo y con otra arena);
+  sin `LodResync`; `LodResync` en el frame de resync del renderer nuevo y con otra arena;
+  `cannot_draw`); solo los rechazos que dejan un chunk sin dibujar llegan al LOD; las subidas
+  atrasadas suben por frames y las perdidas esperan al siguiente;
   `lod_far` es `Some` solo cuando
   `Prepare` dibuja; el foco sigue a la cámara activa; un rechazo llega a la búsqueda de cuevas y
   a `LodFeedback`; la búsqueda con el plano lejano en `H` deja visible todo chunk publicado dentro
@@ -539,7 +574,9 @@ intención del plan:
     banda de conservación y a 200 bloques mirando abajo. Con el plano lejano de la cámara en la
     búsqueda aparecen 87 y 17 píxeles de cielo: el test ve el error;
   - plano lejano y niebla: un chunk pasada la distancia de vista se recorta sin LOD y se dibuja
-    con él; la niebla del valle sobre el detalle completo da la misma imagen con y sin LOD.
+    con él; la niebla del valle sobre el detalle completo da la misma imagen con y sin LOD;
+  - subidas perdidas: un frame sin staging no dibuja esos nodos (la imagen sin nodos) y el
+    siguiente los sube y dibuja la escena entera.
 - Las suites de GPU existentes siguen verdes sin cambios.
 
 ## Para la prueba del dueño
