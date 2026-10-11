@@ -292,7 +292,11 @@ LOD y avisa que difieren. Para medir su costo con el mismo binario:
 
 Los números sin ruido del LOD salen de `headless_world --world forest --lod PRESET` (sin GPU):
 nodos y quads por nivel, los del piso aparte, tiempos de los trabajos y del llenado. `snapshot
---lod PRESET` espera el llenado antes de las capturas.
+--lod PRESET` espera el llenado antes de las capturas; `--lod-tint` tiñe los niveles y
+`--fixed-height` carga como `voxel_world --fixed-height`. Para mirar el borde en vuelo, `stress
+--screenshot PATH` guarda el frame donde termina la medición (la cámara para ahí) y
+`--screenshot-yaw GRADOS` la gira para ese frame: la guiñada del vuelo más 180 mira atrás. La
+salida espera la captura, así que no sirve para medir.
 
 Para que los números sirvan:
 

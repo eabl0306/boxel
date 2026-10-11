@@ -26,6 +26,8 @@
 //! `--lod PRESET` adds the far LOD (ADR 0031, world side only: the shots draw its nodes with the
 //! renderer, as the render plugin would): after the world settles, the shots wait until the LOD
 //! is filled (within `--timeout`), and a `lod:` line gives its nodes, quads and fill time.
+//! `--lod-tint` tints each level (F9 in `voxel_world`). `--fixed-height` streams every layer of
+//! the generator and nothing else, as `voxel_world --fixed-height` does.
 //!
 //! Exit codes: 0 success, 1 usage error, 2 no usable GPU, or rendering or saving failed, 4 the
 //! world did not settle within the timeout. Set `RUST_LOG` for more logging (default filter `warn`).
@@ -81,6 +83,8 @@ usage: snapshot --camera X,Y,Z,YAW,PITCH --shot HH:MM=PATH [--shot ...] [options
   --view-distance N    horizontal mesh radius in chunks (default 12, as voxel_world), also the
                        fog distance
   --vertical-radius N  vertical mesh radius in chunks (default 8)
+  --fixed-height       stream every layer of the generator and nothing else, whatever the
+                       camera height (as voxel_world --fixed-height; needs a world with a floor)
   --seed N             world seed (default: the terrain's)
   --light MODE         on (the default) or off (open sky everywhere)
   --ao MODE            ambient occlusion: off, baked or lit-only (the default); --light off
@@ -104,6 +108,7 @@ usage: snapshot --camera X,Y,Z,YAW,PITCH --shot HH:MM=PATH [--shot ...] [options
                        1.1 times while sprinting: 77)
   --fog-tick N         ticks of the fog clock (64 a second) in the shots: where the wind has
                        taken the cells (default 0)
+  --lod-tint           with --lod: tint each LOD level (F9 in voxel_world)
   --timeout S          wall-clock limit for loading the world, in seconds (default 300)
   --help               this text";
 
@@ -154,6 +159,8 @@ struct Options {
     size: (u32, u32),
     radius: u32,
     vertical_radius: u32,
+    /// `--fixed-height`: every layer of the generator, whatever the camera height.
+    fixed_height: bool,
     seed: u64,
     world: WorldChoice,
     light: bool,
@@ -182,6 +189,8 @@ struct Options {
     fog_steps: u32,
     /// `--lod`.
     lod: lod::LodPreset,
+    /// `--lod-tint`.
+    lod_tint: bool,
 }
 
 /// `Ok(None)` for `--help`.
@@ -192,6 +201,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         size: (1280, 720),
         radius: 12,
         vertical_radius: ChunkViewer::DEFAULT_VERTICAL_RADIUS,
+        fixed_height: false,
         seed: boxel_demo::worldgen::DEFAULT_SEED,
         world: WorldChoice::with_world(World::Overworld),
         light: true,
@@ -210,6 +220,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         fog_tick: 0,
         fog_steps: boxel::fog::DEFAULT_MAX_STEPS,
         lod: lod::LodPreset::Off,
+        lod_tint: false,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -289,6 +300,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--pack" => o.textures = pack::parse(flag, &value()?)?,
             "--fog" => o.fog = fog::parse(flag, &value()?)?,
             "--lod" => o.lod = lod::parse(flag, &value()?)?,
+            "--lod-tint" => o.lod_tint = true,
+            "--fixed-height" => o.fixed_height = true,
             "--fog-res" => o.fog_res = fog::parse_resolution(flag, &value()?)?,
             "--fog-steps" => o.fog_steps = fog::parse_steps(flag, &value()?)?,
             "--fog-tick" => {
@@ -327,7 +340,10 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
     if o.shots.is_empty() {
         return Err("at least one --shot is required".to_string());
     }
-    o.world.validate(false)?;
+    o.world.validate(o.fixed_height)?;
+    if o.lod_tint && o.lod == lod::LodPreset::Off {
+        return Err("--lod-tint needs --lod".to_string());
+    }
     Ok(Some(o))
 }
 
@@ -731,6 +747,8 @@ fn run(
         ),
         None => None,
     };
+    // `--fixed-height`: the generator's layers bound the streaming, as in `voxel_world`.
+    let vertical_bounds = o.fixed_height.then(|| generator.vertical_chunks());
     let mut app = App::new();
     app.add_plugins((
         LogPlugin {
@@ -744,6 +762,7 @@ fn run(
             settings: WorldSettings {
                 light: o.light,
                 ao_policy: o.ao,
+                vertical_bounds,
                 ..WorldSettings::default()
             },
             ..WorldPlugin::default()
@@ -754,7 +773,10 @@ fn run(
         app.add_plugins(PersistPlugin::new(store));
     }
     // `--lod`: the world side only (no render plugin here); the eye is the viewer, the camera.
-    let lod_settings = o.lod.settings();
+    let lod_settings = o.lod.settings().map(|settings| LodSettings {
+        debug_tint: o.lod_tint,
+        ..settings
+    });
     if let Some(settings) = &lod_settings {
         app.add_plugins(LodWorldPlugin {
             settings: settings.clone(),
@@ -774,7 +796,11 @@ fn run(
     );
     app.world_mut().spawn((
         transform,
-        ChunkViewer::new(o.radius).with_vertical_radius(o.vertical_radius),
+        ChunkViewer::new(o.radius).with_vertical_radius(if o.fixed_height {
+            u32::MAX
+        } else {
+            o.vertical_radius
+        }),
     ));
     let deadline = started + o.timeout;
     let timeout = |stats: Box<WorldStats>| {
@@ -1052,6 +1078,26 @@ mod tests {
         let mut bad = BASE.to_vec();
         bad.extend(["--lod", "huge"]);
         assert!(parse(&bad).is_err());
+        // The level tint needs the LOD.
+        assert!(!o.lod_tint);
+        args.push("--lod-tint");
+        assert!(parse(&args).expect("valid").expect("not help").lod_tint);
+        let mut bad = BASE.to_vec();
+        bad.push("--lod-tint");
+        assert!(parse(&bad).unwrap_err().contains("--lod"));
+    }
+
+    #[test]
+    fn fixed_height_needs_a_floor() {
+        let o = parse(&BASE).expect("valid").expect("not help");
+        assert!(!o.fixed_height);
+        let mut args = BASE.to_vec();
+        args.extend(["--world", "forest", "--fixed-height"]);
+        assert!(parse(&args).expect("valid").expect("not help").fixed_height);
+        // The default world, the overworld, goes down forever.
+        let mut bad = BASE.to_vec();
+        bad.push("--fixed-height");
+        assert!(parse(&bad).unwrap_err().contains("--fixed-height"));
     }
 
     #[test]

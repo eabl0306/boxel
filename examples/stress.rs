@@ -48,6 +48,12 @@
 //! when the latest chunk job finished, so the summary gives the border catch-up both on the
 //! frame clock and as the work lag (crossing frame start to the last job of the crossing).
 //!
+//! `--screenshot PATH` saves the frame where the measurement ends, while the world catches up:
+//! what a player sees right after flying, for looking at the leading edge (with `--lod`, ADR
+//! 0031). `--screenshot-yaw DEG` turns the camera for that frame; the flight's yaw plus 180
+//! looks back at the keep band it left. The outputs wait for the shot, so its frames count in
+//! the catch-up: not for measurements.
+//!
 //! Every run waits until the world settled, runs `--warmup` seconds, then measures
 //! `--duration` seconds. Each frame records its wall-clock time (`Time::real_delta`, the whole
 //! loop: world and render) and the work it did: chunks generated and jobs finished (counted by
@@ -149,6 +155,10 @@ usage: stress [--scenario static|fly|dive|spin|path] [GPU options] [options]
   --spans             busy time per system and span in each frame, added to the summary (needs
                       a build with --features trace)
   --spans-csv PATH    also write it per frame (implies --spans)
+  --screenshot PATH   save the frame where the measurement ends (the camera stops there) as a
+                      PNG, while the world catches up: what a player sees right after flying
+  --screenshot-yaw DEG  turn the camera to this yaw for that frame (the position and the pitch
+                      stay): the flight's yaw plus 180 looks back at what it left behind
   --edits             scripted edits during the measurement, one per second near the start: a
                       lamp placed and removed, a shaft dug and capped; the summary gives the
                       frames each one took to publish (meant for --scenario static)
@@ -258,6 +268,10 @@ struct Options {
     vsync: Option<bool>,
     spans: bool,
     spans_csv: Option<PathBuf>,
+    /// `--screenshot`.
+    screenshot: Option<PathBuf>,
+    /// `--screenshot-yaw`, degrees.
+    screenshot_yaw: Option<f64>,
     /// `--edits`.
     edits: bool,
     /// `--time`, clock hours.
@@ -327,6 +341,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         vsync: None,
         spans: false,
         spans_csv: None,
+        screenshot: None,
+        screenshot_yaw: None,
         edits: false,
         time: 12.0,
         light: true,
@@ -473,6 +489,17 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                 o.spans_csv = Some(PathBuf::from(value()?));
                 o.spans = true;
             }
+            "--screenshot" => o.screenshot = Some(PathBuf::from(value()?)),
+            "--screenshot-yaw" => {
+                let v = value()?;
+                o.screenshot_yaw = Some(
+                    v.trim()
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|d| d.is_finite())
+                        .ok_or_else(|| format!("{flag}: {v:?} is not an angle in degrees"))?,
+                );
+            }
             "--edits" => o.edits = true,
             "--time" => o.time = clock::parse_clock(flag, &value()?)?,
             "--pack" => o.textures = pack::parse(flag, &value()?)?,
@@ -506,6 +533,9 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         }
     }
     o.world.validate(o.fixed_height)?;
+    if o.screenshot_yaw.is_some() && o.screenshot.is_none() {
+        return Err("--screenshot-yaw needs --screenshot".to_string());
+    }
     if o.cave && o.world.world != World::Overworld {
         return Err("--cave needs --world overworld (the only world with caves)".to_string());
     }
@@ -780,6 +810,18 @@ enum Phase {
     Done,
 }
 
+/// `--screenshot`: the shot of the frame that ends the measurement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Shot {
+    /// Not asked for yet (or no `--screenshot`).
+    #[default]
+    NotAsked,
+    /// Asked for; the renderer has not saved it yet (the outputs wait for it).
+    Waiting,
+    /// Saved, or failed (exit 3).
+    Done { failed: bool },
+}
+
 /// The part of a record known during the frame's `Update` (the rest comes from the next one).
 #[derive(Clone, Copy, Debug)]
 struct Pending {
@@ -803,6 +845,8 @@ struct Bench {
     presented_at_start: u64,
     /// `translucent_sorts` when the measurement started.
     sorts_at_start: u32,
+    /// `--screenshot`.
+    shot: Shot,
     exiting: bool,
 }
 
@@ -1123,7 +1167,9 @@ fn drive(
         Phase::CatchUp { since, streak } => {
             let streak = if settled { streak + 1 } else { 0 };
             bench.phase = Phase::CatchUp { since, streak };
-            if streak >= SETTLED_FRAMES {
+            if bench.shot == Shot::Waiting {
+                // `--screenshot`: the outputs wait for the shot (a few frames).
+            } else if streak >= SETTLED_FRAMES {
                 let catch_up = Some(now.duration_since(since));
                 bench.finish(&rec, &info, &pacing, spans, script, catch_up, &mut exit);
             } else if now.duration_since(since) > CATCH_UP_LIMIT {
@@ -1131,6 +1177,48 @@ fn drive(
             }
         }
         Phase::Warmup { .. } | Phase::Done => {}
+    }
+}
+
+/// `--screenshot`, after `drive`: asks for a PNG of the frame that ends the measurement, the
+/// camera turned to `--screenshot-yaw` (its position and pitch stay).
+fn shoot(
+    mut bench: ResMut<Bench>,
+    mut cameras: Query<&mut Transform, With<Camera>>,
+    mut requests: MessageWriter<RequestScreenshot>,
+) {
+    if bench.shot != Shot::NotAsked || !matches!(bench.phase, Phase::CatchUp { .. }) {
+        return;
+    }
+    let Some(path) = bench.options.screenshot.clone() else {
+        return;
+    };
+    if let Some(yaw) = bench.options.screenshot_yaw {
+        for mut transform in &mut cameras {
+            let pitch = transform.forward().y.clamp(-1.0, 1.0).asin();
+            *transform =
+                Transform::from_yaw_pitch(transform.translation, (yaw as f32).to_radians(), pitch);
+        }
+    }
+    println!("stress: screenshot -> {}", path.display());
+    requests.write(RequestScreenshot { path });
+    bench.shot = Shot::Waiting;
+}
+
+/// `--screenshot`, before `drive`: the shot's outcome.
+fn shot_saved(mut bench: ResMut<Bench>, mut saved: MessageReader<ScreenshotSaved>) {
+    for event in saved.read() {
+        let failed = match &event.result {
+            Ok(()) => {
+                println!("stress: screenshot saved to {}", event.path.display());
+                false
+            }
+            Err(e) => {
+                eprintln!("stress: screenshot {} failed: {e}", event.path.display());
+                true
+            }
+        };
+        bench.shot = Shot::Done { failed };
     }
 }
 
@@ -1259,6 +1347,9 @@ impl Bench {
             eprintln!("stress: {warning}");
         }
         let mut code = 0;
+        if self.shot == (Shot::Done { failed: true }) {
+            code = 3;
+        }
         if let Some(path) = &self.options.csv
             && let Err(e) = write_file(path, &report::csv(&records))
         {
@@ -1442,6 +1533,7 @@ fn add_bench(app: &mut App, options: Options, info: RunInfo, recorder: Recorder,
             info,
             presented_at_start: 0,
             sorts_at_start: 0,
+            shot: Shot::NotAsked,
             exiting: false,
             options,
         })
@@ -1453,6 +1545,17 @@ fn add_bench(app: &mut App, options: Options, info: RunInfo, recorder: Recorder,
                 .chain()
                 .before(WorldSystems::Interest),
         );
+    if app.world().resource::<Bench>().options.screenshot.is_some() {
+        app.add_message::<RequestScreenshot>()
+            .add_message::<ScreenshotSaved>()
+            .add_systems(
+                Update,
+                (
+                    shot_saved.before(drive),
+                    shoot.after(drive).before(WorldSystems::Interest),
+                ),
+            );
+    }
 }
 
 /// Kills the process if `main` has not returned `limit` after start (the event loop stopped
@@ -2519,6 +2622,44 @@ mod tests {
         assert!(text.contains("\"light\": \"off\""), "{text}");
         assert!(text.contains("\"pack\": \"none\""), "{text}");
         assert!(text.contains("chunk slots, textures procedural."), "{text}");
+    }
+
+    #[test]
+    fn a_screenshot_holds_the_outputs_until_it_is_saved() {
+        for (result, code) in [
+            (Ok(()), AppExit::Success),
+            (Err("no".to_string()), AppExit::from_code(3)),
+        ] {
+            let o = options(&[
+                "--scenario=fly",
+                "--duration=0.010",
+                "--warmup=0",
+                "--screenshot=s.png",
+                "--screenshot-yaw=90",
+            ]);
+            let t0 = Instant::now();
+            let mut app = bench_app(o, t0, frames(30, 5, SETTLED));
+            // Without the renderer's answer the run never ends.
+            assert_eq!(run(&mut app, t0), None);
+            assert_eq!(app.world().resource::<Bench>().shot, Shot::Waiting);
+            // The shot looks along yaw 90 (toward -x) with the start's pitch (-20 degrees).
+            let mut cameras = app.world_mut().query_filtered::<&Transform, With<Camera>>();
+            let forward = cameras.single(app.world()).expect("one camera").forward();
+            let pitch = -20f32.to_radians();
+            assert!((forward.x + pitch.cos()).abs() < 1e-5, "{forward:?}");
+            assert!((forward.y - pitch.sin()).abs() < 1e-5, "{forward:?}");
+            assert!(forward.z.abs() < 1e-5, "{forward:?}");
+            app.world_mut().write_message(ScreenshotSaved {
+                path: PathBuf::from("s.png"),
+                result,
+            });
+            app.update();
+            assert_eq!(app.should_exit(), Some(code));
+        }
+        assert!(
+            parse(&["--screenshot-yaw=180"]).is_err(),
+            "needs --screenshot"
+        );
     }
 
     #[test]
