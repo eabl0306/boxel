@@ -775,9 +775,15 @@ fn lod_bits_match_the_mirror_and_boxel_mesh() {
     ] {
         assert_eq!(const_u32(&module, name), v, "{name}");
     }
-    // The flat outputs of a LOD quad keep the texture layer in its own bits.
+    // The flat output of a LOD quad keeps the texture layer, the face (3 bits), the mip, the
+    // tint, the emissive flag and the level in bits of their own.
     let mat_layer = const_u32(&module, "MAT_LAYER_MASK");
-    assert!(const_u32(&module, "LOD_OUT_MIP_SHIFT") >= mat_layer.count_ones());
+    let face = const_u32(&module, "LOD_OUT_FACE_SHIFT");
+    assert!(face >= mat_layer.count_ones());
+    assert!(const_u32(&module, "LOD_OUT_MIP_SHIFT") >= face + 3);
+    let emissive = const_u32(&module, "LOD_OUT_EMISSIVE_BIT");
+    assert!(emissive > const_u32(&module, "LOD_OUT_TINT_BIT"));
+    assert!(1 << const_u32(&module, "LOD_OUT_LEVEL_SHIFT") > emissive);
     assert!(
         const_u32(&module, "LOD_OUT_TINT_BIT")
             > b::MIP_MASK << const_u32(&module, "LOD_OUT_MIP_SHIFT")

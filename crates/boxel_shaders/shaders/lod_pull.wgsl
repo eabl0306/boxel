@@ -12,7 +12,7 @@ struct LodNodeGpu { node: vec4<i32>, quad_base: u32, counts: array<u32, 3> };
 @group(3) @binding(1) var<storage, read> lod_nodes: array<LodNodeGpu>;
 
 @vertex
-fn vs_lod_pull(@builtin(vertex_index) vi: u32, @location(0) draw: vec2<u32>) -> VsOut {
+fn vs_lod_pull(@builtin(vertex_index) vi: u32, @location(0) draw: vec2<u32>) -> LodOut {
   let q = lod_quads[draw.y + (vi >> 2u)];
   return lod_vertex(q, vi & 3u, lod_nodes[draw.x].node);
 }

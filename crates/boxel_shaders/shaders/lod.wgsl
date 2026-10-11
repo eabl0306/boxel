@@ -9,6 +9,6 @@ struct LodImmediate { node: vec4<i32> };
 var<immediate> lod: LodImmediate;
 
 @vertex
-fn vs_lod(@builtin(vertex_index) vi: u32, @location(0) q: vec2<u32>) -> VsOut {
+fn vs_lod(@builtin(vertex_index) vi: u32, @location(0) q: vec2<u32>) -> LodOut {
   return lod_vertex(q, vi, lod.node);
 }
