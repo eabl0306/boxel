@@ -1,7 +1,7 @@
 # ADR 0031: lejanía con LOD, un plugin opcional
 
-- Estado: borrador. El M1 está hecho en la rama `feat/lod` (sobre `feat/fog`); faltan la prueba
-  del dueño y el `perf-smoke` (al final, "Pendiente").
+- Estado: borrador. El M1 está hecho en la rama `feat/lod` (sobre `feat/fog`); falta la prueba
+  del dueño (al final, "Pendiente").
 - Fecha: 2026-10-11
 
 ## Contexto
@@ -268,7 +268,45 @@ del mundo; la máquina tranquila). Los nodos del piso son 0 en todas las corrida
   carga. Un salto (teletransporte) cuesta lo mismo una vez.
 
 En la RTX 5050, `voxel_world --lod far` a r12 se mantiene en 144 fps con tope (6,9 ms de media),
-con unos 2.100 a 2.200 draws del LOD por frame. Falta el `perf-smoke` del plan ("Pendiente").
+con unos 2.100 a 2.200 draws del LOD por frame.
+
+`just perf-smoke --base HEAD "--new-extra='--lod far'" rtx/surface/r16/uncapped
+rtx/forest/r16/uncapped` del 2026-10-11 sobre 7e2557c (y lo mismo con `780m/surface/r16/uncapped`):
+el mismo binario sin y con el LOD, 10 s por lado, radio 16, sin tope. El harness repitió cada par y dio lo mismo. El llenado terminó a los 2,6
+a 2,7 s (`lod_fill_s`), antes de empezar a medir (el mundo se asentó a los 0,7 s y hay 2 s de
+calentamiento).
+
+| caso | fps | p50 ms | p99 ms | frames > 6,94 ms |
+|---|---:|---:|---:|---:|
+| RTX, superficie, sin tope | 2024 -> 694 | 0,44 -> 1,12 | 1,43 -> 3,92 | 1 -> 0 |
+| RTX, bosque, sin tope | 3655 -> 808 | 0,24 -> 1,03 | 0,78 -> 3,22 | 0 -> 0 |
+| 780M, superficie, sin tope | 538 -> 286 | 1,76 -> 2,72 | 4,52 -> 8,25 | 0 -> 286 |
+
+La 780M no tiene que pasar (decisión del dueño): con `far` cuesta 1 a 1,2 ms en la mediana (el
+plan estimaba de 2 a 3,5) y unos 290 a 400 frames de cada 10 s pasan de 6,94 ms. Para mostrarlo
+en ella va el preset `near`.
+
+El smoke sale con 1 por la regla del 85 % de fps, que es el precio del plugin (como con la niebla,
+ADR 0030), y también por el p99: el plan pedía en la RTX ningún frame de más de 6,94 ms (se cumple)
+y el p99 dentro de 1,5 veces (no se cumple: unas 3 a 4 veces). El LOD cuesta unos 0,7 ms por frame
+en la mediana y lleva el p99 a 3 a 4 ms, siempre debajo de un frame de 144 Hz.
+
+Dónde va ese tiempo: la misma superficie con `--features trace --spans` (frames normales, ms):
+
+| span | media | p99 | máx |
+|---|---:|---:|---:|
+| frame | 1,41 | 3,74 | 5,73 |
+| `render.lod` (lista de draws y su encoding, CPU) | 0,29 | 0,61 | 1,34 |
+| `render.offscreen_wait` (esperar a la GPU) | 0,47 | 2,57 | 3,73 |
+| `world::lod_coverage` | 0,01 | 0,04 | 0,47 |
+| `world::lod_collect` | 0,002 | 0,009 | 0,03 |
+
+- El p99 es casi todo espera de la GPU: con el LOD la RTX dibuja unos 2 M de quads más por
+  frame. El M3 (el camino de GPU de High) baja el costo de CPU, no ese.
+- `render.lod` queda en 0,29 ms de media, debajo de los 0,5 ms con los que el plan adelantaba el
+  M3 antes del M2. Su p99 (0,61 ms) sí pasa.
+- En el lado del mundo, al cruzar un borde de chunk se suman por cruce unos 0,7 ms de
+  `lod_plan` y 0,6 ms de `lod_coverage`, repartidos en unos 8 frames.
 
 ## Desvíos del plan
 
@@ -530,10 +568,10 @@ cargo run --release --example voxel_world -- --lod near --adapter radeon --timeo
 
 ## Pendiente
 
-- El `perf-smoke` del plan en la RTX y la 780M (`just perf-smoke --base HEAD
-  "--new-extra='--lod far'" rtx/surface/r16/uncapped rtx/forest/r16/uncapped`), con sus tablas
-  acá; en la RTX, 0 frames de más de 6,94 ms a r16 con `--lod far`. El JSON de `stress` trae
-  `lod_fill_s` para separar el llenado.
+- Decidir con el dueño el p99 de la RTX: con `--lod far` sube de 0,8 a 1,4 ms a 3 a 4 ms (sin
+  frames de más de 6,94 ms), casi todo trabajo de GPU. Palancas: el preset `near`, dibujar solo
+  los baldes de caras que pueden verse (más draws, menos vértices; hoy un draw por nodo con sus 6
+  baldes), o Hi-Z (M5).
 - M2: ediciones (pirámides por chunk editado, superposición, guardado), el respaldo de nivel 1
   para generadores sin fuente y la fuente exacta de `FlatGenerator`.
 - M3: el camino de GPU de High (un multi-draw indirecto por segmento) y saltar el LOD bajo tierra.
