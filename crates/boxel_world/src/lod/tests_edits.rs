@@ -924,3 +924,53 @@ fn neighbors_built_again_change_on_the_renderer_together() {
     }
     tests::assert_bits_from_scratch(&app);
 }
+
+// ---------------------------------------------------------------------------------------------
+// The fallback between frames
+
+#[test]
+fn fallback_idle_steps_do_not_spin_on_jobs_they_cannot_start() {
+    // A fallback job copies the loaded chunks when it is made, so an idle step (no chunk map)
+    // never starts one: once it has collected the last result, it must not ask for another
+    // step at once.
+    let lod = Arc::new(tests::Hold::default());
+    let steps = Steps {
+        no_lod: true,
+        ..Steps::new(20)
+    };
+    let mut app = app_with(
+        steps,
+        edit_settings(1, 0),
+        lod.clone(),
+        Arc::new(InlineExecutor),
+    );
+    spawn(&mut app, DVec3::new(10.0, 60.0, 10.0));
+    let mut ready = false;
+    for _ in 0..100 {
+        app.update();
+        let settled = app.world().resource::<WorldStats>().is_settled();
+        let state = app.world().resource::<LodWorld>();
+        if settled && lod.held() == 1 && state.jobs.queue.len() > 1 {
+            ready = true;
+            break;
+        }
+        lod.run_all();
+    }
+    assert!(ready, "a fallback job in flight and more queued");
+    assert!(app.world().resource::<IdleWanted>().wanted());
+    // The job ends between frames: the first step collects it.
+    lod.run_all();
+    let until = Instant::now() + Duration::from_secs(5);
+    let first = app.run_idle(until);
+    let state = app.world().resource::<LodWorld>();
+    assert_eq!(state.jobs.in_flight, 0, "the step collected the result");
+    assert!(!state.jobs.queue.is_empty());
+    assert_ne!(first, IdleWork::Ready, "nothing left that a step can do");
+    assert_ne!(state.idle_pending(false), IdleWork::Ready);
+    assert_ne!(app.run_idle(until), IdleWork::Ready);
+    assert_eq!(lod.held(), 0, "no step started a job");
+    // The next update starts the next job, and asks for steps only while it runs.
+    app.update();
+    assert_eq!(lod.held(), 1);
+    assert!(app.world().resource::<IdleWanted>().wanted());
+}

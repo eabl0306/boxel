@@ -36,7 +36,8 @@
 //!    into [`LodOps`] (sends capped per frame) and [`LodStats`].
 //!
 //! Between frames (ADR 0023) an `Idle` step goes on collecting and starting jobs; it never
-//! writes ops (finished meshes wait for `Collect`).
+//! writes ops (finished meshes wait for `Collect`). The fallback's steps only collect: its jobs
+//! copy the loaded chunks when they are made, in `Update`.
 use crate::interest::Viewer;
 use crate::jobs::{JobExecutor, TaskPoolExecutor};
 use crate::persist::WorldStore;
@@ -1320,10 +1321,12 @@ impl LodWorld {
             .is_some_and(|best| !busy || best.class == 0)
     }
 
-    /// What an idle step would find (the cap set last).
+    /// What an idle step would find (the cap set last). It never starts a fallback job (they
+    /// copy the loaded chunks when made): with the fallback it only collects results.
     fn idle_pending(&self, busy: bool) -> IdleWork {
         if self.jobs.has_results()
             || (self.off.is_none()
+                && !self.fallback
                 && self.jobs.has_room()
                 && (self.jobs.handed_off() > 0 || self.may_start(busy)))
         {
@@ -1398,6 +1401,16 @@ impl LodWorld {
             edited_chunks: self.edits.len(),
             pyramids: self.edits.cached(),
             fallback: self.fallback,
+        }
+    }
+
+    /// True if an idle step would find work after this frame: a job in flight to collect, or,
+    /// but for the fallback (whose jobs an idle step never starts), jobs that wait.
+    fn wants_idle(&self) -> bool {
+        if self.fallback {
+            self.jobs.in_flight > 0
+        } else {
+            self.has_job_work()
         }
     }
 
@@ -1847,7 +1860,7 @@ fn lod_collect(
     let fresh = lod.stats(now, &coverage);
     stats.set_if_neq(fresh);
     if let Some(mut wanted) = wanted {
-        wanted.want(world.idle_work && lod.has_job_work());
+        wanted.want(world.idle_work && lod.wants_idle());
     }
 }
 
