@@ -27,7 +27,11 @@
 //!
 //! Below a column's band the source reports one state ([`LodColumn::below`]); a world floor with
 //! air under it may count as solid there, so no node is meshed for faces nobody sees from above.
+//!
+//! [`FlatGenerator`] has an exact source: its cells are the rule applied to its own blocks, which
+//! makes it the oracle of the engine's tests.
 
+use crate::FlatGenerator;
 use boxel_voxel::{BlockRegistry, BlockState, ChunkKey, ChunkPos, DimensionId};
 use std::any::Any;
 use std::ops::RangeInclusive;
@@ -218,5 +222,130 @@ pub trait LodSource: Send + Sync {
     /// Bumped when the coarse output changes (documentation, and a future persisted table).
     fn version(&self) -> u32 {
         0
+    }
+}
+
+/// [`FlatGenerator`]'s classes, kept between calls on one worker for one registry.
+struct FlatMemo {
+    /// The registry they were made from (its address and size).
+    registry: (usize, usize),
+    classes: LodClasses,
+}
+
+impl FlatGenerator {
+    /// The state of the cell whose rows of blocks start at `y0` and are `s` high: the cell rule
+    /// applied to the layers (every row of blocks is one state over its `s^2` blocks).
+    fn cell_at(
+        &self,
+        layers: &[(BlockState, i64)],
+        classes: &LodClasses,
+        y0: i64,
+        s: i64,
+    ) -> BlockState {
+        let area = (s * s) as u64;
+        let mut p = CellPartial::empty(area * s as u64);
+        let mut kinds: Vec<(BlockState, u64)> = Vec::new();
+        let (mut top, mut at) = (0i64, 0usize);
+        for y in y0..y0 + s {
+            // The layer holding block row `y` (air below 0 and above the layers).
+            let state = if y < 0 {
+                BlockState::AIR
+            } else {
+                while at < layers.len() && y >= top + layers[at].1 {
+                    top += layers[at].1;
+                    at += 1;
+                }
+                layers.get(at).map_or(BlockState::AIR, |l| l.0)
+            };
+            match classes.class(state) {
+                LodClass::Empty => {}
+                // Rows go up: the last Solid row is the top one (one state across the row).
+                LodClass::Solid => p.solid = Some(([0, y, 0], state)),
+                LodClass::Fluid => {
+                    let source = classes.fluid(state).unwrap_or(state);
+                    p.fluid_top = Some(y);
+                    p.fluid_blocks += area;
+                    match kinds.iter_mut().find(|k| k.0 == source) {
+                        Some(k) => k.1 += area,
+                        None => kinds.push((source, area)),
+                    }
+                }
+            }
+        }
+        // The fluid with the most blocks, ties to the smaller id (as `CellPartial::of_cell`).
+        p.fluid = kinds.into_iter().reduce(|a, b| {
+            if b.1 > a.1 || (b.1 == a.1 && b.0 < a.0) {
+                b
+            } else {
+                a
+            }
+        });
+        p.state()
+    }
+}
+
+/// Exact: every cell is the cell rule applied to the generator's own blocks (the test oracle of
+/// the engine's LOD). Layers hold the same state over a whole row of blocks, so a cell only looks
+/// at its `s` rows.
+impl LodSource for FlatGenerator {
+    fn column(
+        &self,
+        req: &LodRequest,
+        registry: &BlockRegistry,
+        scratch: &mut LodScratch,
+        emit: &mut dyn FnMut(i64, LodNode<'_>),
+    ) -> LodColumn {
+        let height = self.total_height();
+        if height <= 0 {
+            return LodColumn::AIR;
+        }
+        let (s, e) = (req.cell_size(), req.node_size());
+        // Layer `L`'s cells span blocks `L e - s .. L e + 33 s`: layer -1 holds the bottom layer
+        // in its top border row, and everything outside the band is air.
+        let band = LodColumn {
+            lo: -1,
+            hi: -(-(height + s)).div_euclid(e),
+            below: BlockState::AIR,
+        };
+        let key = (std::ptr::from_ref(registry) as usize, registry.len());
+        let fresh = !matches!(
+            scratch.memo.as_ref().and_then(|m| m.downcast_ref::<FlatMemo>()),
+            Some(m) if m.registry == key
+        );
+        if fresh {
+            scratch.memo = Some(Box::new(FlatMemo {
+                registry: key,
+                classes: LodClasses::from_registry(registry),
+            }));
+        }
+        let memo = scratch.memo.take().expect("set above");
+        let classes = &memo.downcast_ref::<FlatMemo>().expect("set above").classes;
+        let layers: Vec<(BlockState, i64)> = self
+            .layers
+            .iter()
+            .map(|(name, n)| (crate::block(registry, name, "FlatGenerator"), i64::from(*n)))
+            .collect();
+        let first = (*req.layers.start()).max(band.lo);
+        let last = (*req.layers.end()).min(band.hi - 1);
+        for layer in first..=last {
+            let y0 = req.origin(layer)[1];
+            let rows: Vec<BlockState> = (-1..=32i64)
+                .map(|cy| self.cell_at(&layers, classes, y0 + cy * s, s))
+                .collect();
+            if rows.iter().all(|&r| r == rows[0]) {
+                emit(layer, LodNode::Uniform(rows[0]));
+                continue;
+            }
+            for (cy, &state) in (-1..=32i32).zip(&rows) {
+                for x in -1..=32 {
+                    for z in -1..=32 {
+                        scratch.cells.set(x, cy, z, state);
+                    }
+                }
+            }
+            emit(layer, LodNode::Cells(&scratch.cells));
+        }
+        scratch.memo = Some(memo);
+        band
     }
 }

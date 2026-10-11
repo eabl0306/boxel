@@ -13,6 +13,8 @@ boxel_voxel.workspace = true
 [dev-dependencies]
 # The example content (#48), for tests only.
 boxel_demo.workspace = true
+# The `test:` blocks of engine tests (#48).
+boxel_voxel = { workspace = true, features = ["testing"] }
 
 # Criterion flags (--quick, --save-baseline) from `cargo bench --workspace` must not reach the
 # lib unit-test harness.

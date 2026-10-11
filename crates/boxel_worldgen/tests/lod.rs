@@ -1,11 +1,13 @@
 //! The far level of detail's generator side (ADR 0031): the defaulted hook and the types a
 //! `LodSource` fills.
 use boxel_voxel::{BlockRegistry, BlockRegistryBuilder, BlockState, ChunkData, ChunkKey, ChunkPos};
-use boxel_voxel::{DimensionId, MAX_CHUNK_COORD};
+use boxel_voxel::{DimensionId, LocalPos, MAX_CHUNK_COORD};
 use boxel_worldgen::lod::{
-    LOD_PADDED, LOD_PADDED_VOLUME, LodCells, LodColumn, LodNode, LodRequest, LodScratch, LodSource,
+    CellPartial, LOD_PADDED, LOD_PADDED_VOLUME, LodCells, LodClasses, LodColumn, LodNode,
+    LodRequest, LodScratch, LodSource,
 };
 use boxel_worldgen::{FlatGenerator, WorldGenerator};
+use std::collections::HashMap;
 
 /// A generator without a coarse source.
 struct Plain;
@@ -73,7 +75,8 @@ impl WorldGenerator for Ground {
 #[test]
 fn the_default_generator_has_no_coarse_source() {
     assert!(Plain.lod().is_none());
-    assert!(FlatGenerator::new(vec![]).lod().is_none());
+    // The flat generator has one: its exact cells are the engine's test oracle.
+    assert!(FlatGenerator::new(vec![]).lod().is_some());
     let boxed: Box<dyn WorldGenerator> = Box::new(Plain);
     assert!(boxed.lod().is_none());
 }
@@ -165,5 +168,109 @@ fn requests_place_nodes_at_any_distance() {
         assert_eq!(origin[2] >> shift, -edge, "level {level}");
         assert_eq!(origin[0], MAX_CHUNK_COORD << 5, "level {level}");
         assert_eq!(req.node_size(), 32 << level);
+    }
+}
+
+/// The cell rule applied to `g`'s own chunks (each level-`k <= 5` cell lies in one chunk).
+fn exact_cell(
+    g: &FlatGenerator,
+    registry: &BlockRegistry,
+    classes: &LodClasses,
+    chunks: &mut HashMap<ChunkPos, ChunkData>,
+    origin: [i64; 3],
+    s: i64,
+) -> BlockState {
+    let chunk = ChunkPos::new(origin[0] >> 5, origin[1] >> 5, origin[2] >> 5);
+    let data = chunks
+        .entry(chunk)
+        .or_insert_with(|| g.generate(ChunkKey::new(chunk), registry));
+    let local = origin.map(|v| (v & 31) as u32);
+    CellPartial::of_cell(classes, origin, s as u32, |x, y, z| {
+        data.get(LocalPos::new(local[0] + x, local[1] + y, local[2] + z))
+    })
+    .state()
+}
+
+#[test]
+fn the_flat_generators_cells_are_the_rule_on_its_own_chunks() {
+    let registry = boxel_voxel::testing::registry();
+    let classes = LodClasses::from_registry(&registry);
+    let layered = |layers: &[(&str, u32)]| {
+        FlatGenerator::new(layers.iter().map(|&(n, h)| (n.to_string(), h)).collect())
+    };
+    let generators = [
+        // Every class, thin layers.
+        layered(&[
+            ("test:solid", 1),
+            ("test:slab", 2),
+            ("test:cutout", 3),
+            ("test:fluid", 3),
+            ("test:glass", 1),
+            ("test:plant", 1),
+        ]),
+        // A sea 9 deep over ground 37 high, then one 3 deep over 70 (fluid over ground).
+        layered(&[("test:solid", 37), ("test:fluid", 9)]),
+        layered(&[("test:solid", 70), ("test:fluid", 3)]),
+        // Two fluid kinds over ground, and a fluid with nothing under it.
+        layered(&[("test:solid", 100), ("test:hot", 2), ("test:fluid", 20)]),
+        layered(&[("test:fluid", 15), ("test:solid", 1)]),
+        layered(&[]),
+    ];
+    // Far columns too: the generator is the same everywhere.
+    let columns = [[0, 0], [-3, 5], [1 << 20, -(1 << 20)]];
+    for (i, g) in generators.iter().enumerate() {
+        let source = g.lod().expect("a source");
+        let mut chunks = HashMap::new();
+        let mut scratch = LodScratch::default();
+        for level in 1..=5u8 {
+            for column in columns {
+                let req = LodRequest {
+                    dim: DimensionId(0),
+                    level,
+                    column,
+                    layers: -4..=6,
+                };
+                let s = req.cell_size();
+                let mut emitted: HashMap<i64, Vec<BlockState>> = HashMap::new();
+                let band = source.column(&req, &registry, &mut scratch, &mut |layer, node| {
+                    let cells = match node {
+                        LodNode::Uniform(state) => vec![state; LOD_PADDED_VOLUME],
+                        LodNode::Cells(cells) => cells.0.to_vec(),
+                    };
+                    assert!(
+                        emitted.insert(layer, cells).is_none(),
+                        "layer {layer} twice"
+                    );
+                });
+                for layer in req.layers.clone() {
+                    let o = req.origin(layer);
+                    let got = emitted.get(&layer);
+                    assert_eq!(
+                        got.is_some(),
+                        band.uniform_at(layer).is_none(),
+                        "generator {i} level {level} layer {layer}: emitted inside the band only"
+                    );
+                    // Three cell columns of every row: the layers are flat.
+                    for [x, z] in [[-1, -1], [13, 20], [32, 32]] {
+                        for y in -1..=32i32 {
+                            let at = [
+                                o[0] + i64::from(x) * s,
+                                o[1] + i64::from(y) * s,
+                                o[2] + i64::from(z) * s,
+                            ];
+                            let want = exact_cell(g, &registry, &classes, &mut chunks, at, s);
+                            let have = match got {
+                                Some(cells) => cells[LodCells::index(x, y, z)],
+                                None => band.uniform_at(layer).expect("outside the band"),
+                            };
+                            assert_eq!(
+                                have, want,
+                                "generator {i} level {level} layer {layer} cell {x} {y} {z}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

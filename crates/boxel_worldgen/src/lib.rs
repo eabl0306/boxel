@@ -120,6 +120,10 @@ impl WorldGenerator for FlatGenerator {
         // Empty (`0..=-1`) when there are no layers.
         0..=((self.total_height() - 1) >> CHUNK_SHIFT)
     }
+    /// Exact coarse cells (the cell rule applied to its own blocks, [`lod`]).
+    fn lod(&self) -> Option<&dyn LodSource> {
+        Some(self)
+    }
     fn name(&self) -> &str {
         "flat"
     }
