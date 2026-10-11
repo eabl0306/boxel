@@ -87,6 +87,15 @@ pub fn supported(info: &wgpu::AdapterInfo) -> bool {
     info.backend != wgpu::Backend::Gl
 }
 
+/// True if High's GPU-driven LOD path (the node cull, the depth pyramid, one indirect draw list
+/// per segment) is worth it on the adapter of `info`: not on an integrated GPU. On the Radeon
+/// 780M (RADV) it measured slower than the instanced path, about 0.2 ms for the indirect draws
+/// and as much for the pyramid; on the discrete RTX it saves most of the LOD's cost. Both draw
+/// the same pixels.
+pub fn gpu_driven_pays(info: &wgpu::AdapterInfo) -> bool {
+    info.device_type != wgpu::DeviceType::IntegratedGpu
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +123,13 @@ mod tests {
         assert!(!supported(&info(wgpu::Backend::Gl)));
         assert!(supported(&info(wgpu::Backend::Vulkan)));
         assert!(supported(&info(wgpu::Backend::Metal)));
+    }
+
+    #[test]
+    fn integrated_gpus_draw_the_lod_instanced() {
+        let info = |kind| wgpu::AdapterInfo::new(kind, wgpu::Backend::Vulkan);
+        assert!(!gpu_driven_pays(&info(wgpu::DeviceType::IntegratedGpu)));
+        assert!(gpu_driven_pays(&info(wgpu::DeviceType::DiscreteGpu)));
+        assert!(gpu_driven_pays(&info(wgpu::DeviceType::Other)));
     }
 }

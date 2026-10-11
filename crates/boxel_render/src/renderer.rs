@@ -278,8 +278,9 @@ pub struct VoxelRenderer {
     lod_failed: bool,
     /// High: the shared quad index buffer, for the far LOD's GPU-driven path.
     lod_index: Option<wgpu::Buffer>,
-    /// The far LOD draws through the GPU-driven path where the tier has it (High; tests turn it
-    /// off to compare it with the instanced path).
+    /// The far LOD draws through the GPU-driven path where the tier has it (High) and it pays on
+    /// the device ([`crate::lod::gpu_driven_pays`]); tests turn it on and off to compare it with
+    /// the instanced path.
     lod_gpu_driven: bool,
     /// The cave culling search that `lod_sealed` was found for, and whether it reached no chunk
     /// on the border of its box.
@@ -668,7 +669,7 @@ impl VoxelRenderer {
             lod: None,
             lod_failed: false,
             lod_index,
-            lod_gpu_driven: true,
+            lod_gpu_driven: crate::lod::gpu_driven_pays(&device.adapter_info()),
             lod_sealed: None,
             view_uniform: ViewUniform::default(),
         })
@@ -874,8 +875,9 @@ impl VoxelRenderer {
     }
 
     /// Testing: the far LOD draws through its GPU-driven path where the tier has one (High),
-    /// `true` by default; `false` draws it instanced as on Mid and Low. A change drops the LOD
-    /// pass: the next [`VoxelRenderer::set_lod`] builds it again, empty.
+    /// by default where it pays on the device (not on integrated GPUs); `false` draws it
+    /// instanced as on Mid and Low. A change drops the LOD pass: the next
+    /// [`VoxelRenderer::set_lod`] builds it again, empty.
     #[doc(hidden)]
     pub fn debug_set_lod_gpu_driven(&mut self, on: bool) {
         if self.lod_gpu_driven != on {
