@@ -2099,7 +2099,7 @@ fn the_coverage_follows_the_worlds_messages() {
         watched.len(),
         app.world().resource::<LodStats>().watched_chunks
     );
-    for &c in watched {
+    for &c in &watched {
         let slot = map.get(map.id_at(c).expect("loaded")).expect("slot");
         assert!(
             !cov.covered(c) && matches!(slot.mesh(), crate::MeshState::None),
@@ -2301,6 +2301,64 @@ fn five_thousand_events_in_one_frame_are_applied_in_full() {
     assert_bits_from_scratch(&app);
     assert_published_hidden(&app, &model);
     assert_at_most_one(&app, &model, expect.keys().copied());
+}
+
+#[test]
+fn data_events_past_the_budget_wait_their_turn_and_the_feed_catches_up() {
+    // Under a budget of a nanosecond a frame reads `DATA_PER_FRAME_MIN` data events: the rest
+    // wait, in order, while the mesh events are read in full.
+    let mut app = app(
+        Steps::new(20),
+        LodSettings {
+            frame_budget: Duration::from_nanos(1),
+            ..small()
+        },
+    );
+    let viewer = spawn(&mut app, DVec3::new(10.0, 60.0, 10.0));
+    let mut model = Model::default();
+    let walk = |app: &mut App, model: &mut Model, frames: usize, dx: f64| {
+        for _ in 0..frames {
+            app.world_mut()
+                .entity_mut(viewer)
+                .get_mut::<Transform>()
+                .expect("viewer")
+                .translation
+                .x += dx;
+            frame(app, model);
+            // Published chunks are hidden every frame whatever waits.
+            assert_published_hidden(app, model);
+        }
+    };
+    walk(&mut app, &mut model, 100, 0.0);
+    // Three frames' worth of events about loaded chunks (they change nothing: each is read from
+    // its slot as it is when its turn comes).
+    let loaded: Vec<ChunkDataEvent> = app
+        .world()
+        .resource::<ChunkMap>()
+        .iter()
+        .map(|(id, slot)| ChunkDataEvent::Loaded {
+            id,
+            key: slot.key(),
+        })
+        .collect();
+    assert!(!loaded.is_empty());
+    for e in loaded.iter().cycle().take(3 * coverage::DATA_PER_FRAME_MIN) {
+        app.world_mut().write_message(*e);
+    }
+    frame(&mut app, &mut model);
+    let waiting = app.world().resource::<LodCoverage>().data_backlog();
+    assert!(
+        waiting >= 2 * coverage::DATA_PER_FRAME_MIN,
+        "{waiting} data events wait"
+    );
+    assert_feed_matches_map(&app);
+    // A jump: the old chunks unload and new ones load behind the waiting events (whose ids go
+    // stale meanwhile).
+    walk(&mut app, &mut model, 1, 2000.0);
+    walk(&mut app, &mut model, 300, 0.0);
+    assert_eq!(app.world().resource::<LodCoverage>().data_backlog(), 0);
+    assert_feed_matches_map(&app);
+    assert_bits_from_scratch(&app);
 }
 
 #[test]
@@ -2968,4 +3026,34 @@ fn a_parent_and_its_child_refused_in_one_frame_leave_cleanly() {
     assert!(model.nodes.contains_key(&up) && model.nodes.contains_key(&child));
     assert_eq!(app.world().resource::<LodStats>().refused, 2);
     assert_bits_from_scratch(&app);
+}
+
+#[test]
+fn a_jump_replanned_over_frames_keeps_every_sent_node_under_its_parent() {
+    // Under a budget of a nanosecond a replan applies a few columns a frame, coarse levels
+    // first: the old region's level-2 nodes leave frames before their lod-1 children's records
+    // do, and the children must leave the renderer with them (`frame` checks the chain rule).
+    let mut app = app(
+        Steps::new(20),
+        LodSettings {
+            frame_budget: Duration::from_nanos(1),
+            ..small()
+        },
+    );
+    let viewer = spawn(&mut app, DVec3::new(10.0, 60.0, 10.0));
+    let mut model = Model::default();
+    fill(&mut app, &mut model, 300);
+    assert!(model.nodes.keys().any(|k| k.lod == 1));
+    app.world_mut()
+        .entity_mut(viewer)
+        .get_mut::<Transform>()
+        .expect("viewer")
+        .translation
+        .x += 2000.0;
+    let mut replanning = 0;
+    for _ in 0..300 {
+        frame(&mut app, &mut model);
+        replanning += usize::from(app.world().resource::<LodWorld>().replan.is_some());
+    }
+    assert!(replanning > 2, "the replan took {replanning} frames");
 }

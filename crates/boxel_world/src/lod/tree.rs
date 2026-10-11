@@ -118,6 +118,26 @@ impl Node {
     }
 }
 
+/// What a node's column says of it ([`Tree::state`]).
+#[derive(Clone, Copy, Debug, Default)]
+struct NodeFacts {
+    /// It has a record.
+    record: bool,
+    /// Active (module docs): available and wanted.
+    active: bool,
+    /// Wanted and outside its column's known band: uniform, with no record (its covered state
+    /// is its own).
+    uniform: bool,
+}
+
+impl NodeFacts {
+    /// True if the node is covered (module docs) when `children` are its covered children bits:
+    /// active, or not known uniform with all 8 children covered.
+    fn covered(self, children: u8) -> bool {
+        self.active || (!self.uniform && children == 0xFF)
+    }
+}
+
 /// The job of a column in flight.
 #[derive(Debug)]
 pub(crate) struct InFlight {
@@ -295,6 +315,8 @@ pub(crate) struct Tree {
     known: usize,
     /// The generator's lowest chunk layer (its floor): level `k`'s floor layer is `floor >> k`.
     floor: Option<i64>,
+    /// Columns reserved for ([`Tree::reserve`]), kept by [`Tree::clear`].
+    reserved: usize,
 }
 
 /// Adds (`add`) or takes away node `key`'s share of the per-level counts.
@@ -366,7 +388,21 @@ impl Tree {
             counts: vec![LevelStats::default(); usize::from(levels)],
             known: 0,
             floor,
+            reserved: 0,
         }
+    }
+
+    /// Makes room for `columns` columns (and their nodes' bits) at once: a hash map that grows
+    /// moves every entry in one frame, a few milliseconds for the columns map at `far`.
+    pub(crate) fn reserve(&mut self, columns: usize) {
+        self.reserved = columns;
+        let more = |len: usize| columns.saturating_sub(len);
+        self.columns.reserve(more(self.columns.len()));
+        self.children.reserve(more(self.children.len()));
+        self.touched.reserve(more(self.touched.len()));
+        let lod1 = columns / usize::from(self.levels.max(1)) * 2;
+        self.lod1_octants
+            .reserve(lod1.saturating_sub(self.lod1_octants.len()));
     }
 
     /// The per-level counts.
@@ -407,6 +443,7 @@ impl Tree {
     /// True if `key` is wanted and lies outside its column's known band (uniform, no record).
     /// Only wanted layers count: an unwanted column is dropped with its band, and its layers'
     /// covered state must not change then (nothing would tell their parents).
+    #[cfg(test)]
     pub(crate) fn known_uniform(&self, key: ChunkKey) -> bool {
         self.columns.get(&ColumnKey::of(key)).is_some_and(|c| {
             contains(c.plan.wanted, key.pos.y)
@@ -434,6 +471,7 @@ impl Tree {
     }
 
     /// True if node `key` is active (module docs): every record is wanted.
+    #[cfg(test)]
     pub(crate) fn active(&self, key: ChunkKey) -> bool {
         let Some(col) = self.columns.get(&ColumnKey::of(key)) else {
             return false;
@@ -525,11 +563,6 @@ impl Tree {
         }
     }
 
-    /// True if node `key` is covered (module docs).
-    pub(crate) fn covered(&self, key: ChunkKey, cov: &ChunkCoverage) -> bool {
-        self.active(key) || (!self.known_uniform(key) && self.children_bits(key, cov) == 0xFF)
-    }
-
     /// The hidden octants of node `key` (module docs).
     pub(crate) fn mask(&self, key: ChunkKey, cov: &ChunkCoverage) -> u8 {
         let covered = self.children_bits(key, cov);
@@ -561,46 +594,83 @@ impl Tree {
 
     /// Node `key`'s covered state may have changed: brings its parent's bit up to date, and on
     /// up while the parents' states change.
-    pub(crate) fn touch(&mut self, mut key: ChunkKey, cov: &ChunkCoverage) {
+    pub(crate) fn touch(&mut self, key: ChunkKey, cov: &ChunkCoverage) {
+        self.touch_up(key, cov);
+    }
+
+    /// [`Tree::touch`], returning the coarsest level whose covered children bits changed (0:
+    /// none).
+    fn touch_up(&mut self, key: ChunkKey, cov: &ChunkCoverage) -> u8 {
+        let now = self.state(key).covered(self.children_bits(key, cov));
+        self.touch_up_from(key, now)
+    }
+
+    /// [`Tree::touch_up`] with node `key`'s covered state `now` known.
+    fn touch_up_from(&mut self, mut key: ChunkKey, mut now: bool) -> u8 {
+        let mut top = 0;
         while key.lod < self.levels {
             let up = parent(key);
             let bit = octant_bit(key);
-            let now = self.covered(key, cov);
-            let had = self.children.get(&up).is_some_and(|b| b & bit != 0);
-            if now == had {
-                return;
+            let old = self.children.get(&up).copied().unwrap_or(0);
+            if (old & bit != 0) == now {
+                return top;
             }
-            if now && self.known_uniform(up) {
+            let state = self.state(up);
+            if now && state.uniform {
                 // A uniform parent's covered state is its own: its bits are never read.
-                return;
+                return top;
             }
-            let before = self.covered(up, cov);
-            let bits = self.children.entry(up).or_insert(0);
-            if now {
-                *bits |= bit;
-            } else {
-                *bits &= !bit;
-            }
-            if *bits == 0 {
+            let new = if now { old | bit } else { old & !bit };
+            if new == 0 {
                 self.children.remove(&up);
+            } else {
+                self.children.insert(up, new);
             }
-            self.mark_dirty(up);
-            if self.covered(up, cov) == before {
-                return;
+            top = up.lod;
+            if state.record {
+                self.dirty.insert(up);
+            }
+            let after = state.covered(new);
+            if after == state.covered(old) {
+                return top;
             }
             key = up;
+            now = after;
+        }
+        top
+    }
+
+    /// What node `key`'s column says of it, from one lookup.
+    fn state(&self, key: ChunkKey) -> NodeFacts {
+        let Some(col) = self.columns.get(&ColumnKey::of(key)) else {
+            return NodeFacts::default();
+        };
+        let y = key.pos.y;
+        let uniform =
+            contains(col.plan.wanted, y) && col.band.is_some_and(|b| b.uniform_at(y).is_some());
+        match col.nodes.get(&y) {
+            Some(node) => NodeFacts {
+                record: true,
+                active: node.available(),
+                uniform,
+            },
+            None => NodeFacts {
+                record: false,
+                active: uniform,
+                uniform,
+            },
         }
     }
 
-    /// Lod-1 position `p`'s published bits changed: the touched bits up the levels (a touched
-    /// node's column may jump to the first priority class).
-    fn touch_published(&mut self, p: ChunkPos, cov: &ChunkCoverage) {
+    /// Lod-1 position `p`'s published bits changed (`now`: some chunk there is published): the
+    /// touched bits up the levels (a touched node's column may jump to the first priority
+    /// class).
+    fn touch_published(&mut self, p: ChunkPos, mut now: bool) {
         let mut key = ChunkKey {
             dim: self.dim,
             lod: 1,
             pos: p,
         };
-        let mut now = cov.get(p).published != 0;
         while key.lod < self.levels {
             let up = parent(key);
             let bit = octant_bit(key);
@@ -625,19 +695,24 @@ impl Tree {
     }
 
     /// A lod-1 position's full-detail coverage changed: its mask, its parents' covered and
-    /// touched bits, the priority of its column and of its ancestors' (whether they close a
-    /// hole: [`Tree::fills_hole`]).
+    /// touched bits, the priority of its column and of the ancestors whose bits changed (whether
+    /// they close a hole, [`Tree::fills_hole`], depends on nothing else; the touched bits queue
+    /// theirs in [`Tree::touch_published`]).
     pub(crate) fn chunks_changed(&mut self, lod1: ChunkPos, cov: &ChunkCoverage) {
         let mut key = ChunkKey {
             dim: self.dim,
             lod: 1,
             pos: lod1,
         };
-        self.mark_dirty(key);
-        self.touch(key, cov);
-        self.touch_published(lod1, cov);
+        let octants = cov.get(lod1);
+        let state = self.state(key);
+        if state.record {
+            self.dirty.insert(key);
+        }
+        let top = self.touch_up_from(key, state.covered(octants.covered));
+        self.touch_published(lod1, octants.published != 0);
         self.reprioritize.push(ColumnKey::of(key));
-        while key.lod < self.levels {
+        while key.lod < top {
             key = parent(key);
             self.reprioritize.push(ColumnKey::of(key));
         }
@@ -708,7 +783,9 @@ impl Tree {
 
     /// Removes the record of `key` (an op if the renderer has it) and updates its parent. The
     /// column stays (the caller drops it once done with it: [`Tree::drop_if_idle`]). Its
-    /// descendants leave with it: a node leaves the wanted tree with its whole subtree.
+    /// descendants leave with it: a node leaves the wanted tree with its whole subtree. A replan
+    /// applies its levels coarse first, over frames under the budget, so the descendants' own
+    /// records may go a few frames later: the ones on the renderer leave it now (the chain rule).
     fn remove_node(&mut self, key: ChunkKey, cov: &ChunkCoverage) {
         let c = ColumnKey::of(key);
         let Some(col) = self.columns.get_mut(&c) else {
@@ -725,6 +802,10 @@ impl Tree {
             self.lod1_octants.remove(&key.pos);
         }
         self.dirty.remove(&key);
+        // A descendant on the renderer is active, so the covered bits lead to it.
+        if key.lod >= 2 && self.children.get(&key).is_some_and(|&b| b != 0) {
+            self.unsend_below(key, cov);
+        }
         self.touch(key, cov);
         self.lost_changed(key);
     }
@@ -1281,7 +1362,9 @@ impl Tree {
                 }
             }
         }
+        let reserved = self.reserved;
         *self = Self::new(self.dim, self.levels, self.floor);
+        self.reserve(reserved);
         ops
     }
 

@@ -12,22 +12,47 @@
 //!   Never [`ChunkSlot::shown`](crate::ChunkSlot::shown): it goes false after an edit while the
 //!   old mesh is still drawn, and the LOD would flash over the player's own builds.
 //!
-//! The LOD's `Coverage` step feeds it every frame, in full ([`LodCoverage`]): the mesh events,
-//! the data events, the renderer's resyncs and refusals. An `Empty` mesh sends no event, so a
-//! watch list of uncovered loaded chunks that lie in octants where a lod-1 node has quads is
-//! polled, a bounded number per frame, round robin. Whatever changes records its lod-1 position,
-//! and the LOD refreshes the masks there (the node tree takes the bits up the levels).
+//! The LOD's `Coverage` step feeds it every frame ([`LodCoverage`]): the mesh events, the
+//! renderer's resyncs and refusals in full (what full detail draws changes with them in this
+//! frame), and the data events under a time budget. A data event only says whether a chunk draws
+//! nothing (all air or `Missing`), and it is read from the chunk's slot as it is when its turn
+//! comes, so one that waits a few frames (the thousands of a jump or of the first load) only
+//! lets the LOD draw its coarse rounding into an air chunk, or hide an octant that holds nothing,
+//! for those frames. An `Empty` mesh sends no event, so a watch list of uncovered loaded chunks
+//! that lie in octants where a lod-1 node has quads is polled, a bounded number per frame, round
+//! robin. The chunks the world does not want meshed (the data ring around the viewers, hundreds
+//! at `r32`) wait on a slower list until they are wanted. Whatever changes records its lod-1
+//! position, and the LOD refreshes the masks there (the node tree takes the bits up the levels).
 //! [`ChunkCoverage::from_map`] computes it from scratch from a [`ChunkMap`] (the reference the
 //! feed is checked against).
-use crate::{ChunkMap, ChunkSlot, DataState, MeshState};
+use crate::{ChunkId, ChunkMap, ChunkSlot, DataState, Interest, MeshState};
 use boxel_ecs::prelude::*;
 use boxel_voxel::{BlockState, ChunkPos};
 use foldhash::{HashMap, HashSet};
+use std::collections::VecDeque;
+use std::time::Instant;
+
+/// Data events read per frame at least, whatever the time budget (the backlog always moves).
+pub const DATA_PER_FRAME_MIN: usize = 256;
+
+/// Data events read between two looks at the clock.
+const DATA_CLOCK_EVERY: usize = 64;
 
 /// Watched chunks polled per frame at most. A quarter of the list goes per frame (at least 64),
-/// so each one is looked at every 4 frames: the chunks without a mesh yet (the data ring around
-/// the viewers) wait there for long.
+/// so each one is looked at every 4 frames. The chunks no mesh is wanted for (the data ring
+/// around the viewers) wait on a dormant list instead, a sixteenth of it per frame (at least 8,
+/// at most a sixteenth of this): one goes back to the watch list once the world wants its mesh.
 pub const POLL_PER_FRAME: usize = 1024;
+
+/// What a poll found for a watched chunk.
+enum Poll {
+    /// Covered, unloaded, drawing nothing now, or its octant has no LOD quads: no more polls.
+    Done,
+    /// Being meshed: polled again soon.
+    Watch,
+    /// Loaded with no mesh wanted: polled again later.
+    Dormant,
+}
 
 /// The octant bits of one lod-1 node position.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -97,6 +122,12 @@ fn slot(map: &ChunkMap, c: ChunkPos) -> Option<&ChunkSlot> {
     map.get(map.id_at(c)?)
 }
 
+/// The slot of chunk `c` by its id from an event: `None` once that chunk unloaded (a later
+/// event tells about the chunk loaded there since). No lookup by position.
+fn slot_by_id(map: &ChunkMap, id: ChunkId, c: ChunkPos) -> Option<&ChunkSlot> {
+    map.get(id).filter(|s| s.pos == c)
+}
+
 /// Lod-0 coverage per lod-1 position (module docs). Positions with no bit set are not stored.
 #[derive(Clone, Debug, Default)]
 pub struct ChunkCoverage {
@@ -114,9 +145,27 @@ impl ChunkCoverage {
 
     /// Changes the bits of lod-1 position `p` through `f`; returns true if its octants changed.
     fn update_at(&mut self, p: ChunkPos, f: impl FnOnce(&mut Bits)) -> bool {
-        let old = self.bits.get(&p).copied().unwrap_or_default();
-        let mut b = old;
-        f(&mut b);
+        use std::collections::hash_map::Entry;
+        // One lookup: the entry is changed in place, made, or dropped once it holds nothing.
+        let (old, b) = match self.bits.entry(p) {
+            Entry::Occupied(mut e) => {
+                let old = *e.get();
+                f(e.get_mut());
+                let b = *e.get();
+                if b == Bits::default() {
+                    e.remove();
+                }
+                (old, b)
+            }
+            Entry::Vacant(e) => {
+                let mut b = Bits::default();
+                f(&mut b);
+                if b != Bits::default() {
+                    e.insert(b);
+                }
+                (Bits::default(), b)
+            }
+        };
         if b == old {
             return false;
         }
@@ -124,11 +173,6 @@ impl ChunkCoverage {
         let n = |v: u8| v.count_ones() as usize;
         self.published = self.published + n(after.published) - n(before.published);
         self.covered = self.covered + n(after.covered) - n(before.covered);
-        if b == Bits::default() {
-            self.bits.remove(&p);
-        } else {
-            self.bits.insert(p, b);
-        }
         after != before
     }
 
@@ -210,10 +254,15 @@ pub struct LodCoverage {
     /// Chunks upserted in this frame's mesh events, and in the last frame's (module docs).
     upserted_now: HashSet<ChunkPos>,
     upserted_last: HashSet<ChunkPos>,
-    /// Watched chunks, polled round robin from `cursor`.
+    /// The world's data events not read yet, in order: chunk, id, loaded (module docs).
+    data: VecDeque<(ChunkPos, ChunkId, bool)>,
+    /// Watched chunks, polled round robin from `cursor`; the dormant ones from `dormant_cursor`.
+    /// `watched` holds both.
     watch: Vec<ChunkPos>,
+    dormant: Vec<ChunkPos>,
     watched: HashSet<ChunkPos>,
     cursor: usize,
+    dormant_cursor: usize,
 }
 
 impl LodCoverage {
@@ -222,15 +271,20 @@ impl LodCoverage {
         &self.coverage
     }
 
-    /// Chunks waiting on the watch list.
+    /// Chunks waiting on the watch list, dormant ones included.
     pub fn watched(&self) -> usize {
-        self.watch.len()
+        self.watch.len() + self.dormant.len()
     }
 
-    /// The watch list.
+    /// Data events waiting to be read.
+    pub fn data_backlog(&self) -> usize {
+        self.data.len()
+    }
+
+    /// The watch list, dormant chunks last.
     #[cfg(test)]
-    pub(crate) fn watch_list(&self) -> &[ChunkPos] {
-        &self.watch
+    pub(crate) fn watch_list(&self) -> Vec<ChunkPos> {
+        self.watch.iter().chain(&self.dormant).copied().collect()
     }
 
     /// Changes chunk `c` through `f` and records its lod-1 position if its octants changed.
@@ -264,22 +318,49 @@ impl LodCoverage {
         self.upserted_now.clear();
     }
 
-    /// A `Remove` of chunk `c`: no longer published; it may draw nothing now (an `Empty` mesh).
-    pub(crate) fn removed(&mut self, c: ChunkPos, map: &ChunkMap) {
-        let empty = slot(map, c).is_some_and(draws_nothing);
+    /// A `Remove` of chunk `c` (id `id`): no longer published; it may draw nothing now (an
+    /// `Empty` mesh).
+    pub(crate) fn removed(&mut self, c: ChunkPos, id: ChunkId, map: &ChunkMap) {
+        let empty = slot_by_id(map, id, c).is_some_and(draws_nothing);
         self.update(c, |b, bit| {
             put(&mut b.upserted, bit, false);
             put(&mut b.empty, bit, empty);
         });
     }
 
-    /// Chunk `c` loaded (`loaded`) or unloaded: whether it draws nothing, from its slot as it
-    /// is now (so the order of the data events against the mesh events does not matter). A
-    /// loaded chunk that may still mesh to nothing is watched if `quads` says its lod-1 node has
-    /// quads in its octant.
+    /// A data event of the world, read later ([`LodCoverage::read_data`]): chunk `c` (id `id`)
+    /// loaded (`loaded`) or unloaded.
+    pub(crate) fn data_event(&mut self, c: ChunkPos, id: ChunkId, loaded: bool) {
+        self.data.push_back((c, id, loaded));
+    }
+
+    /// Reads the waiting data events in order ([`LodCoverage::data_changed`]): at least
+    /// [`DATA_PER_FRAME_MIN`], then until `until` (module docs).
+    pub(crate) fn read_data(
+        &mut self,
+        map: &ChunkMap,
+        until: Instant,
+        quads: impl Fn(ChunkPos) -> u8,
+    ) {
+        let mut read = 0;
+        while let Some((c, id, loaded)) = self.data.pop_front() {
+            self.data_changed(c, id, loaded, map, &quads);
+            read += 1;
+            if read >= DATA_PER_FRAME_MIN && read % DATA_CLOCK_EVERY == 0 && Instant::now() >= until
+            {
+                return;
+            }
+        }
+    }
+
+    /// Chunk `c` (id `id`) loaded (`loaded`) or unloaded: whether it draws nothing, from its slot
+    /// as it is now (so the order of the data events against the mesh events does not matter,
+    /// and a late one changes nothing a later event does not). A loaded chunk that may still
+    /// mesh to nothing is watched if `quads` says its lod-1 node has quads in its octant.
     pub(crate) fn data_changed(
         &mut self,
         c: ChunkPos,
+        id: ChunkId,
         loaded: bool,
         map: &ChunkMap,
         quads: impl Fn(ChunkPos) -> u8,
@@ -290,7 +371,7 @@ impl LodCoverage {
             // Nothing to clear; if it loaded again since, its `Loaded` event follows.
             return;
         }
-        let Some(slot) = slot(map, c) else {
+        let Some(slot) = slot_by_id(map, id, c) else {
             if b.empty & bit != 0 {
                 self.update(c, |b, bit| put(&mut b.empty, bit, false));
             }
@@ -378,9 +459,11 @@ impl LodCoverage {
         }
     }
 
-    /// Polls a quarter of the watched chunks (at least 64, at most `max`), round robin: one that
-    /// draws nothing now is covered; one that is covered, unloaded, or whose octant has no LOD
-    /// quads (`quads`) leaves the list.
+    /// Polls a quarter of the watched chunks (at least 64, at most `max`) and a sixteenth of the
+    /// dormant ones (at least 8, at most `max / 16`), round robin: one that draws nothing now is
+    /// covered; one that is covered, unloaded, or whose octant has no LOD quads (`quads`) leaves
+    /// the lists; one the world wants no mesh for is dormant, and one it wants a mesh for again is
+    /// watched.
     pub(crate) fn poll(&mut self, map: &ChunkMap, max: usize, quads: impl Fn(ChunkPos) -> u8) {
         let n = self.watch.len().div_ceil(4).max(64).min(max);
         for _ in 0..n.min(self.watch.len()) {
@@ -388,25 +471,56 @@ impl LodCoverage {
                 self.cursor = 0;
             }
             let c = self.watch[self.cursor];
-            let (p, bit) = octant_of_chunk(c);
-            let keep = if self.coverage.covered(c) || quads(p) & bit == 0 {
-                false
-            } else {
-                match slot(map, c) {
-                    None => false,
-                    Some(s) if draws_nothing(s) => {
-                        self.update(c, |b, bit| put(&mut b.empty, bit, true));
-                        false
-                    }
-                    Some(_) => true,
+            match self.look(c, map, &quads) {
+                Poll::Watch => self.cursor += 1,
+                Poll::Dormant => {
+                    self.watch.swap_remove(self.cursor);
+                    self.dormant.push(c);
                 }
-            };
-            if keep {
-                self.cursor += 1;
-            } else {
-                self.watched.remove(&c);
-                self.watch.swap_remove(self.cursor);
+                Poll::Done => {
+                    self.watched.remove(&c);
+                    self.watch.swap_remove(self.cursor);
+                }
             }
+        }
+        let n = self.dormant.len().div_ceil(16).max(8).min(max / 16);
+        for _ in 0..n.min(self.dormant.len()) {
+            if self.dormant_cursor >= self.dormant.len() {
+                self.dormant_cursor = 0;
+            }
+            let c = self.dormant[self.dormant_cursor];
+            match self.look(c, map, &quads) {
+                Poll::Dormant => self.dormant_cursor += 1,
+                Poll::Watch => {
+                    self.dormant.swap_remove(self.dormant_cursor);
+                    self.watch.push(c);
+                }
+                Poll::Done => {
+                    self.watched.remove(&c);
+                    self.dormant.swap_remove(self.dormant_cursor);
+                }
+            }
+        }
+    }
+
+    /// One poll of watched chunk `c` ([`LodCoverage::poll`]); covers it if it draws nothing now.
+    fn look(&mut self, c: ChunkPos, map: &ChunkMap, quads: impl Fn(ChunkPos) -> u8) -> Poll {
+        let (p, bit) = octant_of_chunk(c);
+        if self.coverage.covered(c) || quads(p) & bit == 0 {
+            return Poll::Done;
+        }
+        match slot(map, c) {
+            None => Poll::Done,
+            Some(s) if draws_nothing(s) => {
+                self.update(c, |b, bit| put(&mut b.empty, bit, true));
+                Poll::Done
+            }
+            Some(s)
+                if matches!(s.mesh(), MeshState::None) && !s.interest.contains(Interest::MESH) =>
+            {
+                Poll::Dormant
+            }
+            Some(_) => Poll::Watch,
         }
     }
 

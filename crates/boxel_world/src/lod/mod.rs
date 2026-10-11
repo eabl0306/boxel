@@ -12,19 +12,22 @@
 //! finer nodes or full-detail chunks draw them ([`coverage`]).
 //!
 //! Per frame (in `Update`, after the world's systems, chained [`LodSystems`]):
-//! 1. `Coverage`: every message of the frame, read in full whatever the budget: the world's mesh
-//!    and data events and the main renderer's resyncs and refusals feed the full-detail coverage
-//!    ([`LodCoverage`]); the renderer's own resyncs ([`LodResync`]) and refusals
-//!    ([`LodFeedback`]) make nodes unavailable. The masks follow in the same frame, so a chunk and
-//!    the octant that hid it swap with neither a hole nor a doubled frame.
+//! 1. `Coverage`: the world's mesh events and the main renderer's resyncs and refusals, read in
+//!    full whatever the budget, feed the full-detail coverage ([`LodCoverage`]); the renderer's
+//!    own resyncs ([`LodResync`]) and refusals ([`LodFeedback`]) make nodes unavailable. The
+//!    masks follow in the same frame, so a chunk and the octant that hid it swap with neither a
+//!    hole nor a doubled frame. The world's data events wait for `Collect`.
 //! 2. `Plan`: the eye ([`LodFocus`], or the first [`ChunkViewer`] without one) and the
 //!    thresholds; the wanted tree made again from the coarsest level whose eye moved an eighth of
 //!    its hysteresis band (8 blocks for level 2, 16 for level 3, ...), or all of it after a
 //!    threshold changed; stale job priorities refreshed a batch at a time.
-//! 3. `Dispatch`: finished jobs collected and new ones started by priority, within
-//!    [`LodSettings::frame_budget`] and the in-flight caps (fewer while the world is busy, so
-//!    near chunks come first).
-//! 4. `Collect`: the frame's ops into [`LodOps`] (sends capped per frame), then [`LodStats`].
+//! 3. `Dispatch`: finished jobs collected and new ones started by priority, within what is left
+//!    of the frame's [`LodSettings::frame_budget`] (all of it once the world is settled) and the
+//!    in-flight caps (fewer while the world is busy, so near chunks come first).
+//! 4. `Collect`: the world's data events, within what is left of the frame's
+//!    [`LodSettings::frame_budget`] (they only say which chunks are all air: one read late lets
+//!    the LOD draw its coarse rounding into an air chunk for a few frames), then the frame's ops
+//!    into [`LodOps`] (sends capped per frame) and [`LodStats`].
 //!
 //! Between frames (ADR 0023) an `Idle` step goes on collecting and starting jobs; it never
 //! writes ops (finished meshes wait for `Collect`).
@@ -109,9 +112,11 @@ pub struct LodSettings {
     /// Bytes of quads sent to the renderer per frame at most (a node larger than this still
     /// goes, alone).
     pub upload_bytes_per_frame: usize,
-    /// Main-thread time per frame for collecting finished jobs and starting new ones, and between
-    /// frames per idle step; a replan goes on to its next level while under it (one level per
-    /// frame at least, coarse first). Reading the renderer's messages is not counted.
+    /// Main-thread time per frame, shared in this order by the replan (a few columns at least,
+    /// coarse levels first), collecting finished jobs and starting new ones (a few at least;
+    /// once the world is settled, a budget of their own) and reading the world's data events (a
+    /// few hundred at least); and, between frames, per idle step. Reading the mesh events and the
+    /// renderer's messages is not counted.
     pub frame_budget: Duration,
     /// How long an edited chunk waits before its LOD nodes are rebuilt (milestone 2).
     pub edit_debounce: Duration,
@@ -211,6 +216,13 @@ impl LodSettings {
     /// The preset's horizon `32 R 2^K`, in blocks.
     pub fn preset_horizon(&self) -> f64 {
         f64::from(self.ring_radius) * node_edge(self.levels.clamp(1, MAX_LEVELS)) as f64
+    }
+
+    /// About the most columns the tree holds: every level resident over a disc of `R + 4` of its
+    /// node edges (ancestors stay while their descendants are), with a margin.
+    fn column_estimate(&self) -> usize {
+        let r = f64::from(self.ring_radius) + 4.0;
+        usize::from(self.levels) * (std::f64::consts::PI * r * r).ceil() as usize
     }
 }
 
@@ -560,6 +572,8 @@ pub(crate) struct LodWorld {
     cannot_draw: bool,
     started: Option<Instant>,
     filled_after: Option<Duration>,
+    /// The end of this frame's budget, shared by the steps ([`LodSettings::frame_budget`]).
+    deadline: Option<Instant>,
 }
 
 impl LodWorld {
@@ -591,6 +605,7 @@ impl LodWorld {
             cannot_draw: false,
             started: None,
             filled_after: None,
+            deadline: None,
         }
     }
 }
@@ -661,7 +676,8 @@ impl LodWorld {
     }
 
     /// Starts over when the content (generator, registry), the dimension or the levels changed.
-    fn check_content(&mut self, content: &WorldContent, dim: DimensionId, levels: u8) {
+    fn check_content(&mut self, content: &WorldContent, dim: DimensionId, settings: &LodSettings) {
+        let levels = settings.levels;
         let generator = Arc::as_ptr(&content.generator).cast::<()>() as usize;
         let registry = Arc::as_ptr(&content.registry) as usize;
         let same = self
@@ -679,6 +695,7 @@ impl LodWorld {
             let layers = content.generator.vertical_chunks();
             let (floor, ceiling) = (*layers.start(), *layers.end());
             self.tree = Tree::new(dim, levels, (floor != i64::MIN).then_some(floor));
+            self.tree.reserve(settings.column_estimate());
             self.ceiling = (ceiling != i64::MAX).then_some(ceiling);
             self.planned = None;
             self.plan = Plan::default();
@@ -769,7 +786,7 @@ impl LodWorld {
             }
         }
         if self.replan.is_some() {
-            let until = Instant::now() + budget;
+            let until = self.deadline.unwrap_or_else(|| Instant::now() + budget);
             {
                 let _span = frame_span!("lod.replan");
                 self.replan_step(cov, until);
@@ -1255,10 +1272,10 @@ fn eye_and_view(focus: Option<&LodFocus>, viewer: Option<DVec3>) -> Option<(Eye,
     })
 }
 
-/// `LodSystems::Coverage`: drops ops no renderer took, then reads every message of the frame in
-/// full (never under the budget, module docs): the main renderer's refusals, the world's mesh
-/// events, the main renderer's resync, the world's data events, then polls the watch list, and
-/// applies the LOD renderer's resyncs and refusals. The coverage changes reach the masks, and
+/// `LodSystems::Coverage`: drops ops no renderer took, then reads the messages of the frame
+/// (module docs): the main renderer's refusals, the world's mesh events and the main renderer's
+/// resync in full, the world's data events into a queue (read in `Collect`), then polls the
+/// watch list, and applies the LOD renderer's resyncs and refusals. The coverage changes reach the masks, and
 /// the queued columns whose class changed are queued again.
 #[expect(
     clippy::too_many_arguments,
@@ -1294,8 +1311,8 @@ fn lod_coverage(
         for event in meshes.read() {
             match event {
                 ChunkMeshEvent::Upsert { key, .. } if ours(*key) => coverage.upserted(key.pos),
-                ChunkMeshEvent::Remove { key, .. } if ours(*key) => {
-                    coverage.removed(key.pos, &map);
+                ChunkMeshEvent::Remove { id, key } if ours(*key) => {
+                    coverage.removed(key.pos, *id, &map);
                 }
                 _ => {}
             }
@@ -1305,14 +1322,19 @@ fn lod_coverage(
         }
     }
     {
+        // Read in `Collect`, with what is left of the frame's budget.
         let _span = frame_span!("lod.data_events");
-        let tree = &lod.tree;
         for event in data.read() {
             if ours(event.key()) {
                 let loaded = matches!(event, ChunkDataEvent::Loaded { .. });
-                coverage.data_changed(event.pos(), loaded, &map, |p| tree.lod1_octants(p));
+                coverage.data_event(event.pos(), event.id(), loaded);
             }
         }
+        let budget = lod
+            .settings
+            .as_ref()
+            .map_or(Duration::ZERO, |s| s.frame_budget);
+        lod.deadline = Some(now + budget);
         for (p, octants) in lod.tree.take_lod1_quads() {
             coverage.lod1_quads(p, octants, &map);
         }
@@ -1393,7 +1415,7 @@ fn lod_plan(
         lod.turn_off(LodOff::InvalidSettings, name);
         return;
     };
-    lod.check_content(&content, world.dimension, valid.levels);
+    lod.check_content(&content, world.dimension, &valid);
     if !valid.enabled {
         lod.turn_off(LodOff::Disabled, name);
         return;
@@ -1437,26 +1459,41 @@ fn lod_dispatch(
         .as_ref()
         .map_or(Duration::ZERO, |s| s.frame_budget);
     let settled = world_settled(&stats, &viewers);
+    // A settled world leaves the frame light: the jobs get a budget of their own (the fill).
+    let until = match lod.deadline {
+        Some(deadline) if !settled => deadline,
+        _ => Instant::now() + budget,
+    };
     let cap = lod.cap(settled);
-    lod.run_jobs(
-        Instant::now() + budget,
-        cap,
-        !settled,
-        &content,
-        coverage.coverage(),
-    );
+    lod.run_jobs(until, cap, !settled, &content, coverage.coverage());
 }
 
-/// `LodSystems::Collect`: the frame's ops, the stats, and an ask for idle steps while jobs are
-/// left.
+/// `LodSystems::Collect`: the world's data events within what is left of the budget, the
+/// frame's ops, the stats, and an ask for idle steps while jobs are left.
 fn lod_collect(
     mut lod: ResMut<LodWorld>,
     mut ops: ResMut<LodOps>,
-    coverage: Res<LodCoverage>,
+    mut coverage: ResMut<LodCoverage>,
+    map: Res<ChunkMap>,
     mut stats: ResMut<LodStats>,
     world: Res<WorldSettings>,
     wanted: Option<ResMut<IdleWanted>>,
 ) {
+    let lod = &mut *lod;
+    {
+        // The world's data events last, with what is left of the frame's budget (the replan
+        // and the jobs come first), then the masks they change, as the coverage step does.
+        let _span = frame_span!("lod.read_data");
+        let until = lod.deadline.unwrap_or_else(Instant::now);
+        let tree = &lod.tree;
+        coverage.read_data(&map, until, |p| tree.lod1_octants(p));
+        let changed = coverage.take_changed();
+        let cov = coverage.coverage();
+        for p in changed {
+            lod.tree.chunks_changed(p, cov);
+        }
+        lod.requeue_covered(cov);
+    }
     let now = Instant::now();
     {
         let _span = frame_span!("lod.collect");
