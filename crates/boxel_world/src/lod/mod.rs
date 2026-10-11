@@ -79,6 +79,9 @@ const CLOCK_EVERY: usize = 16;
 /// A replan under way starts over from the top when the eye moved this many top-level cadences
 /// away from where it began (a jump).
 const JUMP_CADENCES: f64 = 4.0;
+/// While the world is busy, the frame's budget is this many times smaller (the world catches up
+/// first, on the main thread as on the workers).
+const BUSY_BUDGET_DIVISOR: u32 = 3;
 /// Jobs handed off to the workers per in-flight slot ([`jobs`] module docs): enough to keep a
 /// worker busy for about a millisecond between two dispatches of the main thread.
 const HANDOFF_PER_SLOT: usize = 4;
@@ -1291,6 +1294,8 @@ fn lod_coverage(
     mut meshes: MessageReader<ChunkMeshEvent>,
     mut chunk_resyncs: MessageReader<ChunkMeshResync>,
     mut data: MessageReader<ChunkDataEvent>,
+    stats: Res<WorldStats>,
+    viewers: Res<ViewerChunks>,
 ) {
     if !ops.ops.is_empty() {
         ops.ops.clear();
@@ -1334,6 +1339,12 @@ fn lod_coverage(
             .settings
             .as_ref()
             .map_or(Duration::ZERO, |s| s.frame_budget);
+        // A busy world catching up gets the main thread first, as it gets the workers.
+        let budget = if world_settled(&stats, &viewers) {
+            budget
+        } else {
+            budget / BUSY_BUDGET_DIVISOR
+        };
         lod.deadline = Some(now + budget);
         for (p, octants) in lod.tree.take_lod1_quads() {
             coverage.lod1_quads(p, octants, &map);
