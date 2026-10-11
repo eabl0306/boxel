@@ -388,7 +388,7 @@ intención del plan:
   mundo reenvíe todo una y otra vez mientras no hay GPU.
 - `GpuState` pasó a `pub(crate)` para ordenar `extract_lod` entre `extract` y
   `extract_visibility`.
-- `RenderInfo` ganó `lod_nodes`, `lod_draws` y `lod_quads` (para F3 y `stress`).
+- `RenderInfo` ganó `lod_nodes`, `lod_draws` y `lod_quads` (para la línea de F3).
 - `stress` mide el llenado desde el arranque de la corrida (`lod_fill_s`), como `settle_s`.
 - La pose alta del test de costura usa un radio de 12 chunks: con radio 4 los chunks que la
   búsqueda vieja perdía quedaban debajo de la imagen.

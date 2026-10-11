@@ -100,6 +100,7 @@ use boxel::world::lod::LodStats;
 use boxel::world::{
     ChunkId, ChunkMeshEvent, ChunkVisibility, WorldContent, WorldStats, WorldSystems,
 };
+use boxel::worldgen::lod::LodSource;
 use edits::EditScript;
 use report::{FrameRecord, RecordLog, RunInfo, Summary};
 use spans::{SpanLog, SpanRow};
@@ -573,10 +574,16 @@ impl WorldGenerator for CountingGenerator {
     fn name(&self) -> &str {
         self.inner.name()
     }
+
+    /// The inner world's far terrain (`--lod`): without it the LOD would be off.
+    fn lod(&self) -> Option<&dyn LodSource> {
+        self.inner.lod()
+    }
 }
 
 /// `--water`: the inner world with water in every air block at or below `level` and a glass
-/// block on the surface of about one water column in 29.
+/// block on the surface of about one water column in 29. It has no LOD source (the inner one
+/// knows nothing of the flood): with `--lod` the LOD stays off and says so in the log.
 struct WaterGenerator {
     inner: Arc<dyn WorldGenerator>,
     level: i64,
@@ -1855,6 +1862,12 @@ mod tests {
         assert!(parse(&["--fog-res", "quarter"]).is_err());
         assert!(parse(&["--fog"]).is_err());
         assert_eq!(options(&[]).lod, lod::LodPreset::Off, "no LOD unless asked");
+        // The counting wrapper keeps the world's far terrain (else --lod would be off).
+        let counting = CountingGenerator {
+            inner: Arc::new(boxel_demo::worldgen::ForestGenerator::default()),
+            generated: Arc::default(),
+        };
+        assert!(counting.lod().is_some());
         assert_eq!(options(&["--lod", "near"]).lod, lod::LodPreset::Near);
         assert!(parse(&["--lod", "huge"]).is_err());
         let o = parse(&["--edits", "--time", "21:30"])
