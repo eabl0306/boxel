@@ -506,8 +506,24 @@ pub(crate) fn cadence(k: u8) -> f64 {
 /// (moved out of it: the eye has not crossed an eighth of their bands since they were made) and
 /// making levels `redo` and below again, with the hysteresis of their spans in `old`. `redo` is
 /// clamped to `1..=K`; an `old` with another number of levels counts as empty.
-pub(crate) fn plan(eye: &Eye, th: &Thresholds, old: &mut Plan, redo: u8) -> Plan {
+///
+/// `ceiling` is the generator's highest chunk layer (`vertical_chunks().end()`, `None` without
+/// one): a level-`k` layer above `ceiling >> k` holds only air, so it is never wanted (no job, no
+/// record). Over a fixed-height world a high eye then wants the columns that reach the ground,
+/// not a disc as wide as `T_1` at its own height.
+pub(crate) fn plan(
+    eye: &Eye,
+    th: &Thresholds,
+    old: &mut Plan,
+    redo: u8,
+    ceiling: Option<i64>,
+) -> Plan {
     let top = th.levels();
+    // The layers of level `k` that may hold more than air, inside the world limit.
+    let layers = |k: u8| {
+        let limit = world_limit(k);
+        Some((-limit, ceiling.map_or(limit, |c| (c >> k).min(limit))))
+    };
     if old.levels.len() != usize::from(top) {
         old.levels = vec![LevelPlan::default(); usize::from(top)];
     }
@@ -553,10 +569,13 @@ pub(crate) fn plan(eye: &Eye, th: &Thresholds, old: &mut Plan, redo: u8) -> Plan
                     continue;
                 }
                 let before = prev.get(x, z);
-                let wanted = hysteresis(
-                    before.and_then(|o| o.wanted),
-                    at.span(gap2, h),
-                    at.span(gap2, stay),
+                let wanted = intersect(
+                    hysteresis(
+                        before.and_then(|o| o.wanted),
+                        at.span(gap2, h),
+                        at.span(gap2, stay),
+                    ),
+                    layers(top),
                 );
                 let Some(span) = wanted else {
                     continue;
@@ -600,7 +619,7 @@ pub(crate) fn plan(eye: &Eye, th: &Thresholds, old: &mut Plan, redo: u8) -> Plan
             let Some((a, b)) = parent.refined else {
                 continue;
             };
-            let Some(wanted) = intersect(Some((a * 2, b * 2 + 1)), Some((-limit, limit))) else {
+            let Some(wanted) = intersect(Some((a * 2, b * 2 + 1)), layers(k)) else {
                 continue;
             };
             for (dx, dz) in [(0, 0), (1, 0), (0, 1), (1, 1)] {

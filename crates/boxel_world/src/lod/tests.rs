@@ -204,7 +204,7 @@ fn the_guard_turns_off_a_huge_vertical_radius_without_bounds() {
 
 /// A plan with no history (no hysteresis).
 fn fresh_plan(eye: &Eye, th: &Thresholds) -> Plan {
-    plan::plan(eye, th, &mut Plan::default(), th.levels())
+    plan::plan(eye, th, &mut Plan::default(), th.levels(), None)
 }
 
 /// Wanted nodes whose layer meets blocks `-64..128` (the toy terrain's band), over every level.
@@ -410,7 +410,7 @@ fn a_fresh_plan_is_the_brute_force_tree() {
 
 /// The plan after `p`, from `eye` (hysteresis from `p`).
 fn replan(mut p: Plan, eye: &Eye, th: &Thresholds) -> Plan {
-    plan::plan(eye, th, &mut p, th.levels())
+    plan::plan(eye, th, &mut p, th.levels(), None)
 }
 
 #[test]
@@ -1385,6 +1385,40 @@ fn the_guard_turns_on_again_only_past_a_margin() {
     assert_eq!(at(20.0).0, None);
 }
 
+/// Over a fixed-height world the wanted layers stop at the generator's top: a high eye wants no
+/// air column at its own height (a disc as wide as `T_1` there), about as many columns as at the
+/// ground (the `far` preset's rings).
+#[test]
+fn a_high_eye_over_a_fixed_height_world_wants_no_air_layers() {
+    let settings = LodSettings {
+        ring_radius: 24,
+        levels: 4,
+        ..small()
+    };
+    let columns_at = |y: f64| {
+        let mut app = app(Steps::new(20), settings.clone());
+        app.world_mut().spawn((
+            Transform::from_translation(DVec3::new(10.0, y, 10.0)),
+            ChunkViewer::new(2).with_vertical_radius(u32::MAX),
+        ));
+        app.update();
+        let lod = app.world().resource::<LodWorld>();
+        assert_eq!(lod.off, None, "y {y}");
+        // The generator's top is chunk layer 3.
+        for (c, col) in &lod.tree.columns {
+            if let Some((_, hi)) = col.plan.wanted {
+                assert!(hi <= 3 >> c.level, "y {y}: {c:?} wants layers up to {hi}");
+            }
+        }
+        app.world().resource::<LodStats>().columns()
+    };
+    let (ground, high) = (columns_at(80.0), columns_at(3000.0));
+    assert!(
+        2 * high <= 3 * ground,
+        "{high} columns at y 3000, {ground} at y 80"
+    );
+}
+
 #[test]
 fn a_generator_without_a_source_turns_the_lod_off() {
     let steps = Steps {
@@ -2070,8 +2104,9 @@ fn layers_entering_a_failed_column_are_lost() {
         app.world_mut().resource_mut::<LodFocus>().origin.y = y;
         fill(app, model, 300);
     };
-    // Up until the layer leaves the wanted tree, and back: its next job panics.
-    go(&mut app, &mut model, 800);
+    // Down until the layer leaves the wanted tree (the column keeps the layers under it), and
+    // back: its next job panics.
+    go(&mut app, &mut model, -700);
     assert!(!app.world().resource::<LodWorld>().tree.wanted(key));
     go(&mut app, &mut model, 60);
     let tree = &app.world().resource::<LodWorld>().tree;
@@ -2079,7 +2114,7 @@ fn layers_entering_a_failed_column_are_lost() {
     assert!(col.failed && col.band.is_some() && tree.lost(key));
     assert_eq!(model.nodes[&up].0 & tree::octant_bit(key), 0);
     // Once more: the layer comes back lost, not waiting for a job that never runs.
-    go(&mut app, &mut model, 800);
+    go(&mut app, &mut model, -700);
     go(&mut app, &mut model, 60);
     let tree = &app.world().resource::<LodWorld>().tree;
     assert!(tree.lost(key), "{:?}", tree.node(key));

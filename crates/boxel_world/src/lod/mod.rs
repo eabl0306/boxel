@@ -511,6 +511,8 @@ pub(crate) struct LodWorld {
     refresh: Vec<ColumnKey>,
     /// The content the tree was built from: generator and registry (pointers), materials.
     content: Option<(usize, usize, Arc<LodMaterials>)>,
+    /// The generator's highest chunk layer ([`plan::plan`]'s ceiling), `None` without one.
+    ceiling: Option<i64>,
     off: Option<LodOff>,
     /// Logged once each.
     warned: Vec<LodOff>,
@@ -538,6 +540,7 @@ impl LodWorld {
             refreshed: None,
             refresh: Vec::new(),
             content: None,
+            ceiling: None,
             off: Some(LodOff::InvalidSettings),
             warned: Vec::new(),
             outbox: Vec::new(),
@@ -621,8 +624,10 @@ impl LodWorld {
         if !same || self.tree.dim != dim || self.tree.levels != levels {
             self.outbox.extend(self.tree.clear());
             self.jobs.queue.clear();
-            let floor = *content.generator.vertical_chunks().start();
+            let layers = content.generator.vertical_chunks();
+            let (floor, ceiling) = (*layers.start(), *layers.end());
             self.tree = Tree::new(dim, levels, (floor != i64::MIN).then_some(floor));
+            self.ceiling = (ceiling != i64::MAX).then_some(ceiling);
             self.planned = None;
             self.plan = Plan::default();
             self.level_eyes = [None; MAX_LEVELS as usize + 1];
@@ -673,7 +678,7 @@ impl LodWorld {
         if redo > 0 {
             let redo = if fresh { th.levels() } else { redo };
             let mut old = std::mem::take(&mut self.plan);
-            let new = plan::plan(&eye, &th, &mut old, redo);
+            let new = plan::plan(&eye, &th, &mut old, redo, self.ceiling);
             self.tree.apply_plan(&old, &new, redo, cov);
             self.plan = new;
             for e in &mut self.level_eyes[1..=usize::from(redo)] {
