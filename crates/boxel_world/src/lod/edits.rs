@@ -18,6 +18,9 @@
 //! - Without persistence an edited chunk that unloads is generated again when it comes back, so
 //!   it leaves the set and its nodes go back to the generator's cells. With persistence it stays
 //!   (it is saved), and its pyramid is read from the store when needed.
+//! - An edited chunk above the generator's top chunk layer raises the plan's ceiling in its
+//!   columns ([`Ceiling`](super::plan::Ceiling)): a platform over the terrain gets nodes at
+//!   every level, as a tower does.
 //! - Level 6 and up (preset `extreme`) does not show edits: a cell spans 8 chunks there.
 //!
 //! The fallback for generators without a coarse source (`fallback`) builds level-1 cells from
@@ -413,6 +416,12 @@ pub(crate) struct Edits {
     waiting: HashMap<ChunkKey, Vec<ColumnKey>>,
     /// Chunks whose pyramid job failed: their nodes show the generator's cells.
     broken: HashSet<ChunkKey>,
+    /// The generator's top chunk layer (`None`: unbounded, or not known yet), and the edited
+    /// chunks above it: they raise the plan's [`Ceiling`](super::plan::Ceiling).
+    top: Option<i64>,
+    above: HashSet<ChunkKey>,
+    /// `above` changed since [`Edits::take_above_changed`].
+    above_changed: bool,
     /// The saved chunks were listed (startup).
     pub(crate) seeded: bool,
 }
@@ -438,6 +447,9 @@ impl Edits {
             jobs: HashMap::default(),
             waiting: HashMap::default(),
             broken: HashSet::default(),
+            top: None,
+            above: HashSet::default(),
+            above_changed: false,
             seeded: false,
         }
     }
@@ -466,6 +478,10 @@ impl Edits {
         if !self.edited.insert(key) {
             return;
         }
+        if self.top.is_some_and(|t| key.pos.y > t) {
+            self.above.insert(key);
+            self.above_changed = true;
+        }
         for level in 1..=PYRAMID_LEVELS {
             let (x0, x1) = nodes_touching(key.pos.x, level);
             let (z0, z1) = nodes_touching(key.pos.z, level);
@@ -475,6 +491,38 @@ impl Edits {
                 }
             }
         }
+    }
+
+    /// The generator's top chunk layer is `top` (`None`: unbounded): the edited chunks above it
+    /// are listed again.
+    pub(crate) fn set_top(&mut self, top: Option<i64>) {
+        if self.top == top {
+            return;
+        }
+        self.top = top;
+        self.above = match top {
+            Some(t) => self
+                .edited
+                .iter()
+                .filter(|k| k.pos.y > t)
+                .copied()
+                .collect(),
+            None => HashSet::default(),
+        };
+        self.above_changed = true;
+    }
+
+    /// True if the edited chunks above the generator's top changed since the last call.
+    pub(crate) fn take_above_changed(&mut self) -> bool {
+        std::mem::take(&mut self.above_changed)
+    }
+
+    /// The edited chunks of `dim` above the generator's top.
+    pub(crate) fn above(&self, dim: DimensionId) -> impl Iterator<Item = ChunkPos> + '_ {
+        self.above
+            .iter()
+            .filter(move |k| k.dim == dim)
+            .map(|k| k.pos)
     }
 
     /// Chunk `key` changed at `now` (a [`BlockChanged`](crate::BlockChanged) there).
@@ -488,6 +536,9 @@ impl Edits {
     pub(crate) fn remove(&mut self, key: ChunkKey) -> (bool, Vec<ColumnKey>) {
         if !self.edited.remove(&key) {
             return (false, Vec::new());
+        }
+        if self.above.remove(&key) {
+            self.above_changed = true;
         }
         for level in 1..=PYRAMID_LEVELS {
             let (x0, x1) = nodes_touching(key.pos.x, level);

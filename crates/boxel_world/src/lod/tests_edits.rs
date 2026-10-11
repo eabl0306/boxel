@@ -60,6 +60,16 @@ fn edit_tower(app: &mut App) {
 /// cell rule on the blocks (`tower`: with the tower), meshed as a job does.
 fn expected(key: ChunkKey, edited: &HashSet<ChunkPos>, tower: bool) -> Built {
     let registry = boxel_voxel::testing::registry();
+    expected_by(key, edited, &|p| block_at(&registry, tower, p))
+}
+
+/// [`expected`] with the edited chunks' blocks from `blocks`.
+fn expected_by(
+    key: ChunkKey,
+    edited: &HashSet<ChunkPos>,
+    blocks: &dyn Fn([i64; 3]) -> BlockState,
+) -> Built {
+    let registry = boxel_voxel::testing::registry();
     let materials = LodMaterials::from_registry(&registry);
     let classes = LodClasses::from_registry(&registry);
     let steps = Steps::new(20);
@@ -97,15 +107,11 @@ fn expected(key: ChunkKey, edited: &HashSet<ChunkPos>, tower: bool) -> Built {
                     continue;
                 }
                 let state = CellPartial::of_cell(&classes, at, s as u32, |bx, by, bz| {
-                    block_at(
-                        &registry,
-                        tower,
-                        [
-                            at[0] + i64::from(bx),
-                            at[1] + i64::from(by),
-                            at[2] + i64::from(bz),
-                        ],
-                    )
+                    blocks([
+                        at[0] + i64::from(bx),
+                        at[1] + i64::from(by),
+                        at[2] + i64::from(bz),
+                    ])
                 })
                 .state();
                 cells.set(x, y, z, state);
@@ -762,4 +768,84 @@ fn a_column_reaching_more_edits_than_half_the_cache_does_not_wait() {
         e.for_column(c, (0, 1), DimensionId(0)),
         ForColumn::Wait
     ));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Edits above the generator's top
+
+/// A platform the player built over the generator's top layer (steps: `vertical_chunks` ends at
+/// layer 3, y 127): y 136..=143 over x, z 32..=47, so whole cells up to level 3 in chunk layer 4.
+const PLATFORM_Y: std::ops::RangeInclusive<i64> = 136..=143;
+const PLATFORM_XZ: std::ops::RangeInclusive<i64> = 32..=47;
+
+/// The block of the steps world at `p`, with the platform.
+fn platform_block(registry: &BlockRegistry, p: [i64; 3]) -> BlockState {
+    if PLATFORM_XZ.contains(&p[0]) && PLATFORM_XZ.contains(&p[2]) && PLATFORM_Y.contains(&p[1]) {
+        return solid(registry);
+    }
+    block_at(registry, false, p)
+}
+
+fn edit_platform(app: &mut App) {
+    let registry = Arc::clone(&app.world().resource::<WorldContent>().registry);
+    let mut queue = app.world_mut().resource_mut::<EditQueue>();
+    for y in PLATFORM_Y {
+        for x in PLATFORM_XZ {
+            for z in PLATFORM_XZ {
+                queue.set_block(BlockPos::new(x, y, z), solid(&registry));
+            }
+        }
+    }
+}
+
+/// A world of `steps` without vertical bounds (chunks above the generator's top load as air,
+/// and the player can build there), the LOD on `executor`.
+fn unbounded_app(steps: Steps, settings: LodSettings, executor: Arc<dyn JobExecutor>) -> App {
+    let mut app = App::new();
+    app.add_plugins(WorldPlugin {
+        generator: Arc::new(steps),
+        registry: Arc::new(boxel_voxel::testing::registry()),
+        settings: WorldSettings {
+            vertical_bounds: None,
+            ..WorldSettings::default()
+        },
+        executor: Arc::new(InlineExecutor),
+    })
+    .add_plugins(LodWorldPlugin { settings, executor });
+    app
+}
+
+#[test]
+fn edits_above_the_generators_top_show_at_the_fine_levels() {
+    // With a source (levels 1 and 2), and with the fallback (level 1 only).
+    for no_lod in [false, true] {
+        let steps = Steps {
+            no_lod,
+            ..Steps::new(20)
+        };
+        let mut app = unbounded_app(steps, edit_settings(2, 0), Arc::new(InlineExecutor));
+        spawn(&mut app, DVec3::new(40.0, 150.0, 40.0));
+        let mut model = Model::default();
+        fill(&mut app, &mut model, 2000);
+        edit_platform(&mut app);
+        refill(&mut app, &mut model, 2000);
+        let registry = boxel_voxel::testing::registry();
+        let edited: HashSet<ChunkPos> = [ChunkPos::new(1, 4, 1)].into_iter().collect();
+        let stats = app.world().resource::<LodStats>().clone();
+        assert_eq!(stats.edited_chunks, 1, "{stats:?}");
+        let levels = if no_lod { 1 } else { 2 };
+        assert_eq!(stats.levels.len(), usize::from(levels));
+        for k in 1..=levels {
+            let key = node_at(k, [40, 140, 40]);
+            let want = built_mesh(expected_by(key, &edited, &|p| platform_block(&registry, p)));
+            assert!(want.is_some(), "level {k}: the platform draws something");
+            let lod = app.world().resource::<LodWorld>();
+            assert!(
+                lod.tree.wanted(key),
+                "no_lod {no_lod}, level {k}: {key:?} above the generator's top is wanted"
+            );
+            assert_eq!(tree_mesh(&app, key), want, "no_lod {no_lod}, level {k}");
+        }
+        tests::assert_bits_from_scratch(&app);
+    }
 }

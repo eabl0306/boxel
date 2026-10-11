@@ -2,7 +2,7 @@
 //! bits and ops, jobs, priorities, far from the origin and the plugin. Engine tests: a toy
 //! generator of `test:` blocks ([`Steps`]) whose coarse cells follow the cell rule exactly.
 use super::coverage::ChunkCoverage;
-use super::plan::{self, ColumnKey, Eye, Plan, contains};
+use super::plan::{self, Ceiling, ColumnKey, Eye, Plan, contains};
 use super::*;
 use crate::jobs::InlineExecutor;
 use crate::{WorldPlugin, WorldSettings};
@@ -204,7 +204,13 @@ fn the_guard_turns_off_a_huge_vertical_radius_without_bounds() {
 
 /// A plan with no history (no hysteresis).
 fn fresh_plan(eye: &Eye, th: &Thresholds) -> Plan {
-    plan::plan(eye, th, &mut Plan::default(), th.levels(), None)
+    plan::plan(
+        eye,
+        th,
+        &mut Plan::default(),
+        th.levels(),
+        &Ceiling::default(),
+    )
 }
 
 /// Wanted nodes whose layer meets blocks `-64..128` (the toy terrain's band), over every level.
@@ -410,7 +416,7 @@ fn a_fresh_plan_is_the_brute_force_tree() {
 
 /// The plan after `p`, from `eye` (hysteresis from `p`).
 fn replan(mut p: Plan, eye: &Eye, th: &Thresholds) -> Plan {
-    plan::plan(eye, th, &mut p, th.levels(), None)
+    plan::plan(eye, th, &mut p, th.levels(), &Ceiling::default())
 }
 
 #[test]
@@ -427,7 +433,13 @@ fn a_level_planned_a_row_a_step_is_the_level_planned_at_once() {
     ] {
         let (a, b) = (at(from), at(to));
         let th = small_thresholds(&b);
-        let old = plan::plan(&a, &th, &mut Plan::default(), th.levels(), None);
+        let old = plan::plan(
+            &a,
+            &th,
+            &mut Plan::default(),
+            th.levels(),
+            &Ceiling::default(),
+        );
         let whole = replan(old.clone(), &b, &th);
         let top = th.levels();
         let mut levels = vec![plan::LevelPlan::default(); usize::from(top)];
@@ -435,7 +447,8 @@ fn a_level_planned_a_row_a_step_is_the_level_planned_at_once() {
             let i = usize::from(k) - 1;
             let parents = levels.get(i + 1).cloned().filter(|_| k < top);
             let prev = &old.levels[i];
-            let mut planner = plan::LevelPlanner::new(b, th, k, parents.as_ref(), None);
+            let mut planner =
+                plan::LevelPlanner::new(b, th, k, parents.as_ref(), Ceiling::default());
             let mut steps = 1;
             while !planner.step(prev, parents.as_ref(), Some(Instant::now())) {
                 steps += 1;
@@ -1167,7 +1180,7 @@ fn replans_go_level_by_level_coarse_first() {
     let eye = lod.planned.expect("planned").eye;
     let th = lod.planned.expect("planned").th;
     let mut empty = Plan::default();
-    let once = plan::plan(&eye, &th, &mut empty, 3, lod.ceiling);
+    let once = plan::plan(&eye, &th, &mut empty, 3, &lod.ceiling);
     for k in 1..=3u8 {
         let i = usize::from(k) - 1;
         let staged: Vec<_> = lod.plan.levels[i].iter().map(|(c, p)| (c, *p)).collect();
@@ -1665,6 +1678,50 @@ fn a_high_eye_over_a_fixed_height_world_wants_no_air_layers() {
         2 * high <= 3 * ground,
         "{high} columns at y 3000, {ground} at y 80"
     );
+}
+
+/// Edited chunks above the generator's top raise the ceiling of their own columns only, at
+/// every level, and a plan wants their layers there.
+#[test]
+fn edits_above_the_top_raise_the_ceiling_of_their_columns() {
+    let none = Ceiling::new(Some(3), [ChunkPos::new(5, 2, 5)]);
+    assert_eq!(none, Ceiling::new(Some(3), []), "an edit under the top");
+    assert_eq!(
+        Ceiling::new(None, [ChunkPos::new(0, 9, 0)]).top(1, [0, 0]),
+        None
+    );
+    let c = Ceiling::new(Some(3), [ChunkPos::new(1, 9, 1), ChunkPos::new(-5, 4, 70)]);
+    for (k, column, top) in [
+        (1, [0, 0], 4),
+        (1, [1, 0], 1),
+        (2, [0, 0], 2),
+        (3, [0, 0], 1),
+        (4, [0, 0], 0),
+        (6, [0, 0], 0),
+        (1, [-3, 35], 2),
+        (2, [-2, 17], 1),
+        (3, [-1, 8], 0),
+    ] {
+        assert_eq!(c.top(k, column), Some(top), "level {k} column {column:?}");
+    }
+    // A plan from right by the edit wants its layers in its columns, and only there.
+    let eye = Eye::from_world(DVec3::new(40.0, 300.0, 40.0));
+    let th = small_thresholds(&eye);
+    let flat = plan::plan(
+        &eye,
+        &th,
+        &mut Plan::default(),
+        th.levels(),
+        &Ceiling::new(Some(3), []),
+    );
+    let raised = plan::plan(&eye, &th, &mut Plan::default(), th.levels(), &c);
+    let column = |p: &Plan, level: u8, x: i64, z: i64| {
+        p.get(ColumnKey { level, x, z }).and_then(|c| c.wanted)
+    };
+    assert_eq!(column(&flat, 1, 0, 0).map(|w| w.1), Some(1));
+    assert_eq!(column(&raised, 1, 0, 0).map(|w| w.1), Some(4));
+    assert_eq!(column(&raised, 2, 0, 0).map(|w| w.1), Some(2));
+    assert_eq!(column(&raised, 1, 1, 0), column(&flat, 1, 1, 0));
 }
 
 /// Every chunk the main renderer draws.

@@ -21,6 +21,9 @@
 //! vertical radius without vertical bounds, an eye kilometers above a fixed-height world), the
 //! guard turns the LOD off.
 //!
+//! No layer above the generator's top is wanted, but in the columns of edited chunks above it
+//! ([`Ceiling`]).
+//!
 //! The set of wanted layers of a column is an interval (the distance to a box grows with its
 //! vertical gap), so the walk is per column: [`plan_level`] keeps one wanted interval per column
 //! and level, and for `k >= 2` the refined part of it, whose children columns want twice its
@@ -31,7 +34,9 @@ use super::coverage::ChunkCoverage;
 use crate::interest::Viewer;
 use boxel_math::{DVec3, I64Vec3, Vec3};
 use boxel_voxel::{BlockPos, ChunkKey, ChunkPos, DimensionId, MAX_CHUNK_COORD};
+use foldhash::HashMap;
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Most LOD levels the settings allow (`k = 1..=6`). The GPU side keeps 4 bits, room for 15.
@@ -186,20 +191,77 @@ impl Thresholds {
     }
 }
 
+/// The highest layer of each level that may hold more than air: the generator's top chunk layer
+/// (`vertical_chunks().end()`), raised per column by the edited chunks above it (a tower or a
+/// platform the player built over the terrain, `edits`). A plan wants no layer above it: over a
+/// fixed-height world a high eye then wants the columns that reach the ground, not a disc as
+/// wide as `T_1` at its own height.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Ceiling {
+    /// The generator's top chunk layer, `None` without one (no layer is left out).
+    generator: Option<i64>,
+    /// Per level (`raised[k - 1]`, empty without such edits), the columns holding edited chunks
+    /// above `generator >> k`: the highest level-`k` layer they reach.
+    raised: Arc<Vec<HashMap<[i64; 2], i64>>>,
+}
+
+impl Ceiling {
+    /// The ceiling of a generator whose top chunk layer is `generator` (`None`: unbounded) with
+    /// the edited chunks `edited` (any of them; those under the top change nothing).
+    pub(crate) fn new(generator: Option<i64>, edited: impl IntoIterator<Item = ChunkPos>) -> Self {
+        let Some(top) = generator else {
+            return Self::default();
+        };
+        let mut raised: Vec<HashMap<[i64; 2], i64>> = Vec::new();
+        for p in edited.into_iter().filter(|p| p.y > top) {
+            if raised.is_empty() {
+                raised = vec![HashMap::default(); usize::from(MAX_LEVELS)];
+            }
+            for k in 1..=MAX_LEVELS {
+                let y = p.y >> k;
+                if y > top >> k {
+                    let at = raised[usize::from(k) - 1]
+                        .entry([p.x >> k, p.z >> k])
+                        .or_insert(y);
+                    *at = (*at).max(y);
+                }
+            }
+        }
+        Self {
+            generator,
+            raised: Arc::new(raised),
+        }
+    }
+
+    /// The highest level-`k` layer of column `[x, z]` that may hold more than air (`None`: no
+    /// limit).
+    pub(crate) fn top(&self, k: u8, column: [i64; 2]) -> Option<i64> {
+        let top = self.generator? >> k;
+        if self.raised.is_empty() {
+            return Some(top);
+        }
+        let raised = self
+            .raised
+            .get(usize::from(k).wrapping_sub(1))
+            .and_then(|m| m.get(&column));
+        Some(raised.map_or(top, |&r| r.max(top)))
+    }
+}
+
 /// True if every published chunk of `cov` lies in a lod-1 node that a plan under `th` from `eye`
 /// wants: its level-2 parent is nearer than `T_1` (refined whatever the hysteresis; its own
 /// ancestors are nearer still than their thresholds), or with one level the node itself is
-/// nearer than the horizon. Chunks above `ceiling >> 1` lie in nodes no plan wants (all air at
-/// the generator's level). A walk over the coverage: called only while `T_1` would shrink.
+/// nearer than the horizon. Chunks above the ceiling lie in nodes no plan wants (all air at the
+/// generator's level). A walk over the coverage: called only while `T_1` would shrink.
 pub(crate) fn reaches_published(
     eye: &Eye,
     th: &Thresholds,
-    ceiling: Option<i64>,
+    ceiling: &Ceiling,
     cov: &ChunkCoverage,
 ) -> bool {
     let t1 = th.level(1);
     cov.positions().all(|p| {
-        if cov.get(p).published == 0 || ceiling.is_some_and(|c| p.y > c >> 1) {
+        if cov.get(p).published == 0 || ceiling.top(1, [p.x, p.z]).is_some_and(|t| p.y > t) {
             return true;
         }
         let lod1 = ChunkKey {
@@ -584,17 +646,14 @@ pub(crate) fn cadence(k: u8) -> f64 {
 /// [`plan_level`] level after level, coarse first, at once (tests; the LOD goes a budgeted part
 /// a frame).
 ///
-/// `ceiling` is the generator's highest chunk layer (`vertical_chunks().end()`, `None` without
-/// one): a level-`k` layer above `ceiling >> k` holds only air, so it is never wanted (no job, no
-/// record). Over a fixed-height world a high eye then wants the columns that reach the ground,
-/// not a disc as wide as `T_1` at its own height.
+/// No layer above `ceiling` is wanted (no job, no record): it holds only air ([`Ceiling`]).
 #[cfg(test)]
 pub(crate) fn plan(
     eye: &Eye,
     th: &Thresholds,
     old: &mut Plan,
     redo: u8,
-    ceiling: Option<i64>,
+    ceiling: &Ceiling,
 ) -> Plan {
     let top = th.levels();
     if old.levels.len() != usize::from(top) {
@@ -636,9 +695,9 @@ pub(crate) fn plan_level(
     k: u8,
     prev: &LevelPlan,
     parents: Option<&LevelPlan>,
-    ceiling: Option<i64>,
+    ceiling: &Ceiling,
 ) -> LevelPlan {
-    let mut planner = LevelPlanner::new(*eye, *th, k, parents, ceiling);
+    let mut planner = LevelPlanner::new(*eye, *th, k, parents, ceiling.clone());
     while !planner.step(prev, parents, None) {}
     planner.finish()
 }
@@ -651,7 +710,7 @@ pub(crate) struct LevelPlanner {
     eye: Eye,
     th: Thresholds,
     k: u8,
-    ceiling: Option<i64>,
+    ceiling: Ceiling,
     /// The level's new window.
     map: LevelPlan,
     /// The top level: the window's rows (z); a finer level: the rows of the parents' window.
@@ -666,7 +725,7 @@ impl LevelPlanner {
         th: Thresholds,
         k: u8,
         parents: Option<&LevelPlan>,
-        ceiling: Option<i64>,
+        ceiling: Ceiling,
     ) -> Self {
         let top = th.levels();
         let Some(parents) = parents.filter(|_| k < top) else {
@@ -722,10 +781,12 @@ impl LevelPlanner {
         }
     }
 
-    /// The layers of level `k` that may hold more than air, inside the world limit.
-    fn layers(&self, k: u8) -> Option<Span> {
+    /// The layers of column `[x, z]` of level `k` that may hold more than air, inside the world
+    /// limit.
+    fn layers(&self, k: u8, column: [i64; 2]) -> Option<Span> {
         let limit = world_limit(k);
-        Some((-limit, self.ceiling.map_or(limit, |c| (c >> k).min(limit))))
+        let top = self.ceiling.top(k, column);
+        Some((-limit, top.map_or(limit, |t| t.min(limit))))
     }
 
     /// The refined layers of a level-`k` column (`k >= 2`) at `gap2` from the eye: nearer than
@@ -795,7 +856,7 @@ impl LevelPlanner {
                     at.span(gap2, h),
                     at.span(gap2, stay),
                 ),
-                self.layers(top),
+                self.layers(top, [x, z]),
             );
             let Some(span) = wanted else {
                 continue;
@@ -824,14 +885,16 @@ impl LevelPlanner {
             let Some((a, b)) = parent.refined else {
                 continue;
             };
-            let Some(wanted) = intersect(Some((a * 2, b * 2 + 1)), self.layers(k)) else {
-                continue;
-            };
             for (cx, cz) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
                 let (x, z) = (px * 2 + cx, pz * 2 + cz);
                 if x.abs() > limit || z.abs() > limit {
                     continue;
                 }
+                // Siblings may differ: one holds an edit above the generator's top.
+                let Some(wanted) = intersect(Some((a * 2, b * 2 + 1)), self.layers(k, [x, z]))
+                else {
+                    continue;
+                };
                 let refined = if k >= 2 {
                     let gap2 = self.eye.column_gap2(k, [x, z]);
                     self.refine(&at, k, gap2, wanted, prev.get(x, z))

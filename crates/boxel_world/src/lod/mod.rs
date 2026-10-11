@@ -600,8 +600,12 @@ pub(crate) struct LodWorld {
     refresh: Vec<ColumnKey>,
     /// The content the tree was built from: generator and registry (pointers), materials.
     content: Option<(usize, usize, Arc<LodMaterials>)>,
-    /// The generator's highest chunk layer ([`plan::plan`]'s ceiling), `None` without one.
-    ceiling: Option<i64>,
+    /// The generator's highest chunk layer, `None` without one.
+    generator_top: Option<i64>,
+    /// The layers a plan may want: up to the generator's top, raised by the edits above it.
+    ceiling: plan::Ceiling,
+    /// The ceiling changed: the next replan makes every level again.
+    replan_all: bool,
     off: Option<LodOff>,
     /// Logged once each.
     warned: Vec<LodOff>,
@@ -640,7 +644,9 @@ impl LodWorld {
             refreshed: None,
             refresh: Vec::new(),
             content: None,
-            ceiling: None,
+            generator_top: None,
+            ceiling: plan::Ceiling::default(),
+            replan_all: false,
             off: Some(LodOff::InvalidSettings),
             warned: Vec::new(),
             outbox: Vec::new(),
@@ -743,7 +749,10 @@ impl LodWorld {
             let (floor, ceiling) = (*layers.start(), *layers.end());
             self.tree = Tree::new(dim, levels, (floor != i64::MIN).then_some(floor));
             self.tree.reserve(settings.column_estimate());
-            self.ceiling = (ceiling != i64::MAX).then_some(ceiling);
+            self.generator_top = (ceiling != i64::MAX).then_some(ceiling);
+            self.edits.set_top(self.generator_top);
+            self.edits.take_above_changed();
+            self.ceiling = plan::Ceiling::new(self.generator_top, self.edits.above(dim));
             self.planned = None;
             self.plan = Plan::default();
             self.replan = None;
@@ -788,7 +797,7 @@ impl LodWorld {
                     && !plan::reaches_published(
                         &eye,
                         &settings.thresholds(keep),
-                        self.ceiling,
+                        &self.ceiling,
                         cov,
                     ) =>
             {
@@ -804,6 +813,14 @@ impl LodWorld {
         }
         self.off = None;
         self.view = view;
+        // Edits above the generator's top raise the layers a plan may want (their columns).
+        if self.edits.take_above_changed() {
+            let ceiling = plan::Ceiling::new(self.generator_top, self.edits.above(self.tree.dim));
+            if ceiling != self.ceiling {
+                self.ceiling = ceiling;
+                self.replan_all = true;
+            }
+        }
         // The coarsest level due: all of them after a threshold changed, else the coarsest whose
         // eye moved past its cadence (finer levels follow it). A replan goes one level per frame,
         // coarse first (more while it is cheap): a first plan or a jump never lands in one
@@ -811,12 +828,14 @@ impl LodWorld {
         // jumps.
         let top = th.levels();
         let budget = settings.frame_budget;
-        let fresh = self.planned.is_none_or(|p| p.th != th);
+        let fresh = self.replan_all || self.planned.is_none_or(|p| p.th != th);
         // A level half applied is finished first (its columns follow the old or the new plan,
         // nothing else).
         let restart = self.replan.as_ref().is_some_and(|r| {
             r.level.is_none()
-                && (r.th != th || r.eye.distance_to(&eye) >= plan::cadence(top) * JUMP_CADENCES)
+                && (self.replan_all
+                    || r.th != th
+                    || r.eye.distance_to(&eye) >= plan::cadence(top) * JUMP_CADENCES)
         });
         if restart || fresh && self.replan.is_none() {
             self.start_replan(eye, th, top);
@@ -875,6 +894,9 @@ impl LodWorld {
         if self.plan.levels.len() != usize::from(top) {
             self.plan.levels = vec![plan::LevelPlan::default(); usize::from(top)];
         }
+        if redo >= top {
+            self.replan_all = false;
+        }
         self.replan = Some(Replan {
             eye,
             th,
@@ -904,7 +926,7 @@ impl LodWorld {
                     let parents = self.plan.levels.get(i + 1);
                     let _span = frame_span!("lod.plan_level");
                     let mut planner = r.planning.take().unwrap_or_else(|| {
-                        plan::LevelPlanner::new(r.eye, r.th, k, parents, self.ceiling)
+                        plan::LevelPlanner::new(r.eye, r.th, k, parents, self.ceiling.clone())
                     });
                     if !planner.step(prev, parents, Some(until)) {
                         r.planning = Some(planner);
