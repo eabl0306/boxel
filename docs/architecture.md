@@ -1134,11 +1134,13 @@ los overlays y el blit, iguales en los tres tiers (`fog.wgsl`, módulo propio):
 1. **Marcha** a un target `Rg32Uint`, a media resolución por defecto. Cada rayo recorre las
    celdas de cada capa con un DDA hasta la profundidad opaca y acumula `exp(-densidad * largo)`.
    La cobertura de cada celda sale de un ruido entero (exacto a cualquier distancia, ADR 0014) y
-   del tick de `FogClock`. Guarda un color y una opacidad por píxel del bloque de 2x2.
+   del momento de `FogClock` (el tick y la fracción del siguiente), con una rampa suave: las
+   celdas aparecen y se apagan de a poco. Cerca de la cámara la capa puede ser suave, sin bordes
+   de celdas. Guarda un color y una opacidad por píxel del bloque de 2x2.
 2. **Composición** sobre el color principal (`dst * T + C`). Descarta los píxeles sin niebla.
 
 Cada pipeline liga a lo sumo un uniform block y una textura, sin sampler (ADR 0011). El uniform
-`Fog` (944 bytes) se escribe cada frame; no se sube nada más. El estilo (capas, cubos, colores,
+`Fog` (1008 bytes) se escribe cada frame; no se sube nada más. El estilo (capas, cubos, colores,
 viento) es del juego; los presets del ejemplo están en `boxel_demo::fog`. La niebla detrás del
 agua o del vidrio se pinta encima de esa superficie (límite conocido).
 
