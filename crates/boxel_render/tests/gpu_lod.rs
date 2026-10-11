@@ -737,7 +737,8 @@ fn every_tier_draws_the_lod_scene_alike() {
             if stats.lod_draws == 0 || stats.lod_refused != 0 || refused != Some(Vec::new()) {
                 return Err(format!("LOD stats {stats:?}, refused {refused:?}"));
             }
-            if stats.lod_draws > stats.lod_drawn || stats.lod_quads == 0 {
+            // At most one draw per face bucket of a drawn node (instanced), or per segment.
+            if stats.lod_draws > 6 * stats.lod_drawn || stats.lod_quads == 0 {
                 return Err(format!("LOD stats {stats:?}"));
             }
             // Every node went up once: the arena holds exactly the quads uploaded.
@@ -776,14 +777,15 @@ fn every_tier_draws_the_lod_scene_alike() {
     report.finish();
 }
 
-/// `mesh` without the quads of the octants in `mask`.
+/// `mesh` without the quads of the octants in `mask`, and without seam marks: what is left is
+/// drawn whole, as the seams by the hidden octants are (`boxel_mesh::lod::Seam`).
 fn without_octants(mesh: &ChunkMesh, mask: u8) -> ChunkMesh {
     let mut quads = Vec::new();
     let mut counts = [0; BUCKET_COUNT];
     for (b, count) in counts.iter_mut().enumerate() {
         for &q in mesh.bucket(b) {
             if mask >> octant_of(q) & 1 == 0 {
-                quads.push(q);
+                quads.push(q.with_light_index(0));
                 *count += 1;
             }
         }

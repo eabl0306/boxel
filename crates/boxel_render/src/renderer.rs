@@ -187,9 +187,9 @@ pub struct RenderStats {
     /// LOD nodes with an octant left to draw (finer detail draws none of it), in view or not,
     /// last frame (0 while the LOD draws nothing).
     pub lod_drawn: u32,
-    /// LOD draw calls of the last frame: one per drawn node inside the frustum, or on High (the
-    /// GPU culls the nodes) one indirect draw per segment of the node table. Not counted in
-    /// [`RenderStats::draws`].
+    /// LOD draw calls of the last frame: one per run of face buckets that can face the camera of
+    /// each drawn node inside the frustum, or on High (the GPU culls the nodes) one indirect
+    /// draw per segment of the node table. Not counted in [`RenderStats::draws`].
     pub lod_draws: u32,
     /// Quads of those draws; on High, the quads of the drawn nodes before the GPU cull.
     pub lod_quads: u64,

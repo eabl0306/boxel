@@ -216,19 +216,26 @@ impl LodImmediate {
 }
 
 /// One node of the far LOD's node table on High (`lod_pull.wgsl`, `lod_cull.wgsl`, ADR 0031): the
-/// node as [`LodImmediate`] has it (plus [`lod::LIVE_BIT`]), its first quad in the LOD arena and
-/// its 6 face bucket counts, two per word (bucket `2i` in the low 16 bits of `counts[i]`). 32
-/// bytes.
+/// node as [`LodImmediate`] has it (plus [`lod::LIVE_BIT`] and the [`lod::ACROSS_SHIFT`] bits),
+/// its first quad in the LOD arena, its 6 face bucket counts, two per word (bucket `2i` in the
+/// low 16 bits of `counts[i]`), and the seam quads at the end of each bucket. 64 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct LodNodeGpu {
-    /// See [`LodImmediate::node`]; w also has [`lod::LIVE_BIT`] when the cull may draw it.
+    /// See [`LodImmediate::node`]; w also has [`lod::LIVE_BIT`] when the cull may draw it, and
+    /// bit [`lod::ACROSS_SHIFT`]` + f` when the node across face bucket `f` covers its seam.
     pub node: [i32; 4],
     /// First quad of face bucket 0 in the LOD arena (the buckets follow in order).
     pub quad_base: u32,
     /// Face bucket quads, two per word: bucket `2i` in bits 0-15 of word `i`, `2i + 1` in bits
     /// 16-31 (a face bucket has at most `boxel_mesh::MAX_QUADS_PER_FACE_BUCKET` quads).
     pub counts: [u32; 3],
+    /// Per face bucket, the quads at its end that only close a seam
+    /// (`boxel_mesh::lod::seam_counts`): those on a node face in bits 0-15, then those on a
+    /// middle plane, the last ones, in bits 16-31 ([`lod::bucket_quads`]).
+    pub seams: [u32; 6],
+    /// Padding to the WGSL struct's 64 bytes.
+    pub pad: [u32; 2],
 }
 
 impl LodNodeGpu {
@@ -248,7 +255,22 @@ impl LodNodeGpu {
             node,
             quad_base,
             counts: [pair(0), pair(1), pair(2)],
+            seams: [0; 6],
+            pad: [0; 2],
         }
+    }
+
+    /// The entry with `seams` (per face bucket, `[on a node face, on a middle plane]`, within
+    /// its count) and `across` (bit `f`: the node of the same level across face bucket `f` draws
+    /// its cells by that face, [`lod::ACROSS_SHIFT`]).
+    pub fn with_seams(mut self, seams: [[u32; 2]; 6], across: u8) -> Self {
+        debug_assert!(
+            seams.iter().flatten().all(|&n| n <= 0xFFFF),
+            "a seam run over 2^16"
+        );
+        self.seams = seams.map(|[face, middle]| (face & 0xFFFF) | (middle & 0xFFFF) << 16);
+        self.node[3] |= i32::from(across & 0x3F) << lod::ACROSS_SHIFT;
+        self
     }
 }
 
@@ -271,6 +293,35 @@ pub mod lod {
     /// Word w of a [`super::LodNodeGpu`]: the High cull may draw the node (its quads are in the
     /// arena and it lies inside the GPU window).
     pub const LIVE_BIT: u32 = 1 << 14;
+    /// Word w of a [`super::LodNodeGpu`], bit `ACROSS_SHIFT + f` (`f` a face bucket): the node
+    /// of the same level across face `f` is drawn, with its octants by that face, so the seam
+    /// quads of this node on that face lie between solid cells ([`bucket_quads`]).
+    pub const ACROSS_SHIFT: u32 = 15;
+
+    /// The quads of face bucket `face` (`count` of them, `seams` = `[on a node face, on a middle
+    /// plane]` at its end) the LOD draws for a node whose octants `hidden` are hidden:
+    /// all of them if an octant is drawn while the one across the middle plane behind face
+    /// `face` is hidden (the middle seam shows there, the others are kept to stay one run),
+    /// else neither the middle seam quads nor, with `across`, the node face ones. The instanced
+    /// draws are cut so on the CPU; `lod_cull.wgsl` mirrors it on High.
+    pub fn bucket_quads(count: u32, seams: [u32; 2], face: usize, hidden: u8, across: bool) -> u32 {
+        let (bit, low) = match face / 2 {
+            0 => (2, 0x33u8),
+            1 => (1, 0x55),
+            _ => (4, 0x0F),
+        };
+        let drawn = !hidden;
+        let exposed = if face.is_multiple_of(2) {
+            drawn & (hidden >> bit) & low
+        } else {
+            drawn & (hidden << bit) & !low
+        };
+        if exposed != 0 {
+            return count;
+        }
+        let [on_face, middle] = seams;
+        count.saturating_sub(middle + if across { on_face } else { 0 })
+    }
     /// Node slots per segment of the High draw lists: slot `s` writes into list
     /// `s / SEGMENT_SLOTS`, one draw per face bucket at most.
     pub const SEGMENT_SLOTS: u32 = 10922;
@@ -288,7 +339,7 @@ pub mod lod {
 }
 
 const _: () = assert!(lod::SEGMENT_DRAWS <= bindings::MAX_DRAWS_PER_LIST);
-const _: () = assert!(size_of::<LodNodeGpu>() == 32);
+const _: () = assert!(size_of::<LodNodeGpu>() == 64);
 
 /// Matches `wgpu::util::DrawIndexedIndirectArgs` and WGSL `DrawArgs` (20 bytes, tightly packed).
 #[repr(C)]

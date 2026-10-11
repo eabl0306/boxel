@@ -4,7 +4,8 @@
 // One invocation per node slot. A live node (its quads in the arena, inside the GPU window) with
 // an octant left to draw whose box (32 * 2^k blocks) meets the frustum writes one indexed draw per
 // face bucket that can face the camera (the box-level back-face test of cull.wgsl) into the list
-// of its segment, with its DrawRef: slots [s * LOD_SEGMENT_SLOTS, (s + 1) * LOD_SEGMENT_SLOTS) write
+// of its segment, with its DrawRef. The skirts and fluid walls at the end of a bucket are left out
+// where nothing shows them (bucket_quads): slots [s * LOD_SEGMENT_SLOTS, (s + 1) * LOD_SEGMENT_SLOTS) write
 // list s, which starts at draw s * LOD_SEGMENT_DRAWS and has its count in counts[s]. A segment
 // has at most 6 * LOD_SEGMENT_SLOTS <= 65535 draws (Vulkan's minimum maxDrawIndirectCount), so no
 // list can overflow and every draw is written. The *_count path is NOT validated by wgpu: index
@@ -16,7 +17,7 @@
 // every depth test, so it is not drawn. Underground, where the rock in front covers the screen,
 // nothing of the LOD is.
 struct DrawArgs { index_count: u32, instance_count: u32, first_index: u32, base_vertex: i32, first_instance: u32 };
-struct LodNodeGpu { node: vec4<i32>, quad_base: u32, counts: array<u32, 3> };
+struct LodNodeGpu { node: vec4<i32>, quad_base: u32, counts: array<u32, 3>, seams: array<u32, 6>, pad: array<u32, 2> };
 
 @group(0) @binding(0) var<uniform> view: View;
 @group(0) @binding(1) var<storage, read> nodes: array<LodNodeGpu>;
@@ -28,6 +29,9 @@ struct LodNodeGpu { node: vec4<i32>, quad_base: u32, counts: array<u32, 3> };
 const LOD_LEVEL_MASK: u32 = 15u;
 const LOD_HIDDEN_MASK: u32 = 0xFFu;
 const LOD_LIVE_BIT: u32 = 0x4000u;
+// Bit LOD_ACROSS_SHIFT + f of node.w: the node of this level across face f draws its cells by
+// that face (boxel_shaders::gpu::lod::ACROSS_SHIFT).
+const LOD_ACROSS_SHIFT: u32 = 15u;
 // Slots per segment, and the draws its list holds (boxel_shaders::gpu::lod, checked by a naga test).
 const LOD_SEGMENT_SLOTS: u32 = 10922u;
 const LOD_SEGMENT_DRAWS: u32 = 65532u;
@@ -55,6 +59,27 @@ fn bucket_visible(f: u32, mn: vec3<f32>, mx: vec3<f32>, cam: vec3<f32>) -> bool 
     case 4u: { return cam.z > mn.z; }
     default: { return cam.z < mx.z; }
   }
+}
+
+// The quads of face bucket f (count c, its seam quads at the end: on a node face in the low 16
+// bits of `seams`, then on a middle plane, the last ones, in the high 16) for a node whose
+// octants `hidden` are hidden. The seam quads close the step to other detail across their plane
+// and lie between solid cells everywhere else: the middle ones are needed only where an octant
+// is drawn while the one across the middle plane behind face f is hidden (then the whole bucket
+// is drawn, one run), the node face ones only where the node across is not of this level or does
+// not draw by that face (`across` false). The mirror of boxel_shaders::gpu::lod::bucket_quads.
+fn bucket_quads(c: u32, seams: u32, f: u32, hidden: u32, across: bool) -> u32 {
+  // The octant bit of face f's axis (faces 0-1 y, 2-3 x, 4-5 z) and the octants on its low side.
+  let bit = select(select(4u, 1u, f < 4u), 2u, f < 2u);
+  let low = select(select(0x0Fu, 0x55u, f < 4u), 0x33u, f < 2u);
+  let drawn = ~hidden & 0xFFu;
+  var exposed = drawn & ((hidden << bit) & ~low);
+  if ((f & 1u) == 0u) {
+    exposed = drawn & (hidden >> bit) & low;
+  }
+  if (exposed != 0u) { return c; }
+  let skip = (seams >> 16u) + select(0u, seams & 0xFFFFu, across);
+  return c - min(skip, c);
 }
 
 // True if the box [mn, mx] (relative to the render origin) lies behind full detail over its
@@ -113,11 +138,14 @@ fn cull_lod(@builtin(global_invocation_id) gid: vec3<u32>) {
   let seg = slot / LOD_SEGMENT_SLOTS;
   let first = seg * LOD_SEGMENT_DRAWS;
   var start = n.quad_base;
+  let hidden = w & LOD_HIDDEN_MASK;
   for (var f = 0u; f < 6u; f++) {
     let c = (n.counts[f >> 1u] >> ((f & 1u) * 16u)) & 0xFFFFu;
-    if (c > 0u && bucket_visible(f, mn, mx, view.camera_rel.xyz)) {
+    let across = ((w >> (LOD_ACROSS_SHIFT + f)) & 1u) != 0u;
+    let q = bucket_quads(c, n.seams[f], f, hidden, across);
+    if (q > 0u && bucket_visible(f, mn, mx, view.camera_rel.xyz)) {
       let s = first + atomicAdd(&counts[seg], 1u);
-      draw_args[s] = DrawArgs(min(c, MAX_QUADS_PER_BUCKET) * 6u, 1u, 0u, 0, s);
+      draw_args[s] = DrawArgs(min(q, MAX_QUADS_PER_BUCKET) * 6u, 1u, 0u, 0, s);
       draw_refs[s] = vec2(slot, start);
     }
     start += c;

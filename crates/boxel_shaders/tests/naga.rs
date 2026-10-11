@@ -844,6 +844,8 @@ fn lod_gpu_path_matches_its_mirrors() {
         offset_of!(LodNodeGpu, node) as u32,
         offset_of!(LodNodeGpu, quad_base) as u32,
         offset_of!(LodNodeGpu, counts) as u32,
+        offset_of!(LodNodeGpu, seams) as u32,
+        offset_of!(LodNodeGpu, pad) as u32,
     ];
     for module in [&pull, &cull] {
         assert_eq!(
@@ -855,17 +857,18 @@ fn lod_gpu_path_matches_its_mirrors() {
         ("LOD_LEVEL_MASK", b::LEVEL_MASK),
         ("LOD_HIDDEN_MASK", 0xFF),
         ("LOD_LIVE_BIT", b::LIVE_BIT),
+        ("LOD_ACROSS_SHIFT", b::ACROSS_SHIFT),
         ("LOD_SEGMENT_SLOTS", b::SEGMENT_SLOTS),
         ("LOD_SEGMENT_DRAWS", b::SEGMENT_DRAWS),
         ("MAX_QUADS_PER_BUCKET", boxel_mesh::MAX_QUADS_PER_BUCKET),
     ] {
         assert_eq!(const_u32(&cull, name), v, "{name}");
     }
-    // The live bit is none of the bits the vertex shader reads.
-    assert_eq!(
-        b::LIVE_BIT & (0xFF | b::MIP_MASK << b::MIP_SHIFT | b::TINT_BIT),
-        0
-    );
+    // The live and across bits are none of the bits the vertex shader reads, nor each other.
+    let read = 0xFF | b::MIP_MASK << b::MIP_SHIFT | b::TINT_BIT;
+    let across = 0x3F << b::ACROSS_SHIFT;
+    assert_eq!((b::LIVE_BIT | across) & read, 0);
+    assert_eq!(b::LIVE_BIT & across, 0);
     let ep = cull
         .entry_points
         .iter()
@@ -917,4 +920,44 @@ fn lod_gpu_path_matches_its_mirrors() {
     assert_eq!(unpacked, [1, 2, 3, 4, 5, 16384]);
     let dead = LodNodeGpu::new(imm, 0, [0; 6], false);
     assert_eq!(dead.node[3] as u32 & b::LIVE_BIT, 0);
+    let seams = [[0, 0], [1, 2], [3, 0], [0, 4], [5, 6], [16384, 1]];
+    let seamed = node.with_seams(seams, 0b10_0101);
+    assert_eq!(
+        seamed.node[3] as u32,
+        node.node[3] as u32 | 0b10_0101 << b::ACROSS_SHIFT
+    );
+    for (f, [face, middle]) in seams.into_iter().enumerate() {
+        assert_eq!(seamed.seams[f], face | middle << 16);
+    }
+}
+
+/// The High cull's seam rule (`bucket_quads`, mirrored in Rust): the middle seam quads of a face
+/// bucket are drawn exactly when an octant is drawn while its partner across the middle plane
+/// behind that face is hidden, and the node face ones also when the node across does not cover
+/// them.
+#[test]
+fn lod_seams_are_drawn_where_a_seam_can_show() {
+    use boxel_shaders::gpu::lod::bucket_quads;
+    // Face bucket order +Y, -Y, +X, -X, +Z, -Z: the axis bit of the octant index and the sign.
+    let axes = [(2u8, 1), (2, -1), (1, 1), (1, -1), (4, 1), (4, -1)];
+    for (f, (bit, sign)) in axes.into_iter().enumerate() {
+        for hidden in 0..=255u8 {
+            // An octant on the side the face looks away from (its cells are by the middle plane,
+            // facing it), drawn, with the one across hidden.
+            let exposed = (0..8u8).any(|o| {
+                let behind = if sign > 0 { o & bit == 0 } else { o & bit != 0 };
+                behind && hidden & 1 << o == 0 && hidden & 1 << (o ^ bit) != 0
+            });
+            for across in [false, true] {
+                let n = bucket_quads(100, [10, 20], f, hidden, across);
+                let want = match (exposed, across) {
+                    (true, _) => 100,
+                    (false, false) => 80,
+                    (false, true) => 70,
+                };
+                assert_eq!(n, want, "face {f}, hidden {hidden:08b}, across {across}");
+            }
+        }
+    }
+    assert_eq!(bucket_quads(5, [10, 20], 0, 0, true), 0, "never below zero");
 }

@@ -6,7 +6,7 @@
 // vertex attribute at location 0, like vs_pull: the draw sets first_instance = its DrawRef
 // index, instance_count = 1, base_vertex = 0. The geometry is group 3 (group 2 stays the main
 // geometry, which the translucent buckets drawn after the LOD still use).
-struct LodNodeGpu { node: vec4<i32>, quad_base: u32, counts: array<u32, 3> };
+struct LodNodeGpu { node: vec4<i32>, quad_base: u32, counts: array<u32, 3>, seams: array<u32, 6>, pad: array<u32, 2> };
 
 @group(3) @binding(0) var<storage, read> lod_quads: array<vec2<u32>>;
 @group(3) @binding(1) var<storage, read> lod_nodes: array<LodNodeGpu>;
