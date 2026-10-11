@@ -5,7 +5,7 @@ use boxel_voxel::{
     BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SHIFT, CHUNK_SIZE, CHUNK_VOLUME, ChunkData,
     ChunkKey,
 };
-use boxel_worldgen::{Frequency, WorldGenerator, block};
+use boxel_worldgen::{Frequency, LodSource, WorldGenerator, block};
 use std::ops::RangeInclusive;
 
 /// Parameters of [`TerrainGenerator`].
@@ -127,6 +127,10 @@ impl WorldGenerator for TerrainGenerator {
     }
     fn name(&self) -> &str {
         "terrain"
+    }
+    /// Its own coarse terrain (ADR 0031).
+    fn lod(&self) -> Option<&dyn LodSource> {
+        Some(self)
     }
 }
 

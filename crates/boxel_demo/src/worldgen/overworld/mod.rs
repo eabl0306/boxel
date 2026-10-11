@@ -41,7 +41,7 @@ use boxel_voxel::{
     BlockPos, BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SHIFT, CHUNK_SIZE, CHUNK_VOLUME,
     ChunkData, ChunkKey, LocalPos,
 };
-use boxel_worldgen::{WorldGenerator, block};
+use boxel_worldgen::{LodSource, WorldGenerator, block};
 use std::ops::RangeInclusive;
 
 /// Name in logs and panics.
@@ -117,7 +117,7 @@ impl OverworldGenerator {
     }
 
     /// The surface rules with the sea's beaches: sand up to `level + beach`.
-    fn rules(&self) -> SurfaceRules {
+    pub(crate) fn rules(&self) -> SurfaceRules {
         let mut rules = self.settings.surface.clone();
         if let Some(sea) = self.settings.sea {
             rules.sand_level = rules.sand_level.max(sea.level.saturating_add(sea.beach));
@@ -439,7 +439,7 @@ impl OverworldGenerator {
     }
 
     /// Ground heights trees may grow on.
-    fn tree_grounds(&self) -> RangeInclusive<i64> {
+    pub(crate) fn tree_grounds(&self) -> RangeInclusive<i64> {
         let s = self.rules();
         s.sand_level + 1..=s.snow_level.min(self.settings.heightmap.max_height())
     }
@@ -600,6 +600,11 @@ impl WorldGenerator for OverworldGenerator {
 
     fn name(&self) -> &str {
         "overworld"
+    }
+
+    /// Its own coarse terrain (ADR 0031), without the caves.
+    fn lod(&self) -> Option<&dyn LodSource> {
+        Some(self)
     }
 }
 

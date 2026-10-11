@@ -2,7 +2,7 @@
 
 use super::{PlantBlocks, Plants, Sea, TerrainGenerator, TerrainSettings, Trees};
 use boxel_voxel::{BlockPos, BlockRegistry, BlockState, CHUNK_SIZE, ChunkData, ChunkKey, LocalPos};
-use boxel_worldgen::WorldGenerator;
+use boxel_worldgen::{LodSource, WorldGenerator};
 use std::ops::RangeInclusive;
 
 /// [`TerrainGenerator`] plus [`Trees`] on its grass. Each chunk places the parts of every tree
@@ -59,7 +59,7 @@ impl ForestGenerator {
 
     /// Ground heights trees may grow on: grass, `sand_level + 1 ..= snow_level`, above the
     /// beaches of the sea.
-    fn grounds(&self) -> RangeInclusive<i64> {
+    pub(crate) fn grounds(&self) -> RangeInclusive<i64> {
         let s = &self.terrain.settings;
         let mut sand = i64::from(s.sand_level);
         if let Some(sea) = self.sea {
@@ -133,5 +133,10 @@ impl WorldGenerator for ForestGenerator {
 
     fn name(&self) -> &str {
         "forest"
+    }
+
+    /// Its own coarse terrain (ADR 0031), with the trees and the sea.
+    fn lod(&self) -> Option<&dyn LodSource> {
+        Some(self)
     }
 }

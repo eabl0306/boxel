@@ -17,6 +17,8 @@ boxel_pack.workspace = true
 boxel_fog.workspace = true
 
 [dev-dependencies]
+# The far LOD tests and bench mesh the demo's coarse nodes (ADR 0031).
+boxel_mesh.workspace = true
 glam.workspace = true
 proptest.workspace = true
 criterion.workspace = true
@@ -31,6 +33,10 @@ harness = false
 
 [[bench]]
 name = "caves"
+harness = false
+
+[[bench]]
+name = "lod"
 harness = false
 
 [lints]

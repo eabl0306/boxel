@@ -8,9 +8,12 @@
 //! stage reads only its own chunk and the seed: features that cross chunk borders (trees, cave
 //! corners) are recomputed by each chunk they touch. They implement the engine's
 //! [`WorldGenerator`](boxel_worldgen::WorldGenerator) on the engine's noise
-//! ([`boxel_worldgen::noise`]).
+//! ([`boxel_worldgen::noise`]), and its [`LodSource`](boxel_worldgen::LodSource) for the far
+//! level of detail (ADR 0031): each answers for coarse cells from its heights, sea and trees,
+//! reading its fields on every call.
 
 mod forest;
+mod lod;
 pub mod overworld;
 mod plants;
 mod sea;
