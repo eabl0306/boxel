@@ -507,8 +507,22 @@ impl Tree {
     }
 
     /// True if node `key` is touched (module docs).
+    #[cfg(test)]
     pub(crate) fn is_touched(&self, key: ChunkKey, cov: &ChunkCoverage) -> bool {
         self.touched_bits(key, cov) != 0
+    }
+
+    /// True if sending node `key` closes a hole in full detail: a lod-1 node with published
+    /// chunks that full detail does not cover whole (its parent hides that octant until it is
+    /// sent), or a coarser node with such a child (touched and not covered: the chain rule sends
+    /// the child only after it).
+    pub(crate) fn fills_hole(&self, key: ChunkKey, cov: &ChunkCoverage) -> bool {
+        if key.lod == 1 {
+            let o = cov.get(key.pos);
+            o.published != 0 && o.covered != 0xFF
+        } else {
+            self.touched_bits(key, cov) & !self.children_bits(key, cov) != 0
+        }
     }
 
     /// True if node `key` is covered (module docs).
@@ -611,9 +625,10 @@ impl Tree {
     }
 
     /// A lod-1 position's full-detail coverage changed: its mask, its parents' covered and
-    /// touched bits, its column's priority.
+    /// touched bits, the priority of its column and of its ancestors' (whether they close a
+    /// hole: [`Tree::fills_hole`]).
     pub(crate) fn chunks_changed(&mut self, lod1: ChunkPos, cov: &ChunkCoverage) {
-        let key = ChunkKey {
+        let mut key = ChunkKey {
             dim: self.dim,
             lod: 1,
             pos: lod1,
@@ -622,6 +637,10 @@ impl Tree {
         self.touch(key, cov);
         self.touch_published(lod1, cov);
         self.reprioritize.push(ColumnKey::of(key));
+        while key.lod < self.levels {
+            key = parent(key);
+            self.reprioritize.push(ColumnKey::of(key));
+        }
     }
 
     /// A new tree reads the whole coverage once (later changes come through
@@ -1047,8 +1066,9 @@ impl Tree {
 
     /// The renderer lost every node (a resync): nothing is available until it is sent again.
     /// The ops not taken yet are dropped (they were for the old nodes), refused nodes stop
-    /// waiting, and every built node is sent again: first the touched lod-1 nodes with their
-    /// ancestors (their holes inside full detail), then the rest, each coarse to fine.
+    /// waiting, and every built node is sent again: first the lod-1 nodes that close holes in
+    /// full detail ([`Tree::fills_hole`]) with their ancestors, then the rest, each coarse to
+    /// fine.
     pub(crate) fn resync(&mut self, cov: &ChunkCoverage) {
         self.ops.clear();
         let mut was_sent = Vec::new();
@@ -1088,7 +1108,7 @@ impl Tree {
         }
         let mut urgent: HashSet<ChunkKey> = HashSet::default();
         for &key in &ready {
-            if key.lod == 1 && self.is_touched(key, cov) {
+            if key.lod == 1 && self.fills_hole(key, cov) {
                 let mut k = key;
                 while urgent.insert(k) && k.lod < self.levels {
                     k = parent(k);

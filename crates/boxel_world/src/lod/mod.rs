@@ -779,12 +779,14 @@ impl LodWorld {
     /// The priority of column `c`'s next job, by class and then by the screen size of its
     /// nearest node, `e_k / max(d, e_k / 4)`. Classes:
     /// - 0, coverage-critical and fill-first: the top level (the horizon appears first, and
-    ///   after a jump), and nodes that contain published chunks (a level-2 and up parent hides
-    ///   their octants: holes until they are sent; their ancestors come with them, as the
-    ///   chain rule needs);
+    ///   after a jump), and nodes that close a hole in full detail ([`Tree::fills_hole`]: a
+    ///   lod-1 node with published chunks next to uncovered ones, whose parent hides that
+    ///   octant until it is sent, and its ancestors, as the chain rule needs);
     /// - 1 in view, 2 out of it;
-    /// - 3, last: lod-1 nodes whose chunks full detail covers (placeholders for when chunks
-    ///   unload or stream in).
+    /// - 3, last: lod-1 nodes under full detail that close no hole (placeholders for when
+    ///   chunks unload or stream in).
+    ///
+    /// [`Tree::fills_hole`]: tree::Tree::fills_hole
     fn priority(
         &self,
         c: ColumnKey,
@@ -805,13 +807,13 @@ impl LodWorld {
         let class = if c.level >= self.tree.levels
             || work
                 .layers()
-                .any(|y| self.tree.is_touched(c.node(dim, y), cov))
+                .any(|y| self.tree.fills_hole(c.node(dim, y), cov))
         {
             0
         } else if c.level == 1
             && work
                 .layers()
-                .all(|y| cov.get(c.node(dim, y).pos).covered == 0xFF)
+                .any(|y| cov.get(c.node(dim, y).pos).published != 0)
         {
             3
         } else if self.in_view(&eye, key) {

@@ -1124,12 +1124,14 @@ fn a_resync_sends_every_node_again_the_coarsest_first() {
     let mut renderer = Model::default();
     fill(&mut app, &mut renderer, 3000);
     assert_eq!(renderer.nodes.len(), before);
-    // The touched lod-1 nodes with their ancestors first, then the rest; each coarse to fine.
+    // The lod-1 nodes that fill holes in full detail (published chunks next to uncovered ones)
+    // with their ancestors first, then the rest; each coarse to fine.
     let lod = app.world().resource::<LodWorld>();
     let cov = app.world().resource::<LodCoverage>().coverage();
     let mut urgent = BTreeSet::new();
     for &k in &renderer.upserts {
-        if k.lod == 1 && lod.tree.is_touched(k, cov) {
+        let o = cov.get(k.pos);
+        if k.lod == 1 && o.published != 0 && o.covered != 0xFF {
             let mut a = k;
             while urgent.insert(a) && a.lod < lod.tree.levels {
                 a = tree::parent(a);
@@ -1552,12 +1554,21 @@ fn the_queue_orders_by_class_then_screen_size() {
             col.nearest(&work, 60i64.div_euclid(node_edge(entry.column.level))),
         );
         let node = |y: i64| entry.column.node(DimensionId(0), y);
-        let expect = if entry.column.level == 3
-            || work.layers().any(|y| state.tree.is_touched(node(y), cov))
-        {
+        // A hole: a lod-1 node with published chunks that full detail does not cover whole, or
+        // a coarser node with such a child (the chain rule needs it first).
+        let hole = |y: i64| {
+            let key = node(y);
+            if key.lod == 1 {
+                let o = cov.get(key.pos);
+                o.published != 0 && o.covered != 0xFF
+            } else {
+                state.tree.touched_bits(key, cov) & !state.tree.children_bits(key, cov) != 0
+            }
+        };
+        let expect = if entry.column.level == 3 || work.layers().any(hole) {
             0
         } else if entry.column.level == 1
-            && work.layers().all(|y| cov.get(node(y).pos).covered == 0xFF)
+            && work.layers().any(|y| cov.get(node(y).pos).published != 0)
         {
             3
         } else if state.in_view(&eye, key) {
@@ -2266,6 +2277,70 @@ fn a_touched_octant_waits_hidden_for_its_lod1_node_which_jumps_ahead() {
     assert!(model.nodes.contains_key(&key));
     assert!(model.nodes[&up].0 & tree::octant_bit(key) != 0);
     assert_bits_from_scratch(&app);
+}
+
+/// The class of the queued entry of column `c`.
+fn queued_class(app: &App, c: ColumnKey) -> u8 {
+    let state = app.world().resource::<LodWorld>();
+    let ticket = state.tree.columns[&c].ticket.expect("queued");
+    state
+        .jobs
+        .queue
+        .iter()
+        .find(|e| e.column == c && e.ticket == ticket)
+        .expect("its entry")
+        .class
+}
+
+/// A lod-1 column under full detail is a placeholder: queued last (class 3), however much full
+/// detail it holds. One that fills a hole (published chunks next to uncovered ones, so its parent
+/// hides that octant until it is sent) jumps to class 0.
+#[test]
+fn placeholders_under_full_detail_go_last_and_holes_first() {
+    let lod = Arc::new(Hold::default());
+    let mut app = focus_app(Steps::new(20), small(), lod.clone(), I64Vec3::new(0, 60, 0));
+    let mut model = Model::default();
+    // Until the top level is sent and level 1 is under way.
+    for _ in 0..400 {
+        lod.run_all();
+        frame(&mut app, &mut model);
+        let stats = app.world().resource::<LodStats>();
+        if stats.levels[1].pending == 0 && stats.sends_waiting == 0 && stats.levels[0].nodes > 4 {
+            break;
+        }
+    }
+    // A queued lod-1 column that wants layer 0, its band not known yet.
+    let state = app.world().resource::<LodWorld>();
+    let c = *state
+        .tree
+        .columns
+        .iter()
+        .filter(|(c, col)| {
+            c.level == 1
+                && col.ticket.is_some()
+                && col.band.is_none()
+                && contains(col.plan.wanted, 0)
+        })
+        .map(|(c, _)| c)
+        .min()
+        .expect("a queued lod-1 column");
+    let key = c.node(DimensionId(0), 0);
+    let set = |app: &mut App, octants: u8| {
+        let mut cov = app.world_mut().resource_mut::<LodCoverage>();
+        for o in 0..8 {
+            cov.set(
+                chunk_of_octant(key.pos, o),
+                octants & (1 << o) != 0,
+                octants & (1 << o) != 0,
+            );
+        }
+    };
+    set(&mut app, 0xFF);
+    frame(&mut app, &mut model);
+    assert_eq!(queued_class(&app, c), 3, "full detail covers it");
+    set(&mut app, 0x0F);
+    frame(&mut app, &mut model);
+    assert_eq!(queued_class(&app, c), 0, "a hole next to full detail");
 }
 
 /// Frames running every held job until the LOD is filled.
