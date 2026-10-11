@@ -11,6 +11,12 @@
 //!
 //! The queue is a max-heap by priority class (0 first) and then by screen size; entries carry a
 //! ticket so a column queued again or dropped leaves its old entries to be skipped when popped.
+//!
+//! The main thread starts jobs (in `Update` and in idle steps) and also hands some off: the best
+//! next columns wait, already taken from the queue, in a short line of their own, and a worker
+//! that finishes a job starts the first of them while fewer than the in-flight cap run. So the
+//! workers stay busy between frames, at any frame rate, and a handed-off job is spawned at the
+//! back of the pool's queue, behind whatever the world queued meanwhile.
 use crate::jobs::JobExecutor;
 use boxel_mesh::lod::{LodMaterials, fits, mesh_node, octant_of};
 use boxel_mesh::{ChunkMesh, Mesher, PaddedChunk};
@@ -20,10 +26,10 @@ use boxel_worldgen::lod::{LodColumn, LodNode, LodRequest, LodScratch};
 use crossbeam_channel::{Receiver, Sender};
 use std::cell::RefCell;
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::plan::ColumnKey;
@@ -298,15 +304,107 @@ impl JobTimes {
     }
 }
 
-/// The LOD's jobs: executor, result channel, queue and counters.
-pub(crate) struct LodJobs {
+/// A job taken from the queue, with the token of its single message.
+struct Job {
+    input: JobInput,
+    token: ResultToken,
+    /// Its priority class when it was taken.
+    class: u8,
+}
+
+/// What the main thread and the workers share: the handed-off jobs and the cap.
+struct Shared {
     executor: Arc<dyn JobExecutor>,
+    /// Jobs taken from the queue for the workers, best first.
+    handoff: Mutex<VecDeque<Job>>,
+    /// Jobs spawned on the pool whose body has not ended.
+    running: AtomicUsize,
+    /// The in-flight cap the main thread set last.
+    cap: AtomicUsize,
+    /// False once the LOD is gone: no job starts another.
+    alive: AtomicBool,
+}
+
+impl Shared {
+    /// Counts one more running job if fewer than the cap run.
+    fn try_acquire(&self) -> bool {
+        let cap = self.cap.load(Ordering::Acquire);
+        self.running
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |r| {
+                (r < cap).then_some(r + 1)
+            })
+            .is_ok()
+    }
+
+    fn handoff(&self) -> std::sync::MutexGuard<'_, VecDeque<Job>> {
+        self.handoff.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Spawns `job` (already counted running). Its body runs under the result contract (module
+    /// docs), then starts the first handed-off job while under the cap.
+    fn launch(this: &Arc<Self>, job: Job) {
+        let running = Running(Arc::clone(this));
+        this.executor.spawn(Box::new(move || {
+            run_job(job);
+            let shared = Arc::clone(&running.0);
+            drop(running);
+            Shared::chain(&shared);
+        }));
+    }
+
+    /// A job ended: starts the next handed-off one, if any and under the cap.
+    fn chain(this: &Arc<Self>) {
+        if !this.alive.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(job) = this.handoff().pop_front() else {
+            return;
+        };
+        if this.try_acquire() {
+            Shared::launch(this, job);
+        } else {
+            this.handoff().push_front(job);
+        }
+    }
+}
+
+/// One running job: counted out when its body ends, or when the executor drops it unrun.
+struct Running(Arc<Shared>);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.running.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// A job body: its single message, `Cancelled` at once if its flag is set.
+fn run_job(job: Job) {
+    let Job { input, token, .. } = job;
+    let id = input.id;
+    if input.cancel.load(Ordering::Relaxed) {
+        token.send(LodMessage::Cancelled { id }, Duration::ZERO);
+        return;
+    }
+    let start = Instant::now();
+    let message = match catch_unwind(AssertUnwindSafe(|| run_column(&input))) {
+        Ok(message) => message,
+        Err(payload) => LodMessage::Failed {
+            id,
+            panic: panic_text(payload.as_ref()),
+        },
+    };
+    token.send(message, start.elapsed());
+}
+
+/// The LOD's jobs: executor, result channel, queue, handed-off jobs and counters.
+pub(crate) struct LodJobs {
+    shared: Arc<Shared>,
     tx: Sender<LodReport>,
     rx: Receiver<LodReport>,
     next_id: u64,
     next_ticket: u32,
     pub(crate) queue: BinaryHeap<Queued>,
-    /// Jobs spawned whose message has not been received.
+    /// Jobs started or handed off whose message has not been received.
     pub(crate) in_flight: usize,
     pub(crate) times: JobTimes,
     /// Jobs that sent `Failed` (a panic or a dropped job), since start.
@@ -319,7 +417,13 @@ impl LodJobs {
     pub(crate) fn new(executor: Arc<dyn JobExecutor>) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
         Self {
-            executor,
+            shared: Arc::new(Shared {
+                executor,
+                handoff: Mutex::new(VecDeque::new()),
+                running: AtomicUsize::new(0),
+                cap: AtomicUsize::new(0),
+                alive: AtomicBool::new(true),
+            }),
             tx,
             rx,
             next_id: 1,
@@ -352,29 +456,102 @@ impl LodJobs {
         ticket
     }
 
-    /// Spawns `input` under the result contract (module docs).
-    pub(crate) fn spawn(&mut self, input: JobInput) {
+    /// Sets the in-flight cap: jobs running on the pool at most (the workers read it too).
+    pub(crate) fn set_cap(&self, cap: usize) {
+        self.shared.cap.store(cap, Ordering::Release);
+    }
+
+    /// Jobs running on the pool (spawned, body not ended).
+    pub(crate) fn running(&self) -> usize {
+        self.shared.running.load(Ordering::Acquire)
+    }
+
+    /// Jobs handed off, waiting for a worker or the main thread to start them.
+    pub(crate) fn handed_off(&self) -> usize {
+        self.shared.handoff().len()
+    }
+
+    /// True if a job may start now: fewer than the cap run.
+    pub(crate) fn has_room(&self) -> bool {
+        self.running() < self.shared.cap.load(Ordering::Acquire)
+    }
+
+    fn job(&mut self, input: JobInput, class: u8) -> Job {
+        self.in_flight += 1;
         let token = ResultToken {
             id: input.id,
             tx: Some(self.tx.clone()),
         };
-        self.in_flight += 1;
-        self.executor.spawn(Box::new(move || {
-            let id = input.id;
-            if input.cancel.load(Ordering::Relaxed) {
-                token.send(LodMessage::Cancelled { id }, Duration::ZERO);
-                return;
-            }
-            let start = Instant::now();
-            let message = match catch_unwind(AssertUnwindSafe(|| run_column(&input))) {
-                Ok(message) => message,
-                Err(payload) => LodMessage::Failed {
-                    id,
-                    panic: panic_text(payload.as_ref()),
-                },
-            };
-            token.send(message, start.elapsed());
-        }));
+        Job {
+            input,
+            token,
+            class,
+        }
+    }
+
+    /// Spawns `input` under the result contract (module docs) if under the cap; else hands it
+    /// off first in line. Either way it sends exactly one message.
+    pub(crate) fn spawn(&mut self, input: JobInput, class: u8) {
+        let job = self.job(input, class);
+        if self.shared.try_acquire() {
+            Shared::launch(&self.shared, job);
+        } else {
+            self.shared.handoff().push_front(job);
+        }
+    }
+
+    /// Hands `input` off to the workers, last in line.
+    pub(crate) fn hand_off(&mut self, input: JobInput, class: u8) {
+        let job = self.job(input, class);
+        self.shared.handoff().push_back(job);
+    }
+
+    /// Starts the first handed-off job if under the cap. False if none was started.
+    pub(crate) fn start_handed_off(&mut self) -> bool {
+        if !self.shared.try_acquire() {
+            return false;
+        }
+        let Some(job) = self.shared.handoff().pop_front() else {
+            self.shared.running.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        };
+        Shared::launch(&self.shared, job);
+        true
+    }
+
+    /// Takes back the handed-off jobs whose class `keep` refuses: they send `Cancelled` at once
+    /// (their columns are queued again when it is received).
+    pub(crate) fn take_back(&mut self, keep: impl Fn(u8) -> bool) {
+        let dropped: VecDeque<Job> = {
+            let mut line = self.shared.handoff();
+            let (kept, dropped) = line.drain(..).partition(|j: &Job| keep(j.class));
+            *line = kept;
+            dropped
+        };
+        for job in dropped {
+            let id = job.input.id;
+            job.token.send(LodMessage::Cancelled { id }, Duration::ZERO);
+        }
+    }
+
+    /// Testing: the handed-off jobs' columns and classes, first in line first.
+    #[cfg(test)]
+    pub(crate) fn handed_off_columns(&self) -> Vec<(ColumnKey, u8)> {
+        self.shared
+            .handoff()
+            .iter()
+            .map(|j| {
+                let [x, z] = j.input.request.column;
+                let level = j.input.request.level;
+                (ColumnKey { level, x, z }, j.class)
+            })
+            .collect()
+    }
+
+    /// Testing: finished jobs' reports waiting in the channel.
+    #[cfg(test)]
+    pub(crate) fn results_waiting(&self) -> usize {
+        self.rx.len()
     }
 
     /// True if a finished job's report is waiting.
@@ -393,5 +570,13 @@ impl LodJobs {
             LodMessage::NoSource { .. } => {}
         }
         Some(report)
+    }
+}
+
+impl Drop for LodJobs {
+    /// No job starts another; the handed-off ones are dropped (their tokens report them).
+    fn drop(&mut self) {
+        self.shared.alive.store(false, Ordering::Release);
+        self.shared.handoff().clear();
     }
 }

@@ -996,6 +996,96 @@ fn in_flight_caps_are_two_while_the_world_is_busy_and_five_once_settled() {
     assert_eq!(lod.held(), 5);
 }
 
+/// A worker that ends a job starts the next handed-off one while under the cap, with no frame
+/// of the main thread in between: the slots stay full between frames.
+#[test]
+fn workers_start_handed_off_jobs_between_frames() {
+    let lod = Arc::new(Hold::default());
+    let steps = Steps::new(20);
+    let calls = Arc::clone(&steps.calls);
+    let mut app = focus_app(steps, small(), lod.clone(), I64Vec3::new(0, 60, 0));
+    app.update();
+    app.update();
+    let jobs = &app.world().resource::<LodWorld>().jobs;
+    let line = jobs.handed_off();
+    assert_eq!((lod.held(), jobs.running()), (5, 5));
+    assert_eq!(line, 4 * 5, "four handed off per slot");
+    // The held jobs run (the workers), with no update: each starts the first in line.
+    assert_eq!(lod.run_all(), 5);
+    let jobs = &app.world().resource::<LodWorld>().jobs;
+    assert_eq!((lod.held(), jobs.running()), (5, 5));
+    assert_eq!(jobs.handed_off(), line - 5);
+    assert_eq!(calls.lock().expect("lock").len(), 5);
+    // Every job still sends one message: nothing is left once all ran.
+    let mut model = Model::default();
+    fill_held(&mut app, &lod, &mut model);
+    let state = app.world().resource::<LodWorld>();
+    assert_eq!((state.jobs.in_flight, state.jobs.running()), (0, 0));
+    assert!(state.jobs_of.is_empty());
+}
+
+/// While the world is busy only class-0 columns run (the top level first, then the nodes that
+/// close holes): the rest waits for the world to settle, and handed-off jobs of a lower class
+/// are taken back.
+#[test]
+fn a_busy_world_runs_only_class_0_columns() {
+    let lod = Arc::new(Hold::default());
+    let world = Arc::new(Hold::default());
+    let steps = Steps::new(20);
+    let calls = Arc::clone(&steps.calls);
+    let mut app = app_with(steps, small(), lod.clone(), world.clone());
+    spawn(&mut app, DVec3::new(10.0, 60.0, 10.0));
+    for _ in 0..200 {
+        lod.run_all();
+        app.update();
+    }
+    let top = small().levels;
+    let calls = calls.lock().expect("lock").clone();
+    assert!(!calls.is_empty());
+    assert!(calls.iter().all(|&(level, _)| level == top), "{calls:?}");
+    let state = app.world().resource::<LodWorld>();
+    assert!(
+        state
+            .jobs
+            .handed_off_columns()
+            .iter()
+            .all(|&(_, class)| class == 0)
+    );
+    assert!(
+        app.world().resource::<LodStats>().fill < 1.0,
+        "level 1 waits"
+    );
+    // Handed-off jobs of other classes are taken back when the world turns busy.
+    let mut state = app.world_mut().resource_mut::<LodWorld>();
+    let c = ColumnKey {
+        level: 1,
+        x: 0,
+        z: 0,
+    };
+    let job = JobInput {
+        id: state.jobs.next_id(),
+        generator: Arc::new(Steps::new(20)),
+        registry: Arc::new(boxel_voxel::testing::registry()),
+        materials: Arc::new(LodMaterials::from_registry(
+            &boxel_voxel::testing::registry(),
+        )),
+        request: LodRequest {
+            dim: DimensionId(0),
+            level: c.level,
+            column: [c.x, c.z],
+            layers: 0..=0,
+        },
+        only: None,
+        cancel: Arc::new(AtomicBool::new(false)),
+    };
+    state.jobs.hand_off(job, 2);
+    assert!(state.jobs.handed_off_columns().contains(&(c, 2)));
+    lod.run_all();
+    app.update();
+    let state = app.world().resource::<LodWorld>();
+    assert!(!state.jobs.handed_off_columns().contains(&(c, 2)));
+}
+
 #[test]
 fn a_panicking_source_fails_its_column_once() {
     let steps = Steps {
@@ -1033,7 +1123,12 @@ fn a_dropped_job_sends_failed() {
         app.update();
     }
     let lod = app.world().resource::<LodWorld>();
-    assert_eq!(lod.jobs.in_flight, 0, "every dropped job reported");
+    assert_eq!(
+        lod.jobs.in_flight,
+        lod.jobs.handed_off() + lod.jobs.results_waiting(),
+        "every dropped job reported (the handed-off ones never ran)"
+    );
+    assert_eq!(lod.jobs.running(), 0, "a dropped job is no longer running");
     assert!(lod.jobs.failed >= 2);
 }
 
@@ -2259,15 +2354,7 @@ fn a_touched_octant_waits_hidden_for_its_lod1_node_which_jumps_ahead() {
     frame(&mut app, &mut model);
     // A short hole rather than drawing over full detail.
     assert!(model.nodes[&up].0 & tree::octant_bit(key) != 0);
-    let state = app.world().resource::<LodWorld>();
-    let ticket = state.tree.columns[&c].ticket.expect("queued");
-    let entry = state
-        .jobs
-        .queue
-        .iter()
-        .find(|e| e.column == c && e.ticket == ticket)
-        .expect("its entry");
-    assert_eq!(entry.class, 0, "touched: the first class");
+    assert_eq!(queued_class(&app, c), 0, "touched: the first class");
     // It goes next.
     let before = calls.lock().expect("lock").len();
     lod.run_all();
@@ -2281,9 +2368,15 @@ fn a_touched_octant_waits_hidden_for_its_lod1_node_which_jumps_ahead() {
     assert_bits_from_scratch(&app);
 }
 
-/// The class of the queued entry of column `c`.
+/// The class of the queued entry of column `c`, or of its job handed off to the workers (a
+/// class-0 column goes there at once; no job of a lower class is ahead of it then).
 fn queued_class(app: &App, c: ColumnKey) -> u8 {
     let state = app.world().resource::<LodWorld>();
+    let line = state.jobs.handed_off_columns();
+    if let Some(at) = line.iter().position(|&(column, _)| column == c) {
+        assert!(line[..at].iter().all(|&(_, class)| class == 0), "{line:?}");
+        return line[at].1;
+    }
     let ticket = state.tree.columns[&c].ticket.expect("queued");
     state
         .jobs

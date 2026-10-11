@@ -73,6 +73,9 @@ const STALE_TURN_DEGREES: f64 = 15.0;
 const REFRESH_PER_FRAME: usize = 256;
 /// Results and dispatches between two looks at the clock.
 const CLOCK_EVERY: usize = 16;
+/// Jobs handed off to the workers per in-flight slot ([`jobs`] module docs): enough to keep a
+/// worker busy for about a millisecond between two dispatches of the main thread.
+const HANDOFF_PER_SLOT: usize = 4;
 
 /// The far LOD's knobs (ADR 0031). Read every frame; an invalid change is logged once and the
 /// last valid settings stay (invalid settings from the start mean no LOD).
@@ -92,8 +95,9 @@ pub struct LodSettings {
     /// Quads the renderer's LOD arena holds (1 Mi..=32 Mi, clamped to the device). Read by the
     /// renderer.
     pub arena_quads: u32,
-    /// Jobs in flight at most while the world is busy (loading or meshing): near chunks wait
-    /// behind at most this many LOD jobs (1..=8).
+    /// Jobs in flight at most while the world is busy (loading or meshing), and only of class
+    /// 0 (the horizon first, and the nodes that close a hole in full detail): the rest waits for
+    /// the world to settle, so near chunks keep the workers (1..=8).
     pub in_flight_busy: usize,
     /// Jobs in flight at most once the world is settled (1..=8).
     pub in_flight_settled: usize,
@@ -125,7 +129,7 @@ impl Default for LodSettings {
             arena_quads: 12 << 20,
             in_flight_busy: 2,
             in_flight_settled: 5,
-            publish_per_frame: 64,
+            publish_per_frame: 192,
             upload_bytes_per_frame: 2 << 20,
             frame_budget: Duration::from_micros(300),
             edit_debounce: Duration::from_millis(500),
@@ -358,7 +362,8 @@ pub struct LodStats {
     pub horizon: f64,
     /// Per level (`levels[k - 1]`).
     pub levels: Vec<LevelStats>,
-    /// Entries in the job queue (a few may be stale).
+    /// Columns waiting for a job: entries in the job queue (a few may be stale) and jobs handed
+    /// off to the workers.
     pub queued_jobs: usize,
     /// Jobs running.
     pub in_flight: usize,
@@ -619,6 +624,7 @@ impl LodWorld {
         }
         self.outbox.extend(self.tree.clear());
         self.jobs.queue.clear();
+        self.jobs.take_back(|_| false);
         self.off = Some(why);
         self.planned = None;
         self.plan = Plan::default();
@@ -644,6 +650,7 @@ impl LodWorld {
         if !same || self.tree.dim != dim || self.tree.levels != levels {
             self.outbox.extend(self.tree.clear());
             self.jobs.queue.clear();
+            self.jobs.take_back(|_| false);
             let layers = content.generator.vertical_chunks();
             let (floor, ceiling) = (*layers.start(), *layers.end());
             self.tree = Tree::new(dim, levels, (floor != i64::MIN).then_some(floor));
@@ -786,6 +793,10 @@ impl LodWorld {
             return;
         };
         let (class, size) = self.priority(c, col, &work, cov);
+        if class == 0 {
+            // Before the workers start a handed-off job of a lower class.
+            self.jobs.take_back(|class| class == 0);
+        }
         let ticket = self.jobs.push(c, class, size);
         if let Some(col) = self.tree.columns.get_mut(&c) {
             col.ticket = Some(ticket);
@@ -866,15 +877,23 @@ impl LodWorld {
         })
     }
 
-    /// Collects finished jobs and starts queued ones while under `cap`, until `until` (checked
-    /// every [`CLOCK_EVERY`] results and dispatches), again while results keep arriving.
+    /// Collects finished jobs and starts queued ones while under `cap`, then hands off the next
+    /// ones to the workers ([`HANDOFF_PER_SLOT`] per slot), until `until` (checked every
+    /// [`CLOCK_EVERY`] results and dispatches), again while results keep arriving. While the
+    /// world is `busy`, only class-0 columns start (handed-off ones of other classes are taken
+    /// back).
     fn run_jobs(
         &mut self,
         until: Instant,
         cap: usize,
+        busy: bool,
         content: &WorldContent,
         cov: &ChunkCoverage,
     ) {
+        self.jobs.set_cap(cap);
+        if busy {
+            self.jobs.take_back(|class| class == 0);
+        }
         loop {
             let mut got = 0;
             while let Some(report) = self.jobs.try_recv() {
@@ -886,7 +905,23 @@ impl LodWorld {
             }
             self.queue_work(cov);
             let mut spawned = 0;
-            while self.off.is_none() && self.jobs.in_flight < cap && self.dispatch_one(content) {
+            while self.off.is_none() && self.jobs.has_room() {
+                if !self.jobs.start_handed_off() {
+                    let Some((input, class)) = self.next_job(content, busy) else {
+                        break;
+                    };
+                    self.jobs.spawn(input, class);
+                }
+                spawned += 1;
+                if spawned % CLOCK_EVERY == 0 && Instant::now() >= until {
+                    return;
+                }
+            }
+            while self.off.is_none() && self.jobs.handed_off() < HANDOFF_PER_SLOT * cap {
+                let Some((input, class)) = self.next_job(content, busy) else {
+                    break;
+                };
+                self.jobs.hand_off(input, class);
                 spawned += 1;
                 if spawned % CLOCK_EVERY == 0 && Instant::now() >= until {
                     return;
@@ -934,19 +969,28 @@ impl LodWorld {
         }
     }
 
-    /// Starts the best queued job (stale entries are skipped). False if none is left.
-    fn dispatch_one(&mut self, content: &WorldContent) -> bool {
-        let Some((_, _, materials)) = &self.content else {
-            return false;
-        };
-        while let Some(entry) = self.jobs.queue.pop() {
+    /// Takes the best queued column (stale entries are skipped) and starts its job's
+    /// bookkeeping; the caller spawns or hands off the job. `None` if none is left, or if the
+    /// world is `busy` and the best is not of class 0.
+    fn next_job(&mut self, content: &WorldContent, busy: bool) -> Option<(JobInput, u8)> {
+        let materials = Arc::clone(&self.content.as_ref()?.2);
+        while let Some(&entry) = self.jobs.queue.peek() {
             let c = entry.column;
+            let current = self
+                .tree
+                .columns
+                .get(&c)
+                .is_some_and(|col| col.ticket == Some(entry.ticket));
+            if current && busy && entry.class > 0 {
+                return None;
+            }
+            self.jobs.queue.pop();
+            if !current {
+                continue;
+            }
             let Some(col) = self.tree.columns.get_mut(&c) else {
                 continue;
             };
-            if col.ticket != Some(entry.ticket) {
-                continue;
-            }
             col.ticket = None;
             let Some(work) = col.work() else {
                 continue;
@@ -955,11 +999,11 @@ impl LodWorld {
             let cancel = Arc::new(AtomicBool::new(false));
             self.tree.start_job(c, id, Arc::clone(&cancel));
             self.jobs_of.insert(id, c);
-            self.jobs.spawn(JobInput {
+            let input = JobInput {
                 id,
                 generator: Arc::clone(&content.generator),
                 registry: Arc::clone(&content.registry),
-                materials: Arc::clone(materials),
+                materials,
                 request: LodRequest {
                     dim: self.tree.dim,
                     level: c.level,
@@ -968,16 +1012,27 @@ impl LodWorld {
                 },
                 only: work.only,
                 cancel,
-            });
-            return true;
+            };
+            return Some((input, entry.class));
         }
-        false
+        None
     }
 
-    /// What an idle step would find under `cap`.
-    fn idle_pending(&self, cap: usize) -> IdleWork {
+    /// True if a queued column may start now: the best one, while the world is `busy`, only if
+    /// it is of class 0.
+    fn may_start(&self, busy: bool) -> bool {
+        self.jobs
+            .queue
+            .peek()
+            .is_some_and(|best| !busy || best.class == 0)
+    }
+
+    /// What an idle step would find (the cap set last).
+    fn idle_pending(&self, busy: bool) -> IdleWork {
         if self.jobs.has_results()
-            || (self.off.is_none() && self.jobs.in_flight < cap && !self.jobs.queue.is_empty())
+            || (self.off.is_none()
+                && self.jobs.has_room()
+                && (self.jobs.handed_off() > 0 || self.may_start(busy)))
         {
             IdleWork::Ready
         } else if self.jobs.in_flight > 0 {
@@ -1004,6 +1059,7 @@ impl LodWorld {
             && self.planned.is_some()
             && self.jobs.in_flight == 0
             && self.jobs.queue.is_empty()
+            && self.jobs.handed_off() == 0
             && self.tree.sends_waiting() == 0
             && !self.tree.has_refused()
     }
@@ -1029,8 +1085,8 @@ impl LodWorld {
             off: self.off,
             horizon: self.planned.map_or(0.0, |p| p.th.horizon()),
             levels: self.tree.counts().to_vec(),
-            queued_jobs: self.jobs.queue.len(),
-            in_flight: self.jobs.in_flight,
+            queued_jobs: self.jobs.queue.len() + self.jobs.handed_off(),
+            in_flight: self.jobs.running(),
             jobs_done: self.jobs.times.count(),
             jobs_failed: self.jobs.failed,
             job_p50: self.jobs.times.quantile(0.5),
@@ -1222,16 +1278,17 @@ fn lod_plan(
     lod.plan(eye, view, &viewers.0, &world, coverage.coverage(), name);
 }
 
-/// True once the world has chunks and nothing left to load or mesh (before its first stats, in
-/// the first frame, it has none: busy).
-fn world_settled(stats: &WorldStats) -> bool {
-    stats.chunks > 0 && stats.is_settled()
+/// True once the world has nothing left to load or mesh: it has chunks, or no viewer wants any
+/// (before its first stats, in the first frame, a world with viewers has none: busy).
+fn world_settled(stats: &WorldStats, viewers: &ViewerChunks) -> bool {
+    stats.is_settled() && (stats.chunks > 0 || viewers.0.is_empty())
 }
 
 /// `LodSystems::Dispatch`: finished jobs and new ones within the frame budget.
 fn lod_dispatch(
     mut lod: ResMut<LodWorld>,
     stats: Res<WorldStats>,
+    viewers: Res<ViewerChunks>,
     content: Res<WorldContent>,
     coverage: Res<LodCoverage>,
 ) {
@@ -1242,8 +1299,15 @@ fn lod_dispatch(
         .settings
         .as_ref()
         .map_or(Duration::ZERO, |s| s.frame_budget);
-    let cap = lod.cap(world_settled(&stats));
-    lod.run_jobs(Instant::now() + budget, cap, &content, coverage.coverage());
+    let settled = world_settled(&stats, &viewers);
+    let cap = lod.cap(settled);
+    lod.run_jobs(
+        Instant::now() + budget,
+        cap,
+        !settled,
+        &content,
+        coverage.coverage(),
+    );
 }
 
 /// `LodSystems::Collect`: the frame's ops, the stats, and an ask for idle steps while jobs are
@@ -1274,6 +1338,7 @@ fn lod_idle(
     mut step: ResMut<IdleStep>,
     mut lod: ResMut<LodWorld>,
     stats: Res<WorldStats>,
+    viewers: Res<ViewerChunks>,
     content: Res<WorldContent>,
     world: Res<WorldSettings>,
     coverage: Res<LodCoverage>,
@@ -1281,12 +1346,14 @@ fn lod_idle(
     if !world.idle_work {
         return;
     }
-    let cap = lod.cap(world_settled(&stats));
-    let pending = lod.idle_pending(cap);
+    let settled = world_settled(&stats, &viewers);
+    let cap = lod.cap(settled);
+    lod.jobs.set_cap(cap);
+    let pending = lod.idle_pending(!settled);
     if pending != IdleWork::Ready || Instant::now() >= step.until {
         step.want(pending);
         return;
     }
-    lod.run_jobs(step.until, cap, &content, coverage.coverage());
-    step.want(lod.idle_pending(cap));
+    lod.run_jobs(step.until, cap, !settled, &content, coverage.coverage());
+    step.want(lod.idle_pending(!settled));
 }
