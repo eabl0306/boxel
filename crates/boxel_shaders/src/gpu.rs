@@ -77,11 +77,12 @@ pub struct FogHeader {
     pub counts: [u32; 4],
     /// rgb = sky color (where layers fade to), a = 0.
     pub sky: [f32; 4],
-    /// xyz = first cell of the debug coverage grid (`fs_fog_debug_coverage`), w = 0.
+    /// xyz = first cell of the debug coverage grid (`fs_fog_debug_coverage`), w = the point
+    /// inside each cell it reads (1/4096 cells per axis).
     pub debug: [i32; 4],
 }
 
-/// One layer of the uniform `Fog` (208 bytes, std140). See `fog.wgsl` for each word.
+/// One layer of the uniform `Fog` (224 bytes, std140). See `fog.wgsl` for each word.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct FogLayerGpu {
@@ -98,6 +99,9 @@ pub struct FogLayerGpu {
     pub lit: [f32; 4],
     /// Face shades: top, bottom, x, z.
     pub face: [f32; 4],
+    /// x, y = distance where the soft fog starts to blend into the cells and where it is all
+    /// cells (0, 0: no soft fog); z, w = brightness at the bottom and the top of the band.
+    pub soft: [f32; 4],
     /// xyz = offset of the displaced origin cell in its lattice step; w = log2 of the step.
     pub lattice: [u32; 4],
     /// xyz = low words of its lattice point, w = 0.
@@ -107,7 +111,8 @@ pub struct FogLayerGpu {
     /// x = 0, y = seed of the second octave, z = octaves, w = flags
     /// ([`fog::LAYER_VOLUME`], [`fog::LAYER_UNIFORM`]).
     pub octave2: [u32; 4],
-    /// x = coverage threshold (0..=4096), y = coverage gain (q8), zw = 0.
+    /// x = coverage threshold at the band's bottom (0..=4096), y = coverage gain (q8), z = rise
+    /// of the threshold to the band's top (0..=4096), w = cell rows of the band.
     pub shape: [u32; 4],
     /// xyz = the wind's fraction of a cell (1/4096), w = 0.
     pub wind: [i32; 4],

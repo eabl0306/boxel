@@ -1,11 +1,41 @@
 //! What the GPU gets of a layer each frame: everything absolute reduced to small integers
 //! relative to the render origin, computed here in `i64` and `i128` (ADR 0014).
 
-use crate::config::{FogLayer, NoiseDims};
+use crate::config::{FogLayer, MAX_PROFILE_ROWS, NoiseDims};
 use crate::noise::{self, COVERAGE_ONE, gain_units, seed32, seed32_octave2, threshold_units};
 
-/// Fixed steps a second of the fog clock (the app's fixed rate): the wind moves once a tick.
+/// Fixed steps a second of the fog clock (the app's fixed rate).
 pub const TICKS_PER_SECOND: u32 = 64;
+
+/// A moment of the fog clock: whole fixed steps (`tick`, 64 a second) and the fraction of the
+/// next one (`subtick`, in 1/65536), so the wind moves the noise every frame and not only once a
+/// tick. Integers only: every machine and tier sees the same cells at the same moment.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FogTime {
+    /// Whole ticks.
+    pub tick: u64,
+    /// Fraction of the next tick, in 1/65536.
+    pub subtick: u16,
+}
+
+impl FogTime {
+    /// `tick` and `subtick / 65536` of the next one.
+    pub const fn new(tick: u64, subtick: u16) -> Self {
+        Self { tick, subtick }
+    }
+
+    /// The moment in 1/65536 ticks.
+    pub fn units(self) -> i128 {
+        (i128::from(self.tick) << 16) | i128::from(self.subtick)
+    }
+}
+
+impl From<u64> for FogTime {
+    /// A whole tick.
+    fn from(tick: u64) -> Self {
+        Self { tick, subtick: 0 }
+    }
+}
 /// Bands are clamped to this far from the render origin, where `f32` is still exact.
 pub const BAND_LIMIT: i64 = 1 << 24;
 /// Band cell indices are clamped to this far from the origin's cell.
@@ -16,18 +46,27 @@ pub fn wind_units(wind: f32) -> i64 {
     (f64::from(wind) * 65536.0 / f64::from(TICKS_PER_SECOND)).round() as i64
 }
 
-/// The wind displacement of a layer after `tick` ticks, per axis: the whole cells (wrapping,
-/// `i64`) and the fraction of a cell in 1/4096 (`0..4096`). Flat noise ignores the wind along y.
-pub fn displacement(layer: &FogLayer, tick: u64) -> [(i64, i32); 3] {
+/// The wind displacement of a layer at `time`, per axis: the whole cells (wrapping, `i64`) and
+/// the fraction of a cell in 1/4096 (`0..4096`). Flat noise ignores the wind along y.
+pub fn displacement(layer: &FogLayer, time: impl Into<FogTime>) -> [(i64, i32); 3] {
+    let units = time.into().units();
     std::array::from_fn(|a| {
         if a == 1 && layer.noise.dims == NoiseDims::Flat {
             return (0, 0);
         }
-        // 1/65536 cells, floored.
-        let q16 = (i128::from(wind_units(layer.wind[a])) * i128::from(tick))
-            .div_euclid(i128::from(layer.cell[a]));
+        // 1/65536 cells, floored: 1/65536 blocks a tick times 1/65536 ticks, over the cell.
+        let q16 = (i128::from(wind_units(layer.wind[a])) * units)
+            .div_euclid(i128::from(layer.cell[a]) << 16);
         ((q16 >> 16) as i64, ((q16 & 0xffff) >> 4) as i32)
     })
+}
+
+/// Cell rows of a layer's band, as its threshold profile counts them: at least 1, at most
+/// [`MAX_PROFILE_ROWS`] (more is only valid without a rise, which ignores the rows).
+pub fn profile_rows(layer: &FogLayer) -> u32 {
+    let cy = i128::from(layer.cell[1].max(1));
+    ((i128::from(layer.max_y) - i128::from(layer.min_y)) / cy)
+        .clamp(1, i128::from(MAX_PROFILE_ROWS)) as u32
 }
 
 /// One layer as the GPU marches it this frame, for a render origin and a tick.
@@ -57,8 +96,12 @@ pub struct LayerParams {
     pub seed32: u32,
     /// Seed of the second octave.
     pub seed32_2: u32,
-    /// Coverage threshold, `0..=4096`.
+    /// Coverage threshold at the bottom of the band, `0..=4096`.
     pub threshold: u32,
+    /// Rise of the threshold to the top of the band, `0..=4096` ([`noise::threshold_at`]).
+    pub rise: u32,
+    /// Cell rows of the band ([`profile_rows`]).
+    pub rows: u32,
     /// Coverage gain (`q8`).
     pub gain: u32,
     /// Band relative to the render origin's y (clamped to `+-2^24`).
@@ -70,14 +113,14 @@ pub struct LayerParams {
 }
 
 impl LayerParams {
-    /// The layer for `render_origin` (world blocks) at `tick`.
-    pub fn new(layer: &FogLayer, render_origin: [i64; 3], tick: u64) -> Self {
+    /// The layer for `render_origin` (world blocks) at `time`.
+    pub fn new(layer: &FogLayer, render_origin: [i64; 3], time: impl Into<FogTime>) -> Self {
         let volume = layer.noise.dims == NoiseDims::Volume;
         let l = layer.noise.scale.max(1).trailing_zeros();
         let cell = layer.cell.map(|c| c.max(1));
         let c0: [i64; 3] = std::array::from_fn(|a| render_origin[a].div_euclid(i64::from(cell[a])));
         let grid = std::array::from_fn(|a| (c0[a] * i64::from(cell[a]) - render_origin[a]) as f32);
-        let disp = displacement(layer, tick);
+        let disp = displacement(layer, time);
         let mut m0 = [0; 3];
         let mut q = [0; 3];
         let mut lo = [0; 3];
@@ -119,6 +162,8 @@ impl LayerParams {
             seed32: s1,
             seed32_2: s2,
             threshold: threshold_units(layer.threshold),
+            rise: threshold_units(layer.threshold_rise),
+            rows: profile_rows(layer),
             gain: gain_units(layer.softness),
             band: [band_rel(layer.min_y), band_rel(layer.max_y)],
             band_cells: [band_cell(layer.min_y), band_cell(layer.max_y)],
@@ -128,16 +173,19 @@ impl LayerParams {
 }
 
 /// The mean coverage (0 to 1) of a layer's cells, from a fixed sample of 1024 cells spread over
-/// many lattice steps: what the march gives the rest of a ray once its step budget runs out.
-/// Deterministic; the same for every origin and tick (on average).
+/// many lattice steps and the rows of the band: what the march gives the rest of a ray once its
+/// step budget runs out. Deterministic; the same for every origin and tick (on average).
 pub fn mean_coverage(layer: &FogLayer) -> f32 {
     let params = LayerParams::new(layer, [0; 3], 0);
     let step = 3 * layer.noise.scale.max(1) as i32 + 1;
+    // Rows of the band near the origin's cell (the threshold rises with them).
+    let first = params.band_cells[0];
+    let rows = (i64::from(params.band_cells[1]) - i64::from(first)).clamp(1, 1 << 16) as i32;
     let mut sum = 0u64;
     for i in 0..1024i32 {
         let d = [
             (i & 31) * step + (i * 7) % step,
-            ((i * 5) % 16) * step,
+            first + (((i * 5) % 16) * step) % rows,
             (i >> 5) * step + (i * 11) % step,
         ];
         sum += u64::from(noise::coverage(&params, d).coverage);

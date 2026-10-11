@@ -9,20 +9,26 @@
 //! and adds `(T_before - T_after) * color` of its own. Up to four records (the depths of the
 //! pixels of a 2x2 block) take the transmittance and color in front of their depth.
 //!
-//! - **Shade.** A body of non-empty cells takes the shade of the face the ray entered it
-//!   through (top, bottom, x or z), so every cube looks flat and crisp; a ray that starts
-//!   inside fog uses 1.
-//! - **Fade.** Each cell's color fades to the sky color with the distance of the segment's
-//!   middle, like the terrain.
+//! - **Shade.** Off by default (every shade 1). A body of non-empty cells can take the shade of
+//!   the face the ray entered it through (top, bottom, x or z); a ray that starts inside fog
+//!   uses 1. The height in the band can shade it too (a gray base, a lit top), by the middle of
+//!   each segment.
+//! - **Fade.** Each segment's color fades to the sky color with the distance of its middle,
+//!   like the terrain.
+//! - **Soft fog.** A cell that starts within the layer's soft distance (and the blend past it)
+//!   is cut in pieces of about a block, and each piece blends the cell's coverage into the
+//!   coverage of the noise read at the piece's middle ([`MarchLayer::soft_coverage`]): no cell
+//!   edges near the camera. Its pieces take no face shade.
 //! - **Budget.** At most `max_steps` cells over all layers; past it the rest of each chord gets
 //!   the layer's mean extinction with shade 1 (no visible wall where the budget ends).
 //! - **Early exit.** Once the optical depth passes 6 (`log2`: 8.66) nothing behind shows.
 //! - **Skip.** A lattice step of the noise whose corners leave no coverage
-//!   ([`noise::step_bound`]) is crossed in one step, and a layer whose every cell is full
-//!   ([`MarchLayer::uniform`]) is taken in one step without walking its cells.
+//!   ([`noise::step_bound`]) is crossed in one step (never in the soft fog, which reads points
+//!   outside the step), and a layer whose every cell is full ([`MarchLayer::uniform`]) is taken
+//!   in one step without walking its cells.
 
 use crate::config::{FogFade, FogLayer};
-use crate::layer::LayerParams;
+use crate::layer::{FogTime, LayerParams};
 use crate::noise;
 
 /// Optical depth (in `log2` units, `exp2(-tau)`) after which the march stops: `6 / ln 2`.
@@ -32,6 +38,13 @@ pub const MIN_DIR: f32 = 1e-30;
 /// Pieces of a chord through a layer whose every cell is full ([`MarchLayer::uniform`]): each
 /// one fades by its own middle.
 pub const UNIFORM_PIECES: u32 = 8;
+/// The soft fog blends into the cells from the soft distance to this much farther (a fraction
+/// of the soft distance).
+pub const SOFT_BLEND: f32 = 0.5;
+/// Length of a piece of the soft fog, in blocks.
+pub const SOFT_PIECE: f32 = 1.0;
+/// Most pieces of one cell in the soft fog.
+pub const SOFT_MAX_PIECES: u32 = 16;
 
 /// One layer as the march reads it (the uniform's per-layer data).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -42,47 +55,101 @@ pub struct MarchLayer {
     pub lit: [f32; 3],
     /// Shades of the faces: top, bottom, x, z.
     pub face_shade: [f32; 4],
+    /// Brightness at the bottom and at the top of the band.
+    pub height_shade: [f32; 2],
+    /// Distances where the soft fog starts to blend into the cells and where it is all cells
+    /// (`[0, 0]`: no soft fog).
+    pub soft: [f32; 2],
     /// Fade start and end distance.
     pub fade: [f32; 2],
     /// The farthest the layer is drawn (blocks along the ray).
     pub max_distance: f32,
     /// Mean extinction (per block, times `log2(e)`) for the rest of a ray past the budget.
     pub sigma_mean_log2e: f32,
-    /// Every cell is full (threshold 0, softness 0): the march takes each chord whole.
+    /// Every cell is full (threshold 0 without a rise, softness 0): the march takes each chord
+    /// whole.
     pub uniform: bool,
 }
 
 impl MarchLayer {
-    /// A layer for `render_origin` and `tick`: `lit` is its color under this frame's light,
+    /// A layer for `render_origin` at `time`: `lit` is its color under this frame's light,
     /// `scene_fade` the scene's fog start and end (used by [`FogFade::Scene`]), `mean_coverage`
     /// its [`crate::mean_coverage`].
     pub fn new(
         layer: &FogLayer,
         render_origin: [i64; 3],
-        tick: u64,
+        time: impl Into<FogTime>,
         lit: [f32; 3],
         scene_fade: [f32; 2],
         mean_coverage: f32,
     ) -> Self {
-        let params = LayerParams::new(layer, render_origin, tick);
+        let params = LayerParams::new(layer, render_origin, time);
         let fade = match layer.fade {
             FogFade::Scene => scene_fade,
             FogFade::Range { start, end } => [start, end],
+        };
+        let soft = if layer.soft_distance > 0.0 {
+            [
+                layer.soft_distance,
+                layer.soft_distance * (1.0 + SOFT_BLEND),
+            ]
+        } else {
+            [0.0; 2]
         };
         Self {
             params,
             lit,
             face_shade: layer.face_shade,
+            height_shade: layer.height_shade,
+            soft,
             fade,
             max_distance: layer.max_distance,
             sigma_mean_log2e: params.density_log2e * mean_coverage,
-            uniform: params.threshold == 0 && params.gain == noise::MAX_GAIN,
+            uniform: params.threshold == 0 && params.rise == 0 && params.gain == noise::MAX_GAIN,
         }
     }
 
     /// Fade (0 to 1) at `dist` blocks.
     pub fn fade_at(&self, dist: f32) -> f32 {
         ((dist - self.fade[0]) / (self.fade[1] - self.fade[0]).max(1.0)).clamp(0.0, 1.0)
+    }
+
+    /// Brightness by the height `y` (relative to the render origin): linear from the band's
+    /// bottom to its top.
+    pub fn height_at(&self, y: f32) -> f32 {
+        let [lo, hi] = self.params.band;
+        let h = ((y - lo) / (hi - lo).max(1.0)).clamp(0.0, 1.0);
+        self.height_shade[0] + (self.height_shade[1] - self.height_shade[0]) * h
+    }
+
+    /// How soft the fog is (0 to 1) at `dist` blocks: 1 up to the soft distance, a smoothstep
+    /// down to 0 at the end of the blend. Only for a layer with soft fog.
+    pub fn soft_weight(&self, dist: f32) -> f32 {
+        let x = ((self.soft[1] - dist) / (self.soft[1] - self.soft[0])).clamp(0.0, 1.0);
+        x * x * (3.0 - 2.0 * x)
+    }
+
+    /// The soft fog's coverage (0 to 1) at `pos` (relative to the render origin): the noise read
+    /// at that point half a cell back (so the middle of a cell reads that cell's value) and the
+    /// threshold at that height.
+    pub fn soft_coverage(&self, pos: [f32; 3]) -> f32 {
+        let p = &self.params;
+        let mut d = [0; 3];
+        let mut sub = [0; 3];
+        for a in 0..3 {
+            let u = (pos[a] - p.grid[a]) / p.cell[a] as f32 - 0.5;
+            let f = u.floor();
+            d[a] = f as i32;
+            sub[a] = ((u - f) * 4096.0) as i32;
+        }
+        let threshold = if p.rise == 0 {
+            p.threshold
+        } else {
+            let h = ((pos[1] - p.band[0]) / (p.band[1] - p.band[0]).max(1.0)).clamp(0.0, 1.0);
+            noise::threshold_at(p.threshold, p.rise, (h * 4096.0) as u32)
+        };
+        let n = noise::noise_at(p, d, sub);
+        noise::coverage_from_noise(n, threshold, p.gain) as f32 / 4096.0
     }
 
     /// The farthest distance drawn: `min(max_distance, fade end)`.
@@ -420,7 +487,8 @@ pub fn march(ray: &Ray, layers: &[MarchLayer], sky: [f32; 3], max_steps: u32) ->
 
 /// One layer's chord `[ta, tb]` of a ray: the cell walk, or the rest of the chord in
 /// [`UNIFORM_PIECES`] pieces for a layer whose every cell is full and past the step budget (the
-/// shader's `march_layer`, segment for segment).
+/// shader's `march_layer`, segment for segment). Each iteration takes one segment in pieces: a
+/// cell (one piece, or about one per block in the soft fog) or the rest of the chord.
 fn march_layer(
     s: &mut State,
     layer: &MarchLayer,
@@ -431,14 +499,18 @@ fn march_layer(
     max_steps: u32,
 ) {
     let p = &layer.params;
-    let dir = ray.dir;
+    let (eye, dir) = (ray.eye, ray.dir);
     let dir_len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
     let up = dir[1] > 0.0;
-    let fade_col = |s0: f32, s1: f32, shade: f32| -> [f32; 3] {
-        let f = layer.fade_at(0.5 * (s0 + s1) * dir_len);
+    let color = |a: f32, b: f32, shade: f32| -> [f32; 3] {
+        let mid = 0.5 * (a + b);
+        let f = layer.fade_at(mid * dir_len);
+        let shade = shade * layer.height_at(eye[1] + mid * dir[1]);
         std::array::from_fn(|i| layer.lit[i] * shade + (sky[i] - layer.lit[i] * shade) * f)
     };
-    let mut dda = Dda::new(ray.eye, dir, p, ta);
+    // A cell that starts before this is in the soft fog (0: no soft fog).
+    let soft_t = layer.soft[1] / dir_len;
+    let mut dda = Dda::new(eye, dir, p, ta);
     let mut s0 = ta;
     let mut shade = 1.0;
     let mut entry = if ta > 0.0 {
@@ -447,39 +519,30 @@ fn march_layer(
         1.0
     };
     let mut prev_full = false;
-    // The rest of the chord from `rest_from`, in pieces of one extinction and shade.
-    let mut rest = None;
-    let mut rest_from = ta;
-    let mut k = 0;
-    if s.steps >= max_steps {
-        rest = Some((layer.sigma_mean_log2e, 1.0));
-    } else if layer.uniform {
-        // One body without inner faces: one step.
-        s.steps += 1;
-        rest = Some((p.density_log2e, entry));
-    }
-    let mut piece = (tb - ta) / UNIFORM_PIECES as f32;
     loop {
-        if rest.is_none() && s.steps >= max_steps {
-            rest = Some((layer.sigma_mean_log2e, 1.0));
-            rest_from = s0;
-            piece = (tb - s0) / UNIFORM_PIECES as f32;
-        }
-        let (a, b, s1, sigma, last, axis);
-        if let Some((rest_sigma, rest_shade)) = rest {
-            a = rest_from + k as f32 * piece;
-            k += 1;
-            last = k == UNIFORM_PIECES;
-            b = if last { tb } else { a + piece };
-            s1 = b;
-            sigma = rest_sigma;
-            shade = rest_shade;
-            axis = 2;
+        let (a, b, pieces, last);
+        // The extinction of the rest of the chord, or the cell's coverage.
+        let mut rest = None;
+        let mut cov = 0.0;
+        let mut soft = false;
+        let mut axis = 2;
+        if s.steps >= max_steps {
+            // Past the budget: the rest at the mean density.
+            (a, b, pieces, last) = (s0, tb, UNIFORM_PIECES, true);
+            rest = Some(layer.sigma_mean_log2e);
+            shade = 1.0;
+        } else if layer.uniform {
+            // One body without inner faces: one step.
+            s.steps += 1;
+            (a, b, pieces, last) = (s0, tb, UNIFORM_PIECES, true);
+            rest = Some(p.density_log2e);
+            shade = entry;
         } else {
             s.steps += 1;
+            soft = s0 < soft_t;
             // A lattice step whose corners leave no coverage is skipped whole (one step).
             let bound = noise::step_bound(p, dda.cell);
-            if bound.is_empty(p) {
+            if !soft && bound.is_empty(p) {
                 let (jump_axis, t) = dda.step_exit(&bound);
                 if t >= tb {
                     break;
@@ -496,33 +559,55 @@ fn march_layer(
             }
             let (exit_axis, t) = dda.exit();
             axis = exit_axis;
-            s1 = t.clamp(s0, tb);
-            a = s0;
-            b = s1;
-            let cov = noise::coverage(p, dda.cell).coverage;
-            sigma = p.density_log2e * (cov as f32 / 4096.0);
-            if sigma > 0.0 && !prev_full {
+            (a, b) = (s0, t.clamp(s0, tb));
+            let c = noise::coverage(p, dda.cell).coverage;
+            cov = c as f32 / 4096.0;
+            if c > 0 && !prev_full {
                 shade = entry;
             }
-            prev_full = sigma > 0.0;
+            prev_full = c > 0;
             last = t >= tb;
+            pieces = if soft {
+                (((b - a) * dir_len / SOFT_PIECE).ceil() as u32).clamp(1, SOFT_MAX_PIECES)
+            } else {
+                1
+            };
         }
-        if sigma > 0.0 {
-            s.segment(a, b, sigma * dir_len, fade_col(a, b, shade));
-            if s.done {
-                break;
+        let piece = (b - a) / pieces as f32;
+        for i in 0..pieces {
+            let pa = a + i as f32 * piece;
+            let pb = if i + 1 == pieces { b } else { pa + piece };
+            let (sigma, sh) = match rest {
+                Some(sigma) => (sigma, shade),
+                None => {
+                    let (mut c, mut sh) = (cov, shade);
+                    if soft {
+                        let mid = 0.5 * (pa + pb);
+                        let w = layer.soft_weight(mid * dir_len);
+                        if w > 0.0 {
+                            let pos = std::array::from_fn(|k| eye[k] + mid * dir[k]);
+                            c += (layer.soft_coverage(pos) - c) * w;
+                            sh += (1.0 - sh) * w;
+                        }
+                    }
+                    (p.density_log2e * c, sh)
+                }
+            };
+            if sigma > 0.0 {
+                s.segment(pa, pb, sigma * dir_len, color(pa, pb, sh));
+                if s.done {
+                    return;
+                }
             }
         }
         if last {
             break;
         }
-        if rest.is_none() {
-            dda.advance(axis);
-            entry = layer.face_shade[entry_face(axis, dda.step[axis])];
-            s0 = s1;
-            if dda.cell[1] < p.band_cells[0] || dda.cell[1] >= p.band_cells[1] {
-                break;
-            }
+        dda.advance(axis);
+        entry = layer.face_shade[entry_face(axis, dda.step[axis])];
+        s0 = b;
+        if dda.cell[1] < p.band_cells[0] || dda.cell[1] >= p.band_cells[1] {
+            break;
         }
     }
 }

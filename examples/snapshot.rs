@@ -847,7 +847,7 @@ fn run(
             &gpu.device,
             Some(FogInput {
                 settings: Arc::new(settings),
-                tick: o.fog_tick,
+                time: o.fog_tick.into(),
             }),
         );
     }

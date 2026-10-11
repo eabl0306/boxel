@@ -16,7 +16,8 @@ pub(crate) use pass::{FogPass, read_words};
 pub use plugin::{FogClock, FogPlugin};
 
 pub use boxel_fog::{
-    FogError, FogFade, FogLayer, FogNoise, FogResolution, NoiseDims, density_for_visibility,
+    FogError, FogFade, FogLayer, FogNoise, FogResolution, FogTime, NoiseDims,
+    density_for_visibility,
 };
 
 use boxel_ecs::prelude::*;
@@ -71,6 +72,6 @@ impl FogSettings {
 pub struct FogInput {
     /// The settings (valid: [`FogSettings::validate`]).
     pub settings: Arc<FogSettings>,
-    /// Ticks of the fog clock (the wind moves once a tick, 64 a second).
-    pub tick: u64,
+    /// The fog clock: ticks (64 a second) and the fraction of the next one.
+    pub time: FogTime,
 }

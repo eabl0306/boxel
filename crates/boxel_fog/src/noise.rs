@@ -15,7 +15,13 @@
 //!   (trilinear; for [`NoiseDims::Flat`] the y weight is 0 and both y corners are the same, so
 //!   it is bilinear in x and z), each product under `2^26`. Two octaves mix as
 //!   `(2 * v1 + v2) / 3`.
-//! - **Coverage.** `clamp(n + 1 - threshold, 0, 4095) * gain >> 8`, at most 4096 (one).
+//! - **Coverage.** A ramp `clamp(n + 1 - threshold, 0, 4095) * gain >> 8`, at most 4096 (one),
+//!   through the fixed-point smoothstep: a cell whose noise crosses the threshold starts almost
+//!   empty and fills in. The threshold rises with the cell's row in the band
+//!   ([`threshold_at`]).
+//!
+//! A cell reads the noise at its min corner; the soft fog near the camera reads it at any point
+//! in 1/4096 of a cell ([`noise_at`]), so a cell's value is the soft fog's half a cell before.
 //!
 //! The GPU never sees an absolute coordinate: [`LayerParams`] splits the
 //! cell of the render origin into a lattice point (low and high words) and an offset inside its
@@ -24,7 +30,7 @@
 //! `i128`, the reference both are tested against.
 
 use crate::config::{FogLayer, NoiseDims};
-use crate::layer::{LayerParams, displacement};
+use crate::layer::{FogTime, LayerParams, displacement, profile_rows};
 
 /// Coverage of a full cell.
 pub const COVERAGE_ONE: u32 = 4096;
@@ -113,10 +119,11 @@ pub fn gain_units(softness: f32) -> u32 {
         .clamp(256.0, f64::from(MAX_GAIN)) as u32
 }
 
-/// Coverage from the noise `n` (`0..4096`): `clamp(n + 1 - threshold, 0, 4095) * gain >> 8`,
-/// at most [`COVERAGE_ONE`]. Never overflows `u32` (`4095 * 2^20 < 2^32`).
+/// The linear part of the coverage of noise `n` (`0..4096`):
+/// `clamp(n + 1 - threshold, 0, 4095) * gain >> 8`, at most [`COVERAGE_ONE`]. Never decreases
+/// as the noise grows, and never overflows `u32` (`4095 * 2^20 < 2^32`).
 #[inline]
-pub const fn coverage_from_noise(n: i32, threshold: u32, gain: u32) -> u32 {
+pub const fn ramp(n: i32, threshold: u32, gain: u32) -> u32 {
     let d = n + 1 - threshold as i32;
     let d = if d < 0 {
         0
@@ -127,6 +134,45 @@ pub const fn coverage_from_noise(n: i32, threshold: u32, gain: u32) -> u32 {
     };
     let c = (d * gain) >> 8;
     if c > COVERAGE_ONE { COVERAGE_ONE } else { c }
+}
+
+/// The fixed-point smoothstep of a ramp value (`0..=4096`): `smooth` up to one, so a cell
+/// starts and ends its fill slowly. 0 below 64.
+#[inline]
+pub const fn smooth_ramp(w: u32) -> u32 {
+    (((w * w) >> 12) * (12288 - 2 * w)) >> 12
+}
+
+/// Coverage (`0..=4096`) from the noise `n` (`0..4096`): the [`smooth_ramp`] of its [`ramp`].
+/// 0 exactly when the ramp is under 64, so the bound of an empty step holds
+/// ([`StepBound::is_empty`]).
+#[inline]
+pub const fn coverage_from_noise(n: i32, threshold: u32, gain: u32) -> u32 {
+    smooth_ramp(ramp(n, threshold, gain))
+}
+
+/// The threshold (`0..=8192`) at height `h12` of the band (0 at its bottom, 4096 at its top):
+/// `threshold + rise * h^2`, so the base stays wide and flat and the tops thin out.
+#[inline]
+pub const fn threshold_at(threshold: u32, rise: u32, h12: u32) -> u32 {
+    threshold + ((rise * ((h12 * h12) >> 12)) >> 12)
+}
+
+/// The height (1/4096 of the band, `0..4096`) of the middle of the cell row `row` rows above the
+/// band's bottom, the row clamped into the band's `rows`.
+pub fn row_height(row: i64, rows: u32) -> u32 {
+    let rows = rows.max(1);
+    let r = row.clamp(0, i64::from(rows) - 1) as u32;
+    ((2 * r + 1) * 2048) / rows
+}
+
+/// The threshold of the cells `dy` rows above the origin's cell.
+pub fn row_threshold(p: &LayerParams, dy: i32) -> u32 {
+    if p.rise == 0 {
+        return p.threshold;
+    }
+    let row = i64::from(dy) - i64::from(p.band_cells[0]);
+    threshold_at(p.threshold, p.rise, row_height(row, p.rows))
 }
 
 /// Mixes two octaves: `(2 * v1 + v2) / 3` in fixed point.
@@ -169,9 +215,20 @@ fn octave(axes: [Axis; 3], seed32: u32) -> i32 {
 }
 
 /// The coverage of the cell `d` cells from the render origin's cell, as the GPU computes it
-/// from the split of [`LayerParams`]. `|d|` is at most 4096 cells along each axis (the march
-/// never walks farther).
+/// from the split of [`LayerParams`]: the noise at its min corner and the threshold of its row.
+/// `|d|` is at most 4096 cells along each axis (the march never walks farther).
 pub fn coverage(p: &LayerParams, d: [i32; 3]) -> Coverage {
+    let noise = noise_at(p, d, [0; 3]);
+    Coverage {
+        noise,
+        coverage: coverage_from_noise(noise, row_threshold(p, d[1]), p.gain),
+    }
+}
+
+/// The noise (`0..4096`) at `sub` (1/4096 of a cell per axis, `0..4096`) past the min corner of
+/// the cell `d` cells from the origin's cell: what the soft fog reads at any point. Flat noise
+/// ignores `sub[1]`.
+pub fn noise_at(p: &LayerParams, d: [i32; 3], sub: [i32; 3]) -> i32 {
     let l = p.log2_scale;
     let volume = p.volume;
     let mut axes1 = [Axis {
@@ -185,7 +242,7 @@ pub fn coverage(p: &LayerParams, d: [i32; 3]) -> Coverage {
             continue;
         }
         let k = p.m0[a] + d[a];
-        let num = (k << 12) - p.q[a];
+        let num = (k << 12) - p.q[a] + sub[a];
         let li = num >> (12 + l);
         let (lo0, hi0) = add_words(p.lo[a], p.hi[a], li);
         let (lo1, hi1) = add_words(p.lo[a], p.hi[a], li + 1);
@@ -207,15 +264,11 @@ pub fn coverage(p: &LayerParams, d: [i32; 3]) -> Coverage {
         }
     }
     let v1 = octave(axes1, p.seed32);
-    let noise = if p.octaves == 2 {
+    if p.octaves == 2 {
         let v2 = octave(axes2, p.seed32_2);
         mix_octaves(v1, v2)
     } else {
         v1
-    };
-    Coverage {
-        noise,
-        coverage: coverage_from_noise(noise, p.threshold, p.gain),
     }
 }
 
@@ -223,7 +276,9 @@ pub fn coverage(p: &LayerParams, d: [i32; 3]) -> Coverage {
 /// along each axis (unbounded along y for flat noise) interpolates the same corners, and value
 /// noise never leaves the range of its corners, so none of them has more noise than
 /// `max_noise` (with two octaves the second one is bounded by 4095). The march skips a whole
-/// step when even that leaves no coverage ([`StepBound::is_empty`]).
+/// step when even that leaves no coverage at the band's lowest threshold
+/// ([`StepBound::is_empty`]). It bounds the cells' noise, not the soft fog's, which reads
+/// points up to half a cell outside the step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StepBound {
     /// First cell offset of the step per axis.
@@ -235,7 +290,8 @@ pub struct StepBound {
 }
 
 impl StepBound {
-    /// True if no cell of the step can have coverage.
+    /// True if no cell of the step can have coverage (the threshold only rises above the
+    /// band's bottom).
     pub fn is_empty(&self, p: &LayerParams) -> bool {
         coverage_from_noise(self.max_noise, p.threshold, p.gain) == 0
     }
@@ -290,14 +346,36 @@ fn corner_values(axes: [Axis; 3], seed32: u32) -> [i32; 8] {
     std::array::from_fn(|i| lattice_value(seed32, [v[0][i & 1], v[1][(i >> 1) & 1], v[2][i >> 2]]))
 }
 
-/// The coverage of absolute cell `cell` at fixed tick `tick`, computed directly in `i128` from
-/// the cell and the wind: the reference [`coverage`] must equal.
-pub fn coverage_direct(layer: &FogLayer, cell: [i64; 3], tick: u64) -> Coverage {
+/// The coverage of absolute cell `cell` at `time`, computed directly in `i128` from the cell,
+/// its row in the band and the wind: the reference [`coverage`] must equal.
+pub fn coverage_direct(layer: &FogLayer, cell: [i64; 3], time: impl Into<FogTime>) -> Coverage {
+    let noise = noise_direct(layer, cell, [0; 3], time);
+    let cy = i64::from(layer.cell[1].max(1));
+    let row = cell[1].saturating_sub(layer.min_y.div_euclid(cy));
+    let threshold = threshold_at(
+        threshold_units(layer.threshold),
+        threshold_units(layer.threshold_rise),
+        row_height(row, profile_rows(layer)),
+    );
+    Coverage {
+        noise,
+        coverage: coverage_from_noise(noise, threshold, gain_units(layer.softness)),
+    }
+}
+
+/// The noise at `sub` (1/4096 of a cell) past the min corner of absolute cell `cell` at `time`,
+/// directly in `i128`: the reference of [`noise_at`].
+pub fn noise_direct(
+    layer: &FogLayer,
+    cell: [i64; 3],
+    sub: [i32; 3],
+    time: impl Into<FogTime>,
+) -> i32 {
     let volume = layer.noise.dims == NoiseDims::Volume;
     let l = layer.noise.scale.trailing_zeros();
     let seed1 = seed32(layer.noise.seed);
     let seed2 = seed32_octave2(seed1);
-    let disp = displacement(layer, tick);
+    let disp = displacement(layer, time);
     let mut axes1 = [Axis {
         lo: [0; 2],
         hi: [0; 2],
@@ -310,7 +388,8 @@ pub fn coverage_direct(layer: &FogLayer, cell: [i64; 3], tick: u64) -> Coverage 
             continue;
         }
         let (d_int, q) = disp[a];
-        let v = (i128::from(cell[a]) - i128::from(d_int)) * 4096 - i128::from(q);
+        let v =
+            (i128::from(cell[a]) - i128::from(d_int)) * 4096 - i128::from(q) + i128::from(sub[a]);
         let li = v >> (12 + l);
         let ((lo0, hi0), (lo1, hi1)) = (words(li), words(li + 1));
         axes1[a] = Axis {
@@ -329,19 +408,11 @@ pub fn coverage_direct(layer: &FogLayer, cell: [i64; 3], tick: u64) -> Coverage 
         }
     }
     let v1 = octave(axes1, seed1);
-    let noise = if layer.noise.octaves == 2 {
+    if layer.noise.octaves == 2 {
         let v2 = octave(axes2, seed2);
         mix_octaves(v1, v2)
     } else {
         v1
-    };
-    Coverage {
-        noise,
-        coverage: coverage_from_noise(
-            noise,
-            threshold_units(layer.threshold),
-            gain_units(layer.softness),
-        ),
     }
 }
 
@@ -395,11 +466,52 @@ mod tests {
         assert_eq!(coverage_from_noise(4095, 0, MAX_GAIN), COVERAGE_ONE);
         // Threshold 1: none.
         assert_eq!(coverage_from_noise(4095, 4096, MAX_GAIN), 0);
-        // Softness 1: the coverage follows the noise.
-        assert_eq!(coverage_from_noise(99, 0, 256), 100);
+        // Softness 1: the ramp follows the noise, the coverage its smoothstep.
+        assert_eq!(ramp(99, 0, 256), 100);
+        assert_eq!(coverage_from_noise(2047, 0, 256), 2048);
+        assert_eq!(coverage_from_noise(4095, 0, 512), COVERAGE_ONE);
         assert_eq!(gain_units(1.0), 256);
         assert_eq!(gain_units(0.0), MAX_GAIN);
         assert_eq!(threshold_units(0.5), 2048);
         assert_eq!(mix_octaves(4095, 4095), 4094);
+    }
+
+    /// The ramp never falls as the noise grows, the smoothstep stays in `0..=4096`, starts and
+    /// ends flat, and is 0 exactly under 64 (what the empty-step bound relies on).
+    #[test]
+    fn the_coverage_ramp_is_smooth() {
+        for gain in [256, 300, 1024, MAX_GAIN] {
+            for thr in [0, 100, 2048, 4096, 8192] {
+                for n in 1..4096 {
+                    assert!(ramp(n, thr, gain) >= ramp(n - 1, thr, gain));
+                }
+            }
+        }
+        assert_eq!(smooth_ramp(0), 0);
+        assert_eq!(smooth_ramp(4096), COVERAGE_ONE);
+        for w in 0..=4096u32 {
+            assert!(smooth_ramp(w) <= COVERAGE_ONE);
+            assert_eq!(smooth_ramp(w) == 0, w < 64, "{w}");
+        }
+        // Flat ends: the first and last 5 % of the ramp move the coverage by under 1 %.
+        assert!(smooth_ramp(205) < 41);
+        assert!(smooth_ramp(4096 - 205) > 4096 - 41);
+    }
+
+    #[test]
+    fn the_threshold_rises_with_the_square_of_the_height() {
+        assert_eq!(threshold_at(1000, 2048, 0), 1000);
+        assert_eq!(threshold_at(1000, 2048, 4096), 3048);
+        assert_eq!(
+            threshold_at(1000, 2048, 2048),
+            1512,
+            "a quarter at half height"
+        );
+        assert_eq!(threshold_at(4096, 4096, 4096), 8192, "never overflows");
+        // Four rows: the middles of each, clamped into the band.
+        let rows: Vec<u32> = (-2..6).map(|r| row_height(r, 4)).collect();
+        assert_eq!(rows, [512, 512, 512, 1536, 2560, 3584, 3584, 3584]);
+        assert_eq!(row_height(65535, 65536), 4095);
+        assert_eq!(row_height(0, 0), 2048, "no rows count as one");
     }
 }

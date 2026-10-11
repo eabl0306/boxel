@@ -15,13 +15,18 @@ pub const MAX_SCALE: u32 = 64;
 pub const MAX_STEPS: u32 = 256;
 /// The step budget a game gets unless it picks one ([`validate`], ADR 0030).
 pub const DEFAULT_MAX_STEPS: u32 = 64;
+/// Largest [`FogLayer::soft_distance`], in blocks: it bounds the extra samples of a ray.
+pub const MAX_SOFT_DISTANCE: f32 = 32.0;
+/// Most cell rows a band with a [`FogLayer::threshold_rise`] may have.
+pub const MAX_PROFILE_ROWS: i64 = 1 << 16;
 
 /// One layer of fog or clouds: the cells of `[min_y, max_y)` with one density each.
 ///
 /// A cell's density is `density * coverage`, where the coverage (0 to 1) comes from integer
 /// value noise over the cell's absolute index minus the wind times the time: the cells never
 /// move, they fill up on the side the wind blows to and empty on the other. Every cell is a
-/// crisp box: the light a ray loses through it is `exp(-density * coverage * length)`.
+/// crisp box: the light a ray loses through it is `exp(-density * coverage * length)`. Near the
+/// camera ([`FogLayer::soft_distance`]) the fog can be soft instead, without cell edges.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FogLayer {
     /// Bottom of the band (world blocks, inclusive). A multiple of `cell[1]`.
@@ -35,8 +40,14 @@ pub struct FogLayer {
     pub noise: FogNoise,
     /// Noise level (0 to 1) where cells start to fill: 0 fills every cell (a blanket), 1 none.
     pub threshold: f32,
-    /// Width of the noise range (0 to 1) over which a cell goes from empty to full: 0 makes
-    /// every cell empty or full (binary cubes).
+    /// How much the threshold rises from the bottom of the band to its top (0 to 1), along the
+    /// square of the height: 0 keeps it level. With more, the cells thin out upwards from a
+    /// flat, wide base into rounded, uneven tops (cumulus clouds).
+    pub threshold_rise: f32,
+    /// Width of the noise range (0 to 1) over which a cell goes from empty to full, along a
+    /// smoothstep. As the wind moves the noise, a cell is born almost transparent and fills in,
+    /// and a dying one fades out; the outer cells of a bank are thinner than the inner ones. 0
+    /// makes every cell empty or full: binary cubes that pop in and out.
     pub softness: f32,
     /// Extinction per block of a full cell: 3 / V sees about V blocks
     /// ([`density_for_visibility`]).
@@ -46,8 +57,17 @@ pub struct FogLayer {
     /// How much of the sky color the fog takes (0 to 1): the warm tint of a sunset.
     pub sky_tint: f32,
     /// Brightness of the fog by the face a ray enters a body of cells through: top, bottom,
-    /// sides along x, sides along z. Default `[1.0, 0.5, 0.8, 0.65]`, the voxel faces' shades.
+    /// sides along x, sides along z. All 1 (the default) is off: fog has no faces.
+    /// [`VOXEL_FACE_SHADE`] shades it like the voxels' faces.
     pub face_shade: [f32; 4],
+    /// Brightness at the bottom and at the top of the band, linear in between: `[0.7, 1.0]`
+    /// gives clouds a gray base and a lit top. `[1.0, 1.0]` (the default) is off.
+    pub height_shade: [f32; 2],
+    /// Distance from the camera (blocks, 0 to [`MAX_SOFT_DISTANCE`]) within which the fog is
+    /// soft: the noise is read at every point along the ray instead of once per cell, so no cell
+    /// edge shows. Beyond it the fog blends back into the cells over half that distance. 0 (the
+    /// default) keeps every cell cubic.
+    pub soft_distance: f32,
     /// Wind in blocks per second. `y` only moves [`NoiseDims::Volume`] noise.
     pub wind: [f32; 3],
     /// The farthest the layer is drawn (blocks along the ray), `(0, 4096]`.
@@ -58,7 +78,8 @@ pub struct FogLayer {
 
 impl FogLayer {
     /// A plain blanket over `[min_y, max_y)`: 1-block cells, every cell full, white, seen about
-    /// 50 blocks through, no wind, drawn to 512 blocks, faded like the terrain.
+    /// 50 blocks through, no shading, cubic up to the camera, no wind, drawn to 512 blocks,
+    /// faded like the terrain.
     pub fn new(min_y: i64, max_y: i64) -> Self {
         Self {
             min_y,
@@ -66,11 +87,14 @@ impl FogLayer {
             cell: [1, 1, 1],
             noise: FogNoise::default(),
             threshold: 0.0,
+            threshold_rise: 0.0,
             softness: 0.0,
             density: density_for_visibility(50.0),
             color: [1.0; 3],
             sky_tint: 0.0,
-            face_shade: DEFAULT_FACE_SHADE,
+            face_shade: [1.0; 4],
+            height_shade: [1.0; 2],
+            soft_distance: 0.0,
             wind: [0.0; 3],
             max_distance: 512.0,
             fade: FogFade::Scene,
@@ -78,8 +102,9 @@ impl FogLayer {
     }
 }
 
-/// The face shades of the voxel shaders: top, bottom, sides along x, sides along z.
-pub const DEFAULT_FACE_SHADE: [f32; 4] = [1.0, 0.5, 0.8, 0.65];
+/// The face shades of the voxel shaders (top, bottom, sides along x, sides along z), for a game
+/// that wants its fog shaded like blocks ([`FogLayer::face_shade`]; off by default).
+pub const VOXEL_FACE_SHADE: [f32; 4] = [1.0, 0.5, 0.8, 0.65];
 
 /// The noise of a layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,11 +190,14 @@ pub enum FogError {
     BadScale(usize),
     /// Octaves outside `1..=2`, or 2 with scale 1.
     BadOctaves(usize),
-    /// A value that is not finite or is out of its range (threshold, softness and sky tint in
-    /// `0..=1`; density, colors and shades not negative).
+    /// A value that is not finite or is out of its range (threshold, its rise, softness and sky
+    /// tint in `0..=1`; density, colors and shades not negative).
     NonFinite(usize),
-    /// `max_distance` outside `(0, 4096]`, or a fade range that is empty or negative.
+    /// `max_distance` outside `(0, 4096]`, a fade range that is empty or negative, or a soft
+    /// distance outside `0..=32`.
     BadDistance(usize),
+    /// A threshold rise over a band of more than [`MAX_PROFILE_ROWS`] cell rows.
+    TallProfile(usize),
     /// The step budget is outside `1..=256`.
     BadSteps,
 }
@@ -200,7 +228,11 @@ impl std::fmt::Display for FogError {
             }
             FogError::BadDistance(i) => write!(
                 f,
-                "fog layer {i}: max_distance goes up to {MAX_FOG_DISTANCE} and a fade range must not be empty"
+                "fog layer {i}: max_distance goes up to {MAX_FOG_DISTANCE}, a fade range must not be empty and soft_distance goes up to {MAX_SOFT_DISTANCE}"
+            ),
+            FogError::TallProfile(i) => write!(
+                f,
+                "fog layer {i}: a threshold rise needs a band of at most {MAX_PROFILE_ROWS} cell rows"
             ),
             FogError::BadSteps => write!(f, "the fog step budget goes from 1 to {MAX_STEPS}"),
         }
@@ -254,18 +286,29 @@ fn validate_layer(i: usize, l: &FogLayer) -> Result<(), FogError> {
         FogFade::Range { start, end } => positive(start) && end.is_finite() && end > start,
     };
     if !unit(l.threshold)
+        || !unit(l.threshold_rise)
         || !unit(l.softness)
         || !unit(l.sky_tint)
         || !positive(l.density)
         || !l.color.iter().all(|&c| positive(c))
         || !l.face_shade.iter().all(|&c| positive(c))
+        || !l.height_shade.iter().all(|&c| positive(c))
         || !l.wind.iter().all(|w| w.is_finite() && w.abs() <= 1024.0)
         || !l.max_distance.is_finite()
+        || !l.soft_distance.is_finite()
     {
         return Err(FogError::NonFinite(i));
     }
-    if l.max_distance <= 0.0 || l.max_distance > MAX_FOG_DISTANCE || !fade_ok {
+    if l.max_distance <= 0.0
+        || l.max_distance > MAX_FOG_DISTANCE
+        || !fade_ok
+        || !(0.0..=MAX_SOFT_DISTANCE).contains(&l.soft_distance)
+    {
         return Err(FogError::BadDistance(i));
+    }
+    let rows = (i128::from(l.max_y) - i128::from(l.min_y)) / i128::from(cy);
+    if l.threshold_rise > 0.0 && rows > i128::from(MAX_PROFILE_ROWS) {
+        return Err(FogError::TallProfile(i));
     }
     Ok(())
 }
@@ -286,6 +329,17 @@ mod tests {
         }
         assert_eq!(density_for_visibility(2.0), 1.5);
         assert!((density_for_visibility(50.0) - 0.06).abs() < 1e-7);
+    }
+
+    #[test]
+    fn a_plain_layer_has_no_shading_and_no_soft_fog() {
+        let l = FogLayer::new(0, 16);
+        assert_eq!(
+            l.face_shade, [1.0; 4],
+            "fog has no faces unless the game asks"
+        );
+        assert_eq!(l.height_shade, [1.0; 2]);
+        assert_eq!((l.soft_distance, l.threshold_rise), (0.0, 0.0));
     }
 
     #[test]
@@ -344,8 +398,11 @@ mod tests {
             &|l| l.color[1] = f32::INFINITY,
             &|l| l.sky_tint = 2.0,
             &|l| l.face_shade[3] = -0.1,
+            &|l| l.height_shade[0] = -0.5,
+            &|l| l.threshold_rise = 1.1,
             &|l| l.wind[0] = f32::NAN,
             &|l| l.max_distance = f32::NAN,
+            &|l| l.soft_distance = f32::INFINITY,
         ] {
             assert_eq!(ok(&[with(bad)]), Err(FogError::NonFinite(0)));
         }
@@ -364,9 +421,24 @@ mod tests {
                     end: 10.0,
                 }
             },
+            &|l| l.soft_distance = -1.0,
+            &|l| l.soft_distance = 33.0,
         ] {
             assert_eq!(ok(&[with(bad)]), Err(FogError::BadDistance(0)));
         }
+        // A rise over a band of 2^16 rows is fine, one more row is not; without a rise any
+        // height is.
+        let tall = |rows: i64, rise: f32| {
+            let mut l = FogLayer::new(-rows, 0);
+            l.threshold_rise = rise;
+            ok(&[l])
+        };
+        assert_eq!(tall(MAX_PROFILE_ROWS, 0.5), Ok(()));
+        assert_eq!(
+            tall(MAX_PROFILE_ROWS + 1, 0.5),
+            Err(FogError::TallProfile(0))
+        );
+        assert_eq!(tall(1 << 40, 0.0), Ok(()));
         assert_eq!(
             validate(std::slice::from_ref(&base), 0),
             Err(FogError::BadSteps)
@@ -374,5 +446,6 @@ mod tests {
         assert_eq!(validate(&[base], 257), Err(FogError::BadSteps));
         // Every error has a message.
         assert!(FogError::BadSteps.to_string().contains("256"));
+        assert!(FogError::TallProfile(2).to_string().contains("65536"));
     }
 }

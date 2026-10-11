@@ -27,7 +27,7 @@
 use boxel_camera::{Camera, CameraView};
 use boxel_fog::march::{Ray, march, texel};
 use boxel_fog::pack::{composite, decode_alpha, decode_color};
-use boxel_fog::{FogFade, FogLayer, FogResolution, LayerParams, NoiseDims, RayBasis};
+use boxel_fog::{FogFade, FogLayer, FogResolution, FogTime, LayerParams, NoiseDims, RayBasis};
 use boxel_gfx::{
     AdapterCaps, GlVersion, RgbaImage, SmokeContext, SmokeLevel, SmokeTest, Tier, floors,
     gpu_tests_required, read_texture_rgba8, run_in_error_scopes, submit_and_wait, tier_request,
@@ -484,7 +484,7 @@ fn fog_input(layers: Vec<FogLayer>, resolution: FogResolution, tick: u64) -> Fog
             resolution,
             ..FogSettings::new(layers)
         }),
-        tick,
+        time: tick.into(),
     }
 }
 
@@ -821,15 +821,17 @@ fn fog_costs_nothing_when_absent_off_or_out_of_reach() {
     .finish();
 }
 
-/// `fs_fog_debug_coverage` equals the CPU oracle bit for bit, far from the origin too.
+/// `fs_fog_debug_coverage` equals the CPU oracle bit for bit, far from the origin too: at the
+/// cells' corners and at points inside them (what the soft fog reads), on rows below, inside
+/// and above a band whose threshold rises, at whole ticks and between them.
 #[test]
 fn the_gpu_noise_is_the_oracle_bit_for_bit() {
     let mut layers = Vec::new();
-    for (cell, scale, octaves, dims) in [
-        ([1, 1, 1], 1, 1, NoiseDims::Flat),
-        ([12, 4, 12], 4, 1, NoiseDims::Flat),
-        ([2, 2, 2], 8, 2, NoiseDims::Volume),
-        ([3, 5, 7], 64, 2, NoiseDims::Volume),
+    for (cell, scale, octaves, dims, rise) in [
+        ([1, 1, 1], 1, 1, NoiseDims::Flat, 0.0),
+        ([12, 4, 12], 4, 1, NoiseDims::Flat, 0.5),
+        ([2, 2, 2], 8, 2, NoiseDims::Volume, 0.0),
+        ([3, 5, 7], 64, 2, NoiseDims::Volume, 0.35),
     ] {
         let mut l = FogLayer::new(0, i64::from(cell[1]) * 8);
         l.cell = cell;
@@ -838,6 +840,7 @@ fn the_gpu_noise_is_the_oracle_bit_for_bit() {
         l.noise.dims = dims;
         l.noise.seed = 0x5eed_0000_0000_0001 + u64::from(scale);
         l.threshold = 0.4;
+        l.threshold_rise = rise;
         l.softness = 0.25;
         l.wind = [2.5, -0.75, -9.0];
         layers.push(l);
@@ -849,20 +852,28 @@ fn the_gpu_noise_is_the_oracle_bit_for_bit() {
         [MAX_BLOCK_COORD - 100, 12, -(MAX_BLOCK_COORD - 100)],
     ];
     let size = [64u32, 48];
+    // (time, row of the grid relative to the origin's cell, point inside the cells)
+    let probes = [
+        (FogTime::from(0), 3, 0),
+        (FogTime::from(0), -40, 1234),
+        (FogTime::new(777_777, 40_000), 6, 4095),
+        (FogTime::new(777_777, 40_000), 2, 0),
+    ];
     for_every_tier(|label, _tier, device, queue, _, report| {
         for (li, layer) in layers.iter().enumerate() {
             for origin in origins {
-                for tick in [0u64, 777_777] {
-                    let first = [-32, 3, -24];
-                    let got = match debug_coverage(device, queue, layer, origin, tick, first, size)
-                    {
+                for (time, row, sub) in probes {
+                    let first = [-32, row, -24];
+                    let got = match debug_coverage(
+                        device, queue, layer, origin, time, first, sub, size,
+                    ) {
                         Ok(g) => g,
                         Err(e) => {
                             report.fail(format!("{label}: debug coverage: {e}"), &[]);
                             return;
                         }
                     };
-                    let params = LayerParams::new(layer, origin, tick);
+                    let params = LayerParams::new(layer, origin, time);
                     let mut bad = 0;
                     for (i, g) in got.iter().enumerate() {
                         let d = [
@@ -870,12 +881,20 @@ fn the_gpu_noise_is_the_oracle_bit_for_bit() {
                             first[1],
                             first[2] + (i as u32 / size[0]) as i32,
                         ];
-                        let want = boxel_fog::noise::coverage(&params, d);
-                        if *g != [want.coverage, want.noise as u32] {
+                        let n = boxel_fog::noise::noise_at(&params, d, [sub; 3]);
+                        let want = [
+                            boxel_fog::noise::coverage_from_noise(
+                                n,
+                                boxel_fog::noise::row_threshold(&params, d[1]),
+                                params.gain,
+                            ),
+                            n as u32,
+                        ];
+                        if *g != want {
                             if bad == 0 {
                                 eprintln!(
-                                    "gpu_fog: {label}: layer {li} origin {origin:?} tick {tick} \
-                                     cell {d:?}: want {want:?}, got {g:?}"
+                                    "gpu_fog: {label}: layer {li} origin {origin:?} {time:?} \
+                                     cell {d:?} point {sub}: want {want:?}, got {g:?}"
                                 );
                             }
                             bad += 1;
@@ -884,8 +903,8 @@ fn the_gpu_noise_is_the_oracle_bit_for_bit() {
                     if bad > 0 {
                         report.fail(
                             format!(
-                                "{label}: layer {li} origin {origin:?} tick {tick}: {bad} cells \
-                                 differ from the oracle"
+                                "{label}: layer {li} origin {origin:?} {time:?} point {sub}: \
+                                 {bad} cells differ from the oracle"
                             ),
                             &[],
                         );

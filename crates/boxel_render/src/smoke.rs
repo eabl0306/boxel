@@ -207,7 +207,7 @@ fn fog_draw(
     layer.density = 4.0;
     let input = crate::fog::FogInput {
         settings: Arc::new(crate::fog::FogSettings::new(vec![layer])),
-        tick: 0,
+        time: crate::fog::FogTime::default(),
     };
     renderer.set_fog(ctx.device, Some(input));
     let mut encoder = ctx

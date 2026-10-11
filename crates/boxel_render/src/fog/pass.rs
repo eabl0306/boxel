@@ -5,7 +5,7 @@ use super::{FogInput, FogSettings};
 use crate::MAIN_COLOR_FORMAT;
 use crate::renderer::ViewParams;
 use boxel_fog::march::MarchLayer;
-use boxel_fog::{FogLayer, FogResolution, RayBasis, mean_coverage};
+use boxel_fog::{FogLayer, FogResolution, FogTime, RayBasis, mean_coverage};
 use boxel_math::UVec2;
 use boxel_shaders::gpu::{
     FOG_BUFFER_SIZE, FOG_LAYERS_OFFSET, FOG_MAX_LAYERS, FogHeader, FogLayerGpu, bindings, fog,
@@ -24,8 +24,9 @@ pub fn frame_layers(
     settings: &FogSettings,
     means: &[f32],
     view: &ViewParams,
-    tick: u64,
+    time: impl Into<FogTime>,
 ) -> Vec<MarchLayer> {
+    let time = time.into();
     let origin = view.render_origin.to_array();
     let eye_y = view.eye_rel.y;
     let mut order: Vec<usize> = (0..settings.layers.len().min(FOG_MAX_LAYERS)).collect();
@@ -38,7 +39,7 @@ pub fn frame_layers(
             let m = MarchLayer::new(
                 layer,
                 origin,
-                tick,
+                time,
                 lit,
                 [view.fog_start, view.fog_end],
                 means.get(i).copied().unwrap_or(0.0),
@@ -80,11 +81,12 @@ fn layer_gpu(m: &MarchLayer) -> FogLayerGpu {
         size: [p.cell[0] as f32, p.cell[1] as f32, p.cell[2] as f32, 0.0],
         lit: [r, g, b, 0.0],
         face: m.face_shade,
+        soft: [m.soft[0], m.soft[1], m.height_shade[0], m.height_shade[1]],
         lattice: [p.m0[0] as u32, p.m0[1] as u32, p.m0[2] as u32, p.log2_scale],
         base_lo: [p.lo[0], p.lo[1], p.lo[2], 0],
         base_hi: [p.hi[0], p.hi[1], p.hi[2], p.seed32],
         octave2: [0, p.seed32_2, p.octaves, flags],
-        shape: [p.threshold, p.gain, 0, 0],
+        shape: [p.threshold, p.gain, p.rise, p.rows],
         wind: [p.q[0], p.q[1], p.q[2], 0],
         cells: [p.band_cells[0], p.band_cells[1], 0, 0],
     }
@@ -271,7 +273,7 @@ impl FogPass {
             self.means = settings.layers.iter().map(mean_coverage).collect();
             self.means_for = Some(Arc::clone(&settings));
         }
-        let layers = frame_layers(&settings, &self.means, view, input.tick);
+        let layers = frame_layers(&settings, &self.means, view, input.time);
         if layers.is_empty() {
             return (0, 0);
         }
@@ -552,18 +554,25 @@ pub(crate) fn read_words(
 }
 
 /// Testing: the noise and coverage `fs_fog_debug_coverage` computes for layer `layer` at
-/// `render_origin` and `tick`, over the cells `first + (x, 0, z)` for `x < size[0]` and
-/// `z < size[1]` (relative to the origin's cell), row by row: `[coverage, noise]` each.
+/// `render_origin` and `time`, at `sub` (1/4096 cells per axis) past the min corner of the cells
+/// `first + (x, 0, z)` for `x < size[0]` and `z < size[1]` (relative to the origin's cell), row
+/// by row: `[coverage, noise]` each (the coverage at the threshold of the cell's row).
 #[doc(hidden)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a test helper, one call site per test"
+)]
 pub fn debug_coverage(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     layer: &FogLayer,
     render_origin: [i64; 3],
-    tick: u64,
+    time: impl Into<FogTime>,
     first: [i32; 3],
+    sub: i32,
     size: [u32; 2],
 ) -> Result<Vec<[u32; 2]>, String> {
+    let time = time.into();
     let mut words = Vec::new();
     boxel_gfx::run_in_error_scopes(device, || {
         let module = create_module(device, ShaderModuleId::Fog);
@@ -584,9 +593,9 @@ pub fn debug_coverage(
                 write_mask: wgpu::ColorWrites::ALL,
             },
         );
-        let m = MarchLayer::new(layer, render_origin, tick, [1.0; 3], [0.0, 1.0], 0.0);
+        let m = MarchLayer::new(layer, render_origin, time, [1.0; 3], [0.0, 1.0], 0.0);
         let header = FogHeader {
-            debug: [first[0], first[1], first[2], 0],
+            debug: [first[0], first[1], first[2], sub],
             ..FogHeader::default()
         };
         let mut layers = [FogLayerGpu::default(); FOG_MAX_LAYERS];

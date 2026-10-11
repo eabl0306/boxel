@@ -12,8 +12,9 @@
 //! - [`pack`]: how the march stores its result in one texel.
 //!
 //! A cell's density is `density * coverage(cell - wind * time)`: the cells never move, the wind
-//! only changes which ones are full. The time is a tick count of the fixed step (64 a second),
-//! never a float, so every machine and tier sees the same cells.
+//! only changes which ones are full, and a soft coverage ramp makes them fill and empty
+//! gradually. The time is a tick count of the fixed step (64 a second) and a fraction of the
+//! next tick, integers, never a float, so every machine and tier sees the same cells.
 
 pub mod config;
 pub mod layer;
@@ -22,10 +23,10 @@ pub mod noise;
 pub mod pack;
 
 pub use config::{
-    DEFAULT_FACE_SHADE, DEFAULT_MAX_STEPS, FogError, FogFade, FogLayer, FogNoise, FogResolution,
-    MAX_FOG_DISTANCE, NoiseDims, density_for_visibility, validate,
+    DEFAULT_MAX_STEPS, FogError, FogFade, FogLayer, FogNoise, FogResolution, MAX_FOG_DISTANCE,
+    MAX_SOFT_DISTANCE, NoiseDims, VOXEL_FACE_SHADE, density_for_visibility, validate,
 };
-pub use layer::{LayerParams, RayBasis, TICKS_PER_SECOND, mean_coverage};
+pub use layer::{FogTime, LayerParams, RayBasis, TICKS_PER_SECOND, mean_coverage};
 pub use noise::{COVERAGE_ONE, Coverage};
 
 /// Most layers a set may have.

@@ -1,21 +1,33 @@
 //! [`FogPlugin`]: the fog of an app (ADR 0030). Not in any default set of plugins: a game adds
 //! it only if it wants fog; without it the renderer never creates a fog resource.
 
-use super::{FogInput, FogLayer, FogSettings};
+use super::{FogInput, FogLayer, FogSettings, FogTime};
 use crate::plugin::{ExtractedFrame, Render, RenderSystems};
-use boxel_app::{App, FixedUpdate, Plugin};
+use boxel_app::{App, FixedTime, FixedUpdate, Plugin, RunFixedMainLoop, RunFixedMainLoopSystems};
 use boxel_ecs::prelude::*;
 use std::sync::Arc;
 
 /// The fog clock: fixed steps since the fog started (64 a second), advanced in `FixedUpdate`
-/// unless paused. The wind moves the noise once a tick, so every machine, tier and frame rate
-/// sees the same cells at the same tick. Set `tick` for a fixed look (tests, screenshots).
+/// unless paused, and the fraction of the next step the frame is past it, so the wind moves the
+/// noise every frame and not in 64 steps a second. Integers: every machine, tier and frame rate
+/// sees the same cells at the same moment. Pause it and set `tick` for a fixed look (tests,
+/// screenshots).
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FogClock {
     /// Ticks so far.
     pub tick: u64,
+    /// Fraction of the next tick (1/65536): the fixed step's overstep, set every frame after the
+    /// steps unless paused.
+    pub subtick: u16,
     /// Stops the wind.
     pub paused: bool,
+}
+
+impl FogClock {
+    /// The moment the fog is drawn at.
+    pub fn time(&self) -> FogTime {
+        FogTime::new(self.tick, self.subtick)
+    }
 }
 
 /// Adds fog to an app: inserts [`FogSettings`] (from `settings`) and [`FogClock`], advances the
@@ -48,6 +60,10 @@ impl Plugin for FogPlugin {
         app.insert_resource(self.settings.clone())
             .init_resource::<FogClock>()
             .add_systems(FixedUpdate, advance_fog_clock)
+            .add_systems(
+                RunFixedMainLoop,
+                interpolate_fog_clock.in_set(RunFixedMainLoopSystems::AfterFixedMainLoop),
+            )
             .add_systems(Render, extract_fog.in_set(RenderSystems::Extract));
     }
 }
@@ -57,6 +73,18 @@ fn advance_fog_clock(mut clock: ResMut<FogClock>) {
     if !clock.paused {
         clock.tick = clock.tick.wrapping_add(1);
     }
+}
+
+/// After the frame's fixed steps: the fraction of the next tick the frame is past the last one.
+fn interpolate_fog_clock(mut clock: ResMut<FogClock>, fixed: Option<Res<FixedTime>>) {
+    if let (false, Some(fixed)) = (clock.paused, fixed) {
+        clock.subtick = subtick(fixed.overstep_fraction_f64());
+    }
+}
+
+/// An overstep fraction (`[0, 1)`) in 1/65536 of a tick.
+fn subtick(fraction: f64) -> u16 {
+    (fraction * 65536.0).floor().clamp(0.0, 65535.0) as u16
 }
 
 /// The last valid settings and the error last logged.
@@ -96,7 +124,7 @@ fn extract_fog(
     if let Some(mut frame) = frame {
         frame.fog = checked.valid.as_ref().map(|s| FogInput {
             settings: Arc::clone(s),
-            tick: clock.tick,
+            time: clock.time(),
         });
     }
 }
@@ -130,7 +158,7 @@ mod tests {
         app.update();
         let fog = frame_fog(&app).expect("fog this frame");
         assert_eq!(fog.settings.layers, vec![FogLayer::new(0, 8)]);
-        assert_eq!(fog.tick, 0);
+        assert_eq!(fog.time, FogTime::default());
     }
 
     #[test]
@@ -156,7 +184,41 @@ mod tests {
         app.world_mut().run_schedule(FixedMain);
         assert_eq!(app.world().resource::<FogClock>().tick, 5);
         app.update();
-        assert_eq!(frame_fog(&app).expect("fog").tick, 5);
+        assert_eq!(frame_fog(&app).expect("fog").time.tick, 5);
+    }
+
+    /// Between ticks the clock reads the fixed step's overstep, so the wind moves every frame;
+    /// paused, the fraction stays where it was.
+    #[test]
+    fn the_clock_interpolates_between_ticks() {
+        use std::time::Duration;
+        let mut app = app(Some(FogPlugin::default()));
+        let mut fixed = FixedTime::default();
+        fixed.accumulate(fixed.timestep() * 3 / 4);
+        app.insert_resource(fixed);
+        app.world_mut().run_schedule(RunFixedMainLoop);
+        let clock = *app.world().resource::<FogClock>();
+        assert!(
+            (clock.subtick as i32 - 49152).abs() <= 1,
+            "three quarters of a tick: {}",
+            clock.subtick
+        );
+        app.update();
+        assert_eq!(frame_fog(&app).expect("fog").time, clock.time());
+        let mut paused = app.world_mut().resource_mut::<FogClock>();
+        paused.paused = true;
+        app.world_mut()
+            .resource_mut::<FixedTime>()
+            .accumulate(Duration::from_millis(1));
+        app.world_mut().run_schedule(RunFixedMainLoop);
+        assert_eq!(app.world().resource::<FogClock>().subtick, clock.subtick);
+        assert_eq!(subtick(0.0), 0);
+        assert_eq!(subtick(0.5), 32768);
+        assert_eq!(
+            subtick(1.5),
+            65535,
+            "a late frame stays before the next tick"
+        );
     }
 
     #[test]
