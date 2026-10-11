@@ -5,7 +5,8 @@ use crate::targets::{Blit, Targets};
 use crate::textures::{generate_block_textures, linear_to_srgb};
 use boxel_camera::{Camera, CameraView};
 use boxel_gfx::{
-    SmokeContext, SmokeLevel, SmokeTest, read_texture_rgba8, run_in_error_scopes, submit_and_wait,
+    SmokeContext, SmokeLevel, SmokeTest, Tier, read_texture_rgba8, run_in_error_scopes,
+    submit_and_wait,
 };
 use boxel_math::{DVec3, I64Vec3, UVec2};
 use boxel_mesh::{BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, PackedQuad, palette_entry};
@@ -132,12 +133,23 @@ fn compile(ctx: &SmokeContext<'_>, smoke: &RendererSmokeTest) -> Result<(), Stri
     let pipelines = TierPipelines::new(ctx.device, ctx.tier);
     if checks_lod(smoke, ctx) {
         let result = run_in_error_scopes(ctx.device, || {
+            // High draws it GPU-driven: both of its pipelines are built.
+            let gpu = (ctx.tier == Tier::High).then(|| crate::lod::GpuInputs {
+                view: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("boxel smoke view"),
+                    size: boxel_shaders::gpu::VIEW_BUFFER_SIZE,
+                    usage: wgpu::BufferUsages::UNIFORM,
+                    mapped_at_creation: false,
+                }),
+                index: crate::path::quad_index_buffer(ctx.device),
+            });
             drop(crate::lod::LodPass::new(
                 ctx.device,
                 &pipelines.layouts.materials,
                 &pipelines.layouts.view,
                 1024,
                 0,
+                gpu,
             ));
             Ok(())
         });

@@ -2,7 +2,7 @@ use crate::arena::{QUAD_BYTES, QuadArena};
 use crate::chunk_table::{ChunkRecord, ChunkTable};
 use crate::fog::{FogInput, FogPass};
 use crate::light::SceneLight;
-use crate::lod::{LodInput, LodPass, LodReport};
+use crate::lod::{GpuInputs, LodInput, LodPass, LodReport};
 use crate::outline::{Outline, OutlinePass};
 use crate::path::{
     HighInputs, HighPath, LowPath, MidPath, SlotVisibility, TierPath, TierPipelines,
@@ -187,10 +187,11 @@ pub struct RenderStats {
     /// LOD nodes with an octant left to draw (finer detail draws none of it), in view or not,
     /// last frame (0 while the LOD draws nothing).
     pub lod_drawn: u32,
-    /// LOD draw calls of the last frame: one per drawn node inside the frustum. Not counted in
+    /// LOD draw calls of the last frame: one per drawn node inside the frustum, or on High (the
+    /// GPU culls the nodes) one indirect draw per segment of the node table. Not counted in
     /// [`RenderStats::draws`].
     pub lod_draws: u32,
-    /// Quads of those draws.
+    /// Quads of those draws; on High, the quads of the drawn nodes before the GPU cull.
     pub lod_quads: u64,
     /// LOD node meshes refused because the LOD arena or its node table was full (cumulative).
     pub lod_refused: u32,
@@ -275,6 +276,14 @@ pub struct VoxelRenderer {
     lod: Option<LodPass>,
     /// The far LOD cannot run on this device (a GL backend, or its pass failed): it stays off.
     lod_failed: bool,
+    /// High: the shared quad index buffer, for the far LOD's GPU-driven path.
+    lod_index: Option<wgpu::Buffer>,
+    /// The far LOD draws through the GPU-driven path where the tier has it (High; tests turn it
+    /// off to compare it with the instanced path).
+    lod_gpu_driven: bool,
+    /// The cave culling search that `lod_sealed` was found for, and whether it reached no chunk
+    /// on the border of its box.
+    lod_sealed: Option<(Arc<VisibleSet>, bool)>,
     /// The per-frame part of the View uniform the last frame wrote.
     view_uniform: ViewUniform,
 }
@@ -589,6 +598,7 @@ impl VoxelRenderer {
             }],
         });
 
+        let mut lod_index = None;
         let path: Box<dyn TierPath + Send + Sync> = if let Some(light) = &low_light {
             Box::new(LowPath::new(voxel, light.clone()))
         } else {
@@ -600,6 +610,7 @@ impl VoxelRenderer {
             let geometry =
                 geometry_bind_group(device, geometry_layout, arena.buffer(), chunk_buffer);
             let index = quad_index_buffer(device);
+            lod_index = cull.is_some().then(|| index.clone());
             match cull {
                 Some(cull) => Box::new(HighPath::new(
                     device,
@@ -656,6 +667,9 @@ impl VoxelRenderer {
             color_mip: textures.mip_levels.saturating_sub(1),
             lod: None,
             lod_failed: false,
+            lod_index,
+            lod_gpu_driven: true,
+            lod_sealed: None,
             view_uniform: ViewUniform::default(),
         })
     }
@@ -773,6 +787,14 @@ impl VoxelRenderer {
                 return;
             }
             let mut pass = None;
+            let gpu = self
+                .lod_index
+                .as_ref()
+                .filter(|_| self.lod_gpu_driven)
+                .map(|index| GpuInputs {
+                    view: self.view_buffer.clone(),
+                    index: index.clone(),
+                });
             let built = boxel_gfx::run_in_error_scopes(device, || {
                 pass = Some(LodPass::new(
                     device,
@@ -780,6 +802,7 @@ impl VoxelRenderer {
                     &self.view_layout,
                     input.settings.arena_quads,
                     self.color_mip,
+                    gpu,
                 ));
                 Ok(())
             });
@@ -826,6 +849,23 @@ impl VoxelRenderer {
         if let Some(lod) = &mut self.lod {
             lod.fail_next_upload();
         }
+    }
+
+    /// Testing: the far LOD draws through its GPU-driven path where the tier has one (High),
+    /// `true` by default; `false` draws it instanced as on Mid and Low. A change drops the LOD
+    /// pass: the next [`VoxelRenderer::set_lod`] builds it again, empty.
+    #[doc(hidden)]
+    pub fn debug_set_lod_gpu_driven(&mut self, on: bool) {
+        if self.lod_gpu_driven != on {
+            self.lod_gpu_driven = on;
+            self.lod = None;
+        }
+    }
+
+    /// True if the far LOD pass draws through the GPU-driven path (High).
+    #[doc(hidden)]
+    pub fn debug_lod_gpu_driven(&self) -> bool {
+        self.lod.as_ref().is_some_and(LodPass::gpu_driven)
     }
 
     /// The LOD stays off on this renderer: a GL backend, or its pass failed to build.
@@ -1176,7 +1216,11 @@ impl VoxelRenderer {
         self.outline.prepare(device, queue, view, self.targets.size);
         if let Some(lod) = &mut self.lod {
             let _span = frame_span!("render.lod");
-            lod.prepare(device, encoder, cull_view);
+            // Underground the cave culling search often reaches no chunk on the border of its
+            // box: no line of sight leaves it, so nothing of the LOD can show (ADR 0031, M3).
+            let sealed =
+                used && search_is_sealed(&mut self.lod_sealed, self.occlusion.set.as_ref());
+            lod.prepare(device, queue, encoder, cull_view, sealed);
         }
         self.path.encode_compute(encoder, slot_count);
         let draws = {
@@ -1273,6 +1317,47 @@ impl VoxelRenderer {
             ..stats
         }
     }
+}
+
+/// True if the cave culling search `set` reached no chunk on the border of its box: no line of
+/// sight leaves the box, so nothing outside it can be seen (ADR 0031: the far LOD draws nothing
+/// then). Found once per search and kept in `cache`.
+fn search_is_sealed(
+    cache: &mut Option<(Arc<VisibleSet>, bool)>,
+    set: Option<&Arc<VisibleSet>>,
+) -> bool {
+    let Some(set) = set else {
+        return false;
+    };
+    if let Some((searched, sealed)) = cache
+        && Arc::ptr_eq(searched, set)
+    {
+        return *sealed;
+    }
+    let sealed = !border_seen(set);
+    *cache = Some((Arc::clone(set), sealed));
+    sealed
+}
+
+/// True if some chunk on the border of `set`'s box may be seen. The top layer first: on the
+/// surface the sky answers at once; underground every border chunk is looked at.
+fn border_seen(set: &VisibleSet) -> bool {
+    let (min, max) = set.bounds();
+    for y in (min.y..=max.y).rev() {
+        let face = y == min.y || y == max.y;
+        for z in min.z..=max.z {
+            if face || z == min.z || z == max.z {
+                if (min.x..=max.x).any(|x| set.is_visible(ChunkPos::new(x, y, z))) {
+                    return true;
+                }
+            } else if set.is_visible(ChunkPos::new(min.x, y, z))
+                || set.is_visible(ChunkPos::new(max.x, y, z))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Moves the far plane of `frustum` (camera-relative, eye at `eye`) to `distance` along its
@@ -1385,6 +1470,45 @@ fn block_textures(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A search that reaches no chunk on the border of its box is sealed (the far LOD draws
+    /// nothing); one that reaches any border chunk, on any face, is not. Found once per set.
+    #[test]
+    fn a_search_that_never_reaches_its_border_is_sealed() {
+        use boxel_math::I64Vec3;
+        use boxel_voxel::ALL_LINKS;
+        use boxel_world::VisibilityView;
+        use boxel_world::visibility::visible_chunks;
+        let view = VisibilityView::new(I64Vec3::new(16, 16, 16), None, 3, 2);
+        // Closed rock: the camera's chunk sees its 6 neighbors, none on the border.
+        let closed = Arc::new(visible_chunks(&view, |_| 0));
+        let mut cache = None;
+        assert!(search_is_sealed(&mut cache, Some(&closed)));
+        assert!(search_is_sealed(&mut cache, Some(&closed)), "cached");
+        assert!(!search_is_sealed(&mut cache, None), "no search: drawn");
+        // Open air, and a tunnel to any one face of the box.
+        let open = Arc::new(visible_chunks(&view, |_| ALL_LINKS));
+        assert!(!search_is_sealed(&mut cache, Some(&open)));
+        let (min, max) = open.bounds();
+        assert_eq!((min.y, max.y), (-2, 2));
+        let tunnels: [fn(ChunkPos) -> bool; 6] = [
+            |p| p.y == 0 && p.z == 0 && p.x >= 0,
+            |p| p.y == 0 && p.z == 0 && p.x <= 0,
+            |p| p.x == 0 && p.z == 0 && p.y >= 0,
+            |p| p.x == 0 && p.z == 0 && p.y <= 0,
+            |p| p.x == 0 && p.y == 0 && p.z >= 0,
+            |p| p.x == 0 && p.y == 0 && p.z <= 0,
+        ];
+        for tunnel in tunnels {
+            let set = Arc::new(visible_chunks(
+                &view,
+                |p| {
+                    if tunnel(p) { ALL_LINKS } else { 0 }
+                },
+            ));
+            assert!(!search_is_sealed(&mut cache, Some(&set)));
+        }
+    }
 
     #[test]
     fn occlusion_bits_follow_the_set_and_the_slots() {

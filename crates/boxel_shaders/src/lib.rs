@@ -29,8 +29,14 @@ pub const OUTLINE_WGSL: &str = include_str!("../shaders/outline.wgsl");
 /// `fog.wgsl`: the fog march and its composite (`vs_fullscreen`, `fs_fog_march`,
 /// `fs_fog_composite_half`, `fs_fog_composite_full`, `fs_fog_debug_coverage`).
 pub const FOG_WGSL: &str = include_str!("../shaders/fog.wgsl");
-/// `lod.wgsl`: far LOD nodes on every tier (`vs_lod`, `fs_lod`, ADR 0031).
+/// `lod_common.wgsl`: what both far LOD pipelines share (`lod_vertex`, `fs_lod`, ADR 0031).
+pub const LOD_COMMON_WGSL: &str = include_str!("../shaders/lod_common.wgsl");
+/// `lod.wgsl`: far LOD nodes, instanced, on every tier (`vs_lod`, ADR 0031).
 pub const LOD_WGSL: &str = include_str!("../shaders/lod.wgsl");
+/// `lod_pull.wgsl`: far LOD nodes, vertex pulling, High (`vs_lod_pull`, ADR 0031).
+pub const LOD_PULL_WGSL: &str = include_str!("../shaders/lod_pull.wgsl");
+/// `lod_cull.wgsl`: High GPU culling of the far LOD nodes (`cull_lod`, ADR 0031).
+pub const LOD_CULL_WGSL: &str = include_str!("../shaders/lod_cull.wgsl");
 
 /// Shader stage of an entry point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,19 +66,30 @@ pub enum ShaderModuleId {
     Outline,
     /// fog march and composite (all tiers, only with the fog plugin).
     Fog,
-    /// common + lod: far LOD nodes (all tiers, only with the LOD plugin).
+    /// common + `lod_common` + lod: far LOD nodes, instanced (all tiers, only with the LOD
+    /// plugin).
     Lod,
+    /// common + `lod_common` + `lod_pull`: far LOD nodes drawn from the GPU cull's lists (tier
+    /// High, only with the LOD plugin).
+    LodPull,
+    /// common + `lod_cull`: GPU culling of the far LOD nodes (tier High, only with the LOD
+    /// plugin).
+    LodCull,
 }
 
 static VOXEL_PULL: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{VOXEL_PULL_WGSL}"));
 static VOXEL_INSTANCED: LazyLock<String> =
     LazyLock::new(|| format!("{COMMON_WGSL}\n{VOXEL_INSTANCED_WGSL}"));
 static CULL: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{CULL_WGSL}"));
-static LOD: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{LOD_WGSL}"));
+static LOD: LazyLock<String> =
+    LazyLock::new(|| format!("{COMMON_WGSL}\n{LOD_COMMON_WGSL}\n{LOD_WGSL}"));
+static LOD_PULL: LazyLock<String> =
+    LazyLock::new(|| format!("{COMMON_WGSL}\n{LOD_COMMON_WGSL}\n{LOD_PULL_WGSL}"));
+static LOD_CULL: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{LOD_CULL_WGSL}"));
 
 impl ShaderModuleId {
     /// All modules.
-    pub const ALL: [ShaderModuleId; 8] = [
+    pub const ALL: [ShaderModuleId; 10] = [
         ShaderModuleId::VoxelPull,
         ShaderModuleId::VoxelInstanced,
         ShaderModuleId::Cull,
@@ -81,6 +98,8 @@ impl ShaderModuleId {
         ShaderModuleId::Outline,
         ShaderModuleId::Fog,
         ShaderModuleId::Lod,
+        ShaderModuleId::LodPull,
+        ShaderModuleId::LodCull,
     ];
 
     /// Debug label.
@@ -94,6 +113,8 @@ impl ShaderModuleId {
             ShaderModuleId::Outline => "boxel outline",
             ShaderModuleId::Fog => "boxel fog",
             ShaderModuleId::Lod => "boxel lod",
+            ShaderModuleId::LodPull => "boxel lod_pull",
+            ShaderModuleId::LodCull => "boxel lod_cull",
         }
     }
 
@@ -108,6 +129,8 @@ impl ShaderModuleId {
             ShaderModuleId::Outline => OUTLINE_WGSL,
             ShaderModuleId::Fog => FOG_WGSL,
             ShaderModuleId::Lod => LOD.as_str(),
+            ShaderModuleId::LodPull => LOD_PULL.as_str(),
+            ShaderModuleId::LodCull => LOD_CULL.as_str(),
         }
     }
 
@@ -148,6 +171,10 @@ impl ShaderModuleId {
                 ("fs_fog_debug_coverage", Stage::Fragment),
             ],
             ShaderModuleId::Lod => &[("vs_lod", Stage::Vertex), ("fs_lod", Stage::Fragment)],
+            ShaderModuleId::LodPull => {
+                &[("vs_lod_pull", Stage::Vertex), ("fs_lod", Stage::Fragment)]
+            }
+            ShaderModuleId::LodCull => &[("cull_lod", Stage::Compute)],
         }
     }
 
@@ -160,7 +187,10 @@ impl ShaderModuleId {
     /// Lowest GL version the module must translate to (checked by naga tests).
     pub const fn min_gl(self) -> (u8, u8) {
         match self {
-            ShaderModuleId::VoxelPull | ShaderModuleId::Cull => (4, 3),
+            ShaderModuleId::VoxelPull
+            | ShaderModuleId::Cull
+            | ShaderModuleId::LodPull
+            | ShaderModuleId::LodCull => (4, 3),
             ShaderModuleId::VoxelInstanced
             | ShaderModuleId::Blit
             | ShaderModuleId::Overlay

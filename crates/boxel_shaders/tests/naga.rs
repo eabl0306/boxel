@@ -821,3 +821,82 @@ fn lod_bits_match_the_mirror_and_boxel_mesh() {
         (0b1010_0101, 4, true)
     );
 }
+
+/// The GPU-driven far LOD of High (`lod_pull.wgsl`, `lod_cull.wgsl`): the node table and its bits
+/// as the Rust mirror has them, the cull's segments within one indirect list and its index
+/// counts within the shared index buffer, the geometry in its own group (group 2 stays the main
+/// geometry), and the pulled vertex the same function as the instanced one.
+#[test]
+fn lod_gpu_path_matches_its_mirrors() {
+    use boxel_shaders::gpu::{LodNodeGpu, bindings, lod as b};
+    use std::mem::offset_of;
+    let (pull, pull_info) = load(ShaderModuleId::LodPull);
+    let (cull, _) = load(ShaderModuleId::LodCull);
+    assert!(!ShaderModuleId::LodPull.uses_immediates());
+    assert!(!ShaderModuleId::LodCull.uses_immediates());
+    let rust = vec![
+        offset_of!(LodNodeGpu, node) as u32,
+        offset_of!(LodNodeGpu, quad_base) as u32,
+        offset_of!(LodNodeGpu, counts) as u32,
+    ];
+    for module in [&pull, &cull] {
+        assert_eq!(
+            struct_layout(module, "LodNodeGpu"),
+            (size_of::<LodNodeGpu>() as u32, rust.clone())
+        );
+    }
+    for (name, v) in [
+        ("LOD_LEVEL_MASK", b::LEVEL_MASK),
+        ("LOD_HIDDEN_MASK", 0xFF),
+        ("LOD_LIVE_BIT", b::LIVE_BIT),
+        ("LOD_SEGMENT_SLOTS", b::SEGMENT_SLOTS),
+        ("LOD_SEGMENT_DRAWS", b::SEGMENT_DRAWS),
+        ("MAX_QUADS_PER_BUCKET", boxel_mesh::MAX_QUADS_PER_BUCKET),
+    ] {
+        assert_eq!(const_u32(&cull, name), v, "{name}");
+    }
+    // The live bit is none of the bits the vertex shader reads.
+    assert_eq!(
+        b::LIVE_BIT & (0xFF | b::MIP_MASK << b::MIP_SHIFT | b::TINT_BIT),
+        0
+    );
+    let ep = cull
+        .entry_points
+        .iter()
+        .find(|e| e.name == "cull_lod")
+        .expect("cull_lod");
+    assert_eq!(ep.workgroup_size, [b::CULL_WORKGROUP_SIZE, 1, 1]);
+    // vs_lod_pull reads the View (group 1) and the LOD geometry (its own group), nothing else.
+    let i = pull
+        .entry_points
+        .iter()
+        .position(|e| e.name == "vs_lod_pull")
+        .expect("vs_lod_pull");
+    let mut groups: Vec<(u32, u32)> = pull
+        .global_variables
+        .iter()
+        .filter(|(h, _)| !pull_info.get_entry_point(i)[*h].is_empty())
+        .filter_map(|(_, g)| g.binding.as_ref().map(|r| (r.group, r.binding)))
+        .collect();
+    groups.sort_unstable();
+    assert_eq!(
+        groups,
+        [
+            (bindings::GROUP_VIEW, 0),
+            (b::GROUP_GEOMETRY, 0),
+            (b::GROUP_GEOMETRY, 1)
+        ]
+    );
+    // The table entry packs as the shaders read it.
+    let imm = LodImmediate::new([-1 << 10, 64, 1 << 30], 5, 0x0F, 4, false);
+    let node = LodNodeGpu::new(imm, 1234, [1, 2, 3, 4, 5, 16384], true);
+    assert_eq!(node.node[0], imm.node[0]);
+    assert_eq!(node.node[3] as u32, imm.node[3] as u32 | b::LIVE_BIT);
+    assert_eq!(node.quad_base, 1234);
+    let unpacked: Vec<u32> = (0..6)
+        .map(|f| (node.counts[f >> 1] >> ((f & 1) * 16)) & 0xFFFF)
+        .collect();
+    assert_eq!(unpacked, [1, 2, 3, 4, 5, 16384]);
+    let dead = LodNodeGpu::new(imm, 0, [0; 6], false);
+    assert_eq!(dead.node[3] as u32 & b::LIVE_BIT, 0);
+}

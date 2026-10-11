@@ -215,7 +215,45 @@ impl LodImmediate {
     }
 }
 
-/// Bits of [`LodImmediate`] (mirrored by `lod.wgsl`).
+/// One node of the far LOD's node table on High (`lod_pull.wgsl`, `lod_cull.wgsl`, ADR 0031): the
+/// node as [`LodImmediate`] has it (plus [`lod::LIVE_BIT`]), its first quad in the LOD arena and
+/// its 6 face bucket counts, two per word (bucket `2i` in the low 16 bits of `counts[i]`). 32
+/// bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+pub struct LodNodeGpu {
+    /// See [`LodImmediate::node`]; w also has [`lod::LIVE_BIT`] when the cull may draw it.
+    pub node: [i32; 4],
+    /// First quad of face bucket 0 in the LOD arena (the buckets follow in order).
+    pub quad_base: u32,
+    /// Face bucket quads, two per word: bucket `2i` in bits 0-15 of word `i`, `2i + 1` in bits
+    /// 16-31 (a face bucket has at most `boxel_mesh::MAX_QUADS_PER_FACE_BUCKET` quads).
+    pub counts: [u32; 3],
+}
+
+impl LodNodeGpu {
+    /// The table entry of a node drawn as `immediate`, its quads from `quad_base` with `faces`
+    /// quads per face bucket (each below 2^16), live (the cull may draw it) if `live`.
+    pub fn new(immediate: LodImmediate, quad_base: u32, faces: [u32; 6], live: bool) -> Self {
+        debug_assert!(
+            faces.iter().all(|&n| n <= 0xFFFF),
+            "a face bucket over 2^16"
+        );
+        let mut node = immediate.node;
+        if live {
+            node[3] |= lod::LIVE_BIT as i32;
+        }
+        let pair = |i: usize| (faces[2 * i] & 0xFFFF) | (faces[2 * i + 1] & 0xFFFF) << 16;
+        Self {
+            node,
+            quad_base,
+            counts: [pair(0), pair(1), pair(2)],
+        }
+    }
+}
+
+/// Bits of [`LodImmediate`] and [`LodNodeGpu`] (mirrored by `lod_common.wgsl` and
+/// `lod_cull.wgsl`).
 pub mod lod {
     /// The level in the low bits of the origin's x.
     pub const LEVEL_MASK: u32 = 15;
@@ -230,7 +268,25 @@ pub mod lod {
     pub const OCTANT_SHIFTS: [u32; 3] = [4, 9, 14];
     /// Immediate bytes of the LOD pipeline.
     pub const IMMEDIATE_SIZE: u32 = 16;
+    /// Word w of a [`super::LodNodeGpu`]: the High cull may draw the node (its quads are in the
+    /// arena and it lies inside the GPU window).
+    pub const LIVE_BIT: u32 = 1 << 14;
+    /// Node slots per segment of the High draw lists: slot `s` writes into list
+    /// `s / SEGMENT_SLOTS`, one draw per face bucket at most.
+    pub const SEGMENT_SLOTS: u32 = 10922;
+    /// Draws one segment's list holds: 6 per slot, within
+    /// [`super::bindings::MAX_DRAWS_PER_LIST`], so a list never overflows.
+    pub const SEGMENT_DRAWS: u32 = 6 * SEGMENT_SLOTS;
+    /// Group of the LOD geometry in `lod_pull.wgsl` (LOD arena at binding 0, node table at
+    /// binding 1). Group 2 stays the main geometry, which the translucent buckets drawn after
+    /// the LOD still use on High.
+    pub const GROUP_GEOMETRY: u32 = 3;
+    /// Workgroup size of `cull_lod`.
+    pub const CULL_WORKGROUP_SIZE: u32 = 64;
 }
+
+const _: () = assert!(lod::SEGMENT_DRAWS <= bindings::MAX_DRAWS_PER_LIST);
+const _: () = assert!(size_of::<LodNodeGpu>() == 32);
 
 /// Matches `wgpu::util::DrawIndexedIndirectArgs` and WGSL `DrawArgs` (20 bytes, tightly packed).
 #[repr(C)]

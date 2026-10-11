@@ -19,7 +19,7 @@
 mod pass;
 mod plugin;
 
-pub(crate) use pass::LodPass;
+pub(crate) use pass::{GpuInputs, LodPass};
 pub use plugin::LodPlugin;
 pub(crate) use plugin::{LodRenderer, lod_far};
 

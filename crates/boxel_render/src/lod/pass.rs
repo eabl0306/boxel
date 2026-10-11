@@ -1,25 +1,38 @@
-//! The LOD pass: the far LOD's own arena, its node records, the CPU cull and the draws.
+//! The LOD pass: the far LOD's own arena, its node records, the cull and the draws.
 //!
 //! Every node is one allocation of its face buckets in the LOD arena (a `VERTEX | COPY_DST`
-//! buffer, sub-allocated like the main arena), so LOD can never take room from full detail. Its
-//! quads reach the GPU at the start of the next frame drawn (one staging buffer per frame, one
-//! copy per node), at most [`UPLOAD_FRAMES`] frames of the world side's sends a frame: after
-//! frames that were not drawn (a hidden window) the backlog goes up over a few frames, not in
-//! one hitch. A node is drawn only once its quads are up; uploads that could not be recorded (no
-//! staging buffer: out of memory) wait for the next frame. Each frame the nodes inside the
-//! frustum (the node box, then the box-level back-face test of each face bucket, as `cull.wgsl`
-//! does for chunks) and with an octant left to draw become one instanced draw each:
-//! `draw(0..4, first..first + n)` over the arena, the node in the immediates
-//! ([`LodImmediate`]). Level 1 is drawn first, then the coarser ones (roughly front to
-//! back, for early-Z).
+//! buffer, `STORAGE` too on High, sub-allocated like the main arena), so LOD can never take room
+//! from full detail. Its quads reach the GPU at the start of the next frame drawn (one staging
+//! buffer per frame, one copy per node), at most [`UPLOAD_FRAMES`] frames of the world side's
+//! sends a frame: after frames that were not drawn (a hidden window) the backlog goes up over a
+//! few frames, not in one hitch. A node is drawn only once its quads are up; uploads that could
+//! not be recorded (no staging buffer: out of memory) wait for the next frame.
+//!
+//! Two ways to draw, with the same vertex and fragment functions (`lod_common.wgsl`), so the same
+//! pixels:
+//! - Mid and Low (M1): each frame the CPU keeps the nodes inside the frustum (the node box, then
+//!   the box-level back-face test of each face bucket, as `cull.wgsl` does for chunks) with an
+//!   octant left to draw, one instanced draw each: `draw(0..4, first..first + n)` over the
+//!   arena, the node in the immediates ([`LodImmediate`]). Level 1 is drawn first, then the
+//!   coarser ones (roughly front to back, for early-Z).
+//! - High (M3, GPU-driven): the nodes live in a GPU table ([`LodNodeGpu`], only the entries that
+//!   changed are written), `lod_cull.wgsl` keeps the face buckets that can face the camera of the
+//!   nodes inside the frustum and writes them into indirect lists, one per segment of
+//!   [`bits::SEGMENT_SLOTS`] slots, and each list is one `multi_draw_indexed_indirect_count`
+//!   with vertex pulling (`lod_pull.wgsl`) and the main path's shared quad index buffer. No
+//!   per-node CPU work, and only the buckets that can be seen go through the vertex stage.
+//!
+//! Underground ([`LodPass::prepare`]'s `sealed`: the cave culling search reached no chunk on the
+//! border of its box, so no line of sight leaves it) nothing is drawn.
 use super::{LodInput, LodReport, far};
 use crate::arena::{ArenaAlloc, ArenaAllocator, QUAD_BYTES};
+use crate::chunk_table::{GPU_WINDOW, GPU_WINDOW_SLACK};
 use crate::path::bucket_visible;
 use crate::renderer::ViewParams;
 use crate::{DEPTH_FORMAT, MAIN_COLOR_FORMAT};
 use boxel_math::{Aabb, I64Vec3, Vec3, wrap_to_i32};
-use boxel_mesh::ChunkMesh;
-use boxel_shaders::gpu::{LodImmediate, lod as bits};
+use boxel_mesh::{ChunkMesh, MAX_QUADS_PER_FACE_BUCKET};
+use boxel_shaders::gpu::{DrawIndexedIndirect, DrawRef, LodImmediate, LodNodeGpu, lod as bits};
 use boxel_shaders::{ShaderModuleId, create_module};
 use boxel_voxel::ChunkKey;
 use boxel_world::lod::LodOp;
@@ -79,9 +92,10 @@ pub(crate) struct LodPassStats {
     pub nodes: u32,
     /// Nodes with an octant left to draw (in view or not), last frame.
     pub drawn: u32,
-    /// Draw calls of the last frame (the drawn nodes inside the frustum).
+    /// Draw calls of the last frame: the drawn nodes inside the frustum (one instanced draw
+    /// each), or on High the indirect lists drawn (one per segment).
     pub draws: u32,
-    /// Quads of those draws.
+    /// Quads of those draws; on High (culled on the GPU) the quads of the drawn nodes.
     pub quads: u64,
     /// Node meshes refused (cumulative).
     pub refused: u32,
@@ -93,11 +107,22 @@ pub(crate) struct LodPassStats {
     pub arena_capacity: u32,
 }
 
+/// What the GPU-driven path of High needs from the renderer.
+pub(crate) struct GpuInputs {
+    /// The `View` uniform (the cull reads its frustum, render origin and eye).
+    pub view: wgpu::Buffer,
+    /// The main path's shared quad index buffer (`[0, 1, 2, 2, 1, 3] + 4q`): drawing the LOD
+    /// leaves it bound for the translucent buckets.
+    pub index: wgpu::Buffer,
+}
+
 /// The far LOD's arena, pipeline and nodes (module docs).
 pub(crate) struct LodPass {
     pipeline: wgpu::RenderPipeline,
     arena: wgpu::Buffer,
     nodes: LodNodes,
+    /// High: the GPU-driven path (module docs).
+    gpu: Option<GpuDriven>,
     /// The next staging buffer is created invalid (tests: [`LodPass::fail_next_upload`]).
     fail_next: bool,
     /// Uploads were lost since the last recorded one (logged once).
@@ -107,28 +132,41 @@ pub(crate) struct LodPass {
 impl LodPass {
     /// Builds the pipeline (layout `[materials, view]` and 16 bytes of immediates: the tier's own
     /// group 0 and 1 bind groups work with it) and an arena of `arena_quads` quads, cut to the
-    /// device's `max_buffer_size`. `color_mip` is the 1x1 mip level of the block textures. Call
-    /// it inside error scopes.
+    /// device's `max_buffer_size`. `color_mip` is the 1x1 mip level of the block textures. With
+    /// `gpu` (High) it draws through the GPU-driven path, its arena also cut to
+    /// `max_storage_buffer_binding_size`. Call it inside error scopes.
     pub fn new(
         device: &wgpu::Device,
         materials: &wgpu::BindGroupLayout,
         view: &wgpu::BindGroupLayout,
         arena_quads: u32,
         color_mip: u32,
+        gpu: Option<GpuInputs>,
     ) -> Self {
-        let quads = u64::from(arena_quads)
-            .min(device.limits().max_buffer_size / QUAD_BYTES)
-            .max(1) as u32;
+        let limits = device.limits();
+        let mut bytes = limits.max_buffer_size;
+        let mut usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST;
+        if gpu.is_some() {
+            bytes = bytes.min(limits.max_storage_buffer_binding_size);
+            usage |= wgpu::BufferUsages::STORAGE;
+        }
+        let quads = u64::from(arena_quads).min(bytes / QUAD_BYTES).max(1) as u32;
         let arena = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("boxel lod arena"),
             size: u64::from(quads) * QUAD_BYTES,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            usage,
             mapped_at_creation: false,
+        });
+        let mut nodes = LodNodes::new(quads, arena_quads, color_mip);
+        let gpu = gpu.map(|inputs| {
+            nodes.table = Some(GpuTable::default());
+            GpuDriven::new(device, materials, view, inputs)
         });
         Self {
             pipeline: pipeline(device, materials, view),
             arena,
-            nodes: LodNodes::new(quads, arena_quads, color_mip),
+            nodes,
+            gpu,
             fail_next: false,
             failing: false,
         }
@@ -143,6 +181,11 @@ impl LodPass {
     /// `LodSettings::arena_quads` the pass was built for.
     pub fn requested_quads(&self) -> u32 {
         self.nodes.requested_quads
+    }
+
+    /// True if it draws through the GPU-driven path (High).
+    pub fn gpu_driven(&self) -> bool {
+        self.gpu.is_some()
     }
 
     /// The horizon while the last input draws LOD.
@@ -174,13 +217,18 @@ impl LodPass {
     /// The frame's work before the main pass: the waiting quads copied into the arena (recorded
     /// into `encoder`: staging buffers of at most [`STAGING_BYTES`], one copy per node; at most
     /// the frame's upload budget, module docs), then the draw list for `view` (the renderer's
-    /// cull view, its far plane at the horizon). A batch whose staging buffer cannot be created
-    /// waits for the next frame, its nodes not drawn meanwhile.
+    /// cull view, its far plane at the horizon; the View uniform holds it on High): on the CPU,
+    /// or on High the changed node table entries (written with `queue`) and the cull (recorded).
+    /// A batch whose staging buffer cannot be created waits for the next frame, its nodes not
+    /// drawn meanwhile. With `sealed` (no line of sight leaves the cave culling box) nothing is
+    /// drawn.
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         view: &ViewParams,
+        sealed: bool,
     ) {
         let budget = self.nodes.upload_budget;
         for (batch, bytes) in self.nodes.take_uploads(STAGING_BYTES, budget) {
@@ -199,13 +247,31 @@ impl LodPass {
                 }
             }
         }
-        self.nodes.cull(view);
+        match &mut self.gpu {
+            None => self.nodes.cull(view, sealed),
+            Some(gpu) => {
+                let segments = self.nodes.gpu_frame(view.render_origin, sealed);
+                gpu.prepare(
+                    device,
+                    queue,
+                    encoder,
+                    &self.arena,
+                    &mut self.nodes,
+                    segments,
+                );
+            }
+        }
     }
 
     /// Records the frame's draws into the main pass (groups 0 and 1 are bound): the LOD pipeline,
-    /// vertex buffer 0 = the LOD arena, one instanced draw per node. Binds no group 2 and no index
-    /// buffer. Returns the draw calls recorded.
+    /// vertex buffer 0 = the LOD arena, one instanced draw per node; on High the pull pipeline,
+    /// its geometry in group [`bits::GROUP_GEOMETRY`], vertex buffer 0 = its draw refs, the
+    /// shared quad index buffer, one indirect draw per segment. Binds no group 2, and no index
+    /// buffer but the main path's own. Returns the draw calls recorded.
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) -> u32 {
+        if let Some(gpu) = &self.gpu {
+            return gpu.draw(pass);
+        }
         let draws = &self.nodes.draws;
         if draws.is_empty() {
             return 0;
@@ -256,6 +322,8 @@ struct LodNodes {
     tint: bool,
     draws: Vec<NodeDraw>,
     stats: LodPassStats,
+    /// High: the GPU node table's CPU side (which entries to write).
+    table: Option<GpuTable>,
 }
 
 impl LodNodes {
@@ -278,6 +346,7 @@ impl LodNodes {
             tint: false,
             draws: Vec::new(),
             stats: LodPassStats::default(),
+            table: None,
         }
     }
 
@@ -292,7 +361,10 @@ impl LodNodes {
     fn apply(&mut self, input: LodInput) {
         self.far = far(&input.settings, input.horizon);
         self.fade_start = input.settings.fade_start.clamp(0.0, 1.0);
-        self.tint = input.settings.debug_tint;
+        if self.tint != input.settings.debug_tint {
+            self.tint = input.settings.debug_tint;
+            self.touch_all();
+        }
         self.upload_budget =
             (input.settings.upload_bytes_per_frame as u64).saturating_mul(UPLOAD_FRAMES);
         if input.resync {
@@ -302,8 +374,11 @@ impl LodNodes {
             match op {
                 LodOp::Upsert { key, mesh, mask } => self.upsert(key, mesh, mask),
                 LodOp::Mask { key, mask } => {
-                    if let Some(node) = self.node_mut(key) {
+                    if let Some(&slot) = self.by_key.get(&key)
+                        && let Some(node) = self.slots[slot as usize].as_mut()
+                    {
                         node.mask = mask;
+                        self.touch(slot);
                     }
                 }
                 LodOp::Remove { key } => self.remove(key),
@@ -322,11 +397,6 @@ impl LodNodes {
         }
     }
 
-    fn node_mut(&mut self, key: ChunkKey) -> Option<&mut LodDraw> {
-        let slot = *self.by_key.get(&key)?;
-        self.slots[slot as usize].as_mut()
-    }
-
     fn upsert(&mut self, key: ChunkKey, mesh: Arc<ChunkMesh>, mask: u8) {
         let level = usize::from(key.lod);
         let origin = node_origin(key);
@@ -337,6 +407,12 @@ impl LodNodes {
             return;
         };
         let faces = face_counts(&mesh);
+        if faces.iter().any(|&n| n > MAX_QUADS_PER_FACE_BUCKET) {
+            tracing::error!("far LOD: {key:?} has a face bucket over the limit; refused");
+            self.remove(key);
+            self.refuse(key);
+            return;
+        }
         let quads: u32 = faces.iter().sum();
         if quads == 0 {
             self.remove(key);
@@ -361,6 +437,7 @@ impl LodNodes {
             node.mask = mask;
             node.pending = Some(mesh);
             self.pending.push(slot);
+            self.touch(slot);
             return;
         }
         let slot = self.free.pop().unwrap_or_else(|| {
@@ -380,6 +457,7 @@ impl LodNodes {
         });
         self.by_key.insert(key, slot);
         self.pending.push(slot);
+        self.touch(slot);
     }
 
     fn remove(&mut self, key: ChunkKey) {
@@ -398,6 +476,7 @@ impl LodNodes {
             m.at = node.at;
         }
         self.free.push(slot);
+        self.touch(slot);
     }
 
     fn refuse(&mut self, key: ChunkKey) {
@@ -426,6 +505,21 @@ impl LodNodes {
         self.pending.clear();
         self.alloc.reset();
         self.stats.nodes = 0;
+        self.touch_all();
+    }
+
+    /// The GPU table entry of `slot` changed (High).
+    fn touch(&mut self, slot: u32) {
+        if let Some(table) = &mut self.table {
+            table.touch(slot);
+        }
+    }
+
+    /// Every GPU table entry changed (High).
+    fn touch_all(&mut self) {
+        if let Some(table) = &mut self.table {
+            table.all = true;
+        }
     }
 }
 
@@ -489,6 +583,9 @@ impl LodNodes {
             }
             bytes += size;
             total += size;
+            if let Some(table) = &mut self.table {
+                table.touch(slot);
+            }
             batch.push(Upload {
                 slot,
                 mesh,
@@ -516,17 +613,33 @@ impl LodNodes {
             if node.pending.is_none() && node.alloc.offset == up.offset {
                 node.pending = Some(up.mesh);
                 self.pending.push(up.slot);
+                if let Some(table) = &mut self.table {
+                    table.touch(up.slot);
+                }
             }
         }
     }
 
-    /// The draw list for `view` (module docs). Empty while the last input does not draw LOD.
-    fn cull(&mut self, view: &ViewParams) {
+    /// The immediates (and the GPU table's node) of `node`.
+    fn immediate(&self, node: &LodDraw) -> LodImmediate {
+        let origin = wrap_to_i32(node.origin);
+        LodImmediate::new(
+            [origin.x, origin.y, origin.z],
+            node.key.lod,
+            node.mask,
+            self.color_mip,
+            self.tint,
+        )
+    }
+
+    /// The draw list for `view` (module docs). Empty while the last input does not draw LOD, or
+    /// `sealed`.
+    fn cull(&mut self, view: &ViewParams, sealed: bool) {
         self.draws.clear();
         self.stats.drawn = 0;
         self.stats.draws = 0;
         self.stats.quads = 0;
-        if self.far.is_none() {
+        if self.far.is_none() || sealed {
             return;
         }
         let (lo, hi) = (I64Vec3::splat(-WINDOW), I64Vec3::splat(WINDOW));
@@ -558,15 +671,8 @@ impl LodNodes {
                 if !seen {
                     continue;
                 }
-                let origin = wrap_to_i32(node.origin);
                 self.draws.push(NodeDraw {
-                    immediate: LodImmediate::new(
-                        [origin.x, origin.y, origin.z],
-                        node.key.lod,
-                        node.mask,
-                        self.color_mip,
-                        self.tint,
-                    ),
+                    immediate: self.immediate(node),
                     first: node.alloc.offset,
                     quads: node.alloc.size,
                 });
@@ -574,6 +680,152 @@ impl LodNodes {
             }
         }
         self.stats.draws = self.draws.len() as u32;
+    }
+
+    /// High: the frame's bookkeeping instead of [`LodNodes::cull`]. The GPU window follows
+    /// `render_origin` (every entry is written again when it moves), and the stats count the
+    /// drawn nodes and their quads (the GPU culls them). Returns the segments to draw, 0 while
+    /// the last input does not draw LOD, or `sealed`.
+    fn gpu_frame(&mut self, render_origin: I64Vec3, sealed: bool) -> u32 {
+        if let Some(table) = &mut self.table {
+            table.follow(render_origin);
+        }
+        self.draws.clear();
+        self.stats.drawn = 0;
+        self.stats.draws = 0;
+        self.stats.quads = 0;
+        if self.far.is_none() || sealed {
+            return 0;
+        }
+        for node in self.slots.iter().flatten() {
+            if node.mask != 0xFF && node.pending.is_none() {
+                self.stats.drawn += 1;
+                self.stats.quads += u64::from(node.alloc.size);
+            }
+        }
+        if self.stats.drawn == 0 {
+            return 0;
+        }
+        let segments = segments_for(self.slots.len());
+        self.stats.draws = segments;
+        segments
+    }
+
+    /// The GPU table entry of `slot`: live once its quads are up and while it lies inside the
+    /// GPU window; zeroed when free.
+    fn gpu_entry(&self, slot: u32, table: &GpuTable) -> LodNodeGpu {
+        let Some(node) = self.slots.get(slot as usize).and_then(Option::as_ref) else {
+            return LodNodeGpu::default();
+        };
+        let live = node.pending.is_none() && table.in_window(node.origin);
+        LodNodeGpu::new(self.immediate(node), node.alloc.offset, node.faces, live)
+    }
+
+    /// High: the table entries to write since the last call, as runs `(first slot, entries)`,
+    /// over `capacity` slots (a new table of that size gets every entry).
+    fn take_table_writes(&mut self, capacity: u32, fresh: bool) -> Vec<(u32, Vec<LodNodeGpu>)> {
+        let Some(mut table) = self.table.take() else {
+            return Vec::new();
+        };
+        let mut runs = Vec::new();
+        if fresh || table.all {
+            // Every entry the table may hold: the slots now and those dropped since (zeroed).
+            let end = (self.slots.len() as u32).max(table.written).min(capacity);
+            if end > 0 {
+                runs.push(0..end);
+            }
+            table.written = self.slots.len() as u32;
+        } else {
+            table.dirty.sort_unstable();
+            for &slot in &table.dirty {
+                if slot >= capacity {
+                    continue;
+                }
+                match runs.last_mut() {
+                    Some(run) if slot < run.end => {}
+                    Some(run) if slot - run.end <= TABLE_MERGE_GAP => run.end = slot + 1,
+                    _ => runs.push(slot..slot + 1),
+                }
+            }
+            table.written = table.written.max(self.slots.len() as u32);
+        }
+        table.clear();
+        let writes = runs
+            .into_iter()
+            .map(|run| {
+                let entries = run
+                    .clone()
+                    .map(|slot| self.gpu_entry(slot, &table))
+                    .collect();
+                (run.start, entries)
+            })
+            .collect();
+        self.table = Some(table);
+        writes
+    }
+}
+
+/// Free slots between two changed ones that still go in one write of the GPU table.
+const TABLE_MERGE_GAP: u32 = 16;
+
+/// The segments of the High draw lists `slots` slots need (at least 1).
+fn segments_for(slots: usize) -> u32 {
+    (slots.max(1) as u32).div_ceil(bits::SEGMENT_SLOTS)
+}
+
+/// The CPU side of the GPU node table (High): which entries changed, and the GPU window (the
+/// rule of `chunk_table`: only nodes whose wrapped origin difference is exact are live).
+#[derive(Debug, Default)]
+struct GpuTable {
+    /// Changed slots since the last write (each once).
+    dirty: Vec<u32>,
+    /// Bit per slot: in `dirty`.
+    dirty_bits: Vec<u64>,
+    /// Every entry changed (a cleared pass, a new tint, a moved window).
+    all: bool,
+    /// The window's center.
+    window: I64Vec3,
+    /// Slots the GPU table holds entries for (the high-water mark of the writes).
+    written: u32,
+}
+
+impl GpuTable {
+    fn touch(&mut self, slot: u32) {
+        let (word, bit) = (slot as usize / 64, 1u64 << (slot % 64));
+        if self.dirty_bits.len() <= word {
+            self.dirty_bits.resize(word + 1, 0);
+        }
+        if self.dirty_bits[word] & bit == 0 {
+            self.dirty_bits[word] |= bit;
+            self.dirty.push(slot);
+        }
+    }
+
+    fn clear(&mut self) {
+        for &slot in &self.dirty {
+            self.dirty_bits[slot as usize / 64] = 0;
+        }
+        self.dirty.clear();
+        self.all = false;
+    }
+
+    fn in_window(&self, origin: I64Vec3) -> bool {
+        let c = self.window;
+        origin.x.abs_diff(c.x) < GPU_WINDOW
+            && origin.y.abs_diff(c.y) < GPU_WINDOW
+            && origin.z.abs_diff(c.z) < GPU_WINDOW
+    }
+
+    /// Re-centers the window on `render_origin` past the slack: every entry is written again.
+    fn follow(&mut self, render_origin: I64Vec3) {
+        let c = self.window;
+        if render_origin.x.abs_diff(c.x) > GPU_WINDOW_SLACK
+            || render_origin.y.abs_diff(c.y) > GPU_WINDOW_SLACK
+            || render_origin.z.abs_diff(c.z) > GPU_WINDOW_SLACK
+        {
+            self.window = render_origin;
+            self.all = true;
+        }
     }
 }
 
@@ -620,6 +872,266 @@ fn copy(
     Ok(())
 }
 
+/// Bytes of one indirect draw.
+const ARGS_BYTES: u64 = size_of::<DrawIndexedIndirect>() as u64;
+
+/// The GPU-driven path of High (module docs): the cull and pull pipelines and the lists.
+struct GpuDriven {
+    cull: wgpu::ComputePipeline,
+    cull_layout: wgpu::BindGroupLayout,
+    pull: wgpu::RenderPipeline,
+    geometry_layout: wgpu::BindGroupLayout,
+    inputs: GpuInputs,
+    /// Sized for some segments, rebuilt larger when the slots pass them.
+    lists: Option<GpuLists>,
+    /// Segments to draw this frame (0: none).
+    segments: u32,
+}
+
+/// The node table and the draw lists, for `segments` segments.
+struct GpuLists {
+    segments: u32,
+    table: wgpu::Buffer,
+    args: wgpu::Buffer,
+    refs: wgpu::Buffer,
+    /// One draw count per segment (cleared before every cull).
+    counts: wgpu::Buffer,
+    cull_group: wgpu::BindGroup,
+    /// Group [`bits::GROUP_GEOMETRY`] of the pull pipeline: the LOD arena and the table.
+    geometry: wgpu::BindGroup,
+}
+
+impl GpuDriven {
+    fn new(
+        device: &wgpu::Device,
+        materials: &wgpu::BindGroupLayout,
+        view: &wgpu::BindGroupLayout,
+        inputs: GpuInputs,
+    ) -> Self {
+        let storage = |binding, read_only| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let cull_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("boxel lod cull"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                storage(1, true),
+                storage(2, false),
+                storage(3, false),
+                storage(4, false),
+            ],
+        });
+        let module = create_module(device, ShaderModuleId::LodCull);
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(ShaderModuleId::LodCull.label()),
+            bind_group_layouts: &[Some(&cull_layout)],
+            immediate_size: 0,
+        });
+        let cull = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("boxel lod cull"),
+            layout: Some(&layout),
+            module: &module,
+            entry_point: Some("cull_lod"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        let vertex_storage = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let geometry_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("boxel lod geometry"),
+            entries: &[vertex_storage(0), vertex_storage(1)],
+        });
+        Self {
+            cull,
+            cull_layout,
+            pull: pull_pipeline(device, materials, view, &geometry_layout),
+            geometry_layout,
+            inputs,
+            lists: None,
+            segments: 0,
+        }
+    }
+
+    /// The lists for `segments` segments.
+    fn lists(&self, device: &wgpu::Device, arena: &wgpu::Buffer, segments: u32) -> GpuLists {
+        let buffer = |label, size: u64, usage| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        let slots = u64::from(segments * bits::SEGMENT_SLOTS);
+        let draws = u64::from(segments * bits::SEGMENT_DRAWS);
+        let table = buffer(
+            "boxel lod nodes",
+            slots * size_of::<LodNodeGpu>() as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        let args = buffer(
+            "boxel lod draw args",
+            draws * ARGS_BYTES,
+            wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::STORAGE,
+        );
+        let refs = buffer(
+            "boxel lod draw refs",
+            draws * size_of::<DrawRef>() as u64,
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
+        );
+        let counts = buffer(
+            "boxel lod draw counts",
+            4 * u64::from(segments),
+            wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST,
+        );
+        fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+            wgpu::BindGroupEntry {
+                binding,
+                resource: buffer.as_entire_binding(),
+            }
+        }
+        let cull_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("boxel lod cull"),
+            layout: &self.cull_layout,
+            entries: &[
+                entry(0, &self.inputs.view),
+                entry(1, &table),
+                entry(2, &args),
+                entry(3, &refs),
+                entry(4, &counts),
+            ],
+        });
+        let geometry = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("boxel lod geometry"),
+            layout: &self.geometry_layout,
+            entries: &[entry(0, arena), entry(1, &table)],
+        });
+        GpuLists {
+            segments,
+            table,
+            args,
+            refs,
+            counts,
+            cull_group,
+            geometry,
+        }
+    }
+
+    /// Writes the changed table entries and records the cull of `segments` segments (none: no
+    /// cull, nothing drawn).
+    fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        arena: &wgpu::Buffer,
+        nodes: &mut LodNodes,
+        segments: u32,
+    ) {
+        let needed = segments_for(nodes.slots.len());
+        let fresh = self.lists.as_ref().is_none_or(|l| l.segments < needed);
+        if fresh {
+            self.lists = Some(self.lists(device, arena, needed));
+        }
+        let Some(lists) = &self.lists else {
+            return;
+        };
+        let capacity = lists.segments * bits::SEGMENT_SLOTS;
+        for (first, entries) in nodes.take_table_writes(capacity, fresh) {
+            queue.write_buffer(
+                &lists.table,
+                u64::from(first) * size_of::<LodNodeGpu>() as u64,
+                bytemuck::cast_slice(&entries),
+            );
+        }
+        self.segments = segments.min(lists.segments);
+        if self.segments == 0 {
+            return;
+        }
+        encoder.clear_buffer(&lists.counts, 0, None);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("boxel lod cull"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.cull);
+        pass.set_bind_group(0, &lists.cull_group, &[]);
+        let slots = (nodes.slots.len() as u32).min(capacity);
+        pass.dispatch_workgroups(slots.div_ceil(bits::CULL_WORKGROUP_SIZE), 1, 1);
+    }
+
+    /// See [`LodPass::draw`].
+    fn draw(&self, pass: &mut wgpu::RenderPass<'_>) -> u32 {
+        let Some(lists) = self.lists.as_ref().filter(|_| self.segments > 0) else {
+            return 0;
+        };
+        pass.set_pipeline(&self.pull);
+        pass.set_bind_group(bits::GROUP_GEOMETRY, &lists.geometry, &[]);
+        pass.set_vertex_buffer(0, lists.refs.slice(..));
+        pass.set_index_buffer(self.inputs.index.slice(..), wgpu::IndexFormat::Uint32);
+        for segment in 0..self.segments {
+            pass.multi_draw_indexed_indirect_count(
+                &lists.args,
+                u64::from(segment * bits::SEGMENT_DRAWS) * ARGS_BYTES,
+                &lists.counts,
+                4 * u64::from(segment),
+                bits::SEGMENT_DRAWS,
+            );
+        }
+        self.segments
+    }
+}
+
+/// The pull pipeline of High: `vs_lod_pull` and `fs_lod` (module `LodPull`), layout
+/// `[materials, view, -, lod geometry]`, the `DrawRef` as one instance-step `Uint32x2` attribute,
+/// indexed triangle lists; otherwise the state of [`pipeline`].
+fn pull_pipeline(
+    device: &wgpu::Device,
+    materials: &wgpu::BindGroupLayout,
+    view: &wgpu::BindGroupLayout,
+    geometry: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let module = create_module(device, ShaderModuleId::LodPull);
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(ShaderModuleId::LodPull.label()),
+        bind_group_layouts: &[Some(materials), Some(view), None, Some(geometry)],
+        immediate_size: 0,
+    });
+    render_pipeline(
+        device,
+        &layout,
+        &module,
+        "vs_lod_pull",
+        size_of::<DrawRef>() as u64,
+        wgpu::PrimitiveTopology::TriangleList,
+    )
+}
+
 /// The LOD pipeline: `vs_lod` and `fs_lod` (module `Lod`), layout `[materials, view]` and 16
 /// bytes of immediates, the quad as one instance-step `Uint32x2` attribute, triangle strips,
 /// back faces culled, depth `Greater` with writes, no blending.
@@ -634,6 +1146,27 @@ fn pipeline(
         bind_group_layouts: &[Some(materials), Some(view)],
         immediate_size: bits::IMMEDIATE_SIZE,
     });
+    render_pipeline(
+        device,
+        &layout,
+        &module,
+        "vs_lod",
+        QUAD_BYTES,
+        wgpu::PrimitiveTopology::TriangleStrip,
+    )
+}
+
+/// A LOD render pipeline: vertex entry `entry` with one instance-step `Uint32x2` attribute of
+/// `stride` bytes, `fs_lod`, `topology`, back faces culled, depth `Greater` with writes, no
+/// blending.
+fn render_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    module: &wgpu::ShaderModule,
+    entry: &str,
+    stride: u64,
+    topology: wgpu::PrimitiveTopology,
+) -> wgpu::RenderPipeline {
     let attributes = [wgpu::VertexAttribute {
         format: wgpu::VertexFormat::Uint32x2,
         offset: 0,
@@ -641,19 +1174,19 @@ fn pipeline(
     }];
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("boxel lod"),
-        layout: Some(&layout),
+        layout: Some(layout),
         vertex: wgpu::VertexState {
-            module: &module,
-            entry_point: Some("vs_lod"),
+            module,
+            entry_point: Some(entry),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             buffers: &[Some(wgpu::VertexBufferLayout {
-                array_stride: QUAD_BYTES,
+                array_stride: stride,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &attributes,
             })],
         },
         primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            topology,
             strip_index_format: None,
             front_face: wgpu::FrontFace::Ccw,
             cull_mode: Some(wgpu::Face::Back),
@@ -670,7 +1203,7 @@ fn pipeline(
         }),
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
-            module: &module,
+            module,
             entry_point: Some("fs_lod"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[Some(wgpu::ColorTargetState {
@@ -847,7 +1380,7 @@ mod tests {
             let batches = nodes.take_uploads(STAGING_BYTES, nodes.upload_budget);
             let quads: u32 = batches.iter().flat_map(|(b, _)| b).map(|u| u.quads).sum();
             assert_eq!(quads, up, "a frame's uploads");
-            nodes.cull(&view);
+            nodes.cull(&view, false);
             assert_eq!(nodes.draws.len(), drawn, "the nodes up are drawn");
         }
         assert!(
@@ -887,12 +1420,12 @@ mod tests {
         for (batch, _) in lost {
             nodes.restore(batch);
         }
-        nodes.cull(&view);
+        nodes.cull(&view, false);
         assert!(nodes.draws.is_empty(), "nothing is up yet");
         let again = nodes.take_uploads(STAGING_BYTES, u64::MAX);
         let quads: Vec<u32> = again.iter().flat_map(|(b, _)| b).map(|u| u.quads).collect();
         assert_eq!(quads, [7, 4], "c's new mesh, a again; b is gone");
-        nodes.cull(&view);
+        nodes.cull(&view, false);
         assert_eq!(nodes.draws.len(), 2);
         check(&nodes);
     }
@@ -970,7 +1503,7 @@ mod tests {
             upsert(far_away, mesh([1; 6]), 0),
         ]));
         nodes.take_uploads(STAGING_BYTES, u64::MAX);
-        nodes.cull(&view);
+        nodes.cull(&view, false);
         let drawn: Vec<(i32, u32)> = nodes
             .draws
             .iter()
@@ -990,7 +1523,7 @@ mod tests {
         let mut off = input(Vec::new());
         off.settings.enabled = false;
         nodes.apply(off);
-        nodes.cull(&view);
+        nodes.cull(&view, false);
         assert!(nodes.draws.is_empty());
         assert_eq!(
             nodes.stats,
@@ -1002,7 +1535,7 @@ mod tests {
             }
         );
         nodes.apply(LodInput::new(LodSettings::default(), None));
-        nodes.cull(&view);
+        nodes.cull(&view, false);
         assert!(nodes.draws.is_empty());
         assert_eq!(nodes.fog_params(), None);
         // The tint, and the fog from fade_start of the horizon to it.
@@ -1010,7 +1543,7 @@ mod tests {
         tinted.settings.debug_tint = true;
         tinted.settings.fade_start = 0.25;
         nodes.apply(tinted);
-        nodes.cull(&view);
+        nodes.cull(&view, false);
         assert!(
             nodes
                 .draws
@@ -1036,9 +1569,156 @@ mod tests {
                 upsert(k(1, 3, 3), mesh([1; 6]), 0),
             ]));
             nodes.take_uploads(STAGING_BYTES, u64::MAX);
-            nodes.cull(&view);
+            nodes.cull(&view, false);
             let drawn: Vec<u32> = nodes.draws.iter().map(|d| d.quads).collect();
             assert_eq!(drawn, [6, 12], "shift {shift}");
         }
+    }
+
+    /// Underground (`sealed`: the cave culling search leaves no line of sight out of its box)
+    /// nothing is drawn, on both paths.
+    #[test]
+    fn a_sealed_search_draws_nothing() {
+        let view = camera_view(DVec3::new(0.0, 100.0, 0.0), 0.0, -0.3);
+        for gpu in [false, true] {
+            let mut nodes = LodNodes::new(1 << 12, 1 << 12, 4);
+            if gpu {
+                nodes.table = Some(GpuTable::default());
+            }
+            nodes.apply(input(vec![upsert(key(1, 0, 0, -3), mesh([3; 6]), 0)]));
+            nodes.take_uploads(STAGING_BYTES, u64::MAX);
+            let frame = |nodes: &mut LodNodes, sealed| {
+                if gpu {
+                    nodes.gpu_frame(view.render_origin, sealed)
+                } else {
+                    nodes.cull(&view, sealed);
+                    nodes.draws.len() as u32
+                }
+            };
+            assert_eq!(frame(&mut nodes, false), 1, "gpu {gpu}");
+            assert_eq!(nodes.stats.quads, 18);
+            assert_eq!(frame(&mut nodes, true), 0, "gpu {gpu}");
+            assert_eq!((nodes.stats.draws, nodes.stats.quads), (0, 0));
+        }
+    }
+
+    /// The GPU table (High): each changed entry is written once, in runs; a node is live only
+    /// once its quads are up and inside the GPU window; a removed node's entry is zeroed; a new
+    /// tint, a cleared pass or a moved window write every entry; a fresh table gets them all.
+    #[test]
+    fn the_gpu_table_writes_what_changed() {
+        let mut nodes = LodNodes::new(1 << 12, 1 << 12, 4);
+        nodes.table = Some(GpuTable::default());
+        let (a, b, c) = (key(1, 0, 0, -3), key(2, 1, 0, -2), key(1, 5, 0, 5));
+        nodes.apply(input(vec![
+            upsert(a, mesh([1, 2, 3, 0, 0, 4]), 0),
+            upsert(b, mesh([5; 6]), 0b11),
+            upsert(c, mesh([1; 6]), 0),
+        ]));
+        let writes = nodes.take_table_writes(64, true);
+        assert_eq!(writes.len(), 1);
+        let (first, entries) = &writes[0];
+        assert_eq!((*first, entries.len()), (0, 3));
+        // Not up yet: nothing is live.
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.node[3] as u32 & bits::LIVE_BIT == 0)
+        );
+        assert!(
+            nodes.take_table_writes(64, false).is_empty(),
+            "written once"
+        );
+        nodes.take_uploads(STAGING_BYTES, u64::MAX);
+        let writes = nodes.take_table_writes(64, false);
+        let entries: Vec<LodNodeGpu> = writes.iter().flat_map(|(_, e)| e.clone()).collect();
+        assert_eq!(entries.len(), 3);
+        let sa = nodes.by_key[&a];
+        let ea = entries[sa as usize];
+        let node = nodes.slots[sa as usize].as_ref().expect("a");
+        assert_eq!(
+            ea,
+            LodNodeGpu::new(
+                nodes.immediate(node),
+                node.alloc.offset,
+                [1, 2, 3, 0, 0, 4],
+                true
+            )
+        );
+        // A mask and a removal: those two entries, the removed one zeroed.
+        let (sb, sc) = (nodes.by_key[&b], nodes.by_key[&c]);
+        nodes.apply(input(vec![
+            LodOp::Mask { key: b, mask: 0xFF },
+            LodOp::Remove { key: c },
+        ]));
+        let writes = nodes.take_table_writes(64, false);
+        let mut written: Vec<(u32, LodNodeGpu)> = writes
+            .iter()
+            .flat_map(|(first, e)| {
+                e.iter()
+                    .enumerate()
+                    .map(move |(i, e)| (first + i as u32, *e))
+            })
+            .collect();
+        written.sort_by_key(|(slot, _)| *slot);
+        let slots: Vec<u32> = written.iter().map(|(slot, _)| *slot).collect();
+        let mut want = vec![sb, sc];
+        want.sort_unstable();
+        assert_eq!(slots, want);
+        let entry = |slot| written.iter().find(|(s, _)| *s == slot).expect("written").1;
+        assert_eq!(entry(sc), LodNodeGpu::default());
+        assert_eq!(entry(sb).node[3] as u32 & 0xFF, 0xFF);
+        // The segments to draw: none while every node is hidden or the input does not draw.
+        let origin = I64Vec3::ZERO;
+        assert_eq!(nodes.gpu_frame(origin, false), 1);
+        assert_eq!((nodes.stats.drawn, nodes.stats.quads), (1, 10));
+        nodes.apply(input(vec![LodOp::Mask { key: a, mask: 0xFF }]));
+        assert_eq!(nodes.gpu_frame(origin, false), 0);
+        // A new tint writes every entry; so does a window that moves.
+        let mut tinted = input(Vec::new());
+        tinted.settings.debug_tint = true;
+        nodes.apply(tinted.clone());
+        let n: usize = nodes
+            .take_table_writes(64, false)
+            .iter()
+            .map(|(_, e)| e.len())
+            .sum();
+        assert_eq!(n, 3, "every slot, the free one zeroed");
+        nodes.apply(tinted);
+        assert!(nodes.take_table_writes(64, false).is_empty());
+        let far = I64Vec3::new(1 << 40, 0, 0);
+        nodes.gpu_frame(far, false);
+        let writes = nodes.take_table_writes(64, false);
+        assert_eq!(writes.iter().map(|(_, e)| e.len()).sum::<usize>(), 3);
+        // The nodes near the origin are outside the window around 2^40: not live.
+        assert!(
+            writes
+                .iter()
+                .flat_map(|(_, e)| e)
+                .all(|e| e.node[3] as u32 & bits::LIVE_BIT == 0)
+        );
+        // A resync drops every node: their entries are zeroed.
+        nodes.apply(LodInput {
+            resync: true,
+            ..input(Vec::new())
+        });
+        let writes = nodes.take_table_writes(64, false);
+        assert!(
+            writes
+                .iter()
+                .flat_map(|(_, e)| e)
+                .all(|e| *e == LodNodeGpu::default())
+        );
+        assert_eq!(writes.iter().map(|(_, e)| e.len()).sum::<usize>(), 3);
+    }
+
+    #[test]
+    fn segments_cover_every_slot() {
+        assert_eq!(segments_for(0), 1);
+        assert_eq!(segments_for(1), 1);
+        let per = bits::SEGMENT_SLOTS as usize;
+        assert_eq!(segments_for(per), 1);
+        assert_eq!(segments_for(per + 1), 2);
+        assert_eq!(segments_for(MAX_LOD_NODES as usize), 7);
     }
 }

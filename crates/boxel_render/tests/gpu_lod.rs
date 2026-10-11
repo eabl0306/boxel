@@ -1634,3 +1634,149 @@ fn the_lod_moves_the_far_plane_and_keeps_the_fog_layers() {
     })
     .finish();
 }
+
+/// A flat floor of `count` level-1 nodes (one top quad each) in rows ahead of the camera: more
+/// than one segment of the High draw lists.
+fn floor_nodes(count: i64) -> Vec<(ChunkKey, Arc<ChunkMesh>)> {
+    let mut counts = [0; BUCKET_COUNT];
+    counts[0] = 1;
+    let top = boxel_mesh::PackedQuad::new([0, 31, 0], 32, 32, boxel_voxel::Face::PosY, 1);
+    let mesh = Arc::new(ChunkMesh::from_quads(vec![top], counts));
+    let row = 128;
+    (0..count)
+        .map(|i| {
+            let pos = ChunkPos::new(i % row - row / 2, -2, -(i / row) - 1);
+            let key = ChunkKey {
+                dim: DimensionId(0),
+                lod: 1,
+                pos,
+            };
+            (key, Arc::clone(&mesh))
+        })
+        .collect()
+}
+
+/// High draws the LOD GPU-driven (`lod_cull.wgsl`, `lod_pull.wgsl`): the same pixels as the
+/// instanced path of Mid and Low on the same device, for the scene, tinted, and for more nodes
+/// than one segment of its draw lists holds; it counts the same drawn nodes and quads.
+#[test]
+fn the_gpu_driven_path_draws_what_the_instanced_one_does() {
+    let chunks = full_detail();
+    let view = scene_view(I64Vec3::ZERO);
+    let many = floor_nodes(i64::from(boxel_shaders::gpu::lod::SEGMENT_SLOTS) + 3000);
+    for_every_tier(|gpu, report| {
+        if gpu.tier != Tier::High || gpu.gl() {
+            return;
+        }
+        let mut run = || -> Result<(), String> {
+            let mut shots = Vec::new();
+            for gpu_driven in [true, false] {
+                let mut renderer = new_renderer(gpu)?;
+                renderer.debug_set_lod_gpu_driven(gpu_driven);
+                load_world(&mut renderer, &chunks, I64Vec3::ZERO)?;
+                renderer.set_lod(gpu.device, Some(lod_input(settings(1 << 20), lod_nodes())));
+                let scene = render(gpu, &mut renderer, &view)?;
+                if renderer.debug_lod_gpu_driven() != gpu_driven {
+                    return Err(format!("not drawn the way asked ({gpu_driven})"));
+                }
+                let stats = renderer.stats();
+                let mut tinted = settings(1 << 20);
+                tinted.debug_tint = true;
+                renderer.set_lod(gpu.device, Some(LodInput::new(tinted, Some(HORIZON))));
+                let tint = render(gpu, &mut renderer, &view)?;
+                let mut big = new_renderer(gpu)?;
+                big.debug_set_lod_gpu_driven(gpu_driven);
+                big.set_lod(gpu.device, Some(lod_input(settings(1 << 20), &many)));
+                let floor = render(gpu, &mut big, &view)?;
+                let big_stats = big.stats();
+                shots.push((gpu_driven, [scene, tint, floor], stats, big_stats));
+            }
+            let (gpu_shots, cpu_shots) = (&shots[0], &shots[1]);
+            for (what, (a, b)) in ["scene", "tint", "floor"]
+                .iter()
+                .zip(gpu_shots.1.iter().zip(&cpu_shots.1))
+            {
+                report.check_close(
+                    &format!("{} High: {what}: GPU-driven vs instanced", gpu.label),
+                    (&gpu.name(&format!("{what}_instanced")), b),
+                    (&gpu.name(&format!("{what}_gpu_driven")), a),
+                    2,
+                    MAX_TIER_DIFF,
+                );
+            }
+            if cpu_shots.1[2].compare(&cpu_shots.1[0], 2).fraction() < 0.05 {
+                return Err("the floor of nodes does not show".into());
+            }
+            for (g, c) in [(gpu_shots.2, cpu_shots.2), (gpu_shots.3, cpu_shots.3)] {
+                if g.lod_drawn != c.lod_drawn || g.lod_drawn == 0 || g.lod_nodes != c.lod_nodes {
+                    return Err(format!("drawn nodes: GPU-driven {g:?}, instanced {c:?}"));
+                }
+                // The GPU-driven path counts the drawn nodes' quads before its cull.
+                if g.lod_quads < c.lod_quads || g.lod_refused != 0 {
+                    return Err(format!("quads: GPU-driven {g:?}, instanced {c:?}"));
+                }
+            }
+            if gpu_shots.3.lod_draws != 2 {
+                return Err(format!("{} segments drawn, not 2", gpu_shots.3.lod_draws));
+            }
+            Ok(())
+        };
+        if let Err(e) = run() {
+            report.fail(format!("{} {}: {e}", gpu.label, gpu.tier), &[]);
+        }
+    })
+    .finish();
+}
+
+/// Underground (ADR 0031, M3): with a cave culling search that reaches no chunk on the border
+/// of its box, the LOD draws nothing, on every tier: the image is the one of a LOD with no
+/// node. With a search that does, the LOD shows.
+#[test]
+fn a_sealed_search_draws_no_lod() {
+    use boxel_voxel::ALL_LINKS;
+    use boxel_world::VisibilityView;
+    use boxel_world::visibility::visible_chunks;
+    let chunks = full_detail();
+    let view = scene_view(I64Vec3::ZERO);
+    let search = VisibilityView::new(view.render_origin, None, 2, 2);
+    let closed = Arc::new(visible_chunks(&search, |_| 0));
+    let open = Arc::new(visible_chunks(&search, |_| ALL_LINKS));
+    for_every_tier(|gpu, report| {
+        if gpu.gl() {
+            return;
+        }
+        let mut run = || -> Result<(), String> {
+            let mut shots = Vec::new();
+            for (set, nodes) in [
+                (&closed, lod_nodes()),
+                (&closed, &[][..]),
+                (&open, lod_nodes()),
+                (&open, &[][..]),
+            ] {
+                let mut renderer = new_renderer(gpu)?;
+                load_world(&mut renderer, &chunks, I64Vec3::ZERO)?;
+                renderer.set_visibility(Some(Arc::clone(set)));
+                renderer.set_lod(gpu.device, Some(lod_input(settings(1 << 20), nodes)));
+                // The first frame uploads; the second draws what is resident.
+                render(gpu, &mut renderer, &view)?;
+                shots.push((render(gpu, &mut renderer, &view)?, renderer.stats()));
+            }
+            report.check_identical(
+                &format!("{} {}: sealed", gpu.label, gpu.tier),
+                (&gpu.name("sealed_no_nodes"), &shots[1].0),
+                (&gpu.name("sealed"), &shots[0].0),
+            );
+            if shots[0].1.lod_draws != 0 {
+                return Err(format!("sealed: {:?}", shots[0].1));
+            }
+            if shots[2].1.lod_draws == 0 || shots[2].0.compare(&shots[3].0, 2).fraction() < 0.05 {
+                return Err(format!("open: the LOD does not show: {:?}", shots[2].1));
+            }
+            Ok(())
+        };
+        if let Err(e) = run() {
+            report.fail(format!("{} {}: {e}", gpu.label, gpu.tier), &[]);
+        }
+    })
+    .finish();
+}
