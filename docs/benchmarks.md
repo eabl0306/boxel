@@ -267,8 +267,9 @@ mezcla corridas con texturas distintas.
 `boxel_demo::fog`:
 
 - `empty`: el plugin sin capas. Mide solo lo que cuesta poder leer la profundidad.
-- `valley`: bancos de cubos de 2 bloques entre y 48 y 64, sobre el mar y las zonas bajas.
-- `clouds`: nubes volumétricas de cubos de 8 bloques entre y 192 y 224.
+- `valley`: bancos de cubos de 2 bloques entre y 46 y 70, sobre el mar y las zonas bajas, con
+  bordes desparejos.
+- `clouds`: nubes volumétricas de cubos de 8 bloques entre y 176 y 240, con bordes desparejos.
 - `both`: valle y nubes, el preset típico de un juego.
 - `inside`: un manto de y 0 a 256 con la cámara adentro y niebla suave cerca, el peor caso.
 - `sunset`: valle y nubes con más color del cielo.

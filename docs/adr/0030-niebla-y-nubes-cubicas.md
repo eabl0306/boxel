@@ -1,6 +1,7 @@
 # ADR 0030: niebla y nubes cúbicas, un plugin opcional
 
-- Estado: aceptado (issue #47), revisado el mismo día tras la primera prueba del dueño (al final)
+- Estado: aceptado (issue #47), revisado el mismo día tras la primera y la segunda prueba del
+  dueño (al final)
 - Fecha: 2026-10-10
 
 ## Contexto
@@ -77,7 +78,9 @@ Por cada capa, el rayo recorre sus celdas con un DDA (Amanatides y Woo) en `f32`
 cámara, hasta la profundidad opaca de sus píxeles. Las bandas de las capas no se solapan, así que
 ordenadas por altura se recorren de adelante hacia atrás. En cada celda:
 
-- la cobertura sale del ruido entero (sección 4) y la extinción es `densidad * cobertura`;
+- la cobertura sale del ruido entero (sección 4) y la extinción es `densidad * cobertura`. Cerca
+  del piso y del techo de la banda los bordes la afinan (sección 4), así que la capa no termina
+  en un plano;
 - la transmitancia baja `exp(-extinción * largo)`;
 - el color es el de la capa iluminada, por el brillo de su altura en la banda (`height_shade`,
   apagado por defecto), desvanecido hacia el color del cielo con la distancia.
@@ -98,10 +101,15 @@ Para no gastar de más:
 
 - sale antes cuando la profundidad óptica pasa de 6 (ya no se ve nada detrás);
 - tiene un tope de celdas por rayo (`max_steps`). Pasado el tope, el resto de cada capa usa su
-  densidad media, sin un muro visible donde se corta;
+  densidad media, sin un muro visible donde se corta. Cerca de los bordes esa media baja como
+  bajan las celdas (`MeanCoverage`, una tabla de la media con el umbral subido un cuarto, la
+  mitad y tres cuartos), así el resto no pinta una franja plana donde las celdas ya terminaron;
 - cruza de un paso un tramo entero de la grilla del ruido cuando sus esquinas no dejan cobertura
-  (la cota es conservadora: el ruido de valor nunca sale del rango de sus esquinas). En la niebla
-  suave no lo hace: lee puntos de hasta medio cubo fuera del tramo;
+  ni con el umbral más bajo de las filas del tramo (la cota es conservadora: el ruido de valor
+  nunca sale del rango de sus esquinas, y el umbral de las filas sale de la subida en la fila más
+  baja y del borde más débil, menos 1 por los saltos del smoothstep). Con bordes y subida salta
+  más tramos, nunca uno con cobertura. En la niebla suave no lo hace: lee puntos de hasta medio
+  cubo fuera del tramo;
 - toma de un paso una capa cuyas celdas están todas llenas.
 
 **Pasada 2, la composición.** Un triángulo a pantalla completa sobre el color principal, con
@@ -137,6 +145,17 @@ grilla en dos palabras de 32 bits (baja y alta) y la fracción del viento en 12 
   golpe.
 - **Perfil.** El umbral sube con el cuadrado de la altura en la banda (`threshold_rise`), por
   fila de celdas y en enteros. La base queda ancha y plana y los topes, finos y desparejos.
+- **Bordes.** `edge_bottom` y `edge_top`, en bloques (0, por defecto, corta en el plano como
+  antes). Dentro de un borde el umbral sube por el smoothstep entero hasta "nunca cubierto" en
+  el plano: `umbral + (4096 - umbral) * smooth(1 - d / borde)`. Cerca del plano solo se llenan
+  las celdas de ruido fuerte, así que cada columna termina a su propia altura: un perfil de
+  cubos desparejo en vez de un plano, y con suavidad se desvanece en vez de cortarse. Una fila
+  de celdas mide `d` desde su cara más cercana al plano, así que la fila pegada al plano siempre
+  queda vacía. La niebla suave lo mide en cada punto, medio cubo hacia adentro (como lee el
+  ruido), así que el medio de una celda tiene exactamente el borde de su fila y el último medio
+  cubo antes del plano no tiene niebla. Las cuentas son enteras por fila y, en la niebla suave,
+  en 1/4096 de bloque, iguales en la CPU y en los tres tiers; lejos del origen dan lo mismo
+  porque usan las filas de la banda relativas a la celda del origen.
 - **Viento.** El momento es `FogTime`: `tick` (`u64`, 64 por segundo) y `subtick`, la fracción
   del tick siguiente en 1/65536, nunca segundos en `f32`. `FogClock` toma `subtick` del sobrante
   del paso fijo en cada frame, así el viento se mueve en cada frame y no a saltos de 64 por
@@ -153,7 +172,8 @@ Cada `FogLayer` es un dato:
 - banda `[min_y, max_y)`, múltiplos del alto de celda, sin solaparse con otras capas;
 - celda `[x, y, z]` de 1 a 32 bloques (por ejemplo `[2, 2, 2]` o `[12, 4, 12]`);
 - ruido: escala (potencia de dos de 1 a 64), octavas, `Flat` o `Volume`, semilla;
-- umbral, cuánto sube hasta el tope de la banda y suavidad;
+- umbral, cuánto sube hasta el tope de la banda, bordes abajo y arriba (en bloques, hasta 1024) y
+  suavidad;
 - densidad por bloque (`density_for_visibility(V) = 3 / V`: se ve un 5 % a V bloques);
 - color, `sky_tint` (cuánto toma del color del cielo, el tono del atardecer), brillo por altura
   y sombreado por cara (los dos apagados por defecto);
@@ -171,10 +191,14 @@ app.add_plugins(FogPlugin::new(vec![boxel_demo::fog::valley(), boxel_demo::fog::
 Los presets del ejemplo están en `boxel_demo::fog`, todos suaves (sin caras, con rampa suave y
 niebla suave cerca):
 
-- `clouds()`: nubes volumétricas, cubos de 8 bloques entre y 192 y 224 con ruido 3D, umbral que
-  sube, base gris y tope claro;
-- `valley()`: bancos de cubos de 2 bloques entre 48 y 64, justo sobre el mar;
-- `blanket()`: un manto, el peor caso;
+- `clouds()`: nubes volumétricas, cubos de 8 bloques entre y 176 y 240 con ruido 3D (casi todas
+  entre 192 y 224), bordes de 20 abajo y 28 arriba, una subida suave del umbral, base gris y
+  tope claro;
+- `valley()`: bancos de cubos de 2 bloques entre 46 y 70, sobre el mar, más densos de 50 a 58,
+  con un borde de 12 arriba (la mitad de la banda) y de 4 abajo. La fila de 46 a 48 siempre
+  queda vacía, así que no hay niebla bajo la superficie del mar (47);
+- `blanket()`: un manto, el peor caso, con bordes de un cuarto de su alto arriba y un octavo
+  abajo (a lo sumo 16 y 4);
 - `sunset()`: valle y nubes con más color del cielo.
 
 ### 6. Valores por defecto y costo medido
@@ -232,8 +256,13 @@ juego):
   dos filas de celdas a cada lado se ven distintas desde donde termina la niebla suave hasta el
   horizonte: una línea recta en la imagen. Es el aspecto cúbico visto de canto; sin la niebla
   suave también estaba.
-- **Bordes de la banda.** La niebla suave no tiene bordes de celdas, pero el piso y el techo de la
-  banda siguen siendo planos nítidos.
+- **Desde la altura del tope.** Con el ojo a la altura del techo de una capa, toda la niebla
+  queda debajo del horizonte, y la lejana se acumula en una franja que llega casi al horizonte:
+  es la geometría de mirar una capa de canto. Los bordes la vuelven un degradé desparejo cerca y
+  el desvanecido la funde con el cielo lejos, pero no la borran.
+- **Bordes y celdas.** La fila pegada a un plano con borde siempre queda vacía, así que un borde
+  menor que una celda solo vacía esa fila y deja otro plano una fila más adentro. Los presets
+  usan bordes de 2 celdas o más.
 - **Profundidad muestreada.** Con el plugin, la profundidad principal se puede leer como textura.
   En algunas GPUs eso puede costar su compresión. Sin el plugin no cambia nada.
 
@@ -253,23 +282,33 @@ juego):
 
 - `boxel_fog`: tests unitarios y proptest. El ruido partido como lo ve la GPU contra la cuenta
   directa en `i128`, con orígenes cerca de 0, ±2^31, 2^40 y el límite del mundo, en puntos dentro
-  de las celdas, entre ticks y con umbral que sube; el viento como traslación exacta, también
-  medio tick; la cota de los tramos vacíos es conservadora; con umbral que sube, cada fila está
-  dentro de la de abajo; una capa suave no cambia la cobertura de una celda más de 1,6 % por
-  tick, y con suavidad 0 sí salta; invariantes del DDA; la marcha (exp(-σL) en una losa, salida
-  temprana, la cola del tope sin salto, sin caras por defecto, un sombreado por cuerpo si se
-  pide, brillo por altura, cámara adentro, corte en la profundidad, capas en los dos sentidos, la
-  niebla suave igual a la integral fina del ruido, idéntica a la cúbica pasada su mezcla, y el
-  medio de una celda lee su celda); el empaquetado; cada error de `validate`.
-- `boxel_demo`: ningún preset tiene caras, todos son suaves y ninguna celda cambia más de 1,6 %
-  por tick.
+  de las celdas, entre ticks, con umbral que sube y con bordes; el viento como traslación
+  exacta, también medio tick; la cota de los tramos vacíos es conservadora, también con subida y
+  bordes, y con ellos solo salta más; con umbral que sube, cada fila está dentro de la de abajo;
+  una capa suave no cambia la cobertura de una celda más de 1,6 % por tick, y con suavidad 0 sí
+  salta; invariantes del DDA; la marcha (exp(-σL) en una losa, salida temprana, la cola del tope
+  sin salto, sin caras por defecto, un sombreado por cuerpo si se pide, brillo por altura, cámara
+  adentro, corte en la profundidad, capas en los dos sentidos, la niebla suave igual a la
+  integral fina del ruido, idéntica a la cúbica pasada su mezcla, y el medio de una celda lee su
+  celda); el empaquetado; cada error de `validate`.
+- `boxel_fog/tests/edges.rs`: ninguna columna llega a un plano con borde (la fila pegada nunca
+  se cubre, el último medio cubo de la niebla suave tampoco, y un rayo dentro de ese medio cubo
+  no cruza niebla, cúbica o suave, con tope o sin él), lejos del origen también; el medio de una
+  fila tiene su borde bit a bit; las columnas terminan a muchas alturas y cada fila del borde es
+  más fina que la de abajo; saltar tramos con bordes no pierde niebla; la niebla suave con bordes
+  es la integral fina del ruido; la cola pasada el tope da en promedio lo mismo que las celdas
+  cerca del techo.
+- `boxel_demo`: ningún preset tiene caras, todos son suaves, ninguna celda cambia más de 1,6 %
+  por tick y ninguno termina en un plano (bordes de 2 celdas o más arriba y abajo, el de abajo
+  no más hondo que el de arriba, y un centro libre).
 - `boxel_shaders/tests/naga.rs`: `fog.wgsl` valida y traduce a GLSL 330, ES 300, 430 y ES 310,
   MSL, HLSL y SPIR-V; el layout del uniform coincide con los espejos de Rust; cada entry point
   liga lo que Low admite; las constantes del shader son las de `boxel_fog`.
 - `boxel_render/tests/gpu_fog.rs`, en cada tier de cada adaptador:
   - sin niebla, con `set_fog(None)`, apagada o fuera de alcance, la imagen es idéntica byte a
     byte y la profundidad no tiene `TEXTURE_BINDING`;
-  - el ruido de la GPU es el oráculo bit a bit, también lejos del origen, dentro de las celdas,
+  - el ruido de la GPU es el oráculo bit a bit, también lejos del origen, en las filas de los
+    bordes, en el peso del borde de la niebla suave a muchas alturas, dentro de las celdas,
     entre ticks y con umbral que sube;
   - cada tier dibuja la marcha de referencia (texel a texel y la composición) en nubes planas y
     volumétricas desde abajo, adentro y arriba, cámara adentro de un manto y de un banco suave,
