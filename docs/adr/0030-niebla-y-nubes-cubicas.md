@@ -221,7 +221,7 @@ segundo; el bosque vuela a 32. El harness repitió cada par y dio lo mismo.
 | RTX, bosque, sin tope | 3903 -> 1146 | 0.23 -> 0.78 | 0.68 -> 2.34 | 0 -> 0 |
 
 En la RTX la niebla cuesta ahora de 0,46 a 0,55 ms por frame en la mediana y ningún frame pasa de
-6,94 ms. Antes de los cambios (bac728d, nubes planas de una octava, sin niebla suave) costaba de
+6,94 ms. Con los bordes de la segunda prueba subió a 1,0 a 1,1 ms (al final). Antes de los cambios (bac728d, nubes planas de una octava, sin niebla suave) costaba de
 0,26 a 0,32 ms. Lo más probable es que la diferencia venga de las nubes: ruido 3D de dos octavas,
 casi sin tramos vacíos que saltar, y una banda de 32 bloques en vez de 4. Sobre bac728d la 780M
 pasaba de 550 a 359 fps sin tope (unos 0,8 ms en la mediana, de 9 a 12 frames lentos cada
@@ -311,8 +311,9 @@ juego):
     bordes, en el peso del borde de la niebla suave a muchas alturas, dentro de las celdas,
     entre ticks y con umbral que sube;
   - cada tier dibuja la marcha de referencia (texel a texel y la composición) en nubes planas y
-    volumétricas desde abajo, adentro y arriba, cámara adentro de un manto y de un banco suave,
-    un banco, el atardecer, una pileta con vidrio y postes finos;
+    volumétricas con bordes desde abajo, justo debajo, adentro y arriba, cámara adentro de un
+    manto y de un banco suave, un banco con bordes visto desde la altura de su techo, un banco,
+    el atardecer, una pileta con vidrio y postes finos;
   - orígenes de render a unos bloques de distancia dan la misma niebla, cúbica y suave;
   - una losa no tiene caras, salvo que la capa pida el sombreado de los vóxeles;
   - cambios de tamaño, de resolución y un renderer nuevo;
@@ -346,3 +347,42 @@ El dueño voló por la niebla y pidió cuatro cambios:
 4. **Nubes volumétricas.** Las nubes del ejemplo eran planas como las de Minecraft. Ahora tienen
    volumen: ruido 3D, una banda de 32 bloques, cubos de 8, umbral que sube (base plana, topes
    desparejos) y brillo por altura en vez de caras.
+
+## Cambios tras la segunda prueba (2026-10-10)
+
+El dueño volvió a volar por la niebla y vio dos cosas:
+
+1. **Bases de nube planas.** Con el umbral que sube, la fila de abajo era la más llena, así que
+   todas las nubes apoyaban su base en el mismo plano.
+2. **Techo plano.** Cada capa llenaba su banda hasta el piso y el techo y se cortaba ahí. Con el
+   ojo a la altura del techo se veía una franja blanca de borde recto, fuera cual fuera la
+   densidad.
+
+Lo que cambió:
+
+- **Bordes** (sección 4): `edge_bottom` y `edge_top`. Cerca de un plano solo se llenan las celdas
+  de ruido fuerte, así que cada columna termina a su propia altura. La fila pegada al plano
+  siempre queda vacía y la niebla suave se apaga medio cubo antes. El salto de tramos vacíos y
+  la cola pasada el tope los tienen en cuenta, así que tampoco ahí aparece un plano.
+- **Presets.** El valle va de 46 a 70 con bordes de 4 abajo y 12 arriba: más denso de 50 a 58 y
+  apoyado en el mar, sin niebla bajo el agua. Las nubes van de 176 a 240 con bordes de 20 y 28 y
+  una subida de 0,2: conservan su volumen y la base queda apenas más pareja que el tope. El
+  manto tiene bordes y el atardecer hereda los del valle y las nubes.
+- **Imágenes** en `bench-results/fog-look/` (fuera de git), con dos tomas nuevas: el ojo a la
+  altura del techo del valle y justo debajo de las nubes.
+
+**Costo.** `just perf-smoke` del 2026-10-10 sobre 7bb443e, como en la sección 6: el mismo
+binario sin niebla y con `--fog both`, RTX, radio 16, sin tope. El harness repitió cada par y
+dio lo mismo.
+
+| caso | fps | p50 ms | p99 ms | frames > 6.94 ms |
+|---|---:|---:|---:|---:|
+| RTX, superficie, sin tope | 2187 -> 620 | 0.41 -> 1.45 | 1.00 -> 4.36 | 0 -> 1 |
+| RTX, bosque, sin tope | 3868 -> 680 | 0.23 -> 1.35 | 0.70 -> 4.25 | 0 -> 0 |
+
+La niebla cuesta ahora de 1,0 a 1,1 ms por frame en la mediana, el doble que antes. Casi todo
+viene de las nubes: su banda pasó de 32 a 64 bloques y un rayo cruza el doble de celdas (en la
+marcha de referencia, de 7 a 13 pasos por rayo mirando al horizonte desde y 100). El valle, con
+la cámara adentro, pasó de 29 a 37. No se ajustó. Si hace falta, las perillas son del juego: una
+banda de nubes más baja (por ejemplo de 184 a 232 con bordes de 16 y 20) o cubos de nube más
+altos.
