@@ -194,6 +194,12 @@ pub struct RenderStats {
     pub lod_quads: u64,
     /// LOD node meshes refused because the LOD arena or its node table was full (cumulative).
     pub lod_refused: u32,
+    /// Quads copied into the LOD arena (cumulative).
+    pub lod_upload_quads: u64,
+    /// LOD arena quads in use.
+    pub lod_arena_used_quads: u32,
+    /// LOD arena size in quads: `LodSettings::arena_quads`, cut to the device's limits.
+    pub lod_arena_capacity_quads: u32,
 }
 
 /// Renderer errors.
@@ -1261,6 +1267,9 @@ impl VoxelRenderer {
             lod_draws: s.draws,
             lod_quads: s.quads,
             lod_refused: s.refused,
+            lod_upload_quads: s.uploaded_quads,
+            lod_arena_used_quads: s.arena_used,
+            lod_arena_capacity_quads: s.arena_capacity,
             ..stats
         }
     }

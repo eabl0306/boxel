@@ -103,6 +103,21 @@ IDLE_METRICS = [
     ('idle worst overrun ms', ('idle', 'overrun_max_ms'), -1),
 ]
 
+# The far LOD (runs with --lod, ADR 0031; compared when either run has them). Its uploads are
+# quads copied into the LOD arena (8 bytes each).
+LOD_METRICS = [
+    ('LOD time to fill s', ('run', 'lod_fill_s'), -1),
+    ('LOD draws avg', ('lod', 'draws', 'avg'), 0),
+    ('LOD quads drawn avg', ('lod', 'quads', 'avg'), 0),
+    ('LOD quads uploaded', ('lod', 'upload_quads'), 0),
+    ('LOD frames with uploads', ('lod', 'upload_frames'), 0),
+    ('LOD quads uploaded per frame p95', ('lod', 'upload_quads_per_frame', 'p95'), -1),
+    ('LOD quads uploaded per frame max', ('lod', 'upload_quads_per_frame', 'max'), -1),
+    ('LOD arena quads used', ('lod', 'arena_used', 'last'), 0),
+    ('LOD jobs in flight avg', ('lod', 'in_flight', 'avg'), 0),
+    ('LOD jobs queued max', ('lod', 'queued', 'max'), 0),
+]
+
 # Settings that make two runs comparable.
 SETTINGS = [
     ('world', ('run', 'world')),
@@ -339,6 +354,8 @@ def compare(base, new):
         metrics = metrics + CULLING_METRICS
     if get(base, ('idle',)) is not None or get(new, ('idle',)) is not None:
         metrics = metrics + IDLE_METRICS
+    if get(base, ('lod',)) is not None or get(new, ('lod',)) is not None:
+        metrics = metrics + LOD_METRICS
     for name, path, direction in metrics:
         b, n = get(base, path), get(new, path)
         pct, verdict = change(b, n, direction)

@@ -327,6 +327,28 @@ class OutputTest(unittest.TestCase):
         code, out, _ = run_main('--compare', self.write('c.md', SAMPLE), self.write('d.md', SAMPLE))
         self.assertNotIn('Note:', out)
 
+    def test_lod_metrics_only_when_a_run_has_the_lod(self):
+        # Runs without --lod write "lod": null; the LOD rows come with the first run that has it.
+        off = copy.deepcopy(SAMPLE)
+        off['lod'] = None
+        far = copy.deepcopy(SAMPLE)
+        far['run']['lod'] = 'far (R 24, K 4, 12288 blocks)'
+        far['run']['lod_fill_s'] = 2.4
+        spread = {'avg': 2000.5, 'p95': 2400, 'max': 2600, 'first': 1900, 'last': 2100}
+        far['lod'] = {
+            'draws': spread, 'quads': spread, 'upload_quads': 120000, 'upload_frames': 40,
+            'upload_quads_per_frame': {'avg': 12.0, 'p95': 0, 'max': 30000, 'first': 0,
+                                       'last': 0},
+            'arena_used': spread, 'arena_quads': 12582912, 'in_flight': spread, 'queued': spread,
+        }
+        code, out, _ = run_main('--compare', self.write('a.md', off), self.write('b.md', far))
+        self.assertEqual(code, 0)
+        self.assertIn('| LOD time to fill s | - | 2.40 | - |  |', out)
+        self.assertIn('| LOD quads uploaded per frame max | - | 30000 | - |  |', out)
+        self.assertIn('| LOD arena quads used | - | 2100 | - |  |', out)
+        code, out, _ = run_main('--compare', self.write('c.md', off), self.write('d.md', SAMPLE))
+        self.assertNotIn('LOD', out)
+
     def test_compare_directories_keeps_bodies_apart(self):
         # Old runs have no bodies field: they had no physics bodies.
         crowded = copy.deepcopy(SAMPLE)

@@ -737,6 +737,13 @@ fn every_tier_draws_the_lod_scene_alike() {
             if stats.lod_draws > stats.lod_drawn || stats.lod_quads == 0 {
                 return Err(format!("LOD stats {stats:?}"));
             }
+            // Every node went up once: the arena holds exactly the quads uploaded.
+            if stats.lod_arena_used_quads == 0
+                || stats.lod_upload_quads != u64::from(stats.lod_arena_used_quads)
+                || stats.lod_arena_capacity_quads < stats.lod_arena_used_quads
+            {
+                return Err(format!("LOD arena stats {stats:?}"));
+            }
             let changed = |a: &RgbaImage, b: &RgbaImage| a.compare(b, 2).fraction();
             if changed(&out[0].1, &without) < 0.05 || changed(&out[0].1, &out[1].1) < 0.05 {
                 return Err("the LOD or its tint changed less than 5 % of the image".into());

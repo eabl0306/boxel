@@ -93,6 +93,18 @@ pub struct FrameRecord {
     /// When the latest chunk job had finished by the time the record was taken, since the
     /// measurement started (`None`: no job yet since then).
     pub last_job_end: Option<Duration>,
+    /// Far LOD draw calls (`RenderInfo::lod_draws`; 0 without `--lod`).
+    pub lod_draws: u32,
+    /// Quads of those draws (`RenderInfo::lod_quads`).
+    pub lod_quads: u64,
+    /// Quads copied into the LOD arena during the frame (8 bytes each).
+    pub lod_upload_quads: u64,
+    /// LOD arena quads in use (`RenderInfo::lod_arena_used_quads`).
+    pub lod_arena_used: u32,
+    /// LOD column jobs running (`LodStats::in_flight`).
+    pub lod_in_flight: u32,
+    /// LOD column jobs waiting (`LodStats::queued_jobs`).
+    pub lod_queued: u32,
 }
 
 /// Append-only list of records stored in fixed blocks: pushing never moves earlier records, so
@@ -238,6 +250,8 @@ pub struct RunInfo {
     /// Seconds from the start until the LOD's first fill was drawn (`None`: no LOD, or it did not
     /// fill during the run). Frames before it carry the fill's jobs and uploads.
     pub lod_fill_s: Option<f64>,
+    /// LOD arena size in quads the renderer got (0: no LOD).
+    pub lod_arena_quads: u32,
 }
 
 /// What `--edits` measured: scripted edits (lamp placed and removed, shaft dug and capped) and
@@ -741,6 +755,44 @@ pub struct Summary {
     pub culling: Culling,
     /// The idle steps between frames.
     pub idle: IdleStats,
+    /// The far LOD (zeros without `--lod`).
+    pub lod: LodFrames,
+}
+
+/// What the far LOD drew and uploaded over the measurement (`--lod`, ADR 0031).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LodFrames {
+    /// Draw calls.
+    pub draws: Spread,
+    /// Quads of those draws.
+    pub quads: Spread,
+    /// Quads uploaded in all.
+    pub upload_quads: u64,
+    /// Frames that uploaded any.
+    pub upload_frames: usize,
+    /// Quads uploaded per frame.
+    pub uploads: Spread,
+    /// Arena quads in use.
+    pub arena_used: Spread,
+    /// Column jobs running.
+    pub in_flight: Spread,
+    /// Column jobs waiting.
+    pub queued: Spread,
+}
+
+impl LodFrames {
+    fn of(records: &[FrameRecord]) -> Self {
+        Self {
+            draws: Spread::of(records.iter().map(|r| r.lod_draws as usize)),
+            quads: Spread::of(records.iter().map(|r| r.lod_quads as usize)),
+            upload_quads: records.iter().map(|r| r.lod_upload_quads).sum(),
+            upload_frames: records.iter().filter(|r| r.lod_upload_quads > 0).count(),
+            uploads: Spread::of(records.iter().map(|r| r.lod_upload_quads as usize)),
+            arena_used: Spread::of(records.iter().map(|r| r.lod_arena_used as usize)),
+            in_flight: Spread::of(records.iter().map(|r| r.lod_in_flight as usize)),
+            queued: Spread::of(records.iter().map(|r| r.lod_queued as usize)),
+        }
+    }
 }
 
 /// What cave culling did over the measurement.
@@ -845,6 +897,7 @@ impl Summary {
             pacing: Pacing::of(records, frames.total.as_secs_f64()),
             culling: Culling::of(records),
             idle: IdleStats::of(records),
+            lod: LodFrames::of(records),
             frames,
         })
     }
@@ -917,7 +970,8 @@ pub const CSV_HEADER: &str = "frame,t_ms,frame_ms,presented,crossed,cam_x,cam_z,
 generated,jobs_done,meshes,removed,upload_quads,d_data_ready,d_chunks,chunks,data_ready,\
 generating,mesh_ready,mesh_empty,meshing,queued_jobs,in_flight,gpu_chunks,quads,draws,arena_used,\
 dropped_chunks,gate_wait_ms,gate_missed,gate_ms,display_locked,visible_chunks,occluded,search_ms,\
-unculled,occlusion_ms,idle_ms,idle_steps,idle_late_ms,idle_overruns,job_end_ms";
+unculled,occlusion_ms,idle_ms,idle_steps,idle_late_ms,idle_overruns,job_end_ms,lod_draws,\
+lod_quads,lod_upload_quads,lod_arena_used,lod_in_flight,lod_queued";
 
 /// The CSV text: header plus one row per record.
 pub fn csv(records: &[FrameRecord]) -> String {
@@ -929,7 +983,7 @@ pub fn csv(records: &[FrameRecord]) -> String {
         let _ = writeln!(
             out,
             "{i},{:.3},{:.4},{},{},{:.2},{:.2},{:.2},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},\
-             {:.4},{},{},{},{},{},{},{},{:.4},{:.4},{},{:.4},{},{}",
+             {:.4},{},{},{},{},{},{},{},{:.4},{:.4},{},{:.4},{},{},{},{},{},{},{},{}",
             ms(r.t),
             ms(r.frame_time),
             u8::from(r.presented),
@@ -974,6 +1028,12 @@ pub fn csv(records: &[FrameRecord]) -> String {
             r.idle_overruns,
             r.last_job_end
                 .map_or_else(String::new, |at| format!("{:.3}", ms(at))),
+            r.lod_draws,
+            r.lod_quads,
+            r.lod_upload_quads,
+            r.lod_arena_used,
+            r.lod_in_flight,
+            r.lod_queued,
         );
     }
     out
@@ -1173,6 +1233,7 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
         ("fog", Json::Str(info.fog.clone())),
         ("lod", Json::Str(info.lod.clone())),
         ("lod_fill_s", Json::opt(info.lod_fill_s, 2)),
+        ("lod_arena_quads", Json::uint(info.lod_arena_quads)),
     ]);
     let frames = Json::Obj(vec![
         ("count", Json::uint(f.frames)),
@@ -1329,13 +1390,76 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
         ("idle", idle),
         ("world", world),
         ("culling", culling),
+        ("lod", lod_json(info, &s.lod)),
         ("worst", Json::Arr(worst)),
         ("timeline", Json::Arr(timeline)),
     ])
 }
 
+/// The far LOD's object, `null` without `--lod`.
+fn lod_json(info: &RunInfo, l: &LodFrames) -> Json {
+    if !lod_on(info) {
+        return Json::Null;
+    }
+    Json::Obj(vec![
+        ("draws", spread_json(&l.draws)),
+        ("quads", spread_json(&l.quads)),
+        ("upload_quads", Json::uint(l.upload_quads)),
+        ("upload_frames", Json::uint(l.upload_frames)),
+        ("upload_quads_per_frame", spread_json(&l.uploads)),
+        ("arena_used", spread_json(&l.arena_used)),
+        ("arena_quads", Json::uint(info.lod_arena_quads)),
+        ("in_flight", spread_json(&l.in_flight)),
+        ("queued", spread_json(&l.queued)),
+    ])
+}
+
+/// The run had the far LOD (`--lod` other than off).
+fn lod_on(info: &RunInfo) -> bool {
+    !info.lod.is_empty() && info.lod != "off"
+}
+
 // ---------------------------------------------------------------------------------------------
 // Markdown
+
+/// The far LOD's section (`--lod`; nothing without it).
+fn lod_markdown(out: &mut String, info: &RunInfo, l: &LodFrames) {
+    if !lod_on(info) {
+        return;
+    }
+    let _ = writeln!(out, "## Far LOD\n");
+    let fill = info.lod_fill_s.map_or_else(
+        || "It did not fill during the run.".to_string(),
+        |f| format!("It filled {f:.2} s after the start."),
+    );
+    let _ = writeln!(
+        out,
+        "{} {fill}\n\n| per frame | avg | p95 | max | first | last |\n|---|---:|---:|---:|---:|---:|",
+        info.lod
+    );
+    for (name, sp) in [
+        ("draw calls", &l.draws),
+        ("quads drawn", &l.quads),
+        ("quads uploaded", &l.uploads),
+        ("arena quads in use", &l.arena_used),
+        ("column jobs in flight", &l.in_flight),
+        ("column jobs queued", &l.queued),
+    ] {
+        let _ = writeln!(
+            out,
+            "| {name} | {:.1} | {} | {} | {} | {} |",
+            sp.avg, sp.p95, sp.max, sp.first, sp.last
+        );
+    }
+    let _ = writeln!(
+        out,
+        "\n{} quads uploaded in {} frames ({:.2} MiB); arena of {} quads.\n",
+        l.upload_quads,
+        l.upload_frames,
+        l.upload_quads as f64 * 8.0 / (1024.0 * 1024.0),
+        info.lod_arena_quads,
+    );
+}
 
 /// A warning when cave culling was on but culled nothing in more than 1 % of the measured
 /// frames because the eye was in rock: such a run does not measure cave culling.
@@ -1584,6 +1708,7 @@ pub fn markdown(info: &RunInfo, s: &Summary) -> String {
         info.arena_quads,
         s.last.dropped_chunks,
     );
+    lod_markdown(&mut out, info, &s.lod);
 
     let c = &s.culling;
     let _ = writeln!(out, "## Cave culling\n");
@@ -2211,7 +2336,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), records.len() + 1);
         let columns = CSV_HEADER.split(',').count();
-        assert_eq!(columns, 42);
+        assert_eq!(columns, 48);
         assert!(lines.iter().all(|l| l.split(',').count() == columns));
         assert!(
             lines[501].starts_with("500,1000.000,10.0000,0,1,"),
@@ -2359,6 +2484,61 @@ mod tests {
             "{data}"
         );
         assert!(data.contains("\"work_max_ms\": 0"), "{data}");
+        assert!(
+            data.contains("\"lod\": null,"),
+            "no LOD object without --lod"
+        );
+        assert!(!text.contains("## Far LOD"));
+    }
+
+    #[test]
+    fn the_far_lod_section_sums_its_uploads_and_spreads_its_counters() {
+        let info = RunInfo {
+            scenario: "fly".to_string(),
+            lod: "far (R 24, K 4, 12288 blocks)".to_string(),
+            lod_fill_s: Some(2.5),
+            lod_arena_quads: 1 << 20,
+            ..RunInfo::default()
+        };
+        // Four frames: uploads of 100 and 300 quads in two of them.
+        let records: Vec<FrameRecord> = [0u64, 100, 0, 300]
+            .into_iter()
+            .enumerate()
+            .map(|(i, uploads)| FrameRecord {
+                t: Duration::from_millis(10 * i as u64),
+                frame_time: Duration::from_millis(10),
+                lod_draws: 2000 + i as u32,
+                lod_quads: 1_000_000,
+                lod_upload_quads: uploads,
+                lod_arena_used: 400 * (i as u32 + 1),
+                lod_in_flight: 5,
+                ..FrameRecord::default()
+            })
+            .collect();
+        let s = Summary::compute(&records).expect("records");
+        assert_eq!((s.lod.upload_quads, s.lod.upload_frames), (400, 2));
+        assert_eq!((s.lod.uploads.max, s.lod.uploads.avg), (300, 100.0));
+        assert_eq!((s.lod.draws.first, s.lod.draws.last), (2000, 2003));
+        assert_eq!(s.lod.arena_used.last, 1600);
+        let text = markdown(&info, &s);
+        assert!(text.contains("## Far LOD"));
+        assert!(text.contains("It filled 2.50 s after the start."), "{text}");
+        assert!(
+            text.contains("| quads uploaded | 100.0 | 300 | 300 | 0 | 300 |"),
+            "{text}"
+        );
+        assert!(text.contains("400 quads uploaded in 2 frames"), "{text}");
+        let data = text.split("```json\n").nth(1).expect("json block");
+        assert!(data.contains("\"lod_arena_quads\": 1048576"), "{data}");
+        assert!(data.contains("\"upload_quads\": 400,"), "{data}");
+        assert!(data.contains("\"upload_frames\": 2,"), "{data}");
+        let csv = csv(&records);
+        assert!(
+            csv.lines()
+                .nth(4)
+                .is_some_and(|l| l.ends_with(",2003,1000000,300,1600,5,0")),
+            "{csv}"
+        );
     }
 
     #[test]

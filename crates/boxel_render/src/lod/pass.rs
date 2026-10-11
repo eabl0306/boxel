@@ -85,6 +85,12 @@ pub(crate) struct LodPassStats {
     pub quads: u64,
     /// Node meshes refused (cumulative).
     pub refused: u32,
+    /// Quads copied into the arena (cumulative).
+    pub uploaded_quads: u64,
+    /// Arena quads in use and the arena's size.
+    pub arena_used: u32,
+    /// See `arena_used`.
+    pub arena_capacity: u32,
 }
 
 /// The far LOD's arena, pipeline and nodes (module docs).
@@ -180,7 +186,10 @@ impl LodPass {
         for (batch, bytes) in self.nodes.take_uploads(STAGING_BYTES, budget) {
             let fail = std::mem::take(&mut self.fail_next);
             match copy(device, encoder, &self.arena, &batch, bytes, fail) {
-                Ok(()) => self.failing = false,
+                Ok(()) => {
+                    self.failing = false;
+                    self.nodes.stats.uploaded_quads += bytes / QUAD_BYTES;
+                }
                 Err(e) => {
                     // wgpu reported why (out of memory); the device stays usable.
                     if !std::mem::replace(&mut self.failing, true) {
@@ -301,6 +310,8 @@ impl LodNodes {
             }
         }
         self.stats.nodes = self.by_key.len() as u32;
+        self.stats.arena_used = self.alloc.used();
+        self.stats.arena_capacity = self.alloc.capacity();
     }
 
     /// See [`LodPass::report`].
@@ -726,7 +737,7 @@ mod tests {
     }
 
     /// The level lists, the key map and the slots agree; the allocator holds exactly the nodes'
-    /// quads.
+    /// quads, and the stats say so.
     fn check(nodes: &LodNodes) {
         let mut listed = 0;
         for (level, list) in nodes.levels.iter().enumerate() {
@@ -741,6 +752,8 @@ mod tests {
         let held: u32 = nodes.slots.iter().flatten().map(|n| n.alloc.size).sum();
         assert_eq!(nodes.alloc.used(), held);
         assert_eq!(nodes.stats.nodes as usize, nodes.by_key.len());
+        assert_eq!(nodes.stats.arena_used, held);
+        assert_eq!(nodes.stats.arena_capacity, nodes.alloc.capacity());
     }
 
     #[test]
@@ -983,6 +996,8 @@ mod tests {
             nodes.stats,
             LodPassStats {
                 nodes: 6,
+                arena_used: nodes.alloc.used(),
+                arena_capacity: nodes.alloc.capacity(),
                 ..LodPassStats::default()
             }
         );

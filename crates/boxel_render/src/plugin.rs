@@ -243,6 +243,12 @@ pub struct RenderInfo {
     pub lod_draws: u32,
     /// Quads of those draws (`RenderStats::lod_quads`).
     pub lod_quads: u64,
+    /// Quads copied into the LOD arena so far (`RenderStats::lod_upload_quads`).
+    pub lod_upload_quads: u64,
+    /// LOD arena quads in use (`RenderStats::lod_arena_used_quads`).
+    pub lod_arena_used_quads: u32,
+    /// LOD arena size in quads (`RenderStats::lod_arena_capacity_quads`).
+    pub lod_arena_capacity_quads: u32,
 }
 
 impl RenderInfo {
@@ -1903,6 +1909,9 @@ fn cleanup(
             info.lod_nodes = stats.lod_nodes;
             info.lod_draws = stats.lod_draws;
             info.lod_quads = stats.lod_quads;
+            info.lod_upload_quads = stats.lod_upload_quads;
+            info.lod_arena_used_quads = stats.lod_arena_used_quads;
+            info.lod_arena_capacity_quads = stats.lod_arena_capacity_quads;
             if let Some(mut board) = board {
                 board.set("render", render_line(ready.ctx.tier, &stats));
             }

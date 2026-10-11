@@ -891,6 +891,8 @@ struct Recorder {
     last_searches: u64,
     /// Frames cave culling skipped for the eye so far (`VisibilityStats::blocked`).
     last_blocked: u64,
+    /// Quads copied into the LOD arena so far (`RenderInfo::lod_upload_quads`).
+    last_lod_uploads: u64,
     /// Quads of every mesh sent to the renderer and not removed.
     resident: HashMap<ChunkId, u32>,
     quads: u64,
@@ -920,6 +922,7 @@ impl Recorder {
             last_presented: 0,
             last_searches: 0,
             last_blocked: 0,
+            last_lod_uploads: 0,
             resident: HashMap::with_capacity(slots),
             quads: 0,
             pending: None,
@@ -973,10 +976,12 @@ fn record(
     mut events: MessageReader<ChunkMeshEvent>,
     mut rec: ResMut<Recorder>,
     mut spans: Option<ResMut<SpanRecorder>>,
+    lod: Option<Res<LodStats>>,
 ) {
     if let Some(spans) = spans.as_deref_mut() {
         spans.times.last_frame(&mut spans.frame);
     }
+    let (lod_in_flight, lod_queued) = lod.map_or((0, 0), |l| (l.in_flight, l.queued_jobs));
     let (mut meshes, mut removed, mut upload_quads) = (0u32, 0u32, 0u64);
     for event in events.read() {
         match event {
@@ -1038,6 +1043,12 @@ fn record(
             idle_late: idle.late,
             idle_overruns: idle.overruns.saturating_sub(rec.last_overruns),
             last_job_end,
+            lod_draws: info.lod_draws,
+            lod_quads: info.lod_quads,
+            lod_upload_quads: info.lod_upload_quads.saturating_sub(rec.last_lod_uploads),
+            lod_arena_used: info.lod_arena_used_quads,
+            lod_in_flight: lod_in_flight as u32,
+            lod_queued: lod_queued as u32,
         };
         rec.log.push(record);
         if let Some(spans) = spans.as_deref_mut() {
@@ -1057,6 +1068,7 @@ fn record(
     rec.last_presented = info.frames_presented;
     rec.last_searches = search.searches;
     rec.last_blocked = search.blocked;
+    rec.last_lod_uploads = info.lod_upload_quads;
 }
 
 /// `Update`, before the world computes interest: phases, the camera script and the exit.
@@ -1333,6 +1345,7 @@ impl Bench {
             self.info.arena_quads = info.arena_capacity_quads;
             self.info.chunk_slots = info.chunk_slot_capacity;
         }
+        self.info.lod_arena_quads = info.lod_arena_capacity_quads;
         let records = rec.log.to_vec();
         if let (Some(script), Some(first), Some(last)) = (script, records.first(), records.last()) {
             self.info.edits = Some(script.stats(&first.world, &last.world));
