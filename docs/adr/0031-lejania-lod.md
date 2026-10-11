@@ -1,8 +1,8 @@
 # ADR 0031: lejanía con LOD, un plugin opcional
 
-- Estado: borrador. El M1, el M3 (en las rondas de optimización) y el M2 (ediciones y respaldo)
-  están hechos en la rama `feat/lod` (sobre `feat/fog`); falta la prueba del dueño (al final,
-  "Pendiente").
+- Estado: borrador. El M1, el M3 y parte del M5 (en las rondas de optimización) y el M2
+  (ediciones y respaldo) están hechos en la rama `feat/lod` (sobre `feat/fog`); falta la prueba
+  del dueño (al final, "Pendiente").
 - Fecha: 2026-10-11
 
 ## Contexto
@@ -166,11 +166,16 @@ Umbrales en bloques (`e_k` es el lado de un nodo de nivel `k`):
 - Ninguna capa por encima de la última capa de chunks del generador
   (`vertical_chunks().end() >> k`) se quiere: ahí todo es aire. Sin esto, un ojo alto sobre un
   mundo de altura fija pedía un disco de aire tan ancho como `T_1` a su propia altura (a y 3.000,
-  casi el doble de columnas que en el suelo).
+  casi el doble de columnas que en el suelo). La excepción son las ediciones (M2): una columna
+  con chunks editados más arriba (una torre o una plataforma sobre el terreno) quiere hasta la
+  capa del más alto, en cada nivel (`plan::Ceiling`).
+- Los viewers a más del horizonte del preset no cuentan para la región de conservación: después
+  de un salto, el registro del viewer en el mundo llega un frame tarde y encendía la guarda.
 
 Un nodo de nivel `k` se refina mientras su caja está a menos de `T_(k-1)` del ojo, con una
 histéresis de un nodo hijo. Cada nivel es una ventana densa de columnas, y un nivel se vuelve a
-planear cuando el ojo se movió un octavo de su banda (sección "Desvíos").
+planear cuando el ojo se movió un octavo de su banda (sección "Desvíos"). Un replaneo va del nivel
+más grueso al más fino, unas filas por frame dentro del presupuesto.
 
 ### 7. Cobertura: el LOD nunca dibuja donde dibuja el detalle completo
 
@@ -208,31 +213,58 @@ profundidad ni z-fighting.
 - Un trabajo es una columna de un nivel: la fuente, y para cada nodo con celdas el llenado, el
   mallado y las pasadas (a lo sumo 3 nodos). Meta: 0,3 ms.
 - Corren en el pool de cómputo asíncrono con un ejecutor propio (el del mundo es privado).
-- A lo sumo 2 en vuelo mientras el mundo carga y 5 cuando se asentó: un chunk cercano espera a
-  lo sumo un trabajo del LOD por hilo.
+- A lo sumo 2 en vuelo mientras el mundo carga, y solo de clase 0 (el horizonte y los huecos);
+  5 cuando se asentó. Un chunk cercano espera a lo sumo un trabajo del LOD por hilo.
+- Los hilos no esperan al principal: por cada lugar en vuelo hay 4 trabajos ya armados, y un
+  hilo que termina uno empieza el siguiente. El respaldo no arma trabajos de antemano.
 - Prioridades: clase 0 el nivel más grueso (el horizonte aparece primero) y los nodos que cierran
   un hueco (un nodo de nivel 1 con chunks publicados que el detalle completo no cubre entero, y
   sus ancestros); clase 1 lo que se ve; clase 2 el resto; clase 3 los nodos de nivel 1 bajo el
   detalle completo que no cierran ningún hueco.
-- El hilo principal gasta a lo sumo 0,3 ms por frame en juntar y lanzar trabajos, y envía a lo
-  sumo 64 nodos y 2 MiB por frame. Entre frames (ADR 0023) un paso `Idle` sigue juntando y
-  lanzando, sin escribir ops.
+- Un solo presupuesto por frame en el hilo principal (`frame_budget`, 0,3 ms), en este orden:
+  el replaneo, juntar y lanzar trabajos y leer los eventos de datos del mundo. Mientras el mundo
+  carga es un tercio, porque el mundo va primero. Con el mundo asentado los trabajos tienen su
+  propio presupuesto. Los eventos de mallas y los mensajes del renderer se leen completos, fuera
+  del presupuesto: de ellos depende qué dibuja el detalle completo.
+- Envía a lo sumo 192 nodos y 2 MiB por frame. Entre frames (ADR 0023) un paso `Idle` sigue
+  juntando y lanzando, sin escribir ops. Con el respaldo solo junta: sus trabajos copian los
+  chunks cargados al crearse, y eso pasa en `Update`.
 
 ### 9. Cómo se dibuja
 
-- `LodPass` dentro de `VoxelRenderer`: su propia arena (`VERTEX | COPY_DST`, sub-asignada como la
-  principal), así el LOD nunca le quita lugar al detalle completo. Las subidas van en un buffer
-  de staging por frame, a lo sumo 4 frames de envíos del mundo por frame: después de frames sin
-  dibujar (ventana oculta) lo atrasado sube en varios frames, sin un tirón. Un nodo se dibuja
-  solo con sus quads arriba; si no se puede crear el staging (sin memoria), esos nodos esperan
-  al frame siguiente en vez de dibujar basura.
-- Un pipeline igual en los tres tiers (`lod.wgsl`, módulo nuevo): el quad instanciado del Low, un
-  uniform block (`View`), una textura (la mip de 1x1 de cada capa, el color medio), 16 bytes de
-  immediates (origen, nivel, máscara, mip, tinte). Una llamada de dibujo por nodo, después del
-  recorte en CPU (frustum y la prueba de caras por caja). La identidad entre tiers sale por
-  construcción.
-- Se dibuja en el pase principal justo después de lo opaco y cutout, antes del agua translúcida
-  y de la niebla.
+- `LodPass` dentro de `VoxelRenderer`: su propia arena (`VERTEX | COPY_DST`, también `STORAGE`
+  en High, sub-asignada como la principal), así el LOD nunca le quita lugar al detalle completo.
+  Las subidas van en un buffer de staging por frame, a lo sumo 4 frames de envíos del mundo por
+  frame: después de frames sin dibujar (ventana oculta) lo atrasado sube en varios frames, sin un
+  tirón. Un nodo se dibuja solo con sus quads arriba; si no se puede crear el staging (sin
+  memoria), esos nodos esperan al frame siguiente en vez de dibujar basura.
+- Dos caminos con las mismas funciones de vértice y fragmento (`lod_common.wgsl`), así que los
+  mismos píxeles:
+  - Mid, Low y las GPU integradas (también en High): recorte en CPU (frustum y prueba de caras
+    por caja) y una llamada instanciada por tramo de baldes de caras que pueden mirar a la cámara
+    (`lod.wgsl`): el quad instanciado del Low, un uniform block (`View`), una textura (la mip de
+    1x1 de cada capa, el color medio), 16 bytes de immediates.
+  - High en GPU dedicadas (el M3): los nodos viven en una tabla en la GPU (`LodNodeGpu`, 64 B;
+    solo se escriben las entradas que cambian). `lod_cull.wgsl` deja los baldes que pueden verse
+    y los escribe en listas indirectas, una por segmento de 10.922 lugares, cada una un
+    `multi_draw_indexed_indirect_count` con vertex pulling (`lod_pull.wgsl`). La geometría del
+    LOD va en el grupo 3. En la 780M este camino era más lento, por eso las integradas usan el
+    otro.
+- **Profundidad jerárquica (el M5, adelantado, solo High).** La pasada principal se corta después
+  de lo opaco y cutout, y el recorte del LOD descarta los nodos tapados en todo su rectángulo por
+  una pirámide de esa profundidad (`lod_hiz.wgsl`). El recorte cuenta cuántos tapa (una lectura
+  asíncrona que nunca se espera): mientras tapa a lo sumo 1 de cada 16, los 30 frames siguientes
+  recortan sin pirámide y sin cortar la pasada. Los píxeles son los mismos.
+- **Bajo tierra** no se dibuja nada en ningún tier: si la búsqueda de cuevas no llega al borde de
+  su caja, ninguna línea de vista sale de ella.
+- **Faldones solo donde hay costura.** Cada quad del LOD lleva su costura en el índice de la
+  paleta de luz (una paleta de 3 entradas de cielo abierto), y los de costura van al final de
+  cada balde. Los faldones y las paredes de agua se dibujan junto a un octante oculto o en una
+  cara del nodo cuyo vecino del mismo nivel no dibuja ahí; en el resto quedan entre celdas
+  sólidas. Los dos caminos cortan igual (`bucket_quads`).
+- Se dibuja en la pasada principal justo después de lo opaco y cutout, antes del agua
+  translúcida y de la niebla. En High los draws translúcidos ligan su grupo 2 y su buffer de
+  índices, así la pasada puede seguir partida.
 - Luz de cielo abierto (`FULL_SKY_LIGHT`): el ciclo de día y noche funciona; no hay luz de
   bloque lejos.
 - Con el LOD dibujando, el renderer mueve el plano lejano del recorte de chunks al horizonte (las
@@ -288,6 +320,17 @@ rearman con su prioridad de siempre. Mientras tanto el renderer sigue dibujando 
 ellos (su malla vieja, o nada si estaba vacío) y la malla nueva lo reemplaza en las ops del mismo
 frame: una edición nunca abre un hueco.
 
+**Los vecinos cambian juntos.** Una edición en el borde de un nodo deja viejos a los dos nodos
+del mismo nivel que la tocan, y cada uno se rearma en su propio trabajo. Si uno cambiara antes,
+el render dejaría afuera los faldones de esa cara (el vecino está dibujado) aunque los dos ya no
+coinciden en sus celdas: se vería el cielo por la costura. Por eso un resultado cuyo vecino de
+cara del mismo nivel espera rearmarse queda guardado, y el grupo sale en el mismo frame cuando
+llega el último. Un vecino que sigue cambiando no retiene a los otros más de 2 s, y un nodo que
+cierra un hueco no espera.
+
+Los chunks editados por encima de la última capa del generador suben el techo de sus columnas
+(sección 6): una plataforma en el cielo tiene nodos en los niveles finos, como una torre.
+
 Sin persistencia, un chunk editado que se descarga vuelve generado, así que sale del conjunto y
 sus nodos vuelven a las celdas del generador. Con persistencia queda (está guardado) y su
 pirámide se lee del disco cuando hace falta. El nivel 6 (`extreme`) no muestra ediciones: ahí una
@@ -298,12 +341,19 @@ armado desde sus chunks reales con la regla exacta (`boxel_world::lod::fallback`
 cargado, si no el guardado, si no el del generador (los generados se guardan por hilo, 64). Un
 trabajo arma un nodo y hay uno en vuelo: cada nodo lee hasta 64 chunks. La banda sale de
 `vertical_chunks`, que debe estar acotado (64 capas como mucho); si no, el LOD queda apagado
-(`NoSource`). El horizonte es `T_1`: 1.536 bloques con `far`.
+(`NoSource`). El horizonte es `T_1`: 1.536 bloques con `far`. Entre frames sus pasos `Idle` solo
+juntan resultados, y no piden otro paso si no hay nada que juntar.
 
 ## Números medidos
 
 La campaña completa (RTX y 780M, r16 y r32, con y sin tope, boost, cuevas, spans) está en
 [rendimiento/lod-2026-10.md](../rendimiento/lod-2026-10.md), con los problemas por orden.
+
+**Después de las tres rondas de optimización** (RTX, `--lod far`, el mismo binario sin y con
+LOD): el LOD cuesta de 0,53 a 0,65 ms de GPU (era 1,07 a 1,16), `render.lod` 0,006 ms de media
+sin tope y 0,025 con tope, y ningún frame pasa de 6,94 ms por el LOD. El llenado tarda de 1,1 a
+1,7 s (la superficie a r32, 2,3 s, y la bajada a r32, 3,1 s: esperan que el mundo se asiente).
+En la 780M `far` cuesta de 1,07 a 1,14 ms. Las tablas de abajo son del M1, antes de optimizar.
 
 `headless_world --world forest --lod PRESET` del 2026-10-11 sobre la rama (sin GPU: solo el lado
 del mundo; la máquina tranquila). Los nodos del piso son 0 en todas las corridas.
@@ -509,6 +559,44 @@ intención del plan:
 - La pose alta del test de costura usa un radio de 12 chunks: con radio 4 los chunks que la
   búsqueda vieja perdía quedaban debajo de la imagen.
 
+**El M3 y las rondas de optimización**
+
+- El M3 vino antes que el M2. Sus listas se parten por rango de lugares (10.922 por lista), no
+  por nivel. La geometría del LOD va en el grupo 3, y los draws translúcidos de High ligan su
+  grupo 2 y su buffer de índices (se tocó `path/high.rs`), así la pasada principal se puede
+  partir.
+- La profundidad jerárquica (el M5 del plan) está hecha, solo en High, y se usa según lo que
+  tapa: si tapa a lo sumo 1 de cada 16 nodos, 30 frames sin ella. La pasada principal se corta
+  después de lo opaco y cutout, y el depth target se puede muestrear mientras existe el camino
+  de GPU.
+- `lod.wgsl` se partió en `lod_common`, `lod`, `lod_pull`, `lod_cull` y `lod_hiz`. El vertex del
+  LOD tiene su propia salida (`LodOut`, la misma cuenta) en vez del `VsOut` y `shade_fragment` de
+  `common`.
+- High usa el camino instanciado en las GPU integradas, y el instanciado dibuja una llamada por
+  tramo de baldes visibles, no una por nodo.
+- Los faldones y las paredes de agua se dibujan solo donde la regla de costura los muestra. Cada
+  quad lleva su costura en el índice de la paleta de luz (3 entradas de cielo abierto); los de
+  costura van al final de cada balde, primero los de las caras del nodo y después los de los
+  planos internos. `LodNodeGpu` mide 64 B, con los conteos de costura por balde, y los bits de
+  vecino van en `node.w`, bits 15 a 20.
+- En High, `RenderStats.lod_draws` cuenta listas indirectas y `lod_quads` los quads de los nodos
+  dibujados antes del recorte en la GPU.
+- Mientras el mundo carga solo corren columnas de clase 0 (el plan decía 2 trabajos de cualquier
+  clase). Los hilos encadenan trabajos armados de antemano. `publish_per_frame` pasó de 64 a 192.
+- Un solo presupuesto por frame para el replaneo, los trabajos y los eventos de datos, dividido
+  por 3 mientras el mundo carga; con el mundo asentado los trabajos tienen el suyo. Los eventos de
+  datos se leen dentro del presupuesto, no completos (los de mallas sí, completos), y el llenado
+  también espera esa cola.
+- Un nivel se planea de a filas: el plan estimaba menos de 0,1 ms por nivel y se midieron hasta
+  0,69 ms.
+- Los viewers más allá del horizonte del preset quedan fuera de la región de conservación. Antes,
+  un salto encendía la guarda y tiraba todos los nodos.
+- La lista de vigilancia tiene una parte dormida para los chunks sin malla pedida.
+- Un nodo que sale del árbol saca del renderer a sus descendientes enviados (un replaneo en varios
+  frames podía dejar nodos de nivel 1 bajo un padre quitado después de un salto).
+- `snapshot` sube todos los nodos en su único frame. Antes sus imágenes tenían cuadrados de cielo
+  del tamaño de un nodo, distintos en cada corrida.
+
 **Ediciones y respaldo (M2)**
 
 - Las pirámides arman el nivel 1 desde los bloques y cada nivel de arriba mezclando los 8 de
@@ -538,6 +626,13 @@ intención del plan:
 - `LodStats` ganó `edited_chunks`, `pyramids` y `fallback`.
 - Un error que encontró el test del respaldo: el LOD se daba por lleno con columnas marcadas para
   rearmar que nadie había puesto en la cola. Ahora esas columnas cuentan como trabajo pendiente.
+- El plan no quería capas por encima de la última capa del generador ("ahí todo es aire"). Con
+  ediciones eso deja de ser cierto: un chunk editado más arriba sube el techo de su columna en
+  cada nivel. Sin esto, una plataforma sobre y 128 no aparecía en los niveles 1 y 2, y con el
+  respaldo no aparecía nunca.
+- Los vecinos del mismo nivel que se rearman por una edición cambian juntos en el renderer
+  (sección 11). El plan no lo pedía: el corte de faldones de la ronda 3 supone que dos vecinos
+  dibujados salen de las mismas celdas.
 
 ## Límites conocidos
 
@@ -553,8 +648,8 @@ intención del plan:
   borde del detalle completo (decisión 5; las caras translúcidas serían M4).
 - **Capas de niebla.** Una capa que se desvanece al color del cielo en su propio alcance deja una
   franja pálida sobre el terreno lejano (decisión 6; M4).
-- **Bajo tierra.** Hasta el M3 no se salta el dibujo del LOD dentro de la roca: lo tapa el
-  early-Z de la roca cercana.
+- **Bajo tierra.** Dentro de una cueva sellada el LOD no se dibuja. En una cueva abierta lo
+  recorta la pirámide de profundidad en High y el early-Z de la roca en Mid y Low.
 - **Bajo el piso del mundo.** Debajo de y = -64 el LOD no tiene cara de piso: nadie vuela ahí.
 - **Cuevas y plantas.** Lejos, las cuevas se cierran y las plantas no están. Las hojas son opacas,
   con el color medio de sus píxeles opacos: los bosques lejanos se ven algo más densos.
@@ -572,11 +667,16 @@ intención del plan:
 - **Vigilancia de chunks vacíos.** Los chunks vacíos en octantes sin quads del LOD no se buscan:
   no cambian lo que se dibuja, pero no cuentan como cubiertos.
 - **Árboles en los niveles 5 y 6.** Se mira uno de cada 4 y de cada 16 lugares de árbol.
-- **Costo en el hilo de render.** Unos 2.000 draws por frame en `far`, uno por nodo, en los tres
-  tiers. El camino de GPU para High es del M3 (antes si el `perf-smoke` lo pide).
-- **El llenado** está atado a la cadencia de los pasos `Idle`. Si en `voxel_world` se siente lento,
-  la palanca es juntar 2 o 3 columnas por trabajo cuando el mundo está asentado (el plan pide
-  0,3 ms por trabajo; necesita el visto bueno del dueño).
+- **p99 sin tope.** En la RTX a r16 queda de 2,3 a 3,2 veces el de sin LOD (a r32, de 1,4 a 1,7):
+  son los triángulos que de verdad se ven. Es el precio del plugin, como la niebla.
+- **Con tope 144** la superficie a r32, con la NVIDIA en su modo alto, suma unos 20 frames de más
+  de 7,5 ms por corrida: refrescos salteados en los frames de la puesta al día (issue #5).
+- **Costo en el hilo de render.** En High casi nada (una lista indirecta por segmento). En Mid,
+  Low y las GPU integradas, una llamada por tramo de baldes visibles de cada nodo visible.
+- **El llenado** tarda de 1,1 a 1,7 s; en la superficie a r32, 2,3 s, y en la bajada a r32,
+  3,1 s, porque espera que el mundo se asiente.
+- **Rearmados por ediciones.** Un nodo cuyo vecino del mismo nivel espera rearmarse sigue con su
+  malla vieja hasta que llegan los dos, a lo sumo 2 s.
 
 ## Alternativas descartadas
 
@@ -660,7 +760,9 @@ intención del plan:
   - plano lejano y niebla: un chunk pasada la distancia de vista se recorta sin LOD y se dibuja
     con él; la niebla del valle sobre el detalle completo da la misma imagen con y sin LOD;
   - subidas perdidas: un frame sin staging no dibuja esos nodos (la imagen sin nodos) y el
-    siguiente los sube y dibuja la escena entera.
+    siguiente los sube y dibuja la escena entera;
+  - M3 y rondas: el camino de GPU de High dibuja lo mismo que el instanciado, una búsqueda de
+    cuevas sellada no dibuja LOD, y en High los nodos detrás del detalle completo no se dibujan.
 - Las suites de GPU existentes siguen verdes sin cambios.
 - M2, `boxel_worldgen`: la fuente de `FlatGenerator` es la regla exacta sobre sus propios chunks
   en los niveles 1 a 5 (capas de todas las clases, mar sobre suelo, dos fluidos, lejos del
@@ -677,6 +779,11 @@ intención del plan:
   disco, y después de reiniciar la app lejos de la torre (sus chunks nunca cargan) los chunks
   guardados son editados desde el primer frame y la torre está igual; el respaldo arma solo el
   nivel 1, igual a la fuente exacta del terreno, y muestra una edición.
+- Después de la revisión del M2: una plataforma sobre la última capa del generador se ve en los
+  niveles 1 y 2, con fuente y con el respaldo, y el techo sube solo en sus columnas; con un
+  trabajo por frame, ningún nodo cambia en el renderer mientras un vecino del mismo nivel espera
+  rearmarse (fallaba en el frame 3); un paso `Idle` del respaldo no pide otro paso enseguida si
+  no puede lanzar nada. El proptest de cobertura pasó con 300 casos.
 
 
 ## Para la prueba del dueño
@@ -739,15 +846,14 @@ cargo run --release --example voxel_world -- --lod far --world-dir /tmp/mundo-lo
 
 ## Pendiente
 
-- Decidir con el dueño el p99 de la RTX: con `--lod far` sube de 0,8 a 1,4 ms a 3 a 4 ms (sin
-  frames de más de 6,94 ms), casi todo trabajo de GPU. Palancas: el preset `near`, dibujar solo
-  los baldes de caras que pueden verse (más draws, menos vértices; hoy un draw por nodo con sus 6
-  baldes), o Hi-Z (M5).
+- Decidir con el dueño el p99 sin tope de la RTX: a r16 queda de 2,3 a 3,2 veces el de sin LOD
+  (sin frames de más de 6,94 ms), casi todo trabajo de GPU. Las palancas del plan (baldes por
+  cara y Hi-Z) ya están; lo que queda es el preset `near` o menos triángulos.
 - La prueba del M2 volando (abajo, "Para la prueba del dueño").
 - M4, según la prueba del dueño: agua translúcida lejana, niebla que se adelgaza sobre el LOD,
   `textureSample` en el nivel 1 para packs de alta resolución, hojas más oscuras.
-- Posibles mejoras de costo: repartir el primer plan en varios frames, agrupar los eventos de la
-  cobertura por posición de nivel 1, cuantizar `T_1` cuando sigue a la región de conservación.
+- Posibles mejoras de costo: agrupar los eventos de la cobertura por posición de nivel 1,
+  cuantizar `T_1` cuando sigue a la región de conservación.
 
 ## Consecuencias
 

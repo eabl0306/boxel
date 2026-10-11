@@ -1159,9 +1159,10 @@ los de antes, byte a byte.
   celda: gana cualquier sólido, salvo agua sobre el suelo.
 - **Ediciones.** Los chunks editados (y, con `PersistPlugin`, los guardados) tienen sus celdas de
   los niveles 1 a 5 calculadas desde sus bloques (una pirámide por chunk) y puestas sobre las del
-  generador; el nodo viejo se dibuja hasta que llega el nuevo. Sin persistencia, un chunk editado
-  que se descarga vuelve a ser el del generador. Un generador sin `lod()` tiene solo el nivel 1,
-  armado desde sus chunks reales.
+  generador; el nodo viejo se dibuja hasta que llega el nuevo, y dos vecinos del mismo nivel que
+  se rearman por una edición cambian juntos. Un chunk editado sobre la última capa del generador
+  sube el techo de su columna. Sin persistencia, un chunk editado que se descarga vuelve a ser el
+  del generador. Un generador sin `lod()` tiene solo el nivel 1, armado desde sus chunks reales.
 - **Cobertura.** Cada nodo lleva una máscara de octantes ocultos donde dibuja el detalle completo
   o un nivel más fino, sacada de los `ChunkMeshEvent` leídos completos cada frame: el LOD y el
   detalle completo nunca dibujan el mismo volumen y cambian en el mismo frame.
