@@ -899,6 +899,13 @@ impl VoxelRenderer {
         self.lod.as_ref().is_some_and(LodPass::gpu_driven)
     }
 
+    /// Testing: whether the last frame's GPU-driven LOD cull (High) used the depth pyramid of
+    /// the solid terrain; `None` without that path.
+    #[doc(hidden)]
+    pub fn debug_lod_occlusion_culling(&self) -> Option<bool> {
+        self.lod.as_ref()?.occlusion_culling()
+    }
+
     /// The LOD stays off on this renderer: a GL backend, or its pass failed to build.
     pub(crate) fn lod_failed(&self) -> bool {
         self.lod_failed
@@ -1251,7 +1258,7 @@ impl VoxelRenderer {
             // box: no line of sight leaves it, so nothing of the LOD can show (ADR 0031, M3).
             let sealed =
                 used && search_is_sealed(&mut self.lod_sealed, self.occlusion.set.as_ref());
-            lod.prepare(device, queue, encoder, cull_view, sealed);
+            lod.prepare(device, queue, encoder, &self.targets, cull_view, sealed);
         }
         self.path.encode_compute(encoder, slot_count);
         let draws = if let Some(lod) = self.lod.as_mut().filter(|l| l.culls_after_solid()) {

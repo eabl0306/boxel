@@ -1788,7 +1788,9 @@ fn a_sealed_search_draws_no_lod() {
 
 /// High culls the LOD against the depth pyramid of the solid terrain (ADR 0031, M3): behind a
 /// stone wall that fills the view no LOD draw is written, and the image is the instanced path's;
-/// without the wall the nodes are drawn.
+/// without the wall the nodes are drawn. Without the wall the pyramid hides nothing, so a few
+/// frames later the cull goes without it (no split pass), with the same pixels; behind the
+/// wall it keeps it.
 #[test]
 fn nodes_behind_full_detail_are_not_drawn_on_high() {
     let wall = mesh_chunk(|_, _, _| "boxel:stone");
@@ -1814,6 +1816,34 @@ fn nodes_behind_full_detail_are_not_drawn_on_high() {
                 renderer.set_lod(gpu.device, Some(lod_input(settings(1 << 20), lod_nodes())));
                 let image = render(gpu, &mut renderer, &view)?;
                 draws.push(renderer.debug_lod_gpu_draws(gpu.device, gpu.queue));
+                if gpu_driven {
+                    // The pyramid's samples come back within a few frames.
+                    let first = renderer.debug_lod_occlusion_culling();
+                    let mut later = image.clone();
+                    for _ in 0..6 {
+                        later = render(gpu, &mut renderer, &view)?;
+                    }
+                    let walled = std::ptr::eq(chunks, &walled);
+                    let now = renderer.debug_lod_occlusion_culling();
+                    if first != Some(true) || now != Some(walled) {
+                        return Err(format!(
+                            "depth pyramid (walled {walled}): first frame {first:?}, later {now:?}"
+                        ));
+                    }
+                    report.check_identical(
+                        &format!(
+                            "{} High: walled {walled}: with and without the pyramid",
+                            gpu.label
+                        ),
+                        (&gpu.name(&format!("first_{walled}")), &image),
+                        (&gpu.name(&format!("later_{walled}")), &later),
+                    );
+                    if renderer.debug_lod_gpu_draws(gpu.device, gpu.queue)
+                        != draws.last().copied().flatten()
+                    {
+                        return Err("the draws changed without the pyramid".into());
+                    }
+                }
                 shots.push(image);
             }
             report.check_identical(

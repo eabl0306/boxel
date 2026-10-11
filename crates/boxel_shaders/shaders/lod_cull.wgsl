@@ -15,7 +15,9 @@
 // (lod_hiz.wgsl): a node whose nearest point lies behind the farthest full-detail depth over its
 // whole screen rectangle (a pixel of margin for the edge growth of finish_vertex) would lose
 // every depth test, so it is not drawn. Underground, where the rock in front covers the screen,
-// nothing of the LOD is.
+// nothing of the LOD is. Those frames count the nodes in the frustum and the ones the pyramid
+// hid; while it hides almost nothing the renderer culls without it (occlusion[2] = 0), before
+// the main pass, for some frames (boxel_render's lod::pass).
 struct DrawArgs { index_count: u32, instance_count: u32, first_index: u32, base_vertex: i32, first_instance: u32 };
 struct LodNodeGpu { node: vec4<i32>, quad_base: u32, counts: array<u32, 3>, seams: array<u32, 6>, pad: array<u32, 2> };
 
@@ -25,6 +27,8 @@ struct LodNodeGpu { node: vec4<i32>, quad_base: u32, counts: array<u32, 3>, seam
 @group(0) @binding(3) var<storage, read_write> draw_refs: array<vec2<u32>>;
 @group(0) @binding(4) var<storage, read_write> counts: array<atomic<u32>>;
 @group(0) @binding(5) var hiz: texture_2d<f32>;
+// [nodes in the frustum, nodes the pyramid hid, use the pyramid (written by the CPU), unused].
+@group(0) @binding(6) var<storage, read_write> occlusion: array<atomic<u32>, 4>;
 
 const LOD_LEVEL_MASK: u32 = 15u;
 const LOD_HIDDEN_MASK: u32 = 0xFFu;
@@ -134,7 +138,14 @@ fn cull_lod(@builtin(global_invocation_id) gid: vec3<u32>) {
   let origin = vec3(n.node.x & ~i32(LOD_LEVEL_MASK), n.node.y, n.node.z);
   let mn = vec3<f32>(origin - view.render_origin.xyz);
   let mx = mn + vec3(f32(32u << k));
-  if (!in_frustum(mn, mx) || occluded(mn, mx)) { return; }
+  if (!in_frustum(mn, mx)) { return; }
+  if (atomicLoad(&occlusion[2]) != 0u) {
+    atomicAdd(&occlusion[0], 1u);
+    if (occluded(mn, mx)) {
+      atomicAdd(&occlusion[1], 1u);
+      return;
+    }
+  }
   let seg = slot / LOD_SEGMENT_SLOTS;
   let first = seg * LOD_SEGMENT_DRAWS;
   var start = n.quad_base;

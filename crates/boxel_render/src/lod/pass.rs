@@ -24,7 +24,10 @@
 //!   per-node CPU work, and only the buckets that can be seen go through the vertex stage. The
 //!   cull runs after the opaque and cutout terrain, against a depth pyramid of what it drew
 //!   (`lod_hiz.wgsl`): a node behind full detail over its whole screen rectangle is not drawn
-//!   (the renderer ends the main pass there and goes on in a second one).
+//!   (the renderer ends the main pass there and goes on in a second one). The pyramid and the
+//!   split pass cost about 0.03 ms on the surface, where they hide almost nothing: the cull
+//!   counts what they hide, and while that is under 1 node in [`OCCLUSION_RATIO`] the frames
+//!   cull without them, before the main pass ([`Occlusion`]; the same pixels either way).
 //!
 //! Skirts and fluid walls (`boxel_mesh::lod::Seam`, last in each face bucket) are drawn only
 //! where a seam can show them: by a hidden octant, or on a node face whose neighbor of the same
@@ -50,6 +53,7 @@ use boxel_voxel::{ChunkKey, Face};
 use boxel_world::lod::LodOp;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Nodes the pass holds at most (the `extreme` preset keeps about 16k).
 pub(crate) const MAX_LOD_NODES: u32 = 1 << 16;
@@ -239,15 +243,17 @@ impl LodPass {
     /// into `encoder`: staging buffers of at most [`STAGING_BYTES`], one copy per node; at most
     /// the frame's upload budget, module docs), then the draw list for `view` (the renderer's
     /// cull view, its far plane at the horizon; the View uniform holds it on High): on the CPU,
-    /// or on High the changed node table entries (written with `queue`) and the cull (recorded).
-    /// A batch whose staging buffer cannot be created waits for the next frame, its nodes not
-    /// drawn meanwhile. With `sealed` (no line of sight leaves the cave culling box) nothing is
-    /// drawn.
+    /// or on High the changed node table entries (written with `queue`) and the cull, recorded
+    /// here unless it waits for the solid terrain drawn into `targets` this frame
+    /// ([`LodPass::culls_after_solid`]). A batch whose staging buffer cannot be created waits for
+    /// the next frame, its nodes not drawn meanwhile. With `sealed` (no line of sight leaves the
+    /// cave culling box) nothing is drawn.
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
+        targets: &Targets,
         view: &ViewParams,
         sealed: bool,
     ) {
@@ -276,6 +282,7 @@ impl LodPass {
                     device,
                     queue,
                     encoder,
+                    targets,
                     &self.arena,
                     &mut self.nodes,
                     segments,
@@ -319,10 +326,16 @@ impl LodPass {
     }
 
     /// True if this frame's LOD is culled on the GPU after the opaque and cutout terrain (High,
-    /// with something to draw): the renderer then ends the main pass after them, calls
-    /// [`LodPass::cull_after_solid`] and draws the LOD and the rest in a second pass.
+    /// with something to draw, using the depth pyramid this frame): the renderer then ends the
+    /// main pass after them, calls [`LodPass::cull_after_solid`] and draws the LOD and the rest
+    /// in a second pass.
     pub fn culls_after_solid(&self) -> bool {
-        self.gpu.as_ref().is_some_and(|g| g.segments > 0)
+        self.gpu.as_ref().is_some_and(GpuDriven::culls_after_solid)
+    }
+
+    /// Testing (High): true if this frame's cull uses the depth pyramid.
+    pub fn occlusion_culling(&self) -> Option<bool> {
+        self.gpu.as_ref().map(|g| g.occlusion.on)
     }
 
     /// Records the cull of [`LodPass::culls_after_solid`]: the depth pyramid of `targets`
@@ -1145,6 +1158,140 @@ struct GpuDriven {
     segments: u32,
     /// Node slots the cull looks at this frame.
     slots: u32,
+    /// Whether the cull uses the depth pyramid this frame, and what it hid lately.
+    occlusion: Occlusion,
+}
+
+/// Frames that cull without the depth pyramid after a sample in which it hid under 1 in
+/// [`OCCLUSION_RATIO`] of the nodes in the frustum; then the pyramid is sampled again.
+pub(crate) const OCCLUSION_SKIP_FRAMES: u32 = 30;
+/// See [`OCCLUSION_SKIP_FRAMES`].
+pub(crate) const OCCLUSION_RATIO: u32 = 16;
+/// Readbacks of the cull's occlusion counts in flight at most.
+const OCCLUSION_SAMPLES: usize = 3;
+
+/// The depth pyramid's use (module docs). A frame that culls with it counts the nodes in the
+/// frustum and those it hid (`lod_cull.wgsl`) and copies the counts to a free readback buffer,
+/// mapped after that frame is submitted and read a frame or two later, never waited for.
+struct Occlusion {
+    /// `[nodes in the frustum, hidden by the pyramid, cull with the pyramid (written by the
+    /// CPU), unused]`.
+    counters: wgpu::Buffer,
+    samples: Vec<OcclusionSample>,
+    /// Frames left that cull without the pyramid.
+    skip: u32,
+    /// This frame culls with the pyramid.
+    on: bool,
+}
+
+/// One readback buffer of [`Occlusion`].
+struct OcclusionSample {
+    buffer: wgpu::Buffer,
+    /// [`SAMPLE_IDLE`], [`SAMPLE_COPIED`], [`SAMPLE_MAPPING`] or [`SAMPLE_READY`].
+    state: Arc<AtomicU8>,
+}
+
+/// Free.
+const SAMPLE_IDLE: u8 = 0;
+/// The counts are copied into it by a frame not known to be submitted yet.
+const SAMPLE_COPIED: u8 = 1;
+/// Mapping (the frame was submitted).
+const SAMPLE_MAPPING: u8 = 2;
+/// Mapped: the counts can be read.
+const SAMPLE_READY: u8 = 3;
+
+/// Frames to cull without the depth pyramid after a sample of `in_frustum` nodes of which it hid
+/// `hidden` (module docs).
+fn occlusion_skip(in_frustum: u32, hidden: u32) -> u32 {
+    if u64::from(hidden) * u64::from(OCCLUSION_RATIO) <= u64::from(in_frustum) {
+        OCCLUSION_SKIP_FRAMES
+    } else {
+        0
+    }
+}
+
+impl Occlusion {
+    fn new(device: &wgpu::Device) -> Self {
+        let buffer = |label, size, usage| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        Self {
+            counters: buffer(
+                "boxel lod occlusion",
+                16,
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+            ),
+            samples: (0..OCCLUSION_SAMPLES)
+                .map(|_| OcclusionSample {
+                    buffer: buffer(
+                        "boxel lod occlusion read",
+                        8,
+                        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    ),
+                    state: Arc::new(AtomicU8::new(SAMPLE_IDLE)),
+                })
+                .collect(),
+            skip: 0,
+            on: true,
+        }
+    }
+
+    /// At the start of a frame (the last one is submitted): maps the samples copied since,
+    /// reads the ones mapped, then decides whether this frame culls with the pyramid and
+    /// records the reset of the counts.
+    fn begin_frame(&mut self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder) {
+        for sample in &self.samples {
+            match sample.state.load(Ordering::Acquire) {
+                SAMPLE_COPIED => {
+                    sample.state.store(SAMPLE_MAPPING, Ordering::Release);
+                    let state = Arc::clone(&sample.state);
+                    sample
+                        .buffer
+                        .slice(..)
+                        .map_async(wgpu::MapMode::Read, move |r| {
+                            let next = if r.is_ok() { SAMPLE_READY } else { SAMPLE_IDLE };
+                            state.store(next, Ordering::Release);
+                        });
+                }
+                SAMPLE_READY => {
+                    let counts = sample.buffer.slice(..).get_mapped_range().ok().map(|m| {
+                        let c: &[u32] = bytemuck::cast_slice(&m);
+                        (c[0], c[1])
+                    });
+                    sample.buffer.unmap();
+                    sample.state.store(SAMPLE_IDLE, Ordering::Release);
+                    if let Some((in_frustum, hidden)) = counts {
+                        self.skip = occlusion_skip(in_frustum, hidden);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.on = self.skip == 0;
+        self.skip = self.skip.saturating_sub(1);
+        queue.write_buffer(&self.counters, 8, bytemuck::bytes_of(&u32::from(self.on)));
+        encoder.clear_buffer(&self.counters, 0, Some(8));
+    }
+
+    /// After a cull with the pyramid: its counts go to a free sample, if any.
+    fn copy_counts(&self, encoder: &mut wgpu::CommandEncoder) {
+        let Some(sample) = self
+            .samples
+            .iter()
+            .find(|s| s.state.load(Ordering::Acquire) == SAMPLE_IDLE)
+        else {
+            return;
+        };
+        encoder.copy_buffer_to_buffer(&self.counters, 0, &sample.buffer, 0, 8);
+        sample.state.store(SAMPLE_COPIED, Ordering::Release);
+    }
 }
 
 /// The depth pyramid (`lod_hiz.wgsl`) of one pair of main targets.
@@ -1214,6 +1361,7 @@ impl GpuDriven {
                 storage(3, false),
                 storage(4, false),
                 texture(5, wgpu::ShaderStages::COMPUTE),
+                storage(6, false),
             ],
         });
         let module = create_module(device, ShaderModuleId::LodCull);
@@ -1287,6 +1435,7 @@ impl GpuDriven {
             cull_group: None,
             segments: 0,
             slots: 0,
+            occlusion: Occlusion::new(device),
         }
     }
 
@@ -1402,16 +1551,23 @@ impl GpuDriven {
     }
 
     /// Writes the changed table entries and clears the draw counts of `segments` segments (none:
-    /// no cull, nothing drawn); [`GpuDriven::cull_after_solid`] records the cull.
+    /// no cull, nothing drawn). The cull is recorded here when it goes without the depth
+    /// pyramid this frame ([`Occlusion`]), else by [`GpuDriven::cull_after_solid`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the frame's GPU state, passed down"
+    )]
     fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
+        targets: &Targets,
         arena: &wgpu::Buffer,
         nodes: &mut LodNodes,
         segments: u32,
     ) {
+        self.occlusion.begin_frame(queue, encoder);
         let needed = segments_for(nodes.slots.len());
         let fresh = self.lists.as_ref().is_none_or(|l| l.segments < needed);
         if fresh {
@@ -1433,20 +1589,40 @@ impl GpuDriven {
         self.slots = (nodes.slots.len() as u32).min(capacity);
         if self.segments > 0 {
             encoder.clear_buffer(&lists.counts, 0, None);
+            if !self.occlusion.on {
+                self.cull(device, encoder, targets);
+            }
         }
     }
 
+    /// True if this frame's cull waits for the solid terrain ([`LodPass::culls_after_solid`]).
+    fn culls_after_solid(&self) -> bool {
+        self.segments > 0 && self.occlusion.on
+    }
+
     /// Records, after the opaque and cutout terrain is drawn into `targets`, the depth pyramid
-    /// of their depth and the cull of the frame's segments (none: nothing).
+    /// of their depth and the cull of the frame's segments against it (none: nothing), and
+    /// samples what it hid.
     fn cull_after_solid(
         &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         targets: &Targets,
     ) {
-        if self.segments == 0 {
-            return;
+        if self.culls_after_solid() {
+            self.cull(device, encoder, targets);
+            self.occlusion.copy_counts(encoder);
         }
+    }
+
+    /// Records the cull of the frame's segments, after the depth pyramid of `targets` when it
+    /// is used this frame.
+    fn cull(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        targets: &Targets,
+    ) {
         if self
             .hiz
             .as_ref()
@@ -1472,6 +1648,7 @@ impl GpuDriven {
                         binding: 5,
                         resource: wgpu::BindingResource::TextureView(&hiz.view),
                     },
+                    buffer_entry(6, &self.occlusion.counters),
                 ],
             })
         });
@@ -1479,14 +1656,16 @@ impl GpuDriven {
             label: Some("boxel lod cull"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&self.hiz_pipeline);
-        for (group, [w, h]) in &hiz.levels {
-            pass.set_bind_group(0, group, &[]);
-            pass.dispatch_workgroups(
-                w.div_ceil(bits::HIZ_WORKGROUP_EDGE),
-                h.div_ceil(bits::HIZ_WORKGROUP_EDGE),
-                1,
-            );
+        if self.occlusion.on {
+            pass.set_pipeline(&self.hiz_pipeline);
+            for (group, [w, h]) in &hiz.levels {
+                pass.set_bind_group(0, group, &[]);
+                pass.dispatch_workgroups(
+                    w.div_ceil(bits::HIZ_WORKGROUP_EDGE),
+                    h.div_ceil(bits::HIZ_WORKGROUP_EDGE),
+                    1,
+                );
+            }
         }
         pass.set_pipeline(&self.cull);
         pass.set_bind_group(0, &*cull_group, &[]);
@@ -2272,6 +2451,18 @@ mod tests {
         nodes.cull(&view, false);
         assert_eq!(drawn(&nodes), [8, 9, 6, 8, 16]);
         assert_eq!(nodes.stats.quads, 47);
+    }
+
+    /// The depth pyramid is skipped for a while once a sample shows it hides under 1 node in
+    /// [`OCCLUSION_RATIO`] of those in the frustum (nothing in the frustum: nothing to hide).
+    #[test]
+    fn the_depth_pyramid_is_skipped_while_it_hides_little() {
+        assert_eq!(occlusion_skip(0, 0), OCCLUSION_SKIP_FRAMES);
+        assert_eq!(occlusion_skip(3200, 0), OCCLUSION_SKIP_FRAMES);
+        assert_eq!(occlusion_skip(3200, 200), OCCLUSION_SKIP_FRAMES);
+        assert_eq!(occlusion_skip(3200, 201), 0);
+        assert_eq!(occlusion_skip(10, 10), 0, "underground: everything hidden");
+        assert_eq!(occlusion_skip(u32::MAX, u32::MAX), 0);
     }
 
     #[test]
