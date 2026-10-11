@@ -20,7 +20,10 @@
 //!   nodes inside the frustum and writes them into indirect lists, one per segment of
 //!   [`bits::SEGMENT_SLOTS`] slots, and each list is one `multi_draw_indexed_indirect_count`
 //!   with vertex pulling (`lod_pull.wgsl`) and the main path's shared quad index buffer. No
-//!   per-node CPU work, and only the buckets that can be seen go through the vertex stage.
+//!   per-node CPU work, and only the buckets that can be seen go through the vertex stage. The
+//!   cull runs after the opaque and cutout terrain, against a depth pyramid of what it drew
+//!   (`lod_hiz.wgsl`): a node behind full detail over its whole screen rectangle is not drawn
+//!   (the renderer ends the main pass there and goes on in a second one).
 //!
 //! Underground ([`LodPass::prepare`]'s `sealed`: the cave culling search reached no chunk on the
 //! border of its box, so no line of sight leaves it) nothing is drawn.
