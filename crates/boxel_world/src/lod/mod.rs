@@ -437,8 +437,9 @@ pub enum LodOp {
 /// The frame's ops (the outbox), in order: the renderer takes them all in its extract step and
 /// applies them before drawing. A node is only sent while its parent chain is on the renderer
 /// (or holds nothing), and its descendants leave when it stops being there: a finer node never
-/// shows inside an octant its parent draws. Ops left at the next `Update` (no renderer) are dropped; a
-/// renderer that drops ops (no device, a resync) writes [`LodResync`] instead.
+/// shows inside an octant its parent draws. Ops left at the next `Update` (no renderer) are
+/// dropped. A renderer drops them too while it has no device; its next device starts with a
+/// resync, and a renderer that drops its nodes writes [`LodResync`].
 #[derive(Resource, Debug, Default)]
 pub struct LodOps {
     /// The ops, in order.
@@ -466,8 +467,9 @@ pub struct LodFeedback {
     pub chunks: Vec<(ChunkPos, bool)>,
 }
 
-/// Written by a renderer that dropped LOD ops or its LOD nodes (no device, a resync, a new LOD
-/// arena): every node becomes unavailable and is sent again, the coarsest level first.
+/// Written by a renderer that dropped its LOD nodes (a resync, which every new device starts
+/// with, or a new LOD arena): every node becomes unavailable and is sent again, the coarsest level
+/// first.
 #[derive(Message, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LodResync;
 

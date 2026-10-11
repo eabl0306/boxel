@@ -178,8 +178,9 @@ profundidad ni z-fighting.
   un nodo rechazado retira a sus descendientes.
 - Los nodos de nivel 1 bajo el detalle completo siguen armados: tapan el borde mientras cargan
   los chunks al volar.
-- Si las ops no llegan a un renderer (no hay uno listo, se perdió el dispositivo, un frame de
-  resync, otra arena), `extract_lod` las descarta y escribe `LodResync`: todo nodo deja de estar
+- Sin renderer (todavía no hay, o se perdió el dispositivo) `extract_lod` descarta las ops. Todo
+  renderer nuevo empieza con un frame de resync; en ese frame, y cuando cambia la arena, el
+  renderer tira sus nodos y `extract_lod` escribe `LodResync`: todo nodo deja de estar
   disponible y se vuelve a enviar, del nivel más grueso al más fino.
 - Los rechazos del renderer principal llegan por `LodFeedback.chunks`: `extract_visibility` ya
   vacía `take_refused` una vez por frame y ahora también los reenvía.
@@ -380,8 +381,11 @@ intención del plan:
 
 - `extract_lod` recibe del `extract` del render un resumen del renderer (`LodRenderer`: si el LOD
   puede dibujar ahí y con qué arena se armó su pasada), así se prueba sin GPU. Un dispositivo
-  perdido se ve como "sin renderer". `LodResync` se escribe una vez por pérdida: cuando se
-  descartan ops, o cuando antes habían llegado ops a un renderer que ya no está.
+  perdido se ve como "sin renderer".
+- Sin renderer, `extract_lod` descarta las ops pero no escribe `LodResync` (el plan pedía
+  escribirlo). Todo renderer, nuevo o rearmado después de perder el dispositivo, empieza con un
+  frame de resync, y ese frame lo escribe. Escribirlo en cada frame sin renderer haría que el
+  mundo reenvíe todo una y otra vez mientras no hay GPU.
 - `GpuState` pasó a `pub(crate)` para ordenar `extract_lod` entre `extract` y
   `extract_visibility`.
 - `RenderInfo` ganó `lod_nodes`, `lod_draws` y `lod_quads` (para F3 y `stress`).
@@ -473,8 +477,9 @@ intención del plan:
 - `boxel_shaders/tests/naga.rs`: `lod.wgsl` valida y traduce a GLSL 330 y ES 300, MSL, HLSL y
   SPIR-V; un uniform block y una textura, sin sampler; el layout de `LodImmediate`; las constantes
   iguales a las de Rust y a `octant_of`; las mips de `textureLoad` en `i32` en todos los módulos.
-- `boxel_render` sin GPU: las reglas de `extract_lod` (ops en orden, `LodResync` sin renderer,
-  una vez por pérdida, en un frame de resync y con otra arena); `lod_far` es `Some` solo cuando
+- `boxel_render` sin GPU: las reglas de `extract_lod` (ops en orden; sin renderer se descartan
+  sin `LodResync`; `LodResync` en el frame de resync del renderer nuevo y con otra arena);
+  `lod_far` es `Some` solo cuando
   `Prepare` dibuja; el foco sigue a la cámara activa; un rechazo llega a la búsqueda de cuevas y
   a `LodFeedback`; la búsqueda con el plano lejano en `H` deja visible todo chunk publicado dentro
   de la vista de recorte, mirando en diagonal sobre la banda de conservación y desde 200 bloques

@@ -6,9 +6,10 @@
 //! - `Update`: the active camera becomes [`LodFocus`], then the world side runs
 //!   ([`LodSystems`]: coverage, plan, jobs, the frame's ops).
 //! - `RenderSystems::Extract`, after the render plugin's own extract and before its cave culling
-//!   search: the ops become the frame's [`LodInput`]. A frame whose ops cannot reach a renderer
-//!   (none ready, a lost device, a resync, a new LOD arena) drops them and writes [`LodResync`]:
-//!   the world side sends every node again, coarse first.
+//!   search: the ops become the frame's [`LodInput`]. A frame without a renderer (none yet, a
+//!   lost device) drops them; a resync frame, which every new renderer starts with, or a new LOD
+//!   arena drops the renderer's nodes and writes [`LodResync`]: the world side sends every node
+//!   again, coarse first.
 //! - The render plugin does the rest: `Prepare` hands the input to the renderer (unless the LOD
 //!   failed its smoke check on this device), the cave culling search reaches the horizon while
 //!   the LOD draws ([`lod_far`]), and the refusals of the main renderer and of the LOD pass go
@@ -140,14 +141,11 @@ pub(crate) struct LodRenderer {
     pub(crate) arena_quads: Option<u32>,
 }
 
-/// What [`extract_lod`] keeps between frames.
+/// What [`extract_lod`] keeps between frames: the last valid settings (the world side logs
+/// invalid ones).
 #[derive(Default)]
 pub(crate) struct Extracted {
-    /// The last valid settings (the world side logs invalid ones).
     valid: Option<LodSettings>,
-    /// Ops went to a renderer since the last [`LodResync`]: when that renderer goes away, the
-    /// world side must hear of it.
-    sent: bool,
 }
 
 /// `RenderSystems::Extract`, after the render plugin's `extract` and before its cave culling
@@ -168,14 +166,12 @@ pub(crate) fn extract_lod(
         return;
     };
     let horizon = stats.off.is_none().then_some(stats.horizon as f32);
-    let state = &mut *state;
     let (input, resync) = frame_input(
         frame.lod_renderer,
         frame.resync,
         state.valid.as_ref(),
         horizon,
         ops.take(),
-        &mut state.sent,
     );
     frame.lod = input;
     if resync {
@@ -185,9 +181,10 @@ pub(crate) fn extract_lod(
 
 /// One frame of LOD for the renderer, and whether the world side must send every node again
 /// ([`LodResync`]):
-/// - no renderer (none yet, or its device is lost: the next one starts without LOD nodes), or no
-///   valid settings: no input; the ops are dropped, and a resync is due if any op was dropped or
-///   had reached a renderer since the last one (`sent`);
+/// - no renderer (none yet, or its device is lost), or no valid settings: no input, the ops are
+///   dropped. Nothing to tell yet: every renderer, a new one or the one rebuilt after a lost
+///   device, starts with a resync frame, and that frame asks for every node (writing it on every
+///   frame without a renderer would only make the world side send everything again and again);
 /// - a resync frame (the renderer drops every chunk: a new renderer, or a frame whose uploads
 ///   were lost, LOD copies included) or another `arena_quads` than the LOD pass was built with
 ///   (the renderer builds it again, empty): an input with no op that drops every node, and a
@@ -199,12 +196,9 @@ pub(crate) fn frame_input(
     settings: Option<&LodSettings>,
     horizon: Option<f32>,
     ops: Vec<LodOp>,
-    sent: &mut bool,
 ) -> (Option<LodInput>, bool) {
     let (Some(renderer), Some(settings)) = (renderer, settings) else {
-        let due = *sent || !ops.is_empty();
-        *sent = false;
-        return (None, due);
+        return (None, false);
     };
     let mut input = LodInput {
         ops,
@@ -216,10 +210,8 @@ pub(crate) fn frame_input(
     if resync || new_arena {
         input.ops.clear();
         input.resync = true;
-        *sent = false;
         return (Some(input), true);
     }
-    *sent |= !input.ops.is_empty();
     (Some(input), false)
 }
 
@@ -325,17 +317,15 @@ mod tests {
     #[test]
     fn ops_reach_a_ready_renderer_in_order() {
         let settings = LodSettings::default();
-        let mut sent = false;
         let (input, resync) = frame_input(
             renderer(true, Some(settings.arena_quads)),
             false,
             Some(&settings),
             Some(12288.0),
             vec![remove(1), remove(2)],
-            &mut sent,
         );
         let input = input.expect("an input");
-        assert!(!resync && !input.resync && sent);
+        assert!(!resync && !input.resync);
         assert_eq!(input.horizon, Some(12288.0));
         assert_eq!(input.ops.len(), 2);
         assert!(matches!(input.ops[1], LodOp::Remove { key } if key.pos.x == 2));
@@ -346,81 +336,52 @@ mod tests {
             Some(&settings),
             None,
             vec![remove(3)],
-            &mut sent,
         );
         assert!(!resync && input.is_some_and(|i| i.ops.len() == 1 && i.far().is_none()));
     }
 
-    /// Every frame whose ops cannot reach the renderer's LOD nodes asks the world side for every
-    /// node again: no renderer (a lost device is no renderer to `extract`), a resync frame and a
-    /// new LOD arena.
+    /// Frames whose ops cannot reach the renderer's LOD nodes: without a renderer (none yet, or a
+    /// lost device, which `extract` reports as none) the ops are dropped and the next renderer's
+    /// first frame, always a resync frame, asks the world side for every node; a resync frame and
+    /// a new LOD arena drop the renderer's nodes and ask too.
     #[test]
     fn dropped_ops_and_dropped_nodes_ask_for_a_resync() {
         let settings = LodSettings::default();
-        let mut sent = false;
-        // No renderer and nothing ever sent: nothing to tell.
-        let (input, resync) = frame_input(None, false, Some(&settings), None, vec![], &mut sent);
-        assert!(input.is_none() && !resync);
-        // Ops dropped with no renderer.
-        let (input, resync) = frame_input(
-            None,
-            false,
-            Some(&settings),
-            None,
-            vec![remove(1)],
-            &mut sent,
-        );
-        assert!(input.is_none() && resync && !sent);
-        // A renderer took ops, then went away (its device was lost) with no new op.
         let ready = renderer(true, Some(settings.arena_quads));
-        frame_input(
-            ready,
-            false,
-            Some(&settings),
-            None,
-            vec![remove(1)],
-            &mut sent,
-        );
-        assert!(sent);
-        let (input, resync) = frame_input(None, false, Some(&settings), None, vec![], &mut sent);
-        assert!(input.is_none() && resync && !sent);
-        // Once told, a renderer still away asks no more.
-        let (_, resync) = frame_input(None, false, Some(&settings), None, vec![], &mut sent);
-        assert!(!resync);
-        // A resync frame: the renderer drops every node and gets no op.
+        // A renderer took ops, then its device was lost: frames without one drop their ops and
+        // ask nothing (the world side would only send everything again into the void).
+        frame_input(ready, false, Some(&settings), None, vec![remove(1)]);
+        for ops in [vec![], vec![remove(2)]] {
+            let (input, resync) = frame_input(None, false, Some(&settings), None, ops);
+            assert!(input.is_none() && !resync);
+        }
+        // The rebuilt renderer's first frame is a resync frame: it drops every node, gets no op
+        // and asks for every node.
         let (input, resync) = frame_input(
-            ready,
+            renderer(true, None),
             true,
             Some(&settings),
             Some(1.0),
             vec![remove(1)],
-            &mut sent,
         );
         let input = input.expect("an input that drops the nodes");
-        assert!(resync && input.resync && input.ops.is_empty() && !sent);
+        assert!(resync && input.resync && input.ops.is_empty());
         // Another arena (F8 to a bigger preset): the pass is built again, empty.
         let bigger = LodSettings {
             arena_quads: 16 << 20,
             ..settings.clone()
         };
-        let (input, resync) = frame_input(
-            ready,
-            false,
-            Some(&bigger),
-            Some(1.0),
-            vec![remove(1)],
-            &mut sent,
-        );
+        let (input, resync) = frame_input(ready, false, Some(&bigger), Some(1.0), vec![remove(1)]);
         let input = input.expect("an input");
         assert!(resync && input.resync && input.ops.is_empty());
         assert_eq!(input.settings.arena_quads, 16 << 20);
         // No valid settings yet: no input.
-        let (input, _) = frame_input(ready, false, None, Some(1.0), vec![], &mut sent);
+        let (input, _) = frame_input(ready, false, None, Some(1.0), vec![]);
         assert!(input.is_none());
     }
 
-    /// The system around [`frame_input`]: it keeps the last valid settings and its `sent` state
-    /// between frames, takes the outbox and writes the message.
+    /// The system around [`frame_input`]: it keeps the last valid settings between frames, takes
+    /// the outbox and writes the message.
     #[test]
     fn extract_lod_takes_the_ops_and_writes_the_resyncs() {
         let mut world = World::new();
@@ -466,14 +427,16 @@ mod tests {
         assert_eq!(input.settings.ring_radius, 24);
         assert_eq!(input.far(), None, "no horizon while the world side is off");
 
-        // The renderer goes away after ops reached it.
+        // The renderer goes away (a lost device): its ops are dropped, nothing asked yet.
+        world.resource_mut::<LodOps>().ops.push(remove(2));
         world.resource_mut::<ExtractedFrame>().lod_renderer = None;
         schedule.run(&mut world);
         assert!(world.resource::<ExtractedFrame>().lod.is_none());
-        assert_eq!(resyncs(&mut world), 1);
+        assert!(world.resource::<LodOps>().ops.is_empty());
+        assert_eq!(resyncs(&mut world), 0);
 
-        // A resync frame.
-        world.resource_mut::<LodOps>().ops.push(remove(2));
+        // The new renderer's first frame is a resync frame: it asks for every node.
+        world.resource_mut::<LodOps>().ops.push(remove(3));
         let mut frame = world.resource_mut::<ExtractedFrame>();
         frame.lod_renderer = renderer(true, None);
         frame.resync = true;
