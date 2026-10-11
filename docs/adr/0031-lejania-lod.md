@@ -234,6 +234,9 @@ profundidad ni z-fighting.
 - `stress --lod PRESET`: el JSON trae `run.lod` y `run.lod_fill_s` (cuándo terminó el primer
   llenado), para separar los frames del llenado.
 - `snapshot --lod PRESET`: espera el llenado y lo dibuja; imprime una línea `lod:`.
+  `--lod-tint` tiñe los niveles y `--fixed-height` carga como en `voxel_world`.
+- `stress --screenshot PATH [--screenshot-yaw GRADOS]`: la captura del frame donde para el vuelo,
+  girada si se pide, para mirar el borde que avanza y la banda que queda atrás.
 - `headless_world --lod PRESET`: nodos y quads por nivel, nodos del piso aparte, tiempos de los
   trabajos y del llenado, sin GPU.
 - `tools/bench_report.py` cuenta `lod` entre los ajustes; las corridas viejas valen `off`.
@@ -544,8 +547,25 @@ intención del plan:
 Lo que yo pude mirar (capturas con `snapshot --lod far` y `voxel_world --lod far --frames`, en la
 RTX): el bosque con relieve hasta el horizonte, lagos azules, playas de arena, de día y de noche,
 sin anillo ni costura visibles desde 250 bloques de altura; sobre el mar a la altura del ojo, el
-agua cercana translúcida y la lejana opaca (el escalón de la decisión 5). Lo que falta mirar
-volando:
+agua cercana translúcida y la lejana opaca (el escalón de la decisión 5).
+
+Después hice un vuelo propio con 30 capturas en `bench-results/lod-look/` (fuera de git; cada una
+con su leyenda en `leeme.txt` y su comando en `comandos.sh`): tu pose a r12, r16 y r32, la
+diagonal, 200 bloques arriba, el mar en el borde, overworld, noche, atardecer, el tinte, `near`
+(también en la 780M), `extreme`, `--fixed-height` (también a 3000 bloques) y la niebla. Con
+`stress --screenshot` miré el frame donde termina un vuelo de 10 s a 100 bloques/s, hacia
+adelante y girando 180 grados: hacia atrás, en diagonal, desde 200 bloques y a r32. En ninguna
+captura hay cielo bajo el horizonte, grietas entre niveles ni terreno doble. No tuve que corregir
+nada del LOD. Tres cosas que se ven y son esperables:
+
+- Desde 200 bloques, el centro de un lago cercano hondo se ve azul opaco con un borde claro: esa
+  capa de chunks queda fuera del radio vertical, así que la dibuja el LOD, con su agua opaca.
+- Sobre el mar, el agua lejana opaca queda un bloque más alta que la cercana (celdas de 2 bloques
+  en el nivel 1); cerca del borde se nota como un escalón con forma de chunk.
+- Desde muy alto (1500 bloques), el bosque del nivel 2 se ve más tupido que el del nivel 1: con
+  "cualquier sólido gana" cada copa ocupa celdas enteras (decisión 4).
+
+Lo que falta mirar volando:
 
 ```bash
 cargo run --release --example voxel_world -- --lod far --timeout 900
