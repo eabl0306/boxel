@@ -19,16 +19,20 @@
 //!   is cut in pieces of about a block, and each piece blends the cell's coverage into the
 //!   coverage of the noise read at the piece's middle ([`MarchLayer::soft_coverage`]): no cell
 //!   edges near the camera. Its pieces take no face shade.
+//! - **Edges.** Near the band's floor and ceiling the threshold rises to never covered
+//!   ([`noise::row_edge`] per cell row, [`noise::point_edge`] per point of the soft fog), so the
+//!   band ends in an uneven skyline of cubes, not a plane.
 //! - **Budget.** At most `max_steps` cells over all layers; past it the rest of each chord gets
-//!   the layer's mean extinction with shade 1 (no visible wall where the budget ends).
+//!   the layer's mean extinction with shade 1 (no visible wall where the budget ends), thinned
+//!   near the edges like the cells ([`MarchLayer::tail_sigma`]).
 //! - **Early exit.** Once the optical depth passes 6 (`log2`: 8.66) nothing behind shows.
-//! - **Skip.** A lattice step of the noise whose corners leave no coverage
-//!   ([`noise::step_bound`]) is crossed in one step (never in the soft fog, which reads points
-//!   outside the step), and a layer whose every cell is full ([`MarchLayer::uniform`]) is taken
-//!   in one step without walking its cells.
+//! - **Skip.** A lattice step of the noise whose corners leave no coverage at the lowest
+//!   threshold of its rows ([`noise::step_bound`]) is crossed in one step (never in the soft fog,
+//!   which reads points outside the step), and a layer whose every cell is full
+//!   ([`MarchLayer::uniform`]) is taken in one step without walking its cells.
 
 use crate::config::{FogFade, FogLayer};
-use crate::layer::{FogTime, LayerParams};
+use crate::layer::{FogTime, LayerParams, MeanCoverage};
 use crate::noise;
 
 /// Optical depth (in `log2` units, `exp2(-tau)`) after which the march stops: `6 / ln 2`.
@@ -64,25 +68,30 @@ pub struct MarchLayer {
     pub fade: [f32; 2],
     /// The farthest the layer is drawn (blocks along the ray).
     pub max_distance: f32,
-    /// Mean extinction (per block, times `log2(e)`) for the rest of a ray past the budget.
+    /// Mean extinction (per block, times `log2(e)`) for the rest of a ray past the budget, away
+    /// from the edges ([`MeanCoverage::core`]).
     pub sigma_mean_log2e: f32,
-    /// Every cell is full (threshold 0 without a rise, softness 0): the march takes each chord
-    /// whole.
+    /// The same where an edge raises the threshold a quarter, a half and three quarters of the
+    /// way ([`MeanCoverage::edge`]).
+    pub sigma_edge_log2e: [f32; 3],
+    /// Every cell is full (threshold 0 without a rise or edges, softness 0): the march takes
+    /// each chord whole.
     pub uniform: bool,
 }
 
 impl MarchLayer {
     /// A layer for `render_origin` at `time`: `lit` is its color under this frame's light,
-    /// `scene_fade` the scene's fog start and end (used by [`FogFade::Scene`]), `mean_coverage`
-    /// its [`crate::mean_coverage`].
+    /// `scene_fade` the scene's fog start and end (used by [`FogFade::Scene`]), `mean` its
+    /// [`crate::mean_coverage`] (a plain number is [`MeanCoverage::level`]).
     pub fn new(
         layer: &FogLayer,
         render_origin: [i64; 3],
         time: impl Into<FogTime>,
         lit: [f32; 3],
         scene_fade: [f32; 2],
-        mean_coverage: f32,
+        mean: impl Into<MeanCoverage>,
     ) -> Self {
+        let mean = mean.into();
         let params = LayerParams::new(layer, render_origin, time);
         let fade = match layer.fade {
             FogFade::Scene => scene_fade,
@@ -104,8 +113,12 @@ impl MarchLayer {
             soft,
             fade,
             max_distance: layer.max_distance,
-            sigma_mean_log2e: params.density_log2e * mean_coverage,
-            uniform: params.threshold == 0 && params.rise == 0 && params.gain == noise::MAX_GAIN,
+            sigma_mean_log2e: params.density_log2e * mean.core,
+            sigma_edge_log2e: mean.edge.map(|m| params.density_log2e * m),
+            uniform: params.threshold == 0
+                && params.rise == 0
+                && params.edges == [0; 2]
+                && params.gain == noise::MAX_GAIN,
         }
     }
 
@@ -131,7 +144,7 @@ impl MarchLayer {
 
     /// The soft fog's coverage (0 to 1) at `pos` (relative to the render origin): the noise read
     /// at that point half a cell back (so the middle of a cell reads that cell's value) and the
-    /// threshold at that height.
+    /// threshold at that height, raised by the edges ([`noise::point_edge`]).
     pub fn soft_coverage(&self, pos: [f32; 3]) -> f32 {
         let p = &self.params;
         let mut d = [0; 3];
@@ -148,8 +161,29 @@ impl MarchLayer {
             let h = ((pos[1] - p.band[0]) / (p.band[1] - p.band[0]).max(1.0)).clamp(0.0, 1.0);
             noise::threshold_at(p.threshold, p.rise, (h * 4096.0) as u32)
         };
+        let threshold = if p.edges == [0; 2] {
+            threshold
+        } else {
+            noise::raise(threshold, noise::smooth_ramp(noise::point_edge(p, pos[1])))
+        };
         let n = noise::noise_at(p, d, sub);
         noise::coverage_from_noise(n, threshold, p.gain) as f32 / 4096.0
+    }
+
+    /// Extinction (per block, `log2`) of the rest of a ray past the budget at height `y`: the
+    /// mean away from the edges, thinned near the band's planes as the edges thin the cells
+    /// ([`MeanCoverage::at`] at the soft fog's [`noise::point_edge`]), none within half a cell
+    /// of a plane with an edge.
+    pub fn tail_sigma(&self, y: f32) -> f32 {
+        let w = noise::point_edge(&self.params, y);
+        if w == 0 {
+            return self.sigma_mean_log2e;
+        }
+        MeanCoverage {
+            core: self.sigma_mean_log2e,
+            edge: self.sigma_edge_log2e,
+        }
+        .at(noise::smooth_ramp(w))
     }
 
     /// The farthest distance drawn: `min(max_distance, fade end)`.
@@ -523,6 +557,8 @@ fn march_layer(
         let (a, b, pieces, last);
         // The extinction of the rest of the chord, or the cell's coverage.
         let mut rest = None;
+        // The rest is the tail past the budget (thinned near the edges).
+        let mut tail = false;
         let mut cov = 0.0;
         let mut soft = false;
         let mut axis = 2;
@@ -530,6 +566,7 @@ fn march_layer(
             // Past the budget: the rest at the mean density.
             (a, b, pieces, last) = (s0, tb, UNIFORM_PIECES, true);
             rest = Some(layer.sigma_mean_log2e);
+            tail = true;
             shade = 1.0;
         } else if layer.uniform {
             // One body without inner faces: one step.
@@ -578,6 +615,7 @@ fn march_layer(
             let pa = a + i as f32 * piece;
             let pb = if i + 1 == pieces { b } else { pa + piece };
             let (sigma, sh) = match rest {
+                Some(_) if tail => (layer.tail_sigma(eye[1] + 0.5 * (pa + pb) * dir[1]), shade),
                 Some(sigma) => (sigma, shade),
                 None => {
                     let (mut c, mut sh) = (cov, shade);

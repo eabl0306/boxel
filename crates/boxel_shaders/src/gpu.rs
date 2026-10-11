@@ -73,7 +73,7 @@ pub struct FogHeader {
     /// xyz = eye relative to the render origin, w = 0.
     pub eye: [f32; 4],
     /// x = layer count (sorted by height), y = flags ([`fog::FLAG_HALF`]), z = step budget,
-    /// w = 0.
+    /// w = the first height of the debug's edge weights (`f32` bits, 0 for the march).
     pub counts: [u32; 4],
     /// rgb = sky color (where layers fade to), a = 0.
     pub sky: [f32; 4],
@@ -89,11 +89,13 @@ pub struct FogLayerGpu {
     /// x, y = band `[min, max)` relative to the render origin's y; z = reach (blocks along the
     /// ray); w = mean extinction per block (`log2` units).
     pub band: [f32; 4],
-    /// x, y = fade start and end distance; z = extinction per block of a full cell (`log2`).
+    /// x, y = fade start and end distance; z = extinction per block of a full cell (`log2`);
+    /// w = the mean extinction where an edge raises the threshold a quarter of the way.
     pub fade: [f32; 4],
-    /// xyz = min corner of the origin's cell relative to the render origin (blocks).
+    /// xyz = min corner of the origin's cell relative to the render origin (blocks); w = the
+    /// mean extinction at half the way.
     pub grid: [f32; 4],
-    /// xyz = cell size in blocks.
+    /// xyz = cell size in blocks; w = the mean extinction at three quarters of the way.
     pub size: [f32; 4],
     /// rgb = color of a lit cell.
     pub lit: [f32; 4],
@@ -116,7 +118,8 @@ pub struct FogLayerGpu {
     pub shape: [u32; 4],
     /// xyz = the wind's fraction of a cell (1/4096), w = 0.
     pub wind: [i32; 4],
-    /// x, y = band cells `[first, end)` relative to the origin's cell, zw = 0.
+    /// x, y = band cells `[first, end)` relative to the origin's cell; z, w = depth of the
+    /// bottom and the top edge in blocks (0: none).
     pub cells: [i32; 4],
 }
 

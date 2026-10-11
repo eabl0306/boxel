@@ -1,9 +1,12 @@
 //! The GPU's split of the noise ([`LayerParams`] plus a small cell offset, with carries into
 //! the high words) against the direct `i128` computation from the absolute cell, far from the
 //! origin too (ADR 0014): the same coverage, bit for bit, at the cells' corners and at points
-//! inside them, at whole ticks and between them. And how the coverage moves with the wind.
+//! inside them, at whole ticks and between them, with a rising threshold and edges. And how the
+//! coverage moves with the wind.
 use boxel_fog::layer::displacement;
-use boxel_fog::noise::{coverage, coverage_direct, noise_at, noise_direct, step_bound};
+use boxel_fog::noise::{
+    coverage, coverage_direct, noise_at, noise_direct, row_threshold, step_bound,
+};
 use boxel_fog::{FogLayer, FogTime, LayerParams, NoiseDims};
 use boxel_voxel::MAX_BLOCK_COORD;
 use proptest::prelude::*;
@@ -34,6 +37,11 @@ fn origin_strategy() -> impl Strategy<Value = i64> {
     (0..centers.len(), -5000i64..5000).prop_map(move |(i, off)| centers[i] + off)
 }
 
+/// Edge depths in blocks: none, shallow, a few cells, up to the most.
+fn edge_strategy() -> impl Strategy<Value = u32> {
+    prop_oneof![Just(0u32), 1u32..=16, 0u32..=boxel_fog::MAX_EDGE]
+}
+
 fn cell_strategy() -> impl Strategy<Value = [u32; 3]> {
     prop_oneof![
         Just([1, 1, 1]),
@@ -55,6 +63,9 @@ proptest! {
         tick in prop_oneof![Just(0u64), 0u64..100_000, 0u64..(1 << 40)],
         subtick in prop_oneof![Just(0u16), any::<u16>()],
         rise in prop_oneof![Just(0.0f32), 0.0f32..=1.0],
+        edges in (edge_strategy(), edge_strategy()),
+        band in (-40i64..40, 1i64..40),
+        near in any::<bool>(),
         d in prop::array::uniform3(-4096i32..=4096),
         sub in prop::array::uniform3(0i32..4096),
     ) {
@@ -62,7 +73,14 @@ proptest! {
         let dims = if volume { NoiseDims::Volume } else { NoiseDims::Flat };
         let mut layer = layer(cell, 1 << l, octaves, dims, seed);
         layer.threshold_rise = rise;
+        (layer.edge_bottom, layer.edge_top) = edges;
+        // A band of `band.1` rows starting `band.0` rows from the origin's: the edges and the
+        // rise land on the cells of `d` near it, and far from it.
+        let cy = i64::from(cell[1]);
         let origin = [ox, oy, oz];
+        let c0 = oy.div_euclid(cy);
+        (layer.min_y, layer.max_y) = ((c0 + band.0) * cy, (c0 + band.0 + band.1) * cy);
+        let d = if near { [d[0], d[1] % 64, d[2]] } else { d };
         let time = FogTime::new(tick, subtick);
         let p = LayerParams::new(&layer, origin, time);
         let abs = std::array::from_fn(|a| p.c0[a] + i64::from(d[a]));
@@ -78,7 +96,8 @@ proptest! {
         d in prop::array::uniform3(-200i32..=200),
         tick in 0u64..1_000_000,
     ) {
-        let layer = layer([2, 2, 2], 8, 2, NoiseDims::Volume, 7);
+        let mut layer = layer([2, 2, 2], 8, 2, NoiseDims::Volume, 7);
+        (layer.min_y, layer.max_y, layer.edge_bottom, layer.edge_top) = (40, 80, 6, 12);
         let a = LayerParams::new(&layer, [ox, 64, oz], tick);
         let b = LayerParams::new(&layer, [ox + shift[0], 64 + shift[1], oz + shift[2]], tick);
         let abs: [i64; 3] = std::array::from_fn(|i| a.c0[i] + i64::from(d[i]));
@@ -238,16 +257,30 @@ proptest! {
     fn the_step_bound_is_conservative(
         ox in origin_strategy(), oz in origin_strategy(),
         l in 1u32..=3, two in any::<bool>(), volume in any::<bool>(), seed in any::<u64>(),
-        threshold in 0.3f32..0.9, softness in 0.0f32..0.5,
+        threshold in 0.2f32..0.9, softness in 0.0f32..0.5,
+        rise in prop_oneof![Just(0.0f32), 0.0f32..0.6],
+        edges in (edge_strategy(), edge_strategy()),
         tick in 0u64..100_000,
-        d in prop::array::uniform3(-300i32..=300),
+        d in prop::array::uniform3(-40i32..=40),
     ) {
         let dims = if volume { NoiseDims::Volume } else { NoiseDims::Flat };
         let mut layer = layer([2, 2, 2], 1 << l, if two { 2 } else { 1 }, dims, seed);
         layer.threshold = threshold;
         layer.softness = softness;
+        layer.threshold_rise = rise;
+        // A band of 24 rows around the origin's cell (y 64): the steps cross its planes.
+        (layer.min_y, layer.max_y) = (40, 88);
+        let plain = LayerParams::new(&layer, [ox, 64, oz], tick);
+        (layer.edge_bottom, layer.edge_top) = edges;
         let p = LayerParams::new(&layer, [ox, 64, oz], tick);
         let bound = step_bound(&p, d);
+        // The rise and the edges only raise the bound's threshold: they skip more, never less.
+        prop_assert_eq!(step_bound(&plain, d), bound);
+        prop_assert!(bound.threshold(&p) >= bound.threshold(&plain));
+        prop_assert!(bound.threshold(&plain) >= p.threshold);
+        if bound.is_empty(&plain) {
+            prop_assert!(bound.is_empty(&p));
+        }
         for (a, &da) in d.iter().enumerate() {
             if a == 1 && !volume {
                 prop_assert_eq!((bound.lo[a], bound.hi[a]), (i32::MIN, i32::MAX));
@@ -256,12 +289,14 @@ proptest! {
                 prop_assert_eq!(bound.hi[a] - bound.lo[a], 1 << l);
             }
         }
-        let ys = if volume { bound.lo[1]..bound.hi[1] } else { d[1]..d[1] + 1 };
+        // Flat noise: the step has every row; check the band's and one past each plane.
+        let ys = if volume { bound.lo[1]..bound.hi[1] } else { -13..13 };
         for x in bound.lo[0]..bound.hi[0] {
             for y in ys.clone() {
                 for z in bound.lo[2]..bound.hi[2] {
                     let c = coverage(&p, [x, y, z]);
                     prop_assert!(c.noise <= bound.max_noise, "{:?} over {}", c, bound.max_noise);
+                    prop_assert!(row_threshold(&p, y) >= bound.threshold(&p), "row {}", y);
                     if bound.is_empty(&p) {
                         prop_assert_eq!(c.coverage, 0);
                     }

@@ -5,7 +5,7 @@ use super::{FogInput, FogSettings};
 use crate::MAIN_COLOR_FORMAT;
 use crate::renderer::ViewParams;
 use boxel_fog::march::MarchLayer;
-use boxel_fog::{FogLayer, FogResolution, FogTime, RayBasis, mean_coverage};
+use boxel_fog::{FogLayer, FogResolution, FogTime, MeanCoverage, RayBasis, mean_coverage};
 use boxel_math::UVec2;
 use boxel_shaders::gpu::{
     FOG_BUFFER_SIZE, FOG_LAYERS_OFFSET, FOG_MAX_LAYERS, FogHeader, FogLayerGpu, bindings, fog,
@@ -22,7 +22,7 @@ pub(crate) const FOG_TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R
 /// ([`mean_coverage`]), in the order of `settings.layers`.
 pub fn frame_layers(
     settings: &FogSettings,
-    means: &[f32],
+    means: &[MeanCoverage],
     view: &ViewParams,
     time: impl Into<FogTime>,
 ) -> Vec<MarchLayer> {
@@ -42,7 +42,7 @@ pub fn frame_layers(
                 time,
                 lit,
                 [view.fog_start, view.fog_end],
-                means.get(i).copied().unwrap_or(0.0),
+                means.get(i).copied().unwrap_or_default(),
             );
             let [lo, hi] = m.params.band;
             let gap = if eye_y < lo {
@@ -74,11 +74,17 @@ fn layer_gpu(m: &MarchLayer) -> FogLayerGpu {
     let flags = if p.volume { fog::LAYER_VOLUME } else { 0 }
         | if m.uniform { fog::LAYER_UNIFORM } else { 0 };
     let [r, g, b] = m.lit;
+    let tail = m.sigma_edge_log2e;
     FogLayerGpu {
         band: [p.band[0], p.band[1], m.reach(), m.sigma_mean_log2e],
-        fade: [m.fade[0], m.fade[1], p.density_log2e, 0.0],
-        grid: [p.grid[0], p.grid[1], p.grid[2], 0.0],
-        size: [p.cell[0] as f32, p.cell[1] as f32, p.cell[2] as f32, 0.0],
+        fade: [m.fade[0], m.fade[1], p.density_log2e, tail[0]],
+        grid: [p.grid[0], p.grid[1], p.grid[2], tail[1]],
+        size: [
+            p.cell[0] as f32,
+            p.cell[1] as f32,
+            p.cell[2] as f32,
+            tail[2],
+        ],
         lit: [r, g, b, 0.0],
         face: m.face_shade,
         soft: [m.soft[0], m.soft[1], m.height_shade[0], m.height_shade[1]],
@@ -88,7 +94,12 @@ fn layer_gpu(m: &MarchLayer) -> FogLayerGpu {
         octave2: [0, p.seed32_2, p.octaves, flags],
         shape: [p.threshold, p.gain, p.rise, p.rows],
         wind: [p.q[0], p.q[1], p.q[2], 0],
-        cells: [p.band_cells[0], p.band_cells[1], 0, 0],
+        cells: [
+            p.band_cells[0],
+            p.band_cells[1],
+            p.edges[0] as i32,
+            p.edges[1] as i32,
+        ],
     }
 }
 
@@ -116,7 +127,7 @@ pub(crate) struct FogPass {
     target: Option<Target>,
     input: Option<FogInput>,
     /// Mean coverage of each layer of `means_for`.
-    means: Vec<f32>,
+    means: Vec<MeanCoverage>,
     means_for: Option<Arc<FogSettings>>,
 }
 
@@ -556,7 +567,8 @@ pub(crate) fn read_words(
 /// Testing: the noise and coverage `fs_fog_debug_coverage` computes for layer `layer` at
 /// `render_origin` and `time`, at `sub` (1/4096 cells per axis) past the min corner of the cells
 /// `first + (x, 0, z)` for `x < size[0]` and `z < size[1]` (relative to the origin's cell), row
-/// by row: `[coverage, noise]` each (the coverage at the threshold of the cell's row).
+/// by row: `[coverage, noise, edge]` each (the coverage at the threshold of the cell's row; the
+/// soft fog's edge weight at height `y0 + (x + 64 z) / 16`, relative to the render origin).
 #[doc(hidden)]
 #[expect(
     clippy::too_many_arguments,
@@ -570,8 +582,9 @@ pub fn debug_coverage(
     time: impl Into<FogTime>,
     first: [i32; 3],
     sub: i32,
+    y0: f32,
     size: [u32; 2],
-) -> Result<Vec<[u32; 2]>, String> {
+) -> Result<Vec<[u32; 3]>, String> {
     let time = time.into();
     let mut words = Vec::new();
     boxel_gfx::run_in_error_scopes(device, || {
@@ -595,6 +608,7 @@ pub fn debug_coverage(
         );
         let m = MarchLayer::new(layer, render_origin, time, [1.0; 3], [0.0, 1.0], 0.0);
         let header = FogHeader {
+            counts: [0, 0, 0, y0.to_bits()],
             debug: [first[0], first[1], first[2], sub],
             ..FogHeader::default()
         };
@@ -663,7 +677,7 @@ pub fn debug_coverage(
         .as_chunks::<4>()
         .0
         .iter()
-        .map(|w| [w[0], w[1]])
+        .map(|w| [w[0], w[1], w[2]])
         .collect())
 }
 
@@ -694,7 +708,7 @@ mod tests {
         let mut empty = FogLayer::new(40, 48);
         empty.threshold = 1.0;
         let settings = FogSettings::new(vec![high, low, empty]);
-        let means = [1.0, 1.0, 0.0];
+        let means = [1.0, 1.0, 0.0].map(MeanCoverage::level);
         let near_low = frame_layers(&settings, &means, &view_at(4.5), 0);
         assert_eq!(
             near_low.len(),
@@ -720,7 +734,7 @@ mod tests {
             let mut layer = FogLayer::new(0, 8);
             layer.color = [0.5; 3];
             layer.sky_tint = tint;
-            frame_layers(&FogSettings::new(vec![layer]), &[1.0], &view, 0)[0].lit
+            frame_layers(&FogSettings::new(vec![layer]), &[1.0.into()], &view, 0)[0].lit
         };
         assert_eq!(lit(0.0), [0.5; 3], "lit by the noon sky");
         assert_eq!(lit(1.0), [1.0, 0.5, 0.25]);
@@ -750,6 +764,25 @@ mod tests {
         assert_eq!(gpu.base_hi[0], u32::MAX, "a negative lattice point");
         assert_eq!(gpu.fade[..2], [10.0, 20.0]);
         assert_eq!(gpu.band[3], m.params.density_log2e * 0.25);
-        assert_eq!(gpu.cells[..2], m.params.band_cells);
+        assert_eq!(
+            gpu.cells,
+            [m.params.band_cells[0], m.params.band_cells[1], 0, 0]
+        );
+        // Edges: their depths, and the tail's means through them; never uniform.
+        layer.edge_bottom = 4;
+        layer.edge_top = 10;
+        let mean = MeanCoverage {
+            core: 1.0,
+            edge: [0.75, 0.5, 0.25],
+        };
+        let edged = MarchLayer::new(&layer, [-5, 3, 1 << 40], 99, [0.5; 3], [10.0, 20.0], mean);
+        let gpu = layer_gpu(&edged);
+        assert_eq!(gpu.cells[2..], [4, 10]);
+        assert_eq!(gpu.octave2[3], fog::LAYER_VOLUME, "edges are never uniform");
+        let d = edged.params.density_log2e;
+        assert_eq!(
+            [gpu.band[3], gpu.fade[3], gpu.grid[3], gpu.size[3]],
+            [d, d * 0.75, d * 0.5, d * 0.25]
+        );
     }
 }

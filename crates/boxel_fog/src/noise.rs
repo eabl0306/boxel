@@ -18,10 +18,14 @@
 //! - **Coverage.** A ramp `clamp(n + 1 - threshold, 0, 4095) * gain >> 8`, at most 4096 (one),
 //!   through the fixed-point smoothstep: a cell whose noise crosses the threshold starts almost
 //!   empty and fills in. The threshold rises with the cell's row in the band
-//!   ([`threshold_at`]).
+//!   ([`threshold_at`]), and near the band's floor and ceiling it rises to never covered along
+//!   their edges ([`edge_weight`], [`raise`]).
 //!
 //! A cell reads the noise at its min corner; the soft fog near the camera reads it at any point
 //! in 1/4096 of a cell ([`noise_at`]), so a cell's value is the soft fog's half a cell before.
+//! The edges follow the same rule: a cell row measures its distance to a plane from its face
+//! nearest it ([`row_edge`]) and the soft fog from half a cell inside the point
+//! ([`point_edge`]), so the middle of a cell has its row's edge.
 //!
 //! The GPU never sees an absolute coordinate: [`LayerParams`] splits the
 //! cell of the render origin into a lattice point (low and high words) and an offset inside its
@@ -166,13 +170,79 @@ pub fn row_height(row: i64, rows: u32) -> u32 {
     ((2 * r + 1) * 2048) / rows
 }
 
-/// The threshold of the cells `dy` rows above the origin's cell.
+/// The threshold of the cells `dy` rows above the origin's cell: its row's rise
+/// ([`rise_threshold`]) raised by the edges ([`row_edge`]).
 pub fn row_threshold(p: &LayerParams, dy: i32) -> u32 {
+    let threshold = rise_threshold(p, dy);
+    if p.edges == [0; 2] {
+        return threshold;
+    }
+    raise(threshold, smooth_ramp(row_edge(p, dy)))
+}
+
+/// The threshold the rise gives the cells `dy` rows above the origin's cell (rows outside the
+/// band take the nearest row's). Never falls as `dy` grows.
+pub fn rise_threshold(p: &LayerParams, dy: i32) -> u32 {
     if p.rise == 0 {
         return p.threshold;
     }
     let row = i64::from(dy) - i64::from(p.band_cells[0]);
     threshold_at(p.threshold, p.rise, row_height(row, p.rows))
+}
+
+/// Rows and blocks past which an edge has no weight: deeper than [`MAX_EDGE`]. Distances are
+/// clamped to it first, so every product stays under `2^31`.
+///
+/// [`MAX_EDGE`]: crate::config::MAX_EDGE
+pub const EDGE_REACH: i32 = 2048;
+const _: () = assert!(crate::config::MAX_EDGE < EDGE_REACH as u32);
+
+/// The weight (`0..=4096`) of an edge `edge` blocks deep at `d12` (1/4096 blocks, at most
+/// `2^28`) from its plane: 4096 at the plane and past it (`d12 <= 0`), falling linearly to 0 at
+/// `edge` blocks. 0 without an edge.
+#[inline]
+pub const fn edge_weight(d12: i32, edge: u32) -> u32 {
+    if edge == 0 {
+        return 0;
+    }
+    if d12 <= 0 {
+        return 4096;
+    }
+    let w = 4096 - d12 / edge as i32;
+    if w < 0 { 0 } else { w as u32 }
+}
+
+/// `threshold` raised `s` (`0..=4096`) of the way to 4096, never covered:
+/// `threshold + (4096 - threshold) * s`. Never falls as either grows; a threshold of 4096 or
+/// more stays as it is.
+#[inline]
+pub const fn raise(threshold: u32, s: u32) -> u32 {
+    threshold + ((4096u32.saturating_sub(threshold) * s) >> 12)
+}
+
+/// The edge weight of the cells `dy` rows above the origin's cell: the larger of the bottom's
+/// and the top's, each by the distance from its plane to the row's face nearest it (the row
+/// along a plane, and any row past it, has 4096). The band cells are exact or clamped far
+/// enough that the weight is the same.
+pub fn row_edge(p: &LayerParams, dy: i32) -> u32 {
+    let [bottom, top] = p.edges;
+    let cy = p.cell[1] as i32;
+    let below = (dy - p.band_cells[0]).clamp(0, EDGE_REACH);
+    let above = (p.band_cells[1] - 1 - dy).clamp(0, EDGE_REACH);
+    edge_weight((below * cy) << 12, bottom).max(edge_weight((above * cy) << 12, top))
+}
+
+/// The edge weight the soft fog reads at height `y` (relative to the render origin): by the
+/// distance to each plane less half a cell, in 1/4096 blocks, so the middle of a cell has its
+/// row's [`row_edge`] exactly and the last half cell before a plane has 4096.
+pub fn point_edge(p: &LayerParams, y: f32) -> u32 {
+    let [bottom, top] = p.edges;
+    if bottom == 0 && top == 0 {
+        return 0;
+    }
+    let half = p.cell[1] as f32 * 0.5;
+    let d12 = |d: f32| (d.clamp(-1.0, EDGE_REACH as f32) * 4096.0) as i32;
+    edge_weight(d12(y - p.band[0] - half), bottom).max(edge_weight(d12(p.band[1] - y - half), top))
 }
 
 /// Mixes two octaves: `(2 * v1 + v2) / 3` in fixed point.
@@ -276,7 +346,7 @@ pub fn noise_at(p: &LayerParams, d: [i32; 3], sub: [i32; 3]) -> i32 {
 /// along each axis (unbounded along y for flat noise) interpolates the same corners, and value
 /// noise never leaves the range of its corners, so none of them has more noise than
 /// `max_noise` (with two octaves the second one is bounded by 4095). The march skips a whole
-/// step when even that leaves no coverage at the band's lowest threshold
+/// step when even that leaves no coverage at the lowest threshold of the step's rows
 /// ([`StepBound::is_empty`]). It bounds the cells' noise, not the soft fog's, which reads
 /// points up to half a cell outside the step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -290,10 +360,31 @@ pub struct StepBound {
 }
 
 impl StepBound {
-    /// True if no cell of the step can have coverage (the threshold only rises above the
-    /// band's bottom).
+    /// True if no cell of the step can have coverage at [`StepBound::threshold`].
     pub fn is_empty(&self, p: &LayerParams) -> bool {
-        coverage_from_noise(self.max_noise, p.threshold, p.gain) == 0
+        coverage_from_noise(self.max_noise, self.threshold(p), p.gain) == 0
+    }
+
+    /// A threshold no cell of the step is under ([`row_threshold`]). With flat noise the step
+    /// has every row: the band's bottom threshold. With 3D noise, the rise of its lowest row
+    /// raised by the least edge weight its rows can have (the bottom edge's at its highest row,
+    /// the top edge's at its lowest), less one for the smoothstep's dips of 1. Edges and the
+    /// rise only ever skip more steps, never one with coverage.
+    pub fn threshold(&self, p: &LayerParams) -> u32 {
+        if !p.volume {
+            return p.threshold;
+        }
+        let (low, high) = (self.lo[1], self.hi[1] - 1);
+        let threshold = rise_threshold(p, low);
+        if p.edges == [0; 2] {
+            return threshold;
+        }
+        let cy = p.cell[1] as i32;
+        let below = (high - p.band_cells[0]).clamp(0, EDGE_REACH);
+        let above = (p.band_cells[1] - 1 - low).clamp(0, EDGE_REACH);
+        let w = edge_weight((below * cy) << 12, p.edges[0])
+            .max(edge_weight((above * cy) << 12, p.edges[1]));
+        raise(threshold, smooth_ramp(w).saturating_sub(1))
     }
 }
 
@@ -347,16 +438,24 @@ fn corner_values(axes: [Axis; 3], seed32: u32) -> [i32; 8] {
 }
 
 /// The coverage of absolute cell `cell` at `time`, computed directly in `i128` from the cell,
-/// its row in the band and the wind: the reference [`coverage`] must equal.
+/// its row in the band, the band's planes and the wind: the reference [`coverage`] must equal.
 pub fn coverage_direct(layer: &FogLayer, cell: [i64; 3], time: impl Into<FogTime>) -> Coverage {
     let noise = noise_direct(layer, cell, [0; 3], time);
     let cy = i64::from(layer.cell[1].max(1));
-    let row = cell[1].saturating_sub(layer.min_y.div_euclid(cy));
-    let threshold = threshold_at(
+    let (bottom, top) = (layer.min_y.div_euclid(cy), layer.max_y.div_euclid(cy));
+    let row = cell[1].saturating_sub(bottom);
+    let rise = threshold_at(
         threshold_units(layer.threshold),
         threshold_units(layer.threshold_rise),
         row_height(row, profile_rows(layer)),
     );
+    // Whole rows from each plane to the row's nearer face, then blocks in 1/4096.
+    let reach = |rows: i128| (rows.clamp(0, i128::from(EDGE_REACH)) * i128::from(cy)) << 12;
+    let below = reach(i128::from(cell[1]) - i128::from(bottom));
+    let above = reach(i128::from(top) - 1 - i128::from(cell[1]));
+    let w =
+        edge_weight(below as i32, layer.edge_bottom).max(edge_weight(above as i32, layer.edge_top));
+    let threshold = raise(rise, smooth_ramp(w));
     Coverage {
         noise,
         coverage: coverage_from_noise(noise, threshold, gain_units(layer.softness)),
@@ -496,6 +595,62 @@ mod tests {
         // Flat ends: the first and last 5 % of the ramp move the coverage by under 1 %.
         assert!(smooth_ramp(205) < 41);
         assert!(smooth_ramp(4096 - 205) > 4096 - 41);
+    }
+
+    /// The edge weight falls linearly from 4096 at the plane to 0 at the edge's depth; the
+    /// raised threshold reaches never covered at 4096 and never falls.
+    #[test]
+    fn edges_raise_the_threshold_to_never_covered() {
+        assert_eq!(edge_weight(0, 0), 0, "no edge");
+        assert_eq!(edge_weight(-5, 8), 4096, "past the plane");
+        assert_eq!(edge_weight(0, 8), 4096, "at the plane");
+        assert_eq!(edge_weight(2 << 12, 8), 3072);
+        assert_eq!(edge_weight(4 << 12, 8), 2048);
+        assert_eq!(edge_weight(8 << 12, 8), 0);
+        assert_eq!(edge_weight(1 << 28, 1), 0, "deep inside");
+        for edge in [1, 3, 8, 100, 1024] {
+            for d in 1..(4 << 12) {
+                assert!(
+                    edge_weight(d, edge) <= edge_weight(d - 1, edge),
+                    "{edge} {d}"
+                );
+            }
+        }
+        assert_eq!(raise(1000, 0), 1000);
+        assert_eq!(raise(1000, 4096), 4096);
+        assert_eq!(raise(1000, 2048), 2548);
+        assert_eq!(raise(5000, 4096), 5000, "already never covered");
+        // Never falls as the threshold or the raise grows.
+        for s in (0..=4096).step_by(7) {
+            for t in 1..=8192 {
+                assert!(raise(t, s) >= raise(t - 1, s), "{t} {s}");
+            }
+        }
+        for t in (0..=8192).step_by(5) {
+            for s in 1..=4096 {
+                assert!(raise(t, s) >= raise(t, s - 1), "{t} {s}");
+            }
+        }
+        // At the plane nothing is covered, whatever the noise and the softness.
+        for gain in [256, 1024, MAX_GAIN] {
+            for t in [0, 1000, 4000] {
+                assert_eq!(
+                    coverage_from_noise(4095, raise(t, smooth_ramp(4096)), gain),
+                    0
+                );
+            }
+        }
+    }
+
+    /// The smoothstep dips by at most one: a lower bound of the edge's raise is the smoothstep
+    /// of the least weight less one (what the empty-step bound uses).
+    #[test]
+    fn the_smoothstep_dips_by_one_at_most() {
+        let mut least_after = u32::MAX;
+        for w in (0..=4096u32).rev() {
+            least_after = least_after.min(smooth_ramp(w));
+            assert!(least_after + 1 >= smooth_ramp(w), "{w}");
+        }
     }
 
     #[test]

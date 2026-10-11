@@ -19,6 +19,8 @@ pub const DEFAULT_MAX_STEPS: u32 = 64;
 pub const MAX_SOFT_DISTANCE: f32 = 32.0;
 /// Most cell rows a band with a [`FogLayer::threshold_rise`] may have.
 pub const MAX_PROFILE_ROWS: i64 = 1 << 16;
+/// Deepest [`FogLayer::edge_bottom`] and [`FogLayer::edge_top`], in blocks.
+pub const MAX_EDGE: u32 = 1024;
 
 /// One layer of fog or clouds: the cells of `[min_y, max_y)` with one density each.
 ///
@@ -44,6 +46,16 @@ pub struct FogLayer {
     /// square of the height: 0 keeps it level. With more, the cells thin out upwards from a
     /// flat, wide base into rounded, uneven tops (cumulus clouds).
     pub threshold_rise: f32,
+    /// Depth of the bottom edge, in blocks (0 to [`MAX_EDGE`]). Within it the threshold rises
+    /// along a smoothstep to never covered at `min_y`, so near the floor only cells of strong
+    /// noise have fog and every column ends at its own height: an uneven underside of cubes
+    /// instead of a flat plane. Distances are measured to a row's face nearest the plane, so the
+    /// row along the plane is always empty, and an edge of a few cells looks best (one under a
+    /// cell only empties that row). 0 (the default) cuts the band at the plane.
+    pub edge_bottom: u32,
+    /// Depth of the top edge, in blocks (0 to [`MAX_EDGE`]): like [`FogLayer::edge_bottom`],
+    /// below `max_y`, for an uneven skyline of cubes instead of a flat top.
+    pub edge_top: u32,
     /// Width of the noise range (0 to 1) over which a cell goes from empty to full, along a
     /// smoothstep. As the wind moves the noise, a cell is born almost transparent and fills in,
     /// and a dying one fades out; the outer cells of a bank are thinner than the inner ones. 0
@@ -78,8 +90,8 @@ pub struct FogLayer {
 
 impl FogLayer {
     /// A plain blanket over `[min_y, max_y)`: 1-block cells, every cell full, white, seen about
-    /// 50 blocks through, no shading, cubic up to the camera, no wind, drawn to 512 blocks,
-    /// faded like the terrain.
+    /// 50 blocks through, no shading, cubic up to the camera, cut flat at both planes, no wind,
+    /// drawn to 512 blocks, faded like the terrain.
     pub fn new(min_y: i64, max_y: i64) -> Self {
         Self {
             min_y,
@@ -88,6 +100,8 @@ impl FogLayer {
             noise: FogNoise::default(),
             threshold: 0.0,
             threshold_rise: 0.0,
+            edge_bottom: 0,
+            edge_top: 0,
             softness: 0.0,
             density: density_for_visibility(50.0),
             color: [1.0; 3],
@@ -198,6 +212,8 @@ pub enum FogError {
     BadDistance(usize),
     /// A threshold rise over a band of more than [`MAX_PROFILE_ROWS`] cell rows.
     TallProfile(usize),
+    /// An edge deeper than [`MAX_EDGE`] blocks.
+    DeepEdge(usize),
     /// The step budget is outside `1..=256`.
     BadSteps,
 }
@@ -234,6 +250,9 @@ impl std::fmt::Display for FogError {
                 f,
                 "fog layer {i}: a threshold rise needs a band of at most {MAX_PROFILE_ROWS} cell rows"
             ),
+            FogError::DeepEdge(i) => {
+                write!(f, "fog layer {i}: an edge goes up to {MAX_EDGE} blocks")
+            }
             FogError::BadSteps => write!(f, "the fog step budget goes from 1 to {MAX_STEPS}"),
         }
     }
@@ -310,6 +329,9 @@ fn validate_layer(i: usize, l: &FogLayer) -> Result<(), FogError> {
     if l.threshold_rise > 0.0 && rows > i128::from(MAX_PROFILE_ROWS) {
         return Err(FogError::TallProfile(i));
     }
+    if l.edge_bottom > MAX_EDGE || l.edge_top > MAX_EDGE {
+        return Err(FogError::DeepEdge(i));
+    }
     Ok(())
 }
 
@@ -340,6 +362,11 @@ mod tests {
         );
         assert_eq!(l.height_shade, [1.0; 2]);
         assert_eq!((l.soft_distance, l.threshold_rise), (0.0, 0.0));
+        assert_eq!(
+            (l.edge_bottom, l.edge_top),
+            (0, 0),
+            "cut flat at both planes"
+        );
     }
 
     #[test]
@@ -439,6 +466,17 @@ mod tests {
             Err(FogError::TallProfile(0))
         );
         assert_eq!(tall(1 << 40, 0.0), Ok(()));
+        // Edges up to MAX_EDGE blocks, on any band.
+        assert_eq!(
+            ok(&[with(&|l| (l.edge_bottom, l.edge_top) = (MAX_EDGE, MAX_EDGE))]),
+            Ok(())
+        );
+        for edges in [(MAX_EDGE + 1, 0), (0, MAX_EDGE + 1)] {
+            assert_eq!(
+                ok(&[with(&|l| (l.edge_bottom, l.edge_top) = edges)]),
+                Err(FogError::DeepEdge(0))
+            );
+        }
         assert_eq!(
             validate(std::slice::from_ref(&base), 0),
             Err(FogError::BadSteps)
@@ -447,5 +485,6 @@ mod tests {
         // Every error has a message.
         assert!(FogError::BadSteps.to_string().contains("256"));
         assert!(FogError::TallProfile(2).to_string().contains("65536"));
+        assert!(FogError::DeepEdge(1).to_string().contains("1024"));
     }
 }

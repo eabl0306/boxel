@@ -23,10 +23,11 @@ pub mod noise;
 pub mod pack;
 
 pub use config::{
-    DEFAULT_MAX_STEPS, FogError, FogFade, FogLayer, FogNoise, FogResolution, MAX_FOG_DISTANCE,
-    MAX_SOFT_DISTANCE, NoiseDims, VOXEL_FACE_SHADE, density_for_visibility, validate,
+    DEFAULT_MAX_STEPS, FogError, FogFade, FogLayer, FogNoise, FogResolution, MAX_EDGE,
+    MAX_FOG_DISTANCE, MAX_SOFT_DISTANCE, NoiseDims, VOXEL_FACE_SHADE, density_for_visibility,
+    validate,
 };
-pub use layer::{FogTime, LayerParams, RayBasis, TICKS_PER_SECOND, mean_coverage};
+pub use layer::{FogTime, LayerParams, MeanCoverage, RayBasis, TICKS_PER_SECOND, mean_coverage};
 pub use noise::{COVERAGE_ONE, Coverage};
 
 /// Most layers a set may have.

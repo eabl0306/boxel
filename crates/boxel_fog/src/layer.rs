@@ -102,6 +102,8 @@ pub struct LayerParams {
     pub rise: u32,
     /// Cell rows of the band ([`profile_rows`]).
     pub rows: u32,
+    /// Depth of the bottom and the top edge, in blocks ([`noise::row_edge`]).
+    pub edges: [u32; 2],
     /// Coverage gain (`q8`).
     pub gain: u32,
     /// Band relative to the render origin's y (clamped to `+-2^24`).
@@ -164,6 +166,7 @@ impl LayerParams {
             threshold: threshold_units(layer.threshold),
             rise: threshold_units(layer.threshold_rise),
             rows: profile_rows(layer),
+            edges: [layer.edge_bottom, layer.edge_top],
             gain: gain_units(layer.softness),
             band: [band_rel(layer.min_y), band_rel(layer.max_y)],
             band_cells: [band_cell(layer.min_y), band_cell(layer.max_y)],
@@ -175,22 +178,72 @@ impl LayerParams {
 /// The mean coverage (0 to 1) of a layer's cells, from a fixed sample of 1024 cells spread over
 /// many lattice steps and the rows of the band: what the march gives the rest of a ray once its
 /// step budget runs out. Deterministic; the same for every origin and tick (on average).
-pub fn mean_coverage(layer: &FogLayer) -> f32 {
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MeanCoverage {
+    /// The mean away from the band's edges (every row at its rise's threshold).
+    pub core: f32,
+    /// The mean with every threshold raised a quarter, a half and three quarters of the way to
+    /// never covered ([`noise::raise`]): what an edge leaves where its smoothstep is there.
+    pub edge: [f32; 3],
+}
+
+impl MeanCoverage {
+    /// The same mean at every height, fading out only over the last quarter of an edge's
+    /// raise.
+    pub const fn level(mean: f32) -> Self {
+        Self {
+            core: mean,
+            edge: [mean; 3],
+        }
+    }
+
+    /// The mean where an edge raises the threshold `s` (`0..=4096`) of the way to never
+    /// covered: linear between the table's quarters, 0 at 4096. The march's tail past the
+    /// budget fades by it near the band's planes, like the cells it stands for.
+    pub fn at(&self, s: u32) -> f32 {
+        let table = [self.core, self.edge[0], self.edge[1], self.edge[2], 0.0];
+        let i = (s >> 10).min(4) as usize;
+        if i == 4 {
+            return 0.0;
+        }
+        let f = (s & 1023) as f32 * (1.0 / 1024.0);
+        table[i] + (table[i + 1] - table[i]) * f
+    }
+}
+
+impl From<f32> for MeanCoverage {
+    /// [`MeanCoverage::level`].
+    fn from(mean: f32) -> Self {
+        Self::level(mean)
+    }
+}
+
+/// The [`MeanCoverage`] of a layer.
+pub fn mean_coverage(layer: &FogLayer) -> MeanCoverage {
     let params = LayerParams::new(layer, [0; 3], 0);
     let step = 3 * layer.noise.scale.max(1) as i32 + 1;
     // Rows of the band near the origin's cell (the threshold rises with them).
     let first = params.band_cells[0];
     let rows = (i64::from(params.band_cells[1]) - i64::from(first)).clamp(1, 1 << 16) as i32;
-    let mut sum = 0u64;
+    let mut sums = [0u64; 4];
     for i in 0..1024i32 {
         let d = [
             (i & 31) * step + (i * 7) % step,
             first + (((i * 5) % 16) * step) % rows,
             (i >> 5) * step + (i * 11) % step,
         ];
-        sum += u64::from(noise::coverage(&params, d).coverage);
+        let n = noise::noise_at(&params, d, [0; 3]);
+        let threshold = noise::rise_threshold(&params, d[1]);
+        for (k, sum) in sums.iter_mut().enumerate() {
+            let t = noise::raise(threshold, 1024 * k as u32);
+            *sum += u64::from(noise::coverage_from_noise(n, t, params.gain));
+        }
     }
-    (sum as f64 / (1024.0 * f64::from(COVERAGE_ONE))) as f32
+    let mean = |sum: u64| (sum as f64 / (1024.0 * f64::from(COVERAGE_ONE))) as f32;
+    MeanCoverage {
+        core: mean(sums[0]),
+        edge: [mean(sums[1]), mean(sums[2]), mean(sums[3])],
+    }
 }
 
 /// The camera ray of every pixel, linear in normalized device coordinates: the direction from
@@ -350,12 +403,33 @@ mod tests {
     fn mean_coverage_follows_the_threshold() {
         let mut layer = FogLayer::new(0, 8);
         layer.noise.scale = 4;
-        assert_eq!(mean_coverage(&layer), 1.0, "threshold 0 fills every cell");
+        let full = mean_coverage(&layer);
+        assert_eq!(full.core, 1.0, "threshold 0 fills every cell");
         layer.threshold = 1.0;
-        assert_eq!(mean_coverage(&layer), 0.0);
+        assert_eq!(mean_coverage(&layer), MeanCoverage::default());
         layer.threshold = 0.5;
         let half = mean_coverage(&layer);
-        assert!((0.3..0.7).contains(&half), "{half}");
+        assert!((0.3..0.7).contains(&half.core), "{half:?}");
+        // The edges' raise thins it out, quarter by quarter, and the edges themselves do not
+        // change the core.
+        assert!(half.edge[0] < half.core && half.edge[2] < half.edge[1] && half.edge[2] > 0.0);
+        layer.edge_top = 6;
+        assert_eq!(mean_coverage(&layer), half);
+    }
+
+    #[test]
+    fn the_mean_fades_through_the_edge() {
+        let m = MeanCoverage {
+            core: 0.8,
+            edge: [0.6, 0.4, 0.1],
+        };
+        assert_eq!(m.at(0), 0.8);
+        assert_eq!(m.at(1024), 0.6);
+        assert_eq!(m.at(2048 + 512), 0.25);
+        assert_eq!(m.at(3072 + 512), 0.05);
+        assert_eq!(m.at(4096), 0.0);
+        assert_eq!(MeanCoverage::from(0.5), MeanCoverage::level(0.5));
+        assert_eq!(MeanCoverage::level(0.5).at(2048), 0.5);
     }
 
     fn mat_mul(a: [[f64; 4]; 4], b: [[f64; 4]; 4]) -> [[f64; 4]; 4] {

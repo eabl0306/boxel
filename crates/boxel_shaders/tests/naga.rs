@@ -260,6 +260,18 @@ fn const_u32(module: &naga::Module, name: &str) -> u32 {
     }
 }
 
+fn const_i32(module: &naga::Module, name: &str) -> i32 {
+    let (_, c) = module
+        .constants
+        .iter()
+        .find(|(_, c)| c.name.as_deref() == Some(name))
+        .unwrap_or_else(|| panic!("missing const {name}"));
+    match module.global_expressions[c.init] {
+        naga::Expression::Literal(naga::Literal::I32(v)) => v,
+        ref other => panic!("{name}: unexpected init {other:?}"),
+    }
+}
+
 fn const_f32(module: &naga::Module, name: &str) -> f32 {
     let (_, c) = module
         .constants
@@ -560,6 +572,10 @@ fn fog_constants_match_boxel_fog() {
     assert_eq!(
         const_u32(&module, "SOFT_MAX_PIECES"),
         boxel_fog::march::SOFT_MAX_PIECES
+    );
+    assert_eq!(
+        const_i32(&module, "EDGE_REACH"),
+        boxel_fog::noise::EDGE_REACH
     );
 }
 
