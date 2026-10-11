@@ -183,6 +183,55 @@ pub struct ChunkImmediate {
     pub origin: [i32; 4],
 }
 
+/// Immediate data of the far LOD pipeline (16 bytes, `lod.wgsl`, ADR 0031): the node one draw
+/// shows. Bits in [`lod`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+pub struct LodImmediate {
+    /// x = the node's world block origin x, low 32 bits (like [`ChunkGpu::origin`]), OR its
+    /// level (a level-`k` origin has `5 + k` zero low bits); y, z = origin y and z (low 32
+    /// bits); w = hidden octants | color mip << [`lod::MIP_SHIFT`] | [`lod::TINT_BIT`].
+    pub node: [i32; 4],
+}
+
+impl LodImmediate {
+    /// The immediates of a level-`level` node at `origin` (low 32 bits of the world origin, its
+    /// low `5 + level` bits zero) whose octants `hidden` are hidden (bit `x | y << 1 | z << 2`),
+    /// colored with mip `mip` of each texture layer (its 1x1 level), tinted per level with
+    /// `tint`.
+    pub fn new(origin: [i32; 3], level: u8, hidden: u8, mip: u32, tint: bool) -> Self {
+        debug_assert!(u32::from(level) <= lod::LEVEL_MASK && level > 0);
+        debug_assert_eq!(
+            origin[0] & lod::LEVEL_MASK as i32,
+            0,
+            "a node origin's low bits"
+        );
+        let w = u32::from(hidden)
+            | ((mip & lod::MIP_MASK) << lod::MIP_SHIFT)
+            | if tint { lod::TINT_BIT } else { 0 };
+        Self {
+            node: [origin[0] | i32::from(level), origin[1], origin[2], w as i32],
+        }
+    }
+}
+
+/// Bits of [`LodImmediate`] (mirrored by `lod.wgsl`).
+pub mod lod {
+    /// The level in the low bits of the origin's x.
+    pub const LEVEL_MASK: u32 = 15;
+    /// The color mip in word w.
+    pub const MIP_SHIFT: u32 = 8;
+    /// Its bits.
+    pub const MIP_MASK: u32 = 31;
+    /// Word w: tint the node with its level's color.
+    pub const TINT_BIT: u32 = 1 << 13;
+    /// Where a quad's octant bits are in its `geo` word (x, y, z): bit 4 of each coordinate of
+    /// its min cell (`boxel_mesh::lod::octant_of`).
+    pub const OCTANT_SHIFTS: [u32; 3] = [4, 9, 14];
+    /// Immediate bytes of the LOD pipeline.
+    pub const IMMEDIATE_SIZE: u32 = 16;
+}
+
 /// Matches `wgpu::util::DrawIndexedIndirectArgs` and WGSL `DrawArgs` (20 bytes, tightly packed).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]

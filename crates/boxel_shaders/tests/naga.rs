@@ -2,7 +2,8 @@
 //! Runs on any machine (no GPU): WGSL front end, validator, and every backend wgpu uses on
 //! desktop: GLSL (GL tiers), MSL (Metal), HLSL SM 5.1 (FXC) and SM 6.0 (DXC), SPIR-V (Vulkan).
 use boxel_shaders::gpu::{
-    ChunkGpu, ChunkImmediate, DrawIndexedIndirect, FogHeader, FogLayerGpu, ViewUniform,
+    ChunkGpu, ChunkImmediate, DrawIndexedIndirect, FogHeader, FogLayerGpu, LodImmediate,
+    ViewUniform,
 };
 use boxel_shaders::{ShaderModuleId, Stage};
 use naga::back::{glsl, hlsl, msl, spv};
@@ -666,4 +667,157 @@ fn no_integer_vector_selects_on_gl_33() {
             }
         }
     }
+}
+
+/// The far LOD pipeline (ADR 0031) runs on every tier, the Low one on GL included: one uniform
+/// block (the View) and one texture, no sampler (`textureLoad`), no storage buffer; the node in
+/// 16 bytes of immediates, the quad as one instance attribute.
+#[test]
+fn lod_binds_one_uniform_block_and_one_texture() {
+    let (module, info) = load(ShaderModuleId::Lod);
+    assert!(ShaderModuleId::Lod.uses_immediates());
+    assert_eq!(ShaderModuleId::Lod.min_gl(), (3, 3));
+    let mut seen = Vec::new();
+    for (i, ep) in module.entry_points.iter().enumerate() {
+        let ep_info = info.get_entry_point(i);
+        let (mut uniforms, mut textures, mut immediates) = (0, 0, 0);
+        for (handle, g) in module.global_variables.iter() {
+            if ep_info[handle].is_empty() {
+                continue;
+            }
+            match g.space {
+                naga::AddressSpace::Uniform => uniforms += 1,
+                naga::AddressSpace::Immediate => immediates += 1,
+                naga::AddressSpace::Storage { .. } => panic!("{}: storage buffer", ep.name),
+                naga::AddressSpace::Handle => match module.types[g.ty].inner {
+                    naga::TypeInner::Image { .. } => textures += 1,
+                    naga::TypeInner::Sampler { .. } => panic!("{}: a sampler", ep.name),
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        seen.push((ep.name.as_str(), (uniforms, textures, immediates)));
+    }
+    seen.sort_unstable();
+    assert_eq!(seen, [("fs_lod", (1, 1, 0)), ("vs_lod", (1, 0, 1))]);
+    assert_eq!(
+        struct_layout(&module, "LodImmediate").0 as usize,
+        size_of::<LodImmediate>()
+    );
+    assert_eq!(
+        size_of::<LodImmediate>() as u32,
+        boxel_shaders::gpu::lod::IMMEDIATE_SIZE
+    );
+    // One instance-step attribute: the quad.
+    let vs = module
+        .entry_points
+        .iter()
+        .find(|e| e.name == "vs_lod")
+        .expect("vs_lod");
+    let attributes = vs
+        .function
+        .arguments
+        .iter()
+        .filter(|arg| matches!(arg.binding, Some(naga::Binding::Location { .. })))
+        .count();
+    assert_eq!(attributes, 1);
+}
+
+/// Every `textureLoad` mip level is an `i32` (naga GLSL bug gfx-rs/wgpu#10037).
+#[test]
+fn texture_load_levels_are_i32() {
+    for id in ShaderModuleId::ALL {
+        let (module, info) = load(id);
+        let functions = module.functions.iter().map(|(h, f)| (f, &info[h])).chain(
+            module
+                .entry_points
+                .iter()
+                .enumerate()
+                .map(|(i, ep)| (&ep.function, info.get_entry_point(i))),
+        );
+        for (f, finfo) in functions {
+            for (_, e) in f.expressions.iter() {
+                if let naga::Expression::ImageLoad {
+                    level: Some(level), ..
+                } = e
+                {
+                    let ty = finfo[*level].ty.inner_with(&module.types);
+                    assert_eq!(
+                        ty.scalar(),
+                        Some(naga::Scalar::I32),
+                        "{}: {:?} loads a mip level of {ty:?}",
+                        id.label(),
+                        f.name
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The bits of `lod.wgsl` equal the Rust mirror's, and a quad's octant there is
+/// `boxel_mesh::lod::octant_of`.
+#[test]
+fn lod_bits_match_the_mirror_and_boxel_mesh() {
+    use boxel_mesh::PackedQuad;
+    use boxel_shaders::gpu::lod as b;
+    use boxel_voxel::Face;
+    let (module, _) = load(ShaderModuleId::Lod);
+    for (name, v) in [
+        ("LOD_LEVEL_MASK", b::LEVEL_MASK),
+        ("LOD_MIP_SHIFT", b::MIP_SHIFT),
+        ("LOD_MIP_MASK", b::MIP_MASK),
+        ("LOD_TINT_BIT", b::TINT_BIT),
+        ("LOD_OCTANT_X_SHIFT", b::OCTANT_SHIFTS[0]),
+        ("LOD_OCTANT_Y_SHIFT", b::OCTANT_SHIFTS[1]),
+        ("LOD_OCTANT_Z_SHIFT", b::OCTANT_SHIFTS[2]),
+    ] {
+        assert_eq!(const_u32(&module, name), v, "{name}");
+    }
+    // The flat outputs of a LOD quad keep the texture layer in its own bits.
+    let mat_layer = const_u32(&module, "MAT_LAYER_MASK");
+    assert!(const_u32(&module, "LOD_OUT_MIP_SHIFT") >= mat_layer.count_ones());
+    assert!(
+        const_u32(&module, "LOD_OUT_TINT_BIT")
+            > b::MIP_MASK << const_u32(&module, "LOD_OUT_MIP_SHIFT")
+    );
+    assert!(
+        1 << const_u32(&module, "LOD_OUT_LEVEL_SHIFT") > const_u32(&module, "LOD_OUT_TINT_BIT")
+    );
+    // Hidden octants, the mip and the tint do not overlap; the level fits every LOD level.
+    assert_eq!(0xFF & (b::MIP_MASK << b::MIP_SHIFT), 0);
+    assert_eq!((b::MIP_MASK << b::MIP_SHIFT) & b::TINT_BIT, 0);
+    assert_eq!(boxel_mesh::lod::OCTANT_CELLS, 1 << 4);
+    for x in [0, 15, 16, 31] {
+        for y in [0, 15, 16, 31] {
+            for z in [0, 16] {
+                for face in Face::ALL {
+                    let q = PackedQuad::new([x, y, z], 1, 1, face, 7);
+                    let shader = b::OCTANT_SHIFTS
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| ((q.geo >> s) & 1) << i)
+                        .sum::<u32>();
+                    assert_eq!(shader as u8, boxel_mesh::lod::octant_of(q));
+                    let want = u8::from(x >= 16) | u8::from(y >= 16) << 1 | u8::from(z >= 16) << 2;
+                    assert_eq!(shader as u8, want);
+                }
+            }
+        }
+    }
+    // The immediates pack as the shader reads them.
+    let imm = LodImmediate::new([-1 << 9, 64, 1 << 30], 4, 0b1010_0101, 4, true);
+    assert_eq!(imm.node[0] & b::LEVEL_MASK as i32, 4);
+    assert_eq!(imm.node[0] & !(b::LEVEL_MASK as i32), -1 << 9);
+    assert_eq!((imm.node[1], imm.node[2]), (64, 1 << 30));
+    let w = imm.node[3] as u32;
+    assert_eq!(
+        (
+            w & 0xFF,
+            (w >> b::MIP_SHIFT) & b::MIP_MASK,
+            w & b::TINT_BIT != 0
+        ),
+        (0b1010_0101, 4, true)
+    );
 }

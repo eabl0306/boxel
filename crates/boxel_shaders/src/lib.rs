@@ -29,6 +29,8 @@ pub const OUTLINE_WGSL: &str = include_str!("../shaders/outline.wgsl");
 /// `fog.wgsl`: the fog march and its composite (`vs_fullscreen`, `fs_fog_march`,
 /// `fs_fog_composite_half`, `fs_fog_composite_full`, `fs_fog_debug_coverage`).
 pub const FOG_WGSL: &str = include_str!("../shaders/fog.wgsl");
+/// `lod.wgsl`: far LOD nodes on every tier (`vs_lod`, `fs_lod`, ADR 0031).
+pub const LOD_WGSL: &str = include_str!("../shaders/lod.wgsl");
 
 /// Shader stage of an entry point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,16 +60,19 @@ pub enum ShaderModuleId {
     Outline,
     /// fog march and composite (all tiers, only with the fog plugin).
     Fog,
+    /// common + lod: far LOD nodes (all tiers, only with the LOD plugin).
+    Lod,
 }
 
 static VOXEL_PULL: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{VOXEL_PULL_WGSL}"));
 static VOXEL_INSTANCED: LazyLock<String> =
     LazyLock::new(|| format!("{COMMON_WGSL}\n{VOXEL_INSTANCED_WGSL}"));
 static CULL: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{CULL_WGSL}"));
+static LOD: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{LOD_WGSL}"));
 
 impl ShaderModuleId {
     /// All modules.
-    pub const ALL: [ShaderModuleId; 7] = [
+    pub const ALL: [ShaderModuleId; 8] = [
         ShaderModuleId::VoxelPull,
         ShaderModuleId::VoxelInstanced,
         ShaderModuleId::Cull,
@@ -75,6 +80,7 @@ impl ShaderModuleId {
         ShaderModuleId::Overlay,
         ShaderModuleId::Outline,
         ShaderModuleId::Fog,
+        ShaderModuleId::Lod,
     ];
 
     /// Debug label.
@@ -87,6 +93,7 @@ impl ShaderModuleId {
             ShaderModuleId::Overlay => "boxel overlay",
             ShaderModuleId::Outline => "boxel outline",
             ShaderModuleId::Fog => "boxel fog",
+            ShaderModuleId::Lod => "boxel lod",
         }
     }
 
@@ -100,6 +107,7 @@ impl ShaderModuleId {
             ShaderModuleId::Overlay => OVERLAY_WGSL,
             ShaderModuleId::Outline => OUTLINE_WGSL,
             ShaderModuleId::Fog => FOG_WGSL,
+            ShaderModuleId::Lod => LOD.as_str(),
         }
     }
 
@@ -139,13 +147,14 @@ impl ShaderModuleId {
                 ("fs_fog_composite_full", Stage::Fragment),
                 ("fs_fog_debug_coverage", Stage::Fragment),
             ],
+            ShaderModuleId::Lod => &[("vs_lod", Stage::Vertex), ("fs_lod", Stage::Fragment)],
         }
     }
 
     /// True if the module declares `var<immediate>` (needs `Features::IMMEDIATES` and the naga
     /// `IMMEDIATES` capability in validation).
     pub const fn uses_immediates(self) -> bool {
-        matches!(self, ShaderModuleId::VoxelInstanced)
+        matches!(self, ShaderModuleId::VoxelInstanced | ShaderModuleId::Lod)
     }
 
     /// Lowest GL version the module must translate to (checked by naga tests).
@@ -156,7 +165,8 @@ impl ShaderModuleId {
             | ShaderModuleId::Blit
             | ShaderModuleId::Overlay
             | ShaderModuleId::Outline
-            | ShaderModuleId::Fog => (3, 3),
+            | ShaderModuleId::Fog
+            | ShaderModuleId::Lod => (3, 3),
         }
     }
 }
