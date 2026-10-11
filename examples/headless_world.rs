@@ -59,6 +59,10 @@
 //!   it still polls for an empty mesh, `filled_after` the time from the first plan to the full
 //!   fill, and the update times those of the frames between the world's settling and the fill.
 //!
+//! - `--spans` (build with `--features trace`): after each of those lines, `spans: phase=P
+//!   update_ms=X top=NAME:MS,...`, the busiest systems and spans of the phase's slowest update
+//!   (the work between that frame and the next included), as `stress --spans` keys them.
+//!
 //! Exit codes: 0 settled, 1 usage error, 4 not settled within the timeout, 5 the world settled
 //! somewhere else than around the viewer after a jump. Set `RUST_LOG` for more logging (default
 //! filter `warn`).
@@ -73,6 +77,7 @@ mod world;
 
 use boxel::camera::{Camera, CameraView};
 use boxel::log::LogPlugin;
+use boxel::log::span_times::{self, SpanFrame, SpanTimes};
 use boxel::math::I64Vec3;
 use boxel::mesh::ChunkMesh;
 use boxel::mesh::{AoPolicy, LightQuantization};
@@ -118,6 +123,8 @@ usage: headless_world [options]
   --jump N             then teleport the viewer N chunks along x (negative: -x, up to the
                        world limit of 2^56) and wait for the new area
   --timeout S          wall-clock limit in seconds (default 60), exit 4 past it
+  --spans              after each report, the busiest spans of its slowest update (needs
+                       --features trace)
   --help               this text";
 
 /// The whole help: [`USAGE`], `--lod` and the world options.
@@ -164,6 +171,8 @@ struct Options {
     idle_work: bool,
     /// `--lod`.
     lod: LodPreset,
+    /// `--spans`.
+    spans: bool,
 }
 
 /// `Ok(None)` for `--help`.
@@ -187,6 +196,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         cave: false,
         idle_work: true,
         lod: LodPreset::Off,
+        spans: false,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -236,6 +246,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--lod" => o.lod = lod::parse(flag, &value()?)?,
             "--cull" => o.cull = true,
             "--cave" => o.cave = true,
+            "--spans" => o.spans = true,
             "--camera" => {
                 let v = value()?;
                 let parts: Vec<f64> = v
@@ -362,9 +373,68 @@ struct Run {
     walk_report: Option<String>,
     /// Voxels to move the viewer along x in this frame (a jump).
     teleport: Option<f64>,
+    /// `--spans`: the span times, and the slowest update of the phase with its spans.
+    spans: Option<Spans>,
+}
+
+/// `--spans`: the layer's handle, a scratch frame, and the phase's slowest update so far (its
+/// time in ms and its spans).
+struct Spans {
+    times: SpanTimes,
+    frame: SpanFrame,
+    slowest: Option<(f64, SpanFrame)>,
+}
+
+/// Spans listed per `spans:` line.
+const TOP_SPANS: usize = 30;
+
+impl Spans {
+    /// In `First`: the previous update (`ms`, the last of the phase's updates) with the spans of
+    /// its frame, which entering this frame's `Main` closed.
+    fn record(&mut self, ms: Option<f64>) {
+        let Some(ms) = ms else {
+            return;
+        };
+        self.times.last_frame(&mut self.frame);
+        if self.slowest.as_ref().is_none_or(|(worst, _)| ms > *worst) {
+            self.slowest = Some((ms, self.frame.clone()));
+        }
+    }
+
+    /// The `spans:` line of `phase` (the busiest keys of its slowest update), and a fresh start
+    /// for the next phase.
+    fn line(&mut self, phase: &str) -> String {
+        let Some((ms, frame)) = self.slowest.take() else {
+            return format!("spans: phase={phase} update_ms=0.00 top=");
+        };
+        let keys = self.times.keys();
+        let mut busy: Vec<(&str, u64)> = keys
+            .iter()
+            .zip(&frame.busy_ns)
+            .map(|(k, &ns)| (k.as_str(), ns))
+            .filter(|&(_, ns)| ns > 0)
+            .collect();
+        busy.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let top: Vec<String> = busy
+            .iter()
+            .take(TOP_SPANS)
+            .map(|(k, ns)| format!("{}:{:.2}", k.replace(' ', "_"), *ns as f64 / 1e6))
+            .collect();
+        format!(
+            "spans: phase={phase} update_ms={ms:.2} top={}",
+            top.join(",")
+        )
+    }
 }
 
 impl Run {
+    /// `--spans`: the `spans:` line of the phase just reported.
+    fn print_spans(&mut self, phase: &str) {
+        if let Some(spans) = self.spans.as_mut() {
+            println!("{}", spans.line(phase));
+        }
+    }
+
     fn exit(&self, code: u8, exit: &mut MessageWriter<AppExit>) {
         exit.write(AppExit::from_code(code));
     }
@@ -461,6 +531,28 @@ fn main() -> AppExit {
     } else {
         Duration::ZERO
     };
+    let spans = if options.spans {
+        if !cfg!(feature = "trace") {
+            eprintln!(
+                "headless_world: --spans needs the system spans: build with --features trace\n\n{}",
+                usage()
+            );
+            return AppExit::from_code(1);
+        }
+        // Installed before the app: LogPlugin then keeps this subscriber.
+        let (layer, times) = span_times::span_times(span_times::MAIN_SCHEDULE);
+        if let Err(e) = boxel::log::init_logging_with_layer(boxel::log::DEFAULT_FILTER, layer) {
+            eprintln!("headless_world: --spans: {e}");
+            return AppExit::from_code(1);
+        }
+        Some(Spans {
+            times,
+            frame: SpanFrame::default(),
+            slowest: None,
+        })
+    } else {
+        None
+    };
     let lod_settings = options.lod.settings();
     let mut app = App::new();
     app.add_plugins((
@@ -492,6 +584,7 @@ fn main() -> AppExit {
         walk_from: VIEWER.x,
         walk_report: None,
         teleport: None,
+        spans,
     })
     .add_systems(Startup, spawn_viewer)
     .add_systems(First, start_update)
@@ -521,6 +614,10 @@ fn spawn_viewer(mut commands: Commands, run: Res<Run>) {
 
 fn start_update(mut run: ResMut<Run>) {
     run.update_start = Some(Instant::now());
+    let last = run.updates.last().copied();
+    if let Some(spans) = run.spans.as_mut() {
+        spans.record(last);
+    }
 }
 
 fn end_update(mut run: ResMut<Run>) {
@@ -848,6 +945,7 @@ fn drive(
                     cull_lines(&run.options, &map, &content.registry, transform, *viewer)
                 );
             }
+            run.print_spans("startup");
             if run.options.lod == LodPreset::Off {
                 run.next_phase(Phase::Loading, now, x, &mut exit);
             } else {
@@ -863,6 +961,7 @@ fn drive(
                 p99(&run.updates),
                 max(&run.updates),
             );
+            run.print_spans("idle");
             run.next_phase(Phase::Idle { since }, now, x, &mut exit);
         }
         Phase::Walking { since } if now.duration_since(since) >= run.options.duration => {
@@ -888,6 +987,7 @@ fn drive(
                 "{report}, caught_up_after={:.3}s",
                 now.duration_since(since).as_secs_f64()
             );
+            run.print_spans("walk");
             run.next_phase(Phase::CatchingUp { since, behind }, now, x, &mut exit);
         }
         // The counters here are from the end of the previous frame, which already planned the
@@ -911,6 +1011,7 @@ fn drive(
                 center.y,
                 center.z,
             );
+            run.print_spans("jump");
             let missing = missing_around(
                 center,
                 viewer.radius,
@@ -964,6 +1065,7 @@ fn drive_lod(
         }
         Phase::LodFilled { p99, max } => {
             println!("{}", lod_lines(&run, &stats, p99, max));
+            run.print_spans("lod_fill");
             let x = viewers.iter().next().map_or(VIEWER.x, |t| t.translation.x);
             run.next_phase(Phase::Loading, Instant::now(), x, &mut exit);
         }
@@ -1129,6 +1231,43 @@ mod tests {
         assert!(o.fixed_height);
         assert!(parse(&["--lod", "everything"]).is_err());
         assert!(usage().contains("--lod PRESET"));
+    }
+
+    #[test]
+    fn spans_flag() {
+        let o = parse(&[]).expect("valid").expect("not help");
+        assert!(!o.spans, "no span layer unless asked");
+        let o = parse(&["--spans", "--jump", "1000"])
+            .expect("valid")
+            .expect("not help");
+        assert!(o.spans);
+        assert!(usage().contains("--spans"));
+    }
+
+    #[test]
+    fn spans_line_lists_the_slowest_update() {
+        let (_layer, times) = span_times::span_times(span_times::MAIN_SCHEDULE);
+        let mut spans = Spans {
+            times,
+            frame: SpanFrame::default(),
+            slowest: None,
+        };
+        assert_eq!(
+            spans.line("startup"),
+            "spans: phase=startup update_ms=0.00 top="
+        );
+        spans.record(None);
+        spans.record(Some(2.0));
+        spans.record(Some(1.0));
+        assert!(
+            spans
+                .line("jump")
+                .starts_with("spans: phase=jump update_ms=2.00 top=")
+        );
+        assert!(
+            spans.slowest.is_none(),
+            "a line starts the next phase afresh"
+        );
     }
 
     #[test]

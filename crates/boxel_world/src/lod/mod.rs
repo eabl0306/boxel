@@ -770,7 +770,11 @@ impl LodWorld {
         }
         if self.replan.is_some() {
             let until = Instant::now() + budget;
-            self.replan_step(cov, until);
+            {
+                let _span = frame_span!("lod.replan");
+                self.replan_step(cov, until);
+            }
+            let _span = frame_span!("lod.queue_work");
             self.queue_work(cov, Some(until));
         }
         // Stale priorities: a batch per frame after the eye moved or turned enough.
@@ -782,6 +786,7 @@ impl LodWorld {
         let stale = self.refreshed.is_none_or(|(e, f)| {
             e.distance_to(&eye) >= STALE_DISTANCE || turned(f, view.forward) >= STALE_TURN_DEGREES
         });
+        let _span = frame_span!("lod.refresh");
         if stale {
             self.refreshed = Some((eye, view.forward));
             self.refresh = self
@@ -831,6 +836,7 @@ impl LodWorld {
                 None => {
                     let prev = &self.plan.levels[i];
                     let parents = self.plan.levels.get(i + 1);
+                    let _span = frame_span!("lod.plan_level");
                     let new = plan::plan_level(&r.eye, &r.th, k, prev, parents, self.ceiling);
                     let window = plan::LevelPlan::two_windows(&new, prev);
                     (new, window, 0)
@@ -1283,28 +1289,39 @@ fn lod_coverage(
             coverage.refused(pos, refused);
         }
     }
-    for event in meshes.read() {
-        match event {
-            ChunkMeshEvent::Upsert { key, .. } if ours(*key) => coverage.upserted(key.pos),
-            ChunkMeshEvent::Remove { key, .. } if ours(*key) => coverage.removed(key.pos, &map),
-            _ => {}
+    {
+        let _span = frame_span!("lod.mesh_events");
+        for event in meshes.read() {
+            match event {
+                ChunkMeshEvent::Upsert { key, .. } if ours(*key) => coverage.upserted(key.pos),
+                ChunkMeshEvent::Remove { key, .. } if ours(*key) => {
+                    coverage.removed(key.pos, &map);
+                }
+                _ => {}
+            }
+        }
+        if chunk_resyncs.read().count() > 0 {
+            coverage.renderer_resynced(&map);
         }
     }
-    if chunk_resyncs.read().count() > 0 {
-        coverage.renderer_resynced(&map);
-    }
-    let tree = &lod.tree;
-    for event in data.read() {
-        if ours(event.key()) {
-            let loaded = matches!(event, ChunkDataEvent::Loaded { .. });
-            coverage.data_changed(event.pos(), loaded, &map, |p| tree.lod1_octants(p));
+    {
+        let _span = frame_span!("lod.data_events");
+        let tree = &lod.tree;
+        for event in data.read() {
+            if ours(event.key()) {
+                let loaded = matches!(event, ChunkDataEvent::Loaded { .. });
+                coverage.data_changed(event.pos(), loaded, &map, |p| tree.lod1_octants(p));
+            }
+        }
+        for (p, octants) in lod.tree.take_lod1_quads() {
+            coverage.lod1_quads(p, octants, &map);
         }
     }
-    for (p, octants) in lod.tree.take_lod1_quads() {
-        coverage.lod1_quads(p, octants, &map);
+    {
+        let _span = frame_span!("lod.poll");
+        let tree = &lod.tree;
+        coverage.poll(&map, POLL_PER_FRAME, |p| tree.lod1_octants(p));
     }
-    let tree = &lod.tree;
-    coverage.poll(&map, POLL_PER_FRAME, |p| tree.lod1_octants(p));
     let changed = coverage.take_changed();
     let cov = coverage.coverage();
     // The LOD renderer's refusals, then its resync (which supersedes them).
@@ -1321,10 +1338,16 @@ fn lod_coverage(
         lod.outbox.clear();
         lod.arena_free = None;
     }
-    for p in changed {
-        lod.tree.chunks_changed(p, cov);
+    {
+        let _span = frame_span!("lod.chunks_changed");
+        for p in changed {
+            lod.tree.chunks_changed(p, cov);
+        }
     }
-    lod.requeue_covered(cov);
+    {
+        let _span = frame_span!("lod.requeue");
+        lod.requeue_covered(cov);
+    }
     coverage.end_frame();
 }
 
@@ -1435,10 +1458,14 @@ fn lod_collect(
     wanted: Option<ResMut<IdleWanted>>,
 ) {
     let now = Instant::now();
-    let out = lod.collect(coverage.coverage(), now);
-    if !out.is_empty() {
-        ops.ops.extend(out);
+    {
+        let _span = frame_span!("lod.collect");
+        let out = lod.collect(coverage.coverage(), now);
+        if !out.is_empty() {
+            ops.ops.extend(out);
+        }
     }
+    let _span = frame_span!("lod.stats");
     let fresh = lod.stats(now, &coverage);
     stats.set_if_neq(fresh);
     if let Some(mut wanted) = wanted {
