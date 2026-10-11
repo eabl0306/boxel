@@ -4,15 +4,17 @@
 //! float well above every hill.
 //!
 //! Every preset is soft: no face shading (fog has no faces), cells that fill and fade as the
-//! wind moves the noise, and soft fog without cell edges near the camera.
+//! wind moves the noise, soft fog without cell edges near the camera, and edges that thin the
+//! cells toward the band's floor and ceiling, so no layer ends in a flat plane.
 
 use boxel_fog::{FogFade, FogLayer, FogNoise, NoiseDims, density_for_visibility};
 
-/// Volumetric cumulus clouds: 8-block cells in a 32-block band at y 192..224 over 3D noise. The
-/// threshold rises to the top, so each cloud has a flat, wide base and thinner, uneven tops; the
-/// base is gray and the top lit. Cells fill and fade as they drift 2 blocks a second along +x,
-/// the edges of a cloud thinner than its core; soft within 16 blocks when flying through; faded
-/// out by 768 blocks.
+/// Volumetric cumulus clouds: 8-block cubes in a 64-block band at y 176..240 over 3D noise,
+/// most of them between 192 and 224. A 28-block top edge gives uneven, rounded tops and a
+/// 20-block bottom edge uneven undersides, a bit flatter than the tops (with a gentle rise of
+/// the threshold the base stays the widest part); the base is gray and the top lit. Cells fill
+/// and fade as they drift 2 blocks a second along +x, the edges of a cloud thinner than its
+/// core; soft within 16 blocks when flying through; faded out by 768 blocks.
 pub fn clouds() -> FogLayer {
     FogLayer {
         cell: [8, 8, 8],
@@ -23,7 +25,9 @@ pub fn clouds() -> FogLayer {
             seed: 0xc10d,
         },
         threshold: 0.55,
-        threshold_rise: 0.3,
+        threshold_rise: 0.2,
+        edge_bottom: 20,
+        edge_top: 28,
         softness: 0.2,
         density: 0.35,
         height_shade: [0.62, 1.0],
@@ -34,14 +38,16 @@ pub fn clouds() -> FogLayer {
             start: 384.0,
             end: 768.0,
         },
-        ..FogLayer::new(192, 224)
+        ..FogLayer::new(176, 240)
     }
 }
 
-/// Valley fog: banks of 2-block cubes from y 48 to 64, just over the sea (its water ends at 47,
-/// so no fog lies under it) and on the low ground around it, seen about 40 blocks through where
-/// thickest, thinner at the edges of a bank, soft within 12 blocks, taking a third of the sky's
-/// color, drifting slowly.
+/// Valley fog: banks of 2-block cubes from y 46 to 70, on the sea and the low ground around it.
+/// Thickest from 50 to 58 (seen about 40 blocks through), thinning over a 12-block top edge into
+/// an uneven skyline of cubes and over a 4-block bottom edge. The row along the band's floor
+/// (46 to 48) is always empty and the soft fog ends half a cell above it, so no fog lies under
+/// the sea's surface (its water ends at 47). Thinner at the edges of a bank, soft within 12
+/// blocks, taking a third of the sky's color, drifting slowly.
 pub fn valley() -> FogLayer {
     FogLayer {
         cell: [2, 2, 2],
@@ -52,6 +58,8 @@ pub fn valley() -> FogLayer {
             seed: 0xfa11e7,
         },
         threshold: 0.45,
+        edge_bottom: 4,
+        edge_top: 12,
         softness: 0.3,
         density: density_for_visibility(40.0),
         color: [0.92, 0.94, 1.0],
@@ -59,16 +67,19 @@ pub fn valley() -> FogLayer {
         soft_distance: 12.0,
         wind: [0.6, 0.0, 0.3],
         max_distance: 384.0,
-        ..FogLayer::new(48, 64)
+        ..FogLayer::new(46, 70)
     }
 }
 
 /// A blanket of 2-block cubes filling `[min_y, max_y)` (both even), seen about `visibility`
-/// blocks through where it is thickest, soft within 12 blocks. Every cell has some fog, of a
-/// density that varies with 3D noise, so no lattice step can be skipped and every ray inside
-/// walks the most cells and the soft fog's pieces: the worst case. (A blanket of equal cells
-/// would be cheap: the march takes it whole.)
+/// blocks through where it is thickest, soft within 12 blocks, with edges like the valley's: a
+/// quarter of its height at the top and an eighth at the bottom (at most 16 and 4 blocks).
+/// Every cell away from the edges has some fog, of a density that varies with 3D noise, so no
+/// lattice step there can be skipped and every ray inside walks the most cells and the soft
+/// fog's pieces: the worst case. (A blanket of equal cells would be cheap: the march takes it
+/// whole.)
 pub fn blanket(min_y: i64, max_y: i64, visibility: f32) -> FogLayer {
+    let height = u32::try_from(max_y.saturating_sub(min_y)).unwrap_or(u32::MAX);
     FogLayer {
         cell: [2, 2, 2],
         noise: FogNoise {
@@ -78,6 +89,8 @@ pub fn blanket(min_y: i64, max_y: i64, visibility: f32) -> FogLayer {
             seed: 0xb1a2,
         },
         threshold: 0.0,
+        edge_bottom: (height / 8).min(4),
+        edge_top: (height / 4).min(16),
         softness: 1.0,
         density: density_for_visibility(visibility),
         color: [0.9, 0.9, 0.92],
@@ -136,9 +149,49 @@ mod tests {
         }
         let c = clouds();
         assert_eq!(c.noise.dims, NoiseDims::Volume, "volumetric clouds");
-        assert!((24..=32).contains(&(c.max_y - c.min_y)));
         assert!(c.cell.iter().all(|e| (6..=8).contains(e)));
         assert!(c.threshold_rise > 0.0 && c.height_shade[0] < c.height_shade[1]);
+    }
+
+    /// No preset ends in a plane: every band has edges of at least two cells at both ends, the
+    /// bottom one no deeper than the top one, and a core that the edges leave alone. The valley's
+    /// top edge is half its band and no fog lies under the sea's surface (y 47); the clouds keep
+    /// a core of two rows of cubes.
+    #[test]
+    fn no_preset_ends_in_a_plane() {
+        for layer in every_preset().into_iter().flatten() {
+            let cy = layer.cell[1];
+            let height = (layer.max_y - layer.min_y) as u32;
+            assert!(
+                layer.edge_bottom >= 2 * cy && layer.edge_top >= 2 * cy,
+                "{layer:?}"
+            );
+            assert!(layer.edge_bottom <= layer.edge_top, "{layer:?}");
+            assert!(
+                layer.edge_bottom + layer.edge_top + cy <= height,
+                "a core: {layer:?}"
+            );
+        }
+        let v = valley();
+        assert_eq!(2 * v.edge_top, (v.max_y - v.min_y) as u32);
+        let p = LayerParams::new(&v, [0; 3], 0);
+        for y in [40.0f32, 46.0, 46.9, 47.0] {
+            assert_eq!(noise::point_edge(&p, y), 4096, "soft fog at y {y}");
+        }
+        let floor_row = p.band_cells[0];
+        assert_eq!(
+            noise::row_threshold(&p, floor_row),
+            4096,
+            "the row 46 to 48"
+        );
+        let c = clouds();
+        assert!(c.edge_bottom < c.edge_top, "a flatter base than top");
+        assert!((c.max_y - c.min_y) as u32 - c.edge_bottom - c.edge_top >= 2 * c.cell[1]);
+        assert_eq!(sunset()[0].edge_top, v.edge_top);
+        let b = blanket(0, 256, 40.0);
+        assert_eq!((b.edge_bottom, b.edge_top), (4, 16));
+        let thin = blanket(0, 8, 40.0);
+        assert_eq!((thin.edge_bottom, thin.edge_top), (1, 2));
     }
 
     /// As the wind moves the noise, no cell of any preset changes its coverage by more than
