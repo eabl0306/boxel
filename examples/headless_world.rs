@@ -47,14 +47,17 @@
 //!   `2^26` chunks) or `--jump -40000000000` (past `2^40` voxels) stream at the true position.
 //!
 //! - `--lod PRESET`: once the world is settled, the far LOD (ADR 0031, world side only: no GPU)
-//!   is filled too, the full-detail coverage is taken from the settled chunks, and `lod:
-//!   preset=P horizon=H columns=N nodes=N quads=N drawn=N floor_nodes=N floor_quads=N
-//!   filled_after=S jobs=N job_p50_us=N job_p99_us=N failed=N update_p99_ms=X
-//!   update_max_ms=X` follows, then one `lod_level:` line per level with the same counts and
-//!   the nodes built blank. `nodes` are the nodes with a mesh, `floor_*` those in the layer of
-//!   the generator's floor (expected 0), `drawn` those with an octant not covered by finer
-//!   nodes or full detail, `filled_after` the time from the first plan to the full fill, and
-//!   the update times those of the frames between the world's settling and the fill.
+//!   is filled too, and `lod: preset=P horizon=H columns=N nodes=N quads=N drawn=N
+//!   floor_nodes=N floor_quads=N filled_after=S jobs=N job_p50_us=N job_p99_us=N failed=N
+//!   published_chunks=N covered_chunks=N watched_chunks=N update_p99_ms=X update_max_ms=X`
+//!   follows, then one `lod_level:` line per level with the same counts and the nodes built
+//!   blank. `nodes` are the nodes with a mesh, `floor_*` those in the layer of the generator's
+//!   floor (expected 0), `drawn` those with quads in an octant not covered by finer nodes or
+//!   full detail (the coverage comes from the world's mesh and data events, as with a
+//!   renderer), `published_chunks` and `covered_chunks` the full-detail chunks the LOD sees
+//!   drawn and does not draw over (empty and air ones too), `watched_chunks` the loaded chunks
+//!   it still polls for an empty mesh, `filled_after` the time from the first plan to the full
+//!   fill, and the update times those of the frames between the world's settling and the fill.
 //!
 //! Exit codes: 0 settled, 1 usage error, 4 not settled within the timeout, 5 the world settled
 //! somewhere else than around the viewer after a jump. Set `RUST_LOG` for more logging (default
@@ -77,7 +80,7 @@ use boxel::prelude::*;
 use boxel::render::{DEFAULT_SKY_COLOR, ViewParams, cull_counts};
 use boxel::voxel::{CHUNK_SIZE, MAX_BLOCK_COORD, MAX_CHUNK_COORD};
 use boxel::world::DataState;
-use boxel::world::lod::{ChunkCoverage, LodCoverage, LodStats, LodWorldPlugin};
+use boxel::world::lod::{LodStats, LodWorldPlugin};
 use boxel::world::visibility::{eye_in_open, visible_chunks};
 use boxel::world::{
     ChunkVisibility, SkyMap, VisibilityView, WorldContent, WorldStats, WorldSystems,
@@ -338,9 +341,9 @@ enum Phase {
     Jumping { since: Instant },
     /// `--lod`: the world is settled; waiting for the LOD's fill.
     LodFilling,
-    /// `--lod`: filled, the coverage replaced; the report comes next frame. The update times
-    /// (p99 and max, ms) of the frames that waited for the fill.
-    LodCovered { p99: f64, max: f64 },
+    /// `--lod`: filled; the report comes next frame. The update times (p99 and max, ms) of the
+    /// frames that waited for the fill.
+    LodFilled { p99: f64, max: f64 },
 }
 
 #[derive(Resource)]
@@ -370,7 +373,7 @@ impl Run {
     fn next_phase(&mut self, done: Phase, now: Instant, x: f64, exit: &mut MessageWriter<AppExit>) {
         let o = &self.options;
         let rank = |p: &Phase| match p {
-            Phase::Loading | Phase::LodFilling | Phase::LodCovered { .. } => 0,
+            Phase::Loading | Phase::LodFilling | Phase::LodFilled { .. } => 0,
             Phase::Idle { .. } => 1,
             Phase::Walking { .. } | Phase::CatchingUp { .. } => 2,
             Phase::Jumping { .. } => 3,
@@ -939,31 +942,27 @@ fn drive(
     }
 }
 
-/// `--lod`, after [`drive`]: waits for the LOD's fill once the world is settled, takes the
-/// full-detail coverage from the settled chunks (as the renderer's meshes would give it), and
-/// reports a frame later, when the masks and the counts are up to date.
+/// `--lod`, after [`drive`]: waits for the LOD's fill once the world is settled, and reports a
+/// frame later, when the masks and the counts are up to date.
 fn drive_lod(
     mut run: ResMut<Run>,
     stats: Option<Res<LodStats>>,
-    coverage: Option<ResMut<LodCoverage>>,
-    map: Res<ChunkMap>,
     viewers: Query<&Transform, With<ChunkViewer>>,
     mut exit: MessageWriter<AppExit>,
 ) {
-    let (Some(stats), Some(mut coverage)) = (stats, coverage) else {
+    let Some(stats) = stats else {
         return;
     };
     match run.phase {
         Phase::LodFilling
             if stats.fill >= 1.0 && stats.in_flight == 0 && stats.sends_waiting == 0 =>
         {
-            run.phase = Phase::LodCovered {
+            run.phase = Phase::LodFilled {
                 p99: p99(&run.updates),
                 max: max(&run.updates),
             };
-            coverage.replace(ChunkCoverage::from_map(&map));
         }
-        Phase::LodCovered { p99, max } => {
+        Phase::LodFilled { p99, max } => {
             println!("{}", lod_lines(&run, &stats, p99, max));
             let x = viewers.iter().next().map_or(VIEWER.x, |t| t.translation.x);
             run.next_phase(Phase::Loading, Instant::now(), x, &mut exit);
@@ -979,7 +978,8 @@ fn lod_lines(run: &Run, stats: &LodStats, p99: f64, max: f64) -> String {
     let mut out = format!(
         "lod: preset={} horizon={} columns={} nodes={} quads={} drawn={} floor_nodes={} \
          floor_quads={} filled_after={:.3}s jobs={} job_p50_us={} job_p99_us={} failed={} \
-         update_p99_ms={:.2} update_max_ms={:.2}",
+         published_chunks={} covered_chunks={} watched_chunks={} update_p99_ms={:.2} \
+         update_max_ms={:.2}",
         run.options.lod.name(),
         stats.horizon,
         stats.columns(),
@@ -993,6 +993,9 @@ fn lod_lines(run: &Run, stats: &LodStats, p99: f64, max: f64) -> String {
         stats.job_p50.as_micros(),
         stats.job_p99.as_micros(),
         stats.jobs_failed,
+        stats.published_chunks,
+        stats.covered_chunks,
+        stats.watched_chunks,
         p99,
         max,
     );

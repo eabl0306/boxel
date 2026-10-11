@@ -12,7 +12,7 @@
 //! The queue is a max-heap by priority class (0 first) and then by screen size; entries carry a
 //! ticket so a column queued again or dropped leaves its old entries to be skipped when popped.
 use crate::jobs::JobExecutor;
-use boxel_mesh::lod::{LodMaterials, fits, mesh_node};
+use boxel_mesh::lod::{LodMaterials, fits, mesh_node, octant_of};
 use boxel_mesh::{ChunkMesh, Mesher, PaddedChunk};
 use boxel_voxel::BlockRegistry;
 use boxel_worldgen::WorldGenerator;
@@ -51,8 +51,8 @@ pub(crate) enum Built {
     Uniform,
     /// Its cells meshed to nothing.
     Blank,
-    /// Its mesh.
-    Mesh(Arc<ChunkMesh>),
+    /// Its mesh, and the octants its quads lie in (bit `x | y << 1 | z << 2`).
+    Mesh(Arc<ChunkMesh>, u8),
     /// A face bucket passed the renderer's limit: the node is lost (its parent draws there).
     TooBig,
 }
@@ -197,7 +197,9 @@ pub(crate) fn run_column(input: &JobInput) -> LodMessage {
                         } else if !fits(mesh) {
                             Built::TooBig
                         } else {
-                            Built::Mesh(Arc::new(mesh.clone()))
+                            let octants =
+                                mesh.quads.iter().fold(0u8, |o, &q| o | 1 << octant_of(q));
+                            Built::Mesh(Arc::new(mesh.clone()), octants)
                         };
                         nodes.push((layer, built));
                     }

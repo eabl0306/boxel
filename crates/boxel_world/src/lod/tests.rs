@@ -661,8 +661,81 @@ fn frame(app: &mut App, model: &mut Model) {
     app.update();
     let ops = app.world_mut().resource_mut::<LodOps>().take();
     model.apply(ops);
-    let top = app.world().resource::<LodWorld>().tree.levels;
-    model.check(top);
+    check_model(app, model);
+}
+
+/// The renderer model against the tree after a frame: a parent hides its children (the swap
+/// is in one frame), every node there has its parent chain available (the chain rule), its mask
+/// is the tree's mask for the coverage of this frame, and every octant it hides is drawn by
+/// something else or holds nothing (module docs of `tree`).
+fn check_model(app: &App, model: &Model) {
+    let lod = app.world().resource::<LodWorld>();
+    let cov = app.world().resource::<LodCoverage>().coverage();
+    let tree = &lod.tree;
+    model.check(tree.levels);
+    for (&key, &(mask, _)) in &model.nodes {
+        assert!(
+            tree.chain_available(key),
+            "{key:?} sent under an unavailable parent"
+        );
+        assert_eq!(
+            mask,
+            tree.mask(key, cov),
+            "{key:?}: the mask on the renderer"
+        );
+        for o in 0..8u8 {
+            if mask & (1 << o) == 0 {
+                continue;
+            }
+            if key.lod == 1 {
+                // Covered chunks: published (drawn) or drawing nothing.
+                assert!(cov.covered(chunk_of_octant(key.pos, o)));
+                continue;
+            }
+            let c = tree::child(key, o);
+            let drawn = model.nodes.contains_key(&c);
+            let nothing = tree.known_uniform(c)
+                || tree
+                    .node(c)
+                    .is_some_and(|n| matches!(n.state, tree::NodeState::Blank));
+            let touched = tree.is_touched(c, cov) && !tree.lost(c);
+            assert!(
+                drawn
+                    || nothing
+                    || full_detail_covers(cov, c)
+                    || touched
+                    || children_hidden(model, tree, cov, c),
+                "{key:?} hides octant {o} ({c:?}) that nothing draws"
+            );
+        }
+    }
+}
+
+/// True if every chunk inside node `key` is covered at full detail.
+fn full_detail_covers(cov: &ChunkCoverage, key: ChunkKey) -> bool {
+    let shift = key.lod - 1;
+    let span = |v: i64| (v << shift)..=(((v + 1) << shift) - 1);
+    span(key.pos.x).all(|x| {
+        span(key.pos.y)
+            .all(|y| span(key.pos.z).all(|z| cov.get(ChunkPos::new(x, y, z)).covered == 0xFF))
+    })
+}
+
+/// True if node `key` is not on the renderer but covered through its children: each of them
+/// drawn, holding nothing, covered at full detail, or itself covered through its children.
+fn children_hidden(model: &Model, tree: &Tree, cov: &ChunkCoverage, key: ChunkKey) -> bool {
+    if key.lod == 1 {
+        return cov.get(key.pos).covered == 0xFF;
+    }
+    (0..8u8).all(|o| {
+        let c = tree::child(key, o);
+        model.nodes.contains_key(&c)
+            || tree.known_uniform(c)
+            || tree
+                .node(c)
+                .is_some_and(|n| matches!(n.state, tree::NodeState::Blank))
+            || children_hidden(model, tree, cov, c)
+    })
 }
 
 /// Frames until the LOD is filled (panics after `max` frames).
@@ -706,6 +779,14 @@ fn assert_bits_from_scratch(app: &App) {
         known,
         "columns with a known band"
     );
+    let (scratch, kept) = lod.tree.lod1_octants_from_scratch();
+    assert_eq!(kept, scratch, "lod-1 octants with quads");
+    let touched: HashMap<ChunkKey, u8> = lod.tree.touched().clone();
+    assert_eq!(
+        touched,
+        lod.tree.touched_from_scratch(&cov),
+        "incremental touched bits"
+    );
     let scratch = lod.tree.children_from_scratch(&cov);
     let mut keys: Vec<ChunkKey> = incremental.keys().chain(scratch.keys()).copied().collect();
     keys.sort_unstable();
@@ -723,7 +804,7 @@ fn assert_bits_from_scratch(app: &App) {
                 lod.tree.active(k),
                 lod.tree.wanted(k),
                 col.and_then(|c| c.band),
-                lod.tree.node(k).map(|n| (n.wanted, n.available())),
+                lod.tree.node(k).map(tree::Node::available),
             )
         })
         .collect();
@@ -768,8 +849,19 @@ fn the_plugin_fills_the_rings_and_sends_every_node() {
     }
     assert_eq!(sent, model.nodes.len());
     assert_eq!(sent, stats.nodes());
-    // Without full detail every lod-1 node draws; level-2 nodes hide what level 1 draws.
-    assert_eq!(stats.levels[0].drawn, stats.levels[0].nodes);
+    // A lod-1 node is not drawn only where full detail covers every octant it has quads in.
+    let cov = app.world().resource::<LodCoverage>().coverage();
+    let hidden = model
+        .nodes
+        .iter()
+        .filter(|(k, (mask, _))| k.lod == 1 && lod.tree.lod1_octants(k.pos) & !mask == 0)
+        .count();
+    assert_eq!(stats.levels[0].drawn, stats.levels[0].nodes - hidden);
+    assert!(
+        stats.covered_chunks > 0 && stats.published_chunks > 0,
+        "{stats:?}"
+    );
+    assert!(cov.covered_chunks() >= cov.published_chunks());
     assert_bits_from_scratch(&app);
     assert!(frames < 300);
 }
@@ -823,6 +915,20 @@ impl Hold {
 
     fn held(&self) -> usize {
         self.0.lock().expect("lock").len()
+    }
+
+    /// Runs the held jobs whose index has its bit set in `pick` (bit `i % 32`), keeps the rest.
+    fn run_some(&self, pick: u32) {
+        let jobs = std::mem::take(&mut *self.0.lock().expect("lock"));
+        let mut kept = Vec::new();
+        for (i, job) in jobs.into_iter().enumerate() {
+            if pick & (1 << (i % 32)) != 0 {
+                job();
+            } else {
+                kept.push(job);
+            }
+        }
+        self.0.lock().expect("lock").extend(kept);
     }
 }
 
@@ -992,7 +1098,8 @@ fn the_tree_follows_a_moving_eye() {
     }
     fill(&mut app, &mut model, 300);
     assert_bits_from_scratch(&app);
-    // Every node on the renderer is wanted, or departed and waiting for its parent.
+    // Every node on the renderer is a sent record (a node that leaves the wanted tree goes at
+    // once: its parent is on the renderer).
     let lod = app.world().resource::<LodWorld>();
     for &key in model.nodes.keys() {
         assert!(lod.tree.node(key).is_some_and(tree::Node::sent), "{key:?}");
@@ -1007,14 +1114,46 @@ fn a_resync_sends_every_node_again_the_coarsest_first() {
     fill(&mut app, &mut model, 300);
     let before = model.nodes.len();
     app.world_mut().write_message(LodResync);
+    // A new renderer, small sends: the order shows.
+    app.world_mut()
+        .resource_mut::<LodSettings>()
+        .publish_per_frame = 4;
     let mut renderer = Model::default();
-    fill(&mut app, &mut renderer, 300);
+    fill(&mut app, &mut renderer, 3000);
     assert_eq!(renderer.nodes.len(), before);
-    let levels: Vec<u8> = renderer.upserts.iter().map(|k| k.lod).collect();
+    // The touched lod-1 nodes with their ancestors first, then the rest; each coarse to fine.
+    let lod = app.world().resource::<LodWorld>();
+    let cov = app.world().resource::<LodCoverage>().coverage();
+    let mut urgent = BTreeSet::new();
+    for &k in &renderer.upserts {
+        if k.lod == 1 && lod.tree.is_touched(k, cov) {
+            let mut a = k;
+            while urgent.insert(a) && a.lod < lod.tree.levels {
+                a = tree::parent(a);
+            }
+        }
+    }
     assert!(
-        levels.windows(2).all(|w| w[0] >= w[1]),
-        "coarse to fine: {levels:?}"
+        urgent.iter().any(|k| k.lod == 1),
+        "full detail touches lod-1 nodes"
     );
+    let split = renderer
+        .upserts
+        .iter()
+        .position(|k| !urgent.contains(k))
+        .unwrap_or(renderer.upserts.len());
+    let (first, rest) = renderer.upserts.split_at(split);
+    assert!(
+        rest.iter().all(|k| !urgent.contains(k)),
+        "urgent nodes first"
+    );
+    for part in [first, rest] {
+        let levels: Vec<u8> = part.iter().map(|k| k.lod).collect();
+        assert!(
+            levels.windows(2).all(|w| w[0] >= w[1]),
+            "coarse to fine: {levels:?}"
+        );
+    }
     assert_bits_from_scratch(&app);
 }
 
@@ -1041,11 +1180,16 @@ fn a_refused_node_waits_for_room_and_its_parent_draws_meanwhile() {
     spawn(&mut app, DVec3::new(10.0, 60.0, 10.0));
     let mut model = Model::default();
     fill(&mut app, &mut model, 300);
-    // A level-1 node whose parent is on the renderer.
+    // A level-1 node away from full detail whose parent is on the renderer.
+    let cov = app.world().resource::<LodCoverage>().coverage().clone();
     let key = *model
         .nodes
         .keys()
-        .find(|k| k.lod == 1 && model.nodes.contains_key(&tree::parent(**k)))
+        .find(|k| {
+            k.lod == 1
+                && model.nodes.contains_key(&tree::parent(**k))
+                && cov.get(k.pos) == Octants::default()
+        })
         .expect("a lod-1 node under a sent parent");
     let up = tree::parent(key);
     assert!(model.nodes[&up].0 & tree::octant_bit(key) != 0);
@@ -1091,11 +1235,18 @@ fn full_detail_coverage_hides_lod1_octants() {
     spawn(&mut app, DVec3::new(10.0, 60.0, 10.0));
     let mut model = Model::default();
     fill(&mut app, &mut model, 300);
+    // A lod-1 node away from the loaded chunks (no event will touch its coverage).
+    let map = app.world().resource::<ChunkMap>();
     let key = *model
         .nodes
         .keys()
-        .find(|k| k.lod == 1)
+        .find(|k| {
+            k.lod == 1
+                && model.nodes[*k].0 == 0
+                && (0..8).all(|o| map.id_at(chunk_of_octant(k.pos, o)).is_none())
+        })
         .expect("a lod-1 node");
+    let drawn = app.world().resource::<LodStats>().levels[0].drawn;
     let chunk = ChunkPos::new(key.pos.x * 2 + 1, key.pos.y * 2, key.pos.z * 2);
     app.world_mut()
         .resource_mut::<LodCoverage>()
@@ -1120,7 +1271,7 @@ fn full_detail_coverage_hides_lod1_octants() {
     assert_eq!(model.nodes[&key].0, 0xFF);
     assert_bits_from_scratch(&app);
     let stats = app.world().resource::<LodStats>();
-    assert_eq!(stats.levels[0].drawn, stats.levels[0].nodes - 1);
+    assert_eq!(stats.levels[0].drawn, drawn - 1);
 }
 
 #[test]
@@ -1239,6 +1390,7 @@ fn the_queue_orders_by_class_then_screen_size() {
         app.update();
     }
     let state = app.world().resource::<LodWorld>();
+    let cov = app.world().resource::<LodCoverage>().coverage();
     let mut queue = state.jobs.queue.clone();
     let eye = state.planned.expect("planned").eye;
     let mut last: Option<(u8, f32)> = None;
@@ -1255,8 +1407,15 @@ fn the_queue_orders_by_class_then_screen_size() {
             DimensionId(0),
             col.nearest(&work, 60i64.div_euclid(node_edge(entry.column.level))),
         );
-        let expect = if entry.column.level == 3 {
+        let node = |y: i64| entry.column.node(DimensionId(0), y);
+        let expect = if entry.column.level == 3
+            || work.layers().any(|y| state.tree.is_touched(node(y), cov))
+        {
             0
+        } else if entry.column.level == 1
+            && work.layers().all(|y| cov.get(node(y).pos).covered == 0xFF)
+        {
+            3
         } else if state.in_view(&eye, key) {
             1
         } else {
@@ -1293,6 +1452,9 @@ fn far_from_the_origin_the_rings_fill_the_same_way() {
         fill(&mut app, &mut model, 300);
         let stats = app.world().resource::<LodStats>();
         assert!(stats.nodes() > 0, "at {at}: {stats:?}");
+        assert!(stats.published_chunks > 0, "at {at}: {stats:?}");
+        assert_feed_matches_map(&app);
+        assert_published_hidden(&app, &model);
         for key in model.nodes.keys() {
             let limit = MAX_CHUNK_COORD >> key.lod;
             assert!(
@@ -1372,7 +1534,7 @@ fn lod_jobs_hand_the_mesher_cells_from_the_source() {
     // its top border row of ground, layer 1 is air over the highest step plus a cell.
     assert_eq!((column.lo, column.hi), (0, 1));
     assert_eq!(nodes.len(), 1);
-    assert!(matches!(nodes[0], (0, jobs::Built::Mesh(_))));
+    assert!(matches!(nodes[0], (0, jobs::Built::Mesh(..))));
 }
 
 #[test]
@@ -1382,7 +1544,7 @@ fn chunk_coverage_from_a_map_matches_the_published_meshes() {
     for _ in 0..20 {
         app.update();
     }
-    let map = app.world().resource::<crate::ChunkMap>();
+    let map = app.world().resource::<ChunkMap>();
     let cov = ChunkCoverage::from_map(map);
     for (_, k, _) in map.ready_meshes() {
         let (p, bit) = octant_of_chunk(k.pos);
@@ -1428,4 +1590,833 @@ fn each_level_is_planned_again_after_an_eighth_of_its_band() {
     let later = eyes(&app);
     assert_ne!(later[3], start[3]);
     assert!(later[1..=3].iter().all(|e| *e == later[3]));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Full-detail coverage: the feed, availability, the invariant
+
+/// The level-`k` node holding chunk `c`, and the octant bit of `c` in it.
+fn node_of_chunk(c: ChunkPos, k: u8) -> (ChunkKey, u8) {
+    let at = |s: u8| ChunkPos::new(c.x >> s, c.y >> s, c.z >> s);
+    let key = ChunkKey {
+        dim: DimensionId(0),
+        lod: k,
+        pos: at(k),
+    };
+    let finer = ChunkKey {
+        dim: DimensionId(0),
+        lod: k - 1,
+        pos: at(k - 1),
+    };
+    (key, tree::octant_bit(finer))
+}
+
+/// Who draws chunk `c` on the renderer model: full detail (published) and the LOD levels whose
+/// node there shows `c`'s octant, those levels whose child toward `c` is lost apart (they may
+/// draw over full detail).
+fn drawers(app: &App, model: &Model, c: ChunkPos) -> (bool, Vec<u8>, Vec<u8>) {
+    let lod = app.world().resource::<LodWorld>();
+    let cov = app.world().resource::<LodCoverage>().coverage();
+    let mut lods = Vec::new();
+    let mut lost = Vec::new();
+    for k in 1..=lod.tree.levels {
+        let (key, bit) = node_of_chunk(c, k);
+        if let Some(&(mask, _)) = model.nodes.get(&key)
+            && mask & bit == 0
+        {
+            if k >= 2 && lod.tree.lost(node_of_chunk(c, k - 1).0) {
+                lost.push(k);
+            } else {
+                lods.push(k);
+            }
+        }
+    }
+    (cov.published(c), lods, lost)
+}
+
+/// At most one of full detail and the LOD levels draws each chunk of `chunks` (a lost child's
+/// parent may draw over full detail).
+fn assert_at_most_one(app: &App, model: &Model, chunks: impl Iterator<Item = ChunkPos>) {
+    for c in chunks {
+        let (fd, lods, lost) = drawers(app, model, c);
+        assert!(
+            usize::from(fd) + lods.len() <= 1 && lods.len() + lost.len() <= 1,
+            "{c:?} drawn by full detail {fd}, levels {lods:?} and over lost children {lost:?}"
+        );
+    }
+}
+
+/// Every published chunk is hidden from every LOD node on the renderer (but under a lost
+/// child).
+fn assert_published_hidden(app: &App, model: &Model) {
+    let cov = app.world().resource::<LodCoverage>().coverage();
+    let mut published = Vec::new();
+    for p in cov.positions() {
+        for o in 0..8 {
+            let c = chunk_of_octant(p, o);
+            if cov.published(c) {
+                published.push(c);
+            }
+        }
+    }
+    for c in published {
+        let (_, lods, _) = drawers(app, model, c);
+        assert!(
+            lods.is_empty(),
+            "{c:?} published and drawn by levels {lods:?}"
+        );
+    }
+}
+
+/// The feed's coverage against a from-scratch one of the map: the same published chunks; covered
+/// ones only where the map says so, and all of them in octants where a lod-1 node has quads
+/// (elsewhere an empty mesh changes nothing drawn and is not looked for).
+fn assert_feed_matches_map(app: &App) {
+    let map = app.world().resource::<ChunkMap>();
+    let lod = app.world().resource::<LodWorld>();
+    let feed = app.world().resource::<LodCoverage>().coverage();
+    let scratch = ChunkCoverage::from_map(map);
+    let positions: foldhash::HashSet<ChunkPos> =
+        feed.positions().chain(scratch.positions()).collect();
+    for p in positions {
+        let (a, b) = (feed.get(p), scratch.get(p));
+        assert_eq!(a.published, b.published, "{p:?}: published");
+        assert_eq!(a.covered & !b.covered, 0, "{p:?}: covered without a reason");
+        let quads = lod.tree.lod1_octants(p);
+        assert_eq!(
+            a.covered & quads,
+            b.covered & quads,
+            "{p:?}: an empty chunk under LOD quads"
+        );
+    }
+}
+
+#[test]
+fn the_coverage_follows_the_worlds_messages() {
+    // Ground at 33 on one tile in five: the chunks under it are solid and enclosed (empty
+    // meshes, no event), and the lod-1 skirts at the node's middle plane put quads in their
+    // octant, so the poll has to find them.
+    let mut app = app(Steps::new(33), small());
+    spawn(&mut app, DVec3::new(10.0, 60.0, 10.0));
+    let mut model = Model::default();
+    fill(&mut app, &mut model, 300);
+    for _ in 0..3 {
+        frame(&mut app, &mut model);
+    }
+    assert_feed_matches_map(&app);
+    assert_published_hidden(&app, &model);
+    let map = app.world().resource::<ChunkMap>();
+    let lod = app.world().resource::<LodWorld>();
+    let cov = app.world().resource::<LodCoverage>().coverage();
+    // Air over the ground: covered by its data.
+    let air = ChunkPos::new(0, 2, 0);
+    assert!(map.id_at(air).is_some() && cov.covered(air) && !cov.published(air));
+    // Enclosed chunks with LOD quads in their octant: covered through the poll.
+    let polled: Vec<ChunkPos> = map
+        .iter()
+        .filter(|(_, s)| {
+            matches!(s.mesh(), crate::MeshState::Empty)
+                && !matches!(s.data(), crate::DataState::Ready(d) if d.as_uniform() == Some(BlockState::AIR))
+        })
+        .map(|(_, s)| s.pos)
+        .filter(|&c| {
+            let (p, bit) = octant_of_chunk(c);
+            lod.tree.lod1_octants(p) & bit != 0
+        })
+        .collect();
+    assert!(
+        !polled.is_empty(),
+        "the scene has empty chunks under LOD quads"
+    );
+    for c in polled {
+        assert!(cov.covered(c), "{c:?}");
+    }
+    // Still watched: loaded chunks without a mesh yet (the data ring), under LOD quads.
+    let watched = app.world().resource::<LodCoverage>().watch_list();
+    assert_eq!(
+        watched.len(),
+        app.world().resource::<LodStats>().watched_chunks
+    );
+    for &c in watched {
+        let slot = map.get(map.id_at(c).expect("loaded")).expect("slot");
+        assert!(
+            !cov.covered(c) && matches!(slot.mesh(), crate::MeshState::None),
+            "{c:?}"
+        );
+    }
+    assert_bits_from_scratch(&app);
+}
+
+/// A lod-1 node on the renderer far from the loaded chunks, with no coverage.
+fn free_lod1(app: &App, model: &Model) -> ChunkKey {
+    let map = app.world().resource::<ChunkMap>();
+    let cov = app.world().resource::<LodCoverage>().coverage();
+    *model
+        .nodes
+        .keys()
+        .filter(|k| {
+            k.lod == 1
+                && model.nodes.contains_key(&tree::parent(**k))
+                && cov.get(k.pos) == Octants::default()
+                && (0..8).all(|o| map.id_at(chunk_of_octant(k.pos, o)).is_none())
+        })
+        .min()
+        .expect("a lod-1 node away from full detail")
+}
+
+fn upsert(c: ChunkPos) -> ChunkMeshEvent {
+    ChunkMeshEvent::Upsert {
+        id: crate::ChunkId::default(),
+        key: ChunkKey {
+            dim: DimensionId(0),
+            lod: 0,
+            pos: c,
+        },
+        mesh: Arc::new(ChunkMesh::default()),
+    }
+}
+
+fn remove(c: ChunkPos) -> ChunkMeshEvent {
+    ChunkMeshEvent::Remove {
+        id: crate::ChunkId::default(),
+        key: ChunkKey {
+            dim: DimensionId(0),
+            lod: 0,
+            pos: c,
+        },
+    }
+}
+
+#[test]
+fn upserts_written_between_frames_count_like_those_of_collect() {
+    let mut app = app(Steps::new(20), small());
+    spawn(&mut app, DVec3::new(10.0, 60.0, 10.0));
+    let mut model = Model::default();
+    fill(&mut app, &mut model, 300);
+    let key = free_lod1(&app, &model);
+    let up = tree::parent(key);
+    let c = chunk_of_octant(key.pos, 0b101);
+    // Written outside `Update`, as the world's idle step does between frames.
+    app.world_mut().write_message(upsert(c));
+    frame(&mut app, &mut model);
+    assert_eq!(model.nodes[&key].0, 1 << 0b101);
+    let cov = app.world().resource::<LodCoverage>().coverage();
+    assert!(cov.published(c));
+    assert!(app.world().resource::<LodWorld>().tree.is_touched(key, cov));
+    assert!(model.nodes[&up].0 & tree::octant_bit(key) != 0);
+    app.world_mut().write_message(remove(c));
+    frame(&mut app, &mut model);
+    assert_eq!(model.nodes[&key].0, 0);
+    assert_bits_from_scratch(&app);
+}
+
+#[test]
+fn a_main_refusal_stops_counting_as_published_and_showing_again_restores_it() {
+    let mut app = app(Steps::new(20), small());
+    spawn(&mut app, DVec3::new(10.0, 60.0, 10.0));
+    let mut model = Model::default();
+    fill(&mut app, &mut model, 300);
+    let key = free_lod1(&app, &model);
+    let c = chunk_of_octant(key.pos, 0b010);
+    app.world_mut().write_message(upsert(c));
+    frame(&mut app, &mut model);
+    assert_eq!(model.nodes[&key].0, 0b100);
+    app.world_mut()
+        .resource_mut::<LodFeedback>()
+        .chunks
+        .push((c, true));
+    frame(&mut app, &mut model);
+    assert_eq!(model.nodes[&key].0, 0, "a refused chunk is not drawn");
+    assert!(
+        !app.world()
+            .resource::<LodCoverage>()
+            .coverage()
+            .published(c)
+    );
+    app.world_mut()
+        .resource_mut::<LodFeedback>()
+        .chunks
+        .push((c, false));
+    frame(&mut app, &mut model);
+    assert_eq!(model.nodes[&key].0, 0b100, "shown again");
+    assert_bits_from_scratch(&app);
+}
+
+#[test]
+fn a_chunk_mesh_resync_rebuilds_the_published_bits_from_the_ready_meshes() {
+    let mut app = app(Steps::new(20), small());
+    spawn(&mut app, DVec3::new(10.0, 60.0, 10.0));
+    let mut model = Model::default();
+    fill(&mut app, &mut model, 300);
+    // A stale upsert of a chunk the world does not have, and a refused real one.
+    let stale = chunk_of_octant(free_lod1(&app, &model).pos, 0);
+    let (_, real, _) = app
+        .world()
+        .resource::<ChunkMap>()
+        .ready_meshes()
+        .next()
+        .expect("a ready mesh");
+    app.world_mut().write_message(upsert(stale));
+    app.world_mut()
+        .resource_mut::<LodFeedback>()
+        .chunks
+        .push((real.pos, true));
+    frame(&mut app, &mut model);
+    let cov = app.world().resource::<LodCoverage>().coverage();
+    assert!(cov.published(stale) && !cov.published(real.pos));
+    // The renderer dropped everything and uploaded the ready meshes again.
+    app.world_mut().write_message(ChunkMeshResync);
+    frame(&mut app, &mut model);
+    let cov = app.world().resource::<LodCoverage>().coverage();
+    assert!(!cov.published(stale) && cov.published(real.pos));
+    assert_feed_matches_map(&app);
+    assert_published_hidden(&app, &model);
+    assert_bits_from_scratch(&app);
+}
+
+/// A world with no viewer (it loads nothing) and the LOD looking from `eye` through
+/// [`LodFocus`], on `executor`.
+fn focus_app(
+    steps: Steps,
+    settings: LodSettings,
+    executor: Arc<dyn JobExecutor>,
+    eye: I64Vec3,
+) -> App {
+    let mut app = app_with(steps, settings, executor, Arc::new(InlineExecutor));
+    app.world_mut().insert_resource(LodFocus {
+        origin: eye,
+        eye_rel: Vec3::splat(0.5),
+        forward: Vec3::X,
+        fov_y: 70f32.to_radians(),
+        aspect: 16.0 / 9.0,
+    });
+    app
+}
+
+#[test]
+fn five_thousand_events_in_one_frame_are_applied_in_full() {
+    let mut app = focus_app(
+        Steps::new(20),
+        small(),
+        Arc::new(InlineExecutor),
+        I64Vec3::new(0, 60, 0),
+    );
+    let mut model = Model::default();
+    fill(&mut app, &mut model, 300);
+    // The budget only bounds the jobs; the events are all read and applied this frame.
+    app.world_mut().resource_mut::<LodSettings>().frame_budget = Duration::from_nanos(1);
+    let mut expect: HashMap<ChunkPos, bool> = HashMap::default();
+    let mut rng = 0x2545_f491_4f6c_dd1du64;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    for _ in 0..5000 {
+        let r = next();
+        let c = ChunkPos::new(
+            (r % 24) as i64 - 12,
+            ((r >> 8) % 4) as i64,
+            ((r >> 16) % 24) as i64 - 12,
+        );
+        let on = (r >> 32) % 3 != 0;
+        app.world_mut()
+            .write_message(if on { upsert(c) } else { remove(c) });
+        expect.insert(c, on);
+    }
+    frame(&mut app, &mut model);
+    let cov = app.world().resource::<LodCoverage>().coverage();
+    for (&c, &on) in &expect {
+        assert_eq!(cov.published(c), on, "{c:?}");
+    }
+    assert_eq!(
+        cov.published_chunks(),
+        expect.values().filter(|&&on| on).count()
+    );
+    assert_bits_from_scratch(&app);
+    assert_published_hidden(&app, &model);
+    assert_at_most_one(&app, &model, expect.keys().copied());
+}
+
+#[test]
+fn a_lost_lod1_child_with_published_chunks_lets_its_parent_draw() {
+    // Level-1 column (1, 0) fails; (3, 1) is refused later.
+    let steps = Steps {
+        panic_at: Some((1, [1, 0])),
+        ..Steps::new(20)
+    };
+    let mut app = focus_app(
+        steps,
+        small(),
+        Arc::new(InlineExecutor),
+        I64Vec3::new(0, 60, 0),
+    );
+    let mut model = Model::default();
+    fill(&mut app, &mut model, 300);
+    let failed = ChunkKey {
+        dim: DimensionId(0),
+        lod: 1,
+        pos: ChunkPos::new(1, 0, 0),
+    };
+    let up = tree::parent(failed);
+    assert!(app.world().resource::<LodWorld>().tree.lost(failed));
+    assert!(model.nodes.contains_key(&up));
+    // A published chunk inside the failed node: its parent keeps drawing the octant.
+    app.world_mut()
+        .resource_mut::<LodCoverage>()
+        .set(chunk_of_octant(failed.pos, 0), true, true);
+    frame(&mut app, &mut model);
+    assert_eq!(model.nodes[&up].0 & tree::octant_bit(failed), 0);
+    // A sent lod-1 node with a published chunk, then refused: lost while it backs off.
+    let refused = ChunkKey {
+        dim: DimensionId(0),
+        lod: 1,
+        pos: ChunkPos::new(3, 0, 1),
+    };
+    assert!(model.nodes.contains_key(&refused), "{refused:?} sent");
+    let up = tree::parent(refused);
+    app.world_mut()
+        .resource_mut::<LodCoverage>()
+        .set(chunk_of_octant(refused.pos, 0), true, true);
+    frame(&mut app, &mut model);
+    assert!(model.nodes[&up].0 & tree::octant_bit(refused) != 0);
+    {
+        let mut feedback = app.world_mut().resource_mut::<LodFeedback>();
+        feedback.refused.push(refused);
+        feedback.arena_free_quads = Some(0);
+    }
+    model.nodes.remove(&refused);
+    frame(&mut app, &mut model);
+    assert_eq!(
+        model.nodes[&up].0 & tree::octant_bit(refused),
+        0,
+        "the parent draws over the refused child"
+    );
+    let chunks: Vec<ChunkPos> = (0..8)
+        .map(|o| chunk_of_octant(refused.pos, o))
+        .chain((0..8).map(|o| chunk_of_octant(failed.pos, o)))
+        .collect();
+    assert_at_most_one(&app, &model, chunks.into_iter());
+}
+
+#[test]
+fn a_touched_octant_waits_hidden_for_its_lod1_node_which_jumps_ahead() {
+    let steps = Steps::new(20);
+    let calls = Arc::clone(&steps.calls);
+    let lod = Arc::new(Hold::default());
+    let mut app = focus_app(steps, small(), lod.clone(), I64Vec3::new(0, 60, 0));
+    let mut model = Model::default();
+    // Until the top level is all sent and level 1 is under way.
+    let mut ready = false;
+    for _ in 0..400 {
+        lod.run_all();
+        frame(&mut app, &mut model);
+        let stats = app.world().resource::<LodStats>();
+        if stats.levels[1].pending == 0
+            && stats.levels[1].nodes > 0
+            && stats.sends_waiting == 0
+            && stats.levels[0].nodes > 4
+        {
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready, "{:?}", app.world().resource::<LodStats>());
+    // A lod-1 column still waiting in the queue, under a sent parent.
+    let state = app.world().resource::<LodWorld>();
+    let (c, key) = state
+        .tree
+        .columns
+        .iter()
+        .filter(|(c, col)| c.level == 1 && col.ticket.is_some())
+        .find_map(|(&c, col)| {
+            let work = col.work()?;
+            let y = work.layers().find(|&y| {
+                let key = c.node(DimensionId(0), y);
+                model.nodes.contains_key(&tree::parent(key)) && !state.tree.known_uniform(key)
+            })?;
+            Some((c, c.node(DimensionId(0), y)))
+        })
+        .expect("a queued lod-1 column under a sent parent");
+    let up = tree::parent(key);
+    assert_eq!(model.nodes[&up].0 & tree::octant_bit(key), 0);
+    app.world_mut()
+        .resource_mut::<LodCoverage>()
+        .set(chunk_of_octant(key.pos, 3), true, true);
+    frame(&mut app, &mut model);
+    // A short hole rather than drawing over full detail.
+    assert!(model.nodes[&up].0 & tree::octant_bit(key) != 0);
+    let state = app.world().resource::<LodWorld>();
+    let ticket = state.tree.columns[&c].ticket.expect("queued");
+    let entry = state
+        .jobs
+        .queue
+        .iter()
+        .find(|e| e.column == c && e.ticket == ticket)
+        .expect("its entry");
+    assert_eq!(entry.class, 0, "touched: the first class");
+    // It goes next.
+    let before = calls.lock().expect("lock").len();
+    lod.run_all();
+    frame(&mut app, &mut model);
+    lod.run_all();
+    let after = calls.lock().expect("lock")[before..].to_vec();
+    assert!(after.contains(&(1, [c.x, c.z])), "{after:?}");
+    fill_held(&mut app, &lod, &mut model);
+    assert!(model.nodes.contains_key(&key));
+    assert!(model.nodes[&up].0 & tree::octant_bit(key) != 0);
+    assert_bits_from_scratch(&app);
+}
+
+/// Frames running every held job until the LOD is filled.
+fn fill_held(app: &mut App, lod: &Hold, model: &mut Model) {
+    for _ in 0..1000 {
+        lod.run_all();
+        frame(app, model);
+        let stats = app.world().resource::<LodStats>();
+        if stats.fill >= 1.0 && stats.in_flight == 0 && stats.sends_waiting == 0 && lod.held() == 0
+        {
+            return;
+        }
+    }
+    panic!("not filled: {:?}", app.world().resource::<LodStats>());
+}
+
+#[test]
+fn a_refused_parent_takes_its_children_off_until_it_is_back() {
+    let mut app = app(Steps::new(20), small());
+    spawn(&mut app, DVec3::new(10.0, 60.0, 10.0));
+    let mut model = Model::default();
+    fill(&mut app, &mut model, 300);
+    let children = |model: &Model, key: ChunkKey| {
+        model
+            .nodes
+            .keys()
+            .filter(|k| k.lod == 1 && tree::parent(**k) == key)
+            .count()
+    };
+    let key = *model
+        .nodes
+        .keys()
+        .filter(|k| k.lod == 2)
+        .max_by_key(|k| children(&model, **k))
+        .expect("a level-2 node");
+    let n = children(&model, key);
+    assert!(n > 0);
+    {
+        let mut feedback = app.world_mut().resource_mut::<LodFeedback>();
+        feedback.refused.push(key);
+        feedback.arena_free_quads = Some(0);
+    }
+    model.nodes.remove(&key);
+    frame(&mut app, &mut model);
+    assert_eq!(
+        children(&model, key),
+        0,
+        "nothing finer shows without its parent"
+    );
+    for _ in 0..10 {
+        frame(&mut app, &mut model);
+        assert!(!model.nodes.contains_key(&key));
+    }
+    app.world_mut()
+        .resource_mut::<LodFeedback>()
+        .arena_free_quads = Some(1 << 30);
+    app.world_mut()
+        .resource_mut::<LodWorld>()
+        .tree
+        .expire_refusals();
+    frame(&mut app, &mut model);
+    assert!(model.nodes.contains_key(&key));
+    assert_eq!(children(&model, key), n, "the children come back with it");
+    assert_bits_from_scratch(&app);
+}
+
+/// One step of the coverage invariant's random runs.
+#[derive(Clone, Debug)]
+enum Step {
+    /// Publish chunk `n` of the near set.
+    Publish(u16),
+    /// Mark it as drawing nothing (an empty mesh).
+    Empty(u16),
+    /// Forget it (unloaded).
+    Clear(u16),
+    /// Run the held jobs picked by these bits.
+    Jobs(u32),
+    /// The renderer refuses node `n` on it.
+    Refuse(u16),
+    /// The arena has room again and the back-off is over.
+    Room,
+    /// The renderer lost every node.
+    Resync,
+    /// The eye moves by (16 x, 8 y, 16 z) blocks.
+    Move(i8, i8, i8),
+}
+
+fn step() -> impl Strategy<Value = Step> {
+    prop_oneof![
+        4 => any::<u16>().prop_map(Step::Publish),
+        2 => any::<u16>().prop_map(Step::Empty),
+        2 => any::<u16>().prop_map(Step::Clear),
+        10 => any::<u32>().prop_map(Step::Jobs),
+        1 => any::<u16>().prop_map(Step::Refuse),
+        1 => Just(Step::Room),
+        1 => Just(Step::Resync),
+        2 => (-3i8..=3, -1i8..=1, -3i8..=3).prop_map(|(x, y, z)| Step::Move(x, y, z)),
+    ]
+}
+
+/// The chunks a run publishes: 13 x 13 columns of layers 0 and 1 around the origin, inside
+/// the wanted lod-1 nodes wherever the eye goes (it stays within 64 blocks of its start).
+fn near_chunk(n: u16) -> ChunkPos {
+    let n = i64::from(n) % (13 * 13 * 2);
+    ChunkPos::new(n % 13 - 6, n / 169, (n / 13) % 13 - 6)
+}
+
+/// The chunks the invariant is checked on: around the near set and above and below it.
+fn sample() -> impl Iterator<Item = ChunkPos> {
+    (-1..=2).flat_map(|y| (-8..=8).flat_map(move |z| (-8..=8).map(move |x| ChunkPos::new(x, y, z))))
+}
+
+/// Once everything is built, sent and published: exactly one of full detail and the LOD draws
+/// each chunk, or none where it draws nothing (covered and not published, or the finest wanted
+/// node there holds nothing).
+fn assert_exactly_one(app: &App, model: &Model) {
+    let lod = app.world().resource::<LodWorld>();
+    let cov = app.world().resource::<LodCoverage>().coverage();
+    for c in sample() {
+        let (fd, lods, lost) = drawers(app, model, c);
+        assert!(lost.is_empty(), "{c:?}: lost children once all is built");
+        if cov.covered(c) {
+            assert!(
+                lods.is_empty(),
+                "{c:?} covered (published {fd}) and drawn by {lods:?}"
+            );
+            continue;
+        }
+        let finest = (1..=lod.tree.levels)
+            .map(|k| node_of_chunk(c, k).0)
+            .find(|&key| lod.tree.wanted(key));
+        let draws = finest.is_some_and(|key| {
+            lod.tree
+                .node(key)
+                .is_some_and(|n| matches!(n.state, tree::NodeState::Ready { .. }))
+        });
+        assert_eq!(
+            lods.len(),
+            usize::from(draws),
+            "{c:?}: drawn by {lods:?}, finest wanted {finest:?}"
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(24))]
+
+    /// The core property (ADR 0031): for random coverage changes, job completion orders,
+    /// refusals, resyncs and eye moves, every chunk is drawn by at most one of full detail and
+    /// the LOD levels, every frame (a lost child's parent may draw over full detail); with
+    /// everything available, exactly one (or none where nothing is there).
+    #[test]
+    fn full_detail_and_the_lod_levels_never_draw_the_same_chunk(
+        steps in proptest::collection::vec(step(), 1..60),
+    ) {
+        let lod = Arc::new(Hold::default());
+        let start = I64Vec3::new(0, 60, 0);
+        // Three levels: an orphaned lod-1 node would show under a level-3 grandparent. Eight
+        // jobs in flight, the top level built first: the random part completes the finer
+        // levels' jobs in any order.
+        let settings = LodSettings {
+            levels: 3,
+            in_flight_busy: 8,
+            in_flight_settled: 8,
+            ..small()
+        };
+        let mut app = focus_app(Steps::new(20), settings, lod.clone(), start);
+        let mut model = Model::default();
+        let top_built = |app: &App| {
+            let tree = &app.world().resource::<LodWorld>().tree;
+            let mut top = tree.columns.iter().filter(|(c, _)| c.level == 3).peekable();
+            top.peek().is_some() && top.all(|(_, col)| col.band.is_some())
+        };
+        for _ in 0..400 {
+            lod.run_all();
+            frame(&mut app, &mut model);
+            if top_built(&app) {
+                break;
+            }
+        }
+        prop_assert!(top_built(&app));
+        let mut eye = start;
+        for step in steps {
+            match step {
+                Step::Publish(n) => app.world_mut().resource_mut::<LodCoverage>().set(near_chunk(n), true, true),
+                Step::Empty(n) => app.world_mut().resource_mut::<LodCoverage>().set(near_chunk(n), true, false),
+                Step::Clear(n) => app.world_mut().resource_mut::<LodCoverage>().set(near_chunk(n), false, false),
+                Step::Jobs(pick) => lod.run_some(pick),
+                Step::Refuse(n) => {
+                    let mut keys: Vec<ChunkKey> = model.nodes.keys().copied().collect();
+                    keys.sort_unstable();
+                    if let Some(&key) = keys.get(usize::from(n) % keys.len().max(1)) {
+                        model.nodes.remove(&key);
+                        let mut feedback = app.world_mut().resource_mut::<LodFeedback>();
+                        feedback.refused.push(key);
+                        feedback.arena_free_quads = Some(0);
+                    }
+                }
+                Step::Room => {
+                    app.world_mut().resource_mut::<LodFeedback>().arena_free_quads = Some(1 << 30);
+                    app.world_mut().resource_mut::<LodWorld>().tree.expire_refusals();
+                }
+                Step::Resync => {
+                    app.world_mut().write_message(LodResync);
+                    model = Model::default();
+                }
+                Step::Move(x, y, z) => {
+                    let to = eye + I64Vec3::new(i64::from(x) * 16, i64::from(y) * 8, i64::from(z) * 16);
+                    eye = I64Vec3::new(to.x.clamp(-64, 64), to.y.clamp(20, 100), to.z.clamp(-64, 64));
+                    app.world_mut().resource_mut::<LodFocus>().origin = eye;
+                }
+            }
+            frame(&mut app, &mut model);
+            assert_at_most_one(&app, &model, sample());
+        }
+        app.world_mut().resource_mut::<LodFeedback>().arena_free_quads = Some(1 << 30);
+        app.world_mut().resource_mut::<LodWorld>().tree.expire_refusals();
+        fill_held(&mut app, &lod, &mut model);
+        assert_exactly_one(&app, &model);
+        assert_bits_from_scratch(&app);
+    }
+}
+
+/// The coverage with real streaming: the demo forest, a viewer flying over it, the LOD on the
+/// same inline executor. Every frame the renderer model (the world's mesh events and the LOD's
+/// ops) is checked: every published chunk's octant is hidden at every level (no drawn level-2
+/// and up octant contains a published chunk, no lod-1 octant draws over one), the feed's
+/// published chunks are the events', and the masks and the chain rule hold.
+fn fly_over_the_forest(viewer: ChunkViewer, bounds: bool) {
+    let generator = boxel_demo::worldgen::ForestGenerator::default();
+    let vertical = boxel_worldgen::WorldGenerator::vertical_chunks(&generator);
+    let mut app = App::new();
+    app.add_plugins(WorldPlugin {
+        generator: Arc::new(generator),
+        registry: Arc::new(boxel_demo::blocks::registry()),
+        settings: WorldSettings {
+            vertical_bounds: bounds.then_some(vertical),
+            ..WorldSettings::default()
+        },
+        executor: Arc::new(InlineExecutor),
+    });
+    app.add_plugins(LodWorldPlugin {
+        settings: small(),
+        executor: Arc::new(InlineExecutor),
+    });
+    let entity = app
+        .world_mut()
+        .spawn((
+            Transform::from_translation(DVec3::new(248.0, 95.0, -256.0)),
+            viewer,
+        ))
+        .id();
+    let mut model = Model::default();
+    let mut published: foldhash::HashSet<ChunkPos> = foldhash::HashSet::default();
+    let (mut upserts, mut removes) = (0, 0);
+    // Published chunks under a node on the renderer, per level (the checks are not vacuous).
+    let mut under = [0usize; 3];
+    let mut cursor = app
+        .world()
+        .resource::<Messages<ChunkMeshEvent>>()
+        .get_cursor();
+    for i in 0..70 {
+        if i >= 20 {
+            // 16 blocks a frame along x, a little up and down: new columns every other frame.
+            let dy = if i % 10 < 5 { 2.0 } else { -2.0 };
+            app.world_mut()
+                .entity_mut(entity)
+                .get_mut::<Transform>()
+                .expect("viewer")
+                .translation += DVec3::new(16.0, dy, 4.0);
+        }
+        frame(&mut app, &mut model);
+        for event in cursor.read(app.world().resource::<Messages<ChunkMeshEvent>>()) {
+            match event {
+                ChunkMeshEvent::Upsert { key, .. } => {
+                    upserts += 1;
+                    published.insert(key.pos)
+                }
+                ChunkMeshEvent::Remove { key, .. } => {
+                    removes += 1;
+                    published.remove(&key.pos)
+                }
+            };
+        }
+        let cov = app.world().resource::<LodCoverage>().coverage();
+        assert_eq!(cov.published_chunks(), published.len(), "frame {i}");
+        for &c in &published {
+            assert!(cov.published(c), "frame {i}: {c:?}");
+            for k in 1..=2 {
+                under[usize::from(k)] +=
+                    usize::from(model.nodes.contains_key(&node_of_chunk(c, k).0));
+            }
+        }
+        assert_published_hidden(&app, &model);
+    }
+    let stats = app.world().resource::<LodStats>();
+    assert!(stats.off.is_none() && stats.drawn() > 0, "{stats:?}");
+    assert!(
+        upserts > 100 && removes > 10,
+        "{upserts} upserts and {removes} removes"
+    );
+    assert!(under[1] > 100 && under[2] > 100, "{under:?}");
+    assert_feed_matches_map(&app);
+    assert_bits_from_scratch(&app);
+}
+
+#[test]
+fn the_coverage_follows_real_streaming_over_the_forest() {
+    fly_over_the_forest(ChunkViewer::new(3).with_vertical_radius(2), false);
+}
+
+#[test]
+fn the_coverage_follows_real_streaming_with_a_fixed_height_world() {
+    // `--fixed-height`: every layer of the generator, the vertical radius unbounded.
+    fly_over_the_forest(ChunkViewer::new(3).with_vertical_radius(u32::MAX), true);
+}
+
+#[test]
+fn a_parent_and_its_child_refused_in_one_frame_leave_cleanly() {
+    let mut app = app(Steps::new(20), small());
+    spawn(&mut app, DVec3::new(10.0, 60.0, 10.0));
+    let mut model = Model::default();
+    fill(&mut app, &mut model, 300);
+    let child = *model
+        .nodes
+        .keys()
+        .filter(|k| k.lod == 1 && model.nodes.contains_key(&tree::parent(**k)))
+        .min()
+        .expect("a lod-1 node under a sent parent");
+    let up = tree::parent(child);
+    {
+        let mut feedback = app.world_mut().resource_mut::<LodFeedback>();
+        feedback.refused.extend([up, child]);
+        feedback.arena_free_quads = Some(0);
+    }
+    // The renderer took neither: no op may name them (the model panics on a removal of a node
+    // it does not hold).
+    model.nodes.remove(&up);
+    model.nodes.remove(&child);
+    frame(&mut app, &mut model);
+    assert!(!model.nodes.keys().any(|k| tree::parent(*k) == up));
+    app.world_mut()
+        .resource_mut::<LodFeedback>()
+        .arena_free_quads = Some(1 << 30);
+    app.world_mut()
+        .resource_mut::<LodWorld>()
+        .tree
+        .expire_refusals();
+    fill(&mut app, &mut model, 50);
+    assert!(model.nodes.contains_key(&up) && model.nodes.contains_key(&child));
+    assert_eq!(app.world().resource::<LodStats>().refused, 2);
+    assert_bits_from_scratch(&app);
 }

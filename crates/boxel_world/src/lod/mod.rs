@@ -12,8 +12,11 @@
 //! finer nodes or full-detail chunks draw them ([`coverage`]).
 //!
 //! Per frame (in `Update`, after the world's systems, chained [`LodSystems`]):
-//! 1. `Coverage`: the renderer's resyncs ([`LodResync`]) and feedback ([`LodFeedback`]), and the
-//!    full-detail coverage changes ([`LodCoverage`]).
+//! 1. `Coverage`: every message of the frame, read in full whatever the budget: the world's mesh
+//!    and data events and the main renderer's resyncs and refusals feed the full-detail coverage
+//!    ([`LodCoverage`]); the renderer's own resyncs ([`LodResync`]) and refusals
+//!    ([`LodFeedback`]) make nodes unavailable. The masks follow in the same frame, so a chunk and
+//!    the octant that hid it swap with neither a hole nor a doubled frame.
 //! 2. `Plan`: the eye ([`LodFocus`], or the first [`ChunkViewer`] without one) and the
 //!    thresholds; the wanted tree made again from the coarsest level whose eye moved an eighth of
 //!    its hysteresis band (8 blocks for level 2, 16 for level 3, ...), or all of it after a
@@ -28,7 +31,10 @@
 use crate::interest::Viewer;
 use crate::jobs::{JobExecutor, TaskPoolExecutor};
 use crate::streaming::ViewerChunks;
-use crate::{ChunkViewer, WorldContent, WorldSettings, WorldStats, WorldSystems};
+use crate::{
+    ChunkDataEvent, ChunkMap, ChunkMeshEvent, ChunkMeshResync, ChunkViewer, WorldContent,
+    WorldSettings, WorldStats, WorldSystems,
+};
 use boxel_app::{App, Idle, IdleStep, IdleWanted, IdleWork, Plugin, Update};
 use boxel_ecs::prelude::*;
 use boxel_math::{DVec3, I64Vec3, Vec3};
@@ -49,7 +55,9 @@ mod plan;
 mod tests;
 mod tree;
 
-pub use coverage::{ChunkCoverage, LodCoverage, Octants, octant_of_chunk};
+pub use coverage::{
+    ChunkCoverage, LodCoverage, Octants, POLL_PER_FRAME, chunk_of_octant, octant_of_chunk,
+};
 pub use plan::{KeepExtent, MAX_LEVELS, Thresholds, node_edge, world_limit};
 
 use jobs::{JobInput, LodJobs, LodMessage};
@@ -368,6 +376,12 @@ pub struct LodStats {
     pub sends_waiting: usize,
     /// Meshes the renderer refused (arena full), since start.
     pub refused: usize,
+    /// Full-detail chunks the main renderer draws, as the LOD sees them.
+    pub published_chunks: usize,
+    /// Full-detail chunks the LOD does not draw over (published, empty or air).
+    pub covered_chunks: usize,
+    /// Loaded chunks watched for an empty mesh.
+    pub watched_chunks: usize,
 }
 
 impl LodStats {
@@ -404,7 +418,9 @@ pub enum LodOp {
         /// Hidden octants, bit `x | y << 1 | z << 2` (a quad's octant: `boxel_mesh::lod`).
         mask: u8,
     },
-    /// A node's hidden octants changed.
+    /// A node's hidden octants changed. It may follow the node's `Upsert` in the same frame: a
+    /// renderer that refused that `Upsert` ignores it (the refusal comes back in
+    /// [`LodFeedback::refused`], and no other op names the node until it is sent again).
     Mask {
         /// The node.
         key: ChunkKey,
@@ -419,7 +435,9 @@ pub enum LodOp {
 }
 
 /// The frame's ops (the outbox), in order: the renderer takes them all in its extract step and
-/// applies them before drawing. Ops left at the next `Update` (no renderer) are dropped; a
+/// applies them before drawing. A node is only sent while its parent chain is on the renderer
+/// (or holds nothing), and its descendants leave when it stops being there: a finer node never
+/// shows inside an octant its parent draws. Ops left at the next `Update` (no renderer) are dropped; a
 /// renderer that drops ops (no device, a resync) writes [`LodResync`] instead.
 #[derive(Resource, Debug, Default)]
 pub struct LodOps {
@@ -442,8 +460,9 @@ pub struct LodFeedback {
     pub refused: Vec<ChunkKey>,
     /// Free quads in the LOD arena after the frame's uploads (`None`: no report yet).
     pub arena_free_quads: Option<u64>,
-    /// Full-detail chunks the main renderer refused (`true`) or took back (`false`), forwarded
-    /// from its own refusals: the coverage counts a refused chunk as not drawn.
+    /// Full-detail chunks the main renderer refused (`true`) or shows as the world sent them
+    /// again (`false`), forwarded from its own refusals, in order: the coverage counts a refused
+    /// chunk as not drawn. Read before this frame's `ChunkMeshResync`, which clears them all.
     pub chunks: Vec<(ChunkPos, bool)>,
 }
 
@@ -660,7 +679,7 @@ impl LodWorld {
             }
             self.planned = Some(Planned { eye, th });
             self.started.get_or_insert_with(Instant::now);
-            self.queue_work();
+            self.queue_work(cov);
         }
         // Stale priorities: a batch per frame after the eye moved or turned enough.
         let turned = |a: Option<DVec3>, b: Option<DVec3>| match (a, b) {
@@ -685,19 +704,33 @@ impl LodWorld {
             let Some(c) = self.refresh.pop() else {
                 break;
             };
-            self.queue(c, true);
+            self.queue(c, true, cov);
         }
     }
 
     /// Queues every column whose work may have changed.
-    fn queue_work(&mut self) {
+    fn queue_work(&mut self, cov: &ChunkCoverage) {
         for c in self.tree.take_work() {
-            self.queue(c, false);
+            self.queue(c, false, cov);
+        }
+    }
+
+    /// Queues again, with a fresh class, the queued columns whose coverage changed.
+    fn requeue_covered(&mut self, cov: &ChunkCoverage) {
+        for c in self.tree.take_reprioritize() {
+            if self
+                .tree
+                .columns
+                .get(&c)
+                .is_some_and(|col| col.ticket.is_some())
+            {
+                self.queue(c, true, cov);
+            }
         }
     }
 
     /// Queues column `c` if it needs a job (`again`: with a fresh priority even if queued).
-    fn queue(&mut self, c: ColumnKey, again: bool) {
+    fn queue(&mut self, c: ColumnKey, again: bool, cov: &ChunkCoverage) {
         let Some(col) = self.tree.columns.get(&c) else {
             return;
         };
@@ -707,17 +740,29 @@ impl LodWorld {
         let Some(work) = col.work() else {
             return;
         };
-        let (class, size) = self.priority(c, col, &work);
+        let (class, size) = self.priority(c, col, &work, cov);
         let ticket = self.jobs.push(c, class, size);
         if let Some(col) = self.tree.columns.get_mut(&c) {
             col.ticket = Some(ticket);
         }
     }
 
-    /// The priority of column `c`'s next job: class 0 for the top level (fill-first: the
-    /// horizon appears first), else 1 in view and 2 out of it; then the screen size of its
-    /// nearest node, `e_k / max(d, e_k / 4)`.
-    fn priority(&self, c: ColumnKey, col: &Column, work: &tree::Work) -> (u8, f32) {
+    /// The priority of column `c`'s next job, by class and then by the screen size of its
+    /// nearest node, `e_k / max(d, e_k / 4)`. Classes:
+    /// - 0, coverage-critical and fill-first: the top level (the horizon appears first, and
+    ///   after a jump), and nodes that contain published chunks (a level-2 and up parent hides
+    ///   their octants: holes until they are sent; their ancestors come with them, as the
+    ///   chain rule needs);
+    /// - 1 in view, 2 out of it;
+    /// - 3, last: lod-1 nodes whose chunks full detail covers (placeholders for when chunks
+    ///   unload or stream in).
+    fn priority(
+        &self,
+        c: ColumnKey,
+        col: &Column,
+        work: &tree::Work,
+        cov: &ChunkCoverage,
+    ) -> (u8, f32) {
         let Some(eye) = self.planned.map(|p| p.eye) else {
             return (2, 0.0);
         };
@@ -727,8 +772,19 @@ impl LodWorld {
         let d = eye.distance(key);
         let ef = e as f64;
         let size = (ef / d.max(ef / 4.0)) as f32;
-        let class = if c.level >= self.tree.levels {
+        let dim = self.tree.dim;
+        let class = if c.level >= self.tree.levels
+            || work
+                .layers()
+                .any(|y| self.tree.is_touched(c.node(dim, y), cov))
+        {
             0
+        } else if c.level == 1
+            && work
+                .layers()
+                .all(|y| cov.get(c.node(dim, y).pos).covered == 0xFF)
+        {
+            3
         } else if self.in_view(&eye, key) {
             1
         } else {
@@ -781,7 +837,7 @@ impl LodWorld {
                     return;
                 }
             }
-            self.queue_work();
+            self.queue_work(cov);
             let mut spawned = 0;
             while self.off.is_none() && self.jobs.in_flight < cap && self.dispatch_one(content) {
                 spawned += 1;
@@ -906,7 +962,7 @@ impl LodWorld {
     }
 
     /// This frame's stats.
-    fn stats(&mut self, now: Instant) -> LodStats {
+    fn stats(&mut self, now: Instant, coverage: &LodCoverage) -> LodStats {
         let filled = self.filled();
         if filled
             && self.filled_after.is_none()
@@ -936,6 +992,9 @@ impl LodWorld {
             filled_after: self.filled_after,
             sends_waiting: self.tree.sends_waiting(),
             refused: self.tree.refusals,
+            published_chunks: coverage.coverage().published_chunks(),
+            covered_chunks: coverage.coverage().covered_chunks(),
+            watched_chunks: coverage.watched(),
         }
     }
 
@@ -973,36 +1032,81 @@ fn eye_and_view(focus: Option<&LodFocus>, viewer: Option<DVec3>) -> Option<(Eye,
     })
 }
 
-/// `LodSystems::Coverage`: drops ops no renderer took, applies the renderer's resyncs and
-/// feedback and the coverage changes.
+/// `LodSystems::Coverage`: drops ops no renderer took, then reads every message of the frame in
+/// full (never under the budget, module docs): the main renderer's refusals, the world's mesh
+/// events, the main renderer's resync, the world's data events, then polls the watch list, and
+/// applies the LOD renderer's resyncs and refusals. The coverage changes reach the masks, and
+/// the queued columns whose class changed are queued again.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a Bevy-style system: one parameter per resource it reads"
+)]
 fn lod_coverage(
     mut lod: ResMut<LodWorld>,
     mut ops: ResMut<LodOps>,
-    mut resyncs: MessageReader<LodResync>,
     mut feedback: ResMut<LodFeedback>,
     mut coverage: ResMut<LodCoverage>,
+    map: Res<ChunkMap>,
+    mut resyncs: MessageReader<LodResync>,
+    mut meshes: MessageReader<ChunkMeshEvent>,
+    mut chunk_resyncs: MessageReader<ChunkMeshResync>,
+    mut data: MessageReader<ChunkDataEvent>,
 ) {
     if !ops.ops.is_empty() {
         ops.ops.clear();
     }
     let lod = &mut *lod;
+    let coverage = &mut *coverage;
     let now = Instant::now();
+    let dim = lod.tree.dim;
+    let ours = |key: ChunkKey| key.lod == 0 && key.dim == dim;
+    // The main renderer's refusals first: a resync of this frame clears them.
+    if !feedback.chunks.is_empty() {
+        for (pos, refused) in std::mem::take(&mut feedback.chunks) {
+            coverage.refused(pos, refused);
+        }
+    }
+    for event in meshes.read() {
+        match event {
+            ChunkMeshEvent::Upsert { key, .. } if ours(*key) => coverage.upserted(key.pos),
+            ChunkMeshEvent::Remove { key, .. } if ours(*key) => coverage.removed(key.pos, &map),
+            _ => {}
+        }
+    }
+    if chunk_resyncs.read().count() > 0 {
+        coverage.renderer_resynced(&map);
+    }
+    let tree = &lod.tree;
+    for event in data.read() {
+        if ours(event.key()) {
+            let loaded = matches!(event, ChunkDataEvent::Loaded { .. });
+            coverage.data_changed(event.pos(), loaded, &map, |p| tree.lod1_octants(p));
+        }
+    }
+    for (p, octants) in lod.tree.take_lod1_quads() {
+        coverage.lod1_quads(p, octants, &map);
+    }
+    let tree = &lod.tree;
+    coverage.poll(&map, POLL_PER_FRAME, |p| tree.lod1_octants(p));
     let changed = coverage.take_changed();
     let cov = coverage.coverage();
+    // The LOD renderer's refusals, then its resync (which supersedes them).
+    if !feedback.refused.is_empty() {
+        lod.tree
+            .refuse(&std::mem::take(&mut feedback.refused), now, cov);
+    }
+    if let Some(free) = feedback.arena_free_quads.take() {
+        lod.arena_free = Some(free);
+    }
     if resyncs.read().count() > 0 {
         lod.tree.resync(cov);
-    }
-    if !feedback.refused.is_empty() || feedback.arena_free_quads.is_some() {
-        for key in std::mem::take(&mut feedback.refused) {
-            lod.tree.refuse(key, now, cov);
-        }
-        if let Some(free) = feedback.arena_free_quads.take() {
-            lod.arena_free = Some(free);
-        }
+        lod.outbox.clear();
+        lod.arena_free = None;
     }
     for p in changed {
         lod.tree.chunks_changed(p, cov);
     }
+    lod.requeue_covered(cov);
 }
 
 /// The first viewer's position (by entity), the eye when there is no [`LodFocus`].
@@ -1060,6 +1164,8 @@ fn lod_plan(
         lod.turn_off(LodOff::NoEye, name);
         return;
     };
+    // A new tree (first plan, content changed, turned on again) reads the coverage as it is.
+    lod.tree.seed(coverage.coverage());
     lod.plan(eye, view, &viewers.0, &world, coverage.coverage(), name);
 }
 
@@ -1102,7 +1208,7 @@ fn lod_collect(
     if !out.is_empty() {
         ops.ops.extend(out);
     }
-    let fresh = lod.stats(now);
+    let fresh = lod.stats(now, &coverage);
     stats.set_if_neq(fresh);
     if let Some(mut wanted) = wanted {
         wanted.want(world.idle_work && lod.has_job_work());
