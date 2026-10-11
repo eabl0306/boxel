@@ -123,6 +123,7 @@ SETTINGS = [
     ('clock', ('run', 'time')),
     ('idle work', ('run', 'idle_work')),
     ('fog', ('run', 'fog')),
+    ('lod', ('run', 'lod')),
     ('seed', ('run', 'seed')),
     ('backend', ('run', 'backend')),
     ('tier', ('run', 'tier')),
@@ -194,6 +195,9 @@ def load(path):
         # Runs from before --fog had no fog.
         if not run.get('fog'):
             run['fog'] = 'off'
+        # Runs from before --lod had no far LOD.
+        if not run.get('lod'):
+            run['lod'] = 'off'
         # Whether the run had --edits (the world's edit latency, null without them).
         run['edits'] = get(data, ('world', 'edits')) is not None
     return data

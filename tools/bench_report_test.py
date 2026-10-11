@@ -316,6 +316,17 @@ class OutputTest(unittest.TestCase):
         self.assertNotIn('idle steps', out)
         self.assertNotIn('Note:', out)
 
+    def test_lod_is_a_setting_and_old_runs_had_none(self):
+        # Runs from before --lod read as off; the plugin's runs pair with them, with a note.
+        far = copy.deepcopy(SAMPLE)
+        far['run']['lod'] = 'far (R 24, K 4, 12288 blocks)'
+        far['run']['lod_fill_s'] = 2.4
+        code, out, _ = run_main('--compare', self.write('a.md', SAMPLE), self.write('b.md', far))
+        self.assertEqual(code, 0)
+        self.assertIn('Note: the settings differ (lod off -> far (R 24, K 4, 12288 blocks))', out)
+        code, out, _ = run_main('--compare', self.write('c.md', SAMPLE), self.write('d.md', SAMPLE))
+        self.assertNotIn('Note:', out)
+
     def test_compare_directories_keeps_bodies_apart(self):
         # Old runs have no bodies field: they had no physics bodies.
         crowded = copy.deepcopy(SAMPLE)

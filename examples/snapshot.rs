@@ -23,6 +23,10 @@
 //! and one `shot:` line per image with the scene light and the mean sRGB brightness (0 to 255).
 //! The same camera and options give the same pixels on the same GPU and driver.
 //!
+//! `--lod PRESET` adds the far LOD (ADR 0031, world side only: the shots draw its nodes with the
+//! renderer, as the render plugin would): after the world settles, the shots wait until the LOD
+//! is filled (within `--timeout`), and a `lod:` line gives its nodes, quads and fill time.
+//!
 //! Exit codes: 0 success, 1 usage error, 2 no usable GPU, or rendering or saving failed, 4 the
 //! world did not settle within the timeout. Set `RUST_LOG` for more logging (default filter `warn`).
 #![expect(clippy::print_stdout, clippy::print_stderr, reason = "CLI output")]
@@ -31,6 +35,8 @@
 mod clock;
 #[path = "shared/fog.rs"]
 mod fog;
+#[path = "shared/lod.rs"]
+mod lod;
 #[path = "shared/pack.rs"]
 mod pack;
 #[path = "shared/world.rs"]
@@ -42,15 +48,17 @@ use boxel::gfx::{
     submit_and_wait, wgpu,
 };
 use boxel::log::LogPlugin;
-use boxel::mesh::AoPolicy;
+use boxel::mesh::{AoPolicy, ChunkMesh};
 use boxel::prelude::*;
 use boxel::render::fog::{FogInput, FogResolution};
+use boxel::render::lod::{LodInput, LodOp};
 use boxel::render::{
     BlockOutline, FLUID_TIME_PERIOD, Outline, RenderSettings, RendererConfig, SceneLight,
     TextureSource, TranslucentSort, ViewParams, VoxelRenderer, block_outline_edges, light_curve,
     load_block_textures, texture_tick,
 };
 use boxel::voxel::{BlockRegistry, MAX_BLOCK_COORD};
+use boxel::world::lod::{LodOps, LodStats, LodWorldPlugin};
 use boxel::world::persist::{PersistPlugin, WorldStore};
 use boxel::world::{
     BlockTickSettings, BlockTicks, DaylightCurve, FluidPlugin, WorldContent, WorldStats,
@@ -102,9 +110,10 @@ usage: snapshot --camera X,Y,Z,YAW,PITCH --shot HH:MM=PATH [--shot ...] [options
 /// The whole help: [`USAGE`], the world options and the GPU flags.
 fn usage() -> String {
     format!(
-        "{USAGE}\n{}\n{}\nworld options:\n{}\n\n{CLI_HELP}",
+        "{USAGE}\n{}\n{}\n{}\nworld options:\n{}\n\n{CLI_HELP}",
         pack::USAGE,
         fog::USAGE,
+        lod::USAGE,
         world::usage(World::Overworld)
     )
 }
@@ -171,6 +180,8 @@ struct Options {
     fog_tick: u64,
     /// `--fog-steps`.
     fog_steps: u32,
+    /// `--lod`.
+    lod: lod::LodPreset,
 }
 
 /// `Ok(None)` for `--help`.
@@ -198,6 +209,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         fog_res: FogResolution::Half,
         fog_tick: 0,
         fog_steps: boxel::fog::DEFAULT_MAX_STEPS,
+        lod: lod::LodPreset::Off,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -276,6 +288,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             }
             "--pack" => o.textures = pack::parse(flag, &value()?)?,
             "--fog" => o.fog = fog::parse(flag, &value()?)?,
+            "--lod" => o.lod = lod::parse(flag, &value()?)?,
             "--fog-res" => o.fog_res = fog::parse_resolution(flag, &value()?)?,
             "--fog-steps" => o.fog_steps = fog::parse_steps(flag, &value()?)?,
             "--fog-tick" => {
@@ -404,10 +417,10 @@ fn parse_edit(flag: &str, value: &str) -> Result<(String, Edit), String> {
 
 /// Updates the app until the world has been settled for [`SETTLED_UPDATES`] updates in a row.
 /// `Err` with the last counters after `deadline`.
-fn settle(app: &mut App, deadline: Instant) -> Result<(), Box<WorldStats>> {
+fn settle(app: &mut App, deadline: Instant, lod: &mut LodNodes) -> Result<(), Box<WorldStats>> {
     let mut settled = 0;
     while settled < SETTLED_UPDATES {
-        app.update();
+        update(app, lod);
         let stats = *app.world().resource::<WorldStats>();
         settled = if stats.chunks > 0 && stats.is_settled() {
             settled + 1
@@ -422,6 +435,68 @@ fn settle(app: &mut App, deadline: Instant) -> Result<(), Box<WorldStats>> {
         std::thread::sleep(Duration::from_millis(2));
     }
     Ok(())
+}
+
+/// One update, and the far LOD's ops of it (`--lod`: the renderer applies them, as the render
+/// plugin would; ops nobody takes are dropped at the next update).
+fn update(app: &mut App, lod: &mut LodNodes) {
+    app.update();
+    if let Some(mut ops) = app.world_mut().get_resource_mut::<LodOps>() {
+        lod.apply(ops.take());
+    }
+}
+
+/// The far LOD's nodes as a renderer holds them after every op so far: mesh and hidden octants.
+#[derive(Default)]
+struct LodNodes(HashMap<ChunkKey, (Arc<ChunkMesh>, u8)>);
+
+impl LodNodes {
+    fn apply(&mut self, ops: Vec<LodOp>) {
+        for op in ops {
+            match op {
+                LodOp::Upsert { key, mesh, mask } => {
+                    self.0.insert(key, (mesh, mask));
+                }
+                LodOp::Mask { key, mask } => {
+                    if let Some(node) = self.0.get_mut(&key) {
+                        node.1 = mask;
+                    }
+                }
+                LodOp::Remove { key } => {
+                    self.0.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Every node, as the ops of a fresh renderer.
+    fn ops(&self) -> Vec<LodOp> {
+        self.0
+            .iter()
+            .map(|(key, (mesh, mask))| LodOp::Upsert {
+                key: *key,
+                mesh: Arc::clone(mesh),
+                mask: *mask,
+            })
+            .collect()
+    }
+}
+
+/// `--lod`: updates the app until the LOD is filled (every wanted node built and sent), after
+/// the world settled. `Err` with the LOD's counters after `deadline`.
+fn fill_lod(app: &mut App, deadline: Instant, lod: &mut LodNodes) -> Result<(), String> {
+    loop {
+        let stats = app.world().resource::<LodStats>();
+        if stats.off.is_none() && stats.fill >= 1.0 && stats.sends_waiting == 0 {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            return Err(format!("the LOD did not fill in time: {stats:?}"));
+        }
+        update(app, lod);
+        #[expect(clippy::disallowed_methods, reason = "the runner's pacing")]
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 /// The cells of the edits, with their states, once each: a later edit of a cell replaces an
@@ -678,6 +753,15 @@ fn run(
     if let Some(store) = store {
         app.add_plugins(PersistPlugin::new(store));
     }
+    // `--lod`: the world side only (no render plugin here); the eye is the viewer, the camera.
+    let lod_settings = o.lod.settings();
+    if let Some(settings) = &lod_settings {
+        app.add_plugins(LodWorldPlugin {
+            settings: settings.clone(),
+            ..LodWorldPlugin::default()
+        });
+    }
+    let mut lod_nodes = LodNodes::default();
     // The fluid clock only moves in `--flow` (deterministic shots).
     app.world_mut().resource_mut::<BlockTickSettings>().paused = true;
     app.finish();
@@ -702,7 +786,7 @@ fn run(
             ),
         )
     };
-    settle(&mut app, deadline).map_err(timeout)?;
+    settle(&mut app, deadline, &mut lod_nodes).map_err(timeout)?;
     if !o.edits.is_empty() {
         let (cells, skipped) = edit_cells(&o.edits, &registry, app.world().resource::<ChunkMap>())
             .map_err(|e| (EXIT_USAGE, e))?;
@@ -710,7 +794,7 @@ fn run(
         for &(pos, state) in &cells {
             queue.set_block(pos, state);
         }
-        settle(&mut app, deadline).map_err(timeout)?;
+        settle(&mut app, deadline, &mut lod_nodes).map_err(timeout)?;
         // The block counts, not the state: stairs take their shape from their neighbors and
         // fences their sides (ADR 0020). A torch without a support drops.
         let map = app.world().resource::<ChunkMap>();
@@ -730,16 +814,41 @@ fn run(
         let mut written = 0;
         for _ in 0..o.flow {
             app.world_mut().resource_mut::<BlockTicks>().advance(1);
-            app.update();
+            update(&mut app, &mut lod_nodes);
             written += app.world().resource::<BlockTicks>().stats().written;
         }
-        settle(&mut app, deadline).map_err(timeout)?;
+        settle(&mut app, deadline, &mut lod_nodes).map_err(timeout)?;
         let stats = app.world().resource::<BlockTicks>().stats();
         println!(
             "flow: ticks={} written={written} queued={} frozen={}",
             o.flow, stats.queued, stats.frozen
         );
     }
+    let settled_after = started.elapsed();
+    let lod_input = match &lod_settings {
+        Some(settings) => {
+            let lod_started = Instant::now();
+            fill_lod(&mut app, deadline, &mut lod_nodes).map_err(|e| (EXIT_TIMEOUT, e))?;
+            let stats = app.world().resource::<LodStats>();
+            let quads: u64 = lod_nodes
+                .0
+                .values()
+                .map(|(m, _)| u64::from(m.total_quads()))
+                .sum();
+            println!(
+                "lod: {} horizon={} nodes={} quads={quads} filled_after={:.1}s",
+                lod::label(o.lod),
+                stats.horizon,
+                lod_nodes.0.len(),
+                lod_started.elapsed().as_secs_f64()
+            );
+            Some(LodInput {
+                ops: lod_nodes.ops(),
+                ..LodInput::new(settings.clone(), Some(stats.horizon as f32))
+            })
+        }
+        None => None,
+    };
     let map = app.world().resource::<ChunkMap>();
     let quads: u64 = map
         .ready_meshes()
@@ -751,7 +860,7 @@ fn run(
         map.len(),
         map.ready_meshes().count(),
         if o.light { "on" } else { "off" },
-        started.elapsed().as_secs_f64()
+        settled_after.as_secs_f64()
     );
     let eye = BlockPos::from_world(transform.translation);
     let hit = center_hit(
@@ -851,6 +960,10 @@ fn run(
             }),
         );
     }
+    // `--lod`: its nodes, drawn to its horizon (the renderer moves the far plane and the terrain
+    // fog out to it).
+    let lod_label = lod::label(o.lod);
+    renderer.set_lod(&gpu.device, lod_input);
     let camera = Camera {
         view_distance: o.radius as f32 * 32.0,
         fov_y_radians: o.fov.to_radians(),
@@ -878,13 +991,14 @@ fn run(
         let [r, g, b] = light.sky;
         println!(
             "shot: {} {} sky_light={r:.3},{g:.3},{b:.3} ambient={:.3} mean={:.1} chunks={} \
-             fog={fog_label} fog_layers={}",
+             fog={fog_label} fog_layers={} lod={lod_label} lod_draws={}",
             TimeOfDay::at_clock(*hours).clock_text(),
             path.display(),
             light.ambient,
             mean_brightness(&image),
             renderer.stats().chunks,
             renderer.stats().fog_layers,
+            renderer.stats().lod_draws,
         );
     }
     // `--world-dir`: the world is saved by the `Shutdown` schedule (nothing else runs there).
@@ -924,6 +1038,19 @@ mod tests {
         );
         let mut bad = BASE.to_vec();
         bad.extend(["--fog-tick", "-1"]);
+        assert!(parse(&bad).is_err());
+    }
+
+    #[test]
+    fn lod_flag() {
+        let o = parse(&BASE).expect("valid").expect("not help");
+        assert_eq!(o.lod, lod::LodPreset::Off, "no LOD unless asked");
+        let mut args = BASE.to_vec();
+        args.extend(["--lod", "near"]);
+        let o = parse(&args).expect("valid").expect("not help");
+        assert_eq!(o.lod, lod::LodPreset::Near);
+        let mut bad = BASE.to_vec();
+        bad.extend(["--lod", "huge"]);
         assert!(parse(&bad).is_err());
     }
 

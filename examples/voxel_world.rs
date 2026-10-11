@@ -59,6 +59,11 @@
 //! the camera and the crates are saved on exit (and edited chunks and crates as their chunks
 //! unload, and every minute), and loaded on the next start with the same `DIR` (`--camera` and
 //! `--time` win over the saved camera and clock).
+//!
+//! `--lod near|far|extreme` draws coarse terrain past the view distance, to the horizon (ADR
+//! 0031, like the Distant Horizons mod); off by default (no LOD plugin at all). F8 cycles far,
+//! extreme, hidden and near, F9 tints each level, F3 shows a `lod` line. Software adapters keep
+//! it off.
 #![expect(clippy::print_stdout, clippy::print_stderr, reason = "CLI output")]
 
 #[path = "shared/clock.rs"]
@@ -67,6 +72,8 @@ mod clock;
 mod crates;
 #[path = "shared/fog.rs"]
 mod fog;
+#[path = "shared/lod.rs"]
+mod lod;
 #[path = "shared/pack.rs"]
 mod pack;
 #[path = "shared/player.rs"]
@@ -146,8 +153,10 @@ exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 check failed, 4 timeout";
 /// The whole help: [`USAGE`] and the world options.
 fn usage() -> String {
     format!(
-        "{USAGE}\nfog options (F7 cycles the presets while the fog is on):\n{}\nworld options:\n{}",
+        "{USAGE}\nfog options (F7 cycles the presets while the fog is on):\n{}\nLOD options (F8 \
+         cycles the presets, F9 tints the levels):\n{}\nworld options:\n{}",
         fog::USAGE,
+        lod::USAGE,
         world::usage(World::Forest)
     )
 }
@@ -231,6 +240,8 @@ struct Options {
     fog_res: boxel::render::fog::FogResolution,
     /// `--fog-steps`.
     fog_steps: u32,
+    /// `--lod`.
+    lod: lod::LodPreset,
     /// `--world-dir`: where the world is saved.
     world_dir: Option<PathBuf>,
     /// `--camera` was given (a saved camera does not replace it).
@@ -297,6 +308,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         fog: fog::FogPreset::Off,
         fog_res: boxel::render::fog::FogResolution::Half,
         fog_steps: boxel::fog::DEFAULT_MAX_STEPS,
+        lod: lod::LodPreset::Off,
         world_dir: None,
         camera_given: false,
     };
@@ -323,6 +335,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--fog" => o.fog = fog::parse(flag, &value()?)?,
             "--fog-res" => o.fog_res = fog::parse_resolution(flag, &value()?)?,
             "--fog-steps" => o.fog_steps = fog::parse_steps(flag, &value()?)?,
+            "--lod" => o.lod = lod::parse(flag, &value()?)?,
             "--timeout" => o.timeout = Some(Duration::from_secs(number(flag, &value()?)?)),
             "--screenshot" => o.screenshot = Some(PathBuf::from(value()?)),
             "--expect-terrain" => o.expect_terrain = true,
@@ -731,6 +744,7 @@ fn gpu_events(
     present: Res<PresentSettings>,
     mut viewers: Query<(&mut ChunkViewer, &mut Camera)>,
     mut exit: MessageWriter<AppExit>,
+    mut lod: Option<(ResMut<LodSettings>, ResMut<LodCycle>)>,
 ) {
     for event in ready.read() {
         println!("boxel: {}", event.summary);
@@ -752,6 +766,14 @@ fn gpu_events(
                 camera.view_distance = SOFTWARE_RADIUS as f32 * 32.0;
             }
             println!("boxel: software adapter: view distance {SOFTWARE_RADIUS} chunks");
+        }
+        // Whatever the radius options: far terrain is too slow on a CPU rasterizer.
+        if info.class == Some(DeviceClass::Software)
+            && let Some((settings, cycle)) = lod.as_mut()
+        {
+            settings.enabled = false;
+            cycle.software = true;
+            println!("boxel: software adapter: LOD off");
         }
     }
     if let Some(event) = failed.read().last() {
@@ -1947,6 +1969,13 @@ fn main() -> AppExit {
             .insert_resource(FogCycle(options.fog))
             .add_systems(Update, cycle_fog);
     }
+    // `--lod`: the plugin only when asked (off adds nothing at all); F8 cycles the presets, F9
+    // tints the levels, F3 shows a line.
+    if let Some(settings) = options.lod.settings() {
+        app.add_plugins(LodPlugin::new(settings))
+            .insert_resource(LodCycle::new(options.lod))
+            .add_systems(Update, (cycle_lod, lod_overlay_line));
+    }
     if let Some(store) = store {
         app.add_plugins(PersistPlugin::new(store))
             .add_systems(Shutdown, save_camera);
@@ -2017,6 +2046,34 @@ mod tests {
         parse_options(&args)
             .expect("valid options")
             .expect("not --help")
+    }
+
+    #[test]
+    fn lod_options_and_the_f8_cycle() {
+        assert_eq!(parse(&[]).lod, lod::LodPreset::Off, "no LOD unless asked");
+        assert_eq!(parse(&["--lod", "far"]).lod, lod::LodPreset::Far);
+        assert!(parse_options(&["--lod".into(), "huge".into()]).is_err());
+        assert!(usage().contains("F8 cycles the presets"));
+        // F8 from far: extreme, hidden, near, far again; from near: far.
+        let mut cycle = LodCycle::new(lod::LodPreset::Far);
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            (cycle.preset, cycle.hidden) = cycle.next();
+            seen.push(cycle.name());
+        }
+        assert_eq!(
+            seen,
+            [
+                lod::label(lod::LodPreset::Extreme),
+                "hidden".to_string(),
+                lod::label(lod::LodPreset::Near),
+                lod::label(lod::LodPreset::Far),
+            ]
+        );
+        assert_eq!(
+            LodCycle::new(lod::LodPreset::Near).next(),
+            (lod::LodPreset::Far, false)
+        );
     }
 
     #[test]
@@ -3339,4 +3396,116 @@ fn cycle_fog(
     cycle.0 = all[(i + 1) % all.len()];
     settings.layers = cycle.0.layers().unwrap_or_default();
     eprintln!("fog: {}", cycle.0.name());
+}
+
+/// What F8 shows (`--lod`; only with the LOD plugin): a preset, or the LOD hidden.
+#[derive(Resource)]
+struct LodCycle {
+    /// The preset whose settings are in use.
+    preset: lod::LodPreset,
+    /// F8 hid the LOD (`LodSettings::enabled` false, the nodes dropped).
+    hidden: bool,
+    /// A software adapter: the LOD stays off whatever F8 shows.
+    software: bool,
+}
+
+impl LodCycle {
+    fn new(preset: lod::LodPreset) -> Self {
+        Self {
+            preset,
+            hidden: false,
+            software: false,
+        }
+    }
+
+    /// The F8 step after this one: far, extreme, hidden, near, then far again.
+    fn next(&self) -> (lod::LodPreset, bool) {
+        use lod::LodPreset::{Extreme, Far, Near, Off};
+        match (self.preset, self.hidden) {
+            (Far, false) => (Extreme, false),
+            (Extreme, false) => (Extreme, true),
+            (_, true) => (Near, false),
+            (Near | Off, false) => (Far, false),
+        }
+    }
+
+    /// Its name for the log and F3.
+    fn name(&self) -> String {
+        if self.hidden {
+            "hidden".to_string()
+        } else {
+            lod::label(self.preset)
+        }
+    }
+}
+
+/// F8: the next LOD step (a preset with another arena rebuilds the LOD pass, which fills again
+/// coarse first); F9: the level tint. Both named in the log.
+fn cycle_lod(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut cycle: ResMut<LodCycle>,
+    mut settings: ResMut<LodSettings>,
+) {
+    if keys.just_pressed(KeyCode::F8) {
+        (cycle.preset, cycle.hidden) = cycle.next();
+        if let Some(preset) = cycle.preset.settings() {
+            *settings = LodSettings {
+                enabled: !cycle.hidden && !cycle.software,
+                debug_tint: settings.debug_tint,
+                ..preset
+            };
+        }
+        let off = if cycle.software {
+            " (off: software adapter)"
+        } else {
+            ""
+        };
+        eprintln!("lod: {}{off}", cycle.name());
+    }
+    if keys.just_pressed(KeyCode::F9) {
+        settings.debug_tint = !settings.debug_tint;
+        eprintln!("lod: level tint {}", on_off(settings.debug_tint));
+    }
+}
+
+/// The F3 `lod` lines: the preset, the horizon, nodes resident and drawn, the fill, then jobs
+/// queued and running, draws and quads of the frame and the refusals.
+fn lod_overlay_line(
+    cycle: Res<LodCycle>,
+    stats: Res<boxel::world::lod::LodStats>,
+    info: Res<RenderInfo>,
+    lines: Option<ResMut<OverlayLines>>,
+) {
+    let Some(mut lines) = lines else {
+        return;
+    };
+    let name = if cycle.hidden {
+        "hidden"
+    } else {
+        cycle.preset.name()
+    };
+    let state = match stats.off {
+        Some(off) => format!("off ({off:?})"),
+        None => format!("to {:.0} blocks", stats.horizon),
+    };
+    lines.set(
+        "lod",
+        format!(
+            "LOD {name} {state}: {} nodes, {} drawn, fill {:.0}%",
+            stats.nodes(),
+            stats.drawn(),
+            stats.fill * 100.0,
+        ),
+    );
+    lines.set(
+        "lod work",
+        format!(
+            "    jobs {} queued {} running, {} draws, {:.2}M quads, {} refused",
+            stats.queued_jobs,
+            stats.in_flight,
+            info.lod_draws,
+            info.lod_quads as f64 / 1e6,
+            stats.refused
+        ),
+    );
 }

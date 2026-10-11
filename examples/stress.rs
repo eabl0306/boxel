@@ -72,6 +72,8 @@ mod clock;
 mod edits;
 #[path = "shared/fog.rs"]
 mod fog;
+#[path = "shared/lod.rs"]
+mod lod;
 #[path = "shared/pack.rs"]
 mod pack;
 #[path = "stress/report.rs"]
@@ -94,6 +96,7 @@ use boxel::voxel::{
 };
 use boxel::window::FramePacingInfo;
 use boxel::world::jobs::{JobExecutor, TaskPoolExecutor};
+use boxel::world::lod::LodStats;
 use boxel::world::{
     ChunkId, ChunkMeshEvent, ChunkVisibility, WorldContent, WorldStats, WorldSystems,
 };
@@ -169,8 +172,9 @@ exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 output not written, 4 timeou
 /// The whole help: [`USAGE`], the physics options and the world options.
 fn usage() -> String {
     format!(
-        "{USAGE}\n{}\nphysics options:\n{}\nworld options:\n{}",
+        "{USAGE}\n{}\n{}\nphysics options:\n{}\nworld options:\n{}",
         fog::USAGE,
+        lod::USAGE,
         bodies::USAGE,
         world::usage(World::Forest)
     )
@@ -279,6 +283,8 @@ struct Options {
     fog_res: FogResolution,
     /// `--fog-steps`.
     fog_steps: u32,
+    /// `--lod`.
+    lod: lod::LodPreset,
     /// The route of the `path` scenario through the cave `--cave` found (empty before
     /// [`find_cave`] and without `--cave`).
     path: Vec<DVec3>,
@@ -331,6 +337,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         sort: TranslucentSort::Background,
         cave: false,
         fog: fog::FogPreset::Off,
+        lod: lod::LodPreset::Off,
         fog_res: FogResolution::Half,
         fog_steps: boxel::fog::DEFAULT_MAX_STEPS,
         path: Vec::new(),
@@ -491,6 +498,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--cave" => o.cave = true,
             "--idle-work" => o.idle_work = on_off(flag, &value()?)?,
             "--fog" => o.fog = fog::parse(flag, &value()?)?,
+            "--lod" => o.lod = lod::parse(flag, &value()?)?,
             "--fog-res" => o.fog_res = fog::parse_resolution(flag, &value()?)?,
             "--fog-steps" => o.fog_steps = fog::parse_steps(flag, &value()?)?,
             other => return Err(format!("unknown argument {other:?}")),
@@ -1015,6 +1023,7 @@ fn drive(
     spans: Option<Res<SpanRecorder>>,
     script: Option<Res<EditScript>>,
     pacing: Option<Res<FramePacingInfo>>,
+    lod: Option<Res<LodStats>>,
 ) {
     if bench.exiting {
         return;
@@ -1045,6 +1054,18 @@ fn drive(
         return;
     }
     let settled = info.ready && stats.chunks > 0 && stats.is_settled();
+    // `--lod`: when its first fill ended, so the frames of the fill can be told apart.
+    if let Some(lod) = lod
+        && lod.fill >= 1.0
+        && bench.info.lod_fill_s.is_none()
+    {
+        let elapsed = elapsed.as_secs_f64();
+        println!(
+            "stress: LOD filled after {elapsed:.2} s: nodes={}",
+            lod.nodes()
+        );
+        bench.info.lod_fill_s = Some(elapsed);
+    }
     match bench.phase {
         Phase::Loading { streak } => {
             let streak = if settled { streak + 1 } else { 0 };
@@ -1367,6 +1388,7 @@ fn run_info(options: &Options, present: String) -> RunInfo {
         cave_culling: if options.cave_culling { "on" } else { "off" }.to_string(),
         idle_work: if options.idle_work { "on" } else { "off" }.to_string(),
         fog: fog::label(options.fog, options.fog_res, options.fog_steps),
+        lod: lod::label(options.lod),
         pack: match &options.textures {
             TextureSource::Procedural => "none".to_string(),
             source => source.label(),
@@ -1585,6 +1607,10 @@ fn main() -> AppExit {
     // `--fog`: the plugin only when asked (off adds nothing at all).
     if let Some(settings) = options.fog.settings(options.fog_res, options.fog_steps) {
         app.add_plugins(FogPlugin { settings });
+    }
+    // `--lod`: the same.
+    if let Some(settings) = options.lod.settings() {
+        app.add_plugins(LodPlugin::new(settings));
     }
     if options.bodies.enabled() {
         let [x, y, z, ..] = options.camera;
@@ -1828,6 +1854,9 @@ mod tests {
         assert!(parse(&["--fog", "mist"]).is_err());
         assert!(parse(&["--fog-res", "quarter"]).is_err());
         assert!(parse(&["--fog"]).is_err());
+        assert_eq!(options(&[]).lod, lod::LodPreset::Off, "no LOD unless asked");
+        assert_eq!(options(&["--lod", "near"]).lod, lod::LodPreset::Near);
+        assert!(parse(&["--lod", "huge"]).is_err());
         let o = parse(&["--edits", "--time", "21:30"])
             .expect("valid")
             .expect("not help");

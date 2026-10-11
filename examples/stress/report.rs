@@ -232,6 +232,12 @@ pub struct RunInfo {
     /// resolution and a step budget other than the engine's (`valley half`, `inside full 32
     /// steps`). Empty in runs from before the option (no fog).
     pub fog: String,
+    /// The far LOD (`--lod`, ADR 0031): `off`, or the preset with its ring radius, levels and
+    /// horizon (`far (R 24, K 4, 12288 blocks)`). Empty in runs from before the option (off).
+    pub lod: String,
+    /// Seconds from the start until the LOD's first fill was drawn (`None`: no LOD, or it did not
+    /// fill during the run). Frames before it carry the fill's jobs and uploads.
+    pub lod_fill_s: Option<f64>,
 }
 
 /// What `--edits` measured: scripted edits (lamp placed and removed, shaft dug and capped) and
@@ -1165,6 +1171,8 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
         ("refresh_hz", Json::opt(info.refresh_hz, 3)),
         ("idle_work", Json::Str(info.idle_work.clone())),
         ("fog", Json::Str(info.fog.clone())),
+        ("lod", Json::Str(info.lod.clone())),
+        ("lod_fill_s", Json::opt(info.lod_fill_s, 2)),
     ]);
     let frames = Json::Obj(vec![
         ("count", Json::uint(f.frames)),
