@@ -264,6 +264,9 @@ profundidad ni z-fighting.
 
 ## Números medidos
 
+La campaña completa (RTX y 780M, r16 y r32, con y sin tope, boost, cuevas, spans) está en
+[rendimiento/lod-2026-10.md](../rendimiento/lod-2026-10.md), con los problemas por orden.
+
 `headless_world --world forest --lod PRESET` del 2026-10-11 sobre la rama (sin GPU: solo el lado
 del mundo; la máquina tranquila). Los nodos del piso son 0 en todas las corridas.
 
