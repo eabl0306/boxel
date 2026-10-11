@@ -29,6 +29,8 @@ pub(super) struct Steps {
     pub(super) base: i64,
     /// A column whose LOD job panics.
     pub(super) panic_at: Option<(u8, [i64; 2])>,
+    /// A column whose LOD jobs panic from when a test sets it.
+    pub(super) panic_later: Arc<Mutex<Option<(u8, [i64; 2])>>>,
     /// No LOD source.
     pub(super) no_lod: bool,
     /// Every LOD column call, in order.
@@ -102,8 +104,10 @@ impl LodSource for Steps {
         scratch: &mut LodScratch,
         emit: &mut dyn FnMut(i64, LodNode<'_>),
     ) -> LodColumn {
+        let later = *self.panic_later.lock().expect("lock");
         assert!(
-            self.panic_at != Some((req.level, req.column)),
+            self.panic_at != Some((req.level, req.column))
+                && later != Some((req.level, req.column)),
             "test source panics at {:?}",
             req.column
         );
@@ -1998,6 +2002,60 @@ fn a_lost_lod1_child_with_published_chunks_lets_its_parent_draw() {
         .chain((0..8).map(|o| chunk_of_octant(failed.pos, o)))
         .collect();
     assert_at_most_one(&app, &model, chunks.into_iter());
+}
+
+/// A column whose job fails after its band is known builds nothing more: a layer that enters its
+/// wanted interval again is lost at once (its parent draws there), not pending for good under a
+/// parent that hides it.
+#[test]
+fn layers_entering_a_failed_column_are_lost() {
+    let steps = Steps::new(20);
+    let panic_later = Arc::clone(&steps.panic_later);
+    let mut app = focus_app(
+        steps,
+        small(),
+        Arc::new(InlineExecutor),
+        I64Vec3::new(0, 60, 0),
+    );
+    let mut model = Model::default();
+    fill(&mut app, &mut model, 300);
+    let key = ChunkKey {
+        dim: DimensionId(0),
+        lod: 1,
+        pos: ChunkPos::new(1, 0, 0),
+    };
+    let up = tree::parent(key);
+    assert!(model.nodes.contains_key(&key) && model.nodes.contains_key(&up));
+    // A published chunk inside it: its parent hides the octant unless the node is lost.
+    app.world_mut()
+        .resource_mut::<LodCoverage>()
+        .set(chunk_of_octant(key.pos, 0), true, true);
+    frame(&mut app, &mut model);
+    *panic_later.lock().expect("lock") = Some((1, [key.pos.x, key.pos.z]));
+    let go = |app: &mut App, model: &mut Model, y: i64| {
+        app.world_mut().resource_mut::<LodFocus>().origin.y = y;
+        fill(app, model, 300);
+    };
+    // Up until the layer leaves the wanted tree, and back: its next job panics.
+    go(&mut app, &mut model, 800);
+    assert!(!app.world().resource::<LodWorld>().tree.wanted(key));
+    go(&mut app, &mut model, 60);
+    let tree = &app.world().resource::<LodWorld>().tree;
+    let col = &tree.columns[&ColumnKey::of(key)];
+    assert!(col.failed && col.band.is_some() && tree.lost(key));
+    assert_eq!(model.nodes[&up].0 & tree::octant_bit(key), 0);
+    // Once more: the layer comes back lost, not waiting for a job that never runs.
+    go(&mut app, &mut model, 800);
+    go(&mut app, &mut model, 60);
+    let tree = &app.world().resource::<LodWorld>().tree;
+    assert!(tree.lost(key), "{:?}", tree.node(key));
+    assert_eq!(
+        model.nodes[&up].0 & tree::octant_bit(key),
+        0,
+        "the parent draws over the failed child"
+    );
+    assert_eq!(app.world().resource::<LodStats>().levels[0].pending, 0);
+    assert_bits_from_scratch(&app);
 }
 
 #[test]

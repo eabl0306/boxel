@@ -779,14 +779,22 @@ impl Tree {
                 }
             }
         }
-        // Entering layers: records inside a known band, uniform layers active.
+        // Entering layers: records inside a known band, uniform layers active. A failed column
+        // builds nothing more: its entering layers are lost at once (failed records inside a
+        // known band, every layer without one), and their parents draw there.
+        let failed = self.columns[&c].failed;
         for span in minus(new.wanted, old.wanted).into_iter().flatten() {
             match band {
+                None if failed => {
+                    for y in span.0..=span.1 {
+                        self.lost_changed(c.node(self.dim, y));
+                    }
+                }
                 None => self.note_work(c),
                 Some(band) => {
                     if let Some(inside) = intersect(Some(span), Some((band.lo, band.hi - 1))) {
                         for y in inside.0..=inside.1 {
-                            self.want_record(c, y);
+                            self.want_record(c, y, failed);
                         }
                         self.note_work(c);
                     }
@@ -797,13 +805,20 @@ impl Tree {
         self.drop_if_idle(c);
     }
 
-    /// A new pending record of `c` at layer `y` (none if it has one).
-    fn want_record(&mut self, c: ColumnKey, y: i64) {
+    /// A new record of `c` at layer `y` (none if it has one): pending, or lost (`failed`: the
+    /// column's jobs failed, so none will build it).
+    fn want_record(&mut self, c: ColumnKey, y: i64, failed: bool) {
         let key = c.node(self.dim, y);
         let col = self.columns.entry(c).or_default();
         if let std::collections::btree_map::Entry::Vacant(e) = col.nodes.entry(y) {
             let node = e.insert(Node::pending());
+            if failed {
+                node.state = NodeState::Failed;
+            }
             tally(&mut self.counts, self.floor, key, node, true);
+            if failed {
+                self.lost_changed(key);
+            }
         }
     }
 
@@ -907,7 +922,7 @@ impl Tree {
         }
         if first && let Some(inside) = intersect(wanted, Some((band.lo, band.hi - 1))) {
             for y in inside.0..=inside.1 {
-                self.want_record(c, y);
+                self.want_record(c, y, false);
             }
         }
         let mut too_big = 0;
