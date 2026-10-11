@@ -1351,6 +1351,40 @@ fn invalid_settings_keep_the_last_valid_ones() {
     assert_eq!(stats.nodes(), 0);
 }
 
+/// Once the guard turned the LOD off, it comes back only when `T_1` is two lod-1 nodes under the
+/// preset's horizon: an eye bobbing across the line does not clear and refill the LOD each time.
+#[test]
+fn the_guard_turns_on_again_only_past_a_margin() {
+    let mut app = app(Steps::new(20), small());
+    let viewer = app
+        .world_mut()
+        .spawn((
+            Transform::from_translation(DVec3::new(10.0, 60.0, 10.0)),
+            ChunkViewer::new(2).with_vertical_radius(u32::MAX),
+        ))
+        .id();
+    let mut model = Model::default();
+    fill(&mut app, &mut model, 300);
+    // Bounds -2..=3, radius 2, hysteresis 2: T_1 = ceil(hypot(192, 32 (layer + 3))) + 128
+    // against a horizon of 1,024; the eye's chunk layer 25 trips it, 20 is past the margin.
+    let mut at = |layer: f64| {
+        app.world_mut()
+            .entity_mut(viewer)
+            .get_mut::<Transform>()
+            .expect("viewer")
+            .translation
+            .y = (layer + 0.5) * 32.0;
+        frame(&mut app, &mut model);
+        (app.world().resource::<LodStats>().off, model.nodes.len())
+    };
+    assert_eq!(at(24.0).0, None);
+    assert_eq!(at(25.0), (Some(LodOff::Guard), 0));
+    for layer in [24.0, 21.0, 24.0, 25.0, 22.0] {
+        assert_eq!(at(layer).0, Some(LodOff::Guard), "layer {layer}");
+    }
+    assert_eq!(at(20.0).0, None);
+}
+
 #[test]
 fn a_generator_without_a_source_turns_the_lod_off() {
     let steps = Steps {

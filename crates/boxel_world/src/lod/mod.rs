@@ -653,7 +653,7 @@ impl LodWorld {
             world.vertical_bounds.as_ref(),
         );
         let th = settings.thresholds(keep);
-        if th.guard() {
+        if th.guard() || (self.off == Some(LodOff::Guard) && th.guard_holds()) {
             self.turn_off(LodOff::Guard, generator);
             return;
         }

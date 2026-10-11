@@ -159,9 +159,16 @@ impl Thresholds {
     }
 
     /// True if the keep region reaches the preset's horizon (`T_1 > 32 R 2^K`): the LOD draws
-    /// nothing and starts no jobs until it drops back.
+    /// nothing and starts no jobs until it drops back ([`Thresholds::guard_holds`]).
     pub fn guard(&self) -> bool {
         self.t[1] > self.preset
+    }
+
+    /// True if a LOD the guard turned off stays off: until `T_1` is two lod-1 node edges (128
+    /// blocks) under the preset's horizon. An eye bobbing across the line (one chunk layer with
+    /// vertical bounds) then does not clear and refill the LOD each time.
+    pub fn guard_holds(&self) -> bool {
+        self.t[1] > self.preset - 2.0 * node_edge(1) as f64
     }
 }
 
