@@ -5,19 +5,22 @@
 //!   what they were; fog that is off, out of reach or fully transparent leaves every pixel
 //!   untouched (the composite discards); dropping the fog gives the plain depth back.
 //! - **Noise:** `fs_fog_debug_coverage` gives the CPU oracle's coverage and noise bit for bit,
-//!   at origins 0, `2^31 - 5`, `-2^40` and near the world limit.
+//!   at origins 0, `2^31 - 5`, `-2^40` and near the world limit, at cell corners and points
+//!   inside cells (the soft fog), across the rows of a rising threshold, between ticks.
 //! - **March:** on scenes whose depth is known exactly (a wide floor and the sky), each texel of
 //!   the march equals the reference march of `boxel_fog::march` (opacity bytes within 3, color
 //!   within 0.02, 0.5 % of the texels may differ where a ray grazes a cell edge), and each pixel
 //!   equals the reference composite of its texel over the fog-free pixel (2 / 255).
-//! - **Tiers:** every tier draws the scenes (clouds from below, inside and above, a camera
-//!   inside a blanket, a noisy bank over the floor, fog over water, fog behind glass, dusk) like
-//!   the best tier of its adapter, at half and full resolution (0.1 % of the pixels, tolerance
-//!   2).
-//! - **Origins:** the same camera with render origins a few blocks apart draws the same image.
+//! - **Tiers:** every tier draws the scenes (flat clouds and volumetric clouds from below,
+//!   inside and above, a camera inside a blanket and inside a soft bank, a noisy bank over the
+//!   floor, fog over water, fog behind glass, dusk) like the best tier of its adapter, at half
+//!   and full resolution (0.1 % of the pixels, tolerance 2).
+//! - **Origins:** the same camera with render origins a few blocks apart draws the same image,
+//!   with cubic and soft fog.
 //! - **Half resolution:** thin posts in front of dense fog look the same at half and full
 //!   resolution (each pixel of a 2x2 block keeps its own depth).
-//! - **Faces:** a slab seen from above has the top shade, from below the bottom shade.
+//! - **Shades:** a slab looks the same from above and below unless the layer asks for face
+//!   shades; then from above it has the top shade, from below the bottom shade.
 //! - **Lifecycle:** resizes, a resolution switch and a rebuilt renderer keep working.
 //! - **Smoke:** `RendererSmokeTest { fog: true }` passes on every tier at both levels.
 //!
@@ -323,6 +326,37 @@ fn bank() -> FogLayer {
     l
 }
 
+/// The bank with soft fog within 12 blocks of the camera.
+fn soft_bank() -> FogLayer {
+    let mut l = bank();
+    l.soft_distance = 12.0;
+    l
+}
+
+/// Volumetric clouds: 6-block cells in a 24-block band over 3D noise, a rising threshold, a
+/// gray base and a lit top, soft within 10 blocks.
+fn cumulus() -> FogLayer {
+    let mut l = FogLayer::new(24, 48);
+    l.cell = [6, 6, 6];
+    l.noise.dims = NoiseDims::Volume;
+    l.noise.scale = 4;
+    l.noise.octaves = 2;
+    l.noise.seed = 31;
+    l.threshold = 0.5;
+    l.threshold_rise = 0.35;
+    l.softness = 0.2;
+    l.density = 0.35;
+    l.height_shade = [0.6, 1.0];
+    l.soft_distance = 10.0;
+    l.wind = [2.0, 0.0, 0.0];
+    l.max_distance = 400.0;
+    l.fade = FogFade::Range {
+        start: 250.0,
+        end: 400.0,
+    };
+    l
+}
+
 /// A blanket that fills every cell, seen about 20 blocks through.
 fn blanket() -> FogLayer {
     let mut l = FogLayer::new(0, 32);
@@ -372,6 +406,34 @@ fn shots() -> Vec<Shot> {
             World::Floor,
             look(DVec3::new(-5.5, 45.0, -9.5), DVec3::new(40.0, 10.0, 60.0)),
             vec![clouds(), bank()],
+            true,
+        ),
+        shot(
+            "cumulus_below",
+            World::Floor,
+            look(DVec3::new(0.5, 10.0, 0.5), DVec3::new(30.0, 50.0, 80.0)),
+            vec![cumulus()],
+            true,
+        ),
+        shot(
+            "cumulus_inside",
+            World::Floor,
+            look(DVec3::new(3.3, 35.5, 2.7), DVec3::new(60.0, 30.0, 70.0)),
+            vec![cumulus()],
+            true,
+        ),
+        shot(
+            "cumulus_above",
+            World::Floor,
+            look(DVec3::new(-5.5, 70.0, -9.5), DVec3::new(40.0, 10.0, 60.0)),
+            vec![soft_bank(), cumulus()],
+            true,
+        ),
+        shot(
+            "soft_inside",
+            World::Floor,
+            look(DVec3::new(10.3, 7.5, 6.7), DVec3::new(40.0, 6.0, 40.0)),
+            vec![soft_bank()],
             true,
         ),
         shot(
@@ -1094,20 +1156,22 @@ fn render_origins_a_few_blocks_apart_draw_the_same_fog() {
         let mut run = || -> Result<(), String> {
             let mut renderer = new_renderer(device, queue, tier, UVec2::new(WIDTH, HEIGHT))?;
             load_world(&mut renderer, &chunks)?;
-            renderer.set_fog(
-                device,
-                Some(fog_input(vec![bank(), clouds()], FogResolution::Half, 99)),
-            );
-            let first = render(device, queue, &mut renderer, &views[0])?;
-            for (i, view) in views.iter().enumerate().skip(1) {
-                let image = render(device, queue, &mut renderer, view)?;
-                report.check_close(
-                    &format!("{label} {tier}: origin shift {i}"),
-                    ("origin0", &first),
-                    (&format!("origin{i}"), &image),
-                    2,
-                    0.002,
-                );
+            for (what, layers) in [
+                ("cubic", vec![bank(), clouds()]),
+                ("soft", vec![soft_bank(), cumulus()]),
+            ] {
+                renderer.set_fog(device, Some(fog_input(layers, FogResolution::Half, 99)));
+                let first = render(device, queue, &mut renderer, &views[0])?;
+                for (i, view) in views.iter().enumerate().skip(1) {
+                    let image = render(device, queue, &mut renderer, view)?;
+                    report.check_close(
+                        &format!("{label} {tier}: {what} origin shift {i}"),
+                        (&format!("{what}_origin0"), &first),
+                        (&format!("{what}_origin{i}"), &image),
+                        2,
+                        0.002,
+                    );
+                }
             }
             Ok(())
         };
@@ -1118,15 +1182,20 @@ fn render_origins_a_few_blocks_apart_draw_the_same_fog() {
     .finish();
 }
 
-/// A dense slab seen from above takes the top shade, from below the bottom shade.
+/// A dense slab looks the same from above and below (fog has no faces), unless the layer asks
+/// for the voxels' face shades: then from above it takes the top shade, from below the bottom
+/// shade.
 #[test]
-fn a_slab_takes_the_shade_of_the_face_seen() {
+fn a_slab_takes_the_shade_of_the_face_seen_only_when_asked() {
     let mut slab = FogLayer::new(40, 44);
     slab.density = 8.0;
-    slab.face_shade = [1.0, 0.5, 0.8, 0.65];
     slab.color = [0.8, 0.8, 0.8];
+    let shaded = FogLayer {
+        face_shade: boxel_fog::VOXEL_FACE_SHADE,
+        ..slab.clone()
+    };
     for_every_tier(|label, tier, device, queue, _, report| {
-        let run = || -> Result<(), String> {
+        let run = |slab: &FogLayer, want_ratio: f32| -> Result<(), String> {
             let mut renderer = new_renderer(device, queue, tier, UVec2::new(WIDTH, HEIGHT))?;
             renderer.set_fog(
                 device,
@@ -1152,13 +1221,15 @@ fn a_slab_takes_the_shade_of_the_face_seen() {
                 "gpu_fog: {label} {tier}: top {}, bottom {} ({ratio})",
                 colors[0], colors[1]
             );
-            if (colors[0] - 0.8).abs() > 0.01 || (ratio - 0.5).abs() > 0.01 {
-                return Err(format!("shades {colors:?}"));
+            if (colors[0] - 0.8).abs() > 0.01 || (ratio - want_ratio).abs() > 0.01 {
+                return Err(format!("shades {colors:?}, want a ratio of {want_ratio}"));
             }
             Ok(())
         };
-        if let Err(e) = run() {
-            report.fail(format!("{label} {tier}: {e}"), &[]);
+        for (slab, ratio) in [(&slab, 1.0), (&shaded, 0.5)] {
+            if let Err(e) = run(slab, ratio) {
+                report.fail(format!("{label} {tier}: {e}"), &[]);
+            }
         }
     })
     .finish();
