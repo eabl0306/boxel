@@ -25,7 +25,8 @@
 //!
 //! `--lod PRESET` adds the far LOD (ADR 0031, world side only: the shots draw its nodes with the
 //! renderer, as the render plugin would): after the world settles, the shots wait until the LOD
-//! is filled (within `--timeout`), and a `lod:` line gives its nodes, quads and fill time.
+//! is filled (within `--timeout`), and a `lod:` line gives its nodes, quads, the edited chunks
+//! it shows (`--fill`, or saved in `--world-dir`) and its fill time.
 //! `--lod-tint` tints each level (F9 in `voxel_world`). `--fixed-height` streams every layer of
 //! the generator and nothing else, as `voxel_world --fixed-height` does.
 //!
@@ -865,10 +866,11 @@ fn run(
                 .map(|(m, _)| u64::from(m.total_quads()))
                 .sum();
             println!(
-                "lod: {} horizon={} nodes={} quads={quads} filled_after={:.1}s",
+                "lod: {} horizon={} nodes={} quads={quads} edited_chunks={} filled_after={:.1}s",
                 lod::label(o.lod),
                 stats.horizon,
                 lod_nodes.0.len(),
+                stats.edited_chunks,
                 lod_started.elapsed().as_secs_f64()
             );
             Some(LodInput {
