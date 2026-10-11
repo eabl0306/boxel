@@ -2351,12 +2351,15 @@ fn data_events_past_the_budget_wait_their_turn_and_the_feed_catches_up() {
         waiting >= 2 * coverage::DATA_PER_FRAME_MIN,
         "{waiting} data events wait"
     );
+    // Not filled while events wait: the masks do not follow the world yet.
+    assert!(app.world().resource::<LodStats>().fill < 1.0);
     assert_feed_matches_map(&app);
     // A jump: the old chunks unload and new ones load behind the waiting events (whose ids go
     // stale meanwhile).
     walk(&mut app, &mut model, 1, 2000.0);
     walk(&mut app, &mut model, 300, 0.0);
     assert_eq!(app.world().resource::<LodCoverage>().data_backlog(), 0);
+    assert_eq!(app.world().resource::<LodStats>().fill, 1.0);
     assert_feed_matches_map(&app);
     assert_bits_from_scratch(&app);
 }

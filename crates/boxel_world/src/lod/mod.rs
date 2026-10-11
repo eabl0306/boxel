@@ -395,7 +395,7 @@ pub struct LodStats {
     /// See `job_p50`.
     pub job_p99: Duration,
     /// Share of the wanted columns built at least once, at most 0.99 until every wanted node is
-    /// built and sent: 1 then.
+    /// built and sent and the world's data events are read (the masks follow the world): 1 then.
     pub fill: f32,
     /// From the first plan to the first full fill.
     pub filled_after: Option<Duration>,
@@ -1206,7 +1206,7 @@ impl LodWorld {
 
     /// This frame's stats.
     fn stats(&mut self, now: Instant, coverage: &LodCoverage) -> LodStats {
-        let filled = self.filled();
+        let filled = self.filled() && coverage.data_backlog() == 0;
         if filled
             && self.filled_after.is_none()
             && let Some(started) = self.started
