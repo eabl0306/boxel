@@ -17,6 +17,10 @@
 //! - A node hides (its mask) the octants whose child is covered, and at level 2 and up also the
 //!   octants whose child is touched and not lost: a short hole is better than drawing over full
 //!   detail, but a lost child would leave the hole for good, so its parent draws there.
+//! - Same-level neighbors change on the renderer together: a node whose face neighbor waits to
+//!   be built again from changed cells (an edit) holds its own new result back, so two neighbors
+//!   are never drawn from different cells (the renderer leaves out the seam quads of a face whose
+//!   neighbor is drawn, which lie between solid cells only if both agree on them).
 //!
 //! Covered and touched children bits are kept per node position (for nodes with a record or
 //! not) and updated incrementally: a change walks up at most `K` ancestors.
@@ -39,6 +43,8 @@ use std::time::{Duration, Instant};
 /// How long a node the renderer refused waits before it is sent again (and only once the arena
 /// reports room for it).
 pub(crate) const REFUSED_RETRY: Duration = Duration::from_secs(1);
+/// How long a held result waits at most for its neighbors' ([`Tree::release_held`]).
+pub(crate) const HOLD_LIMIT: Duration = Duration::from_secs(2);
 
 /// A node record's state.
 #[derive(Clone, Debug)]
@@ -71,15 +77,35 @@ pub(crate) struct Node {
     /// Built from blocks that changed since (an edit): built again, while the renderer keeps
     /// what it has of it.
     pub(crate) stale: bool,
+    /// A job's result for it, held back while a same-level face neighbor waits to be built
+    /// again ([`Tree::release_held`]). Its job is done: it asks for none.
+    held: Option<Box<Held>>,
+}
+
+/// A result held back ([`Node::held`]).
+#[derive(Clone, Debug)]
+struct Held {
+    built: Built,
+    since: Instant,
 }
 
 impl Node {
     fn pending() -> Self {
+        Self::new(NodeState::Pending, false)
+    }
+
+    fn new(state: NodeState, stale: bool) -> Self {
         Self {
-            state: NodeState::Pending,
+            state,
             mask: 0,
-            stale: false,
+            stale,
+            held: None,
         }
+    }
+
+    /// Waits to be built again from changed cells (stale, no result held).
+    fn rebuilding(&self) -> bool {
+        self.stale && self.held.is_none()
     }
 
     /// Sent or blank.
@@ -202,7 +228,7 @@ impl Column {
         let only: Vec<i64> = self
             .nodes
             .iter()
-            .filter(|(_, n)| matches!(n.state, NodeState::Pending) || n.stale)
+            .filter(|(_, n)| n.held.is_none() && (matches!(n.state, NodeState::Pending) || n.stale))
             .map(|(&y, _)| y)
             .collect();
         let (&lo, &hi) = (only.first()?, only.last()?);
@@ -245,6 +271,23 @@ pub(crate) fn parent(key: ChunkKey) -> ChunkKey {
 pub(crate) fn octant_bit(key: ChunkKey) -> u8 {
     let p = key.pos;
     1 << ((p.x & 1) | ((p.y & 1) << 1) | ((p.z & 1) << 2))
+}
+
+/// The 6 nodes of `key`'s level that share a face with it.
+pub(crate) fn face_neighbors(key: ChunkKey) -> [ChunkKey; 6] {
+    let p = key.pos;
+    [
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    ]
+    .map(|(x, y, z)| ChunkKey {
+        pos: ChunkPos::new(p.x + x, p.y + y, p.z + z),
+        ..key
+    })
 }
 
 /// The child of node `key` (level 2 and up) in octant `o` (`x | y << 1 | z << 2`).
@@ -296,6 +339,8 @@ pub(crate) struct Tree {
     chain_changed: bool,
     /// Refused nodes waiting to be sent again.
     refused: Vec<ChunkKey>,
+    /// Nodes holding a result back ([`Node::held`]).
+    held: HashSet<ChunkKey>,
     /// Ops for the next `Collect`.
     ops: Vec<LodOp>,
     /// Columns whose work may have changed (to queue).
@@ -315,6 +360,9 @@ pub(crate) struct Tree {
     pub(crate) too_big: usize,
     /// Per-level counts (`counts[k - 1]`), kept as records and plans change.
     counts: Vec<LevelStats>,
+    /// Records waiting to be built again (stale) or holding a result back: none, and no result
+    /// is held back ([`Tree::holds_back`]).
+    waiting: usize,
     /// Wanted columns whose band is known.
     known: usize,
     /// The generator's lowest chunk layer (its floor): level `k`'s floor layer is `floor >> k`.
@@ -323,8 +371,23 @@ pub(crate) struct Tree {
     reserved: usize,
 }
 
-/// Adds (`add`) or takes away node `key`'s share of the per-level counts.
-fn tally(counts: &mut [LevelStats], floor: Option<i64>, key: ChunkKey, node: &Node, add: bool) {
+/// Adds (`add`) or takes away node `key`'s share of the per-level counts, and of `waiting`
+/// (records waiting to be built again or holding a result back).
+fn tally(
+    counts: &mut [LevelStats],
+    waiting: &mut usize,
+    floor: Option<i64>,
+    key: ChunkKey,
+    node: &Node,
+    add: bool,
+) {
+    if node.stale || node.held.is_some() {
+        if add {
+            *waiting += 1;
+        } else {
+            *waiting -= 1;
+        }
+    }
     let Some(l) = counts.get_mut(usize::from(key.lod).wrapping_sub(1)) else {
         return;
     };
@@ -381,6 +444,7 @@ impl Tree {
             parked: Vec::new(),
             chain_changed: false,
             refused: Vec::new(),
+            held: HashSet::default(),
             ops: Vec::new(),
             work: Vec::new(),
             reprioritize: Vec::new(),
@@ -390,6 +454,7 @@ impl Tree {
             refusals: 0,
             too_big: 0,
             counts: vec![LevelStats::default(); usize::from(levels)],
+            waiting: 0,
             known: 0,
             floor,
             reserved: 0,
@@ -414,6 +479,12 @@ impl Tree {
         &self.counts
     }
 
+    /// Records waiting to be built again or holding a result back (kept as records change).
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.waiting
+    }
+
     /// Wanted columns, and those whose band is known.
     pub(crate) fn columns_known(&self) -> (usize, usize) {
         (self.counts.iter().map(|l| l.columns).sum(), self.known)
@@ -426,9 +497,23 @@ impl Tree {
             .get_mut(&ColumnKey::of(key))?
             .nodes
             .get_mut(&key.pos.y)?;
-        tally(&mut self.counts, self.floor, key, node, false);
+        tally(
+            &mut self.counts,
+            &mut self.waiting,
+            self.floor,
+            key,
+            node,
+            false,
+        );
         let r = f(node);
-        tally(&mut self.counts, self.floor, key, node, true);
+        tally(
+            &mut self.counts,
+            &mut self.waiting,
+            self.floor,
+            key,
+            node,
+            true,
+        );
         Some(r)
     }
 
@@ -803,7 +888,14 @@ impl Tree {
         let Some(node) = col.nodes.remove(&key.pos.y) else {
             return;
         };
-        tally(&mut self.counts, self.floor, key, &node, false);
+        tally(
+            &mut self.counts,
+            &mut self.waiting,
+            self.floor,
+            key,
+            &node,
+            false,
+        );
         if node.sent() {
             self.ops.push(LodOp::Remove { key });
         }
@@ -811,6 +903,7 @@ impl Tree {
             self.lod1_octants.remove(&key.pos);
         }
         self.dirty.remove(&key);
+        self.held.remove(&key);
         // A descendant on the renderer is active, so the covered bits lead to it.
         if key.lod >= 2 && self.children.get(&key).is_some_and(|&b| b != 0) {
             self.unsend_below(key, cov);
@@ -929,7 +1022,14 @@ impl Tree {
             if failed {
                 node.state = NodeState::Failed;
             }
-            tally(&mut self.counts, self.floor, key, node, true);
+            tally(
+                &mut self.counts,
+                &mut self.waiting,
+                self.floor,
+                key,
+                node,
+                true,
+            );
             if failed {
                 self.lost_changed(key);
             }
@@ -975,11 +1075,26 @@ impl Tree {
             col.job = None;
             col.failed = true;
             for (&y, node) in &mut col.nodes {
-                if matches!(node.state, NodeState::Pending) {
+                // A held result came from an earlier job: it still goes.
+                if matches!(node.state, NodeState::Pending) && node.held.is_none() {
                     let key = c.node(self.dim, y);
-                    tally(&mut self.counts, self.floor, key, node, false);
+                    tally(
+                        &mut self.counts,
+                        &mut self.waiting,
+                        self.floor,
+                        key,
+                        node,
+                        false,
+                    );
                     node.state = NodeState::Failed;
-                    tally(&mut self.counts, self.floor, key, node, true);
+                    tally(
+                        &mut self.counts,
+                        &mut self.waiting,
+                        self.floor,
+                        key,
+                        node,
+                        true,
+                    );
                     lost.push(key);
                 }
             }
@@ -1034,7 +1149,12 @@ impl Tree {
         }
         let mut too_big = 0;
         for (y, built) in nodes {
-            too_big += usize::from(self.apply_node(c.node(dim, y), built, cov));
+            let key = c.node(dim, y);
+            if self.waiting > 0 && self.holds_back(key, &built, cov) {
+                self.hold(key, built);
+            } else {
+                too_big += usize::from(self.apply_node(key, built, cov));
+            }
         }
         self.too_big += too_big;
         if first {
@@ -1132,6 +1252,104 @@ impl Tree {
         too_big
     }
 
+    /// True if node `key` waits to be built again from changed cells: stale, no result held,
+    /// and its column still builds.
+    fn rebuilding(&self, key: ChunkKey) -> bool {
+        self.columns.get(&ColumnKey::of(key)).is_some_and(|col| {
+            !col.failed && col.nodes.get(&key.pos.y).is_some_and(Node::rebuilding)
+        })
+    }
+
+    /// When node `key` started holding a result back (`None`: it holds none).
+    fn held_since(&self, key: ChunkKey) -> Option<Instant> {
+        Some(self.node(key)?.held.as_ref()?.since)
+    }
+
+    /// True if what a job built of node `key` waits for its same-level face neighbors (module
+    /// docs): one of them waits to be built again or holds a result back, and the node is not
+    /// lost to a too-big bucket nor closes a hole (unavailable and touched: its parent hides its
+    /// octant meanwhile).
+    fn holds_back(&self, key: ChunkKey, built: &Built, cov: &ChunkCoverage) -> bool {
+        if matches!(built, Built::TooBig) {
+            return false;
+        }
+        let Some(node) = self.node(key) else {
+            return false;
+        };
+        if !matches!(node.state, NodeState::Pending) && !node.stale {
+            return false;
+        }
+        if !node.available() && self.touched_bits(key, cov) != 0 {
+            return false;
+        }
+        face_neighbors(key)
+            .into_iter()
+            .any(|n| self.rebuilding(n) || self.held_since(n).is_some())
+    }
+
+    /// Holds `built` back for node `key` ([`Tree::holds_back`]).
+    fn hold(&mut self, key: ChunkKey, built: Built) {
+        let held = Box::new(Held {
+            built,
+            since: Instant::now(),
+        });
+        if self
+            .update_node(key, |node| node.held = Some(held))
+            .is_some()
+        {
+            self.held.insert(key);
+        }
+    }
+
+    /// Applies the held results that may go: a group of held nodes joined through same-level
+    /// face neighbors that hold a result or wait to be built again goes in one frame, once none
+    /// of them waits (or its oldest result was held [`HOLD_LIMIT`] ago: a neighbor that keeps
+    /// changing does not hold the others for ever).
+    fn release_held(&mut self, now: Instant, cov: &ChunkCoverage) {
+        if self.held.is_empty() {
+            return;
+        }
+        let mut keys: Vec<ChunkKey> = self.held.iter().copied().collect();
+        keys.sort_unstable();
+        let mut seen: HashSet<ChunkKey> = HashSet::default();
+        for key in keys {
+            if !seen.insert(key) {
+                continue;
+            }
+            let mut group = vec![key];
+            let mut since = self.held_since(key).unwrap_or(now);
+            let mut waits = false;
+            let mut i = 0;
+            while let Some(&k) = group.get(i) {
+                i += 1;
+                for n in face_neighbors(k) {
+                    if seen.contains(&n) {
+                        continue;
+                    }
+                    if let Some(t) = self.held_since(n) {
+                        since = since.min(t);
+                    } else if self.rebuilding(n) {
+                        waits = true;
+                    } else {
+                        continue;
+                    }
+                    seen.insert(n);
+                    group.push(n);
+                }
+            }
+            if waits && now.saturating_duration_since(since) < HOLD_LIMIT {
+                continue;
+            }
+            for k in group {
+                let Some(held) = self.update_node(k, |n| n.held.take()).flatten() else {
+                    continue;
+                };
+                self.held.remove(&k);
+                self.too_big += usize::from(self.apply_node(k, held.built, cov));
+            }
+        }
+    }
+
     /// Changes the known band of column `c` to `band` (edits grew it, or their removal shrinks
     /// it). Records outside it go: their layers are uniform, so they stay available. Wanted
     /// layers that enter it were uniform: they get blank records (the renderer had nothing of
@@ -1170,12 +1388,15 @@ impl Tree {
                 continue;
             }
             let key = c.node(self.dim, y);
-            let node = Node {
-                state: NodeState::Blank,
-                mask: 0,
-                stale,
-            };
-            tally(&mut self.counts, self.floor, key, &node, true);
+            let node = Node::new(NodeState::Blank, stale);
+            tally(
+                &mut self.counts,
+                &mut self.waiting,
+                self.floor,
+                key,
+                &node,
+                true,
+            );
             self.columns
                 .get_mut(&c)
                 .expect("the column")
@@ -1196,7 +1417,14 @@ impl Tree {
         else {
             return;
         };
-        tally(&mut self.counts, self.floor, key, &node, false);
+        tally(
+            &mut self.counts,
+            &mut self.waiting,
+            self.floor,
+            key,
+            &node,
+            false,
+        );
         if node.sent() {
             self.ops.push(LodOp::Remove { key });
         }
@@ -1204,6 +1432,7 @@ impl Tree {
             self.lod1_octants.remove(&key.pos);
         }
         self.dirty.remove(&key);
+        self.held.remove(&key);
         if !node.available() {
             self.chain_changed = true;
         }
@@ -1244,9 +1473,19 @@ impl Tree {
         if let Some(band) = col.band {
             let grown = super::edits::widen(band, Some(layers));
             self.set_band(c, grown, false, cov);
-            let col = self.columns.get_mut(&c).expect("the column");
-            for (_, node) in col.nodes.range_mut(layers.0..=layers.1) {
-                node.stale = true;
+            let ys: Vec<i64> = self.columns[&c]
+                .nodes
+                .range(layers.0..=layers.1)
+                .map(|(&y, _)| y)
+                .collect();
+            for y in ys {
+                let key = c.node(self.dim, y);
+                self.update_node(key, |node| {
+                    node.stale = true;
+                    // A held result read the old cells.
+                    node.held = None;
+                });
+                self.held.remove(&key);
             }
         }
         self.note_work(c);
@@ -1339,7 +1578,14 @@ impl Tree {
                 if !*sent && retry.is_none() {
                     continue;
                 }
-                tally(&mut self.counts, self.floor, key, node, false);
+                tally(
+                    &mut self.counts,
+                    &mut self.waiting,
+                    self.floor,
+                    key,
+                    node,
+                    false,
+                );
                 if let NodeState::Ready { sent, retry, .. } = &mut node.state {
                     if *sent {
                         was_sent.push(key);
@@ -1349,7 +1595,14 @@ impl Tree {
                     *sent = false;
                     *retry = None;
                 }
-                tally(&mut self.counts, self.floor, key, node, true);
+                tally(
+                    &mut self.counts,
+                    &mut self.waiting,
+                    self.floor,
+                    key,
+                    node,
+                    true,
+                );
             }
         }
         self.refused.clear();
@@ -1392,9 +1645,9 @@ impl Tree {
         }
     }
 
-    /// The frame's ops: refused nodes due again, sends (at most `max_nodes` and `max_bytes` of
-    /// quads, at least one; a node whose parent chain is not available waits, parked), then the
-    /// masks that changed.
+    /// The frame's ops: held results that may go ([`Tree::release_held`]), refused nodes due
+    /// again, sends (at most `max_nodes` and `max_bytes` of quads, at least one; a node whose
+    /// parent chain is not available waits, parked), then the masks that changed.
     pub(crate) fn collect(
         &mut self,
         max_nodes: usize,
@@ -1403,6 +1656,8 @@ impl Tree {
         now: Instant,
         cov: &ChunkCoverage,
     ) -> Vec<LodOp> {
+        // Held results whose neighbors are built too.
+        self.release_held(now, cov);
         // Refused nodes due again, once the arena reports room for them.
         let mut i = 0;
         while i < self.refused.len() {
@@ -1503,11 +1758,12 @@ impl Tree {
         std::mem::take(&mut self.ops)
     }
 
-    /// Built nodes waiting to be sent: the queue (a few entries may be stale) and the parked
-    /// nodes, but those under a failed ancestor (they never will be sent). The parked list is
-    /// short: parents are built first.
+    /// Built nodes waiting to be sent: the queue (a few entries may be stale), the held results
+    /// and the parked nodes, but those under a failed ancestor (they never will be sent). The
+    /// parked list is short: parents are built first.
     pub(crate) fn sends_waiting(&self) -> usize {
         self.sends.len()
+            + self.held.len()
             + self
                 .parked
                 .iter()
@@ -1542,19 +1798,26 @@ impl Tree {
     /// The per-level counts and the wanted columns with a known band from a walk over every
     /// record (the reference for tests against [`Tree::counts`] and [`Tree::columns_known`]).
     #[cfg(test)]
-    pub(crate) fn count_from_scratch(&self) -> (Vec<LevelStats>, usize) {
+    pub(crate) fn count_from_scratch(&self) -> (Vec<LevelStats>, usize, usize) {
         let mut levels = vec![LevelStats::default(); usize::from(self.levels)];
-        let mut known = 0;
+        let (mut known, mut waiting) = (0, 0);
         for (c, col) in &self.columns {
             if col.plan.wanted.is_some() {
                 levels[usize::from(c.level) - 1].columns += 1;
                 known += usize::from(col.band.is_some());
             }
             for (&y, node) in &col.nodes {
-                tally(&mut levels, self.floor, c.node(self.dim, y), node, true);
+                tally(
+                    &mut levels,
+                    &mut waiting,
+                    self.floor,
+                    c.node(self.dim, y),
+                    node,
+                    true,
+                );
             }
         }
-        (levels, known)
+        (levels, known, waiting)
     }
 
     /// Recomputes every covered bit from scratch (the reference for tests): the children map a

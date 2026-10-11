@@ -21,6 +21,8 @@
 //! - An edited chunk above the generator's top chunk layer raises the plan's ceiling in its
 //!   columns ([`Ceiling`](super::plan::Ceiling)): a platform over the terrain gets nodes at
 //!   every level, as a tower does.
+//! - The nodes an edit reaches are built again by one job per column, so their results land
+//!   apart: same-level neighbors change on the renderer together (`tree` module docs).
 //! - Level 6 and up (preset `extreme`) does not show edits: a cell spans 8 chunks there.
 //!
 //! The fallback for generators without a coarse source (`fallback`) builds level-1 cells from

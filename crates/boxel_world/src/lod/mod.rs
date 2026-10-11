@@ -419,7 +419,8 @@ pub struct LodStats {
     pub fill: f32,
     /// From the first plan to the first full fill.
     pub filled_after: Option<Duration>,
-    /// Meshes waiting to be sent (the per-frame cap).
+    /// Meshes waiting to be sent (the per-frame cap), or held until their same-level neighbors
+    /// are built again too (an edit).
     pub sends_waiting: usize,
     /// Meshes the renderer refused (arena full), since start.
     pub refused: usize,

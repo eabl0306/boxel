@@ -849,3 +849,78 @@ fn edits_above_the_generators_top_show_at_the_fine_levels() {
         tests::assert_bits_from_scratch(&app);
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Rebuilds of neighbors
+
+#[test]
+fn neighbors_built_again_change_on_the_renderer_together() {
+    // The tower's chunks lie by the border of lod-1 nodes 0 and 1 (x and z): four columns are
+    // built again, each by its own job. One job runs a frame, so their results land apart. A
+    // node meshed from the new cells next to one still drawn from the old ones would leave its
+    // seam quads out where the other's cells differ (a see-through gap): no node may change on
+    // the renderer while a same-level face neighbor waits to be built again.
+    let lod = Arc::new(tests::Hold::default());
+    let mut app = app_with(
+        Steps::new(20),
+        edit_settings(2, 0),
+        lod.clone(),
+        Arc::new(InlineExecutor),
+    );
+    spawn(&mut app, DVec3::new(10.0, 60.0, 10.0));
+    let mut model = Model::default();
+    tests::fill_held(&mut app, &lod, &mut model);
+    edit_tower(&mut app);
+    let mut changed = 0;
+    for frame_no in 0..600 {
+        lod.run_some(1);
+        app.update();
+        let ops = app.world_mut().resource_mut::<LodOps>().take();
+        let keys: Vec<ChunkKey> = ops
+            .iter()
+            .filter_map(|op| match op {
+                LodOp::Upsert { key, .. } | LodOp::Remove { key } => Some(*key),
+                LodOp::Mask { .. } => None,
+            })
+            .collect();
+        model.apply(ops);
+        tests::check_model(&app, &model);
+        let state = app.world().resource::<LodWorld>();
+        for &key in &keys {
+            for n in tree::face_neighbors(key) {
+                assert!(
+                    !state.tree.node(n).is_some_and(|n| n.stale),
+                    "frame {frame_no}: {key:?} changed while its neighbor {n:?} waits to be built \
+                     again"
+                );
+            }
+        }
+        changed += keys.len();
+        let stats = app.world().resource::<LodStats>();
+        if stats.edited_chunks > 0
+            && stats.fill >= 1.0
+            && stats.in_flight == 0
+            && stats.sends_waiting == 0
+            && lod.held() == 0
+        {
+            break;
+        }
+    }
+    assert!(changed > 0);
+    let stats = app.world().resource::<LodStats>().clone();
+    assert!(stats.fill >= 1.0 && lod.held() == 0, "{stats:?}");
+    let edited = tower_chunks();
+    for k in 1..=2u8 {
+        for at in [
+            [TOWER_X, *TOWER.end(), TOWER_Z],
+            [TOWER_X, *TOWER.start(), TOWER_Z],
+        ] {
+            let key = node_at(k, at);
+            let want = built_mesh(expected(key, &edited, true));
+            assert_eq!(tree_mesh(&app, key), want, "level {k} {key:?}");
+            let quads = want.as_ref().map(ChunkMesh::total_quads);
+            assert_eq!(model.nodes.get(&key).map(|n| n.1), quads, "level {k}");
+        }
+    }
+    tests::assert_bits_from_scratch(&app);
+}

@@ -670,7 +670,7 @@ pub(super) struct Model {
 }
 
 impl Model {
-    fn apply(&mut self, ops: Vec<LodOp>) {
+    pub(super) fn apply(&mut self, ops: Vec<LodOp>) {
         for op in ops {
             match op {
                 LodOp::Upsert { key, mesh, mask } => {
@@ -825,8 +825,13 @@ pub(super) fn assert_bits_from_scratch(app: &App) {
             "{c:?}: the tree follows its plan"
         );
     }
-    let (levels, known) = lod.tree.count_from_scratch();
+    let (levels, known, waiting) = lod.tree.count_from_scratch();
     assert_eq!(lod.tree.counts(), &levels[..], "incremental counts");
+    assert_eq!(
+        lod.tree.waiting(),
+        waiting,
+        "records waiting to be built again"
+    );
     assert_eq!(
         lod.tree.columns_known().1,
         known,
@@ -954,10 +959,10 @@ impl JobExecutor for Counting {
 
 /// Holds every job until the test runs them.
 #[derive(Default)]
-struct Hold(Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>);
+pub(super) struct Hold(Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>);
 
 impl Hold {
-    fn run_all(&self) -> usize {
+    pub(super) fn run_all(&self) -> usize {
         let jobs = std::mem::take(&mut *self.0.lock().expect("lock"));
         let n = jobs.len();
         for job in jobs {
@@ -966,12 +971,12 @@ impl Hold {
         n
     }
 
-    fn held(&self) -> usize {
+    pub(super) fn held(&self) -> usize {
         self.0.lock().expect("lock").len()
     }
 
     /// Runs the held jobs whose index has its bit set in `pick` (bit `i % 32`), keeps the rest.
-    fn run_some(&self, pick: u32) {
+    pub(super) fn run_some(&self, pick: u32) {
         let jobs = std::mem::take(&mut *self.0.lock().expect("lock"));
         let mut kept = Vec::new();
         for (i, job) in jobs.into_iter().enumerate() {
@@ -2785,7 +2790,7 @@ fn a_renderer_that_cannot_draw_turns_the_lod_off() {
 }
 
 /// Frames running every held job until the LOD is filled.
-fn fill_held(app: &mut App, lod: &Hold, model: &mut Model) {
+pub(super) fn fill_held(app: &mut App, lod: &Hold, model: &mut Model) {
     for _ in 0..1000 {
         lod.run_all();
         frame(app, model);
