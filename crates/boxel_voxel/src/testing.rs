@@ -12,6 +12,7 @@
 //! | `test:plant` | a cross plant, cutout, no collision |
 //! | `test:fluid` | a translucent fluid with a flow layer; the waterlogged blocks hold it |
 //! | `test:hot` | an opaque fluid that emits light and hardens into `test:solid` beside `test:fluid` |
+//! | `test:cutout` | a cutout full cube (leaves), with the plant's layer |
 //!
 //! Every layer is a flat [`TEXTURE_SIZE`]^2 image; the plant's has binary alpha.
 use crate::{
@@ -162,6 +163,11 @@ pub fn builder() -> BlockRegistryBuilder {
         |_, _| {},
     )
     .expect("test:hot");
+    b.add_block(BlockDef {
+        light_opacity: 1,
+        ..cube("test:cutout", RenderShape::Cutout, all(plant))
+    })
+    .expect("test:cutout");
 
     let block = |b: &BlockRegistryBuilder, name: &str| b.block_by_name(name).expect(name);
     let fluid = b
@@ -234,5 +240,9 @@ mod tests {
         assert_eq!(fluid[usize::from(hot.0)].hardens[0].source, solid);
         assert!(r.flags(by("test:fluid")).contains(StateFlags::FLUID));
         assert_ne!(by("test:hot"), BlockState::AIR);
+        let cutout = by("test:cutout");
+        assert_eq!(r.shape(cutout), RenderShape::Cutout);
+        assert!(r.model(cutout).is_solid_cube());
+        assert!(!r.occludes(cutout));
     }
 }

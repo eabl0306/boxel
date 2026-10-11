@@ -20,6 +20,8 @@
 //! - [`storage`]: Minecraft-style paletted container (Uniform | Packed 1/2/4/8 bits | Direct u16).
 //! - [`light`]: the light value format ([`LightValue`]) and the per-state [`LightTables`]. Light
 //!   itself is derived data, computed by `boxel_light`; chunks do not store it.
+//! - [`lod`]: far level of detail (ADR 0031): the [`LodClass`] of every state and the cell rule
+//!   that turns a cube of blocks into one coarse cell ([`CellPartial`]).
 //! - [`ChunkData`]: one chunk's immutable snapshot payload (shared as `Arc<ChunkData>`; edits use
 //!   `Arc::make_mut` copy-on-write), with its light masks ([`LightMasks`]: opaque, partial,
 //!   emitters; built and cached only when the storage cannot serve them as is), and
@@ -32,6 +34,7 @@ pub mod coords;
 pub mod faces;
 pub mod fluid;
 pub mod light;
+pub mod lod;
 pub mod registry;
 pub mod rules;
 pub mod shapes;
@@ -52,6 +55,7 @@ pub use coords::{
 pub use faces::{ALL_LINKS, ChunkFaceInfo, link_bit};
 pub use fluid::{FluidHardening, FluidId, FluidReplace, FluidRules, FluidType, MAX_FLUIDS};
 pub use light::{LightTables, LightValue, MAX_LIGHT, OPAQUE_OPACITY};
+pub use lod::{CellPartial, LodClass, LodClasses};
 pub use masks::{LightMasks, MaskRows, MaskWords, OwnedLightMasks};
 pub use registry::{
     Axis, BlockCollision, BlockDef, BlockId, BlockModel, BlockRegistry, BlockRegistryBuilder,
