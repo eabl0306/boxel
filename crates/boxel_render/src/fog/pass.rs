@@ -95,8 +95,14 @@ fn lit_color(layer: &FogLayer, view: &ViewParams) -> [f32; 3] {
 /// The uniform words of one layer.
 fn layer_gpu(m: &MarchLayer) -> FogLayerGpu {
     let p = &m.params;
-    let flags = if p.volume { fog::LAYER_VOLUME } else { 0 }
-        | if m.uniform { fog::LAYER_UNIFORM } else { 0 };
+    let flags = [
+        (p.volume, fog::LAYER_VOLUME),
+        (m.uniform, fog::LAYER_UNIFORM),
+        (p.skip_rows[0], fog::LAYER_SKIP_BOTTOM),
+        (p.skip_rows[1], fog::LAYER_SKIP_TOP),
+    ]
+    .into_iter()
+    .fold(0, |flags, (on, flag)| if on { flags | flag } else { flags });
     let [r, g, b] = m.lit;
     let k = m.profile.knots;
     FogLayerGpu {
@@ -1027,9 +1033,14 @@ mod tests {
         let edged = MarchLayer::new(&layer, origin, 99, [0.5; 3], [10.0, 20.0], profile);
         let gpu = layer_gpu(&edged);
         assert_eq!(gpu.cells[2..], [4, 10]);
-        // The walk leaves out the row (2 blocks) along each edged plane.
+        // Without soft fog the walk leaves out the row (2 blocks) along each edged plane.
         assert_eq!(gpu.walk[..2], [-9.0, 3.0]);
-        assert_eq!(gpu.octave2[3], fog::LAYER_VOLUME, "edges are never uniform");
+        let skip = fog::LAYER_SKIP_BOTTOM | fog::LAYER_SKIP_TOP;
+        assert_eq!(
+            gpu.octave2[3],
+            fog::LAYER_VOLUME | skip,
+            "edges are never uniform"
+        );
         assert_eq!(gpu.band[2..], [20.0, 12.0]);
         assert_eq!((gpu.fade[3], gpu.grid[3]), (9.0, 0.5));
         assert_eq!((profile.bottom, profile.spacing), (2.0, 12.0 / 7.0));
@@ -1039,5 +1050,12 @@ mod tests {
         let k = profile.knots;
         assert_eq!(gpu.profile_a, [k[0], k[1], k[2], k[3]]);
         assert_eq!(gpu.profile_b, [k[4], k[5], k[6], k[7]]);
+        // With soft fog an edge under two cells keeps its row: the bottom one here.
+        layer.soft_distance = 6.0;
+        layer.edge_bottom = 3;
+        let soft = MarchLayer::new(&layer, origin, 99, [0.5; 3], [10.0, 20.0], profile);
+        let gpu = layer_gpu(&soft);
+        assert_eq!(gpu.walk[..2], [-11.0, 3.0]);
+        assert_eq!(gpu.octave2[3], fog::LAYER_VOLUME | fog::LAYER_SKIP_TOP);
     }
 }

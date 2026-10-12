@@ -54,7 +54,9 @@ pub struct FogLayer {
     /// noise have fog and every column ends at its own height: an uneven underside of cubes
     /// instead of a flat plane. Distances are measured to a row's face nearest the plane, so the
     /// row along the plane is always empty, and an edge of a few cells looks best (one under a
-    /// cell only empties that row). 0 (the default) cuts the band at the plane.
+    /// cell only empties that row). The march skips that row unless the soft fog shows in it,
+    /// which takes an edge under two cells ([`crate::LayerParams::skip_rows`]). 0 (the default)
+    /// cuts the band at the plane.
     pub edge_bottom: u32,
     /// Depth of the top edge, in blocks (0 to [`MAX_EDGE`]): like [`FogLayer::edge_bottom`],
     /// below `max_y`, for an uneven skyline of cubes instead of a flat top.

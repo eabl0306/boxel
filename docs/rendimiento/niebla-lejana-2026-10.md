@@ -137,7 +137,9 @@ de mediana en los dos casos.
 **S7, M2b (1df8ee5) contra M2a (0e0b830, el mismo código que df46e43).** La marcha ya no camina
 la fila pegada a un plano con borde, que siempre está vacía, y multiplica por recíprocos
 calculados en la CPU. Cambian los pasos y el redondeo, dentro de las tolerancias de los tests de
-GPU. Sale con 0.
+GPU. Sale con 0. Tras la revisión, con niebla suave y un borde de menos de dos celdas la fila se
+vuelve a caminar (su niebla suave se ve). Ningún preset tiene un borde así, así que estos números
+no cambian.
 
 | caso | fps | p50 ms | p99 ms | frames > 6,94 ms | cambio |
 |---|---:|---:|---:|---:|---:|

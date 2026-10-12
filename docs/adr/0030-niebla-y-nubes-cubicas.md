@@ -409,5 +409,5 @@ altos.
 - El uniform crece a 1136 bytes. Los detalles están en el ADR 0032.
 - La optimización del ADR 0032 (M2, 2026-10-12) deja `both` en 1,06 a 1,11 ms por frame medio y
   0,96 a 1,01 ms en la mediana (RTX, 1280x720, sin tope), unas 1,1 veces menos que antes del ADR
-  0032. La marcha ya no camina la fila pegada a un plano con borde, que siempre está vacía. El
-  uniform queda en 1200 bytes.
+  0032. La marcha ya no camina la fila pegada a un plano con borde cuando no se ve nada en ella
+  (sin niebla suave, o con un borde de dos celdas o más). El uniform queda en 1200 bytes.

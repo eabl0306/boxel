@@ -114,7 +114,8 @@ pub struct FogLayerGpu {
     /// xyz = high words; w = seed of the first octave.
     pub base_hi: [u32; 4],
     /// x = 0, y = seed of the second octave, z = octaves, w = flags
-    /// ([`fog::LAYER_VOLUME`], [`fog::LAYER_UNIFORM`]).
+    /// ([`fog::LAYER_VOLUME`], [`fog::LAYER_UNIFORM`], [`fog::LAYER_SKIP_BOTTOM`],
+    /// [`fog::LAYER_SKIP_TOP`]).
     pub octave2: [u32; 4],
     /// x = coverage threshold at the band's bottom (0..=4096), y = coverage gain (q8), z = rise
     /// of the threshold to the band's top (0..=4096), w = cell rows of the band.
@@ -130,7 +131,8 @@ pub struct FogLayerGpu {
     /// The same at knots 4 to 7.
     pub profile_b: [f32; 4],
     /// x, y = the rows the walk crosses, `[min, max)` relative to the render origin's y (the
-    /// band less the row along each plane with an edge, `boxel_fog::LayerParams::walk`); z = 1 /
+    /// band less the rows of [`fog::LAYER_SKIP_BOTTOM`] and [`fog::LAYER_SKIP_TOP`],
+    /// `boxel_fog::LayerParams::walk`); z = 1 /
     /// max(band height, 1) (the shader multiplies instead of dividing); w = 0.
     pub walk: [f32; 4],
 }
@@ -143,6 +145,11 @@ pub mod fog {
     pub const LAYER_VOLUME: u32 = 1;
     /// [`super::FogLayerGpu::octave2`] w: every cell is full (the march takes a chord whole).
     pub const LAYER_UNIFORM: u32 = 2;
+    /// [`super::FogLayerGpu::octave2`] w: the walk leaves out the row along the bottom plane,
+    /// where nothing shows (`boxel_fog::LayerParams::skip_rows`).
+    pub const LAYER_SKIP_BOTTOM: u32 = 4;
+    /// [`super::FogLayerGpu::octave2`] w: the same along the top plane.
+    pub const LAYER_SKIP_TOP: u32 = 8;
 }
 
 /// Storage `ChunkGpu` (64 bytes) in the chunk table, one per render chunk slot.

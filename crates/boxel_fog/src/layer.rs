@@ -110,9 +110,17 @@ pub struct LayerParams {
     pub band: [f32; 2],
     /// Band in cells relative to `c0[1]`, `[first, end)` (clamped to `+-2^30`).
     pub band_cells: [i32; 2],
+    /// Whether the walk leaves out the row along the bottom and along the top plane: only
+    /// along a plane with an edge, where nothing or next to nothing shows. The row's cells are
+    /// always empty ([`noise::row_edge`] gives it 4096), but the soft fog reads the edge by the
+    /// distance to the plane less half a cell ([`noise::point_edge`]). Without soft fog, then,
+    /// any edge leaves the row out; with it, only an edge of two cells or more, which raises
+    /// the soft fog's threshold there at least 84 % of the way to 4096 (only noise over 0.84
+    /// shows, and that trace goes). A shallower edge leaves the inner half of the row about the
+    /// soft fog of a row inside, so the walk keeps the row.
+    pub skip_rows: [bool; 2],
     /// The rows the march walks, relative to the render origin's y (clamped as `band` is): the
-    /// band less the row along each plane with an edge, which is always empty
-    /// ([`noise::row_edge`]), the same rows the haze spans. `[lo, lo]` when no row is left.
+    /// band less the rows of [`LayerParams::skip_rows`]. `[lo, lo]` when no row is left.
     pub walk: [f32; 2],
     /// The same rows in cells relative to `c0[1]`, `[first, end)` (`end == first` when none).
     pub walk_cells: [i32; 2],
@@ -157,7 +165,9 @@ impl LayerParams {
                 .clamp(-i128::from(BAND_CELL_LIMIT), i128::from(BAND_CELL_LIMIT)) as i32
         };
         let band_cells = [band_cell(layer.min_y), band_cell(layer.max_y)];
-        let (bottom, top) = (layer.edge_bottom > 0, layer.edge_top > 0);
+        let soft = layer.soft_distance > 0.0;
+        let skip = |edge: u32| edge > 0 && (!soft || edge >= cell[1].saturating_mul(2));
+        let (bottom, top) = (skip(layer.edge_bottom), skip(layer.edge_top));
         let walk_lo = band_rel(layer.min_y.saturating_add(i64::from(bottom) * cy));
         let walk_hi = band_rel(layer.max_y.saturating_sub(i64::from(top) * cy)).max(walk_lo);
         let first = band_cells[0] + i32::from(bottom);
@@ -182,6 +192,7 @@ impl LayerParams {
             gain: gain_units(layer.softness),
             band: [band_rel(layer.min_y), band_rel(layer.max_y)],
             band_cells,
+            skip_rows: [bottom, top],
             walk: [walk_lo, walk_hi],
             walk_cells: [first, end],
             density_log2e: layer.density * std::f32::consts::LOG2_E,
@@ -442,6 +453,51 @@ mod tests {
         assert_eq!(far.band_cells, [1 << 30, 1 << 30]);
         let below = LayerParams::new(&layer, [0, 1 << 60, 0], 0);
         assert_eq!(below.band, [-(BAND_LIMIT as f32); 2]);
+    }
+
+    /// The walk leaves out the row along a plane with an edge only where nothing or next to
+    /// nothing shows: always without soft fog (its cells are empty), with soft fog only for an
+    /// edge of two cells or more, under which the soft fog's threshold is raised at least
+    /// `smooth_ramp(3072)` (84 %) over the whole row. A shallower edge raises it less there, so
+    /// the walk keeps the row.
+    #[test]
+    fn plane_rows_are_left_out_only_where_nothing_shows() {
+        for cy in [1, 2, 6, 16, 24] {
+            let mut layer = FogLayer::new(-20 * i64::from(cy), 20 * i64::from(cy));
+            layer.cell = [cy; 3];
+            for soft in [0.0, 12.0] {
+                for edge in [0, 1, cy, 2 * cy - 1, 2 * cy, 3 * cy] {
+                    (layer.edge_bottom, layer.edge_top) = (edge, edge);
+                    layer.soft_distance = soft;
+                    let p = LayerParams::new(&layer, [0, 5, 0], 0);
+                    let skip = edge > 0 && (soft == 0.0 || edge >= 2 * cy);
+                    let case = format!("cell {cy} edge {edge} soft {soft}");
+                    assert_eq!(p.skip_rows, [skip; 2], "{case}");
+                    let rows = i32::from(skip);
+                    let [lo, hi] = p.band_cells;
+                    assert_eq!(p.walk_cells, [lo + rows, hi - rows], "{case}");
+                    let lift = if skip { cy as f32 } else { 0.0 };
+                    assert_eq!(p.walk, [p.band[0] + lift, p.band[1] - lift], "{case}");
+                    if edge == 0 {
+                        continue;
+                    }
+                    // The rows along the planes: empty cells, and the soft fog's least raise.
+                    assert_eq!(noise::row_threshold(&p, lo), 4096, "{case}");
+                    assert_eq!(noise::row_threshold(&p, hi - 1), 4096, "{case}");
+                    let least = (0..64 * cy)
+                        .flat_map(|i| {
+                            let d = i as f32 / 64.0;
+                            [p.band[0] + d, p.band[1] - cy as f32 + d]
+                        })
+                        .map(|y| noise::smooth_ramp(noise::point_edge(&p, y)))
+                        .min()
+                        .unwrap();
+                    let deep = edge >= 2 * cy;
+                    assert_eq!(least >= noise::smooth_ramp(3072), deep, "{case}: {least}");
+                }
+            }
+        }
+        assert_eq!(noise::smooth_ramp(3072), 3456);
     }
 
     #[test]

@@ -18,7 +18,9 @@
 //!   equals the reference composite of its texel over the fog-free pixel (2 / 255).
 //! - **Tiers:** every tier draws the scenes (flat clouds and volumetric clouds with edges from
 //!   below, just under them, inside and above, a camera inside a blanket and inside a soft bank,
-//!   an edged bank seen from its top's height, a noisy bank over the floor, with the terrain's
+//!   an edged bank seen from its top's height and from inside the row along its plane (an edge
+//!   so shallow that the walk keeps that row for its soft fog), a noisy bank over the floor,
+//!   with the terrain's
 //!   distance fog off too and drawn to 60 blocks in a view to 512 (it fades at its own end), fog
 //!   over water, fog behind glass, dusk) like the best tier of its adapter, at half and full
 //!   resolution (0.1 % of the pixels, tolerance 2). And the haze past the cells: a bank whose
@@ -402,6 +404,15 @@ fn edged_bank() -> FogLayer {
     l
 }
 
+/// The edged bank with a bottom edge of half a cell, so shallow that the walk keeps the row
+/// along its plane (its soft fog reads nearly no edge in the row's upper half), and the top
+/// edge of four cells, whose row the walk leaves out.
+fn shallow_edged_bank() -> FogLayer {
+    let mut l = edged_bank();
+    l.edge_bottom = 1;
+    l
+}
+
 /// A thin noisy bank over the floor whose cells end at 96 blocks and go on as haze to 4 km,
 /// with edges (so its haze starts and ends a cell inside the band): the cells blend into the
 /// haze from 72 blocks, in view on the floor.
@@ -585,6 +596,13 @@ fn shots() -> Vec<Shot> {
             World::Floor,
             look(DVec3::new(0.5, 18.0, 0.5), DVec3::new(60.0, 17.0, 80.0)),
             vec![edged_bank()],
+            true,
+        ),
+        shot(
+            "shallow_edge_row",
+            World::Floor,
+            look(DVec3::new(10.3, 3.8, 6.7), DVec3::new(40.0, 3.0, 40.0)),
+            vec![shallow_edged_bank()],
             true,
         ),
         shot(

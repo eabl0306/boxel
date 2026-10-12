@@ -60,7 +60,7 @@ struct FogLayer {
   profile_a: vec4<f32>,
   profile_b: vec4<f32>,
   // x, y: the rows the walk crosses, [min, max) relative to the render origin's y (the band less
-  // the row along each plane with an edge, always empty); z: 1 / max(band height, 1); w: 0.
+  // the rows of LAYER_SKIP_BOTTOM and LAYER_SKIP_TOP); z: 1 / max(band height, 1); w: 0.
   walk: vec4<f32>,
 };
 
@@ -90,6 +90,10 @@ struct Fog {
 const FLAG_HALF: u32 = 1u;
 const LAYER_VOLUME: u32 = 1u;
 const LAYER_UNIFORM: u32 = 2u;
+// The walk leaves out the row along the bottom (the top) plane, where nothing shows
+// (boxel_fog::LayerParams::skip_rows).
+const LAYER_SKIP_BOTTOM: u32 = 4u;
+const LAYER_SKIP_TOP: u32 = 8u;
 const UNIFORM_PIECES: u32 = 8u;
 const SOFT_PIECE: f32 = 1.0;
 const SOFT_MAX_PIECES: u32 = 16u;
@@ -604,7 +608,7 @@ fn integrate_ramp(st: ptr<function, March>, s0: f32, s1: f32, sigma0: f32, sigma
 }
 
 // The ray's t interval in the rows layer li walks, clipped to [0, t_end] and to the layer's
-// reach (the haze spans the same rows).
+// reach (the haze lies inside those rows).
 fn chord(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, t_end: f32) -> vec2<f32> {
   let walk = fog.layers[li].walk;
   var ta = 0.0;
@@ -780,13 +784,13 @@ fn march_layer(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, up: bool, 
   // The walk (boxel_fog::march::Dda).
   let grid = fog.layers[li].grid.xyz;
   let size3 = fog.layers[li].size.xyz;
-  // The rows walked (LayerParams::walk_cells): the band's, less the row along each plane with
-  // an edge.
+  // The rows walked (LayerParams::walk_cells): the band's, less the rows its flags leave out.
   let cells = fog.layers[li].cells;
-  let first = cells.x + select(0, 1, cells.z != 0);
-  let walk_cells = vec2<i32>(first, max(cells.y - select(0, 1, cells.w != 0), first));
-  let density = fog.layers[li].fade.z;
   let flags = fog.layers[li].octave2.w;
+  let first = cells.x + select(0, 1, (flags & LAYER_SKIP_BOTTOM) != 0u);
+  let walk_cells = vec2<i32>(first,
+                             max(cells.y - select(0, 1, (flags & LAYER_SKIP_TOP) != 0u), first));
+  let density = fog.layers[li].fade.z;
   let np = noise_params(li);
   // A cell that starts before this is in the soft fog (0: no soft fog).
   let soft_t = fog.layers[li].soft.y / dir_len;

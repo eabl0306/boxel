@@ -159,9 +159,17 @@ tiempo de la niebla en `both`:
 - **Reusar la cadena de hashes (E2, 47fe21c).** Al pasar a un paso vecino de la red se reusan
   los hashes que comparten: 4 a 7 en lugar de 14, mismas imágenes. Hizo la niebla un 14 % más
   lenta (más registros vivos), así que se revirtió (df46e43).
-- **Filas que pueden tener niebla y recíprocos (M2b, 1df8ee5).** La fila pegada a un plano con
-  borde siempre está vacía: la marcha ya no la camina (`LayerParams::walk`, las mismas filas que
-  el perfil de bruma). La altura de la banda y el largo del fundido suave se dividen una vez en
+- **Filas que pueden tener niebla y recíprocos (M2b, 1df8ee5).** Las celdas de la fila pegada a
+  un plano con borde siempre están vacías, pero la niebla suave mide el borde desde el plano menos
+  media celda. La marcha deja de caminar esa fila solo donde no se ve nada
+  (`LayerParams::skip_rows`, dos flags del uniform): sin niebla suave, con cualquier borde; con
+  niebla suave, con un borde de dos celdas o más, que sube su umbral al menos un 84 % del camino
+  a lleno (solo se ve ruido sobre 0,84, y ese rastro se pierde). Con un borde más fino, la mitad
+  de adentro de la fila tiene casi la niebla suave de una fila interior, así que se sigue
+  caminando. La primera versión la saltaba con cualquier borde y, con uno fino, la cámara dentro
+  de esa fila perdía la niebla suave a su alrededor (lo encontró la revisión). Todos los presets
+  tienen bordes de dos celdas o más, así que sus imágenes y números no cambian. La altura de la
+  banda y el largo del fundido suave se dividen una vez en
   la CPU y el shader multiplica; el DDA mueve solo la salida del eje que avanzó. Cambian los
   pasos y el redondeo, con la marcha de referencia en el mismo commit. El desvanecido sigue
   dividiendo: multiplicado por su recíproco, llvmpipe dibujaba mal la opacidad de las escenas con
@@ -207,6 +215,9 @@ debajo de 1,4, así que no se empezó la reserva del plan (especializar la march
   esos rayos suelen estar casi opacos ahí.
 - **En GL (Low) no hay LOD**, así que una capa `Scene` con bruma solo la muestra cuando la vista
   pasa de sus celdas.
+- **Rastro de niebla suave en la fila de un plano.** Con un borde de dos celdas o más la marcha no
+  camina la fila pegada al plano, y se pierde la poca niebla suave que deja ahí el ruido sobre
+  0,84. Es lo que aceptó el plan del M2.
 
 ## Alternativas descartadas
 
@@ -227,15 +238,18 @@ debajo de 1,4, así que no se empezó la reserva del plan (especializar la march
   rayos empinados, rasantes y horizontales); profundidades de píxel dentro de un tramo; la
   costura continua, también en una capa llena; ningún salto dentro del anillo; rayos solo de bruma sin pasos; una capa sin
   bruma da bit a bit lo de antes (hash fijo tomado en 0bd2849; desde el M2 el del cúmulo con
-  bordes cambia, porque ya no camina sus filas vacías); las filas pegadas a un plano con borde
-  no se caminan.
+  bordes cambia: multiplica por el recíproco de la altura y ya no camina la fila de su plano de
+  arriba); las filas pegadas a un plano con borde no se caminan cuando no se ve nada en ellas, y
+  con niebla suave y un borde de menos de dos celdas sí, así que la cámara dentro de esa fila ve
+  la niebla suave a su alrededor; una capa sin filas que caminar no visita ninguna celda.
 - `fs_fog_debug_walk`: caminatas por un solo caché en cada eje y sentido, con una y dos octavas,
   ruido plano y 3D, cerca de la celda del origen y a 4096 celdas, en cuatro orígenes lejanos,
   dan el oráculo bit a bit en cada tier.
 - `boxel_render`: el desvanecido de una capa `Scene` con bruma con y sin LOD; escenas nuevas de
   referencia en los tres tiers (bruma lejana, bruma `Scene`, presupuesto agotado, una capa llena
   con bruma a la mitad y sombra de caras desde abajo y desde arriba, una capa de cubos de 16 desde
-  abajo, desde adentro y desde arriba); el ruido contra el oráculo cerca de
+  abajo, desde adentro y desde arriba, y un banco con un borde de media celda visto desde la fila
+  de su plano); el ruido contra el oráculo cerca de
   ±4096 celdas; `gpu_lod` comprueba que el valle con bruma llega al horizonte del LOD.
 - `boxel_demo`: presets válidos, suaves, sin planos y sin saltos por tick; las nubes densas; la
   tabla de pasos (abajo) con techos fijos.

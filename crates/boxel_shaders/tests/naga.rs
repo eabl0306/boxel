@@ -559,6 +559,11 @@ fn fog_constants_match_boxel_fog() {
     assert_eq!(const_u32(&module, "FLAG_HALF"), fog::FLAG_HALF);
     assert_eq!(const_u32(&module, "LAYER_VOLUME"), fog::LAYER_VOLUME);
     assert_eq!(const_u32(&module, "LAYER_UNIFORM"), fog::LAYER_UNIFORM);
+    assert_eq!(
+        const_u32(&module, "LAYER_SKIP_BOTTOM"),
+        fog::LAYER_SKIP_BOTTOM
+    );
+    assert_eq!(const_u32(&module, "LAYER_SKIP_TOP"), fog::LAYER_SKIP_TOP);
     assert_eq!(const_u32(&module, "HI_MIX"), boxel_fog::noise::HI_MIX);
     assert_eq!(
         const_u32(&module, "UNIFORM_PIECES"),

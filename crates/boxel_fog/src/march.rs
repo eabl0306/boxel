@@ -1633,14 +1633,16 @@ mod tests {
 
     /// A layer without haze draws bit for bit what the march drew before the haze existed
     /// (feat/lod 0bd2849), on rays that stay inside the step budget: every kind of layer, near
-    /// the origin and far from it. Except the walk of the edged cumulus, which since the fog's
-    /// M2 skips the always empty rows along its planes (its hash was `0x3b9d_aed0_bfca_7613`).
+    /// the origin and far from it. Except the edged cumulus (its hash was
+    /// `0x3b9d_aed0_bfca_7613`): since the fog's M2 its rise multiplies by the band's reciprocal
+    /// height, and its walk leaves out the row along its top plane, whose edge of two cells
+    /// leaves nothing there to draw (the bottom one, of one cell, keeps its row).
     #[test]
     fn haze_0_draws_as_before() {
         let want = [
             ("soft bank", 0xbe13_1c0c_cc28_677d_u64),
             ("soft bank far", 0x1329_67d9_29c4_d600),
-            ("cumulus", 0x3552_b81e_a192_c14e),
+            ("cumulus", 0x2648_78c0_0b20_ac3c),
             ("flat clouds and a full slab", 0x7927_cb21_f71f_bb28),
             ("scene fade", 0xf7f9_683d_3bca_7304),
         ];
@@ -2018,9 +2020,9 @@ mod tests {
         assert!(empty_in_ring > 0, "some empty step reaches into the ring");
     }
 
-    /// The row along a plane with an edge is always empty, so the walk leaves it out: a ray
-    /// along it takes no step and draws nothing, as the cells it would have walked had none.
-    /// Without the edge the same ray walks that row.
+    /// Without soft fog the row along a plane with an edge is always empty, so the walk leaves
+    /// it out: a ray along it takes no step and draws nothing, as the cells it would have walked
+    /// had none. Without the edge the same ray walks that row.
     #[test]
     fn rows_along_edged_planes_are_not_walked() {
         let mut layer = hazy_bank((4, 8), 0.5);
@@ -2057,6 +2059,62 @@ mod tests {
         let p = LayerParams::new(&layer, [0; 3], 0);
         assert_eq!((p.walk, p.walk_cells), (p.band, p.band_cells));
         assert!(march(&ray(1.5), &[hazy(&layer)], [0.0; 3], 64).steps > 0);
+    }
+
+    /// 16-block cells over 0..160 with soft fog within `soft` blocks and a bottom edge of
+    /// `edge_bottom` blocks.
+    fn edged_soft(edge_bottom: u32, soft: f32) -> FogLayer {
+        let mut l = slab(0, 160, [16; 3], 0.3);
+        l.noise.dims = NoiseDims::Volume;
+        l.noise.scale = 4;
+        l.noise.octaves = 2;
+        l.noise.seed = 77;
+        l.threshold = 0.4;
+        l.softness = 0.25;
+        l.edge_bottom = edge_bottom;
+        l.soft_distance = soft;
+        l
+    }
+
+    /// The soft fog reads an edge by the distance to the plane less half a cell, so an edge
+    /// under two cells leaves the inner half of the row along its plane with about the soft fog
+    /// of a row inside: the walk keeps that row. A camera inside it sees the soft fog around it
+    /// on level rays, and climbing out of the row brings in no fog at once, as the walk of the
+    /// whole band drew it.
+    #[test]
+    fn shallow_edges_keep_the_soft_fog_along_their_planes() {
+        let layer = edged_soft(4, 16.0);
+        let ml = march_layer(&layer, 0.5);
+        let p = &ml.params;
+        assert_eq!((p.walk, p.walk_cells), (p.band, p.band_cells));
+        // At y 13 the edge raises nothing: the soft fog is that of the rows inside.
+        let mut plain = layer.clone();
+        plain.edge_bottom = 0;
+        let plain = march_layer(&plain, 0.5);
+        for x in 0..64 {
+            let pos = [x as f32 * 0.37, 13.0, x as f32 * 0.11];
+            assert_eq!(ml.soft_coverage(pos), plain.soft_coverage(pos), "{pos:?}");
+        }
+        // Level rays within the soft distance (only soft fog), in the row and just over it.
+        let level = |y: f32, i: i32| {
+            let a = i as f32 * 0.26;
+            let ray = Ray {
+                eye: [0.5, y, 0.5],
+                dir: [a.sin(), 0.0, a.cos()],
+                depths: [16.0; 4],
+            };
+            march(&ray, &[ml], [0.0; 3], 64)
+        };
+        let (mut fogged, mut jump) = (0, 0.0f32);
+        for i in 0..24 {
+            let r = level(13.0, i);
+            assert!(r.steps > 0, "ray {i}");
+            fogged += usize::from(r.transmittance[3] < 0.95);
+            let [below, above] = [15.9, 16.1].map(|y| level(y, i).transmittance[3]);
+            jump = jump.max((below - above).abs());
+        }
+        assert!(fogged > 0, "soft fog around the camera");
+        assert!(jump < 0.05, "no fog at once over the row: {jump}");
     }
 
     /// A layer with no row left to walk (one row along an edged plane, or a band clamped far
