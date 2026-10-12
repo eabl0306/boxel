@@ -7,8 +7,8 @@
 //!   drives `App::update()` from `about_to_wait` (never from `RedrawRequested`, so the
 //!   simulation does not freeze while the window is hidden on Wayland). `RedrawRequested` only
 //!   opens the presentation gate [`WindowState::frame_ready`] (see [`winit_runner`]).
-//! - Window and device events become messages; [`InputPlugin`] folds them into [`ButtonInput`]
-//!   and accumulated mouse resources in `PreUpdate`.
+//! - Window and device events become messages; [`InputPlugin`] folds them into [`ButtonInput`],
+//!   accumulated mouse resources and [`CursorPosition`] in `PreUpdate`.
 //! - Updates are paced by `boxel_app::FrameLimit` (default 144 fps, 0 = unlimited, changeable
 //!   at runtime), see [`UpdateMode`]. On Wayland a limit at or above the monitor's refresh rate
 //!   follows the display: updates run when the compositor asks for a frame (see
@@ -19,9 +19,9 @@ mod window;
 
 pub use input::{
     AccumulatedMouseMotion, AccumulatedMouseScroll, ButtonInput, ButtonState, CursorMoved,
-    InputPlugin, InputSystems, KeyboardInput, MouseButtonInput, MouseMotion, MouseWheel,
-    accumulate_mouse_motion_system, accumulate_mouse_scroll_system, keyboard_input_system,
-    mouse_button_input_system,
+    CursorPosition, InputPlugin, InputSystems, KeyboardInput, MouseButtonInput, MouseMotion,
+    MouseWheel, accumulate_mouse_motion_system, accumulate_mouse_scroll_system,
+    cursor_position_system, keyboard_input_system, mouse_button_input_system,
 };
 pub use runner::{FramePacingInfo, UpdateMode, winit_runner};
 pub use window::{
@@ -40,7 +40,7 @@ pub use winit::keyboard::KeyCode;
 pub mod prelude {
     pub use crate::{
         AccumulatedMouseMotion, AccumulatedMouseScroll, ButtonInput, CursorGrab, CursorOptions,
-        InputPlugin, KeyCode, MouseButton, PrimaryWindow, WindowPlugin, WindowSettings,
-        WindowState,
+        CursorPosition, InputPlugin, KeyCode, MouseButton, PrimaryWindow, WindowPlugin,
+        WindowSettings, WindowState,
     };
 }

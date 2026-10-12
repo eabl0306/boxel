@@ -57,6 +57,13 @@ pub struct CursorMoved {
     pub position: Vec2,
 }
 
+/// Where the cursor is: the position of the latest [`CursorMoved`] message, in physical pixels
+/// from the window's top-left. `None` until the cursor first moves over the window. UIs read it
+/// for hover and clicks; it keeps its last value while the cursor is locked (`CursorGrab::Locked`
+/// sends `MouseMotion`, not `CursorMoved`) or outside the window.
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq)]
+pub struct CursorPosition(pub Option<Vec2>);
+
 /// Pressed/just-pressed/just-released sets. `just_*` are cleared by the input systems at the
 /// start of each frame's `PreUpdate` before new events are applied.
 #[derive(Resource, Debug, Clone)]
@@ -185,6 +192,16 @@ pub fn accumulate_mouse_scroll_system(
     acc.set_if_neq(AccumulatedMouseScroll { delta });
 }
 
+/// Keeps [`CursorPosition`] at the latest [`CursorMoved`] message of the frame.
+pub fn cursor_position_system(
+    mut cursor: ResMut<CursorPosition>,
+    mut events: MessageReader<CursorMoved>,
+) {
+    if let Some(last) = events.read().last() {
+        cursor.set_if_neq(CursorPosition(Some(last.position)));
+    }
+}
+
 /// Releases every key and mouse button when the window loses focus (the matching key-up
 /// events go to whichever window has focus now). Runs after the button systems so the
 /// releases show up as `just_released` this frame.
@@ -201,7 +218,7 @@ fn release_on_focus_loss_system(
     }
 }
 
-/// Registers the input messages and resources and adds the four systems to `PreUpdate`
+/// Registers the input messages and resources and adds the input systems to `PreUpdate`
 /// in [`InputSystems`]. Independent of winit's event loop (testable headless).
 #[derive(Default)]
 pub struct InputPlugin;
@@ -218,6 +235,7 @@ impl Plugin for InputPlugin {
             .init_resource::<ButtonInput<MouseButton>>()
             .init_resource::<AccumulatedMouseMotion>()
             .init_resource::<AccumulatedMouseScroll>()
+            .init_resource::<CursorPosition>()
             .add_systems(
                 PreUpdate,
                 (
@@ -228,8 +246,40 @@ impl Plugin for InputPlugin {
                         .chain(),
                     accumulate_mouse_motion_system,
                     accumulate_mouse_scroll_system,
+                    cursor_position_system,
                 )
                     .in_set(InputSystems),
             );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_position_follows_the_latest_cursor_moved() {
+        let mut app = App::new();
+        app.add_plugins(InputPlugin);
+        app.update();
+        assert_eq!(app.world().resource::<CursorPosition>().0, None);
+
+        for x in [10.0, 20.5] {
+            app.world_mut().write_message(CursorMoved {
+                position: Vec2::new(x, 7.0),
+            });
+        }
+        app.update();
+        assert_eq!(
+            app.world().resource::<CursorPosition>().0,
+            Some(Vec2::new(20.5, 7.0))
+        );
+
+        // A frame without movement keeps the last position.
+        app.update();
+        assert_eq!(
+            app.world().resource::<CursorPosition>().0,
+            Some(Vec2::new(20.5, 7.0))
+        );
     }
 }
