@@ -213,7 +213,8 @@ dentro de una nube cuesta trozos suaves, como `inside`.
 
 **Imágenes** en `bench-results/fog-far/look/` (fuera de git, con `comandos.sh` y `leeme.txt`):
 cada preset desde la pose del horizonte, `cumulus16` desde adentro y desde arriba, y el valle con
-bruma 1, 0,25 y 0 contra `both`.
+bruma 1, 0,25 y 0 contra `both`. Las de los cúmulos tras el ajuste de bandas (02 a 07, mismas
+poses) están en `bench-results/fog-far/look-ajuste/`.
 
 **Costo.** La línea base (S0, 0bd2849, RTX, 1280x720, radio 16, sin tope): `--fog both` cuesta
 de 0,97 a 1,06 ms en la mediana. Las mediciones de este ADR (S1 a S3) se corren cuando el M1
