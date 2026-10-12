@@ -42,7 +42,8 @@ const NODE_BYTES: u64 = 32;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MemoryCeiling {
     /// By adapter class: 192 Mi quads (1.5 GiB of pages) on a discrete GPU, 96 Mi (768 MiB) on
-    /// an integrated one, 32 Mi (256 MiB) otherwise.
+    /// an integrated one, 32 Mi (256 MiB) otherwise; never below
+    /// [`ChunkMemorySettings::initial_quads`].
     #[default]
     Auto,
     /// This many quads.
@@ -50,7 +51,7 @@ pub enum MemoryCeiling {
 }
 
 impl MemoryCeiling {
-    /// Quads on an adapter of `class`.
+    /// Quads on an adapter of `class` (`Auto` before the floor raises it).
     pub fn quads(self, class: wgpu::DeviceType) -> u32 {
         match self {
             Self::Quads(quads) => quads,
@@ -238,7 +239,15 @@ impl MemoryLayout {
             .min(facts.page_limit)
             .max(1) as u32;
         let page_chunks = settings.page_chunks.clamp(1, PAGE_CHUNKS_MAX);
-        let ceiling = u64::from(settings.max_quads.quads(facts.class).max(1));
+        // `Auto` never cuts the floor asked for, which validation accepts whatever its size
+        // (wgpu's GL backend reports most real GPUs as `DeviceType::Other`)
+        let ceiling = match settings.max_quads {
+            MemoryCeiling::Auto => MemoryCeiling::Auto
+                .quads(facts.class)
+                .max(settings.initial_quads),
+            MemoryCeiling::Quads(quads) => quads,
+        };
+        let ceiling = u64::from(ceiling.max(1));
         let max_pages = (ceiling.div_ceil(u64::from(page_quads)) as u32)
             .clamp(1, list_pages_limit(page_chunks));
         let ceiling_quads = ceiling.min(u64::from(max_pages) * u64::from(page_quads));
@@ -1393,6 +1402,51 @@ mod tests {
         assert_eq!((m.full_pages(), m.chunk_places()), (1, 4));
         let placed = upsert_resident(&mut m, &mut chunks, &mut uploads, 4, I64Vec3::ZERO, &small);
         assert_eq!(placed, Ok(()));
+    }
+
+    /// `Auto` never cuts the floor asked for: validation accepts any `initial_quads` under it,
+    /// and wgpu's GL backend reports `DeviceType::Other` for most real GPUs.
+    #[test]
+    fn the_auto_ceiling_never_cuts_the_floor() {
+        let big = ChunkMemorySettings {
+            initial_quads: 48 << 20,
+            initial_slots: 98304,
+            ..ChunkMemorySettings::default()
+        };
+        assert_eq!(big.validate(), Ok(()));
+        for class in [
+            wgpu::DeviceType::Other,
+            wgpu::DeviceType::Cpu,
+            wgpu::DeviceType::VirtualGpu,
+            wgpu::DeviceType::IntegratedGpu,
+            wgpu::DeviceType::DiscreteGpu,
+        ] {
+            let layout = MemoryLayout::resolve(&big, facts(class));
+            assert_eq!(layout.floor_quads(), 48 << 20, "{class:?}");
+            assert!(layout.ceiling_quads >= 48 << 20, "{class:?}");
+        }
+        // an explicit ceiling still bounds it (validation refuses a floor above it)
+        let capped = ChunkMemorySettings {
+            max_quads: MemoryCeiling::Quads(24 << 20),
+            initial_quads: 24 << 20,
+            initial_slots: 65536,
+            ..ChunkMemorySettings::default()
+        };
+        let layout = MemoryLayout::resolve(&capped, facts(wgpu::DeviceType::Other));
+        assert_eq!((layout.floor.len(), layout.ceiling_quads), (6, 24 << 20));
+        // six pages hold 65,532 chunks: fewer than the slots, which the renderer logs
+        assert_eq!(layout.floor_chunk_places(), 65532);
+        // past the pages the draw lists allow the floor is cut (and logged) under `Auto` too
+        let huge = ChunkMemorySettings {
+            initial_quads: u32::MAX,
+            ..ChunkMemorySettings::default()
+        };
+        let layout = MemoryLayout::resolve(&huge, facts(wgpu::DeviceType::DiscreteGpu));
+        assert_eq!(layout.max_pages, list_pages_limit(PAGE_CHUNKS_MAX));
+        assert_eq!(
+            layout.floor_quads(),
+            u64::from(layout.max_pages) * (4 << 20)
+        );
     }
 
     #[test]

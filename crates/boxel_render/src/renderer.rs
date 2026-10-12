@@ -603,6 +603,15 @@ impl VoxelRenderer {
             layout.page_chunks,
             layout.ceiling_quads
         );
+        if layout.floor_quads() < u64::from(config.chunk_memory.initial_quads) {
+            tracing::warn!(
+                "chunk memory: the floor holds {} of the {} initial quads (cut to the ceiling of \
+                 {} pages)",
+                layout.floor_quads(),
+                config.chunk_memory.initial_quads,
+                layout.max_pages
+            );
+        }
         if layout.floor_chunk_places() < u64::from(slots) {
             tracing::warn!(
                 "chunk memory: the floor's {} page(s) hold {} chunks, fewer than the {slots} \
