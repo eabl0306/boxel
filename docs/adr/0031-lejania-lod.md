@@ -25,7 +25,8 @@ recomendaciones del plan:
 3. Tres presets: `near`, `far` (el de `--lod` por defecto) y `extreme`. Sin detección del
    dispositivo: el preset lo elige el juego.
 4. La regla de la celda: gana cualquier bloque sólido, salvo agua sobre el suelo.
-5. Agua lejana opaca primero.
+5. Agua lejana opaca primero. Enmendada tras el vuelo del dueño (issue #50): el agua lejana es
+   translúcida, con su fondo (sección 12).
 6. Las capas de niebla mantienen su alcance en el M1. Enmendada por el ADR 0032: una capa con
    bruma (`haze`) y desvanecido `Scene` llega al horizonte del LOD y se desvanece con él; las
    capas sin bruma conservan su alcance.
@@ -346,6 +347,94 @@ Sin persistencia, un chunk editado que se descarga vuelve generado, así que sal
 sus nodos vuelven a las celdas del generador. Con persistencia queda (está guardado) y su
 pirámide se lee del disco cuando hace falta. El nivel 6 (`extreme`) no muestra ediciones: ahí una
 celda abarca 8 chunks.
+
+### 12. Agua lejana translúcida (M4, issue #50)
+
+El dueño voló el LOD y pidió el agua lejana translúcida. Con el agua opaca se veía un escalón azul
+en el borde del detalle completo: el agua cercana deja ver el fondo, y la lejana era un cubo del
+color medio de la textura, más saturado. Esto enmienda la decisión 5.
+
+Lo que hace que el agua cercana se vea como se ve, y que el LOD tiene que imitar:
+
+- Se mezcla con el alfa de su textura (`fs_translucent`), sin escribir profundidad, con
+  `cull_mode None`. Entre dos bloques de agua no hay cara: un rayo cruza una sola capa, la de
+  arriba.
+- Debajo se ve el fondo, y el fondo se oscurece con la hondura: el agua tiene opacidad de luz 1,
+  así que cada bloque de agua quita un nivel de luz de cielo. El fondo de un lago de 10 bloques
+  tiene luz 5. Por eso el centro de un lago hondo se ve más oscuro que la orilla.
+
+**Mallado (`boxel_mesh::lod`).**
+
+- `LodMaterials` marca como translúcido (`RenderShape::Translucent` en su tabla) el estado
+  canónico de un fluido cuya fuente es translúcida: el agua. La lava sigue opaca, como cerca
+  (ADR 0025).
+- En el `PaddedChunk` el agua sigue siendo un vóxel opaco, así el mallador no hace caras entre
+  agua y agua ni entre agua y suelo. Sus caras contra el aire van al balde translúcido (el 7),
+  porque así lo dice la tabla.
+- Pasada nueva, `add_underwater` (el fondo): toda cara de una celda no translúcida (suelo o lava)
+  contra una celda de agua, unidas en rectángulos por plano, material y oscuridad, sin cruzar el
+  borde de un octante. Es el fondo del mar y sus escalones. Son caras de verdad, se dibujan
+  siempre (costura `None`).
+- **Oscuridad.** El LOD no tiene luz, así que cada cara opaca bajo el agua lleva la suya:
+  `n` es cuántas celdas hay desde su celda de enfrente hacia arriba hasta la última celda de
+  agua de esa columna (las de suelo en medio cuentan, para las paredes). En bloques es
+  `d = n s - s/2`: la superficie y el fondo de verdad caen dentro de sus celdas, en promedio a
+  media celda. La cara se ilumina con luz de cielo `15 - d` (0 desde 15 bloques), como el fondo
+  cercano. Va en el índice de paleta de luz del quad, junto a su costura: bits 0 y 1 la costura,
+  2 a 5 la oscuridad. La paleta del LOD tiene 64 entradas de cielo abierto. Se mide dentro del
+  nodo y su borde: es exacta mientras la superficie caiga en el mismo nodo que el fondo (el mar
+  del ejemplo, en y 47, cae siempre dentro).
+- **Faldones.** En el agua, solo en la celda de arriba (aire encima) y con algo que no es aire
+  enfrente: tapan el escalón donde la superficie gruesa queda más alta que la fina. Cada nivel
+  redondea la superficie verdadera a sus celdas, así que la fina siempre cae dentro de esa celda
+  de arriba de la gruesa, y basta con ella. Más abajo, bajo el agua fina, el faldón sería una
+  segunda capa. Van al balde 7. En el suelo, como antes (aire cerca), pero solo con suelo
+  enfrente: con agua enfrente ya está la cara del fondo.
+- **Paredes.** Las paredes de agua del nivel 1 eran para que un rayo bajo el agua cercana no viera
+  el cielo dentro del agua opaca. Ahora el rayo sigue dentro del agua del LOD hasta el fondo, y
+  una pared sobre una celda de agua sería una segunda capa. Quedan solo en el suelo: una celda de
+  suelo junto a uno de los 9 planos, con suelo enfrente, agua a 2 celdas o menos y sin aire cerca.
+  Y ahora en todos los niveles: con el agua translúcida, un rayo puede llegar bajo el fondo grueso
+  en la costura entre dos niveles, que antes tapaba la superficie opaca.
+
+**Dibujo (`boxel_render::lod`).**
+
+- Un nodo guarda sus 6 baldes de caras y, al final, el balde de agua: primero las caras del
+  mallador, después los faldones de las caras del nodo, después los de los planos medios. Su
+  cantidad y sus costuras van en `LodDraw` y, en High, en las dos palabras libres de `LodNodeGpu`.
+- **Una sola capa de agua lejana por píxel.** Primero una prepasada que solo escribe la
+  profundidad de toda el agua del LOD; después la pasada de color, con `GreaterEqual` y la mezcla
+  alfa del agua cercana: solo pasa el agua más cercana. Así un faldón o una cara de agua detrás de
+  otra no suma una capa. Las dos pasadas corren el mismo vértice con la posición `@invariant`, así
+  dan la misma profundidad.
+- La profundidad del agua se escala con `FLUID_DEPTH_SCALE`, como la del agua cercana: pierde todo
+  empate con una cara opaca (una orilla a la misma altura, donde los quads crecen un poco por el
+  borde). El fondo nunca es coplanar con el agua: no hay z-fighting.
+- `cull_mode None`, como el agua cercana: desde abajo también se ve la superficie.
+- Orden en la pasada principal: lo opaco del LOD, el contorno, el agua del LOD (prepasada y
+  color), el agua cercana. El agua cercana se mezcla encima donde está delante. Las máscaras de
+  octantes valen igual para el agua: donde el detalle completo dibuja, el agua del LOD no.
+- **Costuras del agua.** El balde mezcla caras, así que su regla mira todas: los faldones de plano
+  medio se dibujan si algún octante dibujado tiene oculto a su vecino por un plano medio; los de
+  cara, además, si algún vecino del mismo nivel no dibuja su cara. Los que sobran quedan dentro
+  del agua, detrás de la superficie, y la prepasada los tapa. Los dos caminos cortan igual
+  (`water_quads`).
+- Instanciado: un draw por nodo con agua en el frustum, en la prepasada y en la de color. High: el
+  recorte escribe un draw de agua por nodo en una segunda lista por segmento (en los mismos
+  buffers, detrás de las listas de caras) y se dibuja con dos `multi_draw_indexed_indirect_count`
+  por segmento. Sin agua en ningún nodo no se graba nada de esto.
+- **Color.** El agua: la mip de 1x1 de su textura con su alfa (la media, lo que muestrea el agua
+  cercana a esa distancia), luz de cielo abierto, la sombra de su cara y la niebla de distancia,
+  con la cuenta de `fs_translucent`. El fondo: `level_curve(15 - d)` por la luz del cielo, así el
+  día y la noche oscurecen igual que cerca.
+
+**La niebla de `FogPlugin`.** La marcha llega hasta la profundidad que encuentra. Bajo el agua
+lejana llega hasta su superficie, porque la prepasada la escribió. Bajo el agua cercana, que no
+escribe profundidad, llega hasta el fondo. La diferencia es la niebla que habría dentro del agua.
+Las capas del ejemplo empiezan en y 46 y su borde de abajo la anula ahí, y el agua cercana llega a
+46,875: no cambia nada.
+
+Sin LOD no cambia nada: las pipelines y los buffers nuevos son de `LodPass`.
 
 **Respaldo.** Un generador sin `lod()` tiene solo el nivel 1 (`fallback_max_level`, 0 lo apaga),
 armado desde sus chunks reales con la regla exacta (`boxel_world::lod::fallback`): el chunk
