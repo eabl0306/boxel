@@ -18,8 +18,10 @@ pub(crate) const FOG_TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R
 
 /// The layers one frame marches, as the reference march takes them: sorted by height, without
 /// the ones the camera cannot reach (their band is farther above or below the eye than they are
-/// drawn), each with its color under the frame's light. `means` are the layers' mean coverages
-/// ([`mean_coverage`]), in the order of `settings.layers`.
+/// drawn), each with its color under the frame's light and its fade (for
+/// [`boxel_fog::FogFade::Scene`], the terrain's, or the view's distance fog at the layer's own
+/// end if it ends first). `means` are the layers' mean coverages ([`mean_coverage`]), in the
+/// order of `settings.layers`.
 pub fn frame_layers(
     settings: &FogSettings,
     means: &[MeanCoverage],
@@ -41,7 +43,7 @@ pub fn frame_layers(
                 origin,
                 time,
                 lit,
-                [view.fog_start, view.fog_end],
+                scene_fade(layer, view),
                 means.get(i).copied().unwrap_or_default(),
             );
             let [lo, hi] = m.params.band;
@@ -56,6 +58,19 @@ pub fn frame_layers(
             (!empty && gap < m.reach()).then_some(m)
         })
         .collect()
+}
+
+/// The fade of `layer` if it fades like the scene: the terrain's (`view.fog_start` to
+/// `view.fog_end`), or for a layer that ends first (its `max_distance`), the view's distance fog
+/// at that end. Like the terrain, then, it fades out over the last stretch it is drawn instead
+/// of stopping in a hard line where the terrain is still clear (with the fog off, both end
+/// at once).
+fn scene_fade(layer: &FogLayer, view: &ViewParams) -> [f32; 2] {
+    if layer.max_distance >= view.fog_end {
+        [view.fog_start, view.fog_end]
+    } else {
+        view.distance_fog.range(layer.max_distance)
+    }
 }
 
 /// A layer's color under the frame's light: its color times the sky light (never below the
@@ -695,7 +710,14 @@ mod tests {
     }
 
     fn view_with(y: f64, fog: DistanceFog) -> ViewParams {
-        let camera = Camera::default();
+        view_to(y, Camera::default().view_distance, fog)
+    }
+
+    fn view_to(y: f64, view_distance: f32, fog: DistanceFog) -> ViewParams {
+        let camera = Camera {
+            view_distance,
+            ..Camera::default()
+        };
         let transform = Transform::from_yaw_pitch(DVec3::new(0.5, y, 0.5), 0.0, 0.0);
         ViewParams::from_camera(
             &CameraView::compute(&camera, &transform, 1.0),
@@ -735,6 +757,41 @@ mod tests {
         assert_eq!(off[1].fade, [10.0, 20.0]);
         assert_eq!(off[1].reach(), 20.0);
         assert_eq!(layer_gpu(&off[0]).band[2], off[0].reach());
+    }
+
+    /// A layer faded like the scene that ends before the terrain does fades at its own end by
+    /// the distance fog's rule, instead of stopping in a hard line inside the clear stretch
+    /// (a valley fog drawn to 384 blocks, at 16 chunks: the terrain fades from 460.8 to 512).
+    #[test]
+    fn scene_layers_that_end_first_fade_at_their_end() {
+        let mut short = FogLayer::new(0, 8);
+        short.max_distance = 384.0;
+        let mut inside = FogLayer::new(16, 24);
+        inside.max_distance = 500.0;
+        let mut long = FogLayer::new(32, 40);
+        long.max_distance = 600.0;
+        let settings = FogSettings::new(vec![short, inside, long]);
+        let means = [1.0; 3].map(MeanCoverage::level);
+        let fog = DistanceFog::default();
+        let layers = frame_layers(&settings, &means, &view_to(4.5, 512.0, fog), 0);
+        assert_eq!(layers[0].fade, fog.range(384.0));
+        assert_eq!(layers[1].fade, fog.range(500.0));
+        assert_eq!(layers[2].fade, [460.8, 512.0], "the terrain's");
+        for (layer, end) in layers.iter().zip([384.0, 500.0, 512.0]) {
+            assert_eq!(layer.reach(), end);
+            assert_eq!(layer.fade_at(end), 1.0, "faded out at {end}");
+        }
+        // The game's rule, and off: a hard end at the layer's own end.
+        let capped = DistanceFog {
+            max_fade: 16.0,
+            ..fog
+        };
+        let layers = frame_layers(&settings, &means, &view_to(4.5, 512.0, capped), 0);
+        assert_eq!(layers[0].fade, [368.0, 384.0]);
+        let off = DistanceFog::off();
+        let layers = frame_layers(&settings, &means, &view_to(4.5, 512.0, off), 0);
+        assert_eq!(layers[0].fade, [384.0, 384.0]);
+        assert_eq!(layers[2].fade, [512.0, 512.0]);
     }
 
     #[test]

@@ -180,8 +180,10 @@ Cada `FogLayer` es un dato:
 - distancia de la niebla suave (de 0 a 32 bloques, apagada por defecto);
 - viento en bloques por segundo;
 - distancia máxima (hasta 4096) y desvanecido (`Scene`, como el terreno, o un rango propio).
-  Con la niebla de distancia del terreno apagada, `Scene` no desvanece y la capa termina de
-  golpe en la distancia de vista, como el terreno.
+  Una capa `Scene` que termina antes que el terreno se desvanece con la regla de la niebla de
+  distancia en su propio final, para no cortar en seco donde el terreno todavía se ve claro (el
+  valle del ejemplo, de 384 bloques, a 16 chunks). Con la niebla de distancia apagada, `Scene`
+  no desvanece y la capa termina de golpe, como el terreno.
 
 `FogSettings` agrega `enabled`, hasta 4 capas, la resolución (media por defecto) y `max_steps`
 (64 por defecto, `DEFAULT_MAX_STEPS`). Se cambia en tiempo de ejecución con `ResMut<FogSettings>`.

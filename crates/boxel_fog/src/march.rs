@@ -81,7 +81,8 @@ pub struct MarchLayer {
 
 impl MarchLayer {
     /// A layer for `render_origin` at `time`: `lit` is its color under this frame's light,
-    /// `scene_fade` the scene's fog start and end (used by [`FogFade::Scene`]), `mean` its
+    /// `scene_fade` the fade start and end [`FogFade::Scene`] takes (the renderer gives the
+    /// terrain's, or its distance fog at the layer's end if the layer ends first), `mean` its
     /// [`crate::mean_coverage`] (a plain number is [`MeanCoverage::level`]).
     pub fn new(
         layer: &FogLayer,

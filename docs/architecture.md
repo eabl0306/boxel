@@ -1129,8 +1129,9 @@ porque el mundo también es infinito hacia arriba y abajo. El juego cambia la fr
 o la apaga (`enabled: false`): el borde queda nítido, cortado en la misma esfera. No se dibujan
 los chunks enteros sin niebla porque el plano lejano es plano: lo que pasa de la distancia se
 vería a los costados de la pantalla y no al frente, y aparecería y desaparecería al girar. Las
-capas de `FogPlugin` con `FogFade::Scene` usan ese mismo rango; con la niebla apagada terminan de
-golpe, como el terreno.
+capas de `FogPlugin` con `FogFade::Scene` usan ese mismo rango. Una capa que termina antes (su
+`max_distance`) usa la misma regla en su propio final, así no corta en seco donde el terreno
+todavía se ve claro. Con la niebla apagada terminan de golpe, como el terreno.
 
 La niebla solo tapa el borde de lo mallado si la distancia de vista no pasa de donde el disco de
 chunks está completo (`ChunkViewer::mesh_reach`). El disco se mide en chunks (`dx² + dz² <= r²`),

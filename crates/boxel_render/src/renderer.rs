@@ -81,6 +81,10 @@ pub struct ViewParams {
     pub fog_start: f32,
     /// Distance where the terrain has the fog color.
     pub fog_end: f32,
+    /// The distance fog `fog_start` and `fog_end` come from. Fog layers faded like the scene
+    /// that end before `fog_end` take its rule at their own end
+    /// ([`crate::fog::frame_layers`]).
+    pub distance_fog: DistanceFog,
     /// Clear color of the main pass, the sky behind the terrain (linear RGBA).
     pub clear_color: [f32; 4],
     /// The scene light the baked corner light is multiplied by (sky color, ambient floor, AO
@@ -129,6 +133,7 @@ impl ViewParams {
             fog_color: sky_color,
             fog_start,
             fog_end,
+            distance_fog: fog,
             clear_color: sky_color,
             light: SceneLight::default(),
             fluid_time: 0.0,

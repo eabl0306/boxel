@@ -15,8 +15,9 @@
 //! - **Tiers:** every tier draws the scenes (flat clouds and volumetric clouds with edges from
 //!   below, just under them, inside and above, a camera inside a blanket and inside a soft bank,
 //!   an edged bank seen from its top's height, a noisy bank over the floor, with the terrain's
-//!   distance fog off too, fog over water, fog behind glass, dusk) like the best tier of its adapter, at half and full resolution (0.1 %
-//!   of the pixels, tolerance 2).
+//!   distance fog off too and drawn to 60 blocks in a view to 512 (it fades at its own end), fog
+//!   over water, fog behind glass, dusk) like the best tier of its adapter, at half and full
+//!   resolution (0.1 % of the pixels, tolerance 2).
 //! - **Origins:** the same camera with render origins a few blocks apart draws the same image,
 //!   with cubic and soft fog.
 //! - **Half resolution:** thin posts in front of dense fog look the same at half and full
@@ -279,10 +280,18 @@ fn world(registry: &BlockRegistry, kind: World) -> Vec<(I64Vec3, ChunkMesh)> {
 
 /// A camera at `eye` looking at `target`, for a `WIDTH x HEIGHT` target.
 fn look(eye: DVec3, target: DVec3) -> ViewParams {
+    look_to(eye, target, Camera::default().view_distance)
+}
+
+/// [`look`] with the view distance `view_distance`.
+fn look_to(eye: DVec3, target: DVec3, view_distance: f32) -> ViewParams {
     let d = (target - eye).as_vec3();
     let yaw = (-d.x).atan2(-d.z);
     let pitch = d.y.atan2(d.x.hypot(d.z));
-    let camera = Camera::default();
+    let camera = Camera {
+        view_distance,
+        ..Camera::default()
+    };
     let transform = Transform::from_yaw_pitch(eye, yaw, pitch);
     let view = CameraView::compute(&camera, &transform, WIDTH as f32 / HEIGHT as f32);
     ViewParams::from_camera(&view, &camera, DEFAULT_SKY_COLOR, DistanceFog::default())
@@ -291,7 +300,8 @@ fn look(eye: DVec3, target: DVec3) -> ViewParams {
 /// The view with the terrain's distance fog off: the terrain, and the layers faded like the
 /// scene (`FogFade::Scene`), end at the view distance at once.
 fn no_distance_fog(mut view: ViewParams) -> ViewParams {
-    [view.fog_start, view.fog_end] = DistanceFog::off().range(Camera::default().view_distance);
+    view.distance_fog = DistanceFog::off();
+    [view.fog_start, view.fog_end] = view.distance_fog.range(Camera::default().view_distance);
     view
 }
 
@@ -332,6 +342,14 @@ fn bank() -> FogLayer {
     l.density = 0.25;
     l.color = [0.9, 0.92, 1.0];
     l.wind = [1.0, 0.0, 0.5];
+    l
+}
+
+/// The bank drawn to 60 blocks only: in a view to 512 blocks (the terrain fades from 460.8) it
+/// fades out over its last 6 by the distance fog's rule instead of stopping in a hard line.
+fn short_bank() -> FogLayer {
+    let mut l = bank();
+    l.max_distance = 60.0;
     l
 }
 
@@ -492,6 +510,17 @@ fn shots() -> Vec<Shot> {
                 DVec3::new(16.0, 2.0, 16.0),
             )),
             vec![bank()],
+            true,
+        ),
+        shot(
+            "short_bank",
+            World::Floor,
+            look_to(
+                DVec3::new(-20.5, 22.0, -20.5),
+                DVec3::new(16.0, 2.0, 16.0),
+                512.0,
+            ),
+            vec![short_bank()],
             true,
         ),
         shot(
