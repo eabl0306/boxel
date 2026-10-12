@@ -274,9 +274,12 @@ profundidad ni z-fighting.
   `Prepare`). Los chunks publicados llegan más allá de la distancia de vista (la banda de
   conservación y las esquinas de la caja). Si no se dibujaran, quedaría un hueco donde el LOD se
   hizo a un lado.
-- La niebla del terreno va de `fade_start * H` a `H` (0,5 por defecto): el detalle completo y el
-  LOD se funden juntos con el cielo. `ViewParams` no cambia, así que las capas de `FogPlugin`
-  conservan su alcance.
+- La niebla de distancia del terreno usa la misma regla que sin LOD, medida sobre `H` en lugar
+  de la distancia de vista (`RenderSettings::distance_fog`, issue #51): solo el último 10 %, como
+  mucho 64 bloques. Con `far` va de 12.224 a 12.288 bloques. El detalle completo y el LOD se
+  funden juntos con el cielo. Con la niebla apagada el borde queda nítido, con o sin LOD.
+  `ViewParams` no cambia, así que las capas de `FogPlugin` conservan su alcance. Antes iba de la
+  mitad de `H` a `H` (`LodSettings::fade_start`, ya no existe).
 - En GL el LOD queda apagado (sin clip control la profundidad lejana pelea). `voxel_world` lo
   apaga en adaptadores de software, sea cual sea el radio. Si el renderer no puede dibujar el LOD
   (GL, el smoke falló o la pasada no se pudo crear), `extract_lod` lo avisa en
@@ -288,7 +291,8 @@ profundidad ni z-fighting.
 
 - `voxel_world --lod near|far|extreme`: F8 recorre far, extreme, oculto y near; F9 tiñe los
   niveles; F3 muestra una línea `lod` (horizonte, nodos, dibujados, draws, quads, trabajos,
-  llenado y rechazos).
+  llenado y rechazos). F10 prende y apaga la niebla de distancia, con o sin LOD.
+- `--no-distance-fog` (en `voxel_world`, `snapshot` y `stress`) arranca sin niebla de distancia.
 - `stress --lod PRESET`: el JSON trae `run.lod` y `run.lod_fill_s` (cuándo terminó el primer
   llenado), para separar los frames del llenado.
 - `snapshot --lod PRESET`: espera el llenado y lo dibuja; imprime una línea `lod:`.

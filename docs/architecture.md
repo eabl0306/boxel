@@ -1122,6 +1122,14 @@ del render arma con eso la `SceneLight` del frame; sin el plugin queda un mediod
 `RenderSettings::clear_color`. La luz de bloque no depende de la hora: una cueva cerrada se ve
 igual al mediodía y a medianoche (lo verifica `gpu_terrain`).
 
+La niebla de distancia (`RenderSettings::distance_fog`, issue #51) funde el terreno con el color
+del cielo solo al final, como Minecraft: el último 10 % de la distancia de vista, como mucho 64
+bloques. A 16 chunks va de 460,8 a 512 bloques; a 32, de 960 a 1024. Es esférica (distancia 3D),
+porque el mundo también es infinito hacia arriba y abajo. El juego cambia la fracción y el tope,
+o la apaga (`enabled: false`): el borde queda nítido. Las capas de `FogPlugin` con
+`FogFade::Scene` usan ese mismo rango; con la niebla apagada no se desvanecen y llegan a su
+`max_distance`.
+
 ### 10.8 Niebla y nubes cúbicas (ADR 0030)
 
 Opcionales: solo existen si el juego agrega `FogPlugin` (fuera de `DefaultPlugins`). Sin el plugin
@@ -1173,8 +1181,9 @@ los de antes, byte a byte.
   que miran a la cámara. Los faldones y las paredes de agua solo se dibujan donde hay una
   costura con otro nivel o con el detalle completo. Las mismas imágenes en los dos caminos. Con
   el LOD dibujando, el plano lejano del recorte de chunks y de la búsqueda de cuevas
-  pasa a `H` (los chunks publicados llegan más allá de la distancia de vista) y la niebla del
-  terreno va de `0,5 H` a `H`; las capas de `FogPlugin` conservan su alcance. Apagado en GL.
+  pasa a `H` (los chunks publicados llegan más allá de la distancia de vista) y la niebla de
+  distancia se mide sobre `H` con la misma regla (10.7); las capas de `FogPlugin` conservan su
+  alcance. Apagado en GL.
 - **Costo.** En la RTX 5050, `far` suma de 0,54 a 0,60 ms de GPU por frame y ningún frame de más
   de 6,94 ms; en el hilo principal casi nada (`render.lod` 0,007 ms de media). El terreno lejano
   se llena en 1,1 a 1,7 s. En la 780M, `near` cuesta unos 0,4 ms y `far` 1,1 ms. Detalle en

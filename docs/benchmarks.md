@@ -281,6 +281,9 @@ igual corridas con y sin niebla, así se puede comparar una contra otra; solo av
 Para medir el costo de la niebla con el mismo binario:
 `just perf-smoke --base HEAD "--new-extra='--fog both'" rtx/surface/r16/uncapped`.
 
+`--no-distance-fog` apaga la niebla de distancia del terreno (`RenderSettings::distance_fog`):
+el borde queda nítido. Cuesta lo mismo y el resumen no lo anota.
+
 `--lod near|far|extreme` agrega el terreno lejano (ADR 0031) con `LodPlugin`; sin la opción (o con
 `off`) el plugin no está y no cuesta nada. Los presets son los de `examples/shared/lod.rs`:
 `near` llega a 4.096 bloques, `far` a 12.288 y `extreme` a 49.152. El resumen anota el preset
