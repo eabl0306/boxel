@@ -61,16 +61,22 @@ impl UiRect {
     /// `K` side-by-side parts with `gap` pixels between them. The widths differ by at most one
     /// pixel and the first parts take the remainder, so the parts always fill the rectangle.
     pub fn split<const K: usize>(&self, gap: i32) -> [Self; K] {
-        let k = K as i32;
+        std::array::from_fn(|i| self.part(i, K, gap))
+    }
+
+    /// `n` side-by-side parts, as [`UiRect::split`] for a count known only at run time.
+    pub fn split_n(&self, n: usize, gap: i32) -> Vec<Self> {
+        (0..n).map(|i| self.part(i, n, gap)).collect()
+    }
+
+    /// Part `i` of `n` side-by-side parts with `gap` pixels between them.
+    fn part(&self, i: usize, n: usize, gap: i32) -> Self {
+        let k = n.max(1) as i32;
         let free = (self.w - gap * (k - 1)).max(0);
-        let (base, extra) = (free / k.max(1), free % k.max(1));
-        let mut x = self.x;
-        std::array::from_fn(|i| {
-            let w = base + i32::from((i as i32) < extra);
-            let part = Self::new(x, self.y, w, self.h);
-            x += w + gap;
-            part
-        })
+        let (base, extra) = (free / k, free % k);
+        let i = i as i32;
+        let x = self.x + i * (base + gap) + i.min(extra);
+        Self::new(x, self.y, base + i32::from(i < extra), self.h)
     }
 }
 
@@ -228,6 +234,9 @@ mod tests {
         assert_eq!(parts[2].right(), 11);
         let parts: [UiRect; 3] = UiRect::new(0, 0, 13, 1).split(1);
         assert_eq!(parts.map(|p| p.w), [4, 4, 3]);
+        assert_eq!(UiRect::new(0, 0, 13, 1).split_n(3, 1), parts);
+        assert_eq!(parts[1].x, 5);
+        assert!(UiRect::new(0, 0, 13, 1).split_n(0, 1).is_empty());
     }
 
     #[test]

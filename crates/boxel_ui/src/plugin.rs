@@ -7,12 +7,12 @@ use crate::nav::{InputCapture, NavInput, NavKey, resolve};
 use crate::paint::{UiDraw, UiLayer, compose};
 use crate::scale::GuiScale;
 use crate::skin::{UiSkin, UiStyle};
-use boxel_app::{App, Last, Plugin, PreUpdate};
+use boxel_app::{App, Last, Plugin, PreUpdate, Time};
 use boxel_ecs::prelude::*;
 use boxel_math::UVec2;
 use boxel_window::{
-    ButtonInput, ButtonState, CursorPosition, InputSystems, KeyCode, KeyboardInput, MouseButton,
-    WindowState,
+    AccumulatedMouseScroll, ButtonInput, ButtonState, CursorPosition, ImeEvent, ImeOptions,
+    InputSystems, KeyCode, KeyboardInput, MouseButton, TextInput, WindowState,
 };
 
 /// The UI's systems.
@@ -64,10 +64,14 @@ fn ui_begin(
     mut scale: ResMut<GuiScale>,
     mut capture: ResMut<InputCapture>,
     window: Option<Res<WindowState>>,
+    time: Option<Res<Time>>,
     cursor: Res<CursorPosition>,
     mouse: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
+    scroll: Res<AccumulatedMouseScroll>,
     mut keyboard: MessageReader<KeyboardInput>,
+    mut text: MessageReader<TextInput>,
+    mut ime: MessageReader<ImeEvent>,
 ) {
     let physical = window.map_or(UVec2::ZERO, |w| w.physical_size);
     let computed = scale.computed(physical);
@@ -77,16 +81,31 @@ fn ui_begin(
     }
 
     let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+    let ctrl = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
     let input = NavInput {
         cursor: cursor.0.map(|p| scale.to_gui(p)),
         press: mouse.just_pressed(MouseButton::Left),
         held: mouse.pressed(MouseButton::Left),
         shift,
+        ctrl,
         keys: keyboard
             .read()
             .filter(|e| e.state == ButtonState::Pressed)
-            .filter_map(|e| NavKey::from_key(e.key, shift).map(|k| (k, e.repeat)))
+            .filter_map(|e| NavKey::from_key(e.key, shift, ctrl).map(|k| (e.key, k, e.repeat)))
             .collect(),
+        wheel: scroll.delta.y,
+        text: text.read().cloned().collect(),
+        preedit: ime
+            .read()
+            .filter_map(|e| match e {
+                ImeEvent::Preedit { text, .. } => Some(text.clone()),
+                ImeEvent::Commit(_) => None,
+            })
+            .last(),
+        now: time.and_then(|t| {
+            t.last_update()
+                .map(|at| at.saturating_duration_since(t.startup()))
+        }),
     };
     capture.set_if_neq(resolve(&mut state, &input));
 
@@ -97,8 +116,31 @@ fn ui_begin(
     }
 }
 
-/// Composes the layers into [`UiDraw`] when something changed.
-fn ui_end(mut state: ResMut<UiState>, scale: Res<GuiScale>, mut draw: ResMut<UiDraw>) {
+/// Composes the layers into [`UiDraw`] when something changed, and turns the input method on
+/// while a text field has the focus.
+fn ui_end(
+    mut state: ResMut<UiState>,
+    scale: Res<GuiScale>,
+    mut draw: ResMut<UiDraw>,
+    ime: Option<ResMut<ImeOptions>>,
+) {
+    // Written only when the UI's wish changes, so a game that sets it otherwise between two
+    // changes is not overridden every frame.
+    if let Some(mut ime) = ime {
+        let typing = state
+            .memory
+            .focused
+            .and_then(|id| state.hit(id))
+            .is_some_and(|hit| hit.kind.takes_text());
+        let wanted = ImeOptions {
+            allowed: typing,
+            cursor_area: state.memory.ime_area.filter(|_| typing),
+        };
+        if state.memory.ime_written != Some(wanted) {
+            ime.set_if_neq(wanted);
+            state.bypass_change_detection().memory.ime_written = Some(wanted);
+        }
+    }
     let target = scale.physical_size();
     if !state.dirty && draw.target_size() == target {
         return;

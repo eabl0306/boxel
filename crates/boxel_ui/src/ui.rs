@@ -38,8 +38,11 @@ pub struct Response {
     pub hovered: bool,
     /// Has keyboard focus.
     pub focused: bool,
-    /// Two clicks in a short time (lists, later).
+    /// A list's row was pressed twice within [`crate::DOUBLE_CLICK`], or Enter or Space opened
+    /// the selected row.
     pub double_clicked: bool,
+    /// Enter in a focused text field.
+    pub submitted: bool,
 }
 
 /// The UI for a system: `fn menu(mut ui: Ui)`, then [`Ui::layer`] to draw.
@@ -74,6 +77,7 @@ impl<'w> Ui<'w> {
             next_enabled: true,
             next_id: None,
             scopes: Vec::new(),
+            rows: Vec::new(),
         }
     }
 
@@ -104,9 +108,11 @@ pub struct Painter<'a> {
     pub(crate) scale: &'a GuiScale,
     pub(crate) layer: UiLayer,
     clip: Option<UiRect>,
-    next_enabled: bool,
-    next_id: Option<WidgetId>,
-    scopes: Vec<WidgetId>,
+    pub(crate) next_enabled: bool,
+    pub(crate) next_id: Option<WidgetId>,
+    pub(crate) scopes: Vec<WidgetId>,
+    /// The lists and rows being drawn, innermost last.
+    pub(crate) rows: Vec<(WidgetId, usize)>,
 }
 
 /// What a widget returns: its [`Response`] (fields read through it, as in
@@ -151,6 +157,7 @@ impl Resp<'_, '_> {
 /// The input a widget sees this frame.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Interaction {
+    pub id: WidgetId,
     pub enabled: bool,
     pub hovered: bool,
     pub focused: bool,
@@ -162,6 +169,8 @@ pub(crate) struct Interaction {
     pub activated: bool,
     /// Left and Right steps pressed while it had the focus this frame.
     pub nudge: i32,
+    /// Up and Down steps, for widgets that take them.
+    pub nudge_y: i32,
     pub shift: bool,
     pub cursor: Option<IVec2>,
 }
@@ -297,10 +306,7 @@ impl<'a> Painter<'a> {
         let line = text::ellipsis(self.font, text, rect.w.max(0) as u32, size);
         let y = rect.y + (rect.h - (crate::font::GLYPH_HEIGHT * size) as i32) / 2;
         self.text(rect.x, y, &line, style);
-        let shown = self.clipped(rect);
-        let mem = &self.state.memory;
-        let reachable = mem.modal.is_none_or(|m| self.layer >= m);
-        let hovered = reachable && mem.cursor.is_some_and(|c| shown.contains(c));
+        let hovered = self.pointer_over(rect);
         Resp {
             painter: self,
             response: Response {
@@ -328,10 +334,13 @@ impl<'a> Painter<'a> {
         let id = self.state.unique_id(self.layer, base);
         // The part that shows: a widget's hidden part must not take input from what is drawn
         // there (a scrolled row over a header).
+        let full = rect;
         let rect = self.clipped(rect);
         self.state.layers[self.layer.index()].hits.push(Hit {
             id,
             rect,
+            full,
+            row: self.rows.last().copied(),
             enabled,
             kind,
             label: label.to_owned(),
@@ -340,21 +349,38 @@ impl<'a> Painter<'a> {
         let mem = &self.state.memory;
         let hovered = mem.hovered == Some((self.layer, id));
         let focused = enabled && mem.focused == Some(id);
+        let steps = |list: &[(WidgetId, i32)]| {
+            list.iter()
+                .find(|&&(stepped, _)| enabled && stepped == id)
+                .map_or(0, |&(_, n)| n)
+        };
         Interaction {
+            id,
             enabled,
             hovered,
             focused,
             pressed: enabled && mem.pressed == Some(id),
             dragging: enabled && mem.dragging == Some(id),
             activated: enabled && mem.activated == Some(id),
-            nudge: mem
-                .nudge
-                .iter()
-                .find(|&&(nudged, _)| enabled && nudged == id)
-                .map_or(0, |&(_, n)| n),
+            nudge: steps(&mem.nudge),
+            nudge_y: steps(&mem.nudge_y),
             shift: mem.shift,
             cursor: mem.cursor,
         }
+    }
+
+    /// Whether the cursor is over the part of `rect` that shows, on a layer that gets the
+    /// pointer (whatever widget is under it).
+    pub(crate) fn pointer_over(&self, rect: UiRect) -> bool {
+        let shown = self.clipped(rect);
+        let mem = &self.state.memory;
+        let reachable = mem.modal.is_none_or(|m| self.layer >= m);
+        reachable && mem.cursor.is_some_and(|c| shown.contains(c))
+    }
+
+    /// Real time of this frame, if the app has a `Time` resource.
+    pub(crate) fn now(&self) -> Option<std::time::Duration> {
+        self.state.memory.now
     }
 
     /// The part of `rect` the clip leaves (empty when it is cut away).

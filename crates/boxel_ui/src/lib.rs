@@ -57,12 +57,12 @@ pub use skin::{SkinSlot, UiSkin, UiStyle};
 pub use sprite::{Piece, Scaling, Sprite, pieces};
 pub use text::Text;
 pub use ui::{Modal, Painter, Resp, Response, Ui};
-pub use widgets::Steps;
+pub use widgets::{CARET_BLINK, DOUBLE_CLICK, ListRow, SCROLLBAR_GAP, SCROLLBAR_WIDTH, Steps};
 
 /// Common UI items (re-exported by `boxel::prelude` with the `ui` feature).
 pub mod prelude {
     pub use crate::{
-        Column, Grid2, GuiScale, GuiScaleSetting, InputCapture, Modal, Steps, Text, Ui, UiLayer,
-        UiPlugin, UiRect, UiSystems,
+        Column, Grid2, GuiScale, GuiScaleSetting, InputCapture, ListRow, Modal, Steps, Text, Ui,
+        UiLayer, UiPlugin, UiRect, UiSystems,
     };
 }

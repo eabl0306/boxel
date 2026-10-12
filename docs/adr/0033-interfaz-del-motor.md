@@ -1,7 +1,8 @@
 # ADR 0033: la interfaz del motor (`boxel_ui`)
 
 - Estado: aceptado. El dueño eligió la interfaz propia el 2026-10-12 (issue #39, plan de menús).
-  Primera parte, el crate (E-UI1), y segunda, el pase de GPU (E-UI2, sección 6).
+  Partes: el crate (E-UI1), el pase de GPU (E-UI2, sección 6), texto e IME (E-UI4, sección 7) y
+  lista, campo de texto y pestañas (E-UI3, sección 8).
 - Fecha: 2026-10-12
 
 ## Contexto
@@ -114,13 +115,35 @@ el pase (E-UI2) y llega antes de los menús, así que no hay puente.
   vuelve en el mismo frame, vale la posición con la que winit avisa la vuelta, así que un clic
   en ese frame no se pierde.
 
+### 8. Lista, campo de texto y pestañas (E-UI3)
+
+- `list` es la lista de mundos de Minecraft: filas de alto fijo, selección, rueda (media fila por
+  línea), barra de desplazamiento que se arrastra y doble clic (dos clics en la misma fila en
+  menos de 250 ms de tiempo real). Con foco, arriba y abajo mueven la selección y Enter la abre.
+  `scroll_list` es lo mismo sin selección, para páginas de opciones con widgets en las filas.
+- La lista llama a la función de fila solo para las filas que se ven, una más de cada lado y la
+  del widget con foco. El costo no crece con el largo de la lista y Tab igual llega a las filas de
+  afuera: la lista se mueve para mostrar el widget que enfoca el teclado.
+- `text_field` lee `TextInput`, así que escribe acentos, ñ y lo que confirma un IME, que se ve
+  subrayado en el cursor mientras se compone. Tiene cursor, selección con Shift, con el mouse y
+  arrastrando, Ctrl para saltar palabras, Ctrl+A, un máximo de caracteres y un texto de ayuda
+  cuando está vacío. Enter da `submitted`. La interfaz prende el IME solo mientras un campo
+  tiene el foco.
+- Las teclas de navegación llegan por `KeyboardInput` y el texto por `TextInput`, dos colas
+  separadas. La interfaz las alinea contando las teclas que van en las dos (Tab, flechas y
+  Enter): "ab", Tab y "12" en un mismo frame terminan en los dos campos correctos.
+- `tabs`: una pestaña por etiqueta, cada una con su foco. Izquierda y derecha abren la vecina;
+  Ctrl+Tab y Ctrl+Shift+Tab recorren las de la capa modal.
+- El tiempo real sale de `Time`: el doble clic y el parpadeo del cursor (cada 300 ms). `UiTester`
+  mueve su propio reloj, así los tests son exactos.
+- Todavía sin portapapeles: necesita una dependencia nueva y el visto bueno del dueño.
+
 ## Consecuencias
 
 - `boxel_window` suma `CursorPosition`: la última posición del cursor en píxeles físicos.
 - La lista de pintura y la entrada funcionan sin ventana, y `UiTester` hace clic por etiqueta en
   los tests. Con `render` y la feature `ui`, la interfaz se ve en pantalla.
-- Lo que sigue: E-UI3 (lista, campo de texto y pestañas) y E-UI5 (sprites y fuentes de los
-  packs).
+- Lo que sigue: E-UI5 (sprites y fuentes de los packs).
 - Las capas `Screen` y `Popup` se vacían en cada frame que nadie las dibuja, así que una pantalla
   cerrada desaparece sola. El HUD se vacía cuando cambia la escala o el tamaño de la ventana: el
   juego lo redibuja con `resource_changed::<GuiScale>`.

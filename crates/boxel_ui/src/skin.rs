@@ -260,6 +260,22 @@ pub struct UiStyle {
     pub off: String,
     /// Between a cycle's or a slider's label and its value (`"Label: value"`).
     pub separator: String,
+    /// The outline of a list's selected row while the list has the focus.
+    pub selection: Rgba,
+    /// The outline of a list's selected row otherwise.
+    pub selection_unfocused: Rgba,
+    /// Inside a list's selected row.
+    pub selection_fill: Rgba,
+    /// Text in a text field.
+    pub field_text: Rgba,
+    /// Text in a disabled text field.
+    pub field_text_disabled: Rgba,
+    /// A text field's hint, shown while it is empty.
+    pub field_hint: Rgba,
+    /// Behind the selected part of a text field's text.
+    pub field_selection: Rgba,
+    /// A text field's caret.
+    pub caret: Rgba,
 }
 
 impl Default for UiStyle {
@@ -274,6 +290,14 @@ impl Default for UiStyle {
             on: "On".to_owned(),
             off: "Off".to_owned(),
             separator: ": ".to_owned(),
+            selection: rgb(0xFFFFFF),
+            selection_unfocused: rgb(0x808080),
+            selection_fill: rgb(0x000000),
+            field_text: rgb(0xE0E0E0),
+            field_text_disabled: rgb(0x707070),
+            field_hint: rgb(0x808080),
+            field_selection: rgb(0x3355BB),
+            caret: rgb(0xD0D0D0),
         }
     }
 }

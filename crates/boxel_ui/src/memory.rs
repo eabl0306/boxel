@@ -5,8 +5,10 @@ use crate::layout::UiRect;
 use crate::paint::{UiLayer, UiQuad};
 use boxel_ecs::prelude::*;
 use boxel_math::IVec2;
+use boxel_window::{ImeCursorArea, ImeOptions, TextInput};
 use std::any::Any;
 use std::collections::HashMap;
+use std::time::Duration;
 
 /// A widget's identity: a hash of its layer, the id scopes around it and its label (or an
 /// explicit id), plus how many widgets with the same hash came before it in the frame. Stable
@@ -35,17 +37,42 @@ pub enum WidgetKind {
     Cycle,
     /// A value along a track; Left and Right step it.
     Slider,
+    /// A scrolling list; Up and Down move its selection.
+    List,
+    /// A scrolling list without a selection (its rows hold widgets): it takes the wheel, not
+    /// the focus.
+    ScrollList,
+    /// A text field; it takes typed text, and Space, Left, Right and Enter edit it.
+    TextField,
+    /// One tab of a tab bar; Left and Right select the tab next to it.
+    Tab,
 }
 
 impl WidgetKind {
     /// Whether Tab and the arrows can focus it.
     pub const fn focusable(self) -> bool {
-        true
+        !matches!(self, Self::ScrollList)
+    }
+
+    /// Whether the wheel scrolls it.
+    pub const fn scrolls(self) -> bool {
+        matches!(self, Self::List | Self::ScrollList)
     }
 
     /// Whether Left and Right change its value (else they move the focus).
     pub const fn adjustable(self) -> bool {
-        matches!(self, Self::Cycle | Self::Slider)
+        matches!(self, Self::Cycle | Self::Slider | Self::Tab)
+    }
+
+    /// Whether Up and Down change its value (else they move the focus).
+    pub const fn vertical(self) -> bool {
+        matches!(self, Self::List)
+    }
+
+    /// Whether it takes typed text: while it has the focus, Space, Left, Right and Enter are
+    /// its own (Tab, Up and Down still move the focus).
+    pub const fn takes_text(self) -> bool {
+        matches!(self, Self::TextField)
     }
 }
 
@@ -56,8 +83,14 @@ pub struct Hit {
     /// The widget.
     pub id: WidgetId,
     /// Where it takes the pointer, in GUI pixels: its rectangle cut to the clip it was declared
-    /// in (empty when cut away, and then it cannot take the focus either).
+    /// in (empty when cut away, and then it cannot take the focus either, unless a list's row
+    /// declared it).
     pub rect: UiRect,
+    /// Its whole rectangle, before the clip.
+    pub full: UiRect,
+    /// The list and the row that declared it. Scrolled out of view, it can still take the
+    /// keyboard focus, and the list then scrolls to show it.
+    pub row: Option<(WidgetId, usize)>,
     /// Disabled widgets get hover (for tooltips) but no clicks or focus.
     pub enabled: bool,
     /// Its kind.
@@ -113,8 +146,34 @@ pub(crate) struct Memory {
     /// Left (-1) and Right (+1) steps this frame, summed per widget: the focus can move
     /// between two presses of one frame, and each step stays with the widget it was meant for.
     pub nudge: Vec<(WidgetId, i32)>,
+    /// Up (-1) and Down (+1) steps for lists, as `nudge`.
+    pub nudge_y: Vec<(WidgetId, i32)>,
+    /// The wheel this frame (lines, positive up) and the list it scrolls: the last-declared
+    /// enabled list under the cursor.
+    pub wheel: Option<(WidgetId, f32)>,
+    /// Ctrl+Tab (+1) and Ctrl+Shift+Tab (-1) presses, for the first tab bar of the modal layer.
+    pub tab_step: i32,
+    /// The keyboard moved the focus this frame to a list's row widget: that list and the
+    /// widget's whole rectangle in the previous frame, so the list scrolls to show it.
+    pub reveal: Option<(WidgetId, UiRect)>,
+    /// The list and row of the focused widget, which the list declares even out of view.
+    pub focused_row: Option<(WidgetId, usize)>,
+    /// Typed text and editing keys of this frame, each with the text field that had the focus
+    /// when it was typed.
+    pub text: Vec<(WidgetId, TextInput)>,
+    /// The input method's composition, shown at the focused text field's caret.
+    pub preedit: String,
+    /// Where the focused text field drew its caret this frame, for the input method.
+    pub ime_area: Option<ImeCursorArea>,
+    /// What the UI last wrote into `ImeOptions`.
+    pub ime_written: Option<ImeOptions>,
+    /// Real time of this frame (from `Time`), for double clicks and the caret's blink; `None`
+    /// without a `Time` resource.
+    pub now: Option<Duration>,
     /// Shift was held.
     pub shift: bool,
+    /// Ctrl was held.
+    pub ctrl: bool,
     /// Per-widget data.
     pub data: HashMap<WidgetId, Box<dyn Any + Send + Sync>>,
 }
