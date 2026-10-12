@@ -667,12 +667,35 @@ fn color_code(v: f32, max: f32) -> u32 {
   return u32(floor(sqrt(clamp(v, 0.0, 1.0)) * max + 0.5));
 }
 
+// The ring [a, b] (view depth) of a layer whose every cell is full
+// (boxel_fog::march::full_ring_span): UNIFORM_PIECES pieces, each blending a full cell and the
+// body's shade into the haze and 1 by its middle, as a cell of the ring does.
+fn full_ring(li: u32, a: f32, b: f32, shade: f32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32,
+             st: ptr<function, March>) {
+  let density = fog.layers[li].fade.z;
+  let haze = fog.layers[li].grid.w;
+  let piece = (b - a) / f32(UNIFORM_PIECES);
+  for (var i = 0u; i < UNIFORM_PIECES; i++) {
+    let pa = a + f32(i) * piece;
+    let pb = select(pa + piece, b, i + 1u == UNIFORM_PIECES);
+    let mid = 0.5 * (pa + pb);
+    let w = blend_weight(li, mid * dir_len);
+    let h = haze * haze_at(li, eye.y + mid * dir.y);
+    let sigma = density + (h - density) * w;
+    let sh = shade + (1.0 - shade) * w;
+    if (sigma > 0.0) {
+      integrate(st, pa, pb, sigma * dir_len, segment_color(li, pa, pb, sh, eye.y, dir.y, dir_len));
+      if ((*st).done) { return; }
+    }
+  }
+}
+
 // One layer of a ray (boxel_fog::march's layer loop): its chord, the walk of its cells up to
 // where they end and their fog, then its haze. Each iteration of the walk takes one segment in
 // pieces: a cell (one piece, or about one per block in the soft fog), the rest of the chord (a
-// layer whose every cell is full), or none when it crosses an empty lattice step; past the step
-// budget the rest of the cells go through the profile. Every piece of the walk goes through one
-// `integrate`, which keeps the code small.
+// layer whose every cell is full, up to its ring), or none when it crosses an empty lattice step;
+// past the step budget the rest of the cells go through the profile. Every piece of the walk goes
+// through one `integrate`, which keeps the code small.
 fn march_layer(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, up: bool, t_end: f32,
                max_steps: u32, st: ptr<function, March>) {
   let ch = chord(li, eye, dir, dir_len, t_end);
@@ -717,6 +740,8 @@ fn march_layer(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, up: bool, 
     entry = face_shade(li, 1u, select(-1, 1, up));
   }
   var prev_full = false;
+  // Where the ring of a layer whose every cell is full starts (FAR: none).
+  var ring_from = FAR;
   // The ray's step count, in a local while the layer is walked: counted through the pointer,
   // lavapipe (Mesa 26.0) never left this loop once a lattice step had been skipped.
   var steps = (*st).steps;
@@ -740,13 +765,20 @@ fn march_layer(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, up: bool, 
       haze_span(li, s0, tc, 1.0, eye, dir, dir_len, st);
       break;
     } else if ((flags & LAYER_UNIFORM) != 0u) {
-      // Every cell full: one body, no inner faces, one step.
+      // Every cell full: one body, no inner faces, one step. With a ring the body ends where it
+      // starts, and the rest of the cells blends into the haze after it.
       steps += 1u;
       rest = true;
       rest_sigma = density;
       shade = entry;
       b = tc;
-      pieces = UNIFORM_PIECES;
+      if (ring) {
+        b = clamp(t_blend, s0, tc);
+        if (b < tc) {
+          ring_from = b;
+        }
+      }
+      pieces = select(0u, UNIFORM_PIECES, b > s0);
       last = true;
     } else {
       steps += 1u;
@@ -856,6 +888,9 @@ fn march_layer(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, up: bool, 
     }
   }
   (*st).steps = steps;
+  if (!(*st).done && ring_from < tc) {
+    full_ring(li, ring_from, tc, shade, eye, dir, dir_len, st);
+  }
   if (!(*st).done && tb > t_cells) {
     haze_span(li, max(ta, t_cells), tb, haze, eye, dir, dir_len, st);
   }

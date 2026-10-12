@@ -37,7 +37,8 @@
 //!   threshold of its rows ([`noise::step_bound`]) is crossed in one step (never in the soft fog,
 //!   which reads points outside the step, nor into the blend before the haze, where an empty
 //!   cell still takes haze), and a layer whose every cell is full ([`MarchLayer::uniform`]) is
-//!   taken in one step without walking its cells.
+//!   taken in one step without walking its cells (its blend before the haze in pieces that
+//!   blend as cells do).
 
 use crate::config::{FogFade, FogLayer, MAX_FOG_DISTANCE};
 use crate::layer::{FogTime, HAZE_KNOTS, HazeProfile, LayerParams};
@@ -47,8 +48,8 @@ use crate::noise;
 pub const EXIT_TAU_LOG2: f32 = 8.66;
 /// The march treats direction components smaller than this as this (no division by zero).
 pub const MIN_DIR: f32 = 1e-30;
-/// Pieces of a chord through a layer whose every cell is full ([`MarchLayer::uniform`]): each
-/// one fades by its own middle.
+/// Pieces of a chord through a layer whose every cell is full ([`MarchLayer::uniform`]), and as
+/// many for its blend before the haze: each one fades (and blends) by its own middle.
 pub const UNIFORM_PIECES: u32 = 8;
 /// The soft fog blends into the cells from the soft distance to this much farther (a fraction
 /// of the soft distance).
@@ -613,8 +614,9 @@ pub fn march(ray: &Ray, layers: &[MarchLayer], sky: [f32; 3], max_steps: u32) ->
 
 /// One layer's chord `[ta, tb]` of a ray (the shader's `march_layer`, segment for segment): the
 /// cell walk up to where the cells end, or the rest of the chord in [`UNIFORM_PIECES`] pieces
-/// for a layer whose every cell is full; past the step budget the rest of the cells through the
-/// profile; then the haze past the cells. Each iteration of the walk takes one segment in
+/// for a layer whose every cell is full (up to its ring, then the ring through
+/// [`full_ring_span`]); past the step budget the rest of the cells through the profile; then the
+/// haze past the cells. Each iteration of the walk takes one segment in
 /// pieces: a cell (one piece, or about one per block in the soft fog) or the rest of the chord.
 fn march_layer(
     s: &mut State,
@@ -654,6 +656,8 @@ fn march_layer(
         1.0
     };
     let mut prev_full = false;
+    // Where the ring of a layer whose every cell is full starts (it blends after its body).
+    let mut full_ring = None;
     loop {
         let (a, b, pieces, last);
         // The extinction of the rest of the chord, or the cell's coverage.
@@ -669,9 +673,15 @@ fn march_layer(
             haze_span(s, layer, eye, dir, s0, tc, 1.0, sky);
             break;
         } else if layer.uniform {
-            // One body without inner faces: one step.
+            // One body without inner faces: one step. With a ring the body ends where it
+            // starts, and the rest of the cells blends into the haze after it.
             s.steps += 1;
-            (a, b, pieces, last) = (s0, tc, UNIFORM_PIECES, true);
+            let tm = if ring { t_blend.max(s0).min(tc) } else { tc };
+            if tm < tc {
+                full_ring = Some(tm);
+            }
+            let pieces_body = if tm > s0 { UNIFORM_PIECES } else { 0 };
+            (a, b, pieces, last) = (s0, tm, pieces_body, true);
             rest = Some(p.density_log2e);
             shade = entry;
         } else {
@@ -767,8 +777,54 @@ fn march_layer(
             break;
         }
     }
+    if let Some(tm) = full_ring {
+        full_ring_span(s, layer, eye, dir, tm, tc, shade, sky);
+    }
     if !s.done && tb > t_cells {
         haze_span(s, layer, eye, dir, ta.max(t_cells), tb, layer.haze, sky);
+    }
+}
+
+/// The ring `[a, b]` (view depth) of a layer whose every cell is full (the shader's
+/// `full_ring`): [`UNIFORM_PIECES`] pieces, each blending a full cell and the body's `shade` into
+/// the haze and 1 by its middle, as a cell of the ring does, so at the end of the cells the layer
+/// is its haze.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shader's arguments, one call each"
+)]
+fn full_ring_span(
+    s: &mut State,
+    layer: &MarchLayer,
+    eye: [f32; 3],
+    dir: [f32; 3],
+    a: f32,
+    b: f32,
+    shade: f32,
+    sky: [f32; 3],
+) {
+    let dir_len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+    let density = layer.params.density_log2e;
+    let piece = (b - a) / UNIFORM_PIECES as f32;
+    for i in 0..UNIFORM_PIECES {
+        let pa = a + i as f32 * piece;
+        let pb = if i + 1 == UNIFORM_PIECES {
+            b
+        } else {
+            pa + piece
+        };
+        let mid = 0.5 * (pa + pb);
+        let w = layer.blend_weight(mid * dir_len);
+        let haze = layer.haze * layer.haze_at(eye[1] + mid * dir[1]);
+        let sigma = density + (haze - density) * w;
+        let sh = shade + (1.0 - shade) * w;
+        if sigma > 0.0 {
+            let col = layer.color_at(mid, sh, eye[1], dir[1], dir_len, sky);
+            s.segment(pa, pb, sigma * dir_len, col);
+            if s.done {
+                return;
+            }
+        }
     }
 }
 
@@ -1773,6 +1829,109 @@ mod tests {
             worst_no_ring > 0.2 * d,
             "{worst_no_ring} of {d}: the test bites"
         );
+    }
+
+    /// A layer whose every cell is full blends into its haze too: across the end of its cells
+    /// its extinction meets a haze of half its density, and a slab seen through a shaded face
+    /// takes the haze's shade (1) there, not a step from the face's.
+    #[test]
+    fn a_full_layer_blends_into_its_haze_too() {
+        let mut layer = slab(0, 24, [2, 2, 2], 0.03);
+        layer.face_shade = [1.0, 0.5, 0.8, 0.65];
+        layer.color = [1.0; 3];
+        layer.max_distance = 64.0;
+        layer.haze = 0.5;
+        layer.fade = FogFade::Range {
+            start: 1500.0,
+            end: 2000.0,
+        };
+        let ml = hazy(&layer);
+        assert!(ml.uniform);
+        assert_eq!(
+            (ml.cells_end, ml.blend_start, ml.reach),
+            (64.0, 48.0, 2000.0)
+        );
+        let no_ring = MarchLayer {
+            blend_start: ml.cells_end,
+            ..ml
+        };
+        let d = ml.params.density_log2e;
+        // Extinction per block and color per unit opacity across the end, and the haze's there:
+        // level rays inside the band (shade 1) and rays rising into it from below (through the
+        // bottom faces, shade 0.5).
+        let across = |m: &MarchLayer, i: u32| -> (f32, f32, f32) {
+            let a = i as f32 * 0.091;
+            let below = i % 2 == 1;
+            let eye = if below {
+                [0.3 + i as f32, -2.0, 0.7]
+            } else {
+                [0.3 + i as f32, 12.0 + (i % 5) as f32, 0.7]
+            };
+            let rise = if below { 0.06 } else { 0.0 };
+            let dir = norm([a.sin(), rise, a.cos()]);
+            let (near, far) = (63.75, 64.25);
+            let r = march(
+                &Ray {
+                    eye,
+                    dir,
+                    depths: [near, far, far, far],
+                },
+                std::slice::from_ref(m),
+                [0.0; 3],
+                256,
+            );
+            assert_eq!(r.steps, 1, "{i}: one step");
+            assert!(r.transmittance[1] > 0.05, "{i}: thin enough to see the end");
+            let sigma = (r.transmittance[0] / r.transmittance[1]).log2() / (far - near);
+            let shade = (r.color[1][0] - r.color[0][0]) / (r.transmittance[0] - r.transmittance[1]);
+            (sigma, m.haze * m.haze_at(eye[1] + 64.0 * dir[1]), shade)
+        };
+        let (mut worst, mut worst_shade) = (0.0f32, 0.0f32);
+        let (mut worst_no_ring, mut worst_shade_no_ring) = (0.0f32, 0.0f32);
+        for i in 0..64 {
+            let (sigma, haze, shade) = across(&ml, i);
+            assert!((haze - 0.5 * d).abs() < 1e-6 * d, "{i}: {haze}");
+            worst = worst.max((sigma - haze).abs());
+            worst_shade = worst_shade.max((shade - 1.0).abs());
+            let (sigma, haze, shade) = across(&no_ring, i);
+            worst_no_ring = worst_no_ring.max((sigma - haze).abs());
+            worst_shade_no_ring = worst_shade_no_ring.max((shade - 1.0).abs());
+        }
+        assert!(worst < 0.05 * d, "{worst} of {d}");
+        assert!(worst_shade < 0.02, "shade {worst_shade}");
+        assert!(
+            worst_no_ring > 0.2 * d && worst_shade_no_ring > 0.2,
+            "{worst_no_ring} of {d}, shade {worst_shade_no_ring}: the test bites"
+        );
+        // Up to just past the end, the layer taken whole draws about what a walk of its cells
+        // does (each cell of the ring blended by its middle), from inside the band and from a
+        // ray that enters it in the ring (no body).
+        for (eye, dir) in [
+            ([0.3, 12.0, 0.7], [0.0, 0.0, 1.0]),
+            ([0.3, 40.0, 0.7], norm([0.0, -0.3, 1.0])),
+        ] {
+            let ray = Ray {
+                eye,
+                dir,
+                depths: [64.25; 4],
+            };
+            let whole = march(&ray, &[ml], [0.0; 3], 256);
+            let walked = march(
+                &ray,
+                &[MarchLayer {
+                    uniform: false,
+                    ..ml
+                }],
+                [0.0; 3],
+                256,
+            );
+            assert!(
+                (whole.transmittance[0] - walked.transmittance[0]).abs() < 2e-3
+                    && (whole.color[0][0] - walked.color[0][0]).abs() < 2e-3,
+                "{eye:?}: {whole:?} vs {walked:?}"
+            );
+            assert!(whole.transmittance[0] < 0.995, "{eye:?}: some fog");
+        }
     }
 
     /// The skip of empty lattice steps never jumps into the ring: there an empty cell still

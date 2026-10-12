@@ -425,6 +425,23 @@ fn hazy_scene_bank() -> FogLayer {
     l
 }
 
+/// A slab whose every cell is full (the march takes it whole) over 20..24, shaded by the face
+/// it is seen through, its cells ending at 64 blocks and going on as a haze of half its density
+/// to 4 km: its body blends into the haze from 48 blocks, in view from below and above.
+fn hazy_slab() -> FogLayer {
+    let mut l = FogLayer::new(20, 24);
+    l.cell = [2, 2, 2];
+    l.density = 0.06;
+    l.face_shade = [1.0, 0.5, 0.8, 0.65];
+    l.max_distance = 64.0;
+    l.haze = 0.5;
+    l.fade = FogFade::Range {
+        start: 2048.0,
+        end: 4096.0,
+    };
+    l
+}
+
 /// Big cumulus: 16-block cells over 64..176 with a rise and deep edges, soft within 32 blocks,
 /// cells to 1024 blocks and haze from there to 4 km.
 fn cumulus16() -> FogLayer {
@@ -631,6 +648,20 @@ fn shots() -> Vec<Shot> {
                 true,
             )
         },
+        shot(
+            "haze_full_below",
+            World::Floor,
+            look_angles(DVec3::new(0.5, 10.0, 0.5), 25.0, 10.0),
+            vec![hazy_slab()],
+            true,
+        ),
+        shot(
+            "haze_full_above",
+            World::Floor,
+            look_angles(DVec3::new(-5.5, 40.0, -9.5), 40.0, -15.0),
+            vec![hazy_slab()],
+            true,
+        ),
         shot(
             "cumulus16_below_5",
             World::Floor,

@@ -65,6 +65,10 @@ tramo largo y lejano emite casi todo en su frente. Para una extinción constante
   (`FAR_BLEND`), como la niebla suave se funde con las celdas cerca de la cámara. Al fin de las
   celdas, una celda vale lo mismo que la bruma. El salto de tramos vacíos nunca entra en ese
   anillo: ahí una celda vacía también lleva bruma.
+- Una capa con todas las celdas llenas, que la marcha toma entera sin recorrer celdas, también se
+  funde: su cuerpo termina donde empieza el anillo y el anillo va en 8 trozos que se funden como
+  celdas (densidad y sombra de cara). Sin eso quedaba un círculo donde terminan sus celdas si su
+  bruma es menor que 1 o si sombrea por caras.
 - Un rayo que empieza pasado el fin de las celdas no recorre ninguna: solo bruma, sin pasos.
 - Pasado el presupuesto de pasos, el resto de las celdas usa el mismo perfil (antes, 8 trozos de
   la media con `MeanCoverage`, que ya no existe). Cambia un poco la imagen de los rayos que
@@ -160,11 +164,12 @@ LOD (768 bloques sin LOD, donde terminan las nubes de hoy):
 - `boxel_fog`: rangos de `haze` y del límite en celdas; el perfil (filas que cubre, sin borde,
   subida, determinista); la bruma contra una integral fina (error relativo menor que 1e-3 en
   rayos empinados, rasantes y horizontales); profundidades de píxel dentro de un tramo; la
-  costura continua; ningún salto dentro del anillo; rayos solo de bruma sin pasos; una capa sin
+  costura continua, también en una capa llena; ningún salto dentro del anillo; rayos solo de bruma sin pasos; una capa sin
   bruma da bit a bit lo de antes (hash fijo tomado en 0bd2849).
 - `boxel_render`: el desvanecido de una capa `Scene` con bruma con y sin LOD; escenas nuevas de
-  referencia en los tres tiers (bruma lejana, bruma `Scene`, presupuesto agotado, una capa de
-  cubos de 16 desde abajo, desde adentro y desde arriba); el ruido contra el oráculo cerca de
+  referencia en los tres tiers (bruma lejana, bruma `Scene`, presupuesto agotado, una capa llena
+  con bruma a la mitad y sombra de caras desde abajo y desde arriba, una capa de cubos de 16 desde
+  abajo, desde adentro y desde arriba); el ruido contra el oráculo cerca de
   ±4096 celdas; `gpu_lod` comprueba que el valle con bruma llega al horizonte del LOD.
 - `boxel_demo`: presets válidos, suaves, sin planos y sin saltos por tick; las nubes densas; la
   tabla de pasos (abajo) con techos fijos.
