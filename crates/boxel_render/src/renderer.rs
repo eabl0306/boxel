@@ -77,8 +77,7 @@ pub struct ViewParams {
     pub eye_rel: Vec3,
     /// Fog color (linear RGBA).
     pub fog_color: [f32; 4],
-    /// Distance where the terrain starts to fade into the fog color ([`DistanceFog::range`];
-    /// [`crate::NO_FOG`] for none).
+    /// Distance where the terrain starts to fade into the fog color ([`DistanceFog::range`]).
     pub fog_start: f32,
     /// Distance where the terrain has the fog color.
     pub fog_end: f32,

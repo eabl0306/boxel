@@ -24,11 +24,12 @@
 //!   behind it (hidden), compared with the front slab alone (depth precision on every backend,
 //!   including GL where reverse-Z loses its precision gain); with the distance fog's band over
 //!   the front slab it fades toward the sky, and with the fog off it is the same as far from the
-//!   band (finite numbers on every tier);
+//!   band;
 //! - a floor of chunks in the disc a streaming viewer of radius 4 meshes, seen from the corner of
 //!   its chunk nearest to a step of the disc's edge: with the view distance at the viewer's
 //!   `mesh_reach` the distance fog hides the steps (the same picture as a floor without them),
-//!   at 32 blocks a chunk of radius they show (issue #51);
+//!   at 32 blocks a chunk of radius they show (issue #51); with the fog off the floor ends at
+//!   the distance whichever way the camera looks, steps hidden too;
 //! - the blocks of ADR 0018, meshed by the real `Mesher` over two chunks: a water pool and a
 //!   glass box (translucent bucket, blended back to front), bottom and top slabs, cross plants
 //!   and logs along X and Z, and the blocks of ADR 0020 (stairs of every kind, a fence run,
@@ -374,8 +375,9 @@ fn disc_columns(filled: bool) -> Vec<IVec3> {
 }
 
 /// From 36 blocks over the floor at the corner (32, 32) of chunk (0, 0), toward the nearest
-/// step of the disc's edge (column (3, 3), 90.5 blocks away), with the view distance `distance`.
-fn disc_view(distance: f32) -> ViewParams {
+/// step of the disc's edge (column (3, 3), 90.5 blocks away), with the view distance `distance`
+/// and the distance fog `fog`.
+fn disc_view(distance: f32, fog: DistanceFog) -> ViewParams {
     let camera = Camera {
         view_distance: distance,
         ..Camera::default()
@@ -384,7 +386,9 @@ fn disc_view(distance: f32) -> ViewParams {
     let d = (DVec3::new(122.0, 4.0, 122.0) - eye).as_vec3();
     let yaw = (-d.x).atan2(-d.z);
     let pitch = d.y.atan2(d.x.hypot(d.z));
-    view_params(&camera, &Transform::from_yaw_pitch(eye, yaw, pitch))
+    let transform = Transform::from_yaw_pitch(eye, yaw, pitch);
+    let view = CameraView::compute(&camera, &transform, WIDTH as f32 / HEIGHT as f32);
+    ViewParams::from_camera(&view, &camera, DEFAULT_SKY_COLOR, fog)
 }
 
 /// `n` copies of the bottom face of voxel (0, 0, 0): never visible from above the chunk (face
@@ -711,6 +715,9 @@ struct TierImages {
     /// The same at 32 blocks a chunk of radius: the steps show.
     disc_steps: RgbaImage,
     disc_steps_filled: RgbaImage,
+    /// `disc` and `disc_filled` with the distance fog off: a hard edge at the distance.
+    disc_off: RgbaImage,
+    disc_off_filled: RgbaImage,
     /// The blocks of ADR 0018 ([`special_scene`]), and without their translucent quads.
     special: RgbaImage,
     special_opaque: RgbaImage,
@@ -1061,12 +1068,12 @@ fn render_tier(
         .map_err(|e| e.to_string())?;
     let (far_front, _) = render(&device, &queue, &mut renderer, &far)?;
     // The distance fog (issue #51): its band at 450 to 500 voxels fades the slab (480 away)
-    // toward the sky; off, nothing fades.
+    // toward the sky; off, nothing fades before 500.
     let mut edge = far;
     [edge.fog_start, edge.fog_end] = DistanceFog::default().range(500.0);
     let (far_fog_edge, _) = render(&device, &queue, &mut renderer, &edge)?;
     let mut off = far;
-    [off.fog_start, off.fog_end] = boxel_render::NO_FOG;
+    [off.fog_start, off.fog_end] = DistanceFog::off().range(500.0);
     let (far_fog_off, _) = render(&device, &queue, &mut renderer, &off)?;
     renderer
         .upsert_chunk(7, I64Vec3::ZERO, Arc::new(far_scene(registry, false, true)))
@@ -1094,12 +1101,23 @@ fn render_tier(
                 .upsert_chunk(chunk_id(c), (c * 32).as_i64vec3(), floor.clone())
                 .map_err(|e| e.to_string())?;
         }
-        for distance in [reach, steps] {
-            disc_images.push(render(&device, &queue, &mut renderer, &disc_view(distance))?.0);
+        for (distance, fog) in [
+            (reach, DistanceFog::default()),
+            (steps, DistanceFog::default()),
+            (reach, DistanceFog::off()),
+        ] {
+            let view = disc_view(distance, fog);
+            disc_images.push(render(&device, &queue, &mut renderer, &view)?.0);
         }
     }
-    let [disc, disc_steps, disc_filled, disc_steps_filled] =
-        <[RgbaImage; 4]>::try_from(disc_images).map_err(|_| "disc images".to_string())?;
+    let [
+        disc,
+        disc_steps,
+        disc_off,
+        disc_filled,
+        disc_steps_filled,
+        disc_off_filled,
+    ] = <[RgbaImage; 6]>::try_from(disc_images).map_err(|_| "disc images".to_string())?;
     renderer.clear_chunks();
 
     let special_meshes = special_scene(registry);
@@ -1171,6 +1189,8 @@ fn render_tier(
         disc_filled,
         disc_steps,
         disc_steps_filled,
+        disc_off,
+        disc_off_filled,
         special,
         special_opaque,
         special_no_boxes,
@@ -1318,6 +1338,8 @@ fn tiers_render_identically() {
                     (&name("disc_filled"), &i.disc_filled),
                     (&name("disc_steps"), &i.disc_steps),
                     (&name("disc_steps_filled"), &i.disc_steps_filled),
+                    (&name("disc_off"), &i.disc_off),
+                    (&name("disc_off_filled"), &i.disc_off_filled),
                     (&name("special"), &i.special),
                     (&name("special_opaque"), &i.special_opaque),
                     (&name("special_no_boxes"), &i.special_no_boxes),
@@ -1364,6 +1386,19 @@ fn tiers_render_identically() {
                 &format!("{label} {}: disc floor at 32 blocks a chunk", i.tier),
                 (&name("disc_steps"), &i.disc_steps),
                 (&name("disc_steps_filled"), &i.disc_steps_filled),
+                0.005,
+            );
+            // Off, nothing past the distance shows, whichever way the camera looks: the floor
+            // past the disc is inside the far plane toward the sides of the image.
+            report.check_same(
+                &format!("{label} {}: disc floor, distance fog off", i.tier),
+                (&name("disc_off"), &i.disc_off),
+                (&name("disc_off_filled"), &i.disc_off_filled),
+            );
+            report.check_differs(
+                &format!("{label} {}: disc floor, distance fog on and off", i.tier),
+                (&name("disc"), &i.disc),
+                (&name("disc_off"), &i.disc_off),
                 0.005,
             );
             report.check_range(&name("special"), &i.special, 0.3..=1.0);
@@ -1444,6 +1479,7 @@ fn tiers_render_identically() {
                 ("far_both", &best.far_both, &i.far_both),
                 ("far_fog_edge", &best.far_fog_edge, &i.far_fog_edge),
                 ("disc", &best.disc, &i.disc),
+                ("disc_off", &best.disc_off, &i.disc_off),
                 ("special", &best.special, &i.special),
                 ("special_opaque", &best.special_opaque, &i.special_opaque),
                 (

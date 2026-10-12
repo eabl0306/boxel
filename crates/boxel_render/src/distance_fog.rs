@@ -2,19 +2,15 @@
 //! fades into the sky color, so chunks (and the far LOD) do not end in a hard line. Spherical:
 //! the distance is 3D, since the world is infinite up and down as well.
 
-/// The fog distances while the distance fog is off ([`DistanceFog::range`]): both far past
-/// anything drawn, so the shaders' `(d - start) / max(end - start, 1)` stays 0 with finite
-/// arithmetic (no infinity, no NaN).
-pub const NO_FOG: [f32; 2] = [f32::MAX, f32::MAX];
-
 /// How the terrain fades into the sky color at the edge of what is drawn
 /// ([`crate::RenderSettings::distance_fog`]): only the end, over `min(fade_fraction * d,
 /// max_fade)` blocks before the distance `d` (the view distance, or the far LOD's horizon while
 /// it draws). The defaults are Minecraft's: the last 10 %, at most 64 blocks (two chunks).
-/// Off, nothing fades: the terrain ends at the distance with a hard edge.
+/// Off, nothing fades: the terrain ends at the distance with a hard edge, still a sphere.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DistanceFog {
-    /// False turns the fade off (with or without the far LOD). Default true.
+    /// False turns the fade off (with or without the far LOD): everything past the distance
+    /// takes the fog color at once. Default true.
     pub enabled: bool,
     /// Fraction of the distance the fade takes, `0..=1` (0: a hard edge). Default 0.1.
     pub fade_fraction: f32,
@@ -54,11 +50,20 @@ impl DistanceFog {
     }
 
     /// Fog start and end for terrain drawn to `distance` blocks: from `distance - min(
-    /// fade_fraction * distance, max_fade)` to `distance`. Off, [`NO_FOG`]. Invalid settings
-    /// ([`DistanceFog::validate`]) give the default's range.
+    /// fade_fraction * distance, max_fade)` to `distance`. Off, both at `distance`: the shaders'
+    /// `(d - start) / max(end - start, 1)` cuts within a block. The cut is spherical rather
+    /// than no fog at all, because the far plane is flat: past the distance, chunks and LOD
+    /// nodes would show toward the sides of the screen and not straight ahead, popping as the
+    /// camera turns. Invalid settings ([`DistanceFog::validate`]) give the default's range. The
+    /// numbers are always finite (`distance` is clamped to `0..=f32::MAX`, NaN to 0).
     pub fn range(&self, distance: f32) -> [f32; 2] {
+        let distance = if distance.is_nan() {
+            0.0
+        } else {
+            distance.clamp(0.0, f32::MAX)
+        };
         if !self.enabled {
-            return NO_FOG;
+            return [distance, distance];
         }
         let fog = if self.validate().is_ok() {
             *self
@@ -141,24 +146,50 @@ mod tests {
         assert_eq!(whole.range(512.0), [0.0, 512.0]);
     }
 
+    /// The shaders' fog factor at `d` blocks.
+    fn factor([start, end]: [f32; 2], d: f32) -> f32 {
+        ((d - start) / (end - start).max(1.0)).clamp(0.0, 1.0)
+    }
+
     #[test]
-    fn off_fades_nothing_with_finite_numbers() {
+    fn off_cuts_at_the_distance() {
         let off = DistanceFog::off();
         for distance in [0.0, 64.0, 512.0, 12_288.0] {
-            assert_eq!(off.range(distance), NO_FOG);
-        }
-        // The shaders' fog factor: 0 everywhere, never NaN.
-        let [start, end] = NO_FOG;
-        for d in [0.0f32, 512.0, 1e9, f32::MAX] {
-            let fog = ((d - start) / (end - start).max(1.0)).clamp(0.0, 1.0);
-            assert_eq!(fog, 0.0, "{d}");
+            let range = off.range(distance);
+            assert_eq!(range, [distance, distance]);
+            // No fade before the distance, all fog a block past it: a hard spherical edge.
+            for d in [0.0, distance * 0.5, distance * 0.99, distance] {
+                assert_eq!(factor(range, d), 0.0, "{distance}: {d}");
+            }
+            for d in [distance + 1.0, distance * 2.0 + 1.0, f32::MAX] {
+                assert_eq!(factor(range, d), 1.0, "{distance}: {d}");
+            }
         }
         // Off whatever the numbers.
         let off_invalid = DistanceFog {
             fade_fraction: f32::NAN,
             ..DistanceFog::off()
         };
-        assert_eq!(off_invalid.range(512.0), NO_FOG);
+        assert_eq!(off_invalid.range(512.0), [512.0, 512.0]);
+    }
+
+    #[test]
+    fn the_numbers_are_always_finite() {
+        for fog in [DistanceFog::default(), DistanceFog::off()] {
+            for distance in [f32::INFINITY, f32::MAX, f32::NAN, -1.0, f32::NEG_INFINITY] {
+                let range = fog.range(distance);
+                assert!(range.iter().all(|v| v.is_finite()), "{fog:?} {distance}");
+                for d in [0.0, 512.0, f32::MAX] {
+                    assert!(!factor(range, d).is_nan(), "{fog:?} {distance} {d}");
+                }
+            }
+        }
+        assert_eq!(DistanceFog::default().range(f32::NAN), [0.0, 0.0]);
+        assert_eq!(DistanceFog::default().range(-5.0), [0.0, 0.0]);
+        assert_eq!(
+            DistanceFog::off().range(f32::INFINITY),
+            [f32::MAX, f32::MAX]
+        );
     }
 
     #[test]

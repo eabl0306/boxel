@@ -160,7 +160,8 @@ pub enum NoiseDims {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum FogFade {
     /// Like the terrain: from the scene's fog start to its fog end (the renderer's distance fog
-    /// at the view distance). With that fog off, no fade: the layer ends at its `max_distance`.
+    /// at the view distance). With that fog off, no fade: the layer ends at the view distance
+    /// at once, as the terrain does.
     #[default]
     Scene,
     /// Linearly from `start` to `end` blocks.

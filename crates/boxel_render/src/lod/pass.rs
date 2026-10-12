@@ -2168,8 +2168,7 @@ mod tests {
             fog: DistanceFog::off(),
             ..input(Vec::new())
         });
-        let [start, end] = crate::NO_FOG;
-        assert_eq!(nodes.fog_params(), Some([start, end, 0.0, 0.0]));
+        assert_eq!(nodes.fog_params(), Some([12288.0, 12288.0, 0.0, 0.0]));
     }
 
     #[test]

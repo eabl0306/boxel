@@ -53,7 +53,7 @@ mod sort;
 mod targets;
 mod upload;
 
-pub use distance_fog::{DistanceFog, DistanceFogError, NO_FOG};
+pub use distance_fog::{DistanceFog, DistanceFogError};
 pub use light::{LIGHT_LEVELS, SceneLight, light_curve};
 pub use outline::{BlockOutline, Outline, OutlineEdge, block_outline_edges, outline_edges};
 pub use overlay::{OverlayDraw, OverlayRect};

@@ -676,7 +676,7 @@ fn lod_costs_nothing_when_absent_off_or_empty() {
             if renderer.stats().lod_draws != 0 {
                 return Err("draws without nodes".into());
             }
-            // The distance fog off: no fade at the horizon either.
+            // The distance fog off: no fade at the horizon either, a hard edge there.
             renderer.set_lod(
                 gpu.device,
                 Some(LodInput {
@@ -685,7 +685,7 @@ fn lod_costs_nothing_when_absent_off_or_empty() {
                 }),
             );
             render(gpu, &mut renderer, &view)?;
-            let [start, end] = boxel_render::NO_FOG;
+            let [start, end] = DistanceFog::off().range(HORIZON);
             let off = renderer.debug_view_uniform().fog_params;
             if !gpu.gl() && off != [start, end, 0.0, 0.0] {
                 return Err(format!("fog off: fog params {off:?}"));

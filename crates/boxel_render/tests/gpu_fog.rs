@@ -288,10 +288,10 @@ fn look(eye: DVec3, target: DVec3) -> ViewParams {
     ViewParams::from_camera(&view, &camera, DEFAULT_SKY_COLOR, DistanceFog::default())
 }
 
-/// The view with the terrain's distance fog off: layers faded like the scene
-/// (`FogFade::Scene`) do not fade and reach their `max_distance`.
+/// The view with the terrain's distance fog off: the terrain, and the layers faded like the
+/// scene (`FogFade::Scene`), end at the view distance at once.
 fn no_distance_fog(mut view: ViewParams) -> ViewParams {
-    [view.fog_start, view.fog_end] = boxel_render::NO_FOG;
+    [view.fog_start, view.fog_end] = DistanceFog::off().range(Camera::default().view_distance);
     view
 }
 

@@ -277,7 +277,10 @@ profundidad ni z-fighting.
 - La niebla de distancia del terreno usa la misma regla que sin LOD, medida sobre `H` en lugar
   de la distancia de vista (`RenderSettings::distance_fog`, issue #51): solo el último 10 %, como
   mucho 64 bloques. Con `far` va de 12.224 a 12.288 bloques. El detalle completo y el LOD se
-  funden juntos con el cielo. Con la niebla apagada el borde queda nítido, con o sin LOD.
+  funden juntos con el cielo. Con la niebla apagada el borde queda nítido, con o sin LOD: todo
+  lo que pasa de `H` toma el color del cielo de golpe. Así el borde es la misma esfera hacia
+  donde se mire; con el plano lejano solo, los nodos que la histéresis conserva más allá de `H`
+  aparecerían a los costados de la pantalla al girar.
   `ViewParams` no cambia, así que las capas de `FogPlugin` conservan su alcance. Antes iba de la
   mitad de `H` a `H` (`LodSettings::fade_start`, ya no existe).
 - En GL el LOD queda apagado (sin clip control la profundidad lejana pelea). `voxel_world` lo
