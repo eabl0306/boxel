@@ -4,6 +4,15 @@ use crate::color::Rgba;
 use boxel_ecs::prelude::*;
 use boxel_math::UVec2;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Source of [`UiDraw::generation`] and [`crate::UiAtlas::generation`].
+static GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// A generation no list or atlas of this process had before (never 0).
+pub(crate) fn next_generation() -> u64 {
+    GENERATION.fetch_add(1, Ordering::Relaxed)
+}
 
 /// One textured rectangle of the paint list, in physical pixels.
 ///
@@ -119,7 +128,9 @@ impl UiLayer {
 /// to the target.
 ///
 /// `generation` changes only when the list or the target size really changes, so a renderer
-/// copies the `Arc` and uploads only then; an idle menu or a still HUD uploads nothing.
+/// copies the `Arc` and uploads only then; an idle menu or a still HUD uploads nothing. It is
+/// unique in the process: two lists with the same generation are the same list (a clone keeps
+/// it), even from two apps, so a renderer never keeps another list's quads.
 #[derive(Resource, Clone, Debug, Default)]
 pub struct UiDraw {
     quads: Arc<Vec<UiQuad>>,
@@ -138,7 +149,8 @@ impl UiDraw {
         self.target
     }
 
-    /// Changes whenever [`UiDraw::quads`] or [`UiDraw::target_size`] change.
+    /// Changes whenever [`UiDraw::quads`] or [`UiDraw::target_size`] change, to a number no
+    /// other list of this process has (0 is the empty default's).
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -155,7 +167,7 @@ impl UiDraw {
         }
         self.quads = Arc::new(quads);
         self.target = target;
-        self.generation += 1;
+        self.generation = next_generation();
         true
     }
 }
@@ -194,17 +206,37 @@ mod tests {
     #[test]
     fn generation_moves_only_on_a_change() {
         let mut draw = UiDraw::default();
+        assert_eq!(draw.generation(), 0);
         let quad = UiQuad::solid([0, 0], [4, 4], [1, 2, 3, 4]);
         assert!(draw.update(vec![quad], UVec2::new(8, 8)));
-        assert_eq!(draw.generation(), 1);
+        let first = draw.generation();
+        assert_ne!(first, 0);
         for _ in 0..100 {
             assert!(!draw.update(vec![quad], UVec2::new(8, 8)));
         }
-        assert_eq!(draw.generation(), 1);
+        assert_eq!(draw.generation(), first);
         assert!(draw.update(vec![quad], UVec2::new(9, 8)));
+        let resized = draw.generation();
+        assert_ne!(resized, first);
         assert!(draw.update(Vec::new(), UVec2::new(9, 8)));
-        assert_eq!(draw.generation(), 3);
+        assert!(![0, first, resized].contains(&draw.generation()));
         assert!(draw.is_empty());
+    }
+
+    #[test]
+    fn lists_built_apart_never_share_a_generation() {
+        // The same steps on two lists, other quads: a renderer keyed on the generation must
+        // tell them apart.
+        let (mut a, mut b) = (UiDraw::default(), UiDraw::default());
+        let target = UVec2::new(8, 8);
+        assert!(a.update(vec![UiQuad::solid([0, 0], [4, 4], [1; 4])], target));
+        assert!(b.update(vec![UiQuad::solid([2, 2], [6, 6], [2; 4])], target));
+        assert_ne!(a.generation(), b.generation());
+        // A clone is the same list, and moves on its own.
+        let mut c = a.clone();
+        assert_eq!(c.generation(), a.generation());
+        assert!(c.update(Vec::new(), target));
+        assert!(![a.generation(), b.generation()].contains(&c.generation()));
     }
 
     #[test]

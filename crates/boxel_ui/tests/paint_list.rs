@@ -27,11 +27,11 @@ fn an_idle_menu_keeps_its_generation() {
     assert!(!t.draw().is_empty());
     t.frames(100);
     assert_eq!(t.draw().generation(), generation, "100 idle frames");
-    // Hovering a button changes its sprite: one new generation, then idle again.
+    // Hovering a button changes its sprite: a new generation, then idle again.
     let b = t.hit("test:b").unwrap().rect;
     t.move_to(IVec2::new(b.x + 1, b.y + 1)).frame();
     let hovered = t.draw().generation();
-    assert_eq!(hovered, generation + 1);
+    assert_ne!(hovered, generation);
     t.frames(10);
     assert_eq!(t.draw().generation(), hovered);
 }

@@ -1,5 +1,6 @@
 //! The UI atlas: one RGBA8 sRGB page holding every sprite and glyph the UI draws.
 
+use crate::paint::next_generation;
 use crate::sprite::{Scaling, Sprite};
 use boxel_ecs::prelude::*;
 use std::collections::HashMap;
@@ -68,8 +69,11 @@ struct Shelf {
 ///
 /// Images never move once placed: when the page is full it doubles (up to
 /// [`MAX_ATLAS_SIZE`]) and keeps every texel where it was. `generation` changes with every
-/// change of the pixels, so a renderer uploads the page only then. Sprites can be found by a
-/// key (`game:heart_full`): the engine's skin uses none, a game registers its own.
+/// change of the pixels, so a renderer uploads the page only then. Like the
+/// [`UiDraw`](crate::UiDraw)'s, it is unique in the process: two atlases with the same
+/// generation are the same page (a clone keeps it), so one built again the same way with other
+/// pixels is uploaded too. Sprites can be found by a key (`game:heart_full`): the engine's skin
+/// uses none, a game registers its own.
 #[derive(Resource, Clone, Debug)]
 pub struct UiAtlas {
     size: u32,
@@ -114,7 +118,8 @@ impl UiAtlas {
         &self.rgba
     }
 
-    /// Changes whenever the pixels or the page size change.
+    /// Changes whenever the pixels or the page size change, to a number no other atlas of this
+    /// process has.
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -147,7 +152,7 @@ impl UiAtlas {
                 page[dst..dst + row].copy_from_slice(&rgba[src..src + row]);
             }
         }
-        self.generation += 1;
+        self.generation = next_generation();
         Ok(at)
     }
 
@@ -234,7 +239,7 @@ impl UiAtlas {
         }
         self.size = size;
         self.rgba = Arc::new(page);
-        self.generation += 1;
+        self.generation = next_generation();
     }
 }
 
@@ -290,5 +295,20 @@ mod tests {
         assert_eq!(atlas.find("test:other"), None);
         let sprite = atlas.sprite(id);
         assert_eq!([sprite.src[2], sprite.src[3]], [4, 4]);
+    }
+
+    #[test]
+    fn atlases_built_apart_never_share_a_generation() {
+        // The same steps on two pages, other pixels: a renderer keyed on the generation must
+        // upload the second one.
+        let (mut a, mut b) = (UiAtlas::new(64), UiAtlas::new(64));
+        a.add_image(2, 2, &image(2, 2, 7)).unwrap();
+        b.add_image(2, 2, &image(2, 2, 9)).unwrap();
+        assert_ne!(a.generation(), b.generation());
+        // A clone is the same page, and moves on its own.
+        let mut c = a.clone();
+        assert_eq!(c.generation(), a.generation());
+        c.add_image(1, 1, &image(1, 1, 3)).unwrap();
+        assert!(![a.generation(), b.generation()].contains(&c.generation()));
     }
 }

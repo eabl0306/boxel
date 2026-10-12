@@ -1230,7 +1230,8 @@ la lista de pintura de `boxel_ui` (`UiDraw` con su `UiAtlas`).
   byte a byte.
 - **Qué sube.** `Extract` copia la lista y la página del atlas (un `Arc` cada una) solo cuando
   el pase no tiene su generación. La lista se convierte y se sube cuando cambia ella o el tamaño
-  del frame; el atlas, cuando cambia su generación. Una interfaz quieta no sube nada. Tras una
+  del frame; el atlas, cuando cambia su generación. Las generaciones son únicas en el proceso:
+  una lista o un atlas distinto nunca tiene la de otro. Una interfaz quieta no sube nada. Tras una
   pérdida del dispositivo, la primera lista crea el pase otra vez y sube todo.
 - **Dibujo.** Un pase con `LoadOp::Load` sobre el color principal, justo después del overlay y
   antes del blit (las capturas la incluyen y los menús tapan el F3 y la mira), con un solo

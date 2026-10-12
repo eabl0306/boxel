@@ -253,7 +253,8 @@ impl UiPass {
 
     /// Takes `draw` and `atlas` for a `target` sized frame, uploading only what changed since
     /// the last call: the atlas page when its generation changed, the instances when the list's
-    /// generation or `target` changed. An idle UI uploads nothing.
+    /// generation or `target` changed. An idle UI uploads nothing. Generations are unique in the
+    /// process, so another list or atlas (from another app, or built again) is always uploaded.
     ///
     /// Quads whose numbers do not fit the instance (a source past texel 65535, or a mapping so
     /// large that its texel arithmetic would pass 2^32) are left out and counted in
@@ -645,13 +646,18 @@ mod tests {
         );
     }
 
-    /// A UI app with one button; `hover` puts the cursor on it (another list).
+    /// A UI app one frame in, with one button.
     fn ui_app() -> boxel_ui::testing::UiTester {
+        ui_app_at(10)
+    }
+
+    /// A UI app one frame in, with one button at `x`.
+    fn ui_app_at(x: i32) -> boxel_ui::testing::UiTester {
         use boxel_ui::{Modal, Ui, UiLayer, UiRect};
         let mut t = boxel_ui::testing::UiTester::new(UVec2::new(640, 480));
-        t.add_systems(|mut ui: Ui| {
+        t.add_systems(move |mut ui: Ui| {
             let mut p = ui.layer(UiLayer::Screen, Modal::Yes);
-            p.button(UiRect::new(10, 10, 100, 20), "test:play");
+            p.button(UiRect::new(x, 10, 100, 20), "test:play");
         });
         t.frame();
         t
@@ -717,6 +723,39 @@ mod tests {
         assert_eq!(wanted(has(Some(d), Some(a)), None), (Some(None), None));
         assert_eq!(wanted(has(None, Some(a)), None), (None, None));
         assert_eq!(wanted(None, None), (None, None));
+    }
+
+    #[test]
+    fn a_list_or_an_atlas_built_apart_is_never_taken_for_the_one_the_pass_has() {
+        // Two apps one frame in, and two atlases built the same way: the same steps, other
+        // pixels. A pass with the first ones must take the second ones.
+        let (draw, _) = resources(&ui_app_at(10));
+        let (other_draw, _) = resources(&ui_app_at(200));
+        assert_ne!(**draw.quads(), **other_draw.quads());
+        let atlas_with = |rgba: [u8; 4]| {
+            let mut atlas = UiAtlas::new(64);
+            atlas.add_image(2, 2, &rgba.repeat(4)).unwrap();
+            atlas
+        };
+        let (atlas, other_atlas) = (atlas_with([255, 0, 0, 255]), atlas_with([0, 0, 255, 255]));
+        assert_ne!(**atlas.rgba(), **other_atlas.rgba());
+        let has = Some(PassHas {
+            draw: Some(draw.generation()),
+            atlas: Some(atlas.generation()),
+        });
+        assert_eq!(
+            generations(&UiExtract::wanted(has, Some((&other_draw, &other_atlas)))),
+            (
+                Some(Some(other_draw.generation())),
+                Some(other_atlas.generation())
+            )
+        );
+        // A clone is the same list and the same page: nothing to copy.
+        let clones = (&draw.clone(), &atlas.clone());
+        assert_eq!(
+            generations(&UiExtract::wanted(has, Some(clones))),
+            (None, None)
+        );
     }
 
     proptest::proptest! {

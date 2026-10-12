@@ -75,6 +75,9 @@ el pase (E-UI2) y llega antes de los menús, así que no hay puente.
 - Costo cero sin uso: el pase se crea con la primera lista que no está vacía y no abre nada
   mientras la lista está vacía. `Extract` copia la lista y el atlas solo cuando el pase no tiene
   su generación, y se suben solo cuando cambian (o cambia el tamaño del frame).
+- Las generaciones de `UiDraw` y `UiAtlas` salen de un contador único del proceso, como las de
+  los targets. Dos listas o dos atlas distintos nunca tienen la misma, así que el pase no se
+  queda con los píxeles viejos si el juego reemplaza el atlas por otro armado igual.
 - Liga una sola textura y la lee con `textureLoad`, sin sampler, uniform ni immediates
   (`ui.wgsl`). Corre en Low y en GL 3.3.
 - El mapeo de cada quad viaja en enteros relativos a su primer píxel dibujado, no a su origen:
