@@ -153,7 +153,7 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_gfx` | política sobre wgpu: preferencias, instancia, tiers, scoring, smoke, selección, LKG, superficie, readback, hal; ejemplo `gpu_info` | (wgpu) |
 | `boxel_shaders` | WGSL embebido, composición, espejos `#[repr(C)]`, tests de naga | (wgpu, bytemuck) |
 | `boxel_voxel` | coordenadas (`BlockPos`, `ChunkPos`, `WorldPos`: bloque más offset, exacto a cualquier distancia), `Face`, registry (con emisión RGB y opacidad de luz), paleta, `LightValue` y `LightTables`, `ChunkData` con sus máscaras de luz (`LightMasks`), qué caras de un chunk se ven entre sí (`ChunkFaceInfo`, ADR 0022), clases de LOD y la regla de la celda lejana (`lod`, ADR 0031) | (glam) |
-| `boxel_mesh` | `PackedQuad`, `ChunkMesh` con su paleta de luz, `PaddedChunk`, `Mesher` (fork de bgm que fusiona por material, AO y luz), mallado de los nodos lejanos (`lod`: materiales, cortes por octante, faldones y paredes de agua, ADR 0031) | voxel |
+| `boxel_mesh` | `PackedQuad`, `ChunkMesh` con su paleta de luz, `PaddedChunk`, `Mesher` (fork de bgm que fusiona por material, AO y luz), mallado de los nodos lejanos (`lod`: materiales, cortes por octante, faldones, paredes, el fondo bajo el agua y las orillas, ADR 0031) | voxel |
 | `boxel_light` | luz de vóxeles en CPU, sin ECS ni GPU (ADR 0015): techos de cielo por columna (`SkyTile`, caminata hacia abajo), luz exacta de un chunk desde una caja de 64³ (cielo y RGB, caminos rápidos para cuevas oscuras y cielo abierto), `PaddedLight`, `ChunkLight`; oráculo global para los tests | voxel |
 | `boxel_worldgen` | trait `WorldGenerator` (con `lod()`, la fuente del terreno lejano: `LodSource`, ADR 0031), `FlatGenerator` y ruido entero exacto 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`, `splitmix64`, `Frequency`) | voxel |
 | `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, mensajes (`ChunkMeshEvent`, `BlockChanged`, `ChunkDataEvent`), guardar y cargar el mundo (`persist`: `ChunkStore`, `RedbStore`, `WorldStore`, `PersistPlugin`, ADR 0024), reloj del mundo (`TimeOfDay`, `DaylightCurve`, `DaylightPlugin`), ticks programados de bloques (`BlockTicks`, `BlockTicksPlugin`), agua y lava que corren y bloques con agua (`FluidPlugin`, ADR 0021 y 0025), las reglas de vecinos (`NeighborRules`, ADR 0020 y 0027), qué hace usar un bloque (`BlockUses`, una puerta que se abre, ADR 0027), la búsqueda de la ocultación de cuevas (`ChunkVisibility`, `visibility`, ADR 0022) y el lado del mundo del LOD lejano (`lod`: `LodWorldPlugin`, planificador, cobertura, trabajos, ADR 0031) | app, voxel, mesh, light, worldgen, transform, diagnostic |
@@ -1163,12 +1163,15 @@ los overlays y el blit, iguales en los tres tiers (`fog.wgsl`, módulo propio):
 2. **Composición** sobre el color principal (`dst * T + C`). Descarta los píxeles sin niebla.
 
 Cada pipeline liga a lo sumo un uniform block y una textura, sin sampler (ADR 0011). El uniform
-`Fog` (1136 bytes) se escribe cada frame; no se sube nada más. El estilo (capas, cubos, colores,
+`Fog` (1200 bytes) se escribe cada frame; no se sube nada más. El estilo (capas, cubos, colores,
 viento) es del juego; los presets del ejemplo están en `boxel_demo::fog`. Una capa puede seguir
 pasadas sus celdas como una bruma de su densidad media a cada altura (`haze`, ADR 0032), hasta
 el horizonte del LOD si se desvanece como el terreno: así la niebla y las nubes llegan lejos sin
-recorrer celdas allá. La niebla detrás del
-agua o del vidrio se pinta encima de esa superficie (límite conocido).
+recorrer celdas allá. La niebla detrás del agua o del vidrio se pinta encima de esa superficie
+(límite conocido). La marcha termina en la superficie del agua lejana del LOD, que escribe
+profundidad, y en el fondo del agua cercana, que no la escribe (ADR 0032, sección 10). En
+`both`, la ronda de optimización (M2) dejó la niebla en 1,06 a 1,11 ms por frame en la RTX a
+720p, unas 1,1 veces menos que antes.
 
 ### 10.9 Terreno lejano: LOD por anillos (ADR 0031)
 
@@ -1181,8 +1184,10 @@ los de antes, byte a byte.
   horizonte `H` (12.288 bloques en el preset `far`: `R = 24`, `K = 4`).
 - **Datos.** El generador muestrea cada nivel (`WorldGenerator::lod`, `LodSource`): un trabajo
   arma una columna de un nivel y malla sus nodos con el mallador de siempre (todo cubo opaco, sin
-  luz ni AO) más cortes por octante, faldones y, en el nivel 1, paredes de agua. La regla de la
-  celda: gana cualquier sólido, salvo agua sobre el suelo.
+  luz ni AO) más cortes por octante, faldones, paredes de suelo junto al agua, el fondo bajo el
+  agua (oscurecido por su hondura, como la luz de cielo cerca) y las orillas. La regla de la
+  celda: gana cualquier sólido, salvo agua sobre el suelo. El agua es translúcida (ADR 0031,
+  sección 12); la lava sigue opaca.
 - **Ediciones.** Los chunks editados (y, con `PersistPlugin`, los guardados) tienen sus celdas de
   los niveles 1 a 5 calculadas desde sus bloques (una pirámide por chunk) y puestas sobre las del
   generador; el nodo viejo se dibuja hasta que llega el nuevo, y dos vecinos del mismo nivel que
@@ -1196,16 +1201,18 @@ los de antes, byte a byte.
   cutout. En High, desde la GPU: una tabla de nodos, un compute que descarta nodos y caras que no
   se ven (y, cuando sirve, los que tapa el terreno cercano) y una lista indirecta por segmento.
   En Mid, Low y las GPUs integradas, instanciado (`lod.wgsl`), una llamada por tramo de caras
-  que miran a la cámara. Los faldones y las paredes de agua solo se dibujan donde hay una
-  costura con otro nivel o con el detalle completo. Las mismas imágenes en los dos caminos. Con
+  que miran a la cámara. Los faldones y las paredes solo se dibujan donde hay una costura con
+  otro nivel o con el detalle completo. El agua lejana va después de lo opaco y del contorno y
+  antes del agua cercana: una prepasada de profundidad y una de color con `GreaterEqual`, así
+  cada píxel muestra una sola capa de agua lejana. Las mismas imágenes en los dos caminos. Con
   el LOD dibujando, el plano lejano del recorte de chunks y de la búsqueda de cuevas
   pasa a `H` (los chunks publicados llegan más allá de la distancia de vista) y la niebla de
   distancia se mide sobre `H` con la misma regla (10.7); las capas de `FogPlugin` conservan su
   alcance, salvo las que tienen bruma, que llegan a `H` (ADR 0032). Apagado en GL.
 - **Costo.** En la RTX 5050, `far` suma de 0,54 a 0,60 ms de GPU por frame y ningún frame de más
-  de 6,94 ms; en el hilo principal casi nada (`render.lod` 0,007 ms de media). El terreno lejano
-  se llena en 1,1 a 1,7 s. En la 780M, `near` cuesta unos 0,4 ms y `far` 1,1 ms. Detalle en
-  `docs/rendimiento/lod-2026-10.md`.
+  de 6,94 ms; en el hilo principal casi nada (`render.lod` 0,007 ms de media). El agua
+  translúcida suma unos 0,04 ms. El terreno lejano se llena en 1,1 a 1,7 s. En la 780M, `near`
+  cuesta unos 0,4 ms y `far` 1,1 ms. Detalle en `docs/rendimiento/lod-2026-10.md`.
 
 ---
 
@@ -1399,9 +1406,9 @@ pub trait ChunkStore: Send + Sync + 'static {
 | Milestone | Contenido | Criterio de salida |
 |---|---|---|
 | **M0 scaffold** | workspace y tooling; fork del ECS; `boxel_app`; ventana con compuerta de presentación e input; detección completa (tiers, scoring, smoke, overrides, LKG de crashes, device lost, catch_unwind); tiers High, Mid y Low con buckets opaco y cutout (High sin Hi-Z); paleta, registry, worldgen, mesher, streaming con jobs; cámara libre; `gpu_info`, `voxel_world`, `headless_world` | compila, tests, clippy y rustdoc limpios; `voxel_world` dibuja terreno en Vulkan High y en GL (Mid y Low); imágenes iguales entre tiers; la simulación no se congela con la ventana minimizada |
-| **M1 mundo jugable** | criterio de entrada: re-fork sobre bevy 0.20.0 final (hecho el 2026-10-09, issue #24). Motor sin contenido, con el de los ejemplos en `boxel_demo` (hecho: ADR 0029, issue #48). Niebla y nubes cúbicas como plugin opcional (hecho: ADR 0030, issue #47; falta el mapa del suelo). Pase translúcido; AO; raycast y edición de bloques (hechos: ADR 0016, `voxel_world`); el sistema de ediciones si se recortó; propiedades de bloque e IdMap; `ChunkStore` con redb (hecho: ADR 0024, con entidades); crecimiento del arena y presupuesto de subida; caras interiores de hojas (opcional); re-selección en caliente si se recortó; decisión `static-dxc` o DLL en Windows; timestamps de GPU; actualizar a wgpu 31 | editar y guardar un mundo; agua visible |
+| **M1 mundo jugable** | criterio de entrada: re-fork sobre bevy 0.20.0 final (hecho el 2026-10-09, issue #24). Motor sin contenido, con el de los ejemplos en `boxel_demo` (hecho: ADR 0029, issue #48). Niebla y nubes cúbicas como plugin opcional (hecho: ADR 0030, issue #47; falta el mapa del suelo), con bruma lejana y nubes grandes sobre el LOD (hecho: ADR 0032; nubes que cambian con el clima, issue #53, y bruma por bioma, issue #43, quedan para después). Pase translúcido; AO; raycast y edición de bloques (hechos: ADR 0016, `voxel_world`); el sistema de ediciones si se recortó; propiedades de bloque e IdMap; `ChunkStore` con redb (hecho: ADR 0024, con entidades); crecimiento del arena y presupuesto de subida; caras interiores de hojas (opcional); re-selección en caliente si se recortó; decisión `static-dxc` o DLL en Windows; timestamps de GPU; actualizar a wgpu 31 | editar y guardar un mundo; agua visible |
 | **M2 GPU-driven completo** | Hi-Z en dos fases (High) o enlaces por subceldas de 16³ (el cave culling por BFS ya está en los tres tiers, ADR 0022); pool de ocupación en GPU; `create_shader_module_trusted` con medición; pipeline cache de Vulkan; verificar DX12 High; clip control en GL (upstream); decidir WESL | caída de draws y de tiempo de GPU medida |
-| **M3 escala** | LOD por anillos 3D con el generador muestreando cada nivel (M1, M2 y M3 del LOD hechos: ADR 0031; falta la prueba del dueño); listas indirectas segmentadas (más de 65 535 draws); render en hilo propio; inicialización de GPU asíncrona (respetando los error scopes por hilo) | distancias de vista grandes estables |
+| **M3 escala** | LOD por anillos 3D con el generador muestreando cada nivel (M1, M2 y M3 del LOD y el agua lejana translúcida hechos: ADR 0031; falta la prueba del dueño de las ediciones y del agua); listas indirectas segmentadas (más de 65 535 draws); render en hilo propio; inicialización de GPU asíncrona (respetando los error scopes por hilo) | distancias de vista grandes estables |
 | **M4 experimental** | ray marching sobre bricks/ocupación; mesh shaders opt-in; evaluar bevy_ecs 0.21 y el núcleo ECS propio | prototipos medidos |
 
 wgpu v31 (milestone con fecha 2026-10-09) trae cambios que tocan el scaffold

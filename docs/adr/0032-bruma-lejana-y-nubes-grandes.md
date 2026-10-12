@@ -1,8 +1,8 @@
 # ADR 0032: bruma lejana y nubes grandes sobre el LOD
 
-- Estado: borrador (issue #47). El M1 pasó el vuelo del dueño el 2026-10-12 (ver "Decisiones
-  del dueño tras el vuelo"). El M2 se hizo y midió el mismo día: baja la niebla de `both` 1,1
-  veces, no 1,5. La reserva espera la decisión del dueño (sección 9).
+- Estado: aceptado (issue #47). El M1 pasó el vuelo del dueño el 2026-10-12 y sus respuestas
+  están en "Decisiones del dueño tras el vuelo". El M2 se hizo y midió el mismo día: baja la
+  niebla de `both` 1,1 veces, no 1,5. Queda una decisión abierta: la reserva del M2 (sección 9).
 - Fecha: 2026-10-11
 - Enmienda: ADR 0030 (el límite de distancia, la cola pasado el tope) y ADR 0031 (decisión 6)
 
@@ -175,9 +175,30 @@ tiempo de la niebla en `both`:
   dividiendo: multiplicado por su recíproco, llvmpipe dibujaba mal la opacidad de las escenas con
   bruma (ningún otro driver lo hacía).
 
-Resultado (S8 contra S0): 1,1 veces menos por frame medio, casi igual en la mediana. Queda por
-debajo de 1,4, así que no se empezó la reserva del plan (especializar la marcha con constantes
-`override`, `EXIT_TAU` de 8,66 a 8): necesita el sí del dueño.
+Resultado (S8 contra S0, la misma escena y el mismo smoke):
+
+| caso | frame medio con niebla menos sin ella | mediana |
+|---|---:|---:|
+| `both`, superficie | 1,17 -> 1,06 ms (1,10 veces) | 0,97 -> 0,96 ms |
+| `both`, bosque | 1,22 -> 1,11 ms (1,10 veces) | 1,05 -> 1,01 ms |
+| `decks` al horizonte, `--lod far` (S3 -> S8) | 1,52 -> 1,36 ms (1,12 veces) | 1,41 -> 1,24 ms |
+
+Queda por debajo de 1,4, así que no se empezó la reserva del plan: especializar la marcha con
+constantes `override` (un pipeline por configuración) o bajar `EXIT_TAU` de 8,66 a 8 (el color
+cambia hasta 0,004). Necesita el sí del dueño. S0 es de otra sesión, y el mismo binario se mueve
+unos 0,07 ms en la mediana entre sesiones.
+
+Los dos arreglos de la revisión (2624da9, la fila de un plano con borde fino, y 519ac2a, una capa
+sin filas que caminar) no cambian las imágenes de los presets ni la tabla de pasos: no se
+midieron de nuevo.
+
+### 10. El agua lejana
+
+Con el agua lejana translúcida (ADR 0031, sección 12) la marcha termina en la superficie del
+agua lejana, porque su prepasada escribe profundidad, y en el fondo del agua cercana, que no la
+escribe. La diferencia es la niebla que habría dentro del agua. En los presets del ejemplo no se
+ve: sus capas empiezan en y 46, el borde de abajo las anula ahí y el agua cercana llega a 46,875.
+Un juego con niebla bajo el nivel del mar sí la vería (límite conocido).
 
 ## Decisiones del dueño tras el vuelo (2026-10-12)
 
@@ -218,6 +239,14 @@ debajo de 1,4, así que no se empezó la reserva del plan (especializar la march
 - **Rastro de niebla suave en la fila de un plano.** Con un borde de dos celdas o más la marcha no
   camina la fila pegada al plano, y se pierde la poca niebla suave que deja ahí el ruido sobre
   0,84. Es lo que aceptó el plan del M2.
+- **Niebla bajo el agua.** Una capa que baja del nivel del agua termina en la superficie del agua
+  lejana y en el fondo del agua cercana (sección 10). Los presets del ejemplo no llegan ahí.
+- **Volar dentro de una nube sigue caro.** Con la cámara dentro de una capa de nubes los rayos
+  cruzan unos 50 trozos suaves: el p99 a 720p rozaba 6,94 ms en S4 (antes del M2). El M2 bajó
+  0,18 ms en `inside`, pero quedan 31 frames de más de 6,94 ms en 10 s. La reserva es lo que
+  queda para ese caso.
+- **Nubes iguales en todo el cielo** y bruma en todos lados a la vez, hasta el clima (issue #53)
+  y los biomas (issue #43).
 
 ## Alternativas descartadas
 
@@ -236,10 +265,10 @@ debajo de 1,4, así que no se empezó la reserva del plan (especializar la march
 - `boxel_fog`: rangos de `haze` y del límite en celdas; el perfil (filas que cubre, sin borde,
   subida, determinista); la bruma contra una integral fina (error relativo menor que 1e-3 en
   rayos empinados, rasantes y horizontales); profundidades de píxel dentro de un tramo; la
-  costura continua, también en una capa llena; ningún salto dentro del anillo; rayos solo de bruma sin pasos; una capa sin
-  bruma da bit a bit lo de antes (hash fijo tomado en 0bd2849; desde el M2 el del cúmulo con
-  bordes cambia: multiplica por el recíproco de la altura y ya no camina la fila de su plano de
-  arriba); las filas pegadas a un plano con borde no se caminan cuando no se ve nada en ellas, y
+  costura continua, también en una capa llena; ningún salto dentro del anillo; rayos solo de
+  bruma sin pasos; una capa sin bruma da bit a bit lo de antes (hash fijo tomado en 0bd2849;
+  desde el M2 el del cúmulo con bordes cambia: multiplica por el recíproco de la altura y ya no
+  camina la fila de su plano de arriba); las filas pegadas a un plano con borde no se caminan cuando no se ve nada en ellas, y
   con niebla suave y un borde de menos de dos celdas sí, así que la cámara dentro de esa fila ve
   la niebla suave a su alrededor; una capa sin filas que caminar no visita ninguna celda.
 - `fs_fog_debug_walk`: caminatas por un solo caché en cada eje y sentido, con una y dos octavas,
