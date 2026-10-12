@@ -212,9 +212,15 @@ El mundo se elige con `--world`: `forest` (por defecto, el de todas las corridas
 `terrain`, `flat` u `overworld` (piedra infinita hacia abajo con cuevas). Con el overworld,
 `--caves mc|closed|off` elige las cuevas: `mc` tiene entradas desde la superficie y `closed` no
 deja ver ninguna cueva desde arriba. El overworld no acepta `--fixed-height` (no tiene piso) y usa
-un arena de 24 Mi quads y 65 536 slots; `--arena-quads N` y `--chunk-slots N` los cambian. El
-resumen anota el mundo y el arena y los slots que el renderer obtuvo de verdad (los límites del
-dispositivo pueden recortarlos), y `tools/bench_report.py` solo compara corridas del mismo mundo.
+un arena de 24 Mi quads y 65 536 slots; `--arena-quads N` y `--chunk-slots N` los cambian (son el
+piso de páginas y la tabla inicial, ADR 0035). El resumen anota el mundo y el arena y los slots
+que el renderer obtuvo de verdad (los límites del dispositivo pueden recortarlos), y
+`tools/bench_report.py` solo compara corridas del mismo mundo.
+
+`--alloc-probe 32,64` es la sonda de páginas (ADR 0035): mientras mide, cada medio segundo crea
+justo después del present un buffer como una página, cuatro de cada tamaño, y al final los
+suelta. Imprime cuánto tardó cada uno, si hizo falta un bloque nuevo de memoria de la GPU y el
+tiempo de ese frame. Sus frames no sirven como medida del caso.
 
 Los generadores de esos mundos (salvo `flat`) son contenido de ejemplo y viven en `boxel_demo`
 (#48). Sus benches de criterion son `cargo bench -p boxel_demo --bench terrain` y

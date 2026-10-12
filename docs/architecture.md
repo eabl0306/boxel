@@ -206,9 +206,10 @@ Conclusión: el sobrecosto de wgpu es **por comando**. Un motor que emite pocos 
 multi-draw por lista) no lo nota. Por eso:
 
 - Tier High: un `multi_draw_indexed_indirect_count` para los buckets opacos y otro para el
-  cutout.
-- Nunca se re-bindean buffers por chunk: un arena de quads, una tabla de chunks, un índice
-  compartido. El dato por draw llega por un atributo de instancia (§10.4).
+  cutout, por página de quads.
+- Nunca se re-bindean buffers por chunk, solo por página (ADR 0035): pocas páginas de quads,
+  una tabla de chunks, un índice compartido. El dato por draw llega por un atributo de instancia
+  (§10.4).
 - Mid/Low sí hacen un draw por bucket visible (decenas a pocos miles por frame): 60 a 100 ns cada
   uno, menos de 0.5 ms con la distancia de vista por defecto.
 
@@ -479,9 +480,9 @@ encuentra la lista llena deshace su `atomicAdd`).
 Límite adicional (verificado en wgpu-hal 30.0.1): en la variante `*_count`, wgpu-hal pasa
 `max_count` a `vkCmdDrawIndexedIndirectCount` sin compararlo con `maxDrawIndirectCount`, cuyo
 mínimo en Vulkan es 65535 (los drivers de escritorio reportan 2³² - 1). boxel limita cada lista,
-cada llamada y cada contador a 65535 draws. Si hay más buckets visibles (no pasa con la
-configuración por defecto), High omite algunos sin orden (no los más lejanos: pueden faltar chunks
-cercanos), Mid y Low dibujan todos, y se avisa una vez. M3 segmenta las listas. Ese mínimo vale
+cada llamada y cada contador a 65535 draws. Las listas son por página de quads y una página
+tiene a lo sumo 10 922 chunks, así que su lista opaca (6 por chunk, 65 532) nunca se llena:
+High dibuja todos los buckets visibles (ADR 0035). Ese mínimo vale
 solo si el dispositivo tiene `multiDrawIndirect` (si no, el límite es 1), y wgpu ofrece el
 multi-draw con count aunque no lo tenga (riesgo abierto; las GPUs de escritorio lo tienen).
 
@@ -926,9 +927,9 @@ cambia el layout.
 
 | Recurso | Uso | Tiers |
 |---|---|---|
-| Arena de quads | un buffer `STORAGE | VERTEX | COPY_DST` de entradas de 8 bytes, sub-asignado con `offset-allocator`: una asignación por chunk con los 8 buckets contiguos y, a continuación, su paleta de luz (`boxel_render::arena_len`: quads más entradas de paleta, al menos una); 8 Mi entradas = 64 MiB por defecto | todos |
-| Tabla de chunks | storage `array<ChunkGpu>` (64 B: origen i32x3 con los 32 bits bajos del origen `i64`, `quad_base`, 8 contadores, flags con el bit vivo solo dentro de la ventana de la cámara, que lee solo High, `light_base` = `quad_base` + quads en el offset 52, `light_len` (entradas de la paleta) en el 56, relleno) | High, Mid |
-| Luz por quad | buffer `VERTEX | COPY_DST` paralelo al arena y del mismo tamaño, reservado entero al crear el renderer (64 MiB con el arena por defecto, haya quads o no): en el offset de cada quad, su entrada de paleta ya expandida (segundo atributo de instancia) | Low |
+| Páginas de quads | buffers de tamaño fijo (4 Mi entradas de 8 bytes, 32 MiB, por defecto) `STORAGE` en High/Mid y `VERTEX` en Low, con `COPY_DST | COPY_SRC`, cada uno sub-asignado con `offset-allocator`: un chunk entero en una página, sus 8 buckets contiguos y, a continuación, su paleta de luz (`boxel_render::arena_len`: quads más entradas de paleta, al menos una). Clase Solid o Translucent; a lo sumo 10 922 chunks por página. Piso de 8 Mi entradas (dos páginas, 64 MiB) por defecto (ADR 0035) | todos |
+| Tabla de chunks | storage `array<ChunkGpu>` (64 B: origen i32x3 con los 32 bits bajos del origen `i64`, `quad_base` dentro de su página, 8 contadores, flags con el bit vivo solo dentro de la ventana de la cámara, que lee solo High, `light_base` = `quad_base` + quads en el offset 52, `light_len` (entradas de la paleta) en el 56, `page` en el 60) | High, Mid |
+| Luz por quad | una página de luz `VERTEX` por página, del mismo tamaño: en el offset de cada quad, su entrada de paleta ya expandida (segundo atributo de instancia) | Low |
 | Tabla CPU | espejo en CPU (origen `i64`, rangos, contadores) para culling en CPU | todos |
 | Índice compartido | u32 `[0,1,2,2,1,3] + 4i` para 98 304 quads (2.36 MB) | High, Mid |
 | Textura de bloques | `texture_2d_array` RGBA8 sRGB con mips hasta 1x1; el lado de las imágenes del registro (16x16 en el demo), o el tamaño más común de un resource pack (ver abajo) | todos |
@@ -965,12 +966,13 @@ subida son los mismos, así que los tres tiers lo ven igual.
   en frío con los packs de prueba; queda en `RenderInfo::textures::load_time`.
 
 Layouts de bind groups (congelados): grupo 0 estático (textura + sampler), grupo 1 por frame
-(view), grupo 2 geometría (arena + tabla, solo lectura, vertex) en High/Mid. Lo pesado y estático
-va en el grupo 0, lo que cambia en el más alto (fast path de wgpu sin rebind, #9738).
+(view), grupo 2 geometría (una página + tabla, solo lectura, vertex) en High/Mid, uno por página.
+Lo pesado y estático va en el grupo 0, lo que cambia en el más alto (fast path de wgpu sin
+rebind, #9738).
 
-Si el arena o la tabla se llenan, el chunk no se sube: se cuenta en `RenderInfo::dropped_chunks`,
-se avisa en el log y aparece en la línea de diagnóstico `render`. El crecimiento del arena llega
-en M1.
+Si ninguna página puede tomar un chunk o la tabla se llena, el chunk no se sube: se cuenta en
+`RenderInfo::dropped_chunks`, se avisa en el log y aparece en la línea de diagnóstico `render`.
+Las páginas todavía no crecen: el piso es todo lo que hay hasta el M2 de #57 (ADR 0035).
 
 ### 10.3 Pases por tier
 
@@ -981,22 +983,26 @@ Cada tier usa tres pipelines de vóxeles (ADR 0012, ADR 0018): **opaco** (`fs_op
 None`) para el bucket 7, al final. Los buckets translúcidos salen de una lista en CPU que comparten
 los tres tiers, con los chunks de atrás hacia adelante por distancia. Dentro de un chunk, el
 renderer reordena los quads translúcidos para la cámara en un trabajo aparte y los vuelve a subir
-sobre su rango del arena (ADR 0018, sección 3).
+sobre su rango de la página (ADR 0018, sección 3). Los chunks a la misma distancia van por su
+origen `i64` (x, luego y, luego z), así el orden no depende de los slots ni de las páginas
+(ADR 0035).
 
 **High** (Vulkan con MDI-count):
 
-1. `clear_buffer(draw_counts)` (dos contadores: opaco y cutout; los bits de la ocultación de
-   cuevas que siguen en el mismo buffer no se tocan).
+1. `clear_buffer(draw_counts)` (dos contadores por página: opaco y cutout; los bits de la
+   ocultación de cuevas que siguen en el mismo buffer no se tocan).
 2. Compute `cull_chunks` (64 hilos por grupo, un hilo por slot): salta los slots que la
    ocultación de cuevas oculta (un bit por slot, ADR 0022); AABB contra 6 planos; por bucket
    de cara, un test de backface a nivel chunk (un bucket +Y solo se ve si la cámara está por
    encima de su `min.y`, etc.); el bucket cutout solo usa el frustum. Por bucket visible:
-   `atomicAdd` en su lista y escribe `DrawIndexedIndirect { index_count: n*6, instance_count: 1,
-   first_index: 0, base_vertex: 0, first_instance: s }` y `DrawRef { chunk_slot, quad_start }` en
-   la posición `s`. Cada lista tiene capacidad de hasta 65 535 draws (§5.11).
-3. Pase principal: pipeline opaco + `multi_draw_indexed_indirect_count` sobre la lista opaca;
-   pipeline cutout + otro sobre la lista cutout; pipeline translúcido + un `draw_indexed` por
-   chunk translúcido visible, con su `DrawRef` en un buffer chico que la CPU escribe cada frame.
+   `atomicAdd` en la lista de la página del chunk y escribe `DrawIndexedIndirect { index_count:
+   n*6, instance_count: 1, first_index: 0, base_vertex: 0, first_instance: s }` y `DrawRef {
+   chunk_slot, quad_start }` en la posición `s`. Una página tiene a lo sumo 10 922 chunks, así que
+   sus listas (65 532 draws opacos, un sexto cutout) nunca se llenan (ADR 0035, §5.11).
+3. Pase principal: pipeline opaco + un `multi_draw_indexed_indirect_count` por página con
+   chunks, con la página atada; pipeline cutout + lo mismo; pipeline translúcido + un
+   `draw_indexed` por chunk translúcido visible, con su `DrawRef` en un buffer chico que la CPU
+   escribe cada frame, atando la página cuando cambia.
 4. Blit a la superficie.
 
 Ocultación de cuevas (ADR 0022, los tres tiers): en su `Extract`, el render busca desde su cámara
@@ -1015,19 +1021,21 @@ tiene compute).
 
 1. Culling en CPU con los mismos tests que el shader (también los bits de la ocultación de
    cuevas).
-2. Escribe los `DrawRef` del frame en el buffer de instancia.
-3. Pipeline opaco y `draw_indexed(0..n*6, 0, i..i+1)` por bucket de cara visible; después
-   pipeline cutout para los buckets cutout y pipeline translúcido para los translúcidos.
+2. Escribe los `DrawRef` del frame en el buffer de instancia (opacos página por página, luego
+   cutout igual, luego translúcidos de atrás hacia adelante).
+3. Pipeline opaco y `draw_indexed(0..n*6, 0, i..i+1)` por bucket de cara visible, atando cada
+   página antes de sus draws; después pipeline cutout para los buckets cutout y pipeline
+   translúcido para los translúcidos.
 4. Blit.
 
 **Low** (GL 3.3, GLES 3.0, Vulkan/GL forzado):
 
 1. Culling en CPU (como Mid, con la ocultación de cuevas).
-2. Pipeline `vs_instanced` (opaco, cutout y translúcido), arena como buffer de vértices por instancia
-   (`Uint32x2` en `@location(0)`, stride 8) y el buffer de luz por quad como segundo buffer por
-   instancia (`Uint32x2` en `@location(1)`, mismos offsets: el mismo `first_instance` llega a los
-   dos), `TriangleStrip`; por bucket visible: `set_immediates(0, origen del chunk)` y
-   `draw(0..4, primer_quad..primer_quad+n)`.
+2. Pipeline `vs_instanced` (opaco, cutout y translúcido), la página del chunk como buffer de
+   vértices por instancia (`Uint32x2` en `@location(0)`, stride 8) y su página de luz como
+   segundo buffer por instancia (`Uint32x2` en `@location(1)`, mismos offsets: el mismo
+   `first_instance` llega a los dos), `TriangleStrip`; por bucket visible: `set_immediates(0,
+   origen del chunk)` y `draw(0..4, primer_quad..primer_quad+n)`.
 3. Blit.
 
 El bucket translúcido se dibuja desde ADR 0018 (agua y vidrio).
@@ -1098,7 +1106,7 @@ uniform block y que ningún shader guarda un array en una variable local.
 ### 10.7 Luz en el fragment shader y día y noche (ADR 0015)
 
 Cada quad lleva el índice de su entrada en la paleta de luz del chunk: las `LightValue` (cielo,
-rojo, verde, azul, 4 bits cada uno) de sus 4 esquinas. High y Mid la leen del arena en
+rojo, verde, azul, 4 bits cada uno) de sus 4 esquinas. High y Mid la leen de la página en
 `ChunkGpu::light_base` más el índice, sin binding nuevo; Low la recibe ya expandida como segundo
 atributo de instancia. Un índice fuera de la paleta (solo en una malla mal hecha) da cielo
 abierto en los tres tiers y en la CPU: High y Mid lo comparan con `ChunkGpu::light_len` y nunca
