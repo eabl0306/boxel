@@ -95,7 +95,7 @@ use boxel::gfx::{CLI_HELP, PresentModePref};
 use boxel::log::span_times::{self, SpanFrame, SpanTimes};
 use boxel::mesh::AoPolicy;
 use boxel::prelude::*;
-use boxel::render::fog::FogResolution;
+use boxel::render::fog::{FogResolution, FogSettings};
 use boxel::render::{DistanceFog, GpuFailed, TextureSource, TranslucentSort};
 use boxel::voxel::{
     BlockPos, BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, LocalPos, MAX_BLOCK_COORD,
@@ -1751,7 +1751,7 @@ fn main() -> AppExit {
         app.insert_resource(EditScript::new(DVec3::new(x, y, z)));
     }
     // `--fog`: the plugin only when asked (off adds nothing at all). The far presets end their
-    // clouds at the `--lod` preset's horizon.
+    // clouds at the `--lod` preset's horizon while the LOD draws ([`fog_follows_the_lod`]).
     if let Some(settings) = options.fog.settings(
         options.fog_res,
         options.fog_steps,
@@ -1759,6 +1759,15 @@ fn main() -> AppExit {
         options.fog_haze,
     ) {
         app.add_plugins(FogPlugin { settings });
+        if options.lod != lod::LodPreset::Off {
+            app.insert_resource(FarFog {
+                preset: options.fog,
+                haze: options.fog_haze,
+                lod: options.lod,
+                horizon: options.lod.horizon(),
+            })
+            .add_systems(Update, fog_follows_the_lod);
+        }
     }
     // `--lod`: the same.
     if let Some(settings) = options.lod.settings() {
@@ -1785,6 +1794,36 @@ fn main() -> AppExit {
     // is 144 fps).
     app.insert_resource(fps_limit);
     app.run()
+}
+
+/// `--fog` with `--lod`: what the far presets' clouds are built from.
+#[derive(Resource)]
+struct FarFog {
+    preset: fog::FogPreset,
+    /// `--fog-haze`.
+    haze: f32,
+    lod: lod::LodPreset,
+    /// The horizon the layers end their far clouds at.
+    horizon: Option<f32>,
+}
+
+/// The far presets end their clouds at the LOD's horizon while it draws, and at 768 blocks, as
+/// without it, while it draws nothing (a GL backend or a failed LOD pass, its guard:
+/// [`lod::LodPreset::drawn_horizon`]). The layers are set only when they change.
+fn fog_follows_the_lod(
+    stats: Option<Res<LodStats>>,
+    mut far: ResMut<FarFog>,
+    mut settings: ResMut<FogSettings>,
+) {
+    let horizon = far.lod.drawn_horizon(stats.as_deref());
+    if horizon == far.horizon {
+        return;
+    }
+    far.horizon = horizon;
+    let layers = fog::with_haze_factor(far.preset.layers(horizon).unwrap_or_default(), far.haze);
+    if settings.layers != layers {
+        settings.layers = layers;
+    }
 }
 
 #[cfg(test)]
@@ -1981,6 +2020,50 @@ mod tests {
             (o.timeout, o.scenario),
             (Duration::from_secs(30), Scenario::Spin)
         );
+    }
+
+    /// With `--lod`, the far clouds end at its horizon while it draws and at 768 blocks while it
+    /// draws nothing (a GL backend); a preset without far clouds is left alone.
+    #[test]
+    fn far_clouds_follow_whether_the_lod_draws() {
+        use boxel::fog::FogFade;
+        use boxel::world::lod::LodOff;
+        let follow = |preset: fog::FogPreset| {
+            let mut app = App::new();
+            let settings = preset.settings(FogResolution::Half, 64, Some(12_288.0), 1.0);
+            app.insert_resource(settings.expect("layers"))
+                .insert_resource(FarFog {
+                    preset,
+                    haze: 1.0,
+                    lod: lod::LodPreset::Far,
+                    horizon: Some(12_288.0),
+                })
+                .add_systems(Update, fog_follows_the_lod);
+            app
+        };
+        let set_off = |app: &mut App, off| {
+            app.insert_resource(LodStats {
+                off,
+                ..LodStats::default()
+            });
+            app.update();
+        };
+        let mut app = follow(fog::FogPreset::Cumulus16);
+        let cloud_fade = |app: &App| app.world().resource::<FogSettings>().layers[1].fade;
+        let range = |start, end| FogFade::Range { start, end };
+        app.update();
+        assert_eq!(cloud_fade(&app), range(6144.0, 12_288.0), "no stats yet");
+        set_off(&mut app, Some(LodOff::Unsupported));
+        assert_eq!(cloud_fade(&app), range(384.0, 768.0));
+        set_off(&mut app, None);
+        assert_eq!(cloud_fade(&app), range(6144.0, 12_288.0));
+        // `both` has no far clouds: its settings are never touched.
+        let mut app = follow(fog::FogPreset::Both);
+        app.update();
+        let changed = |app: &App| app.world().resource_ref::<FogSettings>().last_changed();
+        let before = changed(&app);
+        set_off(&mut app, Some(LodOff::Unsupported));
+        assert_eq!(changed(&app), before);
     }
 
     #[test]

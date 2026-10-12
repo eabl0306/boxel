@@ -3,7 +3,7 @@
 //! `LodSource`).
 #![allow(dead_code, reason = "each example uses its own part")]
 
-use boxel::world::lod::LodSettings;
+use boxel::world::lod::{LodSettings, LodStats};
 
 /// Help lines of `--lod`.
 pub const USAGE: &str =
@@ -66,6 +66,14 @@ impl LodPreset {
     pub fn horizon(self) -> Option<f32> {
         self.settings().map(|s| s.preset_horizon() as f32)
     }
+
+    /// The horizon the LOD draws to: [`LodPreset::horizon`] while it draws, `None` while its
+    /// stats say it draws nothing ([`LodStats::off`]: disabled, a GL backend or a failed LOD
+    /// pass, its guard...). Without stats (no LOD plugin yet), the preset's.
+    pub fn drawn_horizon(self, stats: Option<&LodStats>) -> Option<f32> {
+        self.horizon()
+            .filter(|_| stats.is_none_or(|s| s.off.is_none()))
+    }
 }
 
 /// `--lod PRESET`.
@@ -114,6 +122,20 @@ mod tests {
         }
         assert!(LodPreset::Off.settings().is_none());
         assert_eq!(LodPreset::Off.horizon(), None);
+    }
+
+    #[test]
+    fn the_drawn_horizon_is_none_while_the_lod_draws_nothing() {
+        use boxel::world::lod::LodOff;
+        let far = LodPreset::Far;
+        assert_eq!(far.drawn_horizon(None), Some(12_288.0));
+        let mut stats = LodStats::default();
+        assert_eq!(far.drawn_horizon(Some(&stats)), Some(12_288.0));
+        for off in [LodOff::Unsupported, LodOff::Guard, LodOff::Disabled] {
+            stats.off = Some(off);
+            assert_eq!(far.drawn_horizon(Some(&stats)), None, "{off:?}");
+        }
+        assert_eq!(LodPreset::Off.drawn_horizon(None), None);
     }
 
     #[test]

@@ -999,12 +999,18 @@ fn run(
             width: style.width,
         }));
     }
+    // `--lod`: its nodes, drawn to its horizon (the renderer moves the far plane and the terrain
+    // fog out to it).
+    let lod_label = lod::label(o.lod);
+    renderer.set_lod(&gpu.device, lod_input);
     // `--fog`: the demo's preset at a fixed tick (the same cells every run), its far clouds
-    // ending at the `--lod` preset's horizon.
+    // ending at the `--lod` preset's horizon while the LOD draws (not on a GL backend: there
+    // they end at 768 blocks, as without it).
     let fog_label = fog::label(o.fog, o.fog_res, o.fog_steps, o.fog_haze);
+    let fog_horizon = o.lod.horizon().filter(|_| renderer.lod_far().is_some());
     if let Some(settings) = o
         .fog
-        .settings(o.fog_res, o.fog_steps, o.lod.horizon(), o.fog_haze)
+        .settings(o.fog_res, o.fog_steps, fog_horizon, o.fog_haze)
     {
         renderer.set_fog(
             &gpu.device,
@@ -1014,10 +1020,6 @@ fn run(
             }),
         );
     }
-    // `--lod`: its nodes, drawn to its horizon (the renderer moves the far plane and the terrain
-    // fog out to it).
-    let lod_label = lod::label(o.lod);
-    renderer.set_lod(&gpu.device, lod_input);
     let camera = Camera {
         view_distance: world::view_distance(ChunkViewer::new(o.radius)),
         fov_y_radians: o.fov.to_radians(),

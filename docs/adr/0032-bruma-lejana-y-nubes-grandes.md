@@ -127,8 +127,12 @@ LOD (768 bloques sin LOD, donde terminan las nubes de hoy):
 - `--fog-haze F` (0 a 1, 1 por defecto) multiplica la bruma de cada capa. En 0 las nubes se
   desvanecen en sus celdas (de la mitad al final) en lugar de cortarse en un círculo: es la
   burbuja de hoy. Shift+F7 lo recorre: 1, 0,25 y 0.
-- F8 rearma las capas al cambiar el LOD, así las nubes siguen el horizonte nuevo (oculto: 768).
-- `stress` y `snapshot` pasan el horizonte del preset de `--lod` y aceptan `--fog-haze`.
+- Las nubes lejanas toman el horizonte del LOD mientras dibuja. Si no dibuja nada (oculto con
+  F8, un adaptador por software, un backend GL, una pasada que falló o su guarda, según
+  `LodStats::off`) terminan a 768, como sin LOD. Cuando eso cambia, con F8 o sin tocar nada, las
+  capas se rearman.
+- `stress` y `snapshot` pasan el horizonte del preset de `--lod` con la misma regla y aceptan
+  `--fog-haze`.
 
 ## Límites conocidos
 

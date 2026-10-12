@@ -67,7 +67,7 @@
 //!
 //! `--fog PRESET` adds the cubic fog and clouds (ADR 0030 and 0032); off by default. F7 cycles
 //! the presets, Shift+F7 the haze past the cells (1, 0.25 and 0, today's bubble), and the far
-//! presets end their clouds at the LOD's horizon, following F8.
+//! presets end their clouds at the LOD's horizon while it draws, following F8.
 //!
 //! The terrain fades into the sky over the last stretch before the view distance (or the LOD's
 //! horizon): the last 10 %, at most 64 blocks (`RenderSettings::distance_fog`).
@@ -2001,6 +2001,7 @@ fn main() -> AppExit {
             .insert_resource(FogCycle {
                 preset: options.fog,
                 haze: options.fog_haze,
+                horizon: options.lod.horizon(),
             })
             .add_systems(Update, cycle_fog);
     }
@@ -2126,7 +2127,11 @@ mod tests {
         let res = boxel::render::fog::FogResolution::Half;
         let settings = preset.settings(res, 64, Some(12_288.0), 1.0);
         app.insert_resource(settings.expect("layers"))
-            .insert_resource(FogCycle { preset, haze: 1.0 })
+            .insert_resource(FogCycle {
+                preset,
+                haze: 1.0,
+                horizon: Some(12_288.0),
+            })
             .insert_resource(LodCycle::new(lod::LodPreset::Far))
             .insert_resource(lod::LodPreset::Far.settings().expect("settings"))
             .init_resource::<ButtonInput<KeyCode>>()
@@ -2175,6 +2180,18 @@ mod tests {
         press(&mut app, KeyCode::F8, false);
         assert_eq!(cloud_fade(&app), range(384.0, 768.0));
         press(&mut app, KeyCode::F8, false);
+        assert_eq!(cloud_fade(&app), range(2048.0, 4096.0));
+        // The LOD drawing nothing (a GL backend, a failed LOD pass): 768, then back.
+        let lod_off = |app: &mut App, off| {
+            app.insert_resource(boxel::world::lod::LodStats {
+                off,
+                ..Default::default()
+            });
+            app.update();
+        };
+        lod_off(&mut app, Some(boxel::world::lod::LodOff::Unsupported));
+        assert_eq!(cloud_fade(&app), range(384.0, 768.0));
+        lod_off(&mut app, None);
         assert_eq!(cloud_fade(&app), range(2048.0, 4096.0));
         // F7 goes on through decks, inside, sunset, off and back.
         let mut seen = Vec::new();
@@ -3542,6 +3559,8 @@ struct FogCycle {
     preset: fog::FogPreset,
     /// Every layer's haze times this ([`fog::with_haze_factor`]).
     haze: f32,
+    /// The horizon the layers end their far clouds at ([`fog_horizon`] when they were built).
+    horizon: Option<f32>,
 }
 
 impl FogCycle {
@@ -3562,25 +3581,25 @@ impl FogCycle {
     }
 }
 
-/// The horizon the far fog presets end their clouds at: the LOD's while it draws, `None`
-/// without it (hidden by F8, a software adapter or no LOD plugin).
-fn fog_horizon(lod: Option<&LodCycle>) -> Option<f32> {
+/// The horizon the far fog presets end their clouds at: the LOD's while it draws, `None` while
+/// it draws nothing (hidden by F8, a software adapter, a GL backend or a failed LOD pass, its
+/// guard: [`lod::LodPreset::drawn_horizon`]) or without the LOD plugin.
+fn fog_horizon(lod: Option<&LodCycle>, stats: Option<&boxel::world::lod::LodStats>) -> Option<f32> {
     lod.filter(|c| !c.hidden && !c.software)
-        .and_then(|c| c.preset.horizon())
+        .and_then(|c| c.preset.drawn_horizon(stats))
 }
 
 /// F7: the next fog preset (`off` keeps the plugin with no layers); Shift+F7: the next haze
-/// factor. Both named in the log. When F8 changes the LOD, the layers are built again so the
-/// far clouds end at the new horizon.
+/// factor. Both named in the log. When the horizon the LOD draws to changes (F8, or the LOD
+/// turning off or on), the layers are built again so the far clouds end at the new one.
 fn cycle_fog(
     keys: Res<ButtonInput<KeyCode>>,
     mut cycle: ResMut<FogCycle>,
     mut settings: ResMut<boxel::render::fog::FogSettings>,
     lod: Option<Res<LodCycle>>,
+    stats: Option<Res<boxel::world::lod::LodStats>>,
 ) {
-    let lod_changed = lod
-        .as_ref()
-        .is_some_and(|l| l.is_changed() && !l.is_added());
+    let horizon = fog_horizon(lod.as_deref(), stats.as_deref());
     if keys.just_pressed(KeyCode::F7) {
         if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
             cycle.haze = FogCycle::next_haze(cycle.haze);
@@ -3591,10 +3610,11 @@ fn cycle_fog(
             cycle.preset = all[(i + 1) % all.len()];
             eprintln!("fog: {}", cycle.preset.name());
         }
-    } else if !lod_changed {
+    } else if horizon == cycle.horizon {
         return;
     }
-    settings.layers = cycle.layers(fog_horizon(lod.as_deref()));
+    cycle.horizon = horizon;
+    settings.layers = cycle.layers(horizon);
 }
 
 /// What F8 shows (`--lod`; only with the LOD plugin): a preset, or the LOD hidden.
