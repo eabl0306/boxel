@@ -248,9 +248,9 @@ fn without_a_window_the_plugin_stays_idle() {
     assert!(!app.world().resource::<RenderInfo>().ready);
 }
 
-/// The chunk memory a renderer starts with (ADR 0035): two pages of 4 Mi quads, 32,768 slots,
-/// the ceiling by adapter class, growth on; invalid settings are refused before a renderer is
-/// built.
+/// The chunk memory a renderer starts with (ADR 0035): 8 Mi quads (four pages of 2 Mi, chunk
+/// places for every slot), 32,768 slots, pages of 4 Mi quads, the ceiling by adapter class,
+/// growth on; invalid settings are refused before a renderer is built.
 #[test]
 fn chunk_memory_settings_default_and_validate() {
     let settings = RenderSettings::default().chunk_memory;

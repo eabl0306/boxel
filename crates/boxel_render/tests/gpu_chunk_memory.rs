@@ -17,7 +17,9 @@
 //! - a default 4 Mi page filled past quad 65,535: those ranges read back exact;
 //! - High's draw lists past 65,535 draws: about 22,500 chunks of six visible face buckets each
 //!   (and 2,000 with 64 chunks a page). The draws the cull wrote equal the CPU count, nothing is
-//!   dropped, and High draws what Mid draws (0.1 % of the pixels, channel tolerance 2).
+//!   dropped, and High draws what Mid draws (0.1 % of the pixels, channel tolerance 2);
+//! - the default floor's chunk places cover its 32,768 slots, and a page full of chunks with
+//!   quads to spare refuses with `RendererError::PageChunksFull`, shown in the stats.
 //!
 //! Failing images are saved under `CARGO_TARGET_TMPDIR/gpu_chunk_memory/`.
 #![expect(clippy::print_stderr, reason = "test progress and failure details")]
@@ -822,8 +824,9 @@ fn render_lists(
     Ok(image)
 }
 
-/// About 22,500 chunks at the default 10,922 chunks a page: three pages, 67,500 draws or more
-/// (one list held 65,535 before pages, and High dropped the rest).
+/// About 22,500 chunks at the default 10,922 chunks a page: 67,500 draws or more over three of
+/// the floor's four pages (its 32,768 slots need four; one list held 65,535 before pages, and
+/// High dropped the rest).
 #[test]
 fn high_lists_hold_every_bucket_past_65535_draws() {
     let memory = ChunkMemorySettings {
@@ -848,4 +851,78 @@ fn high_lists_hold_every_bucket_with_small_pages() {
         ..ChunkMemorySettings::default()
     };
     lists_past_one_list(45, memory, 6000);
+}
+
+/// The default floor holds the 32,768 slots' chunks (four pages of 2 Mi quads), and a page full
+/// of chunks refuses with its own error while it still has quads free, shown in the stats.
+#[test]
+fn pages_full_of_chunks_are_told_apart() {
+    each_tier("chunk places", |adapter, caps, tier, _report| {
+        let (device, queue, errors) = device_for(adapter, caps, tier)?;
+        let default = renderer(
+            &device,
+            &queue,
+            tier,
+            ChunkMemorySettings::default(),
+            TranslucentSort::Off,
+        )?;
+        let memory = default.stats().chunk_memory;
+        if (memory.pages, memory.capacity_quads) != (4, 8 << 20) || memory.chunk_places < 32768 {
+            return Err(format!("default floor: {memory:?}"));
+        }
+        drop(default);
+        // one page of 4 chunk places (the ceiling allows no more), 8 slots
+        let capped = ChunkMemorySettings {
+            initial_quads: 1 << 16,
+            initial_slots: 8,
+            max_quads: boxel_render::MemoryCeiling::Quads(1 << 16),
+            page_quads: 1 << 16,
+            page_chunks: 4,
+            grow: false,
+            ..ChunkMemorySettings::default()
+        };
+        let mut renderer = renderer(&device, &queue, tier, capped, TranslucentSort::Off)?;
+        let mesh = Arc::new(cube_mesh());
+        let origin = |id: u64| I64Vec3::new(64 * id as i64, 0, 0);
+        for id in 0..4 {
+            renderer
+                .upsert_chunk(id, origin(id), Arc::clone(&mesh))
+                .map_err(|e| format!("chunk {id}: {e}"))?;
+        }
+        match renderer.upsert_chunk(4, origin(4), Arc::clone(&mesh)) {
+            Err(boxel_render::RendererError::PageChunksFull {
+                needed: 7,
+                page_chunks: 4,
+            }) => {}
+            other => return Err(format!("a fifth chunk: {other:?}")),
+        }
+        let stats = renderer.stats();
+        let memory = stats.chunk_memory;
+        if (memory.pages, memory.chunk_places, memory.full_pages) != (1, 4, 1)
+            || memory.largest_free_quads < 7
+            || (stats.chunks, stats.dropped_chunks) != (4, 1)
+        {
+            return Err(format!("full of chunks: {stats:?}"));
+        }
+        let mut refused = Vec::new();
+        renderer.take_refused(|pos, r| refused.push((pos, r)));
+        if refused != [(boxel_voxel::ChunkPos::new(2 * 4, 0, 0), true)] {
+            return Err(format!("refused: {refused:?}"));
+        }
+        // a removed chunk frees its place
+        renderer.remove_chunk(0);
+        renderer
+            .upsert_chunk(4, origin(4), Arc::clone(&mesh))
+            .map_err(|e| format!("after a removal: {e}"))?;
+        if renderer.stats().chunk_memory.full_pages != 1 {
+            return Err(format!("after a removal: {:?}", renderer.stats()));
+        }
+        let view = look(
+            DVec3::new(160.0, 100.0, -60.0),
+            DVec3::new(160.0, 16.0, 16.0),
+            I64Vec3::ZERO,
+        );
+        frame(&device, &queue, &mut renderer, Vec::new(), false, &view)?;
+        no_errors(&errors)
+    });
 }

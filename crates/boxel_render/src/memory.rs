@@ -1,8 +1,8 @@
-//! Chunk memory in pages (ADR 0035). Chunk quads live in several GPU buffers of a fixed size, the
-//! pages, each sub-allocated by its own [`ArenaAllocator`]. A chunk's whole range (its 8 buckets,
-//! then its light palette) sits in one page, so `ChunkGpu::quad_base` and `light_base` are
-//! page-local and every draw binds its chunk's page. On Low every page has a light page of the
-//! same size, parallel to it (ADR 0015).
+//! Chunk memory in pages (ADR 0035). Chunk quads live in several GPU buffers of a fixed size
+//! (floor pages may be smaller), the pages, each sub-allocated by its own [`ArenaAllocator`]. A
+//! chunk's whole range (its 8 buckets, then its light palette) sits in one page, so
+//! `ChunkGpu::quad_base` and `light_base` are page-local and every draw binds its chunk's page.
+//! On Low every page has a light page of the same size, parallel to it (ADR 0015).
 //!
 //! A page has a class: chunks with translucent quads go to Translucent pages, so the back to front
 //! translucent pass, one order on every tier, seldom switches buffers. Placement is deterministic
@@ -11,7 +11,8 @@
 //! one High draw-list segment: a page holds at most `page_chunks` chunks, so its 6 face buckets
 //! each fit one indirect list of [`PAGE_DRAWS_MAX`] draws.
 //!
-//! The renderer creates the floor pages at GPU start ([`MemoryLayout`]). The memory work emits
+//! The renderer creates the floor pages at GPU start ([`MemoryLayout`]), enough of them for the
+//! initial table's chunks (the floor's quads then go over smaller pages). The memory work emits
 //! what it writes as [`MemOp`]s through a [`CopySink`]: the GPU sink stages them and records the
 //! copies, a test sink replays them over byte models of the pages.
 use crate::arena::{ArenaAlloc, ArenaAllocator, QUAD_BYTES};
@@ -72,11 +73,14 @@ impl MemoryCeiling {
 /// ([`crate::RendererError`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChunkMemorySettings {
-    /// Quads of the pages created at GPU start (default 8 Mi: two pages, 64 MiB). Below
-    /// `page_quads` the floor is one page of exactly this many quads (small apps and tests keep
-    /// a single arena); above, whole pages. With two pages or more one of them is Translucent.
+    /// Quads of the pages created at GPU start, the floor (default 8 Mi, 64 MiB: four pages of
+    /// 2 Mi). Below `page_quads` the floor is one page of exactly this many quads (small apps
+    /// and tests keep a single arena); above, whole pages. When `initial_slots` needs more pages
+    /// than that (`page_chunks` chunks a page), the same quads go over that many smaller pages,
+    /// each of `MIN_PAGE_QUADS` at least. With two pages or more the last one is Translucent.
     pub initial_quads: u32,
-    /// Chunk slots of the table created at GPU start (default 32,768). High also clamps them to
+    /// Chunk slots of the table created at GPU start (default 32,768); the floor has chunk
+    /// places for all of them when its quads allow (`initial_quads`). High also clamps them to
     /// `64 * max_compute_workgroups_per_dimension`, High and Mid to the storage binding size.
     pub initial_slots: u32,
     /// The most quads the pages may hold.
@@ -239,26 +243,48 @@ impl MemoryLayout {
             .clamp(1, list_pages_limit(page_chunks));
         let ceiling_quads = ceiling.min(u64::from(max_pages) * u64::from(page_quads));
         let ceiling_slots = settings.max_slots.clamp(1, facts.slot_limit);
+        let slots = settings.initial_slots.clamp(1, ceiling_slots);
         let initial = u64::from(settings.initial_quads.max(1)).min(ceiling_quads);
-        let floor = if initial < u64::from(page_quads) {
-            vec![(PageClass::Solid, initial as u32)]
+        let mut sizes = if initial < u64::from(page_quads) {
+            vec![initial]
         } else {
             let pages = initial
                 .div_ceil(u64::from(page_quads))
                 .min(u64::from(max_pages)) as usize;
-            let mut floor = vec![(PageClass::Solid, page_quads); pages];
-            if pages >= 2
-                && let Some(last) = floor.last_mut()
-            {
-                last.0 = PageClass::Translucent;
-            }
-            floor
+            vec![u64::from(page_quads); pages]
         };
+        // Enough pages for the initial table's chunks, `page_chunks` each: nothing adds pages
+        // later yet, and a page full of chunks refuses one with quads to spare. The same quads
+        // go over more, smaller pages (at least `MIN_PAGE_QUADS` each, at most `max_pages`).
+        let total: u64 = sizes.iter().sum();
+        let for_slots = u64::from(slots.div_ceil(page_chunks))
+            .min(u64::from(max_pages))
+            .min(total / u64::from(MIN_PAGE_QUADS));
+        if for_slots > sizes.len() as u64 {
+            let (each, extra) = (total / for_slots, total % for_slots);
+            sizes = (0..for_slots)
+                .map(|i| each + u64::from(i < extra))
+                .collect();
+        }
+        let pages = sizes.len();
+        let floor = sizes
+            .into_iter()
+            .enumerate()
+            .map(|(i, quads)| {
+                // with two pages or more the last one is Translucent
+                let class = if pages >= 2 && i + 1 == pages {
+                    PageClass::Translucent
+                } else {
+                    PageClass::Solid
+                };
+                (class, quads as u32)
+            })
+            .collect();
         Self {
             page_quads,
             page_chunks,
             floor,
-            slots: settings.initial_slots.clamp(1, ceiling_slots),
+            slots,
             max_pages,
             ceiling_quads,
             ceiling_slots,
@@ -268,6 +294,16 @@ impl MemoryLayout {
     /// Opaque draws of one page's High list.
     pub fn stride(&self) -> u32 {
         6 * self.page_chunks
+    }
+
+    /// Quads of the floor pages.
+    pub fn floor_quads(&self) -> u64 {
+        self.floor.iter().map(|&(_, quads)| u64::from(quads)).sum()
+    }
+
+    /// Chunks the floor pages hold at most.
+    pub fn floor_chunk_places(&self) -> u64 {
+        self.floor.len() as u64 * u64::from(self.page_chunks)
     }
 }
 
@@ -543,6 +579,25 @@ impl ChunkMemory {
             .unwrap_or(0)
     }
 
+    /// Chunks the pages hold at most.
+    pub fn chunk_places(&self) -> u32 {
+        self.pages().count() as u32 * self.page_chunks
+    }
+
+    /// Pages holding `page_chunks` chunks: they take no new chunk, whatever quads they have
+    /// free.
+    pub fn full_pages(&self) -> u32 {
+        self.pages()
+            .filter(|(_, p)| p.chunks >= self.page_chunks)
+            .count() as u32
+    }
+
+    /// True if some page has a free range of `size` quads (whether or not it has a chunk
+    /// place left).
+    fn has_range(&self, size: u32) -> bool {
+        self.pages().any(|(_, p)| p.alloc.largest_free() >= size)
+    }
+
     /// Bytes of the allocator nodes.
     pub fn cpu_bytes(&self) -> u64 {
         self.pages()
@@ -579,6 +634,8 @@ pub(crate) enum Refusal {
     Table,
     /// No page can take `needed` quads; `resident`: the chunk's older mesh stays.
     Pages { needed: u32, resident: bool },
+    /// A page has `needed` quads free, but every such page holds `page_chunks` chunks.
+    PageChunks { needed: u32, resident: bool },
 }
 
 /// Places chunk `id`'s non-empty `mesh` at `origin`: a slot, a range in a page, its record, and
@@ -600,9 +657,13 @@ pub(crate) fn upsert_resident(
     let old = chunks.get(id).map(|(_, r)| r.alloc);
     let counts = bucket_counts(mesh);
     let Some(alloc) = memory.place(old, needed, PageClass::of(&counts)) else {
-        return Err(Refusal::Pages {
-            needed,
-            resident: old.is_some(),
+        let resident = old.is_some();
+        // `place` takes any page with the range and a chunk place (the old page needs no
+        // place), so a page that has the range is full of chunks
+        return Err(if memory.has_range(needed) {
+            Refusal::PageChunks { needed, resident }
+        } else {
+            Refusal::Pages { needed, resident }
         });
     };
     let record = ChunkRecord {
@@ -812,6 +873,11 @@ pub struct ChunkMemoryStats {
     pub table_bytes: u64,
     /// Bytes of High's draw lists.
     pub list_bytes: u64,
+    /// Chunks the pages hold at most: [`ChunkMemorySettings::page_chunks`] a page.
+    pub chunk_places: u32,
+    /// Pages holding `page_chunks` chunks: they take no new chunk, whatever quads they have free
+    /// ([`crate::RendererError::PageChunksFull`]).
+    pub full_pages: u32,
     /// Extra binds of the last frame's translucent pass: one each time two buckets drawn one
     /// after the other sit in different pages.
     pub translucent_page_switches: u32,
@@ -1104,7 +1170,16 @@ mod tests {
         let discrete = facts(wgpu::DeviceType::DiscreteGpu);
         let default = MemoryLayout::resolve(&ChunkMemorySettings::default(), discrete);
         assert_eq!(default.page_quads, 4 << 20);
-        assert_eq!(default.floor, [(Solid, 4 << 20), (Translucent, 4 << 20)]);
+        // 8 Mi quads in pages of 2 Mi: four pages hold the 32,768 slots' chunks
+        assert_eq!(
+            default.floor,
+            [
+                (Solid, 2 << 20),
+                (Solid, 2 << 20),
+                (Solid, 2 << 20),
+                (Translucent, 2 << 20)
+            ]
+        );
         assert_eq!((default.slots, default.page_chunks), (32768, 10922));
         assert_eq!(default.ceiling_quads, 192 << 20);
         assert_eq!(default.max_pages, 48);
@@ -1135,9 +1210,13 @@ mod tests {
         );
         let odd = ChunkMemorySettings {
             initial_quads: (4 << 20) + 1,
+            initial_slots: 64,
             ..ChunkMemorySettings::default()
         };
-        assert_eq!(MemoryLayout::resolve(&odd, discrete).floor.len(), 2);
+        assert_eq!(
+            MemoryLayout::resolve(&odd, discrete).floor,
+            [(Solid, 4 << 20), (Translucent, 4 << 20)]
+        );
         // the device cuts the page size; the ceiling by adapter class
         let tiny = DeviceFacts {
             page_limit: 1 << 20,
@@ -1184,6 +1263,136 @@ mod tests {
         );
         let memory = ChunkMemory::with_floor(&layout);
         assert!(memory.pages().all(|(id, _)| u32::from(id) < MAX_PAGES));
+    }
+
+    /// A non-empty mesh of `quads` opaque quads (`quads + 1` entries with its palette).
+    fn solid_mesh(quads: u32) -> Arc<ChunkMesh> {
+        let mut counts = [0; BUCKET_COUNT];
+        counts[0] = quads;
+        let quads = vec![PackedQuad { geo: 0, mat: 0 }; quads as usize];
+        Arc::new(ChunkMesh::from_quads(quads, counts))
+    }
+
+    /// The floor holds every chunk the initial table does, as main's single arena did whenever
+    /// the quads fit (growth, which would add pages for chunk places, is not there yet): the
+    /// table refuses first, never a page full of chunks with quads to spare. The quads are the
+    /// ones asked for.
+    #[test]
+    fn the_floor_holds_every_initial_slot() {
+        let discrete = facts(wgpu::DeviceType::DiscreteGpu);
+        // the defaults, the overworld of the examples, a floor below one page
+        for (quads, slots) in [(8 << 20, 32768), (24 << 20, 65536), (2 << 20, 32768)] {
+            let settings = ChunkMemorySettings {
+                initial_quads: quads,
+                initial_slots: slots,
+                ..ChunkMemorySettings::default()
+            };
+            let layout = MemoryLayout::resolve(&settings, discrete);
+            let what = format!("{quads} quads, {slots} slots: {:?}", layout.floor);
+            assert_eq!(layout.floor_quads(), u64::from(quads), "{what}");
+            assert!(layout.floor_chunk_places() >= u64::from(slots), "{what}");
+            assert!(
+                layout
+                    .floor
+                    .iter()
+                    .all(|&(_, q)| (MIN_PAGE_QUADS..=layout.page_quads).contains(&q)),
+                "{what}"
+            );
+            let mut memory = ChunkMemory::with_floor(&layout);
+            let mut chunks = ChunkTable::new(layout.slots);
+            let mut uploads = Uploads::default();
+            let mesh = solid_mesh(1);
+            for id in 0..u64::from(slots) {
+                upsert_resident(
+                    &mut memory,
+                    &mut chunks,
+                    &mut uploads,
+                    id,
+                    I64Vec3::ZERO,
+                    &mesh,
+                )
+                .unwrap_or_else(|e| panic!("{what}: chunk {id} refused: {e:?}"));
+            }
+            let next = u64::from(slots);
+            let refusal = upsert_resident(
+                &mut memory,
+                &mut chunks,
+                &mut uploads,
+                next,
+                I64Vec3::ZERO,
+                &mesh,
+            );
+            assert_eq!(refusal, Err(Refusal::Table), "{what}");
+        }
+        // the floors of the existing tests and of the examples' big worlds keep their pages
+        let small = ChunkMemorySettings {
+            initial_quads: 1 << 18,
+            initial_slots: 4096,
+            ..ChunkMemorySettings::default()
+        };
+        assert_eq!(
+            MemoryLayout::resolve(&small, discrete).floor,
+            [(Solid, 1 << 18)]
+        );
+        let big = ChunkMemorySettings {
+            initial_quads: 48 << 20,
+            initial_slots: 98304,
+            ..ChunkMemorySettings::default()
+        };
+        let layout = MemoryLayout::resolve(&big, discrete);
+        assert_eq!(layout.floor.len(), 12);
+        assert!(layout.floor.iter().all(|&(_, q)| q == 4 << 20));
+        // no split page below `MIN_PAGE_QUADS`: tiny pages of few chunks stay as asked
+        let tiny = ChunkMemorySettings {
+            initial_quads: 32 * 4096,
+            initial_slots: 4096,
+            page_quads: 4096,
+            page_chunks: 64,
+            ..ChunkMemorySettings::default()
+        };
+        let layout = MemoryLayout::resolve(&tiny, discrete);
+        assert_eq!(layout.floor.len(), 32);
+        assert!(
+            layout.floor_chunk_places() < 4096,
+            "the quads cap the pages"
+        );
+    }
+
+    /// A refusal tells quads that ran out from pages full of chunks.
+    #[test]
+    fn a_refusal_tells_quads_from_chunk_places() {
+        let mut m = memory(&[Solid, Translucent], 1024, 2);
+        let mut chunks = ChunkTable::new(16);
+        let mut uploads = Uploads::default();
+        let small = solid_mesh(1);
+        for id in 0..4 {
+            let placed =
+                upsert_resident(&mut m, &mut chunks, &mut uploads, id, I64Vec3::ZERO, &small);
+            assert_eq!(placed, Ok(()));
+        }
+        assert_eq!((m.full_pages(), m.chunk_places()), (2, 4));
+        // quads to spare in both pages, no chunk place
+        assert_eq!(
+            upsert_resident(&mut m, &mut chunks, &mut uploads, 4, I64Vec3::ZERO, &small),
+            Err(Refusal::PageChunks {
+                needed: 2,
+                resident: false
+            })
+        );
+        // a resident chunk larger than any free range: the quads ran out
+        let large = solid_mesh(1500);
+        assert_eq!(
+            upsert_resident(&mut m, &mut chunks, &mut uploads, 0, I64Vec3::ZERO, &large),
+            Err(Refusal::Pages {
+                needed: 1501,
+                resident: true
+            })
+        );
+        // a removed chunk frees its place
+        assert!(remove_resident(&mut m, &mut chunks, &mut uploads, 1));
+        assert_eq!((m.full_pages(), m.chunk_places()), (1, 4));
+        let placed = upsert_resident(&mut m, &mut chunks, &mut uploads, 4, I64Vec3::ZERO, &small);
+        assert_eq!(placed, Ok(()));
     }
 
     #[test]

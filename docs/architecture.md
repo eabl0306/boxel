@@ -927,7 +927,7 @@ cambia el layout.
 
 | Recurso | Uso | Tiers |
 |---|---|---|
-| Páginas de quads | buffers de tamaño fijo (4 Mi entradas de 8 bytes, 32 MiB, por defecto) `STORAGE` en High/Mid y `VERTEX` en Low, con `COPY_DST | COPY_SRC`, cada uno sub-asignado con `offset-allocator`: un chunk entero en una página, sus 8 buckets contiguos y, a continuación, su paleta de luz (`boxel_render::arena_len`: quads más entradas de paleta, al menos una). Clase Solid o Translucent; a lo sumo 10 922 chunks por página. Piso de 8 Mi entradas (dos páginas, 64 MiB) por defecto (ADR 0035) | todos |
+| Páginas de quads | buffers de tamaño fijo (4 Mi entradas de 8 bytes, 32 MiB, por defecto) `STORAGE` en High/Mid y `VERTEX` en Low, con `COPY_DST | COPY_SRC`, cada uno sub-asignado con `offset-allocator`: un chunk entero en una página, sus 8 buckets contiguos y, a continuación, su paleta de luz (`boxel_render::arena_len`: quads más entradas de paleta, al menos una). Clase Solid o Translucent; a lo sumo 10 922 chunks por página. Piso de 8 Mi entradas (64 MiB) por defecto, en cuatro páginas de 2 Mi para que entren los chunks de las 32 768 slots (ADR 0035) | todos |
 | Tabla de chunks | storage `array<ChunkGpu>` (64 B: origen i32x3 con los 32 bits bajos del origen `i64`, `quad_base` dentro de su página, 8 contadores, flags con el bit vivo solo dentro de la ventana de la cámara, que lee solo High, `light_base` = `quad_base` + quads en el offset 52, `light_len` (entradas de la paleta) en el 56, `page` en el 60) | High, Mid |
 | Luz por quad | una página de luz `VERTEX` por página, del mismo tamaño: en el offset de cada quad, su entrada de paleta ya expandida (segundo atributo de instancia) | Low |
 | Tabla CPU | espejo en CPU (origen `i64`, rangos, contadores) para culling en CPU | todos |
@@ -972,7 +972,9 @@ rebind, #9738).
 
 Si ninguna página puede tomar un chunk o la tabla se llena, el chunk no se sube: se cuenta en
 `RenderInfo::dropped_chunks`, se avisa en el log y aparece en la línea de diagnóstico `render`.
-Las páginas todavía no crecen: el piso es todo lo que hay hasta el M2 de #57 (ADR 0035).
+Una página llena de chunks que todavía tiene quads libres da su propio error
+(`RendererError::PageChunksFull`) y se ve en `ChunkMemoryStats::full_pages`. Las páginas todavía
+no crecen: el piso es todo lo que hay hasta el M2 de #57 (ADR 0035).
 
 ### 10.3 Pases por tier
 

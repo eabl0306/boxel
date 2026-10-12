@@ -18,7 +18,7 @@ y descartaba el resto sin orden.
 ### 1. Páginas de tamaño fijo
 
 Los quads viven en varios buffers del mismo tamaño, las páginas: 4 Mi quads (32 MiB) por
-defecto. Cada página tiene su propio `offset_allocator` con nodos `u32` (el modo `u16` corta los
+defecto. Las del piso pueden ser más chicas (punto 6). Cada página tiene su propio `offset_allocator` con nodos `u32` (el modo `u16` corta los
 offsets mayores a 65 535). Un chunk entero va en una página: sus 8 buckets y su paleta de luz. Así
 `quad_base` y `light_base` son locales a la página y los shaders de vértices no cambian. En Low
 cada página tiene una página de luz paralela.
@@ -53,9 +53,16 @@ igual tras un resync o al reabrir un mundo.
 ### 6. Ajustes
 
 `ChunkMemorySettings` reemplaza `arena_quads` y `max_chunk_slots`: el piso (`initial_quads`,
-8 Mi por defecto: dos páginas), las slots iniciales, el techo en quads y slots (igual en los tres
-tiers; los bytes solo se informan) y el tamaño de página. El techo automático es 192 Mi quads en
-una GPU dedicada, 96 Mi en una integrada y 32 Mi en otras.
+8 Mi por defecto), las slots iniciales, el techo en quads y slots (igual en los tres tiers; los
+bytes solo se informan) y el tamaño de página. El techo automático es 192 Mi quads en una GPU
+dedicada, 96 Mi en una integrada y 32 Mi en otras.
+
+El piso tiene lugar para los chunks de todas las slots iniciales, como el arena único de antes.
+Si sus quads dan menos páginas de las que hacen falta (una cada 10 922 slots), los mismos quads
+se reparten en más páginas, más chicas, de 4 096 quads como mínimo. Por defecto son cuatro
+páginas de 2 Mi: 64 MiB, igual que antes. Si el techo no deja tantas páginas, se avisa al
+arrancar. Un chunk que no entra porque las páginas con quads libres ya tienen todos sus chunks da
+su propio error, `PageChunksFull`, y las estadísticas cuentan esas páginas.
 
 ### 7. Lo que se escribe pasa por un sumidero
 

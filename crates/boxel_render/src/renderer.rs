@@ -165,8 +165,8 @@ pub struct RenderStats {
     pub draws: u32,
     /// Chunks not resident because no page could take them or the chunk table was full
     /// (cumulative). Non-zero means holes in the world: raise
-    /// [`ChunkMemorySettings::initial_quads`] or `initial_slots`, or the view distance is too
-    /// large for them.
+    /// [`ChunkMemorySettings::initial_quads`] (quads) or `initial_slots` (chunks: slots and the
+    /// floor's chunk places), or the view distance is too large for them.
     pub dropped_chunks: u32,
     /// Resident chunks inside the GPU window that cave culling hides this frame (ADR 0022): the
     /// world's visibility search did not reach them, because they are behind closed rock or
@@ -225,6 +225,15 @@ pub enum RendererError {
     ArenaFull {
         /// Quads requested.
         needed: u32,
+    },
+    /// A page has room for the mesh, but every such page holds its most chunks
+    /// ([`ChunkMemorySettings::page_chunks`]; the chunk keeps its older mesh, if any; logged).
+    #[error("chunk memory pages full of chunks ({page_chunks} each; {needed} quads requested)")]
+    PageChunksFull {
+        /// Quads requested.
+        needed: u32,
+        /// Chunks a page holds at most.
+        page_chunks: u32,
     },
     /// No free chunk slot.
     #[error("chunk table full ({0} slots)")]
@@ -586,13 +595,22 @@ impl VoxelRenderer {
             })
         });
         tracing::info!(
-            "chunk memory: {} floor page(s) of {} quads, {} chunks a page, {slots} slots, \
-             ceiling {} quads",
+            "chunk memory: a floor of {} quads in {} page(s), pages of {} quads, {} chunks a \
+             page, {slots} slots, ceiling {} quads",
+            layout.floor_quads(),
             layout.floor.len(),
             layout.page_quads,
             layout.page_chunks,
             layout.ceiling_quads
         );
+        if layout.floor_chunk_places() < u64::from(slots) {
+            tracing::warn!(
+                "chunk memory: the floor's {} page(s) hold {} chunks, fewer than the {slots} \
+                 slots (the ceiling or initial_quads limit the pages)",
+                layout.floor.len(),
+                layout.floor_chunk_places()
+            );
+        }
 
         let TierPipelines {
             layouts,
@@ -970,10 +988,11 @@ impl VoxelRenderer {
     }
 
     /// Calls `f` with every change since the last call, in order, of the chunks whose last
-    /// upload was refused ([`RendererError::ChunkTableFull`] or [`RendererError::ArenaFull`]):
-    /// `(position, true)` when refused, `(position, false)` when the chunk shows what was sent
-    /// last again (a later upload, a removal, [`VoxelRenderer::clear_chunks`]). Cave culling
-    /// sees through a refused chunk ([`boxel_world::ChunkVisibility::set_unshown`]).
+    /// upload was refused ([`RendererError::ChunkTableFull`], [`RendererError::ArenaFull`] or
+    /// [`RendererError::PageChunksFull`]): `(position, true)` when refused, `(position, false)`
+    /// when the chunk shows what was sent last again (a later upload, a removal,
+    /// [`VoxelRenderer::clear_chunks`]). Cave culling sees through a refused chunk
+    /// ([`boxel_world::ChunkVisibility::set_unshown`]).
     pub fn take_refused(&mut self, mut f: impl FnMut(ChunkPos, bool)) {
         for (pos, refused) in self.refused.changes.drain(..) {
             f(pos, refused);
@@ -1091,12 +1110,21 @@ impl VoxelRenderer {
                 self.refused.refuse(id, pos, false);
                 Err(RendererError::ChunkTableFull(self.chunks.capacity()))
             }
-            Err(Refusal::Pages { needed, resident }) => {
+            Err(
+                refusal @ (Refusal::Pages { needed, resident }
+                | Refusal::PageChunks { needed, resident }),
+            ) => {
                 // Nothing changed: a resident chunk keeps its old mesh (range and slot
                 // untouched), and goes on drawing it.
                 self.stats.dropped_chunks += 1;
                 self.refused.refuse(id, pos, resident);
-                Err(RendererError::ArenaFull { needed })
+                Err(match refusal {
+                    Refusal::PageChunks { .. } => RendererError::PageChunksFull {
+                        needed,
+                        page_chunks: self.layout.page_chunks,
+                    },
+                    _ => RendererError::ArenaFull { needed },
+                })
             }
         }
     }
@@ -1473,6 +1501,8 @@ impl VoxelRenderer {
             } else {
                 0
             },
+            chunk_places: self.memory.chunk_places(),
+            full_pages: self.memory.full_pages(),
             translucent_page_switches: self.stats.chunk_memory.translucent_page_switches,
             cpu_bytes: self.memory.cpu_bytes(),
         }

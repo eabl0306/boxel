@@ -805,8 +805,8 @@ impl UploadWarnings {
         }
         tracing::warn!(
             "{} chunk upload(s) failed (last: {}); {dropped_total} chunks dropped so far: raise \
-             RenderSettings::chunk_memory (initial_quads, initial_slots) or lower the view \
-             distance",
+             RenderSettings::chunk_memory (initial_quads for quads, initial_slots for chunks) or \
+             lower the view distance",
             self.failures,
             self.last_error
         );
@@ -2080,7 +2080,7 @@ fn cleanup(
 fn render_line(tier: Tier, stats: &crate::RenderStats) -> String {
     let memory = &stats.chunk_memory;
     let mib = |quads: u64| (quads * 8) >> 20;
-    format!(
+    let mut line = format!(
         "tier={tier} chunks={} quads={}/{} draws={} visible={} dropped={} occluded={} \
          pages={} {}/{}MiB",
         stats.chunks,
@@ -2093,7 +2093,12 @@ fn render_line(tier: Tier, stats: &crate::RenderStats) -> String {
         memory.pages,
         mib(memory.used_quads),
         mib(memory.capacity_quads),
-    )
+    );
+    if memory.full_pages > 0 {
+        // pages that refuse new chunks whatever quads they have free
+        line += &format!(" full_of_chunks={}", memory.full_pages);
+    }
+    line
 }
 
 /// `settings` if valid, else the defaults (logged once a renderer is built).
@@ -2291,6 +2296,9 @@ mod tests {
             "tier=Mid chunks=3 quads=10/100 draws=5 visible=2 dropped=1 occluded=4 pages=2 \
              24/64MiB"
         );
+        let mut full = stats;
+        full.chunk_memory.full_pages = 1;
+        assert!(render_line(Tier::Mid, &full).ends_with(" 24/64MiB full_of_chunks=1"));
     }
 
     #[test]
@@ -2304,9 +2312,17 @@ mod tests {
         assert_eq!(w.failures, 0);
         let first = w.last;
         w.record(&crate::RendererError::ChunkTableFull(4));
+        w.record(&crate::RendererError::PageChunksFull {
+            needed: 2,
+            page_chunks: 4,
+        });
         w.flush(2);
         assert_eq!(w.last, first, "second warning within 5 s is held back");
-        assert_eq!(w.failures, 1);
+        assert_eq!(w.failures, 2);
+        assert_eq!(
+            w.last_error,
+            "chunk memory pages full of chunks (4 each; 2 quads requested)"
+        );
     }
 
     #[test]
