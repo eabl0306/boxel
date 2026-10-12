@@ -192,6 +192,8 @@ struct Options {
     fog_tick: u64,
     /// `--fog-steps`.
     fog_steps: u32,
+    /// `--fog-haze`.
+    fog_haze: f32,
     /// `--lod`.
     lod: lod::LodPreset,
     /// `--lod-tint`.
@@ -226,6 +228,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         fog_res: FogResolution::Half,
         fog_tick: 0,
         fog_steps: boxel::fog::DEFAULT_MAX_STEPS,
+        fog_haze: 1.0,
         lod: lod::LodPreset::Off,
         lod_tint: false,
         no_distance_fog: false,
@@ -313,6 +316,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--fixed-height" => o.fixed_height = true,
             "--fog-res" => o.fog_res = fog::parse_resolution(flag, &value()?)?,
             "--fog-steps" => o.fog_steps = fog::parse_steps(flag, &value()?)?,
+            "--fog-haze" => o.fog_haze = fog::parse_haze(flag, &value()?)?,
             "--fog-tick" => {
                 let v = value()?;
                 o.fog_tick = v
@@ -995,9 +999,13 @@ fn run(
             width: style.width,
         }));
     }
-    // `--fog`: the demo's preset at a fixed tick (the same cells every run).
-    let fog_label = fog::label(o.fog, o.fog_res, o.fog_steps);
-    if let Some(settings) = o.fog.settings(o.fog_res, o.fog_steps) {
+    // `--fog`: the demo's preset at a fixed tick (the same cells every run), its far clouds
+    // ending at the `--lod` preset's horizon.
+    let fog_label = fog::label(o.fog, o.fog_res, o.fog_steps, o.fog_haze);
+    if let Some(settings) = o
+        .fog
+        .settings(o.fog_res, o.fog_steps, o.lod.horizon(), o.fog_haze)
+    {
         renderer.set_fog(
             &gpu.device,
             Some(FogInput {
@@ -1092,6 +1100,18 @@ mod tests {
         );
         let mut bad = BASE.to_vec();
         bad.extend(["--fog-tick", "-1"]);
+        assert!(parse(&bad).is_err());
+        // `--fog-haze`: 1 unless given, the last one wins.
+        assert_eq!(
+            parse(&BASE).expect("valid").expect("not help").fog_haze,
+            1.0
+        );
+        let mut args = BASE.to_vec();
+        args.extend(["--fog", "decks", "--fog-haze", "1", "--fog-haze", "0"]);
+        let o = parse(&args).expect("valid").expect("not help");
+        assert_eq!((o.fog, o.fog_haze), (fog::FogPreset::Decks, 0.0));
+        let mut bad = BASE.to_vec();
+        bad.extend(["--fog-haze", "-1"]);
         assert!(parse(&bad).is_err());
     }
 

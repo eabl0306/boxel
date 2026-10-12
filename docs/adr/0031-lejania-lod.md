@@ -26,7 +26,9 @@ recomendaciones del plan:
    dispositivo: el preset lo elige el juego.
 4. La regla de la celda: gana cualquier bloque sólido, salvo agua sobre el suelo.
 5. Agua lejana opaca primero.
-6. Las capas de niebla mantienen su alcance en el M1.
+6. Las capas de niebla mantienen su alcance en el M1. Enmendada por el ADR 0032: una capa con
+   bruma (`haze`) y desvanecido `Scene` llega al horizonte del LOD y se desvanece con él; las
+   capas sin bruma conservan su alcance.
 7. LOD apagado en backends GL y en adaptadores de software.
 8. Nada del LOD generado se guarda en disco.
 9. La rama sale de `feat/fog`.
@@ -281,8 +283,9 @@ profundidad ni z-fighting.
   lo que pasa de `H` toma el color del cielo de golpe. Así el borde es la misma esfera hacia
   donde se mire; con el plano lejano solo, los nodos que la histéresis conserva más allá de `H`
   aparecerían a los costados de la pantalla al girar.
-  `ViewParams` no cambia, así que las capas de `FogPlugin` conservan su alcance. Antes iba de la
-  mitad de `H` a `H` (`LodSettings::fade_start`, ya no existe).
+  `ViewParams` no cambia, así que las capas de `FogPlugin` sin bruma conservan su alcance; las
+  que tienen bruma toman el desvanecido del LOD (`LodPass::fog_params`, ADR 0032). Antes iba de
+  la mitad de `H` a `H` (`LodSettings::fade_start`, ya no existe).
 - En GL el LOD queda apagado (sin clip control la profundidad lejana pelea). `voxel_world` lo
   apaga en adaptadores de software, sea cual sea el radio. Si el renderer no puede dibujar el LOD
   (GL, el smoke falló o la pasada no se pudo crear), `extract_lod` lo avisa en
@@ -721,8 +724,9 @@ intención del plan:
   piso real del mundo (sus caras de abajo) donde la fuente del ejemplo pone piedra.
 - **Agua opaca.** El mar lejano es un color opaco: en un mar calmo se ve un escalón de color en el
   borde del detalle completo (decisión 5; las caras translúcidas serían M4).
-- **Capas de niebla.** Una capa que se desvanece al color del cielo en su propio alcance deja una
-  franja pálida sobre el terreno lejano (decisión 6; M4).
+- **Capas de niebla.** Una capa sin bruma que se desvanece al color del cielo en su propio
+  alcance deja una franja pálida sobre el terreno lejano (decisión 6). Con bruma la capa sigue
+  hasta el horizonte y la franja no aparece (ADR 0032).
 - **Bajo tierra.** Dentro de una cueva sellada el LOD no se dibuja. En una cueva abierta lo
   recorta la pirámide de profundidad en High y el early-Z de la roca en Mid y Low.
 - **Bajo el piso del mundo.** Debajo de y = -64 el LOD no tiene cara de piso: nadie vuela ahí.
@@ -914,8 +918,9 @@ cargo run --release --example voxel_world -- --adapter radeon --lod near --timeo
   (sin frames de más de 6,94 ms), casi todo trabajo de GPU. Las palancas del plan (baldes por
   cara y Hi-Z) ya están; lo que queda es el preset `near` (1,37 a 2 veces) o menos triángulos.
 - La prueba del dueño volando, también la del M2 ("Qué mirar en el vuelo del dueño").
-- M4, según la prueba del dueño: agua translúcida lejana, niebla que se adelgaza sobre el LOD,
-  `textureSample` en el nivel 1 para packs de alta resolución, hojas más oscuras.
+- M4, según la prueba del dueño: agua translúcida lejana, `textureSample` en el nivel 1 para
+  packs de alta resolución, hojas más oscuras. La niebla sobre el LOD pasó al ADR 0032 (bruma
+  lejana).
 - Posibles mejoras de costo: agrupar los eventos de la cobertura por posición de nivel 1,
   cuantizar `T_1` cuando sigue a la región de conservación.
 

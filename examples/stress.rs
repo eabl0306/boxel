@@ -302,6 +302,8 @@ struct Options {
     fog_res: FogResolution,
     /// `--fog-steps`.
     fog_steps: u32,
+    /// `--fog-haze`.
+    fog_haze: f32,
     /// `--lod`.
     lod: lod::LodPreset,
     /// The route of the `path` scenario through the cave `--cave` found (empty before
@@ -362,6 +364,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         lod: lod::LodPreset::Off,
         fog_res: FogResolution::Half,
         fog_steps: boxel::fog::DEFAULT_MAX_STEPS,
+        fog_haze: 1.0,
         path: Vec::new(),
     };
     let mut timeout = None;
@@ -535,6 +538,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--lod" => o.lod = lod::parse(flag, &value()?)?,
             "--fog-res" => o.fog_res = fog::parse_resolution(flag, &value()?)?,
             "--fog-steps" => o.fog_steps = fog::parse_steps(flag, &value()?)?,
+            "--fog-haze" => o.fog_haze = fog::parse_haze(flag, &value()?)?,
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
@@ -1507,7 +1511,12 @@ fn run_info(options: &Options, present: String) -> RunInfo {
         light: if options.light { "on" } else { "off" }.to_string(),
         cave_culling: if options.cave_culling { "on" } else { "off" }.to_string(),
         idle_work: if options.idle_work { "on" } else { "off" }.to_string(),
-        fog: fog::label(options.fog, options.fog_res, options.fog_steps),
+        fog: fog::label(
+            options.fog,
+            options.fog_res,
+            options.fog_steps,
+            options.fog_haze,
+        ),
         lod: lod::label(options.lod),
         pack: match &options.textures {
             TextureSource::Procedural => "none".to_string(),
@@ -1741,8 +1750,14 @@ fn main() -> AppExit {
         let [x, y, z, ..] = options.camera;
         app.insert_resource(EditScript::new(DVec3::new(x, y, z)));
     }
-    // `--fog`: the plugin only when asked (off adds nothing at all).
-    if let Some(settings) = options.fog.settings(options.fog_res, options.fog_steps) {
+    // `--fog`: the plugin only when asked (off adds nothing at all). The far presets end their
+    // clouds at the `--lod` preset's horizon.
+    if let Some(settings) = options.fog.settings(
+        options.fog_res,
+        options.fog_steps,
+        options.lod.horizon(),
+        options.fog_haze,
+    ) {
         app.add_plugins(FogPlugin { settings });
     }
     // `--lod`: the same.
@@ -1998,6 +2013,18 @@ mod tests {
         assert!(parse(&["--fog", "mist"]).is_err());
         assert!(parse(&["--fog-res", "quarter"]).is_err());
         assert!(parse(&["--fog"]).is_err());
+        // `--fog-haze`: 1 unless given, the last one wins (a smoke's new side appends its own).
+        assert_eq!(options(&[]).fog_haze, 1.0);
+        let o = options(&[
+            "--fog",
+            "cumulus16",
+            "--fog-haze",
+            "0",
+            "--fog-haze",
+            "0.25",
+        ]);
+        assert_eq!((o.fog, o.fog_haze), (fog::FogPreset::Cumulus16, 0.25));
+        assert!(parse(&["--fog-haze", "2"]).is_err());
         assert_eq!(options(&[]).lod, lod::LodPreset::Off, "no LOD unless asked");
         // The counting wrapper keeps the world's far terrain (else --lod would be off).
         let counting = CountingGenerator {

@@ -101,9 +101,11 @@ Para no gastar de más:
 
 - sale antes cuando la profundidad óptica pasa de 6 (ya no se ve nada detrás);
 - tiene un tope de celdas por rayo (`max_steps`). Pasado el tope, el resto de cada capa usa su
-  densidad media, sin un muro visible donde se corta. Cerca de los bordes esa media baja como
-  bajan las celdas (`MeanCoverage`, una tabla de la media con el umbral subido un cuarto, la
-  mitad y tres cuartos), así el resto no pinta una franja plana donde las celdas ya terminaron;
+  densidad media a cada altura, sin un muro visible donde se corta. Cerca de los bordes esa media
+  baja como bajan las celdas, así el resto no pinta una franja plana donde las celdas ya
+  terminaron. Desde el ADR 0032 es el perfil de 8 nudos de la bruma lejana (`HazeProfile`); antes
+  era `MeanCoverage`, una tabla de la media con el umbral subido un cuarto, la mitad y tres
+  cuartos;
 - cruza de un paso un tramo entero de la grilla del ruido cuando sus esquinas no dejan cobertura
   ni con el umbral más bajo de las filas del tramo (la cota es conservadora: el ruido de valor
   nunca sale del rango de sus esquinas, y el umbral de las filas sale de la subida en la fila más
@@ -122,8 +124,8 @@ que un píxel sin niebla no cambia. La interfaz nunca tiene niebla y las captura
   y el uniform `Fog` (grupo 1);
 - la composición lee solo el target de la marcha (grupo 0).
 
-**Datos por frame.** El uniform `Fog` tiene un encabezado de 112 bytes y 4 capas de 224, 1008
-bytes en total, y se escribe cada frame. No se sube ninguna textura ni volumen: la densidad es una
+**Datos por frame.** El uniform `Fog` tiene un encabezado de 112 bytes y 4 capas de 256, 1136
+bytes en total (224 y 1008 antes del ADR 0032), y se escribe cada frame. No se sube ninguna textura ni volumen: la densidad es una
 función de la celda absoluta, el momento del reloj y la capa.
 
 ### 4. Ruido entero y viento
@@ -179,11 +181,14 @@ Cada `FogLayer` es un dato:
   y sombreado por cara (los dos apagados por defecto);
 - distancia de la niebla suave (de 0 a 32 bloques, apagada por defecto);
 - viento en bloques por segundo;
-- distancia máxima (hasta 4096) y desvanecido (`Scene`, como el terreno, o un rango propio).
+- distancia máxima de las celdas (hasta 4096 de sus celdas más chicas y 65.536 bloques; hasta
+  el ADR 0032 era 4096 bloques), la bruma que sigue después (`haze`, 0 por defecto, ADR 0032) y
+  desvanecido (`Scene`, como el terreno, o un rango propio).
   Una capa `Scene` que termina antes que el terreno se desvanece con la regla de la niebla de
   distancia en su propio final, para no cortar en seco donde el terreno todavía se ve claro (el
   valle del ejemplo, de 384 bloques, a 16 chunks). Con la niebla de distancia apagada, `Scene`
-  no desvanece y la capa termina de golpe, como el terreno.
+  no desvanece y la capa termina de golpe, como el terreno. Una capa `Scene` con bruma toma en
+  cambio el desvanecido del terreno más lejano, el del LOD mientras dibuja (ADR 0032).
 
 `FogSettings` agrega `enabled`, hasta 4 capas, la resolución (media por defecto) y `max_steps`
 (64 por defecto, `DEFAULT_MAX_STEPS`). Se cambia en tiempo de ejecución con `ResMut<FogSettings>`.
@@ -390,3 +395,14 @@ marcha de referencia, de 7 a 13 pasos por rayo mirando al horizonte desde y 100)
 la cámara adentro, pasó de 29 a 37. No se ajustó. Si hace falta, las perillas son del juego: una
 banda de nubes más baja (por ejemplo de 184 a 232 con bordes de 16 y 20) o cubos de nube más
 altos.
+
+## Cambios con la bruma lejana (ADR 0032, 2026-10-11)
+
+- Una capa puede seguir pasadas sus celdas como una bruma de su densidad media a cada altura
+  (`haze`), hasta el horizonte del LOD. Con `haze` en 0, el valor por defecto y el de todos los
+  presets de este ADR, se ve como antes.
+- El límite de `max_distance` se cuenta en celdas: 4096 de las más chicas de la capa, con un tope
+  de 65.536 bloques.
+- La cola pasado el tope de pasos usa el perfil de la bruma en lugar de `MeanCoverage`. Los rayos
+  que agotan el presupuesto cambian un poco, también en `both`.
+- El uniform crece a 1136 bytes. Los detalles están en el ADR 0032.

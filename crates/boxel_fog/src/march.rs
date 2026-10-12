@@ -462,6 +462,12 @@ pub struct MarchResult {
     pub color: [[f32; 3]; 4],
     /// Cells visited.
     pub steps: u32,
+    /// Pieces of soft fog integrated (outside the budget).
+    pub soft_pieces: u32,
+    /// Pieces of haze integrated: past the cells, and the rest of the cells past the budget.
+    pub haze_pieces: u32,
+    /// The step budget ran out before the cells did.
+    pub capped: bool,
 }
 
 /// The march state of one ray (the shader's variables).
@@ -475,6 +481,9 @@ struct State {
     out_t: [f32; 4],
     out_c: [[f32; 3]; 4],
     steps: u32,
+    soft_pieces: u32,
+    haze_pieces: u32,
+    capped: bool,
     done: bool,
 }
 
@@ -566,6 +575,9 @@ pub fn march(ray: &Ray, layers: &[MarchLayer], sky: [f32; 3], max_steps: u32) ->
         out_t: [1.0; 4],
         out_c: [[0.0; 3]; 4],
         steps: 0,
+        soft_pieces: 0,
+        haze_pieces: 0,
+        capped: false,
         done: false,
     };
     let dir = ray.dir;
@@ -593,6 +605,9 @@ pub fn march(ray: &Ray, layers: &[MarchLayer], sky: [f32; 3], max_steps: u32) ->
         transmittance: s.out_t,
         color: s.out_c,
         steps: s.steps,
+        soft_pieces: s.soft_pieces,
+        haze_pieces: s.haze_pieces,
+        capped: s.capped,
     }
 }
 
@@ -650,6 +665,7 @@ fn march_layer(
         let mut axis = 2;
         if s.steps >= max_steps {
             // Past the budget: the rest of the cells through the profile, unshaded.
+            s.capped = true;
             haze_span(s, layer, eye, dir, s0, tc, 1.0, sky);
             break;
         } else if layer.uniform {
@@ -706,6 +722,9 @@ fn march_layer(
             };
         }
         let piece = (b - a) / pieces as f32;
+        if soft {
+            s.soft_pieces += pieces;
+        }
         for i in 0..pieces {
             let pa = a + i as f32 * piece;
             let pb = if i + 1 == pieces { b } else { pa + piece };
@@ -830,6 +849,7 @@ fn haze_span(
                     len * (0.5 - tau / 12.0)
                 };
                 let col = layer.color_at(p + e, 1.0, eye[1], dir[1], dir_len, sky);
+                s.haze_pieces += 1;
                 s.segment_ramp(p, q, s0, s1, col);
                 if s.done {
                     return;
@@ -1066,6 +1086,10 @@ mod tests {
         assert_eq!(whole.steps, 1, "a uniform layer is one step");
         assert!((whole.transmittance[0] - exact.transmittance[0]).abs() < 1e-4);
         assert_eq!(capped.steps, 10);
+        // The counters of the step table: only the capped ray takes the tail, in one piece (a
+        // level ray crosses no knot).
+        assert_eq!((exact.capped, exact.haze_pieces), (false, 0));
+        assert_eq!((capped.capped, capped.haze_pieces), (true, 1));
         assert!((exact.transmittance[0] - capped.transmittance[0]).abs() < 1e-4);
         assert!((exact.transmittance[0] - (-2.0f32).exp()).abs() < 1e-3);
     }
@@ -1220,6 +1244,9 @@ mod tests {
             transmittance: [1.0, 0.5, 0.5, 0.0],
             color: [[0.0; 3], [0.5, 0.0, 0.0], [0.5, 0.0, 0.0], [1.0, 0.0, 0.0]],
             steps: 1,
+            soft_pieces: 0,
+            haze_pieces: 0,
+            capped: false,
         };
         let [c, a] = texel(&r);
         assert_eq!(a & 0xff, 0);
@@ -1399,6 +1426,12 @@ mod tests {
             40,
         );
         assert_eq!(r.steps, 40, "the budget counts cells, not pieces");
+        // Pieces of at most a block cover the soft fog and its blend (48 blocks), at most one
+        // more per cell.
+        assert!(
+            (48..48 + 40 + SOFT_MAX_PIECES).contains(&r.soft_pieces),
+            "{r:?}"
+        );
     }
 
     /// A rising threshold is never a uniform layer, even with threshold and softness 0.
@@ -1825,6 +1858,7 @@ mod tests {
             64,
         );
         assert_eq!(r.steps, 0);
+        assert!(!r.capped && r.haze_pieces >= 1, "{r:?}");
         assert!(r.transmittance[0] < 0.9, "{r:?}");
         // Without haze the layer ends with its cells, out of this ray's reach.
         layer.haze = 0.0;

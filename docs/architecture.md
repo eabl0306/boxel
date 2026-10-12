@@ -2,7 +2,7 @@
 
 Documento técnico de referencia. Fecha: 2026-10-05. Estado: aprobado para el milestone M0
 (revisión final, después de tres revisiones adversariales del borrador v1).
-Las decisiones puntuales están en `docs/adr/` (0001 a 0031). Durante M0 hubo además una
+Las decisiones puntuales están en `docs/adr/` (0001 a 0032). Durante M0 hubo además una
 especificación para los agentes implementadores (en inglés, en `.scaffold/`), borrada al cerrar M0;
 este documento queda como referencia.
 
@@ -158,7 +158,7 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_worldgen` | trait `WorldGenerator` (con `lod()`, la fuente del terreno lejano: `LodSource`, ADR 0031), `FlatGenerator` y ruido entero exacto 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`, `splitmix64`, `Frequency`) | voxel |
 | `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, mensajes (`ChunkMeshEvent`, `BlockChanged`, `ChunkDataEvent`), guardar y cargar el mundo (`persist`: `ChunkStore`, `RedbStore`, `WorldStore`, `PersistPlugin`, ADR 0024), reloj del mundo (`TimeOfDay`, `DaylightCurve`, `DaylightPlugin`), ticks programados de bloques (`BlockTicks`, `BlockTicksPlugin`), agua y lava que corren y bloques con agua (`FluidPlugin`, ADR 0021 y 0025), las reglas de vecinos (`NeighborRules`, ADR 0020 y 0027), qué hace usar un bloque (`BlockUses`, una puerta que se abre, ADR 0027), la búsqueda de la ocultación de cuevas (`ChunkVisibility`, `visibility`, ADR 0022) y el lado del mundo del LOD lejano (`lod`: `LodWorldPlugin`, planificador, cobertura, trabajos, ADR 0031) | app, voxel, mesh, light, worldgen, transform, diagnostic |
 | `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `SceneLight` (luz del cielo, ambiente y curva de brillo del frame), `PresentSettings` (vsync en tiempo de ejecución), texturas de las imágenes del registro o de un resource pack con las recetas que pasa el juego (`TextureSource`, `PackSource`), screenshots, ocultación de cuevas en los tres tiers (ADR 0022), contorno del bloque apuntado (`BlockOutline`, ADR 0026), texturas animadas de los packs (`LayerAnimation`, ADR 0028), conteo de draws en CPU (`cull_counts`), niebla y nubes cúbicas opcionales (`fog`: `FogPlugin`, `FogSettings`, `FogClock`, ADR 0030), terreno lejano opcional (`lod`: `LodPlugin`, `LodPass`, ADR 0031) | gfx, shaders, world, camera, window, pack, fog |
-| `boxel_fog` | niebla y nubes cúbicas sin GPU ni ECS (ADR 0030): las capas (`FogLayer`, `validate`), el ruido entero que el shader repite bit a bit, cada capa en enteros chicos relativos al origen de render (`LayerParams`), la marcha de referencia de los tests y el empaquetado del texel | - |
+| `boxel_fog` | niebla y nubes cúbicas sin GPU ni ECS (ADR 0030 y 0032): las capas (`FogLayer`, `validate`), el ruido entero que el shader repite bit a bit, cada capa en enteros chicos relativos al origen de render (`LayerParams`), el perfil de la bruma lejana (`HazeProfile`), la marcha de referencia de los tests y el empaquetado del texel | - |
 | `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::collision`: cubos y cajas que pueden subir media celda, como la valla de 1,5 bloques, más un contorno para apuntar, ADR 0018 y 0026), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas, el integrador de un cuerpo (`step_body`, `predict`), el narrowphase (`shape_contact`) y la grilla del broadphase (`Grid`). Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`; pasos en `FixedPostUpdate`, interpolación en `AfterFixedMainLoop`), `PhysicsQuery` (rayos a vóxeles y cuerpos, cajas, el chequeo para poner bloques), `BodyIndex`, cuerpos (`RigidBody`, `Collider`, `Velocity`, `BodyPosition`, `Contacts`, `Interpolated`, `Teleport`, `Frozen`, `Sleeping`, `ReportContacts`), `CharacterController` (caminar, agacharse con el borde protegido y la caja de 1,5 (`Crouch`), correr con el salto corriendo y el vuelo creativo, ADR 0026), `Projectile`, nadar (`SwimPlugin`, `Swimmer`, ADR 0021; también en bloques con agua, y el vuelo no lo siente) y los mensajes `VoxelImpact`, `CollisionStarted`, `CollisionEnded` y `ProjectileHit`. Los cuerpos quietos se duermen (despiertan con `BlockChanged` y `ChunkDataEvent` del mundo, entre otras cosas) y, con muchos cuerpos despiertos, el paso corre en los hilos de cómputo. Fases P0 a P4 hechas | ecs, app, math, tasks, transform, voxel, world, diagnostic |
 | `boxel_pack` | lector de resource packs de Minecraft Java (formatos ~64 a 120): `pack.mcmeta` con overlays, texturas de bloque PNG a RGBA8 (animaciones `.png.mcmeta`), modelos de bloque con herencia `parent` y variables `#`, blockstates `variants` y `multipart`. Solo datos; `boxel_render` lo usa para las texturas de bloque | (serde, png) |
 | `boxel_demo` | contenido de los ejemplos, fuera del motor (ADR 0029, `publish = false`): bloques y capas (`blocks::registry`, `blocks::builder`), pintor procedural (`textures`), formas y reglas de escaleras, vallas, antorchas, muros y puertas (`shapes`, `rules`), agua y lava (`fluids`), recetas y tintes de packs (`pack`), generadores `TerrainGenerator`, `ForestGenerator` y `OverworldGenerator` con `Sea`, las cuevas y su fuente de LOD (`worldgen`, ADR 0031), presets de niebla y nubes (`fog`, ADR 0030) | voxel, worldgen, pack, fog |
@@ -1131,7 +1131,8 @@ los chunks enteros sin niebla porque el plano lejano es plano: lo que pasa de la
 vería a los costados de la pantalla y no al frente, y aparecería y desaparecería al girar. Las
 capas de `FogPlugin` con `FogFade::Scene` usan ese mismo rango. Una capa que termina antes (su
 `max_distance`) usa la misma regla en su propio final, así no corta en seco donde el terreno
-todavía se ve claro. Con la niebla apagada terminan de golpe, como el terreno.
+todavía se ve claro. Con la niebla apagada terminan de golpe, como el terreno. Una capa con
+bruma (ADR 0032) toma el rango del terreno más lejano: el del LOD mientras dibuja.
 
 La niebla solo tapa el borde de lo mallado si la distancia de vista no pasa de donde el disco de
 chunks está completo (`ChunkViewer::mesh_reach`). El disco se mide en chunks (`dx² + dz² <= r²`),
@@ -1162,8 +1163,11 @@ los overlays y el blit, iguales en los tres tiers (`fog.wgsl`, módulo propio):
 2. **Composición** sobre el color principal (`dst * T + C`). Descarta los píxeles sin niebla.
 
 Cada pipeline liga a lo sumo un uniform block y una textura, sin sampler (ADR 0011). El uniform
-`Fog` (1008 bytes) se escribe cada frame; no se sube nada más. El estilo (capas, cubos, colores,
-viento) es del juego; los presets del ejemplo están en `boxel_demo::fog`. La niebla detrás del
+`Fog` (1136 bytes) se escribe cada frame; no se sube nada más. El estilo (capas, cubos, colores,
+viento) es del juego; los presets del ejemplo están en `boxel_demo::fog`. Una capa puede seguir
+pasadas sus celdas como una bruma de su densidad media a cada altura (`haze`, ADR 0032), hasta
+el horizonte del LOD si se desvanece como el terreno: así la niebla y las nubes llegan lejos sin
+recorrer celdas allá. La niebla detrás del
 agua o del vidrio se pinta encima de esa superficie (límite conocido).
 
 ### 10.9 Terreno lejano: LOD por anillos (ADR 0031)
@@ -1197,7 +1201,7 @@ los de antes, byte a byte.
   el LOD dibujando, el plano lejano del recorte de chunks y de la búsqueda de cuevas
   pasa a `H` (los chunks publicados llegan más allá de la distancia de vista) y la niebla de
   distancia se mide sobre `H` con la misma regla (10.7); las capas de `FogPlugin` conservan su
-  alcance. Apagado en GL.
+  alcance, salvo las que tienen bruma, que llegan a `H` (ADR 0032). Apagado en GL.
 - **Costo.** En la RTX 5050, `far` suma de 0,54 a 0,60 ms de GPU por frame y ningún frame de más
   de 6,94 ms; en el hilo principal casi nada (`render.lod` 0,007 ms de media). El terreno lejano
   se llena en 1,1 a 1,7 s. En la 780M, `near` cuesta unos 0,4 ms y `far` 1,1 ms. Detalle en

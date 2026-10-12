@@ -60,6 +60,12 @@ impl LodPreset {
             ..LodSettings::default()
         })
     }
+
+    /// Its horizon `32 R 2^K` in blocks, `None` for [`LodPreset::Off`]: where the far fog
+    /// presets end their clouds (`fog::FogPreset::layers`).
+    pub fn horizon(self) -> Option<f32> {
+        self.settings().map(|s| s.preset_horizon() as f32)
+    }
 }
 
 /// `--lod PRESET`.
@@ -104,8 +110,10 @@ mod tests {
             let s = preset.settings().expect("a preset with settings");
             assert_eq!(s.validate(), Ok(()), "{preset:?}");
             assert_eq!(s.horizon(keep), horizon, "{preset:?}");
+            assert_eq!(preset.horizon(), Some(horizon as f32), "{preset:?}");
         }
         assert!(LodPreset::Off.settings().is_none());
+        assert_eq!(LodPreset::Off.horizon(), None);
     }
 
     #[test]

@@ -270,13 +270,18 @@ mezcla corridas con texturas distintas.
 - `valley`: bancos de cubos de 2 bloques entre y 46 y 70, sobre el mar y las zonas bajas, con
   bordes desparejos.
 - `clouds`: nubes volumétricas de cubos de 8 bloques entre y 176 y 240, con bordes desparejos.
-- `both`: valle y nubes, el preset típico de un juego.
+- `both`: valle y nubes, el preset típico de un juego y la referencia de la niebla.
+- `cumulus16`, `cumulus20` y `cumulus24`: nubes grandes de cubos de 16, 20 o 24 bloques sobre el
+  valle, que siguen como bruma hasta el horizonte del `--lod` (ADR 0032; sin LOD, hasta 768).
+- `decks`: `cumulus16` bajo una capa alta y fina.
 - `inside`: un manto de y 0 a 256 con la cámara adentro y niebla suave cerca, el peor caso.
 - `sunset`: valle y nubes con más color del cielo.
 
-`--fog-res half|full` elige la resolución de la marcha (media por defecto) y `--fog-steps N` el
-tope de celdas por rayo (64 por defecto, el del motor). El resumen anota la niebla
-(`fog: valley half`, con los pasos si no son los de siempre) y `tools/bench_report.py` empareja
+`--fog-res half|full` elige la resolución de la marcha (media por defecto), `--fog-steps N` el
+tope de celdas por rayo (64 por defecto, el del motor) y `--fog-haze F` cuánta bruma lejana
+llevan las capas (de 0 a 1, 1 por defecto; gana la última, así el lado nuevo de un smoke puede
+cambiarla). El resumen anota la niebla (`fog: valley half`, con los pasos y la bruma si no son
+los de siempre) y `tools/bench_report.py` empareja
 igual corridas con y sin niebla, así se puede comparar una contra otra; solo avisa que difieren.
 Para medir el costo de la niebla con el mismo binario:
 `just perf-smoke --base HEAD "--new-extra='--fog both'" rtx/surface/r16/uncapped`.
