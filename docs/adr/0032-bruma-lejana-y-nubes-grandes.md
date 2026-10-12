@@ -1,7 +1,8 @@
 # ADR 0032: bruma lejana y nubes grandes sobre el LOD
 
 - Estado: borrador (issue #47). El M1 pasó el vuelo del dueño el 2026-10-12 (ver "Decisiones
-  del dueño tras el vuelo"); falta el M2.
+  del dueño tras el vuelo"). El M2 se hizo y midió el mismo día: baja la niebla de `both` 1,1
+  veces, no 1,5. La reserva espera la decisión del dueño (sección 9).
 - Fecha: 2026-10-11
 - Enmienda: ADR 0030 (el límite de distancia, la cola pasado el tope) y ADR 0031 (decisión 6)
 
@@ -96,8 +97,9 @@ rama de la niebla: sin `FogPlugin` no se calcula nada.
   llegan a 8.192, de 16 a 65.536.
 - La bruma usa solo alturas relativas al origen de render y largos sobre el rayo, nunca enteros
   de celda: lejos del origen da lo mismo.
-- El uniform `Fog` pasa de 1008 a 1136 bytes (dos `vec4` más por capa, los nudos). Ningún
-  binding, textura ni sampler nuevo. Los tres tiers dan la misma imagen.
+- El uniform `Fog` pasa de 1008 a 1136 bytes (dos `vec4` más por capa, los nudos) y a 1200 con
+  el M2 (uno más: las filas que camina la marcha y un recíproco). Ningún binding, textura ni
+  sampler nuevo. Los tres tiers dan la misma imagen.
 
 ### 7. Nubes grandes con los campos de siempre
 
@@ -140,6 +142,34 @@ LOD (768 bloques sin LOD, donde terminan las nubes de hoy):
   capas se rearman.
 - `stress` y `snapshot` pasan el horizonte del preset de `--lod` con la misma regla y aceptan
   `--fog-haze`.
+
+### 9. Optimización de la marcha (M2)
+
+Primero los cambios exactos, cada uno con su commit y su smoke, y la meta de bajar 1,5 veces el
+tiempo de la niebla en `both`:
+
+- **Atajos exactos (M2a-1, 0e0b830).** El umbral de cada fila se calcula una vez por fila; el de
+  un paso de la red, una vez por banda de filas. La segunda octava toma el valor de la primera en
+  lugar de interpolarla otra vez. La niebla suave decide con la primera octava cuando puede, como
+  las celdas. Una celda (o un punto suave) cuyo paso de red no puede tener cobertura a su umbral
+  vale 0 sin interpolar. La prueba de paso vacío va una vez por recarga, las palabras que el ruido
+  lee en cada paso se leen una vez por capa, y un trozo único no divide. Mismas imágenes byte a
+  byte en High, Mid y Low. Una entrada nueva, `fs_fog_debug_walk`, camina celdas con un solo caché
+  como la marcha y da el oráculo bit a bit.
+- **Reusar la cadena de hashes (E2, 47fe21c).** Al pasar a un paso vecino de la red se reusan
+  los hashes que comparten: 4 a 7 en lugar de 14, mismas imágenes. Hizo la niebla un 14 % más
+  lenta (más registros vivos), así que se revirtió (df46e43).
+- **Filas que pueden tener niebla y recíprocos (M2b, 1df8ee5).** La fila pegada a un plano con
+  borde siempre está vacía: la marcha ya no la camina (`LayerParams::walk`, las mismas filas que
+  el perfil de bruma). La altura de la banda y el largo del fundido suave se dividen una vez en
+  la CPU y el shader multiplica; el DDA mueve solo la salida del eje que avanzó. Cambian los
+  pasos y el redondeo, con la marcha de referencia en el mismo commit. El desvanecido sigue
+  dividiendo: multiplicado por su recíproco, llvmpipe dibujaba mal la opacidad de las escenas con
+  bruma (ningún otro driver lo hacía).
+
+Resultado (S8 contra S0): 1,1 veces menos por frame medio, casi igual en la mediana. Queda por
+debajo de 1,4, así que no se empezó la reserva del plan (especializar la marcha con constantes
+`override`, `EXIT_TAU` de 8,66 a 8): necesita el sí del dueño.
 
 ## Decisiones del dueño tras el vuelo (2026-10-12)
 
@@ -196,7 +226,12 @@ LOD (768 bloques sin LOD, donde terminan las nubes de hoy):
   subida, determinista); la bruma contra una integral fina (error relativo menor que 1e-3 en
   rayos empinados, rasantes y horizontales); profundidades de píxel dentro de un tramo; la
   costura continua, también en una capa llena; ningún salto dentro del anillo; rayos solo de bruma sin pasos; una capa sin
-  bruma da bit a bit lo de antes (hash fijo tomado en 0bd2849).
+  bruma da bit a bit lo de antes (hash fijo tomado en 0bd2849; desde el M2 el del cúmulo con
+  bordes cambia, porque ya no camina sus filas vacías); las filas pegadas a un plano con borde
+  no se caminan.
+- `fs_fog_debug_walk`: caminatas por un solo caché en cada eje y sentido, con una y dos octavas,
+  ruido plano y 3D, cerca de la celda del origen y a 4096 celdas, en cuatro orígenes lejanos,
+  dan el oráculo bit a bit en cada tier.
 - `boxel_render`: el desvanecido de una capa `Scene` con bruma con y sin LOD; escenas nuevas de
   referencia en los tres tiers (bruma lejana, bruma `Scene`, presupuesto agotado, una capa llena
   con bruma a la mitad y sombra de caras desde abajo y desde arriba, una capa de cubos de 16 desde
@@ -211,26 +246,29 @@ referencia sobre un abanico fijo de rayos, con el horizonte `far` y una vista de
 `stress` (y 140, 20 grados abajo), `horizon` (y 140, 8 arriba), `above` (y 420, 25 abajo) y
 `deck` (y 250, nivel).
 
-| preset | pose | pasos medios | p90 | tope agotado | trozos suaves | trozos de bruma |
-|---|---|---:|---:|---:|---:|---:|
-| both | stress | 16,2 | 46 | 2 % | 0,0 | 0,0 |
-| both | horizon | 20,9 | 46 | 2 % | 0,0 | 0,0 |
-| cumulus16 | stress | 19,5 | 64 | 10 % | 0,0 | 0,4 |
-| cumulus16 | horizon | 24,8 | 64 | 10 % | 0,3 | 0,4 |
-| cumulus16 | above | 25,1 | 63 | 9 % | 0,0 | 1,5 |
-| cumulus16 | deck | 11,3 | 20 | 0 % | 53,0 | 0,0 |
-| cumulus20 | horizon | 25,8 | 53 | 7 % | 6,7 | 0,4 |
-| cumulus24 | stress | 16,3 | 46 | 5 % | 7,2 | 0,3 |
-| cumulus24 | horizon | 22,0 | 46 | 5 % | 22,4 | 0,3 |
-| decks | horizon | 27,5 | 64 | 12 % | 0,3 | 0,9 |
-| decks | above | 32,6 | 64 | 11 % | 40,1 | 1,6 |
-| inside | stress | 64,0 | 64 | 100 % | 27,3 | 1,6 |
+Antes y después del M2 (4f43b4d y 1df8ee5):
 
-Los cúmulos dan unos pasos más que `both` mirando al horizonte; `cumulus24` da menos pasos. Para
-llenar de 200 a 300, sus bandas empiezan en 176, 160 y 144, cerca de las poses a y 140: los rayos
-que suben desde ahí entran en la niebla suave de `cumulus20` y `cumulus24` (6,7 y 22,4 trozos
-suaves por rayo mirando al horizonte), aunque las primeras filas de la banda están vacías. Volar
-dentro de una nube cuesta trozos suaves, como `inside`.
+| preset | pose | pasos medios | tope agotado | trozos suaves | trozos de bruma |
+|---|---|---:|---:|---:|---:|
+| both | stress | 16,2 -> 11,9 | 2 % -> 0 % | 0,0 | 0,0 |
+| both | horizon | 20,9 -> 16,2 | 2 % -> 0 % | 0,0 | 0,0 |
+| cumulus16 | stress | 19,5 -> 15,4 | 10 % -> 4 % | 0,0 | 0,4 |
+| cumulus16 | horizon | 24,8 -> 19,7 | 10 % -> 4 % | 0,3 -> 0,0 | 0,4 |
+| cumulus16 | above | 25,1 -> 20,6 | 9 % -> 6 % | 0,0 | 1,5 -> 1,4 |
+| cumulus16 | deck | 11,3 -> 9,9 | 0 % | 53,0 | 0,0 |
+| cumulus20 | horizon | 25,8 -> 21,2 | 7 % -> 4 % | 6,7 -> 0,0 | 0,4 -> 0,3 |
+| cumulus24 | stress | 16,3 -> 11,8 | 5 % -> 2 % | 7,2 -> 0,0 | 0,3 |
+| cumulus24 | horizon | 22,0 -> 16,3 | 5 % -> 2 % | 22,4 -> 3,1 | 0,3 |
+| decks | horizon | 27,5 -> 21,5 | 12 % -> 4 % | 0,3 -> 0,0 | 0,9 -> 0,6 |
+| decks | above | 32,6 -> 25,3 | 11 % -> 7 % | 40,1 -> 32,1 | 1,6 -> 1,4 |
+| inside | stress | 64,0 | 100 % | 27,3 | 1,6 |
+
+En el M1 los cúmulos daban unos pasos más que `both` mirando al horizonte. Para llenar de 200 a
+300, sus bandas empiezan en 176, 160 y 144, cerca de las poses a y 140: los rayos que subían desde
+ahí entraban en la niebla suave de `cumulus20` y `cumulus24` (6,7 y 22,4 trozos suaves por rayo
+mirando al horizonte), aunque la primera fila de la banda está vacía. Desde el M2 esa fila no se
+camina y casi toda esa niebla suave desaparece. Volar dentro de una nube sigue costando trozos
+suaves, como `inside`.
 
 **Imágenes** en `bench-results/fog-far/look/` (fuera de git, con `comandos.sh` y `leeme.txt`):
 cada preset desde la pose del horizonte, `cumulus16` desde adentro y desde arriba, y el valle con
@@ -253,6 +291,13 @@ de partida (S0, 0bd2849) `--fog both` cuesta de 0,97 a 1,06 ms en la mediana.
 | S4 | `decks` desde y 420 (dentro de su capa alta), 25 grados abajo | 2,24 ms | 2,11 ms |
 | S4 | `cumulus16` dentro de la capa (y 250, a nivel) | 2,24 ms | 2,11 ms |
 | S4 | `cumulus16` desde arriba (y 420, 25 grados abajo) | 1,36 ms | 1,26 ms |
+| S5 | M2a-1 (0e0b830) contra el M1, `both`, superficie y bosque | -0,10 a -0,12 ms | -0,07 a -0,11 ms |
+| S6 | E2 (47fe21c) contra M2a-1, igual (se revirtió) | +0,24 a +0,26 ms | +0,19 a +0,22 ms |
+| S7 | M2b (1df8ee5) contra M2a, `both`, superficie y bosque | -0,06 a -0,07 ms | -0,04 ms |
+| S7 | M2b contra M2a, `inside` | -0,18 ms | -0,21 ms |
+| S8 | `both` en 1df8ee5, superficie | 1,06 ms | 0,96 ms |
+| S8 | `both` en 1df8ee5, bosque | 1,11 ms | 1,01 ms |
+| S8 | `decks` mirando al horizonte con `--lod far` | 1,36 ms | 1,24 ms |
 
 - `both` cuesta casi lo mismo que antes (5 % menos de fps, del tamaño de lo que varía el mismo
   binario entre sesiones). La bruma es barata.
@@ -263,11 +308,17 @@ de partida (S0, 0bd2849) `--fog both` cuesta de 0,97 a 1,06 ms en la mediana.
   del horizonte, por unos 53 trozos suaves por rayo. Ahí el p99 llega a 6,9 ms a 720p y algunos
   frames pasan de 6,94 ms. Es lo que más tiene que bajar el M2. `cumulus16` desde arriba queda en
   lo estimado.
+- El M2 deja `both` en 1,06 a 1,11 ms por frame medio, contra 1,17 a 1,22 en S0: 1,1 veces
+  menos, y casi igual en la mediana (0,96 a 1,01 contra 0,97 a 1,05). La meta era 1,5. `decks`
+  al horizonte bajó de 1,52 a 1,36 ms. Con `inside`, los frames de más de 6,94 ms bajaron de 53 a
+  31 en 10 s.
 
 ## Pendiente
 
-- M2: la ronda de optimización de la marcha, medida contra `both`. Si baja menos de 1,4 veces,
-  decide el dueño.
+- Decisión del dueño sobre el M2: bajó 1,1 veces, por debajo de 1,4. Las opciones del plan son
+  aceptarlo, o aprobar la reserva: especializar la marcha con constantes `override` por capa (un
+  pipeline por configuración, compilado al cambiar de preset) o bajar `EXIT_TAU` de 8,66 a 8 (el
+  color cambia hasta 0,004).
 - Con el clima (issue #53): nubes que cambian de tipo, de cantidad y de color con los días.
 - Con los biomas (issue #43): bruma que depende del bioma y de la hora del día.
 

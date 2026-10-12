@@ -124,8 +124,9 @@ que un píxel sin niebla no cambia. La interfaz nunca tiene niebla y las captura
   y el uniform `Fog` (grupo 1);
 - la composición lee solo el target de la marcha (grupo 0).
 
-**Datos por frame.** El uniform `Fog` tiene un encabezado de 112 bytes y 4 capas de 256, 1136
-bytes en total (224 y 1008 antes del ADR 0032), y se escribe cada frame. No se sube ninguna textura ni volumen: la densidad es una
+**Datos por frame.** El uniform `Fog` tiene un encabezado de 112 bytes y 4 capas de 272, 1200
+bytes en total (224 y 1008 antes del ADR 0032, 256 y 1136 antes de su M2), y se escribe cada
+frame. No se sube ninguna textura ni volumen: la densidad es una
 función de la celda absoluta, el momento del reloj y la capa.
 
 ### 4. Ruido entero y viento
@@ -406,3 +407,7 @@ altos.
 - La cola pasado el tope de pasos usa el perfil de la bruma en lugar de `MeanCoverage`. Los rayos
   que agotan el presupuesto cambian un poco, también en `both`.
 - El uniform crece a 1136 bytes. Los detalles están en el ADR 0032.
+- La optimización del ADR 0032 (M2, 2026-10-12) deja `both` en 1,06 a 1,11 ms por frame medio y
+  0,96 a 1,01 ms en la mediana (RTX, 1280x720, sin tope), unas 1,1 veces menos que antes del ADR
+  0032. La marcha ya no camina la fila pegada a un plano con borde, que siempre está vacía. El
+  uniform queda en 1200 bytes.
