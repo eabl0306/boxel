@@ -4,12 +4,17 @@
 // One invocation per node slot. A live node (its quads in the arena, inside the GPU window) with
 // an octant left to draw whose box (32 * 2^k blocks) meets the frustum writes one indexed draw per
 // face bucket that can face the camera (the box-level back-face test of cull.wgsl) into the list
-// of its segment, with its DrawRef. The skirts and fluid walls at the end of a bucket are left out
+// of its segment, with its DrawRef. The skirts and walls at the end of a bucket are left out
 // where nothing shows them (bucket_quads): slots [s * LOD_SEGMENT_SLOTS, (s + 1) * LOD_SEGMENT_SLOTS) write
 // list s, which starts at draw s * LOD_SEGMENT_DRAWS and has its count in counts[s]. A segment
 // has at most 6 * LOD_SEGMENT_SLOTS <= 65535 draws (Vulkan's minimum maxDrawIndirectCount), so no
 // list can overflow and every draw is written. The *_count path is NOT validated by wgpu: index
 // counts stay within the shared index buffer (MAX_QUADS_PER_BUCKET quads).
+//
+// A node with water (issue #50) also writes one draw of its water bucket (water_quads) into the
+// water list of its segment, behind the face lists in the same buffers: with S segments, water
+// list s starts at draw S * LOD_SEGMENT_DRAWS + s * LOD_SEGMENT_SLOTS and has its count in
+// counts[S + s] (the counts hold 2 S words).
 //
 // The cull runs after the opaque and cutout terrain is drawn, with its depth pyramid
 // (lod_hiz.wgsl): a node whose nearest point lies behind the farthest full-detail depth over its
@@ -19,7 +24,7 @@
 // hid; while it hides almost nothing the renderer culls without it (occlusion[2] = 0), before
 // the main pass, for some frames (boxel_render's lod::pass).
 struct DrawArgs { index_count: u32, instance_count: u32, first_index: u32, base_vertex: i32, first_instance: u32 };
-struct LodNodeGpu { node: vec4<i32>, quad_base: u32, counts: array<u32, 3>, seams: array<u32, 6>, pad: array<u32, 2> };
+struct LodNodeGpu { node: vec4<i32>, quad_base: u32, counts: array<u32, 3>, seams: array<u32, 6>, water: u32, water_seams: u32 };
 
 @group(0) @binding(0) var<uniform> view: View;
 @group(0) @binding(1) var<storage, read> nodes: array<LodNodeGpu>;
@@ -83,6 +88,22 @@ fn bucket_quads(c: u32, seams: u32, f: u32, hidden: u32, across: bool) -> u32 {
   }
   if (exposed != 0u) { return c; }
   let skip = (seams >> 16u) + select(0u, seams & 0xFFFFu, across);
+  return c - min(skip, c);
+}
+
+// The quads of the water bucket (count c, its seam quads at the end as in bucket_quads, its faces
+// mixed) for a node whose octants `hidden` are hidden and whose 6 `across` bits are `across`: all
+// of them if a drawn octant has a hidden one across any middle plane, else not the middle seams,
+// nor, when every neighbor of this level covers its face, the node face ones. The mirror of
+// boxel_shaders::gpu::lod::water_quads.
+fn water_quads(c: u32, seams: u32, hidden: u32, across: u32) -> u32 {
+  let drawn = ~hidden & 0xFFu;
+  // An octant and the one across the middle plane of x (bit 1), y (bit 2) or z (bit 4).
+  let partner = ((hidden >> 1u) & 0x55u) | ((hidden << 1u) & 0xAAu)
+    | ((hidden >> 2u) & 0x33u) | ((hidden << 2u) & 0xCCu)
+    | ((hidden >> 4u) & 0x0Fu) | ((hidden << 4u) & 0xF0u);
+  if ((drawn & partner) != 0u) { return c; }
+  let skip = (seams >> 16u) + select(0u, seams & 0xFFFFu, across == 0x3Fu);
   return c - min(skip, c);
 }
 
@@ -160,5 +181,14 @@ fn cull_lod(@builtin(global_invocation_id) gid: vec3<u32>) {
       draw_refs[s] = vec2(slot, start);
     }
     start += c;
+  }
+  // The water bucket follows the face buckets; drawn from both sides, so no face test.
+  let water = water_quads(n.water, n.water_seams, hidden, (w >> LOD_ACROSS_SHIFT) & 0x3Fu);
+  if (water > 0u) {
+    let segments = arrayLength(&counts) / 2u;
+    let s = segments * LOD_SEGMENT_DRAWS + seg * LOD_SEGMENT_SLOTS
+      + atomicAdd(&counts[segments + seg], 1u);
+    draw_args[s] = DrawArgs(min(water, MAX_QUADS_PER_BUCKET) * 6u, 1u, 0u, 0, s);
+    draw_refs[s] = vec2(slot, start);
   }
 }

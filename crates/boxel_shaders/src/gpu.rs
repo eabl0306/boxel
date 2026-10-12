@@ -237,7 +237,8 @@ impl LodImmediate {
 /// One node of the far LOD's node table on High (`lod_pull.wgsl`, `lod_cull.wgsl`, ADR 0031): the
 /// node as [`LodImmediate`] has it (plus [`lod::LIVE_BIT`] and the [`lod::ACROSS_SHIFT`] bits),
 /// its first quad in the LOD arena, its 6 face bucket counts, two per word (bucket `2i` in the
-/// low 16 bits of `counts[i]`), and the seam quads at the end of each bucket. 64 bytes.
+/// low 16 bits of `counts[i]`), the seam quads at the end of each bucket, and its water bucket
+/// (after the face buckets) with its seams. 64 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct LodNodeGpu {
@@ -253,8 +254,12 @@ pub struct LodNodeGpu {
     /// (`boxel_mesh::lod::seam_counts`): those on a node face in bits 0-15, then those on a
     /// middle plane, the last ones, in bits 16-31 ([`lod::bucket_quads`]).
     pub seams: [u32; 6],
-    /// Padding to the WGSL struct's 64 bytes.
-    pub pad: [u32; 2],
+    /// Quads of the water bucket (the see-through fluid's, translucent, issue #50), right after
+    /// the face buckets in the arena.
+    pub water: u32,
+    /// Its seam quads, as one word of `seams` (`boxel_mesh::lod::water_seams`,
+    /// [`lod::water_quads`]).
+    pub water_seams: u32,
 }
 
 impl LodNodeGpu {
@@ -275,7 +280,8 @@ impl LodNodeGpu {
             quad_base,
             counts: [pair(0), pair(1), pair(2)],
             seams: [0; 6],
-            pad: [0; 2],
+            water: 0,
+            water_seams: 0,
         }
     }
 
@@ -289,6 +295,15 @@ impl LodNodeGpu {
         );
         self.seams = seams.map(|[face, middle]| (face & 0xFFFF) | (middle & 0xFFFF) << 16);
         self.node[3] |= i32::from(across & 0x3F) << lod::ACROSS_SHIFT;
+        self
+    }
+
+    /// The entry with `water` quads in its water bucket, `seams` of them at its end (`[on a
+    /// node face, on a middle plane]`, each below 2^16).
+    pub fn with_water(mut self, water: u32, seams: [u32; 2]) -> Self {
+        debug_assert!(seams.iter().all(|&n| n <= 0xFFFF), "a seam run over 2^16");
+        self.water = water;
+        self.water_seams = (seams[0] & 0xFFFF) | (seams[1] & 0xFFFF) << 16;
         self
     }
 }
@@ -340,6 +355,30 @@ pub mod lod {
         }
         let [on_face, middle] = seams;
         count.saturating_sub(middle + if across { on_face } else { 0 })
+    }
+    /// The quads of the water bucket (`count` of them, `seams` = `[on a node face, on a middle
+    /// plane]` at its end, its faces mixed) the LOD draws for a node whose octants `hidden` are
+    /// hidden, `across` its bits [`ACROSS_SHIFT`] (bit `f`: the node across face bucket `f`
+    /// covers its seam): all of them if a drawn octant has a hidden one across any middle plane,
+    /// else none of the middle seam quads, nor, with every bit of `across`, the node face ones.
+    /// Water skirts that are not needed lie inside the water, behind its surface (the depth
+    /// prepass leaves them out); this only saves their work. `lod_cull.wgsl` mirrors it.
+    pub fn water_quads(count: u32, seams: [u32; 2], hidden: u8, across: u8) -> u32 {
+        let drawn = !hidden;
+        // An octant and the one across the middle plane of x (bit 1), y (bit 2) or z (bit 4).
+        let exposed = drawn
+            & ((hidden >> 1) & 0x55
+                | (hidden << 1) & 0xAA
+                | (hidden >> 2) & 0x33
+                | (hidden << 2) & 0xCC
+                | (hidden >> 4) & 0x0F
+                | (hidden << 4) & 0xF0);
+        if exposed != 0 {
+            return count;
+        }
+        let [on_face, middle] = seams;
+        let all_across = across & 0x3F == 0x3F;
+        count.saturating_sub(middle + if all_across { on_face } else { 0 })
     }
     /// Node slots per segment of the High draw lists: slot `s` writes into list
     /// `s / SEGMENT_SLOTS`, one draw per face bucket at most.

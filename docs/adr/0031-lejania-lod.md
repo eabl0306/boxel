@@ -140,15 +140,17 @@ sería arena).
 ### 5. Mallado
 
 El mallador de siempre (`Mesher::mesh`, sin cambios) sobre un `PaddedChunk` llenado a mano, con
-una tabla de materiales del LOD: todo lo visible es un cubo opaco, el agua también, y estados
-parecidos se fusionan (`LodMaterials`). Sin luz y sin AO. Después, en `boxel_mesh::lod`:
+una tabla de materiales del LOD: todo lo visible es un cubo opaco (el agua, translúcida desde la
+sección 12), y estados parecidos se fusionan (`LodMaterials`). Sin luz y sin AO. Después, en
+`boxel_mesh::lod`:
 
 - **Octantes:** los quads se cortan en la celda 16, así cada quad queda en un octante del nodo.
 - **Faldones:** en las 6 caras del nodo y en los 3 planos internos, una cara hacia el plano donde
   un sólido o un fluido toca otro y hay aire cerca. Tapan las grietas entre niveles y con el
   detalle completo.
 - **Paredes de agua (solo nivel 1):** caras en esos planos cerca del agua, para que un rayo que
-  pasa bajo el agua translúcida cercana no vea el cielo.
+  pasa bajo el agua translúcida cercana no vea el cielo. Con el agua translúcida (sección 12)
+  quedan solo en el suelo, en todos los niveles, y se suma el fondo bajo el agua.
 
 La salida es el `PackedQuad` de siempre (8 bytes), en celdas.
 
@@ -419,6 +421,13 @@ Lo que hace que el agua cercana se vea como se ve, y que el LOD tiene que imitar
   cara, además, si algún vecino del mismo nivel no dibuja su cara. Los que sobran quedan dentro
   del agua, detrás de la superficie, y la prepasada los tapa. Los dos caminos cortan igual
   (`water_quads`).
+- **El faldón de agua en la costura con el detalle completo.** Ahí no hay prepasada que valga: el
+  agua cercana es otra capa. La parte del faldón que queda bajo la superficie cercana sería una
+  segunda capa, y se veía como una línea más oscura en el borde. Por eso un faldón de agua en un
+  costado empieza 0,875 bloques arriba de su celda: la superficie cercana más baja posible en esa
+  celda (un solo bloque de agua, con su superficie a 0,875). En el mar del ejemplo (agua hasta
+  y 46, superficie cercana a 46,875 y celda de arriba de 46 a 48) el faldón va justo de 46,875 a
+  48. Y se sombrea como la superficie, no como un costado: continúa la superficie.
 - Instanciado: un draw por nodo con agua en el frustum, en la prepasada y en la de color. High: el
   recorte escribe un draw de agua por nodo en una segunda lista por segmento (en los mismos
   buffers, detrás de las listas de caras) y se dibuja con dos `multi_draw_indexed_indirect_count`
@@ -811,8 +820,13 @@ intención del plan:
   (1.024) no espera las pirámides que faltan: se arma con las que hay.
 - **Generadores sin fuente.** Solo el nivel 1, y solo con `vertical_chunks` acotado. Muestra el
   piso real del mundo (sus caras de abajo) donde la fuente del ejemplo pone piedra.
-- **Agua opaca.** El mar lejano es un color opaco: en un mar calmo se ve un escalón de color en el
-  borde del detalle completo (decisión 5; las caras translúcidas serían M4).
+- **Agua lejana (sección 12).** El fondo lejano tiene la oscuridad de su hondura en celdas: desde
+  muy alto, un lago lejano muestra escalones de color más gruesos que uno cercano (de 2 a 16
+  bloques). La hondura se cuenta dentro del nodo: si la superficie cae en el nodo de arriba y el
+  fondo a menos de 15 bloques del techo del nodo, el fondo se ve más claro. La niebla de
+  `FogPlugin` termina en la superficie del agua lejana y en el fondo del agua cercana. Bajo el
+  agua, mirando hacia arriba casi en horizontal más allá del detalle completo, la superficie
+  lejana se ve desde abajo; el LOD no oscurece la vista bajo el agua como podría el juego.
 - **Capas de niebla.** Una capa sin bruma que se desvanece al color del cielo en su propio
   alcance deja una franja pálida sobre el terreno lejano (decisión 6). Con bruma la capa sigue
   hasta el horizonte y la franja no aparece (ADR 0032).
@@ -933,6 +947,28 @@ intención del plan:
   - M3 y rondas: el camino de GPU de High dibuja lo mismo que el instanciado, una búsqueda de
     cuevas sellada no dibuja LOD, y en High los nodos detrás del detalle completo no se dibujan.
 - Las suites de GPU existentes siguen verdes sin cambios.
+- Agua translúcida (sección 12), `boxel_mesh::lod`: el agua es el único material translúcido y la
+  lava sigue opaca; proptest del fondo contra fuerza bruta (toda cara de suelo hacia el agua, con
+  la oscuridad de su hondura, en los niveles 1 a 4), de los faldones (el suelo con aire cerca y
+  suelo enfrente, la celda de arriba del agua) y de las paredes (en todos los niveles, con su
+  oscuridad); desde el aire o desde dentro del agua de un nodo dibujado no se ve ningún faldón ni
+  pared; un mar de prueba con su fondo a 7 bloques (luz 8), su faldón y sus paredes. Las pruebas
+  de grietas apuntan dentro del suelo (el agua deja ver) y suman rayos hacia dentro del agua, que
+  deben cruzar una cara de agua antes (sin eso el fondo se vería sin teñir), con la superficie
+  cercana a 0,875 y el faldón lejano recortado como lo dibuja el shader. Quitar los faldones de
+  agua, las paredes o el fondo hace fallar alguna; recortar el faldón 1,5 bloques en vez de 0,875
+  también. Lo mismo con la fuente del ejemplo (`boxel_demo`).
+- `boxel_shaders`: las entradas de agua validan y traducen a todos los backends, con la posición
+  `@invariant` solo en el agua; los bits de costura y oscuridad iguales a los de `boxel_mesh`;
+  `water_quads` contra fuerza bruta en las 256 máscaras.
+- `boxel_render` sin GPU: el balde de agua sube con los de caras, justo detrás; se dibuja aparte,
+  sin las costuras que nadie ve; la entrada de High lo lleva; la cuenta de nodos con agua sigue a
+  los cambios (máscaras, mallas nuevas, resync).
+- `gpu_lod`: la costura se dibuja bajo dos cielos (magenta y verde), y ningún píxel de suelo
+  puede seguir el color del cielo (un hueco bajo el agua translúcida solo lo tiñe); la pose sobre
+  el mar tiene agua del LOD (1.290 quads). Sin el fondo bajo el agua aparecen 2.975 píxeles. Los
+  tiers de cada adaptador dibujan las tres poses igual (0,0000 % en la RTX y la 780M; llvmpipe
+  dentro de la tolerancia), con el camino de GPU de High en la RTX.
 - M2, `boxel_worldgen`: la fuente de `FlatGenerator` es la regla exacta sobre sus propios chunks
   en los niveles 1 a 5 (capas de todas las clases, mar sobre suelo, dos fluidos, lejos del
   origen); sin la cláusula del agua el test falla.
@@ -968,10 +1004,11 @@ horizonte, grietas entre niveles ni terreno doble.
 
 Tres cosas que se ven y son esperables:
 
-- Desde 200 bloques, el centro de un lago cercano hondo se ve azul opaco con un borde claro: esa
-  capa de chunks queda fuera del radio vertical, así que la dibuja el LOD, con su agua opaca.
-- Sobre el mar, el agua lejana opaca queda un bloque más alta que la cercana (celdas de 2 bloques
-  en el nivel 1); cerca del borde se nota como un escalón con forma de chunk.
+- Desde 200 bloques, el centro de un lago cercano hondo lo dibuja el LOD (esa capa de chunks queda
+  fuera del radio vertical). Con el agua translúcida (sección 12) se ve como el resto del lago.
+- Sobre el mar, el agua lejana queda un bloque más alta que la cercana (celdas de 2 bloques en el
+  nivel 1). Con el agua opaca se notaba como un escalón con forma de chunk; translúcida, el
+  faldón que tapa ese escalón se ve como la superficie (sección 12).
 - Desde muy alto (1500 bloques), el bosque del nivel 2 se ve más tupido que el del nivel 1: con
   "cualquier sólido gana" cada copa ocupa celdas enteras (decisión 4).
 
@@ -1007,9 +1044,9 @@ cargo run --release --example voxel_world -- --adapter radeon --lod near --timeo
   (sin frames de más de 6,94 ms), casi todo trabajo de GPU. Las palancas del plan (baldes por
   cara y Hi-Z) ya están; lo que queda es el preset `near` (1,37 a 2 veces) o menos triángulos.
 - La prueba del dueño volando, también la del M2 ("Qué mirar en el vuelo del dueño").
-- M4, según la prueba del dueño: agua translúcida lejana, `textureSample` en el nivel 1 para
-  packs de alta resolución, hojas más oscuras. La niebla sobre el LOD pasó al ADR 0032 (bruma
-  lejana).
+- M4, según la prueba del dueño: `textureSample` en el nivel 1 para packs de alta resolución,
+  hojas más oscuras. El agua translúcida lejana está hecha (sección 12). La niebla sobre el LOD
+  pasó al ADR 0032 (bruma lejana).
 - Posibles mejoras de costo: agrupar los eventos de la cobertura por posición de nivel 1,
   cuantizar `T_1` cuando sigue a la región de conservación.
 

@@ -29,11 +29,19 @@
 //!   counts what they hide, and while that is under 1 node in [`OCCLUSION_RATIO`] the frames
 //!   cull without them, before the main pass ([`Occlusion`]; the same pixels either way).
 //!
-//! Skirts and fluid walls (`boxel_mesh::lod::Seam`, last in each face bucket) are drawn only
-//! where a seam can show them: by a hidden octant, or on a node face whose neighbor of the same
-//! level does not draw its cells there (kept as nodes change; bits [`bits::ACROSS_SHIFT`] of
-//! the node on High). Both paths cut a bucket's draw by the same rule ([`bits::bucket_quads`]),
-//! so they draw the same pixels.
+//! Skirts and walls (`boxel_mesh::lod::Seam`, last in each face bucket) are drawn only where a
+//! seam can show them: by a hidden octant, or on a node face whose neighbor of the same level
+//! does not draw its cells there (kept as nodes change; bits [`bits::ACROSS_SHIFT`] of the node
+//! on High). Both paths cut a bucket's draw by the same rule ([`bits::bucket_quads`]), so they
+//! draw the same pixels.
+//!
+//! The water bucket (the see-through fluid's quads, translucent: issue #50) follows a node's
+//! face buckets in the arena and is drawn apart, after the opaque terrain and before the near
+//! water ([`LodPass::draw_water`]): a depth prepass of all of it, then its color, blended, with
+//! depth `GreaterEqual` and no writes, so only the nearest far water shows, one layer per pixel.
+//! Both pipelines run the same vertex function with an invariant position. One draw per node in
+//! the frustum with water (instanced), or one more list per segment (High, behind the face
+//! lists in the same buffers), cut by [`bits::water_quads`].
 //!
 //! Underground ([`LodPass::prepare`]'s `sealed`: the cave culling search reached no chunk on the
 //! border of its box, so no line of sight leaves it) nothing is drawn.
@@ -45,8 +53,8 @@ use crate::renderer::ViewParams;
 use crate::targets::Targets;
 use crate::{DEPTH_FORMAT, DistanceFog, MAIN_COLOR_FORMAT};
 use boxel_math::{Aabb, I64Vec3, Vec3, wrap_to_i32};
-use boxel_mesh::lod::seam_counts;
-use boxel_mesh::{ChunkMesh, MAX_QUADS_PER_FACE_BUCKET};
+use boxel_mesh::lod::{seam_counts, water_seams};
+use boxel_mesh::{ChunkMesh, MAX_QUADS_PER_BUCKET, MAX_QUADS_PER_FACE_BUCKET, TRANSLUCENT_BUCKET};
 use boxel_shaders::gpu::{DrawIndexedIndirect, DrawRef, LodImmediate, LodNodeGpu, lod as bits};
 use boxel_shaders::{ShaderModuleId, create_module};
 use boxel_voxel::{ChunkKey, Face};
@@ -75,12 +83,16 @@ struct LodDraw {
     key: ChunkKey,
     /// World block origin of the node (`pos << (5 + level)`).
     origin: I64Vec3,
-    /// Its quads in the arena: the 6 face buckets, contiguous.
+    /// Its quads in the arena: the 6 face buckets, then the water bucket, contiguous.
     alloc: ArenaAlloc,
     /// Quads per face bucket.
     faces: [u32; 6],
     /// Per face bucket, its seam quads at the end: `[on a node face, on a middle plane]`.
     seams: [[u32; 2]; 6],
+    /// Quads of the water bucket (the see-through fluid's, translucent: issue #50).
+    water: u32,
+    /// Its seam quads at the end, as `seams`.
+    water_seams: [u32; 2],
     /// Bit `f`: the node of this level across face bucket `f` draws its cells by that face
     /// ([`LodNodes::across`]), kept as nodes change.
     across: u8,
@@ -94,6 +106,8 @@ struct LodDraw {
     at: u32,
     /// Its quads counted in [`LodNodes::live`] (0: not counted): uploaded with an octant left.
     counted: u32,
+    /// Counted in [`LodNodes::live_water`]: counted, with a water bucket.
+    counted_water: bool,
 }
 
 impl LodDraw {
@@ -102,7 +116,7 @@ impl LodDraw {
     }
 }
 
-/// One draw of a frame.
+/// One draw of a frame (of face buckets, or of a water bucket).
 #[derive(Clone, Copy, Debug)]
 struct NodeDraw {
     immediate: LodImmediate,
@@ -141,9 +155,11 @@ pub(crate) struct GpuInputs {
     pub index: wgpu::Buffer,
 }
 
-/// The far LOD's arena, pipeline and nodes (module docs).
+/// The far LOD's arena, pipelines and nodes (module docs).
 pub(crate) struct LodPass {
     pipeline: wgpu::RenderPipeline,
+    /// The water bucket's depth prepass and color pass (instanced).
+    water: WaterPipelines,
     arena: wgpu::Buffer,
     nodes: LodNodes,
     /// High: the GPU-driven path (module docs).
@@ -187,8 +203,29 @@ impl LodPass {
             nodes.table = Some(GpuTable::default());
             GpuDriven::new(device, materials, view, inputs)
         });
+        let module = create_module(device, ShaderModuleId::Lod);
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(ShaderModuleId::Lod.label()),
+            bind_group_layouts: &[Some(materials), Some(view)],
+            immediate_size: bits::IMMEDIATE_SIZE,
+        });
+        let instanced = |entry, draws| {
+            render_pipeline(
+                device,
+                &layout,
+                &module,
+                entry,
+                QUAD_BYTES,
+                wgpu::PrimitiveTopology::TriangleStrip,
+                draws,
+            )
+        };
         Self {
-            pipeline: pipeline(device, materials, view),
+            pipeline: instanced("vs_lod", Draws::Faces),
+            water: WaterPipelines {
+                depth: instanced("vs_lod_water", Draws::WaterDepth),
+                color: instanced("vs_lod_water", Draws::Water),
+            },
             arena,
             nodes,
             gpu,
@@ -378,6 +415,37 @@ impl LodPass {
         }
         draws.len() as u32
     }
+
+    /// Records the frame's water buckets into the main pass (groups 0 and 1 are bound), after
+    /// the opaque terrain of both full detail and the LOD and before the near water: a depth
+    /// prepass of every water draw, then their color, blended, where the depth is their own, so
+    /// one layer of far water shows per pixel (issue #50). The instanced draws of
+    /// [`LodPass::draw`]'s state; on High the water lists, twice. Binds what
+    /// [`LodPass::draw`] binds. Returns the draw calls recorded.
+    pub fn draw_water(&self, pass: &mut wgpu::RenderPass<'_>) -> u32 {
+        if let Some(gpu) = &self.gpu {
+            return gpu.draw_water(pass, self.nodes.live_water > 0);
+        }
+        let draws = &self.nodes.water_draws;
+        if draws.is_empty() {
+            return 0;
+        }
+        pass.set_vertex_buffer(0, self.arena.slice(..));
+        for pipeline in [&self.water.depth, &self.water.color] {
+            pass.set_pipeline(pipeline);
+            for d in draws {
+                pass.set_immediates(0, bytemuck::bytes_of(&d.immediate));
+                pass.draw(0..4, d.first..d.first + d.quads);
+            }
+        }
+        2 * draws.len() as u32
+    }
+}
+
+/// The two pipelines of the water bucket: its depth prepass and its blended color.
+struct WaterPipelines {
+    depth: wgpu::RenderPipeline,
+    color: wgpu::RenderPipeline,
 }
 
 /// A node's quads on their way up.
@@ -415,10 +483,14 @@ struct LodNodes {
     fog: DistanceFog,
     tint: bool,
     draws: Vec<NodeDraw>,
+    /// The frame's draws of water buckets (instanced path), in the order of `draws`.
+    water_draws: Vec<NodeDraw>,
     stats: LodPassStats,
     /// Uploaded nodes with an octant left to draw and their quads, kept as nodes change (the
     /// High frame reads them instead of walking every slot).
     live: (u32, u64),
+    /// Those of them with a water bucket (High draws no water list without one).
+    live_water: u32,
     /// High: the GPU node table's CPU side (which entries to write).
     table: Option<GpuTable>,
     /// Slots whose [`LodDraw::across`] may have changed (a neighbor did).
@@ -444,8 +516,10 @@ impl LodNodes {
             fog: DistanceFog::default(),
             tint: false,
             draws: Vec::new(),
+            water_draws: Vec::new(),
             stats: LodPassStats::default(),
             live: (0, 0),
+            live_water: 0,
             table: None,
             stale: Vec::new(),
         }
@@ -472,6 +546,15 @@ impl LodNodes {
                 *q += u64::from(now);
             }
             node.counted = now;
+        }
+        let water = now > 0 && node.water > 0;
+        if water != node.counted_water {
+            if water {
+                self.live_water += 1;
+            } else {
+                self.live_water -= 1;
+            }
+            node.counted_water = water;
         }
     }
 
@@ -536,19 +619,19 @@ impl LodNodes {
             self.refuse(key);
             return;
         };
-        let faces = face_counts(&mesh);
-        if faces.iter().any(|&n| n > MAX_QUADS_PER_FACE_BUCKET) {
-            tracing::error!("far LOD: {key:?} has a face bucket over the limit; refused");
+        let (faces, water) = bucket_counts(&mesh);
+        if faces.iter().any(|&n| n > MAX_QUADS_PER_FACE_BUCKET) || water > MAX_QUADS_PER_BUCKET {
+            tracing::error!("far LOD: {key:?} has a bucket over the limit; refused");
             self.remove(key);
             self.refuse(key);
             return;
         }
-        let quads: u32 = faces.iter().sum();
+        let quads: u32 = faces.iter().sum::<u32>() + water;
         if quads == 0 {
             self.remove(key);
             return;
         }
-        let seams = node_seams(&mesh, faces);
+        let (seams, water_seams) = node_seams(&mesh, faces, water);
         let old = self.by_key.get(&key).copied();
         let old_alloc = old.and_then(|s| self.slots[s as usize].as_ref().map(|n| n.alloc));
         if old.is_none() && self.by_key.len() as u32 >= MAX_LOD_NODES {
@@ -566,6 +649,8 @@ impl LodNodes {
             node.alloc = alloc;
             node.faces = faces;
             node.seams = seams;
+            node.water = water;
+            node.water_seams = water_seams;
             node.mask = mask;
             node.pending = Some(mesh);
             self.pending.push(slot);
@@ -586,12 +671,15 @@ impl LodNodes {
             alloc,
             faces,
             seams,
+            water,
+            water_seams,
             across: 0,
             stale: true,
             mask,
             pending: Some(mesh),
             at,
             counted: 0,
+            counted_water: false,
         });
         self.stale.push(slot);
         self.by_key.insert(key, slot);
@@ -653,6 +741,7 @@ impl LodNodes {
         self.alloc.reset();
         self.stats.nodes = 0;
         self.live = (0, 0);
+        self.live_water = 0;
         self.touch_all();
     }
 
@@ -743,39 +832,44 @@ fn node_origin(key: ChunkKey) -> Option<I64Vec3> {
     ))
 }
 
-/// The 6 face bucket counts of a node mesh, cut so they never cover more than its quads. LOD
-/// meshes have nothing in the cutout and translucent buckets.
-fn face_counts(mesh: &ChunkMesh) -> [u32; 6] {
-    debug_assert!(
-        mesh.bucket_counts[6..].iter().all(|&n| n == 0),
-        "a LOD mesh with cutout or translucent quads"
-    );
+/// The 6 face bucket counts of a node mesh and its water (translucent) bucket's, cut so they
+/// never cover more than its quads. LOD meshes have nothing in the cutout bucket, so the water
+/// bucket follows the face buckets.
+fn bucket_counts(mesh: &ChunkMesh) -> ([u32; 6], u32) {
+    debug_assert_eq!(mesh.bucket_counts[6], 0, "a LOD mesh with cutout quads");
     let mut left = mesh.total_quads().min(mesh.quads.len() as u32);
-    let mut faces = [0; 6];
-    for (f, &n) in faces.iter_mut().zip(&mesh.bucket_counts[..6]) {
-        *f = n.min(left);
-        left -= *f;
-    }
-    faces
+    let mut take = |n: u32| {
+        let n = n.min(left);
+        left -= n;
+        n
+    };
+    let faces = std::array::from_fn(|f| take(mesh.bucket_counts[f]));
+    let skipped = take(mesh.bucket_counts[6]);
+    let water = if skipped == 0 {
+        take(mesh.bucket_counts[TRANSLUCENT_BUCKET])
+    } else {
+        0
+    };
+    (faces, water)
 }
 
 /// The octants (bit `x | y << 1 | z << 2`) that hold the cells by each node face, in face bucket
 /// order (+Y, -Y, +X, -X, +Z, -Z).
 const OCTANTS_BY_FACE: [u8; 6] = [0xCC, 0x33, 0xAA, 0x55, 0xF0, 0x0F];
 
-/// The seam quads of each face bucket of a node mesh with `faces` (`boxel_mesh::lod::seam_counts`),
+/// The seam quads of each face bucket of a node mesh with `faces`
+/// (`boxel_mesh::lod::seam_counts`) and of its water bucket of `water` quads (`water_seams`),
 /// none for a mesh whose counts do not match its quads (never left out, then).
-fn node_seams(mesh: &ChunkMesh, faces: [u32; 6]) -> [[u32; 2]; 6] {
+fn node_seams(mesh: &ChunkMesh, faces: [u32; 6], water: u32) -> ([[u32; 2]; 6], [u32; 2]) {
     if mesh.total_quads() as usize != mesh.quads.len() {
-        return [[0; 2]; 6];
+        return ([[0; 2]; 6], [0; 2]);
     }
+    let within = |s: [u32; 2], n: u32| if s[0] + s[1] > n { [0; 2] } else { s };
     let mut seams = seam_counts(mesh);
     for (s, &n) in seams.iter_mut().zip(&faces) {
-        if s[0] + s[1] > n {
-            *s = [0; 2];
-        }
+        *s = within(*s, n);
     }
-    seams
+    (seams, within(water_seams(mesh), water))
 }
 
 impl LodNodes {
@@ -870,11 +964,12 @@ impl LodNodes {
         )
     }
 
-    /// The draw list for `view` (module docs). Empty while the last input does not draw LOD, or
-    /// `sealed`.
+    /// The draw lists for `view` (module docs), of face buckets and of water buckets. Empty while
+    /// the last input does not draw LOD, or `sealed`.
     fn cull(&mut self, view: &ViewParams, sealed: bool) {
         self.refresh_across();
         self.draws.clear();
+        self.water_draws.clear();
         self.stats.drawn = 0;
         self.stats.draws = 0;
         self.stats.quads = 0;
@@ -940,9 +1035,20 @@ impl LodNodes {
                         quads,
                     });
                 }
+                // The water bucket after the face buckets, drawn from both sides: no face test.
+                let water = bits::water_quads(node.water, node.water_seams, node.mask, node.across);
+                if water > 0 {
+                    self.water_draws.push(NodeDraw {
+                        immediate,
+                        first: start,
+                        quads: water,
+                    });
+                    self.stats.quads += u64::from(water);
+                }
             }
         }
-        self.stats.draws = self.draws.len() as u32;
+        // Each water draw twice: its depth prepass and its color.
+        self.stats.draws = (self.draws.len() + 2 * self.water_draws.len()) as u32;
     }
 
     /// High: the frame's bookkeeping instead of [`LodNodes::cull`]. The GPU window follows
@@ -954,6 +1060,7 @@ impl LodNodes {
             table.follow(render_origin);
         }
         self.draws.clear();
+        self.water_draws.clear();
         self.stats.drawn = 0;
         self.stats.draws = 0;
         self.stats.quads = 0;
@@ -965,7 +1072,8 @@ impl LodNodes {
             return 0;
         }
         let segments = segments_for(self.slots.len());
-        self.stats.draws = segments;
+        // A face list per segment, and the water lists twice (prepass and color) if any water.
+        self.stats.draws = segments * if self.live_water > 0 { 3 } else { 1 };
         segments
     }
 
@@ -978,6 +1086,7 @@ impl LodNodes {
         let live = node.pending.is_none() && table.in_window(node.origin);
         LodNodeGpu::new(self.immediate(node), node.alloc.offset, node.faces, live)
             .with_seams(node.seams, node.across)
+            .with_water(node.water, node.water_seams)
     }
 
     /// High: the table entries to write since the last call, as runs `(first slot, entries)`,
@@ -1148,6 +1257,8 @@ struct GpuDriven {
     cull: wgpu::ComputePipeline,
     cull_layout: wgpu::BindGroupLayout,
     pull: wgpu::RenderPipeline,
+    /// The water bucket's prepass and color, from the water lists.
+    pull_water: WaterPipelines,
     geometry_layout: wgpu::BindGroupLayout,
     hiz_pipeline: wgpu::ComputePipeline,
     hiz_layout: wgpu::BindGroupLayout,
@@ -1308,13 +1419,15 @@ struct HiZ {
     levels: Vec<(wgpu::BindGroup, [u32; 2])>,
 }
 
-/// The node table and the draw lists, for `segments` segments.
+/// The node table and the draw lists, for `segments` segments: per segment a list of face
+/// bucket draws ([`bits::SEGMENT_DRAWS`] long), then per segment a list of water bucket draws
+/// ([`bits::SEGMENT_SLOTS`] long, one per node), in the same buffers (`lod_cull.wgsl`).
 struct GpuLists {
     segments: u32,
     table: wgpu::Buffer,
     args: wgpu::Buffer,
     refs: wgpu::Buffer,
-    /// One draw count per segment (cleared before every cull).
+    /// One draw count per face list, then one per water list (cleared before every cull).
     counts: wgpu::Buffer,
     /// Group [`bits::GROUP_GEOMETRY`] of the pull pipeline: the LOD arena and the table.
     geometry: wgpu::BindGroup,
@@ -1426,10 +1539,31 @@ impl GpuDriven {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
+        let module = create_module(device, ShaderModuleId::LodPull);
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(ShaderModuleId::LodPull.label()),
+            bind_group_layouts: &[Some(materials), Some(view), None, Some(&geometry_layout)],
+            immediate_size: 0,
+        });
+        let pulled = |entry, draws| {
+            render_pipeline(
+                device,
+                &layout,
+                &module,
+                entry,
+                size_of::<DrawRef>() as u64,
+                wgpu::PrimitiveTopology::TriangleList,
+                draws,
+            )
+        };
         Self {
             cull,
             cull_layout,
-            pull: pull_pipeline(device, materials, view, &geometry_layout),
+            pull: pulled("vs_lod_pull", Draws::Faces),
+            pull_water: WaterPipelines {
+                depth: pulled("vs_lod_pull_water", Draws::WaterDepth),
+                color: pulled("vs_lod_pull_water", Draws::Water),
+            },
             geometry_layout,
             hiz_pipeline,
             hiz_layout,
@@ -1515,7 +1649,8 @@ impl GpuDriven {
             })
         };
         let slots = u64::from(segments * bits::SEGMENT_SLOTS);
-        let draws = u64::from(segments * bits::SEGMENT_DRAWS);
+        // The face lists, then the water lists.
+        let draws = u64::from(segments * (bits::SEGMENT_DRAWS + bits::SEGMENT_SLOTS));
         let table = buffer(
             "boxel lod nodes",
             slots * size_of::<LodNodeGpu>() as u64,
@@ -1533,7 +1668,7 @@ impl GpuDriven {
         );
         let counts = buffer(
             "boxel lod draw counts",
-            4 * u64::from(segments),
+            8 * u64::from(segments),
             wgpu::BufferUsages::INDIRECT
                 | wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
@@ -1696,60 +1831,51 @@ impl GpuDriven {
         }
         self.segments
     }
+
+    /// See [`LodPass::draw_water`]: the water lists, nothing without `water` (no live node has
+    /// a water bucket).
+    fn draw_water(&self, pass: &mut wgpu::RenderPass<'_>, water: bool) -> u32 {
+        let Some(lists) = self.lists.as_ref().filter(|_| self.segments > 0 && water) else {
+            return 0;
+        };
+        // The water lists start after every face list of the buffers (`lod_cull.wgsl`).
+        let base = lists.segments * bits::SEGMENT_DRAWS;
+        pass.set_bind_group(bits::GROUP_GEOMETRY, &lists.geometry, &[]);
+        pass.set_vertex_buffer(0, lists.refs.slice(..));
+        pass.set_index_buffer(self.inputs.index.slice(..), wgpu::IndexFormat::Uint32);
+        for pipeline in [&self.pull_water.depth, &self.pull_water.color] {
+            pass.set_pipeline(pipeline);
+            for segment in 0..self.segments {
+                pass.multi_draw_indexed_indirect_count(
+                    &lists.args,
+                    u64::from(base + segment * bits::SEGMENT_SLOTS) * ARGS_BYTES,
+                    &lists.counts,
+                    4 * u64::from(lists.segments + segment),
+                    bits::SEGMENT_SLOTS,
+                );
+            }
+        }
+        2 * self.segments
+    }
 }
 
-/// The pull pipeline of High: `vs_lod_pull` and `fs_lod` (module `LodPull`), layout
-/// `[materials, view, -, lod geometry]`, the `DrawRef` as one instance-step `Uint32x2` attribute,
-/// indexed triangle lists; otherwise the state of [`pipeline`].
-fn pull_pipeline(
-    device: &wgpu::Device,
-    materials: &wgpu::BindGroupLayout,
-    view: &wgpu::BindGroupLayout,
-    geometry: &wgpu::BindGroupLayout,
-) -> wgpu::RenderPipeline {
-    let module = create_module(device, ShaderModuleId::LodPull);
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some(ShaderModuleId::LodPull.label()),
-        bind_group_layouts: &[Some(materials), Some(view), None, Some(geometry)],
-        immediate_size: 0,
-    });
-    render_pipeline(
-        device,
-        &layout,
-        &module,
-        "vs_lod_pull",
-        size_of::<DrawRef>() as u64,
-        wgpu::PrimitiveTopology::TriangleList,
-    )
+/// What a LOD render pipeline draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Draws {
+    /// The face buckets (`fs_lod`): back faces culled, depth `Greater` with writes, no blending.
+    Faces,
+    /// The water bucket's depth prepass (`fs_lod_water_depth`): no face culling, depth
+    /// `Greater` with writes, no color written.
+    WaterDepth,
+    /// The water bucket's color (`fs_lod_water`): no face culling, depth `GreaterEqual` without
+    /// writes (only the prepass's nearest water passes), alpha blending like the near water.
+    Water,
 }
 
-/// The LOD pipeline: `vs_lod` and `fs_lod` (module `Lod`), layout `[materials, view]` and 16
-/// bytes of immediates, the quad as one instance-step `Uint32x2` attribute, triangle strips,
-/// back faces culled, depth `Greater` with writes, no blending.
-fn pipeline(
-    device: &wgpu::Device,
-    materials: &wgpu::BindGroupLayout,
-    view: &wgpu::BindGroupLayout,
-) -> wgpu::RenderPipeline {
-    let module = create_module(device, ShaderModuleId::Lod);
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some(ShaderModuleId::Lod.label()),
-        bind_group_layouts: &[Some(materials), Some(view)],
-        immediate_size: bits::IMMEDIATE_SIZE,
-    });
-    render_pipeline(
-        device,
-        &layout,
-        &module,
-        "vs_lod",
-        QUAD_BYTES,
-        wgpu::PrimitiveTopology::TriangleStrip,
-    )
-}
-
-/// A LOD render pipeline: vertex entry `entry` with one instance-step `Uint32x2` attribute of
-/// `stride` bytes, `fs_lod`, `topology`, back faces culled, depth `Greater` with writes, no
-/// blending.
+/// A LOD render pipeline of `layout` (`[materials, view]` and the immediates of `lod.wgsl`, or
+/// `[materials, view, -, lod geometry]` for `lod_pull.wgsl`): vertex entry `entry` with one
+/// instance-step `Uint32x2` attribute of `stride` bytes (the quad, or the `DrawRef`), `topology`,
+/// and what it `draws`.
 fn render_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -1757,14 +1883,45 @@ fn render_pipeline(
     entry: &str,
     stride: u64,
     topology: wgpu::PrimitiveTopology,
+    draws: Draws,
 ) -> wgpu::RenderPipeline {
     let attributes = [wgpu::VertexAttribute {
         format: wgpu::VertexFormat::Uint32x2,
         offset: 0,
         shader_location: 0,
     }];
+    let (fragment, cull_mode, depth_write, depth_compare, blend, write_mask) = match draws {
+        Draws::Faces => (
+            "fs_lod",
+            Some(wgpu::Face::Back),
+            true,
+            wgpu::CompareFunction::Greater,
+            None,
+            wgpu::ColorWrites::ALL,
+        ),
+        Draws::WaterDepth => (
+            "fs_lod_water_depth",
+            None,
+            true,
+            wgpu::CompareFunction::Greater,
+            None,
+            wgpu::ColorWrites::empty(),
+        ),
+        Draws::Water => (
+            "fs_lod_water",
+            None,
+            false,
+            wgpu::CompareFunction::GreaterEqual,
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+            wgpu::ColorWrites::ALL,
+        ),
+    };
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("boxel lod"),
+        label: Some(match draws {
+            Draws::Faces => "boxel lod",
+            Draws::WaterDepth => "boxel lod water depth",
+            Draws::Water => "boxel lod water",
+        }),
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module,
@@ -1780,27 +1937,27 @@ fn render_pipeline(
             topology,
             strip_index_format: None,
             front_face: wgpu::FrontFace::Ccw,
-            cull_mode: Some(wgpu::Face::Back),
+            cull_mode,
             unclipped_depth: false,
             polygon_mode: wgpu::PolygonMode::Fill,
             conservative: false,
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: Some(true),
-            depth_compare: Some(wgpu::CompareFunction::Greater),
+            depth_write_enabled: Some(depth_write),
+            depth_compare: Some(depth_compare),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module,
-            entry_point: Some("fs_lod"),
+            entry_point: Some(fragment),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: MAIN_COLOR_FORMAT,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
+                blend,
+                write_mask,
             })],
         }),
         multiview_mask: None,
@@ -1889,6 +2046,13 @@ mod tests {
                 (n + 1, q + u64::from(node.alloc.size))
             });
         assert_eq!(nodes.live, live);
+        let water = nodes
+            .slots
+            .iter()
+            .flatten()
+            .filter(|n| n.mask != 0xFF && n.pending.is_none() && n.water > 0)
+            .count();
+        assert_eq!(nodes.live_water as usize, water);
     }
 
     #[test]
@@ -2437,8 +2601,123 @@ mod tests {
             .as_ref()
             .map(|n| n.seams);
         assert_eq!(fine_seams, Some(seams));
-        assert_eq!(node_seams(&mesh([4; 6]), [4; 6]), [[0; 2]; 6]);
-        assert_eq!(node_seams(&m, [10, 10, 3, 10, 10, 10])[2], [0, 0]);
+        assert_eq!(node_seams(&mesh([4; 6]), [4; 6], 0), ([[0; 2]; 6], [0; 2]));
+        assert_eq!(node_seams(&m, [10, 10, 3, 10, 10, 10], 0).0[2], [0, 0]);
+    }
+
+    /// `seamed_mesh` with `water` quads in the translucent bucket, the last `water_seams` of
+    /// them seam quads (`[on a node face, on a middle plane]`).
+    fn watered_mesh(
+        faces: [u32; 6],
+        seams: [[u32; 2]; 6],
+        water: u32,
+        water_seams: [u32; 2],
+    ) -> Arc<ChunkMesh> {
+        let base = seamed_mesh(faces, seams);
+        let mut quads = base.quads.clone();
+        let mut counts = base.bucket_counts;
+        let [on_face, middle] = water_seams;
+        for i in 0..water {
+            let seam = if i + middle >= water {
+                Seam::Middle
+            } else if i + middle + on_face >= water {
+                Seam::Face
+            } else {
+                Seam::None
+            };
+            quads.push(
+                PackedQuad::new([i % 32, 9, 5], 1, 1, Face::PosY, 2).with_light_index(seam as u16),
+            );
+        }
+        counts[TRANSLUCENT_BUCKET] = water;
+        let mut mesh = ChunkMesh::from_quads(quads, counts);
+        mesh.palette = boxel_mesh::lod::LOD_PALETTE.to_vec();
+        Arc::new(mesh)
+    }
+
+    /// The water bucket (issue #50) goes up with the face buckets, right after them, and is
+    /// drawn apart, from both sides, without the seam quads nothing shows: the middle ones while
+    /// no octant is hidden, the node face ones while every neighbor of the level covers its
+    /// face. High's table entry carries it, and counts the nodes that have one.
+    #[test]
+    fn water_buckets_are_drawn_after_the_faces() {
+        let mut nodes = LodNodes::new(1 << 12, 1 << 12, 4);
+        nodes.table = Some(GpuTable::default());
+        let seams = [[1, 2], [0, 0], [3, 1], [2, 2], [0, 4], [1, 0]];
+        let m = watered_mesh([10; 6], seams, 12, [3, 2]);
+        let dry = seamed_mesh([10; 6], seams);
+        let (a, b) = (key(1, -1, 0, -3), key(1, 0, 0, -3));
+        nodes.apply(input(vec![upsert(a, m.clone(), 0), upsert(b, dry, 0)]));
+        check(&nodes);
+        fn node(nodes: &LodNodes, k: ChunkKey) -> &LodDraw {
+            let slot = nodes.by_key[&k];
+            nodes.slots[slot as usize].as_ref().expect("resident")
+        }
+        assert_eq!(node(&nodes, a).alloc.size, 72);
+        assert_eq!(
+            (node(&nodes, a).water, node(&nodes, a).water_seams),
+            (12, [3, 2])
+        );
+        assert_eq!(nodes.live_water, 0, "not up yet");
+        let ups = nodes.take_uploads(STAGING_BYTES, u64::MAX);
+        assert_eq!(
+            ups.iter().map(|(_, b)| b).sum::<u64>(),
+            (72 + 60) * QUAD_BYTES
+        );
+        assert_eq!(nodes.live_water, 1);
+        let view = camera_view(DVec3::new(0.0, 100.0, 0.0), 0.0, -0.3);
+        nodes.cull(&view, false);
+        // a's water after its 60 face quads; b has none. Not a single octant hidden, and b (its
+        // only neighbor of the level) covers one face of a's: the node face seams stay.
+        let water = |nodes: &LodNodes| -> Vec<(u32, u32)> {
+            nodes
+                .water_draws
+                .iter()
+                .map(|d| (d.first - node(nodes, a).alloc.offset, d.quads))
+                .collect()
+        };
+        assert_eq!(water(&nodes), [(60, 10)]);
+        assert_eq!(
+            nodes.stats.draws,
+            6 + 2,
+            "the water twice: prepass and color"
+        );
+        assert_eq!(nodes.stats.quads, 40 + 10);
+        // An octant hidden by a's middle plane: every water quad.
+        nodes.apply(input(vec![LodOp::Mask {
+            key: a,
+            mask: 0b0001,
+        }]));
+        nodes.cull(&view, false);
+        assert_eq!(water(&nodes), [(60, 12)]);
+        // High's entry.
+        let e = nodes.gpu_entry(nodes.by_key[&a], nodes.table.as_ref().expect("table"));
+        assert_eq!((e.water, e.water_seams), (12, 3 | 2 << 16));
+        assert_eq!(e.water, 12);
+        // Hidden whole: no water drawn, none counted.
+        nodes.apply(input(vec![LodOp::Mask { key: a, mask: 0xFF }]));
+        nodes.cull(&view, false);
+        assert!(nodes.water_draws.is_empty());
+        assert_eq!(nodes.live_water, 0);
+        nodes.apply(input(vec![LodOp::Mask { key: a, mask: 0 }]));
+        assert_eq!(nodes.live_water, 1);
+        // A new mesh without water: not counted from its frame on (not drawn until it is up).
+        nodes.apply(input(vec![upsert(a, seamed_mesh([10; 6], seams), 0)]));
+        assert_eq!(nodes.live_water, 0);
+        nodes.take_uploads(STAGING_BYTES, u64::MAX);
+        nodes.cull(&view, false);
+        assert!(nodes.water_draws.is_empty());
+        assert_eq!(nodes.live_water, 0);
+        // A resync forgets every count.
+        nodes.apply(input(vec![upsert(b, m, 0)]));
+        nodes.take_uploads(STAGING_BYTES, u64::MAX);
+        assert_eq!(nodes.live_water, 1);
+        nodes.apply(LodInput {
+            resync: true,
+            ..input(Vec::new())
+        });
+        assert_eq!(nodes.live_water, 0);
+        check(&nodes);
     }
 
     /// The instanced draws leave out the seam quads nothing shows, as High's cull does: on a

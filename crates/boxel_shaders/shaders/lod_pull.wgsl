@@ -6,7 +6,7 @@
 // vertex attribute at location 0, like vs_pull: the draw sets first_instance = its DrawRef
 // index, instance_count = 1, base_vertex = 0. The geometry is group 3 (group 2 stays the main
 // geometry, which the translucent buckets drawn after the LOD still use).
-struct LodNodeGpu { node: vec4<i32>, quad_base: u32, counts: array<u32, 3>, seams: array<u32, 6>, pad: array<u32, 2> };
+struct LodNodeGpu { node: vec4<i32>, quad_base: u32, counts: array<u32, 3>, seams: array<u32, 6>, water: u32, water_seams: u32 };
 
 @group(3) @binding(0) var<storage, read> lod_quads: array<vec2<u32>>;
 @group(3) @binding(1) var<storage, read> lod_nodes: array<LodNodeGpu>;
@@ -14,5 +14,13 @@ struct LodNodeGpu { node: vec4<i32>, quad_base: u32, counts: array<u32, 3>, seam
 @vertex
 fn vs_lod_pull(@builtin(vertex_index) vi: u32, @location(0) draw: vec2<u32>) -> LodOut {
   let q = lod_quads[draw.y + (vi >> 2u)];
-  return lod_vertex(q, vi & 3u, lod_nodes[draw.x].node);
+  return lod_vertex(q, vi & 3u, lod_nodes[draw.x].node, false);
+}
+
+// The water bucket (issue #50), from the water lists lod_cull.wgsl writes: its depth prepass and
+// its blended color pass both run this.
+@vertex
+fn vs_lod_pull_water(@builtin(vertex_index) vi: u32, @location(0) draw: vec2<u32>) -> LodWaterOut {
+  let q = lod_quads[draw.y + (vi >> 2u)];
+  return lod_water_vertex(q, vi & 3u, lod_nodes[draw.x].node);
 }

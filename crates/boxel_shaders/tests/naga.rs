@@ -718,7 +718,18 @@ fn lod_binds_one_uniform_block_and_one_texture() {
         seen.push((ep.name.as_str(), (uniforms, textures, immediates)));
     }
     seen.sort_unstable();
-    assert_eq!(seen, [("fs_lod", (1, 1, 0)), ("vs_lod", (1, 0, 1))]);
+    assert_eq!(
+        seen,
+        [
+            ("fs_lod", (1, 1, 0)),
+            ("fs_lod_water", (1, 1, 0)),
+            ("fs_lod_water_depth", (0, 0, 0)),
+            ("vs_lod", (1, 0, 1)),
+            ("vs_lod_water", (1, 0, 1))
+        ]
+    );
+    assert!(invariant_position(&module, "vs_lod_water"));
+    assert!(!invariant_position(&module, "vs_lod"));
     assert_eq!(
         struct_layout(&module, "LodImmediate").0 as usize,
         size_of::<LodImmediate>()
@@ -793,8 +804,26 @@ fn lod_bits_match_the_mirror_and_boxel_mesh() {
     ] {
         assert_eq!(const_u32(&module, name), v, "{name}");
     }
+    // A quad's seam and darkness are where boxel_mesh puts them in its light palette index.
+    assert_eq!(
+        const_u32(&module, "LOD_SEAM_SHIFT"),
+        boxel_mesh::layout::MAT_LIGHT_SHIFT
+    );
+    assert_eq!(
+        const_u32(&module, "LOD_DARK_SHIFT"),
+        boxel_mesh::layout::MAT_LIGHT_SHIFT + u32::from(boxel_mesh::lod::DARK_SHIFT)
+    );
+    assert_eq!(
+        const_u32(&module, "LOD_DARK_MASK"),
+        u32::from(boxel_mesh::lod::MAX_DARK)
+    );
+    let q = PackedQuad::new([0; 3], 1, 1, Face::PosY, 7).with_light_index(2 | 13 << 2);
+    assert_eq!((q.mat >> const_u32(&module, "LOD_DARK_SHIFT")) & 15, 13);
+    assert_eq!(boxel_mesh::lod::dark_of(q), 13);
     // The flat output of a LOD quad keeps the texture layer, the face (3 bits), the mip, the
-    // tint, the emissive flag and the level in bits of their own.
+    // tint, the emissive flag, the level and the darkness in bits of their own.
+    assert_eq!(const_u32(&module, "LOD_OUT_DARK_SHIFT"), 28);
+    assert!(const_u32(&module, "LOD_OUT_LEVEL_SHIFT") + 4 <= 28);
     let mat_layer = const_u32(&module, "MAT_LAYER_MASK");
     let face = const_u32(&module, "LOD_OUT_FACE_SHIFT");
     assert!(face >= mat_layer.count_ones());
@@ -863,7 +892,8 @@ fn lod_gpu_path_matches_its_mirrors() {
         offset_of!(LodNodeGpu, quad_base) as u32,
         offset_of!(LodNodeGpu, counts) as u32,
         offset_of!(LodNodeGpu, seams) as u32,
-        offset_of!(LodNodeGpu, pad) as u32,
+        offset_of!(LodNodeGpu, water) as u32,
+        offset_of!(LodNodeGpu, water_seams) as u32,
     ];
     for module in [&pull, &cull] {
         assert_eq!(
@@ -947,6 +977,62 @@ fn lod_gpu_path_matches_its_mirrors() {
     for (f, [face, middle]) in seams.into_iter().enumerate() {
         assert_eq!(seamed.seams[f], face | middle << 16);
     }
+    let watered = seamed.with_water(70_000, [9, 16384]);
+    assert_eq!(
+        (watered.water, watered.water_seams),
+        (70_000, 9 | 16384 << 16)
+    );
+    assert_eq!(watered.seams, seamed.seams);
+    // The water entries: the same geometry and View, an invariant position.
+    for entry in ["vs_lod_pull_water", "fs_lod_water", "fs_lod_water_depth"] {
+        assert!(pull.entry_points.iter().any(|e| e.name == entry), "{entry}");
+    }
+    assert!(invariant_position(&pull, "vs_lod_pull_water"));
+    assert!(!invariant_position(&pull, "vs_lod_pull"));
+}
+
+/// True if the vertex entry `entry` of `module` returns a struct whose position is invariant.
+fn invariant_position(module: &naga::Module, entry: &str) -> bool {
+    let ep = module
+        .entry_points
+        .iter()
+        .find(|e| e.name == entry)
+        .expect(entry);
+    let ty = ep.function.result.as_ref().expect("a vertex output").ty;
+    match &module.types[ty].inner {
+        naga::TypeInner::Struct { members, .. } => members.iter().any(|m| {
+            matches!(
+                m.binding,
+                Some(naga::Binding::BuiltIn(naga::BuiltIn::Position {
+                    invariant: true
+                }))
+            )
+        }),
+        _ => false,
+    }
+}
+
+/// The High cull's water rule (`water_quads`, mirrored in Rust): the water bucket's middle seam
+/// quads are drawn exactly when some drawn octant has its partner across some middle plane
+/// hidden, and the node face ones also when some neighbor of the level does not cover its face.
+#[test]
+fn lod_water_seams_are_drawn_where_a_seam_can_show() {
+    use boxel_shaders::gpu::lod::water_quads;
+    for hidden in 0..=255u8 {
+        let exposed = (0..8u8).any(|o| {
+            hidden & 1 << o == 0 && [1u8, 2, 4].iter().any(|&bit| hidden & 1 << (o ^ bit) != 0)
+        });
+        for across in [0u8, 0b01_0110, 0x3F, 0xFF] {
+            let n = water_quads(100, [10, 20], hidden, across);
+            let want = match (exposed, across & 0x3F == 0x3F) {
+                (true, _) => 100,
+                (false, false) => 80,
+                (false, true) => 70,
+            };
+            assert_eq!(n, want, "hidden {hidden:08b}, across {across:06b}");
+        }
+    }
+    assert_eq!(water_quads(5, [10, 20], 0, 0x3F), 0, "never below zero");
 }
 
 /// The High cull's seam rule (`bucket_quads`, mirrored in Rust): the middle seam quads of a face

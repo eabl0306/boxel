@@ -1,12 +1,15 @@
 //! Crack ray tests of the far level of detail (ADR 0031) on the demo's own coarse cells: rays
-//! cast from finer terrain across a seam toward coarser terrain must meet a face before a point
-//! under the coarser surface, or the sky would show through the seam. Two scenes over a sea more
-//! than 8 blocks deep: two LOD levels of the forest's source, and real full-detail chunks of the
-//! forest beside a level-1 node.
+//! cast from finer terrain across a seam toward coarser terrain must meet an opaque face before
+//! a point inside the coarser ground, or the sky would show through the seam, and must cross a
+//! face of the water before a point inside the coarser water (translucent near and far, issue
+//! #50), or its bed would show untinted. Two scenes over a sea more than 8 blocks deep: two LOD
+//! levels of the forest's source, and real full-detail chunks of the forest beside a level-1
+//! node.
 use boxel_demo::worldgen::ForestGenerator;
-use boxel_mesh::lod::{LodMaterials, fits, mesh_node, octant_of};
+use boxel_mesh::lod::{LodMaterials, Seam, fits, mesh_node, octant_of, seam_of};
 use boxel_mesh::{
     ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher, PackedQuad, PaddedChunk,
+    TRANSLUCENT_BUCKET, layout,
 };
 use boxel_voxel::{
     BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, DimensionId, NEIGHBOR_OFFSETS,
@@ -27,19 +30,27 @@ struct Rect {
 
 impl Rect {
     /// `q` of a mesh whose cell `(0, 0, 0)` starts at `origin`, cells `cell` blocks wide.
+    /// A fluid surface quad of full detail (`SHAPE_FLUID_SURFACE`) has its top 0.875 up its
+    /// cell.
     fn of(q: PackedQuad, origin: [f64; 3], cell: f64) -> Self {
         let face = q.face();
         let (n, ua, va) = face.axes();
         let normal = face.normal();
         let sign = f64::from(normal.x + normal.y + normal.z);
         let p = q.pos().map(f64::from);
-        let positive = if sign > 0.0 { 1.0 } else { 0.0 };
+        let surface = q.shape() == layout::SHAPE_FLUID_SURFACE;
+        let positive = match (sign > 0.0, surface && n == 1) {
+            (true, true) => layout::FLUID_SURFACE as f64,
+            (true, false) => 1.0,
+            _ => 0.0,
+        };
         let span = |a: usize, len: u32| {
-            (
-                a,
-                origin[a] + p[a] * cell,
-                origin[a] + (p[a] + f64::from(len)) * cell,
-            )
+            let len = if surface && a == 1 {
+                layout::FLUID_SURFACE as f64
+            } else {
+                f64::from(len)
+            };
+            (a, origin[a] + p[a] * cell, origin[a] + (p[a] + len) * cell)
         };
         Self {
             n,
@@ -55,6 +66,15 @@ impl Rect {
         if d[self.n] * self.sign >= 0.0 {
             return None;
         }
+        self.crosses(o, d)
+    }
+
+    /// Where the ray `o + t d` meets the rectangle from either side, `t > 0` (water, drawn with
+    /// no face culling).
+    fn crosses(&self, o: [f64; 3], d: [f64; 3]) -> Option<f64> {
+        if d[self.n] == 0.0 {
+            return None;
+        }
         let t = (self.plane - o[self.n]) / d[self.n];
         if t <= 1e-9 {
             return None;
@@ -65,19 +85,75 @@ impl Rect {
     }
 }
 
-/// The opaque quads of `mesh` (a LOD mesh has nothing else; full-detail water is translucent)
-/// as rectangles, those `skip` keeps out left out.
+/// The quads of `mesh` as rectangles, those `skip` keeps out left out: its opaque ones (the face
+/// buckets) and its water's (the translucent bucket). With `lod` (a LOD mesh), a water skirt on a
+/// side starts `FLUID_SURFACE` up its cell, as the LOD's water draws it (`lod_common.wgsl`).
 fn rects(
     mesh: &ChunkMesh,
     origin: [f64; 3],
     cell: f64,
+    lod: bool,
     skip: impl Fn(PackedQuad) -> bool,
-) -> Vec<Rect> {
-    (0..6)
-        .flat_map(|b| mesh.bucket(b).iter().copied())
-        .filter(|&q| !skip(q))
-        .map(|q| Rect::of(q, origin, cell))
-        .collect()
+) -> Rects {
+    let of = |buckets: &[usize]| -> Vec<Rect> {
+        buckets
+            .iter()
+            .flat_map(|&b| mesh.bucket(b).iter().copied())
+            .filter(|&q| !skip(q))
+            .map(|q| Rect::of(q, origin, cell))
+            .collect()
+    };
+    let mut water = of(&[TRANSLUCENT_BUCKET]);
+    if lod {
+        let quads = mesh
+            .bucket(TRANSLUCENT_BUCKET)
+            .iter()
+            .filter(|&&q| !skip(q));
+        for (r, q) in water.iter_mut().zip(quads) {
+            if seam_of(*q) != Seam::None && r.n != 1 {
+                r.v.1 += f64::from(layout::FLUID_SURFACE);
+            }
+        }
+    }
+    Rects {
+        opaque: of(&[0, 1, 2, 3, 4, 5]),
+        water,
+    }
+}
+
+/// The rectangles of a scene: what stops a ray, and the water it crosses.
+#[derive(Default)]
+struct Rects {
+    opaque: Vec<Rect>,
+    water: Vec<Rect>,
+}
+
+impl Rects {
+    fn extend(&mut self, other: Rects) {
+        self.opaque.extend(other.opaque);
+        self.water.extend(other.water);
+    }
+
+    /// True if a ray to a point inside the ground (at `t = 1`) meets no opaque face first: it
+    /// would show the sky through a crack.
+    fn slips(&self, o: [f64; 3], d: [f64; 3]) -> bool {
+        !self
+            .opaque
+            .iter()
+            .filter_map(|r| r.hit(o, d))
+            .any(|t| t <= 1.0)
+    }
+
+    /// True if a ray from above every surface to a point inside the water (at `t = 1`) meets no
+    /// opaque face and crosses no face of the water first: it would show the bed untinted.
+    fn untinted(&self, o: [f64; 3], d: [f64; 3]) -> bool {
+        self.slips(o, d)
+            && !self
+                .water
+                .iter()
+                .filter_map(|r| r.crosses(o, d))
+                .any(|t| t <= 1.0)
+    }
 }
 
 /// The level-`level` node `[x, y, z]` of the forest's coarse terrain, `None` if it is uniform
@@ -124,22 +200,26 @@ fn node_rects(
     level: u8,
     origin: [f64; 3],
     hidden: u8,
-) -> Vec<Rect> {
+) -> Rects {
     let mut padded = PaddedChunk::new();
     m.fill(&cells.0[..], &mut padded);
     let mut mesh = ChunkMesh::default();
     mesh_node(&mut Mesher::new(), &padded, m, level, &mut mesh);
     assert!(fits(&mesh));
-    rects(&mesh, origin, f64::from(1u32 << level), |q| {
+    rects(&mesh, origin, f64::from(1u32 << level), true, |q| {
         hidden & (1 << octant_of(q)) != 0
     })
 }
 
-/// The top of the non-air cells of column `(x, z)` of a node, in blocks above its origin.
-fn cell_top(cells: &LodCells, m: &LodMaterials, x: i32, z: i32, cell: f64) -> f64 {
+/// The top of the non-air cells of column `(x, z)` of a node, in blocks above its origin; with
+/// `ground`, of the cells that are not see-through (not water).
+fn cell_top(cells: &LodCells, m: &LodMaterials, x: i32, z: i32, cell: f64, ground: bool) -> f64 {
     let top = (-1..=32)
         .rev()
-        .find(|&y| m.canonical(cells.get(x, y, z)) != 0)
+        .find(|&y| {
+            let c = m.canonical(cells.get(x, y, z));
+            c != 0 && !(ground && m.see_through(c))
+        })
         .unwrap_or(-1);
     f64::from(top + 1) * cell
 }
@@ -161,24 +241,32 @@ impl Numbers {
     }
 }
 
-/// Casts `count` rays from `ray()`'s start to its target through `rects`; returns the rays that
-/// meet nothing before their target (they would show the sky through a crack).
-fn slips(
-    rects: &[Rect],
+/// Casts `count` rays from `ray()`'s start to its target; returns those `fails(o, d)`.
+fn cast(
     count: usize,
     mut ray: impl FnMut() -> Option<([f64; 3], [f64; 3])>,
+    fails: impl Fn([f64; 3], [f64; 3]) -> bool,
 ) -> Vec<([f64; 3], [f64; 3])> {
-    let (mut cast, mut slipped) = (0, Vec::new());
+    let (mut cast, mut failed) = (0, Vec::new());
     while cast < count {
         let Some((o, target)) = ray() else { continue };
         cast += 1;
         let d = [target[0] - o[0], target[1] - o[1], target[2] - o[2]];
-        let hit = rects.iter().filter_map(|r| r.hit(o, d)).any(|t| t <= 1.0);
-        if !hit {
-            slipped.push((o, target));
+        if fails(o, d) {
+            failed.push((o, target));
         }
     }
-    slipped
+    failed
+}
+
+/// Fails with the first rays of `failed` unless it is empty.
+fn assert_none(what: &str, failed: &[([f64; 3], [f64; 3])]) {
+    assert!(
+        failed.is_empty(),
+        "{what}: {} rays failed, first {:?}",
+        failed.len(),
+        &failed[..failed.len().min(4)]
+    );
 }
 
 /// True if the forest's sea is more than 8 blocks deep somewhere along the seam `x = seam`,
@@ -193,15 +281,16 @@ fn deep_sea_at(world: &ForestGenerator, seam: i64, zs: std::ops::Range<i64>) -> 
 }
 
 /// Casts 10,000 rays from above the level-`fine` terrain of the coarse node column `column`'s
-/// octants `(0, *, 0)` (drawn by the two fine nodes of layers 0 and 1) to under the level
-/// `fine + 1` terrain of its octants `(1, *, 0)`; returns the rays that slipped.
+/// octants `(0, *, 0)` (drawn by the two fine nodes of layers 0 and 1) into the level `fine + 1`
+/// ground of its octants `(1, *, 0)`, and 10,000 into its water; returns the rays that slipped
+/// and those that reached the water untinted.
 fn two_levels(
     world: &ForestGenerator,
     r: &BlockRegistry,
     m: &LodMaterials,
     fine: u8,
     column: [i64; 2],
-) -> Vec<([f64; 3], [f64; 3])> {
+) -> [Vec<([f64; 3], [f64; 3])>; 2] {
     let coarse = fine + 1;
     let (sf, sc) = (f64::from(1u32 << fine), f64::from(1u32 << coarse));
     // The coarse node's edge, and the fine one's.
@@ -211,39 +300,75 @@ fn two_levels(
         .collect();
     let big = node(world, r, coarse, [column[0], 0, column[1]]).expect("coarse terrain");
     // The fine nodes draw the coarse node's octants with x = 0 (rays stay at z < half).
-    let mut rects = Vec::new();
+    let mut rects = Rects::default();
     for (y, cells) in fine_nodes.iter().enumerate() {
         rects.extend(node_rects(cells, m, fine, [0.0, y as f64 * half, 0.0], 0));
     }
     rects.extend(node_rects(&big, m, coarse, [0.0; 3], 0b0101_0101));
-    // The top of the fine terrain at `(x, z)`, in blocks.
+    // The top of the fine terrain (its water included) at `(x, z)`, in blocks.
     let fine_top = |x: f64, z: f64| {
         let (cx, cz) = ((x / sf) as i32, (z / sf) as i32);
         fine_nodes
             .iter()
             .enumerate()
-            .map(|(y, cells)| match cell_top(cells, m, cx, cz, sf) {
+            .map(|(y, cells)| match cell_top(cells, m, cx, cz, sf, false) {
                 0.0 => 0.0,
                 top => top + y as f64 * half,
             })
             .fold(0.0, f64::max)
     };
     let mut n = Numbers(7);
-    slips(&rects, 10_000, || {
+    let start = |n: &mut Numbers| {
         let (x, z) = (
             n.between(sf, half - sf),
             n.between(2.0 * sf, half - 2.0 * sf),
         );
         let top = fine_top(x, z);
-        let start = [x, n.between(top + 0.01, top + 20.0), z];
-        let (tx, tz) = (
+        [x, n.between(top + 0.01, top + 20.0), z]
+    };
+    let target = |n: &mut Numbers| {
+        (
             n.between(half + sf, e - sf),
             n.between(2.0 * sf, half - 2.0 * sf),
-        );
-        let top = cell_top(&big, m, (tx / sc) as i32, (tz / sc) as i32, sc);
-        let target = [tx, n.between((top - 6.0 * sc).max(0.5), top - 0.01), tz];
-        (start[1] < e - 1.0).then_some((start, target))
-    })
+        )
+    };
+    let into_ground = |n: &mut Numbers| {
+        let (tx, tz) = target(n);
+        let top = cell_top(&big, m, (tx / sc) as i32, (tz / sc) as i32, sc, true);
+        [tx, n.between((top - 6.0 * sc).max(0.5), top - 0.01), tz]
+    };
+    // A point inside the coarse water, if the scene has some (a few tries).
+    let into_water = |n: &mut Numbers| {
+        (0..64).find_map(|_| {
+            let (tx, tz) = target(n);
+            let (cx, cz) = ((tx / sc) as i32, (tz / sc) as i32);
+            let bed = cell_top(&big, m, cx, cz, sc, true);
+            let top = cell_top(&big, m, cx, cz, sc, false);
+            (top > bed).then(|| [tx, n.between(bed + 0.01, top - 0.01), tz])
+        })
+    };
+    let slipped = cast(
+        10_000,
+        || {
+            let (o, t) = (start(&mut n), into_ground(&mut n));
+            (o[1] < e - 1.0).then_some((o, t))
+        },
+        |o, d| rects.slips(o, d),
+    );
+    let untinted = if into_water(&mut Numbers(3)).is_some() {
+        cast(
+            10_000,
+            || {
+                let o = start(&mut n);
+                let t = into_water(&mut n)?;
+                (o[1] < e - 1.0).then_some((o, t))
+            },
+            |o, d| rects.untinted(o, d),
+        )
+    } else {
+        Vec::new()
+    };
+    [slipped, untinted]
 }
 
 #[test]
@@ -265,13 +390,9 @@ fn no_ray_slips_between_two_demo_lod_levels() {
         let seam = origin[0] + e / 2;
         let deep = deep_sea_at(&world, seam, origin[1]..origin[1] + e / 2);
         assert_eq!(deep, sea, "level {fine} column {column:?}");
-        let slipped = two_levels(&world, &r, &m, fine, column);
-        assert!(
-            slipped.is_empty(),
-            "level {fine} column {column:?}: {} rays slipped, first {:?}",
-            slipped.len(),
-            &slipped[..slipped.len().min(4)]
-        );
+        let [slipped, untinted] = two_levels(&world, &r, &m, fine, column);
+        assert_none(&format!("level {fine} column {column:?}, ground"), &slipped);
+        assert_none(&format!("level {fine} column {column:?}, water"), &untinted);
     }
 }
 
@@ -317,46 +438,71 @@ fn no_ray_slips_between_demo_chunks_and_level_one() {
             f64::from(world.terrain.height_at(x, z))
         };
         let coarse = node(&world, &r, 1, [column[0], 0, column[1]]).expect("terrain");
-        // Full detail draws chunk (0, 1, 0) of the node, its octant 2; its water is
-        // translucent, so only its opaque faces stop a ray.
+        // Full detail draws chunk (0, 1, 0) of the node, its octant 2: its opaque faces stop a
+        // ray, its translucent water tints it.
         let chunk = [column[0] * 2, 1, column[1] * 2];
         let mut rects = rects(
             &chunk_mesh(&world, &r, chunk),
             [0.0, 32.0, 0.0],
             1.0,
+            false,
             |_| false,
         );
         rects.extend(node_rects(&coarse, &m, 1, [0.0; 3], 0b0000_0100));
         let mut n = Numbers(11);
-        let target = |n: &mut Numbers| {
-            let (tx, tz) = (n.between(33.0, 63.0), n.between(2.0, 30.0));
-            let top = cell_top(&coarse, &m, (tx / 2.0) as i32, (tz / 2.0) as i32, 2.0);
+        let target = |n: &mut Numbers| (n.between(33.0, 63.0), n.between(2.0, 30.0));
+        let into_ground = |n: &mut Numbers| {
+            let (tx, tz) = target(n);
+            let top = cell_top(&coarse, &m, (tx / 2.0) as i32, (tz / 2.0) as i32, 2.0, true);
             [tx, n.between((top - 8.0).max(32.5), top - 0.01), tz]
         };
-        // From above the ground and the sea.
-        let slipped = slips(&rects, 10_000, || {
+        let into_water = |n: &mut Numbers| loop {
+            let (tx, tz) = target(n);
+            let (cx, cz) = ((tx / 2.0) as i32, (tz / 2.0) as i32);
+            let bed = cell_top(&coarse, &m, cx, cz, 2.0, true);
+            let top = cell_top(&coarse, &m, cx, cz, 2.0, false);
+            if top > bed {
+                return [tx, n.between(bed.max(32.0) + 0.01, top - 0.01), tz];
+            }
+        };
+        // From above the ground and the sea (whose surface is 0.875 up its top block).
+        let above = |n: &mut Numbers| {
             let (x, z) = (n.between(1.0, 31.0), n.between(2.0, 30.0));
-            let top = height(x, z).max(sea) + 1.0;
-            (top < 62.0).then(|| ([x, n.between(top + 0.01, 63.0), z], target(&mut n)))
-        });
-        assert!(
-            slipped.is_empty(),
-            "column {column:?}: {} rays from above slipped, first {:?}",
-            slipped.len(),
-            &slipped[..slipped.len().min(4)]
+            let ground = height(x, z);
+            let top = if ground >= sea {
+                ground + 1.0
+            } else {
+                sea + 0.875
+            };
+            (top < 62.0).then(|| [x, n.between(top + 0.01, 63.0), z])
+        };
+        let slipped = cast(
+            10_000,
+            || Some((above(&mut n)?, into_ground(&mut n))),
+            |o, d| rects.slips(o, d),
+        );
+        assert_none(&format!("column {column:?}, from above"), &slipped);
+        let untinted = cast(
+            10_000,
+            || Some((above(&mut n)?, into_water(&mut n))),
+            |o, d| rects.untinted(o, d),
+        );
+        assert_none(
+            &format!("column {column:?}, from above into the water"),
+            &untinted,
         );
         // From under the near sea's surface.
-        let slipped = slips(&rects, 10_000, || {
-            let (x, z) = (n.between(1.0, 31.0), n.between(2.0, 30.0));
-            let ground = height(x, z) + 1.0;
-            let top = sea + 0.9;
-            (ground + 1.0 < top).then(|| ([x, n.between(ground + 0.01, top), z], target(&mut n)))
-        });
-        assert!(
-            slipped.is_empty(),
-            "column {column:?}: {} rays from under the sea slipped, first {:?}",
-            slipped.len(),
-            &slipped[..slipped.len().min(4)]
+        let slipped = cast(
+            10_000,
+            || {
+                let (x, z) = (n.between(1.0, 31.0), n.between(2.0, 30.0));
+                let ground = height(x, z) + 1.0;
+                let top = sea + 0.875;
+                (ground + 1.0 < top)
+                    .then(|| ([x, n.between(ground + 0.01, top), z], into_ground(&mut n)))
+            },
+            |o, d| rects.slips(o, d),
         );
+        assert_none(&format!("column {column:?}, from under the sea"), &slipped);
     }
 }

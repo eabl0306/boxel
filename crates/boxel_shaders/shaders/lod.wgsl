@@ -10,5 +10,11 @@ var<immediate> lod: LodImmediate;
 
 @vertex
 fn vs_lod(@builtin(vertex_index) vi: u32, @location(0) q: vec2<u32>) -> LodOut {
-  return lod_vertex(q, vi, lod.node);
+  return lod_vertex(q, vi, lod.node, false);
+}
+
+// The water bucket (issue #50): its depth prepass and its blended color pass both run this.
+@vertex
+fn vs_lod_water(@builtin(vertex_index) vi: u32, @location(0) q: vec2<u32>) -> LodWaterOut {
+  return lod_water_vertex(q, vi, lod.node);
 }

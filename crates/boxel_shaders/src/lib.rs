@@ -180,10 +180,20 @@ impl ShaderModuleId {
                 ("fs_fog_debug_coverage", Stage::Fragment),
                 ("fs_fog_debug_walk", Stage::Fragment),
             ],
-            ShaderModuleId::Lod => &[("vs_lod", Stage::Vertex), ("fs_lod", Stage::Fragment)],
-            ShaderModuleId::LodPull => {
-                &[("vs_lod_pull", Stage::Vertex), ("fs_lod", Stage::Fragment)]
-            }
+            ShaderModuleId::Lod => &[
+                ("vs_lod", Stage::Vertex),
+                ("fs_lod", Stage::Fragment),
+                ("vs_lod_water", Stage::Vertex),
+                ("fs_lod_water", Stage::Fragment),
+                ("fs_lod_water_depth", Stage::Fragment),
+            ],
+            ShaderModuleId::LodPull => &[
+                ("vs_lod_pull", Stage::Vertex),
+                ("fs_lod", Stage::Fragment),
+                ("vs_lod_pull_water", Stage::Vertex),
+                ("fs_lod_water", Stage::Fragment),
+                ("fs_lod_water_depth", Stage::Fragment),
+            ],
             ShaderModuleId::LodCull => &[("cull_lod", Stage::Compute)],
             ShaderModuleId::LodHiz => &[("hiz_reduce", Stage::Compute)],
         }

@@ -11,10 +11,12 @@
 //!   quads draws, with full-detail chunks in those octants.
 //! - **Seam:** a real forest world and its LOD, run by `WorldPlugin` and `LodWorldPlugin` until
 //!   both settle, drawn as a renderer holds them after every op, with cave culling on and the
-//!   search of the render plugin (`frame_visibility_with` and the LOD's horizon), cleared to
-//!   magenta: no magenta pixel where a ray meets the ground, at eye level over a sea more than 8
-//!   blocks deep across the seam, looking diagonally over the keep band, and 200 blocks up
-//!   pitched 20 degrees down. With the camera's own far plane in the search, holes show.
+//!   search of the render plugin (`frame_visibility_with` and the LOD's horizon), under a magenta
+//!   and a green sky: no pixel where a ray meets the ground follows the sky's color (not even
+//!   through the translucent far water, issue #50), at eye level over a sea more than 8 blocks
+//!   deep across the seam (whose LOD has water), looking diagonally over the keep band, and 200
+//!   blocks up pitched 20 degrees down; the tiers of an adapter draw each alike. With the
+//!   camera's own far plane in the search, holes show.
 //! - **Far plane and fog:** a chunk past the view distance is culled without LOD and drawn with
 //!   it; the demo's valley fog layer over full detail draws the same with and without LOD. The
 //!   hazy valley's haze reaches the LOD's horizon over the LOD terrain, and without LOD ends at
@@ -45,6 +47,7 @@ use boxel_math::{DVec3, I64Vec3, UVec2};
 use boxel_mesh::lod::{LodMaterials, mesh_node, octant_of};
 use boxel_mesh::{
     BUCKET_COUNT, ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher, PaddedChunk,
+    TRANSLUCENT_BUCKET,
 };
 use boxel_render::lod::{LodInput, LodOp, LodSettings};
 use boxel_render::{
@@ -755,8 +758,9 @@ fn every_tier_draws_the_lod_scene_alike() {
             if stats.lod_draws == 0 || stats.lod_refused != 0 || refused != Some(Vec::new()) {
                 return Err(format!("LOD stats {stats:?}, refused {refused:?}"));
             }
-            // At most one draw per face bucket of a drawn node (instanced), or per segment.
-            if stats.lod_draws > 6 * stats.lod_drawn || stats.lod_quads == 0 {
+            // At most one draw per face bucket of a drawn node and two of its water (instanced),
+            // or three per segment.
+            if stats.lod_draws > 8 * stats.lod_drawn || stats.lod_quads == 0 {
                 return Err(format!("LOD stats {stats:?}"));
             }
             // Every node went up once: the arena holds exactly the quads uploaded.
@@ -1134,6 +1138,9 @@ const SEAM_RADIUS: u32 = 4;
 const SEAM_VERTICAL: u32 = 8;
 /// The clear color of the seam test: the sky shows as magenta.
 const MAGENTA: [f32; 4] = [1.0, 0.0, 1.0, 1.0];
+/// The seam test's second sky: where a pixel turns from magenta toward green, the sky shows
+/// through it, if only through translucent water.
+const GREEN: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
 /// A ray meeting `y = SEAM_FLOOR` (the lowest top of the demo terrain) within this share of the
 /// horizon meets drawn terrain first.
 const SEAM_REACH: f64 = 0.7;
@@ -1402,6 +1409,29 @@ fn ground_pixels(transform: &Transform, camera: &Camera, reach: f64) -> Vec<bool
     out
 }
 
+/// Pixels that must show terrain (`ground`) but change with the sky between `magenta` (the
+/// scene under the [`MAGENTA`] sky) and `green` (under [`GREEN`]): more red and blue, less green.
+/// The sky shows there, if only through translucent water, which only tints it. Nothing else in
+/// a ground pixel follows the sky's color (the terrain fog lies past [`SEAM_REACH`]), so a pixel
+/// that two draws of the same scene leave apart (a tie between coplanar quads, drawn in another
+/// order) does not count unless it moves that way.
+fn sky_shows(magenta: &RgbaImage, green: &RgbaImage, ground: &[bool]) -> usize {
+    magenta
+        .data
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(green.data.as_chunks::<4>().0)
+        .zip(ground)
+        .filter(|((m, g), ground)| {
+            **ground
+                && m[0] > g[0].saturating_add(2)
+                && m[1].saturating_add(2) < g[1]
+                && m[2] > g[2].saturating_add(2)
+        })
+        .count()
+}
+
 /// Pixels of `image` that must show terrain (`ground`) but show the magenta sky.
 fn holes(image: &RgbaImage, ground: &[bool]) -> usize {
     image
@@ -1414,7 +1444,8 @@ fn holes(image: &RgbaImage, ground: &[bool]) -> usize {
         .count()
 }
 
-/// Everything a seam pose draws: the world's chunks and nodes and the camera.
+/// Everything a seam pose draws: the world's chunks and nodes and the camera (under the
+/// [`MAGENTA`] sky).
 struct SeamScene {
     name: &'static str,
     chunks: Vec<(I64Vec3, Arc<ChunkMesh>)>,
@@ -1482,11 +1513,12 @@ fn seam_scenes() -> &'static [SeamScene] {
     })
 }
 
-/// Renders a seam scene with the visible set `set`.
+/// Renders a seam scene with the visible set `set` under the sky `sky`.
 fn render_seam(
     gpu: &Gpu<'_>,
     scene: &SeamScene,
     set: &Arc<boxel_world::VisibleSet>,
+    sky: [f32; 4],
 ) -> Result<RgbaImage, String> {
     let config = RendererConfig {
         arena_quads: 1 << 21,
@@ -1510,7 +1542,12 @@ fn render_seam(
     }
     renderer.set_lod(gpu.device, Some(scene.lod.clone()));
     renderer.set_visibility(Some(Arc::clone(set)));
-    let image = render(gpu, &mut renderer, &scene.view)?;
+    let view = ViewParams {
+        clear_color: sky,
+        fog_color: sky,
+        ..scene.view
+    };
+    let image = render(gpu, &mut renderer, &view)?;
     let report = renderer.take_lod_report().ok_or("no LOD pass")?;
     if !report.refused.is_empty() {
         return Err(format!("{} LOD nodes refused", report.refused.len()));
@@ -1520,22 +1557,30 @@ fn render_seam(
 
 /// Full detail and LOD meet without a hole: no ray that meets the ground shows the sky, at the
 /// seam over a deep sea, looking diagonally over the keep band and from high up pitched down
-/// (cave culling on, searched as the render plugin does with the LOD on). Searched with the
-/// camera's far plane instead, the last two poses show holes: the search must reach the horizon.
+/// (cave culling on, searched as the render plugin does with the LOD on). The far water is
+/// translucent (issue #50), so a hole under it only tints the sky: each scene is drawn under two
+/// skies, and no ground pixel may follow the sky's color. The sea scene holds LOD water, and the
+/// tiers of an adapter draw it alike. Searched with the camera's far plane instead, the last two
+/// poses show holes: the search must reach the horizon.
 #[test]
 fn full_detail_and_lod_meet_without_holes() {
     let mut scenes: Option<&[SeamScene]> = None;
-    for_every_tier(|gpu, report| {
+    let mut images: Vec<(String, Tier, &str, RgbaImage)> = Vec::new();
+    let mut report = for_every_tier(|gpu, report| {
         if gpu.gl() {
             return;
         }
         let scenes = *scenes.get_or_insert_with(seam_scenes);
         for scene in scenes {
             let what = format!("{} {}: seam {}", gpu.label, gpu.tier, scene.name);
-            let images = render_seam(gpu, scene, &scene.with_lod).and_then(|with_lod| {
-                render_seam(gpu, scene, &scene.without).map(|without| (with_lod, without))
-            });
-            let (with_lod, without) = match images {
+            let images_of = || -> Result<_, String> {
+                Ok((
+                    render_seam(gpu, scene, &scene.with_lod, MAGENTA)?,
+                    render_seam(gpu, scene, &scene.with_lod, GREEN)?,
+                    render_seam(gpu, scene, &scene.without, MAGENTA)?,
+                ))
+            };
+            let (with_lod, green, without) = match images_of() {
                 Ok(images) => images,
                 Err(e) => {
                     report.fail(format!("{what}: {e}"), &[]);
@@ -1544,18 +1589,20 @@ fn full_detail_and_lod_meet_without_holes() {
             };
             let name = gpu.name(&format!("seam_{}", scene.name));
             let lost = format!("{name}_camera_far_plane");
-            report.keep(&[(&name, &with_lod), (&lost, &without)]);
+            let sky = format!("{name}_green");
+            report.keep(&[(&name, &with_lod), (&sky, &green), (&lost, &without)]);
             let (found, found_without) = (
-                holes(&with_lod, &scene.ground),
+                sky_shows(&with_lod, &green, &scene.ground),
                 holes(&without, &scene.ground),
             );
             eprintln!(
-                "gpu_lod: {what}: {found} holes, {found_without} with the camera's far plane"
+                "gpu_lod: {what}: {found} pixels show the sky, {found_without} holes with the \
+                 camera's far plane"
             );
             if found > 0 {
                 report.fail(
-                    format!("{what}: {found} sky pixels on the ground"),
-                    &[(&name, &with_lod)],
+                    format!("{what}: {found} ground pixels show the sky"),
+                    &[(&name, &with_lod), (&sky, &green)],
                 );
             }
             if scene.loses && found_without == 0 {
@@ -1564,9 +1611,42 @@ fn full_detail_and_lod_meet_without_holes() {
                     &[(&lost, &without)],
                 );
             }
+            images.push((gpu.label.to_string(), gpu.tier, scene.name, with_lod));
         }
-    })
-    .finish();
+    });
+    // The sea pose's LOD has water to draw.
+    if let Some(scenes) = scenes {
+        let water: u32 = scenes[0]
+            .lod
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                LodOp::Upsert { mesh, .. } => Some(mesh.bucket_counts[TRANSLUCENT_BUCKET]),
+                _ => None,
+            })
+            .sum();
+        eprintln!("gpu_lod: seam {}: {water} LOD water quads", scenes[0].name);
+        if water == 0 {
+            report.fail(format!("seam {}: no LOD water", scenes[0].name), &[]);
+        }
+    }
+    // The best tier of each adapter comes first.
+    for (i, (label, tier, scene, image)) in images.iter().enumerate() {
+        let Some((_, best_tier, _, best)) = images[..i]
+            .iter()
+            .find(|(l, _, s, _)| l == label && s == scene)
+        else {
+            continue;
+        };
+        report.check_close(
+            &format!("{label}: seam {scene}: {tier} vs {best_tier}"),
+            (&format!("{label}_{best_tier}_seam_{scene}"), best),
+            (&format!("{label}_{tier}_seam_{scene}"), image),
+            2,
+            MAX_TIER_DIFF,
+        );
+    }
+    report.finish();
 }
 
 // ---------------------------------------------------------------- far plane and fog

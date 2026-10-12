@@ -6,7 +6,9 @@
 //! one instanced draw per run of the face buckets of a visible node that can face the camera
 //! (`lod.wgsl`), on High from lists the GPU culls (`lod_cull.wgsl`, against the depth of the
 //! terrain drawn before it while that hides something, and `lod_pull.wgsl`), with the same
-//! pixels. Both leave out the skirts no seam shows.
+//! pixels. Both leave out the skirts no seam shows. Far water is translucent like the near water
+//! (issue #50): one layer of it per pixel over its bed, drawn after the block outline and before
+//! the near water.
 //!
 //! Without LOD input the renderer creates none of it (no pipeline, no arena) and every frame is
 //! what it was before. With it ([`crate::VoxelRenderer::set_lod`]) and the LOD on, the main

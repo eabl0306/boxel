@@ -1290,6 +1290,9 @@ impl VoxelRenderer {
                 lod.draw(&mut pass);
             }
             self.outline.draw(&mut pass);
+            // The far water (one layer, a depth prepass then its color) before the near water,
+            // which blends over it where it is in front.
+            lod.draw_water(&mut pass);
             solid + self.path.draw_translucent(&mut pass, self.arena.buffer())
         } else {
             let mut pass = self.targets.begin_main_pass(encoder, view.clear_color);
@@ -1304,6 +1307,10 @@ impl VoxelRenderer {
             }
             // Over the solid terrain, under the water (not counted in the draws).
             self.outline.draw(&mut pass);
+            // The far water before the near water, as above.
+            if let Some(lod) = &self.lod {
+                lod.draw_water(&mut pass);
+            }
             solid + self.path.draw_translucent(&mut pass, self.arena.buffer())
         };
         (self.stats.fog_passes, self.stats.fog_layers) = match &mut self.fog {
