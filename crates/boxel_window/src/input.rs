@@ -57,12 +57,49 @@ pub struct CursorMoved {
     pub position: Vec2,
 }
 
+/// The cursor left the window: [`CursorPosition`] becomes `None` until the next
+/// [`CursorMoved`].
+#[derive(Message, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorLeft;
+
 /// Where the cursor is: the position of the latest [`CursorMoved`] message, in physical pixels
-/// from the window's top-left. `None` until the cursor first moves over the window. UIs read it
-/// for hover and clicks; it keeps its last value while the cursor is locked (`CursorGrab::Locked`
-/// sends `MouseMotion`, not `CursorMoved`) or outside the window.
+/// from the window's top-left. `None` until the cursor first moves over the window, and from a
+/// frame with a [`CursorLeft`] until the next move (a cursor that leaves and comes back within
+/// one frame counts as outside until it moves again). UIs read it for hover and clicks; it keeps
+/// its last value while the cursor is locked (`CursorGrab::Locked` sends `MouseMotion`, not
+/// `CursorMoved`).
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq)]
 pub struct CursorPosition(pub Option<Vec2>);
+
+/// Text the user typed, in order: what each key press wrote under the user's layout (dead keys
+/// arrive composed: "´" then "e" is one "é"), and every input method commit
+/// ([`ImeEvent::Commit`]). Never empty and without control characters: Enter, Backspace, Tab,
+/// Escape and Delete only arrive as [`KeyboardInput`]. Held keys type again with the OS repeat;
+/// keys pressed with Ctrl or Super (Command) are shortcuts and type nothing (Ctrl+Alt, Windows'
+/// Alt Gr, does). A text field reads this; game controls read keys.
+#[derive(Message, Clone, Debug, PartialEq, Eq)]
+pub struct TextInput {
+    /// The typed text.
+    pub text: String,
+}
+
+/// Input method (IME) composition, sent only while `ImeOptions::allowed` is set. While an input
+/// method composes, keys go to it: winit sends no [`KeyboardInput`] for them.
+#[derive(Message, Clone, Debug, PartialEq, Eq)]
+pub enum ImeEvent {
+    /// The text being composed, not typed yet: a text field shows it at its caret. Empty when
+    /// the composition ends, is cancelled or the input method is turned off.
+    Preedit {
+        /// The composed text so far.
+        text: String,
+        /// The composition's caret as a byte range of `text` (`None`: hide it).
+        cursor: Option<(usize, usize)>,
+    },
+    /// The composition ended with this text (without control characters). The same text also
+    /// arrives as a [`TextInput`], in order with the typed keys, so a text field that reads
+    /// [`TextInput`] must not insert this again.
+    Commit(String),
+}
 
 /// Pressed/just-pressed/just-released sets. `just_*` are cleared by the input systems at the
 /// start of each frame's `PreUpdate` before new events are applied.
@@ -192,13 +229,22 @@ pub fn accumulate_mouse_scroll_system(
     acc.set_if_neq(AccumulatedMouseScroll { delta });
 }
 
-/// Keeps [`CursorPosition`] at the latest [`CursorMoved`] message of the frame.
+/// Keeps [`CursorPosition`] at the latest [`CursorMoved`] message of the frame, or `None` in a
+/// frame with a [`CursorLeft`]. The two queues do not keep their relative order, so a leave
+/// wins: a move after it in the same frame shows at the next move. The common case, the last
+/// moves and then the leave in one frame, must end outside.
 pub fn cursor_position_system(
     mut cursor: ResMut<CursorPosition>,
-    mut events: MessageReader<CursorMoved>,
+    mut moved: MessageReader<CursorMoved>,
+    mut left: MessageReader<CursorLeft>,
 ) {
-    if let Some(last) = events.read().last() {
-        cursor.set_if_neq(CursorPosition(Some(last.position)));
+    // Read both to the end so neither reader keeps old messages.
+    let last = moved.read().last().map(|event| event.position);
+    let left = left.read().count() > 0;
+    if left {
+        cursor.set_if_neq(CursorPosition(None));
+    } else if let Some(position) = last {
+        cursor.set_if_neq(CursorPosition(Some(position)));
     }
 }
 
@@ -230,6 +276,9 @@ impl Plugin for InputPlugin {
             .add_message::<MouseMotion>()
             .add_message::<MouseWheel>()
             .add_message::<CursorMoved>()
+            .add_message::<CursorLeft>()
+            .add_message::<TextInput>()
+            .add_message::<ImeEvent>()
             .add_message::<WindowFocused>()
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<ButtonInput<MouseButton>>()
@@ -281,5 +330,40 @@ mod tests {
             app.world().resource::<CursorPosition>().0,
             Some(Vec2::new(20.5, 7.0))
         );
+    }
+
+    #[test]
+    fn cursor_position_is_none_after_the_cursor_leaves() {
+        let mut app = App::new();
+        app.add_plugins(InputPlugin);
+        let position = |app: &App| app.world().resource::<CursorPosition>().0;
+        let moved = |app: &mut App, x: f32| {
+            app.world_mut().write_message(CursorMoved {
+                position: Vec2::new(x, 3.0),
+            });
+        };
+
+        // The last moves and the leave in one frame: outside.
+        moved(&mut app, 1.0);
+        moved(&mut app, 0.0);
+        app.world_mut().write_message(CursorLeft);
+        app.update();
+        assert_eq!(position(&app), None);
+        app.update();
+        assert_eq!(position(&app), None);
+
+        // Back in: the next move shows it again.
+        moved(&mut app, 5.0);
+        app.update();
+        assert_eq!(position(&app), Some(Vec2::new(5.0, 3.0)));
+
+        // Out and back within one frame: outside until it moves again.
+        app.world_mut().write_message(CursorLeft);
+        moved(&mut app, 6.0);
+        app.update();
+        assert_eq!(position(&app), None);
+        moved(&mut app, 7.0);
+        app.update();
+        assert_eq!(position(&app), Some(Vec2::new(7.0, 3.0)));
     }
 }

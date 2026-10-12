@@ -88,13 +88,29 @@ el pase (E-UI2) y llega antes de los menús, así que no hay puente.
   nuestras tablas: un píxel puede quedar tantos pasos lejos como capas translúcidas tiene encima
   (`tests/gpu_ui.rs`). Los tiers de una misma GPU dan los mismos bytes.
 
+### 7. Texto y métodos de entrada (E-UI4)
+
+- El runner manda el texto de cada tecla como `TextInput`, con la distribución del teclado y las
+  teclas muertas ya aplicadas: en X11 y Wayland, "´" y "e" llegan como "é". Quita los caracteres
+  de control, así que Enter, Retroceso, Tab, Esc y Supr siguen siendo solo teclas. Con Ctrl o
+  Super no escribe nada, porque es un atajo (winit da "c" para Ctrl+C). Ctrl+Alt sí escribe: es
+  AltGr en Windows. Una tecla mantenida escribe de nuevo con la repetición del sistema.
+- Un método de entrada (IME, por ejemplo para chino o japonés) manda `ImeEvent::Preedit` con lo
+  que se está componiendo. Lo confirmado llega como `TextInput`, en orden con las teclas, y
+  también como `ImeEvent::Commit`. Un campo de texto lee solo `TextInput`.
+- `ImeOptions { allowed, cursor_area }` se aplica en el hilo principal junto a `CursorOptions`.
+  Va apagado por defecto, porque mientras un IME compone winit no manda las teclas. La interfaz
+  lo prende solo con un campo de texto enfocado.
+- `CursorLeft`: `CursorPosition` pasa a `None` cuando el cursor sale de la ventana, y nada queda
+  resaltado. Si sale y vuelve en el mismo frame, cuenta como afuera hasta que se mueva.
+
 ## Consecuencias
 
 - `boxel_window` suma `CursorPosition`: la última posición del cursor en píxeles físicos.
 - La lista de pintura y la entrada funcionan sin ventana, y `UiTester` hace clic por etiqueta en
   los tests. Con `render` y la feature `ui`, la interfaz se ve en pantalla.
-- Lo que sigue: E-UI3 (lista, campo de texto y pestañas), E-UI4 (texto con acentos desde el
-  runner, protegido) y E-UI5 (sprites y fuentes de los packs).
+- Lo que sigue: E-UI3 (lista, campo de texto y pestañas) y E-UI5 (sprites y fuentes de los
+  packs).
 - Las capas `Screen` y `Popup` se vacían en cada frame que nadie las dibuja, así que una pantalla
   cerrada desaparece sola. El HUD se vacía cuando cambia la escala o el tamaño de la ventana: el
   juego lo redibuja con `resource_changed::<GuiScale>`.

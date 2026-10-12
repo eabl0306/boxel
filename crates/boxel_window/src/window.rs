@@ -1,7 +1,7 @@
 use crate::runner::{FramePacingInfo, RunnerSettings, UpdateMode, winit_runner};
 use boxel_app::{App, FrameLimit, Plugin};
 use boxel_ecs::prelude::*;
-use boxel_math::UVec2;
+use boxel_math::{IVec2, UVec2};
 use std::sync::Arc;
 use winit::event_loop::{EventLoop, OwnedDisplayHandle};
 use winit::window::{Window, WindowId};
@@ -86,6 +86,7 @@ impl Plugin for WindowPlugin {
                 grab: CursorGrab::None,
                 visible: true,
             })
+            .init_resource::<ImeOptions>()
             .insert_resource(RunnerSettings {
                 exit_on_close: self.exit_on_close,
                 update_mode: self.update_mode,
@@ -162,6 +163,28 @@ pub struct CursorOptions {
     pub grab: CursorGrab,
     /// Cursor visible.
     pub visible: bool,
+}
+
+/// Desired input method (IME) state; the runner applies changes before each update, next to
+/// [`CursorOptions`]. Off by default, as winit's: while an input method composes, keys go to it
+/// and winit sends no `KeyboardInput`, which game controls do not want. A UI turns it on while a
+/// text field has focus. Plain typing, dead keys included, arrives as `TextInput` either way.
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImeOptions {
+    /// Input method events (`ImeEvent`) allowed.
+    pub allowed: bool,
+    /// Where the text being typed is: the input method places its candidate box next to it
+    /// without covering it (X11 uses only the position). `None`: not set. Sent while `allowed`.
+    pub cursor_area: Option<ImeCursorArea>,
+}
+
+/// A rectangle in physical pixels from the window's top-left (see [`ImeOptions`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImeCursorArea {
+    /// Top-left corner.
+    pub position: IVec2,
+    /// Width and height.
+    pub size: UVec2,
 }
 
 /// Cursor grab mode.

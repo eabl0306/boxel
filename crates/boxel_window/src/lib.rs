@@ -8,7 +8,9 @@
 //!   simulation does not freeze while the window is hidden on Wayland). `RedrawRequested` only
 //!   opens the presentation gate [`WindowState::frame_ready`] (see [`winit_runner`]).
 //! - Window and device events become messages; [`InputPlugin`] folds them into [`ButtonInput`],
-//!   accumulated mouse resources and [`CursorPosition`] in `PreUpdate`.
+//!   accumulated mouse resources and [`CursorPosition`] in `PreUpdate`. Typed text arrives as
+//!   [`TextInput`] (layout and dead keys applied) and input method composition as [`ImeEvent`],
+//!   enabled through [`ImeOptions`].
 //! - Updates are paced by `boxel_app::FrameLimit` (default 144 fps, 0 = unlimited, changeable
 //!   at runtime), see [`UpdateMode`]. On Wayland a limit at or above the monitor's refresh rate
 //!   follows the display: updates run when the compositor asks for a frame (see
@@ -18,16 +20,17 @@ mod runner;
 mod window;
 
 pub use input::{
-    AccumulatedMouseMotion, AccumulatedMouseScroll, ButtonInput, ButtonState, CursorMoved,
-    CursorPosition, InputPlugin, InputSystems, KeyboardInput, MouseButtonInput, MouseMotion,
-    MouseWheel, accumulate_mouse_motion_system, accumulate_mouse_scroll_system,
-    cursor_position_system, keyboard_input_system, mouse_button_input_system,
+    AccumulatedMouseMotion, AccumulatedMouseScroll, ButtonInput, ButtonState, CursorLeft,
+    CursorMoved, CursorPosition, ImeEvent, InputPlugin, InputSystems, KeyboardInput,
+    MouseButtonInput, MouseMotion, MouseWheel, TextInput, accumulate_mouse_motion_system,
+    accumulate_mouse_scroll_system, cursor_position_system, keyboard_input_system,
+    mouse_button_input_system,
 };
 pub use runner::{FramePacingInfo, UpdateMode, winit_runner};
 pub use window::{
-    CursorGrab, CursorOptions, DisplayHandle, PrimaryWindow, WindowCloseRequested, WindowCreated,
-    WindowFocused, WindowMode, WindowOccluded, WindowPlugin, WindowResized, WindowSettings,
-    WindowState,
+    CursorGrab, CursorOptions, DisplayHandle, ImeCursorArea, ImeOptions, PrimaryWindow,
+    WindowCloseRequested, WindowCreated, WindowFocused, WindowMode, WindowOccluded, WindowPlugin,
+    WindowResized, WindowSettings, WindowState,
 };
 
 pub use winit;

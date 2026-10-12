@@ -1,9 +1,11 @@
 use crate::input::{
-    ButtonState, CursorMoved, KeyboardInput, MouseButtonInput, MouseMotion, MouseWheel,
+    ButtonState, CursorLeft, CursorMoved, ImeEvent, KeyboardInput, MouseButtonInput, MouseMotion,
+    MouseWheel, TextInput,
 };
 use crate::window::{
-    CursorGrab, CursorOptions, PrimaryWindow, WindowCloseRequested, WindowCreated, WindowFocused,
-    WindowMode, WindowOccluded, WindowResized, WindowSettings, WindowState,
+    CursorGrab, CursorOptions, ImeCursorArea, ImeOptions, PrimaryWindow, WindowCloseRequested,
+    WindowCreated, WindowFocused, WindowMode, WindowOccluded, WindowResized, WindowSettings,
+    WindowState,
 };
 use boxel_app::{
     App, AppExit, FrameDeadline, FrameLimit, FramePacer, FrameWait, IDLE_MARGIN, IDLE_POLL,
@@ -14,10 +16,10 @@ use boxel_math::{UVec2, Vec2};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalSize};
-use winit::event::{DeviceEvent, DeviceId, ElementState, MouseScrollDelta, WindowEvent};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::event::{DeviceEvent, DeviceId, ElementState, Ime, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::PhysicalKey;
+use winit::keyboard::{ModifiersState, PhysicalKey};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
@@ -131,7 +133,7 @@ impl Default for RunnerSettings {
 ///    `WindowState::frame_ready = true` and clears the pending-redraw timestamp. Messages are
 ///    written only if their `Messages<T>` resource exists.
 /// 4. `device_event`: `MouseMotion` while focused.
-/// 5. `about_to_wait`: applies `CursorOptions` changes; computes
+/// 5. `about_to_wait`: applies `CursorOptions` and `ImeOptions` changes; computes
 ///    `occluded = winit_occluded || (redraw pending for > 100 ms)` and writes `WindowOccluded` on
 ///    change; runs `app.update()`; if `!frame_ready` and no redraw is pending, calls
 ///    `window.request_redraw()` and records the time; exits the loop on `app.should_exit()`.
@@ -150,6 +152,11 @@ impl Default for RunnerSettings {
 /// Details of this implementation:
 /// - Updates start once the window exists and plugins are finished (desktop platforms deliver
 ///   `resumed` before the first `about_to_wait`).
+/// - A key press's text (`KeyEvent::text`, layout and dead keys applied) becomes `TextInput`
+///   without control characters; releases, the synthetic presses of a focus gain and shortcuts
+///   (Ctrl or Super held, but not Ctrl+Alt: Windows' Alt Gr) type nothing. An IME commit becomes
+///   `TextInput` and `ImeEvent::Commit`, a preedit `ImeEvent::Preedit`, and `Ime::Disabled` an
+///   empty preedit. `CursorLeft` is forwarded.
 /// - `WindowResized` is written only when the size actually changes (never for 0x0). On Wayland,
 ///   `Window::request_inner_size` is applied client-side and winit sends no `Resized` event, so
 ///   the runner compares `Window::inner_size` with `WindowState` before every update there.
@@ -390,6 +397,9 @@ impl ApplicationHandler for WinitApp {
         if let Some(cursor) = self.core.cursor_change(self.app.world()) {
             apply_cursor(&window, cursor);
         }
+        if let Some(ime) = self.core.ime_change(self.app.world()) {
+            apply_ime(&window, ime);
+        }
         let now = Instant::now();
         if self.poll_minimized {
             self.core.poll_minimized(now, || window.is_minimized());
@@ -437,6 +447,8 @@ struct RunnerCore {
     settings: RunnerSettings,
     /// Keyboard focus as last reported by winit (gates raw mouse motion).
     focused: bool,
+    /// Modifier keys as last reported by winit (shortcuts type no text).
+    modifiers: ModifiersState,
     /// Last `WindowEvent::Occluded` (never sent on Wayland and Windows).
     winit_occluded: bool,
     /// Last polled `Window::is_minimized` (X11 only, where minimizing sends no `Occluded`).
@@ -451,6 +463,8 @@ struct RunnerCore {
     gate_opened_at: Option<Instant>,
     /// The cursor state last applied to the window (the OS default at creation).
     applied_cursor: CursorOptions,
+    /// The input method state last applied to the window (winit's default: not allowed).
+    applied_ime: ImeOptions,
     /// Frame deadlines ([`FrameLimit`]).
     pacer: FramePacer,
     /// The deadline of a due frame held for its presentation gate (see `gate_wait`).
@@ -500,6 +514,7 @@ impl RunnerCore {
         Self {
             settings,
             focused: true,
+            modifiers: ModifiersState::empty(),
             winit_occluded: false,
             minimized: false,
             minimized_polled_at: None,
@@ -510,6 +525,7 @@ impl RunnerCore {
                 grab: CursorGrab::None,
                 visible: true,
             },
+            applied_ime: ImeOptions::default(),
             pacer: FramePacer::new(),
             gate_hold: None,
             refresh_millihertz: None,
@@ -691,11 +707,21 @@ impl RunnerCore {
                     write(world, AppExit::Success);
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } => {
                 if let Some(message) = key_message(event.physical_key, event.state, event.repeat) {
                     write(world, message);
                 }
+                let typed = !is_synthetic && !is_shortcut(self.modifiers);
+                if let Some(text) = key_text(event.text.as_deref(), event.state, typed) {
+                    write(world, text);
+                }
             }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::Ime(ime) => ime_messages(world, ime),
             WindowEvent::MouseInput { state, button, .. } => {
                 write(
                     world,
@@ -721,6 +747,7 @@ impl RunnerCore {
                     },
                 );
             }
+            WindowEvent::CursorLeft { .. } => write(world, CursorLeft),
             WindowEvent::RedrawRequested => self.gate_opened(world, Instant::now()),
             _ => {}
         }
@@ -810,6 +837,22 @@ impl RunnerCore {
             self.applied_cursor = wanted;
             wanted
         })
+    }
+
+    /// What to change on the input method for the desired [`ImeOptions`] (and marks them
+    /// applied): `allowed` when it changed, and the cursor area while allowed when it changed
+    /// or IME was just allowed (an area set while not allowed waits for that).
+    fn ime_change(&mut self, world: &World) -> Option<ImeChange> {
+        let wanted = *world.get_resource::<ImeOptions>()?;
+        let applied = std::mem::replace(&mut self.applied_ime, wanted);
+        let allowed = (wanted.allowed != applied.allowed).then_some(wanted.allowed);
+        let area_due =
+            wanted.allowed && (allowed.is_some() || wanted.cursor_area != applied.cursor_area);
+        let change = ImeChange {
+            allowed,
+            cursor_area: wanted.cursor_area.filter(|_| area_due),
+        };
+        (change != ImeChange::default()).then_some(change)
     }
 
     /// Refreshes `minimized` from `is_minimized` (`None`: unknown, counts as not minimized),
@@ -1153,6 +1196,75 @@ fn key_message(key: PhysicalKey, state: ElementState, repeat: bool) -> Option<Ke
     })
 }
 
+/// The text a key press typed (`None`: nothing printable). Releases type nothing, nor presses
+/// that are not `typed`: the synthetic ones winit sends for keys already held when the window
+/// gains focus, and shortcuts ([`is_shortcut`]).
+fn key_text(text: Option<&str>, state: ElementState, typed: bool) -> Option<TextInput> {
+    if state != ElementState::Pressed || !typed {
+        return None;
+    }
+    printable(text?).map(|text| TextInput { text })
+}
+
+/// Keys pressed with these modifiers are shortcuts, not text: `KeyEvent::text` ignores Ctrl, so
+/// Ctrl+C would type "c". Ctrl or Super (Command), but not Ctrl+Alt, which is how Windows
+/// reports Alt Gr ("@" on a Spanish layout).
+fn is_shortcut(modifiers: ModifiersState) -> bool {
+    modifiers.super_key() || (modifiers.control_key() && !modifiers.alt_key())
+}
+
+/// `text` without control characters (Enter is "\r", Backspace "\u{8}", Escape "\u{1b}",
+/// Delete "\u{7f}"); `None` if nothing is left.
+fn printable(text: &str) -> Option<String> {
+    let text: String = text.chars().filter(|c| !c.is_control()).collect();
+    (!text.is_empty()).then_some(text)
+}
+
+/// Input method messages: the preedit as is, a commit as [`TextInput`] (in order with typed
+/// keys) and [`ImeEvent::Commit`], and `Disabled` as an empty preedit, which clears any
+/// composition shown.
+fn ime_messages(world: &mut World, ime: Ime) {
+    match ime {
+        Ime::Enabled => {}
+        Ime::Preedit(text, cursor) => write(world, ImeEvent::Preedit { text, cursor }),
+        Ime::Commit(text) => {
+            if let Some(text) = printable(&text) {
+                write(world, TextInput { text: text.clone() });
+                write(world, ImeEvent::Commit(text));
+            }
+        }
+        Ime::Disabled => write(
+            world,
+            ImeEvent::Preedit {
+                text: String::new(),
+                cursor: None,
+            },
+        ),
+    }
+}
+
+/// What to change on the window's input method.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ImeChange {
+    /// `Window::set_ime_allowed`.
+    allowed: Option<bool>,
+    /// `Window::set_ime_cursor_area`, after `allowed`.
+    cursor_area: Option<ImeCursorArea>,
+}
+
+/// Applies an input method change.
+fn apply_ime(window: &Window, change: ImeChange) {
+    if let Some(allowed) = change.allowed {
+        window.set_ime_allowed(allowed);
+    }
+    if let Some(area) = change.cursor_area {
+        window.set_ime_cursor_area(
+            PhysicalPosition::new(area.position.x, area.position.y),
+            PhysicalSize::new(area.size.x, area.size.y),
+        );
+    }
+}
+
 /// Scroll in lines: line deltas as is, pixel deltas divided by 32.
 fn wheel_delta(delta: MouseScrollDelta) -> Vec2 {
     match delta {
@@ -1167,8 +1279,8 @@ fn wheel_delta(delta: MouseScrollDelta) -> Vec2 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ButtonInput, InputPlugin, MouseButton};
-    use winit::dpi::PhysicalPosition;
+    use crate::{ButtonInput, CursorPosition, InputPlugin, MouseButton};
+    use boxel_math::IVec2;
     use winit::event::TouchPhase;
     use winit::keyboard::{KeyCode, NativeKeyCode};
 
@@ -1354,8 +1466,16 @@ mod tests {
         core.window_event(&mut world, WindowEvent::CloseRequested);
         core.window_event(&mut world, WindowEvent::Focused(false));
         core.device_event(&mut world, &DeviceEvent::MouseMotion { delta: (1.0, 1.0) });
+        core.window_event(&mut world, WindowEvent::Ime(Ime::Commit("a".to_string())));
+        core.window_event(
+            &mut world,
+            WindowEvent::CursorLeft {
+                device_id: DeviceId::dummy(),
+            },
+        );
         assert!(!state(&world).focused);
         assert!(!world.contains_resource::<Messages<AppExit>>());
+        assert!(!world.contains_resource::<Messages<TextInput>>());
     }
 
     #[test]
@@ -2815,6 +2935,184 @@ mod tests {
             wheel_delta(MouseScrollDelta::LineDelta(0.0, -3.0)),
             Vec2::new(0.0, -3.0)
         );
+    }
+
+    #[test]
+    fn ime_changes_are_reported_once() {
+        let mut app = app();
+        app.init_resource::<ImeOptions>();
+        let mut core = core();
+        let mut set = |app: &mut App, options: ImeOptions| {
+            *app.world_mut().resource_mut::<ImeOptions>() = options;
+            core.ime_change(app.world())
+        };
+        let area = |x: i32| ImeCursorArea {
+            position: IVec2::new(x, -4),
+            size: UVec2::new(2, 18),
+        };
+        // winit's default: nothing to apply.
+        assert_eq!(set(&mut app, ImeOptions::default()), None);
+
+        // An area while not allowed waits; allowing sends both, in that order.
+        let hidden = ImeOptions {
+            allowed: false,
+            cursor_area: Some(area(10)),
+        };
+        assert_eq!(set(&mut app, hidden), None);
+        let shown = ImeOptions {
+            allowed: true,
+            ..hidden
+        };
+        let both = ImeChange {
+            allowed: Some(true),
+            cursor_area: Some(area(10)),
+        };
+        assert_eq!(set(&mut app, shown), Some(both));
+        assert_eq!(set(&mut app, shown), None);
+
+        // The caret moves: only the area.
+        let moved = ImeOptions {
+            cursor_area: Some(area(20)),
+            ..shown
+        };
+        let area_only = ImeChange {
+            allowed: None,
+            cursor_area: Some(area(20)),
+        };
+        assert_eq!(set(&mut app, moved), Some(area_only));
+
+        // No area: allowed alone; turned off: no area.
+        let bare = ImeOptions {
+            allowed: true,
+            cursor_area: None,
+        };
+        assert_eq!(set(&mut app, bare), None);
+        let off = ImeChange {
+            allowed: Some(false),
+            cursor_area: None,
+        };
+        let moved_off = ImeOptions {
+            allowed: false,
+            ..moved
+        };
+        assert_eq!(set(&mut app, moved_off), Some(off));
+        let on = ImeChange {
+            allowed: Some(true),
+            cursor_area: None,
+        };
+        assert_eq!(set(&mut app, bare), Some(on));
+
+        // An app without the resource changes nothing.
+        let mut core = RunnerCore::new(RunnerSettings::default());
+        assert_eq!(core.ime_change(&World::new()), None);
+    }
+
+    #[test]
+    fn key_text_drops_control_characters_releases_and_shortcuts() {
+        let typed = |text: Option<&str>| key_text(text, ElementState::Pressed, true);
+        let text = |s: &str| {
+            Some(TextInput {
+                text: s.to_string(),
+            })
+        };
+        assert_eq!(typed(Some("a")), text("a"));
+        // Dead keys arrive composed in one press (X11 and Wayland).
+        assert_eq!(typed(Some("á")), text("á"));
+        assert_eq!(typed(Some("ñ")), text("ñ"));
+        assert_eq!(typed(Some("Ü")), text("Ü"));
+        // Windows sends the dead key and the letter when they do not combine.
+        assert_eq!(typed(Some("´x")), text("´x"));
+        // Enter, Backspace, Tab, Escape and Delete type nothing.
+        for control in ["\r", "\u{8}", "\t", "\u{1b}", "\u{7f}", "\u{9b}"] {
+            assert_eq!(typed(Some(control)), None, "{control:?}");
+        }
+        assert_eq!(typed(Some("a\tb")), text("ab"));
+        assert_eq!(typed(None), None);
+        assert_eq!(key_text(Some("a"), ElementState::Released, true), None);
+        // Synthetic presses and shortcuts.
+        assert_eq!(key_text(Some("a"), ElementState::Pressed, false), None);
+
+        assert!(!is_shortcut(ModifiersState::empty()));
+        assert!(!is_shortcut(ModifiersState::SHIFT));
+        assert!(!is_shortcut(ModifiersState::ALT));
+        assert!(is_shortcut(ModifiersState::CONTROL));
+        assert!(is_shortcut(ModifiersState::CONTROL | ModifiersState::SHIFT));
+        assert!(is_shortcut(ModifiersState::SUPER));
+        // AltGr on Windows.
+        assert!(!is_shortcut(ModifiersState::CONTROL | ModifiersState::ALT));
+
+        // The runner keeps the modifiers winit reports.
+        let mut core = core();
+        assert!(!is_shortcut(core.modifiers));
+        let mut world = World::new();
+        let ctrl = ModifiersState::CONTROL.into();
+        core.window_event(&mut world, WindowEvent::ModifiersChanged(ctrl));
+        assert!(is_shortcut(core.modifiers));
+    }
+
+    #[test]
+    fn ime_events_become_messages() {
+        // `InputPlugin` registers the text messages.
+        let mut app = app();
+        let world = app.world_mut();
+        let mut core = core();
+        for ime in [
+            Ime::Enabled,
+            Ime::Preedit("ni".to_string(), Some((2, 2))),
+            Ime::Preedit(String::new(), None),
+            Ime::Commit("你".to_string()),
+            Ime::Commit("\r".to_string()),
+            Ime::Preedit("h".to_string(), Some((1, 1))),
+            Ime::Disabled,
+        ] {
+            core.window_event(world, WindowEvent::Ime(ime));
+        }
+        let preedit = |text: &str, cursor| ImeEvent::Preedit {
+            text: text.to_string(),
+            cursor,
+        };
+        assert_eq!(
+            messages::<ImeEvent>(world),
+            vec![
+                preedit("ni", Some((2, 2))),
+                preedit("", None),
+                ImeEvent::Commit("你".to_string()),
+                preedit("h", Some((1, 1))),
+                preedit("", None),
+            ]
+        );
+        assert_eq!(
+            messages::<TextInput>(world),
+            vec![TextInput {
+                text: "你".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn cursor_left_clears_the_cursor_position() {
+        let mut app = app();
+        let mut core = core();
+        let moved = |x: f64| WindowEvent::CursorMoved {
+            device_id: DeviceId::dummy(),
+            position: PhysicalPosition::new(x, 2.0),
+        };
+        let left = || WindowEvent::CursorLeft {
+            device_id: DeviceId::dummy(),
+        };
+        let position = |app: &App| app.world().resource::<CursorPosition>().0;
+
+        core.window_event(app.world_mut(), moved(4.0));
+        app.update();
+        assert_eq!(position(&app), Some(Vec2::new(4.0, 2.0)));
+        core.window_event(app.world_mut(), moved(1.0));
+        core.window_event(app.world_mut(), left());
+        assert_eq!(messages::<CursorLeft>(app.world()), vec![CursorLeft]);
+        app.update();
+        assert_eq!(position(&app), None);
+        core.window_event(app.world_mut(), moved(3.0));
+        app.update();
+        assert_eq!(position(&app), Some(Vec2::new(3.0, 2.0)));
     }
 
     #[test]
