@@ -274,13 +274,16 @@ impl<'a> Painter<'a> {
                 }
             }
         }
-        if !it.dragging {
-            data.grab = None;
-        }
+        // The press's own frame counts too: a press and a release within one frame (a slow
+        // frame, a synthetic click) leave `dragging` already off.
         if let Some(grab) = data.grab
+            && (it.pressed || it.dragging)
             && let Some(cursor) = it.cursor
         {
             data.scroll = bar.scroll_at(cursor.y - grab, max_scroll);
+        }
+        if !it.dragging {
+            data.grab = None;
         }
         if let Some(selected) = selected
             && let Some(pick) = pick

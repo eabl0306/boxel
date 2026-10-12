@@ -174,6 +174,14 @@ fn the_scrollbar_handle_follows_a_drag_and_a_press_on_its_track() {
     press_at(&mut t, bar_x, 25);
     assert_eq!(scroll(&t), 0);
     assert_eq!(worlds_of(&t).selected, None);
+
+    // A press and a release within one frame (a slow frame, a synthetic click) on the track
+    // still bring the handle there.
+    let mut t = list_tester(20);
+    t.move_to(IVec2::new(bar_x, 100)).press().release().frame();
+    assert_eq!(scroll(&t), 282);
+    t.frame();
+    assert_eq!(scroll(&t), 282);
 }
 
 #[test]
