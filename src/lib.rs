@@ -33,7 +33,8 @@
 //! Features: `window`, `render`, `voxel`, `png`, `debug` (ECS diagnostics with system and
 //! component names) and `physics` (boxel's own minimal physics: add `physics::PhysicsPlugin`)
 //! are on by default; `trace`/`trace_tracy` add spans; `hal` adds the Vulkan escape hatch
-//! (Windows/Linux).
+//! (Windows/Linux); `pack` re-exports the resource-pack reader; `ui` (ADR 0033) adds the game UI
+//! as `ui` (add `ui::UiPlugin`: menus and a HUD drawn from a retained paint list).
 
 pub use boxel_app as app;
 pub use boxel_diagnostic as diagnostic;
@@ -74,6 +75,9 @@ pub use boxel_physics as physics;
 #[cfg(feature = "pack")]
 pub use boxel_pack as pack;
 
+#[cfg(feature = "ui")]
+pub use boxel_ui as ui;
+
 use boxel_app::{PluginGroup, PluginGroupBuilder};
 
 /// Everything a typical app needs.
@@ -110,6 +114,9 @@ pub mod prelude {
 
     #[cfg(feature = "physics")]
     pub use boxel_physics::prelude::*;
+
+    #[cfg(feature = "ui")]
+    pub use boxel_ui::prelude::*;
 }
 
 /// Log, task pools, time, frame stats, input, window + winit runner, voxel world with its day and

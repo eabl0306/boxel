@@ -265,6 +265,7 @@ dependencies = [
  "boxel_shaders",
  "boxel_tasks",
  "boxel_transform",
+ "boxel_ui",
  "boxel_voxel",
  "boxel_window",
  "boxel_world",
