@@ -617,8 +617,73 @@ pub fn debug_coverage(
     y0: f32,
     size: [u32; 2],
 ) -> Result<Vec<[u32; 3]>, String> {
-    let time = time.into();
-    let mut words = Vec::new();
+    let header = FogHeader {
+        counts: [0, 0, 0, y0.to_bits()],
+        debug: [first[0], first[1], first[2], sub],
+        ..FogHeader::default()
+    };
+    let words = debug_draw(
+        device,
+        queue,
+        "fs_fog_debug_coverage",
+        layer,
+        render_origin,
+        time.into(),
+        &[header],
+        size,
+    )?;
+    Ok(words[0].iter().map(|w| [w[0], w[1], w[2]]).collect())
+}
+
+/// Testing: walks through one noise cache as the march takes them (`fs_fog_debug_walk`), in
+/// layer `layer` at `render_origin` and `time`. Per walk `(first, code)`, row by row: pixel
+/// `(x, y)` starts at cell `first` plus `y` cells along z (x when walking z) and steps `x` cells
+/// along the axis and sign `code` (0 to 5: +x, -x, +y, -y, +z, -z); it gives `[coverage, noise,
+/// step threshold, empty]` of its last cell (the coverage at its row's threshold; the threshold
+/// and the emptiness of its first-octave lattice step, as `boxel_fog::noise::StepBound`).
+#[doc(hidden)]
+pub fn debug_walk(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layer: &FogLayer,
+    render_origin: [i64; 3],
+    time: impl Into<FogTime>,
+    walks: &[([i32; 3], u32)],
+    size: [u32; 2],
+) -> Result<Vec<Vec<[u32; 4]>>, String> {
+    let headers: Vec<FogHeader> = walks
+        .iter()
+        .map(|&(first, code)| FogHeader {
+            debug: [first[0], first[1], first[2], code as i32],
+            ..FogHeader::default()
+        })
+        .collect();
+    debug_draw(
+        device,
+        queue,
+        "fs_fog_debug_walk",
+        layer,
+        render_origin,
+        time.into(),
+        &headers,
+        size,
+    )
+}
+
+/// Draws the debug entry `entry` with layer `layer` once per header into an `Rgba32Uint` target
+/// of `size` and reads each back, row by row.
+#[expect(clippy::too_many_arguments, reason = "the debug entries' shared draw")]
+fn debug_draw(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    entry: &str,
+    layer: &FogLayer,
+    render_origin: [i64; 3],
+    time: FogTime,
+    headers: &[FogHeader],
+    size: [u32; 2],
+) -> Result<Vec<Vec<[u32; 4]>>, String> {
+    let mut out = Vec::with_capacity(headers.len());
     boxel_gfx::run_in_error_scopes(device, || {
         let module = create_module(device, ShaderModuleId::Fog);
         let uniform_layout = uniform_layout(device);
@@ -631,7 +696,7 @@ pub fn debug_coverage(
             device,
             &module,
             &layout,
-            "fs_fog_debug_coverage",
+            entry,
             wgpu::ColorTargetState {
                 format: wgpu::TextureFormat::Rgba32Uint,
                 blend: None,
@@ -646,11 +711,6 @@ pub fn debug_coverage(
             [0.0, 1.0],
             HazeProfile::default(),
         );
-        let header = FogHeader {
-            counts: [0, 0, 0, y0.to_bits()],
-            debug: [first[0], first[1], first[2], sub],
-            ..FogHeader::default()
-        };
         let mut layers = [FogLayerGpu::default(); FOG_MAX_LAYERS];
         layers[0] = layer_gpu(&m);
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
@@ -659,7 +719,6 @@ pub fn debug_coverage(
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        queue.write_buffer(&uniform, 0, bytemuck::bytes_of(&header));
         queue.write_buffer(&uniform, FOG_LAYERS_OFFSET, bytemuck::cast_slice(&layers));
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("boxel fog debug"),
@@ -684,40 +743,39 @@ pub fn debug_coverage(
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("boxel fog debug"),
-        });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        for header in headers {
+            queue.write_buffer(&uniform, 0, bytemuck::bytes_of(header));
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("boxel fog debug"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
             });
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(bindings::FOG_GROUP_UNIFORM, &group, &[]);
-            pass.draw(0..3, 0..1);
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("boxel fog debug"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(bindings::FOG_GROUP_UNIFORM, &group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            queue.submit([encoder.finish()]);
+            let words = read_words(device, queue, &texture)?;
+            out.push(words.as_chunks::<4>().0.to_vec());
         }
-        queue.submit([encoder.finish()]);
-        words = read_words(device, queue, &texture)?;
         Ok(())
     })?;
-    Ok(words
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|w| [w[0], w[1], w[2]])
-        .collect())
+    Ok(out)
 }
 
 #[cfg(test)]

@@ -637,6 +637,7 @@ fn fog_entry_points_bind_one_block_and_one_texture_at_most() {
             ("fs_fog_composite_full", (0, 1, 0)),
             ("fs_fog_composite_half", (0, 1, 0)),
             ("fs_fog_debug_coverage", (1, 0, 0)),
+            ("fs_fog_debug_walk", (1, 0, 0)),
             ("fs_fog_march", (1, 1, 0)),
             ("vs_fullscreen", (0, 0, 0)),
         ]

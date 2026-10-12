@@ -27,7 +27,8 @@ pub const OVERLAY_WGSL: &str = include_str!("../shaders/overlay.wgsl");
 /// `outline.wgsl`: the targeted block's outline, clip-space quads (`vs_outline`, `fs_outline`).
 pub const OUTLINE_WGSL: &str = include_str!("../shaders/outline.wgsl");
 /// `fog.wgsl`: the fog march and its composite (`vs_fullscreen`, `fs_fog_march`,
-/// `fs_fog_composite_half`, `fs_fog_composite_full`, `fs_fog_debug_coverage`).
+/// `fs_fog_composite_half`, `fs_fog_composite_full`, `fs_fog_debug_coverage`,
+/// `fs_fog_debug_walk`).
 pub const FOG_WGSL: &str = include_str!("../shaders/fog.wgsl");
 /// `lod_common.wgsl`: what both far LOD pipelines share (`lod_vertex`, `fs_lod`, ADR 0031).
 pub const LOD_COMMON_WGSL: &str = include_str!("../shaders/lod_common.wgsl");
@@ -177,6 +178,7 @@ impl ShaderModuleId {
                 ("fs_fog_composite_half", Stage::Fragment),
                 ("fs_fog_composite_full", Stage::Fragment),
                 ("fs_fog_debug_coverage", Stage::Fragment),
+                ("fs_fog_debug_walk", Stage::Fragment),
             ],
             ShaderModuleId::Lod => &[("vs_lod", Stage::Vertex), ("fs_lod", Stage::Fragment)],
             ShaderModuleId::LodPull => {

@@ -10,6 +10,8 @@
 //!   inside cells (the soft fog), across the rows of a rising threshold and of the edges next to
 //!   the band's planes, between ticks, out to 4096 cells from the origin's (as far as a walk
 //!   goes), with cells up to 24 blocks; and the soft fog's edge weight at a column of heights.
+//!   Walks through one noise cache, as the march takes its cells (`fs_fog_debug_walk`), along
+//!   every axis and sign end in the oracle's coverage, noise and step bound bit for bit.
 //! - **March:** on scenes whose depth is known exactly (a wide floor and the sky), each texel of
 //!   the march equals the reference march of `boxel_fog::march` (opacity bytes within 3, color
 //!   within 0.02, 0.5 % of the texels may differ where a ray grazes a cell edge), and each pixel
@@ -1139,34 +1141,8 @@ fn fog_costs_nothing_when_absent_off_or_out_of_reach() {
 /// edge weight over a column of heights through the band. Big cells (16 and 24 blocks) too.
 #[test]
 fn the_gpu_noise_is_the_oracle_bit_for_bit() {
-    let mut layers = Vec::new();
-    for (cell, scale, octaves, dims, rise, edges) in [
-        ([1, 1, 1], 1, 1, NoiseDims::Flat, 0.0, (0, 0)),
-        ([12, 4, 12], 4, 1, NoiseDims::Flat, 0.5, (6, 10)),
-        ([2, 2, 2], 8, 2, NoiseDims::Volume, 0.0, (0, 3)),
-        ([3, 5, 7], 64, 2, NoiseDims::Volume, 0.35, (5, 17)),
-        ([16, 16, 16], 8, 2, NoiseDims::Volume, 0.25, (32, 48)),
-        ([24, 24, 24], 8, 1, NoiseDims::Volume, 0.2, (48, 48)),
-    ] {
-        let mut l = FogLayer::new(0, i64::from(cell[1]) * 8);
-        l.cell = cell;
-        l.noise.scale = scale;
-        l.noise.octaves = octaves;
-        l.noise.dims = dims;
-        l.noise.seed = 0x5eed_0000_0000_0001 + u64::from(scale);
-        l.threshold = 0.4;
-        l.threshold_rise = rise;
-        (l.edge_bottom, l.edge_top) = edges;
-        l.softness = 0.25;
-        l.wind = [2.5, -0.75, -9.0];
-        layers.push(l);
-    }
-    let origins = [
-        [0i64, 0, 0],
-        [(1 << 31) - 5, 70, -(1 << 31) + 3],
-        [-(1 << 40), -3, 1 << 40],
-        [MAX_BLOCK_COORD - 100, 12, -(MAX_BLOCK_COORD - 100)],
-    ];
+    let layers = oracle_layers();
+    let origins = ORACLE_ORIGINS;
     let size = [64u32, 48];
     // The grid's first cell along x and z: near the origin's cell, and reaching 4096 cells from
     // it on either side (the farthest a walk goes).
@@ -1242,6 +1218,129 @@ fn the_gpu_noise_is_the_oracle_bit_for_bit() {
                             ),
                             &[],
                         );
+                    }
+                }
+            }
+        }
+    })
+    .finish();
+}
+
+/// The layers the noise oracle tests read: flat and 3D noise, one and two octaves, lattice
+/// steps of 1 to 64 cells, with and without a rise and edges, cells of 1 to 24 blocks, a wind
+/// with a fraction of a cell on every axis.
+fn oracle_layers() -> Vec<FogLayer> {
+    let mut layers = Vec::new();
+    for (cell, scale, octaves, dims, rise, edges) in [
+        ([1, 1, 1], 1, 1, NoiseDims::Flat, 0.0, (0, 0)),
+        ([12, 4, 12], 4, 1, NoiseDims::Flat, 0.5, (6, 10)),
+        ([2, 2, 2], 8, 2, NoiseDims::Volume, 0.0, (0, 3)),
+        ([3, 5, 7], 64, 2, NoiseDims::Volume, 0.35, (5, 17)),
+        ([16, 16, 16], 8, 2, NoiseDims::Volume, 0.25, (32, 48)),
+        ([24, 24, 24], 8, 1, NoiseDims::Volume, 0.2, (48, 48)),
+    ] {
+        let mut l = FogLayer::new(0, i64::from(cell[1]) * 8);
+        l.cell = cell;
+        l.noise.scale = scale;
+        l.noise.octaves = octaves;
+        l.noise.dims = dims;
+        l.noise.seed = 0x5eed_0000_0000_0001 + u64::from(scale);
+        l.threshold = 0.4;
+        l.threshold_rise = rise;
+        (l.edge_bottom, l.edge_top) = edges;
+        l.softness = 0.25;
+        l.wind = [2.5, -0.75, -9.0];
+        layers.push(l);
+    }
+    layers
+}
+
+/// The render origins of the noise oracle tests: 0, `2^31 - 5`, `-2^40` and near the world
+/// limit.
+const ORACLE_ORIGINS: [[i64; 3]; 4] = [
+    [0, 0, 0],
+    [(1 << 31) - 5, 70, -(1 << 31) + 3],
+    [-(1 << 40), -3, 1 << 40],
+    [MAX_BLOCK_COORD - 100, 12, -(MAX_BLOCK_COORD - 100)],
+];
+
+/// Walks through one noise cache, as the march reads its cells (`fs_fog_debug_walk`), end in
+/// the CPU oracle's coverage, noise and step bound bit for bit: one cell at a time along each
+/// axis and sign, across lattice steps, rows and the band's planes, near the origin's cell and
+/// up to the 4096 cells a walk may go from it, for the oracle layers, at its origins, at a
+/// whole tick and between ticks.
+#[test]
+fn walks_through_one_cache_end_in_the_oracle() {
+    let layers = oracle_layers();
+    let size = [64u32, 6];
+    let reach = 4096 - size[0] as i32 + 1;
+    for_every_tier(|label, _tier, device, queue, _, report| {
+        for (li, layer) in layers.iter().enumerate() {
+            for origin in ORACLE_ORIGINS {
+                for time in [FogTime::from(0), FogTime::new(777_777, 40_000)] {
+                    let params = LayerParams::new(layer, origin, time);
+                    let band = params.band_cells;
+                    // Every axis and sign, from near the origin's cell (its rows across the
+                    // bottom plane) and from where a walk ends 4096 cells out.
+                    let mut walks = Vec::new();
+                    for code in 0..6u32 {
+                        let (axis, sign) = ((code / 2) as usize, 1 - 2 * (code & 1) as i32);
+                        let mut near = [-32, band[0] - 3, -24];
+                        if axis == 1 {
+                            near[1] = band[0] - 3 * sign;
+                        }
+                        walks.push((near, code));
+                        let mut far = [-4096 + 7, band[1] - 2, 4096 - 7];
+                        far[axis] = reach * sign;
+                        walks.push((far, code));
+                    }
+                    let got = match boxel_render::fog::debug_walk(
+                        device, queue, layer, origin, time, &walks, size,
+                    ) {
+                        Ok(g) => g,
+                        Err(e) => {
+                            report.fail(format!("{label}: debug walk: {e}"), &[]);
+                            return;
+                        }
+                    };
+                    for (&(first, code), got) in walks.iter().zip(&got) {
+                        let axis = (code / 2) as usize;
+                        let sign = 1 - 2 * (code & 1) as i32;
+                        let side = if axis == 2 { 0 } else { 2 };
+                        let mut bad = 0;
+                        for (i, g) in got.iter().enumerate() {
+                            let (x, y) = (i as i32 % size[0] as i32, i as i32 / size[0] as i32);
+                            let mut d = first;
+                            d[side] += y;
+                            d[axis] += x * sign;
+                            let c = boxel_fog::noise::coverage(&params, d);
+                            let bound = boxel_fog::noise::step_bound(&params, d);
+                            let want = [
+                                c.coverage,
+                                c.noise as u32,
+                                bound.threshold(&params),
+                                u32::from(bound.is_empty(&params)),
+                            ];
+                            if *g != want {
+                                if bad == 0 {
+                                    eprintln!(
+                                        "gpu_fog: {label}: layer {li} origin {origin:?} {time:?} \
+                                         walk {code} from {first:?}: cell {d:?}: want {want:?}, \
+                                         got {g:?}"
+                                    );
+                                }
+                                bad += 1;
+                            }
+                        }
+                        if bad > 0 {
+                            report.fail(
+                                format!(
+                                    "{label}: layer {li} origin {origin:?} {time:?} walk {code} \
+                                     from {first:?}: {bad} cells differ from the oracle"
+                                ),
+                                &[],
+                            );
+                        }
                     }
                 }
             }

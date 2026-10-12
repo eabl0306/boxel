@@ -78,7 +78,8 @@ pub struct FogHeader {
     /// rgb = sky color (where layers fade to), a = 0.
     pub sky: [f32; 4],
     /// xyz = first cell of the debug coverage grid (`fs_fog_debug_coverage`), w = the point
-    /// inside each cell it reads (1/4096 cells per axis).
+    /// inside each cell it reads (1/4096 cells per axis); for `fs_fog_debug_walk`, xyz = the
+    /// walks' first cell, w = their axis and sign (0 to 5: +x, -x, +y, -y, +z, -z).
     pub debug: [i32; 4],
 }
 

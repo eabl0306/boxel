@@ -11,10 +11,10 @@
 mod pass;
 mod plugin;
 
-#[doc(hidden)]
-pub use pass::debug_coverage;
 pub use pass::frame_layers;
 pub(crate) use pass::{FogPass, read_words};
+#[doc(hidden)]
+pub use pass::{debug_coverage, debug_walk};
 pub use plugin::{FogClock, FogPlugin};
 
 pub use boxel_fog::{
