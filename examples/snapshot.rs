@@ -946,15 +946,13 @@ fn run(
     );
 
     // The renderer, with every ready mesh.
-    let (arena_quads, max_chunk_slots) = o.world.render_capacity();
     let size = UVec2::new(o.size.0, o.size.1);
     let mut renderer = VoxelRenderer::new(
         &gpu.device,
         &gpu.queue,
         gpu.tier,
         &RendererConfig {
-            arena_quads,
-            max_chunk_slots,
+            chunk_memory: o.world.chunk_memory(),
             // the shot is the first frame: sorted in it
             translucent_sort: TranslucentSort::Inline,
         },

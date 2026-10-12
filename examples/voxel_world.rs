@@ -2060,7 +2060,6 @@ fn main() -> AppExit {
         },
         None => None,
     };
-    let (arena_quads, max_chunk_slots) = options.world.render_capacity();
     let world_settings = WorldSettings {
         vertical_bounds: options.fixed_height.then(|| generator.vertical_chunks()),
         ..WorldSettings::default()
@@ -2083,8 +2082,7 @@ fn main() -> AppExit {
                 // Only `--frames` sets it. `--minimize-test` alone keeps the interactive path on
                 // purpose: nothing is rendered while hidden, as in a normal run.
                 render_when_hidden: options.frames.is_some(),
-                arena_quads,
-                max_chunk_slots,
+                chunk_memory: options.world.chunk_memory(),
                 textures: options.textures.clone(),
                 distance_fog: if options.distance_fog {
                     DistanceFog::default()

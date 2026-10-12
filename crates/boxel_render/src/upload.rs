@@ -4,16 +4,21 @@
 //! creates (and later frees) a staging buffer per call, a few microseconds each, and crossing a
 //! chunk border changes a few hundred chunks.
 //!
-//! A chunk's arena range holds its quads and then its light palette (ADR 0015), which High and
-//! Mid read at `ChunkGpu::light_base`. Low has no storage buffers: there each quad's palette
-//! entry is written, expanded, at the quad's own offset in a second buffer parallel to the arena
-//! (its second instance attribute).
+//! A chunk's range in its page (`crate::memory`) holds its quads and then its light palette
+//! (ADR 0015), which High and Mid read at `ChunkGpu::light_base`. Low has no storage buffers:
+//! there each quad's palette entry is written, expanded, at the quad's own offset in a light page
+//! parallel to the page (its second instance attribute).
 //!
 //! A re-sorted translucent bucket (`crate::sort`) goes the same way: its permuted quads over the
 //! bucket's own range, after the meshes of the frame (a mesh uploaded in the same frame is
-//! written first), and on Low their expanded light over the same range of the light buffer.
+//! written first), and on Low their expanded light over the same range of the light page.
+//!
+//! The writes go through a [`CopySink`]: [`GpuSink`] stages them and records the copies, the
+//! memory tests replay them over byte models of the buffers.
 use crate::arena::QUAD_BYTES;
 use crate::chunk_table::ChunkTable;
+use crate::memory::{CopySink, MemOp, MemTarget, PageSet};
+use crate::sort::SortedBucket;
 use boxel_mesh::{ChunkMesh, FULL_SKY_ENTRY, PackedQuad, PaletteEntry, TRANSLUCENT_BUCKET};
 use boxel_shaders::gpu::ChunkGpu;
 use std::collections::HashMap;
@@ -35,7 +40,9 @@ const STAGING_BYTES: u64 = 64 << 20;
 /// A mesh waiting for its upload.
 #[derive(Debug)]
 struct PendingMesh {
-    /// First arena quad (the chunk's current range).
+    /// The chunk's page.
+    page: u16,
+    /// First quad in the page (the chunk's current range).
     offset: u32,
     /// The mesh, shared with the world: its quads are copied once, into the staging buffer.
     mesh: Arc<ChunkMesh>,
@@ -48,7 +55,7 @@ pub(crate) fn light_entries(mesh: &ChunkMesh) -> u32 {
 }
 
 /// The palette a mesh is uploaded with (see [`light_entries`]).
-fn uploaded_palette(mesh: &ChunkMesh) -> &[PaletteEntry] {
+pub(crate) fn uploaded_palette(mesh: &ChunkMesh) -> &[PaletteEntry] {
     if mesh.palette.is_empty() {
         std::slice::from_ref(&FULL_SKY_ENTRY)
     } else {
@@ -56,7 +63,7 @@ fn uploaded_palette(mesh: &ChunkMesh) -> &[PaletteEntry] {
     }
 }
 
-/// Arena entries (8 bytes each) a chunk mesh takes: its quads plus its light palette (at least
+/// Page entries (8 bytes each) a chunk mesh takes: its quads plus its light palette (at least
 /// one entry). [`RenderStats::arena_used_quads`](crate::RenderStats) counts these.
 pub fn arena_len(mesh: &ChunkMesh) -> u32 {
     mesh.total_quads() + light_entries(mesh)
@@ -80,7 +87,9 @@ impl PendingMesh {
 /// A re-sorted translucent bucket waiting for its upload.
 #[derive(Debug)]
 struct PendingSorted {
-    /// First arena quad of the chunk's translucent bucket.
+    /// The chunk's page.
+    page: u16,
+    /// First quad of the chunk's translucent bucket in the page.
     offset: u32,
     /// The mesh the quads come from (its palette lights them on Low).
     mesh: Arc<ChunkMesh>,
@@ -88,30 +97,28 @@ struct PendingSorted {
     quads: Vec<PackedQuad>,
 }
 
-/// One copy into the arena, the Low light buffer or the chunk table.
+/// One copy into a page, a Low light page or the chunk table.
 #[derive(Clone, Debug)]
 enum Piece {
-    /// `pending[range]`, consecutive in the arena: quads and palettes.
+    /// `pending[range]`, consecutive in one page: quads and palettes.
     Meshes(Range<usize>),
-    /// The same range in the Low light buffer: each quad's palette entry, expanded.
+    /// The same range in the Low light page: each quad's palette entry, expanded.
     LowLight(Range<usize>),
     /// Chunk table slots.
     Slots(Range<u32>),
     /// `sorted_pending[i]`: a translucent bucket in its new order.
     Sorted(usize),
-    /// The light of `sorted_pending[i]` in the Low light buffer.
+    /// The light of `sorted_pending[i]` in the Low light page.
     SortedLowLight(usize),
 }
 
-/// The buffers the copies go to.
+/// What the tier has to write to.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct UploadTargets<'a> {
-    /// The quad arena.
-    pub arena: &'a wgpu::Buffer,
-    /// The chunk table (High/Mid; Low has none).
-    pub table: Option<&'a wgpu::Buffer>,
-    /// The per-quad light buffer parallel to the arena (Low only).
-    pub low_light: Option<&'a wgpu::Buffer>,
+pub(crate) struct UploadKinds {
+    /// A GPU chunk table (High/Mid; Low has none).
+    pub table: bool,
+    /// Light pages parallel to the pages (Low only).
+    pub low_light: bool,
 }
 
 /// Changes waiting for the next frame, plus reused scratch space.
@@ -142,24 +149,51 @@ pub(crate) struct Uploads {
 }
 
 impl Uploads {
-    /// Queues the quads of `mesh` for the arena range starting at quad `offset`, the new range of
-    /// chunk `id`.
-    /// A sorted bucket of the chunk's previous mesh no longer applies.
-    pub fn mesh(&mut self, id: u64, offset: u32, mesh: Arc<ChunkMesh>) {
-        self.meshes.insert(id, PendingMesh { offset, mesh });
+    /// Queues the quads of `mesh` for the range starting at quad `offset` of `page`, the new
+    /// range of chunk `id`. A sorted bucket of the chunk's previous mesh no longer applies.
+    pub fn mesh(&mut self, id: u64, page: u16, offset: u32, mesh: Arc<ChunkMesh>) {
+        self.meshes.insert(id, PendingMesh { page, offset, mesh });
         self.sorted.remove(&id);
     }
 
     /// Queues `quads`, the translucent bucket of chunk `id`'s current `mesh` in a new order, for
-    /// the bucket's arena range starting at quad `offset`. Written after any pending mesh.
-    pub fn sorted(&mut self, id: u64, offset: u32, mesh: Arc<ChunkMesh>, quads: Vec<PackedQuad>) {
+    /// the bucket's range starting at quad `offset` of `page`. Written after any pending mesh.
+    pub fn sorted(
+        &mut self,
+        id: u64,
+        page: u16,
+        offset: u32,
+        mesh: Arc<ChunkMesh>,
+        quads: Vec<PackedQuad>,
+    ) {
         self.sorted.insert(
             id,
             PendingSorted {
+                page,
                 offset,
                 mesh,
                 quads,
             },
+        );
+    }
+
+    /// Queues `sorted` over its chunk's translucent bucket, if the chunk is still resident in
+    /// `chunks` with that bucket (a trimmed bucket, from a malformed mesh, keeps the mesher's
+    /// order).
+    pub fn sorted_bucket(&mut self, chunks: &ChunkTable, sorted: SortedBucket) {
+        let Some((_, record)) = chunks.get(sorted.id) else {
+            return;
+        };
+        if record.counts[TRANSLUCENT_BUCKET] as usize != sorted.quads.len() {
+            return;
+        }
+        let start: u32 = record.counts[..TRANSLUCENT_BUCKET].iter().sum();
+        self.sorted(
+            sorted.id,
+            record.alloc.page,
+            record.alloc.alloc.offset + start,
+            sorted.mesh,
+            sorted.quads,
         );
     }
 
@@ -174,7 +208,7 @@ impl Uploads {
         self.meshes.len() + self.sorted.len()
     }
 
-    /// Drops every pending mesh (the arena was reset).
+    /// Drops every pending mesh (every page was reset).
     pub fn clear(&mut self) {
         self.meshes.clear();
         self.sorted.clear();
@@ -198,19 +232,18 @@ impl Uploads {
         self.fail_next = true;
     }
 
-    /// Records into `encoder` the copies that bring the GPU up to date: every pending mesh into
-    /// the arena (and on Low its expanded light into the light buffer), and every stale slot of
-    /// `chunks` into the table (Low has no table: its stale slots are just forgotten). Nothing
-    /// when nothing changed.
-    pub fn flush(
+    /// Writes through `sink` what brings the GPU up to date: every pending mesh into its page
+    /// (and on Low its expanded light into the light page), and every stale slot of `chunks`
+    /// into the table (Low has no table: its stale slots are just forgotten). Nothing when
+    /// nothing changed.
+    pub fn flush<S: CopySink>(
         &mut self,
-        device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
-        targets: UploadTargets<'_>,
+        sink: &mut S,
         chunks: &mut ChunkTable,
+        kinds: UploadKinds,
     ) {
         chunks.take_stale_runs(TABLE_MERGE_GAP, &mut self.runs);
-        if targets.table.is_none() {
+        if !kinds.table {
             self.runs.clear();
         }
         if self.meshes.is_empty() && self.sorted.is_empty() && self.runs.is_empty() {
@@ -219,7 +252,8 @@ impl Uploads {
         debug_assert!(
             self.meshes.iter().all(|(&id, mesh)| {
                 chunks.get(id).is_some_and(|(_, r)| {
-                    (r.alloc.offset, r.alloc.size) == (mesh.offset, mesh.len())
+                    (r.alloc.page, r.alloc.alloc.offset, r.alloc.alloc.size)
+                        == (mesh.page, mesh.offset, mesh.len())
                         && r.light_base == mesh.offset + mesh.mesh.total_quads()
                 })
             }),
@@ -229,7 +263,8 @@ impl Uploads {
             self.sorted.iter().all(|(&id, sorted)| {
                 chunks.get(id).is_some_and(|(_, r)| {
                     let start: u32 = r.counts[..TRANSLUCENT_BUCKET].iter().sum();
-                    r.alloc.offset + start == sorted.offset
+                    r.alloc.page == sorted.page
+                        && r.alloc.alloc.offset + start == sorted.offset
                         && r.counts[TRANSLUCENT_BUCKET] as usize == sorted.quads.len()
                 })
             }),
@@ -237,11 +272,12 @@ impl Uploads {
         );
         self.pending
             .extend(self.meshes.drain().map(|(_, mesh)| mesh));
-        self.pending.sort_unstable_by_key(|mesh| mesh.offset);
-        let limit = device.limits().max_buffer_size.min(STAGING_BYTES);
+        self.pending
+            .sort_unstable_by_key(|mesh| (mesh.page, mesh.offset));
+        let limit = sink.max_batch();
         self.pieces.clear();
         mesh_pieces(&self.pending, limit, &mut self.pieces);
-        if targets.low_light.is_some() {
+        if kinds.low_light {
             let low: Vec<(Piece, u64)> = self
                 .pieces
                 .iter()
@@ -260,11 +296,11 @@ impl Uploads {
         self.sorted_pending
             .extend(self.sorted.drain().map(|(_, sorted)| sorted));
         self.sorted_pending
-            .sort_unstable_by_key(|sorted| sorted.offset);
+            .sort_unstable_by_key(|sorted| (sorted.page, sorted.offset));
         for (i, sorted) in self.sorted_pending.iter().enumerate() {
             let bytes = sorted.quads.len() as u64 * QUAD_BYTES;
             self.pieces.push((Piece::Sorted(i), bytes));
-            if targets.low_light.is_some() {
+            if kinds.low_light {
                 self.pieces.push((Piece::SortedLowLight(i), bytes));
             }
         }
@@ -272,125 +308,201 @@ impl Uploads {
         let mut start = 0;
         while start < self.pieces.len() {
             let end = start + batch_len(&self.pieces[start..], limit);
-            self.copy_batch(device, encoder, targets, chunks, start..end);
+            self.write_batch(sink, chunks, start..end);
             start = end;
         }
         self.pending.clear();
         self.sorted_pending.clear();
     }
 
-    /// One staging buffer with `pieces[batch]`, and their copies.
-    fn copy_batch(
-        &mut self,
-        device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
-        targets: UploadTargets<'_>,
-        chunks: &ChunkTable,
-        batch: Range<usize>,
-    ) {
+    /// The writes of `pieces[batch]`, in one batch of `sink`.
+    fn write_batch<S: CopySink>(&mut self, sink: &mut S, chunks: &ChunkTable, batch: Range<usize>) {
         let bytes: u64 = self.pieces[batch.clone()]
             .iter()
             .map(|(_, bytes)| bytes)
             .sum();
-        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        let fail = std::mem::take(&mut self.fail_next);
+        let Self {
+            pieces,
+            pending,
+            sorted_pending,
+            entries,
+            low_words,
+            ..
+        } = self;
+        let written = sink.writes(bytes, fail, &mut |put| {
+            for (piece, _) in &pieces[batch.clone()] {
+                match piece {
+                    Piece::Meshes(range) => {
+                        for mesh in &pending[range.clone()] {
+                            let target = MemTarget::Page(mesh.page);
+                            let at = u64::from(mesh.offset) * QUAD_BYTES;
+                            let quads: &[u8] = bytemuck::cast_slice(mesh.quads());
+                            put(MemOp::Write {
+                                target,
+                                offset: at,
+                                data: quads,
+                            });
+                            put(MemOp::Write {
+                                target,
+                                offset: at + quads.len() as u64,
+                                data: bytemuck::cast_slice(uploaded_palette(&mesh.mesh)),
+                            });
+                        }
+                    }
+                    Piece::LowLight(range) => {
+                        for mesh in &pending[range.clone()] {
+                            expand_light(&mesh.mesh, low_words);
+                            put(MemOp::Write {
+                                target: MemTarget::LightPage(mesh.page),
+                                offset: u64::from(mesh.offset) * QUAD_BYTES,
+                                data: bytemuck::cast_slice(low_words),
+                            });
+                        }
+                    }
+                    Piece::Slots(slots) => {
+                        entries.clear();
+                        entries.extend(slots.clone().map(|slot| chunks.gpu_entry_at(slot)));
+                        put(MemOp::Write {
+                            target: MemTarget::Table,
+                            offset: u64::from(slots.start) * ENTRY_BYTES,
+                            data: bytemuck::cast_slice(entries),
+                        });
+                    }
+                    Piece::Sorted(i) => {
+                        let sorted = &sorted_pending[*i];
+                        put(MemOp::Write {
+                            target: MemTarget::Page(sorted.page),
+                            offset: u64::from(sorted.offset) * QUAD_BYTES,
+                            data: bytemuck::cast_slice(&sorted.quads),
+                        });
+                    }
+                    Piece::SortedLowLight(i) => {
+                        let sorted = &sorted_pending[*i];
+                        quad_light(&sorted.mesh, &sorted.quads, low_words);
+                        put(MemOp::Write {
+                            target: MemTarget::LightPage(sorted.page),
+                            offset: u64::from(sorted.offset) * QUAD_BYTES,
+                            data: bytemuck::cast_slice(low_words),
+                        });
+                    }
+                }
+            }
+        });
+        if !written {
+            // The batch could not be staged (out of memory, a lost device): these copies are
+            // lost, but their meshes and stale slots were already taken: `take_lost` tells the
+            // caller to upload every chunk again (the render plugin resyncs).
+            self.lost = true;
+        }
+    }
+}
+
+/// The GPU's [`CopySink`]: each batch is one `MAP_WRITE` staging buffer, and its writes are
+/// copies recorded into the frame's encoder (writes that follow each other in one buffer share
+/// one copy).
+pub(crate) struct GpuSink<'a> {
+    /// The device (staging buffers).
+    pub device: &'a wgpu::Device,
+    /// The frame's encoder.
+    pub encoder: &'a mut wgpu::CommandEncoder,
+    /// The pages.
+    pub pages: &'a PageSet,
+    /// The chunk table (High/Mid).
+    pub table: Option<&'a wgpu::Buffer>,
+    /// Scratch: the copies of a batch (target, staging offset, target offset, bytes).
+    pub copies: &'a mut Vec<(MemTarget, u64, u64, u64)>,
+}
+
+/// The buffer `target` names.
+fn target_buffer<'a>(
+    pages: &'a PageSet,
+    table: Option<&'a wgpu::Buffer>,
+    target: MemTarget,
+) -> Option<&'a wgpu::Buffer> {
+    match target {
+        MemTarget::Page(id) => pages.get(id).map(|p| &p.quads),
+        MemTarget::LightPage(id) => pages.get(id).and_then(|p| p.light.as_ref()),
+        MemTarget::Table => table,
+    }
+}
+
+impl CopySink for GpuSink<'_> {
+    fn max_batch(&self) -> u64 {
+        self.device.limits().max_buffer_size.min(STAGING_BYTES)
+    }
+
+    fn writes(
+        &mut self,
+        bytes: u64,
+        fail: bool,
+        fill: &mut dyn FnMut(&mut dyn FnMut(MemOp<'_>)),
+    ) -> bool {
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("boxel uploads"),
-            // Over every `max_buffer_size` (and unaligned): `fail_next_batch`.
-            size: if std::mem::take(&mut self.fail_next) {
-                u64::MAX
-            } else {
-                bytes
-            },
+            // Over every `max_buffer_size` (and unaligned): `Uploads::fail_next_batch`.
+            size: if fail { u64::MAX } else { bytes },
             usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: true,
         });
+        let copies = &mut *self.copies;
+        copies.clear();
         {
             let mut view = match staging.slice(..).get_mapped_range_mut() {
                 Ok(view) => view,
                 Err(e) => {
                     // The buffer could not be created (out of memory, a lost device): wgpu
-                    // reported why, and the device stays usable. These copies are lost, but
-                    // their meshes and stale slots were already taken: `take_lost` tells the
-                    // caller to upload every chunk again (the render plugin resyncs).
+                    // reported why, and the device stays usable.
                     tracing::error!("chunk uploads lost: {e}");
-                    self.lost = true;
-                    return;
+                    return false;
                 }
             };
-            let mut at = 0;
-            let mut put = |data: &[u8]| {
-                view.slice(at..at + data.len()).copy_from_slice(data);
-                at += data.len();
-            };
-            for (piece, _) in &self.pieces[batch.clone()] {
-                match piece {
-                    Piece::Meshes(range) => {
-                        for mesh in &self.pending[range.clone()] {
-                            put(bytemuck::cast_slice(mesh.quads()));
-                            put(bytemuck::cast_slice(uploaded_palette(&mesh.mesh)));
+            let mut at = 0u64;
+            fill(&mut |op| match op {
+                MemOp::Write {
+                    target,
+                    offset,
+                    data,
+                } => {
+                    let len = data.len() as u64;
+                    view.slice(at as usize..at as usize + data.len())
+                        .copy_from_slice(data);
+                    match copies.last_mut() {
+                        Some((t, src, dst, size))
+                            if *t == target && *src + *size == at && *dst + *size == offset =>
+                        {
+                            *size += len;
                         }
+                        _ => copies.push((target, at, offset, len)),
                     }
-                    Piece::LowLight(range) => {
-                        for mesh in &self.pending[range.clone()] {
-                            expand_light(&mesh.mesh, &mut self.low_words);
-                            put(bytemuck::cast_slice(&self.low_words));
-                        }
-                    }
-                    Piece::Slots(slots) => {
-                        self.entries.clear();
-                        self.entries
-                            .extend(slots.clone().map(|slot| chunks.gpu_entry_at(slot)));
-                        put(bytemuck::cast_slice(&self.entries));
-                    }
-                    Piece::Sorted(i) => put(bytemuck::cast_slice(&self.sorted_pending[*i].quads)),
-                    Piece::SortedLowLight(i) => {
-                        let sorted = &self.sorted_pending[*i];
-                        quad_light(&sorted.mesh, &sorted.quads, &mut self.low_words);
-                        put(bytemuck::cast_slice(&self.low_words));
-                    }
+                    at += len;
                 }
-            }
+            });
         }
         staging.unmap();
-        let mut src = 0;
-        for (piece, size) in &self.pieces[batch] {
-            let (dst, offset) = match piece {
-                Piece::Meshes(range) => (
-                    Some(targets.arena),
-                    u64::from(self.pending[range.start].offset) * QUAD_BYTES,
-                ),
-                Piece::LowLight(range) => (
-                    targets.low_light,
-                    u64::from(self.pending[range.start].offset) * QUAD_BYTES,
-                ),
-                Piece::Slots(slots) => (targets.table, u64::from(slots.start) * ENTRY_BYTES),
-                Piece::Sorted(i) => (
-                    Some(targets.arena),
-                    u64::from(self.sorted_pending[*i].offset) * QUAD_BYTES,
-                ),
-                Piece::SortedLowLight(i) => (
-                    targets.low_light,
-                    u64::from(self.sorted_pending[*i].offset) * QUAD_BYTES,
-                ),
-            };
-            if let Some(dst) = dst {
-                encoder.copy_buffer_to_buffer(&staging, src, dst, offset, *size);
+        for &(target, src, dst, size) in self.copies.iter() {
+            if size > 0
+                && let Some(buffer) = target_buffer(self.pages, self.table, target)
+            {
+                self.encoder
+                    .copy_buffer_to_buffer(&staging, src, buffer, dst, size);
             }
-            src += size;
         }
+        true
     }
 }
 
-/// Sets `out` to what the Low light buffer holds over `mesh`'s arena range: the palette entry
-/// of each quad (open sky for an index outside the palette), then the palette itself (never
-/// drawn; it only keeps the range the same size as in the arena).
-fn expand_light(mesh: &ChunkMesh, out: &mut Vec<PaletteEntry>) {
+/// Sets `out` to what the Low light page holds over `mesh`'s range: the palette entry of each
+/// quad (open sky for an index outside the palette), then the palette itself (never drawn; it
+/// only keeps the range the same size as in the page).
+pub(crate) fn expand_light(mesh: &ChunkMesh, out: &mut Vec<PaletteEntry>) {
     quad_light(mesh, &mesh.quads, out);
     out.extend_from_slice(uploaded_palette(mesh));
 }
 
 /// Sets `out` to the palette entry of each of `quads` (from `mesh`), open sky for an index
 /// outside the palette.
-fn quad_light(mesh: &ChunkMesh, quads: &[PackedQuad], out: &mut Vec<PaletteEntry>) {
+pub(crate) fn quad_light(mesh: &ChunkMesh, quads: &[PackedQuad], out: &mut Vec<PaletteEntry>) {
     let palette = uploaded_palette(mesh);
     out.clear();
     out.extend(quads.iter().map(|q| {
@@ -401,16 +513,18 @@ fn quad_light(mesh: &ChunkMesh, quads: &[PackedQuad], out: &mut Vec<PaletteEntry
     }));
 }
 
-/// Appends the copies of `pending` (sorted by offset) to `pieces`: one per run of meshes that
-/// follow each other in the arena, cut where it would pass `limit` bytes. Never across a gap: it
-/// may hold another chunk's quads.
+/// Appends the copies of `pending` (sorted by page, then offset) to `pieces`: one per run of
+/// meshes that follow each other in one page, cut where it would pass `limit` bytes. Never
+/// across a gap (it may hold another chunk's quads) nor across pages.
 fn mesh_pieces(pending: &[PendingMesh], limit: u64, pieces: &mut Vec<(Piece, u64)>) {
     let mut first = 0;
     let mut bytes = 0;
     for (i, mesh) in pending.iter().enumerate() {
         bytes += mesh.bytes();
         let joined = pending.get(i + 1).is_some_and(|next| {
-            mesh.offset + mesh.len() == next.offset && bytes + next.bytes() <= limit
+            mesh.page == next.page
+                && mesh.offset + mesh.len() == next.offset
+                && bytes + next.bytes() <= limit
         });
         if !joined {
             pieces.push((Piece::Meshes(first..i + 1), bytes));
@@ -437,9 +551,14 @@ fn batch_len(pieces: &[(Piece, u64)], limit: u64) -> usize {
 mod tests {
     use super::*;
 
-    /// A pending mesh of `len` arena entries: `len - 1` quads and one palette entry.
+    /// A pending mesh of `len` page entries in page 0: `len - 1` quads and one palette entry.
     fn pending(offset: u32, len: usize) -> PendingMesh {
+        in_page(0, offset, len)
+    }
+
+    fn in_page(page: u16, offset: u32, len: usize) -> PendingMesh {
         PendingMesh {
+            page,
             offset,
             mesh: Arc::new(ChunkMesh::from_quads(
                 vec![PackedQuad::default(); len - 1],
@@ -475,6 +594,22 @@ mod tests {
             [(0..2, 5), (2..4, 5), (4..5, 1)]
         );
         assert!(mesh_ranges(&[], u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn runs_of_meshes_never_join_across_pages() {
+        // Page 0 ends at 5 and page 1 starts at 5: the same offsets, other buffers.
+        let meshes = [
+            in_page(0, 0, 3),
+            in_page(0, 3, 2),
+            in_page(1, 5, 2),
+            in_page(1, 7, 1),
+            in_page(3, 8, 1),
+        ];
+        assert_eq!(
+            mesh_ranges(&meshes, u64::MAX),
+            [(0..2, 5), (2..4, 3), (4..5, 1)]
+        );
     }
 
     #[test]

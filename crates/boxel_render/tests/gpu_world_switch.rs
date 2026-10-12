@@ -54,8 +54,9 @@ use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher};
 use boxel_render::fog::{FogClock, FogInput, FogPlugin, FogSettings, FogTime};
 use boxel_render::lod::{LodInput, LodSettings};
 use boxel_render::{
-    BlockTextureData, PackSource, RenderSettings, RendererConfig, ResetState, Resync, SceneLight,
-    TextureSource, TranslucentSort, ViewParams, VoxelRenderer, light_curve, load_block_textures,
+    BlockTextureData, ChunkMemorySettings, PackSource, RenderSettings, RendererConfig, ResetState,
+    Resync, SceneLight, TextureSource, TranslucentSort, ViewParams, VoxelRenderer, light_curve,
+    load_block_textures,
 };
 use boxel_transform::Transform;
 use boxel_voxel::{
@@ -422,8 +423,11 @@ fn textures() -> &'static BlockTextureData {
 /// The renderer of the tests: large enough that nothing is refused.
 fn config() -> RendererConfig {
     RendererConfig {
-        arena_quads: 1 << 20,
-        max_chunk_slots: 2048,
+        chunk_memory: ChunkMemorySettings {
+            initial_quads: 1 << 20,
+            initial_slots: 2048,
+            ..ChunkMemorySettings::default()
+        },
         translucent_sort: TranslucentSort::Inline,
     }
 }
@@ -739,7 +743,11 @@ fn clear_world_leaves_a_fresh_renderer() {
     let scene = sparse(1, -4..=4, 0..=0, -4..=4);
     let view = sparse_view(I64Vec3::ZERO);
     let small = RendererConfig {
-        max_chunk_slots: 16,
+        chunk_memory: ChunkMemorySettings {
+            initial_slots: 16,
+            grow: false,
+            ..config().chunk_memory
+        },
         ..config()
     };
     assert!(scene.len() > 16, "some chunks are refused");

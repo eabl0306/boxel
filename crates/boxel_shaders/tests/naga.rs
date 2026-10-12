@@ -356,6 +356,79 @@ fn cull_clamps_to_the_index_buffer_of_boxel_mesh() {
         const_u32(&module, "MAX_QUADS_PER_BUCKET"),
         boxel_mesh::MAX_QUADS_PER_BUCKET
     );
+    assert_eq!(
+        const_u32(&module, "MAX_PAGES"),
+        boxel_shaders::gpu::chunk_memory::MAX_PAGES
+    );
+}
+
+/// Where `cull.wgsl` writes draw `n` (counted from 0) of page `p`'s opaque (`cutout = false`) or
+/// cutout list, for `pages` lists of `stride` opaque draws; `None` when the list is full. The
+/// same arithmetic as the shader, spelled out below.
+fn cull_slot(p: u32, n: u32, cutout: bool, pages: u32, stride: u32) -> Option<u32> {
+    let max_pages = boxel_shaders::gpu::chunk_memory::MAX_PAGES;
+    let pages = pages.min(max_pages);
+    if p >= pages {
+        return None;
+    }
+    if cutout {
+        let cut = stride / 6;
+        (n < cut).then(|| pages * stride + p * cut + n)
+    } else {
+        (n < stride).then(|| p * stride + n)
+    }
+}
+
+/// The per-page draw lists of `cull.wgsl` (ADR 0035): its indexing is the one of [`cull_slot`]
+/// (the source spells it out), and for any page count, stride and draw count every write stays
+/// inside its own page's list, and the lists of different pages never overlap.
+#[test]
+fn cull_writes_stay_inside_their_page_lists() {
+    use boxel_shaders::gpu::chunk_memory::{MAX_PAGES, PAGE_DRAWS_MAX};
+    for line in [
+        "let pages = min(view.counts.y, MAX_PAGES);",
+        "if (p >= pages) { return; }",
+        "let s = atomicAdd(&cull.counts[p], 1u);",
+        "if (s < stride) {",
+        "let i = p * stride + s;",
+        "let cut = stride / 6u;",
+        "let c = atomicAdd(&cull.counts[MAX_PAGES + p], 1u);",
+        "if (c < cut) {",
+        "let i = pages * stride + p * cut + c;",
+    ] {
+        assert!(boxel_shaders::CULL_WGSL.contains(line), "{line}");
+    }
+    for (pages, stride) in [(1, 6), (3, 24), (4, PAGE_DRAWS_MAX), (MAX_PAGES + 4, 12)] {
+        let total = pages.min(MAX_PAGES) * stride * 7 / 6;
+        let mut seen = vec![false; total as usize];
+        for p in 0..pages + 2 {
+            for cutout in [false, true] {
+                let cap = if cutout { stride / 6 } else { stride };
+                let (base, end) = if cutout {
+                    let start = pages.min(MAX_PAGES) * stride + p * (stride / 6);
+                    (start, start + stride / 6)
+                } else {
+                    (p * stride, p * stride + stride)
+                };
+                for n in 0..cap + 3 {
+                    match cull_slot(p, n, cutout, pages, stride) {
+                        Some(i) => {
+                            assert!(p < pages.min(MAX_PAGES) && n < cap);
+                            assert!((base..end).contains(&i), "page {p} draw {n}: {i}");
+                            assert!(i < total);
+                            assert!(!seen[i as usize], "two draws at {i}");
+                            seen[i as usize] = true;
+                        }
+                        None => assert!(p >= pages.min(MAX_PAGES) || n >= cap),
+                    }
+                }
+            }
+        }
+        assert!(
+            seen.iter().all(|&s| s),
+            "{pages} pages of {stride}: every entry used"
+        );
+    }
 }
 
 fn struct_layout(module: &naga::Module, name: &str) -> (u32, Vec<u32>) {
@@ -403,21 +476,26 @@ fn gpu_struct_layouts_match_the_rust_mirrors() {
     assert_eq!(offsets[7..], [240, 256, 272, 336]);
     let (size, offsets) = struct_layout(&pull, "ChunkGpu");
     assert_eq!((size, size_of::<ChunkGpu>()), (64, 64));
-    assert_eq!(offsets[..6], [0, 12, 16, 48, 52, 56]);
+    assert_eq!(offsets, [0, 12, 16, 48, 52, 56, 60]);
     assert_eq!(offset_of!(ChunkGpu, flags), 48);
     assert_eq!(offset_of!(ChunkGpu, light_base), 52);
     assert_eq!(offset_of!(ChunkGpu, light_len), 56);
+    assert_eq!(offset_of!(ChunkGpu, page), 60);
     let (cull, _) = load(ShaderModuleId::Cull);
     assert_eq!(
         struct_layout(&cull, "DrawArgs").0 as usize,
         size_of::<DrawIndexedIndirect>()
     );
     assert_eq!(size_of::<DrawIndexedIndirect>(), 20);
-    // The cave culling bits follow the two draw counts (ADR 0022).
+    // The cave culling bits follow the two draw counts of every page (ADR 0022, ADR 0035).
     let (_, offsets) = struct_layout(&cull, "CullState");
     assert_eq!(
         u64::from(offsets[1]),
         boxel_shaders::gpu::bindings::CULL_VISIBLE_OFFSET
+    );
+    assert_eq!(
+        boxel_shaders::gpu::bindings::CULL_VISIBLE_OFFSET,
+        8 * u64::from(boxel_shaders::gpu::chunk_memory::MAX_PAGES)
     );
     let (low, _) = load(ShaderModuleId::VoxelInstanced);
     assert_eq!(

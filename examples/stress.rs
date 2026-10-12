@@ -86,6 +86,8 @@ mod fog;
 mod lod;
 #[path = "shared/pack.rs"]
 mod pack;
+#[path = "stress/probe.rs"]
+mod probe;
 #[path = "stress/report.rs"]
 mod report;
 #[path = "stress/spans.rs"]
@@ -153,6 +155,10 @@ usage: stress [--scenario static|fly|dive|spin|path] [GPU options] [options]
                       not with the overworld, which has no floor)
   --arena-quads N     renderer quad arena (default 8388608, 25165824 with the overworld)
   --chunk-slots N     renderer chunk table (default 32768, 65536 with the overworld)
+  --alloc-probe MIB,..  while measuring, every 0.5 s a buffer of chunk memory's page usages is
+                      created right after present, 4 of each size, then all dropped; prints each
+                      creation's time, whether it needed a new GPU memory block and its frame
+                      time (ADR 0035; measures, so the frame times are not the run's)
   --fps-limit N       at most N updates per second (default 0: unlimited, the uncapped loop)
   --vsync on|off      vsync: on is --present vsync (Fifo), off is --present novsync (Mailbox,
                       else Immediate); without it the run presents with --present immediate
@@ -270,6 +276,8 @@ struct Options {
     /// `--arena-quads` and `--chunk-slots` (`None`: the world's default).
     arena_quads: Option<u32>,
     chunk_slots: Option<u32>,
+    /// `--alloc-probe`: page sizes in MiB (empty: no probe).
+    alloc_probe: Vec<u32>,
     /// `--fps-limit` (0: unlimited).
     fps_limit: u32,
     /// `--vsync` (`None`: not given).
@@ -351,6 +359,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         fixed_height: false,
         arena_quads: None,
         chunk_slots: None,
+        alloc_probe: Vec::new(),
         fps_limit: 0,
         vsync: None,
         spans: false,
@@ -479,6 +488,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                         .ok_or_else(|| format!("{flag}: {n} is not in 1..=1048576"))?,
                 );
             }
+            "--alloc-probe" => o.alloc_probe = probe::parse(&value()?)?,
             "--vertical-radius" => {
                 let r = number(flag, &value()?)?;
                 o.vertical_radius = u32::try_from(r)
@@ -1587,6 +1597,15 @@ fn add_bench(app: &mut App, options: Options, info: RunInfo, recorder: Recorder,
                 .chain()
                 .before(WorldSystems::Interest),
         );
+    let sizes = app.world().resource::<Bench>().options.alloc_probe.clone();
+    if !sizes.is_empty() {
+        app.insert_resource(probe::AllocProbe::new(&sizes))
+            .add_systems(PreUpdate, probe::report.after(record))
+            .add_systems(
+                Update,
+                probe::request.after(drive).before(WorldSystems::Interest),
+            );
+    }
     if app.world().resource::<Bench>().options.screenshot.is_some() {
         app.add_message::<RequestScreenshot>()
             .add_message::<ScreenshotSaved>()
@@ -1715,8 +1734,7 @@ fn main() -> AppExit {
                 gpu,
                 gpu_config,
                 render_when_hidden: true,
-                arena_quads,
-                max_chunk_slots: chunk_slots,
+                chunk_memory: world::chunk_memory((arena_quads, chunk_slots)),
                 textures: options.textures.clone(),
                 translucent_sort: options.sort,
                 distance_fog: if options.no_distance_fog {

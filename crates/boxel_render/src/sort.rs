@@ -1279,7 +1279,7 @@ mod tests {
             table.insert(ChunkRecord {
                 id,
                 origin,
-                alloc,
+                alloc: crate::memory::PagedAlloc { page: 0, alloc },
                 counts: mesh.bucket_counts,
                 light_base: alloc.offset + mesh.total_quads(),
                 light_len: 1,

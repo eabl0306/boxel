@@ -441,8 +441,11 @@ fn lod_input(settings: LodSettings, nodes: &[(ChunkKey, Arc<ChunkMesh>)]) -> Lod
 fn new_renderer(gpu: &Gpu<'_>) -> Result<VoxelRenderer, String> {
     let registry = registry();
     let config = RendererConfig {
-        arena_quads: 1 << 18,
-        max_chunk_slots: 256,
+        chunk_memory: boxel_render::ChunkMemorySettings {
+            initial_quads: 1 << 18,
+            initial_slots: 256,
+            ..boxel_render::ChunkMemorySettings::default()
+        },
         translucent_sort: TranslucentSort::Inline,
     };
     VoxelRenderer::new(
@@ -1521,8 +1524,11 @@ fn render_seam(
     sky: [f32; 4],
 ) -> Result<RgbaImage, String> {
     let config = RendererConfig {
-        arena_quads: 1 << 21,
-        max_chunk_slots: 4096,
+        chunk_memory: boxel_render::ChunkMemorySettings {
+            initial_quads: 1 << 21,
+            initial_slots: 4096,
+            ..boxel_render::ChunkMemorySettings::default()
+        },
         translucent_sort: TranslucentSort::Inline,
     };
     let mut renderer = VoxelRenderer::new(

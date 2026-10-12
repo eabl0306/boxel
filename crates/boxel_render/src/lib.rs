@@ -1,6 +1,7 @@
 //! `boxel_render`: the voxel renderer. No render graph: each tier is a fixed, ordered list of
 //! passes over explicit frame resources (ADR 0007). All tiers share the mesher output
-//! (`PackedQuad`), the quad arena and the WGSL decode; only submission differs:
+//! (`PackedQuad`), the pages of chunk quads (ADR 0035) and the WGSL decode; only submission
+//! differs:
 //!
 //! | Tier | Culling | Submission | Per-draw data reaches the shader via |
 //! |------|---------|------------|--------------------------------------|
@@ -49,7 +50,10 @@ mod textures;
 mod ui;
 
 mod arena;
+#[doc(hidden)]
+pub mod bench;
 mod chunk_table;
+mod memory;
 mod path;
 mod sort;
 mod targets;
@@ -57,6 +61,10 @@ mod upload;
 
 pub use distance_fog::{DistanceFog, DistanceFogError};
 pub use light::{LIGHT_LEVELS, SceneLight, light_curve};
+pub use memory::{
+    ChunkMemoryError, ChunkMemorySettings, ChunkMemoryStats, DEFAULT_PAGE_QUADS, MIN_PAGE_QUADS,
+    MemoryCeiling,
+};
 pub use outline::{BlockOutline, Outline, OutlineEdge, block_outline_edges, outline_edges};
 pub use overlay::{OverlayDraw, OverlayRect};
 pub use pack_textures::{
@@ -64,16 +72,16 @@ pub use pack_textures::{
     load_block_textures,
 };
 pub use path::{CullCounts, cull_counts};
+#[doc(hidden)]
+pub use plugin::{DebugAllocProbe, frame_visibility, frame_visibility_with};
 pub use plugin::{
     DebugDestroyDevice, GpuFailed, GpuReady, PresentSettings, Render, RenderInfo, RenderPlugin,
     RenderSettings, RenderSystems, RequestScreenshot, Resync, ScreenshotSaved, SurfaceInfo,
 };
 #[doc(hidden)]
-pub use plugin::{frame_visibility, frame_visibility_with};
-#[doc(hidden)]
-pub use renderer::ResetState;
+pub use renderer::{AllocProbeReport, ResetState};
 pub use renderer::{
-    DEFAULT_SKY_COLOR, FLUID_TIME_PERIOD, RenderStats, RendererConfig, RendererError,
+    ChunkOp, DEFAULT_SKY_COLOR, FLUID_TIME_PERIOD, RenderStats, RendererConfig, RendererError,
     TEXTURE_TICKS_PER_SECOND, ViewParams, VoxelRenderer, texture_tick,
 };
 pub use smoke::RendererSmokeTest;

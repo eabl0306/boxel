@@ -119,9 +119,9 @@ impl Default for WorldChoice {
     }
 }
 
-/// Default quad arena of the renderer (`RenderSettings::arena_quads`).
+/// Default chunk memory floor of the renderer (`ChunkMemorySettings::initial_quads`).
 const ARENA_QUADS: u32 = 8 << 20;
-/// Default chunk table size of the renderer (`RenderSettings::max_chunk_slots`).
+/// Default chunk table size of the renderer (`ChunkMemorySettings::initial_slots`).
 const CHUNK_SLOTS: u32 = 32_768;
 /// The overworld's: caves mesh far more chunks, with more quads each.
 const OVERWORLD_ARENA_QUADS: u32 = 24 << 20;
@@ -268,14 +268,32 @@ impl WorldChoice {
         Some(OverworldGenerator::new(seed, settings))
     }
 
-    /// Default `(arena quads, chunk slots)` of the renderer for this world: the engine defaults
-    /// (8 Mi quads, 32 768 slots), and 24 Mi quads (192 MiB) and 65 536 slots for the overworld.
+    /// Default `(quads, chunk slots)` the renderer starts with for this world: the engine
+    /// defaults (8 Mi quads, 32 768 slots), and 24 Mi quads (192 MiB) and 65 536 slots for the
+    /// overworld.
     pub fn render_capacity(self) -> (u32, u32) {
         if self.world == World::Overworld {
             (OVERWORLD_ARENA_QUADS, OVERWORLD_CHUNK_SLOTS)
         } else {
             (ARENA_QUADS, CHUNK_SLOTS)
         }
+    }
+
+    /// The renderer's chunk memory for this world: [`WorldChoice::render_capacity`] as the
+    /// floor and the initial table, the rest the engine's defaults.
+    #[cfg(feature = "render")]
+    pub fn chunk_memory(self) -> boxel::render::ChunkMemorySettings {
+        chunk_memory(self.render_capacity())
+    }
+}
+
+/// Chunk memory starting at `(quads, chunk slots)`, the rest the engine's defaults.
+#[cfg(feature = "render")]
+pub fn chunk_memory((quads, slots): (u32, u32)) -> boxel::render::ChunkMemorySettings {
+    boxel::render::ChunkMemorySettings {
+        initial_quads: quads,
+        initial_slots: slots,
+        ..boxel::render::ChunkMemorySettings::default()
     }
 }
 

@@ -747,8 +747,12 @@ fn full_arena_scenes(
     let largest = terrain.iter().map(|(_, m)| arena_len(m)).max();
     let config = RendererConfig {
         // slack for the size bins of `offset_allocator`, filled below
-        arena_quads: quads + largest.unwrap_or(0) / 4 + 8,
-        max_chunk_slots: 256,
+        chunk_memory: boxel_render::ChunkMemorySettings {
+            initial_quads: quads + largest.unwrap_or(0) / 4 + 8,
+            initial_slots: 256,
+            grow: false,
+            ..boxel_render::ChunkMemorySettings::default()
+        },
         translucent_sort: TranslucentSort::Inline,
     };
     let mut renderer = VoxelRenderer::new(
@@ -995,8 +999,11 @@ fn render_tier(
 ) -> Result<TierImages, String> {
     let (device, queue, errors) = device_for(adapter, caps, tier)?;
     let config = RendererConfig {
-        arena_quads: 1 << 20,
-        max_chunk_slots: 256,
+        chunk_memory: boxel_render::ChunkMemorySettings {
+            initial_quads: 1 << 20,
+            initial_slots: 256,
+            ..boxel_render::ChunkMemorySettings::default()
+        },
         translucent_sort: TranslucentSort::Inline,
     };
     let mut renderer = VoxelRenderer::new(
@@ -1613,8 +1620,11 @@ fn light_indices_past_the_palette_read_open_sky_on_every_tier() {
             let result = (|| {
                 let (device, queue, errors) = device_for(adapter, &caps, tier)?;
                 let config = RendererConfig {
-                    arena_quads: 1 << 13,
-                    max_chunk_slots: 8,
+                    chunk_memory: boxel_render::ChunkMemorySettings {
+                        initial_quads: 1 << 13,
+                        initial_slots: 8,
+                        ..boxel_render::ChunkMemorySettings::default()
+                    },
                     translucent_sort: TranslucentSort::Inline,
                 };
                 let mut renderer = VoxelRenderer::new(
@@ -1750,8 +1760,11 @@ fn pack_textures_render_on_every_tier() {
             let result = (|| {
                 let (device, queue, errors) = device_for(adapter, &caps, tier)?;
                 let config = RendererConfig {
-                    arena_quads: 1 << 13,
-                    max_chunk_slots: 8,
+                    chunk_memory: boxel_render::ChunkMemorySettings {
+                        initial_quads: 1 << 13,
+                        initial_slots: 8,
+                        ..boxel_render::ChunkMemorySettings::default()
+                    },
                     translucent_sort: TranslucentSort::Inline,
                 };
                 let mut renderer = VoxelRenderer::new(

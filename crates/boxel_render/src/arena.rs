@@ -1,5 +1,9 @@
-//! Quad arena: one `STORAGE | VERTEX | COPY_DST` buffer of `PackedQuads`, sub-allocated in quad
-//! units with `offset_allocator` (one allocation per chunk, all 7 buckets contiguous).
+//! Quad arena allocator: a buffer of `PackedQuads` sub-allocated in quad units with
+//! `offset_allocator` (one allocation per chunk, all 8 buckets contiguous, then its light palette).
+//! Every page of chunk memory (`crate::memory`) and the far LOD's arena have one.
+//!
+//! The allocator keeps `u32` nodes: `offset_allocator`'s `u16` mode stores the offsets as `u16`
+//! too and silently truncates every offset past 65,535.
 use boxel_mesh::PackedQuad;
 use offset_allocator::{Allocation, Allocator};
 
@@ -18,6 +22,20 @@ pub(crate) struct ArenaAlloc {
     handle: Allocation,
 }
 
+impl ArenaAlloc {
+    /// Quads held in the arena (`>= size`; larger only after an in-place `replace`).
+    #[cfg(test)]
+    pub fn reserved(&self) -> u32 {
+        self.reserved
+    }
+
+    /// The same range holding a mesh of `size > 0` quads instead, if that fits in what it
+    /// reserves (the slack stays reserved).
+    pub fn with_size(self, size: u32) -> Option<Self> {
+        (size > 0 && size <= self.reserved).then_some(Self { size, ..self })
+    }
+}
+
 impl std::fmt::Debug for ArenaAlloc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArenaAlloc")
@@ -33,6 +51,15 @@ pub(crate) struct ArenaAllocator {
     allocator: Allocator,
     capacity: u32,
     used: u32,
+}
+
+impl std::fmt::Debug for ArenaAllocator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArenaAllocator")
+            .field("capacity", &self.capacity)
+            .field("used", &self.used)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ArenaAllocator {
@@ -55,6 +82,13 @@ impl ArenaAllocator {
     /// Quads held by live allocations (reserved ranges, see `replace`).
     pub fn used(&self) -> u32 {
         self.used
+    }
+
+    /// The largest `size` [`ArenaAllocator::allocate`] gives a range for right now, exactly
+    /// (0 once the allocator nodes run out). O(1): the allocator's size bins, which `allocate`
+    /// rounds every request up to.
+    pub fn largest_free(&self) -> u32 {
+        self.allocator.storage_report().largest_free_region
     }
 
     /// Allocates `size > 0` quads.
@@ -96,44 +130,13 @@ impl ArenaAllocator {
             }
             return Some(new);
         }
-        let old = old?;
-        (size > 0 && size <= old.reserved).then_some(ArenaAlloc { size, ..old })
+        old?.with_size(size)
     }
 
     /// Frees everything.
     pub fn reset(&mut self) {
         self.allocator.reset();
         self.used = 0;
-    }
-}
-
-/// The GPU buffer plus its allocator.
-pub(crate) struct QuadArena {
-    buffer: wgpu::Buffer,
-    /// Allocator over the buffer, in quads.
-    pub alloc: ArenaAllocator,
-}
-
-impl QuadArena {
-    /// Creates the buffer (`capacity * 8` bytes).
-    pub fn new(device: &wgpu::Device, capacity: u32, max_allocs: u32) -> Self {
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("boxel quad arena"),
-            size: u64::from(capacity) * QUAD_BYTES,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::VERTEX
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        Self {
-            buffer,
-            alloc: ArenaAllocator::new(capacity, max_allocs),
-        }
-    }
-
-    /// The arena buffer.
-    pub fn buffer(&self) -> &wgpu::Buffer {
-        &self.buffer
     }
 }
 
@@ -296,6 +299,47 @@ mod tests {
             arena.free(alloc);
         }
         assert_eq!(arena.used(), 0);
+    }
+
+    /// `largest_free` is an exact fit test: whatever it reports allocates, one more does not.
+    #[test]
+    fn largest_free_is_an_exact_fit_test() {
+        let mut arena = ArenaAllocator::new(100_000, 64);
+        let mut live = Vec::new();
+        for size in [1000, 333, 77_777, 12, 5000] {
+            live.push(arena.allocate(size).expect("setup"));
+        }
+        arena.free(live.swap_remove(2));
+        arena.free(live.swap_remove(0));
+        for _ in 0..3 {
+            let largest = arena.largest_free();
+            assert!(largest > 0);
+            let a = arena.allocate(largest).expect("largest_free fits");
+            arena.free(a);
+            assert!(arena.allocate(largest + 1).is_none_or(|a| {
+                arena.free(a);
+                false
+            }));
+            live.push(arena.allocate(largest / 3 + 1).expect("a third"));
+        }
+        // out of nodes: nothing fits, and it says so
+        let mut few = ArenaAllocator::new(1 << 20, 3);
+        let _a = few.allocate(16).expect("one");
+        assert_eq!(few.largest_free(), 0);
+        assert!(few.allocate(16).is_none());
+    }
+
+    /// Offsets past 65,535 come back exact (the `u16` node mode would cut them).
+    #[test]
+    fn offsets_past_u16_are_exact() {
+        let mut arena = ArenaAllocator::new(1 << 20, 64);
+        let mut end = 0;
+        for _ in 0..10 {
+            let a = arena.allocate(30_000).expect("fits");
+            assert_eq!(a.offset, end);
+            end += 30_000;
+        }
+        assert!(end > 1 << 16);
     }
 
     #[test]

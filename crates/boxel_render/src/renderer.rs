@@ -1,25 +1,30 @@
-use crate::arena::{QUAD_BYTES, QuadArena};
-use crate::chunk_table::{ChunkRecord, ChunkTable};
+use crate::arena::QUAD_BYTES;
+use crate::chunk_table::ChunkTable;
 use crate::distance_fog::DistanceFog;
 use crate::fog::{FogInput, FogPass};
 use crate::light::SceneLight;
 use crate::lod::{GpuInputs, LodInput, LodPass, LodReport};
+use crate::memory::{
+    CHUNK_GPU_BYTES, ChunkMemory, ChunkMemorySettings, ChunkMemoryStats, DeviceFacts, MemoryLayout,
+    PageClass, PageSet, Refusal, create_page, list_bytes, remove_resident, upsert_resident,
+};
 use crate::outline::{Outline, OutlinePass};
 use crate::path::{
     HighInputs, HighPath, LowPath, MidPath, SlotVisibility, TierPath, TierPipelines,
-    geometry_bind_group, quad_index_buffer,
+    quad_index_buffer,
 };
+use crate::plugin::Resync;
 use crate::sort::{SortedBucket, TranslucentSort, TranslucentSorter};
 use crate::targets::{Blit, Targets};
 use crate::texture_animation::TextureAnimator;
 use crate::textures::BlockTextureData;
-use crate::upload::{UploadTargets, Uploads, arena_len, light_entries};
+use crate::upload::{GpuSink, UploadKinds, Uploads};
 use boxel_camera::{Camera, CameraView};
 use boxel_gfx::Tier;
 use boxel_math::{Frustum, I64Vec3, Mat4, UVec2, Vec3, wrap_to_i32};
-use boxel_mesh::{BUCKET_COUNT, ChunkMesh, TRANSLUCENT_BUCKET, pack_model_box};
+use boxel_mesh::{ChunkMesh, pack_model_box};
 use boxel_shaders::gpu::{
-    ChunkGpu, VIEW_BOX_CAPACITY, VIEW_BOXES_OFFSET, VIEW_BUFFER_SIZE, ViewUniform, bindings,
+    VIEW_BOX_CAPACITY, VIEW_BOXES_OFFSET, VIEW_BUFFER_SIZE, ViewUniform, bindings,
 };
 use boxel_voxel::{CHUNK_SHIFT, ChunkPos, ModelBox};
 use boxel_world::VisibleSet;
@@ -28,40 +33,39 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt as _;
 
-/// Upper bound of chunk slots (keeps the allocator node table and the GPU table bounded).
-const MAX_SLOTS: u32 = 1 << 20;
-/// Bytes of one chunk table entry.
-const CHUNK_GPU_BYTES: u64 = size_of::<ChunkGpu>() as u64;
-
 /// The default sky: the clear color and fog color of a noon view (linear RGBA).
 pub const DEFAULT_SKY_COLOR: [f32; 4] = [0.30, 0.52, 0.85, 1.0];
 
 /// Renderer construction parameters.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct RendererConfig {
-    /// Quad arena capacity (clamped to `max_storage_buffer_binding_size / 8` on High/Mid and
-    /// `max_buffer_size / 8` on Low). Each chunk takes its quads plus its light palette (one
-    /// entry of 8 bytes per distinct corner light set, usually a few dozen). Low also allocates
-    /// a second buffer of the same size (each quad's light, ADR 0015).
-    pub arena_quads: u32,
-    /// Chunk slots. High clamps it to `64 * max_compute_workgroups_per_dimension`; its draw
-    /// lists hold `min(6 * slots, 65535)` opaque and `min(slots, 65535)` cutout draws. When more
-    /// buckets are visible, High skips arbitrary ones (not the farthest; not counted in
-    /// [`RenderStats`]) and logs one warning; Mid and Low draw them all.
-    pub max_chunk_slots: u32,
+    /// How chunk quads are kept on the GPU (ADR 0035): pages, the floor created here, the chunk
+    /// table and the ceiling. Each chunk takes its quads plus its light palette (one entry of 8
+    /// bytes per distinct corner light set, usually a few dozen) in one page; Low also has a
+    /// light page of the same size per page (each quad's light, ADR 0015).
+    pub chunk_memory: ChunkMemorySettings,
     /// How the translucent quads inside each chunk are sorted back to front (ADR 0018). Default
     /// [`TranslucentSort::Background`]; [`VoxelRenderer::set_translucent_sort`] changes it later.
     pub translucent_sort: TranslucentSort,
 }
 
-impl Default for RendererConfig {
-    fn default() -> Self {
-        Self {
-            arena_quads: 8 << 20,
-            max_chunk_slots: 32768,
-            translucent_sort: TranslucentSort::default(),
-        }
-    }
+/// One chunk mesh change for the renderer ([`VoxelRenderer::apply_ops`]).
+#[derive(Clone, Debug)]
+pub enum ChunkOp {
+    /// Uploads (or replaces) a chunk mesh ([`VoxelRenderer::upsert_chunk`]).
+    Upsert {
+        /// Any stable id (`ChunkId::to_bits`).
+        id: u64,
+        /// World voxel origin (`i64`; wrapped to 32 bits only when uploaded).
+        origin: I64Vec3,
+        /// The mesh (empty: the chunk is removed).
+        mesh: Arc<ChunkMesh>,
+    },
+    /// Removes a chunk ([`VoxelRenderer::remove_chunk`]).
+    Remove {
+        /// Its id.
+        id: u64,
+    },
 }
 
 /// Per-frame camera input of the renderer (camera-relative).
@@ -147,21 +151,22 @@ impl ViewParams {
 pub struct RenderStats {
     /// Resident chunks.
     pub chunks: u32,
-    /// Arena entries in use: the quads of every resident chunk plus their light palettes.
+    /// Page entries in use: the quads of every resident chunk plus their light palettes.
     pub arena_used_quads: u32,
-    /// Arena capacity: `RendererConfig::arena_quads`, cut to the device's buffer limits.
+    /// Quads the pages hold ([`ChunkMemoryStats::capacity_quads`]).
     pub arena_capacity_quads: u32,
-    /// Chunk table capacity: `RendererConfig::max_chunk_slots`, cut to the device's limits.
+    /// Chunk table capacity: [`ChunkMemorySettings::initial_slots`], cut to the device's
+    /// limits.
     pub chunk_slot_capacity: u32,
     /// Chunks passing CPU culling (Mid/Low; High: 0, culling is on the GPU).
     pub visible_chunks: u32,
-    /// Draw calls recorded (High: 2 multi-draws, opaque + cutout, plus one draw per visible
-    /// chunk with translucent quads).
+    /// Draw calls recorded (High: 2 multi-draws, opaque + cutout, per page holding chunks, plus
+    /// one draw per visible chunk with translucent quads).
     pub draws: u32,
-    /// Chunks not resident because the arena or the chunk table was full (cumulative). Non-zero
-    /// means holes in the world: raise `arena_quads`/`max_chunk_slots` or the view distance is
-    /// too large for them (M1 adds arena growth). Buckets skipped by a full High draw list are
-    /// not counted (see [`RendererConfig::max_chunk_slots`]).
+    /// Chunks not resident because no page could take them or the chunk table was full
+    /// (cumulative). Non-zero means holes in the world: raise
+    /// [`ChunkMemorySettings::initial_quads`] or `initial_slots`, or the view distance is too
+    /// large for them.
     pub dropped_chunks: u32,
     /// Resident chunks inside the GPU window that cave culling hides this frame (ADR 0022): the
     /// world's visibility search did not reach them, because they are behind closed rock or
@@ -208,13 +213,15 @@ pub struct RenderStats {
     pub lod_arena_used_quads: u32,
     /// LOD arena size in quads: `LodSettings::arena_quads`, cut to the device's limits.
     pub lod_arena_capacity_quads: u32,
+    /// Chunk memory: pages, use, bytes (ADR 0035).
+    pub chunk_memory: ChunkMemoryStats,
 }
 
 /// Renderer errors.
 #[derive(Debug, thiserror::Error)]
 pub enum RendererError {
-    /// The arena cannot fit the mesh (M0: no growth; the chunk is skipped and logged once).
-    #[error("quad arena full ({needed} quads requested)")]
+    /// No page can take the mesh (the chunk keeps its older mesh, if any; logged).
+    #[error("chunk memory full ({needed} quads requested)")]
     ArenaFull {
         /// Quads requested.
         needed: u32,
@@ -242,12 +249,23 @@ pub struct VoxelRenderer {
     view_buffer: wgpu::Buffer,
     /// Group 1: `View` uniform.
     view_bind_group: wgpu::BindGroup,
-    arena: QuadArena,
+    /// The pages, CPU side: placement and use (ADR 0035).
+    memory: ChunkMemory,
+    /// The pages, GPU side (Low's light pages and High/Mid's group 2 included).
+    pages: PageSet,
+    /// Page size, chunks a page, the floor and the ceiling of this renderer.
+    layout: MemoryLayout,
+    /// Pages with High draw lists (`View::counts.y` on every tier).
+    list_pages: u32,
     chunks: ChunkTable,
     /// GPU chunk table (High/Mid).
     chunk_buffer: Option<wgpu::Buffer>,
-    /// Low: the light palette entry of each arena quad, at the quad's offset (vertex slot 1).
-    low_light: Option<wgpu::Buffer>,
+    /// Scratch of the upload sink.
+    copies: Vec<(crate::memory::MemTarget, u64, u64, u64)>,
+    /// Bytes [`VoxelRenderer::render`] clears at most a frame (by adapter class).
+    clear_budget: u64,
+    /// The buffers of the allocation probe ([`VoxelRenderer::debug_alloc_probe`]).
+    probe: Vec<ProbeBuffer>,
     /// Meshes (and, through `chunks`, table entries) waiting for the next `render`.
     uploads: Uploads,
     /// Keeps each chunk's translucent bucket in back-to-front order for the camera.
@@ -257,12 +275,7 @@ pub struct VoxelRenderer {
     path: Box<dyn TierPath + Send + Sync>,
     targets: Targets,
     blit: Blit,
-    /// Opaque draw-list capacity (High; also written to `View::counts.y` on every tier).
-    cap_opaque: u32,
-    /// Cutout draw-list capacity.
-    cap_cutout: u32,
     stats: RenderStats,
-    warned_list_overflow: bool,
     /// Cave culling: the visible set of the frame and its bits per slot.
     occlusion: Occlusion,
     /// Chunks whose last upload was refused (cave culling must see through them).
@@ -305,8 +318,8 @@ pub struct ResetState {
     pub chunks: usize,
     /// Highest live table slot + 1.
     pub slots: u32,
-    /// Arena quads allocated.
-    pub arena_used: u32,
+    /// Chunk memory quads allocated.
+    pub arena_used: u64,
     /// Chunks refused.
     pub refused: usize,
     /// Refusal changes not taken yet.
@@ -319,7 +332,7 @@ pub struct ResetState {
     pub occlusion_set: bool,
 }
 
-/// The chunks whose last upload [`VoxelRenderer::upsert_chunk`] refused (chunk table or arena
+/// The chunks whose last upload [`VoxelRenderer::upsert_chunk`] refused (chunk table or pages
 /// full). The world takes them for drawn with that mesh, but the renderer shows an older mesh or
 /// nothing there, and where their faces are missing the rock around them shows what lies behind
 /// it: cave culling must see through them (ADR 0022). Their changes go to the world
@@ -498,7 +511,7 @@ impl VoxelRenderer {
     /// Creates every GPU resource for `tier` inside Validation/Internal/OOM error scopes
     /// (`boxel_gfx::run_in_error_scopes`, nested scopes are fine): block texture array (from
     /// `textures`: [`crate::generate_block_textures`] or [`crate::load_block_textures`]),
-    /// sampler, view uniform, quad arena, chunk table (High/Mid) / CPU table (all), shared quad index buffer (`[0,1,2,2,1,3] + 4i` for `MAX_QUADS_PER_BUCKET`
+    /// sampler, view uniform, the floor pages of chunk quads (ADR 0035), chunk table (High/Mid) / CPU table (all), shared quad index buffer (`[0,1,2,2,1,3] + 4i` for `MAX_QUADS_PER_BUCKET`
     /// quads, u32; High/Mid), the tier's opaque and cutout pipelines (+ cull on High), main color
     /// (`MAIN_COLOR_FORMAT`, `RENDER_ATTACHMENT | COPY_SRC | TEXTURE_BINDING`) and depth targets
     /// of `size`, and the blit pipeline for `output_format` (`fs_blit` if sRGB, else
@@ -558,48 +571,28 @@ impl VoxelRenderer {
             mapped_at_creation: false,
         });
 
-        // Slots and arena sized from the device limits.
-        let storage_limit = limits
-            .max_storage_buffer_binding_size
-            .min(limits.max_buffer_size);
-        let mut slots = config.max_chunk_slots.clamp(1, MAX_SLOTS);
-        if tier == Tier::High {
-            slots = slots.min(
-                bindings::CULL_WORKGROUP_SIZE
-                    .saturating_mul(limits.max_compute_workgroups_per_dimension),
-            );
-        }
-        if tier >= Tier::Mid {
-            slots = slots.min(u32::try_from(storage_limit / CHUNK_GPU_BYTES).unwrap_or(u32::MAX));
-        }
-        let slots = slots.max(1);
-        let arena_limit = if tier >= Tier::Mid {
-            storage_limit
-        } else {
-            limits.max_buffer_size
-        };
-        let arena_quads = u64::from(config.arena_quads)
-            .min(arena_limit / QUAD_BYTES)
-            .max(1) as u32;
-        let arena = QuadArena::new(device, arena_quads, 2 * slots + 4);
-        let low_light = (tier == Tier::Low).then(|| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("boxel low light"),
-                size: u64::from(arena_quads) * QUAD_BYTES,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        });
+        // Chunk memory sized from the settings and the device limits (ADR 0035).
+        let layout = MemoryLayout::resolve(&config.chunk_memory, DeviceFacts::of(device, tier));
+        let slots = layout.slots;
         let chunk_buffer = (tier >= Tier::Mid).then(|| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("boxel chunk table"),
                 size: u64::from(slots) * CHUNK_GPU_BYTES,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                // `COPY_SRC`: a larger table starts as a copy of this one (ADR 0035).
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             })
         });
-        let cap_opaque = (6 * slots).min(bindings::MAX_DRAWS_PER_LIST);
-        let cap_cutout = slots.min(bindings::MAX_DRAWS_PER_LIST);
+        tracing::info!(
+            "chunk memory: {} floor page(s) of {} quads, {} chunks a page, {slots} slots, \
+             ceiling {} quads",
+            layout.floor.len(),
+            layout.page_quads,
+            layout.page_chunks,
+            layout.ceiling_quads
+        );
 
         let TierPipelines {
             layouts,
@@ -629,35 +622,41 @@ impl VoxelRenderer {
             }],
         });
 
+        let memory = ChunkMemory::with_floor(&layout);
+        // Every page id below this has its High lists (the floor never changes yet).
+        let list_pages = memory.id_span().max(1);
+        let mut pages = PageSet::default();
+        let geometry = layouts.geometry.as_ref().zip(chunk_buffer.as_ref());
+        if tier >= Tier::Mid && geometry.is_none() {
+            return Err("internal: missing geometry resources".to_string());
+        }
+        for (id, page) in memory.pages() {
+            let quads = page.alloc.capacity();
+            pages.insert(id, create_page(device, tier, id, quads, geometry));
+        }
+
         let mut lod_index = None;
-        let path: Box<dyn TierPath + Send + Sync> = if let Some(light) = &low_light {
-            Box::new(LowPath::new(voxel, light.clone()))
-        } else {
-            let (Some(geometry_layout), Some(chunk_buffer)) =
-                (layouts.geometry.as_ref(), chunk_buffer.as_ref())
-            else {
-                return Err("internal: missing geometry resources".to_string());
-            };
-            let geometry =
-                geometry_bind_group(device, geometry_layout, arena.buffer(), chunk_buffer);
-            let index = quad_index_buffer(device);
-            lod_index = cull.is_some().then(|| index.clone());
-            match cull {
-                Some(cull) => Box::new(HighPath::new(
-                    device,
-                    voxel,
-                    cull,
-                    HighInputs {
-                        view: &view_buffer,
-                        chunks: chunk_buffer,
-                        geometry,
-                        index,
-                        cap_opaque,
-                        cap_cutout,
-                        slots,
-                    },
-                )),
-                None => Box::new(MidPath::new(device, voxel, geometry, index, slots)),
+        let path: Box<dyn TierPath + Send + Sync> = match (tier, chunk_buffer.as_ref()) {
+            (Tier::Low, _) | (_, None) => Box::new(LowPath::new(voxel)),
+            (_, Some(chunk_buffer)) => {
+                let index = quad_index_buffer(device);
+                lod_index = cull.is_some().then(|| index.clone());
+                match cull {
+                    Some(cull) => Box::new(HighPath::new(
+                        device,
+                        voxel,
+                        cull,
+                        HighInputs {
+                            view: &view_buffer,
+                            chunks: chunk_buffer,
+                            index,
+                            pages: list_pages,
+                            stride: layout.stride(),
+                            slots,
+                        },
+                    )),
+                    None => Box::new(MidPath::new(device, voxel, index, slots)),
+                }
             }
         };
 
@@ -675,19 +674,21 @@ impl VoxelRenderer {
             view_buffer,
             view_bind_group,
             stats: RenderStats::default(),
-            arena,
+            clear_budget: clear_budget(device.adapter_info().device_type),
+            memory,
+            pages,
+            layout,
+            list_pages,
             chunks: ChunkTable::new(slots),
             chunk_buffer,
-            low_light,
+            copies: Vec::new(),
+            probe: Vec::new(),
             uploads: Uploads::default(),
             sorter: TranslucentSorter::new(config.translucent_sort),
             sorted: Vec::new(),
             path,
             targets,
             blit,
-            cap_opaque,
-            cap_cutout,
-            warned_list_overflow: false,
             occlusion: Occlusion::default(),
             refused: Refused::default(),
             outline,
@@ -1043,10 +1044,12 @@ impl VoxelRenderer {
     /// more away from it on some axis, the chunk stays resident but no tier draws it (its wrapped
     /// origin difference may not be exact). Empty meshes remove the chunk.
     ///
-    /// The chunk's arena range holds its quads and then its light palette (High and Mid read it
-    /// there; Low gets each quad's entry in a parallel buffer). Every quad's light index should
-    /// be inside the palette (the mesher guarantees it; debug-asserted). A mesh without a
-    /// palette, or a quad whose index is past it, is lit as open sky on every tier.
+    /// The chunk's range in its page holds its quads and then its light palette (High and Mid
+    /// read it there; Low gets each quad's entry in a parallel light page). Every quad's light
+    /// index should be inside the palette (the mesher guarantees it; debug-asserted). A mesh
+    /// without a palette, or a quad whose index is past it, is lit as open sky on every tier.
+    /// The page is chosen the same way on every tier (ADR 0035): the chunk's own page, the
+    /// pages of its class (with or without translucent quads), its own range, the other class.
     ///
     /// Chunk changes stay on the CPU until the next [`VoxelRenderer::render`], which records all
     /// of them at the start of its encoder (one staging buffer for the whole frame). Until then
@@ -1061,12 +1064,6 @@ impl VoxelRenderer {
             self.remove_chunk(id);
             return Ok(());
         }
-        let pos = ChunkPos::from_i64vec3(origin >> CHUNK_SHIFT);
-        if self.chunks.slot_for(id).is_none() {
-            self.stats.dropped_chunks += 1;
-            self.refused.refuse(id, pos, false);
-            return Err(RendererError::ChunkTableFull(self.chunks.capacity()));
-        }
         debug_assert!(
             mesh.palette.is_empty()
                 || mesh
@@ -1075,51 +1072,48 @@ impl VoxelRenderer {
                     .all(|q| usize::from(q.light_index()) < mesh.palette.len()),
             "a quad's light index is outside its palette"
         );
-        let needed = arena_len(&mesh);
-        let old = self.chunks.get(id).map(|(_, r)| r.alloc);
-        let Some(alloc) = self.arena.alloc.replace(old, needed) else {
-            // Nothing changed: a resident chunk keeps its old mesh (range and slot untouched),
-            // and goes on drawing it.
-            self.stats.dropped_chunks += 1;
-            self.refused.refuse(id, pos, old.is_some());
-            return Err(RendererError::ArenaFull { needed });
-        };
-        let record = ChunkRecord {
+        let pos = ChunkPos::from_i64vec3(origin >> CHUNK_SHIFT);
+        match upsert_resident(
+            &mut self.memory,
+            &mut self.chunks,
+            &mut self.uploads,
             id,
             origin,
-            alloc,
-            counts: bucket_counts(&mesh),
-            light_base: alloc.offset + mesh.total_quads(),
-            light_len: light_entries(&mesh),
-        };
-        if self.chunks.insert(record).is_none() {
-            // unreachable: `slot_for` succeeded above, so this is a new chunk (no old range)
-            self.arena.alloc.free(alloc);
-            self.stats.dropped_chunks += 1;
-            self.refused.refuse(id, pos, false);
-            return Err(RendererError::ChunkTableFull(self.chunks.capacity()));
+            &mesh,
+        ) {
+            Ok(()) => {
+                self.refused.shown(id);
+                self.sorter.upsert(id, origin, mesh);
+                Ok(())
+            }
+            Err(Refusal::Table) => {
+                self.stats.dropped_chunks += 1;
+                self.refused.refuse(id, pos, false);
+                Err(RendererError::ChunkTableFull(self.chunks.capacity()))
+            }
+            Err(Refusal::Pages { needed, resident }) => {
+                // Nothing changed: a resident chunk keeps its old mesh (range and slot
+                // untouched), and goes on drawing it.
+                self.stats.dropped_chunks += 1;
+                self.refused.refuse(id, pos, resident);
+                Err(RendererError::ArenaFull { needed })
+            }
         }
-        self.refused.shown(id);
-        self.sorter.upsert(id, origin, Arc::clone(&mesh));
-        self.uploads.mesh(id, alloc.offset, mesh);
-        Ok(())
     }
     /// Removes a chunk; returns false if unknown. Reaches the GPU with the next `render`.
     pub fn remove_chunk(&mut self, id: u64) -> bool {
         self.refused.shown(id);
-        let Some((_, record)) = self.chunks.remove(id) else {
+        if !remove_resident(&mut self.memory, &mut self.chunks, &mut self.uploads, id) {
             return false;
-        };
-        self.arena.alloc.free(record.alloc);
-        self.uploads.forget(id);
+        }
         self.sorter.remove(id);
         true
     }
-    /// Removes every chunk. Reaches the GPU with the next `render`.
+    /// Removes every chunk. Reaches the GPU with the next `render`. The pages stay.
     pub fn clear_chunks(&mut self) {
         self.refused.clear();
         self.chunks.clear();
-        self.arena.alloc.reset();
+        self.memory.reset();
         self.uploads.clear();
         self.sorter.clear();
     }
@@ -1143,13 +1137,51 @@ impl VoxelRenderer {
         ResetState {
             chunks: self.chunks.len(),
             slots: self.chunks.slot_count(),
-            arena_used: self.arena.alloc.used(),
+            arena_used: self.memory.used(),
             refused: self.refused.by_id.len(),
             refused_changes: self.refused.changes.len() + self.refused.undrawn.len(),
             pending_uploads: self.uploads.pending_len(),
             sorted_chunks: self.sorter.len(),
             occlusion_set: self.occlusion.set.is_some(),
         }
+    }
+    /// One frame's chunk changes, as the render plugin applies them before each frame (GPU tests
+    /// call it to run the plugin's exact sequence): first the clear `resync` asks for
+    /// ([`Resync::Chunks`]: [`VoxelRenderer::clear_chunks`], for a new renderer, lost uploads or
+    /// a rejected frame; [`Resync::World`]: [`VoxelRenderer::clear_world`], the world closed),
+    /// after which `ops` holds every chunk again; then each op in order. Returns the refusals
+    /// (each also counted in [`RenderStats::dropped_chunks`] and reported by
+    /// [`VoxelRenderer::take_refused`]). `device` is where pages for the frame's meshes will be
+    /// created once chunk memory grows (#57 M2); today the floor is all there is.
+    pub fn apply_ops(
+        &mut self,
+        device: &wgpu::Device,
+        ops: impl IntoIterator<Item = ChunkOp>,
+        resync: Resync,
+    ) -> Vec<RendererError> {
+        match resync {
+            Resync::None => {}
+            Resync::Chunks => self.clear_chunks(),
+            Resync::World => self.clear_world(device),
+        }
+        let mut errors = Vec::new();
+        for op in ops {
+            let result = match op {
+                ChunkOp::Upsert { id, origin, mesh } => {
+                    let _span = frame_span!("render.upsert");
+                    self.upsert_chunk(id, origin, mesh)
+                }
+                ChunkOp::Remove { id } => {
+                    let _span = frame_span!("render.remove");
+                    self.remove_chunk(id);
+                    Ok(())
+                }
+            };
+            if let Err(e) = result {
+                errors.push(e);
+            }
+        }
+        errors
     }
     /// How the translucent quads inside each chunk are sorted ([`RendererConfig::translucent_sort`]).
     pub fn translucent_sort(&self) -> TranslucentSort {
@@ -1219,6 +1251,13 @@ impl VoxelRenderer {
         });
         let cull_view = cull_view.as_ref().unwrap_or(view);
         {
+            // Chunk memory's work between frames (ADR 0035): today the page counts the draws
+            // read and the allocation probe's clears.
+            let _span = frame_span!("render.pages");
+            self.pages.sync(&self.memory);
+            self.clear_probe(encoder);
+        }
+        {
             let _span = frame_span!("render.textures");
             self.animator
                 .update(queue, &self.block_texture, view.texture_tick);
@@ -1228,31 +1267,23 @@ impl VoxelRenderer {
             self.sorter
                 .update(&self.chunks, cull_view, &mut self.sorted);
             for sorted in self.sorted.drain(..) {
-                let Some((_, record)) = self.chunks.get(sorted.id) else {
-                    continue;
-                };
-                // A trimmed bucket (malformed mesh) keeps the mesher's order.
-                if record.counts[TRANSLUCENT_BUCKET] as usize != sorted.quads.len() {
-                    continue;
-                }
-                let start: u32 = record.counts[..TRANSLUCENT_BUCKET].iter().sum();
-                self.uploads.sorted(
-                    sorted.id,
-                    record.alloc.offset + start,
-                    sorted.mesh,
-                    sorted.quads,
-                );
+                self.uploads.sorted_bucket(&self.chunks, sorted);
             }
         }
         {
             let _span = frame_span!("render.upload");
-            let targets = UploadTargets {
-                arena: self.arena.buffer(),
+            let mut sink = GpuSink {
+                device,
+                encoder,
+                pages: &self.pages,
                 table: self.chunk_buffer.as_ref(),
-                low_light: self.low_light.as_ref(),
+                copies: &mut self.copies,
             };
-            self.uploads
-                .flush(device, encoder, targets, &mut self.chunks);
+            let kinds = UploadKinds {
+                table: self.chunk_buffer.is_some(),
+                low_light: self.tier == Tier::Low,
+            };
+            self.uploads.flush(&mut sink, &mut self.chunks, kinds);
         }
         debug_assert!(self.chunks.is_synced());
         let slot_count = self.chunks.slot_count();
@@ -1280,8 +1311,8 @@ impl VoxelRenderer {
             ]),
             counts: [
                 slot_count,
-                self.cap_opaque,
-                self.cap_cutout,
+                self.list_pages,
+                self.layout.stride(),
                 u32::from(culled),
             ],
             sky_light,
@@ -1327,7 +1358,7 @@ impl VoxelRenderer {
                 let mut pass = self.targets.begin_main_pass(encoder, view.clear_color);
                 pass.set_bind_group(bindings::GROUP_MATERIALS, &self.materials, &[]);
                 pass.set_bind_group(bindings::GROUP_VIEW, &self.view_bind_group, &[]);
-                self.path.draw_solid(&mut pass, self.arena.buffer())
+                self.path.draw_solid(&mut pass, &self.pages)
             };
             {
                 let _span = frame_span!("render.lod");
@@ -1344,12 +1375,12 @@ impl VoxelRenderer {
             // The far water (one layer, a depth prepass then its color) before the near water,
             // which blends over it where it is in front.
             lod.draw_water(&mut pass);
-            solid + self.path.draw_translucent(&mut pass, self.arena.buffer())
+            solid + self.path.draw_translucent(&mut pass, &self.pages)
         } else {
             let mut pass = self.targets.begin_main_pass(encoder, view.clear_color);
             pass.set_bind_group(bindings::GROUP_MATERIALS, &self.materials, &[]);
             pass.set_bind_group(bindings::GROUP_VIEW, &self.view_bind_group, &[]);
-            let solid = self.path.draw_solid(&mut pass, self.arena.buffer());
+            let solid = self.path.draw_solid(&mut pass, &self.pages);
             // The far LOD right after the near terrain (early-Z rejects it behind hills) and
             // before the water, which writes no depth (counted apart, in `lod_draws`).
             if let Some(lod) = &self.lod {
@@ -1362,7 +1393,7 @@ impl VoxelRenderer {
             if let Some(lod) = &self.lod {
                 lod.draw_water(&mut pass);
             }
-            solid + self.path.draw_translucent(&mut pass, self.arena.buffer())
+            solid + self.path.draw_translucent(&mut pass, &self.pages)
         };
         (self.stats.fog_passes, self.stats.fog_layers) = match &mut self.fog {
             Some(fog) => {
@@ -1388,21 +1419,7 @@ impl VoxelRenderer {
         self.stats.visible_chunks = visible;
         self.stats.draws = draws;
         self.stats.occluded_chunks = hidden;
-        // Only chunks inside the window take draws: the old area still resident after a
-        // teleport does not count (it would warn falsely, and only once), nor do the chunks cave
-        // culling hides.
-        let drawable = (self.chunks.drawable_len() as u64).saturating_sub(u64::from(hidden));
-        if self.tier == Tier::High
-            && 6 * drawable > u64::from(self.cap_opaque)
-            && !self.warned_list_overflow
-        {
-            self.warned_list_overflow = true;
-            tracing::warn!(
-                "{drawable} chunks may need more than {} opaque indirect draws: past that, High \
-                 skips arbitrary buckets, not the farthest (draw lists are not segmented until M3)",
-                self.cap_opaque
-            );
-        }
+        self.stats.chunk_memory.translucent_page_switches = self.path.translucent_page_switches();
     }
     /// Encodes the fullscreen blit of the main color target into `target`.
     pub fn blit(&self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
@@ -1418,17 +1435,159 @@ impl VoxelRenderer {
     }
     /// Last frame counters.
     pub fn stats(&self) -> RenderStats {
+        let memory = self.chunk_memory();
         RenderStats {
             chunks: self.chunks.len() as u32,
-            arena_used_quads: self.arena.alloc.used(),
-            arena_capacity_quads: self.arena.alloc.capacity(),
+            arena_used_quads: u32::try_from(memory.used_quads).unwrap_or(u32::MAX),
+            arena_capacity_quads: u32::try_from(memory.capacity_quads).unwrap_or(u32::MAX),
             chunk_slot_capacity: self.chunks.capacity(),
+            chunk_memory: memory,
             translucent_sorts: self.sorter.stats().sorts,
             translucent_sorted_quads: self.sorter.stats().quads,
             texture_layer_uploads: self.animator.counters.layers,
             texture_upload_bytes: self.animator.counters.bytes,
             textures_behind: self.animator.counters.behind,
             ..self.lod_stats(self.stats)
+        }
+    }
+
+    /// Chunk memory now: pages, use and bytes (ADR 0035).
+    pub fn chunk_memory(&self) -> ChunkMemoryStats {
+        let translucent_pages = self
+            .memory
+            .pages()
+            .filter(|(_, p)| p.class == PageClass::Translucent)
+            .count() as u32;
+        ChunkMemoryStats {
+            pages: self.memory.pages().count() as u32,
+            translucent_pages,
+            used_quads: self.memory.used(),
+            capacity_quads: self.memory.capacity(),
+            ceiling_quads: self.layout.ceiling_quads,
+            ceiling_slots: self.layout.ceiling_slots,
+            largest_free_quads: self.memory.largest_free(),
+            page_bytes: self.pages.bytes(),
+            table_bytes: self.chunk_buffer.as_ref().map_or(0, wgpu::Buffer::size),
+            list_bytes: if self.tier == Tier::High {
+                list_bytes(self.list_pages, self.layout.stride())
+            } else {
+                0
+            },
+            translucent_page_switches: self.stats.chunk_memory.translucent_page_switches,
+            cpu_bytes: self.memory.cpu_bytes(),
+        }
+    }
+
+    /// Testing: the bytes of page `id` (with `light`, of its Low light page), from quad
+    /// `offset`, `quads` of them (waits for the GPU).
+    #[doc(hidden)]
+    pub fn debug_read_page(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        id: u16,
+        light: bool,
+        range: std::ops::Range<u32>,
+    ) -> Result<Vec<u8>, String> {
+        let page = self.pages.get(id).ok_or_else(|| format!("no page {id}"))?;
+        let buffer = if light {
+            page.light.as_ref().ok_or("no light page (not Low)")?
+        } else {
+            &page.quads
+        };
+        crate::memory::read_buffer(
+            device,
+            queue,
+            buffer,
+            u64::from(range.start) * QUAD_BYTES,
+            u64::from(range.end.saturating_sub(range.start)) * QUAD_BYTES,
+        )
+    }
+
+    /// Testing: where chunk `id` lives, `(page, first quad, quads with its palette)`.
+    #[doc(hidden)]
+    pub fn debug_chunk_range(&self, id: u64) -> Option<(u16, u32, u32)> {
+        self.chunks
+            .get(id)
+            .map(|(_, r)| (r.alloc.page, r.alloc.alloc.offset, r.alloc.alloc.size))
+    }
+
+    /// Testing (High): the opaque and cutout draws the last frame's cull wrote, per page with
+    /// lists (waits for the GPU); `None` on Mid and Low.
+    #[doc(hidden)]
+    pub fn debug_high_draw_counts(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Option<Result<Vec<[u32; 2]>, String>> {
+        self.path.debug_draw_counts(device, queue)
+    }
+
+    /// Testing (the M0 probe of ADR 0035): creates one buffer of `mib` MiB with the usages of a
+    /// page, timed, and reports whether the GPU allocator needed a new memory block for it. Later
+    /// frames clear the probe's buffers within the clear budget, as a new page will be; `mib = 0`
+    /// drops them all. The render plugin calls it right after present, where pages will be
+    /// created ([`crate::DebugAllocProbe`]).
+    #[doc(hidden)]
+    pub fn debug_alloc_probe(&mut self, device: &wgpu::Device, mib: u32) -> AllocProbeReport {
+        let report = |device: &wgpu::Device| {
+            device
+                .generate_allocator_report()
+                .map(|r| (r.blocks.len(), r.total_reserved_bytes))
+        };
+        if mib == 0 {
+            let before = report(device);
+            self.probe.clear();
+            let after = report(device);
+            return AllocProbeReport {
+                mib,
+                create: Duration::ZERO,
+                blocks: before.zip(after).map(|(b, a)| (b.0, a.0)),
+                reserved: before.zip(after).map(|(b, a)| (b.1, a.1)),
+                buffers: 0,
+            };
+        }
+        let before = report(device);
+        let start = Instant::now();
+        let copies = wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
+        let usage = if self.tier >= Tier::Mid {
+            wgpu::BufferUsages::STORAGE | copies
+        } else {
+            wgpu::BufferUsages::VERTEX | copies
+        };
+        let buffer = {
+            let _span = frame_span!("render.page_create");
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("boxel alloc probe"),
+                size: u64::from(mib) << 20,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        let create = start.elapsed();
+        let after = report(device);
+        self.probe.push(ProbeBuffer { buffer, cleared: 0 });
+        AllocProbeReport {
+            mib,
+            create,
+            blocks: before.zip(after).map(|(b, a)| (b.0, a.0)),
+            reserved: before.zip(after).map(|(b, a)| (b.1, a.1)),
+            buffers: self.probe.len(),
+        }
+    }
+
+    /// Records the probe's clears of this frame, within the clear budget.
+    fn clear_probe(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        let mut budget = self.clear_budget;
+        for probe in &mut self.probe {
+            let left = probe.buffer.size() - probe.cleared;
+            let n = left.min(budget);
+            if n == 0 {
+                continue;
+            }
+            encoder.clear_buffer(&probe.buffer, probe.cleared, Some(n));
+            probe.cleared += n;
+            budget -= n;
         }
     }
 
@@ -1504,25 +1663,37 @@ pub(crate) fn far_plane_at(frustum: &mut Frustum, eye: Vec3, distance: f32) {
     frustum.set_max_distance(eye, forward, distance);
 }
 
-/// Bucket counts of `mesh` (see [`trim_counts`]).
-fn bucket_counts(mesh: &ChunkMesh) -> [u32; BUCKET_COUNT] {
-    debug_assert_eq!(
-        mesh.bucket_counts.iter().sum::<u32>(),
-        mesh.total_quads(),
-        "bucket counts do not match the quads"
-    );
-    trim_counts(mesh.bucket_counts, mesh.total_quads())
+/// Bytes [`VoxelRenderer::render`] clears at most in one frame on an adapter of `class` (ADR 0035):
+/// 32 MiB on a discrete GPU, 8 MiB on an integrated one, 4 MiB otherwise.
+fn clear_budget(class: wgpu::DeviceType) -> u64 {
+    match class {
+        wgpu::DeviceType::DiscreteGpu => 32 << 20,
+        wgpu::DeviceType::IntegratedGpu => 8 << 20,
+        _ => 4 << 20,
+    }
 }
 
-/// Trims bucket counts from the last bucket so they never cover more than `total` quads (a
-/// malformed mesh must not make draws read other chunks' quads).
-fn trim_counts(mut counts: [u32; BUCKET_COUNT], total: u32) -> [u32; BUCKET_COUNT] {
-    let mut left = total;
-    for c in &mut counts {
-        *c = (*c).min(left);
-        left -= *c;
-    }
-    counts
+/// A buffer of the allocation probe, cleared a slice a frame.
+struct ProbeBuffer {
+    buffer: wgpu::Buffer,
+    /// Bytes cleared so far.
+    cleared: u64,
+}
+
+/// What one call of [`VoxelRenderer::debug_alloc_probe`] saw.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AllocProbeReport {
+    /// MiB created (0: the probe's buffers were dropped).
+    pub mib: u32,
+    /// Time `create_buffer` took.
+    pub create: Duration,
+    /// Memory blocks of the GPU allocator before and after (`None`: the backend has no report).
+    pub blocks: Option<(usize, usize)>,
+    /// Bytes the GPU allocator reserved before and after.
+    pub reserved: Option<(u64, u64)>,
+    /// Probe buffers alive after the call.
+    pub buffers: usize,
 }
 
 /// Block texture array (layer-major upload, full mip chain), its `D2Array` view and the block
@@ -1646,6 +1817,8 @@ mod tests {
     #[test]
     fn occlusion_bits_follow_the_set_and_the_slots() {
         use crate::arena::ArenaAllocator;
+        use crate::chunk_table::ChunkRecord;
+        use crate::memory::PagedAlloc;
         use boxel_math::I64Vec3;
         use boxel_world::VisibilityView;
         use boxel_world::visibility::visible_chunks;
@@ -1656,7 +1829,7 @@ mod tests {
             table.insert(ChunkRecord {
                 id,
                 origin: chunk << 5,
-                alloc,
+                alloc: PagedAlloc { page: 0, alloc },
                 counts: [1, 0, 0, 0, 0, 0, 0, 0],
                 light_base: alloc.offset + 1,
                 light_len: 1,
@@ -1802,6 +1975,7 @@ mod tests {
 
     #[test]
     fn bucket_counts_never_exceed_the_quads() {
+        use crate::memory::trim_counts;
         let counts = [2, 0, 0, 0, 0, 0, 3, 0];
         assert_eq!(trim_counts(counts, 5), counts);
         assert_eq!(

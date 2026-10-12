@@ -60,6 +60,7 @@ const APP_WIDE: &[&str] = &[
     "boxel_ecs::entity_disabling::DefaultQueryFilters",
     "boxel_ecs::message::message_registry::MessageRegistry",
     "boxel_ecs::message::messages::Messages<boxel_app::app::AppExit>",
+    "boxel_ecs::message::messages::Messages<boxel_render::plugin::DebugAllocProbe>",
     "boxel_ecs::message::messages::Messages<boxel_render::plugin::DebugDestroyDevice>",
     "boxel_ecs::message::messages::Messages<boxel_render::plugin::GpuFailed>",
     "boxel_ecs::message::messages::Messages<boxel_render::plugin::GpuReady>",

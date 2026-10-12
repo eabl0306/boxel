@@ -60,6 +60,11 @@ pollster.workspace = true
 boxel_render = { path = ".", features = ["ui"] }
 boxel_ui.workspace = true
 proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "chunk_memory"
+harness = false
 
 [lints]
 workspace = true

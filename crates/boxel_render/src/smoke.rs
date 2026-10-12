@@ -1,3 +1,4 @@
+use crate::memory::ChunkMemorySettings;
 use crate::path::TierPipelines;
 use crate::renderer::{DEFAULT_SKY_COLOR, RendererConfig, ViewParams, VoxelRenderer};
 use crate::sort::TranslucentSort;
@@ -178,8 +179,12 @@ fn compile(ctx: &SmokeContext<'_>, smoke: &RendererSmokeTest) -> Result<(), Stri
 /// A real renderer drawing one opaque and one cutout quad under a camera looking down.
 fn draw(ctx: &SmokeContext<'_>, smoke: &RendererSmokeTest) -> Result<(), String> {
     let config = RendererConfig {
-        arena_quads: 1024,
-        max_chunk_slots: 8,
+        chunk_memory: ChunkMemorySettings {
+            initial_quads: 1024,
+            initial_slots: 8,
+            grow: false,
+            ..ChunkMemorySettings::default()
+        },
         translucent_sort: TranslucentSort::Inline,
     };
     let registry = smoke_registry();

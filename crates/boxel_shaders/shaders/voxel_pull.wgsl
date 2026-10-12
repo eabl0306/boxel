@@ -1,7 +1,8 @@
-// Tiers High + Mid: vertex pulling from the quad arena (needs DownlevelFlags::VERTEX_STORAGE).
+// Tiers High + Mid: vertex pulling from a page of chunk quads (needs DownlevelFlags::VERTEX_STORAGE).
 // Per-draw data = DrawRef (chunk_slot, quad_start) read as an INSTANCE-STEP vertex attribute at
 // location 0; the draw sets first_instance = DrawRef index, instance_count = 1, base_vertex = 0.
-// The light palette entry of each quad is read from the same arena at ChunkGpu::light_base.
+// Group 2 binds the page of the drawn chunk: quad_start and ChunkGpu::light_base are page-local.
+// The light palette entry of each quad is read from the same page at ChunkGpu::light_base.
 @group(0) @binding(0) var block_textures: texture_2d_array<f32>;
 @group(0) @binding(1) var block_sampler: sampler;
 @group(1) @binding(0) var<uniform> view: View;
@@ -12,7 +13,7 @@
 fn vs_pull(@builtin(vertex_index) vi: u32, @location(0) draw: vec2<u32>) -> VsOut {
   let ch = chunks[draw.x];
   let q = quads[draw.y + (vi >> 2u)];
-  // The chunk's light palette follows its quads in the arena (no extra binding). An index past
+  // The chunk's light palette follows its quads in its page (no extra binding). An index past
   // the palette (only a malformed mesh) reads open sky, as on Low, never another chunk's data.
   let li = (q.y >> MAT_LIGHT_SHIFT) & MAT_LIGHT_MASK;
   let lw = select(FULL_SKY_LIGHT, quads[ch.light_base + min(li, ch.light_len - 1u)], li < ch.light_len);

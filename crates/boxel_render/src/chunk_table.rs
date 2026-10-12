@@ -11,7 +11,7 @@
 //! The table also tracks which slots changed since the GPU copy was last brought up to date
 //! ([`ChunkTable::take_stale_runs`]), so the renderer uploads them once per frame in a few
 //! contiguous runs instead of one write per change.
-use crate::arena::ArenaAlloc;
+use crate::memory::PagedAlloc;
 use boxel_math::{I64Vec3, IVec3, wrap_to_i32};
 use boxel_mesh::{BUCKET_COUNT, TRANSLUCENT_BUCKET};
 use boxel_shaders::gpu::ChunkGpu;
@@ -38,14 +38,14 @@ pub(crate) struct ChunkRecord {
     pub id: u64,
     /// World voxel min corner (`i64`); the culling AABB is `[origin, origin + 32]`.
     pub origin: I64Vec3,
-    /// Arena range of the chunk: the quads of all buckets (bucket 0 first), then its light
-    /// palette.
-    pub alloc: ArenaAlloc,
+    /// The chunk's page and its range there: the quads of all buckets (bucket 0 first), then
+    /// its light palette.
+    pub alloc: PagedAlloc,
     /// Quads per bucket.
     pub counts: [u32; BUCKET_COUNT],
-    /// First light palette entry in the arena: `alloc.offset` + the mesh's quads.
+    /// First light palette entry in the page: `alloc.alloc.offset` + the mesh's quads.
     pub light_base: u32,
-    /// Light palette entries in the arena (at least 1).
+    /// Light palette entries in the page (at least 1).
     pub light_len: u32,
 }
 
@@ -60,12 +60,12 @@ impl ChunkRecord {
     pub fn gpu(&self, live: bool) -> ChunkGpu {
         ChunkGpu {
             origin: self.gpu_origin().to_array(),
-            quad_base: self.alloc.offset,
+            quad_base: self.alloc.alloc.offset,
             counts: self.counts,
             flags: if live { ChunkGpu::FLAG_LIVE } else { 0 },
             light_base: self.light_base,
             light_len: self.light_len,
-            pad: 0,
+            page: u32::from(self.alloc.page),
         }
     }
 }
@@ -94,6 +94,8 @@ pub(crate) struct ChunkTable {
     stale_bits: Vec<u64>,
     /// Slots `0..stale_prefix` are all stale (after `clear` or a window move).
     stale_prefix: u32,
+    /// Highest slot count since the table was made: no slot at or past it was ever written.
+    high_water: u32,
     /// Bumped by every clear and window move: per-slot data derived from the records and the
     /// window (the cave culling bits) must be rebuilt. Smaller changes go to `touched`.
     version: u64,
@@ -117,6 +119,7 @@ impl ChunkTable {
             stale: Vec::new(),
             stale_bits: vec![0; capacity.div_ceil(64) as usize],
             stale_prefix: 0,
+            high_water: 0,
             version: 0,
             touched: Vec::new(),
             touched_bits: vec![0; capacity.div_ceil(64) as usize],
@@ -160,6 +163,7 @@ impl ChunkTable {
 
     /// Live chunks inside the GPU window: the ones a tier may draw. The rest stay resident
     /// (the old area for a few frames after a teleport) but take no draws.
+    #[cfg(test)]
     pub fn drawable_len(&self) -> usize {
         self.drawable
     }
@@ -201,6 +205,7 @@ impl ChunkTable {
         if slot as usize == self.records.len() {
             self.records.push(None);
         }
+        self.high_water = self.high_water.max(slot + 1);
         let old = self.records[slot as usize].replace(record);
         if old.is_some_and(|r| self.in_window(r.origin)) {
             self.drawable -= 1;
@@ -239,11 +244,12 @@ impl ChunkTable {
         Some((slot, record))
     }
 
-    /// Removes every record (the caller resets the arena). The GPU entries of the old slots go
-    /// to zero with the next upload.
+    /// Removes every record (the caller frees the pages). The GPU entries of every slot ever
+    /// written go to zero with the next upload: after a frame that lost its uploads, slots past
+    /// the slot count may still hold old entries.
     pub fn clear(&mut self) {
         self.version += 1;
-        self.mark_all_stale();
+        self.stale_prefix = self.stale_prefix.max(self.high_water);
         self.records.clear();
         self.free.clear();
         self.translucent.clear();
@@ -377,7 +383,7 @@ mod tests {
         ChunkRecord {
             id,
             origin: I64Vec3::new(id as i64 * 32, 0, 0),
-            alloc,
+            alloc: PagedAlloc { page: 0, alloc },
             counts,
             // 3 quads, then 1 palette entry
             light_base: alloc.offset + 3,
@@ -455,11 +461,16 @@ mod tests {
         let r = record(&mut arena, 3);
         let gpu = r.gpu(true);
         assert_eq!(gpu.origin, [96, 0, 0]);
-        assert_eq!(gpu.quad_base, r.alloc.offset);
+        assert_eq!(gpu.quad_base, r.alloc.alloc.offset);
         assert_eq!(gpu.counts, r.counts);
         assert_eq!(gpu.flags, ChunkGpu::FLAG_LIVE);
-        assert_eq!(gpu.light_base, r.alloc.offset + 3);
-        assert_eq!((gpu.light_len, gpu.pad), (1, 0));
+        assert_eq!(gpu.light_base, r.alloc.alloc.offset + 3);
+        assert_eq!((gpu.light_len, gpu.page), (1, 0));
+        let in_page = ChunkRecord {
+            alloc: PagedAlloc { page: 7, ..r.alloc },
+            ..r
+        };
+        assert_eq!(in_page.gpu(true), ChunkGpu { page: 7, ..gpu });
         assert_eq!(r.gpu(false), ChunkGpu { flags: 0, ..gpu });
     }
 
@@ -615,6 +626,31 @@ mod tests {
         );
     }
 
+    /// A frame whose uploads were lost leaves old entries on the GPU, also past the slot
+    /// count; the resync's `clear` zeroes them all.
+    #[test]
+    fn clear_zeroes_what_a_lost_upload_left_behind() {
+        let mut arena = ArenaAllocator::new(1024, 64);
+        let mut table = ChunkTable::new(16);
+        let mut gpu = vec![ChunkGpu::default(); 16];
+        for id in 0..6 {
+            table.insert(record(&mut arena, id));
+        }
+        sync(&mut table, &mut gpu, 0);
+        for id in 2..6 {
+            table.remove(id);
+        }
+        // lost: the runs are taken, nothing reaches the GPU
+        let mut runs = Vec::new();
+        table.take_stale_runs(0, &mut runs);
+        assert_eq!(table.slot_count(), 2);
+        assert!(gpu[5].flags != 0, "slot 5 still live on the GPU");
+        table.clear();
+        assert_eq!(sync(&mut table, &mut gpu, 0), [(0, 6)]);
+        assert_mirrored(&table, &gpu);
+        assert!(gpu.iter().all(|e| *e == ChunkGpu::default()));
+    }
+
     #[test]
     fn stale_runs_cover_changed_slots_and_merge_small_gaps() {
         let mut arena = ArenaAllocator::new(1024, 64);
@@ -645,10 +681,10 @@ mod tests {
         assert_eq!(table.slot_count(), 9);
         assert_eq!(sync(&mut table, &mut gpu, 0), [(9, 10)]);
         assert_mirrored(&table, &gpu);
-        // `clear` zeroes every old slot, also one that went just before it.
+        // `clear` zeroes every slot ever written, also ones that went before it.
         table.remove(8);
         table.clear();
-        assert_eq!(sync(&mut table, &mut gpu, 0), [(0, 9)]);
+        assert_eq!(sync(&mut table, &mut gpu, 0), [(0, 10)]);
         assert_mirrored(&table, &gpu);
         // A window move sends every slot again (the live flags change).
         for id in 0..4 {
@@ -685,14 +721,14 @@ mod tests {
                             let mut r = record(&mut arena, id);
                             r.origin.x += next(3) as i64 * (1 << 31);
                             if let Some((_, old)) = table.get(id) {
-                                arena.free(old.alloc);
+                                arena.free(old.alloc.alloc);
                             }
                             table.insert(r);
                         }
                     }
                     45..85 => {
                         if let Some((_, r)) = table.remove(next(60)) {
-                            arena.free(r.alloc);
+                            arena.free(r.alloc.alloc);
                         }
                     }
                     85..87 => {

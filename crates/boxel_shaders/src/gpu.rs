@@ -160,20 +160,22 @@ pub struct ChunkGpu {
     /// The shaders only use it minus `ViewUniform::render_origin` (wrapping too), which is exact
     /// for chunks less than `2^31` voxels from the camera.
     pub origin: [i32; 3],
-    /// First quad of bucket 0 in the arena (buckets are contiguous, `boxel_mesh` order).
+    /// First quad of bucket 0 in the chunk's page (buckets are contiguous, `boxel_mesh` order).
+    /// Page-local: the draws of a chunk bind its page ([`ChunkGpu::page`]).
     pub quad_base: u32,
     /// Quad counts per bucket: `[0..6)` opaque faces, `[6]` cutout, `[7]` translucent.
     pub counts: [u32; 8],
     /// Bit 0 = [`ChunkGpu::FLAG_LIVE`].
     pub flags: u32,
-    /// First entry of the chunk's light palette in the arena (`quad_base` + total quads): High
+    /// First entry of the chunk's light palette in its page (`quad_base` + total quads): High
     /// and Mid read a quad's 4 corner lights at `light_base` + its palette index.
     pub light_base: u32,
     /// Entries of the chunk's light palette (at least 1). A quad whose index is not below it is
     /// lit as open sky, as on Low and on the CPU, instead of reading another chunk's data.
     pub light_len: u32,
-    /// Padding to 64 bytes (WGSL struct alignment 16).
-    pub pad: u32,
+    /// The page holding the chunk's quads and palette (below [`chunk_memory::MAX_PAGES`]): the
+    /// High cull writes its draws into that page's lists. Keeps the struct at 64 bytes.
+    pub page: u32,
 }
 
 impl ChunkGpu {
@@ -190,7 +192,7 @@ impl ChunkGpu {
 pub struct DrawRef {
     /// Chunk table slot.
     pub chunk_slot: u32,
-    /// First quad of the drawn bucket in the arena.
+    /// First quad of the drawn bucket in its chunk's page.
     pub quad_start: u32,
 }
 
@@ -396,6 +398,20 @@ pub mod lod {
     pub const HIZ_WORKGROUP_EDGE: u32 = 8;
 }
 
+/// Chunk memory in pages (ADR 0035): chunk quads live in several GPU buffers, each one High
+/// draw-list segment.
+pub mod chunk_memory {
+    /// Page ids are below this (`cull.wgsl` keeps two draw counts per page id).
+    pub const MAX_PAGES: u32 = 256;
+    /// Chunks one page holds at most: its 6 face buckets each fit one list of
+    /// [`PAGE_DRAWS_MAX`] draws.
+    pub const PAGE_CHUNKS_MAX: u32 = 10922;
+    /// Opaque draws of one page's list at most (its cutout list holds a sixth).
+    pub const PAGE_DRAWS_MAX: u32 = 6 * PAGE_CHUNKS_MAX;
+}
+
+const _: () = assert!(chunk_memory::PAGE_DRAWS_MAX <= bindings::MAX_DRAWS_PER_LIST);
+const _: () = assert!(chunk_memory::MAX_PAGES <= u16::MAX as u32);
 const _: () = assert!(lod::SEGMENT_DRAWS <= bindings::MAX_DRAWS_PER_LIST);
 const _: () = assert!(size_of::<LodNodeGpu>() == 64);
 
@@ -424,21 +440,21 @@ pub mod bindings {
     /// Group 2 (High/Mid): quad arena (binding 0) + chunk table (binding 1), read-only storage. Vertex.
     pub const GROUP_GEOMETRY: u32 = 2;
     /// Cull pipeline group 0: view (0), chunks (1), draw args (2), draw refs (3), cull state (4:
-    /// the two draw counts, opaque and cutout, as `atomic<u32>`, then one visibility bit per
-    /// chunk slot from byte [`CULL_VISIBLE_OFFSET`], ADR 0022).
+    /// two draw counts per page, opaque at `p` and cutout at `MAX_PAGES + p`, as `atomic<u32>`,
+    /// then one visibility bit per chunk slot from byte [`CULL_VISIBLE_OFFSET`], ADR 0022).
     pub const CULL_GROUP: u32 = 0;
     /// Max draws per indirect list and per `multi_draw_indexed_indirect_count` call. wgpu-hal
     /// passes `max_count` to `vkCmdDrawIndexedIndirectCount` without checking
     /// `maxDrawIndirectCount`, whose Vulkan minimum is 65535 (desktop drivers report 2^32 - 1).
-    /// Draws past the capacity are dropped by `cull.wgsl` (never written).
+    /// A page's lists hold at most [`super::chunk_memory::PAGE_DRAWS_MAX`] draws, below it.
     pub const MAX_DRAWS_PER_LIST: u32 = 65535;
     /// Immediate bytes used by the Low tier.
     pub const LOW_IMMEDIATE_SIZE: u32 = 16;
     /// Workgroup size of `cull_chunks`.
     pub const CULL_WORKGROUP_SIZE: u32 = 64;
     /// Byte offset of the per-slot visibility bits in the cull state buffer (after the two draw
-    /// counts).
-    pub const CULL_VISIBLE_OFFSET: u64 = 8;
+    /// counts of every page).
+    pub const CULL_VISIBLE_OFFSET: u64 = 8 * super::chunk_memory::MAX_PAGES as u64;
     /// Fog march: the main depth (`texture_2d<f32>`, unfilterable) in this group...
     pub const FOG_GROUP_DEPTH: u32 = 0;
     /// ... at this binding.

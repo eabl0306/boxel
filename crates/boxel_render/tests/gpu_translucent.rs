@@ -347,8 +347,11 @@ fn render_tier(
     let (device, queue, errors) = device_for(adapter, caps, tier)?;
     let registry = boxel_demo::blocks::registry();
     let config = RendererConfig {
-        arena_quads: 1 << 16,
-        max_chunk_slots: 64,
+        chunk_memory: boxel_render::ChunkMemorySettings {
+            initial_quads: 1 << 16,
+            initial_slots: 64,
+            ..boxel_render::ChunkMemorySettings::default()
+        },
         translucent_sort: TranslucentSort::Off,
     };
     let mut renderer = VoxelRenderer::new(

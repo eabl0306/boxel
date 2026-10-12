@@ -525,6 +525,7 @@ dependencies = [
  "boxel_world",
  "boxel_worldgen",
  "bytemuck",
+ "criterion",
  "crossbeam-channel",
  "foldhash",
  "offset-allocator",

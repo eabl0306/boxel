@@ -16,9 +16,10 @@ use crate::lod::{LodFeedback, LodInput, LodRenderer, LodSettings, lod_far};
 use crate::outline::{BlockOutline, Outline, OutlineCache};
 use crate::overlay::{OverlayDraw, OverlayPass, OverlayRect};
 use crate::{
-    BlockTextureData, DEFAULT_SKY_COLOR, DistanceFog, FLUID_TIME_PERIOD, RendererConfig,
-    RendererSmokeTest, SceneLight, TextureReport, TextureSource, TranslucentSort, ViewParams,
-    VoxelRenderer, generate_block_textures, light_curve, load_block_textures, texture_tick,
+    AllocProbeReport, BlockTextureData, ChunkMemorySettings, ChunkMemoryStats, ChunkOp,
+    DEFAULT_SKY_COLOR, DistanceFog, FLUID_TIME_PERIOD, RendererConfig, RendererSmokeTest,
+    SceneLight, TextureReport, TextureSource, TranslucentSort, ViewParams, VoxelRenderer,
+    generate_block_textures, light_curve, load_block_textures, texture_tick,
 };
 use boxel_app::{App, Last, MainScheduleOrder, Plugin, Shutdown, Time};
 use boxel_camera::{Camera, CameraView};
@@ -32,8 +33,8 @@ use boxel_gfx::{
     build_fingerprint, configure_surface, create_gl_instance, create_instance,
     install_lkg_panic_hook, read_texture_rgba8, select_gpu,
 };
-use boxel_math::{I64Vec3, UVec2};
-use boxel_mesh::{ChunkMesh, MaterialTable};
+use boxel_math::UVec2;
+use boxel_mesh::MaterialTable;
 use boxel_transform::Transform;
 use boxel_voxel::{BlockRegistry, BlockRegistryBuilder, ChunkPos};
 use boxel_window::{DisplayHandle, PrimaryWindow, WindowState};
@@ -102,10 +103,11 @@ pub struct RenderSettings {
     /// Brightness curve of the light levels ([`light_curve`]): 0 (the default) is Minecraft's
     /// dark "moody" curve, 1 the brightest.
     pub light_gamma: f32,
-    /// Quad arena capacity (8 bytes per quad). Default 8 Mi quads (64 MiB).
-    pub arena_quads: u32,
-    /// Chunk table capacity (render chunk slots). Default 32768.
-    pub max_chunk_slots: u32,
+    /// How chunk quads are kept on the GPU (ADR 0035): pages of 4 Mi quads (32 MiB), a floor of
+    /// 8 Mi quads and 32,768 chunk slots by default. Read when a renderer is built (the first
+    /// GPU, a recovered device loss); an invalid value is logged and the defaults are used
+    /// ([`ChunkMemorySettings::validate`]).
+    pub chunk_memory: ChunkMemorySettings,
     /// Automation: while the window is hidden or no frame is ready, still render the main color
     /// target (no acquire/present) and count it in `RenderInfo::frames_rendered`, so scripted
     /// runs (`voxel_world --frames`) progress on a covered window. Default false.
@@ -132,8 +134,7 @@ impl Default for RenderSettings {
             ao_strength: SceneLight::DEFAULT_AO_STRENGTH,
             block_light_gain: 1.0,
             light_gamma: SceneLight::DEFAULT_GAMMA,
-            arena_quads: 8 << 20,
-            max_chunk_slots: 32768,
+            chunk_memory: ChunkMemorySettings::default(),
             render_when_hidden: false,
             textures: TextureSource::Procedural,
             translucent_sort: TranslucentSort::default(),
@@ -214,7 +215,7 @@ pub struct RenderInfo {
     /// Chunks resident on the GPU.
     pub chunks: u32,
     /// Draw calls recorded last frame (`RenderStats::draws`: Mid/Low one per visible bucket;
-    /// High its 2 indirect multi-draws, opaque + cutout).
+    /// High 2 indirect multi-draws, opaque + cutout, per page holding chunks).
     pub draws: u32,
     /// Chunks that passed the CPU cull last frame (`RenderStats::visible_chunks`; Mid/Low).
     pub visible_chunks: u32,
@@ -227,17 +228,22 @@ pub struct RenderInfo {
     pub translucent_sorts: u32,
     /// Device losses recovered from.
     pub recoveries: u32,
-    /// `RenderStats::dropped_chunks` (arena or chunk table full; warn-logged).
+    /// `RenderStats::dropped_chunks` (no page or chunk slot free; warn-logged).
     pub dropped_chunks: u32,
-    /// Arena entries in use (`RenderStats::arena_used_quads`): the quads of every resident chunk
+    /// Page entries in use (`RenderStats::arena_used_quads`): the quads of every resident chunk
     /// plus their light palettes. 0 until a renderer exists.
     pub arena_used_quads: u32,
-    /// Quads the arena holds (`RenderStats::arena_capacity_quads`): the requested
-    /// `RenderSettings::arena_quads`, cut to the device's limits. 0 until a renderer exists.
+    /// Quads the pages hold (`RenderStats::arena_capacity_quads`). 0 until a renderer exists.
     pub arena_capacity_quads: u32,
     /// Chunk table slots (`RenderStats::chunk_slot_capacity`): the requested
-    /// `RenderSettings::max_chunk_slots`, cut to the device's limits. 0 until a renderer exists.
+    /// `ChunkMemorySettings::initial_slots`, cut to the device's limits. 0 until a renderer
+    /// exists.
     pub chunk_slot_capacity: u32,
+    /// Chunk memory: pages, use and bytes (`RenderStats::chunk_memory`, ADR 0035).
+    pub chunk_memory: ChunkMemoryStats,
+    /// Testing: what the last [`DebugAllocProbe`] saw, with how many probes ran so far.
+    #[doc(hidden)]
+    pub alloc_probe: Option<(u64, AllocProbeReport)>,
     /// How the block texture array was built (source, size, layers from a pack, load time,
     /// warnings). Default until the first GPU selection.
     pub textures: TextureReport,
@@ -325,6 +331,17 @@ pub struct ScreenshotSaved {
 #[derive(Message, Clone, Copy, Debug, Default)]
 pub struct DebugDestroyDevice;
 
+/// Measurement (the M0 probe of ADR 0035, `stress --alloc-probe`): right after this frame's
+/// present the renderer creates a buffer of `mib` MiB with the usages of a page of chunk quads,
+/// where pages will be created, and later frames clear it as a new page will be; `mib = 0` drops
+/// the probe's buffers. The outcome lands in `RenderInfo::alloc_probe`.
+#[doc(hidden)]
+#[derive(Message, Clone, Copy, Debug, Default)]
+pub struct DebugAllocProbe {
+    /// MiB to create, 0 to drop every probe buffer.
+    pub mib: u32,
+}
+
 /// Adds the renderer. Requires `WindowPlugin` (for `DisplayHandle`/`PrimaryWindow`) and
 /// `boxel_app` time. Optional integrations: `boxel_world::WorldPlugin` (mesh events),
 /// `boxel_diagnostic` (`"gpu"`/`"render"` lines), `boxel_camera::Camera`. The `Render`
@@ -365,6 +382,7 @@ impl Plugin for RenderPlugin {
             .add_message::<RequestScreenshot>()
             .add_message::<ScreenshotSaved>()
             .add_message::<DebugDestroyDevice>()
+            .add_message::<DebugAllocProbe>()
             .add_message::<ChunkMeshEvent>()
             .add_message::<ChunkMeshResync>()
             // `edit_schedule` keeps systems other plugins already added to `Render`.
@@ -663,20 +681,6 @@ impl Losses {
     }
 }
 
-/// One chunk mesh change for the renderer.
-#[derive(Clone, Debug)]
-enum MeshOp {
-    Upsert {
-        id: u64,
-        /// World voxel origin (`i64`; wrapped to 32 bits only when uploaded).
-        origin: I64Vec3,
-        mesh: Arc<ChunkMesh>,
-    },
-    Remove {
-        id: u64,
-    },
-}
-
 /// The extract boundary: inputs copied from the main world by `Extract`, the view computed by
 /// `Prepare`, and the frame results `Cleanup` writes back.
 #[derive(Resource, Default)]
@@ -698,7 +702,7 @@ pub(crate) struct ExtractedFrame {
     /// Full resync: `meshes` holds every ready mesh, and `renderer.clear_chunks` (or, for a new
     /// world, `renderer.clear_world`) runs first.
     pub(crate) resync: Resync,
-    meshes: Vec<MeshOp>,
+    meshes: Vec<ChunkOp>,
     /// Pending screenshot paths (kept until a frame exists to read).
     screenshots: Vec<PathBuf>,
     /// Copy of `OverlayDraw::rects`.
@@ -718,6 +722,10 @@ pub(crate) struct ExtractedFrame {
     /// its device is lost).
     pub(crate) lod_renderer: Option<LodRenderer>,
     destroy_device: bool,
+    /// [`DebugAllocProbe`] requests not run yet, in MiB.
+    alloc_probe: Vec<u32>,
+    /// What they saw (`Draw` output).
+    alloc_probe_done: Vec<AllocProbeReport>,
     /// `Prepare` output.
     view: Option<ViewParams>,
     /// `Draw` results.
@@ -797,7 +805,8 @@ impl UploadWarnings {
         }
         tracing::warn!(
             "{} chunk upload(s) failed (last: {}); {dropped_total} chunks dropped so far: raise \
-             RenderSettings::arena_quads/max_chunk_slots or lower the view distance",
+             RenderSettings::chunk_memory (initial_quads, initial_slots) or lower the view \
+             distance",
             self.failures,
             self.last_error
         );
@@ -1059,8 +1068,7 @@ fn bootstrap(p: &mut SetupParams) {
         });
     let textures = block_texture_data(p);
     let config = RendererConfig {
-        arena_quads: settings.arena_quads,
-        max_chunk_slots: settings.max_chunk_slots,
+        chunk_memory: valid_chunk_memory(settings.chunk_memory),
         translucent_sort: settings.translucent_sort,
     };
     let present = p.present.mode;
@@ -1404,7 +1412,10 @@ pub(crate) fn extract(
     mut mesh_events: MessageReader<ChunkMeshEvent>,
     mut resyncs: MessageWriter<ChunkMeshResync>,
     mut screenshots: MessageReader<RequestScreenshot>,
-    mut destroy: MessageReader<DebugDestroyDevice>,
+    (mut destroy, mut probes): (
+        MessageReader<DebugDestroyDevice>,
+        MessageReader<DebugAllocProbe>,
+    ),
     overlay: Res<OverlayDraw>,
     time: Option<Res<Time>>,
     (outline, content, mut outline_cache): (
@@ -1444,6 +1455,8 @@ pub(crate) fn extract(
         .screenshots
         .extend(screenshots.read().map(|r| r.path.clone()));
     frame.destroy_device = destroy.read().count() > 0;
+    // Kept until a frame is drawn (the probe runs after a submit).
+    frame.alloc_probe.extend(probes.read().map(|p| p.mib));
     frame.view = None;
     frame.rendered = false;
     frame.presented = false;
@@ -1464,7 +1477,7 @@ pub(crate) fn extract(
         if let Some(map) = chunks.as_deref() {
             frame
                 .meshes
-                .extend(map.ready_meshes().map(|(id, key, mesh)| MeshOp::Upsert {
+                .extend(map.ready_meshes().map(|(id, key, mesh)| ChunkOp::Upsert {
                     id: id.to_bits(),
                     origin: key.pos.origin().as_i64vec3(),
                     mesh: Arc::clone(mesh),
@@ -1649,14 +1662,14 @@ pub fn frame_visibility_with(
     Some(visibility.update(&search, |p| map.visibility_links_at(p)))
 }
 
-fn mesh_op(event: &ChunkMeshEvent) -> MeshOp {
+fn mesh_op(event: &ChunkMeshEvent) -> ChunkOp {
     match event {
-        ChunkMeshEvent::Upsert { id, key, mesh } => MeshOp::Upsert {
+        ChunkMeshEvent::Upsert { id, key, mesh } => ChunkOp::Upsert {
             id: id.to_bits(),
             origin: key.pos.origin().as_i64vec3(),
             mesh: Arc::clone(mesh),
         },
-        ChunkMeshEvent::Remove { id, .. } => MeshOp::Remove { id: id.to_bits() },
+        ChunkMeshEvent::Remove { id, .. } => ChunkOp::Remove { id: id.to_bits() },
     }
 }
 
@@ -1677,15 +1690,18 @@ fn prepare(
     }
     let frame = &mut *frame;
     let queue = &ready.ctx.queue;
-    match frame.resync {
-        Resync::None => {}
-        Resync::Chunks => ready.renderer.clear_chunks(),
-        Resync::World => ready.renderer.clear_world(&ready.ctx.device),
-    }
+    ready.renderer.set_translucent_sort(frame.translucent_sort);
+    // The frame's chunk changes; a resync frame first runs the clear it asks for (`meshes` then
+    // holds every ready mesh), before this frame's visible set is taken.
+    let errors = ready
+        .renderer
+        .apply_ops(&ready.ctx.device, frame.meshes.drain(..), frame.resync);
     if frame.resync != Resync::None {
         ready.resync = Resync::None;
     }
-    ready.renderer.set_translucent_sort(frame.translucent_sort);
+    for e in &errors {
+        warnings.record(e);
+    }
     ready.renderer.set_outline(frame.outline.take());
     ready.renderer.set_visibility(frame.visibility.clone());
     let fog = frame.fog.take();
@@ -1706,22 +1722,6 @@ fn prepare(
         ready.renderer.set_lod(&ready.ctx.device, None);
     } else {
         ready.renderer.set_lod(&ready.ctx.device, lod);
-    }
-    for op in frame.meshes.drain(..) {
-        let result = match op {
-            MeshOp::Upsert { id, origin, mesh } => {
-                let _span = frame_span!("render.upsert");
-                ready.renderer.upsert_chunk(id, origin, mesh)
-            }
-            MeshOp::Remove { id } => {
-                let _span = frame_span!("render.remove");
-                ready.renderer.remove_chunk(id);
-                Ok(())
-            }
-        };
-        if let Err(e) = result {
-            warnings.record(&e);
-        }
     }
     warnings.flush(ready.renderer.stats().dropped_chunks);
     let color = ready.renderer.main_color().size();
@@ -1821,6 +1821,7 @@ fn draw(
                     }
                     ready.ctx.queue.present(texture);
                 }
+                after_present(ready, frame);
                 ready.frames += 1;
                 frame.rendered = true;
                 frame.presented = true;
@@ -1846,7 +1847,20 @@ fn draw(
     }
     if frame.render_when_hidden {
         render_offscreen(ready, &view);
+        after_present(ready, frame);
         frame.rendered = true;
+    }
+}
+
+/// After a frame was submitted (and presented): the work that waits for the frame to be out,
+/// today the allocation probe ([`DebugAllocProbe`]). Not when the frame marked the device lost.
+fn after_present(ready: &mut ReadyGpu, frame: &mut ExtractedFrame) {
+    if ready.ctx.health.is_lost() {
+        return;
+    }
+    for mib in frame.alloc_probe.drain(..) {
+        let report = ready.renderer.debug_alloc_probe(&ready.ctx.device, mib);
+        frame.alloc_probe_done.push(report);
     }
 }
 
@@ -1905,7 +1919,7 @@ fn render_offscreen(ready: &mut ReadyGpu, view: &ViewParams) {
 /// - or `render` could not record them (`take_lost_uploads`: a staging buffer could not be
 ///   created, which wgpu reports before `finish`, and the frame itself runs).
 ///
-/// Either way the renderer's chunk table and arena no longer match the GPU: the next frame
+/// Either way the renderer's chunk table and pages no longer match the GPU: the next frame
 /// uploads every chunk again. Past [`MAX_REJECTED_FRAMES`] recent losses the device is marked
 /// lost instead, and `Setup` rebuilds it.
 fn after_frame(ready: &mut ReadyGpu, errors_before_finish: u32) {
@@ -2020,6 +2034,11 @@ fn cleanup(
             info.arena_used_quads = stats.arena_used_quads;
             info.arena_capacity_quads = stats.arena_capacity_quads;
             info.chunk_slot_capacity = stats.chunk_slot_capacity;
+            info.chunk_memory = stats.chunk_memory;
+            for report in frame.alloc_probe_done.drain(..) {
+                let seq = info.alloc_probe.map_or(1, |(seq, _)| seq + 1);
+                info.alloc_probe = Some((seq, report));
+            }
             info.lod_nodes = stats.lod_nodes;
             info.lod_draws = stats.lod_draws;
             info.lod_quads = stats.lod_quads;
@@ -2059,16 +2078,33 @@ fn cleanup(
 
 /// The `"render"` diagnostics line.
 fn render_line(tier: Tier, stats: &crate::RenderStats) -> String {
+    let memory = &stats.chunk_memory;
+    let mib = |quads: u64| (quads * 8) >> 20;
     format!(
-        "tier={tier} chunks={} quads={}/{} draws={} visible={} dropped={} occluded={}",
+        "tier={tier} chunks={} quads={}/{} draws={} visible={} dropped={} occluded={} \
+         pages={} {}/{}MiB",
         stats.chunks,
         stats.arena_used_quads,
         stats.arena_capacity_quads,
         stats.draws,
         stats.visible_chunks,
         stats.dropped_chunks,
-        stats.occluded_chunks
+        stats.occluded_chunks,
+        memory.pages,
+        mib(memory.used_quads),
+        mib(memory.capacity_quads),
     )
+}
+
+/// `settings` if valid, else the defaults (logged once a renderer is built).
+fn valid_chunk_memory(settings: ChunkMemorySettings) -> ChunkMemorySettings {
+    match settings.validate() {
+        Ok(()) => settings,
+        Err(e) => {
+            tracing::warn!("RenderSettings::chunk_memory: {e}; using the defaults");
+            ChunkMemorySettings::default()
+        }
+    }
 }
 
 /// Reads the main color target and writes a PNG (parent directories are created).
@@ -2119,6 +2155,8 @@ fn shutdown(mut gpu: ResMut<GpuState>, mut lkg: ResMut<LkgRes>, mut info: ResMut
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boxel_math::I64Vec3;
+    use boxel_mesh::ChunkMesh;
 
     #[test]
     fn first_loss_retries_and_the_second_excludes_the_tier() {
@@ -2240,11 +2278,18 @@ mod tests {
             draws: 5,
             dropped_chunks: 1,
             occluded_chunks: 4,
+            chunk_memory: ChunkMemoryStats {
+                pages: 2,
+                used_quads: 3 << 20,
+                capacity_quads: 8 << 20,
+                ..ChunkMemoryStats::default()
+            },
             ..crate::RenderStats::default()
         };
         assert_eq!(
             render_line(Tier::Mid, &stats),
-            "tier=Mid chunks=3 quads=10/100 draws=5 visible=2 dropped=1 occluded=4"
+            "tier=Mid chunks=3 quads=10/100 draws=5 visible=2 dropped=1 occluded=4 pages=2 \
+             24/64MiB"
         );
     }
 
@@ -2276,15 +2321,15 @@ mod tests {
             key,
             mesh: Arc::clone(&mesh),
         }) {
-            MeshOp::Upsert { id, origin, .. } => {
+            ChunkOp::Upsert { id, origin, .. } => {
                 assert_eq!(id, chunk.to_bits());
                 assert_eq!(origin, I64Vec3::new(32, -64, 96));
             }
-            MeshOp::Remove { .. } => panic!("expected an upsert"),
+            ChunkOp::Remove { .. } => panic!("expected an upsert"),
         }
         match mesh_op(&ChunkMeshEvent::Remove { id: chunk, key }) {
-            MeshOp::Remove { id } => assert_eq!(id, chunk.to_bits()),
-            MeshOp::Upsert { .. } => panic!("expected a remove"),
+            ChunkOp::Remove { id } => assert_eq!(id, chunk.to_bits()),
+            ChunkOp::Upsert { .. } => panic!("expected a remove"),
         }
     }
 

@@ -492,8 +492,11 @@ fn render_tier(
 ) -> Result<Vec<Rendered>, String> {
     let (device, queue, errors) = device_for(adapter, caps, tier)?;
     let config = RendererConfig {
-        arena_quads: 1 << 21,
-        max_chunk_slots: 1024,
+        chunk_memory: boxel_render::ChunkMemorySettings {
+            initial_quads: 1 << 21,
+            initial_slots: 1024,
+            ..boxel_render::ChunkMemorySettings::default()
+        },
         translucent_sort: TranslucentSort::Inline,
     };
     let mut renderer = VoxelRenderer::new(
@@ -754,8 +757,12 @@ fn render_refused(
 ) -> Result<Vec<RefusedImages>, String> {
     let (device, queue, errors) = device_for(adapter, caps, tier)?;
     let config = RendererConfig {
-        arena_quads: 1 << 21,
-        max_chunk_slots: scene.meshes.len() as u32 - 2,
+        chunk_memory: boxel_render::ChunkMemorySettings {
+            initial_quads: 1 << 21,
+            initial_slots: scene.meshes.len() as u32 - 2,
+            grow: false,
+            ..boxel_render::ChunkMemorySettings::default()
+        },
         translucent_sort: TranslucentSort::Inline,
     };
     let mut renderer = VoxelRenderer::new(
@@ -963,8 +970,11 @@ fn render_lost(
 ) -> Result<Vec<LostImages>, String> {
     let (device, queue, errors) = device_for(adapter, caps, tier)?;
     let config = RendererConfig {
-        arena_quads: 1 << 21,
-        max_chunk_slots: 1024,
+        chunk_memory: boxel_render::ChunkMemorySettings {
+            initial_quads: 1 << 21,
+            initial_slots: 1024,
+            ..boxel_render::ChunkMemorySettings::default()
+        },
         translucent_sort: TranslucentSort::Inline,
     };
     let textures = boxel_render::generate_block_textures(scene.registry.textures());
@@ -1480,8 +1490,11 @@ fn render_world_frames(
 ) -> Result<Vec<WorldImages>, String> {
     let (device, queue, errors) = device_for(adapter, caps, tier)?;
     let config = RendererConfig {
-        arena_quads: 1 << 21,
-        max_chunk_slots: 4096,
+        chunk_memory: boxel_render::ChunkMemorySettings {
+            initial_quads: 1 << 21,
+            initial_slots: 4096,
+            ..boxel_render::ChunkMemorySettings::default()
+        },
         translucent_sort: TranslucentSort::Inline,
     };
     let registry = boxel_demo::blocks::registry();

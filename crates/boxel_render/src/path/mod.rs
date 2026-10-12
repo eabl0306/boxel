@@ -6,6 +6,11 @@
 //! This module also owns what every tier shares: the frozen bind group layouts (group 0
 //! materials, group 1 view, group 2 geometry on High/Mid, the cull group), the voxel pipeline
 //! builder and the CPU culling used by Mid and Low (the same tests as `cull.wgsl`).
+//!
+//! Chunk quads live in pages (`crate::memory`, ADR 0035): every tier binds a chunk's page before
+//! drawing it, once per page for the opaque and cutout buckets (drawn page by page, slot order
+//! inside a page on Mid and Low) and whenever the page changes in the back to front translucent
+//! list.
 mod high;
 mod low;
 mod mid;
@@ -15,6 +20,7 @@ pub(crate) use low::LowPath;
 pub(crate) use mid::MidPath;
 
 use crate::chunk_table::ChunkTable;
+use crate::memory::PageSet;
 use crate::renderer::ViewParams;
 use crate::{DEPTH_FORMAT, MAIN_COLOR_FORMAT};
 use boxel_gfx::Tier;
@@ -73,16 +79,35 @@ pub(crate) trait TierPath {
     }
 
     /// Records the solid draws into the main pass (groups 0 and 1 are already bound): the opaque
-    /// buckets with the opaque pipeline, then the cutout bucket with the cutout pipeline.
-    /// Returns the draw calls recorded.
-    fn draw_solid(&self, pass: &mut wgpu::RenderPass<'_>, arena: &wgpu::Buffer) -> u32;
+    /// buckets with the opaque pipeline, then the cutout bucket with the cutout pipeline, each
+    /// page's draws with that page bound. Returns the draw calls recorded.
+    fn draw_solid(&self, pass: &mut wgpu::RenderPass<'_>, pages: &PageSet) -> u32;
 
     /// Records the translucent buckets ([`translucent_draws`], back to front) with the
-    /// translucent pipeline, after [`TierPath::draw_solid`]. Something else may have been drawn
-    /// in between (the block outline, ADR 0026; the far LOD, ADR 0031), even in a new pass with
-    /// only groups 0 and 1 bound: it sets every other group, buffer and immediate it uses again.
-    /// Returns the draw calls recorded.
-    fn draw_translucent(&self, pass: &mut wgpu::RenderPass<'_>, arena: &wgpu::Buffer) -> u32;
+    /// translucent pipeline, after [`TierPath::draw_solid`], binding each bucket's page when it
+    /// changes. Something else may have been drawn in between (the block outline, ADR 0026; the
+    /// far LOD, ADR 0031), even in a new pass with only groups 0 and 1 bound: it sets every other
+    /// group, buffer and immediate it uses again. Returns the draw calls recorded.
+    fn draw_translucent(&self, pass: &mut wgpu::RenderPass<'_>, pages: &PageSet) -> u32;
+
+    /// The page changes of this frame's translucent list ([`page_switches`]).
+    fn translucent_page_switches(&self) -> u32;
+
+    /// Testing (High): the draw counts the last frame's cull wrote, opaque and cutout per page.
+    fn debug_draw_counts(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Option<Result<Vec<[u32; 2]>, String>> {
+        let _ = (device, queue);
+        None
+    }
+}
+
+/// How often two buckets drawn one after the other in `list` sit in different pages: the extra
+/// binds of drawing it in order.
+pub(crate) fn page_switches(list: &[BucketDraw]) -> u32 {
+    list.windows(2).filter(|w| w[0].page != w[1].page).count() as u32
 }
 
 /// Bind group layouts shared by the voxel pipelines of a tier.
@@ -91,7 +116,7 @@ pub(crate) struct VoxelLayouts {
     pub materials: wgpu::BindGroupLayout,
     /// Group 1: `View` uniform (vertex + fragment).
     pub view: wgpu::BindGroupLayout,
-    /// Group 2 (High/Mid): quad arena + chunk table, read-only storage (vertex).
+    /// Group 2 (High/Mid): a page of quads + the chunk table, read-only storage (vertex).
     pub geometry: Option<wgpu::BindGroupLayout>,
 }
 
@@ -187,7 +212,8 @@ impl VoxelPipelines {
             immediate_size,
         });
         // High/Mid: DrawRef per draw; Low: the PackedQuad itself (slot 0) and its light palette
-        // entry (slot 1, a buffer parallel to the arena, ADR 0015). All instance-step Uint32x2.
+        // entry (slot 1, a light page parallel to the page, ADR 0015). All instance-step
+        // Uint32x2.
         let attribute = |shader_location| {
             [wgpu::VertexAttribute {
                 format: wgpu::VertexFormat::Uint32x2,
@@ -348,11 +374,12 @@ pub(crate) fn quad_index_buffer(device: &wgpu::Device) -> wgpu::Buffer {
     })
 }
 
-/// Group 2 of the High/Mid voxel pipelines: quad arena (binding 0) + chunk table (binding 1).
+/// Group 2 of the High/Mid voxel pipelines: a page of quads (binding 0) + chunk table
+/// (binding 1).
 pub(crate) fn geometry_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
-    arena: &wgpu::Buffer,
+    page: &wgpu::Buffer,
     chunks: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -361,7 +388,7 @@ pub(crate) fn geometry_bind_group(
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: arena.as_entire_binding(),
+                resource: page.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
@@ -401,7 +428,8 @@ fn storage_entry(
     }
 }
 
-/// One visible bucket: draw `count` quads starting at arena quad `quad_start` of chunk `slot`.
+/// One visible bucket: draw `count` quads starting at quad `quad_start` of page `page`, of chunk
+/// `slot`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BucketDraw {
     /// Chunk table slot.
@@ -409,7 +437,9 @@ pub(crate) struct BucketDraw {
     /// Chunk origin as the GPU gets it, the low 32 bits of the world origin (Low passes it as
     /// immediates).
     pub origin: IVec3,
-    /// First quad in the arena.
+    /// The chunk's page.
+    pub page: u16,
+    /// First quad in the page.
     pub quad_start: u32,
     /// Quads (never 0, never above `MAX_QUADS_PER_BUCKET`).
     pub count: u32,
@@ -418,14 +448,25 @@ pub(crate) struct BucketDraw {
 /// Result of the CPU culling (reused every frame).
 #[derive(Debug, Default)]
 pub(crate) struct CpuCull {
-    /// Visible non-empty opaque face buckets, in slot then face order.
-    pub opaque: Vec<BucketDraw>,
-    /// Visible non-empty cutout buckets.
-    pub cutout: Vec<BucketDraw>,
+    /// Visible non-empty opaque face buckets by page id, each in slot then face order.
+    pub opaque: Vec<Vec<BucketDraw>>,
+    /// Visible non-empty cutout buckets by page id, each in slot order.
+    pub cutout: Vec<Vec<BucketDraw>>,
     /// Visible non-empty translucent buckets, back to front ([`translucent_draws`]).
     pub translucent: Vec<BucketDraw>,
     /// Chunks inside the frustum.
     pub visible_chunks: u32,
+}
+
+/// The non-empty lists of `by_page`, with their page id, in id order.
+pub(crate) fn page_lists(
+    by_page: &[Vec<BucketDraw>],
+) -> impl Iterator<Item = (u16, &[BucketDraw])> {
+    by_page
+        .iter()
+        .enumerate()
+        .filter(|(_, list)| !list.is_empty())
+        .map(|(page, list)| (page as u16, list.as_slice()))
 }
 
 impl CpuCull {
@@ -433,8 +474,9 @@ impl CpuCull {
     /// around the camera, see `chunk_table`) with the tests of `cull_chunks`: the cave culling
     /// bit of the slot when `visibility` is given, chunk AABB `[origin - render_origin, + 32]`
     /// against the frustum (p-vertex test), then the per-face bucket test with the
-    /// camera-relative eye; the cutout bucket only needs the frustum. The translucent buckets
-    /// come from [`translucent_draws`].
+    /// camera-relative eye; the cutout bucket only needs the frustum. The opaque and cutout
+    /// buckets go to their page's list (slot order inside it: with one page, the order of a
+    /// single list). The translucent buckets come from [`translucent_draws`].
     ///
     /// Chunks outside the window are skipped at any view distance: Mid and Low draw with the
     /// wrapped origins too, whose difference is exact only inside it.
@@ -444,8 +486,9 @@ impl CpuCull {
         view: &ViewParams,
         visibility: Option<SlotVisibility<'_>>,
     ) {
-        self.opaque.clear();
-        self.cutout.clear();
+        for list in self.opaque.iter_mut().chain(&mut self.cutout) {
+            list.clear();
+        }
         self.visible_chunks = 0;
         translucent_draws(chunks, view, visibility, &mut self.translucent);
         for (slot, record) in chunks.iter() {
@@ -461,12 +504,19 @@ impl CpuCull {
                 continue;
             }
             self.visible_chunks += 1;
-            let mut start = record.alloc.offset;
+            let page = record.alloc.page;
+            let p = usize::from(page);
+            if self.opaque.len() <= p {
+                self.opaque.resize_with(p + 1, Vec::new);
+                self.cutout.resize_with(p + 1, Vec::new);
+            }
+            let mut start = record.alloc.alloc.offset;
             for (face, &n) in record.counts[..6].iter().enumerate() {
                 if n > 0 && bucket_visible(face, min, max, view.eye_rel) {
-                    self.opaque.push(BucketDraw {
+                    self.opaque[p].push(BucketDraw {
                         slot,
                         origin: record.gpu_origin(),
+                        page,
                         quad_start: start,
                         count: n.min(MAX_QUADS_PER_BUCKET),
                     });
@@ -475,29 +525,37 @@ impl CpuCull {
             }
             let n = record.counts[CUTOUT_BUCKET];
             if n > 0 {
-                self.cutout.push(BucketDraw {
+                self.cutout[p].push(BucketDraw {
                     slot,
                     origin: record.gpu_origin(),
+                    page,
                     quad_start: start,
                     count: n.min(MAX_QUADS_PER_BUCKET),
                 });
             }
         }
     }
+
+    /// Opaque and cutout draws in all.
+    pub fn solid_len(&self) -> usize {
+        self.opaque.iter().chain(&self.cutout).map(Vec::len).sum()
+    }
 }
 
 /// The visible non-empty translucent buckets, back to front: every tier draws them from this
 /// list, in this order, so blending gives the same pixels on all of them. Same window, cave
 /// culling and frustum tests as [`CpuCull::run`]; sorted by the squared distance from the eye
-/// to the chunk's center, farthest first, ties by slot. Inside a bucket the quads are drawn in
-/// arena order, which `crate::sort` keeps back to front for the camera (ADR 0018).
+/// to the chunk's center, farthest first, ties by chunk origin (`i64`, x then y then z), then
+/// by slot (only chunks at the same origin). The order is then a function of the camera and the
+/// chunks, whatever their slots and pages (resyncs, a reopened world). Inside a bucket the quads
+/// are drawn in page order, which `crate::sort` keeps back to front for the camera (ADR 0018).
 pub(crate) fn translucent_draws(
     chunks: &ChunkTable,
     view: &ViewParams,
     visibility: Option<SlotVisibility<'_>>,
     out: &mut Vec<BucketDraw>,
 ) {
-    let mut keyed: Vec<(f32, BucketDraw)> = Vec::new();
+    let mut keyed: Vec<(f32, I64Vec3, BucketDraw)> = Vec::new();
     for (slot, record) in chunks.iter_translucent() {
         if !chunks.in_window(record.origin) || !slot_visible(visibility, slot) {
             continue;
@@ -507,21 +565,28 @@ pub(crate) fn translucent_draws(
         if !view.frustum.intersects_aabb(&Aabb::new(min, max)) {
             continue;
         }
-        let start = record.alloc.offset + record.counts[..TRANSLUCENT_BUCKET].iter().sum::<u32>();
+        let start =
+            record.alloc.alloc.offset + record.counts[..TRANSLUCENT_BUCKET].iter().sum::<u32>();
         let center = min + Vec3::splat(CHUNK_EDGE / 2.0);
         keyed.push((
             (center - view.eye_rel).length_squared(),
+            record.origin,
             BucketDraw {
                 slot,
                 origin: record.gpu_origin(),
+                page: record.alloc.page,
                 quad_start: start,
                 count: record.counts[TRANSLUCENT_BUCKET].min(MAX_QUADS_PER_BUCKET),
             },
         ));
     }
-    keyed.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.slot.cmp(&b.1.slot)));
+    keyed.sort_by(|a, b| {
+        b.0.total_cmp(&a.0)
+            .then_with(|| a.1.to_array().cmp(&b.1.to_array()))
+            .then(a.2.slot.cmp(&b.2.slot))
+    });
     out.clear();
-    out.extend(keyed.into_iter().map(|(_, d)| d));
+    out.extend(keyed.into_iter().map(|(_, _, d)| d));
 }
 
 /// What every tier draws for a set of chunks, counted on the CPU with the culling rules of Mid
@@ -605,6 +670,7 @@ mod tests {
     use super::*;
     use crate::arena::ArenaAllocator;
     use crate::chunk_table::ChunkRecord;
+    use crate::memory::PagedAlloc;
     use boxel_camera::{Camera, CameraView};
     use boxel_math::{DVec3, I64Vec3, wrap_to_i32};
     use boxel_transform::Transform;
@@ -626,7 +692,7 @@ mod tests {
             table.insert(ChunkRecord {
                 id: i as u64,
                 origin: *origin,
-                alloc,
+                alloc: PagedAlloc { page: 0, alloc },
                 counts: [1, 1, 1, 1, 1, 1, 2, 1],
                 light_base: alloc.offset + 9,
                 light_len: 1,
@@ -635,13 +701,116 @@ mod tests {
         table
     }
 
+    /// Chunks like [`table_with`]'s, each in its page (each page its own allocator).
+    fn table_paged(chunks: &[(I64Vec3, u16)]) -> ChunkTable {
+        let mut arenas: Vec<ArenaAllocator> =
+            (0..8).map(|_| ArenaAllocator::new(1 << 16, 1024)).collect();
+        let mut table = ChunkTable::new(64);
+        for (i, &(origin, page)) in chunks.iter().enumerate() {
+            let alloc = arenas[usize::from(page)].allocate(10).expect("arena");
+            table.insert(ChunkRecord {
+                id: i as u64,
+                origin,
+                alloc: PagedAlloc { page, alloc },
+                counts: [1, 1, 1, 1, 1, 1, 2, 1],
+                light_base: alloc.offset + 9,
+                light_len: 1,
+            });
+        }
+        table
+    }
+
+    /// With many pages each page's draws come together, slot order inside the page, pages in id
+    /// order; the draws themselves are the ones of a single page. The translucent list does not
+    /// depend on the pages.
+    #[test]
+    fn cpu_cull_groups_draws_by_page() {
+        let origins: Vec<I64Vec3> = (0..9)
+            .map(|i| I64Vec3::new(32 * (i % 3) - 32, 0, -64 - 32 * (i / 3)))
+            .collect();
+        let view = camera_view(DVec3::new(16.5, 16.5, 16.5), 0.0, 0.0);
+        let one = table_paged(&origins.iter().map(|&o| (o, 0)).collect::<Vec<_>>());
+        let pages = [2, 0, 1, 2, 2, 0, 1, 0, 2];
+        let many = table_paged(
+            &origins
+                .iter()
+                .zip(pages)
+                .map(|(&o, p)| (o, p))
+                .collect::<Vec<_>>(),
+        );
+        let (mut a, mut b) = (CpuCull::default(), CpuCull::default());
+        a.run(&one, &view, None);
+        b.run(&many, &view, None);
+        assert_eq!(a.visible_chunks, b.visible_chunks);
+        assert!(a.visible_chunks > 4);
+        assert_eq!(page_lists(&a.opaque).count(), 1, "one page: one list");
+        // the same draws, as (slot, bucket, count)
+        let key = |table: &ChunkTable, d: &BucketDraw| {
+            let (_, r) = table.iter().find(|(s, _)| *s == d.slot).expect("slot");
+            (d.slot, d.quad_start - r.alloc.alloc.offset, d.count)
+        };
+        for (x, y) in [(&a.opaque, &b.opaque), (&a.cutout, &b.cutout)] {
+            let mut flat_a: Vec<_> = x.iter().flatten().map(|d| key(&one, d)).collect();
+            let mut flat_b: Vec<_> = y.iter().flatten().map(|d| key(&many, d)).collect();
+            assert_eq!(
+                flat_a,
+                x.concat().iter().map(|d| key(&one, d)).collect::<Vec<_>>()
+            );
+            flat_a.sort_unstable();
+            flat_b.sort_unstable();
+            assert_eq!(flat_a, flat_b);
+            for (page, list) in page_lists(y) {
+                assert!(list.iter().all(|d| d.page == page));
+                assert!(
+                    list.windows(2).all(|w| w[0].slot <= w[1].slot),
+                    "slot order"
+                );
+                assert!(list.iter().all(|d| pages[d.slot as usize] == page));
+            }
+            let ids: Vec<u16> = page_lists(y).map(|(p, _)| p).collect();
+            assert_eq!(ids, [0, 1, 2]);
+        }
+        let origins_of = |t: &ChunkTable, l: &[BucketDraw]| -> Vec<I64Vec3> {
+            l.iter()
+                .map(|d| t.record_at(d.slot).expect("live").origin)
+                .collect()
+        };
+        assert_eq!(
+            origins_of(&one, &a.translucent),
+            origins_of(&many, &b.translucent)
+        );
+        assert!(page_switches(&b.translucent) > 0);
+        assert_eq!(page_switches(&a.translucent), 0);
+    }
+
+    /// Translucent buckets at the same distance go by chunk origin, whatever their slots: two
+    /// tables with the same chunks in other slots give the same list.
+    #[test]
+    fn translucent_ties_break_by_chunk_origin() {
+        // Two chunks mirrored across the eye's x: their centers are exactly as far.
+        let view = camera_view(DVec3::new(0.0, 16.5, 16.5), 0.0, 0.0);
+        let (left, right) = (I64Vec3::new(-32, 0, -64), I64Vec3::new(0, 0, -64));
+        let far = I64Vec3::new(0, 0, -128);
+        for order in [[left, right, far], [right, far, left], [far, right, left]] {
+            let table = table_paged(&order.map(|o| (o, 0)));
+            let mut out = Vec::new();
+            translucent_draws(&table, &view, None, &mut out);
+            let origins: Vec<I64Vec3> = out
+                .iter()
+                .map(|d| table.record_at(d.slot).expect("live").origin)
+                .collect();
+            assert_eq!(origins, [far, left, right], "{order:?}");
+        }
+    }
+
     /// Visible opaque buckets of `slot` as offsets inside its allocation (= face index here).
     fn visible_faces(cull: &CpuCull, table: &ChunkTable, slot: u32) -> Vec<u32> {
         let (_, record) = table.iter().find(|(s, _)| *s == slot).expect("slot");
         cull.opaque
             .iter()
+            .flatten()
             .filter(|d| d.slot == slot)
-            .map(|d| d.quad_start - record.alloc.offset)
+            .map(|d| d.quad_start - record.alloc.alloc.offset)
             .collect()
     }
 
@@ -691,13 +860,15 @@ mod tests {
         cull.run(&table, &view, None);
         assert_eq!(cull.visible_chunks, 1);
         assert_eq!(visible_faces(&cull, &table, 0), [0, 2, 3, 4, 5]);
-        assert_eq!(cull.cutout.len(), 1);
+        let cutout: Vec<_> = cull.cutout.iter().flatten().collect();
+        assert_eq!(cutout.len(), 1);
         let (_, record) = table.iter().next().expect("record");
-        assert_eq!(cull.cutout[0].quad_start, record.alloc.offset + 6);
-        assert_eq!(cull.cutout[0].count, 2);
+        assert_eq!(cutout[0].quad_start, record.alloc.alloc.offset + 6);
+        assert_eq!(cutout[0].count, 2);
         assert!(
             cull.opaque
                 .iter()
+                .flatten()
                 .all(|d| d.count == 1 && d.origin == IVec3::ZERO)
         );
     }
@@ -712,8 +883,15 @@ mod tests {
         cull.run(&table, &view, None);
         assert_eq!(cull.visible_chunks, 1);
         assert_eq!(visible_faces(&cull, &table, 0), [0, 1, 2, 3, 4, 5]);
-        assert_eq!(cull.cutout.iter().map(|d| d.slot).collect::<Vec<_>>(), [0]);
-        assert!(cull.opaque.iter().all(|d| d.slot == 0));
+        assert_eq!(
+            cull.cutout
+                .iter()
+                .flatten()
+                .map(|d| d.slot)
+                .collect::<Vec<_>>(),
+            [0]
+        );
+        assert!(cull.opaque.iter().flatten().all(|d| d.slot == 0));
     }
 
     #[test]
@@ -729,7 +907,8 @@ mod tests {
             s.dedup();
             s
         };
-        assert_eq!(slots(&cull.opaque), [0, 1]);
+        let flat = |lists: &[Vec<BucketDraw>]| lists.concat();
+        assert_eq!(slots(&flat(&cull.opaque)), [0, 1]);
         assert_eq!(slots(&cull.translucent), [1, 0]);
         let bits = [0b01u32];
         let hidden = SlotVisibility {
@@ -738,8 +917,8 @@ mod tests {
         };
         cull.run(&table, &view, Some(hidden));
         assert_eq!(cull.visible_chunks, 1);
-        assert_eq!(slots(&cull.opaque), [0]);
-        assert_eq!(slots(&cull.cutout), [0]);
+        assert_eq!(slots(&flat(&cull.opaque)), [0]);
+        assert_eq!(slots(&flat(&cull.cutout)), [0]);
         assert_eq!(slots(&cull.translucent), [0]);
         assert!(hidden.visible(0) && !hidden.visible(1) && hidden.visible(32));
         let none = SlotVisibility {
@@ -747,7 +926,7 @@ mod tests {
             changed: false,
         };
         cull.run(&table, &view, Some(none));
-        assert_eq!(slots(&cull.opaque), [0, 1]);
+        assert_eq!(slots(&flat(&cull.opaque)), [0, 1]);
     }
 
     #[test]
@@ -770,6 +949,7 @@ mod tests {
             .opaque
             .iter()
             .chain(&cull.cutout)
+            .flatten()
             .chain(&cull.translucent);
         assert_eq!(got.chunks, cull.visible_chunks);
         assert_eq!(got.buckets as usize, drawn.clone().count());
@@ -796,7 +976,13 @@ mod tests {
         let mut cull = CpuCull::default();
         cull.run(&table, &view, None);
         assert_eq!(cull.visible_chunks, 1);
-        assert!(cull.opaque.iter().chain(&cull.cutout).all(|d| d.slot == 0));
+        assert!(
+            cull.opaque
+                .iter()
+                .chain(&cull.cutout)
+                .flatten()
+                .all(|d| d.slot == 0)
+        );
         // integer subtraction first: the same result far from the world origin
         let far = 1i64 << 24;
         let table = table_with(&[I64Vec3::new(far, 0, far - 64)]);
@@ -834,13 +1020,13 @@ mod tests {
                     .collect()
             };
             // Low draws with the wrapped origin of each chunk.
-            for d in cull.opaque.iter().chain(&cull.cutout) {
+            for d in cull.opaque.iter().chain(&cull.cutout).flatten() {
                 assert_eq!(d.origin, wrap_to_i32(origins[d.slot as usize]));
             }
             (
                 cull.visible_chunks,
-                buckets(&cull.opaque),
-                buckets(&cull.cutout),
+                buckets(&cull.opaque.concat()),
+                buckets(&cull.cutout.concat()),
             )
         };
         let near = run(I64Vec3::ZERO);
@@ -898,7 +1084,7 @@ mod tests {
                 assert_eq!(view.frustum.intersects_aabb(&aabb), in_front, "{eye}");
             }
             cull.run(&table, &view, None);
-            let mut slots: Vec<u32> = cull.opaque.iter().map(|d| d.slot).collect();
+            let mut slots: Vec<u32> = cull.opaque.iter().flatten().map(|d| d.slot).collect();
             slots.dedup();
             assert_eq!(slots, visible, "camera at {eye}");
             assert_eq!(

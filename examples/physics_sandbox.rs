@@ -906,7 +906,6 @@ fn main() -> AppExit {
         .timeout
         .map(|timeout| spawn_watchdog(timeout.saturating_add(WATCHDOG_GRACE)));
 
-    let (arena_quads, max_chunk_slots) = options.world.render_capacity();
     let plugins = DefaultPlugins
         .set(WindowPlugin {
             primary: WindowSettings {
@@ -921,8 +920,7 @@ fn main() -> AppExit {
                 gpu,
                 gpu_config,
                 render_when_hidden: options.automation(),
-                arena_quads,
-                max_chunk_slots,
+                chunk_memory: options.world.chunk_memory(),
                 ..RenderSettings::default()
             },
         })

@@ -86,7 +86,7 @@ struct View {
   camera_rel: vec4<f32>,           // xyz = eye position relative to render_origin
   fog_color: vec4<f32>,
   fog_params: vec4<f32>,           // x = fog start, y = fog end (world units)
-  counts: vec4<u32>,               // x = chunk slot count, y = opaque list capacity (= cutout list base), z = cutout list capacity (High), w = 1: cave culling bits in use (High)
+  counts: vec4<u32>,               // x = chunk slot count, y = pages with draw lists (L), z = opaque draws per page list (stride; the cutout lists hold stride / 6, after L opaque ones), w = 1: cave culling bits in use (High)
   sky_light: vec4<f32>,            // rgb = sky light color times the daylight intensity (linear), a = ambient floor
   light_params: vec4<f32>,         // x = AO strength (0.55: the darkest corner keeps 45 %), y = block-light gain, zw = 0
   light_curve: array<vec4<f32>, 4>, // brightness of light levels 0..15 (level 4k + j at [k][j]; level 15 = 1)
@@ -98,12 +98,12 @@ struct View {
 
 struct ChunkGpu {                  // 64 bytes, mirrors boxel_shaders::gpu::ChunkGpu
   origin: vec3<i32>,               // world voxel min corner of the chunk, low 32 bits (wraps; only used minus render_origin)
-  quad_base: u32,                  // first quad of bucket 0 in the quad arena
+  quad_base: u32,                  // first quad of bucket 0 in the chunk's page
   counts: array<u32, 8>,           // [0..6) opaque face buckets, [6] cutout, [7] translucent
   flags: u32,                      // bit0 = live
-  light_base: u32,                 // first light palette entry in the quad arena (= quad_base + total quads)
+  light_base: u32,                 // first light palette entry in the chunk's page (= quad_base + total quads)
   light_len: u32,                  // light palette entries (>= 1); a quad index not below it reads open sky
-  pad: u32,
+  page: u32,                       // the page holding the chunk (< MAX_PAGES); only the High cull reads it
 };
 
 struct VsOut {

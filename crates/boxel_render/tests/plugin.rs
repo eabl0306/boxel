@@ -10,8 +10,9 @@ use boxel_ecs::prelude::*;
 use boxel_ecs::schedule::ScheduleLabel;
 use boxel_gfx::PresentModePref;
 use boxel_render::{
-    GpuFailed, GpuReady, PresentSettings, Render, RenderInfo, RenderPlugin, RenderSettings,
-    RenderSystems, RequestScreenshot, ScreenshotSaved, SurfaceInfo,
+    ChunkMemoryError, ChunkMemorySettings, DebugAllocProbe, GpuFailed, GpuReady, MemoryCeiling,
+    PresentSettings, Render, RenderInfo, RenderPlugin, RenderSettings, RenderSystems,
+    RequestScreenshot, ScreenshotSaved, SurfaceInfo,
 };
 use boxel_world::ChunkMeshEvent;
 use std::collections::HashSet;
@@ -145,6 +146,7 @@ fn render_runs_right_after_last_and_registers_its_messages() {
     assert!(world.contains_resource::<Messages<RequestScreenshot>>());
     assert!(world.contains_resource::<Messages<ScreenshotSaved>>());
     assert!(world.contains_resource::<Messages<ChunkMeshEvent>>());
+    assert!(world.contains_resource::<Messages<DebugAllocProbe>>());
     assert!(world.contains_resource::<RenderInfo>());
     assert!(world.contains_resource::<SurfaceInfo>());
     assert_eq!(world.resource::<RenderSettings>().app_name, "plugin_test");
@@ -244,4 +246,36 @@ fn without_a_window_the_plugin_stays_idle() {
     // `Shutdown` with nothing to release is fine.
     app.shutdown();
     assert!(!app.world().resource::<RenderInfo>().ready);
+}
+
+/// The chunk memory a renderer starts with (ADR 0035): two pages of 4 Mi quads, 32,768 slots,
+/// the ceiling by adapter class, growth on; invalid settings are refused before a renderer is
+/// built.
+#[test]
+fn chunk_memory_settings_default_and_validate() {
+    let settings = RenderSettings::default().chunk_memory;
+    assert_eq!(settings, ChunkMemorySettings::default());
+    assert_eq!(
+        (settings.initial_quads, settings.initial_slots),
+        (8 << 20, 32768)
+    );
+    assert_eq!(
+        (settings.page_quads, settings.page_chunks),
+        (4 << 20, 10922)
+    );
+    assert_eq!(
+        (settings.max_quads, settings.max_slots),
+        (MemoryCeiling::Auto, 1 << 20)
+    );
+    assert!(settings.grow);
+    assert_eq!(settings.validate(), Ok(()));
+    let quads = |class| MemoryCeiling::Auto.quads(class);
+    assert_eq!(quads(wgpu::DeviceType::DiscreteGpu), 192 << 20);
+    assert_eq!(quads(wgpu::DeviceType::IntegratedGpu), 96 << 20);
+    assert_eq!(quads(wgpu::DeviceType::Cpu), 32 << 20);
+    let tiny = ChunkMemorySettings {
+        page_quads: 1000,
+        ..settings
+    };
+    assert_eq!(tiny.validate(), Err(ChunkMemoryError::PageQuads(1000)));
 }
