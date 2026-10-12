@@ -1,12 +1,16 @@
 //! [`TerrainGenerator`]: the M0 heightmap terrain.
 
-use super::{Heightmap, Sea};
+use super::names::Role;
+use super::{BlockNames, Heightmap, MissingBlocks, Sea};
 use boxel_voxel::{
     BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SHIFT, CHUNK_SIZE, CHUNK_VOLUME, ChunkData,
     ChunkKey,
 };
 use boxel_worldgen::{Frequency, LodSource, WorldGenerator, block};
 use std::ops::RangeInclusive;
+
+/// Name in logs and panics.
+const NAME: &str = "TerrainGenerator";
 
 /// Parameters of [`TerrainGenerator`].
 #[derive(Clone, Debug, PartialEq)]
@@ -28,6 +32,9 @@ pub struct TerrainSettings {
     pub snow_level: i32,
     /// Lowest generated y (bedrock); below is air (and outside `vertical_chunks`).
     pub bottom: i32,
+    /// The blocks it places, and those of a [`ForestGenerator`](super::ForestGenerator) on this
+    /// terrain: the demo's by default.
+    pub names: BlockNames,
 }
 
 impl Default for TerrainSettings {
@@ -41,6 +48,7 @@ impl Default for TerrainSettings {
             sand_level: 40,
             snow_level: 100,
             bottom: -64,
+            names: BlockNames::default(),
         }
     }
 }
@@ -77,6 +85,18 @@ impl TerrainGenerator {
     pub fn height_at(&self, x: i64, z: i64) -> i32 {
         // Computed in i32 (`Heightmap` keeps the settings' types), so it fits.
         self.heightmap().height_at(self.seed, x, z) as i32
+    }
+
+    /// `Ok` if `registry` has every block of [`TerrainSettings::names`] this generator places
+    /// (the surface blocks and the bedrock), else the error that names each missing one (see
+    /// [`BlockNames`]).
+    pub fn check(&self, registry: &BlockRegistry) -> Result<(), MissingBlocks> {
+        self.settings.names.require(registry, NAME, Self::roles())
+    }
+
+    /// The blocks of [`TerrainGenerator::check`].
+    pub(crate) fn roles() -> impl Iterator<Item = Role> {
+        Role::SURFACE.into_iter().chain([Role::Bedrock])
     }
 
     /// The heightmap stage of these settings.
@@ -146,8 +166,8 @@ impl TerrainGenerator {
     }
 
     /// [`WorldGenerator::generate`] with `sea`: source water from above each low column up to
-    /// the sea level and sand on the columns of [`Sea::sandy`] (no water without `boxel:water`
-    /// in the registry). `None` is the terrain as it was.
+    /// the sea level and sand on the columns of [`Sea::sandy`] (no water without
+    /// [`BlockNames::water`] in the registry). `None` is the terrain as it was.
     pub(crate) fn generate_with(
         &self,
         key: ChunkKey,
@@ -156,7 +176,8 @@ impl TerrainGenerator {
     ) -> ChunkData {
         let s = &self.settings;
         let origin = key.pos.origin();
-        let water = sea.and_then(|_| registry.by_name("boxel:water"));
+        let names = &s.names;
+        let water = sea.and_then(|_| registry.by_name(names.water));
         let sea = sea.filter(|_| water.is_some());
         // The highest block of any column: its top, or the water over it.
         let sea_top = sea.map_or(i32::MIN, sea_level_i32);
@@ -170,7 +191,7 @@ impl TerrainGenerator {
             return ChunkData::uniform(BlockState::AIR);
         }
         if y0 > bottom && y1 < i64::from(self.min_possible_height().saturating_sub(s.dirt_depth)) {
-            return ChunkData::uniform(block(registry, "boxel:stone", "TerrainGenerator"));
+            return ChunkData::uniform(block(registry, names.stone, NAME));
         }
         // Column heights, indexed like one y layer of the chunk: `x * 32 + z`.
         let heights = self.column_heights(origin.x, origin.z);
@@ -181,15 +202,15 @@ impl TerrainGenerator {
         if y0 > i64::from(max_h.max(s.bottom).max(sea_top)) {
             return ChunkData::uniform(BlockState::AIR);
         }
-        let stone = block(registry, "boxel:stone", "TerrainGenerator");
+        let stone = block(registry, names.stone, NAME);
         if y0 > bottom && y1 < i64::from(min_h.saturating_sub(s.dirt_depth)) {
             return ChunkData::uniform(stone);
         }
-        let bedrock = block(registry, "boxel:bedrock", "TerrainGenerator");
-        let dirt = block(registry, "boxel:dirt", "TerrainGenerator");
-        let grass = block(registry, "boxel:grass", "TerrainGenerator");
-        let sand = block(registry, "boxel:sand", "TerrainGenerator");
-        let snow = block(registry, "boxel:snow", "TerrainGenerator");
+        let bedrock = block(registry, names.bedrock, NAME);
+        let dirt = block(registry, names.dirt, NAME);
+        let grass = block(registry, names.grass, NAME);
+        let sand = block(registry, names.sand, NAME);
+        let snow = block(registry, names.snow, NAME);
         let water = water.unwrap_or(BlockState::AIR);
         let sandy = |h: i32| sea.is_some_and(|sea| sea.sandy(i64::from(h)));
         let top_block = |h: i32| {

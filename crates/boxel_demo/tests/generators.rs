@@ -182,6 +182,7 @@ fn terrain_chunks_follow_the_column_rules() {
             sand_level: 2,
             snow_level: 14,
             bottom: -6,
+            ..TerrainSettings::default()
         },
     );
     let mut tops = std::collections::BTreeSet::new();

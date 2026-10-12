@@ -36,7 +36,8 @@ pub use caves::{
 };
 pub use terrain::{Heightmap, SurfaceBlocks, SurfaceRules};
 
-use crate::worldgen::{Plants, Sea, Tree, Trees};
+use crate::worldgen::names::Role;
+use crate::worldgen::{BlockNames, MissingBlocks, Plants, Sea, Tree, Trees};
 use boxel_voxel::{
     BlockPos, BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SHIFT, CHUNK_SIZE, CHUNK_VOLUME,
     ChunkData, ChunkKey, LocalPos,
@@ -64,11 +65,13 @@ pub struct OverworldSettings {
     /// Water up to a sea level over the low columns, sand beaches, and no cave within
     /// [`Sea::FLOOR`] blocks under the water (ADR 0021; `None`: dry).
     pub sea: Option<Sea>,
+    /// The blocks it places (all but [`BlockNames::bedrock`]): the demo's by default.
+    pub names: BlockNames,
 }
 
 impl Default for OverworldSettings {
     /// The default heightmap and surface, the default caves (with openings), trees, plants and
-    /// sea.
+    /// sea, and the demo's blocks.
     fn default() -> Self {
         Self {
             heightmap: Heightmap::default(),
@@ -79,6 +82,7 @@ impl Default for OverworldSettings {
             trees: Some(Trees::default()),
             plants: Some(Plants::default()),
             sea: Some(Sea::default()),
+            names: BlockNames::default(),
         }
     }
 }
@@ -116,6 +120,19 @@ impl OverworldGenerator {
         Self { seed, settings }
     }
 
+    /// `Ok` if `registry` has every block of [`OverworldSettings::names`] this generator
+    /// places: the surface blocks, the water with a sea, the log and leaves with trees, the
+    /// plants with plants. Else the error that names each missing one (see [`BlockNames`]).
+    pub fn check(&self, registry: &BlockRegistry) -> Result<(), MissingBlocks> {
+        let s = &self.settings;
+        let roles = Role::SURFACE
+            .into_iter()
+            .chain(s.sea.map(|_| Role::Water))
+            .chain(s.trees.iter().flat_map(|_| Role::TREES))
+            .chain(s.plants.iter().flat_map(|_| Role::PLANTS));
+        s.names.require(registry, NAME, roles)
+    }
+
     /// The surface rules with the sea's beaches: sand up to `level + beach`.
     pub(crate) fn rules(&self) -> SurfaceRules {
         let mut rules = self.settings.surface.clone();
@@ -133,9 +150,10 @@ impl OverworldGenerator {
             .is_some_and(|sea| sea.covers(h) && y > h.saturating_sub(Sea::FLOOR))
     }
 
-    /// The sea, if `boxel:water` is in `registry`, with its water.
+    /// The sea, if its water ([`BlockNames::water`]) is in `registry`, with its water.
     fn sea_water(&self, registry: &BlockRegistry) -> Option<(Sea, BlockState)> {
-        Some((self.settings.sea?, registry.by_name("boxel:water")?))
+        let sea = self.settings.sea?;
+        Some((sea, registry.by_name(self.settings.names.water)?))
     }
 
     /// Surface height of column `(x, z)` (before the caves).
@@ -201,7 +219,7 @@ impl OverworldGenerator {
     pub fn block_at(&self, p: BlockPos, registry: &BlockRegistry) -> BlockState {
         let h = self.height_at(p.x, p.z);
         if p.y <= h && !self.carves(p, h) {
-            let blocks = SurfaceBlocks::new(registry, NAME);
+            let blocks = SurfaceBlocks::named(registry, &self.settings.names, NAME);
             return self.rules().block_at(&blocks, h, p.y);
         }
         if let Some((sea, water)) = self.sea_water(registry)
@@ -213,8 +231,8 @@ impl OverworldGenerator {
         }
         let (Some(trees), Some(log), Some(leaves)) = (
             &self.settings.trees,
-            registry.by_name("boxel:log"),
-            registry.by_name("boxel:leaves"),
+            registry.by_name(self.settings.names.log),
+            registry.by_name(self.settings.names.leaves),
         ) else {
             return BlockState::AIR;
         };
@@ -234,7 +252,10 @@ impl OverworldGenerator {
     /// The plant at `p` (air if none): on the cell above a solid grass top (`h` is the column's
     /// height).
     fn plant_at(&self, p: BlockPos, h: i64, registry: &BlockRegistry) -> BlockState {
-        let (Some(plants), Some(blocks)) = (&self.settings.plants, Plants::blocks(registry)) else {
+        let (Some(plants), Some(blocks)) = (
+            &self.settings.plants,
+            Plants::blocks_named(registry, &self.settings.names),
+        ) else {
             return BlockState::AIR;
         };
         let grows = p.y == h + 1
@@ -319,7 +340,7 @@ impl OverworldGenerator {
         highest: i64,
         registry: &BlockRegistry,
     ) -> Vec<BlockState> {
-        let blocks = SurfaceBlocks::new(registry, NAME);
+        let blocks = SurfaceBlocks::named(registry, &self.settings.names, NAME);
         let y0 = origin.y;
         let mut dense = vec![BlockState::AIR; CHUNK_VOLUME];
         let rules = self.rules();
@@ -456,8 +477,8 @@ impl OverworldGenerator {
     ) -> (Vec<Tree>, BlockState, BlockState) {
         let (Some(trees), Some(log), Some(leaves)) = (
             &self.settings.trees,
-            registry.by_name("boxel:log"),
-            registry.by_name("boxel:leaves"),
+            registry.by_name(self.settings.names.log),
+            registry.by_name(self.settings.names.leaves),
         ) else {
             return (Vec::new(), BlockState::AIR, BlockState::AIR);
         };
@@ -495,7 +516,10 @@ impl OverworldGenerator {
         dense: &mut Option<Vec<BlockState>>,
         registry: &BlockRegistry,
     ) {
-        let (Some(plants), Some(blocks)) = (&self.settings.plants, Plants::blocks(registry)) else {
+        let (Some(plants), Some(blocks)) = (
+            &self.settings.plants,
+            Plants::blocks_named(registry, &self.settings.names),
+        ) else {
             return;
         };
         let size = i64::from(CHUNK_SIZE);
@@ -552,7 +576,7 @@ impl WorldGenerator for OverworldGenerator {
         if y0 > (heightmap.max_height() + self.reach_above()).max(sea_top) {
             return ChunkData::uniform(BlockState::AIR);
         }
-        let stone = || block(registry, "boxel:stone", NAME);
+        let stone = || block(registry, self.settings.names.stone, NAME);
         // Deep: every corner and voxel is below every depth rule of every column.
         if y0 + size <= heightmap.min_height().saturating_sub(self.surface_reach()) {
             return self.carved_stone(origin, || None, stone());

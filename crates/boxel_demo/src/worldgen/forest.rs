@@ -1,6 +1,7 @@
 //! [`ForestGenerator`]: the M0 terrain with trees, the default world of the examples.
 
-use super::{PlantBlocks, Plants, Sea, TerrainGenerator, TerrainSettings, Trees};
+use super::names::Role;
+use super::{MissingBlocks, PlantBlocks, Plants, Sea, TerrainGenerator, TerrainSettings, Trees};
 use boxel_voxel::{BlockPos, BlockRegistry, BlockState, CHUNK_SIZE, ChunkData, ChunkKey, LocalPos};
 use boxel_worldgen::{LodSource, WorldGenerator};
 use std::ops::RangeInclusive;
@@ -11,9 +12,9 @@ use std::ops::RangeInclusive;
 /// neighbor data.
 ///
 /// This is the world the examples streamed as `Forest` before it moved here: for the same seed
-/// it gave the same chunks until the plants came (ADR 0018). Without `boxel:log` or
-/// `boxel:leaves` in the registry the trees are skipped; without `boxel:short_grass` or
-/// `boxel:poppy`, the plants.
+/// it gave the same chunks until the plants came (ADR 0018). Its blocks are the terrain's
+/// [`TerrainSettings::names`]. Without their log or leaves in the registry the trees are skipped;
+/// without their short grass or flower, the plants.
 ///
 /// The trees go in with [`Trees::place`] ([`ChunkData::set`], about 60 us per chunk with trees)
 /// on purpose: it is the default world of the stress runs, and the earlier runs (master and the
@@ -55,6 +56,19 @@ impl ForestGenerator {
             plants: Some(Plants::default()),
             sea: Some(Sea::default()),
         }
+    }
+
+    /// `Ok` if `registry` has every block of the terrain's [`TerrainSettings::names`] this
+    /// generator places: the terrain's, the log and leaves, the water with a sea, the plants with
+    /// plants. Else the error that names each missing one (see
+    /// [`BlockNames`](super::BlockNames)).
+    pub fn check(&self, registry: &BlockRegistry) -> Result<(), MissingBlocks> {
+        let roles = TerrainGenerator::roles()
+            .chain(self.sea.map(|_| Role::Water))
+            .chain(Role::TREES)
+            .chain(self.plants.iter().flat_map(|_| Role::PLANTS));
+        let names = &self.terrain.settings.names;
+        names.require(registry, "ForestGenerator", roles)
     }
 
     /// Ground heights trees may grow on: grass, `sand_level + 1 ..= snow_level`, above the
@@ -106,10 +120,10 @@ impl WorldGenerator for ForestGenerator {
     fn generate(&self, key: ChunkKey, registry: &BlockRegistry) -> ChunkData {
         let mut data = self.terrain.generate_with(key, registry, self.sea);
         let origin = key.pos.origin();
-        if let (Some(log), Some(leaves)) = (
-            registry.by_name("boxel:log"),
-            registry.by_name("boxel:leaves"),
-        ) {
+        let names = &self.terrain.settings.names;
+        if let (Some(log), Some(leaves)) =
+            (registry.by_name(names.log), registry.by_name(names.leaves))
+        {
             let grounds = self.grounds();
             let trees = self
                 .trees
@@ -119,7 +133,8 @@ impl WorldGenerator for ForestGenerator {
                 });
             Trees::place(&trees, origin, &mut data, log, leaves);
         }
-        if let (Some(plants), Some(blocks)) = (&self.plants, Plants::blocks(registry)) {
+        if let (Some(plants), Some(blocks)) = (&self.plants, Plants::blocks_named(registry, names))
+        {
             self.place_plants(plants, blocks, origin, &mut data);
         }
         data

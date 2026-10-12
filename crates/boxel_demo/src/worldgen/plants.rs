@@ -3,6 +3,7 @@
 //! neighbor data; a plant goes on the cell above the ground block when that cell is air (trees
 //! win).
 
+use super::BlockNames;
 use boxel_voxel::{BlockRegistry, BlockState};
 use boxel_worldgen::noise::hash2;
 
@@ -12,9 +13,9 @@ const PLANT_SALT: u64 = 0x0091_a275_f10e;
 /// What grows on one column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlantKind {
-    /// `boxel:short_grass`.
+    /// [`BlockNames::short_grass`] (`boxel:short_grass` by default).
     ShortGrass,
-    /// `boxel:poppy`.
+    /// [`BlockNames::flower`] (`boxel:poppy` by default).
     Flower,
 }
 
@@ -55,11 +56,17 @@ impl Plants {
         }
     }
 
-    /// The block states of the two kinds (`None` when the registry lacks either).
+    /// The block states of the two kinds with the demo's names ([`BlockNames::default`]), as
+    /// [`Plants::blocks_named`].
     pub fn blocks(registry: &BlockRegistry) -> Option<PlantBlocks> {
+        Self::blocks_named(registry, &BlockNames::default())
+    }
+
+    /// The block states of the two kinds of `names` (`None` when the registry lacks either).
+    pub fn blocks_named(registry: &BlockRegistry, names: &BlockNames) -> Option<PlantBlocks> {
         Some(PlantBlocks {
-            grass: registry.by_name("boxel:short_grass")?,
-            flower: registry.by_name("boxel:poppy")?,
+            grass: registry.by_name(names.short_grass)?,
+            flower: registry.by_name(names.flower)?,
         })
     }
 }

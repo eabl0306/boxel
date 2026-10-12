@@ -149,7 +149,10 @@ Detalle y comandos en `bench-results/split48/integ/` (local, no se sube).
 - Migración para `game/`:
   - `WorldPlugin::default()` pasa a
     `WorldPlugin::new(gen, Arc::new(boxel_demo::blocks::registry()))`;
-  - los generadores pasan a `boxel_demo::worldgen`;
+  - los generadores pasan a `boxel_demo::worldgen`; los bloques que ponen se eligen con
+    `BlockNames` (en `TerrainSettings::names` y `OverworldSettings::names`, por defecto los
+    `boxel:` de siempre), así que un juego los usa con sus propios bloques, y `check` dice qué
+    nombres le faltan a su registro;
   - `--pack` pasa a `PackSource::new(dir).with_recipes(boxel_demo::pack::recipes())`, y los
     tintes a `boxel_demo::pack`;
   - `BlockModel::Stairs` y las demás variantes pasan a `Boxes` con un `BoxModel` registrado, y

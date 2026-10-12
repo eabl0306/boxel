@@ -11,9 +11,16 @@
 //! ([`boxel_worldgen::noise`]), and its [`LodSource`](boxel_worldgen::LodSource) for the far
 //! level of detail (ADR 0031): each answers for coarse cells from its heights, sea and trees,
 //! reading its fields on every call.
+//!
+//! The blocks they place are settings too: [`BlockNames`] in [`TerrainSettings::names`] and
+//! [`OverworldSettings::names`], the demo's `boxel:` names by default. A game with its own
+//! registry sets its own names and gets the same world, chunk by chunk and far cell by far cell,
+//! with its blocks; `check` on each generator tells it, as a [`MissingBlocks`] error, which names
+//! its registry lacks.
 
 mod forest;
 mod lod;
+mod names;
 pub mod overworld;
 mod plants;
 mod sea;
@@ -21,6 +28,7 @@ mod terrain;
 mod trees;
 
 pub use forest::ForestGenerator;
+pub use names::{BlockNames, MissingBlocks};
 pub use overworld::{
     CaveSettings, Caves, Heightmap, OverworldGenerator, OverworldSettings, SurfaceRules,
 };

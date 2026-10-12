@@ -1,7 +1,7 @@
 //! The surface stages: [`Heightmap`] (one height per column) and [`SurfaceRules`] (which block
 //! each depth of a column gets).
 
-use crate::worldgen::TerrainSettings;
+use crate::worldgen::{BlockNames, TerrainSettings};
 use boxel_voxel::{BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SIZE};
 use boxel_worldgen::Frequency;
 use boxel_worldgen::noise::{self, Fbm};
@@ -213,29 +213,34 @@ impl SurfaceRules {
 /// The blocks of the surface rules, resolved from a registry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SurfaceBlocks {
-    /// `boxel:stone`.
+    /// [`BlockNames::stone`].
     pub stone: BlockState,
-    /// `boxel:dirt`.
+    /// [`BlockNames::dirt`].
     pub dirt: BlockState,
-    /// `boxel:grass`.
+    /// [`BlockNames::grass`].
     pub grass: BlockState,
-    /// `boxel:sand`.
+    /// [`BlockNames::sand`].
     pub sand: BlockState,
-    /// `boxel:snow`.
+    /// [`BlockNames::snow`].
     pub snow: BlockState,
 }
 
 impl SurfaceBlocks {
-    /// The built-in blocks; panics with the name if `registry` lacks one (the generator and the
-    /// registry do not match).
+    /// The demo's blocks ([`BlockNames::default`]), as [`SurfaceBlocks::named`].
     pub fn new(registry: &BlockRegistry, generator: &str) -> Self {
+        Self::named(registry, &BlockNames::default(), generator)
+    }
+
+    /// The blocks of `names`; panics with the name if `registry` lacks one (the generator and
+    /// the registry do not match: `check` on the generator says so without panicking).
+    pub fn named(registry: &BlockRegistry, names: &BlockNames, generator: &str) -> Self {
         let block = |name| boxel_worldgen::block(registry, name, generator);
         Self {
-            stone: block("boxel:stone"),
-            dirt: block("boxel:dirt"),
-            grass: block("boxel:grass"),
-            sand: block("boxel:sand"),
-            snow: block("boxel:snow"),
+            stone: block(names.stone),
+            dirt: block(names.dirt),
+            grass: block(names.grass),
+            sand: block(names.sand),
+            snow: block(names.snow),
         }
     }
 }

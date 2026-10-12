@@ -10,7 +10,8 @@
 //! - [`pack`]: how the demo layers read a Minecraft resource pack.
 //! - [`textures`]: the procedural painter of the demo layers.
 //! - [`worldgen`]: the terrain, forest and overworld generators, the sea and the caves, and
-//!   [`worldgen::DEFAULT_SEED`].
+//!   [`worldgen::DEFAULT_SEED`]. The blocks they place are a setting
+//!   ([`worldgen::BlockNames`], these blocks by default), so a game reuses them with its own.
 //! - [`fog`]: the fog and cloud presets (valley fog, clouds, a blanket, dusk).
 //!
 //! Not published: a game copies what it needs, or depends on it by path.

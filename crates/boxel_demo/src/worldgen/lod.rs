@@ -35,7 +35,9 @@
 //! examples' forest without a sea), and every cell is a pure function of its world position, so
 //! the borders of neighboring nodes agree.
 
-use super::{ForestGenerator, Heightmap, OverworldGenerator, Sea, TerrainGenerator, Tree, Trees};
+use super::{
+    BlockNames, ForestGenerator, Heightmap, OverworldGenerator, Sea, TerrainGenerator, Tree, Trees,
+};
 use crate::worldgen::overworld::{SurfaceBlocks, SurfaceRules};
 use boxel_voxel::{BlockRegistry, BlockState};
 use boxel_worldgen::lod::{
@@ -396,15 +398,15 @@ impl Surface<'_> {
 }
 
 impl Blocks {
-    /// The blocks of `registry`; the surface ones must be there (named after `generator` if
-    /// not), water, log and leaves may be missing (no sea, no trees).
-    fn new(registry: &BlockRegistry, generator: &str) -> Self {
+    /// The blocks of `names` in `registry`; the surface ones must be there (named after
+    /// `generator` if not), water, log and leaves may be missing (no sea, no trees).
+    fn new(registry: &BlockRegistry, names: &BlockNames, generator: &str) -> Self {
         let or_air = |name| registry.by_name(name).unwrap_or(BlockState::AIR);
         Self {
-            surface: SurfaceBlocks::new(registry, generator),
-            water: or_air("boxel:water"),
-            log: or_air("boxel:log"),
-            leaves: or_air("boxel:leaves"),
+            surface: SurfaceBlocks::named(registry, names, generator),
+            water: or_air(names.water),
+            log: or_air(names.log),
+            leaves: or_air(names.leaves),
         }
     }
 
@@ -440,7 +442,7 @@ impl LodSource for TerrainGenerator {
             rules: SurfaceRules::from_terrain(&self.settings),
             trees: None,
             sea: None,
-            blocks: Blocks::new(registry, "TerrainGenerator"),
+            blocks: Blocks::new(registry, &self.settings.names, "TerrainGenerator"),
         }
         .column(req, scratch, emit)
     }
@@ -448,8 +450,8 @@ impl LodSource for TerrainGenerator {
 
 impl LodSource for ForestGenerator {
     /// The terrain with its trees and sea as
-    /// [`generate`](boxel_worldgen::WorldGenerator::generate) places them (water only with
-    /// `boxel:water` in the registry, trees only with `boxel:log` and `boxel:leaves`); the floor
+    /// [`generate`](boxel_worldgen::WorldGenerator::generate) places them (water only with its
+    /// [`BlockNames::water`] in the registry, trees only with its log and leaves); the floor
     /// counts as stone.
     fn column(
         &self,
@@ -458,7 +460,7 @@ impl LodSource for ForestGenerator {
         scratch: &mut LodScratch,
         emit: &mut dyn FnMut(i64, LodNode<'_>),
     ) -> LodColumn {
-        let blocks = Blocks::new(registry, "ForestGenerator");
+        let blocks = Blocks::new(registry, &self.terrain.settings.names, "ForestGenerator");
         let sea = self.sea.filter(|_| blocks.has_water());
         let rules = SurfaceRules::from_terrain(&self.terrain.settings);
         Surface {
@@ -482,7 +484,7 @@ impl LodSource for OverworldGenerator {
         scratch: &mut LodScratch,
         emit: &mut dyn FnMut(i64, LodNode<'_>),
     ) -> LodColumn {
-        let blocks = Blocks::new(registry, "OverworldGenerator");
+        let blocks = Blocks::new(registry, &self.settings.names, "OverworldGenerator");
         let trees = self.settings.trees.as_ref().filter(|_| blocks.has_trees());
         Surface {
             seed: self.seed,
@@ -509,7 +511,7 @@ mod tests {
         terrain: &'a TerrainGenerator,
         registry: &BlockRegistry,
     ) -> [Surface<'a>; 3] {
-        let blocks = Blocks::new(registry, "test");
+        let blocks = Blocks::new(registry, &BlockNames::default(), "test");
         let forest_sea = forest.sea.filter(|_| blocks.has_water());
         [
             Surface {

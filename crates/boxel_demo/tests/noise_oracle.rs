@@ -194,6 +194,7 @@ fn power_of_two_frequencies_are_bit_identical_to_the_former_noise() {
                     sand_level: 2,
                     snow_level: 14,
                     bottom: -6,
+                    ..TerrainSettings::default()
                 },
             ),
             10_000,
