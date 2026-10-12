@@ -42,7 +42,8 @@ const NODE_BYTES: u64 = 32;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MemoryCeiling {
     /// By adapter class: 192 Mi quads (1.5 GiB of pages) on a discrete GPU, 96 Mi (768 MiB) on
-    /// an integrated one, 32 Mi (256 MiB) otherwise; never below
+    /// an integrated one or one of unknown class (`Other`: wgpu's GL backend reports most real
+    /// GPUs so), 32 Mi (256 MiB) on a CPU or virtual one; never below
     /// [`ChunkMemorySettings::initial_quads`].
     #[default]
     Auto,
@@ -57,8 +58,8 @@ impl MemoryCeiling {
             Self::Quads(quads) => quads,
             Self::Auto => match class {
                 wgpu::DeviceType::DiscreteGpu => 192 << 20,
-                wgpu::DeviceType::IntegratedGpu => 96 << 20,
-                _ => 32 << 20,
+                wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::Other => 96 << 20,
+                wgpu::DeviceType::Cpu | wgpu::DeviceType::VirtualGpu => 32 << 20,
             },
         }
     }
@@ -1237,7 +1238,10 @@ mod tests {
         );
         for (class, quads) in [
             (wgpu::DeviceType::IntegratedGpu, 96 << 20),
+            // wgpu's GL backend reports most real GPUs as `Other` (the 780M among them)
+            (wgpu::DeviceType::Other, 96 << 20),
             (wgpu::DeviceType::Cpu, 32 << 20),
+            (wgpu::DeviceType::VirtualGpu, 32 << 20),
         ] {
             let layout = MemoryLayout::resolve(&ChunkMemorySettings::default(), facts(class));
             assert_eq!(layout.ceiling_quads, quads);

@@ -55,9 +55,11 @@ igual tras un resync o al reabrir un mundo.
 `ChunkMemorySettings` reemplaza `arena_quads` y `max_chunk_slots`: el piso (`initial_quads`,
 8 Mi por defecto), las slots iniciales, el techo en quads y slots (igual en los tres tiers; los
 bytes solo se informan) y el tamaño de página. El techo automático es 192 Mi quads en una GPU
-dedicada, 96 Mi en una integrada y 32 Mi en otras, y nunca queda por debajo del piso pedido: el
-backend GL de wgpu informa casi toda GPU real como `Other`, y antes un piso de 48 Mi quedaba en
-32 Mi sin aviso. Si el piso igual se corta (por el límite de páginas), se avisa al arrancar.
+dedicada, 96 Mi en una integrada o de clase desconocida y 32 Mi en una de CPU o virtual. El
+backend GL de wgpu informa casi toda GPU real como desconocida (`Other`), la 780M incluida, por
+eso esas van como integradas. El techo automático nunca queda por debajo del piso pedido; antes
+un piso de 48 Mi quedaba en 32 Mi sin aviso en GL. Si el piso igual se corta (por el límite de
+páginas), se avisa al arrancar.
 
 El piso tiene lugar para los chunks de todas las slots iniciales, como el arena único de antes.
 Si sus quads dan menos páginas de las que hacen falta (una cada 10 922 slots), los mismos quads

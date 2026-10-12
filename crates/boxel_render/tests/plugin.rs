@@ -272,6 +272,7 @@ fn chunk_memory_settings_default_and_validate() {
     let quads = |class| MemoryCeiling::Auto.quads(class);
     assert_eq!(quads(wgpu::DeviceType::DiscreteGpu), 192 << 20);
     assert_eq!(quads(wgpu::DeviceType::IntegratedGpu), 96 << 20);
+    assert_eq!(quads(wgpu::DeviceType::Other), 96 << 20);
     assert_eq!(quads(wgpu::DeviceType::Cpu), 32 << 20);
     let tiny = ChunkMemorySettings {
         page_quads: 1000,
