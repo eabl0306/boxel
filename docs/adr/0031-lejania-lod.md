@@ -640,8 +640,9 @@ rama, una vez, la máquina tranquila. Detalle en
   (criterion `lod/column` sobre el lago: nivel 1 de 254 a 373 us, nivel 4 de 218 a 337 us).
 - Las orillas de la revisión suman de 0,4 a 0,7 % de quads del LOD en el mundo del ejemplo
   (niveles 1 a 4, 24 x 24 columnas) y hasta un 19 % en un nodo que es todo lago. El trabajo de la
-  columna del lago pasa de 371 a 400 us (nivel 1) y de 345 a 359 us (nivel 4). Sin smoke de
-  frames: se dibujan siempre, pero detrás de todo, y son medio por ciento de los quads.
+  columna del lago pasa de 371 a 400 us (nivel 1) y de 345 a 359 us (nivel 4). El smoke (el agua
+  sin orillas contra dbc51de, una vez) da 928 -> 917 fps en la superficie y 1139 -> 1124 en el
+  bosque: unos 0,01 ms por frame, sin frames de más de 6,94 ms.
 
 ### Ediciones (M2)
 
