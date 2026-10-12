@@ -2,8 +2,8 @@
 
 - Estado: borrador. El M1, el M3 y parte del M5 (en las rondas de optimización) y el M2
   (ediciones y respaldo) están hechos en la rama `feat/lod` (sobre `feat/fog`), con los números
-  finales medidos sobre 3506990. Falta la prueba del dueño ("Qué mirar en el vuelo del dueño",
-  al final).
+  finales medidos sobre 3506990. Tras el vuelo del dueño, el agua lejana translúcida (M4,
+  sección 12) está hecha en `feat/fog-far`. Falta la prueba del dueño del agua.
 - Fecha: 2026-10-11
 
 ## Contexto
@@ -350,6 +350,14 @@ sus nodos vuelven a las celdas del generador. Con persistencia queda (está guar
 pirámide se lee del disco cuando hace falta. El nivel 6 (`extreme`) no muestra ediciones: ahí una
 celda abarca 8 chunks.
 
+**Respaldo.** Un generador sin `lod()` tiene solo el nivel 1 (`fallback_max_level`, 0 lo apaga),
+armado desde sus chunks reales con la regla exacta (`boxel_world::lod::fallback`): el chunk
+cargado, si no el guardado, si no el del generador (los generados se guardan por hilo, 64). Un
+trabajo arma un nodo y hay uno en vuelo: cada nodo lee hasta 64 chunks. La banda sale de
+`vertical_chunks`, que debe estar acotado (64 capas como mucho); si no, el LOD queda apagado
+(`NoSource`). El horizonte es `T_1`: 1.536 bloques con `far`. Entre frames sus pasos `Idle` solo
+juntan resultados, y no piden otro paso si no hay nada que juntar.
+
 ### 12. Agua lejana translúcida (M4, issue #50)
 
 El dueño voló el LOD y pidió el agua lejana translúcida. Con el agua opaca se veía un escalón azul
@@ -444,14 +452,6 @@ Las capas del ejemplo empiezan en y 46 y su borde de abajo la anula ahí, y el a
 46,875: no cambia nada.
 
 Sin LOD no cambia nada: las pipelines y los buffers nuevos son de `LodPass`.
-
-**Respaldo.** Un generador sin `lod()` tiene solo el nivel 1 (`fallback_max_level`, 0 lo apaga),
-armado desde sus chunks reales con la regla exacta (`boxel_world::lod::fallback`): el chunk
-cargado, si no el guardado, si no el del generador (los generados se guardan por hilo, 64). Un
-trabajo arma un nodo y hay uno en vuelo: cada nodo lee hasta 64 chunks. La banda sale de
-`vertical_chunks`, que debe estar acotado (64 capas como mucho); si no, el LOD queda apagado
-(`NoSource`). El horizonte es `T_1`: 1.536 bloques con `far`. Entre frames sus pasos `Idle` solo
-juntan resultados, y no piden otro paso si no hay nada que juntar.
 
 ## Números medidos
 
@@ -597,6 +597,22 @@ Dónde va ese tiempo: la misma superficie con `--features trace --spans` (frames
   M3 antes del M2. Su p99 (0,61 ms) sí pasa.
 - En el lado del mundo, al cruzar un borde de chunk se suman por cruce unos 0,7 ms de
   `lod_plan` y 0,6 ms de `lod_coverage`, repartidos en unos 8 frames.
+
+### Agua translúcida (M4, issue #50)
+
+El mismo smoke con `--lod far` a los dos lados, el binario de antes del agua (1df8ee5) contra la
+rama, una vez, la máquina tranquila. Detalle en
+[rendimiento/lod-2026-10.md](../rendimiento/lod-2026-10.md).
+
+| caso, sin tope | fps | p99 ms | frames > 6,94 ms | costo |
+|---|---:|---:|---:|---:|
+| RTX, superficie r16, `far` | 963 -> 928 | 2,49 -> 2,59 | 0 -> 0 | 0,04 ms |
+| RTX, bosque r16, `far` | 1183 -> 1128 | 2,14 -> 2,21 | 1 -> 0 | 0,04 ms |
+| 780M, superficie r16, `near` | 444 -> 436 | 5,66 -> 5,76 | 11 -> 0 | 0,04 ms |
+
+- Un 4 % más de quads (el fondo bajo el agua) y el agua dibujada dos veces (prepasada y color).
+- El llenado tarda de 0,1 a 0,3 s más en la RTX: un trabajo de columna con agua cuesta más
+  (criterion `lod/column` sobre el lago: nivel 1 de 254 a 373 us, nivel 4 de 218 a 337 us).
 
 ### Ediciones (M2)
 
@@ -1037,13 +1053,18 @@ cargo run --release --example voxel_world -- --adapter radeon --lod near --timeo
 7. En la 780M con `near`: que se vea bien; no tiene que ir a 144 fps.
 8. Decidir el precio en la RTX: el p99 sin tope queda de 2,3 a 3,2 veces a r16 (sin frames de
    más de 6,94 ms). Con tope 144 el LOD no se nota a r16.
+9. El agua lejana translúcida (sección 12): sobre un lago calmo, el borde del detalle completo ya
+   no tiene escalón azul; desde arriba, los lagos lejanos muestran su orilla clara y su centro
+   oscuro; de noche se oscurecen como los cercanos. Capturas de antes y después en
+   `bench-results/lod-water/` (`leeme.txt`).
 
 ## Pendiente
 
 - Decidir con el dueño el p99 sin tope de la RTX: a r16 queda de 2,3 a 3,2 veces el de sin LOD
   (sin frames de más de 6,94 ms), casi todo trabajo de GPU. Las palancas del plan (baldes por
   cara y Hi-Z) ya están; lo que queda es el preset `near` (1,37 a 2 veces) o menos triángulos.
-- La prueba del dueño volando, también la del M2 ("Qué mirar en el vuelo del dueño").
+- La prueba del dueño volando, también la del M2 y la del agua translúcida ("Qué mirar en el
+  vuelo del dueño").
 - M4, según la prueba del dueño: `textureSample` en el nivel 1 para packs de alta resolución,
   hojas más oscuras. El agua translúcida lejana está hecha (sección 12). La niebla sobre el LOD
   pasó al ADR 0032 (bruma lejana).
