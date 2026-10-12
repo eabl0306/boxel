@@ -75,6 +75,9 @@ pub enum WorldShutdownSystems {
 ///   same moment and transaction as the edited chunks, the ticks and the clock. A job that
 ///   writes entity records writes every staged chunk with them.
 ///
+/// A world whose file was repaired when it opened (it was not closed cleanly: a crash) is
+/// reported with a warning when the plugin is added ([`WorldStore::repaired`]).
+///
 /// Disk writes run in save jobs on `executor` (the IO task pool by default), one at a time; a
 /// frame only hands chunks over and starts a job. Loads read the store inside the generation
 /// jobs. A failed save keeps its chunks in memory (loads read them) and tries again after
@@ -111,6 +114,11 @@ impl Plugin for PersistPlugin {
             self.store.ids().registry_states(),
             "the WorldStore was opened with another registry than the WorldPlugin's"
         );
+        // Logged here, not while the file opened: a game may open its world before `LogPlugin`
+        // installs the subscriber (`voxel_world` does), and that line would be lost.
+        if self.store.repaired() {
+            tracing::warn!("the world file was not closed cleanly: redb repaired it");
+        }
         let mut jobs = world
             .get_resource_mut::<WorldJobs>()
             .expect("PersistPlugin needs WorldPlugin first");

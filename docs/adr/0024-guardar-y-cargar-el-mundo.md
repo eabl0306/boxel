@@ -285,6 +285,12 @@ marcador `Crate`, como haría un juego.
   (`WorldStore::close`, issue #58): redb escribe su cierre limpio y suelta el archivo aunque algún
   job guarde un clon, así un relanzamiento lo abre enseguida y sin reparar. Las operaciones
   posteriores fallan en silencio con `NotConnected`.
+- **Reparación.** Si el archivo no se cerró limpio (un crash), redb lo repara al abrirlo. Abrir
+  no escribe en el log, porque un juego puede abrir el mundo antes de que el log exista (así lo
+  hacen `voxel_world` y `snapshot`) y la línea se perdería. El store lo guarda
+  (`ChunkStore::repaired`, `WorldStore::repaired`) y `PersistPlugin` deja un solo aviso cuando
+  se agrega (test). Un archivo nuevo no cuenta, aunque redb también pase por su reparación al
+  crearlo.
 
 La carga y la escritura usan la maquinaria de jobs de siempre (`JobExecutor`, con
 `IoTaskPoolExecutor` nuevo para las escrituras), así los tests corren todo en línea y son
@@ -294,9 +300,9 @@ deterministas.
 
 - `boxel_world::persist`: `ChunkStore` (ahora con `keys`, `load_meta` y `save_batch` de un
   `SaveBatch` de chunks y metadatos), `RedbStore`, `MemoryStore`, `NullChunkStore`,
-  `WorldStore` (`open`, `open_dir`, `meta`, `put_meta`, `stats`, `ids`, `close`), `PersistPlugin`
-  (después de `WorldPlugin`), `WorldShutdownSystems`, `PersistSettings`, `PersistStats`,
-  `PersistError`, `IdMap` y `format` (claves, registros).
+  `WorldStore` (`open`, `open_dir`, `meta`, `put_meta`, `stats`, `ids`, `close`, `repaired`),
+  `PersistPlugin` (después de `WorldPlugin`), `WorldShutdownSystems`, `PersistSettings`,
+  `PersistStats`, `PersistError`, `IdMap` y `format` (claves, registros).
 - Un `WorldStore` sirve a un solo `PersistPlugin`. Una `App` nueva abre el mundo otra vez: un
   segundo plugin con el mismo store (o un clon) entra en pánico, porque empezaría sin el índice
   de chunks guardados y guardaría copias generadas encima de ellos (test).

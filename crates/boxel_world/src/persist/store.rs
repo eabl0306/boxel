@@ -392,6 +392,13 @@ impl WorldStore {
         result
     }
 
+    /// The world's file was not closed cleanly (a crash) and was repaired when it opened
+    /// ([`ChunkStore::repaired`]). [`PersistPlugin`](super::PersistPlugin) logs it once, when it
+    /// is added.
+    pub fn repaired(&self) -> bool {
+        self.inner.backend.repaired()
+    }
+
     /// [`WorldStore::close`] ran.
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::SeqCst)

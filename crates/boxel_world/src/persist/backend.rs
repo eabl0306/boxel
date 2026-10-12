@@ -4,11 +4,11 @@ use super::format::{
     ENTITY_KEY_LEN, KEY_LEN, decode_entity_key, decode_key, encode_entity_key, encode_key,
 };
 use boxel_voxel::ChunkKey;
-use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::Path;
-use std::sync::{Mutex, PoisonError, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 /// What one [`ChunkStore::save_batch`] writes, atomically: chunk records, metadata values and
@@ -70,6 +70,13 @@ pub trait ChunkStore: Send + Sync + 'static {
     /// default only flushes and keeps the store usable (a store in memory can be opened again).
     fn close(&self) -> io::Result<()> {
         self.flush()
+    }
+    /// The store's file was not closed cleanly (a crash) and was repaired when the store opened
+    /// it. Opening logs nothing (a game may open its world before its logging is up):
+    /// [`PersistPlugin`](super::PersistPlugin) logs it. A store without a file never is (the
+    /// default).
+    fn repaired(&self) -> bool {
+        false
     }
 }
 
@@ -235,7 +242,7 @@ pub(crate) const REOPEN_EVERY: Duration = Duration::from_secs(1);
 ///
 /// [`ChunkStore::close`] closes the file cleanly at a moment the caller chooses, while clones of
 /// the store still live (jobs that read it): nothing opens it again after that. Opening a file
-/// that was not closed cleanly (a crash) repairs it, with a warning in the log.
+/// that was not closed cleanly (a crash) repairs it ([`ChunkStore::repaired`]).
 pub struct RedbStore {
     /// Opens the file again (the path, or a test's backend).
     open: Box<dyn Fn() -> Result<redb::Database, redb::DatabaseError> + Send + Sync>,
@@ -244,6 +251,8 @@ pub struct RedbStore {
     db: RwLock<Handle>,
     /// [`REOPEN_EVERY`] (tests shorten it).
     reopen_every: Duration,
+    /// The first opening repaired the file ([`ChunkStore::repaired`]).
+    repaired: bool,
     /// Runs after an operation failed, between the read lock and the write lock (tests).
     #[cfg(test)]
     after_failure: Option<Box<dyn Fn(&RedbStore) + Send + Sync>>,
@@ -277,28 +286,29 @@ fn io_error(e: impl Into<redb::Error>) -> io::Error {
 
 impl RedbStore {
     /// Opens the database file at `path`, or creates it (and its parent directories). A file
-    /// that is not a redb database is an error, never overwritten.
+    /// that is not a redb database is an error, never overwritten. A file that was not closed
+    /// cleanly is repaired, without a log line ([`ChunkStore::repaired`] tells).
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
         let path = path.to_path_buf();
-        Self::with_opener(move || {
-            // redb reports every step of a repair: one warning per opening.
-            let (file, warned) = (path.display().to_string(), Cell::new(false));
+        // redb runs its repair on a file it creates (an empty one) too: only a file that held a
+        // world was repaired.
+        let held = std::fs::metadata(&path).is_ok_and(|m| m.len() > 0);
+        // Set by every opening that repairs the file; only the first one's is kept.
+        let repairs = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&repairs);
+        let mut store = Self::with_opener(move || {
+            let seen = Arc::clone(&seen);
             redb::Database::builder()
                 .set_cache_size(REDB_CACHE_BYTES)
-                .set_repair_callback(move |_| {
-                    if !warned.replace(true) {
-                        tracing::warn!(
-                            file = file.as_str(),
-                            "the world file was not closed cleanly: redb repairs it"
-                        );
-                    }
-                })
+                .set_repair_callback(move |_| seen.store(true, Ordering::Relaxed))
                 .create(&path)
-        })
+        })?;
+        store.repaired = held && repairs.load(Ordering::Relaxed);
+        Ok(store)
     }
 
     /// Opens the database `open` gives, and again with it after an error.
@@ -323,6 +333,7 @@ impl RedbStore {
                 reopened: None,
             }),
             reopen_every: REOPEN_EVERY,
+            repaired: false,
             #[cfg(test)]
             after_failure: None,
         })
@@ -416,6 +427,9 @@ impl ChunkStore for RedbStore {
         handle.epoch += 1;
         drop(handle.db.take());
         Ok(())
+    }
+    fn repaired(&self) -> bool {
+        self.repaired
     }
     fn load(&self, key: ChunkKey) -> io::Result<Option<Vec<u8>>> {
         use redb::ReadableDatabase;

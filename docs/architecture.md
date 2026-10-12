@@ -1350,6 +1350,7 @@ pub trait ChunkStore: Send + Sync + 'static {
     fn save_batch(&self, batch: &SaveBatch) -> std::io::Result<()>; // chunks y metadatos, atómico
     fn flush(&self) -> std::io::Result<()> { Ok(()) }
     fn close(&self) -> std::io::Result<()> { self.flush() } // cierre limpio, para siempre
+    fn repaired(&self) -> bool { false } // se reparó al abrir (no se cerró limpio)
 }
 ```
 
@@ -1372,7 +1373,8 @@ pub trait ChunkStore: Send + Sync + 'static {
   aunque queden clones vivos (`WorldShutdownSystems::{Save, Close}`). Después, cualquier operación
   de un clon falla en silencio con `NotConnected`. Un sistema propio de `Shutdown` que escribe en
   el store va `.before(WorldShutdownSystems::Close)`. Abrir un archivo que no se cerró limpio (un
-  crash) lo repara y deja un aviso en el log.
+  crash) lo repara (`WorldStore::repaired`), y `PersistPlugin` deja un aviso en el log cuando se
+  agrega, aunque el mundo se haya abierto antes de que hubiera log.
 - Si el disco falla, los chunks esperan en memoria y `RedbStore` vuelve a abrir el archivo cuando
   el disco funciona otra vez.
 - Entidades: las marcadas con `Saved` se guardan con su chunk a través de los `EntityCodec` que

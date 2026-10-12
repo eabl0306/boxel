@@ -1,8 +1,9 @@
 //! Closing a redb world (issue #58, E-P): a closed world's file opens again at once and without a
 //! repair while clones of its store live; a file that was not closed cleanly (a crash) is
-//! repaired with one warning; the exit (`Shutdown`) saves everything, lets a game system ordered
-//! before `WorldShutdownSystems::Close` write its value and then closes the file, far from the
-//! origin and with the task pools, as in the game.
+//! repaired, and the app of the world logs one warning, also when the world opened before
+//! anything logged; the exit (`Shutdown`) saves everything, lets a game system ordered before
+//! `WorldShutdownSystems::Close` write its value and then closes the file, far from the origin
+//! and with the task pools, as in the game.
 use boxel_app::{App, Shutdown};
 use boxel_ecs::prelude::*;
 use boxel_math::DVec3;
@@ -11,7 +12,7 @@ use boxel_voxel::{
     BlockPos, BlockRegistry, BlockState, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, ChunkKey, ChunkPos,
     LocalPos,
 };
-use boxel_world::jobs::{IoTaskPoolExecutor, TaskPoolExecutor};
+use boxel_world::jobs::{InlineExecutor, IoTaskPoolExecutor, TaskPoolExecutor};
 use boxel_world::persist::{
     ChunkStore, PersistPlugin, PersistSettings, RedbStore, WORLD_FILE, WorldShutdownSystems,
     WorldStore,
@@ -128,6 +129,7 @@ fn a_closed_world_file_opens_again_at_once_without_a_repair() {
     let tmp = TempDir::new("clean");
     let registry = boxel_demo::blocks::registry();
     let store = WorldStore::open_dir(&tmp.0, &registry, "ground").unwrap();
+    assert!(!store.repaired(), "a new file is not a repair");
     store.put_meta("game:player", b"far".to_vec()).unwrap();
     // A job still holds a clone.
     let job = store.clone();
@@ -140,6 +142,7 @@ fn a_closed_world_file_opens_again_at_once_without_a_repair() {
     assert!(job.is_closed());
     drop(open_clean(&file).expect("released and clean"));
     let again = WorldStore::open_dir(&tmp.0, &registry, "ground").expect("opens at once");
+    assert!(!again.repaired());
     assert_eq!(again.meta("game:player").unwrap(), Some(b"far".to_vec()));
     assert_eq!(
         job.meta("game:player").unwrap_err().kind(),
@@ -148,39 +151,101 @@ fn a_closed_world_file_opens_again_at_once_without_a_repair() {
 }
 
 #[test]
-fn a_file_not_closed_cleanly_is_repaired_with_one_warning() {
+fn a_file_not_closed_cleanly_is_repaired_and_says_so() {
     let tmp = TempDir::new("crash");
     let registry = boxel_demo::blocks::registry();
-    let live = tmp.0.join("live");
-    let store = WorldStore::open_dir(&live, &registry, "ground").unwrap();
-    store.put_meta("game:player", b"far".to_vec()).unwrap();
-    // Copied while open: the copy was never closed cleanly, as after a crash.
-    let copy = tmp.0.join("copy").join(WORLD_FILE);
-    std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
-    std::fs::copy(live.join(WORLD_FILE), &copy).unwrap();
-    store.close().unwrap();
+    let copy = crashed_worlds(&tmp.0, &registry, 1)[0].join(WORLD_FILE);
 
+    // The open itself logs nothing: its app does (below).
     let logged = Logged::default();
     let repaired =
         tracing::subscriber::with_default(logged.clone(), || RedbStore::open(&copy)).unwrap();
-    assert_eq!(logged.with(REPAIR).len(), 1, "one warning");
+    assert!(repaired.repaired());
+    assert!(logged.with(REPAIR).is_empty());
     assert_eq!(
         repaired.load_meta("game:player").unwrap(),
         Some(b"far".to_vec())
     );
-    // Closed cleanly now: no repair, no warning.
+    // Closed cleanly now: no repair.
     repaired.close().unwrap();
-    let logged = Logged::default();
-    let again = tracing::subscriber::with_default(logged.clone(), || RedbStore::open(&copy));
-    assert!(again.is_ok());
-    assert!(logged.with(REPAIR).is_empty());
+    assert!(!RedbStore::open(&copy).unwrap().repaired());
     // Nor for the world closed by its store.
-    let logged = Logged::default();
-    let live = tracing::subscriber::with_default(logged.clone(), || {
-        RedbStore::open(live.join(WORLD_FILE))
+    let live = RedbStore::open(tmp.0.join("live").join(WORLD_FILE)).unwrap();
+    assert!(!live.repaired());
+}
+
+/// `count` world directories whose file was copied while its store was open: files that were
+/// never closed cleanly, as after a crash.
+fn crashed_worlds(dir: &Path, registry: &BlockRegistry, count: usize) -> Vec<PathBuf> {
+    let live = dir.join("live");
+    let store = WorldStore::open_dir(&live, registry, "ground").unwrap();
+    store.put_meta("game:player", b"far".to_vec()).unwrap();
+    let copies = (0..count)
+        .map(|i| {
+            let copy = dir.join(format!("crash-{i}"));
+            std::fs::create_dir_all(&copy).unwrap();
+            std::fs::copy(live.join(WORLD_FILE), copy.join(WORLD_FILE)).unwrap();
+            copy
+        })
+        .collect();
+    store.close().unwrap();
+    copies
+}
+
+/// An app with the world of `store` (built, never updated).
+fn app_with(store: WorldStore, registry: &Arc<BlockRegistry>) -> App {
+    let mut app = App::new();
+    app.add_plugins(WorldPlugin {
+        generator: Arc::new(Ground),
+        registry: Arc::clone(registry),
+        executor: Arc::new(InlineExecutor),
+        ..WorldPlugin::default()
+    })
+    .add_plugins(PersistPlugin {
+        store,
+        executor: Arc::new(InlineExecutor),
     });
-    assert!(live.is_ok());
-    assert!(logged.with(REPAIR).is_empty());
+    app
+}
+
+/// A world opened before anything logs (`voxel_world` and `snapshot` open theirs before
+/// `LogPlugin` installs the subscriber) still reports its repair, once, when its `PersistPlugin`
+/// is added; one opened while the app logs reports it once too, not twice; a clean one or a new
+/// one never (redb runs its repair on a file it creates too).
+#[test]
+fn a_repair_is_logged_once_by_the_app_of_the_world() {
+    let tmp = TempDir::new("repair-log");
+    let registry = Arc::new(boxel_demo::blocks::registry());
+    let crashed = crashed_worlds(&tmp.0, &registry, 2);
+
+    // Nothing listens while it opens.
+    let store = WorldStore::open_dir(&crashed[0], &registry, "ground").unwrap();
+    assert!(store.repaired());
+    let logged = Logged::default();
+    let app = tracing::subscriber::with_default(logged.clone(), || app_with(store, &registry));
+    assert_eq!(logged.with(REPAIR).len(), 1, "reported by the app");
+    drop(app);
+
+    // Opened while the app logs.
+    let logged = Logged::default();
+    let app = tracing::subscriber::with_default(logged.clone(), || {
+        let store = WorldStore::open_dir(&crashed[1], &registry, "ground").unwrap();
+        app_with(store, &registry)
+    });
+    assert_eq!(logged.with(REPAIR).len(), 1, "one warning, not two");
+    drop(app);
+
+    // Dropping the apps closed both cleanly; a new world was never repaired.
+    for dir in crashed.iter().chain([&tmp.0.join("new")]) {
+        let logged = Logged::default();
+        let app = tracing::subscriber::with_default(logged.clone(), || {
+            let store = WorldStore::open_dir(dir, &registry, "ground").unwrap();
+            assert!(!store.repaired());
+            app_with(store, &registry)
+        });
+        assert!(logged.with(REPAIR).is_empty());
+        drop(app);
+    }
 }
 
 // ------------------------------------------------------------------ the exit
