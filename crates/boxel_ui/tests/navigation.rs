@@ -355,6 +355,27 @@ fn a_modal_popup_takes_the_focus_from_the_screen_under_it() {
 }
 
 #[test]
+fn arrow_steps_stay_with_the_widget_they_were_pressed_on() {
+    let mut t = tester();
+    t.tap(KeyCode::Tab).tap(KeyCode::Tab);
+    assert_eq!(t.focused().as_deref(), Some("test:mode"));
+    // A slow frame sees Right on the cycle, Tab to the slider and Right again.
+    t.key(KeyCode::ArrowRight, ButtonState::Pressed, false)
+        .key(KeyCode::Tab, ButtonState::Pressed, false)
+        .key(KeyCode::ArrowRight, ButtonState::Pressed, false)
+        .frame();
+    assert_eq!(t.focused().as_deref(), Some("test:fov"));
+    assert_eq!((menu(&t).mode, menu(&t).fov), (1, 75));
+    // Left, Tab to the toggle and Left: each moves its own step back.
+    t.key(KeyCode::ArrowLeft, ButtonState::Pressed, false)
+        .key(KeyCode::Tab, ButtonState::Pressed, false)
+        .key(KeyCode::ArrowLeft, ButtonState::Pressed, false)
+        .frame();
+    assert_eq!(t.focused().as_deref(), Some("test:flag"));
+    assert_eq!((menu(&t).fov, menu(&t).flag), (70, true));
+}
+
+#[test]
 fn a_modal_screen_hides_the_hud_from_the_pointer() {
     #[derive(Resource, Default)]
     struct Hud(u32);

@@ -82,7 +82,7 @@ pub(crate) fn resolve(state: &mut UiState, input: &NavInput) -> InputCapture {
     mem.shift = input.shift;
     mem.pressed = None;
     mem.activated = None;
-    mem.nudge = None;
+    mem.nudge.clear();
 
     // Hover: the last-declared rectangle under the cursor, top layer first; a modal layer
     // with content hides the layers below it (the HUD is never modal).
@@ -155,10 +155,12 @@ pub(crate) fn resolve(state: &mut UiState, input: &NavInput) -> InputCapture {
         let step = match key {
             NavKey::Left | NavKey::Right if adjustable => {
                 let delta = if key == NavKey::Left { -1 } else { 1 };
-                if let (Some(i), Some(focused)) = (at, mem.focused) {
-                    let total = mem.nudge.map_or(0, |(_, n)| n) + delta;
-                    mem.nudge = Some((focused, total));
-                    debug_assert_eq!(order[i].id, focused);
+                if let Some(i) = at {
+                    let id = order[i].id;
+                    match mem.nudge.iter_mut().find(|(nudged, _)| *nudged == id) {
+                        Some((_, total)) => *total += delta,
+                        None => mem.nudge.push((id, delta)),
+                    }
                 }
                 0
             }

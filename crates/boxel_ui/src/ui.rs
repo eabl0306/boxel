@@ -160,7 +160,7 @@ pub(crate) struct Interaction {
     pub dragging: bool,
     /// Enter or Space while focused.
     pub activated: bool,
-    /// Left and Right steps while focused.
+    /// Left and Right steps pressed while it had the focus this frame.
     pub nudge: i32,
     pub shift: bool,
     pub cursor: Option<IVec2>,
@@ -341,10 +341,11 @@ impl<'a> Painter<'a> {
             pressed: enabled && mem.pressed == Some(id),
             dragging: enabled && mem.dragging == Some(id),
             activated: enabled && mem.activated == Some(id),
-            nudge: match mem.nudge {
-                Some((nudged, n)) if enabled && nudged == id => n,
-                _ => 0,
-            },
+            nudge: mem
+                .nudge
+                .iter()
+                .find(|&&(nudged, _)| enabled && nudged == id)
+                .map_or(0, |&(_, n)| n),
             shift: mem.shift,
             cursor: mem.cursor,
         }

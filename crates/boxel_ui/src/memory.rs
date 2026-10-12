@@ -109,8 +109,9 @@ pub(crate) struct Memory {
     pub dragging: Option<WidgetId>,
     /// The focused widget Enter or Space activated this frame.
     pub activated: Option<WidgetId>,
-    /// Left (-1) and Right (+1) steps for the focused widget this frame.
-    pub nudge: Option<(WidgetId, i32)>,
+    /// Left (-1) and Right (+1) steps this frame, summed per widget: the focus can move
+    /// between two presses of one frame, and each step stays with the widget it was meant for.
+    pub nudge: Vec<(WidgetId, i32)>,
     /// Shift was held.
     pub shift: bool,
     /// Per-widget data.
