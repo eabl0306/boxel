@@ -111,13 +111,14 @@ fn far_clouds(min_y: i64, max_y: i64, horizon: f32) -> FogLayer {
     }
 }
 
-/// Big cumulus for the far LOD: 16-block cubes from y 192 to 304, most of them between 208 and
-/// 288 (twice today's cubes, cloud masses four times as wide over a 128-block lattice). A
-/// threshold that rises along the height gives domes over a wide base; 2 rows of bottom edge
-/// leave an uneven but fairly flat underside and 3 of top edge a ragged skyline. Dense enough
-/// that one cube crossed face to face is about 95 % opaque, so a ray that meets a cloud stops
-/// after a few cubes. Cells to 3,072 blocks, then the haze to `horizon`; drifting 4 blocks a
-/// second.
+/// Big cumulus for the far LOD: 16-block cubes in a band from y 176 to 320 that fill 208 to 288,
+/// five rows, a few reaching down to 192 (twice today's cubes, cloud masses four times as wide
+/// over a 128-block lattice). The row along each plane is always empty and the next one is
+/// raised halfway (2 rows of edge at both ends), so the base is uneven but fairly flat; a
+/// threshold that rises gently along the height thins the upper rows into domes over a wide
+/// base. Dense enough that one cube crossed face to face is about 95 % opaque, so a ray that
+/// meets a cloud stops after a few cubes. Cells to 3,072 blocks, then the haze to `horizon`;
+/// drifting 4 blocks a second.
 pub fn cumulus16(horizon: f32) -> FogLayer {
     FogLayer {
         cell: [16, 16, 16],
@@ -127,18 +128,19 @@ pub fn cumulus16(horizon: f32) -> FogLayer {
             dims: NoiseDims::Volume,
             seed: 0xc016,
         },
-        threshold_rise: 0.25,
+        threshold_rise: 0.15,
         edge_bottom: 32,
-        edge_top: 48,
+        edge_top: 32,
         density: 0.18,
         wind: [4.0, 0.0, 1.0],
         max_distance: 3072.0,
-        ..far_clouds(192, 304, horizon)
+        ..far_clouds(176, 320, horizon)
     }
 }
 
-/// Like [`cumulus16`] with 20-block cubes from y 180 to 320, most of them between 200 and 300,
-/// over a 160-block lattice; cells to 3,840 blocks, drifting 5 blocks a second.
+/// Like [`cumulus16`] with 20-block cubes in a band from y 160 to 340 that fill 200 to 300 (the
+/// owner's range), five rows, over a 160-block lattice; cells to 3,840 blocks, drifting 5
+/// blocks a second.
 pub fn cumulus20(horizon: f32) -> FogLayer {
     FogLayer {
         cell: [20, 20, 20],
@@ -148,19 +150,19 @@ pub fn cumulus20(horizon: f32) -> FogLayer {
             dims: NoiseDims::Volume,
             seed: 0xc020,
         },
-        threshold_rise: 0.25,
+        threshold_rise: 0.15,
         edge_bottom: 40,
-        edge_top: 60,
+        edge_top: 40,
         density: 0.15,
         wind: [5.0, 0.0, 1.5],
         max_distance: 3840.0,
-        ..far_clouds(180, 320, horizon)
+        ..far_clouds(160, 340, horizon)
     }
 }
 
-/// The biggest cubes and the cheapest steps: 24-block cubes from y 168 to 312, most of them
-/// between 192 and 288, over a 192-block lattice of one octave (smoother, rounder masses); cells
-/// to 4,608 blocks, drifting 6 blocks a second.
+/// The biggest cubes and the cheapest steps: 24-block cubes in a band from y 144 to 336 that
+/// fill 192 to 288, four rows, some reaching down to 168, over a 192-block lattice of one octave
+/// (smoother, rounder masses); cells to 4,608 blocks, drifting 6 blocks a second.
 pub fn cumulus24(horizon: f32) -> FogLayer {
     FogLayer {
         cell: [24, 24, 24],
@@ -170,13 +172,13 @@ pub fn cumulus24(horizon: f32) -> FogLayer {
             dims: NoiseDims::Volume,
             seed: 0xc024,
         },
-        threshold_rise: 0.2,
+        threshold_rise: 0.15,
         edge_bottom: 48,
         edge_top: 48,
         density: 0.12,
         wind: [6.0, 0.0, 2.0],
         max_distance: 4608.0,
-        ..far_clouds(168, 312, horizon)
+        ..far_clouds(144, 336, horizon)
     }
 }
 
@@ -362,6 +364,35 @@ mod tests {
             );
         }
         assert_eq!(decks(1000.0), vec![cumulus16(1000.0), high_deck(1000.0)]);
+    }
+
+    /// The big cumulus fill the heights their docs give (the owner asked for cubes that fill 200
+    /// to 300): every knot of their haze profile (the mean coverage of the cell row at its
+    /// height, the rise and the edges in it) inside that range holds at least a quarter of the
+    /// densest knot, every knot outside it less, and the base is denser than the top (domes).
+    #[test]
+    fn the_cumulus_fill_their_range() {
+        for (layer, range) in [
+            (cumulus16(FAR_HORIZON), 208.0..288.0),
+            (cumulus20(FAR_HORIZON), 200.0..300.0),
+            (cumulus24(FAR_HORIZON), 192.0..288.0),
+        ] {
+            let p = boxel_fog::haze_profile(&layer);
+            let peak = p.knots.iter().copied().fold(0.0, f32::max);
+            let bottom = layer.min_y as f32 + p.bottom;
+            let mut inside = Vec::new();
+            for (k, &knot) in p.knots.iter().enumerate() {
+                let y = bottom + k as f32 * p.spacing;
+                if range.contains(&y) {
+                    assert!(knot >= 0.25 * peak, "{range:?}: knot {k} at y {y}: {p:?}");
+                    inside.push(knot);
+                } else {
+                    assert!(knot < 0.25 * peak, "{range:?}: knot {k} at y {y}: {p:?}");
+                }
+            }
+            assert!(inside.len() >= 4, "{range:?}: {p:?}");
+            assert!(inside[0] > inside[inside.len() - 1], "domes: {p:?}");
+        }
     }
 
     /// Today's presets end with their cells; the hazy valley is the valley with its mean
@@ -578,13 +609,15 @@ mod tests {
 
     /// The ceilings of `fog_steps_per_ray`, per preset (both, cumulus16, cumulus20, cumulus24,
     /// decks, inside) and pose (stress, horizon, above, deck): mean steps and mean pieces per
-    /// ray, the first run (2026-10-11) plus 25 %, at least half a piece.
+    /// ray, the first run plus 25 %, at least half a piece. `both` and `inside` from 2026-10-11;
+    /// the cumulus presets and `decks` from their retune to fill 200 to 300 (taller bands, the
+    /// lowest of them nearer the poses at y 140).
     const CEILINGS: [[(f32, f32); 4]; 6] = [
         [(20.3, 0.5), (26.2, 0.5), (14.9, 0.5), (22.3, 0.8)],
-        [(23.5, 0.5), (29.8, 0.5), (27.2, 2.2), (19.2, 66.4)],
-        [(23.5, 0.7), (29.8, 0.7), (27.3, 2.2), (32.0, 61.7)],
-        [(18.8, 0.5), (22.9, 4.3), (21.2, 1.7), (22.4, 62.5)],
-        [(25.3, 1.3), (35.0, 1.3), (36.8, 52.3), (24.9, 66.9)],
+        [(24.4, 0.5), (31.0, 0.9), (31.4, 1.9), (14.2, 66.3)],
+        [(23.9, 0.5), (32.3, 8.9), (29.2, 1.9), (34.2, 61.7)],
+        [(20.4, 9.4), (27.5, 28.4), (26.8, 1.4), (27.5, 62.3)],
+        [(25.7, 1.2), (34.4, 1.5), (40.8, 52.2), (18.0, 66.3)],
         [(80.0, 36.2), (80.0, 36.2), (39.4, 1.7), (48.3, 31.2)],
     ];
 }

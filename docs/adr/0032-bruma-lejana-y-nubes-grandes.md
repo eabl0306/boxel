@@ -103,15 +103,21 @@ rama de la niebla: sin `FogPlugin` no se calcula nada.
 Los presets nuevos de `boxel_demo::fog` usan solo campos que ya existían. Toman el horizonte del
 LOD (768 bloques sin LOD, donde terminan las nubes de hoy):
 
-| preset | cubo | banda | ruido | densidad | celdas hasta |
-|---|---|---|---|---:|---:|
-| `cumulus16` | 16 | 192 a 304 | escala 8, 2 octavas | 0,18 | 3.072 |
-| `cumulus20` | 20 | 180 a 320 | escala 8, 2 octavas | 0,15 | 3.840 |
-| `cumulus24` | 24 | 168 a 312 | escala 8, 1 octava | 0,12 | 4.608 |
-| `high_deck` | 32 x 8 | 400 a 440 | plano, escala 16 | 0,05 | 1.536 |
+| preset | cubo | banda | cubos en | ruido | densidad | celdas hasta |
+|---|---|---|---|---|---:|---:|
+| `cumulus16` | 16 | 176 a 320 | 208 a 288 | escala 8, 2 octavas | 0,18 | 3.072 |
+| `cumulus20` | 20 | 160 a 340 | 200 a 300 | escala 8, 2 octavas | 0,15 | 3.840 |
+| `cumulus24` | 24 | 144 a 336 | 192 a 288 | escala 8, 1 octava | 0,12 | 4.608 |
+| `high_deck` | 32 x 8 | 400 a 440 | 408 a 432 | plano, escala 16 | 0,05 | 1.536 |
 
 - Todas: ruido 3D (salvo la capa alta), suavidad 0,25, base gris, suaves a 32 bloques, bruma 1,
   desvanecido de la mitad del horizonte al horizonte. `decks` es `cumulus16` con `high_deck`.
+- Los cúmulos llenan lo que pidió el dueño (cubos de 200 a 300): bordes de 2 filas abajo y
+  arriba (la fila del plano siempre vacía, la siguiente subida a la mitad) y una subida suave del
+  umbral (0,15), así cada fila del rango tiene al menos un cuarto de la cobertura de la más densa
+  y la base es más ancha que el tope. Con los valores del plan (subida 0,25, borde de 3 filas
+  arriba) solo se llenaban 2 filas, unos 32 bloques. Lo comprueba un test sobre el perfil de
+  bruma.
 - Un cubo cruzado de cara a cara es cerca de 95 % opaco: un rayo que encuentra una nube sale tras
   2 a 4 cubos llenos, a cualquier distancia. Lo barato viene de la densidad, no de saltar.
 - Las celdas terminan a 192 celdas (contadas en su lado más chico), donde una celda mide unos 4
@@ -188,17 +194,21 @@ referencia sobre un abanico fijo de rayos, con el horizonte `far` y una vista de
 |---|---|---:|---:|---:|---:|---:|
 | both | stress | 16,2 | 46 | 2 % | 0,0 | 0,0 |
 | both | horizon | 20,9 | 46 | 2 % | 0,0 | 0,0 |
-| cumulus16 | stress | 18,8 | 61 | 9 % | 0,0 | 0,4 |
-| cumulus16 | horizon | 23,8 | 61 | 9 % | 0,0 | 0,4 |
-| cumulus16 | above | 21,7 | 55 | 7 % | 0,0 | 1,7 |
-| cumulus16 | deck | 15,3 | 28 | 2 % | 53,0 | 0,1 |
-| cumulus20 | horizon | 23,8 | 58 | 8 % | 0,0 | 0,5 |
-| cumulus24 | horizon | 18,3 | 39 | 3 % | 3,1 | 0,3 |
-| decks | horizon | 28,0 | 64 | 11 % | 0,0 | 1,0 |
-| decks | above | 29,4 | 64 | 9 % | 40,1 | 1,7 |
+| cumulus16 | stress | 19,5 | 64 | 10 % | 0,0 | 0,4 |
+| cumulus16 | horizon | 24,8 | 64 | 10 % | 0,3 | 0,4 |
+| cumulus16 | above | 25,1 | 63 | 9 % | 0,0 | 1,5 |
+| cumulus16 | deck | 11,3 | 20 | 0 % | 53,0 | 0,0 |
+| cumulus20 | horizon | 25,8 | 53 | 7 % | 6,7 | 0,4 |
+| cumulus24 | stress | 16,3 | 46 | 5 % | 7,2 | 0,3 |
+| cumulus24 | horizon | 22,0 | 46 | 5 % | 22,4 | 0,3 |
+| decks | horizon | 27,5 | 64 | 12 % | 0,3 | 0,9 |
+| decks | above | 32,6 | 64 | 11 % | 40,1 | 1,6 |
 | inside | stress | 64,0 | 64 | 100 % | 27,3 | 1,6 |
 
-Los cúmulos dan pocos pasos más que `both` mirando al horizonte; `cumulus24` da menos. Volar
+Los cúmulos dan unos pasos más que `both` mirando al horizonte; `cumulus24` da menos pasos. Para
+llenar de 200 a 300, sus bandas empiezan en 176, 160 y 144, cerca de las poses a y 140: los rayos
+que suben desde ahí entran en la niebla suave de `cumulus20` y `cumulus24` (6,7 y 22,4 trozos
+suaves por rayo mirando al horizonte), aunque las primeras filas de la banda están vacías. Volar
 dentro de una nube cuesta trozos suaves, como `inside`.
 
 **Imágenes** en `bench-results/fog-far/look/` (fuera de git, con `comandos.sh` y `leeme.txt`):
