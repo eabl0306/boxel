@@ -147,96 +147,27 @@ fn add_words(lo: vec3<u32>, hi: vec3<u32>, li: vec3<i32>) -> Words {
 
 // Corner values of a lattice step, z0 plane in a (x0y0, x1y0, x0y1, x1y1), z1 plane in b
 // (boxel_fog::noise::corner_values): each axis' words folded into one (lo ^ hi * HI_MIX), then a
-// hash chain from the octave's seed whose first links the corners share (14 hashes, fewer when
-// the next step shares a side: step_corners). Flat noise has the same y words at both y corners.
+// hash chain from the octave's seed whose first links the corners share (14 hashes). Flat noise
+// has the same y words at both y corners.
 struct Corners { a: vec4<i32>, b: vec4<i32> };
 
-// The corners of one octave's lattice step and the links of its hash chain they share (x, then
-// x and y; the corners take z last).
-struct Octave {
-  c: Corners,
-  hx0: u32,
-  hx1: u32,
-  h00: u32,
-  h10: u32,
-  h01: u32,
-  h11: u32,
-};
-
-// The value of the corner at the end of the chain link h with the folded z word v.
-fn corner(h: u32, v: u32) -> i32 {
-  return i32(lowbias32(h ^ v) >> 20u);
-}
-
-// The corners of the lattice step whose low and high corners have words w0 and w1. A step one
-// lattice step from `last` along one axis (`moved`, the change of the step's key; any other
-// change reloads) keeps the links and corners the two steps share: 4 hashes after a move along
-// z, 6 along y, 7 along x, instead of 14. The same values either way.
-fn step_corners(w0: Words, w1: Words, seed: u32, moved: vec3<i32>, last: Octave) -> Octave {
+fn corners(w0: Words, w1: Words, seed: u32) -> Corners {
   let v0 = w0.lo ^ (w0.hi * HI_MIX);
   let v1 = w1.lo ^ (w1.hi * HI_MIX);
-  var o = last;
-  // Counted as integers: llvmpipe (LLVM 21) drew wrong fog with `&&` chains of these bools.
-  let one = vec3<i32>(moved == vec3<i32>(1)) + vec3<i32>(moved == vec3<i32>(-1));
-  let still = vec3<i32>(moved == vec3<i32>(0));
-  if (still.x + still.y + one.z == 3) {
-    // The z plane the steps share keeps its corners.
-    if (moved.z > 0) {
-      o.c.a = last.c.b;
-      o.c.b = vec4<i32>(corner(o.h00, v1.z), corner(o.h10, v1.z), corner(o.h01, v1.z), corner(o.h11, v1.z));
-    } else {
-      o.c.b = last.c.a;
-      o.c.a = vec4<i32>(corner(o.h00, v0.z), corner(o.h10, v0.z), corner(o.h01, v0.z), corner(o.h11, v0.z));
-    }
-  } else if (still.x + one.y + still.z == 3) {
-    // The y row the steps share keeps its links and corners.
-    if (moved.y > 0) {
-      o.h00 = last.h01;
-      o.h10 = last.h11;
-      o.h01 = lowbias32(o.hx0 ^ v1.y);
-      o.h11 = lowbias32(o.hx1 ^ v1.y);
-      o.c.a = vec4<i32>(last.c.a.z, last.c.a.w, corner(o.h01, v0.z), corner(o.h11, v0.z));
-      o.c.b = vec4<i32>(last.c.b.z, last.c.b.w, corner(o.h01, v1.z), corner(o.h11, v1.z));
-    } else {
-      o.h01 = last.h00;
-      o.h11 = last.h10;
-      o.h00 = lowbias32(o.hx0 ^ v0.y);
-      o.h10 = lowbias32(o.hx1 ^ v0.y);
-      o.c.a = vec4<i32>(corner(o.h00, v0.z), corner(o.h10, v0.z), last.c.a.x, last.c.a.y);
-      o.c.b = vec4<i32>(corner(o.h00, v1.z), corner(o.h10, v1.z), last.c.b.x, last.c.b.y);
-    }
-  } else if (one.x + still.y + still.z == 3) {
-    // The x column the steps share keeps its links and corners.
-    if (moved.x > 0) {
-      o.hx0 = last.hx1;
-      o.h00 = last.h10;
-      o.h01 = last.h11;
-      o.hx1 = lowbias32(seed ^ v1.x);
-      o.h10 = lowbias32(o.hx1 ^ v0.y);
-      o.h11 = lowbias32(o.hx1 ^ v1.y);
-      o.c.a = vec4<i32>(last.c.a.y, corner(o.h10, v0.z), last.c.a.w, corner(o.h11, v0.z));
-      o.c.b = vec4<i32>(last.c.b.y, corner(o.h10, v1.z), last.c.b.w, corner(o.h11, v1.z));
-    } else {
-      o.hx1 = last.hx0;
-      o.h10 = last.h00;
-      o.h11 = last.h01;
-      o.hx0 = lowbias32(seed ^ v0.x);
-      o.h00 = lowbias32(o.hx0 ^ v0.y);
-      o.h01 = lowbias32(o.hx0 ^ v1.y);
-      o.c.a = vec4<i32>(corner(o.h00, v0.z), last.c.a.x, corner(o.h01, v0.z), last.c.a.z);
-      o.c.b = vec4<i32>(corner(o.h00, v1.z), last.c.b.x, corner(o.h01, v1.z), last.c.b.z);
-    }
-  } else {
-    o.hx0 = lowbias32(seed ^ v0.x);
-    o.hx1 = lowbias32(seed ^ v1.x);
-    o.h00 = lowbias32(o.hx0 ^ v0.y);
-    o.h10 = lowbias32(o.hx1 ^ v0.y);
-    o.h01 = lowbias32(o.hx0 ^ v1.y);
-    o.h11 = lowbias32(o.hx1 ^ v1.y);
-    o.c.a = vec4<i32>(corner(o.h00, v0.z), corner(o.h10, v0.z), corner(o.h01, v0.z), corner(o.h11, v0.z));
-    o.c.b = vec4<i32>(corner(o.h00, v1.z), corner(o.h10, v1.z), corner(o.h01, v1.z), corner(o.h11, v1.z));
-  }
-  return o;
+  let hx0 = lowbias32(seed ^ v0.x);
+  let hx1 = lowbias32(seed ^ v1.x);
+  let h00 = lowbias32(hx0 ^ v0.y);
+  let h10 = lowbias32(hx1 ^ v0.y);
+  let h01 = lowbias32(hx0 ^ v1.y);
+  let h11 = lowbias32(hx1 ^ v1.y);
+  var c: Corners;
+  c.a = vec4<i32>(
+    i32(lowbias32(h00 ^ v0.z) >> 20u), i32(lowbias32(h10 ^ v0.z) >> 20u),
+    i32(lowbias32(h01 ^ v0.z) >> 20u), i32(lowbias32(h11 ^ v0.z) >> 20u));
+  c.b = vec4<i32>(
+    i32(lowbias32(h00 ^ v1.z) >> 20u), i32(lowbias32(h10 ^ v1.z) >> 20u),
+    i32(lowbias32(h01 ^ v1.z) >> 20u), i32(lowbias32(h11 ^ v1.z) >> 20u));
+  return c;
 }
 
 // Trilinear (flat noise: the y weight is 0, so the y lerps give their first corner).
@@ -283,7 +214,7 @@ fn noise_params(li: u32) -> NoiseParams {
 // of the last cell row read, so a walk computes each row's once.
 struct NoiseCache {
   key1: vec3<i32>,
-  o1: Octave,
+  c1: Corners,
   lo1: vec3<i32>,
   hi1: vec3<i32>,
   // The most noise a cell of the step can have, with every octave (step_bound's max_noise).
@@ -295,18 +226,16 @@ struct NoiseCache {
   // No cell of the step has coverage at t1 (StepBound::is_empty).
   empty: bool,
   key2: vec3<i32>,
-  o2: Octave,
+  c2: Corners,
   // The last row a cell was read in and its threshold (row_threshold).
   row: i32,
   row_t: u32,
 };
 
-// No step has the keys' first value, and a key less it neither overflows nor gives a move of
-// one step (keys stay within about 2^25: the cells a ray reads lie within 4097 of the origin's).
 fn new_cache() -> NoiseCache {
   var c: NoiseCache;
-  c.key1 = vec3<i32>(1 << 30);
-  c.key2 = vec3<i32>(1 << 30);
+  c.key1 = vec3<i32>(0x7fffffff);
+  c.key2 = vec3<i32>(0x7fffffff);
   c.t1_row = 0x7fffffff;
   c.row = 0x7fffffff;
   return c;
@@ -329,7 +258,6 @@ fn load_lattice(np: NoiseParams, num: vec3<i32>, cache: ptr<function, NoiseCache
   let l = np.lat.w;
   let lattice1 = num >> vec3<u32>(12u + l);
   if (any(lattice1 != (*cache).key1)) {
-    let moved = lattice1 - (*cache).key1;
     (*cache).key1 = lattice1;
     let lo = fog.layers[np.li].base_lo;
     let hi = fog.layers[np.li].base_hi;
@@ -337,8 +265,8 @@ fn load_lattice(np: NoiseParams, num: vec3<i32>, cache: ptr<function, NoiseCache
     let up1 = vec3<i32>(1, i32(np.volume), 1);
     let w0 = add_words(lo.xyz, hi.xyz, lattice1);
     let w1 = add_words(lo.xyz, hi.xyz, lattice1 + up1);
-    (*cache).o1 = step_corners(w0, w1, hi.w, moved, (*cache).o1);
-    let c = (*cache).o1.c;
+    let c = corners(w0, w1, hi.w);
+    (*cache).c1 = c;
     // Cells k of the step: from L * lattice (one more with a wind fraction), L of them.
     (*cache).lo1 = (lattice1 << vec3<u32>(l)) + vec3<i32>(np.q > vec3<i32>(0)) - bitcast<vec3<i32>>(np.lat.xyz);
     (*cache).hi1 = (*cache).lo1 + vec3<i32>(1 << l);
@@ -379,7 +307,7 @@ fn cell_coverage(np: NoiseParams, num: vec3<i32>, threshold: u32, cache: ptr<fun
   if (coverage_of(np.gain, (*cache).max_noise, threshold) == 0u) {
     return 0u;
   }
-  let v1 = interp((*cache).o1.c, (num >> vec3<u32>(np.lat.w)) & vec3<i32>(4095));
+  let v1 = interp((*cache).c1, (num >> vec3<u32>(np.lat.w)) & vec3<i32>(4095));
   if (!np.two) {
     return coverage_of(np.gain, v1, threshold);
   }
@@ -403,7 +331,7 @@ fn walk_coverage(np: NoiseParams, d: vec3<i32>, num: vec3<i32>, cache: ptr<funct
 
 // The noise (0..4096) at `num` (in the cached first-octave step).
 fn cell_noise(np: NoiseParams, num: vec3<i32>, cache: ptr<function, NoiseCache>) -> i32 {
-  let v1 = interp((*cache).o1.c, (num >> vec3<u32>(np.lat.w)) & vec3<i32>(4095));
+  let v1 = interp((*cache).c1, (num >> vec3<u32>(np.lat.w)) & vec3<i32>(4095));
   if (np.two) {
     return octaves_noise(np, num, v1, cache);
   }
@@ -415,7 +343,6 @@ fn octaves_noise(np: NoiseParams, num: vec3<i32>, v1: i32, cache: ptr<function, 
   let l = np.lat.w;
   let lattice2 = num >> vec3<u32>(11u + l);
   if (any(lattice2 != (*cache).key2)) {
-    let moved = lattice2 - (*cache).key2;
     (*cache).key2 = lattice2;
     let lo = fog.layers[np.li].base_lo;
     let hi = fog.layers[np.li].base_hi;
@@ -424,9 +351,9 @@ fn octaves_noise(np: NoiseParams, num: vec3<i32>, v1: i32, cache: ptr<function, 
     let up2 = vec3<i32>(1, i32(np.volume), 1);
     let w0 = add_words(lo2, hi2, lattice2);
     let w1 = add_words(lo2, hi2, lattice2 + up2);
-    (*cache).o2 = step_corners(w0, w1, fog.layers[np.li].octave2.y, moved, (*cache).o2);
+    (*cache).c2 = corners(w0, w1, fog.layers[np.li].octave2.y);
   }
-  let v2 = interp((*cache).o2.c, (num >> vec3<u32>(l - 1u)) & vec3<i32>(4095));
+  let v2 = interp((*cache).c2, (num >> vec3<u32>(l - 1u)) & vec3<i32>(4095));
   return ((2 * v1 + v2) * 21845) >> 16u;
 }
 
