@@ -83,8 +83,8 @@ usage: snapshot --camera X,Y,Z,YAW,PITCH --shot HH:MM=PATH [--shot ...] [options
   --shot HH:MM=PATH    render at this clock time (06:00 sunrise, 12:00 noon, 18:00 sunset,
                        00:00 midnight) and save a PNG; repeat for more times of the same world
   --size WxH           image size (default 1280x720)
-  --view-distance N    horizontal mesh radius in chunks (default 12, as voxel_world), also the
-                       fog distance
+  --view-distance N    horizontal mesh radius in chunks (default 12, as voxel_world); the fog
+                       ends where the meshed disc is complete (340 blocks at 12)
   --no-distance-fog    no fade into the sky at the view distance (or at the LOD's horizon):
                        the terrain ends with a hard edge (F10 in voxel_world)
   --vertical-radius N  vertical mesh radius in chunks (default 8)
@@ -1011,7 +1011,7 @@ fn run(
     let lod_label = lod::label(o.lod);
     renderer.set_lod(&gpu.device, lod_input);
     let camera = Camera {
-        view_distance: o.radius as f32 * 32.0,
+        view_distance: world::view_distance(ChunkViewer::new(o.radius)),
         fov_y_radians: o.fov.to_radians(),
         ..Camera::default()
     };

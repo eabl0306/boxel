@@ -1124,11 +1124,22 @@ igual al mediodía y a medianoche (lo verifica `gpu_terrain`).
 
 La niebla de distancia (`RenderSettings::distance_fog`, issue #51) funde el terreno con el color
 del cielo solo al final, como Minecraft: el último 10 % de la distancia de vista, como mucho 64
-bloques. A 16 chunks va de 460,8 a 512 bloques; a 32, de 960 a 1024. Es esférica (distancia 3D),
+bloques. Con 512 bloques va de 460,8 a 512; con 1024, de 960 a 1024. Es esférica (distancia 3D),
 porque el mundo también es infinito hacia arriba y abajo. El juego cambia la fracción y el tope,
 o la apaga (`enabled: false`): el borde queda nítido. Las capas de `FogPlugin` con
 `FogFade::Scene` usan ese mismo rango; con la niebla apagada no se desvanecen y llegan a su
 `max_distance`.
+
+La niebla solo tapa el borde de lo mallado si la distancia de vista no pasa de donde el disco de
+chunks está completo (`ChunkViewer::mesh_reach`). El disco se mide en chunks (`dx² + dz² <= r²`),
+así que su borde es una escalera que hacia las diagonales queda más cerca que 32 bloques por
+chunk de radio. Con la cámara en una esquina de su chunk, el primer hueco está a 340 bloques a
+radio 12 (no a 384) y a 472 a radio 16 (no a 512). Con la distancia en 32 por radio esos huecos
+quedan casi sin niebla y se ven muescas duras que cambian al moverse. Por eso `voxel_world`,
+`snapshot` y `physics_sandbox` usan `mesh_reach` como distancia de vista (lo verifica
+`gpu_tiers`). `stress` y `headless_world` siguen en 32 por radio para que sus números sigan
+comparables. Ver los 512 bloques completos a radio 16 pediría mallar un anillo más, como el
+margen de un chunk que suma Minecraft, con su costo.
 
 ### 10.8 Niebla y nubes cúbicas (ADR 0030)
 

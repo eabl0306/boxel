@@ -131,7 +131,8 @@ usage: voxel_world [GPU options] [options]
   --resize-test           at frame 30 (and after 10 presented frames) grow the window by
                           100x50 and check the surface follows (implies --frames 120)
   --seed N                terrain seed
-  --view-distance N       mesh radius in chunks (default 12; 6 on a software adapter)
+  --view-distance N       mesh radius in chunks (default 12; 6 on a software adapter); the fog
+                          ends where the meshed disc is complete (340 blocks at 12)
   --vertical-radius N     vertical mesh radius in chunks, up and down (default 8)
   --no-distance-fog       no fade into the sky at the view distance or the LOD's horizon: the
                           terrain ends with a hard edge (F10 toggles the fade)
@@ -725,9 +726,14 @@ fn spawn_camera(mut commands: Commands, run: Res<Run>) {
     let radius = o.view_distance.unwrap_or(DEFAULT_RADIUS);
     let [x, y, z, yaw, pitch] = o.camera;
     let (yaw, pitch) = ((yaw as f32).to_radians(), (pitch as f32).to_radians());
+    let viewer = ChunkViewer::new(radius).with_vertical_radius(if o.fixed_height {
+        u32::MAX
+    } else {
+        o.vertical_radius
+    });
     commands.spawn((
         Camera {
-            view_distance: radius as f32 * 32.0,
+            view_distance: world::view_distance(viewer),
             ..Camera::default()
         },
         Transform::from_yaw_pitch(DVec3::new(x, y, z), yaw, pitch),
@@ -737,11 +743,7 @@ fn spawn_camera(mut commands: Commands, run: Res<Run>) {
             pitch,
             ..FlyCamera::default()
         },
-        ChunkViewer::new(radius).with_vertical_radius(if o.fixed_height {
-            u32::MAX
-        } else {
-            o.vertical_radius
-        }),
+        viewer,
     ));
 }
 
@@ -773,7 +775,7 @@ fn gpu_events(
         if info.class == Some(DeviceClass::Software) && run.options.view_distance.is_none() {
             for (mut viewer, mut camera) in &mut viewers {
                 viewer.radius = SOFTWARE_RADIUS;
-                camera.view_distance = SOFTWARE_RADIUS as f32 * 32.0;
+                camera.view_distance = world::view_distance(*viewer);
             }
             println!("boxel: software adapter: view distance {SOFTWARE_RADIUS} chunks");
         }

@@ -808,10 +808,10 @@ struct Run {
 }
 
 fn spawn_camera(mut commands: Commands, run: Res<Run>) {
-    let radius = run.options.view_distance;
+    let viewer = ChunkViewer::new(run.options.view_distance);
     commands.spawn((
         Camera {
-            view_distance: radius as f32 * 32.0,
+            view_distance: world::view_distance(viewer),
             ..Camera::default()
         },
         Transform::from_yaw_pitch(DVec3::new(0.5, 120.0, 0.5), 0.0, -0.2),
@@ -820,7 +820,7 @@ fn spawn_camera(mut commands: Commands, run: Res<Run>) {
             pitch: -0.2,
             ..FlyCamera::default()
         },
-        ChunkViewer::new(radius),
+        viewer,
     ));
 }
 

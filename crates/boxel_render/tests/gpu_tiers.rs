@@ -25,6 +25,10 @@
 //!   including GL where reverse-Z loses its precision gain); with the distance fog's band over
 //!   the front slab it fades toward the sky, and with the fog off it is the same as far from the
 //!   band (finite numbers on every tier);
+//! - a floor of chunks in the disc a streaming viewer of radius 4 meshes, seen from the corner of
+//!   its chunk nearest to a step of the disc's edge: with the view distance at the viewer's
+//!   `mesh_reach` the distance fog hides the steps (the same picture as a floor without them),
+//!   at 32 blocks a chunk of radius they show (issue #51);
 //! - the blocks of ADR 0018, meshed by the real `Mesher` over two chunks: a water pool and a
 //!   glass box (translucent bucket, blended back to front), bottom and top slabs, cross plants
 //!   and logs along X and Z, and the blocks of ADR 0020 (stairs of every kind, a fence run,
@@ -333,6 +337,54 @@ fn far_scene(registry: &BlockRegistry, front: bool, back: bool) -> ChunkMesh {
     let mut bucket_counts = [0; BUCKET_COUNT];
     bucket_counts[Face::PosZ.index()] = quads.len() as u32;
     ChunkMesh::from_quads(quads, bucket_counts)
+}
+
+/// Radius of the disc scene's viewer.
+const DISC_RADIUS: u32 = 4;
+
+/// A stone floor: the top face of the voxels at y = 3 of a chunk.
+fn floor_mesh(registry: &BlockRegistry) -> ChunkMesh {
+    let stone = registry
+        .textures()
+        .iter()
+        .position(|t| t.name == "boxel:stone")
+        .expect("stone") as u16;
+    let mut bucket_counts = [0; BUCKET_COUNT];
+    bucket_counts[Face::PosY.index()] = 1;
+    ChunkMesh::from_quads(
+        vec![PackedQuad::new([0, 3, 0], 32, 32, Face::PosY, stone)],
+        bucket_counts,
+    )
+}
+
+/// The floor's columns: the disc a viewer of radius [`DISC_RADIUS`] meshes around chunk (0, 0)
+/// (`dx^2 + dz^2 <= r^2`), or with `filled` every column two chunks past it as well.
+fn disc_columns(filled: bool) -> Vec<IVec3> {
+    let r = DISC_RADIUS as i32;
+    let reach = r + 2;
+    let mut columns = Vec::new();
+    for dz in -reach..=reach {
+        for dx in -reach..=reach {
+            if filled || dx * dx + dz * dz <= r * r {
+                columns.push(IVec3::new(dx, 0, dz));
+            }
+        }
+    }
+    columns
+}
+
+/// From 36 blocks over the floor at the corner (32, 32) of chunk (0, 0), toward the nearest
+/// step of the disc's edge (column (3, 3), 90.5 blocks away), with the view distance `distance`.
+fn disc_view(distance: f32) -> ViewParams {
+    let camera = Camera {
+        view_distance: distance,
+        ..Camera::default()
+    };
+    let eye = DVec3::new(32.0, 40.0, 32.0);
+    let d = (DVec3::new(122.0, 4.0, 122.0) - eye).as_vec3();
+    let yaw = (-d.x).atan2(-d.z);
+    let pitch = d.y.atan2(d.x.hypot(d.z));
+    view_params(&camera, &Transform::from_yaw_pitch(eye, yaw, pitch))
 }
 
 /// `n` copies of the bottom face of voxel (0, 0, 0): never visible from above the chunk (face
@@ -653,6 +705,12 @@ struct TierImages {
     far_fog_edge: RgbaImage,
     /// `far_front` with the distance fog off.
     far_fog_off: RgbaImage,
+    /// The disc's floor ([`disc_columns`]) and the filled floor, at the viewer's `mesh_reach`.
+    disc: RgbaImage,
+    disc_filled: RgbaImage,
+    /// The same at 32 blocks a chunk of radius: the steps show.
+    disc_steps: RgbaImage,
+    disc_steps_filled: RgbaImage,
     /// The blocks of ADR 0018 ([`special_scene`]), and without their translucent quads.
     special: RgbaImage,
     special_opaque: RgbaImage,
@@ -1024,6 +1082,26 @@ fn render_tier(
         return Err("an empty mesh did not remove the chunk".to_string());
     }
 
+    // The disc scene (issue #51): the same floor mesh in every column.
+    let floor = Arc::new(floor_mesh(registry));
+    let reach = boxel_world::ChunkViewer::new(DISC_RADIUS).mesh_reach();
+    let steps = DISC_RADIUS as f32 * 32.0;
+    let mut disc_images = Vec::new();
+    for filled in [false, true] {
+        renderer.clear_chunks();
+        for c in disc_columns(filled) {
+            renderer
+                .upsert_chunk(chunk_id(c), (c * 32).as_i64vec3(), floor.clone())
+                .map_err(|e| e.to_string())?;
+        }
+        for distance in [reach, steps] {
+            disc_images.push(render(&device, &queue, &mut renderer, &disc_view(distance))?.0);
+        }
+    }
+    let [disc, disc_steps, disc_filled, disc_steps_filled] =
+        <[RgbaImage; 4]>::try_from(disc_images).map_err(|_| "disc images".to_string())?;
+    renderer.clear_chunks();
+
     let special_meshes = special_scene(registry);
     let sloped = special_meshes
         .iter()
@@ -1089,6 +1167,10 @@ fn render_tier(
         far_back,
         far_fog_edge,
         far_fog_off,
+        disc,
+        disc_filled,
+        disc_steps,
+        disc_steps_filled,
         special,
         special_opaque,
         special_no_boxes,
@@ -1232,6 +1314,10 @@ fn tiers_render_identically() {
                     (&name("far_back"), &i.far_back),
                     (&name("far_fog_edge"), &i.far_fog_edge),
                     (&name("far_fog_off"), &i.far_fog_off),
+                    (&name("disc"), &i.disc),
+                    (&name("disc_filled"), &i.disc_filled),
+                    (&name("disc_steps"), &i.disc_steps),
+                    (&name("disc_steps_filled"), &i.disc_steps_filled),
                     (&name("special"), &i.special),
                     (&name("special_opaque"), &i.special_opaque),
                     (&name("special_no_boxes"), &i.special_no_boxes),
@@ -1266,6 +1352,19 @@ fn tiers_render_identically() {
                 (&name("far_front"), &i.far_front),
                 (&name("far_fog_edge"), &i.far_fog_edge),
                 0.1,
+            );
+            report.check_range(&name("disc"), &i.disc, 0.2..=0.9);
+            report.check_same(
+                &format!("{label} {}: disc floor at the viewer's mesh reach", i.tier),
+                (&name("disc"), &i.disc),
+                (&name("disc_filled"), &i.disc_filled),
+            );
+            // control: at 32 blocks a chunk of radius the fog does not hide the steps
+            report.check_differs(
+                &format!("{label} {}: disc floor at 32 blocks a chunk", i.tier),
+                (&name("disc_steps"), &i.disc_steps),
+                (&name("disc_steps_filled"), &i.disc_steps_filled),
+                0.005,
             );
             report.check_range(&name("special"), &i.special, 0.3..=1.0);
             report.check_differs(
@@ -1344,6 +1443,7 @@ fn tiers_render_identically() {
                 ("minus_chunk", &best.minus_chunk, &i.minus_chunk),
                 ("far_both", &best.far_both, &i.far_both),
                 ("far_fog_edge", &best.far_fog_edge, &i.far_fog_edge),
+                ("disc", &best.disc, &i.disc),
                 ("special", &best.special, &i.special),
                 ("special_opaque", &best.special_opaque, &i.special_opaque),
                 (

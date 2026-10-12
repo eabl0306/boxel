@@ -317,6 +317,60 @@ fn exposed_chunks() -> Vec<ChunkPos> {
     out
 }
 
+/// `ChunkViewer::mesh_reach` is the distance from the viewer to the nearest column the
+/// streaming does not mesh, wherever the viewer stands in its chunk (the worst place is a
+/// corner): the distance fog ending there hides every step of the disc's edge (issue #51).
+#[test]
+fn mesh_reach_is_where_the_meshed_disc_is_complete() {
+    use crate::interest::{Columns, Level};
+    // From `(x, z)` (blocks from the viewer chunk's origin) to the column `dx, dz` chunks away.
+    let gap = |x: f64, z: f64, dx: i64, dz: i64| {
+        let axis = |p: f64, d: i64| {
+            let lo = 32.0 * d as f64;
+            (lo - p).max(p - (lo + 32.0)).max(0.0)
+        };
+        axis(x, dx).hypot(axis(z, dz))
+    };
+    for radius in (0..=64).chain([100, 300]) {
+        let columns = Columns::new(radius, 0);
+        let reach = f64::from(ChunkViewer::new(radius).mesh_reach());
+        let r = i64::from(radius) + 2;
+        let nearest = |x: f64, z: f64| {
+            let mut nearest = f64::INFINITY;
+            for dz in -r..=r {
+                for dx in -r..=r {
+                    if columns.level(dx, dz) != Level::Mesh {
+                        nearest = nearest.min(gap(x, z, dx, dz));
+                    }
+                }
+            }
+            nearest
+        };
+        let corners = [(0.0, 0.0), (32.0, 0.0), (0.0, 32.0), (32.0, 32.0)];
+        let worst = corners
+            .iter()
+            .map(|&(x, z)| nearest(x, z))
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            (worst - reach).abs() < 1e-3,
+            "radius {radius}: {worst} vs {reach}"
+        );
+        for (x, z) in [(16.0, 16.0), (0.5, 31.5), (24.5, 19.5)] {
+            assert!(nearest(x, z) >= reach - 1e-3, "radius {radius} at {x}, {z}");
+        }
+    }
+    // Toward the diagonals the steps come nearer than 32 blocks a chunk of radius.
+    assert!((ChunkViewer::new(12).mesh_reach() - 340.16).abs() < 0.01);
+    assert!((ChunkViewer::new(16).mesh_reach() - 472.47).abs() < 0.01);
+    assert!((ChunkViewer::new(32).mesh_reach() - 979.53).abs() < 0.01);
+    assert_eq!(ChunkViewer::new(1).mesh_reach(), 0.0);
+    // Radii are clamped as the streaming clamps them.
+    assert_eq!(
+        ChunkViewer::new(u32::MAX).mesh_reach(),
+        ChunkViewer::new(4096).mesh_reach()
+    );
+}
+
 #[test]
 fn plugin_streams_settles_and_uses_fast_paths() {
     let executor = Arc::new(CountingExecutor::default());

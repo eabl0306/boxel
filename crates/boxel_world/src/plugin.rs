@@ -59,6 +59,32 @@ impl ChunkViewer {
             ..self
         }
     }
+
+    /// How far, in blocks, every column is meshed wherever the viewer stands in its chunk: the
+    /// largest camera view distance whose distance fog hides the edge of the meshed columns.
+    /// The mesh columns are a disc of chunk offsets, so its edge is a staircase that comes
+    /// nearer than `32 * radius` toward the diagonals: 340 blocks at radius 12, 472 at 16 (0 at
+    /// radius 0 and 1, whose diagonal neighbors are not meshed). Horizontal only: the layers
+    /// reach `32 * vertical_radius` blocks up and down.
+    pub fn mesh_reach(self) -> f32 {
+        let r = i64::from(self.radius.min(crate::interest::MAX_RADIUS));
+        // Seen from the nearest corner of the viewer's chunk, a column `dx, dz` chunks away
+        // starts `(|dx| - 1, |dz| - 1)` chunks away (0 for a neighbor). The nearest column off
+        // the disc in row `dz >= 0` is the first past its half width (the disc is symmetric).
+        let nearest = (0..=r + 1)
+            .map(|dz| {
+                let first = if dz <= r {
+                    (r * r - dz * dz).isqrt() + 1
+                } else {
+                    0
+                };
+                let (a, b) = ((first - 1).max(0), (dz - 1).max(0));
+                a * a + b * b
+            })
+            .min()
+            .unwrap_or(0);
+        (32.0 * (nearest as f64).sqrt()) as f32
+    }
 }
 
 impl Default for ChunkViewer {

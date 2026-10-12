@@ -667,6 +667,8 @@ fn cull_lines(
     viewer: ChunkViewer,
 ) -> String {
     let [_, _, _, yaw, pitch] = o.camera.unwrap_or([0.0, 0.0, 0.0, -90.0, 0.0]);
+    // 32 blocks a chunk of radius, as stress culls (not `ChunkViewer::mesh_reach`, the view
+    // distance of the other examples): the counts stay comparable with stress and older runs.
     let camera = Camera {
         view_distance: viewer.radius as f32 * 32.0,
         ..Camera::default()

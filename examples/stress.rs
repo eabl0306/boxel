@@ -944,6 +944,9 @@ fn spawn_camera(mut commands: Commands, bench: Res<Bench>) {
     let o = &bench.options;
     commands.spawn((
         Camera {
+            // 32 blocks a chunk of radius, not where the meshed disc is complete as in the
+            // other examples (`ChunkViewer::mesh_reach`): the far plane culls as it always did,
+            // so the numbers stay comparable. The steps of the disc's edge may show.
             view_distance: o.radius as f32 * 32.0,
             ..Camera::default()
         },

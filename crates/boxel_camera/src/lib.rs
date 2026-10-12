@@ -18,7 +18,9 @@ pub struct Camera {
     pub fov_y_radians: f32,
     /// Near plane distance (reverse-Z, infinite far).
     pub near: f32,
-    /// Culling and fog distance in world units.
+    /// Culling and fog distance in world units. With a streaming viewer, at most where its
+    /// meshed columns are complete (`ChunkViewer::mesh_reach`, less than 32 blocks a chunk of
+    /// radius), or the distance fog shows the steps of their edge.
     pub view_distance: f32,
     /// Only active cameras render.
     pub active: bool,

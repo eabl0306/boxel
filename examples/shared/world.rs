@@ -28,6 +28,14 @@ pub fn usage(default: World) -> String {
     )
 }
 
+/// The camera's view distance for `viewer`: where its meshed columns are complete
+/// (`ChunkViewer::mesh_reach`, 340 blocks at radius 12 instead of 384), so the distance fog
+/// hides every step of their edge (issue #51). At radius 0 and 1 that is nothing, so a chunk is
+/// drawn instead, steps and all.
+pub fn view_distance(viewer: ChunkViewer) -> f32 {
+    viewer.mesh_reach().max(32.0)
+}
+
 /// The generator family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum World {
@@ -339,6 +347,18 @@ mod tests {
             WorldChoice::with_world(World::Flat).render_capacity(),
             (8 << 20, 32_768)
         );
+    }
+
+    #[test]
+    fn the_view_distance_ends_where_the_meshed_disc_is_complete() {
+        for radius in 2..=64 {
+            let viewer = ChunkViewer::new(radius);
+            assert_eq!(view_distance(viewer), viewer.mesh_reach(), "{radius}");
+            assert!(view_distance(viewer) <= radius as f32 * 32.0, "{radius}");
+        }
+        assert!((view_distance(ChunkViewer::new(12)) - 340.16).abs() < 0.01);
+        assert_eq!(view_distance(ChunkViewer::new(1)), 32.0);
+        assert_eq!(view_distance(ChunkViewer::new(0)), 32.0);
     }
 
     #[test]
