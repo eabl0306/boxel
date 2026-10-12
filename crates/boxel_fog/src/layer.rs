@@ -275,9 +275,11 @@ pub fn haze_profile(layer: &FogLayer) -> HazeProfile {
     let cy = i128::from(layer.cell[1].max(1));
     let rows = (lo.div_euclid(cy), hi.div_euclid(cy));
     for (k, knot) in profile.knots.iter_mut().enumerate() {
-        // The row that holds the knot's height (the top knot's: the one under it).
-        let y = lo as f64 + k as f64 * (hi - lo) as f64 / (HAZE_KNOTS - 1) as f64;
-        let row = (y.floor() as i128).div_euclid(cy).clamp(rows.0, rows.1 - 1);
+        // The row that holds the knot's height (the top knot's: the one under it), in integers
+        // from the band's own bottom: `floor(lo + x) = lo + floor(x)`, exact at any height.
+        let knots = (HAZE_KNOTS - 1) as i128;
+        let y = lo + (k as i128 * (hi - lo)).div_euclid(knots);
+        let row = y.div_euclid(cy).clamp(rows.0, rows.1 - 1);
         // The threshold of that row, from an origin in it (so its row index is small).
         let at_row = LayerParams::new(layer, [0, (row * cy) as i64, 0], 0);
         let threshold = noise::row_threshold(&at_row, 0);
@@ -535,13 +537,25 @@ mod tests {
     }
 
     /// The profile is deterministic and the same wherever the band is (the noise is read at
-    /// the same cells, the thresholds by the rows of the band).
+    /// the same cells, the thresholds by the rows of the band), up to the world's limit, where
+    /// an `f64` height no longer holds a knot's fraction of a block.
     #[test]
     fn the_profile_is_deterministic() {
+        use boxel_voxel::MAX_BLOCK_COORD;
         let layer = valley();
         let p = haze_profile(&layer);
         assert_eq!(haze_profile(&layer), p);
-        for shift in [-(1i64 << 40), -1024, 2048, 1 << 50] {
+        for shift in [
+            -(1i64 << 40),
+            -1024,
+            2048,
+            1 << 50,
+            1 << 52,
+            1 << 55,
+            -(1 << 55),
+            MAX_BLOCK_COORD - 5000,
+            -MAX_BLOCK_COORD + 5000,
+        ] {
             let mut moved = valley();
             (moved.min_y, moved.max_y) = (layer.min_y + shift, layer.max_y + shift);
             assert_eq!(haze_profile(&moved), p, "{shift}");
