@@ -174,7 +174,8 @@ pub struct ImeOptions {
     /// Input method events (`ImeEvent`) allowed.
     pub allowed: bool,
     /// Where the text being typed is: the input method places its candidate box next to it
-    /// without covering it (X11 uses only the position). `None`: not set. Sent while `allowed`.
+    /// without covering it (X11 uses only the position). `None`: not set. Sent while `allowed`,
+    /// and again each time the input method starts over (Wayland forgets it on focus changes).
     pub cursor_area: Option<ImeCursorArea>,
 }
 

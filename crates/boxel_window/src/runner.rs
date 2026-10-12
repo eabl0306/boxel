@@ -729,7 +729,15 @@ impl RunnerCore {
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
-            WindowEvent::Ime(ime) => ime_messages(world, ime),
+            WindowEvent::Ime(ime) => {
+                if ime == Ime::Enabled {
+                    // The input method started over and may have forgotten the cursor area
+                    // (Wayland's text-input `enable` resets it on every keyboard focus, and winit
+                    // keeps no copy): `ime_change` sends it again.
+                    self.applied_ime.cursor_area = None;
+                }
+                ime_messages(world, ime);
+            }
             WindowEvent::MouseInput { state, button, .. } => {
                 write(
                     world,
@@ -859,8 +867,9 @@ impl RunnerCore {
     }
 
     /// What to change on the input method for the desired [`ImeOptions`] (and marks them
-    /// applied): `allowed` when it changed, and the cursor area while allowed when it changed
-    /// or IME was just allowed (an area set while not allowed waits for that).
+    /// applied): `allowed` when it changed, and the cursor area while allowed when it changed,
+    /// IME was just allowed (an area set while not allowed waits for that) or the input method
+    /// reported `Ime::Enabled`.
     fn ime_change(&mut self, world: &World) -> Option<ImeChange> {
         let wanted = *world.get_resource::<ImeOptions>()?;
         let applied = std::mem::replace(&mut self.applied_ime, wanted);
@@ -3025,6 +3034,51 @@ mod tests {
         // An app without the resource changes nothing.
         let mut core = RunnerCore::new(RunnerSettings::default());
         assert_eq!(core.ime_change(&World::new()), None);
+    }
+
+    #[test]
+    fn ime_area_is_sent_again_when_the_input_method_starts() {
+        let mut app = app();
+        app.init_resource::<ImeOptions>();
+        let mut core = core();
+        let area = ImeCursorArea {
+            position: IVec2::new(30, 40),
+            size: UVec2::new(2, 18),
+        };
+        let shown = ImeOptions {
+            allowed: true,
+            cursor_area: Some(area),
+        };
+        *app.world_mut().resource_mut::<ImeOptions>() = shown;
+        assert!(core.ime_change(app.world()).is_some());
+        assert_eq!(core.ime_change(app.world()), None);
+
+        // Wayland forgets the area each time the window's text input gains focus (alt-tab back,
+        // or the first focus after IME was allowed) and then reports `Ime::Enabled`.
+        core.window_event(app.world_mut(), WindowEvent::Ime(Ime::Enabled));
+        let area_only = ImeChange {
+            allowed: None,
+            cursor_area: Some(area),
+        };
+        assert_eq!(core.ime_change(app.world()), Some(area_only));
+        assert_eq!(core.ime_change(app.world()), None);
+
+        // Nothing to send again without an area, or while not allowed.
+        *app.world_mut().resource_mut::<ImeOptions>() = ImeOptions {
+            allowed: true,
+            cursor_area: None,
+        };
+        assert_eq!(core.ime_change(app.world()), None);
+        core.window_event(app.world_mut(), WindowEvent::Ime(Ime::Enabled));
+        assert_eq!(core.ime_change(app.world()), None);
+        let hidden = ImeOptions {
+            allowed: false,
+            cursor_area: Some(area),
+        };
+        *app.world_mut().resource_mut::<ImeOptions>() = hidden;
+        assert!(core.ime_change(app.world()).is_some());
+        core.window_event(app.world_mut(), WindowEvent::Ime(Ime::Enabled));
+        assert_eq!(core.ime_change(app.world()), None);
     }
 
     #[test]

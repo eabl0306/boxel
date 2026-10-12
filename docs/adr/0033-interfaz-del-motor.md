@@ -100,7 +100,9 @@ el pase (E-UI2) y llega antes de los menús, así que no hay puente.
   también como `ImeEvent::Commit`. Un campo de texto lee solo `TextInput`.
 - `ImeOptions { allowed, cursor_area }` se aplica en el hilo principal junto a `CursorOptions`.
   Va apagado por defecto, porque mientras un IME compone winit no manda las teclas. La interfaz
-  lo prende solo con un campo de texto enfocado.
+  lo prende solo con un campo de texto enfocado. Cuando el IME arranca de nuevo (`Ime::Enabled`)
+  el runner vuelve a mandar `cursor_area`, porque Wayland la olvida cada vez que la ventana
+  recupera el foco.
 - `CursorLeft`: `CursorPosition` pasa a `None` cuando el cursor sale de la ventana, y nada queda
   resaltado. El runner lo manda justo antes del update y solo si el cursor no volvió. Si sale y
   vuelve en el mismo frame, vale la posición con la que winit avisa la vuelta, así que un clic
