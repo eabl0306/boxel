@@ -216,9 +216,24 @@ cada preset desde la pose del horizonte, `cumulus16` desde adentro y desde arrib
 bruma 1, 0,25 y 0 contra `both`. Las de los cúmulos tras el ajuste de bandas (02 a 07, mismas
 poses) están en `bench-results/fog-far/look-ajuste/`.
 
-**Costo.** La línea base (S0, 0bd2849, RTX, 1280x720, radio 16, sin tope): `--fog both` cuesta
-de 0,97 a 1,06 ms en la mediana. Las mediciones de este ADR (S1 a S3) se corren cuando el M1
-esté completo y van aquí y en `docs/rendimiento/`.
+**Costo.** RTX, 1280x720, radio 16, sin tope, cada smoke una vez con su `--base` (detalle en
+[rendimiento/niebla-lejana-2026-10.md](../rendimiento/niebla-lejana-2026-10.md)). En el punto
+de partida (S0, 0bd2849) `--fog both` cuesta de 0,97 a 1,06 ms en la mediana.
+
+| medición | qué compara | costo medio | costo p50 |
+|---|---|---:|---:|
+| S1 | el M1 (4f43b4d) contra 0bd2849, `both`, superficie y bosque | +0,08 ms | +0,07 a 0,08 ms |
+| S2 | bruma 1 contra 0, `cumulus16` con `--lod far` | +0,03 ms | +0,05 ms |
+| S3 | `cumulus16` mirando al horizonte con `--lod far` | 1,45 ms | 1,36 ms |
+| S3 | `cumulus20`, igual | 1,43 ms | 1,32 ms |
+| S3 | `cumulus24`, igual | 1,45 ms | 1,35 ms |
+| S3 | `decks`, igual | 1,52 ms | 1,41 ms |
+
+- `both` cuesta casi lo mismo que antes (5 % menos de fps, del tamaño de lo que varía el mismo
+  binario entre sesiones). La bruma es barata.
+- Los cuatro presets nuevos cuestan casi lo mismo y quedan en lo estimado, salvo `cumulus24`,
+  que se esperaba más barato: su banda empieza en 144, justo sobre la pose, y sus rayos cruzan
+  niebla suave. A 1080p el costo por texel sube unas 2,25 veces.
 
 ## Pendiente
 
@@ -227,6 +242,8 @@ esté completo y van aquí y en `docs/rendimiento/`.
 - Decisiones del dueño tras el vuelo: fuerza y alcance de la bruma del valle (1 y 384 por ahora),
   bruma o marcha lejana para las nubes, mapa de cobertura, qué presets quedan y la tecla del
   factor (Shift+F7 o F11).
+- S4 tras el vuelo: el preset que quede, desde arriba (y 420) o dentro de la capa (y 250), la
+  peor de las dos según la tabla de pasos.
 - M2: la ronda de optimización de la marcha, medida contra `both`.
 
 ## Consecuencias
