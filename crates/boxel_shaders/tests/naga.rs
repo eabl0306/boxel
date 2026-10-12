@@ -524,7 +524,7 @@ fn fog_uniform_layout_matches_the_rust_mirrors() {
     assert_eq!(offsets[..7], header.map(|o| o as u32));
     assert_eq!(u64::from(offsets[7]), FOG_LAYERS_OFFSET);
     let (size, offsets) = struct_layout(&module, "FogLayer");
-    assert_eq!((size as usize, size_of::<FogLayerGpu>()), (224, 224));
+    assert_eq!((size as usize, size_of::<FogLayerGpu>()), (256, 256));
     let layer = [
         offset_of!(FogLayerGpu, band),
         offset_of!(FogLayerGpu, fade),
@@ -540,6 +540,8 @@ fn fog_uniform_layout_matches_the_rust_mirrors() {
         offset_of!(FogLayerGpu, shape),
         offset_of!(FogLayerGpu, wind),
         offset_of!(FogLayerGpu, cells),
+        offset_of!(FogLayerGpu, profile_a),
+        offset_of!(FogLayerGpu, profile_b),
     ];
     assert_eq!(offsets, layer.map(|o| o as u32));
     assert_eq!(
@@ -566,6 +568,15 @@ fn fog_constants_match_boxel_fog() {
         boxel_fog::march::EXIT_TAU_LOG2
     );
     assert_eq!(const_f32(&module, "MIN_DIR"), boxel_fog::march::MIN_DIR);
+    assert_eq!(
+        const_u32(&module, "HAZE_KNOTS") as usize,
+        boxel_fog::HAZE_KNOTS
+    );
+    assert_eq!(
+        const_u32(&module, "HAZE_PIECES"),
+        boxel_fog::march::HAZE_PIECES
+    );
+    assert_eq!(const_f32(&module, "LN_2"), std::f32::consts::LN_2);
     assert_eq!(
         const_f32(&module, "SOFT_PIECE"),
         boxel_fog::march::SOFT_PIECE

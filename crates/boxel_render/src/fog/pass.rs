@@ -5,7 +5,7 @@ use super::{FogInput, FogSettings};
 use crate::MAIN_COLOR_FORMAT;
 use crate::renderer::ViewParams;
 use boxel_fog::march::MarchLayer;
-use boxel_fog::{FogLayer, FogResolution, FogTime, MeanCoverage, RayBasis, mean_coverage};
+use boxel_fog::{FogLayer, FogResolution, FogTime, HazeProfile, RayBasis, haze_profile};
 use boxel_math::UVec2;
 use boxel_shaders::gpu::{
     FOG_BUFFER_SIZE, FOG_LAYERS_OFFSET, FOG_MAX_LAYERS, FogHeader, FogLayerGpu, bindings, fog,
@@ -18,14 +18,17 @@ pub(crate) const FOG_TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R
 
 /// The layers one frame marches, as the reference march takes them: sorted by height, without
 /// the ones the camera cannot reach (their band is farther above or below the eye than they are
-/// drawn), each with its color under the frame's light and its fade (for
-/// [`boxel_fog::FogFade::Scene`], the terrain's, or the view's distance fog at the layer's own
-/// end if it ends first). `means` are the layers' mean coverages ([`mean_coverage`]), in the
-/// order of `settings.layers`.
+/// drawn), each with its color under the frame's light and its fade. For
+/// [`boxel_fog::FogFade::Scene`] that is the terrain's, or the view's distance fog at the
+/// layer's own end if it ends first; a layer with haze takes the farthest terrain's instead:
+/// `lod_fade` (the far LOD's fade at its horizon) while the LOD draws, else the view's.
+/// `profiles` are the layers' haze profiles ([`haze_profile`]), in the order of
+/// `settings.layers`.
 pub fn frame_layers(
     settings: &FogSettings,
-    means: &[MeanCoverage],
+    profiles: &[HazeProfile],
     view: &ViewParams,
+    lod_fade: Option<[f32; 2]>,
     time: impl Into<FogTime>,
 ) -> Vec<MarchLayer> {
     let time = time.into();
@@ -38,13 +41,19 @@ pub fn frame_layers(
         .filter_map(|i| {
             let layer = &settings.layers[i];
             let lit = lit_color(layer, view);
+            // A layer with haze reaches as far as the terrain is drawn and fades with it.
+            let fade = if layer.haze > 0.0 {
+                lod_fade.unwrap_or([view.fog_start, view.fog_end])
+            } else {
+                scene_fade(layer, view)
+            };
             let m = MarchLayer::new(
                 layer,
                 origin,
                 time,
                 lit,
-                scene_fade(layer, view),
-                means.get(i).copied().unwrap_or_default(),
+                fade,
+                profiles.get(i).copied().unwrap_or_default(),
             );
             let [lo, hi] = m.params.band;
             let gap = if eye_y < lo {
@@ -55,16 +64,16 @@ pub fn frame_layers(
                 0.0
             };
             let empty = layer.density <= 0.0 || m.params.threshold >= 4096;
-            (!empty && gap < m.reach()).then_some(m)
+            (!empty && gap < m.reach).then_some(m)
         })
         .collect()
 }
 
-/// The fade of `layer` if it fades like the scene: the terrain's (`view.fog_start` to
-/// `view.fog_end`), or for a layer that ends first (its `max_distance`), the view's distance fog
-/// at that end. Like the terrain, then, it fades out over the last stretch it is drawn instead
-/// of stopping in a hard line where the terrain is still clear (with the fog off, both end
-/// at once).
+/// The fade of `layer` without haze if it fades like the scene: the terrain's (`view.fog_start`
+/// to `view.fog_end`), or for a layer that ends first (its `max_distance`), the view's distance
+/// fog at that end. Like the terrain, then, it fades out over the last stretch it is drawn
+/// instead of stopping in a hard line where the terrain is still clear (with the fog off, both
+/// end at once). The layers keep it while the far LOD draws (ADR 0031).
 fn scene_fade(layer: &FogLayer, view: &ViewParams) -> [f32; 2] {
     if layer.max_distance >= view.fog_end {
         [view.fog_start, view.fog_end]
@@ -89,18 +98,18 @@ fn layer_gpu(m: &MarchLayer) -> FogLayerGpu {
     let flags = if p.volume { fog::LAYER_VOLUME } else { 0 }
         | if m.uniform { fog::LAYER_UNIFORM } else { 0 };
     let [r, g, b] = m.lit;
-    let tail = m.sigma_edge_log2e;
+    let k = m.profile.knots;
     FogLayerGpu {
-        band: [p.band[0], p.band[1], m.reach(), m.sigma_mean_log2e],
-        fade: [m.fade[0], m.fade[1], p.density_log2e, tail[0]],
-        grid: [p.grid[0], p.grid[1], p.grid[2], tail[1]],
+        band: [p.band[0], p.band[1], m.reach, m.cells_end],
+        fade: [m.fade[0], m.fade[1], p.density_log2e, m.blend_start],
+        grid: [p.grid[0], p.grid[1], p.grid[2], m.haze],
         size: [
             p.cell[0] as f32,
             p.cell[1] as f32,
             p.cell[2] as f32,
-            tail[2],
+            m.profile.spacing,
         ],
-        lit: [r, g, b, 0.0],
+        lit: [r, g, b, m.haze_bottom()],
         face: m.face_shade,
         soft: [m.soft[0], m.soft[1], m.height_shade[0], m.height_shade[1]],
         lattice: [p.m0[0] as u32, p.m0[1] as u32, p.m0[2] as u32, p.log2_scale],
@@ -115,6 +124,8 @@ fn layer_gpu(m: &MarchLayer) -> FogLayerGpu {
             p.edges[0] as i32,
             p.edges[1] as i32,
         ],
+        profile_a: [k[0], k[1], k[2], k[3]],
+        profile_b: [k[4], k[5], k[6], k[7]],
     }
 }
 
@@ -141,9 +152,9 @@ pub(crate) struct FogPass {
     depth_group: wgpu::BindGroup,
     target: Option<Target>,
     input: Option<FogInput>,
-    /// Mean coverage of each layer of `means_for`.
-    means: Vec<MeanCoverage>,
-    means_for: Option<Arc<FogSettings>>,
+    /// The haze profile of each layer of `profiles_for`.
+    profiles: Vec<HazeProfile>,
+    profiles_for: Option<Arc<FogSettings>>,
 }
 
 impl FogPass {
@@ -251,8 +262,8 @@ impl FogPass {
             depth_group,
             target: None,
             input: None,
-            means: Vec::new(),
-            means_for: None,
+            profiles: Vec::new(),
+            profiles_for: None,
         }
     }
 
@@ -272,15 +283,21 @@ impl FogPass {
     }
 
     /// Encodes the march and the composite into `color` (the main color target of `size`) for
-    /// `view`, after the main pass. Returns the passes recorded (0 or 2) and the layers
-    /// marched: nothing is recorded while the fog is off, has no layer the camera can reach, or
-    /// the view cannot be inverted.
+    /// `view`, after the main pass; `lod_fade` is the far LOD's fade while it draws (layers
+    /// with haze take it, [`frame_layers`]). Returns the passes recorded (0 or 2) and the
+    /// layers marched: nothing is recorded while the fog is off, has no layer the camera can
+    /// reach, or the view cannot be inverted.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the renderer's one call, its targets and the frame"
+    )]
     pub fn encode(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         view: &ViewParams,
+        lod_fade: Option<[f32; 2]>,
         color: &wgpu::TextureView,
         size: UVec2,
     ) -> (u32, u32) {
@@ -292,14 +309,14 @@ impl FogPass {
             return (0, 0);
         }
         if !self
-            .means_for
+            .profiles_for
             .as_ref()
             .is_some_and(|s| Arc::ptr_eq(s, &settings))
         {
-            self.means = settings.layers.iter().map(mean_coverage).collect();
-            self.means_for = Some(Arc::clone(&settings));
+            self.profiles = settings.layers.iter().map(haze_profile).collect();
+            self.profiles_for = Some(Arc::clone(&settings));
         }
-        let layers = frame_layers(&settings, &self.means, view, input.time);
+        let layers = frame_layers(&settings, &self.profiles, view, lod_fade, input.time);
         if layers.is_empty() {
             return (0, 0);
         }
@@ -621,7 +638,14 @@ pub fn debug_coverage(
                 write_mask: wgpu::ColorWrites::ALL,
             },
         );
-        let m = MarchLayer::new(layer, render_origin, time, [1.0; 3], [0.0, 1.0], 0.0);
+        let m = MarchLayer::new(
+            layer,
+            render_origin,
+            time,
+            [1.0; 3],
+            [0.0, 1.0],
+            HazeProfile::default(),
+        );
         let header = FogHeader {
             counts: [0, 0, 0, y0.to_bits()],
             debug: [first[0], first[1], first[2], sub],
@@ -713,6 +737,10 @@ mod tests {
         view_to(y, Camera::default().view_distance, fog)
     }
 
+    fn profiles(settings: &FogSettings) -> Vec<HazeProfile> {
+        settings.layers.iter().map(haze_profile).collect()
+    }
+
     fn view_to(y: f64, view_distance: f32, fog: DistanceFog) -> ViewParams {
         let camera = Camera {
             view_distance,
@@ -739,24 +767,34 @@ mod tests {
             end: 20.0,
         };
         let settings = FogSettings::new(vec![scene, ranged]);
-        let means = [1.0, 1.0].map(MeanCoverage::level);
+        let profiles = profiles(&settings);
         let distance = Camera::default().view_distance;
-        let on = frame_layers(&settings, &means, &view_at(4.5), 0);
+        let on = frame_layers(&settings, &profiles, &view_at(4.5), None, 0);
         assert_eq!(on[0].fade, DistanceFog::default().range(distance));
         assert_eq!(on[0].fade, [distance - 0.1 * distance, distance]);
-        assert_eq!(on[0].reach(), distance);
+        assert_eq!(on[0].reach, distance);
         assert_eq!(on[1].fade, [10.0, 20.0]);
         assert!((on[0].fade_at(distance - 0.05 * distance) - 0.5).abs() < 1e-5);
-        let off = frame_layers(&settings, &means, &view_with(4.5, DistanceFog::off()), 0);
+        let off_view = view_with(4.5, DistanceFog::off());
+        let off = frame_layers(&settings, &profiles, &off_view, None, 0);
         assert_eq!(off[0].fade, [distance, distance]);
-        assert_eq!(off[0].reach(), distance);
+        assert_eq!(off[0].reach, distance);
         for d in [0.0, distance - 1.0, distance] {
             assert_eq!(off[0].fade_at(d), 0.0, "{d}");
         }
         assert_eq!(off[0].fade_at(distance + 1.0), 1.0);
         assert_eq!(off[1].fade, [10.0, 20.0]);
-        assert_eq!(off[1].reach(), 20.0);
-        assert_eq!(layer_gpu(&off[0]).band[2], off[0].reach());
+        assert_eq!(off[1].reach, 20.0);
+        assert_eq!(layer_gpu(&off[0]).band[2], off[0].reach);
+        // Without haze they keep it while the far LOD draws (ADR 0031).
+        let lod = frame_layers(
+            &settings,
+            &profiles,
+            &view_at(4.5),
+            Some([12_224.0, 12_288.0]),
+            0,
+        );
+        assert_eq!(lod, on);
     }
 
     /// A layer faded like the scene that ends before the terrain does fades at its own end by
@@ -771,14 +809,14 @@ mod tests {
         let mut long = FogLayer::new(32, 40);
         long.max_distance = 600.0;
         let settings = FogSettings::new(vec![short, inside, long]);
-        let means = [1.0; 3].map(MeanCoverage::level);
+        let profiles = profiles(&settings);
         let fog = DistanceFog::default();
-        let layers = frame_layers(&settings, &means, &view_to(4.5, 512.0, fog), 0);
+        let layers = frame_layers(&settings, &profiles, &view_to(4.5, 512.0, fog), None, 0);
         assert_eq!(layers[0].fade, fog.range(384.0));
         assert_eq!(layers[1].fade, fog.range(500.0));
         assert_eq!(layers[2].fade, [460.8, 512.0], "the terrain's");
         for (layer, end) in layers.iter().zip([384.0, 500.0, 512.0]) {
-            assert_eq!(layer.reach(), end);
+            assert_eq!(layer.reach, end);
             assert_eq!(layer.fade_at(end), 1.0, "faded out at {end}");
         }
         // The game's rule, and off: a hard end at the layer's own end.
@@ -786,12 +824,58 @@ mod tests {
             max_fade: 16.0,
             ..fog
         };
-        let layers = frame_layers(&settings, &means, &view_to(4.5, 512.0, capped), 0);
+        let layers = frame_layers(&settings, &profiles, &view_to(4.5, 512.0, capped), None, 0);
         assert_eq!(layers[0].fade, [368.0, 384.0]);
         let off = DistanceFog::off();
-        let layers = frame_layers(&settings, &means, &view_to(4.5, 512.0, off), 0);
+        let layers = frame_layers(&settings, &profiles, &view_to(4.5, 512.0, off), None, 0);
         assert_eq!(layers[0].fade, [384.0, 384.0]);
         assert_eq!(layers[2].fade, [512.0, 512.0]);
+    }
+
+    /// A layer with haze reaches as far as the terrain is drawn and fades with it: the view's
+    /// end without LOD (not its own end's fade), the LOD's horizon while the LOD draws; with the
+    /// terrain's fog off it ends there at once. A layer with its own range keeps it.
+    #[test]
+    fn hazy_scene_layers_take_the_far_terrains_fade() {
+        let mut valley = FogLayer::new(0, 8);
+        (valley.max_distance, valley.haze) = (384.0, 1.0);
+        let mut ranged = FogLayer::new(16, 24);
+        ranged.haze = 1.0;
+        ranged.fade = boxel_fog::FogFade::Range {
+            start: 1000.0,
+            end: 2000.0,
+        };
+        let settings = FogSettings::new(vec![valley, ranged]);
+        let profiles = profiles(&settings);
+        let fog = DistanceFog::default();
+        let view = view_to(4.5, 512.0, fog);
+        let far = frame_layers(&settings, &profiles, &view, None, 0);
+        assert_eq!(far[0].fade, [460.8, 512.0], "not range(384)");
+        assert_eq!((far[0].cells_end, far[0].reach), (384.0, 512.0));
+        assert_eq!(far[0].blend_start, 288.0);
+        let horizon = [12_224.0, 12_288.0];
+        let lod = frame_layers(&settings, &profiles, &view, Some(horizon), 0);
+        assert_eq!(lod[0].fade, horizon);
+        assert_eq!((lod[0].cells_end, lod[0].reach), (384.0, 12_288.0));
+        for layers in [&far, &lod] {
+            assert_eq!(layers[1].fade, [1000.0, 2000.0], "a range ignores the LOD");
+            assert_eq!(layers[1].reach, 2000.0);
+        }
+        // The terrain's fog off: a hard end at the same distance, as the terrain.
+        let off = view_to(4.5, 512.0, DistanceFog::off());
+        let ended = frame_layers(&settings, &profiles, &off, None, 0);
+        assert_eq!((ended[0].fade, ended[0].reach), ([512.0, 512.0], 512.0));
+        let ended = frame_layers(&settings, &profiles, &off, Some([12_288.0; 2]), 0);
+        assert_eq!((ended[0].fade, ended[0].reach), ([12_288.0; 2], 12_288.0));
+        // A view that ends before the cells: no haze, as without it.
+        let short = frame_layers(&settings, &profiles, &view_to(4.5, 340.0, fog), None, 0);
+        assert_eq!((short[0].cells_end, short[0].reach), (340.0, 340.0));
+        // A band out of the camera's old reach is in the haze's.
+        let high = view_to(500.0, 512.0, fog);
+        assert_eq!(frame_layers(&settings, &profiles, &high, None, 0).len(), 2);
+        let mut plain = settings.clone();
+        plain.layers[0].haze = 0.0;
+        assert_eq!(frame_layers(&plain, &profiles, &high, None, 0).len(), 1);
     }
 
     #[test]
@@ -802,15 +886,15 @@ mod tests {
         let mut empty = FogLayer::new(40, 48);
         empty.threshold = 1.0;
         let settings = FogSettings::new(vec![high, low, empty]);
-        let means = [1.0, 1.0, 0.0].map(MeanCoverage::level);
-        let near_low = frame_layers(&settings, &means, &view_at(4.5), 0);
+        let profiles = profiles(&settings);
+        let near_low = frame_layers(&settings, &profiles, &view_at(4.5), None, 0);
         assert_eq!(
             near_low.len(),
             1,
             "the high layer is out of reach, the empty one never shows"
         );
         assert_eq!(near_low[0].params.band, [-4.0, 4.0]);
-        let between = frame_layers(&settings, &means, &view_at(150.5), 0);
+        let between = frame_layers(&settings, &profiles, &view_at(150.5), None, 0);
         assert_eq!(between.len(), 2);
         assert!(
             between[0].params.band[0] < between[1].params.band[0],
@@ -828,7 +912,8 @@ mod tests {
             let mut layer = FogLayer::new(0, 8);
             layer.color = [0.5; 3];
             layer.sky_tint = tint;
-            frame_layers(&FogSettings::new(vec![layer]), &[1.0.into()], &view, 0)[0].lit
+            let settings = FogSettings::new(vec![layer]);
+            frame_layers(&settings, &profiles(&settings), &view, None, 0)[0].lit
         };
         assert_eq!(lit(0.0), [0.5; 3], "lit by the noon sky");
         assert_eq!(lit(1.0), [1.0, 0.5, 0.25]);
@@ -843,13 +928,15 @@ mod tests {
         layer.noise.octaves = 2;
         layer.noise.scale = 4;
         layer.threshold = 0.5;
-        let m = MarchLayer::new(&layer, [-5, 3, 1 << 40], 99, [0.5; 3], [10.0, 20.0], 0.25);
+        let origin = [-5, 3, 1 << 40];
+        let level = HazeProfile::level(&layer, 0.25);
+        let m = MarchLayer::new(&layer, origin, 99, [0.5; 3], [10.0, 20.0], level);
         let gpu = layer_gpu(&m);
         assert_eq!(gpu.octave2[2], 2);
         assert_eq!(gpu.octave2[3], fog::LAYER_VOLUME);
         // Every cell full (threshold 0, softness 0): the march takes the layer whole.
         layer.threshold = 0.0;
-        let full = MarchLayer::new(&layer, [-5, 3, 1 << 40], 99, [0.5; 3], [10.0, 20.0], 1.0);
+        let full = MarchLayer::new(&layer, origin, 99, [0.5; 3], [10.0, 20.0], level);
         assert_eq!(
             layer_gpu(&full).octave2[3],
             fog::LAYER_VOLUME | fog::LAYER_UNIFORM
@@ -857,26 +944,35 @@ mod tests {
         assert_eq!(gpu.lattice[3], 2);
         assert_eq!(gpu.base_hi[0], u32::MAX, "a negative lattice point");
         assert_eq!(gpu.fade[..2], [10.0, 20.0]);
-        assert_eq!(gpu.band[3], m.params.density_log2e * 0.25);
+        // Without haze: reach, cells end and blend start are the same distance.
+        assert_eq!(gpu.band[2..], [20.0, 20.0]);
+        assert_eq!((gpu.fade[3], gpu.grid[3]), (20.0, 0.0));
+        let d = m.params.density_log2e;
+        assert_eq!(gpu.profile_a, [d * 0.25; 4]);
+        assert_eq!(gpu.profile_b, [d * 0.25; 4]);
         assert_eq!(
             gpu.cells,
             [m.params.band_cells[0], m.params.band_cells[1], 0, 0]
         );
-        // Edges: their depths, and the tail's means through them; never uniform.
+        // Edges: their depths, and the profile's span inside them; never uniform. With haze
+        // past the cells: the reach, the cells' end, the blend's start and the haze.
         layer.edge_bottom = 4;
         layer.edge_top = 10;
-        let mean = MeanCoverage {
-            core: 1.0,
-            edge: [0.75, 0.5, 0.25],
-        };
-        let edged = MarchLayer::new(&layer, [-5, 3, 1 << 40], 99, [0.5; 3], [10.0, 20.0], mean);
+        layer.haze = 0.5;
+        layer.max_distance = 12.0;
+        let profile = haze_profile(&layer);
+        let edged = MarchLayer::new(&layer, origin, 99, [0.5; 3], [10.0, 20.0], profile);
         let gpu = layer_gpu(&edged);
         assert_eq!(gpu.cells[2..], [4, 10]);
         assert_eq!(gpu.octave2[3], fog::LAYER_VOLUME, "edges are never uniform");
-        let d = edged.params.density_log2e;
-        assert_eq!(
-            [gpu.band[3], gpu.fade[3], gpu.grid[3], gpu.size[3]],
-            [d, d * 0.75, d * 0.5, d * 0.25]
-        );
+        assert_eq!(gpu.band[2..], [20.0, 12.0]);
+        assert_eq!((gpu.fade[3], gpu.grid[3]), (9.0, 0.5));
+        assert_eq!((profile.bottom, profile.spacing), (2.0, 12.0 / 7.0));
+        assert_eq!(gpu.size[3], profile.spacing);
+        // The first knot two blocks over the band's bottom (-8, 3 under the origin).
+        assert_eq!(gpu.lit[3], -11.0 + 2.0);
+        let k = profile.knots;
+        assert_eq!(gpu.profile_a, [k[0], k[1], k[2], k[3]]);
+        assert_eq!(gpu.profile_b, [k[4], k[5], k[6], k[7]]);
     }
 }

@@ -3,7 +3,9 @@
 // zero first vertex, i32 textureLoad levels, no function-local arrays.
 //
 // fs_fog_march: one ray per texel (per 2x2 pixels at half resolution) walks the cells of each
-// layer (an integer-exact 3D DDA) up to the opaque depth of its pixels and writes, per texel, the
+// layer (an integer-exact 3D DDA) up to where they end, then crosses its haze (pieces of linear
+// extinction between the knots of a height profile), up to the opaque depth of its pixels, and
+// writes, per texel, the
 // fog color per unit opacity (x, 11-11-10 sqrt) and one opacity byte per pixel (y, sqrt). The
 // algorithm is boxel_fog::march step for step; the noise is boxel_fog::noise bit for bit.
 // fs_fog_composite_*: blends a pixel's byte over the main color (dst * T + C), discarding a 0
@@ -16,18 +18,19 @@
 // sampler (the Low tier on GL puts every block on binding 0 and every texture on unit 0, ADR 0011).
 
 struct FogLayer {
-  // x, y: band [min, max) relative to the render origin's y; z: reach (blocks along the ray);
-  // w: mean extinction per block (log2 units) for the rest of a ray past the step budget.
+  // x, y: band [min, max) relative to the render origin's y; z: reach (blocks along the ray:
+  // where the haze ends, or the cells of a layer without haze); w: where the cells end.
   band: vec4<f32>,
   // x, y: fade start and end distance; z: extinction per block of a full cell (log2 units);
-  // w: band.w where an edge raises the threshold a quarter of the way (MarchLayer::tail_sigma).
+  // w: where the cells start to blend into the haze (band.w: no blend).
   fade: vec4<f32>,
-  // xyz: min corner of the origin's cell relative to the render origin (blocks); w: band.w at
-  // half the way.
+  // xyz: min corner of the origin's cell relative to the render origin (blocks); w: the haze
+  // (the fraction of the profile past the cells).
   grid: vec4<f32>,
-  // xyz: cell size (blocks); w: band.w at three quarters of the way.
+  // xyz: cell size (blocks); w: blocks between the profile's knots (0: no haze).
   size: vec4<f32>,
-  // rgb: color of a lit cell.
+  // rgb: color of a lit cell; w: height of the profile's first knot relative to the render
+  // origin.
   lit: vec4<f32>,
   // shades of the faces: top, bottom, x, z.
   face: vec4<f32>,
@@ -50,6 +53,10 @@ struct FogLayer {
   // x, y: band cells [first, end) relative to the origin's cell; z, w: depth of the bottom and
   // the top edge (blocks, 0: none).
   cells: vec4<i32>,
+  // The profile (boxel_fog::HazeProfile): mean extinction per block (log2 units) at a haze of 1
+  // at knots 0 to 3 and 4 to 7, also the rest of the cells past the step budget.
+  profile_a: vec4<f32>,
+  profile_b: vec4<f32>,
 };
 
 struct Fog {
@@ -82,6 +89,9 @@ const UNIFORM_PIECES: u32 = 8u;
 const SOFT_PIECE: f32 = 1.0;
 const SOFT_MAX_PIECES: u32 = 16u;
 const EXIT_TAU: f32 = 8.66;
+const HAZE_KNOTS: u32 = 8u;
+const HAZE_PIECES: u32 = 10u;
+const LN_2: f32 = 0.6931471805599453;
 const MIN_DIR: f32 = 1e-30;
 const HI_MIX: u32 = 0x9e3779b1u;
 const FAR: f32 = 1e30;
@@ -395,24 +405,43 @@ fn point_edge(li: u32, y: f32) -> u32 {
   return max(edge_weight(below, cells.z), edge_weight(above, cells.w));
 }
 
-// Extinction (per unit length, log2) of the rest of a ray past the budget at height y: the mean,
-// thinned near the planes like the cells (MarchLayer::tail_sigma).
-fn tail_sigma(li: u32, y: f32) -> f32 {
-  let w = point_edge(li, y);
-  let means = vec4<f32>(fog.layers[li].band.w, fog.layers[li].fade.w, fog.layers[li].grid.w,
-                        fog.layers[li].size.w);
-  if (w == 0u) {
-    return means.x;
-  }
-  let s = smooth_ramp(w);
-  let i = s >> 10u;
-  if (i >= 4u) {
+// Knot k (0..8) of layer li's profile.
+fn knot(li: u32, k: u32) -> f32 {
+  let a = fog.layers[li].profile_a;
+  let b = fog.layers[li].profile_b;
+  return select(b[k & 3u], a[k & 3u], k < 4u);
+}
+
+// Extinction per block (log2 units, at a haze of 1) at height y by knots k and k + 1 (k < 7),
+// the first knot at lo: their line, clamped to its ends (HazeProfile::at_interval).
+fn haze_sigma(li: u32, k: u32, lo: f32, y: f32) -> f32 {
+  let sp = fog.layers[li].size.w;
+  let y0 = lo + f32(k) * sp;
+  let w = clamp((y - y0) / sp, 0.0, 1.0);
+  let k0 = knot(li, k);
+  return k0 + (knot(li, k + 1u) - k0) * w;
+}
+
+// The profile at height y (MarchLayer::haze_at): linear between knots, 0 outside them.
+fn haze_at(li: u32, y: f32) -> f32 {
+  let sp = fog.layers[li].size.w;
+  if (sp <= 0.0) {
     return 0.0;
   }
-  let f = f32(s & 1023u) * (1.0 / 1024.0);
-  let a = means[i];
-  let b = select(means[min(i + 1u, 3u)], 0.0, i == 3u);
-  return a + (b - a) * f;
+  let lo = fog.layers[li].lit.w;
+  let u = (y - lo) / sp;
+  if (!(u >= 0.0 && u < f32(HAZE_KNOTS - 1u))) {
+    return 0.0;
+  }
+  return haze_sigma(li, u32(floor(u)), lo, y);
+}
+
+// How much of a cell before the end of the cells is haze (0 to 1) at `dist` blocks
+// (MarchLayer::blend_weight).
+fn blend_weight(li: u32, dist: f32) -> f32 {
+  let start = fog.layers[li].fade.w;
+  let x = clamp((dist - start) / (fog.layers[li].band.w - start), 0.0, 1.0);
+  return x * x * (3.0 - 2.0 * x);
 }
 
 // The soft fog's coverage (0 to 1) at `pos` (MarchLayer::soft_coverage): the noise read at that
@@ -492,6 +521,33 @@ fn integrate(st: ptr<function, March>, s0: f32, s1: f32, sigma_t: f32, col: vec3
   }
 }
 
+// [s0, s1] (s1 > s0) whose extinction (per unit t, log2) goes linearly from sigma0 to sigma1, of
+// color col: the exact optical depth of the piece and of each record inside it
+// (State::segment_ramp).
+fn integrate_ramp(st: ptr<function, March>, s0: f32, s1: f32, sigma0: f32, sigma1: f32,
+                  col: vec3<f32>) {
+  let len = s1 - s0;
+  let slope = (sigma1 - sigma0) / len;
+  loop {
+    if ((*st).next >= 4u) { break; }
+    let rt = (*st).rec_t[(*st).next];
+    if (rt > s1) { break; }
+    let x = max(rt - s0, 0.0);
+    let tr = (*st).t * exp2(-(sigma0 + 0.5 * slope * x) * x);
+    (*st).rec_tr = select((*st).rec_tr, vec4<f32>(tr), RECORDS == vec4<u32>((*st).next));
+    (*st).csum += (*st).c + ((*st).t - tr) * col;
+    (*st).next += 1u;
+  }
+  let tau = 0.5 * (sigma0 + sigma1) * len;
+  let t_new = (*st).t * exp2(-tau);
+  (*st).c += ((*st).t - t_new) * col;
+  (*st).t = t_new;
+  (*st).tau += tau;
+  if ((*st).tau > EXIT_TAU) {
+    (*st).done = true;
+  }
+}
+
 // The ray's t interval in layer li's band, clipped to [0, t_end] and to the layer's reach.
 fn chord(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, t_end: f32) -> vec2<f32> {
   let band = fog.layers[li].band;
@@ -525,6 +581,75 @@ fn segment_color(li: u32, s0: f32, s1: f32, shade: f32, eye_y: f32, dir_y: f32,
   return mix(lit, fog.sky.rgb, f);
 }
 
+// The haze of layer li over [a, b] (view depth) at `factor` times its profile
+// (boxel_fog::march::haze_span): cut where the ray crosses a knot height and at the fade start,
+// at most HAZE_PIECES pieces of linear extinction, each colored at the point its light comes from
+// on average (exact for a constant extinction), without shade.
+fn haze_span(li: u32, a: f32, b: f32, factor: f32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32,
+             st: ptr<function, March>) {
+  let sp = fog.layers[li].size.w;
+  if (b <= a || factor <= 0.0 || sp <= 0.0) {
+    return;
+  }
+  let lo = fog.layers[li].lit.w;
+  let flat = abs(dir.y) < MIN_DIR;
+  let up = dir.y > 0.0;
+  let last = f32(HAZE_KNOTS - 1u);
+  let u = (eye.y + a * dir.y - lo) / sp;
+  // The next knot the ray crosses: the one above it going up, below it going down.
+  var j = clamp(ceil(u) - 1.0, -1.0, last);
+  if (up) {
+    j = clamp(floor(u) + 1.0, 0.0, last + 1.0);
+  }
+  let inv = 1.0 / select(dir.y, 1.0, flat);
+  var t_fade = fog.layers[li].fade.x / dir_len;
+  if (t_fade <= a) {
+    t_fade = FAR;
+  }
+  var p = a;
+  for (var i = 0u; i < HAZE_PIECES; i++) {
+    if (p >= b) { break; }
+    var t_knot = FAR;
+    if (!flat && j >= 0.0 && j <= last) {
+      t_knot = (lo + j * sp - eye.y) * inv;
+    }
+    let q = max(min(min(t_knot, t_fade), b), p);
+    // The interval of knots the piece lies in.
+    var k = j;
+    if (flat) {
+      k = clamp(floor(u), -1.0, last);
+    } else if (up) {
+      k = j - 1.0;
+    }
+    if (q > p && k >= 0.0 && k < last) {
+      let s0 = factor * haze_sigma(li, u32(k), lo, eye.y + p * dir.y) * dir_len;
+      let s1 = factor * haze_sigma(li, u32(k), lo, eye.y + q * dir.y) * dir_len;
+      if (s0 > 0.0 || s1 > 0.0) {
+        // Where the piece's light comes from on average: e of its length in, with
+        // e = 1 / tau - T / (1 - T) (natural units), its series when tau is small.
+        let len = q - p;
+        let tau2 = 0.5 * (s0 + s1) * len;
+        let tau = tau2 * LN_2;
+        var e = len * (0.5 - tau / 12.0);
+        if (tau >= 0.01) {
+          let tr = exp2(-tau2);
+          e = len * (1.0 / tau - tr / (1.0 - tr));
+        }
+        let m = p + e;
+        integrate_ramp(st, p, q, s0, s1, segment_color(li, m, m, 1.0, eye.y, dir.y, dir_len));
+        if ((*st).done) { return; }
+      }
+    }
+    if (t_knot <= q) {
+      j += select(-1.0, 1.0, up);
+    }
+    if (t_fade <= q) {
+      t_fade = FAR;
+    }
+    p = q;
+  }
+}
+
 // Shade of the face a ray enters a cell through, stepping along `axis` in direction `s`.
 fn face_shade(li: u32, axis: u32, s: i32) -> f32 {
   let face = fog.layers[li].face;
@@ -542,10 +667,11 @@ fn color_code(v: f32, max: f32) -> u32 {
   return u32(floor(sqrt(clamp(v, 0.0, 1.0)) * max + 0.5));
 }
 
-// One layer of a ray (boxel_fog::march's layer loop): its chord, the walk of its cells and their
-// fog. Each iteration takes one segment in pieces: a cell (one piece, or about one per block in
-// the soft fog), the rest of the chord (a layer whose every cell is full, or past the step
-// budget), or none when it crosses an empty lattice step. Every piece goes through one
+// One layer of a ray (boxel_fog::march's layer loop): its chord, the walk of its cells up to
+// where they end and their fog, then its haze. Each iteration of the walk takes one segment in
+// pieces: a cell (one piece, or about one per block in the soft fog), the rest of the chord (a
+// layer whose every cell is full), or none when it crosses an empty lattice step; past the step
+// budget the rest of the cells go through the profile. Every piece of the walk goes through one
 // `integrate`, which keeps the code small.
 fn march_layer(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, up: bool, t_end: f32,
                max_steps: u32, st: ptr<function, March>) {
@@ -554,6 +680,18 @@ fn march_layer(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, up: bool, 
   let tb = ch.y;
   if (ta >= tb) { return; }
   take(st, ta);
+  let haze = fog.layers[li].grid.w;
+  let t_cells = fog.layers[li].band.w / dir_len;
+  if (ta >= t_cells) {
+    // Past the cells: only the haze, no walk.
+    haze_span(li, ta, tb, haze, eye, dir, dir_len, st);
+    return;
+  }
+  // The cells' part of the chord, and where they start to blend into the haze (only when the
+  // layer goes on past them: the ring).
+  let tc = min(tb, t_cells);
+  let ring = fog.layers[li].band.z > fog.layers[li].band.w;
+  let t_blend = fog.layers[li].fade.w / dir_len;
   let safe = select(select(vec3<f32>(MIN_DIR), vec3<f32>(-MIN_DIR), dir < vec3<f32>(0.0)), dir,
                     abs(dir) >= vec3<f32>(MIN_DIR));
   let inv = 1.0 / safe;
@@ -591,40 +729,38 @@ fn march_layer(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, up: bool, 
     // The rest of the chord at one extinction, or a cell of coverage `cov`.
     var rest = false;
     var rest_sigma = 0.0;
-    // The rest is the tail past the budget (thinned near the edges).
-    var tail = false;
     var cov = 0.0;
     var soft = false;
+    // How much of the cell is haze (in the ring).
+    var blend = 0.0;
     // Crossed an empty lattice step this iteration.
     var skipped = false;
     if (steps >= max_steps) {
-      // Past the budget: the rest at the mean density.
-      rest = true;
-      rest_sigma = fog.layers[li].band.w;
-      tail = true;
-      shade = 1.0;
-      b = tb;
-      pieces = UNIFORM_PIECES;
-      last = true;
+      // Past the budget: the rest of the cells through the profile, unshaded.
+      haze_span(li, s0, tc, 1.0, eye, dir, dir_len, st);
+      break;
     } else if ((flags & LAYER_UNIFORM) != 0u) {
       // Every cell full: one body, no inner faces, one step.
       steps += 1u;
       rest = true;
       rest_sigma = density;
       shade = entry;
-      b = tb;
+      b = tc;
       pieces = UNIFORM_PIECES;
       last = true;
     } else {
       steps += 1u;
       soft = s0 < soft_t;
       let num = lattice_cell(li, cell, &cache);
+      var skip = false;
+      var jump_axis = 0u;
+      var t_box = FAR;
       if (!soft && coverage_of(li, step_max_noise(li, &cache), cache.t1) == 0u) {
-        // The whole lattice step is empty: cross it in one step (Dda::step_exit, Dda::jump).
+        // The whole lattice step is empty: cross it in one step (Dda::step_exit, Dda::jump),
+        // but not into the ring, where an empty cell still takes haze.
         let box_edge = cache.lo1 + (cache.hi1 - cache.lo1) * edge;
         let tb3 = (grid + vec3<f32>(box_edge) * size3 - eye) * inv;
-        var jump_axis = 0u;
-        var t_box = tb3.x;
+        t_box = tb3.x;
         if (volume_layer && tb3.y < t_box) {
           jump_axis = 1u;
           t_box = tb3.y;
@@ -633,7 +769,10 @@ fn march_layer(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, up: bool, 
           jump_axis = 2u;
           t_box = tb3.z;
         }
-        if (t_box >= tb) { break; }
+        skip = !ring || t_box <= t_blend;
+      }
+      if (skip) {
+        if (t_box >= tc) { break; }
         let sj = max(t_box, s0);
         let along = vec3<i32>(vec3<bool>(jump_axis == 0u, jump_axis == 1u, jump_axis == 2u));
         let past = cache.hi1 * edge + (cache.lo1 - 1) * (1 - edge);
@@ -657,15 +796,20 @@ fn march_layer(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, up: bool, 
           axis = 1u;
           t_exit = t_next.y;
         }
-        b = clamp(t_exit, s0, tb);
+        b = clamp(t_exit, s0, tc);
         let c = cell_coverage(li, num, row_threshold(li, cell.y), &cache);
         cov = f32(c) / 4096.0;
         if (c > 0u && !prev_full) {
           shade = entry;
         }
         prev_full = c > 0u;
-        last = t_exit >= tb;
+        last = t_exit >= tc;
         pieces = 1u;
+        if (ring && 0.5 * (a + b) > t_blend) {
+          // In the ring: one piece, blending into the haze by its middle.
+          soft = false;
+          blend = blend_weight(li, 0.5 * (a + b) * dir_len);
+        }
         if (soft) {
           pieces = clamp(u32(ceil((b - a) * dir_len / SOFT_PIECE)), 1u, SOFT_MAX_PIECES);
         }
@@ -677,14 +821,11 @@ fn march_layer(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, up: bool, 
       let pb = select(pa + piece, b, i + 1u == pieces);
       var sigma = rest_sigma;
       var sh = shade;
-      if (tail) {
-        sigma = tail_sigma(li, eye.y + 0.5 * (pa + pb) * dir.y);
-      }
       if (!rest) {
         var c = cov;
+        let mid = 0.5 * (pa + pb);
         if (soft) {
           // Blend the cell into the noise read at the piece's middle.
-          let mid = 0.5 * (pa + pb);
           let w = soft_weight(li, mid * dir_len);
           if (w > 0.0) {
             c += (soft_coverage(li, eye + mid * dir, &cache) - c) * w;
@@ -692,6 +833,12 @@ fn march_layer(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, up: bool, 
           }
         }
         sigma = density * c;
+        if (blend > 0.0) {
+          // Blend the cell into the haze at the piece's middle.
+          let h = haze * haze_at(li, eye.y + mid * dir.y);
+          sigma += (h - sigma) * blend;
+          sh += (1.0 - sh) * blend;
+        }
       }
       if (sigma > 0.0) {
         integrate(st, pa, pb, sigma * dir_len, segment_color(li, pa, pb, sh, eye.y, dir.y, dir_len));
@@ -709,6 +856,9 @@ fn march_layer(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, up: bool, 
     }
   }
   (*st).steps = steps;
+  if (!(*st).done && tb > t_cells) {
+    haze_span(li, max(ta, t_cells), tb, haze, eye, dir, dir_len, st);
+  }
 }
 
 @fragment

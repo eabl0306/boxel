@@ -16,7 +16,9 @@
 //!   blocks deep across the seam, looking diagonally over the keep band, and 200 blocks up
 //!   pitched 20 degrees down. With the camera's own far plane in the search, holes show.
 //! - **Far plane and fog:** a chunk past the view distance is culled without LOD and drawn with
-//!   it; the demo's valley fog layer over full detail draws the same with and without LOD.
+//!   it; the demo's valley fog layer over full detail draws the same with and without LOD. The
+//!   hazy valley's haze reaches the LOD's horizon over the LOD terrain, and without LOD ends at
+//!   the view distance like the plain valley with LOD.
 //! - **Origins:** the scene moved far from the origin, across the `i32` edges, draws the same
 //!   pixels.
 //! - **GL:** on GL backends the LOD stays off and the image is the one without LOD.
@@ -1647,6 +1649,101 @@ fn the_lod_moves_the_far_plane_and_keeps_the_fog_layers() {
                 (&gpu.name("valley"), &fogged),
                 (&gpu.name("valley_lod"), &fogged_lod),
             );
+            Ok(())
+        };
+        if let Err(e) = run() {
+            report.fail(format!("{} {}: {e}", gpu.label, gpu.tier), &[]);
+        }
+    })
+    .finish();
+}
+
+/// The demo's hazy valley (its haze past the cells) over the LOD terrain: while the LOD draws,
+/// its haze goes on to the horizon, so every texel whose ray meets the band 0.6 to 3 km away
+/// has fog over an empty LOD, and over the forest's LOD those the hills do not hide; without
+/// LOD none lies past the view distance, and neither does the plain valley's with LOD (layers
+/// without haze keep their range).
+#[test]
+fn a_hazy_valley_reaches_the_lod_horizon() {
+    use boxel_render::fog::{FogInput, FogSettings};
+    let camera = Camera::default();
+    let transform = Transform::from_yaw_pitch(DVec3::new(16.5, 100.0, 20.5), 0.0, -0.06);
+    let cv = CameraView::compute(&camera, &transform, WIDTH as f32 / HEIGHT as f32);
+    let view = ViewParams::from_camera(&cv, &camera, DEFAULT_SKY_COLOR, DistanceFog::default());
+    let basis =
+        boxel_fog::RayBasis::new(view.view_proj.to_cols_array_2d(), view.eye_rel.to_array())
+            .expect("basis");
+    // Where each half-resolution texel's ray enters the valley's band (its top, y 70), in blocks.
+    let top = 70.0 - view.render_origin.y as f32 - view.eye_rel.y;
+    let entry = |tx: u32, ty: u32| -> Option<f32> {
+        let ndc = [
+            (2 * tx + 1) as f32 / WIDTH as f32 * 2.0 - 1.0,
+            1.0 - (2 * ty + 1) as f32 / HEIGHT as f32 * 2.0,
+        ];
+        let dir = basis.dir(ndc[0], ndc[1]);
+        let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+        (dir[1] < 0.0).then(|| top / dir[1] * len)
+    };
+    let fog = |layer| FogInput {
+        settings: Arc::new(FogSettings::new(vec![layer])),
+        time: 7u64.into(),
+    };
+    for_every_tier(|gpu, report| {
+        if gpu.gl() {
+            return;
+        }
+        let run = || -> Result<(), String> {
+            let texels =
+                |lod: Option<LodInput>, fog: FogInput| -> Result<(UVec2, Vec<[u32; 2]>), String> {
+                    let mut renderer = new_renderer(gpu)?;
+                    load_world(&mut renderer, &full_detail(), I64Vec3::ZERO)?;
+                    renderer.set_lod(gpu.device, lod);
+                    renderer.set_fog(gpu.device, Some(fog));
+                    render(gpu, &mut renderer, &view)?;
+                    renderer
+                        .fog_texels(gpu.device, gpu.queue)
+                        .ok_or("no fog target")?
+                };
+            // (texels with fog, texels) whose ray enters the band within `range` blocks.
+            let count = |(size, words): &(UVec2, Vec<[u32; 2]>), range: std::ops::Range<f32>| {
+                let (mut fogged, mut all) = (0, 0);
+                for ty in 0..size.y {
+                    for tx in 0..size.x {
+                        if entry(tx, ty).is_some_and(|d| range.contains(&d)) {
+                            all += 1;
+                            fogged += usize::from(words[(ty * size.x + tx) as usize][1] != 0);
+                        }
+                    }
+                }
+                (fogged, all)
+            };
+            let what = format!("{} {}", gpu.label, gpu.tier);
+            let hazy = boxel_demo::fog::hazy_valley();
+            let nodes = || Some(lod_input(settings(1 << 20), lod_nodes()));
+            let empty = || Some(LodInput::new(settings(1 << 20), Some(HORIZON)));
+            let far = 600.0..3000.0;
+            // Over the void every far texel has haze; over the forest its hills stand out of it.
+            for (name, lod, least) in [("an empty LOD", empty(), 1.0), ("the LOD", nodes(), 0.3)] {
+                let (fogged, all) = count(&texels(lod, fog(hazy.clone()))?, far.clone());
+                eprintln!("gpu_lod: {what}: hazy valley over {name}: {fogged} of {all} far texels");
+                if all < 100 || (fogged as f64) < least * all as f64 {
+                    return Err(format!(
+                        "over {name}: {fogged} of {all} far texels have haze"
+                    ));
+                }
+            }
+            let past = 390.0..f32::INFINITY;
+            for (name, lod, layer) in [
+                ("the hazy valley without LOD", None, hazy),
+                ("the valley with LOD", nodes(), boxel_demo::fog::valley()),
+            ] {
+                let (fogged, all) = count(&texels(lod, fog(layer))?, past.clone());
+                if all < 100 || fogged > 0 {
+                    return Err(format!(
+                        "{name}: {fogged} of {all} texels past the view distance have fog"
+                    ));
+                }
+            }
             Ok(())
         };
         if let Err(e) = run() {

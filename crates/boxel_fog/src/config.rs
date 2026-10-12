@@ -4,9 +4,12 @@
 
 use crate::MAX_FOG_LAYERS;
 
-/// The farthest a layer is drawn, in blocks ([`FogLayer::max_distance`]): it bounds the cell
-/// offsets the GPU walks to 4096 cells, so every integer stays small.
-pub const MAX_FOG_DISTANCE: f32 = 4096.0;
+/// Most cells a layer's walk goes from the origin's cell along an axis ([`FogLayer::max_distance`]
+/// is at most this many of its smallest cells), so every integer of the GPU's noise stays small.
+pub const MAX_FOG_CELLS: u32 = 4096;
+/// The farthest a layer is drawn, in blocks: its cells ([`FogLayer::max_distance`]) and its haze
+/// ([`FogLayer::haze`]). An `f32` cap past the farthest horizon of a far LOD (49,152 blocks).
+pub const MAX_FOG_DISTANCE: f32 = 65_536.0;
 /// Largest cell edge, in blocks.
 pub const MAX_CELL: u32 = 32;
 /// Largest noise scale, in cells per lattice step.
@@ -82,8 +85,15 @@ pub struct FogLayer {
     pub soft_distance: f32,
     /// Wind in blocks per second. `y` only moves [`NoiseDims::Volume`] noise.
     pub wind: [f32; 3],
-    /// The farthest the layer is drawn (blocks along the ray), `(0, 4096]`.
+    /// Where the layer's cells end (blocks along the ray): its cubes are walked up to here.
+    /// Positive, at most [`MAX_FOG_CELLS`] of its smallest cells and [`MAX_FOG_DISTANCE`].
     pub max_distance: f32,
+    /// Past its cells (`max_distance`), the layer goes on as a smooth haze of this fraction, from
+    /// 0 to 1, of its mean extinction at each height, up to its fade end (for
+    /// [`FogFade::Scene`], the end of the farthest terrain drawn). 0 (the default) ends the
+    /// layer with its cells. A [`FogFade::Range`] should end where the terrain does, or the haze
+    /// runs on over the void.
+    pub haze: f32,
     /// How the layer fades into the sky with distance.
     pub fade: FogFade,
 }
@@ -111,6 +121,7 @@ impl FogLayer {
             soft_distance: 0.0,
             wind: [0.0; 3],
             max_distance: 512.0,
+            haze: 0.0,
             fade: FogFade::Scene,
         }
     }
@@ -162,7 +173,9 @@ pub enum FogFade {
     /// Like the terrain: from the scene's fog start to its fog end (the renderer's distance fog
     /// at the view distance). A layer that ends first fades by the same rule at its own end
     /// (`max_distance`), so it does not stop in a hard line where the terrain is still clear.
-    /// With that fog off, no fade: the layer ends at once, as the terrain does.
+    /// With that fog off, no fade: the layer ends at once, as the terrain does. A layer with
+    /// [`FogLayer::haze`] takes the fade of the farthest terrain drawn instead (the far LOD's
+    /// horizon while it draws) and its haze ends there, with the terrain.
     #[default]
     Scene,
     /// Linearly from `start` to `end` blocks.
@@ -207,11 +220,12 @@ pub enum FogError {
     BadScale(usize),
     /// Octaves outside `1..=2`, or 2 with scale 1.
     BadOctaves(usize),
-    /// A value that is not finite or is out of its range (threshold, its rise, softness and sky
-    /// tint in `0..=1`; density, colors and shades not negative).
+    /// A value that is not finite or is out of its range (threshold, its rise, softness, sky
+    /// tint and haze in `0..=1`; density, colors and shades not negative).
     NonFinite(usize),
-    /// `max_distance` outside `(0, 4096]`, a fade range that is empty or negative, or a soft
-    /// distance outside `0..=32`.
+    /// `max_distance` not positive, over [`MAX_FOG_CELLS`] of the layer's smallest cells or over
+    /// [`MAX_FOG_DISTANCE`]; a fade range that is empty or negative; or a soft distance outside
+    /// `0..=32`.
     BadDistance(usize),
     /// A threshold rise over a band of more than [`MAX_PROFILE_ROWS`] cell rows.
     TallProfile(usize),
@@ -247,7 +261,7 @@ impl std::fmt::Display for FogError {
             }
             FogError::BadDistance(i) => write!(
                 f,
-                "fog layer {i}: max_distance goes up to {MAX_FOG_DISTANCE}, a fade range must not be empty and soft_distance goes up to {MAX_SOFT_DISTANCE}"
+                "fog layer {i}: max_distance goes up to {MAX_FOG_CELLS} of the smallest cells and {MAX_FOG_DISTANCE} blocks, a fade range must not be empty and soft_distance goes up to {MAX_SOFT_DISTANCE}"
             ),
             FogError::TallProfile(i) => write!(
                 f,
@@ -311,6 +325,7 @@ fn validate_layer(i: usize, l: &FogLayer) -> Result<(), FogError> {
         || !unit(l.threshold_rise)
         || !unit(l.softness)
         || !unit(l.sky_tint)
+        || !unit(l.haze)
         || !positive(l.density)
         || !l.color.iter().all(|&c| positive(c))
         || !l.face_shade.iter().all(|&c| positive(c))
@@ -321,8 +336,11 @@ fn validate_layer(i: usize, l: &FogLayer) -> Result<(), FogError> {
     {
         return Err(FogError::NonFinite(i));
     }
+    // The walk stays within MAX_FOG_CELLS cells of the origin's cell along every axis.
+    let min_cell = l.cell.iter().copied().min().unwrap_or(1);
+    let cells_limit = (MAX_FOG_CELLS as f32 * min_cell as f32).min(MAX_FOG_DISTANCE);
     if l.max_distance <= 0.0
-        || l.max_distance > MAX_FOG_DISTANCE
+        || l.max_distance > cells_limit
         || !fade_ok
         || !(0.0..=MAX_SOFT_DISTANCE).contains(&l.soft_distance)
     {
@@ -370,6 +388,46 @@ mod tests {
             (0, 0),
             "cut flat at both planes"
         );
+        assert_eq!(l.haze, 0.0, "it ends with its cells");
+    }
+
+    /// The cells reach at most 4096 of the smallest cells and 65,536 blocks; the haze is a
+    /// fraction.
+    #[test]
+    fn the_cells_reach_4096_cells_and_the_haze_is_a_fraction() {
+        let with = |cell: [u32; 3], max_distance: f32, haze: f32| {
+            let mut l = FogLayer::new(0, i64::from(cell[1]) * 4);
+            (l.cell, l.max_distance, l.haze) = (cell, max_distance, haze);
+            ok(&[l])
+        };
+        assert_eq!(with([2, 2, 2], 8192.0, 0.0), Ok(()));
+        assert_eq!(with([2, 2, 2], 8192.5, 0.0), Err(FogError::BadDistance(0)));
+        assert_eq!(with([16, 16, 16], MAX_FOG_DISTANCE, 1.0), Ok(()));
+        assert_eq!(
+            with([24, 24, 24], 98_304.0, 1.0),
+            Err(FogError::BadDistance(0))
+        );
+        assert_eq!(
+            with([32, 32, 32], 65_537.0, 1.0),
+            Err(FogError::BadDistance(0))
+        );
+        // The smallest cell counts, along any axis.
+        assert_eq!(with([16, 1, 16], 4096.0, 0.0), Ok(()));
+        assert_eq!(
+            with([16, 1, 16], 4097.0, 0.0),
+            Err(FogError::BadDistance(0))
+        );
+        assert_eq!(
+            with([8, 16, 4], 16_385.0, 0.0),
+            Err(FogError::BadDistance(0))
+        );
+        for haze in [0.0, 0.25, 1.0] {
+            assert_eq!(with([2, 2, 2], 384.0, haze), Ok(()));
+        }
+        for haze in [-0.1, 1.5, f32::NAN, f32::INFINITY] {
+            assert_eq!(with([2, 2, 2], 384.0, haze), Err(FogError::NonFinite(0)));
+        }
+        assert!(FogError::BadDistance(0).to_string().contains("65536"));
     }
 
     #[test]

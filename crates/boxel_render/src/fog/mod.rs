@@ -3,7 +3,9 @@
 //! of it (no pipeline, no target, no sampled depth) and every frame is what it was before.
 //!
 //! - [`FogSettings`]: the layers and how they are drawn, the game's style ([`boxel_fog`] holds
-//!   the layer types and their validation).
+//!   the layer types and their validation). A layer can go on past its cells as a haze of its
+//!   mean density ([`FogLayer::haze`]), as far as the terrain is drawn (the far LOD's horizon
+//!   while it draws, for a layer faded like the scene).
 //! - [`FogInput`]: what one frame of fog needs; [`crate::VoxelRenderer::set_fog`] takes it.
 
 mod pass;
@@ -35,8 +37,9 @@ pub struct FogSettings {
     /// Resolution of the march (default half).
     pub resolution: FogResolution,
     /// Cells a ray visits at most over all layers (1 to 256, default
-    /// [`boxel_fog::DEFAULT_MAX_STEPS`]); past it each layer uses its mean density. More shows
-    /// the cubes deeper into thick fog and costs more on weak GPUs.
+    /// [`boxel_fog::DEFAULT_MAX_STEPS`]); past it the rest of each layer's cells is its mean
+    /// density at each height (its haze profile, [`boxel_fog::HazeProfile`]). More shows the
+    /// cubes deeper into thick fog and costs more on weak GPUs.
     pub max_steps: u32,
 }
 

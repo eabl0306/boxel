@@ -22,17 +22,25 @@
 //! - **Edges.** Near the band's floor and ceiling the threshold rises to never covered
 //!   ([`noise::row_edge`] per cell row, [`noise::point_edge`] per point of the soft fog), so the
 //!   band ends in an uneven skyline of cubes, not a plane.
-//! - **Budget.** At most `max_steps` cells over all layers; past it the rest of each chord gets
-//!   the layer's mean extinction with shade 1 (no visible wall where the budget ends), thinned
-//!   near the edges like the cells ([`MarchLayer::tail_sigma`]).
+//! - **Haze.** The cells end at [`MarchLayer::cells_end`]. A layer with
+//!   [`FogLayer::haze`] goes on past them as a smooth haze of that fraction of its
+//!   [`HazeProfile`] (the mean extinction at each height) up to [`MarchLayer::reach`], taken in
+//!   pieces split at the knot heights the ray crosses and at the fade start, each of linear
+//!   extinction, so every record inside one gets its exact transmittance. Over the last
+//!   [`FAR_BLEND`] before the cells end, each cell blends into the haze, and at their end a cell
+//!   is the haze.
+//! - **Budget.** At most `max_steps` cells over all layers; past it the rest of each layer's
+//!   cells takes its haze profile at full strength with shade 1 (no visible wall where the budget
+//!   ends), thinned near the edges like the cells.
 //! - **Early exit.** Once the optical depth passes 6 (`log2`: 8.66) nothing behind shows.
 //! - **Skip.** A lattice step of the noise whose corners leave no coverage at the lowest
 //!   threshold of its rows ([`noise::step_bound`]) is crossed in one step (never in the soft fog,
-//!   which reads points outside the step), and a layer whose every cell is full
-//!   ([`MarchLayer::uniform`]) is taken in one step without walking its cells.
+//!   which reads points outside the step, nor into the blend before the haze, where an empty
+//!   cell still takes haze), and a layer whose every cell is full ([`MarchLayer::uniform`]) is
+//!   taken in one step without walking its cells.
 
-use crate::config::{FogFade, FogLayer};
-use crate::layer::{FogTime, LayerParams, MeanCoverage};
+use crate::config::{FogFade, FogLayer, MAX_FOG_DISTANCE};
+use crate::layer::{FogTime, HAZE_KNOTS, HazeProfile, LayerParams};
 use crate::noise;
 
 /// Optical depth (in `log2` units, `exp2(-tau)`) after which the march stops: `6 / ln 2`.
@@ -49,6 +57,14 @@ pub const SOFT_BLEND: f32 = 0.5;
 pub const SOFT_PIECE: f32 = 1.0;
 /// Most pieces of one cell in the soft fog.
 pub const SOFT_MAX_PIECES: u32 = 16;
+/// The cells blend into the haze over this last fraction of their distance
+/// ([`MarchLayer::blend_start`]), the mirror of the soft fog's blend near the camera.
+pub const FAR_BLEND: f32 = 0.25;
+/// Most pieces of one chord of haze: one per knot height crossed and one at the fade start, plus
+/// one.
+pub const HAZE_PIECES: u32 = HAZE_KNOTS as u32 + 2;
+/// A `t` past every chord (the shader's `FAR`).
+const FAR: f32 = 1e30;
 
 /// One layer as the march reads it (the uniform's per-layer data).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -66,14 +82,19 @@ pub struct MarchLayer {
     pub soft: [f32; 2],
     /// Fade start and end distance.
     pub fade: [f32; 2],
-    /// The farthest the layer is drawn (blocks along the ray).
-    pub max_distance: f32,
-    /// Mean extinction (per block, times `log2(e)`) for the rest of a ray past the budget, away
-    /// from the edges ([`MeanCoverage::core`]).
-    pub sigma_mean_log2e: f32,
-    /// The same where an edge raises the threshold a quarter, a half and three quarters of the
-    /// way ([`MeanCoverage::edge`]).
-    pub sigma_edge_log2e: [f32; 3],
+    /// Where the cells end (blocks along the ray): `min(max_distance, fade end)`.
+    pub cells_end: f32,
+    /// The farthest the layer is drawn: `cells_end`, or with haze its fade end (at most
+    /// [`MAX_FOG_DISTANCE`]) when that is farther.
+    pub reach: f32,
+    /// Where the cells start to blend into the haze, [`FAR_BLEND`] of `cells_end` before it;
+    /// `cells_end` when the layer ends with its cells (no blend).
+    pub blend_start: f32,
+    /// The fraction of the profile the haze takes ([`FogLayer::haze`]).
+    pub haze: f32,
+    /// The mean extinction at each height ([`crate::haze_profile`]): the haze past the cells,
+    /// and the rest of the cells past the step budget.
+    pub profile: HazeProfile,
     /// Every cell is full (threshold 0 without a rise or edges, softness 0): the march takes
     /// each chord whole.
     pub uniform: bool,
@@ -82,21 +103,32 @@ pub struct MarchLayer {
 impl MarchLayer {
     /// A layer for `render_origin` at `time`: `lit` is its color under this frame's light,
     /// `scene_fade` the fade start and end [`FogFade::Scene`] takes (the renderer gives the
-    /// terrain's, or its distance fog at the layer's end if the layer ends first), `mean` its
-    /// [`crate::mean_coverage`] (a plain number is [`MeanCoverage::level`]).
+    /// terrain's, or its distance fog at the layer's end if the layer ends first; for a layer
+    /// with haze, the farthest terrain's), `profile` its [`crate::haze_profile`].
     pub fn new(
         layer: &FogLayer,
         render_origin: [i64; 3],
         time: impl Into<FogTime>,
         lit: [f32; 3],
         scene_fade: [f32; 2],
-        mean: impl Into<MeanCoverage>,
+        profile: HazeProfile,
     ) -> Self {
-        let mean = mean.into();
         let params = LayerParams::new(layer, render_origin, time);
         let fade = match layer.fade {
             FogFade::Scene => scene_fade,
             FogFade::Range { start, end } => [start, end],
+        };
+        let end = fade[1].max(fade[0]);
+        let cells_end = layer.max_distance.min(end);
+        let reach = if layer.haze > 0.0 {
+            cells_end.max(end.min(MAX_FOG_DISTANCE))
+        } else {
+            cells_end
+        };
+        let blend_start = if reach > cells_end {
+            cells_end * (1.0 - FAR_BLEND)
+        } else {
+            cells_end
         };
         let soft = if layer.soft_distance > 0.0 {
             [
@@ -113,9 +145,11 @@ impl MarchLayer {
             height_shade: layer.height_shade,
             soft,
             fade,
-            max_distance: layer.max_distance,
-            sigma_mean_log2e: params.density_log2e * mean.core,
-            sigma_edge_log2e: mean.edge.map(|m| params.density_log2e * m),
+            cells_end,
+            reach,
+            blend_start,
+            haze: layer.haze,
+            profile,
             uniform: params.threshold == 0
                 && params.rise == 0
                 && params.edges == [0; 2]
@@ -134,6 +168,23 @@ impl MarchLayer {
         let [lo, hi] = self.params.band;
         let h = ((y - lo) / (hi - lo).max(1.0)).clamp(0.0, 1.0);
         self.height_shade[0] + (self.height_shade[1] - self.height_shade[0]) * h
+    }
+
+    /// The color of fog at view depth `mid` of a ray from `eye_y` along `dir_y` (`dir_len` its
+    /// length): lit times `shade` and the brightness at that height, faded to `sky` by that
+    /// distance (the shader's `segment_color` of a segment whose middle is `mid`).
+    pub fn color_at(
+        &self,
+        mid: f32,
+        shade: f32,
+        eye_y: f32,
+        dir_y: f32,
+        dir_len: f32,
+        sky: [f32; 3],
+    ) -> [f32; 3] {
+        let f = self.fade_at(mid * dir_len);
+        let shade = shade * self.height_at(eye_y + mid * dir_y);
+        std::array::from_fn(|i| self.lit[i] * shade + (sky[i] - self.lit[i] * shade) * f)
     }
 
     /// How soft the fog is (0 to 1) at `dist` blocks: 1 up to the soft distance, a smoothstep
@@ -171,25 +222,24 @@ impl MarchLayer {
         noise::coverage_from_noise(n, threshold, p.gain) as f32 / 4096.0
     }
 
-    /// Extinction (per block, `log2`) of the rest of a ray past the budget at height `y`: the
-    /// mean away from the edges, thinned near the band's planes as the edges thin the cells
-    /// ([`MeanCoverage::at`] at the soft fog's [`noise::point_edge`]), none within half a cell
-    /// of a plane with an edge.
-    pub fn tail_sigma(&self, y: f32) -> f32 {
-        let w = noise::point_edge(&self.params, y);
-        if w == 0 {
-            return self.sigma_mean_log2e;
-        }
-        MeanCoverage {
-            core: self.sigma_mean_log2e,
-            edge: self.sigma_edge_log2e,
-        }
-        .at(noise::smooth_ramp(w))
+    /// Height of the profile's first knot relative to the render origin (the band's bottom,
+    /// clamped as [`LayerParams::band`] is, plus [`HazeProfile::bottom`]).
+    pub fn haze_bottom(&self) -> f32 {
+        self.params.band[0] + self.profile.bottom
     }
 
-    /// The farthest distance drawn: `min(max_distance, fade end)`.
-    pub fn reach(&self) -> f32 {
-        self.max_distance.min(self.fade[1].max(self.fade[0]))
+    /// Extinction per block (`log2` units) of the profile at height `y` (relative to the render
+    /// origin), at a haze of 1 ([`HazeProfile::at`]).
+    pub fn haze_at(&self, y: f32) -> f32 {
+        self.profile.at(self.haze_bottom(), y)
+    }
+
+    /// How much of a cell in the blend before the haze is haze (0 to 1) at `dist` blocks: a
+    /// smoothstep from 0 at [`MarchLayer::blend_start`] to 1 at [`MarchLayer::cells_end`]. Only
+    /// for a layer that goes on past its cells.
+    pub fn blend_weight(&self, dist: f32) -> f32 {
+        let x = ((dist - self.blend_start) / (self.cells_end - self.blend_start)).clamp(0.0, 1.0);
+        x * x * (3.0 - 2.0 * x)
     }
 }
 
@@ -460,6 +510,32 @@ impl State {
             self.done = true;
         }
     }
+
+    /// Integrates `[s0, s1]` (view depth, `s1 > s0`) whose extinction (per unit `t`, `log2`)
+    /// goes linearly from `sigma0` to `sigma1`, of color `col`: the exact optical depth of the
+    /// piece and of each record inside it.
+    fn segment_ramp(&mut self, s0: f32, s1: f32, sigma0: f32, sigma1: f32, col: [f32; 3]) {
+        let len = s1 - s0;
+        let slope = (sigma1 - sigma0) / len;
+        while self.next < 4 && self.rec_t[self.next] <= s1 {
+            let x = (self.rec_t[self.next] - s0).max(0.0);
+            let tr = self.t * (-(sigma0 + 0.5 * slope * x) * x).exp2();
+            let k = self.rec_order[self.next];
+            self.out_t[k] = tr;
+            self.out_c[k] = std::array::from_fn(|i| self.c[i] + (self.t - tr) * col[i]);
+            self.next += 1;
+        }
+        let tau = 0.5 * (sigma0 + sigma1) * len;
+        let t_new = self.t * (-tau).exp2();
+        for (c, &k) in self.c.iter_mut().zip(&col) {
+            *c += (self.t - t_new) * k;
+        }
+        self.t = t_new;
+        self.tau += tau;
+        if self.tau > EXIT_TAU_LOG2 {
+            self.done = true;
+        }
+    }
 }
 
 /// Sorts four depths ascending with the shader's network (0-1, 2-3, 0-2, 1-3, 1-2), keeping
@@ -505,7 +581,7 @@ pub fn march(ray: &Ray, layers: &[MarchLayer], sky: [f32; 3], max_steps: u32) ->
         let Some((ta, tb)) = band_chord(ray.eye[1], dir[1], p.band) else {
             continue;
         };
-        let tb = tb.min(t_end).min(layer.reach() / dir_len);
+        let tb = tb.min(t_end).min(layer.reach / dir_len);
         if ta >= tb {
             continue;
         }
@@ -520,10 +596,11 @@ pub fn march(ray: &Ray, layers: &[MarchLayer], sky: [f32; 3], max_steps: u32) ->
     }
 }
 
-/// One layer's chord `[ta, tb]` of a ray: the cell walk, or the rest of the chord in
-/// [`UNIFORM_PIECES`] pieces for a layer whose every cell is full and past the step budget (the
-/// shader's `march_layer`, segment for segment). Each iteration takes one segment in pieces: a
-/// cell (one piece, or about one per block in the soft fog) or the rest of the chord.
+/// One layer's chord `[ta, tb]` of a ray (the shader's `march_layer`, segment for segment): the
+/// cell walk up to where the cells end, or the rest of the chord in [`UNIFORM_PIECES`] pieces
+/// for a layer whose every cell is full; past the step budget the rest of the cells through the
+/// profile; then the haze past the cells. Each iteration of the walk takes one segment in
+/// pieces: a cell (one piece, or about one per block in the soft fog) or the rest of the chord.
 fn march_layer(
     s: &mut State,
     layer: &MarchLayer,
@@ -537,11 +614,19 @@ fn march_layer(
     let (eye, dir) = (ray.eye, ray.dir);
     let dir_len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
     let up = dir[1] > 0.0;
+    let t_cells = layer.cells_end / dir_len;
+    if ta >= t_cells {
+        // Past the cells: only the haze, no walk.
+        haze_span(s, layer, eye, dir, ta, tb, layer.haze, sky);
+        return;
+    }
+    // The cells' part of the chord, and where they start to blend into the haze (only when the
+    // layer goes on past them: the ring).
+    let tc = tb.min(t_cells);
+    let ring = layer.reach > layer.cells_end;
+    let t_blend = layer.blend_start / dir_len;
     let color = |a: f32, b: f32, shade: f32| -> [f32; 3] {
-        let mid = 0.5 * (a + b);
-        let f = layer.fade_at(mid * dir_len);
-        let shade = shade * layer.height_at(eye[1] + mid * dir[1]);
-        std::array::from_fn(|i| layer.lit[i] * shade + (sky[i] - layer.lit[i] * shade) * f)
+        layer.color_at(0.5 * (a + b), shade, eye[1], dir[1], dir_len, sky)
     };
     // A cell that starts before this is in the soft fog (0: no soft fog).
     let soft_t = layer.soft[1] / dir_len;
@@ -558,31 +643,35 @@ fn march_layer(
         let (a, b, pieces, last);
         // The extinction of the rest of the chord, or the cell's coverage.
         let mut rest = None;
-        // The rest is the tail past the budget (thinned near the edges).
-        let mut tail = false;
         let mut cov = 0.0;
         let mut soft = false;
+        // How much of the cell is haze (in the ring).
+        let mut blend = 0.0;
         let mut axis = 2;
         if s.steps >= max_steps {
-            // Past the budget: the rest at the mean density.
-            (a, b, pieces, last) = (s0, tb, UNIFORM_PIECES, true);
-            rest = Some(layer.sigma_mean_log2e);
-            tail = true;
-            shade = 1.0;
+            // Past the budget: the rest of the cells through the profile, unshaded.
+            haze_span(s, layer, eye, dir, s0, tc, 1.0, sky);
+            break;
         } else if layer.uniform {
             // One body without inner faces: one step.
             s.steps += 1;
-            (a, b, pieces, last) = (s0, tb, UNIFORM_PIECES, true);
+            (a, b, pieces, last) = (s0, tc, UNIFORM_PIECES, true);
             rest = Some(p.density_log2e);
             shade = entry;
         } else {
             s.steps += 1;
             soft = s0 < soft_t;
-            // A lattice step whose corners leave no coverage is skipped whole (one step).
+            // A lattice step whose corners leave no coverage is skipped whole (one step), but
+            // not into the ring, where an empty cell still takes haze.
             let bound = noise::step_bound(p, dda.cell);
-            if !soft && bound.is_empty(p) {
+            let skip = if !soft && bound.is_empty(p) {
                 let (jump_axis, t) = dda.step_exit(&bound);
-                if t >= tb {
+                (!ring || t <= t_blend).then_some((jump_axis, t))
+            } else {
+                None
+            };
+            if let Some((jump_axis, t)) = skip {
+                if t >= tc {
                     break;
                 }
                 let sj = t.max(s0);
@@ -597,14 +686,19 @@ fn march_layer(
             }
             let (exit_axis, t) = dda.exit();
             axis = exit_axis;
-            (a, b) = (s0, t.clamp(s0, tb));
+            (a, b) = (s0, t.clamp(s0, tc));
             let c = noise::coverage(p, dda.cell).coverage;
             cov = c as f32 / 4096.0;
             if c > 0 && !prev_full {
                 shade = entry;
             }
             prev_full = c > 0;
-            last = t >= tb;
+            last = t >= tc;
+            if ring && 0.5 * (a + b) > t_blend {
+                // In the ring: one piece, blending into the haze by its middle.
+                soft = false;
+                blend = layer.blend_weight(0.5 * (a + b) * dir_len);
+            }
             pieces = if soft {
                 (((b - a) * dir_len / SOFT_PIECE).ceil() as u32).clamp(1, SOFT_MAX_PIECES)
             } else {
@@ -616,12 +710,11 @@ fn march_layer(
             let pa = a + i as f32 * piece;
             let pb = if i + 1 == pieces { b } else { pa + piece };
             let (sigma, sh) = match rest {
-                Some(_) if tail => (layer.tail_sigma(eye[1] + 0.5 * (pa + pb) * dir[1]), shade),
                 Some(sigma) => (sigma, shade),
                 None => {
                     let (mut c, mut sh) = (cov, shade);
+                    let mid = 0.5 * (pa + pb);
                     if soft {
-                        let mid = 0.5 * (pa + pb);
                         let w = layer.soft_weight(mid * dir_len);
                         if w > 0.0 {
                             let pos = std::array::from_fn(|k| eye[k] + mid * dir[k]);
@@ -629,7 +722,13 @@ fn march_layer(
                             sh += (1.0 - sh) * w;
                         }
                     }
-                    (p.density_log2e * c, sh)
+                    let mut sigma = p.density_log2e * c;
+                    if blend > 0.0 {
+                        let haze = layer.haze * layer.haze_at(eye[1] + mid * dir[1]);
+                        sigma += (haze - sigma) * blend;
+                        sh += (1.0 - sh) * blend;
+                    }
+                    (sigma, sh)
                 }
             };
             if sigma > 0.0 {
@@ -648,6 +747,102 @@ fn march_layer(
         if dda.cell[1] < p.band_cells[0] || dda.cell[1] >= p.band_cells[1] {
             break;
         }
+    }
+    if !s.done && tb > t_cells {
+        haze_span(s, layer, eye, dir, ta.max(t_cells), tb, layer.haze, sky);
+    }
+}
+
+/// The haze of `layer` over `[a, b]` (view depth) at `factor` times its profile (the shader's
+/// `haze_span`). The chord is cut where the ray crosses a knot height and at the fade start, at
+/// most [`HAZE_PIECES`] pieces: inside each the extinction is linear in `t`, so the piece and
+/// every record inside it get their exact optical depth ([`State::segment_ramp`]). A piece's
+/// color is taken at the point its light comes from on average (exact for a constant
+/// extinction), without shade: haze has no faces.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shader's arguments, one call each"
+)]
+fn haze_span(
+    s: &mut State,
+    layer: &MarchLayer,
+    eye: [f32; 3],
+    dir: [f32; 3],
+    a: f32,
+    b: f32,
+    factor: f32,
+    sky: [f32; 3],
+) {
+    let sp = layer.profile.spacing;
+    if b <= a || factor <= 0.0 || sp <= 0.0 {
+        return;
+    }
+    let dir_len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+    let lo = layer.haze_bottom();
+    let flat = dir[1].abs() < MIN_DIR;
+    let up = dir[1] > 0.0;
+    let last = (HAZE_KNOTS - 1) as f32;
+    let u = (eye[1] + a * dir[1] - lo) / sp;
+    // The next knot the ray crosses: the one above it going up, below it going down.
+    let mut j = if up {
+        (u.floor() + 1.0).clamp(0.0, last + 1.0)
+    } else {
+        (u.ceil() - 1.0).clamp(-1.0, last)
+    };
+    let inv = 1.0 / if flat { 1.0 } else { dir[1] };
+    let mut t_fade = layer.fade[0] / dir_len;
+    if t_fade <= a {
+        t_fade = FAR;
+    }
+    let mut p = a;
+    for _ in 0..HAZE_PIECES {
+        if p >= b {
+            break;
+        }
+        let t_knot = if !flat && j >= 0.0 && j <= last {
+            (lo + j * sp - eye[1]) * inv
+        } else {
+            FAR
+        };
+        let q = t_knot.min(t_fade).min(b).max(p);
+        // The interval of knots the piece lies in.
+        let k = if flat {
+            u.floor().clamp(-1.0, last)
+        } else if up {
+            j - 1.0
+        } else {
+            j
+        };
+        if q > p && k >= 0.0 && k < last {
+            let k = k as usize;
+            let s0 = factor * layer.profile.at_interval(lo, k, eye[1] + p * dir[1]) * dir_len;
+            let s1 = factor * layer.profile.at_interval(lo, k, eye[1] + q * dir[1]) * dir_len;
+            if s0 > 0.0 || s1 > 0.0 {
+                // Where the piece's light comes from on average: e of its length in, with
+                // e = 1 / tau - T / (1 - T) (natural units), its series when tau is small.
+                let len = q - p;
+                let tau2 = 0.5 * (s0 + s1) * len;
+                let tau = tau2 * std::f32::consts::LN_2;
+                let e = if tau >= 0.01 {
+                    let tr = (-tau2).exp2();
+                    len * (1.0 / tau - tr / (1.0 - tr))
+                } else {
+                    len * (0.5 - tau / 12.0)
+                };
+                let col = layer.color_at(p + e, 1.0, eye[1], dir[1], dir_len, sky);
+                s.segment_ramp(p, q, s0, s1, col);
+                if s.done {
+                    return;
+                }
+            }
+        }
+        if t_knot <= q {
+            j += if up { 1.0 } else { -1.0 };
+        }
+        if t_fade <= q {
+            t_fade = FAR;
+        }
+        p = q;
     }
 }
 
@@ -688,8 +883,16 @@ mod tests {
         l
     }
 
+    /// The layer with a profile of the same mean coverage at every height.
     fn march_layer(l: &FogLayer, mean: f32) -> MarchLayer {
-        MarchLayer::new(l, [0; 3], 0, l.color, [0.0, 1.0], mean)
+        MarchLayer::new(
+            l,
+            [0; 3],
+            0,
+            l.color,
+            [0.0, 1.0],
+            HazeProfile::level(l, mean),
+        )
     }
 
     /// The same layer walked cell by cell (as if it were not uniform).
@@ -855,6 +1058,8 @@ mod tests {
             dir: [0.0, 0.0, 1.0],
             depths: [100.0; 4],
         };
+        // The profile of a full slab is its density at every height.
+        assert_eq!(crate::haze_profile(&layer), ml.profile);
         let exact = march(&ray, &[ml], [0.0; 3], 256);
         let capped = march(&ray, &[ml], [0.0; 3], 10);
         let whole = march(&ray, &[march_layer(&layer, 1.0)], [0.0; 3], 10);
@@ -964,7 +1169,7 @@ mod tests {
         for dir in [[0.3f32, 0.05, 1.0], [-1.0, -0.2, 0.4], [0.7, 0.3, -1.0]] {
             let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
             let (t0, t1) = band_chord(eye[1], dir[1], p.band).expect("chord");
-            let t1 = t1.min(ml.reach() / len);
+            let t1 = t1.min(ml.cells_end / len);
             let mut tau = 0.0;
             for v in walk(eye, dir, p, t0, t1, 100_000) {
                 let cov = noise::coverage(p, v.cell).coverage as f32 / 4096.0;
@@ -1203,5 +1408,513 @@ mod tests {
         assert!(march_layer(&layer, 1.0).uniform);
         layer.threshold_rise = 0.25;
         assert!(!march_layer(&layer, 1.0).uniform);
+    }
+
+    /// The layers and rays of `haze_0_draws_as_before`: every kind of layer the march walks,
+    /// near the origin and far from it, rays that stay inside the budget.
+    fn golden_scenes(
+        make: &dyn Fn(&FogLayer, [i64; 3], [f32; 2]) -> MarchLayer,
+    ) -> Vec<(&'static str, Vec<MarchLayer>, Vec<Ray>)> {
+        let soft = soft_bank(16.0);
+        let mut cumulus = slab(24, 60, [6, 6, 6], 0.35);
+        cumulus.noise.dims = NoiseDims::Volume;
+        cumulus.noise.scale = 4;
+        cumulus.noise.octaves = 2;
+        cumulus.noise.seed = 31;
+        cumulus.threshold = 0.5;
+        cumulus.threshold_rise = 0.35;
+        (cumulus.edge_bottom, cumulus.edge_top) = (6, 12);
+        cumulus.softness = 0.2;
+        cumulus.height_shade = [0.6, 1.0];
+        cumulus.soft_distance = 10.0;
+        cumulus.wind = [2.0, 0.0, 0.0];
+        cumulus.max_distance = 400.0;
+        cumulus.fade = FogFade::Range {
+            start: 250.0,
+            end: 400.0,
+        };
+        let mut flat = slab(24, 28, [6, 4, 6], 0.6);
+        flat.noise.scale = 2;
+        flat.noise.seed = 5;
+        flat.threshold = 0.5;
+        flat.max_distance = 400.0;
+        flat.fade = FogFade::Range {
+            start: 250.0,
+            end: 400.0,
+        };
+        let full = slab(-8, 2, [1, 1, 1], 0.2);
+        let mut scene = soft_bank(0.0);
+        scene.fade = FogFade::Scene;
+        scene.max_distance = 120.0;
+        let far = [(1 << 31) - 5, 70, -(1 << 31) + 3];
+        let fan = |eye: [f32; 3], depths: [f32; 4]| -> Vec<Ray> {
+            let mut out = Vec::new();
+            for i in 0..24 {
+                let a = i as f32 * 0.27;
+                let e = -0.6 + (i % 7) as f32 * 0.2;
+                out.push(Ray {
+                    eye,
+                    dir: [a.sin(), e, a.cos()],
+                    depths: [
+                        depths[i % 4],
+                        depths[(i + 1) % 4],
+                        depths[(i + 2) % 4],
+                        depths[3],
+                    ],
+                });
+            }
+            out
+        };
+        let depths = [7.5, 23.0, 61.25, f32::INFINITY];
+        vec![
+            (
+                "soft bank",
+                vec![make(&soft, [0; 3], [0.0, 1.0])],
+                fan([0.3, 0.7, 0.2], depths),
+            ),
+            (
+                "soft bank far",
+                vec![make(&soft, far, [0.0, 1.0])],
+                fan([0.3, 0.7, 0.2], depths),
+            ),
+            (
+                "cumulus",
+                vec![make(&cumulus, [0; 3], [0.0, 1.0])],
+                fan([3.3, 35.5, 2.7], depths)
+                    .into_iter()
+                    .chain(fan([0.5, 10.0, 0.5], [30.0, 90.0, 200.0, f32::INFINITY]))
+                    .collect(),
+            ),
+            (
+                "flat clouds and a full slab",
+                vec![
+                    make(&full, [0; 3], [0.0, 1.0]),
+                    make(&flat, [0; 3], [0.0, 1.0]),
+                ],
+                fan([0.5, 10.0, 0.5], [30.0, 90.0, 200.0, f32::INFINITY])
+                    .into_iter()
+                    .chain(fan([0.5, -3.0, 0.5], depths))
+                    .collect(),
+            ),
+            (
+                "scene fade",
+                vec![make(&scene, [0; 3], [100.0, 150.0])],
+                fan([0.3, 0.7, 0.2], [20.0, 90.0, 140.0, f32::INFINITY]),
+            ),
+        ]
+    }
+
+    /// FNV-1a over the bits of a march's results.
+    fn golden_hash(results: &[MarchResult]) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let mut eat = |w: u32| {
+            for b in w.to_le_bytes() {
+                h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        for r in results {
+            eat(r.steps);
+            for k in 0..4 {
+                eat(r.transmittance[k].to_bits());
+                for c in 0..3 {
+                    eat(r.color[k][c].to_bits());
+                }
+            }
+        }
+        h
+    }
+
+    /// A layer without haze draws bit for bit what the march drew before the haze existed
+    /// (feat/lod 0bd2849), on rays that stay inside the step budget: every kind of layer, near
+    /// the origin and far from it.
+    #[test]
+    fn haze_0_draws_as_before() {
+        let want = [
+            ("soft bank", 0xbe13_1c0c_cc28_677d_u64),
+            ("soft bank far", 0x1329_67d9_29c4_d600),
+            ("cumulus", 0x3b9d_aed0_bfca_7613),
+            ("flat clouds and a full slab", 0x7927_cb21_f71f_bb28),
+            ("scene fade", 0xf7f9_683d_3bca_7304),
+        ];
+        // The profile only feeds the haze and the budget's tail: none of it shows here.
+        let make = |l: &FogLayer, origin: [i64; 3], fade: [f32; 2]| {
+            MarchLayer::new(
+                l,
+                origin,
+                1234,
+                [0.9, 0.92, 1.0],
+                fade,
+                HazeProfile::level(l, 0.5),
+            )
+        };
+        for ((name, layers, rays), (want_name, hash)) in golden_scenes(&make).into_iter().zip(want)
+        {
+            assert_eq!(name, want_name);
+            let results: Vec<MarchResult> = rays
+                .iter()
+                .map(|r| march(r, &layers, [0.2, 0.3, 0.9], 256))
+                .collect();
+            assert!(results.iter().all(|r| r.steps < 256), "{name}");
+            assert!(results.iter().any(|r| r.transmittance[3] < 0.9), "{name}");
+            assert_eq!(golden_hash(&results), hash, "{name}");
+        }
+    }
+
+    /// A noisy bank over 0..24 of 2-block cells, with or without edges, its haze drawn far.
+    fn hazy_bank(edges: (u32, u32), density: f32) -> FogLayer {
+        let mut l = slab(0, 24, [2, 2, 2], density);
+        l.noise.dims = NoiseDims::Volume;
+        l.noise.scale = 4;
+        l.noise.octaves = 2;
+        l.noise.seed = 404;
+        l.threshold = 0.4;
+        l.softness = 0.3;
+        (l.edge_bottom, l.edge_top) = edges;
+        l.haze = 1.0;
+        l.fade = FogFade::Range {
+            start: 1500.0,
+            end: 2000.0,
+        };
+        l
+    }
+
+    /// The layer's march data with its real profile.
+    fn hazy(l: &FogLayer) -> MarchLayer {
+        MarchLayer::new(l, [0; 3], 0, l.color, [0.0, 1.0], crate::haze_profile(l))
+    }
+
+    /// The optical depth (`log2`) of the haze along `[t0, t1]` of a ray, by fine midpoint
+    /// pieces of the profile.
+    fn dense_haze(ml: &MarchLayer, eye: [f32; 3], dir: [f32; 3], t0: f32, t1: f32) -> f64 {
+        let len = f64::from((dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt());
+        let n = 100_000;
+        let dt = f64::from(t1 - t0) / f64::from(n);
+        (0..n)
+            .map(|i| {
+                let t = f64::from(t0) + (f64::from(i) + 0.5) * dt;
+                let y = (f64::from(eye[1]) + t * f64::from(dir[1])) as f32;
+                f64::from(ml.haze * ml.haze_at(y)) * dt * len
+            })
+            .sum()
+    }
+
+    /// The haze of a chord matches a fine integral of its profile, on steep, grazing and
+    /// horizontal rays, with and without edges, at haze 1 and less.
+    #[test]
+    fn haze_span_matches_dense_sampling() {
+        for (edges, haze) in [((4, 8), 1.0), ((0, 0), 1.0), ((4, 8), 0.4)] {
+            let mut layer = hazy_bank(edges, 0.003);
+            layer.haze = haze;
+            // Every chord is haze: the cells end at the camera.
+            let ml = MarchLayer {
+                cells_end: 0.0,
+                blend_start: 0.0,
+                ..hazy(&layer)
+            };
+            assert_eq!(ml.reach, 2000.0);
+            for (eye, dir) in [
+                ([0.3f32, 10.0, 0.7], [0.0f32, -1.0, 0.0]),
+                ([0.3, 40.0, 0.7], [0.2, -1.0, 0.1]),
+                ([0.3, -9.0, 0.7], [0.1, 1.0, -0.3]),
+                ([0.3, 10.0, 0.7], [1.0, 0.02, 0.0]),
+                ([0.3, 23.0, 0.7], [0.6, -0.013, 0.8]),
+                ([0.3, 25.0, 0.7], [0.6, -0.03, 0.8]),
+                ([0.3, 12.5, 0.7], [0.0, 0.0, 1.0]),
+                ([0.3, 3.5, 0.7], [-0.7, 0.0, 0.7]),
+            ] {
+                let dir = norm(dir);
+                let (t0, t1) = band_chord(eye[1], dir[1], ml.params.band).expect("chord");
+                let t1 = t1.min(ml.reach);
+                let want = dense_haze(&ml, eye, dir, t0, t1);
+                let r = march(
+                    &Ray {
+                        eye,
+                        dir,
+                        depths: [f32::INFINITY; 4],
+                    },
+                    &[ml],
+                    [0.0; 3],
+                    64,
+                );
+                let got = -f64::from(r.transmittance[0]).log2();
+                assert_eq!(r.steps, 0, "no cell");
+                assert!(want > 1e-3, "{eye:?} {dir:?}: some haze ({want})");
+                assert!(
+                    (got - want).abs() <= 1e-3 * want,
+                    "{edges:?} {eye:?} {dir:?}: {got} vs {want}"
+                );
+            }
+        }
+    }
+
+    /// A record inside a piece of haze takes the transmittance of a march cut at its depth,
+    /// though the extinction varies along the piece.
+    #[test]
+    fn haze_records_take_their_own_depth() {
+        let mut layer = hazy_bank((4, 8), 0.05);
+        layer.fade = FogFade::Range {
+            start: 5000.0,
+            end: 8000.0,
+        };
+        let ml = MarchLayer {
+            cells_end: 0.0,
+            blend_start: 0.0,
+            reach: 2000.0,
+            ..hazy(&layer)
+        };
+        let eye = [0.3, 30.0, 0.7];
+        let dir = norm([0.4, -0.05, 1.0]);
+        let depths = [190.0, 260.5, f32::INFINITY, 333.25];
+        let all = march(&Ray { eye, dir, depths }, &[ml], [0.2, 0.3, 0.9], 64);
+        for (k, &depth) in depths.iter().enumerate() {
+            let one = march(
+                &Ray {
+                    eye,
+                    dir,
+                    depths: [depth; 4],
+                },
+                &[ml],
+                [0.2, 0.3, 0.9],
+                64,
+            );
+            assert!(
+                (one.transmittance[0] - all.transmittance[k]).abs() < 1e-5,
+                "{k}: {} vs {}",
+                one.transmittance[0],
+                all.transmittance[k]
+            );
+            for c in 0..3 {
+                assert!((one.color[0][c] - all.color[k][c]).abs() < 1e-5, "{k}");
+            }
+        }
+        let t = all.transmittance;
+        assert!(t[1] < 0.99 && t[3] < t[1] && t[2] < t[3], "{t:?}");
+    }
+
+    /// Where the cells end, their extinction meets the haze's: the cells of the ring blend into
+    /// it, so a thin slab across the end sees about the haze, not the last cell's own coverage
+    /// (which it does without the ring).
+    #[test]
+    fn the_far_blend_is_continuous() {
+        let mut layer = hazy_bank((4, 8), 0.03);
+        layer.max_distance = 64.0;
+        let ml = hazy(&layer);
+        assert_eq!(
+            (ml.cells_end, ml.blend_start, ml.reach),
+            (64.0, 48.0, 2000.0)
+        );
+        let no_ring = MarchLayer {
+            blend_start: ml.cells_end,
+            ..ml
+        };
+        let d = ml.params.density_log2e;
+        // Extinction per block across the end and the haze's there, over a fan of rays.
+        let across = |m: &MarchLayer, i: u32| -> (f32, f32) {
+            let a = i as f32 * 0.091;
+            let eye = [0.3 + i as f32, 12.0 + (i % 5) as f32, 0.7];
+            let dir = norm([a.sin(), 0.002 * (i % 3) as f32 - 0.002, a.cos()]);
+            let (near, far) = (63.75, 64.25);
+            let r = march(
+                &Ray {
+                    eye,
+                    dir,
+                    depths: [near, far, far, far],
+                },
+                std::slice::from_ref(m),
+                [0.0; 3],
+                256,
+            );
+            assert!(r.transmittance[1] > 0.05, "{i}: thin enough to see the end");
+            let sigma = (r.transmittance[0] / r.transmittance[1]).log2() / (far - near);
+            (sigma, m.haze * m.haze_at(eye[1] + 64.0 * dir[1]))
+        };
+        let (mut worst, mut worst_no_ring) = (0.0f32, 0.0f32);
+        for i in 0..64 {
+            let (sigma, haze) = across(&ml, i);
+            worst = worst.max((sigma - haze).abs());
+            let (sigma, haze) = across(&no_ring, i);
+            worst_no_ring = worst_no_ring.max((sigma - haze).abs());
+        }
+        assert!(worst < 0.05 * d, "{worst} of {d}");
+        assert!(
+            worst_no_ring > 0.2 * d,
+            "{worst_no_ring} of {d}: the test bites"
+        );
+    }
+
+    /// The skip of empty lattice steps never jumps into the ring: there an empty cell still
+    /// takes haze. The march keeps what a plain walk of the cells (blended in the ring) and the
+    /// haze past them give.
+    #[test]
+    fn no_skip_into_the_ring() {
+        let mut layer = slab(-16, 16, [2, 2, 2], 0.3);
+        layer.noise.dims = NoiseDims::Volume;
+        layer.noise.scale = 4;
+        layer.threshold = 0.7;
+        layer.max_distance = 200.0;
+        layer.haze = 1.0;
+        layer.fade = FogFade::Range {
+            start: 1000.0,
+            end: 4000.0,
+        };
+        let ml = hazy(&layer);
+        let p = &ml.params;
+        assert_eq!((ml.cells_end, ml.blend_start), (200.0, 150.0));
+        let eye = [0.5, 0.5, 0.5];
+        let (mut skipped, mut empty_in_ring) = (false, 0);
+        for dir in [[0.3f32, 0.05, 1.0], [-1.0, -0.04, 0.4], [0.7, 0.02, -1.0]] {
+            let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+            let (t0, t1) = band_chord(eye[1], dir[1], p.band).expect("chord");
+            let t1 = t1.min(ml.reach / len);
+            let (t_cells, t_blend) = (ml.cells_end / len, ml.blend_start / len);
+            assert!(t1 > t_cells, "{dir:?}: the haze is in view");
+            let mut tau = 0.0;
+            for v in walk(eye, dir, p, t0, t1.min(t_cells), 100_000) {
+                let cov = noise::coverage(p, v.cell).coverage as f32 / 4096.0;
+                let mut sigma = p.density_log2e * cov;
+                let mid = 0.5 * (v.t0 + v.t1);
+                let empty = noise::step_bound(p, v.cell).is_empty(p);
+                if mid > t_blend {
+                    let haze = ml.haze * ml.haze_at(eye[1] + mid * dir[1]);
+                    sigma += (haze - sigma) * ml.blend_weight(mid * len);
+                    empty_in_ring += usize::from(empty);
+                } else {
+                    skipped |= empty;
+                }
+                tau += f64::from(sigma * (v.t1 - v.t0) * len);
+            }
+            tau += dense_haze(&ml, eye, dir, t_cells, t1);
+            let r = march(
+                &Ray {
+                    eye,
+                    dir,
+                    depths: [f32::INFINITY; 4],
+                },
+                &[ml],
+                [0.0; 3],
+                256,
+            );
+            let want = (-tau).exp2() as f32;
+            assert!(
+                (r.transmittance[0] - want).abs() < 2e-4
+                    || (want < 0.003 && r.transmittance[0] < 0.003),
+                "{dir:?}: {} vs {want}",
+                r.transmittance[0]
+            );
+            assert!(r.steps < 256, "{dir:?}: {} steps", r.steps);
+        }
+        assert!(skipped, "some ray skips an empty step before the ring");
+        assert!(empty_in_ring > 0, "some empty step reaches into the ring");
+    }
+
+    /// A chord that starts past the cells is haze only: no cell, no step.
+    #[test]
+    fn haze_only_chords_need_no_cells() {
+        let mut layer = hazy_bank((4, 8), 0.05);
+        (layer.min_y, layer.max_y) = (100, 124);
+        layer.max_distance = 50.0;
+        let ml = hazy(&layer);
+        let r = march(
+            &Ray {
+                eye: [0.5, 0.5, 0.5],
+                dir: norm([0.0, 0.5, 1.0]),
+                depths: [f32::INFINITY; 4],
+            },
+            &[ml],
+            [0.0; 3],
+            64,
+        );
+        assert_eq!(r.steps, 0);
+        assert!(r.transmittance[0] < 0.9, "{r:?}");
+        // Without haze the layer ends with its cells, out of this ray's reach.
+        layer.haze = 0.0;
+        let r = march(
+            &Ray {
+                eye: [0.5, 0.5, 0.5],
+                dir: norm([0.0, 0.5, 1.0]),
+                depths: [f32::INFINITY; 4],
+            },
+            &[hazy(&layer)],
+            [0.0; 3],
+            64,
+        );
+        assert_eq!((r.steps, r.transmittance), (0, [1.0; 4]));
+    }
+
+    /// Where the cells end and how far the layer reaches, per fade and haze.
+    #[test]
+    fn cells_end_and_reach_per_fade_and_haze() {
+        let ends = |max_distance: f32, fade: FogFade, scene: [f32; 2], haze: f32| {
+            let mut l = FogLayer::new(0, 8);
+            (l.max_distance, l.fade, l.haze) = (max_distance, fade, haze);
+            let m = MarchLayer::new(&l, [0; 3], 0, [1.0; 3], scene, HazeProfile::level(&l, 1.0));
+            (m.cells_end, m.reach, m.blend_start)
+        };
+        let scene = FogFade::Scene;
+        let range = |start, end| FogFade::Range { start, end };
+        // Like the terrain, at 16 chunks: the haze reaches the view's end.
+        assert_eq!(
+            ends(384.0, scene, [460.8, 512.0], 0.0),
+            (384.0, 384.0, 384.0)
+        );
+        assert_eq!(
+            ends(384.0, scene, [460.8, 512.0], 1.0),
+            (384.0, 512.0, 288.0)
+        );
+        assert_eq!(
+            ends(384.0, scene, [512.0, 512.0], 0.25),
+            (384.0, 512.0, 288.0)
+        );
+        // The view ends first: no haze, no ring.
+        assert_eq!(
+            ends(384.0, scene, [306.0, 340.0], 1.0),
+            (340.0, 340.0, 340.0)
+        );
+        // A range that ends with the cells, or past them.
+        let cumulus = range(384.0, 768.0);
+        assert_eq!(ends(768.0, cumulus, [0.0, 1.0], 1.0), (768.0, 768.0, 768.0));
+        let far = range(6144.0, 12_288.0);
+        assert_eq!(
+            ends(3072.0, far, [0.0, 1.0], 1.0),
+            (3072.0, 12_288.0, 2304.0)
+        );
+        assert_eq!(ends(3072.0, far, [0.0, 1.0], 0.0), (3072.0, 3072.0, 3072.0));
+        // An extreme end: the haze stops at the cap.
+        let extreme = range(1.0e5, 1.0e9);
+        assert_eq!(
+            ends(3072.0, extreme, [0.0, 1.0], 1.0),
+            (3072.0, MAX_FOG_DISTANCE, 2304.0)
+        );
+    }
+
+    /// Haze that has nowhere to go (its fade ends with the cells) changes nothing, not even
+    /// on rays past the budget.
+    #[test]
+    fn haze_without_reach_changes_nothing() {
+        let mut layer = hazy_bank((4, 8), 0.2);
+        layer.max_distance = 300.0;
+        layer.fade = FogFade::Range {
+            start: 200.0,
+            end: 300.0,
+        };
+        let with = hazy(&layer);
+        layer.haze = 0.0;
+        let without = hazy(&layer);
+        assert_eq!(with.reach, without.reach);
+        for i in 0..32 {
+            let a = i as f32 * 0.3;
+            let ray = Ray {
+                eye: [0.3, 2.0 + (i % 20) as f32, 0.7],
+                dir: [a.sin(), 0.05 * (i % 5) as f32 - 0.1, a.cos()],
+                depths: [40.0, 150.0, f32::INFINITY, 280.0],
+            };
+            for budget in [256, 6] {
+                assert_eq!(
+                    march(&ray, &[with], [0.2, 0.3, 0.9], budget),
+                    march(&ray, &[without], [0.2, 0.3, 0.9], budget),
+                    "{i} {budget}"
+                );
+            }
+        }
     }
 }

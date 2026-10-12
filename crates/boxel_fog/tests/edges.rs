@@ -4,7 +4,7 @@
 //! skip and the tail past the budget lose no fog and invent none.
 use boxel_fog::march::{MarchLayer, Ray, band_chord, march, walk};
 use boxel_fog::noise::{self, coverage, point_edge, row_edge};
-use boxel_fog::{FogFade, FogLayer, LayerParams, NoiseDims, mean_coverage};
+use boxel_fog::{FogFade, FogLayer, HazeProfile, LayerParams, NoiseDims, haze_profile};
 use boxel_voxel::MAX_BLOCK_COORD;
 use proptest::prelude::*;
 
@@ -77,13 +77,13 @@ proptest! {
             prop_assert_eq!(coverage(&p, [x, p.band_cells[0], z]).coverage, 0);
             prop_assert_eq!(coverage(&p, [x, p.band_cells[1] - 1, z]).coverage, 0);
         }
-        let ml = MarchLayer::new(&layer, origin, tick, [1.0; 3], [0.0, 1.0], mean_coverage(&layer));
+        let ml = MarchLayer::new(&layer, origin, tick, [1.0; 3], [0.0, 1.0], haze_profile(&layer));
         let half = cell[1] as f32 * 0.5;
         let [lo, hi] = p.band;
         let dir = [yaw.sin(), 0.0, yaw.cos()];
         for y in [hi - half * inset * 2.0, lo + half * inset * 2.0] {
             prop_assert_eq!(point_edge(&p, y), 4096);
-            prop_assert_eq!(ml.tail_sigma(y), 0.0);
+            prop_assert_eq!(ml.haze_at(y), 0.0);
             let eye = [0.3, y, 0.7];
             prop_assert_eq!(ml.soft_coverage([5.1, y, -2.3]), 0.0);
             let r = march(&Ray { eye, dir, depths: [f32::INFINITY; 4] }, &[ml], [0.0; 3], budget);
@@ -181,7 +181,14 @@ fn skipping_with_edges_loses_no_fog() {
     layer.threshold = 0.5;
     layer.threshold_rise = 0.3;
     layer.max_distance = 200.0;
-    let ml = MarchLayer::new(&layer, [0; 3], 0, layer.color, [0.0, 1.0], 0.1);
+    let ml = MarchLayer::new(
+        &layer,
+        [0; 3],
+        0,
+        layer.color,
+        [0.0, 1.0],
+        HazeProfile::level(&layer, 0.1),
+    );
     let p = &ml.params;
     let mut raised = 0;
     for (eye, dir) in [
@@ -192,7 +199,7 @@ fn skipping_with_edges_loses_no_fog() {
     ] {
         let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
         let (t0, t1) = band_chord(eye[1], dir[1], p.band).expect("chord");
-        let t1 = t1.min(ml.reach() / len);
+        let t1 = t1.min(ml.cells_end / len);
         let mut tau = 0.0;
         for v in walk(eye, dir, p, t0, t1, 100_000) {
             let cov = coverage(p, v.cell).coverage as f32 / 4096.0;
@@ -239,8 +246,14 @@ fn coverage_from_noise_at(bound: &noise::StepBound, p: &LayerParams) -> bool {
 fn the_soft_fog_and_the_tail_follow_the_edges() {
     let mut layer = bank(0, 32, [2, 2, 2], (4, 16));
     layer.soft_distance = 16.0;
-    let mean = mean_coverage(&layer);
-    let ml = MarchLayer::new(&layer, [0; 3], 0, [1.0; 3], [0.0, 1.0], mean);
+    let ml = MarchLayer::new(
+        &layer,
+        [0; 3],
+        0,
+        [1.0; 3],
+        [0.0, 1.0],
+        haze_profile(&layer),
+    );
     // The soft fog from inside, looking up and out through the top edge: a fine integral.
     let eye = [0.3, 22.7, 0.2];
     for dir in [[0.3f32, 0.2, 1.0], [-1.0, 0.1, 0.4], [0.2, 0.9, -0.3]] {
@@ -286,13 +299,20 @@ fn the_soft_fog_and_the_tail_follow_the_edges() {
             );
         }
     }
-    // The tail: the core's mean deep inside, thinner up the edge, nothing at the plane.
-    assert_eq!(ml.tail_sigma(8.0), ml.sigma_mean_log2e);
-    let up: Vec<f32> = [16.5f32, 20.0, 24.0, 28.0, 30.5]
-        .map(|y| ml.tail_sigma(y))
+    // The tail (the profile): the core's mean deep inside, thinner up the edge, nothing in the
+    // row along the plane.
+    let core = ml.profile.knots[1];
+    assert_eq!(ml.profile.knots[1..4], [core; 3], "{:?}", ml.profile);
+    assert_eq!(ml.haze_at(8.0), core);
+    let up: Vec<f32> = [16.5f32, 20.0, 24.0, 28.0, 29.5]
+        .map(|y| ml.haze_at(y))
         .to_vec();
-    assert!(up.windows(2).all(|w| w[0] >= w[1]), "{up:?}");
-    assert_eq!(ml.tail_sigma(31.5), 0.0);
+    assert!(
+        up.windows(2).all(|w| w[0] >= w[1]) && up[4] < up[0],
+        "{up:?}"
+    );
+    assert_eq!(ml.haze_at(30.5), 0.0);
+    assert_eq!(ml.haze_at(31.5), 0.0);
     // Rays along the top rows with a tiny budget: the tail gives about what the cells give,
     // far less than a tail without edges.
     let cubic = MarchLayer {
@@ -300,7 +320,10 @@ fn the_soft_fog_and_the_tail_follow_the_edges() {
         ..ml
     };
     let flat = MarchLayer {
-        sigma_edge_log2e: [ml.sigma_mean_log2e; 3],
+        profile: HazeProfile {
+            knots: [core; 8],
+            ..ml.profile
+        },
         ..cubic
     };
     // Optical depth along rows at height `y`, summed over 64 rays.

@@ -82,7 +82,7 @@ pub struct ViewParams {
     /// Distance where the terrain has the fog color.
     pub fog_end: f32,
     /// The distance fog `fog_start` and `fog_end` come from. Fog layers faded like the scene
-    /// that end before `fog_end` take its rule at their own end
+    /// that end before `fog_end` take its rule at their own end, unless their haze goes on
     /// ([`crate::fog::frame_layers`]).
     pub distance_fog: DistanceFog,
     /// Clear color of the main pass, the sky behind the terrain (linear RGBA).
@@ -770,7 +770,8 @@ impl VoxelRenderer {
     /// and cutout terrain, culls the chunks (and High's GPU cull) with the far plane at the
     /// horizon instead of the view's, and fades the terrain into the fog color by the input's
     /// distance fog at the horizon ([`LodInput::fog`]) instead of [`ViewParams::fog_start`] to
-    /// [`ViewParams::fog_end`] (the fog layers keep those).
+    /// [`ViewParams::fog_end`]. Fog layers with haze ([`crate::fog::FogLayer::haze`]) faded like
+    /// the scene follow it to the horizon; the others keep their range.
     pub fn set_lod(&mut self, device: &wgpu::Device, input: Option<LodInput>) {
         let Some(input) = input else {
             if self.lod.take().is_some() {
@@ -1308,11 +1309,18 @@ impl VoxelRenderer {
         (self.stats.fog_passes, self.stats.fog_layers) = match &mut self.fog {
             Some(fog) => {
                 let _span = frame_span!("render.fog");
+                // Layers with haze reach the far LOD's horizon while it draws.
+                let lod_fade = self
+                    .lod
+                    .as_ref()
+                    .and_then(LodPass::fog_params)
+                    .map(|p| [p[0], p[1]]);
                 fog.encode(
                     device,
                     queue,
                     encoder,
                     view,
+                    lod_fade,
                     &self.targets.color_view,
                     self.targets.size,
                 )

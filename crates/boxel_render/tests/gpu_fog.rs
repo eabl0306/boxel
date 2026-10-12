@@ -2,12 +2,14 @@
 //! `BOXEL_REQUIRE_GPU=1`; run with `--test-threads=1` like the other GPU tests.
 //!
 //! - **Zero cost:** without fog input the depth target is a plain attachment and frames are
-//!   what they were; fog that is off, out of reach or fully transparent leaves every pixel
-//!   untouched (the composite discards); dropping the fog gives the plain depth back.
+//!   what they were; fog that is off, out of reach (its haze too) or fully transparent leaves
+//!   every pixel untouched (the composite discards); dropping the fog gives the plain depth
+//!   back.
 //! - **Noise:** `fs_fog_debug_coverage` gives the CPU oracle's coverage and noise bit for bit,
 //!   at origins 0, `2^31 - 5`, `-2^40` and near the world limit, at cell corners and points
 //!   inside cells (the soft fog), across the rows of a rising threshold and of the edges next to
-//!   the band's planes, between ticks; and the soft fog's edge weight at a column of heights.
+//!   the band's planes, between ticks, out to 4096 cells from the origin's (as far as a walk
+//!   goes), with cells up to 24 blocks; and the soft fog's edge weight at a column of heights.
 //! - **March:** on scenes whose depth is known exactly (a wide floor and the sky), each texel of
 //!   the march equals the reference march of `boxel_fog::march` (opacity bytes within 3, color
 //!   within 0.02, 0.5 % of the texels may differ where a ray grazes a cell edge), and each pixel
@@ -17,9 +19,12 @@
 //!   an edged bank seen from its top's height, a noisy bank over the floor, with the terrain's
 //!   distance fog off too and drawn to 60 blocks in a view to 512 (it fades at its own end), fog
 //!   over water, fog behind glass, dusk) like the best tier of its adapter, at half and full
-//!   resolution (0.1 % of the pixels, tolerance 2).
+//!   resolution (0.1 % of the pixels, tolerance 2). And the haze past the cells: a bank whose
+//!   cells blend into a haze to 4 km over the floor and the void, one faded like the scene whose
+//!   haze goes on to the view's end, the tail of a tiny step budget through the profile, and big
+//!   16-block cumulus with haze from below at 5 and 15 degrees, inside and above.
 //! - **Origins:** the same camera with render origins a few blocks apart draws the same image,
-//!   with cubic and soft fog.
+//!   with cubic and soft fog and with haze past a ring of cells in view.
 //! - **Half resolution:** thin posts in front of dense fog look the same at half and full
 //!   resolution (each pixel of a 2x2 block keeps its own depth).
 //! - **Shades:** a slab looks the same from above and below unless the layer asks for face
@@ -395,6 +400,69 @@ fn edged_bank() -> FogLayer {
     l
 }
 
+/// A thin noisy bank over the floor whose cells end at 96 blocks and go on as haze to 4 km,
+/// with edges (so its haze starts and ends a cell inside the band): the cells blend into the
+/// haze from 72 blocks, in view on the floor.
+fn hazy_bank() -> FogLayer {
+    let mut l = bank();
+    (l.edge_bottom, l.edge_top) = (2, 4);
+    l.density = 0.05;
+    l.max_distance = 96.0;
+    l.haze = 1.0;
+    l.fade = FogFade::Range {
+        start: 2048.0,
+        end: 4096.0,
+    };
+    l
+}
+
+/// The thin bank faded like the scene, its cells ending at 60 blocks: in a view to 512 its haze
+/// goes on to the view's end and fades there with the terrain.
+fn hazy_scene_bank() -> FogLayer {
+    let mut l = hazy_bank();
+    l.max_distance = 60.0;
+    l.fade = FogFade::Scene;
+    l
+}
+
+/// Big cumulus: 16-block cells over 64..176 with a rise and deep edges, soft within 32 blocks,
+/// cells to 1024 blocks and haze from there to 4 km.
+fn cumulus16() -> FogLayer {
+    let mut l = FogLayer::new(64, 176);
+    l.cell = [16, 16, 16];
+    l.noise.dims = NoiseDims::Volume;
+    l.noise.scale = 8;
+    l.noise.octaves = 2;
+    l.noise.seed = 1616;
+    l.threshold = 0.55;
+    l.threshold_rise = 0.25;
+    (l.edge_bottom, l.edge_top) = (32, 48);
+    l.softness = 0.25;
+    l.density = 0.18;
+    l.height_shade = [0.55, 1.0];
+    l.soft_distance = 32.0;
+    l.wind = [4.0, 0.0, 1.0];
+    l.max_distance = 1024.0;
+    l.haze = 1.0;
+    l.fade = FogFade::Range {
+        start: 2048.0,
+        end: 4096.0,
+    };
+    l
+}
+
+/// A camera at `eye` looking along `yaw` (degrees from -z toward -x, as the camera's) and
+/// `pitch` degrees up.
+fn look_angles(eye: DVec3, yaw: f64, pitch: f64) -> ViewParams {
+    let (yaw, pitch) = (yaw.to_radians(), pitch.to_radians());
+    let dir = DVec3::new(
+        -yaw.sin() * pitch.cos(),
+        pitch.sin(),
+        -yaw.cos() * pitch.cos(),
+    );
+    look(eye, eye + dir * 100.0)
+}
+
 /// A blanket that fills every cell, seen about 20 blocks through.
 fn blanket() -> FogLayer {
     let mut l = FogLayer::new(0, 32);
@@ -410,9 +478,20 @@ struct Shot {
     view: ViewParams,
     layers: Vec<FogLayer>,
     tick: u64,
+    /// The step budget of the march.
+    max_steps: u32,
     /// The depth is known exactly (the floor and the sky): the march is compared texel by
     /// texel with the reference.
     analytic: bool,
+}
+
+impl Shot {
+    /// The shot's fog at `resolution`.
+    fn input(&self, resolution: FogResolution) -> FogInput {
+        let mut input = fog_input(self.layers.clone(), resolution, self.tick);
+        Arc::make_mut(&mut input.settings).max_steps = self.max_steps;
+        input
+    }
 }
 
 fn shots() -> Vec<Shot> {
@@ -422,6 +501,7 @@ fn shots() -> Vec<Shot> {
         view,
         layers,
         tick: 1234,
+        max_steps: boxel_fog::DEFAULT_MAX_STEPS,
         analytic,
     };
     vec![
@@ -521,6 +601,62 @@ fn shots() -> Vec<Shot> {
                 512.0,
             ),
             vec![short_bank()],
+            true,
+        ),
+        shot(
+            "haze_far",
+            World::Floor,
+            look(DVec3::new(0.5, 30.0, 0.5), DVec3::new(60.0, 8.0, 80.0)),
+            vec![hazy_bank()],
+            true,
+        ),
+        shot(
+            "haze_scene",
+            World::Floor,
+            look_to(
+                DVec3::new(-20.5, 22.0, -20.5),
+                DVec3::new(16.0, 2.0, 16.0),
+                512.0,
+            ),
+            vec![hazy_scene_bank()],
+            true,
+        ),
+        Shot {
+            max_steps: 6,
+            ..shot(
+                "haze_budget",
+                World::Floor,
+                look(DVec3::new(10.3, 7.5, 6.7), DVec3::new(40.0, 6.0, 40.0)),
+                vec![hazy_bank()],
+                true,
+            )
+        },
+        shot(
+            "cumulus16_below_5",
+            World::Floor,
+            look_angles(DVec3::new(0.5, 20.0, 0.5), 30.0, 5.0),
+            vec![cumulus16()],
+            true,
+        ),
+        shot(
+            "cumulus16_below_15",
+            World::Floor,
+            look_angles(DVec3::new(0.5, 20.0, 0.5), -20.0, 15.0),
+            vec![cumulus16()],
+            true,
+        ),
+        shot(
+            "cumulus16_inside",
+            World::Floor,
+            look_angles(DVec3::new(3.3, 120.5, 2.7), 10.0, -3.0),
+            vec![cumulus16()],
+            true,
+        ),
+        shot(
+            "cumulus16_above",
+            World::Floor,
+            look_angles(DVec3::new(-5.5, 260.0, -9.5), 40.0, -25.0),
+            vec![hazy_bank(), cumulus16()],
             true,
         ),
         shot(
@@ -681,13 +817,13 @@ fn check_against_reference(
     fogged: &RgbaImage,
     report: &mut Report,
 ) {
-    let settings = FogSettings::new(shot.layers.clone());
-    let means: Vec<_> = settings
+    let settings = shot.input(FogResolution::Half).settings;
+    let profiles: Vec<_> = settings
         .layers
         .iter()
-        .map(boxel_fog::mean_coverage)
+        .map(boxel_fog::haze_profile)
         .collect();
-    let layers = frame_layers(&settings, &means, &shot.view, shot.tick);
+    let layers = frame_layers(&settings, &profiles, &shot.view, None, shot.tick);
     let basis = RayBasis::new(
         shot.view.view_proj.to_cols_array_2d(),
         shot.view.eye_rel.to_array(),
@@ -899,11 +1035,20 @@ fn fog_costs_nothing_when_absent_off_or_out_of_reach() {
             Arc::make_mut(&mut off.settings).enabled = false;
             let mut far = clouds();
             (far.min_y, far.max_y, far.max_distance) = (900, 904, 100.0);
+            // Its haze goes on to 400 blocks, still short of the band.
+            let far_haze = FogLayer {
+                haze: 1.0,
+                ..far.clone()
+            };
             let mut clear = bank();
             clear.density = 1e-9;
             for (what, input) in [
                 ("off", off),
                 ("out of reach", fog_input(vec![far], FogResolution::Half, 0)),
+                (
+                    "haze out of reach",
+                    fog_input(vec![far_haze], FogResolution::Half, 0),
+                ),
                 (
                     "transparent",
                     fog_input(vec![clear], FogResolution::Full, 0),
@@ -959,7 +1104,8 @@ fn fog_costs_nothing_when_absent_off_or_out_of_reach() {
 /// `fs_fog_debug_coverage` equals the CPU oracle bit for bit, far from the origin too: at the
 /// cells' corners and at points inside them (what the soft fog reads), on rows below, inside
 /// and above a band whose threshold rises and on the rows of its edges, at whole ticks and
-/// between them; and the soft fog's edge weight over a column of heights through the band.
+/// between them, out to the 4096 cells a walk may go from the origin's cell; and the soft fog's
+/// edge weight over a column of heights through the band. Big cells (16 and 24 blocks) too.
 #[test]
 fn the_gpu_noise_is_the_oracle_bit_for_bit() {
     let mut layers = Vec::new();
@@ -968,6 +1114,8 @@ fn the_gpu_noise_is_the_oracle_bit_for_bit() {
         ([12, 4, 12], 4, 1, NoiseDims::Flat, 0.5, (6, 10)),
         ([2, 2, 2], 8, 2, NoiseDims::Volume, 0.0, (0, 3)),
         ([3, 5, 7], 64, 2, NoiseDims::Volume, 0.35, (5, 17)),
+        ([16, 16, 16], 8, 2, NoiseDims::Volume, 0.25, (32, 48)),
+        ([24, 24, 24], 8, 1, NoiseDims::Volume, 0.2, (48, 48)),
     ] {
         let mut l = FogLayer::new(0, i64::from(cell[1]) * 8);
         l.cell = cell;
@@ -989,12 +1137,22 @@ fn the_gpu_noise_is_the_oracle_bit_for_bit() {
         [MAX_BLOCK_COORD - 100, 12, -(MAX_BLOCK_COORD - 100)],
     ];
     let size = [64u32, 48];
-    // (time, row of the grid relative to the origin's cell, point inside the cells)
+    // The grid's first cell along x and z: near the origin's cell, and reaching 4096 cells from
+    // it on either side (the farthest a walk goes).
+    let (near, plus, minus) = (
+        [-32, -24],
+        [4096 - size[0] as i32 + 1, 4096 - size[1] as i32 + 1],
+        [-4096, -4096],
+    );
+    // (time, row of the grid relative to the origin's cell, point inside the cells, first x z)
     let probes = [
-        (FogTime::from(0), 3, 0),
-        (FogTime::from(0), -40, 1234),
-        (FogTime::new(777_777, 40_000), 6, 4095),
-        (FogTime::new(777_777, 40_000), 2, 0),
+        (FogTime::from(0), 3, 0, near),
+        (FogTime::from(0), -40, 1234, near),
+        (FogTime::new(777_777, 40_000), 6, 4095, near),
+        (FogTime::new(777_777, 40_000), 2, 0, near),
+        (FogTime::new(31, 77), 4, 4095, plus),
+        (FogTime::new(31, 77), 4096, 0, minus),
+        (FogTime::new(9_999, 5), -4096, 2048, plus),
     ];
     for_every_tier(|label, _tier, device, queue, _, report| {
         for (li, layer) in layers.iter().enumerate() {
@@ -1002,13 +1160,13 @@ fn the_gpu_noise_is_the_oracle_bit_for_bit() {
                 // The rows along the band's planes and the next ones in.
                 let band = LayerParams::new(layer, origin, 0).band_cells;
                 let edge_probes = [
-                    (FogTime::new(9, 123), band[1] - 1, 0),
-                    (FogTime::new(9, 123), band[1] - 2, 2048),
-                    (FogTime::new(9, 123), band[0], 0),
-                    (FogTime::new(9, 123), band[0] + 1, 4095),
+                    (FogTime::new(9, 123), band[1] - 1, 0, near),
+                    (FogTime::new(9, 123), band[1] - 2, 2048, near),
+                    (FogTime::new(9, 123), band[0], 0, near),
+                    (FogTime::new(9, 123), band[0] + 1, 4095, near),
                 ];
-                for (time, row, sub) in probes.into_iter().chain(edge_probes) {
-                    let first = [-32, row, -24];
+                for (time, row, sub, [x0, z0]) in probes.into_iter().chain(edge_probes) {
+                    let first = [x0, row, z0];
                     let params = LayerParams::new(layer, origin, time);
                     let y0 = (params.band[0] - 4.0).clamp(-1.0e6, 1.0e6);
                     let got = match debug_coverage(
@@ -1099,10 +1257,7 @@ fn every_tier_draws_the_fog_of_the_reference() {
                 let plain = render(device, queue, &mut renderer, &shot.view)?;
                 let mut images = Vec::new();
                 for resolution in [FogResolution::Half, FogResolution::Full] {
-                    renderer.set_fog(
-                        device,
-                        Some(fog_input(shot.layers.clone(), resolution, shot.tick)),
-                    );
+                    renderer.set_fog(device, Some(shot.input(resolution)));
                     let image = render(device, queue, &mut renderer, &shot.view)?;
                     if renderer.stats().fog_passes != 2 {
                         return Err(format!("{}: no fog passes", shot.name));
@@ -1239,9 +1394,15 @@ fn render_origins_a_few_blocks_apart_draw_the_same_fog() {
         let mut run = || -> Result<(), String> {
             let mut renderer = new_renderer(device, queue, tier, UVec2::new(WIDTH, HEIGHT))?;
             load_world(&mut renderer, &chunks)?;
+            // The thin bank's cells end at 40 blocks, its ring (30 to 40) and haze on the floor.
+            let haze = FogLayer {
+                max_distance: 40.0,
+                ..hazy_bank()
+            };
             for (what, layers) in [
                 ("cubic", vec![bank(), clouds()]),
                 ("soft", vec![soft_bank(), cumulus()]),
+                ("haze", vec![haze]),
             ] {
                 renderer.set_fog(device, Some(fog_input(layers, FogResolution::Half, 99)));
                 let first = render(device, queue, &mut renderer, &views[0])?;

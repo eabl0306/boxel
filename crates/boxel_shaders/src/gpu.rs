@@ -82,22 +82,23 @@ pub struct FogHeader {
     pub debug: [i32; 4],
 }
 
-/// One layer of the uniform `Fog` (224 bytes, std140). See `fog.wgsl` for each word.
+/// One layer of the uniform `Fog` (256 bytes, std140). See `fog.wgsl` for each word.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct FogLayerGpu {
     /// x, y = band `[min, max)` relative to the render origin's y; z = reach (blocks along the
-    /// ray); w = mean extinction per block (`log2` units).
+    /// ray: where the haze ends, or the cells of a layer without haze); w = where the cells end.
     pub band: [f32; 4],
     /// x, y = fade start and end distance; z = extinction per block of a full cell (`log2`);
-    /// w = the mean extinction where an edge raises the threshold a quarter of the way.
+    /// w = where the cells start to blend into the haze (`band` w: no blend).
     pub fade: [f32; 4],
     /// xyz = min corner of the origin's cell relative to the render origin (blocks); w = the
-    /// mean extinction at half the way.
+    /// haze (the fraction of the profile past the cells).
     pub grid: [f32; 4],
-    /// xyz = cell size in blocks; w = the mean extinction at three quarters of the way.
+    /// xyz = cell size in blocks; w = blocks between the profile's knots (0: no haze).
     pub size: [f32; 4],
-    /// rgb = color of a lit cell.
+    /// rgb = color of a lit cell; w = height of the profile's first knot relative to the render
+    /// origin.
     pub lit: [f32; 4],
     /// Face shades: top, bottom, x, z.
     pub face: [f32; 4],
@@ -121,6 +122,11 @@ pub struct FogLayerGpu {
     /// x, y = band cells `[first, end)` relative to the origin's cell; z, w = depth of the
     /// bottom and the top edge in blocks (0: none).
     pub cells: [i32; 4],
+    /// The profile's mean extinction per block (`log2` units, at a haze of 1) at knots 0 to 3
+    /// (`boxel_fog::HazeProfile`).
+    pub profile_a: [f32; 4],
+    /// The same at knots 4 to 7.
+    pub profile_b: [f32; 4],
 }
 
 /// Flags of the fog uniform.

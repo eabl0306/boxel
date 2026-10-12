@@ -71,6 +71,17 @@ pub fn valley() -> FogLayer {
     }
 }
 
+/// The valley fog going on past its cubes: from 384 blocks on, a haze of its mean density at
+/// each height lies on the sea and the low ground as far as the terrain is drawn (the far LOD's
+/// horizon while it draws), fading with it. The cubes blend into it from 288 blocks. Seen from
+/// a hill, the far lowlands become a white sheet with the hills standing out of it.
+pub fn hazy_valley() -> FogLayer {
+    FogLayer {
+        haze: 1.0,
+        ..valley()
+    }
+}
+
 /// A blanket of 2-block cubes filling `[min_y, max_y)` (both even), seen about `visibility`
 /// blocks through where it is thickest, soft within 12 blocks, with edges like the valley's: a
 /// quarter of its height at the top and an eighth at the bottom (at most 16 and 4 blocks).
@@ -123,6 +134,8 @@ mod tests {
             vec![clouds()],
             vec![valley()],
             vec![valley(), clouds()],
+            vec![hazy_valley()],
+            vec![hazy_valley(), clouds()],
             vec![blanket(0, 256, 40.0)],
             sunset(),
         ]
@@ -151,6 +164,28 @@ mod tests {
         assert_eq!(c.noise.dims, NoiseDims::Volume, "volumetric clouds");
         assert!(c.cell.iter().all(|e| (6..=8).contains(e)));
         assert!(c.threshold_rise > 0.0 && c.height_shade[0] < c.height_shade[1]);
+    }
+
+    /// Today's presets end with their cells; the hazy valley is the valley with its mean
+    /// density past them, and none of that haze lies under the sea's surface (y 47).
+    #[test]
+    fn only_the_hazy_valley_has_haze() {
+        for layer in [clouds(), valley(), blanket(0, 256, 40.0)]
+            .into_iter()
+            .chain(sunset())
+        {
+            assert_eq!(layer.haze, 0.0, "{layer:?}");
+        }
+        let hazy = hazy_valley();
+        assert_eq!(hazy.haze, 1.0);
+        assert_eq!(FogLayer { haze: 0.0, ..hazy }, valley());
+        let profile = boxel_fog::haze_profile(&hazy_valley());
+        let lo = hazy.min_y as f32 + profile.bottom;
+        assert_eq!(lo, 48.0);
+        for y in [40.0, 46.0, 47.0, 47.9] {
+            assert_eq!(profile.at(lo, y), 0.0, "haze at y {y}");
+        }
+        assert!(profile.at(lo, 52.0) > 0.0);
     }
 
     /// No preset ends in a plane: every band has edges of at least two cells at both ends, the

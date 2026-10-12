@@ -175,75 +175,120 @@ impl LayerParams {
     }
 }
 
-/// The mean coverage (0 to 1) of a layer's cells, from a fixed sample of 1024 cells spread over
-/// many lattice steps and the rows of the band: what the march gives the rest of a ray once its
-/// step budget runs out. Deterministic; the same for every origin and tick (on average).
+/// Knots of a [`HazeProfile`].
+pub const HAZE_KNOTS: usize = 8;
+
+/// The haze of a layer ([`FogLayer::haze`]): its mean extinction at 8 heights spread evenly over
+/// the rows that can hold fog, linear between them and none outside. The row along a plane with
+/// an edge is always empty ([`noise::row_edge`]), so with an edge the haze starts a cell inside,
+/// like the cells; without one it is cut at the plane. Built on the CPU from the integer noise
+/// ([`haze_profile`]): the rise and the edges thin it like they thin the cells.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct MeanCoverage {
-    /// The mean away from the band's edges (every row at its rise's threshold).
-    pub core: f32,
-    /// The mean with every threshold raised a quarter, a half and three quarters of the way to
-    /// never covered ([`noise::raise`]): what an edge leaves where its smoothstep is there.
-    pub edge: [f32; 3],
+pub struct HazeProfile {
+    /// Height of the first knot over the band's bottom (`min_y`), in blocks.
+    pub bottom: f32,
+    /// Blocks between knots (0: no row can hold fog, no haze).
+    pub spacing: f32,
+    /// Mean extinction per block (`log2` units) at each knot, at a haze of 1.
+    pub knots: [f32; HAZE_KNOTS],
 }
 
-impl MeanCoverage {
-    /// The same mean at every height, fading out only over the last quarter of an edge's
-    /// raise.
-    pub const fn level(mean: f32) -> Self {
+impl HazeProfile {
+    /// The rows of `layer` that can hold fog with the same mean coverage (0 to 1) everywhere.
+    pub fn level(layer: &FogLayer, mean: f32) -> Self {
+        let (bottom, spacing) = haze_span(layer);
         Self {
-            core: mean,
-            edge: [mean; 3],
+            bottom,
+            spacing,
+            knots: [layer.density * std::f32::consts::LOG2_E * mean; HAZE_KNOTS],
         }
     }
 
-    /// The mean where an edge raises the threshold `s` (`0..=4096`) of the way to never
-    /// covered: linear between the table's quarters, 0 at 4096. The march's tail past the
-    /// budget fades by it near the band's planes, like the cells it stands for.
-    pub fn at(&self, s: u32) -> f32 {
-        let table = [self.core, self.edge[0], self.edge[1], self.edge[2], 0.0];
-        let i = (s >> 10).min(4) as usize;
-        if i == 4 {
+    /// Extinction per block (`log2` units, at a haze of 1) at height `y`, the first knot at
+    /// height `lo` (both in the same frame): linear between knots, 0 below the first and from
+    /// the last one up.
+    pub fn at(&self, lo: f32, y: f32) -> f32 {
+        if self.spacing <= 0.0 {
             return 0.0;
         }
-        let f = (s & 1023) as f32 * (1.0 / 1024.0);
-        table[i] + (table[i + 1] - table[i]) * f
+        let u = (y - lo) / self.spacing;
+        if !(0.0..(HAZE_KNOTS - 1) as f32).contains(&u) {
+            return 0.0;
+        }
+        self.at_interval(lo, u.floor() as usize, y)
+    }
+
+    /// Extinction per block at height `y` by the knots `k` and `k + 1` (`k < 7`), the first knot
+    /// at `lo`: their line, clamped to its ends.
+    pub fn at_interval(&self, lo: f32, k: usize, y: f32) -> f32 {
+        let y0 = lo + k as f32 * self.spacing;
+        let w = ((y - y0) / self.spacing).clamp(0.0, 1.0);
+        self.knots[k] + (self.knots[k + 1] - self.knots[k]) * w
     }
 }
 
-impl From<f32> for MeanCoverage {
-    /// [`MeanCoverage::level`].
-    fn from(mean: f32) -> Self {
-        Self::level(mean)
-    }
+/// The rows of a layer that can hold fog, `[lo, hi)` in blocks: the band less the row along
+/// each plane with an edge. `None` if no row can.
+fn coverable(layer: &FogLayer) -> Option<(i128, i128)> {
+    let cy = i128::from(layer.cell[1].max(1));
+    let lo = i128::from(layer.min_y) + if layer.edge_bottom > 0 { cy } else { 0 };
+    let hi = i128::from(layer.max_y) - if layer.edge_top > 0 { cy } else { 0 };
+    (lo < hi).then_some((lo, hi))
 }
 
-/// The [`MeanCoverage`] of a layer.
-pub fn mean_coverage(layer: &FogLayer) -> MeanCoverage {
+/// [`HazeProfile::bottom`] and [`HazeProfile::spacing`] of a layer (0 and 0 if no row can hold
+/// fog).
+fn haze_span(layer: &FogLayer) -> (f32, f32) {
+    coverable(layer).map_or((0.0, 0.0), |(lo, hi)| {
+        let spacing = (hi - lo) as f64 / (HAZE_KNOTS - 1) as f64;
+        ((lo - i128::from(layer.min_y)) as f32, spacing as f32)
+    })
+}
+
+/// The [`HazeProfile`] of a layer: at each knot, its density times the mean coverage of the cell
+/// row that holds it (the top knot takes the row under it), over a fixed sample of 1024 cells
+/// spread over many lattice steps, read at that row's threshold. Every knot reads the same
+/// noise, so a layer without edges and rise has the same mean at every knot. Deterministic; the
+/// same for every origin and tick (on average).
+pub fn haze_profile(layer: &FogLayer) -> HazeProfile {
+    let (bottom, spacing) = haze_span(layer);
+    let mut profile = HazeProfile {
+        bottom,
+        spacing,
+        knots: [0.0; HAZE_KNOTS],
+    };
+    let Some((lo, hi)) = coverable(layer) else {
+        return profile;
+    };
     let params = LayerParams::new(layer, [0; 3], 0);
     let step = 3 * layer.noise.scale.max(1) as i32 + 1;
-    // Rows of the band near the origin's cell (the threshold rises with them).
-    let first = params.band_cells[0];
-    let rows = (i64::from(params.band_cells[1]) - i64::from(first)).clamp(1, 1 << 16) as i32;
-    let mut sums = [0u64; 4];
-    for i in 0..1024i32 {
-        let d = [
-            (i & 31) * step + (i * 7) % step,
-            first + (((i * 5) % 16) * step) % rows,
-            (i >> 5) * step + (i * 11) % step,
-        ];
-        let n = noise::noise_at(&params, d, [0; 3]);
-        let threshold = noise::rise_threshold(&params, d[1]);
-        for (k, sum) in sums.iter_mut().enumerate() {
-            let t = noise::raise(threshold, 1024 * k as u32);
-            *sum += u64::from(noise::coverage_from_noise(n, t, params.gain));
-        }
+    let noise: Vec<i32> = (0..1024i32)
+        .map(|i| {
+            let d = [
+                (i & 31) * step + (i * 7) % step,
+                ((i * 5) % 16) * step + (i * 3) % step,
+                (i >> 5) * step + (i * 11) % step,
+            ];
+            noise::noise_at(&params, d, [0; 3])
+        })
+        .collect();
+    let cy = i128::from(layer.cell[1].max(1));
+    let rows = (lo.div_euclid(cy), hi.div_euclid(cy));
+    for (k, knot) in profile.knots.iter_mut().enumerate() {
+        // The row that holds the knot's height (the top knot's: the one under it).
+        let y = lo as f64 + k as f64 * (hi - lo) as f64 / (HAZE_KNOTS - 1) as f64;
+        let row = (y.floor() as i128).div_euclid(cy).clamp(rows.0, rows.1 - 1);
+        // The threshold of that row, from an origin in it (so its row index is small).
+        let at_row = LayerParams::new(layer, [0, (row * cy) as i64, 0], 0);
+        let threshold = noise::row_threshold(&at_row, 0);
+        let sum: u64 = noise
+            .iter()
+            .map(|&n| u64::from(noise::coverage_from_noise(n, threshold, at_row.gain)))
+            .sum();
+        let mean = (sum as f64 / (1024.0 * f64::from(COVERAGE_ONE))) as f32;
+        *knot = params.density_log2e * mean;
     }
-    let mean = |sum: u64| (sum as f64 / (1024.0 * f64::from(COVERAGE_ONE))) as f32;
-    MeanCoverage {
-        core: mean(sums[0]),
-        edge: [mean(sums[1]), mean(sums[2]), mean(sums[3])],
-    }
+    profile
 }
 
 /// The camera ray of every pixel, linear in normalized device coordinates: the direction from
@@ -399,37 +444,108 @@ mod tests {
         assert_eq!(displacement(&layer, 64)[1], (0, 1024));
     }
 
-    #[test]
-    fn mean_coverage_follows_the_threshold() {
-        let mut layer = FogLayer::new(0, 8);
-        layer.noise.scale = 4;
-        let full = mean_coverage(&layer);
-        assert_eq!(full.core, 1.0, "threshold 0 fills every cell");
-        layer.threshold = 1.0;
-        assert_eq!(mean_coverage(&layer), MeanCoverage::default());
-        layer.threshold = 0.5;
-        let half = mean_coverage(&layer);
-        assert!((0.3..0.7).contains(&half.core), "{half:?}");
-        // The edges' raise thins it out, quarter by quarter, and the edges themselves do not
-        // change the core.
-        assert!(half.edge[0] < half.core && half.edge[2] < half.edge[1] && half.edge[2] > 0.0);
-        layer.edge_top = 6;
-        assert_eq!(mean_coverage(&layer), half);
+    /// A valley-like bank: 2-block cells over 46..70 with edges of 4 and 12 blocks.
+    fn valley() -> FogLayer {
+        let mut l = FogLayer::new(46, 70);
+        l.cell = [2, 2, 2];
+        l.noise.dims = NoiseDims::Volume;
+        l.noise.scale = 8;
+        l.noise.octaves = 2;
+        l.noise.seed = 0xfa11e7;
+        l.threshold = 0.45;
+        (l.edge_bottom, l.edge_top) = (4, 12);
+        l.softness = 0.3;
+        l.density = 0.075;
+        l
     }
 
+    /// The haze spans the rows that can hold fog: none in the row along a plane with an edge
+    /// (the valley's 46 to 48, under the sea's surface at 47), some in its core.
     #[test]
-    fn the_mean_fades_through_the_edge() {
-        let m = MeanCoverage {
-            core: 0.8,
-            edge: [0.6, 0.4, 0.1],
-        };
-        assert_eq!(m.at(0), 0.8);
-        assert_eq!(m.at(1024), 0.6);
-        assert_eq!(m.at(2048 + 512), 0.25);
-        assert_eq!(m.at(3072 + 512), 0.05);
-        assert_eq!(m.at(4096), 0.0);
-        assert_eq!(MeanCoverage::from(0.5), MeanCoverage::level(0.5));
-        assert_eq!(MeanCoverage::level(0.5).at(2048), 0.5);
+    fn the_haze_spans_the_rows_that_can_hold_fog() {
+        let layer = valley();
+        let p = haze_profile(&layer);
+        assert_eq!((p.bottom, p.spacing), (2.0, 20.0 / 7.0));
+        let lo = layer.min_y as f32 + p.bottom;
+        for y in [30.0, 46.0, 47.0, 47.99, 68.0, 69.0, 70.0, 90.0] {
+            assert_eq!(p.at(lo, y), 0.0, "y {y}");
+        }
+        for y in [48.0, 50.0, 55.0, 60.0] {
+            assert!(p.at(lo, y) > 0.0, "y {y}: {p:?}");
+        }
+        assert!(p.knots.iter().all(|&k| k >= 0.0));
+        // The top edge thins it toward the ceiling.
+        assert!(p.knots[7] < p.knots[4], "{p:?}");
+        // Between knots, linear.
+        let mid = 0.5 * (p.knots[2] + p.knots[3]);
+        assert!((p.at(lo, lo + 2.5 * p.spacing) - mid).abs() < 1e-6);
+        // No row at all: no haze.
+        let mut thin = valley();
+        thin.max_y = 50;
+        assert_eq!(haze_profile(&thin), HazeProfile::default());
+    }
+
+    /// Without an edge the haze goes up to the plane and stops there, like the cells.
+    #[test]
+    fn without_an_edge_the_haze_reaches_the_plane() {
+        let mut layer = valley();
+        (layer.edge_bottom, layer.edge_top) = (0, 0);
+        let p = haze_profile(&layer);
+        assert_eq!((p.bottom, p.spacing), (0.0, 24.0 / 7.0));
+        let lo = layer.min_y as f32;
+        assert!(p.knots[0] > 0.0 && p.knots[7] > 0.0, "{p:?}");
+        assert_eq!(p.at(lo, lo), p.knots[0]);
+        assert_eq!(p.at(lo, lo - 0.01), 0.0);
+        assert_eq!(p.at(lo, 70.0), 0.0, "the band is [min_y, max_y)");
+        assert!(p.at(lo, 69.99) > 0.0);
+    }
+
+    /// Without edges or a rise every knot has the same mean, from 0 (threshold 1) to the full
+    /// density (threshold 0); a rise makes the base denser than the top.
+    #[test]
+    fn the_profile_follows_the_threshold_and_its_rise() {
+        let mut layer = valley();
+        (layer.edge_bottom, layer.edge_top) = (0, 0);
+        let d = layer.density * std::f32::consts::LOG2_E;
+        let level = haze_profile(&layer);
+        assert!(
+            level.knots.iter().all(|&k| k == level.knots[0]),
+            "{level:?}"
+        );
+        assert!((0.25 * d..0.75 * d).contains(&level.knots[0]), "{level:?}");
+        assert_eq!(
+            HazeProfile::level(&layer, level.knots[0] / d).knots[3],
+            level.knots[0] / d * d
+        );
+        (layer.threshold, layer.softness) = (0.0, 0.0);
+        assert_eq!(
+            haze_profile(&layer).knots,
+            [d; HAZE_KNOTS],
+            "every cell full"
+        );
+        layer.threshold = 1.0;
+        assert_eq!(haze_profile(&layer).knots, [0.0; HAZE_KNOTS]);
+        (layer.threshold, layer.softness) = (0.45, 0.3);
+        layer.threshold_rise = 0.3;
+        let rise = haze_profile(&layer);
+        assert!(
+            rise.knots.windows(2).all(|w| w[0] >= w[1]) && rise.knots[0] > rise.knots[7],
+            "{rise:?}"
+        );
+    }
+
+    /// The profile is deterministic and the same wherever the band is (the noise is read at
+    /// the same cells, the thresholds by the rows of the band).
+    #[test]
+    fn the_profile_is_deterministic() {
+        let layer = valley();
+        let p = haze_profile(&layer);
+        assert_eq!(haze_profile(&layer), p);
+        for shift in [-(1i64 << 40), -1024, 2048, 1 << 50] {
+            let mut moved = valley();
+            (moved.min_y, moved.max_y) = (layer.min_y + shift, layer.max_y + shift);
+            assert_eq!(haze_profile(&moved), p, "{shift}");
+        }
     }
 
     fn mat_mul(a: [[f64; 4]; 4], b: [[f64; 4]; 4]) -> [[f64; 4]; 4] {

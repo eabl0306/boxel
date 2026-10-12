@@ -7,7 +7,8 @@
 //! - [`noise`]: the integer noise that gives each cell its coverage, bit for bit what the shader
 //!   computes, and a direct `i128` reference of it.
 //! - [`layer`]: a layer reduced to small integers relative to the render origin for one frame
-//!   ([`LayerParams`]), and the camera rays ([`RayBasis`]).
+//!   ([`LayerParams`]), its haze past its cells ([`HazeProfile`]), and the camera rays
+//!   ([`RayBasis`]).
 //! - [`march`]: the shader's march in `f32`, the reference of the GPU tests.
 //! - [`pack`]: how the march stores its result in one texel.
 //!
@@ -24,10 +25,12 @@ pub mod pack;
 
 pub use config::{
     DEFAULT_MAX_STEPS, FogError, FogFade, FogLayer, FogNoise, FogResolution, MAX_EDGE,
-    MAX_FOG_DISTANCE, MAX_SOFT_DISTANCE, NoiseDims, VOXEL_FACE_SHADE, density_for_visibility,
-    validate,
+    MAX_FOG_CELLS, MAX_FOG_DISTANCE, MAX_SOFT_DISTANCE, NoiseDims, VOXEL_FACE_SHADE,
+    density_for_visibility, validate,
 };
-pub use layer::{FogTime, LayerParams, MeanCoverage, RayBasis, TICKS_PER_SECOND, mean_coverage};
+pub use layer::{
+    FogTime, HAZE_KNOTS, HazeProfile, LayerParams, RayBasis, TICKS_PER_SECOND, haze_profile,
+};
 pub use noise::{COVERAGE_ONE, Coverage};
 
 /// Most layers a set may have.
