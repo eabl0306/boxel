@@ -1,9 +1,10 @@
-# Bruma lejana y nubes grandes: medición del M1 (2026-10-11)
+# Bruma lejana y nubes grandes: medición del M1 (2026-10-11, S4 el 2026-10-12)
 
 Qué se midió: el M1 de la ronda de niebla ([ADR 0032](../adr/0032-bruma-lejana-y-nubes-grandes.md),
-issue #47), rama `feat/fog-far` en 4f43b4d. Solo nivel 1: cada smoke una vez, con su `--base`,
-la máquina tranquila y nada compilando. RTX 5050, 1280x720, radio 16, sin tope. Costo = el frame
-medio con niebla menos sin niebla (por 1/fps), y la diferencia de medianas.
+issue #47), rama `feat/fog-far` en 4f43b4d. S4 se midió tras el vuelo del dueño, en 7ae1be8,
+con el mismo binario (desde 4f43b4d solo cambiaron docs). Solo nivel 1: cada smoke una vez, con
+su `--base`, la máquina tranquila y nada compilando. RTX 5050, 1280x720, radio 16, sin tope.
+Costo = el frame medio con niebla menos sin niebla (por 1/fps), y la diferencia de medianas.
 
 ## Lo importante
 
@@ -12,10 +13,13 @@ medio con niebla menos sin niebla (por 1/fps), y la diferencia de medianas.
   mediana dio 1,40 ms en S0 y 1,47 en S1), así que puede ser ruido. El M2 parte de aquí.
 - La bruma lejana con el LOD cuesta 0,03 ms por frame (S2), lo estimado.
 - Mirando al horizonte con el LOD lejano, los cuatro presets nuevos cuestan de 1,43 a 1,52 ms por
-  frame (S3). Entre ellos hay menos de 0,1 ms, así que en el vuelo se puede elegir por cómo se
-  ven. A 1080p el costo por texel es unas 2,25 veces mayor.
-- S3 sale con 1 por la regla del 85 % de fps: es el precio del plugin, como en S0 y en ADR 0030,
-  no una regresión.
+  frame (S3). Entre ellos hay menos de 0,1 ms; tras el vuelo, el dueño se quedó con todos. A
+  1080p el costo por texel es unas 2,25 veces mayor.
+- Volar dentro de una nube es lo más caro: de 2,24 a 2,30 ms por frame con `decks` o `cumulus16`
+  (S4), por la niebla suave. Desde arriba, `cumulus16` cuesta 1,36 ms. Dentro de una nube el p99
+  llega a 6,9 ms a 720p: es lo que más tiene que bajar el M2.
+- S3 y S4 salen con 1 por la regla del 85 % de fps: es el precio del plugin, como en S0 y en
+  ADR 0030, no una regresión.
 
 ## S0: punto de partida
 
@@ -62,6 +66,32 @@ el ajuste empieza en 144, justo sobre la pose, y los rayos que suben cruzan su n
 trozos suaves por rayo en la tabla de pasos, contra 0,3 de `cumulus16`). Las perillas son del
 juego (el piso de la banda, `soft_distance`). No se ajustó nada.
 
+## S4: los presets más caros, desde adentro y desde arriba
+
+El dueño se queda con todos los presets, así que se midieron los más caros según la tabla de
+pasos, `decks` y `cumulus16`, en dos poses: dentro de la capa (y 250, a nivel) y arriba (y 420, 25
+grados abajo). `perf.py smoke --base HEAD --new-extra '--fog X' surface -- --lod far --camera
+POSE`: el mismo binario sin niebla y con el preset. El harness repitió cada par y los dos dieron
+lo mismo; la tabla muestra el segundo.
+
+| preset | pose | fps | p50 ms | p99 ms | frames > 6,94 ms | costo medio | costo p50 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `decks` | dentro (y 250) | 1282 -> 325 | 0,70 -> 2,83 | 2,00 -> 6,91 | 0 -> 27 | 2,30 ms | 2,13 ms |
+| `decks` | arriba (y 420) | 1571 -> 348 | 0,57 -> 2,68 | 1,70 -> 6,40 | 0 -> 1 | 2,24 ms | 2,11 ms |
+| `cumulus16` | dentro (y 250) | 1262 -> 330 | 0,70 -> 2,81 | 2,05 -> 6,87 | 0 -> 22 | 2,24 ms | 2,11 ms |
+| `cumulus16` | arriba (y 420) | 1580 -> 502 | 0,57 -> 1,83 | 1,70 -> 4,82 | 0 -> 0 | 1,36 ms | 1,26 ms |
+
+- Dentro de una nube cuesta 1,5 veces lo de la pose del horizonte (S3). Es la niebla suave: unos
+  53 trozos suaves por rayo, que no cuentan en el presupuesto de pasos.
+- Para `decks`, y 420 no es arriba: cae dentro de su capa alta (400 a 440), con 40 trozos suaves
+  por rayo, y cuesta lo mismo que dentro de los cúmulos. `cumulus16` desde arriba queda en lo
+  estimado (0,9 a 1,5 ms).
+- Dentro de una nube, a 720p, el p99 llega a 6,9 ms y de 22 a 27 frames de 10 s pasan de 6,94 ms
+  (144 Hz). A 1080p el costo por texel sube unas 2,25 veces. Es el caso que más tiene que bajar
+  el M2: su E4 (decidir con la primera octava en los trozos suaves) apunta ahí.
+- Los cuatro salen con 1 por la regla del 85 % de fps: el precio del plugin. No se ajustó nada;
+  las perillas son del juego (`soft_distance`, octavas, densidad).
+
 ## Pasos por rayo
 
 `cargo test -p boxel_demo fog_steps_per_ray -- --nocapture` en 4f43b4d: la marcha de referencia
@@ -98,6 +128,7 @@ sobre un abanico fijo de 360 rayos por pose, con el horizonte `far` y una vista 
 
 ## Archivos
 
-En `bench-results/fog-far/` (fuera de git): `S0`, `S1`, `S2` y `S3-*` con el log de cada smoke,
-sus corridas (`runs/`) y todas las métricas (`compare.txt`), y `M1/` con la tabla de pasos y los
-logs de los builds y del arranque de `voxel_world`.
+En `bench-results/fog-far/` (fuera de git): `S0`, `S1`, `S2`, `S3-*` y `S4/` (una carpeta por
+preset y pose) con el log de cada smoke, sus corridas (`runs/`) y todas las métricas
+(`compare.txt`, del primer par), y `M1/` con la tabla de pasos y los logs de los builds y del
+arranque de `voxel_world`.

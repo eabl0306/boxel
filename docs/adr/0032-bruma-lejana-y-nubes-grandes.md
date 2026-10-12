@@ -1,6 +1,7 @@
 # ADR 0032: bruma lejana y nubes grandes sobre el LOD
 
-- Estado: borrador (issue #47), a confirmar con el vuelo del dueño
+- Estado: borrador (issue #47). El M1 pasó el vuelo del dueño el 2026-10-12 (ver "Decisiones
+  del dueño tras el vuelo"); falta el M2.
 - Fecha: 2026-10-11
 - Enmienda: ADR 0030 (el límite de distancia, la cola pasado el tope) y ADR 0031 (decisión 6)
 
@@ -140,6 +141,23 @@ LOD (768 bloques sin LOD, donde terminan las nubes de hoy):
 - `stress` y `snapshot` pasan el horizonte del preset de `--lod` con la misma regla y aceptan
   `--fog-haze`.
 
+## Decisiones del dueño tras el vuelo (2026-10-12)
+
+- **Bruma del valle:** queda en 1, con celdas hasta 384.
+- **Nubes pasadas sus celdas:** queda el banco de bruma, sin marcha lejana. La franja plana del
+  horizonte viene del terreno de la demo, que es muy plano. Con montañas el horizonte cambia, y
+  mucho de lo lejano quedará tapado (puede que hasta mejore el rendimiento; habrá que verlo).
+- **Presets de nubes:** quedan todos (`cumulus16`, `cumulus20`, `cumulus24` y `decks` con
+  `high_deck`). Cada uno se ve como un tipo de nube distinto.
+- **Mapa de cobertura:** no en esta ronda. Hoy, si hay nubes, hay nubes en todo el cielo. El tipo
+  de nube, cuántas hay, los días despejados y el color de tormenta con lluvia van al sistema de
+  clima (issue #53), siempre con cambios graduales, nunca de golpe.
+- **Bruma por bioma y por hora del día:** después, con los biomas (issue #43). Hoy la bruma está
+  en todos lados a la vez.
+- **Tecla del factor de bruma:** Shift+F7. No hay más trabajo de teclas en la demo.
+- **M2:** sigue como en el plan. Si baja el tiempo de la niebla menos de 1,4 veces, se informa y
+  se para antes de especializar el shader o tocar `EXIT_TAU` (esa decisión sigue abierta).
+
 ## Límites conocidos
 
 - **Bruma más densa que la realidad vista desde arriba.** `e` a la menos la profundidad media es
@@ -150,7 +168,8 @@ LOD (768 bloques sin LOD, donde terminan las nubes de hoy):
   horizonte, con las colinas asomando. Es la idea aceptada; Shift+F7 muestra 0,25 y 0.
 - **Franja de cielo bajo el banco de nubes.** Mirando al horizonte desde y 140, entre el borde
   del LOD y la base del banco de nubes queda una línea de cielo de unos 10 píxeles a 1080p: los
-  rayos que entrarían a la banda más allá del horizonte ya tomaron el color del cielo.
+  rayos que entrarían a la banda más allá del horizonte ya tomaron el color del cielo. Por
+  ahora no se arregla: con montañas en el terreno el horizonte cambia (decisión del dueño).
 - **Cubos grandes cerca del fin de las celdas** titilan un poco con el viento (unos 2 texels de
   media resolución a 1080p). El anillo de fusión y la suavidad lo suavizan.
 - **Rayos que agotan el presupuesto con bruma menor que 1** toman el perfil completo hasta el fin
@@ -165,9 +184,11 @@ LOD (768 bloques sin LOD, donde terminan las nubes de hoy):
 - **La primitiva cerrada del perfil** con un plan B contra la cancelación: cortar en los nudos es
   exacto y más simple.
 - **Una sola media por capa.** Deja un escalón en la costura de las nubes con subida.
-- **Pendientes hasta después del vuelo:** la marcha lejana suave anclada al mundo para las nubes,
-  un mapa de cobertura (grupos de nubes con cielo abierto entre ellos) y un presupuesto de pasos
-  por capa.
+- **La marcha lejana suave anclada al mundo para las nubes:** el dueño se queda con el banco de
+  bruma (ver sus decisiones).
+- **Un mapa de cobertura** (grupos de nubes con cielo abierto entre ellos) en esta ronda: pasa al
+  clima (issue #53).
+- **Un presupuesto de pasos por capa:** no entra en esta ronda.
 
 ## Cómo se probó
 
@@ -228,23 +249,27 @@ de partida (S0, 0bd2849) `--fog both` cuesta de 0,97 a 1,06 ms en la mediana.
 | S3 | `cumulus20`, igual | 1,43 ms | 1,32 ms |
 | S3 | `cumulus24`, igual | 1,45 ms | 1,35 ms |
 | S3 | `decks`, igual | 1,52 ms | 1,41 ms |
+| S4 | `decks` dentro de la capa (y 250, a nivel), con `--lod far` | 2,30 ms | 2,13 ms |
+| S4 | `decks` desde y 420 (dentro de su capa alta), 25 grados abajo | 2,24 ms | 2,11 ms |
+| S4 | `cumulus16` dentro de la capa (y 250, a nivel) | 2,24 ms | 2,11 ms |
+| S4 | `cumulus16` desde arriba (y 420, 25 grados abajo) | 1,36 ms | 1,26 ms |
 
 - `both` cuesta casi lo mismo que antes (5 % menos de fps, del tamaño de lo que varía el mismo
   binario entre sesiones). La bruma es barata.
 - Los cuatro presets nuevos cuestan casi lo mismo y quedan en lo estimado, salvo `cumulus24`,
   que se esperaba más barato: su banda empieza en 144, justo sobre la pose, y sus rayos cruzan
   niebla suave. A 1080p el costo por texel sube unas 2,25 veces.
+- Volar dentro de una nube es lo más caro (S4, en 7ae1be8, el mismo binario): 1,5 veces la pose
+  del horizonte, por unos 53 trozos suaves por rayo. Ahí el p99 llega a 6,9 ms a 720p y algunos
+  frames pasan de 6,94 ms. Es lo que más tiene que bajar el M2. `cumulus16` desde arriba queda en
+  lo estimado.
 
 ## Pendiente
 
-- El vuelo del dueño (`voxel_world --lod far --fog both --camera 0,140,0,45,8`): F7 por los
-  cuatro presets nuevos, Shift+F7 en cada uno, subir a y 420, F8 por los horizontes.
-- Decisiones del dueño tras el vuelo: fuerza y alcance de la bruma del valle (1 y 384 por ahora),
-  bruma o marcha lejana para las nubes, mapa de cobertura, qué presets quedan y la tecla del
-  factor (Shift+F7 o F11).
-- S4 tras el vuelo: el preset que quede, desde arriba (y 420) o dentro de la capa (y 250), la
-  peor de las dos según la tabla de pasos.
-- M2: la ronda de optimización de la marcha, medida contra `both`.
+- M2: la ronda de optimización de la marcha, medida contra `both`. Si baja menos de 1,4 veces,
+  decide el dueño.
+- Con el clima (issue #53): nubes que cambian de tipo, de cantidad y de color con los días.
+- Con los biomas (issue #43): bruma que depende del bioma y de la hora del día.
 
 ## Consecuencias
 
