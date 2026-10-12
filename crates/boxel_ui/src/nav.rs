@@ -106,10 +106,19 @@ pub(crate) fn resolve(state: &mut UiState, input: &NavInput) -> InputCapture {
             .iter()
             .find_map(|&l| layers[l.index()].hits.iter().find(|h: &&Hit| h.id == id))
     };
-    // A focused widget that was not declared last frame is gone.
+    // The keyboard belongs to the enabled widgets of the modal layer, in declaration order. A
+    // focused widget outside them (gone, disabled, or under a modal layer opened over it) loses
+    // the focus, so Enter cannot activate a widget the player no longer reaches.
+    let order: Vec<&Hit> = mem.modal.map_or_else(Vec::new, |layer| {
+        layers[layer.index()]
+            .hits
+            .iter()
+            .filter(|h| h.enabled && h.kind.focusable())
+            .collect()
+    });
     if mem
         .focused
-        .is_some_and(|id| find(id).is_none_or(|h| !h.enabled))
+        .is_some_and(|id| !order.iter().any(|h| h.id == id))
     {
         mem.focused = None;
     }
@@ -134,14 +143,7 @@ pub(crate) fn resolve(state: &mut UiState, input: &NavInput) -> InputCapture {
         mem.dragging = None;
     }
 
-    // Keys move the focus among the enabled widgets of the modal layer, in declaration order.
-    let order: Vec<&Hit> = mem.modal.map_or_else(Vec::new, |layer| {
-        layers[layer.index()]
-            .hits
-            .iter()
-            .filter(|h| h.enabled && h.kind.focusable())
-            .collect()
-    });
+    // Keys move the focus along `order`.
     for &(key, repeat) in &input.keys {
         if order.is_empty() {
             break;
@@ -163,8 +165,8 @@ pub(crate) fn resolve(state: &mut UiState, input: &NavInput) -> InputCapture {
             NavKey::Next | NavKey::Down | NavKey::Right => 1,
             NavKey::Prev | NavKey::Up | NavKey::Left => -1,
             NavKey::Activate => {
-                if !repeat {
-                    mem.activated = mem.focused;
+                if !repeat && let Some(i) = at {
+                    mem.activated = Some(order[i].id);
                 }
                 0
             }

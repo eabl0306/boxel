@@ -99,7 +99,7 @@ pub(crate) struct Memory {
     pub hovered: Option<(UiLayer, WidgetId)>,
     /// The topmost modal layer with content: layers below it get no input.
     pub modal: Option<UiLayer>,
-    /// The widget with keyboard focus.
+    /// The widget with keyboard focus: always an enabled widget of the `modal` layer.
     pub focused: Option<WidgetId>,
     /// Focus moved by the keyboard (tooltips follow it) rather than by a click.
     pub focus_visible: bool,

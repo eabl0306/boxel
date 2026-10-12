@@ -1,6 +1,6 @@
 //! Mouse and keyboard through `UiPlugin`, headless (`InputPlugin`, a `WindowState`, no window):
 //! hover, presses, Tab order, Enter and Space, arrows on sliders and cycles, Shift+click,
-//! disabled widgets, key repeat and `InputCapture`.
+//! disabled widgets, key repeat, a popup over a screen and `InputCapture`.
 
 use boxel_ecs::prelude::*;
 use boxel_math::{IVec2, UVec2, Vec2};
@@ -310,6 +310,48 @@ fn a_modal_layer_captures_input_and_the_hud_alone_does_not() {
         None,
         "no keyboard navigation without a modal layer"
     );
+}
+
+#[test]
+fn a_modal_popup_takes_the_focus_from_the_screen_under_it() {
+    #[derive(Resource, Default)]
+    struct Confirm(Vec<&'static str>);
+    // Clicking "play" opens a confirmation over the screen, which stays drawn under it.
+    fn confirm(mut ui: Ui, menu: Res<Menu>, mut confirm: ResMut<Confirm>) {
+        if !menu.clicks.contains(&"play") {
+            return;
+        }
+        let mut p = ui.layer(UiLayer::Popup, Modal::Yes);
+        let [yes, no] = UiRect::new(300, 100, 200, 20).split(4);
+        if p.button(yes, "test:yes").clicked {
+            confirm.0.push("yes");
+        }
+        if p.button(no, "test:no").clicked {
+            confirm.0.push("no");
+        }
+    }
+    let mut t = tester();
+    t.app.init_resource::<Confirm>();
+    t.add_systems(confirm.after(screen));
+    t.tap(KeyCode::Tab).tap(KeyCode::Enter);
+    assert_eq!(menu(&t).clicks, ["play"]);
+    assert!(t.hit("test:yes").is_some(), "the confirmation is open");
+    assert_eq!(
+        t.focused(),
+        None,
+        "the screen under the popup lost the focus"
+    );
+
+    // Enter and Space activate nothing until a popup widget has the focus; they never reach
+    // the screen.
+    t.tap(KeyCode::Enter).tap(KeyCode::Space);
+    assert_eq!(menu(&t).clicks, ["play"]);
+    assert!(t.app.world().resource::<Confirm>().0.is_empty());
+    t.tap(KeyCode::Tab);
+    assert_eq!(t.focused().as_deref(), Some("test:yes"));
+    t.tap(KeyCode::Tab).tap(KeyCode::Enter);
+    assert_eq!(t.app.world().resource::<Confirm>().0, ["no"]);
+    assert_eq!(menu(&t).clicks, ["play"]);
 }
 
 #[test]
