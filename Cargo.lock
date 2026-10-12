@@ -566,6 +566,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "boxel_ui"
+version = "0.1.0-dev"
+dependencies = [
+ "boxel_app",
+ "boxel_ecs",
+ "boxel_math",
+ "boxel_window",
+ "proptest",
+]
+
+[[package]]
 name = "boxel_utils"
 version = "0.1.0"
 dependencies = [

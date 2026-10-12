@@ -1,0 +1,22 @@
+[package]
+name = "boxel_ui"
+description = "boxel's optional game UI: GUI scale, a retained paint list, sprites, bitmap text and widgets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+boxel_ecs.workspace = true
+boxel_app.workspace = true
+boxel_math.workspace = true
+boxel_window.workspace = true
+
+[dev-dependencies]
+# Tests get system/component names in ECS diagnostics (dev-only; users opt in through boxel/debug).
+boxel_ecs = { workspace = true, features = ["debug"] }
+proptest.workspace = true
+
+[lints]
+workspace = true
