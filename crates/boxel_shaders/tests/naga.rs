@@ -820,6 +820,27 @@ fn lod_bits_match_the_mirror_and_boxel_mesh() {
     let q = PackedQuad::new([0; 3], 1, 1, Face::PosY, 7).with_light_index(2 | 13 << 2);
     assert_eq!((q.mat >> const_u32(&module, "LOD_DARK_SHIFT")) & 15, 13);
     assert_eq!(boxel_mesh::lod::dark_of(q), 13);
+    // And its bank flag, apart from both.
+    let bank = const_u32(&module, "LOD_BANK_BIT");
+    assert_eq!(
+        bank,
+        u32::from(boxel_mesh::lod::BANK_BIT) << boxel_mesh::layout::MAT_LIGHT_SHIFT
+    );
+    assert_eq!(q.mat & bank, 0);
+    let b = q.with_light_index(2 | 13 << 2 | boxel_mesh::lod::BANK_BIT);
+    assert!(b.mat & bank != 0 && boxel_mesh::lod::is_bank(b) && !boxel_mesh::lod::is_bank(q));
+    assert_eq!(boxel_mesh::lod::dark_of(b), 13);
+    assert_eq!(boxel_mesh::lod::seam_of(b), boxel_mesh::lod::Seam::Middle);
+    // Every light palette index a LOD quad can have is in the LOD palette.
+    let top = 3
+        | u16::from(boxel_mesh::lod::MAX_DARK) << boxel_mesh::lod::DARK_SHIFT
+        | boxel_mesh::lod::BANK_BIT;
+    assert!(usize::from(top) < boxel_mesh::lod::LOD_PALETTE.len());
+    // A bank lies behind anything a LOD level draws (the horizon of the largest preset is under
+    // 2^16 blocks, the near plane at least 0.01: a depth of 0.01 / 2^16 at worst, kept 64 times
+    // apart), in front of the sky (0).
+    let depth = const_f32(&module, "LOD_BANK_DEPTH");
+    assert!(depth > 0.0 && depth < 0.01 / 65536.0 / 64.0, "{depth}");
     // The flat output of a LOD quad keeps the texture layer, the face (3 bits), the mip, the
     // tint, the emissive flag, the level and the darkness in bits of their own.
     assert_eq!(const_u32(&module, "LOD_OUT_DARK_SHIFT"), 28);

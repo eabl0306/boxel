@@ -16,13 +16,18 @@
 //! 4. [`add_fluid_walls`]: the same planes, a face on every ground cell next to a plane that lies
 //!    near a see-through fluid, so that a ray under the water (near or far) meets the ground's
 //!    side instead of the sky, even where the cell rule rounded the cell across up to ground.
+//! 5. [`add_banks`]: the same planes seen from the other side, a face into every see-through fluid
+//!    cell on its ground that is next to a plane, so that a ray through the far water that
+//!    crosses into finer detail inside the ground the cell rule dropped (a sea over its bed keeps
+//!    its cell water) meets the ground instead of the sky. Drawn behind everything else
+//!    ([`is_bank`]): they show only where nothing else would.
 //!
 //! Every visible state is a cube at a distance ([`LodMaterials`]): an opaque one, but for the
 //! see-through fluids, whose faces against the air go into the translucent bucket. Inside the
 //! node a see-through fluid still hides its neighbors' faces from the mesher, so the bed under it
 //! comes from post-pass 2 alone. The quads of post-passes 3 and 4 come last in their bucket,
 //! marked by their plane ([`Seam`]), so the renderer can leave out those nothing needs
-//! ([`seam_counts`], [`water_seams`]).
+//! ([`seam_counts`], [`water_seams`]); the banks are always drawn, after the bed.
 use crate::packed::layout;
 use crate::{
     AoPolicy, BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, FULL_SKY_ENTRY, MAX_QUADS_PER_BUCKET,
@@ -190,19 +195,19 @@ pub const fn octant_of(quad: PackedQuad) -> u8 {
     (((g >> 4) & 1) | (((g >> 9) & 1) << 1) | (((g >> 14) & 1) << 2)) as u8
 }
 
-/// Where a LOD quad lies: a face of the mesher or of the bed under water ([`add_underwater`]),
-/// or a quad of post-pass 3 or 4 ([`add_skirts`], [`add_fluid_walls`]) on one of the node's 6
-/// faces or on a middle plane (cell 16 of an axis). Those close the seam with other detail across
-/// their plane, and only such a seam shows them: where this node or a neighbor of its level draws
-/// the cells across, they lie between solid cells, behind the faces of the surface (or, for a
-/// see-through fluid, inside it, behind its surface).
+/// Where a LOD quad lies: a face of the mesher, of the bed under water ([`add_underwater`]) or a
+/// bank ([`add_banks`]), or a quad of post-pass 3 or 4 ([`add_skirts`], [`add_fluid_walls`]) on
+/// one of the node's 6 faces or on a middle plane (cell 16 of an axis). Those close the seam with
+/// other detail across their plane, and only such a seam shows them: where this node or a
+/// neighbor of its level draws the cells across, they lie between solid cells, behind the faces
+/// of the surface (or, for a see-through fluid, inside it, behind its surface).
 ///
-/// LOD meshes have no light, so a quad's light palette index holds its seam (bits 0 and 1) and
-/// its darkness ([`dark_of`], from [`DARK_SHIFT`]): a LOD mesh's palette is [`LOD_PALETTE`] (open
-/// sky for every index).
+/// LOD meshes have no light, so a quad's light palette index holds its seam (bits 0 and 1), its
+/// darkness ([`dark_of`], from [`DARK_SHIFT`]) and its bank flag ([`BANK_BIT`]): a LOD mesh's
+/// palette is open sky for every index it uses (a prefix of [`LOD_PALETTE`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Seam {
-    /// A face of the mesher or of the bed under water, always drawn.
+    /// A face of the mesher, of the bed under water or a bank, always drawn.
     None = 0,
     /// On a node face (plane 0 or 32): needed where the node across is not of this level, or
     /// does not draw its cells by the plane.
@@ -220,9 +225,12 @@ pub const DARK_SHIFT: u16 = 2;
 /// The darkest a LOD face gets: sky light 0, 15 blocks or more under water.
 pub const MAX_DARK: u8 = 15;
 
-/// The light palette of a non-empty LOD mesh: open sky for every light palette index a quad can
-/// have ([`Seam`] and darkness).
-pub const LOD_PALETTE: [PaletteEntry; 64] = [FULL_SKY_ENTRY; 64];
+/// The bit of a bank ([`add_banks`], [`is_bank`]) in a LOD quad's light palette index.
+pub const BANK_BIT: u16 = 1 << 6;
+
+/// Open sky for every light palette index a LOD quad can have ([`Seam`], darkness and
+/// [`BANK_BIT`]): a LOD mesh's palette is the prefix of it that covers the indices of its quads.
+pub const LOD_PALETTE: [PaletteEntry; 128] = [FULL_SKY_ENTRY; 128];
 
 /// The [`Seam`] of a LOD quad (bits 0 and 1 of its light palette index).
 pub const fn seam_of(quad: PackedQuad) -> Seam {
@@ -241,6 +249,15 @@ pub const fn seam_of(quad: PackedQuad) -> Seam {
 /// it with sky light `15 - dark`.
 pub const fn dark_of(quad: PackedQuad) -> u8 {
     ((quad.light_index() >> DARK_SHIFT) & MAX_DARK as u16) as u8
+}
+
+/// True for a bank ([`add_banks`], bit [`BANK_BIT`] of its light palette index): a face into a
+/// see-through fluid cell, on that cell's side away from its normal (the cell plane across from
+/// where a face of its direction lies), in that cell's octant. The renderer draws it there with
+/// the depth of the farthest point (just in front of the sky), so it shows only where a ray
+/// meets nothing else; a bank on a side shows only to an eye above its top.
+pub const fn is_bank(quad: PackedQuad) -> bool {
+    quad.light_index() & BANK_BIT != 0
 }
 
 /// Per face bucket of a LOD mesh, `[on a node face, on a middle plane]`: the quads at the end of
@@ -273,10 +290,10 @@ fn bucket_seams(quads: &[PackedQuad]) -> [u32; 2] {
 }
 
 /// Meshes a LOD node: `padded` filled by [`LodMaterials::fill`], meshed without light and AO,
-/// then [`split_octants`], and the quads of [`add_underwater`], [`add_skirts`] and
-/// [`add_fluid_walls`] (`level` sets the darkness under water). In each bucket the faces of the
-/// mesher come first, then the bed under water, then the quads on a node face, then those on a
-/// middle plane ([`seam_counts`], [`water_seams`]).
+/// then [`split_octants`], and the quads of [`add_underwater`], [`add_skirts`],
+/// [`add_fluid_walls`] and [`add_banks`] (`level` sets the darkness under water). In each bucket
+/// the faces of the mesher come first, then the bed under water and the banks, then the quads on
+/// a node face, then those on a middle plane ([`seam_counts`], [`water_seams`]).
 pub fn mesh_node(
     mesher: &mut Mesher,
     padded: &PaddedChunk,
@@ -301,6 +318,7 @@ pub fn mesh_node(
     skirts(padded, materials, water.as_ref(), &near_air, &mut extra);
     if let Some(water) = &water {
         walls(padded, materials, water, &near_air, &mut extra);
+        banks(padded, materials, water, &mut extra);
     }
     append(out, extra);
 }
@@ -397,6 +415,33 @@ pub fn add_fluid_walls(
     if let Some(water) = Water::of(padded, materials, level) {
         let mut extra = Vec::new();
         walls(padded, materials, &water, &near_air(padded), &mut extra);
+        append(mesh, extra);
+    }
+}
+
+/// Post-pass 5 (every level): banks. The cell rule keeps a cell water when a sea lies over the
+/// ground inside it (rule 1), so the bed under far water can lie lower than the true ground, by
+/// up to a cell less a block. A ray through the far water that crosses one of the planes of
+/// [`add_skirts`] into finer detail in that band goes on inside the true ground, where finer
+/// detail draws no face (full detail has none between two ground blocks). A bank closes it: on
+/// those planes, every see-through fluid cell next to the plane that sits on ground gets a face
+/// into it on the plane, with that ground's material and lit as deep as the cell (the bed's
+/// light):
+/// - on its side toward an x or z plane whose cell across is ground, or a see-through fluid on
+///   ground (across air, or a fluid over more fluid, finer detail holds no ground there);
+/// - on its bottom, toward a y plane (the ground under it is the cell across).
+///
+/// A bank is the cell's face away from its normal ([`is_bank`]): the renderer draws it behind
+/// everything, so where this node or its level draws the cells across it stays hidden behind the
+/// bed beyond it (or the coplanar face of the ground across), and where finer detail draws them
+/// the ground's faces there win. So banks need no seam rule: they go into the bucket of their
+/// face after the bed, always drawn ([`Seam::None`]; about half a percent of a node's quads).
+/// Merged greedily per plane, material, darkness and octant. Nothing for a node without a
+/// see-through fluid.
+pub fn add_banks(padded: &PaddedChunk, materials: &LodMaterials, level: u8, mesh: &mut ChunkMesh) {
+    if let Some(water) = Water::of(padded, materials, level) {
+        let mut extra = Vec::new();
+        banks(padded, materials, &water, &mut extra);
         append(mesh, extra);
     }
 }
@@ -601,9 +646,42 @@ fn walls(
     }
 }
 
-/// The faces post-passes 3 and 4 add, each with the cell coordinate along its normal: on plane
-/// `p` of an axis, the cell at `p - 1` faces the positive way (planes 16 and 32) and the cell at
-/// `p` the negative way (planes 0 and 16).
+/// [`add_banks`]'s quads into `out`.
+fn banks(padded: &PaddedChunk, materials: &LodMaterials, water: &Water, out: &mut Vec<Placed>) {
+    let ground = |m: u16| m != 0 && !materials.see_through(m);
+    for (face, n) in plane_faces() {
+        // `face` is the fluid cell's face toward the plane; its bank faces back into it. Not on
+        // the top of a cell (the plane over a fluid cell is no bed), nor by a plane no
+        // see-through cell touches.
+        if face == Face::PosY || !on_plane(&water.clear, face, n) {
+            continue;
+        }
+        let step = face_step(face);
+        let grid = face_grid(face, n, padded, |c, across| {
+            if !materials.see_through(padded.get(c[0], c[1], c[2])) {
+                return None;
+            }
+            let under = padded.get(c[0], c[1] - 1, c[2]);
+            let bank = if face == Face::NegY {
+                ground(across)
+            } else if materials.see_through(across) {
+                // Water across holds ground the rule dropped only if it sits on ground too.
+                let a = add(c, step);
+                ground(under) && ground(padded.get(a[0], a[1] - 1, a[2]))
+            } else {
+                ground(under) && across != 0
+            };
+            bank.then(|| face_key(under, water.dark(c)))
+        });
+        let table = materials.table();
+        merge_grid_marked(&grid, face.opposite(), n, table, Seam::None, true, out);
+    }
+}
+
+/// The faces post-passes 3 and 4 add (and the cells post-pass 5 lines from the other side),
+/// each with the cell coordinate along its normal: on plane `p` of an axis, the cell at `p - 1`
+/// faces the positive way (planes 16 and 32) and the cell at `p` the negative way (planes 0 and
+/// 16).
 fn plane_faces() -> impl Iterator<Item = (Face, i32)> {
     [
         (Face::PosX, Face::NegX),
@@ -676,6 +754,20 @@ fn merge_grid(
     seam: Seam,
     out: &mut Vec<Placed>,
 ) {
+    merge_grid_marked(grid, face, n, table, seam, false, out);
+}
+
+/// [`merge_grid`], the quads marked as banks ([`BANK_BIT`]) with `bank`.
+fn merge_grid_marked(
+    grid: &[[u32; 32]; 32],
+    face: Face,
+    n: i32,
+    table: &MaterialTable,
+    seam: Seam,
+    bank: bool,
+    out: &mut Vec<Placed>,
+) {
+    let bank = if bank { BANK_BIT } else { 0 };
     let (na, ua, va) = face.axes();
     let mut used = [0u32; 32];
     for v0 in 0..32usize {
@@ -720,7 +812,7 @@ fn merge_grid(
                 table.layer(m, face),
             )
             .with_flags(flags | layout::SHAPE_CUBE << 1)
-            .with_light_index(seam as u16 | dark << DARK_SHIFT);
+            .with_light_index(seam as u16 | dark << DARK_SHIFT | bank);
             out.push((table.bucket(m, face), quad));
             u0 = u1;
         }
@@ -831,8 +923,9 @@ fn reshaped(q: PackedQuad, pos: [u32; 3], w: u32, h: u32) -> PackedQuad {
     }
 }
 
-/// Adds `extra` cube quads (open sky, marked with their [`Seam`] and darkness) to `mesh`, each
-/// in its bucket, every bucket in [`Seam`] order (stable: the quads of a seam keep theirs).
+/// Adds `extra` cube quads (open sky, marked with their [`Seam`], darkness and bank flag) to
+/// `mesh`, each in its bucket, every bucket in [`Seam`] order (stable: the quads of a seam keep
+/// theirs).
 fn append(mesh: &mut ChunkMesh, extra: Vec<Placed>) {
     if extra.is_empty() {
         return;
@@ -850,8 +943,9 @@ fn append(mesh: &mut ChunkMesh, extra: Vec<Placed>) {
     set_buckets(mesh, buckets);
 }
 
-/// Writes `buckets` into `mesh` bucket-contiguous, with the palette [`LOD_PALETTE`] (open sky:
-/// what the mesher gives a mesh without light, for every [`Seam`] and darkness) and a new hash.
+/// Writes `buckets` into `mesh` bucket-contiguous, with the prefix of [`LOD_PALETTE`] that
+/// covers its quads' light palette indices (open sky: what the mesher gives a mesh without light,
+/// for every [`Seam`], darkness and bank flag) and a new hash.
 fn set_buckets(mesh: &mut ChunkMesh, buckets: [Vec<PackedQuad>; BUCKET_COUNT]) {
     debug_assert!(
         mesh.palette.iter().all(|&e| e == FULL_SKY_ENTRY),
@@ -863,8 +957,9 @@ fn set_buckets(mesh: &mut ChunkMesh, buckets: [Vec<PackedQuad>; BUCKET_COUNT]) {
         mesh.quads.extend_from_slice(quads);
     }
     mesh.palette.clear();
-    if !mesh.quads.is_empty() {
-        mesh.palette.extend_from_slice(&LOD_PALETTE);
+    if let Some(top) = mesh.quads.iter().map(|q| q.light_index()).max() {
+        mesh.palette
+            .extend_from_slice(&LOD_PALETTE[..=usize::from(top)]);
     }
     mesh.hash = mesh.compute_hash();
 }

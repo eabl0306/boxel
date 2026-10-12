@@ -4,9 +4,10 @@
 //! face of the water before a point inside the coarser water (translucent near and far, issue
 //! #50), or its bed would show untinted. Two scenes over a sea more than 8 blocks deep: two LOD
 //! levels of the forest's source, and real full-detail chunks of the forest beside a level-1
-//! node.
+//! node, there also from the level-1 terrain into a chunk (a chunk at the loading edge drawn by
+//! the LOD with a meshed one behind it).
 use boxel_demo::worldgen::ForestGenerator;
-use boxel_mesh::lod::{LodMaterials, Seam, fits, mesh_node, octant_of, seam_of};
+use boxel_mesh::lod::{LodMaterials, Seam, fits, is_bank, mesh_node, octant_of, seam_of};
 use boxel_mesh::{
     ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher, PackedQuad, PaddedChunk,
     TRANSLUCENT_BUCKET, layout,
@@ -18,7 +19,7 @@ use boxel_worldgen::WorldGenerator;
 use boxel_worldgen::lod::{LodCells, LodNode, LodRequest, LodScratch};
 
 /// A quad as a rectangle in space: its face's axis, plane and direction, and its extent along
-/// the two other axes.
+/// the two other axes; for a LOD bank, how high the eye must be for it to be drawn.
 #[derive(Clone, Copy, Debug)]
 struct Rect {
     n: usize,
@@ -26,12 +27,15 @@ struct Rect {
     sign: f64,
     u: (usize, f64, f64),
     v: (usize, f64, f64),
+    bank: Option<f64>,
 }
 
 impl Rect {
     /// `q` of a mesh whose cell `(0, 0, 0)` starts at `origin`, cells `cell` blocks wide.
     /// A fluid surface quad of full detail (`SHAPE_FLUID_SURFACE`) has its top 0.875 up its
-    /// cell.
+    /// cell. A LOD bank lies on its cell's side away from its normal, and one on a side is drawn
+    /// only for an eye above its top (`lod_common.wgsl`); drawn behind everything, it stops a
+    /// ray only where nothing else would (nothing lies past a crack test's point in the ground).
     fn of(q: PackedQuad, origin: [f64; 3], cell: f64) -> Self {
         let face = q.face();
         let (n, ua, va) = face.axes();
@@ -39,7 +43,9 @@ impl Rect {
         let sign = f64::from(normal.x + normal.y + normal.z);
         let p = q.pos().map(f64::from);
         let surface = q.shape() == layout::SHAPE_FLUID_SURFACE;
+        let bank = is_bank(q);
         let positive = match (sign > 0.0, surface && n == 1) {
+            _ if bank => f64::from(u8::from(sign < 0.0)),
             (true, true) => layout::FLUID_SURFACE as f64,
             (true, false) => 1.0,
             _ => 0.0,
@@ -52,18 +58,20 @@ impl Rect {
             };
             (a, origin[a] + p[a] * cell, origin[a] + (p[a] + len) * cell)
         };
+        let v = span(va, q.h());
         Self {
             n,
             plane: origin[n] + (p[n] + positive) * cell,
             sign,
             u: span(ua, q.w()),
-            v: span(va, q.h()),
+            v,
+            bank: bank.then_some(if n == 1 { f64::NEG_INFINITY } else { v.2 }),
         }
     }
 
     /// Where the ray `o + t d` meets the rectangle from its front, `t > 0`.
     fn hit(&self, o: [f64; 3], d: [f64; 3]) -> Option<f64> {
-        if d[self.n] * self.sign >= 0.0 {
+        if d[self.n] * self.sign >= 0.0 || self.bank.is_some_and(|top| o[1] <= top) {
             return None;
         }
         self.crosses(o, d)
@@ -504,5 +512,47 @@ fn no_ray_slips_between_demo_chunks_and_level_one() {
             |o, d| rects.slips(o, d),
         );
         assert_none(&format!("column {column:?}, from under the sea"), &slipped);
+    }
+}
+
+#[test]
+fn no_ray_slips_from_demo_level_one_into_chunks() {
+    let r = boxel_demo::blocks::registry();
+    let m = LodMaterials::from_registry(&r);
+    let world = ForestGenerator::default();
+    // The other way from the steady view (a chunk at the loading edge drawn by level 1 with a
+    // meshed one behind it): full detail draws the node's octant (1, 1, 0), the chunk at x 32..64
+    // and y 32..64, over the seas of the test above; rays from above the level-1 terrain at
+    // x < 32, its water included, into the ground of the chunk.
+    for column in [[-53, 20], [-53, -48], [-60, -20]] {
+        let origin = [column[0] * 64, 0, column[1] * 64];
+        let coarse = node(&world, &r, 1, [column[0], 0, column[1]]).expect("terrain");
+        let chunk = [column[0] * 2 + 1, 1, column[1] * 2];
+        let mut rects = rects(
+            &chunk_mesh(&world, &r, chunk),
+            [32.0, 32.0, 0.0],
+            1.0,
+            false,
+            |_| false,
+        );
+        rects.extend(node_rects(&coarse, &m, 1, [0.0; 3], 0b0000_1000));
+        let mut n = Numbers(17);
+        let into_ground = |n: &mut Numbers| {
+            let (tx, tz) = (n.between(33.0, 63.0), n.between(2.0, 30.0));
+            let (x, z) = (origin[0] + tx as i64, origin[2] + tz as i64);
+            let top = (f64::from(world.terrain.height_at(x, z)) + 1.0).min(64.0);
+            (top > 33.0).then(|| [tx, n.between((top - 8.0).max(32.5), top - 0.01), tz])
+        };
+        let above = |n: &mut Numbers| {
+            let (x, z) = (n.between(1.0, 31.0), n.between(2.0, 30.0));
+            let top = cell_top(&coarse, &m, (x / 2.0) as i32, (z / 2.0) as i32, 2.0, false);
+            (top < 62.0).then(|| [x, n.between(top + 0.01, 63.0), z])
+        };
+        let slipped = cast(
+            10_000,
+            || Some((above(&mut n)?, into_ground(&mut n)?)),
+            |o, d| rects.slips(o, d),
+        );
+        assert_none(&format!("column {column:?}, into the chunk"), &slipped);
     }
 }

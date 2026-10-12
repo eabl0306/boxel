@@ -2,8 +2,9 @@
 //! splits, the bed under water, skirts, walls), on `test:` blocks. `test:fluid` is see-through
 //! (translucent, like water), `test:hot` opaque (like lava).
 use boxel_mesh::lod::{
-    LOD_PALETTE, LodMaterials, MAX_DARK, Seam, add_fluid_walls, add_skirts, add_underwater,
-    dark_of, fits, mesh_node, octant_of, seam_counts, seam_of, split_octants, water_seams,
+    LOD_PALETTE, LodMaterials, MAX_DARK, Seam, add_banks, add_fluid_walls, add_skirts,
+    add_underwater, dark_of, fits, is_bank, mesh_node, octant_of, seam_counts, seam_of,
+    split_octants, water_seams,
 };
 use boxel_mesh::{
     AoPolicy, ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher, PADDED_VOLUME, PackedQuad,
@@ -217,7 +218,7 @@ fn octant(p: [u32; 3]) -> u8 {
 }
 
 /// A quad as a rectangle in space: its face's axis, plane and direction, and its extent along
-/// the two other axes.
+/// the two other axes; for a LOD bank, how high the eye must be for it to be drawn.
 #[derive(Clone, Copy, Debug)]
 struct Rect {
     n: usize,
@@ -225,11 +226,16 @@ struct Rect {
     sign: f64,
     u: (usize, f64, f64),
     v: (usize, f64, f64),
+    bank: Option<f64>,
 }
 
 impl Rect {
     /// `q` of a mesh whose cell `(0, 0, 0)` starts at `origin`, cells `cell` blocks wide. A
     /// fluid surface quad of full detail (`SHAPE_FLUID_SURFACE`) has its top 0.875 up its cell.
+    /// A LOD bank lies on its cell's side away from its normal, and one on a side is drawn only
+    /// for an eye above its top (`lod_common.wgsl`); it is drawn behind everything, so it stops
+    /// a ray only where nothing else would (a crack test's ray into the ground meets nothing
+    /// past it).
     fn of(q: PackedQuad, origin: [f64; 3], cell: f64) -> Self {
         let face = q.face();
         let (n, ua, va) = face.axes();
@@ -237,7 +243,9 @@ impl Rect {
         let sign = f64::from(normal.x + normal.y + normal.z);
         let p = q.pos().map(f64::from);
         let surface = q.shape() == layout::SHAPE_FLUID_SURFACE;
+        let bank = is_bank(q);
         let positive = match (sign > 0.0, surface && face == Face::PosY) {
+            _ if bank => f64::from(u8::from(sign < 0.0)),
             (true, true) => layout::FLUID_SURFACE as f64,
             (true, false) => 1.0,
             _ => 0.0,
@@ -250,18 +258,20 @@ impl Rect {
             };
             (a, origin[a] + p[a] * cell, origin[a] + (p[a] + len) * cell)
         };
+        let v = span(va, q.h());
         Self {
             n,
             plane: origin[n] + (p[n] + positive) * cell,
             sign,
             u: span(ua, q.w()),
-            v: span(va, q.h()),
+            v,
+            bank: bank.then_some(if n == 1 { f64::NEG_INFINITY } else { v.2 }),
         }
     }
 
     /// Where the ray `o + t d` meets the rectangle from its front, `t > 0`.
     fn hit(&self, o: [f64; 3], d: [f64; 3]) -> Option<f64> {
-        if d[self.n] * self.sign >= 0.0 {
+        if d[self.n] * self.sign >= 0.0 || self.bank.is_some_and(|top| o[1] <= top) {
             return None;
         }
         self.crosses(o, d)
@@ -598,6 +608,68 @@ proptest! {
     }
 
     #[test]
+    fn banks_face_into_water_on_ground_by_every_plane(
+        scene in scene_strategy(),
+        smooth in 1usize..9,
+        level in 1u8..=6,
+    ) {
+        let r = testing::registry();
+        let m = LodMaterials::from_registry(&r);
+        let cells = scene_cells(&r, &scene.0, &scene.1, smooth);
+        let (padded, mut mesh) = plain_mesh(&m, &cells);
+        split_octants(&mut mesh);
+        add_skirts(&padded, &m, level, &mut mesh);
+        add_fluid_walls(&padded, &m, level, &mut mesh);
+        let before = mesh.clone();
+        add_banks(&padded, &m, level, &mut mesh);
+        let state = |c: [i32; 3]| cells[index(c[0], c[1], c[2])];
+        // A see-through cell by a plane, on ground: on its bottom toward a y plane, on its side
+        // toward an x or z plane with ground across, or a see-through cell on ground; the bank
+        // faces back into it.
+        let expected: BTreeSet<([u32; 3], Face)> = plane_cells()
+            .into_iter()
+            .filter(|&(c, face, across)| {
+                let under = |c: [i32; 3]| ground_state(&m, state([c[0], c[1] - 1, c[2]]));
+                clear_state(&m, state(c))
+                    && match face {
+                        Face::PosY => false,
+                        Face::NegY => ground_state(&m, state(across)),
+                        _ if clear_state(&m, state(across)) => under(c) && under(across),
+                        _ => under(c) && ground_state(&m, state(across)),
+                    }
+            })
+            .map(|(c, f, _)| (c.map(|a| a as u32), f.opposite()))
+            .collect();
+        prop_assert_eq!(added(&before, &mesh), expected);
+        let new: Vec<PackedQuad> = mesh.quads[..]
+            .iter()
+            .copied()
+            .filter(|q| !before.quads.contains(q))
+            .collect();
+        prop_assert!(before.quads.iter().all(|&q| !is_bank(q)));
+        for q in new {
+            // In the bucket of its face, always drawn, on a plane.
+            prop_assert!(is_bank(q), "{:?}", q);
+            let b = (0..6).find(|&b| mesh.bucket(b).contains(&q));
+            prop_assert_eq!(b, Some(q.face().index()));
+            prop_assert_eq!(seam_of(q), Seam::None);
+            let (na, _, _) = q.face().axes();
+            prop_assert!([0, 15, 16, 31].contains(&q.pos()[na]), "{:?}", q);
+            for (p, f) in q.unit_faces() {
+                let c = p.map(|a| a as i32);
+                prop_assert_eq!(octant(p), octant_of(q));
+                // The ground under the cell, lit as deep as the cell.
+                let under = m.canonical(state([c[0], c[1] - 1, c[2]]));
+                prop_assert_eq!(q.layer(), m.table().layer(under, f));
+                prop_assert_eq!(dark_of(q), dark_at(&cells, &m, level, c), "{:?}", q);
+            }
+        }
+        let top = mesh.quads.iter().map(|q| usize::from(q.light_index())).max();
+        prop_assert!(top.is_none_or(|t| t < mesh.palette.len()));
+        prop_assert_eq!(mesh.hash, mesh.compute_hash());
+    }
+
+    #[test]
     fn post_pass_faces_are_never_seen_from_inside_a_drawn_node(
         scene in scene_strategy(),
         smooth in 1usize..9,
@@ -617,9 +689,9 @@ proptest! {
         let mut full = ChunkMesh::default();
         mesh_node(&mut Mesher::new(), &padded, &m, level, &mut full);
         // Cubes only, each opaque one in the bucket of its face and the see-through fluid's in
-        // the translucent bucket, the surfaces first, then the post-pass quads on a node face,
-        // then those on a middle plane (and those planes only), which `seam_counts` and
-        // `water_seams` find; open sky only.
+        // the translucent bucket, the surfaces (and banks) first, then the post-pass quads on a
+        // node face, then those on a middle plane (and those planes only), which `seam_counts`
+        // and `water_seams` find; open sky only.
         prop_assert_eq!(full.bucket_counts[6], 0);
         let seams = seam_counts(&full);
         for b in [0, 1, 2, 3, 4, 5, TRANSLUCENT_BUCKET] {
@@ -643,18 +715,22 @@ proptest! {
             let count = |seam| quads.iter().filter(|&&q| seam_of(q) == seam).count() as u32;
             let at_end = if b < 6 { seams[b] } else { water_seams(&full) };
             prop_assert_eq!(at_end, [count(Seam::Face), count(Seam::Middle)]);
+            let banks = quads.iter().filter(|&&q| is_bank(q)).count() as u32;
             prop_assert_eq!(
-                quads.len() as u32 - at_end[0] - at_end[1],
+                quads.len() as u32 - at_end[0] - at_end[1] - banks,
                 plain.bucket_counts[b],
-                "the post-passes add only seam quads"
+                "the post-passes add only seam quads and banks"
             );
         }
         prop_assert!(plain.quads.iter().all(|&q| seam_of(q) == Seam::None));
-        let palette: &[_] = if full.quads.is_empty() { &[] } else { &LOD_PALETTE };
-        prop_assert_eq!(&full.palette[..], palette);
+        // Open sky for every light palette index the quads use, and no more.
+        let top = full.quads.iter().map(|q| usize::from(q.light_index()) + 1).max();
+        prop_assert_eq!(&full.palette[..], &LOD_PALETTE[..top.unwrap_or(0)]);
+        // Without the banks: drawn behind everything, they show only where a ray leaves the
+        // node and meets nothing past it (`banks_close_the_ground_the_cell_rule_drops`).
         let (a, b) = (
             rects(&plain, [0.0; 3], 1.0, |_| false),
-            rects(&full, [0.0; 3], 1.0, |_| false),
+            rects(&full, [0.0; 3], 1.0, is_bank),
         );
         for ((x, y, z), (dx, dy, dz)) in rays {
             // From air or from inside the see-through fluid.
@@ -1055,12 +1131,15 @@ impl Terrain {
         ChunkData::from_dense(&dense)
     }
 
-    /// The full-detail mesh of chunk `(0, 0, 0)`, its neighbors as they are.
-    fn chunk_mesh(&self, r: &BlockRegistry) -> ChunkMesh {
-        let center = self.chunk(r, [0; 3]);
+    /// The full-detail mesh of chunk `c`, its neighbors as they are.
+    fn chunk_mesh(&self, r: &BlockRegistry, c: [i64; 3]) -> ChunkMesh {
+        let center = self.chunk(r, c);
         let neighbors: Vec<ChunkData> = NEIGHBOR_OFFSETS
             .iter()
-            .map(|d| self.chunk(r, [i64::from(d.x), i64::from(d.y), i64::from(d.z)]))
+            .map(|d| {
+                let d = [d.x, d.y, d.z].map(i64::from);
+                self.chunk(r, [c[0] + d[0], c[1] + d[1], c[2] + d[2]])
+            })
             .collect();
         let input = MeshInput {
             center: &center,
@@ -1097,7 +1176,7 @@ fn no_ray_slips_between_full_detail_and_level_one() {
         let coarse = terrain.cells(&r, &m, 1, [0; 3]);
         // Full detail draws chunk (0, 0, 0), the level-1 node's octant 0: its opaque faces stop a
         // ray, and its translucent fluid tints it.
-        let near = terrain.chunk_mesh(&r);
+        let near = terrain.chunk_mesh(&r, [0; 3]);
         let mut opaque = rects(&near, [0.0; 3], 1.0, |_| false);
         let near_water = water_rects(&near, [0.0; 3], 1.0, false, |_| false);
         let (o1, far_water) = node_rects(&coarse, &m, 1, [0; 3], 0b0000_0001);
@@ -1190,6 +1269,128 @@ fn no_ray_slips_between_full_detail_and_level_one() {
             &format!("basin {basin:?}, from under the sea"),
             found,
             10_000,
+        );
+    }
+}
+
+/// Casts rays into the near ground of full-detail chunk `chunk` (under its true top, at most 8
+/// blocks) from above the level-1 terrain of `nodes` (`(origin, hidden octants)`, their water
+/// included), over `x` and `z` in `starts`; asserts every ray meets an opaque face first. The
+/// other way from the steady view: the full-detail region is convex around the eye, so a ray from
+/// it never comes back into it, but a chunk left unmeshed or refused at the loading edge is drawn
+/// by level 1 with a meshed one behind it. (Not from inside the far water: a bank on a side shows
+/// only to an eye above its top.)
+fn assert_far_to_near(
+    what: &str,
+    r: &BlockRegistry,
+    m: &LodMaterials,
+    terrain: &Terrain,
+    chunk: [i64; 3],
+    nodes: &[([i64; 3], u8)],
+    starts: ([f64; 2], [f64; 2]),
+) {
+    let any = |s: BlockState| m.canonical(s) != 0;
+    let corner = chunk.map(|c| (c * 32) as f64);
+    let mut opaque = rects(&terrain.chunk_mesh(r, chunk), corner, 1.0, |_| false);
+    let cells: Vec<_> = nodes
+        .iter()
+        .map(|&(origin, hidden)| {
+            let cells = terrain.cells(r, m, 1, origin);
+            opaque.extend(node_rects(&cells, m, 1, origin, hidden).0);
+            (origin, cells)
+        })
+        .collect();
+    // The far cell column under `(x, z)`: its node's cells and the column there.
+    let column = |x: f64, z: f64| {
+        cells.iter().find_map(|(o, cells)| {
+            let (cx, cz) = ((x - o[0] as f64) / 2.0, (z - o[2] as f64) / 2.0);
+            ((0.0..32.0).contains(&cx) && (0.0..32.0).contains(&cz))
+                .then(|| (o[1] as f64, cells, cx as i32, cz as i32))
+        })
+    };
+    let mut n = Numbers(13);
+    let into_ground = |n: &mut Numbers| {
+        let (tx, tz) = (
+            n.between(corner[0] + 1.0, corner[0] + 31.0),
+            n.between(corner[2] + 2.0, corner[2] + 30.0),
+        );
+        let top = ((terrain.top(tx as i64, tz as i64) + 1) as f64).min(corner[1] + 32.0);
+        [
+            tx,
+            n.between((top - 8.0).max(corner[1] + 0.5), top - 0.01),
+            tz,
+        ]
+    };
+    let (xs, zs) = starts;
+    let start = |n: &mut Numbers| (n.between(xs[0], xs[1]), n.between(zs[0], zs[1]));
+    let above = |n: &mut Numbers| {
+        let (x, z) = start(n);
+        let (y0, cells, cx, cz) = column(x, z)?;
+        let top = y0 + top_of(cells, cx, cz, 2.0, any);
+        (top < y0 + 62.0).then(|| [x, n.between(top + 0.01, y0 + 63.0), z])
+    };
+    let found = cast(
+        10_000,
+        || Some((above(&mut n)?, into_ground(&mut n))),
+        slips(&opaque),
+    );
+    assert_none(&format!("{what}, from above"), found, 10_000);
+}
+
+/// Banks close the ground the cell rule drops under far water (a sea over a bed in the lower
+/// block of a cell keeps the cell water) where a ray through the far water crosses into full
+/// detail: across a middle plane of the level-1 node, across a node face, and down through a
+/// y plane onto a hidden chunk under the far water.
+#[test]
+fn banks_close_the_ground_the_cell_rule_drops() {
+    let r = testing::registry();
+    let m = LodMaterials::from_registry(&r);
+    // Seas 8 to 14 blocks deep (even and odd tops) across x = 32, their beds sloping either way.
+    for (basin, sea, amplitude) in [
+        ((32.0, 16.0, 12.0), 18, 0.5),
+        ((24.0, 16.0, 16.0), 18, 0.5),
+        ((40.0, 16.0, 16.0), 18, 0.5),
+        ((20.0, 20.0, 20.0), 24, 0.3),
+        ((44.0, 10.0, 20.0), 24, 0.8),
+        ((32.0, 16.0, 12.0), 17, 0.5),
+        ((44.0, 10.0, 20.0), 23, 0.8),
+    ] {
+        let terrain = Terrain::new(20.0, amplitude, basin, sea);
+        // Full detail draws chunk (1, 0, 0), the node's octant 1, across its middle plane.
+        assert_far_to_near(
+            &format!("middle plane, basin {basin:?} sea {sea}"),
+            &r,
+            &m,
+            &terrain,
+            [1, 0, 0],
+            &[([0; 3], 0b0000_0010)],
+            ([1.0, 31.0], [2.0, 30.0]),
+        );
+        // The same seas moved 32 blocks on: full detail draws chunk (2, 0, 0), octant 0 of the
+        // node at x = 64, across the face of the node at x = 0.
+        let moved = Terrain::new(20.0, amplitude, (basin.0 + 32.0, basin.1, basin.2), sea);
+        assert_far_to_near(
+            &format!("node face, basin {basin:?} sea {sea}"),
+            &r,
+            &m,
+            &moved,
+            [2, 0, 0],
+            &[([0; 3], 0), ([64, 0, 0], 0b0000_0001)],
+            ([33.0, 63.0], [2.0, 30.0]),
+        );
+    }
+    // A sea over a bed around y 32: full detail draws chunk (0, 0, 0), the node's octant 0, and
+    // the node the far water over it.
+    for (basin, sea) in [((16.0, 16.0, 6.0), 38), ((24.0, 8.0, 8.0), 39)] {
+        let terrain = Terrain::new(33.0, 0.3, basin, sea);
+        assert_far_to_near(
+            &format!("y plane, basin {basin:?} sea {sea}"),
+            &r,
+            &m,
+            &terrain,
+            [0, 0, 0],
+            &[([0; 3], 0b0000_0001)],
+            ([1.0, 63.0], [2.0, 30.0]),
         );
     }
 }

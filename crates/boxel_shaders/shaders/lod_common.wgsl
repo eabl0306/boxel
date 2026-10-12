@@ -3,13 +3,13 @@
 //
 // A node is a 32^3 grid of cells of 2^k blocks (level k). Its quads are ordinary PackedQuads in
 // cells (cubes only, AO open); with no light, a quad's light palette index holds its seam (bits
-// 0-1) and its darkness under water (bits 2-5, boxel_mesh::lod::dark_of). The vertex shader
-// scales a quad to blocks and collapses the quads of the octants finer detail draws; the
-// fragment shader colors a face with the 1x1 mip of its texture layer (the texture's mean, tint
-// included), lit as open sky (less its darkness), fogged like the terrain. The water bucket
-// (issue #50) is drawn translucent, one layer per pixel: a depth prepass, then its color where
-// the depth is its own (lod_water_vertex). Both pipelines run these same functions on the same
-// quads, so they draw the same pixels.
+// 0-1), its darkness under water (bits 2-5, boxel_mesh::lod::dark_of) and its bank flag (bit 6,
+// boxel_mesh::lod::is_bank). The vertex shader scales a quad to blocks and collapses the quads
+// of the octants finer detail draws; the fragment shader colors a face with the 1x1 mip of its
+// texture layer (the texture's mean, tint included), lit as open sky (less its darkness),
+// fogged like the terrain. The water bucket (issue #50) is drawn translucent, one layer per
+// pixel: a depth prepass, then its color where the depth is its own (lod_water_vertex). Both
+// pipelines run these same functions on the same quads, so they draw the same pixels.
 //
 // Exactly ONE uniform block (View) and ONE texture, no sampler (textureLoad), like Low (ADR 0011).
 //
@@ -30,6 +30,11 @@ const LOD_SEAM_SHIFT: u32 = 20u;
 // A quad's darkness: bits 2-5 of its light palette index (boxel_mesh::lod::DARK_SHIFT).
 const LOD_DARK_SHIFT: u32 = 22u;
 const LOD_DARK_MASK: u32 = 15u;
+// A bank: bit 6 of its light palette index (boxel_mesh::lod::BANK_BIT).
+const LOD_BANK_BIT: u32 = 0x4000000u;
+// The depth of a bank (reverse-Z, a share of its w): 2^-30, behind anything nearer than 2^30
+// times the near plane, in front of the sky (0).
+const LOD_BANK_DEPTH: f32 = 9.313225746154785e-10;
 // LodOut::bits of a LOD quad: the texture layer (bits 0-11), its face (12-14), then the color
 // mip, the tint flag, the emissive flag, the level and the darkness (flat, for the fragment).
 const LOD_OUT_FACE_SHIFT: u32 = 12u;
@@ -60,6 +65,11 @@ struct LodOut {
 // layer under the finer water, and it is shaded as the top it continues. Where the finer top
 // lies higher in that cell (near water whose top block is the cell's upper one), the skirt
 // under it is a second layer: the LOD does not know the finer top (ADR 0031, known limits).
+//
+// A bank (opaque, boxel_mesh::lod::add_banks) lies on its cell's side away from its normal and
+// gets LOD_BANK_DEPTH: it shows only where nothing else is drawn, the sky through ground the
+// cell rule dropped. One on a side is collapsed unless the eye is above its top, so every ray
+// that meets it goes down past it, into the bed or the ground beyond.
 fn lod_vertex(q: vec2<u32>, corner: u32, node: vec4<i32>, water: bool) -> LodOut {
   let w = u32(node.w);
   let k = u32(node.x) & LOD_LEVEL_MASK;
@@ -76,9 +86,11 @@ fn lod_vertex(q: vec2<u32>, corner: u32, node: vec4<i32>, water: bool) -> LodOut
   if (dot(cross(u, v), n) < 0.0) { if (c == 1u) { c = 2u; } else if (c == 2u) { c = 1u; } }
   let cu = f32(c & 1u);
   let cv = f32(c >> 1u);
+  let bank = !water && (q.y & LOD_BANK_BIT) != 0u;
   // Cells to blocks: exact in f32 (at most 32 * 2^15). The edge growth works in blocks on
   // screen, so it is the same at every level.
-  var local = (p + max(n, vec3(0.0)) + u * (cu * qw) + v * (cv * qh)) * f32(1u << k);
+  let scale = f32(1u << k);
+  var local = (p + max(select(n, -n, bank), vec3(0.0)) + u * (cu * qw) + v * (cv * qh)) * scale;
   // A side's v is y; a skirt is one cell tall (only the top cell of a fluid has one).
   let skirt = water && f >= 2u && ((q.y >> LOD_SEAM_SHIFT) & 3u) != 0u;
   if (skirt && c < 2u) {
@@ -86,17 +98,23 @@ fn lod_vertex(q: vec2<u32>, corner: u32, node: vec4<i32>, water: bool) -> LodOut
   }
   let origin = vec3(node.x & ~i32(LOD_LEVEL_MASK), node.y, node.z);
   // finish_vertex: the wrapping i32 subtraction first, then the edge growth.
-  let rel = vec3<f32>(origin - view.render_origin.xyz) + local;
+  let base = vec3<f32>(origin - view.render_origin.xyz);
+  let rel = base + local;
   let clip = view.view_proj * vec4(rel, 1.0);
   let axis_u = select(view.view_proj[0], view.view_proj[2], f == 2u || f == 3u);
   let axis_v = select(view.view_proj[1], view.view_proj[2], f < 2u);
   let t = vec2(2.0 * cu - 1.0, 2.0 * cv - 1.0) * edge_growth(clip, axis_u, axis_v, 0.5 * view.viewport.xy);
   var o: LodOut;
   o.clip = clip + axis_u * t.x + axis_v * t.y;
+  if (bank) {
+    o.clip.z = o.clip.w * LOD_BANK_DEPTH;
+  }
   let oct = ((geo >> LOD_OCTANT_X_SHIFT) & 1u)
     | (((geo >> LOD_OCTANT_Y_SHIFT) & 1u) << 1u)
     | (((geo >> LOD_OCTANT_Z_SHIFT) & 1u) << 2u);
-  if (((w >> oct) & 1u) != 0u) {
+  // A bank on a side (v is y) with the eye at or under its top.
+  let low_eye = bank && f >= 2u && view.camera_rel.y <= base.y + (p.y + qh) * scale;
+  if (((w >> oct) & 1u) != 0u || low_eye) {
     // Hidden: every corner at one point outside the depth range, the whole quad is clipped.
     o.clip = vec4(0.0, 0.0, -1.0, 1.0);
   }

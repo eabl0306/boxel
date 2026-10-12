@@ -1649,6 +1649,106 @@ fn full_detail_and_lod_meet_without_holes() {
     report.finish();
 }
 
+/// Chunks the LOD draws in front of full detail (left unmeshed or refused at the loading edge,
+/// with meshed chunks behind them): the sea pose with the chunk columns one and three ahead of
+/// the eye's taken out of full detail and drawn by their level-1 nodes (across a middle plane
+/// of a node and across a node face). A ray through their far water into the meshed chunks
+/// behind meets the ground the cell rule dropped under that water, where full detail draws no
+/// face: the banks close it (`boxel_mesh::lod::add_banks`; without them 99 pixels show the sky
+/// on the RTX and the 780M). No ground pixel follows the sky's color, and the tiers of an
+/// adapter draw it alike.
+#[test]
+fn a_chunk_drawn_by_the_lod_in_front_of_full_detail_shows_no_sky() {
+    let mut scene: Option<SeamScene> = None;
+    let mut images: Vec<(String, Tier, RgbaImage)> = Vec::new();
+    let mut report = for_every_tier(|gpu, report| {
+        if gpu.gl() {
+            return;
+        }
+        let scene = scene.get_or_insert_with(|| {
+            let sea = &seam_scenes()[0];
+            // The columns of chunks at x -3264 and -3328 (along -x, one and three ahead of the
+            // eye's), at every y.
+            let out = |x: i64| x == SEAM_X + 32 || x == SEAM_X + 96;
+            let gone: Vec<I64Vec3> = sea
+                .chunks
+                .iter()
+                .map(|(origin, _)| *origin)
+                .filter(|o| out(o.x))
+                .collect();
+            assert!(!gone.is_empty(), "no chunk to take out");
+            let mut lod = sea.lod.clone();
+            for op in &mut lod.ops {
+                if let LodOp::Upsert { key, mask, .. } = op
+                    && key.lod == 1
+                {
+                    for o in &gone {
+                        let c = *o / 32;
+                        if (c >> 1) == I64Vec3::new(key.pos.x, key.pos.y, key.pos.z) {
+                            *mask &= !(1 << ((c.x & 1) | (c.y & 1) << 1 | (c.z & 1) << 2));
+                        }
+                    }
+                }
+            }
+            SeamScene {
+                name: "drawn_by_the_lod",
+                chunks: sea
+                    .chunks
+                    .iter()
+                    .filter(|(o, _)| !out(o.x))
+                    .cloned()
+                    .collect(),
+                lod,
+                view: sea.view,
+                with_lod: Arc::clone(&sea.with_lod),
+                without: Arc::clone(&sea.without),
+                ground: sea.ground.clone(),
+                loses: false,
+            }
+        });
+        let what = format!("{} {}: seam {}", gpu.label, gpu.tier, scene.name);
+        let images_of = || -> Result<_, String> {
+            Ok((
+                render_seam(gpu, scene, &scene.with_lod, MAGENTA)?,
+                render_seam(gpu, scene, &scene.with_lod, GREEN)?,
+            ))
+        };
+        let (magenta, green) = match images_of() {
+            Ok(images) => images,
+            Err(e) => {
+                report.fail(format!("{what}: {e}"), &[]);
+                return;
+            }
+        };
+        let name = gpu.name(&format!("seam_{}", scene.name));
+        let sky = format!("{name}_green");
+        report.keep(&[(&name, &magenta), (&sky, &green)]);
+        let found = sky_shows(&magenta, &green, &scene.ground);
+        eprintln!("gpu_lod: {what}: {found} pixels show the sky");
+        if found > 0 {
+            report.fail(
+                format!("{what}: {found} ground pixels show the sky"),
+                &[(&name, &magenta), (&sky, &green)],
+            );
+        }
+        images.push((gpu.label.to_string(), gpu.tier, magenta));
+    });
+    // The best tier of each adapter comes first.
+    for (i, (label, tier, image)) in images.iter().enumerate() {
+        let Some((_, best_tier, best)) = images[..i].iter().find(|(l, _, _)| l == label) else {
+            continue;
+        };
+        report.check_close(
+            &format!("{label}: drawn by the LOD: {tier} vs {best_tier}"),
+            (&format!("{label}_{best_tier}_drawn_by_the_lod"), best),
+            (&format!("{label}_{tier}_drawn_by_the_lod"), image),
+            2,
+            MAX_TIER_DIFF,
+        );
+    }
+    report.finish();
+}
+
 // ---------------------------------------------------------------- far plane and fog
 
 /// While the LOD draws, a chunk past the camera's view distance is drawn (the world side counts

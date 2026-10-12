@@ -150,7 +150,7 @@ sección 12), y estados parecidos se fusionan (`LodMaterials`). Sin luz y sin AO
   detalle completo.
 - **Paredes de agua (solo nivel 1):** caras en esos planos cerca del agua, para que un rayo que
   pasa bajo el agua translúcida cercana no vea el cielo. Con el agua translúcida (sección 12)
-  quedan solo en el suelo, en todos los niveles, y se suma el fondo bajo el agua.
+  quedan solo en el suelo, en todos los niveles, y se suman el fondo bajo el agua y las orillas.
 
 La salida es el `PackedQuad` de siempre (8 bytes), en celdas.
 
@@ -391,7 +391,8 @@ Lo que hace que el agua cercana se vea como se ve, y que el LOD tiene que imitar
   `d = n s - s/2`: la superficie y el fondo de verdad caen dentro de sus celdas, en promedio a
   media celda. La cara se ilumina con luz de cielo `15 - d` (0 desde 15 bloques), como el fondo
   cercano. Va en el índice de paleta de luz del quad, junto a su costura: bits 0 y 1 la costura,
-  2 a 5 la oscuridad. La paleta del LOD tiene 64 entradas de cielo abierto. Se mide dentro del
+  2 a 5 la oscuridad (y el 6 marca las orillas). La paleta de un nodo es de cielo abierto, con
+  tantas entradas como el índice más alto que usan sus quads (a lo sumo 127). Se mide dentro del
   nodo y su borde: es exacta mientras la superficie caiga en el mismo nodo que el fondo (el mar
   del ejemplo, en y 47, cae siempre dentro).
 - **Faldones.** En el agua, solo en la celda de arriba (aire encima) y con algo que no es aire
@@ -406,6 +407,16 @@ Lo que hace que el agua cercana se vea como se ve, y que el LOD tiene que imitar
   suelo junto a uno de los 9 planos, con suelo enfrente, agua a 2 celdas o menos y sin aire cerca.
   Y ahora en todos los niveles: con el agua translúcida, un rayo puede llegar bajo el fondo grueso
   en la costura entre dos niveles, que antes tapaba la superficie opaca.
+- **Orillas** (`add_banks`, de la revisión). La regla 1 deja agua una celda con mar sobre su
+  suelo, así que el fondo lejano puede quedar hasta una celda menos un bloque más abajo que el
+  suelo de verdad. Un rayo que pasa por el agua lejana y cruza a detalle completo en esa franja
+  sigue dentro del suelo verdadero, donde el detalle completo no tiene cara (entre dos bloques de
+  suelo no hay), y ve el cielo. Pasa cuando el LOD dibuja un chunk delante de uno con detalle
+  completo: un chunk sin mallar o rechazado en el borde que carga. Una orilla lo tapa: en los 9
+  planos, cada celda de agua junto al plano que está sobre suelo lleva una cara hacia dentro de
+  ella, en el plano, con el material de ese suelo y la oscuridad de la celda. En su costado si
+  enfrente hay suelo, o agua que también está sobre suelo (con aire, o agua sobre más agua, del
+  otro lado no hay suelo), y en su piso hacia un plano y. Son medio por ciento de los quads.
 
 **Dibujo (`boxel_render::lod`).**
 
@@ -448,6 +459,12 @@ Lo que hace que el agua cercana se vea como se ve, y que el LOD tiene que imitar
   recorte escribe un draw de agua por nodo en una segunda lista por segmento (en los mismos
   buffers, detrás de las listas de caras) y se dibuja con dos `multi_draw_indexed_indirect_count`
   por segmento. Sin agua en ningún nodo no se graba nada de esto.
+- **Las orillas, detrás de todo.** Su profundidad es la del punto más lejano (2^-30 de su w,
+  delante del cielo): solo se ven donde el rayo no encuentra nada más, que es el hueco. Donde el
+  LOD dibuja lo de enfrente quedan detrás del fondo de más allá, y donde lo dibuja el detalle
+  completo ganan sus caras. Por eso no necesitan regla de costura: van en el balde de su cara,
+  después del fondo, y se dibujan siempre. Una orilla de costado solo se dibuja con el ojo más
+  alto que su borde de arriba, así todo rayo que la toca baja y detrás tiene fondo o suelo.
 - **Color.** El agua: la mip de 1x1 de su textura con su alfa (la media, lo que muestrea el agua
   cercana a esa distancia), luz de cielo abierto, la sombra de su cara y la niebla de distancia,
   con la cuenta de `fs_translucent`. El fondo: `level_curve(15 - d)` por la luz del cielo, así el
@@ -621,6 +638,10 @@ rama, una vez, la máquina tranquila. Detalle en
 - Un 4 % más de quads (el fondo bajo el agua) y el agua dibujada dos veces (prepasada y color).
 - El llenado tarda de 0,1 a 0,3 s más en la RTX: un trabajo de columna con agua cuesta más
   (criterion `lod/column` sobre el lago: nivel 1 de 254 a 373 us, nivel 4 de 218 a 337 us).
+- Las orillas de la revisión suman de 0,4 a 0,7 % de quads del LOD en el mundo del ejemplo
+  (niveles 1 a 4, 24 x 24 columnas) y hasta un 19 % en un nodo que es todo lago. El trabajo de la
+  columna del lago pasa de 371 a 400 us (nivel 1) y de 345 a 359 us (nivel 4). Sin smoke de
+  frames: se dibujan siempre, pero detrás de todo, y son medio por ciento de los quads.
 
 ### Ediciones (M2)
 
@@ -854,7 +875,9 @@ intención del plan:
 - **Agua lejana en el borde del detalle completo.** Con el bloque de arriba del agua cercana en
   el bloque de arriba de su celda de nivel 1 (alturas impares), el faldón es una segunda capa de
   1 bloque bajo la superficie cercana (sección 12). Un agua cercana que corre, con la superficie
-  más baja que 0,875, deja una franja sin teñir bajo el faldón.
+  más baja que 0,875, deja una franja sin teñir bajo el faldón. Las orillas no se dibujan para un
+  ojo más bajo que su borde de arriba (dentro del agua lejana, en un chunk que dibuja el LOD), y
+  si detrás del suelo hay algo (el piso de una cueva), en el hueco se ve eso y no la orilla.
 - **Capas de niebla.** Una capa sin bruma que se desvanece al color del cielo en su propio
   alcance deja una franja pálida sobre el terreno lejano (decisión 6). Con bruma la capa sigue
   hasta el horizonte y la franja no aparece (ADR 0032).
@@ -989,9 +1012,16 @@ intención del plan:
 - `boxel_shaders`: las entradas de agua validan y traducen a todos los backends, con la posición
   `@invariant` solo en el agua; los bits de costura y oscuridad iguales a los de `boxel_mesh`;
   `water_quads` contra fuerza bruta en las 256 máscaras.
-- Revisión del agua: la prueba de grietas de la costura suma mares de altura impar: ningún rayo
-  se cuela ni llega sin teñir, con alturas pares ningún rayo cruza dos capas de agua, y con
-  impares la segunda capa queda solo en su banda de 1 bloque (el límite).
+- Revisión del agua: las orillas contra fuerza bruta (proptest, niveles 1 a 6: cada celda de agua
+  sobre suelo junto a un plano, su material y su oscuridad). Pruebas de grietas al revés, desde
+  arriba del LOD hacia el suelo de un chunk con detalle completo, por un plano medio, por una cara
+  de nodo y por un plano y, con mares de alturas pares e impares: sin orillas se cuelan hasta 644
+  rayos de 10.000 (en 13 de los 16 casos), con ellas ninguno. Con la fuente del ejemplo, 32 sin orillas y ninguno con
+  ellas. En `gpu_lod`, la pose del mar con dos columnas de chunks dibujadas por el LOD: sin
+  orillas 99 píxeles muestran el cielo en la RTX y la 780M, con ellas ninguno, y los tiers
+  dibujan igual (0,0000 % en la RTX y la 780M). La prueba de grietas de la costura suma mares de
+  altura impar: ningún rayo se cuela ni llega sin teñir, con alturas pares ningún rayo cruza dos
+  capas de agua, y con impares la segunda capa queda solo en su banda de 1 bloque (el límite).
 - `boxel_render` sin GPU: el balde de agua sube con los de caras, justo detrás; se dibuja aparte,
   sin las costuras que nadie ve; la entrada de High lo lleva; la cuenta de nodos con agua sigue a
   los cambios (máscaras, mallas nuevas, resync).
