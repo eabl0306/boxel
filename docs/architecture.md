@@ -2,7 +2,7 @@
 
 Documento técnico de referencia. Fecha: 2026-10-05. Estado: aprobado para el milestone M0
 (revisión final, después de tres revisiones adversariales del borrador v1).
-Las decisiones puntuales están en `docs/adr/` (0001 a 0032). Durante M0 hubo además una
+Las decisiones puntuales están en `docs/adr/` (0001 a 0033). Durante M0 hubo además una
 especificación para los agentes implementadores (en inglés, en `.scaffold/`), borrada al cerrar M0;
 este documento queda como referencia.
 
@@ -134,6 +134,8 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
   motor: lo usan `boxel_render`, `boxel_shaders` (en tests) y los presets de `boxel_demo`.
 - `boxel_physics` depende de `boxel_world` (lee `ChunkMap`); ni `boxel_world` ni `boxel_render`
   dependen de él. Su núcleo (`boxel_physics::core`) no usa el ECS.
+- `boxel_ui` (ADR 0033) depende solo de `boxel_app`, `boxel_ecs`, `boxel_math` y `boxel_window`.
+  Sus tipos de pintura son datos simples: el renderer los va a leer, nunca al revés.
 - El núcleo del renderer (`VoxelRenderer`) no usa el ECS; el plugin es una capa fina encima.
 
 ---
@@ -161,15 +163,17 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_fog` | niebla y nubes cúbicas sin GPU ni ECS (ADR 0030 y 0032): las capas (`FogLayer`, `validate`), el ruido entero que el shader repite bit a bit, cada capa en enteros chicos relativos al origen de render (`LayerParams`), el perfil de la bruma lejana (`HazeProfile`), la marcha de referencia de los tests y el empaquetado del texel | - |
 | `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::collision`: cubos y cajas que pueden subir media celda, como la valla de 1,5 bloques, más un contorno para apuntar, ADR 0018 y 0026), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas, el integrador de un cuerpo (`step_body`, `predict`), el narrowphase (`shape_contact`) y la grilla del broadphase (`Grid`). Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`; pasos en `FixedPostUpdate`, interpolación en `AfterFixedMainLoop`), `PhysicsQuery` (rayos a vóxeles y cuerpos, cajas, el chequeo para poner bloques), `BodyIndex`, cuerpos (`RigidBody`, `Collider`, `Velocity`, `BodyPosition`, `Contacts`, `Interpolated`, `Teleport`, `Frozen`, `Sleeping`, `ReportContacts`), `CharacterController` (caminar, agacharse con el borde protegido y la caja de 1,5 (`Crouch`), correr con el salto corriendo y el vuelo creativo, ADR 0026), `Projectile`, nadar (`SwimPlugin`, `Swimmer`, ADR 0021; también en bloques con agua, y el vuelo no lo siente) y los mensajes `VoxelImpact`, `CollisionStarted`, `CollisionEnded` y `ProjectileHit`. Los cuerpos quietos se duermen (despiertan con `BlockChanged` y `ChunkDataEvent` del mundo, entre otras cosas) y, con muchos cuerpos despiertos, el paso corre en los hilos de cómputo. Fases P0 a P4 hechas | ecs, app, math, tasks, transform, voxel, world, diagnostic |
 | `boxel_pack` | lector de resource packs de Minecraft Java (formatos ~64 a 120): `pack.mcmeta` con overlays, texturas de bloque PNG a RGBA8 (animaciones `.png.mcmeta`), modelos de bloque con herencia `parent` y variables `#`, blockstates `variants` y `multipart`. Solo datos; `boxel_render` lo usa para las texturas de bloque | (serde, png) |
+| `boxel_ui` | interfaz opcional para juegos (ADR 0033, feature `ui`, fuera de `DefaultPlugins`): escala de GUI entera (`GuiScale`), lista de pintura retenida por capas (`UiDraw`, `UiQuad`, `UiLayer`) con su atlas (`UiAtlas`), sprites estirados, en mosaico y nine-slice, skin procedural (`UiSkin`), fuentes de mapa de bits (`BitmapFont`, `FontBuilder`, `font8x8` de dominio público), widgets declarados por el juego (`Ui`, `Painter`: botón, ciclo, slider, interruptor, etiqueta, tooltip), foco y teclado, `InputCapture`, el rasterizador de referencia en CPU (`raster`) y `UiTester` | app, ecs, math, window |
 | `boxel_demo` | contenido de los ejemplos, fuera del motor (ADR 0029, `publish = false`): bloques y capas (`blocks::registry`, `blocks::builder`), pintor procedural (`textures`), formas y reglas de escaleras, vallas, antorchas, muros y puertas (`shapes`, `rules`), agua y lava (`fluids`), recetas y tintes de packs (`pack`), generadores `TerrainGenerator`, `ForestGenerator` y `OverworldGenerator` con `Sea`, las cuevas y su fuente de LOD (`worldgen`, ADR 0031), presets de niebla y nubes (`fog`, ADR 0030) | voxel, worldgen, pack, fog |
 | `boxel_facade_check` | solo CI: prueba que los derives resuelven `::boxel::ecs` para un usuario que depende solo de `boxel` | fachada |
 | `vendor/*` (7 crates) | ECS y tareas (fork de Bevy) | - |
 
-Features de la fachada: `default = [window, render, voxel, png, debug, physics]`, más `trace`
-(spans de sistemas, implica `debug`), `trace_tracy` (Tracy), `track_location` y `hal` (escape
-hatch Vulkan). `physics` implica `voxel` y expone `boxel::physics`. `debug` hace que los
-diagnósticos del ECS (conflictos B0001, errores de schedule, spans) muestren nombres de sistemas
-y componentes; conviene apagarla en builds de distribución.
+Features de la fachada: `default = [window, render, voxel, png, debug, physics]`, más `trace` (spans
+de sistemas, implica `debug`), `trace_tracy` (Tracy), `track_location`, `hal` (escape hatch Vulkan),
+`pack` (el lector de resource packs) y `ui` (la interfaz, ADR 0033). `physics` implica `voxel` y
+expone `boxel::physics`. `debug` hace que los diagnósticos del ECS (conflictos B0001, errores de
+schedule, spans) muestren nombres de sistemas y componentes; conviene apagarla en builds de
+distribución.
 
 ---
 
