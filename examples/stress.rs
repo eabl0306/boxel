@@ -96,7 +96,7 @@ use boxel::log::span_times::{self, SpanFrame, SpanTimes};
 use boxel::mesh::AoPolicy;
 use boxel::prelude::*;
 use boxel::render::fog::FogResolution;
-use boxel::render::{GpuFailed, TextureSource, TranslucentSort};
+use boxel::render::{DistanceFog, GpuFailed, TextureSource, TranslucentSort};
 use boxel::voxel::{
     BlockPos, BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, LocalPos, MAX_BLOCK_COORD,
 };
@@ -169,6 +169,8 @@ usage: stress [--scenario static|fly|dive|spin|path] [GPU options] [options]
                       --no-cave-culling is off)
   --idle-work on|off  the world's work between frames under --fps-limit (default on, ADR 0023);
                       off: in its frame steps only
+  --no-distance-fog   no fade into the sky at the view distance or the LOD's horizon (the same
+                      cost; not in the summary)
   --pack DIR          block textures from a Minecraft Java resource pack (the directory with
                       pack.mcmeta; default: procedural); the summary records it and its load time
   --water Y           water in every air block at or below height Y (lakes and seas), with a
@@ -282,6 +284,8 @@ struct Options {
     cave_culling: bool,
     /// `--idle-work`: the world's work between frames on (the default) or off.
     idle_work: bool,
+    /// `--no-distance-fog`: `RenderSettings::distance_fog` off.
+    no_distance_fog: bool,
     /// `--pack`.
     textures: TextureSource,
     /// `--bodies`, `--body-kind` and `--projectiles`.
@@ -348,6 +352,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         light: true,
         cave_culling: true,
         idle_work: true,
+        no_distance_fog: false,
         textures: TextureSource::Procedural,
         bodies: BodyOptions::default(),
         water: None,
@@ -525,6 +530,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--no-cave-culling" => o.cave_culling = false,
             "--cave" => o.cave = true,
             "--idle-work" => o.idle_work = on_off(flag, &value()?)?,
+            "--no-distance-fog" => o.no_distance_fog = true,
             "--fog" => o.fog = fog::parse(flag, &value()?)?,
             "--lod" => o.lod = lod::parse(flag, &value()?)?,
             "--fog-res" => o.fog_res = fog::parse_resolution(flag, &value()?)?,
@@ -1690,6 +1696,11 @@ fn main() -> AppExit {
                 max_chunk_slots: chunk_slots,
                 textures: options.textures.clone(),
                 translucent_sort: options.sort,
+                distance_fog: if options.no_distance_fog {
+                    DistanceFog::off()
+                } else {
+                    DistanceFog::default()
+                },
                 ..RenderSettings::default()
             },
         })
@@ -1864,6 +1875,13 @@ mod tests {
         }
         assert!(options(&["--cave-culling=on"]).cave_culling);
         assert!(usage().contains("--cave-culling on|off"));
+    }
+
+    #[test]
+    fn distance_fog_is_on_unless_asked() {
+        assert!(!options(&[]).no_distance_fog);
+        assert!(options(&["--no-distance-fog"]).no_distance_fog);
+        assert!(usage().contains("--no-distance-fog"));
     }
 
     #[test]

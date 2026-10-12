@@ -28,7 +28,9 @@
 //! is filled (within `--timeout`), and a `lod:` line gives its nodes, quads, the edited chunks
 //! it shows (`--fill`, or saved in `--world-dir`) and its fill time.
 //! `--lod-tint` tints each level (F9 in `voxel_world`). `--fixed-height` streams every layer of
-//! the generator and nothing else, as `voxel_world --fixed-height` does.
+//! the generator and nothing else, as `voxel_world --fixed-height` does. `--no-distance-fog`
+//! turns off the fade into the sky at the edge (`RenderSettings::distance_fog`, F10 in
+//! `voxel_world`).
 //!
 //! Exit codes: 0 success, 1 usage error, 2 no usable GPU, or rendering or saving failed, 4 the
 //! world did not settle within the timeout. Set `RUST_LOG` for more logging (default filter `warn`).
@@ -56,9 +58,9 @@ use boxel::prelude::*;
 use boxel::render::fog::{FogInput, FogResolution};
 use boxel::render::lod::{LodInput, LodOp};
 use boxel::render::{
-    BlockOutline, FLUID_TIME_PERIOD, Outline, RenderSettings, RendererConfig, SceneLight,
-    TextureSource, TranslucentSort, ViewParams, VoxelRenderer, block_outline_edges, light_curve,
-    load_block_textures, texture_tick,
+    BlockOutline, DistanceFog, FLUID_TIME_PERIOD, Outline, RenderSettings, RendererConfig,
+    SceneLight, TextureSource, TranslucentSort, ViewParams, VoxelRenderer, block_outline_edges,
+    light_curve, load_block_textures, texture_tick,
 };
 use boxel::voxel::{BlockRegistry, MAX_BLOCK_COORD};
 use boxel::world::lod::{LodOps, LodStats, LodWorldPlugin};
@@ -83,6 +85,8 @@ usage: snapshot --camera X,Y,Z,YAW,PITCH --shot HH:MM=PATH [--shot ...] [options
   --size WxH           image size (default 1280x720)
   --view-distance N    horizontal mesh radius in chunks (default 12, as voxel_world), also the
                        fog distance
+  --no-distance-fog    no fade into the sky at the view distance (or at the LOD's horizon):
+                       the terrain ends with a hard edge (F10 in voxel_world)
   --vertical-radius N  vertical mesh radius in chunks (default 8)
   --fixed-height       stream every layer of the generator and nothing else, whatever the
                        camera height (as voxel_world --fixed-height; needs a world with a floor)
@@ -192,6 +196,8 @@ struct Options {
     lod: lod::LodPreset,
     /// `--lod-tint`.
     lod_tint: bool,
+    /// `--no-distance-fog`: `RenderSettings::distance_fog` off.
+    no_distance_fog: bool,
 }
 
 /// `Ok(None)` for `--help`.
@@ -222,6 +228,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         fog_steps: boxel::fog::DEFAULT_MAX_STEPS,
         lod: lod::LodPreset::Off,
         lod_tint: false,
+        no_distance_fog: false,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -302,6 +309,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--fog" => o.fog = fog::parse(flag, &value()?)?,
             "--lod" => o.lod = lod::parse(flag, &value()?)?,
             "--lod-tint" => o.lod_tint = true,
+            "--no-distance-fog" => o.no_distance_fog = true,
             "--fixed-height" => o.fixed_height = true,
             "--fog-res" => o.fog_res = fog::parse_resolution(flag, &value()?)?,
             "--fog-steps" => o.fog_steps = fog::parse_steps(flag, &value()?)?,
@@ -773,6 +781,12 @@ fn run(
     if let Some(store) = store {
         app.add_plugins(PersistPlugin::new(store));
     }
+    // `--no-distance-fog`: as `RenderSettings::distance_fog` off, for the view and the LOD.
+    let distance_fog = if o.no_distance_fog {
+        DistanceFog::off()
+    } else {
+        DistanceFog::default()
+    };
     // `--lod`: the world side only (no render plugin here); the eye is the viewer, the camera.
     // A shot is one frame: every node goes up in it (the renderer's upload budget is per frame,
     // and with it most nodes of a fresh renderer would wait for later frames, not drawn).
@@ -875,6 +889,7 @@ fn run(
             );
             Some(LodInput {
                 ops: lod_nodes.ops(),
+                fog: distance_fog,
                 ..LodInput::new(settings.clone(), Some(stats.horizon as f32))
             })
         }
@@ -1001,7 +1016,10 @@ fn run(
         ..Camera::default()
     };
     let view = CameraView::compute(&camera, &transform, size.x as f32 / size.y as f32);
-    let settings = RenderSettings::default();
+    let settings = RenderSettings {
+        distance_fog,
+        ..RenderSettings::default()
+    };
     for (hours, path) in &o.shots {
         let (sky_color, light) = scene_light(*hours, &settings);
         let params = ViewParams {
@@ -1022,7 +1040,7 @@ fn run(
         let [r, g, b] = light.sky;
         println!(
             "shot: {} {} sky_light={r:.3},{g:.3},{b:.3} ambient={:.3} mean={:.1} chunks={} \
-             fog={fog_label} fog_layers={} lod={lod_label} lod_draws={}",
+             fog={fog_label} fog_layers={} lod={lod_label} lod_draws={} distance_fog={}",
             TimeOfDay::at_clock(*hours).clock_text(),
             path.display(),
             light.ambient,
@@ -1030,6 +1048,11 @@ fn run(
             renderer.stats().chunks,
             renderer.stats().fog_layers,
             renderer.stats().lod_draws,
+            if settings.distance_fog.enabled {
+                "on"
+            } else {
+                "off"
+            },
         );
     }
     // `--world-dir`: the world is saved by the `Shutdown` schedule (nothing else runs there).
@@ -1090,6 +1113,21 @@ mod tests {
         let mut bad = BASE.to_vec();
         bad.push("--lod-tint");
         assert!(parse(&bad).unwrap_err().contains("--lod"));
+    }
+
+    #[test]
+    fn no_distance_fog_flag() {
+        let o = parse(&BASE).expect("valid").expect("not help");
+        assert!(!o.no_distance_fog, "the distance fog is on unless asked");
+        let mut args = BASE.to_vec();
+        args.push("--no-distance-fog");
+        assert!(
+            parse(&args)
+                .expect("valid")
+                .expect("not help")
+                .no_distance_fog
+        );
+        assert!(usage().contains("--no-distance-fog"));
     }
 
     #[test]

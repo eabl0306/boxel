@@ -64,6 +64,10 @@
 //! 0031, like the Distant Horizons mod); off by default (no LOD plugin at all). F8 cycles far,
 //! extreme, hidden and near, F9 tints each level, F3 shows a `lod` line. Software adapters keep
 //! it off.
+//!
+//! The terrain fades into the sky over the last stretch before the view distance (or the LOD's
+//! horizon): the last 10 %, at most 64 blocks (`RenderSettings::distance_fog`).
+//! `--no-distance-fog` starts without it (a hard edge) and F10 toggles it.
 #![expect(clippy::print_stdout, clippy::print_stderr, reason = "CLI output")]
 
 #[path = "shared/clock.rs"]
@@ -129,6 +133,8 @@ usage: voxel_world [GPU options] [options]
   --seed N                terrain seed
   --view-distance N       mesh radius in chunks (default 12; 6 on a software adapter)
   --vertical-radius N     vertical mesh radius in chunks, up and down (default 8)
+  --no-distance-fog       no fade into the sky at the view distance or the LOD's horizon: the
+                          terrain ends with a hard edge (F10 toggles the fade)
   --fixed-height          stream every layer of the generator and nothing else, whatever the
                           camera height (boxel M0 streaming, for comparisons)
   --size WxH              window size in logical pixels (default 1280x720)
@@ -242,6 +248,8 @@ struct Options {
     fog_steps: u32,
     /// `--lod`.
     lod: lod::LodPreset,
+    /// `--no-distance-fog` clears it: the fade at the view distance (F10 toggles it).
+    distance_fog: bool,
     /// `--world-dir`: where the world is saved.
     world_dir: Option<PathBuf>,
     /// `--camera` was given (a saved camera does not replace it).
@@ -309,6 +317,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         fog_res: boxel::render::fog::FogResolution::Half,
         fog_steps: boxel::fog::DEFAULT_MAX_STEPS,
         lod: lod::LodPreset::Off,
+        distance_fog: true,
         world_dir: None,
         camera_given: false,
     };
@@ -336,6 +345,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--fog-res" => o.fog_res = fog::parse_resolution(flag, &value()?)?,
             "--fog-steps" => o.fog_steps = fog::parse_steps(flag, &value()?)?,
             "--lod" => o.lod = lod::parse(flag, &value()?)?,
+            "--no-distance-fog" => o.distance_fog = false,
             "--timeout" => o.timeout = Some(Duration::from_secs(number(flag, &value()?)?)),
             "--screenshot" => o.screenshot = Some(PathBuf::from(value()?)),
             "--expect-terrain" => o.expect_terrain = true,
@@ -1923,6 +1933,11 @@ fn main() -> AppExit {
                 arena_quads,
                 max_chunk_slots,
                 textures: options.textures.clone(),
+                distance_fog: if options.distance_fog {
+                    DistanceFog::default()
+                } else {
+                    DistanceFog::off()
+                },
                 ..RenderSettings::default()
             },
         })
@@ -2016,6 +2031,7 @@ fn main() -> AppExit {
         .init_resource::<FixedSteps>()
         .add_systems(Startup, spawn_camera)
         .add_systems(FixedUpdate, count_fixed_steps)
+        .add_systems(Update, toggle_distance_fog)
         .add_systems(
             Update,
             (
@@ -2074,6 +2090,28 @@ mod tests {
             LodCycle::new(lod::LodPreset::Near).next(),
             (lod::LodPreset::Far, false)
         );
+    }
+
+    #[test]
+    fn distance_fog_option_and_the_f10_toggle() {
+        assert!(parse(&[]).distance_fog, "on unless asked");
+        assert!(!parse(&["--no-distance-fog"]).distance_fog);
+        assert!(usage().contains("--no-distance-fog"));
+        assert!(usage().contains("F10 toggles"));
+        let mut app = App::new();
+        app.insert_resource(RenderSettings::default())
+            .init_resource::<ButtonInput<KeyCode>>()
+            .add_systems(Update, toggle_distance_fog);
+        let press = |app: &mut App| {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.release(KeyCode::F10);
+            keys.clear_just();
+            keys.press(KeyCode::F10);
+            app.update();
+            app.world().resource::<RenderSettings>().distance_fog
+        };
+        assert_eq!(press(&mut app), DistanceFog::off());
+        assert_eq!(press(&mut app), DistanceFog::default());
     }
 
     #[test]
@@ -3376,6 +3414,17 @@ mod tests {
         assert!(Run::new(parse(&["--duration", "0"])).complete(&info));
         assert!(!Run::new(parse(&["--duration", "3600"])).complete(&info));
     }
+}
+
+/// F10: the distance fog on or off (`RenderSettings::distance_fog`; `--no-distance-fog` starts
+/// with it off), named in the log.
+fn toggle_distance_fog(keys: Res<ButtonInput<KeyCode>>, mut settings: ResMut<RenderSettings>) {
+    if !keys.just_pressed(KeyCode::F10) {
+        return;
+    }
+    let fog = &mut settings.distance_fog;
+    fog.enabled = !fog.enabled;
+    eprintln!("distance fog: {}", on_off(fog.enabled));
 }
 
 /// The fog preset F7 shows (`--fog`; only while the fog plugin is on).
