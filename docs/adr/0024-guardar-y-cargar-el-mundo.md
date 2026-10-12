@@ -281,7 +281,10 @@ marcador `Crate`, como haría un juego.
   - si esa escritura falla, al reintentar se toma la foto otra vez: la vieja no se escribe junto
     a chunks más nuevos (test).
 - **Salida** (schedule `Shutdown`, que corren los dos runners): espera el job en curso y escribe
-  todo lo que queda en el hilo principal, que ya no dibuja.
+  todo lo que queda en el hilo principal, que ya no dibuja. Después cierra el store
+  (`WorldStore::close`, issue #58): redb escribe su cierre limpio y suelta el archivo aunque algún
+  job guarde un clon, así un relanzamiento lo abre enseguida y sin reparar. Las operaciones
+  posteriores fallan en silencio con `NotConnected`.
 
 La carga y la escritura usan la maquinaria de jobs de siempre (`JobExecutor`, con
 `IoTaskPoolExecutor` nuevo para las escrituras), así los tests corren todo en línea y son
@@ -291,9 +294,9 @@ deterministas.
 
 - `boxel_world::persist`: `ChunkStore` (ahora con `keys`, `load_meta` y `save_batch` de un
   `SaveBatch` de chunks y metadatos), `RedbStore`, `MemoryStore`, `NullChunkStore`,
-  `WorldStore` (`open`, `open_dir`, `meta`, `put_meta`, `stats`, `ids`), `PersistPlugin`
-  (después de `WorldPlugin`), `PersistSettings`, `PersistStats`, `PersistError`, `IdMap` y
-  `format` (claves, registros).
+  `WorldStore` (`open`, `open_dir`, `meta`, `put_meta`, `stats`, `ids`, `close`), `PersistPlugin`
+  (después de `WorldPlugin`), `WorldShutdownSystems`, `PersistSettings`, `PersistStats`,
+  `PersistError`, `IdMap` y `format` (claves, registros).
 - Un `WorldStore` sirve a un solo `PersistPlugin`. Una `App` nueva abre el mundo otra vez: un
   segundo plugin con el mismo store (o un clon) entra en pánico, porque empezaría sin el índice
   de chunks guardados y guardaría copias generadas encima de ellos (test).

@@ -101,7 +101,7 @@ use boxel::voxel::rules;
 use boxel::voxel::{Axis, BlockRegistry, Facing, MAX_BLOCK_COORD, SlabHalf};
 use boxel::window::winit::dpi::PhysicalSize;
 use boxel::window::{PrimaryWindow, WindowResized};
-use boxel::world::persist::{PersistPlugin, PersistSettings, WorldStore};
+use boxel::world::persist::{PersistPlugin, PersistSettings, WorldShutdownSystems, WorldStore};
 use boxel::world::{
     BlockEdit, BlockUses, FluidPlugin, TimeOfDay, WorldContent, WorldStats, WorldSystems,
 };
@@ -2014,7 +2014,8 @@ fn main() -> AppExit {
     }
     if let Some(store) = store {
         app.add_plugins(PersistPlugin::new(store))
-            .add_systems(Shutdown, save_camera);
+            // Before the exit closes the store.
+            .add_systems(Shutdown, save_camera.before(WorldShutdownSystems::Close));
         // `--time` sets the clock: the saved one neither replaces it nor is replaced by it.
         if options.time.is_some() {
             app.insert_resource(PersistSettings {

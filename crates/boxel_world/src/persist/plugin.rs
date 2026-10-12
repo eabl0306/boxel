@@ -41,12 +41,26 @@ impl Default for PersistSettings {
     }
 }
 
+/// The `Shutdown` sets of [`PersistPlugin`], chained: the exit save, then the store's close.
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WorldShutdownSystems {
+    /// Waits for the running save, then writes the saved entities, every loaded chunk with
+    /// edits, what is still staged, the pending ticks and the clock, on this thread.
+    Save,
+    /// Closes the [`WorldStore`] ([`WorldStore::close`]): the file is closed cleanly and
+    /// released before the app returns, whoever still holds a clone. An app's own `Shutdown`
+    /// system that writes the store ([`WorldStore::put_meta`]) goes `.before(Close)`: after it,
+    /// the write fails with the closed error.
+    Close,
+}
+
 /// Saves and loads the world of [`WorldPlugin`](crate::WorldPlugin) (add it after that one) in
 /// `store` (ADR 0024):
 ///
 /// - A chunk with edits is saved when it unloads, by the autosave
 ///   ([`PersistSettings::autosave`]) and on exit (the `Shutdown` schedule, which the runners
-///   run). Chunks nobody edited are never saved: they come from the generator again.
+///   run). Chunks nobody edited are never saved: they come from the generator again. The exit
+///   then closes the store ([`WorldShutdownSystems`]).
 /// - A saved chunk is loaded instead of generated, in the chunk's generation job. A sky walk
 ///   (the light's sky tops, ADR 0015) reads saved chunks too, so the light of a saved world is
 ///   the light it had.
@@ -117,9 +131,18 @@ impl Plugin for PersistPlugin {
             .add_systems(Update, save_step.after(WorldSystems::Visibility))
             // Like the other board lines: its order does not matter.
             .add_systems(Last, publish_save_stats.ambiguous_with_all())
+            .configure_sets(
+                Shutdown,
+                (WorldShutdownSystems::Save, WorldShutdownSystems::Close).chain(),
+            )
             .add_systems(
                 Shutdown,
-                (save_entities_on_exit, save_on_exit).chain(),
+                (
+                    (save_entities_on_exit, save_on_exit)
+                        .chain()
+                        .in_set(WorldShutdownSystems::Save),
+                    close_store_on_exit.in_set(WorldShutdownSystems::Close),
+                ),
             );
     }
 }
@@ -240,6 +263,16 @@ fn save_on_exit(
     match p.save_now(settings.max_batch) {
         Ok(()) => tracing::info!(stats = ?p.store.stats(), "world saved"),
         Err(e) => tracing::error!("the world could not be saved: {e}"),
+    }
+}
+
+/// `Shutdown`, after the exit save: closes the store on this thread, so the file is closed
+/// cleanly and released before the app returns (a relaunch opens it at once, without a repair),
+/// whoever still holds a clone of it.
+fn close_store_on_exit(store: Res<WorldStore>) {
+    match store.close() {
+        Ok(()) => tracing::debug!(handles = store.handles(), "the world store is closed"),
+        Err(e) => tracing::error!("the world store could not be closed: {e}"),
     }
 }
 

@@ -8,7 +8,8 @@
 //!   shared by the main thread and the jobs. [`WorldStore::open_dir`] opens a directory.
 //! - [`PersistPlugin`]: saves the chunks with edits as they unload, with the autosave and on
 //!   exit, loads saved chunks instead of generating them, and keeps the pending block ticks and
-//!   the world clock. Chunks nobody edited are never saved: they come from the seed again.
+//!   the world clock. Chunks nobody edited are never saved: they come from the seed again. The
+//!   exit closes the store after its save ([`WorldShutdownSystems`], [`WorldStore::close`]).
 //! - [`Saved`] entities: what the registered [`EntityCodec`]s write of them (physics saves its
 //!   bodies) is saved with the chunk they are in, when it unloads (they are despawned then),
 //!   with the autosave and on exit, and they come back when the chunk loads.
@@ -48,6 +49,6 @@ pub use backend::{
 };
 pub use entities::{EntityCodec, EntityCodecs, Saved, SavedId, SavedIds, add_entity_codec};
 pub use format::{EntityPart, FORMAT_VERSION, FormatError, IdMap};
-pub use plugin::{PersistPlugin, PersistSettings};
+pub use plugin::{PersistPlugin, PersistSettings, WorldShutdownSystems};
 pub(crate) use saver::Persist;
 pub use store::{PersistError, PersistStats, WORLD_FILE, WorldStore};

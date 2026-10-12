@@ -430,19 +430,25 @@ fn entities_survive_a_restart_and_keep_their_ids() {
 fn an_entity_that_moved_is_saved_under_its_new_chunk_only() {
     let o = BlockPos::new(0, 0, 0);
     let setup = Setup::new(Arc::new(MemoryStore::new()), o.y);
-    let (mut app, viewer) = setup.start(o);
+    let (mut app, _) = setup.start(o);
     let first = Thing {
         at: at(o, 1, 0, 1),
         value: 7,
     };
-    let e = app.world_mut().spawn((Saved::new(), first)).id();
+    app.world_mut().spawn((Saved::new(), first));
     settle(&mut app);
-    // Saved where it is (exit), then moved across a chunk border.
-    app.world_mut().run_schedule(boxel_app::Shutdown);
-    settle(&mut app);
+    // Saved where it is (the exit, which closes the store), then moved across a chunk border in
+    // a new app.
+    app.shutdown();
+    drop(app);
     let saved = records(setup.backend.as_ref());
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0].0, chunk_key(first.at));
+    let (mut app, viewer) = setup.start(o);
+    let e = {
+        let mut q = app.world_mut().query_filtered::<Entity, With<Thing>>();
+        q.single(app.world()).expect("back after the restart")
+    };
     let moved = Thing {
         at: at(o, -1, 0, 1),
         value: 7,
@@ -876,8 +882,8 @@ fn a_saved_viewer_is_never_put_away() {
             .is_some(),
         "its chunk loaded"
     );
-    app.world_mut().run_schedule(boxel_app::Shutdown);
-    settle(&mut app);
+    // The exit saves it and leaves it alive (it closes the store, so nothing runs after it).
+    app.shutdown();
     let saved = records(setup.backend.as_ref());
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0].0, chunk_key(far.at), "saved where it is");

@@ -4,6 +4,7 @@ use super::format::{
     ENTITY_KEY_LEN, KEY_LEN, decode_entity_key, decode_key, encode_entity_key, encode_key,
 };
 use boxel_voxel::ChunkKey;
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::Path;
@@ -63,6 +64,19 @@ pub trait ChunkStore: Send + Sync + 'static {
     fn flush(&self) -> io::Result<()> {
         Ok(())
     }
+    /// Closes the store for good: waits for the operation in progress, writes what a clean
+    /// shutdown writes and releases the file, whoever still holds the store. Every later
+    /// operation fails with [`io::ErrorKind::NotConnected`]. Closing again does nothing. The
+    /// default only flushes and keeps the store usable (a store in memory can be opened again).
+    fn close(&self) -> io::Result<()> {
+        self.flush()
+    }
+}
+
+/// The error of an operation on a closed store or world ([`ChunkStore::close`],
+/// [`WorldStore::close`](super::WorldStore::close)).
+pub(crate) fn closed_error() -> io::Error {
+    io::Error::new(io::ErrorKind::NotConnected, "the world is closed")
 }
 
 /// Stores nothing: every chunk regenerates from the seed (the world without
@@ -218,6 +232,10 @@ pub(crate) const REOPEN_EVERY: Duration = Duration::from_secs(1);
 /// runs the operation once more: saves and loads work again as soon as the disk does (while it
 /// keeps failing, the file is opened again at most once a second). Committed batches are never
 /// lost.
+///
+/// [`ChunkStore::close`] closes the file cleanly at a moment the caller chooses, while clones of
+/// the store still live (jobs that read it): nothing opens it again after that. Opening a file
+/// that was not closed cleanly (a crash) repairs it, with a warning in the log.
 pub struct RedbStore {
     /// Opens the file again (the path, or a test's backend).
     open: Box<dyn Fn() -> Result<redb::Database, redb::DatabaseError> + Send + Sync>,
@@ -226,12 +244,17 @@ pub struct RedbStore {
     db: RwLock<Handle>,
     /// [`REOPEN_EVERY`] (tests shorten it).
     reopen_every: Duration,
+    /// Runs after an operation failed, between the read lock and the write lock (tests).
+    #[cfg(test)]
+    after_failure: Option<Box<dyn Fn(&RedbStore) + Send + Sync>>,
 }
 
 /// The open database of a [`RedbStore`].
 struct Handle {
-    /// `None` after an opening failed.
+    /// `None` after an opening failed, and once closed.
     db: Option<redb::Database>,
+    /// [`ChunkStore::close`] ran: every operation fails, and the file is never opened again.
+    closed: bool,
     /// Bumped by every opening: an error seen on an older database does not close a newer one.
     epoch: u64,
     /// The last opening after an error.
@@ -262,8 +285,18 @@ impl RedbStore {
         }
         let path = path.to_path_buf();
         Self::with_opener(move || {
+            // redb reports every step of a repair: one warning per opening.
+            let (file, warned) = (path.display().to_string(), Cell::new(false));
             redb::Database::builder()
                 .set_cache_size(REDB_CACHE_BYTES)
+                .set_repair_callback(move |_| {
+                    if !warned.replace(true) {
+                        tracing::warn!(
+                            file = file.as_str(),
+                            "the world file was not closed cleanly: redb repairs it"
+                        );
+                    }
+                })
                 .create(&path)
         })
     }
@@ -285,10 +318,13 @@ impl RedbStore {
             open: Box::new(open),
             db: RwLock::new(Handle {
                 db: Some(db),
+                closed: false,
                 epoch: 0,
                 reopened: None,
             }),
             reopen_every: REOPEN_EVERY,
+            #[cfg(test)]
+            after_failure: None,
         })
     }
 
@@ -299,12 +335,26 @@ impl RedbStore {
         self
     }
 
+    /// Runs `hook` after an operation failed, once its read lock is released and before it
+    /// takes the write lock to open the file again.
+    #[cfg(test)]
+    pub(crate) fn with_after_failure(
+        mut self,
+        hook: impl Fn(&RedbStore) + Send + Sync + 'static,
+    ) -> Self {
+        self.after_failure = Some(Box::new(hook));
+        self
+    }
+
     /// Runs `op` on the database; after an error, opens the file again and runs it once more
     /// (see the [type docs](RedbStore)). `op` must leave nothing behind when it fails: a
     /// transaction that is not committed writes nothing.
     fn run<T>(&self, op: impl Fn(&redb::Database) -> Result<T, redb::Error>) -> io::Result<T> {
         let (epoch, error) = {
             let handle = self.db.read().unwrap_or_else(PoisonError::into_inner);
+            if handle.closed {
+                return Err(closed_error());
+            }
             let error = match &handle.db {
                 Some(db) => match op(db) {
                     Ok(value) => return Ok(value),
@@ -314,7 +364,15 @@ impl RedbStore {
             };
             (handle.epoch, error)
         };
+        #[cfg(test)]
+        if let Some(hook) = &self.after_failure {
+            hook(self);
+        }
         let mut handle = self.db.write().unwrap_or_else(PoisonError::into_inner);
+        // Closed meanwhile (the operation may have failed because of it): never opened again.
+        if handle.closed {
+            return Err(closed_error());
+        }
         // Unless another thread opened it again meanwhile.
         if handle.epoch == epoch {
             if handle
@@ -346,6 +404,19 @@ impl RedbStore {
 }
 
 impl ChunkStore for RedbStore {
+    /// Takes the lock alone (so it waits for the operation in progress), marks the store closed
+    /// and drops the database under it: redb writes its clean shutdown and releases the file
+    /// lock before any other operation sees the handle again.
+    fn close(&self) -> io::Result<()> {
+        let mut handle = self.db.write().unwrap_or_else(PoisonError::into_inner);
+        if handle.closed {
+            return Ok(());
+        }
+        handle.closed = true;
+        handle.epoch += 1;
+        drop(handle.db.take());
+        Ok(())
+    }
     fn load(&self, key: ChunkKey) -> io::Result<Option<Vec<u8>>> {
         use redb::ReadableDatabase;
         let key = encode_key(key);

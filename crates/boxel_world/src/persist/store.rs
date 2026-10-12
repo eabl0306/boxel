@@ -1,5 +1,5 @@
 //! [`WorldStore`]: an open world, shared by the main thread and the jobs (ADR 0024).
-use super::backend::{ChunkStore, RedbStore, SaveBatch};
+use super::backend::{ChunkStore, RedbStore, SaveBatch, closed_error};
 use super::format::{
     self, FORMAT_VERSION, FormatError, IdMap, decode_chunk, decode_clock, decode_names,
     decode_ticks, encode_chunk, encode_names, open_entity, seal_entity,
@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// File of a world directory ([`WorldStore::open_dir`]).
@@ -31,6 +31,9 @@ pub(crate) const META_CLOCK: &str = "boxel:clock";
 pub(crate) const META_ENTITIES: &str = "boxel:entities";
 /// Prefix of the engine's metadata names.
 const RESERVED: &str = "boxel:";
+
+/// Openings of a world in this process ([`WorldStore::open`]), to tell two openings apart.
+static OPENINGS: AtomicU64 = AtomicU64::new(0);
 
 /// Why a world could not be opened.
 #[derive(Debug)]
@@ -187,13 +190,18 @@ struct Inner {
     loaded_entities: AtomicUsize,
     entity_errors: AtomicUsize,
     opened: Mutex<Option<Opened>>,
+    /// [`WorldStore::close`] ran: every operation fails quietly from then on.
+    closed: AtomicBool,
+    /// Which opening of the process this is (increasing).
+    opened_seq: u64,
 }
 
 /// An open world (ADR 0024): its store, its [`IdMap`] and the chunks waiting to be written.
 /// Cheap to clone (one `Arc`), shared by the main thread and the jobs; also a resource once
 /// [`PersistPlugin`](super::PersistPlugin) is added, for game data
 /// ([`WorldStore::meta`], [`WorldStore::put_meta`]). It serves one `PersistPlugin`: a new `App`
-/// opens the world again (drop the old store first: a redb file is locked while it is open).
+/// opens the world again (a redb file is locked while it is open: the exit closes it,
+/// [`WorldStore::close`]).
 #[derive(Clone, Resource)]
 pub struct WorldStore {
     inner: Arc<Inner>,
@@ -202,6 +210,8 @@ pub struct WorldStore {
 impl fmt::Debug for WorldStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WorldStore")
+            .field("opening", &self.opened_seq())
+            .field("closed", &self.is_closed())
             .field("states", &self.inner.ids.names().len())
             .field("stats", &self.stats())
             .finish_non_exhaustive()
@@ -350,8 +360,66 @@ impl WorldStore {
                     entities,
                     next_entity,
                 })),
+                closed: AtomicBool::new(false),
+                opened_seq: OPENINGS.fetch_add(1, Ordering::Relaxed),
             }),
         })
+    }
+
+    /// Closes the world for good, now, on this thread, while clones of it still live (jobs
+    /// that read it, a game's task): waits for the store operation in progress, closes the
+    /// store underneath ([`ChunkStore::close`]: a redb file writes its clean shutdown and is
+    /// released, so it opens again at once and without a repair) and drops the chunks and
+    /// entity records still waiting to be written (write them first: the exit does). Closing
+    /// again does nothing.
+    ///
+    /// From then on every operation of every clone fails with the error kind
+    /// [`io::ErrorKind::NotConnected`], without a log line and without counting it in
+    /// [`PersistStats`]: a reader that comes late gets nothing, never a made-up copy. The
+    /// [`PersistPlugin`](super::PersistPlugin) closes its store in `Shutdown`, after the exit
+    /// save ([`WorldShutdownSystems::Close`](super::WorldShutdownSystems::Close)).
+    pub fn close(&self) -> io::Result<()> {
+        if self.inner.closed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let result = self.inner.backend.close();
+        // Nothing writes them any more: a clone kept after the close holds no chunk data. Taken
+        // under their locks, which `stage` and `stage_entity` check the flag under.
+        let pending = std::mem::take(&mut *self.inner.pending.lock().expect("pending lock"));
+        let entities =
+            std::mem::take(&mut *self.inner.pending_entities.lock().expect("pending lock"));
+        drop((pending, entities));
+        result
+    }
+
+    /// [`WorldStore::close`] ran.
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::SeqCst)
+    }
+
+    /// How many handles (clones) of this world are alive, this one included. For diagnostics
+    /// and tests: it changes as jobs come and go, so never wait for a count.
+    pub fn handles(&self) -> usize {
+        Arc::strong_count(&self.inner)
+    }
+
+    /// `other` is a handle of the same opening of the world (a clone of this one).
+    pub fn same(&self, other: &WorldStore) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Which opening of the process this is: a later [`WorldStore::open`] has a higher one.
+    pub(crate) fn opened_seq(&self) -> u64 {
+        self.inner.opened_seq
+    }
+
+    /// The closed error once [`WorldStore::close`] ran: every operation checks it first.
+    fn check_open(&self) -> io::Result<()> {
+        if self.is_closed() {
+            Err(closed_error())
+        } else {
+            Ok(())
+        }
     }
 
     /// The world's id map (stored state names and the states they load as).
@@ -389,23 +457,37 @@ impl WorldStore {
     /// A game value saved with the world (`None` if never written). Reads the store: blocks on
     /// the disk, so call it while loading, not every frame.
     pub fn meta(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
-        self.inner.backend.load_meta(name)
+        self.check_open()?;
+        self.inner
+            .backend
+            .load_meta(name)
+            .map_err(|e| self.closed_or(e))
     }
 
     /// Saves a game value with the world (a player position, a seed), durably, now: blocks on
     /// the disk, so call it while loading or exiting (a `Shutdown` system), not every frame.
     /// Names starting with `boxel:` belong to the engine and are refused.
     pub fn put_meta(&self, name: &str, value: Vec<u8>) -> io::Result<()> {
+        self.check_open()?;
         if name.starts_with(RESERVED) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("metadata names starting with {RESERVED:?} belong to the engine"),
             ));
         }
-        self.inner.backend.save_batch(&SaveBatch {
-            meta: vec![(name.to_string(), value)],
-            ..SaveBatch::default()
-        })
+        self.inner
+            .backend
+            .save_batch(&SaveBatch {
+                meta: vec![(name.to_string(), value)],
+                ..SaveBatch::default()
+            })
+            .map_err(|e| self.closed_or(e))
+    }
+
+    /// `e`, or the closed error when the world closed meanwhile: an operation the close cut
+    /// short is a late reader, not a store that fails (nothing to log or count).
+    fn closed_or(&self, e: io::Error) -> io::Error {
+        if self.is_closed() { closed_error() } else { e }
     }
 
     /// What [`WorldStore::open`] read for the world (taken once, by the persistence plugin).
@@ -414,29 +496,39 @@ impl WorldStore {
     }
 
     /// Hands chunk `key` over for saving (the newest copy wins): from now on loads of `key` read
-    /// this copy until a save job writes it.
+    /// this copy until a save job writes it. Dropped once the world is closed.
     pub(crate) fn stage(&self, key: ChunkKey, data: Arc<ChunkData>) {
         let seq = self.inner.next_seq.fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .pending
-            .lock()
-            .expect("pending lock")
-            .insert(key, Staged { data, seq });
+        let mut pending = self.inner.pending.lock().expect("pending lock");
+        // Checked under the lock the close empties the copies under: none outlives the close.
+        if self.is_closed() {
+            drop(pending);
+            tracing::debug!(chunk = ?key.pos, "the world is closed: the chunk is not saved");
+            return;
+        }
+        pending.insert(key, Staged { data, seq });
     }
 
     /// The saved blocks of chunk `key`: the copy waiting to be written, else the stored record.
     /// `Ok(None)` when there is none, or when the record is damaged (logged and counted in
     /// [`PersistStats::load_errors`]): the caller generates the chunk then. `Err` when the store
     /// itself fails (counted too): the record may be fine, so the caller must not make up a copy
-    /// that could be edited and saved over it.
+    /// that could be edited and saved over it. `Err` without a count or a log once the world is
+    /// closed.
     pub(crate) fn load_chunk(&self, key: ChunkKey) -> io::Result<Option<Arc<ChunkData>>> {
+        self.check_open()?;
         if let Some(staged) = self.inner.pending.lock().expect("pending lock").get(&key) {
             return Ok(Some(Arc::clone(&staged.data)));
         }
-        let bytes = self.inner.backend.load(key).inspect_err(|e| {
-            self.inner.load_errors.fetch_add(1, Ordering::Relaxed);
-            tracing::error!(chunk = ?key.pos, "saved chunk cannot be read now: {e}");
-        })?;
+        let bytes = match self.inner.backend.load(key) {
+            Ok(bytes) => bytes,
+            Err(_) if self.is_closed() => return Err(closed_error()),
+            Err(e) => {
+                self.inner.load_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(chunk = ?key.pos, "saved chunk cannot be read now: {e}");
+                return Err(e);
+            }
+        };
         let Some(bytes) = bytes else {
             return Ok(None);
         };
@@ -481,13 +573,14 @@ impl WorldStore {
     /// entity records `entities` ([`WorldStore::entity_writes`]) in one batch. Once it is
     /// durable, a copy or record is dropped unless a newer one of its key was staged meanwhile.
     /// On an error nothing is dropped (the caller tries again later). Returns the chunks
-    /// written.
+    /// written. Fails with the closed error, not counted, once the world is closed.
     pub(crate) fn write(
         &self,
         keys: &[ChunkKey],
         meta: &[(String, MetaValue)],
         entities: &[EntityWrite],
     ) -> io::Result<usize> {
+        self.check_open()?;
         let staged: Vec<(ChunkKey, Arc<ChunkData>, u64)> = {
             let pending = self.inner.pending.lock().expect("pending lock");
             keys.iter()
@@ -517,6 +610,9 @@ impl WorldStore {
             }
         }
         if let Err(e) = self.inner.backend.save_batch(&batch) {
+            if self.is_closed() {
+                return Err(closed_error());
+            }
             self.inner.save_errors.fetch_add(1, Ordering::Relaxed);
             return Err(e);
         }
@@ -549,13 +645,18 @@ impl WorldStore {
 
     /// Hands the record of entity `id` in chunk `chunk` over for saving, as content without its
     /// envelope ([`format::entity_payload`]; `None`: its removal; the newest wins): from now on
-    /// loads of `chunk` read it over the stored records until a save job writes it.
+    /// loads of `chunk` read it over the stored records until a save job writes it. Dropped once
+    /// the world is closed.
     pub(crate) fn stage_entity(&self, chunk: ChunkKey, id: u64, bytes: Option<Arc<Vec<u8>>>) {
         let seq = self.inner.next_seq.fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .pending_entities
-            .lock()
-            .expect("pending lock")
+        let mut pending = self.inner.pending_entities.lock().expect("pending lock");
+        // Under the lock the close empties it under, as in `stage`.
+        if self.is_closed() {
+            drop(pending);
+            tracing::debug!(id, chunk = ?chunk.pos, "the world is closed: the entity is not saved");
+            return;
+        }
+        pending
             .entry(chunk)
             .or_default()
             .insert(id, StagedEntity { bytes, seq });
@@ -565,9 +666,11 @@ impl WorldStore {
     /// ([`format::entity_payload`]): the stored ones with the records and removals waiting to
     /// be written over them. A stored record that is damaged or of another record version is
     /// left out (logged and counted in [`PersistStats::entity_errors`]; it stays as it is).
-    /// `Err` when the store fails (counted too): the records stay as they are. Runs in the
-    /// chunk's generation job, so the envelopes are opened off the main thread.
+    /// `Err` when the store fails (counted too): the records stay as they are; without a count
+    /// or a log once the world is closed. Runs in the chunk's generation job, so the envelopes
+    /// are opened off the main thread.
     pub(crate) fn load_entities(&self, key: ChunkKey) -> io::Result<Vec<(u64, Vec<u8>)>> {
+        self.check_open()?;
         // The staged ones first: a save job that lands between the two reads wrote the same
         // records, and laying the staged ones over the store again changes nothing.
         let staged: HashMap<u64, Option<Arc<Vec<u8>>>, foldhash::fast::FixedState> = self
@@ -583,10 +686,15 @@ impl WorldStore {
                     .collect()
             })
             .unwrap_or_default();
-        let stored = self.inner.backend.load_entities(key).inspect_err(|e| {
-            self.inner.entity_errors.fetch_add(1, Ordering::Relaxed);
-            tracing::error!(chunk = ?key.pos, "saved entities cannot be read now: {e}");
-        })?;
+        let stored = match self.inner.backend.load_entities(key) {
+            Ok(stored) => stored,
+            Err(_) if self.is_closed() => return Err(closed_error()),
+            Err(e) => {
+                self.inner.entity_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(chunk = ?key.pos, "saved entities cannot be read now: {e}");
+                return Err(e);
+            }
+        };
         let mut records: std::collections::BTreeMap<u64, Vec<u8>> =
             std::collections::BTreeMap::new();
         for (id, bytes) in stored {

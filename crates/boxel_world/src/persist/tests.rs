@@ -7,8 +7,8 @@ use crate::ticks::BlockTicks;
 use boxel_voxel::{
     BlockPos, BlockState, ChunkData, ChunkKey, ChunkPos, DimensionId, LocalPos, MAX_CHUNK_COORD,
 };
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 fn key(x: i64, y: i64, z: i64) -> ChunkKey {
@@ -115,7 +115,7 @@ fn staged_copies_are_read_until_written_and_the_newest_is_written() {
 /// comes back, is edited and unloads again while its save runs).
 struct Racing {
     inner: MemoryStore,
-    store: std::sync::Mutex<Option<WorldStore>>,
+    store: Mutex<Option<WorldStore>>,
     key: ChunkKey,
 }
 
@@ -142,7 +142,7 @@ fn a_copy_staged_during_its_write_stays_staged() {
     let k = key(0, 0, 0);
     let racing = Arc::new(Racing {
         inner: MemoryStore::new(),
-        store: std::sync::Mutex::new(None),
+        store: Mutex::new(None),
         key: k,
     });
     let store = WorldStore::open(
@@ -227,7 +227,7 @@ fn save_jobs_take_at_most_a_batch() {
 #[derive(Default)]
 struct Counting {
     inner: MemoryStore,
-    batches: std::sync::atomic::AtomicUsize,
+    batches: AtomicUsize,
 }
 
 impl ChunkStore for Counting {
@@ -340,13 +340,49 @@ fn pending_ticks_restore_in_order_relative_to_the_clock() {
     assert_eq!(format::decode_ticks(&blob).unwrap(), saved);
 }
 
+/// Holds a disk's reads while it is shut: an operation in progress, for as long as a test says.
+#[derive(Debug, Default)]
+struct Gate {
+    shut: Mutex<bool>,
+    opened: Condvar,
+    /// Told when a read stops at the gate.
+    waiting: Mutex<Option<mpsc::Sender<()>>>,
+}
+
+impl Gate {
+    /// Shuts the gate: the receiver hears when a read stops at it.
+    fn shut(&self) -> mpsc::Receiver<()> {
+        let (tx, rx) = mpsc::channel();
+        *self.waiting.lock().unwrap() = Some(tx);
+        *self.shut.lock().unwrap() = true;
+        rx
+    }
+
+    fn open(&self) {
+        *self.shut.lock().unwrap() = false;
+        self.opened.notify_all();
+    }
+
+    /// Waits while the gate is shut.
+    fn pass(&self) {
+        let mut shut = self.shut.lock().unwrap();
+        if *shut && let Some(tx) = self.waiting.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
+        while *shut {
+            shut = self.opened.wait(shut).unwrap();
+        }
+    }
+}
+
 /// A redb file on a disk that fails while `fail` is set (every read, write, sync and resize),
-/// like a disk that is full or goes away for a moment. Locks go to the file, so a database that
-/// is still open keeps the next one from opening.
+/// like a disk that is full or goes away for a moment, and whose reads wait at `gate`. Locks go
+/// to the file, so a database that is still open keeps the next one from opening.
 #[derive(Debug)]
 struct FailingDisk {
     file: redb::backends::FileBackend,
     fail: Arc<AtomicBool>,
+    gate: Arc<Gate>,
 }
 
 impl FailingDisk {
@@ -366,6 +402,7 @@ impl redb::StorageBackend for FailingDisk {
         self.file.len()
     }
     fn read(&self, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+        self.gate.pass();
         self.check()?;
         self.file.read(offset, out)
     }
@@ -422,11 +459,14 @@ impl Drop for TempFile {
     }
 }
 
-/// A [`RedbStore`] of `path` on a [`FailingDisk`], without a page cache (every read goes to the
-/// disk) and without a wait between two openings of the file.
-fn failing_redb(path: &std::path::Path, fail: &Arc<AtomicBool>) -> RedbStore {
-    let (path, fail) = (path.to_path_buf(), Arc::clone(fail));
-    RedbStore::with_opener(move || {
+/// Opens `path` on a [`FailingDisk`], without a page cache (every read goes to the disk).
+fn disk_opener(
+    path: &std::path::Path,
+    fail: &Arc<AtomicBool>,
+    gate: &Arc<Gate>,
+) -> impl Fn() -> Result<redb::Database, redb::DatabaseError> + Send + Sync + 'static {
+    let (path, fail, gate) = (path.to_path_buf(), Arc::clone(fail), Arc::clone(gate));
+    move || {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -436,13 +476,20 @@ fn failing_redb(path: &std::path::Path, fail: &Arc<AtomicBool>) -> RedbStore {
         let disk = FailingDisk {
             file: redb::backends::FileBackend::new(file)?,
             fail: Arc::clone(&fail),
+            gate: Arc::clone(&gate),
         };
         redb::Database::builder()
             .set_cache_size(0)
             .create_with_backend(disk)
-    })
-    .expect("opens")
-    .with_reopen_every(Duration::ZERO)
+    }
+}
+
+/// A [`RedbStore`] of `path` on a [`FailingDisk`] ([`disk_opener`]), without a wait between two
+/// openings of the file.
+fn failing_redb(path: &std::path::Path, fail: &Arc<AtomicBool>) -> RedbStore {
+    RedbStore::with_opener(disk_opener(path, fail, &Arc::default()))
+        .expect("opens")
+        .with_reopen_every(Duration::ZERO)
 }
 
 /// redb fails every operation after one IO error until the database is opened again: the store
@@ -699,7 +746,7 @@ fn the_entity_index_follows_records_and_ids() {
 
 /// Runs jobs when the test says so (a busy IO pool).
 #[derive(Default)]
-struct Held(std::sync::Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>);
+struct Held(Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>);
 
 impl crate::jobs::JobExecutor for Held {
     fn spawn(&self, job: Box<dyn FnOnce() + Send + 'static>) {
@@ -783,4 +830,247 @@ fn a_failed_entity_save_is_written_once_the_disk_works() {
         redb.load_entities(c).unwrap(),
         vec![(1, format::seal_entity(&[42]))]
     );
+}
+
+// ---- Closing a world -----------------------------------------------------------------------
+
+/// Keeps the message of every event at `INFO` or above logged on the thread it is the
+/// subscriber of (`tracing::subscriber::with_default`).
+#[derive(Clone, Default)]
+struct Logged(Arc<Mutex<Vec<String>>>);
+
+impl Logged {
+    fn lines(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// The `message` field of an event.
+struct Message(String);
+
+impl tracing::field::Visit for Message {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
+}
+
+impl tracing::Subscriber for Logged {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() <= tracing::Level::INFO
+    }
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        self.0.lock().unwrap().push(message.0);
+    }
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// A world closed while another thread holds a clone of it (a job): the close does not wait for
+/// the clone, every operation of the clone then fails with the closed error, without a log line
+/// or a count, what was staged is dropped, staging keeps nothing and closing again does nothing.
+/// A redb store underneath is closed too (its file is released); a store in memory stays usable.
+#[test]
+fn a_closed_world_fails_every_operation_quietly() {
+    let tmp = TempFile::new("closed_world");
+    let backends: [Arc<dyn ChunkStore>; 2] = [
+        Arc::new(MemoryStore::new()),
+        Arc::new(RedbStore::open(&tmp.0).unwrap()),
+    ];
+    let (k, far) = (key(1, 2, 3), key(1 << 40, -(1 << 31), MAX_CHUNK_COORD));
+    for (redb, backend) in [false, true].into_iter().zip(backends) {
+        let store = WorldStore::open(
+            Arc::clone(&backend),
+            &boxel_demo::blocks::registry(),
+            "test",
+        )
+        .unwrap();
+        // Saved: a chunk, an entity record and a game value. Staged: a chunk and a record.
+        store.stage(k, stone_chunk());
+        store.stage_entity(k, 1, Some(Arc::new(vec![1])));
+        store
+            .write(&[k], &[], &store.entity_writes(&[(k, 1)]))
+            .unwrap();
+        store.put_meta("game:player", b"1".to_vec()).unwrap();
+        store.stage(far, stone_chunk());
+        store.stage_entity(far, 2, Some(Arc::new(vec![2])));
+        let before = store.stats();
+        assert_eq!((before.pending, before.pending_entities), (1, 1));
+
+        let (closed, wait) = mpsc::channel::<()>();
+        let clone = store.clone();
+        let job = std::thread::spawn(move || {
+            wait.recv().unwrap();
+            let logged = Logged::default();
+            let kinds = tracing::subscriber::with_default(logged.clone(), || {
+                assert!(clone.read_chunk(k).is_none());
+                [
+                    clone.load_chunk(k).map(drop),
+                    clone.load_chunk(far).map(drop),
+                    clone.load_entities(k).map(drop),
+                    clone.load_entities(far).map(drop),
+                    clone.meta("game:player").map(drop),
+                    clone.put_meta("game:player", b"2".to_vec()),
+                    clone.write(&[far], &[], &[]).map(drop),
+                ]
+                .map(|r| r.map_err(|e| e.kind()))
+            });
+            (kinds, logged.lines())
+        });
+        store.close().unwrap();
+        assert!(store.is_closed());
+        closed.send(()).unwrap();
+        let (kinds, lines) = job.join().unwrap();
+        assert!(
+            kinds
+                .iter()
+                .all(|k| *k == Err(std::io::ErrorKind::NotConnected)),
+            "{kinds:?}"
+        );
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(
+            store.stats(),
+            PersistStats {
+                pending: 0,
+                pending_entities: 0,
+                ..before
+            },
+            "the staged copies are dropped, nothing is counted"
+        );
+        store.stage(k, stone_chunk());
+        store.stage_entity(k, 3, None);
+        assert_eq!(
+            (store.stats().pending, store.stats().pending_entities),
+            (0, 0)
+        );
+        store.close().unwrap();
+
+        if redb {
+            let e = backend.load(k).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::NotConnected);
+            // Released while the closed store and its clones live.
+            let again = RedbStore::open(&tmp.0).unwrap();
+            assert!(again.load(k).unwrap().is_some());
+            assert_eq!(again.load_meta("game:player").unwrap(), Some(b"1".to_vec()));
+            assert!(again.load(far).unwrap().is_none(), "dropped, never written");
+        } else {
+            assert!(backend.load(k).unwrap().is_some());
+            let again = WorldStore::open(backend, &boxel_demo::blocks::registry(), "test")
+                .expect("a store in memory opens again");
+            assert!(again.read_chunk(k).is_some());
+        }
+    }
+}
+
+/// A reader whose operation failed before the close takes the write lock after it: it gets the
+/// closed error and never opens the file again.
+#[test]
+fn a_reader_that_failed_before_the_close_never_opens_the_file_again() {
+    let tmp = TempFile::new("closed_reopen");
+    let fail = Arc::new(AtomicBool::new(false));
+    let opens = Arc::new(AtomicUsize::new(0));
+    let opener = disk_opener(&tmp.0, &fail, &Arc::default());
+    let counted = {
+        let opens = Arc::clone(&opens);
+        move || {
+            opens.fetch_add(1, Ordering::SeqCst);
+            opener()
+        }
+    };
+    // The close lands between the failed read and its write lock.
+    let redb = RedbStore::with_opener(counted)
+        .unwrap()
+        .with_reopen_every(Duration::ZERO)
+        .with_after_failure(|redb| redb.close().unwrap());
+    let a = key(1 << 40, -(1 << 31), MAX_CHUNK_COORD);
+    redb.save_batch(&SaveBatch {
+        chunks: vec![(a, vec![7])],
+        ..SaveBatch::default()
+    })
+    .unwrap();
+    fail.store(true, Ordering::SeqCst);
+    assert_eq!(
+        redb.load(a).unwrap_err().kind(),
+        std::io::ErrorKind::NotConnected
+    );
+    fail.store(false, Ordering::SeqCst);
+    assert_eq!(
+        redb.load(a).unwrap_err().kind(),
+        std::io::ErrorKind::NotConnected
+    );
+    assert_eq!(opens.load(Ordering::SeqCst), 1, "never opened again");
+    // The file is released, and the committed record is there.
+    let again = RedbStore::open(&tmp.0).unwrap();
+    assert_eq!(again.load(a).unwrap(), Some(vec![7]));
+}
+
+/// The close waits for the operation in progress (operations run under the read lock), which
+/// ends well; the operations after it get the closed error.
+#[test]
+fn closing_redb_waits_for_the_operation_in_progress() {
+    let tmp = TempFile::new("close_waits");
+    let gate = Arc::new(Gate::default());
+    let redb = Arc::new(
+        RedbStore::with_opener(disk_opener(&tmp.0, &Arc::default(), &gate)).expect("opens"),
+    );
+    let a = key(-(1 << 40), 3, 1 << 31);
+    redb.save_batch(&SaveBatch {
+        chunks: vec![(a, vec![9])],
+        ..SaveBatch::default()
+    })
+    .unwrap();
+    let waiting = gate.shut();
+    let reader = {
+        let redb = Arc::clone(&redb);
+        std::thread::spawn(move || redb.load(a))
+    };
+    waiting
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the read reaches the disk");
+    let (done, closed) = mpsc::channel();
+    let closer = {
+        let redb = Arc::clone(&redb);
+        std::thread::spawn(move || done.send(redb.close()).unwrap())
+    };
+    assert!(
+        matches!(
+            closed.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "the close waits for the read"
+    );
+    gate.open();
+    assert_eq!(reader.join().unwrap().unwrap(), Some(vec![9]));
+    closed.recv().unwrap().unwrap();
+    closer.join().unwrap();
+    assert_eq!(
+        redb.load(a).unwrap_err().kind(),
+        std::io::ErrorKind::NotConnected
+    );
+    let again = RedbStore::open(&tmp.0).unwrap();
+    assert_eq!(again.load(a).unwrap(), Some(vec![9]));
+}
+
+/// Clones are handles of one opening; another opening of the same world is not the same and
+/// comes later.
+#[test]
+fn handles_of_one_opening_are_the_same() {
+    let backend = Arc::new(MemoryStore::new());
+    let first = open(&backend);
+    let clone = first.clone();
+    assert!(first.same(&clone));
+    assert_eq!(first.handles(), 2);
+    drop(clone);
+    assert_eq!(first.handles(), 1);
+    let second = open(&backend);
+    assert!(!first.same(&second));
+    assert!(second.opened_seq() > first.opened_seq());
 }

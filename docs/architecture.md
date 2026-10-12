@@ -1349,6 +1349,7 @@ pub trait ChunkStore: Send + Sync + 'static {
     fn load_meta(&self, name: &str) -> std::io::Result<Option<Vec<u8>>>;
     fn save_batch(&self, batch: &SaveBatch) -> std::io::Result<()>; // chunks y metadatos, atómico
     fn flush(&self) -> std::io::Result<()> { Ok(()) }
+    fn close(&self) -> std::io::Result<()> { self.flush() } // cierre limpio, para siempre
 }
 ```
 
@@ -1367,6 +1368,11 @@ pub trait ChunkStore: Send + Sync + 'static {
   chunks por transacción). Autoguardado cada 60 s y guardado final en `Shutdown`. Los ticks y el
   reloj van siempre en la misma transacción que todos los chunks editados: el disco guarda un solo
   momento del mundo.
+- Al salir, después del guardado final, `WorldStore::close` cierra el archivo limpio y lo libera,
+  aunque queden clones vivos (`WorldShutdownSystems::{Save, Close}`). Después, cualquier operación
+  de un clon falla en silencio con `NotConnected`. Un sistema propio de `Shutdown` que escribe en
+  el store va `.before(WorldShutdownSystems::Close)`. Abrir un archivo que no se cerró limpio (un
+  crash) lo repara y deja un aviso en el log.
 - Si el disco falla, los chunks esperan en memoria y `RedbStore` vuelve a abrir el archivo cuando
   el disco funciona otra vez.
 - Entidades: las marcadas con `Saved` se guardan con su chunk a través de los `EntityCodec` que

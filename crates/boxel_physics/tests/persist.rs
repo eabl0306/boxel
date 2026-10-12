@@ -324,7 +324,7 @@ fn a_body_moved_across_chunks_is_saved_under_its_chunk() {
     let base = bases()[2];
     let backend = Arc::new(MemoryStore::new());
     let mut sim = start(&backend, base);
-    let ball = sim.body(
+    sim.body(
         sim.pos(30.5, 4.6, 3.5),
         (
             Saved::new(),
@@ -334,9 +334,21 @@ fn a_body_moved_across_chunks_is_saved_under_its_chunk() {
         ),
     );
     sim.steps(1);
-    sim.app.world_mut().run_schedule(boxel_app::Shutdown);
-    calm(&mut sim);
+    // Saved where it is by the exit (which closes the store), then it flies on in a new app.
+    sim.app.shutdown();
+    drop(sim);
+    let keys = backend.entity_keys().unwrap();
+    assert_eq!(keys.len(), 1);
+    let mut sim = start(&backend, base);
+    let ball = {
+        let mut q = sim
+            .app
+            .world_mut()
+            .query_filtered::<Entity, (With<Saved>, With<Collider>)>();
+        q.single(sim.app.world()).expect("back after the restart")
+    };
     let first = ChunkPos::containing(sim.position(ball).block);
+    assert_eq!(keys[0].0, ChunkKey::new(first), "saved where it was");
     sim.steps(40);
     let now = sim.position(ball).block;
     assert_ne!(ChunkPos::containing(now), first, "it crossed a border");
