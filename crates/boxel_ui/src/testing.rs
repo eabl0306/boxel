@@ -101,8 +101,8 @@ impl UiTester {
         self
     }
 
-    /// Moves to the center of the widget labeled `label`, presses and runs a frame (the widget
-    /// sees the click in it), then releases and runs another.
+    /// Moves to the center of the widget labeled `label` (of the part its clip shows), presses
+    /// and runs a frame (the widget sees the click in it), then releases and runs another.
     ///
     /// # Panics
     /// If no widget had that label in the latest frame.

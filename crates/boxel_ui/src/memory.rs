@@ -55,7 +55,8 @@ impl WidgetKind {
 pub struct Hit {
     /// The widget.
     pub id: WidgetId,
-    /// Where it is, in GUI pixels.
+    /// Where it takes the pointer, in GUI pixels: its rectangle cut to the clip it was declared
+    /// in (empty when cut away, and then it cannot take the focus either).
     pub rect: UiRect,
     /// Disabled widgets get hover (for tooltips) but no clicks or focus.
     pub enabled: bool,
@@ -99,7 +100,7 @@ pub(crate) struct Memory {
     pub hovered: Option<(UiLayer, WidgetId)>,
     /// The topmost modal layer with content: layers below it get no input.
     pub modal: Option<UiLayer>,
-    /// The widget with keyboard focus: always an enabled widget of the `modal` layer.
+    /// The widget with keyboard focus: always an enabled widget of the `modal` layer that shows.
     pub focused: Option<WidgetId>,
     /// Focus moved by the keyboard (tooltips follow it) rather than by a click.
     pub focus_visible: bool,

@@ -198,7 +198,9 @@ impl<'a> Painter<'a> {
         out
     }
 
-    /// Runs `f` with everything it draws cut to `rect` (and to any clip already set).
+    /// Runs `f` with everything it draws cut to `rect` (and to any clip already set). Widgets
+    /// and labels inside answer the pointer only where they show, and a widget cut away
+    /// entirely cannot take the focus.
     pub fn with_clip<R>(&mut self, rect: UiRect, f: impl FnOnce(&mut Self) -> R) -> R {
         let saved = self.clip;
         self.clip = Some(saved.map_or(rect, |c| c.intersect(&rect)));
@@ -295,9 +297,10 @@ impl<'a> Painter<'a> {
         let line = text::ellipsis(self.font, text, rect.w.max(0) as u32, size);
         let y = rect.y + (rect.h - (crate::font::GLYPH_HEIGHT * size) as i32) / 2;
         self.text(rect.x, y, &line, style);
+        let shown = self.clipped(rect);
         let mem = &self.state.memory;
         let reachable = mem.modal.is_none_or(|m| self.layer >= m);
-        let hovered = reachable && mem.cursor.is_some_and(|c| rect.contains(c));
+        let hovered = reachable && mem.cursor.is_some_and(|c| shown.contains(c));
         Resp {
             painter: self,
             response: Response {
@@ -323,6 +326,9 @@ impl<'a> Painter<'a> {
             .iter()
             .fold(base, |id, scope| id.mix(&scope.0.to_le_bytes()));
         let id = self.state.unique_id(self.layer, base);
+        // The part that shows: a widget's hidden part must not take input from what is drawn
+        // there (a scrolled row over a header).
+        let rect = self.clipped(rect);
         self.state.layers[self.layer.index()].hits.push(Hit {
             id,
             rect,
@@ -349,6 +355,11 @@ impl<'a> Painter<'a> {
             shift: mem.shift,
             cursor: mem.cursor,
         }
+    }
+
+    /// The part of `rect` the clip leaves (empty when it is cut away).
+    fn clipped(&self, rect: UiRect) -> UiRect {
+        self.clip.map_or(rect, |clip| clip.intersect(&rect))
     }
 
     /// A widget label centered in `rect` (ellipsis when too long), white or gray.

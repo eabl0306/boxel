@@ -106,14 +106,15 @@ pub(crate) fn resolve(state: &mut UiState, input: &NavInput) -> InputCapture {
             .iter()
             .find_map(|&l| layers[l.index()].hits.iter().find(|h: &&Hit| h.id == id))
     };
-    // The keyboard belongs to the enabled widgets of the modal layer, in declaration order. A
-    // focused widget outside them (gone, disabled, or under a modal layer opened over it) loses
-    // the focus, so Enter cannot activate a widget the player no longer reaches.
+    // The keyboard belongs to the enabled widgets of the modal layer that show, in declaration
+    // order. A focused widget outside them (gone, disabled, clipped away, or under a modal
+    // layer opened over it) loses the focus, so Enter cannot activate a widget the player no
+    // longer reaches.
     let order: Vec<&Hit> = mem.modal.map_or_else(Vec::new, |layer| {
         layers[layer.index()]
             .hits
             .iter()
-            .filter(|h| h.enabled && h.kind.focusable())
+            .filter(|h| h.enabled && h.kind.focusable() && !h.rect.is_empty())
             .collect()
     });
     if mem

@@ -37,7 +37,8 @@ No es egui porque:
   cambia cuando cambian sus bytes. El HUD guarda sus quads hasta que el juego lo redibuja: un HUD
   quieto y un menú sin cambios no suben nada.
 - Hover y clics usan los rectángulos del frame anterior (un frame de atraso, no se nota porque
-  las pantallas no se mueven).
+  las pantallas no se mueven), recortados igual que su dibujo. Lo que no se ve no recibe
+  entrada: ni la parte recortada de un widget ni lo que queda bajo una capa modal.
 - `InputCapture` dice si la interfaz toma el puntero y el teclado. El juego frena con eso su
   propia entrada (picking, jugador, hotbar). Escape es siempre del juego.
 

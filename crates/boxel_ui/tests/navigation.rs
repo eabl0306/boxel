@@ -1,11 +1,11 @@
 //! Mouse and keyboard through `UiPlugin`, headless (`InputPlugin`, a `WindowState`, no window):
 //! hover, presses, Tab order, Enter and Space, arrows on sliders and cycles, Shift+click,
-//! disabled widgets, key repeat, a popup over a screen and `InputCapture`.
+//! disabled widgets, key repeat, a popup over a screen, clipped widgets and `InputCapture`.
 
 use boxel_ecs::prelude::*;
 use boxel_math::{IVec2, UVec2, Vec2};
 use boxel_ui::testing::UiTester;
-use boxel_ui::{Column, InputCapture, Modal, Steps, Ui, UiLayer, UiRect};
+use boxel_ui::{Column, InputCapture, Modal, Steps, Text, Ui, UiLayer, UiRect};
 use boxel_window::{ButtonState, CursorMoved, CursorPosition, KeyCode};
 
 #[derive(Resource)]
@@ -373,6 +373,74 @@ fn arrow_steps_stay_with_the_widget_they_were_pressed_on() {
         .frame();
     assert_eq!(t.focused().as_deref(), Some("test:flag"));
     assert_eq!((menu(&t).fov, menu(&t).flag), (70, true));
+}
+
+#[test]
+fn widgets_answer_input_only_where_their_clip_shows_them() {
+    #[derive(Resource, Default)]
+    struct Clipped {
+        clicks: Vec<&'static str>,
+        label_hovered: bool,
+    }
+    fn clipped(mut ui: Ui, mut out: ResMut<Clipped>) {
+        let out = &mut *out;
+        let mut p = ui.layer(UiLayer::Screen, Modal::Yes);
+        if p.button(UiRect::new(10, 40, 200, 20), "test:done").clicked {
+            out.clicks.push("done");
+        }
+        // A scrolled list: rows above and below its area are cut away.
+        p.with_clip(UiRect::new(10, 0, 200, 50), |p| {
+            if p.button(UiRect::new(10, 45, 200, 20), "test:row").clicked {
+                out.clicks.push("row");
+            }
+            if p.button(UiRect::new(10, 100, 200, 20), "test:hidden")
+                .clicked
+            {
+                out.clicks.push("hidden");
+            }
+            let label = p.label(UiRect::new(10, 120, 200, 20), "test:label", Text::default());
+            out.label_hovered = label.hovered;
+        });
+    }
+    let mut t = UiTester::new(UVec2::new(1280, 720));
+    t.app.init_resource::<Clipped>();
+    t.add_systems(clipped);
+    t.frame();
+    let clicks = |t: &UiTester| t.app.world().resource::<Clipped>().clicks.clone();
+
+    // The rectangles are cut to what shows.
+    assert_eq!(t.hit("test:row").unwrap().rect, UiRect::new(10, 45, 200, 5));
+    assert!(t.hit("test:hidden").unwrap().rect.is_empty());
+    // Under the row's hidden part, the button that shows takes the click.
+    t.move_to(IVec2::new(50, 55))
+        .press()
+        .frame()
+        .release()
+        .frame();
+    assert_eq!(clicks(&t), ["done"]);
+    // Where the row shows over it, the row (declared later) takes it.
+    t.move_to(IVec2::new(50, 47))
+        .press()
+        .frame()
+        .release()
+        .frame();
+    assert_eq!(clicks(&t), ["done", "row"]);
+    // A row clipped away entirely gets no hover, click or focus; neither does a label.
+    t.move_to(IVec2::new(50, 110))
+        .press()
+        .frame()
+        .release()
+        .frame();
+    assert_eq!(t.state().hovered(), None);
+    assert_eq!(clicks(&t), ["done", "row"]);
+    t.move_to(IVec2::new(50, 125)).frame();
+    assert!(!t.app.world().resource::<Clipped>().label_hovered);
+    let mut order = Vec::new();
+    for _ in 0..3 {
+        t.tap(KeyCode::Tab);
+        order.push(t.focused().unwrap());
+    }
+    assert_eq!(order, ["test:done", "test:row", "test:done"]);
 }
 
 #[test]
