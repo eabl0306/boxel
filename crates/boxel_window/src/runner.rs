@@ -133,10 +133,11 @@ impl Default for RunnerSettings {
 ///    `WindowState::frame_ready = true` and clears the pending-redraw timestamp. Messages are
 ///    written only if their `Messages<T>` resource exists.
 /// 4. `device_event`: `MouseMotion` while focused.
-/// 5. `about_to_wait`: applies `CursorOptions` and `ImeOptions` changes; computes
-///    `occluded = winit_occluded || (redraw pending for > 100 ms)` and writes `WindowOccluded` on
-///    change; runs `app.update()`; if `!frame_ready` and no redraw is pending, calls
-///    `window.request_redraw()` and records the time; exits the loop on `app.should_exit()`.
+/// 5. `about_to_wait`: applies `CursorOptions` and `ImeOptions` changes; writes a pending
+///    `CursorLeft`; computes `occluded = winit_occluded || (redraw pending for > 100 ms)` and
+///    writes `WindowOccluded` on change; runs `app.update()`; if `!frame_ready` and no redraw is
+///    pending, calls `window.request_redraw()` and records the time; exits the loop on
+///    `app.should_exit()`.
 ///    The update still runs in `about_to_wait`; idle steps ([`App::run_idle`], ADR 0023) run
 ///    in the later iterations of the wait, never in the iteration of the update.
 ///    Control flow: `Continuous` waits for the next [`FrameLimit`] deadline (`WaitUntil` the
@@ -156,7 +157,8 @@ impl Default for RunnerSettings {
 ///   without control characters; releases, the synthetic presses of a focus gain and shortcuts
 ///   (Ctrl or Super held, but not Ctrl+Alt: Windows' Alt Gr) type nothing. An IME commit becomes
 ///   `TextInput` and `ImeEvent::Commit`, a preedit `ImeEvent::Preedit`, and `Ime::Disabled` an
-///   empty preedit. `CursorLeft` is forwarded.
+///   empty preedit. `CursorLeft` is held until just before the update and dropped if the cursor
+///   moved back in by then.
 /// - `WindowResized` is written only when the size actually changes (never for 0x0). On Wayland,
 ///   `Window::request_inner_size` is applied client-side and winit sends no `Resized` event, so
 ///   the runner compares `Window::inner_size` with `WindowState` before every update there.
@@ -400,6 +402,7 @@ impl ApplicationHandler for WinitApp {
         if let Some(ime) = self.core.ime_change(self.app.world()) {
             apply_ime(&window, ime);
         }
+        self.core.flush_cursor_left(self.app.world_mut());
         let now = Instant::now();
         if self.poll_minimized {
             self.core.poll_minimized(now, || window.is_minimized());
@@ -449,6 +452,9 @@ struct RunnerCore {
     focused: bool,
     /// Modifier keys as last reported by winit (shortcuts type no text).
     modifiers: ModifiersState,
+    /// The cursor left the window and has not moved back in since the last update: the
+    /// `CursorLeft` that `flush_cursor_left` writes before the next one.
+    cursor_left: bool,
     /// Last `WindowEvent::Occluded` (never sent on Wayland and Windows).
     winit_occluded: bool,
     /// Last polled `Window::is_minimized` (X11 only, where minimizing sends no `Occluded`).
@@ -515,6 +521,7 @@ impl RunnerCore {
             settings,
             focused: true,
             modifiers: ModifiersState::empty(),
+            cursor_left: false,
             winit_occluded: false,
             minimized: false,
             minimized_polled_at: None,
@@ -672,6 +679,7 @@ impl RunnerCore {
     /// (the first redraw counts as pending from `now`).
     fn window_created(&mut self, world: &mut World, size: UVec2, scale_factor: f64, now: Instant) {
         self.focused = true;
+        self.cursor_left = false;
         self.winit_occluded = false;
         self.minimized = false;
         self.minimized_polled_at = None;
@@ -740,6 +748,7 @@ impl RunnerCore {
                 );
             }
             WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_left = false;
                 write(
                     world,
                     CursorMoved {
@@ -747,7 +756,7 @@ impl RunnerCore {
                     },
                 );
             }
-            WindowEvent::CursorLeft { .. } => write(world, CursorLeft),
+            WindowEvent::CursorLeft { .. } => self.cursor_left = true,
             WindowEvent::RedrawRequested => self.gate_opened(world, Instant::now()),
             _ => {}
         }
@@ -837,6 +846,16 @@ impl RunnerCore {
             self.applied_cursor = wanted;
             wanted
         })
+    }
+
+    /// Writes `CursorLeft` if the cursor left the window and has not moved back in since the
+    /// last update. Called just before the update, after the frame's events: written as it
+    /// came, a leave would lose its order against the `CursorMoved` queue, and winit reports a
+    /// cursor that comes back with a move, whose position would then be dropped.
+    fn flush_cursor_left(&mut self, world: &mut World) {
+        if std::mem::take(&mut self.cursor_left) {
+            write(world, CursorLeft);
+        }
     }
 
     /// What to change on the input method for the desired [`ImeOptions`] (and marks them
@@ -1473,6 +1492,7 @@ mod tests {
                 device_id: DeviceId::dummy(),
             },
         );
+        core.flush_cursor_left(&mut world);
         assert!(!state(&world).focused);
         assert!(!world.contains_resource::<Messages<AppExit>>());
         assert!(!world.contains_resource::<Messages<TextInput>>());
@@ -3100,19 +3120,44 @@ mod tests {
         let left = || WindowEvent::CursorLeft {
             device_id: DeviceId::dummy(),
         };
-        let position = |app: &App| app.world().resource::<CursorPosition>().0;
+        let entered = || WindowEvent::CursorEntered {
+            device_id: DeviceId::dummy(),
+        };
+        // One frame as `about_to_wait` runs it: the events, the pending leave, the update.
+        let frame = |core: &mut RunnerCore, app: &mut App, events: Vec<WindowEvent>| {
+            for event in events {
+                core.window_event(app.world_mut(), event);
+            }
+            core.flush_cursor_left(app.world_mut());
+            app.update();
+            app.world().resource::<CursorPosition>().0
+        };
+        let at = |x: f32| Some(Vec2::new(x, 2.0));
 
-        core.window_event(app.world_mut(), moved(4.0));
-        app.update();
-        assert_eq!(position(&app), Some(Vec2::new(4.0, 2.0)));
+        assert_eq!(frame(&mut core, &mut app, vec![moved(4.0)]), at(4.0));
+
+        // The last moves and the leave: outside. The leave waits for the end of the frame.
         core.window_event(app.world_mut(), moved(1.0));
         core.window_event(app.world_mut(), left());
+        assert_eq!(messages::<CursorLeft>(app.world()), vec![]);
+        core.flush_cursor_left(app.world_mut());
         assert_eq!(messages::<CursorLeft>(app.world()), vec![CursorLeft]);
         app.update();
-        assert_eq!(position(&app), None);
-        core.window_event(app.world_mut(), moved(3.0));
-        app.update();
-        assert_eq!(position(&app), Some(Vec2::new(3.0, 2.0)));
+        assert_eq!(app.world().resource::<CursorPosition>().0, None);
+        assert_eq!(frame(&mut core, &mut app, vec![]), None);
+        assert_eq!(frame(&mut core, &mut app, vec![moved(3.0)]), at(3.0));
+
+        // Out and back within one frame: winit reports the way back in with a move, and that
+        // position holds, so a click in this frame lands on it.
+        let back = vec![left(), entered(), moved(5.0)];
+        assert_eq!(frame(&mut core, &mut app, back), at(5.0));
+        assert_eq!(frame(&mut core, &mut app, vec![]), at(5.0));
+
+        // In, out, in and out again: outside. Back in without a move: outside until one.
+        let twice = vec![left(), entered(), moved(6.0), left()];
+        assert_eq!(frame(&mut core, &mut app, twice), None);
+        assert_eq!(frame(&mut core, &mut app, vec![entered()]), None);
+        assert_eq!(frame(&mut core, &mut app, vec![moved(7.0)]), at(7.0));
     }
 
     #[test]

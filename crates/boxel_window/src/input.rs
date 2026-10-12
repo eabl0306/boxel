@@ -57,17 +57,17 @@ pub struct CursorMoved {
     pub position: Vec2,
 }
 
-/// The cursor left the window: [`CursorPosition`] becomes `None` until the next
-/// [`CursorMoved`].
+/// The cursor left the window and did not come back before the frame: [`CursorPosition`]
+/// becomes `None` until the next [`CursorMoved`]. The runner writes it after the frame's moves,
+/// and not at all if the cursor moved back in (winit reports a cursor that comes back with a
+/// move).
 #[derive(Message, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CursorLeft;
 
 /// Where the cursor is: the position of the latest [`CursorMoved`] message, in physical pixels
-/// from the window's top-left. `None` until the cursor first moves over the window, and from a
-/// frame with a [`CursorLeft`] until the next move (a cursor that leaves and comes back within
-/// one frame counts as outside until it moves again). UIs read it for hover and clicks; it keeps
-/// its last value while the cursor is locked (`CursorGrab::Locked` sends `MouseMotion`, not
-/// `CursorMoved`).
+/// from the window's top-left. `None` until the cursor first moves over the window, and after a
+/// [`CursorLeft`] until the next move. UIs read it for hover and clicks; it keeps its last value
+/// while the cursor is locked (`CursorGrab::Locked` sends `MouseMotion`, not `CursorMoved`).
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq)]
 pub struct CursorPosition(pub Option<Vec2>);
 
@@ -230,9 +230,7 @@ pub fn accumulate_mouse_scroll_system(
 }
 
 /// Keeps [`CursorPosition`] at the latest [`CursorMoved`] message of the frame, or `None` in a
-/// frame with a [`CursorLeft`]. The two queues do not keep their relative order, so a leave
-/// wins: a move after it in the same frame shows at the next move. The common case, the last
-/// moves and then the leave in one frame, must end outside.
+/// frame with a [`CursorLeft`], which comes after the frame's moves.
 pub fn cursor_position_system(
     mut cursor: ResMut<CursorPosition>,
     mut moved: MessageReader<CursorMoved>,
@@ -356,14 +354,5 @@ mod tests {
         moved(&mut app, 5.0);
         app.update();
         assert_eq!(position(&app), Some(Vec2::new(5.0, 3.0)));
-
-        // Out and back within one frame: outside until it moves again.
-        app.world_mut().write_message(CursorLeft);
-        moved(&mut app, 6.0);
-        app.update();
-        assert_eq!(position(&app), None);
-        moved(&mut app, 7.0);
-        app.update();
-        assert_eq!(position(&app), Some(Vec2::new(7.0, 3.0)));
     }
 }

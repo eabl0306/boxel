@@ -102,7 +102,9 @@ el pase (E-UI2) y llega antes de los menús, así que no hay puente.
   Va apagado por defecto, porque mientras un IME compone winit no manda las teclas. La interfaz
   lo prende solo con un campo de texto enfocado.
 - `CursorLeft`: `CursorPosition` pasa a `None` cuando el cursor sale de la ventana, y nada queda
-  resaltado. Si sale y vuelve en el mismo frame, cuenta como afuera hasta que se mueva.
+  resaltado. El runner lo manda justo antes del update y solo si el cursor no volvió. Si sale y
+  vuelve en el mismo frame, vale la posición con la que winit avisa la vuelta, así que un clic
+  en ese frame no se pierde.
 
 ## Consecuencias
 
