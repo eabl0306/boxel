@@ -135,7 +135,8 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 - `boxel_physics` depende de `boxel_world` (lee `ChunkMap`); ni `boxel_world` ni `boxel_render`
   dependen de él. Su núcleo (`boxel_physics::core`) no usa el ECS.
 - `boxel_ui` (ADR 0033) depende solo de `boxel_app`, `boxel_ecs`, `boxel_math` y `boxel_window`.
-  Sus tipos de pintura son datos simples: el renderer los va a leer, nunca al revés.
+  Sus tipos de pintura son datos simples: `boxel_render` los lee con su feature `ui`, nunca al
+  revés.
 - El núcleo del renderer (`VoxelRenderer`) no usa el ECS; el plugin es una capa fina encima.
 
 ---
@@ -159,7 +160,7 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_light` | luz de vóxeles en CPU, sin ECS ni GPU (ADR 0015): techos de cielo por columna (`SkyTile`, caminata hacia abajo), luz exacta de un chunk desde una caja de 64³ (cielo y RGB, caminos rápidos para cuevas oscuras y cielo abierto), `PaddedLight`, `ChunkLight`; oráculo global para los tests | voxel |
 | `boxel_worldgen` | trait `WorldGenerator` (con `lod()`, la fuente del terreno lejano: `LodSource`, ADR 0031), `FlatGenerator` y ruido entero exacto 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`, `splitmix64`, `Frequency`) | voxel |
 | `boxel_world` | `ChunkMap`, ciclo de vida, scheduler, jobs, ediciones, mensajes (`ChunkMeshEvent`, `BlockChanged`, `ChunkDataEvent`), guardar y cargar el mundo (`persist`: `ChunkStore`, `RedbStore`, `WorldStore`, `PersistPlugin`, ADR 0024), reloj del mundo (`TimeOfDay`, `DaylightCurve`, `DaylightPlugin`), ticks programados de bloques (`BlockTicks`, `BlockTicksPlugin`), agua y lava que corren y bloques con agua (`FluidPlugin`, ADR 0021 y 0025), las reglas de vecinos (`NeighborRules`, ADR 0020 y 0027), qué hace usar un bloque (`BlockUses`, una puerta que se abre, ADR 0027), la búsqueda de la ocultación de cuevas (`ChunkVisibility`, `visibility`, ADR 0022) y el lado del mundo del LOD lejano (`lod`: `LodWorldPlugin`, planificador, cobertura, trabajos, ADR 0031) | app, voxel, mesh, light, worldgen, transform, diagnostic |
-| `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `SceneLight` (luz del cielo, ambiente y curva de brillo del frame), `PresentSettings` (vsync en tiempo de ejecución), texturas de las imágenes del registro o de un resource pack con las recetas que pasa el juego (`TextureSource`, `PackSource`), screenshots, ocultación de cuevas en los tres tiers (ADR 0022), contorno del bloque apuntado (`BlockOutline`, ADR 0026), texturas animadas de los packs (`LayerAnimation`, ADR 0028), conteo de draws en CPU (`cull_counts`), niebla y nubes cúbicas opcionales (`fog`: `FogPlugin`, `FogSettings`, `FogClock`, ADR 0030), terreno lejano opcional (`lod`: `LodPlugin`, `LodPass`, ADR 0031) | gfx, shaders, world, camera, window, pack, fog |
+| `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `SceneLight` (luz del cielo, ambiente y curva de brillo del frame), `PresentSettings` (vsync en tiempo de ejecución), texturas de las imágenes del registro o de un resource pack con las recetas que pasa el juego (`TextureSource`, `PackSource`), screenshots, ocultación de cuevas en los tres tiers (ADR 0022), contorno del bloque apuntado (`BlockOutline`, ADR 0026), texturas animadas de los packs (`LayerAnimation`, ADR 0028), conteo de draws en CPU (`cull_counts`), niebla y nubes cúbicas opcionales (`fog`: `FogPlugin`, `FogSettings`, `FogClock`, ADR 0030), terreno lejano opcional (`lod`: `LodPlugin`, `LodPass`, ADR 0031), el pase de la interfaz con la feature `ui` (`UiPass`, ADR 0033) | gfx, shaders, world, camera, window, pack, fog, ui (opcional) |
 | `boxel_fog` | niebla y nubes cúbicas sin GPU ni ECS (ADR 0030 y 0032): las capas (`FogLayer`, `validate`), el ruido entero que el shader repite bit a bit, cada capa en enteros chicos relativos al origen de render (`LayerParams`), el perfil de la bruma lejana (`HazeProfile`), la marcha de referencia de los tests y el empaquetado del texel | - |
 | `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::collision`: cubos y cajas que pueden subir media celda, como la valla de 1,5 bloques, más un contorno para apuntar, ADR 0018 y 0026), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas, el integrador de un cuerpo (`step_body`, `predict`), el narrowphase (`shape_contact`) y la grilla del broadphase (`Grid`). Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`; pasos en `FixedPostUpdate`, interpolación en `AfterFixedMainLoop`), `PhysicsQuery` (rayos a vóxeles y cuerpos, cajas, el chequeo para poner bloques), `BodyIndex`, cuerpos (`RigidBody`, `Collider`, `Velocity`, `BodyPosition`, `Contacts`, `Interpolated`, `Teleport`, `Frozen`, `Sleeping`, `ReportContacts`), `CharacterController` (caminar, agacharse con el borde protegido y la caja de 1,5 (`Crouch`), correr con el salto corriendo y el vuelo creativo, ADR 0026), `Projectile`, nadar (`SwimPlugin`, `Swimmer`, ADR 0021; también en bloques con agua, y el vuelo no lo siente) y los mensajes `VoxelImpact`, `CollisionStarted`, `CollisionEnded` y `ProjectileHit`. Los cuerpos quietos se duermen (despiertan con `BlockChanged` y `ChunkDataEvent` del mundo, entre otras cosas) y, con muchos cuerpos despiertos, el paso corre en los hilos de cómputo. Fases P0 a P4 hechas | ecs, app, math, tasks, transform, voxel, world, diagnostic |
 | `boxel_pack` | lector de resource packs de Minecraft Java (formatos ~64 a 120): `pack.mcmeta` con overlays, texturas de bloque PNG a RGBA8 (animaciones `.png.mcmeta`), modelos de bloque con herencia `parent` y variables `#`, blockstates `variants` y `multipart`. Solo datos; `boxel_render` lo usa para las texturas de bloque | (serde, png) |
@@ -170,7 +171,8 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 
 Features de la fachada: `default = [window, render, voxel, png, debug, physics]`, más `trace` (spans
 de sistemas, implica `debug`), `trace_tracy` (Tracy), `track_location`, `hal` (escape hatch Vulkan),
-`pack` (el lector de resource packs) y `ui` (la interfaz, ADR 0033). `physics` implica `voxel` y
+`pack` (el lector de resource packs) y `ui` (la interfaz, ADR 0033; con `render`, el renderer la
+dibuja). `physics` implica `voxel` y
 expone `boxel::physics`. `debug` hace que los diagnósticos del ECS (conflictos B0001, errores de
 schedule, spans) muestren nombres de sistemas y componentes; conviene apagarla en builds de
 distribución.
@@ -1217,6 +1219,29 @@ los de antes, byte a byte.
   de 6,94 ms; en el hilo principal casi nada (`render.lod` 0,007 ms de media). El agua
   translúcida suma unos 0,04 ms. El terreno lejano se llena en 1,1 a 1,7 s. En la 780M, `near`
   cuesta unos 0,4 ms y `far` 1,1 ms. Detalle en `docs/rendimiento/lod-2026-10.md`.
+
+### 10.10 La interfaz del juego (ADR 0033)
+
+Opcional: solo con la feature `ui` de `boxel_render` (la fachada la prende con `ui` y `render`) y
+la lista de pintura de `boxel_ui` (`UiDraw` con su `UiAtlas`).
+
+- **Cuándo existe.** `UiPass` se crea con la primera lista que no está vacía. Mientras la lista
+  está vacía no abre ningún pase, y sin `UiPlugin` no hay pase: los frames son los de antes,
+  byte a byte.
+- **Qué sube.** `Extract` copia la lista y la página del atlas (un `Arc` cada una) solo cuando
+  el pase no tiene su generación. La lista se convierte y se sube cuando cambia ella o el tamaño
+  del frame; el atlas, cuando cambia su generación. Una interfaz quieta no sube nada. Tras una
+  pérdida del dispositivo, la primera lista crea el pase otra vez y sube todo.
+- **Dibujo.** Un pase con `LoadOp::Load` sobre el color principal, justo después del overlay y
+  antes del blit (las capturas la incluyen y los menús tapan el F3 y la mira), con un solo
+  `draw(0..4, 0..n)`. Liga una textura `Rgba8UnormSrgb` leída con `textureLoad`, nada más
+  (`ui.wgsl`), así que corre en Low y en GL 3.3.
+- **Mismos píxeles.** Cada quad lleva su rectángulo en clip space, el tinte en luz lineal (de la
+  tabla exacta) y el mapeo en enteros relativo a su primer píxel dibujado; todo llega `flat` al
+  fragment. El texel sale con aritmética entera, igual que `UiQuad::texel_at`, aunque el origen
+  del mapeo esté muy lejos de la pantalla. Lo opaco da los mismos bytes que `boxel_ui::raster`
+  en los tres tiers; cada capa translúcida puede redondear un paso distinto
+  (`tests/gpu_ui.rs`).
 
 ---
 

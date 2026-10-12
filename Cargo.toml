@@ -164,8 +164,9 @@ hal = ["boxel_gfx?/hal"]
 # through boxel_render::TextureSource either way; this re-exports the reader as boxel::pack.
 pack = ["dep:boxel_pack"]
 # Game UI (ADR 0033): GUI scale, a retained paint list, sprites, bitmap text and widgets, as
-# boxel::ui. Off by default; its UiPlugin is not in DefaultPlugins (games add it).
-ui = ["window", "dep:boxel_ui"]
+# boxel::ui. Off by default; its UiPlugin is not in DefaultPlugins (games add it). With `render`,
+# the renderer draws its paint list over the frame.
+ui = ["window", "dep:boxel_ui", "boxel_render?/ui"]
 
 [dependencies]
 boxel_ecs.workspace = true

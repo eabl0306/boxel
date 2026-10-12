@@ -460,6 +460,84 @@ fn overlay_and_outline_bind_nothing() {
     }
 }
 
+/// The UI pass (ADR 0033) runs on every tier, the Low one on GL included: one 2D float texture
+/// (the atlas page, read with `textureLoad`) and nothing else: no sampler, uniform, storage
+/// buffer or immediates. Every fragment input but the position is flat, so no tier interpolates
+/// a value the texel or the tint depend on.
+#[test]
+fn ui_binds_one_texture_and_nothing_else() {
+    let id = ShaderModuleId::Ui;
+    let (module, _) = load(id);
+    assert!(!id.uses_immediates());
+    assert_eq!(id.min_gl(), (3, 3));
+    let globals: Vec<_> = module.global_variables.iter().map(|(_, g)| g).collect();
+    assert_eq!(globals.len(), 1, "one global: the atlas");
+    let atlas = globals[0];
+    assert_eq!(atlas.space, naga::AddressSpace::Handle);
+    assert_eq!(
+        atlas.binding,
+        Some(naga::ResourceBinding {
+            group: 0,
+            binding: 0
+        })
+    );
+    assert_eq!(
+        module.types[atlas.ty].inner,
+        naga::TypeInner::Image {
+            dim: naga::ImageDimension::D2,
+            arrayed: false,
+            class: naga::ImageClass::Sampled {
+                kind: naga::ScalarKind::Float,
+                multi: false,
+            },
+        }
+    );
+    let fs = module
+        .entry_points
+        .iter()
+        .find(|e| e.name == "fs_ui")
+        .expect("fs_ui");
+    let mut inputs = Vec::new();
+    for arg in &fs.function.arguments {
+        let naga::TypeInner::Struct { members, .. } = &module.types[arg.ty].inner else {
+            panic!("fs_ui takes the vertex output struct");
+        };
+        for member in members {
+            match member.binding.as_ref().expect("bound member") {
+                naga::Binding::BuiltIn(b) => {
+                    assert_eq!(*b, naga::BuiltIn::Position { invariant: false });
+                }
+                naga::Binding::Location {
+                    location,
+                    interpolation,
+                    ..
+                } => {
+                    assert_eq!(
+                        *interpolation,
+                        Some(naga::Interpolation::Flat),
+                        "location {location} is not flat"
+                    );
+                    inputs.push(*location);
+                }
+            }
+        }
+    }
+    assert_eq!(inputs, [0, 1, 2]);
+    // The quad comes as four instance attributes of one buffer: rect, tint, scale, source.
+    let vs = module
+        .entry_points
+        .iter()
+        .find(|e| e.name == "vs_ui")
+        .expect("vs_ui");
+    let attributes = vs
+        .function
+        .arguments
+        .iter()
+        .filter(|arg| matches!(arg.binding, Some(naga::Binding::Location { .. })))
+        .count();
+    assert_eq!(attributes, 4);
+}
+
 #[test]
 fn low_tier_takes_the_quad_and_its_light_as_two_instance_attributes() {
     let (module, _) = load(ShaderModuleId::VoxelInstanced);

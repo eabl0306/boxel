@@ -1,5 +1,5 @@
 //! Colors: sRGB bytes as the UI stores them, and the exact conversions to and from linear light
-//! that the CPU reference raster uses (and the GPU pass will use for the tint).
+//! that the CPU reference raster uses (and `boxel_render`'s UI pass uses for the tint).
 //!
 //! The tables below are literals computed once in f64 and rounded to f32, so the conversions are
 //! the same on every platform (no `powf`, whose last bit varies between C libraries).

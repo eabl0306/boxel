@@ -252,6 +252,15 @@ pub struct RenderInfo {
     pub lod_arena_used_quads: u32,
     /// LOD arena size in quads (`RenderStats::lod_arena_capacity_quads`).
     pub lod_arena_capacity_quads: u32,
+    /// Quads the UI pass draws each frame (feature `ui`, ADR 0033; 0 without it, before the
+    /// first non-empty paint list and while the list is empty).
+    pub ui_quads: u32,
+    /// UI paint list uploads since the device's UI pass was created (feature `ui`): they happen
+    /// only when the list or the frame size changes, so an idle UI adds none.
+    pub ui_uploads: u64,
+    /// UI atlas page uploads since the device's UI pass was created (feature `ui`): the first
+    /// one, then one per change of the atlas.
+    pub ui_atlas_uploads: u64,
 }
 
 impl RenderInfo {
@@ -396,6 +405,8 @@ impl Plugin for RenderPlugin {
             ),
         )
         .add_systems(Shutdown, shutdown);
+        #[cfg(feature = "ui")]
+        app.add_systems(Render, crate::ui::extract_ui.in_set(RenderSystems::Extract));
     }
 }
 
@@ -437,6 +448,9 @@ struct ReadyGpu {
     renderer: VoxelRenderer,
     /// Overlay rectangles drawn on top of the frame.
     overlay: OverlayPass,
+    /// The game UI drawn over the overlay, created on the first non-empty paint list.
+    #[cfg(feature = "ui")]
+    ui: Option<crate::ui::UiPass>,
     /// `None` only between a failed `Lost` recreation and the next `Setup`.
     surface: Option<wgpu::Surface<'static>>,
     config: wgpu::SurfaceConfiguration,
@@ -474,11 +488,15 @@ impl ReadyGpu {
         let ReadyGpu {
             renderer,
             overlay,
+            #[cfg(feature = "ui")]
+            ui,
             surface,
             config,
             ctx,
             ..
         } = *self;
+        #[cfg(feature = "ui")]
+        drop(ui);
         drop(overlay);
         drop(renderer);
         drop(surface);
@@ -518,6 +536,15 @@ impl GpuState {
             GpuStage::Ready(ready) => Some(ready),
             _ => None,
         }
+    }
+
+    /// The UI pass of the selected device: `None` without a usable device, `Some(None)` before
+    /// the first non-empty paint list.
+    #[cfg(feature = "ui")]
+    pub(crate) fn ui_pass(&self) -> Option<Option<&crate::ui::UiPass>> {
+        self.ready()
+            .filter(|r| !r.ctx.health.is_lost())
+            .map(|r| r.ui.as_ref())
     }
 
     /// Leaves `Ready` (dropping renderer, surface, context) and enters `next`. Returns whether a
@@ -637,6 +664,9 @@ pub(crate) struct ExtractedFrame {
     screenshots: Vec<PathBuf>,
     /// Copy of `OverlayDraw::rects`.
     overlay: Vec<OverlayRect>,
+    /// The UI's paint list and atlas page when the UI pass lacks them (`crate::ui`).
+    #[cfg(feature = "ui")]
+    pub(crate) ui: crate::ui::UiExtract,
     /// The block outline of `BlockOutline`, as the world has the block this frame.
     outline: Option<Outline>,
     /// The chunks the camera may see this frame (cave culling), `None` when off.
@@ -1075,6 +1105,8 @@ fn bootstrap(p: &mut SetupParams) {
     p.gpu.stage = GpuStage::Ready(Box::new(ReadyGpu {
         renderer,
         overlay,
+        #[cfg(feature = "ui")]
+        ui: None,
         surface: Some(surface),
         config: surface_config,
         ctx,
@@ -1650,6 +1682,14 @@ fn prepare(
         &frame.overlay,
         UVec2::new(color.width, color.height),
     );
+    #[cfg(feature = "ui")]
+    crate::ui::prepare_ui(
+        &mut ready.ui,
+        &ready.ctx.device,
+        queue,
+        &mut frame.ui,
+        UVec2::new(color.width, color.height),
+    );
     frame.view = frame.camera.map(|(camera, transform)| {
         let aspect = ready.config.width.max(1) as f32 / ready.config.height.max(1) as f32;
         let view = CameraView::compute(&camera, &transform, aspect);
@@ -1710,6 +1750,10 @@ fn draw(
                     ready
                         .overlay
                         .encode(&mut encoder, ready.renderer.main_color_view());
+                    #[cfg(feature = "ui")]
+                    if let Some(ui) = &ready.ui {
+                        ui.encode(&mut encoder, ready.renderer.main_color_view());
+                    }
                     ready.renderer.blit(&mut encoder, &target);
                     // wgpu validates and encodes the recorded commands here
                     let _span = frame_span!("render.finish");
@@ -1786,6 +1830,10 @@ fn render_offscreen(ready: &mut ReadyGpu, view: &ViewParams) {
         ready
             .overlay
             .encode(&mut encoder, ready.renderer.main_color_view());
+        #[cfg(feature = "ui")]
+        if let Some(ui) = &ready.ui {
+            ui.encode(&mut encoder, ready.renderer.main_color_view());
+        }
         let _span = frame_span!("render.finish");
         let errors = ready.ctx.health.error_count();
         (encoder.finish(), errors)
@@ -1929,6 +1977,14 @@ fn cleanup(
             info.lod_upload_quads = stats.lod_upload_quads;
             info.lod_arena_used_quads = stats.lod_arena_used_quads;
             info.lod_arena_capacity_quads = stats.lod_arena_capacity_quads;
+            #[cfg(feature = "ui")]
+            {
+                let ui = ready.ui.as_ref().map(crate::ui::UiPass::stats);
+                let ui = ui.unwrap_or_default();
+                info.ui_quads = ui.quads;
+                info.ui_uploads = ui.uploads;
+                info.ui_atlas_uploads = ui.atlas_uploads;
+            }
             if let Some(mut board) = board {
                 board.set("render", render_line(ready.ctx.tier, &stats));
             }

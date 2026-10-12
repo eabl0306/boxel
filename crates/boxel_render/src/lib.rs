@@ -45,6 +45,8 @@ mod renderer;
 mod smoke;
 mod texture_animation;
 mod textures;
+#[cfg(feature = "ui")]
+mod ui;
 
 mod arena;
 mod chunk_table;
@@ -76,6 +78,8 @@ pub use smoke::RendererSmokeTest;
 pub use sort::TranslucentSort;
 pub use texture_animation::{DEFAULT_TEXTURE_UPLOAD_BUDGET, FrameKey, LayerAnimation};
 pub use textures::{BLOCK_TEXTURE_SIZE, BlockTextureData, generate_block_textures};
+#[cfg(feature = "ui")]
+pub use ui::{UiPass, UiPassStats};
 pub use upload::arena_len;
 
 /// Format of the main color target (screenshots read it).

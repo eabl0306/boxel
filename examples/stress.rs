@@ -48,6 +48,10 @@
 //! when the latest chunk job finished, so the summary gives the border catch-up both on the
 //! frame clock and as the work lag (crossing frame start to the last job of the crossing).
 //!
+//! `--ui` adds the engine's UI (`UiPlugin`, ADR 0033) with nothing declared: an empty paint list,
+//! for which the renderer creates no UI pass. It needs a build with `--features ui`; the run
+//! against one without it measures what an idle UI costs.
+//!
 //! `--screenshot PATH` saves the frame where the measurement ends, while the world catches up:
 //! what a player sees right after flying, for looking at the leading edge (with `--lod`, ADR
 //! 0031). `--screenshot-yaw DEG` turns the camera for that frame; the flight's yaw plus 180
@@ -178,6 +182,8 @@ usage: stress [--scenario static|fly|dive|spin|path] [GPU options] [options]
                       +waterY
   --sort on|off       sort the translucent quads inside each chunk for the camera (default on, on
                       the async compute pool); off keeps the mesher's order
+  --ui                the engine's UI with nothing declared: an empty paint list, no UI pass
+                      (needs a build with --features ui)
   --help              this text
 The run presents with --present immediate unless --vsync, --present or BOXEL_PRESENT is given.
 exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 output not written, 4 timeout";
@@ -306,6 +312,8 @@ struct Options {
     fog_haze: f32,
     /// `--lod`.
     lod: lod::LodPreset,
+    /// `--ui`: `UiPlugin` with an empty paint list.
+    ui: bool,
     /// The route of the `path` scenario through the cave `--cave` found (empty before
     /// [`find_cave`] and without `--cave`).
     path: Vec<DVec3>,
@@ -365,6 +373,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         fog_res: FogResolution::Half,
         fog_steps: boxel::fog::DEFAULT_MAX_STEPS,
         fog_haze: 1.0,
+        ui: false,
         path: Vec::new(),
     };
     let mut timeout = None;
@@ -534,6 +543,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--cave" => o.cave = true,
             "--idle-work" => o.idle_work = on_off(flag, &value()?)?,
             "--no-distance-fog" => o.no_distance_fog = true,
+            "--ui" if cfg!(feature = "ui") => o.ui = true,
+            "--ui" => return Err("--ui needs a build with --features ui".into()),
             "--fog" => o.fog = fog::parse(flag, &value()?)?,
             "--lod" => o.lod = lod::parse(flag, &value()?)?,
             "--fog-res" => o.fog_res = fog::parse_resolution(flag, &value()?)?,
@@ -1773,6 +1784,11 @@ fn main() -> AppExit {
     if let Some(settings) = options.lod.settings() {
         app.add_plugins(LodPlugin::new(settings));
     }
+    // `--ui`: the UI with nothing declared (an empty paint list, so no UI pass).
+    #[cfg(feature = "ui")]
+    if options.ui {
+        app.add_plugins(UiPlugin);
+    }
     if options.bodies.enabled() {
         let [x, y, z, ..] = options.camera;
         app.add_plugins(BodiesPlugin {
@@ -1932,6 +1948,17 @@ mod tests {
         }
         assert!(options(&["--cave-culling=on"]).cave_culling);
         assert!(usage().contains("--cave-culling on|off"));
+    }
+
+    #[test]
+    fn the_ui_needs_its_feature() {
+        assert!(!options(&[]).ui);
+        assert!(usage().contains("--ui"));
+        if cfg!(feature = "ui") {
+            assert!(options(&["--ui"]).ui);
+        } else {
+            assert!(parse(&["--ui"]).is_err());
+        }
     }
 
     #[test]

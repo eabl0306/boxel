@@ -41,6 +41,9 @@ pub const LOD_CULL_WGSL: &str = include_str!("../shaders/lod_cull.wgsl");
 /// `lod_hiz.wgsl`: the depth pyramid the far LOD's High cull tests against (`hiz_reduce`,
 /// ADR 0031).
 pub const LOD_HIZ_WGSL: &str = include_str!("../shaders/lod_hiz.wgsl");
+/// `ui.wgsl`: the game UI's paint list, one atlas texture read with `textureLoad` (`vs_ui`,
+/// `fs_ui`, ADR 0033).
+pub const UI_WGSL: &str = include_str!("../shaders/ui.wgsl");
 
 /// Shader stage of an entry point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +84,9 @@ pub enum ShaderModuleId {
     LodCull,
     /// `lod_hiz`: the depth pyramid of the far LOD's cull (tier High, only with the LOD plugin).
     LodHiz,
+    /// The game UI's paint list (all tiers, only with `boxel_render`'s feature `ui` and a
+    /// non-empty paint list).
+    Ui,
 }
 
 static VOXEL_PULL: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{VOXEL_PULL_WGSL}"));
@@ -95,7 +101,7 @@ static LOD_CULL: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{LO
 
 impl ShaderModuleId {
     /// All modules.
-    pub const ALL: [ShaderModuleId; 11] = [
+    pub const ALL: [ShaderModuleId; 12] = [
         ShaderModuleId::VoxelPull,
         ShaderModuleId::VoxelInstanced,
         ShaderModuleId::Cull,
@@ -107,6 +113,7 @@ impl ShaderModuleId {
         ShaderModuleId::LodPull,
         ShaderModuleId::LodCull,
         ShaderModuleId::LodHiz,
+        ShaderModuleId::Ui,
     ];
 
     /// Debug label.
@@ -123,6 +130,7 @@ impl ShaderModuleId {
             ShaderModuleId::LodPull => "boxel lod_pull",
             ShaderModuleId::LodCull => "boxel lod_cull",
             ShaderModuleId::LodHiz => "boxel lod_hiz",
+            ShaderModuleId::Ui => "boxel ui",
         }
     }
 
@@ -140,6 +148,7 @@ impl ShaderModuleId {
             ShaderModuleId::LodPull => LOD_PULL.as_str(),
             ShaderModuleId::LodCull => LOD_CULL.as_str(),
             ShaderModuleId::LodHiz => LOD_HIZ_WGSL,
+            ShaderModuleId::Ui => UI_WGSL,
         }
     }
 
@@ -196,6 +205,7 @@ impl ShaderModuleId {
             ],
             ShaderModuleId::LodCull => &[("cull_lod", Stage::Compute)],
             ShaderModuleId::LodHiz => &[("hiz_reduce", Stage::Compute)],
+            ShaderModuleId::Ui => &[("vs_ui", Stage::Vertex), ("fs_ui", Stage::Fragment)],
         }
     }
 
@@ -218,7 +228,8 @@ impl ShaderModuleId {
             | ShaderModuleId::Overlay
             | ShaderModuleId::Outline
             | ShaderModuleId::Fog
-            | ShaderModuleId::Lod => (3, 3),
+            | ShaderModuleId::Lod
+            | ShaderModuleId::Ui => (3, 3),
         }
     }
 }
