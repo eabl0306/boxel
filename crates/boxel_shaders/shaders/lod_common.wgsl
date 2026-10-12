@@ -57,7 +57,9 @@ struct LodOut {
 // by a plane where finer detail can lie lower) closes the step down to a finer fluid's top,
 // which lies at least FLUID_SURFACE up that cell (the near water's surface in its lowest block,
 // and a finer LOD level's top is higher still): it starts there, so less of it is a second
-// layer under the finer water, and it is shaded as the top it continues.
+// layer under the finer water, and it is shaded as the top it continues. Where the finer top
+// lies higher in that cell (near water whose top block is the cell's upper one), the skirt
+// under it is a second layer: the LOD does not know the finer top (ADR 0031, known limits).
 fn lod_vertex(q: vec2<u32>, corner: u32, node: vec4<i32>, water: bool) -> LodOut {
   let w = u32(node.w);
   let k = u32(node.x) & LOD_LEVEL_MASK;

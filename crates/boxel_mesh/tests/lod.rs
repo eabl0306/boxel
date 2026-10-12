@@ -936,6 +936,20 @@ fn untinted<'a>(opaque: &'a [Rect], water: &'a [Rect]) -> impl Fn([f64; 3], [f64
     move |o, d| nearest(opaque, o, d, 1.0).is_none() && !crosses(water, o, d, 1.0)
 }
 
+/// A ray from above every surface that crosses a quad of the near water and one of the far water
+/// before it meets an opaque quad: two layers of water blended over what it shows. (Any number
+/// of far water quads is one layer: the far water's depth prepass keeps the nearest.)
+fn twice<'a>(
+    opaque: &'a [Rect],
+    near: &'a [Rect],
+    far: &'a [Rect],
+) -> impl Fn([f64; 3], [f64; 3]) -> bool {
+    move |o, d| {
+        let stop = nearest(opaque, o, d, 1.0).unwrap_or(1.0);
+        crosses(near, o, d, stop) && crosses(far, o, d, stop)
+    }
+}
+
 fn assert_none(what: &str, (cast, failed): (usize, Vec<([f64; 3], [f64; 3])>), count: usize) {
     assert_eq!(cast, count);
     assert!(
@@ -1068,13 +1082,16 @@ fn no_ray_slips_between_full_detail_and_level_one() {
     let any = |s: BlockState| m.canonical(s) != 0;
     let ground = |s: BlockState| ground_state(&m, s);
     // Seas 8 to 14 blocks deep cross the seam at x = 32, their beds sloping either way; the
-    // ground stays inside chunk y 0.
+    // ground stays inside chunk y 0. Their top blocks are even (the near surface 0.875 up the
+    // lower block of its level-1 cell) or odd (up the upper one).
     for (basin, sea, amplitude) in [
         ((32.0, 16.0, 12.0), 18, 0.5),
         ((24.0, 16.0, 16.0), 18, 0.5),
         ((40.0, 16.0, 16.0), 18, 0.5),
         ((20.0, 20.0, 20.0), 24, 0.3),
         ((44.0, 10.0, 20.0), 24, 0.8),
+        ((32.0, 16.0, 12.0), 17, 0.5),
+        ((44.0, 10.0, 20.0), 23, 0.8),
     ] {
         let terrain = Terrain::new(20.0, amplitude, basin, sea);
         let coarse = terrain.cells(&r, &m, 1, [0; 3]);
@@ -1082,10 +1099,10 @@ fn no_ray_slips_between_full_detail_and_level_one() {
         // ray, and its translucent fluid tints it.
         let near = terrain.chunk_mesh(&r);
         let mut opaque = rects(&near, [0.0; 3], 1.0, |_| false);
-        let mut water = water_rects(&near, [0.0; 3], 1.0, false, |_| false);
-        let (o1, w1) = node_rects(&coarse, &m, 1, [0; 3], 0b0000_0001);
+        let near_water = water_rects(&near, [0.0; 3], 1.0, false, |_| false);
+        let (o1, far_water) = node_rects(&coarse, &m, 1, [0; 3], 0b0000_0001);
         opaque.extend(o1);
-        water.extend(w1);
+        let water: Vec<Rect> = near_water.iter().chain(&far_water).copied().collect();
         let mut n = Numbers(11);
         let into_ground = |n: &mut Numbers| {
             let (tx, tz) = (n.between(33.0, 63.0), n.between(2.0, 30.0));
@@ -1130,6 +1147,33 @@ fn no_ray_slips_between_full_detail_and_level_one() {
             found,
             10_000,
         );
+        // One layer of water: the far water's skirt on the seam starts 0.875 up its cell, the
+        // near surface over an even top block. Over an odd one the near surface lies a block
+        // higher, and the skirt under it is a second layer from 0.875 up the cell to the near
+        // surface (a known limit, ADR 0031: the LOD does not know the fine top in its cell).
+        let (cast_n, doubled) = cast(
+            10_000,
+            || Some((above(&mut n)?, into_water(&mut n))),
+            twice(&opaque, &near_water, &far_water),
+        );
+        if sea % 2 == 0 {
+            assert_none(
+                &format!("basin {basin:?} sea {sea}, one layer of water"),
+                (cast_n, doubled),
+                10_000,
+            );
+        } else {
+            let band = (sea - 1) as f64 + 0.875..sea as f64 + 0.875;
+            assert!(
+                !doubled.is_empty(),
+                "basin {basin:?} sea {sea}: no second layer"
+            );
+            for (o, t) in doubled {
+                let k = (32.0 - o[0]) / (t[0] - o[0]);
+                let y = o[1] + k * (t[1] - o[1]);
+                assert!(band.contains(&y), "a second layer at y {y}: {o:?} {t:?}");
+            }
+        }
         // From under the near sea's surface.
         let found = cast(
             10_000,

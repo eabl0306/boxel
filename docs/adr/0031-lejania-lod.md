@@ -436,6 +436,14 @@ Lo que hace que el agua cercana se vea como se ve, y que el LOD tiene que imitar
   celda (un solo bloque de agua, con su superficie a 0,875). En el mar del ejemplo (agua hasta
   y 46, superficie cercana a 46,875 y celda de arriba de 46 a 48) el faldón va justo de 46,875 a
   48. Y se sombrea como la superficie, no como un costado: continúa la superficie.
+- **Límite: alturas impares.** Si el agua cercana llega al bloque de arriba de esa celda (en el
+  nivel 1, un agua cuyo bloque de arriba tiene y impar, como un mar hasta y 45), su superficie
+  queda un bloque más alta y el faldón debajo de ella es una segunda capa de 1 bloque: una línea
+  algo más clara en el borde. El LOD no sabe dónde cae la superficie fina dentro de su celda; la
+  celda solo dice que es agua. Arreglarlo pide que la fuente lo diga (un dato más por celda en
+  `LodSource`), un cambio de contrato que queda pendiente. Empezar el faldón más arriba dejaría
+  una franja sin teñir, que se nota más: con el alfa del agua del ejemplo, la segunda capa mueve
+  el píxel un 23 % del contraste entre agua y fondo, y la franja sin teñir un 63 %.
 - Instanciado: un draw por nodo con agua en el frustum, en la prepasada y en la de color. High: el
   recorte escribe un draw de agua por nodo en una segunda lista por segmento (en los mismos
   buffers, detrás de las listas de caras) y se dibuja con dos `multi_draw_indexed_indirect_count`
@@ -843,6 +851,10 @@ intención del plan:
   `FogPlugin` termina en la superficie del agua lejana y en el fondo del agua cercana. Bajo el
   agua, mirando hacia arriba casi en horizontal más allá del detalle completo, la superficie
   lejana se ve desde abajo; el LOD no oscurece la vista bajo el agua como podría el juego.
+- **Agua lejana en el borde del detalle completo.** Con el bloque de arriba del agua cercana en
+  el bloque de arriba de su celda de nivel 1 (alturas impares), el faldón es una segunda capa de
+  1 bloque bajo la superficie cercana (sección 12). Un agua cercana que corre, con la superficie
+  más baja que 0,875, deja una franja sin teñir bajo el faldón.
 - **Capas de niebla.** Una capa sin bruma que se desvanece al color del cielo en su propio
   alcance deja una franja pálida sobre el terreno lejano (decisión 6). Con bruma la capa sigue
   hasta el horizonte y la franja no aparece (ADR 0032).
@@ -977,6 +989,9 @@ intención del plan:
 - `boxel_shaders`: las entradas de agua validan y traducen a todos los backends, con la posición
   `@invariant` solo en el agua; los bits de costura y oscuridad iguales a los de `boxel_mesh`;
   `water_quads` contra fuerza bruta en las 256 máscaras.
+- Revisión del agua: la prueba de grietas de la costura suma mares de altura impar: ningún rayo
+  se cuela ni llega sin teñir, con alturas pares ningún rayo cruza dos capas de agua, y con
+  impares la segunda capa queda solo en su banda de 1 bloque (el límite).
 - `boxel_render` sin GPU: el balde de agua sube con los de caras, justo detrás; se dibuja aparte,
   sin las costuras que nadie ve; la entrada de High lo lleva; la cuenta de nodos con agua sigue a
   los cambios (máscaras, mallas nuevas, resync).
@@ -1056,7 +1071,8 @@ cargo run --release --example voxel_world -- --adapter radeon --lod near --timeo
 9. El agua lejana translúcida (sección 12): sobre un lago calmo, el borde del detalle completo ya
    no tiene escalón azul; desde arriba, los lagos lejanos muestran su orilla clara y su centro
    oscuro; de noche se oscurecen como los cercanos. Capturas de antes y después en
-   `bench-results/lod-water/` (`leeme.txt`).
+   `bench-results/lod-water/` (`leeme.txt`). En un agua de altura impar el borde puede mostrar
+   una línea de 1 bloque algo más clara (límite conocido).
 
 ## Pendiente
 
@@ -1068,6 +1084,8 @@ cargo run --release --example voxel_world -- --adapter radeon --lod near --timeo
 - M4, según la prueba del dueño: `textureSample` en el nivel 1 para packs de alta resolución,
   hojas más oscuras. El agua translúcida lejana está hecha (sección 12). La niebla sobre el LOD
   pasó al ADR 0032 (bruma lejana).
+- El faldón del agua lejana sobre alturas impares (sección 12): que la fuente diga en qué bloque
+  de su celda cae la superficie del agua, para empezar el faldón ahí.
 - Posibles mejoras de costo: agrupar los eventos de la cobertura por posición de nivel 1,
   cuantizar `T_1` cuando sigue a la región de conservación.
 
