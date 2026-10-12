@@ -62,6 +62,8 @@ pub struct LodMaterials {
     material_class: Box<[LodClass]>,
     /// By material id: a see-through fluid's canonical state.
     see_through: Box<[bool]>,
+    /// Those canonical states (water: usually one).
+    see_through_ids: Box<[u16]>,
     table: MaterialTable,
 }
 
@@ -111,11 +113,15 @@ impl LodMaterials {
         for m in emissive {
             table.set_emissive(m, true);
         }
+        let see_through_ids = (0..n as u16)
+            .filter(|&m| see_through[usize::from(m)])
+            .collect();
         Self {
             classes,
             canonical: canonical.into(),
             material_class: material_class.into(),
             see_through: see_through.into(),
+            see_through_ids,
             table,
         }
     }
@@ -287,13 +293,14 @@ pub fn mesh_node(
     );
     split_octants(out);
     let water = Water::of(padded, materials, level);
+    let near_air = near_air(padded);
     let mut extra = Vec::new();
     if let Some(water) = &water {
         underwater(padded, materials, water, &mut extra);
     }
-    skirts(padded, materials, water.as_ref(), &mut extra);
+    skirts(padded, materials, water.as_ref(), &near_air, &mut extra);
     if let Some(water) = &water {
-        walls(padded, materials, water, &mut extra);
+        walls(padded, materials, water, &near_air, &mut extra);
     }
     append(out, extra);
 }
@@ -362,7 +369,13 @@ pub fn add_underwater(
 pub fn add_skirts(padded: &PaddedChunk, materials: &LodMaterials, level: u8, mesh: &mut ChunkMesh) {
     let water = Water::of(padded, materials, level);
     let mut extra = Vec::new();
-    skirts(padded, materials, water.as_ref(), &mut extra);
+    skirts(
+        padded,
+        materials,
+        water.as_ref(),
+        &near_air(padded),
+        &mut extra,
+    );
     append(mesh, extra);
 }
 
@@ -383,7 +396,7 @@ pub fn add_fluid_walls(
 ) {
     if let Some(water) = Water::of(padded, materials, level) {
         let mut extra = Vec::new();
-        walls(padded, materials, &water, &mut extra);
+        walls(padded, materials, &water, &near_air(padded), &mut extra);
         append(mesh, extra);
     }
 }
@@ -413,22 +426,39 @@ struct Water {
 impl Water {
     /// The see-through fluid of `padded` (cells of level `level`), `None` if it has none.
     fn of(padded: &PaddedChunk, materials: &LodMaterials, level: u8) -> Option<Self> {
+        // Most nodes hold none: one pass over the voxels that compiles to wide compares.
+        let ids = &materials.see_through_ids;
+        let any = ids.iter().any(|&id| {
+            padded
+                .voxels
+                .iter()
+                .fold(false, |found, &m| found | (m == id))
+        });
+        if !any {
+            return None;
+        }
         let clear: Box<[u64]> = (0..PADDED_AREA)
             .map(|row| {
                 let voxels = &padded.voxels[row * PADDED..(row + 1) * PADDED];
-                voxels.iter().enumerate().fold(0, |bits, (z, &m)| {
-                    bits | u64::from(materials.see_through(m)) << z
-                })
+                voxels
+                    .iter()
+                    .enumerate()
+                    .fold(0, |bits, (z, m)| bits | u64::from(ids.contains(m)) << z)
             })
             .collect();
-        if clear.iter().all(|&row| row == 0) {
-            return None;
+        // The columns that hold some (bit `z + 1` of entry `x + 1`): the others lie under none.
+        let mut columns = [0u64; PADDED];
+        for (row, &bits) in clear.iter().enumerate() {
+            columns[row % PADDED] |= bits;
         }
         // Column by column from the top: a cell under a counted cell counts one more, the top
         // cell of a see-through fluid counts 1, air and anything else 0.
         let mut depth = vec![0u8; PADDED_VOLUME].into_boxed_slice();
         for x in -1..=NODE {
-            for z in -1..=NODE {
+            let mut wet = columns[(x + 1) as usize];
+            while wet != 0 {
+                let z = wet.trailing_zeros() as i32 - 1;
+                wet &= wet - 1;
                 let mut above = 0u8;
                 for y in (-1..=NODE).rev() {
                     let i = PaddedChunk::index(x, y, z);
@@ -514,9 +544,9 @@ fn skirts(
     padded: &PaddedChunk,
     materials: &LodMaterials,
     water: Option<&Water>,
+    near_air: &[u64],
     out: &mut Vec<Placed>,
 ) {
-    let near_air = near_air(padded);
     for (face, n) in plane_faces() {
         let step = face_step(face);
         let grid = face_grid(face, n, padded, |c, across| {
@@ -526,7 +556,7 @@ fn skirts(
             } else if materials.see_through(m) {
                 // The top cell of the fluid: air right above it.
                 (padded.get(c[0], c[1] + 1, c[2]) == 0).then(|| face_key(m, 0))
-            } else if !materials.see_through(across) && is_near(&near_air, c) {
+            } else if !materials.see_through(across) && is_near(near_air, c) {
                 let dark = water.map_or(0, |w| w.dark(add(c, step)));
                 Some(face_key(m, dark))
             } else {
@@ -538,10 +568,24 @@ fn skirts(
 }
 
 /// [`add_fluid_walls`]'s quads into `out`.
-fn walls(padded: &PaddedChunk, materials: &LodMaterials, water: &Water, out: &mut Vec<Placed>) {
-    let near_air = near_air(padded);
+fn walls(
+    padded: &PaddedChunk,
+    materials: &LodMaterials,
+    water: &Water,
+    near_air: &[u64],
+    out: &mut Vec<Placed>,
+) {
     let near_water = within_two(|row| water.clear[row]);
+    // The cells a wall can sit on: near the fluid, not near the air.
+    let candidates: Box<[u64]> = near_water
+        .iter()
+        .zip(near_air)
+        .map(|(&w, &a)| w & !a)
+        .collect();
     for (face, n) in plane_faces() {
+        if !on_plane(&candidates, face, n) {
+            continue;
+        }
         let step = face_step(face);
         let grid = face_grid(face, n, padded, |c, across| {
             let m = padded.get(c[0], c[1], c[2]);
@@ -550,7 +594,7 @@ fn walls(padded: &PaddedChunk, materials: &LodMaterials, water: &Water, out: &mu
                 && across != 0
                 && !materials.see_through(across)
                 && is_near(&near_water, c)
-                && !is_near(&near_air, c);
+                && !is_near(near_air, c);
             wall.then(|| face_key(m, water.dark(add(c, step))))
         });
         merge_grid(&grid, face, n, materials.table(), seam(n), out);
@@ -679,6 +723,21 @@ fn merge_grid(
             .with_light_index(seam as u16 | dark << DARK_SHIFT);
             out.push((table.bucket(m, face), quad));
             u0 = u1;
+        }
+    }
+}
+
+/// True if some cell of the node at normal coordinate `n` of `face` has its bit set in the padded
+/// row masks `mask`.
+fn on_plane(mask: &[u64], face: Face, n: i32) -> bool {
+    const INNER: u64 = ((1 << NODE) - 1) << 1;
+    let row = |x: i32, y: i32| (x + 1) as usize + (y + 1) as usize * PADDED;
+    match face.axes().0 {
+        0 => (0..NODE).any(|y| mask[row(n, y)] & INNER != 0),
+        1 => (0..NODE).any(|x| mask[row(x, n)] & INNER != 0),
+        _ => {
+            let bit = 1u64 << (n + 1);
+            (0..NODE).any(|y| (0..NODE).any(|x| mask[row(x, y)] & bit != 0))
         }
     }
 }
