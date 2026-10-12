@@ -2,7 +2,7 @@ use crate::font::{BitmapFont, GLYPH_HEIGHT};
 use crate::layout::UiRect;
 use crate::memory::WidgetKind;
 use crate::skin::SkinSlot;
-use crate::text::Text;
+use crate::text::{self, Text};
 use crate::ui::{Painter, Resp, Response};
 use boxel_math::{IVec2, UVec2};
 use boxel_window::{ImeCursorArea, KeyCode, TextInput};
@@ -257,13 +257,15 @@ impl<'a> Painter<'a> {
             *value = edit.chars.iter().collect();
         }
 
-        // Scroll the text to keep the caret in view, and use the room a shorter text leaves.
+        // Scroll the text to keep the caret in view, with the composition after it, and use the
+        // room a shorter text leaves.
         let chars = &edit.chars;
+        let composing_w = text::measure(font, &preedit, 1) as i32;
         let mut first = first.min(edit.caret);
-        while first < edit.caret && width(font, &chars[first..edit.caret]) > inner_w {
+        while first < edit.caret && width(font, &chars[first..edit.caret]) + composing_w > inner_w {
             first += 1;
         }
-        while first > 0 && width(font, &chars[first - 1..]) <= inner_w {
+        while first > 0 && width(font, &chars[first - 1..]) + composing_w <= inner_w {
             first -= 1;
         }
         let mut last = first;

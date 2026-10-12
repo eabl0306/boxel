@@ -710,6 +710,35 @@ fn an_input_method_composes_at_the_caret_and_commits_as_text() {
     assert_eq!(quads(&t), 9 + 2 + 2);
 }
 
+#[test]
+fn a_composition_at_the_end_of_a_full_field_scrolls_into_view() {
+    let mut t = lone_tester();
+    t.click("test:lone");
+    // 14 "M" fill the 112 GUI pixels the field shows; the caret is at their end.
+    t.type_text("MMMMMMMMMMMMMM");
+    let scale = t.scale();
+    let n = scale.scale() as i32;
+    let text_right = scale.to_physical(IVec2::new(NAME.x + 4 + 112, 0)).x;
+    let ka = measure(t.app.world().resource::<BitmapFont>(), "ka", 1) as i32 * n;
+    t.preedit("ka").frame();
+    let caret_x = t.ime().cursor_area.unwrap().position.x;
+    assert!(
+        caret_x + ka <= text_right,
+        "the composition fits: {caret_x} + {ka} > {text_right}"
+    );
+    // Its underline shows whole (one GUI pixel high, under the glyphs).
+    let underline_y = scale.to_physical(IVec2::new(0, NAME.y + 6 + 8)).y;
+    let underline = t
+        .state()
+        .quads(UiLayer::Screen)
+        .iter()
+        .find(|q| q.min[1] == underline_y && q.max[1] - q.min[1] == n)
+        .copied()
+        .unwrap();
+    assert_eq!(underline.max[0] - underline.min[0], ka);
+    assert_eq!(underline.min[0], caret_x);
+}
+
 // ---- the tabs
 
 #[derive(Resource, Default)]
