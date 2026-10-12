@@ -216,6 +216,32 @@ fn a_press_selects_a_row_and_two_within_250_ms_open_it() {
 }
 
 #[test]
+fn a_press_picks_the_row_drawn_under_the_cursor_though_the_wheel_turns_in_its_frame() {
+    // At the top, a wheel turn up (touchpad momentum) with a press on row 1 (40 to 60).
+    let mut t = list_tester(10);
+    t.move_to(IVec2::new(60, 45)).frame();
+    t.scroll(1.0).press().frame().release().frame();
+    assert_eq!(worlds_of(&t).selected, Some(1));
+    assert_eq!(scroll(&t), 0);
+
+    // At the bottom, a wheel turn down with a press on the last row's lower half.
+    let mut t = list_tester(20);
+    t.move_to(IVec2::new(60, 115)).scroll(-100.0).frame();
+    assert_eq!(scroll(&t), 300);
+    t.scroll(-1.0).press().frame().release().frame();
+    assert_eq!(worlds_of(&t).selected, Some(19));
+
+    // In the middle the press takes the row it was over when drawn (row 6 at 100 of scroll),
+    // not the one the wheel brings under the cursor in the same frame.
+    let mut t = list_tester(20);
+    t.move_to(IVec2::new(60, 55)).scroll(-10.0).frame();
+    assert_eq!(scroll(&t), 100);
+    t.scroll(-1.0).press().frame().release().frame();
+    assert_eq!(worlds_of(&t).selected, Some(6));
+    assert_eq!(scroll(&t), 110);
+}
+
+#[test]
 fn up_and_down_move_the_selection_and_scroll_to_it() {
     let mut t = list_tester(20);
     t.tap(KeyCode::Tab);

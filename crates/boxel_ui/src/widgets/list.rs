@@ -43,7 +43,7 @@ struct ListData {
     /// The latest press on a row: which and when (real time).
     last_press: Option<(usize, Duration)>,
     /// Where the first row's top was last frame (`rect.y - scroll`), to place the rectangles
-    /// its rows' widgets declared then.
+    /// its rows' widgets declared then and the row a press lands on.
     content_y: i32,
 }
 
@@ -205,6 +205,10 @@ impl<'a> Painter<'a> {
             response.changed = true;
         }
         let current = selected.as_deref().copied().flatten();
+        // The scroll the last frame drew, which a press goes by (as every widget's, against the
+        // last frame's rectangles): the wheel, the keyboard and a reveal move it below, and
+        // unclamped yet.
+        let shown = data.scroll;
 
         // The wheel, and a row widget the keyboard just focused.
         let mem = &self.state.memory;
@@ -243,7 +247,7 @@ impl<'a> Painter<'a> {
         {
             if cursor.x >= bar.track.x {
                 if max_scroll > 0 {
-                    let top = bar.top(data.scroll, max_scroll);
+                    let top = bar.top(shown.min(max_scroll), max_scroll);
                     let on_handle = (top..top + bar.handle).contains(&cursor.y);
                     data.grab = Some(if on_handle {
                         cursor.y - top
@@ -252,8 +256,10 @@ impl<'a> Painter<'a> {
                     });
                 }
             } else if cursor.x < rect.x + rows_w && selected.is_some() {
-                let at = (i64::from(cursor.y - rect.y) + i64::from(data.scroll)) / i64::from(row_h);
-                if cursor.y >= rect.y && (0..rows as i64).contains(&at) {
+                // The row drawn under the cursor, from where the first row's top was.
+                let at =
+                    (i64::from(cursor.y) - i64::from(data.content_y)).div_euclid(i64::from(row_h));
+                if (0..rows as i64).contains(&at) {
                     let at = at as usize;
                     let now = self.now();
                     let double = match (data.last_press, now) {
