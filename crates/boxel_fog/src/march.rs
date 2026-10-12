@@ -296,7 +296,9 @@ pub struct Dda {
 
 impl Dda {
     /// The walk of a ray from `t0` through the cells of `params`, the y cell clamped into the
-    /// rows it walks ([`LayerParams::walk_cells`]).
+    /// rows it walks ([`LayerParams::walk_cells`]). With no row to walk, the y cell lands just
+    /// under them, as the shader's `clamp` (a `max`, then a `min`) puts it: outside, so nothing
+    /// is walked.
     pub fn new(eye: [f32; 3], dir: [f32; 3], params: &LayerParams, t0: f32) -> Self {
         let size = params.cell.map(|c| c as f32);
         let mut cell = [0; 3];
@@ -316,7 +318,9 @@ impl Dda {
             let p = eye[a] + t0 * dir[a];
             cell[a] = ((p - params.grid[a]) / size[a]).floor() as i32;
         }
-        cell[1] = cell[1].clamp(params.walk_cells[0], params.walk_cells[1] - 1);
+        cell[1] = cell[1]
+            .max(params.walk_cells[0])
+            .min(params.walk_cells[1] - 1);
         let mut dda = Self {
             cell,
             step,
@@ -397,7 +401,7 @@ impl Dda {
             };
         }
         if axis != 1 {
-            self.cell[1] = self.cell[1].clamp(self.band[0], self.band[1] - 1);
+            self.cell[1] = self.cell[1].max(self.band[0]).min(self.band[1] - 1);
         }
         for a in 0..3 {
             self.t_next[a] = self.boundary(a);
@@ -419,7 +423,7 @@ pub struct Visit {
 }
 
 /// Every cell the ray crosses between `t0` and `t1` inside the rows `params` walks
-/// ([`LayerParams::walk_cells`]), at most `max_cells`.
+/// ([`LayerParams::walk_cells`]), at most `max_cells`; none when no row is left to walk.
 pub fn walk(
     eye: [f32; 3],
     dir: [f32; 3],
@@ -429,6 +433,9 @@ pub fn walk(
     max_cells: usize,
 ) -> Vec<Visit> {
     let mut out = Vec::new();
+    if params.walk_cells[0] >= params.walk_cells[1] {
+        return out;
+    }
     let mut dda = Dda::new(eye, dir, params, t0);
     let mut s0 = t0;
     let mut entered = None;
@@ -2050,6 +2057,33 @@ mod tests {
         let p = LayerParams::new(&layer, [0; 3], 0);
         assert_eq!((p.walk, p.walk_cells), (p.band, p.band_cells));
         assert!(march(&ray(1.5), &[hazy(&layer)], [0.0; 3], 64).steps > 0);
+    }
+
+    /// A layer with no row left to walk (one row along an edged plane, or a band clamped far
+    /// from the origin) walks no cell, and a walk started on it puts the y cell just under it
+    /// instead of panicking.
+    #[test]
+    fn an_empty_walk_visits_nothing() {
+        let mut one_row = slab(0, 16, [16; 3], 0.3);
+        one_row.edge_bottom = 4;
+        assert_eq!(crate::config::validate(&[one_row.clone()], 64), Ok(()));
+        let far = slab(0, 16, [16; 3], 0.3);
+        let cases = [
+            (LayerParams::new(&one_row, [0; 3], 0), [1, 1]),
+            (LayerParams::new(&far, [0, 1 << 40, 0], 0), [-(1 << 30); 2]),
+        ];
+        for (p, cells) in cases {
+            assert_eq!(p.walk_cells, cells);
+            for dir in [
+                [1.0, 0.0, 0.0],
+                norm([0.3, 1.0, 0.2]),
+                norm([0.3, -1.0, 0.2]),
+            ] {
+                assert_eq!(walk([0.5, 8.0, 0.5], dir, &p, 0.0, 10.0, 10), []);
+                let dda = Dda::new([0.5, 8.0, 0.5], dir, &p, 0.0);
+                assert_eq!(dda.cell[1], cells[0] - 1, "{dir:?}");
+            }
+        }
     }
 
     /// A chord that starts past the cells is haze only: no cell, no step.
