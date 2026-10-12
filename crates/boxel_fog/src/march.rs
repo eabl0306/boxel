@@ -99,6 +99,12 @@ pub struct MarchLayer {
     /// Every cell is full (threshold 0 without a rise or edges, softness 0): the march takes
     /// each chord whole.
     pub uniform: bool,
+    /// `1 / max(band height, 1)`: the height in the band multiplies by it
+    /// ([`MarchLayer::height_at`], the soft fog's rise).
+    pub inv_height: f32,
+    /// `1 / (soft[1] - soft[0])` (0 without soft fog): [`MarchLayer::soft_weight`] multiplies by
+    /// it.
+    pub inv_soft: f32,
 }
 
 impl MarchLayer {
@@ -155,6 +161,12 @@ impl MarchLayer {
                 && params.rise == 0
                 && params.edges == [0; 2]
                 && params.gain == noise::MAX_GAIN,
+            inv_height: 1.0 / (params.band[1] - params.band[0]).max(1.0),
+            inv_soft: if soft[1] > soft[0] {
+                1.0 / (soft[1] - soft[0])
+            } else {
+                0.0
+            },
         }
     }
 
@@ -166,8 +178,7 @@ impl MarchLayer {
     /// Brightness by the height `y` (relative to the render origin): linear from the band's
     /// bottom to its top.
     pub fn height_at(&self, y: f32) -> f32 {
-        let [lo, hi] = self.params.band;
-        let h = ((y - lo) / (hi - lo).max(1.0)).clamp(0.0, 1.0);
+        let h = ((y - self.params.band[0]) * self.inv_height).clamp(0.0, 1.0);
         self.height_shade[0] + (self.height_shade[1] - self.height_shade[0]) * h
     }
 
@@ -191,7 +202,7 @@ impl MarchLayer {
     /// How soft the fog is (0 to 1) at `dist` blocks: 1 up to the soft distance, a smoothstep
     /// down to 0 at the end of the blend. Only for a layer with soft fog.
     pub fn soft_weight(&self, dist: f32) -> f32 {
-        let x = ((self.soft[1] - dist) / (self.soft[1] - self.soft[0])).clamp(0.0, 1.0);
+        let x = ((self.soft[1] - dist) * self.inv_soft).clamp(0.0, 1.0);
         x * x * (3.0 - 2.0 * x)
     }
 
@@ -211,7 +222,7 @@ impl MarchLayer {
         let threshold = if p.rise == 0 {
             p.threshold
         } else {
-            let h = ((pos[1] - p.band[0]) / (p.band[1] - p.band[0]).max(1.0)).clamp(0.0, 1.0);
+            let h = ((pos[1] - p.band[0]) * self.inv_height).clamp(0.0, 1.0);
             noise::threshold_at(p.threshold, p.rise, (h * 4096.0) as u32)
         };
         let threshold = if p.edges == [0; 2] {
@@ -284,8 +295,8 @@ pub struct Dda {
 }
 
 impl Dda {
-    /// The walk of a ray from `t0` through the cells of `params`, the y cell clamped into its
-    /// band.
+    /// The walk of a ray from `t0` through the cells of `params`, the y cell clamped into the
+    /// rows it walks ([`LayerParams::walk_cells`]).
     pub fn new(eye: [f32; 3], dir: [f32; 3], params: &LayerParams, t0: f32) -> Self {
         let size = params.cell.map(|c| c as f32);
         let mut cell = [0; 3];
@@ -305,7 +316,7 @@ impl Dda {
             let p = eye[a] + t0 * dir[a];
             cell[a] = ((p - params.grid[a]) / size[a]).floor() as i32;
         }
-        cell[1] = cell[1].clamp(params.band_cells[0], params.band_cells[1] - 1);
+        cell[1] = cell[1].clamp(params.walk_cells[0], params.walk_cells[1] - 1);
         let mut dda = Self {
             cell,
             step,
@@ -315,7 +326,7 @@ impl Dda {
             dir,
             grid: params.grid,
             size,
-            band: params.band_cells,
+            band: params.walk_cells,
         };
         for a in 0..3 {
             dda.t_next[a] = dda.boundary(a);
@@ -407,8 +418,8 @@ pub struct Visit {
     pub entered: Option<usize>,
 }
 
-/// Every cell the ray crosses between `t0` and `t1` inside the band of `params`, at most
-/// `max_cells`.
+/// Every cell the ray crosses between `t0` and `t1` inside the rows `params` walks
+/// ([`LayerParams::walk_cells`]), at most `max_cells`.
 pub fn walk(
     eye: [f32; 3],
     dir: [f32; 3],
@@ -436,7 +447,7 @@ pub fn walk(
         dda.advance(axis);
         entered = Some(entry_face(axis, dda.step[axis]));
         s0 = s1;
-        if dda.cell[1] < params.band_cells[0] || dda.cell[1] >= params.band_cells[1] {
+        if dda.cell[1] < params.walk_cells[0] || dda.cell[1] >= params.walk_cells[1] {
             break;
         }
     }
@@ -591,7 +602,7 @@ pub fn march(ray: &Ray, layers: &[MarchLayer], sky: [f32; 3], max_steps: u32) ->
         }
         let layer = &layers[if up { n } else { layers.len() - 1 - n }];
         let p = &layer.params;
-        let Some((ta, tb)) = band_chord(ray.eye[1], dir[1], p.band) else {
+        let Some((ta, tb)) = band_chord(ray.eye[1], dir[1], p.walk) else {
             continue;
         };
         let tb = tb.min(t_end).min(layer.reach / dir_len);
@@ -705,7 +716,7 @@ fn march_layer(
                 entry = layer.face_shade[entry_face(jump_axis, dda.step[jump_axis])];
                 prev_full = false;
                 s0 = sj;
-                if dda.cell[1] < p.band_cells[0] || dda.cell[1] >= p.band_cells[1] {
+                if dda.cell[1] < p.walk_cells[0] || dda.cell[1] >= p.walk_cells[1] {
                     break;
                 }
                 continue;
@@ -773,7 +784,7 @@ fn march_layer(
         dda.advance(axis);
         entry = layer.face_shade[entry_face(axis, dda.step[axis])];
         s0 = b;
-        if dda.cell[1] < p.band_cells[0] || dda.cell[1] >= p.band_cells[1] {
+        if dda.cell[1] < p.walk_cells[0] || dda.cell[1] >= p.walk_cells[1] {
             break;
         }
     }
@@ -1615,13 +1626,14 @@ mod tests {
 
     /// A layer without haze draws bit for bit what the march drew before the haze existed
     /// (feat/lod 0bd2849), on rays that stay inside the step budget: every kind of layer, near
-    /// the origin and far from it.
+    /// the origin and far from it. Except the walk of the edged cumulus, which since the fog's
+    /// M2 skips the always empty rows along its planes (its hash was `0x3b9d_aed0_bfca_7613`).
     #[test]
     fn haze_0_draws_as_before() {
         let want = [
             ("soft bank", 0xbe13_1c0c_cc28_677d_u64),
             ("soft bank far", 0x1329_67d9_29c4_d600),
-            ("cumulus", 0x3b9d_aed0_bfca_7613),
+            ("cumulus", 0x3552_b81e_a192_c14e),
             ("flat clouds and a full slab", 0x7927_cb21_f71f_bb28),
             ("scene fade", 0xf7f9_683d_3bca_7304),
         ];
@@ -1997,6 +2009,47 @@ mod tests {
         }
         assert!(skipped, "some ray skips an empty step before the ring");
         assert!(empty_in_ring > 0, "some empty step reaches into the ring");
+    }
+
+    /// The row along a plane with an edge is always empty, so the walk leaves it out: a ray
+    /// along it takes no step and draws nothing, as the cells it would have walked had none.
+    /// Without the edge the same ray walks that row.
+    #[test]
+    fn rows_along_edged_planes_are_not_walked() {
+        let mut layer = hazy_bank((4, 8), 0.5);
+        (layer.haze, layer.soft_distance) = (0.0, 0.0);
+        let p = LayerParams::new(&layer, [0; 3], 0);
+        assert_eq!((p.walk, p.walk_cells), ([2.0, 22.0], [1, 11]));
+        assert_eq!((p.band, p.band_cells), ([0.0, 24.0], [0, 12]));
+        let ray = |y: f32| Ray {
+            eye: [0.5, y, 0.5],
+            dir: norm([1.0, 0.0, 0.3]),
+            depths: [300.0; 4],
+        };
+        for y in [0.5, 1.5, 22.5, 23.5] {
+            let r = march(&ray(y), &[hazy(&layer)], [0.0; 3], 64);
+            assert_eq!((r.steps, r.transmittance), (0, [1.0; 4]), "y {y}");
+            // The rows' coverage the walk would have read: none.
+            let row = (y / 2.0).floor() as i32;
+            for x in 0..150 {
+                let c = noise::coverage(&p, [x, row, x / 3]);
+                assert_eq!(c.coverage, 0, "y {y} cell {x}");
+            }
+        }
+        // A ray inside the walked rows still walks them; without edges the plane rows too.
+        assert!(march(&ray(11.0), &[hazy(&layer)], [0.0; 3], 64).steps > 0);
+        // Two rows, both along an edged plane: nothing left to walk.
+        let mut thin = layer.clone();
+        (thin.max_y, thin.edge_bottom, thin.edge_top) = (4, 2, 2);
+        let p = LayerParams::new(&thin, [0; 3], 0);
+        assert_eq!((p.walk, p.walk_cells), ([2.0, 2.0], [1, 1]));
+        for y in [0.5, 2.0, 3.5] {
+            assert_eq!(march(&ray(y), &[hazy(&thin)], [0.0; 3], 64).steps, 0);
+        }
+        (layer.edge_bottom, layer.edge_top) = (0, 0);
+        let p = LayerParams::new(&layer, [0; 3], 0);
+        assert_eq!((p.walk, p.walk_cells), (p.band, p.band_cells));
+        assert!(march(&ray(1.5), &[hazy(&layer)], [0.0; 3], 64).steps > 0);
     }
 
     /// A chord that starts past the cells is haze only: no cell, no step.

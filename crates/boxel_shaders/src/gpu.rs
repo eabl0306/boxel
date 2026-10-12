@@ -83,7 +83,7 @@ pub struct FogHeader {
     pub debug: [i32; 4],
 }
 
-/// One layer of the uniform `Fog` (256 bytes, std140). See `fog.wgsl` for each word.
+/// One layer of the uniform `Fog` (272 bytes, std140). See `fog.wgsl` for each word.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct FogLayerGpu {
@@ -103,8 +103,9 @@ pub struct FogLayerGpu {
     pub lit: [f32; 4],
     /// Face shades: top, bottom, x, z.
     pub face: [f32; 4],
-    /// x, y = distance where the soft fog starts to blend into the cells and where it is all
-    /// cells (0, 0: no soft fog); z, w = brightness at the bottom and the top of the band.
+    /// x = 1 / the length of the soft fog's blend into the cells (0: no soft fog), y = distance
+    /// where it is all cells (0: no soft fog); z, w = brightness at the bottom and the top of
+    /// the band.
     pub soft: [f32; 4],
     /// xyz = offset of the displaced origin cell in its lattice step; w = log2 of the step.
     pub lattice: [u32; 4],
@@ -128,6 +129,10 @@ pub struct FogLayerGpu {
     pub profile_a: [f32; 4],
     /// The same at knots 4 to 7.
     pub profile_b: [f32; 4],
+    /// x, y = the rows the walk crosses, `[min, max)` relative to the render origin's y (the
+    /// band less the row along each plane with an edge, `boxel_fog::LayerParams::walk`); z = 1 /
+    /// max(band height, 1) (the shader multiplies instead of dividing); w = 0.
+    pub walk: [f32; 4],
 }
 
 /// Flags of the fog uniform.

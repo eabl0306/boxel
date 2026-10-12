@@ -524,7 +524,7 @@ fn fog_uniform_layout_matches_the_rust_mirrors() {
     assert_eq!(offsets[..7], header.map(|o| o as u32));
     assert_eq!(u64::from(offsets[7]), FOG_LAYERS_OFFSET);
     let (size, offsets) = struct_layout(&module, "FogLayer");
-    assert_eq!((size as usize, size_of::<FogLayerGpu>()), (256, 256));
+    assert_eq!((size as usize, size_of::<FogLayerGpu>()), (272, 272));
     let layer = [
         offset_of!(FogLayerGpu, band),
         offset_of!(FogLayerGpu, fade),
@@ -542,6 +542,7 @@ fn fog_uniform_layout_matches_the_rust_mirrors() {
         offset_of!(FogLayerGpu, cells),
         offset_of!(FogLayerGpu, profile_a),
         offset_of!(FogLayerGpu, profile_b),
+        offset_of!(FogLayerGpu, walk),
     ];
     assert_eq!(offsets, layer.map(|o| o as u32));
     assert_eq!(

@@ -111,7 +111,7 @@ fn layer_gpu(m: &MarchLayer) -> FogLayerGpu {
         ],
         lit: [r, g, b, m.haze_bottom()],
         face: m.face_shade,
-        soft: [m.soft[0], m.soft[1], m.height_shade[0], m.height_shade[1]],
+        soft: [m.inv_soft, m.soft[1], m.height_shade[0], m.height_shade[1]],
         lattice: [p.m0[0] as u32, p.m0[1] as u32, p.m0[2] as u32, p.log2_scale],
         base_lo: [p.lo[0], p.lo[1], p.lo[2], 0],
         base_hi: [p.hi[0], p.hi[1], p.hi[2], p.seed32],
@@ -126,6 +126,7 @@ fn layer_gpu(m: &MarchLayer) -> FogLayerGpu {
         ],
         profile_a: [k[0], k[1], k[2], k[3]],
         profile_b: [k[4], k[5], k[6], k[7]],
+        walk: [p.walk[0], p.walk[1], m.inv_height, 0.0],
     }
 }
 
@@ -1012,6 +1013,10 @@ mod tests {
             gpu.cells,
             [m.params.band_cells[0], m.params.band_cells[1], 0, 0]
         );
+        // Without edges the walk crosses the whole band (-8..8, 3 under the origin); the
+        // reciprocal of the band's height (16), and no soft fog.
+        assert_eq!(gpu.walk, [-11.0, 5.0, 0.0625, 0.0]);
+        assert_eq!(gpu.soft[..2], [0.0, 0.0]);
         // Edges: their depths, and the profile's span inside them; never uniform. With haze
         // past the cells: the reach, the cells' end, the blend's start and the haze.
         layer.edge_bottom = 4;
@@ -1022,6 +1027,8 @@ mod tests {
         let edged = MarchLayer::new(&layer, origin, 99, [0.5; 3], [10.0, 20.0], profile);
         let gpu = layer_gpu(&edged);
         assert_eq!(gpu.cells[2..], [4, 10]);
+        // The walk leaves out the row (2 blocks) along each edged plane.
+        assert_eq!(gpu.walk[..2], [-9.0, 3.0]);
         assert_eq!(gpu.octave2[3], fog::LAYER_VOLUME, "edges are never uniform");
         assert_eq!(gpu.band[2..], [20.0, 12.0]);
         assert_eq!((gpu.fade[3], gpu.grid[3]), (9.0, 0.5));

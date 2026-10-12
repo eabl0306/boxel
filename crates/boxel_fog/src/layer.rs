@@ -110,6 +110,12 @@ pub struct LayerParams {
     pub band: [f32; 2],
     /// Band in cells relative to `c0[1]`, `[first, end)` (clamped to `+-2^30`).
     pub band_cells: [i32; 2],
+    /// The rows the march walks, relative to the render origin's y (clamped as `band` is): the
+    /// band less the row along each plane with an edge, which is always empty
+    /// ([`noise::row_edge`]), the same rows the haze spans. `[lo, lo]` when no row is left.
+    pub walk: [f32; 2],
+    /// The same rows in cells relative to `c0[1]`, `[first, end)` (`end == first` when none).
+    pub walk_cells: [i32; 2],
     /// Extinction per block of a full cell, times `log2(e)` (the GPU uses `exp2`).
     pub density_log2e: f32,
 }
@@ -150,6 +156,12 @@ impl LayerParams {
             (i128::from(y.div_euclid(cy)) - i128::from(c0[1]))
                 .clamp(-i128::from(BAND_CELL_LIMIT), i128::from(BAND_CELL_LIMIT)) as i32
         };
+        let band_cells = [band_cell(layer.min_y), band_cell(layer.max_y)];
+        let (bottom, top) = (layer.edge_bottom > 0, layer.edge_top > 0);
+        let walk_lo = band_rel(layer.min_y.saturating_add(i64::from(bottom) * cy));
+        let walk_hi = band_rel(layer.max_y.saturating_sub(i64::from(top) * cy)).max(walk_lo);
+        let first = band_cells[0] + i32::from(bottom);
+        let end = (band_cells[1] - i32::from(top)).max(first);
         Self {
             c0,
             grid,
@@ -169,7 +181,9 @@ impl LayerParams {
             edges: [layer.edge_bottom, layer.edge_top],
             gain: gain_units(layer.softness),
             band: [band_rel(layer.min_y), band_rel(layer.max_y)],
-            band_cells: [band_cell(layer.min_y), band_cell(layer.max_y)],
+            band_cells,
+            walk: [walk_lo, walk_hi],
+            walk_cells: [first, end],
             density_log2e: layer.density * std::f32::consts::LOG2_E,
         }
     }

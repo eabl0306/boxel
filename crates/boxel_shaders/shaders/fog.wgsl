@@ -36,8 +36,8 @@ struct FogLayer {
   lit: vec4<f32>,
   // shades of the faces: top, bottom, x, z.
   face: vec4<f32>,
-  // x, y: distance where the soft fog starts to blend into the cells and where it is all cells
-  // (0, 0: no soft fog); z, w: brightness at the bottom and the top of the band.
+  // x: 1 / the length of the soft fog's blend into the cells (0: no soft fog); y: distance where
+  // it is all cells (0: no soft fog); z, w: brightness at the bottom and the top of the band.
   soft: vec4<f32>,
   // xyz: offset of the displaced origin cell inside its lattice step; w: log2 of the step.
   lattice: vec4<u32>,
@@ -59,6 +59,9 @@ struct FogLayer {
   // at knots 0 to 3 and 4 to 7, also the rest of the cells past the step budget.
   profile_a: vec4<f32>,
   profile_b: vec4<f32>,
+  // x, y: the rows the walk crosses, [min, max) relative to the render origin's y (the band less
+  // the row along each plane with an edge, always empty); z: 1 / max(band height, 1); w: 0.
+  walk: vec4<f32>,
 };
 
 struct Fog {
@@ -507,7 +510,7 @@ fn soft_coverage(np: NoiseParams, pos: vec3<f32>, cache: ptr<function, NoiseCach
   var threshold = shape.x;
   if (shape.z != 0u) {
     let band = fog.layers[li].band;
-    let h = clamp((pos.y - band.x) / max(band.y - band.x, 1.0), 0.0, 1.0);
+    let h = clamp((pos.y - band.x) * fog.layers[li].walk.z, 0.0, 1.0);
     threshold = threshold_at(shape.x, shape.z, u32(h * 4096.0));
   }
   let cells = fog.layers[li].cells;
@@ -520,7 +523,7 @@ fn soft_coverage(np: NoiseParams, pos: vec3<f32>, cache: ptr<function, NoiseCach
 // How soft the fog is (0 to 1) at `dist` blocks (MarchLayer::soft_weight).
 fn soft_weight(li: u32, dist: f32) -> f32 {
   let soft = fog.layers[li].soft;
-  let x = clamp((soft.y - dist) / (soft.y - soft.x), 0.0, 1.0);
+  let x = clamp((soft.y - dist) * soft.x, 0.0, 1.0);
   return x * x * (3.0 - 2.0 * x);
 }
 
@@ -600,23 +603,24 @@ fn integrate_ramp(st: ptr<function, March>, s0: f32, s1: f32, sigma0: f32, sigma
   }
 }
 
-// The ray's t interval in layer li's band, clipped to [0, t_end] and to the layer's reach.
+// The ray's t interval in the rows layer li walks, clipped to [0, t_end] and to the layer's
+// reach (the haze spans the same rows).
 fn chord(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, t_end: f32) -> vec2<f32> {
-  let band = fog.layers[li].band;
+  let walk = fog.layers[li].walk;
   var ta = 0.0;
   var tb = FAR;
   if (abs(dir.y) < MIN_DIR) {
-    if (eye.y < band.x || eye.y >= band.y) {
+    if (eye.y < walk.x || eye.y >= walk.y) {
       return vec2<f32>(1.0, 0.0);
     }
   } else {
     let inv = 1.0 / dir.y;
-    let a = (band.x - eye.y) * inv;
-    let b = (band.y - eye.y) * inv;
+    let a = (walk.x - eye.y) * inv;
+    let b = (walk.y - eye.y) * inv;
     ta = max(min(a, b), 0.0);
     tb = max(a, b);
   }
-  return vec2<f32>(ta, min(min(tb, t_end), band.z / dir_len));
+  return vec2<f32>(ta, min(min(tb, t_end), fog.layers[li].band.z / dir_len));
 }
 
 // The color of a segment: lit times the shade and the brightness at the middle's height, faded
@@ -624,11 +628,12 @@ fn chord(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, t_end: f32) -> v
 fn segment_color(li: u32, s0: f32, s1: f32, shade: f32, eye_y: f32, dir_y: f32,
                  dir_len: f32) -> vec3<f32> {
   let mid = 0.5 * (s0 + s1);
+  // The fade divides: multiplied by its reciprocal, llvmpipe (LLVM 21) drew the haze scenes of
+  // gpu_fog with the wrong opacity, which no rounding of a color explains.
   let fade = fog.layers[li].fade;
   let f = clamp((mid * dir_len - fade.x) / max(fade.y - fade.x, 1.0), 0.0, 1.0);
-  let band = fog.layers[li].band;
   let hs = fog.layers[li].soft.zw;
-  let h = clamp((eye_y + mid * dir_y - band.x) / max(band.y - band.x, 1.0), 0.0, 1.0);
+  let h = clamp((eye_y + mid * dir_y - fog.layers[li].band.x) * fog.layers[li].walk.z, 0.0, 1.0);
   let lit = fog.layers[li].lit.rgb * (shade * (hs.x + (hs.y - hs.x) * h));
   return mix(lit, fog.sky.rgb, f);
 }
@@ -775,14 +780,18 @@ fn march_layer(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, up: bool, 
   // The walk (boxel_fog::march::Dda).
   let grid = fog.layers[li].grid.xyz;
   let size3 = fog.layers[li].size.xyz;
-  let band_cells = fog.layers[li].cells.xy;
+  // The rows walked (LayerParams::walk_cells): the band's, less the row along each plane with
+  // an edge.
+  let cells = fog.layers[li].cells;
+  let first = cells.x + select(0, 1, cells.z != 0);
+  let walk_cells = vec2<i32>(first, max(cells.y - select(0, 1, cells.w != 0), first));
   let density = fog.layers[li].fade.z;
   let flags = fog.layers[li].octave2.w;
   let np = noise_params(li);
   // A cell that starts before this is in the soft fog (0: no soft fog).
   let soft_t = fog.layers[li].soft.y / dir_len;
   var cell = vec3<i32>(floor((eye + ta * dir - grid) / size3));
-  cell.y = clamp(cell.y, band_cells.x, band_cells.y - 1);
+  cell.y = clamp(cell.y, walk_cells.x, walk_cells.y - 1);
   var t_next = (grid + vec3<f32>(cell + edge) * size3 - eye) * inv;
   var cache = new_cache();
   var s0 = ta;
@@ -863,13 +872,13 @@ fn march_layer(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, up: bool, 
         let inside = clamp(vec3<i32>(floor((eye + sj * dir - grid) / size3)), cache.lo1, cache.hi1 - 1);
         cell = past * along + inside * (1 - along);
         if (jump_axis != 1u) {
-          cell.y = clamp(cell.y, band_cells.x, band_cells.y - 1);
+          cell.y = clamp(cell.y, walk_cells.x, walk_cells.y - 1);
         }
         t_next = (grid + vec3<f32>(cell + edge) * size3 - eye) * inv;
         entry = face_shade(li, jump_axis, stepv[jump_axis]);
         prev_full = false;
         s0 = sj;
-        if (cell.y < band_cells.x || cell.y >= band_cells.y) { break; }
+        if (cell.y < walk_cells.x || cell.y >= walk_cells.y) { break; }
         skipped = true;
       } else {
         var t_exit = t_next.z;
@@ -935,12 +944,20 @@ fn march_layer(li: u32, eye: vec3<f32>, dir: vec3<f32>, dir_len: f32, up: bool, 
     }
     if ((*st).done || last) { break; }
     if (!skipped) {
-      let along = vec3<bool>(axis == 0u, axis == 1u, axis == 2u);
-      cell += stepv * vec3<i32>(along);
-      t_next = select(t_next, (grid + vec3<f32>(cell + edge) * size3 - eye) * inv, along);
+      // Only the stepped axis' exit moves (Dda::advance).
+      if (axis == 0u) {
+        cell.x += stepv.x;
+        t_next.x = (grid.x + f32(cell.x + edge.x) * size3.x - eye.x) * inv.x;
+      } else if (axis == 1u) {
+        cell.y += stepv.y;
+        t_next.y = (grid.y + f32(cell.y + edge.y) * size3.y - eye.y) * inv.y;
+      } else {
+        cell.z += stepv.z;
+        t_next.z = (grid.z + f32(cell.z + edge.z) * size3.z - eye.z) * inv.z;
+      }
       entry = face_shade(li, axis, stepv[axis]);
       s0 = b;
-      if (cell.y < band_cells.x || cell.y >= band_cells.y) { break; }
+      if (cell.y < walk_cells.x || cell.y >= walk_cells.y) { break; }
     }
   }
   (*st).steps = steps;
