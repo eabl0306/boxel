@@ -585,10 +585,6 @@ fn settings_validate_their_ranges() {
             ..LodSettings::default()
         },
         LodSettings {
-            fade_start: f32::NAN,
-            ..LodSettings::default()
-        },
-        LodSettings {
             arena_quads: 1,
             ..LodSettings::default()
         },

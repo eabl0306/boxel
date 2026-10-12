@@ -34,7 +34,7 @@ use boxel_mesh::{
     BUCKET_COUNT, ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher, PackedQuad,
 };
 use boxel_render::{
-    BlockTextureData, DEFAULT_SKY_COLOR, PackSource, RendererConfig, TextureSource,
+    BlockTextureData, DEFAULT_SKY_COLOR, DistanceFog, PackSource, RendererConfig, TextureSource,
     TranslucentSort, ViewParams, VoxelRenderer, load_block_textures,
 };
 use boxel_transform::Transform;
@@ -203,7 +203,7 @@ fn view(height: f64, tick: u64) -> ViewParams {
     let view = CameraView::compute(&camera, &transform, WIDTH as f32 / HEIGHT as f32);
     ViewParams {
         texture_tick: tick,
-        ..ViewParams::from_camera(&view, &camera, DEFAULT_SKY_COLOR, 0.6)
+        ..ViewParams::from_camera(&view, &camera, DEFAULT_SKY_COLOR, DistanceFog::default())
     }
 }
 
@@ -470,7 +470,7 @@ fn side_view(fluid_time: f32) -> ViewParams {
     let view = CameraView::compute(&camera, &transform, WIDTH as f32 / HEIGHT as f32);
     ViewParams {
         fluid_time,
-        ..ViewParams::from_camera(&view, &camera, DEFAULT_SKY_COLOR, 0.6)
+        ..ViewParams::from_camera(&view, &camera, DEFAULT_SKY_COLOR, DistanceFog::default())
     }
 }
 

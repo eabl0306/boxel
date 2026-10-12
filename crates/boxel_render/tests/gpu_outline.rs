@@ -27,8 +27,8 @@ use boxel_gfx::{
 use boxel_math::{DVec3, I64Vec3, UVec2};
 use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher};
 use boxel_render::{
-    BlockOutline, DEFAULT_SKY_COLOR, Outline, RendererConfig, ViewParams, VoxelRenderer,
-    block_outline_edges,
+    BlockOutline, DEFAULT_SKY_COLOR, DistanceFog, Outline, RendererConfig, ViewParams,
+    VoxelRenderer, block_outline_edges,
 };
 use boxel_transform::Transform;
 use boxel_voxel::{BlockRegistry, BlockState, ChunkData, LocalPos};
@@ -178,7 +178,7 @@ fn view() -> ViewParams {
     let camera = Camera::default();
     let transform = Transform::from_yaw_pitch(eye, yaw, pitch);
     let view = CameraView::compute(&camera, &transform, WIDTH as f32 / HEIGHT as f32);
-    ViewParams::from_camera(&view, &camera, DEFAULT_SKY_COLOR, 0.6)
+    ViewParams::from_camera(&view, &camera, DEFAULT_SKY_COLOR, DistanceFog::default())
 }
 
 fn outline(registry: &BlockRegistry, block: [i64; 3], state: &str) -> Outline {

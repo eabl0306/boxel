@@ -684,20 +684,56 @@ pub fn debug_coverage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DistanceFog;
     use crate::renderer::{DEFAULT_SKY_COLOR, ViewParams};
     use boxel_camera::{Camera, CameraView};
     use boxel_math::DVec3;
     use boxel_transform::Transform;
 
     fn view_at(y: f64) -> ViewParams {
+        view_with(y, DistanceFog::default())
+    }
+
+    fn view_with(y: f64, fog: DistanceFog) -> ViewParams {
         let camera = Camera::default();
         let transform = Transform::from_yaw_pitch(DVec3::new(0.5, y, 0.5), 0.0, 0.0);
         ViewParams::from_camera(
             &CameraView::compute(&camera, &transform, 1.0),
             &camera,
             DEFAULT_SKY_COLOR,
-            0.6,
+            fog,
         )
+    }
+
+    /// Layers faded like the scene take the terrain's distance fog at the view distance, and
+    /// end there; with it off they do not fade and reach their own `max_distance`. Layers with
+    /// their own range keep it either way.
+    #[test]
+    fn scene_layers_follow_the_distance_fog() {
+        let scene = FogLayer::new(0, 8);
+        let mut ranged = FogLayer::new(16, 24);
+        ranged.fade = boxel_fog::FogFade::Range {
+            start: 10.0,
+            end: 20.0,
+        };
+        let settings = FogSettings::new(vec![scene, ranged]);
+        let means = [1.0, 1.0].map(MeanCoverage::level);
+        let distance = Camera::default().view_distance;
+        let on = frame_layers(&settings, &means, &view_at(4.5), 0);
+        assert_eq!(on[0].fade, DistanceFog::default().range(distance));
+        assert_eq!(on[0].fade, [distance - 0.1 * distance, distance]);
+        assert_eq!(on[0].reach(), distance);
+        assert_eq!(on[1].fade, [10.0, 20.0]);
+        assert!((on[0].fade_at(distance - 0.05 * distance) - 0.5).abs() < 1e-5);
+        let off = frame_layers(&settings, &means, &view_with(4.5, DistanceFog::off()), 0);
+        assert_eq!(off[0].fade, crate::NO_FOG);
+        assert_eq!(off[0].reach(), FogLayer::new(0, 8).max_distance);
+        for d in [0.0, distance, 4096.0] {
+            assert_eq!(off[0].fade_at(d), 0.0, "{d}");
+        }
+        assert_eq!(off[1].fade, [10.0, 20.0]);
+        assert_eq!(off[1].reach(), 20.0);
+        assert_eq!(layer_gpu(&off[0]).band[2], off[0].reach());
     }
 
     #[test]

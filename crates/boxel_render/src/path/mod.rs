@@ -614,7 +614,7 @@ mod tests {
         let camera = Camera::default();
         let transform = Transform::from_yaw_pitch(eye, yaw, pitch);
         let cv = CameraView::compute(&camera, &transform, 16.0 / 9.0);
-        ViewParams::from_camera(&cv, &camera, [0.0; 4], 0.6)
+        ViewParams::from_camera(&cv, &camera, [0.0; 4], crate::DistanceFog::default())
     }
 
     /// Chunks with one quad in every opaque face bucket, two cutout quads and one translucent.
@@ -876,7 +876,7 @@ mod tests {
         let view_at = |eye: DVec3| {
             let transform = Transform::from_yaw_pitch(eye, 0.0, 0.0);
             let cv = CameraView::compute(&camera, &transform, 16.0 / 9.0);
-            ViewParams::from_camera(&cv, &camera, [0.0; 4], 0.6)
+            ViewParams::from_camera(&cv, &camera, [0.0; 4], crate::DistanceFog::default())
         };
         let eye = DVec3::new(16.5, 16.5, 16.5);
         let mut cull = CpuCull::default();

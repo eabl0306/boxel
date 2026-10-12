@@ -38,7 +38,9 @@ use boxel_gfx::{
 };
 use boxel_math::{Aabb, DVec3, I64Vec3, UVec2, Vec3};
 use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher};
-use boxel_render::{DEFAULT_SKY_COLOR, RendererConfig, TranslucentSort, ViewParams, VoxelRenderer};
+use boxel_render::{
+    DEFAULT_SKY_COLOR, DistanceFog, RendererConfig, TranslucentSort, ViewParams, VoxelRenderer,
+};
 use boxel_transform::Transform;
 use boxel_voxel::{
     ALL_LINKS, BlockPos, BlockRegistry, BlockState, CHUNK_SHIFT, ChunkData, ChunkFaceInfo,
@@ -448,7 +450,7 @@ fn view_params(view: &View, shift: I64Vec3) -> (ViewParams, CameraView) {
     let camera = Camera::default();
     let cv = CameraView::compute(&camera, &transform, WIDTH as f32 / HEIGHT as f32);
     (
-        ViewParams::from_camera(&cv, &camera, DEFAULT_SKY_COLOR, 0.6),
+        ViewParams::from_camera(&cv, &camera, DEFAULT_SKY_COLOR, DistanceFog::default()),
         cv,
     )
 }

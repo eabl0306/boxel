@@ -33,6 +33,7 @@ macro_rules! frame_span {
 #[cfg(not(feature = "trace"))]
 pub(crate) struct NoSpan;
 
+mod distance_fog;
 pub mod fog;
 mod light;
 pub mod lod;
@@ -52,6 +53,7 @@ mod sort;
 mod targets;
 mod upload;
 
+pub use distance_fog::{DistanceFog, DistanceFogError, NO_FOG};
 pub use light::{LIGHT_LEVELS, SceneLight, light_curve};
 pub use outline::{BlockOutline, Outline, OutlineEdge, block_outline_edges, outline_edges};
 pub use overlay::{OverlayDraw, OverlayRect};
@@ -86,7 +88,7 @@ pub mod prelude {
     pub use crate::fog::FogPlugin;
     pub use crate::lod::{LodPlugin, LodSettings};
     pub use crate::{
-        BlockOutline, PresentSettings, RenderInfo, RenderPlugin, RenderSettings, RequestScreenshot,
-        ScreenshotSaved,
+        BlockOutline, DistanceFog, PresentSettings, RenderInfo, RenderPlugin, RenderSettings,
+        RequestScreenshot, ScreenshotSaved,
     };
 }

@@ -16,9 +16,9 @@ use crate::lod::{LodFeedback, LodInput, LodRenderer, LodSettings, lod_far};
 use crate::outline::{BlockOutline, Outline, OutlineCache};
 use crate::overlay::{OverlayDraw, OverlayPass, OverlayRect};
 use crate::{
-    BlockTextureData, DEFAULT_SKY_COLOR, FLUID_TIME_PERIOD, RendererConfig, RendererSmokeTest,
-    SceneLight, TextureReport, TextureSource, TranslucentSort, ViewParams, VoxelRenderer,
-    generate_block_textures, light_curve, load_block_textures, texture_tick,
+    BlockTextureData, DEFAULT_SKY_COLOR, DistanceFog, FLUID_TIME_PERIOD, RendererConfig,
+    RendererSmokeTest, SceneLight, TextureReport, TextureSource, TranslucentSort, ViewParams,
+    VoxelRenderer, generate_block_textures, light_curve, load_block_textures, texture_tick,
 };
 use boxel_app::{App, Last, MainScheduleOrder, Plugin, Shutdown, Time};
 use boxel_camera::{Camera, CameraView};
@@ -89,8 +89,11 @@ pub struct RenderSettings {
     /// `boxel_world::DaylightPlugin` ([`TimeOfDay`] and [`DaylightCurve`]) the curve gives the sky
     /// color, the sky light and the ambient floor of the current time instead.
     pub clear_color: [f32; 4],
-    /// Fog starts at this fraction of `Camera::view_distance` and ends at the distance.
-    pub fog_start_fraction: f32,
+    /// How the terrain fades into the fog color at `Camera::view_distance` (and at the far
+    /// LOD's horizon while it draws): only the last 10 %, at most 64 blocks, by default;
+    /// `enabled: false` for a hard edge. Read every frame; an invalid change is logged and the
+    /// last valid one stays ([`DistanceFog::validate`]).
+    pub distance_fog: DistanceFog,
     /// What the most occluded corner loses to ambient occlusion (0.55: it keeps 45 %).
     pub ao_strength: f32,
     /// Multiplier of block light (lamps, lava). Default 1.
@@ -124,7 +127,7 @@ impl Default for RenderSettings {
             smoke_level: SmokeLevel::Auto,
             tier_policy: TierPolicy::default(),
             clear_color: DEFAULT_SKY_COLOR,
-            fog_start_fraction: 0.6,
+            distance_fog: DistanceFog::default(),
             ao_strength: SceneLight::DEFAULT_AO_STRENGTH,
             block_light_gain: 1.0,
             light_gamma: SceneLight::DEFAULT_GAMMA,
@@ -623,7 +626,8 @@ pub(crate) struct ExtractedFrame {
     fluid_time: f32,
     /// Game ticks of the texture animations ([`ViewParams::texture_tick`]).
     texture_tick: u64,
-    fog_start_fraction: f32,
+    /// The distance fog of this frame: the last valid `RenderSettings::distance_fog`.
+    pub(crate) distance_fog: DistanceFog,
     render_when_hidden: bool,
     translucent_sort: TranslucentSort,
     /// Full resync: `meshes` holds every ready mesh, `renderer.clear_chunks` runs first.
@@ -1306,6 +1310,17 @@ fn scene_light(
     )
 }
 
+/// The distance fog of the next frames: `fog` if valid, else (logged) the `last` valid one.
+fn valid_distance_fog(fog: DistanceFog, last: DistanceFog) -> DistanceFog {
+    match fog.validate() {
+        Ok(()) => fog,
+        Err(e) => {
+            tracing::warn!("RenderSettings::distance_fog: {e}; the last valid one stays");
+            last
+        }
+    }
+}
+
 /// `RenderSystems::Extract`: the only reads of the main world for this frame's rendering.
 pub(crate) fn extract(
     settings: Res<RenderSettings>,
@@ -1345,7 +1360,9 @@ pub(crate) fn extract(
         &settings,
         clock.as_ref().map(|(time, curve)| (&**time, &**curve)),
     );
-    frame.fog_start_fraction = settings.fog_start_fraction;
+    if settings.is_changed() {
+        frame.distance_fog = valid_distance_fog(settings.distance_fog, frame.distance_fog);
+    }
     frame.fluid_time = time
         .as_ref()
         .map_or(0.0, |t| (t.elapsed_secs_f64() % FLUID_TIME_PERIOD) as f32);
@@ -1640,7 +1657,7 @@ fn prepare(
             light: frame.light,
             fluid_time: frame.fluid_time,
             texture_tick: frame.texture_tick,
-            ..ViewParams::from_camera(&view, &camera, frame.sky_color, frame.fog_start_fraction)
+            ..ViewParams::from_camera(&view, &camera, frame.sky_color, frame.distance_fog)
         }
     });
 }
@@ -2022,6 +2039,26 @@ mod tests {
         assert_eq!(losses.exclusions[0].max_tier, None);
         losses.exclude("nv", Some(Tier::High));
         assert_eq!(losses.exclusions[0].max_tier, None, "never loosened");
+    }
+
+    #[test]
+    fn an_invalid_distance_fog_keeps_the_last_valid_one() {
+        let off = DistanceFog::off();
+        let short = DistanceFog {
+            max_fade: 16.0,
+            ..DistanceFog::default()
+        };
+        assert_eq!(valid_distance_fog(short, off), short);
+        assert_eq!(valid_distance_fog(off, short), off);
+        let bad = DistanceFog {
+            fade_fraction: 2.0,
+            ..DistanceFog::default()
+        };
+        assert_eq!(valid_distance_fog(bad, short), short);
+        assert_eq!(
+            ExtractedFrame::default().distance_fog,
+            DistanceFog::default()
+        );
     }
 
     #[test]

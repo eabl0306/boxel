@@ -462,7 +462,7 @@ mod tests {
             &CameraView::compute(&camera, &transform, 16.0 / 9.0),
             &camera,
             [0.0; 4],
-            0.5,
+            crate::DistanceFog::default(),
         );
         view.render_origin = render_origin;
         view

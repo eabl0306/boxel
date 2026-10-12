@@ -82,7 +82,7 @@ use boxel::math::I64Vec3;
 use boxel::mesh::ChunkMesh;
 use boxel::mesh::{AoPolicy, LightQuantization};
 use boxel::prelude::*;
-use boxel::render::{DEFAULT_SKY_COLOR, ViewParams, cull_counts};
+use boxel::render::{DEFAULT_SKY_COLOR, DistanceFog, ViewParams, cull_counts};
 use boxel::voxel::{CHUNK_SIZE, MAX_BLOCK_COORD, MAX_CHUNK_COORD};
 use boxel::world::DataState;
 use boxel::world::lod::{LodStats, LodWorldPlugin};
@@ -680,7 +680,7 @@ fn cull_lines(
         CameraView::compute(&camera, &t, 16.0 / 9.0)
     };
     let cv = look(yaw);
-    let view = ViewParams::from_camera(&cv, &camera, DEFAULT_SKY_COLOR, 0.6);
+    let view = ViewParams::from_camera(&cv, &camera, DEFAULT_SKY_COLOR, DistanceFog::default());
     let open = eye_in_open(
         cv.render_origin,
         cv.eye_rel,

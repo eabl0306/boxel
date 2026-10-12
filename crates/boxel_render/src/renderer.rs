@@ -1,5 +1,6 @@
 use crate::arena::{QUAD_BYTES, QuadArena};
 use crate::chunk_table::{ChunkRecord, ChunkTable};
+use crate::distance_fog::DistanceFog;
 use crate::fog::{FogInput, FogPass};
 use crate::light::SceneLight;
 use crate::lod::{GpuInputs, LodInput, LodPass, LodReport};
@@ -76,9 +77,10 @@ pub struct ViewParams {
     pub eye_rel: Vec3,
     /// Fog color (linear RGBA).
     pub fog_color: [f32; 4],
-    /// Fog start distance.
+    /// Distance where the terrain starts to fade into the fog color ([`DistanceFog::range`];
+    /// [`crate::NO_FOG`] for none).
     pub fog_start: f32,
-    /// Fog end distance.
+    /// Distance where the terrain has the fog color.
     pub fog_end: f32,
     /// Clear color of the main pass, the sky behind the terrain (linear RGBA).
     pub clear_color: [f32; 4],
@@ -110,23 +112,24 @@ pub fn texture_tick(seconds: f64) -> u64 {
 pub const FLUID_TIME_PERIOD: f64 = 60.0;
 
 impl ViewParams {
-    /// From a camera view: fog from `camera.view_distance * fog_start_fraction` to the distance,
-    /// `sky_color` as both the fog and the clear color, and a noon [`SceneLight`] (set
-    /// [`ViewParams::light`] for another time of day).
+    /// From a camera view: the distance fog `fog` at `camera.view_distance`
+    /// ([`DistanceFog::range`]), `sky_color` as both the fog and the clear color, and a noon
+    /// [`SceneLight`] (set [`ViewParams::light`] for another time of day).
     pub fn from_camera(
         view: &CameraView,
         camera: &Camera,
         sky_color: [f32; 4],
-        fog_start_fraction: f32,
+        fog: DistanceFog,
     ) -> Self {
+        let [fog_start, fog_end] = fog.range(camera.view_distance);
         Self {
             view_proj: view.view_proj,
             frustum: view.frustum,
             render_origin: view.render_origin,
             eye_rel: view.eye_rel,
             fog_color: sky_color,
-            fog_start: camera.view_distance * fog_start_fraction,
-            fog_end: camera.view_distance,
+            fog_start,
+            fog_end,
             clear_color: sky_color,
             light: SceneLight::default(),
             fluid_time: 0.0,
@@ -761,8 +764,8 @@ impl VoxelRenderer {
     /// Without LOD nothing of it exists and frames are what they were before. With it and the
     /// input drawing ([`LodInput::far`]), each `render` draws the nodes right after the opaque
     /// and cutout terrain, culls the chunks (and High's GPU cull) with the far plane at the
-    /// horizon instead of the view's, and fades the terrain into the fog color from
-    /// `fade_start` of the horizon to the horizon instead of [`ViewParams::fog_start`] to
+    /// horizon instead of the view's, and fades the terrain into the fog color by the input's
+    /// distance fog at the horizon ([`LodInput::fog`]) instead of [`ViewParams::fog_start`] to
     /// [`ViewParams::fog_end`] (the fog layers keep those).
     pub fn set_lod(&mut self, device: &wgpu::Device, input: Option<LodInput>) {
         let Some(input) = input else {

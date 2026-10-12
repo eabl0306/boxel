@@ -46,7 +46,7 @@ use boxel_mesh::{
 };
 use boxel_render::lod::{LodInput, LodOp, LodSettings};
 use boxel_render::{
-    DEFAULT_SKY_COLOR, RendererConfig, RendererSmokeTest, TranslucentSort, ViewParams,
+    DEFAULT_SKY_COLOR, DistanceFog, RendererConfig, RendererSmokeTest, TranslucentSort, ViewParams,
     VoxelRenderer,
 };
 use boxel_transform::Transform;
@@ -395,7 +395,7 @@ fn look(eye: DVec3, target: DVec3) -> ViewParams {
     let camera = Camera::default();
     let transform = Transform::from_yaw_pitch(eye, yaw, pitch);
     let view = CameraView::compute(&camera, &transform, WIDTH as f32 / HEIGHT as f32);
-    ViewParams::from_camera(&view, &camera, DEFAULT_SKY_COLOR, 0.6)
+    ViewParams::from_camera(&view, &camera, DEFAULT_SKY_COLOR, DistanceFog::default())
 }
 
 /// The scene's camera, moved by `shift`: over the floor, through the water wall, toward the
@@ -653,10 +653,12 @@ fn lod_costs_nothing_when_absent_off_or_empty() {
                 (&gpu.name("plain"), &plain),
                 (&gpu.name("empty"), &empty),
             );
+            // The distance fog's rule at the horizon instead of the view distance.
             let want_fog = if gpu.gl() {
                 uniform.fog_params
             } else {
-                [0.5 * HORIZON, HORIZON, 0.0, 0.0]
+                let [start, end] = DistanceFog::default().range(HORIZON);
+                [start, end, 0.0, 0.0]
             };
             if moved.fog_params != want_fog {
                 return Err(format!("fog params {:?}", moved.fog_params));
@@ -673,6 +675,20 @@ fn lod_costs_nothing_when_absent_off_or_empty() {
             }
             if renderer.stats().lod_draws != 0 {
                 return Err("draws without nodes".into());
+            }
+            // The distance fog off: no fade at the horizon either.
+            renderer.set_lod(
+                gpu.device,
+                Some(LodInput {
+                    fog: DistanceFog::off(),
+                    ..LodInput::new(settings(1 << 20), Some(HORIZON))
+                }),
+            );
+            render(gpu, &mut renderer, &view)?;
+            let [start, end] = boxel_render::NO_FOG;
+            let off = renderer.debug_view_uniform().fog_params;
+            if !gpu.gl() && off != [start, end, 0.0, 0.0] {
+                return Err(format!("fog off: fog params {off:?}"));
             }
             renderer.set_lod(gpu.device, None);
             let dropped = render(gpu, &mut renderer, &view)?;
@@ -1444,7 +1460,7 @@ fn seam_scenes() -> &'static [SeamScene] {
                     name: pose.name,
                     chunks: world.chunks(),
                     lod: world.lod_input(),
-                    view: ViewParams::from_camera(&cv, &camera, MAGENTA, 0.6),
+                    view: ViewParams::from_camera(&cv, &camera, MAGENTA, DistanceFog::default()),
                     with_lod: world.visible(&camera, &transform, Some(horizon)),
                     without: world.visible(&camera, &transform, None),
                     ground: ground_pixels(&transform, &camera, SEAM_REACH * f64::from(horizon)),
@@ -1573,7 +1589,7 @@ fn the_lod_moves_the_far_plane_and_keeps_the_fog_layers() {
         };
         let transform = Transform::from_yaw_pitch(DVec3::new(16.5, 100.0, 20.5), 0.0, -0.25);
         let cv = CameraView::compute(&camera, &transform, WIDTH as f32 / HEIGHT as f32);
-        ViewParams::from_camera(&cv, &camera, DEFAULT_SKY_COLOR, 0.6)
+        ViewParams::from_camera(&cv, &camera, DEFAULT_SKY_COLOR, DistanceFog::default())
     };
     let (view_far, view_fog) = (view_at(128.0), view_at(384.0));
     let fog = FogInput {

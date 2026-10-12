@@ -43,7 +43,7 @@ use crate::chunk_table::{GPU_WINDOW, GPU_WINDOW_SLACK};
 use crate::path::bucket_visible;
 use crate::renderer::ViewParams;
 use crate::targets::Targets;
-use crate::{DEPTH_FORMAT, MAIN_COLOR_FORMAT};
+use crate::{DEPTH_FORMAT, DistanceFog, MAIN_COLOR_FORMAT};
 use boxel_math::{Aabb, I64Vec3, Vec3, wrap_to_i32};
 use boxel_mesh::lod::seam_counts;
 use boxel_mesh::{ChunkMesh, MAX_QUADS_PER_FACE_BUCKET};
@@ -218,8 +218,8 @@ impl LodPass {
         self.nodes.far
     }
 
-    /// The terrain fog of the View uniform while the LOD draws: from `fade_start` of the horizon
-    /// to the horizon.
+    /// The terrain fog of the View uniform while the LOD draws: the last input's distance fog at
+    /// the horizon ([`crate::DistanceFog::range`]).
     pub fn fog_params(&self) -> Option<[f32; 4]> {
         self.nodes.fog_params()
     }
@@ -410,9 +410,9 @@ struct LodNodes {
     /// Refused since the last report.
     refused: Vec<ChunkKey>,
     warned_full: bool,
-    /// The last input's horizon when it draws, its fade start and tint.
+    /// The last input's horizon when it draws, its distance fog and tint.
     far: Option<f32>,
-    fade_start: f32,
+    fog: DistanceFog,
     tint: bool,
     draws: Vec<NodeDraw>,
     stats: LodPassStats,
@@ -441,7 +441,7 @@ impl LodNodes {
             refused: Vec::new(),
             warned_full: false,
             far: None,
-            fade_start: 0.0,
+            fog: DistanceFog::default(),
             tint: false,
             draws: Vec::new(),
             stats: LodPassStats::default(),
@@ -477,7 +477,10 @@ impl LodNodes {
 
     /// See [`LodPass::fog_params`].
     fn fog_params(&self) -> Option<[f32; 4]> {
-        self.far.map(|h| [self.fade_start * h, h, 0.0, 0.0])
+        self.far.map(|h| {
+            let [start, end] = self.fog.range(h);
+            [start, end, 0.0, 0.0]
+        })
     }
 
     /// Applies one frame's input: a resync drops every node first, then the ops in order. A mesh
@@ -485,7 +488,7 @@ impl LodNodes {
     /// any more, its older mesh included, and the next [`LodNodes::report`] names it.
     fn apply(&mut self, input: LodInput) {
         self.far = far(&input.settings, input.horizon);
-        self.fade_start = input.settings.fade_start.clamp(0.0, 1.0);
+        self.fog = input.fog;
         if self.tint != input.settings.debug_tint {
             self.tint = input.settings.debug_tint;
             self.touch_all();
@@ -1853,7 +1856,7 @@ mod tests {
         let camera = Camera::default();
         let transform = Transform::from_yaw_pitch(eye, yaw, pitch);
         let cv = CameraView::compute(&camera, &transform, 16.0 / 9.0);
-        let mut view = ViewParams::from_camera(&cv, &camera, [0.0; 4], 0.6);
+        let mut view = ViewParams::from_camera(&cv, &camera, [0.0; 4], DistanceFog::default());
         crate::renderer::far_plane_at(&mut view.frustum, view.eye_rel, 12288.0);
         view
     }
@@ -2137,10 +2140,10 @@ mod tests {
         nodes.cull(&view, false);
         assert!(nodes.draws.is_empty());
         assert_eq!(nodes.fog_params(), None);
-        // The tint, and the fog from fade_start of the horizon to it.
+        // The tint, and the distance fog's rule at the horizon: the last 10 %, at most 64
+        // blocks.
         let mut tinted = input(Vec::new());
         tinted.settings.debug_tint = true;
-        tinted.settings.fade_start = 0.25;
         nodes.apply(tinted);
         nodes.cull(&view, false);
         assert!(
@@ -2149,7 +2152,24 @@ mod tests {
                 .iter()
                 .all(|d| d.immediate.node[3] as u32 & bits::TINT_BIT != 0)
         );
+        assert_eq!(nodes.fog_params(), Some([12224.0, 12288.0, 0.0, 0.0]));
+        // The game's numbers, and the fog off: no fade at the horizon either.
+        let longer = LodInput {
+            fog: DistanceFog {
+                fade_fraction: 0.75,
+                max_fade: 1e6,
+                ..DistanceFog::default()
+            },
+            ..input(Vec::new())
+        };
+        nodes.apply(longer);
         assert_eq!(nodes.fog_params(), Some([3072.0, 12288.0, 0.0, 0.0]));
+        nodes.apply(LodInput {
+            fog: DistanceFog::off(),
+            ..input(Vec::new())
+        });
+        let [start, end] = crate::NO_FOG;
+        assert_eq!(nodes.fog_params(), Some([start, end, 0.0, 0.0]));
     }
 
     #[test]

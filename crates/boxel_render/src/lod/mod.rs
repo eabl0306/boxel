@@ -10,8 +10,9 @@
 //!
 //! Without LOD input the renderer creates none of it (no pipeline, no arena) and every frame is
 //! what it was before. With it ([`crate::VoxelRenderer::set_lod`]) and the LOD on, the main
-//! frustum's far plane and the terrain fog move out to the horizon, so full detail and LOD fade
-//! together into the sky; the fog layers keep their own ranges.
+//! frustum's far plane and the terrain's distance fog move out to the horizon (the same rule as
+//! at the view distance, [`crate::DistanceFog`]), so full detail and LOD fade together into the
+//! sky; the fog layers keep their own ranges.
 //!
 //! - [`LodPlugin`]: the far LOD of an app, world side included (not in any default set of
 //!   plugins).
@@ -30,14 +31,19 @@ pub use boxel_world::lod::{
     LodFeedback, LodFocus, LodOp, LodOps, LodResync, LodSettings, LodStats, LodSystems,
 };
 
+use crate::DistanceFog;
 use boxel_voxel::ChunkKey;
 
 /// One frame of far LOD for [`crate::VoxelRenderer::set_lod`].
 #[derive(Clone, Debug)]
 pub struct LodInput {
     /// The settings (valid: [`LodSettings::validate`]). The renderer reads `enabled`,
-    /// `fade_start`, `arena_quads` (a change rebuilds the LOD pass empty) and `debug_tint`.
+    /// `arena_quads` (a change rebuilds the LOD pass empty) and `debug_tint`.
     pub settings: LodSettings,
+    /// The terrain's distance fog while the LOD draws, at the horizon instead of the view
+    /// distance ([`DistanceFog::range`]): the render plugin's `RenderSettings::distance_fog`.
+    /// [`LodInput::new`] gives the default.
+    pub fog: DistanceFog,
     /// The horizon in blocks ([`LodStats::horizon`]), `None` while the world side draws nothing
     /// (it is off, or the keep region reaches the preset's horizon). Without it, or with
     /// `settings.enabled` false, the renderer draws no node and frames are what they are
@@ -51,10 +57,11 @@ pub struct LodInput {
 }
 
 impl LodInput {
-    /// Settings and horizon with no op.
+    /// Settings and horizon with no op, and the default distance fog.
     pub fn new(settings: LodSettings, horizon: Option<f32>) -> Self {
         Self {
             settings,
+            fog: DistanceFog::default(),
             horizon,
             ops: Vec::new(),
             resync: false,

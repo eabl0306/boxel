@@ -207,7 +207,7 @@ fn draw(ctx: &SmokeContext<'_>, smoke: &RendererSmokeTest) -> Result<(), String>
         &CameraView::compute(&camera, &transform, 1.0),
         &camera,
         DEFAULT_SKY_COLOR,
-        0.6,
+        crate::DistanceFog::default(),
     );
     let mut encoder = ctx
         .device

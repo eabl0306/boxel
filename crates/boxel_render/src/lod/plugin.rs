@@ -182,7 +182,9 @@ pub(crate) fn extract_lod(
         horizon,
         ops.take(),
     );
-    frame.lod = input;
+    // The render settings' distance fog, at the horizon while the LOD draws.
+    let fog = frame.distance_fog;
+    frame.lod = input.map(|input| LodInput { fog, ..input });
     if resync {
         resyncs.write(LodResync);
     }
@@ -424,6 +426,17 @@ mod tests {
             "the outbox is taken"
         );
         assert_eq!(resyncs(&mut world), 0);
+        // The render settings' distance fog (the render plugin's extract copies it), at the
+        // horizon.
+        assert_eq!(input.fog, crate::DistanceFog::default());
+        world.resource_mut::<ExtractedFrame>().distance_fog = crate::DistanceFog::off();
+        schedule.run(&mut world);
+        let input = world
+            .resource::<ExtractedFrame>()
+            .lod
+            .clone()
+            .expect("input");
+        assert_eq!(input.fog, crate::DistanceFog::off());
 
         // An invalid change keeps the last valid settings.
         world.resource_mut::<LodSettings>().ring_radius = 0;
@@ -632,7 +645,8 @@ mod tests {
 
             // The renderer's cull view with the LOD: the far plane at the horizon.
             let cv = CameraView::compute(&camera, &transform, aspect);
-            let mut view = ViewParams::from_camera(&cv, &camera, [0.0; 4], 0.6);
+            let mut view =
+                ViewParams::from_camera(&cv, &camera, [0.0; 4], crate::DistanceFog::default());
             far_plane_at(&mut view.frustum, view.eye_rel, HORIZON);
             let published: Vec<_> = map
                 .ready_meshes()

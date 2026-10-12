@@ -27,7 +27,9 @@ use boxel_math::{DVec3, I64Vec3, IVec3, UVec2};
 use boxel_mesh::{
     BUCKET_COUNT, ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher, PackedQuad, layout,
 };
-use boxel_render::{DEFAULT_SKY_COLOR, RendererConfig, TranslucentSort, ViewParams, VoxelRenderer};
+use boxel_render::{
+    DEFAULT_SKY_COLOR, DistanceFog, RendererConfig, TranslucentSort, ViewParams, VoxelRenderer,
+};
 use boxel_transform::Transform;
 use boxel_voxel::{BlockRegistry, BlockState, ChunkData, Face, LocalPos, NEIGHBOR_OFFSETS};
 use std::path::PathBuf;
@@ -327,7 +329,8 @@ fn look(eye: DVec3, target: DVec3, clear: [f32; 4]) -> ViewParams {
     let camera = Camera::default();
     let transform = Transform::from_yaw_pitch(eye, yaw, pitch);
     let view = CameraView::compute(&camera, &transform, WIDTH as f32 / HEIGHT as f32);
-    let mut view = ViewParams::from_camera(&view, &camera, DEFAULT_SKY_COLOR, 0.6);
+    let mut view =
+        ViewParams::from_camera(&view, &camera, DEFAULT_SKY_COLOR, DistanceFog::default());
     view.clear_color = clear;
     view
 }

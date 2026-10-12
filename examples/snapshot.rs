@@ -1008,7 +1008,7 @@ fn run(
             light,
             fluid_time: (o.fluid_time % FLUID_TIME_PERIOD) as f32,
             texture_tick: texture_tick(o.fluid_time),
-            ..ViewParams::from_camera(&view, &camera, sky_color, settings.fog_start_fraction)
+            ..ViewParams::from_camera(&view, &camera, sky_color, settings.distance_fog)
         };
         // The first frame uploads; the second draws exactly what a steady game frame draws.
         render(&gpu.device, &gpu.queue, &mut renderer, &params).map_err(gpu_err)?;

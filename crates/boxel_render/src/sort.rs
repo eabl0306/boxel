@@ -1256,7 +1256,7 @@ mod tests {
         let camera = Camera::default();
         let transform = Transform::from_yaw_pitch(eye, yaw, pitch);
         let cv = CameraView::compute(&camera, &transform, 16.0 / 9.0);
-        ViewParams::from_camera(&cv, &camera, [0.0; 4], 0.6)
+        ViewParams::from_camera(&cv, &camera, [0.0; 4], crate::DistanceFog::default())
     }
 
     /// Two translucent quads (y planes 3 and 9) and one opaque quad.

@@ -48,7 +48,8 @@ use boxel_gfx::{
 use boxel_math::{Aabb, DVec3, I64Vec3, UVec2, Vec3};
 use boxel_mesh::{AoPolicy, ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher};
 use boxel_render::{
-    DEFAULT_SKY_COLOR, RendererConfig, TranslucentSort, ViewParams, VoxelRenderer, arena_len,
+    DEFAULT_SKY_COLOR, DistanceFog, RendererConfig, TranslucentSort, ViewParams, VoxelRenderer,
+    arena_len,
 };
 use boxel_transform::Transform;
 use boxel_voxel::{BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, NEIGHBOR_OFFSETS};
@@ -257,7 +258,7 @@ fn view_params(camera: &Camera, transform: &Transform, shift: I64Vec3) -> ViewPa
     let mut transform = *transform;
     transform.translation += shift.as_dvec3();
     let view = CameraView::compute(camera, &transform, WIDTH as f32 / HEIGHT as f32);
-    ViewParams::from_camera(&view, camera, DEFAULT_SKY_COLOR, 0.6)
+    ViewParams::from_camera(&view, camera, DEFAULT_SKY_COLOR, DistanceFog::default())
 }
 
 /// The default camera with a view distance of `2^34` voxels, past the chunks left behind by a
@@ -822,7 +823,7 @@ fn render_cracks(
         let cv = CameraView::compute(&camera, &transform, aspect);
         let params = ViewParams {
             clear_color: CRACK_CLEAR,
-            ..ViewParams::from_camera(&cv, &camera, DEFAULT_SKY_COLOR, 0.6)
+            ..ViewParams::from_camera(&cv, &camera, DEFAULT_SKY_COLOR, DistanceFog::default())
         };
         let (image, _) = render(&device, &queue, &mut renderer, &params)?;
         images.push(image);
@@ -1200,7 +1201,7 @@ fn lit_view_params(view: &LitView, shift: I64Vec3) -> ViewParams {
             ambient: daylight.ambient,
             ..SceneLight::noon()
         },
-        ..ViewParams::from_camera(&cv, &camera, daylight.sky_color, 0.6)
+        ..ViewParams::from_camera(&cv, &camera, daylight.sky_color, DistanceFog::default())
     }
 }
 

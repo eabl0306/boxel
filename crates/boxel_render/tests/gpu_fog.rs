@@ -14,8 +14,8 @@
 //!   equals the reference composite of its texel over the fog-free pixel (2 / 255).
 //! - **Tiers:** every tier draws the scenes (flat clouds and volumetric clouds with edges from
 //!   below, just under them, inside and above, a camera inside a blanket and inside a soft bank,
-//!   an edged bank seen from its top's height, a noisy bank over the floor, fog over water, fog
-//!   behind glass, dusk) like the best tier of its adapter, at half and full resolution (0.1 %
+//!   an edged bank seen from its top's height, a noisy bank over the floor, with the terrain's
+//!   distance fog off too, fog over water, fog behind glass, dusk) like the best tier of its adapter, at half and full resolution (0.1 %
 //!   of the pixels, tolerance 2).
 //! - **Origins:** the same camera with render origins a few blocks apart draws the same image,
 //!   with cubic and soft fog.
@@ -41,7 +41,7 @@ use boxel_math::{DVec3, I64Vec3, UVec2, Vec3};
 use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher};
 use boxel_render::fog::{FogInput, FogSettings, debug_coverage, frame_layers};
 use boxel_render::{
-    DEFAULT_SKY_COLOR, RendererConfig, RendererSmokeTest, TranslucentSort, ViewParams,
+    DEFAULT_SKY_COLOR, DistanceFog, RendererConfig, RendererSmokeTest, TranslucentSort, ViewParams,
     VoxelRenderer,
 };
 use boxel_transform::Transform;
@@ -285,7 +285,14 @@ fn look(eye: DVec3, target: DVec3) -> ViewParams {
     let camera = Camera::default();
     let transform = Transform::from_yaw_pitch(eye, yaw, pitch);
     let view = CameraView::compute(&camera, &transform, WIDTH as f32 / HEIGHT as f32);
-    ViewParams::from_camera(&view, &camera, DEFAULT_SKY_COLOR, 0.6)
+    ViewParams::from_camera(&view, &camera, DEFAULT_SKY_COLOR, DistanceFog::default())
+}
+
+/// The view with the terrain's distance fog off: layers faded like the scene
+/// (`FogFade::Scene`) do not fade and reach their `max_distance`.
+fn no_distance_fog(mut view: ViewParams) -> ViewParams {
+    [view.fog_start, view.fog_end] = boxel_render::NO_FOG;
+    view
 }
 
 /// A dusk light and sky.
@@ -474,6 +481,16 @@ fn shots() -> Vec<Shot> {
             "bank",
             World::Floor,
             look(DVec3::new(-20.5, 22.0, -20.5), DVec3::new(16.0, 2.0, 16.0)),
+            vec![bank()],
+            true,
+        ),
+        shot(
+            "bank_no_distance_fog",
+            World::Floor,
+            no_distance_fog(look(
+                DVec3::new(-20.5, 22.0, -20.5),
+                DVec3::new(16.0, 2.0, 16.0),
+            )),
             vec![bank()],
             true,
         ),
@@ -1182,7 +1199,7 @@ fn render_origins_a_few_blocks_apart_draw_the_same_fog() {
         cv.frustum = boxel_math::Frustum::from_view_proj_reverse_z(cv.view_proj);
         cv.frustum
             .set_max_distance(cv.eye_rel, cv.forward, camera.view_distance);
-        ViewParams::from_camera(&cv, &camera, DEFAULT_SKY_COLOR, 0.6)
+        ViewParams::from_camera(&cv, &camera, DEFAULT_SKY_COLOR, DistanceFog::default())
     };
     let views = [
         shifted(I64Vec3::ZERO),

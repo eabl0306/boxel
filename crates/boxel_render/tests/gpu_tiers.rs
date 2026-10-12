@@ -22,7 +22,9 @@
 //!   fits keeps its old mesh, a smaller mesh reuses the chunk's own range;
 //! - a far scene: a 32x32 slab ~480 voxels away and a second slab of another texture 1 voxel
 //!   behind it (hidden), compared with the front slab alone (depth precision on every backend,
-//!   including GL where reverse-Z loses its precision gain);
+//!   including GL where reverse-Z loses its precision gain); with the distance fog's band over
+//!   the front slab it fades toward the sky, and with the fog off it is the same as far from the
+//!   band (finite numbers on every tier);
 //! - the blocks of ADR 0018, meshed by the real `Mesher` over two chunks: a water pool and a
 //!   glass box (translucent bucket, blended back to front), bottom and top slabs, cross plants
 //!   and logs along X and Z, and the blocks of ADR 0020 (stairs of every kind, a fence run,
@@ -45,8 +47,8 @@ use boxel_mesh::{
     PackedQuad, TRANSLUCENT_BUCKET, layout,
 };
 use boxel_render::{
-    DEFAULT_SKY_COLOR, RendererConfig, RendererError, RendererSmokeTest, TranslucentSort,
-    ViewParams, VoxelRenderer, arena_len,
+    DEFAULT_SKY_COLOR, DistanceFog, RendererConfig, RendererError, RendererSmokeTest,
+    TranslucentSort, ViewParams, VoxelRenderer, arena_len,
 };
 use boxel_transform::Transform;
 use boxel_voxel::{
@@ -569,7 +571,7 @@ fn special_view() -> ViewParams {
 
 fn view_params(camera: &Camera, transform: &Transform) -> ViewParams {
     let view = CameraView::compute(camera, transform, WIDTH as f32 / HEIGHT as f32);
-    ViewParams::from_camera(&view, camera, DEFAULT_SKY_COLOR, 0.6)
+    ViewParams::from_camera(&view, camera, DEFAULT_SKY_COLOR, DistanceFog::default())
 }
 
 /// Looks over the heightfield from above one corner (the slab and the canopy are in view).
@@ -647,6 +649,10 @@ struct TierImages {
     far_both: RgbaImage,
     far_front: RgbaImage,
     far_back: RgbaImage,
+    /// `far_front` with the distance fog's band over the slab (450 to 500 voxels).
+    far_fog_edge: RgbaImage,
+    /// `far_front` with the distance fog off.
+    far_fog_off: RgbaImage,
     /// The blocks of ADR 0018 ([`special_scene`]), and without their translucent quads.
     special: RgbaImage,
     special_opaque: RgbaImage,
@@ -996,6 +1002,14 @@ fn render_tier(
         .upsert_chunk(7, I64Vec3::ZERO, Arc::new(far_scene(registry, true, false)))
         .map_err(|e| e.to_string())?;
     let (far_front, _) = render(&device, &queue, &mut renderer, &far)?;
+    // The distance fog (issue #51): its band at 450 to 500 voxels fades the slab (480 away)
+    // toward the sky; off, nothing fades.
+    let mut edge = far;
+    [edge.fog_start, edge.fog_end] = DistanceFog::default().range(500.0);
+    let (far_fog_edge, _) = render(&device, &queue, &mut renderer, &edge)?;
+    let mut off = far;
+    [off.fog_start, off.fog_end] = boxel_render::NO_FOG;
+    let (far_fog_off, _) = render(&device, &queue, &mut renderer, &off)?;
     renderer
         .upsert_chunk(7, I64Vec3::ZERO, Arc::new(far_scene(registry, false, true)))
         .map_err(|e| e.to_string())?;
@@ -1073,6 +1087,8 @@ fn render_tier(
         far_both,
         far_front,
         far_back,
+        far_fog_edge,
+        far_fog_off,
         special,
         special_opaque,
         special_no_boxes,
@@ -1214,6 +1230,8 @@ fn tiers_render_identically() {
                     (&name("far_both"), &i.far_both),
                     (&name("far_front"), &i.far_front),
                     (&name("far_back"), &i.far_back),
+                    (&name("far_fog_edge"), &i.far_fog_edge),
+                    (&name("far_fog_off"), &i.far_fog_off),
                     (&name("special"), &i.special),
                     (&name("special_opaque"), &i.special_opaque),
                     (&name("special_no_boxes"), &i.special_no_boxes),
@@ -1236,6 +1254,17 @@ fn tiers_render_identically() {
                 &format!("{label} {}: far scene, back slab alone", i.tier),
                 (&name("far_front"), &i.far_front),
                 (&name("far_back"), &i.far_back),
+                0.1,
+            );
+            report.check_same(
+                &format!("{label} {}: far scene, distance fog off", i.tier),
+                (&name("far_fog_off"), &i.far_fog_off),
+                (&name("far_front"), &i.far_front),
+            );
+            report.check_differs(
+                &format!("{label} {}: far scene in the distance fog's band", i.tier),
+                (&name("far_front"), &i.far_front),
+                (&name("far_fog_edge"), &i.far_fog_edge),
                 0.1,
             );
             report.check_range(&name("special"), &i.special, 0.3..=1.0);
@@ -1314,6 +1343,7 @@ fn tiers_render_identically() {
                 ("canopy", &best.canopy, &i.canopy),
                 ("minus_chunk", &best.minus_chunk, &i.minus_chunk),
                 ("far_both", &best.far_both, &i.far_both),
+                ("far_fog_edge", &best.far_fog_edge, &i.far_fog_edge),
                 ("special", &best.special, &i.special),
                 ("special_opaque", &best.special_opaque, &i.special_opaque),
                 (

@@ -113,9 +113,6 @@ pub struct LodSettings {
     pub ring_radius: u32,
     /// `K`: the coarsest level (1..=[`MAX_LEVELS`]). The horizon is `32 R 2^K` blocks.
     pub levels: u8,
-    /// Where the terrain fog starts, as a fraction of the horizon (0..=1; 1: a hard edge). Read
-    /// by the renderer.
-    pub fade_start: f32,
     /// Quads the renderer's LOD arena holds (1 Mi..=32 Mi, clamped to the device). Read by the
     /// renderer.
     pub arena_quads: u32,
@@ -153,7 +150,6 @@ impl Default for LodSettings {
             enabled: true,
             ring_radius: 24,
             levels: 4,
-            fade_start: 0.5,
             arena_quads: 12 << 20,
             in_flight_busy: 2,
             in_flight_settled: 5,
@@ -188,9 +184,6 @@ impl LodSettings {
         }
         if !(1..=MAX_LEVELS).contains(&self.levels) {
             return err(format!("levels {} is not in 1..={MAX_LEVELS}", self.levels));
-        }
-        if !(0.0..=1.0).contains(&self.fade_start) {
-            return err(format!("fade_start {} is not in 0..=1", self.fade_start));
         }
         if !((1 << 20)..=(32 << 20)).contains(&self.arena_quads) {
             return err(format!(
