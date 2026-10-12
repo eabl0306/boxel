@@ -71,20 +71,31 @@ pub struct CursorLeft;
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq)]
 pub struct CursorPosition(pub Option<Vec2>);
 
-/// Text the user typed, in order: what each key press wrote under the user's layout (dead keys
-/// arrive composed: "´" then "e" is one "é"), and every input method commit
-/// ([`ImeEvent::Commit`]). Never empty and without control characters: Enter, Backspace, Tab,
-/// Escape and Delete only arrive as [`KeyboardInput`]. Held keys type again with the OS repeat;
-/// keys pressed with Ctrl or Super (Command) are shortcuts and type nothing (Ctrl+Alt, Windows'
-/// Alt Gr, does). A text field reads this; game controls read keys.
+/// What a text field reads, in the order the user typed it: the text of each key press and
+/// input method commit, and the presses that typed nothing (Backspace, Enter, the arrows,
+/// shortcuts). One stream, so "x", Backspace, "y" within a frame does not read as Backspace,
+/// "x", "y". Key releases and the presses winit makes up for keys already held when the window
+/// gains focus send nothing. Game controls read [`KeyboardInput`] instead.
 #[derive(Message, Clone, Debug, PartialEq, Eq)]
-pub struct TextInput {
-    /// The typed text.
-    pub text: String,
+pub enum TextInput {
+    /// Typed text: what a key press wrote under the user's layout (dead keys arrive composed:
+    /// "´" then "e" is one "é") or an input method commit ([`ImeEvent::Commit`]). Never empty
+    /// and without control characters. Held keys type again with the OS repeat.
+    Text(String),
+    /// A key press that typed nothing: Enter, Backspace, Tab, Escape and Delete (their control
+    /// characters are dropped), keys without text (arrows, Home, End, modifiers) and shortcuts,
+    /// keys pressed with Ctrl or Super (Command). Ctrl+Alt is Windows' Alt Gr and types.
+    Key {
+        /// Physical key.
+        key: KeyCode,
+        /// OS key repeat.
+        repeat: bool,
+    },
 }
 
 /// Input method (IME) composition, sent only while `ImeOptions::allowed` is set. While an input
-/// method composes, keys go to it: winit sends no [`KeyboardInput`] for them.
+/// method composes, keys go to it: winit sends no [`KeyboardInput`] (nor [`TextInput::Key`])
+/// for them.
 #[derive(Message, Clone, Debug, PartialEq, Eq)]
 pub enum ImeEvent {
     /// The text being composed, not typed yet: a text field shows it at its caret. Empty when
@@ -96,7 +107,7 @@ pub enum ImeEvent {
         cursor: Option<(usize, usize)>,
     },
     /// The composition ended with this text (without control characters). The same text also
-    /// arrives as a [`TextInput`], in order with the typed keys, so a text field that reads
+    /// arrives as a [`TextInput::Text`], in order with the keys, so a text field that reads
     /// [`TextInput`] must not insert this again.
     Commit(String),
 }

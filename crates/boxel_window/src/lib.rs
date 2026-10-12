@@ -8,9 +8,9 @@
 //!   simulation does not freeze while the window is hidden on Wayland). `RedrawRequested` only
 //!   opens the presentation gate [`WindowState::frame_ready`] (see [`winit_runner`]).
 //! - Window and device events become messages; [`InputPlugin`] folds them into [`ButtonInput`],
-//!   accumulated mouse resources and [`CursorPosition`] in `PreUpdate`. Typed text arrives as
-//!   [`TextInput`] (layout and dead keys applied) and input method composition as [`ImeEvent`],
-//!   enabled through [`ImeOptions`].
+//!   accumulated mouse resources and [`CursorPosition`] in `PreUpdate`. Typed text (layout and
+//!   dead keys applied) and the keys that edit it arrive in order as [`TextInput`], input method
+//!   composition as [`ImeEvent`], enabled through [`ImeOptions`].
 //! - Updates are paced by `boxel_app::FrameLimit` (default 144 fps, 0 = unlimited, changeable
 //!   at runtime), see [`UpdateMode`]. On Wayland a limit at or above the monitor's refresh rate
 //!   follows the display: updates run when the compositor asks for a frame (see

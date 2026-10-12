@@ -90,14 +90,18 @@ el pase (E-UI2) y llega antes de los menús, así que no hay puente.
 
 ### 7. Texto y métodos de entrada (E-UI4)
 
-- El runner manda el texto de cada tecla como `TextInput`, con la distribución del teclado y las
-  teclas muertas ya aplicadas: en X11 y Wayland, "´" y "e" llegan como "é". Quita los caracteres
-  de control, así que Enter, Retroceso, Tab, Esc y Supr siguen siendo solo teclas. Con Ctrl o
-  Super no escribe nada, porque es un atajo (winit da "c" para Ctrl+C). Ctrl+Alt sí escribe: es
-  AltGr en Windows. Una tecla mantenida escribe de nuevo con la repetición del sistema.
+- `TextInput` es un solo flujo en orden con lo que lee un campo de texto. `TextInput::Text` trae
+  el texto de cada tecla, con la distribución del teclado y las teclas muertas ya aplicadas: en
+  X11 y Wayland, "´" y "e" llegan como "é". `TextInput::Key` trae las teclas que no escribieron
+  nada: Enter, Retroceso, Tab, Esc y Supr (sus caracteres de control se quitan), las flechas,
+  Inicio y Fin. Va todo junto porque con dos colas un campo no distingue "x, Retroceso, y" de
+  "Retroceso, x, y" cuando caen en el mismo frame. Con Ctrl o Super la tecla no escribe, porque
+  es un atajo (winit da "c" para Ctrl+C), y llega como `Key`. Ctrl+Alt sí escribe: es AltGr en
+  Windows. Una tecla mantenida se repite con la repetición del sistema. Los controles del juego
+  siguen leyendo `KeyboardInput`.
 - Un método de entrada (IME, por ejemplo para chino o japonés) manda `ImeEvent::Preedit` con lo
-  que se está componiendo. Lo confirmado llega como `TextInput`, en orden con las teclas, y
-  también como `ImeEvent::Commit`. Un campo de texto lee solo `TextInput`.
+  que se está componiendo. Lo confirmado llega como `TextInput::Text`, en orden con las teclas,
+  y también como `ImeEvent::Commit`. Un campo de texto lee solo `TextInput`.
 - `ImeOptions { allowed, cursor_area }` se aplica en el hilo principal junto a `CursorOptions`.
   Va apagado por defecto, porque mientras un IME compone winit no manda las teclas. La interfaz
   lo prende solo con un campo de texto enfocado. Cuando el IME arranca de nuevo (`Ime::Enabled`)

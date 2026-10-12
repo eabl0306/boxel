@@ -153,11 +153,12 @@ impl Default for RunnerSettings {
 /// Details of this implementation:
 /// - Updates start once the window exists and plugins are finished (desktop platforms deliver
 ///   `resumed` before the first `about_to_wait`).
-/// - A key press's text (`KeyEvent::text`, layout and dead keys applied) becomes `TextInput`
-///   without control characters; releases, the synthetic presses of a focus gain and shortcuts
-///   (Ctrl or Super held, but not Ctrl+Alt: Windows' Alt Gr) type nothing. An IME commit becomes
-///   `TextInput` and `ImeEvent::Commit`, a preedit `ImeEvent::Preedit`, and `Ime::Disabled` an
-///   empty preedit. `CursorLeft` is held until just before the update and dropped if the cursor
+/// - A key press's text (`KeyEvent::text`, layout and dead keys applied) without control
+///   characters becomes `TextInput::Text`, and a press that typed nothing `TextInput::Key`, in
+///   one ordered stream. Shortcuts (Ctrl or Super held, but not Ctrl+Alt: Windows' Alt Gr) type
+///   nothing; releases and the synthetic presses of a focus gain send nothing. An IME commit
+///   becomes `TextInput::Text` and `ImeEvent::Commit`, a preedit `ImeEvent::Preedit`, and
+///   `Ime::Disabled` an empty preedit. `CursorLeft` is held until just before the update and dropped if the cursor
 ///   moved back in by then.
 /// - `WindowResized` is written only when the size actually changes (never for 0x0). On Wayland,
 ///   `Window::request_inner_size` is applied client-side and winit sends no `Resized` event, so
@@ -719,15 +720,14 @@ impl RunnerCore {
                 event,
                 is_synthetic,
                 ..
-            } => {
-                if let Some(message) = key_message(event.physical_key, event.state, event.repeat) {
-                    write(world, message);
-                }
-                let typed = !is_synthetic && !is_shortcut(self.modifiers);
-                if let Some(text) = key_text(event.text.as_deref(), event.state, typed) {
-                    write(world, text);
-                }
-            }
+            } => self.key_input(
+                world,
+                event.physical_key,
+                event.text.as_deref(),
+                event.state,
+                event.repeat,
+                is_synthetic,
+            ),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::Ime(ime) => {
                 if ime == Ime::Enabled {
@@ -854,6 +854,27 @@ impl RunnerCore {
             self.applied_cursor = wanted;
             wanted
         })
+    }
+
+    /// A `WindowEvent::KeyboardInput` (its parts: tests cannot build a winit `KeyEvent`).
+    fn key_input(
+        &mut self,
+        world: &mut World,
+        key: PhysicalKey,
+        text: Option<&str>,
+        state: ElementState,
+        repeat: bool,
+        synthetic: bool,
+    ) {
+        if let Some(message) = key_message(key, state, repeat) {
+            write(world, message);
+        }
+        if state == ElementState::Pressed && !synthetic {
+            let shortcut = is_shortcut(self.modifiers);
+            if let Some(input) = key_text(key, text, repeat, shortcut) {
+                write(world, input);
+            }
+        }
     }
 
     /// Writes `CursorLeft` if the cursor left the window and has not moved back in since the
@@ -1224,14 +1245,21 @@ fn key_message(key: PhysicalKey, state: ElementState, repeat: bool) -> Option<Ke
     })
 }
 
-/// The text a key press typed (`None`: nothing printable). Releases type nothing, nor presses
-/// that are not `typed`: the synthetic ones winit sends for keys already held when the window
-/// gains focus, and shortcuts ([`is_shortcut`]).
-fn key_text(text: Option<&str>, state: ElementState, typed: bool) -> Option<TextInput> {
-    if state != ElementState::Pressed || !typed {
-        return None;
+/// What a key press means to a text field: the text it typed, or else the key (`None`: an
+/// unidentified key that typed nothing). A `shortcut` ([`is_shortcut`]) types nothing.
+fn key_text(
+    key: PhysicalKey,
+    text: Option<&str>,
+    repeat: bool,
+    shortcut: bool,
+) -> Option<TextInput> {
+    if let Some(text) = text.filter(|_| !shortcut).and_then(printable) {
+        return Some(TextInput::Text(text));
     }
-    printable(text?).map(|text| TextInput { text })
+    let PhysicalKey::Code(key) = key else {
+        return None;
+    };
+    Some(TextInput::Key { key, repeat })
 }
 
 /// Keys pressed with these modifiers are shortcuts, not text: `KeyEvent::text` ignores Ctrl, so
@@ -1248,7 +1276,7 @@ fn printable(text: &str) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Input method messages: the preedit as is, a commit as [`TextInput`] (in order with typed
+/// Input method messages: the preedit as is, a commit as [`TextInput::Text`] (in order with the
 /// keys) and [`ImeEvent::Commit`], and `Disabled` as an empty preedit, which clears any
 /// composition shown.
 fn ime_messages(world: &mut World, ime: Ime) {
@@ -1257,7 +1285,7 @@ fn ime_messages(world: &mut World, ime: Ime) {
         Ime::Preedit(text, cursor) => write(world, ImeEvent::Preedit { text, cursor }),
         Ime::Commit(text) => {
             if let Some(text) = printable(&text) {
-                write(world, TextInput { text: text.clone() });
+                write(world, TextInput::Text(text.clone()));
                 write(world, ImeEvent::Commit(text));
             }
         }
@@ -3082,11 +3110,14 @@ mod tests {
     }
 
     #[test]
-    fn key_text_drops_control_characters_releases_and_shortcuts() {
-        let typed = |text: Option<&str>| key_text(text, ElementState::Pressed, true);
-        let text = |s: &str| {
-            Some(TextInput {
-                text: s.to_string(),
+    fn key_presses_type_their_text_or_pass_the_key() {
+        let a = PhysicalKey::Code(KeyCode::KeyA);
+        let typed = |text: Option<&str>| key_text(a, text, false, false);
+        let text = |s: &str| Some(TextInput::Text(s.to_string()));
+        let key_a = |repeat| {
+            Some(TextInput::Key {
+                key: KeyCode::KeyA,
+                repeat,
             })
         };
         assert_eq!(typed(Some("a")), text("a"));
@@ -3096,15 +3127,20 @@ mod tests {
         assert_eq!(typed(Some("Ü")), text("Ü"));
         // Windows sends the dead key and the letter when they do not combine.
         assert_eq!(typed(Some("´x")), text("´x"));
-        // Enter, Backspace, Tab, Escape and Delete type nothing.
+        // Enter, Backspace, Tab, Escape and Delete type nothing: their key goes through.
         for control in ["\r", "\u{8}", "\t", "\u{1b}", "\u{7f}", "\u{9b}"] {
-            assert_eq!(typed(Some(control)), None, "{control:?}");
+            assert_eq!(typed(Some(control)), key_a(false), "{control:?}");
         }
         assert_eq!(typed(Some("a\tb")), text("ab"));
-        assert_eq!(typed(None), None);
-        assert_eq!(key_text(Some("a"), ElementState::Released, true), None);
-        // Synthetic presses and shortcuts.
-        assert_eq!(key_text(Some("a"), ElementState::Pressed, false), None);
+        assert_eq!(typed(None), key_a(false));
+        assert_eq!(key_text(a, None, true, false), key_a(true));
+        assert_eq!(key_text(a, Some("a"), true, false), text("a"));
+        // Shortcuts type nothing.
+        assert_eq!(key_text(a, Some("a"), false, true), key_a(false));
+        // An unidentified key types, but has no key to pass.
+        let unknown = PhysicalKey::Unidentified(NativeKeyCode::Xkb(0x1234));
+        assert_eq!(key_text(unknown, Some("ß"), false, false), text("ß"));
+        assert_eq!(key_text(unknown, None, false, false), None);
 
         assert!(!is_shortcut(ModifiersState::empty()));
         assert!(!is_shortcut(ModifiersState::SHIFT));
@@ -3115,13 +3151,71 @@ mod tests {
         // AltGr on Windows.
         assert!(!is_shortcut(ModifiersState::CONTROL | ModifiersState::ALT));
 
-        // The runner keeps the modifiers winit reports.
+        // Through the runner: releases and synthetic presses send nothing, and the modifiers
+        // winit reports make shortcuts.
+        let mut app = app();
+        let world = app.world_mut();
         let mut core = core();
+        core.key_input(world, a, Some("a"), ElementState::Released, false, false);
+        core.key_input(world, a, Some("a"), ElementState::Pressed, false, true);
+        assert_eq!(messages::<TextInput>(world), vec![]);
         assert!(!is_shortcut(core.modifiers));
-        let mut world = World::new();
         let ctrl = ModifiersState::CONTROL.into();
-        core.window_event(&mut world, WindowEvent::ModifiersChanged(ctrl));
+        core.window_event(world, WindowEvent::ModifiersChanged(ctrl));
         assert!(is_shortcut(core.modifiers));
+        core.key_input(world, a, Some("a"), ElementState::Pressed, false, false);
+        assert_eq!(
+            messages::<TextInput>(world),
+            vec![TextInput::Key {
+                key: KeyCode::KeyA,
+                repeat: false
+            }]
+        );
+    }
+
+    #[test]
+    fn text_edits_keep_their_order_within_a_frame() {
+        let x = (KeyCode::KeyX, Some("x"));
+        let y = (KeyCode::KeyY, Some("y"));
+        let backspace = (KeyCode::Backspace, Some("\u{8}"));
+        // One frame of presses, as a text field reads them.
+        let frame = |presses: &[(KeyCode, Option<&'static str>)]| {
+            let mut app = app();
+            let mut core = core();
+            for &(key, text) in presses {
+                let key = PhysicalKey::Code(key);
+                let world = app.world_mut();
+                core.key_input(world, key, text, ElementState::Pressed, false, false);
+            }
+            messages::<TextInput>(app.world())
+        };
+        let text = |s: &str| TextInput::Text(s.to_string());
+        let key = |key| TextInput::Key { key, repeat: false };
+        // Fixing a typo and deleting an older character must read differently.
+        assert_ne!(frame(&[x, backspace, y]), frame(&[backspace, x, y]));
+        assert_eq!(
+            frame(&[x, backspace, y]),
+            vec![text("x"), key(KeyCode::Backspace), text("y")]
+        );
+
+        // An input method commit falls in order with the keys.
+        let mut app = app();
+        let world = app.world_mut();
+        let mut core = core();
+        core.window_event(world, WindowEvent::Ime(Ime::Commit("你".to_string())));
+        let enter = PhysicalKey::Code(KeyCode::Enter);
+        core.key_input(
+            world,
+            enter,
+            Some("\r"),
+            ElementState::Pressed,
+            false,
+            false,
+        );
+        assert_eq!(
+            messages::<TextInput>(world),
+            vec![text("你"), key(KeyCode::Enter)]
+        );
     }
 
     #[test]
@@ -3157,9 +3251,7 @@ mod tests {
         );
         assert_eq!(
             messages::<TextInput>(world),
-            vec![TextInput {
-                text: "你".to_string()
-            }]
+            vec![TextInput::Text("你".to_string())]
         );
     }
 
