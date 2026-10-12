@@ -319,6 +319,114 @@ fn row_widgets_take_the_pointer_and_the_keyboard_reaches_rows_scrolled_away() {
     assert_eq!(t.focused().as_deref(), Some("test:delete"));
 }
 
+/// The row of a list whose widget has the keyboard focus.
+fn focused_row(t: &UiTester) -> Option<usize> {
+    let id = t.state().focused()?;
+    t.state().hit(id)?.row.map(|(_, row)| row)
+}
+
+/// Asserts the focused widget shows whole (the list scrolled to it).
+fn assert_focused_shows(t: &UiTester) {
+    let hit = t.state().hit(t.state().focused().unwrap()).unwrap();
+    assert_eq!(hit.rect, hit.full, "the focused widget shows whole");
+}
+
+#[test]
+fn after_the_wheel_scrolls_the_focused_widget_away_tab_goes_on_from_it() {
+    let mut t = list_tester(30);
+    t.app.world_mut().resource_mut::<Worlds>().buttons = true;
+    t.frame();
+    // The list, then the buttons of rows 0 to 3.
+    for _ in 0..5 {
+        t.tap(KeyCode::Tab);
+    }
+    assert_eq!(focused_row(&t), Some(3));
+    let to_the_end = |t: &mut UiTester| {
+        t.move_to(IVec2::new(60, 60)).scroll(-100.0).frame().frame();
+        assert_eq!(scroll(t), 500);
+    };
+    // Rows 25 to 29 show; Tab goes on to row 4, not to the first row in view.
+    to_the_end(&mut t);
+    assert_eq!(focused_row(&t), Some(3));
+    t.tap(KeyCode::Tab);
+    assert_eq!(focused_row(&t), Some(4));
+    assert_focused_shows(&t);
+    // And Shift+Tab to the row before, not out of the rows.
+    to_the_end(&mut t);
+    hold(&mut t, KeyCode::ShiftLeft, true);
+    t.tap(KeyCode::Tab);
+    assert_eq!(focused_row(&t), Some(3));
+    to_the_end(&mut t);
+    t.tap(KeyCode::Tab);
+    hold(&mut t, KeyCode::ShiftLeft, false);
+    assert_eq!(focused_row(&t), Some(2));
+    assert_focused_shows(&t);
+}
+
+/// An options page whose rows each hold a button, but for header rows (a label only) and rows
+/// whose button is disabled.
+#[derive(Resource, Default)]
+struct Sections {
+    rows: usize,
+    headers: Vec<usize>,
+    disabled: Vec<usize>,
+    pressed: Vec<usize>,
+}
+
+fn sections(mut ui: Ui, mut sections: ResMut<Sections>) {
+    let s = &mut *sections;
+    let rows = s.rows;
+    let (headers, disabled, pressed) = (&s.headers, &s.disabled, &mut s.pressed);
+    let mut p = ui.layer(UiLayer::Screen, Modal::Yes);
+    p.scroll_list(LIST, "test:sections", 20, rows, |p, row| {
+        let r = UiRect::new(row.rect.x + 2, row.rect.y + 2, 120, 16);
+        if headers.contains(&row.index) {
+            p.label(r, "test:header", Text::default());
+        } else if p
+            .enabled(!disabled.contains(&row.index))
+            .button(r, "test:option")
+            .clicked
+        {
+            pressed.push(row.index);
+        }
+    });
+    p.button(UiRect::new(20, 130, 100, 20), "test:done");
+}
+
+#[test]
+fn tab_walks_past_rows_with_nothing_to_focus_both_ways() {
+    let mut t = UiTester::new(UVec2::new(1280, 720));
+    // Rows 0 to 4 show; just below the view, a header (row 5) and a disabled row (row 6).
+    t.app.insert_resource(Sections {
+        rows: 12,
+        headers: vec![5],
+        disabled: vec![6],
+        ..Sections::default()
+    });
+    t.add_systems(sections);
+    t.frame();
+    let mut walk = Vec::new();
+    for _ in 0..10 {
+        t.tap(KeyCode::Tab);
+        walk.push(focused_row(&t));
+    }
+    assert_eq!(walk, [0, 1, 2, 3, 4, 7, 8, 9, 10, 11].map(Some));
+    t.tap(KeyCode::Tab);
+    assert_eq!(t.focused().as_deref(), Some("test:done"));
+    // Back up from the button under the list, past the same two rows.
+    hold(&mut t, KeyCode::ShiftLeft, true);
+    let mut walk = Vec::new();
+    for _ in 0..7 {
+        t.tap(KeyCode::Tab);
+        walk.push(focused_row(&t));
+    }
+    hold(&mut t, KeyCode::ShiftLeft, false);
+    assert_eq!(walk, [11, 10, 9, 8, 7, 4, 3].map(Some));
+    assert_focused_shows(&t);
+    t.tap(KeyCode::Enter);
+    assert_eq!(t.app.world().resource::<Sections>().pressed, [3]);
+}
+
 #[test]
 fn only_the_rows_that_show_are_drawn_and_a_lost_selection_is_cleared() {
     let mut t = list_tester(1000);

@@ -121,9 +121,12 @@ el pase (E-UI2) y llega antes de los menús, así que no hay puente.
   línea), barra de desplazamiento que se arrastra y doble clic (dos clics en la misma fila en
   menos de 250 ms de tiempo real). Con foco, arriba y abajo mueven la selección y Enter la abre.
   `scroll_list` es lo mismo sin selección, para páginas de opciones con widgets en las filas.
-- La lista llama a la función de fila solo para las filas que se ven, una más de cada lado y la
-  del widget con foco. El costo no crece con el largo de la lista y Tab igual llega a las filas de
-  afuera: la lista se mueve para mostrar el widget que enfoca el teclado.
+- La lista llama a la función de fila solo para las filas que se ven y una más de cada lado.
+  Mientras el foco está en el widget de una fila, llama también a esa fila y a las que van desde
+  ella hasta la más cercana de cada lado con algo que enfocar. Así Tab sigue fila por fila desde
+  el widget con foco, aunque la rueda lo haya sacado de la vista, y salta las filas sin nada que
+  enfocar (un título, una opción desactivada). El costo crece con las filas que salta, no con el
+  largo de la lista. La lista se mueve para mostrar el widget que enfoca el teclado.
 - `text_field` lee `TextInput`, así que escribe acentos, ñ y lo que confirma un IME, que se ve
   subrayado en el cursor mientras se compone. Tiene cursor, selección con Shift, con el mouse y
   arrastrando, Ctrl para saltar palabras, Ctrl+A, un máximo de caracteres y un texto de ayuda
