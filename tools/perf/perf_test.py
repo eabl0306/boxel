@@ -322,6 +322,22 @@ class CaseTest(unittest.TestCase):
             self.assertFalse(runs.supports(new, Case(scenario='grow')))
             steps = fake_binary(d, 'steps', HELP + '  --radius-steps R0,R1@T1  steps\n')
             self.assertTrue(runs.supports(steps, Case(scenario='grow')))
+            # the switch case needs the switch scenario
+            self.assertFalse(runs.supports(new, Case(scenario='switch')))
+            switch = fake_binary(d, 'switch', HELP.replace('path]', 'path|switch]'))
+            self.assertTrue(runs.supports(switch, Case(scenario='switch')))
+            self.assertTrue(runs.supports(switch, Case(scenario='cave-path')))
+
+    def test_the_switch_case_flies_the_surface_and_changes_worlds(self):
+        case = runs.parse_case('780m/switch/r16')
+        args = case.args(10)
+        self.assertEqual(args[args.index('--scenario') + 1], 'switch')
+        self.assertEqual(args[args.index('--speed') + 1], '64')
+        self.assertEqual(args[args.index('--switch-every') + 1], '4')
+        self.assertEqual(args[args.index('--world') + 1], 'overworld')
+        # a longer run may space the switches out (stress keeps the last value)
+        long = runs.parse_case('rtx/switch', Case(extra=('--switch-every', '20')))
+        self.assertEqual(long.args(200)[-2:], ['--switch-every', '20'])
 
 
 class MetricsTest(unittest.TestCase):

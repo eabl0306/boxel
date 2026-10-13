@@ -152,6 +152,10 @@ bench-dive *args: (_stress "dive" args)
 bench-path *args: (_stress "path" args)
 
 [group('bench')]
+[doc('Stress run flying, with a world change every 20 s: just bench-switch --world overworld --speed 64')]
+bench-switch *args: (_stress "switch" args)
+
+[group('bench')]
 [doc('static, fly at 32 and 64 voxels/s, and spin, with the same options')]
 bench-all *args: (_stress "static" args) (_stress "fly" "--speed 32" args) (_stress "fly" "--speed 64" args) (_stress "spin" args)
 

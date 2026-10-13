@@ -40,6 +40,7 @@ CAVE_CAMERA = ['--camera', '656,-1000,16,-90,0']
 CAVE_FLAG = r'^\s*--cave\s'
 PATH_SCENARIO = r'--scenario \S*\bpath\b'
 RADIUS_STEPS = r'^\s*--radius-steps\s'
+SWITCH_SCENARIO = r'--scenario \S*\bswitch\b'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -69,6 +70,12 @@ SCENARIOS = {
     'grow': Scenario('static', (*OVERWORLD, '--cave', *CAVE_CAMERA, '--radius-steps', '8,32@1'),
                      'cueva abierta, radio 8 a 32 al segundo', (CAVE_FLAG, RADIUS_STEPS),
                      ('--arena-quads', '--chunk-slots')),
+    # Worlds closed and opened while the app runs (ADR 0034): the surface flight, and every 4 s
+    # the world closes and the other of two seeds opens. A long run (the stress default is every
+    # 20 s) says so with its own --switch-every.
+    'switch': Scenario('switch', (*OVERWORLD, '--speed', '64', '--switch-every', '4'),
+                       'superficie, vuelo a 64, otro mundo cada 4 s', (SWITCH_SCENARIO,),
+                       ('--switch-every',)),
 }
 
 # Over this radius the overworld needs a bigger renderer arena and chunk table.

@@ -13,6 +13,9 @@
 //!   no new chunks).
 //! - `path` (with `--cave`): the camera follows a route through a cave at `--speed` voxels per
 //!   second, back and forth, looking where it goes; it never leaves open space.
+//! - `switch`: the camera flies as in `fly`, and every `--switch-every` seconds (20 by default)
+//!   the world closes and the other of two seeds opens, in this process (ADR 0034, see
+//!   [`switch`]): the run also reports each switch and the frames outside the switch frames.
 //!
 //! `--cave` (overworld) moves the start to open space in a cave: the air voxel nearest to
 //! `--camera` with air on every side, under the surface (see [`cave`]). Cave culling culls nothing
@@ -94,6 +97,8 @@ mod probe;
 mod report;
 #[path = "stress/spans.rs"]
 mod spans;
+#[path = "stress/switch.rs"]
+mod switch;
 #[path = "shared/world.rs"]
 mod world;
 
@@ -110,6 +115,7 @@ use boxel::voxel::{
 };
 use boxel::window::FramePacingInfo;
 use boxel::world::jobs::{JobExecutor, TaskPoolExecutor};
+use boxel::world::lifecycle::WorldLifecycleSystems;
 use boxel::world::lod::LodStats;
 use boxel::world::{
     ChunkId, ChunkMeshEvent, ChunkVisibility, WorldContent, WorldStats, WorldSystems,
@@ -129,9 +135,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use world::{World, WorldChoice};
 
 const USAGE: &str = "\
-usage: stress [--scenario static|fly|dive|spin|path] [GPU options] [options]
-  --scenario NAME     static (default), fly, dive (straight down), spin, or path (with --cave:
-                      a route through the cave, back and forth at --speed)
+usage: stress [--scenario static|fly|dive|spin|path|switch] [GPU options] [options]
+  --scenario NAME     static (default), fly, dive (straight down), spin, path (with --cave:
+                      a route through the cave, back and forth at --speed), or switch (fly,
+                      and every --switch-every seconds close the world and open another seed)
+  --switch-every SECS with --scenario switch, the seconds between world changes (default 20);
+                      the worlds are --seed and the next seed
   --radius N          mesh radius in chunks (default 16)
   --speed V           fly and dive speed in voxels per second (default 32)
   --duration SECS     measured time (default 20)
@@ -234,15 +243,17 @@ enum Scenario {
     Dive,
     Spin,
     Path,
+    Switch,
 }
 
 impl Scenario {
-    const ALL: [Scenario; 5] = [
+    const ALL: [Scenario; 6] = [
         Scenario::Static,
         Scenario::Fly,
         Scenario::Dive,
         Scenario::Spin,
         Scenario::Path,
+        Scenario::Switch,
     ];
 
     fn name(self) -> &'static str {
@@ -252,6 +263,7 @@ impl Scenario {
             Scenario::Dive => "dive",
             Scenario::Spin => "spin",
             Scenario::Path => "path",
+            Scenario::Switch => "switch",
         }
     }
 
@@ -261,7 +273,10 @@ impl Scenario {
 
     /// True if the camera moves at `--speed`.
     fn moves(self) -> bool {
-        matches!(self, Scenario::Fly | Scenario::Dive | Scenario::Path)
+        matches!(
+            self,
+            Scenario::Fly | Scenario::Dive | Scenario::Path | Scenario::Switch
+        )
     }
 }
 
@@ -342,6 +357,8 @@ struct Options {
     /// The route of the `path` scenario through the cave `--cave` found (empty before
     /// [`find_cave`] and without `--cave`).
     path: Vec<DVec3>,
+    /// `--switch-every`.
+    switch_every: Duration,
 }
 
 impl Options {
@@ -405,6 +422,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         fog_haze: 1.0,
         ui: false,
         path: Vec::new(),
+        switch_every: switch::DEFAULT_EVERY,
     };
     let mut timeout = None;
     let mut it = args.iter();
@@ -427,7 +445,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--scenario" => {
                 let v = value()?;
                 o.scenario = Scenario::parse(&v).ok_or_else(|| {
-                    format!("{flag}: {v:?} is not static, fly, dive, spin or path")
+                    format!("{flag}: {v:?} is not static, fly, dive, spin, path or switch")
                 })?;
             }
             "--radius" => {
@@ -438,6 +456,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                     .ok_or_else(|| format!("{flag}: {r} is not in 1..=64"))?;
             }
             "--speed" => o.speed = positive(flag, &value()?)?,
+            "--switch-every" => o.switch_every = seconds(flag, &value()?)?,
             "--duration" => o.duration = seconds(flag, &value()?)?,
             "--warmup" => {
                 let v = value()?;
@@ -616,7 +635,12 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
     if o.cave && o.world.world != World::Overworld {
         return Err("--cave needs --world overworld (the only world with caves)".to_string());
     }
-    if o.cave && matches!(o.scenario, Scenario::Fly | Scenario::Dive) {
+    if o.cave
+        && matches!(
+            o.scenario,
+            Scenario::Fly | Scenario::Dive | Scenario::Switch
+        )
+    {
         return Err(format!(
             "--cave with {}: the camera would go straight through the rock (use path)",
             o.scenario.name()
@@ -624,6 +648,11 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
     }
     if o.scenario == Scenario::Path && !o.cave {
         return Err("--scenario path needs --cave (the route goes through a cave)".to_string());
+    }
+    if o.scenario == Scenario::Switch && o.bodies.enabled() {
+        return Err(
+            "--scenario switch with bodies: the bodies would outlive their world".to_string(),
+        );
     }
     o.timeout = timeout.unwrap_or(SETTLE_ALLOWANCE + o.warmup + o.duration);
     Ok(Some(o))
@@ -821,7 +850,7 @@ fn camera_at(
     let mut position = DVec3::new(x, y, z);
     match scenario {
         Scenario::Static => {}
-        Scenario::Fly => position += flat_direction(yaw) * (speed * t),
+        Scenario::Fly | Scenario::Switch => position += flat_direction(yaw) * (speed * t),
         Scenario::Dive => position.y -= speed * t,
         Scenario::Spin => yaw += TAU * (t / duration).min(1.0),
         // Without a route (no `--cave`) it stays put.
@@ -1189,6 +1218,7 @@ fn drive(
     script: Option<Res<EditScript>>,
     pacing: Option<Res<FramePacingInfo>>,
     lod: Option<Res<LodStats>>,
+    switches: Option<Res<switch::SwitchTrack>>,
 ) {
     if bench.exiting {
         return;
@@ -1196,6 +1226,7 @@ fn drive(
     let pacing = pacing.as_deref().copied().unwrap_or_default();
     let spans = spans.as_deref();
     let script = script.as_deref();
+    let switches = switches.as_deref();
     let now = time.last_update().unwrap_or_else(Instant::now);
     let elapsed = now.saturating_duration_since(bench.started);
     if elapsed > bench.options.timeout {
@@ -1207,7 +1238,9 @@ fn drive(
             ),
             Phase::CatchUp { .. } => {
                 // The measurement is complete; only the catch-up time is missing.
-                bench.finish(&rec, &info, &pacing, spans, script, None, &mut exit);
+                bench.finish(
+                    &rec, &info, &pacing, spans, script, switches, None, &mut exit,
+                );
                 return;
             }
             _ => eprintln!(
@@ -1285,9 +1318,13 @@ fn drive(
                 // `--screenshot`: the outputs wait for the shot (a few frames).
             } else if streak >= SETTLED_FRAMES {
                 let catch_up = Some(now.duration_since(since));
-                bench.finish(&rec, &info, &pacing, spans, script, catch_up, &mut exit);
+                bench.finish(
+                    &rec, &info, &pacing, spans, script, switches, catch_up, &mut exit,
+                );
             } else if now.duration_since(since) > CATCH_UP_LIMIT {
-                bench.finish(&rec, &info, &pacing, spans, script, None, &mut exit);
+                bench.finish(
+                    &rec, &info, &pacing, spans, script, switches, None, &mut exit,
+                );
             }
         }
         Phase::Warmup { .. } | Phase::Done => {}
@@ -1410,6 +1447,7 @@ impl Bench {
         pacing: &FramePacingInfo,
         spans: Option<&SpanRecorder>,
         script: Option<&EditScript>,
+        switches: Option<&switch::SwitchTrack>,
         catch_up: Option<Duration>,
         exit: &mut MessageWriter<AppExit>,
     ) {
@@ -1447,6 +1485,11 @@ impl Bench {
         if let Some(memory) = &self.info.chunk_memory {
             println!("{}", memory.line());
         }
+        if let Some(switches) = switches {
+            for line in switches.lines() {
+                println!("{line}");
+            }
+        }
         if let Some(warning) = report::rock_warning(&self.info, &summary) {
             eprintln!("stress: {warning}");
         }
@@ -1467,6 +1510,10 @@ impl Bench {
                 // Before the data block, with the other tables for people.
                 let at = text.find(report::DATA_HEADING).unwrap_or(text.len());
                 text.insert_str(at, &spans::markdown(&records, &spans.log, &span_keys));
+            }
+            if let Some(switches) = switches {
+                let at = text.find(report::DATA_HEADING).unwrap_or(text.len());
+                text.insert_str(at, &switches.markdown());
             }
             if let Err(e) = write_file(path, &text) {
                 eprintln!("stress: {e}");
@@ -1656,6 +1703,18 @@ fn add_bench(app: &mut App, options: Options, info: RunInfo, recorder: Recorder,
         );
     let steps = app.world().resource::<Bench>().options.radius_steps.clone();
     app.insert_resource(memory::MemoryTrack::new(steps));
+    let options = &app.world().resource::<Bench>().options;
+    if let Some(every) = (options.scenario == Scenario::Switch).then_some(options.switch_every) {
+        app.insert_resource(switch::SwitchTrack::new(every))
+            .add_systems(
+                PreUpdate,
+                switch::track.after(record).after(WorldLifecycleSystems),
+            )
+            .add_systems(
+                Update,
+                switch::request.after(drive).before(WorldSystems::Interest),
+            );
+    }
     let sizes = app.world().resource::<Bench>().options.alloc_probe.clone();
     if !sizes.is_empty() {
         app.insert_resource(probe::AllocProbe::new(&sizes))
@@ -1753,10 +1812,21 @@ fn main() -> AppExit {
     let generated = Arc::new(AtomicU64::new(0));
     let jobs_done = Arc::new(AtomicU64::new(0));
     let job_clock = Arc::new(JobClock::new());
-    let mut inner = options.world.generator(options.seed);
-    if let Some(level) = options.water {
-        inner = Arc::new(WaterGenerator { inner, level });
-    }
+    let world_of = |seed: u64| -> Arc<dyn WorldGenerator> {
+        let inner = options.world.generator(seed);
+        match options.water {
+            Some(level) => Arc::new(WaterGenerator { inner, level }),
+            None => inner,
+        }
+    };
+    let inner = world_of(options.seed);
+    // `--scenario switch`: the other world, counted as the first one.
+    let other = (options.scenario == Scenario::Switch).then(|| {
+        Arc::new(CountingGenerator {
+            inner: world_of(options.seed.wrapping_add(1)),
+            generated: Arc::clone(&generated),
+        }) as Arc<dyn WorldGenerator>
+    });
     let cave = if options.cave {
         match find_cave(&mut options, inner.as_ref()) {
             Ok(description) => {
@@ -1772,6 +1842,11 @@ fn main() -> AppExit {
         String::new()
     };
     let fixed_bounds = options.fixed_height.then(|| inner.vertical_chunks());
+    let first: Arc<dyn WorldGenerator> = Arc::new(CountingGenerator {
+        inner,
+        generated: Arc::clone(&generated),
+    });
+    let switch_every = options.switch_every;
     let (arena_quads, chunk_slots) = options.render_capacity();
     let info = RunInfo {
         cave,
@@ -1812,10 +1887,7 @@ fn main() -> AppExit {
             },
         })
         .set(WorldPlugin {
-            generator: Arc::new(CountingGenerator {
-                inner,
-                generated: Arc::clone(&generated),
-            }),
+            generator: Arc::clone(&first),
             executor: Arc::new(CountingExecutor {
                 done: Arc::clone(&jobs_done),
                 last: Arc::clone(&job_clock),
@@ -1880,6 +1952,9 @@ fn main() -> AppExit {
             center: DVec3::new(x, y, z),
         });
     }
+    if let Some(other) = other {
+        app.insert_resource(switch::SwitchPlan::new([first, other], switch_every));
+    }
     add_bench(
         &mut app,
         options,
@@ -1935,6 +2010,42 @@ mod tests {
     fn parse(args: &[&str]) -> Result<Option<Options>, String> {
         let args: Vec<String> = args.iter().map(ToString::to_string).collect();
         parse_options(&args)
+    }
+
+    #[test]
+    fn switch_scenario() {
+        let o = parse(&[
+            "--scenario",
+            "switch",
+            "--world",
+            "overworld",
+            "--speed",
+            "64",
+        ])
+        .expect("valid")
+        .expect("not help");
+        assert_eq!(o.scenario, Scenario::Switch);
+        assert!(o.scenario.moves());
+        assert_eq!(o.switch_every, switch::DEFAULT_EVERY);
+        let o = parse(&["--scenario", "switch", "--switch-every", "4"])
+            .expect("valid")
+            .expect("not help");
+        assert_eq!(o.switch_every, Duration::from_secs(4));
+        // It flies as fly does.
+        let start = [16.0, 140.0, 16.0, -90.0, -20.0];
+        assert_eq!(
+            camera_at(Scenario::Switch, start, 64.0, 20.0, 2.0, &[]),
+            camera_at(Scenario::Fly, start, 64.0, 20.0, 2.0, &[])
+        );
+        for args in [
+            &["--scenario", "switch", "--switch-every", "0"][..],
+            &["--scenario", "switch", "--world", "overworld", "--cave"],
+            &["--scenario", "switch", "--bodies", "10"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?} was accepted");
+        }
+        // tools/perf finds the scenario in the help (runs.py SWITCH_SCENARIO).
+        assert!(usage().contains("--scenario static|fly|dive|spin|path|switch"));
     }
 
     #[test]
