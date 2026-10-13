@@ -513,6 +513,16 @@ fn a_world_comes_back_whole_after_another_one() {
     );
 
     open(&mut app, spec(2));
+    let unsaved = app
+        .world()
+        .resource::<WorldLifecycle>()
+        .last_open()
+        .unwrap();
+    assert_eq!(
+        (unsaved.saved_chunks, unsaved.saved_index, unsaved.lod_seed),
+        (0, Duration::ZERO, Duration::ZERO),
+        "an unsaved world has no saved index"
+    );
     settle(&mut app);
     assert_eq!(
         block_at(&app, edit),
@@ -524,6 +534,15 @@ fn a_world_comes_back_whole_after_another_one() {
 
     let store = open_store(&backend);
     open(&mut app, spec(1).with_store(store));
+    let opened = app
+        .world()
+        .resource::<WorldLifecycle>()
+        .last_open()
+        .unwrap();
+    assert!(
+        opened.saved_chunks >= 2 && opened.took >= opened.saved_index + opened.lod_seed,
+        "the open reports the edited chunks and its parts: {opened:?}"
+    );
     assert_eq!(app.world().resource::<TimeOfDay>().tick, 777_777);
     assert_eq!(app.world().resource::<BlockTicks>().pending(), ticks);
     settle(&mut app);

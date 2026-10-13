@@ -200,6 +200,20 @@ pub struct CloseReport {
     pub store_handles: usize,
 }
 
+/// How an open went ([`WorldLifecycle::last_open`]): the main-thread time of [`open_world`] and
+/// its two parts that grow with the saved world.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OpenReport {
+    /// The whole open on the main thread ([`WorldOpen`] included).
+    pub took: Duration,
+    /// Of it, the save state built from the store: the index of its saved chunks and entities.
+    pub saved_index: Duration,
+    /// Of it, the far LOD's saved chunks seeded as edits (zero without the far LOD).
+    pub lod_seed: Duration,
+    /// Chunks saved in the store when it opened.
+    pub saved_chunks: usize,
+}
+
 /// Why a world did not open ([`open_world`], [`WorldEvent::OpenFailed`]). The app's world is
 /// left as it was.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -354,6 +368,8 @@ pub struct WorldLifecycle {
     pub(crate) closed_backends: Vec<(Weak<dyn crate::persist::ChunkStore>, u64)>,
     /// The report of the last close (tests and tools).
     pub(crate) last_report: Option<CloseReport>,
+    /// The report of the last open (tests and tools).
+    pub(crate) last_open: Option<OpenReport>,
 }
 
 impl Default for WorldLifecycle {
@@ -365,6 +381,7 @@ impl Default for WorldLifecycle {
             staged_meta: Vec::new(),
             closed_backends: Vec::new(),
             last_report: None,
+            last_open: None,
         }
     }
 }
@@ -417,6 +434,11 @@ impl WorldLifecycle {
     /// The report of the last close that ended.
     pub fn last_report(&self) -> Option<&CloseReport> {
         self.last_report.as_ref()
+    }
+
+    /// The report of the last open.
+    pub fn last_open(&self) -> Option<OpenReport> {
+        self.last_open
     }
 }
 
@@ -502,4 +524,6 @@ pub(crate) struct OpenContext {
     /// The saved clock (only with `PersistSettings::clock`), else the spec's.
     pub(crate) clock: Option<u64>,
     pub(crate) ticks: Option<Vec<(BlockPos, u64)>>,
+    /// Written by the open: how long the far LOD's seed took.
+    pub(crate) lod_seed: Duration,
 }

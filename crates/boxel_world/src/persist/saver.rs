@@ -172,6 +172,11 @@ impl Persist {
         }
     }
 
+    /// Chunks saved (or staged) in the world.
+    pub(crate) fn saved_chunks(&self) -> usize {
+        self.saved.values().map(Vec::len).sum()
+    }
+
     /// Nothing waits to be written and no save job runs (a failure waiting for its next try
     /// is not idle).
     pub(crate) fn idle(&self) -> bool {

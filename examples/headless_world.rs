@@ -59,12 +59,24 @@
 //!   it still polls for an empty mesh, `filled_after` the time from the first plan to the full
 //!   fill, and the update times those of the frames between the world's settling and the fill.
 //!
+//! - `--reopen`: last, the world is saved, closed and opened again from its store, in this
+//!   process (ADR 0034). One block of every loaded chunk that is not a single block state is
+//!   flipped between air and stone first, so every such chunk is saved: the biggest saved world
+//!   of this view. Once the world settled again, `reopen: saved_chunks=N teardown_ms=X
+//!   closed_after_ms=X chunks_written=N store_open_ms=X open_ms=X saved_index_ms=X
+//!   lod_seed_ms=X settled_after=S`: the close frame's main-thread time (save snapshot and
+//!   teardown), the time to `WorldEvent::Closed` (the last save written, the store closed, the
+//!   memory freed), the store opened again (`WorldStore::open`, which a game runs off the main
+//!   thread), the open's main-thread time and, of it, the index of the saved chunks and the far
+//!   LOD's seed (with `--lod`), and the time until the world settled again.
+//!
 //! - `--spans` (build with `--features trace`): after each of those lines, `spans: phase=P
 //!   update_ms=X top=NAME:MS,...`, the busiest systems and spans of the phase's slowest update
 //!   (the work between that frame and the next included), as `stress --spans` keys them.
 //!
 //! Exit codes: 0 settled, 1 usage error, 4 not settled within the timeout, 5 the world settled
-//! somewhere else than around the viewer after a jump. Set `RUST_LOG` for more logging (default
+//! somewhere else than around the viewer after a jump, 6 the world did not close or open again
+//! with `--reopen`. Set `RUST_LOG` for more logging (default
 //! filter `warn`).
 #![expect(clippy::print_stdout, clippy::print_stderr, reason = "CLI output")]
 
@@ -83,9 +95,13 @@ use boxel::mesh::ChunkMesh;
 use boxel::mesh::{AoPolicy, LightQuantization};
 use boxel::prelude::*;
 use boxel::render::{DEFAULT_SKY_COLOR, DistanceFog, ViewParams, cull_counts};
-use boxel::voxel::{CHUNK_SIZE, MAX_BLOCK_COORD, MAX_CHUNK_COORD};
+use boxel::voxel::{CHUNK_SIZE, LocalPos, MAX_BLOCK_COORD, MAX_CHUNK_COORD};
 use boxel::world::DataState;
+use boxel::world::lifecycle::{
+    CloseOptions, WorldLifecycle, WorldLifecycleSystems, WorldStatus, close_world, open_world,
+};
 use boxel::world::lod::{LodStats, LodWorldPlugin};
+use boxel::world::persist::{ChunkStore, MemoryStore, PersistPlugin, PersistSettings, WorldStore};
 use boxel::world::visibility::{eye_in_open, visible_chunks};
 use boxel::world::{
     ChunkVisibility, SkyMap, VisibilityView, WorldContent, WorldStats, WorldSystems,
@@ -96,6 +112,9 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use world::{World, WorldChoice};
+
+/// The ECS world (`World` is the example's choice of generator here).
+type EcsWorld = boxel::prelude::World;
 
 const USAGE: &str = "\
 usage: headless_world [options]
@@ -122,6 +141,8 @@ usage: headless_world [options]
   --duration S         walk duration in seconds with --speed (default 5)
   --jump N             then teleport the viewer N chunks along x (negative: -x, up to the
                        world limit of 2^56) and wait for the new area
+  --reopen             last, save the world (one block flipped in every chunk with blocks),
+                       close it and open it again from its store, and report the times
   --timeout S          wall-clock limit in seconds (default 60), exit 4 past it
   --spans              after each report, the busiest spans of its slowest update (needs
                        --features trace)
@@ -140,6 +161,8 @@ fn usage() -> String {
 const EXIT_TIMEOUT: u8 = 4;
 /// Exit code when the world settled away from the viewer after a jump.
 const EXIT_OFF_CENTER: u8 = 5;
+/// Exit code when `--reopen` could not close or open the world.
+const EXIT_REOPEN: u8 = 6;
 
 /// Viewer position (`--viewer-y` replaces y).
 const VIEWER: DVec3 = DVec3::new(0.0, 80.0, 0.0);
@@ -173,6 +196,8 @@ struct Options {
     lod: LodPreset,
     /// `--spans`.
     spans: bool,
+    /// `--reopen`.
+    reopen: bool,
 }
 
 /// `Ok(None)` for `--help`.
@@ -197,6 +222,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         idle_work: true,
         lod: LodPreset::Off,
         spans: false,
+        reopen: false,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -247,6 +273,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--cull" => o.cull = true,
             "--cave" => o.cave = true,
             "--spans" => o.spans = true,
+            "--reopen" => o.reopen = true,
             "--camera" => {
                 let v = value()?;
                 let parts: Vec<f64> = v
@@ -355,6 +382,13 @@ enum Phase {
     /// `--lod`: filled; the report comes next frame. The update times (p99 and max, ms) of the
     /// frames that waited for the fill.
     LodFilled { p99: f64, max: f64 },
+    /// `--reopen`: the edits that make the world saved were queued `frames` frames ago (0: not
+    /// yet); waiting for it to settle.
+    ReopenEditing { frames: u32 },
+    /// `--reopen`: the world closes.
+    ReopenClosing,
+    /// `--reopen`: the world opened again at `since`; waiting for it to settle.
+    ReopenSettling { since: Instant },
 }
 
 #[derive(Resource)]
@@ -375,6 +409,19 @@ struct Run {
     teleport: Option<f64>,
     /// `--spans`: the span times, and the slowest update of the phase with its spans.
     spans: Option<Spans>,
+    /// `--reopen`: the world's saves and the report so far.
+    reopen: Option<Reopen>,
+}
+
+/// `--reopen`: the world's saves (a memory store, opened again on the same backend), the world
+/// to open again, and the parts of the `reopen:` line known so far.
+struct Reopen {
+    backend: Arc<MemoryStore>,
+    registry: Arc<BlockRegistry>,
+    /// The world as it was at the close (its store comes once it closed).
+    spec: Option<WorldSpec>,
+    /// The parts of the line up to the open.
+    line: String,
 }
 
 /// `--spans`: the layer's handle, a scratch frame, and the phase's slowest update so far (its
@@ -447,11 +494,13 @@ impl Run {
             Phase::Idle { .. } => 1,
             Phase::Walking { .. } | Phase::CatchingUp { .. } => 2,
             Phase::Jumping { .. } => 3,
+            Phase::ReopenEditing { .. } | Phase::ReopenClosing | Phase::ReopenSettling { .. } => 4,
         };
         let candidates = [
             (o.idle > Duration::ZERO).then_some(Phase::Idle { since: now }),
             (o.speed > 0.0).then_some(Phase::Walking { since: now }),
             (o.jump != 0).then_some(Phase::Jumping { since: now }),
+            o.reopen.then_some(Phase::ReopenEditing { frames: 0 }),
         ];
         let Some(next) = candidates
             .into_iter()
@@ -554,6 +603,24 @@ fn main() -> AppExit {
         None
     };
     let lod_settings = options.lod.settings();
+    let registry = Arc::new(boxel_demo::blocks::registry());
+    // `--reopen`: the world is saved in memory from the start (no autosave: the close writes it).
+    let reopen = if options.reopen {
+        let backend = Arc::new(MemoryStore::new());
+        match WorldStore::open(
+            Arc::clone(&backend) as Arc<dyn ChunkStore>,
+            &registry,
+            generator.name(),
+        ) {
+            Ok(store) => Some((backend, store)),
+            Err(e) => {
+                eprintln!("headless_world: --reopen: {e}");
+                return AppExit::from_code(1);
+            }
+        }
+    } else {
+        None
+    };
     let mut app = App::new();
     app.add_plugins((
         LogPlugin {
@@ -564,10 +631,23 @@ fn main() -> AppExit {
         WorldPlugin {
             generator,
             settings,
-            registry: Arc::new(boxel_demo::blocks::registry()),
+            registry: Arc::clone(&registry),
             ..WorldPlugin::default()
         },
     ));
+    let reopen = reopen.map(|(backend, store)| {
+        app.add_plugins(PersistPlugin::new(store))
+            .insert_resource(PersistSettings {
+                autosave: None,
+                ..PersistSettings::default()
+            });
+        Reopen {
+            backend,
+            registry,
+            spec: None,
+            line: String::new(),
+        }
+    });
     if let Some(settings) = lod_settings {
         app.add_plugins(LodWorldPlugin {
             settings,
@@ -585,10 +665,16 @@ fn main() -> AppExit {
         walk_report: None,
         teleport: None,
         spans,
+        reopen,
     })
     .add_systems(Startup, spawn_viewer)
     .add_systems(First, start_update)
-    .add_systems(PreUpdate, (drive, drive_lod).chain())
+    .add_systems(
+        PreUpdate,
+        (drive, drive_lod, drive_reopen)
+            .chain()
+            .before(WorldLifecycleSystems),
+    )
     .add_systems(Update, move_viewer.before(WorldSystems::Interest))
     .add_systems(Last, end_update)
     .run()
@@ -1075,6 +1161,149 @@ fn drive_lod(
     }
 }
 
+/// `--reopen`, after [`drive_lod`]: flips a block of every chunk with blocks, closes the world
+/// once that settled, opens it again from its store once it closed, and reports when it settled
+/// again (the last phase: then the run ends). Exclusive, before the lifecycle's driver, as a
+/// game's screen hook.
+fn drive_reopen(world: &mut EcsWorld) {
+    let phase = world.resource::<Run>().phase;
+    let stats = *world.resource::<WorldStats>();
+    let settled = stats.chunks > 0 && stats.is_settled();
+    match phase {
+        Phase::ReopenEditing { frames: 0 } => {
+            let edits = flips(world);
+            let line = format!("reopen: saved_chunks={}", edits.len());
+            let mut queue = world.resource_mut::<EditQueue>();
+            for (pos, state) in edits {
+                queue.set_block(pos, state);
+            }
+            let mut run = world.resource_mut::<Run>();
+            if let Some(reopen) = run.reopen.as_mut() {
+                reopen.line = line;
+            }
+            run.phase = Phase::ReopenEditing { frames: 1 };
+        }
+        // A few frames for the edits to reach the counters.
+        Phase::ReopenEditing { frames } if frames < 3 || !settled => {
+            world.resource_mut::<Run>().phase = Phase::ReopenEditing {
+                frames: frames.saturating_add(1),
+            };
+        }
+        Phase::ReopenEditing { .. } => {
+            let spec = WorldSpec::new(
+                Arc::clone(&world.resource::<WorldContent>().generator),
+                world.resource::<WorldSettings>().clone(),
+            );
+            if !close_world(world, CloseOptions::default()) {
+                eprintln!("headless_world: --reopen: the world did not close");
+                world.write_message(AppExit::from_code(EXIT_REOPEN));
+                return;
+            }
+            let mut run = world.resource_mut::<Run>();
+            if let Some(reopen) = run.reopen.as_mut() {
+                reopen.spec = Some(spec);
+            }
+            run.phase = Phase::ReopenClosing;
+        }
+        Phase::ReopenClosing => {
+            let lifecycle = world.resource::<WorldLifecycle>();
+            if lifecycle.status() != WorldStatus::Closed {
+                return;
+            }
+            let report = lifecycle.last_report().cloned().unwrap_or_default();
+            if !report.saved || !report.errors.is_empty() {
+                eprintln!("headless_world: --reopen: the world was not saved: {report:?}");
+                world.write_message(AppExit::from_code(EXIT_REOPEN));
+                return;
+            }
+            let Some(mut reopen) = world.resource_mut::<Run>().reopen.take() else {
+                return;
+            };
+            let Some(spec) = reopen.spec.take() else {
+                return;
+            };
+            let started = Instant::now();
+            let store = WorldStore::open(
+                Arc::clone(&reopen.backend) as Arc<dyn ChunkStore>,
+                &reopen.registry,
+                spec.generator.name(),
+            );
+            let store_open = started.elapsed();
+            let opened = match store {
+                Ok(store) => open_world(world, spec.with_store(store))
+                    .map_err(|e| e.to_string())
+                    .and_then(|_| {
+                        world
+                            .resource::<WorldLifecycle>()
+                            .last_open()
+                            .ok_or_else(|| "no open report".to_string())
+                    }),
+                Err(e) => Err(e.to_string()),
+            };
+            let open = match opened {
+                Ok(open) => open,
+                Err(e) => {
+                    eprintln!("headless_world: --reopen: the world did not open: {e}");
+                    world.write_message(AppExit::from_code(EXIT_REOPEN));
+                    return;
+                }
+            };
+            let ms = |d: Duration| d.as_secs_f64() * 1e3;
+            reopen.line = format!(
+                "{} teardown_ms={:.2} closed_after_ms={:.1} chunks_written={} store_open_ms={:.2} \
+                 open_ms={:.2} saved_index_ms={:.2} lod_seed_ms={:.2}",
+                reopen.line,
+                ms(report.teardown),
+                ms(report.took),
+                report.chunks_written,
+                ms(store_open),
+                ms(open.took),
+                ms(open.saved_index),
+                ms(open.lod_seed),
+            );
+            let mut run = world.resource_mut::<Run>();
+            run.reopen = Some(reopen);
+            run.phase = Phase::ReopenSettling {
+                since: Instant::now(),
+            };
+        }
+        Phase::ReopenSettling { since } if settled => {
+            let run = world.resource::<Run>();
+            let line = run.reopen.as_ref().map_or("", |r| r.line.as_str());
+            println!("{line} settled_after={:.3}s", since.elapsed().as_secs_f64());
+            world.write_message(AppExit::Success);
+        }
+        _ => {}
+    }
+}
+
+/// `--reopen`: an edit for every loaded chunk that is not a single block state, its middle
+/// block flipped between air and stone, so the close saves it.
+fn flips(world: &EcsWorld) -> Vec<(BlockPos, BlockState)> {
+    let map = world.resource::<ChunkMap>();
+    let registry = &world.resource::<WorldContent>().registry;
+    let Some(stone) = registry.by_name("boxel:stone") else {
+        return Vec::new();
+    };
+    let middle = LocalPos::new(16, 16, 16);
+    map.iter()
+        .filter_map(|(_, slot)| {
+            let DataState::Ready(data) = slot.data() else {
+                return None;
+            };
+            data.as_uniform().is_none().then(|| {
+                let o = slot.key().pos.origin();
+                let state = if data.get(middle) == BlockState::AIR {
+                    stone
+                } else {
+                    BlockState::AIR
+                };
+                (BlockPos::new(o.x + 16, o.y + 16, o.z + 16), state)
+            })
+        })
+        .collect()
+}
+
 /// The `lod:` and `lod_level:` lines (`p99` and `max`: the fill's update times).
 fn lod_lines(run: &Run, stats: &LodStats, p99: f64, max: f64) -> String {
     let sum =
@@ -1233,6 +1462,17 @@ mod tests {
         assert!(o.fixed_height);
         assert!(parse(&["--lod", "everything"]).is_err());
         assert!(usage().contains("--lod PRESET"));
+    }
+
+    #[test]
+    fn reopen_flag() {
+        let o = parse(&[]).expect("valid").expect("not help");
+        assert!(!o.reopen, "no reopen unless asked");
+        let o = parse(&["--reopen", "--view-distance", "16"])
+            .expect("valid")
+            .expect("not help");
+        assert!(o.reopen);
+        assert!(usage().contains("--reopen"));
     }
 
     #[test]

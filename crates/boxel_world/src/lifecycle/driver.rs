@@ -1,9 +1,9 @@
 //! The lifecycle's driver: opens and closes worlds, and polls a close until it ends.
 use super::scope::after_teardown;
 use super::{
-    CloseOptions, CloseReport, OpenContext, OpenWorldError, Request, WorldEpoch, WorldEvent,
-    WorldGarbage, WorldLifecycle, WorldOpen, WorldSave, WorldScoped, WorldSpec, WorldStatus,
-    WorldTeardown,
+    CloseOptions, CloseReport, OpenContext, OpenReport, OpenWorldError, Request, WorldEpoch,
+    WorldEvent, WorldGarbage, WorldLifecycle, WorldOpen, WorldSave, WorldScoped, WorldSpec,
+    WorldStatus, WorldTeardown,
 };
 use crate::jobs::{IoTaskPoolExecutor, JobExecutor};
 use crate::lod::{LodFeedback, LodWorld};
@@ -274,13 +274,17 @@ pub fn open_world(world: &mut World, spec: WorldSpec) -> Result<WorldEpoch, Open
     }
     *world.resource_mut::<WorldSettings>() = settings;
     let mut restored = None;
+    let mut report = OpenReport::default();
     if let Some(store) = store {
         // Logged here, where the app's log is up (a game may open its store before it is).
         if store.repaired() {
             tracing::warn!("the world file was not closed cleanly: redb repaired it");
         }
         let executor = Arc::clone(&world.resource::<PersistExecutor>().0);
+        let index = Instant::now();
         let mut persist = Persist::new(store.clone(), executor);
+        report.saved_index = index.elapsed();
+        report.saved_chunks = persist.saved_chunks();
         restored = persist.restore.take();
         world.resource_mut::<WorldJobs>().persist = Some(persist);
         world.insert_resource(store);
@@ -302,12 +306,17 @@ pub fn open_world(world: &mut World, spec: WorldSpec) -> Result<WorldEpoch, Open
         epoch,
         clock: saved_clock.filter(|_| keep_clock).or(clock),
         ticks,
+        lod_seed: Duration::ZERO,
     });
     let _ = world.try_run_schedule(WorldOpen);
-    world.remove_resource::<OpenContext>();
+    if let Some(ctx) = world.remove_resource::<OpenContext>() {
+        report.lod_seed = ctx.lod_seed;
+    }
     world.write_message(WorldEvent::Opened { epoch });
-    tracing::debug!(epoch = epoch.get(), took = ?started.elapsed(), "world opened");
-    declare_stall(world, started.elapsed());
+    report.took = started.elapsed();
+    world.resource_mut::<WorldLifecycle>().last_open = Some(report);
+    tracing::debug!(epoch = epoch.get(), ?report, "world opened");
+    declare_stall(world, report.took);
     Ok(epoch)
 }
 
@@ -334,11 +343,13 @@ pub(crate) fn open_engine_state(
         time.tick = ctx.clock.unwrap_or(start);
     }
     if let Some(mut lod) = lod {
+        let seed = Instant::now();
         lod.open_world(
             store.as_deref().cloned(),
             jobs.persist.as_ref(),
             ctx.epoch.get(),
         );
+        ctx.lod_seed = seed.elapsed();
     }
     if let Some(mut feedback) = feedback {
         feedback.refused.clear();
