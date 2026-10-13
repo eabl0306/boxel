@@ -163,6 +163,10 @@ pub(crate) struct Memory {
     pub text: Vec<(WidgetId, TextInput)>,
     /// The input method's composition, shown at the focused text field's caret.
     pub preedit: String,
+    /// The focus moved this frame to another text field while a composition was open: the
+    /// composition was dropped, and the input method goes off for this frame so the platform
+    /// ends it too (its commit would land in the new field).
+    pub ime_restart: bool,
     /// Where the focused text field drew its caret this frame, for the input method.
     pub ime_area: Option<ImeCursorArea>,
     /// What the UI last wrote into `ImeOptions`.

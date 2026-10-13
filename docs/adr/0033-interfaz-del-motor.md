@@ -132,6 +132,10 @@ el pase (E-UI2) y llega antes de los menús, así que no hay puente.
   arrastrando, Ctrl para saltar palabras, Ctrl+A, un máximo de caracteres y un texto de ayuda
   cuando está vacío. Enter da `submitted` una sola vez aunque se mantenga, como un botón. La
   interfaz prende el IME solo mientras un campo tiene el foco.
+- Una composición es del campo donde empezó. Si el foco pasa a otro campo, la interfaz la
+  descarta y apaga el IME un frame para que el sistema también la cierre. Si no, lo que se
+  confirma después caería en el otro campo. Es lo mismo que pasa cuando el foco sale de los
+  campos.
 - Las teclas de navegación llegan por `KeyboardInput` y el texto por `TextInput`, dos colas
   separadas. La interfaz las alinea con las teclas que van en las dos (Tab, flechas y Enter):
   "ab", Tab y "12" en un mismo frame terminan en los dos campos correctos. Una de esas teclas

@@ -281,7 +281,10 @@ pub(crate) fn resolve(state: &mut UiState, input: &NavInput) -> InputCapture {
     if let Some(preedit) = &input.preedit {
         mem.preedit.clone_from(preedit);
     }
-    if !typing {
+    // A composition belongs to the field it started in: when the focus moves to another field,
+    // it is dropped there and in the platform (`ime_restart`), as when the focus leaves fields.
+    mem.ime_restart = typing && mem.focused != was && !mem.preedit.is_empty();
+    if !typing || mem.ime_restart {
         mem.preedit.clear();
     }
 

@@ -11,7 +11,7 @@ use boxel_ui::testing::UiTester;
 use boxel_ui::text::measure;
 use boxel_ui::{
     BitmapFont, DOUBLE_CLICK, InputCapture, Modal, SCROLLBAR_WIDTH, Text, Ui, UiAtlas, UiLayer,
-    UiRect,
+    UiQuad, UiRect,
 };
 use boxel_window::{ButtonState, ImeOptions, KeyCode, KeyboardInput, TextInput};
 use std::time::Duration;
@@ -808,6 +808,61 @@ fn a_real_press_after_presses_the_input_method_took_moves_the_focus_once() {
     assert_eq!(t.focused().as_deref(), Some("test:create"));
 }
 
+/// The underline of a composition shown in the field at `field`, if any (one GUI pixel high,
+/// under the glyphs).
+fn composition_underline(t: &UiTester, field: UiRect) -> Option<UiQuad> {
+    let scale = t.scale();
+    let n = scale.scale() as i32;
+    let y = scale.to_physical(IVec2::new(0, field.y + 6 + 8)).y;
+    t.state()
+        .quads(UiLayer::Screen)
+        .iter()
+        .find(|q| q.min[1] == y && q.max[1] - q.min[1] == n)
+        .copied()
+}
+
+#[test]
+fn a_composition_ends_when_the_focus_moves_to_another_field() {
+    let mut t = form_tester();
+    let seed = t.hit("test:seed").unwrap().rect;
+    t.click("test:name");
+    t.preedit("sekai").frame();
+    assert!(composition_underline(&t, NAME).is_some());
+    // A press on the seed field: the composition is the name field's, so the seed field does
+    // not show it, and the input method goes off for a frame so the platform ends it too
+    // (else its commit would land in the seed field).
+    t.move_to(IVec2::new(seed.x + 4, seed.y + 10))
+        .press()
+        .frame();
+    assert_eq!(t.focused().as_deref(), Some("test:seed"));
+    assert!(composition_underline(&t, seed).is_none());
+    assert!(composition_underline(&t, NAME).is_none());
+    assert!(!t.ime().allowed);
+    t.release().frame();
+    assert!(t.ime().allowed);
+    assert!(t.ime().cursor_area.is_some());
+    // A composition in the seed field shows there and stays while the focus stays.
+    t.preedit("ki").frame();
+    assert!(composition_underline(&t, seed).is_some());
+    t.move_to(IVec2::new(seed.x + 4, seed.y + 10))
+        .press()
+        .frame()
+        .release()
+        .frame();
+    assert!(composition_underline(&t, seed).is_some());
+    assert!(t.ime().allowed);
+    // Shift+Tab to the name field ends it the same way.
+    t.key(KeyCode::ShiftLeft, ButtonState::Pressed, false)
+        .frame()
+        .key(KeyCode::Tab, ButtonState::Pressed, false)
+        .frame();
+    assert_eq!(t.focused().as_deref(), Some("test:name"));
+    assert!(composition_underline(&t, NAME).is_none());
+    assert!(!t.ime().allowed);
+    t.frame();
+    assert!(t.ime().allowed);
+}
+
 #[test]
 fn a_long_text_scrolls_to_keep_the_caret_in_view() {
     let mut t = form_tester();
@@ -915,15 +970,8 @@ fn a_composition_at_the_end_of_a_full_field_scrolls_into_view() {
         caret_x + ka <= text_right,
         "the composition fits: {caret_x} + {ka} > {text_right}"
     );
-    // Its underline shows whole (one GUI pixel high, under the glyphs).
-    let underline_y = scale.to_physical(IVec2::new(0, NAME.y + 6 + 8)).y;
-    let underline = t
-        .state()
-        .quads(UiLayer::Screen)
-        .iter()
-        .find(|q| q.min[1] == underline_y && q.max[1] - q.min[1] == n)
-        .copied()
-        .unwrap();
+    // Its underline shows whole.
+    let underline = composition_underline(&t, NAME).unwrap();
     assert_eq!(underline.max[0] - underline.min[0], ka);
     assert_eq!(underline.min[0], caret_x);
 }

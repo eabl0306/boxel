@@ -117,7 +117,8 @@ fn ui_begin(
 }
 
 /// Composes the layers into [`UiDraw`] when something changed, and turns the input method on
-/// while a text field has the focus.
+/// while a text field has the focus (off for one frame when the focus moved to another field
+/// with a composition open, so the platform ends it).
 fn ui_end(
     mut state: ResMut<UiState>,
     scale: Res<GuiScale>,
@@ -127,14 +128,15 @@ fn ui_end(
     // Written only when the UI's wish changes, so a game that sets it otherwise between two
     // changes is not overridden every frame.
     if let Some(mut ime) = ime {
-        let typing = state
-            .memory
-            .focused
-            .and_then(|id| state.hit(id))
-            .is_some_and(|hit| hit.kind.takes_text());
+        let on = !state.memory.ime_restart
+            && state
+                .memory
+                .focused
+                .and_then(|id| state.hit(id))
+                .is_some_and(|hit| hit.kind.takes_text());
         let wanted = ImeOptions {
-            allowed: typing,
-            cursor_area: state.memory.ime_area.filter(|_| typing),
+            allowed: on,
+            cursor_area: state.memory.ime_area.filter(|_| on),
         };
         if state.memory.ime_written != Some(wanted) {
             ime.set_if_neq(wanted);
