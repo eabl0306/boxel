@@ -17,7 +17,9 @@
 //!   `MAX_TIER_DIFF` of a fresh B on its tier and across tiers.
 //! - **(d) 20 switches** between a small scene and a big one that grows chunk memory past its
 //!   floor (test 29, #57's G9): the reset state, chunk memory included, equals a fresh
-//!   renderer's after every switch, and no size grows past the big scene's peak.
+//!   renderer's after every switch, and no size grows past the big scene's peak, with page
+//!   creations that take no time and with slow ones (set, never measured: the machine's load
+//!   must not decide the result).
 //! - **(e) A busy clear:** `clear_world` and `clear_chunks` while a page is being cleared, a page
 //!   is half drained, a table is cleared ahead and a table copy waits: a fresh renderer after the
 //!   first, every chunk back after the second.
@@ -451,6 +453,9 @@ fn new_renderer(gpu: &Gpu<'_>, config: &RendererConfig) -> Result<VoxelRenderer,
         gpu.queue,
         MaterialTable::from_registry(registry()).model_boxes(),
     );
+    // How long the driver takes to make a page must not change what the tests compare: a slow
+    // one asks for pages earlier from then on (case (d) sets the time it needs).
+    renderer.debug_set_page_create_time(Some(Duration::ZERO));
     Ok(renderer)
 }
 
@@ -978,11 +983,21 @@ fn growing_config() -> RendererConfig {
     }
 }
 
+/// What a page creation counts as taking in case (d): instant, and slower than the 2 ms after
+/// which a class asks for pages earlier for the rest of the session (ADR 0035, decision 7: a
+/// driver that needed a new memory block).
+const CREATE_TIMES: [Duration; 2] = [Duration::ZERO, Duration::from_millis(3)];
+
 /// Joint case (d) and test 29 (#57's G9): 20 switches between a small scene and a big one that
 /// grows chunk memory past its floor (pages, the table, High's lists). After every switch the
 /// renderer's per-world state is a fresh renderer's, chunk memory included; every load of a
 /// scene leaves the same state and sizes (nothing accumulates), the small scene never more than
-/// the big one, and the last image is a fresh renderer's.
+/// the big one, and the last image is a fresh renderer's. Page creations take a set time
+/// ([`CREATE_TIMES`]), never the measured one: one creation over 2 ms on a busy machine would
+/// double a reserve in the middle of the run, and the loads after it would differ from the
+/// first as if something leaked. With slow creations the reserves double in the first big load
+/// and stay doubled across the switches (what the device taught stays), so the loads compared
+/// start with the second small one.
 #[test]
 fn twenty_switches_leave_a_fresh_renderer_every_time() {
     let small = sparse(3, -2..=2, 0..=0, -2..=2);
@@ -990,10 +1005,13 @@ fn twenty_switches_leave_a_fresh_renderer_every_time() {
     big.extend(sparse(4, -8..=8, 2..=4, -8..=8));
     let view = sparse_view(I64Vec3::ZERO);
     for_every_tier(|gpu, report| {
-        let run = |report: &mut Report| -> Result<(), String> {
+        let run = |report: &mut Report, took: Duration| -> Result<(), String> {
+            let label = format!("{} {} ({took:?} a page)", gpu.label, gpu.tier);
             let config = growing_config();
             let fresh = new_renderer(gpu, &config)?.debug_reset_state();
             let mut renderer = new_renderer(gpu, &config)?;
+            renderer.debug_set_page_create_time(Some(took));
+            let compared_from = if took > Duration::ZERO { 2 } else { 0 };
             let mut first: [Option<Loaded>; 2] = [None, None];
             let mut next_id = 0;
             for load in 0..21 {
@@ -1002,15 +1020,15 @@ fn twenty_switches_leave_a_fresh_renderer_every_time() {
                     switch_world(gpu, &mut renderer);
                     let state = renderer.debug_reset_state();
                     report.check(state == fresh, || {
-                        format!(
-                            "{} {}: switch {load}: {state:?}, fresh {fresh:?}",
-                            gpu.label, gpu.tier
-                        )
+                        format!("{label}: switch {load}: {state:?}, fresh {fresh:?}")
                     });
                     draw(gpu, &mut renderer, &view)?;
                 }
                 stream_in(gpu, &mut renderer, scene, I64Vec3::ZERO, next_id, 24, &view)?;
                 next_id += 1 << 20;
+                if load < compared_from {
+                    continue;
+                }
                 let stats = renderer.stats();
                 let memory = stats.chunk_memory;
                 let loaded = Loaded {
@@ -1022,10 +1040,7 @@ fn twenty_switches_leave_a_fresh_renderer_every_time() {
                 match first[load % 2] {
                     None => first[load % 2] = Some(loaded),
                     Some(expected) => report.check(loaded == expected, || {
-                        format!(
-                            "{} {}: load {load}: {loaded:?}, first {expected:?}",
-                            gpu.label, gpu.tier
-                        )
+                        format!("{label}: load {load}: {loaded:?}, first {expected:?}")
                     }),
                 }
             }
@@ -1039,36 +1054,34 @@ fn twenty_switches_leave_a_fresh_renderer_every_time() {
                         && s.bytes.0 <= b.bytes.0
                         && s.bytes.1 <= b.bytes.1
                         && s.bytes.2 <= b.bytes.2,
-                    || format!("{} {}: small {s:?}, big {b:?}", gpu.label, gpu.tier),
+                    || format!("{label}: small {s:?}, big {b:?}"),
                 );
                 // the big scene grew past the floor, pages and table
                 report.check(
                     b.state.pages > floor.chunk_memory.pages
                         && b.slot_capacity > floor.chunk_slot_capacity,
-                    || {
-                        format!(
-                            "{} {}: the big scene did not grow: {b:?}",
-                            gpu.label, gpu.tier
-                        )
-                    },
+                    || format!("{label}: the big scene did not grow: {b:?}"),
                 );
             }
             let last = render(gpu, &mut renderer, &view)?;
             let mut fresh_small = new_renderer(gpu, &config)?;
             stream_in(gpu, &mut fresh_small, &small, I64Vec3::ZERO, 0, 24, &view)?;
             let expected = render(gpu, &mut fresh_small, &view)?;
+            let ms = took.as_millis();
             report.check_identical(
-                &format!(
-                    "{} {}: the small scene after 20 switches",
-                    gpu.label, gpu.tier
-                ),
-                (&gpu.name("switch_20"), &last),
-                (&gpu.name("switch_20_fresh"), &expected),
+                &format!("{label}: the small scene after 20 switches"),
+                (&gpu.name(&format!("switch_20_{ms}ms")), &last),
+                (&gpu.name(&format!("switch_20_{ms}ms_fresh")), &expected),
             );
             Ok(())
         };
-        if let Err(e) = run(report) {
-            report.fail(format!("{} {}: {e}", gpu.label, gpu.tier), &[]);
+        for took in CREATE_TIMES {
+            if let Err(e) = run(report, took) {
+                report.fail(
+                    format!("{} {} ({took:?} a page): {e}", gpu.label, gpu.tier),
+                    &[],
+                );
+            }
         }
     })
     .finish();

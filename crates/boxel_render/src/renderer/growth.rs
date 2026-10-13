@@ -125,6 +125,8 @@ pub(super) struct Growth {
     pub counters: Counters,
     /// Testing: the next creation fails.
     fail_next: bool,
+    /// Testing: what every creation counts as having taken, instead of its measured time.
+    create_time: Option<Duration>,
     /// Testing: the clear budget and the move budget of a frame instead of the adapter's.
     budgets: Option<(u64, MoveBudget)>,
     /// The slow-creation warning was given.
@@ -160,6 +162,7 @@ impl Growth {
             eye: I64Vec3::ZERO,
             counters: Counters::default(),
             fail_next: false,
+            create_time: None,
             budgets: None,
             warned_slow: false,
         }
@@ -406,7 +409,7 @@ impl VoxelRenderer {
                 Ok(())
             })
         };
-        let took = start.elapsed();
+        let took = self.growth.create_time.unwrap_or_else(|| start.elapsed());
         let now = self.growth.now();
         let (page, lists) = match (result, made) {
             (Ok(()), Some(made)) => made,
@@ -1040,6 +1043,14 @@ impl VoxelRenderer {
     #[doc(hidden)]
     pub fn debug_fail_next_page(&mut self) {
         self.growth.fail_next = true;
+    }
+
+    /// Testing: every page creation counts as taking `took` instead of the time it took, so the
+    /// slow-creation doubling of the reserve (ADR 0035, decision 7) follows the test and not how
+    /// busy the machine is; `None` measures again.
+    #[doc(hidden)]
+    pub fn debug_set_page_create_time(&mut self, took: Option<Duration>) {
+        self.growth.create_time = took;
     }
 
     /// Testing: what one frame may clear (bytes, a multiple of 8) and move (bytes and copy
