@@ -31,13 +31,7 @@ impl MidPath {
         index: wgpu::Buffer,
         slots: u32,
     ) -> Self {
-        let capacity = 8 * slots.max(1) as usize;
-        let draw_refs = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("boxel draw refs"),
-            size: (capacity * size_of::<DrawRef>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let (draw_refs, capacity) = draw_refs(device, slots);
         Self {
             voxel,
             index,
@@ -48,6 +42,19 @@ impl MidPath {
             switches: 0,
         }
     }
+}
+
+/// The per-frame `DrawRef` buffer for `slots` chunk slots (8 a slot), bound by its written
+/// range, so a new one is never zero-filled.
+fn draw_refs(device: &wgpu::Device, slots: u32) -> (wgpu::Buffer, usize) {
+    let capacity = 8 * slots.max(1) as usize;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("boxel draw refs"),
+        size: (capacity * size_of::<DrawRef>()) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    (buffer, capacity)
 }
 
 impl TierPath for MidPath {
@@ -139,6 +146,10 @@ impl TierPath for MidPath {
             draws += 1;
         }
         draws
+    }
+
+    fn resize_table(&mut self, device: &wgpu::Device, _table: Option<&wgpu::Buffer>, slots: u32) {
+        (self.draw_refs, self.capacity) = draw_refs(device, slots);
     }
 
     fn translucent_page_switches(&self) -> u32 {

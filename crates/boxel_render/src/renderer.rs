@@ -6,7 +6,7 @@ use crate::light::SceneLight;
 use crate::lod::{GpuInputs, LodInput, LodPass, LodReport};
 use crate::memory::{
     CHUNK_GPU_BYTES, ChunkMemory, ChunkMemorySettings, ChunkMemoryStats, DeviceFacts, MemoryLayout,
-    PageClass, PageSet, Refusal, create_page, list_bytes, remove_resident, upsert_resident,
+    PageClass, PageSet, Refusal, create_page, remove_resident, upsert_resident,
 };
 use crate::outline::{Outline, OutlinePass};
 use crate::path::{
@@ -32,6 +32,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt as _;
+
+mod growth;
+pub use growth::{MemoryDemand, MemoryReserve, ReserveMode};
 
 /// The default sky: the clear color and fog color of a noon view (linear RGBA).
 pub const DEFAULT_SKY_COLOR: [f32; 4] = [0.30, 0.52, 0.85, 1.0];
@@ -155,18 +158,20 @@ pub struct RenderStats {
     pub arena_used_quads: u32,
     /// Quads the pages hold ([`ChunkMemoryStats::capacity_quads`]).
     pub arena_capacity_quads: u32,
-    /// Chunk table capacity: [`ChunkMemorySettings::initial_slots`], cut to the device's
-    /// limits.
+    /// Chunk table capacity now: [`ChunkMemorySettings::initial_slots`] cut to the device's
+    /// limits, then grown as chunks need it (ADR 0035).
     pub chunk_slot_capacity: u32,
     /// Chunks passing CPU culling (Mid/Low; High: 0, culling is on the GPU).
     pub visible_chunks: u32,
     /// Draw calls recorded (High: 2 multi-draws, opaque + cutout, per page holding chunks, plus
     /// one draw per visible chunk with translucent quads).
     pub draws: u32,
-    /// Chunks not resident because no page could take them or the chunk table was full
-    /// (cumulative). Non-zero means holes in the world: raise
-    /// [`ChunkMemorySettings::initial_quads`] (quads) or `initial_slots` (chunks: slots and the
-    /// floor's chunk places), or the view distance is too large for them.
+    /// Uploads refused because no page could take them or the chunk table was full
+    /// (cumulative; retries are not counted again). The chunks wait with their mesh and come
+    /// back once room frees ([`ChunkMemoryStats::refused_waiting`]); while they wait the world
+    /// has holes. With growth that happens only at the ceiling
+    /// ([`ChunkMemorySettings::max_quads`], `max_slots`) or after a failed creation; with
+    /// `grow: false` raise `initial_quads` or `initial_slots`, or lower the view distance.
     pub dropped_chunks: u32,
     /// Resident chunks inside the GPU window that cave culling hides this frame (ADR 0022): the
     /// world's visibility search did not reach them, because they are behind closed rock or
@@ -264,8 +269,8 @@ pub struct VoxelRenderer {
     pages: PageSet,
     /// Page size, chunks a page, the floor and the ceiling of this renderer.
     layout: MemoryLayout,
-    /// Pages with High draw lists (`View::counts.y` on every tier).
-    list_pages: u32,
+    /// The runtime of chunk memory: growth, the table, retries and shrink (ADR 0035).
+    growth: growth::Growth,
     chunks: ChunkTable,
     /// GPU chunk table (High/Mid).
     chunk_buffer: Option<wgpu::Buffer>,
@@ -339,6 +344,23 @@ pub struct ResetState {
     pub sorted_chunks: usize,
     /// A cave culling set is held.
     pub occlusion_set: bool,
+    /// Chunk memory pages.
+    pub pages: u32,
+    /// Their class, size and state in id order (hashed).
+    pub page_layout: u64,
+    /// Their bytes (Low's light pages included).
+    pub page_bytes: u64,
+    /// Chunk table capacity.
+    pub table_slots: u32,
+    /// Page ids High's draw lists cover (0 on Mid and Low).
+    pub list_pages: u32,
+    /// Refused chunks kept for a retry.
+    pub refused_waiting: usize,
+    /// Pieces asked for between frames (bits: Solid page, Translucent page, table).
+    pub wanted: u32,
+    /// Pieces in progress: a table being cleared or waiting for its copy, a list pair being
+    /// cleared, Draining pages.
+    pub pending_pieces: u32,
 }
 
 /// The chunks whose last upload [`VoxelRenderer::upsert_chunk`] refused (chunk table or pages
@@ -361,9 +383,38 @@ struct Refused {
     undrawn: HashMap<ChunkPos, bool>,
     /// Positions refused since the last [`VoxelRenderer::render`].
     fresh: Vec<ChunkPos>,
+    /// The refused chunks' origin and mesh (the `Arc` the world holds, not a copy), retried
+    /// once room rises ([`VoxelRenderer::retry_refused`]).
+    retained: growth::Retained,
+    /// Quads of `retained` per class (Solid, Translucent): growth makes room for them too.
+    waiting: [u64; 2],
+}
+
+/// The class index and the page quads of a kept mesh.
+fn waiting_quads(mesh: &ChunkMesh) -> (usize, u64) {
+    let class = PageClass::of(&crate::memory::bucket_counts(mesh));
+    (class.index(), u64::from(crate::upload::arena_len(mesh)))
 }
 
 impl Refused {
+    /// Keeps chunk `id`'s refused mesh for a retry.
+    fn retain(&mut self, id: u64, origin: I64Vec3, mesh: Arc<ChunkMesh>) {
+        let (class, quads) = waiting_quads(&mesh);
+        self.waiting[class] += quads;
+        if let Some((_, old)) = self.retained.insert(id, (origin, mesh)) {
+            let (class, quads) = waiting_quads(&old);
+            self.waiting[class] -= quads;
+        }
+    }
+
+    /// Drops chunk `id`'s kept mesh.
+    fn forget(&mut self, id: u64) {
+        if let Some((_, old)) = self.retained.remove(&id) {
+            let (class, quads) = waiting_quads(&old);
+            self.waiting[class] -= quads;
+        }
+    }
+
     /// The upload of chunk `id` at `pos` was refused; `resident`: its older mesh stays drawn.
     fn refuse(&mut self, id: u64, pos: ChunkPos, resident: bool) {
         if self.by_id.insert(id, pos).is_none() {
@@ -377,6 +428,7 @@ impl Refused {
 
     /// Chunk `id` shows what the world sent last: a mesh was uploaded, or it was removed.
     fn shown(&mut self, id: u64) {
+        self.forget(id);
         if let Some(pos) = self.by_id.remove(&id) {
             self.changes.push((pos, false));
             self.undrawn.insert(pos, false);
@@ -385,6 +437,8 @@ impl Refused {
 
     /// Every chunk was removed.
     fn clear(&mut self) {
+        self.retained.clear();
+        self.waiting = [0; 2];
         for (_, pos) in self.by_id.drain() {
             self.changes.push((pos, false));
             self.undrawn.insert(pos, false);
@@ -581,7 +635,8 @@ impl VoxelRenderer {
         });
 
         // Chunk memory sized from the settings and the device limits (ADR 0035).
-        let layout = MemoryLayout::resolve(&config.chunk_memory, DeviceFacts::of(device, tier));
+        let facts = DeviceFacts::of(device, tier);
+        let layout = MemoryLayout::resolve(&config.chunk_memory, facts);
         let slots = layout.slots;
         let chunk_buffer = (tier >= Tier::Mid).then(|| {
             device.create_buffer(&wgpu::BufferDescriptor {
@@ -650,8 +705,14 @@ impl VoxelRenderer {
         });
 
         let memory = ChunkMemory::with_floor(&layout);
-        // Every page id below this has its High lists (the floor never changes yet).
+        // Every page id below this has its High lists (larger ones come with growth).
         let list_pages = memory.id_span().max(1);
+        let growth = growth::Growth::new(
+            config.chunk_memory.grow,
+            facts,
+            layouts.geometry.clone(),
+            list_pages,
+        );
         let mut pages = PageSet::default();
         let geometry = layouts.geometry.as_ref().zip(chunk_buffer.as_ref());
         if tier >= Tier::Mid && geometry.is_none() {
@@ -705,7 +766,7 @@ impl VoxelRenderer {
             memory,
             pages,
             layout,
-            list_pages,
+            growth,
             chunks: ChunkTable::new(slots),
             chunk_buffer,
             copies: Vec::new(),
@@ -1081,12 +1142,27 @@ impl VoxelRenderer {
     ///
     /// Chunk changes stay on the CPU until the next [`VoxelRenderer::render`], which records all
     /// of them at the start of its encoder (one staging buffer for the whole frame). Until then
-    /// the renderer holds `mesh` (no copy of its quads).
+    /// the renderer holds `mesh` (no copy of its quads). A refused mesh is kept (shared, not
+    /// copied) and retried once room rises ([`VoxelRenderer::retry_refused`]); call
+    /// [`VoxelRenderer::reserve`] before a burst, as [`VoxelRenderer::apply_ops`] does, so pages
+    /// are made for it first.
     pub fn upsert_chunk(
         &mut self,
         id: u64,
         origin: I64Vec3,
         mesh: Arc<ChunkMesh>,
+    ) -> Result<(), RendererError> {
+        self.upsert_inner(id, origin, mesh, true)
+    }
+
+    /// [`VoxelRenderer::upsert_chunk`]; a retry (`caller` false) that is refused again changes
+    /// nothing: not counted, not reported, not returned as a warning.
+    fn upsert_inner(
+        &mut self,
+        id: u64,
+        origin: I64Vec3,
+        mesh: Arc<ChunkMesh>,
+        caller: bool,
     ) -> Result<(), RendererError> {
         if mesh.is_empty() {
             self.remove_chunk(id);
@@ -1114,9 +1190,11 @@ impl VoxelRenderer {
                 self.sorter.upsert(id, origin, mesh);
                 Ok(())
             }
+            Err(_) if !caller => Err(RendererError::ArenaFull { needed: 0 }),
             Err(Refusal::Table) => {
                 self.stats.dropped_chunks += 1;
                 self.refused.refuse(id, pos, false);
+                self.refused.retain(id, origin, mesh);
                 Err(RendererError::ChunkTableFull(self.chunks.capacity()))
             }
             Err(
@@ -1127,6 +1205,7 @@ impl VoxelRenderer {
                 // untouched), and goes on drawing it.
                 self.stats.dropped_chunks += 1;
                 self.refused.refuse(id, pos, resident);
+                self.refused.retain(id, origin, mesh);
                 Err(match refusal {
                     Refusal::PageChunks { .. } => RendererError::PageChunksFull {
                         needed,
@@ -1140,32 +1219,42 @@ impl VoxelRenderer {
     /// Removes a chunk; returns false if unknown. Reaches the GPU with the next `render`.
     pub fn remove_chunk(&mut self, id: u64) -> bool {
         self.refused.shown(id);
-        if !remove_resident(&mut self.memory, &mut self.chunks, &mut self.uploads, id) {
+        let Some(quads) = self.chunks.get(id).map(|(_, r)| r.alloc.alloc.size) else {
             return false;
-        }
+        };
+        let table_was_full = self.chunks.free_slots() == 0;
+        remove_resident(&mut self.memory, &mut self.chunks, &mut self.uploads, id);
         self.sorter.remove(id);
+        if table_was_full {
+            self.growth.room_rose();
+        } else {
+            self.growth.freed(u64::from(quads), self.layout.page_quads);
+        }
         true
     }
-    /// Removes every chunk. Reaches the GPU with the next `render`. The pages stay.
+    /// Removes every chunk. Reaches the GPU with the next `render`. The pages stay (a Draining
+    /// one takes chunks again; one being cleared goes on clearing), and so does a grown table.
     pub fn clear_chunks(&mut self) {
         self.refused.clear();
         self.chunks.clear();
         self.memory.reset();
         self.uploads.clear();
         self.sorter.clear();
+        self.growth.clear_chunks();
     }
     /// Forgets the world (it closed): everything [`VoxelRenderer::clear_chunks`] drops, and the
     /// refused chunks, the cave culling set and the far LOD's sealed search go without a word to
     /// the next world ([`VoxelRenderer::take_refused`] reports no `(pos, false)` for them), so
     /// that world starts as a fresh renderer would ([`VoxelRenderer::debug_reset_state`]). The
-    /// device, pipelines, targets, textures, fog and far LOD passes stay. `device` is for the
-    /// chunk memory, which the next world grows again from its floor (#57).
+    /// device, pipelines, targets, textures, fog and far LOD passes stay. Chunk memory goes
+    /// back to where a fresh renderer starts (ADR 0035): the floor's pages, the initial table
+    /// and lists, nothing wanted, kept or in progress; the next world grows again from there.
     pub fn clear_world(&mut self, device: &wgpu::Device) {
-        let _ = device;
         self.clear_chunks();
         self.refused = Refused::default();
         self.occlusion = Occlusion::default();
         self.lod_sealed = None;
+        self.reset_memory(device);
     }
     /// What must equal a fresh renderer's right after [`VoxelRenderer::clear_world`] (the
     /// shared world switch tests). Cumulative stats are not part of it.
@@ -1180,45 +1269,35 @@ impl VoxelRenderer {
             pending_uploads: self.uploads.pending_len(),
             sorted_chunks: self.sorter.len(),
             occlusion_set: self.occlusion.set.is_some(),
+            pages: self.memory.pages().count() as u32,
+            page_layout: self.page_layout(),
+            page_bytes: self.pages.bytes(),
+            table_slots: self.chunks.capacity(),
+            list_pages: self.path.list_pages().unwrap_or(0),
+            refused_waiting: self.refused.retained.len(),
+            wanted: self.growth.wanted_bits(),
+            pending_pieces: self.growth.pending_pieces(),
         }
     }
-    /// One frame's chunk changes, as the render plugin applies them before each frame (GPU tests
-    /// call it to run the plugin's exact sequence): first the clear `resync` asks for
-    /// ([`Resync::Chunks`]: [`VoxelRenderer::clear_chunks`], for a new renderer, lost uploads or
-    /// a rejected frame; [`Resync::World`]: [`VoxelRenderer::clear_world`], the world closed),
-    /// after which `ops` holds every chunk again; then each op in order. Returns the refusals
-    /// (each also counted in [`RenderStats::dropped_chunks`] and reported by
-    /// [`VoxelRenderer::take_refused`]). `device` is where pages for the frame's meshes will be
-    /// created once chunk memory grows (#57 M2); today the floor is all there is.
-    pub fn apply_ops(
-        &mut self,
-        device: &wgpu::Device,
-        ops: impl IntoIterator<Item = ChunkOp>,
-        resync: Resync,
-    ) -> Vec<RendererError> {
-        match resync {
-            Resync::None => {}
-            Resync::Chunks => self.clear_chunks(),
-            Resync::World => self.clear_world(device),
-        }
-        let mut errors = Vec::new();
-        for op in ops {
-            let result = match op {
-                ChunkOp::Upsert { id, origin, mesh } => {
-                    let _span = frame_span!("render.upsert");
-                    self.upsert_chunk(id, origin, mesh)
-                }
-                ChunkOp::Remove { id } => {
-                    let _span = frame_span!("render.remove");
-                    self.remove_chunk(id);
-                    Ok(())
-                }
+
+    /// The pages' class, quads and state in id order, hashed (FNV-1a).
+    fn page_layout(&self) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for (id, page) in self.memory.pages() {
+            let state = match page.state {
+                crate::memory::PageState::Clearing { .. } => 0,
+                crate::memory::PageState::Active => 1,
+                crate::memory::PageState::Draining => 2,
             };
-            if let Err(e) = result {
-                errors.push(e);
+            let word = u64::from(id) << 48
+                | (page.class.index() as u64) << 40
+                | state << 32
+                | u64::from(page.alloc.capacity());
+            for byte in word.to_le_bytes() {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
             }
         }
-        errors
+        hash
     }
     /// How the translucent quads inside each chunk are sorted ([`RendererConfig::translucent_sort`]).
     pub fn translucent_sort(&self) -> TranslucentSort {
@@ -1288,10 +1367,10 @@ impl VoxelRenderer {
         });
         let cull_view = cull_view.as_ref().unwrap_or(view);
         {
-            // Chunk memory's work between frames (ADR 0035): today the page counts the draws
-            // read and the allocation probe's clears.
+            // Chunk memory's work between frames (ADR 0035): the table copy, the clears of new
+            // pieces, evacuation and releases; the allocation probe's clears.
             let _span = frame_span!("render.pages");
-            self.pages.sync(&self.memory);
+            self.maintain(device, encoder);
             self.clear_probe(encoder);
         }
         {
@@ -1348,7 +1427,7 @@ impl VoxelRenderer {
             ]),
             counts: [
                 slot_count,
-                self.list_pages,
+                self.path.list_pages().unwrap_or(1),
                 self.layout.stride(),
                 u32::from(culled),
             ],
@@ -1457,6 +1536,9 @@ impl VoxelRenderer {
         self.stats.draws = draws;
         self.stats.occluded_chunks = hidden;
         self.stats.chunk_memory.translucent_page_switches = self.path.translucent_page_switches();
+        let eye = view.eye_rel;
+        let eye = I64Vec3::new(eye.x as i64, eye.y as i64, eye.z as i64);
+        self.decide_growth(view.render_origin + eye);
     }
     /// Encodes the fullscreen blit of the main color target into `target`.
     pub fn blit(&self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
@@ -1495,7 +1577,7 @@ impl VoxelRenderer {
             .pages()
             .filter(|(_, p)| p.class == PageClass::Translucent)
             .count() as u32;
-        ChunkMemoryStats {
+        self.growth_stats(ChunkMemoryStats {
             pages: self.memory.pages().count() as u32,
             translucent_pages,
             used_quads: self.memory.used(),
@@ -1505,16 +1587,13 @@ impl VoxelRenderer {
             largest_free_quads: self.memory.largest_free(),
             page_bytes: self.pages.bytes(),
             table_bytes: self.chunk_buffer.as_ref().map_or(0, wgpu::Buffer::size),
-            list_bytes: if self.tier == Tier::High {
-                list_bytes(self.list_pages, self.layout.stride())
-            } else {
-                0
-            },
+            list_bytes: self.path.list_bytes(),
             chunk_places: self.memory.chunk_places(),
             full_pages: self.memory.full_pages(),
             translucent_page_switches: self.stats.chunk_memory.translucent_page_switches,
             cpu_bytes: self.memory.cpu_bytes(),
-        }
+            ..ChunkMemoryStats::default()
+        })
     }
 
     /// Testing: the bytes of page `id` (with `light`, of its Low light page), from quad

@@ -2,8 +2,8 @@
 //! Self-skips without an adapter unless `BOXEL_REQUIRE_GPU=1`; run with `--test-threads=1` like
 //! the other GPU tests.
 //!
-//! The renderer's side, driven as the render plugin's `prepare` drives it (cases (a) to (d) of
-//! the joint contract, before #57 moves them to its memory ops):
+//! The renderer's side, driven as the render plugin's `prepare` drives it (cases (a) to (e) of
+//! the joint contract), through `VoxelRenderer::apply_ops` with the frame's `Resync`:
 //!
 //! - **(a) Reset state:** right after `clear_world` the renderer's per-world state
 //!   (`debug_reset_state`) equals a fresh renderer's, refused chunks and a cave culling set
@@ -15,8 +15,12 @@
 //!   origin and 2^40 away.
 //! - **(c) Heightfield:** the `gpu_tiers` heightfield with leaves and water: B after A within
 //!   `MAX_TIER_DIFF` of a fresh B on its tier and across tiers.
-//! - **(d) 20 switches** between a small scene and a big one (test 29): the reset state equals a
-//!   fresh renderer's after every switch, and no size grows past the big scene's peak.
+//! - **(d) 20 switches** between a small scene and a big one that grows chunk memory past its
+//!   floor (test 29, #57's G9): the reset state, chunk memory included, equals a fresh
+//!   renderer's after every switch, and no size grows past the big scene's peak.
+//! - **(e) A busy clear:** `clear_world` and `clear_chunks` while a page is being cleared, a page
+//!   is half drained, a table is cleared ahead and a table copy waits: a fresh renderer after the
+//!   first, every chunk back after the second.
 //!
 //! The world's side: a headless app (`WorldPlugin` with no world at startup, the lifecycle, the
 //! daylight clock and, for test 26, the far LOD and the fog) records every frame as the render
@@ -54,9 +58,9 @@ use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher};
 use boxel_render::fog::{FogClock, FogInput, FogPlugin, FogSettings, FogTime};
 use boxel_render::lod::{LodInput, LodSettings};
 use boxel_render::{
-    BlockTextureData, ChunkMemorySettings, PackSource, RenderSettings, RendererConfig, ResetState,
-    Resync, SceneLight, TextureSource, TranslucentSort, ViewParams, VoxelRenderer, light_curve,
-    load_block_textures,
+    BlockTextureData, ChunkMemorySettings, ChunkOp, PackSource, RenderSettings, RendererConfig,
+    ResetState, Resync, SceneLight, TextureSource, TranslucentSort, ViewParams, VoxelRenderer,
+    light_curve, load_block_textures,
 };
 use boxel_transform::Transform;
 use boxel_voxel::{
@@ -702,11 +706,17 @@ fn stream_in(
     view: &ViewParams,
 ) -> Result<(), String> {
     for (n, part) in chunks.chunks(batch.max(1)).enumerate() {
-        for (i, (c, mesh)) in part.iter().enumerate() {
-            let id = first_id + (n * batch + i) as u64;
-            renderer
-                .upsert_chunk(id, c.as_i64vec3() * 32 + shift, Arc::clone(mesh))
-                .map_err(|e| format!("upsert {c}: {e}"))?;
+        let ops: Vec<ChunkOp> = part
+            .iter()
+            .enumerate()
+            .map(|(i, (c, mesh))| ChunkOp::Upsert {
+                id: first_id + (n * batch + i) as u64,
+                origin: c.as_i64vec3() * 32 + shift,
+                mesh: Arc::clone(mesh),
+            })
+            .collect();
+        if let Some(e) = renderer.apply_ops(gpu.device, ops, Resync::None).first() {
+            return Err(format!("batch {n}: {e}"));
         }
         draw(gpu, renderer, view)?;
     }
@@ -714,12 +724,13 @@ fn stream_in(
 }
 
 /// A renderer's switch to the next world as `prepare` runs it on a `Resync::World` frame: the
-/// old world's last refusals are taken and dropped (`extract_visibility`), then `clear_world`
-/// and no cave culling set (a resync frame culls nothing).
+/// old world's last refusals are taken and dropped (`extract_visibility`), then the frame's
+/// ops with `Resync::World` (`clear_world` first; the next world's chunks come in later frames
+/// here) and no cave culling set (a resync frame culls nothing).
 fn switch_world(gpu: &Gpu<'_>, renderer: &mut VoxelRenderer) {
     renderer.take_refused(|_, _| {});
     renderer.take_undrawn(|_, _| {});
-    renderer.clear_world(gpu.device);
+    renderer.apply_ops(gpu.device, Vec::new(), Resync::World);
     renderer.set_visibility(None);
 }
 
@@ -759,16 +770,16 @@ fn clear_world_leaves_a_fresh_renderer() {
             let empty = render(gpu, &mut new_renderer(gpu, &small)?, &view)?;
             for world in [true, false] {
                 let mut renderer = new_renderer(gpu, &small)?;
-                let mut refused = 0;
-                for (i, (c, mesh)) in scene.iter().enumerate() {
-                    let origin = c.as_i64vec3() * 32;
-                    if renderer
-                        .upsert_chunk(i as u64, origin, Arc::clone(mesh))
-                        .is_err()
-                    {
-                        refused += 1;
-                    }
-                }
+                let ops: Vec<ChunkOp> = scene
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (c, mesh))| ChunkOp::Upsert {
+                        id: i as u64,
+                        origin: c.as_i64vec3() * 32,
+                        mesh: Arc::clone(mesh),
+                    })
+                    .collect();
+                let refused = renderer.apply_ops(gpu.device, ops, Resync::None).len();
                 renderer.set_visibility(Some(Arc::clone(&set)));
                 draw(gpu, &mut renderer, &view)?;
                 let held = renderer.debug_reset_state();
@@ -777,7 +788,7 @@ fn clear_world_leaves_a_fresh_renderer() {
                     || format!("{} {}: the world held {held:?}", gpu.label, gpu.tier),
                 );
                 if world {
-                    renderer.clear_world(gpu.device);
+                    renderer.apply_ops(gpu.device, Vec::new(), Resync::World);
                     let state = renderer.debug_reset_state();
                     report.check(state == fresh.debug_reset_state(), || {
                         format!(
@@ -805,7 +816,7 @@ fn clear_world_leaves_a_fresh_renderer() {
                         format!("{} {}: chunks left after clear_world", gpu.label, gpu.tier)
                     });
                 } else {
-                    renderer.clear_chunks();
+                    renderer.apply_ops(gpu.device, Vec::new(), Resync::Chunks);
                     let shown = reports_refusals(&mut renderer)
                         .iter()
                         .filter(|(_, refused)| !refused)
@@ -854,8 +865,18 @@ fn a_sparse_world_after_another_draws_as_in_a_fresh_renderer() {
                 let fresh_image = render(gpu, &mut fresh, &view)?;
 
                 let mut resynced = new_renderer(gpu, &config())?;
-                resynced.clear_chunks();
-                stream_in(gpu, &mut resynced, &b, shift, 1 << 20, b.len(), &view)?;
+                let ops: Vec<ChunkOp> = b
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (c, mesh))| ChunkOp::Upsert {
+                        id: (1 << 20) + i as u64,
+                        origin: c.as_i64vec3() * 32 + shift,
+                        mesh: Arc::clone(mesh),
+                    })
+                    .collect();
+                if let Some(e) = resynced.apply_ops(gpu.device, ops, Resync::Chunks).first() {
+                    return Err(format!("B in one resync frame: {e}"));
+                }
                 let resynced_image = render(gpu, &mut resynced, &view)?;
 
                 let what = format!("{} {} {place}", gpu.label, gpu.tier);
@@ -939,12 +960,29 @@ struct Loaded {
     state: ResetState,
     arena_capacity: u32,
     slot_capacity: u32,
+    /// Chunk memory bytes: pages, table, High's lists.
+    bytes: (u64, u64, u64),
 }
 
-/// Joint case (d) and test 29: 20 switches between a small scene and a big one. After every
-/// switch the renderer's per-world state is a fresh renderer's; every load of a scene leaves the
-/// same state and sizes (nothing accumulates), the small scene never more than the big one, and
-/// the last image is a fresh renderer's. (#57 adds its pages, table and list sizes.)
+/// Chunk memory that grows past its floor with the big scene of case (d): pages of 16 Ki quads
+/// from a floor of two (one Translucent) and 64 slots.
+fn growing_config() -> RendererConfig {
+    RendererConfig {
+        chunk_memory: ChunkMemorySettings {
+            initial_quads: 1 << 15,
+            initial_slots: 64,
+            page_quads: 1 << 14,
+            ..ChunkMemorySettings::default()
+        },
+        translucent_sort: TranslucentSort::Inline,
+    }
+}
+
+/// Joint case (d) and test 29 (#57's G9): 20 switches between a small scene and a big one that
+/// grows chunk memory past its floor (pages, the table, High's lists). After every switch the
+/// renderer's per-world state is a fresh renderer's, chunk memory included; every load of a
+/// scene leaves the same state and sizes (nothing accumulates), the small scene never more than
+/// the big one, and the last image is a fresh renderer's.
 #[test]
 fn twenty_switches_leave_a_fresh_renderer_every_time() {
     let small = sparse(3, -2..=2, 0..=0, -2..=2);
@@ -953,8 +991,9 @@ fn twenty_switches_leave_a_fresh_renderer_every_time() {
     let view = sparse_view(I64Vec3::ZERO);
     for_every_tier(|gpu, report| {
         let run = |report: &mut Report| -> Result<(), String> {
-            let fresh = new_renderer(gpu, &config())?.debug_reset_state();
-            let mut renderer = new_renderer(gpu, &config())?;
+            let config = growing_config();
+            let fresh = new_renderer(gpu, &config)?.debug_reset_state();
+            let mut renderer = new_renderer(gpu, &config)?;
             let mut first: [Option<Loaded>; 2] = [None, None];
             let mut next_id = 0;
             for load in 0..21 {
@@ -973,10 +1012,12 @@ fn twenty_switches_leave_a_fresh_renderer_every_time() {
                 stream_in(gpu, &mut renderer, scene, I64Vec3::ZERO, next_id, 24, &view)?;
                 next_id += 1 << 20;
                 let stats = renderer.stats();
+                let memory = stats.chunk_memory;
                 let loaded = Loaded {
                     state: renderer.debug_reset_state(),
                     arena_capacity: stats.arena_capacity_quads,
                     slot_capacity: stats.chunk_slot_capacity,
+                    bytes: (memory.page_bytes, memory.table_bytes, memory.list_bytes),
                 };
                 match first[load % 2] {
                     None => first[load % 2] = Some(loaded),
@@ -989,16 +1030,31 @@ fn twenty_switches_leave_a_fresh_renderer_every_time() {
                 }
             }
             if let [Some(s), Some(b)] = first {
+                let floor = new_renderer(gpu, &config)?.stats();
                 report.check(
                     s.state.arena_used <= b.state.arena_used
                         && s.state.slots <= b.state.slots
-                        && (s.arena_capacity, s.slot_capacity)
-                            == (b.arena_capacity, b.slot_capacity),
+                        && s.arena_capacity <= b.arena_capacity
+                        && s.slot_capacity <= b.slot_capacity
+                        && s.bytes.0 <= b.bytes.0
+                        && s.bytes.1 <= b.bytes.1
+                        && s.bytes.2 <= b.bytes.2,
                     || format!("{} {}: small {s:?}, big {b:?}", gpu.label, gpu.tier),
+                );
+                // the big scene grew past the floor, pages and table
+                report.check(
+                    b.state.pages > floor.chunk_memory.pages
+                        && b.slot_capacity > floor.chunk_slot_capacity,
+                    || {
+                        format!(
+                            "{} {}: the big scene did not grow: {b:?}",
+                            gpu.label, gpu.tier
+                        )
+                    },
                 );
             }
             let last = render(gpu, &mut renderer, &view)?;
-            let mut fresh_small = new_renderer(gpu, &config())?;
+            let mut fresh_small = new_renderer(gpu, &config)?;
             stream_in(gpu, &mut fresh_small, &small, I64Vec3::ZERO, 0, 24, &view)?;
             let expected = render(gpu, &mut fresh_small, &view)?;
             report.check_identical(
@@ -1013,6 +1069,141 @@ fn twenty_switches_leave_a_fresh_renderer_every_time() {
         };
         if let Err(e) = run(report) {
             report.fail(format!("{} {}: {e}", gpu.label, gpu.tier), &[]);
+        }
+    })
+    .finish();
+}
+
+/// Joint case (e): `clear_world` and `clear_chunks` (as `apply_ops` runs them for
+/// `Resync::World` and `Resync::Chunks`) landing while chunk memory is busy: a page being
+/// cleared, a page half drained into the others, a larger table being cleared ahead and one put
+/// in use in the frame whose copy of the old table waits for the next render. After the world's
+/// clear the renderer is a fresh one and B draws as a fresh B; after the chunks' clear every
+/// chunk comes back and draws as a fresh renderer fed them in one frame.
+#[test]
+fn a_clear_in_the_middle_of_memory_work_is_clean() {
+    let mut a = heightfield(0.5);
+    a.extend(sparse(4, -8..=8, 2..=4, -8..=8));
+    let b = sparse(2, -4..=4, 0..=0, -4..=4);
+    let view = sparse_view(I64Vec3::ZERO);
+    for_every_tier(|gpu, report| {
+        for world in [true, false] {
+            let run = |report: &mut Report| -> Result<(), String> {
+                let config = growing_config();
+                let fresh = new_renderer(gpu, &config)?.debug_reset_state();
+                let mut renderer = new_renderer(gpu, &config)?;
+                stream_in(gpu, &mut renderer, &a, I64Vec3::ZERO, 0, 24, &view)?;
+                // everything slow: a slice of a clear and one copy a frame
+                renderer.debug_set_budgets(Some((4096, 1 << 10, 1)));
+                renderer.debug_force_page(false);
+                renderer.grow_between_frames(gpu.device);
+                let victim = renderer
+                    .debug_pages()
+                    .iter()
+                    .find(|p| p.3 == 1 && !p.1)
+                    .map(|p| p.0)
+                    .ok_or("no Solid page")?;
+                if !renderer.debug_evacuate_page(victim) {
+                    return Err(format!("page {victim} would not drain"));
+                }
+                draw(gpu, &mut renderer, &view)?;
+                // more new chunks than free slots: a table at once, its copy waiting
+                let stats = renderer.stats();
+                let free = (stats.chunk_slot_capacity - stats.chunks) as usize;
+                let extra: Vec<ChunkOp> = (0..free + 1)
+                    .map(|i| {
+                        let (c, mesh) = &b[i % b.len()];
+                        ChunkOp::Upsert {
+                            id: (1 << 30) + i as u64,
+                            origin: (c.as_i64vec3() + I64Vec3::new(0, 8 + 2 * i as i64, 0)) * 32,
+                            mesh: Arc::clone(mesh),
+                        }
+                    })
+                    .collect();
+                if let Some(e) = renderer
+                    .apply_ops(gpu.device, extra.clone(), Resync::None)
+                    .first()
+                {
+                    return Err(format!("the extra chunks: {e}"));
+                }
+                // and a larger one ahead, being cleared
+                for _ in 0..3 {
+                    renderer.grow_between_frames(gpu.device);
+                }
+                let busy = renderer.chunk_memory();
+                let pending = renderer.debug_reset_state().pending_pieces;
+                let tables = if gpu.tier >= Tier::Mid { 2 } else { 0 };
+                report.check(
+                    busy.clearing_pages >= 1 && busy.draining_pages == 1 && pending > tables,
+                    || {
+                        format!(
+                            "{} {}: not busy: {busy:?}, {pending} pieces",
+                            gpu.label, gpu.tier
+                        )
+                    },
+                );
+                renderer.debug_set_budgets(None);
+                if world {
+                    switch_world(gpu, &mut renderer);
+                    let state = renderer.debug_reset_state();
+                    report.check(state == fresh, || {
+                        format!(
+                            "{} {}: busy, then clear_world: {state:?}, fresh {fresh:?}",
+                            gpu.label, gpu.tier
+                        )
+                    });
+                    draw(gpu, &mut renderer, &view)?;
+                    stream_in(gpu, &mut renderer, &b, I64Vec3::ZERO, 1 << 20, 7, &view)?;
+                    let after = render(gpu, &mut renderer, &view)?;
+                    let mut fresh_b = new_renderer(gpu, &config)?;
+                    stream_in(gpu, &mut fresh_b, &b, I64Vec3::ZERO, 0, 7, &view)?;
+                    let expected = render(gpu, &mut fresh_b, &view)?;
+                    report.check_identical(
+                        &format!("{} {}: B after a busy A", gpu.label, gpu.tier),
+                        (&gpu.name("busy_world_after"), &after),
+                        (&gpu.name("busy_world_fresh"), &expected),
+                    );
+                } else {
+                    let mut all: Vec<ChunkOp> = a
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (c, mesh))| ChunkOp::Upsert {
+                            id: i as u64,
+                            origin: c.as_i64vec3() * 32,
+                            mesh: Arc::clone(mesh),
+                        })
+                        .collect();
+                    all.extend(extra);
+                    if let Some(e) = renderer
+                        .apply_ops(gpu.device, all.clone(), Resync::Chunks)
+                        .first()
+                    {
+                        return Err(format!("the resync: {e}"));
+                    }
+                    for _ in 0..4 {
+                        draw(gpu, &mut renderer, &view)?;
+                        renderer.grow_between_frames(gpu.device);
+                    }
+                    let after = render(gpu, &mut renderer, &view)?;
+                    let mut fresh_a = new_renderer(gpu, &config)?;
+                    if let Some(e) = fresh_a.apply_ops(gpu.device, all, Resync::Chunks).first() {
+                        return Err(format!("the fresh resync: {e}"));
+                    }
+                    let expected = render(gpu, &mut fresh_a, &view)?;
+                    report.check_close(
+                        &format!("{} {}: A after a busy clear_chunks", gpu.label, gpu.tier),
+                        (&gpu.name("busy_chunks_after"), &after),
+                        (&gpu.name("busy_chunks_fresh"), &expected),
+                    );
+                }
+                Ok(())
+            };
+            if let Err(e) = run(report) {
+                report.fail(
+                    format!("{} {} world {world}: {e}", gpu.label, gpu.tier),
+                    &[],
+                );
+            }
         }
     })
     .finish();
@@ -1437,10 +1628,22 @@ fn replay(
                 return Err(format!("frame {i}: refused chunks {refusals:?}"));
             }
         }
-        match frame.resync {
-            Resync::None => {}
-            Resync::Chunks => renderer.clear_chunks(),
-            Resync::World => renderer.clear_world(gpu.device),
+        // `prepare`'s order: the frame's ops (with the clear its resync asks for), then the
+        // visible set, the fog and the far LOD
+        let ops: Vec<ChunkOp> = frame
+            .meshes
+            .iter()
+            .map(|op| match op {
+                MeshOp::Upsert { id, origin, mesh } => ChunkOp::Upsert {
+                    id: *id,
+                    origin: *origin,
+                    mesh: Arc::clone(mesh),
+                },
+                MeshOp::Remove { id } => ChunkOp::Remove { id: *id },
+            })
+            .collect();
+        if let Some(e) = renderer.apply_ops(gpu.device, ops, frame.resync).first() {
+            return Err(format!("frame {i}: {e}"));
         }
         renderer.set_visibility(frame.visibility.clone());
         let fog = frame.fog.clone().map(|fog| match fog_time {
@@ -1449,16 +1652,6 @@ fn replay(
         });
         renderer.set_fog(gpu.device, fog);
         renderer.set_lod(gpu.device, frame.lod.clone());
-        for op in &frame.meshes {
-            match op {
-                MeshOp::Upsert { id, origin, mesh } => renderer
-                    .upsert_chunk(*id, *origin, Arc::clone(mesh))
-                    .map_err(|e| format!("frame {i}: upsert at {origin}: {e}"))?,
-                MeshOp::Remove { id } => {
-                    renderer.remove_chunk(*id);
-                }
-            }
-        }
         match frame.capture {
             None => draw(gpu, &mut renderer, &frame.view)?,
             Some(name) => {

@@ -15,7 +15,7 @@ mod high;
 mod low;
 mod mid;
 
-pub(crate) use high::{HighInputs, HighPath};
+pub(crate) use high::{HighInputs, HighPath, ListPair};
 pub(crate) use low::LowPath;
 pub(crate) use mid::MidPath;
 
@@ -92,6 +92,36 @@ pub(crate) trait TierPath {
 
     /// The page changes of this frame's translucent list ([`page_switches`]).
     fn translucent_page_switches(&self) -> u32;
+
+    /// High: the page ids its draw lists cover (`L`); `None` on Mid and Low, which have none.
+    fn list_pages(&self) -> Option<u32> {
+        None
+    }
+
+    /// High: a new pair of draw lists for `pages` page ids, not in use yet (ADR 0035: it is
+    /// cleared before [`TierPath::swap_lists`] puts it in use).
+    fn create_lists(&self, device: &wgpu::Device, pages: u32) -> Option<ListPair> {
+        let _ = (device, pages);
+        None
+    }
+
+    /// High: puts `lists` in use; the cull's bind group is built again with `table`.
+    fn swap_lists(&mut self, device: &wgpu::Device, lists: ListPair, table: &wgpu::Buffer) {
+        let _ = (device, lists, table);
+    }
+
+    /// The chunk table changed (a larger one, or the initial one again after a world switch):
+    /// what is sized by the slots or bound to the table is built again (High: the cull state,
+    /// its bind group and the translucent refs; Mid: the draw refs). High's cave culling bits
+    /// must be written again (the renderer rebuilds them).
+    fn resize_table(&mut self, device: &wgpu::Device, table: Option<&wgpu::Buffer>, slots: u32) {
+        let _ = (device, table, slots);
+    }
+
+    /// Bytes of High's draw lists (0 on Mid and Low).
+    fn list_bytes(&self) -> u64 {
+        0
+    }
 
     /// Testing (High): the draw counts the last frame's cull wrote, opaque and cutout per page.
     fn debug_draw_counts(

@@ -96,6 +96,8 @@ pub(crate) struct ChunkTable {
     stale_prefix: u32,
     /// Highest slot count since the table was made: no slot at or past it was ever written.
     high_water: u32,
+    /// Slots below this were taken by some [`ChunkTable::take_stale_runs`].
+    written: u32,
     /// Bumped by every clear and window move: per-slot data derived from the records and the
     /// window (the cave culling bits) must be rebuilt. Smaller changes go to `touched`.
     version: u64,
@@ -120,6 +122,7 @@ impl ChunkTable {
             stale_bits: vec![0; capacity.div_ceil(64) as usize],
             stale_prefix: 0,
             high_water: 0,
+            written: 0,
             version: 0,
             touched: Vec::new(),
             touched_bits: vec![0; capacity.div_ceil(64) as usize],
@@ -154,6 +157,44 @@ impl ChunkTable {
     /// Slot capacity.
     pub fn capacity(&self) -> u32 {
         self.capacity
+    }
+
+    /// Raises the capacity to `capacity` (a larger GPU table is in use, ADR 0035). Slots,
+    /// records and the stale and touched slots stay as they are.
+    pub fn grow(&mut self, capacity: u32) {
+        if capacity <= self.capacity {
+            return;
+        }
+        self.capacity = capacity;
+        let words = capacity.div_ceil(64) as usize;
+        self.stale_bits.resize(words, 0);
+        self.touched_bits.resize(words, 0);
+    }
+
+    /// Free slots: the chunks the table takes before it is full.
+    pub fn free_slots(&self) -> u32 {
+        self.capacity - self.by_id.len() as u32
+    }
+
+    /// Slots below this were sent to the GPU table by some upload ([`ChunkTable::take_stale_runs`]);
+    /// none at or past it ever was (a larger table copies only the slots below it).
+    pub fn written_slots(&self) -> u32 {
+        self.written
+    }
+
+    /// Moves chunk `id` to `alloc` (shrink moved its quads, ADR 0035): its light base follows,
+    /// and its slot goes stale (the GPU entry is sent again) but is not touched (cave culling's
+    /// view of the slot does not change) and the version stays.
+    pub fn relocate(&mut self, id: u64, alloc: PagedAlloc) {
+        let Some(&slot) = self.by_id.get(&id) else {
+            return;
+        };
+        let Some(record) = self.records[slot as usize].as_mut() else {
+            return;
+        };
+        record.light_base = record.light_base - record.alloc.alloc.offset + alloc.alloc.offset;
+        record.alloc = alloc;
+        self.mark_stale(slot);
     }
 
     /// Live chunks.
@@ -358,6 +399,9 @@ impl ChunkTable {
         }
         self.stale.clear();
         self.stale_prefix = 0;
+        if let Some(last) = runs.last() {
+            self.written = self.written.max(last.end);
+        }
     }
 
     /// Records that the GPU entry of `slot` changed.

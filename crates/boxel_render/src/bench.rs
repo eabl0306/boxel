@@ -4,7 +4,7 @@ use crate::ChunkMemorySettings;
 use crate::arena::ArenaAllocator;
 use crate::chunk_table::{ChunkRecord, ChunkTable};
 use crate::memory::{
-    ChunkMemory, CopySink, MemOp, MemoryLayout, PageClass, PagedAlloc, bucket_counts,
+    ChunkMemory, CopySink, MemOp, MemTarget, MemoryLayout, PageClass, PagedAlloc, bucket_counts,
     upsert_resident,
 };
 use crate::path::CpuCull;
@@ -170,6 +170,13 @@ impl CopySink for CountSink {
         });
         true
     }
+
+    fn copy(&mut self, _: MemTarget, _: u64, _: MemTarget, _: u64, bytes: u64) {
+        self.writes += 1;
+        self.bytes += bytes;
+    }
+
+    fn clear(&mut self, _: MemTarget, _: u64, _: u64) {}
 }
 
 impl FlushBench {

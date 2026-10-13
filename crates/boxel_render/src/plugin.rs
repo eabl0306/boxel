@@ -104,9 +104,11 @@ pub struct RenderSettings {
     /// dark "moody" curve, 1 the brightest.
     pub light_gamma: f32,
     /// How chunk quads are kept on the GPU (ADR 0035): pages of 4 Mi quads (32 MiB), a floor of
-    /// 8 Mi quads and 32,768 chunk slots by default. Read when a renderer is built (the first
-    /// GPU, a recovered device loss); an invalid value is logged and the defaults are used
-    /// ([`ChunkMemorySettings::validate`]).
+    /// 8 Mi quads and 32,768 chunk slots by default, growing between frames up to the ceiling
+    /// and shrinking back to the floor. The ceiling (`max_quads`, `max_slots`) is read every
+    /// frame; the rest when a renderer is built (the first GPU, a recovered device loss). An
+    /// invalid value is logged: a renderer then starts with the defaults, a live change keeps
+    /// the last valid ceiling ([`ChunkMemorySettings::validate`]).
     pub chunk_memory: ChunkMemorySettings,
     /// Automation: while the window is hidden or no frame is ready, still render the main color
     /// target (no acquire/present) and count it in `RenderInfo::frames_rendered`, so scripted
@@ -699,6 +701,8 @@ pub(crate) struct ExtractedFrame {
     pub(crate) distance_fog: DistanceFog,
     render_when_hidden: bool,
     translucent_sort: TranslucentSort,
+    /// The last valid `RenderSettings::chunk_memory`: its ceiling is live (ADR 0035).
+    pub(crate) chunk_memory: ChunkMemorySettings,
     /// Full resync: `meshes` holds every ready mesh, and `renderer.clear_chunks` (or, for a new
     /// world, `renderer.clear_world`) runs first.
     pub(crate) resync: Resync,
@@ -804,9 +808,10 @@ impl UploadWarnings {
             return;
         }
         tracing::warn!(
-            "{} chunk upload(s) failed (last: {}); {dropped_total} chunks dropped so far: raise \
-             RenderSettings::chunk_memory (initial_quads for quads, initial_slots for chunks) or \
-             lower the view distance",
+            "{} chunk upload(s) failed (last: {}); {dropped_total} chunks dropped so far (they \
+             wait and come back when room frees): raise RenderSettings::chunk_memory.max_quads \
+             (max_slots for chunks; initial_quads and initial_slots with grow off) or lower the \
+             view distance",
             self.failures,
             self.last_error
         );
@@ -1444,6 +1449,10 @@ pub(crate) fn extract(
     );
     if settings.is_changed() {
         frame.distance_fog = valid_distance_fog(settings.distance_fog, frame.distance_fog);
+        match settings.chunk_memory.validate() {
+            Ok(()) => frame.chunk_memory = settings.chunk_memory,
+            Err(e) => tracing::warn!("RenderSettings::chunk_memory: {e}; the last valid one stays"),
+        }
     }
     frame.fluid_time = time
         .as_ref()
@@ -1691,6 +1700,7 @@ fn prepare(
     let frame = &mut *frame;
     let queue = &ready.ctx.queue;
     ready.renderer.set_translucent_sort(frame.translucent_sort);
+    ready.renderer.set_memory_limits(&frame.chunk_memory);
     // The frame's chunk changes; a resync frame first runs the clear it asks for (`meshes` then
     // holds every ready mesh), before this frame's visible set is taken.
     let errors = ready
@@ -1853,11 +1863,14 @@ fn draw(
 }
 
 /// After a frame was submitted (and presented): the work that waits for the frame to be out,
-/// today the allocation probe ([`DebugAllocProbe`]). Not when the frame marked the device lost.
+/// chunk memory's growth (ADR 0035: a page or table created here costs the wait before the next
+/// update, not a frame) and the allocation probe ([`DebugAllocProbe`]). Not when the frame
+/// marked the device lost.
 fn after_present(ready: &mut ReadyGpu, frame: &mut ExtractedFrame) {
     if ready.ctx.health.is_lost() {
         return;
     }
+    ready.renderer.grow_between_frames(&ready.ctx.device);
     for mib in frame.alloc_probe.drain(..) {
         let report = ready.renderer.debug_alloc_probe(&ready.ctx.device, mib);
         frame.alloc_probe_done.push(report);
@@ -2098,6 +2111,10 @@ fn render_line(tier: Tier, stats: &crate::RenderStats) -> String {
         // pages that refuse new chunks whatever quads they have free
         line += &format!(" full_of_chunks={}", memory.full_pages);
     }
+    if memory.refused_waiting > 0 {
+        // refused chunks kept until room frees (at the ceiling, or after a failed creation)
+        line += &format!(" waiting={}", memory.refused_waiting);
+    }
     line
 }
 
@@ -2299,6 +2316,8 @@ mod tests {
         let mut full = stats;
         full.chunk_memory.full_pages = 1;
         assert!(render_line(Tier::Mid, &full).ends_with(" 24/64MiB full_of_chunks=1"));
+        full.chunk_memory.refused_waiting = 7;
+        assert!(render_line(Tier::Mid, &full).ends_with(" full_of_chunks=1 waiting=7"));
     }
 
     #[test]

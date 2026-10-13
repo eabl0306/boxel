@@ -22,8 +22,12 @@ use boxel_gfx::Tier;
 use boxel_math::I64Vec3;
 use boxel_mesh::{BUCKET_COUNT, ChunkMesh, TRANSLUCENT_BUCKET};
 use boxel_shaders::gpu::chunk_memory::{MAX_PAGES, PAGE_CHUNKS_MAX, PAGE_DRAWS_MAX};
-use boxel_shaders::gpu::{ChunkGpu, DrawIndexedIndirect, DrawRef, bindings};
+use boxel_shaders::gpu::{ChunkGpu, DrawIndexedIndirect, bindings};
 use std::sync::Arc;
+use std::time::Duration;
+
+mod policy;
+pub(crate) use policy::{ClassSample, MemoryPolicy, SLOW_CREATE, Sample};
 
 /// Default page size in quads: 4 Mi quads, 32 MiB.
 pub const DEFAULT_PAGE_QUADS: u32 = 4 << 20;
@@ -70,9 +74,10 @@ impl MemoryCeiling {
 /// ceiling (`max_quads`, `max_slots`) is counted in quads and slots, the same numbers on every
 /// tier; bytes are only reported ([`ChunkMemoryStats`]).
 ///
-/// Growth past the floor is not there yet (#57 M2): until then every renderer keeps the floor
-/// and the initial table, whatever `grow` says, and refuses the chunks that do not fit
-/// ([`crate::RendererError`]).
+/// With `grow` the pages and the table grow between frames as chunks need them, up to the
+/// ceiling, and shrink back toward the floor when a class has room to spare; a chunk is refused
+/// only at the ceiling (or after a failed creation) and comes back once room frees
+/// ([`crate::VoxelRenderer::reserve`], [`crate::VoxelRenderer::retry_refused`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChunkMemorySettings {
     /// Quads of the pages created at GPU start, the floor (default 8 Mi, 64 MiB: four pages of
@@ -87,9 +92,10 @@ pub struct ChunkMemorySettings {
     /// places for all of them when its quads allow (`initial_quads`). High also clamps them to
     /// `64 * max_compute_workgroups_per_dimension`, High and Mid to the storage binding size.
     pub initial_slots: u32,
-    /// The most quads the pages may hold.
+    /// The most quads the pages may hold (read every frame by the render plugin:
+    /// [`crate::VoxelRenderer::set_memory_limits`]).
     pub max_quads: MemoryCeiling,
-    /// The most chunk slots (default and at most `1 << 20`).
+    /// The most chunk slots (default and at most `1 << 20`; read every frame).
     pub max_slots: u32,
     /// Quads of one page (default 4 Mi, 32 MiB; at least 4,096). Clamped to the device's buffer
     /// limits, the same on every tier the device runs.
@@ -97,8 +103,8 @@ pub struct ChunkMemorySettings {
     /// Chunks one page holds at most (default and at most 10,922: 6 draws each fit one High
     /// indirect list of 65,532). Tests lower it to get many pages in small scenes.
     pub page_chunks: u32,
-    /// Grow and shrink the pages and the table at runtime (#57 M2); `false` keeps the floor and
-    /// the initial table.
+    /// Grow and shrink the pages and the table at runtime (default); `false` keeps the floor and
+    /// the initial table (refused chunks are still retried when room frees).
     pub grow: bool,
 }
 
@@ -286,7 +292,7 @@ impl MemoryLayout {
                 (class, (each + u64::from(i < extra)) as u32)
             })
             .collect();
-        // growth (#57 M2) never sees fewer pages than the floor has
+        // growth never sees fewer pages than the floor has
         let max_pages = max_pages.max(pages as u32);
         Self {
             page_quads,
@@ -297,6 +303,23 @@ impl MemoryLayout {
             ceiling_quads,
             ceiling_slots,
         }
+    }
+
+    /// Takes the live part of `settings` (ADR 0035: the ceiling is read every frame): the most
+    /// quads, pages and slots. The page size, the floor and the initial table stay.
+    pub fn set_ceiling(&mut self, settings: &ChunkMemorySettings, facts: DeviceFacts) {
+        let live = Self::resolve(
+            &ChunkMemorySettings {
+                page_quads: self.page_quads,
+                page_chunks: self.page_chunks,
+                ..*settings
+            },
+            facts,
+        );
+        // never fewer pages than the floor has
+        self.max_pages = live.max_pages.max(self.floor.len() as u32);
+        self.ceiling_quads = live.ceiling_quads.max(self.floor_quads());
+        self.ceiling_slots = live.ceiling_slots.max(self.slots);
     }
 
     /// Opaque draws of one page's High list.
@@ -335,6 +358,25 @@ impl PageClass {
             Self::Solid
         }
     }
+
+    /// Both classes, Solid first.
+    pub const ALL: [Self; 2] = [Self::Solid, Self::Translucent];
+
+    /// 0 for Solid, 1 for Translucent.
+    pub fn index(self) -> usize {
+        match self {
+            Self::Solid => 0,
+            Self::Translucent => 1,
+        }
+    }
+
+    /// The other class.
+    pub fn other(self) -> Self {
+        match self {
+            Self::Solid => Self::Translucent,
+            Self::Translucent => Self::Solid,
+        }
+    }
 }
 
 /// A chunk's range: a page and a range inside it (page-local quads).
@@ -346,11 +388,31 @@ pub(crate) struct PagedAlloc {
     pub alloc: ArenaAlloc,
 }
 
+/// What a page is doing (ADR 0035).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PageState {
+    /// Created between frames: [`crate::VoxelRenderer::render`] clears it a slice a frame
+    /// before anything binds it (wgpu would zero-fill it whole in the submit that first uses
+    /// it). It takes no chunk yet; `cleared` bytes of it are clear (of its light page too, on
+    /// Low).
+    Clearing {
+        /// Bytes cleared from its start.
+        cleared: u64,
+    },
+    /// Takes chunks.
+    Active,
+    /// Shrink picked it: it takes no new chunk, its chunks move to the other pages a few MiB a
+    /// frame, then it goes.
+    Draining,
+}
+
 /// The CPU side of one page.
 #[derive(Debug)]
 pub(crate) struct Page {
     /// What it holds.
     pub class: PageClass,
+    /// What it is doing.
+    pub state: PageState,
     /// Its ranges, in quads.
     pub alloc: ArenaAllocator,
     /// Chunks resident in it.
@@ -361,23 +423,31 @@ pub(crate) struct Page {
 
 impl Page {
     /// An empty page of `quads` quads that holds at most `page_chunks` chunks.
-    fn new(class: PageClass, quads: u32, page_chunks: u32) -> Self {
+    fn new(class: PageClass, state: PageState, quads: u32, page_chunks: u32) -> Self {
         // `n` live ranges and `n + 1` free ones between them, one more while `replace` holds a
         // chunk's old range, and slack (`ArenaAllocator::new`). A page cannot hold more chunks
         // than half its quads (a mesh takes a quad and a palette entry at least).
         let nodes = 2 * page_chunks.min(quads / 2 + 1) + 4;
         Self {
             class,
+            state,
             alloc: ArenaAllocator::new(quads, nodes),
             chunks: 0,
             nodes,
         }
     }
 
-    /// True if a range of `size` quads fits, and with `new` (a chunk not resident here yet)
-    /// a chunk place too.
+    /// True if the page is Active and a range of `size` quads fits, and with `new` (a chunk not
+    /// resident here yet) a chunk place too.
     fn fits(&self, size: u32, new: bool, page_chunks: u32) -> bool {
-        self.alloc.largest_free() >= size && (!new || self.chunks < page_chunks)
+        self.state == PageState::Active
+            && self.alloc.largest_free() >= size
+            && (!new || self.chunks < page_chunks)
+    }
+
+    /// Free quads (unreserved).
+    pub fn free(&self) -> u32 {
+        self.alloc.capacity() - self.alloc.used()
     }
 }
 
@@ -388,6 +458,9 @@ pub(crate) struct ChunkMemory {
     pages: Vec<Option<Page>>,
     /// Chunks one page holds at most.
     page_chunks: u32,
+    /// Per class (`PageClass::index`): resident chunks of the class and their quads, wherever
+    /// they sit (a spilled chunk counts for its own class).
+    class_use: [(u32, u64); 2],
 }
 
 impl ChunkMemory {
@@ -396,6 +469,7 @@ impl ChunkMemory {
         Self {
             pages: Vec::new(),
             page_chunks: page_chunks.clamp(1, PAGE_CHUNKS_MAX),
+            class_use: [(0, 0); 2],
         }
     }
 
@@ -408,9 +482,14 @@ impl ChunkMemory {
         memory
     }
 
-    /// Adds an empty page with the lowest free id, returned.
+    /// Adds an empty Active page with the lowest free id, returned.
     pub fn add_page(&mut self, class: PageClass, quads: u32) -> u16 {
-        let page = Page::new(class, quads, self.page_chunks);
+        self.add_page_in(class, PageState::Active, quads)
+    }
+
+    /// Adds an empty page in `state` with the lowest free id, returned.
+    pub fn add_page_in(&mut self, class: PageClass, state: PageState, quads: u32) -> u16 {
+        let page = Page::new(class, state, quads, self.page_chunks);
         let id = match self.pages.iter().position(Option::is_none) {
             Some(free) => {
                 self.pages[free] = Some(page);
@@ -430,6 +509,103 @@ impl ChunkMemory {
         self.pages.get(usize::from(id)).and_then(Option::as_ref)
     }
 
+    /// The id the next page added gets: the lowest free one.
+    pub fn next_id(&self) -> u16 {
+        self.pages
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or(self.pages.len()) as u16
+    }
+
+    /// Sets the state of page `id`.
+    pub fn set_state(&mut self, id: u16, state: PageState) {
+        if let Some(page) = self.pages.get_mut(usize::from(id)).and_then(Option::as_mut) {
+            page.state = state;
+        }
+    }
+
+    /// Drops page `id`, which must hold no chunk; its id is free again. False if it holds one
+    /// (or there is no such page).
+    pub fn remove_page(&mut self, id: u16) -> bool {
+        match self.pages.get(usize::from(id)) {
+            Some(Some(page)) if page.chunks == 0 => {}
+            _ => return false,
+        }
+        self.pages[usize::from(id)] = None;
+        while self.pages.last().is_some_and(Option::is_none) {
+            self.pages.pop();
+        }
+        true
+    }
+
+    /// Counts a resident chunk of `counts` (`+1`) or one that went (`-1`) for its class.
+    pub fn track(&mut self, counts: &[u32; BUCKET_COUNT], quads: u32, add: bool) {
+        let (chunks, used) = &mut self.class_use[PageClass::of(counts).index()];
+        if add {
+            *chunks += 1;
+            *used += u64::from(quads);
+        } else {
+            *chunks -= 1;
+            *used -= u64::from(quads);
+        }
+    }
+
+    /// Resident chunks of `class` and their quads, wherever they sit.
+    pub fn class_use(&self, class: PageClass) -> (u32, u64) {
+        self.class_use[class.index()]
+    }
+
+    /// The policy's view of each class ([`ClassSample`]).
+    pub fn sample_classes(&self) -> [ClassSample; 2] {
+        let mut classes = [ClassSample::default(); 2];
+        for class in PageClass::ALL {
+            let c = &mut classes[class.index()];
+            (c.chunks, c.used) = self.class_use(class);
+        }
+        for (id, page) in self.pages() {
+            let c = &mut classes[page.class.index()];
+            c.pages += 1;
+            let places = u64::from(self.page_chunks.saturating_sub(page.chunks));
+            let used = u64::from(page.alloc.used());
+            match page.state {
+                PageState::Clearing { .. } => {
+                    c.clearing = true;
+                    c.free += u64::from(page.free());
+                    c.places += places;
+                }
+                PageState::Active => {
+                    c.free += u64::from(page.free());
+                    c.places += places;
+                    // ties to the highest id: ids stay compact and the lists small
+                    if c.emptiest.is_none_or(|(_, _, best)| used <= best) {
+                        c.emptiest = Some((id, page.alloc.capacity(), used));
+                    }
+                }
+                PageState::Draining => c.draining = Some((id, used)),
+            }
+        }
+        classes
+    }
+
+    /// Free quads and chunk places of the Active pages of `class`.
+    pub fn active_room(&self, class: PageClass) -> (u64, u64) {
+        self.pages()
+            .filter(|(_, p)| p.class == class && p.state == PageState::Active)
+            .fold((0, 0), |(quads, places), (_, p)| {
+                (
+                    quads + u64::from(p.free()),
+                    places + u64::from(self.page_chunks.saturating_sub(p.chunks)),
+                )
+            })
+    }
+
+    /// The lowest Clearing page of `class`.
+    pub fn clearing_page(&self, class: PageClass) -> Option<u16> {
+        self.pages()
+            .find(|(_, p)| p.class == class && matches!(p.state, PageState::Clearing { .. }))
+            .map(|(id, _)| id)
+    }
+
     /// Every page with its id, in id order.
     pub fn pages(&self) -> impl Iterator<Item = (u16, &Page)> {
         self.pages
@@ -445,11 +621,11 @@ impl ChunkMemory {
 
     /// A range of `size` quads for a chunk of `class`, replacing its range `old` (if resident),
     /// in this order:
-    /// 1. `old`'s page, when of `class` (a remeshed chunk stays where it is);
-    /// 2. the pages of `class`, lowest id first, skipping those that hold `page_chunks` chunks
-    ///    (a chunk moving in counts as new there) and those it does not fit in;
+    /// 1. `old`'s page, when of `class` and Active (a remeshed chunk stays where it is);
+    /// 2. the Active pages of `class`, lowest id first, skipping those that hold `page_chunks`
+    ///    chunks (a chunk moving in counts as new there) and those it does not fit in;
     /// 3. `old`'s range in place, when `size` fits in what it reserves and its page is of
-    ///    `class`;
+    ///    `class` and Active;
     /// 4. the pages of the other class (same order and skips), then `old`'s range in place
     ///    whatever its class: the image is the same, only the binds cost more, and the next
     ///    remesh moves the chunk back to its class (rule 1 needs the class).
@@ -484,19 +660,18 @@ impl ChunkMemory {
             }
             return Some(new);
         }
-        // 3. in place, of the class
+        // 3. in place, of the class, in an Active page
         if let Some(o) = old
             && class_of(self, o.page) == Some(class)
+            && self
+                .page(o.page)
+                .is_some_and(|p| p.state == PageState::Active)
             && let Some(alloc) = o.alloc.with_size(size)
         {
             return Some(PagedAlloc { alloc, ..o });
         }
-        // 4. the other class, then in place
-        let other = match class {
-            PageClass::Solid => PageClass::Translucent,
-            PageClass::Translucent => PageClass::Solid,
-        };
-        if let Some(new) = self.allocate_in_class(other, size, old_page) {
+        // 4. the other class, then in place whatever the page (a Draining page moves it later)
+        if let Some(new) = self.allocate_in_class(class.other(), size, old_page) {
             if let Some(o) = old {
                 self.release(o, Some(new.page));
             }
@@ -559,12 +734,17 @@ impl ChunkMemory {
         self.release(alloc, None);
     }
 
-    /// Frees every range (every chunk was removed); the pages stay.
+    /// Frees every range (every chunk was removed); the pages stay, a Draining one goes back to
+    /// Active (shrink starts again from what the refill needs) and a Clearing one keeps clearing.
     pub fn reset(&mut self) {
         for page in self.pages.iter_mut().flatten() {
             page.alloc.reset();
             page.chunks = 0;
+            if page.state == PageState::Draining {
+                page.state = PageState::Active;
+            }
         }
+        self.class_use = [(0, 0); 2];
     }
 
     /// Quads in use (reserved ranges), all pages.
@@ -579,9 +759,10 @@ impl ChunkMemory {
             .sum()
     }
 
-    /// The largest range any page can give right now.
+    /// The largest range an Active page can give right now.
     pub fn largest_free(&self) -> u32 {
         self.pages()
+            .filter(|(_, p)| p.state == PageState::Active)
             .map(|(_, p)| p.alloc.largest_free())
             .max()
             .unwrap_or(0)
@@ -662,7 +843,8 @@ pub(crate) fn upsert_resident(
         return Err(Refusal::Table);
     }
     let needed = arena_len(mesh);
-    let old = chunks.get(id).map(|(_, r)| r.alloc);
+    let old_record = chunks.get(id).map(|(_, r)| *r);
+    let old = old_record.map(|r| r.alloc);
     let counts = bucket_counts(mesh);
     let Some(alloc) = memory.place(old, needed, PageClass::of(&counts)) else {
         let resident = old.is_some();
@@ -685,6 +867,10 @@ pub(crate) fn upsert_resident(
     let inserted = chunks.insert(record);
     // `slot_for` succeeded above, so this cannot fail
     debug_assert!(inserted.is_some());
+    if let Some(old) = old_record {
+        memory.track(&old.counts, old.alloc.alloc.size, false);
+    }
+    memory.track(&counts, needed, true);
     uploads.mesh(id, alloc.page, alloc.alloc.offset, Arc::clone(mesh));
     Ok(())
 }
@@ -700,8 +886,191 @@ pub(crate) fn remove_resident(
         return false;
     };
     memory.free(record.alloc);
+    memory.track(&record.counts, record.alloc.alloc.size, false);
     uploads.forget(id);
     true
+}
+
+/// Moves the chunks of Draining page `victim` (`ids`: the chunks it held when it started
+/// draining, taken from the end) into the other pages, within `budget`: each chunk gets a range
+/// elsewhere ([`ChunkMemory::place`], tight: the slack of its old range stays behind), a mesh
+/// still waiting for its upload is re-keyed to it (nothing to copy), any other is copied page to
+/// page through `sink` (and its Low light, `low_light`), and its table entry points there from
+/// this frame's flush on ([`ChunkTable::relocate`]: stale, not touched). Stops when nothing
+/// fits elsewhere or the budget is spent. Returns the bytes moved by copies.
+pub(crate) fn evacuate<S: CopySink>(
+    memory: &mut ChunkMemory,
+    chunks: &mut ChunkTable,
+    uploads: &mut Uploads,
+    sink: &mut S,
+    victim: u16,
+    ids: &mut Vec<u64>,
+    budget: &mut MoveBudget,
+    low_light: bool,
+) -> u64 {
+    let mut moved = 0;
+    // moves of adjacent ranges to adjacent ranges go in one copy
+    let mut run: Option<(u16, u64, u16, u64, u64)> = None;
+    let copy = |sink: &mut S, run: (u16, u64, u16, u64, u64)| {
+        let (from_page, from, to_page, to, bytes) = run;
+        sink.copy(
+            MemTarget::Page(from_page),
+            from,
+            MemTarget::Page(to_page),
+            to,
+            bytes,
+        );
+        if low_light {
+            sink.copy(
+                MemTarget::LightPage(from_page),
+                from,
+                MemTarget::LightPage(to_page),
+                to,
+                bytes,
+            );
+        }
+    };
+    while let Some(&id) = ids.last() {
+        let Some((_, record)) = chunks.get(id).filter(|(_, r)| r.alloc.page == victim) else {
+            // removed, or remeshed out of the page since
+            ids.pop();
+            continue;
+        };
+        let record = *record;
+        let size = record.alloc.alloc.size;
+        let bytes = u64::from(size) * QUAD_BYTES;
+        let (copy_bytes, copies) = if low_light {
+            (2 * bytes, 2)
+        } else {
+            (bytes, 1)
+        };
+        if !budget.take(copy_bytes, copies) {
+            break;
+        }
+        let Some(new) = memory.place(None, size, PageClass::of(&record.counts)) else {
+            budget.give_back(copy_bytes, copies);
+            break;
+        };
+        debug_assert_ne!(new.page, victim, "a Draining page took a chunk");
+        ids.pop();
+        if uploads.relocate(id, record.alloc, new) {
+            // its mesh is still on its way: it lands in the new range
+            budget.give_back(copy_bytes, copies);
+        } else {
+            let from = u64::from(record.alloc.alloc.offset) * QUAD_BYTES;
+            let to = u64::from(new.alloc.offset) * QUAD_BYTES;
+            run = match run {
+                Some((fp, f, tp, t, n)) if tp == new.page && f + n == from && t + n == to => {
+                    // the merged copy needs no command of its own
+                    budget.give_back(0, if low_light { 2 } else { 1 });
+                    Some((fp, f, tp, t, n + bytes))
+                }
+                Some(done) => {
+                    copy(sink, done);
+                    Some((victim, from, new.page, to, bytes))
+                }
+                None => Some((victim, from, new.page, to, bytes)),
+            };
+            moved += copy_bytes;
+        }
+        memory.free(record.alloc);
+        chunks.relocate(id, new);
+    }
+    if let Some(done) = run {
+        copy(sink, done);
+    }
+    moved
+}
+
+/// Clears the next slices of the Clearing pages through `sink`, lowest id first, within
+/// `budget` bytes (taken from it; Low clears each page's light page too, at the same offsets).
+/// Returns the pages whose last byte was cleared now; they stay Clearing until the renderer puts
+/// them in use (High may wait for its lists).
+pub(crate) fn clear_pages<S: CopySink>(
+    memory: &mut ChunkMemory,
+    sink: &mut S,
+    budget: &mut u64,
+    low_light: bool,
+) -> Vec<u16> {
+    let mut done = Vec::new();
+    let per_byte = if low_light { 2 } else { 1 };
+    for (id, page) in memory.pages.iter_mut().enumerate() {
+        let Some(page) = page else {
+            continue;
+        };
+        let PageState::Clearing { cleared } = &mut page.state else {
+            continue;
+        };
+        let size = u64::from(page.alloc.capacity()) * QUAD_BYTES;
+        if *cleared >= size {
+            continue;
+        }
+        // whole quads, so every slice stays 4-byte aligned
+        let n = ((size - *cleared).min(*budget / per_byte) / QUAD_BYTES) * QUAD_BYTES;
+        if n == 0 {
+            break;
+        }
+        sink.clear(MemTarget::Page(id as u16), *cleared, n);
+        if low_light {
+            sink.clear(MemTarget::LightPage(id as u16), *cleared, n);
+        }
+        *cleared += n;
+        *budget -= n * per_byte;
+        if *cleared >= size {
+            done.push(id as u16);
+        }
+    }
+    done
+}
+
+/// What one frame may move ([`evacuate`]): bytes and copy commands.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MoveBudget {
+    /// Bytes left.
+    pub bytes: u64,
+    /// Copy commands left.
+    pub copies: u32,
+    /// Something was taken.
+    spent: bool,
+}
+
+impl MoveBudget {
+    /// The budget of one frame on an adapter of `class` (ADR 0035): 32 MiB and 512 copies on a
+    /// discrete GPU, 8 MiB and 256 on an integrated one, 4 MiB and 128 otherwise.
+    pub fn of(class: wgpu::DeviceType) -> Self {
+        match class {
+            wgpu::DeviceType::DiscreteGpu => Self::new(32 << 20, 512),
+            wgpu::DeviceType::IntegratedGpu => Self::new(8 << 20, 256),
+            _ => Self::new(4 << 20, 128),
+        }
+    }
+
+    /// `bytes` and `copies` a frame.
+    pub fn new(bytes: u64, copies: u32) -> Self {
+        Self {
+            bytes,
+            copies,
+            spent: false,
+        }
+    }
+
+    /// Takes `bytes` and `copies` if they are left (a single chunk larger than the whole budget
+    /// still goes when nothing was taken yet).
+    fn take(&mut self, bytes: u64, copies: u32) -> bool {
+        if self.copies < copies || (self.bytes < bytes && self.spent) {
+            return false;
+        }
+        self.spent = true;
+        self.bytes = self.bytes.saturating_sub(bytes);
+        self.copies -= copies;
+        true
+    }
+
+    /// Gives back what [`MoveBudget::take`] took for a move that copied nothing.
+    fn give_back(&mut self, bytes: u64, copies: u32) {
+        self.bytes += bytes;
+        self.copies += copies;
+    }
 }
 
 /// Where a [`MemOp`] goes.
@@ -745,6 +1114,20 @@ pub(crate) trait CopySink {
         fail: bool,
         fill: &mut dyn FnMut(&mut dyn FnMut(MemOp<'_>)),
     ) -> bool;
+
+    /// Copies `bytes` from byte `from_offset` of `from` to byte `to_offset` of `to` (two
+    /// different buffers), ordered after everything recorded before it.
+    fn copy(
+        &mut self,
+        from: MemTarget,
+        from_offset: u64,
+        to: MemTarget,
+        to_offset: u64,
+        bytes: u64,
+    );
+
+    /// Zeroes `bytes` of `target` from byte `offset` (4-byte aligned).
+    fn clear(&mut self, target: MemTarget, offset: u64, bytes: u64);
 }
 
 /// The GPU side of one page.
@@ -788,6 +1171,33 @@ impl PageSet {
             self.pages.resize_with(i + 1, || None);
         }
         self.pages[i] = Some(page);
+    }
+
+    /// Takes page `id` out (dropped, never `destroy()`ed: copies recorded from it this frame
+    /// still run).
+    pub fn take(&mut self, id: u16) -> Option<PageGpu> {
+        let page = self.pages.get_mut(usize::from(id))?.take();
+        while self.pages.last().is_some_and(Option::is_none) {
+            self.pages.pop();
+        }
+        page
+    }
+
+    /// Builds every page's group 2 again with `table` (a new chunk table, High/Mid).
+    pub fn rebind(
+        &mut self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        table: &wgpu::Buffer,
+    ) {
+        for page in self.pages.iter_mut().flatten() {
+            page.geometry = Some(crate::path::geometry_bind_group(
+                device,
+                layout,
+                &page.quads,
+                table,
+            ));
+        }
     }
 
     /// Takes the chunk counts of `memory`'s pages.
@@ -850,13 +1260,6 @@ pub(crate) fn create_page(
     }
 }
 
-/// Bytes of High's draw lists for `pages` page lists of `stride` opaque draws each (draw args,
-/// draw refs).
-pub(crate) fn list_bytes(pages: u32, stride: u32) -> u64 {
-    let draws = u64::from(pages) * u64::from(stride) * 7 / 6;
-    draws * (ARGS_BYTES + size_of::<DrawRef>() as u64)
-}
-
 /// Chunk memory counters ([`crate::RenderStats::chunk_memory`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ChunkMemoryStats {
@@ -891,6 +1294,34 @@ pub struct ChunkMemoryStats {
     pub translucent_page_switches: u32,
     /// Bytes of the page allocators on the CPU.
     pub cpu_bytes: u64,
+    /// Pages being cleared before their first use (created between frames).
+    pub clearing_pages: u32,
+    /// Pages being emptied by shrink.
+    pub draining_pages: u32,
+    /// Refused chunks kept with their mesh, waiting for room (retried nearest first).
+    pub refused_waiting: u32,
+    /// Chunk table capacity in slots.
+    pub table_slots: u32,
+    /// Pages created past the floor (cumulative since the world opened).
+    pub pages_created: u32,
+    /// Pages released by shrink (cumulative).
+    pub pages_released: u32,
+    /// Page, list or table creations that failed (cumulative).
+    pub page_create_failures: u32,
+    /// Pages created or put in use inside a frame because the frame's meshes needed them now
+    /// (wgpu zero-fills what was not cleared yet in that frame; cumulative). Steady streaming
+    /// should show none.
+    pub emergency_pages: u32,
+    /// Chunk tables grown inside a frame the same way (cumulative).
+    pub emergency_tables: u32,
+    /// Bytes shrink copied from page to page (cumulative).
+    pub relocated_bytes: u64,
+    /// The most bytes one frame copied from page to page.
+    pub max_relocated_frame: u64,
+    /// Time of the last page creation between frames.
+    pub last_page_create: Duration,
+    /// The slowest page creation between frames so far (kept across worlds).
+    pub max_page_create: Duration,
 }
 
 /// Testing: `bytes` of `buffer` from byte `offset` (it needs `COPY_SRC`; waits for the GPU).
@@ -1620,6 +2051,7 @@ mod tests {
     struct ModelSink {
         buffers: HashMap<MemTarget, Model>,
         writes: usize,
+        copies: usize,
     }
 
     impl CopySink for ModelSink {
@@ -1659,6 +2091,60 @@ mod tests {
                 }
             });
             true
+        }
+
+        fn copy(
+            &mut self,
+            from: MemTarget,
+            from_offset: u64,
+            to: MemTarget,
+            to_offset: u64,
+            bytes: u64,
+        ) {
+            assert_ne!(from, to, "a copy within one buffer");
+            let src = self
+                .buffers
+                .get(&from)
+                .expect("a copy from a missing buffer");
+            let range = from_offset as usize..(from_offset + bytes) as usize;
+            assert!(
+                range.end <= src.bytes.len(),
+                "{from:?} {range:?} out of bounds"
+            );
+            // a copy that reads never-written bytes would make wgpu zero-fill its source
+            assert!(
+                src.written[range.clone()].iter().all(|&w| w),
+                "a copy reads never-written bytes of {from:?}"
+            );
+            let data = src.bytes[range].to_vec();
+            let dst = self
+                .buffers
+                .get_mut(&to)
+                .expect("a copy to a missing buffer");
+            let range = to_offset as usize..(to_offset + bytes) as usize;
+            assert!(
+                range.end <= dst.bytes.len(),
+                "{to:?} {range:?} out of bounds"
+            );
+            dst.bytes[range.clone()].copy_from_slice(&data);
+            dst.written[range].iter_mut().for_each(|w| *w = true);
+            self.copies += 1;
+        }
+
+        fn clear(&mut self, target: MemTarget, offset: u64, bytes: u64) {
+            assert_eq!(offset % 4, 0, "an unaligned clear");
+            assert_eq!(bytes % 4, 0, "an unaligned clear");
+            let model = self
+                .buffers
+                .get_mut(&target)
+                .expect("a clear of a missing buffer");
+            let range = offset as usize..(offset + bytes) as usize;
+            assert!(
+                range.end <= model.bytes.len(),
+                "{target:?} {range:?} out of bounds"
+            );
+            model.bytes[range.clone()].fill(0);
+            model.written[range].iter_mut().for_each(|w| *w = true);
         }
     }
 
@@ -1806,9 +2292,32 @@ mod tests {
         Ok(())
     }
 
+    /// The models of a new page `id` of `quads` quads: never written (a page made between
+    /// frames, cleared before use, or one made at once in a frame), or `zeroed` as wgpu leaves a
+    /// floor page after its first use.
+    fn add_models(sink: &mut ModelSink, id: u16, quads: u32, kinds: UploadKinds, zeroed: bool) {
+        let len = quads as usize * QUAD_BYTES as usize;
+        let model = || {
+            let mut m = Model::new(len);
+            if zeroed {
+                m.bytes.fill(0);
+                m.written.fill(true);
+            }
+            m
+        };
+        sink.buffers.insert(MemTarget::Page(id), model());
+        if kinds.low_light {
+            sink.buffers.insert(MemTarget::LightPage(id), model());
+        }
+    }
+
     /// One random run: frames of upserts, removes, re-sorted buckets, window moves, frames that
     /// draw nothing, lost frames (then a resync, as the render plugin does) and clears, over
-    /// tiny pages. Every flushed frame must leave the models equal to the CPU state.
+    /// tiny pages; with `grow`, also pages made between frames and cleared a slice a frame,
+    /// pages made at once (emergencies), the table grown (its written slots copied), and pages
+    /// drained into the others within random budgets and released. Every flushed frame must
+    /// leave the models equal to the CPU state, and every page a draw binds (holding chunks)
+    /// fully written or cleared unless it was an emergency.
     fn replay(
         seed: u64,
         page_quads: u32,
@@ -1816,12 +2325,15 @@ mod tests {
         floor: usize,
         slots: u32,
         kinds: UploadKinds,
-    ) -> Result<(), String> {
+        grow: bool,
+    ) -> Result<ReplayCounts, String> {
+        let mut counts = ReplayCounts::default();
         let mut rng = Rng(seed | 1);
         let mut memory = ChunkMemory::new(page_chunks);
         let mut sink = ModelSink {
             buffers: HashMap::new(),
             writes: 0,
+            copies: 0,
         };
         for k in 0..floor {
             let class = if k + 1 == floor && floor > 1 {
@@ -1830,12 +2342,7 @@ mod tests {
                 Solid
             };
             let id = memory.add_page(class, page_quads);
-            let len = page_quads as usize * QUAD_BYTES as usize;
-            sink.buffers.insert(MemTarget::Page(id), Model::new(len));
-            if kinds.low_light {
-                sink.buffers
-                    .insert(MemTarget::LightPage(id), Model::new(len));
-            }
+            add_models(&mut sink, id, page_quads, kinds, true);
         }
         if kinds.table {
             let len = slots as usize * CHUNK_GPU_BYTES as usize;
@@ -1844,7 +2351,11 @@ mod tests {
         let mut chunks = ChunkTable::new(slots);
         let mut uploads = Uploads::default();
         let mut expected: HashMap<u64, Expected> = HashMap::new();
-        let ids = u64::from(slots) + 6;
+        // pages made at once in a frame: wgpu zero-fills them at their first use
+        let mut emergency: std::collections::HashSet<u16> = std::collections::HashSet::new();
+        // shrink's victim and the chunks it held
+        let mut victim: Option<(u16, Vec<u64>)> = None;
+        let ids = u64::from(slots) * 2 + 6;
         let max_quads = (page_quads / 3).max(2);
         for frame in 0..60 {
             for _ in 0..rng.next(12) {
@@ -1907,6 +2418,43 @@ mod tests {
                     }
                 }
             }
+            if grow && memory.next_id() < 12 {
+                // growth: a page between frames (cleared before use) or at once (an emergency)
+                let class = if rng.next(3) == 0 { Translucent } else { Solid };
+                match rng.next(8) {
+                    0 => {
+                        let id = memory.add_page_in(
+                            class,
+                            PageState::Clearing { cleared: 0 },
+                            page_quads,
+                        );
+                        add_models(&mut sink, id, page_quads, kinds, false);
+                    }
+                    1 => {
+                        let id = memory.add_page(class, page_quads);
+                        add_models(&mut sink, id, page_quads, kinds, false);
+                        emergency.insert(id);
+                    }
+                    _ => {}
+                }
+            }
+            if grow && victim.is_none() && rng.next(4) == 0 {
+                // shrink picks a page holding chunks
+                let pick = memory
+                    .pages()
+                    .filter(|(_, p)| p.state == PageState::Active && p.chunks > 0)
+                    .map(|(id, _)| id)
+                    .nth(rng.next(4) as usize);
+                if let Some(id) = pick {
+                    memory.set_state(id, PageState::Draining);
+                    let held = chunks
+                        .iter()
+                        .filter(|(_, r)| r.alloc.page == id)
+                        .map(|(_, r)| r.id)
+                        .collect();
+                    victim = Some((id, held));
+                }
+            }
             match rng.next(12) {
                 // a frame that draws nothing: the changes wait
                 0 => continue,
@@ -1919,8 +2467,60 @@ mod tests {
                     memory.reset();
                     uploads.clear();
                     expected.clear();
+                    victim = None;
                 }
                 _ => {}
+            }
+            if grow && kinds.table && rng.next(6) == 0 && chunks.capacity() < 256 {
+                // a larger table: the old one's written slots copied before the frame's uploads
+                let capacity = chunks.capacity() * 2;
+                let old = sink.buffers.remove(&MemTarget::Table).expect("table");
+                let mut new = Model::new(capacity as usize * CHUNK_GPU_BYTES as usize);
+                let n = chunks.written_slots() as usize * CHUNK_GPU_BYTES as usize;
+                new.bytes[..n].copy_from_slice(&old.bytes[..n]);
+                new.written[..n].copy_from_slice(&old.written[..n]);
+                sink.buffers.insert(MemTarget::Table, new);
+                chunks.grow(capacity);
+                counts.tables += 1;
+            }
+            if grow {
+                // the maintenance step: clears, then evacuation within random budgets
+                let mut budget = rng.next(u64::from(page_quads) * 16) & !7;
+                for id in clear_pages(&mut memory, &mut sink, &mut budget, kinds.low_light) {
+                    memory.set_state(id, PageState::Active);
+                    counts.cleared += 1;
+                }
+                if let Some((id, held)) = &mut victim {
+                    let mut moves = MoveBudget::new(
+                        rng.next(u64::from(page_quads) * 8),
+                        1 + rng.next(8) as u32,
+                    );
+                    evacuate(
+                        &mut memory,
+                        &mut chunks,
+                        &mut uploads,
+                        &mut sink,
+                        *id,
+                        held,
+                        &mut moves,
+                        kinds.low_light,
+                    );
+                    let id = *id;
+                    if memory.page(id).is_some_and(|p| p.chunks == 0) {
+                        if !memory.remove_page(id) {
+                            return Err(format!("frame {frame}: page {id} not released"));
+                        }
+                        sink.buffers.remove(&MemTarget::Page(id));
+                        sink.buffers.remove(&MemTarget::LightPage(id));
+                        emergency.remove(&id);
+                        victim = None;
+                        counts.released += 1;
+                    } else if rng.next(10) == 0 {
+                        // cancelled: back to Active
+                        memory.set_state(id, PageState::Active);
+                        victim = None;
+                    }
+                }
             }
             uploads.flush(&mut sink, &mut chunks, kinds);
             if uploads.take_lost() {
@@ -1928,6 +2528,7 @@ mod tests {
                 chunks.clear();
                 memory.reset();
                 uploads.clear();
+                victim = None;
                 let mut again: Vec<(u64, Expected)> = expected.drain().collect();
                 again.sort_by_key(|(id, _)| *id);
                 for (id, e) in again {
@@ -1960,11 +2561,77 @@ mod tests {
             if memory.pages().any(|(_, p)| p.chunks > page_chunks) {
                 return Err(format!("frame {frame}: a page holds too many chunks"));
             }
+            for (id, page) in memory.pages() {
+                if matches!(page.state, PageState::Clearing { .. }) && page.chunks > 0 {
+                    return Err(format!("frame {frame}: Clearing page {id} holds a chunk"));
+                }
+                // a page a draw binds must be written or cleared whole (else wgpu zero-fills
+                // it in the frame), unless it was made at once
+                let bound = page.chunks > 0;
+                let whole = sink.buffers[&MemTarget::Page(id)]
+                    .written
+                    .iter()
+                    .all(|&w| w);
+                if bound && !whole && !emergency.contains(&id) {
+                    return Err(format!(
+                        "frame {frame}: page {id} is bound half uninitialized"
+                    ));
+                }
+            }
+            let (solid, translucent) = (memory.class_use(Solid), memory.class_use(Translucent));
+            let quads: u64 = chunks
+                .iter()
+                .map(|(_, r)| u64::from(r.alloc.alloc.size))
+                .sum();
+            if u64::from(solid.0 + translucent.0) != chunks.len() as u64
+                || solid.1 + translucent.1 != quads
+            {
+                return Err(format!("frame {frame}: the class counts drifted"));
+            }
         }
         if sink.writes == 0 {
             return Err("nothing was written".to_string());
         }
-        Ok(())
+        counts.copies = sink.copies;
+        Ok(counts)
+    }
+
+    /// What one replay did besides writes.
+    #[derive(Debug, Default)]
+    struct ReplayCounts {
+        /// Page to page copies.
+        copies: usize,
+        /// Pages cleared whole.
+        cleared: usize,
+        /// Pages released.
+        released: usize,
+        /// Tables grown.
+        tables: usize,
+    }
+
+    /// The growth replays are not vacuous: over a few seeds pages are cleared, chunks copied
+    /// between pages, pages released and tables grown, on High/Mid and on Low.
+    #[test]
+    fn the_replay_clears_moves_releases_and_grows() {
+        for low in [false, true] {
+            let kinds = UploadKinds {
+                table: !low,
+                low_light: low,
+            };
+            let mut total = ReplayCounts::default();
+            for seed in 0..24 {
+                let c = replay(seed * 7919 + 1, 1024, 6, 2, 24, kinds, true)
+                    .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+                total.copies += c.copies;
+                total.cleared += c.cleared;
+                total.released += c.released;
+                total.tables += c.tables;
+            }
+            assert!(total.copies > 0, "{total:?}");
+            assert!(total.cleared > 0, "{total:?}");
+            assert!(total.released > 0, "{total:?}");
+            assert_eq!(total.tables > 0, !low, "{total:?}");
+        }
     }
 
     proptest! {
@@ -1980,10 +2647,11 @@ mod tests {
             floor in 1usize..4,
             slots in 4u32..48,
             low in any::<bool>(),
+            grow in any::<bool>(),
         ) {
             let kinds = UploadKinds { table: !low, low_light: low };
-            let result = replay(seed, page_quads, page_chunks, floor, slots, kinds);
-            prop_assert!(result.is_ok(), "{}", result.unwrap_err());
+            let result = replay(seed, page_quads, page_chunks, floor, slots, kinds, grow);
+            prop_assert!(result.is_ok(), "{}", result.err().unwrap_or_default());
         }
     }
 }

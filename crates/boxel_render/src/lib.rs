@@ -81,8 +81,9 @@ pub use plugin::{
 #[doc(hidden)]
 pub use renderer::{AllocProbeReport, ResetState};
 pub use renderer::{
-    ChunkOp, DEFAULT_SKY_COLOR, FLUID_TIME_PERIOD, RenderStats, RendererConfig, RendererError,
-    TEXTURE_TICKS_PER_SECOND, ViewParams, VoxelRenderer, texture_tick,
+    ChunkOp, DEFAULT_SKY_COLOR, FLUID_TIME_PERIOD, MemoryDemand, MemoryReserve, RenderStats,
+    RendererConfig, RendererError, ReserveMode, TEXTURE_TICKS_PER_SECOND, ViewParams,
+    VoxelRenderer, texture_tick,
 };
 pub use smoke::RendererSmokeTest;
 pub use sort::TranslucentSort;

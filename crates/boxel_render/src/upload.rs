@@ -17,7 +17,7 @@
 //! memory tests replay them over byte models of the buffers.
 use crate::arena::QUAD_BYTES;
 use crate::chunk_table::ChunkTable;
-use crate::memory::{CopySink, MemOp, MemTarget, PageSet};
+use crate::memory::{CopySink, MemOp, MemTarget, PageSet, PagedAlloc};
 use crate::sort::SortedBucket;
 use boxel_mesh::{ChunkMesh, FULL_SKY_ENTRY, PackedQuad, PaletteEntry, TRANSLUCENT_BUCKET};
 use boxel_shaders::gpu::ChunkGpu;
@@ -201,6 +201,24 @@ impl Uploads {
     pub fn forget(&mut self, id: u64) {
         self.meshes.remove(&id);
         self.sorted.remove(&id);
+    }
+
+    /// Chunk `id` moved from `old` to `new` (shrink, ADR 0035): its pending mesh and sorted
+    /// bucket go to the new range. True if a mesh was pending (it writes the whole new range, so
+    /// nothing has to be copied there).
+    pub fn relocate(&mut self, id: u64, old: PagedAlloc, new: PagedAlloc) -> bool {
+        if let Some(sorted) = self.sorted.get_mut(&id) {
+            sorted.page = new.page;
+            sorted.offset = sorted.offset - old.alloc.offset + new.alloc.offset;
+        }
+        match self.meshes.get_mut(&id) {
+            Some(mesh) => {
+                mesh.page = new.page;
+                mesh.offset = new.alloc.offset;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Meshes and sorted buckets waiting for the next flush.
@@ -414,16 +432,14 @@ pub(crate) struct GpuSink<'a> {
     pub copies: &'a mut Vec<(MemTarget, u64, u64, u64)>,
 }
 
-/// The buffer `target` names.
-fn target_buffer<'a>(
-    pages: &'a PageSet,
-    table: Option<&'a wgpu::Buffer>,
-    target: MemTarget,
-) -> Option<&'a wgpu::Buffer> {
-    match target {
-        MemTarget::Page(id) => pages.get(id).map(|p| &p.quads),
-        MemTarget::LightPage(id) => pages.get(id).and_then(|p| p.light.as_ref()),
-        MemTarget::Table => table,
+impl GpuSink<'_> {
+    /// The buffer `target` names.
+    fn buffer(&self, target: MemTarget) -> Option<&wgpu::Buffer> {
+        match target {
+            MemTarget::Page(id) => self.pages.get(id).map(|p| &p.quads),
+            MemTarget::LightPage(id) => self.pages.get(id).and_then(|p| p.light.as_ref()),
+            MemTarget::Table => self.table,
+        }
     }
 }
 
@@ -482,13 +498,42 @@ impl CopySink for GpuSink<'_> {
         staging.unmap();
         for &(target, src, dst, size) in self.copies.iter() {
             if size > 0
-                && let Some(buffer) = target_buffer(self.pages, self.table, target)
+                && let Some(buffer) = self.buffer(target)
             {
+                let buffer = buffer.clone();
                 self.encoder
-                    .copy_buffer_to_buffer(&staging, src, buffer, dst, size);
+                    .copy_buffer_to_buffer(&staging, src, &buffer, dst, size);
             }
         }
         true
+    }
+
+    fn copy(
+        &mut self,
+        from: MemTarget,
+        from_offset: u64,
+        to: MemTarget,
+        to_offset: u64,
+        bytes: u64,
+    ) {
+        if bytes == 0 {
+            return;
+        }
+        if let (Some(src), Some(dst)) = (self.buffer(from), self.buffer(to)) {
+            let (src, dst) = (src.clone(), dst.clone());
+            self.encoder
+                .copy_buffer_to_buffer(&src, from_offset, &dst, to_offset, bytes);
+        }
+    }
+
+    fn clear(&mut self, target: MemTarget, offset: u64, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        if let Some(buffer) = self.buffer(target) {
+            let buffer = buffer.clone();
+            self.encoder.clear_buffer(&buffer, offset, Some(bytes));
+        }
     }
 }
 
