@@ -124,7 +124,7 @@ impl SwitchTrack {
 
     /// The `stress: switch N:` lines and the run's `stress: switches` line.
     pub fn lines(&self) -> Vec<String> {
-        let ms = |d: Option<Duration>| d.map_or_else(|| "-".to_string(), |d| fmt_ms(d));
+        let ms = |d: Option<Duration>| d.map_or_else(|| "-".to_string(), fmt_ms);
         let mut out: Vec<String> = self
             .switches
             .iter()

@@ -228,7 +228,7 @@ fn close(app: &mut App) {
     while app.world().resource::<WorldLifecycle>().status() != WorldStatus::Closed {
         app.update();
         assert!(began.elapsed() < Duration::from_secs(30), "not closed");
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::yield_now();
     }
     let report = app
         .world()
@@ -248,7 +248,7 @@ fn within_release(mut done: impl FnMut() -> bool) -> bool {
         if began.elapsed() > RELEASE {
             return false;
         }
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::yield_now();
     }
 }
 
