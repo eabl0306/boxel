@@ -56,16 +56,19 @@ type Span = (i32, i32, u32, u32);
 
 /// The spans of a nine-slice axis: sprite length `len`, borders `a` and `b`, destination length
 /// `dst` (Minecraft's `blitNineSlicedSprite`: borders clamped to half the destination, the
-/// middle repeated with its last copy cut, or stretched).
+/// middle repeated with its last copy cut, or stretched). Borders wider than the sprite (which
+/// a pack cannot declare, but engine code may pass) are clamped to it first.
 fn nine_slice_axis(len: u32, a: u32, b: u32, dst: i32, stretch: bool, out: &mut Vec<Span>) {
     out.clear();
     if dst <= 0 {
         return;
     }
-    if dst == len as i32 {
+    if i64::from(dst) == i64::from(len) {
         out.push((0, dst, 0, len));
         return;
     }
+    let a = a.min(len);
+    let b = b.min(len - a);
     let a = a.min(dst as u32 / 2);
     let b = b.min(dst as u32 / 2);
     if a > 0 {
@@ -87,9 +90,11 @@ fn nine_slice_axis(len: u32, a: u32, b: u32, dst: i32, stretch: bool, out: &mut 
 
 /// Copies of the source span `src..src + tile` from `at` over `dst` pixels, the last one cut.
 fn tile_axis(at: i32, dst: i32, src: u32, tile: u32, out: &mut Vec<Span>) {
+    // A tile longer than any destination is one cut copy.
+    let tile = i32::try_from(tile.max(1)).unwrap_or(i32::MAX);
     let mut done = 0;
     while done < dst {
-        let n = (dst - done).min(tile as i32);
+        let n = (dst - done).min(tile);
         out.push((at + done, n, src, n as u32));
         done += n;
     }
@@ -129,9 +134,12 @@ pub fn pieces(sprite: &Sprite, dst: UiRect, out: &mut Vec<Piece>) {
         }
         Scaling::Stretch => {}
     }
-    // Sprite GUI pixels to texels.
-    let tx = |v: u32| v * sw / gw;
-    let ty = |v: u32| v * sh / gh;
+    // Sprite GUI pixels to texels, widened: a pack may declare sizes up to `i32::MAX`. `v` is
+    // at most the GUI size, so the result is at most the texel size.
+    let to_texels =
+        |v: u32, texels: u32, gui: u32| (u64::from(v) * u64::from(texels) / u64::from(gui)) as u32;
+    let tx = |v: u32| to_texels(v, sw, gw);
+    let ty = |v: u32| to_texels(v, sh, gh);
     for &(dy, dh, vy, vh) in &rows {
         for &(dx, dw, vx, vw) in &cols {
             out.push(Piece {
@@ -272,6 +280,73 @@ mod tests {
             }]
         );
         assert!(cut(&stretch, UiRect::new(0, 0, 0, 5)).is_empty());
+    }
+
+    #[test]
+    fn huge_sprite_sizes_cut_without_overflow() {
+        // A tile wider than any destination: one cut copy.
+        let tile = Sprite {
+            src: [0, 0, 16, 16],
+            scaling: Scaling::Tile {
+                w: u32::MAX,
+                h: 3_000_000_000,
+            },
+        };
+        assert_eq!(
+            cut(&tile, UiRect::new(0, 0, 100, 20)),
+            [Piece {
+                dst: UiRect::new(0, 0, 100, 20),
+                src: [0, 0, 0, 0]
+            }]
+        );
+        // A nine-slice Minecraft accepts (sizes up to i32::MAX), stretched or tiled: the
+        // borders stay 1 GUI pixel and the texels stay inside the sprite.
+        for stretch_inner in [false, true] {
+            let sprite = Sprite {
+                src: [0, 0, 16, 16],
+                scaling: Scaling::NineSlice {
+                    w: 2_000_000_000,
+                    h: i32::MAX as u32,
+                    border: [1; 4],
+                    stretch_inner,
+                },
+            };
+            let out = cut(&sprite, UiRect::new(0, 0, 100, 20));
+            assert_eq!(out.len(), 9, "{stretch_inner}");
+            let area: i32 = out.iter().map(|p| p.dst.w * p.dst.h).sum();
+            assert_eq!(area, 100 * 20);
+            assert!(
+                out.iter()
+                    .all(|p| p.src[0] + p.src[2] <= 16 && p.src[1] + p.src[3] <= 16)
+            );
+            assert_eq!(out[8].dst, UiRect::new(99, 19, 1, 1));
+        }
+    }
+
+    #[test]
+    fn borders_wider_than_the_sprite_stay_inside_it() {
+        // A pack cannot declare these, engine code may: the borders are cut to the sprite.
+        for border in [[u32::MAX; 4], [3, 3, 3, 3], [0, 0, 9, 9]] {
+            let sprite = Sprite {
+                src: [0, 0, 4, 4],
+                scaling: Scaling::NineSlice {
+                    w: 4,
+                    h: 4,
+                    border,
+                    stretch_inner: false,
+                },
+            };
+            for size in [1, 3, 7, 10] {
+                let out = cut(&sprite, UiRect::new(0, 0, size, size));
+                assert!(
+                    out.iter()
+                        .all(|p| p.src[0] + p.src[2] <= 4 && p.src[1] + p.src[3] <= 4),
+                    "{border:?} {size}: {out:?}"
+                );
+                let area: i32 = out.iter().map(|p| p.dst.w * p.dst.h).sum();
+                assert!(area <= size * size, "{border:?} {size}");
+            }
+        }
     }
 
     proptest::proptest! {

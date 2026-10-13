@@ -255,7 +255,7 @@ impl FontBuilder {
             image.w.checked_div(columns).unwrap_or(0),
             image.h.checked_div(rows.len() as u32).unwrap_or(0),
         ];
-        self.cut(image, cell, rows, height, 7 - ascent)
+        self.cut(image, cell, rows, height, 7i32.saturating_sub(ascent))
     }
 
     /// Adds the cells of a grid, each drawn `gui_h` GUI pixels tall and `shift` lower.
@@ -393,13 +393,18 @@ impl FontBuilder {
             .as_ref()
             .map(|font| font.glyphs.clone())
             .unwrap_or_default();
+        // In 64 bits and saturated back: a pack's provider may ask for any height.
+        let narrow = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
         for (&c, pending) in &self.glyphs {
-            let (cell_h, gui_h) = (pending.cell_h, pending.gui_h);
+            let (cell_h, gui_h) = (u64::from(pending.cell_h), u64::from(pending.gui_h));
             let image = &pending.image;
-            let to_gui = |texels: u32| (texels * gui_h).div_ceil(cell_h);
+            let to_gui = |texels: u32| narrow((u64::from(texels) * gui_h).div_ceil(cell_h));
             let size = [to_gui(image.w), to_gui(image.h)];
             let src = if size[0] > 0 && size[1] > 0 {
-                let covered = size.map(|gui| (gui * cell_h).div_ceil(gui_h));
+                // Never smaller than the image (a saturated size covers less than it).
+                let covered = [(size[0], image.w), (size[1], image.h)].map(|(gui, texels)| {
+                    narrow((u64::from(gui) * cell_h).div_ceil(gui_h)).max(texels)
+                });
                 let padded;
                 let image = if covered == [image.w, image.h] {
                     image
@@ -420,14 +425,20 @@ impl FontBuilder {
                 (Some(advance), _) => advance,
                 (None, ' ' | '\u{a0}') => SPACE_ADVANCE,
                 // Minecraft's `(int) (0.5 + width * scale) + 1`, in integers.
-                (None, _) => (2 * image.w * gui_h + cell_h) / (2 * cell_h) + 1,
+                (None, _) => {
+                    let (w, g, h) = (u128::from(image.w), u128::from(gui_h), u128::from(cell_h));
+                    u32::try_from((2 * w * g + h) / (2 * h) + 1).unwrap_or(u32::MAX)
+                }
             };
+            let top = (i64::from(pending.top) * gui_h as i64 / cell_h as i64)
+                .saturating_add(i64::from(pending.shift))
+                .clamp(i32::MIN.into(), i32::MAX.into()) as i32;
             glyphs.insert(
                 c,
                 Glyph {
                     src,
                     size,
-                    top: pending.shift + pending.top * gui_h as i32 / cell_h as i32,
+                    top,
                     advance,
                 },
             );
@@ -525,5 +536,33 @@ mod tests {
         assert_eq!((accented.size, accented.top), ([4, 14], -6));
         assert_eq!(font.resolve('?'), fallback.resolve('?'));
         assert_eq!(font.resolve('z'), fallback.resolve('?'));
+    }
+
+    #[test]
+    fn extreme_bitmap_heights_and_ascents_do_not_overflow() {
+        let image = GlyphBitmap::from_rows(&["########"; 8]);
+        let mut atlas = UiAtlas::new(64);
+        let mut builder = FontBuilder::new();
+        builder
+            .bitmap(&image, &["a"], 600_000_000, 7)
+            .bitmap(&image, &["b"], u32::MAX, i32::MIN)
+            .bitmap(&image, &["c"], 8, i32::MAX)
+            .bitmap(&image, &["d"], 8, -32768);
+        let font = builder.build(&mut atlas).unwrap();
+        // 8 texels drawn 600 000 000 GUI pixels tall, from the image as it is.
+        let a = font.resolve('a');
+        assert_eq!(
+            (a.size, [a.src[2], a.src[3]], a.top, a.advance),
+            ([600_000_000; 2], [8, 8], 0, 600_000_001)
+        );
+        // Past the integer ranges, sizes and offsets stop at their ends.
+        let b = font.resolve('b');
+        assert_eq!(
+            (b.size, b.top, b.advance),
+            ([u32::MAX; 2], i32::MAX, u32::MAX)
+        );
+        assert_eq!(font.resolve('c').top, 7 - i32::MAX);
+        // 32768 below the baseline: the glyph's top is 32775 GUI pixels under the line's top.
+        assert_eq!(font.resolve('d').top, 32775);
     }
 }

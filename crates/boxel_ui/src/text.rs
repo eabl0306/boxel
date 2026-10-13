@@ -66,11 +66,11 @@ impl Text {
 /// The width of a line in GUI pixels: the sum of its advances (the last one included, as
 /// Minecraft measures), times `size`. Stops at the first newline.
 pub fn measure(font: &BitmapFont, text: &str, size: u32) -> u32 {
+    // Saturating: a pack's font may have glyphs far wider than the screen.
     text.chars()
         .take_while(|&c| c != '\n')
-        .map(|c| font.resolve(c).advance)
-        .sum::<u32>()
-        * size.max(1)
+        .fold(0u32, |w, c| w.saturating_add(font.resolve(c).advance))
+        .saturating_mul(size.max(1))
 }
 
 /// Splits `text` into lines no wider than `max_width` GUI pixels, breaking at spaces and at
@@ -143,13 +143,14 @@ pub struct PlacedGlyph {
 /// Places every glyph of `text` from `x`, `y` (the top of the first line); newlines start a new
 /// line [`LINE_HEIGHT`] times `size` lower.
 pub fn layout(font: &BitmapFont, text: &str, x: i32, y: i32, size: u32) -> Vec<PlacedGlyph> {
-    let size = size.max(1) as i32;
+    // Saturating, as `measure`: glyphs far off the screen stay far off it.
+    let size = i32::try_from(size.max(1)).unwrap_or(i32::MAX);
     let mut out = Vec::with_capacity(text.len());
     let (mut pen_x, mut pen_y) = (x, y);
     for c in text.chars() {
         if c == '\n' {
             pen_x = x;
-            pen_y += LINE_HEIGHT as i32 * size;
+            pen_y = pen_y.saturating_add((LINE_HEIGHT as i32).saturating_mul(size));
             continue;
         }
         let glyph = font.resolve(c);
@@ -157,10 +158,11 @@ pub fn layout(font: &BitmapFont, text: &str, x: i32, y: i32, size: u32) -> Vec<P
             out.push(PlacedGlyph {
                 glyph,
                 x: pen_x,
-                y: pen_y + glyph.top * size,
+                y: pen_y.saturating_add(glyph.top.saturating_mul(size)),
             });
         }
-        pen_x += glyph.advance as i32 * size;
+        let advance = i32::try_from(glyph.advance).unwrap_or(i32::MAX);
+        pen_x = pen_x.saturating_add(advance.saturating_mul(size));
     }
     out
 }
@@ -203,6 +205,22 @@ mod tests {
         assert!(cut.ends_with("..."), "{cut}");
         assert!(measure(&font, &cut, 1) <= 40, "{cut}");
         assert!(cut.len() > 3);
+    }
+
+    #[test]
+    fn huge_advances_saturate() {
+        // Engine code may build any advance; widths and pens stop at the integer ends.
+        let mut atlas = UiAtlas::new(64);
+        let mut builder = crate::FontBuilder::new();
+        builder
+            .space('w', u32::MAX)
+            .bits('a', [0xFF; 8])
+            .fallback(default_font(&mut atlas).unwrap());
+        let font = builder.build(&mut atlas).unwrap();
+        assert_eq!(measure(&font, "ww", 3), u32::MAX);
+        let placed = layout(&font, "wa\nwwa", 0, 0, u32::MAX);
+        assert_eq!(placed[0].x, i32::MAX);
+        assert_eq!((placed[1].x, placed[1].y), (i32::MAX, i32::MAX));
     }
 
     #[test]
