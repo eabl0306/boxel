@@ -1,7 +1,8 @@
 # Memoria de chunks en páginas y cambio de mundo: medición (2026-10-13)
 
 Qué se midió: la memoria de chunks en páginas (issue #57, [ADR 0035](../adr/0035-memoria-de-chunks-en-paginas.md))
-y el ciclo de vida del mundo (issue #58, M1 y M2), ya juntos en main en 91e071f. La base es
+y el ciclo de vida del mundo (issue #58, M1 y M2, [ADR 0034](../adr/0034-ciclo-de-vida-del-mundo.md)),
+ya juntos en main en 91e071f. M6 mide #58 M3 en su rama. La base es
 90da83b, el main de antes. Solo nivel 1: cada smoke una vez, la máquina tranquila y nada
 compilando. 1280x720, sin tope.
 
@@ -20,6 +21,11 @@ compilando. 1280x720, sin tope.
   las 9 páginas que había creado. Es el diseño: suelta una página cada 5 s como mucho. A los
   60 s quedan 5 páginas, una sobre el piso, que la histéresis guarda a propósito (M5).
 - El ciclo de vida del mundo no cambia la malla: chunks y quads iguales a 90da83b (M2).
+- **Cambiar de mundo cuesta un frame de 2 a 7 ms** para cerrar y uno de 2 ms para abrir, y el
+  mundo nuevo se asienta en 0,3 s a radio 16. Abrir un mundo guardado grande ya no recorre sus
+  chunks en el hilo principal: 0,09 ms en vez de 13 ms a radio 32 (M6).
+- **El RSS crece con los cambios** (un 18 % en la RTX y un 9 % en la 780M en diez), pero no es
+  memoria del motor: con un solo arena de malloc crece un 3,5 %. Decide el dueño (M6).
 
 ## M1: la sonda de páginas
 
@@ -112,3 +118,50 @@ de volver a radio 8 quedan 4 páginas, volvió al piso.
 La de 80 s es una prueba de funcionamiento, no una medida. Nada se movió de página: las páginas
 nuevas guardaban el anillo de radio 32 y se vaciaron solas. El frame máximo de la 780M es la
 creación del bloque nuevo, no el encogimiento.
+
+## M6: cambiar de mundo (#58 M3)
+
+Rama feat/world-m3. Los tests de fugas (`crates/boxel_world/tests/lifecycle_leaks.rs`) pasan: de
+30 mundos seguidos a radio 4, el heap vivo crece 315 KiB del tercero al último en la primera
+corrida del binario (se llenan las cachés de cada hilo) y 3 KiB en la segunda. Los archivos
+abiertos, los hilos y las slots del mapa quedan iguales.
+
+`headless_world --world overworld --view-distance R --lod near --reopen`: un bloque cambiado en
+cada chunk con bloques, así todos se guardan, y el mundo se cierra y se abre otra vez. Antes es
+6b41d75, sin los índices hechos al abrir el store; después es la rama.
+
+| radio | guardados | frame del cierre | hasta `Closed` | abrir el store | apertura antes | apertura después | asentado |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 16 | 8 665 | 3,92 ms | 560 ms | 1,26 -> 4,22 ms | 2,48 ms | 0,02 ms | 0,27 s |
+| 32 | 32 191 | 14,36 ms | 2 048 ms | 1,72 -> 12,14 ms | 13,05 ms | 0,09 ms | 0,93 s |
+
+Antes, de la apertura a radio 32, 0,73 ms eran el índice de guardados y 12,29 ms la semilla del
+LOD. `Closed` espera el último guardado de todos los chunks editados. Abrir el store lo hace el
+juego fuera del hilo principal.
+
+`just bench-switch --world overworld --caves mc --speed 64 --radius 16 --duration 210`, una vez por
+GPU, sin tope: vuela como el caso de superficie y cambia de mundo cada 20 s, diez veces.
+
+| GPU | frame del cierre | desmontaje | hasta `Closed` | frame de la apertura | asentado | p99 fuera de las pausas | máximo fuera |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| RTX 5050 | 2,2 a 5,0 ms | 1,0 a 2,1 ms | 9 a 12 ms | 1,6 a 2,0 ms | 0,27 a 0,29 s | 1,09 ms | 4,64 ms |
+| 780M | 3,9 a 7,2 ms | 1,9 a 3,6 ms | 12 a 18 ms | 1,5 a 1,8 ms | 0,29 a 0,36 s | 4,60 ms | 8,47 ms |
+
+La superficie en el smoke de M2 (main, 10 s) tiene p99 de 1,21 y 4,83 ms y máximo de 4,16 y 6,54
+ms. El p99 fuera de las pausas queda bajo 1,5 veces el de la superficie en las dos GPU. El
+máximo no, pero la superficie sin cambios tampoco cumpliría esa regla. En la 780M, 3 frames de
+114 000 pasan los 6,94 ms.
+
+El RSS crece con los cambios. Los registros de cada frame de la corrida son parte (unos 190 MiB
+en la RTX), así que la corrida los resta:
+
+| GPU | RSS tras el 1.º | tras el 10.º | sin los registros | crece |
+|---|---:|---:|---:|---:|
+| RTX 5050 | 339 MiB | 568 MiB | 319 -> 377 MiB | 18 % |
+| 780M | 283 MiB | 351 MiB | 278 -> 302 MiB | 9 % |
+| RTX, `MALLOC_ARENA_MAX=1` | 332 MiB | 513 MiB | 312 -> 323 MiB | 3,5 % |
+
+La última es un diagnóstico, no una medida del caso: con un solo arena de malloc el RSS casi no
+crece. Lo que crece es memoria libre que glibc guarda en el arena de cada hilo, no memoria viva del
+motor (los tests de fugas lo confirman). La regla del plan, 5 %, solo se cumple así.
+

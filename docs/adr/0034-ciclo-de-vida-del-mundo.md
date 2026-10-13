@@ -85,9 +85,29 @@ enteros y no recorre los chunks guardados en el hilo principal (M3, ver Medicion
 - Borrar un mundo solo después del `Closed` de un cierre con `save: false`.
 - No guardar un `ChunkId` cuando cambia `WorldEpoch`.
 
-## Mediciones
+## Mediciones (2026-10-13)
 
-Pendientes de M3.
+Detalle en [rendimiento/memoria-y-mundos-2026-10.md](../rendimiento/memoria-y-mundos-2026-10.md).
+
+- El cierre en el hilo principal: 3,9 ms a radio 16 y 14,4 ms a radio 32, con todos los chunks con
+  bloques guardados. Queda bajo los 20 ms del plan.
+- La apertura de ese mundo guardado costaba 2,5 ms a radio 16 y 13 ms a radio 32, casi todo la
+  semilla del LOD. Con los índices hechos en `WorldStore::open` cuesta 0,02 y 0,09 ms. Abrir el
+  store, fuera del hilo principal, pasa de 1,3 a 4,2 ms y de 1,7 a 12 ms.
+- Diez cambios de mundo volando a radio 16: el frame del cierre va de 2 a 5 ms en la RTX y de 4 a
+  7 ms en la 780M, el de la apertura unos 2 ms. El mundo nuevo se asienta en 0,3 s. Fuera de esos
+  dos frames, el p99 queda bajo 1,5 veces el p99 de la superficie.
+- 30 mundos seguidos sin GPU dejan el heap, los archivos abiertos y los hilos como estaban.
+
+## Pendiente
+
+- El RSS crece con los cambios: un 18 % en la RTX y un 9 % en la 780M tras diez cambios, no el 5 %
+  del plan. No es memoria del motor: el heap vivo no crece, y con un solo arena de malloc
+  (`MALLOC_ARENA_MAX=1`) el RSS crece un 3,5 %. Es memoria que glibc guarda en el arena de cada
+  hilo. Limitar los arenas en el juego u otro asignador lo arreglaría. Decide el dueño.
+- El plan pedía que ningún frame fuera de los dos de pausa pasara 1,5 veces el p99 de la
+  superficie. El frame más largo pasa (4,6 ms en la RTX, 8,5 ms en la 780M), pero el vuelo sobre la
+  superficie sin cambios también tiene frames así (4,2 y 6,5 ms en 10 s). El p99 sí cumple.
 
 ## Consecuencias
 
