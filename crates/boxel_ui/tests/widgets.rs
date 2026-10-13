@@ -13,7 +13,7 @@ use boxel_ui::{
     BitmapFont, DOUBLE_CLICK, InputCapture, Modal, SCROLLBAR_WIDTH, Text, Ui, UiAtlas, UiLayer,
     UiQuad, UiRect,
 };
-use boxel_window::{ButtonState, ImeOptions, KeyCode, KeyboardInput, TextInput};
+use boxel_window::{ButtonInput, ButtonState, ImeOptions, KeyCode, KeyboardInput, TextInput};
 use std::time::Duration;
 
 // ---- the list
@@ -577,7 +577,8 @@ fn typing_goes_to_the_focused_field_and_stops_at_its_maximum() {
         InputCapture {
             pointer: true,
             keyboard: true,
-            text: true
+            text: true,
+            composing: false
         }
     );
     // The input method is on while a field has the focus, with the caret's place.
@@ -772,6 +773,39 @@ fn keys_an_input_method_takes_neither_move_the_focus_nor_submit() {
     assert_eq!(form_of(&t).seed, "1");
     assert!(form_of(&t).submitted.is_empty());
     assert_eq!(t.focused().as_deref(), Some("test:seed"));
+}
+
+#[test]
+fn escape_is_the_input_method_s_while_it_composes() {
+    /// A game screen that closes on Escape, as `InputCapture` asks.
+    #[derive(Resource, Default)]
+    struct Closed(u32);
+    fn close_on_escape(
+        keys: Res<ButtonInput<KeyCode>>,
+        capture: Res<InputCapture>,
+        mut closed: ResMut<Closed>,
+    ) {
+        if keys.just_pressed(KeyCode::Escape) && !capture.composing {
+            closed.0 += 1;
+        }
+    }
+    let mut t = form_tester();
+    t.app.init_resource::<Closed>();
+    t.add_systems(close_on_escape);
+    t.click("test:name");
+    assert!(!t.capture().composing);
+    t.preedit("nihon").frame();
+    assert!(t.capture().composing);
+    // Escape cancels the composition: Windows still reports the press, and the composition
+    // ends in the same frame. It is the input method's, not the game's.
+    ime_key(&mut t, KeyCode::Escape);
+    t.preedit("").frame();
+    assert!(t.capture().composing);
+    assert_eq!(t.app.world().resource::<Closed>().0, 0);
+    // With no composition, Escape is the game's again.
+    t.frame().tap(KeyCode::Escape);
+    assert!(!t.capture().composing);
+    assert_eq!(t.app.world().resource::<Closed>().0, 1);
 }
 
 #[test]

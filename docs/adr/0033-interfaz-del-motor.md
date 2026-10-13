@@ -41,7 +41,9 @@ No es egui porque:
   las pantallas no se mueven), recortados igual que su dibujo. Lo que no se ve no recibe
   entrada: ni la parte recortada de un widget ni lo que queda bajo una capa modal.
 - `InputCapture` dice si la interfaz toma el puntero y el teclado. El juego frena con eso su
-  propia entrada (picking, jugador, hotbar). Escape es siempre del juego.
+  propia entrada (picking, jugador, hotbar). Escape es del juego, salvo en un frame en que un
+  IME compone en un campo (`composing`): ese Escape cancela la composición y Windows lo manda
+  igual, así que el juego no debe cerrar la pantalla con él.
 
 ### 3. Una textura y aritmética entera
 

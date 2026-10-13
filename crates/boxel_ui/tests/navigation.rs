@@ -275,7 +275,8 @@ fn a_modal_layer_captures_input_and_the_hud_alone_does_not() {
         InputCapture {
             pointer: true,
             keyboard: true,
-            text: false
+            text: false,
+            composing: false
         }
     );
 
@@ -301,7 +302,8 @@ fn a_modal_layer_captures_input_and_the_hud_alone_does_not() {
         InputCapture {
             pointer: true,
             keyboard: false,
-            text: false
+            text: false,
+            composing: false
         }
     );
     t.tap(KeyCode::Tab);

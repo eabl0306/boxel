@@ -18,10 +18,14 @@ use std::time::Duration;
 pub struct InputCapture {
     /// Clicks and the wheel belong to the UI.
     pub pointer: bool,
-    /// Keys belong to the UI (Escape stays the game's).
+    /// Keys belong to the UI (Escape stays the game's, unless `composing`).
     pub keyboard: bool,
     /// Typed text belongs to a focused text field.
     pub text: bool,
+    /// An input method composed in a focused text field during this frame, so this frame's
+    /// keys may be its own, Escape included: Escape cancels the composition, and Windows still
+    /// reports the press. A game that acts on Escape leaves it alone then.
+    pub composing: bool,
 }
 
 /// A navigation key press.
@@ -145,6 +149,7 @@ pub(crate) fn resolve(state: &mut UiState, input: &NavInput) -> InputCapture {
     let layers = &state.layers;
     let mem = &mut state.memory;
     let was = mem.focused;
+    let composed = !mem.preedit.is_empty();
     mem.cursor = input.cursor;
     mem.shift = input.shift;
     mem.ctrl = input.ctrl;
@@ -292,6 +297,9 @@ pub(crate) fn resolve(state: &mut UiState, input: &NavInput) -> InputCapture {
         pointer: mem.modal.is_some() || mem.hovered.is_some_and(|(l, _)| l != UiLayer::Hud),
         keyboard: mem.modal.is_some(),
         text: typing,
+        // Open when the frame began or when it ended: the key that cancels a composition comes
+        // in the frame that ends it.
+        composing: composed || !mem.preedit.is_empty(),
     }
 }
 
