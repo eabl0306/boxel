@@ -8,6 +8,11 @@
 //! settled and the process's resident memory then; for the run, the 99th percentile and the
 //! longest of the measured frames outside the declared stalls (the close frame and the open
 //! frame, `Time::stall`).
+//!
+//! In the open frame, with the old world gone and the new one not streamed yet, it also reads
+//! malloc's own statistics (glibc): the bytes in use, which a leak makes grow from switch to
+//! switch, and the freed bytes malloc keeps in its arenas, resident but nobody's memory. The
+//! resident memory alone cannot tell the two apart.
 use super::{Bench, Phase, Recorder};
 use boxel::prelude::*;
 use boxel::world::WorldStats;
@@ -72,8 +77,81 @@ pub struct Switch {
     /// run's own frame records (they grow with every measured frame).
     pub rss: Option<u64>,
     pub logs: u64,
+    /// The memory in the open frame (`None` without glibc).
+    pub at_open: Option<Memory>,
     /// The open was refused.
     pub failed: bool,
+}
+
+/// The process's memory at one moment: resident pages, and malloc's heap over all its arenas
+/// (Rust's allocations and the C libraries', the GPU driver's among them).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Memory {
+    /// Resident bytes (`VmRSS`).
+    pub resident: Option<u64>,
+    /// Bytes allocated and not freed (`uordblks + hblkhd`), the run's own records included.
+    pub in_use: u64,
+    /// Of `in_use`, the run's own frame records.
+    pub records: u64,
+    /// Freed bytes malloc keeps in its arenas for later allocations (`fordblks`): resident
+    /// once touched, but nobody's memory.
+    pub free: u64,
+    /// What reading malloc's statistics took (it walks every arena's free lists).
+    pub took: Duration,
+}
+
+impl Memory {
+    /// The bytes in use without the run's own records: what the engine and the drivers hold.
+    pub fn heap(&self) -> u64 {
+        self.in_use.saturating_sub(self.records)
+    }
+
+    /// The process's memory now, with `records` bytes of the run's own records in the heap.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn now(records: u64) -> Option<Self> {
+        let start = Instant::now();
+        let info = glibc::mallinfo2();
+        let took = start.elapsed();
+        Some(Self {
+            resident: resident_bytes(),
+            in_use: (info.uordblks + info.hblkhd) as u64,
+            records,
+            free: info.fordblks as u64,
+            took,
+        })
+    }
+
+    /// Without glibc the run does not read the heap.
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    fn now(_records: u64) -> Option<Self> {
+        None
+    }
+}
+
+/// glibc's `struct mallinfo2` (`malloc.h`, glibc 2.33 and later): ten `size_t`.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[repr(C)]
+struct MallInfo2 {
+    arena: usize,
+    ordblks: usize,
+    smblks: usize,
+    hblks: usize,
+    hblkhd: usize,
+    usmblks: usize,
+    fsmblks: usize,
+    uordblks: usize,
+    fordblks: usize,
+    keepcost: usize,
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[expect(unsafe_code, reason = "malloc's statistics are a C function of glibc")]
+mod glibc {
+    // SAFETY: `mallinfo2` takes nothing and returns the struct by value (`MallInfo2` has its
+    // layout); it only reads malloc's state, under each arena's lock.
+    unsafe extern "C" {
+        pub safe fn mallinfo2() -> super::MallInfo2;
+    }
 }
 
 /// A measured frame's wall time, and whether a stall was declared in it.
@@ -135,7 +213,8 @@ impl SwitchTrack {
                 format!(
                     "stress: switch {}: close_frame_ms={} teardown_ms={:.2} closing_frames={} \
                      closed_after_ms={} open_frame_ms={} settled_after_s={} rss_mib={} \
-                     records_mib={}{}",
+                     records_mib={} at_open: rss_mib={} heap_mib={} malloc_free_mib={} \
+                     probe_ms={}{}",
                     i + 1,
                     self.frame_ms(s.close_frame)
                         .map_or("-".to_string(), |v| format!("{v:.2}")),
@@ -150,6 +229,13 @@ impl SwitchTrack {
                         .map_or("-".to_string(), |d| format!("{:.2}", d.as_secs_f64())),
                     s.rss.map_or("-".to_string(), |b| (b >> 20).to_string()),
                     s.logs >> 20,
+                    mib(s.at_open.and_then(|m| m.resident)),
+                    mib1(s.at_open.map(|m| m.heap())),
+                    mib1(s.at_open.map(|m| m.free)),
+                    s.at_open.map_or("-".to_string(), |m| format!(
+                        "{:.2}",
+                        m.took.as_secs_f64() * 1e3
+                    )),
                     if s.failed { " (the open failed)" } else { "" },
                 )
             })
@@ -165,15 +251,23 @@ impl SwitchTrack {
                 })
                 .map_or("-".to_string(), |b| (b >> 20).to_string())
         };
+        let at_open = |i: usize, of: fn(&Memory) -> u64| {
+            mib1(self.switches.get(i).and_then(|s| s.at_open).map(|m| of(&m)))
+        };
         out.push(format!(
             "stress: switches={} stall_frames={stalls} outside: frames={count} p99_ms={p99:.2} \
              max_ms={max:.2} rss_mib: first={} tenth={}, without the run's records: first={} \
-             tenth={}",
+             tenth={}; at the open, without the records: heap_mib first={} tenth={}, \
+             malloc_free_mib first={} tenth={}",
             self.switches.len(),
             rss(0, true),
             rss(9, true),
             rss(0, false),
             rss(9, false),
+            at_open(0, Memory::heap),
+            at_open(9, Memory::heap),
+            at_open(0, |m| m.free),
+            at_open(9, |m| m.free),
         ));
         out
     }
@@ -190,14 +284,15 @@ impl SwitchTrack {
         let _ = writeln!(
             out,
             "| switch | close frame ms | teardown ms | frames closing | closed after ms | open \
-             frame ms | settled after s | RSS MiB | records MiB |\n\
-             |---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+             frame ms | settled after s | RSS MiB | records MiB | at the open: RSS MiB | heap \
+             MiB | malloc free MiB |\n\
+             |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
         );
         let cell = |v: Option<String>| v.unwrap_or_else(|| "-".to_string());
         for (i, s) in self.switches.iter().enumerate() {
             let _ = writeln!(
                 out,
-                "| {} | {} | {:.2} | {} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {:.2} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                 i + 1,
                 cell(self.frame_ms(s.close_frame).map(|v| format!("{v:.2}"))),
                 s.teardown.as_secs_f64() * 1e3,
@@ -211,6 +306,9 @@ impl SwitchTrack {
                 cell(s.settled_after.map(|d| format!("{:.2}", d.as_secs_f64()))),
                 cell(s.rss.map(|b| (b >> 20).to_string())),
                 s.logs >> 20,
+                mib(s.at_open.and_then(|m| m.resident)),
+                mib1(s.at_open.map(|m| m.heap())),
+                mib1(s.at_open.map(|m| m.free)),
             );
         }
         let (p99, max, count) = self.outside();
@@ -218,7 +316,9 @@ impl SwitchTrack {
             out,
             "\nFrames outside the declared stalls: {count}, p99 {p99:.2} ms, longest {max:.2} \
              ms. The run's own frame records grow with every frame: compare the RSS without \
-             them.\n"
+             them. At the open (the old world gone, the new one not streamed yet) the heap is \
+             malloc's bytes in use without the records, which grow from switch to switch only \
+             with a leak; malloc's free bytes are resident but nobody's.\n"
         );
         out
     }
@@ -226,6 +326,19 @@ impl SwitchTrack {
 
 fn fmt_ms(d: Duration) -> String {
     format!("{:.1}", d.as_secs_f64() * 1e3)
+}
+
+/// Whole MiB, or `-`.
+fn mib(bytes: Option<u64>) -> String {
+    bytes.map_or_else(|| "-".to_string(), |b| (b >> 20).to_string())
+}
+
+/// MiB with one decimal (a leak of a few hundred KiB a switch shows), or `-`.
+fn mib1(bytes: Option<u64>) -> String {
+    bytes.map_or_else(
+        || "-".to_string(),
+        |b| format!("{:.1}", b as f64 / f64::from(1 << 20)),
+    )
 }
 
 /// Resident memory of this process in bytes (Linux; `None` elsewhere).
@@ -310,7 +423,8 @@ pub fn track(
         rec.quads = 0;
     }
     track.last_status = Some(status);
-    let track_frames = track.frames.len();
+    // The run's own records as allocated (whole blocks and vectors).
+    let records = (rec.log.heap_bytes() + track.frames.capacity() * size_of::<FrameTime>()) as u64;
     let Some(switch) = track.switches.last_mut() else {
         return;
     };
@@ -321,6 +435,8 @@ pub fn track(
     if opened {
         switch.open_frame = Some(frame);
         switch.opened_at = Some(now);
+        // A declared stall frame: the probe's time stays out of the frames compared.
+        switch.at_open = Memory::now(records);
     }
     switch.failed |= failed;
     if let (Some(open_frame), Some(at), None) =
@@ -331,7 +447,7 @@ pub fn track(
     {
         switch.settled_after = Some(now.saturating_duration_since(at));
         switch.rss = resident_bytes();
-        switch.logs = (rec.log.heap_bytes() + track_frames * size_of::<FrameTime>()) as u64;
+        switch.logs = records;
     }
 }
 
@@ -374,6 +490,13 @@ mod tests {
             settled_after: Some(Duration::from_secs(2)),
             rss: Some(512 << 20),
             logs: 12 << 20,
+            at_open: Some(Memory {
+                resident: Some(300 << 20),
+                in_use: 210 << 20,
+                records: 10 << 20,
+                free: 40 << 20,
+                took: Duration::from_micros(250),
+            }),
             ..Switch::default()
         });
         assert_eq!(track.outside(), (2.0, 2.0, 198));
@@ -382,9 +505,37 @@ mod tests {
         assert!(lines[0].contains("close_frame_ms=40.00 teardown_ms=3.00 closing_frames=2"));
         assert!(lines[0].contains("rss_mib=512 records_mib=12"));
         assert!(
-            lines[1].ends_with("first=512 tenth=-, without the run's records: first=500 tenth=-")
+            lines[0]
+                .contains("at_open: rss_mib=300 heap_mib=200.0 malloc_free_mib=40.0 probe_ms=0.25")
         );
+        assert!(lines[1].contains(
+            "first=512 tenth=-, without the run's records: first=500 tenth=-; at the open, \
+             without the records: heap_mib first=200.0 tenth=-, malloc_free_mib first=40.0 tenth=-"
+        ));
         assert!(lines[1].starts_with("stress: switches=1 stall_frames=2"));
-        assert!(track.markdown().starts_with("## World switches"));
+        let markdown = track.markdown();
+        assert!(markdown.starts_with("## World switches"));
+        assert!(markdown.contains("| 512 | 12 | 300 | 200.0 | 40.0 |"));
+    }
+
+    /// malloc's statistics read in this process: the bytes in use cover a live allocation and
+    /// drop once it is freed.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn the_heap_counts_what_is_allocated() {
+        // zeroed: mapped fresh, never touched, so it costs no resident memory
+        const SIZE: u64 = 256 << 20;
+        // other tests of this binary allocate and free meanwhile
+        const MARGIN: u64 = 64 << 20;
+        let before = Memory::now(0).expect("glibc");
+        let block = std::hint::black_box(vec![0u8; SIZE as usize]);
+        let during = Memory::now(0).expect("glibc");
+        drop(block);
+        let after = Memory::now(0).expect("glibc");
+        assert!(before.resident.is_some());
+        assert!(during.heap() + MARGIN >= before.heap() + SIZE);
+        assert!(after.heap() + SIZE <= during.heap() + MARGIN);
+        let records = Memory::now(1 << 20).expect("glibc");
+        assert_eq!(records.heap(), records.in_use - (1 << 20));
     }
 }

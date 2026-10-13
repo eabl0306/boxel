@@ -138,9 +138,11 @@ impl RecordLog {
         self.iter().copied().collect()
     }
 
-    /// Bytes of the records kept so far (what the run itself adds to the process's memory).
+    /// Heap bytes the records take so far, as allocated (whole blocks): what the run itself
+    /// adds to the process's memory.
     pub fn heap_bytes(&self) -> usize {
-        self.blocks.iter().map(Vec::len).sum::<usize>() * size_of::<FrameRecord>()
+        self.blocks.iter().map(Vec::capacity).sum::<usize>() * size_of::<FrameRecord>()
+            + self.blocks.capacity() * size_of::<Vec<FrameRecord>>()
     }
 }
 
@@ -2354,6 +2356,8 @@ mod tests {
         assert_eq!(log.blocks.len(), 3);
         assert!(log.blocks.iter().all(|b| b.capacity() == RecordLog::BLOCK));
         assert!(all.windows(2).all(|w| w[0].t < w[1].t));
+        // the heap they take: the three blocks whole, the third one mostly empty
+        assert!(log.heap_bytes() >= 3 * RecordLog::BLOCK * size_of::<FrameRecord>());
     }
 
     #[test]
