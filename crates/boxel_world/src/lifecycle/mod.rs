@@ -127,7 +127,8 @@ pub enum WorldStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CloseOptions {
     /// Writes the world's last moment (the default). `false` only to delete the world
-    /// afterwards: what waits to be saved is dropped (the batches already written stay).
+    /// afterwards: what waits to be saved is dropped (the batches already written stay), a save
+    /// job running at the close ends on its own and what it fails to write is dropped too.
     pub save: bool,
 }
 
@@ -176,16 +177,19 @@ pub enum WorldEvent {
 /// How a close went ([`WorldEvent::Closed`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CloseReport {
-    /// The world had a store and its last moment was written.
+    /// The world had a store and its last moment was written (never for a close without its
+    /// save, [`CloseOptions::save`]).
     pub saved: bool,
     /// The last save kept failing for `PersistSettings::close_timeout`: what was not written
-    /// yet is lost (the batches written before stay).
+    /// yet is lost (the batches written before stay). A slow save that does not fail is waited
+    /// for.
     pub gave_up: bool,
     /// Chunk records written from the close to the end.
     pub chunks_written: usize,
     /// Entity records written from the close to the end.
     pub entities_written: usize,
-    /// The errors of the last save and of the store's close.
+    /// The errors of the last save (none for a close without its save) and of the store's
+    /// close.
     pub errors: Vec<String>,
     /// Main-thread time of the close frame (save snapshot and teardown).
     pub teardown: Duration,

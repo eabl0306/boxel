@@ -56,8 +56,10 @@ enum Phase {
 pub(crate) struct ClosingWorld {
     epoch: WorldEpoch,
     started: Instant,
-    /// The last save gives up at this time.
+    /// The last save, while it keeps failing, gives up at this time.
     deadline: Instant,
+    /// [`CloseOptions::save`]: off, what a failed job puts back is dropped again, never retried.
+    save: bool,
     /// Handed over by the persistence's teardown.
     pub(crate) persist: Option<Persist>,
     pub(crate) store: Option<WorldStore>,
@@ -387,6 +389,7 @@ fn close_now(world: &mut World, options: CloseOptions) {
         epoch,
         started,
         deadline: started + settings.close_timeout,
+        save: options.save,
         persist: None,
         store: None,
         stats_before,
@@ -440,12 +443,20 @@ fn poll_closing(world: &mut World) -> bool {
                 };
                 let now = Instant::now();
                 p.poll(now, settings.retry_after);
-                p.start(now, settings.max_batch);
-                // An inline executor ran it already.
-                p.poll(now, settings.retry_after);
+                // Only a save that keeps failing gives up, checked before the next try: a
+                // running job is waited for (the store's close must not cut it off).
+                let give_up = now >= closing.deadline && !p.in_flight() && p.last_error().is_some();
+                if !closing.save {
+                    // A job running at the close that failed put its work back: dropped again.
+                    p.discard();
+                } else if !give_up {
+                    p.start(now, settings.max_batch);
+                    // An inline executor ran it already.
+                    p.poll(now, settings.retry_after);
+                }
                 if p.idle() {
                     start_release(world, &mut closing);
-                } else if now >= closing.deadline {
+                } else if give_up {
                     tracing::error!(
                         "the world's last save did not succeed within {:?}: what was not written \
                          is lost",
@@ -492,9 +503,10 @@ impl ClosingWorld {
 }
 
 /// Ends the save phase: the report's counts and errors, then the store's close and the drop of
-/// the save state on the IO pool (an unsaved world has neither).
+/// the save state on the IO pool (an unsaved world has neither). A close without its save
+/// reports neither a save nor the error of the job it dropped.
 fn start_release(world: &World, closing: &mut ClosingWorld) {
-    if let Some(p) = closing.persist.as_ref() {
+    if let Some(p) = closing.persist.as_ref().filter(|_| closing.save) {
         if let Some(e) = p.last_error() {
             closing.report.errors.push(e.to_string());
         }

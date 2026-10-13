@@ -31,7 +31,7 @@ use std::io;
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 2^40 blocks east and south: the worlds of these tests sit there.
 const FAR: i64 = 1 << 40;
@@ -668,7 +668,7 @@ fn refused_opens_change_nothing() {
     app.add_systems(Idle, move |world: &mut World| {
         *seen.lock().unwrap() = Some(open_world(world, spec(1)));
     });
-    app.run_idle(std::time::Instant::now() + Duration::from_millis(5));
+    app.run_idle(Instant::now() + Duration::from_millis(5));
     assert_eq!(*result.lock().unwrap(), Some(Err(OpenWorldError::InIdle)));
     assert_eq!(status(&app), WorldStatus::Closed);
     assert!(app.world().resource::<ChunkMap>().is_empty());
@@ -689,126 +689,6 @@ fn refused_opens_change_nothing() {
         bare.world().resource::<WorldLifecycle>().status(),
         WorldStatus::Closed
     );
-}
-
-/// A store in memory whose close is for good, as a file's: every write after it fails.
-#[derive(Default)]
-struct Closable {
-    inner: MemoryStore,
-    closed: AtomicBool,
-}
-
-impl Closable {
-    fn check(&self) -> io::Result<()> {
-        if self.closed.load(Ordering::SeqCst) {
-            Err(io::Error::new(io::ErrorKind::NotConnected, "closed"))
-        } else {
-            Ok(())
-        }
-    }
-}
-
-impl ChunkStore for Closable {
-    fn load(&self, key: ChunkKey) -> io::Result<Option<Vec<u8>>> {
-        self.check()?;
-        self.inner.load(key)
-    }
-    fn keys(&self) -> io::Result<Vec<ChunkKey>> {
-        self.check()?;
-        self.inner.keys()
-    }
-    fn load_meta(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
-        self.check()?;
-        self.inner.load_meta(name)
-    }
-    fn save_batch(&self, batch: &SaveBatch) -> io::Result<()> {
-        self.check()?;
-        self.inner.save_batch(batch)
-    }
-    fn close(&self) -> io::Result<()> {
-        self.closed.store(true, Ordering::SeqCst);
-        Ok(())
-    }
-}
-
-/// Test 10, while a world closes: a store refused then because it is the closing world's (a
-/// clone a game kept to reload it, or another opening of its backend) is dropped, not closed:
-/// closing it would close the store the closing world still writes its last moment to. Here an
-/// autosave is in flight at the close, so the last moment's job starts after the refusal.
-#[test]
-fn a_store_refused_while_its_world_closes_keeps_the_last_save() {
-    for clone in [true, false] {
-        let held = Arc::new(Held::default());
-        let mut app = app_with(Arc::clone(&held) as Arc<dyn JobExecutor>);
-        app.insert_resource(PersistSettings {
-            autosave: None,
-            retry_after: Duration::from_millis(5),
-            close_timeout: Duration::from_millis(100),
-            ..PersistSettings::default()
-        });
-        let backend = Arc::new(Closable::default());
-        let opening = || {
-            WorldStore::open(
-                Arc::clone(&backend) as Arc<dyn ChunkStore>,
-                &testing::registry(),
-                "hills",
-            )
-            .unwrap()
-        };
-        let a = opening();
-        let kept = a.clone();
-        open(&mut app, spec(1).with_store(a));
-        held.run_all();
-        settle(&mut app);
-        held.run_all();
-        let glass = state(&app, "test:glass");
-        let (first, last) = (block(0, 0, 1, 26, 1), block(1, 1, 2, 27, 2));
-        app.world_mut()
-            .resource_mut::<EditQueue>()
-            .set_block(first, glass);
-        app.update();
-        app.world_mut()
-            .resource_mut::<WorldLifecycle>()
-            .request_save();
-        app.update();
-        app.update();
-        // The autosave's job waits; the last edit goes with the close.
-        app.world_mut()
-            .resource_mut::<EditQueue>()
-            .set_block(last, glass);
-        app.update();
-        assert!(close_world(app.world_mut(), CloseOptions::default()));
-        assert_eq!(status(&app), WorldStatus::Closing);
-        let refused = if clone { kept.clone() } else { opening() };
-        assert_eq!(
-            open_world(app.world_mut(), spec(2).with_store(refused)),
-            Err(OpenWorldError::NotClosed)
-        );
-        for _ in 0..400 {
-            held.run_all();
-            app.update();
-            if status(&app) == WorldStatus::Closed {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(status(&app), WorldStatus::Closed);
-        let report = app
-            .world()
-            .resource::<WorldLifecycle>()
-            .last_report()
-            .cloned()
-            .unwrap();
-        assert!(report.saved && !report.gave_up, "clone {clone}: {report:?}");
-        let keys = backend.inner.keys().unwrap();
-        for pos in [first, last] {
-            assert!(
-                keys.contains(&ChunkKey::new(ChunkPos::containing(pos))),
-                "clone {clone}: {pos:?} saved"
-            );
-        }
-        assert!(kept.is_closed());
-    }
 }
 
 // ------------------------------------------------------------------- requests and frames
@@ -1125,4 +1005,263 @@ fn staged_game_data_is_saved_with_the_world() {
         backend.load_meta("game:player").unwrap(),
         Some(b"exit".to_vec())
     );
+}
+
+// ------------------------------------------------------------------------ the close's save
+
+/// An app on `held` IO jobs whose world, saved in `store`, settled with an autosave job in
+/// flight (it wrote nothing yet) that holds an edit at `first`, and an edit at `last` made
+/// after that job started. Its close's last save comes after that job.
+fn closing_app(
+    held: &Arc<Held>,
+    store: WorldStore,
+    settings: PersistSettings,
+) -> (App, BlockPos, BlockPos) {
+    let mut app = app_with(Arc::clone(held) as Arc<dyn JobExecutor>);
+    app.insert_resource(settings);
+    open(&mut app, spec(1).with_store(store));
+    held.run_all();
+    settle(&mut app);
+    held.run_all();
+    let glass = state(&app, "test:glass");
+    let (first, last) = (block(0, 0, 1, 26, 1), block(1, 1, 2, 27, 2));
+    app.world_mut()
+        .resource_mut::<EditQueue>()
+        .set_block(first, glass);
+    app.update();
+    app.world_mut()
+        .resource_mut::<WorldLifecycle>()
+        .request_save();
+    app.update();
+    app.update();
+    app.world_mut()
+        .resource_mut::<EditQueue>()
+        .set_block(last, glass);
+    app.update();
+    (app, first, last)
+}
+
+/// Waits `time` without sleeping the thread (the jobs run on this one).
+fn pass(time: Duration) {
+    let end = Instant::now() + time;
+    while Instant::now() < end {
+        std::thread::yield_now();
+    }
+}
+
+/// Runs `held`'s jobs and frames until the world is closed, for at most 5 s.
+fn run_until_closed(app: &mut App, held: &Held) {
+    let end = Instant::now() + Duration::from_secs(5);
+    while status(app) != WorldStatus::Closed && Instant::now() < end {
+        held.run_all();
+        app.update();
+        std::thread::yield_now();
+    }
+}
+
+fn last_report(app: &App) -> boxel_world::lifecycle::CloseReport {
+    app.world()
+        .resource::<WorldLifecycle>()
+        .last_report()
+        .cloned()
+        .expect("a close ended")
+}
+
+/// A close with `save: false` (the world is deleted next) writes nothing more: an autosave in
+/// flight that fails is not tried again, the close ends once that job reported (not at
+/// `close_timeout`), and the report says the world was not saved, without the dropped save's
+/// error. With a disk that works, the job in flight lands and the report still says not saved.
+#[test]
+fn a_close_without_saving_drops_what_waits_and_says_so() {
+    for disk_works in [false, true] {
+        let held = Arc::new(Held::default());
+        let flaky = Arc::new(Flaky::default());
+        let store = WorldStore::open(
+            Arc::clone(&flaky) as Arc<dyn ChunkStore>,
+            &testing::registry(),
+            "hills",
+        )
+        .unwrap();
+        let (mut app, first, last) = closing_app(
+            &held,
+            store,
+            PersistSettings {
+                autosave: None,
+                retry_after: Duration::ZERO,
+                close_timeout: Duration::from_secs(60),
+                ..PersistSettings::default()
+            },
+        );
+        flaky.fail.store(!disk_works, Ordering::SeqCst);
+        assert!(close_world(app.world_mut(), CloseOptions { save: false }));
+        for _ in 0..3 {
+            held.run_all();
+            app.update();
+        }
+        assert_eq!(status(&app), WorldStatus::Closed, "works {disk_works}");
+        let report = last_report(&app);
+        assert!(
+            !report.saved && !report.gave_up && report.errors.is_empty(),
+            "works {disk_works}: {report:?}"
+        );
+        flaky.fail.store(false, Ordering::SeqCst);
+        let keys = flaky.inner.keys().unwrap();
+        let saved = |pos: BlockPos| keys.contains(&ChunkKey::new(ChunkPos::containing(pos)));
+        assert_eq!(saved(first), disk_works, "the job in flight");
+        assert!(!saved(last), "dropped");
+    }
+}
+
+/// `close_timeout` gives up on a last save that keeps failing, not on one still running: a
+/// slow job that outlives it is waited for, and the report says what it did.
+#[test]
+fn a_slow_last_save_is_waited_for() {
+    let held = Arc::new(Held::default());
+    let backend = Arc::new(MemoryStore::new());
+    let (mut app, first, last) = closing_app(
+        &held,
+        open_store(&backend),
+        PersistSettings {
+            autosave: None,
+            close_timeout: Duration::from_millis(20),
+            ..PersistSettings::default()
+        },
+    );
+    assert!(close_world(app.world_mut(), CloseOptions::default()));
+    pass(Duration::from_millis(40));
+    app.update();
+    app.update();
+    assert_eq!(status(&app), WorldStatus::Closing, "the jobs still run");
+    for _ in 0..4 {
+        held.run_all();
+        app.update();
+    }
+    assert_eq!(status(&app), WorldStatus::Closed);
+    let report = last_report(&app);
+    assert!(report.saved && !report.gave_up, "{report:?}");
+    assert!(report.errors.is_empty(), "{report:?}");
+    let keys = backend.keys().unwrap();
+    for pos in [first, last] {
+        assert!(keys.contains(&ChunkKey::new(ChunkPos::containing(pos))));
+    }
+}
+
+/// A last save that keeps failing gives up at `close_timeout` even when it may try again at
+/// once (`retry_after` zero) and its jobs run off the main thread: the deadline is checked
+/// between a failed job and the next try, so a new try never hides the failure.
+#[test]
+fn a_failing_last_save_gives_up_between_tries() {
+    let held = Arc::new(Held::default());
+    let flaky = Arc::new(Flaky::default());
+    let store = WorldStore::open(
+        Arc::clone(&flaky) as Arc<dyn ChunkStore>,
+        &testing::registry(),
+        "hills",
+    )
+    .unwrap();
+    let (mut app, _, _) = closing_app(
+        &held,
+        store,
+        PersistSettings {
+            autosave: None,
+            retry_after: Duration::ZERO,
+            close_timeout: Duration::from_millis(20),
+            ..PersistSettings::default()
+        },
+    );
+    flaky.fail.store(true, Ordering::SeqCst);
+    assert!(close_world(app.world_mut(), CloseOptions::default()));
+    run_until_closed(&mut app, &held);
+    assert_eq!(status(&app), WorldStatus::Closed);
+    let report = last_report(&app);
+    assert!(report.gave_up && !report.saved, "{report:?}");
+    assert!(!report.errors.is_empty(), "{report:?}");
+}
+
+/// A store in memory whose close is for good, as a file's: every write after it fails.
+#[derive(Default)]
+struct Closable {
+    inner: MemoryStore,
+    closed: AtomicBool,
+}
+
+impl Closable {
+    fn check(&self) -> io::Result<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            Err(io::Error::new(io::ErrorKind::NotConnected, "closed"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl ChunkStore for Closable {
+    fn load(&self, key: ChunkKey) -> io::Result<Option<Vec<u8>>> {
+        self.check()?;
+        self.inner.load(key)
+    }
+    fn keys(&self) -> io::Result<Vec<ChunkKey>> {
+        self.check()?;
+        self.inner.keys()
+    }
+    fn load_meta(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
+        self.check()?;
+        self.inner.load_meta(name)
+    }
+    fn save_batch(&self, batch: &SaveBatch) -> io::Result<()> {
+        self.check()?;
+        self.inner.save_batch(batch)
+    }
+    fn close(&self) -> io::Result<()> {
+        self.closed.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Test 10, while a world closes: a store refused then because it is the closing world's (a
+/// clone a game kept to reload it, or another opening of its backend) is dropped, not closed:
+/// closing it would close the store the closing world still writes its last moment to. Here an
+/// autosave is in flight at the close, so the last moment's job starts after the refusal.
+#[test]
+fn a_store_refused_while_its_world_closes_keeps_the_last_save() {
+    let settings = PersistSettings {
+        autosave: None,
+        retry_after: Duration::from_millis(5),
+        close_timeout: Duration::from_millis(100),
+        ..PersistSettings::default()
+    };
+    for clone in [true, false] {
+        let held = Arc::new(Held::default());
+        let backend = Arc::new(Closable::default());
+        let opening = || {
+            WorldStore::open(
+                Arc::clone(&backend) as Arc<dyn ChunkStore>,
+                &testing::registry(),
+                "hills",
+            )
+            .unwrap()
+        };
+        let a = opening();
+        let kept = a.clone();
+        let (mut app, first, last) = closing_app(&held, a, settings.clone());
+        assert!(close_world(app.world_mut(), CloseOptions::default()));
+        assert_eq!(status(&app), WorldStatus::Closing);
+        let refused = if clone { kept.clone() } else { opening() };
+        assert_eq!(
+            open_world(app.world_mut(), spec(2).with_store(refused)),
+            Err(OpenWorldError::NotClosed)
+        );
+        run_until_closed(&mut app, &held);
+        assert_eq!(status(&app), WorldStatus::Closed);
+        let report = last_report(&app);
+        assert!(report.saved && !report.gave_up, "clone {clone}: {report:?}");
+        let keys = backend.inner.keys().unwrap();
+        for pos in [first, last] {
+            assert!(
+                keys.contains(&ChunkKey::new(ChunkPos::containing(pos))),
+                "clone {clone}: {pos:?} saved"
+            );
+        }
+        assert!(kept.is_closed());
+    }
 }

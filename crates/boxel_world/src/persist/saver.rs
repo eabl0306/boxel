@@ -178,6 +178,11 @@ impl Persist {
         !self.in_flight && self.queue.is_empty() && self.meta.is_empty() && !self.entities.has_ops()
     }
 
+    /// A save job runs.
+    pub(crate) fn in_flight(&self) -> bool {
+        self.in_flight
+    }
+
     /// The error of the last save while saves fail (`None` once one succeeds).
     pub(crate) fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()

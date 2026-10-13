@@ -34,7 +34,9 @@ pub struct PersistSettings {
     /// update.
     pub clock: bool,
     /// How long a closing world keeps trying to write its last save (a full disk): then it
-    /// gives up, closes the file and says so (`CloseReport::gave_up`). Default 10 s.
+    /// gives up, closes the file and says so (`CloseReport::gave_up`). A save job still running
+    /// then is waited for, and only a failed one gives up: a slow disk loses nothing. Default
+    /// 10 s.
     pub close_timeout: Duration,
 }
 
