@@ -973,8 +973,8 @@ rebind, #9738).
 La memoria crece y encoge mientras corre la app (ADR 0035). Justo después de present se crea a lo
 sumo una página o una tabla más grande, que los frames siguientes limpian por partes antes de
 usarla. Antes de colocar las mallas de un frame, `reserve` hace lugar para ellas. Una clase con
-lugar de sobra vacía su página más vacía hacia las otras, unos MiB por frame, y la suelta. Nunca
-baja del piso.
+lugar de sobra vacía su página de crecimiento más vacía hacia las otras, unos MiB por frame, y la
+suelta. Nunca baja del piso.
 
 Un chunk se rechaza solo en el techo, tras una creación fallida o pasado el límite de páginas
 creadas dentro de un frame. Se cuenta en `RenderInfo::dropped_chunks`, se avisa en el log, se

@@ -94,22 +94,30 @@ chunk rechazado espera y no entra en ningún hueco.
   estadísticas la cuentan.
 - La tabla de chunks crece duplicando, por adelantado cuando quedan pocas slots libres o en el
   momento si el frame la necesita. La nueva empieza como copia en la GPU de las slots que se
-  escribieron. Las slots no cambian nunca.
+  escribieron. Las slots no cambian nunca. La tabla nunca se achica: un pedido que la tabla ya
+  pasó se descarta.
 - Una creación de más de 2 ms (un bloque nuevo del driver) duplica la reserva de su clase una vez.
   Una que falla deja a su clase sin crecer 10 s.
 - Un chunk rechazado guarda su malla (el mismo `Arc`, sin copia) y se reintenta, el más cercano
-  primero, cuando aparece lugar.
+  primero, cuando aparece lugar. Cada vez es una sola pasada por todos, 131 072 quads por frame,
+  y después nada hasta que vuelva a aparecer lugar. Uno rechazado por falta de slot no pide
+  páginas mientras la tabla no pueda crecer.
 - El techo se lee en cada frame. Bajarlo no saca nada residente.
 - Con `grow: false` queda el piso fijo, más el reintento.
 
 ### 9. Encoger
 
-Si una clase puede perder su página más vacía y aun así guardar su reserva más media página,
+Si una clase puede perder su página más vacía y aun así guardar su reserva (más lo que esperan sus
+chunks rechazados) más media página, y sus lugares para chunks más los de media página,
 durante 5 s y sin haber creado una página en los 10 s anteriores, esa página pasa a Draining. Ya
 no recibe chunks. Sus chunks se copian de página a página a los huecos de las otras, unos MiB por
 frame (32, 8 o 4, como la limpieza), y su entrada de la tabla cambia en el mismo frame. Vacía, se
-suelta. Vuelve a Active si a la clase le falta lugar o si en 2 s no pudo mover nada. Nunca baja
-del piso. Es también la única desfragmentación.
+suelta. Vuelve a Active si a la clase le faltan quads o lugares, o si en 2 s no pudo mover nada.
+Es también la única desfragmentación.
+
+Nunca baja del piso, contando las dos clases juntas. Solo se sueltan páginas del tamaño de
+crecimiento: una del piso más chica no se podría volver a crear, y la memoria quedaría por encima
+del piso.
 
 ### 10. Al cambiar de mundo
 
