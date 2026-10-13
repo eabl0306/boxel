@@ -160,9 +160,10 @@ trace = [
 trace_tracy = ["trace", "boxel_log/tracy"]
 # Vulkan escape hatch (Windows/Linux only; a no-op elsewhere).
 hal = ["boxel_gfx?/hal"]
-# Minecraft Java resource-pack reader (textures, models, blockstates). The renderer reads packs
-# through boxel_render::TextureSource either way; this re-exports the reader as boxel::pack.
-pack = ["dep:boxel_pack"]
+# Minecraft Java resource-pack reader (textures, models, blockstates, GUI sprites and fonts). The
+# renderer reads packs through boxel_render::TextureSource either way; this re-exports the reader
+# as boxel::pack and, with `ui`, lets boxel::ui take a pack's GUI sprites and fonts.
+pack = ["dep:boxel_pack", "boxel_ui?/pack"]
 # Game UI (ADR 0033): GUI scale, a retained paint list, sprites, bitmap text and widgets, as
 # boxel::ui. Off by default; its UiPlugin is not in DefaultPlugins (games add it). With `render`,
 # the renderer draws its paint list over the frame.

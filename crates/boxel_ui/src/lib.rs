@@ -21,8 +21,10 @@
 //!
 //! The default look is procedural ([`UiSkin::procedural`]) and the default font is `font8x8`
 //! (public domain, ASCII and Latin-1); a game maps its own sprites to the skin's slots and
-//! builds its own [`BitmapFont`] with [`FontBuilder`]. [`UiPlugin`] is not in
-//! `DefaultPlugins`.
+//! builds its own [`BitmapFont`] with [`FontBuilder`]. With the feature `pack` they can come
+//! from a Minecraft resource pack read by `boxel_pack`'s `GuiPack`: `UiAtlas::insert_pack_sprite`
+//! keeps a GUI sprite's `gui.scaling` and `FontBuilder::pack_font` adds a pack font's bitmap and
+//! space providers. [`UiPlugin`] is not in `DefaultPlugins`.
 
 mod atlas;
 pub mod color;
@@ -31,6 +33,8 @@ pub mod font8x8;
 mod layout;
 mod memory;
 mod nav;
+#[cfg(feature = "pack")]
+mod pack;
 mod paint;
 mod plugin;
 pub mod raster;

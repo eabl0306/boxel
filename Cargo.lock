@@ -578,6 +578,8 @@ dependencies = [
  "boxel_app",
  "boxel_ecs",
  "boxel_math",
+ "boxel_pack",
+ "boxel_ui",
  "boxel_window",
  "proptest",
 ]

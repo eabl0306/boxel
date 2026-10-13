@@ -34,7 +34,8 @@
 //! component names) and `physics` (boxel's own minimal physics: add `physics::PhysicsPlugin`)
 //! are on by default; `trace`/`trace_tracy` add spans; `hal` adds the Vulkan escape hatch
 //! (Windows/Linux); `pack` re-exports the resource-pack reader; `ui` (ADR 0033) adds the game UI
-//! as `ui` (add `ui::UiPlugin`: menus and a HUD drawn from a retained paint list).
+//! as `ui` (add `ui::UiPlugin`: menus and a HUD drawn from a retained paint list), and with
+//! `pack` it takes a pack's GUI sprites and fonts.
 
 pub use boxel_app as app;
 pub use boxel_diagnostic as diagnostic;

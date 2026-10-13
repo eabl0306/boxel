@@ -1,8 +1,9 @@
 # ADR 0033: la interfaz del motor (`boxel_ui`)
 
 - Estado: aceptado. El dueño eligió la interfaz propia el 2026-10-12 (issue #39, plan de menús).
-  Partes: el crate (E-UI1), el pase de GPU (E-UI2, sección 6), texto e IME (E-UI4, sección 7) y
-  lista, campo de texto y pestañas (E-UI3, sección 8).
+  Partes: el crate (E-UI1), el pase de GPU (E-UI2, sección 6), texto e IME (E-UI4, sección 7),
+  lista, campo de texto y pestañas (E-UI3, sección 8) y sprites y fuentes de los packs (E-UI5,
+  sección 9).
 - Fecha: 2026-10-12
 
 ## Contexto
@@ -151,12 +152,38 @@ el pase (E-UI2) y llega antes de los menús, así que no hay puente.
   mueve su propio reloj, así los tests son exactos.
 - Todavía sin portapapeles: necesita una dependencia nueva y el visto bueno del dueño.
 
+### 9. Sprites y fuentes de los packs (E-UI5)
+
+- `boxel_pack::GuiPack` lee la parte de GUI de un resource pack cuando el juego la pide. Abrirlo
+  lee solo `pack.mcmeta`, así que no decodifica las texturas de bloque como `ResourcePack`. Los
+  overlays valen igual: gana el último que trae el archivo.
+- `sprite("minecraft:widget/button")` lee `textures/gui/sprites/widget/button.png` con su
+  `gui.scaling` (`stretch`, `tile` o `nine_slice`, con `border` y `stretch_inner`), y `texture`
+  lee cualquier textura por su id. Un `.mcmeta` que Minecraft rechazaría es un error. Un sprite
+  animado da el primer cuadro de su secuencia.
+- `font("minecraft:default")` lee `font/default.json` con sus proveedores `bitmap` (imagen,
+  `chars`, `height`, `ascent`) y `space`, y sigue los `reference` que están dentro del pack.
+  `ttf`, `unihex`, `legacy_unicode` y lo que falta se saltan con un aviso. Un `filter` vale con
+  las opciones por defecto de Minecraft (uniforme y japonés apagados).
+- Lo que el pack no tiene es `None`, y el juego sigue con su aspecto. Un nombre que Minecraft
+  rechazaría (`..`, mayúsculas) no encuentra nada, así que una fuente no lee fuera del pack.
+- `boxel_ui` con la feature `pack` (la fachada la prende con `ui` y `pack`):
+  `UiAtlas::insert_pack_sprite` guarda el sprite con su escala y `FontBuilder::pack_font` suma
+  los proveedores. Como en Minecraft, gana el primer proveedor que tiene el carácter, el glifo
+  mide `height` píxeles de GUI y su borde de arriba queda `7 - ascent` bajo la línea.
+- Cada glifo cae en píxeles de GUI enteros: su imagen se rellena con texels transparentes hasta
+  lo que cubren esos píxeles. Una fuente de 16 texels queda con dos texels exactos por píxel de
+  GUI. El avance es el de Minecraft: el ancho redondeado más uno.
+- El juego elige qué sprites y fuentes pide y a qué slot del skin van. Del pack no se sube nada
+  al repositorio: los tests arman packs sintéticos en un directorio temporal.
+
 ## Consecuencias
 
 - `boxel_window` suma `CursorPosition`: la última posición del cursor en píxeles físicos.
 - La lista de pintura y la entrada funcionan sin ventana, y `UiTester` hace clic por etiqueta en
   los tests. Con `render` y la feature `ui`, la interfaz se ve en pantalla.
-- Lo que sigue: E-UI5 (sprites y fuentes de los packs).
+- Un juego puede vestir la interfaz con el pack que ya usa para los bloques, sin copiar nada de
+  él al repositorio.
 - Las capas `Screen` y `Popup` se vacían en cada frame que nadie las dibuja, así que una pantalla
   cerrada desaparece sola. El HUD se vacía cuando cambia la escala o el tamaño de la ventana: el
   juego lo redibuja con `resource_changed::<GuiScale>`.

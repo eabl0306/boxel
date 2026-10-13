@@ -63,6 +63,22 @@ pub enum PackError {
     /// Referenced model id is neither in the pack nor a known builtin.
     #[error("missing model {0}")]
     MissingModel(ResourceId),
+    /// A GUI texture's `.png.mcmeta` (its `gui.scaling`, say) that Minecraft would reject.
+    #[error("invalid GUI texture metadata in {path}: {message}")]
+    InvalidGuiMeta {
+        /// The `.png.mcmeta` file.
+        path: PathBuf,
+        /// What went wrong.
+        message: String,
+    },
+    /// A font definition (`font/*.json`) that Minecraft would reject.
+    #[error("invalid font in {path}: {message}")]
+    InvalidFont {
+        /// The font file.
+        path: PathBuf,
+        /// What went wrong.
+        message: String,
+    },
 }
 
 /// Non-fatal note collected while loading (ignored folders, odd sizes, skipped models).

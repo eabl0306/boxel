@@ -185,19 +185,41 @@ pub enum Derive {
 #[derive(Clone, Debug)]
 struct Pending {
     image: GlyphBitmap,
-    /// Texel rows per [`GLYPH_HEIGHT`] GUI pixels (the source cell height).
+    /// Texel rows per `gui_h` GUI pixels (the source cell height).
     cell_h: u32,
+    /// GUI pixels `cell_h` texels are drawn on ([`GLYPH_HEIGHT`] but for a pack's bitmap
+    /// provider with another `height`).
+    gui_h: u32,
     /// Top in texels from the line top.
     top: i32,
+    /// GUI pixels added to the top (a pack provider's `7 - ascent`).
+    shift: i32,
+    /// The pen's move, when it is not the drawn width plus one.
+    advance: Option<u32>,
+}
+
+impl Pending {
+    /// `image` with `cell_h` texel rows drawn on `gui_h` GUI pixels, at the line's top.
+    fn new(image: GlyphBitmap, cell_h: u32, gui_h: u32) -> Self {
+        Self {
+            image,
+            cell_h: cell_h.max(1),
+            gui_h,
+            top: 0,
+            shift: 0,
+            advance: None,
+        }
+    }
 }
 
 /// Builds a [`BitmapFont`]: the mechanism is the engine's, the images and character tables come
 /// from the game (a pack's `font/ascii.png`, marks it draws itself).
 ///
-/// Per character the font uses the first of: a glyph added here (grid, bits, derived or
-/// composed), the fallback font, `'?'`. Every glyph is drawn [`GLYPH_HEIGHT`] GUI pixels tall
-/// for its source cell height, so a 16-pixel pack font draws at the same size as an 8-pixel
-/// one.
+/// Per character the font uses the first of: a glyph added here (grid, bitmap provider, bits,
+/// derived, composed or a space), the fallback font, `'?'`. A glyph added again replaces the
+/// earlier one. Every glyph is drawn [`GLYPH_HEIGHT`] GUI pixels tall for its source cell height
+/// (a pack's bitmap provider can ask for another height), so a 16-pixel pack font draws at the
+/// same size as an 8-pixel one.
 #[derive(Clone, Debug, Default)]
 pub struct FontBuilder {
     glyphs: BTreeMap<char, Pending>,
@@ -214,6 +236,37 @@ impl FontBuilder {
     /// `rows[i]`, left to right (Minecraft's bitmap provider). `'\0'` marks an unused cell. Each
     /// glyph keeps its used width.
     pub fn grid(&mut self, image: &GlyphBitmap, cell: [u32; 2], rows: &[&str]) -> &mut Self {
+        self.cut(image, cell, rows, GLYPH_HEIGHT, 0)
+    }
+
+    /// Minecraft's bitmap provider as a pack declares it: `image` is a grid of `rows.len()` rows
+    /// of equal cells (the image divided by the grid), each glyph drawn `height` GUI pixels tall
+    /// (Minecraft's default is 8) with its top `7 - ascent` GUI pixels below the line's top
+    /// (Minecraft's `ascent`; 7 puts it on the line's top). `'\0'` marks an unused cell.
+    pub fn bitmap(
+        &mut self,
+        image: &GlyphBitmap,
+        rows: &[&str],
+        height: u32,
+        ascent: i32,
+    ) -> &mut Self {
+        let columns = rows.first().map_or(0, |row| row.chars().count()) as u32;
+        let cell = [
+            image.w.checked_div(columns).unwrap_or(0),
+            image.h.checked_div(rows.len() as u32).unwrap_or(0),
+        ];
+        self.cut(image, cell, rows, height, 7 - ascent)
+    }
+
+    /// Adds the cells of a grid, each drawn `gui_h` GUI pixels tall and `shift` lower.
+    fn cut(
+        &mut self,
+        image: &GlyphBitmap,
+        cell: [u32; 2],
+        rows: &[&str],
+        gui_h: u32,
+        shift: i32,
+    ) -> &mut Self {
         let [cw, ch] = cell;
         for (row, chars) in rows.iter().enumerate() {
             for (col, c) in chars.chars().enumerate() {
@@ -221,7 +274,13 @@ impl FontBuilder {
                     continue;
                 }
                 let glyph = image.crop(col as u32 * cw, row as u32 * ch, cw, ch);
-                self.add(c, glyph, ch, 0);
+                self.insert(
+                    c,
+                    Pending {
+                        shift,
+                        ..Pending::new(glyph, ch, gui_h)
+                    },
+                );
             }
         }
         self
@@ -235,16 +294,38 @@ impl FontBuilder {
     /// Adds `c` from an image `cell_h` texels tall per 8 GUI pixels, its top `top` texels below
     /// the line's top.
     pub fn add(&mut self, c: char, image: GlyphBitmap, cell_h: u32, top: i32) -> &mut Self {
-        let w = image.used_width();
-        let image = image.crop(0, 0, w, image.h);
-        self.glyphs.insert(
+        self.insert(
             c,
             Pending {
-                image,
-                cell_h: cell_h.max(1),
                 top,
+                ..Pending::new(image, cell_h, GLYPH_HEIGHT)
             },
-        );
+        )
+    }
+
+    /// Adds `c` as a character that draws nothing and moves the pen `advance` GUI pixels
+    /// (Minecraft's space provider).
+    pub fn space(&mut self, c: char, advance: u32) -> &mut Self {
+        self.insert(
+            c,
+            Pending {
+                advance: Some(advance),
+                ..Pending::new(GlyphBitmap::new(0, 0), 1, GLYPH_HEIGHT)
+            },
+        )
+    }
+
+    /// Whether a glyph for `c` was added (the fallback font does not count): a game adds the
+    /// accents a pack lacks with `if !builder.contains('á') { builder.mark(..) }`.
+    pub fn contains(&self, c: char) -> bool {
+        self.glyphs.contains_key(&c)
+    }
+
+    /// Adds `c`, its image cut to its used width.
+    fn insert(&mut self, c: char, mut pending: Pending) -> &mut Self {
+        let image = &pending.image;
+        pending.image = image.crop(0, 0, image.used_width(), image.h);
+        self.glyphs.insert(c, pending);
         self
     }
 
@@ -254,7 +335,14 @@ impl FontBuilder {
             let image = match how {
                 Derive::Rotate180 => source.image.rotated_180(),
             };
-            self.add(c, image, source.cell_h, source.top);
+            self.insert(
+                c,
+                Pending {
+                    image,
+                    advance: None,
+                    ..source
+                },
+            );
         }
         self
     }
@@ -272,20 +360,18 @@ impl FontBuilder {
         let w = base_img.w.max(mark.w);
         let h = (base_img.h + above).max((dy + mark.h as i32).max(0) as u32 + above);
         let mut image = GlyphBitmap::new(w, h);
-        let paste = |image: &mut GlyphBitmap, from: &GlyphBitmap, x0: u32, y0: u32| {
-            for y in 0..from.h {
-                for x in 0..from.w {
-                    let texel = from.get(x, y);
-                    if texel[3] > 0 {
-                        image.set(x0 + x, y0 + y, texel);
-                    }
-                }
-            }
-        };
         paste(&mut image, base_img, 0, above);
         let mark_x = (base_img.w.saturating_sub(mark.w)) / 2;
         paste(&mut image, mark, mark_x, (dy + above as i32) as u32);
-        self.add(c, image, source.cell_h, source.top - above as i32)
+        self.insert(
+            c,
+            Pending {
+                image,
+                top: source.top - above as i32,
+                advance: None,
+                ..source
+            },
+        )
     }
 
     /// Characters this builder has no glyph for come from `font`.
@@ -295,6 +381,12 @@ impl FontBuilder {
     }
 
     /// Places every glyph in `atlas` and returns the font.
+    ///
+    /// A glyph is drawn on whole GUI pixels: its width and height round up, and its image is
+    /// padded with transparent texels to the size those pixels cover, so a 16-texel pack font
+    /// keeps exactly two texels per GUI pixel. Its advance is the drawn width rounded to the
+    /// nearest pixel, plus one (Minecraft's rule); a space is [`SPACE_ADVANCE`] unless a space
+    /// provider said otherwise.
     pub fn build(&self, atlas: &mut UiAtlas) -> Result<BitmapFont, AtlasError> {
         let mut glyphs = self
             .fallback
@@ -302,30 +394,57 @@ impl FontBuilder {
             .map(|font| font.glyphs.clone())
             .unwrap_or_default();
         for (&c, pending) in &self.glyphs {
+            let (cell_h, gui_h) = (pending.cell_h, pending.gui_h);
             let image = &pending.image;
-            let src = if image.w > 0 && image.h > 0 {
+            let to_gui = |texels: u32| (texels * gui_h).div_ceil(cell_h);
+            let size = [to_gui(image.w), to_gui(image.h)];
+            let src = if size[0] > 0 && size[1] > 0 {
+                let covered = size.map(|gui| (gui * cell_h).div_ceil(gui_h));
+                let padded;
+                let image = if covered == [image.w, image.h] {
+                    image
+                } else {
+                    padded = {
+                        let mut out = GlyphBitmap::new(covered[0], covered[1]);
+                        paste(&mut out, image, 0, 0);
+                        out
+                    };
+                    &padded
+                };
                 let at = atlas.add_image(image.w, image.h, &image.rgba)?;
                 [at[0], at[1], image.w, image.h]
             } else {
                 [0, 0, 0, 0]
             };
-            let to_gui = |texels: u32| (texels * GLYPH_HEIGHT).div_ceil(pending.cell_h);
-            let width = to_gui(image.w);
-            let advance = match c {
-                ' ' | '\u{a0}' => SPACE_ADVANCE,
-                _ => width + 1,
+            let advance = match (pending.advance, c) {
+                (Some(advance), _) => advance,
+                (None, ' ' | '\u{a0}') => SPACE_ADVANCE,
+                // Minecraft's `(int) (0.5 + width * scale) + 1`, in integers.
+                (None, _) => (2 * image.w * gui_h + cell_h) / (2 * cell_h) + 1,
             };
             glyphs.insert(
                 c,
                 Glyph {
                     src,
-                    size: [width, to_gui(image.h)],
-                    top: pending.top * GLYPH_HEIGHT as i32 / pending.cell_h as i32,
+                    size,
+                    top: pending.shift + pending.top * gui_h as i32 / cell_h as i32,
                     advance,
                 },
             );
         }
         Ok(BitmapFont { glyphs })
+    }
+}
+
+/// Copies the texels of `from` with alpha above 0 into `image` at `(x0, y0)`.
+fn paste(image: &mut GlyphBitmap, from: &GlyphBitmap, x0: u32, y0: u32) {
+    for y in 0..from.h {
+        for x in 0..from.w {
+            let texel = from.get(x, y);
+            if texel[3] > 0 {
+                image.set(x0 + x, y0 + y, texel);
+            }
+        }
     }
 }
 

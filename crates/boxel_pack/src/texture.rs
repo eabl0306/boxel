@@ -158,13 +158,13 @@ fn load_one(
     })
 }
 
-struct RgbaImage {
-    width: u32,
-    height: u32,
-    rgba: Vec<u8>,
+pub(crate) struct RgbaImage {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) rgba: Vec<u8>,
 }
 
-fn decode_png(path: &Path) -> Result<RgbaImage, PackError> {
+pub(crate) fn decode_png(path: &Path) -> Result<RgbaImage, PackError> {
     let file = std::fs::File::open(path).map_err(|source| PackError::Io {
         path: path.to_path_buf(),
         source,

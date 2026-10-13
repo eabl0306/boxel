@@ -7,16 +7,24 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# GUI sprites and fonts read by boxel_pack (ADR 0033): UiAtlas::insert_pack_sprite and
+# FontBuilder::pack_font. Off: no pack code.
+pack = ["dep:boxel_pack"]
+
 [dependencies]
 boxel_ecs.workspace = true
 boxel_app.workspace = true
 boxel_math.workspace = true
 boxel_window.workspace = true
+boxel_pack = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Tests get system/component names in ECS diagnostics (dev-only; users opt in through boxel/debug).
 boxel_ecs = { workspace = true, features = ["debug"] }
 proptest.workspace = true
+# The pack bridge's tests run in every `cargo test`: this crate with feature `pack`.
+boxel_ui = { workspace = true, features = ["pack"] }
 
 [lints]
 workspace = true
