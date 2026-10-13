@@ -295,6 +295,20 @@ class CaseTest(unittest.TestCase):
         self.assertEqual(boost[boost.index('--speed') + 1], '100')
         self.assertNotIn('--world', boost, 'the forest, like the forest case')
 
+    def test_the_grow_case_steps_the_radius_and_lets_a_side_start_small(self):
+        floor = ('--chunk-memory', 'grow', '--arena-quads', '8388608', '--chunk-slots', '32768')
+        case = runs.parse_case('rtx/grow/r32', Case(extra=('--chunk-memory', 'fixed'),
+                                                    new_extra=floor))
+        base, new = case.args(20), case.args(20, 'new')
+        self.assertEqual(base[base.index('--radius-steps') + 1], '8,32@1')
+        self.assertEqual(base[base.index('--arena-quads') + 1], '50331648')
+        # the new side's own flags come last: stress keeps them
+        self.assertEqual(new[-len(floor):], list(floor))
+        self.assertLess(new.index('--chunk-memory'), len(new) - len(floor))
+        # other cases still refuse what they set
+        with self.assertRaises(ValueError):
+            runs.parse_case('rtx/cave-static/r32', Case(new_extra=('--arena-quads', '1')))
+
     def test_supports_reads_the_help(self):
         with tempfile.TemporaryDirectory() as d:
             old = fake_binary(d, 'old', OLD_HELP)
@@ -304,6 +318,10 @@ class CaseTest(unittest.TestCase):
             self.assertFalse(runs.supports(old, Case(scenario='cave-path')))
             self.assertTrue(runs.supports(new, Case(scenario='cave-static')))
             self.assertTrue(runs.supports(new, Case(scenario='cave-path')))
+            # the grow case needs --radius-steps too
+            self.assertFalse(runs.supports(new, Case(scenario='grow')))
+            steps = fake_binary(d, 'steps', HELP + '  --radius-steps R0,R1@T1  steps\n')
+            self.assertTrue(runs.supports(steps, Case(scenario='grow')))
 
 
 class MetricsTest(unittest.TestCase):

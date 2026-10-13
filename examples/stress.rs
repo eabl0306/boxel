@@ -84,6 +84,8 @@ mod edits;
 mod fog;
 #[path = "shared/lod.rs"]
 mod lod;
+#[path = "stress/memory.rs"]
+mod memory;
 #[path = "shared/pack.rs"]
 mod pack;
 #[path = "stress/probe.rs"]
@@ -153,8 +155,16 @@ usage: stress [--scenario static|fly|dive|spin|path] [GPU options] [options]
   --vertical-radius N chunks loaded above and below the camera (default 8)
   --fixed-height      load only the generator's layers, like M0 (for comparisons with older runs;
                       not with the overworld, which has no floor)
-  --arena-quads N     renderer quad arena (default 8388608, 25165824 with the overworld)
-  --chunk-slots N     renderer chunk table (default 32768, 65536 with the overworld)
+  --arena-quads N     chunk memory the renderer starts with, in quads (default 8388608, 25165824
+                      with the overworld; ADR 0035)
+  --chunk-slots N     chunk table the renderer starts with (default 32768, 65536 with the
+                      overworld)
+  --chunk-memory fixed|grow  grow keeps the pages and the table growing and shrinking at
+                      runtime (the default); fixed keeps what the renderer starts with
+  --max-chunk-quads N the most quads chunk memory may grow to (default: by adapter class)
+  --radius-steps R0,R1@T1,..  settle at radius R0, then step to R1 T1 seconds into the
+                      measurement, and so on (takes the place of --radius); the summary says
+                      what chunk memory did
   --alloc-probe MIB,..  while measuring, every 0.5 s a buffer of chunk memory's page usages is
                       created right after present, 4 of each size, then all dropped; prints each
                       creation's time, whether it needed a new GPU memory block and its frame
@@ -278,6 +288,13 @@ struct Options {
     chunk_slots: Option<u32>,
     /// `--alloc-probe`: page sizes in MiB (empty: no probe).
     alloc_probe: Vec<u32>,
+    /// `--chunk-memory`: grow (`None`: the default, grow).
+    chunk_memory_grow: Option<bool>,
+    /// `--max-chunk-quads`.
+    max_chunk_quads: Option<u32>,
+    /// `--radius-steps`: `(radius, seconds into the measurement)`, the first at 0, and the text.
+    radius_steps: Vec<(u32, f64)>,
+    radius_steps_text: String,
     /// `--fps-limit` (0: unlimited).
     fps_limit: u32,
     /// `--vsync` (`None`: not given).
@@ -360,6 +377,10 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         arena_quads: None,
         chunk_slots: None,
         alloc_probe: Vec::new(),
+        chunk_memory_grow: None,
+        max_chunk_quads: None,
+        radius_steps: Vec::new(),
+        radius_steps_text: String::new(),
         fps_limit: 0,
         vsync: None,
         spans: false,
@@ -489,6 +510,27 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                 );
             }
             "--alloc-probe" => o.alloc_probe = probe::parse(&value()?)?,
+            "--chunk-memory" => {
+                o.chunk_memory_grow = Some(match value()?.as_str() {
+                    "grow" => true,
+                    "fixed" => false,
+                    v => return Err(format!("{flag}: {v:?} is not fixed or grow")),
+                });
+            }
+            "--max-chunk-quads" => {
+                let n = number(flag, &value()?)?;
+                o.max_chunk_quads = Some(
+                    u32::try_from(n)
+                        .ok()
+                        .filter(|n| *n >= 4096)
+                        .ok_or_else(|| format!("{flag}: {n} is not in 4096..=4294967295"))?,
+                );
+            }
+            "--radius-steps" => {
+                let v = value()?;
+                o.radius_steps = memory::parse_steps(&v)?;
+                o.radius_steps_text = v;
+            }
             "--vertical-radius" => {
                 let r = number(flag, &value()?)?;
                 o.vertical_radius = u32::try_from(r)
@@ -564,6 +606,10 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         }
     }
     o.world.validate(o.fixed_height)?;
+    if let Some(&(radius, _)) = o.radius_steps.first() {
+        // the steps take the place of --radius, wherever it was given
+        o.radius = radius;
+    }
     if o.screenshot_yaw.is_some() && o.screenshot.is_none() {
         return Err("--screenshot-yaw needs --screenshot".to_string());
     }
@@ -984,6 +1030,28 @@ fn spawn_camera(mut commands: Commands, bench: Res<Bench>) {
     ));
 }
 
+/// `PreUpdate`, after `record`: what chunk memory did in each measured frame, kept in the
+/// run's summary.
+fn track_memory(
+    mut bench: ResMut<Bench>,
+    info: Res<RenderInfo>,
+    mut track: ResMut<memory::MemoryTrack>,
+) {
+    let Phase::Measuring { start } = bench.phase else {
+        return;
+    };
+    track.frame(Instant::now(), start, &info.chunk_memory);
+    let o = &bench.options;
+    let run = memory::summary(
+        &track,
+        &info.chunk_memory,
+        o.chunk_memory_grow.unwrap_or(true),
+        o.max_chunk_quads,
+        &o.radius_steps_text,
+    );
+    bench.info.chunk_memory = Some(run);
+}
+
 /// Exit 2 when no GPU can be used.
 fn gpu_failed(
     mut failed: MessageReader<GpuFailed>,
@@ -1363,22 +1431,8 @@ impl Bench {
         if info.textures.size > 0 {
             self.info.texture_load_ms = Some(info.textures.load_time.as_secs_f64() * 1000.0);
         }
-        // What the renderer got: the device's limits may cut the requested arena and table.
-        if info.arena_capacity_quads > 0 {
-            if (info.arena_capacity_quads, info.chunk_slot_capacity)
-                != (self.info.arena_quads, self.info.chunk_slots)
-            {
-                println!(
-                    "stress: the renderer got {} quads and {} chunk slots (asked for {} and {})",
-                    info.arena_capacity_quads,
-                    info.chunk_slot_capacity,
-                    self.info.arena_quads,
-                    self.info.chunk_slots
-                );
-            }
-            self.info.arena_quads = info.arena_capacity_quads;
-            self.info.chunk_slots = info.chunk_slot_capacity;
-        }
+        // The chunk memory the renderer started with stays in `arena_quads` and `chunk_slots`
+        // (what it grew to is in the chunk memory summary).
         self.info.lod_arena_quads = info.lod_arena_capacity_quads;
         let records = rec.log.to_vec();
         if let (Some(script), Some(first), Some(last)) = (script, records.first(), records.last()) {
@@ -1390,6 +1444,9 @@ impl Bench {
             return;
         };
         println!("{}", report::one_line(&self.info, &summary));
+        if let Some(memory) = &self.info.chunk_memory {
+            println!("{}", memory.line());
+        }
         if let Some(warning) = report::rock_warning(&self.info, &summary) {
             eprintln!("stress: {warning}");
         }
@@ -1590,13 +1647,15 @@ fn add_bench(app: &mut App, options: Options, info: RunInfo, recorder: Recorder,
             options,
         })
         .add_systems(Startup, spawn_camera)
-        .add_systems(PreUpdate, record)
+        .add_systems(PreUpdate, (record, track_memory).chain())
         .add_systems(
             Update,
-            (gpu_failed, drive, scripted_edits)
+            (gpu_failed, drive, scripted_edits, memory::step_radius)
                 .chain()
                 .before(WorldSystems::Interest),
         );
+    let steps = app.world().resource::<Bench>().options.radius_steps.clone();
+    app.insert_resource(memory::MemoryTrack::new(steps));
     let sizes = app.world().resource::<Bench>().options.alloc_probe.clone();
     if !sizes.is_empty() {
         app.insert_resource(probe::AllocProbe::new(&sizes))
@@ -1734,7 +1793,14 @@ fn main() -> AppExit {
                 gpu,
                 gpu_config,
                 render_when_hidden: true,
-                chunk_memory: world::chunk_memory((arena_quads, chunk_slots)),
+                chunk_memory: boxel::render::ChunkMemorySettings {
+                    grow: options.chunk_memory_grow.unwrap_or(true),
+                    max_quads: options.max_chunk_quads.map_or(
+                        boxel::render::MemoryCeiling::Auto,
+                        boxel::render::MemoryCeiling::Quads,
+                    ),
+                    ..world::chunk_memory((arena_quads, chunk_slots))
+                },
                 textures: options.textures.clone(),
                 translucent_sort: options.sort,
                 distance_fog: if options.no_distance_fog {
@@ -2226,6 +2292,10 @@ mod tests {
             &["--arena-quads", "100"],
             &["--chunk-slots", "0"],
             &["--chunk-slots", "2000000"],
+            &["--chunk-memory", "auto"],
+            &["--max-chunk-quads", "100"],
+            &["--radius-steps", "8"],
+            &["--radius-steps", "8,32@2,16@1"],
             &["--fps-limit", "-1"],
             &["--fps-limit", "100001"],
             &["--fps-limit"],
@@ -2320,6 +2390,26 @@ mod tests {
         .expect("not help");
         assert_eq!(o.world.label(), "overworld/closed");
         assert_eq!(o.render_capacity(), (1 << 20, 4096));
+        // chunk memory (ADR 0035): the steps take the place of --radius; the last flag wins
+        let o = parse(&[
+            "--radius-steps",
+            "8,32@1,8@20",
+            "--radius",
+            "16",
+            "--chunk-memory",
+            "fixed",
+            "--max-chunk-quads",
+            "65536",
+            "--chunk-memory=grow",
+        ])
+        .expect("valid")
+        .expect("not help");
+        assert_eq!(o.radius, 8);
+        assert_eq!(o.radius_steps, vec![(8, 0.0), (32, 1.0), (8, 20.0)]);
+        assert_eq!(
+            (o.chunk_memory_grow, o.max_chunk_quads),
+            (Some(true), Some(65536))
+        );
         // The forest keeps --fixed-height (it has a floor).
         assert!(parse(&["--fixed-height"]).expect("valid").is_some());
     }
@@ -2551,9 +2641,10 @@ mod tests {
         *stats = frame.stats;
         info.ready = true;
         info.frames_presented += u64::from(frame.presented);
-        // A device that cuts the arena and the chunk table.
-        info.arena_capacity_quads = 1 << 20;
-        info.chunk_slot_capacity = 4096;
+        // Chunk memory that grew (the summary keeps what it started with).
+        info.arena_capacity_quads = 1 << 26;
+        info.chunk_slot_capacity = 1 << 16;
+        info.chunk_memory.pages = 16;
     }
 
     /// The bench systems with a fake world and renderer; no window, GPU or threads.
@@ -2736,11 +2827,14 @@ mod tests {
             Some(0.039),
             "frame 11 (66 ms) to 14 (105 ms)"
         );
-        // The summary keeps what the renderer got, not the 8 Mi quads and 32 768 slots asked.
+        // The summary keeps the chunk memory asked for (the 8 Mi quads and 32 768 slots it
+        // starts with); what it grew to is in its own summary (ADR 0035).
         assert_eq!(
             (bench.info.arena_quads, bench.info.chunk_slots),
-            (1 << 20, 4096)
+            (8 << 20, 32768)
         );
+        let memory = bench.info.chunk_memory.as_ref().expect("measured");
+        assert_eq!((memory.mode.as_str(), memory.pages), ("grow", 16));
     }
 
     #[test]

@@ -39,6 +39,7 @@ CAVE_CAMERA = ['--camera', '656,-1000,16,-90,0']
 # The binary must match these in its --help to run the scenario (cave runs came later).
 CAVE_FLAG = r'^\s*--cave\s'
 PATH_SCENARIO = r'--scenario \S*\bpath\b'
+RADIUS_STEPS = r'^\s*--radius-steps\s'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -47,6 +48,8 @@ class Scenario:
     args: tuple
     label: str
     needs: tuple = ()
+    # Flags the case sets that --extra and --new-extra may set again (stress keeps the last).
+    overridable: tuple = ()
 
 
 SCENARIOS = {
@@ -60,6 +63,12 @@ SCENARIOS = {
                           'cueva abierta, ruta a 8', (CAVE_FLAG, PATH_SCENARIO)),
     'cave-static': Scenario('static', (*OVERWORLD, '--cave', *CAVE_CAMERA),
                             'cueva abierta, quieta', (CAVE_FLAG,)),
+    # Chunk memory growing (ADR 0035): settled at radius 8, radius 32 one second into the
+    # measurement. A side that grows from the default floor says so with its own
+    # --arena-quads and --chunk-slots (they override the big arena of radius 32).
+    'grow': Scenario('static', (*OVERWORLD, '--cave', *CAVE_CAMERA, '--radius-steps', '8,32@1'),
+                     'cueva abierta, radio 8 a 32 al segundo', (CAVE_FLAG, RADIUS_STEPS),
+                     ('--arena-quads', '--chunk-slots')),
 }
 
 # Over this radius the overworld needs a bigger renderer arena and chunk table.
@@ -150,6 +159,7 @@ def parse_case(text, default=Case()):
     case = Case(**fields)
     plain = dataclasses.replace(case, extra=(), new_extra=())
     own = {a for a in plain.args(1) if a.startswith('--')} | set(HARNESS_FLAGS)
+    own -= set(SCENARIOS[case.scenario].overridable)
     taken = sorted({a for a in (*case.extra, *case.new_extra) if a in own})
     if taken:
         raise ValueError(f"{text!r}: the case already sets {', '.join(taken)}; say it with the "

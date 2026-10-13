@@ -163,8 +163,9 @@ pub struct RunInfo {
     /// Cave culling (`--cave-culling`): `on` or `off`. Empty in runs from before it (no
     /// culling).
     pub cave_culling: String,
-    /// Renderer quad arena (quads) and chunk table (slots) the renderer got: the requested ones
-    /// (`--arena-quads`, `--chunk-slots` or the world's default) cut to the device's limits.
+    /// Chunk memory (quads) and chunk table (slots) the renderer starts with (`--arena-quads`,
+    /// `--chunk-slots` or the world's default; ADR 0035: it grows from there, see
+    /// `chunk_memory`).
     pub arena_quads: u32,
     /// See `arena_quads`.
     pub chunk_slots: u32,
@@ -252,6 +253,8 @@ pub struct RunInfo {
     pub lod_fill_s: Option<f64>,
     /// LOD arena size in quads the renderer got (0: no LOD).
     pub lod_arena_quads: u32,
+    /// What chunk memory did while measuring (ADR 0035; `None` before the measurement).
+    pub chunk_memory: Option<super::memory::MemoryRun>,
 }
 
 /// What `--edits` measured: scripted edits (lamp placed and removed, shaft dug and capped) and
@@ -1234,6 +1237,25 @@ pub fn json(info: &RunInfo, s: &Summary) -> Json {
         ("lod", Json::Str(info.lod.clone())),
         ("lod_fill_s", Json::opt(info.lod_fill_s, 2)),
         ("lod_arena_quads", Json::uint(info.lod_arena_quads)),
+        (
+            "chunk_memory",
+            info.chunk_memory.as_ref().map_or(Json::Null, |m| {
+                Json::Obj(vec![
+                    ("mode", Json::Str(m.mode.clone())),
+                    ("max_quads", Json::uint(m.max_quads)),
+                    ("radius_steps", Json::Str(m.radius_steps.clone())),
+                    ("pages", Json::uint(m.pages)),
+                    ("pages_created", Json::uint(m.pages_created)),
+                    ("pages_released", Json::uint(m.pages_released)),
+                    ("max_page_create_ms", Json::num(m.max_page_create_ms, 3)),
+                    ("emergency_pages", Json::uint(m.emergency_pages)),
+                    ("late_emergency_pages", Json::uint(m.late_emergency_pages)),
+                    ("peak_page_bytes", Json::uint(m.peak_page_bytes)),
+                    ("max_relocated_frame", Json::uint(m.max_relocated_frame)),
+                    ("refused_waiting", Json::uint(m.refused_waiting)),
+                ])
+            }),
+        ),
     ]);
     let frames = Json::Obj(vec![
         ("count", Json::uint(f.frames)),
