@@ -2,7 +2,7 @@
 
 - Estado: aceptado. El dueño tomó las recomendaciones del plan el 2026-10-12 (issue #57, plan de
   crecimiento del arena). M0 y M1: las páginas y la sonda de asignación. M2 y M3: crecer y encoger
-  mientras corre la app.
+  mientras corre la app. Medido el 2026-10-13: la página queda en 32 MiB.
 - Fecha: 2026-10-12
 
 ## Contexto
@@ -125,12 +125,26 @@ del piso.
 tabla y las listas iniciales, nada pedido ni en curso. Lo que enseñó el dispositivo se queda: las
 esperas tras un fallo, la reserva duplicada y la creación más lenta.
 
+## Mediciones (2026-10-13)
+
+Detalle en [rendimiento/memoria-y-mundos-2026-10.md](../rendimiento/memoria-y-mundos-2026-10.md).
+
+- La sonda decide 32 MiB. Dentro de un bloque, crear una página tarda microsegundos con los dos
+  tamaños. Un bloque nuevo de 256 MiB tarda unos 25 ms en la 780M y de 2 a 13 ms en la RTX, igual
+  con 32 que con 64 MiB.
+- A radio 32 en la cueva, 9 páginas con chunks (18 multi-draws) no cuestan nada en la RTX y en la
+  780M van un 7 % más rápido que el arena único.
+- Crecer de radio 8 a 32 desde el piso: 0 chunks perdidos y 0 páginas de emergencia en las dos
+  GPU.
+- Encoger suelta una página cada 5 s como mucho: 2 de 9 a los 15 s y 8 a los 60 s. Queda una sobre
+  el piso por la histéresis.
+
 ## Pendiente
 
-- La sonda (`stress --alloc-probe 32,64`) está hecha pero no se corrió: sus números deciden si la
-  página queda en 32 MiB o pasa a 64.
-- Medir: el caso `grow` de `tools/perf` (radio 8 a 32 al segundo) y la vuelta al piso con
-  `--radius-steps 8,32@1,8@20`. Se corren en la próxima ronda, no en esta tarea.
+- La decisión 7: el bloque nuevo pasa los 2 ms en la 780M (unos 25 ms, un frame largo cada 256 MiB
+  de crecimiento). `MemoryHints::Manual` iría en `boxel_gfx`, que está protegido. Decide el dueño.
+- Tras volver de radio 32 a 8, soltar las páginas de más tarda casi un minuto, no los 15 s del
+  plan. Soltar de una vez las páginas que ya están vacías lo acortaría. Decide el dueño.
 
 ## Consecuencias
 

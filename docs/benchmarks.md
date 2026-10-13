@@ -229,10 +229,16 @@ memoria fija contra una que crece desde el piso por defecto, con el mismo binari
 `just perf-smoke --base HEAD "--new-extra='--chunk-memory grow --arena-quads 8388608 --chunk-slots 32768'" rtx/grow/r32 780m/grow/r32 -- --chunk-memory fixed`.
 En ese caso el lado nuevo puede repetir `--arena-quads` y `--chunk-slots` (gana el último).
 
+La vuelta al piso no entra en el smoke (el caso `grow` ya fija `--radius-steps`). Se mira con
+`just bench-static`, los argumentos de la cueva quieta, los de la GPU y
+`--radius-steps 8,32@1,8@20 --chunk-memory grow --arena-quads 8388608 --chunk-slots 32768`. Encoger
+suelta una página cada 5 s como mucho, así que hace falta `--duration 80` para verlo terminar.
+
 `--alloc-probe 32,64` es la sonda de páginas (ADR 0035): mientras mide, cada medio segundo crea
 justo después del present un buffer como una página, cuatro de cada tamaño, y al final los
 suelta. Imprime cuánto tardó cada uno, si hizo falta un bloque nuevo de memoria de la GPU y el
-tiempo de ese frame. Sus frames no sirven como medida del caso.
+tiempo de ese frame. Sus frames no sirven como medida del caso: en la 780M el bloque nuevo da un
+frame de unos 25 ms y el smoke sale con 1.
 
 Los generadores de esos mundos (salvo `flat`) son contenido de ejemplo y viven en `boxel_demo`
 (#48). Sus benches de criterion son `cargo bench -p boxel_demo --bench terrain` y
