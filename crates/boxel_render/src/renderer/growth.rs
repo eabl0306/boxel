@@ -539,11 +539,13 @@ impl VoxelRenderer {
         }
     }
 
-    /// Puts `buffer` (`capacity` slots) in use as the chunk table: the old one is copied into it
-    /// at the start of the next `render` (only the slots uploads wrote; a copy still pending
-    /// keeps its source, the last table a frame wrote), every page's group 2 and the tier's
-    /// table-sized buffers are built again, and the cave culling bits are written again.
+    /// Puts `buffer` (`capacity` slots, more than the table in use) in use as the chunk table:
+    /// the old one is copied into it at the start of the next `render` (only the slots uploads
+    /// wrote; a copy still pending keeps its source, the last table a frame wrote), every page's
+    /// group 2 and the tier's table-sized buffers are built again, and the cave culling bits are
+    /// written again.
     fn swap_table(&mut self, device: &wgpu::Device, buffer: wgpu::Buffer, capacity: u32) {
+        debug_assert!(capacity > self.chunks.capacity(), "a table never shrinks");
         let old = self.chunk_buffer.replace(buffer);
         if self.growth.table_copy.is_none()
             && let Some(old) = old
@@ -584,7 +586,11 @@ impl VoxelRenderer {
             }
             return None;
         }
-        if let Some(slots) = self.growth.wanted_table.take() {
+        // (one asked for before the table grew past it at once is not wanted any more: built and
+        // swapped in, the flush would write past its end)
+        if let Some(slots) = self.growth.wanted_table.take()
+            && slots > self.chunks.capacity()
+        {
             let start = Instant::now();
             if self.chunk_buffer.is_none() {
                 self.chunks.grow(slots);
@@ -671,7 +677,16 @@ impl VoxelRenderer {
         if let Some(lists) = &mut self.growth.next_lists {
             budget -= lists.clear_some(encoder, budget);
         }
-        // a larger table ahead: cleared above what the copy brings, then put in use
+        // a larger table ahead: cleared above what the copy brings, then put in use (dropped if
+        // the table grew past it at once meanwhile)
+        if self
+            .growth
+            .next_table
+            .as_ref()
+            .is_some_and(|n| n.capacity <= self.chunks.capacity())
+        {
+            self.growth.next_table = None;
+        }
         if let Some(next) = &mut self.growth.next_table {
             let total = next.buffer.size() - next.from;
             let n = (total - next.cleared).min(budget);

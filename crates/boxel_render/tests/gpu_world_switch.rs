@@ -1079,7 +1079,9 @@ fn twenty_switches_leave_a_fresh_renderer_every_time() {
 /// cleared, a page half drained into the others, a larger table being cleared ahead and one put
 /// in use in the frame whose copy of the old table waits for the next render. After the world's
 /// clear the renderer is a fresh one and B draws as a fresh B; after the chunks' clear every
-/// chunk comes back and draws as a fresh renderer fed them in one frame.
+/// chunk comes back and draws as a fresh renderer fed them in one frame. The table starts at 96
+/// slots: the one asked for ahead (twice the table) is then larger than the one the burst puts
+/// in use at once (the next power of two), so it is still wanted after it.
 #[test]
 fn a_clear_in_the_middle_of_memory_work_is_clean() {
     let mut a = heightfield(0.5);
@@ -1089,7 +1091,8 @@ fn a_clear_in_the_middle_of_memory_work_is_clean() {
     for_every_tier(|gpu, report| {
         for world in [true, false] {
             let run = |report: &mut Report| -> Result<(), String> {
-                let config = growing_config();
+                let mut config = growing_config();
+                config.chunk_memory.initial_slots = 96;
                 let fresh = new_renderer(gpu, &config)?.debug_reset_state();
                 let mut renderer = new_renderer(gpu, &config)?;
                 stream_in(gpu, &mut renderer, &a, I64Vec3::ZERO, 0, 24, &view)?;

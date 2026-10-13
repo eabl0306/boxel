@@ -1769,6 +1769,92 @@ fn chunks_refused_at_the_slot_ceiling_make_no_page() {
     });
 }
 
+/// A table asked for between frames that waits (the one creation of `grow_between_frames` went
+/// to a page) while frames that are not drawn grow the table past it at once: the old request
+/// is never swapped in. It used to be: the two-Prepare fallback built the smaller table, the
+/// next frame swapped it in, and the flush wrote slots past its end (rejected frames, then a
+/// device rebuild).
+#[test]
+fn a_stale_table_request_never_shrinks_the_table() {
+    let registry = boxel_demo::blocks::registry();
+    let mesh = pillars(&registry, 4, "boxel:stone");
+    let cells = grid(100);
+    let view = grid_view();
+    let memory = ChunkMemorySettings {
+        initial_quads: 1 << 14,
+        initial_slots: 8,
+        page_quads: 1 << 14,
+        grow: true,
+        ..ChunkMemorySettings::default()
+    };
+    let wide = ChunkMemorySettings {
+        initial_quads: 1 << 18,
+        initial_slots: 256,
+        grow: false,
+        ..ChunkMemorySettings::default()
+    };
+    let all = upserts(&cells, 0, &mesh);
+    each_tier("stale table", |adapter, caps, tier, report| {
+        let (device, queue, errors) = device_for(adapter, caps, tier)?;
+        let mut reference = renderer(&device, &queue, tier, wide, TranslucentSort::Off)?;
+        let expected = frame(&device, &queue, &mut reference, all.clone(), true, &view)?;
+        let mut paged = renderer(&device, &queue, tier, memory, TranslucentSort::Off)?;
+        // a drawn frame wants a page and a table of 16 slots; the page takes the creation
+        paged.debug_force_page(false);
+        plugin_frame(
+            &device,
+            &queue,
+            &mut paged,
+            all[..4].to_vec(),
+            Resync::Chunks,
+            &view,
+            false,
+        )?;
+        let pages = paged.chunk_memory().pages_created;
+        if pages != 1 {
+            return Err(format!("{pages} pages made between frames"));
+        }
+        // three Prepares with no frame: bursts grow the table to 64, then 128, at once
+        for ops in [all[4..40].to_vec(), all[40..].to_vec(), Vec::new()] {
+            if let Some(e) = paged.apply_ops(&device, ops, Resync::None).first() {
+                return Err(format!("refused: {e}"));
+            }
+        }
+        let mut image = None;
+        for _ in 0..3 {
+            let (i, _) = plugin_frame(
+                &device,
+                &queue,
+                &mut paged,
+                Vec::new(),
+                Resync::None,
+                &view,
+                true,
+            )?;
+            image = i;
+        }
+        let stats = paged.chunk_memory();
+        if stats.table_slots < 128 {
+            return Err(format!("the table shrank: {stats:?}"));
+        }
+        let image = image.ok_or("no image")?;
+        let diff = expected.compare(&image, 0);
+        if diff.differing_pixels > 0 {
+            report.fail(
+                format!(
+                    "stale table {tier}: {} pixels differ",
+                    diff.differing_pixels
+                ),
+                &[
+                    ("stale table wide", &expected),
+                    ("stale table paged", &image),
+                ],
+            );
+        }
+        no_errors(&errors)
+    });
+}
+
 /// G7 (faults): uploads lost while a page drains lead to a resync and the right image; a page
 /// that cannot be created leaves chunks waiting, and they come back after the 10 s backoff; a
 /// fresh renderer fed a scene of many pages in one resync frame (what the plugin does after a
