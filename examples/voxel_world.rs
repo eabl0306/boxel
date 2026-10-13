@@ -2896,6 +2896,58 @@ mod tests {
         assert!(camera_at(&mut app).y > before.y + 2.0);
     }
 
+    /// Walking across a world switch (F4): the closed world's body goes with it, no body
+    /// stands in no world, the next world's lands on that world's ground under the camera, and
+    /// G flies again at the speed the camera had before walking.
+    #[test]
+    fn walking_across_a_world_switch_lands_and_flies_again() {
+        use boxel::physics::BodyPosition;
+        use boxel::world::lifecycle::{close_world, finish_closing, open_world};
+        use boxel::worldgen::FlatGenerator;
+        let (mut app, body) = walking_app();
+        assert!(close_world(app.world_mut(), CloseOptions::default()));
+        assert!(finish_closing(app.world_mut(), Duration::from_secs(10)));
+        assert!(app.world().get_entity(body).is_err(), "gone with its world");
+        for _ in 0..5 {
+            app.update();
+        }
+        assert!(
+            walker(&mut app).is_none(),
+            "it waits for the next world's ground"
+        );
+        // The next world's grass is a block higher (top at y = 5): below the camera's eye, but
+        // over the closed world's feet.
+        let settings = app.world().resource::<WorldSettings>().clone();
+        let higher = FlatGenerator::new(vec![
+            ("boxel:stone".to_string(), 4),
+            ("boxel:grass".to_string(), 1),
+        ]);
+        open_world(app.world_mut(), WorldSpec::new(Arc::new(higher), settings)).expect("opens");
+        for _ in 0..64 {
+            app.update();
+        }
+        let body = walker(&mut app).expect("walking in the next world");
+        let feet = app.world().get::<BodyPosition>(body).expect("body").0;
+        assert_eq!(feet, WorldPos::from_dvec3(DVec3::new(0.5, 5.0, 0.5)));
+
+        // G: flying at the speed from before walking (Space flies the camera up).
+        tap(&mut app, player::WALK_KEY);
+        assert!(walker(&mut app).is_none());
+        let speed = app
+            .world_mut()
+            .query::<&FlyCamera>()
+            .single(app.world())
+            .expect("camera")
+            .speed;
+        assert_eq!(speed, FlyCamera::default().speed);
+        let before = camera_at(&mut app);
+        key(&mut app, KeyCode::Space, true);
+        for _ in 0..10 {
+            app.update();
+        }
+        assert!(camera_at(&mut app).y > before.y + 2.0);
+    }
+
     #[test]
     fn the_targeted_block_is_outlined() {
         let mut app = picking_app();

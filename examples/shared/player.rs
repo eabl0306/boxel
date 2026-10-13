@@ -275,7 +275,7 @@ pub fn player_body(feet: WorldPos) -> impl Bundle {
 /// camera takes input); then the player body is spawned under the active camera's eye, or
 /// removed. The camera's fly speed is 0 while
 /// walking. With [`Walking::land`] the player waits for the ground under the camera to load and
-/// stands on it.
+/// stands on it. A body gone while walking went with its world: the next world's lands.
 pub fn switch_mode(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
@@ -295,6 +295,11 @@ pub fn switch_mode(
     }
     match (walking.on, players.iter().next()) {
         (true, None) => {
+            if walking.fly_speed.is_some() {
+                // The closed world's body (`WorldScoped`): the camera's height says nothing of
+                // the next world's ground, and its fly speed is the one kept already.
+                walking.land = true;
+            }
             let eye = WorldPos::from_dvec3(eye.translation);
             let below_eye = eye.offset(DVec3::new(0.0, -EYE_HEIGHT, 0.0));
             let feet = if walking.land {
@@ -310,7 +315,7 @@ pub fn switch_mode(
             };
             walking.land = false;
             commands.spawn(player_body(feet));
-            walking.fly_speed = Some(fly.speed);
+            walking.fly_speed.get_or_insert(fly.speed);
             fly.speed = 0.0;
         }
         (false, Some(player)) => {
