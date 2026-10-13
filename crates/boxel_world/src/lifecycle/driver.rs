@@ -561,9 +561,12 @@ fn finish(world: &mut World, closing: ClosingWorld) {
     }
     let epoch = closing.epoch;
     let mut lifecycle = world.resource_mut::<WorldLifecycle>();
-    lifecycle
-        .closed_backends
-        .retain(|(b, _)| b.strong_count() > 0);
+    // One entry per live backend: this close's count is the highest, so it replaces the entry
+    // of an earlier close on the same backend (a store reopened on it over and over would grow
+    // the list otherwise).
+    lifecycle.closed_backends.retain(|(b, _)| {
+        b.strong_count() > 0 && closing.backend.as_ref().is_none_or(|c| !Weak::ptr_eq(b, c))
+    });
     if let Some(backend) = closing.backend {
         lifecycle.closed_backends.push((backend, openings()));
     }

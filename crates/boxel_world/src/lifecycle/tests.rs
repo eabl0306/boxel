@@ -319,3 +319,30 @@ fn the_save_state_is_idle_once_written() {
     p.poll(now, Duration::from_secs(1));
     assert!(p.idle());
 }
+
+/// A store reopened on the same backend world after world keeps one entry of it in the closed
+/// backends (the newest close's count), and a store opened before the newest close is still
+/// refused.
+#[test]
+fn a_backend_closed_again_and_again_is_remembered_once() {
+    let mut app = app(Arc::new(InlineExecutor), None);
+    let backend = Arc::new(MemoryStore::new());
+    for _ in 0..5 {
+        open(&mut app, spec(0).with_store(store(&backend)));
+        settle(&mut app);
+        assert!(close_world(app.world_mut(), CloseOptions::default()));
+        assert_eq!(
+            app.world().resource::<super::WorldLifecycle>().status(),
+            WorldStatus::Closed
+        );
+    }
+    let early = store(&backend);
+    open(&mut app, spec(0).with_store(store(&backend)));
+    assert!(close_world(app.world_mut(), CloseOptions::default()));
+    let lifecycle = app.world().resource::<super::WorldLifecycle>();
+    assert_eq!(lifecycle.closed_backends.len(), 1);
+    assert_eq!(
+        open_world(app.world_mut(), spec(0).with_store(early)),
+        Err(super::OpenWorldError::StoreOpenedEarly)
+    );
+}

@@ -496,6 +496,12 @@ impl ChunkMap {
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
+    /// Slots the map has room for without growing. It never shrinks: it keeps the most slots a
+    /// world of this app used at once (a world's close drains the slots in place, so ids never
+    /// repeat), and only a bigger world grows it.
+    pub fn slot_capacity(&self) -> usize {
+        self.slots.capacity()
+    }
     /// All slots.
     pub fn iter(&self) -> impl Iterator<Item = (ChunkId, &ChunkSlot)> {
         self.slots.iter()
