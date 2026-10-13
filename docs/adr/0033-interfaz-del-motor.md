@@ -130,8 +130,8 @@ el pase (E-UI2) y llega antes de los menús, así que no hay puente.
 - `text_field` lee `TextInput`, así que escribe acentos, ñ y lo que confirma un IME, que se ve
   subrayado en el cursor mientras se compone. Tiene cursor, selección con Shift, con el mouse y
   arrastrando, Ctrl para saltar palabras, Ctrl+A, un máximo de caracteres y un texto de ayuda
-  cuando está vacío. Enter da `submitted`. La interfaz prende el IME solo mientras un campo
-  tiene el foco.
+  cuando está vacío. Enter da `submitted` una sola vez aunque se mantenga, como un botón. La
+  interfaz prende el IME solo mientras un campo tiene el foco.
 - Las teclas de navegación llegan por `KeyboardInput` y el texto por `TextInput`, dos colas
   separadas. La interfaz las alinea con las teclas que van en las dos (Tab, flechas y Enter):
   "ab", Tab y "12" en un mismo frame terminan en los dos campos correctos. Una de esas teclas

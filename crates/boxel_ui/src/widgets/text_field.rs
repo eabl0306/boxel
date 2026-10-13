@@ -187,9 +187,10 @@ impl<'a> Painter<'a> {
     /// `TextInput`: typed text (accents, dead keys and input method commits included) replaces
     /// the selection, and the keys: Left, Right, Home and End move the caret (Shift selects,
     /// Ctrl jumps words), Backspace and Delete erase (Ctrl a word; held, they repeat), Ctrl+A
-    /// selects everything, Enter reports `submitted`. Space types; Escape stays the game's. An
-    /// input method's composition shows at the caret, and the UI turns the input method on
-    /// (`ImeOptions`) while a field has the focus, with the caret's place for its window.
+    /// selects everything, Enter reports `submitted` (once while held). Space types; Escape stays
+    /// the game's. An input method's composition shows at the caret, and the UI turns the input
+    /// method on (`ImeOptions`) while a field has the focus, with the caret's place for its
+    /// window.
     ///
     /// The caret blinks every [`CARET_BLINK`] of real time (always shown without a `Time`
     /// resource). A text wider than the field scrolls to keep it in view.
@@ -238,7 +239,10 @@ impl<'a> Painter<'a> {
             }
             match event {
                 TextInput::Text(text) => edit.insert(text),
-                TextInput::Key { key, .. } => submitted |= edit.key(*key, mem.shift, mem.ctrl),
+                // Enter submits on its press, not on the OS repeats of a held Enter.
+                TextInput::Key { key, repeat } => {
+                    submitted |= edit.key(*key, mem.shift, mem.ctrl) && !repeat;
+                }
             }
         }
         let preedit = if it.focused {

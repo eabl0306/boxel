@@ -661,6 +661,17 @@ fn editing_keys_move_the_caret_select_and_erase_with_repeat() {
     t.tap(KeyCode::Enter);
     assert_eq!(form_of(&t).submitted, ["name"]);
     assert_eq!(t.focused().as_deref(), Some("test:name"));
+    // Held, it submits once, as a held Enter activates a button once: its OS repeats do not.
+    t.key(KeyCode::Enter, ButtonState::Pressed, false)
+        .frame()
+        .key(KeyCode::Enter, ButtonState::Pressed, true)
+        .frame()
+        .key(KeyCode::Enter, ButtonState::Pressed, true)
+        .key(KeyCode::Enter, ButtonState::Pressed, true)
+        .frame()
+        .key(KeyCode::Enter, ButtonState::Released, false)
+        .frame();
+    assert_eq!(form_of(&t).submitted, ["name", "name"]);
 }
 
 #[test]
