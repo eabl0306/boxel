@@ -4,6 +4,8 @@ use super::format::{
     self, FORMAT_VERSION, FormatError, IdMap, decode_chunk, decode_clock, decode_names,
     decode_ticks, encode_chunk, encode_names, open_entity, seal_entity,
 };
+use super::saver::{SavedIndex, saved_index};
+use crate::lod::LodSeed;
 use boxel_ecs::prelude::*;
 use boxel_voxel::{BlockPos, BlockRegistry, ChunkData, ChunkKey};
 use std::collections::HashMap;
@@ -170,7 +172,10 @@ type PendingEntities = HashMap<
 /// index), the pending ticks and the clock.
 #[derive(Debug, Default)]
 pub(crate) struct Opened {
-    pub(crate) keys: Vec<ChunkKey>,
+    /// The saved layers of each chunk column.
+    pub(crate) saved: SavedIndex,
+    /// The far LOD's index of the same chunks.
+    pub(crate) lod: LodSeed,
     pub(crate) ticks: Option<Vec<(BlockPos, u64)>>,
     pub(crate) clock: Option<u64>,
     /// Every saved entity: the chunk whose record holds it and its saved id.
@@ -247,8 +252,10 @@ impl WorldStore {
     /// world made with another one opens with a warning (chunks that were not saved come from
     /// the new generator).
     ///
-    /// Reads the version, the id map and the index of saved chunks (every key, once). A world
-    /// with another format version or a damaged id map is an error and is not touched; damaged
+    /// Reads the version, the id map and the index of saved chunks (every key, once), and
+    /// builds from it what the world's save state and its far LOD start with, so the world's
+    /// open does not walk the saved chunks on the main thread (call this off it). A world with
+    /// another format version or a damaged id map is an error and is not touched; damaged
     /// pending ticks or clock only warn (they are lost).
     pub fn open(
         backend: Arc<dyn ChunkStore>,
@@ -347,6 +354,11 @@ impl WorldStore {
             .max()
             .unwrap_or(1)
             .max(1);
+        // The indexes the world's save state and its far LOD start from: built here, where a
+        // game opens its store off the main thread, they cost the open no walk of the saved
+        // chunks there.
+        let saved = saved_index(keys);
+        let lod = LodSeed::of(&saved);
         Ok(Self {
             inner: Arc::new(Inner {
                 backend,
@@ -362,7 +374,8 @@ impl WorldStore {
                 loaded_entities: AtomicUsize::new(0),
                 entity_errors: AtomicUsize::new(0),
                 opened: Mutex::new(Some(Opened {
-                    keys,
+                    saved,
+                    lod,
                     ticks,
                     clock,
                     entities,

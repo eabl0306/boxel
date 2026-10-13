@@ -77,6 +77,7 @@ pub use coverage::{
 };
 pub use plan::{KeepExtent, MAX_LEVELS, Thresholds, node_edge, world_limit};
 
+pub(crate) use edits::LodSeed;
 use edits::{ChunkSource, Edits, ForColumn};
 use fallback::FallbackInput;
 use jobs::{JobInput, LodJobs, LodMessage};
@@ -703,30 +704,23 @@ impl LodWorld {
     }
 
     /// A world opened: its store (edited chunks unloaded since are read from it), its saved
-    /// chunks as edits (their cells come from their blocks) and its epoch.
+    /// chunks as edits (their cells come from their blocks), taken whole from the `seed` the
+    /// store built when it opened, and its epoch.
     pub(crate) fn open_world(
         &mut self,
         store: Option<WorldStore>,
-        persist: Option<&crate::persist::Persist>,
+        seed: Option<LodSeed>,
         epoch: u64,
     ) {
         self.store = store;
         self.epoch = epoch;
-        let Some(persist) = persist else {
+        let Some(seed) = seed else {
             return;
         };
         if std::mem::replace(&mut self.edits.seeded, true) {
             return;
         }
-        for (dim, x, z) in persist.saved_columns() {
-            for &y in persist.layers(dim, x, z) {
-                self.edits.insert(ChunkKey {
-                    dim,
-                    lod: 0,
-                    pos: ChunkPos::new(x, y, z),
-                });
-            }
-        }
+        self.edits.seed(seed);
     }
 
     /// The store the LOD reads (tests).

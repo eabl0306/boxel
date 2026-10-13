@@ -206,9 +206,11 @@ pub struct CloseReport {
 pub struct OpenReport {
     /// The whole open on the main thread ([`WorldOpen`] included).
     pub took: Duration,
-    /// Of it, the save state built from the store: the index of its saved chunks and entities.
+    /// Of it, the save state made from what the store read when it opened: its saved entities
+    /// are indexed here, its saved chunks come indexed ([`WorldStore::open`]).
     pub saved_index: Duration,
-    /// Of it, the far LOD's saved chunks seeded as edits (zero without the far LOD).
+    /// Of it, the far LOD taking its edits, the saved chunks the store indexed for it (zero
+    /// without the far LOD).
     pub lod_seed: Duration,
     /// Chunks saved in the store when it opened.
     pub saved_chunks: usize,

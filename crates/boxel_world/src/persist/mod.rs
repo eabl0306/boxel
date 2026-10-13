@@ -57,7 +57,9 @@ pub use entities::{EntityCodec, EntityCodecs, Saved, SavedId, SavedIds, add_enti
 pub use format::{EntityPart, FORMAT_VERSION, FormatError, IdMap};
 pub(crate) use plugin::{PersistExecutor, close_store_on_exit};
 pub use plugin::{PersistPlugin, PersistSettings};
-pub(crate) use saver::Persist;
+#[cfg(test)]
+pub(crate) use saver::saved_index;
+pub(crate) use saver::{Persist, SavedIndex};
 pub use store::{PersistError, PersistStats, WORLD_FILE, WorldStore};
 pub(crate) use store::{WeakStore, openings};
 

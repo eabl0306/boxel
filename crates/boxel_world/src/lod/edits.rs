@@ -402,6 +402,54 @@ pub(crate) enum ForColumn {
     Wait,
 }
 
+/// The far LOD's view of a world's saved chunks: the edited set and its index by node, as
+/// [`Edits::insert`] builds them. [`WorldStore::open`] builds it with the store's own index of
+/// the saved chunks (off the main thread in a game), and the far LOD takes it whole when the
+/// world opens ([`Edits::seed`]): a big saved world costs the open no walk on the main thread.
+#[derive(Debug, Default)]
+pub(crate) struct LodSeed {
+    edited: HashSet<ChunkKey>,
+    index: HashMap<(u8, i64, i64), Vec<ChunkKey>>,
+}
+
+impl LodSeed {
+    /// The chunks of `saved` (the saved layers of each column).
+    pub(crate) fn of(saved: &crate::persist::SavedIndex) -> Self {
+        let mut seed = Self::default();
+        for (&(dim, x, z), layers) in saved {
+            for &y in layers {
+                let key = ChunkKey {
+                    dim,
+                    lod: 0,
+                    pos: ChunkPos::new(x, y, z),
+                };
+                if seed.edited.insert(key) {
+                    index_chunk(&mut seed.index, key);
+                }
+            }
+        }
+        seed
+    }
+
+    /// Chunks in it.
+    pub(crate) fn len(&self) -> usize {
+        self.edited.len()
+    }
+}
+
+/// Lists `key` under every node, at levels 1 to [`PYRAMID_LEVELS`], that its padded cells reach.
+fn index_chunk(index: &mut HashMap<(u8, i64, i64), Vec<ChunkKey>>, key: ChunkKey) {
+    for level in 1..=PYRAMID_LEVELS {
+        let (x0, x1) = nodes_touching(key.pos.x, level);
+        let (z0, z1) = nodes_touching(key.pos.z, level);
+        for x in x0..=x1 {
+            for z in z0..=z1 {
+                index.entry((level, x, z)).or_default().push(key);
+            }
+        }
+    }
+}
+
 /// The edited chunks and their pyramids (module docs).
 #[derive(Debug)]
 pub(crate) struct Edits {
@@ -491,14 +539,28 @@ impl Edits {
             self.above.insert(key);
             self.above_changed = true;
         }
-        for level in 1..=PYRAMID_LEVELS {
-            let (x0, x1) = nodes_touching(key.pos.x, level);
-            let (z0, z1) = nodes_touching(key.pos.z, level);
-            for x in x0..=x1 {
-                for z in z0..=z1 {
-                    self.index.entry((level, x, z)).or_default().push(key);
-                }
+        index_chunk(&mut self.index, key);
+    }
+
+    /// Adds the chunks of `seed` to the edited set, as [`Edits::insert`] of each would: taken
+    /// whole when the set is empty (a world's open), no walk of them.
+    pub(crate) fn seed(&mut self, seed: LodSeed) {
+        if !self.edited.is_empty() {
+            for key in seed.edited {
+                self.insert(key);
             }
+            return;
+        }
+        self.edited = seed.edited;
+        self.index = seed.index;
+        if let Some(top) = self.top {
+            self.above = self
+                .edited
+                .iter()
+                .filter(|k| k.pos.y > top)
+                .copied()
+                .collect();
+            self.above_changed |= !self.above.is_empty();
         }
     }
 
@@ -751,5 +813,78 @@ impl Edits {
     #[cfg(test)]
     pub(crate) fn evict_all(&mut self) {
         self.cache = Cache::default();
+    }
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+    use crate::persist::saved_index;
+    use boxel_voxel::DimensionId;
+    use std::collections::BTreeMap;
+
+    fn key(x: i64, y: i64, z: i64) -> ChunkKey {
+        ChunkKey {
+            dim: DimensionId(0),
+            lod: 0,
+            pos: ChunkPos::new(x, y, z),
+        }
+    }
+
+    /// Saved chunks far from the origin, a column with several layers, neighbors sharing nodes,
+    /// one chunk twice and two above a top of 3.
+    fn saved() -> Vec<ChunkKey> {
+        let far = 1 << 35;
+        vec![
+            key(far, 0, -far),
+            key(far, 2, -far),
+            key(far, 5, -far),
+            key(far + 1, 0, -far),
+            key(far + 1, 0, -far - 1),
+            key(-far, -4, far),
+            key(-far, 9, far),
+            key(far, 0, -far),
+        ]
+    }
+
+    fn sorted(edits: &Edits) -> BTreeMap<(u8, i64, i64), Vec<(i64, i64, i64)>> {
+        edits
+            .index
+            .iter()
+            .map(|(&node, keys)| {
+                let mut keys: Vec<_> = keys.iter().map(|k| (k.pos.x, k.pos.y, k.pos.z)).collect();
+                keys.sort_unstable();
+                (node, keys)
+            })
+            .collect()
+    }
+
+    /// A seed the store built gives the edited set, the node index and the chunks above the
+    /// generator's top that inserting the saved chunks one by one gives; a set with edits
+    /// already gets them one by one.
+    #[test]
+    fn a_seed_equals_the_saved_chunks_inserted_one_by_one() {
+        for top in [None, Some(3)] {
+            let mut one_by_one = Edits::new(4);
+            one_by_one.set_top(top);
+            for key in saved() {
+                one_by_one.insert(key);
+            }
+            let mut seeded = Edits::new(4);
+            seeded.set_top(top);
+            let seed = LodSeed::of(&saved_index(saved()));
+            assert_eq!(seed.len(), 7);
+            seeded.seed(seed);
+            assert_eq!(seeded.edited, one_by_one.edited);
+            assert_eq!(sorted(&seeded), sorted(&one_by_one));
+            assert_eq!(seeded.above, one_by_one.above);
+            assert_eq!(seeded.above.len(), if top.is_some() { 2 } else { 0 });
+            assert_eq!(seeded.take_above_changed(), one_by_one.take_above_changed());
+        }
+        let mut edited = Edits::new(4);
+        edited.insert(key(7, 7, 7));
+        edited.seed(LodSeed::of(&saved_index(saved())));
+        assert_eq!(edited.len(), 8);
+        assert!(edited.index.values().flatten().any(|k| k.pos.x == 7));
     }
 }

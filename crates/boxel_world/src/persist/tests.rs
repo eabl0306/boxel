@@ -1132,8 +1132,22 @@ fn an_opening_is_numbered_before_it_reads_its_index() {
     let later = open(&backend);
     gate.open();
     let early = early.join().unwrap();
-    assert!(!early.take_opened().unwrap().keys.contains(&edited));
-    assert!(later.take_opened().unwrap().keys.contains(&edited));
+    let has_edited = |store: &WorldStore| {
+        let opened = store.take_opened().unwrap();
+        let column = (edited.dim, edited.pos.x, edited.pos.z);
+        let saved = opened
+            .saved
+            .get(&column)
+            .is_some_and(|l| l.contains(&edited.pos.y));
+        assert_eq!(
+            opened.lod.len(),
+            usize::from(saved),
+            "the far LOD's index agrees"
+        );
+        saved
+    };
+    assert!(!has_edited(&early));
+    assert!(has_edited(&later));
     assert!(
         early.opened_seq() < later.opened_seq(),
         "the opening with the stale index comes first"

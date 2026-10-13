@@ -312,6 +312,16 @@ pub fn open_world(world: &mut World, spec: WorldSpec) -> Result<WorldEpoch, Open
     if let Some(ctx) = world.remove_resource::<OpenContext>() {
         report.lod_seed = ctx.lod_seed;
     }
+    // Without the far LOD nobody took its index of the saved chunks: dropped off the main
+    // thread (it is as big as the saved world).
+    let unused = world
+        .resource_mut::<WorldJobs>()
+        .persist
+        .as_mut()
+        .and_then(|p| p.lod_seed.take());
+    if let Some(seed) = unused.filter(|s| s.len() > 0) {
+        io_executor(world).spawn(Box::new(move || drop(seed)));
+    }
     world.write_message(WorldEvent::Opened { epoch });
     report.took = started.elapsed();
     world.resource_mut::<WorldLifecycle>().last_open = Some(report);
@@ -332,7 +342,7 @@ pub(crate) fn open_engine_state(
     lod: Option<ResMut<LodWorld>>,
     feedback: Option<ResMut<LodFeedback>>,
     mut edits: ResMut<EditQueue>,
-    jobs: Res<WorldJobs>,
+    mut jobs: ResMut<WorldJobs>,
     store: Option<Res<WorldStore>>,
 ) {
     if let (Some(mut ticks), Some(saved)) = (ticks, ctx.ticks.take()) {
@@ -346,7 +356,7 @@ pub(crate) fn open_engine_state(
         let seed = Instant::now();
         lod.open_world(
             store.as_deref().cloned(),
-            jobs.persist.as_ref(),
+            jobs.persist.as_mut().and_then(|p| p.lod_seed.take()),
             ctx.epoch.get(),
         );
         ctx.lod_seed = seed.elapsed();

@@ -4,6 +4,7 @@
 use super::entities::EntityIndex;
 use super::store::{EntityWrite, META_ENTITIES, MetaValue, WorldStore, entities_meta};
 use crate::jobs::JobExecutor;
+use crate::lod::LodSeed;
 use crate::{ChunkId, ChunkMap, DataState};
 use boxel_voxel::{BlockPos, ChunkData, ChunkKey, ChunkPos, DimensionId, MAX_CHUNK_COORD};
 use crossbeam_channel::{Receiver, Sender};
@@ -14,6 +15,32 @@ use std::time::{Duration, Instant};
 
 /// A chunk column of the index: dimension and chunk x, z.
 pub(crate) type ColumnKey = (DimensionId, i64, i64);
+
+/// The saved layers of each chunk column, ascending ([`saved_index`]).
+pub(crate) type SavedIndex = HashMap<ColumnKey, Vec<i64>, foldhash::fast::FixedState>;
+
+/// The saved layers of each column of `keys`, ascending, without the chunks the world never
+/// streams (past its limit, ADR 0014, or of another lod). [`WorldStore::open`] builds it, off the
+/// main thread in a game: a big saved world opens without walking its chunks there.
+pub(crate) fn saved_index(keys: Vec<ChunkKey>) -> SavedIndex {
+    let mut saved = SavedIndex::default();
+    let inside = |c: i64| (-MAX_CHUNK_COORD..=MAX_CHUNK_COORD).contains(&c);
+    for key in keys {
+        if key.lod != 0 || ![key.pos.x, key.pos.y, key.pos.z].into_iter().all(inside) {
+            tracing::warn!(?key, "a saved chunk outside the world is ignored");
+            continue;
+        }
+        saved
+            .entry((key.dim, key.pos.x, key.pos.z))
+            .or_default()
+            .push(key.pos.y);
+    }
+    for layers in saved.values_mut() {
+        layers.sort_unstable();
+        layers.dedup();
+    }
+    saved
+}
 
 /// What a save job sends back (exactly once: see [`ReportGuard`]).
 struct SaveReport {
@@ -80,7 +107,7 @@ pub(crate) struct Persist {
     pub(crate) store: WorldStore,
     executor: Arc<dyn JobExecutor>,
     /// Saved (or staged) layers of each chunk column, ascending.
-    saved: HashMap<ColumnKey, Vec<i64>, foldhash::fast::FixedState>,
+    saved: SavedIndex,
     /// Staged chunks waiting for a save job, oldest first, and the same keys as a set.
     queue: VecDeque<ChunkKey>,
     queued: HashSet<ChunkKey, foldhash::fast::FixedState>,
@@ -116,6 +143,9 @@ pub(crate) struct Persist {
     pub(crate) save_requested: bool,
     /// The error of the last save, while saves fail.
     last_error: Option<String>,
+    /// The far LOD's index of the saved chunks, built with the store's (`WorldStore::open`),
+    /// until the far LOD takes it at the open.
+    pub(crate) lod_seed: Option<LodSeed>,
 }
 
 impl Persist {
@@ -130,29 +160,12 @@ impl Persist {
             "a WorldStore serves one PersistPlugin: open the world again (WorldStore::open) for \
              a new App",
         );
-        let mut saved: HashMap<ColumnKey, Vec<i64>, _> = HashMap::default();
-        let inside = |c: i64| (-MAX_CHUNK_COORD..=MAX_CHUNK_COORD).contains(&c);
-        for key in opened.keys {
-            // The world never streams chunks past its limit (ADR 0014) or of another lod.
-            if key.lod != 0 || ![key.pos.x, key.pos.y, key.pos.z].into_iter().all(inside) {
-                tracing::warn!(?key, "a saved chunk outside the world is ignored");
-                continue;
-            }
-            saved
-                .entry((key.dim, key.pos.x, key.pos.z))
-                .or_default()
-                .push(key.pos.y);
-        }
-        for layers in saved.values_mut() {
-            layers.sort_unstable();
-            layers.dedup();
-        }
         let entities = EntityIndex::new(opened.entities, opened.next_entity);
         let (tx, rx) = crossbeam_channel::unbounded();
         Self {
             store,
             executor,
-            saved,
+            saved: opened.saved,
             queue: VecDeque::new(),
             queued: HashSet::default(),
             meta: Vec::new(),
@@ -169,6 +182,7 @@ impl Persist {
             moment: Moment::None,
             save_requested: false,
             last_error: None,
+            lod_seed: Some(opened.lod),
         }
     }
 
@@ -237,12 +251,6 @@ impl Persist {
     /// The saved layers of chunk column `(x, z)` of `dim`, ascending.
     pub(crate) fn layers(&self, dim: DimensionId, x: i64, z: i64) -> &[i64] {
         self.saved.get(&(dim, x, z)).map_or(&[], Vec::as_slice)
-    }
-
-    /// Every saved (or staged) chunk column, in no order: with [`Persist::layers`] the far LOD
-    /// lists the saved chunks, whose cells it builds from their blocks (ADR 0031).
-    pub(crate) fn saved_columns(&self) -> impl Iterator<Item = ColumnKey> + '_ {
-        self.saved.keys().copied()
     }
 
     /// Chunks staged and not handed to a save job yet.
