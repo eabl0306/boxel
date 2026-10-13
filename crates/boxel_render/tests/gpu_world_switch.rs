@@ -32,7 +32,7 @@
 //!   with water and an animated pack texture in view, at the origin and 2^40 away.
 //! - **26 LOD and fog (every tier but GL, where the LOD stays off):** the LOD arena is empty
 //!   after a close, and B after A draws its LOD and the fog layers as a fresh B does (the fog
-//!   clock starts again at 0).
+//!   clock, tick and subtick, starts again at 0).
 //! - **27 Same-frame switch:** a close and an open in one frame give test 25's image.
 //!
 //! The cameras are placed so no two translucent chunk centers are equidistant (until #57 breaks
@@ -51,7 +51,7 @@ use boxel_gfx::{
 };
 use boxel_math::{DVec3, I64Vec3, IVec3, UVec2};
 use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher};
-use boxel_render::fog::{FogClock, FogInput, FogPlugin, FogSettings};
+use boxel_render::fog::{FogClock, FogInput, FogPlugin, FogSettings, FogTime};
 use boxel_render::lod::{LodInput, LodSettings};
 use boxel_render::{
     BlockTextureData, PackSource, RenderSettings, RendererConfig, ResetState, Resync, SceneLight,
@@ -1410,12 +1410,12 @@ struct Captured {
 }
 
 /// Replays `frames` on a fresh renderer as the render plugin's `extract_visibility` and
-/// `prepare` run them, with the fog clock at `fog_tick` if given. No chunk may be refused: the
+/// `prepare` run them, with the fog clock at `fog_time` if given. No chunk may be refused: the
 /// recorded cave culling sets never heard of a refusal.
 fn replay(
     gpu: &Gpu<'_>,
     frames: &[Frame],
-    fog_tick: Option<u64>,
+    fog_time: Option<FogTime>,
 ) -> Result<HashMap<&'static str, Captured>, String> {
     let mut renderer = new_renderer(gpu, &config())?;
     let mut out = HashMap::new();
@@ -1435,11 +1435,8 @@ fn replay(
             Resync::World => renderer.clear_world(gpu.device),
         }
         renderer.set_visibility(frame.visibility.clone());
-        let fog = frame.fog.clone().map(|fog| match fog_tick {
-            Some(tick) => FogInput {
-                time: tick.into(),
-                ..fog
-            },
+        let fog = frame.fog.clone().map(|fog| match fog_time {
+            Some(time) => FogInput { time, ..fog },
             None => fog,
         });
         renderer.set_fog(gpu.device, fog);
@@ -1725,6 +1722,9 @@ fn a_close_and_an_open_in_one_frame_draw_as_a_fresh_world() {
     .finish();
 }
 
+/// World A's fog clock in the forests: well past B's start and between two ticks.
+const A_FOG_TIME: FogTime = FogTime::new(5000, 0x8000);
+
 /// The recordings of the forests with their far LOD and the demo's valley fog.
 struct Forests {
     /// A (its fog clock moved on), its close (`closed`, `still_closed`), B.
@@ -1753,23 +1753,28 @@ fn forests() -> &'static Forests {
         let mut switched = recorder();
         switched.lifecycle().request_open(spec(a(), clock_a));
         switched.frame(None);
-        // A's fog has blown for a while.
-        switched.app.world_mut().resource_mut::<FogClock>().tick = 5000;
+        // A's fog has blown for a while and stopped half a tick on, paused as a screenshot pauses
+        // it (a running clock rewrites the subtick every frame, so only a paused one could carry
+        // A's subtick into B).
+        *switched.app.world_mut().resource_mut::<FogClock>() = FogClock {
+            tick: A_FOG_TIME.tick,
+            subtick: A_FOG_TIME.subtick,
+            paused: true,
+        };
         switched.settle("a");
         switched.close("closed");
         switched.frame(Some("still_closed"));
         switched.open(spec(b(), clock_b), "b");
-        let fog_tick = |name| {
+        let fog_time = |name| {
             captured_frame(&switched.frames, name)
                 .fog
                 .as_ref()
                 .expect("fog")
                 .time
-                .tick
         };
         assert_eq!(
-            (fog_tick("a"), fog_tick("b")),
-            (5000, 0),
+            (fog_time("a"), fog_time("b")),
+            (A_FOG_TIME, FogTime::new(0, 0)),
             "the fog clock of each world"
         );
 
@@ -1785,7 +1790,7 @@ fn forests() -> &'static Forests {
 /// Test 26, on every tier but GL (where the LOD stays off; Low draws it as Mid does): the LOD
 /// arena is empty from the frame of a close on, as a renderer that never had a world draws it;
 /// B after A then draws its LOD, with no horizon of A left, and the fog layers as a fresh B (the
-/// fog clock is the open's).
+/// fog clock, tick and subtick, is the open's).
 #[test]
 fn the_lod_and_the_fog_start_again_with_the_next_world() {
     let forests = forests();
@@ -1808,7 +1813,7 @@ fn the_lod_and_the_fog_start_again_with_the_next_world() {
                 )
             });
             // The control: B with A's fog clock looks otherwise.
-            let blown = replay(gpu, &forests.fresh, Some(5000))?;
+            let blown = replay(gpu, &forests.fresh, Some(A_FOG_TIME))?;
             let moved = blown["b"].image.compare(&b.image, 2).fraction();
             report.check(moved > 0.002, || {
                 format!(
