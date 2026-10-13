@@ -30,8 +30,9 @@
 //!   draws it, with no chunk left and a fresh renderer's reset state.
 //! - **25 Switch image:** B after A, settled, matches a fresh B on each tier and across tiers,
 //!   with water and an animated pack texture in view, at the origin and 2^40 away.
-//! - **26 LOD and fog (High and Mid):** the LOD arena is empty after a close, and B after A
-//!   draws its LOD and the fog layers as a fresh B does (the fog clock starts again at 0).
+//! - **26 LOD and fog (every tier but GL, where the LOD stays off):** the LOD arena is empty
+//!   after a close, and B after A draws its LOD and the fog layers as a fresh B does (the fog
+//!   clock starts again at 0).
 //! - **27 Same-frame switch:** a close and an open in one frame give test 25's image.
 //!
 //! The cameras are placed so no two translucent chunk centers are equidistant (until #57 breaks
@@ -1781,14 +1782,15 @@ fn forests() -> &'static Forests {
     })
 }
 
-/// Test 26, on High and Mid (Low and GL draw no LOD): the LOD arena is empty from the frame of a
-/// close on, as a renderer that never had a world draws it; B after A then draws its LOD, with no
-/// horizon of A left, and the fog layers as a fresh B (the fog clock is the open's).
+/// Test 26, on every tier but GL (where the LOD stays off; Low draws it as Mid does): the LOD
+/// arena is empty from the frame of a close on, as a renderer that never had a world draws it;
+/// B after A then draws its LOD, with no horizon of A left, and the fog layers as a fresh B (the
+/// fog clock is the open's).
 #[test]
 fn the_lod_and_the_fog_start_again_with_the_next_world() {
     let forests = forests();
     for_every_tier(|gpu, report| {
-        if gpu.tier == Tier::Low || gpu.gl() {
+        if gpu.gl() {
             return;
         }
         let run = |report: &mut Report| -> Result<(), String> {
