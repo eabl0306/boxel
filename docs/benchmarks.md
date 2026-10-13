@@ -234,6 +234,15 @@ La vuelta al piso no entra en el smoke (el caso `grow` ya fija `--radius-steps`)
 `--radius-steps 8,32@1,8@20 --chunk-memory grow --arena-quads 8388608 --chunk-slots 32768`. Encoger
 suelta una página cada 5 s como mucho, así que hace falta `--duration 80` para verlo terminar.
 
+Cambiar de mundo (ADR 0034) se mira con `just bench-switch`, los argumentos de la superficie y los
+de la GPU, `--duration 210` para diez cambios. Por cada cambio imprime el frame del cierre, los
+frames cerrando, el tiempo hasta `Closed`, el frame de la apertura, cuánto tarda en asentarse el
+mundo nuevo y la memoria residente. Al final da el p99 y el máximo de los frames fuera de las dos
+pausas declaradas de cada cambio. El caso `switch` de `tools/perf` cambia cada 4 s, así un smoke de
+10 s ve dos. Sin ventana, `headless_world --reopen` guarda el mundo con un bloque cambiado en cada
+chunk con bloques, lo cierra, lo abre otra vez desde su store e imprime los tiempos del cierre y
+de la apertura.
+
 `--alloc-probe 32,64` es la sonda de páginas (ADR 0035): mientras mide, cada medio segundo crea
 justo después del present un buffer como una página, cuatro de cada tamaño, y al final los
 suelta. Imprime cuánto tardó cada uno, si hizo falta un bloque nuevo de memoria de la GPU y el
@@ -357,6 +366,7 @@ Para que los números sirvan:
 | `dive` | baja en línea recta a velocidad fija | los tirones al entrar capas nuevas por debajo |
 | `spin` | gira 360 grados en su lugar | el costo de que cambie lo que se ve, sin chunks nuevos |
 | `path` | con `--cave`, recorre una cueva ida y vuelta mirando hacia adelante | la ocultación de cuevas mientras se camina bajo tierra |
+| `switch` | vuela como `fly` y cada `--switch-every` segundos (20) cierra el mundo y abre otra semilla | el cambio de mundo sin reiniciar (ADR 0034) |
 
 Todos esperan a que el mundo termine de cargar, corren `--warmup` segundos sin medir y después
 miden `--duration` segundos.

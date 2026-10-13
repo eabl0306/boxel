@@ -2,7 +2,7 @@
 
 Documento técnico de referencia. Fecha: 2026-10-05. Estado: aprobado para el milestone M0
 (revisión final, después de tres revisiones adversariales del borrador v1).
-Las decisiones puntuales están en `docs/adr/` (0001 a 0033). Durante M0 hubo además una
+Las decisiones puntuales están en `docs/adr/` (0001 a 0035). Durante M0 hubo además una
 especificación para los agentes implementadores (en inglés, en `.scaffold/`), borrada al cerrar M0;
 este documento queda como referencia.
 
@@ -159,7 +159,7 @@ Reglas de dependencia (verificadas por el esqueleto que compila):
 | `boxel_mesh` | `PackedQuad`, `ChunkMesh` con su paleta de luz, `PaddedChunk`, `Mesher` (fork de bgm que fusiona por material, AO y luz), mallado de los nodos lejanos (`lod`: materiales, cortes por octante, faldones, paredes, el fondo bajo el agua y las orillas, ADR 0031) | voxel |
 | `boxel_light` | luz de vóxeles en CPU, sin ECS ni GPU (ADR 0015): techos de cielo por columna (`SkyTile`, caminata hacia abajo), luz exacta de un chunk desde una caja de 64³ (cielo y RGB, caminos rápidos para cuevas oscuras y cielo abierto), `PaddedLight`, `ChunkLight`; oráculo global para los tests | voxel |
 | `boxel_worldgen` | trait `WorldGenerator` (con `lod()`, la fuente del terreno lejano: `LodSource`, ADR 0031), `FlatGenerator` y ruido entero exacto 2D y 3D (`hash3`, `fbm_3d`, `fbm_3d_grid`, `splitmix64`, `Frequency`) | voxel |
-| `boxel_world` | `ChunkMap`, ciclo de vida, abrir y cerrar mundos con la app en marcha (`lifecycle`, issue #58), scheduler, jobs, ediciones, mensajes (`ChunkMeshEvent`, `BlockChanged`, `ChunkDataEvent`), guardar y cargar el mundo (`persist`: `ChunkStore`, `RedbStore`, `WorldStore`, `PersistPlugin`, ADR 0024), reloj del mundo (`TimeOfDay`, `DaylightCurve`, `DaylightPlugin`), ticks programados de bloques (`BlockTicks`, `BlockTicksPlugin`), agua y lava que corren y bloques con agua (`FluidPlugin`, ADR 0021 y 0025), las reglas de vecinos (`NeighborRules`, ADR 0020 y 0027), qué hace usar un bloque (`BlockUses`, una puerta que se abre, ADR 0027), la búsqueda de la ocultación de cuevas (`ChunkVisibility`, `visibility`, ADR 0022) y el lado del mundo del LOD lejano (`lod`: `LodWorldPlugin`, planificador, cobertura, trabajos, ADR 0031) | app, voxel, mesh, light, worldgen, transform, diagnostic |
+| `boxel_world` | `ChunkMap`, ciclo de vida, abrir y cerrar mundos con la app en marcha (`lifecycle`: `WorldSpec`, `WorldLifecycle`, `WorldEvent`, `WorldScoped`, ADR 0034), scheduler, jobs, ediciones, mensajes (`ChunkMeshEvent`, `BlockChanged`, `ChunkDataEvent`), guardar y cargar el mundo (`persist`: `ChunkStore`, `RedbStore`, `WorldStore`, `PersistPlugin`, ADR 0024), reloj del mundo (`TimeOfDay`, `DaylightCurve`, `DaylightPlugin`), ticks programados de bloques (`BlockTicks`, `BlockTicksPlugin`), agua y lava que corren y bloques con agua (`FluidPlugin`, ADR 0021 y 0025), las reglas de vecinos (`NeighborRules`, ADR 0020 y 0027), qué hace usar un bloque (`BlockUses`, una puerta que se abre, ADR 0027), la búsqueda de la ocultación de cuevas (`ChunkVisibility`, `visibility`, ADR 0022) y el lado del mundo del LOD lejano (`lod`: `LodWorldPlugin`, planificador, cobertura, trabajos, ADR 0031) | app, voxel, mesh, light, worldgen, transform, diagnostic |
 | `boxel_render` | `VoxelRenderer` (High/Mid/Low), `RenderPlugin`, `SceneLight` (luz del cielo, ambiente y curva de brillo del frame), `PresentSettings` (vsync en tiempo de ejecución), texturas de las imágenes del registro o de un resource pack con las recetas que pasa el juego (`TextureSource`, `PackSource`), screenshots, ocultación de cuevas en los tres tiers (ADR 0022), contorno del bloque apuntado (`BlockOutline`, ADR 0026), texturas animadas de los packs (`LayerAnimation`, ADR 0028), conteo de draws en CPU (`cull_counts`), niebla y nubes cúbicas opcionales (`fog`: `FogPlugin`, `FogSettings`, `FogClock`, ADR 0030), terreno lejano opcional (`lod`: `LodPlugin`, `LodPass`, ADR 0031), el pase de la interfaz con la feature `ui` (`UiPass`, ADR 0033) | gfx, shaders, world, camera, window, pack, fog, ui (opcional) |
 | `boxel_fog` | niebla y nubes cúbicas sin GPU ni ECS (ADR 0030 y 0032): las capas (`FogLayer`, `validate`), el ruido entero que el shader repite bit a bit, cada capa en enteros chicos relativos al origen de render (`LayerParams`), el perfil de la bruma lejana (`HazeProfile`), la marcha de referencia de los tests y el empaquetado del texel | - |
 | `boxel_physics` | física propia mínima (ADR 0016). Núcleo sin ECS: `CollisionTable` (desde `BlockDef::collision`: cubos y cajas que pueden subir media celda, como la valla de 1,5 bloques, más un contorno para apuntar, ADR 0018 y 0026), `VoxelSource`, barrido AABB por ejes contra la grilla (`move_box`), raycast DDA exacto en `i64` (`raycast_voxels`), rayos contra cajas y esferas, el integrador de un cuerpo (`step_body`, `predict`), el narrowphase (`shape_contact`) y la grilla del broadphase (`Grid`). Capa ECS: `ChunkSource` (lee `ChunkMap`), `PhysicsPlugin` (fuera de `DefaultPlugins`; pasos en `FixedPostUpdate`, interpolación en `AfterFixedMainLoop`), `PhysicsQuery` (rayos a vóxeles y cuerpos, cajas, el chequeo para poner bloques), `BodyIndex`, cuerpos (`RigidBody`, `Collider`, `Velocity`, `BodyPosition`, `Contacts`, `Interpolated`, `Teleport`, `Frozen`, `Sleeping`, `ReportContacts`), `CharacterController` (caminar, agacharse con el borde protegido y la caja de 1,5 (`Crouch`), correr con el salto corriendo y el vuelo creativo, ADR 0026), `Projectile`, nadar (`SwimPlugin`, `Swimmer`, ADR 0021; también en bloques con agua, y el vuelo no lo siente) y los mensajes `VoxelImpact`, `CollisionStarted`, `CollisionEnded` y `ProjectileHit`. Los cuerpos quietos se duermen (despiertan con `BlockChanged` y `ChunkDataEvent` del mundo, entre otras cosas) y, con muchos cuerpos despiertos, el paso corre en los hilos de cómputo. Fases P0 a P4 hechas | ecs, app, math, tasks, transform, voxel, world, diagnostic |
@@ -1398,6 +1398,18 @@ pub trait ChunkStore: Send + Sync + 'static {
   cuando su chunk se descarga, y vuelven con él antes del paso de física siguiente. El
   autoguardado y la salida las guardan en la misma transacción que los chunks con ediciones, los
   ticks y el reloj, y solo rearman las que cambiaron (ADR 0024 sección 3).
+
+### 12.1 Abrir y cerrar mundos (ADR 0034)
+
+Un mundo es un `WorldSpec` (generador, ajustes, store y reloj) y hay uno abierto a la vez. Los
+recursos del motor quedan insertados toda la vida de la app: al cerrar, cada plugin devuelve su
+estado por mundo al de un proceso nuevo en `WorldSave`, `WorldTeardown` y `WorldOpen`, y el
+renderer olvida el mundo (`Resync::World`, `clear_world`). El cierre corre en un `PreUpdate`;
+el último guardado, el cierre del archivo y la liberación de memoria siguen en el pool de IO hasta
+`WorldEvent::Closed`. El mundo de `WorldPlugin::new` abre por el mismo camino en `PreStartup`, así
+que un mundo abierto después de otro empieza igual que en un proceso nuevo. `WorldStore::open`,
+fuera del hilo principal en un juego, arma el índice de chunks guardados y la semilla del LOD. El
+juego pide aperturas y cierres con `WorldCommandsExt` y sigue la lista de la ADR.
 
 ---
 
