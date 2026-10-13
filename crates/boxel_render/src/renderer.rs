@@ -615,7 +615,7 @@ impl VoxelRenderer {
         if layout.floor_chunk_places() < u64::from(slots) {
             tracing::warn!(
                 "chunk memory: the floor's {} page(s) hold {} chunks, fewer than the {slots} \
-                 slots (the ceiling or initial_quads limit the pages)",
+                 slots (initial_quads or the High lists limit the pages)",
                 layout.floor.len(),
                 layout.floor_chunk_places()
             );

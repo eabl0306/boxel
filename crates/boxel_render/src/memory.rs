@@ -77,9 +77,11 @@ impl MemoryCeiling {
 pub struct ChunkMemorySettings {
     /// Quads of the pages created at GPU start, the floor (default 8 Mi, 64 MiB: four pages of
     /// 2 Mi). Below `page_quads` the floor is one page of exactly this many quads (small apps
-    /// and tests keep a single arena); above, whole pages. When `initial_slots` needs more pages
-    /// than that (`page_chunks` chunks a page), the same quads go over that many smaller pages,
-    /// each of `MIN_PAGE_QUADS` at least. With two pages or more the last one is Translucent.
+    /// and tests keep a single arena); above, whole pages, never past `max_quads` (a ceiling
+    /// that is not a page multiple spreads its quads over the pages). When `initial_slots`
+    /// needs more pages than that (`page_chunks` chunks a page), the same quads go over that
+    /// many smaller pages, each of `MIN_PAGE_QUADS` at least, whatever `max_quads`. With two
+    /// pages or more the last one is Translucent.
     pub initial_quads: u32,
     /// Chunk slots of the table created at GPU start (default 32,768); the floor has chunk
     /// places for all of them when its quads allow (`initial_quads`). High also clamps them to
@@ -224,7 +226,8 @@ pub(crate) struct MemoryLayout {
     pub floor: Vec<(PageClass, u32)>,
     /// Chunk slots of the initial table.
     pub slots: u32,
-    /// The most pages: the ceiling in quads over `page_quads`, at most [`list_pages_limit`].
+    /// The most pages: the ceiling in quads over `page_quads` or the floor's pages if more, at
+    /// most [`list_pages_limit`].
     pub max_pages: u32,
     /// The most quads.
     pub ceiling_quads: u64,
@@ -255,41 +258,36 @@ impl MemoryLayout {
         let ceiling_slots = settings.max_slots.clamp(1, facts.slot_limit);
         let slots = settings.initial_slots.clamp(1, ceiling_slots);
         let initial = u64::from(settings.initial_quads.max(1)).min(ceiling_quads);
-        let mut sizes = if initial < u64::from(page_quads) {
-            vec![initial]
+        let page = u64::from(page_quads);
+        // Below a page, exactly `initial`; above, whole pages as far as the ceiling lets them
+        // (one that is not a page multiple cuts the last page's worth, spread over all of them).
+        let total = if initial < page {
+            initial
         } else {
-            let pages = initial
-                .div_ceil(u64::from(page_quads))
-                .min(u64::from(max_pages)) as usize;
-            vec![u64::from(page_quads); pages]
+            (initial.div_ceil(page) * page).min(ceiling_quads)
         };
         // Enough pages for the initial table's chunks, `page_chunks` each: nothing adds pages
         // later yet, and a page full of chunks refuses one with quads to spare. The same quads
-        // go over more, smaller pages (at least `MIN_PAGE_QUADS` each, at most `max_pages`).
-        let total: u64 = sizes.iter().sum();
+        // go over more, smaller pages, each of `MIN_PAGE_QUADS` at least. The split keeps the
+        // quads, so the ceiling does not cap it; the pages the High lists allow do.
         let for_slots = u64::from(slots.div_ceil(page_chunks))
-            .min(u64::from(max_pages))
+            .min(u64::from(list_pages_limit(page_chunks)))
             .min(total / u64::from(MIN_PAGE_QUADS));
-        if for_slots > sizes.len() as u64 {
-            let (each, extra) = (total / for_slots, total % for_slots);
-            sizes = (0..for_slots)
-                .map(|i| each + u64::from(i < extra))
-                .collect();
-        }
-        let pages = sizes.len();
-        let floor = sizes
-            .into_iter()
-            .enumerate()
-            .map(|(i, quads)| {
+        let pages = total.div_ceil(page).max(for_slots);
+        let (each, extra) = (total / pages, total % pages);
+        let floor = (0..pages)
+            .map(|i| {
                 // with two pages or more the last one is Translucent
                 let class = if pages >= 2 && i + 1 == pages {
                     PageClass::Translucent
                 } else {
                     PageClass::Solid
                 };
-                (class, quads as u32)
+                (class, (each + u64::from(i < extra)) as u32)
             })
             .collect();
+        // growth (#57 M2) never sees fewer pages than the floor has
+        let max_pages = max_pages.max(pages as u32);
         Self {
             page_quads,
             page_chunks,
@@ -1289,21 +1287,30 @@ mod tests {
     /// The floor holds every chunk the initial table does, as main's single arena did whenever
     /// the quads fit (growth, which would add pages for chunk places, is not there yet): the
     /// table refuses first, never a page full of chunks with quads to spare. The quads are the
-    /// ones asked for.
+    /// ones asked for, and an explicit ceiling equal to them splits them as `Auto` does: it
+    /// bounds quads, not how many pages share them.
     #[test]
     fn the_floor_holds_every_initial_slot() {
         let discrete = facts(wgpu::DeviceType::DiscreteGpu);
         // the defaults, the overworld of the examples, a floor below one page
-        for (quads, slots) in [(8 << 20, 32768), (24 << 20, 65536), (2 << 20, 32768)] {
+        let cases = [(8 << 20, 32768), (24 << 20, 65536), (2 << 20, 32768)];
+        for ((quads, slots), max_quads) in cases.into_iter().flat_map(|(quads, slots)| {
+            [MemoryCeiling::Auto, MemoryCeiling::Quads(quads)].map(|c| ((quads, slots), c))
+        }) {
             let settings = ChunkMemorySettings {
                 initial_quads: quads,
                 initial_slots: slots,
+                max_quads,
                 ..ChunkMemorySettings::default()
             };
             let layout = MemoryLayout::resolve(&settings, discrete);
-            let what = format!("{quads} quads, {slots} slots: {:?}", layout.floor);
+            let what = format!(
+                "{quads} quads, {slots} slots, {max_quads:?}: {:?}",
+                layout.floor
+            );
             assert_eq!(layout.floor_quads(), u64::from(quads), "{what}");
             assert!(layout.floor_chunk_places() >= u64::from(slots), "{what}");
+            assert!(layout.floor.len() <= layout.max_pages as usize, "{what}");
             assert!(
                 layout
                     .floor
@@ -1429,7 +1436,8 @@ mod tests {
             assert_eq!(layout.floor_quads(), 48 << 20, "{class:?}");
             assert!(layout.ceiling_quads >= 48 << 20, "{class:?}");
         }
-        // an explicit ceiling still bounds it (validation refuses a floor above it)
+        // an explicit ceiling still bounds the quads (validation refuses a floor above it); the
+        // floor's 24 Mi go over seven pages, enough for the 65,536 slots' chunks
         let capped = ChunkMemorySettings {
             max_quads: MemoryCeiling::Quads(24 << 20),
             initial_quads: 24 << 20,
@@ -1437,9 +1445,12 @@ mod tests {
             ..ChunkMemorySettings::default()
         };
         let layout = MemoryLayout::resolve(&capped, facts(wgpu::DeviceType::Other));
-        assert_eq!((layout.floor.len(), layout.ceiling_quads), (6, 24 << 20));
-        // six pages hold 65,532 chunks: fewer than the slots, which the renderer logs
-        assert_eq!(layout.floor_chunk_places(), 65532);
+        assert_eq!(
+            (layout.floor_quads(), layout.ceiling_quads),
+            (24 << 20, 24 << 20)
+        );
+        assert_eq!((layout.floor.len(), layout.max_pages), (7, 7));
+        assert_eq!(layout.floor_chunk_places(), 7 * 10922);
         // past the pages the draw lists allow the floor is cut (and logged) under `Auto` too
         let huge = ChunkMemorySettings {
             initial_quads: u32::MAX,
@@ -1451,6 +1462,74 @@ mod tests {
             layout.floor_quads(),
             u64::from(layout.max_pages) * (4 << 20)
         );
+    }
+
+    /// The floor rounds up to whole pages only as far as the ceiling lets it: a ceiling that is
+    /// not a page multiple gets its quads over the pages evenly, never more.
+    #[test]
+    fn the_floor_never_passes_the_ceiling() {
+        let discrete = facts(wgpu::DeviceType::DiscreteGpu);
+        // 6 Mi under a ceiling of 6 Mi: not two whole pages of 4 Mi
+        let six = ChunkMemorySettings {
+            initial_quads: 6 << 20,
+            max_quads: MemoryCeiling::Quads(6 << 20),
+            ..ChunkMemorySettings::default()
+        };
+        let layout = MemoryLayout::resolve(&six, discrete);
+        assert_eq!(
+            (layout.floor_quads(), layout.ceiling_quads),
+            (6 << 20, 6 << 20)
+        );
+        assert!(layout.floor_chunk_places() >= 32768, "{:?}", layout.floor);
+        // `Auto` lifted to a floor that is not a page multiple: the quads asked for
+        let cpu = ChunkMemorySettings {
+            initial_quads: 50 << 20,
+            ..ChunkMemorySettings::default()
+        };
+        let layout = MemoryLayout::resolve(&cpu, facts(wgpu::DeviceType::Cpu));
+        assert_eq!(
+            (layout.floor_quads(), layout.ceiling_quads),
+            (50 << 20, 50 << 20)
+        );
+        assert_eq!(layout.floor.len(), 13);
+        // whatever the settings
+        for page_quads in [MIN_PAGE_QUADS, 3 << 20, 4 << 20] {
+            for initial in [1, 5000, 3 << 20, (4 << 20) + 1, 6 << 20, 50 << 20] {
+                let ceilings = [
+                    MemoryCeiling::Auto,
+                    MemoryCeiling::Quads(initial),
+                    MemoryCeiling::Quads(initial + page_quads / 2),
+                    MemoryCeiling::Quads(initial.saturating_mul(3)),
+                ];
+                for (max_quads, slots, page_chunks) in ceilings.into_iter().flat_map(|c| {
+                    [(8, 4), (32768, PAGE_CHUNKS_MAX), (98304, 1000)].map(|(s, p)| (c, s, p))
+                }) {
+                    let settings = ChunkMemorySettings {
+                        initial_quads: initial,
+                        initial_slots: slots,
+                        max_quads,
+                        page_quads,
+                        page_chunks,
+                        ..ChunkMemorySettings::default()
+                    };
+                    assert_eq!(settings.validate(), Ok(()));
+                    for class in [wgpu::DeviceType::DiscreteGpu, wgpu::DeviceType::Cpu] {
+                        let layout = MemoryLayout::resolve(&settings, facts(class));
+                        let what = format!("{settings:?} on {class:?}: {layout:?}");
+                        assert!(layout.floor_quads() <= layout.ceiling_quads, "{what}");
+                        assert!(layout.floor.len() <= layout.max_pages as usize, "{what}");
+                        assert!(layout.max_pages <= list_pages_limit(page_chunks), "{what}");
+                        assert!(
+                            layout
+                                .floor
+                                .iter()
+                                .all(|&(_, q)| q > 0 && q <= layout.page_quads),
+                            "{what}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

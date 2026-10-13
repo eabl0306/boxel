@@ -871,9 +871,9 @@ fn pages_full_of_chunks_are_told_apart() {
             return Err(format!("default floor: {memory:?}"));
         }
         drop(default);
-        // one page of 4 chunk places (the ceiling allows no more), 8 slots
+        // one page of 4 chunk places (its quads split no further), 8 slots
         let capped = ChunkMemorySettings {
-            initial_quads: 1 << 16,
+            initial_quads: boxel_render::MIN_PAGE_QUADS,
             initial_slots: 8,
             max_quads: boxel_render::MemoryCeiling::Quads(1 << 16),
             page_quads: 1 << 16,

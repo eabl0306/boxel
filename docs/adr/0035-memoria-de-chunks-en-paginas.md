@@ -64,8 +64,11 @@ páginas), se avisa al arrancar.
 El piso tiene lugar para los chunks de todas las slots iniciales, como el arena único de antes.
 Si sus quads dan menos páginas de las que hacen falta (una cada 10 922 slots), los mismos quads
 se reparten en más páginas, más chicas, de 4 096 quads como mínimo. Por defecto son cuatro
-páginas de 2 Mi: 64 MiB, igual que antes. Si el techo no deja tantas páginas, se avisa al
-arrancar. Un chunk que no entra porque las páginas con quads libres ya tienen todos sus chunks da
+páginas de 2 Mi: 64 MiB, igual que antes. El techo no limita ese reparto, porque los quads son los
+mismos. Lo limitan los quads (4 096 por página) y las páginas que admiten las listas de High (84
+con 10 922 chunks por página); si así quedan menos lugares que slots, se avisa al arrancar. El
+piso nunca pasa del techo: si el techo no es múltiplo de página, el piso no redondea a páginas
+enteras y reparte los quads del techo entre sus páginas. Un chunk que no entra porque las páginas con quads libres ya tienen todos sus chunks da
 su propio error, `PageChunksFull`, y las estadísticas cuentan esas páginas.
 
 ### 7. Lo que se escribe pasa por un sumidero
