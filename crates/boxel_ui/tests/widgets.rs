@@ -13,7 +13,7 @@ use boxel_ui::{
     BitmapFont, DOUBLE_CLICK, InputCapture, Modal, SCROLLBAR_WIDTH, Text, Ui, UiAtlas, UiLayer,
     UiRect,
 };
-use boxel_window::{ButtonState, ImeOptions, KeyCode, TextInput};
+use boxel_window::{ButtonState, ImeOptions, KeyCode, KeyboardInput, TextInput};
 use std::time::Duration;
 
 // ---- the list
@@ -725,6 +725,42 @@ fn text_and_tab_in_one_frame_reach_the_fields_in_their_order() {
     assert_eq!(form_of(&t).seed, "12");
     assert_eq!(form_of(&t).submitted, ["name"]);
     assert_eq!(t.focused().as_deref(), Some("test:name"));
+}
+
+/// A key an input method takes, as Windows reports it: a `KeyboardInput` press and release,
+/// and nothing in `TextInput`.
+fn ime_key(t: &mut UiTester, key: KeyCode) {
+    for state in [ButtonState::Pressed, ButtonState::Released] {
+        t.app.world_mut().write_message(KeyboardInput {
+            key,
+            state,
+            repeat: false,
+        });
+    }
+}
+
+#[test]
+fn keys_an_input_method_takes_neither_move_the_focus_nor_submit() {
+    let mut t = form_tester();
+    t.click("test:name");
+    t.type_text("a");
+    // Down picks a candidate, Enter confirms it: both go to the input method.
+    t.preedit("ka").frame();
+    ime_key(&mut t, KeyCode::ArrowDown);
+    t.frame();
+    assert_eq!(t.focused().as_deref(), Some("test:name"));
+    ime_key(&mut t, KeyCode::Enter);
+    t.preedit("");
+    t.app
+        .world_mut()
+        .write_message(TextInput::Text("か".to_owned()));
+    // A real Tab in the same frame still moves on, after the commit.
+    t.key(KeyCode::Tab, ButtonState::Pressed, false);
+    t.type_text("1");
+    assert_eq!(form_of(&t).name, "aか");
+    assert_eq!(form_of(&t).seed, "1");
+    assert!(form_of(&t).submitted.is_empty());
+    assert_eq!(t.focused().as_deref(), Some("test:seed"));
 }
 
 #[test]

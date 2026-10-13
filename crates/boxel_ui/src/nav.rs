@@ -65,9 +65,9 @@ impl NavKey {
     }
 }
 
-/// The keys that come in both input streams: as a `KeyboardInput` press (navigation) and as a
-/// [`TextInput::Key`] (text fields). Counting them lines the two streams up (Space is typed
-/// text, so it is not one of them).
+/// The navigation keys that also come as a [`TextInput::Key`] (text fields), besides their
+/// `KeyboardInput` press. They line the two streams up (Space is typed text, so it is not one
+/// of them).
 fn in_both_streams(key: KeyCode) -> bool {
     matches!(
         key,
@@ -79,6 +79,14 @@ fn in_both_streams(key: KeyCode) -> bool {
             | KeyCode::Enter
             | KeyCode::NumpadEnter
     )
+}
+
+/// The key of a [`TextInput::Key`] that also comes as a `KeyboardInput` press.
+fn both_streams_key(event: &TextInput) -> Option<KeyCode> {
+    match event {
+        TextInput::Key { key, .. } if in_both_streams(*key) => Some(*key),
+        _ => None,
+    }
 }
 
 /// This frame's input, as the begin system read it.
@@ -205,34 +213,45 @@ pub(crate) fn resolve(state: &mut UiState, input: &NavInput) -> InputCapture {
         mem.dragging = None;
     }
 
-    // Keys move the focus along `order`. `marks` keeps the focus after each key that comes in
-    // both streams, so the text typed between two of them goes to the field focused then.
-    let mut marks = vec![mem.focused];
+    // Keys move the focus along `order`, and text goes to the field focused when it was typed.
+    // A key that comes in both streams pairs its press with the next `TextInput::Key` of the
+    // text stream when that is the same key: the text up to it goes to the field focused before
+    // the press. A press without one is a key an input method took (Windows reports them, X11,
+    // Wayland and macOS do not) or one winit made up as the window gained focus: it leaves the
+    // focus in a text field, so picking a candidate with an arrow does not move it away.
+    let field = |id: Option<WidgetId>| {
+        id.filter(|&id| order.iter().any(|h| h.id == id && h.kind.takes_text()))
+    };
+    let deliver = |mem: &mut Memory, events: &[TextInput]| {
+        if let Some(id) = field(mem.focused) {
+            mem.text.extend(events.iter().map(|e| (id, e.clone())));
+        }
+    };
+    let mut next = 0;
     for &(code, key, repeat) in &input.keys {
+        if in_both_streams(code) {
+            let pair = input.text[next..]
+                .iter()
+                .position(|e| both_streams_key(e).is_some())
+                .map(|i| next + i)
+                .filter(|&i| both_streams_key(&input.text[i]) == Some(code));
+            match pair {
+                Some(i) => {
+                    deliver(mem, &input.text[next..=i]);
+                    next = i + 1;
+                }
+                None if field(mem.focused).is_some() => continue,
+                None => {}
+            }
+        }
         match key {
             NavKey::NextTab => mem.tab_step += 1,
             NavKey::PrevTab => mem.tab_step -= 1,
             _ if order.is_empty() => {}
             _ => navigate(mem, &order, key, repeat),
         }
-        if in_both_streams(code) {
-            marks.push(mem.focused);
-        }
     }
-    let field = |id: Option<WidgetId>| {
-        id.filter(|&id| order.iter().any(|h| h.id == id && h.kind.takes_text()))
-    };
-    let mut at = 0;
-    for event in &input.text {
-        if let Some(id) = field(marks[at.min(marks.len() - 1)]) {
-            mem.text.push((id, event.clone()));
-        }
-        if let TextInput::Key { key, .. } = event
-            && in_both_streams(*key)
-        {
-            at += 1;
-        }
-    }
+    deliver(mem, &input.text[next..]);
     mem.focused_row = mem.focused.and_then(find).and_then(|h| h.row);
     let typing = field(mem.focused).is_some();
     if let Some(preedit) = &input.preedit {
