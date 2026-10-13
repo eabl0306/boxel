@@ -41,6 +41,9 @@ const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 /// (only a leaked clone explains it).
 const HANDLE_WARN_AFTER: Duration = Duration::from_secs(2);
 
+/// [`finish_closing`] blocks on what the close waits for this long at most between polls.
+const SLICE: Duration = Duration::from_millis(5);
+
 /// Where a close stands.
 enum Phase {
     /// The last save job runs (or retries).
@@ -56,8 +59,9 @@ enum Phase {
 pub(crate) struct ClosingWorld {
     epoch: WorldEpoch,
     started: Instant,
-    /// The last save, while it keeps failing, gives up at this time.
-    deadline: Instant,
+    /// The last save, while it keeps failing, gives up at this time. `None` (a `close_timeout`
+    /// too long for an `Instant`): never while the app runs; the exit sets it.
+    deadline: Option<Instant>,
     /// [`CloseOptions::save`]: off, what a failed job puts back is dropped again, never retried.
     save: bool,
     /// Handed over by the persistence's teardown.
@@ -388,7 +392,7 @@ fn close_now(world: &mut World, options: CloseOptions) {
     world.resource_mut::<WorldLifecycle>().closing = Some(ClosingWorld {
         epoch,
         started,
-        deadline: started + settings.close_timeout,
+        deadline: started.checked_add(settings.close_timeout),
         save: options.save,
         persist: None,
         store: None,
@@ -445,7 +449,9 @@ fn poll_closing(world: &mut World) -> bool {
                 p.poll(now, settings.retry_after);
                 // Only a save that keeps failing gives up, checked before the next try: a
                 // running job is waited for (the store's close must not cut it off).
-                let give_up = now >= closing.deadline && !p.in_flight() && p.last_error().is_some();
+                let give_up = closing.deadline.is_some_and(|d| now >= d)
+                    && !p.in_flight()
+                    && p.last_error().is_some();
                 if !closing.save {
                     // A job running at the close that failed put its work back: dropped again.
                     p.discard();
@@ -460,7 +466,7 @@ fn poll_closing(world: &mut World) -> bool {
                     tracing::error!(
                         "the world's last save did not succeed within {:?}: what was not written \
                          is lost",
-                        settings.close_timeout
+                        closing.started.elapsed()
                     );
                     closing.report.gave_up = true;
                     start_release(world, &mut closing);
@@ -567,10 +573,11 @@ fn finish(world: &mut World, closing: ClosingWorld) {
     world.write_message(WorldEvent::Closed { epoch, report });
 }
 
-/// Finishes the close in progress on this thread, blocking for at most `wait` (exit, tests).
-/// True when no close is in progress any more.
+/// Finishes the close in progress on this thread, blocking for at most `wait` (exit, tests;
+/// one too long for an `Instant`, `Duration::MAX`, has no limit). True when no close is in
+/// progress any more.
 pub fn finish_closing(world: &mut World, wait: Duration) -> bool {
-    let until = Instant::now() + wait;
+    let until = Instant::now().checked_add(wait);
     loop {
         if world
             .get_resource::<WorldLifecycle>()
@@ -582,11 +589,11 @@ pub fn finish_closing(world: &mut World, wait: Duration) -> bool {
             return true;
         }
         let now = Instant::now();
-        if now >= until {
+        if until.is_some_and(|until| now >= until) {
             return false;
         }
         // Block on what the close waits for, a short while at most.
-        let slice = (until - now).min(Duration::from_millis(5));
+        let slice = until.map_or(SLICE, |until| (until - now).min(SLICE));
         let mut lifecycle = world.resource_mut::<WorldLifecycle>();
         let Some(closing) = lifecycle.closing.as_mut() else {
             continue;
@@ -638,7 +645,15 @@ pub(crate) fn save_world_on_exit(world: &mut World) {
             }
         }
         WorldStatus::Closing => {
-            if !finish_closing(world, settings.close_timeout + Duration::from_secs(1)) {
+            // A close that never gives up kept trying until the player quit: now a failing save
+            // gives up (one still running is waited for).
+            if let Some(closing) = world.resource_mut::<WorldLifecycle>().closing.as_mut() {
+                closing.deadline.get_or_insert_with(Instant::now);
+            }
+            let wait = settings
+                .close_timeout
+                .saturating_add(Duration::from_secs(1));
+            if !finish_closing(world, wait) {
                 tracing::error!("the world did not finish closing before the exit");
             }
         }

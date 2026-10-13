@@ -180,9 +180,9 @@ pub struct CloseReport {
     /// The world had a store and its last moment was written (never for a close without its
     /// save, [`CloseOptions::save`]).
     pub saved: bool,
-    /// The last save kept failing for `PersistSettings::close_timeout`: what was not written
-    /// yet is lost (the batches written before stay). A slow save that does not fail is waited
-    /// for.
+    /// The last save kept failing for `PersistSettings::close_timeout` (or until the exit):
+    /// what was not written yet is lost (the batches written before stay). A slow save that
+    /// does not fail is waited for.
     pub gave_up: bool,
     /// Chunk records written from the close to the end.
     pub chunks_written: usize,

@@ -1300,3 +1300,59 @@ fn a_closed_world_leaves_no_board_lines() {
     settle(&mut app);
     assert_eq!(line(&app, "light"), None);
 }
+
+// ------------------------------------------------------------------ a close that never ends
+
+/// A `close_timeout` past what a deadline can hold (`Duration::MAX`: never give up) closes as
+/// any other with a disk that works. With a disk that keeps failing it keeps trying while the
+/// app runs, and the exit gives up on it (it tried until the player quit) instead of waiting
+/// forever.
+#[test]
+fn a_close_that_never_gives_up_ends_at_the_exit() {
+    for disk_works in [true, false] {
+        let flaky = Arc::new(Flaky::default());
+        let store = WorldStore::open(
+            Arc::clone(&flaky) as Arc<dyn ChunkStore>,
+            &testing::registry(),
+            "hills",
+        )
+        .unwrap();
+        let mut app = app();
+        app.insert_resource(PersistSettings {
+            autosave: None,
+            retry_after: Duration::ZERO,
+            close_timeout: Duration::MAX,
+            ..PersistSettings::default()
+        });
+        open(&mut app, spec(1).with_store(store));
+        settle(&mut app);
+        let glass = state(&app, "test:glass");
+        let edit = block(0, 0, 1, 26, 1);
+        app.world_mut()
+            .resource_mut::<EditQueue>()
+            .set_block(edit, glass);
+        app.update();
+        flaky.fail.store(!disk_works, Ordering::SeqCst);
+        assert!(close_world(app.world_mut(), CloseOptions::default()));
+        for _ in 0..5 {
+            app.update();
+        }
+        if disk_works {
+            assert_eq!(status(&app), WorldStatus::Closed);
+        } else {
+            assert_eq!(status(&app), WorldStatus::Closing, "it keeps trying");
+            app.shutdown();
+            assert_eq!(status(&app), WorldStatus::Closed, "the exit gave up");
+        }
+        let report = last_report(&app);
+        assert_eq!(report.saved, disk_works, "{report:?}");
+        assert_eq!(report.gave_up, !disk_works, "{report:?}");
+        flaky.fail.store(false, Ordering::SeqCst);
+        let saved = flaky
+            .inner
+            .keys()
+            .unwrap()
+            .contains(&ChunkKey::new(ChunkPos::containing(edit)));
+        assert_eq!(saved, disk_works);
+    }
+}
