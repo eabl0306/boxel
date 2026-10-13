@@ -93,14 +93,21 @@ fn declare_stall(world: &mut World, stall: Duration) {
 
 /// The store of a refused spec: closed and dropped off the main thread (the last handle of an
 /// open redb file writes and syncs it when dropped). Only dropped when it shares its backend
-/// with the open world's store: closing it would close that world's file.
+/// with the open world's store or the closing world's (a clone of it, or another opening of its
+/// file): closing it would close the file that world still reads or writes its last save to.
 fn refuse_store(world: &World, store: Option<WorldStore>) {
     let Some(store) = store else {
         return;
     };
+    let backend = Arc::downgrade(store.backend());
     let shared = world
         .get_resource::<WorldStore>()
-        .is_some_and(|open| Arc::ptr_eq(open.backend(), store.backend()));
+        .is_some_and(|open| Arc::ptr_eq(open.backend(), store.backend()))
+        || world
+            .get_resource::<WorldLifecycle>()
+            .and_then(|l| l.closing.as_ref())
+            .and_then(|c| c.backend.as_ref())
+            .is_some_and(|closing| Weak::ptr_eq(closing, &backend));
     io_executor(world).spawn(Box::new(move || {
         if !shared {
             let _ = store.close();
@@ -226,7 +233,8 @@ fn check_open(world: &World, spec: &WorldSpec) -> Result<(), OpenWorldError> {
 /// [`WorldLifecycleSystems`](super::WorldLifecycleSystems)): its content, settings and store are
 /// installed, [`WorldOpen`] runs and [`WorldEvent::Opened`] is written. Refused when a world is
 /// open or closing, in an `Idle` step, or for a store that cannot serve it ([`OpenWorldError`]);
-/// a refused spec's store is closed off the main thread, and the app's world is left as it was.
+/// a refused spec's store is closed off the main thread (only dropped when it shares the open or
+/// closing world's backend), and the app's world is left as it was.
 pub fn open_world(world: &mut World, spec: WorldSpec) -> Result<WorldEpoch, OpenWorldError> {
     let started = Instant::now();
     if let Err(e) = check_open(world, &spec) {

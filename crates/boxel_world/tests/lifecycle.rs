@@ -691,6 +691,126 @@ fn refused_opens_change_nothing() {
     );
 }
 
+/// A store in memory whose close is for good, as a file's: every write after it fails.
+#[derive(Default)]
+struct Closable {
+    inner: MemoryStore,
+    closed: AtomicBool,
+}
+
+impl Closable {
+    fn check(&self) -> io::Result<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            Err(io::Error::new(io::ErrorKind::NotConnected, "closed"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl ChunkStore for Closable {
+    fn load(&self, key: ChunkKey) -> io::Result<Option<Vec<u8>>> {
+        self.check()?;
+        self.inner.load(key)
+    }
+    fn keys(&self) -> io::Result<Vec<ChunkKey>> {
+        self.check()?;
+        self.inner.keys()
+    }
+    fn load_meta(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
+        self.check()?;
+        self.inner.load_meta(name)
+    }
+    fn save_batch(&self, batch: &SaveBatch) -> io::Result<()> {
+        self.check()?;
+        self.inner.save_batch(batch)
+    }
+    fn close(&self) -> io::Result<()> {
+        self.closed.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Test 10, while a world closes: a store refused then because it is the closing world's (a
+/// clone a game kept to reload it, or another opening of its backend) is dropped, not closed:
+/// closing it would close the store the closing world still writes its last moment to. Here an
+/// autosave is in flight at the close, so the last moment's job starts after the refusal.
+#[test]
+fn a_store_refused_while_its_world_closes_keeps_the_last_save() {
+    for clone in [true, false] {
+        let held = Arc::new(Held::default());
+        let mut app = app_with(Arc::clone(&held) as Arc<dyn JobExecutor>);
+        app.insert_resource(PersistSettings {
+            autosave: None,
+            retry_after: Duration::from_millis(5),
+            close_timeout: Duration::from_millis(100),
+            ..PersistSettings::default()
+        });
+        let backend = Arc::new(Closable::default());
+        let opening = || {
+            WorldStore::open(
+                Arc::clone(&backend) as Arc<dyn ChunkStore>,
+                &testing::registry(),
+                "hills",
+            )
+            .unwrap()
+        };
+        let a = opening();
+        let kept = a.clone();
+        open(&mut app, spec(1).with_store(a));
+        held.run_all();
+        settle(&mut app);
+        held.run_all();
+        let glass = state(&app, "test:glass");
+        let (first, last) = (block(0, 0, 1, 26, 1), block(1, 1, 2, 27, 2));
+        app.world_mut()
+            .resource_mut::<EditQueue>()
+            .set_block(first, glass);
+        app.update();
+        app.world_mut()
+            .resource_mut::<WorldLifecycle>()
+            .request_save();
+        app.update();
+        app.update();
+        // The autosave's job waits; the last edit goes with the close.
+        app.world_mut()
+            .resource_mut::<EditQueue>()
+            .set_block(last, glass);
+        app.update();
+        assert!(close_world(app.world_mut(), CloseOptions::default()));
+        assert_eq!(status(&app), WorldStatus::Closing);
+        let refused = if clone { kept.clone() } else { opening() };
+        assert_eq!(
+            open_world(app.world_mut(), spec(2).with_store(refused)),
+            Err(OpenWorldError::NotClosed)
+        );
+        for _ in 0..400 {
+            held.run_all();
+            app.update();
+            if status(&app) == WorldStatus::Closed {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(status(&app), WorldStatus::Closed);
+        let report = app
+            .world()
+            .resource::<WorldLifecycle>()
+            .last_report()
+            .cloned()
+            .unwrap();
+        assert!(report.saved && !report.gave_up, "clone {clone}: {report:?}");
+        let keys = backend.inner.keys().unwrap();
+        for pos in [first, last] {
+            assert!(
+                keys.contains(&ChunkKey::new(ChunkPos::containing(pos))),
+                "clone {clone}: {pos:?} saved"
+            );
+        }
+        assert!(kept.is_closed());
+    }
+}
+
 // ------------------------------------------------------------------- requests and frames
 
 /// Test 11: requests through `Commands` run in the next `PreUpdate`, in order: a switch (close,
