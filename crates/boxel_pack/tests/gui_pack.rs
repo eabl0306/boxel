@@ -200,6 +200,16 @@ fn bad_gui_metadata_is_an_error() {
             "no_border",
             r#"{"gui": {"scaling": {"type": "nine_slice", "width": 8, "height": 8}}}"#,
         ),
+        // Minecraft reads these sizes as ints: anything past i32::MAX is rejected.
+        (
+            "huge_tile",
+            r#"{"gui": {"scaling": {"type": "tile", "width": 3000000000, "height": 16}}}"#,
+        ),
+        (
+            "huge_nine_slice",
+            r#"{"gui": {"scaling": {"type": "nine_slice", "width": 2147483648, "height": 8,
+                "border": 1}}}"#,
+        ),
     ];
     for (name, meta) in cases {
         pack.png(&format!("{SPRITES}/{name}.png"), 8, 8, |_, _| [0; 4]);
@@ -284,6 +294,89 @@ fn overlays_win_and_animated_sprites_show_their_first_frame() {
         (&icon.rgba[..4], icon.scaling),
         (&[255, 0, 0, 255][..], GuiScaling::Stretch)
     );
+}
+
+#[test]
+fn animated_sprites_drop_the_frames_minecraft_drops() {
+    let pack = TempPack::simple("animation_rules");
+    // Strips of 2x2 frames whose red channel is the frame's index; `frames` lists the sequence.
+    let cases = [
+        // One usable frame left: the texture is static and shows strip frame 0.
+        ("single", 2, r#"[1]"#, 0),
+        // A frame of 0 ticks is dropped, so the sequence starts at strip frame 0.
+        ("zero_time", 3, r#"[{"index": 1, "time": 0}, 0, 2]"#, 0),
+        // An index outside the strip is dropped too.
+        ("outside", 2, r#"[5, 1, 0]"#, 1),
+        // Nothing usable: static, frame 0.
+        ("none", 2, r#"[{"index": 1, "time": 0}, 7]"#, 0),
+    ];
+    for (name, frames, sequence, _) in cases {
+        pack.png(&format!("{SPRITES}/{name}.png"), 2, 2 * frames, |_, y| {
+            [y as u8 / 2, 0, 0, 255]
+        });
+        pack.text(
+            &format!("{SPRITES}/{name}.png.mcmeta"),
+            &format!(r#"{{"animation": {{"frames": {sequence}}}}}"#),
+        );
+    }
+    let reader = pack.open();
+    for (name, _, _, shown) in cases {
+        let texture = sprite(&reader, name);
+        assert_eq!((texture.width, texture.height), (2, 2), "{name}");
+        assert_eq!(texture.rgba, [shown, 0, 0, 255].repeat(4), "{name}");
+    }
+}
+
+#[test]
+fn overlay_directories_minecraft_rejects_are_skipped() {
+    let outside = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("gui_pack")
+        .join("outside_overlay");
+    let pack = TempPack::new(
+        "bad_overlays",
+        &format!(
+            r#"{{"pack": {{"pack_format": 64, "description": "test"}},
+                "overlays": {{"entries": [
+                    {{"directory": "../outside_overlay", "formats": [1, 200]}},
+                    {{"directory": "{}", "formats": [1, 200]}},
+                    {{"directory": "late/inner", "formats": [1, 200]}},
+                    {{"directory": "..", "formats": [1, 200]}},
+                    {{"directory": ".", "formats": [1, 200]}},
+                    {{"directory": "", "formats": [1, 200]}},
+                    {{"directory": "Late-2.x_ok", "formats": [1, 200]}}
+                ]}}}}"#,
+            outside.display()
+        ),
+    );
+    // Each rejected directory holds an icon that would win over the base's if it were read.
+    let red = |_: u32, _: u32| [255, 0, 0, 255];
+    let green = |_: u32, _: u32| [0, 255, 0, 255];
+    let blue = |_: u32, _: u32| [0, 0, 255, 255];
+    pack.png(&format!("{SPRITES}/icon.png"), 1, 1, red);
+    pack.png(
+        &format!("../outside_overlay/{SPRITES}/icon.png"),
+        1,
+        1,
+        blue,
+    );
+    pack.png(&format!("late/inner/{SPRITES}/icon.png"), 1, 1, blue);
+    pack.png(&format!("Late-2.x_ok/{SPRITES}/other.png"), 1, 1, green);
+    let reader = pack.open();
+    assert_eq!(
+        sprite(&reader, "icon").rgba,
+        [255, 0, 0, 255],
+        "{:?}",
+        reader.warnings()
+    );
+    // Upper case, `-`, `_` and `.` are fine, as in Minecraft.
+    assert_eq!(sprite(&reader, "other").rgba, [0, 255, 0, 255]);
+    let rejected: Vec<_> = reader
+        .warnings()
+        .iter()
+        .filter(|w| w.message.contains("not a valid overlay directory"))
+        .collect();
+    assert_eq!(rejected.len(), 6, "{:?}", reader.warnings());
+    let _ = std::fs::remove_dir_all(&outside);
 }
 
 /// The bitmap providers of a font, in order.
@@ -395,6 +488,12 @@ fn bad_providers_are_skipped_with_a_warning() {
             {"type": "space", "advances": {"ab": 1}},
             {"type": "reference", "id": "minecraft:loop"},
             {"providers": []},
+            {"type": "bitmap", "file": "minecraft:font/grid.png", "ascent": -2147483648,
+             "chars": ["a"]},
+            {"type": "bitmap", "file": "minecraft:font/grid.png", "height": 600000000,
+             "ascent": 7, "chars": ["a"]},
+            {"type": "bitmap", "file": "minecraft:font/grid.png", "ascent": -32768,
+             "chars": ["y"]},
             {"type": "bitmap", "file": "minecraft:font/grid.png", "ascent": 7, "chars": ["z"]}
         ]}"#,
     );
@@ -408,9 +507,13 @@ fn bad_providers_are_skipped_with_a_warning() {
         .expect("reads")
         .expect("exists");
     let bitmaps = bitmaps(&font.providers);
-    assert_eq!(bitmaps.len(), 1);
-    assert_eq!(bitmaps[0].chars, ["z"]);
-    assert_eq!(font.warnings.len(), 10, "{:?}", font.warnings);
+    // A glyph far below the line (an old trick for invisible glyphs) is kept; one past
+    // 32768 GUI pixels is skipped.
+    assert_eq!(bitmaps.len(), 2);
+    assert_eq!(bitmaps[0].chars, ["y"]);
+    assert_eq!(bitmaps[0].ascent, -32768);
+    assert_eq!(bitmaps[1].chars, ["z"]);
+    assert_eq!(font.warnings.len(), 12, "{:?}", font.warnings);
     assert!(
         font.warnings[8].message.contains("cycle"),
         "{:?}",
@@ -425,4 +528,70 @@ fn bad_providers_are_skipped_with_a_warning() {
     assert!(matches!(err, PackError::InvalidJson { .. }), "{err}");
     let err = reader.font(&id("empty")).expect_err("empty");
     assert!(matches!(err, PackError::InvalidFont { .. }), "{err}");
+}
+
+#[test]
+fn a_font_referenced_again_is_read_once() {
+    let pack = TempPack::simple("repeated_references");
+    pack.png("assets/minecraft/textures/font/grid.png", 8, 8, |_, _| {
+        [255; 4]
+    });
+    // Each level names the next three times, seven levels deep: read every time, the last
+    // font would be read 3^7 = 2187 times.
+    let refs = |next: &str| {
+        let one = format!(r#"{{"type": "reference", "id": "minecraft:{next}"}}"#);
+        format!(r#"{{"providers": [{one}, {one}, {one}]}}"#)
+    };
+    pack.text("assets/minecraft/font/default.json", &refs("f1"));
+    for level in 1..7 {
+        pack.text(
+            &format!("assets/minecraft/font/f{level}.json"),
+            &refs(&format!("f{}", level + 1)),
+        );
+    }
+    pack.text(
+        "assets/minecraft/font/f7.json",
+        r#"{"providers": [
+            {"type": "bitmap", "file": "minecraft:font/grid.png", "ascent": 7, "chars": ["x"]}
+        ]}"#,
+    );
+    // A diamond: both branches name `c`, which comes in once, where it is first named.
+    pack.text(
+        "assets/minecraft/font/diamond.json",
+        r#"{"providers": [
+            {"type": "reference", "id": "minecraft:a"},
+            {"type": "reference", "id": "minecraft:b"}
+        ]}"#,
+    );
+    for (name, next) in [("a", "c"), ("b", "c")] {
+        pack.text(
+            &format!("assets/minecraft/font/{name}.json"),
+            &format!(
+                r#"{{"providers": [
+                    {{"type": "reference", "id": "minecraft:{next}"}},
+                    {{"type": "bitmap", "file": "minecraft:font/grid.png", "ascent": 7,
+                      "chars": ["{name}"]}}
+                ]}}"#
+            ),
+        );
+    }
+    pack.text(
+        "assets/minecraft/font/c.json",
+        r#"{"providers": [
+            {"type": "bitmap", "file": "minecraft:font/grid.png", "ascent": 7, "chars": ["c"]}
+        ]}"#,
+    );
+    let reader = pack.open();
+
+    let font = reader.font(&id("default")).expect("reads").expect("exists");
+    assert_eq!(font.providers.len(), 1, "{:?}", font.warnings.len());
+    assert!(font.warnings.is_empty(), "{:?}", font.warnings);
+
+    let font = reader.font(&id("diamond")).expect("reads").expect("exists");
+    let chars: Vec<_> = bitmaps(&font.providers)
+        .iter()
+        .map(|b| b.chars[0].clone())
+        .collect();
+    assert_eq!(chars, ["c", "a", "b"]);
+    assert!(font.warnings.is_empty(), "{:?}", font.warnings);
 }

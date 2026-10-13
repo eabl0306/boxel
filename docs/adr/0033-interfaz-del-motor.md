@@ -166,7 +166,14 @@ el pase (E-UI2) y llega antes de los menús, así que no hay puente.
   `ttf`, `unihex`, `legacy_unicode` y lo que falta se saltan con un aviso. Un `filter` vale con
   las opciones por defecto de Minecraft (uniforme y japonés apagados).
 - Lo que el pack no tiene es `None`, y el juego sigue con su aspecto. Un nombre que Minecraft
-  rechazaría (`..`, mayúsculas) no encuentra nada, así que una fuente no lee fuera del pack.
+  rechazaría (`..`, mayúsculas) no encuentra nada, así que una fuente no lee fuera del pack. Un
+  overlay cuyo directorio no es un solo nombre (`-_a-zA-Z0-9.`, sin `.` ni `..`) se salta con un
+  aviso, también en `ResourcePack`.
+- Un pack hostil no cuelga ni desborda nada. Cada fuente se lee y cada imagen se decodifica una
+  vez por carga, aunque se nombren muchas veces. Los tamaños de `gui.scaling` pasan solo hasta
+  `i32::MAX`, como en Minecraft. Un proveedor con glifos de más de 32768 píxeles de GUI (alto,
+  ancho, `ascent` o avance) se salta con un aviso. Un sprite animado da el primer cuadro que
+  Minecraft reproduciría.
 - `boxel_ui` con la feature `pack` (la fachada la prende con `ui` y `pack`):
   `UiAtlas::insert_pack_sprite` guarda el sprite con su escala y `FontBuilder::pack_font` suma
   los proveedores. Como en Minecraft, gana el primer proveedor que tiene el carácter, el glifo

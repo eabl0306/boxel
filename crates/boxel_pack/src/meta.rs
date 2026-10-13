@@ -231,7 +231,22 @@ fn resolve_format_range(pack: &PackSection, warnings: &mut Vec<PackWarning>) -> 
     }
 }
 
+/// Whether `directory` is a name Minecraft takes for an overlay (`[-_a-zA-Z0-9.]+`), minus `.`
+/// and `..`: one plain directory inside the pack, never a path out of it.
+fn valid_overlay_directory(directory: &str) -> bool {
+    !matches!(directory, "" | "." | "..")
+        && directory
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 fn overlay_from_raw(raw: OverlayRaw) -> Result<OverlayEntry, String> {
+    if !valid_overlay_directory(&raw.directory) {
+        return Err(format!(
+            "overlay {:?} is not a valid overlay directory (one name of -_a-zA-Z0-9.); skipped",
+            raw.directory
+        ));
+    }
     let formats = if let Some(spec) = raw.formats {
         spec.as_range()
             .ok_or_else(|| format!("overlay '{}': empty formats", raw.directory))?
@@ -300,5 +315,37 @@ mod tests {
         let obj: FormatSpec =
             serde_json::from_str(r#"{"min_inclusive": 84, "max_inclusive": 88}"#).unwrap();
         assert_eq!(obj.as_range(), Some(FormatRange { min: 84, max: 88 }));
+    }
+
+    #[test]
+    fn overlay_directories_are_one_plain_name() {
+        let overlay = |directory: &str| {
+            overlay_from_raw(OverlayRaw {
+                directory: directory.to_string(),
+                formats: Some(FormatSpec::Single(64)),
+                min_format: None,
+                max_format: None,
+            })
+        };
+        for good in ["overlay_64", "Late-2.x", "a.b", "..."] {
+            assert!(overlay(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "/home/user/other",
+            "../outside",
+            "a/b",
+            "a\\b",
+            "C:",
+            "ü",
+        ] {
+            let err = overlay(bad).expect_err(bad);
+            assert!(
+                err.contains("not a valid overlay directory"),
+                "{bad}: {err}"
+            );
+        }
     }
 }

@@ -24,6 +24,7 @@ use crate::atlas::{AtlasError, SpriteId, UiAtlas};
 use crate::font::{FontBuilder, GlyphBitmap};
 use crate::sprite::Scaling;
 use boxel_pack::{FontProvider, GuiScaling, GuiTexture, PackFont};
+use std::collections::HashMap;
 
 impl From<GuiScaling> for Scaling {
     fn from(scaling: GuiScaling) -> Self {
@@ -72,16 +73,20 @@ impl FontBuilder {
     /// negative ones to 0). Within the font the first provider with a character wins, as in
     /// Minecraft; its glyphs replace those added to this builder before.
     pub fn pack_font(&mut self, font: &PackFont) -> &mut Self {
+        // Providers that name the same image share it: copy it out once.
+        let mut images: HashMap<(*const u8, u32, u32), GlyphBitmap> = HashMap::new();
         for provider in font.providers.iter().rev() {
             match provider {
                 FontProvider::Bitmap(bitmap) => {
-                    let image = GlyphBitmap {
-                        w: bitmap.width,
-                        h: bitmap.height,
-                        rgba: bitmap.rgba.clone(),
-                    };
+                    let image = images
+                        .entry((bitmap.rgba.as_ptr(), bitmap.width, bitmap.height))
+                        .or_insert_with(|| GlyphBitmap {
+                            w: bitmap.width,
+                            h: bitmap.height,
+                            rgba: bitmap.rgba.to_vec(),
+                        });
                     let rows: Vec<&str> = bitmap.chars.iter().map(String::as_str).collect();
-                    self.bitmap(&image, &rows, bitmap.glyph_height, bitmap.ascent);
+                    self.bitmap(image, &rows, bitmap.glyph_height, bitmap.ascent);
                 }
                 FontProvider::Space(space) => {
                     for &(c, advance) in &space.advances {
@@ -194,7 +199,7 @@ mod tests {
             file: ResourceId::parse("test:font/grid.png"),
             width,
             height: h,
-            rgba,
+            rgba: rgba.into(),
             chars: chars.iter().map(|s| (*s).to_owned()).collect(),
             glyph_height: height,
             ascent,

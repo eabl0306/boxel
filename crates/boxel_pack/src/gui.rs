@@ -140,7 +140,8 @@ impl GuiPack {
     /// A font: `minecraft:default` reads `assets/minecraft/font/default.json` with its bitmap
     /// and space providers and their images, following `reference` providers inside the pack.
     /// Providers that cannot be used are skipped with a warning in [`PackFont::warnings`]; a
-    /// font file that does not parse is an error.
+    /// font file that does not parse is an error. Each font file is read and each image decoded
+    /// once, however many times the pack names them.
     pub fn font(&self, id: &ResourceId) -> Result<Option<PackFont>, PackError> {
         font::load(self, id)
     }
@@ -176,7 +177,10 @@ impl GuiPack {
         let (width, height, rgba) = match meta.animation {
             None => (image.width, image.height, image.rgba),
             Some(raw) => {
-                // An animated GUI texture shows the first frame of its sequence.
+                // An animated GUI texture shows the first frame of its sequence, after
+                // Minecraft drops the frames it cannot play; with one frame or none left it is
+                // static and shows strip frame 0. The dropped frames' warnings do not matter
+                // for a still frame.
                 let animation = raw.into_animation();
                 let (fw, fh) = animation.frame_size(image.width, image.height);
                 let frames = split_frames(image.width, image.height, &image.rgba, &animation)
@@ -184,9 +188,11 @@ impl GuiPack {
                         path: png.clone(),
                         message,
                     })?;
-                let first = animation.frames.first().map_or(0, |f| f.index) as usize;
+                let first = animation
+                    .timeline(frames.len() as u32, &mut Vec::new())
+                    .map_or(0, |timeline| timeline.frames()[0].index);
                 let frame = frames
-                    .get(first)
+                    .get(first as usize)
                     .or(frames.first())
                     .cloned()
                     .unwrap_or_default();
@@ -252,8 +258,14 @@ enum BorderRaw {
     },
 }
 
-/// Reads a GUI texture's `.png.mcmeta`, with Minecraft's checks: sizes above 0 and a
-/// nine-slice that keeps a center on both axes.
+/// Whether `width` by `height` is a size Minecraft takes: above 0 and an `int`.
+fn valid_gui_size(width: u32, height: u32) -> bool {
+    let valid = |n: u32| (1..=i32::MAX as u32).contains(&n);
+    valid(width) && valid(height)
+}
+
+/// Reads a GUI texture's `.png.mcmeta`, with Minecraft's checks: sizes above 0 and up to
+/// `i32::MAX` and a nine-slice that keeps a center on both axes.
 fn read_meta(path: &Path) -> Result<GuiMeta, PackError> {
     let text = std::fs::read_to_string(path).map_err(|source| PackError::Io {
         path: path.to_path_buf(),
@@ -271,7 +283,7 @@ fn read_meta(path: &Path) -> Result<GuiMeta, PackError> {
     let scaling = match file.gui.and_then(|g| g.scaling) {
         None | Some(ScalingRaw::Stretch) => GuiScaling::Stretch,
         Some(ScalingRaw::Tile { width, height }) => {
-            if width == 0 || height == 0 {
+            if !valid_gui_size(width, height) {
                 return Err(invalid(format!("tile size {width}x{height}")));
             }
             GuiScaling::Tile { width, height }
@@ -292,7 +304,7 @@ fn read_meta(path: &Path) -> Result<GuiMeta, PackError> {
                 } => [left, top, right, bottom],
             };
             let [left, top, right, bottom] = border;
-            if width == 0 || height == 0 {
+            if !valid_gui_size(width, height) {
                 return Err(invalid(format!("nine-slice size {width}x{height}")));
             }
             if left.saturating_add(right) >= width {
