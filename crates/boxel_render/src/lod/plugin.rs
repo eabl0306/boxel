@@ -177,7 +177,7 @@ pub(crate) fn extract_lod(
     let horizon = stats.off.is_none().then_some(stats.horizon as f32);
     let (input, resync) = frame_input(
         frame.lod_renderer,
-        frame.resync,
+        frame.resync != crate::plugin::Resync::None,
         state.valid.as_ref(),
         horizon,
         ops.take(),
@@ -462,7 +462,7 @@ mod tests {
         world.resource_mut::<LodOps>().ops.push(remove(3));
         let mut frame = world.resource_mut::<ExtractedFrame>();
         frame.lod_renderer = renderer(true, None);
-        frame.resync = true;
+        frame.resync = crate::plugin::Resync::Chunks;
         schedule.run(&mut world);
         let input = world
             .resource::<ExtractedFrame>()

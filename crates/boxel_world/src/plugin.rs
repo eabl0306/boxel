@@ -1,14 +1,26 @@
 use crate::interest::Viewer;
 use crate::jobs::{JobExecutor, TaskPoolExecutor};
+use crate::lifecycle::{
+    OpenSystems, PendingOpen, SaveSystems, TeardownSystems, WorldEpoch, WorldEvent, WorldGarbage,
+    WorldLifecycle, WorldLifecycleSystems, WorldOpen, WorldSave, WorldScope, WorldScopeApp,
+    WorldShutdownSystems, WorldTeardown, despawn_world_entities, drive_world_lifecycle,
+    lifecycle_busy, lifecycle_startup, open_engine_state, placeholder_generator,
+    save_world_on_exit, world_open,
+};
 use crate::map::DataChange;
 use crate::neighbor_rules::{BlockUses, NeighborRules};
+use crate::persist::close_store_on_exit;
 use crate::sky::{SkyMap, SkyRule};
 use crate::streaming::{Ctx, ViewerChunks, WorldJobs};
 use crate::{ChunkId, ChunkMap, ChunkVisibility, WorldStats};
-use boxel_app::{App, Idle, IdleStep, IdleWanted, IdleWork, Last, Plugin, Update};
+use boxel_app::{
+    App, Idle, IdleStep, IdleWanted, IdleWork, Last, Plugin, PreStartup, PreUpdate, Shutdown,
+    Update,
+};
 use boxel_diagnostic::DiagnosticsBoard;
 use boxel_ecs::message::MessageCursor;
 use boxel_ecs::prelude::*;
+use boxel_ecs::schedule::SingleThreadedExecutor;
 use boxel_light::sky_tile::DEFAULT_WALK_LIMIT;
 use boxel_mesh::{AoPolicy, ChunkMesh, MaterialTable};
 use boxel_tasks::{AsyncComputeTaskPool, TaskPool};
@@ -398,6 +410,10 @@ pub enum WorldSystems {
 /// stats system in `Last` refreshes `WorldStats` and publishes a `"world"` line to
 /// `DiagnosticsBoard` if present. `TaskPoolPlugin` is recommended (pool sizes); without it the
 /// default executor initializes a default async compute pool.
+///
+/// Worlds open and close while the app runs ([`crate::lifecycle`]): the generator and the
+/// settings here are the world opened before `Startup` (read from the `WorldContent` and
+/// `WorldSettings` resources as they are then); [`WorldPlugin::closed`] starts with none.
 pub struct WorldPlugin {
     /// Generator.
     pub generator: Arc<dyn WorldGenerator>,
@@ -422,6 +438,16 @@ impl WorldPlugin {
     }
 }
 
+impl WorldPlugin {
+    /// No world at startup: one opens later, at any time, through the lifecycle
+    /// ([`WorldSpec`](crate::lifecycle::WorldSpec),
+    /// [`WorldCommandsExt`](crate::lifecycle::WorldCommandsExt)). The registry is the app's, for
+    /// every world.
+    pub fn closed(registry: Arc<BlockRegistry>) -> Self {
+        Self::new(Arc::clone(placeholder_generator()), registry)
+    }
+}
+
 impl Default for WorldPlugin {
     /// An empty world: a [`FlatGenerator`] without layers and a registry with air only (the
     /// engine has no content, #48; a game passes its own, [`WorldPlugin::new`]), default
@@ -436,6 +462,7 @@ impl Default for WorldPlugin {
 
 impl Plugin for WorldPlugin {
     fn build(&self, app: &mut App) {
+        let closed = Arc::ptr_eq(&self.generator, placeholder_generator());
         if self.registry.is_empty() {
             tracing::warn!(
                 generator = self.generator.name(),
@@ -449,13 +476,6 @@ impl Plugin for WorldPlugin {
             self.generator.vertical_chunks(),
             self.settings.sky_walk_limit,
         );
-        if rule == SkyRule::Open {
-            tracing::warn!(
-                generator = self.generator.name(),
-                "the generator does not declare its top (WorldGenerator::vertical_chunks): \
-                 light runs without sky tops, every column is open sky"
-            );
-        }
         let workers = async_compute_threads();
         let mut jobs = WorldJobs::new(1, workers, Arc::clone(&self.executor));
         jobs.begin_frame(&self.settings, Instant::now());
@@ -510,10 +530,122 @@ impl Plugin for WorldPlugin {
             )
             .add_systems(
                 Idle,
-                (renderer_resyncs, idle_world, publish_data_changes).chain(),
+                (renderer_resyncs, idle_world, publish_data_changes)
+                    .chain()
+                    .run_if(world_open),
             )
             .add_systems(Last, publish_stats);
+        add_lifecycle(app, closed);
     }
+}
+
+/// The lifecycle of the app's worlds (`crate::lifecycle`): its resources, schedules and
+/// driver, the world's gates, teardown and open, and the world's per-world registrations. The
+/// world of [`WorldPlugin::new`] opens in `PreStartup`, from the resources as they are then.
+fn add_lifecycle(app: &mut App, closed: bool) {
+    let single = |schedule: &mut Schedule| {
+        schedule.set_executor(SingleThreadedExecutor::new());
+    };
+    if !closed {
+        app.init_resource::<PendingOpen>();
+    }
+    app.init_resource::<WorldLifecycle>()
+        .init_resource::<WorldEpoch>()
+        .init_resource::<WorldGarbage>()
+        .init_resource::<WorldScope>()
+        .add_message::<WorldEvent>()
+        .edit_schedule(WorldSave, single)
+        .edit_schedule(WorldTeardown, single)
+        .edit_schedule(WorldOpen, single)
+        .configure_sets(WorldSave, (SaveSystems::Game, SaveSystems::World).chain())
+        .configure_sets(
+            WorldTeardown,
+            (
+                TeardownSystems::Despawn,
+                TeardownSystems::Physics,
+                TeardownSystems::Ticks,
+                TeardownSystems::Persist,
+                TeardownSystems::Streaming,
+                TeardownSystems::Lod,
+                TeardownSystems::Render,
+                TeardownSystems::Game,
+            )
+                .chain(),
+        )
+        .configure_sets(WorldOpen, (OpenSystems::Engine, OpenSystems::Game).chain())
+        // A closed world streams nothing; the other world systems find empty state.
+        .configure_sets(Update, WorldSystems::Interest.run_if(world_open))
+        .add_systems(PreStartup, lifecycle_startup.in_set(WorldLifecycleSystems))
+        // Exclusive, and only with requests or a close in progress. Its order against the rest
+        // of `PreUpdate` (input) does not matter: it comes before the persistence's entity step
+        // and the frame's fixed steps.
+        .add_systems(
+            PreUpdate,
+            drive_world_lifecycle
+                .in_set(WorldLifecycleSystems)
+                .run_if(lifecycle_busy)
+                .ambiguous_with_all(),
+        )
+        .configure_sets(
+            Shutdown,
+            (WorldShutdownSystems::Save, WorldShutdownSystems::Close).chain(),
+        )
+        .add_systems(
+            Shutdown,
+            (
+                save_world_on_exit.in_set(WorldShutdownSystems::Save),
+                close_store_on_exit.in_set(WorldShutdownSystems::Close),
+            ),
+        )
+        .add_systems(
+            WorldTeardown,
+            (
+                despawn_world_entities.in_set(TeardownSystems::Despawn),
+                teardown_streaming.in_set(TeardownSystems::Streaming),
+            ),
+        )
+        .add_systems(WorldOpen, open_engine_state.in_set(OpenSystems::Engine))
+        .world_resource::<ChunkMap>(ChunkMap::is_clear)
+        .world_resource::<SkyMap>(SkyMap::is_clear)
+        .world_resource::<WorldJobs>(WorldJobs::is_clear)
+        .world_resource::<WorldContent>(|c| Arc::ptr_eq(&c.generator, placeholder_generator()))
+        .world_resource::<ChunkVisibility>(ChunkVisibility::is_clear)
+        .world_resource::<ViewerChunks>(|v| v.0.is_empty())
+        .world_resource::<WorldStats>(|s| *s == WorldStats::default())
+        .world_resource::<EditQueue>(EditQueue::is_empty)
+        .world_message::<ChunkMeshEvent>()
+        .world_message::<ChunkMeshResync>()
+        .world_message::<BlockChanged>()
+        .world_message::<ChunkDataEvent>();
+}
+
+/// `WorldTeardown`, `TeardownSystems::Streaming`: the map, the sky tops and the jobs back to a
+/// new world's (their contents dropped off the main thread), the generator back to the
+/// placeholder.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a Bevy-style system: one parameter per resource it resets"
+)]
+fn teardown_streaming(
+    mut map: ResMut<ChunkMap>,
+    mut sky: ResMut<SkyMap>,
+    mut jobs: ResMut<WorldJobs>,
+    mut visibility: ResMut<ChunkVisibility>,
+    mut viewers: ResMut<ViewerChunks>,
+    mut stats: ResMut<WorldStats>,
+    mut edits: ResMut<EditQueue>,
+    mut content: ResMut<WorldContent>,
+    mut garbage: ResMut<WorldGarbage>,
+) {
+    garbage.push(map.take_all());
+    garbage.push(sky.take_all());
+    garbage.push(jobs.reset_world());
+    garbage.push(std::mem::take(&mut *visibility));
+    garbage.push(std::mem::take(&mut viewers.0));
+    *stats = WorldStats::default();
+    garbage.push(std::mem::take(&mut edits.edits));
+    let generator = std::mem::replace(&mut content.generator, Arc::clone(placeholder_generator()));
+    garbage.push(generator);
 }
 
 /// Threads of the async compute pool (initializing a default pool if `TaskPoolPlugin` did not

@@ -11,7 +11,7 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 /// File of a world directory ([`WorldStore::open_dir`]).
 pub const WORLD_FILE: &str = "world.redb";
@@ -34,6 +34,12 @@ const RESERVED: &str = "boxel:";
 
 /// Openings of a world in this process ([`WorldStore::open`]), to tell two openings apart.
 static OPENINGS: AtomicU64 = AtomicU64::new(0);
+
+/// How many worlds this process opened so far: a store opened later has an
+/// [`opened_seq`](WorldStore::opened_seq) at least this.
+pub(crate) fn openings() -> u64 {
+    OPENINGS.load(Ordering::SeqCst)
+}
 
 /// Why a world could not be opened.
 #[derive(Debug)]
@@ -501,6 +507,16 @@ impl WorldStore {
         if self.is_closed() { closed_error() } else { e }
     }
 
+    /// A handle that does not keep the world alive (its handle count, once closed).
+    pub(crate) fn downgrade(&self) -> WeakStore {
+        WeakStore(Arc::downgrade(&self.inner))
+    }
+
+    /// What [`WorldStore::open`] read is still there: no world was served from this store.
+    pub(crate) fn has_opened(&self) -> bool {
+        self.inner.opened.lock().expect("opened lock").is_some()
+    }
+
     /// What [`WorldStore::open`] read for the world (taken once, by the persistence plugin).
     pub(crate) fn take_opened(&self) -> Option<Opened> {
         self.inner.opened.lock().expect("opened lock").take()
@@ -740,6 +756,16 @@ impl WorldStore {
         self.inner
             .entity_errors
             .fetch_add(errors, Ordering::Relaxed);
+    }
+}
+
+/// A [`WorldStore`] handle that does not keep it alive.
+pub(crate) struct WeakStore(Weak<Inner>);
+
+impl WeakStore {
+    /// Handles of the world still alive.
+    pub(crate) fn handles(&self) -> usize {
+        self.0.strong_count()
     }
 }
 

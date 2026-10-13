@@ -3188,3 +3188,32 @@ fn a_jump_replanned_over_frames_keeps_every_sent_node_under_its_parent() {
     }
     assert!(replanning > 2, "the replan took {replanning} frames");
 }
+
+/// A world's close (`LodWorld::reset_world`) leaves a new world's LOD: only the settings checks
+/// and the warnings already logged stay (the app's); the store, the edits and the epoch go.
+#[test]
+fn a_reset_keeps_only_the_settings_checks_and_the_warnings() {
+    let mut lod = LodWorld::new(Arc::new(InlineExecutor));
+    lod.check_settings(&LodSettings::default(), true);
+    lod.warned.push(LodOff::Guard);
+    let key = ChunkKey {
+        dim: DimensionId(0),
+        lod: 0,
+        pos: ChunkPos::new(1 << 35, 0, 0),
+    };
+    lod.edits.insert(key);
+    lod.epoch = 7;
+    assert!(!lod.is_world_clear());
+    let (old, handed_off) = lod.reset_world();
+    assert!(handed_off.is_empty());
+    assert_eq!(old.epoch, 7);
+    assert!(lod.is_world_clear());
+    assert!(lod.validated.is_some() && lod.error.is_none());
+    assert_eq!(lod.warned, vec![LodOff::Guard]);
+    assert_eq!(lod.epoch, 0);
+    assert_eq!(
+        lod.off,
+        Some(LodOff::InvalidSettings),
+        "as a new one starts"
+    );
+}

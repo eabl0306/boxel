@@ -66,10 +66,12 @@ pub use pack_textures::{
 pub use path::{CullCounts, cull_counts};
 pub use plugin::{
     DebugDestroyDevice, GpuFailed, GpuReady, PresentSettings, Render, RenderInfo, RenderPlugin,
-    RenderSettings, RenderSystems, RequestScreenshot, ScreenshotSaved, SurfaceInfo,
+    RenderSettings, RenderSystems, RequestScreenshot, Resync, ScreenshotSaved, SurfaceInfo,
 };
 #[doc(hidden)]
 pub use plugin::{frame_visibility, frame_visibility_with};
+#[doc(hidden)]
+pub use renderer::ResetState;
 pub use renderer::{
     DEFAULT_SKY_COLOR, FLUID_TIME_PERIOD, RenderStats, RendererConfig, RendererError,
     TEXTURE_TICKS_PER_SECOND, ViewParams, VoxelRenderer, texture_tick,

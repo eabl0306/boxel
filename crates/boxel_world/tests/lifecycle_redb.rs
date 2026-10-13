@@ -3,7 +3,8 @@
 //! repaired, and the app of the world logs one warning, also when the world opened before
 //! anything logged; the exit (`Shutdown`) saves everything, lets a game system ordered before
 //! `WorldShutdownSystems::Close` write its value and then closes the file, far from the origin
-//! and with the task pools, as in the game.
+//! and with the task pools, as in the game. A world closed while the app runs releases its file
+//! the same way, and an exit while it closes finishes the close first.
 use boxel_app::{App, Shutdown};
 use boxel_ecs::prelude::*;
 use boxel_math::DVec3;
@@ -13,15 +14,19 @@ use boxel_voxel::{
     LocalPos,
 };
 use boxel_world::jobs::{InlineExecutor, IoTaskPoolExecutor, TaskPoolExecutor};
+use boxel_world::lifecycle::{
+    CloseOptions, WorldLifecycle, WorldScoped, WorldSpec, WorldStatus, close_world, open_world,
+};
 use boxel_world::persist::{
     ChunkStore, PersistPlugin, PersistSettings, RedbStore, WORLD_FILE, WorldShutdownSystems,
     WorldStore,
 };
-use boxel_world::{ChunkMap, ChunkViewer, EditQueue, WorldPlugin, WorldStats};
+use boxel_world::{ChunkMap, ChunkViewer, EditQueue, WorldPlugin, WorldSettings, WorldStats};
 use boxel_worldgen::WorldGenerator;
 use std::io;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -192,7 +197,7 @@ fn crashed_worlds(dir: &Path, registry: &BlockRegistry, count: usize) -> Vec<Pat
     copies
 }
 
-/// An app with the world of `store` (built, never updated).
+/// An app with the world of `store`, updated once (the world opens in its first update).
 fn app_with(store: WorldStore, registry: &Arc<BlockRegistry>) -> App {
     let mut app = App::new();
     app.add_plugins(WorldPlugin {
@@ -201,16 +206,14 @@ fn app_with(store: WorldStore, registry: &Arc<BlockRegistry>) -> App {
         executor: Arc::new(InlineExecutor),
         ..WorldPlugin::default()
     })
-    .add_plugins(PersistPlugin {
-        store,
-        executor: Arc::new(InlineExecutor),
-    });
+    .add_plugins(PersistPlugin::new(store).with_executor(Arc::new(InlineExecutor)));
+    app.update();
     app
 }
 
 /// A world opened before anything logs (`voxel_world` and `snapshot` open theirs before
-/// `LogPlugin` installs the subscriber) still reports its repair, once, when its `PersistPlugin`
-/// is added; one opened while the app logs reports it once too, not twice; a clean one or a new
+/// `LogPlugin` installs the subscriber) still reports its repair, once, when the app opens the
+/// world; one opened while the app logs reports it once too, not twice; a clean one or a new
 /// one never (redb runs its repair on a file it creates too).
 #[test]
 fn a_repair_is_logged_once_by_the_app_of_the_world() {
@@ -288,10 +291,7 @@ fn start(dir: &Path, registry: &Arc<BlockRegistry>, p: BlockPos) -> (App, Entity
         executor: Arc::new(TaskPoolExecutor),
         ..WorldPlugin::default()
     })
-    .add_plugins(PersistPlugin {
-        store,
-        executor: Arc::new(IoTaskPoolExecutor),
-    })
+    .add_plugins(PersistPlugin::new(store).with_executor(Arc::new(IoTaskPoolExecutor)))
     .insert_resource(PersistSettings {
         autosave: None,
         ..PersistSettings::default()
@@ -407,4 +407,148 @@ fn the_exit_saves_everything_then_closes_the_file() {
         assert!(began.elapsed() < Duration::from_secs(60), "not loaded");
     }
     assert_eq!(block(&app, b), Some(stone), "saved by the exit");
+}
+
+// ------------------------------------------------------------------ worlds closed at runtime
+
+/// Runs jobs at once, or holds them while `hold` is set until someone runs them.
+#[derive(Default)]
+struct Switch {
+    hold: AtomicBool,
+    held: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+}
+
+impl boxel_world::jobs::JobExecutor for Switch {
+    fn spawn(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+        if self.hold.load(Ordering::SeqCst) {
+            self.held.lock().unwrap().push(job);
+        } else {
+            job();
+        }
+    }
+}
+
+impl Switch {
+    fn run_held(&self) {
+        loop {
+            let jobs = std::mem::take(&mut *self.held.lock().unwrap());
+            if jobs.is_empty() {
+                return;
+            }
+            for job in jobs {
+                job();
+            }
+        }
+    }
+}
+
+/// An app without a world, chunk jobs on the task pool, saves on `io`, no autosave.
+fn closed_app(registry: &Arc<BlockRegistry>, io: Arc<dyn boxel_world::jobs::JobExecutor>) -> App {
+    let mut app = App::new();
+    app.add_plugins(WorldPlugin {
+        executor: Arc::new(TaskPoolExecutor),
+        ..WorldPlugin::closed(Arc::clone(registry))
+    })
+    .add_plugins(PersistPlugin::without_store().with_executor(io))
+    .insert_resource(PersistSettings {
+        autosave: None,
+        ..PersistSettings::default()
+    });
+    app.update();
+    app
+}
+
+/// Opens the world of `dir` in `app` with its viewer at `p` (despawned with the world) and
+/// settles it.
+fn open_dir(app: &mut App, dir: &Path, registry: &Arc<BlockRegistry>, p: BlockPos) {
+    let store = WorldStore::open_dir(dir, registry, "ground").expect("opens");
+    let spec = WorldSpec::new(Arc::new(Ground), WorldSettings::default()).with_store(store);
+    open_world(app.world_mut(), spec).expect("the world opens");
+    app.world_mut().spawn((
+        Transform::from_translation(center(p)),
+        ChunkViewer::new(1).with_vertical_radius(1),
+        WorldScoped,
+    ));
+    settle(app);
+}
+
+/// Test 15 at runtime: once a world closed (`WorldEvent::Closed`), its file opens again at once
+/// and cleanly, and the same folder serves the next world with its edits.
+#[test]
+fn a_closed_worlds_file_opens_again_at_once() {
+    let tmp = TempDir::new("closed");
+    let registry = Arc::new(boxel_demo::blocks::registry());
+    let stone = registry.by_name("boxel:stone").unwrap();
+    let o = BlockPos::new(1 << 40, 2, -(1 << 40));
+    let mut app = closed_app(&registry, Arc::new(IoTaskPoolExecutor));
+    open_dir(&mut app, &tmp.0, &registry, o);
+    edit(&mut app, at(o, 1, 0, 1), stone);
+    assert!(close_world(app.world_mut(), CloseOptions::default()));
+    let began = Instant::now();
+    while app.world().resource::<WorldLifecycle>().status() != WorldStatus::Closed {
+        app.update();
+        assert!(began.elapsed() < Duration::from_secs(30), "not closed");
+    }
+    let report = app
+        .world()
+        .resource::<WorldLifecycle>()
+        .last_report()
+        .unwrap();
+    assert!(report.saved && report.errors.is_empty(), "{report:?}");
+    assert_eq!(report.store_handles, 0);
+    drop(open_clean(&tmp.0.join(WORLD_FILE)).expect("released and clean"));
+    open_dir(&mut app, &tmp.0, &registry, o);
+    assert_eq!(block(&app, at(o, 1, 0, 1)), Some(stone));
+}
+
+/// Test 18 while closing: an exit while the world closes finishes the close on its thread:
+/// the last save is written and the file is closed cleanly before the app returns.
+#[test]
+fn an_exit_while_closing_finishes_the_close() {
+    let tmp = TempDir::new("exit-closing");
+    let registry = Arc::new(boxel_demo::blocks::registry());
+    let stone = registry.by_name("boxel:stone").unwrap();
+    let o = BlockPos::new(-(1 << 40), 2, 1 << 40);
+    let switch = Arc::new(Switch::default());
+    let mut app = closed_app(&registry, Arc::clone(&switch) as _);
+    open_dir(&mut app, &tmp.0, &registry, o);
+    edit(&mut app, at(o, 2, 0, 2), stone);
+    switch.hold.store(true, Ordering::SeqCst);
+    assert!(close_world(app.world_mut(), CloseOptions::default()));
+    assert_eq!(
+        app.world().resource::<WorldLifecycle>().status(),
+        WorldStatus::Closing,
+        "the last save waits"
+    );
+    // Another thread runs the held jobs while the exit waits for them.
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    let worker = {
+        let switch = Arc::clone(&switch);
+        std::thread::spawn(move || {
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                stopped.recv_timeout(Duration::from_millis(2))
+            {
+                switch.run_held();
+            }
+            switch.run_held();
+        })
+    };
+    app.shutdown();
+    stop.send(()).unwrap();
+    worker.join().unwrap();
+    assert_eq!(
+        app.world().resource::<WorldLifecycle>().status(),
+        WorldStatus::Closed
+    );
+    assert!(
+        app.world()
+            .resource::<WorldLifecycle>()
+            .last_report()
+            .unwrap()
+            .saved
+    );
+    drop(open_clean(&tmp.0.join(WORLD_FILE)).expect("released and clean"));
+    let mut app = closed_app(&registry, Arc::new(InlineExecutor));
+    open_dir(&mut app, &tmp.0, &registry, o);
+    assert_eq!(block(&app, at(o, 2, 0, 2)), Some(stone));
 }

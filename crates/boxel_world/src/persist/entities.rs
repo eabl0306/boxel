@@ -21,9 +21,10 @@
 //! - A record is brought back only if its id is not alive and it is the newest record of its id:
 //!   a chunk that unloads and loads again never brings an entity back twice.
 use super::format::{EntityPart, entity_parts, entity_payload};
-use super::plugin::{PersistSettings, save_meta};
+use super::plugin::{PersistSettings, save_meta, stage_game_meta};
 use super::saver::{Moment, Persist};
 use super::store::WorldStore;
+use crate::lifecycle::WorldLifecycle;
 use crate::streaming::WorldJobs;
 use crate::{BlockTicks, ChunkMap, ChunkViewer, TimeOfDay, WorldSettings};
 use boxel_app::App;
@@ -125,8 +126,14 @@ pub(crate) struct SavedLog {
 }
 
 impl SavedLog {
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.added.is_empty() && self.removed.is_empty()
+    }
+
+    /// Forgets every marker that came or went.
+    pub(crate) fn clear(&mut self) {
+        self.added.clear();
+        self.removed.clear();
     }
 }
 
@@ -409,26 +416,7 @@ pub(crate) fn entity_work(jobs: Res<WorldJobs>, log: Res<SavedLog>) -> bool {
 /// edited chunks, the pending ticks and the clock (before the frame's fixed steps: a body comes
 /// back before physics steps its chunk, and goes before physics would freeze it there).
 pub(crate) fn entity_step(world: &mut World) {
-    run(world, false);
-}
-
-/// `Shutdown`, before the world's last save: every saved entity alive is saved.
-pub(crate) fn save_entities_on_exit(world: &mut World) {
-    run(world, true);
-}
-
-/// The entity step (see [`entity_step`]); `exit` saves every entity alive.
-fn run(world: &mut World, exit: bool) {
-    let settings = world.resource::<WorldSettings>();
-    let (dim, bounds) = (settings.dimension, settings.vertical_bounds.clone());
-    let log = world
-        .get_resource_mut::<SavedLog>()
-        .map(|mut log| std::mem::take(&mut *log))
-        .unwrap_or_default();
-    let codecs = world
-        .get_resource::<EntityCodecs>()
-        .cloned()
-        .unwrap_or_default();
+    let (log, codecs, dim, bounds) = step_inputs(world);
     world.resource_scope(|world, mut jobs: Mut<WorldJobs>| {
         // Saving changes nothing the readers of the world's jobs see.
         let Some(p) = jobs.bypass_change_detection().persist.as_mut() else {
@@ -451,16 +439,98 @@ fn run(world: &mut World, exit: bool) {
         if std::mem::take(&mut step.p.entities.unloaded) || fresh {
             step.put_away();
         }
-        // On exit the save step that follows stages the rest of the moment.
-        let asked = step.p.moment == Moment::Asked;
-        if exit || asked {
+        if step.p.moment == Moment::Asked {
             step.snapshot();
-        }
-        if asked && !exit {
             step.stage_world();
             step.p.moment = Moment::Taken;
         }
     });
+}
+
+/// What every run of the entity step reads: the markers that came or went (taken), the codecs,
+/// the dimension and the vertical bounds.
+fn step_inputs(
+    world: &mut World,
+) -> (
+    SavedLog,
+    EntityCodecs,
+    DimensionId,
+    Option<RangeInclusive<i64>>,
+) {
+    let settings = world.resource::<WorldSettings>();
+    let (dim, bounds) = (settings.dimension, settings.vertical_bounds.clone());
+    let log = world
+        .get_resource_mut::<SavedLog>()
+        .map(|mut log| std::mem::take(&mut *log))
+        .unwrap_or_default();
+    let codecs = world
+        .get_resource::<EntityCodecs>()
+        .cloned()
+        .unwrap_or_default();
+    (log, codecs, dim, bounds)
+}
+
+/// `WorldSave`, `SaveSystems::World` (a close and the exit): the world's last moment. The
+/// records chunk loads read and no step brought back yet stay as they are on disk; the markers
+/// that came or went are followed (a saved entity the game despawned before the close loses its
+/// record); every saved entity alive is saved under its chunk, with the edited chunks, the
+/// pending ticks, the clock and the game data staged with `WorldLifecycle::stage_meta`, as one
+/// moment that the next save job writes whole.
+pub(crate) fn close_snapshot(world: &mut World) {
+    let (log, codecs, dim, bounds) = step_inputs(world);
+    world.resource_scope(|world, mut jobs: Mut<WorldJobs>| {
+        let Some(p) = jobs.bypass_change_detection().persist.as_mut() else {
+            return;
+        };
+        let mut step = Step {
+            world,
+            codecs: &codecs,
+            p,
+            dim,
+            bounds,
+        };
+        step.p.entities.arrived.clear();
+        let forgotten = log
+            .removed
+            .iter()
+            .filter(|&&(entity, id)| step.p.entities.live.get(&id) == Some(&entity))
+            .count();
+        if forgotten > 0 {
+            tracing::debug!(
+                forgotten,
+                "saved entities despawned before the close lose their records"
+            );
+        }
+        for (entity, id) in log.removed {
+            step.forget(entity, id);
+        }
+        step.adopt(log.added);
+        step.snapshot();
+        step.stage_world();
+        // Whether the autosave's moment was asked or taken, this one covers it.
+        step.p.moment = Moment::None;
+    });
+}
+
+/// `WorldTeardown`, `TeardownSystems::Despawn`: every saved entity alive is despawned, viewers
+/// included, after `close_snapshot` made its record (it leaves the index first, so its discard
+/// hook removes nothing).
+pub(crate) fn put_away_all(world: &mut World) {
+    let alive: Vec<Entity> = {
+        let Some(mut jobs) = world.get_resource_mut::<WorldJobs>() else {
+            return;
+        };
+        let Some(p) = jobs.bypass_change_detection().persist.as_mut() else {
+            return;
+        };
+        p.entities.made.clear();
+        let mut alive: Vec<(u64, Entity)> = p.entities.live.drain().collect();
+        alive.sort_unstable_by_key(|&(id, _)| id);
+        alive.into_iter().map(|(_, e)| e).collect()
+    };
+    for entity in alive {
+        world.despawn(entity);
+    }
 }
 
 /// One run of the entity step.
@@ -727,6 +797,9 @@ impl Step<'_> {
             self.world.get_resource::<BlockTicks>(),
             self.world.get_resource::<TimeOfDay>(),
         );
+        if let Some(mut lifecycle) = self.world.get_resource_mut::<WorldLifecycle>() {
+            stage_game_meta(self.p, &mut lifecycle);
+        }
     }
 
     /// Saves every saved entity alive under its chunk: the ones whose record is not current

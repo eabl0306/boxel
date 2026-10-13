@@ -125,10 +125,7 @@ impl Setup {
                 ..WorldSettings::default()
             },
         })
-        .add_plugins(PersistPlugin {
-            store,
-            executor: Arc::clone(&self.io),
-        });
+        .add_plugins(PersistPlugin::new(store).with_executor(Arc::clone(&self.io)));
         if self.fluids {
             app.add_plugins(FluidPlugin);
         }
@@ -609,10 +606,7 @@ fn the_world_clock_is_saved() {
             registry: Arc::new(boxel_demo::blocks::registry()),
             ..WorldPlugin::default()
         })
-        .add_plugins(PersistPlugin {
-            store,
-            executor: Arc::new(InlineExecutor),
-        })
+        .add_plugins(PersistPlugin::new(store).with_executor(Arc::new(InlineExecutor)))
         .insert_resource(settings)
         .insert_resource(TimeOfDay::at_clock(hours));
         app.update();
@@ -636,11 +630,12 @@ fn the_world_clock_is_saved() {
     assert_eq!(app.world().resource::<TimeOfDay>().tick, tick, "still");
 }
 
-/// A `WorldStore` serves one `PersistPlugin`. A second one (a clone of the store, in a new app)
-/// would start without the index of saved chunks and save generated copies over them: it
-/// panics. A new app opens the world again.
+/// A `WorldStore` serves one world. A second one (a clone of the store, in a new app) would
+/// start without the index of saved chunks and save generated copies over them: the startup
+/// world of `WorldPlugin::new` refuses to open, a build-time mistake that panics. A new app opens
+/// the world again.
 #[test]
-#[should_panic(expected = "a WorldStore serves one PersistPlugin")]
+#[should_panic(expected = "the world store already served a world")]
 fn a_world_store_serves_one_persist_plugin() {
     let backend: Arc<dyn ChunkStore> = Arc::new(MemoryStore::new());
     let registry = boxel_demo::blocks::registry();
@@ -652,10 +647,8 @@ fn a_world_store_serves_one_persist_plugin() {
             registry: Arc::new(boxel_demo::blocks::registry()),
             ..WorldPlugin::default()
         })
-        .add_plugins(PersistPlugin {
-            store,
-            executor: Arc::new(InlineExecutor),
-        });
+        .add_plugins(PersistPlugin::new(store).with_executor(Arc::new(InlineExecutor)));
+        app.update();
         app
     };
     drop(app(WorldStore::open(
@@ -901,10 +894,7 @@ fn a_chunk_that_comes_back_before_its_save_keeps_its_edits() {
                 ..WorldSettings::default()
             },
         })
-        .add_plugins(PersistPlugin {
-            store,
-            executor: Arc::clone(&setup.io),
-        })
+        .add_plugins(PersistPlugin::new(store).with_executor(Arc::clone(&setup.io)))
         .insert_resource(PersistSettings {
             autosave: None,
             ..PersistSettings::default()
@@ -1105,10 +1095,7 @@ fn a_failed_snapshot_is_taken_again_on_the_next_try() {
         registry: Arc::new(boxel_demo::blocks::registry()),
         ..WorldPlugin::default()
     })
-    .add_plugins(PersistPlugin {
-        store,
-        executor: Arc::new(InlineExecutor),
-    })
+    .add_plugins(PersistPlugin::new(store).with_executor(Arc::new(InlineExecutor)))
     .insert_resource(TimeOfDay::at_clock(6.0));
     app.update();
     assert_eq!(app.world().resource::<TimeOfDay>().tick, 200);

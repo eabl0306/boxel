@@ -5,6 +5,7 @@ use super::{FogInput, FogLayer, FogSettings, FogTime};
 use crate::plugin::{ExtractedFrame, Render, RenderSystems};
 use boxel_app::{App, FixedTime, FixedUpdate, Plugin, RunFixedMainLoop, RunFixedMainLoopSystems};
 use boxel_ecs::prelude::*;
+use boxel_world::lifecycle::{OpenSystems, WorldOpen};
 use std::sync::Arc;
 
 /// The fog clock: fixed steps since the fog started (64 a second), advanced in `FixedUpdate`
@@ -64,8 +65,16 @@ impl Plugin for FogPlugin {
                 RunFixedMainLoop,
                 interpolate_fog_clock.in_set(RunFixedMainLoopSystems::AfterFixedMainLoop),
             )
-            .add_systems(Render, extract_fog.in_set(RenderSystems::Extract));
+            .add_systems(Render, extract_fog.in_set(RenderSystems::Extract))
+            .add_systems(WorldOpen, start_fog_clock.in_set(OpenSystems::Engine));
     }
+}
+
+/// `WorldOpen`: every world starts its fog clock at 0, as a fresh process does (a paused clock
+/// stays paused).
+fn start_fog_clock(mut clock: ResMut<FogClock>) {
+    clock.tick = 0;
+    clock.subtick = 0;
 }
 
 /// `FixedUpdate`: one tick per fixed step.

@@ -721,6 +721,47 @@ impl WorldJobs {
         }
     }
 
+    /// Back to a new world's job state for a world's close, returning the old one to drop off
+    /// the main thread: a new result channel and scheduler (late results of the old jobs go
+    /// nowhere), the edit batches, the published meshes, the planner and the counters as a fresh
+    /// process has them. Kept: the executor, the mesh job body, the test clock, the measured job
+    /// cost of the automatic cap and the uniform snapshots (one per block state of the registry).
+    /// The save state was taken by the persistence first.
+    pub(crate) fn reset_world(&mut self) -> WorldJobs {
+        debug_assert!(self.persist.is_none(), "the save state goes first");
+        let mut fresh = WorldJobs::new(1, self.auto_cap.workers, Arc::clone(&self.executor));
+        fresh.mesh_fn = self.mesh_fn;
+        fresh.mesh_options = self.mesh_options;
+        fresh.light_cache_sq = self.light_cache_sq;
+        fresh.hold = self.hold;
+        fresh.now = self.now;
+        #[cfg(test)]
+        {
+            fresh.manual_clock = self.manual_clock;
+        }
+        fresh.auto_cap = std::mem::replace(&mut self.auto_cap, AutoCap::new(1));
+        fresh.uniform = std::mem::take(&mut self.uniform);
+        std::mem::replace(self, fresh)
+    }
+
+    /// Uniform snapshots kept (tests).
+    #[cfg(test)]
+    pub(crate) fn uniform_len(&self) -> usize {
+        self.uniform.len()
+    }
+
+    /// Nothing of a world: no save state, no published or waiting mesh, no edit batch, no job.
+    pub(crate) fn is_clear(&self) -> bool {
+        self.persist.is_none()
+            && self.published.is_empty()
+            && self.pending.is_empty()
+            && self.batch_pending.is_empty()
+            && self.batches.is_empty()
+            && self.scheduler.queued() == 0
+            && self.scheduler.in_flight() == 0
+            && self.rx.is_empty()
+    }
+
     /// Priority of a new job for `pos` (nearest current viewer).
     fn priority(&self, pos: ChunkPos) -> u32 {
         self.planner.priority(pos)

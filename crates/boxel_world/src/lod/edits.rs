@@ -40,6 +40,7 @@ use boxel_worldgen::lod::{LodCells, LodColumn};
 use foldhash::{HashMap, HashSet};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// The levels a [`Pyramid`] holds: 1 to 5 (a level-5 cell is one chunk).
@@ -318,12 +319,18 @@ pub(crate) struct PyramidInput {
     pub(crate) materials: Arc<LodMaterials>,
 }
 
-/// A pyramid job's body.
-pub(crate) fn run_pyramids(input: &PyramidInput) -> Vec<(ChunkKey, Arc<Pyramid>)> {
+/// A pyramid job's body. `None` when `alive` went off on the way (the world closed).
+pub(crate) fn run_pyramids(
+    input: &PyramidInput,
+    alive: &AtomicBool,
+) -> Option<Vec<(ChunkKey, Arc<Pyramid>)>> {
     input
         .chunks
         .iter()
         .map(|(key, source)| {
+            if !alive.load(Ordering::Acquire) {
+                return None;
+            }
             let data = source.read(
                 *key,
                 input.store.as_ref(),
@@ -331,7 +338,7 @@ pub(crate) fn run_pyramids(input: &PyramidInput) -> Vec<(ChunkKey, Arc<Pyramid>)
                 &input.registry,
             );
             let classes = input.materials.classes();
-            (*key, Arc::new(Pyramid::of_chunk(classes, &data)))
+            Some((*key, Arc::new(Pyramid::of_chunk(classes, &data))))
         })
         .collect()
 }

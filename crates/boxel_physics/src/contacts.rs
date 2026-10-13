@@ -908,6 +908,13 @@ pub(crate) struct ContactSet {
     writes: EntityHashMap<u32>,
 }
 
+impl ContactSet {
+    /// No pair in contact, this step or the previous one.
+    pub(crate) fn is_clear(&self) -> bool {
+        self.previous.is_empty() && self.current.is_empty()
+    }
+}
+
 /// The face of a box facing direction `d` (its largest component; ties Y, X, Z).
 fn face_toward(d: DVec3) -> Face {
     let a = d.abs();

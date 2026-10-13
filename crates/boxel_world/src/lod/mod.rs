@@ -40,14 +40,14 @@
 //! copy the loaded chunks when they are made, in `Update`.
 use crate::interest::Viewer;
 use crate::jobs::{JobExecutor, TaskPoolExecutor};
+use crate::lifecycle::{TeardownSystems, WorldGarbage, WorldScopeApp, WorldTeardown, world_open};
 use crate::persist::WorldStore;
 use crate::streaming::ViewerChunks;
-use crate::streaming::WorldJobs;
 use crate::{
     BlockChanged, ChunkDataEvent, ChunkMap, ChunkMeshEvent, ChunkMeshResync, ChunkViewer,
     WorldContent, WorldSettings, WorldStats, WorldSystems,
 };
-use boxel_app::{App, Idle, IdleStep, IdleWanted, IdleWork, Plugin, Startup, Update};
+use boxel_app::{App, Idle, IdleStep, IdleWanted, IdleWork, Plugin, Update};
 use boxel_ecs::prelude::*;
 use boxel_math::{DVec3, I64Vec3, Vec3};
 use boxel_mesh::ChunkMesh;
@@ -56,6 +56,7 @@ use boxel_transform::Transform;
 use boxel_voxel::{ChunkKey, ChunkPos, DimensionId};
 use boxel_worldgen::lod::LodRequest;
 use foldhash::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -299,17 +300,26 @@ impl Plugin for LodWorldPlugin {
                     LodSystems::Collect,
                 )
                     .chain()
-                    .after(WorldSystems::Visibility),
+                    .after(WorldSystems::Visibility)
+                    .run_if(world_open),
             )
-            // Its order against the persistence's startup does not matter: it only lists the
-            // saved chunks.
-            .add_systems(Startup, lod_seed_saved.ambiguous_with_all())
+            .add_systems(WorldTeardown, teardown_lod.in_set(TeardownSystems::Lod))
+            .world_resource::<LodWorld>(LodWorld::is_world_clear)
+            .world_resource::<LodCoverage>(LodCoverage::is_clear)
+            .world_resource::<LodOps>(|o| o.ops.is_empty())
+            .world_resource::<LodStats>(|s| *s == LodStats::default())
+            .world_resource::<ViewerEye>(|e| e.0.is_none())
+            .world_resource::<LodFeedback>(|f| {
+                f.refused.is_empty() && f.chunks.is_empty() && f.arena_free_quads.is_none()
+            })
+            .world_message::<LodResync>()
             .add_systems(
                 Update,
                 (
                     track_viewer_eye
                         .ambiguous_with_all()
-                        .before(LodSystems::Plan),
+                        .before(LodSystems::Plan)
+                        .run_if(world_open),
                     lod_edits.in_set(LodSystems::Edits),
                     lod_coverage.in_set(LodSystems::Coverage),
                     lod_plan.in_set(LodSystems::Plan),
@@ -319,8 +329,30 @@ impl Plugin for LodWorldPlugin {
             )
             // Its order against the world's idle step does not matter: they share no state but
             // the step's answer, which keeps the most urgent.
-            .add_systems(Idle, lod_idle.ambiguous_with_all());
+            .add_systems(Idle, lod_idle.ambiguous_with_all().run_if(world_open));
     }
+}
+
+/// `WorldTeardown`, `TeardownSystems::Lod`: the LOD back to a new world's (the old tree, jobs
+/// and coverage dropped off the main thread). The renderer's feedback lists go; whether it can
+/// draw the LOD stays (a renderer fact).
+fn teardown_lod(
+    mut lod: ResMut<LodWorld>,
+    mut coverage: ResMut<LodCoverage>,
+    mut ops: ResMut<LodOps>,
+    mut stats: ResMut<LodStats>,
+    mut eye: ResMut<ViewerEye>,
+    mut feedback: ResMut<LodFeedback>,
+    mut garbage: ResMut<WorldGarbage>,
+) {
+    garbage.push(lod.reset_world());
+    garbage.push(std::mem::take(&mut *coverage));
+    garbage.push(std::mem::take(&mut ops.ops));
+    *stats = LodStats::default();
+    *eye = ViewerEye::default();
+    feedback.refused.clear();
+    feedback.chunks.clear();
+    feedback.arena_free_quads = None;
 }
 
 /// Where the LOD looks from: the active camera's render origin and the eye's offset from it,
@@ -612,6 +644,8 @@ pub(crate) struct LodWorld {
     filled_after: Option<Duration>,
     /// The end of this frame's budget, shared by the steps ([`LodSettings::frame_budget`]).
     deadline: Option<Instant>,
+    /// The world's epoch (`WorldEpoch`), for the fallback's cache of generated cells.
+    epoch: u64,
 }
 
 impl LodWorld {
@@ -650,7 +684,65 @@ impl LodWorld {
             started: None,
             filled_after: None,
             deadline: None,
+            epoch: 0,
         }
+    }
+
+    /// Back to a new world's LOD for a world's close, returning the old one to drop off the
+    /// main thread (its tree included): every column job is cancelled, no job starts another
+    /// and the handed-off ones are taken out. Only the settings checks and the warnings logged
+    /// stay (the app's); the renderer drops its nodes on its own (a resync frame).
+    pub(crate) fn reset_world(&mut self) -> (LodWorld, VecDeque<jobs::Job>) {
+        self.tree.cancel_all();
+        let handed_off = self.jobs.shut();
+        let mut fresh = LodWorld::new(self.jobs.executor());
+        fresh.validated = self.validated.take();
+        fresh.error = self.error.take();
+        fresh.warned = std::mem::take(&mut self.warned);
+        (std::mem::replace(self, fresh), handed_off)
+    }
+
+    /// A world opened: its store (edited chunks unloaded since are read from it), its saved
+    /// chunks as edits (their cells come from their blocks) and its epoch.
+    pub(crate) fn open_world(
+        &mut self,
+        store: Option<WorldStore>,
+        persist: Option<&crate::persist::Persist>,
+        epoch: u64,
+    ) {
+        self.store = store;
+        self.epoch = epoch;
+        let Some(persist) = persist else {
+            return;
+        };
+        if std::mem::replace(&mut self.edits.seeded, true) {
+            return;
+        }
+        for (dim, x, z) in persist.saved_columns() {
+            for &y in persist.layers(dim, x, z) {
+                self.edits.insert(ChunkKey {
+                    dim,
+                    lod: 0,
+                    pos: ChunkPos::new(x, y, z),
+                });
+            }
+        }
+    }
+
+    /// The store the LOD reads (tests).
+    #[cfg(test)]
+    pub(crate) fn store_for_tests(&self) -> Option<&WorldStore> {
+        self.store.as_ref()
+    }
+
+    /// Nothing of a world: no column, no edit, no store or content, no job.
+    fn is_world_clear(&self) -> bool {
+        self.tree.column_count() == 0
+            && self.edits.len() == 0
+            && self.store.is_none()
+            && self.content.is_none()
+            && self.jobs.is_idle()
+            && self.outbox.is_empty()
     }
 }
 
@@ -730,6 +822,13 @@ impl LodWorld {
             .content
             .as_ref()
             .is_some_and(|(g, r, _)| (*g, *r) == (generator, registry));
+        // A world's content is constant: another generator is another world (a close resets
+        // the content first).
+        debug_assert!(
+            self.content.is_none() || same,
+            "the generator or the registry changed inside an open world: close it and open \
+             another one"
+        );
         if !same {
             let materials = Arc::new(LodMaterials::from_registry(&content.registry));
             self.content = Some((generator, registry, materials));
@@ -1271,6 +1370,7 @@ impl LodWorld {
                     chunks,
                     store: self.store.clone(),
                     materials: Arc::clone(&materials),
+                    epoch: self.epoch,
                 };
                 (Vec::new(), None, Some(input))
             } else {
@@ -1466,10 +1566,11 @@ impl LodWorld {
                 registry: Arc::clone(&content.registry),
                 materials: Arc::clone(&materials),
             };
-            self.jobs.spawn_free(id, move || LodMessage::Pyramids {
-                id,
-                pyramids: edits::run_pyramids(&input),
-            });
+            self.jobs
+                .spawn_free(id, move |alive| match edits::run_pyramids(&input, alive) {
+                    Some(pyramids) => LodMessage::Pyramids { id, pyramids },
+                    None => LodMessage::Cancelled { id },
+                });
         }
     }
 }
@@ -1613,25 +1714,6 @@ fn lod_coverage(
     coverage.end_frame();
 }
 
-/// `Startup`: with persistence, every saved chunk is edited (its cells come from its blocks).
-fn lod_seed_saved(jobs: Res<WorldJobs>, mut lod: ResMut<LodWorld>) {
-    let Some(persist) = jobs.persist.as_ref() else {
-        return;
-    };
-    if std::mem::replace(&mut lod.edits.seeded, true) {
-        return;
-    }
-    for (dim, x, z) in persist.saved_columns() {
-        for &y in persist.layers(dim, x, z) {
-            lod.edits.insert(ChunkKey {
-                dim,
-                lod: 0,
-                pos: ChunkPos::new(x, y, z),
-            });
-        }
-    }
-}
-
 /// `LodSystems::Edits`: the frame's block changes and unloads into the edited set (`edits`),
 /// the changes whose debounce ended, and pyramid jobs for the pyramids asked for.
 #[expect(
@@ -1651,7 +1733,11 @@ fn lod_edits(
     let lod = &mut *lod;
     let dim = world.dimension;
     let now = Instant::now();
-    if lod.store.is_none() != store.is_none() {
+    let same = match (&lod.store, store.as_deref()) {
+        (Some(a), Some(b)) => a.same(b),
+        (a, b) => a.is_none() && b.is_none(),
+    };
+    if !same {
         lod.store = store.map(|s| s.clone());
     }
     // Edits come by chunk: one look per run of changes in the same chunk.

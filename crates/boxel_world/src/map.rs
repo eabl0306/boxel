@@ -423,6 +423,14 @@ impl Tally {
     }
 }
 
+/// What [`ChunkMap::take_all`] took out of the map, dropped off the main thread.
+pub(crate) struct TakenChunks {
+    _slots: Vec<ChunkSlot>,
+    _index: HashMap<ChunkPos, ChunkId, foldhash::fast::FixedState>,
+    _data_changes: Vec<DataChange>,
+    _face_changes: Vec<(ChunkPos, u16)>,
+}
+
 /// All loaded chunks. Owned by the main thread (ECS resource); workers only see `Arc` snapshots.
 /// The slot counters of [`ChunkMap::stats`] are kept up to date on every change (no walk).
 #[derive(Resource, Default)]
@@ -654,6 +662,32 @@ impl ChunkMap {
     /// Sets a slot's remesh request.
     pub(crate) fn set_remesh_pending(&mut self, id: ChunkId, pending: bool) {
         self.update(id, |slot| slot.set_bit(REMESH_PENDING, pending));
+    }
+    /// Empties the map for a world's close: every slot's jobs are cancelled, then the slots
+    /// are drained in place (every slot's version moves on: no `ChunkId` is handed out twice in
+    /// the process) and returned with the index and the change lists, to drop off the main
+    /// thread. The slot vector keeps its length.
+    pub(crate) fn take_all(&mut self) -> TakenChunks {
+        let mut slots = Vec::with_capacity(self.slots.len());
+        for (_, slot) in self.slots.drain() {
+            slot.cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            slots.push(slot);
+        }
+        self.tally = Tally::default();
+        TakenChunks {
+            _slots: slots,
+            _index: std::mem::take(&mut self.index),
+            _data_changes: std::mem::take(&mut self.data_changes),
+            _face_changes: std::mem::take(&mut self.face_changes),
+        }
+    }
+    /// No slot, no index entry and no change waiting (a closed world).
+    pub(crate) fn is_clear(&self) -> bool {
+        self.slots.is_empty()
+            && self.index.is_empty()
+            && self.data_changes.is_empty()
+            && self.face_changes.is_empty()
     }
     /// The data of a `Ready` slot, to edit in place (the slot stays `Ready`, so its counts do
     /// not change). `None` if the slot is not loaded or not `Ready`.

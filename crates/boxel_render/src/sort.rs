@@ -600,7 +600,6 @@ impl TranslucentSorter {
     }
 
     /// Chunks with translucent quads tracked.
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.chunks.len()
     }

@@ -59,6 +59,7 @@ mod persist;
 mod plugin;
 mod projectile;
 mod query;
+mod reset;
 mod sleep;
 mod source;
 mod swim;

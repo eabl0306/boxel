@@ -216,10 +216,7 @@ impl Setup {
                 ..WorldSettings::default()
             },
         })
-        .add_plugins(PersistPlugin {
-            store,
-            executor: Arc::new(InlineExecutor),
-        });
+        .add_plugins(PersistPlugin::new(store).with_executor(Arc::new(InlineExecutor)));
         if self.codecs {
             add_entity_codec(&mut app, ThingCodec);
             add_entity_codec(&mut app, LinkCodec);

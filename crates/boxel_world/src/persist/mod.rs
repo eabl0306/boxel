@@ -9,7 +9,8 @@
 //! - [`PersistPlugin`]: saves the chunks with edits as they unload, with the autosave and on
 //!   exit, loads saved chunks instead of generating them, and keeps the pending block ticks and
 //!   the world clock. Chunks nobody edited are never saved: they come from the seed again. The
-//!   exit closes the store after its save ([`WorldShutdownSystems`], [`WorldStore::close`]).
+//!   exit closes the store after its save ([`WorldShutdownSystems`], [`WorldStore::close`]); so
+//!   does closing the world while the app runs ([`crate::lifecycle`]).
 //! - [`Saved`] entities: what the registered [`EntityCodec`]s write of them (physics saves its
 //!   bodies) is saved with the chunk they are in, when it unloads (they are despawned then),
 //!   with the autosave and on exit, and they come back when the chunk loads.
@@ -34,6 +35,8 @@
 //!     ..WorldPlugin::default()
 //! })
 //! .add_plugins(PersistPlugin::new(store));
+//! // Or open worlds while the app runs: `WorldPlugin::closed`, `PersistPlugin::without_store`
+//! // and a `lifecycle::WorldSpec` with the store.
 //! ```
 mod backend;
 mod entities;
@@ -47,8 +50,17 @@ mod tests;
 pub use backend::{
     ChunkStore, MemoryStore, NullChunkStore, REDB_CACHE_BYTES, RedbStore, SaveBatch,
 };
+#[cfg(test)]
+pub(crate) use entities::SavedLog;
+pub(crate) use entities::put_away_all;
 pub use entities::{EntityCodec, EntityCodecs, Saved, SavedId, SavedIds, add_entity_codec};
 pub use format::{EntityPart, FORMAT_VERSION, FormatError, IdMap};
-pub use plugin::{PersistPlugin, PersistSettings, WorldShutdownSystems};
+pub(crate) use plugin::{PersistExecutor, close_store_on_exit};
+pub use plugin::{PersistPlugin, PersistSettings};
 pub(crate) use saver::Persist;
 pub use store::{PersistError, PersistStats, WORLD_FILE, WorldStore};
+pub(crate) use store::{WeakStore, openings};
+
+/// The `Shutdown` sets, now the lifecycle's (kept here for apps that named them through
+/// `persist`).
+pub use crate::lifecycle::WorldShutdownSystems;

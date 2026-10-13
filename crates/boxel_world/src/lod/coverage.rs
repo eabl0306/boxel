@@ -266,6 +266,16 @@ pub struct LodCoverage {
 }
 
 impl LodCoverage {
+    /// Nothing of a world: no chunk covered, watched or waiting.
+    pub(crate) fn is_clear(&self) -> bool {
+        self.coverage.is_empty()
+            && self.changed.is_empty()
+            && self.upserted_now.is_empty()
+            && self.upserted_last.is_empty()
+            && self.data.is_empty()
+            && self.watched.is_empty()
+    }
+
     /// The coverage.
     pub fn coverage(&self) -> &ChunkCoverage {
         &self.coverage

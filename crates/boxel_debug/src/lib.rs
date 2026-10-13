@@ -35,6 +35,7 @@ use boxel_render::{OverlayDraw, OverlayRect, PresentSettings, RenderInfo, Surfac
 use boxel_transform::Transform;
 use boxel_voxel::{BlockPos, LightValue};
 use boxel_window::{ButtonInput, FramePacingInfo, KeyCode};
+use boxel_world::lifecycle::{TeardownSystems, WorldScopeApp, WorldTeardown};
 use boxel_world::{ChunkMap, TimeOfDay, WorldStats};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write;
@@ -306,9 +307,16 @@ impl Plugin for DebugOverlayPlugin {
         .init_resource::<OverlayLines>()
         .init_resource::<Crosshair>()
         .init_resource::<CrosshairTarget>()
+        .world_resource::<CrosshairTarget>(|t| t.0.is_none())
         .add_systems(Update, (toggle_overlay, frame_keys))
-        .add_systems(Last, (track_frames, build_overlay).chain());
+        .add_systems(Last, (track_frames, build_overlay).chain())
+        .add_systems(WorldTeardown, forget_target.in_set(TeardownSystems::Render));
     }
+}
+
+/// `WorldTeardown`: the crosshair target was a block of the closed world.
+fn forget_target(mut target: ResMut<CrosshairTarget>) {
+    *target = CrosshairTarget::default();
 }
 
 /// Flips [`DebugOverlay::visible`] on a press of its toggle key.

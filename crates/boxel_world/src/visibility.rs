@@ -581,6 +581,15 @@ pub struct ChunkVisibility {
 }
 
 impl ChunkVisibility {
+    /// Nothing held, searched or unshown: as a new world has it.
+    pub(crate) fn is_clear(&self) -> bool {
+        self.last.is_none()
+            && self.unshown.is_empty()
+            && self.grid.held.is_none()
+            && !self.opened
+            && self.closed.is_none()
+    }
+
     /// Applies the map's changes of [`ChunkSlot::visibility_links`](crate::ChunkSlot) (in
     /// order) to the grid.
     pub(crate) fn apply_changes(&mut self, changes: &[(ChunkPos, u16)]) {

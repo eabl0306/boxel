@@ -4,7 +4,8 @@
 //! and night clock, flowing water and saves (in memory), and physics (with the `physics`
 //! feature) runs with
 //! `ambiguity_detection: LogLevel::Error` on `First`, `PreUpdate`, `RunFixedMainLoop`,
-//! `FixedUpdate`, `FixedPostUpdate`, `Update`, `PostUpdate` and `Last`: building those schedules
+//! `FixedUpdate`, `FixedPostUpdate`, `Update`, `PostUpdate`, `Last` and the world lifecycle's
+//! `WorldSave`, `WorldTeardown` and `WorldOpen` (a close runs the first two): building those schedules
 //! on the first `app.update()` panics on any pair of systems with conflicting access and no
 //! order between them. The first update runs one fixed step, so the fixed schedules are built
 //! too.
@@ -41,6 +42,9 @@ use boxel::transform::Transform;
 use boxel::voxel::{BlockPos, ChunkPos};
 use boxel::window::{ButtonInput, InputPlugin, KeyCode};
 use boxel::world::jobs::InlineExecutor;
+use boxel::world::lifecycle::{
+    CloseOptions, WorldCommandsExt, WorldOpen, WorldSave, WorldTeardown,
+};
 use boxel::world::persist::{MemoryStore, PersistPlugin, WorldStore};
 use boxel::world::{
     ChunkMap, ChunkViewer, DaylightPlugin, FluidPlugin, Interest, TimeOfDay, WorldPlugin,
@@ -84,10 +88,7 @@ fn strict_app() -> App {
     .expect("an empty world opens");
     app.add_plugins((
         FluidPlugin,
-        PersistPlugin {
-            store,
-            executor: Arc::new(InlineExecutor),
-        },
+        PersistPlugin::new(store).with_executor(Arc::new(InlineExecutor)),
     ));
     #[cfg(feature = "physics")]
     app.add_plugins(boxel::physics::PhysicsPlugin::default());
@@ -98,7 +99,10 @@ fn strict_app() -> App {
         .edit_schedule(FixedPostUpdate, strict)
         .edit_schedule(Update, strict)
         .edit_schedule(PostUpdate, strict)
-        .edit_schedule(Last, strict);
+        .edit_schedule(Last, strict)
+        .edit_schedule(WorldSave, strict)
+        .edit_schedule(WorldTeardown, strict)
+        .edit_schedule(WorldOpen, strict);
     app.finish();
     app.cleanup();
     let mut fixed = app.world_mut().resource_mut::<FixedTime>();
@@ -132,6 +136,14 @@ fn engine_systems_are_not_ambiguous() {
     assert!(!app.world().resource::<ChunkMap>().is_empty());
     assert!(app.world().resource::<WorldStats>().chunks > 0);
     assert!(app.world().resource::<TimeOfDay>().tick > noon.tick);
+    // The lifecycle's schedules (the startup world ran `WorldOpen`): a close runs `WorldSave`
+    // and `WorldTeardown`, through the driver in `PreUpdate`.
+    app.world_mut()
+        .commands()
+        .close_world(CloseOptions::default());
+    app.world_mut().flush();
+    app.update();
+    assert!(app.world().resource::<ChunkMap>().is_empty());
 }
 
 #[test]

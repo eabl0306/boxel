@@ -186,10 +186,7 @@ mod tests {
             PhysicsPlugin::default(),
             CratesPlugin,
         ))
-        .add_plugins(PersistPlugin {
-            store,
-            executor: Arc::new(InlineExecutor),
-        });
+        .add_plugins(PersistPlugin::new(store).with_executor(Arc::new(InlineExecutor)));
         app.finish();
         app.cleanup();
         app.world_mut().spawn((

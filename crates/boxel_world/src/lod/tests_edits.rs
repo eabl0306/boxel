@@ -584,10 +584,7 @@ fn persistent_app(backend: &Arc<MemoryStore>, at: DVec3) -> (App, Entity) {
         },
         executor: Arc::new(InlineExecutor),
     })
-    .add_plugins(PersistPlugin {
-        store,
-        executor: Arc::new(InlineExecutor),
-    })
+    .add_plugins(PersistPlugin::new(store).with_executor(Arc::new(InlineExecutor)))
     .add_plugins(LodWorldPlugin {
         settings: edit_settings(2, 0),
         executor: Arc::new(InlineExecutor),

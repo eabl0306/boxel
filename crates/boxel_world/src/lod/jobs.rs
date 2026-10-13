@@ -443,7 +443,7 @@ impl JobTimes {
 }
 
 /// A job taken from the queue, with the token of its single message.
-struct Job {
+pub(crate) struct Job {
     input: JobInput,
     token: ResultToken,
     /// Its priority class when it was taken.
@@ -639,20 +639,26 @@ impl LodJobs {
     }
 
     /// Spawns a job outside the in-flight cap (a pyramid job): `body` under the result contract
-    /// (module docs) on the executor, sending exactly one message for `id`.
+    /// (module docs) on the executor, sending exactly one message for `id`. A job that starts
+    /// after [`LodJobs::shut`] sends `Cancelled`; `body` gets the flag to stop on the way.
     pub(crate) fn spawn_free(
         &mut self,
         id: u64,
-        body: impl FnOnce() -> LodMessage + Send + 'static,
+        body: impl FnOnce(&AtomicBool) -> LodMessage + Send + 'static,
     ) {
         self.in_flight += 1;
         let token = ResultToken {
             id,
             tx: Some(self.tx.clone()),
         };
+        let shared = Arc::clone(&self.shared);
         self.shared.executor.spawn(Box::new(move || {
+            if !shared.alive.load(Ordering::Acquire) {
+                token.send(LodMessage::Cancelled { id }, Duration::ZERO);
+                return;
+            }
             let start = Instant::now();
-            let message = match catch_unwind(AssertUnwindSafe(body)) {
+            let message = match catch_unwind(AssertUnwindSafe(|| body(&shared.alive))) {
                 Ok(message) => message,
                 Err(payload) => LodMessage::Failed {
                     id,
@@ -680,6 +686,30 @@ impl LodJobs {
         };
         Shared::launch(&self.shared, job);
         true
+    }
+
+    /// Stops the jobs for a world's close, now: no job starts another (pyramid jobs that start
+    /// later send `Cancelled`), and the handed-off ones are taken out whole, to drop off the main
+    /// thread (each token then reports into this channel, which nobody reads any more).
+    pub(crate) fn shut(&mut self) -> VecDeque<Job> {
+        self.shared.alive.store(false, Ordering::Release);
+        std::mem::take(&mut *self.shared.handoff())
+    }
+
+    /// Where the jobs run.
+    pub(crate) fn executor(&self) -> Arc<dyn JobExecutor> {
+        Arc::clone(&self.shared.executor)
+    }
+
+    /// No job queued, handed off or waiting for its report.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.in_flight == 0 && self.queue.is_empty() && self.handed_off() == 0
+    }
+
+    /// Testing: the shared state's handles (the pool's jobs hold one each).
+    #[cfg(test)]
+    pub(crate) fn shared_handles(&self) -> usize {
+        Arc::strong_count(&self.shared)
     }
 
     /// Takes back the handed-off jobs whose class `keep` refuses: they send `Cancelled` at once
@@ -741,5 +771,43 @@ impl Drop for LodJobs {
     fn drop(&mut self) {
         self.shared.alive.store(false, Ordering::Release);
         self.shared.handoff().clear();
+    }
+}
+
+#[cfg(test)]
+mod shut_tests {
+    use super::*;
+    use crate::tests::support::HoldExecutor;
+
+    /// After `shut` a pyramid job that starts says `Cancelled` without running its body, one
+    /// that runs stops at its flag, and the jobs keep no handle of the shared state once they
+    /// ran.
+    #[test]
+    fn shut_jobs_start_nothing() {
+        let held = Arc::new(HoldExecutor::default());
+        let mut jobs = LodJobs::new(Arc::clone(&held) as Arc<dyn JobExecutor>);
+        let ran = Arc::new(AtomicUsize::new(0));
+        for id in [1, 2] {
+            let ran = Arc::clone(&ran);
+            jobs.spawn_free(id, move |alive| {
+                if alive.load(Ordering::Acquire) {
+                    ran.fetch_add(1, Ordering::Relaxed);
+                }
+                LodMessage::Cancelled { id }
+            });
+        }
+        assert_eq!(jobs.shared_handles(), 3, "the LOD and the two jobs");
+        let handed_off = jobs.shut();
+        assert!(handed_off.is_empty());
+        held.run_all();
+        assert_eq!(ran.load(Ordering::Relaxed), 0, "no body ran");
+        assert_eq!(jobs.shared_handles(), 1);
+        let mut cancelled = 0;
+        while let Some(report) = jobs.try_recv() {
+            assert!(matches!(report.message, LodMessage::Cancelled { .. }));
+            cancelled += 1;
+        }
+        assert_eq!(cancelled, 2);
+        assert!(jobs.is_idle());
     }
 }

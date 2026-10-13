@@ -1776,6 +1776,19 @@ impl Tree {
         !self.refused.is_empty()
     }
 
+    /// Cancels every column's job, sending no op (a world's close: the renderer drops every
+    /// node on its own, and the tree is dropped off the main thread).
+    pub(crate) fn cancel_all(&mut self) {
+        for col in self.columns.values_mut() {
+            col.cancel();
+        }
+    }
+
+    /// Columns held (tests).
+    pub(crate) fn column_count(&self) -> usize {
+        self.columns.len()
+    }
+
     /// Drops everything: removes every node the renderer has and cancels every job.
     pub(crate) fn clear(&mut self) -> Vec<LodOp> {
         let mut ops = std::mem::take(&mut self.ops);

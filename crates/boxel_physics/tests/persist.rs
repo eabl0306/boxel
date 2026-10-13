@@ -54,10 +54,7 @@ fn start(backend: &Arc<MemoryStore>, base: I64Vec3) -> Sim {
         Duration::ZERO,
         (
             SwimPlugin,
-            PersistPlugin {
-                store,
-                executor: Arc::new(InlineExecutor),
-            },
+            PersistPlugin::new(store).with_executor(Arc::new(InlineExecutor)),
         ),
     );
     sim.app.insert_resource(PersistSettings {

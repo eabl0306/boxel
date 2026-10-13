@@ -21,6 +21,8 @@ boxel_tasks.workspace = true
 boxel_transform.workspace = true
 boxel_voxel.workspace = true
 boxel_world.workspace = true
+# The warning of a body that outlived its world (ADR 0034).
+tracing.workspace = true
 
 [dev-dependencies]
 # The example content (#48), for tests, benches and examples only.

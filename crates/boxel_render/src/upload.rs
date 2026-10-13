@@ -169,6 +169,11 @@ impl Uploads {
         self.sorted.remove(&id);
     }
 
+    /// Meshes and sorted buckets waiting for the next flush.
+    pub fn pending_len(&self) -> usize {
+        self.meshes.len() + self.sorted.len()
+    }
+
     /// Drops every pending mesh (the arena was reset).
     pub fn clear(&mut self) {
         self.meshes.clear();

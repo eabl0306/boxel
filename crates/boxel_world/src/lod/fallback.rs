@@ -74,14 +74,21 @@ pub(crate) struct FallbackInput {
     pub(crate) chunks: HashMap<ChunkPos, ChunkSource>,
     pub(crate) store: Option<WorldStore>,
     pub(crate) materials: Arc<LodMaterials>,
+    /// The world's epoch (`WorldEpoch`): a generator of another world at the same address (or
+    /// the same generator with another seed) never reads this world's cached cells.
+    pub(crate) epoch: u64,
 }
 
+/// A key of the generated cells: generator and registry (their addresses), the world's epoch and
+/// the chunk.
+type GeneratedKey = (usize, usize, u64, ChunkKey);
+
 /// The level-1 cells of generated chunks, per worker: a short first-in first-out cache, by
-/// generator and registry (their addresses) and chunk.
+/// [`GeneratedKey`].
 #[derive(Default)]
 struct Generated {
-    cells: HashMap<(usize, usize, ChunkKey), Arc<Level1>>,
-    order: VecDeque<(usize, usize, ChunkKey)>,
+    cells: HashMap<GeneratedKey, Arc<Level1>>,
+    order: VecDeque<GeneratedKey>,
 }
 
 thread_local! {
@@ -112,6 +119,7 @@ fn chunk_cells(
     let key_of = (
         std::ptr::from_ref(generator).cast::<()>() as usize,
         std::ptr::from_ref(registry) as usize,
+        input.epoch,
         key,
     );
     GENERATED.with(|g| {
@@ -164,5 +172,53 @@ pub(crate) fn fill(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boxel_voxel::ChunkData;
+    use std::ops::RangeInclusive;
+    use std::sync::Mutex;
+
+    /// Uniform chunks of the state its seed names: one generator (one address) whose world
+    /// changes, as a game's generator that keeps its seed behind a lock.
+    struct Seeded(Mutex<u16>);
+
+    impl WorldGenerator for Seeded {
+        fn generate(&self, _: ChunkKey, _: &BlockRegistry) -> ChunkData {
+            ChunkData::uniform(BlockState(*self.0.lock().unwrap()))
+        }
+        fn vertical_chunks(&self) -> RangeInclusive<i64> {
+            0..=0
+        }
+        fn name(&self) -> &str {
+            "seeded"
+        }
+    }
+
+    /// The generated cells are cached per world (`WorldEpoch`): the same generator at the same
+    /// address with another seed in the next world never reads the cells of the last one.
+    #[test]
+    fn generated_cells_are_cached_per_world() {
+        let registry = boxel_voxel::testing::registry();
+        let solid = registry.default_state(registry.block_by_name("test:solid").unwrap());
+        let lamp = registry.default_state(registry.block_by_name("test:lamp").unwrap());
+        let generator = Seeded(Mutex::new(solid.0));
+        let input = |epoch| FallbackInput {
+            band: LodColumn::AIR,
+            chunks: HashMap::default(),
+            store: None,
+            materials: Arc::new(LodMaterials::from_registry(&registry)),
+            epoch,
+        };
+        let pos = ChunkPos::new(1 << 35, 0, -(1 << 35));
+        let at = |epoch| chunk_cells(&input(epoch), DimensionId(0), pos, &generator, &registry);
+        let first = at(1);
+        assert_eq!(first.get(0, 0, 0), solid);
+        *generator.0.lock().unwrap() = lamp.0;
+        assert!(Arc::ptr_eq(&at(1), &first), "cached within a world");
+        assert_eq!(at(2).get(0, 0, 0), lamp, "the next world's own cells");
     }
 }

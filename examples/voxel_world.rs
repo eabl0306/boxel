@@ -60,6 +60,11 @@
 //! unload, and every minute), and loaded on the next start with the same `DIR` (`--camera` and
 //! `--time` win over the saved camera and clock).
 //!
+//! F4 closes the world and opens the other of two seeds (the run's and the next one) while the
+//! app runs (ADR 0034, issue #58), without a store; with `--world-dir` the run's seed keeps its
+//! folder, opened again once the other world closed. `--switch-at N[,M..]` presses it at those
+//! frames (with `--frames`).
+//!
 //! `--lod near|far|extreme` draws coarse terrain past the view distance, to the horizon (ADR
 //! 0031, like the Distant Horizons mod); off by default (no LOD plugin at all). F8 cycles far,
 //! extreme, hidden and near, F9 tints each level, F3 shows a `lod` line. Software adapters keep
@@ -101,9 +106,13 @@ use boxel::voxel::rules;
 use boxel::voxel::{Axis, BlockRegistry, Facing, MAX_BLOCK_COORD, SlabHalf};
 use boxel::window::winit::dpi::PhysicalSize;
 use boxel::window::{PrimaryWindow, WindowResized};
-use boxel::world::persist::{PersistPlugin, PersistSettings, WorldShutdownSystems, WorldStore};
+use boxel::world::lifecycle::{
+    CloseOptions, SaveSystems, WorldCommandsExt, WorldEvent, WorldLifecycle, WorldSave, WorldSpec,
+};
+use boxel::world::persist::{PersistPlugin, PersistSettings, WorldStore};
 use boxel::world::{
-    BlockEdit, BlockUses, FluidPlugin, TimeOfDay, WorldContent, WorldStats, WorldSystems,
+    BlockEdit, BlockUses, FluidPlugin, TimeOfDay, WorldContent, WorldSettings, WorldStats,
+    WorldSystems,
 };
 use boxel_demo::rules::{Kind, Kinds};
 use player::WalkPlugin;
@@ -146,6 +155,8 @@ usage: voxel_world [GPU options] [options]
   --camera x,y,z,yaw,pitch  initial camera, degrees (default 0,120,0,45,-30)
   --simulate-device-loss N[,M..]  destroy the GPU device at frame N (recovery check; a
                           list repeats it: the second loss of an adapter lowers its tier)
+  --switch-at N[,M..]     at frame N close the world and open the other seed, as F4 does
+                          (the run's seed and the next one, in turn)
   --async-threads N       async compute pool size (chunk jobs)
   --debug-overlay         start with the F3 debug overlay visible (F3 toggles it)
   --walk                  start walking on the ground under the camera (G toggles walking)
@@ -230,6 +241,8 @@ struct Options {
     camera: [f64; 5],
     /// Frames at which the device is destroyed, ascending.
     simulate_device_loss: Vec<u64>,
+    /// Frames at which the world switches seeds (as F4), ascending.
+    switch_at: Vec<u64>,
     async_threads: Option<usize>,
     world: WorldChoice,
     debug_overlay: bool,
@@ -310,6 +323,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         size: (1280, 720),
         camera: [0.0, 120.0, 0.0, 45.0, -30.0],
         simulate_device_loss: Vec::new(),
+        switch_at: Vec::new(),
         async_threads: None,
         world: WorldChoice::default(),
         debug_overlay: false,
@@ -428,6 +442,14 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                     .collect::<Result<_, _>>()?;
                 o.simulate_device_loss.sort_unstable();
             }
+            "--switch-at" => {
+                let v = value()?;
+                o.switch_at = v
+                    .split(',')
+                    .map(|n| number(flag, n.trim()))
+                    .collect::<Result<_, _>>()?;
+                o.switch_at.sort_unstable();
+            }
             "--async-threads" => {
                 let n = number(flag, &value()?)?;
                 o.async_threads = Some(
@@ -470,8 +492,12 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
     if o.frames.is_none() && (o.screenshot.is_some() || o.resize_test || o.vsync_test) {
         o.frames = Some(IMPLIED_FRAMES);
     }
-    if o.frames.is_none() && (o.wait_chunks || !o.simulate_device_loss.is_empty()) {
-        return Err("--wait-chunks and --simulate-device-loss need --frames".to_string());
+    if o.frames.is_none()
+        && (o.wait_chunks || !o.simulate_device_loss.is_empty() || !o.switch_at.is_empty())
+    {
+        return Err(
+            "--wait-chunks, --simulate-device-loss and --switch-at need --frames".to_string(),
+        );
     }
     if o.timeout.is_none() {
         o.timeout = o.default_timeout();
@@ -1850,9 +1876,9 @@ fn open_world(
     Ok(store)
 }
 
-/// `--world-dir`, on exit: the camera, saved with the world.
-fn save_camera(store: Res<WorldStore>, cameras: Query<(&Transform, &FlyCamera)>) {
-    let Some((transform, fly)) = cameras.iter().next() else {
+/// `--world-dir`, when its world closes (F4) and on exit: the camera, saved with the world.
+fn save_camera(store: Option<Res<WorldStore>>, cameras: Query<(&Transform, &FlyCamera)>) {
+    let (Some(store), Some((transform, fly))) = (store, cameras.iter().next()) else {
         return;
     };
     let p = transform.translation;
@@ -1866,6 +1892,122 @@ fn save_camera(store: Res<WorldStore>, cameras: Query<(&Transform, &FlyCamera)>)
     );
     if let Err(e) = store.put_meta(CAMERA_META, text.into_bytes()) {
         eprintln!("boxel: the camera could not be saved: {e}");
+    }
+}
+
+/// F4 and `--switch-at`: the world switches between two seeds of this run's world while the app
+/// runs (ADR 0034). The camera stays where it is and streams the other world.
+#[derive(Resource)]
+struct SeedSwitch {
+    world: WorldChoice,
+    /// The run's seed (index 0, with the `--world-dir` folder if any) and the next one.
+    seeds: [u64; 2],
+    current: usize,
+    dir: Option<PathBuf>,
+    /// `--switch-at` frames left, ascending.
+    script: Vec<u64>,
+    /// The folder's world opens once the other one closed (its file is locked until then).
+    reopen: bool,
+}
+
+impl SeedSwitch {
+    fn new(options: &Options) -> Self {
+        Self {
+            world: options.world,
+            seeds: [options.seed, options.seed.wrapping_add(1)],
+            current: 0,
+            dir: options.world_dir.clone(),
+            script: options.switch_at.clone(),
+            reopen: false,
+        }
+    }
+
+    /// The world of seed `index`: its generator, the live settings, no store.
+    fn spec(&self, index: usize, settings: &WorldSettings) -> WorldSpec {
+        WorldSpec::new(self.world.generator(self.seeds[index]), settings.clone())
+    }
+}
+
+/// F4 (interactive) or a `--switch-at` frame: closes the world and asks for the other seed's
+/// (the folder's world waits for the close, see [`reopen_world_dir`]).
+fn switch_world(
+    mut switch: ResMut<SeedSwitch>,
+    run: Res<Run>,
+    info: Res<RenderInfo>,
+    keys: Res<ButtonInput<KeyCode>>,
+    lifecycle: Res<WorldLifecycle>,
+    settings: Res<WorldSettings>,
+    mut commands: Commands,
+) {
+    let scripted = run
+        .counted(&info)
+        .is_some_and(|frame| switch.script.first().is_some_and(|&at| frame >= at));
+    let pressed = !run.options.automation() && keys.just_pressed(KeyCode::F4);
+    if !(scripted || pressed) || !lifecycle.is_open() {
+        return;
+    }
+    if scripted {
+        switch.script.remove(0);
+    }
+    let next = 1 - switch.current;
+    switch.current = next;
+    println!(
+        "boxel: switching to seed {} at frame {}",
+        switch.seeds[next],
+        run.counted(&info).unwrap_or(0)
+    );
+    commands.close_world(CloseOptions::default());
+    if next == 0 && switch.dir.is_some() {
+        switch.reopen = true;
+    } else {
+        commands.open_world(switch.spec(next, &settings));
+    }
+}
+
+/// The world events of the switches: the folder's world opens again once the other one closed
+/// (`WorldStore::open_dir`: its redb file is free from then on).
+fn reopen_world_dir(
+    mut switch: ResMut<SeedSwitch>,
+    mut events: MessageReader<WorldEvent>,
+    content: Res<WorldContent>,
+    settings: Res<WorldSettings>,
+    mut commands: Commands,
+) {
+    for event in events.read() {
+        match event {
+            WorldEvent::Closed { report, .. } => {
+                println!(
+                    "boxel: world closed in {:.0} ms (teardown {:.1} ms, saved {})",
+                    report.took.as_secs_f64() * 1e3,
+                    report.teardown.as_secs_f64() * 1e3,
+                    report.saved
+                );
+                if !std::mem::take(&mut switch.reopen) {
+                    continue;
+                }
+                let Some(dir) = switch.dir.clone() else {
+                    continue;
+                };
+                let generator = switch.world.generator(switch.seeds[0]);
+                match WorldStore::open_dir(&dir, &content.registry, generator.name()) {
+                    Ok(store) => {
+                        commands.open_world(switch.spec(0, &settings).with_store(store));
+                    }
+                    Err(e) => {
+                        eprintln!("boxel: --world-dir {}: {e}", dir.display());
+                        commands.open_world(switch.spec(0, &settings));
+                    }
+                }
+            }
+            WorldEvent::Opened { epoch } => {
+                println!(
+                    "boxel: world of seed {} opened (epoch {})",
+                    switch.seeds[switch.current],
+                    epoch.get()
+                );
+            }
+            WorldEvent::OpenFailed { error } => eprintln!("boxel: a world did not open: {error}"),
+        }
     }
 }
 
@@ -2014,8 +2156,8 @@ fn main() -> AppExit {
     }
     if let Some(store) = store {
         app.add_plugins(PersistPlugin::new(store))
-            // Before the exit closes the store.
-            .add_systems(Shutdown, save_camera.before(WorldShutdownSystems::Close));
+            // With the world's last moment: when it closes (F4) and on exit.
+            .add_systems(WorldSave, save_camera.in_set(SaveSystems::Game));
         // `--time` sets the clock: the saved one neither replaces it nor is replaced by it.
         if options.time.is_some() {
             app.insert_resource(PersistSettings {
@@ -2049,6 +2191,8 @@ fn main() -> AppExit {
     ));
     // The camera moves first; the world then computes interest from the new position.
     app.configure_sets(Update, FlyCameraSystems.before(WorldSystems::Interest))
+        .insert_resource(SeedSwitch::new(&options))
+        .add_systems(Update, (switch_world, reopen_world_dir).chain())
         .insert_resource(Run::new(options))
         .init_resource::<FixedSteps>()
         .add_systems(Startup, spawn_camera)
@@ -2258,6 +2402,24 @@ mod tests {
             let args: Vec<String> = args.iter().map(ToString::to_string).collect();
             assert!(parse_options(&args).is_err(), "{args:?}");
         }
+    }
+
+    /// `--switch-at` (F4 at those frames): sorted, scripted runs only; the other seed is the
+    /// next one.
+    #[test]
+    fn switch_at_option_and_the_two_seeds() {
+        let o = parse(&["--frames", "100", "--switch-at", "60, 20", "--seed", "7"]);
+        assert_eq!(o.switch_at, vec![20, 60]);
+        let switch = SeedSwitch::new(&o);
+        assert_eq!(
+            (switch.seeds, switch.current, switch.reopen),
+            ([7, 8], 0, false)
+        );
+        let args: Vec<String> = ["--switch-at", "20"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(parse_options(&args).is_err(), "needs --frames");
     }
 
     #[test]

@@ -191,6 +191,28 @@ impl SkyMap {
             open: Arc::new(SkyTile::uniform(i64::MIN, i64::MIN)),
         }
     }
+    /// Empties the columns for a world's close: every walk is cancelled, the columns are
+    /// drained in place (no `ColumnId` is handed out twice) and returned with the index, to drop
+    /// off the main thread. The rule stays until the next world sets its own.
+    pub(crate) fn take_all(
+        &mut self,
+    ) -> (
+        Vec<SkyColumn>,
+        HashMap<(i64, i64), ColumnId, foldhash::fast::FixedState>,
+    ) {
+        let mut columns = Vec::with_capacity(self.columns.len());
+        for (_, column) in self.columns.drain() {
+            column
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            columns.push(column);
+        }
+        (columns, std::mem::take(&mut self.index))
+    }
+    /// No column (a closed world).
+    pub(crate) fn is_clear(&self) -> bool {
+        self.columns.is_empty() && self.index.is_empty()
+    }
     /// Chunk columns with a loaded slot.
     pub fn len(&self) -> usize {
         self.columns.len()

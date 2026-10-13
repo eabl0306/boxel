@@ -296,6 +296,29 @@ pub struct VoxelRenderer {
     view_uniform: ViewUniform,
 }
 
+/// The renderer's per-world state, compared with a fresh renderer's
+/// ([`VoxelRenderer::debug_reset_state`]).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResetState {
+    /// Chunks in the table.
+    pub chunks: usize,
+    /// Highest live table slot + 1.
+    pub slots: u32,
+    /// Arena quads allocated.
+    pub arena_used: u32,
+    /// Chunks refused.
+    pub refused: usize,
+    /// Refusal changes not taken yet.
+    pub refused_changes: usize,
+    /// Meshes and sorted buckets waiting for a flush.
+    pub pending_uploads: usize,
+    /// Chunks the translucent sorter tracks.
+    pub sorted_chunks: usize,
+    /// A cave culling set is held.
+    pub occlusion_set: bool,
+}
+
 /// The chunks whose last upload [`VoxelRenderer::upsert_chunk`] refused (chunk table or arena
 /// full). The world takes them for drawn with that mesh, but the renderer shows an older mesh or
 /// nothing there, and where their faces are missing the rock around them shows what lies behind
@@ -1099,6 +1122,34 @@ impl VoxelRenderer {
         self.arena.alloc.reset();
         self.uploads.clear();
         self.sorter.clear();
+    }
+    /// Forgets the world (it closed): everything [`VoxelRenderer::clear_chunks`] drops, and the
+    /// refused chunks, the cave culling set and the far LOD's sealed search go without a word to
+    /// the next world ([`VoxelRenderer::take_refused`] reports no `(pos, false)` for them), so
+    /// that world starts as a fresh renderer would ([`VoxelRenderer::debug_reset_state`]). The
+    /// device, pipelines, targets, textures, fog and far LOD passes stay. `device` is for the
+    /// chunk memory, which the next world grows again from its floor (#57).
+    pub fn clear_world(&mut self, device: &wgpu::Device) {
+        let _ = device;
+        self.clear_chunks();
+        self.refused = Refused::default();
+        self.occlusion = Occlusion::default();
+        self.lod_sealed = None;
+    }
+    /// What must equal a fresh renderer's right after [`VoxelRenderer::clear_world`] (the
+    /// shared world switch tests). Cumulative stats are not part of it.
+    #[doc(hidden)]
+    pub fn debug_reset_state(&self) -> ResetState {
+        ResetState {
+            chunks: self.chunks.len(),
+            slots: self.chunks.slot_count(),
+            arena_used: self.arena.alloc.used(),
+            refused: self.refused.by_id.len(),
+            refused_changes: self.refused.changes.len() + self.refused.undrawn.len(),
+            pending_uploads: self.uploads.pending_len(),
+            sorted_chunks: self.sorter.len(),
+            occlusion_set: self.occlusion.set.is_some(),
+        }
     }
     /// How the translucent quads inside each chunk are sorted ([`RendererConfig::translucent_sort`]).
     pub fn translucent_sort(&self) -> TranslucentSort {

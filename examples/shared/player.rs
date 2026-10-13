@@ -40,6 +40,7 @@ use boxel::math::DVec2;
 use boxel::physics::{Crouch, Frozen, PhysicsStats, Swimmer};
 use boxel::prelude::*;
 use boxel::world::WorldSystems;
+use boxel::world::lifecycle::WorldScoped;
 use std::time::Duration;
 
 /// Eye height above the feet, blocks (Minecraft's).
@@ -264,6 +265,9 @@ pub fn player_body(feet: WorldPos) -> impl Bundle {
         // In water it swims (with `SwimPlugin`): held Space keeps setting the jump latch, which
         // swims up there.
         Swimmer::default(),
+        // Of the world it stands in: a close despawns it (still walking, the next world gets a
+        // new one under the camera).
+        WorldScoped,
     )
 }
 

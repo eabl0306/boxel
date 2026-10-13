@@ -494,6 +494,7 @@ dependencies = [
  "boxel_worldgen",
  "criterion",
  "proptest",
+ "tracing",
 ]
 
 [[package]]

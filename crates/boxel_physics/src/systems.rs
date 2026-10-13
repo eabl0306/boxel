@@ -78,6 +78,13 @@ pub enum PhysicsSystems {
 #[derive(Resource, Default)]
 pub(crate) struct PendingImpacts(Vec<VoxelImpact>);
 
+impl PendingImpacts {
+    /// No impact waits.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// The outputs of the threads of a parallel step, merged under a lock (once per batch of
 /// bodies, when the thread's state is dropped).
 pub(crate) struct Sink<T>(Mutex<T>);
@@ -388,6 +395,13 @@ impl Merge for Prepared {
 /// gameplay (a nudge), since every physics write comes before it.
 #[derive(Resource, Default)]
 pub(crate) struct WritebackTick(Option<Tick>);
+
+impl WritebackTick {
+    /// No write-back ran yet.
+    pub(crate) fn is_unset(&self) -> bool {
+        self.0.is_none()
+    }
+}
 
 /// [`PhysicsSystems::Prepare`]. A teleport clears [`Contacts`] (the body is not on its old
 /// ground any more: the next step finds the new one); a teleport or a nudge (a

@@ -1,14 +1,18 @@
 //! [`PersistPlugin`]: saving and loading a world while it streams (ADR 0024).
-use super::entities::{EntityCodecs, SavedLog, entity_step, entity_work, save_entities_on_exit};
+use super::entities::{EntityCodecs, SavedLog, close_snapshot, entity_step, entity_work};
 use super::saver::{Moment, Persist};
-use super::store::{WorldStore, clock_meta, ticks_meta};
+use super::store::{MetaValue, WorldStore, clock_meta, ticks_meta};
 use crate::jobs::{IoTaskPoolExecutor, JobExecutor};
+use crate::lifecycle::{
+    PendingOpen, SaveSystems, TeardownSystems, WorldEpoch, WorldLifecycle, WorldLifecycleSystems,
+    WorldSave, WorldScopeApp, WorldTeardown,
+};
 use crate::streaming::WorldJobs;
 use crate::{BlockTicks, ChunkMap, TimeOfDay, WorldContent, WorldSystems};
-use boxel_app::{App, Last, Plugin, PreUpdate, Shutdown, Startup, Update};
+use boxel_app::{App, Last, Plugin, PreUpdate, Update};
 use boxel_diagnostic::DiagnosticsBoard;
 use boxel_ecs::prelude::*;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Knobs of saving. Read every frame.
@@ -16,7 +20,7 @@ use std::time::{Duration, Instant};
 pub struct PersistSettings {
     /// While the game runs, how often the loaded chunks with edits, the pending block ticks and
     /// the world clock are saved (a crash loses at most this much). `None`: only when a chunk
-    /// unloads and on exit. Default 60 s.
+    /// unloads, when the world closes and on exit. Default 60 s.
     pub autosave: Option<Duration>,
     /// Most chunk records per save job (one write transaction). Default 256. A job that also
     /// writes the pending ticks and the clock writes every chunk handed over with them, in the
@@ -25,9 +29,13 @@ pub struct PersistSettings {
     /// After a save fails, how long until the next try (its chunks stay in memory meanwhile).
     /// Default 1 s.
     pub retry_after: Duration,
-    /// Saves the world clock ([`TimeOfDay`]) and sets it back at startup. Default true; a game
-    /// that sets the clock itself (a fixed hour) turns it off before the first update.
+    /// Saves the world clock ([`TimeOfDay`]) and sets it back when the world opens. Default
+    /// true; a game that sets the clock itself (a fixed hour) turns it off before the first
+    /// update.
     pub clock: bool,
+    /// How long a closing world keeps trying to write its last save (a full disk): then it
+    /// gives up, closes the file and says so (`CloseReport::gave_up`). Default 10 s.
+    pub close_timeout: Duration,
 }
 
 impl Default for PersistSettings {
@@ -37,67 +45,77 @@ impl Default for PersistSettings {
             max_batch: 256,
             retry_after: Duration::from_secs(1),
             clock: true,
+            close_timeout: crate::lifecycle::default_close_timeout(),
         }
     }
 }
 
-/// The `Shutdown` sets of [`PersistPlugin`], chained: the exit save, then the store's close.
-#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum WorldShutdownSystems {
-    /// Waits for the running save, then writes the saved entities, every loaded chunk with
-    /// edits, what is still staged, the pending ticks and the clock, on this thread.
-    Save,
-    /// Closes the [`WorldStore`] ([`WorldStore::close`]): the file is closed cleanly and
-    /// released before the app returns, whoever still holds a clone. An app's own `Shutdown`
-    /// system that writes the store ([`WorldStore::put_meta`]) goes `.before(Close)`: after it,
-    /// the write fails with the closed error.
-    Close,
-}
+/// Where save jobs, the store's close and the drop of a closed world run.
+#[derive(Resource, Clone)]
+pub(crate) struct PersistExecutor(pub(crate) Arc<dyn JobExecutor>);
 
-/// Saves and loads the world of [`WorldPlugin`](crate::WorldPlugin) (add it after that one) in
-/// `store` (ADR 0024):
+/// Saves and loads the worlds of [`WorldPlugin`](crate::WorldPlugin) (add it after that one)
+/// (ADR 0024):
 ///
 /// - A chunk with edits is saved when it unloads, by the autosave
-///   ([`PersistSettings::autosave`]) and on exit (the `Shutdown` schedule, which the runners
-///   run). Chunks nobody edited are never saved: they come from the generator again. The exit
-///   then closes the store ([`WorldShutdownSystems`]).
+///   ([`PersistSettings::autosave`]), when its world closes and on exit (the `Shutdown`
+///   schedule, which the runners run). Chunks nobody edited are never saved: they come from the
+///   generator again. The exit then closes the store
+///   ([`WorldShutdownSystems`](crate::lifecycle::WorldShutdownSystems)).
 /// - A saved chunk is loaded instead of generated, in the chunk's generation job. A sky walk
 ///   (the light's sky tops, ADR 0015) reads saved chunks too, so the light of a saved world is
 ///   the light it had.
 /// - The pending block ticks ([`BlockTicks`], flowing water) and the world clock
-///   ([`TimeOfDay`], unless [`PersistSettings::clock`] is off) are saved with the autosave, on
-///   exit and with chunks that unload while ticks wait, always in one transaction with every
-///   edited chunk (one moment of the world), and restored at startup.
+///   ([`TimeOfDay`], unless [`PersistSettings::clock`] is off) are saved with the autosave, at
+///   the close, on exit and with chunks that unload while ticks wait, always in one transaction
+///   with every edited chunk (one moment of the world), and restored when the world opens.
 /// - [`Saved`](super::Saved) entities, through the registered
 ///   [`EntityCodec`](super::EntityCodec)s: in `PreUpdate`, the ones whose chunk has no slot
 ///   (it unloaded) are saved and despawned, and the ones of the chunks that loaded come back,
-///   before the frame's fixed steps; the autosave and the exit save every one alive, in the
-///   same moment and transaction as the edited chunks, the ticks and the clock. A job that
-///   writes entity records writes every staged chunk with them.
+///   before the frame's fixed steps; the autosave, the close and the exit save every one alive,
+///   in the same moment and transaction as the edited chunks, the ticks and the clock. A job
+///   that writes entity records writes every staged chunk with them.
 ///
-/// A world whose file was repaired when it opened (it was not closed cleanly: a crash) is
-/// reported with a warning when the plugin is added ([`WorldStore::repaired`]).
+/// [`PersistPlugin::new`] saves the world [`WorldPlugin::new`](crate::WorldPlugin::new) opens at
+/// startup in its store; [`PersistPlugin::without_store`] only makes saved worlds possible: each
+/// [`WorldSpec`](crate::lifecycle::WorldSpec) brings its own store.
 ///
-/// Disk writes run in save jobs on `executor` (the IO task pool by default), one at a time; a
+/// Disk writes run in save jobs on the executor (the IO task pool by default), one at a time; a
 /// frame only hands chunks over and starts a job. Loads read the store inside the generation
 /// jobs. A failed save keeps its chunks in memory (loads read them) and tries again after
-/// [`PersistSettings::retry_after`]. Adds the [`WorldStore`] and [`PersistSettings`] resources,
-/// and a `"save"` line to `DiagnosticsBoard` when present.
+/// [`PersistSettings::retry_after`]. Adds the [`PersistSettings`] resource, the [`WorldStore`]
+/// resource while a saved world is open, and a `"save"` line to `DiagnosticsBoard` when present.
 pub struct PersistPlugin {
-    /// The open world, opened for this app: a [`WorldStore`] serves one `PersistPlugin` (a
-    /// second one panics).
-    pub store: WorldStore,
-    /// Where save jobs run (tests use `jobs::InlineExecutor`).
-    pub executor: Arc<dyn JobExecutor>,
+    /// The store of the startup world, taken out at build: the plugin keeps no handle of it.
+    store: Mutex<Option<WorldStore>>,
+    executor: Arc<dyn JobExecutor>,
 }
 
 impl PersistPlugin {
-    /// Saves to `store`, with save jobs on the IO task pool.
+    /// Saves the world [`WorldPlugin::new`](crate::WorldPlugin::new) opens at startup in `store`
+    /// (it must not have served a world), with save jobs on the IO task pool.
     pub fn new(store: WorldStore) -> Self {
         Self {
-            store,
+            store: Mutex::new(Some(store)),
             executor: Arc::new(IoTaskPoolExecutor),
         }
+    }
+
+    /// No startup store: the worlds opened later bring theirs
+    /// ([`WorldSpec::store`](crate::lifecycle::WorldSpec::store)).
+    pub fn without_store() -> Self {
+        Self {
+            store: Mutex::new(None),
+            executor: Arc::new(IoTaskPoolExecutor),
+        }
+    }
+
+    /// Runs the save jobs, the store's close and the drop of closed worlds on `executor`
+    /// (tests use `jobs::InlineExecutor`).
+    #[must_use]
+    pub fn with_executor(mut self, executor: Arc<dyn JobExecutor>) -> Self {
+        self.executor = executor;
+        self
     }
 }
 
@@ -109,69 +127,72 @@ impl Plugin for PersistPlugin {
             .expect("PersistPlugin needs WorldPlugin first")
             .registry
             .len();
-        assert_eq!(
-            states,
-            self.store.ids().registry_states(),
-            "the WorldStore was opened with another registry than the WorldPlugin's"
+        assert!(
+            !world.contains_resource::<PersistExecutor>(),
+            "one PersistPlugin per app"
         );
-        // Logged here, not while the file opened: a game may open its world before `LogPlugin`
-        // installs the subscriber (`voxel_world` does), and that line would be lost.
-        if self.store.repaired() {
-            tracing::warn!("the world file was not closed cleanly: redb repaired it");
+        let store = self.store.lock().expect("store lock").take();
+        if let Some(store) = store {
+            assert_eq!(
+                states,
+                store.ids().registry_states(),
+                "the WorldStore was opened with another registry than the WorldPlugin's"
+            );
+            let mut pending = world.get_resource_mut::<PendingOpen>().expect(
+                "PersistPlugin::new saves the world WorldPlugin::new opens at startup: with \
+                 WorldPlugin::closed use PersistPlugin::without_store and open each world with \
+                 its store",
+            );
+            pending.store = Some(store);
         }
-        let mut jobs = world
-            .get_resource_mut::<WorldJobs>()
-            .expect("PersistPlugin needs WorldPlugin first");
-        assert!(jobs.persist.is_none(), "one PersistPlugin per world");
-        jobs.persist = Some(Persist::new(self.store.clone(), Arc::clone(&self.executor)));
-        app.insert_resource(self.store.clone())
+        app.insert_resource(PersistExecutor(Arc::clone(&self.executor)))
             .init_resource::<PersistSettings>()
             .init_resource::<EntityCodecs>()
             .init_resource::<SavedLog>()
-            .add_systems(Startup, restore_saved)
+            .world_resource::<SavedLog>(SavedLog::is_empty)
             // Exclusive (codecs read and spawn entities), and only when there is work. Its order
             // against the rest of `PreUpdate` (input) does not matter: it only has to come before
-            // the frame's fixed steps.
+            // the frame's fixed steps, and after the lifecycle's requests.
             .add_systems(
                 PreUpdate,
-                entity_step.run_if(entity_work).ambiguous_with_all(),
+                entity_step
+                    .run_if(entity_work)
+                    .after(WorldLifecycleSystems)
+                    .ambiguous_with_all(),
             )
             .add_systems(Update, save_step.after(WorldSystems::Visibility))
             // Like the other board lines: its order does not matter.
             .add_systems(Last, publish_save_stats.ambiguous_with_all())
-            .configure_sets(
-                Shutdown,
-                (WorldShutdownSystems::Save, WorldShutdownSystems::Close).chain(),
-            )
+            .add_systems(WorldSave, close_snapshot.in_set(SaveSystems::World))
             .add_systems(
-                Shutdown,
-                (
-                    (save_entities_on_exit, save_on_exit)
-                        .chain()
-                        .in_set(WorldShutdownSystems::Save),
-                    close_store_on_exit.in_set(WorldShutdownSystems::Close),
-                ),
+                WorldTeardown,
+                teardown_persist.in_set(TeardownSystems::Persist),
             );
     }
 }
 
-/// Startup: the pending block ticks and the world clock of a saved world.
-fn restore_saved(
-    mut jobs: ResMut<WorldJobs>,
-    settings: Res<PersistSettings>,
-    ticks: Option<ResMut<BlockTicks>>,
-    time: Option<ResMut<TimeOfDay>>,
-) {
-    let Some((saved_ticks, clock)) = jobs.persist.as_mut().and_then(|p| p.restore.take()) else {
-        return;
-    };
-    if let (Some(mut ticks), Some(saved)) = (ticks, saved_ticks) {
-        ticks.restore(saved);
+/// `WorldTeardown`, `TeardownSystems::Persist`: the save state and the store go to the close in
+/// progress (its last job runs on; the store is closed off the main thread), the markers the
+/// despawns logged are dropped, and the `"save"` line goes.
+fn teardown_persist(world: &mut World) {
+    let persist = world.resource_mut::<WorldJobs>().persist.take();
+    let store = world.remove_resource::<WorldStore>();
+    if let Some(closing) = world.resource_mut::<WorldLifecycle>().closing.as_mut() {
+        closing.persist = persist;
+        closing.store = store;
+    } else {
+        debug_assert!(persist.is_none(), "a teardown outside a close");
     }
-    if settings.clock
-        && let (Some(mut time), Some(tick)) = (time, clock)
-    {
-        time.tick = tick;
+    world.resource_mut::<SavedLog>().clear();
+    if let Some(mut board) = world.get_resource_mut::<DiagnosticsBoard>() {
+        board.remove("save");
+    }
+}
+
+/// The game data staged for the next save moment ([`WorldLifecycle::stage_meta`]) joins it.
+pub(super) fn stage_game_meta(p: &mut Persist, lifecycle: &mut WorldLifecycle) {
+    for (name, value) in lifecycle.staged_meta.drain(..) {
+        p.set_meta(name, MetaValue::Bytes(value));
     }
 }
 
@@ -213,9 +234,15 @@ fn save_step(
     settings: Res<PersistSettings>,
     ticks: Option<Res<BlockTicks>>,
     time: Option<Res<TimeOfDay>>,
+    mut log: ResMut<SavedLog>,
+    mut lifecycle: ResMut<WorldLifecycle>,
 ) {
     // Saving changes nothing the readers of these resources see.
     let Some(p) = jobs.bypass_change_detection().persist.as_mut() else {
+        // An unsaved world: no entity step follows the markers.
+        if !log.is_empty() {
+            log.clear();
+        }
         return;
     };
     let now = Instant::now();
@@ -233,9 +260,10 @@ fn save_step(
         Moment::None => {}
     }
     if p.can_start(now) {
-        let autosave = settings
-            .autosave
-            .is_some_and(|every| now.saturating_duration_since(p.last_autosave) >= every);
+        let autosave = std::mem::take(&mut p.save_requested)
+            || settings
+                .autosave
+                .is_some_and(|every| now.saturating_duration_since(p.last_autosave) >= every);
         let ticking = ticks.as_deref().is_some_and(|t| {
             let stats = t.stats();
             stats.queued + stats.frozen > 0
@@ -248,53 +276,39 @@ fn save_step(
             }
             p.stage_dirty(map.bypass_change_detection());
             save_meta(p, &settings, ticks.as_deref(), time.as_deref());
+            stage_game_meta(p, lifecycle.bypass_change_detection());
         }
     }
     p.start(now, settings.max_batch);
 }
 
-/// `Shutdown`: waits for the running save, then writes every loaded chunk with edits, what is
-/// still staged, the pending ticks and the clock, on this thread.
-fn save_on_exit(
-    mut jobs: ResMut<WorldJobs>,
-    mut map: ResMut<ChunkMap>,
-    settings: Res<PersistSettings>,
-    ticks: Option<Res<BlockTicks>>,
-    time: Option<Res<TimeOfDay>>,
-) {
-    let Some(p) = jobs.persist.as_mut() else {
-        return;
-    };
-    p.wait();
-    p.stage_dirty(&mut map);
-    save_meta(p, &settings, ticks.as_deref(), time.as_deref());
-    match p.save_now(settings.max_batch) {
-        Ok(()) => tracing::info!(stats = ?p.store.stats(), "world saved"),
-        Err(e) => tracing::error!("the world could not be saved: {e}"),
-    }
-}
-
 /// `Shutdown`, after the exit save: closes the store on this thread, so the file is closed
 /// cleanly and released before the app returns (a relaunch opens it at once, without a repair),
 /// whoever still holds a clone of it.
-fn close_store_on_exit(store: Res<WorldStore>) {
+pub(crate) fn close_store_on_exit(store: Option<Res<WorldStore>>) {
+    let Some(store) = store else {
+        return;
+    };
     match store.close() {
         Ok(()) => tracing::debug!(handles = store.handles(), "the world store is closed"),
         Err(e) => tracing::error!("the world store could not be closed: {e}"),
     }
 }
 
-/// The `"save"` line of the `DiagnosticsBoard`, when one is present and the counts changed.
+/// The `"save"` line of the `DiagnosticsBoard`, when one is present, a saved world is open and
+/// the counts changed (or the world did: the line comes back after a reopen with equal counts).
 fn publish_save_stats(
-    store: Res<WorldStore>,
+    store: Option<Res<WorldStore>>,
     jobs: Res<WorldJobs>,
+    epoch: Res<WorldEpoch>,
     board: Option<ResMut<DiagnosticsBoard>>,
-    mut last: Local<Option<(super::PersistStats, usize)>>,
+    mut last: Local<Option<(WorldEpoch, super::PersistStats, usize)>>,
 ) {
-    let Some(mut board) = board else {
+    let (Some(mut board), Some(store)) = (board, store) else {
         return;
     };
     let now = (
+        *epoch,
         store.stats(),
         jobs.persist.as_ref().map_or(0, Persist::queued),
     );
@@ -302,7 +316,7 @@ fn publish_save_stats(
         return;
     }
     *last = Some(now);
-    let (stats, queued) = now;
+    let (_, stats, queued) = now;
     board.set(
         "save",
         format!(

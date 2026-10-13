@@ -44,6 +44,9 @@
 //! recomputed by the remeshes the edits and loads start, and reaches the renderer with the
 //! meshes.
 //!
+//! Worlds open and close while the app runs ([`lifecycle`], ADR 0034): one at a time, each a
+//! [`lifecycle::WorldSpec`] (generator, settings, store, clock); everything else is the app's.
+//!
 //! [`DaylightPlugin`] adds the world clock ([`TimeOfDay`], one tick per fixed step, 20-minute
 //! days) and the [`DaylightCurve`] the renderer turns into the scene light: day and night change
 //! a uniform only, never a mesh.
@@ -81,6 +84,7 @@ mod tests;
 pub mod visibility;
 
 pub mod jobs;
+pub mod lifecycle;
 pub mod lod;
 pub mod persist;
 pub mod reference;
@@ -108,6 +112,7 @@ pub use visibility::{ChunkVisibility, VisibilityStats, VisibilityView, VisibleSe
 
 /// Common items.
 pub mod prelude {
+    pub use crate::lifecycle::{WorldCommandsExt, WorldEvent, WorldSpec, world_open};
     pub use crate::{
         ChunkMap, ChunkViewer, DaylightPlugin, EditQueue, TimeOfDay, WorldPlugin, WorldSettings,
     };

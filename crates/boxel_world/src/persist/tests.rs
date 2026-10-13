@@ -1139,3 +1139,103 @@ fn an_opening_is_numbered_before_it_reads_its_index() {
         "the opening with the stale index comes first"
     );
 }
+
+/// Test 19: a close whose last save keeps failing (the disk fails) gives up after
+/// `PersistSettings::close_timeout`, says so in its report, closes the file all the same and
+/// ends `Closed`, without a panic; the batches written before stay.
+#[test]
+fn a_close_whose_last_save_fails_gives_up_and_closes_the_file() {
+    use crate::lifecycle::{
+        CloseOptions, WorldLifecycle, WorldSpec, WorldStatus, close_world, finish_closing,
+        open_world,
+    };
+    use crate::tests::support::{LayerGen, fake_mesh};
+    use crate::{ChunkMap, ChunkViewer, EditQueue, WorldPlugin, WorldSettings, WorldStats};
+    use boxel_app::App;
+    use boxel_math::DVec3;
+    use boxel_transform::Transform;
+
+    let tmp = TempFile::new("close_fails");
+    let fail = Arc::new(AtomicBool::new(false));
+    let registry = Arc::new(boxel_demo::blocks::registry());
+    let stone = registry.by_name("boxel:stone").unwrap();
+    let store = WorldStore::open(
+        Arc::new(failing_redb(&tmp.0, &fail)) as Arc<dyn ChunkStore>,
+        &registry,
+        "layers",
+    )
+    .unwrap();
+    let mut app = App::new();
+    app.add_plugins(WorldPlugin {
+        executor: Arc::new(InlineExecutor),
+        ..WorldPlugin::closed(Arc::clone(&registry))
+    })
+    .add_plugins(PersistPlugin::without_store().with_executor(Arc::new(InlineExecutor)))
+    .insert_resource(PersistSettings {
+        autosave: None,
+        retry_after: Duration::from_millis(5),
+        close_timeout: Duration::from_millis(60),
+        ..PersistSettings::default()
+    });
+    app.world_mut()
+        .resource_mut::<crate::streaming::WorldJobs>()
+        .mesh_fn = fake_mesh;
+    app.update();
+    let spec = WorldSpec::new(
+        Arc::new(LayerGen::new(-2..=1)),
+        WorldSettings {
+            vertical_bounds: Some(-2..=1),
+            ..WorldSettings::default()
+        },
+    );
+    open_world(app.world_mut(), spec.with_store(store)).unwrap();
+    app.world_mut().spawn((
+        Transform::from_translation(DVec3::new(16.0, 16.0, 16.0)),
+        ChunkViewer::new(1).with_vertical_radius(1),
+    ));
+    let settle = |app: &mut App| {
+        for _ in 0..200 {
+            app.update();
+            let stats = *app.world().resource::<WorldStats>();
+            if stats.chunks > 0 && stats.is_settled() {
+                return;
+            }
+        }
+        panic!("not settled");
+    };
+    settle(&mut app);
+    let (kept, lost) = (BlockPos::new(3, 40, 3), BlockPos::new(5, 41, 5));
+    app.world_mut()
+        .resource_mut::<EditQueue>()
+        .set_block(kept, stone);
+    settle(&mut app);
+    app.world_mut()
+        .resource_mut::<WorldLifecycle>()
+        .request_save();
+    for _ in 0..3 {
+        app.update();
+    }
+    assert_eq!(app.world().resource::<WorldStore>().stats().saved_chunks, 1);
+    app.world_mut()
+        .resource_mut::<EditQueue>()
+        .set_block(lost, stone);
+    settle(&mut app);
+    assert_eq!(
+        app.world().resource::<ChunkMap>().block_at(lost),
+        Some(stone)
+    );
+
+    fail.store(true, Ordering::SeqCst);
+    assert!(close_world(app.world_mut(), CloseOptions::default()));
+    assert!(finish_closing(app.world_mut(), Duration::from_secs(5)));
+    let lifecycle = app.world().resource::<WorldLifecycle>();
+    assert_eq!(lifecycle.status(), WorldStatus::Closed);
+    let report = lifecycle.last_report().unwrap();
+    assert!(report.gave_up && !report.saved, "{report:?}");
+    assert!(!report.errors.is_empty());
+
+    fail.store(false, Ordering::SeqCst);
+    let reopened = RedbStore::open(&tmp.0).expect("the file is closed");
+    let keys = reopened.keys().unwrap();
+    assert!(keys.contains(&ChunkKey::new(ChunkPos::containing(kept))));
+}

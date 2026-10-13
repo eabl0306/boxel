@@ -44,6 +44,10 @@ impl DiagnosticsBoard {
     pub fn get(&self, key: &str) -> Option<&str> {
         self.entries.get(key).map(String::as_str)
     }
+    /// Removes the line for `key` (a source that is gone: the save line of a closed world).
+    pub fn remove(&mut self, key: &str) -> Option<String> {
+        self.entries.remove(key)
+    }
     /// All lines, sorted by key.
     pub fn iter(&self) -> impl Iterator<Item = (&'static str, &str)> {
         self.entries.iter().map(|(k, v)| (*k, v.as_str()))
@@ -168,4 +172,19 @@ fn log_diagnostics(stats: &mut FrameStats, board: &DiagnosticsBoard) {
         tracing::info!("{key}: {value}");
     }
     stats.worst_frame_time = Duration::ZERO;
+}
+
+#[cfg(test)]
+mod board_tests {
+    use super::DiagnosticsBoard;
+
+    #[test]
+    fn a_line_can_be_removed() {
+        let mut board = DiagnosticsBoard::default();
+        board.set("save", "saved=1");
+        board.set("world", "chunks=2");
+        assert_eq!(board.remove("save").as_deref(), Some("saved=1"));
+        assert_eq!(board.remove("save"), None);
+        assert_eq!(board.iter().collect::<Vec<_>>(), [("world", "chunks=2")]);
+    }
 }

@@ -183,6 +183,29 @@ impl BlockTicks {
         self.now
     }
 
+    /// Back to a new world's ticks (a world's close; its pending ticks were saved): the clock at
+    /// 0, the queue, the echoes, the reactions and the counts empty. The handlers stay (they
+    /// are the app's).
+    pub fn clear_world(&mut self) {
+        self.now = 0;
+        self.fraction = 0;
+        self.queue = Queue::default();
+        self.echoes.clear();
+        self.reactions.clear();
+        self.stats = BlockTickStats::default();
+    }
+
+    /// Nothing of a world: the clock at 0 and nothing queued, frozen or waiting to react.
+    pub(crate) fn is_world_clear(&self) -> bool {
+        self.now == 0
+            && self.fraction == 0
+            && self.queue.ticks.is_empty()
+            && self.queue.scheduled.is_empty()
+            && self.queue.frozen.is_empty()
+            && self.echoes.is_empty()
+            && self.reactions.is_empty()
+    }
+
     /// Moves the game clock `ticks` forward (tests and tools; the plugin advances it from the
     /// fixed steps).
     pub fn advance(&mut self, ticks: u64) {
@@ -438,9 +461,13 @@ pub struct BlockTicksPlugin;
 impl boxel_app::Plugin for BlockTicksPlugin {
     fn build(&self, app: &mut boxel_app::App) {
         use crate::WorldSystems;
+        use crate::lifecycle::{TeardownSystems, WorldScopeApp, WorldTeardown, world_open};
         app.init_resource::<BlockTicks>()
             .init_resource::<BlockTickSettings>()
-            .add_systems(boxel_app::FixedUpdate, advance_clock)
+            .world_resource::<BlockTicks>(BlockTicks::is_world_clear)
+            .add_systems(WorldTeardown, clear_ticks.in_set(TeardownSystems::Ticks))
+            // A closed world's clock stands (the next world starts at 0).
+            .add_systems(boxel_app::FixedUpdate, advance_clock.run_if(world_open))
             .add_systems(
                 boxel_app::Update,
                 (
@@ -483,6 +510,11 @@ fn publish_tick_stats(
             stats.behind
         ),
     );
+}
+
+/// `WorldTeardown`, `TeardownSystems::Ticks` ([`BlockTicks::clear_world`]).
+fn clear_ticks(mut ticks: ResMut<BlockTicks>) {
+    ticks.clear_world();
 }
 
 fn advance_clock(settings: Res<BlockTickSettings>, mut ticks: ResMut<BlockTicks>) {

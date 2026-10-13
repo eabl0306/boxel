@@ -37,6 +37,7 @@ use boxel_mesh::{ChunkMesh, MaterialTable};
 use boxel_transform::Transform;
 use boxel_voxel::{BlockRegistry, BlockRegistryBuilder, ChunkPos};
 use boxel_window::{DisplayHandle, PrimaryWindow, WindowState};
+use boxel_world::lifecycle::{TeardownSystems, WorldScopeApp, WorldTeardown};
 use boxel_world::{
     ChunkMap, ChunkMeshEvent, ChunkMeshResync, ChunkViewer, ChunkVisibility, DaylightCurve,
     TimeOfDay, VisibilityView, VisibleSet, WorldContent, WorldSettings,
@@ -404,7 +405,9 @@ impl Plugin for RenderPlugin {
                 cleanup.in_set(RenderSystems::Cleanup),
             ),
         )
-        .add_systems(Shutdown, shutdown);
+        .add_systems(Shutdown, shutdown)
+        .add_systems(WorldTeardown, forget_world.in_set(TeardownSystems::Render))
+        .world_resource::<BlockOutline>(|o| o.block.is_none());
         #[cfg(feature = "ui")]
         app.add_systems(Render, crate::ui::extract_ui.in_set(RenderSystems::Extract));
     }
@@ -442,6 +445,40 @@ enum GpuStage {
     Stopped,
 }
 
+/// What the renderer drops and uploads again before its next frame, ordered: writers only raise
+/// it, the stronger one wins (one flag for every reset, shared with the chunk memory of #57).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Resync {
+    /// Nothing.
+    #[default]
+    None,
+    /// Every chunk is dropped ([`VoxelRenderer::clear_chunks`](crate::VoxelRenderer::clear_chunks))
+    /// and every ready mesh uploaded again: a new device, or a frame whose uploads were lost.
+    Chunks,
+    /// The world closed: everything of it goes
+    /// ([`VoxelRenderer::clear_world`](crate::VoxelRenderer::clear_world)), and its last refusals
+    /// never reach the next world.
+    World,
+}
+
+impl Resync {
+    /// Raises it to `to` if that is stronger.
+    pub fn raise(&mut self, to: Resync) {
+        *self = (*self).max(to);
+    }
+}
+
+/// `WorldTeardown`, `TeardownSystems::Render`: the renderer forgets the closed world in its
+/// next frame (every chunk, refusal, cull set and far LOD node of it, [`Resync::World`]), and the
+/// block outline goes. Without a ready device nothing is needed: every new device starts with a
+/// resync.
+fn forget_world(mut gpu: ResMut<GpuState>, mut outline: ResMut<BlockOutline>) {
+    if let GpuStage::Ready(ready) = &mut gpu.stage {
+        ready.resync.raise(Resync::World);
+    }
+    outline.block = None;
+}
+
 /// Selected device with its surface and renderer. Field order is the drop order (renderer,
 /// surface, context), see [`ReadyGpu::teardown`].
 struct ReadyGpu {
@@ -459,9 +496,10 @@ struct ReadyGpu {
     configured_for: UVec2,
     /// Present preference the surface is configured with (follows [`PresentSettings`]).
     present: PresentModePref,
-    /// Next `Extract` uploads every ready mesh (`renderer.clear_chunks` first): a new renderer, or a
-    /// frame whose chunk uploads were lost (see [`after_frame`]).
-    resync: bool,
+    /// What the next `Extract` resyncs (writers only raise it): [`Resync::Chunks`] for a new
+    /// renderer or a frame whose chunk uploads were lost (see [`after_frame`]),
+    /// [`Resync::World`] when the world closed (`forget_world`).
+    resync: Resync,
     /// Recent frames with lost chunk uploads.
     rejected: RejectedFrames,
     /// LKG `confirm_good` was called (first presented frame of this selection).
@@ -657,8 +695,9 @@ pub(crate) struct ExtractedFrame {
     pub(crate) distance_fog: DistanceFog,
     render_when_hidden: bool,
     translucent_sort: TranslucentSort,
-    /// Full resync: `meshes` holds every ready mesh, `renderer.clear_chunks` runs first.
-    pub(crate) resync: bool,
+    /// Full resync: `meshes` holds every ready mesh, and `renderer.clear_chunks` (or, for a new
+    /// world, `renderer.clear_world`) runs first.
+    pub(crate) resync: Resync,
     meshes: Vec<MeshOp>,
     /// Pending screenshot paths (kept until a frame exists to read).
     screenshots: Vec<PathBuf>,
@@ -1112,7 +1151,7 @@ fn bootstrap(p: &mut SetupParams) {
         ctx,
         configured_for: size,
         present,
-        resync: true,
+        resync: Resync::Chunks,
         rejected: RejectedFrames::default(),
         confirmed: false,
         frames: 0,
@@ -1411,13 +1450,13 @@ pub(crate) fn extract(
     frame.gate_used = false;
 
     let ready = gpu.ready().filter(|r| !r.ctx.health.is_lost());
-    frame.resync = ready.is_some_and(|r| r.resync);
+    frame.resync = ready.map_or(Resync::None, |r| r.resync);
     frame.lod_renderer = ready.map(|r| LodRenderer {
         drawable: r.lod_ok && crate::lod::supported(&r.ctx.caps.info) && !r.renderer.lod_failed(),
         arena_quads: r.renderer.lod_arena_quads(),
     });
     frame.meshes.clear();
-    if frame.resync {
+    if frame.resync != Resync::None {
         // Everything currently published replaces whatever the events would say. The chunks
         // being remeshed are missing: the world sends their next mesh even if identical.
         mesh_events.clear();
@@ -1472,16 +1511,22 @@ pub(crate) fn extract_visibility(
         return;
     };
     if let GpuStage::Ready(ready) = &mut gpu.stage {
-        ready.renderer.take_refused(|pos, refused| {
-            forward_refused(pos, refused, &mut visibility, &map);
-        });
-        // Taken whatever the LOD: the renderer keeps them until then.
-        ready.renderer.take_undrawn(|pos, undrawn| {
-            if let Some(lod) = lod_feedback.as_deref_mut() {
-                lod.chunks.push((pos, undrawn));
-            }
-        });
-        if frame.resync {
+        if frame.resync == Resync::World {
+            // The closed world's last refusals: the next world never hears of them.
+            ready.renderer.take_refused(|_, _| {});
+            ready.renderer.take_undrawn(|_, _| {});
+        } else {
+            ready.renderer.take_refused(|pos, refused| {
+                forward_refused(pos, refused, &mut visibility, &map);
+            });
+            // Taken whatever the LOD: the renderer keeps them until then.
+            ready.renderer.take_undrawn(|pos, undrawn| {
+                if let Some(lod) = lod_feedback.as_deref_mut() {
+                    lod.chunks.push((pos, undrawn));
+                }
+            });
+        }
+        if frame.resync != Resync::None {
             // `prepare` drops every chunk first (a new renderer may not know the old refusals).
             visibility.clear_unshown(|pos| map.visibility_links_at(pos));
         }
@@ -1507,7 +1552,7 @@ pub(crate) fn extract_visibility(
     // The aspect `prepare` uses: the same view, so the same frustum.
     let aspect = ready.config.width.max(1) as f32 / ready.config.height.max(1) as f32;
     frame.visibility = frame_visibility_with(
-        frame.resync,
+        frame.resync != Resync::None,
         &content.registry,
         &map,
         &mut visibility,
@@ -1632,9 +1677,13 @@ fn prepare(
     }
     let frame = &mut *frame;
     let queue = &ready.ctx.queue;
-    if frame.resync {
-        ready.renderer.clear_chunks();
-        ready.resync = false;
+    match frame.resync {
+        Resync::None => {}
+        Resync::Chunks => ready.renderer.clear_chunks(),
+        Resync::World => ready.renderer.clear_world(&ready.ctx.device),
+    }
+    if frame.resync != Resync::None {
+        ready.resync = Resync::None;
     }
     ready.renderer.set_translucent_sort(frame.translucent_sort);
     ready.renderer.set_outline(frame.outline.take());
@@ -1875,7 +1924,7 @@ fn after_frame(ready: &mut ReadyGpu, errors_before_finish: u32) {
                  every chunk again",
                 ready.rejected.recent
             );
-            ready.resync = true;
+            ready.resync.raise(Resync::Chunks);
         }
         FrameVerdict::Lost => {
             ready.ctx.health.mark_lost(format!(

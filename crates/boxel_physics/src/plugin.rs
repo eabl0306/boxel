@@ -175,6 +175,7 @@ impl Plugin for PhysicsPlugin {
             // It writes only its own line of the board: its order against the other board
             // writers in `Last` (the world's stats) does not matter.
             .add_systems(Last, publish_stats.ambiguous_with_all());
+        crate::reset::add_reset(app);
     }
 
     fn finish(&self, app: &mut App) {

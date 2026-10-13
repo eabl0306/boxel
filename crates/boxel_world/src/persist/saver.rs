@@ -111,6 +111,11 @@ pub(crate) struct Persist {
     pub(crate) entities: EntityIndex,
     /// The snapshot the entity step takes for the save step (see [`Moment`]).
     pub(crate) moment: Moment,
+    /// A save was asked for (`WorldLifecycle::request_save`): the next save step treats it as a
+    /// due autosave.
+    pub(crate) save_requested: bool,
+    /// The error of the last save, while saves fail.
+    last_error: Option<String>,
 }
 
 impl Persist {
@@ -162,6 +167,41 @@ impl Persist {
             restore: Some((opened.ticks, opened.clock)),
             entities,
             moment: Moment::None,
+            save_requested: false,
+            last_error: None,
+        }
+    }
+
+    /// Nothing waits to be written and no save job runs (a failure waiting for its next try
+    /// is not idle).
+    pub(crate) fn idle(&self) -> bool {
+        !self.in_flight && self.queue.is_empty() && self.meta.is_empty() && !self.entities.has_ops()
+    }
+
+    /// The error of the last save while saves fail (`None` once one succeeds).
+    pub(crate) fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    /// Drops everything waiting to be written (a world closed to be deleted): the batches
+    /// already written stay, a running job ends on its own.
+    pub(crate) fn discard(&mut self) {
+        self.queue.clear();
+        self.queued.clear();
+        self.meta.clear();
+        self.dirty.clear();
+        let _ = self.entities.take_ops();
+        let _ = self.entities.take_next_id();
+        self.entities.arrived.clear();
+        self.moment = Moment::None;
+        self.save_requested = false;
+    }
+
+    /// Waits up to `wait` for the running save job's report, and takes it (a close finished on
+    /// this thread). Without a job it waits `wait` (a failure's next try may come by then).
+    pub(crate) fn wait_report(&mut self, wait: Duration) {
+        if let Ok(report) = self.rx.recv_timeout(wait) {
+            self.on_report(report, Instant::now());
         }
     }
 
@@ -341,6 +381,7 @@ impl Persist {
                 }
                 self.failing = false;
                 self.retry_at = None;
+                self.last_error = None;
             }
             Err(e) => {
                 if self.failing {
@@ -351,6 +392,7 @@ impl Persist {
                     );
                 }
                 self.failing = true;
+                self.last_error = Some(e);
                 self.retry_at = Some(now + self.retry_after);
                 for key in report.keys.into_iter().rev() {
                     if self.queued.insert(key) {
