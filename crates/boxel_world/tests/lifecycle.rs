@@ -4,6 +4,7 @@
 //! a saved world comes back whole (edits, ticks, clock, saved entities, game data), and the
 //! requests, errors and frame order behave as documented. Positions sit at 2^40.
 use boxel_app::{App, Idle, PreUpdate, Startup, Update};
+use boxel_diagnostic::DiagnosticsBoard;
 use boxel_ecs::prelude::*;
 use boxel_math::DVec3;
 use boxel_transform::Transform;
@@ -1264,4 +1265,38 @@ fn a_store_refused_while_its_world_closes_keeps_the_last_save() {
         }
         assert!(kept.is_closed());
     }
+}
+
+// ------------------------------------------------------------------------- the board lines
+
+/// The board lines of a closed world go with it: while closed, `"world"` shows the empty map
+/// (not the closed world's last counts), and a next world with light off shows no `"light"`
+/// line, as in a fresh app.
+#[test]
+fn a_closed_world_leaves_no_board_lines() {
+    let line = |app: &App, key: &str| {
+        app.world()
+            .resource::<DiagnosticsBoard>()
+            .get(key)
+            .map(str::to_string)
+    };
+    let mut app = app();
+    app.init_resource::<DiagnosticsBoard>();
+    open(&mut app, spec(1));
+    settle(&mut app);
+    let world = line(&app, "world").expect("a world line");
+    assert!(!world.starts_with("chunks=0 "), "{world}");
+    assert!(line(&app, "light").is_some());
+    close(&mut app);
+    app.update();
+    let world = line(&app, "world").expect("a world line");
+    assert!(world.starts_with("chunks=0 "), "{world}");
+
+    let dark = WorldSettings {
+        light: false,
+        ..settings()
+    };
+    open(&mut app, WorldSpec::new(Arc::new(Hills { seed: 2 }), dark));
+    settle(&mut app);
+    assert_eq!(line(&app, "light"), None);
 }

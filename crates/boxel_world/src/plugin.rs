@@ -621,7 +621,8 @@ fn add_lifecycle(app: &mut App, closed: bool) {
 
 /// `WorldTeardown`, `TeardownSystems::Streaming`: the map, the sky tops and the jobs back to a
 /// new world's (their contents dropped off the main thread), the generator back to the
-/// placeholder.
+/// placeholder. The `"world"` and `"light"` board lines go too: `publish_stats` compares with
+/// the `WorldStats` reset here, so it would never refresh them.
 #[expect(
     clippy::too_many_arguments,
     reason = "a Bevy-style system: one parameter per resource it resets"
@@ -636,6 +637,7 @@ fn teardown_streaming(
     mut edits: ResMut<EditQueue>,
     mut content: ResMut<WorldContent>,
     mut garbage: ResMut<WorldGarbage>,
+    board: Option<ResMut<DiagnosticsBoard>>,
 ) {
     garbage.push(map.take_all());
     garbage.push(sky.take_all());
@@ -646,6 +648,10 @@ fn teardown_streaming(
     garbage.push(std::mem::take(&mut edits.edits));
     let generator = std::mem::replace(&mut content.generator, Arc::clone(placeholder_generator()));
     garbage.push(generator);
+    if let Some(mut board) = board {
+        board.remove("world");
+        board.remove("light");
+    }
 }
 
 /// Threads of the async compute pool (initializing a default pool if `TaskPoolPlugin` did not
@@ -844,8 +850,9 @@ fn publish_meshes(
 }
 
 /// Refreshes `WorldStats` (slot counts, scheduler counts, interest backlog) and the `"world"`
-/// board line. The slot counts are kept by the map (no walk); debug builds check them against a
-/// walk of every slot in the frames that changed the map.
+/// and `"light"` board lines (no `"light"` with light off). The slot counts are kept by the map
+/// (no walk); debug builds check them against a walk of every slot in the frames that changed
+/// the map.
 fn publish_stats(
     map: Res<ChunkMap>,
     sky: Res<SkyMap>,
@@ -902,6 +909,9 @@ fn publish_stats(
                     now.edit_batches_split
                 ),
             );
+        } else {
+            // A world with light off after one with light on.
+            board.remove("light");
         }
     }
 }
