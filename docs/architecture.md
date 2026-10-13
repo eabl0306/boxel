@@ -970,11 +970,17 @@ Layouts de bind groups (congelados): grupo 0 estático (textura + sampler), grup
 Lo pesado y estático va en el grupo 0, lo que cambia en el más alto (fast path de wgpu sin
 rebind, #9738).
 
-Si ninguna página puede tomar un chunk o la tabla se llena, el chunk no se sube: se cuenta en
-`RenderInfo::dropped_chunks`, se avisa en el log y aparece en la línea de diagnóstico `render`.
-Una página llena de chunks que todavía tiene quads libres da su propio error
-(`RendererError::PageChunksFull`) y se ve en `ChunkMemoryStats::full_pages`. Las páginas todavía
-no crecen: el piso es todo lo que hay hasta el M2 de #57 (ADR 0035).
+La memoria crece y encoge mientras corre la app (ADR 0035). Justo después de present se crea a lo
+sumo una página o una tabla más grande, que los frames siguientes limpian por partes antes de
+usarla. Antes de colocar las mallas de un frame, `reserve` hace lugar para ellas. Una clase con
+lugar de sobra vacía su página más vacía hacia las otras, unos MiB por frame, y la suelta. Nunca
+baja del piso.
+
+Un chunk se rechaza solo en el techo, tras una creación fallida o pasado el límite de páginas
+creadas dentro de un frame. Se cuenta en `RenderInfo::dropped_chunks`, se avisa en el log, se
+guarda con su malla y vuelve, el más cercano primero, cuando hay lugar (`waiting` en la línea de
+diagnóstico `render`). Una página llena de chunks que todavía tiene quads libres da su propio error
+(`RendererError::PageChunksFull`) y se ve en `ChunkMemoryStats::full_pages`.
 
 ### 10.3 Pases por tier
 

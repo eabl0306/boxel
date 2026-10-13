@@ -213,9 +213,21 @@ El mundo se elige con `--world`: `forest` (por defecto, el de todas las corridas
 `--caves mc|closed|off` elige las cuevas: `mc` tiene entradas desde la superficie y `closed` no
 deja ver ninguna cueva desde arriba. El overworld no acepta `--fixed-height` (no tiene piso) y usa
 un arena de 24 Mi quads y 65 536 slots; `--arena-quads N` y `--chunk-slots N` los cambian (son el
-piso de páginas y la tabla inicial, ADR 0035). El resumen anota el mundo y el arena y los slots
-que el renderer obtuvo de verdad (los límites del dispositivo pueden recortarlos), y
-`tools/bench_report.py` solo compara corridas del mismo mundo.
+piso de páginas y la tabla inicial, ADR 0035). El resumen anota el mundo y la memoria con la que
+arranca el renderer, y `tools/bench_report.py` solo compara corridas del mismo mundo.
+
+La memoria de chunks crece y encoge sola (ADR 0035). `--chunk-memory fixed` la deja fija en lo que
+arranca, `--max-chunk-quads N` le pone techo y `--radius-steps 8,32@1,8@20` asienta el mundo con
+radio 8, pasa a 32 un segundo después de empezar a medir y vuelve a 8 a los 20 s (reemplaza a
+`--radius`). La corrida imprime una línea con lo que hizo la memoria: páginas creadas y soltadas,
+la creación más lenta, las páginas hechas dentro de un frame (y cuántas después del primer
+segundo de cada paso, que deberían ser cero), el pico de bytes y lo más que movió un frame. El JSON
+del resumen trae lo mismo en `chunk_memory`.
+
+El caso `grow` de `tools/perf` es la cueva quieta con `--radius-steps 8,32@1`. Para comparar una
+memoria fija contra una que crece desde el piso por defecto, con el mismo binario:
+`just perf-smoke --base HEAD "--new-extra='--chunk-memory grow --arena-quads 8388608 --chunk-slots 32768'" rtx/grow/r32 780m/grow/r32 -- --chunk-memory fixed`.
+En ese caso el lado nuevo puede repetir `--arena-quads` y `--chunk-slots` (gana el último).
 
 `--alloc-probe 32,64` es la sonda de páginas (ADR 0035): mientras mide, cada medio segundo crea
 justo después del present un buffer como una página, cuatro de cada tamaño, y al final los

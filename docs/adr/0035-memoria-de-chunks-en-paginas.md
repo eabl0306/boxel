@@ -1,8 +1,8 @@
 # ADR 0035: la memoria de chunks en páginas
 
 - Estado: aceptado. El dueño tomó las recomendaciones del plan el 2026-10-12 (issue #57, plan de
-  crecimiento del arena). Primera parte (M0 y M1): las páginas con capacidad fija y la sonda de
-  asignación. El crecimiento (M2) y el encogimiento (M3) vienen después.
+  crecimiento del arena). M0 y M1: las páginas y la sonda de asignación. M2 y M3: crecer y encoger
+  mientras corre la app.
 - Fecha: 2026-10-12
 
 ## Contexto
@@ -77,12 +77,52 @@ Toda escritura de memoria sale como `MemOp` hacia un `CopySink`. En la GPU se ag
 staging y copias. En los tests se aplica sobre modelos en bytes de cada página y de la tabla, y un
 proptest comprueba frame a frame que lo que hay en la GPU es lo que dice la CPU.
 
+### 8. Crecer entre frames
+
+Una política pura decide al final de cada frame, con un reloj que los tests adelantan. Cada clase
+guarda una reserva de quads libres (media página Solid, un cuarto Translucent, o un octavo de lo que
+usa si es más) y de lugares para chunks. Cuando le falta, pide una página. También pide una si un
+chunk rechazado espera y no entra en ningún hueco.
+
+- La página se crea justo después de present, en error scopes, una por frame. Nace en estado
+  Clearing y los frames siguientes la limpian por partes (32 MiB por frame en una GPU dedicada, 8
+  en una integrada, 4 en otra). Así wgpu nunca llena con ceros una página entera dentro de un frame.
+  Si su id pasa las listas de High, llega con listas más grandes, que se limpian igual.
+- Antes de colocar las mallas de un frame, `reserve` hace lugar: pone en uso una página que se
+  estaba limpiando o crea una en el momento (una por clase en un frame normal, las que hagan falta
+  en un resync). Esa es la emergencia: wgpu llena con ceros lo que no se limpió, y las
+  estadísticas la cuentan.
+- La tabla de chunks crece duplicando, por adelantado cuando quedan pocas slots libres o en el
+  momento si el frame la necesita. La nueva empieza como copia en la GPU de las slots que se
+  escribieron. Las slots no cambian nunca.
+- Una creación de más de 2 ms (un bloque nuevo del driver) duplica la reserva de su clase una vez.
+  Una que falla deja a su clase sin crecer 10 s.
+- Un chunk rechazado guarda su malla (el mismo `Arc`, sin copia) y se reintenta, el más cercano
+  primero, cuando aparece lugar.
+- El techo se lee en cada frame. Bajarlo no saca nada residente.
+- Con `grow: false` queda el piso fijo, más el reintento.
+
+### 9. Encoger
+
+Si una clase puede perder su página más vacía y aun así guardar su reserva más media página,
+durante 5 s y sin haber creado una página en los 10 s anteriores, esa página pasa a Draining. Ya
+no recibe chunks. Sus chunks se copian de página a página a los huecos de las otras, unos MiB por
+frame (32, 8 o 4, como la limpieza), y su entrada de la tabla cambia en el mismo frame. Vacía, se
+suelta. Vuelve a Active si a la clase le falta lugar o si en 2 s no pudo mover nada. Nunca baja
+del piso. Es también la única desfragmentación.
+
+### 10. Al cambiar de mundo
+
+`clear_world` (ADR 0034) deja la memoria como la de un renderer nuevo: las páginas del piso, la
+tabla y las listas iniciales, nada pedido ni en curso. Lo que enseñó el dispositivo se queda: las
+esperas tras un fallo, la reserva duplicada y la creación más lenta.
+
 ## Pendiente
 
 - La sonda (`stress --alloc-probe 32,64`) está hecha pero no se corrió: sus números deciden si la
   página queda en 32 MiB o pasa a 64.
-- Crecer, encoger y reintentar los chunks rechazados (M2 y M3). Hasta entonces el piso es todo lo
-  que hay.
+- Medir: el caso `grow` de `tools/perf` (radio 8 a 32 al segundo) y la vuelta al piso con
+  `--radius-steps 8,32@1,8@20`. Se corren en la próxima ronda, no en esta tarea.
 
 ## Consecuencias
 
@@ -91,3 +131,7 @@ proptest comprueba frame a frame que lo que hay en la GPU es lo que dice la CPU.
 - Entre chunks vecinos, Mid y Low pueden dibujar en otro orden que antes. Solo se nota en píxeles
   de borde con profundidad exactamente igual, dentro de la tolerancia entre tiers.
 - La tabla de chunks y las páginas tienen `COPY_SRC` para moverse y leerse en tests.
+- El proptest de `MemOp` también reproduce páginas nuevas, limpiezas, tablas que crecen y páginas
+  que se vacían. Los tests de GPU comparan una memoria que crece y encoge contra una página grande,
+  píxel a píxel en la escena sin vecinos.
+- Mover un chunk puede cambiar su orden entre vecinos en Mid y Low, dentro de la misma tolerancia.
