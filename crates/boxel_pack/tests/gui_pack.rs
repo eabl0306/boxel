@@ -531,6 +531,50 @@ fn bad_providers_are_skipped_with_a_warning() {
 }
 
 #[test]
+fn cells_past_4096_texels_are_skipped() {
+    let pack = TempPack::simple("tall_cells");
+    // One texel wide: drawn 1 GUI pixel tall, a cell 32768 texels tall is 32768 texels per GUI
+    // pixel, and padded to whole pixels its glyph would be 32768 texels square.
+    for h in [4096, 4097, 32768] {
+        pack.png(
+            &format!("assets/minecraft/textures/font/tall{h}.png"),
+            1,
+            h,
+            |_, _| [255; 4],
+        );
+    }
+    // 4097 texels wide and 8 tall: drawn 4097 GUI pixels wide, under 32768.
+    pack.png(
+        "assets/minecraft/textures/font/wide.png",
+        4097,
+        8,
+        |_, _| [255; 4],
+    );
+    pack.text(
+        "assets/minecraft/font/default.json",
+        r#"{"providers": [
+            {"type": "bitmap", "file": "minecraft:font/tall32768.png", "height": 1, "ascent": 0,
+             "chars": ["a"]},
+            {"type": "bitmap", "file": "minecraft:font/tall4097.png", "ascent": 7, "chars": ["b"]},
+            {"type": "bitmap", "file": "minecraft:font/wide.png", "ascent": 7, "chars": ["c"]},
+            {"type": "bitmap", "file": "minecraft:font/tall4096.png", "ascent": 7, "chars": ["d"]}
+        ]}"#,
+    );
+    let font = pack
+        .open()
+        .font(&id("default"))
+        .expect("reads")
+        .expect("exists");
+    let bitmaps = bitmaps(&font.providers);
+    assert_eq!(bitmaps.len(), 1, "{:?}", font.warnings);
+    assert_eq!(bitmaps[0].cell(), [1, 4096]);
+    assert_eq!(font.warnings.len(), 3, "{:?}", font.warnings);
+    for (warning, file) in font.warnings.iter().zip(["tall32768", "tall4097", "wide"]) {
+        assert!(warning.message.contains(file), "{warning:?}");
+    }
+}
+
+#[test]
 fn a_font_referenced_again_is_read_once() {
     let pack = TempPack::simple("repeated_references");
     pack.png("assets/minecraft/textures/font/grid.png", 8, 8, |_, _| {

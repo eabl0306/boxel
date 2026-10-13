@@ -172,15 +172,17 @@ el pase (E-UI2) y llega antes de los menús, así que no hay puente.
 - Un pack hostil no cuelga ni desborda nada. Cada fuente se lee y cada imagen se decodifica una
   vez por carga, aunque se nombren muchas veces. Los tamaños de `gui.scaling` pasan solo hasta
   `i32::MAX`, como en Minecraft. Un proveedor con glifos de más de 32768 píxeles de GUI (alto,
-  ancho, `ascent` o avance) se salta con un aviso. Un sprite animado da el primer cuadro que
-  Minecraft reproduciría.
+  ancho, `ascent` o avance) o con celdas de más de 4096 texels de lado se salta con un aviso. Un
+  sprite animado da el primer cuadro que Minecraft reproduciría.
 - `boxel_ui` con la feature `pack` (la fachada la prende con `ui` y `pack`):
   `UiAtlas::insert_pack_sprite` guarda el sprite con su escala y `FontBuilder::pack_font` suma
   los proveedores. Como en Minecraft, gana el primer proveedor que tiene el carácter, el glifo
   mide `height` píxeles de GUI y su borde de arriba queda `7 - ascent` bajo la línea.
 - Cada glifo cae en píxeles de GUI enteros: su imagen se rellena con texels transparentes hasta
   lo que cubren esos píxeles. Una fuente de 16 texels queda con dos texels exactos por píxel de
-  GUI. El avance es el de Minecraft: el ancho redondeado más uno.
+  GUI. El avance es el de Minecraft: el ancho redondeado más uno. Un glifo que así relleno no
+  entra en la página más grande del atlas da `AtlasError::Full` antes de armarse, y el juego
+  sigue con su fuente.
 - El juego elige qué sprites y fuentes pide y a qué slot del skin van. Del pack no se sube nada
   al repositorio: los tests arman packs sintéticos en un directorio temporal.
 

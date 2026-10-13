@@ -20,6 +20,11 @@ const MAX_REFERENCE_DEPTH: usize = 8;
 /// from overflowing.
 const MAX_GLYPH_SPAN: u32 = 32768;
 
+/// The widest and tallest cell in texels. A provider past it is skipped: a 512x pack's cells are
+/// 256, and a glyph cut from a taller cell drawn a few GUI pixels tall would be padded (to whole
+/// GUI pixels, as `boxel_ui` draws it) past any UI atlas.
+const MAX_CELL_SIDE: u32 = 4096;
+
 /// A pack's font: its providers in Minecraft's order, where the first provider that has a
 /// character draws it. `reference` providers are replaced by the providers of the font they
 /// name; providers behind a `filter` are kept only for Minecraft's default options (uniform
@@ -282,8 +287,14 @@ impl Load<'_> {
             glyph_height,
             ascent,
         };
-        // A cell drawn `glyph_height` GUI pixels tall is this wide.
         let [cell_w, cell_h] = bitmap.cell();
+        if cell_w > MAX_CELL_SIDE || cell_h > MAX_CELL_SIDE {
+            return Err(format!(
+                "cells of {} are {cell_w}x{cell_h} texels, past {MAX_CELL_SIDE}",
+                bitmap.file
+            ));
+        }
+        // A cell drawn `glyph_height` GUI pixels tall is this wide.
         if u64::from(cell_w) * u64::from(glyph_height)
             > u64::from(MAX_GLYPH_SPAN) * u64::from(cell_h)
         {

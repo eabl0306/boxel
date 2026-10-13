@@ -1,7 +1,7 @@
 //! Bitmap fonts: glyphs in the UI atlas, built from grids of cells (Minecraft's bitmap font
 //! provider), from 8x8 bit rows (the engine's default font) or composed from other glyphs.
 
-use crate::atlas::{AtlasError, UiAtlas};
+use crate::atlas::{AtlasError, MAX_ATLAS_SIZE, UiAtlas};
 use crate::font8x8;
 use boxel_ecs::prelude::*;
 use std::collections::{BTreeMap, HashMap};
@@ -86,12 +86,21 @@ pub struct GlyphBitmap {
 
 impl GlyphBitmap {
     /// A transparent image.
+    ///
+    /// # Panics
+    /// When `w * h * 4` bytes cannot be allocated, as any `Vec`.
     pub fn new(w: u32, h: u32) -> Self {
         Self {
             w,
             h,
-            rgba: vec![0; (w * h * 4) as usize],
+            // In `usize`: past 2^30 texels the size overflows a u32.
+            rgba: vec![0; (w as usize).saturating_mul(h as usize).saturating_mul(4)],
         }
+    }
+
+    /// The first byte of texel `(x, y)`, inside the image.
+    fn offset(&self, x: u32, y: u32) -> usize {
+        (y as usize * self.w as usize + x as usize) * 4
     }
 
     /// A white image drawn with text rows: `#` is an opaque texel, anything else transparent.
@@ -127,7 +136,7 @@ impl GlyphBitmap {
         if x >= self.w || y >= self.h {
             return [0; 4];
         }
-        let i = ((y * self.w + x) * 4) as usize;
+        let i = self.offset(x, y);
         [
             self.rgba[i],
             self.rgba[i + 1],
@@ -139,7 +148,7 @@ impl GlyphBitmap {
     /// Sets the texel at `(x, y)` (ignored outside).
     pub fn set(&mut self, x: u32, y: u32, texel: [u8; 4]) {
         if x < self.w && y < self.h {
-            let i = ((y * self.w + x) * 4) as usize;
+            let i = self.offset(x, y);
             self.rgba[i..i + 4].copy_from_slice(&texel);
         }
     }
@@ -387,6 +396,9 @@ impl FontBuilder {
     /// keeps exactly two texels per GUI pixel. Its advance is the drawn width rounded to the
     /// nearest pixel, plus one (Minecraft's rule); a space is [`SPACE_ADVANCE`] unless a space
     /// provider said otherwise.
+    ///
+    /// A glyph that, padded, is wider or taller than [`MAX_ATLAS_SIZE`] is
+    /// [`AtlasError::Full`] before its padded image is made, as any image too big for the page.
     pub fn build(&self, atlas: &mut UiAtlas) -> Result<BitmapFont, AtlasError> {
         let mut glyphs = self
             .fallback
@@ -405,6 +417,14 @@ impl FontBuilder {
                 let covered = [(size[0], image.w), (size[1], image.h)].map(|(gui, texels)| {
                     narrow((u64::from(gui) * cell_h).div_ceil(gui_h)).max(texels)
                 });
+                // A glyph drawn 1 GUI pixel tall from a 32768-texel cell pads to 32768 texels
+                // square: refused here, not allocated and then refused by the page.
+                if covered.iter().any(|&side| side > MAX_ATLAS_SIZE) {
+                    return Err(AtlasError::Full {
+                        w: covered[0],
+                        h: covered[1],
+                    });
+                }
                 let padded;
                 let image = if covered == [image.w, image.h] {
                     image
@@ -564,5 +584,24 @@ mod tests {
         assert_eq!(font.resolve('c').top, 7 - i32::MAX);
         // 32768 below the baseline: the glyph's top is 32775 GUI pixels under the line's top.
         assert_eq!(font.resolve('d').top, 32775);
+    }
+
+    #[test]
+    fn a_glyph_padded_past_the_atlas_fails_before_it_is_made() {
+        // One texel wide and 32768 tall, drawn 1 GUI pixel tall: padded to whole GUI pixels it
+        // would be 32768 texels square (4 GiB, and 32768 * 32768 * 4 overflows a u32).
+        let tall = |h: u32| GlyphBitmap {
+            w: 1,
+            h,
+            rgba: [255; 4].repeat(h as usize),
+        };
+        let mut atlas = UiAtlas::new(64);
+        for h in [32768, 5000] {
+            let mut builder = FontBuilder::new();
+            builder.bitmap(&tall(h), &["a"], 1, 0);
+            assert_eq!(builder.build(&mut atlas), Err(AtlasError::Full { w: h, h }));
+        }
+        // Nothing went into the page.
+        assert_eq!(atlas.size(), 64);
     }
 }
