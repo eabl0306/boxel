@@ -98,16 +98,25 @@ Detalle en [rendimiento/memoria-y-mundos-2026-10.md](../rendimiento/memoria-y-mu
   7 ms en la 780M, el de la apertura unos 2 ms. El mundo nuevo se asienta en 0,3 s. Fuera de esos
   dos frames, el p99 queda bajo 1,5 veces el p99 de la superficie.
 - 30 mundos seguidos sin GPU dejan el heap, los archivos abiertos y los hilos como estaban.
+- En los diez cambios volando, el heap de malloc en uso entre dos mundos crece unos 3 MiB en los
+  primeros cambios y después unos 0,1 MiB por cambio, cada vez menos. La corrida lo lee en el
+  frame de cada apertura.
 
 ## Pendiente
 
-- El RSS crece con los cambios: un 18 % en la RTX y un 9 % en la 780M tras diez cambios, no el 5 %
-  del plan. No es memoria del motor: el heap vivo no crece, y con un solo arena de malloc
-  (`MALLOC_ARENA_MAX=1`) el RSS crece un 3,5 %. Es memoria que glibc guarda en el arena de cada
-  hilo. Limitar los arenas en el juego u otro asignador lo arreglaría. Decide el dueño.
+Las dos reglas de aceptación de la corrida de cambios no se cumplen. M3 no está cerrado hasta que
+el dueño decida.
+
+- El RSS crece con los cambios: tras diez, de un 5 a un 18 % en la RTX y de un 7 a un 9 % en la
+  780M según la corrida, no el 5 % del plan. Casi todo es memoria libre que malloc guarda en sus
+  arenas: crece unos 20 MiB, y el heap en uso unos 3. Con un solo arena (`MALLOC_ARENA_MAX=1`) el
+  RSS crece un 3,5 %. Limitar los arenas en el juego u otro asignador lo bajaría. Una fuga de
+  menos de 0,1 MiB por cambio no queda descartada. El dueño decide si esta medida reemplaza a la
+  regla del 5 %.
 - El plan pedía que ningún frame fuera de los dos de pausa pasara 1,5 veces el p99 de la
-  superficie. El frame más largo pasa (4,6 ms en la RTX, 8,5 ms en la 780M), pero el vuelo sobre la
-  superficie sin cambios también tiene frames así (4,2 y 6,5 ms en 10 s). El p99 sí cumple.
+  superficie. El frame más largo pasa (de 4,6 a 5,2 ms en la RTX y de 8,5 a 8,8 ms en la 780M),
+  pero el vuelo sobre la superficie sin cambios también tiene frames así (4,2 y 6,5 ms en 10 s). El
+  p99 sí cumple.
 
 ## Consecuencias
 

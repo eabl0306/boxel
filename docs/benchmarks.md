@@ -237,11 +237,13 @@ suelta una página cada 5 s como mucho, así que hace falta `--duration 80` para
 Cambiar de mundo (ADR 0034) se mira con `just bench-switch`, los argumentos de la superficie y los
 de la GPU, `--duration 210` para diez cambios. Por cada cambio imprime el frame del cierre, los
 frames cerrando, el tiempo hasta `Closed`, el frame de la apertura, cuánto tarda en asentarse el
-mundo nuevo y la memoria residente. Al final da el p99 y el máximo de los frames fuera de las dos
-pausas declaradas de cada cambio. El caso `switch` de `tools/perf` cambia cada 4 s, así un smoke de
-10 s ve dos. Sin ventana, `headless_world --reopen` guarda el mundo con un bloque cambiado en cada
-chunk con bloques, lo cierra, lo abre otra vez desde su store e imprime los tiempos del cierre y
-de la apertura.
+mundo nuevo y la memoria residente. En el frame de la apertura lee además las cuentas de malloc
+(glibc): el heap en uso sin los registros de la corrida, que crece de un cambio a otro solo con
+una fuga, y la memoria libre que malloc guarda. Al final da el p99 y el máximo de los frames fuera
+de las dos pausas declaradas de cada cambio. El caso `switch` de `tools/perf` cambia cada 4 s, así
+un smoke de 10 s ve dos. Sin ventana, `headless_world --reopen` guarda el mundo con un bloque
+cambiado en cada chunk con bloques, lo cierra, lo abre otra vez desde su store e imprime los
+tiempos del cierre y de la apertura.
 
 `--alloc-probe 32,64` es la sonda de páginas (ADR 0035): mientras mide, cada medio segundo crea
 justo después del present un buffer como una página, cuatro de cada tamaño, y al final los

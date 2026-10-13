@@ -24,8 +24,10 @@ compilando. 1280x720, sin tope.
 - **Cambiar de mundo cuesta un frame de 2 a 7 ms** para cerrar y uno de 2 ms para abrir, y el
   mundo nuevo se asienta en 0,3 s a radio 16. Abrir un mundo guardado grande ya no recorre sus
   chunks en el hilo principal: 0,09 ms en vez de 13 ms a radio 32 (M6).
-- **El RSS crece con los cambios** (un 18 % en la RTX y un 9 % en la 780M en diez), pero no es
-  memoria del motor: con un solo arena de malloc crece un 3,5 %. Decide el dueño (M6).
+- **El RSS crece con los cambios**: en diez, de un 5 a un 18 % en la RTX y de un 7 a un 9 % en la
+  780M según la corrida. El plan pide 5 %. Casi todo es memoria libre que malloc guarda (unos 20
+  MiB); el heap en uso entre dos mundos crece unos 3 MiB y después unos 0,1 MiB por cambio, cada
+  vez menos. Decide el dueño (M6).
 
 ## M1: la sonda de páginas
 
@@ -152,16 +154,34 @@ ms. El p99 fuera de las pausas queda bajo 1,5 veces el de la superficie en las d
 máximo no, pero la superficie sin cambios tampoco cumpliría esa regla. En la 780M, 3 frames de
 114 000 pasan los 6,94 ms.
 
+Dos corridas más por GPU en 1fe1099 dan frames parecidos: p99 fuera de las pausas de 1,09 y 1,48
+ms en la RTX y de 4,57 y 4,59 ms en la 780M, máximo fuera de 4,52 y 5,24 ms y de 7,26 y 8,81 ms.
+
 El RSS crece con los cambios. Los registros de cada frame de la corrida son parte (unos 190 MiB
-en la RTX), así que la corrida los resta:
+en la RTX), así que la corrida los resta. Desde 1fe1099, en el frame de cada apertura (el mundo
+viejo cerrado, el nuevo sin cargar, una pausa declarada) la corrida lee también las cuentas de
+malloc de glibc: los bytes en uso sin los registros, que una fuga hace crecer, y los bytes libres
+que malloc guarda en sus arenas, residentes pero de nadie. Cuentan también lo que pide el driver
+de la GPU. Leerlas tarda de 0,1 a 0,8 ms. La primera corrida de cada GPU imprimía MiB enteros.
 
-| GPU | RSS tras el 1.º | tras el 10.º | sin los registros | crece |
-|---|---:|---:|---:|---:|
-| RTX 5050 | 339 MiB | 568 MiB | 319 -> 377 MiB | 18 % |
-| 780M | 283 MiB | 351 MiB | 278 -> 302 MiB | 9 % |
-| RTX, `MALLOC_ARENA_MAX=1` | 332 MiB | 513 MiB | 312 -> 323 MiB | 3,5 % |
+| GPU | corrida | RSS sin los registros, 1.º -> 10.º | crece | heap en uso en la apertura | libre de malloc |
+|---|---|---:|---:|---:|---:|
+| RTX 5050 | anterior | 319 -> 377 MiB | 18 % | | |
+| RTX 5050 | 1fe1099 | 363 -> 385 MiB | 6,1 % | 61 -> 65 MiB | 129 -> 150 MiB |
+| RTX 5050 | 1fe1099 | 369 -> 386 MiB | 4,6 % | 61,4 -> 64,8 MiB | 129,7 -> 149,5 MiB |
+| 780M | anterior | 278 -> 302 MiB | 9 % | | |
+| 780M | 1fe1099 | 279 -> 298 MiB | 6,8 % | 39 -> 42 MiB | 120 -> 138 MiB |
+| 780M | 1fe1099 | 279 -> 298 MiB | 6,8 % | 39,4 -> 42,6 MiB | 120,2 -> 138,2 MiB |
+| RTX, `MALLOC_ARENA_MAX=1` | anterior | 312 -> 323 MiB | 3,5 % | | |
 
-La última es un diagnóstico, no una medida del caso: con un solo arena de malloc el RSS casi no
-crece. Lo que crece es memoria libre que glibc guarda en el arena de cada hilo, no memoria viva del
-motor (los tests de fugas lo confirman). La regla del plan, 5 %, solo se cumple así.
+La última es un diagnóstico, no una medida del caso. En las corridas que leen malloc, lo que
+crece es su memoria libre, unos 20 MiB: explica casi todo el RSS que crece. El heap en uso entre
+dos mundos crece unos 3 MiB en los primeros cuatro o cinco cambios y después unos 0,1 MiB por
+cambio, cada vez menos.
+Treinta cambios cada 4 s en la RTX lo confirman: de 45,6 a 48,6 MiB hasta el 26.º, los últimos a
+0,04 MiB por cambio. En esa corrida hay además un salto único de 14 MiB en el 27.º, pero una
+corrida quieta sin cambios (con una traza temporal del heap cada 5 s) tiene el mismo salto a los
+15 s y después queda igual en 230 000 frames: no lo causa el cambio de mundo. Una fuga de menos de
+0,1 MiB por cambio no queda descartada. La regla del plan, 5 % de RSS, no se cumple en la 780M y
+en la RTX depende de la corrida.
 
