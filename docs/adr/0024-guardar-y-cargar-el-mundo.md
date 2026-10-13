@@ -288,8 +288,8 @@ marcador `Crate`, como haría un juego.
 - **Reparación.** Si el archivo no se cerró limpio (un crash), redb lo repara al abrirlo. Abrir
   no escribe en el log, porque un juego puede abrir el mundo antes de que el log exista (así lo
   hacen `voxel_world` y `snapshot`) y la línea se perdería. El store lo guarda
-  (`ChunkStore::repaired`, `WorldStore::repaired`) y `PersistPlugin` deja un solo aviso cuando
-  se agrega (test). Un archivo nuevo no cuenta, aunque redb también pase por su reparación al
+  (`ChunkStore::repaired`, `WorldStore::repaired`) y la app deja un solo aviso cuando abre ese
+  mundo (test). Un archivo nuevo no cuenta, aunque redb también pase por su reparación al
   crearlo.
 
 La carga y la escritura usan la maquinaria de jobs de siempre (`JobExecutor`, con
@@ -301,11 +301,16 @@ deterministas.
 - `boxel_world::persist`: `ChunkStore` (ahora con `keys`, `load_meta` y `save_batch` de un
   `SaveBatch` de chunks y metadatos), `RedbStore`, `MemoryStore`, `NullChunkStore`,
   `WorldStore` (`open`, `open_dir`, `meta`, `put_meta`, `stats`, `ids`, `close`, `repaired`),
-  `PersistPlugin` (después de `WorldPlugin`), `WorldShutdownSystems`, `PersistSettings`,
-  `PersistStats`, `PersistError`, `IdMap` y `format` (claves, registros).
-- Un `WorldStore` sirve a un solo `PersistPlugin`. Una `App` nueva abre el mundo otra vez: un
-  segundo plugin con el mismo store (o un clon) entra en pánico, porque empezaría sin el índice
-  de chunks guardados y guardaría copias generadas encima de ellos (test).
+  `PersistPlugin` (después de `WorldPlugin`; `new(store)`, `without_store()` y
+  `with_executor`), `WorldShutdownSystems`, `PersistSettings`, `PersistStats`, `PersistError`,
+  `IdMap` y `format` (claves, registros).
+- Un `WorldStore` sirve a un solo mundo. Para otro mundo, o una `App` nueva, se abre otra vez:
+  un segundo mundo con el mismo store (o un clon) no abre (`OpenWorldError::StoreServed`, y el
+  mundo de arranque entra en pánico), porque empezaría sin el índice de chunks guardados y
+  guardaría copias generadas encima de ellos (test).
+- Desde el issue #58 los mundos abren y cierran con la app en marcha (`boxel_world::lifecycle`):
+  cada `WorldSpec` trae su store, y al cerrar se guarda el último momento y se cierra el archivo
+  fuera del hilo principal.
 - `ChunkSlot::dirty`: el chunk tiene ediciones que todavía no se entregaron para guardar.
 - `BlockTicks::pending` y `BlockTicks::restore`.
 - `jobs::IoTaskPoolExecutor`.
