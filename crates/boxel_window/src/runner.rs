@@ -19,7 +19,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{DeviceEvent, DeviceId, ElementState, Ime, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{ModifiersState, PhysicalKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
@@ -156,10 +156,11 @@ impl Default for RunnerSettings {
 /// - A key press's text (`KeyEvent::text`, layout and dead keys applied) without control
 ///   characters becomes `TextInput::Text`, and a press that typed nothing `TextInput::Key`, in
 ///   one ordered stream. Shortcuts (Ctrl or Super held, but not Ctrl+Alt: Windows' Alt Gr) type
-///   nothing; releases and the synthetic presses of a focus gain send nothing. An IME commit
-///   becomes `TextInput::Text` and `ImeEvent::Commit`, a preedit `ImeEvent::Preedit`, and
-///   `Ime::Disabled` an empty preedit. `CursorLeft` is held until just before the update and dropped if the cursor
-///   moved back in by then.
+///   nothing; releases, the synthetic presses of a focus gain and the presses an IME takes
+///   (Windows reports them as `NamedKey::Process`) send nothing. An IME commit becomes
+///   `TextInput::Text` and `ImeEvent::Commit`, a preedit `ImeEvent::Preedit`, and
+///   `Ime::Disabled` an empty preedit. `CursorLeft` is held until just before the update and
+///   dropped if the cursor moved back in by then.
 /// - `WindowResized` is written only when the size actually changes (never for 0x0). On Wayland,
 ///   `Window::request_inner_size` is applied client-side and winit sends no `Resized` event, so
 ///   the runner compares `Window::inner_size` with `WindowState` before every update there.
@@ -727,6 +728,7 @@ impl RunnerCore {
                 event.state,
                 event.repeat,
                 is_synthetic,
+                taken_by_ime(&event.logical_key),
             ),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::Ime(ime) => {
@@ -857,6 +859,8 @@ impl RunnerCore {
     }
 
     /// A `WindowEvent::KeyboardInput` (its parts: tests cannot build a winit `KeyEvent`).
+    /// `ime`: the input method took the press ([`taken_by_ime`]), so it edits the composition
+    /// and not the text field.
     fn key_input(
         &mut self,
         world: &mut World,
@@ -865,11 +869,12 @@ impl RunnerCore {
         state: ElementState,
         repeat: bool,
         synthetic: bool,
+        ime: bool,
     ) {
         if let Some(message) = key_message(key, state, repeat) {
             write(world, message);
         }
-        if state == ElementState::Pressed && !synthetic {
+        if state == ElementState::Pressed && !synthetic && !ime {
             let shortcut = is_shortcut(self.modifiers);
             if let Some(input) = key_text(key, text, repeat, shortcut) {
                 write(world, input);
@@ -1267,6 +1272,14 @@ fn key_text(
 /// reports Alt Gr ("@" on a Spanish layout).
 fn is_shortcut(modifiers: ModifiersState) -> bool {
     modifiers.super_key() || (modifiers.control_key() && !modifiers.alt_key())
+}
+
+/// A key press the input method took to edit its composition. Windows still reports it, with
+/// its real physical key, no text and this logical key (`VK_PROCESSKEY`); X11, Wayland and
+/// macOS do not report it. As `TextInput::Key`, Backspace there would delete committed text and
+/// Enter would submit the field before the commit arrives.
+fn taken_by_ime(logical_key: &Key) -> bool {
+    *logical_key == Key::Named(NamedKey::Process)
 }
 
 /// `text` without control characters (Enter is "\r", Backspace "\u{8}", Escape "\u{1b}",
@@ -3153,17 +3166,18 @@ mod tests {
 
         // Through the runner: releases and synthetic presses send nothing, and the modifiers
         // winit reports make shortcuts.
+        use ElementState::{Pressed, Released};
         let mut app = app();
         let world = app.world_mut();
         let mut core = core();
-        core.key_input(world, a, Some("a"), ElementState::Released, false, false);
-        core.key_input(world, a, Some("a"), ElementState::Pressed, false, true);
+        core.key_input(world, a, Some("a"), Released, false, false, false);
+        core.key_input(world, a, Some("a"), Pressed, false, true, false);
         assert_eq!(messages::<TextInput>(world), vec![]);
         assert!(!is_shortcut(core.modifiers));
         let ctrl = ModifiersState::CONTROL.into();
         core.window_event(world, WindowEvent::ModifiersChanged(ctrl));
         assert!(is_shortcut(core.modifiers));
-        core.key_input(world, a, Some("a"), ElementState::Pressed, false, false);
+        core.key_input(world, a, Some("a"), Pressed, false, false, false);
         assert_eq!(
             messages::<TextInput>(world),
             vec![TextInput::Key {
@@ -3185,7 +3199,7 @@ mod tests {
             for &(key, text) in presses {
                 let key = PhysicalKey::Code(key);
                 let world = app.world_mut();
-                core.key_input(world, key, text, ElementState::Pressed, false, false);
+                core.key_input(world, key, text, ElementState::Pressed, false, false, false);
             }
             messages::<TextInput>(app.world())
         };
@@ -3211,11 +3225,49 @@ mod tests {
             ElementState::Pressed,
             false,
             false,
+            false,
         );
         assert_eq!(
             messages::<TextInput>(world),
             vec![text("你"), key(KeyCode::Enter)]
         );
+    }
+
+    #[test]
+    fn keys_the_input_method_takes_do_not_reach_the_text_field() {
+        assert!(taken_by_ime(&Key::Named(NamedKey::Process)));
+        assert!(!taken_by_ime(&Key::Named(NamedKey::Enter)));
+        assert!(!taken_by_ime(&Key::Character("n".into())));
+
+        // Windows, composing "ni" with an input method: "n", "i", Backspace and Enter edit and
+        // confirm the composition, so the field must not delete or submit anything; only the
+        // commit types.
+        let mut app = app();
+        let world = app.world_mut();
+        let mut core = core();
+        let presses = [
+            KeyCode::KeyN,
+            KeyCode::KeyI,
+            KeyCode::Backspace,
+            KeyCode::Enter,
+        ];
+        for key in presses {
+            let key = PhysicalKey::Code(key);
+            core.key_input(world, key, None, ElementState::Pressed, false, false, true);
+            core.key_input(world, key, None, ElementState::Released, false, false, true);
+        }
+        core.window_event(world, WindowEvent::Ime(Ime::Commit("你".to_string())));
+        assert_eq!(
+            messages::<TextInput>(world),
+            vec![TextInput::Text("你".to_string())]
+        );
+        // The game's key state still follows the keyboard.
+        let pressed: Vec<_> = messages::<KeyboardInput>(world)
+            .into_iter()
+            .filter(|input| input.state == ButtonState::Pressed)
+            .map(|input| input.key)
+            .collect();
+        assert_eq!(pressed, presses);
     }
 
     #[test]

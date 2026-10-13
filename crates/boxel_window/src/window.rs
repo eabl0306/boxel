@@ -166,9 +166,10 @@ pub struct CursorOptions {
 }
 
 /// Desired input method (IME) state; the runner applies changes before each update, next to
-/// [`CursorOptions`]. Off by default, as winit's: while an input method composes, keys go to it
-/// and winit sends no `KeyboardInput`, which game controls do not want. A UI turns it on while a
-/// text field has focus. Plain typing, dead keys included, arrives as `TextInput` either way.
+/// [`CursorOptions`]. Off by default, as winit's: while an input method composes, keys go to it,
+/// which game controls do not want (X11, Wayland and macOS send no `KeyboardInput` for them;
+/// Windows does, and the runner keeps them out of `TextInput`). A UI turns it on while a text
+/// field has focus. Plain typing, dead keys included, arrives as `TextInput` either way.
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ImeOptions {
     /// Input method events (`ImeEvent`) allowed.

@@ -74,8 +74,9 @@ pub struct CursorPosition(pub Option<Vec2>);
 /// What a text field reads, in the order the user typed it: the text of each key press and
 /// input method commit, and the presses that typed nothing (Backspace, Enter, the arrows,
 /// shortcuts). One stream, so "x", Backspace, "y" within a frame does not read as Backspace,
-/// "x", "y". Key releases and the presses winit makes up for keys already held when the window
-/// gains focus send nothing. Game controls read [`KeyboardInput`] instead.
+/// "x", "y". Key releases, the presses winit makes up for keys already held when the window
+/// gains focus and the keys an input method takes ([`ImeEvent`]) send nothing. Game controls
+/// read [`KeyboardInput`] instead.
 #[derive(Message, Clone, Debug, PartialEq, Eq)]
 pub enum TextInput {
     /// Typed text: what a key press wrote under the user's layout (dead keys arrive composed:
@@ -93,9 +94,9 @@ pub enum TextInput {
     },
 }
 
-/// Input method (IME) composition, sent only while `ImeOptions::allowed` is set. While an input
-/// method composes, keys go to it: winit sends no [`KeyboardInput`] (nor [`TextInput::Key`])
-/// for them.
+/// Input method (IME) composition, sent only while `ImeOptions::allowed` is set. The keys that
+/// edit a composition go to the input method and never arrive as [`TextInput`]: X11, Wayland
+/// and macOS do not report them, and Windows reports them only as [`KeyboardInput`].
 #[derive(Message, Clone, Debug, PartialEq, Eq)]
 pub enum ImeEvent {
     /// The text being composed, not typed yet: a text field shows it at its caret. Empty when

@@ -103,10 +103,12 @@ el pase (E-UI2) y llega antes de los menús, así que no hay puente.
   que se está componiendo. Lo confirmado llega como `TextInput::Text`, en orden con las teclas,
   y también como `ImeEvent::Commit`. Un campo de texto lee solo `TextInput`.
 - `ImeOptions { allowed, cursor_area }` se aplica en el hilo principal junto a `CursorOptions`.
-  Va apagado por defecto, porque mientras un IME compone winit no manda las teclas. La interfaz
-  lo prende solo con un campo de texto enfocado. Cuando el IME arranca de nuevo (`Ime::Enabled`)
-  el runner vuelve a mandar `cursor_area`, porque Wayland la olvida cada vez que la ventana
-  recupera el foco.
+  Va apagado por defecto, porque mientras un IME compone las teclas van a él. En X11, Wayland y
+  macOS winit no las manda. En Windows sí, sin texto y como `NamedKey::Process`, y el runner las
+  deja fuera de `TextInput`: si no, Retroceso borraría texto ya escrito y Enter enviaría el campo
+  antes de que llegue lo confirmado. La interfaz lo prende solo con un campo de texto enfocado.
+  Cuando el IME arranca de nuevo (`Ime::Enabled`) el runner vuelve a mandar `cursor_area`,
+  porque Wayland la olvida cada vez que la ventana recupera el foco.
 - `CursorLeft`: `CursorPosition` pasa a `None` cuando el cursor sale de la ventana, y nada queda
   resaltado. El runner lo manda justo antes del update y solo si el cursor no volvió. Si sale y
   vuelve en el mismo frame, vale la posición con la que winit avisa la vuelta, así que un clic
