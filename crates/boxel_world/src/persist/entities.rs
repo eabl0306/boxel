@@ -514,7 +514,9 @@ pub(crate) fn close_snapshot(world: &mut World) {
 
 /// `WorldTeardown`, `TeardownSystems::Despawn`: every saved entity alive is despawned, viewers
 /// included, after `close_snapshot` made its record (it leaves the index first, so its discard
-/// hook removes nothing).
+/// hook removes nothing). The index may still name one the game despawned (before a close
+/// without its save, which runs no `close_snapshot`, or in this set): skipped, not despawned
+/// again.
 pub(crate) fn put_away_all(world: &mut World) {
     let alive: Vec<Entity> = {
         let Some(mut jobs) = world.get_resource_mut::<WorldJobs>() else {
@@ -529,7 +531,8 @@ pub(crate) fn put_away_all(world: &mut World) {
         alive.into_iter().map(|(_, e)| e).collect()
     };
     for entity in alive {
-        world.despawn(entity);
+        // `World::despawn` would log a dead one as a warning.
+        let _ = world.try_despawn(entity);
     }
 }
 

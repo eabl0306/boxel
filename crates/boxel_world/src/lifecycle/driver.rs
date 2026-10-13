@@ -672,7 +672,8 @@ pub(crate) fn despawn_world_entities(world: &mut World) {
         .iter(world)
         .collect();
     for entity in doomed {
-        world.despawn(entity);
+        // One may have gone with an entity before it (its parent): no warning for it.
+        let _ = world.try_despawn(entity);
     }
 }
 

@@ -39,6 +39,8 @@ boxel_voxel = { workspace = true, features = ["testing"] }
 boxel_ecs = { workspace = true, features = ["debug"] }
 proptest.workspace = true
 criterion.workspace = true
+# The ECS's warnings (it logs through `log`): the lifecycle tests check a close logs none.
+log.workspace = true
 
 # Criterion flags (--quick, --save-baseline) must not reach the lib unit-test harness.
 [lib]

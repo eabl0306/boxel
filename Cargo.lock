@@ -636,6 +636,7 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "foldhash",
+ "log",
  "lz4_flex",
  "proptest",
  "redb",

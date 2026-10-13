@@ -1356,3 +1356,73 @@ fn a_close_that_never_gives_up_ends_at_the_exit() {
         assert_eq!(saved, disk_works);
     }
 }
+
+// ------------------------------------------------------------------- the ECS's warnings
+
+thread_local! {
+    /// The `log` lines at `WARN` or above of this thread, while it watches.
+    static WARNINGS: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Keeps the `log` warnings (the ECS logs through `log`, not `tracing`) of the threads that
+/// watch ([`warnings_of`]).
+struct Warnings;
+
+impl log::Log for Warnings {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Warn
+    }
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            WARNINGS.with(|w| {
+                if let Some(lines) = w.borrow_mut().as_mut() {
+                    lines.push(record.args().to_string());
+                }
+            });
+        }
+    }
+    fn flush(&self) {}
+}
+
+/// The `log` warnings this thread logged while running `f`.
+fn warnings_of(f: impl FnOnce()) -> Vec<String> {
+    static LOGGER: Warnings = Warnings;
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        log::set_logger(&LOGGER).expect("the only logger");
+        log::set_max_level(log::LevelFilter::Warn);
+    });
+    WARNINGS.with(|w| *w.borrow_mut() = Some(Vec::new()));
+    f();
+    WARNINGS.with(|w| w.borrow_mut().take().unwrap_or_default())
+}
+
+/// A saved entity the game despawned just before a close without its save (the world is
+/// deleted next) is not despawned again: the close logs no warning.
+#[test]
+fn a_saved_entity_despawned_before_an_unsaved_close_warns_nothing() {
+    let mut app = app();
+    let backend = Arc::new(MemoryStore::new());
+    open(&mut app, spec(1).with_store(open_store(&backend)));
+    app.world_mut().spawn((
+        Saved::new(),
+        Token {
+            at: block(0, 0, 4, 18, 4),
+            value: 1,
+        },
+    ));
+    settle(&mut app);
+    let gone = app
+        .world_mut()
+        .query_filtered::<Entity, With<Token>>()
+        .single(app.world())
+        .expect("alive");
+    app.world_mut().despawn(gone);
+    let warnings = warnings_of(|| {
+        assert!(close_world(app.world_mut(), CloseOptions { save: false }));
+        assert!(finish_closing(app.world_mut(), Duration::from_secs(10)));
+    });
+    assert_eq!(warnings, Vec::<String>::new());
+    assert_eq!(status(&app), WorldStatus::Closed);
+}
