@@ -1659,6 +1659,116 @@ fn the_ceiling_refuses_the_same_chunks_everywhere_and_gives_them_back() {
     }
 }
 
+/// The slot ceiling: chunks refused for want of a chunk slot make no page once the table cannot
+/// grow (pages cannot help them; they used to count as quad demand, so growth made pages nothing
+/// could use and shrink drained them again, for good). Raising the slot ceiling grows the table
+/// and brings them back.
+#[test]
+fn chunks_refused_at_the_slot_ceiling_make_no_page() {
+    let registry = boxel_demo::blocks::registry();
+    let small = pillars(&registry, 25, "boxel:stone");
+    let cells = grid(100);
+    let view = grid_view();
+    let memory = ChunkMemorySettings {
+        initial_quads: 4 * 4096,
+        initial_slots: 64,
+        page_quads: 4096,
+        max_slots: 64,
+        grow: true,
+        ..ChunkMemorySettings::default()
+    };
+    let wide = ChunkMemorySettings {
+        initial_quads: 1 << 18,
+        initial_slots: 256,
+        grow: false,
+        ..ChunkMemorySettings::default()
+    };
+    let all = upserts(&cells, 0, &small);
+    each_tier("slot ceiling", |adapter, caps, tier, report| {
+        let (device, queue, errors) = device_for(adapter, caps, tier)?;
+        let mut reference = renderer(&device, &queue, tier, wide, TranslucentSort::Off)?;
+        let expected = frame(&device, &queue, &mut reference, all.clone(), true, &view)?;
+        let mut paged = renderer(&device, &queue, tier, memory, TranslucentSort::Off)?;
+        let second = std::time::Duration::from_secs(1);
+        let (_, refused) = plugin_frame(
+            &device,
+            &queue,
+            &mut paged,
+            all.clone(),
+            Resync::Chunks,
+            &view,
+            false,
+        )?;
+        let after = paged.chunk_memory();
+        if refused != 36 || after.refused_waiting != 36 {
+            return Err(format!("{refused} refused at the slot ceiling: {after:?}"));
+        }
+        // past every hold and backoff: nothing grows for them
+        for _ in 0..40 {
+            paged.debug_advance_clock(second);
+            plugin_frame(
+                &device,
+                &queue,
+                &mut paged,
+                Vec::new(),
+                Resync::None,
+                &view,
+                false,
+            )?;
+        }
+        let stats = paged.chunk_memory();
+        if stats.pages_created != after.pages_created
+            || stats.pages > after.pages
+            || stats.refused_waiting != 36
+        {
+            return Err(format!(
+                "pages for chunks without a slot: {after:?}, then {stats:?}"
+            ));
+        }
+        // a higher slot ceiling: the table grows and they come back
+        paged.set_memory_limits(&ChunkMemorySettings {
+            max_slots: 256,
+            ..memory
+        });
+        let mut image = None;
+        for _ in 0..30 {
+            paged.debug_advance_clock(second);
+            let (i, _) = plugin_frame(
+                &device,
+                &queue,
+                &mut paged,
+                Vec::new(),
+                Resync::None,
+                &view,
+                true,
+            )?;
+            image = i;
+            if paged.chunk_memory().refused_waiting == 0 {
+                break;
+            }
+        }
+        let stats = paged.chunk_memory();
+        if stats.refused_waiting != 0 || stats.table_slots <= 64 {
+            return Err(format!("still waiting for a slot: {stats:?}"));
+        }
+        let image = image.ok_or("no image")?;
+        let diff = expected.compare(&image, 0);
+        if diff.differing_pixels > 0 {
+            report.fail(
+                format!(
+                    "slot ceiling {tier}: {} pixels differ",
+                    diff.differing_pixels
+                ),
+                &[
+                    ("slot ceiling wide", &expected),
+                    ("slot ceiling paged", &image),
+                ],
+            );
+        }
+        no_errors(&errors)
+    });
+}
+
 /// G7 (faults): uploads lost while a page drains lead to a resync and the right image; a page
 /// that cannot be created leaves chunks waiting, and they come back after the 10 s backoff; a
 /// fresh renderer fed a scene of many pages in one resync frame (what the plugin does after a

@@ -386,24 +386,51 @@ struct Refused {
     /// The refused chunks' origin and mesh (the `Arc` the world holds, not a copy), retried
     /// once room rises ([`VoxelRenderer::retry_refused`]).
     retained: growth::Retained,
-    /// `retained` per class (Solid, Translucent): growth makes room for them too.
+    /// `retained` refused for pages, per class (Solid, Translucent): growth makes room for them.
     waiting: [growth::Waiting; 2],
+    /// `retained` refused for a chunk slot, per class: pages help them only once the table grows.
+    for_slots: [growth::Waiting; 2],
 }
 
 impl Refused {
-    /// Keeps chunk `id`'s refused mesh for a retry.
-    fn retain(&mut self, id: u64, origin: I64Vec3, mesh: Arc<ChunkMesh>) {
-        let kept = growth::Kept::new(origin, mesh);
-        self.waiting[kept.class].add(kept.quads);
+    /// Keeps chunk `id`'s refused mesh for a retry; `table`: refused for want of a chunk slot.
+    fn retain(&mut self, id: u64, origin: I64Vec3, mesh: Arc<ChunkMesh>, table: bool) {
+        let kept = growth::Kept::new(origin, mesh, table);
+        self.wait(&kept, true);
         if let Some(old) = self.retained.insert(id, kept) {
-            self.waiting[old.class].remove(old.quads);
+            self.wait(&old, false);
         }
+    }
+
+    /// Counts `kept` among the waiting chunks (`add`) or takes it out.
+    fn wait(&mut self, kept: &growth::Kept, add: bool) {
+        let waiting = if kept.table {
+            &mut self.for_slots[kept.class]
+        } else {
+            &mut self.waiting[kept.class]
+        };
+        if add {
+            waiting.add(kept.quads);
+        } else {
+            waiting.remove(kept.quads);
+        }
+    }
+
+    /// A retry of chunk `id` was refused again; `table`: for want of a chunk slot this time.
+    fn refused_again(&mut self, id: u64, table: bool) {
+        let Some(kept) = self.retained.get(&id).filter(|k| k.table != table).cloned() else {
+            return;
+        };
+        self.wait(&kept, false);
+        let kept = growth::Kept { table, ..kept };
+        self.wait(&kept, true);
+        self.retained.insert(id, kept);
     }
 
     /// Drops chunk `id`'s kept mesh.
     fn forget(&mut self, id: u64) {
         if let Some(old) = self.retained.remove(&id) {
-            self.waiting[old.class].remove(old.quads);
+            self.wait(&old, false);
         }
     }
 
@@ -431,6 +458,7 @@ impl Refused {
     fn clear(&mut self) {
         self.retained.clear();
         self.waiting = Default::default();
+        self.for_slots = Default::default();
         for (_, pos) in self.by_id.drain() {
             self.changes.push((pos, false));
             self.undrawn.insert(pos, false);
@@ -1182,11 +1210,14 @@ impl VoxelRenderer {
                 self.sorter.upsert(id, origin, mesh);
                 Ok(())
             }
-            Err(_) if !caller => Err(RendererError::ArenaFull { needed: 0 }),
+            Err(refusal) if !caller => {
+                self.refused.refused_again(id, refusal == Refusal::Table);
+                Err(RendererError::ArenaFull { needed: 0 })
+            }
             Err(Refusal::Table) => {
                 self.stats.dropped_chunks += 1;
                 self.refused.refuse(id, pos, false);
-                self.refused.retain(id, origin, mesh);
+                self.refused.retain(id, origin, mesh, true);
                 Err(RendererError::ChunkTableFull(self.chunks.capacity()))
             }
             Err(
@@ -1197,7 +1228,7 @@ impl VoxelRenderer {
                 // untouched), and goes on drawing it.
                 self.stats.dropped_chunks += 1;
                 self.refused.refuse(id, pos, resident);
-                self.refused.retain(id, origin, mesh);
+                self.refused.retain(id, origin, mesh, false);
                 Err(match refusal {
                     Refusal::PageChunks { .. } => RendererError::PageChunksFull {
                         needed,
@@ -2075,6 +2106,44 @@ mod tests {
         refused.refuse(3, a, false);
         refused.clear();
         assert_eq!(take(&mut refused), [(a, false)]);
+    }
+
+    /// Chunks refused for a slot wait apart from those refused for pages (pages help them only
+    /// once the table grows); a retry refused for the other reason moves the chunk across.
+    #[test]
+    fn chunks_refused_for_a_slot_wait_apart() {
+        let mesh = |quads: usize| {
+            let mut counts = [0; boxel_mesh::BUCKET_COUNT];
+            counts[0] = quads as u32;
+            Arc::new(ChunkMesh::from_quads(
+                vec![boxel_mesh::PackedQuad::default(); quads],
+                counts,
+            ))
+        };
+        let quads = |w: &[growth::Waiting; 2]| [w[0].quads, w[1].quads];
+        let mut refused = Refused::default();
+        refused.retain(1, I64Vec3::ZERO, mesh(10), true);
+        refused.retain(2, I64Vec3::ZERO, mesh(20), false);
+        let (a, b) = (
+            crate::upload::arena_len(&mesh(10)),
+            crate::upload::arena_len(&mesh(20)),
+        );
+        assert_eq!(quads(&refused.for_slots), [u64::from(a), 0]);
+        assert_eq!(quads(&refused.waiting), [u64::from(b), 0]);
+        // a retry refused for pages this time, then a new mesh refused for a slot
+        refused.refused_again(1, false);
+        refused.refused_again(2, false);
+        assert_eq!(quads(&refused.for_slots), [0, 0]);
+        assert_eq!(quads(&refused.waiting), [u64::from(a + b), 0]);
+        refused.retain(2, I64Vec3::ZERO, mesh(20), true);
+        assert_eq!(quads(&refused.for_slots), [u64::from(b), 0]);
+        assert_eq!(quads(&refused.waiting), [u64::from(a), 0]);
+        assert_eq!(refused.for_slots[0].largest(), b);
+        refused.forget(2);
+        refused.shown(1);
+        assert_eq!(quads(&refused.for_slots), [0, 0]);
+        assert_eq!(quads(&refused.waiting), [0, 0]);
+        assert!(refused.retained.is_empty());
     }
 
     #[test]

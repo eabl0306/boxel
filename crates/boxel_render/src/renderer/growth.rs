@@ -842,10 +842,23 @@ impl VoxelRenderer {
     fn memory_sample(&self) -> Sample {
         let mut classes = self.memory.sample_classes();
         let largest = self.memory.largest_free();
-        for (class, waiting) in classes.iter_mut().zip(&self.refused.waiting) {
-            class.waiting = waiting.quads;
+        // chunks refused for a slot wait for pages only while the table can still grow: at the
+        // slot ceiling no page helps them
+        let table_grows = self.chunks.capacity() < self.layout.ceiling_slots
+            && self.growth.policy.can_grow_table(self.growth.now());
+        for (i, class) in classes.iter_mut().enumerate() {
+            let (pages, slots) = (&self.refused.waiting[i], &self.refused.for_slots[i]);
+            let (quads, size) = if table_grows {
+                (
+                    pages.quads + slots.quads,
+                    pages.largest().max(slots.largest()),
+                )
+            } else {
+                (pages.quads, pages.largest())
+            };
+            class.waiting = quads;
             // a waiting chunk larger than every free range: growth, not the free quads, helps
-            class.blocked = waiting.largest() > largest;
+            class.blocked = size > largest;
         }
         Sample {
             classes,
@@ -1120,15 +1133,18 @@ pub(super) struct Kept {
     pub class: usize,
     /// The quads it takes in a page.
     pub quads: u32,
+    /// Its last refusal was for want of a chunk slot (else of pages).
+    pub table: bool,
 }
 
 impl Kept {
-    pub fn new(origin: I64Vec3, mesh: Arc<boxel_mesh::ChunkMesh>) -> Self {
+    pub fn new(origin: I64Vec3, mesh: Arc<boxel_mesh::ChunkMesh>, table: bool) -> Self {
         Self {
             origin,
             class: PageClass::of(&bucket_counts(&mesh)).index(),
             quads: arena_len(&mesh),
             mesh,
+            table,
         }
     }
 }
@@ -1256,6 +1272,7 @@ mod tests {
                     mesh: Arc::default(),
                     class: 0,
                     quads,
+                    table: false,
                 };
                 (i, k)
             })
@@ -1310,6 +1327,7 @@ mod tests {
                 mesh: Arc::default(),
                 class: 0,
                 quads: 100,
+                table: false,
             },
         );
         assert_eq!(pass.batch(&kept, I64Vec3::ZERO, 200), [4, 5]);

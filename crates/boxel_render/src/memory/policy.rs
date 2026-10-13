@@ -252,7 +252,8 @@ impl MemoryPolicy {
                         // past a lowered ceiling: as soon as the victim's chunks fit elsewhere
                         left >= used
                     } else {
-                        !recent && others >= reserve + page / 2
+                        // the waiting chunks count as for growth: the two never meet
+                        !recent && others >= reserve + c.waiting + page / 2
                     }
             });
             match victim {
