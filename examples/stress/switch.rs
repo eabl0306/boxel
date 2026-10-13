@@ -68,8 +68,10 @@ pub struct Switch {
     opened_at: Option<Instant>,
     /// From the open to the first settled frame of the new world.
     pub settled_after: Option<Duration>,
-    /// Resident memory of the process when the new world settled.
+    /// Resident memory of the process when the new world settled, and of it the bytes of the
+    /// run's own frame records (they grow with every measured frame).
     pub rss: Option<u64>,
+    pub logs: u64,
     /// The open was refused.
     pub failed: bool,
 }
@@ -132,7 +134,8 @@ impl SwitchTrack {
             .map(|(i, s)| {
                 format!(
                     "stress: switch {}: close_frame_ms={} teardown_ms={:.2} closing_frames={} \
-                     closed_after_ms={} open_frame_ms={} settled_after_s={} rss_mib={}{}",
+                     closed_after_ms={} open_frame_ms={} settled_after_s={} rss_mib={} \
+                     records_mib={}{}",
                     i + 1,
                     self.frame_ms(s.close_frame)
                         .map_or("-".to_string(), |v| format!("{v:.2}")),
@@ -146,24 +149,31 @@ impl SwitchTrack {
                     s.settled_after
                         .map_or("-".to_string(), |d| format!("{:.2}", d.as_secs_f64())),
                     s.rss.map_or("-".to_string(), |b| (b >> 20).to_string()),
+                    s.logs >> 20,
                     if s.failed { " (the open failed)" } else { "" },
                 )
             })
             .collect();
         let (p99, max, count) = self.outside();
         let stalls = self.frames.iter().filter(|f| f.stall).count();
-        let rss = |i: usize| {
+        let rss = |i: usize, own: bool| {
             self.switches
                 .get(i)
-                .and_then(|s| s.rss)
+                .and_then(|s| {
+                    s.rss
+                        .map(|b| b.saturating_sub(if own { 0 } else { s.logs }))
+                })
                 .map_or("-".to_string(), |b| (b >> 20).to_string())
         };
         out.push(format!(
             "stress: switches={} stall_frames={stalls} outside: frames={count} p99_ms={p99:.2} \
-             max_ms={max:.2} rss_mib: first={} tenth={}",
+             max_ms={max:.2} rss_mib: first={} tenth={}, without the run's records: first={} \
+             tenth={}",
             self.switches.len(),
-            rss(0),
-            rss(9),
+            rss(0, true),
+            rss(9, true),
+            rss(0, false),
+            rss(9, false),
         ));
         out
     }
@@ -180,13 +190,14 @@ impl SwitchTrack {
         let _ = writeln!(
             out,
             "| switch | close frame ms | teardown ms | frames closing | closed after ms | open \
-             frame ms | settled after s | RSS MiB |\n|---:|---:|---:|---:|---:|---:|---:|---:|"
+             frame ms | settled after s | RSS MiB | records MiB |\n\
+             |---:|---:|---:|---:|---:|---:|---:|---:|---:|"
         );
         let cell = |v: Option<String>| v.unwrap_or_else(|| "-".to_string());
         for (i, s) in self.switches.iter().enumerate() {
             let _ = writeln!(
                 out,
-                "| {} | {} | {:.2} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {:.2} | {} | {} | {} | {} | {} | {} |",
                 i + 1,
                 cell(self.frame_ms(s.close_frame).map(|v| format!("{v:.2}"))),
                 s.teardown.as_secs_f64() * 1e3,
@@ -199,13 +210,15 @@ impl SwitchTrack {
                 ),
                 cell(s.settled_after.map(|d| format!("{:.2}", d.as_secs_f64()))),
                 cell(s.rss.map(|b| (b >> 20).to_string())),
+                s.logs >> 20,
             );
         }
         let (p99, max, count) = self.outside();
         let _ = writeln!(
             out,
             "\nFrames outside the declared stalls: {count}, p99 {p99:.2} ms, longest {max:.2} \
-             ms.\n"
+             ms. The run's own frame records grow with every frame: compare the RSS without \
+             them.\n"
         );
         out
     }
@@ -297,6 +310,7 @@ pub fn track(
         rec.quads = 0;
     }
     track.last_status = Some(status);
+    let track_frames = track.frames.len();
     let Some(switch) = track.switches.last_mut() else {
         return;
     };
@@ -317,6 +331,7 @@ pub fn track(
     {
         switch.settled_after = Some(now.saturating_duration_since(at));
         switch.rss = resident_bytes();
+        switch.logs = (rec.log.heap_bytes() + track_frames * size_of::<FrameTime>()) as u64;
     }
 }
 
@@ -358,13 +373,17 @@ mod tests {
             closed_after: Some(Duration::from_millis(20)),
             settled_after: Some(Duration::from_secs(2)),
             rss: Some(512 << 20),
+            logs: 12 << 20,
             ..Switch::default()
         });
         assert_eq!(track.outside(), (2.0, 2.0, 198));
         let lines = track.lines();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("close_frame_ms=40.00 teardown_ms=3.00 closing_frames=2"));
-        assert!(lines[0].contains("rss_mib=512"));
+        assert!(lines[0].contains("rss_mib=512 records_mib=12"));
+        assert!(
+            lines[1].ends_with("first=512 tenth=-, without the run's records: first=500 tenth=-")
+        );
         assert!(lines[1].starts_with("stress: switches=1 stall_frames=2"));
         assert!(track.markdown().starts_with("## World switches"));
     }

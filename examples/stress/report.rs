@@ -137,6 +137,11 @@ impl RecordLog {
     pub fn to_vec(&self) -> Vec<FrameRecord> {
         self.iter().copied().collect()
     }
+
+    /// Bytes of the records kept so far (what the run itself adds to the process's memory).
+    pub fn heap_bytes(&self) -> usize {
+        self.blocks.iter().map(Vec::len).sum::<usize>() * size_of::<FrameRecord>()
+    }
 }
 
 /// Everything about a run that is not a per-frame number.
