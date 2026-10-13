@@ -775,6 +775,40 @@ fn keys_an_input_method_takes_neither_move_the_focus_nor_submit() {
 }
 
 #[test]
+fn a_real_press_after_presses_the_input_method_took_moves_the_focus_once() {
+    let mut t = form_tester();
+    t.click("test:seed");
+    t.preedit("ka").frame();
+    // One slow frame: Down picks a candidate and Enter confirms it (the input method takes
+    // both), then a real Down. The text queue has the commit and that Down's key: it is the
+    // real press's, not the first Down's.
+    ime_key(&mut t, KeyCode::ArrowDown);
+    ime_key(&mut t, KeyCode::Enter);
+    t.preedit("");
+    t.app
+        .world_mut()
+        .write_message(TextInput::Text("か".to_owned()));
+    t.key(KeyCode::ArrowDown, ButtonState::Pressed, false)
+        .frame()
+        .key(KeyCode::ArrowDown, ButtonState::Released, false)
+        .frame();
+    assert_eq!(form_of(&t).seed, "か");
+    assert_eq!(t.focused().as_deref(), Some("test:create"));
+    assert_eq!(form_of(&t).created, 0, "the taken Enter activates nothing");
+    assert!(form_of(&t).submitted.is_empty());
+
+    // A click moves the focus from the field to the button in the frame of a taken press: the
+    // input method was still on, so that press does not move the focus on either.
+    t.click("test:seed");
+    t.preedit("ki").frame();
+    let create = t.hit("test:create").unwrap().rect;
+    t.move_to(IVec2::new(create.x + 1, create.y + 1)).press();
+    ime_key(&mut t, KeyCode::ArrowDown);
+    t.frame().release().frame();
+    assert_eq!(t.focused().as_deref(), Some("test:create"));
+}
+
+#[test]
 fn a_long_text_scrolls_to_keep_the_caret_in_view() {
     let mut t = form_tester();
     t.click("test:name");

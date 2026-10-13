@@ -89,6 +89,30 @@ fn both_streams_key(event: &TextInput) -> Option<KeyCode> {
     }
 }
 
+/// For each press of `keys`, the index in `text` of its [`TextInput::Key`], if it has one.
+/// Matched from the end: a press pairs with the latest unpaired key of `text` when that is the
+/// same key. The presses an input method takes (they have none) come while it composes, before
+/// the commit that ends the composition and the real presses after it: matched from the start,
+/// a taken Down would take the key of a real Down later in the frame.
+fn pair_keys(keys: &[(KeyCode, NavKey, bool)], text: &[TextInput]) -> Vec<Option<usize>> {
+    let mut text_keys = text
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| Some((i, both_streams_key(e)?)))
+        .rev()
+        .peekable();
+    let mut pairs: Vec<Option<usize>> = keys
+        .iter()
+        .rev()
+        .map(|&(code, ..)| {
+            let (i, _) = text_keys.next_if(|&(_, key)| key == code)?;
+            Some(i)
+        })
+        .collect();
+    pairs.reverse();
+    pairs
+}
+
 /// This frame's input, as the begin system read it.
 #[derive(Debug, Default)]
 pub(crate) struct NavInput {
@@ -120,6 +144,7 @@ pub(crate) struct NavInput {
 pub(crate) fn resolve(state: &mut UiState, input: &NavInput) -> InputCapture {
     let layers = &state.layers;
     let mem = &mut state.memory;
+    let was = mem.focused;
     mem.cursor = input.cursor;
     mem.shift = input.shift;
     mem.ctrl = input.ctrl;
@@ -214,11 +239,12 @@ pub(crate) fn resolve(state: &mut UiState, input: &NavInput) -> InputCapture {
     }
 
     // Keys move the focus along `order`, and text goes to the field focused when it was typed.
-    // A key that comes in both streams pairs its press with the next `TextInput::Key` of the
-    // text stream when that is the same key: the text up to it goes to the field focused before
-    // the press. A press without one is a key an input method took (Windows reports them, X11,
-    // Wayland and macOS do not) or one winit made up as the window gained focus: it leaves the
-    // focus in a text field, so picking a candidate with an arrow does not move it away.
+    // A key that comes in both streams pairs its press with its `TextInput::Key` (`pair_keys`):
+    // the text up to it goes to the field focused before the press. A press without one is a
+    // key an input method took (Windows reports them, X11, Wayland and macOS do not) or one
+    // winit made up as the window gained focus. It moves nothing once a text field had the focus
+    // this frame (the input method is on), so picking a candidate with an arrow neither moves
+    // the focus away nor, after a click or a real press moved it on, moves it again.
     let field = |id: Option<WidgetId>| {
         id.filter(|&id| order.iter().any(|h| h.id == id && h.kind.takes_text()))
     };
@@ -227,20 +253,18 @@ pub(crate) fn resolve(state: &mut UiState, input: &NavInput) -> InputCapture {
             mem.text.extend(events.iter().map(|e| (id, e.clone())));
         }
     };
+    let pairs = pair_keys(&input.keys, &input.text);
+    let mut had_field = field(was).is_some();
     let mut next = 0;
-    for &(code, key, repeat) in &input.keys {
+    for (&(code, key, repeat), &pair) in input.keys.iter().zip(&pairs) {
+        had_field |= field(mem.focused).is_some();
         if in_both_streams(code) {
-            let pair = input.text[next..]
-                .iter()
-                .position(|e| both_streams_key(e).is_some())
-                .map(|i| next + i)
-                .filter(|&i| both_streams_key(&input.text[i]) == Some(code));
             match pair {
                 Some(i) => {
                     deliver(mem, &input.text[next..=i]);
                     next = i + 1;
                 }
-                None if field(mem.focused).is_some() => continue,
+                None if had_field => continue,
                 None => {}
             }
         }

@@ -135,8 +135,10 @@ el pase (E-UI2) y llega antes de los menús, así que no hay puente.
 - Las teclas de navegación llegan por `KeyboardInput` y el texto por `TextInput`, dos colas
   separadas. La interfaz las alinea con las teclas que van en las dos (Tab, flechas y Enter):
   "ab", Tab y "12" en un mismo frame terminan en los dos campos correctos. Una de esas teclas
-  que llega sin su `TextInput` es del IME (Windows la manda igual) y no saca el foco del campo:
-  elegir un candidato con una flecha no salta al widget de abajo.
+  que llega sin su `TextInput` es del IME (Windows la manda igual) y no mueve el foco si un
+  campo lo tuvo en ese frame: elegir un candidato con una flecha no salta al widget de abajo.
+  Las parejas se arman desde el final del frame, porque las teclas del IME llegan antes de lo
+  que confirma y de las teclas reales que siguen.
 - `tabs`: una pestaña por etiqueta, cada una con su foco. Izquierda y derecha abren la vecina;
   Ctrl+Tab y Ctrl+Shift+Tab recorren las de la capa modal.
 - El tiempo real sale de `Time`: el doble clic y el parpadeo del cursor (cada 300 ms). `UiTester`
