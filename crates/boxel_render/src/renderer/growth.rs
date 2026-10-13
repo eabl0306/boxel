@@ -840,7 +840,7 @@ impl VoxelRenderer {
 
     /// The policy's view of chunk memory now.
     fn memory_sample(&self) -> Sample {
-        let mut classes = self.memory.sample_classes();
+        let mut classes = self.memory.sample_classes(self.layout.page_quads);
         let largest = self.memory.largest_free();
         // chunks refused for a slot wait for pages only while the table can still grow: at the
         // slot ceiling no page helps them

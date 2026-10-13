@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod policy;
-pub(crate) use policy::{ClassSample, MemoryPolicy, SLOW_CREATE, Sample};
+pub(crate) use policy::{ClassSample, MemoryPolicy, PageSample, SLOW_CREATE, Sample};
 
 /// Default page size in quads: 4 Mi quads, 32 MiB.
 pub const DEFAULT_PAGE_QUADS: u32 = 4 << 20;
@@ -555,8 +555,9 @@ impl ChunkMemory {
         self.class_use[class.index()]
     }
 
-    /// The policy's view of each class ([`ClassSample`]).
-    pub fn sample_classes(&self) -> [ClassSample; 2] {
+    /// The policy's view of each class ([`ClassSample`]); `page_quads`: the growth page size
+    /// (only pages of that size are shrink's victims).
+    pub fn sample_classes(&self, page_quads: u32) -> [ClassSample; 2] {
         let mut classes = [ClassSample::default(); 2];
         for class in PageClass::ALL {
             let c = &mut classes[class.index()];
@@ -566,7 +567,12 @@ impl ChunkMemory {
             let c = &mut classes[page.class.index()];
             c.pages += 1;
             let places = u64::from(self.page_chunks.saturating_sub(page.chunks));
-            let used = u64::from(page.alloc.used());
+            let sample = PageSample {
+                id,
+                quads: page.alloc.capacity(),
+                used: u64::from(page.alloc.used()),
+                chunks: page.chunks,
+            };
             match page.state {
                 PageState::Clearing { .. } => {
                     c.clearing = true;
@@ -576,12 +582,16 @@ impl ChunkMemory {
                 PageState::Active => {
                     c.free += u64::from(page.free());
                     c.places += places;
-                    // ties to the highest id: ids stay compact and the lists small
-                    if c.emptiest.is_none_or(|(_, _, best)| used <= best) {
-                        c.emptiest = Some((id, page.alloc.capacity(), used));
+                    // A floor page smaller than a growth page is never the victim: growth
+                    // could not make it again, and memory would settle above the floor. Ties
+                    // to the highest id: ids stay compact and the lists small.
+                    if sample.quads == page_quads
+                        && c.emptiest.is_none_or(|best| sample.used <= best.used)
+                    {
+                        c.emptiest = Some(sample);
                     }
                 }
-                PageState::Draining => c.draining = Some((id, used)),
+                PageState::Draining => c.draining = Some(sample),
             }
         }
         classes
@@ -1474,6 +1484,36 @@ mod tests {
         let _b = m.place(None, 16, Solid).expect("b");
         assert!(m.place(None, 16, Solid).is_none(), "full of chunks");
         assert_eq!(m.place(Some(a), 32, Solid).map(|a| a.page), Some(0));
+    }
+
+    /// Shrink's victim is a page of the growth size. A smaller floor page holding less is passed
+    /// over: releasing it would leave a growth page that the floor guard never lets go (one
+    /// page fewer than the floor's, with more quads), so memory settled above the floor.
+    #[test]
+    fn only_growth_pages_are_shrink_victims() {
+        // the default floor's shape: three Solid pages and a Translucent one of half a page
+        let mut m = memory(&[Solid, Solid, Solid, Translucent], 2048, 100);
+        let grown = m.add_page(Solid, 4096);
+        let _a = m.place(None, 2048, Solid).expect("a");
+        let _b = m.place(None, 2048, Solid).expect("b");
+        let c = m.place(None, 2048, Solid).expect("c");
+        assert_eq!(page_of(m.place(None, 1024, Solid)), Some(grown));
+        assert_eq!(page_of(m.place(None, 1024, Solid)), Some(grown));
+        // page 2 ends with one small chunk, the grown page with two larger ones
+        m.free(c);
+        assert_eq!(page_of(m.place(None, 256, Solid)), Some(2));
+        let [solid, translucent] = m.sample_classes(4096);
+        let victim = solid.emptiest.expect("a victim");
+        assert_eq!((victim.id, victim.quads, victim.used), (grown, 4096, 2048));
+        assert_eq!(
+            translucent.emptiest, None,
+            "the floor's Translucent page stays"
+        );
+        // pages all of the growth size: the emptiest, ties to the highest id
+        let mut m = memory(&[Solid, Solid, Solid], 2048, 100);
+        let _a = m.place(None, 1024, Solid).expect("a");
+        let [solid, _] = m.sample_classes(2048);
+        assert_eq!(solid.emptiest.map(|p| (p.id, p.used)), Some((2, 0)));
     }
 
     #[test]
