@@ -106,7 +106,7 @@ fn load_one(
     rel: &str,
     warnings: &mut Vec<PackWarning>,
 ) -> Result<Texture, PackError> {
-    let rgba_img = decode_png(path)?;
+    let rgba_img = decode_png(path, |_, _| Ok(()))?;
     let mcmeta_rel = format!("{rel}.mcmeta");
     let animation = if let Some(meta_path) = index.files.get(&mcmeta_rel) {
         match load_animation(meta_path) {
@@ -164,7 +164,13 @@ pub(crate) struct RgbaImage {
     pub(crate) rgba: Vec<u8>,
 }
 
-pub(crate) fn decode_png(path: &Path) -> Result<RgbaImage, PackError> {
+/// Decodes a PNG to RGBA8. `allow` sees its width and height from the header first, and its
+/// `Err` refuses the image before anything is decoded: the png crate's limits do not count the
+/// image itself, so a few MB of PNG can ask for many GB.
+pub(crate) fn decode_png(
+    path: &Path,
+    allow: impl FnOnce(u32, u32) -> Result<(), String>,
+) -> Result<RgbaImage, PackError> {
     let file = std::fs::File::open(path).map_err(|source| PackError::Io {
         path: path.to_path_buf(),
         source,
@@ -174,6 +180,10 @@ pub(crate) fn decode_png(path: &Path) -> Result<RgbaImage, PackError> {
     let mut reader = decoder.read_info().map_err(|e| PackError::InvalidPng {
         path: path.to_path_buf(),
         message: e.to_string(),
+    })?;
+    allow(reader.info().width, reader.info().height).map_err(|message| PackError::InvalidPng {
+        path: path.to_path_buf(),
+        message,
     })?;
     let size = reader
         .output_buffer_size()

@@ -255,6 +255,15 @@ pub fn split_frames(
     rgba: &[u8],
     anim: &Animation,
 ) -> Result<Vec<Vec<u8>>, String> {
+    let count = frame_count(width, height, anim)?;
+    let size = anim.frame_size(width, height);
+    Ok((0..count)
+        .map(|index| strip_frame(width, rgba, size, index))
+        .collect())
+}
+
+/// How many frames the strip holds, or why it is not a whole number of them.
+pub(crate) fn frame_count(width: u32, height: u32, anim: &Animation) -> Result<u32, String> {
     let (fw, fh) = anim.frame_size(width, height);
     if fw == 0 || fh == 0 {
         return Err("animation frame size is zero".into());
@@ -269,24 +278,22 @@ pub fn split_frames(
             "texture height {height} is not a multiple of frame height {fh}"
         ));
     }
+    Ok((width / fw) * (height / fh))
+}
+
+/// Frame `index` (row by row) of a strip `width` texels wide with frames of `(fw, fh)`, which
+/// [`frame_count`] accepted. In `usize`: past 4 GiB of texels the offsets overflow a u32.
+pub(crate) fn strip_frame(width: u32, rgba: &[u8], (fw, fh): (u32, u32), index: u32) -> Vec<u8> {
+    let (width, fw, fh) = (width as usize, fw as usize, fh as usize);
     let cols = width / fw;
-    let rows = height / fh;
-    let frame_count = cols * rows;
-    let mut out = Vec::with_capacity(frame_count as usize);
-    for row in 0..rows {
-        for col in 0..cols {
-            let mut frame = vec![0u8; (fw * fh * 4) as usize];
-            for y in 0..fh {
-                let src_y = row * fh + y;
-                let src_off = ((src_y * width + col * fw) * 4) as usize;
-                let dst_off = (y * fw * 4) as usize;
-                let len = (fw * 4) as usize;
-                frame[dst_off..dst_off + len].copy_from_slice(&rgba[src_off..src_off + len]);
-            }
-            out.push(frame);
-        }
+    let (col, row) = (index as usize % cols, index as usize / cols);
+    let len = fw * 4;
+    let mut frame = vec![0u8; fw * fh * 4];
+    for y in 0..fh {
+        let src = ((row * fh + y) * width + col * fw) * 4;
+        frame[y * len..(y + 1) * len].copy_from_slice(&rgba[src..src + len]);
     }
-    Ok(out)
+    frame
 }
 
 #[cfg(test)]
@@ -316,6 +323,22 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert_eq!(&frames[0][..4], &[255, 0, 0, 255]);
         assert_eq!(&frames[1][..4], &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn split_grid_row_by_row() {
+        // 2 by 2 frames of 1x1 texel, the red channel the texel's index.
+        let rgba: Vec<u8> = (0..4).flat_map(|i| [i, 0, 0, 255]).collect();
+        let anim = Animation {
+            frametime: 1,
+            interpolate: false,
+            frames: vec![],
+            width: Some(1),
+            height: Some(1),
+        };
+        let frames = split_frames(2, 2, &rgba, &anim).unwrap();
+        let red: Vec<u8> = frames.iter().map(|f| f[0]).collect();
+        assert_eq!(red, [0, 1, 2, 3]);
     }
 
     fn anim(frametime: u32, interpolate: bool, frames: &[(u32, Option<u32>)]) -> Animation {

@@ -57,6 +57,21 @@ impl TempPack {
         writer.write_image_data(&data).expect("png data");
     }
 
+    /// A black 8-bit grayscale PNG: about 1 KB on disk per 1 MB of texels, four times that
+    /// once decoded to RGBA.
+    fn gray_png(&self, rel: &str, w: u32, h: u32) {
+        let path = self.root.join(rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+        let file = std::fs::File::create(path).expect("png file");
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+        encoder.set_color(png::ColorType::Grayscale);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("png header");
+        writer
+            .write_image_data(&vec![0; w as usize * h as usize])
+            .expect("png data");
+    }
+
     fn open(&self) -> GuiPack {
         GuiPack::open(&self.root).expect("open the pack")
     }
@@ -325,6 +340,77 @@ fn animated_sprites_drop_the_frames_minecraft_drops() {
         assert_eq!((texture.width, texture.height), (2, 2), "{name}");
         assert_eq!(texture.rgba, [shown, 0, 0, 255].repeat(4), "{name}");
     }
+}
+
+#[test]
+fn gui_images_past_4096_by_4096_texels_are_refused_before_decoding() {
+    let pack = TempPack::simple("huge_images");
+    // One row or column more than a full UI atlas page (4096 by 4096): refused from the
+    // header. A 40000 by 40000 grayscale PNG is 1.5 MB on disk and 6.4 GB decoded to RGBA.
+    pack.gray_png(&format!("{SPRITES}/huge.png"), 4097, 4096);
+    pack.gray_png("assets/minecraft/textures/font/huge.png", 4096, 4097);
+    pack.text(
+        "assets/minecraft/font/default.json",
+        r#"{"providers": [
+            {"type": "bitmap", "file": "minecraft:font/huge.png", "ascent": 7, "chars": ["a"]}
+        ]}"#,
+    );
+    let reader = pack.open();
+    let err = reader.sprite(&id("huge")).expect_err("too big");
+    assert!(
+        matches!(err, PackError::InvalidPng { .. }) && err.to_string().contains("4097x4096"),
+        "{err}"
+    );
+    let font = reader.font(&id("default")).expect("reads").expect("exists");
+    assert!(font.providers.is_empty());
+    assert_eq!(font.warnings.len(), 1, "{:?}", font.warnings);
+    assert!(
+        font.warnings[0].message.contains("4096x4097"),
+        "{:?}",
+        font.warnings[0]
+    );
+}
+
+#[test]
+fn a_font_decodes_at_most_two_full_atlas_pages_of_images() {
+    let pack = TempPack::simple("many_big_images");
+    // Four images of half an atlas page fill the font's 2 * 4096 * 4096 texels; the fifth, of
+    // one texel, is skipped. Each provider cuts one 2048 by 1024 cell.
+    for i in 0..5 {
+        let (w, h) = if i < 4 { (4096, 2048) } else { (1, 1) };
+        pack.gray_png(&format!("assets/minecraft/textures/font/page{i}.png"), w, h);
+    }
+    let providers: Vec<String> = (0..5)
+        .map(|i| {
+            let chars = if i < 4 {
+                format!(r#"["{i}\u0000", "\u0000\u0000"]"#)
+            } else {
+                format!(r#"["{i}"]"#)
+            };
+            format!(
+                r#"{{"type": "bitmap", "file": "minecraft:font/page{i}.png", "ascent": 7,
+                    "chars": {chars}}}"#
+            )
+        })
+        .collect();
+    pack.text(
+        "assets/minecraft/font/default.json",
+        &format!(r#"{{"providers": [{}]}}"#, providers.join(",")),
+    );
+    let font = pack
+        .open()
+        .font(&id("default"))
+        .expect("reads")
+        .expect("exists");
+    let bitmaps = bitmaps(&font.providers);
+    assert_eq!(bitmaps.len(), 4, "{:?}", font.warnings);
+    assert_eq!(bitmaps[3].cell(), [2048, 1024]);
+    assert_eq!(font.warnings.len(), 1, "{:?}", font.warnings);
+    assert!(
+        font.warnings[0].message.contains("page4"),
+        "{:?}",
+        font.warnings[0]
+    );
 }
 
 #[test]

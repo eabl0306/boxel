@@ -169,13 +169,18 @@ el pase (E-UI2) y llega antes de los menús, así que no hay puente.
   rechazaría (`..`, mayúsculas) no encuentra nada, así que una fuente no lee fuera del pack. Un
   overlay cuyo directorio no es un solo nombre (`-_a-zA-Z0-9.`, sin `.` ni `..`) se salta con un
   aviso, también en `ResourcePack`.
-- Un pack hostil no cuelga ni desborda nada. Cada fuente se lee y cada imagen se decodifica una
-  vez por carga, aunque se nombren muchas veces. Los tamaños de `gui.scaling` pasan solo hasta
-  `i32::MAX`, como en Minecraft. Un proveedor con glifos de más de 32768 píxeles de GUI (alto,
-  ancho, `ascent` o avance) o con celdas de más de 4096 texels de lado se salta con un aviso.
-  Las celdas que nombran los proveedores de una fuente suman a lo sumo dos páginas llenas del
-  atlas (2 × 4096 × 4096 texels), y los que pasan se saltan con un aviso. Un sprite animado da el
-  primer cuadro que Minecraft reproduciría.
+- Un pack hostil no cuelga ni desborda nada, y lo que pide de memoria tiene tope:
+  - Cada fuente se lee y cada imagen se decodifica una vez por carga, aunque se nombren muchas
+    veces.
+  - Una imagen de GUI (sprite, textura o imagen de fuente) de más de 4096 × 4096 texels, una
+    página llena del atlas, se rechaza por su cabecera, antes de decodificarla. Un sprite así es
+    un error.
+  - Las imágenes de una fuente suman a lo sumo dos páginas llenas, y las celdas que nombran sus
+    proveedores también. Un proveedor que pasa ese tope, que tiene glifos de más de 32768 píxeles
+    de GUI (alto, ancho, `ascent` o avance) o celdas de más de 4096 texels de lado se salta con
+    un aviso.
+  - Los tamaños de `gui.scaling` pasan solo hasta `i32::MAX`, como en Minecraft. Un sprite
+    animado da el primer cuadro que Minecraft reproduciría, y solo ese cuadro se copia.
 - `boxel_ui` con la feature `pack` (la fachada la prende con `ui` y `pack`):
   `UiAtlas::insert_pack_sprite` guarda el sprite con su escala y `FontBuilder::pack_font` suma
   los proveedores. Como en Minecraft, gana el primer proveedor que tiene el carácter, el glifo

@@ -6,12 +6,24 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::animation::{AnimationRaw, split_frames};
+use crate::animation::{AnimationRaw, frame_count, strip_frame};
 use crate::error::{PackError, PackWarning};
 use crate::font::{self, PackFont};
 use crate::id::ResourceId;
 use crate::meta::{self, OpenOptions, PackMeta};
 use crate::texture::decode_png;
+
+/// The most texels a GUI image (a sprite, a texture, a font's image) may have: a full UI atlas
+/// page of 4096 by 4096. A bigger one is refused from its PNG header, before it is decoded.
+pub(crate) const MAX_GUI_TEXELS: u64 = 4096 * 4096;
+
+/// Whether a `width` by `height` image is at most `max` texels, for `decode_png`.
+pub(crate) fn at_most(width: u32, height: u32, max: u64) -> Result<(), String> {
+    if u64::from(width) * u64::from(height) > max {
+        return Err(format!("{width}x{height} is more than {max} texels"));
+    }
+    Ok(())
+}
 
 /// How a GUI sprite fills a rectangle of another size: Minecraft's `gui.scaling` in the sprite's
 /// `.png.mcmeta`. Sizes are GUI pixels; the texture may hold more texels per GUI pixel (a
@@ -123,7 +135,9 @@ impl GuiPack {
     }
 
     /// A GUI sprite: `minecraft:widget/button` reads
-    /// `assets/minecraft/textures/gui/sprites/widget/button.png` and its `.png.mcmeta`.
+    /// `assets/minecraft/textures/gui/sprites/widget/button.png` and its `.png.mcmeta`. A PNG of
+    /// more than 4096 * 4096 texels (a whole animation strip included) is
+    /// [`PackError::InvalidPng`], refused before it is decoded.
     pub fn sprite(&self, id: &ResourceId) -> Result<Option<GuiTexture>, PackError> {
         let path = format!("textures/gui/sprites/{}.png", id.path);
         self.texture_file(&id.namespace, &path)
@@ -131,7 +145,7 @@ impl GuiPack {
 
     /// Any texture by its id under `textures/`: `minecraft:gui/title/minecraft` reads
     /// `assets/minecraft/textures/gui/title/minecraft.png`, `minecraft:font/ascii` the default
-    /// font image. Its `.png.mcmeta` gives the scaling, as for a sprite.
+    /// font image. Its `.png.mcmeta` gives the scaling and its size is bounded, as for a sprite.
     pub fn texture(&self, id: &ResourceId) -> Result<Option<GuiTexture>, PackError> {
         let path = format!("textures/{}.png", id.path);
         self.texture_file(&id.namespace, &path)
@@ -142,7 +156,8 @@ impl GuiPack {
     /// Providers that cannot be used are skipped with a warning in [`PackFont::warnings`]; a
     /// font file that does not parse is an error. Each font file is read and each image decoded
     /// once, however many times the pack names them. The cells a font's bitmap providers name
-    /// hold at most 2 * 4096 * 4096 texels together: the providers past that are skipped.
+    /// hold at most 2 * 4096 * 4096 texels together, and so do its images, none of them past
+    /// 4096 * 4096: the providers past that are skipped.
     pub fn font(&self, id: &ResourceId) -> Result<Option<PackFont>, PackError> {
         font::load(self, id)
     }
@@ -170,7 +185,7 @@ impl GuiPack {
         let Some(png) = self.file(namespace, path) else {
             return Ok(None);
         };
-        let image = decode_png(&png)?;
+        let image = decode_png(&png, |w, h| at_most(w, h, MAX_GUI_TEXELS))?;
         let meta = match self.file(namespace, &format!("{path}.mcmeta")) {
             Some(file) => read_meta(&file)?,
             None => GuiMeta::default(),
@@ -181,22 +196,28 @@ impl GuiPack {
                 // An animated GUI texture shows the first frame of its sequence, after
                 // Minecraft drops the frames it cannot play; with one frame or none left it is
                 // static and shows strip frame 0. The dropped frames' warnings do not matter
-                // for a still frame.
+                // for a still frame. Only that frame is copied out: a strip of 1x1 frames has
+                // millions.
                 let animation = raw.into_animation();
                 let (fw, fh) = animation.frame_size(image.width, image.height);
-                let frames = split_frames(image.width, image.height, &image.rgba, &animation)
-                    .map_err(|message| PackError::InvalidGuiMeta {
-                        path: png.clone(),
-                        message,
+                let count =
+                    frame_count(image.width, image.height, &animation).map_err(|message| {
+                        PackError::InvalidGuiMeta {
+                            path: png.clone(),
+                            message,
+                        }
                     })?;
-                let first = animation
-                    .timeline(frames.len() as u32, &mut Vec::new())
-                    .map_or(0, |timeline| timeline.frames()[0].index);
-                let frame = frames
-                    .get(first as usize)
-                    .or(frames.first())
-                    .cloned()
-                    .unwrap_or_default();
+                // Without a `frames` list the sequence plays the strip in order: frame 0 first,
+                // and a timeline of millions is not built to say so.
+                let first = if animation.frames.is_empty() {
+                    0
+                } else {
+                    animation
+                        .timeline(count, &mut Vec::new())
+                        .map_or(0, |timeline| timeline.frames()[0].index)
+                };
+                let first = if first < count { first } else { 0 };
+                let frame = strip_frame(image.width, &image.rgba, (fw, fh), first);
                 (fw, fh, frame)
             }
         };

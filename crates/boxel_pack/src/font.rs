@@ -8,7 +8,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::error::{PackError, PackWarning};
-use crate::gui::GuiPack;
+use crate::gui::{GuiPack, MAX_GUI_TEXELS, at_most};
 use crate::id::ResourceId;
 use crate::texture::decode_png;
 
@@ -29,6 +29,11 @@ const MAX_CELL_SIDE: u32 = 4096;
 /// page, as glyphs are cut to their used width. A provider past it is skipped, so cutting a
 /// font's glyphs costs a bounded amount however many providers name one big image.
 const MAX_FONT_GLYPH_TEXELS: u64 = 2 * 4096 * 4096;
+
+/// The texels of every image a font decodes, together (each one is at most [`MAX_GUI_TEXELS`]).
+/// An image past it is not decoded and its providers are skipped: a pack could name thousands of
+/// big images, each a few KB on disk, through providers that cut one small cell.
+const MAX_FONT_IMAGE_TEXELS: u64 = 2 * 4096 * 4096;
 
 /// A pack's font: its providers in Minecraft's order, where the first provider that has a
 /// character draws it. `reference` providers are replaced by the providers of the font they
@@ -106,6 +111,7 @@ pub(crate) fn load(pack: &GuiPack, id: &ResourceId) -> Result<Option<PackFont>, 
         stack: vec![id.clone()],
         read: HashSet::new(),
         images: HashMap::new(),
+        image_texels: 0,
         glyph_texels: 0,
         font: PackFont::default(),
     };
@@ -124,6 +130,8 @@ struct Load<'a> {
     read: HashSet<ResourceId>,
     /// Images decoded so far (or why they could not be), by texture id.
     images: HashMap<ResourceId, Result<Image, String>>,
+    /// The texels of the images decoded so far.
+    image_texels: u64,
     /// The texels of the cells the font's bitmap providers name so far.
     glyph_texels: u64,
     font: PackFont,
@@ -216,6 +224,7 @@ impl Load<'_> {
     /// The image `file` (a texture id), decoded the first time it is named.
     fn image(&mut self, file: &ResourceId) -> Result<Image, String> {
         let pack = self.pack;
+        let decoded = &mut self.image_texels;
         self.images
             .entry(file.clone())
             .or_insert_with(|| {
@@ -223,7 +232,19 @@ impl Load<'_> {
                 let path = pack
                     .file(&file.namespace, &path)
                     .ok_or_else(|| format!("image {file} is not in the pack"))?;
-                let image = decode_png(&path).map_err(|e| e.to_string())?;
+                let left = MAX_FONT_IMAGE_TEXELS - *decoded;
+                let image = decode_png(&path, |w, h| {
+                    at_most(w, h, MAX_GUI_TEXELS)?;
+                    if u64::from(w) * u64::from(h) > left {
+                        return Err(format!(
+                            "{w}x{h} would pass the {MAX_FONT_IMAGE_TEXELS} texels a font's \
+                             images share ({left} left)"
+                        ));
+                    }
+                    Ok(())
+                })
+                .map_err(|e| e.to_string())?;
+                *decoded += u64::from(image.width) * u64::from(image.height);
                 Ok((image.width, image.height, image.rgba.into()))
             })
             .clone()
