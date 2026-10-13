@@ -24,7 +24,7 @@ use crate::atlas::{AtlasError, SpriteId, UiAtlas};
 use crate::font::{FontBuilder, GlyphBitmap};
 use crate::sprite::Scaling;
 use boxel_pack::{FontProvider, GuiScaling, GuiTexture, PackFont};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 impl From<GuiScaling> for Scaling {
     fn from(scaling: GuiScaling) -> Self {
@@ -71,13 +71,36 @@ impl FontBuilder {
     /// Adds the glyphs of a pack's font: its bitmap providers with their `height` and `ascent`
     /// ([`FontBuilder::bitmap`]) and its space providers (advances rounded to whole GUI pixels,
     /// negative ones to 0). Within the font the first provider with a character wins, as in
-    /// Minecraft; its glyphs replace those added to this builder before.
+    /// Minecraft; its glyphs replace those added to this builder before. A later provider's
+    /// cell for that character is never cut.
     pub fn pack_font(&mut self, font: &PackFont) -> &mut Self {
         // Providers that name the same image share it: copy it out once.
         let mut images: HashMap<(*const u8, u32, u32), GlyphBitmap> = HashMap::new();
-        for provider in font.providers.iter().rev() {
+        // The characters earlier providers have. A pack may name one big image in thousands of
+        // providers: only the cells that draw something are cut.
+        let mut taken: HashSet<char> = HashSet::new();
+        for provider in &font.providers {
             match provider {
                 FontProvider::Bitmap(bitmap) => {
+                    // Taken characters become unused cells; within a provider the last cell
+                    // of a character still wins, as in Minecraft.
+                    let rows: Vec<String> = bitmap
+                        .chars
+                        .iter()
+                        .map(|row| {
+                            row.chars()
+                                .map(|c| if taken.contains(&c) { '\0' } else { c })
+                                .collect()
+                        })
+                        .collect();
+                    let new: Vec<char> = rows
+                        .iter()
+                        .flat_map(|row| row.chars())
+                        .filter(|&c| c != '\0')
+                        .collect();
+                    if new.is_empty() {
+                        continue;
+                    }
                     let image = images
                         .entry((bitmap.rgba.as_ptr(), bitmap.width, bitmap.height))
                         .or_insert_with(|| GlyphBitmap {
@@ -85,12 +108,15 @@ impl FontBuilder {
                             h: bitmap.height,
                             rgba: bitmap.rgba.to_vec(),
                         });
-                    let rows: Vec<&str> = bitmap.chars.iter().map(String::as_str).collect();
+                    let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
                     self.bitmap(image, &rows, bitmap.glyph_height, bitmap.ascent);
+                    taken.extend(new);
                 }
                 FontProvider::Space(space) => {
                     for &(c, advance) in &space.advances {
-                        self.space(c, advance.max(0.0).round() as u32);
+                        if taken.insert(c) {
+                            self.space(c, advance.max(0.0).round() as u32);
+                        }
                     }
                 }
             }
@@ -254,5 +280,37 @@ mod tests {
         );
         // What the pack lacks keeps the builder's own glyph.
         assert_eq!(built.resolve('z').size, [1, GLYPH_HEIGHT]);
+    }
+
+    #[test]
+    fn a_cell_an_earlier_provider_has_is_never_cut() {
+        // The second provider's image is not even there: had its cell for 'a' been cut, the
+        // first texel read would panic. A pack may name one big image in thousands of
+        // providers, and each overridden cell was cut and thrown away.
+        let missing = FontProvider::Bitmap(BitmapProvider {
+            file: ResourceId::parse("test:font/missing.png"),
+            width: 8,
+            height: 8,
+            rgba: Vec::new().into(),
+            chars: vec!["a".to_owned()],
+            glyph_height: 8,
+            ascent: 7,
+        });
+        let font = PackFont {
+            providers: vec![
+                bitmap([8, 8], &["a"], &[3], 8, 7),
+                missing,
+                // 'a' is taken, 'c' is new: only 'c' is cut.
+                bitmap([8, 8], &["ac"], &[8, 5], 8, 7),
+            ],
+            warnings: Vec::new(),
+        };
+        let mut atlas = UiAtlas::new(64);
+        let built = FontBuilder::new()
+            .pack_font(&font)
+            .build(&mut atlas)
+            .unwrap();
+        assert_eq!(built.resolve('a').size, [3, GLYPH_HEIGHT]);
+        assert_eq!(built.resolve('c').size, [5, GLYPH_HEIGHT]);
     }
 }

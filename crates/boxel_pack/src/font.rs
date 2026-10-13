@@ -25,6 +25,11 @@ const MAX_GLYPH_SPAN: u32 = 32768;
 /// GUI pixels, as `boxel_ui` draws it) past any UI atlas.
 const MAX_CELL_SIDE: u32 = 4096;
 
+/// The texels of every cell a font's bitmap providers name, together: twice the largest UI atlas
+/// page, as glyphs are cut to their used width. A provider past it is skipped, so cutting a
+/// font's glyphs costs a bounded amount however many providers name one big image.
+const MAX_FONT_GLYPH_TEXELS: u64 = 2 * 4096 * 4096;
+
 /// A pack's font: its providers in Minecraft's order, where the first provider that has a
 /// character draws it. `reference` providers are replaced by the providers of the font they
 /// name; providers behind a `filter` are kept only for Minecraft's default options (uniform
@@ -101,6 +106,7 @@ pub(crate) fn load(pack: &GuiPack, id: &ResourceId) -> Result<Option<PackFont>, 
         stack: vec![id.clone()],
         read: HashSet::new(),
         images: HashMap::new(),
+        glyph_texels: 0,
         font: PackFont::default(),
     };
     load.read_providers(&path)?;
@@ -118,6 +124,8 @@ struct Load<'a> {
     read: HashSet<ResourceId>,
     /// Images decoded so far (or why they could not be), by texture id.
     images: HashMap<ResourceId, Result<Image, String>>,
+    /// The texels of the cells the font's bitmap providers name so far.
+    glyph_texels: u64,
     font: PackFont,
 }
 
@@ -303,6 +311,20 @@ impl Load<'_> {
                 bitmap.file
             ));
         }
+        let glyphs = bitmap
+            .chars
+            .iter()
+            .flat_map(|row| row.chars())
+            .filter(|&c| c != '\0')
+            .count() as u64;
+        let texels = glyphs.saturating_mul(u64::from(cell_w) * u64::from(cell_h));
+        if texels > MAX_FONT_GLYPH_TEXELS - self.glyph_texels {
+            return Err(format!(
+                "{glyphs} cells of {cell_w}x{cell_h} texels would pass the \
+                 {MAX_FONT_GLYPH_TEXELS} texels of cells a font may name"
+            ));
+        }
+        self.glyph_texels += texels;
         Ok(bitmap)
     }
 }

@@ -141,7 +141,8 @@ impl GuiPack {
     /// and space providers and their images, following `reference` providers inside the pack.
     /// Providers that cannot be used are skipped with a warning in [`PackFont::warnings`]; a
     /// font file that does not parse is an error. Each font file is read and each image decoded
-    /// once, however many times the pack names them.
+    /// once, however many times the pack names them. The cells a font's bitmap providers name
+    /// hold at most 2 * 4096 * 4096 texels together: the providers past that are skipped.
     pub fn font(&self, id: &ResourceId) -> Result<Option<PackFont>, PackError> {
         font::load(self, id)
     }

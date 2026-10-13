@@ -575,6 +575,46 @@ fn cells_past_4096_texels_are_skipped() {
 }
 
 #[test]
+fn a_font_names_at_most_twice_a_full_atlas_of_glyph_cells() {
+    let pack = TempPack::simple("many_big_cells");
+    // One 2048 by 2048 image, named whole by ten providers: 4 Mi texels of cells each. Cutting
+    // them all would hold 160 MiB of glyphs (2000 providers, 32 GiB); a font names at most
+    // 2 * 4096 * 4096 texels of cells, so the ninth and tenth are skipped.
+    pack.png(
+        "assets/minecraft/textures/font/big.png",
+        2048,
+        2048,
+        |_, _| [255; 4],
+    );
+    let providers: Vec<String> = (0..10)
+        .map(|i| {
+            format!(
+                r#"{{"type": "bitmap", "file": "minecraft:font/big.png", "ascent": 7,
+                    "chars": ["\ue{i:03x}"]}}"#
+            )
+        })
+        .collect();
+    pack.text(
+        "assets/minecraft/font/default.json",
+        &format!(r#"{{"providers": [{}]}}"#, providers.join(",")),
+    );
+    let font = pack
+        .open()
+        .font(&id("default"))
+        .expect("reads")
+        .expect("exists");
+    let bitmaps = bitmaps(&font.providers);
+    assert_eq!(bitmaps.len(), 8, "{:?}", font.warnings);
+    assert_eq!(bitmaps[7].chars, ["\u{e007}"]);
+    assert_eq!(font.warnings.len(), 2, "{:?}", font.warnings);
+    assert!(
+        font.warnings[0].message.contains("33554432"),
+        "{:?}",
+        font.warnings[0]
+    );
+}
+
+#[test]
 fn a_font_referenced_again_is_read_once() {
     let pack = TempPack::simple("repeated_references");
     pack.png("assets/minecraft/textures/font/grid.png", 8, 8, |_, _| {
