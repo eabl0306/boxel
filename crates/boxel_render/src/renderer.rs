@@ -386,32 +386,24 @@ struct Refused {
     /// The refused chunks' origin and mesh (the `Arc` the world holds, not a copy), retried
     /// once room rises ([`VoxelRenderer::retry_refused`]).
     retained: growth::Retained,
-    /// Quads of `retained` per class (Solid, Translucent): growth makes room for them too.
-    waiting: [u64; 2],
-}
-
-/// The class index and the page quads of a kept mesh.
-fn waiting_quads(mesh: &ChunkMesh) -> (usize, u64) {
-    let class = PageClass::of(&crate::memory::bucket_counts(mesh));
-    (class.index(), u64::from(crate::upload::arena_len(mesh)))
+    /// `retained` per class (Solid, Translucent): growth makes room for them too.
+    waiting: [growth::Waiting; 2],
 }
 
 impl Refused {
     /// Keeps chunk `id`'s refused mesh for a retry.
     fn retain(&mut self, id: u64, origin: I64Vec3, mesh: Arc<ChunkMesh>) {
-        let (class, quads) = waiting_quads(&mesh);
-        self.waiting[class] += quads;
-        if let Some((_, old)) = self.retained.insert(id, (origin, mesh)) {
-            let (class, quads) = waiting_quads(&old);
-            self.waiting[class] -= quads;
+        let kept = growth::Kept::new(origin, mesh);
+        self.waiting[kept.class].add(kept.quads);
+        if let Some(old) = self.retained.insert(id, kept) {
+            self.waiting[old.class].remove(old.quads);
         }
     }
 
     /// Drops chunk `id`'s kept mesh.
     fn forget(&mut self, id: u64) {
-        if let Some((_, old)) = self.retained.remove(&id) {
-            let (class, quads) = waiting_quads(&old);
-            self.waiting[class] -= quads;
+        if let Some(old) = self.retained.remove(&id) {
+            self.waiting[old.class].remove(old.quads);
         }
     }
 
@@ -438,7 +430,7 @@ impl Refused {
     /// Every chunk was removed.
     fn clear(&mut self) {
         self.retained.clear();
-        self.waiting = [0; 2];
+        self.waiting = Default::default();
         for (_, pos) in self.by_id.drain() {
             self.changes.push((pos, false));
             self.undrawn.insert(pos, false);

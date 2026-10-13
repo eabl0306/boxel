@@ -16,6 +16,7 @@ use crate::upload::{GpuSink, arena_len};
 use boxel_gfx::Tier;
 use boxel_math::I64Vec3;
 use boxel_shaders::gpu::chunk_memory::MAX_PAGES;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -115,8 +116,8 @@ pub(super) struct Growth {
     shrink_lists: bool,
     /// Per class: the Draining page and the chunks it held when it started draining.
     victims: [Option<(u16, Vec<u64>)>; 2],
-    /// Room rose since the refused chunks were last retried.
-    retry: bool,
+    /// The retries of the refused chunks.
+    retry: RetryPass,
     /// Quads freed by removes since the last retry.
     freed: u64,
     /// The last frame's eye in world voxels (retries go nearest first).
@@ -154,7 +155,7 @@ impl Growth {
             next_lists: None,
             shrink_lists: false,
             victims: [None, None],
-            retry: false,
+            retry: RetryPass::default(),
             freed: 0,
             eye: I64Vec3::ZERO,
             counters: Counters::default(),
@@ -169,9 +170,9 @@ impl Growth {
         Instant::now() + self.clock
     }
 
-    /// Room rose: the refused chunks are retried.
+    /// Room rose: the refused chunks are retried (a new pass, from the nearest).
     pub fn room_rose(&mut self) {
-        self.retry = true;
+        self.retry.arm();
         self.freed = 0;
     }
 
@@ -189,7 +190,7 @@ impl Growth {
     pub fn clear_chunks(&mut self) {
         self.victims = [None, None];
         self.table_copy = None;
-        self.retry = false;
+        self.retry.stop();
         self.freed = 0;
     }
 
@@ -630,41 +631,31 @@ impl VoxelRenderer {
         self.create_wanted(device)
     }
 
-    /// Retries the refused chunks kept with their mesh, nearest to the last frame's eye first,
-    /// at most 131,072 quads a frame, once room rose (a page went in use, the table grew,
-    /// removes freed a quarter page). A chunk placed now is reported shown
+    /// Retries the refused chunks kept with their mesh once room rose (a page went in use, the
+    /// table grew, removes freed a quarter page): one pass over all of them, nearest to the last
+    /// frame's eye first, at most 131,072 quads a frame (a chunk refused again counts too), then
+    /// nothing until room rises again. A chunk placed now is reported shown
     /// ([`VoxelRenderer::take_refused`]); one refused again changes nothing and is not counted
     /// again in [`crate::RenderStats::dropped_chunks`]. [`VoxelRenderer::apply_ops`] calls it.
     pub fn retry_refused(&mut self) {
-        if !self.growth.retry || self.refused.retained.is_empty() {
+        if !self.growth.retry.pending() {
             return;
         }
-        let eye = self.growth.eye;
-        let mut order: Vec<(i128, u64)> = self
-            .refused
-            .retained
-            .iter()
-            .map(|(&id, (origin, _))| {
-                let d = *origin + I64Vec3::splat(16) - eye;
-                let (x, y, z) = (i128::from(d.x), i128::from(d.y), i128::from(d.z));
-                (x * x + y * y + z * z, id)
-            })
-            .collect();
-        order.sort_unstable();
-        let mut budget = RETRY_QUADS;
-        let mut all = true;
-        for (_, id) in order {
-            if budget == 0 {
-                all = false;
-                break;
-            }
-            let Some((origin, mesh)) = self.refused.retained.get(&id).cloned() else {
+        if self.refused.retained.is_empty() {
+            self.growth.retry.stop();
+            return;
+        }
+        let ids = self
+            .growth
+            .retry
+            .batch(&self.refused.retained, self.growth.eye, RETRY_QUADS);
+        for id in ids {
+            let Some(kept) = self.refused.retained.get(&id) else {
                 continue;
             };
-            budget = budget.saturating_sub(u64::from(arena_len(&mesh)));
+            let (origin, mesh) = (kept.origin, Arc::clone(&kept.mesh));
             let _ = self.upsert_inner(id, origin, mesh, false);
         }
-        self.growth.retry = !all;
     }
 
     /// Chunk memory's work between frames, at the start of `render` (span `render.pages`): the
@@ -850,18 +841,11 @@ impl VoxelRenderer {
     /// The policy's view of chunk memory now.
     fn memory_sample(&self) -> Sample {
         let mut classes = self.memory.sample_classes();
-        for (class, waiting) in classes.iter_mut().zip(self.refused.waiting) {
-            class.waiting = waiting;
-        }
-        if !self.refused.retained.is_empty() {
+        let largest = self.memory.largest_free();
+        for (class, waiting) in classes.iter_mut().zip(&self.refused.waiting) {
+            class.waiting = waiting.quads;
             // a waiting chunk larger than every free range: growth, not the free quads, helps
-            let largest = self.memory.largest_free();
-            for (_, mesh) in self.refused.retained.values() {
-                let class = PageClass::of(&bucket_counts(mesh));
-                if arena_len(mesh) > largest {
-                    classes[class.index()].blocked = true;
-                }
-            }
+            class.blocked = waiting.largest() > largest;
         }
         Sample {
             classes,
@@ -898,7 +882,7 @@ impl VoxelRenderer {
         g.next_lists = None;
         g.shrink_lists = false;
         g.victims = [None, None];
-        g.retry = false;
+        g.retry.stop();
         g.freed = 0;
         g.policy.forget_world();
         g.counters = Counters {
@@ -1126,8 +1110,128 @@ impl VoxelRenderer {
     }
 }
 
-/// Keeps the mesh `Arc`s of refused chunks (see `Refused::retained`).
-pub(super) type Retained = std::collections::HashMap<u64, (I64Vec3, Arc<boxel_mesh::ChunkMesh>)>;
+/// A refused chunk kept for its retry (see `Refused::retained`).
+#[derive(Clone, Debug)]
+pub(super) struct Kept {
+    pub origin: I64Vec3,
+    /// The `Arc` the world holds, not a copy.
+    pub mesh: Arc<boxel_mesh::ChunkMesh>,
+    /// Its class (`PageClass::index`).
+    pub class: usize,
+    /// The quads it takes in a page.
+    pub quads: u32,
+}
+
+impl Kept {
+    pub fn new(origin: I64Vec3, mesh: Arc<boxel_mesh::ChunkMesh>) -> Self {
+        Self {
+            origin,
+            class: PageClass::of(&bucket_counts(&mesh)).index(),
+            quads: arena_len(&mesh),
+            mesh,
+        }
+    }
+}
+
+/// The refused chunks kept by id.
+pub(super) type Retained = HashMap<u64, Kept>;
+
+/// The refused chunks of one class waiting for room: their quads (growth makes room for them)
+/// and their sizes (one larger than every free range asks for a page).
+#[derive(Debug, Default)]
+pub(super) struct Waiting {
+    pub quads: u64,
+    /// How many wait, by size.
+    sizes: BTreeMap<u32, u32>,
+}
+
+impl Waiting {
+    pub fn add(&mut self, size: u32) {
+        self.quads += u64::from(size);
+        *self.sizes.entry(size).or_default() += 1;
+    }
+
+    pub fn remove(&mut self, size: u32) {
+        self.quads -= u64::from(size);
+        if let std::collections::btree_map::Entry::Occupied(mut n) = self.sizes.entry(size) {
+            *n.get_mut() -= 1;
+            if *n.get() == 0 {
+                n.remove();
+            }
+        }
+    }
+
+    /// The largest waiting chunk's quads (0: none waits).
+    pub fn largest(&self) -> u32 {
+        self.sizes.last_key_value().map_or(0, |(&size, _)| size)
+    }
+}
+
+/// The retries of the refused chunks (ADR 0035): once room rose, one pass over all of them,
+/// nearest to the eye first, a budget of quads a frame (a chunk refused again spends it too),
+/// and nothing more until room rises again. Room that rises during a pass starts a new one from
+/// the nearest. A pass is finite, so chunks waiting past the ceiling cost nothing while nothing
+/// frees, and a far chunk that fits a hole the nearer ones do not is reached.
+#[derive(Debug, Default)]
+pub(super) struct RetryPass {
+    /// Room rose: the next batch starts a pass.
+    armed: bool,
+    /// The pass in progress: the ids nearest first, and the next one to try.
+    order: Vec<u64>,
+    at: usize,
+}
+
+impl RetryPass {
+    /// Room rose.
+    pub fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    /// Nothing waits any more.
+    pub fn stop(&mut self) {
+        *self = Self::default();
+    }
+
+    /// A pass waits to start or is in progress.
+    pub fn pending(&self) -> bool {
+        self.armed || self.at < self.order.len()
+    }
+
+    /// This frame's chunks to try: the next ones of the pass (a new pass of `kept` sorted
+    /// nearest to `eye` first if room rose) until they take `budget` quads. Ids no longer kept
+    /// are skipped; chunks kept after the pass started wait for the next one.
+    pub fn batch(&mut self, kept: &Retained, eye: I64Vec3, budget: u64) -> Vec<u64> {
+        if std::mem::take(&mut self.armed) {
+            let mut order: Vec<(i128, u64)> = kept
+                .iter()
+                .map(|(&id, k)| {
+                    let d = k.origin + I64Vec3::splat(16) - eye;
+                    let (x, y, z) = (i128::from(d.x), i128::from(d.y), i128::from(d.z));
+                    (x * x + y * y + z * z, id)
+                })
+                .collect();
+            order.sort_unstable();
+            self.order = order.into_iter().map(|(_, id)| id).collect();
+            self.at = 0;
+        }
+        let mut ids = Vec::new();
+        let mut left = budget;
+        while left > 0
+            && let Some(&id) = self.order.get(self.at)
+        {
+            self.at += 1;
+            if let Some(k) = kept.get(&id) {
+                left = left.saturating_sub(u64::from(k.quads));
+                ids.push(id);
+            }
+        }
+        if self.at >= self.order.len() {
+            self.order = Vec::new();
+            self.at = 0;
+        }
+        ids
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1141,5 +1245,95 @@ mod tests {
         assert_eq!(list_span(5), 8);
         assert_eq!(list_span(MAX_PAGES), MAX_PAGES);
         assert_eq!(list_span(MAX_PAGES + 3), MAX_PAGES);
+    }
+
+    /// `n` kept chunks of `quads` each along +x, id `i` at chunk `i` (nearer for a lower id).
+    fn kept(n: u64, quads: u32) -> Retained {
+        (0..n)
+            .map(|i| {
+                let k = Kept {
+                    origin: I64Vec3::new(i as i64 * 32, 0, 0),
+                    mesh: Arc::default(),
+                    class: 0,
+                    quads,
+                };
+                (i, k)
+            })
+            .collect()
+    }
+
+    /// Past the ceiling, far more quads wait than one frame retries: a pass tries each chunk
+    /// once, nearest first, over several frames, then nothing until room rises again (it used
+    /// to retry the same nearest chunks every frame, forever, and never reach the far ones).
+    #[test]
+    fn a_retry_pass_tries_every_chunk_once_then_waits_for_room() {
+        let kept = kept(1000, 1000);
+        let mut pass = RetryPass::default();
+        assert!(!pass.pending());
+        assert!(pass.batch(&kept, I64Vec3::ZERO, RETRY_QUADS).is_empty());
+        pass.arm();
+        let mut tried = Vec::new();
+        let mut frames = 0;
+        while pass.pending() {
+            let batch = pass.batch(&kept, I64Vec3::ZERO, RETRY_QUADS);
+            let quads: u64 = batch.iter().map(|id| u64::from(kept[id].quads)).sum();
+            assert!(quads < RETRY_QUADS + 1000, "a frame's budget");
+            tried.extend(batch);
+            frames += 1;
+            assert!(frames < 100, "the pass never ends");
+        }
+        assert_eq!(
+            tried,
+            (0..1000).collect::<Vec<_>>(),
+            "each once, nearest first"
+        );
+        assert_eq!(frames, 8);
+        // nothing until room rises again, then a new pass from the nearest
+        assert!(pass.batch(&kept, I64Vec3::ZERO, RETRY_QUADS).is_empty());
+        pass.arm();
+        assert_eq!(pass.batch(&kept, I64Vec3::ZERO, 3000), [0, 1, 2]);
+    }
+
+    /// Room that rises during a pass starts a new one from the nearest (to the new eye); chunks
+    /// shown or removed during a pass are skipped, chunks refused during it wait for the next.
+    #[test]
+    fn room_rising_during_a_pass_starts_over_from_the_nearest() {
+        let mut kept = kept(10, 100);
+        let mut pass = RetryPass::default();
+        pass.arm();
+        assert_eq!(pass.batch(&kept, I64Vec3::ZERO, 300), [0, 1, 2]);
+        kept.remove(&3);
+        kept.insert(
+            10,
+            Kept {
+                origin: I64Vec3::new(-64, 0, 0),
+                mesh: Arc::default(),
+                class: 0,
+                quads: 100,
+            },
+        );
+        assert_eq!(pass.batch(&kept, I64Vec3::ZERO, 200), [4, 5]);
+        pass.arm();
+        let eye = I64Vec3::new(9 * 32 + 16, 16, 16);
+        assert_eq!(pass.batch(&kept, eye, 300), [9, 8, 7]);
+        pass.stop();
+        assert!(!pass.pending());
+    }
+
+    #[test]
+    fn waiting_chunks_keep_their_quads_and_largest_size() {
+        let mut waiting = Waiting::default();
+        assert_eq!((waiting.quads, waiting.largest()), (0, 0));
+        for size in [10, 30, 30, 20] {
+            waiting.add(size);
+        }
+        assert_eq!((waiting.quads, waiting.largest()), (90, 30));
+        waiting.remove(30);
+        assert_eq!((waiting.quads, waiting.largest()), (60, 30));
+        waiting.remove(30);
+        assert_eq!((waiting.quads, waiting.largest()), (30, 20));
+        waiting.remove(10);
+        waiting.remove(20);
+        assert_eq!((waiting.quads, waiting.largest()), (0, 0));
     }
 }
