@@ -1074,3 +1074,68 @@ fn handles_of_one_opening_are_the_same() {
     assert!(!first.same(&second));
     assert!(second.opened_seq() > first.opened_seq());
 }
+
+/// A store in memory whose index read stops at `gate` once it has the keys: an opening that has
+/// its index and has not finished yet.
+struct SlowIndex {
+    inner: Arc<MemoryStore>,
+    gate: Arc<Gate>,
+}
+
+impl ChunkStore for SlowIndex {
+    fn load(&self, key: ChunkKey) -> std::io::Result<Option<Vec<u8>>> {
+        self.inner.load(key)
+    }
+    fn keys(&self) -> std::io::Result<Vec<ChunkKey>> {
+        let keys = self.inner.keys();
+        self.gate.pass();
+        keys
+    }
+    fn load_meta(&self, name: &str) -> std::io::Result<Option<Vec<u8>>> {
+        self.inner.load_meta(name)
+    }
+    fn save_batch(&self, batch: &SaveBatch) -> std::io::Result<()> {
+        self.inner.save_batch(batch)
+    }
+    fn entity_keys(&self) -> std::io::Result<Vec<(ChunkKey, u64)>> {
+        self.inner.entity_keys()
+    }
+    fn load_entities(&self, key: ChunkKey) -> std::io::Result<Vec<(u64, Vec<u8>)>> {
+        self.inner.load_entities(key)
+    }
+}
+
+/// An opening is numbered before it reads its index: one that read it before a world's last
+/// save and finished after that world closed comes before every opening after the close, so a
+/// check against the number at the close tells its index is stale.
+#[test]
+fn an_opening_is_numbered_before_it_reads_its_index() {
+    let backend = Arc::new(MemoryStore::new());
+    let world = open(&backend);
+    let gate = Arc::new(Gate::default());
+    let indexed = gate.shut();
+    let early = {
+        let slow = Arc::new(SlowIndex {
+            inner: Arc::clone(&backend),
+            gate: Arc::clone(&gate),
+        });
+        std::thread::spawn(move || {
+            WorldStore::open(slow, &boxel_demo::blocks::registry(), "test").expect("opens")
+        })
+    };
+    indexed.recv().unwrap();
+    // The world's last save and its close, while that opening holds an index without them.
+    let edited = key(1, 2, 3);
+    world.stage(edited, stone_chunk());
+    world.write(&[edited], &[], &[]).unwrap();
+    world.close().unwrap();
+    let later = open(&backend);
+    gate.open();
+    let early = early.join().unwrap();
+    assert!(!early.take_opened().unwrap().keys.contains(&edited));
+    assert!(later.take_opened().unwrap().keys.contains(&edited));
+    assert!(
+        early.opened_seq() < later.opened_seq(),
+        "the opening with the stale index comes first"
+    );
+}

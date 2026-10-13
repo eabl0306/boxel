@@ -192,7 +192,7 @@ struct Inner {
     opened: Mutex<Option<Opened>>,
     /// [`WorldStore::close`] ran: every operation fails quietly from then on.
     closed: AtomicBool,
-    /// Which opening of the process this is (increasing).
+    /// Which opening of the process this is (increasing), taken before the index was read.
     opened_seq: u64,
 }
 
@@ -249,6 +249,8 @@ impl WorldStore {
         registry: &BlockRegistry,
         generator: &str,
     ) -> Result<Self, PersistError> {
+        // Numbered before anything is read (see `opened_seq`).
+        let opened_seq = OPENINGS.fetch_add(1, Ordering::Relaxed);
         let keys = backend.keys()?;
         let names = backend.load_meta(META_STATES)?;
         let new = match backend.load_meta(META_FORMAT)? {
@@ -361,7 +363,7 @@ impl WorldStore {
                     next_entity,
                 })),
                 closed: AtomicBool::new(false),
-                opened_seq: OPENINGS.fetch_add(1, Ordering::Relaxed),
+                opened_seq,
             }),
         })
     }
@@ -415,7 +417,9 @@ impl WorldStore {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
-    /// Which opening of the process this is: a later [`WorldStore::open`] has a higher one.
+    /// Which opening of the process this is: a later [`WorldStore::open`] has a higher one. Taken
+    /// when the open starts, before it reads the index of saved chunks, so an opening whose index
+    /// misses a write has a lower number than every opening started after that write.
     pub(crate) fn opened_seq(&self) -> u64 {
         self.inner.opened_seq
     }
