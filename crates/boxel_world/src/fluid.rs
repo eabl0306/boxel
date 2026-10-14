@@ -210,7 +210,8 @@ impl<'a> Fluids<'a> {
 
     /// Minecraft's `canPassThroughWall`: a fluid passes from `a` to its neighbor `b` across
     /// `face` of `a` unless their collision faces there cover the whole face together (a full
-    /// block always does). Cells without collision (air, fluids, plants) never stop it.
+    /// block always does). Cells without collision (air, fluids, plants) never stop it. The
+    /// collision, not the support shape (ADR 0037), as Minecraft.
     fn wall_open(&self, a: Option<BlockState>, b: Option<BlockState>, face: Face) -> bool {
         let (Some(a), Some(b)) = (a, b) else {
             return true;

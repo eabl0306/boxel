@@ -571,4 +571,59 @@ mod tests {
         assert_eq!(uses.use_block(&registry, gate, Facing::South), None);
         assert!(BlockUses::default().rule(&registry, gate).is_none());
     }
+
+    /// Torches on a cube that collides 14/16 high (Minecraft's mud) stay when its support shape
+    /// is full (ADR 0037) and drop when it holds by its collision, far from the origin and next
+    /// to the world limit, in one batch each.
+    #[test]
+    fn supports_hold_torches_far_from_the_origin() {
+        use boxel_voxel::{
+            BlockCollision, BlockDef, BlockModel, CollisionBox, FaceTextures, MAX_BLOCK_COORD,
+            OPAQUE_OPACITY, RenderShape, TextureId,
+        };
+        let mut b = boxel_demo::blocks::builder();
+        for name in ["test:sink", "test:sunk"] {
+            b.add_block(BlockDef {
+                name: name.into(),
+                shape: RenderShape::Opaque,
+                model: BlockModel::CUBE,
+                collision: BlockCollision::Boxes(vec![CollisionBox::new([0; 3], [16, 14, 16])]),
+                emission: [0; 3],
+                light_opacity: OPAQUE_OPACITY,
+                textures: FaceTextures::all(TextureId(0)),
+            })
+            .unwrap();
+        }
+        let sink = b.block_by_name("test:sink").unwrap();
+        b.set_support(sink, |_| Some(BlockCollision::Full)).unwrap();
+        let registry = b.build();
+        let rules = NeighborRules::from_registry(&registry);
+        let s = |name: &str| registry.parse_state(name).unwrap();
+        let (torch, wall_torch) = (s("boxel:torch"), s("boxel:wall_torch[facing=east]"));
+        let far = BlockPos::new(1 << 40, -(1 << 31), 7);
+        let edge = BlockPos::new(MAX_BLOCK_COORD + 20, -MAX_BLOCK_COORD, MAX_BLOCK_COORD + 30);
+        for base in [far, edge] {
+            let at = |x: i64, y: i64| BlockPos::new(base.x + x, base.y + y, base.z);
+            // The sink at the base and the sunk 4 east, each with a torch on top and a wall
+            // torch on its east side, placed as one batch.
+            let mut edits = Vec::new();
+            for (x, ground) in [(0, "test:sink"), (4, "test:sunk")] {
+                for (pos, state) in [
+                    (at(x, 0), s(ground)),
+                    (at(x, 1), torch),
+                    (at(x + 1, 0), wall_torch),
+                ] {
+                    edits.push(BlockEdit { pos, state });
+                }
+            }
+            rules.expand(&registry, |_| Some(BlockState::AIR), &mut edits);
+            let mut blocks = HashMap::new();
+            apply(&mut blocks, &edits);
+            settled(&rules, &registry, &blocks).unwrap();
+            assert_eq!(blocks[&at(0, 1)], torch, "{base:?}");
+            assert_eq!(blocks[&at(1, 0)], wall_torch, "{base:?}");
+            assert_eq!(blocks[&at(4, 1)], BlockState::AIR, "{base:?}");
+            assert_eq!(blocks[&at(5, 0)], BlockState::AIR, "{base:?}");
+        }
+    }
 }

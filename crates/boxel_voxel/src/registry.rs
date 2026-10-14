@@ -459,7 +459,9 @@ pub struct BlockDef {
     pub shape: RenderShape,
     /// Geometry (ignored for `RenderShape::None`).
     pub model: BlockModel,
-    /// How it collides (physics, ADR 0016). Usually [`BlockModel::default_collision`].
+    /// How it collides (physics, ADR 0016). Usually [`BlockModel::default_collision`]. Also
+    /// what it holds other blocks with, unless its block sets a support shape
+    /// ([`BlockRegistry::support`]).
     pub collision: BlockCollision,
     /// Block light emission `[red, green, blue]`, each `0..=15` (white light has equal
     /// channels; `[0, 0, 0]` emits nothing). Emitters keep their emission even when opaque.
@@ -496,9 +498,9 @@ pub enum RegistryError {
     /// 15, or a fluid state marked full bright ([`BlockRegistryBuilder::set_full_bright`]).
     #[error("invalid light values of {0}")]
     InvalidLight(String),
-    /// A collision or model box outside the cell or empty (`min < max <= 16` on every axis; a
-    /// collision box may reach up to [`MAX_COLLISION_HEIGHT`]), a model box texture offset
-    /// outside `-32..32` (in a [`BoxModel`] too).
+    /// A collision, support or model box outside the cell or empty (`min < max <= 16` on every
+    /// axis; a collision or support box may reach up to [`MAX_COLLISION_HEIGHT`]), a model box
+    /// texture offset outside `-32..32` (in a [`BoxModel`] too).
     #[error("invalid collision box of {0}")]
     InvalidCollision(String),
     /// Block id not registered.
@@ -570,6 +572,9 @@ pub struct BlockRegistryBuilder {
     blocks_motion: Vec<bool>,
     /// The states drawn full bright (by state id; missing at the end: not).
     full_bright: Vec<bool>,
+    /// The support shape of each state (by state id; `None` or missing at the end: its
+    /// collision).
+    support: Vec<Option<BlockCollision>>,
     /// The fluids, by [`FluidId`].
     fluids: Vec<FluidType>,
     /// The fluid the waterlogged states hold.
@@ -706,6 +711,44 @@ impl BlockRegistryBuilder {
             self.full_bright.resize(range.end, false);
         }
         self.full_bright[range].copy_from_slice(&marks);
+        Ok(())
+    }
+
+    /// Sets the support shape of the states of `block`: the shape they hold other blocks with
+    /// (Minecraft's `getBlockSupportShape`), which [`crate::rules::is_sturdy`] and
+    /// [`crate::rules::supports_center`] read. `None` keeps a state's collision, the default; a
+    /// block that sinks a little and still holds a torch (Minecraft's mud: it collides 14/16
+    /// high and supports as a full cube) sets `Some(BlockCollision::Full)`. Physics, fluids and
+    /// the mesher never read it. It sets every state of `block`, so a later call replaces an
+    /// earlier one.
+    ///
+    /// Fails with [`RegistryError::UnknownBlock`], or with [`RegistryError::InvalidCollision`]
+    /// (nothing set) when a box is not a valid collision box
+    /// ([`CollisionBox::is_valid_collision`]).
+    pub fn set_support(
+        &mut self,
+        block: BlockId,
+        support: impl Fn(&StateValues<'_>) -> Option<BlockCollision>,
+    ) -> Result<(), RegistryError> {
+        let info = &self.blocks[self.block_index(block)?];
+        let range = usize::from(info.first)..usize::from(info.first + info.count);
+        let shapes: Vec<Option<BlockCollision>> = range
+            .clone()
+            .map(|s| support(&info.values(BlockState(s as u16))))
+            .collect();
+        let valid = |shape: &BlockCollision| match shape {
+            BlockCollision::Boxes(boxes) => boxes.iter().all(|b| b.is_valid_collision()),
+            BlockCollision::None | BlockCollision::Full => true,
+        };
+        if !shapes.iter().flatten().all(valid) {
+            return Err(RegistryError::InvalidCollision(info.name.clone()));
+        }
+        if self.support.len() < range.end {
+            self.support.resize(range.end, None);
+        }
+        for (slot, shape) in self.support[range].iter_mut().zip(shapes) {
+            *slot = shape;
+        }
         Ok(())
     }
 
@@ -1013,6 +1056,11 @@ impl BlockRegistryBuilder {
                 .map(|b| outline_of(&self.box_models, b.model))
                 .collect(),
             collisions: states.iter().map(|b| b.collision.clone()).collect(),
+            supports: {
+                let mut supports = self.support;
+                supports.resize(states.len(), None);
+                supports
+            },
             flags,
             emission: states
                 .iter()
@@ -1086,6 +1134,9 @@ pub struct BlockRegistry {
     /// The outline of each state ([`BlockRegistry::outline`]).
     outlines: Vec<BlockCollision>,
     collisions: Vec<BlockCollision>,
+    /// The support shape of each state set apart from its collision
+    /// ([`BlockRegistry::support`]; `None`: its collision).
+    supports: Vec<Option<BlockCollision>>,
     flags: Vec<StateFlags>,
     emission: Vec<LightValue>,
     opacity: Vec<u8>,
@@ -1291,6 +1342,16 @@ impl BlockRegistry {
         self.collisions
             .get(s.0 as usize)
             .unwrap_or(&BlockCollision::None)
+    }
+    /// The shape `s` holds other blocks with (Minecraft's `getBlockSupportShape`, ADR 0037):
+    /// what [`crate::rules::is_sturdy`] and [`crate::rules::supports_center`] read. Its
+    /// collision unless [`BlockRegistryBuilder::set_support`] set another (out of range ->
+    /// `None`, as [`BlockRegistry::collision`]).
+    pub fn support(&self, s: BlockState) -> &BlockCollision {
+        match self.supports.get(s.0 as usize) {
+            Some(Some(shape)) => shape,
+            _ => self.collision(s),
+        }
     }
     /// True if `s` hides the neighbor faces it touches (an `Opaque` full cube,
     /// [`StateFlags::OCCLUDES`]).

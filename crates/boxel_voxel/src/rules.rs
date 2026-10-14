@@ -6,10 +6,11 @@
 //! asks the use rules on a player's click (`BlockUses`). The rules themselves are content: the
 //! game writes them, as closures over what they need, and they can be tested without a world.
 //!
-//! Also the helpers rules are written with: which sixteenths of a face a collision covers
-//! ([`collision_face_cover`], [`is_sturdy`], [`supports_center`]); and the fluid of the blocks
-//! that hold one (the registry's waterlog fluid, water) when a player places or breaks one (ADR
-//! 0025): [`placed_into`] and [`broken`].
+//! Also the helpers rules are written with: which sixteenths of a face a shape covers
+//! ([`collision_face_cover`], of a collision or a support shape) and whether a face holds a
+//! block ([`is_sturdy`], [`supports_center`], on the support shape, ADR 0037); and the fluid of
+//! the blocks that hold one (the registry's waterlog fluid, water) when a player places or
+//! breaks one (ADR 0025): [`placed_into`] and [`broken`].
 //!
 //! [`BlockRegistryBuilder::set_neighbor_rule`]: crate::BlockRegistryBuilder::set_neighbor_rule
 //! [`BlockRegistryBuilder::set_use_rule`]: crate::BlockRegistryBuilder::set_use_rule
@@ -93,8 +94,9 @@ impl std::fmt::Debug for UseRule {
     }
 }
 
-/// Which sixteenths of `face` of a block colliding as `collision` its boxes cover, flush with
-/// the cell border: bit `u` of row `v` along the face's axes ([`Face::axes`]). A box that
+/// Which sixteenths of `face` the boxes of the shape `collision` cover, flush with the cell
+/// border: bit `u` of row `v` along the face's axes ([`Face::axes`]). Any shape: a collision
+/// ([`BlockRegistry::collision`]) or a support shape ([`BlockRegistry::support`]). A box that
 /// reaches into the cell above (a fence's 1.5 blocks, ADR 0026) covers the top face with its
 /// cross-section, as Minecraft cuts a shape at the face; the part above the cell is left out.
 pub fn collision_face_cover(collision: &BlockCollision, face: Face) -> [u16; 16] {
@@ -129,16 +131,18 @@ pub fn span_bits(lo: u8, hi: u8) -> u16 {
     ((1u32 << hi) - (1u32 << lo)) as u16
 }
 
-/// True if `face` of `state` is a sturdy face (Minecraft's "full face"): its collision covers
-/// the whole face. A full cube, the back of stairs, the bottom of a bottom slab.
+/// True if `face` of `state` is a sturdy face (Minecraft's `isFaceSturdy`): its support shape
+/// ([`BlockRegistry::support`], its collision unless set) covers the whole face. A full cube,
+/// the back of stairs, the bottom of a bottom slab.
 pub fn is_sturdy(registry: &BlockRegistry, state: BlockState, face: Face) -> bool {
-    collision_face_cover(registry.collision(state), face) == [u16::MAX; 16]
+    collision_face_cover(registry.support(state), face) == [u16::MAX; 16]
 }
 
 /// True if `face` of `state` can hold something at its center (Minecraft's `CENTER` support):
-/// its collision covers the middle 2x2 sixteenths of the face (a fence post's top does).
+/// its support shape ([`BlockRegistry::support`], its collision unless set) covers the middle
+/// 2x2 sixteenths of the face (a fence post's top does).
 pub fn supports_center(registry: &BlockRegistry, state: BlockState, face: Face) -> bool {
-    let rows = collision_face_cover(registry.collision(state), face);
+    let rows = collision_face_cover(registry.support(state), face);
     let mid = span_bits(7, 9);
     rows[7] & mid == mid && rows[8] & mid == mid
 }
@@ -174,5 +178,33 @@ pub fn broken(registry: &BlockRegistry, state: BlockState) -> BlockState {
         waterlog_source(registry).unwrap_or(BlockState::AIR)
     } else {
         BlockState::AIR
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing;
+
+    /// No block of the `test:` set sets a support shape, so every state (and one out of range)
+    /// holds other blocks with its collision: [`is_sturdy`] and [`supports_center`] read what
+    /// they read before ADR 0037.
+    #[test]
+    fn support_defaults_to_the_collision() {
+        let r = testing::registry();
+        let states = (0..r.len() as u16)
+            .map(BlockState)
+            .chain([BlockState(u16::MAX)]);
+        for s in states {
+            assert_eq!(r.support(s), r.collision(s), "{s:?}");
+            for face in Face::ALL {
+                let cover = collision_face_cover(r.collision(s), face);
+                let mid = span_bits(7, 9);
+                let center = cover[7] & mid == mid && cover[8] & mid == mid;
+                let full = cover == [u16::MAX; 16];
+                assert_eq!(is_sturdy(&r, s, face), full, "{s:?} {face:?}");
+                assert_eq!(supports_center(&r, s, face), center, "{s:?} {face:?}");
+            }
+        }
     }
 }

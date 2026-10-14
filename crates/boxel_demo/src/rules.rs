@@ -10,9 +10,9 @@
 //! from.
 //!
 //! Most rules only read what no rule changes (whether a neighbor is stairs and its `facing` and
-//! `half`, whether it is a fence or a wall, the `facing` of a gate, the collision faces of
-//! blocks without rules). A wall also reads the block above it: its collision and, for another
-//! wall, its post. A change runs down a column of walls one block at a time, so the world
+//! `half`, whether it is a fence or a wall, the `facing` of a gate, the support faces of
+//! blocks without rules, ADR 0037). A wall also reads the block above it: its collision and, for
+//! another wall, its post. A change runs down a column of walls one block at a time, so the world
 //! applies the rules again around what a rule changed (ADR 0027). Walls only read upward, so
 //! that ends.
 
@@ -279,7 +279,9 @@ fn covers(cover: &[u16; 16], rect: [u8; 4]) -> bool {
 /// The post and sides of a wall (Minecraft's `WallBlock::updateShape`), given which sides
 /// connect ([`wall_connects`], indexed by `Facing as usize`) and the block above it. A connected
 /// side is tall when the bottom of the block above covers it (the collision of what is above,
-/// cut at its bottom face: a block, a wall or a fence above), else low. The post stands:
+/// cut at its bottom face: a block, a wall or a fence above), else low. The collision on
+/// purpose, not the support shape the other rules read (ADR 0037): Minecraft's `WallBlock` cuts
+/// the collision shape of the block above. The post stands:
 /// - under a wall with a post;
 /// - else at an end, a corner, a T or alone: when north and south differ in being connected,
 ///   east and west differ, or nothing connects;
