@@ -39,6 +39,6 @@ Con una sola forma, el juego tenía que elegir: o el jugador no se hunde, o la a
 - Nada cambia hasta que un juego fije un apoyo. El demo no fija ninguno, así sus tests y goldens
   siguen iguales.
 - Cada regla nueva tiene que elegir entre apoyo y colisión. La lista de arriba dice cuál.
-- El juego hace después su parte: barro, arena de almas y nieve chocan a 14/16 con apoyo entero.
-  La regla de la nieve pasa a leer la colisión del bloque de abajo, y el pepino de mar la
+- El juego hace después su parte: barro, arena de almas y la nieve de 8 capas chocan a 14/16 con
+  apoyo entero, y cada capa de nieve tiene su apoyo de 2/16 por capa. La regla de la nieve pasa a leer la colisión del bloque de abajo, y el pepino de mar la
   colisión o el apoyo, como en Minecraft.
