@@ -2,7 +2,7 @@
 
 Documento técnico de referencia. Fecha: 2026-10-05. Estado: aprobado para el milestone M0
 (revisión final, después de tres revisiones adversariales del borrador v1).
-Las decisiones puntuales están en `docs/adr/` (0001 a 0036). Durante M0 hubo además una
+Las decisiones puntuales están en `docs/adr/` (0001 a 0037). Durante M0 hubo además una
 especificación para los agentes implementadores (en inglés, en `.scaffold/`), borrada al cerrar M0;
 este documento queda como referencia.
 
@@ -634,7 +634,8 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   material del mesher queda libre. Tablas SoA por estado: nombre, capa de dibujo (`None`,
   `Opaque`, `Cutout`, `Translucent`), modelo (`Cube { axis }`, `Slab`, `Cross`, ADR 0018;
   `Stairs`, `Fence`, `Torch`, `WallTorch`, ADR 0020, hechos de cajas en dieciseisavos),
-  colisión (`None`, `Full` o cajas), flags, emisión RGB, brillo pleno por estado (ADR 0036),
+  colisión (`None`, `Full` o cajas), forma de apoyo por estado (ADR 0037), flags, emisión RGB,
+  brillo pleno por estado (ADR 0036),
   opacidad de luz (15 en los cubos opacos, 1 en hojas, agua y losas, 0 en vidrio y plantas),
   texturas por cara. Solo un cubo `Opaque`
   tapa caras vecinas (`BlockRegistry::occludes`). Contenido congelado: aire,
