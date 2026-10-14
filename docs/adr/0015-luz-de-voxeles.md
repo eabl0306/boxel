@@ -410,7 +410,8 @@ los mismos quads que antes.
   ve del color de su emisión, de día y de noche. Los demás bloques hacen la misma cuenta que
   antes, en el mismo orden. El flag no entra en la clave del merge: sale del material, que ya
   está. Viaja al fragment en el mismo entero que el AO (`VsOut::ao`, bits 8 a 12), sin otro
-  varying. ADR 0036 lo cambia: brillan a pleno solo los estados marcados.
+  varying. ADR 0036 lo cambia: brillan a pleno solo los estados marcados, y los demás emisores
+  se ven planos a su propia luz.
 - **Lotes de ediciones enteros sin tope de fps.** La espera de la sección 7 era de 2 frames. Sin
   tope un frame dura menos de medio ms, menos que un job de malla con luz, y en P7 salían
   partidos 1 a 3 lotes de 20. Ahora es un tiempo con un piso de frames:

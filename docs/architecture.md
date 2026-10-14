@@ -826,9 +826,10 @@ un `Mesher` thread-local (~0.6 MiB de scratch) y un `LightScratch` (~0.7 MiB).
    la capa de enfrente; el AO sale de una tabla de 256 entradas sobre su opacidad y la luz de cada
    esquina es el promedio redondeado de sus 4 celdas sin las opacas. Las 4 luces van a la paleta
    del chunk (hasta 4096 entradas, orden de primera aparición). Ambos dependen solo del vértice,
-   así que un quad fusionado es exacto. Los quads salen ya canónicos (esquina mínima, `w` y `h`
-   en los ejes u y v de la cara). Validado contra oráculos de fuerza bruta de caras visibles y de
-   sombreado.
+   así que un quad fusionado es exacto. Un emisor sin brillo pleno es la excepción (ADR 0036):
+   sus caras son planas, sin AO, a la luz de enfrente subida hasta su emisión, como en Minecraft.
+   Los quads salen ya canónicos (esquina mínima, `w` y `h` en los ejes u y v de la cara).
+   Validado contra oráculos de fuerza bruta de caras visibles y de sombreado.
 4. **Bloques que no son cubos** (ADR 0018, ADR 0020): después del greedy, un paso por bloque
    emite sus quads de `w = h = 1` con un código de forma. Losas, escaleras, vallas y antorchas
    son cajas: una cara de caja (`SHAPE_BOX`) lleva en los bits de `w` y `h` el índice de su caja
