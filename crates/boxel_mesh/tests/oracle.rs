@@ -1,13 +1,14 @@
 //! Property tests: the mesher against the brute-force oracles on random padded chunks (the
-//! visible faces, and the AO and corner light of each one under random light and AO policies),
-//! and `gather` against a per-voxel reference on random chunks with random neighbors.
+//! visible faces, and the AO and corner light of each one under random light and AO policies,
+//! lit emitters included), and `gather` against a per-voxel reference on random chunks with
+//! random neighbors.
 mod common;
 
 use boxel_mesh::{
     AoPolicy, ChunkMesh, LightQuantization, MaterialTable, MeshInput, MeshOptions, Mesher,
     PaddedChunk, VoxelClass,
 };
-use boxel_voxel::{BlockState, CHUNK_VOLUME, ChunkData, LocalPos};
+use boxel_voxel::{BlockState, CHUNK_VOLUME, ChunkData, LightValue, LocalPos, Paletted};
 use common::{
     CUTOUT, Fill, LIGHT_FILLS, LightFill, NO_GEOMETRY, OPAQUE, Repr, Rng, TRANSLUCENT, chunk_repr,
     neighbor_slot, random_light, random_padded, split, test_table, verify_mesh, verify_shading,
@@ -25,6 +26,16 @@ const MATERIALS: [u16; 8] = [
     TRANSLUCENT[1],
     NO_GEOMETRY,
 ];
+
+/// [`test_table`] with three lit emitters (ADR 0036): an opaque, a cutout and a translucent
+/// material, from weak to full.
+fn lit_table() -> MaterialTable {
+    let mut table = test_table();
+    table.set_lit_emission(OPAQUE[1], LightValue::from_rgb([9, 4, 0]));
+    table.set_lit_emission(CUTOUT[0], LightValue::from_rgb([3, 1, 0]));
+    table.set_lit_emission(TRANSLUCENT[1], LightValue::from_rgb([15, 15, 15]));
+    table
+}
 
 fn fill_strategy() -> impl Strategy<Value = Fill> {
     prop_oneof![
@@ -170,13 +181,39 @@ proptest! {
         let mut out = ChunkMesh::default();
         mesher.mesh(&padded, light.as_ref(), &table, options, &mut out);
         verify_mesh(&padded, &table, &out);
-        verify_shading(&padded, light.as_ref(), policy, &out);
+        verify_shading(&padded, &table, light.as_ref(), policy, &out);
         prop_assert_eq!(out.hash, out.compute_hash());
 
         // Reuse after another chunk (scratch, palette and key table state).
         let other = random_padded(&table, Fill::Noise, seed ^ 1, 50, &palette);
         let mut scratch = ChunkMesh::default();
         mesher.mesh(&other, light.as_ref(), &table, options, &mut scratch);
+        let mut again = ChunkMesh::default();
+        mesher.mesh(&padded, light.as_ref(), &table, options, &mut again);
+        prop_assert_eq!(&again, &out);
+    }
+
+    /// The same with lit emitters (ADR 0036): their faces are flat, AO open and each corner the
+    /// light in front raised to the emission, under every light (none and uniform included) and
+    /// AO policy; every other face is shaded as before.
+    #[test]
+    fn lit_emitters_shade_as_the_oracle(
+        fill in fill_strategy(),
+        light in light_strategy(),
+        policy in policy_strategy(),
+        seed in any::<u64>(),
+        density in 0u32..=100,
+        palette in proptest::collection::vec(proptest::sample::select(MATERIALS.to_vec()), 1..=4),
+    ) {
+        let table = lit_table();
+        let padded = random_padded(&table, fill, seed, density, &palette);
+        let light = random_light(light, seed);
+        let options = MeshOptions::with_ao(policy);
+        let mut mesher = Mesher::new();
+        let mut out = ChunkMesh::default();
+        mesher.mesh(&padded, light.as_ref(), &table, options, &mut out);
+        verify_mesh(&padded, &table, &out);
+        verify_shading(&padded, &table, light.as_ref(), policy, &out);
         let mut again = ChunkMesh::default();
         mesher.mesh(&padded, light.as_ref(), &table, options, &mut again);
         prop_assert_eq!(&again, &out);
@@ -207,7 +244,7 @@ fn palette_overflow_requantizes() {
             );
             assert_eq!(out.light_quantization, level, "{fill:?} {policy:?}");
             verify_mesh(&padded, &table, &out);
-            verify_shading(&padded, light.as_ref(), policy, &out);
+            verify_shading(&padded, &table, light.as_ref(), policy, &out);
         }
     }
 }
@@ -244,11 +281,65 @@ proptest! {
         prop_assert!(padded.voxels == expected.voxels, "voxel ids differ");
         prop_assert!(padded.opaque == expected.opaque, "opaque masks differ");
         prop_assert!(padded.transparent == expected.transparent, "transparent masks differ");
+        prop_assert!(!padded.lit_emitters, "no lit emitter in the table");
 
         let options = MeshOptions::default();
         let mut out = ChunkMesh::default();
         mesher.mesh(&padded, None, &table, options, &mut out);
         verify_mesh(&padded, &table, &out);
+        prop_assert_eq!(mesher.mesh_chunk(&input, &table, options), out);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// `gather` flags the chunks whose center may hold a lit emitter (exactly, but for `Direct`
+    /// storage: always), whatever the neighbors hold, and a chunk it does not flag meshes as if
+    /// the mesher looked at every voxel.
+    #[test]
+    fn gather_flags_the_lit_emitters_of_the_center(
+        kinds in proptest::collection::vec(kind_strategy(), 27),
+        light in light_strategy(),
+        policy in policy_strategy(),
+        seed in any::<u64>(),
+        density in 0u32..=100,
+    ) {
+        let table = lit_table();
+        let mut rng = Rng::new(seed);
+        let center_kind = match kinds[0] {
+            ChunkKind::Missing => ChunkKind::Packed,
+            kind => kind,
+        };
+        let center = random_chunk(center_kind, &mut rng, density).expect("center");
+        let neighbors: Vec<Option<ChunkData>> =
+            kinds[1..].iter().map(|&k| random_chunk(k, &mut rng, density)).collect();
+        let light = random_light(light, seed);
+        let input = MeshInput {
+            center: &center,
+            neighbors: std::array::from_fn(|i| neighbors[i].as_ref()),
+            light: light.as_ref(),
+        };
+        let mut mesher = Mesher::new();
+        let mut padded = PaddedChunk::new();
+        mesher.gather(&input, &table, &mut padded);
+        let mut dense = vec![BlockState::AIR; CHUNK_VOLUME];
+        center.to_dense(&mut dense);
+        let holds = dense.iter().any(|s| !table.lit_emission(s.0).is_dark());
+        match center.blocks() {
+            Paletted::Direct(_) => prop_assert!(padded.lit_emitters),
+            _ => prop_assert_eq!(padded.lit_emitters, holds),
+        }
+        let options = MeshOptions::with_ao(policy);
+        let mut out = ChunkMesh::default();
+        mesher.mesh(&padded, light.as_ref(), &table, options, &mut out);
+        verify_mesh(&padded, &table, &out);
+        verify_shading(&padded, &table, light.as_ref(), policy, &out);
+        let mut looked = padded.clone();
+        looked.lit_emitters = true;
+        let mut all = ChunkMesh::default();
+        mesher.mesh(&looked, light.as_ref(), &table, options, &mut all);
+        prop_assert_eq!(&all, &out);
         prop_assert_eq!(mesher.mesh_chunk(&input, &table, options), out);
     }
 }

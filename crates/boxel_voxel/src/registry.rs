@@ -675,11 +675,12 @@ impl BlockRegistryBuilder {
 
     /// Draws the states of `block` for which `states` is true at the full brightness of their
     /// texture: no light, face shade or AO (Minecraft's emissive rendering, a `game:lamp` that
-    /// glows). Every other state is lit by the light around it, its own emission included (a
-    /// `game:ember_ore` that emits a little shows that light on its faces, not a glow). It
-    /// sets every state of `block`, so a later call replaces an earlier one. A state that emits
-    /// nothing may be marked: the flag is a look. A fluid cannot be marked: it is drawn full
-    /// bright exactly when it emits ([`BlockRegistry::is_full_bright`]).
+    /// glows). Every other state that emits is lit by its own light, as Minecraft lights such a
+    /// block: flat, with face shade and no AO, each face at the light in front of it raised to
+    /// the state's emission (a `game:ember_ore` that emits 9 shows 9 on its faces in a dark
+    /// cave, not a glow). It sets every state of `block`, so a later call replaces an earlier
+    /// one. A state that emits nothing may be marked: the flag is a look. A fluid cannot be
+    /// marked: it is drawn full bright exactly when it emits ([`BlockRegistry::is_full_bright`]).
     ///
     /// Fails with [`RegistryError::UnknownBlock`], or with [`RegistryError::InvalidLight`]
     /// (nothing set) when a state it marks is a [`BlockModel::Fluid`].
@@ -1308,8 +1309,8 @@ impl BlockRegistry {
     }
     /// True if `s` is drawn at the full brightness of its texture, with no light, face shade or
     /// AO ([`BlockRegistryBuilder::set_full_bright`]; a fluid: when it emits; out of range:
-    /// false). The mesher marks its quads with this; every other state is lit, its own
-    /// emission included.
+    /// false). The mesher marks its quads with this; every other state is lit, and one that
+    /// emits is lit flat by its own light, as in Minecraft.
     pub fn is_full_bright(&self, s: BlockState) -> bool {
         self.full_bright.get(s.0 as usize).copied().unwrap_or(false)
     }

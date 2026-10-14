@@ -202,7 +202,13 @@ fn corner_heights_follow_the_brute_force_rule() {
                     OPTIONS,
                 );
                 if seed % 2 == 0 {
-                    common::verify_shading(&padded, light.as_ref(), AoPolicy::BakedLitOnly, &lit);
+                    common::verify_shading(
+                        &padded,
+                        &table,
+                        light.as_ref(),
+                        AoPolicy::BakedLitOnly,
+                        &lit,
+                    );
                 }
                 assert_eq!(drawn_heights(&lit), got, "the light changes no height");
             }

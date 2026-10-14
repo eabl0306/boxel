@@ -316,6 +316,8 @@ fn emissive_blocks_flag_their_quads() {
         assert!(!table.emissive(block(&registry, name).0), "{name}");
     }
     assert!(!table.emissive(0) && !table.emissive(u16::MAX));
+    // The demo draws every emitter full bright: no lit emitter, so no chunk is looked at.
+    assert!(!table.has_lit_emitters());
     // A stone floor with one emitter of each kind on it, lit and unlit: the emitters' quads,
     // and only theirs, carry the flag (verify_mesh checks every unit face).
     let center = chunk_repr(
@@ -329,6 +331,7 @@ fn emissive_blocks_flag_their_quads() {
         Repr::Packed,
     );
     let padded = gathered(&isolated(&center), &table);
+    assert!(!padded.lit_emitters);
     let light = common::full_light(|x, y, z| {
         let d = ((x - 8).abs() + (y - 1).abs() + (z - 8).abs()) as u8;
         LightValue::new(15, 14u8.saturating_sub(d), 0, 0).0
@@ -398,26 +401,42 @@ fn the_emissive_flag_follows_full_bright() {
             let name = registry.state_name(s);
             assert_eq!(table.emissive(m), registry.is_full_bright(s), "{name}");
             glowing += usize::from(table.emissive(m));
+            // Every other emitter is lit by its own light.
+            let lit = if table.emissive(m) {
+                LightValue::DARK
+            } else {
+                registry.emission(s)
+            };
+            assert_eq!(table.lit_emission(m), lit, "{name}");
         }
     }
-    assert!(!table.emissive(0));
+    assert!(table.has_lit_emitters());
+    assert!(!table.emissive(0) && table.lit_emission(0).is_dark());
     // test:lamp, the 16 levels of test:hot, the lit ore and the paint; not the unmarked
     // emitters.
     assert_eq!(glowing, 1 + 16 + 1 + 1);
 }
 
+/// A quad decoded: its geometry and texture, AO and corner lights (palette order aside).
+fn decoded(mesh: &ChunkMesh, q: PackedQuad) -> (u32, u16, u8, [LightValue; 4]) {
+    (q.geo, q.layer(), q.ao_byte(), mesh.corner_light(q))
+}
+
 #[test]
-fn a_lit_emitter_meshes_as_a_plain_block() {
+fn a_lit_emitter_is_drawn_flat_at_its_own_light() {
     let (plain, plain_table) = glow_registry(&[]);
     let (marked, marked_table) =
         glow_registry(&["test:ember", "test:ember_plant", "test:ember_post"]);
     let by = |r: &BlockRegistry, name: &str| r.parse_state(name).expect(name);
     let floor = by(&plain, "test:solid");
-    // A cave: no sky, the light falling off around the block; the floor under it gives AO.
+    // A cave: no sky, a red light falling off around the block, no green; the floor under it
+    // gives AO. The emission [3, 1, 0] is below the red around it and above the green.
     let light = common::full_light(|x, y, z| {
         let d = ((x - 8).abs() + (y - 1).abs() + (z - 8).abs()) as u8;
-        LightValue::new(0, 13u8.saturating_sub(d), 5u8.saturating_sub(d / 2), 0).0
+        LightValue::new(0, 13u8.saturating_sub(d), 0, 0).0
     });
+    let light_at = |p: [i32; 3]| light.get(p[0], p[1], p[2]);
+    let emission = LightValue::from_rgb(common::EMBER);
     let mesh = |table: &MaterialTable, s: BlockState| {
         let center = chunk_repr(
             &dense_from(|x, y, z| match (x, y, z) {
@@ -433,44 +452,127 @@ fn a_lit_emitter_meshes_as_a_plain_block() {
         (padded, out)
     };
     let flag = layout::FLAG_EMISSIVE << layout::GEO_FLAGS_SHIFT;
+    let own = |q: &PackedQuad| q.unit_faces().any(|(p, _)| p == [8, 1, 8]);
     for (looks, ember, special) in [
         ("test:solid", "test:ember", None),
         ("test:plant", "test:ember_plant", Some(layout::SHAPE_CROSS)),
         ("test:post", "test:ember_post", Some(layout::SHAPE_BOX)),
     ] {
         let (_, like) = mesh(&plain_table, by(&plain, looks));
-        let (padded, unlit) = mesh(&plain_table, by(&plain, ember));
-        let (lit_padded, lit) = mesh(&marked_table, by(&marked, ember));
-        // Unmarked, the emitter is drawn as the block it looks like: the same quads and light.
-        assert_eq!(unlit.quads, like.quads, "{ember}");
-        assert_eq!(unlit.palette, like.palette, "{ember}");
-        assert_eq!(unlit.bucket_counts, like.bucket_counts, "{ember}");
-        assert!(unlit.quads.iter().all(|q| !q.is_emissive()), "{ember}");
-        // Marked, the same quads in the same order, its own with the flag bit and no other change.
-        assert_eq!(lit.palette, unlit.palette, "{ember}");
-        assert_eq!(lit.bucket_counts, unlit.bucket_counts, "{ember}");
-        assert_eq!(lit.quads.len(), unlit.quads.len(), "{ember}");
-        let mut flagged = 0;
-        for (a, b) in unlit.quads.iter().zip(&lit.quads) {
-            assert_eq!(a.mat, b.mat, "{ember}");
-            assert!(
-                a.geo ^ b.geo == 0 || a.geo ^ b.geo == flag,
-                "{ember}: {a:?} {b:?}"
+        let (padded, lit) = mesh(&plain_table, by(&plain, ember));
+        assert!(padded.lit_emitters, "{ember}");
+        assert!(plain_table.has_lit_emitters());
+        assert_eq!(
+            plain_table.lit_emission(by(&plain, ember).0),
+            emission,
+            "{ember}"
+        );
+        // Unmarked: its faces are flat, AO open, at the light they read raised to its emission.
+        let faces: Vec<&PackedQuad> = lit.quads.iter().filter(|q| own(q)).collect();
+        assert!(!faces.is_empty(), "{ember}");
+        for q in &faces {
+            assert!(!q.is_emissive(), "{ember}: {q:?}");
+            assert_eq!(q.ao_byte(), 0xFF, "{ember}: {q:?}");
+            let n = q.face().normal().to_array();
+            let front = [8 + n[0], 1 + n[1], 8 + n[2]];
+            // A cross reads its own cell, a box face against the floor too; every other face
+            // the voxel in front of it.
+            let cell = match special {
+                Some(layout::SHAPE_CROSS) => [8, 1, 8],
+                Some(_) if q.face() == Face::NegY => [8, 1, 8],
+                _ => front,
+            };
+            let want = light_at(cell).max(emission);
+            assert_eq!(
+                want.rgb()[1],
+                common::EMBER[1],
+                "the emission lifts the green"
             );
-            flagged += usize::from(b.is_emissive());
+            assert!(want.red() > common::EMBER[0], "the red around wins");
+            assert_eq!(lit.corner_light(**q), [want; 4], "{ember}: {q:?}");
         }
         match special {
+            // The checks of the greedy path (verify_mesh only knows cubes).
             None => {
-                verify_mesh(&padded, &plain_table, &unlit);
-                verify_mesh(&lit_padded, &marked_table, &lit);
-                assert_eq!(flagged, 5, "{ember}: the floor hides one face");
+                verify_mesh(&padded, &plain_table, &lit);
+                common::verify_shading(&padded, &plain_table, Some(&light), OPTIONS.ao, &lit);
+                assert_eq!(faces.len(), 5, "{ember}: the floor hides one face");
             }
-            Some(shape) => {
-                for q in &lit.quads {
-                    assert_eq!(q.is_emissive(), q.shape() == shape, "{ember}: {q:?}");
+            Some(shape) => assert!(faces.iter().all(|q| q.shape() == shape), "{ember}"),
+        }
+        // The other quads (the floor) are the look-alike's.
+        let rest = |m: &ChunkMesh| {
+            let mut v: Vec<_> = m
+                .quads
+                .iter()
+                .filter(|q| !own(q))
+                .map(|q| decoded(m, *q))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(rest(&lit), rest(&like), "{ember}");
+        // Marked, it is drawn full bright: the look-alike's quads in the same order, its own
+        // with the flag bit and no other change.
+        let (_, glowing) = mesh(&marked_table, by(&marked, ember));
+        assert_eq!(
+            marked_table.lit_emission(by(&marked, ember).0),
+            LightValue::DARK
+        );
+        assert_eq!(glowing.palette, like.palette, "{ember}");
+        assert_eq!(glowing.bucket_counts, like.bucket_counts, "{ember}");
+        assert_eq!(glowing.quads.len(), like.quads.len(), "{ember}");
+        for (a, b) in like.quads.iter().zip(&glowing.quads) {
+            assert_eq!(a.mat, b.mat, "{ember}");
+            let expected = if own(b) { flag } else { 0 };
+            assert_eq!(a.geo ^ b.geo, expected, "{ember}: {a:?} {b:?}");
+        }
+    }
+}
+
+#[test]
+fn a_lit_emitter_is_flat_under_a_uniform_light_too() {
+    let (registry, table) = glow_registry(&[]);
+    let by = |name: &str| registry.parse_state(name).expect(name);
+    let (floor, ember) = (by("test:solid"), by("test:ember"));
+    let center = chunk_repr(
+        &dense_from(|x, y, z| match (x, y, z) {
+            (_, 0, _) => floor.0,
+            (8, 1, 8) | (20, 1, 20) => ember.0,
+            _ => 0,
+        }),
+        Repr::Packed,
+    );
+    let padded = gathered(&isolated(&center), &table);
+    let emission = LightValue::from_rgb(common::EMBER);
+    let dark = PaddedLight::Uniform(LightValue::DARK);
+    let reddish = PaddedLight::Uniform(LightValue::new(9, 7, 0, 0));
+    for (light, v) in [
+        (None, LightValue::FULL_SKY),
+        (Some(&dark), LightValue::DARK),
+        (Some(&reddish), LightValue::new(9, 7, 0, 0)),
+    ] {
+        for policy in [AoPolicy::Off, AoPolicy::Baked, AoPolicy::BakedLitOnly] {
+            let mut out = ChunkMesh::default();
+            let options = MeshOptions::with_ao(policy);
+            Mesher::new().mesh(&padded, light, &table, options, &mut out);
+            verify_mesh(&padded, &table, &out);
+            common::verify_shading(&padded, &table, light, policy, &out);
+            let at = |p| {
+                out.quads
+                    .iter()
+                    .filter(move |q| q.unit_faces().any(|(u, _)| u == p))
+            };
+            for p in [[8, 1, 8], [20, 1, 20]] {
+                assert_eq!(at(p).count(), 5, "{light:?} {policy:?}");
+                for q in at(p) {
+                    assert_eq!(q.ao_byte(), 0xFF, "{light:?} {policy:?}");
+                    assert_eq!(out.corner_light(*q), [v.max(emission); 4], "{light:?}");
                 }
-                assert!(flagged > 0, "{ember}");
             }
+            // The floor keeps the uniform light.
+            let floor = quad_at(&out, [0, 0, 0], Face::PosY);
+            assert_eq!(out.corner_light(floor), [v; 4], "{light:?} {policy:?}");
         }
     }
 }
@@ -774,7 +876,7 @@ fn ao_shades_the_floor_along_a_wall_and_follows_the_policy() {
             &mut out,
         );
         verify_mesh(&padded, &table, &out);
-        common::verify_shading(&padded, light, policy, &out);
+        common::verify_shading(&padded, &table, light, policy, &out);
         out
     };
     let dark = PaddedLight::Uniform(LightValue::DARK);
@@ -829,7 +931,7 @@ fn light_reaches_the_palette_and_splits_merges() {
     let mut mesher = Mesher::new();
     let mesh = mesher.mesh_chunk(&input, &table, OPTIONS);
     verify_mesh(&padded, &table, &mesh);
-    common::verify_shading(&padded, Some(&light), AoPolicy::BakedLitOnly, &mesh);
+    common::verify_shading(&padded, &table, Some(&light), AoPolicy::BakedLitOnly, &mesh);
     assert_eq!(mesh.light_quantization, LightQuantization::Exact);
     // The floor top splits where the red changes; the far corners are plain sky.
     let top = mesh.bucket(Face::PosY.index());

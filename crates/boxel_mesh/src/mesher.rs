@@ -12,7 +12,8 @@ use crate::{
 use boxel_light::PaddedLight;
 use boxel_voxel::{
     BlockModel, BlockRegistry, BlockState, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, FLUID_LEVEL, Face,
-    LightValue, LocalPos, MAX_MODEL_BOXES, ModelBox, NEIGHBOR_OFFSETS, RenderShape, neighbor_index,
+    LightValue, LocalPos, MAX_MODEL_BOXES, ModelBox, NEIGHBOR_OFFSETS, Paletted, RenderShape,
+    neighbor_index,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
@@ -47,8 +48,10 @@ impl MeshOptions {
 }
 
 /// Mesher-side view of the registry: per material id, bgm class, render shape (bucket routing),
-/// model, the texture layer and shape code of each face and whether it is drawn full bright
-/// (`BlockRegistry::is_full_bright`). Built once per registry and shared (`Arc`) by mesh jobs.
+/// model, the texture layer and shape code of each face, whether it is drawn full bright
+/// (`BlockRegistry::is_full_bright`) and the light it is lit by when it emits without being
+/// full bright ([`MaterialTable::lit_emission`]). Built once per registry and shared (`Arc`) by
+/// mesh jobs.
 #[derive(Clone, Debug, Default)]
 pub struct MaterialTable {
     class: Vec<VoxelClass>,
@@ -58,6 +61,10 @@ pub struct MaterialTable {
     /// Shape code of each cube face (`layout::SHAPE_CUBE` or `SHAPE_TURNED`).
     codes: Vec<[u8; 6]>,
     emissive: Vec<bool>,
+    /// Per material: the emission of a lit emitter (ADR 0036), dark for the others.
+    lit: Vec<LightValue>,
+    /// Some material is a lit emitter: gather looks for them in the center chunk.
+    has_lit: bool,
     /// Some material is a fluid (`BlockModel::Fluid`): gather marks the surface cells.
     has_fluid: bool,
     /// Per state: the material it is meshed as (itself, but the source's material for every
@@ -245,6 +252,8 @@ impl MaterialTable {
             layers: vec![[0u16; 6]; n],
             codes: vec![[0u8; 6]; n],
             emissive: vec![false; n],
+            lit: vec![LightValue::DARK; n],
+            has_lit: false,
             has_fluid: false,
             fluid_source: (0..n as u16).collect(),
             fluid_level: vec![0; n],
@@ -268,6 +277,12 @@ impl MaterialTable {
             table.shape[m] = registry.shape(s);
             table.layers[m] = Face::ALL.map(|f| registry.face_texture(s, f).0);
             table.emissive[m] = registry.is_full_bright(s);
+            // An emitter that is not full bright is lit by its own light. A fluid never is: it
+            // is full bright when it emits.
+            if !table.emissive[m] {
+                table.lit[m] = registry.emission(s);
+                table.has_lit |= !table.lit[m].is_dark();
+            }
             table.set_model(m as u16, registry.model(s), registry.model_boxes(s));
             // Every level of a fluid meshes as its source (level 0).
             if registry.model(s) == BlockModel::Fluid
@@ -461,10 +476,39 @@ impl MaterialTable {
         }
         self.emissive[i] = emissive;
     }
+    /// The emission of `material` if it is a lit emitter, else dark (out of range too): a block
+    /// that emits light and is not drawn full bright (ADR 0036). The mesher draws its faces as
+    /// Minecraft draws such a block, flat: AO open and every corner the light of the voxel the
+    /// face reads (the one in front of it, or the block's own for a cross and for a box face
+    /// against an opaque cube), raised per channel to this emission. The shader keeps their face
+    /// shade.
+    #[inline]
+    pub fn lit_emission(&self, material: u16) -> LightValue {
+        self.lit
+            .get(usize::from(material))
+            .copied()
+            .unwrap_or(LightValue::DARK)
+    }
+    /// Sets the [`MaterialTable::lit_emission`] of `material` (tables built with
+    /// [`MaterialTable::from_parts`]; dark: not a lit emitter). For a material that is not
+    /// drawn full bright and is not a fluid, as [`MaterialTable::from_registry`] gives them.
+    pub fn set_lit_emission(&mut self, material: u16, emission: LightValue) {
+        let i = usize::from(material);
+        if self.lit.len() <= i {
+            self.lit.resize(i + 1, LightValue::DARK);
+        }
+        self.lit[i] = emission.block();
+        self.has_lit = self.lit.iter().any(|e| !e.is_dark());
+    }
+    /// True if some material is a lit emitter ([`MaterialTable::lit_emission`]).
+    pub fn has_lit_emitters(&self) -> bool {
+        self.has_lit
+    }
     /// Test helper: explicit table (`shape[i]` and `layers[i]` for material `i`; every material
     /// is a cube until [`MaterialTable::set_model`]; the bgm class is derived from the shape and
     /// model exactly as in [`MaterialTable::from_registry`]; no material is emissive until
-    /// [`MaterialTable::set_emissive`]).
+    /// [`MaterialTable::set_emissive`], nor a lit emitter until
+    /// [`MaterialTable::set_lit_emission`]).
     pub fn from_parts(shape: Vec<RenderShape>, layers: Vec<[u16; 6]>) -> Self {
         assert!(shape.len() == layers.len());
         let n = shape.len();
@@ -475,6 +519,8 @@ impl MaterialTable {
         Self {
             class,
             emissive: vec![false; n],
+            lit: vec![LightValue::DARK; n],
+            has_lit: false,
             model: vec![BlockModel::CUBE; n],
             codes: vec![[0; 6]; n],
             has_fluid: false,
@@ -526,6 +572,9 @@ struct Scratch {
     key_table: KeyTable,
     /// Fluid surface cells with their own corner heights (ADR 0021).
     fluid: FluidScratch,
+    /// A uniform light spread over every padded voxel, for a chunk with a lit emitter (made on
+    /// first use, kept).
+    expanded: Option<Box<[u16; PADDED_VOLUME]>>,
 }
 
 /// Reusable mesher (one per worker thread; about 0.6 MiB of scratch plus the quad lists).
@@ -553,6 +602,7 @@ impl Mesher {
                 palette: LightPalette::new(),
                 key_table: KeyTable::new(),
                 fluid: FluidScratch::new(),
+                expanded: None,
             },
             padded: PaddedChunk::new(),
             dense: vec![BlockState::AIR; CHUNK_VOLUME].into_boxed_slice(),
@@ -576,7 +626,8 @@ impl Mesher {
     ///
     /// Face culling and greedy merging are binary greedy meshing (an in-repo fork, `greedy.rs`).
     /// Two unit faces merge only if they have the same material, the same AO byte and the same 4
-    /// corner lights ([`reference_face_shading`] defines both, per `options.ao`). Each quad gets
+    /// corner lights ([`reference_face_shading`] defines both, per `options.ao`; the faces of a
+    /// lit emitter are flat, [`reference_lit_emitter_shading`]). Each quad gets
     /// `MaterialTable::layer` of its material and face (and [`layout::FLAG_EMISSIVE`] if
     /// `MaterialTable::emissive`) and is routed to `MaterialTable::bucket`.
     /// Corner lights go to the palette in first-seen order; past 4096 distinct entries the chunk
@@ -645,6 +696,8 @@ fn gather_into(
 ) {
     out.clear();
     gather_center(dense, input.center, materials, out);
+    // Only the inner 32^3 is meshed, so only the center's lit emitters count.
+    out.lit_emitters = materials.has_lit && may_hold_lit_emitter(input.center, materials);
     for (offset, neighbor) in NEIGHBOR_OFFSETS.iter().zip(input.neighbors) {
         if let Some(chunk) = neighbor {
             gather_border([offset.x, offset.y, offset.z], chunk, materials, out);
@@ -655,6 +708,19 @@ fn gather_into(
     }
     if materials.marks_fluid_surfaces() {
         mark_fluid_surfaces(materials, out);
+    }
+}
+
+/// True if `chunk` may hold a lit emitter ([`MaterialTable::lit_emission`]): a palette scan, so
+/// it may answer yes for an entry no longer used, but never no for a chunk that holds one.
+/// `Direct` storage answers yes.
+fn may_hold_lit_emitter(chunk: &ChunkData, materials: &MaterialTable) -> bool {
+    // The material of a state with geometry is its id; the others have none and are not lit.
+    let lit = |s: &BlockState| !materials.lit_emission(s.0).is_dark();
+    match chunk.blocks() {
+        Paletted::Uniform(s) => lit(s),
+        Paletted::Packed { palette, .. } => palette.iter().any(lit),
+        Paletted::Direct(_) => true,
     }
 }
 
@@ -871,10 +937,27 @@ fn mesh_into(
     // Sloped fluid cells leave the greedy pass (ADR 0021).
     find_sloped(padded, materials, &mut s.greedy, &mut s.fluid);
     let elide = options.ao == AoPolicy::BakedLitOnly;
+    // The faces of lit emitters are flat (ADR 0036). Only the full-light path draws them, so a
+    // uniform light around one (no light, or a chunk all of one emitter) is spread first.
+    let glow = padded.lit_emitters && materials.has_lit;
     let full = match light {
         None => Err(LightValue::FULL_SKY),
         Some(PaddedLight::Uniform(v)) => Err(*v),
         Some(PaddedLight::Full(values)) => Ok(&**values),
+    };
+    let mut expanded = None;
+    let full = match full {
+        Err(v) if glow => {
+            let mut values = s.expanded.take().unwrap_or_else(|| {
+                vec![0; PADDED_VOLUME]
+                    .into_boxed_slice()
+                    .try_into()
+                    .expect("PADDED_VOLUME values")
+            });
+            values.fill(v.0);
+            Ok(&**expanded.insert(values))
+        }
+        full => full,
     };
     let kind = match full {
         // Uniform light: one palette entry, the key is the material and maybe the AO.
@@ -900,7 +983,7 @@ fn mesh_into(
                 }
             }
             // Never fails: no palette here.
-            let _ = emit_specials(padded, materials, &mut s.specials, |_, _, nb9| {
+            let _ = emit_specials(padded, materials, &mut s.specials, |_, _, _, nb9| {
                 Ok(match nb9 {
                     Some(nb9) if ao => (AO_TABLE[neighborhood8(nb9)], 0),
                     _ => (AO_OPEN_BYTE, 0),
@@ -911,7 +994,7 @@ fn mesh_into(
                 padded,
                 materials,
                 &mut s.specials,
-                |_, _, _| Ok((AO_OPEN_BYTE, 0)),
+                |_, _, _, _| Ok((AO_OPEN_BYTE, 0)),
             );
             if s.greedy.quads.iter().any(|q| !q.is_empty()) || !s.specials.is_empty() {
                 out.palette.push(palette_entry([v; 4]));
@@ -928,7 +1011,12 @@ fn mesh_into(
                 s.greedy.clear();
                 s.palette.clear();
                 s.key_table.clear();
-                if mesh_lit(s, padded, values, materials, options.ao, elide, level).is_ok() {
+                let meshed = if glow {
+                    mesh_lit::<true>(s, padded, values, materials, options.ao, elide, level)
+                } else {
+                    mesh_lit::<false>(s, padded, values, materials, options.ao, elide, level)
+                };
+                if meshed.is_ok() {
                     out.light_quantization = level;
                     break;
                 }
@@ -952,12 +1040,16 @@ fn mesh_into(
         KeyKind::Table => assemble(greedy, specials, materials, out, |k| s.key_table.key(k)),
     }
     out.hash = out.compute_hash();
+    if expanded.is_some() {
+        s.expanded = expanded;
+    }
 }
 
 /// Fills the keys and merges every face under full light at quantization `level`, then adds the
 /// quads of the non-cube blocks. `Err` when the palette overflows (the caller tries the next
-/// level).
-fn mesh_lit(
+/// level). With `GLOW` (the chunk may hold a lit emitter), the faces of the lit emitters are
+/// flat ([`flat_shading`]); without it no face asks, so the hot path stays as it was.
+fn mesh_lit<const GLOW: bool>(
     s: &mut Scratch,
     padded: &PaddedChunk,
     light: &[u16; PADDED_VOLUME],
@@ -969,15 +1061,32 @@ fn mesh_lit(
     for face in 0..6 {
         let (keys, palette, table) = (&mut s.keys, &mut s.palette, &mut s.key_table);
         visit_face(face, &s.greedy, padded, |i, front, nb9| {
-            let (ao, corners) = lit_shading(light, front, face, nb9, ao, elide, level);
-            keys[i] = table.id(padded.voxels[i], ao, corners, palette)?;
+            let material = padded.voxels[i];
+            // A fluid surface id (`FLUID_SURFACE_BIT`) is past the table: never lit.
+            let emission = if GLOW {
+                materials.lit_emission(material)
+            } else {
+                LightValue::DARK
+            };
+            let (ao, corners) = if GLOW && !emission.is_dark() {
+                flat_shading(light, front, emission, level)
+            } else {
+                lit_shading(light, front, face, nb9, ao, elide, level)
+            };
+            keys[i] = table.id(material, ao, corners, palette)?;
             Ok(())
         })?;
         s.greedy.merge_face(face, &s.keys);
     }
     let palette = &mut s.palette;
-    let mut shade = |cell, face: Face, nb9| {
+    let mut shade = |material, cell, face: Face, nb9| {
+        let emission = if GLOW {
+            materials.lit_emission(material)
+        } else {
+            LightValue::DARK
+        };
         let (ao, corners) = match nb9 {
+            _ if GLOW && !emission.is_dark() => flat_shading(light, cell, emission, level),
             Some(nb9) => lit_shading(light, cell, face.index(), nb9, ao, elide, level),
             // A cross: the light of its own cell, AO open.
             None => (AO_OPEN_BYTE, level.apply([LightValue(light[cell]); 4])),
@@ -1029,11 +1138,26 @@ fn lit_shading(
     (ao, corners)
 }
 
+/// AO byte and corner lights of a face of a lit emitter ([`MaterialTable::lit_emission`],
+/// ADR 0036), the way Minecraft lights a block that emits: flat, AO open, every corner the
+/// light of `cell` (the voxel whose light the face reads) raised per channel to `emission`.
+#[inline]
+fn flat_shading(
+    light: &[u16; PADDED_VOLUME],
+    cell: usize,
+    emission: LightValue,
+    level: LightQuantization,
+) -> (u8, [LightValue; 4]) {
+    let flat = LightValue(light[cell]).max(emission);
+    (AO_OPEN_BYTE, level.apply([flat; 4]))
+}
+
 /// The quads of the non-cube blocks of the inner 32^3 (ADR 0018, ADR 0020), one block at a time,
-/// into `out` with their buckets (cleared first). `shade(cell, face, nb9)` gives a quad's AO
-/// byte and light palette index: for a box face, `cell` is the padded index of the voxel whose
-/// layer shades it and `nb9` the opacity of that 3x3 layer ([`box_face_layer`]), as for the
-/// cube face there; for a cross, `cell` is the block's own voxel and `nb9` is `None`.
+/// into `out` with their buckets (cleared first). `shade(material, cell, face, nb9)` gives the
+/// AO byte and light palette index of a quad of the block of `material`: for a box face, `cell`
+/// is the padded index of the voxel whose layer shades it and `nb9` the opacity of that 3x3
+/// layer ([`box_face_layer`]), as for the cube face there; for a cross, `cell` is the block's
+/// own voxel and `nb9` is `None`.
 ///
 /// A model made of boxes (slabs, stairs, fences, torches) draws one `SHAPE_BOX` quad per box
 /// face its other boxes do not cover. A face flush with the cell border is hidden by an opaque
@@ -1048,7 +1172,7 @@ fn emit_specials(
     padded: &PaddedChunk,
     materials: &MaterialTable,
     out: &mut Vec<(u8, PackedQuad)>,
-    mut shade: impl FnMut(usize, Face, Option<u32>) -> Result<(u8, u16), PaletteFull>,
+    mut shade: impl FnMut(u16, usize, Face, Option<u32>) -> Result<(u8, u16), PaletteFull>,
 ) -> Result<(), PaletteFull> {
     out.clear();
     // `index`: the model box of a `SHAPE_BOX` quad (0 is `w = h = 1` for the others).
@@ -1081,7 +1205,7 @@ fn emit_specials(
                     Some(shading) => shading,
                     None => {
                         let (cell, nb9) = box_face_layer(padded, [x, y, z], face);
-                        let shading = shade(cell, face, Some(nb9))?;
+                        let shading = shade(m, cell, face, Some(nb9))?;
                         shaded[face.index()] = Some(shading);
                         shading
                     }
@@ -1091,7 +1215,7 @@ fn emit_specials(
         } else if materials.model(m) == BlockModel::Cross {
             let i = PaddedChunk::index(x, y, z);
             for face in [Face::PosX, Face::PosZ] {
-                let shading = shade(i, face, None)?;
+                let shading = shade(m, i, face, None)?;
                 push(m, pos, face, Face::PosX, layout::SHAPE_CROSS, 0, shading);
             }
         }
@@ -1465,6 +1589,9 @@ pub fn reference_visible_faces(padded: &PaddedChunk) -> BTreeSet<([u32; 3], Face
 /// - AO per corner: 0 when both sides are opaque, else 3 minus the opaque count of the sides
 ///   and the diagonal. Always open with [`AoPolicy::Off`]; open on a face whose 4 corner lights
 ///   are 0 with [`AoPolicy::BakedLitOnly`].
+///
+/// A face of a lit emitter ([`MaterialTable::lit_emission`]) is shaded flat instead
+/// ([`reference_lit_emitter_shading`]); this oracle knows no materials.
 pub fn reference_face_shading(
     padded: &PaddedChunk,
     light: Option<&PaddedLight>,
@@ -1511,6 +1638,23 @@ pub fn reference_box_face_shading_at(
     let opaque = class_from_masks(padded, front[0], front[1], front[2]) == VoxelClass::Opaque;
     let layer = if opaque { p.map(|c| c as i32) } else { front };
     layer_shading(padded, light, policy, layer, face)
+}
+
+/// The oracle of a face of a lit emitter ([`MaterialTable::lit_emission`] `emission`, ADR 0036):
+/// AO open, under every policy, and every corner the light of padded voxel `cell` raised per
+/// channel to `emission` (no [`LightQuantization`]; `light` `None` is sky 15 everywhere).
+/// `cell` is the voxel whose light the face reads: the one in front of a cube face, the front
+/// layer's of a box face ([`reference_box_face_shading_at`]), a cross's own.
+pub fn reference_lit_emitter_shading(
+    light: Option<&PaddedLight>,
+    cell: [i32; 3],
+    emission: LightValue,
+) -> FaceShading {
+    let at = light.map_or(LightValue::FULL_SKY, |l| l.get(cell[0], cell[1], cell[2]));
+    FaceShading {
+        ao: AO_OPEN_BYTE,
+        light: [at.max(emission); 4],
+    }
 }
 
 /// AO and corner lights of a face of direction `face` whose front layer is the one through

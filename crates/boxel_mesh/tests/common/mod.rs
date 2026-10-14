@@ -5,7 +5,7 @@ use boxel_light::{PADDED_VOLUME, PaddedLight};
 use boxel_mesh::{
     AoPolicy, BUCKET_COUNT, ChunkMesh, FLUID_SURFACE_BIT, FaceShading, MAX_PALETTE_ENTRIES,
     MaterialTable, PaddedChunk, VoxelClass, fluid_flow, layout, reference_face_shading,
-    reference_visible_faces,
+    reference_lit_emitter_shading, reference_visible_faces,
 };
 use boxel_voxel::{
     BlockDef, BlockRegistryBuilder, BlockState, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, Face,
@@ -507,12 +507,14 @@ pub fn random_light(fill: LightFill, seed: u64) -> Option<PaddedLight> {
     })
 }
 
-/// Checks the shading of a mesh against [`reference_face_shading`]: every unit face of every
-/// quad has the quad's AO byte and palette corners, and those equal the reference at the mesh's
-/// quantization level. Also checks that the palette fits, every quad indexes it and every entry
-/// is used.
+/// Checks the shading of a mesh against [`reference_face_shading`] (and
+/// [`reference_lit_emitter_shading`] on the faces of the lit emitters of `table`): every unit
+/// face of every quad has the quad's AO byte and palette corners, and those equal the reference
+/// at the mesh's quantization level. Also checks that the palette fits, every quad indexes it and
+/// every entry is used.
 pub fn verify_shading(
     padded: &PaddedChunk,
+    table: &MaterialTable,
     light: Option<&PaddedLight>,
     policy: AoPolicy,
     mesh: &ChunkMesh,
@@ -537,10 +539,17 @@ pub fn verify_shading(
             light: mesh.corner_light(*quad),
         };
         for (p, face) in quad.unit_faces() {
-            let mut want = reference
+            let mut want = *reference
                 .get(&(p, face))
-                .unwrap_or_else(|| panic!("{p:?} {face:?} is not a visible face"))
-                .quantized(mesh.light_quantization, elide);
+                .unwrap_or_else(|| panic!("{p:?} {face:?} is not a visible face"));
+            let id = padded.get(p[0] as i32, p[1] as i32, p[2] as i32);
+            let emission = table.lit_emission(id & !FLUID_SURFACE_BIT);
+            if !emission.is_dark() {
+                let n = face.normal().to_array();
+                let front = std::array::from_fn(|a| p[a] as i32 + n[a]);
+                want = reference_lit_emitter_shading(light, front, emission);
+            }
+            let mut want = want.quantized(mesh.light_quantization, elide);
             if quad.shape() == layout::SHAPE_FLUID_SLOPE {
                 // Sloped fluid quads have no AO: their AO bits hold corner heights.
                 want.ao = 0xFF;

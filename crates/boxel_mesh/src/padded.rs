@@ -51,6 +51,11 @@ pub struct PaddedChunk {
     /// index. Their cell in `voxels` holds their water (a transparent fluid source), so it culls
     /// and slopes as water; the mesher draws the block's boxes from here.
     pub waterlogged: Vec<(u32, u16)>,
+    /// The inner 32^3 may hold a lit emitter (`MaterialTable::lit_emission`, ADR 0036), whose
+    /// faces the mesher draws flat. Gather sets it from the center chunk's palette; `new` and
+    /// `clear` set it, so a chunk filled by hand is always looked at. When it is false the
+    /// mesher never asks a voxel whether it is one.
+    pub lit_emitters: bool,
 }
 
 impl Default for PaddedChunk {
@@ -70,6 +75,7 @@ impl PaddedChunk {
             cull_mask: u16::MAX,
             fluid_levels: Vec::new(),
             waterlogged: Vec::new(),
+            lit_emitters: true,
         }
     }
     /// Resets to empty.
@@ -81,6 +87,7 @@ impl PaddedChunk {
         self.cull_mask = u16::MAX;
         self.fluid_levels.clear();
         self.waterlogged.clear();
+        self.lit_emitters = true;
     }
     /// Linear index of chunk-local `(x, y, z)`, each in `-1..=32`.
     #[inline]

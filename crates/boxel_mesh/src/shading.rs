@@ -4,7 +4,9 @@
 //! Both values only depend on the vertex (the 4 front-layer voxels around it), never on which
 //! face asks: two visible coplanar faces that share a vertex see the same AO and the same light
 //! there. So when two adjacent faces have the same key, the value is constant along the axis
-//! they share, and a merged quad interpolates exactly what its unit faces would.
+//! they share, and a merged quad interpolates exactly what its unit faces would. The faces of a
+//! lit emitter (ADR 0036) are flat instead, AO open and 4 equal corners, so equal keys merge
+//! exactly too.
 //!
 //! The front-layer neighborhood of a face is the 3x3 block of voxels in the layer in front of
 //! it, centered on the voxel the face looks at. A cell is `(du, dv)` in `-1..=1` along the face's

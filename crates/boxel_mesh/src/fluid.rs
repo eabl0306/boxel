@@ -350,14 +350,14 @@ fn any_layer(padded: &PaddedChunk, y: i32) -> bool {
 
 /// Appends the quads of the sloped cells to `out` with their buckets
 /// ([`MaterialTable::sloped_bucket`]): one `SHAPE_FLUID_SLOPE` quad per visible face.
-/// `shade(front, face, nb9)` gives the light palette
-/// index (and an AO byte, unused: the heights take its bits) as for the cube face in its place.
+/// `shade(material, front, face, nb9)` gives the light palette index (and an AO byte, unused: the
+/// heights take its bits) as for the cube face of the fluid's material in its place.
 pub(crate) fn emit_sloped(
     cells: &[SlopedCell],
     padded: &PaddedChunk,
     materials: &MaterialTable,
     out: &mut Vec<(u8, PackedQuad)>,
-    mut shade: impl FnMut(usize, Face, Option<u32>) -> Result<(u8, u16), PaletteFull>,
+    mut shade: impl FnMut(u16, usize, Face, Option<u32>) -> Result<(u8, u16), PaletteFull>,
 ) -> Result<(), PaletteFull> {
     for cell in cells {
         let [x, y, z] = cell.pos;
@@ -370,7 +370,7 @@ pub(crate) fn emit_sloped(
             let n = face.normal();
             let front = PaddedChunk::index(x as i32 + n.x, y as i32 + n.y, z as i32 + n.z);
             let nb9 = front_nb9(face, &padded.opaque, x as usize, y as usize, z as usize);
-            let (_, light) = shade(front, face, Some(nb9))?;
+            let (_, light) = shade(m, front, face, Some(nb9))?;
             // A sloping top shows the flow texture (the fluid's side texture).
             let texture = if face == Face::PosY && flowing {
                 Face::PosX

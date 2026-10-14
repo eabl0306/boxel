@@ -7,7 +7,9 @@
 //! Light and ambient occlusion are baked per quad corner (ADR 0015): each quad carries an AO
 //! byte and the index of its 4 corner lights in the chunk's light palette
 //! ([`ChunkMesh::palette`]). Both are part of the merge key, and both only depend on the vertex,
-//! so a merged quad is exact. [`AoPolicy`] says which faces get AO.
+//! so a merged quad is exact. [`AoPolicy`] says which faces get AO. A block that emits light
+//! without being drawn full bright is lit flat by its own light, as in Minecraft (ADR 0036,
+//! [`MaterialTable::lit_emission`]).
 //!
 //! [`lod`] meshes the far level of detail's nodes (ADR 0031) with the same mesher: coarse cells
 //! as opaque cubes, then octant splits, skirts and fluid walls.
@@ -24,7 +26,8 @@ pub mod shading;
 pub use fluid::{FLAT as FLUID_FLAT, fluid_flow, reference_fluid_heights};
 pub use mesher::{
     AoPolicy, MaterialTable, MeshInput, MeshOptions, Mesher, reference_box_face_shading_at,
-    reference_face_shading, reference_face_shading_at, reference_visible_faces,
+    reference_face_shading, reference_face_shading_at, reference_lit_emitter_shading,
+    reference_visible_faces,
 };
 pub use packed::{
     ChunkMesh, FULL_SKY_ENTRY, LightQuantization, MAX_PALETTE_ENTRIES, PackedQuad, PaletteEntry,

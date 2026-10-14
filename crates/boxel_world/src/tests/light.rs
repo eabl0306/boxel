@@ -1071,18 +1071,19 @@ impl WorldGenerator for PocketGen {
     }
 }
 
-/// An emitter that is not full bright is lit by its own light, far from the origin too: its
-/// faces show the light of the air in front of them (one less than its emission), with no
-/// flag, as a plain block would; marked, its mesh only gains the flag on its own faces.
+/// An emitter that is not full bright is lit by its own light as in Minecraft, far from the
+/// origin too: its faces are flat, AO open and at the light in front of them raised to its
+/// emission (here the emission itself: the air in front has one less), with no flag; marked, its
+/// faces get the flag and the shading of a plain block, and nothing else changes.
 #[test]
 fn an_emitter_not_full_bright_is_lit_by_its_light_far_from_the_origin() {
-    let flag = boxel_mesh::layout::FLAG_EMISSIVE << boxel_mesh::layout::GEO_FLAGS_SHIFT;
     let pocket_mesh = |chunk: ChunkPos, marked: bool| {
         let generator = PocketGen { chunk };
         let registry = ember_registry(marked);
         let mut app = lit_app(generator, registry, small(), Arc::new(InlineExecutor));
         spawn(&mut app, chunk, 1, 1);
         settle(&mut app);
+        assert!(assert_matches_reference(&app) > 0, "{chunk:?}");
         let front = BlockPos::from_parts(chunk, LocalPos::new(17, 16, 16));
         let map = app.world().resource::<ChunkMap>();
         let (_, slot) = map
@@ -1095,7 +1096,22 @@ fn an_emitter_not_full_bright_is_lit_by_its_light_far_from_the_origin() {
         };
         (mesh, light_at(&app, front))
     };
-    let corner = |e: u8| ((e - 1) + 2 * (e - 2) + (e - 3) + 2) / 4;
+    let emission = LightValue::from_rgb(EMBER);
+    // A plain block's corner: the rounded mean of the front cell, two sides and a diagonal.
+    let smooth = |e: u8| ((e - 1) + 2 * (e - 2) + (e - 3) + 2) / 4;
+    let center = [POCKET.x(), POCKET.y(), POCKET.z()];
+    let own = |q: &boxel_mesh::PackedQuad| q.unit_faces().any(|(p, _)| p == center);
+    // The quads that are not the ember's, decoded (palette order aside).
+    let rest = |mesh: &boxel_mesh::ChunkMesh| {
+        let mut quads: Vec<_> = mesh
+            .quads
+            .iter()
+            .filter(|q| !own(q))
+            .map(|q| (q.geo, q.layer(), q.ao_byte(), mesh.corner_light(*q)))
+            .collect();
+        quads.sort_unstable();
+        quads
+    };
     for chunk in [
         ChunkPos::new((1 << 26) - 2, -3, 5),
         ChunkPos::new(-7, 1 << 35, -(1 << 35)),
@@ -1108,15 +1124,12 @@ fn an_emitter_not_full_bright_is_lit_by_its_light_far_from_the_origin() {
             LightValue::new(0, EMBER[0] - 1, EMBER[1] - 1, 0),
             "{chunk:?}"
         );
-        let center = [POCKET.x(), POCKET.y(), POCKET.z()];
-        let own = |q: &boxel_mesh::PackedQuad| q.unit_faces().any(|(p, _)| p == center);
         let faces: Vec<_> = lit.quads.iter().filter(|q| own(q)).collect();
         assert_eq!(faces.len(), 6, "{chunk:?}");
         for q in faces {
             assert!(!q.is_emissive(), "{chunk:?}: {q:?}");
-            // Each corner is the rounded mean of the front cell, two sides and a diagonal.
-            let expected = LightValue::new(0, corner(EMBER[0]), corner(EMBER[1]), 0);
-            assert_eq!(lit.corner_light(*q), [expected; 4], "{chunk:?}: {q:?}");
+            assert_eq!(q.ao_byte(), 0xFF, "{chunk:?}: {q:?}");
+            assert_eq!(lit.corner_light(*q), [emission; 4], "{chunk:?}: {q:?}");
         }
         // The pocket's walls are lit by it too.
         assert!(
@@ -1126,14 +1139,16 @@ fn an_emitter_not_full_bright_is_lit_by_its_light_far_from_the_origin() {
                 .any(|q| lit.corner_light(*q).iter().any(|c| c.rgb()[0] > 0)),
             "{chunk:?}"
         );
-        // Marked: the same mesh, the flag on its own faces only.
+        // Marked: the flag on its own faces, shaded as a plain block's; the rest is the same.
         let (glowing, _) = pocket_mesh(chunk, true);
-        assert_eq!(glowing.palette, lit.palette, "{chunk:?}");
         assert_eq!(glowing.quads.len(), lit.quads.len(), "{chunk:?}");
-        for (a, b) in lit.quads.iter().zip(&glowing.quads) {
-            assert_eq!(a.mat, b.mat, "{chunk:?}");
-            let expected = if own(a) { flag } else { 0 };
-            assert_eq!(a.geo ^ b.geo, expected, "{chunk:?}: {a:?}");
+        assert_eq!(rest(&glowing), rest(&lit), "{chunk:?}");
+        let faces: Vec<_> = glowing.quads.iter().filter(|q| own(q)).collect();
+        assert_eq!(faces.len(), 6, "{chunk:?}");
+        for q in faces {
+            assert!(q.is_emissive(), "{chunk:?}: {q:?}");
+            let plain = LightValue::new(0, smooth(EMBER[0]), smooth(EMBER[1]), 0);
+            assert_eq!(glowing.corner_light(*q), [plain; 4], "{chunk:?}: {q:?}");
         }
     }
 }

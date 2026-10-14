@@ -11,7 +11,7 @@ use boxel_demo::shapes::{
 use boxel_mesh::{
     AoPolicy, BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, FaceShading, MaterialTable, MeshOptions,
     Mesher, PackedQuad, PaddedChunk, VoxelClass, layout, reference_box_face_shading_at,
-    reference_visible_faces,
+    reference_lit_emitter_shading, reference_visible_faces,
 };
 use boxel_voxel::{
     Axis, BlockModel, BoxModelId, Face, Facing, LightValue, ModelBox, RenderShape, SlabHalf,
@@ -209,8 +209,18 @@ fn expected_specials(
                         if hidden {
                             continue;
                         }
-                        let shading = reference_box_face_shading_at(padded, light, policy, p, face)
-                            .quantized(level, elide);
+                        // A lit emitter's face is flat, at the light of the voxel whose layer
+                        // shades it (the one in front, or its own against an opaque cube).
+                        let emission = table.lit_emission(m);
+                        let shading = if emission.is_dark() {
+                            reference_box_face_shading_at(padded, light, policy, p, face)
+                        } else {
+                            let front = [x + n.x, y + n.y, z + n.z];
+                            let opaque = table.class(nm) == VoxelClass::Opaque;
+                            let cell = if opaque { [x, y, z] } else { front };
+                            reference_lit_emitter_shading(light, cell, emission)
+                        }
+                        .quantized(level, elide);
                         out.push((
                             p,
                             face,
@@ -224,6 +234,7 @@ fn expected_specials(
                 }
                 if m == CROSS {
                     let own = light.map_or(LightValue::FULL_SKY, |l| l.get(x, y, z));
+                    let own = own.max(table.lit_emission(m));
                     for face in [Face::PosX, Face::PosZ] {
                         let shading = FaceShading {
                             ao: 0xFF,
@@ -315,11 +326,34 @@ fn mesh(
 
 #[test]
 fn random_chunks_with_shapes_match_the_rules() {
-    let table = table();
+    random_chunks_match_the_rules(&table(), 0..48);
+}
+
+/// The same with lit emitters (ADR 0036) among the cubes, the cross and the boxes: their faces
+/// are flat, at their light raised to their emission.
+#[test]
+fn random_chunks_with_lit_emitters_match_the_rules() {
+    let mut table = table();
+    for (m, rgb) in [
+        (2, [9, 4, 0]),
+        (CROSS, [3, 1, 0]),
+        (STAIRS, [15, 6, 2]),
+        (TORCH, [14, 11, 6]),
+        (GLASS_SLAB, [1, 1, 1]),
+    ] {
+        table.set_lit_emission(m, LightValue::from_rgb(rgb));
+    }
+    random_chunks_match_the_rules(&table, 100..124);
+}
+
+/// Random chunks of every shape of `table`, one per seed, under every light and AO policy:
+/// the greedy faces equal the oracle and the per-block quads the rules.
+fn random_chunks_match_the_rules(table: &MaterialTable, seeds: std::ops::Range<u64>) {
     let fills = [Fill::Noise, Fill::Boxes, Fill::Terrain, Fill::Lattice];
     let policies = [AoPolicy::Off, AoPolicy::Baked, AoPolicy::BakedLitOnly];
     let mut specials_seen = 0;
-    for seed in 0..48u64 {
+    let count = seeds.end - seeds.start;
+    for seed in seeds {
         let fill = fills[seed as usize % fills.len()];
         // Shapes first in the palette: Terrain puts the first entries on top.
         let palette: Vec<u16> = if seed % 2 == 0 {
@@ -330,16 +364,16 @@ fn random_chunks_with_shapes_match_the_rules() {
         } else {
             ALL.to_vec()
         };
-        let padded = random_padded(&table, fill, seed, 20 + (seed as u32 * 7) % 60, &palette);
+        let padded = random_padded(table, fill, seed, 20 + (seed as u32 * 7) % 60, &palette);
         let light_fill = LIGHT_FILLS[seed as usize % LIGHT_FILLS.len()];
         let light = random_light(light_fill, seed);
         let policy = policies[seed as usize % 3];
-        let mesh = mesh(&padded, &table, light.as_ref(), policy);
-        let (cubes, specials) = split_mesh(&mesh, &table);
+        let mesh = mesh(&padded, table, light.as_ref(), policy);
+        let (cubes, specials) = split_mesh(&mesh, table);
         assert_eq!(cubes, reference_visible_faces(&padded), "seed {seed}");
         let expected = expected_specials(
             &padded,
-            &table,
+            table,
             light.as_ref(),
             policy,
             mesh.light_quantization,
@@ -359,7 +393,7 @@ fn random_chunks_with_shapes_match_the_rules() {
         );
     }
     assert!(
-        specials_seen > 50_000,
+        specials_seen as u64 > 1_000 * count,
         "the fills exercise the per-block path ({specials_seen})"
     );
 }
