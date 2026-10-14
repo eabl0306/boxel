@@ -139,6 +139,24 @@ Detalle en [rendimiento/memoria-y-mundos-2026-10.md](../rendimiento/memoria-y-mu
 - Encoger suelta una página cada 5 s como mucho: 2 de 9 a los 15 s y 8 a los 60 s. Queda una sobre
   el piso por la histéresis.
 
+## Sin pisos fijos (2026-10-13)
+
+La decisión 10 del plan pedía quitar los pisos fijos después de la ronda de control siguiente. La
+ronda 2 no encontró empeoramientos
+([rendimiento/control-2026-10-13.md](../rendimiento/control-2026-10-13.md)), así que se quitaron:
+
+- `tools/perf` ya no arranca los casos de radio 32 con 48 Mi quads y 98 304 slots.
+- Los ejemplos ya no le dan 24 Mi quads y 65 536 slots al overworld.
+
+Todo arranca del piso por defecto (8 Mi quads, 32 768 slots) y crece. `--arena-quads`,
+`--chunk-slots` y `--chunk-memory` siguen como opciones. Un binario de antes de las páginas (sin
+`--chunk-memory`) sigue recibiendo los 48 Mi en radio 32, para que `perf-bisect` pueda medir a
+través de #57. `snapshot` reserva todo antes de subir, como el primer frame del plugin.
+
+El smoke en la RTX, radio 32 con tope 144, no ve diferencia: 142 y 143 fps en la superficie y en
+la ruta de la cueva, igual que antes. Desde el piso, la superficie crea 4 páginas y la cueva 9, sin
+chunks perdidos ni páginas de emergencia.
+
 ## Pendiente
 
 - La decisión 7: el bloque nuevo pasa los 2 ms en la 780M (unos 25 ms, un frame largo cada 256 MiB

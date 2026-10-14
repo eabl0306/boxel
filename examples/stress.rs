@@ -164,10 +164,9 @@ usage: stress [--scenario static|fly|dive|spin|path|switch] [GPU options] [optio
   --vertical-radius N chunks loaded above and below the camera (default 8)
   --fixed-height      load only the generator's layers, like M0 (for comparisons with older runs;
                       not with the overworld, which has no floor)
-  --arena-quads N     chunk memory the renderer starts with, in quads (default 8388608, 25165824
-                      with the overworld; ADR 0035)
-  --chunk-slots N     chunk table the renderer starts with (default 32768, 65536 with the
-                      overworld)
+  --arena-quads N     chunk memory the renderer starts with, in quads (default 8388608;
+                      ADR 0035)
+  --chunk-slots N     chunk table the renderer starts with (default 32768)
   --chunk-memory fixed|grow  grow keeps the pages and the table growing and shrinking at
                       runtime (the default); fixed keeps what the renderer starts with
   --max-chunk-quads N the most quads chunk memory may grow to (default: by adapter class)
@@ -298,7 +297,7 @@ struct Options {
     world: WorldChoice,
     vertical_radius: u32,
     fixed_height: bool,
-    /// `--arena-quads` and `--chunk-slots` (`None`: the world's default).
+    /// `--arena-quads` and `--chunk-slots` (`None`: the engine's default).
     arena_quads: Option<u32>,
     chunk_slots: Option<u32>,
     /// `--alloc-probe`: page sizes in MiB (empty: no probe).
@@ -362,12 +361,12 @@ struct Options {
 }
 
 impl Options {
-    /// Renderer `(arena quads, chunk slots)`: the flags, else the world's defaults.
+    /// Renderer `(arena quads, chunk slots)`: the flags, else the engine's defaults.
     fn render_capacity(&self) -> (u32, u32) {
-        let (quads, slots) = self.world.render_capacity();
+        let memory = boxel::render::ChunkMemorySettings::default();
         (
-            self.arena_quads.unwrap_or(quads),
-            self.chunk_slots.unwrap_or(slots),
+            self.arena_quads.unwrap_or(memory.initial_quads),
+            self.chunk_slots.unwrap_or(memory.initial_slots),
         )
     }
 }
@@ -1874,7 +1873,9 @@ fn main() -> AppExit {
                         boxel::render::MemoryCeiling::Auto,
                         boxel::render::MemoryCeiling::Quads,
                     ),
-                    ..world::chunk_memory((arena_quads, chunk_slots))
+                    initial_quads: arena_quads,
+                    initial_slots: chunk_slots,
+                    ..boxel::render::ChunkMemorySettings::default()
                 },
                 textures: options.textures.clone(),
                 translucent_sort: options.sort,
@@ -2476,7 +2477,7 @@ mod tests {
     }
 
     #[test]
-    fn worlds_set_the_render_capacity_and_flags_override_it() {
+    fn every_world_starts_from_the_engine_floor_and_flags_override_it() {
         let o = parse(&[
             "--world",
             "overworld",
@@ -2489,7 +2490,7 @@ mod tests {
         .expect("not help");
         assert_eq!((o.scenario, o.speed), (Scenario::Dive, 64.0));
         assert_eq!(o.world.label(), "overworld/mc");
-        assert_eq!(o.render_capacity(), (24 << 20, 65_536));
+        assert_eq!(o.render_capacity(), (8 << 20, 32_768));
         let o = parse(&[
             "--world=overworld",
             "--caves=closed",

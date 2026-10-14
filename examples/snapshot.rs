@@ -58,9 +58,9 @@ use boxel::prelude::*;
 use boxel::render::fog::{FogInput, FogResolution};
 use boxel::render::lod::{LodInput, LodOp};
 use boxel::render::{
-    BlockOutline, DistanceFog, FLUID_TIME_PERIOD, Outline, RenderSettings, RendererConfig,
-    SceneLight, TextureSource, TranslucentSort, ViewParams, VoxelRenderer, block_outline_edges,
-    light_curve, load_block_textures, texture_tick,
+    BlockOutline, ChunkOp, DistanceFog, FLUID_TIME_PERIOD, Outline, RenderSettings, RendererConfig,
+    Resync, SceneLight, TextureSource, TranslucentSort, ViewParams, VoxelRenderer,
+    block_outline_edges, light_curve, load_block_textures, texture_tick,
 };
 use boxel::voxel::{BlockRegistry, MAX_BLOCK_COORD};
 use boxel::world::lod::{LodOps, LodStats, LodWorldPlugin};
@@ -952,9 +952,9 @@ fn run(
         &gpu.queue,
         gpu.tier,
         &RendererConfig {
-            chunk_memory: o.world.chunk_memory(),
             // the shot is the first frame: sorted in it
             translucent_sort: TranslucentSort::Inline,
+            ..RendererConfig::default()
         },
         &textures,
         gpu.output_format,
@@ -966,14 +966,19 @@ fn run(
     // The model boxes of slabs, stairs, fences and torches (ADR 0020).
     let content = app.world().resource::<WorldContent>();
     renderer.set_model_boxes(&gpu.queue, content.materials.model_boxes());
-    for (id, key, mesh) in map.ready_meshes() {
-        renderer
-            .upsert_chunk(
-                id.to_bits(),
-                key.pos.origin().as_i64vec3(),
-                Arc::clone(mesh),
-            )
-            .map_err(|e| gpu_err(format!("upload {:?}: {e}", key.pos)))?;
+    // As the render plugin's first frame does: room for every mesh first (chunk memory grows
+    // past its floor, ADR 0035), then the uploads.
+    let ops = map.ready_meshes().map(|(id, key, mesh)| ChunkOp::Upsert {
+        id: id.to_bits(),
+        origin: key.pos.origin().as_i64vec3(),
+        mesh: Arc::clone(mesh),
+    });
+    if let Some(e) = renderer
+        .apply_ops(&gpu.device, ops, Resync::Chunks)
+        .into_iter()
+        .next()
+    {
+        return Err(gpu_err(format!("upload: {e}")));
     }
     // `--outline`: what the render plugin hands the renderer for a `BlockOutline` there.
     if let Some(block) = o.outline {

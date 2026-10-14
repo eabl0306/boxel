@@ -2082,7 +2082,6 @@ fn main() -> AppExit {
                 // Only `--frames` sets it. `--minimize-test` alone keeps the interactive path on
                 // purpose: nothing is rendered while hidden, as in a normal run.
                 render_when_hidden: options.frames.is_some(),
-                chunk_memory: options.world.chunk_memory(),
                 textures: options.textures.clone(),
                 distance_fog: if options.distance_fog {
                     DistanceFog::default()
@@ -2391,7 +2390,6 @@ mod tests {
         );
         let o = parse(&["--world", "overworld", "--caves", "off"]);
         assert_eq!(o.world.label(), "overworld/off");
-        assert_eq!(o.world.render_capacity(), (24 << 20, 65_536));
         assert_eq!(parse(&["--no-trees"]).world.label(), "terrain");
         for args in [
             &["--world", "overworld", "--fixed-height"][..],

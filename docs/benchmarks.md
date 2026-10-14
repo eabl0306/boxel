@@ -119,6 +119,11 @@ just perf-bisect rtx/surface/r16/uncapped perf-control-3 main --metric catch_up
 `--fps-min` y `--p99-max` solo cambian la regla del smoke, así que el bisect con `--metric` los
 rechaza. El bisect muestra los números de cada corrida.
 
+Cada caso arranca con la memoria de chunks del binario y crece (ADR 0035). Un binario de antes
+de que creciera (sin `--chunk-memory` en su `--help`) perdía chunks del overworld en radio 32 con
+su arena fijo, así que ahí recibe uno de 48 Mi quads y 98 304 slots. Por eso el bisect sirve
+también entre commits de antes y después de #57.
+
 Sin tope, a veces la RTX pasa una corrida entera, o un tramo largo, un 12 % más lenta al mismo
 reloj y con menos potencia, con cualquier binario
 ([rendimiento/sin-tope-lento-2026-10.md](rendimiento/sin-tope-lento-2026-10.md)). Una corrida así
@@ -211,10 +216,11 @@ viejas, que no tienen radio vertical.
 El mundo se elige con `--world`: `forest` (por defecto, el de todas las corridas anteriores),
 `terrain`, `flat` u `overworld` (piedra infinita hacia abajo con cuevas). Con el overworld,
 `--caves mc|closed|off` elige las cuevas: `mc` tiene entradas desde la superficie y `closed` no
-deja ver ninguna cueva desde arriba. El overworld no acepta `--fixed-height` (no tiene piso) y usa
-un arena de 24 Mi quads y 65 536 slots; `--arena-quads N` y `--chunk-slots N` los cambian (son el
-piso de páginas y la tabla inicial, ADR 0035). El resumen anota el mundo y la memoria con la que
-arranca el renderer, y `tools/bench_report.py` solo compara corridas del mismo mundo.
+deja ver ninguna cueva desde arriba. El overworld no acepta `--fixed-height` (no tiene piso). Todos
+los mundos arrancan con la memoria de chunks por defecto del motor (8 Mi quads y 32 768 slots) y
+crecen; `--arena-quads N` y `--chunk-slots N` cambian el piso de páginas y la tabla inicial
+(ADR 0035). El resumen anota el mundo y la memoria con la que arranca el renderer, y
+`tools/bench_report.py` solo compara corridas del mismo mundo.
 
 La memoria de chunks crece y encoge sola (ADR 0035). `--chunk-memory fixed` la deja fija en lo que
 arranca, `--max-chunk-quads N` le pone techo y `--radius-steps 8,32@1,8@20` asienta el mundo con
@@ -224,15 +230,16 @@ la creación más lenta, las páginas hechas dentro de un frame (y cuántas desp
 segundo de cada paso, que deberían ser cero), el pico de bytes y lo más que movió un frame. El JSON
 del resumen trae lo mismo en `chunk_memory`.
 
-El caso `grow` de `tools/perf` es la cueva quieta con `--radius-steps 8,32@1`. Para comparar una
-memoria fija contra una que crece desde el piso por defecto, con el mismo binario:
-`just perf-smoke --base HEAD "--new-extra='--chunk-memory grow --arena-quads 8388608 --chunk-slots 32768'" rtx/grow/r32 780m/grow/r32 -- --chunk-memory fixed`.
-En ese caso el lado nuevo puede repetir `--arena-quads` y `--chunk-slots` (gana el último).
+El caso `grow` de `tools/perf` es la cueva quieta con `--radius-steps 8,32@1`. Como todos los
+casos, arranca del piso por defecto. Para compararlo con una memoria fija y grande, con el mismo
+binario:
+`just perf-smoke --base HEAD "--new-extra='--chunk-memory grow --arena-quads 8388608 --chunk-slots 32768'" rtx/grow/r32 780m/grow/r32 -- --chunk-memory fixed --arena-quads 50331648 --chunk-slots 98304`.
+El lado nuevo repite las opciones y gana el último.
 
 La vuelta al piso no entra en el smoke (el caso `grow` ya fija `--radius-steps`). Se mira con
-`just bench-static`, los argumentos de la cueva quieta, los de la GPU y
-`--radius-steps 8,32@1,8@20 --chunk-memory grow --arena-quads 8388608 --chunk-slots 32768`. Encoger
-suelta una página cada 5 s como mucho, así que hace falta `--duration 80` para verlo terminar.
+`just bench-static`, los argumentos de la cueva quieta, los de la GPU y `--radius-steps 8,32@1,8@20`.
+Encoger suelta una página cada 5 s como mucho, así que hace falta `--duration 80` para verlo
+terminar.
 
 Cambiar de mundo (ADR 0034) se mira con `just bench-switch`, los argumentos de la superficie y los
 de la GPU, `--duration 210` para diez cambios. Por cada cambio imprime el frame del cierre, los

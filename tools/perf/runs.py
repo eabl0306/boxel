@@ -41,6 +41,8 @@ CAVE_FLAG = r'^\s*--cave\s'
 PATH_SCENARIO = r'--scenario \S*\bpath\b'
 RADIUS_STEPS = r'^\s*--radius-steps\s'
 SWITCH_SCENARIO = r'--scenario \S*\bswitch\b'
+# A binary whose --help has this grows chunk memory (ADR 0035); older ones had a fixed arena.
+GROWS = r'^\s*--chunk-memory\s'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -65,11 +67,9 @@ SCENARIOS = {
     'cave-static': Scenario('static', (*OVERWORLD, '--cave', *CAVE_CAMERA),
                             'cueva abierta, quieta', (CAVE_FLAG,)),
     # Chunk memory growing (ADR 0035): settled at radius 8, radius 32 one second into the
-    # measurement. A side that grows from the default floor says so with its own
-    # --arena-quads and --chunk-slots (they override the big arena of radius 32).
+    # measurement, from the default floor like every case.
     'grow': Scenario('static', (*OVERWORLD, '--cave', *CAVE_CAMERA, '--radius-steps', '8,32@1'),
-                     'cueva abierta, radio 8 a 32 al segundo', (CAVE_FLAG, RADIUS_STEPS),
-                     ('--arena-quads', '--chunk-slots')),
+                     'cueva abierta, radio 8 a 32 al segundo', (CAVE_FLAG, RADIUS_STEPS)),
     # Worlds closed and opened while the app runs (ADR 0034): the surface flight, and every 4 s
     # the world closes and the other of two seeds opens. A long run (the stress default is every
     # 20 s) says so with its own --switch-every.
@@ -78,9 +78,13 @@ SCENARIOS = {
                        ('--switch-every',)),
 }
 
-# Over this radius the overworld needs a bigger renderer arena and chunk table.
+# Over this radius runs take longer to settle. Every case starts from the binary's own chunk
+# memory and grows (ADR 0035), but a binary from before growth (no GROWS in its --help) dropped
+# chunks of the overworld over this radius with its fixed arena: it gets FIXED_ARENA, so
+# perf-bisect still measures across that change (an explicit --arena-quads or --chunk-slots in
+# the extra options comes after it and wins).
 BIG_RADIUS = 16
-BIG_ARENA = ['--arena-quads', '50331648', '--chunk-slots', '98304']
+FIXED_ARENA = ['--arena-quads', '50331648', '--chunk-slots', '98304']
 # A second under this fps (or with fewer frames shown) is the compositor's 30 fps throttle. With a
 # lower cap the limits are this share of the cap, and caps under MIN_CAP would hide the throttle.
 THROTTLE_FPS = 100
@@ -129,15 +133,16 @@ class Case:
         text += f", {' '.join(self.extra)}" if self.extra else ''
         return text + (f", solo el nuevo: {' '.join(self.new_extra)}" if self.new_extra else '')
 
-    def args(self, duration, side='base'):
-        """The stress arguments of a run; the new side also gets `new_extra`."""
+    def args(self, duration, side='base', fixed_arena=False):
+        """The stress arguments of a run; the new side also gets `new_extra`. `fixed_arena`: the
+        binary cannot grow chunk memory (`grows`)."""
         s = SCENARIOS[self.scenario]
         big = self.radius > BIG_RADIUS
         args = ['--scenario', s.stress, *s.args, *GPUS[self.gpu], '--radius', str(self.radius),
                 '--fps-limit', str(self.cap), '--duration', f'{duration:g}',
                 '--timeout', str(int(duration) + (240 if big else 150))]
-        if big and '--world' in s.args:
-            args += BIG_ARENA
+        if fixed_arena and big and '--world' in s.args:
+            args += FIXED_ARENA
         return args + list(self.extra) + (list(self.new_extra) if side == 'new' else [])
 
 
@@ -177,11 +182,8 @@ def parse_case(text, default=Case()):
 _help = {}
 
 
-def supports(binary, case):
-    """True if `binary` knows the flags and the scenario of `case` (from its --help)."""
-    needs = SCENARIOS[case.scenario].needs
-    if not needs:
-        return True
+def help_text(binary):
+    """The --help of `binary` (empty if it does not run), read once."""
     if binary not in _help:
         try:
             done = subprocess.run([binary, '--help'], capture_output=True, text=True,
@@ -189,7 +191,20 @@ def supports(binary, case):
             _help[binary] = done.stdout + done.stderr
         except (OSError, subprocess.TimeoutExpired):
             _help[binary] = ''
-    return all(re.search(need, _help[binary], re.M) for need in needs)
+    return _help[binary]
+
+
+def supports(binary, case):
+    """True if `binary` knows the flags and the scenario of `case` (from its --help)."""
+    needs = SCENARIOS[case.scenario].needs
+    if not needs:
+        return True
+    return all(re.search(need, help_text(binary), re.M) for need in needs)
+
+
+def grows(binary):
+    """True if `binary` grows chunk memory (ADR 0035, from its --help)."""
+    return re.search(GROWS, help_text(binary), re.M) is not None
 
 
 # ---------------------------------------------------------------------------------------------
@@ -453,8 +468,8 @@ def run_once(binary, case, prefix, label, duration, nvidia=False, side='base'):
     """One run of `binary` on `case`, watched (`side` 'new' adds the case's new_extra). Writes
     PREFIX.{md,csv,log,watch.json} (and .nv.csv). Returns (rc, watch, measure start, nvidia
     samples)."""
-    args = [binary, *case.args(duration, side), '--label', label, '--csv', prefix + '.csv',
-            '--summary', prefix + '.md']
+    args = [binary, *case.args(duration, side, fixed_arena=not grows(binary)), '--label', label,
+            '--csv', prefix + '.csv', '--summary', prefix + '.md']
     sampler = NvidiaSampler().start() if nvidia else None
     measure_at = None
     with open(prefix + '.log', 'w') as log:

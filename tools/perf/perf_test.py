@@ -286,28 +286,42 @@ class CaseTest(unittest.TestCase):
                             ('--duration', '10'), ('--timeout', '160')):
             self.assertEqual(args[args.index(flag) + 1], value)
         self.assertNotIn('--arena-quads', args)
+        # every case starts from the binary's own chunk memory and grows (ADR 0035)
         big = Case('rtx', 'surface', 32, 0).args(20)
-        self.assertEqual(big[big.index('--arena-quads') + 1], '50331648')
+        self.assertNotIn('--arena-quads', big)
+        self.assertNotIn('--chunk-slots', big)
         self.assertEqual(big[big.index('--timeout') + 1], '260')
-        self.assertNotIn('--arena-quads', Case('rtx', 'forest', 32, 0).args(20))
         boost = runs.parse_case('rtx/boost/r16/144').args(10)
         self.assertEqual(boost[:2], ['--scenario', 'fly'])
         self.assertEqual(boost[boost.index('--speed') + 1], '100')
         self.assertNotIn('--world', boost, 'the forest, like the forest case')
 
-    def test_the_grow_case_steps_the_radius_and_lets_a_side_start_small(self):
-        floor = ('--chunk-memory', 'grow', '--arena-quads', '8388608', '--chunk-slots', '32768')
+    def test_a_binary_with_a_fixed_arena_gets_the_big_one_over_radius_16(self):
+        """Binaries from before chunk memory grew (perf-bisect across #57) dropped chunks of
+        the overworld over radius 16 with their own arena."""
+        fixed = Case('rtx', 'surface', 32, 0).args(20, fixed_arena=True)
+        self.assertEqual(fixed[fixed.index('--arena-quads') + 1], '50331648')
+        self.assertEqual(fixed[fixed.index('--chunk-slots') + 1], '98304')
+        for small in (Case('rtx', 'forest', 32, 0), Case('rtx', 'surface', 16, 0)):
+            self.assertNotIn('--arena-quads', small.args(20, fixed_arena=True))
+        # an explicit arena comes after it: stress keeps the last value
+        own = runs.parse_case('rtx/cave-path/r32', Case(extra=('--arena-quads', '25165824')))
+        args = own.args(20, fixed_arena=True)
+        self.assertEqual(args[-2:], ['--arena-quads', '25165824'])
+        self.assertLess(args.index('--arena-quads'), len(args) - 2)
+
+    def test_the_grow_case_steps_the_radius_from_the_floor(self):
         case = runs.parse_case('rtx/grow/r32', Case(extra=('--chunk-memory', 'fixed'),
-                                                    new_extra=floor))
+                                                    new_extra=('--chunk-memory', 'grow')))
         base, new = case.args(20), case.args(20, 'new')
         self.assertEqual(base[base.index('--radius-steps') + 1], '8,32@1')
-        self.assertEqual(base[base.index('--arena-quads') + 1], '50331648')
+        self.assertNotIn('--arena-quads', base)
         # the new side's own flags come last: stress keeps them
-        self.assertEqual(new[-len(floor):], list(floor))
-        self.assertLess(new.index('--chunk-memory'), len(new) - len(floor))
-        # other cases still refuse what they set
-        with self.assertRaises(ValueError):
-            runs.parse_case('rtx/cave-static/r32', Case(new_extra=('--arena-quads', '1')))
+        self.assertEqual(new[-2:], ['--chunk-memory', 'grow'])
+        self.assertLess(new.index('--chunk-memory'), len(new) - 2)
+        # no case sets the arena any more, so any case takes it as an option
+        big = runs.parse_case('rtx/cave-static/r32', Case(new_extra=('--arena-quads', '1')))
+        self.assertEqual(big.args(20, 'new')[-2:], ['--arena-quads', '1'])
 
     def test_supports_reads_the_help(self):
         with tempfile.TemporaryDirectory() as d:
@@ -327,6 +341,10 @@ class CaseTest(unittest.TestCase):
             switch = fake_binary(d, 'switch', HELP.replace('path]', 'path|switch]'))
             self.assertTrue(runs.supports(switch, Case(scenario='switch')))
             self.assertTrue(runs.supports(switch, Case(scenario='cave-path')))
+            # chunk memory grows from the binary that has --chunk-memory on
+            self.assertFalse(runs.grows(new))
+            grows = fake_binary(d, 'grows', HELP + '  --chunk-memory fixed|grow  grows\n')
+            self.assertTrue(runs.grows(grows))
 
     def test_the_switch_case_flies_the_surface_and_changes_worlds(self):
         case = runs.parse_case('780m/switch/r16')
@@ -735,6 +753,17 @@ class SmokeRunTest(FakeMachine):
         self.assertEqual(r.status, 'unmeasured')
         self.assertTrue(r.gave_up)
         self.assertEqual(calls(base.path) + calls(new.path), 0)
+
+    def test_a_base_with_a_fixed_arena_runs_radius_32_with_the_big_one(self):
+        """perf-bisect across #57: the old binary gets the arena it needs, the new one grows."""
+        old = self.binary('old')
+        new = self.binary('new', help_text=HELP + '  --chunk-memory fixed|grow  grows\n')
+        r = self.smoke(old, new, Case('rtx', 'surface', 32, 144))
+        self.assertEqual(r.status, 'ok', self.output())
+        with open(old.path + '.args') as f:
+            self.assertIn('--arena-quads 50331648 --chunk-slots 98304', f.read())
+        with open(new.path + '.args') as f:
+            self.assertNotIn('--arena-quads', f.read())
 
     def test_scenarios_the_base_or_the_new_binary_lack(self):
         cave = Case(scenario='cave-path')

@@ -119,14 +119,6 @@ impl Default for WorldChoice {
     }
 }
 
-/// Default chunk memory floor of the renderer (`ChunkMemorySettings::initial_quads`).
-const ARENA_QUADS: u32 = 8 << 20;
-/// Default chunk table size of the renderer (`ChunkMemorySettings::initial_slots`).
-const CHUNK_SLOTS: u32 = 32_768;
-/// The overworld's: caves mesh far more chunks, with more quads each.
-const OVERWORLD_ARENA_QUADS: u32 = 24 << 20;
-const OVERWORLD_CHUNK_SLOTS: u32 = 65_536;
-
 impl WorldChoice {
     /// `world` with trees and its default caves.
     pub fn with_world(world: World) -> Self {
@@ -267,34 +259,6 @@ impl WorldChoice {
         }
         Some(OverworldGenerator::new(seed, settings))
     }
-
-    /// Default `(quads, chunk slots)` the renderer starts with for this world: the engine
-    /// defaults (8 Mi quads, 32 768 slots), and 24 Mi quads (192 MiB) and 65 536 slots for the
-    /// overworld.
-    pub fn render_capacity(self) -> (u32, u32) {
-        if self.world == World::Overworld {
-            (OVERWORLD_ARENA_QUADS, OVERWORLD_CHUNK_SLOTS)
-        } else {
-            (ARENA_QUADS, CHUNK_SLOTS)
-        }
-    }
-
-    /// The renderer's chunk memory for this world: [`WorldChoice::render_capacity`] as the
-    /// floor and the initial table, the rest the engine's defaults.
-    #[cfg(feature = "render")]
-    pub fn chunk_memory(self) -> boxel::render::ChunkMemorySettings {
-        chunk_memory(self.render_capacity())
-    }
-}
-
-/// Chunk memory starting at `(quads, chunk slots)`, the rest the engine's defaults.
-#[cfg(feature = "render")]
-pub fn chunk_memory((quads, slots): (u32, u32)) -> boxel::render::ChunkMemorySettings {
-    boxel::render::ChunkMemorySettings {
-        initial_quads: quads,
-        initial_slots: slots,
-        ..boxel::render::ChunkMemorySettings::default()
-    }
 }
 
 #[cfg(test)]
@@ -335,7 +299,6 @@ mod tests {
             (o.cave_mode(), o.label().as_str()),
             (Some(CaveMode::Mc), "overworld/mc")
         );
-        assert_eq!(o.render_capacity(), (24 << 20, 65_536));
         assert_eq!(*o.generator(1).vertical_chunks().start(), i64::MIN);
         let closed =
             parse(&["--world", "overworld", "--caves", "closed", "--no-trees"]).expect("valid");
@@ -361,10 +324,6 @@ mod tests {
             assert_eq!(World::parse(world.name()), Some(world));
             assert!(c.generator(5).vertical_chunks().start() > &i64::MIN || c.unbounded());
         }
-        assert_eq!(
-            WorldChoice::with_world(World::Flat).render_capacity(),
-            (8 << 20, 32_768)
-        );
     }
 
     #[test]

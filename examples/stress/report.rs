@@ -171,7 +171,7 @@ pub struct RunInfo {
     /// culling).
     pub cave_culling: String,
     /// Chunk memory (quads) and chunk table (slots) the renderer starts with (`--arena-quads`,
-    /// `--chunk-slots` or the world's default; ADR 0035: it grows from there, see
+    /// `--chunk-slots` or the engine's default; ADR 0035: it grows from there, see
     /// `chunk_memory`).
     pub arena_quads: u32,
     /// See `arena_quads`.

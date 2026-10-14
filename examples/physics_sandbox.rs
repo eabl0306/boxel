@@ -920,7 +920,6 @@ fn main() -> AppExit {
                 gpu,
                 gpu_config,
                 render_when_hidden: options.automation(),
-                chunk_memory: options.world.chunk_memory(),
                 ..RenderSettings::default()
             },
         })
