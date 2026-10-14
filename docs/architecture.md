@@ -2,7 +2,7 @@
 
 Documento técnico de referencia. Fecha: 2026-10-05. Estado: aprobado para el milestone M0
 (revisión final, después de tres revisiones adversariales del borrador v1).
-Las decisiones puntuales están en `docs/adr/` (0001 a 0035). Durante M0 hubo además una
+Las decisiones puntuales están en `docs/adr/` (0001 a 0036). Durante M0 hubo además una
 especificación para los agentes implementadores (en inglés, en `.scaffold/`), borrada al cerrar M0;
 este documento queda como referencia.
 
@@ -634,8 +634,9 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   material del mesher queda libre. Tablas SoA por estado: nombre, capa de dibujo (`None`,
   `Opaque`, `Cutout`, `Translucent`), modelo (`Cube { axis }`, `Slab`, `Cross`, ADR 0018;
   `Stairs`, `Fence`, `Torch`, `WallTorch`, ADR 0020, hechos de cajas en dieciseisavos),
-  colisión (`None`, `Full` o cajas), flags, emisión RGB, opacidad de luz (15 en los cubos opacos,
-  1 en hojas, agua y losas, 0 en vidrio y plantas), texturas por cara. Solo un cubo `Opaque`
+  colisión (`None`, `Full` o cajas), flags, emisión RGB, brillo pleno por estado (ADR 0036),
+  opacidad de luz (15 en los cubos opacos, 1 en hojas, agua y losas, 0 en vidrio y plantas),
+  texturas por cara. Solo un cubo `Opaque`
   tapa caras vecinas (`BlockRegistry::occludes`). Contenido congelado: aire,
   piedra, tierra, pasto, arena, grava, nieve, bedrock, tronco, hojas (cutout), agua (translúcida,
   `boxel:water[level=0..15]` desde ADR 0021),
@@ -855,7 +856,7 @@ un `Mesher` thread-local (~0.6 MiB de scratch) y un `LightScratch` (~0.7 MiB).
 **`PackedQuad` (8 bytes):**
 
 ```
-geo: x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | flags:4 (bit 0 emisivo, bits 1 a 3 forma)
+geo: x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | flags:4 (bit 0 brillo pleno, bits 1 a 3 forma)
 mat: capa:12 | ao:8 (2 bits por esquina, 3 = abierto) | luz:12 (índice en la paleta del chunk)
 forma 7 (agua inclinada, w = h = 1): los bits de w-1 y h-1 llevan las alturas de las esquinas 0 y 1
   y el byte de AO las de las esquinas 2 y 3 (4 bits cada una, en dieciseisavos menos 1); el bit
