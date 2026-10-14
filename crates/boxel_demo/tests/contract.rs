@@ -106,6 +106,22 @@ fn decode_matches_get_for_hand_built_packed() {
     }
 }
 
+/// The demo draws exactly its emitters full bright (ADR 0036), the look every emitter had before
+/// the flag (ADR 0015 sec. 12): its lamps and torches are marked, and lava glows because it
+/// emits.
+#[test]
+fn the_demo_draws_exactly_its_emitters_full_bright() {
+    let r = boxel_demo::blocks::registry();
+    let mut glowing = 0;
+    for s in (0..r.len() as u16).map(BlockState) {
+        let name = r.state_name(s);
+        assert_eq!(r.is_full_bright(s), !r.emission(s).is_dark(), "{name}");
+        glowing += usize::from(r.is_full_bright(s));
+    }
+    // 4 lamps, 16 lava levels, the torch and 4 wall torches.
+    assert_eq!(glowing, 4 + 16 + 1 + 4);
+}
+
 #[test]
 fn default_registry_ids_shapes_and_faces_are_frozen() {
     use boxel_voxel::{BlockState, Face, RenderShape};

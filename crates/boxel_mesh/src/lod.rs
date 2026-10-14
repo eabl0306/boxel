@@ -51,13 +51,15 @@ const PLANES: [i32; 3] = [0, 16, 32];
 /// LOD meshes) and the LOD [`MaterialTable`].
 ///
 /// The canonical state of a state is the lowest state id with the same [`LodClass`], the same 6
-/// face texture layers, the same emissive flag and the same see-through flag, so look-alike
-/// variants (the levels of a fluid, a slab and its full block, a waterlogged state) merge into
-/// one greedy quad. Fluid states first become their source. Empty states have material 0. In the
-/// table every canonical state is a cube (`SHAPE_CUBE`) with its state's face layers and emissive
-/// flag: an opaque one (`RenderShape::Opaque`), but for a fluid whose source is translucent (water,
-/// ADR 0025), which is see-through at a distance too (`RenderShape::Translucent`: its faces go
-/// into the translucent bucket). No fluid, box or cross shape reaches a LOD mesh.
+/// face texture layers, the same full-bright flag (`BlockRegistry::is_full_bright`) and the same
+/// see-through flag, so look-alike variants (the levels of a fluid, a slab and its full block, a
+/// waterlogged state) merge into one greedy quad, and a lit emitter shares the id of a plain
+/// block that looks the same. Fluid states first become their source. Empty states have material
+/// 0. In the table every canonical state is a cube (`SHAPE_CUBE`) with its state's face layers
+/// and full-bright flag (`MaterialTable::emissive`): an opaque one (`RenderShape::Opaque`), but
+/// for a fluid whose source is translucent (water, ADR 0025), which is see-through at a
+/// distance too (`RenderShape::Translucent`: its faces go into the translucent bucket). No
+/// fluid, box or cross shape reaches a LOD mesh.
 #[derive(Clone, Debug)]
 pub struct LodMaterials {
     classes: LodClasses,
@@ -93,7 +95,7 @@ impl LodMaterials {
                 LodClass::Fluid => classes.fluid(s).unwrap_or(s),
             };
             let faces = Face::ALL.map(|f| registry.face_texture(looks, f).0);
-            let glows = !registry.emission(looks).is_dark();
+            let glows = registry.is_full_bright(looks);
             let clear =
                 class == LodClass::Fluid && registry.shape(looks) == RenderShape::Translucent;
             let key = (class, faces, glows, clear);
@@ -744,7 +746,7 @@ fn face_grid(
 
 /// Greedy rectangles of equal face key in `grid` (0 = none), never across an octant border
 /// (cell 16 of u or v), as quads of `face` at normal coordinate `n` marked `seam`, with their
-/// material's layer and emissive flag and their key's darkness, each with its bucket (by its
+/// material's layer and full-bright flag and their key's darkness, each with its bucket (by its
 /// material and face: a see-through fluid's is the translucent one).
 fn merge_grid(
     grid: &[[u32; 32]; 32],

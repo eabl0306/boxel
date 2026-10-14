@@ -30,6 +30,9 @@
 //! `in_wall`, `open`; default 581, facing north, closed; Opaque, light opacity 0; no collision
 //! when open).
 //!
+//! Every emitter is drawn full bright (ADR 0036): the lamps and torches are marked, and lava
+//! glows because it emits.
+//!
 //! The texture layers, in this order: 0 stone to 20 poppy (stone, dirt, grass top, grass side,
 //! sand, gravel, snow, bedrock, log side, log top, leaves, water, planks, the 4 lamps, lava,
 //! glass, short grass, poppy), 21 torch, 22 cobblestone, 23 obsidian, 24 `water_flow` and 25
@@ -351,13 +354,14 @@ pub fn builder() -> BlockRegistryBuilder {
     .expect("demo water");
     b.add_block(block("planks", opaque, true, all(t.planks)))
         .expect("demo planks");
-    // The first emitters (ADR 0015): full-cube colored lamps.
+    // The first emitters (ADR 0015): full-cube colored lamps, drawn full bright (ADR 0036).
     for (lamp, texture) in LAMPS.iter().zip(t.lamps) {
         let def = BlockDef {
             emission: lamp.emission,
             ..block(lamp.short_name(), opaque, true, all(texture))
         };
         b.add_block(def).expect("demo emitter");
+        full_bright(&mut b, lamp.name);
     }
     // Lava flows like water with its own rules (ADR 0025) and the same `level` property. It
     // glows, is drawn opaque (Minecraft's solid layer) but hides no neighbor face, lets
@@ -612,6 +616,7 @@ fn add_shapes(b: &mut BlockRegistryBuilder, t: &Layers) {
     );
     b.add_block(torch_def("torch", BlockModel::Boxes(torch)))
         .expect("demo torch");
+    full_bright(b, "boxel:torch");
     let wall_torches = Facing::ALL.map(|facing| {
         let model = BoxModel {
             boxes: vec![shapes::wall_torch_box(facing)],
@@ -627,6 +632,14 @@ fn add_shapes(b: &mut BlockRegistryBuilder, t: &Layers) {
         },
     )
     .expect("demo wall torch");
+    full_bright(b, "boxel:wall_torch");
+}
+
+/// Draws every state of the block `name` full bright (ADR 0036): the demo's lamps and torches,
+/// so they glow as every emitter did before. Lava needs no call: a fluid glows when it emits.
+fn full_bright(b: &mut BlockRegistryBuilder, name: &str) {
+    let block = b.block_by_name(name).expect(name);
+    b.set_full_bright(block, |_| true).expect(name);
 }
 
 /// The blocks lava makes when it meets water (ADR 0025), after the torches: cobblestone and

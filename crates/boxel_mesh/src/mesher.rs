@@ -47,8 +47,8 @@ impl MeshOptions {
 }
 
 /// Mesher-side view of the registry: per material id, bgm class, render shape (bucket routing),
-/// model, the texture layer and shape code of each face and whether it emits light. Built once
-/// per registry and shared (`Arc`) by mesh jobs.
+/// model, the texture layer and shape code of each face and whether it is drawn full bright
+/// (`BlockRegistry::is_full_bright`). Built once per registry and shared (`Arc`) by mesh jobs.
 #[derive(Clone, Debug, Default)]
 pub struct MaterialTable {
     class: Vec<VoxelClass>,
@@ -267,7 +267,7 @@ impl MaterialTable {
             }
             table.shape[m] = registry.shape(s);
             table.layers[m] = Face::ALL.map(|f| registry.face_texture(s, f).0);
-            table.emissive[m] = !registry.emission(s).is_dark();
+            table.emissive[m] = registry.is_full_bright(s);
             table.set_model(m as u16, registry.model(s), registry.model_boxes(s));
             // Every level of a fluid meshes as its source (level 0).
             if registry.model(s) == BlockModel::Fluid
@@ -445,8 +445,8 @@ impl MaterialTable {
             .get(material as usize)
             .map_or(0, |l| l[face.index()])
     }
-    /// True if the material's block emits light: its quads get [`layout::FLAG_EMISSIVE`] (out of
-    /// range -> `false`).
+    /// True if the material is drawn full bright (`BlockRegistry::is_full_bright`): its quads
+    /// get [`layout::FLAG_EMISSIVE`] (out of range -> `false`).
     pub fn emissive(&self, material: u16) -> bool {
         self.emissive
             .get(material as usize)

@@ -6,7 +6,8 @@
 //!   `(y << 10) | (x << 5) | z` (z fastest), the same order as binary-greedy-meshing's padded
 //!   linearization.
 //! - [`registry`]: data-driven blocks; runtime `BlockState(u16)` is dense and never persisted raw.
-//!   Each state has an RGB emission and a light opacity (ADR 0015).
+//!   Each state has an RGB emission and a light opacity (ADR 0015), and the states a game marks
+//!   are drawn full bright (ADR 0036).
 //! - [`state`]: block state properties (ADR 0019): `game:log[axis=x]`, one dense id per
 //!   combination of values, contiguous per block.
 //! - [`shapes`]: the boxes of the models made of boxes (ADR 0020: slabs, and the [`BoxModel`]s a

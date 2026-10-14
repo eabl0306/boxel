@@ -368,6 +368,113 @@ fn emissive_blocks_flag_their_quads() {
     assert!(parts.emissive(OPAQUE[0]) && !parts.emissive(OPAQUE[1]));
 }
 
+/// The registry of [`common::glow_builder`] with the blocks `marked` drawn full bright, and its
+/// table.
+fn glow_registry(marked: &[&str]) -> (BlockRegistry, MaterialTable) {
+    let mut b = common::glow_builder();
+    for name in marked {
+        let block = b.block_by_name(name).expect(name);
+        b.set_full_bright(block, |_| true).expect(name);
+    }
+    let registry = b.build();
+    let table = MaterialTable::from_registry(&registry);
+    (registry, table)
+}
+
+#[test]
+fn the_emissive_flag_follows_full_bright() {
+    let mut b = common::glow_builder();
+    let ore = b.block_by_name("test:ember_ore").expect("test:ember_ore");
+    b.set_full_bright(ore, |v| v.get("lit") == Some("true"))
+        .expect("test:ember_ore");
+    let paint = b.block_by_name("test:paint").expect("test:paint");
+    b.set_full_bright(paint, |_| true).expect("test:paint");
+    let registry = b.build();
+    let table = MaterialTable::from_registry(&registry);
+    let mut glowing = 0;
+    for s in (0..registry.len() as u16).map(BlockState) {
+        let m = registry.material(s);
+        if m != 0 {
+            let name = registry.state_name(s);
+            assert_eq!(table.emissive(m), registry.is_full_bright(s), "{name}");
+            glowing += usize::from(table.emissive(m));
+        }
+    }
+    assert!(!table.emissive(0));
+    // test:lamp, the 16 levels of test:hot, the lit ore and the paint; not the unmarked
+    // emitters.
+    assert_eq!(glowing, 1 + 16 + 1 + 1);
+}
+
+#[test]
+fn a_lit_emitter_meshes_as_a_plain_block() {
+    let (plain, plain_table) = glow_registry(&[]);
+    let (marked, marked_table) =
+        glow_registry(&["test:ember", "test:ember_plant", "test:ember_post"]);
+    let by = |r: &BlockRegistry, name: &str| r.parse_state(name).expect(name);
+    let floor = by(&plain, "test:solid");
+    // A cave: no sky, the light falling off around the block; the floor under it gives AO.
+    let light = common::full_light(|x, y, z| {
+        let d = ((x - 8).abs() + (y - 1).abs() + (z - 8).abs()) as u8;
+        LightValue::new(0, 13u8.saturating_sub(d), 5u8.saturating_sub(d / 2), 0).0
+    });
+    let mesh = |table: &MaterialTable, s: BlockState| {
+        let center = chunk_repr(
+            &dense_from(|x, y, z| match (x, y, z) {
+                (_, 0, _) => floor.0,
+                (8, 1, 8) => s.0,
+                _ => 0,
+            }),
+            Repr::Packed,
+        );
+        let padded = gathered(&isolated(&center), table);
+        let mut out = ChunkMesh::default();
+        Mesher::new().mesh(&padded, Some(&light), table, OPTIONS, &mut out);
+        (padded, out)
+    };
+    let flag = layout::FLAG_EMISSIVE << layout::GEO_FLAGS_SHIFT;
+    for (looks, ember, special) in [
+        ("test:solid", "test:ember", None),
+        ("test:plant", "test:ember_plant", Some(layout::SHAPE_CROSS)),
+        ("test:post", "test:ember_post", Some(layout::SHAPE_BOX)),
+    ] {
+        let (_, like) = mesh(&plain_table, by(&plain, looks));
+        let (padded, unlit) = mesh(&plain_table, by(&plain, ember));
+        let (lit_padded, lit) = mesh(&marked_table, by(&marked, ember));
+        // Unmarked, the emitter is drawn as the block it looks like: the same quads and light.
+        assert_eq!(unlit.quads, like.quads, "{ember}");
+        assert_eq!(unlit.palette, like.palette, "{ember}");
+        assert_eq!(unlit.bucket_counts, like.bucket_counts, "{ember}");
+        assert!(unlit.quads.iter().all(|q| !q.is_emissive()), "{ember}");
+        // Marked, the same quads in the same order, its own with the flag bit and no other change.
+        assert_eq!(lit.palette, unlit.palette, "{ember}");
+        assert_eq!(lit.bucket_counts, unlit.bucket_counts, "{ember}");
+        assert_eq!(lit.quads.len(), unlit.quads.len(), "{ember}");
+        let mut flagged = 0;
+        for (a, b) in unlit.quads.iter().zip(&lit.quads) {
+            assert_eq!(a.mat, b.mat, "{ember}");
+            assert!(
+                a.geo ^ b.geo == 0 || a.geo ^ b.geo == flag,
+                "{ember}: {a:?} {b:?}"
+            );
+            flagged += usize::from(b.is_emissive());
+        }
+        match special {
+            None => {
+                verify_mesh(&padded, &plain_table, &unlit);
+                verify_mesh(&lit_padded, &marked_table, &lit);
+                assert_eq!(flagged, 5, "{ember}: the floor hides one face");
+            }
+            Some(shape) => {
+                for q in &lit.quads {
+                    assert_eq!(q.is_emissive(), q.shape() == shape, "{ember}: {q:?}");
+                }
+                assert!(flagged > 0, "{ember}");
+            }
+        }
+    }
+}
+
 #[test]
 fn gather_with_uniform_neighbors() {
     let table = test_table();

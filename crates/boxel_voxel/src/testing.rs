@@ -6,7 +6,7 @@
 //! |---|---|
 //! | `test:solid` | an opaque full cube |
 //! | `test:glass` | a translucent cube light passes |
-//! | `test:lamp` | an opaque cube that emits light |
+//! | `test:lamp` | an opaque cube that emits light, drawn full bright |
 //! | `test:slab` | a bottom slab, `waterlogged` |
 //! | `test:boxes` | two boxes (a post and a bar), `waterlogged` |
 //! | `test:plant` | a cross plant, cutout, no collision |
@@ -170,6 +170,8 @@ pub fn builder() -> BlockRegistryBuilder {
     .expect("test:cutout");
 
     let block = |b: &BlockRegistryBuilder, name: &str| b.block_by_name(name).expect(name);
+    b.set_full_bright(block(&b, "test:lamp"), |_| true)
+        .expect("test:lamp");
     let fluid = b
         .add_fluid(block(&b, "test:fluid"), FLUID)
         .expect("test:fluid");
@@ -225,6 +227,9 @@ mod tests {
             r.emission(by("test:lamp")),
             LightValue::new(0, red, green, blue)
         );
+        assert!(r.is_full_bright(by("test:lamp")));
+        assert!(r.is_full_bright(by("test:hot[level=3]")));
+        assert!(!r.is_full_bright(solid) && !r.is_full_bright(by("test:fluid")));
         let wet = by("test:slab[waterlogged=true]");
         assert!(r.flags(wet).contains(StateFlags::WATERLOGGED));
         let boxes = by("test:boxes[waterlogged=true]");

@@ -492,8 +492,8 @@ pub enum RegistryError {
     /// Texture id not registered.
     #[error("unknown texture id {0}")]
     UnknownTexture(u16),
-    /// Emission channel or light opacity above 15, or an `Opaque` cube whose light opacity is
-    /// not 15.
+    /// Emission channel or light opacity above 15, an `Opaque` cube whose light opacity is not
+    /// 15, or a fluid state marked full bright ([`BlockRegistryBuilder::set_full_bright`]).
     #[error("invalid light values of {0}")]
     InvalidLight(String),
     /// A collision or model box outside the cell or empty (`min < max <= 16` on every axis; a
@@ -568,6 +568,8 @@ pub struct BlockRegistryBuilder {
     box_model_ids: std::collections::HashMap<BoxModel, BoxModelId>,
     /// The blocks that stop movement where they do not collide (by [`BlockId`]).
     blocks_motion: Vec<bool>,
+    /// The states drawn full bright (by state id; missing at the end: not).
+    full_bright: Vec<bool>,
     /// The fluids, by [`FluidId`].
     fluids: Vec<FluidType>,
     /// The fluid the waterlogged states hold.
@@ -668,6 +670,41 @@ impl BlockRegistryBuilder {
             self.blocks_motion.resize(i + 1, false);
         }
         self.blocks_motion[i] = true;
+        Ok(())
+    }
+
+    /// Draws the states of `block` for which `states` is true at the full brightness of their
+    /// texture: no light, face shade or AO (Minecraft's emissive rendering, a `game:lamp` that
+    /// glows). Every other state is lit by the light around it, its own emission included (a
+    /// `game:ember_ore` that emits a little shows that light on its faces, not a glow). It
+    /// sets every state of `block`, so a later call replaces an earlier one. A state that emits
+    /// nothing may be marked: the flag is a look. A fluid cannot be marked: it is drawn full
+    /// bright exactly when it emits ([`BlockRegistry::is_full_bright`]).
+    ///
+    /// Fails with [`RegistryError::UnknownBlock`], or with [`RegistryError::InvalidLight`]
+    /// (nothing set) when a state it marks is a [`BlockModel::Fluid`].
+    pub fn set_full_bright(
+        &mut self,
+        block: BlockId,
+        states: impl Fn(&StateValues<'_>) -> bool,
+    ) -> Result<(), RegistryError> {
+        let info = &self.blocks[self.block_index(block)?];
+        let range = usize::from(info.first)..usize::from(info.first + info.count);
+        let marks: Vec<bool> = range
+            .clone()
+            .map(|s| states(&info.values(BlockState(s as u16))))
+            .collect();
+        if range
+            .clone()
+            .zip(&marks)
+            .any(|(s, &mark)| mark && self.states[s].model == BlockModel::Fluid)
+        {
+            return Err(RegistryError::InvalidLight(info.name.clone()));
+        }
+        if self.full_bright.len() < range.end {
+            self.full_bright.resize(range.end, false);
+        }
+        self.full_bright[range].copy_from_slice(&marks);
         Ok(())
     }
 
@@ -981,6 +1018,19 @@ impl BlockRegistryBuilder {
                 .map(|b| LightValue::from_rgb(b.emission))
                 .collect(),
             opacity: states.iter().map(|b| b.light_opacity).collect(),
+            // A fluid glows exactly when it emits: in the shaders the same quad bit also picks
+            // its flow speed and animation (ADR 0036).
+            full_bright: states
+                .iter()
+                .enumerate()
+                .map(|(i, b)| {
+                    if b.model == BlockModel::Fluid {
+                        b.emission != [0; 3]
+                    } else {
+                        self.full_bright.get(i).copied().unwrap_or(false)
+                    }
+                })
+                .collect(),
             faces: states.iter().map(|b| b.textures).collect(),
             textures: self.textures,
             box_models: self.box_models,
@@ -1038,6 +1088,8 @@ pub struct BlockRegistry {
     flags: Vec<StateFlags>,
     emission: Vec<LightValue>,
     opacity: Vec<u8>,
+    /// The states drawn full bright ([`BlockRegistry::is_full_bright`]).
+    full_bright: Vec<bool>,
     faces: Vec<FaceTextures>,
     textures: Vec<TextureSpec>,
     box_models: Vec<BoxModel>,
@@ -1254,6 +1306,13 @@ impl BlockRegistry {
     pub fn is_waterlogged(&self, s: BlockState) -> bool {
         self.flags(s).contains(StateFlags::WATERLOGGED)
     }
+    /// True if `s` is drawn at the full brightness of its texture, with no light, face shade or
+    /// AO ([`BlockRegistryBuilder::set_full_bright`]; a fluid: when it emits; out of range:
+    /// false). The mesher marks its quads with this; every other state is lit, its own
+    /// emission included.
+    pub fn is_full_bright(&self, s: BlockState) -> bool {
+        self.full_bright.get(s.0 as usize).copied().unwrap_or(false)
+    }
     /// True if `s` could hold water: its block has the [`WATERLOGGED`] property and it is not a
     /// full cube (a double slab holds none, as in Minecraft).
     pub fn can_be_waterlogged(&self, s: BlockState) -> bool {
@@ -1299,3 +1358,6 @@ impl BlockRegistry {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

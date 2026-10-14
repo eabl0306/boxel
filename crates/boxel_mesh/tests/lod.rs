@@ -1,6 +1,8 @@
 //! Far level of detail meshing (ADR 0031): the LOD material table and the post-passes (octant
 //! splits, the bed under water, skirts, walls), on `test:` blocks. `test:fluid` is see-through
 //! (translucent, like water), `test:hot` opaque (like lava).
+mod common;
+
 use boxel_mesh::lod::{
     LOD_PALETTE, LodMaterials, MAX_DARK, Seam, add_banks, add_fluid_walls, add_skirts,
     add_underwater, dark_of, fits, is_bank, mesh_node, octant_of, seam_counts, seam_of,
@@ -69,6 +71,33 @@ fn unit_faces(mesh: &ChunkMesh) -> BTreeSet<([u32; 3], Face, u16, usize)> {
         }
     }
     out
+}
+
+#[test]
+fn only_full_bright_states_glow_at_a_distance() {
+    let mut b = common::glow_builder();
+    let paint = b.block_by_name("test:paint").expect("test:paint");
+    b.set_full_bright(paint, |_| true).expect("test:paint");
+    let r = b.build();
+    let m = LodMaterials::from_registry(&r);
+    let t = m.table();
+    // An unmarked emitter looks like the plain block with its layers, also at a distance.
+    let solid = by(&r, "test:solid");
+    let ember = by(&r, "test:ember");
+    assert_eq!(m.canonical(ember), solid.0);
+    assert!(!t.emissive(m.canonical(ember)));
+    // A marked state glows, and does not merge with a plain look-alike.
+    let paint = by(&r, "test:paint");
+    assert_eq!(m.canonical(paint), paint.0);
+    assert!(t.emissive(paint.0));
+    let lamp = by(&r, "test:lamp");
+    assert!(t.emissive(m.canonical(lamp)));
+    for s in (0..r.len() as u16).map(BlockState) {
+        let c = m.canonical(s);
+        if c != 0 {
+            assert_eq!(t.emissive(c), r.is_full_bright(s), "{}", r.state_name(s));
+        }
+    }
 }
 
 #[test]

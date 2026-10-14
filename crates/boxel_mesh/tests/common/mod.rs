@@ -8,10 +8,56 @@ use boxel_mesh::{
     reference_visible_faces,
 };
 use boxel_voxel::{
-    BlockState, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, Face, LightValue, LocalPos, NEIGHBOR_OFFSETS,
-    Paletted, RenderShape,
+    BlockDef, BlockRegistryBuilder, BlockState, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, Face,
+    FaceTextures, LightValue, LocalPos, NEIGHBOR_OFFSETS, Paletted, Property, RenderShape, testing,
 };
 use std::collections::BTreeSet;
+
+/// The light of the unmarked emitters of [`glow_builder`]: weak and warm.
+pub const EMBER: [u8; 3] = [3, 1, 0];
+
+/// [`testing::builder`] plus blocks that look like test blocks, none of them full bright
+/// (ADR 0036): `test:ember` (`test:solid` emitting [`EMBER`]), `test:ember_ore` (the same,
+/// emitting only with `lit=true`), `test:ember_plant` (`test:plant` emitting), `test:post` and
+/// `test:ember_post` (the model of `test:boxes` without water, the second emitting) and
+/// `test:paint` (`test:solid` again, emitting nothing).
+pub fn glow_builder() -> BlockRegistryBuilder {
+    let base = testing::registry();
+    let like = |name: &str, new: &str, emission: [u8; 3]| {
+        let s = base.parse_state(name).expect(name);
+        BlockDef {
+            name: new.to_string(),
+            shape: base.shape(s),
+            model: base.model(s),
+            collision: base.collision(s).clone(),
+            emission,
+            light_opacity: base.light_opacity(s),
+            textures: FaceTextures::all(base.face_texture(s, Face::PosY)),
+        }
+    };
+    let mut b = testing::builder();
+    b.add_block(like("test:solid", "test:ember", EMBER))
+        .expect("test:ember");
+    b.add_block_with_states(
+        like("test:solid", "test:ember_ore", [0; 3]),
+        vec![Property::boolean("lit")],
+        |values, def| {
+            if values.get("lit") == Some("true") {
+                def.emission = EMBER;
+            }
+        },
+    )
+    .expect("test:ember_ore");
+    b.add_block(like("test:plant", "test:ember_plant", EMBER))
+        .expect("test:ember_plant");
+    b.add_block(like("test:boxes", "test:post", [0; 3]))
+        .expect("test:post");
+    b.add_block(like("test:boxes", "test:ember_post", EMBER))
+        .expect("test:ember_post");
+    b.add_block(like("test:solid", "test:paint", [0; 3]))
+        .expect("test:paint");
+    b
+}
 
 /// Materials of [`test_table`]: 0 air, 1..=3 opaque, 4..=5 cutout, 6..=7 translucent, 8 a
 /// non-air state without geometry. Ids above 8 are outside the table (also no geometry).

@@ -25,9 +25,10 @@ pub mod layout {
     pub const GEO_FACE_SHIFT: u32 = 25;
     /// Shift of the 4 flag bits.
     pub const GEO_FLAGS_SHIFT: u32 = 28;
-    /// Flag bit (of the 4 at [`GEO_FLAGS_SHIFT`]): the quad's block emits light, so the shader
-    /// draws it at the full brightness of its texture (no light, face shading or AO), the way
-    /// Minecraft draws glowing blocks. Set by the mesher from `MaterialTable::emissive`.
+    /// Flag bit (of the 4 at [`GEO_FLAGS_SHIFT`]): the quad's block is drawn full bright
+    /// (`BlockRegistry::is_full_bright`), so the shader draws it at the full brightness of its
+    /// texture (no light, face shading or AO), the way Minecraft draws glowing blocks. Set by
+    /// the mesher from `MaterialTable::emissive`.
     pub const FLAG_EMISSIVE: u32 = 1;
     /// Shift of the 3-bit shape code (flag bits 1 to 3, ADR 0018): how the shader turns the
     /// quad's cell and face into geometry. [`SHAPE_CROSS`] and [`SHAPE_BOX`] come from the

@@ -1010,3 +1010,130 @@ fn far_worlds_mesh_like_the_origin() {
     assert_ne!(near_edited, near_first);
     assert!(assert_matches_reference(&app) > 20);
 }
+
+/// The light of `test:ember`: an opaque cube, not drawn full bright (ADR 0036).
+const EMBER: [u8; 3] = [9, 4, 0];
+
+/// `boxel_voxel::testing` plus `test:ember`, `test:solid` emitting [`EMBER`]; drawn full bright
+/// when `marked`.
+fn ember_registry(marked: bool) -> Arc<BlockRegistry> {
+    let base = boxel_voxel::testing::registry();
+    let solid = base.by_name("test:solid").expect("test:solid");
+    let mut b = boxel_voxel::testing::builder();
+    b.add_block(BlockDef {
+        name: "test:ember".to_string(),
+        shape: RenderShape::Opaque,
+        model: BlockModel::CUBE,
+        collision: BlockCollision::Full,
+        emission: EMBER,
+        light_opacity: 15,
+        textures: FaceTextures::all(base.face_texture(solid, boxel_voxel::Face::PosY)),
+    })
+    .expect("test:ember");
+    if marked {
+        let ember = b.block_by_name("test:ember").expect("test:ember");
+        b.set_full_bright(ember, |_| true).expect("test:ember");
+    }
+    Arc::new(b.build())
+}
+
+/// `test:solid` in the layers `chunk.y - 2..=chunk.y + 2`, but for a closed 3x3x3 air pocket in
+/// the middle of `chunk` with `test:ember` at its center.
+struct PocketGen {
+    chunk: ChunkPos,
+}
+
+/// The local position of the ember in its chunk.
+const POCKET: LocalPos = LocalPos::new(16, 16, 16);
+
+impl WorldGenerator for PocketGen {
+    fn generate(&self, key: ChunkKey, registry: &BlockRegistry) -> ChunkData {
+        let solid = registry.by_name("test:solid").expect("test:solid");
+        let mut data = ChunkData::uniform(solid);
+        if key.pos == self.chunk {
+            for dy in 15..=17 {
+                for dx in 15..=17 {
+                    for dz in 15..=17 {
+                        data.set(LocalPos::new(dx, dy, dz), BlockState::AIR);
+                    }
+                }
+            }
+            let ember = registry.by_name("test:ember").expect("test:ember");
+            data.set(POCKET, ember);
+        }
+        data
+    }
+    fn vertical_chunks(&self) -> RangeInclusive<i64> {
+        self.chunk.y - 2..=self.chunk.y + 2
+    }
+    fn name(&self) -> &str {
+        "pocket"
+    }
+}
+
+/// An emitter that is not full bright is lit by its own light, far from the origin too: its
+/// faces show the light of the air in front of them (one less than its emission), with no
+/// flag, as a plain block would; marked, its mesh only gains the flag on its own faces.
+#[test]
+fn an_emitter_not_full_bright_is_lit_by_its_light_far_from_the_origin() {
+    let flag = boxel_mesh::layout::FLAG_EMISSIVE << boxel_mesh::layout::GEO_FLAGS_SHIFT;
+    let pocket_mesh = |chunk: ChunkPos, marked: bool| {
+        let generator = PocketGen { chunk };
+        let registry = ember_registry(marked);
+        let mut app = lit_app(generator, registry, small(), Arc::new(InlineExecutor));
+        spawn(&mut app, chunk, 1, 1);
+        settle(&mut app);
+        let front = BlockPos::from_parts(chunk, LocalPos::new(17, 16, 16));
+        let map = app.world().resource::<ChunkMap>();
+        let (_, slot) = map
+            .iter()
+            .find(|(_, s)| s.pos == chunk)
+            .expect("the pocket chunk");
+        let mesh = match slot.mesh() {
+            MeshState::Ready { mesh, .. } => Arc::clone(mesh),
+            other => panic!("{chunk:?}: no mesh: {other:?}"),
+        };
+        (mesh, light_at(&app, front))
+    };
+    let corner = |e: u8| ((e - 1) + 2 * (e - 2) + (e - 3) + 2) / 4;
+    for chunk in [
+        ChunkPos::new((1 << 26) - 2, -3, 5),
+        ChunkPos::new(-7, 1 << 35, -(1 << 35)),
+        ChunkPos::new(boxel_voxel::MAX_CHUNK_COORD - 8, 1, 3),
+    ] {
+        let (lit, front) = pocket_mesh(chunk, false);
+        // The air in front of a face has the emission minus one, and no sky (a closed pocket).
+        assert_eq!(
+            front,
+            LightValue::new(0, EMBER[0] - 1, EMBER[1] - 1, 0),
+            "{chunk:?}"
+        );
+        let center = [POCKET.x(), POCKET.y(), POCKET.z()];
+        let own = |q: &boxel_mesh::PackedQuad| q.unit_faces().any(|(p, _)| p == center);
+        let faces: Vec<_> = lit.quads.iter().filter(|q| own(q)).collect();
+        assert_eq!(faces.len(), 6, "{chunk:?}");
+        for q in faces {
+            assert!(!q.is_emissive(), "{chunk:?}: {q:?}");
+            // Each corner is the rounded mean of the front cell, two sides and a diagonal.
+            let expected = LightValue::new(0, corner(EMBER[0]), corner(EMBER[1]), 0);
+            assert_eq!(lit.corner_light(*q), [expected; 4], "{chunk:?}: {q:?}");
+        }
+        // The pocket's walls are lit by it too.
+        assert!(
+            lit.quads
+                .iter()
+                .filter(|q| !own(q))
+                .any(|q| lit.corner_light(*q).iter().any(|c| c.rgb()[0] > 0)),
+            "{chunk:?}"
+        );
+        // Marked: the same mesh, the flag on its own faces only.
+        let (glowing, _) = pocket_mesh(chunk, true);
+        assert_eq!(glowing.palette, lit.palette, "{chunk:?}");
+        assert_eq!(glowing.quads.len(), lit.quads.len(), "{chunk:?}");
+        for (a, b) in lit.quads.iter().zip(&glowing.quads) {
+            assert_eq!(a.mat, b.mat, "{chunk:?}");
+            let expected = if own(a) { flag } else { 0 };
+            assert_eq!(a.geo ^ b.geo, expected, "{chunk:?}: {a:?}");
+        }
+    }
+}
