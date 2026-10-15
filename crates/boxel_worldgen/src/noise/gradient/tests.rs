@@ -22,8 +22,9 @@ fn terrain() -> Fbm {
     fbm(1, 256, 5, 2, 0.5)
 }
 
-/// [`gradient_fbm_2d`] as documented: an `i128` division for every split, [`hash2`] for every
-/// corner (so the cells must fit in `i64`), the documented evaluation order, no table.
+/// [`gradient_fbm_2d`] as documented: the hashed phase of each octave, an `i128` division for
+/// every split, [`hash2`] for every corner (so the cells must fit in `i64`), the documented
+/// evaluation order, no table.
 fn reference(seed: u64, x: i64, z: i64, f: Fbm) -> f64 {
     let fade = |t: f64| t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
     let lerp = |a: f64, b: f64, t: f64| a + (b - a) * t;
@@ -41,12 +42,15 @@ fn reference(seed: u64, x: i64, z: i64, f: Fbm) -> f64 {
     let mut num = i128::from(f.frequency.num());
     let (mut sum, mut weight_sum, mut amplitude) = (0.0, 0.0, 1.0);
     for k in 0..f.octaves {
-        let split = |c: i64| {
-            let p = i128::from(c) * num;
+        let mixed = splitmix64(seed.wrapping_add(u64::from(k)));
+        let q = |salt: u64| ((u128::from(splitmix64(mixed ^ salt)) * den as u128) >> 64) as i128;
+        let (qx, qz) = (q(0x5048_4153_455f_0058), q(0x5048_4153_455f_005a));
+        let split = |c: i64, q: i128| {
+            let p = i128::from(c) * num + q;
             let t = p.rem_euclid(den) as f64 / den as f64;
             (i64::try_from(p.div_euclid(den)).unwrap(), t)
         };
-        let ((x0, tx), (z0, tz)) = (split(x), split(z));
+        let ((x0, tx), (z0, tz)) = (split(x, qx), split(z, qz));
         let dot = |cx: i64, cz: i64, dx: f64, dz: f64| {
             let g: [f64; 2] =
                 gradients[(hash2(seed.wrapping_add(u64::from(k)), cx, cz) & 7) as usize];
@@ -71,14 +75,17 @@ fn reference(seed: u64, x: i64, z: i64, f: Fbm) -> f64 {
 }
 
 #[test]
-fn gradient_noise_is_zero_on_the_lattice_and_stays_in_range() {
+fn gradient_noise_is_zero_on_its_shifted_lattice_and_stays_in_range() {
+    // The lattice of 1/16 is shifted by (qx, qz) sixteenths: its points are at 16 c - q.
     let f = Frequency::one_in(16);
+    let mixed = splitmix64(3);
+    let (qx, qz) = (
+        i64::from(phase(mixed, PHASE_X, 16)),
+        i64::from(phase(mixed, PHASE_Z, 16)),
+    );
     for (cx, cz) in [(0, 0), (-3, 7), (1 << 27, -(1 << 27)), (1 << 40, 5)] {
-        assert_eq!(
-            gradient_noise_2d(3, cx * 16, cz * 16, f),
-            0.0,
-            "({cx}, {cz})"
-        );
+        let (x, z) = (cx * 16 - qx, cz * 16 - qz);
+        assert_eq!(gradient_noise_2d(3, x, z, f), 0.0, "({cx}, {cz})");
     }
     let frequency = Frequency::new(37, 1000);
     let (mut min, mut max) = (f64::MAX, f64::MIN);
@@ -96,6 +103,59 @@ fn gradient_noise_is_zero_on_the_lattice_and_stays_in_range() {
         gradient_noise_2d(11, 5, -9, frequency)
     );
     assert_eq!(gradient_fbm_2d(11, 5, -9, Fbm { octaves: 0, ..one }), 0.0);
+}
+
+#[test]
+fn gradient_fbm_is_not_pinned_on_its_coarsest_lattice() {
+    // Integer lacunarity: every octave's lattice holds octave 0's. Without the phases the fbm
+    // was exactly 0 at every multiple of the wavelength (and so was a warp's offset).
+    let f = fbm(1, 1 << 17, 4, 2, 0.4);
+    let zeros = (-20i64..20)
+        .flat_map(|i| (-20i64..20).map(move |j| (i << 17, j << 17)))
+        .filter(|&(x, z)| gradient_fbm_2d(0x00b0_7e1d, x, z, f) == 0.0)
+        .count();
+    assert_eq!(zeros, 0);
+    let w = super::super::Warp::new(7, fbm(1, 1 << 9, 3, 2, 0.5), 48);
+    let still = (-20i64..20)
+        .flat_map(|i| (-20i64..20).map(move |j| (i << 9, j << 9)))
+        .filter(|&(x, z)| w.offset(x, z) == (0, 0))
+        .count();
+    assert!(
+        still < 8,
+        "{still} of 1600 lattice points without an offset"
+    );
+    // Each octave's phase comes from its own seed: two octaves rarely share one.
+    let phases: std::collections::HashSet<(u32, u32)> = (0..64u64)
+        .map(|k| {
+            let m = splitmix64(9 + k);
+            (phase(m, PHASE_X, 1 << 20), phase(m, PHASE_Z, 1 << 20))
+        })
+        .collect();
+    assert_eq!(phases.len(), 64);
+}
+
+#[test]
+fn shifted_split_is_exact() {
+    for c in [0, 1, -1, 1 << 40, -(1 << 62), i64::MAX, i64::MIN] {
+        for (num, den) in [
+            (1u64, 16u32),
+            (3, 10),
+            (u64::MAX, 7),
+            (1 << 63, 1 << 31),
+            (5, 1),
+        ] {
+            for q in [0, 1, den - 1] {
+                let (cell, rem) = split_shifted(Scale::new(num, den), c, q);
+                let p = i128::from(c) * i128::from(num) + i128::from(q);
+                assert_eq!(
+                    cell * i128::from(den) + i128::from(rem),
+                    p,
+                    "{c} {num} {den} {q}"
+                );
+                assert!(rem < den);
+            }
+        }
+    }
 }
 
 #[test]
@@ -369,8 +429,16 @@ fn gradient_slope_per_axis_is_bounded_by_its_peak() {
     let steepest = (0..(1 << 12))
         .flat_map(|seed| {
             let n = |x: i64, z: i64| gradient_noise_2d(seed, x, z, Frequency::one_in(1 << 16));
-            let c = 1i64 << 15;
-            [(n(c + 1, c) - n(c, c)).abs(), (n(c, c + 1) - n(c, c)).abs()]
+            // The center of the shifted cell (0, 0).
+            let mixed = splitmix64(seed);
+            let (cx, cz) = (
+                (1i64 << 15) - i64::from(phase(mixed, PHASE_X, 1 << 16)),
+                (1i64 << 15) - i64::from(phase(mixed, PHASE_Z, 1 << 16)),
+            );
+            [
+                (n(cx + 1, cz) - n(cx, cz)).abs(),
+                (n(cx, cz + 1) - n(cx, cz)).abs(),
+            ]
         })
         .fold(0.0, f64::max)
         * f64::from(1u32 << 16);

@@ -102,13 +102,50 @@ struct Axis {
     fade: f64,
 }
 
-/// `c` on `scale`'s lattice: the exact cell and the position inside it.
+/// Salt of an octave's lattice phase along x, mixed into its seed.
+const PHASE_X: u64 = 0x5048_4153_455f_0058;
+/// Salt of an octave's lattice phase along z.
+const PHASE_Z: u64 = 0x5048_4153_455f_005a;
+
+/// The phase of an octave's lattice on one axis, in `[0, den)`: `floor(splitmix64(mixed_seed ^
+/// salt) * den / 2^64)`, in units of `1 / den` of a cell.
 #[inline]
-fn axis(scale: Scale, c: i64) -> Axis {
-    let (cell, rem) = match scale.split_narrow(c) {
-        Some((cell, rem)) => (i128::from(cell), rem),
-        None => scale.split(c),
-    };
+fn phase(mixed_seed: u64, salt: u64, den: u32) -> u32 {
+    ((u128::from(splitmix64(mixed_seed ^ salt)) * u128::from(den)) >> 64) as u32
+}
+
+/// `floor((c * num + q) / den)` and its remainder, exact: `c * num` is at most `2^127 - 2^63` in
+/// magnitude and `q < 2^32`, so the sum fits in `i128` (the 64-bit path when it fits in `i64`).
+#[inline]
+fn split_shifted(s: Scale, c: i64, q: u32) -> (i128, u32) {
+    let narrow = i64::try_from(s.num)
+        .ok()
+        .and_then(|num| c.checked_mul(num))
+        .and_then(|p| p.checked_add(i64::from(q)));
+    if let Some(p) = narrow {
+        return match s.shift {
+            Some(shift) => (i128::from(p >> shift), (p as u32) & ((1 << shift) - 1)),
+            None => {
+                let den = i64::from(s.den);
+                (i128::from(p.div_euclid(den)), p.rem_euclid(den) as u32)
+            }
+        };
+    }
+    let p = i128::from(c) * i128::from(s.num) + i128::from(q);
+    match s.shift {
+        Some(shift) => (p >> shift, (p as u32) & ((1 << shift) - 1)),
+        None => {
+            let den = i128::from(s.den);
+            (p.div_euclid(den), p.rem_euclid(den) as u32)
+        }
+    }
+}
+
+/// `c` on `scale`'s lattice shifted by the phase `q / den` of a cell: the exact cell and the
+/// position inside it.
+#[inline]
+fn axis(scale: Scale, c: i64, q: u32) -> Axis {
+    let (cell, rem) = split_shifted(scale, c, q);
     let t = scale.fraction(rem);
     Axis {
         cell,
@@ -168,23 +205,43 @@ fn kernel([h00, h10, h01, h11]: [u32; 4], x: &Axis, z: &Axis) -> f64 {
 }
 
 impl Octave {
+    /// The phases `(qx, qz)` of this octave's lattice ([`phase`]).
+    #[inline]
+    fn phases(self) -> (u32, u32) {
+        let den = self.scale.den;
+        (
+            phase(self.mixed_seed, PHASE_X, den),
+            phase(self.mixed_seed, PHASE_Z, den),
+        )
+    }
+
     /// The octave's gradient noise at `(x, z)` (without the amplitude).
     #[inline]
     fn gradient(self, x: i64, z: i64) -> f64 {
-        let (x, z) = (axis(self.scale, x), axis(self.scale, z));
+        let (qx, qz) = self.phases();
+        let (x, z) = (axis(self.scale, x, qx), axis(self.scale, z, qz));
         kernel(corner_hashes(self.mixed_seed, x.cell, z.cell), &x, &z)
     }
 }
 
 /// 2D gradient noise (Perlin's, with a quintic fade) in `[-1, 1]` at integer `(x, z)`, with
-/// `frequency` lattice cells per voxel. 0 at every lattice point.
+/// `frequency = num / den` lattice cells per voxel, on a lattice shifted by a phase hashed from
+/// the seed.
 ///
-/// The cell of `x` is `floor(x * frequency)`, exact, and `t` its position inside the cell, in
-/// `[0, 1)`. Lattice point `c` has the gradient `G[hash2(seed, c) & 7]` (for cells inside `i64`;
-/// past it, the value noise's extension of `hash2`), one of `(+-1, +-1)`, `(+-1, 0)` and
-/// `(0, +-1)`. The noise is `lerp(lerp(d00, d10, fade(tx)), lerp(d01, d11, fade(tx)),
-/// fade(tz))`, `dij` the dot product of corner `ij`'s gradient with the offset from that corner,
-/// `fade(t) = 6t^5 - 15t^4 + 10t^3`, clamped to `[-1, 1]`.
+/// The phase is `(qx, qz) / den` of a cell, `q = floor(splitmix64(splitmix64(seed) ^ salt) * den
+/// / 2^64)` with one salt per axis, so the cell of `x` is `floor((x * num + qx) / den)`, exact,
+/// and `t = ((x * num + qx) mod den) / den` its position inside the cell, in `[0, 1)`. Lattice
+/// point `c` has the gradient `G[hash2(seed, c) & 7]` (for cells inside `i64`; past it, the value
+/// noise's extension of `hash2`), one of `(+-1, +-1)`, `(+-1, 0)` and `(0, +-1)`. The noise is
+/// `lerp(lerp(d00, d10, fade(tx)), lerp(d01, d11, fade(tx)), fade(tz))`, `dij` the dot product
+/// of corner `ij`'s gradient with the offset from that corner, `fade(t) = 6t^5 - 15t^4 + 10t^3`,
+/// clamped to `[-1, 1]`.
+///
+/// Gradient noise is 0 on its own lattice points. Without the phase every octave of an fbm with
+/// an integer lacunarity would hold octave 0's lattice, so the fbm would be pinned to 0 on it
+/// (on a 131 km grid for a 2^17 wavelength); with it, each octave's zeros sit at its own hashed
+/// offset. With an integer frequency (`den = 1`) every sample is a lattice point and the noise is
+/// 0 everywhere.
 pub fn gradient_noise_2d(seed: u64, x: i64, z: i64, frequency: Frequency) -> f64 {
     let octave = Octave {
         mixed_seed: splitmix64(seed),
@@ -232,10 +289,11 @@ pub fn gradient_fbm_2d_grid(seed: u64, xs: &[i64], zs: &[i64], fbm: Fbm, out: &m
     let points = out.len();
     let mut weight_sum = 0.0;
     for octave in fbm.octaves(seed) {
+        let (qx, qz) = octave.phases();
         x_axes.clear();
-        x_axes.extend(xs.iter().map(|&x| axis(octave.scale, x)));
+        x_axes.extend(xs.iter().map(|&x| axis(octave.scale, x, qx)));
         z_axes.clear();
-        z_axes.extend(zs.iter().map(|&z| axis(octave.scale, z)));
+        z_axes.extend(zs.iter().map(|&z| axis(octave.scale, z, qz)));
         let amplitude = octave.amplitude;
         let rows = out.chunks_exact_mut(zs.len()).zip(&x_axes);
         if table.rebuild(octave.mixed_seed, &x_axes, &z_axes, points) {
