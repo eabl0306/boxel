@@ -10,6 +10,11 @@
 //!
 //! [`lod`] is the far level of detail's side of a generator (ADR 0031): a [`LodSource`] samples
 //! coarse cells level by level, for terrain far beyond the full-detail view distance.
+//!
+//! [`registry`] holds the ids, registries and salts of the world generation entries a game and
+//! its mods register (ADR 0039 sec. 11 to 13), with the checks that run when the app is
+//! built and when a world opens; [`realm`] holds the layout of a dimension's realms along y and
+//! its checks.
 
 use boxel_voxel::{
     BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SHIFT, CHUNK_SIZE, CHUNK_VOLUME, ChunkData,
@@ -21,9 +26,12 @@ pub mod exact;
 pub mod field;
 pub mod lod;
 pub mod noise;
+pub mod realm;
+pub mod registry;
 
 pub use lod::LodSource;
 pub use noise::Frequency;
+pub use registry::{GenId, GenRegistry};
 
 /// A chunk generator.
 ///
