@@ -15,7 +15,8 @@ instead of stress's. `APP --perf-cases` prints `{"format": 1, "cases": [{"name":
 run one: it waits for its world to settle, prints a line `APP: measuring ...` (its own name) when
 the measurement starts, measures `--duration` seconds and writes the files stress writes (the
 summary's JSON with the keys `metrics` reads, a CSV with `t_ms` and `presented` per frame). It
-exits 0, or non-zero when it failed (2: no usable GPU).
+exits 0, or non-zero when it failed (2: no usable GPU). A summary without one of APP_SUMMARY, or
+a CSV without those columns, is a failed run: a number left out must not pass as no regression.
 """
 import csv
 import dataclasses
@@ -116,6 +117,12 @@ APP_FORMAT = 1
 APP_NAME = re.compile(r'[a-z][a-z0-9-]*')
 # The line a run prints when its measurement starts: `stress: measuring ...`, `APP: measuring`.
 MEASURING = re.compile(r'\S+: measuring ')
+# The summary keys the verdicts read, which an outside app must write (stress's older binaries,
+# a base or a bisect, may lack some: they are not checked). refresh_hz may be null.
+APP_SUMMARY = (('run', 'fps_limit'), ('frames', 'avg_fps'), ('frames', 'p50_ms'),
+               ('frames', 'p99_ms'), ('frames', 'over_144hz'), ('frames', 'over_7_5ms'),
+               ('timeline',))
+APP_CSV = ('t_ms', 'presented')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -488,6 +495,13 @@ def fmt_limit(value):
     return f'{value:g}' if value == int(value) else f'{value:.1f}'
 
 
+def app_missing(summary, columns):
+    """What an outside app's run left out of APP_SUMMARY (dotted keys) and APP_CSV (`.csv
+    COLUMN`)."""
+    keys = ['.'.join(p) for p in APP_SUMMARY if bench_report.get(summary, p) is None]
+    return keys + [f'.csv {c}' for c in APP_CSV if c not in columns]
+
+
 def metrics(summary, times_ms, nv=None, nv_state=None):
     """The numbers the verdicts and the reports use. `slow` counts the frames over 6.94 ms (the
     smoke rule, capped or not) and `slow75` those over 7.5 ms (the checkpoint's slow frames with
@@ -638,9 +652,15 @@ def measure(binary, case, prefix, label, duration, nvidia=False, attempts=None, 
             with open(prefix + '.md', encoding='utf-8') as f:
                 summary = bench_report.parse_summary(f.read(), prefix + '.md')
             with open(prefix + '.csv', newline='') as f:
-                times = presented_times(csv.DictReader(f))
+                rows = csv.DictReader(f)
+                columns = rows.fieldnames or ()
+                times = presented_times(rows)
         except (OSError, ValueError, bench_report.ReportError) as e:
             run.error = f'no summary: {e}'
+            return run
+        missing = app_missing(summary, columns) if case.declared else []
+        if missing:
+            run.error = f"no summary: {prefix} lacks {', '.join(missing)}"
             return run
         end = measure_at + duration if measure_at else None
         share = pstate_share(samples, measure_at, end) if nvidia else None

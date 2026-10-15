@@ -951,6 +951,34 @@ class OutsideTest(FakeMachine):
         self.assertIn('has no gone scenario and the base has it', self.output())
         self.assertEqual(calls(new), 1, 'surface still ran')
 
+    def test_an_app_that_fails_or_writes_no_usable_summary(self):
+        base = self.app('base')
+        self.assertEqual(self.cmd_smoke(base, self.app('crash', fail=True), ['surface']), 1)
+        self.assertIn('FAILED: new run exit code 2', self.output())
+        self.assertEqual(self.cmd_smoke(self.app('down', fail=True), base, ['surface']), 2)
+        self.assertIn('not measured: base run exit code 2', self.output())
+        other = dict(summary(), format=2)
+        self.assertEqual(self.cmd_smoke(base, self.app('other', data=other), ['surface']), 1)
+        self.assertIn('FAILED: new run no summary', self.output())
+        # A key the verdicts read left out is a failure, not a pass on missing numbers.
+        for path in (('frames', 'avg_fps'), ('frames', 'p99_ms'), ('run', 'fps_limit')):
+            data = summary()
+            del data[path[0]][path[1]]
+            name = 'no-' + '-'.join(path)
+            self.assertEqual(self.cmd_smoke(base, self.app(name, data=data), ['surface']), 1,
+                             name)
+            self.assertIn(f"lacks {'.'.join(path)}", self.output())
+        data = summary()
+        del data['timeline']
+        self.assertEqual(self.cmd_smoke(base, self.app('no-timeline', data=data),
+                                        ['surface']), 1)
+        self.assertIn('lacks timeline', self.output())
+        self.assertEqual(runs.app_missing(summary(), ('frame', 't_ms', 'presented')), [])
+        self.assertEqual(runs.app_missing({'format': 1}, ('t_ms',)),
+                         ['run.fps_limit', 'frames.avg_fps', 'frames.p50_ms', 'frames.p99_ms',
+                          'frames.over_144hz', 'frames.over_7_5ms', 'timeline',
+                          '.csv presented'])
+
     def test_two_built_binaries_and_cases_from_either(self):
         new = self.app('new')
         self.assertEqual(self.cmd_smoke('HEAD', new), 64)

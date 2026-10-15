@@ -97,9 +97,12 @@ Lo que hace la app (el detalle está en `tools/perf/runs.py`):
   imprime `APP: measuring ...` al empezar a medir, mide `--duration` segundos y deja un resumen y
   un CSV como los de stress. Del resumen se leen `run.fps_limit`, `run.refresh_hz`, `frames`
   (`avg_fps`, `p50_ms`, `p99_ms`, `over_144hz`, `over_7_5ms`) y los fps de cada segundo de
-  `timeline`; del CSV, `t_ms` y `presented`. Sale con 0, o con otro código si falló (2: sin GPU).
-  Para `just bench-report --compare`, el resumen trae también `run.scenario`, `run.radius`,
-  `run.speed`, `run.backend` y `run.tier`.
+  `timeline`; del CSV, `t_ms` y `presented`. Si falta uno (`refresh_hz` puede ser null), la
+  corrida cuenta como fallida. Sale con 0, o con otro código si falló (2: sin GPU).
+- Para `just bench-report --compare`, el resumen trae también `run.scenario`, `run.radius`,
+  `run.speed`, `run.backend` y `run.tier`, y lo que fija y cambia el costo (`run.pack`,
+  `run.fog`, `run.lod`, `run.vsync`, `run.time`, `run.window`): sin ellos, el informe los da por
+  apagados.
 
 ### Nivel 2: la ronda de control
 
