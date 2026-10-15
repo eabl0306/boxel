@@ -630,3 +630,47 @@ fn a_fluid_hardens_beside_each_fluid_it_declares() {
     assert_eq!(world.at([10, 10]), "test:basalt");
     assert_eq!(world.at([16, 10]), "test:rock");
 }
+
+/// A cutout cube with `waterlogged` and full collision (leaves, ADR 0038) holds a water source
+/// when wet, but its walls are closed on every face (Minecraft's `canPassThroughWall` on a full
+/// collision shape): the water never flows out nor counts for a neighbor. Dry, it still takes a
+/// new source (`canPlaceLiquid`), which its walls keep from reaching it.
+#[test]
+fn a_wet_cutout_cube_is_a_sealed_source() {
+    let mut b = slab_builder();
+    let leaves = BlockDef {
+        name: "test:wet_cube".into(),
+        shape: RenderShape::Cutout,
+        model: BlockModel::CUBE,
+        collision: BlockCollision::Full,
+        emission: [0; 3],
+        light_opacity: 1,
+        textures: FaceTextures::all(TextureId(0)),
+    };
+    b.add_block_with_states(leaves, vec![Property::boolean(WATERLOGGED)], |_, _| {})
+        .unwrap();
+    let block = fluid_block(&mut b, "test:fluid");
+    let fluid = b.add_fluid(block, GOO).unwrap();
+    b.set_waterlog_fluid(fluid).unwrap();
+    let r = b.build();
+    let wet = r.parse_state("test:wet_cube[waterlogged=true]").unwrap();
+    let dry = r.parse_state("test:wet_cube[waterlogged=false]").unwrap();
+    let fluids = Fluids::new(&r);
+    let flow = Flow {
+        fluids,
+        id: fluid,
+        rules: GOO,
+    };
+    assert_eq!(fluids.content(wet), Some((fluid, Fluid::SOURCE)));
+    assert_eq!(fluids.content(dry), None);
+    let air = Some(BlockState::AIR);
+    let source = r.fluid(fluid).map(|f| f.first);
+    for face in Face::ALL {
+        for other in [air, source, Some(dry)] {
+            assert!(!fluids.wall_open(Some(wet), other, face), "{face:?}");
+            assert!(!fluids.wall_open(other, Some(wet), face), "{face:?}");
+        }
+    }
+    assert!(flow.takes_source(Some(dry)));
+    assert!(!flow.takes_source(Some(wet)));
+}

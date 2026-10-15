@@ -23,7 +23,7 @@
 //!   be replaced (`FluidType::replaced_by`): an empty cell always, water only by lava falling
 //!   into it (which turns it to stone, `FluidType::falls_into`), lava only by water where the
 //!   lava is at least 4/9 high. A fluid never replaces its own cells.
-//! - A waterlogged block (a slab, stairs or a fence whose `waterlogged` is `true`, ADR 0025)
+//! - A waterlogged block (a slab, stairs, a fence or leaves with `waterlogged=true`, ADR 0025)
 //!   holds a source of the registry's waterlog fluid (water): it ticks and spreads like one and
 //!   counts as one for its neighbors, but never hardens (only the fluid's own block does, as in
 //!   Minecraft's `LiquidBlock`).
