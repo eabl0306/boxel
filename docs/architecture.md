@@ -2,7 +2,7 @@
 
 Documento técnico de referencia. Fecha: 2026-10-05. Estado: aprobado para el milestone M0
 (revisión final, después de tres revisiones adversariales del borrador v1).
-Las decisiones puntuales están en `docs/adr/` (0001 a 0037). Durante M0 hubo además una
+Las decisiones puntuales están en `docs/adr/` (0001 a 0038). Durante M0 hubo además una
 especificación para los agentes implementadores (en inglés, en `.scaffold/`), borrada al cerrar M0;
 este documento queda como referencia.
 
@@ -845,7 +845,7 @@ un `Mesher` thread-local (~0.6 MiB de scratch) y un `LightScratch` (~0.7 MiB).
    de `w - 1`, `h - 1` y el AO. Validado contra un oráculo de alturas y sin grietas entre chunks.
    Un bloque con agua (ADR 0025) se junta como su agua (`PaddedChunk::waterlogged` guarda el
    bloque, que se dibuja con sus cajas) y su agua va siempre por bloque, con las caras metidas
-   1/512 en la celda. Los costados de los fluidos y el techo inclinado llevan la textura de flujo,
+   1/512 en la celda. Solo un bloque opaco tapa caras de su agua (ADR 0038). Los costados de los fluidos y el techo inclinado llevan la textura de flujo,
    que el shader desplaza con el tiempo (`viewport.z` del uniform `View`). El shader corre la
    profundidad de todo fluido 2^-16 de su distancia hacia atrás: pierde los empates con las caras
    que toca.

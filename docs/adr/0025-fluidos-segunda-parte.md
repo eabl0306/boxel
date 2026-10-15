@@ -124,7 +124,7 @@ mar, el agua queda quieta como una pared vertical, porque el agua generada no pr
   (`GEO_FLUID_INSET_BIT`, `FLUID_INSET`). Minecraft hace lo mismo con 0.001: así la cara del bloque
   en el borde siempre queda delante y no pelea en profundidad con la del agua. El techo del agua,
   que a 16/16 queda en el plano del techo de un escalón o de un poste, pierde ese empate por la
-  sección 6.
+  sección 6. Qué caras tapa el bloque lo precisa el ADR 0038: solo uno opaco tapa alguna.
 
 ### 5. Textura de flujo
 
