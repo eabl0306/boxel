@@ -1,6 +1,8 @@
 //! The full-bright flag (ADR 0036, [`BlockRegistryBuilder::set_full_bright`]): off by default,
 //! set per state, fixed for fluids by their emission, and kept out of every other per-state
-//! table. On the `test:` blocks ([`crate::testing`]) and a few more after them.
+//! table. The flag that keeps flowing fluids out ([`StateFlags::KEEPS_FLUIDS_OUT`], #110): on
+//! every waterloggable state, and on every state of a declared block. On the `test:` blocks
+//! ([`crate::testing`]) and a few more after them.
 use super::*;
 use crate::testing;
 
@@ -153,4 +155,78 @@ fn a_state_that_emits_nothing_may_be_full_bright() {
     assert!(r.is_full_bright(paint));
     assert!(!r.flags(paint).contains(StateFlags::EMISSIVE));
     assert!(r.emission(paint).is_dark());
+}
+
+/// Every state that can be waterlogged keeps flowing fluids out, dry or wet, whether it collides
+/// or not; a plant, a cube, a fluid and a full cube with the property (a double slab) do not.
+#[test]
+fn waterloggable_states_keep_fluids_out() {
+    let mut b = builder();
+    let solid = b.by_name("test:solid").expect("test:solid");
+    let full = BlockDef {
+        name: "test:double".to_string(),
+        ..b.states[usize::from(solid.0)].clone()
+    };
+    b.add_block_with_states(full, vec![Property::boolean(WATERLOGGED)], |_, _| {})
+        .expect("test:double");
+    let r = b.build();
+    let mut kept = 0;
+    for s in states(&r) {
+        let name = r.name(s);
+        let keeps = ["test:slab", "test:boxes"].contains(&name);
+        assert_eq!(r.keeps_fluids_out(s), keeps, "{}", r.state_name(s));
+        assert_eq!(r.keeps_fluids_out(s), r.can_be_waterlogged(s), "{name}");
+        kept += usize::from(keeps);
+    }
+    assert_eq!(kept, 4, "two states each");
+    let plant = by(&r, "test:plant");
+    assert!(!r.blocks_motion(plant) && !r.keeps_fluids_out(plant));
+    assert!(!r.keeps_fluids_out(by(&r, "test:double[waterlogged=true]")));
+}
+
+/// A declared block keeps flowing fluids out in every state and nothing else of it changes: it
+/// still does not stop movement.
+#[test]
+fn a_declared_block_keeps_fluids_out_in_every_state() {
+    let plain = builder().build();
+    let mut b = builder();
+    for name in ["test:plant", "test:ember_ore"] {
+        b.set_keeps_fluids_out(block(&b, name)).expect(name);
+    }
+    let marked = b.build();
+    assert_eq!(marked.len(), plain.len());
+    for s in states(&plain) {
+        let declared = ["test:plant", "test:ember_ore"].contains(&plain.name(s));
+        let keeps = declared || plain.can_be_waterlogged(s);
+        assert_eq!(marked.keeps_fluids_out(s), keeps, "{}", plain.state_name(s));
+        assert_eq!(
+            marked.flags(s) - StateFlags::KEEPS_FLUIDS_OUT,
+            plain.flags(s) - StateFlags::KEEPS_FLUIDS_OUT,
+            "{}",
+            plain.state_name(s)
+        );
+        assert_eq!(marked.blocks_motion(s), plain.blocks_motion(s));
+    }
+    for name in [
+        "test:plant",
+        "test:ember_ore[lit=true]",
+        "test:ember_ore[lit=false]",
+    ] {
+        assert!(marked.keeps_fluids_out(by(&marked, name)), "{name}");
+    }
+    assert!(!marked.blocks_motion(by(&marked, "test:plant")));
+}
+
+#[test]
+fn keeping_fluids_out_needs_a_known_block() {
+    let mut b = builder();
+    let unknown = BlockId(b.blocks.len() as u16);
+    assert_eq!(
+        b.set_keeps_fluids_out(unknown),
+        Err(RegistryError::UnknownBlock(unknown.0))
+    );
+    assert!(
+        b.keeps_fluids_out.is_empty(),
+        "the failed call sets nothing"
+    );
 }

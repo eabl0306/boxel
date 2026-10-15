@@ -1,12 +1,12 @@
 //! The dump of G1 (`content_golden.rs`), shared with the demo's golden
 //! (`boxel_demo/tests/golden.rs`): everything the registry says about each state, the texture
 //! layer names in order, and what placing a block into air or a water source and breaking it
-//! leave. Only the two accessor helpers below may change after the content moved.
+//! leave. Only the accessor helpers below may change after the content moved.
 
 use boxel_voxel::rules::{broken, placed_into};
 use boxel_voxel::shapes::half_name;
 use boxel_voxel::{
-    BlockCollision, BlockModel, BlockRegistry, BlockState, CollisionBox, Face, ModelBox,
+    BlockCollision, BlockModel, BlockRegistry, BlockState, CollisionBox, Face, ModelBox, StateFlags,
 };
 use std::fmt::Write as _;
 
@@ -18,6 +18,17 @@ fn boxes_of(r: &BlockRegistry, s: BlockState) -> Vec<ModelBox> {
 /// The shape `s` is picked by.
 fn outline_of(r: &BlockRegistry, s: BlockState) -> BlockCollision {
     r.outline(s).clone()
+}
+
+/// The flags of `s` as they were frozen: `KEEPS_FLUIDS_OUT` came later (#110) and is left out
+/// where it only repeats `WATERLOGGABLE`; anywhere else it shows.
+fn flags_of(r: &BlockRegistry, s: BlockState) -> u16 {
+    let flags = r.flags(s);
+    if flags.contains(StateFlags::WATERLOGGABLE) {
+        (flags - StateFlags::KEEPS_FLUIDS_OUT).bits()
+    } else {
+        flags.bits()
+    }
 }
 
 /// The model printed by kind: today's stairs, fences, torches, walls and gates are all `boxes`.
@@ -86,7 +97,7 @@ pub fn dump(r: &BlockRegistry) -> String {
             boxes.join(" "),
             collision_text(&outline_of(r, s)),
             collision_text(r.collision(s)),
-            r.flags(s).bits(),
+            flags_of(r, s),
             r.emission(s).0,
             r.light_opacity(s),
             faces.join(","),

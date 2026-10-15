@@ -367,6 +367,14 @@ bitflags::bitflags! {
         /// gate, open or closed, as Minecraft's gates are solid wood; an open one does not
         /// collide, ADR 0027). Fluids never flow into it and stand on it.
         const BLOCKS_MOTION = 1 << 6;
+        /// No flowing fluid enters or breaks it, even where it does not stop movement: every
+        /// [`StateFlags::WATERLOGGABLE`] state, dry or waterlogged (Minecraft's
+        /// `LiquidBlockContainer`: flowing water never washes a dry `game:lichen` away, lava
+        /// never turns a waterlogged one to stone), and every state of a block declared with
+        /// [`BlockRegistryBuilder::set_keeps_fluids_out`] (`game:sugar_cane`). A dry
+        /// waterloggable one still takes a new source of the waterlog fluid. Unlike
+        /// [`StateFlags::BLOCKS_MOTION`], it is no floor for a new source (#110).
+        const KEEPS_FLUIDS_OUT = 1 << 7;
     }
 }
 
@@ -570,6 +578,8 @@ pub struct BlockRegistryBuilder {
     box_model_ids: std::collections::HashMap<BoxModel, BoxModelId>,
     /// The blocks that stop movement where they do not collide (by [`BlockId`]).
     blocks_motion: Vec<bool>,
+    /// The blocks no flowing fluid enters (by [`BlockId`]; missing at the end: not).
+    keeps_fluids_out: Vec<bool>,
     /// The states drawn full bright (by state id; missing at the end: not).
     full_bright: Vec<bool>,
     /// The support shape of each state (by state id; `None` or missing at the end: its
@@ -675,6 +685,19 @@ impl BlockRegistryBuilder {
             self.blocks_motion.resize(i + 1, false);
         }
         self.blocks_motion[i] = true;
+        Ok(())
+    }
+
+    /// Declares that no flowing fluid enters or breaks any state of `block`
+    /// ([`StateFlags::KEEPS_FLUIDS_OUT`]), though it neither collides nor stops movement:
+    /// Minecraft's sugar cane, portals and bubble columns. Waterloggable states need no call,
+    /// they keep fluids out by themselves. Not for a fluid's own block.
+    pub fn set_keeps_fluids_out(&mut self, block: BlockId) -> Result<(), RegistryError> {
+        let i = self.block_index(block)?;
+        if self.keeps_fluids_out.len() <= i {
+            self.keeps_fluids_out.resize(i + 1, false);
+        }
+        self.keeps_fluids_out[i] = true;
         Ok(())
     }
 
@@ -1020,6 +1043,8 @@ impl BlockRegistryBuilder {
                     .copied()
                     .unwrap_or(false);
                 f.set(StateFlags::BLOCKS_MOTION, solid || declared);
+                let keeps = self.keeps_fluids_out.get(usize::from(block)).copied();
+                f.set(StateFlags::KEEPS_FLUIDS_OUT, keeps.unwrap_or(false));
                 f.set(
                     StateFlags::OCCLUDES,
                     b.shape == RenderShape::Opaque && b.model.is_solid_cube(),
@@ -1039,7 +1064,7 @@ impl BlockRegistryBuilder {
                     continue;
                 }
                 let f = &mut flags[usize::from(state)];
-                f.insert(StateFlags::WATERLOGGABLE);
+                f.insert(StateFlags::WATERLOGGABLE | StateFlags::KEEPS_FLUIDS_OUT);
                 if block.values(BlockState(state)).get(WATERLOGGED) == Some("true") {
                     f.insert(StateFlags::WATERLOGGED);
                 }
@@ -1363,6 +1388,12 @@ impl BlockRegistry {
     /// What the fluid rules call solid.
     pub fn blocks_motion(&self, s: BlockState) -> bool {
         self.flags(s).contains(StateFlags::BLOCKS_MOTION)
+    }
+    /// True if no flowing fluid enters or breaks `s` ([`StateFlags::KEEPS_FLUIDS_OUT`]): it can
+    /// be waterlogged, dry or not, or its block was declared to
+    /// ([`BlockRegistryBuilder::set_keeps_fluids_out`]).
+    pub fn keeps_fluids_out(&self, s: BlockState) -> bool {
+        self.flags(s).contains(StateFlags::KEEPS_FLUIDS_OUT)
     }
     /// True if `s` holds a water source besides itself ([`StateFlags::WATERLOGGED`], ADR 0025).
     pub fn is_waterlogged(&self, s: BlockState) -> bool {
