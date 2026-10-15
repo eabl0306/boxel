@@ -223,8 +223,10 @@ impl<C: Field> Field for LatticeField<C> {
             grid.z0 + grid.nz as i64 * grid.size,
         );
         let (i0, j0) = (grid.x0 >> k, grid.z0 >> k);
-        let (width, depth) = ((up(x1) - i0 + 1) as usize, (up(z1) - j0 + 1) as usize);
-        let exact = (width * depth) as u128 <= 4 * corners.len() as u128 + 64;
+        let (width, depth) = ((up(x1) - i0 + 1) as u128, (up(z1) - j0 + 1) as u128);
+        // In u128: a grid of huge cells over a fine lattice spans more than usize.
+        let exact = width * depth <= 4 * corners.len() as u128 + 64;
+        let (width, depth) = (width as usize, depth as usize);
         let bounds: Vec<Span> = if exact {
             let xs: Vec<i64> = (0..width as i64).map(|i| (i0 + i) << k).collect();
             let zs: Vec<i64> = (0..depth as i64).map(|j| (j0 + j) << k).collect();

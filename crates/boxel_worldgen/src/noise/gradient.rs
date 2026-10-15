@@ -413,6 +413,10 @@ pub struct FbmSplit {
     share: f64,
     /// Bound of `|full - kept|` everywhere: 0 when nothing is dropped.
     dropped: f64,
+    /// The `min_wavelength` it was split at.
+    cut: u64,
+    /// How many octaves it keeps (a prefix of the whole fbm's).
+    kept_count: u32,
 }
 
 impl Fbm {
@@ -459,6 +463,8 @@ impl Fbm {
             } else {
                 normalize(dropped_weight, weight) + ROUNDING
             },
+            cut: min_wavelength,
+            kept_count: kept,
         }
     }
 
@@ -493,6 +499,40 @@ impl FbmSplit {
     /// dropped.
     pub const fn dropped(&self) -> f64 {
         self.dropped
+    }
+
+    /// The `min_wavelength` this split was made at ([`Fbm::split_at`]).
+    pub const fn cut(&self) -> u64 {
+        self.cut
+    }
+
+    /// Bound of `|self.sample - other.sample|` at every point, for either basis, when both split
+    /// the same fbm: the weight of the octaves one keeps and the other drops, over the full
+    /// weight, plus `2^-40` for rounding; 0 exactly when they keep the same octaves (then they
+    /// give the same bits). Panics if the fbms differ.
+    pub fn distance(&self, other: &FbmSplit) -> f64 {
+        let same = |a: Fbm, b: Fbm| {
+            (a.frequency, a.octaves, a.lacunarity, a.gain.to_bits())
+                == (b.frequency, b.octaves, b.lacunarity, b.gain.to_bits())
+        };
+        assert!(
+            same(self.fbm, other.fbm),
+            "FbmSplit::distance of two different fbms"
+        );
+        let (lo, hi) = if self.kept_count < other.kept_count {
+            (self.kept_count, other.kept_count)
+        } else {
+            (other.kept_count, self.kept_count)
+        };
+        if lo == hi {
+            return 0.0;
+        }
+        let between: f64 = (self.fbm.octaves(0))
+            .skip(lo as usize)
+            .take((hi - lo) as usize)
+            .map(|o| f64::abs(o.amplitude))
+            .sum();
+        normalize(between, self.weight) + ROUNDING
     }
 
     /// The kept part at `(x, z)`: `basis.fbm(seed, x, z, kept()) * share()`. With nothing dropped

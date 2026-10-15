@@ -376,7 +376,7 @@ proptest! {
 
     #[test]
     fn coarse_forms_bound_the_full_tree(
-        seed in any::<u64>(), x in place(), z in place(), cut in 0u64..2048,
+        seed in any::<u64>(), x in place(), z in place(), cut in 0u64..2048, cut2 in 0u64..2048,
         d in (-300i64..300, -300i64..300),
     ) {
         let noise = NoiseField::new(seed, fbm(1024, 6), Basis::Gradient, 1000);
@@ -391,24 +391,44 @@ proptest! {
         );
         let blend = Blend::new(&weight, &min, Const(300), 16);
         let warped = Warped::new(Warp::new(seed, fbm(256, 2), 40), &lattice);
-        fn holds<F: Coarsen>(name: &str, f: &F, cut: u64, points: &[(i64, i64)]) -> Result<(), TestCaseError> {
-            let (coarse, d) = f.coarse(cut);
+        // A fast weight (a steep spline over a short fbm) between inputs far apart: what the
+        // coarse form changes is mostly the weight, so its term carries the bound.
+        let fast = Splined::new(
+            NoiseField::new(seed ^ 7, fbm(32, 5), Basis::Gradient, 1000),
+            Spline::new(&[(-40, 0), (40, 1 << 16)]),
+        );
+        let swing = Blend::new(&fast, Const(5000), Const(-5000), 16);
+        /// `|f - coarse| <= d` over the points, and the same for a coarse form of the coarse
+        /// form at another wavelength.
+        fn holds<F: Coarsen>(name: &str, f: &F, cuts: (u64, u64), points: &[(i64, i64)]) -> Result<(), TestCaseError>
+        where
+            F::Coarse: Coarsen,
+        {
+            let (coarse, d) = f.coarse(cuts.0);
+            let (coarser, d2) = coarse.coarse(cuts.1);
             for &(x, z) in points {
-                let (full, part) = (f.value(x, z), coarse.value(x, z));
+                let (full, part, less) = (f.value(x, z), coarse.value(x, z), coarser.value(x, z));
                 prop_assert!(full.abs_diff(part) <= d, "{name} at ({x}, {z}): {full} {part} over {d}");
+                prop_assert!(part.abs_diff(less) <= d2, "{name} twice at ({x}, {z}): {part} {less} over {d2}");
             }
             Ok(())
         }
-        let points = [(x, z), (x + d.0, z + d.1), (x - 17, z + 5), (x & !15, z & !15)];
-        holds("const", &Const(3), cut, &points)?;
-        holds("noise", &noise, cut, &points)?;
-        holds("lattice", &lattice, cut, &points)?;
-        holds("splined", &splined, cut, &points)?;
-        holds("add", &add, cut, &points)?;
-        holds("min", &min, cut, &points)?;
-        holds("weight", &weight, cut, &points)?;
-        holds("blend", &blend, cut, &points)?;
-        holds("warped", &warped, cut, &points)?;
+        let mut points: Vec<(i64, i64)> = (0..8i64)
+            .flat_map(|i| (0..8i64).map(move |j| (x + 3 * i, z + 5 * j)))
+            .collect();
+        points.extend([(x + d.0, z + d.1), (x & !15, z & !15)]);
+        let cuts = (cut, cut2);
+        holds("const", &Const(3), cuts, &points)?;
+        holds("noise", &noise, cuts, &points)?;
+        holds("lattice", &lattice, cuts, &points)?;
+        holds("splined", &splined, cuts, &points)?;
+        holds("add", &add, cuts, &points)?;
+        holds("min", &min, cuts, &points)?;
+        holds("weight", &weight, cuts, &points)?;
+        holds("blend", &blend, cuts, &points)?;
+        holds("warped", &warped, cuts, &points)?;
+        holds("fast weight", &fast, cuts, &points)?;
+        holds("swing", &swing, cuts, &points)?;
     }
 
     #[test]
@@ -553,6 +573,45 @@ fn node_cells_cost_a_few_grids_per_leaf() {
     }
     // WG1_COUNTS=1 shows the counts.
     assert!(std::env::var("WG1_COUNTS").is_err(), "{report:?}");
+}
+
+#[test]
+fn a_coarse_noise_coarsened_again_keeps_its_cut() {
+    // The reviewer's case: a field already split at 2048, split again at 16, must not get the
+    // octaves under 2048 back (it did, 2230 apart with a bound of 302), and its bound is between
+    // the two splits only.
+    let full = Fbm {
+        frequency: Frequency::one_in(4096),
+        octaves: 10,
+        lacunarity: 2,
+        gain: 0.8,
+    };
+    let n = NoiseField::new(3, full, Basis::Gradient, 10_000);
+    let (c1, _) = n.coarse(2048);
+    let (c2, d2) = c1.coarse(16);
+    assert_eq!(d2, 0);
+    let (c3, d3) = c1.coarse(4096);
+    assert!(d3 > 0);
+    let mut worst = (0, 0);
+    for x in (0..20_000i64).step_by(37) {
+        for z in (0..2_000i64).step_by(41) {
+            assert_eq!(c1.value(x, z), c2.value(x, z));
+            worst.0 = worst.0.max(c1.value(x, z).abs_diff(c3.value(x, z)));
+            worst.1 = worst.1.max(n.value(x, z).abs_diff(c3.value(x, z)));
+        }
+    }
+    assert!(worst.0 <= d3, "{} over {d3}", worst.0);
+    assert!(worst.1 <= n.coarse(4096).1);
+}
+
+#[test]
+fn lattice_cells_of_huge_cells() {
+    // Cells of 2^33 blocks over a lattice of 1: the lattice table would span 2^68 points, so
+    // the size is decided in u128 and the center bounds are taken.
+    let f = LatticeField::new(0, Const(1));
+    let cells = f.cells(&CellGrid::new(0, 0, 1 << 33, 2, 2));
+    assert_eq!(cells.corners, vec![1; 9]);
+    assert_eq!(cells.bounds, vec![Span::point(1); 4]);
 }
 
 #[test]

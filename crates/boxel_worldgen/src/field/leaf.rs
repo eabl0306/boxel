@@ -79,18 +79,24 @@ impl NoiseField {
         }
     }
 
-    /// The field of the octaves [`Fbm::split_at`]`(min_wavelength)` keeps (in the full fbm's
-    /// scale), and a bound of how far the full field ever is from it:
-    /// `ceil(amplitude * dropped) + 1` (the 1 for the two roundings to integers), 0 when nothing
-    /// is dropped.
+    /// This field with the octaves under `min_wavelength` dropped too: the octaves
+    /// [`Fbm::split_at`] keeps at `max(min_wavelength, cut)` (in the full fbm's scale), `cut` the
+    /// wavelength this field was already split at (0 for a whole one), so splitting a coarse
+    /// field again never brings octaves back. With it, a bound of how far this field ever is
+    /// from the result: `ceil(amplitude * distance) + 1` ([`FbmSplit::distance`], the 1 for the
+    /// two roundings to integers), 0 when the same octaves are kept.
     pub fn split_at(&self, min_wavelength: u64) -> (Self, u64) {
-        let split = self.split.fbm().split_at(min_wavelength);
+        let split = self
+            .split
+            .fbm()
+            .split_at(min_wavelength.max(self.split.cut()));
         let coarse = Self::from_split(self.seed, split, self.basis, self.amplitude);
-        if split.dropped() == 0.0 {
-            // Nothing dropped: the same values, bit for bit.
+        let distance = split.distance(&self.split);
+        if distance == 0.0 {
+            // The same octaves: the same values, bit for bit.
             return (coarse, 0);
         }
-        let dropped = Q16::from_f64(split.dropped()).times(self.amplitude as u64);
+        let dropped = Q16::from_f64(distance).times(self.amplitude as u64);
         (coarse, dropped.saturating_add(1))
     }
 
