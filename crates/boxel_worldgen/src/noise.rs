@@ -1,7 +1,7 @@
 //! Deterministic noise from integers (no dependencies): 2D value noise ([`value_noise_2d`],
-//! [`fbm_2d`]) and 3D gradient noise ([`gradient_noise_3d`], [`fbm_3d`]). Same seed +
-//! coordinates = same value on every platform (integer lattice and hashing, `f64`
-//! interpolation).
+//! [`fbm_2d`]), 2D gradient noise ([`gradient_noise_2d`], [`gradient_fbm_2d`]), 3D gradient
+//! noise ([`gradient_noise_3d`], [`fbm_3d`]). Same seed + coordinates = same value on every
+//! platform (integer lattice and hashing, `f64` interpolation).
 //!
 //! Samples are integer coordinates and frequencies exact fractions ([`Frequency`]), so the
 //! lattice cell of a sample is an exact integer and its position inside the cell an exact
@@ -15,6 +15,9 @@
 //! After the integer split the noise uses only `+`, `-`, `*` and `/` on `f64` (correctly rounded
 //! by IEEE 754 everywhere), in a fixed order: no `mul_add` (Rust never fuses on its own), no
 //! `powf` and no other libm call, whose results may differ between platforms.
+//!
+//! [`Fbm::split_at`] cuts an fbm for the far LOD (the long octaves and a bound of the short
+//! ones), and [`Fbm::lipschitz`] bounds its slope.
 
 /// A noise frequency as an exact fraction: `num` lattice cells every `den` voxels.
 ///
@@ -572,8 +575,10 @@ impl LatticeTable {
 }
 
 mod d3;
+mod gradient;
 
 pub use d3::{Fbm3, Frequency3, fbm_3d, fbm_3d_grid, gradient_noise_3d, hash3};
+pub use gradient::{Basis, FbmSplit, gradient_fbm_2d, gradient_fbm_2d_grid, gradient_noise_2d};
 
 #[cfg(test)]
 mod tests;

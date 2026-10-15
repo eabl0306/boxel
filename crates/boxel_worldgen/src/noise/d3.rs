@@ -127,13 +127,13 @@ fn gradient(h: u64) -> [f64; 3] {
 /// Quintic fade `6t^5 - 15t^4 + 10t^3` for `t` in `[0, 1]`: 0 and 1 at the ends with zero first
 /// and second derivatives, so the noise is C2 across cell borders.
 #[inline]
-fn fade(t: f64) -> f64 {
+pub(super) fn fade(t: f64) -> f64 {
     t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 }
 
 /// `a + (b - a) * t`.
 #[inline(always)]
-fn lerp(a: f64, b: f64, t: f64) -> f64 {
+pub(super) fn lerp(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t
 }
 
