@@ -135,6 +135,10 @@ struct BoxFace {
     rect: Rect,
 }
 
+/// No solid top ([`BoxShape::top_floor`] of a model whose boxes leave part of its top layer
+/// open).
+const NO_FLOOR: u8 = u8::MAX;
+
 /// The faces a model made of boxes draws: every box face that no other box of the model covers
 /// (the bottom of a stair's step on its slab, a fence bar's end on the post), and what its faces
 /// flush with the cell border cover, per face.
@@ -142,6 +146,13 @@ struct BoxFace {
 struct BoxShape {
     faces: Vec<BoxFace>,
     covers: [Cover; 6],
+    /// The faces (bit [`Face::index`]) its boxes cover whole on the cell border (Minecraft's
+    /// sturdy faces: a slab's bottom, the back of stairs).
+    sturdy: u8,
+    /// The lowest y (sixteenths) from which its boxes fill every layer up to the cell's top
+    /// whole: 8 for a top slab or upside-down stairs, 0 for a full box, [`NO_FLOOR`] when the
+    /// top layer is not full (a bottom slab, a fence).
+    top_floor: u8,
 }
 
 impl BoxShape {
@@ -180,7 +191,31 @@ impl BoxShape {
                 });
             }
         }
-        Self { faces, covers }
+        let sturdy = Face::ALL
+            .iter()
+            .filter(|f| covers[f.index()] == [u16::MAX; 16])
+            .fold(0, |bits, f| bits | 1 << f.index());
+        // Down from the top layer while the boxes fill the layer's whole 16x16 section.
+        let mut top_floor = NO_FLOOR;
+        for y in (0..16).rev() {
+            let mut layer: Cover = [0; 16];
+            for b in boxes {
+                let (min, max) = (b.bounds.min, b.bounds.max);
+                if min[1] <= y && y < max[1] {
+                    add_rect(&mut layer, [min[0], max[0], min[2], max[2]]);
+                }
+            }
+            if layer != [u16::MAX; 16] {
+                break;
+            }
+            top_floor = y;
+        }
+        Self {
+            faces,
+            covers,
+            sturdy,
+            top_floor,
+        }
     }
 }
 
@@ -302,8 +337,9 @@ impl MaterialTable {
     /// Declares `material` (a block made of boxes) as waterlogged, holding a source of fluid
     /// `water` (ADR 0025): gather puts the water in its cell (it culls, merges and slopes as
     /// that fluid) and keeps the block in [`PaddedChunk::waterlogged`], whose boxes are drawn
-    /// as for the dry block. The water's faces against the block's sturdy faces are not drawn,
-    /// the others sit [`layout::FLUID_INSET`] inside the cell.
+    /// as for the dry block. The water's faces the block hides are not drawn (only an opaque
+    /// block hides any, ADR 0038), the others sit [`layout::FLUID_INSET`] inside the cell (but
+    /// the top).
     pub fn set_waterlogged(&mut self, material: u16, water: u16) {
         let i = usize::from(material);
         if i >= self.class.len() || usize::from(water) >= self.class.len() {
@@ -322,15 +358,23 @@ impl MaterialTable {
             .copied()
             .unwrap_or(false)
     }
-    /// The faces (bit [`Face::index`]) that the boxes of `material` cover whole on the cell
-    /// border (Minecraft's sturdy faces: a slab's bottom, the back of stairs); 0 for a material
-    /// not made of boxes.
-    pub(crate) fn sturdy_faces(&self, material: u16) -> u8 {
+    /// The faces (bit [`Face::index`]) of the water held by the waterlogged block `material`
+    /// that the block itself hides, the water's top corners being `heights` (sixteenths), as
+    /// Minecraft's liquid renderer does (ADR 0038). Only a block that occludes hides its water
+    /// (`canOcclude`: here [`RenderShape::Opaque`]); a cutout or translucent one (roots, leaves)
+    /// hides none. An opaque one hides the sides and the bottom its boxes cover whole on the
+    /// cell border (`isFaceOccludedBySelf`: a slab's bottom, the back of stairs), and the top
+    /// only where every corner lies inside its solid top or on it (at or above
+    /// [`BoxShape::top_floor`]: under a top slab), where it would be hidden or lose its depth
+    /// tie anyway (ADR 0025 sec. 6). 0 for a material not made of boxes.
+    pub(crate) fn held_water_hidden(&self, material: u16, heights: [u8; 4]) -> u8 {
+        if self.shape(material) != RenderShape::Opaque {
+            return 0;
+        }
         self.box_models.of(material).map_or(0, |shape| {
-            Face::ALL
-                .iter()
-                .filter(|f| shape.covers[f.index()] == [u16::MAX; 16])
-                .fold(0, |bits, f| bits | 1 << f.index())
+            let top = 1 << Face::PosY.index();
+            let inside = heights.iter().all(|&h| h >= shape.top_floor);
+            shape.sturdy & !top | if inside { top } else { 0 }
         })
     }
     /// Declares `material` as level `level` (`1..=15`; 0 is the source itself) of the fluid
@@ -1708,4 +1752,71 @@ fn layer_shading(
         AoPolicy::Baked | AoPolicy::BakedLitOnly => ao,
     };
     FaceShading { ao, light: corners }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shape of the boxes `(min, max)` (sixteenths).
+    fn shape(boxes: &[([u8; 3], [u8; 3])]) -> BoxShape {
+        let boxes: Vec<ModelBox> = boxes
+            .iter()
+            .map(|&(min, max)| ModelBox::new(min, max))
+            .collect();
+        BoxShape::new(&boxes, |_| 0)
+    }
+
+    #[test]
+    fn the_top_floor_is_where_the_solid_top_starts() {
+        // A bottom slab has no solid top, a top slab from 8, a full box from 0.
+        assert_eq!(shape(&[([0; 3], [16, 8, 16])]).top_floor, NO_FLOOR);
+        assert_eq!(shape(&[([0, 8, 0], [16; 3])]).top_floor, 8);
+        assert_eq!(shape(&[([0; 3], [16; 3])]).top_floor, 0);
+        // A plate under the top.
+        assert_eq!(shape(&[([0, 15, 0], [16; 3])]).top_floor, 15);
+        // Two half boxes of different depth: whole from 8 up.
+        let halves = [([0, 4, 0], [16, 16, 8]), ([0, 8, 8], [16; 3])];
+        assert_eq!(shape(&halves).top_floor, 8);
+        // Upside-down stairs: the step below fills only half its layers.
+        let stairs = [([0, 8, 0], [16; 3]), ([0; 3], [16, 8, 8])];
+        assert_eq!(shape(&stairs).top_floor, 8);
+        // A top that misses one sixteenth.
+        assert_eq!(shape(&[([0, 8, 0], [16, 16, 15])]).top_floor, NO_FLOOR);
+    }
+
+    #[test]
+    fn sturdy_faces_are_the_border_faces_the_boxes_cover_whole() {
+        let registry = boxel_demo::blocks::registry();
+        let table = MaterialTable::from_registry(&registry);
+        let mut models = 0;
+        for i in 0..registry.len() {
+            let s = BlockState(i as u16);
+            let Some(shape) = table.box_models.of(registry.material(s)) else {
+                continue;
+            };
+            models += 1;
+            let boxes = registry.model_boxes(s);
+            for face in Face::ALL {
+                let (n, u, v) = face.axes();
+                let positive = face.index().is_multiple_of(2);
+                let border = if positive { 16 } else { 0 };
+                // Every sixteenth of the border face lies on a box face on that border.
+                let whole = (0..16).all(|a| {
+                    (0..16).all(|b| {
+                        boxes.iter().any(|bx| {
+                            let (min, max) = (bx.bounds.min, bx.bounds.max);
+                            let plane = if positive { max[n] } else { min[n] };
+                            plane == border
+                                && (min[u]..max[u]).contains(&a)
+                                && (min[v]..max[v]).contains(&b)
+                        })
+                    })
+                });
+                let sturdy = shape.sturdy >> face.index() & 1 == 1;
+                assert_eq!(sturdy, whole, "{} {face:?}", registry.state_name(s));
+            }
+        }
+        assert!(models > 0);
+    }
 }

@@ -23,8 +23,9 @@
 //!
 //! The water of a waterlogged block (ADR 0025) is a source cell like any other for its
 //! neighbors, but always drawn one block at a time: a surface cell with its corner heights, any
-//! other one full (16/16 corners). Its faces against the block's sturdy faces (a slab's bottom,
-//! the back of stairs) are not drawn and the others carry [`layout::GEO_FLUID_INSET_BIT`].
+//! other one full (16/16 corners). An opaque block hides the faces its boxes cover whole on the
+//! border (a slab's bottom, the back of stairs) and the top only inside or on its solid top; a
+//! cutout block hides none (ADR 0038). The faces drawn carry [`layout::GEO_FLUID_INSET_BIT`].
 //!
 //! Textures (ADR 0025): the side faces show the fluid's flow texture (its side texture), and
 //! so does the top of a cell whose corners slope ([`fluid_flow`]); a level top shows the still
@@ -267,7 +268,7 @@ pub(crate) fn find_sloped(
             pos,
             material: fluid,
             heights: corners,
-            faces: greedy.take_faces(pos) & !materials.sturdy_faces(block),
+            faces: greedy.take_faces(pos) & !materials.held_water_hidden(block, corners),
             inset: true,
         });
     }
