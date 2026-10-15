@@ -137,6 +137,9 @@ media celda, sólida. Así las torres, los troncos y las copas sobreviven en tod
 los mares poco profundos siguen siendo agua lejos (si no, a 3 km todo mar de menos de 6 bloques
 sería arena).
 
+Un bloque inundado que no es sólido (pasto marino, algas, corales, una valla) cuenta como el agua
+que guarda: de lejos el mar se ve entero. Uno sólido (una losa) sigue sólido (issue #111).
+
 ### 5. Mallado
 
 El mallador de siempre (`Mesher::mesh`, sin cambios) sobre un `PaddedChunk` llenado a mano, con
@@ -885,6 +888,7 @@ intención del plan:
 - **Bajo tierra.** Dentro de una cueva sellada el LOD no se dibuja. En una cueva abierta lo
   recorta la pirámide de profundidad en High y el early-Z de la roca en Mid y Low.
 - **Bajo el piso del mundo.** Debajo de y = -64 el LOD no tiene cara de piso: nadie vuela ahí.
+- **Agua de un bloque sólido inundado.** No se cuenta: una losa inundada es sólida, sin su agua.
 - **Cuevas y plantas.** Lejos, las cuevas se cierran y las plantas no están. Las hojas son opacas,
   con el color medio de sus píxeles opacos: los bosques lejanos se ven algo más densos.
 - **Acantilados.** Los faldones cubren pendientes de hasta 3 a 1; un acantilado vertical puede
@@ -938,6 +942,9 @@ intención del plan:
   vacía, el cubo cutout `test:cutout` sólido); la regla de la celda en todos los casos del plan;
   proptest: la regla por mezclas igual a la directa en grillas al azar hasta el nivel 4, con
   orígenes hasta 2^40, y la mezcla asociativa y conmutativa.
+- Agua guardada (#111): una planta o una caja finas inundadas son agua en los niveles 1 a 4, lejos
+  del origen y en el límite del mundo, y sus gemelos secos no; una losa inundada sigue sólida; las
+  pirámides, `FlatGenerator` y `LodMaterials` lo siguen; ningún bloque del ejemplo está inundado.
 - `boxel_mesh::lod`: materiales; los cortes por octante conservan cada cara y dejan cada quad en
   un octante; faldones y paredes contra referencias de fuerza bruta; las caras de las pasadas no
   se ven desde adentro de un nodo dibujado; pruebas de grietas de 10.000 rayos (nivel 1 contra 2,
