@@ -38,6 +38,23 @@ fn q16_rounds_up() {
 }
 
 #[test]
+fn round_f64_rounds_halves_away_from_zero() {
+    for (v, want) in [
+        (0.0, 0),
+        (0.49, 0),
+        (0.5, 1),
+        (-0.5, -1),
+        (-0.49, 0),
+        (2.5, 3),
+        (-2.5, -3),
+        (1e12 + 0.5, 1_000_000_000_001),
+        (-((1u64 << 51) as f64) - 0.5, -(1 << 51) - 1),
+    ] {
+        assert_eq!(round_f64(v), want, "{v}");
+    }
+}
+
+#[test]
 fn isqrt_ceil_is_the_ceiling() {
     for n in 0u128..2000 {
         let r = isqrt_ceil(n);

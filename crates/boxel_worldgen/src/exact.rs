@@ -157,6 +157,21 @@ impl Slope {
     }
 }
 
+/// `v` rounded to the nearest integer, halves away from 0, exact for `|v| < 2^52`: the cast
+/// truncates, and `v - trunc(v)` is exact there (no `round`, which may be a libm call).
+#[inline]
+pub(crate) fn round_f64(v: f64) -> i64 {
+    let t = v as i64;
+    let frac = v - t as f64;
+    if frac >= 0.5 {
+        t + 1
+    } else if frac <= -0.5 {
+        t - 1
+    } else {
+        t
+    }
+}
+
 /// `ceil(sqrt(n))`.
 pub fn isqrt_ceil(n: u128) -> u128 {
     let r = n.isqrt();

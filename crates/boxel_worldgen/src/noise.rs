@@ -1,7 +1,8 @@
 //! Deterministic noise from integers (no dependencies): 2D value noise ([`value_noise_2d`],
 //! [`fbm_2d`]), 2D gradient noise ([`gradient_noise_2d`], [`gradient_fbm_2d`]), 3D gradient
-//! noise ([`gradient_noise_3d`], [`fbm_3d`]). Same seed + coordinates = same value on every
-//! platform (integer lattice and hashing, `f64` interpolation).
+//! noise ([`gradient_noise_3d`], [`fbm_3d`]), an integer domain warp ([`Warp`]) and cellular
+//! noise with stable site ids and exact Voronoi cells ([`Cellular`]). Same seed + coordinates =
+//! same value on every platform (integer lattice and hashing, `f64` interpolation).
 //!
 //! Samples are integer coordinates and frequencies exact fractions ([`Frequency`]), so the
 //! lattice cell of a sample is an exact integer and its position inside the cell an exact
@@ -10,7 +11,9 @@
 //! an `f64`; an absolute coordinate never does.
 //!
 //! The seed goes through `SplitMix64` before it is combined with the lattice coordinates, so
-//! nearby seeds (`fbm_2d` uses `seed + octave` per octave) give unrelated lattices.
+//! nearby seeds (`fbm_2d` uses `seed + octave` per octave) give unrelated lattices. Two fields
+//! from one world seed take [`mix_seed`] with their own salts, never `seed + salt`, so no field
+//! reaches another one's octaves.
 //!
 //! After the integer split the noise uses only `+`, `-`, `*` and `/` on `f64` (correctly rounded
 //! by IEEE 754 everywhere), in a fixed order: no `mul_add` (Rust never fuses on its own), no
@@ -225,6 +228,17 @@ impl Scale {
         };
         (cell, self.weight(rem))
     }
+}
+
+/// The seed of one field of a world: `splitmix64(splitmix64(seed) ^ salt)`, each field with its
+/// own constant salt.
+///
+/// Mixed, not added: an fbm gives octave `k` the seed `seed + k`, so `seed + salt` with salts a
+/// few apart (or two world seeds a few apart) would hand one field's octave lattices to another
+/// field's octaves. The world seed is mixed before the salt goes in, so world 1 with salt 0 does
+/// not get the noise of world 0 with salt 1 either (the demo caves' rule).
+pub const fn mix_seed(seed: u64, salt: u64) -> u64 {
+    splitmix64(splitmix64(seed) ^ salt)
 }
 
 /// `SplitMix64` output function (Steele, Lea and Flood 2014): a bijective 64-bit mix.
@@ -574,11 +588,15 @@ impl LatticeTable {
     }
 }
 
+mod cellular;
 mod d3;
 mod gradient;
+mod warp;
 
+pub use cellular::{Cellular, Nearest, Site, SiteId, VoronoiCell, VoronoiEdge};
 pub use d3::{Fbm3, Frequency3, fbm_3d, fbm_3d_grid, gradient_noise_3d, hash3};
 pub use gradient::{Basis, FbmSplit, gradient_fbm_2d, gradient_fbm_2d_grid, gradient_noise_2d};
+pub use warp::Warp;
 
 #[cfg(test)]
 mod tests;
