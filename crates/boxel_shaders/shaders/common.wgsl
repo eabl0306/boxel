@@ -344,9 +344,12 @@ fn finish_vertex(d: Decoded, chunk_origin: vec3<i32>, view: View) -> VsOut {
   // strict Greater test, so on equal depths rounding would pick a winner per pixel (z-fighting).
   // A fluid's depth (near / w, reverse-Z) is scaled by FLUID_DEPTH_SCALE: 2^-16 of its distance
   // farther. That is about 100 times the f32 rounding of a depth, and up to 4096 blocks away
-  // (far past any view distance) less than the 1/16 of a block between a fluid face and
-  // anything truly behind it (box faces and fluid heights are sixteenths). Every face on a fluid
-  // face's plane wins. The vertex does not move on screen, so no crack opens.
+  // (far past any view distance) less than the 1/16 of a block between a fluid face on a
+  // sixteenth and anything truly behind it (box faces and fluid heights are sixteenths). An
+  // inset face (FLUID_INSET) has only 1/512 to its cell's border: past about 128 blocks a face
+  // there, truly behind it, can win in some pixels (cosmetic, the same on every tier, ADR 0038).
+  // Every face on a fluid face's plane wins. The vertex does not move on screen, so no crack
+  // opens.
   let shape = d.flags >> 1u;
   if (shape == SHAPE_FLUID_CUBE || shape == SHAPE_FLUID_SURFACE || shape == SHAPE_FLUID_SLOPE) {
     o.clip.z = o.clip.z * FLUID_DEPTH_SCALE;

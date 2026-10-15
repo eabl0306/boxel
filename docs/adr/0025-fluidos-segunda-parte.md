@@ -4,7 +4,9 @@
 - Fecha: 2026-10-09
 - Revisa: ADR 0021 (fluidos), ADR 0018 sección 6 (la superficie del agua) y ADR 0020 (modelos de
   cajas)
-- Revisado por: ADR 0029 (agua y lava se declaran en el registro, con `boxel_demo::fluids`)
+- Revisado por: ADR 0029 (agua y lava se declaran en el registro, con `boxel_demo::fluids`) y
+  ADR 0038 (sección 4: qué caras de su agua tapa un bloque; sección 6: el margen de las caras
+  metidas)
 - Revisado: 2026-10-14 (#110, ningún fluido que corre entra en un bloque que puede tener agua)
 
 ## Contexto
@@ -124,7 +126,7 @@ mar, el agua queda quieta como una pared vertical, porque el agua generada no pr
   (`GEO_FLUID_INSET_BIT`, `FLUID_INSET`). Minecraft hace lo mismo con 0.001: así la cara del bloque
   en el borde siempre queda delante y no pelea en profundidad con la del agua. El techo del agua,
   que a 16/16 queda en el plano del techo de un escalón o de un poste, pierde ese empate por la
-  sección 6. Qué caras tapa el bloque lo precisa el ADR 0038: solo uno opaco tapa alguna.
+  sección 6. Qué caras tapa el bloque lo precisa el ADR 0038: uno cutout no tapa ninguna.
 
 ### 5. Textura de flujo
 
@@ -162,8 +164,12 @@ mar, el agua queda quieta como una pared vertical, porque el agua generada no pr
 - El shader escala la profundidad de todo quad de fluido por `FLUID_DEPTH_SCALE` (1 - 2^-16):
   queda esa fracción de su distancia más atrás y pierde todos los empates. Es unas 100 veces el
   redondeo de `f32` y, hasta 4096 bloques, menos que el 1/16 de bloque que separa una cara de
-  fluido de lo que de verdad está detrás. Los vértices no se mueven en pantalla, así que no abre
-  grietas.
+  fluido en una dieciseisava de lo que de verdad está detrás. Los vértices no se mueven en
+  pantalla, así que no abre grietas.
+- Una cara metida 1/512 (el agua de un bloque con agua, sección 4) tiene solo ese margen hasta el
+  borde de su celda. Desde unos 128 bloques el corrimiento lo supera, y una cara en ese borde, que
+  está de verdad detrás, puede ganarle en algunos píxeles. Es cosmético e igual en los tres tiers
+  (ADR 0038).
 - `gpu_fluids` lo prueba en los tres tiers, junto con el techo inclinado de la lava visto desde
   abajo de su chunk.
 
