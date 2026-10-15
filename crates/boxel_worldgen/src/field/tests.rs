@@ -375,6 +375,43 @@ proptest! {
     }
 
     #[test]
+    fn coarse_forms_bound_the_full_tree(
+        seed in any::<u64>(), x in place(), z in place(), cut in 0u64..2048,
+        d in (-300i64..300, -300i64..300),
+    ) {
+        let noise = NoiseField::new(seed, fbm(1024, 6), Basis::Gradient, 1000);
+        let value = NoiseField::new(seed ^ 1, fbm(512, 5), Basis::Value, 500);
+        let lattice = LatticeField::new(4, noise);
+        let splined = Splined::new(&lattice, spline());
+        let add = Add::new(&value, &splined);
+        let min = Min::new(&add, &noise);
+        let weight = LatticeField::new(
+            6,
+            Splined::new(noise, Spline::new(&[(-300, 0), (300, 1 << 16)])),
+        );
+        let blend = Blend::new(&weight, &min, Const(300), 16);
+        let warped = Warped::new(Warp::new(seed, fbm(256, 2), 40), &lattice);
+        fn holds<F: Coarsen>(name: &str, f: &F, cut: u64, points: &[(i64, i64)]) -> Result<(), TestCaseError> {
+            let (coarse, d) = f.coarse(cut);
+            for &(x, z) in points {
+                let (full, part) = (f.value(x, z), coarse.value(x, z));
+                prop_assert!(full.abs_diff(part) <= d, "{name} at ({x}, {z}): {full} {part} over {d}");
+            }
+            Ok(())
+        }
+        let points = [(x, z), (x + d.0, z + d.1), (x - 17, z + 5), (x & !15, z & !15)];
+        holds("const", &Const(3), cut, &points)?;
+        holds("noise", &noise, cut, &points)?;
+        holds("lattice", &lattice, cut, &points)?;
+        holds("splined", &splined, cut, &points)?;
+        holds("add", &add, cut, &points)?;
+        holds("min", &min, cut, &points)?;
+        holds("weight", &weight, cut, &points)?;
+        holds("blend", &blend, cut, &points)?;
+        holds("warped", &warped, cut, &points)?;
+    }
+
+    #[test]
     fn noise_split_bounds_the_full_field(
         seed in any::<u64>(), x in place(), z in place(), cut in 0u64..4096,
         basis in prop::sample::select(vec![Basis::Value, Basis::Gradient]),
@@ -516,6 +553,25 @@ fn node_cells_cost_a_few_grids_per_leaf() {
     }
     // WG1_COUNTS=1 shows the counts.
     assert!(std::env::var("WG1_COUNTS").is_err(), "{report:?}");
+}
+
+#[test]
+fn coarse_forms_compose_their_bounds() {
+    // Nothing dropped: the same tree, bound 0.
+    let noise = NoiseField::new(4, fbm(1024, 4), Basis::Gradient, 1000);
+    let tree = Add::new(Splined::new(LatticeField::new(3, noise), spline()), noise);
+    let (same, d) = tree.coarse(0);
+    assert_eq!(d, 0);
+    assert_eq!(same.value(123, -45), tree.value(123, -45));
+    // Two octaves dropped: the noise's bound, times the spline's steepest slope (3) where it
+    // runs through the spline, plus itself where it is added.
+    let (_, dn) = noise.coarse(512);
+    let (_, dt) = tree.coarse(512);
+    assert!(dn > 0);
+    assert_eq!(dt, Q16::from_int(3).times(dn) + dn);
+    // A spline flat over the noise's values takes none of it.
+    let flat = Splined::new(noise, Spline::new(&[(-5000, 7), (5000, 7)]));
+    assert_eq!(flat.coarse(512).1, 0);
 }
 
 #[test]

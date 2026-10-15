@@ -3,7 +3,8 @@
 
 use super::cells::corner_grid;
 use super::{
-    CellGrid, Cells, Field, Fine, Rect, Slope, Span, bound_from_slope, by_bound, fine_from_slope,
+    CellGrid, Cells, Coarsen, Field, Fine, Rect, Slope, Span, bound_from_slope, by_bound,
+    fine_from_slope,
 };
 use crate::exact::Q16;
 
@@ -288,5 +289,16 @@ impl<C: Field> LatticeField<C> {
             up: u64::from(!aligned),
             down: 1,
         })
+    }
+}
+
+impl<C: Coarsen> Coarsen for LatticeField<C> {
+    type Coarse = LatticeField<C::Coarse>;
+
+    /// The coarse child on the same lattice, with the child's bound: a weighted mean of values
+    /// at most `d` apart, floored, moves by at most `d` (an integer).
+    fn coarse(&self, min_wavelength: u64) -> (Self::Coarse, u64) {
+        let (child, d) = self.child.coarse(min_wavelength);
+        (LatticeField::new(self.shift, child), d)
     }
 }

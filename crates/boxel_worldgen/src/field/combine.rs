@@ -2,7 +2,7 @@
 //! bounds from its children's; the proofs are in the docs, the checks in the tests.
 
 use super::{
-    CellGrid, Cells, Field, Fine, Rect, Slope, Span, Spline, bound_from_slope, by_bound,
+    CellGrid, Cells, Coarsen, Field, Fine, Rect, Slope, Span, Spline, bound_from_slope, by_bound,
     corner_values, fine_from_slope, slope_cells,
 };
 use crate::exact::{Q16, div_ceil_sticky, mul_shift_ceil, saturate};
@@ -569,5 +569,64 @@ impl<C: Field> Field for Warped<C> {
     /// child per cell.
     fn cells(&self, grid: &CellGrid) -> Cells {
         slope_cells(self, grid)
+    }
+}
+
+impl<C: Coarsen> Coarsen for Splined<C> {
+    type Coarse = Splined<C::Coarse>;
+
+    /// The child's bound times the spline's steepest slope over both children's values.
+    fn coarse(&self, min_wavelength: u64) -> (Self::Coarse, u64) {
+        let (child, d) = self.child.coarse(min_wavelength);
+        let (m_lo, m_hi) = self
+            .spline
+            .slopes_over(self.child.range().hull(child.range()));
+        let m = Q16::from_raw(saturate(m_lo.unsigned_abs().max(m_hi.unsigned_abs())));
+        (Splined::new(child, self.spline.clone()), m.times(d))
+    }
+}
+
+impl<A: Coarsen, B: Coarsen> Coarsen for Add<A, B> {
+    type Coarse = Add<A::Coarse, B::Coarse>;
+
+    /// Both bounds added.
+    fn coarse(&self, min_wavelength: u64) -> (Self::Coarse, u64) {
+        let ((a, da), (b, db)) = (self.a.coarse(min_wavelength), self.b.coarse(min_wavelength));
+        (Add::new(a, b), da.saturating_add(db))
+    }
+}
+
+impl<A: Coarsen, B: Coarsen> Coarsen for Min<A, B> {
+    type Coarse = Min<A::Coarse, B::Coarse>;
+
+    /// The larger bound: `|min(a, b) - min(a', b')| <= max(|a - a'|, |b - b'|)`.
+    fn coarse(&self, min_wavelength: u64) -> (Self::Coarse, u64) {
+        let ((a, da), (b, db)) = (self.a.coarse(min_wavelength), self.b.coarse(min_wavelength));
+        (Min::new(a, b), da.max(db))
+    }
+}
+
+impl<W: Coarsen, A: Coarsen, B: Coarsen> Coarsen for Blend<W, A, B> {
+    type Coarse = Blend<W::Coarse, A::Coarse, B::Coarse>;
+
+    /// `g - g' = (w (a - a') + (S - w)(b - b') + (w - w')(a' - b')) / S`: the larger input bound
+    /// plus the weight's bound times the coarse inputs' largest gap over `S` (the floors keep it
+    /// within the ceiling of that).
+    fn coarse(&self, min_wavelength: u64) -> (Self::Coarse, u64) {
+        let (w, dw) = self.weight.coarse(min_wavelength);
+        let ((a, da), (b, db)) = (self.a.coarse(min_wavelength), self.b.coarse(min_wavelength));
+        let term = mul_shift_ceil(dw, gap(a.range(), b.range()), self.shift);
+        let d = da.max(db).saturating_add(term);
+        (Blend::new(w, a, b, self.shift), d)
+    }
+}
+
+impl<C: Coarsen> Coarsen for Warped<C> {
+    type Coarse = Warped<C::Coarse>;
+
+    /// The coarse child at the same warped points (the warp stays whole), with its bound.
+    fn coarse(&self, min_wavelength: u64) -> (Self::Coarse, u64) {
+        let (child, d) = self.child.coarse(min_wavelength);
+        (Warped::new(self.warp, child), d)
     }
 }

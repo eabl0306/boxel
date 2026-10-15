@@ -11,7 +11,9 @@
 //!   values at a rectangle's 4 corners ([`Fine`]). That is the margin a LOD cell needs: the
 //!   interpolant's maximum is at a corner, so `max corner + fine.up` bounds the field inside;
 //! - [`Field::cells`]: the corners, bounds and fines of a whole grid of cells at once
-//!   ([`CellGrid`], [`Cells`]), the form a LOD node asks for.
+//!   ([`CellGrid`], [`Cells`]), the form a LOD node asks for;
+//! - [`Coarsen::coarse`], for the fields that have one: the same tree with the short noise
+//!   octaves dropped, and a bound of the difference.
 //!
 //! The fields are generic structs, monomorphized: [`LatticeField`] (a child sampled at the points
 //! of a `2^k` lattice and interpolated exactly), [`Splined`] (a fixed-point [`Spline`] of a
@@ -286,6 +288,35 @@ impl<F: Field + ?Sized> Field for &F {
     }
     fn cells(&self, grid: &CellGrid) -> Cells {
         (**self).cells(grid)
+    }
+}
+
+/// A field with a cheaper coarse form for the far LOD: the noise octaves under a wavelength
+/// dropped everywhere in the tree ([`Fbm::split_at`](crate::noise::Fbm::split_at)), and a bound
+/// of how far the field ever is from it.
+///
+/// The bound composes through the combinators: a [`NoiseField`] gives its split's bound; a
+/// [`LatticeField`] or [`Warped`] keeps its child's (a weighted mean, or the same sample points);
+/// [`Add`] adds both; [`Min`] takes the larger; a [`Splined`] multiplies its child's by the
+/// spline's steepest slope over the child's values (`|S(u) - S(v)| < m |u - v| + 1`, so `ceil(m
+/// d)` for integers); a [`Blend`] takes the larger of its inputs' plus the weight's times the
+/// gap of the coarse inputs over the scale. So the plan's margin "dropped octaves times the local
+/// spline slope" is the tree's own, not done by hand. The bound is global (one per field); a
+/// margin per LOD cell can add it to the coarse field's [`Field::cells`].
+pub trait Coarsen: Field {
+    /// The coarse form's type (the same combinators over the coarse children).
+    type Coarse: Field;
+
+    /// The coarse form for `min_wavelength` and `d` with `|self(p) - coarse(p)| <= d` at every
+    /// point.
+    fn coarse(&self, min_wavelength: u64) -> (Self::Coarse, u64);
+}
+
+impl<F: Coarsen + ?Sized> Coarsen for &F {
+    type Coarse = F::Coarse;
+
+    fn coarse(&self, min_wavelength: u64) -> (Self::Coarse, u64) {
+        (**self).coarse(min_wavelength)
     }
 }
 

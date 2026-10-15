@@ -1,6 +1,6 @@
 //! The leaves of a field: [`Const`] and [`NoiseField`] (a quantized fbm).
 
-use super::{CellGrid, Cells, Field, Fine, Rect, Slope, Span, slope_cells};
+use super::{CellGrid, Cells, Coarsen, Field, Fine, Rect, Slope, Span, slope_cells};
 use crate::exact::{Q16, round_f64};
 use crate::noise::{Basis, Fbm, FbmSplit};
 
@@ -81,10 +81,15 @@ impl NoiseField {
 
     /// The field of the octaves [`Fbm::split_at`]`(min_wavelength)` keeps (in the full fbm's
     /// scale), and a bound of how far the full field ever is from it:
-    /// `ceil(amplitude * dropped) + 1` (the 1 for the two roundings to integers).
+    /// `ceil(amplitude * dropped) + 1` (the 1 for the two roundings to integers), 0 when nothing
+    /// is dropped.
     pub fn split_at(&self, min_wavelength: u64) -> (Self, u64) {
         let split = self.split.fbm().split_at(min_wavelength);
         let coarse = Self::from_split(self.seed, split, self.basis, self.amplitude);
+        if split.dropped() == 0.0 {
+            // Nothing dropped: the same values, bit for bit.
+            return (coarse, 0);
+        }
         let dropped = Q16::from_f64(split.dropped()).times(self.amplitude as u64);
         (coarse, dropped.saturating_add(1))
     }
@@ -142,5 +147,22 @@ impl Field for NoiseField {
     /// [`slope_cells`]: the per-cell defaults from a corner grid and a center grid.
     fn cells(&self, grid: &CellGrid) -> Cells {
         slope_cells(self, grid)
+    }
+}
+
+impl Coarsen for Const {
+    type Coarse = Self;
+
+    fn coarse(&self, _min_wavelength: u64) -> (Self, u64) {
+        (*self, 0)
+    }
+}
+
+impl Coarsen for NoiseField {
+    type Coarse = Self;
+
+    /// [`NoiseField::split_at`].
+    fn coarse(&self, min_wavelength: u64) -> (Self, u64) {
+        self.split_at(min_wavelength)
     }
 }
