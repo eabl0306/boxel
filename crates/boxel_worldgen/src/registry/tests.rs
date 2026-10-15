@@ -258,6 +258,53 @@ fn ordered_entries_sort_by_phase_then_priority_then_id() {
     assert_ne!(low.params_hash(ix), high.params_hash(ix));
 }
 
+/// A kind as a trait object over plain data, the shape WG-REGION registers.
+trait Kind: GenEntry {
+    fn height(&self) -> i32;
+}
+
+#[derive(Debug)]
+struct Flat(i32);
+
+impl HashParams for Flat {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&self.0);
+    }
+}
+
+impl GenEntry for Flat {
+    fn version(&self) -> u32 {
+        4
+    }
+    fn order(&self) -> Order {
+        Order::new(1, self.0)
+    }
+}
+
+impl Kind for Flat {
+    fn height(&self) -> i32 {
+        self.0
+    }
+}
+
+#[test]
+fn trait_objects_register_like_plain_entries() {
+    let mut builder: GenRegistryBuilder<Box<dyn Kind>> = GenRegistryBuilder::new("test_kind");
+    builder
+        .register(id("test:low"), Box::new(Flat(-3)))
+        .register(id("test:high"), Box::new(Flat(7)));
+    let kinds = builder.freeze().expect("no duplicates");
+    let high = kinds.find("test:high").expect("high");
+    assert_eq!(high.index(), 0, "the higher priority first");
+    assert_eq!(kinds[high].height(), 7);
+    assert_eq!(kinds.version(high), 4);
+    // The box adds nothing to the hash: the same as the plain entry's.
+    let mut plain = GenRegistryBuilder::new("test_kind");
+    plain.register(id("test:high"), Flat(7));
+    let plain = plain.freeze().expect("one entry");
+    assert_eq!(kinds.params_hash(high), plain.params_hash(GenIx::new(0)));
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
