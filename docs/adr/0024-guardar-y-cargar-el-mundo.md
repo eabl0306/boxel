@@ -5,6 +5,8 @@
 - Revisa: la sección 12 de `docs/architecture.md` (el trait `ChunkStore`), el punto de la
   descarga de ADR 0015 sección 7 (una edición que movió un techo ya no se pierde) y "Fuera de
   esta parte" de ADR 0021 (los ticks programados se guardan).
+- Revisado por: ADR 0039 (una clave de metadatos más del motor, `boxel:worldgen`, que llega con
+  WG-SAVE)
 
 ## Contexto
 

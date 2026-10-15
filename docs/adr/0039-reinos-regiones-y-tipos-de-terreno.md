@@ -68,7 +68,8 @@ WorldPreset (game:default, game:large_biomes, ...)  se elige al crear el mundo, 
 - `WorldGenerator` y `LodSource` conservan sus firmas. Los métodos nuevos tienen valor por defecto
   y dejan todo como hoy:
   - `version() -> u32`: 0.
-  - `realms() -> &RealmStack`: un solo reino que abarca toda y, con cielo `Open`.
+  - `realms() -> &RealmStack`: un solo reino que abarca toda y, con cielo `Open` y `lod = Draw`
+    (el único reino `Draw` que pide la sección 2).
   - `as_query() -> Option<&dyn WorldQuery>`: `None`.
   - más adelante, `column_bounds` (WG4, sección 14).
 
@@ -91,7 +92,8 @@ ser +infinito e `y_lo`, -infinito.
   (4096 bloques) cruza un plano, y un chunk está siempre en un solo reino.
 - `realm_of(y)` es una búsqueda binaria entre a lo sumo 8 planos: O(1) para quien pregunte
   (streaming, lejanía, luz, física, la cámara).
-- Despacho: `generate(key)` llama a `realm_of(key.y)` y al generador de ese reino. Es una llamada
+- Despacho: `generate(key)` llama a `realm_of` con un vóxel de su chunk (`key.pos.y << 5`: la clave
+  da la capa en chunks y `realm_of` toma vóxeles) y al generador de ese reino. Es una llamada
   virtual por chunk.
 - Cada reino tiene su sal (`salt(id del reino)`, mezclada en la semilla), así agregar un reino no
   mueve el azar de otro.
@@ -148,7 +150,8 @@ El plano es un corte duro. La continuidad a través de él la acuerda el conteni
   porque las agujas se apoyan en él.
 - Los tipos que tocan un plano se ubican desde él. La distancia del `ContactField` es un parámetro
   del Context, y la aguja, el agujero que rompe y la montaña invertida son reglas `Point` sobre esa
-  distancia (un disco alrededor del sitio). Ningún reino lee el selector del otro.
+  distancia (un disco alrededor del sitio; la sección 7 dice qué radio pide en cada distancia).
+  Ningún reino lee el selector del otro.
 
 Ejemplo: el reparto que el dueño eligió para el juego (decisión 5 del plan).
 
@@ -246,12 +249,18 @@ grad H = suma_k w_k grad H_k + suma_k (H_k - m) grad w_k      (para cualquier co
 - Un paso de la caja mueve los conteos de todos los tipos juntos a lo sumo 6 de 9 cada 256
   bloques. Con m el punto medio de las alturas presentes, el segundo término es a lo sumo `D / 768`
   por eje y `D / 543` (raíz de 2 veces más) en diagonal, con cualquier cantidad de tipos. D es la
-  mayor `|H_a - H_b|` entre tipos que se tocan.
+  mayor `|H_a - H_b|` entre los tipos presentes en la columna (los de sus 16 puntos de retícula).
+  El primer término es a lo sumo la mayor pendiente de esos tipos.
 - Los tipos suman relieve sobre la base común del Context, así D es una diferencia de relieves.
   Cada tipo declara su rango de relieve `[lo_k, hi_k]` dentro de la banda, y para cada par
   `D_ab = max(hi_a - lo_b, hi_b - lo_a)`.
-- El chequeo al congelar pide `max(slope_a, slope_b) + D_ab / 543 <= 3` para todo par que las
-  reglas puedan poner lado a lado. El chequeo por pares también cubre los puntos triples.
+- El chequeo al congelar pide `max(slope) + max(D_ab) / 543 <= 3` para todo par y todo trío de
+  tipos que las reglas puedan juntar en una misma ventana de 4 x 4 puntos de retícula, con los dos
+  máximos tomados dentro del grupo. Con los tríos alcanza: un grupo más grande cumple si cumple el
+  trío de su tipo más empinado y su par más lejano.
+- Solo por pares no alcanza: con `a` en [90, 110], `b` en [-110, -90] y un `c` más empinado en
+  [-10, 10], cada par pasa con la pendiente máxima que le deja el chequeo y el punto triple llega a
+  3,08.
 - El tope de 3:1 vale en cualquier línea, no solo en los ejes. Es lo que piden los faldones de la
   lejanía (ADR 0031) y el test de pendiente.
 
@@ -274,14 +283,20 @@ agujas (suben), el agujero gigante y las montañas invertidas (bajan).
   ```
 
   El término vale cero hasta K, y su pendiente es a lo sumo `max(pendiente propia, s_c)` en
-  cualquier línea (d_f es una distancia de Chebyshev, 1-Lipschitz en toda dirección).
+  cualquier línea (d_f es una distancia de Chebyshev, 1-Lipschitz en toda dirección). La pendiente
+  propia es la del término antes del cono.
 - El término se suma a la altura mezclada del tipo, así el tope pide
-  `slope_k + max(pendiente propia, s_c) <= 3` (chequeo al congelar). Con `s_c = 2,5`, el relieve
-  propio del tipo queda con pendiente de a lo sumo 0,5 en su núcleo; si no, el tipo baja `s_c`.
-- La altura cuesta lugar. Una aguja de 12 km necesita una `d_f` de unos 5,4 km en su pico, así su
-  región mide al menos unos 11 km (celdas de 2^14). Su regla `Point` es un disco de radio de al
-  menos 5,6 km alrededor del sitio de contacto. Un agujero de profundidad P necesita una región de
-  al menos `2 (512 + P / 2,5)` bloques.
+  `slope_k + max(pendiente propia, s_c) <= 3` (chequeo al congelar), con `slope_k` la pendiente que
+  el tipo declara en `limits`. Con `s_c = 2,5`, el tipo declara una pendiente de a lo sumo 0,5; si
+  necesita más, baja `s_c`.
+- La altura cuesta lugar, medido en `d_f`, que es de Chebyshev. Una aguja de 12 km necesita una
+  `d_f` de unos 5,4 km en su pico, así su región tiene que contener un cuadrado de unos 11 km de
+  lado. Su regla `Point` lo da si la distancia del `ContactField` también es de Chebyshev: un
+  cuadrado de semilado de al menos 5,6 km alrededor del sitio de contacto. Un disco euclídeo de
+  radio R da en su centro solo unos `R / raíz de 2` de `d_f`, porque el punto ajeno más cercano cae
+  en la diagonal, así necesita un radio de al menos unos 7,9 km. V3 elige la distancia.
+- Un agujero de profundidad P necesita una región que contenga un cuadrado de
+  `2 (512 + P / 2,5)` bloques de lado.
 - Costo: `d_f` se calcula por columna de chunk con los puntos ajenos de una ventana de radio
   `D_max / Ls`, leídos una vez del memo de la retícula (unos 45 x 45 puntos en una aguja, y solo en
   regiones de aguja). Si mide alto, la palanca es una cota conservadora por celda de región desde
@@ -444,10 +459,10 @@ Además:
   nada, y lo lejano es la niebla y el color de cielo del entorno. Al volver, la lejanía se llena de
   cero, como después de un salto. Sin cambios en el motor. En el aire bajo la cara de abajo del
   techo, el entorno deja el LOD encendido, así la superficie sigue dibujada abajo.
-- Las caras de la lejanía se iluminan como cielo abierto (ADR 0031 sección 12). Está bien para el
-  reino dibujado, que es `Open`. Dibujar lejos un reino `Closed` o `Under` (islas del cielo vistas
-  desde la superficie, la cara de abajo vista desde abajo) es EW-REALMLOD, y no está planeado: pide
-  un árbol por reino y una paleta de luz por nodo.
+- Las caras de la lejanía se iluminan como cielo abierto (ADR 0031 secciones 9 y 12). Está bien
+  para el reino dibujado, que es `Open`. Dibujar lejos un reino `Closed` o `Under` (islas del cielo
+  vistas desde la superficie, la cara de abajo vista desde abajo) es EW-REALMLOD, y no está
+  planeado: pide un árbol por reino y una paleta de luz por nodo.
 - Una aguja de 12 km son 24 capas de nodos en el nivel 4 y 6 en el nivel 6: varios jobs por columna
   en los niveles cercanos, en columnas raras, que cuenta V3. Una torre fina queda al menos como una
   columna de celdas en todo nivel (cualquier bloque sólido hace sólida su celda).
@@ -489,7 +504,7 @@ mundo para el conjunto que resuelve su preset. Rechazan:
 - ids desconocidos y duplicados;
 - una regla `Point` con más de una entrada;
 - envoltorios que apuntan a ranuras que no existen;
-- un par de tipos que pueden quedar lado a lado y no pasan el chequeo de pendiente y relieve de
+- un par o un trío de tipos que pueden juntarse y no pasan el chequeo de pendiente y relieve de
   borde (sección 6);
 - términos de núcleo cuyo cono o pendiente propia, sumados a la pendiente de su tipo, rompen el
   tope (sección 7);
@@ -541,8 +556,8 @@ fn column_bounds(&self, dim, realm: RealmIx, area: ColumnArea) -> ColumnBounds
 ColumnBounds { layers: RangeInclusive<i64>, ground_lo: i64 }
 ```
 
-- `ColumnArea` es un cuadrado alineado de 2^n columnas de chunk: n = 0 para una columna de chunk,
-  n = k para una columna de nodos de nivel k.
+- `ColumnArea` es un cuadrado alineado de 2^n x 2^n columnas de chunk: n = 0 para una columna de
+  chunk, n = k para una columna de nodos de nivel k (un nodo mide 2^k chunks de lado).
 - `layers` son las capas de chunk que pueden tener algo que no es aire. `ground_lo` es un vóxel en
   o bajo la superficie abierta más baja del reino en el área; en un reino `Ceiling`, al revés: en o
   sobre el punto más alto de su cara de abajo.
@@ -641,9 +656,10 @@ Consecuencias del modelo:
   64 bloques). `environment_at` es por posición, no solo por reino: el aire bajo la cara de abajo
   del techo usa un entorno como el de la superficie (LOD encendido, sol), y su roca y sus cuevas uno
   oscuro (LOD apagado).
-- Los reinos `Closed` usan una curva sin sol y su propio ambiente (en el juego, el Nether cerca de
-  0,15 y las cuevas del techo 0,02, como las de hoy), y su color de cielo es el de su niebla, así no
-  se ve nada más allá del radio cargado.
+- Los reinos `Closed`, y las partes oscuras de los demás (la roca y las cuevas del techo, que es
+  `Under`), usan una curva sin sol y su propio ambiente (en el juego, el Nether cerca de 0,15 y las
+  cuevas del techo 0,02, como las de hoy). Su color de cielo es el de su niebla, así no se ve nada
+  más allá del radio cargado.
 - El día y la noche siguen siendo globales: un reloj por mundo. Los reinos `Closed` no lo ven.
 - EW-REALMENV (render, protegido) existe solo si alguno de esos recursos resulta leído una sola vez
   al arrancar. `FogSettings` cambia en tiempo de ejecución y `DaylightCurve` se lee en cada frame.
@@ -658,8 +674,10 @@ Consecuencias del modelo:
 
 ### 17. El guardado
 
-- Una clave de metadatos nueva del motor, `boxel:worldgen`. Se escribe al crear el mundo, junto a
-  `boxel:generator`, y entra en `RESERVED` de `tools/no_content.py`.
+- Una clave de metadatos nueva del motor, `boxel:worldgen`. Se escribe solo al crear el mundo,
+  junto a `boxel:generator`, y entra en `RESERVED` de `tools/no_content.py`. El store escribe
+  `boxel:generator` en cualquier mundo que no la tenga, pero `boxel:worldgen` no: un mundo viejo no
+  la recibe al abrirse, así sigue abriendo como legado.
 - `FORMAT_VERSION` no cambia. El store rechaza cualquier versión que no sea la actual y no tiene
   lector de versiones viejas, así subirla rechazaría todas las partidas guardadas. El valor lleva su
   propio byte de versión del registro, así el registro puede crecer sin tocar `FORMAT_VERSION`.
@@ -669,10 +687,10 @@ Consecuencias del modelo:
     `IdMap`);
   - por dimensión, la tabla de reinos (id del reino y span), el spec del generador (id del tipo,
     versión y hash de parámetros) y la lista del digest.
-- Al abrir, el motor compara el registro guardado con el registro vivo y le devuelve al juego
-  `WorldgenDiff { added, removed, changed }`. La política es del juego. La que eligió el dueño para
-  el juego: avisar y seguir. Los chunks que no se guardaron salen del conjunto nuevo, así la tierra
-  guardada puede encontrarse con tierra nueva en una costura.
+- Al abrir, el motor compara lo guardado en `boxel:worldgen` con los registros vivos y le devuelve
+  al juego `WorldgenDiff { added, removed, changed }`. La política es del juego. La que eligió el
+  dueño para el juego: avisar y seguir. Los chunks que no se guardaron salen del conjunto nuevo,
+  así la tierra guardada puede encontrarse con tierra nueva en una costura.
 - Agregar un reino a un mundo existente es una entrada agregada, más un span cambiado en el reino
   que corta (en el reparto del juego, los últimos 256 bloques de la superficie sobre -4096 pasan a
   graduar hacia la roca del Nether). Solo muestran costura los chunks ya guardados ahí abajo: en la
@@ -714,8 +732,8 @@ El diseño de las estructuras es de #116. Acá queda solo la puerta.
   ejemplo `game:land_cells`) con peso y condición, y una entrada de `BiomeRule` restringida a ese
   tipo. El rendezvous le da cerca de `w / (W + w)` de las celdas elegibles (W es la suma de los
   pesos que ya estaban); las demás conservan su tipo. Su pendiente y su rango de relieve en la
-  banda pasan el chequeo contra cada tipo que puede tener al lado, o el mundo no abre y el mensaje
-  nombra los dos ids.
+  banda pasan el chequeo con cada par y cada trío de tipos que puede tener cerca (sección 6), o el
+  mundo no abre y el mensaje nombra los ids.
 - **Modificar lo de serie**: `KindWrapper` y `ContextWrapper` por `(priority, id)`, y
   modificadores de forma, reglas de superficie, carvers, features, pasos post y sets de estructuras
   agregados por id a su fase. Una entrada `Disable(id)` de prioridad mayor apaga una.
@@ -740,10 +758,10 @@ El diseño de las estructuras es de #116. Acá queda solo la puerta.
 - v1 (W0 y W1) es solo el reino de la superficie, con un tipo de tierra (`game:continental`). No
   corre mezcla en el camino caliente hasta que W2 la mida: el camino rápido del interior corre en
   todas partes, y el selector tiene una regla `Cell` con una entrada.
-- La API de reinos y regiones existe desde el primer PR del motor, con un reino, la forma `Ground`
-  y tipos de test, así nada se reescribe cuando llegue el mundo vertical. El streaming, la luz y el
-  lado del mundo de la lejanía no cambian en v1. Ningún término de núcleo, volumen ni otra forma se
-  construye antes de su paso V.
+- La API de reinos y regiones existe desde WG-REGION (el paso 4 de abajo, el primero que genera
+  chunks), con un reino, la forma `Ground` y tipos de test, así nada se reescribe cuando llegue el
+  mundo vertical. El streaming, la luz y el lado del mundo de la lejanía no cambian en v1. Ningún
+  término de núcleo, volumen ni otra forma se construye antes de su paso V.
 - Pasos del motor antes del primer vuelo, en orden:
   1. WG-ADR: este ADR, en paralelo con WG1 y W0, antes de WG-REG.
   2. WG1 #67: primitivas exactas (ruido de gradiente 2D, deformación entera, ruido celular con ids
@@ -791,8 +809,10 @@ El diseño de las estructuras es de #116. Acá queda solo la puerta.
   la gran ronda de control. El Nether entra al mundo de serie del juego cuando se acepta V1; el
   agujero, las agujas y el techo quedan en el tipo de mundo "Vertical" hasta que la ronda de control
   los mida.
-- Un OK del dueño por item protegido, cuando le toca: WG4, EW-REALMSKY, EW-SKYUNDER, EW-REALMENV
-  solo si hace falta, y EW-GRAVITY después de la gran ronda de control.
+- Un OK del dueño por item protegido, cuando le toca. Del mundo vertical: WG4, EW-REALMSKY,
+  EW-SKYUNDER, EW-REALMENV solo si hace falta, y EW-GRAVITY después de la gran ronda de control.
+  Del resto de la generación, fuera de este contrato: EW-SNOWLOD (después de W2), EW-TINT (W2), WG6
+  (W3) y WG3 solo si una medición lo pide.
 - No planeado: dos dimensiones cargadas a la vez; un Nether como dimensión aparte con portales (el
   reino lo reemplaza); dibujar un segundo reino en la lejanía (EW-REALMLOD).
 
@@ -873,7 +893,9 @@ Los tests del motor usan ids `test:`; los del juego, su contenido.
     techo no.
 13. **Streaming y techo de la lejanía** (WG4): `known_air(pos)` nunca salta un chunk con algo; con
     un reino que sube para siempre, la lejanía quiere las mismas capas que sin él; la fuente del
-    reino dibujado nunca emite una capa de otro reino.
+    reino dibujado nunca emite una capa de otro reino; con un generador de un solo reino cuya cota
+    es `vertical_chunks`, el streaming y la lejanía quieren los mismos chunks y capas con la cota y
+    sin ella.
 14. **Goldens** por versión de generador: `WorldGenerator::version` y `LodSource::version` suben con
     ellos.
 
@@ -926,6 +948,8 @@ Los tests del motor usan ids `test:`; los del juego, su contenido.
 - **Un tope de 4 tipos por columna.** Con la cota de `2^51`, `i64` alcanza para cualquier cantidad.
 - **El chequeo de pendiente `|edge_a - edge_b| / 768`.** Estaba mal: dos tipos con el mismo rango de
   relieve pueden diferir en todo el rango, y solo miraba los ejes.
+- **Un chequeo de pendiente solo por pares.** No cubre los puntos triples: un tipo empinado entre
+  dos tipos lejanos en altura pasa cada par y rompe el tope (sección 6).
 - **Un producto por rampa en los términos de núcleo.** No respeta el tope: un término de 12 km por
   una rampa de 512 bloques da una pendiente cerca de 23.
 - **El desvanecido de volúmenes `(1 - Wcore)` por conteo de caja.** Podía valer 1/49 en el corte y

@@ -4,6 +4,7 @@
 - Fecha: 2026-10-10
 - Revisa: ADR 0018 (modelos), ADR 0020 y 0027 (escaleras, vallas, antorchas, muros y puertas de
   valla), ADR 0021 y 0025 (fluidos), ADR 0028 (texturas animadas de los packs)
+- Revisado por: ADR 0039 (la sección 7 suma la clave reservada `worldgen`, que llega con WG-SAVE)
 
 ## Contexto
 
