@@ -147,6 +147,7 @@ ronda 2 no encontró empeoramientos
 
 - `tools/perf` ya no arranca los casos de radio 32 con 48 Mi quads y 98 304 slots.
 - Los ejemplos ya no le dan 24 Mi quads y 65 536 slots al overworld.
+- boxelcraft tampoco: desde 2026-10-14 arranca con `ChunkMemorySettings::default()`.
 
 En el motor todo arranca del piso por defecto (8 Mi quads, 32 768 slots) y crece. `--arena-quads`,
 `--chunk-slots` y `--chunk-memory` siguen como opciones. Un binario de antes de las páginas (sin
@@ -163,9 +164,6 @@ chunks perdidos ni páginas de emergencia.
   de crecimiento). `MemoryHints::Manual` iría en `boxel_gfx`, que está protegido. Decide el dueño.
 - Tras volver de radio 32 a 8, soltar las páginas de más tarda casi un minuto, no los 15 s del
   plan. Soltar de una vez las páginas que ya están vacías lo acortaría. Decide el dueño.
-- La parte del juego de la decisión 10. boxelcraft, que vive en su propio repo, todavía arranca el
-  overworld con 24 Mi quads y 65 536 slots (`world::ARENA_QUADS` y `world::CHUNK_SLOTS`). Quitarlos
-  y usar `ChunkMemorySettings::default()`, con su test, se hace en el juego.
 
 ## Consecuencias
 
