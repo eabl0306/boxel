@@ -941,14 +941,26 @@ class OutsideTest(FakeMachine):
         # A base from before the app declared cases: nothing to compare against.
         old = fake_stress(self.dir, 'old')
         self.assertEqual(self.cmd_smoke(old, new, ['surface']), 2, self.output())
-        self.assertIn('the base declares no cases', self.output())
+        self.assertIn('the base binary declares no cases', self.output())
         self.assertEqual(calls(old) + calls(new), 0)
 
-    def test_two_built_binaries_and_cases_from_the_new_one(self):
+    def test_by_default_a_case_the_new_binary_lost_fails(self):
+        base = self.app('base', cases={'surface': 's', 'gone': 'g'})
+        new = self.app('new', cases={'surface': 's'})
+        self.assertEqual(self.cmd_smoke(base, new), 1, self.output())
+        self.assertIn('has no gone scenario and the base has it', self.output())
+        self.assertEqual(calls(new), 1, 'surface still ran')
+
+    def test_two_built_binaries_and_cases_from_either(self):
         new = self.app('new')
         self.assertEqual(self.cmd_smoke('HEAD', new), 64)
         self.assertIn("--outside takes --base BIN, a built binary of the app", self.output())
-        self.assertEqual(self.cmd_smoke(new, fake_stress(self.dir, 'stress')), 2)
+        # A new binary that declares no cases lost every case of the base.
+        self.assertEqual(self.cmd_smoke(new, fake_stress(self.dir, 'stress')), 1)
+        self.assertIn('the new binary declares no cases', self.output())
+        self.assertIn('has no underground scenario and the base has it', self.output())
+        self.assertEqual(self.cmd_smoke(fake_stress(self.dir, 'a'), fake_stress(self.dir, 'b')),
+                         2)
         self.assertIn('not an outside app', self.output())
         self.assertEqual(self.cmd_smoke(new, new, ['dive']), 64)
         self.assertIn("'dive' is not a GPU", self.output())

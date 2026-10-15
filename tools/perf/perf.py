@@ -21,8 +21,8 @@ failure counts. Capped on the RTX, p99 only counts when both runs landed in the 
 `--` go to stress on both sides (`-- --bodies 10000`); --new-extra 'OPTIONS' go to the new side
 only, after them, to price an option against the same binary without it (`--base HEAD
 --new-extra '--fog valley'`). With --outside, base and new are built binaries of an outside app
-that declares its own cases (runs.py, its module doc): every case it declares by default, with the
-same rules and table.
+that declares its own cases (runs.py, its module doc): by default every case either side declares
+(one the new binary lost fails), with the same rules and table.
 
 check (level 2, `just perf-check`): the fixed matrix (`perf.py cases`), 3 interleaved runs of
 20 s per case and side, on a commit of main, against the binary of the last checkpoint
@@ -550,22 +550,27 @@ def merge_base():
 
 def outside_binaries(a):
     """(base, new, the cases they declare) of an outside app: two built binaries (this harness
-    builds only the engine's stress). A case only the base declares is the new binary's loss,
-    one only the new declares is skipped."""
+    builds only the engine's stress). The new binary's cases first, then the ones only the base
+    declares: those are the new binary's loss (also when it declares none at all), and one only
+    the new declares is skipped."""
     for flag, spec in (('--base', a.base), ('--new', a.new)):
         if not spec or not os.path.isfile(spec):
             raise ValueError(f'--outside takes {flag} BIN, a built binary of the app (git refs '
                              f'build only stress): {spec!r} is not a file')
     base, new = resolve(a.base, 'base'), resolve(a.new, 'new')
-    try:
-        declared = runs.app_cases(new.path)
-    except ValueError as e:
-        raise PerfError(str(e)) from None
-    try:
-        declared = {**runs.app_cases(base.path), **declared}
-    except ValueError as e:
-        say(f'perf-smoke: note: the base declares no cases, so none can be compared ({e})')
-    return base, new, declared
+    sides, errors = {}, []
+    for side, binary, note in (('new', new, 'every case of the base is lost'),
+                               ('base', base, 'none can be compared')):
+        try:
+            sides[side] = runs.app_cases(binary.path)
+        except ValueError as e:
+            errors.append(str(e))
+            say(f'perf-smoke: note: the {side} binary declares no cases, so {note} ({e})')
+    if not sides:
+        raise PerfError('; '.join(errors))
+    mine = sides.get('new', {})
+    lost = {k: s for k, s in sides.get('base', {}).items() if k not in mine}
+    return base, new, {**mine, **lost}
 
 
 def cmd_smoke(a):
@@ -575,7 +580,7 @@ def cmd_smoke(a):
     declared = None
     if a.outside:
         base, new, declared = outside_binaries(a)
-        names = a.cases or list(runs.app_cases(new.path))
+        names = a.cases or list(declared)
     else:
         names = a.cases or DEFAULT_SMOKE
     cases = [runs.parse_case(text, default, declared) for text in names]

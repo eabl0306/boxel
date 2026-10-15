@@ -79,12 +79,12 @@ python3 tools/perf/perf.py cases --outside BIN       # los casos que declara
 python3 tools/perf/perf.py smoke --outside --base BIN_BASE --new BIN_NUEVO [CASO...] [-- OPCIONES]
 ```
 
-- Sin casos corre todos los que declara el binario nuevo. Un caso se escribe como los de stress:
-  `780m/surface/144`. Las opciones tras `--` van a la app en los dos lados.
+- Sin casos corre todos los que declara alguno de los dos binarios. Un caso se escribe como los
+  de stress: `780m/surface/144`. Las opciones tras `--` van a la app en los dos lados.
 - Base y nuevo son binarios ya compilados: perf.py solo compila stress. La app trae su receta,
   que compila los dos y llama a perf.py (sin `tools/quiet.sh` alrededor).
 - Un caso que la base no declara se salta (sale con 2). Uno que el binario nuevo perdió es un
-  fallo (sale con 1).
+  fallo (sale con 1), también si el nuevo ya no declara ninguno.
 - `perf-check` y `perf-bisect` no corren apps de fuera.
 
 Lo que hace la app (el detalle está en `tools/perf/runs.py`):
