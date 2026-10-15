@@ -650,7 +650,8 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   escalera, los lados de una valla y el soporte de una antorcha siguen a sus vecinos
   (`boxel_voxel::rules`, aplicadas por `boxel_world::NeighborRules` en cada lote de ediciones).
   Desde ADR 0025, la lava corre (`boxel:lava[level=0..15]`), hay adoquín y obsidiana, y losas,
-  escaleras y vallas guardan agua (`waterlogged`).
+  escaleras y vallas guardan agua (`waterlogged`). Desde ADR 0038 el motor también deja guardar
+  agua a un cubo cutout, aunque la demo no tiene ninguno.
 - **Contenedor de paleta:** `Uniform(state)` | `Packed { palette, bits 1/2/4/8, words }` |
   `Direct(u16)`. Los índices nunca cruzan palabras de 64 bits. `set` agrega a la paleta en el
   lugar mientras entra; se compacta al guardar o en reposo. Medido en un mundo de 512x256x512:
@@ -844,11 +845,12 @@ un `Mesher` thread-local (~0.6 MiB de scratch) y un `LightScratch` (~0.7 MiB).
    las máscaras del greedy y se emite por bloque con `SHAPE_FLUID_SLOPE` y sus alturas en los bits
    de `w - 1`, `h - 1` y el AO. Validado contra un oráculo de alturas y sin grietas entre chunks.
    Un bloque con agua (ADR 0025) se junta como su agua (`PaddedChunk::waterlogged` guarda el
-   bloque, que se dibuja con sus cajas) y su agua va siempre por bloque, con las caras metidas
-   1/512 en la celda. Un bloque cutout no tapa ninguna cara de su agua (ADR 0038). Los costados de
-   los fluidos y el techo inclinado llevan la textura de flujo, que el shader desplaza con el
-   tiempo (`viewport.z` del uniform `View`). El shader corre la profundidad de todo fluido 2^-16 de
-   su distancia hacia atrás: pierde los empates con las caras que toca.
+   bloque, que se dibuja con sus cajas; un cubo cutout con agua, con sus caras una por bloque,
+   ADR 0038) y su agua va siempre por bloque, con las caras metidas 1/512 en la celda. Un bloque
+   cutout no tapa ninguna cara de su agua (ADR 0038). Los costados de los fluidos y el techo
+   inclinado llevan la textura de flujo, que el shader desplaza con el tiempo (`viewport.z` del
+   uniform `View`). El shader corre la profundidad de todo fluido 2^-16 de su distancia hacia
+   atrás: pierde los empates con las caras que toca.
 6. **Buckets (8, congelados, ADR 0012):** 0 a 5 = caras opacas en orden `Face`; 6 = **cutout**
    (todas las caras de materiales cutout, como las hojas, y el techo inclinado de un fluido opaco,
    ADR 0025); 7 = translúcido. `ChunkMesh` guarda los quads contiguos por bucket,

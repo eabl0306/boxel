@@ -1,7 +1,7 @@
 # ADR 0038: agua en bloques que dejan ver
 
-- Estado: aceptado. El dueño aprobó el item EW-WATERFACE (#109) el 2026-10-14 y tomó las
-  decisiones del plan.
+- Estado: aceptado. El dueño aprobó los items EW-WATERFACE (#109) y EW-WETCUBE (#113) el
+  2026-10-14 y tomó las decisiones del plan.
 - Fecha: 2026-10-14
 - Revisa: ADR 0025, sección 4 (qué caras de su agua tapa un bloque con agua) y sección 6 (el
   margen de las caras metidas)
@@ -17,7 +17,8 @@ fuera y estuviera donde estuviera la cara del agua. Fallaba dos veces:
 - El techo del agua queda entre 11/16 y 16/16. Una placa fina arriba del todo lo tapaba aunque
   no llegara hasta el agua.
 
-Las hojas con agua (#113) llegan después, con su propia decisión.
+Además las hojas no podían tener agua (#113): un cubo completo nunca la guardaba, y el greedy
+no sabe dibujar un cubo cuya celda es agua.
 
 ## Decisión 1: qué caras de su agua tapa el bloque
 
@@ -42,6 +43,20 @@ Como el `LiquidBlockRenderer` de Minecraft, salvo en los bloques translúcidos:
 Está en `MaterialTable::held_water_hidden` (`boxel_mesh`), que lee dos bytes por modelo
 calculados una vez (`sturdy` y `top_floor`).
 
+## Decisión 2: cubos con agua
+
+- Un cubo cutout con `waterlogged` guarda agua (hojas, como en Minecraft desde 1.19). Uno opaco
+  (la losa doble), translúcido o invisible nunca, diga lo que diga su propiedad. Un cubo
+  translúcido con agua pediría ordenar dos capas translúcidas en una celda, y Minecraft no tiene
+  ninguno.
+- El cubo se dibuja igual que seco: las mismas caras, capas, AO y luz, pero una cara por bloque
+  (fuera del greedy). Tapa sus caras como el seco: contra un cubo opaco y contra el mismo bloque,
+  seco o con agua (`MaterialTable::dry`).
+- Su agua es la de cualquier bloque con agua (decisión 1): como es cutout, no tapa ninguna cara.
+- Para el fluido es una fuente sellada si colisiona entero: no corre, no cuenta para sus vecinos
+  y no toma una fuente nueva (`canPassThroughWall`). Romperlo deja su agua. Sin cambios en el
+  código de fluidos, luz, físicas, guardado ni lejanía (en la lejanía es sólido, como seco).
+
 ## Consecuencias
 
 - Las raíces muestran toda su agua: costados y piso 1/512 hacia adentro y el techo a sus
@@ -57,6 +72,13 @@ calculados una vez (`sturdy` y `top_floor`).
   distancia) lo supera desde unos 128 bloques, y una cara en ese borde, de verdad detrás del agua,
   puede ganarle en algunos píxeles. Es cosmético e igual en los tres tiers; el ADR 0025 y el
   comentario de `common.wgsl` ya lo dicen.
+- Un cubo con agua cuesta sus caras una a una más las de su agua: un techo de 16x16 hojas con
+  agua sobre un estanque son 1277 quads, contra 131 secas. Solo en contenido que lo pida.
+- Entre una hoja seca y una con agua queda una cara (la de la seca, que ve agua). Entre dos
+  secas no hay ninguna. Las hojas de Minecraft dibujan las dos.
 - Descartado: tapar el techo solo a 16/16 (suma un quad oculto bajo cada losa de arriba con agua
   y mueve el golden), mantener la regla vieja para los cutout (las raíces siguen secas) y que un
   translúcido no tape nada (el orden translúcido no lo resuelve).
+- Descartado: dibujar el cubo con agua en el greedy (su celda debe ser agua para el corte y las
+  alturas, ADR 0025) y esconder la cara de la hoja seca contra la mojada (cambia el corte del
+  greedy, el camino caliente).

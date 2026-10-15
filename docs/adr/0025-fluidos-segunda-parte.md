@@ -81,7 +81,7 @@ mar, el agua queda quieta como una pared vertical, porque el agua generada no pr
 
 - `StateFlags::WATERLOGGED` marca los estados que guardan una fuente de agua y
   `StateFlags::WATERLOGGABLE` los que podrían. Un cubo completo (la losa doble) no es ninguna de
-  las dos cosas, diga lo que diga su propiedad.
+  las dos cosas, diga lo que diga su propiedad (un cubo cutout sí, ADR 0038).
 - El agua no cambia el modelo, la colisión ni la textura del bloque. La valla con agua corta el
   cielo directo como el agua (opacidad 1); losas y escaleras ya lo hacían.
 
