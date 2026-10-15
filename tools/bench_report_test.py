@@ -145,6 +145,13 @@ class OutputTest(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertIn('| 500 | 2 | 3 | 5 | 8 | 200 | 2 | 0 | 6.50 | 100 | 10 | 250 | - | - |',
                       rows[0])
+        # An outside app's summary (tools/perf, "Medir una app de fuera") has no world rates:
+        # they show as '-', not a crash or a 0.
+        app = copy.deepcopy(SAMPLE)
+        app['world'] = {'final': {'chunks': 10}}
+        code, out, _ = run_main(self.write('app.md', app))
+        self.assertEqual(code, 0)
+        self.assertIn('| 6.50 | - | - | - |', out)
 
     def test_directories_skip_other_files(self):
         self.write('run.md', SAMPLE, 'runs')

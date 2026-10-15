@@ -325,7 +325,7 @@ def table(runs):
         cells = [
             title(run), f"{r['backend']} {r['tier']}", f['count'], f['avg_fps'], f['p50_ms'],
             f['p99_ms'], f['p999_ms'], f['max_ms'], f['low_1_fps'], f['over_144hz'],
-            f['over_60hz'], get(f, ('crossing', 'max_ms')), w['generated_per_s'],
+            f['over_60hz'], get(f, ('crossing', 'max_ms')), get(w, ('generated_per_s',)),
             get(w, ('queued', 'max')), get(w, ('border_catch_up', 'max_ms')),
             f.get('over_7_5ms'), get(run, ('pacing', 'presented_fps')), r.get('idle_work'),
             get(w, ('border_catch_up', 'work_max_ms')),
