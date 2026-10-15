@@ -3,9 +3,10 @@
 //! (Minecraft's `getSpread` and `getSlopeDistance` as written: every rule checked in full at
 //! every step, every block read from the world), on random blocks near the origin and far from
 //! it, for every fluid of the registry: water, lava and a third one that looks further for a
-//! way down than the memo keeps. And the fluids of a registry without a waterlog fluid, and
-//! what hardens in a world of test fluids: never a waterlogged block, and a fluid beside each
-//! fluid it hardens with.
+//! way down than the memo keeps. The random blocks include a waterloggable plant and a plant
+//! that keeps fluids out, neither of which collides. And the blocks no flowing fluid enters,
+//! the fluids of a registry without a waterlog fluid, and what hardens in a world of test
+//! fluids: never a waterlogged block, and a fluid beside each fluid it hardens with.
 use super::*;
 use crate::jobs::InlineExecutor;
 use crate::streaming::WorldJobs;
@@ -50,10 +51,34 @@ fn fluid_block(b: &mut BlockRegistryBuilder, name: &str) -> boxel_voxel::BlockId
     b.block_by_name(name).unwrap()
 }
 
-/// The demo's blocks and fluids, and a third fluid that water flows into where it is at least
-/// 2 high.
+/// A plant without collision named `name` (a cross, cutout), with layer 0 on every face and
+/// the properties `properties`.
+fn plant_block(
+    b: &mut BlockRegistryBuilder,
+    name: &str,
+    properties: Vec<Property>,
+) -> boxel_voxel::BlockId {
+    let def = BlockDef {
+        name: name.into(),
+        shape: RenderShape::Cutout,
+        model: BlockModel::Cross,
+        collision: BlockCollision::None,
+        emission: [0; 3],
+        light_opacity: 0,
+        textures: FaceTextures::all(TextureId(0)),
+    };
+    b.add_block_with_states(def, properties, |_, _| {}).unwrap();
+    b.block_by_name(name).unwrap()
+}
+
+/// The demo's blocks and fluids, a third fluid that water flows into where it is at least 2
+/// high, and two plants without collision that no flowing fluid enters: `test:lichen`, which
+/// can be waterlogged, and `test:cane`, declared to keep fluids out.
 static REGISTRY: LazyLock<BlockRegistry> = LazyLock::new(|| {
     let mut b = boxel_demo::blocks::builder();
+    plant_block(&mut b, "test:lichen", vec![Property::boolean(WATERLOGGED)]);
+    let cane = plant_block(&mut b, "test:cane", Vec::new());
+    b.set_keeps_fluids_out(cane).unwrap();
     let goo = fluid_block(&mut b, "test:goo");
     let goo = b.add_fluid(goo, GOO).unwrap();
     let water = FluidId(0);
@@ -91,16 +116,20 @@ fn states(keep: impl Fn(BlockState) -> bool) -> Vec<BlockState> {
         .collect()
 }
 
-/// Dry blocks that would take a water source (slabs, stairs and fences) and waterlogged ones:
-/// the cells whose walls the rules check.
+/// Dry blocks that would take a water source (slabs, stairs, fences and the lichen) and
+/// waterlogged ones: the cells whose walls the rules check.
 static DRY: LazyLock<Vec<BlockState>> =
     LazyLock::new(|| states(|s| REGISTRY.can_be_waterlogged(s) && !REGISTRY.is_waterlogged(s)));
 static WET: LazyLock<Vec<BlockState>> = LazyLock::new(|| states(|s| REGISTRY.is_waterlogged(s)));
+/// The blocks without collision that keep flowing fluids out: the lichen, dry and wet, and the
+/// cane.
+static KEEPERS: LazyLock<Vec<BlockState>> =
+    LazyLock::new(|| states(|s| REGISTRY.keeps_fluids_out(s) && REGISTRY.collision(s).is_none()));
 
-/// A random block, weighted out of `air + stone + 12`: air, stone, a water source, a dry block
+/// A random block, weighted out of `air + stone + 13`: air, stone, a water source, a dry block
 /// that would take one (often enough that two sources sit beside one and it takes them), a
-/// waterlogged block, any state of the registry (every level of water and lava, plants,
-/// torches) or not loaded.
+/// waterlogged block, a block without collision that keeps fluids out, any state of the
+/// registry (every level of water and lava, plants, torches) or not loaded.
 fn block(air: u32, stone: u32) -> impl Strategy<Value = Option<BlockState>> {
     let len = REGISTRY.len() as u16;
     let pick = |list: &'static LazyLock<Vec<BlockState>>| {
@@ -112,6 +141,7 @@ fn block(air: u32, stone: u32) -> impl Strategy<Value = Option<BlockState>> {
         3 => Just(REGISTRY.by_name("boxel:water")),
         3 => pick(&DRY),
         1 => pick(&WET),
+        1 => pick(&KEEPERS),
         4 => (0..len).prop_map(|s| Some(BlockState(s))),
         1 => Just(None),
     ]
@@ -331,6 +361,67 @@ fn the_third_fluid_finds_a_way_down_6_blocks_away() {
     assert_eq!(fast, general_targets(&flow, &world, center, Some(source)));
     let east = Some((Face::PosX, Some(Fluid::flowing(5))));
     assert_eq!(fast, [None, None, None, east]);
+}
+
+/// No flowing fluid enters a block that can be waterlogged, dry or wet, nor a block declared to
+/// keep fluids out, though neither collides (Minecraft's `LiquidBlockContainer` and its list of
+/// blocks that hold no fluid): not water, nor lava, nor the third fluid. None is a hole but a
+/// wet one for water (it holds water), and lava falling on a wet one does not turn it to stone.
+/// Only the water's new source goes into a dry one, while a plain plant holds every fluid.
+#[test]
+fn a_block_that_can_hold_water_holds_no_flowing_fluid() {
+    let r = &*REGISTRY;
+    let s = |name: &str| r.parse_state(name).expect(name);
+    let dry = s("test:lichen[waterlogged=false]");
+    let wet = s("test:lichen[waterlogged=true]");
+    let cane = s("test:cane");
+    let plant = s("boxel:short_grass");
+    let water = s("boxel:water");
+    for state in [dry, wet, cane, plant] {
+        assert!(r.collision(state).is_none() && !r.blocks_motion(state));
+    }
+    let air = Some(BlockState::AIR);
+    for (i, fluid) in r.fluids().iter().enumerate() {
+        let id = FluidId(i as u8);
+        let flow = Flow {
+            fluids: Fluids::new(r),
+            id,
+            rules: fluid.rules,
+        };
+        let takes = r.waterlog_fluid() == Some(id);
+        for state in [dry, wet, cane] {
+            let what = format!("{id:?} into {}", r.state_name(state));
+            assert!(!flow.can_hold(Some(state)), "{what}");
+            assert_eq!(
+                flow.is_hole(air, Some(state)),
+                takes && state == wet,
+                "{what}"
+            );
+            for new in [None, Some(Fluid::FALLING), Some(Fluid::flowing(7))] {
+                assert!(!flow.can_hold_new(Some(state), new), "{what}");
+                assert!(
+                    !flow.can_pass_through(air, Some(state), Face::PosX, new),
+                    "{what}"
+                );
+                for face in [Face::PosX, Face::NegY] {
+                    assert!(!flow.can_spread_to(air, Some(state), face, new), "{what}");
+                }
+            }
+        }
+        assert_eq!(flow.can_hold_new(Some(dry), Some(Fluid::SOURCE)), takes);
+        assert!(!flow.can_hold_new(Some(wet), Some(Fluid::SOURCE)));
+        assert!(!flow.can_hold_new(Some(cane), Some(Fluid::SOURCE)));
+        assert!(flow.can_hold(Some(plant)) && flow.is_hole(air, Some(plant)));
+    }
+    // Lava falls into a water source (and turns it to stone) but not into a wet lichen.
+    let lava = Flow {
+        fluids: Fluids::new(r),
+        id: FluidId(1),
+        rules: r.fluids()[1].rules,
+    };
+    let falling = Some(Fluid::FALLING);
+    assert!(lava.can_spread_to(air, Some(water), Face::NegY, falling));
+    assert!(!lava.can_spread_to(air, Some(wet), Face::NegY, falling));
 }
 
 /// A builder with texture 0 and `test:slab`, a bottom slab that can be waterlogged.

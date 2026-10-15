@@ -18,7 +18,8 @@
 //!   lava 3.
 //! - A cell can hold a fluid if nothing in it stops movement (air, plants, torches, water and
 //!   lava; a fence gate stops it open or closed, as in Minecraft, though an open one does not
-//!   collide: `BlockRegistry::blocks_motion`). The fluid may flow into it if what it holds can
+//!   collide: `BlockRegistry::blocks_motion`) and it does not keep fluids out
+//!   (`BlockRegistry::keeps_fluids_out`, below). The fluid may flow into it if what it holds can
 //!   be replaced (`FluidType::replaced_by`): an empty cell always, water only by lava falling
 //!   into it (which turns it to stone, `FluidType::falls_into`), lava only by water where the
 //!   lava is at least 4/9 high. A fluid never replaces its own cells.
@@ -26,12 +27,16 @@
 //!   holds a source of the registry's waterlog fluid (water): it ticks and spreads like one and
 //!   counts as one for its neighbors, but never hardens (only the fluid's own block does, as in
 //!   Minecraft's `LiquidBlock`).
-//!   Flowing water never fills a block (it stops movement), but a dry one where water would
-//!   make a new source (two sources beside it) takes it and becomes waterlogged, as in
-//!   Minecraft (`canPlaceLiquid`). Between two cells, a fluid passes only where their collision
-//!   faces toward each other leave part of the face open (Minecraft's `canPassThroughWall`):
-//!   water flows out of the sides of a waterlogged slab but not through the bottom of a bottom
-//!   slab.
+//!   No flowing fluid enters a block that can be waterlogged, dry or wet, with collision or
+//!   without (Minecraft's `LiquidBlockContainer`): flowing water never washes a dry
+//!   `game:lichen` away, and lava never burns one nor turns a waterlogged one to stone (it
+//!   still hardens beside a wet one). Nor does one enter a block declared with
+//!   `BlockRegistryBuilder::set_keeps_fluids_out` (`game:sugar_cane`). But a dry waterloggable
+//!   block where water would make a new source (two sources beside it) takes it and becomes
+//!   waterlogged, as in Minecraft (`canPlaceLiquid`). Between two cells, a fluid passes only
+//!   where their collision faces toward each other leave part of the face open (Minecraft's
+//!   `canPassThroughWall`): water flows out of the sides of a waterlogged slab but not through
+//!   the bottom of a bottom slab.
 //! - A fluid next to another may harden at once (`FluidType::hardens`, Minecraft's
 //!   `LiquidBlock::shouldSpreadLiquid`): a lava cell with water above it or beside it turns to
 //!   obsidian if it is a source, to cobblestone otherwise. A fluid may harden beside several
@@ -49,7 +54,7 @@ use boxel_app::{App, Plugin};
 use boxel_voxel::rules::collision_face_cover;
 use boxel_voxel::{
     BlockCollision, BlockModel, BlockPos, BlockRegistry, BlockState, FLUID_LEVEL, Face, FluidId,
-    FluidRules, FluidType,
+    FluidRules, FluidType, StateFlags,
 };
 use std::cell::Cell;
 
@@ -404,15 +409,19 @@ impl Flow<'_> {
         self.fluid(state).is_some_and(|f| f.source)
     }
 
-    /// Minecraft's `canHoldFluid`: nothing in the cell stops movement (air, plants, torches,
-    /// water and lava; not a fence gate, even open: [`BlockRegistry::blocks_motion`]), and it is
-    /// not a fluid this module does not know.
+    /// Minecraft's `canHoldFluid` for flowing fluid (`canHoldAnyFluid` and
+    /// `canHoldSpecificFluid`): nothing in the cell stops movement (air, plants, torches, water
+    /// and lava; not a fence gate, even open: [`BlockRegistry::blocks_motion`]) nor keeps fluids
+    /// out (no block that can be waterlogged, dry or not, and no `game:sugar_cane`:
+    /// [`BlockRegistry::keeps_fluids_out`]), and it is not a fluid this module does not know.
     fn can_hold(&self, state: Option<BlockState>) -> bool {
         let Some(state) = state else {
             return false;
         };
         let registry = self.registry();
-        !registry.blocks_motion(state)
+        !registry
+            .flags(state)
+            .intersects(StateFlags::BLOCKS_MOTION | StateFlags::KEEPS_FLUIDS_OUT)
             && (registry.model(state) != BlockModel::Fluid || self.fluids.content(state).is_some())
     }
 

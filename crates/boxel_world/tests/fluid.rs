@@ -3,17 +3,19 @@
 //! of a game tick in schedule order, no chunks, no budget, no overlay. The engine must match it
 //! cell for cell after every game tick: spread distance, the way down, falling, new sources,
 //! draining, lava's slower and shorter flow, lava meeting water (obsidian, cobblestone, stone),
-//! and waterlogged slabs and fences (sources that flow out through their open faces, never
-//! filled by flowing water, waterlogged by a new source between two others), and fence gates
-//! that hold fluids back open or closed. Also the tick budget (it only delays), ticks frozen in
-//! unloaded chunks, worldgen water that stays still, and the same scenes far from the origin.
+//! and waterlogged slabs, fences and lichen (sources that flow out through their open faces,
+//! never entered by flowing water or lava, collision or not, waterlogged by a new source between
+//! two others), a cane no fluid enters either, and fence gates that hold fluids back open or
+//! closed. Also the tick budget (it only delays), ticks frozen in unloaded chunks, worldgen water
+//! that stays still, and the same scenes far from the origin.
 use boxel_app::App;
 use boxel_ecs::prelude::*;
 use boxel_math::DVec3;
 use boxel_transform::Transform;
 use boxel_voxel::{
-    BlockPos, BlockRegistry, BlockState, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, ChunkKey, ChunkPos,
-    LocalPos, MAX_BLOCK_COORD,
+    BlockCollision, BlockDef, BlockModel, BlockPos, BlockRegistry, BlockState, CHUNK_SIZE,
+    CHUNK_VOLUME, ChunkData, ChunkKey, ChunkPos, FaceTextures, LocalPos, MAX_BLOCK_COORD, Property,
+    RenderShape, TextureId, WATERLOGGED,
 };
 use boxel_world::jobs::InlineExecutor;
 use boxel_world::{
@@ -54,6 +56,14 @@ enum Cell {
     Gate {
         open: bool,
     },
+    /// A lichen, maybe waterlogged: a plant without collision that can be waterlogged, so no
+    /// flowing fluid enters it (Minecraft's glow lichen).
+    Lichen {
+        wet: bool,
+    },
+    /// A cane: a plant without collision that no fluid enters either, declared so (Minecraft's
+    /// sugar cane).
+    Cane,
 }
 
 /// The fluids.
@@ -131,7 +141,9 @@ fn content(cell: Cell) -> Option<(Kind, (u8, bool, bool))> {
     match cell {
         Cell::Water(l) => Some((Kind::Water, amounts(l))),
         Cell::Lava(l) => Some((Kind::Lava, amounts(l))),
-        Cell::Slab { wet: true, .. } | Cell::Fence { wet: true } => Some((Kind::Water, amounts(0))),
+        Cell::Slab { wet: true, .. } | Cell::Fence { wet: true } | Cell::Lichen { wet: true } => {
+            Some((Kind::Water, amounts(0)))
+        }
         _ => None,
     }
 }
@@ -156,7 +168,9 @@ fn takes(kind: Kind, cell: Cell) -> bool {
     kind == Kind::Water
         && matches!(
             cell,
-            Cell::Slab { wet: false, .. } | Cell::Fence { wet: false }
+            Cell::Slab { wet: false, .. }
+                | Cell::Fence { wet: false }
+                | Cell::Lichen { wet: false }
         )
 }
 
@@ -165,6 +179,7 @@ fn wet(cell: Cell) -> Cell {
     match cell {
         Cell::Slab { top, .. } => Cell::Slab { top, wet: true },
         Cell::Fence { .. } => Cell::Fence { wet: true },
+        Cell::Lichen { .. } => Cell::Lichen { wet: true },
         other => other,
     }
 }
@@ -298,7 +313,8 @@ impl Sim {
         }
     }
 
-    /// Nothing in it stops movement.
+    /// Nothing in it stops movement or keeps fluids out (a lichen and a cane do, without
+    /// collision).
     fn holds(&self, cell: Cell) -> bool {
         matches!(
             cell,
@@ -537,6 +553,32 @@ impl WorldGenerator for Ground {
     }
 }
 
+/// A plant without collision named `name`.
+fn plant(name: &str) -> BlockDef {
+    BlockDef {
+        name: name.into(),
+        shape: RenderShape::Cutout,
+        model: BlockModel::Cross,
+        collision: BlockCollision::None,
+        emission: [0; 3],
+        light_opacity: 0,
+        textures: FaceTextures::all(TextureId(0)),
+    }
+}
+
+/// The demo's blocks and, after them (no demo id moves), `test:lichen`, which can be
+/// waterlogged, and `test:cane`, declared to keep fluids out: two plants without collision.
+fn registry() -> BlockRegistry {
+    let mut b = boxel_demo::blocks::builder();
+    let properties = vec![Property::boolean(WATERLOGGED)];
+    b.add_block_with_states(plant("test:lichen"), properties, |_, _| {})
+        .unwrap();
+    b.add_block(plant("test:cane")).unwrap();
+    let cane = b.block_by_name("test:cane").unwrap();
+    b.set_keeps_fluids_out(cane).unwrap();
+    b.build()
+}
+
 struct Engine {
     app: App,
     origin: BlockPos,
@@ -547,7 +589,7 @@ struct Engine {
 impl Engine {
     /// The world around `origin` (the ground's top is `origin.y - 1`) with the viewer there.
     fn new(origin: BlockPos, placed: &[([i64; 3], Cell)]) -> Self {
-        let registry = Arc::new(boxel_demo::blocks::registry());
+        let registry = Arc::new(registry());
         let mut app = App::new();
         let placed = placed
             .iter()
@@ -657,6 +699,10 @@ fn state_of(registry: &BlockRegistry, cell: Cell) -> BlockState {
         Cell::Gate { open } => registry
             .parse_state(&format!("boxel:oak_fence_gate[facing=east,open={open}]"))
             .unwrap(),
+        Cell::Lichen { wet } => registry
+            .parse_state(&format!("test:lichen[waterlogged={wet}]"))
+            .unwrap(),
+        Cell::Cane => registry.by_name("test:cane").unwrap(),
     }
 }
 
@@ -681,6 +727,10 @@ fn cell_of(registry: &BlockRegistry, state: BlockState) -> Cell {
         "boxel:oak_fence_gate" => Cell::Gate {
             open: registry.property(state, "open") == Some("true"),
         },
+        "test:lichen" => Cell::Lichen {
+            wet: registry.is_waterlogged(state),
+        },
+        "test:cane" => Cell::Cane,
         other => panic!("unexpected {other}"),
     }
 }
@@ -815,8 +865,10 @@ fn the_same_scenes_far_from_the_origin() {
     edits.push(([-7, 0, -8], Cell::Water(0)));
     edits.push(([-7, 0, -7], Cell::Fence { wet: false }));
     edits.push(([-7, 0, -6], Cell::Water(0)));
-    // An open fence gate in the flow.
+    // An open fence gate, a dry lichen and a cane in the flow.
     edits.push(([2, 0, 2], Cell::Gate { open: true }));
+    edits.push(([1, 0, -2], Cell::Lichen { wet: false }));
+    edits.push(([-2, 0, -1], Cell::Cane));
     for origin in [
         BlockPos::new((1 << 31) - 2, -(1 << 31) + 3, -(1 << 31) + 1),
         BlockPos::new(1 << 40, 1 << 40, -(1 << 40)),
@@ -1168,8 +1220,10 @@ fn two_sources_waterlog_the_dry_block_between_them() {
         top: false,
         wet: false,
     };
-    // Between two sources on the ground a dry slab or fence takes the new source; next to one
-    // source it stays dry, with flowing water around it.
+    let lichen = Cell::Lichen { wet: false };
+    // Between two sources on the ground a dry slab, fence or lichen takes the new source; next
+    // to one source it stays dry, with flowing water around it. Two sources over a dry lichen
+    // in the ground make no third: it is no floor (it does not stop movement).
     let edits = [
         ([-1, 0, 0], Cell::Water(0)),
         ([0, 0, 0], dry),
@@ -1179,6 +1233,12 @@ fn two_sources_waterlog_the_dry_block_between_them() {
         ([1, 0, 4], Cell::Water(0)),
         ([0, 0, -6], dry),
         ([1, 0, -6], Cell::Water(0)),
+        ([-1, 0, -10], Cell::Water(0)),
+        ([0, 0, -10], lichen),
+        ([1, 0, -10], Cell::Water(0)),
+        ([7, 0, 0], Cell::Water(0)),
+        ([8, -1, 0], lichen),
+        ([9, 0, 0], Cell::Water(0)),
     ];
     let (engine, _) = run(ORIGIN, "two sources", &edits, &[], 30);
     assert_eq!(
@@ -1190,6 +1250,69 @@ fn two_sources_waterlog_the_dry_block_between_them() {
     );
     assert_eq!(engine.get([0, 0, 4]), Cell::Fence { wet: true });
     assert_eq!(engine.get([0, 0, -6]), dry, "one source is not enough");
+    assert_eq!(engine.get([0, 0, -10]), Cell::Lichen { wet: true });
+    assert_eq!(engine.get([8, 0, 0]), Cell::Water(1), "no third source");
+    assert_eq!(engine.get([8, -1, 0]), lichen);
+}
+
+#[test]
+fn flowing_water_keeps_a_lichen_and_cane_and_washes_a_plant() {
+    let dry = Cell::Lichen { wet: false };
+    let wet = Cell::Lichen { wet: true };
+    // A source with a dry lichen, a cane and a plant around it, and a waterlogged lichen (a
+    // source too) further away: the water goes around the lichen and the cane, never into
+    // them, and washes the plant away.
+    let edits = [
+        ([0, 0, 0], Cell::Water(0)),
+        ([2, 0, 0], dry),
+        ([0, 0, 2], Cell::Cane),
+        ([-2, 0, 0], Cell::Plant),
+        ([-6, 0, -6], wet),
+    ];
+    let (engine, _) = run(ORIGIN, "lichen and cane", &edits, &[], 60);
+    assert_eq!(engine.get([2, 0, 0]), dry);
+    assert_eq!(engine.get([0, 0, 2]), Cell::Cane);
+    assert_eq!(engine.get([-6, 0, -6]), wet);
+    assert_eq!(engine.get([-2, 0, 0]), Cell::Water(2), "the plant is gone");
+    assert_eq!(engine.get([3, 0, 0]), Cell::Water(5), "around the lichen");
+    assert_eq!(engine.get([0, 0, 3]), Cell::Water(5), "around the cane");
+    assert_eq!(
+        engine.get([-6, 0, -5]),
+        Cell::Water(1),
+        "out of the wet one"
+    );
+}
+
+#[test]
+fn lava_neither_burns_nor_falls_into_a_lichen() {
+    let dry = Cell::Lichen { wet: false };
+    let wet = Cell::Lichen { wet: true };
+    // A lava source over a waterlogged lichen: it does not fall in (no stone), it spreads on
+    // top, and the water flowing out of the lichen meets it.
+    let edits = [([0, 0, 0], wet), ([0, 1, 0], Cell::Lava(0))];
+    let (engine, _) = run(ORIGIN, "lava over a lichen", &edits, &[], 160);
+    assert_eq!(engine.get([0, 0, 0]), wet, "no stone");
+    assert_eq!(engine.get([0, 1, 0]), Cell::Lava(0));
+    // A lava source beside a dry lichen and a cane, and another over a dry lichen: the lava
+    // flows around them and on top, never into them.
+    let edits = [
+        ([0, 0, 0], Cell::Lava(0)),
+        ([1, 0, 0], dry),
+        ([-1, 0, 0], Cell::Cane),
+        ([6, 0, 0], dry),
+        ([6, 1, 0], Cell::Lava(0)),
+    ];
+    let (engine, _) = run(ORIGIN, "lava beside a lichen", &edits, &[], 160);
+    assert_eq!(engine.get([1, 0, 0]), dry);
+    assert_eq!(engine.get([-1, 0, 0]), Cell::Cane);
+    assert_eq!(engine.get([6, 0, 0]), dry);
+    assert_eq!(engine.get([0, 0, 1]), Cell::Lava(2));
+    assert_eq!(engine.get([7, 1, 0]), Cell::Lava(2), "on top of the lichen");
+    // It still hardens beside a waterlogged one.
+    let edits = [([0, 0, 0], Cell::Lava(0)), ([1, 0, 0], wet)];
+    let (engine, _) = run(ORIGIN, "lava beside a wet lichen", &edits, &[], 12);
+    assert_eq!(engine.get([0, 0, 0]), Cell::Obsidian);
+    assert_eq!(engine.get([1, 0, 0]), wet);
 }
 
 #[test]
@@ -1212,6 +1335,8 @@ fn random_terrain_with_waterlogged_blocks_matches_the_simulator() {
                     22..26 => edits.push(([x, y, z], Cell::Fence { wet })),
                     26..30 => edits.push(([x, 0, z], Cell::Stone)),
                     30..34 => edits.push(([x, y, z], Cell::Gate { open: !wet })),
+                    34..38 => edits.push(([x, y, z], Cell::Lichen { wet })),
+                    38..40 => edits.push(([x, y, z], Cell::Cane)),
                     _ => {}
                 }
             }
