@@ -17,11 +17,17 @@ boxel_demo.workspace = true
 boxel_voxel = { workspace = true, features = ["testing"] }
 # Property tests of the noise kit and the field bounds (#67).
 proptest.workspace = true
+# Grid against point benches of the noise kit and the fields (#67).
+criterion.workspace = true
 
 # Criterion flags (--quick, --save-baseline) from `cargo bench --workspace` must not reach the
 # lib unit-test harness.
 [lib]
 bench = false
+
+[[bench]]
+name = "noise"
+harness = false
 
 [lints]
 workspace = true
