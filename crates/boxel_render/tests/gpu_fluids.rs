@@ -12,6 +12,10 @@
 //!   the plane of the post's or step's top). The solid's quads drawn alone, on two clear colors,
 //!   cover the pixels that do not change; inside them (one pixel in from their edge) the full
 //!   scene shows exactly those quads: the fluid never wins a tie.
+//! - waterlogged roots (`test:roots`, a cutout block of one full box, ADR 0038): in full water
+//!   their water's top at 16/16 ties with the roots' top and loses, as above; in a pool their
+//!   water shows through the holes of their texture (the square around the screen center
+//!   differs from the same pool with dry roots).
 //!
 //! For every adapter (filtered by `WGPU_BACKEND` / `WGPU_ADAPTER_NAME`) and every tier a local
 //! capability check allows (the one of `gpu_tiers.rs`); every tier also draws the full scenes as
@@ -31,7 +35,11 @@ use boxel_render::{
     DEFAULT_SKY_COLOR, DistanceFog, RendererConfig, TranslucentSort, ViewParams, VoxelRenderer,
 };
 use boxel_transform::Transform;
-use boxel_voxel::{BlockRegistry, BlockState, ChunkData, Face, LocalPos, NEIGHBOR_OFFSETS};
+use boxel_voxel::{
+    BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockState, BoxModel, ChunkData, Face,
+    FaceTextures, LocalPos, ModelBox, NEIGHBOR_OFFSETS, Property, RenderShape, TextureImage,
+    TextureSpec, WATERLOGGED,
+};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -139,6 +147,49 @@ fn adapter_label(caps: &AdapterCaps) -> String {
 }
 
 // ---------------------------------------------------------------- scenes
+
+/// The demo blocks plus `test:roots`, waterloggable roots: cutout, one full box, a frame
+/// texture (3 opaque texels around a clear middle, so the eye sees into the cell). The demo
+/// keeps its ids.
+fn registry() -> BlockRegistry {
+    let mut b = boxel_demo::blocks::builder();
+    let edge = 16;
+    let texels: Vec<[u8; 4]> = (0..edge * edge)
+        .map(|i| {
+            let (x, y) = (i % edge, i / edge);
+            let frame = x.min(y).min(edge - 1 - x).min(edge - 1 - y) < 3;
+            if frame { [120, 80, 50, 255] } else { [0; 4] }
+        })
+        .collect();
+    let frame = b
+        .add_texture(TextureSpec {
+            name: "test:roots".to_string(),
+            image: TextureImage {
+                size: edge as u32,
+                texels: texels.into(),
+                binary_alpha: true,
+            },
+        })
+        .expect("test:roots texture");
+    let full = b
+        .add_box_model(BoxModel::from_boxes(vec![ModelBox::new([0; 3], [16; 3])]))
+        .expect("full box");
+    b.add_block_with_states(
+        BlockDef {
+            name: "test:roots".to_string(),
+            shape: RenderShape::Cutout,
+            model: BlockModel::Boxes(full),
+            collision: BlockCollision::Full,
+            emission: [0; 3],
+            light_opacity: 1,
+            textures: FaceTextures::all(frame),
+        },
+        vec![Property::boolean(WATERLOGGED)],
+        |_, _| {},
+    )
+    .expect("test:roots");
+    b.build()
+}
 
 /// Chunks of a scene: (world voxel origin, mesh).
 type Chunks = Vec<(I64Vec3, ChunkMesh)>;
@@ -287,8 +338,26 @@ fn scenes(registry: &BlockRegistry) -> Vec<Scene> {
     };
     let fence = pool(get("boxel:oak_fence[waterlogged=true]"));
     let stairs = pool(get("boxel:stone_stairs[facing=north,waterlogged=true]"));
+    let wet_roots = get("test:roots[waterlogged=true]");
+    let full_roots = pool(wet_roots);
     let above = DVec3::new(8.5, 11.5, 8.6);
     let middle = DVec3::new(8.5, 9.0, 8.5);
+
+    // Roots at (8, 8, 8) in a 3x3 pool on a stone floor: their water's top (14/16, level with
+    // the pool) shows through the middle of the roots' top. Dry, the floor shows there.
+    let roots_pool = |roots: BlockState| {
+        mesh_world(
+            registry,
+            &move |p| match (p.x, p.y, p.z) {
+                (8, 8, 8) => roots,
+                (7..=9, 8, 7..=9) => water,
+                (7..=9, 7, 7..=9) => stone,
+                _ => air,
+            },
+            &[IVec3::ZERO],
+        )
+    };
+    let dry_roots = registry.with_water(wet_roots, false).expect("dry roots");
     vec![
         Scene {
             name: "sloping lava top from below its chunk",
@@ -315,6 +384,20 @@ fn scenes(registry: &BlockRegistry) -> Vec<Scene> {
             name: "waterlogged stairs in full water",
             check: Check::Wins(tops(&stairs)),
             chunks: stairs,
+            eye: above,
+            target: middle,
+        },
+        Scene {
+            name: "waterlogged roots in full water",
+            check: Check::Wins(tops(&full_roots)),
+            chunks: full_roots,
+            eye: above,
+            target: middle,
+        },
+        Scene {
+            name: "waterlogged roots in a pool",
+            check: Check::Drawn(roots_pool(dry_roots)),
+            chunks: roots_pool(wet_roots),
             eye: above,
             target: middle,
         },
@@ -372,10 +455,10 @@ fn render_tier(
     adapter: &wgpu::Adapter,
     caps: &AdapterCaps,
     tier: Tier,
+    registry: &BlockRegistry,
     scenes: &[Scene],
 ) -> Result<Vec<SceneImages>, String> {
     let (device, queue, errors) = device_for(adapter, caps, tier)?;
-    let registry = boxel_demo::blocks::registry();
     let config = RendererConfig {
         chunk_memory: boxel_render::ChunkMemorySettings {
             initial_quads: 1 << 16,
@@ -394,10 +477,7 @@ fn render_tier(
         UVec2::new(WIDTH, HEIGHT),
     )
     .map_err(|e| format!("VoxelRenderer::new: {e}"))?;
-    renderer.set_model_boxes(
-        &queue,
-        MaterialTable::from_registry(&registry).model_boxes(),
-    );
+    renderer.set_model_boxes(&queue, MaterialTable::from_registry(registry).model_boxes());
     let mut out = Vec::new();
     for scene in scenes {
         let view = |clear| look(scene.eye, scene.target, clear);
@@ -543,7 +623,7 @@ fn fluids_lose_depth_ties_and_their_sloping_tops_show_on_every_tier() {
         eprintln!("skipping: no adapter");
         return;
     }
-    let registry = boxel_demo::blocks::registry();
+    let registry = registry();
     let scenes = scenes(&registry);
     let mut report = Report::new();
     let mut rendered = 0;
@@ -552,7 +632,7 @@ fn fluids_lose_depth_ties_and_their_sloping_tops_show_on_every_tier() {
         let label = adapter_label(&caps);
         let mut tiers = Vec::new();
         for tier in allowed_tiers(&caps) {
-            match render_tier(adapter, &caps, tier, &scenes) {
+            match render_tier(adapter, &caps, tier, &registry, &scenes) {
                 Ok(images) => tiers.push((tier, images)),
                 Err(e) => report.fail(format!("{label} {tier}: {e}"), &[]),
             }

@@ -17,8 +17,9 @@ use boxel_mesh::MeshOptions;
 use boxel_tasks::{TaskPool, TaskPoolBuilder};
 use boxel_transform::Transform;
 use boxel_voxel::{
-    BlockCollision, BlockDef, BlockModel, BlockPos, BlockRegistry, BlockState, ChunkData, ChunkKey,
-    ChunkPos, FaceTextures, LightValue, LocalPos, RenderShape, TextureId,
+    BlockCollision, BlockDef, BlockModel, BlockPos, BlockRegistry, BlockState, BoxModel, ChunkData,
+    ChunkKey, ChunkPos, FaceTextures, LightValue, LocalPos, ModelBox, Property, RenderShape,
+    TextureId, WATERLOGGED,
 };
 use boxel_worldgen::WorldGenerator;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1150,5 +1151,112 @@ fn an_emitter_not_full_bright_is_lit_by_its_light_far_from_the_origin() {
             let plain = LightValue::new(0, smooth(EMBER[0]), smooth(EMBER[1]), 0);
             assert_eq!(glowing.corner_light(*q), [plain; 4], "{chunk:?}: {q:?}");
         }
+    }
+}
+
+/// `boxel_voxel::testing` plus `test:roots`, a cutout block of one full box that holds water (as
+/// mangrove roots).
+fn roots_registry() -> Arc<BlockRegistry> {
+    let base = boxel_voxel::testing::registry();
+    let leaves = base.by_name("test:cutout").expect("test:cutout");
+    let mut b = boxel_voxel::testing::builder();
+    let full = b
+        .add_box_model(BoxModel::from_boxes(vec![ModelBox::new([0; 3], [16; 3])]))
+        .expect("full box");
+    b.add_block_with_states(
+        BlockDef {
+            name: "test:roots".to_string(),
+            shape: RenderShape::Cutout,
+            model: BlockModel::Boxes(full),
+            collision: BlockCollision::Full,
+            emission: [0; 3],
+            light_opacity: 1,
+            textures: FaceTextures::all(base.face_texture(leaves, boxel_voxel::Face::PosY)),
+        },
+        vec![Property::boolean(WATERLOGGED)],
+        |_, _| {},
+    )
+    .expect("test:roots");
+    Arc::new(b.build())
+}
+
+/// Air in the layers `chunk.y - 2..=chunk.y + 2`, but for a basin of `test:solid` in the middle
+/// of `chunk` (a 5x5 floor and a wall around it) holding a 3x3 pool of `test:fluid` with
+/// waterlogged `test:roots` at its center ([`ROOTS`]).
+struct PoolGen {
+    chunk: ChunkPos,
+}
+
+/// The local position of the roots in their chunk.
+const ROOTS: LocalPos = LocalPos::new(16, 16, 16);
+
+impl WorldGenerator for PoolGen {
+    fn generate(&self, key: ChunkKey, registry: &BlockRegistry) -> ChunkData {
+        let mut data = ChunkData::uniform(BlockState::AIR);
+        if key.pos == self.chunk {
+            let get = |name: &str| registry.parse_state(name).expect(name);
+            let (solid, fluid) = (get("test:solid"), get("test:fluid"));
+            for x in 14..=18 {
+                for z in 14..=18 {
+                    data.set(LocalPos::new(x, 15, z), solid);
+                    let wall = x == 14 || x == 18 || z == 14 || z == 18;
+                    data.set(LocalPos::new(x, 16, z), if wall { solid } else { fluid });
+                }
+            }
+            data.set(ROOTS, get("test:roots[waterlogged=true]"));
+        }
+        data
+    }
+    fn vertical_chunks(&self) -> RangeInclusive<i64> {
+        self.chunk.y - 2..=self.chunk.y + 2
+    }
+    fn name(&self) -> &str {
+        "pool"
+    }
+}
+
+/// Cutout blocks never hide their own water (ADR 0038), far from the origin too: waterlogged
+/// roots in a pool show their water's top, level with the pool and inset, and nothing else of
+/// it; the chunk's mesh is the same everywhere (its positions are chunk-local).
+#[test]
+fn waterlogged_roots_show_their_water_far_from_the_origin() {
+    let pool_mesh = |chunk: ChunkPos| {
+        let generator = PoolGen { chunk };
+        let mut app = lit_app(
+            generator,
+            roots_registry(),
+            small(),
+            Arc::new(InlineExecutor),
+        );
+        spawn(&mut app, chunk, 1, 1);
+        settle(&mut app);
+        assert!(assert_matches_reference(&app) > 0, "{chunk:?}");
+        let map = app.world().resource::<ChunkMap>();
+        let (_, slot) = map
+            .iter()
+            .find(|(_, s)| s.pos == chunk)
+            .expect("the pool chunk");
+        match slot.mesh() {
+            MeshState::Ready { mesh, .. } => Arc::clone(mesh),
+            other => panic!("{chunk:?}: no mesh: {other:?}"),
+        }
+    };
+    let origin = pool_mesh(ChunkPos::new(0, 0, 0));
+    let center = [ROOTS.x(), ROOTS.y(), ROOTS.z()];
+    let water: Vec<_> = origin
+        .quads
+        .iter()
+        .filter(|q| q.pos() == center && q.shape() == boxel_mesh::layout::SHAPE_FLUID_SLOPE)
+        .collect();
+    assert_eq!(water.len(), 1, "{water:?}");
+    assert_eq!(water[0].face(), boxel_voxel::Face::PosY);
+    assert_eq!(water[0].fluid_heights(), Some([boxel_mesh::FLUID_FLAT; 4]));
+    assert!(water[0].fluid_inset());
+    for chunk in [
+        ChunkPos::new((1 << 26) - 2, -3, 5),
+        ChunkPos::new(-7, 1 << 35, -(1 << 35)),
+        ChunkPos::new(boxel_voxel::MAX_CHUNK_COORD - 8, 1, 3),
+    ] {
+        assert_eq!(*pool_mesh(chunk), *origin, "{chunk:?}");
     }
 }

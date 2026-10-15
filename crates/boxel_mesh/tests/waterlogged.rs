@@ -1,16 +1,23 @@
 //! Waterlogged blocks (ADR 0025): the block's boxes as for the dry block, and its water as a
-//! source cell of the fluid around it, drawn by itself with its faces inset and none against
-//! the block's sturdy faces; and the flow texture on the top of a sloping fluid cell.
+//! source cell of the fluid around it, drawn by itself with its faces inset and none of those the
+//! block hides (ADR 0038: only an opaque block hides any, where its boxes cover the border whole,
+//! and the top only inside or on its solid top); and the flow texture on the top of a sloping
+//! fluid cell.
 mod common;
 
 use boxel_mesh::{
     AoPolicy, BUCKET_COUNT, ChunkMesh, FLUID_FLAT, FLUID_SURFACE_BIT, MaterialTable, MeshInput,
     MeshOptions, Mesher, PackedQuad, PaddedChunk, TRANSLUCENT_BUCKET, VoxelClass, fluid_flow,
-    layout,
+    layout, reference_fluid_heights, reference_visible_faces,
 };
-use boxel_voxel::{BlockRegistry, BlockState, ChunkData, Face};
+use boxel_voxel::{
+    BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockState, BoxModel, CHUNK_SIZE,
+    ChunkData, Face, FaceTextures, ModelBox, NEIGHBOR_OFFSETS, Property, RenderShape, SlabHalf,
+    WATERLOGGED, testing,
+};
 use common::{Repr, chunk_repr, dense_from};
-use std::collections::BTreeMap;
+use proptest::prelude::*;
+use std::collections::{BTreeMap, BTreeSet};
 
 const OPTIONS: MeshOptions = MeshOptions::with_ao(AoPolicy::BakedLitOnly);
 
@@ -143,7 +150,7 @@ fn a_waterlogged_slab_in_a_lake_is_part_of_the_lake() {
 }
 
 #[test]
-fn sturdy_faces_hide_the_water_and_the_rest_is_inset() {
+fn opaque_blocks_hide_the_water_they_cover() {
     let (registry, table) = registry();
     let slab = state(&registry, "boxel:stone_slab[waterlogged=true]");
     let stairs = state(&registry, "boxel:oak_stairs[facing=east,waterlogged=true]");
@@ -234,4 +241,316 @@ fn a_sloping_top_shows_the_flow_texture() {
     assert_eq!(fluid_flow([16, 14, 16, 14]), [4, 0]);
     assert_eq!(fluid_flow([14, 14, 10, 10]), [0, 8]);
     assert_eq!(fluid_flow([12; 4]), [0, 0]);
+}
+
+// ---------------------------------------------------------------- what a block hides (ADR 0038)
+
+/// [`testing::builder`] plus waterloggable blocks (`waterlogged`, opacity 1) for the held water
+/// rule: `test:roots` (cutout, one full box, as mangrove roots), `test:cage` (the same box,
+/// opaque), `test:plate` (opaque, a plate under the top, `[0, 15, 0]-[16, 16, 16]`) and
+/// `test:upper` (opaque, a top slab). The test blocks keep their ids.
+fn held_registry() -> (BlockRegistry, MaterialTable) {
+    let base = testing::registry();
+    let texture = |name: &str| base.face_texture(state(&base, name), Face::PosY);
+    let (solid, leaves) = (texture("test:solid"), texture("test:cutout"));
+    let mut b = testing::builder();
+    let full = ModelBox::new([0; 3], [16; 3]);
+    let plate = ModelBox::new([0, 15, 0], [16; 3]);
+    let full_model = b
+        .add_box_model(BoxModel::from_boxes(vec![full]))
+        .expect("full box");
+    let plate_model = b
+        .add_box_model(BoxModel::from_boxes(vec![plate]))
+        .expect("plate");
+    let upper = BlockModel::Slab(SlabHalf::Top);
+    let blocks = [
+        (
+            "test:roots",
+            RenderShape::Cutout,
+            BlockModel::Boxes(full_model),
+            BlockCollision::Full,
+            leaves,
+        ),
+        (
+            "test:cage",
+            RenderShape::Opaque,
+            BlockModel::Boxes(full_model),
+            BlockCollision::Full,
+            solid,
+        ),
+        (
+            "test:plate",
+            RenderShape::Opaque,
+            BlockModel::Boxes(plate_model),
+            BlockCollision::Boxes(vec![plate.bounds]),
+            solid,
+        ),
+        (
+            "test:upper",
+            RenderShape::Opaque,
+            upper,
+            upper.default_collision(),
+            solid,
+        ),
+    ];
+    for (name, shape, model, collision, texture) in blocks {
+        let def = BlockDef {
+            name: name.to_string(),
+            shape,
+            model,
+            collision,
+            emission: [0; 3],
+            light_opacity: 1,
+            textures: FaceTextures::all(texture),
+        };
+        b.add_block_with_states(def, vec![Property::boolean(WATERLOGGED)], |_, _| {})
+            .expect(name);
+    }
+    let registry = b.build();
+    for name in ["test:solid", "test:fluid", "test:slab", "test:boxes"] {
+        assert_eq!(state(&registry, name), state(&base, name), "{name}");
+    }
+    let table = MaterialTable::from_registry(&registry);
+    (registry, table)
+}
+
+/// The faces of the water quads at `p` (all inset, at `heights`).
+fn water_at(mesh: &ChunkMesh, p: [u32; 3], heights: [u8; 4]) -> BTreeSet<Face> {
+    let quads = quads_at(mesh, p, layout::SHAPE_FLUID_SLOPE);
+    for quad in quads.values() {
+        assert!(quad.fluid_inset(), "{quad:?}");
+        assert_eq!(quad.fluid_heights(), Some(heights), "{quad:?}");
+    }
+    quads.keys().copied().collect()
+}
+
+/// How many box faces the mesh draws at `p`.
+fn box_faces(mesh: &ChunkMesh, p: [u32; 3]) -> usize {
+    mesh.quads
+        .iter()
+        .filter(|q| q.pos() == p && q.shape() == layout::SHAPE_BOX)
+        .count()
+}
+
+#[test]
+fn a_cutout_block_never_hides_its_water() {
+    use Face::*;
+    let (registry, table) = held_registry();
+    let roots = state(&registry, "test:roots[waterlogged=true]");
+    let fluid = state(&registry, "test:fluid");
+    let solid = state(&registry, "test:solid");
+    // Alone in the air: all 6 faces of its water, at 12/16 (air around), and its 6 box faces.
+    let (_, mesh) = mesh_of(&table, |x, y, z| ((x, y, z) == (5, 5, 5)).then_some(roots));
+    assert_eq!(
+        water_at(&mesh, [5, 5, 5], [12; 4]),
+        BTreeSet::from(Face::ALL)
+    );
+    assert_eq!(box_faces(&mesh, [5, 5, 5]), 6);
+    // In the middle of a 3x3 pool on a floor: only its top, level with the pool (no water side
+    // toward the pool, no bottom on the floor). Its boxes as for dry roots: the bottom on the
+    // floor is hidden.
+    let (_, mesh) = mesh_of(&table, |x, y, z| match (x, y, z) {
+        (5, 5, 5) => Some(roots),
+        (4..=6, 5, 4..=6) => Some(fluid),
+        (4..=6, 4, 4..=6) => Some(solid),
+        _ => None,
+    });
+    let flat = [FLUID_FLAT; 4];
+    assert_eq!(water_at(&mesh, [5, 5, 5], flat), BTreeSet::from([PosY]));
+    assert_eq!(box_faces(&mesh, [5, 5, 5]), 5);
+}
+
+#[test]
+fn the_top_hides_only_inside_the_solid_top() {
+    use Face::*;
+    let (registry, table) = held_registry();
+    let wet = |name: &str| state(&registry, &format!("{name}[waterlogged=true]"));
+    let alone = |s: BlockState| {
+        let (_, mesh) = mesh_of(&table, |x, y, z| ((x, y, z) == (5, 5, 5)).then_some(s));
+        mesh
+    };
+    let sides = [PosX, NegX, PosZ, NegZ];
+    // A top slab: its solid top starts at 8, under the corners (12/16): no top. Its sides are
+    // half covered and its bottom open.
+    let mesh = alone(wet("test:upper"));
+    let want = BTreeSet::from_iter(sides.into_iter().chain([NegY]));
+    assert_eq!(water_at(&mesh, [5, 5, 5], [12; 4]), want);
+    // A plate from 15: the corners (12/16) lie below it, every face shows.
+    let mesh = alone(wet("test:plate"));
+    assert_eq!(
+        water_at(&mesh, [5, 5, 5], [12; 4]),
+        BTreeSet::from(Face::ALL)
+    );
+    // An opaque full box hides all of its water.
+    let mesh = alone(wet("test:cage"));
+    assert_eq!(water_at(&mesh, [5, 5, 5], [0; 4]), BTreeSet::new());
+    assert_eq!(box_faces(&mesh, [5, 5, 5]), 6);
+    // The plate with full water on its 4 sides (water above them): its corners are at 16/16, on
+    // the plate's top. No top, no side (water beside), the bottom over the air.
+    let fluid = state(&registry, "test:fluid");
+    let plate = wet("test:plate");
+    let (_, mesh) = mesh_of(&table, |x, y, z| match (x, y, z) {
+        (5, 5, 5) => Some(plate),
+        (4 | 6, 5 | 6, 5) | (5, 5 | 6, 4 | 6) => Some(fluid),
+        _ => None,
+    });
+    assert_eq!(water_at(&mesh, [5, 5, 5], [16; 4]), BTreeSet::from([NegY]));
+}
+
+/// The blocks of the random scenes of [`held_water_faces_match_minecraft`], water first: more
+/// often water than anything else.
+const MIX: [&str; 18] = [
+    "test:fluid",
+    "test:fluid",
+    "test:fluid",
+    "test:fluid[level=2]",
+    "test:fluid[level=5]",
+    "test:fluid[level=9]",
+    "test:solid",
+    "test:roots",
+    "test:roots[waterlogged=true]",
+    "test:plate",
+    "test:plate[waterlogged=true]",
+    "test:upper",
+    "test:upper[waterlogged=true]",
+    "test:slab",
+    "test:slab[waterlogged=true]",
+    "test:boxes",
+    "test:boxes[waterlogged=true]",
+    "test:cage[waterlogged=true]",
+];
+
+/// The faces of the water of waterlogged `s` that the block hides, its water's corners at
+/// `heights`, from the rule written out in floating point (Minecraft's `LiquidBlockRenderer`,
+/// ADR 0038): none unless the block is opaque (`canOcclude`); then a side or the bottom where
+/// its boxes cover the whole border face, and the top where every point from the lowest corner
+/// up to the top of the cell is inside a box and the top border is covered whole.
+fn hidden_by_block(registry: &BlockRegistry, s: BlockState, heights: [u8; 4]) -> BTreeSet<Face> {
+    if registry.shape(s) != RenderShape::Opaque {
+        return BTreeSet::new();
+    }
+    let boxes: Vec<([f64; 3], [f64; 3])> = registry
+        .model_boxes(s)
+        .iter()
+        .map(|b| {
+            let f = |c: [u8; 3]| c.map(|v| f64::from(v) / 16.0);
+            (f(b.bounds.min), f(b.bounds.max))
+        })
+        .collect();
+    // The centers of the sixteenths of a block edge.
+    let centers = || (0..16).map(|i| (f64::from(i) + 0.5) / 16.0);
+    let covered = |face: Face| {
+        let (n, u, v) = face.axes();
+        let normal = face.normal();
+        let positive = [normal.x, normal.y, normal.z][n] > 0;
+        let border = if positive { 1.0 } else { 0.0 };
+        centers().all(|a| {
+            centers().all(|b| {
+                boxes.iter().any(|(min, max)| {
+                    let plane = if positive { max[n] } else { min[n] };
+                    plane == border && min[u] < a && a < max[u] && min[v] < b && b < max[v]
+                })
+            })
+        })
+    };
+    let low = f64::from(*heights.iter().min().expect("4 corners")) / 16.0;
+    let solid_above = centers().filter(|&y| y > low).all(|y| {
+        centers().all(|x| {
+            centers().all(|z| {
+                boxes.iter().any(|(min, max)| {
+                    (0..3).all(|k| min[k] < [x, y, z][k] && [x, y, z][k] < max[k])
+                })
+            })
+        })
+    });
+    Face::ALL
+        .into_iter()
+        .filter(|&face| match face {
+            Face::PosY => covered(face) && solid_above,
+            _ => covered(face),
+        })
+        .collect()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Random scenes of water, solid cubes and waterlogged and dry blocks (cutout and opaque,
+    /// with and without a solid top), in a corner of the chunk, its middle or across its
+    /// borders: every waterlogged block's water draws the faces the greedy cull leaves
+    /// (`reference_visible_faces`) but those the block hides ([`hidden_by_block`]), inset, at
+    /// the oracle's corner heights (16/16 under water or an opaque cube).
+    #[test]
+    fn held_water_faces_match_minecraft(
+        seed in any::<u64>(),
+        corner in 0usize..3,
+        fill in 20u64..=100,
+    ) {
+        let (registry, table) = held_registry();
+        let mix: Vec<BlockState> = MIX.iter().map(|name| state(&registry, name)).collect();
+        // A 6^3 window of random blocks (padded coordinates), the rest air.
+        let origin = [-1, 12, 27][corner];
+        let window = origin..origin + 6;
+        let mut rng = common::Rng::new(seed);
+        let mut cells = BTreeMap::new();
+        for x in window.clone() {
+            for y in window.clone() {
+                for z in window.clone() {
+                    if rng.below(100) < fill {
+                        cells.insert([x, y, z], rng.pick(&mix));
+                    }
+                }
+            }
+        }
+        // The chunk at offset `d` from the center, if the window reaches into it.
+        let chunk_of = |d: [i32; 3]| -> Option<ChunkData> {
+            let lo = d.map(|c| c * CHUNK_SIZE);
+            let touches = lo.iter().all(|&l| window.start < l + CHUNK_SIZE && l < window.end);
+            touches.then(|| {
+                let at =
+                    |x, y, z| cells.get(&[lo[0] + x, lo[1] + y, lo[2] + z]).map_or(0, |s| s.0);
+                chunk_repr(&dense_from(at), Repr::Packed)
+            })
+        };
+        let center = chunk_of([0; 3]).expect("every window reaches into the center");
+        let around: Vec<Option<ChunkData>> =
+            NEIGHBOR_OFFSETS.iter().map(|d| chunk_of([d.x, d.y, d.z])).collect();
+        let input = MeshInput {
+            center: &center,
+            neighbors: std::array::from_fn(|i| around[i].as_ref()),
+            light: None,
+        };
+        let mut padded = PaddedChunk::new();
+        let mut mesher = Mesher::new();
+        mesher.gather(&input, &table, &mut padded);
+        let mesh = mesher.mesh_chunk(&input, &table, OPTIONS);
+        let visible = reference_visible_faces(&padded);
+        let heights = reference_fluid_heights(&padded, &table);
+        let mut wet = BTreeSet::new();
+        for (&[x, y, z], &s) in &cells {
+            let inner = [x, y, z].iter().all(|c| (0..CHUNK_SIZE).contains(c));
+            if !inner || !registry.is_waterlogged(s) {
+                continue;
+            }
+            let p = [x as u32, y as u32, z as u32];
+            wet.insert(p);
+            let m = registry.material(s);
+            prop_assert_eq!(padded.waterlogged_at(PaddedChunk::index(x, y, z)), Some(m));
+            let corners = heights.get(&p).copied().unwrap_or([16; 4]);
+            let hidden = hidden_by_block(&registry, s, corners);
+            let want: BTreeSet<Face> = Face::ALL
+                .into_iter()
+                .filter(|&f| visible.contains(&(p, f)) && !hidden.contains(&f))
+                .collect();
+            let got = water_at(&mesh, p, corners);
+            let name = registry.state_name(s);
+            prop_assert_eq!(&got, &want, "{} at {:?}, corners {:?}", name, p, corners);
+        }
+        // The greedy pass draws no face of a waterlogged cell.
+        for quad in &mesh.quads {
+            if quad.shape() != layout::SHAPE_FLUID_SLOPE && quad.shape() != layout::SHAPE_BOX {
+                prop_assert!(quad.unit_faces().all(|(p, _)| !wet.contains(&p)), "{:?}", quad);
+            }
+        }
+    }
 }
