@@ -1,8 +1,8 @@
 //! Waterlogged blocks (ADR 0025): the block's boxes as for the dry block, and its water as a
 //! source cell of the fluid around it, drawn by itself with its faces inset and none of those the
-//! block hides (ADR 0038: only an opaque block hides any, where its boxes cover the border whole,
-//! and the top only inside or on its solid top); and the flow texture on the top of a sloping
-//! fluid cell.
+//! block hides (ADR 0038: a cutout block hides none; an opaque or translucent one where its boxes
+//! cover the border whole, and the top only inside or on its solid top); and the flow texture on
+//! the top of a sloping fluid cell.
 mod common;
 
 use boxel_mesh::{
@@ -247,22 +247,33 @@ fn a_sloping_top_shows_the_flow_texture() {
 
 /// [`testing::builder`] plus waterloggable blocks (`waterlogged`, opacity 1) for the held water
 /// rule: `test:roots` (cutout, one full box, as mangrove roots), `test:cage` (the same box,
-/// opaque), `test:plate` (opaque, a plate under the top, `[0, 15, 0]-[16, 16, 16]`) and
-/// `test:upper` (opaque, a top slab). The test blocks keep their ids.
+/// opaque), `test:glass_box` (the same box, translucent), `test:glass_slab` (translucent, a
+/// bottom slab), `test:plate` (opaque, a plate under the top, `[0, 15, 0]-[16, 16, 16]`),
+/// `test:thick_plate` (opaque, `[0, 13, 0]-[16, 16, 16]`) and `test:upper` (opaque, a top slab).
+/// The test blocks keep their ids.
 fn held_registry() -> (BlockRegistry, MaterialTable) {
     let base = testing::registry();
     let texture = |name: &str| base.face_texture(state(&base, name), Face::PosY);
-    let (solid, leaves) = (texture("test:solid"), texture("test:cutout"));
+    let (solid, leaves, glass) = (
+        texture("test:solid"),
+        texture("test:cutout"),
+        texture("test:glass"),
+    );
     let mut b = testing::builder();
     let full = ModelBox::new([0; 3], [16; 3]);
     let plate = ModelBox::new([0, 15, 0], [16; 3]);
+    let thick = ModelBox::new([0, 13, 0], [16; 3]);
     let full_model = b
         .add_box_model(BoxModel::from_boxes(vec![full]))
         .expect("full box");
     let plate_model = b
         .add_box_model(BoxModel::from_boxes(vec![plate]))
         .expect("plate");
+    let thick_model = b
+        .add_box_model(BoxModel::from_boxes(vec![thick]))
+        .expect("thick plate");
     let upper = BlockModel::Slab(SlabHalf::Top);
+    let lower = BlockModel::Slab(SlabHalf::Bottom);
     let blocks = [
         (
             "test:roots",
@@ -279,10 +290,31 @@ fn held_registry() -> (BlockRegistry, MaterialTable) {
             solid,
         ),
         (
+            "test:glass_box",
+            RenderShape::Translucent,
+            BlockModel::Boxes(full_model),
+            BlockCollision::Full,
+            glass,
+        ),
+        (
+            "test:glass_slab",
+            RenderShape::Translucent,
+            lower,
+            lower.default_collision(),
+            glass,
+        ),
+        (
             "test:plate",
             RenderShape::Opaque,
             BlockModel::Boxes(plate_model),
             BlockCollision::Boxes(vec![plate.bounds]),
+            solid,
+        ),
+        (
+            "test:thick_plate",
+            RenderShape::Opaque,
+            BlockModel::Boxes(thick_model),
+            BlockCollision::Boxes(vec![thick.bounds]),
             solid,
         ),
         (
@@ -365,8 +397,11 @@ fn the_top_hides_only_inside_the_solid_top() {
     use Face::*;
     let (registry, table) = held_registry();
     let wet = |name: &str| state(&registry, &format!("{name}[waterlogged=true]"));
+    let cell = PaddedChunk::index(5, 5, 5) as u32;
     let alone = |s: BlockState| {
-        let (_, mesh) = mesh_of(&table, |x, y, z| ((x, y, z) == (5, 5, 5)).then_some(s));
+        let (padded, mesh) = mesh_of(&table, |x, y, z| ((x, y, z) == (5, 5, 5)).then_some(s));
+        // The cell holds water, whatever of it shows.
+        assert_eq!(padded.waterlogged, vec![(cell, s.0)]);
         mesh
     };
     let sides = [PosX, NegX, PosZ, NegZ];
@@ -395,11 +430,56 @@ fn the_top_hides_only_inside_the_solid_top() {
         _ => None,
     });
     assert_eq!(water_at(&mesh, [5, 5, 5], [16; 4]), BTreeSet::from([NegY]));
+    // A thick plate from 13, a solid cube on both of its x sides: every corner at 13/16 (air
+    // on the z side), on the plate's floor. Its top is hidden (a corner at the floor counts as
+    // inside), its z sides and bottom show.
+    let solid = state(&registry, "test:solid");
+    let thick = wet("test:thick_plate");
+    let (_, mesh) = mesh_of(&table, |x, y, z| match (x, y, z) {
+        (5, 5, 5) => Some(thick),
+        (4 | 6, 5, 5) => Some(solid),
+        _ => None,
+    });
+    let want = BTreeSet::from([PosZ, NegZ, NegY]);
+    assert_eq!(water_at(&mesh, [5, 5, 5], [13; 4]), want);
+    // A solid cube on +z too: the corners there at 14/16, the others at 13/16.
+    let (_, mesh) = mesh_of(&table, |x, y, z| match (x, y, z) {
+        (5, 5, 5) => Some(thick),
+        (4 | 6, 5, 5) | (5, 5, 6) => Some(solid),
+        _ => None,
+    });
+    let want = BTreeSet::from([NegZ, NegY]);
+    assert_eq!(water_at(&mesh, [5, 5, 5], [13, 13, 14, 14]), want);
+}
+
+#[test]
+fn a_translucent_block_hides_its_water_like_an_opaque_one() {
+    use Face::*;
+    let (registry, table) = held_registry();
+    let wet = |name: &str| state(&registry, &format!("{name}[waterlogged=true]"));
+    // Alone in the air. A full glass box covers all of its water: none shows, though the cell
+    // holds it, and its 6 box faces show.
+    let cell = PaddedChunk::index(5, 5, 5) as u32;
+    let glass = wet("test:glass_box");
+    let (padded, mesh) = mesh_of(&table, |x, y, z| ((x, y, z) == (5, 5, 5)).then_some(glass));
+    assert_eq!(padded.waterlogged, vec![(cell, glass.0)]);
+    assert_eq!(water_at(&mesh, [5, 5, 5], [12; 4]), BTreeSet::new());
+    assert_eq!(box_faces(&mesh, [5, 5, 5]), 6);
+    // A glass slab covers its bottom whole: the 4 sides and the top show.
+    let slab = wet("test:glass_slab");
+    let (padded, mesh) = mesh_of(&table, |x, y, z| ((x, y, z) == (5, 5, 5)).then_some(slab));
+    assert_eq!(padded.waterlogged, vec![(cell, slab.0)]);
+    let want = BTreeSet::from([PosY, PosX, NegX, PosZ, NegZ]);
+    assert_eq!(water_at(&mesh, [5, 5, 5], [12; 4]), want);
+    // Its boxes are drawn translucent.
+    let translucent = mesh.bucket(TRANSLUCENT_BUCKET).iter();
+    let boxes = translucent.filter(|q| q.pos() == [5, 5, 5] && q.shape() == layout::SHAPE_BOX);
+    assert_eq!(boxes.count(), box_faces(&mesh, [5, 5, 5]));
 }
 
 /// The blocks of the random scenes of [`held_water_faces_match_minecraft`], water first: more
 /// often water than anything else.
-const MIX: [&str; 18] = [
+const MIX: [&str; 22] = [
     "test:fluid",
     "test:fluid",
     "test:fluid",
@@ -418,15 +498,24 @@ const MIX: [&str; 18] = [
     "test:boxes",
     "test:boxes[waterlogged=true]",
     "test:cage[waterlogged=true]",
+    "test:glass_box",
+    "test:glass_box[waterlogged=true]",
+    "test:glass_slab[waterlogged=true]",
+    "test:thick_plate[waterlogged=true]",
 ];
 
 /// The faces of the water of waterlogged `s` that the block hides, its water's corners at
 /// `heights`, from the rule written out in floating point (Minecraft's `LiquidBlockRenderer`,
-/// ADR 0038): none unless the block is opaque (`canOcclude`); then a side or the bottom where
-/// its boxes cover the whole border face, and the top where every point from the lowest corner
-/// up to the top of the cell is inside a box and the top border is covered whole.
+/// ADR 0038): none for a cutout block (Minecraft's `canOcclude`); an opaque or translucent one
+/// (the translucent sort could not order its box faces against water faces on their plane)
+/// hides a side or the bottom where its boxes cover the whole border face, and the top where
+/// every point from the lowest corner up to the top of the cell is inside a box and the top
+/// border is covered whole.
 fn hidden_by_block(registry: &BlockRegistry, s: BlockState, heights: [u8; 4]) -> BTreeSet<Face> {
-    if registry.shape(s) != RenderShape::Opaque {
+    if !matches!(
+        registry.shape(s),
+        RenderShape::Opaque | RenderShape::Translucent
+    ) {
         return BTreeSet::new();
     }
     let boxes: Vec<([f64; 3], [f64; 3])> = registry
@@ -475,9 +564,9 @@ fn hidden_by_block(registry: &BlockRegistry, s: BlockState, heights: [u8; 4]) ->
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    /// Random scenes of water, solid cubes and waterlogged and dry blocks (cutout and opaque,
-    /// with and without a solid top), in a corner of the chunk, its middle or across its
-    /// borders: every waterlogged block's water draws the faces the greedy cull leaves
+    /// Random scenes of water, solid cubes and waterlogged and dry blocks (cutout, translucent
+    /// and opaque, with and without a solid top), in a corner of the chunk, its middle or across
+    /// its borders: every waterlogged block's water draws the faces the greedy cull leaves
     /// (`reference_visible_faces`) but those the block hides ([`hidden_by_block`]), inset, at
     /// the oracle's corner heights (16/16 under water or an opaque cube).
     #[test]

@@ -337,9 +337,9 @@ impl MaterialTable {
     /// Declares `material` (a block made of boxes) as waterlogged, holding a source of fluid
     /// `water` (ADR 0025): gather puts the water in its cell (it culls, merges and slopes as
     /// that fluid) and keeps the block in [`PaddedChunk::waterlogged`], whose boxes are drawn
-    /// as for the dry block. The water's faces the block hides are not drawn (only an opaque
-    /// block hides any, ADR 0038), the others sit [`layout::FLUID_INSET`] inside the cell (but
-    /// the top).
+    /// as for the dry block. The water's faces the block hides are not drawn (a cutout block
+    /// hides none, ADR 0038), the others sit [`layout::FLUID_INSET`] inside the cell (but the
+    /// top).
     pub fn set_waterlogged(&mut self, material: u16, water: u16) {
         let i = usize::from(material);
         if i >= self.class.len() || usize::from(water) >= self.class.len() {
@@ -360,15 +360,17 @@ impl MaterialTable {
     }
     /// The faces (bit [`Face::index`]) of the water held by the waterlogged block `material`
     /// that the block itself hides, the water's top corners being `heights` (sixteenths), as
-    /// Minecraft's liquid renderer does (ADR 0038). Only a block that occludes hides its water
-    /// (`canOcclude`: here [`RenderShape::Opaque`]); a cutout or translucent one (roots, leaves)
-    /// hides none. An opaque one hides the sides and the bottom its boxes cover whole on the
-    /// cell border (`isFaceOccludedBySelf`: a slab's bottom, the back of stairs), and the top
-    /// only where every corner lies inside its solid top or on it (at or above
-    /// [`BoxShape::top_floor`]: under a top slab), where it would be hidden or lose its depth
-    /// tie anyway (ADR 0025 sec. 6). 0 for a material not made of boxes.
+    /// Minecraft's liquid renderer does (ADR 0038). A cutout block (roots, leaves) hides none,
+    /// as in Minecraft, where it does not occlude (`canOcclude`). An opaque or translucent one
+    /// hides the sides and the bottom its boxes cover whole on the cell border
+    /// (`isFaceOccludedBySelf`: a slab's bottom, the back of stairs), and the top only where
+    /// every corner lies inside its solid top or on it (at or above [`BoxShape::top_floor`]:
+    /// under a top slab), where it would be hidden or lose its depth tie anyway (ADR 0025 sec.
+    /// 6). A translucent one hides like an opaque one: the translucent sort, which leaves out
+    /// the inset, cannot order its box face and a water face on one plane facing the same way.
+    /// 0 for a material not made of boxes.
     pub(crate) fn held_water_hidden(&self, material: u16, heights: [u8; 4]) -> u8 {
-        if self.shape(material) != RenderShape::Opaque {
+        if self.shape(material) == RenderShape::Cutout {
             return 0;
         }
         self.box_models.of(material).map_or(0, |shape| {
