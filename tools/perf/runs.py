@@ -7,6 +7,15 @@ not count: they overlapped a build or another benchmark, the rest of the machine
 compositor throttled the window to 30 fps (a second under 100 fps or under 50 frames shown, or
 under 70 % of a lower cap). A run that still does not count after the last attempt is kept as
 `noisy` and its numbers never feed a verdict.
+
+An outside app (a binary of another repository, built on the engine) declares its own scenarios
+instead of stress's. `APP --perf-cases` prints `{"format": 1, "cases": [{"name": "surface",
+"label": "superficie, vuelo a 64"}, ...]}` and exits 0. `APP --perf-case NAME` and the GPU,
+`--radius`, `--fps-limit`, `--duration`, `--timeout`, `--label`, `--csv` and `--summary` options
+run one: it waits for its world to settle, prints a line `APP: measuring ...` (its own name) when
+the measurement starts, measures `--duration` seconds and writes the files stress writes (the
+summary's JSON with the keys `metrics` reads, a CSV with `t_ms` and `presented` per frame). It
+exits 0, or non-zero when it failed (2: no usable GPU).
 """
 import csv
 import dataclasses
@@ -47,6 +56,7 @@ GROWS = r'^\s*--chunk-memory\s'
 
 @dataclasses.dataclass(frozen=True)
 class Scenario:
+    # The stress scenario, or None for a case an outside app declares (APP_CASE).
     stress: str
     args: tuple
     label: str
@@ -98,6 +108,14 @@ ATTEMPTS = 4
 # A capped run that skipped refreshes on more than this share of its frames is in the high skip
 # mode (skip_mode).
 HIGH_MODE_SKIPS = 0.01
+# The protocol of an outside app (module doc): the flag that lists its cases, the one that runs
+# one, the version of the list and the names a case may take (not a GPU, a radius or a cap).
+APP_CASES = '--perf-cases'
+APP_CASE = '--perf-case'
+APP_FORMAT = 1
+APP_NAME = re.compile(r'[a-z][a-z0-9-]*')
+# The line a run prints when its measurement starts: `stress: measuring ...`, `APP: measuring`.
+MEASURING = re.compile(r'\S+: measuring ')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -112,6 +130,13 @@ class Case:
     # '--fog valley'`): an option the new binary turns on, measured against the same binary
     # without it (`--base HEAD`).
     new_extra: tuple = ()
+    # The scenario an outside app declared under the name `scenario` (app_cases), None for one of
+    # stress's (SCENARIOS).
+    declared: Scenario = None
+
+    @property
+    def spec(self):
+        return self.declared or SCENARIOS[self.scenario]
 
     def __str__(self):
         cap = str(self.cap) if self.cap else 'uncapped'
@@ -126,7 +151,7 @@ class Case:
     @property
     def label(self):
         """Spanish name for the reports."""
-        text = SCENARIOS[self.scenario].label
+        text = self.spec.label
         if self.radius != 16:
             text += f', radio {self.radius}'
         text += f', tope {self.cap}' if self.cap else ', sin tope'
@@ -134,11 +159,13 @@ class Case:
         return text + (f", solo el nuevo: {' '.join(self.new_extra)}" if self.new_extra else '')
 
     def args(self, duration, side='base', fixed_arena=False):
-        """The stress arguments of a run; the new side also gets `new_extra`. `fixed_arena`: the
-        binary cannot grow chunk memory (`grows`)."""
-        s = SCENARIOS[self.scenario]
+        """The stress arguments of a run (an outside app's: its case by name instead of the
+        scenario); the new side also gets `new_extra`. `fixed_arena`: the binary cannot grow
+        chunk memory (`grows`)."""
+        s = self.spec
         big = self.radius > BIG_RADIUS
-        args = ['--scenario', s.stress, *s.args, *GPUS[self.gpu], '--radius', str(self.radius),
+        head = [APP_CASE, self.scenario] if self.declared else ['--scenario', s.stress, *s.args]
+        args = [*head, *GPUS[self.gpu], '--radius', str(self.radius),
                 '--fps-limit', str(self.cap), '--duration', f'{duration:g}',
                 '--timeout', str(int(duration) + (240 if big else 150))]
         if fixed_arena and big and '--world' in s.args:
@@ -146,13 +173,16 @@ class Case:
         return args + list(self.extra) + (list(self.new_extra) if side == 'new' else [])
 
 
-def parse_case(text, default=Case()):
-    """`gpu/scenario/rN/cap` in any order; missing parts come from `default`."""
-    fields = dataclasses.asdict(default)
+def parse_case(text, default=Case(), declared=None):
+    """`gpu/scenario/rN/cap` in any order; missing parts come from `default`. `declared`: the
+    cases of an outside app (app_cases), which stand in for stress's scenarios."""
+    scenarios = SCENARIOS if declared is None else declared
+    # Not dataclasses.asdict: it would turn `declared` into a dict.
+    fields = {f.name: getattr(default, f.name) for f in dataclasses.fields(Case)}
     for part in filter(None, text.lower().split('/')):
         if part in GPUS:
             fields['gpu'] = part
-        elif part in SCENARIOS:
+        elif part in scenarios:
             fields['scenario'] = part
         elif re.fullmatch(r'r\d+', part):
             fields['radius'] = int(part[1:])
@@ -162,16 +192,21 @@ def parse_case(text, default=Case()):
             fields['cap'] = int(part.removeprefix('cap'))
         else:
             raise ValueError(f'{text!r}: {part!r} is not a GPU ({", ".join(GPUS)}), a scenario '
-                             f'({", ".join(SCENARIOS)}), a radius (r16) or a cap (144, uncapped)')
+                             f'({", ".join(scenarios)}), a radius (r16) or a cap (144, uncapped)')
     if not 1 <= fields['radius'] <= 64:
         raise ValueError(f'{text!r}: the radius goes from 1 to 64')
     if fields['cap'] and fields['cap'] < MIN_CAP:
         raise ValueError(f'{text!r}: caps under {MIN_CAP} hide the compositor\'s 30 fps throttle '
                          '(use 0 or uncapped, 144, ...)')
+    if declared is not None:
+        if fields['scenario'] not in declared:
+            raise ValueError(f"{text!r}: the app declares no {fields['scenario']!r} case "
+                             f"({', '.join(declared)})")
+        fields['declared'] = declared[fields['scenario']]
     case = Case(**fields)
     plain = dataclasses.replace(case, extra=(), new_extra=())
     own = {a for a in plain.args(1) if a.startswith('--')} | set(HARNESS_FLAGS)
-    own -= set(SCENARIOS[case.scenario].overridable)
+    own -= set(case.spec.overridable)
     taken = sorted({a for a in (*case.extra, *case.new_extra) if a in own})
     if taken:
         raise ValueError(f"{text!r}: the case already sets {', '.join(taken)}; say it with the "
@@ -194,8 +229,59 @@ def help_text(binary):
     return _help[binary]
 
 
+_app = {}
+
+
+def _read_app_cases(binary):
+    try:
+        done = subprocess.run([binary, APP_CASES], capture_output=True, text=True, timeout=30,
+                              stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise ValueError(f'{binary} {APP_CASES} did not run: {e}') from None
+    if done.returncode != 0:
+        raise ValueError(f'{binary} {APP_CASES} exited with {done.returncode}: not an outside '
+                         'app, or one from before it declared cases')
+    try:
+        data = json.loads(done.stdout)
+        items = data['cases'] if data.get('format') == APP_FORMAT else None
+        cases = {c['name']: Scenario(None, (), str(c['label'])) for c in items}
+    except (ValueError, TypeError, KeyError, AttributeError):
+        items = cases = None
+    if not cases or len(cases) != len(items):
+        raise ValueError(f'{binary} {APP_CASES} printed no list of format {APP_FORMAT} with '
+                         'cases of distinct names')
+    bad = sorted(str(n) for n in cases
+                 if not isinstance(n, str) or not APP_NAME.fullmatch(n) or n in GPUS
+                 or n == 'uncapped' or re.fullmatch(r'(r|cap)\d+', n))
+    if bad:
+        raise ValueError(f"{binary} declares cases a case name cannot hold: {', '.join(bad)} "
+                         '(lowercase letters, digits and dashes from a letter on; not a GPU, rN, '
+                         'capN or uncapped)')
+    return cases
+
+
+def app_cases(binary):
+    """{name: Scenario} of the cases the outside app `binary` declares (`APP --perf-cases`, the
+    module doc), asked once. ValueError when it answers no valid list (stress does not know the
+    flag)."""
+    if binary not in _app:
+        try:
+            _app[binary] = _read_app_cases(binary)
+        except ValueError as e:
+            _app[binary] = e
+    if isinstance(_app[binary], ValueError):
+        raise _app[binary]
+    return _app[binary]
+
+
 def supports(binary, case):
-    """True if `binary` knows the flags and the scenario of `case` (from its --help)."""
+    """True if `binary` knows the flags and the scenario of `case` (from its --help), or declares
+    the case of an outside app."""
+    if case.declared:
+        try:
+            return case.scenario in app_cases(binary)
+        except ValueError:
+            return False
     needs = SCENARIOS[case.scenario].needs
     if not needs:
         return True
@@ -468,7 +554,8 @@ def run_once(binary, case, prefix, label, duration, nvidia=False, side='base'):
     """One run of `binary` on `case`, watched (`side` 'new' adds the case's new_extra). Writes
     PREFIX.{md,csv,log,watch.json} (and .nv.csv). Returns (rc, watch, measure start, nvidia
     samples)."""
-    args = [binary, *case.args(duration, side, fixed_arena=not grows(binary)), '--label', label,
+    fixed_arena = not case.declared and not grows(binary)
+    args = [binary, *case.args(duration, side, fixed_arena=fixed_arena), '--label', label,
             '--csv', prefix + '.csv', '--summary', prefix + '.md']
     sampler = NvidiaSampler().start() if nvidia else None
     measure_at = None
@@ -479,7 +566,7 @@ def run_once(binary, case, prefix, label, duration, nvidia=False, side='base'):
         watcher = machine.Watcher(proc.pid).start()
         for line in proc.stdout:
             log.write(line)
-            if measure_at is None and line.startswith('stress: measuring'):
+            if measure_at is None and MEASURING.match(line):
                 measure_at = time.time()
         proc.stdout.close()
         rc = proc.wait()

@@ -95,12 +95,19 @@ OLD_HELP = 'usage: stress [--scenario static|fly|dive|spin]\n  --caves MODE  cav
 FAKE_STRESS = r'''#!/usr/bin/env python3
 """Fake stress: --help prints HELP; a run writes the files a real one writes from SUMMARY (the
 first run of the binary throttled when THROTTLE, the refreshes in SKIP left out of the CSV), or
-fails like stress without a GPU when FAIL is True or appears in the arguments."""
+fails like stress without a GPU when FAIL is True or appears in the arguments. With CASES (a
+JSON text) it is an outside app: --perf-cases prints CASES, and a run says `app: measuring`."""
 import json, os, sys
-HELP, SUMMARY, FAIL, THROTTLE, SKIP = @VALUES@
+HELP, SUMMARY, FAIL, THROTTLE, SKIP, CASES = @VALUES@
 args = sys.argv[1:]
 if '--help' in args:
     print(HELP)
+    sys.exit(0)
+if '--perf-cases' in args:
+    if CASES is None:
+        print('stress: unknown argument --perf-cases', file=sys.stderr)
+        sys.exit(1)
+    print(CASES)
     sys.exit(0)
 me = os.path.abspath(__file__)
 n = int(open(me + '.count').read()) if os.path.exists(me + '.count') else 0
@@ -113,7 +120,7 @@ out = {args[i]: args[i + 1] for i in range(len(args) - 1) if args[i].startswith(
 data = json.loads(SUMMARY)
 if n == 0 and THROTTLE:
     data['timeline'][1]['fps'] = 30.0
-print('stress: measuring fly for 3 s', flush=True)
+print('app' if CASES else 'stress', 'measuring fly for 3 s', sep=': ', flush=True)
 with open(out['--summary'], 'w') as f:
     f.write('# stress\n\n## Data\n\n```json\n' + json.dumps(data) + '\n```\n')
 with open(out['--csv'], 'w') as f:
@@ -125,11 +132,16 @@ with open(out['--csv'], 'w') as f:
 
 
 def fake_stress(folder, name, data=None, fail=False, help_text=HELP, throttle_first=False,
-                skip=()):
+                skip=(), cases=None):
     """A fake stress binary in `folder`; `data` is its summary (default: summary()), `skip` the
-    refreshes its runs skip."""
+    refreshes its runs skip. `cases`: an outside app instead, declaring these {name: label} (a
+    string: printed as it is)."""
     path = os.path.join(folder, name)
-    values = repr((help_text, json.dumps(data or summary()), fail, throttle_first, tuple(skip)))
+    if isinstance(cases, dict):
+        cases = json.dumps({'format': 1, 'cases': [{'name': n, 'label': label}
+                                                   for n, label in cases.items()]})
+    values = repr((help_text, json.dumps(data or summary()), fail, throttle_first, tuple(skip),
+                   cases))
     with open(path, 'w') as f:
         f.write(FAKE_STRESS.replace('@VALUES@', values))
     os.chmod(path, 0o755)
@@ -841,6 +853,111 @@ class SmokeRunTest(FakeMachine):
         os.chmod(same, 0o755)
         self.cmd_smoke(['surface'], base, perf.Binary(same, 'copy'))
         self.assertIn('both binaries are the same', self.output())
+
+
+# The cases a fake outside app declares.
+APP_CASES = {'surface': 'superficie, vuelo a 64', 'underground': 'bajo tierra, vuelo a 64'}
+
+
+class OutsideTest(FakeMachine):
+    """An outside app's cases (runs.app_cases) and perf-smoke --outside on fake apps."""
+
+    def app(self, name, cases=APP_CASES, **kw):
+        return fake_stress(self.dir, name, cases=cases, **kw)
+
+    def test_the_app_declares_its_cases(self):
+        cases = runs.app_cases(self.app('app'))
+        self.assertEqual(list(cases), ['surface', 'underground'])
+        self.assertEqual(cases['underground'].label, 'bajo tierra, vuelo a 64')
+        self.assertIsNone(cases['surface'].stress)
+        with self.assertRaisesRegex(ValueError, 'exited with 1: not an outside app'):
+            runs.app_cases(fake_stress(self.dir, 'stress'))
+        for name, text in [('format', json.dumps({'format': 2, 'cases': []})),
+                           ('garbage', 'surface, underground'),
+                           ('twice', json.dumps({'format': 1, 'cases': [
+                               {'name': 'a', 'label': 'x'}, {'name': 'a', 'label': 'y'}]}))]:
+            with self.assertRaisesRegex(ValueError, 'printed no list of format 1', msg=name):
+                runs.app_cases(self.app(name, cases=text))
+        bad = self.app('bad', cases={n: 'x' for n in ('rtx', 'r16', 'cap60', 'uncapped',
+                                                      'Big', 'ok-2')})
+        with self.assertRaisesRegex(ValueError, 'Big, cap60, r16, rtx, uncapped \\('):
+            runs.app_cases(bad)
+
+    def test_a_case_of_the_app_runs_by_its_name(self):
+        declared = runs.app_cases(self.app('app'))
+        case = runs.parse_case('780m/underground/144', Case(), declared)
+        self.assertEqual(str(case), '780m/underground/r16/144')
+        self.assertEqual(case.label, 'bajo tierra, vuelo a 64, tope 144')
+        args = case.args(10)
+        self.assertEqual(args[:6], ['--perf-case', 'underground', '--adapter', '780m',
+                                    '--backend', 'vulkan'])
+        self.assertNotIn('--scenario', args)
+        self.assertIn('--radius 16 --fps-limit 144 --duration 10', ' '.join(args))
+        with self.assertRaisesRegex(ValueError, "'forest' is not a GPU"):
+            runs.parse_case('forest', Case(), declared)
+        with self.assertRaisesRegex(ValueError, "declares no 'surface' case"):
+            runs.parse_case('rtx', Case(), {'underground': declared['underground']})
+        with self.assertRaisesRegex(ValueError, 'already sets --perf-case'):
+            runs.parse_case('surface', Case(extra=('--perf-case', 'x')), declared)
+        self.assertTrue(runs.MEASURING.match('app: measuring surface for 10 s'))
+        self.assertTrue(runs.MEASURING.match('stress: measuring fly for 10 s'))
+
+    def cmd_smoke(self, base, new, cases=(), extra=()):
+        argv = ['smoke', '--outside', '--base', base, '--new', new, '--duration', '3', *cases]
+        if extra:
+            argv += ['--', *extra]
+        with mock.patch.object(perf, 'root', return_value=self.dir), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            code = perf.main(argv)
+        self.said.append(err.getvalue())
+        return code
+
+    def test_every_declared_case_against_the_base(self):
+        base, new = self.app('base'), self.app('new', data=summary(fps=950))
+        self.assertEqual(self.cmd_smoke(base, new, extra=['--lod', 'near']), 0, self.output())
+        with open(new + '.args') as f:
+            runs_of_new = f.read().splitlines()
+        self.assertEqual([line.split()[:2] for line in runs_of_new],
+                         [['--perf-case', 'surface'], ['--perf-case', 'underground']])
+        self.assertTrue(all(' --lod near --label new-file-' in line for line in runs_of_new))
+        self.assertEqual(calls(base), 2)
+        self.assertIn('| rtx/underground/r16/uncapped --lod near | 1000 -> 950 (-5.0 %)',
+                      self.output())
+
+    def test_the_same_binary_on_both_sides_checks_the_app(self):
+        one = self.app('app')
+        self.assertEqual(self.cmd_smoke(one, one, ['surface']), 0, self.output())
+        self.assertIn('both binaries are the same: a check of the app', self.output())
+        self.assertEqual(calls(one), 2)
+
+    def test_cases_one_side_lacks(self):
+        base = self.app('base', cases={'surface': 's', 'gone': 'g'})
+        new = self.app('new', cases={'surface': 's', 'coast': 'c'})
+        self.assertEqual(self.cmd_smoke(base, new, ['coast']), 2, self.output())
+        self.assertIn('base file-', self.output())
+        self.assertIn('has no coast scenario |', self.output())
+        self.assertEqual(self.cmd_smoke(base, new, ['gone']), 1, self.output())
+        self.assertIn('has no gone scenario and the base has it', self.output())
+        # A base from before the app declared cases: nothing to compare against.
+        old = fake_stress(self.dir, 'old')
+        self.assertEqual(self.cmd_smoke(old, new, ['surface']), 2, self.output())
+        self.assertIn('the base declares no cases', self.output())
+        self.assertEqual(calls(old) + calls(new), 0)
+
+    def test_two_built_binaries_and_cases_from_the_new_one(self):
+        new = self.app('new')
+        self.assertEqual(self.cmd_smoke('HEAD', new), 64)
+        self.assertIn("--outside takes --base BIN, a built binary of the app", self.output())
+        self.assertEqual(self.cmd_smoke(new, fake_stress(self.dir, 'stress')), 2)
+        self.assertIn('not an outside app', self.output())
+        self.assertEqual(self.cmd_smoke(new, new, ['dive']), 64)
+        self.assertIn("'dive' is not a GPU", self.output())
+
+    def test_cases_lists_the_apps(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(perf.main(['cases', '--outside', self.app('app')]), 0)
+        self.assertIn('  underground  --perf-case underground  (bajo tierra, vuelo a 64)',
+                      self.output())
 
 
 class TreeBinaryTest(unittest.TestCase):

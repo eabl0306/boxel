@@ -4,10 +4,11 @@
 usage:
   perf.py smoke [--base REF|BIN] [--new REF|BIN] [--gpu G] [--radius N] [--cap N]
                 [--new-extra 'OPTIONS'] [CASE...] [-- STRESS OPTIONS]
+  perf.py smoke --outside --base BIN --new BIN [...] [CASE...] [-- APP OPTIONS]
   perf.py check [--base REF|BIN] [--ref REF] [--rounds N] [--dry-run] [--no-tag]
                 [--accept-partial] [--off-main]
   perf.py bisect CASE GOOD BAD [--metric M]... [-- STRESS OPTIONS]
-  perf.py cases
+  perf.py cases [--outside BIN]
 
 smoke (level 1, `just perf-smoke`): one 10 s stress run per side of each case, base against the
 new binary, on a quiet machine. The base is a git ref (default: the merge base of HEAD and main)
@@ -19,7 +20,9 @@ failure counts. Capped on the RTX, p99 only counts when both runs landed in the 
 (issue #5). Cases: surface and forest by default, on the RTX, radius 16, uncapped. Options after
 `--` go to stress on both sides (`-- --bodies 10000`); --new-extra 'OPTIONS' go to the new side
 only, after them, to price an option against the same binary without it (`--base HEAD
---new-extra '--fog valley'`).
+--new-extra '--fog valley'`). With --outside, base and new are built binaries of an outside app
+that declares its own cases (runs.py, its module doc): every case it declares by default, with the
+same rules and table.
 
 check (level 2, `just perf-check`): the fixed matrix (`perf.py cases`), 3 interleaved runs of
 20 s per case and side, on a commit of main, against the binary of the last checkpoint
@@ -545,20 +548,50 @@ def merge_base():
         raise PerfError('no merge base with main: pass --base REF') from None
 
 
+def outside_binaries(a):
+    """(base, new, the cases they declare) of an outside app: two built binaries (this harness
+    builds only the engine's stress). A case only the base declares is the new binary's loss,
+    one only the new declares is skipped."""
+    for flag, spec in (('--base', a.base), ('--new', a.new)):
+        if not spec or not os.path.isfile(spec):
+            raise ValueError(f'--outside takes {flag} BIN, a built binary of the app (git refs '
+                             f'build only stress): {spec!r} is not a file')
+    base, new = resolve(a.base, 'base'), resolve(a.new, 'new')
+    try:
+        declared = runs.app_cases(new.path)
+    except ValueError as e:
+        raise PerfError(str(e)) from None
+    try:
+        declared = {**runs.app_cases(base.path), **declared}
+    except ValueError as e:
+        say(f'perf-smoke: note: the base declares no cases, so none can be compared ({e})')
+    return base, new, declared
+
+
 def cmd_smoke(a):
     no_quiet_slot()
     default = Case(gpu=a.gpu, radius=a.radius, cap=a.cap, extra=tuple(a.extra),
                    new_extra=tuple(shlex.split(a.new_extra or '')))
-    cases = [runs.parse_case(text, default) for text in (a.cases or DEFAULT_SMOKE)]
+    declared = None
+    if a.outside:
+        base, new, declared = outside_binaries(a)
+        names = a.cases or list(runs.app_cases(new.path))
+    else:
+        names = a.cases or DEFAULT_SMOKE
+    cases = [runs.parse_case(text, default, declared) for text in names]
     runs_s = sum(2 * runs.estimate_s(c, a.duration) for c in cases)
     say(f'perf-smoke: {len(cases)} cases, {2 * len(cases)} runs of {a.duration:g} s, about '
         f'{minutes(runs_s)} of runs (more with builds or repeats)')
-    base = resolve(a.base or merge_base(), a.base or 'merge base')
-    new = resolve(a.new)
+    if not a.outside:
+        base = resolve(a.base or merge_base(), a.base or 'merge base')
+        new = resolve(a.new)
     base_md5, new_md5 = md5(base.path), md5(new.path)
     say(f'perf-smoke: base {base} (md5 {base_md5}), new {new} (md5 {new_md5})')
     if default.new_extra:
         say(f"perf-smoke: the new side also runs with {' '.join(default.new_extra)}")
+    elif base_md5 == new_md5 and a.outside:
+        say('perf-smoke: note: both binaries are the same: a check of the app and the machine, '
+            'not of a change')
     elif base_md5 == new_md5 and base.path != new.path:
         say('perf-smoke: note: both binaries are the same, so the branch does not change stress '
             '(only docs, tests or tools) or a build reused the other one')
@@ -1263,7 +1296,16 @@ def cmd_bisect(a):
     return 1
 
 
-def cmd_cases(_):
+def cmd_cases(a):
+    if a.outside:
+        try:
+            declared = runs.app_cases(a.outside)
+        except ValueError as e:
+            raise PerfError(str(e)) from None
+        say(f'cases of {a.outside} (perf.py smoke --outside; case: gpu/name/rN/cap):')
+        for name, s in declared.items():
+            say(f'  {name:<12} {runs.APP_CASE} {name}  ({s.label})')
+        return 0
     say('scenarios (case: gpu/scenario/rN/cap, e.g. rtx/surface/r16/uncapped; caps 0 or '
         f'{runs.MIN_CAP}+):')
     for name, s in runs.SCENARIOS.items():
@@ -1299,6 +1341,8 @@ def parser():
     s.add_argument('--nvidia', action='store_true', help='sample the NVIDIA state (read only)')
     s.add_argument('--new-extra', metavar='OPTIONS',
                    help="stress options for the new side only, quoted ('--fog valley')")
+    s.add_argument('--outside', action='store_true',
+                   help='--base and --new are binaries of an outside app with its own cases')
     c = sub.add_parser('check', help='level 2: the checkpoint round')
     c.add_argument('--base', help='git ref or stress binary (default: the last checkpoint)')
     c.add_argument('--ref', default='HEAD', help='commit of main to measure (default HEAD)')
@@ -1320,7 +1364,8 @@ def parser():
                    help='pairs per commit with --metric (default 3)')
     b.add_argument('--duration', type=float,
                    help=f'seconds per run (default {SMOKE_S}, {CHECK_S} with --metric)')
-    sub.add_parser('cases', help='scenarios and the checkpoint matrix')
+    k = sub.add_parser('cases', help='scenarios and the checkpoint matrix')
+    k.add_argument('--outside', metavar='BIN', help="an outside app's cases instead")
     return p
 
 

@@ -69,6 +69,38 @@ con:
 En una tarea no se estudian refrescos salteados con tope. Salen con mucho ruido por el estado de
 energía de la NVIDIA (issue #5).
 
+### Medir una app de fuera
+
+El smoke también mide un binario de otro repositorio hecho con el motor. La app declara sus casos
+y el smoke los corre con las mismas reglas, la misma tabla y las mismas salidas:
+
+```bash
+python3 tools/perf/perf.py cases --outside BIN       # los casos que declara
+python3 tools/perf/perf.py smoke --outside --base BIN_BASE --new BIN_NUEVO [CASO...] [-- OPCIONES]
+```
+
+- Sin casos corre todos los que declara el binario nuevo. Un caso se escribe como los de stress:
+  `780m/surface/144`. Las opciones tras `--` van a la app en los dos lados.
+- Base y nuevo son binarios ya compilados: perf.py solo compila stress. La app trae su receta,
+  que compila los dos y llama a perf.py (sin `tools/quiet.sh` alrededor).
+- Un caso que la base no declara se salta (sale con 2). Uno que el binario nuevo perdió es un
+  fallo (sale con 1).
+- `perf-check` y `perf-bisect` no corren apps de fuera.
+
+Lo que hace la app (el detalle está en `tools/perf/runs.py`):
+
+- `BIN --perf-cases` imprime `{"format": 1, "cases": [{"name": "surface", "label": "superficie,
+  vuelo a 64"}]}` y sale con 0. Un nombre lleva minúsculas, dígitos y guiones, empieza con una
+  letra y no es una GPU, `rN`, `capN` ni `uncapped`.
+- `BIN --perf-case NOMBRE`, con las opciones de GPU, `--radius`, `--fps-limit`, `--duration`,
+  `--timeout`, `--label`, `--csv` y `--summary`, corre un caso. Espera a que su mundo se asiente,
+  imprime `APP: measuring ...` al empezar a medir, mide `--duration` segundos y deja un resumen y
+  un CSV como los de stress. Del resumen se leen `run.fps_limit`, `run.refresh_hz`, `frames`
+  (`avg_fps`, `p50_ms`, `p99_ms`, `over_144hz`, `over_7_5ms`) y los fps de cada segundo de
+  `timeline`; del CSV, `t_ms` y `presented`. Sale con 0, o con otro código si falló (2: sin GPU).
+  Para `just bench-report --compare`, el resumen trae también `run.scenario`, `run.radius`,
+  `run.speed`, `run.backend` y `run.tier`.
+
 ### Nivel 2: la ronda de control
 
 La corre solo quien integra en `main` (el dueño, o Claude cuando integra), sobre un commit de
