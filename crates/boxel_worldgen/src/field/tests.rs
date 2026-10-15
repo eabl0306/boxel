@@ -160,6 +160,73 @@ fn check<F: Field>(name: &str, f: &F, case: &Case) -> Result<(), TestCaseError> 
     Ok(())
 }
 
+/// Checks `f.cells(grid)` against the contract: corners equal to the grid form, and in every
+/// cell the bound and the fine against the field at `points` (fractions of the cell) and at its
+/// corners and center.
+fn check_cells<F: Field>(
+    name: &str,
+    f: &F,
+    grid: &CellGrid,
+    points: &[(f64, f64)],
+) -> Result<(), TestCaseError> {
+    let cells = f.cells(grid);
+    let mut corners = vec![0; (grid.nx + 1) * (grid.nz + 1)];
+    f.grid(&grid.corner_xs(), &grid.corner_zs(), &mut corners);
+    prop_assert_eq!(&cells.corners, &corners, "{} corners", name);
+    prop_assert_eq!(cells.bounds.len(), grid.len());
+    prop_assert_eq!(cells.fines.len(), grid.len());
+    for i in 0..grid.nx {
+        for j in 0..grid.nz {
+            let rect = grid.rect(i, j);
+            let (bound, fine) = (cells.bounds[i * grid.nz + j], cells.fines[i * grid.nz + j]);
+            let values = cells.corner_values(grid, i, j);
+            prop_assert_eq!(values, corner_values(f, rect), "{} cell corners", name);
+            let s = rect.x1 - rect.x0;
+            let inside = points
+                .iter()
+                .map(|&(tx, tz)| {
+                    (
+                        rect.x0 + (tx * s as f64) as i64,
+                        rect.z0 + (tz * s as f64) as i64,
+                    )
+                })
+                .chain(rect.corners())
+                .chain([(rect.center_x(), rect.center_z())]);
+            for (x, z) in inside {
+                let v = f.value(x, z);
+                prop_assert!(
+                    bound.contains(v),
+                    "{name}: {v} at ({x}, {z}) out of {bound:?} on {rect:?}"
+                );
+                let (num, den) = interpolant(rect, values, x, z);
+                let scaled = i128::from(v) * den;
+                prop_assert!(
+                    scaled <= num + i128::from(fine.up) * den
+                        && scaled >= num - i128::from(fine.down) * den,
+                    "{name}: {v} at ({x}, {z}) with {fine:?} on {rect:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A grid of a few cells of a LOD-like size at a place.
+fn cell_grid() -> impl Strategy<Value = CellGrid> {
+    (
+        place(),
+        place(),
+        prop::sample::select(vec![1i64, 2, 3, 4, 8, 16, 17, 32, 64, 128, 256]),
+        1usize..4,
+        1usize..4,
+        any::<bool>(),
+    )
+        .prop_map(|(x, z, size, nx, nz, aligned)| {
+            let snap = |c: i64| if aligned { c - c.rem_euclid(size) } else { c };
+            CellGrid::new(snap(x), snap(z), size, nx, nz)
+        })
+}
+
 /// Centers: the origin, the edges of `i32`, `2^40`, next to the world limit on both sides.
 fn place() -> impl Strategy<Value = i64> {
     let centers = [
@@ -262,6 +329,52 @@ proptest! {
     }
 
     #[test]
+    fn every_field_keeps_its_contract_over_cells(
+        seed in any::<u64>(),
+        grid in cell_grid(),
+        points in prop::collection::vec((0.0f64..=1.0, 0.0f64..=1.0), 4),
+    ) {
+        let noise = NoiseField::new(seed, fbm(64, 3), Basis::Gradient, 1000);
+        let value = NoiseField::new(seed ^ 1, fbm(32, 2), Basis::Value, 500);
+        let lattice = LatticeField::new(4, noise);
+        let coarse = LatticeField::new(8, value);
+        let fine = LatticeField::new(1, value);
+        let splined = Splined::new(&lattice, spline());
+        let add = Add::new(&coarse, &splined);
+        let min = Min::new(&add, &noise);
+        let weight = LatticeField::new(
+            6,
+            Splined::new(noise, Spline::new(&[(-300, 0), (300, 1 << 16)])),
+        );
+        let blend = Blend::new(&weight, &min, Const(300), 16);
+        let warped = Warped::new(Warp::new(seed, fbm(256, 2), 40), &lattice);
+        let plane = Plane { a: 3, b: -2, c: 7, lo: -(1 << 40), hi: 1 << 40 };
+        let crossing = Min::new(plane, Plane { a: -1, b: 1, c: 5, lo: -(1 << 40), hi: 1 << 40 });
+        check_cells("const", &Const(-42), &grid, &points)?;
+        check_cells("noise", &noise, &grid, &points)?;
+        check_cells("value noise", &value, &grid, &points)?;
+        check_cells("lattice", &lattice, &grid, &points)?;
+        check_cells("coarse lattice", &coarse, &grid, &points)?;
+        check_cells("fine lattice", &fine, &grid, &points)?;
+        check_cells("splined", &splined, &grid, &points)?;
+        check_cells("add", &add, &grid, &points)?;
+        check_cells("min", &min, &grid, &points)?;
+        check_cells("weight", &weight, &grid, &points)?;
+        check_cells("blend", &blend, &grid, &points)?;
+        check_cells("warped", &warped, &grid, &points)?;
+        check_cells("planes' min", &crossing, &grid, &points)?;
+        // A leaf's grid version is its per-cell version, cell by cell.
+        let cells = noise.cells(&grid);
+        for i in 0..grid.nx {
+            for j in 0..grid.nz {
+                let rect = grid.rect(i, j);
+                prop_assert_eq!(cells.bounds[i * grid.nz + j], noise.bound(rect));
+                prop_assert_eq!(cells.fines[i * grid.nz + j], noise.fine(rect));
+            }
+        }
+    }
+
+    #[test]
     fn noise_split_bounds_the_full_field(
         seed in any::<u64>(), x in place(), z in place(), cut in 0u64..4096,
         basis in prop::sample::select(vec![Basis::Value, Basis::Gradient]),
@@ -316,6 +429,93 @@ fn bounds_stay_local_on_big_cells() {
             assert!(b.contains(f.value(rect.center_x(), rect.center_z())));
         }
     }
+}
+
+/// A leaf that counts the values it computes, with the slope defaults and their grid form.
+#[derive(Debug)]
+struct Counted<F> {
+    f: F,
+    calls: std::cell::Cell<u64>,
+}
+
+impl<F: Field> Field for Counted<F> {
+    fn value(&self, x: i64, z: i64) -> i64 {
+        self.calls.set(self.calls.get() + 1);
+        self.f.value(x, z)
+    }
+    fn grid(&self, xs: &[i64], zs: &[i64], out: &mut [i64]) {
+        self.calls.set(self.calls.get() + out.len() as u64);
+        self.f.grid(xs, zs, out);
+    }
+    fn range(&self) -> Span {
+        self.f.range()
+    }
+    fn slope(&self) -> Slope {
+        self.f.slope()
+    }
+    fn cells(&self, grid: &CellGrid) -> Cells {
+        slope_cells(self, grid)
+    }
+}
+
+#[test]
+fn node_cells_cost_a_few_grids_per_leaf() {
+    // The bench's tree (Blend, Min, Add, Splined, three lattices) over a LOD node of 34 x 34
+    // cells: per cell, bound and fine asked every leaf about a hundred values; the node's cells
+    // ask each leaf a few grids.
+    let terrain = fbm(256, 5);
+    let meander = Fbm {
+        frequency: Frequency::one_in(512),
+        octaves: 3,
+        lacunarity: 2,
+        gain: 0.5,
+    };
+    let count = |f| Counted {
+        f,
+        calls: std::cell::Cell::new(0),
+    };
+    let (n1, n2, n3) = (
+        count(NoiseField::new(7, terrain, Basis::Gradient, 1000)),
+        count(NoiseField::new(8, terrain, Basis::Gradient, 300)),
+        count(NoiseField::new(9, meander, Basis::Gradient, 40)),
+    );
+    let lattice = LatticeField::new(5, &n1);
+    let weight = LatticeField::new(
+        8,
+        Splined::new(&n2, Spline::new(&[(-300, 0), (300, 1 << 16)])),
+    );
+    let relief = Add::new(LatticeField::new(2, &n3), Splined::new(&lattice, spline()));
+    let tree = Blend::new(&weight, Min::new(&relief, Const(1500)), Const(64), 16);
+    let leaves = || n1.calls.take() + n2.calls.take() + n3.calls.take();
+    let mut report = Vec::new();
+    for level in [1u32, 4, 6] {
+        let s = 1i64 << level;
+        let grid = CellGrid::new(32 * s, 64 * s, s, 34, 34);
+        let _ = leaves();
+        let cells = tree.cells(&grid);
+        let node = leaves();
+        let mut per_cell = 0;
+        for (i, j) in [(0, 0), (17, 9), (33, 33)] {
+            let rect = grid.rect(i, j);
+            let _ = (tree.bound(rect), tree.fine(rect));
+            per_cell += leaves();
+        }
+        let per_cell_node = per_cell / 3 * 34 * 34;
+        assert!(
+            node * 5 < per_cell_node,
+            "level {level}: {node} against {per_cell_node}"
+        );
+        report.push(format!(
+            "level {level}: {node} per node, {per_cell_node} per cell"
+        ));
+        assert!(
+            node < 12 * 35 * 35,
+            "level {level}: {node} leaf values per node"
+        );
+        assert_eq!(cells.bounds.len(), 34 * 34);
+    }
+    // WG1_COUNTS=1 shows the counts.
+    assert!(std::env::var("WG1_COUNTS").is_err(), "{report:?}");
 }
 
 #[test]

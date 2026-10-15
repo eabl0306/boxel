@@ -1,6 +1,6 @@
 //! The leaves of a field: [`Const`] and [`NoiseField`] (a quantized fbm).
 
-use super::{Field, Fine, Rect, Slope, Span};
+use super::{CellGrid, Cells, Field, Fine, Rect, Slope, Span, slope_cells};
 use crate::exact::{Q16, round_f64};
 use crate::noise::{Basis, Fbm, FbmSplit};
 
@@ -24,6 +24,13 @@ impl Field for Const {
     }
     fn fine(&self, _rect: Rect) -> Fine {
         Fine::ZERO
+    }
+    fn cells(&self, grid: &CellGrid) -> Cells {
+        Cells {
+            corners: vec![self.0; (grid.nx + 1) * (grid.nz + 1)],
+            bounds: vec![Span::point(self.0); grid.len()],
+            fines: vec![Fine::ZERO; grid.len()],
+        }
     }
 }
 
@@ -131,5 +138,9 @@ impl Field for NoiseField {
     }
     fn slope(&self) -> Slope {
         self.slope
+    }
+    /// [`slope_cells`]: the per-cell defaults from a corner grid and a center grid.
+    fn cells(&self, grid: &CellGrid) -> Cells {
+        slope_cells(self, grid)
     }
 }

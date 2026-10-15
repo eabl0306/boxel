@@ -9,7 +9,9 @@
 //! - [`Field::slope`]: a Lipschitz bound with a rounding allowance ([`Slope`]), along any line;
 //! - [`Field::fine`]: how far the field can stand over or under the bilinear interpolant of its
 //!   values at a rectangle's 4 corners ([`Fine`]). That is the margin a LOD cell needs: the
-//!   interpolant's maximum is at a corner, so `max corner + fine.up` bounds the field inside.
+//!   interpolant's maximum is at a corner, so `max corner + fine.up` bounds the field inside;
+//! - [`Field::cells`]: the corners, bounds and fines of a whole grid of cells at once
+//!   ([`CellGrid`], [`Cells`]), the form a LOD node asks for.
 //!
 //! The fields are generic structs, monomorphized: [`LatticeField`] (a child sampled at the points
 //! of a `2^k` lattice and interpolated exactly), [`Splined`] (a fixed-point [`Spline`] of a
@@ -29,11 +31,13 @@
 use crate::exact::isqrt_ceil;
 pub use crate::exact::{Q16, Slope};
 
+mod cells;
 mod combine;
 mod lattice;
 mod leaf;
 mod spline;
 
+pub use cells::{CellGrid, Cells, default_cells, slope_cells};
 pub use combine::{Add, Blend, Min, Splined, Warped};
 pub use lattice::LatticeField;
 pub use leaf::{Const, NoiseField};
@@ -250,6 +254,15 @@ pub trait Field {
     fn fine(&self, rect: Rect) -> Fine {
         fine_from_slope(self, rect)
     }
+
+    /// The corner values, bounds and fines of every cell of `grid` at once (a LOD node's cells),
+    /// each as sound as [`Field::bound`] and [`Field::fine`]; the corners are the grid form's
+    /// values, bit for bit. The default reads the corner grid once and asks `bound` and `fine`
+    /// per cell ([`default_cells`]); the combinators take one `cells` per child and derive theirs
+    /// from it, so a tree's leaves run a few grids per node instead of a few evaluations per cell.
+    fn cells(&self, grid: &CellGrid) -> Cells {
+        default_cells(self, grid)
+    }
 }
 
 impl<F: Field + ?Sized> Field for &F {
@@ -270,6 +283,9 @@ impl<F: Field + ?Sized> Field for &F {
     }
     fn fine(&self, rect: Rect) -> Fine {
         (**self).fine(rect)
+    }
+    fn cells(&self, grid: &CellGrid) -> Cells {
+        (**self).cells(grid)
     }
 }
 

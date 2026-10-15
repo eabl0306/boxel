@@ -2,8 +2,8 @@
 //! bounds from its children's; the proofs are in the docs, the checks in the tests.
 
 use super::{
-    Field, Fine, Rect, Slope, Span, Spline, bound_from_slope, by_bound, corner_values,
-    fine_from_slope,
+    CellGrid, Cells, Field, Fine, Rect, Slope, Span, Spline, bound_from_slope, by_bound,
+    corner_values, fine_from_slope, slope_cells,
 };
 use crate::exact::{Q16, div_ceil_sticky, mul_shift_ceil, saturate};
 use crate::noise::Warp;
@@ -79,12 +79,37 @@ impl<C: Field> Field for Splined<C> {
     }
     fn fine(&self, rect: Rect) -> Fine {
         let input = self.child.bound(rect);
+        let corners = corner_values(&self.child, rect);
+        self.fine_of(input, self.child.fine(rect), corners, rect.half_diagonal())
+    }
+    fn cells(&self, grid: &CellGrid) -> Cells {
+        let child = self.child.cells(grid);
+        let half = grid.half_diagonal();
+        let mut cells = Cells {
+            corners: child.corners.iter().map(|&v| self.spline.eval(v)).collect(),
+            bounds: Vec::with_capacity(grid.len()),
+            fines: Vec::with_capacity(grid.len()),
+        };
+        for (i, j, k) in Cells::indices(grid) {
+            let input = child.bounds[k];
+            let corners = child.corner_values(grid, i, j);
+            cells.bounds.push(self.spline.range_over(input));
+            cells
+                .fines
+                .push(self.fine_of(input, child.fines[k], corners, half));
+        }
+        cells
+    }
+}
+
+impl<C: Field> Splined<C> {
+    /// The fine of one cell from the child's bound, fine and corner values there (the rule in
+    /// the type's docs). Shared by [`Field::fine`] and [`Field::cells`].
+    fn fine_of(&self, input: Span, child_fine: Fine, corners: [i64; 4], half: u64) -> Fine {
         let (m_lo, m_hi) = self.spline.slopes_over(input);
         let m = Q16::from_raw(saturate(m_lo.unsigned_abs().max(m_hi.unsigned_abs())));
         let bend = Q16::from_raw(saturate((m_hi - m_lo).unsigned_abs()));
-        let child_fine = self.child.fine(rect);
         let e = child_fine.up.max(child_fine.down);
-        let corners = corner_values(&self.child, rect);
         let lo = corners.iter().copied().fold(i64::MAX, i64::min);
         let hi = corners.iter().copied().fold(i64::MIN, i64::max);
         let w = hi.abs_diff(lo);
@@ -92,8 +117,7 @@ impl<C: Field> Field for Splined<C> {
             .times(e)
             .saturating_add(div_ceil_sticky(bend.times(w), 4))
             .saturating_add(1);
-        let near =
-            (w.div_ceil(2).saturating_add(e)).min(self.child.slope().over(rect.half_diagonal()));
+        let near = (w.div_ceil(2).saturating_add(e)).min(self.child.slope().over(half));
         let mean = m.times(near).saturating_add(1);
         let outputs = corners.map(|c| self.spline.eval(c));
         by_bound(self.spline.range_over(input), outputs).min(Fine::both(jensen.min(mean)))
@@ -146,11 +170,32 @@ impl<A: Field, B: Field> Field for Add<A, B> {
         self.a.slope().sum(self.b.slope())
     }
     fn fine(&self, rect: Rect) -> Fine {
-        let (a, b) = (self.a.fine(rect), self.b.fine(rect));
-        Fine {
-            up: a.up.saturating_add(b.up),
-            down: a.down.saturating_add(b.down),
+        add_fines(self.a.fine(rect), self.b.fine(rect))
+    }
+    fn cells(&self, grid: &CellGrid) -> Cells {
+        let (a, b) = (self.a.cells(grid), self.b.cells(grid));
+        Cells {
+            corners: a
+                .corners
+                .iter()
+                .zip(&b.corners)
+                .map(|(a, b)| a + b)
+                .collect(),
+            bounds: (a.bounds.iter().zip(&b.bounds))
+                .map(|(a, b)| Span::new(a.lo + b.lo, a.hi + b.hi))
+                .collect(),
+            fines: (a.fines.iter().zip(&b.fines))
+                .map(|(&a, &b)| add_fines(a, b))
+                .collect(),
         }
+    }
+}
+
+/// The fine of a sum: both sides added.
+fn add_fines(a: Fine, b: Fine) -> Fine {
+    Fine {
+        up: a.up.saturating_add(b.up),
+        down: a.down.saturating_add(b.down),
     }
 }
 
@@ -202,28 +247,53 @@ impl<A: Field, B: Field> Field for Min<A, B> {
         self.a.slope().max(self.b.slope())
     }
     fn fine(&self, rect: Rect) -> Fine {
-        let (fa, fb) = (self.a.fine(rect), self.b.fine(rect));
         let (ca, cb) = (corner_values(&self.a, rect), corner_values(&self.b, rect));
-        let (mut over, mut under, mut gap) = (0u64, 0u64, 0u64);
-        for (a, b) in ca.into_iter().zip(cb) {
-            let d = i128::from(a) - i128::from(b);
-            let size = saturate(d.unsigned_abs());
-            gap = gap.max(size);
-            if d > 0 {
-                over = over.max(size);
-            } else {
-                under = under.max(size);
-            }
+        min_fine(self.a.fine(rect), self.b.fine(rect), ca, cb)
+    }
+    fn cells(&self, grid: &CellGrid) -> Cells {
+        let (a, b) = (self.a.cells(grid), self.b.cells(grid));
+        let mut cells = Cells {
+            corners: (a.corners.iter().zip(&b.corners))
+                .map(|(&a, &b)| a.min(b))
+                .collect(),
+            bounds: Vec::with_capacity(grid.len()),
+            fines: Vec::with_capacity(grid.len()),
+        };
+        for (i, j, k) in Cells::indices(grid) {
+            let (span_a, span_b) = (a.bounds[k], b.bounds[k]);
+            cells.bounds.push(Span::new(
+                span_a.lo.min(span_b.lo),
+                span_a.hi.min(span_b.hi),
+            ));
+            let (ca, cb) = (a.corner_values(grid, i, j), b.corner_values(grid, i, j));
+            cells.fines.push(min_fine(a.fines[k], b.fines[k], ca, cb));
         }
-        let up = fa
-            .up
-            .saturating_add(over)
-            .min(fb.up.saturating_add(under))
-            .min(fa.up.max(fb.up).saturating_add(gap.div_ceil(2)));
-        Fine {
-            up,
-            down: fa.down.max(fb.down),
+        cells
+    }
+}
+
+/// The fine of `min(a, b)` on a cell from the children's fines and corner values there (the rule
+/// in [`Min`]'s docs).
+fn min_fine(fa: Fine, fb: Fine, ca: [i64; 4], cb: [i64; 4]) -> Fine {
+    let (mut over, mut under, mut gap) = (0u64, 0u64, 0u64);
+    for (a, b) in ca.into_iter().zip(cb) {
+        let d = i128::from(a) - i128::from(b);
+        let size = saturate(d.unsigned_abs());
+        gap = gap.max(size);
+        if d > 0 {
+            over = over.max(size);
+        } else {
+            under = under.max(size);
         }
+    }
+    let up = fa
+        .up
+        .saturating_add(over)
+        .min(fb.up.saturating_add(under))
+        .min(fa.up.max(fb.up).saturating_add(gap.div_ceil(2)));
+    Fine {
+        up,
+        down: fa.down.max(fb.down),
     }
 }
 
@@ -363,12 +433,47 @@ impl<W: Field, A: Field, B: Field> Field for Blend<W, A, B> {
             (false, true) => return self.b.fine(rect),
             _ => {}
         }
-        let d = gap(self.a.bound(rect), self.b.bound(rect));
-        let moved = w
-            .width()
-            .min(self.weight.slope().over(rect.half_diagonal()));
-        let term = mul_shift_ceil(d, moved, self.shift);
+        let (ab, bb) = (self.a.bound(rect), self.b.bound(rect));
         let (fa, fb) = (self.a.fine(rect), self.b.fine(rect));
+        self.fine_of(w, ab, bb, fa, fb, rect.half_diagonal())
+    }
+    fn cells(&self, grid: &CellGrid) -> Cells {
+        let w = self.weight.cells(grid);
+        let (a, b) = (self.a.cells(grid), self.b.cells(grid));
+        let mut cells = Cells {
+            corners: (w.corners.iter().zip(&a.corners).zip(&b.corners))
+                .map(|((&w, &a), &b)| self.mix(w, a, b))
+                .collect(),
+            bounds: Vec::with_capacity(grid.len()),
+            fines: Vec::with_capacity(grid.len()),
+        };
+        let half = grid.half_diagonal();
+        for (_, _, k) in Cells::indices(grid) {
+            let (wb, ab, bb) = (w.bounds[k], a.bounds[k], b.bounds[k]);
+            cells.bounds.push(match self.reaches(wb) {
+                (true, false) => ab,
+                (false, true) => bb,
+                _ => ab.hull(bb),
+            });
+            cells
+                .fines
+                .push(self.fine_of(wb, ab, bb, a.fines[k], b.fines[k], half));
+        }
+        cells
+    }
+}
+
+impl<W: Field, A: Field, B: Field> Blend<W, A, B> {
+    /// The fine of one cell from the weight's bound and the inputs' bounds and fines there (the
+    /// rule in the type's docs). Shared by [`Field::fine`] and [`Field::cells`].
+    fn fine_of(&self, w: Span, ab: Span, bb: Span, fa: Fine, fb: Fine, half: u64) -> Fine {
+        match self.reaches(w) {
+            (true, false) => return fa,
+            (false, true) => return fb,
+            _ => {}
+        }
+        let moved = w.width().min(self.weight.slope().over(half));
+        let term = mul_shift_ceil(gap(ab, bb), moved, self.shift);
         Fine {
             up: fa.up.max(fb.up),
             down: fa.down.max(fb.down),
@@ -459,5 +564,10 @@ impl<C: Field> Field for Warped<C> {
     }
     fn fine(&self, rect: Rect) -> Fine {
         fine_from_slope(self, rect)
+    }
+    /// [`slope_cells`]: the center bounds without the child's grown one, which would ask the
+    /// child per cell.
+    fn cells(&self, grid: &CellGrid) -> Cells {
+        slope_cells(self, grid)
     }
 }

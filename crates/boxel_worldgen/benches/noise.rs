@@ -3,7 +3,7 @@
 //! and at `2^40` (`*_far`, where the lattice cells of the noise leave `i32`).
 use boxel_worldgen::exact::point_segment_distance;
 use boxel_worldgen::field::{
-    Add, Blend, Const, Field, LatticeField, Min, NoiseField, Rect, Spline, Splined,
+    Add, Blend, CellGrid, Const, Field, LatticeField, Min, NoiseField, Rect, Spline, Splined,
 };
 use boxel_worldgen::noise::{
     Basis, Cellular, Fbm, Frequency, Warp, fbm_2d, fbm_2d_grid, gradient_fbm_2d,
@@ -181,6 +181,23 @@ fn bench(c: &mut Criterion) {
     c.bench_function("field/tree_bound_and_fine", |b| {
         b.iter(|| (tree.bound(black_box(cell)), tree.fine(cell)));
     });
+    // A LOD node: its 35 x 35 corner grid alone, and the corners, bounds and fines of its 34 x 34
+    // cells at once, at levels 1, 4 and 6.
+    for level in [1u32, 4, 6] {
+        let s = 1i64 << level;
+        let grid = CellGrid::new(32 * s, 64 * s, s, 34, 34);
+        let (xs, zs) = (grid.corner_xs(), grid.corner_zs());
+        c.bench_function(&format!("field/node_corners_l{level}"), |b| {
+            let mut out = vec![0; xs.len() * zs.len()];
+            b.iter(|| {
+                tree.grid(black_box(&xs), &zs, &mut out);
+                out[0]
+            });
+        });
+        c.bench_function(&format!("field/node_cells_l{level}"), |b| {
+            b.iter(|| tree.cells(black_box(&grid)));
+        });
+    }
 }
 
 criterion_group!(benches, bench);

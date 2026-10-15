@@ -1,7 +1,10 @@
 //! [`LatticeField`]: a child field sampled at the points of a `2^k` lattice and interpolated
 //! exactly with integer weights.
 
-use super::{Field, Fine, Rect, Slope, Span, bound_from_slope, fine_from_slope};
+use super::cells::corner_grid;
+use super::{
+    CellGrid, Cells, Field, Fine, Rect, Slope, Span, bound_from_slope, by_bound, fine_from_slope,
+};
 use crate::exact::Q16;
 
 /// Lattice points [`LatticeField::bound`] reads one by one; past them it takes its own
@@ -203,23 +206,87 @@ impl<C: Field> Field for LatticeField<C> {
     }
 
     fn fine(&self, rect: Rect) -> Fine {
+        self.inside_fine(rect)
+            .unwrap_or_else(|| fine_from_slope(self, rect))
+    }
+
+    /// One lattice table for the bounds when the grid's cells are not much coarser than the
+    /// lattice (the table is then about the size of the corner grid), else the center bounds;
+    /// the fines from those bounds and the corner grid.
+    fn cells(&self, grid: &CellGrid) -> Cells {
+        let k = self.shift;
+        let corners = corner_grid(self, grid);
+        let up = |c: i64| (c >> k) + i64::from(c & ((1 << k) - 1) != 0);
+        let (x1, z1) = (
+            grid.x0 + grid.nx as i64 * grid.size,
+            grid.z0 + grid.nz as i64 * grid.size,
+        );
+        let (i0, j0) = (grid.x0 >> k, grid.z0 >> k);
+        let (width, depth) = ((up(x1) - i0 + 1) as usize, (up(z1) - j0 + 1) as usize);
+        let exact = (width * depth) as u128 <= 4 * corners.len() as u128 + 64;
+        let bounds: Vec<Span> = if exact {
+            let xs: Vec<i64> = (0..width as i64).map(|i| (i0 + i) << k).collect();
+            let zs: Vec<i64> = (0..depth as i64).map(|j| (j0 + j) << k).collect();
+            let mut table = vec![0; width * depth];
+            self.child.grid(&xs, &zs, &mut table);
+            Cells::indices(grid)
+                .map(|(i, j, _)| {
+                    let rect = grid.rect(i, j);
+                    let (a0, a1) = ((rect.x0 >> k) - i0, up(rect.x1) - i0);
+                    let (b0, b1) = ((rect.z0 >> k) - j0, up(rect.z1) - j0);
+                    let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+                    for a in a0..=a1 {
+                        for &v in &table
+                            [a as usize * depth + b0 as usize..=a as usize * depth + b1 as usize]
+                        {
+                            (lo, hi) = (lo.min(v), hi.max(v));
+                        }
+                    }
+                    Span::new(lo, hi)
+                })
+                .collect()
+        } else {
+            let mut centers = vec![0; grid.len()];
+            self.grid(&grid.center_xs(), &grid.center_zs(), &mut centers);
+            let reach = self.slope.over_sq(grid.center_reach_sq());
+            centers
+                .iter()
+                .map(|&c| Span::around(c, reach, self.range))
+                .collect()
+        };
+        let spread = Fine::both(self.slope.over(grid.half_diagonal()));
+        let mut cells = Cells {
+            corners,
+            bounds,
+            fines: Vec::with_capacity(grid.len()),
+        };
+        for (i, j, k) in Cells::indices(grid) {
+            let fine = self.inside_fine(grid.rect(i, j)).unwrap_or_else(|| {
+                by_bound(cells.bounds[k], cells.corner_values(grid, i, j)).min(spread)
+            });
+            cells.fines.push(fine);
+        }
+        cells
+    }
+}
+
+impl<C: Field> LatticeField<C> {
+    /// The fine of a rectangle inside one lattice cell, `None` past one. There the field is
+    /// floor(B), B bilinear: B equals its own interpolant on any sub-rectangle, and the floors
+    /// move each side by under 1. With the corners on lattice points their values are B exactly,
+    /// so the field never stands over it.
+    fn inside_fine(&self, rect: Rect) -> Option<Fine> {
         let k = self.shift;
         let mask = (1 << k) - 1;
         let (base_x, base_z) = (rect.x0 & !mask, rect.z0 & !mask);
         let inside = rect.x1 - base_x <= 1 << k && rect.z1 - base_z <= 1 << k;
-        if !inside {
-            return fine_from_slope(self, rect);
-        }
-        // On one lattice cell the field is floor(B), B bilinear: B equals its own interpolant
-        // on any sub-rectangle, and the floors move each side by under 1. With the corners on
-        // lattice points their values are B exactly, so the field never stands over it.
         let aligned = rect
             .corners()
             .iter()
             .all(|&(x, z)| x & mask == 0 && z & mask == 0);
-        Fine {
+        inside.then_some(Fine {
             up: u64::from(!aligned),
             down: 1,
-        }
+        })
     }
 }
