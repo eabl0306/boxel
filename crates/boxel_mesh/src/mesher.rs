@@ -343,8 +343,8 @@ impl MaterialTable {
     /// source of fluid `water` (ADR 0025), `dry` being the same block without it: gather puts
     /// the water in its cell (it culls, merges and slopes as that fluid) and keeps the block in
     /// [`PaddedChunk::waterlogged`], whose boxes, or cube faces, are drawn as for the dry block
-    /// (a cube face is hidden by an opaque cube and by the dry block, wet or not, as in the
-    /// greedy pass, ADR 0038). The water's faces the block hides are not drawn (a cutout block
+    /// (a face is hidden by an opaque cube and by the dry block, wet or not, as the dry block's
+    /// faces are, ADR 0038). The water's faces the block hides are not drawn (a cutout block
     /// hides none, ADR 0038), the others sit [`layout::FLUID_INSET`] inside the cell (but the
     /// top).
     pub fn set_waterlogged(&mut self, material: u16, water: u16, dry: u16) {
@@ -1227,15 +1227,15 @@ fn flat_shading(
 /// A model made of boxes (slabs, stairs, fences, torches) draws one `SHAPE_BOX` quad per box
 /// face its other boxes do not cover. A face flush with the cell border is hidden by an opaque
 /// cube in front of it, or by a neighbor made of boxes whose faces on that border cover it, if
-/// that neighbor is opaque or the same material (two bottom slabs side by side, a stair's back
-/// against a full stair face). Faces inside the cell are always drawn. Cubes never hide against
-/// a box model (the greedy pass sees it as empty), so a cube face behind a stair's back is drawn
-/// and hidden by depth. A cross gives two quads (faces `PosX` and `PosZ`, see
-/// [`layout::SHAPE_CROSS`]) with the texture of its side. The waterlogged blocks of the inner
-/// 32^3 ([`PaddedChunk::waterlogged`], ADR 0025) draw their boxes the same way, after the rest;
-/// a waterlogged cutout cube (ADR 0038) draws one unit quad per face, the quad the greedy pass
-/// draws there for the dry cube (layer, shape code, AO, light, flags), but those
-/// [`cube_face_hidden`] hides.
+/// that neighbor is opaque or the same block, wet or dry (two bottom slabs side by side, a
+/// stair's back against a full stair face, wet roots beside dry ones). Faces inside the cell
+/// are always drawn. Cubes never hide against a box model (the greedy pass sees it as empty),
+/// so a cube face behind a stair's back is drawn and hidden by depth. A cross gives two quads
+/// (faces `PosX` and `PosZ`, see [`layout::SHAPE_CROSS`]) with the texture of its side. The
+/// waterlogged blocks of the inner 32^3 ([`PaddedChunk::waterlogged`], ADR 0025) draw their
+/// boxes the same way, after the rest; a waterlogged cutout cube (ADR 0038) draws one unit quad
+/// per face, the quad the greedy pass draws there for the dry cube (layer, shape code, AO,
+/// light, flags), but those [`cube_face_hidden`] hides.
 fn emit_specials(
     padded: &PaddedChunk,
     materials: &MaterialTable,
@@ -1359,7 +1359,8 @@ fn cube_face_hidden(
 
 /// True if the neighbor in front of `bf` (a face of material `m` at inner `p`, flush with the
 /// cell border) hides it: an opaque cube, or a model made of boxes (dry or waterlogged),
-/// opaque or of material `m`, whose faces on that border cover it.
+/// opaque or the same block as `m` (wet or dry, [`MaterialTable::dry`]), whose faces on that
+/// border cover it. Any other state of the same block (a pane's connections) hides nothing.
 fn box_face_hidden(
     padded: &PaddedChunk,
     materials: &MaterialTable,
@@ -1378,7 +1379,7 @@ fn box_face_hidden(
         },
         VoxelClass::Empty => return false,
     };
-    let hides = nm == m || materials.shape(nm) == RenderShape::Opaque;
+    let hides = materials.dry(nm) == materials.dry(m) || materials.shape(nm) == RenderShape::Opaque;
     hides
         && materials
             .box_models
@@ -1653,7 +1654,10 @@ pub(crate) fn class_from_masks(padded: &PaddedChunk, x: i32, y: i32, z: i32) -> 
 /// face is visible if the voxel is an opaque or transparent cube and the neighbor is empty or a
 /// non-cube block, or transparent with a different material). The mesher's greedy output (the
 /// quads with shape code `SHAPE_CUBE` or `SHAPE_TURNED`), expanded with
-/// `PackedQuad::unit_faces`, must equal this set.
+/// `PackedQuad::unit_faces`, must equal this set. Waterlogged cutout cubes (ADR 0038) are
+/// outside its scope: their cell counts as the water it holds, and their own unit quads, though
+/// `SHAPE_CUBE` or `SHAPE_TURNED`, come from the per-block path and are left out of the
+/// comparison.
 pub fn reference_visible_faces(padded: &PaddedChunk) -> BTreeSet<([u32; 3], Face)> {
     // Class from the column masks (what bgm reads), material from the voxel ids.
     let class = |x, y, z| class_from_masks(padded, x, y, z);

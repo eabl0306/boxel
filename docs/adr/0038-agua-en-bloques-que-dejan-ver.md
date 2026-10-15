@@ -76,6 +76,10 @@ calculados una vez (`sturdy` y `top_floor`).
   agua sobre un estanque son 1277 quads, contra 131 secas. Solo en contenido que lo pida.
 - Entre una hoja seca y una con agua queda una cara (la de la seca, que ve agua). Entre dos
   secas no hay ninguna. Las hojas de Minecraft dibujan las dos.
+- Un modelo de cajas con agua y el mismo seco se tapan entre sí las caras del borde, como dos
+  secos (`MaterialTable::dry`): antes las raíces con agua y las secas dibujaban las dos caras en
+  el mismo plano. Otros estados del mismo bloque (las conexiones de un panel) siguen sin taparse;
+  queda para otra issue.
 - Descartado: tapar el techo solo a 16/16 (suma un quad oculto bajo cada losa de arriba con agua
   y mueve el golden), mantener la regla vieja para los cutout (las raíces siguen secas) y que un
   translúcido no tape nada (el orden translúcido no lo resuelve).

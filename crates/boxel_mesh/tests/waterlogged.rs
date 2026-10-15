@@ -509,6 +509,66 @@ fn a_translucent_block_hides_its_water_like_an_opaque_one() {
     assert_eq!(boxes.count(), box_faces(&mesh, [5, 5, 5]));
 }
 
+/// The wet and dry twins of a model made of boxes hide each other's faces on their border, as
+/// two dry ones do (ADR 0038): cutout roots side by side, in a chunk and across its border
+/// (either twin in the padding of the other's chunk), and translucent twins, a full box and a
+/// slab. Without it, both cutout faces were drawn on one plane and the leaf holes looked
+/// filled. Another block that is not opaque still hides nothing.
+#[test]
+fn wet_and_dry_twins_of_a_box_model_hide_each_other() {
+    use Face::*;
+    let (registry, table) = held_registry();
+    let twins = |name: &str| {
+        [false, true].map(|wet| state(&registry, &format!("{name}[waterlogged={wet}]")))
+    };
+    let faces = |mesh: &ChunkMesh, p: [u32; 3]| -> BTreeSet<Face> {
+        quads_at(mesh, p, layout::SHAPE_BOX).into_keys().collect()
+    };
+    let pair = |a: BlockState, b: BlockState| {
+        let name = |s| registry.state_name(s);
+        format!("{} beside {}", name(a), name(b))
+    };
+    // The first at x = 5, the second at x = 6.
+    for name in ["test:roots", "test:glass_box", "test:glass_slab"] {
+        let [dry, wet] = twins(name);
+        for (a, b) in [(wet, dry), (dry, wet), (wet, wet), (dry, dry)] {
+            let (_, mesh) = mesh_of(&table, |x, y, z| match (x, y, z) {
+                (5, 5, 5) => Some(a),
+                (6, 5, 5) => Some(b),
+                _ => None,
+            });
+            let (left, right) = (faces(&mesh, [5, 5, 5]), faces(&mesh, [6, 5, 5]));
+            let what = pair(a, b);
+            assert!(!left.contains(&PosX) && !right.contains(&NegX), "{what}");
+            assert!(left.contains(&NegX) && right.contains(&PosX), "{what}");
+        }
+    }
+    // Across the border x = 31 / 0.
+    let [dry, wet] = twins("test:roots");
+    for (a, b) in [(wet, dry), (dry, wet)] {
+        let world = move |[x, y, z]: [i32; 3]| match (x, y, z) {
+            (31, 5, 5) => Some(a),
+            (32, 5, 5) => Some(b),
+            _ => None,
+        };
+        let (_, left) = mesh_world(&table, &world, [0; 3], None, OPTIONS);
+        let (_, right) = mesh_world(&table, &world, [1, 0, 0], None, OPTIONS);
+        let (left, right) = (faces(&left, [31, 5, 5]), faces(&right, [0, 5, 5]));
+        let what = pair(a, b);
+        assert_eq!((left.len(), right.len()), (5, 5), "{what}");
+        assert!(!left.contains(&PosX) && !right.contains(&NegX), "{what}");
+    }
+    // Wet roots beside a dry glass box: both faces show.
+    let glass = twins("test:glass_box")[0];
+    let (_, mesh) = mesh_of(&table, |x, y, z| match (x, y, z) {
+        (5, 5, 5) => Some(wet),
+        (6, 5, 5) => Some(glass),
+        _ => None,
+    });
+    assert!(faces(&mesh, [5, 5, 5]).contains(&PosX));
+    assert!(faces(&mesh, [6, 5, 5]).contains(&NegX));
+}
+
 /// The blocks of the random scenes of [`held_water_faces_match_minecraft`], water first: more
 /// often water than anything else.
 const MIX: [&str; 26] = [
