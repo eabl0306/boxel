@@ -1,5 +1,6 @@
 //! Fluid types declared in the registry (#48): which blocks can be fluids, the tables between
-//! fluids, the waterlog fluid, and what the registry answers about each state.
+//! fluids, the waterlog fluid, what the registry answers about each state, and which full cubes
+//! hold water (ADR 0038).
 use boxel_voxel::*;
 
 fn texture(b: &mut BlockRegistryBuilder) -> TextureId {
@@ -235,4 +236,65 @@ fn only_the_fluid_model_is_a_liquid() {
     assert!(!fluid(mist), "a translucent cube without collision");
     assert!(fluid(liquid) && fluid(opaque));
     assert!(!fluid(hard), "a fluid model that collides");
+}
+
+/// Full cubes with `waterlogged` (ADR 0038): only a cutout one holds water, as Minecraft's
+/// leaves do, turned or not. An opaque one (a double slab), a translucent one and an invisible
+/// one hold none, whatever the property says. Holding water changes no other flag nor the
+/// opacity, and a cutout cube never occludes.
+#[test]
+fn only_a_cutout_cube_holds_water() {
+    let (mut b, block) = builder(BlockModel::Fluid, levels());
+    let t = TextureId(0);
+    let water = b.add_fluid(block, RULES).unwrap();
+    b.set_waterlog_fluid(water).unwrap();
+    let cube = |name: &str, shape, model, light_opacity| BlockDef {
+        shape,
+        collision: BlockCollision::Full,
+        light_opacity,
+        ..def(name, model, t)
+    };
+    let turned = BlockModel::Cube { axis: Axis::X };
+    let blocks = [
+        cube("test:wet_cube", RenderShape::Cutout, BlockModel::CUBE, 1),
+        cube("test:wet_log", RenderShape::Cutout, turned, 1),
+        cube(
+            "test:wet_glass",
+            RenderShape::Translucent,
+            BlockModel::CUBE,
+            0,
+        ),
+        cube("test:wet_solid", RenderShape::Opaque, BlockModel::CUBE, 15),
+        cube("test:wet_hidden", RenderShape::None, BlockModel::CUBE, 0),
+    ];
+    for def in blocks {
+        b.add_block_with_states(def, vec![Property::boolean(WATERLOGGED)], |_, _| {})
+            .unwrap();
+    }
+    let r = b.build();
+    for (name, holds, opacity) in [
+        ("test:wet_cube", true, 1),
+        ("test:wet_log", true, 1),
+        ("test:wet_glass", false, 0),
+        ("test:wet_solid", false, 15),
+        ("test:wet_hidden", false, 0),
+    ] {
+        let dry = r
+            .parse_state(&format!("{name}[waterlogged=false]"))
+            .unwrap();
+        let wet = r.parse_state(&format!("{name}[waterlogged=true]")).unwrap();
+        for s in [dry, wet] {
+            assert_eq!(r.can_be_waterlogged(s), holds, "{name}");
+            assert_eq!(r.light_opacity(s), opacity, "{name}");
+            assert!(r.flags(s).contains(StateFlags::SOLID), "{name}");
+            assert_eq!(r.occludes(s), r.shape(s) == RenderShape::Opaque, "{name}");
+        }
+        assert_eq!(r.is_waterlogged(wet), holds, "{name}");
+        assert!(!r.is_waterlogged(dry), "{name}");
+        // The water is the only difference between the two states.
+        let held = StateFlags::WATERLOGGED;
+        assert_eq!(r.flags(wet) - held, r.flags(dry), "{name}");
+        assert_eq!(r.with_water(dry, true), Some(wet));
+        assert_eq!(r.with_water(wet, false), Some(dry));
+    }
 }

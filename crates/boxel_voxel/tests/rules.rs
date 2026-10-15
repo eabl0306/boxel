@@ -1,7 +1,8 @@
 //! Neighbor and use rules registered per block (#48): the registry keeps what the builder was
 //! given, by block, and refuses blocks it does not have. The rules are closures over what they
 //! need; the engine only stores and hands them out. And the support shape the rule helpers read
-//! (ADR 0037, #112): its collision unless a block sets another, per state.
+//! (ADR 0037, #112): its collision unless a block sets another, per state, and the water a cutout
+//! cube keeps when it is placed or broken (ADR 0038).
 use boxel_voxel::rules::{NeighborRule, UseRule, is_sturdy, supports_center};
 use boxel_voxel::*;
 use std::sync::Arc;
@@ -308,4 +309,71 @@ fn support_changes_no_other_table() {
     let solid = r.by_name("test:solid").unwrap();
     assert_eq!(r.support(solid), &BlockCollision::None);
     assert!(!is_sturdy(&r, solid, Face::PosY));
+}
+
+/// `test:solid`, `test:water` (16 levels, the waterlog fluid) and two full cubes with
+/// `waterlogged`: `test:wet_cube`, cutout (leaves), and `test:wet_solid`, opaque (a double
+/// slab).
+fn wet_cube_registry() -> BlockRegistry {
+    let mut b = builder();
+    let t = TextureId(0);
+    let water = BlockDef {
+        shape: RenderShape::Translucent,
+        model: BlockModel::Fluid,
+        collision: BlockCollision::None,
+        light_opacity: 1,
+        ..cube("test:water", t)
+    };
+    let levels = vec![Property::int(FLUID_LEVEL, 0..=15)];
+    b.add_block_with_states(water, levels, |_, _| {}).unwrap();
+    let block = b.block_by_name("test:water").unwrap();
+    let rules = FluidRules {
+        delay: 5,
+        slope_find_distance: 4,
+        drop_off: 1,
+        infinite: true,
+    };
+    let fluid = b.add_fluid(block, rules).unwrap();
+    b.set_waterlog_fluid(fluid).unwrap();
+    let wet = || vec![Property::boolean(WATERLOGGED)];
+    let leaves = BlockDef {
+        shape: RenderShape::Cutout,
+        light_opacity: 1,
+        ..cube("test:wet_cube", t)
+    };
+    b.add_block_with_states(leaves, wet(), |_, _| {}).unwrap();
+    b.add_block_with_states(cube("test:wet_solid", t), wet(), |_, _| {})
+        .unwrap();
+    b.build()
+}
+
+/// A cutout cube placed into a water source keeps it, and is dry in flowing water or in the
+/// air; broken, a waterlogged one leaves its source (Minecraft's leaves, ADR 0038). An opaque
+/// cube with the property is placed as it is and leaves air.
+#[test]
+fn a_cutout_cube_keeps_the_water_it_is_placed_into() {
+    use boxel_voxel::rules::{broken, placed_into};
+    let r = wet_cube_registry();
+    let s = |name: &str| r.parse_state(name).expect(name);
+    let source = s("test:water");
+    let flowing = s("test:water[level=3]");
+    let dry = s("test:wet_cube[waterlogged=false]");
+    let wet = s("test:wet_cube[waterlogged=true]");
+    assert_eq!(placed_into(&r, dry, source), wet);
+    assert_eq!(placed_into(&r, wet, source), wet);
+    for existing in [flowing, BlockState::AIR] {
+        assert_eq!(placed_into(&r, dry, existing), dry);
+        assert_eq!(placed_into(&r, wet, existing), dry);
+    }
+    assert_eq!(broken(&r, wet), source);
+    assert_eq!(broken(&r, dry), BlockState::AIR);
+    for state in [
+        s("test:wet_solid[waterlogged=false]"),
+        s("test:wet_solid[waterlogged=true]"),
+    ] {
+        for existing in [source, flowing, BlockState::AIR] {
+            assert_eq!(placed_into(&r, state, existing), state);
+        }
+        assert_eq!(broken(&r, state), BlockState::AIR);
+    }
 }

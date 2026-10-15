@@ -360,7 +360,8 @@ bitflags::bitflags! {
         /// 0025).
         const WATERLOGGED = 1 << 4;
         /// Could hold a water source: it has the [`WATERLOGGED`] property and is not a full
-        /// cube (ADR 0025).
+        /// cube, unless a cutout one (leaves hold water, a double slab or glass none; ADR 0025,
+        /// ADR 0038).
         const WATERLOGGABLE = 1 << 5;
         /// Stops movement (Minecraft's `blocksMotion`): it collides ([`StateFlags::SOLID`]),
         /// or its block was declared to ([`BlockRegistryBuilder::set_blocks_motion`]: a fence
@@ -1058,9 +1059,11 @@ impl BlockRegistryBuilder {
             if !block.properties.iter().any(|p| p.name() == WATERLOGGED) {
                 continue;
             }
-            // A full cube holds no water (a double slab), whatever its property says.
+            // An opaque, translucent or invisible full cube holds no water (a double slab),
+            // whatever its property says; a cutout one does (leaves, ADR 0038).
             for state in block.first..block.first + block.count {
-                if states[usize::from(state)].model.is_solid_cube() {
+                let def = &states[usize::from(state)];
+                if def.model.is_solid_cube() && def.shape != RenderShape::Cutout {
                     continue;
                 }
                 let f = &mut flags[usize::from(state)];
@@ -1407,7 +1410,8 @@ impl BlockRegistry {
         self.full_bright.get(s.0 as usize).copied().unwrap_or(false)
     }
     /// True if `s` could hold water: its block has the [`WATERLOGGED`] property and it is not a
-    /// full cube (a double slab holds none, as in Minecraft).
+    /// full cube, unless a cutout one (leaves hold water, a double slab or glass none, as in
+    /// Minecraft; ADR 0038).
     pub fn can_be_waterlogged(&self, s: BlockState) -> bool {
         self.flags(s).contains(StateFlags::WATERLOGGABLE)
     }
