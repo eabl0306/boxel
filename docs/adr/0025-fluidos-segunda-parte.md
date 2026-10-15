@@ -5,6 +5,7 @@
 - Revisa: ADR 0021 (fluidos), ADR 0018 sección 6 (la superficie del agua) y ADR 0020 (modelos de
   cajas)
 - Revisado por: ADR 0029 (agua y lava se declaran en el registro, con `boxel_demo::fluids`)
+- Revisado: 2026-10-14 (#110, ningún fluido que corre entra en un bloque que puede tener agua)
 
 ## Contexto
 
@@ -89,12 +90,15 @@ mar, el agua queda quieta como una pared vertical, porque el agua generada no pr
 - Entre dos celdas, un fluido pasa solo donde las caras de colisión de ambas, la de cada una hacia
   la otra, dejan abierta parte de la cara (`canPassThroughWall`). El agua de una losa de abajo sale
   por los costados y nunca por el piso.
-- El agua que corre no llena un bloque: lo frena como cualquier sólido. Pero donde el agua haría
-  una fuente nueva (dos fuentes al lado y piso firme), un bloque seco que puede tener agua la toma
-  y queda con agua (`canPlaceLiquid`).
+- Ningún fluido que corre entra en un bloque que puede tener agua, seco o con agua, tenga
+  colisión o no (el `LiquidBlockContainer` de Minecraft): el agua no se lleva un liquen ni un
+  coral seco, y la lava no los quema ni vuelve piedra uno con agua. Tampoco entra en un bloque
+  marcado con `set_keeps_fluids_out` (en Minecraft, la caña de azúcar y los portales). Donde el
+  agua haría una fuente nueva, un bloque seco la toma y queda con agua (`canPlaceLiquid`). Issue
+  #110.
 - El simulador de fuerza bruta de los tests modela todo esto y el motor coincide con él en cada
-  tick de juego, también en terreno al azar con losas y vallas, secas y con agua, y lejos del
-  origen.
+  tick de juego, también en terreno al azar con losas, vallas y líquenes, secos y con agua, y
+  cañas, y lejos del origen.
 
 **En el juego** (`boxel_voxel::rules`, puras, y `voxel_world`):
 
