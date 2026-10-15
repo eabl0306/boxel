@@ -1133,8 +1133,11 @@ fn per_block<T: Clone>(mut slots: Vec<Option<T>>, blocks: usize) -> Vec<Option<T
     slots
 }
 
-/// `namespace:path`, both non-empty, `[a-z0-9_]` (path may contain `/`).
-fn validate_name(name: &str) -> Result<(), RegistryError> {
+/// Checks the name rule of every engine registry: `namespace:path`, both non-empty,
+/// `[a-z0-9_]` (the path may also contain `/`). Blocks and textures follow it, and so do the ids
+/// of world generation (`boxel_worldgen`'s `GenId`, ADR 0039 sec. 11). Fails with
+/// [`RegistryError::InvalidName`].
+pub fn validate_name(name: &str) -> Result<(), RegistryError> {
     let ok = name.split_once(':').is_some_and(|(ns, path)| {
         !ns.is_empty()
             && !path.is_empty()

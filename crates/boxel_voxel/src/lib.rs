@@ -62,7 +62,7 @@ pub use registry::{
     Axis, BlockCollision, BlockDef, BlockId, BlockModel, BlockRegistry, BlockRegistryBuilder,
     BlockState, BoxModel, BoxModelId, CollisionBox, FLUID_LEVEL, FaceTextures,
     MAX_COLLISION_HEIGHT, MAX_STATES, RegistryError, RenderShape, SlabHalf, StateFlags, TextureId,
-    TextureImage, TextureSpec, WATERLOGGED,
+    TextureImage, TextureSpec, WATERLOGGED, validate_name,
 };
 pub use shapes::{Facing, MAX_MODEL_BOXES, ModelBox};
 pub use state::{Property, StateName, StateParseError, StateValues};

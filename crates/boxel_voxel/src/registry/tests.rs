@@ -2,7 +2,7 @@
 //! set per state, fixed for fluids by their emission, and kept out of every other per-state
 //! table. The flag that keeps flowing fluids out ([`StateFlags::KEEPS_FLUIDS_OUT`], #110): on
 //! every waterloggable state, and on every state of a declared block. On the `test:` blocks
-//! ([`crate::testing`]) and a few more after them.
+//! ([`crate::testing`]) and a few more after them. The name rule every registry shares.
 use super::*;
 use crate::testing;
 
@@ -229,4 +229,22 @@ fn keeping_fluids_out_needs_a_known_block() {
         b.keeps_fluids_out.is_empty(),
         "the failed call sets nothing"
     );
+}
+
+#[test]
+fn the_name_rule_is_namespace_colon_path() {
+    // Public for the ids of world generation (ADR 0039 sec. 11), which share the rule.
+    for name in ["test:a", "test_2:dirt", "test:ores/deep_3"] {
+        assert_eq!(validate_name(name), Ok(()), "{name}");
+    }
+    for name in [
+        "", "test", ":a", "test:", "Test:a", "test:A", "test:a-b", "test/x:a", "test:a b",
+        "test:a:b", "tést:a",
+    ] {
+        assert_eq!(
+            validate_name(name),
+            Err(RegistryError::InvalidName(name.to_string())),
+            "{name}"
+        );
+    }
 }
