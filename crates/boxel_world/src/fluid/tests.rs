@@ -121,8 +121,8 @@ fn states(keep: impl Fn(BlockState) -> bool) -> Vec<BlockState> {
 static DRY: LazyLock<Vec<BlockState>> =
     LazyLock::new(|| states(|s| REGISTRY.can_be_waterlogged(s) && !REGISTRY.is_waterlogged(s)));
 static WET: LazyLock<Vec<BlockState>> = LazyLock::new(|| states(|s| REGISTRY.is_waterlogged(s)));
-/// The blocks without collision that keep flowing fluids out: the lichen, dry and wet, and the
-/// cane.
+/// The blocks without collision that keep flowing fluids out: the lichen, dry and wet, the cane
+/// and the demo's wall without a post or sides (no collision box), dry and wet.
 static KEEPERS: LazyLock<Vec<BlockState>> =
     LazyLock::new(|| states(|s| REGISTRY.keeps_fluids_out(s) && REGISTRY.collision(s).is_none()));
 
