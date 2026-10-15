@@ -2,13 +2,14 @@
 //! 5): registering in any order gives the same indices, salts and digest; duplicates and unknown
 //! ids fail with their ids in the message; an added entry changes no other entry's salt, seed or
 //! line, and removing it gives the old digest back; the diff of two digests; no two salts or
-//! octave seeds of the test entries collide; the fixed values of the salt and parameter hash. The
-//! checks of realm layouts and a whole world open are in `realm/tests.rs`.
+//! octave seeds of the test entries collide; the fixed values of the salt and parameter hash; the
+//! build counter's memo rule. The checks of realm layouts and a whole world open are in
+//! `realm/tests.rs`.
 use super::*;
 use crate::noise::{mix_seed, splitmix64};
 use boxel_voxel::RegistryError;
 use proptest::prelude::*;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 fn id(name: &str) -> GenId {
     GenId::new(name).expect(name)
@@ -615,4 +616,46 @@ fn a_damaged_list_keeps_one_line_per_key() {
         digest.entries(),
         [line(&scope, "test_kind", "test:a", 1, 9)]
     );
+}
+
+#[test]
+fn build_keys_are_unique_across_threads() {
+    let keys: Vec<Vec<BuildKey>> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..4)
+            .map(|_| s.spawn(|| (0..1000).map(|_| BuildKey::next()).collect::<Vec<_>>()))
+            .collect();
+        workers
+            .into_iter()
+            .map(|w| w.join().expect("worker"))
+            .collect()
+    });
+    for keys in &keys {
+        assert!(keys.is_sorted_by(|a, b| a < b), "keys grow in each thread");
+    }
+    let all: BTreeSet<BuildKey> = keys.iter().flatten().copied().collect();
+    assert_eq!(all.len(), 4000);
+    assert!(all.iter().all(|k| k.get() != 0));
+}
+
+#[test]
+fn a_memo_resets_when_the_build_changes() {
+    // World A, then world B, then A opened again: a fresh build each time.
+    let (a, b, a_again) = (BuildKey::next(), BuildKey::next(), BuildKey::next());
+    let mut memo = BuildMemo::new(Vec::<u32>::new());
+    assert_eq!(memo.key(), None);
+    let mut resets = 0;
+    memo.get(a, |m| {
+        resets += 1;
+        m.clear();
+    })
+    .push(1);
+    memo.get(a, |_| panic!("the same build keeps its memo"))
+        .push(2);
+    assert_eq!(*memo.get(a, |_| unreachable!()), [1, 2]);
+    assert_eq!(resets, 1);
+    assert!(memo.get(b, Vec::clear).is_empty(), "B never reads A's memo");
+    memo.get(b, |_| unreachable!()).push(3);
+    assert_eq!(memo.key(), Some(b));
+    assert_eq!(*memo.get(a_again, Vec::clear), [] as [u32; 0]);
+    assert_eq!(memo.key(), Some(a_again));
 }

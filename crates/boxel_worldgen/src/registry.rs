@@ -2,8 +2,9 @@
 //! ([`GenId`]), the registries the app's plugins fill and freeze before any world opens
 //! ([`GenRegistryBuilder`], [`GenRegistry`]), the salts that come from the ids, the digest of
 //! what a preset reaches ([`RegistryDigest`]) with its diff against a saved one
-//! ([`WorldgenDiff`]) and the checks that make a bad mix of mods fail at load with its ids in
-//! the message ([`Checks`], [`FreezeError`]).
+//! ([`WorldgenDiff`]), the build counter that keys per-worker memos ([`BuildKey`]) and the
+//! checks that make a bad mix of mods fail at load with its ids in the message ([`Checks`],
+//! [`FreezeError`]).
 //!
 //! The rules that let a mod add an entry without moving any other:
 //! - Order comes from the ids, never from registration or hash order. Freezing sorts the entries
@@ -30,11 +31,13 @@ use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::ops::Index;
 
+mod build;
 mod check;
 mod digest;
 mod hash;
 mod id;
 
+pub use build::{BuildKey, BuildMemo};
 pub use check::{Checks, FreezeError, Problem};
 pub use digest::{Changed, DigestBuilder, DigestEntry, DigestScope, RegistryDigest, WorldgenDiff};
 pub use hash::{HashParams, ParamsHasher, fnv1a64, hash_params};
