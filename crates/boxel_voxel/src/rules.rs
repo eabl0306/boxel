@@ -149,7 +149,7 @@ pub fn supports_center(registry: &BlockRegistry, state: BlockState, face: Face) 
 
 /// The source (`level` 0) of the fluid the waterlogged states of `registry` hold
 /// (`BlockRegistry::waterlog_fluid`), if it has one.
-fn waterlog_source(registry: &BlockRegistry) -> Option<BlockState> {
+pub(crate) fn waterlog_source(registry: &BlockRegistry) -> Option<BlockState> {
     let id = registry.waterlog_fluid()?;
     registry.fluid(id).map(|fluid| fluid.first)
 }

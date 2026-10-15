@@ -2,16 +2,24 @@
 //! turns a cube of blocks into one coarse cell.
 //!
 //! A level-`k` LOD cell stands for `s^3` blocks, `s = 2^k`. Every state of a registry has a
-//! [`LodClass`] ([`LodClasses::from_registry`], from its [`RenderShape`] and [`BlockModel`],
-//! never from its name):
+//! [`LodClass`] ([`LodClasses::from_registry`], from its [`RenderShape`], its [`BlockModel`] and
+//! the water it holds, never from its name):
 //!
 //! | Class | States |
 //! |---|---|
 //! | [`LodClass::Empty`] | `RenderShape::None`, crosses (plants), translucent blocks that are not fluids (glass), slabs and models made of boxes filling less than half the cell |
 //! | [`LodClass::Solid`] | opaque and cutout cubes (leaves), slabs and models made of boxes filling at least half the cell |
-//! | [`LodClass::Fluid`] | `BlockModel::Fluid` states; each counts as its fluid's source |
+//! | [`LodClass::Fluid`] | `BlockModel::Fluid` states, each counted as its fluid's source; states that hold water and are not Solid (below) |
 //!
-//! A waterlogged state has its block's class (the water it holds is ignored).
+//! The first class that matches wins:
+//!
+//! 1. Solid, as the table says. A waterlogged Solid state (a slab) stays Solid: its water is not
+//!    counted.
+//! 2. Fluid for a state that holds water ([`BlockRegistry::is_waterlogged`]) in a registry with a
+//!    waterlog fluid ([`BlockRegistry::waterlog_fluid`]), counted as that fluid's source: a
+//!    waterlogged plant or thin model is the sea it stands in, so a sea floor full of them stays
+//!    water far away. A state with the flag in a registry without a waterlog fluid holds nothing.
+//! 3. Fluid or Empty, as the table says.
 //!
 //! The cell rule (the contract every LOD source follows):
 //!
@@ -32,17 +40,18 @@
 //! is the [`CellPartial::merge`] of its 8 level-`k` partials, exactly the rule applied to its
 //! blocks while the cell holds one fluid kind ([`CellPartial::of_cell`] is the rule applied
 //! directly).
-use crate::{BlockModel, BlockRegistry, BlockState, RenderShape};
+use crate::{BlockModel, BlockRegistry, BlockState, RenderShape, rules};
 
 /// What a state is seen from far away ([`LodClasses`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum LodClass {
-    /// Not drawn at a distance (air, plants, glass, thin models).
+    /// Not drawn at a distance (air, glass, plants and thin models that hold no water).
     #[default]
     Empty,
     /// Ground: any solid block makes its cell solid.
     Solid,
-    /// A fluid, counted as its source.
+    /// A fluid, counted as its source, or a state that is not Solid and holds water, counted as
+    /// the waterlog fluid's source.
     Fluid,
 }
 
@@ -50,19 +59,22 @@ pub enum LodClass {
 /// much of its cell to be [`LodClass::Solid`].
 pub const HALF_CELL_VOLUME: u32 = 16 * 16 * 16 / 2;
 
-/// The [`LodClass`] of every state of a registry, and the source state of each fluid state.
+/// The [`LodClass`] of every state of a registry, and the source each Fluid state counts as.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LodClasses {
-    /// By state id: the class and, for a fluid, its source (else the state itself).
+    /// By state id: the class and, for a Fluid state, the source it counts as (else the state
+    /// itself).
     entries: Box<[(LodClass, BlockState)]>,
 }
 
 impl LodClasses {
-    /// The classes of `registry`'s states, from their [`RenderShape`] and [`BlockModel`] (see the
-    /// module table).
+    /// The classes of `registry`'s states, from their [`RenderShape`], their [`BlockModel`] and
+    /// the water they hold (module docs).
     pub fn from_registry(registry: &BlockRegistry) -> Self {
         // Box model fill by `BoxModelId`, measured once per model.
         let mut boxes_solid: Vec<Option<bool>> = Vec::new();
+        // The source the waterlogged states hold.
+        let held = rules::waterlog_source(registry);
         let entries = (0..registry.len())
             .map(|i| {
                 let s = BlockState(i as u16);
@@ -85,11 +97,13 @@ impl LodClasses {
                         solid_if(solid)
                     }
                 };
-                let source = match class {
-                    LodClass::Fluid => fluid_source(registry, s),
-                    LodClass::Empty | LodClass::Solid => s,
-                };
-                (class, source)
+                // Any solid wins, then the water a state holds, then the table.
+                match (class, held) {
+                    (LodClass::Solid, _) => (class, s),
+                    (_, Some(water)) if registry.is_waterlogged(s) => (LodClass::Fluid, water),
+                    (LodClass::Fluid, _) => (class, fluid_source(registry, s)),
+                    (LodClass::Empty, _) => (class, s),
+                }
             })
             .collect();
         Self { entries }
@@ -112,7 +126,8 @@ impl LodClasses {
             .map_or(LodClass::Empty, |e| e.0)
     }
 
-    /// The source state of fluid `s` (its level 0), `None` for a state that is not a fluid.
+    /// The source Fluid state `s` counts as (its fluid's level 0, or the waterlog fluid's for a
+    /// state that holds water), `None` for a state that is not Fluid.
     pub fn fluid(&self, s: BlockState) -> Option<BlockState> {
         match self.entries.get(usize::from(s.0)) {
             Some(&(LodClass::Fluid, source)) => Some(source),
@@ -332,7 +347,9 @@ mod tests {
     use super::*;
     use crate::testing;
     use crate::{
-        BlockCollision, BlockDef, BoxModel, FaceTextures, ModelBox, OPAQUE_OPACITY, TextureId,
+        BlockCollision, BlockDef, BlockRegistryBuilder, BoxModel, FLUID_LEVEL, FaceTextures,
+        MAX_BLOCK_COORD, ModelBox, OPAQUE_OPACITY, Property, TextureId, TextureImage, TextureSpec,
+        WATERLOGGED,
     };
     use proptest::prelude::*;
 
@@ -340,8 +357,24 @@ mod tests {
         r.parse_state(name).expect(name)
     }
 
+    /// A cross plant that always holds water (its `waterlogged` property has the one value
+    /// `true`), with the layer `texture`.
+    fn wet_plant(texture: TextureId) -> (BlockDef, Vec<Property>) {
+        let def = BlockDef {
+            name: "test:wet_plant".to_string(),
+            shape: RenderShape::Cutout,
+            model: BlockModel::Cross,
+            collision: BlockCollision::None,
+            emission: [0; 3],
+            light_opacity: 0,
+            textures: FaceTextures::all(texture),
+        };
+        (def, vec![Property::new(WATERLOGGED, ["true"])])
+    }
+
     /// The test registry plus models made of boxes of a quarter, three quarters and two equal
-    /// boxes of three eighths (overlapping), and a translucent box model.
+    /// boxes of three eighths (overlapping), a translucent box model and `test:wet_plant`, a
+    /// cross that always holds water.
     fn registry() -> BlockRegistry {
         let mut b = testing::builder();
         let mut boxes = |name: &str, shape, boxes: Vec<ModelBox>| {
@@ -377,6 +410,9 @@ mod tests {
             vec![under_half(), under_half()],
         );
         boxes("test:clear_half", RenderShape::Translucent, vec![half()]);
+        let (def, wet) = wet_plant(TextureId(0));
+        b.add_block_with_states(def, wet, |_, _| {})
+            .expect("test:wet_plant");
         b.build()
     }
 
@@ -394,8 +430,18 @@ mod tests {
         assert_eq!(class("test:plant"), LodClass::Empty, "a cross is dropped");
         assert_eq!(class("test:slab"), LodClass::Solid, "a slab fills half");
         assert_eq!(class("test:slab[waterlogged=true]"), LodClass::Solid);
+        assert_eq!(
+            c.fluid(by(&r, "test:slab[waterlogged=true]")),
+            None,
+            "any solid wins"
+        );
         assert_eq!(class("test:boxes"), LodClass::Empty, "a post and a bar");
-        assert_eq!(class("test:boxes[waterlogged=true]"), LodClass::Empty);
+        // What holds water and is not solid is the water it holds.
+        let water = by(&r, "test:fluid");
+        for wet in ["test:boxes[waterlogged=true]", "test:wet_plant"] {
+            assert_eq!(class(wet), LodClass::Fluid, "{wet}");
+            assert_eq!(c.fluid(by(&r, wet)), Some(water), "{wet}");
+        }
         assert_eq!(class("test:quarter"), LodClass::Empty);
         assert_eq!(class("test:three_quarters"), LodClass::Solid);
         assert_eq!(
@@ -406,6 +452,63 @@ mod tests {
         assert_eq!(class("test:clear_half"), LodClass::Empty);
         assert_eq!(c.class(BlockState(u16::MAX)), LodClass::Empty);
         assert_eq!(c.fluid(by(&r, "test:solid")), None);
+    }
+
+    #[test]
+    fn held_water_needs_a_waterlog_fluid() {
+        // A fluid and a wet cross, but no `set_waterlog_fluid`: the flag holds nothing.
+        let mut b = BlockRegistryBuilder::new();
+        let layer = b
+            .add_texture(TextureSpec {
+                name: "test:layer".to_string(),
+                image: TextureImage::solid(testing::TEXTURE_SIZE, [40, 90, 200, 160]),
+            })
+            .expect("test:layer");
+        let fluid = b
+            .add_block_with_states(
+                BlockDef {
+                    name: "test:fluid".to_string(),
+                    shape: RenderShape::Translucent,
+                    model: BlockModel::Fluid,
+                    collision: BlockCollision::None,
+                    emission: [0; 3],
+                    light_opacity: 1,
+                    textures: FaceTextures::all(layer),
+                },
+                vec![Property::int(FLUID_LEVEL, 0..=15)],
+                |_, _| {},
+            )
+            .expect("test:fluid");
+        let block = b.block_by_name("test:fluid").expect("test:fluid");
+        b.add_fluid(block, testing::FLUID).expect("test:fluid");
+        let (def, wet) = wet_plant(layer);
+        let plant = b.add_block_with_states(def, wet, |_, _| {}).expect("plant");
+        let r = b.build();
+        let c = LodClasses::from_registry(&r);
+        assert!(r.waterlog_fluid().is_none());
+        assert!(r.is_waterlogged(plant));
+        assert_eq!(c.class(plant), LodClass::Empty);
+        assert_eq!(c.fluid(plant), None);
+        assert_eq!(c.class(fluid), LodClass::Fluid);
+        assert_eq!(c.fluid(fluid), Some(fluid));
+    }
+
+    #[test]
+    fn a_dry_twin_differs_only_by_its_water() {
+        let r = registry();
+        let c = LodClasses::from_registry(&r);
+        let water = by(&r, "test:fluid");
+        for s in (0..r.len() as u16).map(BlockState) {
+            let dry = r.with_water(s, false).unwrap_or(s);
+            let name = r.state_name(s);
+            if r.is_waterlogged(s) && c.class(dry) != LodClass::Solid {
+                assert_eq!(c.class(s), LodClass::Fluid, "{name}");
+                assert_eq!(c.fluid(s), Some(water), "{name}");
+            } else {
+                assert_eq!(c.class(s), c.class(dry), "{name}");
+                assert_eq!(c.fluid(s), c.fluid(dry), "{name}");
+            }
+        }
     }
 
     #[test]
@@ -559,6 +662,81 @@ mod tests {
     }
 
     #[test]
+    fn held_water_is_water_to_the_rule() {
+        let r = registry();
+        let c = LodClasses::from_registry(&r);
+        let (solid, water) = (by(&r, "test:solid"), by(&r, "test:fluid"));
+        let wet = [
+            by(&r, "test:wet_plant"),
+            by(&r, "test:boxes[waterlogged=true]"),
+        ];
+        let dry = [by(&r, "test:plant"), by(&r, "test:boxes")];
+        let sea = 46;
+        // Far from the origin too (ADR 0014), up to the world limit.
+        let origins = [
+            0,
+            1i64 << 31,
+            -(1i64 << 31),
+            1i64 << 40,
+            MAX_BLOCK_COORD,
+            -MAX_BLOCK_COORD,
+        ];
+        // Even grounds: the bed's top and the plants share a level-1 cell.
+        for depth in [4, 10] {
+            let ground = sea - depth;
+            for o in origins {
+                let origin = [o, o, -o];
+                // `[plant, post]`: a layer of plants on the bed, a post from the bed to the
+                // surface in one column of every 16 by 16 blocks, water over the rest.
+                let block = |[plant, post]: [BlockState; 2], at: [i64; 3]| {
+                    let [x, y, z] = [0, 1, 2].map(|a| at[a] - origin[a]);
+                    if y <= ground {
+                        solid
+                    } else if y > sea {
+                        BlockState::AIR
+                    } else if x.rem_euclid(16) == 0 && z.rem_euclid(16) == 0 {
+                        post
+                    } else if y == ground + 1 {
+                        plant
+                    } else {
+                        water
+                    }
+                };
+                let mut dry_cells = Vec::new();
+                for level in 1..=4 {
+                    let s = 1i64 << level;
+                    let (first, last) = ((ground + 1).div_euclid(s), sea.div_euclid(s));
+                    // A cell with a post and one without, every cell holding water.
+                    for cell_x in [0, 1] {
+                        for cell_y in first..=last {
+                            let at = [origin[0] + cell_x * s, origin[1] + cell_y * s, origin[2]];
+                            let cell = |pair: [BlockState; 2]| {
+                                direct(&c, at, s as u32, |x, y, z| {
+                                    let d = [x, y, z].map(i64::from);
+                                    block(pair, [at[0] + d[0], at[1] + d[1], at[2] + d[2]])
+                                })
+                            };
+                            assert_eq!(
+                                cell(wet),
+                                water,
+                                "depth {depth} origin {o} level {level} cell {cell_x} {cell_y}"
+                            );
+                            dry_cells.push(cell(dry));
+                        }
+                    }
+                }
+                // Dry, the same sea gets its bed and holes.
+                for want in [solid, BlockState::AIR] {
+                    assert!(
+                        dry_cells.contains(&want),
+                        "depth {depth} origin {o}: {want:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_puddle_on_land_stays_ground() {
         let r = registry();
         let c = LodClasses::from_registry(&r);
@@ -606,7 +784,8 @@ mod tests {
         out.expect("8 children")
     }
 
-    /// The states of the property tests: one fluid kind, so the merge is exact.
+    /// The states of the property tests: one fluid kind (the wet states hold it), so the merge
+    /// is exact.
     fn palette(r: &BlockRegistry) -> Vec<BlockState> {
         [
             "air",
@@ -620,6 +799,8 @@ mod tests {
             "test:fluid",
             "test:fluid[level=7]",
             "test:slab[waterlogged=true]",
+            "test:boxes[waterlogged=true]",
+            "test:wet_plant",
         ]
         .iter()
         .map(|n| {
@@ -640,7 +821,7 @@ mod tests {
         let volume = edge * edge * edge;
         (
             prop::collection::vec((-1..e, -1..e + 1), n),
-            prop::collection::vec((0..volume, 0..11usize), 0..8),
+            prop::collection::vec((0..volume, 0..13usize), 0..8),
         )
     }
 
@@ -684,7 +865,7 @@ mod tests {
         #[test]
         fn partials_merge_associatively_and_commutatively(
             blocks in prop::collection::vec(
-                ((-40i64..40, -40i64..40, -40i64..40), 0..11usize, 0u64..3), 3),
+                ((-40i64..40, -40i64..40, -40i64..40), 0..13usize, 0u64..3), 3),
         ) {
             let r = registry();
             let c = LodClasses::from_registry(&r);

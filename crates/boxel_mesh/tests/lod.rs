@@ -118,6 +118,10 @@ fn materials_are_cubes_of_canonical_states_and_water_is_see_through() {
         assert_eq!(m.class(fluid.0), LodClass::Fluid);
         assert!(t.model(fluid.0).is_solid_cube());
     }
+    // The water a thin model holds is water's material, though the wet state comes first.
+    let wet = by(&r, "test:boxes[waterlogged=true]");
+    assert!(wet < water);
+    assert_eq!(m.canonical(wet), water.0);
     // A translucent fluid is see-through at a distance too, its faces in the translucent
     // bucket; an opaque one (lava) stays an opaque cube.
     assert!(m.see_through(water.0));

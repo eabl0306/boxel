@@ -20,10 +20,12 @@
 //!
 //! "That fluid" is the source with the most blocks in the cell (ties to the smallest id), and the
 //! classes come from [`LodClasses::from_registry`]: plants, glass and thin models are Empty,
-//! cubes (cutout ones too), slabs and models filling at least half the cell are Solid. A source
-//! may approximate the rule (a heightfield cannot afford to look at every block of a 16-block
-//! cell), within bounds its own tests check; what the engine builds from real chunks (player
-//! edits) follows it exactly.
+//! cubes (cutout ones too), slabs and models filling at least half the cell are Solid, and a
+//! state that holds water and is not Solid is that water (a waterlogged plant or fence counts as
+//! a source of the waterlog fluid; a waterlogged slab stays Solid). A source may approximate the
+//! rule (a heightfield cannot afford to look at every block of a 16-block cell), within bounds
+//! its own tests check; what the engine builds from real chunks (player edits) follows it
+//! exactly.
 //!
 //! Below a column's band the source reports one state ([`LodColumn::below`]); a world floor with
 //! air under it may count as solid there, so no node is meshed for faces nobody sees from above.

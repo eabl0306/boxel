@@ -50,16 +50,18 @@ const PLANES: [i32; 3] = [0, 16, 32];
 /// What every registry state looks like at a distance: its canonical state (the material id of
 /// LOD meshes) and the LOD [`MaterialTable`].
 ///
-/// The canonical state of a state is the lowest state id with the same [`LodClass`], the same 6
-/// face texture layers, the same full-bright flag (`BlockRegistry::is_full_bright`) and the same
-/// see-through flag, so look-alike variants (the levels of a fluid, a slab and its full block, a
-/// waterlogged state) merge into one greedy quad, and a lit emitter shares the id of a plain
-/// block that looks the same. Fluid states first become their source. Empty states have material
-/// 0. In the table every canonical state is a cube (`SHAPE_CUBE`) with its state's face layers
-/// and full-bright flag (`MaterialTable::emissive`): an opaque one (`RenderShape::Opaque`), but
-/// for a fluid whose source is translucent (water, ADR 0025), which is see-through at a
-/// distance too (`RenderShape::Translucent`: its faces go into the translucent bucket). No
-/// fluid, box or cross shape reaches a LOD mesh.
+/// A state looks like itself, or a Fluid one like the source it counts as (a fluid's level 0;
+/// for a state that holds water, the waterlog fluid's). Its canonical state is what the lowest
+/// state id with the same [`LodClass`], the same 6 face texture layers, the same full-bright flag
+/// (`BlockRegistry::is_full_bright`) and the same see-through flag looks like, so look-alike
+/// variants (the levels of a fluid, a slab and its full block, a waterlogged slab) merge into one
+/// greedy quad, a lit emitter shares the id of a plain block that looks the same, and the water a
+/// plant or a fence holds is water's own material (never the id of the wet state, which may come
+/// first). Empty states have material 0. In the table every canonical state is a cube
+/// (`SHAPE_CUBE`) with its state's face layers and full-bright flag (`MaterialTable::emissive`):
+/// an opaque one (`RenderShape::Opaque`), but for a fluid whose source is translucent (water, ADR
+/// 0025), which is see-through at a distance too (`RenderShape::Translucent`: its faces go into
+/// the translucent bucket). No fluid, box or cross shape reaches a LOD mesh.
 #[derive(Clone, Debug)]
 pub struct LodMaterials {
     classes: LodClasses,
@@ -100,15 +102,16 @@ impl LodMaterials {
                 class == LodClass::Fluid && registry.shape(looks) == RenderShape::Translucent;
             let key = (class, faces, glows, clear);
             let material = *first.entry(key).or_insert_with(|| {
-                let m = i as u16;
-                material_class[i] = class;
-                see_through[i] = clear;
-                shapes[i] = if clear {
+                let m = looks.0;
+                let at = usize::from(m);
+                material_class[at] = class;
+                see_through[at] = clear;
+                shapes[at] = if clear {
                     RenderShape::Translucent
                 } else {
                     RenderShape::Opaque
                 };
-                layers[i] = faces;
+                layers[at] = faces;
                 if glows {
                     emissive.push(m);
                 }
