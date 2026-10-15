@@ -1155,7 +1155,7 @@ fn an_emitter_not_full_bright_is_lit_by_its_light_far_from_the_origin() {
 }
 
 /// `boxel_voxel::testing` plus `test:roots`, a cutout block of one full box that holds water (as
-/// mangrove roots).
+/// mangrove roots), and `test:wet_cube`, a cutout cube that holds water (as leaves, ADR 0038).
 fn roots_registry() -> Arc<BlockRegistry> {
     let base = boxel_voxel::testing::registry();
     let leaves = base.by_name("test:cutout").expect("test:cutout");
@@ -1163,20 +1163,28 @@ fn roots_registry() -> Arc<BlockRegistry> {
     let full = b
         .add_box_model(BoxModel::from_boxes(vec![ModelBox::new([0; 3], [16; 3])]))
         .expect("full box");
+    let roots_def = BlockDef {
+        name: "test:roots".to_string(),
+        shape: RenderShape::Cutout,
+        model: BlockModel::Boxes(full),
+        collision: BlockCollision::Full,
+        emission: [0; 3],
+        light_opacity: 1,
+        textures: FaceTextures::all(base.face_texture(leaves, boxel_voxel::Face::PosY)),
+    };
     b.add_block_with_states(
-        BlockDef {
-            name: "test:roots".to_string(),
-            shape: RenderShape::Cutout,
-            model: BlockModel::Boxes(full),
-            collision: BlockCollision::Full,
-            emission: [0; 3],
-            light_opacity: 1,
-            textures: FaceTextures::all(base.face_texture(leaves, boxel_voxel::Face::PosY)),
-        },
+        roots_def.clone(),
         vec![Property::boolean(WATERLOGGED)],
         |_, _| {},
     )
     .expect("test:roots");
+    let cube = BlockDef {
+        name: "test:wet_cube".to_string(),
+        model: BlockModel::CUBE,
+        ..roots_def.clone()
+    };
+    b.add_block_with_states(cube, vec![Property::boolean(WATERLOGGED)], |_, _| {})
+        .expect("test:wet_cube");
     Arc::new(b.build())
 }
 
@@ -1252,6 +1260,81 @@ fn waterlogged_roots_show_their_water_far_from_the_origin() {
     assert_eq!(water[0].face(), boxel_voxel::Face::PosY);
     assert_eq!(water[0].fluid_heights(), Some([boxel_mesh::FLUID_FLAT; 4]));
     assert!(water[0].fluid_inset());
+    for chunk in [
+        ChunkPos::new((1 << 26) - 2, -3, 5),
+        ChunkPos::new(-7, 1 << 35, -(1 << 35)),
+        ChunkPos::new(boxel_voxel::MAX_CHUNK_COORD - 8, 1, 3),
+    ] {
+        assert_eq!(*pool_mesh(chunk), *origin, "{chunk:?}");
+    }
+}
+
+/// [`PoolGen`] with waterlogged `test:wet_cube` at [`ROOTS`] instead of the roots.
+struct LeavesPoolGen(PoolGen);
+
+impl WorldGenerator for LeavesPoolGen {
+    fn generate(&self, key: ChunkKey, registry: &BlockRegistry) -> ChunkData {
+        let mut data = self.0.generate(key, registry);
+        if key.pos == self.0.chunk {
+            let leaves = registry.parse_state("test:wet_cube[waterlogged=true]");
+            data.set(ROOTS, leaves.expect("test:wet_cube"));
+        }
+        data
+    }
+    fn vertical_chunks(&self) -> RangeInclusive<i64> {
+        self.0.vertical_chunks()
+    }
+    fn name(&self) -> &str {
+        "leaves pool"
+    }
+}
+
+/// A waterlogged cutout cube (ADR 0038) in a pool, far from the origin too: its water shows its
+/// top only, level with the pool and inset, and the cube draws its 5 faces that see no solid
+/// (one unit quad each, cutout); the chunk's mesh is the same everywhere.
+#[test]
+fn waterlogged_leaves_show_their_water_far_from_the_origin() {
+    use boxel_mesh::{CUTOUT_BUCKET, layout};
+    let pool_mesh = |chunk: ChunkPos| {
+        let generator = LeavesPoolGen(PoolGen { chunk });
+        let mut app = lit_app(
+            generator,
+            roots_registry(),
+            small(),
+            Arc::new(InlineExecutor),
+        );
+        spawn(&mut app, chunk, 1, 1);
+        settle(&mut app);
+        assert!(assert_matches_reference(&app) > 0, "{chunk:?}");
+        let map = app.world().resource::<ChunkMap>();
+        let (_, slot) = map
+            .iter()
+            .find(|(_, s)| s.pos == chunk)
+            .expect("the pool chunk");
+        match slot.mesh() {
+            MeshState::Ready { mesh, .. } => Arc::clone(mesh),
+            other => panic!("{chunk:?}: no mesh: {other:?}"),
+        }
+    };
+    let origin = pool_mesh(ChunkPos::new(0, 0, 0));
+    let center = [ROOTS.x(), ROOTS.y(), ROOTS.z()];
+    let at = |shape: u8| -> Vec<_> {
+        origin
+            .quads
+            .iter()
+            .filter(|q| q.pos() == center && q.shape() == shape)
+            .collect()
+    };
+    let water = at(layout::SHAPE_FLUID_SLOPE);
+    assert_eq!(water.len(), 1, "{water:?}");
+    assert_eq!(water[0].face(), boxel_voxel::Face::PosY);
+    assert_eq!(water[0].fluid_heights(), Some([boxel_mesh::FLUID_FLAT; 4]));
+    assert!(water[0].fluid_inset());
+    let cube = at(layout::SHAPE_CUBE);
+    assert_eq!(cube.len(), 5, "{cube:?}");
+    assert!(cube.iter().all(|q| q.face() != boxel_voxel::Face::NegY));
+    let cutout = origin.bucket(CUTOUT_BUCKET);
+    assert!(cube.iter().all(|q| cutout.contains(q)));
     for chunk in [
         ChunkPos::new((1 << 26) - 2, -3, 5),
         ChunkPos::new(-7, 1 << 35, -(1 << 35)),

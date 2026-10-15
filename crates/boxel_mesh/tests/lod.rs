@@ -1427,3 +1427,35 @@ fn banks_close_the_ground_the_cell_rule_drops() {
         );
     }
 }
+
+/// A cutout cube holding water (ADR 0038) is ground at a distance like the dry one, with its id:
+/// its water is not counted, as for a waterlogged slab.
+#[test]
+fn a_wet_cutout_cube_looks_like_the_dry_one_far_away() {
+    use boxel_voxel::{BlockCollision, BlockDef, BlockModel, FaceTextures, Property, WATERLOGGED};
+    let base = testing::registry();
+    let leaves = base.face_texture(by(&base, "test:cutout"), Face::PosY);
+    let mut b = testing::builder();
+    let def = BlockDef {
+        name: "test:wet_cube".into(),
+        shape: RenderShape::Cutout,
+        model: BlockModel::CUBE,
+        collision: BlockCollision::Full,
+        emission: [0; 3],
+        light_opacity: 1,
+        textures: FaceTextures::all(leaves),
+    };
+    b.add_block_with_states(def, vec![Property::boolean(WATERLOGGED)], |_, _| {})
+        .expect("test:wet_cube");
+    let r = b.build();
+    let wet = by(&r, "test:wet_cube[waterlogged=true]");
+    let dry = by(&r, "test:wet_cube[waterlogged=false]");
+    assert!(r.is_waterlogged(wet));
+    let classes = boxel_voxel::lod::LodClasses::from_registry(&r);
+    assert_eq!(classes.class(wet), LodClass::Solid);
+    assert_eq!(classes.fluid(wet), None);
+    let m = LodMaterials::from_registry(&r);
+    assert_eq!(m.canonical(wet), m.canonical(dry));
+    assert_eq!(m.canonical(dry), m.canonical(by(&r, "test:cutout")));
+    assert_eq!(m.class(m.canonical(wet)), LodClass::Solid);
+}

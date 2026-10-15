@@ -1,21 +1,23 @@
 //! Waterlogged blocks (ADR 0025): the block's boxes as for the dry block, and its water as a
 //! source cell of the fluid around it, drawn by itself with its faces inset and none of those the
 //! block hides (ADR 0038: a cutout block hides none; an opaque or translucent one where its boxes
-//! cover the border whole, and the top only inside or on its solid top); and the flow texture on
-//! the top of a sloping fluid cell.
+//! cover the border whole, and the top only inside or on its solid top); cutout cubes that hold
+//! water (ADR 0038), drawn as the dry cube one face per block; and the flow texture on the top of
+//! a sloping fluid cell.
 mod common;
 
+use boxel_light::PaddedLight;
 use boxel_mesh::{
-    AoPolicy, BUCKET_COUNT, ChunkMesh, FLUID_FLAT, FLUID_SURFACE_BIT, MaterialTable, MeshInput,
-    MeshOptions, Mesher, PackedQuad, PaddedChunk, TRANSLUCENT_BUCKET, VoxelClass, fluid_flow,
-    layout, reference_fluid_heights, reference_visible_faces,
+    AoPolicy, BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, FLUID_FLAT, FLUID_SURFACE_BIT, MaterialTable,
+    MeshInput, MeshOptions, Mesher, PackedQuad, PaddedChunk, TRANSLUCENT_BUCKET, VoxelClass,
+    fluid_flow, layout, reference_fluid_heights, reference_visible_faces,
 };
 use boxel_voxel::{
-    BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockState, BoxModel, CHUNK_SIZE,
-    ChunkData, Face, FaceTextures, ModelBox, NEIGHBOR_OFFSETS, Property, RenderShape, SlabHalf,
-    WATERLOGGED, testing,
+    Axis, BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockState, BoxModel, CHUNK_SIZE,
+    ChunkData, Face, FaceTextures, LightValue, ModelBox, NEIGHBOR_OFFSETS, Property, RenderShape,
+    SlabHalf, WATERLOGGED, testing,
 };
-use common::{Repr, chunk_repr, dense_from};
+use common::{Repr, chunk_repr, dense_from, full_light};
 use proptest::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -249,8 +251,11 @@ fn a_sloping_top_shows_the_flow_texture() {
 /// rule: `test:roots` (cutout, one full box, as mangrove roots), `test:cage` (the same box,
 /// opaque), `test:glass_box` (the same box, translucent), `test:glass_slab` (translucent, a
 /// bottom slab), `test:plate` (opaque, a plate under the top, `[0, 15, 0]-[16, 16, 16]`),
-/// `test:thick_plate` (opaque, `[0, 13, 0]-[16, 16, 16]`) and `test:upper` (opaque, a top slab).
-/// The test blocks keep their ids.
+/// `test:thick_plate` (opaque, `[0, 13, 0]-[16, 16, 16]`) and `test:upper` (opaque, a top slab);
+/// and full cubes with `waterlogged` (ADR 0038): `test:wet_cube` (cutout, as leaves),
+/// `test:wet_log` (the same turned to X, its ends solid), `test:wet_glass` (translucent) and
+/// `test:wet_solid` (opaque, opacity 15), of which only the cutout ones hold water. The test
+/// blocks keep their ids.
 fn held_registry() -> (BlockRegistry, MaterialTable) {
     let base = testing::registry();
     let texture = |name: &str| base.face_texture(state(&base, name), Face::PosY);
@@ -325,15 +330,42 @@ fn held_registry() -> (BlockRegistry, MaterialTable) {
             solid,
         ),
     ];
-    for (name, shape, model, collision, texture) in blocks {
+    let log_faces = FaceTextures {
+        top: solid,
+        bottom: solid,
+        side: leaves,
+    };
+    let x_log = BlockModel::Cube { axis: Axis::X };
+    let all = FaceTextures::all;
+    let blocks = blocks.map(|(name, shape, model, collision, texture)| {
+        (name, shape, model, collision, all(texture), 1)
+    });
+    let (cutout, cube) = (RenderShape::Cutout, BlockModel::CUBE);
+    let cubes = [
+        ("test:wet_cube", cutout, cube, all(leaves), 1),
+        ("test:wet_log", cutout, x_log, log_faces, 1),
+        (
+            "test:wet_glass",
+            RenderShape::Translucent,
+            cube,
+            all(glass),
+            0,
+        ),
+        ("test:wet_solid", RenderShape::Opaque, cube, all(solid), 15),
+    ]
+    .map(|(name, shape, model, textures, opacity)| {
+        (name, shape, model, BlockCollision::Full, textures, opacity)
+    });
+    let defs = blocks.into_iter().chain(cubes);
+    for (name, shape, model, collision, textures, light_opacity) in defs {
         let def = BlockDef {
             name: name.to_string(),
             shape,
             model,
             collision,
             emission: [0; 3],
-            light_opacity: 1,
-            textures: FaceTextures::all(texture),
+            light_opacity,
+            textures,
         };
         b.add_block_with_states(def, vec![Property::boolean(WATERLOGGED)], |_, _| {})
             .expect(name);
@@ -479,7 +511,7 @@ fn a_translucent_block_hides_its_water_like_an_opaque_one() {
 
 /// The blocks of the random scenes of [`held_water_faces_match_minecraft`], water first: more
 /// often water than anything else.
-const MIX: [&str; 22] = [
+const MIX: [&str; 26] = [
     "test:fluid",
     "test:fluid",
     "test:fluid",
@@ -502,6 +534,10 @@ const MIX: [&str; 22] = [
     "test:glass_box[waterlogged=true]",
     "test:glass_slab[waterlogged=true]",
     "test:thick_plate[waterlogged=true]",
+    "test:wet_cube",
+    "test:wet_cube[waterlogged=true]",
+    "test:wet_cube[waterlogged=true]",
+    "test:wet_log[waterlogged=true]",
 ];
 
 /// The faces of the water of waterlogged `s` that the block hides, its water's corners at
@@ -561,14 +597,35 @@ fn hidden_by_block(registry: &BlockRegistry, s: BlockState, heights: [u8; 4]) ->
         .collect()
 }
 
+/// The faces of the waterlogged cube `s` the mesher draws, its neighbors being `around` (by
+/// face, air outside the scene), from the rule written out (ADR 0038): every face but those
+/// toward an opaque cube or toward the same block without its water, dry or waterlogged, as the
+/// greedy pass culls the dry cube.
+fn wet_cube_faces(
+    registry: &BlockRegistry,
+    s: BlockState,
+    around: [BlockState; 6],
+) -> BTreeSet<Face> {
+    let dry = |s: BlockState| registry.with_water(s, false).unwrap_or(s);
+    Face::ALL
+        .into_iter()
+        .filter(|f| {
+            let n = around[f.index()];
+            !registry.occludes(n) && dry(n) != dry(s)
+        })
+        .collect()
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
     /// Random scenes of water, solid cubes and waterlogged and dry blocks (cutout, translucent
-    /// and opaque, with and without a solid top), in a corner of the chunk, its middle or across
-    /// its borders: every waterlogged block's water draws the faces the greedy cull leaves
-    /// (`reference_visible_faces`) but those the block hides ([`hidden_by_block`]), inset, at
-    /// the oracle's corner heights (16/16 under water or an opaque cube).
+    /// and opaque, with and without a solid top, boxes and cubes), in a corner of the chunk, its
+    /// middle or across its borders: every waterlogged block's water draws the faces the greedy
+    /// cull leaves (`reference_visible_faces`) but those the block hides ([`hidden_by_block`]),
+    /// inset, at the oracle's corner heights (16/16 under water or an opaque cube); every
+    /// waterlogged cube draws one unit quad per face [`wet_cube_faces`] keeps, and the greedy
+    /// pass none of a waterlogged cell.
     #[test]
     fn held_water_faces_match_minecraft(
         seed in any::<u64>(),
@@ -635,11 +692,302 @@ proptest! {
             let name = registry.state_name(s);
             prop_assert_eq!(&got, &want, "{} at {:?}, corners {:?}", name, p, corners);
         }
-        // The greedy pass draws no face of a waterlogged cell.
+        // The cube faces at a waterlogged cell are the wet cube's own unit quads.
+        let mut drawn: BTreeMap<[u32; 3], BTreeSet<Face>> = BTreeMap::new();
         for quad in &mesh.quads {
             if quad.shape() != layout::SHAPE_FLUID_SLOPE && quad.shape() != layout::SHAPE_BOX {
-                prop_assert!(quad.unit_faces().all(|(p, _)| !wet.contains(&p)), "{:?}", quad);
+                for (p, face) in quad.unit_faces().filter(|(p, _)| wet.contains(p)) {
+                    prop_assert!(quad.w() == 1 && quad.h() == 1, "{:?}", quad);
+                    prop_assert!(drawn.entry(p).or_default().insert(face), "{:?}", quad);
+                }
+            }
+        }
+        let at = |p: [i32; 3]| cells.get(&p).copied().unwrap_or(BlockState::AIR);
+        for &p in &wet {
+            let [x, y, z] = p.map(|c| c as i32);
+            let s = at([x, y, z]);
+            let want = if registry.model(s).is_solid_cube() {
+                let around = Face::ALL.map(|f| {
+                    let n = f.normal();
+                    at([x + n.x, y + n.y, z + n.z])
+                });
+                wet_cube_faces(&registry, s, around)
+            } else {
+                BTreeSet::new()
+            };
+            let got = drawn.remove(&p).unwrap_or_default();
+            prop_assert_eq!(&got, &want, "{} at {:?}", registry.state_name(s), p);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- cutout cubes that hold water (ADR 0038)
+
+/// The chunk `chunk` (in chunks from the center) of the world `f` (block coordinates from the
+/// center chunk's origin, `None` air), meshed with its 26 neighbors and `light`: its padded
+/// input and its mesh.
+fn mesh_world(
+    table: &MaterialTable,
+    f: &dyn Fn([i32; 3]) -> Option<BlockState>,
+    chunk: [i32; 3],
+    light: Option<&PaddedLight>,
+    options: MeshOptions,
+) -> (PaddedChunk, ChunkMesh) {
+    let data = |d: [i32; 3]| -> ChunkData {
+        let lo: [i32; 3] = std::array::from_fn(|k| (chunk[k] + d[k]) * CHUNK_SIZE);
+        let at = |x, y, z| f([lo[0] + x, lo[1] + y, lo[2] + z]).map_or(0, |s| s.0);
+        chunk_repr(&dense_from(at), Repr::Packed)
+    };
+    let center = data([0; 3]);
+    let around: Vec<ChunkData> = NEIGHBOR_OFFSETS
+        .iter()
+        .map(|d| data([d.x, d.y, d.z]))
+        .collect();
+    let input = MeshInput {
+        center: &center,
+        neighbors: std::array::from_fn(|i| Some(&around[i])),
+        light,
+    };
+    let mut padded = PaddedChunk::new();
+    let mut mesher = Mesher::new();
+    mesher.gather(&input, table, &mut padded);
+    let mesh = mesher.mesh_chunk(&input, table, options);
+    (padded, mesh)
+}
+
+/// A unit face as it is drawn: position, face, texture layer, shape code, AO byte, the 4 corner
+/// lights and the emissive flag.
+type DrawnFace = ([u32; 3], Face, u16, u8, u8, [u16; 4], bool);
+
+/// Every unit face of the cutout bucket of `mesh`, each once.
+fn cutout_faces(mesh: &ChunkMesh) -> BTreeSet<DrawnFace> {
+    let mut out = BTreeSet::new();
+    for &quad in mesh.bucket(CUTOUT_BUCKET) {
+        let light = mesh.corner_light(quad).map(|l| l.0);
+        for (p, face) in quad.unit_faces() {
+            let drawn = (
+                p,
+                face,
+                quad.layer(),
+                quad.shape(),
+                quad.ao_byte(),
+                light,
+                quad.is_emissive(),
+            );
+            assert!(out.insert(drawn), "{p:?} {face:?} twice");
+        }
+    }
+    out
+}
+
+/// The cube faces (`SHAPE_CUBE` or `SHAPE_TURNED`) the mesh draws at `p`, by face.
+fn cube_quads(mesh: &ChunkMesh, p: [u32; 3]) -> BTreeMap<Face, PackedQuad> {
+    let mut out = quads_at(mesh, p, layout::SHAPE_CUBE);
+    out.extend(quads_at(mesh, p, layout::SHAPE_TURNED));
+    out
+}
+
+/// The materials of the cutout cubes of [`held_registry`]: they hold water, the others do not.
+#[test]
+fn the_table_meshes_a_wet_cutout_cube_as_its_water() {
+    let (registry, table) = held_registry();
+    let water = state(&registry, "test:fluid").0;
+    for name in ["test:wet_cube", "test:wet_log"] {
+        let wet = state(&registry, &format!("{name}[waterlogged=true]")).0;
+        let dry = state(&registry, &format!("{name}[waterlogged=false]")).0;
+        assert!(
+            table.is_waterlogged(wet) && !table.is_waterlogged(dry),
+            "{name}"
+        );
+        assert_eq!(table.class(wet), VoxelClass::Transparent, "{name}");
+        assert_eq!(table.class(dry), VoxelClass::Transparent, "{name}");
+        assert_eq!(table.fluid_level(wet), (water, 0), "{name}");
+        assert_eq!(table.model(wet), table.model(dry), "{name}");
+        for face in Face::ALL {
+            assert_eq!(table.layer(wet, face), table.layer(dry, face), "{name}");
+            assert_eq!(
+                table.cube_code(wet, face),
+                table.cube_code(dry, face),
+                "{name}"
+            );
+            assert_eq!(table.bucket(wet, face), CUTOUT_BUCKET, "{name}");
+        }
+    }
+    for (name, class) in [
+        ("test:wet_glass", VoxelClass::Transparent),
+        ("test:wet_solid", VoxelClass::Opaque),
+    ] {
+        let s = state(&registry, &format!("{name}[waterlogged=true]")).0;
+        assert!(!table.is_waterlogged(s), "{name}");
+        assert_eq!(table.class(s), class, "{name}");
+        assert_eq!(table.fluid_level(s), (s, 0), "{name}");
+    }
+}
+
+/// A waterlogged cutout cube is drawn exactly as the dry one: in every scene (lone cubes, a
+/// turned log, a cluster on a floor beside other leaves, a cluster across a chunk border), with
+/// no light and with a light that falls off, for every AO policy, the unit faces of the cutout
+/// bucket are the same, one per block for the wet cubes where the greedy pass merges the dry
+/// ones. A lone cube's quads are the same bytes. Their water is drawn apart (the translucent
+/// bucket), at the cost of a canopy: the 16x16 canopy over a pool below.
+#[test]
+fn the_wet_cube_looks_like_the_dry_one() {
+    let (registry, table) = held_registry();
+    let s = |name: &str| state(&registry, name);
+    let (solid, cutout, fluid) = (s("test:solid"), s("test:cutout"), s("test:fluid"));
+    let cube = [false, true].map(|wet| s(&format!("test:wet_cube[waterlogged={wet}]")));
+    let log = [false, true].map(|wet| s(&format!("test:wet_log[waterlogged={wet}]")));
+    // A lone cube and a lone log; a 3x3x3 cluster on a floor, other leaves beside it; a row of
+    // turned logs; a cluster across the border x = 31 / 0, under a solid.
+    let world = |wet: usize| {
+        move |[x, y, z]: [i32; 3]| match (x, y, z) {
+            (5, 5, 5) | (12..=14, 10..=12, 12..=14) | (30..=33, 20..=21, 5..=6) => Some(cube[wet]),
+            (9, 5, 5) | (5..=8, 20, 20) => Some(log[wet]),
+            (12..=14, 9, 12..=14) | (30..=33, 22, 5) => Some(solid),
+            (15, 10..=11, 13) => Some(cutout),
+            _ => None,
+        }
+    };
+    // Sky falling off around a point, and a red light around another.
+    let light_of = |chunk: [i32; 3]| {
+        full_light(move |x, y, z| {
+            let [x, y, z] = [x + 32 * chunk[0], y + 32 * chunk[1], z + 32 * chunk[2]];
+            let sky = 15 - ((x - 16).abs() + (z - 8).abs() + (y - 20).abs()).min(15);
+            let red = 14 - ((x - 13).abs() + (y - 11).abs() + (z - 15).abs()).min(14);
+            LightValue::new(sky as u8, red as u8, 0, 0).0
+        })
+    };
+    for chunk in [[0; 3], [1, 0, 0]] {
+        let light = light_of(chunk);
+        for light in [None, Some(&light)] {
+            for ao in [AoPolicy::Off, AoPolicy::Baked, AoPolicy::BakedLitOnly] {
+                let options = MeshOptions::with_ao(ao);
+                let what = format!("chunk {chunk:?}, light {}, {ao:?}", light.is_some());
+                let (_, dry) = mesh_world(&table, &world(0), chunk, light, options);
+                let (_, wet) = mesh_world(&table, &world(1), chunk, light, options);
+                assert_eq!(cutout_faces(&wet), cutout_faces(&dry), "{what}");
+                assert!(!cutout_faces(&dry).is_empty(), "{what}");
+                if chunk == [0; 3] && light.is_none() {
+                    for p in [[5, 5, 5], [9, 5, 5]] {
+                        let quads = cube_quads(&dry, p);
+                        assert_eq!(quads.len(), 6, "{what}");
+                        assert_eq!(cube_quads(&wet, p), quads, "{what}");
+                    }
+                }
             }
         }
     }
+    // A 16x16 canopy of cubes over a pool: dry, the greedy pass merges its 6 sides; wet, every
+    // cube draws its own faces and its water (top, bottom and the rim's sides).
+    let canopy = |wet: usize| {
+        move |[x, y, z]: [i32; 3]| match (x, y, z) {
+            (8..24, 12, 8..24) => Some(cube[wet]),
+            (8..24, 4, 8..24) => Some(fluid),
+            (8..24, 3, 8..24) => Some(solid),
+            _ => None,
+        }
+    };
+    let quads = |wet| {
+        let (_, mesh) = mesh_world(&table, &canopy(wet), [0; 3], None, OPTIONS);
+        [CUTOUT_BUCKET, TRANSLUCENT_BUCKET].map(|b| mesh.bucket(b).len())
+    };
+    // The pool is 125 translucent quads. Wet: 512 tops and bottoms and 64 rim sides of cubes,
+    // as many of water.
+    assert_eq!(quads(0), [6, 125]);
+    assert_eq!(quads(1), [576, 125 + 576]);
+}
+
+/// The water of a wet cube shows whole (a cutout block hides none of it): alone, its 6 faces
+/// inset at 12/16 and the cube's 6 faces; in the top layer of a pool two deep, only its top,
+/// level with the pool, and still the cube's 6 faces (water all around it). The cube's faces go
+/// to the cutout bucket, its water to the translucent one.
+#[test]
+fn the_water_of_a_wet_cube() {
+    use Face::*;
+    let (registry, table) = held_registry();
+    let wet = state(&registry, "test:wet_cube[waterlogged=true]");
+    let fluid = state(&registry, "test:fluid");
+    let solid = state(&registry, "test:solid");
+    let buckets = |mesh: &ChunkMesh, p: [u32; 3]| {
+        for b in 0..BUCKET_COUNT {
+            for q in mesh.bucket(b).iter().filter(|q| q.pos() == p) {
+                let want = match q.shape() {
+                    layout::SHAPE_FLUID_SLOPE => TRANSLUCENT_BUCKET,
+                    _ => CUTOUT_BUCKET,
+                };
+                assert_eq!(b, want, "{q:?}");
+            }
+        }
+    };
+    let p = [5, 5, 5];
+    let (_, mesh) = mesh_of(&table, |x, y, z| ((x, y, z) == (5, 5, 5)).then_some(wet));
+    assert_eq!(water_at(&mesh, p, [12; 4]), BTreeSet::from(Face::ALL));
+    assert_eq!(cube_quads(&mesh, p).len(), 6);
+    buckets(&mesh, p);
+    let (_, mesh) = mesh_of(&table, |x, y, z| match (x, y, z) {
+        (5, 5, 5) => Some(wet),
+        (3..=7, 4..=5, 3..=7) => Some(fluid),
+        (3..=7, 3, 3..=7) => Some(solid),
+        _ => None,
+    });
+    let flat = [FLUID_FLAT; 4];
+    assert_eq!(water_at(&mesh, p, flat), BTreeSet::from([PosY]));
+    assert_eq!(cube_quads(&mesh, p).len(), 6);
+    buckets(&mesh, p);
+}
+
+/// A wet cube culls as the dry one and its water as water: no face between two wet cubes, cube
+/// or water; between a wet and a dry cube of one block, the dry one's face (it sees water) and
+/// the water's face toward it, but not the wet one's (it sees its dry twin); none of its own
+/// against an opaque cube (whose face shows, as against a dry cube); both cube faces and the
+/// water's against other leaves; and against a wet slab the water hides, the slab's box face
+/// and the cube's face show.
+#[test]
+fn a_wet_cube_culls_as_the_dry_one() {
+    use Face::*;
+    let (registry, table) = held_registry();
+    let s = |name: &str| state(&registry, name);
+    let wet = s("test:wet_cube[waterlogged=true]");
+    let dry = s("test:wet_cube[waterlogged=false]");
+    let (solid, cutout) = (s("test:solid"), s("test:cutout"));
+    let slab = s("test:slab[waterlogged=true]");
+    // Each pair in its own row: the wet cube at x = 5, the other at x = 6.
+    let pairs = [wet, dry, solid, cutout, slab];
+    let (_, mesh) = mesh_of(&table, |x, y, z| match (x, z) {
+        (5, 5) if y % 5 == 0 && y / 5 < 5 => Some(wet),
+        (6, 5) if y % 5 == 0 && y / 5 < 5 => Some(pairs[(y / 5) as usize]),
+        _ => None,
+    });
+    let row = |k: u32| ([5, 5 * k, 5], [6, 5 * k, 5]);
+    let has = |faces: BTreeMap<Face, PackedQuad>, f: Face| faces.contains_key(&f);
+    let water = |p: [u32; 3]| quads_at(&mesh, p, layout::SHAPE_FLUID_SLOPE);
+    // Two wet cubes.
+    let (a, b) = row(0);
+    assert!(!has(cube_quads(&mesh, a), PosX) && !has(cube_quads(&mesh, b), NegX));
+    assert!(!has(water(a), PosX) && !has(water(b), NegX));
+    assert_eq!(cube_quads(&mesh, a).len(), 5);
+    // A wet and a dry cube of the same block.
+    let (a, b) = row(1);
+    assert!(!has(cube_quads(&mesh, a), PosX));
+    assert!(has(cube_quads(&mesh, b), NegX));
+    assert!(has(water(a), PosX));
+    // Against an opaque cube.
+    let (a, b) = row(2);
+    assert!(!has(cube_quads(&mesh, a), PosX) && !has(water(a), PosX));
+    assert!(has(cube_quads(&mesh, b), NegX), "the solid's face shows");
+    // Against other leaves.
+    let (a, b) = row(3);
+    assert!(has(cube_quads(&mesh, a), PosX) && has(cube_quads(&mesh, b), NegX));
+    assert!(has(water(a), PosX));
+    // Against a wet slab: the slab's water and the cube's hide each other.
+    let (a, b) = row(4);
+    assert!(has(cube_quads(&mesh, a), PosX));
+    assert!(!has(water(a), PosX) && !has(water(b), NegX));
+    let slab_faces: Vec<Face> = mesh
+        .quads
+        .iter()
+        .filter(|q| q.pos() == b && q.shape() == layout::SHAPE_BOX)
+        .map(|q| q.face())
+        .collect();
+    assert!(slab_faces.contains(&NegX), "{slab_faces:?}");
 }

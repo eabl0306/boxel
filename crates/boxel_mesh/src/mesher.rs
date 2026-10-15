@@ -73,8 +73,11 @@ pub struct MaterialTable {
     fluid_source: Vec<u16>,
     fluid_level: Vec<u8>,
     /// Per state: a waterlogged block (ADR 0025), gathered as its water (`fluid_source`) and
-    /// drawn as its boxes too.
+    /// drawn as its boxes, or as the faces of a cutout cube, too.
     waterlogged: Vec<bool>,
+    /// Per state: the material of the same block without its water (itself for the others): a
+    /// waterlogged cube hides its faces against its dry twin as the greedy pass does.
+    dry: Vec<u16>,
     /// The models made of boxes (ADR 0020), see [`BoxModels`].
     box_models: BoxModels,
 }
@@ -293,6 +296,7 @@ impl MaterialTable {
             fluid_source: (0..n as u16).collect(),
             fluid_level: vec![0; n],
             waterlogged: vec![false; n],
+            dry: (0..n as u16).collect(),
             box_models: BoxModels {
                 shape_of: vec![NO_SHAPE; n],
                 ..BoxModels::default()
@@ -329,27 +333,41 @@ impl MaterialTable {
             if registry.is_waterlogged(s)
                 && let Some(water) = water
             {
-                table.set_waterlogged(m as u16, water);
+                let dry = registry.with_water(s, false).unwrap_or(s);
+                table.set_waterlogged(m as u16, water, registry.material(dry));
             }
         }
         table
     }
-    /// Declares `material` (a block made of boxes) as waterlogged, holding a source of fluid
-    /// `water` (ADR 0025): gather puts the water in its cell (it culls, merges and slopes as
-    /// that fluid) and keeps the block in [`PaddedChunk::waterlogged`], whose boxes are drawn
-    /// as for the dry block. The water's faces the block hides are not drawn (a cutout block
+    /// Declares `material` (a block made of boxes or a cutout cube) as waterlogged, holding a
+    /// source of fluid `water` (ADR 0025), `dry` being the same block without it: gather puts
+    /// the water in its cell (it culls, merges and slopes as that fluid) and keeps the block in
+    /// [`PaddedChunk::waterlogged`], whose boxes, or cube faces, are drawn as for the dry block
+    /// (a cube face is hidden by an opaque cube and by the dry block, wet or not, as in the
+    /// greedy pass, ADR 0038). The water's faces the block hides are not drawn (a cutout block
     /// hides none, ADR 0038), the others sit [`layout::FLUID_INSET`] inside the cell (but the
     /// top).
-    pub fn set_waterlogged(&mut self, material: u16, water: u16) {
+    pub fn set_waterlogged(&mut self, material: u16, water: u16, dry: u16) {
         let i = usize::from(material);
-        if i >= self.class.len() || usize::from(water) >= self.class.len() {
+        let n = self.class.len();
+        if i >= n || usize::from(water) >= n || usize::from(dry) >= n {
             return;
         }
         self.class[i] = VoxelClass::Transparent;
         self.fluid_source[i] = water;
         self.fluid_level[i] = 0;
         self.waterlogged[i] = true;
+        self.dry[i] = dry;
         self.has_fluid = true;
+    }
+    /// The material of `material` without its water ([`MaterialTable::set_waterlogged`]; itself
+    /// for every other material and out of range).
+    #[inline]
+    pub(crate) fn dry(&self, material: u16) -> u16 {
+        self.dry
+            .get(usize::from(material))
+            .copied()
+            .unwrap_or(material)
     }
     /// True if `material` is a waterlogged block ([`MaterialTable::set_waterlogged`]).
     pub fn is_waterlogged(&self, material: u16) -> bool {
@@ -573,6 +591,7 @@ impl MaterialTable {
             fluid_source: (0..n as u16).collect(),
             fluid_level: vec![0; n],
             waterlogged: vec![false; n],
+            dry: (0..n as u16).collect(),
             box_models: BoxModels {
                 shape_of: vec![NO_SHAPE; n],
                 ..BoxModels::default()
@@ -1213,7 +1232,10 @@ fn flat_shading(
 /// a box model (the greedy pass sees it as empty), so a cube face behind a stair's back is drawn
 /// and hidden by depth. A cross gives two quads (faces `PosX` and `PosZ`, see
 /// [`layout::SHAPE_CROSS`]) with the texture of its side. The waterlogged blocks of the inner
-/// 32^3 ([`PaddedChunk::waterlogged`], ADR 0025) draw their boxes the same way, after the rest.
+/// 32^3 ([`PaddedChunk::waterlogged`], ADR 0025) draw their boxes the same way, after the rest;
+/// a waterlogged cutout cube (ADR 0038) draws one unit quad per face, the quad the greedy pass
+/// draws there for the dry cube (layer, shape code, AO, light, flags), but those
+/// [`cube_face_hidden`] hides.
 fn emit_specials(
     padded: &PaddedChunk,
     materials: &MaterialTable,
@@ -1264,6 +1286,20 @@ fn emit_specials(
                 let shading = shade(m, i, face, None)?;
                 push(m, pos, face, Face::PosX, layout::SHAPE_CROSS, 0, shading);
             }
+        } else if materials.model(m).is_solid_cube() {
+            // A waterlogged cube (`padded.special` holds none): the unit faces of the dry cube,
+            // shaded from the voxel in front as in the greedy pass.
+            for face in Face::ALL {
+                if cube_face_hidden(padded, materials, m, [x, y, z], face) {
+                    continue;
+                }
+                let n = face.normal();
+                let front = PaddedChunk::index(x + n.x, y + n.y, z + n.z);
+                let nb9 = front_nb9(face, &padded.opaque, x as usize, y as usize, z as usize);
+                let shading = shade(m, front, face, Some(nb9))?;
+                let code = materials.cube_code(m, face);
+                push(m, pos, face, face, code, 0, shading);
+            }
         }
         Ok(())
     };
@@ -1293,6 +1329,32 @@ pub(crate) const fn padded_pos(i: usize) -> [i32; 3] {
     let (z, rest) = (i % PADDED, i / PADDED);
     let (x, y) = (rest % PADDED, rest / PADDED);
     [x as i32 - 1, y as i32 - 1, z as i32 - 1]
+}
+
+/// True if the neighbor in front of `face` of the waterlogged cube of material `m` at inner `p`
+/// hides it, as the greedy pass hides the face of the dry cube: an opaque cube, or the same
+/// block without its water ([`MaterialTable::dry`]), dry or waterlogged. The padding holds the
+/// waterlogged blocks too, so it holds across chunk borders.
+fn cube_face_hidden(
+    padded: &PaddedChunk,
+    materials: &MaterialTable,
+    m: u16,
+    [x, y, z]: [i32; 3],
+    face: Face,
+) -> bool {
+    let n = face.normal();
+    let (nx, ny, nz) = (x + n.x, y + n.y, z + n.z);
+    match class_from_masks(padded, nx, ny, nz) {
+        VoxelClass::Opaque => true,
+        VoxelClass::Transparent => {
+            let i = PaddedChunk::index(nx, ny, nz);
+            let front = padded
+                .waterlogged_at(i)
+                .unwrap_or_else(|| materials.split_surface(padded.voxels[i]).0);
+            materials.dry(front) == materials.dry(m)
+        }
+        VoxelClass::Empty | VoxelClass::Special => false,
+    }
 }
 
 /// True if the neighbor in front of `bf` (a face of material `m` at inner `p`, flush with the

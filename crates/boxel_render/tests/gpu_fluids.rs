@@ -16,6 +16,9 @@
 //!   their water's top at 16/16 ties with the roots' top and loses, as above; in a pool their
 //!   water shows through the holes of their texture (the square around the screen center
 //!   differs from the same pool with dry roots).
+//! - waterlogged leaves (`test:wet_leaves`, a cutout cube with the same texture, ADR 0038): in
+//!   full water their top wins the tie with their water's; in a pool and alone in the air their
+//!   water shows through the holes (against the same scenes with dry leaves).
 //!
 //! For every adapter (filtered by `WGPU_BACKEND` / `WGPU_ADAPTER_NAME`) and every tier a local
 //! capability check allows (the one of `gpu_tiers.rs`); every tier also draws the full scenes as
@@ -149,8 +152,9 @@ fn adapter_label(caps: &AdapterCaps) -> String {
 // ---------------------------------------------------------------- scenes
 
 /// The demo blocks plus `test:roots`, waterloggable roots: cutout, one full box, a frame
-/// texture (3 opaque texels around a clear middle, so the eye sees into the cell). The demo
-/// keeps its ids.
+/// texture (3 opaque texels around a clear middle, so the eye sees into the cell), and
+/// `test:wet_leaves`, the same as a cutout cube (leaves that hold water). The demo keeps its
+/// ids.
 fn registry() -> BlockRegistry {
     let mut b = boxel_demo::blocks::builder();
     let edge = 16;
@@ -174,20 +178,25 @@ fn registry() -> BlockRegistry {
     let full = b
         .add_box_model(BoxModel::from_boxes(vec![ModelBox::new([0; 3], [16; 3])]))
         .expect("full box");
-    b.add_block_with_states(
-        BlockDef {
-            name: "test:roots".to_string(),
-            shape: RenderShape::Cutout,
-            model: BlockModel::Boxes(full),
-            collision: BlockCollision::Full,
-            emission: [0; 3],
-            light_opacity: 1,
-            textures: FaceTextures::all(frame),
-        },
-        vec![Property::boolean(WATERLOGGED)],
-        |_, _| {},
-    )
-    .expect("test:roots");
+    let roots = BlockDef {
+        name: "test:roots".to_string(),
+        shape: RenderShape::Cutout,
+        model: BlockModel::Boxes(full),
+        collision: BlockCollision::Full,
+        emission: [0; 3],
+        light_opacity: 1,
+        textures: FaceTextures::all(frame),
+    };
+    let leaves = BlockDef {
+        name: "test:wet_leaves".to_string(),
+        model: BlockModel::CUBE,
+        ..roots.clone()
+    };
+    for def in [roots, leaves] {
+        let name = def.name.clone();
+        b.add_block_with_states(def, vec![Property::boolean(WATERLOGGED)], |_, _| {})
+            .expect(&name);
+    }
     b.build()
 }
 
@@ -358,6 +367,22 @@ fn scenes(registry: &BlockRegistry) -> Vec<Scene> {
         )
     };
     let dry_roots = registry.with_water(wet_roots, false).expect("dry roots");
+    // Leaves at (8, 8, 8), the same scenes, and alone in the air: their water's top (14/16 in
+    // the pool, 12/16 alone) shows through the middle of their top. Dry, the floor or the sky
+    // shows there.
+    let wet_leaves = get("test:wet_leaves[waterlogged=true]");
+    let dry_leaves = registry.with_water(wet_leaves, false).expect("dry leaves");
+    let full_leaves = pool(wet_leaves);
+    let leaves_top = |chunks: &Chunks| -> Chunks {
+        let keep = |q: PackedQuad| {
+            q.shape() == layout::SHAPE_CUBE && q.face() == Face::PosY && q.pos() == [8, 8, 8]
+        };
+        chunks.iter().map(|(o, m)| (*o, only(m, &keep))).collect()
+    };
+    let alone = |block: BlockState| {
+        let at = move |p: IVec3| if p == IVec3::splat(8) { block } else { air };
+        mesh_world(registry, &at, &[IVec3::ZERO])
+    };
     vec![
         Scene {
             name: "sloping lava top from below its chunk",
@@ -398,6 +423,27 @@ fn scenes(registry: &BlockRegistry) -> Vec<Scene> {
             name: "waterlogged roots in a pool",
             check: Check::Drawn(roots_pool(dry_roots)),
             chunks: roots_pool(wet_roots),
+            eye: above,
+            target: middle,
+        },
+        Scene {
+            name: "waterlogged leaves in full water",
+            check: Check::Wins(leaves_top(&full_leaves)),
+            chunks: full_leaves,
+            eye: above,
+            target: middle,
+        },
+        Scene {
+            name: "waterlogged leaves in a pool",
+            check: Check::Drawn(roots_pool(dry_leaves)),
+            chunks: roots_pool(wet_leaves),
+            eye: above,
+            target: middle,
+        },
+        Scene {
+            name: "waterlogged leaves alone",
+            check: Check::Drawn(alone(dry_leaves)),
+            chunks: alone(wet_leaves),
             eye: above,
             target: middle,
         },

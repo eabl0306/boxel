@@ -49,7 +49,8 @@ pub struct PaddedChunk {
     pub fluid_levels: Vec<(u32, u8)>,
     /// The waterlogged blocks (ADR 0025): padded index and the block's material, sorted by
     /// index. Their cell in `voxels` holds their water (a transparent fluid source), so it culls
-    /// and slopes as water; the mesher draws the block's boxes from here.
+    /// and slopes as water; the mesher draws the block's boxes, or the faces of a cutout cube
+    /// (ADR 0038), from here.
     pub waterlogged: Vec<(u32, u16)>,
     /// The inner 32^3 may hold a lit emitter (`MaterialTable::lit_emission`, ADR 0036), whose
     /// faces the mesher draws flat. Gather sets it from the center chunk's palette; `new` and
