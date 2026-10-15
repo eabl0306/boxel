@@ -1,9 +1,9 @@
 //! The registries against ADR 0039 "Cómo se prueba" 3 to 5 (worldgen plan sec. 10, tests 4 and
-//! 5): registering in any order gives the same indices and salts; duplicates and unknown ids
-//! fail with their ids in the message; an added entry changes no other entry's salt or seed, and
-//! removing it gives the old registry back; no two salts or octave seeds of the test entries
-//! collide; the fixed values of the salt and parameter hash. The checks of realm layouts are in
-//! `realm/tests.rs`.
+//! 5): registering in any order gives the same indices, salts and digest; duplicates and unknown
+//! ids fail with their ids in the message; an added entry changes no other entry's salt, seed or
+//! line, and removing it gives the old digest back; the diff of two digests; no two salts or
+//! octave seeds of the test entries collide; the fixed values of the salt and parameter hash. The
+//! checks of realm layouts and a whole world open are in `realm/tests.rs`.
 use super::*;
 use crate::noise::{mix_seed, splitmix64};
 use boxel_voxel::RegistryError;
@@ -90,6 +90,38 @@ fn table(r: &GenRegistry<Entry>) -> Vec<(usize, GenId, u64, u32, u64)> {
             )
         })
         .collect()
+}
+
+/// The scope every entry of [`digest`] sits in.
+fn realm_scope() -> DigestScope {
+    DigestScope::of_realm(&id("test:dimension"), &id("test:realm"))
+}
+
+/// The digest of every entry of `r`, all in [`realm_scope`].
+fn digest(r: &GenRegistry<Entry>) -> RegistryDigest {
+    let scope = realm_scope();
+    let mut digest = DigestBuilder::new();
+    for ix in r.indices() {
+        digest.add(&scope, r, ix);
+    }
+    digest.finish()
+}
+
+/// A digest line.
+fn line(
+    scope: &DigestScope,
+    registry: &'static str,
+    name: &str,
+    version: u32,
+    params: u64,
+) -> DigestEntry {
+    DigestEntry {
+        scope: scope.clone(),
+        registry: registry.into(),
+        id: id(name),
+        version,
+        params,
+    }
 }
 
 /// Up to 40 test entries with random weights, versions and orders, plus a shuffled copy.
@@ -234,6 +266,9 @@ proptest! {
     ) {
         let (a, b) = (registry(&entries), registry(&shuffled));
         prop_assert_eq!(table(&a), table(&b));
+        let (da, db) = (digest(&a), digest(&b));
+        prop_assert_eq!(da.hash(), db.hash());
+        prop_assert_eq!(da, db);
     }
 
     #[test]
@@ -259,10 +294,21 @@ proptest! {
             prop_assert_eq!(b.version(jx), a.version(ix));
             prop_assert_eq!(b.params_hash(jx), a.params_hash(ix));
         }
-        // Removing it gives the old registry back, bit for bit.
+        // The diff shows exactly the new line, and the other way exactly its removal.
+        let (da, db) = (digest(&a), digest(&b));
+        let new_ix = b.find(extra.0.as_str()).expect("added");
+        let new_line = DigestEntry::of(&realm_scope(), &b, new_ix);
+        let added = WorldgenDiff::between(&da, &db);
+        prop_assert_eq!(&added.added, &vec![new_line.clone()]);
+        prop_assert!(added.removed.is_empty() && added.changed.is_empty());
+        let removed = WorldgenDiff::between(&db, &da);
+        prop_assert_eq!(&removed.removed, &vec![new_line]);
+        prop_assert!(removed.added.is_empty() && removed.changed.is_empty());
+        // Removing it gives the old registry and digest back, bit for bit.
         let without: Vec<_> = with.into_iter().filter(|(id, _)| *id != extra.0).collect();
         let c = registry(&without);
         prop_assert_eq!(table(&c), table(&a));
+        prop_assert_eq!(digest(&c), da);
     }
 }
 
@@ -398,4 +444,175 @@ fn no_two_salts_or_octave_seeds_of_the_test_entries_collide() {
             }
         }
     }
+}
+
+#[test]
+fn a_digest_lists_each_line_once_in_order() {
+    let r = registry(&[(id("test:b"), Entry::new(2)), (id("test:a"), Entry::new(1))]);
+    let (a, b) = (r.find("test:a").expect("a"), r.find("test:b").expect("b"));
+    let dim = id("test:dimension");
+    let (r1, r2) = (
+        DigestScope::of_realm(&dim, &id("test:r1")),
+        DigestScope::of_realm(&dim, &id("test:r2")),
+    );
+    let mut forward = DigestBuilder::new();
+    forward
+        .add(&r2, &r, a)
+        .add(&r1, &r, b)
+        .add(&r1, &r, a)
+        .add(&r1, &r, a);
+    let mut backward = DigestBuilder::new();
+    backward.add(&r1, &r, a).add(&r1, &r, b).add(&r2, &r, a);
+    let (forward, backward) = (forward.finish(), backward.finish());
+    assert_eq!(forward, backward);
+    let lines: Vec<(&str, &str)> = forward
+        .entries()
+        .iter()
+        .map(|e| {
+            (
+                e.scope.realm.as_ref().expect("realm").as_str(),
+                e.id.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            ("test:r1", "test:a"),
+            ("test:r1", "test:b"),
+            ("test:r2", "test:a")
+        ]
+    );
+    assert_eq!(forward.version(), forward.hash() as u32);
+    assert_eq!(
+        forward.entries()[0].to_string(),
+        format!(
+            "test_entry test:a in realm test:r1 of dimension test:dimension (version 1, params \
+             {:#018x})",
+            r.params_hash(a)
+        )
+    );
+
+    // Any field of any line changes the hash.
+    let base = forward.entries().to_vec();
+    let edits: [fn(&mut DigestEntry); 6] = [
+        |e| e.scope = DigestScope::PRESET,
+        |e| e.scope.realm = Some(GenId::new("test:r3").expect("id")),
+        |e| e.registry = "test_other".into(),
+        |e| e.id = GenId::new("test:c").expect("id"),
+        |e| e.version += 1,
+        |e| e.params ^= 1,
+    ];
+    for edit in edits {
+        let mut lines = base.clone();
+        edit(&mut lines[1]);
+        assert_ne!(RegistryDigest::from_entries(lines).hash(), forward.hash());
+    }
+}
+
+#[test]
+fn a_dimension_has_its_own_digest() {
+    let r = registry(&[(id("test:a"), Entry::new(1)), (id("test:b"), Entry::new(2))]);
+    let (a, b) = (GenIx::new(0), GenIx::new(1));
+    let (d1, d2) = (id("test:d1"), id("test:d2"));
+    let mut whole = DigestBuilder::new();
+    whole
+        .add(&DigestScope::PRESET, &r, a)
+        .add(&DigestScope::of_dimension(&d1), &r, a)
+        .add(&DigestScope::of_realm(&d1, &id("test:r")), &r, b)
+        .add(&DigestScope::of_dimension(&d2), &r, b);
+    let whole = whole.finish();
+    let mut only_d1 = DigestBuilder::new();
+    only_d1.add(&DigestScope::of_dimension(&d1), &r, a).add(
+        &DigestScope::of_realm(&d1, &id("test:r")),
+        &r,
+        b,
+    );
+    assert_eq!(whole.dimension(&d1), only_d1.finish());
+    assert_eq!(whole.dimension(&d2).entries().len(), 1);
+    assert_ne!(whole.dimension(&d1).hash(), whole.hash());
+    assert!(whole.dimension(&id("test:d3")).entries().is_empty());
+}
+
+#[test]
+fn the_diff_lists_added_removed_and_changed_lines() {
+    let dim = id("test:overworld");
+    let preset = DigestScope::PRESET;
+    let world = DigestScope::of_dimension(&dim);
+    let surface = DigestScope::of_realm(&dim, &id("test:surface"));
+    let deep = DigestScope::of_realm(&dim, &id("test:deep"));
+    let saved = RegistryDigest::from_entries(vec![
+        line(&preset, "test_preset", "test:default", 1, 10),
+        line(&world, "test_generator", "test:regions", 1, 20),
+        line(&surface, "test_kind", "test:plains", 1, 30),
+        line(&surface, "test_kind", "test:hills", 1, 31),
+        line(&surface, "test_kind", "test:dunes", 2, 32),
+        line(&surface, "test_kind", "test:mod_kind", 1, 33),
+        line(&surface, "test_rule", "test:plains", 1, 34),
+    ]);
+    let live = RegistryDigest::from_entries(vec![
+        // A realm added: its lines are new, even for a kind the surface had already.
+        line(&deep, "test_kind", "test:plains", 1, 30),
+        line(&surface, "test_rule", "test:plains", 1, 34),
+        line(&surface, "test_kind", "test:dunes", 2, 99),
+        line(&surface, "test_kind", "test:hills", 2, 31),
+        line(&surface, "test_kind", "test:plains", 1, 30),
+        line(&world, "test_generator", "test:regions", 1, 20),
+        line(&preset, "test_preset", "test:default", 1, 10),
+    ]);
+    let diff = WorldgenDiff::between(&saved, &live);
+    assert_eq!(diff.added, [line(&deep, "test_kind", "test:plains", 1, 30)]);
+    assert_eq!(
+        diff.removed,
+        [line(&surface, "test_kind", "test:mod_kind", 1, 33)]
+    );
+    assert_eq!(
+        diff.changed,
+        [
+            Changed {
+                saved: line(&surface, "test_kind", "test:dunes", 2, 32),
+                live: line(&surface, "test_kind", "test:dunes", 2, 99),
+            },
+            Changed {
+                saved: line(&surface, "test_kind", "test:hills", 1, 31),
+                live: line(&surface, "test_kind", "test:hills", 2, 31),
+            },
+        ]
+    );
+    let message = diff.to_string();
+    for needle in [
+        "1 added, 1 removed, 2 changed",
+        "added test_kind test:plains in realm test:deep of dimension test:overworld",
+        "removed test_kind test:mod_kind in realm test:surface",
+        "changed test_kind test:hills in realm test:surface of dimension test:overworld: version 1 \
+         -> 2",
+        "changed test_kind test:dunes",
+    ] {
+        assert!(message.contains(needle), "{needle:?} not in {message}");
+    }
+    assert!(!diff.is_empty());
+
+    let same = WorldgenDiff::between(&saved, &saved);
+    assert!(same.is_empty());
+    assert_eq!(
+        same.to_string(),
+        "world generation unchanged since the world was saved"
+    );
+    let empty = RegistryDigest::from_entries(Vec::new());
+    assert_eq!(WorldgenDiff::between(&empty, &live).added, live.entries());
+    assert_eq!(WorldgenDiff::between(&live, &empty).removed, live.entries());
+}
+
+#[test]
+fn a_damaged_list_keeps_one_line_per_key() {
+    let scope = realm_scope();
+    let digest = RegistryDigest::from_entries(vec![
+        line(&scope, "test_kind", "test:a", 2, 5),
+        line(&scope, "test_kind", "test:a", 1, 9),
+        line(&scope, "test_kind", "test:a", 1, 9),
+    ]);
+    assert_eq!(
+        digest.entries(),
+        [line(&scope, "test_kind", "test:a", 1, 9)]
+    );
 }

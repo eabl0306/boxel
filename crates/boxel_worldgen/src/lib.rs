@@ -11,8 +11,8 @@
 //! [`lod`] is the far level of detail's side of a generator (ADR 0031): a [`LodSource`] samples
 //! coarse cells level by level, for terrain far beyond the full-detail view distance.
 //!
-//! [`registry`] holds the ids, registries and salts of the world generation entries a game and
-//! its mods register (ADR 0039 sec. 11 to 13), with the checks that run when the app is
+//! [`registry`] holds the ids, registries, salts and digest of the world generation entries a
+//! game and its mods register (ADR 0039 sec. 11 to 13), with the checks that run when the app is
 //! built and when a world opens; [`realm`] holds the layout of a dimension's realms along y and
 //! its checks.
 

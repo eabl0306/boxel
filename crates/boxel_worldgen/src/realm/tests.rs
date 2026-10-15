@@ -1,6 +1,13 @@
 //! Realm spans, and every layout check failing with its ids in the message (ADR 0039 "Cómo se
-//! prueba" 4 and 11).
+//! prueba" 4 and 11). Then a whole world open over test registries (a preset, its dimensions,
+//! their realms and kinds): every problem of a bad mix reported at once, and the digest of a
+//! good one per dimension and realm, with a realm added as one more line. The real presets and
+//! dimension tables come with WG-SAVE; these are `test:` stand-ins.
 use super::*;
+use crate::registry::{
+    DigestBuilder, DigestScope, FreezeError, GenEntry, GenRegistry, GenRegistryBuilder,
+    RegistryDigest, WorldgenDiff,
+};
 
 fn id(name: &str) -> GenId {
     GenId::new(name).expect(name)
@@ -366,4 +373,270 @@ fn layout_hashes_follow_every_field() {
             crate::registry::hash_params(&base)
         );
     }
+}
+
+// ---- A world open over test registries ------------------------------------------------------
+
+/// A test preset: the dimensions it maps.
+struct Preset(Vec<GenId>);
+/// A test dimension: its realms, bottom first.
+struct Dimension(Vec<GenId>);
+/// A test realm: its layout and the kinds its selector can pick.
+struct Realm(RealmLayout, Vec<GenId>);
+/// A test terrain kind with one parameter.
+struct Kind(u32);
+
+impl HashParams for Preset {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&self.0);
+    }
+}
+impl HashParams for Dimension {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&self.0);
+    }
+}
+impl HashParams for Realm {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&self.0).write(&self.1);
+    }
+}
+impl HashParams for Kind {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&self.0);
+    }
+}
+impl GenEntry for Preset {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+impl GenEntry for Dimension {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+impl GenEntry for Realm {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+impl GenEntry for Kind {
+    fn version(&self) -> u32 {
+        3
+    }
+}
+
+/// The test app's registries, frozen.
+struct Registries {
+    presets: GenRegistry<Preset>,
+    dimensions: GenRegistry<Dimension>,
+    realms: GenRegistry<Realm>,
+    kinds: GenRegistry<Kind>,
+}
+
+impl Registries {
+    /// The resolution of `preset` at world open: every id it reaches, checked, and the digest.
+    fn open(&self, preset: &GenId) -> Result<RegistryDigest, FreezeError> {
+        let mut checks = Checks::new();
+        let mut digest = DigestBuilder::new();
+        let world = id("test:world");
+        if let Some(p) = checks.resolve(&self.presets, preset, &world) {
+            digest.add(&DigestScope::PRESET, &self.presets, p);
+            for dim_id in &self.presets[p].0 {
+                let Some(d) = checks.resolve(&self.dimensions, dim_id, preset) else {
+                    continue;
+                };
+                digest.add(&DigestScope::of_dimension(dim_id), &self.dimensions, d);
+                let mut layouts = Vec::new();
+                for realm_id in &self.dimensions[d].0 {
+                    let Some(r) = checks.resolve(&self.realms, realm_id, dim_id) else {
+                        continue;
+                    };
+                    let scope = DigestScope::of_realm(dim_id, realm_id);
+                    digest.add(&scope, &self.realms, r);
+                    let realm = &self.realms[r];
+                    layouts.push((realm_id, &realm.0));
+                    for kind_id in &realm.1 {
+                        if let Some(k) = checks.resolve(&self.kinds, kind_id, realm_id) {
+                            digest.add(&scope, &self.kinds, k);
+                        }
+                    }
+                }
+                check_realms(&mut checks, dim_id, layouts);
+            }
+        }
+        checks.finish().map(|()| digest.finish())
+    }
+}
+
+/// The registries plugins would build: a good preset `test:default` (one dimension, a surface
+/// over a deep realm, kinds shared between them) and a bad one, `test:broken`.
+fn registries(extra_realm: bool) -> Registries {
+    let mut checks = Checks::new();
+    let mut presets = GenRegistryBuilder::new("test_preset");
+    presets
+        .register(id("test:default"), Preset(vec![id("test:overworld")]))
+        .register(
+            id("test:broken"),
+            Preset(vec![
+                id("test:overworld"),
+                id("test:broken"),
+                id("test:missing"),
+            ]),
+        );
+    let mut dimensions = GenRegistryBuilder::new("test_dimension");
+    let mut overworld = vec![id("test:deep"), id("test:surface")];
+    if extra_realm {
+        overworld.insert(0, id("test:abyss"));
+    }
+    dimensions
+        .register(id("test:overworld"), Dimension(overworld))
+        .register(
+            id("test:broken"),
+            Dimension(vec![
+                id("test:surface"),
+                id("test:sky"),
+                id("test:gone"),
+                id("test:cave"),
+            ]),
+        );
+    let mut realms = GenRegistryBuilder::new("test_realm");
+    let deep_lo = if extra_realm { Some(-8192) } else { None };
+    realms
+        .register(
+            id("test:abyss"),
+            Realm(
+                ground(RealmSpan::below(-8192), RealmLod::Off),
+                vec![id("test:plains")],
+            ),
+        )
+        .register(
+            id("test:deep"),
+            Realm(
+                ground(RealmSpan::new(deep_lo, Some(-4096)), RealmLod::Off),
+                vec![id("test:plains")],
+            ),
+        )
+        .register(
+            id("test:surface"),
+            Realm(
+                ground(RealmSpan::above(-4096), RealmLod::Draw),
+                vec![id("test:plains"), id("test:hills")],
+            ),
+        )
+        .register(
+            id("test:sky"),
+            Realm(
+                ground(RealmSpan::above(12000), RealmLod::Draw),
+                vec![id("test:clouds")],
+            ),
+        )
+        .register(
+            id("test:cave"),
+            Realm(
+                RealmLayout {
+                    span: RealmSpan::below(0),
+                    form: RealmForm::Cavern,
+                    lod: RealmLod::Off,
+                },
+                Vec::new(),
+            ),
+        );
+    let mut kinds = GenRegistryBuilder::new("test_kind");
+    kinds
+        .register(id("test:plains"), Kind(1))
+        .register(id("test:hills"), Kind(2));
+    let registries = Registries {
+        presets: checks.freeze(presets).expect("presets"),
+        dimensions: checks.freeze(dimensions).expect("dimensions"),
+        realms: checks.freeze(realms).expect("realms"),
+        kinds: checks.freeze(kinds).expect("kinds"),
+    };
+    checks.finish().expect("the app builds");
+    registries
+}
+
+#[test]
+fn a_bad_mix_fails_at_world_open_with_every_id() {
+    let error = registries(false)
+        .open(&id("test:broken"))
+        .expect_err("broken");
+    let message = error.to_string();
+    for needle in [
+        "test:broken names test_dimension test:missing, which is not registered",
+        "test:broken names test_realm test:gone, which is not registered",
+        "test:sky names test_kind test:clouds, which is not registered",
+        "test:sky of dimension test:broken has a plane at y 12000",
+        "realms test:surface and test:sky of dimension test:broken overlap",
+        "realms test:surface and test:cave of dimension test:broken overlap",
+        "dimension test:broken has 2 realms the far LOD draws (test:surface, test:sky)",
+        "realm test:cave of dimension test:broken has the form Cavern, which is not built yet",
+    ] {
+        assert!(message.contains(needle), "{needle:?} not in {message}");
+    }
+    assert_eq!(error.problems().len(), 8, "{message}");
+    let unknown = registries(false)
+        .open(&id("test:nothing"))
+        .expect_err("unknown preset");
+    assert_eq!(
+        unknown.to_string(),
+        "world generation check failed: test:world names test_preset test:nothing, which is not \
+         registered"
+    );
+}
+
+#[test]
+fn a_good_mix_opens_with_its_digest() {
+    let digest = registries(false).open(&id("test:default")).expect("opens");
+    let lines: Vec<String> = digest
+        .entries()
+        .iter()
+        .map(|e| format!("{} {} {}", e.scope, e.registry, e.id))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "the preset test_preset test:default",
+            "dimension test:overworld test_dimension test:overworld",
+            "realm test:deep of dimension test:overworld test_kind test:plains",
+            "realm test:deep of dimension test:overworld test_realm test:deep",
+            "realm test:surface of dimension test:overworld test_kind test:hills",
+            "realm test:surface of dimension test:overworld test_kind test:plains",
+            "realm test:surface of dimension test:overworld test_realm test:surface",
+        ]
+    );
+    assert!(
+        digest
+            .entries()
+            .iter()
+            .filter(|e| e.registry == "test_kind")
+            .all(|e| e.version == 3)
+    );
+    // The same registries give the same digest on every open.
+    assert_eq!(
+        registries(false).open(&id("test:default")).expect("opens"),
+        digest
+    );
+
+    // A mod's realm cuts the deep realm's open span at a free plane: one realm added (with its
+    // kind), one realm changed (its span) and one dimension changed (its list).
+    let with_abyss = registries(true).open(&id("test:default")).expect("opens");
+    let diff = WorldgenDiff::between(&digest, &with_abyss);
+    let added: Vec<(&str, &str)> = diff
+        .added
+        .iter()
+        .map(|e| (&*e.registry, e.id.as_str()))
+        .collect();
+    assert_eq!(
+        added,
+        [("test_kind", "test:plains"), ("test_realm", "test:abyss")]
+    );
+    assert!(diff.removed.is_empty());
+    let changed: Vec<&str> = diff.changed.iter().map(|c| c.live.id.as_str()).collect();
+    assert_eq!(changed, ["test:overworld", "test:deep"]);
+    assert_ne!(
+        with_abyss.dimension(&id("test:overworld")).version(),
+        digest.dimension(&id("test:overworld")).version()
+    );
 }
