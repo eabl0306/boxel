@@ -184,7 +184,9 @@ imágenes de V1.
 - Las reglas son datos del juego, y los mods les agregan entradas: `SelectorRule { id, priority,
   condition, scope, entries }`. `condition` es una conjunción de intervalos enteros sobre
   parámetros con nombre del Context (`ParamId`, leídos como `i32` en los puntos de la retícula).
-  Decide la primera regla en orden `(priority, id)` cuya condición se cumple.
+  Decide la primera regla en orden `(priority, id)` cuya condición se cumple. Todo mapa tiene una
+  regla de reserva, de prioridad mínima, con alcance `Cell` y sin condición, así cada punto recibe
+  un tipo; el chequeo al congelar rechaza un mapa sin ella.
 - Alcances (`scope`):
   - `Cell(cs)`: el tipo de la celda de región. Es un campo celular con jitter, de paso 2^cs (2^12
     por defecto) y deformado por la deformación grande del Context. Cada punto va al sitio más
@@ -509,7 +511,9 @@ mundo para el conjunto que resuelve su preset. Rechazan:
 - términos de núcleo cuyo cono o pendiente propia, sumados a la pendiente de su tipo, rompen el
   tope (sección 7);
 - features sin alcance o sin altura declarados;
-- spans de reinos que se pisan o que no están en planos de 4096 bloques;
+- spans de reinos que se pisan o que no están en planos de 4096 bloques, o más de 8 planos por
+  dimensión (el tope que hace O(1) a `realm_of`);
+- un mapa de regiones sin regla de reserva (sección 4);
 - una forma que no coincide con la política del `floor`, o que todavía no está hecha;
 - una dimensión sin exactamente un reino `Draw`.
 
@@ -977,3 +981,5 @@ Los tests del motor usan ids `test:`; los del juego, su contenido.
   código de las cajas de luz. Su tamaño (S a M) es una estimación.
 - Del juego, sobre imágenes: la escala y el clima (W0), el tamaño de región (W0b, 2^12 para
   empezar) y qué formas de relieve de W2 pasan a ser tipos con borde (por defecto, ninguna).
+- La forma de la distancia del `ContactField` (cuadrado de Chebyshev de 5,6 km o disco redondo de
+  unos 7,9 km) se elige en V3, sobre imágenes de las agujas.
