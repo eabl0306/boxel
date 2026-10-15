@@ -373,15 +373,16 @@ mod tests {
     }
 
     /// The test registry plus models made of boxes of a quarter, three quarters and two equal
-    /// boxes of three eighths (overlapping), a translucent box model and `test:wet_plant`, a
-    /// cross that always holds water.
+    /// boxes of three eighths (overlapping), two half models that can hold water (the translucent
+    /// `test:clear_half` and the unseen `test:unseen`) and `test:wet_plant`, a cross that always
+    /// holds water.
     fn registry() -> BlockRegistry {
         let mut b = testing::builder();
-        let mut boxes = |name: &str, shape, boxes: Vec<ModelBox>| {
+        let mut boxes = |name: &str, shape, boxes: Vec<ModelBox>, properties: Vec<Property>| {
             let model = b
                 .add_box_model(BoxModel::from_boxes(boxes))
                 .expect("box model");
-            b.add_block(BlockDef {
+            let def = BlockDef {
                 name: name.to_string(),
                 shape,
                 model: BlockModel::Boxes(model),
@@ -389,27 +390,38 @@ mod tests {
                 emission: [0; 3],
                 light_opacity: OPAQUE_OPACITY,
                 textures: FaceTextures::all(TextureId(0)),
-            })
-            .expect(name);
+            };
+            b.add_block_with_states(def, properties, |_, _| {})
+                .expect(name);
         };
         let half = || ModelBox::new([0, 0, 0], [16, 8, 16]);
         let under_half = || ModelBox::new([0, 0, 0], [16, 8, 12]);
+        let wet = || vec![Property::boolean(WATERLOGGED)];
         boxes(
             "test:quarter",
             RenderShape::Opaque,
             vec![ModelBox::new([0, 0, 0], [16, 8, 8])],
+            vec![],
         );
         boxes(
             "test:three_quarters",
             RenderShape::Cutout,
             vec![half(), ModelBox::new([0, 8, 0], [16, 16, 8])],
+            vec![],
         );
         boxes(
             "test:overlap",
             RenderShape::Opaque,
             vec![under_half(), under_half()],
+            vec![],
         );
-        boxes("test:clear_half", RenderShape::Translucent, vec![half()]);
+        boxes(
+            "test:clear_half",
+            RenderShape::Translucent,
+            vec![half()],
+            wet(),
+        );
+        boxes("test:unseen", RenderShape::None, vec![half()], wet());
         let (def, wet) = wet_plant(TextureId(0));
         b.add_block_with_states(def, wet, |_, _| {})
             .expect("test:wet_plant");
@@ -436,9 +448,14 @@ mod tests {
             "any solid wins"
         );
         assert_eq!(class("test:boxes"), LodClass::Empty, "a post and a bar");
-        // What holds water and is not solid is the water it holds.
+        // What holds water and is not solid is the water it holds, even translucent or unseen.
         let water = by(&r, "test:fluid");
-        for wet in ["test:boxes[waterlogged=true]", "test:wet_plant"] {
+        for wet in [
+            "test:boxes[waterlogged=true]",
+            "test:wet_plant",
+            "test:clear_half[waterlogged=true]",
+            "test:unseen[waterlogged=true]",
+        ] {
             assert_eq!(class(wet), LodClass::Fluid, "{wet}");
             assert_eq!(c.fluid(by(&r, wet)), Some(water), "{wet}");
         }
@@ -450,6 +467,7 @@ mod tests {
             "overlaps count once"
         );
         assert_eq!(class("test:clear_half"), LodClass::Empty);
+        assert_eq!(class("test:unseen"), LodClass::Empty);
         assert_eq!(c.class(BlockState(u16::MAX)), LodClass::Empty);
         assert_eq!(c.fluid(by(&r, "test:solid")), None);
     }
@@ -706,7 +724,8 @@ mod tests {
                 for level in 1..=4 {
                     let s = 1i64 << level;
                     let (first, last) = ((ground + 1).div_euclid(s), sea.div_euclid(s));
-                    // A cell with a post and one without, every cell holding water.
+                    // The cell at x 0, with a post, and the next one, without a post below
+                    // level 4 (at level 4 it reaches the post at x 16). Every cell holds water.
                     for cell_x in [0, 1] {
                         for cell_y in first..=last {
                             let at = [origin[0] + cell_x * s, origin[1] + cell_y * s, origin[2]];

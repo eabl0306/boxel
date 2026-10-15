@@ -131,11 +131,11 @@ celda de nivel `k` abarca `s = 2^k` bloques por lado:
 2. Si no hay sólido y al menos la mitad es fluido, es fluido.
 3. Si no, aire.
 
-La clase de cada estado sale de `RenderShape` y `BlockModel`, nunca de nombres: las plantas y el
-vidrio son vacíos; las hojas y los cubos cutout, sólidos; una losa o una caja que llena al menos
-media celda, sólida. Así las torres, los troncos y las copas sobreviven en todos los niveles, y
-los mares poco profundos siguen siendo agua lejos (si no, a 3 km todo mar de menos de 6 bloques
-sería arena).
+La clase de cada estado sale de `RenderShape`, `BlockModel` y el agua que guarda, nunca de
+nombres: las plantas y el vidrio son vacíos; las hojas y los cubos cutout, sólidos; una losa o una
+caja que llena al menos media celda, sólida. Así las torres, los troncos y las copas sobreviven en
+todos los niveles, y los mares poco profundos siguen siendo agua lejos (si no, a 3 km todo mar de
+menos de 6 bloques sería arena).
 
 Un bloque inundado que no es sólido (pasto marino, algas, corales, una valla) cuenta como el agua
 que guarda: de lejos el mar se ve entero. Uno sólido (una losa) sigue sólido (issue #111).
