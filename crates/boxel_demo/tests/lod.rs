@@ -120,7 +120,8 @@ struct Exact<'a> {
     chunks: HashMap<[i64; 3], Vec<BlockState>>,
 }
 
-/// The block at `[x, y, z]`, its chunk generated once.
+/// The block at `[x, y, z]`, its chunk generated once. No generated block holds water, so
+/// counting held water as water at a distance (`boxel_voxel::lod`) leaves every cell as it was.
 fn block(
     chunks: &mut HashMap<[i64; 3], Vec<BlockState>>,
     generator: &dyn WorldGenerator,
@@ -137,7 +138,12 @@ fn block(
             .to_dense(&mut dense);
         dense
     });
-    dense[LocalPos::new((x & 31) as u32, (y & 31) as u32, (z & 31) as u32).index()]
+    let state = dense[LocalPos::new((x & 31) as u32, (y & 31) as u32, (z & 31) as u32).index()];
+    assert!(
+        !registry.is_waterlogged(state),
+        "a waterlogged block at {x} {y} {z}"
+    );
+    state
 }
 
 impl<'a> Exact<'a> {

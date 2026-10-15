@@ -165,8 +165,8 @@ fn node_at(k: u8, [x, y, z]: [i64; 3]) -> ChunkKey {
 // ---------------------------------------------------------------------------------------------
 // Pyramids, overlays and the geometry of edits
 
-/// A chunk of every class: ground with a slab, a cutout layer, one fluid over part of it, glass
-/// and plants, from a fixed hash.
+/// A chunk of every class: ground with a slab, a cutout layer, one fluid over part of it (with
+/// thin models that hold it), glass and plants, from a fixed hash.
 fn mixed_chunk(registry: &BlockRegistry) -> ChunkData {
     let names = [
         "test:solid",
@@ -180,6 +180,7 @@ fn mixed_chunk(registry: &BlockRegistry) -> ChunkData {
         .iter()
         .map(|n| registry.by_name(n).expect("a test block"))
         .collect();
+    let wet = wet_boxes(registry);
     let mut data = ChunkData::uniform(BlockState::AIR);
     for y in 0..32u32 {
         for x in 0..32u32 {
@@ -191,7 +192,11 @@ fn mixed_chunk(registry: &BlockRegistry) -> ChunkData {
                     states[0]
                 } else if y < 14 && x < 20 {
                     // A sea over part of it, with things sticking out.
-                    if hash < 3 { states[1] } else { states[5] }
+                    match hash {
+                        0..3 => states[1],
+                        3 => wet,
+                        _ => states[5],
+                    }
                 } else {
                     match hash {
                         0 => states[2],
@@ -207,6 +212,13 @@ fn mixed_chunk(registry: &BlockRegistry) -> ChunkData {
     data
 }
 
+/// `test:boxes` holding water: water at a distance (`boxel_voxel::lod`).
+fn wet_boxes(registry: &BlockRegistry) -> BlockState {
+    registry
+        .parse_state("test:boxes[waterlogged=true]")
+        .expect("test:boxes")
+}
+
 #[test]
 fn pyramids_are_the_cell_rule_on_the_chunks_blocks() {
     let registry = boxel_voxel::testing::registry();
@@ -217,6 +229,7 @@ fn pyramids_are_the_cell_rule_on_the_chunks_blocks() {
         mixed_chunk(&registry),
         ChunkData::uniform(solid),
         ChunkData::uniform(fluid),
+        ChunkData::uniform(wet_boxes(&registry)),
         ChunkData::uniform(BlockState::AIR),
     ] {
         let pyramid = Pyramid::of_chunk(&classes, &data);
@@ -248,6 +261,16 @@ fn pyramids_are_the_cell_rule_on_the_chunks_blocks() {
             );
         }
     }
+    // A chunk of thin models under water is water at every level.
+    let wet = Pyramid::of_chunk(&classes, &ChunkData::uniform(wet_boxes(&registry)));
+    for level in 1..=edits::PYRAMID_LEVELS {
+        let n = 32usize >> level;
+        for i in 0..n {
+            assert_eq!(wet.get(level, i, n - 1 - i, i / 2), fluid, "level {level}");
+        }
+    }
+    let level1 = edits::Level1::of_chunk(&classes, &ChunkData::uniform(wet_boxes(&registry)));
+    assert_eq!(level1, edits::Level1::Uniform(fluid));
 }
 
 #[test]

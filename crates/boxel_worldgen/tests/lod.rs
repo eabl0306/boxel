@@ -1,7 +1,10 @@
 //! The far level of detail's generator side (ADR 0031): the defaulted hook and the types a
 //! `LodSource` fills.
+use boxel_voxel::{
+    BlockCollision, BlockDef, BlockModel, DimensionId, FaceTextures, LocalPos, MAX_CHUNK_COORD,
+    Property, RenderShape, TextureId, WATERLOGGED, testing,
+};
 use boxel_voxel::{BlockRegistry, BlockRegistryBuilder, BlockState, ChunkData, ChunkKey, ChunkPos};
-use boxel_voxel::{DimensionId, LocalPos, MAX_CHUNK_COORD};
 use boxel_worldgen::lod::{
     CellPartial, LOD_PADDED, LOD_PADDED_VOLUME, LodCells, LodClasses, LodColumn, LodNode,
     LodRequest, LodScratch, LodSource,
@@ -191,9 +194,30 @@ fn exact_cell(
     .state()
 }
 
+/// The test registry plus `test:wet_plant`, a cross that always holds water (its `waterlogged`
+/// property has the one value `true`).
+fn registry_with_a_wet_plant() -> BlockRegistry {
+    let mut b = testing::builder();
+    b.add_block_with_states(
+        BlockDef {
+            name: "test:wet_plant".to_string(),
+            shape: RenderShape::Cutout,
+            model: BlockModel::Cross,
+            collision: BlockCollision::None,
+            emission: [0; 3],
+            light_opacity: 0,
+            textures: FaceTextures::all(TextureId(0)),
+        },
+        vec![Property::new(WATERLOGGED, ["true"])],
+        |_, _| {},
+    )
+    .expect("test:wet_plant");
+    b.build()
+}
+
 #[test]
 fn the_flat_generators_cells_are_the_rule_on_its_own_chunks() {
-    let registry = boxel_voxel::testing::registry();
+    let registry = registry_with_a_wet_plant();
     let classes = LodClasses::from_registry(&registry);
     let layered = |layers: &[(&str, u32)]| {
         FlatGenerator::new(layers.iter().map(|&(n, h)| (n.to_string(), h)).collect())
@@ -211,6 +235,8 @@ fn the_flat_generators_cells_are_the_rule_on_its_own_chunks() {
         // A sea 9 deep over ground 37 high, then one 3 deep over 70 (fluid over ground).
         layered(&[("test:solid", 37), ("test:fluid", 9)]),
         layered(&[("test:solid", 70), ("test:fluid", 3)]),
+        // The same sea with plants that hold its water on the bed.
+        layered(&[("test:solid", 37), ("test:wet_plant", 1), ("test:fluid", 8)]),
         // Two fluid kinds over ground, and a fluid with nothing under it.
         layered(&[("test:solid", 100), ("test:hot", 2), ("test:fluid", 20)]),
         layered(&[("test:fluid", 15), ("test:solid", 1)]),
