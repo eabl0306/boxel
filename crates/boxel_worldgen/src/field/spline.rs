@@ -47,7 +47,7 @@ impl Spline {
             .windows(2)
             .map(|w| {
                 let (dx, dy) = (
-                    i128::from(w[1].0 - w[0].0),
+                    i128::from(w[1].0) - i128::from(w[0].0),
                     i128::from(w[1].1) - i128::from(w[0].1),
                 );
                 let scaled = dy << 16;
@@ -85,9 +85,10 @@ impl Spline {
         }
         let (x0, y0) = (self.xs[k - 1], self.ys[k - 1]);
         let (x1, y1) = (self.xs[k], self.ys[k]);
-        let step = (i128::from(y1) - i128::from(y0)) * i128::from(x - x0);
+        // Differences in i128: knots 2^62 apart on both sides of 0 are 2^63 apart.
+        let step = (i128::from(y1) - i128::from(y0)) * (i128::from(x) - i128::from(x0));
         // Between y0 and y1: it fits.
-        (i128::from(y0) + step.div_euclid(i128::from(x1 - x0))) as i64
+        (i128::from(y0) + step.div_euclid(i128::from(x1) - i128::from(x0))) as i64
     }
 
     /// The knots.

@@ -255,8 +255,8 @@ proptest! {
             prop_assert_eq!(w.den, v.den);
             prop_assert_eq!(w.nx, v.nx + i128::from(o.0) * v.den);
             prop_assert_eq!(w.nz, v.nz + i128::from(o.1) * v.den);
-            let (vx, vz) = v.rounded();
-            let (wx, wz) = w.rounded();
+            let (vx, vz) = v.rounded().unwrap();
+            let (wx, wz) = w.rounded().unwrap();
             prop_assert_eq!((wx - o.0, wz - o.1), (vx, vz));
             // Rounded to the nearest block.
             prop_assert!((2 * (i128::from(vx) * v.den - v.nx)).abs() <= v.den);
@@ -286,15 +286,36 @@ fn orient_and_incircle_signs() {
     assert!(incircle(a, b, c, (1, 1)) > 0);
     assert_eq!(incircle(a, b, c, (2, 2)), 0);
     assert!(incircle(a, b, c, (3, 3)) < 0);
-    assert_eq!(circumcenter(a, b, c).map(ExactPoint::rounded), Some((1, 1)));
+    assert_eq!(
+        circumcenter(a, b, c).and_then(ExactPoint::rounded),
+        Some((1, 1))
+    );
     assert_eq!(circumcenter(a, (1, 1), (2, 2)), None);
     // Halves round up.
-    let v = ExactPoint {
-        nx: 3,
-        nz: -3,
-        den: 2,
-    };
-    assert_eq!(v.rounded(), (2, -1));
+    let v = ExactPoint::new(3, -3, 2);
+    assert_eq!(v.rounded(), Some((2, -1)));
+    // Lowest terms with a positive denominator: one point, one value.
+    assert_eq!(ExactPoint::new(-6, 9, -12), ExactPoint::new(2, -3, 4));
+    assert_eq!(ExactPoint::new(0, 0, -5), ExactPoint::new(0, 0, 1));
+    let square = [(0, 0), (2, 0), (2, 2), (0, 2)];
+    assert_eq!(
+        circumcenter(square[0], square[1], square[2]),
+        circumcenter(square[0], square[2], square[3])
+    );
+    assert_eq!(gcd(0, 0), 0);
+    assert_eq!(gcd(12, 18), 6);
+    assert_eq!(gcd(1 << 100, 3 << 90), 1 << 90);
+}
+
+#[test]
+fn rounding_a_far_circumcenter_gives_none() {
+    // Nearly collinear points within 2^30 of each other: the center lies near 2^91.
+    let m = MAX_SPREAD;
+    let (a, b, c) = ((0, 0), (m, m - 1), (-(m - 1), -(m - 2)));
+    assert_ne!(orient(a, b, c), 0);
+    let v = circumcenter(a, b, c).unwrap();
+    assert_eq!(v.rounded(), None);
+    assert!(v.nx.unsigned_abs() > u128::from(u64::MAX) * v.den.unsigned_abs());
 }
 
 #[test]

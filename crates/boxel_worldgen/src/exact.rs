@@ -355,7 +355,8 @@ pub fn point_segment_distance(p: (i64, i64), a: (i64, i64), b: (i64, i64)) -> Di
     }
 }
 
-/// A point with exact rational coordinates `(nx / den, nz / den)`, `den > 0`.
+/// A point with exact rational coordinates `(nx / den, nz / den)`, `den > 0`, in lowest terms
+/// (`gcd(nx, nz, den) = 1`), so equal points compare and hash equal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ExactPoint {
     /// Numerator of x.
@@ -367,13 +368,45 @@ pub struct ExactPoint {
 }
 
 impl ExactPoint {
-    /// The nearest block coordinates, halves rounded up (toward `+inf`).
-    pub fn rounded(self) -> (i64, i64) {
-        let round = |n: i128| -> i64 {
-            let r = (2 * n + self.den).div_euclid(2 * self.den);
-            i64::try_from(r).expect("a circumcenter of points in range fits in i64")
-        };
-        (round(self.nx), round(self.nz))
+    /// `(nx / den, nz / den)` in lowest terms. Panics if `den` is 0.
+    pub fn new(nx: i128, nz: i128, den: i128) -> Self {
+        assert!(den != 0, "ExactPoint: the denominator must not be 0");
+        let sign = den.signum();
+        let g = gcd(
+            gcd(nx.unsigned_abs(), nz.unsigned_abs()),
+            den.unsigned_abs(),
+        ) as i128;
+        Self {
+            nx: sign * nx / g,
+            nz: sign * nz / g,
+            den: sign * den / g,
+        }
+    }
+
+    /// The nearest block coordinates, halves rounded up (toward `+inf`), or `None` when they
+    /// leave `i64` (the center of three nearly collinear points can lie far outside the world).
+    pub fn rounded(self) -> Option<(i64, i64)> {
+        let round = |n: i128| i64::try_from((2 * n + self.den).div_euclid(2 * self.den)).ok();
+        Some((round(self.nx)?, round(self.nz)?))
+    }
+}
+
+/// Greatest common divisor (binary; `gcd(0, b) = b`).
+fn gcd(mut a: u128, mut b: u128) -> u128 {
+    if a == 0 || b == 0 {
+        return a | b;
+    }
+    let shift = (a | b).trailing_zeros();
+    a >>= a.trailing_zeros();
+    loop {
+        b >>= b.trailing_zeros();
+        if a > b {
+            (a, b) = (b, a);
+        }
+        b -= a;
+        if b == 0 {
+            return a << shift;
+        }
     }
 }
 
@@ -431,11 +464,11 @@ pub fn circumcenter(a: (i64, i64), b: (i64, i64), c: (i64, i64)) -> Option<Exact
         (den, ux, uz) = (-den, -ux, -uz);
     }
     // |a| < 2^62 and den < 2^62: the products stay under 2^124.
-    Some(ExactPoint {
-        nx: i128::from(a.0) * den + ux,
-        nz: i128::from(a.1) * den + uz,
+    Some(ExactPoint::new(
+        i128::from(a.0) * den + ux,
+        i128::from(a.1) * den + uz,
         den,
-    })
+    ))
 }
 
 #[cfg(test)]

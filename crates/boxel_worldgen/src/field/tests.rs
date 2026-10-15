@@ -604,6 +604,18 @@ fn blend_refuses_a_weight_out_of_scale() {
 }
 
 #[test]
+fn spline_takes_knots_at_its_limits() {
+    let k = Spline::MAX_KNOT;
+    let s = Spline::new(&[(-k, -k), (k, k)]);
+    assert_eq!(
+        (s.eval(0), s.eval(-k), s.eval(k), s.eval(i64::MIN)),
+        (0, -k, k, -k)
+    );
+    assert_eq!(s.max_slope(), Q16::ONE);
+    assert_eq!(s.range_over(Span::new(-k, k)), Span::new(-k, k));
+}
+
+#[test]
 #[should_panic(expected = "strictly increasing")]
 fn spline_refuses_unsorted_knots() {
     let _ = Spline::new(&[(0, 0), (0, 1)]);
