@@ -86,21 +86,27 @@ fn bench(c: &mut Criterion) {
         |xs, zs, out| warp.offset_grid(xs, zs, out),
     );
 
+    // The cellular pair by hand: its output buffer is allocated outside the timed loop.
     let cells = Cellular::new(7, 8, 0);
-    let first = cells.nearest(0, 0);
-    pair(
-        c,
-        "noise/cellular",
-        0,
-        |x, z| cells.nearest(x, z).d1,
-        |xs, zs, out| {
-            let mut near = vec![first; out.len()];
-            cells.nearest_grid(xs, zs, &mut near);
-            for (o, n) in out.iter_mut().zip(near) {
-                *o = n.d1;
+    let (xs, zs) = (axis(0), axis(0));
+    c.bench_function("noise/cellular_point", |b| {
+        b.iter(|| {
+            let mut last = cells.nearest(0, 0);
+            for &x in &xs {
+                for &z in &zs {
+                    last = cells.nearest(black_box(x), z);
+                }
             }
-        },
-    );
+            last
+        });
+    });
+    c.bench_function("noise/cellular_grid", |b| {
+        let mut out = vec![cells.nearest(0, 0); xs.len() * zs.len()];
+        b.iter(|| {
+            cells.nearest_grid(black_box(&xs), &zs, &mut out);
+            out[0]
+        });
+    });
     let plates = Cellular::new(7, 15, 1 << 15 >> 2);
     c.bench_function("noise/voronoi_cell", |b| {
         b.iter(|| plates.voronoi_cell(black_box(plates.cell_of(0, 0))));

@@ -10,8 +10,8 @@
 
 use super::d3::{fade, lerp};
 use super::{
-    Fbm, Frequency, Octave, Scale, cell_hash, fbm_2d, fbm_2d_grid, lattice_hash, normalize,
-    splitmix64,
+    Fbm, Frequency, Octave, Scale, cell_hash, excess, fbm_2d, fbm_2d_grid, lattice_hash, mix,
+    normalize, splitmix64, tile_hash,
 };
 use crate::exact::Q16;
 
@@ -172,11 +172,37 @@ fn corner_hashes(mixed_seed: u64, x0: i128, z0: i128) -> [u32; 4] {
             lattice_hash(mixed_seed, x1, z1),
         ];
     }
+    far_corner_hashes(mixed_seed, x0, z0)
+}
+
+/// [`corner_hashes`] of a cell with a corner outside `i32`. Usually the four corners still share
+/// their bits above `i32` (one `2^32 x 2^32` tile), and so the tag `hash2` makes of those bits:
+/// one tag instead of four (the value noise's `far_corners`).
+#[inline(never)]
+fn far_corner_hashes(mixed_seed: u64, x0: i128, z0: i128) -> [u32; 4] {
+    if let (Ok(x0), Ok(z0)) = (i64::try_from(x0), i64::try_from(z0)) {
+        // `c + 1` exists and has the excess of `c` unless its low 32 bits wrap.
+        let same_tile = |c: i64| c as i32 != i32::MAX && c != i64::MAX;
+        if same_tile(x0) && same_tile(z0) {
+            let e = ((excess(x0) as u64) << 32) | excess(z0) as u64;
+            // `corner_hashes` takes the i32 path otherwise.
+            debug_assert!(e != 0, "far_corner_hashes of a cell inside i32");
+            let tag = mix(e);
+            let (x0, z0) = (x0 as i32, z0 as i32);
+            let (x1, z1) = (x0 + 1, z0 + 1);
+            return [
+                tile_hash(mixed_seed, tag, x0, z0),
+                tile_hash(mixed_seed, tag, x1, z0),
+                tile_hash(mixed_seed, tag, x0, z1),
+                tile_hash(mixed_seed, tag, x1, z1),
+            ];
+        }
+    }
     wide_corner_hashes(mixed_seed, x0, z0)
 }
 
-/// [`corner_hashes`] of a cell with a corner outside `i32`, corner by corner; kept out of line so
-/// the common path stays small. `+ 1` cannot overflow: cells are below `2^127 - 2^63` in
+/// [`corner_hashes`] of any cell, corner by corner (for cells whose corners straddle a `2^32`
+/// tile or leave `i64`); kept out of line so the common path stays small. `+ 1` cannot overflow: cells are below `2^127 - 2^63` in
 /// magnitude ([`Scale::split`]).
 #[inline(never)]
 fn wide_corner_hashes(mixed_seed: u64, x0: i128, z0: i128) -> [u32; 4] {

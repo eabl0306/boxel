@@ -135,6 +135,44 @@ fn gradient_fbm_is_not_pinned_on_its_coarsest_lattice() {
 }
 
 #[test]
+fn corner_shortcuts_match_hashing_each_corner() {
+    let mixed = splitmix64(77);
+    let tile = 1i64 << 32;
+    // Inside i32, at its edges, inside and across 2^32 tiles of the hash, at the ends of i64.
+    let edges = [
+        0,
+        -1,
+        i64::from(i32::MAX) - 1,
+        i64::from(i32::MAX),
+        i64::from(i32::MIN),
+        i64::from(i32::MIN) - 1,
+        tile,
+        tile + i64::from(i32::MAX),
+        -3 * tile + 12_345,
+        (1 << 40) + i64::from(i32::MAX),
+        i64::MAX - 1,
+        i64::MAX,
+        i64::MIN,
+    ];
+    for x in edges {
+        for z in edges {
+            let fast = corner_hashes(mixed, x.into(), z.into());
+            assert_eq!(
+                fast,
+                wide_corner_hashes(mixed, x.into(), z.into()),
+                "cell ({x}, {z})"
+            );
+        }
+    }
+    // And past i64 (octaves finer than a voxel far out).
+    let far = i128::from(i64::MAX) + 5;
+    assert_eq!(
+        corner_hashes(mixed, far, -far),
+        wide_corner_hashes(mixed, far, -far)
+    );
+}
+
+#[test]
 fn shifted_split_is_exact() {
     for c in [0, 1, -1, 1 << 40, -(1 << 62), i64::MAX, i64::MIN] {
         for (num, den) in [
