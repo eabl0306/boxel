@@ -276,6 +276,53 @@ fn voronoi_neighbor_three_cells_away_on_small_cells() {
 }
 
 #[test]
+fn voronoi_window_holds_every_neighbor() {
+    // Every (shift, margin) up to 2^12 where the window bound on integer points, sqrt(2) (S - 1 -
+    // m), gave a window one cell smaller than the real vertices need: the cell from the window
+    // must equal the cell from a window one larger. `VORONOI_SEEDS` runs more seeds.
+    let seeds: u64 = std::env::var("VORONOI_SEEDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    let configs = [
+        (0u32, 0i64),
+        (1, 0),
+        (2, 0),
+        (2, 1),
+        (3, 1),
+        (4, 2),
+        (5, 5),
+        (6, 24),
+        (7, 48),
+        (10, 175),
+        (10, 387),
+        (11, 351),
+        (11, 775),
+        (12, 702),
+    ];
+    let mut wrong = Vec::new();
+    for (shift, margin) in configs {
+        for seed in 0..seeds {
+            let c = Cellular::new(splitmix64(seed), shift, margin);
+            for i in -2..2 {
+                for j in -2..2 {
+                    let id = SiteId { i, j };
+                    if c.voronoi_cell(id) != c.voronoi_cell_in(id, c.window + 1) {
+                        wrong.push((shift, margin, seed, id));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} cells differ, first {:?}",
+        wrong.len(),
+        &wrong[..wrong.len().min(4)]
+    );
+}
+
+#[test]
 fn voronoi_vertices_are_empty_on_small_cells() {
     // Every vertex of every cell around the origin against a window of 8 cells, exactly, for the
     // small cells and margins where the window radius is tightest.

@@ -297,8 +297,13 @@ impl Cellular {
     /// holds no other site (exact `incircle`; between cocircular sites, the one at the smaller
     /// angle, so every one is visited).
     pub fn voronoi_cell(&self, id: SiteId) -> VoronoiCell {
+        self.voronoi_cell_in(id, self.window)
+    }
+
+    /// [`Cellular::voronoi_cell`] from the sites within `w` cells: the same cell for any `w` at
+    /// least the window (the tests compare a wider one).
+    fn voronoi_cell_in(&self, id: SiteId, w: i64) -> VoronoiCell {
         let a = self.site(id);
-        let w = self.window;
         let mut others = Vec::with_capacity(((2 * w + 1) * (2 * w + 1) - 1) as usize);
         for di in -w..=w {
             for dj in -w..=w {
