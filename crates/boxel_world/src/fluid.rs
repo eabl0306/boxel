@@ -26,7 +26,9 @@
 //! - A waterlogged block (a slab, stairs, a fence or leaves with `waterlogged=true`, ADR 0025)
 //!   holds a source of the registry's waterlog fluid (water): it ticks and spreads like one and
 //!   counts as one for its neighbors, but never hardens (only the fluid's own block does, as in
-//!   Minecraft's `LiquidBlock`).
+//!   Minecraft's `LiquidBlock`). Leaves (cutout cubes, ADR 0038), whose full collision closes
+//!   every face, are a sealed source: their water never flows out, counts for no neighbor's new
+//!   source, and no new source forms in dry leaves (the collision rule below).
 //!   No flowing fluid enters a block that can be waterlogged, dry or wet, with collision or
 //!   without (Minecraft's `LiquidBlockContainer`): flowing water never washes a dry
 //!   `game:lichen` away, and lava never burns one nor turns a waterlogged one to stone (it

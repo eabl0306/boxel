@@ -53,9 +53,11 @@ calculados una vez (`sturdy` y `top_floor`).
   (fuera del greedy). Tapa sus caras como el seco: contra un cubo opaco y contra el mismo bloque,
   seco o con agua (`MaterialTable::dry`).
 - Su agua es la de cualquier bloque con agua (decisión 1): como es cutout, no tapa ninguna cara.
-- Para el fluido es una fuente sellada si colisiona entero: no corre, no cuenta para sus vecinos
-  y no toma una fuente nueva (`canPassThroughWall`). Romperlo deja su agua. Sin cambios en el
-  código de fluidos, luz, físicas, guardado ni lejanía (en la lejanía es sólido, como seco).
+- Para el fluido es una fuente sellada si colisiona entero: no corre, no cuenta para la fuente
+  nueva de un vecino y no toma una fuente nueva (`canPassThroughWall`). La lava a su lado igual
+  se endurece, y una celda que cae la cuenta entre sus fuentes vecinas, como en Minecraft.
+  Romperlo deja su agua. Sin cambios en el código de fluidos, luz, físicas, guardado ni lejanía
+  (en la lejanía es sólido, como seco).
 
 ## Consecuencias
 

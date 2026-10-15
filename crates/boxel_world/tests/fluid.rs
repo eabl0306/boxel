@@ -1476,8 +1476,9 @@ fn waterlogged_leaves_are_a_sealed_source() {
         Cell::Water(0),
         "a new source on the leaves"
     );
-    // Broken, wet leaves leave their source (`rules::broken`), which flows as any; lava beside
-    // wet leaves hardens.
+    // Wet leaves broken: the source they leave (`rules::broken`, tested in `boxel_voxel`'s
+    // tests/rules.rs) is written here in their place, and flows as any. Lava beside wet leaves
+    // hardens.
     let later = [(30, vec![([0, 0, 0], Cell::Water(0))])];
     let edits = [
         ([0, 0, 0], wet),
