@@ -258,7 +258,58 @@ fn window_radius_follows_the_margin() {
     assert_eq!(window_radius(4096, 4096 / 10), 3);
     assert_eq!(window_radius(4096, 4096 / 5), 2);
     assert_eq!(window_radius(4096, 2047), 1);
-    assert_eq!(window_radius(1, 0), 1);
+    // Cells of one block: a vertex can lie anywhere in a unit square around a corner site.
+    assert_eq!(window_radius(1, 0), 2);
+    assert_eq!(window_radius(4, 0), 3);
+}
+
+#[test]
+fn voronoi_neighbor_three_cells_away_on_small_cells() {
+    // Cells of 4 blocks: sites (11, -1) and (10, 8) are neighbors 3 cells apart, past a window
+    // of 2 that bounded the vertices as integer points (sqrt(2) (S - 1 - m)).
+    let c = Cellular::new(splitmix64(605), 2, 0);
+    let a = c.site(SiteId { i: 2, j: -1 });
+    let far = c.site(SiteId { i: 2, j: 2 });
+    assert_eq!((a.pos(), far.pos()), ((11, -1), (10, 8)));
+    let cell = c.voronoi_cell(a.id);
+    assert!(cell.edges.iter().any(|e| e.neighbor.id == far.id));
+}
+
+#[test]
+fn voronoi_vertices_are_empty_on_small_cells() {
+    // Every vertex of every cell around the origin against a window of 8 cells, exactly, for the
+    // small cells and margins where the window radius is tightest.
+    for (shift, margin) in [
+        (0u32, 0i64),
+        (1, 0),
+        (2, 0),
+        (2, 1),
+        (3, 1),
+        (4, 2),
+        (5, 5),
+        (6, 24),
+    ] {
+        for seed in 0..60u64 {
+            let c = Cellular::new(splitmix64(seed), shift, margin);
+            for i in -2..2 {
+                for j in -2..2 {
+                    let id = SiteId { i, j };
+                    let cell = c.voronoi_cell(id);
+                    let wide = around(&c, id, 8);
+                    for e in &cell.edges {
+                        let v = normalized(e.end, cell.site.pos());
+                        let r = scaled(v, cell.site.pos(), cell.site.pos());
+                        for s in &wide {
+                            assert!(
+                                scaled(v, cell.site.pos(), s.pos()) >= r,
+                                "shift {shift} margin {margin} seed {seed} {id:?}: {s:?} nearer"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]

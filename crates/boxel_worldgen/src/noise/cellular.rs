@@ -289,9 +289,9 @@ impl Cellular {
     /// The Voronoi cell of site `id`, exact.
     ///
     /// Its neighbors lie within [`Cellular`]'s window of cells (a radius of 3 cells with no
-    /// margin, 2 from a margin of about 0.17 of a cell): a point of the cell's boundary is
-    /// at most `sqrt(2) * (2^shift - 1 - margin)` from its nearest site (its own cell's site is
-    /// that close), and a neighbor shares such a point, so it is at most twice that from the
+    /// margin, 2 from a margin of about 0.17 of a cell): a point of the cell's boundary, a real
+    /// point, is under `sqrt(2) * (2^shift - margin)` from its nearest site (its own cell's site
+    /// is that close), and a neighbor shares such a point, so it is under twice that from the
     /// site. The neighbors come counterclockwise by gift wrapping: from the nearest site, each
     /// next one is the site left of the last edge whose circle through the site and that edge
     /// holds no other site (exact `incircle`; between cocircular sites, the one at the smaller
@@ -381,15 +381,17 @@ impl Best {
 }
 
 /// The Chebyshev radius, in cells, of the window around a site that holds all its Voronoi
-/// neighbors: the smallest `r` such that a site `r + 1` cells away on some axis is farther than
-/// `2 sqrt(2) (size - 1 - margin)` (twice the largest distance from a point to its nearest site).
-/// Sites `r + 1` cells apart on an axis are at least `r * size + 2 * margin + 1` apart on it.
+/// neighbors: the smallest `r` such that a site `r + 1` cells away on some axis is at least
+/// `2 sqrt(2) (size - margin)` away. A Voronoi vertex is a real point, under `size - margin`
+/// from its own cell's site along each axis, so it is under `sqrt(2) (size - margin)` from its
+/// nearest site, and a neighbor is under twice that from the site. Sites `r + 1` cells apart on
+/// an axis are at least `r * size + 2 * margin + 1` apart on it.
 fn window_radius(size: i64, margin: i64) -> i64 {
-    let reach_sq = 8 * i128::from(size - 1 - margin).pow(2);
+    let reach_sq = 8 * i128::from(size - margin).pow(2);
     let r = (1..)
         .find(|&r: &i64| {
             let gap = i128::from(r) * i128::from(size) + i128::from(2 * margin + 1);
-            gap * gap > reach_sq
+            gap * gap >= reach_sq
         })
         .expect("a radius of 3 always suffices");
     debug_assert!(
