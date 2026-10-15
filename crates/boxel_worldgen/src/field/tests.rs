@@ -296,6 +296,29 @@ proptest! {
 }
 
 #[test]
+fn bounds_stay_local_on_big_cells() {
+    // A wavelength of 4096 blocks and cells of 64: the bound is the center value plus and minus
+    // the slope over the half diagonal, far inside the range, for the noise, a fine lattice
+    // over it (past the 64 lattice points it reads one by one) and a warp of it.
+    let noise = NoiseField::new(3, fbm(4096, 3), Basis::Gradient, 1 << 20);
+    let lattice = LatticeField::new(2, noise);
+    let warped = Warped::new(Warp::new(3, fbm(512, 2), 16), noise);
+    for origin in [0, 1 << 40, MAX_BLOCK_COORD - 64] {
+        let rect = Rect::cell(origin, -origin, 64);
+        for (name, b, f) in [
+            ("noise", noise.bound(rect), &noise as &dyn Field),
+            ("lattice", lattice.bound(rect), &lattice),
+            ("warped", warped.bound(rect), &warped),
+        ] {
+            let slope = f.slope().over(46);
+            assert!(b.width() <= 2 * slope, "{name}: {b:?} over {slope}");
+            assert!(b.width() < noise.range().width() / 8, "{name}: {b:?}");
+            assert!(b.contains(f.value(rect.center_x(), rect.center_z())));
+        }
+    }
+}
+
+#[test]
 fn min_needs_its_crossing_term() {
     // min(x, s - x) on [0, s]: both linear (fine 0), 0 at both corners, s / 2 in the middle.
     let s = 1 << 10;

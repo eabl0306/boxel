@@ -83,6 +83,19 @@ impl Span {
         let (lo, hi) = (self.lo.unsigned_abs(), self.hi.unsigned_abs());
         if lo > hi { lo } else { hi }
     }
+
+    /// The values both spans hold. Panics if they are disjoint (two sound bounds of one field
+    /// over one rectangle never are).
+    pub fn intersect(self, other: Self) -> Self {
+        Self::new(self.lo.max(other.lo), self.hi.min(other.hi))
+    }
+
+    /// `[v - r, v + r]`, clipped to `within` (`within` when `v` is out of it).
+    fn around(v: i64, r: u64, within: Self) -> Self {
+        let (v, r) = (i128::from(v), i128::from(r));
+        let clip = |t: i128| t.clamp(within.lo.into(), within.hi.into()) as i64;
+        Self::new(clip(v - r), clip(v + r))
+    }
 }
 
 /// A closed rectangle of blocks, `x0..=x1` by `z0..=z1`, with its 4 corners `(x0, z0)`, `(x1,
@@ -136,6 +149,16 @@ impl Rect {
         crate::exact::saturate(isqrt_ceil(sx * sx + sz * sz).div_ceil(2))
     }
 
+    /// The center's x, rounded down (no overflow).
+    pub const fn center_x(self) -> i64 {
+        self.x0 + (self.x1 - self.x0) / 2
+    }
+
+    /// The center's z, rounded down (no overflow).
+    pub const fn center_z(self) -> i64 {
+        self.z0 + (self.z1 - self.z0) / 2
+    }
+
     /// Whether `(x, z)` lies in the rectangle.
     pub const fn contains(self, x: i64, z: i64) -> bool {
         self.x0 <= x && x <= self.x1 && self.z0 <= z && z <= self.z1
@@ -186,8 +209,8 @@ impl Fine {
 /// - `|value(p) - value(q)| <= slope().per_block * |p - q| + slope().jitter`;
 /// - `fine(rect)` bounds the deviation from the interpolant of the 4 corner values over `rect`.
 ///
-/// Only `value`, `range` and `slope` are required: `grid` defaults to a loop, `bound` to the
-/// range and `fine` to [`fine_from_slope`].
+/// Only `value`, `range` and `slope` are required: `grid` defaults to a loop, `bound` to
+/// [`bound_from_slope`] and `fine` to [`fine_from_slope`].
 pub trait Field {
     /// The value at `(x, z)`.
     fn value(&self, x: i64, z: i64) -> i64;
@@ -214,10 +237,10 @@ pub trait Field {
     /// Every value the field takes.
     fn range(&self) -> Span;
 
-    /// Every value the field takes at the integer points of `rect`, inside [`Field::range`].
+    /// Every value the field takes at the integer points of `rect`, inside [`Field::range`]. The
+    /// default is [`bound_from_slope`]: one value at the center and the slope.
     fn bound(&self, rect: Rect) -> Span {
-        let _ = rect;
-        self.range()
+        bound_from_slope(self, rect)
     }
 
     /// The field's Lipschitz bound with its rounding allowance.
@@ -253,6 +276,17 @@ impl<F: Field + ?Sized> Field for &F {
 /// The 4 corner values of `rect`.
 pub fn corner_values<F: Field + ?Sized>(f: &F, rect: Rect) -> [i64; 4] {
     rect.corners().map(|(x, z)| f.value(x, z))
+}
+
+/// A sound [`Field::bound`] for any field from one evaluation: the value at the center of `rect`
+/// (rounded down to a block) plus and minus the slope over the distance to its farthest corner,
+/// clipped to the range. The margin stays local at any cell size.
+pub fn bound_from_slope<F: Field + ?Sized>(f: &F, rect: Rect) -> Span {
+    let (cx, cz) = (rect.center_x(), rect.center_z());
+    let dx = u128::from((cx - rect.x0).max(rect.x1 - cx).unsigned_abs());
+    let dz = u128::from((cz - rect.z0).max(rect.z1 - cz).unsigned_abs());
+    let r = f.slope().over_sq(dx * dx + dz * dz);
+    Span::around(f.value(cx, cz), r, f.range())
 }
 
 /// A sound [`Field::fine`] for any field, from its slope and its bound over `rect`.

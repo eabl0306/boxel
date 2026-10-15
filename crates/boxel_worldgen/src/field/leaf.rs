@@ -32,7 +32,9 @@ impl Field for Const {
 ///
 /// Its slope is `amplitude` times the fbm's Lipschitz bound ([`FbmSplit::lipschitz`]), with a
 /// jitter of 2: 1 for the rounding to an integer and 1 for the `f64` rounding of the fbm, far
-/// under a unit while `amplitude <= 2^40`.
+/// under a unit while `amplitude <= 2^40`. Its bound over a rectangle is the trait's default,
+/// local: the value at the center plus and minus that slope over the distance to the farthest
+/// corner ([`bound_from_slope`](super::bound_from_slope)).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NoiseField {
     seed: u64,

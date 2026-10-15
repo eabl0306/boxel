@@ -1,16 +1,18 @@
 //! [`LatticeField`]: a child field sampled at the points of a `2^k` lattice and interpolated
 //! exactly with integer weights.
 
-use super::{Field, Fine, Rect, Slope, Span, fine_from_slope};
+use super::{Field, Fine, Rect, Slope, Span, bound_from_slope, fine_from_slope};
 use crate::exact::Q16;
 
-/// Lattice points [`LatticeField::bound`] reads one by one before it asks the child for a bound
-/// over the whole lattice rectangle instead.
+/// Lattice points [`LatticeField::bound`] reads one by one; past them it takes its own
+/// [`bound_from_slope`] (with the child's bound over the lattice rectangle, if tighter).
 const MAX_BOUND_POINTS: u128 = 64;
 
 /// A field known at the points of a lattice of spacing `S = 2^shift` and interpolated between
-/// them exactly: the plan's `Lattice<C>` (the child is only ever evaluated at lattice points, so
-/// a spline or any costly field runs 4 times per lattice cell, not per block).
+/// them exactly: the plan's `Lattice<C>`. The child is only ever evaluated at lattice points: a
+/// point query reads up to 4 of them, and the grid form reads each lattice point the grid
+/// touches once, so a costly child (a spline of an fbm) runs about once per lattice cell of a
+/// chunk instead of once per block.
 ///
 /// At `(x, z)`, with `i = x >> shift`, `fx = x & (S - 1)` and the same for z, the value is
 /// `floor(((S - fx)(S - fz) v00 + fx (S - fz) v10 + (S - fx) fz v01 + fx fz v11) / S^2)`, `vab`
@@ -184,9 +186,8 @@ impl<C: Field> Field for LatticeField<C> {
         let (i0, i1, j0, j1) = (rect.x0 >> k, up(rect.x1), rect.z0 >> k, up(rect.z1));
         let points = u128::from(i1.abs_diff(i0) + 1) * u128::from(j1.abs_diff(j0) + 1);
         if points > MAX_BOUND_POINTS {
-            return self
-                .child
-                .bound(Rect::new(i0 << k, j0 << k, i1 << k, j1 << k));
+            let lattice = Rect::new(i0 << k, j0 << k, i1 << k, j1 << k);
+            return bound_from_slope(self, rect).intersect(self.child.bound(lattice));
         }
         let xs: Vec<i64> = (i0..=i1).map(|i| i << k).collect();
         let zs: Vec<i64> = (j0..=j1).map(|j| j << k).collect();

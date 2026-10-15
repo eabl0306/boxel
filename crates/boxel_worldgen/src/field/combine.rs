@@ -1,7 +1,10 @@
 //! The combinators: [`Splined`], [`Add`], [`Min`], [`Blend`] and [`Warped`]. Each derives its
 //! bounds from its children's; the proofs are in the docs, the checks in the tests.
 
-use super::{Field, Fine, Rect, Slope, Span, Spline, by_bound, corner_values, fine_from_slope};
+use super::{
+    Field, Fine, Rect, Slope, Span, Spline, bound_from_slope, by_bound, corner_values,
+    fine_from_slope,
+};
 use crate::exact::{Q16, div_ceil_sticky, mul_shift_ceil, saturate};
 use crate::noise::Warp;
 
@@ -377,9 +380,16 @@ impl<W: Field, A: Field, B: Field> Field for Blend<W, A, B> {
 /// `child(p + warp(p))`: a field sampled at warped points ([`Warp`] in whole blocks).
 ///
 /// Bounds: range the child's; bound the child's over the rectangle grown by the warp's
-/// amplitude; slope: the warped point moves by at most `(1 + sqrt(2) Lw) d + sqrt(2) Rw`
-/// ([`Warp::displacement_slope`]), so `Lc (1 + sqrt(2) Lw)` per block and `Lc sqrt(2) Rw + Rc`
-/// of jitter; fine from that slope ([`fine_from_slope`]).
+/// amplitude, with this field's own [`bound_from_slope`]; slope: the warped point moves by at
+/// most `(1 + sqrt(2) Lw) d + sqrt(2) Rw` ([`Warp::displacement_slope`]), so `Lc (1 + sqrt(2)
+/// Lw)` per block and `Lc sqrt(2) Rw + Rc` of jitter; fine from that slope
+/// ([`fine_from_slope`]).
+///
+/// The warped points of a grid are not a grid, so [`Field::grid`] evaluates the child point by
+/// point (the offsets themselves come from the warp's grid form). The cheap order puts the
+/// lattice outside: `LatticeField::new(k, Warped::new(warp, noise))` runs the warp and the noise
+/// only at the lattice points, while `Warped::new(warp, lattice)` reads up to 4 lattice points
+/// per block.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Warped<C> {
     child: C,
@@ -436,12 +446,13 @@ impl<C: Field> Field for Warped<C> {
     }
     fn bound(&self, rect: Rect) -> Span {
         let a = self.warp.amplitude();
-        self.child.bound(Rect::new(
+        let grown = self.child.bound(Rect::new(
             rect.x0 - a,
             rect.z0 - a,
             rect.x1 + a,
             rect.z1 + a,
-        ))
+        ));
+        grown.intersect(bound_from_slope(self, rect))
     }
     fn slope(&self) -> Slope {
         self.slope
