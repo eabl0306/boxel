@@ -2,10 +2,11 @@
 //! callable from any worker thread.
 //!
 //! The engine holds the mechanism: the [`WorldGenerator`] trait, [`FlatGenerator`] (layers), the
-//! integer noise ([`noise`], [`Frequency`]) that stays exact at any `i64` coordinate with its
-//! exact integer helpers ([`exact`]), and [`block`] to resolve block names. The terrains of a
-//! game (heightmaps, caves, trees) are its content: they implement [`WorldGenerator`] on top of
-//! this crate.
+//! integer noise ([`noise`], [`Frequency`]) that stays exact at any `i64` coordinate, the field
+//! combinators that carry their own bounds for the far LOD's margins ([`field`]) with their exact
+//! integer helpers ([`exact`]), and [`block`] to resolve block names. The terrains of a game
+//! (heightmaps, caves, trees) are its content: they implement [`WorldGenerator`] on top of this
+//! crate.
 //!
 //! [`lod`] is the far level of detail's side of a generator (ADR 0031): a [`LodSource`] samples
 //! coarse cells level by level, for terrain far beyond the full-detail view distance.
@@ -17,6 +18,7 @@ use boxel_voxel::{
 use std::ops::RangeInclusive;
 
 pub mod exact;
+pub mod field;
 pub mod lod;
 pub mod noise;
 

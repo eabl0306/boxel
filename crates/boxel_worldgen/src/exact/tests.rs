@@ -28,6 +28,10 @@ fn q16_rounds_up() {
         (Q16::MAX.times(0), Q16::MAX.mul_up(Q16::ZERO)),
         (0, Q16::ZERO)
     );
+    assert_eq!(div_ceil_sticky(u64::MAX, 4), u64::MAX);
+    assert_eq!(div_ceil_sticky(9, 4), 3);
+    assert_eq!(mul_shift_ceil(u64::MAX, 3, 16), u64::MAX);
+    assert_eq!(mul_shift_ceil(3, 5, 2), 4);
     assert_eq!(Q16::ONE.scale(1, 3).raw(), 21_846);
     assert!(Q16::from_f64(0.5).raw() >= 32_768);
     assert!(Q16::from_f64(1.0 / 3.0).to_f64() >= 1.0 / 3.0);

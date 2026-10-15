@@ -20,7 +20,8 @@
 //! `powf` and no other libm call, whose results may differ between platforms.
 //!
 //! [`Fbm::split_at`] cuts an fbm for the far LOD (the long octaves and a bound of the short
-//! ones), and [`Fbm::lipschitz`] bounds its slope.
+//! ones), and [`Fbm::lipschitz`] bounds its slope; the fields built on the noise
+//! ([`crate::field`]) carry those bounds.
 
 /// A noise frequency as an exact fraction: `num` lattice cells every `den` voxels.
 ///

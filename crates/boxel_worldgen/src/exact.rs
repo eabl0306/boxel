@@ -106,6 +106,19 @@ impl Q16 {
     }
 }
 
+/// `ceil(v / d)`, with `u64::MAX` (a saturated, unbounded value) kept as is. Panics if `d` is 0.
+pub(crate) const fn div_ceil_sticky(v: u64, d: u64) -> u64 {
+    if v == u64::MAX { v } else { v.div_ceil(d) }
+}
+
+/// `ceil(a * b / 2^shift)` (saturating; `u64::MAX` in `a` or `b` counts as unbounded).
+pub(crate) fn mul_shift_ceil(a: u64, b: u64, shift: u32) -> u64 {
+    if a != 0 && b != 0 && (a == u64::MAX || b == u64::MAX) {
+        return u64::MAX;
+    }
+    saturate((u128::from(a) * u128::from(b)).div_ceil(1 << shift))
+}
+
 /// `v` as a `u64`, saturated.
 #[inline]
 pub(crate) fn saturate(v: u128) -> u64 {
