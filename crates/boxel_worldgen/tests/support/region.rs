@@ -1,21 +1,22 @@
 //! Test content of the region generator (#119, #133), shared by `tests/region.rs`,
 //! `tests/region_lod.rs`, `tests/decoration.rs` and `benches/region.rs`: a `test:` Context with a
 //! base height, two parameters and a warp, test kinds that add relief to that base (also with
-//! bounds per chunk column), valleys carved by a shape modifier, the registries of a test world,
-//! and the hand-fused single-kind twin the bench compares against.
+//! bounds per chunk column), valleys carved by a shape modifier, a carver of holes under a roof,
+//! the registries of a test world, and the hand-fused single-kind twin the bench compares against.
 #![allow(dead_code, reason = "each user takes part of it")]
 
 use boxel_voxel::{
-    BlockPos, BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SIZE, ChunkData, ChunkKey,
+    BlockPos, BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SIZE, ChunkData, ChunkKey, Occupancy,
 };
 use boxel_worldgen::field::{Add, Field, LatticeField, NoiseField, Q16, Rect, Slope, Span};
-use boxel_worldgen::noise::{Basis, Fbm, Frequency, Warp, mix_seed};
+use boxel_worldgen::noise::{Basis, Fbm, Frequency, Warp, mix_seed, splitmix64};
 use boxel_worldgen::realm::{FluidRule, RealmForm, RealmLod, RealmSky, RealmSpan, RealmSpec};
+use boxel_worldgen::region::{CarveChunk, CarveMask, CarveReach, CarverStage};
 use boxel_worldgen::region::{CarveCorner, ShapeEffect, ShapeModifier, divide_tops};
 use boxel_worldgen::region::{
-    ChunkColumns, Context, Decoration, Entry, FillStage, FloorFill, HeightQ, Interval, KindGrid,
-    KindLimits, RegionGenerator, RegionSettings, RegionSpec, Rock, RuleEntry, Scope, SelectorRule,
-    Stages, SurfaceStage, TerrainKind, TopLayers, block_of, decorate,
+    ChunkColumns, ColumnsAround, Context, Decoration, Entry, FillStage, FloorFill, HeightQ,
+    Interval, KindGrid, KindLimits, RegionGenerator, RegionSettings, RegionSpec, Rock, RuleEntry,
+    Scope, SelectorRule, Stages, SurfaceStage, TerrainKind, TopLayers, block_of, decorate,
 };
 use boxel_worldgen::registry::{
     Checks, FreezeError, GenEntry, GenId, GenRegistry, GenRegistryBuilder, HashParams, ParamsHasher,
@@ -676,12 +677,162 @@ pub fn hooked_entries() -> Vec<(&'static str, Arc<dyn TerrainKind<TestContext>>)
         .collect()
 }
 
+/// A test carver: holes of 4 x 4 x 4 blocks, one cube in `one_in` by a hash of the cube, under a
+/// roof: nothing is carved within `roof` blocks under the lowest ground of the column and of its
+/// 4 neighbors `reads` blocks away. So its rules read the surface `roof` blocks deep over an
+/// apron of `reads`; it declares `reach`, right or wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Holes {
+    /// One cube in this many is a hole.
+    pub one_in: u64,
+    /// The roof, in blocks.
+    pub roof: u32,
+    /// How far it reads the neighbors' grounds.
+    pub reads: u32,
+    /// What it declares.
+    pub reach: CarveReach,
+}
+
+impl Holes {
+    /// Holes in one cube of `one_in` under a roof of `roof` over an apron of `reads`, declared
+    /// right.
+    pub const fn new(one_in: u64, roof: u32, reads: u32) -> Self {
+        Self {
+            one_in,
+            roof,
+            reads,
+            reach: CarveReach {
+                surface: roof,
+                apron: reads,
+            },
+        }
+    }
+
+    /// Whether the cube `(i, j, k)` (blocks `4 i..4 i + 4`...) is a hole under `seed`.
+    pub fn hole(&self, seed: u64, (i, j, k): (i64, i64, i64)) -> bool {
+        let h = splitmix64(
+            seed ^ splitmix64(i as u64)
+                ^ splitmix64(j as u64).rotate_left(21)
+                ^ splitmix64(k as u64).rotate_left(42),
+        );
+        h.is_multiple_of(self.one_in)
+    }
+
+    /// Per column of the chunk of `columns`, the lowest ground its rule reads: its chunk's own
+    /// columns, and the ring of its apron through [`ChunkColumns::tops`], 4 strips (as a cave
+    /// stage asks for its water shell).
+    fn lowest<Cx: Context>(&self, columns: &ChunkColumns<'_, Cx>) -> Vec<i64> {
+        let (o, r) = (columns.origin, i64::from(self.reads));
+        let side = 32 + 2 * r;
+        let mut ground = vec![0; (side * side) as usize];
+        for (c, &g) in columns.ground.iter().enumerate() {
+            let (x, z) = (r + (c >> 5) as i64, r + (c & 31) as i64);
+            ground[(x * side + z) as usize] = g;
+        }
+        if r > 0 {
+            // The -x and +x strips over the whole side, then the -z and +z ones between them.
+            let strips = [
+                (0, r, 0, side),
+                (32 + r, side, 0, side),
+                (r, 32 + r, 0, r),
+                (r, 32 + r, 32 + r, side),
+            ];
+            for (x0, x1, z0, z1) in strips {
+                let xs: Vec<i64> = (x0..x1).map(|x| o.x - r + x).collect();
+                let zs: Vec<i64> = (z0..z1).map(|z| o.z - r + z).collect();
+                let n = xs.len() * zs.len();
+                let (mut g, mut f) = (vec![0; n], vec![0; n]);
+                columns.tops(&xs, &zs, &mut g, &mut f);
+                for (i, x) in (x0..x1).enumerate() {
+                    for (j, z) in (z0..z1).enumerate() {
+                        ground[(x * side + z) as usize] = g[i * zs.len() + j];
+                    }
+                }
+            }
+        }
+        let at = |x: i64, z: i64| ground[(x * side + z) as usize];
+        (0..CHUNK_AREA as i64)
+            .map(|c| {
+                let (x, z) = (r + (c >> 5), r + (c & 31));
+                at(x, z)
+                    .min(at(x - r, z))
+                    .min(at(x + r, z))
+                    .min(at(x, z - r))
+                    .min(at(x, z + r))
+            })
+            .collect()
+    }
+}
+
+impl HashParams for Holes {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&self.one_in)
+            .write(&self.roof)
+            .write(&self.reads)
+            .write(&self.reach.surface)
+            .write(&self.reach.apron);
+    }
+}
+
+impl GenEntry for Holes {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+
+impl<Cx: Context> CarverStage<Cx> for Holes {
+    fn reach(&self) -> CarveReach {
+        self.reach
+    }
+    fn carve(&self, chunk: &CarveChunk<'_, Cx>) -> CarveMask {
+        let o = chunk.origin;
+        let lowest = chunk.columns.map(|c| self.lowest(c));
+        let roof = i64::from(self.roof);
+        let mut keep: Box<Occupancy> = Box::new([u32::MAX; CHUNK_AREA]);
+        for n in 0..512 {
+            let (ci, cj, ck) = (n >> 6, (n >> 3) & 7, n & 7);
+            if !self.hole(
+                chunk.seed,
+                ((o.x >> 2) + ci, (o.y >> 2) + cj, (o.z >> 2) + ck),
+            ) {
+                continue;
+            }
+            for ly in 4 * cj..4 * cj + 4 {
+                for lx in 4 * ci..4 * ci + 4 {
+                    let word = &mut keep[(ly * 32 + lx) as usize];
+                    for lz in 4 * ck..4 * ck + 4 {
+                        let under_roof = lowest
+                            .as_ref()
+                            .is_none_or(|low| o.y + ly <= low[(lx * 32 + lz) as usize] - roof);
+                        if under_roof {
+                            *word &= !(1 << lz);
+                        }
+                    }
+                }
+            }
+        }
+        CarveMask::of(keep)
+    }
+    fn block_names(&self) -> Vec<&str> {
+        Vec::new()
+    }
+}
+
 /// The FNV fingerprint of a chunk's states.
 pub fn fingerprint(chunk: &ChunkData) -> u64 {
     let mut dense = vec![BlockState::AIR; boxel_voxel::CHUNK_VOLUME];
     chunk.to_dense(&mut dense);
     let bytes: Vec<u8> = dense.iter().flat_map(|s| s.0.to_le_bytes()).collect();
     boxel_worldgen::registry::fnv1a64(&bytes)
+}
+
+/// The columns around a chunk of a stage that reads none (the twin's surface).
+pub struct NoApron;
+
+impl ColumnsAround for NoApron {
+    fn tops(&self, _: &[i64], _: &[i64], _: &mut [i64], _: &mut [i64]) {
+        unreachable!("the twin's stages read no column outside their chunk")
+    }
 }
 
 /// A hand-fused single-kind generator: the region generator of a map with one kind, written
@@ -790,16 +941,11 @@ impl Twin {
         let stages = Stages {
             fill: &self.fill as &dyn FillStage<TestContext>,
             surface: &self.surface as &dyn SurfaceStage<TestContext>,
+            carvers: &[],
             floor: solid,
             fluid: registry.by_name("test:fluid").expect("test:fluid"),
         };
-        let columns = ChunkColumns {
-            origin,
-            ground: &ground,
-            fluid_top: &fluid_top,
-            cx: &self.cx,
-            fields: &fields,
-        };
+        let columns = ChunkColumns::new(origin, &ground, &fluid_top, &self.cx, &fields, &NoApron);
         decorate(&columns, &stages, registry)
     }
 }

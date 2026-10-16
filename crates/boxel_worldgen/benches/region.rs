@@ -11,6 +11,11 @@
 //! `kind_heights_*`, `context_grid` and `region_heights_*` split a chunk's cost: one kind's
 //! heights over a chunk column, the Context's fields, and the blended heights of the chunk column.
 //!
+//! `carve_*` (#133): the test world with the test carver (holes of 4 blocks, one cube in 5, under
+//! a roof of 6 over an apron of 3, `support/region.rs`) on the interior column: a deep chunk (the
+//! fill and the mask, 1 bit), the ground's chunk (the column stage, the carver reading its apron),
+//! and the carver's own mask without columns (what the deep chunk pays for the carver itself).
+//!
 //! Budgets: selection 0.5 us warm, 2 us cold amortized; interior chunks at most 5 % over the twin;
 //! on a border column the machinery (selection and blend: `region_heights_border` less
 //! `region_heights_interior` and one `kind_heights_*` per extra kind) at most 4 us per extra kind;
@@ -21,10 +26,12 @@ mod support;
 use boxel_voxel::{ChunkKey, ChunkPos};
 use boxel_worldgen::WorldGenerator;
 use boxel_worldgen::region::{
-    Context, KindGrid, RegionGenerator, RegionSettings, TerrainKind, clear_worker_memo,
+    CarveChunk, CarverStage, Context, KindGrid, RegionGenerator, RegionSettings, TerrainKind,
+    clear_worker_memo,
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use support::*;
 
@@ -166,6 +173,45 @@ fn bench(c: &mut Criterion) {
             bounds
         );
     }
+
+    // The carver, on the interior column.
+    let holes = Holes::new(5, 6, 3);
+    let carved = generator_with(
+        &world,
+        SEED,
+        RegionSettings::default(),
+        decoration().with_carver(id("test:holes"), Arc::new(holes)),
+    );
+    let (cx, cz) = find(&carved, (40, -40), 1);
+    let ground = carved.column_info(cx << 5, cz << 5).ground;
+    let bounds = carved.local_bounds(cx, cz);
+    let (deep, surface) = (
+        key(cx, (bounds.deep >> 5) - 1, cz),
+        key(cx, ground >> 5, cz),
+    );
+    c.bench_function("carve_deep_interior", |b| {
+        b.iter(|| carved.generate(black_box(deep), &registry));
+    });
+    c.bench_function("carve_surface_interior", |b| {
+        b.iter(|| carved.generate(black_box(surface), &registry));
+    });
+    let solid = registry.by_name("test:solid").expect("test:solid");
+    let fluid = registry.by_name("test:fluid").expect("test:fluid");
+    c.bench_function("carve_mask_deep", |b| {
+        b.iter(|| {
+            let chunk = CarveChunk {
+                cx: carved.context(),
+                seed: SEED,
+                origin: black_box(deep).pos.origin(),
+                columns: None,
+                floor: solid,
+                fluid,
+                registry: &registry,
+            };
+            CarverStage::<TestContext>::carve(&holes, &chunk)
+        });
+    });
+    eprintln!("carved interior column ({cx}, {cz}): ground {ground}, {bounds:?}");
 }
 
 criterion_group!(benches, bench);

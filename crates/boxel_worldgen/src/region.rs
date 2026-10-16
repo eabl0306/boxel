@@ -8,9 +8,10 @@
 //! - [`SelectorRule`] and [`RuleEntry`]: the region map (game data; mods add rules and entries).
 //!   The selector is the only place a kind is chosen.
 //! - [`blend`]: the exact integer weights and blend.
-//! - [`ShapeModifier`], [`FillStage`] and [`SurfaceStage`]: the decoration hook, with
-//!   [`decorate`]. Kinds and modifiers give bounds per chunk column
-//!   ([`TerrainKind::column_bounds`], [`ShapeModifier::column_effect`]).
+//! - [`ShapeModifier`], [`FillStage`], [`SurfaceStage`] and [`CarverStage`]: the decoration
+//!   hook, with [`decorate`]. Kinds and modifiers give bounds per chunk column
+//!   ([`TerrainKind::column_bounds`], [`ShapeModifier::column_effect`]) and a stage may read the
+//!   columns around its chunk as far as it declares ([`ChunkColumns::tops`]).
 //! - [`RegionGenerator`]: one realm, built at world open from the registries, with the freeze
 //!   checks of its rules and kinds, and its far LOD: the region pass, one [`LodSource`] for the
 //!   whole realm (ADR 0039 sec. 10).
@@ -22,7 +23,7 @@
 //! world opened after another on the same workers never reads the first one's.
 //!
 //! Not built yet: core terms, volumes and the other realm forms (WG-VOLUME, WG-CAVERN), the biome
-//! table and the rest of the decoration layer.
+//! table and the rest of the decoration layer (features, structures, post steps).
 //!
 //! [`LodSource`]: crate::lod::LodSource
 
@@ -43,7 +44,8 @@ pub use check::{border_relief, check_kinds, check_modifiers, slope_passes};
 #[cfg(feature = "test-support")]
 pub use check_lod::{CORNER_STEP, LodReport, check_lod, lod_corners, lod_memo_bytes};
 pub use decorate::{
-    ChunkColumns, Decoration, FillStage, FloorFill, LOD_TOP_RUNS, LodColumns, LodTop, NoSurface,
+    CarveChunk, CarveMask, CarveReach, CarverStage, ChunkColumns, ColumnsAround, Decoration,
+    FillStage, FloorFill, LOD_TOP_RUNS, LodColumns, LodTop, MAX_APRON, NoSurface, RealmCarver,
     Rock, Stages, SurfaceReach, SurfaceStage, TopLayers, decorate,
 };
 pub use dimension::{DimensionGenerator, REALM_GENERATOR};

@@ -239,6 +239,13 @@ pub enum Problem {
         /// The lattice's `log2` spacing.
         lattice: u32,
     },
+    /// A carver whose apron is wider than [`MAX_APRON`](crate::region::MAX_APRON).
+    CarverApron {
+        /// The carver.
+        carver: GenId,
+        /// Its apron, in blocks.
+        apron: u32,
+    },
     /// A check the engine does not define (the game's own), with its ids and message.
     Other {
         /// The ids the problem involves.
@@ -291,6 +298,7 @@ impl Problem {
                 .chain(modifiers)
                 .chain(kinds)
                 .collect(),
+            Self::CarverApron { carver, .. } => vec![carver],
             Self::Overlap { dimension, a, b } => vec![dimension, a, b],
             Self::Gap {
                 dimension,
@@ -553,6 +561,11 @@ impl fmt::Display for Problem {
                     q(*added),
                 )
             }
+            Self::CarverApron { carver, apron } => write!(
+                f,
+                "carver {carver} declares an apron of {apron} blocks, over {} (one chunk)",
+                crate::region::MAX_APRON
+            ),
             Self::Other { message, .. } => f.write_str(message),
         }
     }

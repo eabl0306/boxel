@@ -2,7 +2,8 @@
 
 use super::blend::{self, WINDOW_POINTS, Window};
 use super::decorate::{
-    ChunkColumns, Decoration, FillStage, Rock, Stages, SurfaceReach, SurfaceStage,
+    CarveReach, ChunkColumns, ColumnsAround, Decoration, FillStage, MAX_APRON, RealmCarver, Stages,
+    SurfaceReach, SurfaceStage,
 };
 use super::kind::{Context, HeightQ, KindGrid, TerrainKind, block_of};
 use super::memo::{self, Point, WindowKinds, WindowPoints};
@@ -98,7 +99,9 @@ pub struct LocalBounds {
     /// is `Uniform` air, after the selection reads.
     pub top: i64,
     /// A chunk whose highest block is at or under this one lies under every column's surface
-    /// stage: it takes the deep path, the fill alone, without the column stage.
+    /// stage and every carver's surface reach ([`CarveReach::surface`], under the lowest ground
+    /// of the chunk column and of its carvers' apron): it takes the deep path, the fill and the
+    /// carvers without columns, without the column stage.
     pub deep: i64,
 }
 
@@ -156,6 +159,10 @@ pub struct RegionGenerator<Cx: Context> {
     fill: Arc<dyn FillStage<Cx>>,
     pub(super) surface: Arc<dyn SurfaceStage<Cx>>,
     pub(super) reach: SurfaceReach,
+    /// In the order they run.
+    carvers: Box<[RealmCarver<Cx>]>,
+    /// The carvers' widest surface reach and apron, `None` without carvers.
+    carve: Option<CarveReach>,
     digest: RegistryDigest,
     vertical: RangeInclusive<i64>,
 }
@@ -164,13 +171,14 @@ impl<Cx: Context> RegionGenerator<Cx> {
     /// The generator of `spec.realm`, with the Context `context` builds from the realm's seed,
     /// or `None` with every problem recorded in `checks`: the realm, the rules and entries the
     /// realm reaches, their kinds and parameters, the kinds' forms, limits, slopes and border
-    /// reliefs, the shape modifiers' slopes on top of them ([`check_modifiers`]), every added
-    /// entry that names a missing rule ([`check_rule_entries`]), and every
-    /// block name the realm (its floor and fluid) and its stages use
-    /// ([`Problem::UnknownBlock`](crate::registry::Problem::UnknownBlock), so a typo fails at
-    /// world open and never in a worker). Its digest lines ([`RegionGenerator::digest`]) are
-    /// those of the realm: the realm, its `region` settings, its `context`, its rules and
-    /// entries, its kinds and its stages.
+    /// reliefs, the shape modifiers' slopes on top of them ([`check_modifiers`]), the stages'
+    /// ids (each once) and the carvers' aprons ([`MAX_APRON`]), every added entry that names a
+    /// missing rule ([`check_rule_entries`]), and every block name the realm (its floor and
+    /// fluid) and its stages use ([`Problem::UnknownBlock`](crate::registry::Problem::UnknownBlock),
+    /// so a typo fails at world open and never in a worker). Its digest lines
+    /// ([`RegionGenerator::digest`]) are those of the realm: the realm, its `region` settings,
+    /// its `context`, its rules and entries, its kinds and its stages (`fill_stage`,
+    /// `surface_stage`, one `shape_modifier` and one `carver_stage` per modifier and carver).
     ///
     /// [`check_modifiers`]: super::check_modifiers
     ///
@@ -232,6 +240,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
             fill,
             surface,
             mut modifiers,
+            mut carvers,
         } = decoration;
         for name in fill.1.block_names() {
             checks.block(blocks, name, &fill.0);
@@ -252,23 +261,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
                 surface.1.version(),
                 hash_params(&*surface.1),
             ));
-        // By `(phase, priority, id)`, as a registry orders its entries: the higher priority first.
-        modifiers.sort_by(|(a, ma), (b, mb)| {
-            let key = |m: &Arc<dyn ShapeModifier<Cx>>| {
-                let o = m.order();
-                (o.phase, std::cmp::Reverse(o.priority))
-            };
-            key(ma).cmp(&key(mb)).then_with(|| a.cmp(b))
-        });
-        let mut ids: Vec<&GenId> = modifiers.iter().map(|(id, _)| id).collect();
-        ids.sort();
-        for run in ids.chunk_by(|a, b| a == b).filter(|r| r.len() > 1) {
-            checks.push(Problem::Duplicate {
-                registry: "shape_modifier",
-                id: run[0].clone(),
-                count: run.len(),
-            });
-        }
+        sort_stages(checks, "shape_modifier", &mut modifiers);
         let modifiers: Vec<RealmModifier<Cx>> = modifiers
             .into_iter()
             .map(|(id, modifier)| {
@@ -290,6 +283,37 @@ impl<Cx: Context> RegionGenerator<Cx> {
             .collect();
         let lower = modifiers.iter().map(|m| i64::from(m.effect.lower())).sum();
         let raise = modifiers.iter().map(|m| i64::from(m.effect.raise())).sum();
+        sort_stages(checks, "carver_stage", &mut carvers);
+        let carvers: Vec<RealmCarver<Cx>> = carvers
+            .into_iter()
+            .map(|(id, stage)| {
+                for name in stage.block_names() {
+                    checks.block(blocks, name, &id);
+                }
+                let reach = stage.reach();
+                if reach.apron > MAX_APRON {
+                    checks.push(Problem::CarverApron {
+                        carver: id.clone(),
+                        apron: reach.apron,
+                    });
+                }
+                let mut params = ParamsHasher::new();
+                params.write(&stage.order()).write(&*stage);
+                digest.push(line("carver_stage", &id, stage.version(), params.finish()));
+                RealmCarver {
+                    seed: id.seed(realm_seed),
+                    id,
+                    stage,
+                }
+            })
+            .collect();
+        let carve = carvers
+            .iter()
+            .map(|c| c.stage.reach())
+            .reduce(|a, b| CarveReach {
+                surface: a.surface.max(b.surface),
+                apron: a.apron.max(b.apron),
+            });
         // Once per world would do; a problem two realms find is reported once.
         check_rule_entries(checks, rules, entries);
         let resolved = select::resolve(
@@ -343,6 +367,8 @@ impl<Cx: Context> RegionGenerator<Cx> {
             fill: fill.1,
             surface: surface.1,
             reach,
+            carvers: carvers.into(),
+            carve,
             digest: digest.finish(),
             vertical,
         })
@@ -450,7 +476,8 @@ impl<Cx: Context> RegionGenerator<Cx> {
 
     /// The last window of the memo, if it is in the lattice cell of chunk column `column`: its
     /// points and the column's bounds, which it computes from the cell's kinds when the last one
-    /// was another chunk column of the cell.
+    /// was another chunk column of the cell (`None` when they need another cell's window: a
+    /// carver's apron across the cell's border).
     fn last_window<R>(&self, column: (i64, i64), f: impl FnOnce(&memo::Last) -> R) -> Option<R> {
         if !self.memo {
             return None;
@@ -459,7 +486,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
         memo::with_last(self.key, |last| {
             let last = last.as_mut().filter(|l| l.cell == cell)?;
             if last.column != column {
-                last.bounds = self.bounds_of(column, &last.kinds);
+                last.bounds = self.bounds_in_cell(column, &last.kinds)?;
                 last.column = column;
             }
             Some(f(last))
@@ -538,9 +565,62 @@ impl<Cx: Context> RegionGenerator<Cx> {
     }
 
     /// The bounds of chunk column `column` (in chunks), whose lattice cell's window holds
-    /// `kinds`.
+    /// `kinds`; a carver's apron across the cell's border reads the windows of the cells it
+    /// reaches.
     fn bounds_of(&self, column: (i64, i64), kinds: &WindowKinds) -> LocalBounds {
-        let (lo, hi) = self.ground_span(chunk_rect(column), kinds);
+        let area = chunk_rect(column);
+        let span = self.ground_span(area, kinds);
+        let apron = self.carve.filter(|c| c.apron > 0).map(|c| {
+            let a = i64::from(c.apron);
+            let wide = Rect::new(area.x0 - a, area.z0 - a, area.x1 + a, area.z1 + a);
+            let (s, own) = (self.shift, self.cell_of(column));
+            let mut lo = i64::MAX;
+            for i in wide.x0 >> s..=wide.x1 >> s {
+                for j in wide.z0 >> s..=wide.z1 >> s {
+                    let part = Rect::new(
+                        (i << s).max(wide.x0),
+                        (j << s).max(wide.z0),
+                        (((i + 1) << s) - 1).min(wide.x1),
+                        (((j + 1) << s) - 1).min(wide.z1),
+                    );
+                    let span = if (i, j) == own {
+                        self.ground_span(part, kinds)
+                    } else {
+                        self.ground_span(part, &WindowKinds::of(&self.points((i, j))))
+                    };
+                    lo = lo.min(span.0);
+                }
+            }
+            lo
+        });
+        self.assemble(span, apron)
+    }
+
+    /// [`RegionGenerator::bounds_of`] from the kinds of the chunk column's own lattice cell alone,
+    /// `None` if a carver's apron reaches another cell (it reads that cell's window, from the
+    /// memo).
+    fn bounds_in_cell(&self, column: (i64, i64), kinds: &WindowKinds) -> Option<LocalBounds> {
+        let area = chunk_rect(column);
+        let span = self.ground_span(area, kinds);
+        let apron = match self.carve.filter(|c| c.apron > 0) {
+            None => None,
+            Some(c) => {
+                let a = i64::from(c.apron);
+                let wide = Rect::new(area.x0 - a, area.z0 - a, area.x1 + a, area.z1 + a);
+                let s = self.shift;
+                let inside = wide.x0 >> s == wide.x1 >> s && wide.z0 >> s == wide.z1 >> s;
+                if !inside {
+                    return None;
+                }
+                Some(self.ground_span(wide, kinds).0)
+            }
+        };
+        Some(self.assemble(span, apron))
+    }
+
+    /// The bounds of a chunk column whose heights span `(lo, hi)` (in [`HeightQ`], unclamped),
+    /// with the lowest height `apron` of the carvers' apron around it, if they have one.
+    fn assemble(&self, (lo, hi): (i64, i64), apron: Option<i64>) -> LocalBounds {
         let spec = self.spec();
         let block = |h: i64| block_of(spec.datum, clamp_height(h));
         let (ground_lo, ground_hi) = (block(lo), block(hi));
@@ -550,11 +630,16 @@ impl<Cx: Context> RegionGenerator<Cx> {
         {
             top = top.max(level);
         }
+        let mut deep = ground_lo.saturating_sub(self.reach.depth.into());
+        if let Some(carve) = self.carve {
+            let lowest = apron.map_or(ground_lo, |a| ground_lo.min(block(a)));
+            deep = deep.min(lowest.saturating_sub(carve.surface.into()));
+        }
         LocalBounds {
             ground_lo,
             ground_hi,
             top,
-            deep: ground_lo.saturating_sub(self.reach.depth.into()),
+            deep,
         }
     }
 
@@ -718,6 +803,54 @@ impl<Cx: Context> RegionGenerator<Cx> {
         self.heights_in((&xs, &zs), &fields, &points, area, out);
     }
 
+    /// The grounds and fluid tops of the columns of the grid `xs` x `zs` (point `i * zs.len() +
+    /// j`), bit for bit as their own chunks compute them, however many lattice cells and chunk
+    /// columns the grid crosses (each column with its own lattice cell's window): what a stage
+    /// reads of the columns around its chunk ([`ChunkColumns::tops`]).
+    ///
+    /// # Panics
+    ///
+    /// If `ground` or `fluid_top` is not one entry per column of the grid.
+    pub fn column_tops(&self, xs: &[i64], zs: &[i64], ground: &mut [i64], fluid_top: &mut [i64]) {
+        let n = xs.len() * zs.len();
+        assert!(
+            ground.len() == n && fluid_top.len() == n,
+            "{NAME}::column_tops: one ground and one fluid top per column"
+        );
+        let level = self.fluid_level();
+        let datum = self.spec().datum;
+        let (ci, cj) = (cells_of(xs, self.shift), cells_of(zs, self.shift));
+        let (mut sx, mut sz, mut h) = (Vec::new(), Vec::new(), Vec::new());
+        for (i, xi) in &ci {
+            sx.clear();
+            sx.extend(xi.iter().map(|&a| xs[a]));
+            for (j, zj) in &cj {
+                sz.clear();
+                sz.extend(zj.iter().map(|&b| zs[b]));
+                let fields = self.cx.grid(&sx, &sz);
+                h.clear();
+                h.resize(sx.len() * sz.len(), 0);
+                self.heights_in((&sx, &sz), &fields, &self.points((*i, *j)), None, &mut h);
+                for (row, &a) in h.chunks_exact(sz.len()).zip(xi) {
+                    for (&h, &b) in row.iter().zip(zj) {
+                        let g = block_of(datum, h);
+                        ground[a * zs.len() + b] = g;
+                        fluid_top[a * zs.len() + b] = if g < level { level } else { g };
+                    }
+                }
+            }
+        }
+    }
+
+    /// The `y` of the realm's fluid level (`FluidRule::top`, with the rule read once): `i64::MIN`
+    /// without fluid.
+    fn fluid_level(&self) -> i64 {
+        match self.spec().fluid {
+            FluidRule::SeaLevel { level, .. } => level,
+            FluidRule::None => i64::MIN,
+        }
+    }
+
     /// The dominant kind of column `(x, z)`: the largest blend weight, ties to the smaller id
     /// (the biome table's input). Selection reads only, no height.
     pub fn dominant_kind(&self, x: i64, z: i64) -> &GenId {
@@ -760,7 +893,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
 
     /// The chunk at `key` through the column stage, without the fast paths over the local top
     /// and under the deep bound: what [`WorldGenerator::generate`] must equal, for tests of a
-    /// realm's bounds (a game's or a mod's kinds and modifiers included).
+    /// realm's bounds (a game's or a mod's kinds, modifiers and carvers included).
     pub fn generate_full(&self, key: ChunkKey, registry: &BlockRegistry) -> ChunkData {
         let origin = key.pos.origin();
         if !self.spec().span.contains(origin.y) {
@@ -768,6 +901,25 @@ impl<Cx: Context> RegionGenerator<Cx> {
         }
         let window = self.window((key.pos.x, key.pos.z));
         self.column_stage(origin, &window, registry)
+    }
+
+    /// The stages of a chunk, with the realm's floor and fluid states (the fluid only where the
+    /// chunk may hold it: a deep chunk reads it only to carve around it).
+    fn stages(&self, registry: &BlockRegistry, deep: bool) -> Stages<'_, Cx> {
+        let spec = self.spec();
+        let fluid = match &spec.fluid {
+            FluidRule::SeaLevel { fluid, .. } if !deep || !self.carvers.is_empty() => {
+                block(registry, fluid, NAME)
+            }
+            _ => BlockState::AIR,
+        };
+        Stages {
+            fill: &*self.fill,
+            surface: &*self.surface,
+            carvers: &self.carvers,
+            floor: block(registry, &spec.floor, NAME),
+            fluid,
+        }
     }
 
     /// The chunk at `origin` from its columns.
@@ -787,33 +939,14 @@ impl<Cx: Context> RegionGenerator<Cx> {
         self.heights_in((&xs, &zs), &fields, points, area, &mut h);
         let spec = self.spec();
         let ground = h.map(|h| block_of(spec.datum, h));
-        // `FluidRule::top`, with the rule read once.
-        let level = match spec.fluid {
-            FluidRule::SeaLevel { level, .. } => level,
-            FluidRule::None => i64::MIN,
-        };
+        let level = self.fluid_level();
         let fluid_top = ground.map(|g| if g < level { level } else { g });
         if cfg!(debug_assertions) {
             self.check_grounds(origin, points, bounds, &ground);
         }
-        let fluid = match &spec.fluid {
-            FluidRule::SeaLevel { fluid, .. } => block(registry, fluid, NAME),
-            FluidRule::None => BlockState::AIR,
-        };
-        let stages = Stages {
-            fill: &*self.fill,
-            surface: &*self.surface,
-            floor: block(registry, &spec.floor, NAME),
-            fluid,
-        };
-        let columns = ChunkColumns {
-            origin,
-            ground: &ground,
-            fluid_top: &fluid_top,
-            cx: &self.cx,
-            fields: &fields,
-        };
-        let chunk = super::decorate::decorate(&columns, &stages, registry);
+        let around = Around(self);
+        let columns = ChunkColumns::new(origin, &ground, &fluid_top, &self.cx, &fields, &around);
+        let chunk = super::decorate::decorate(&columns, &self.stages(registry, false), registry);
         if cfg!(debug_assertions) {
             self.check_top(origin, bounds, &chunk);
             self.check_vertical((origin.x, origin.z), bounds);
@@ -821,14 +954,9 @@ impl<Cx: Context> RegionGenerator<Cx> {
         chunk
     }
 
-    /// The deep path: the fill alone.
+    /// The deep path: the fill alone, carved by the carvers without columns.
     fn deep(&self, origin: BlockPos, registry: &BlockRegistry) -> ChunkData {
-        let floor = block(registry, &self.spec().floor, NAME);
-        let mut out = Vec::new();
-        match self.fill.rock(&self.cx, origin, floor, registry, &mut out) {
-            Rock::Uniform(state) => ChunkData::uniform(state),
-            Rock::Dense => ChunkData::from_dense(&out),
-        }
+        super::decorate::deep(&self.cx, origin, &self.stages(registry, true), registry)
     }
 
     /// The debug span check of the grounds: each lies between the bounds of its chunk column.
@@ -937,6 +1065,55 @@ pub fn check_realm_blocks(
     if let FluidRule::SeaLevel { fluid, .. } = &spec.fluid {
         checks.block(blocks, fluid, realm);
     }
+}
+
+/// Sorts the stages of one phase of a decoration by `(phase, priority, id)`, as a registry orders
+/// its entries (the higher priority first), and records in `checks` every id given more than once
+/// (`registry` names the kind of stage).
+fn sort_stages<T: GenEntry + ?Sized>(
+    checks: &mut Checks,
+    registry: &'static str,
+    stages: &mut [(GenId, Arc<T>)],
+) {
+    stages.sort_by(|(a, sa), (b, sb)| {
+        let key = |s: &Arc<T>| {
+            let o = s.order();
+            (o.phase, std::cmp::Reverse(o.priority))
+        };
+        key(sa).cmp(&key(sb)).then_with(|| a.cmp(b))
+    });
+    let mut ids: Vec<&GenId> = stages.iter().map(|(id, _)| id).collect();
+    ids.sort();
+    for run in ids.chunk_by(|a, b| a == b).filter(|r| r.len() > 1) {
+        checks.push(Problem::Duplicate {
+            registry,
+            id: run[0].clone(),
+            count: run.len(),
+        });
+    }
+}
+
+/// The columns around a chunk, from the generator ([`RegionGenerator::column_tops`]).
+struct Around<'g, Cx: Context>(&'g RegionGenerator<Cx>);
+
+impl<Cx: Context> ColumnsAround for Around<'_, Cx> {
+    fn tops(&self, xs: &[i64], zs: &[i64], ground: &mut [i64], fluid_top: &mut [i64]) {
+        self.0.column_tops(xs, zs, ground, fluid_top);
+    }
+}
+
+/// The lattice cells of the coordinates `v` on a lattice of `2^shift`, each with the indices of
+/// its coordinates, in the order the cells first appear.
+fn cells_of(v: &[i64], shift: u32) -> Vec<(i64, Vec<usize>)> {
+    let mut cells: Vec<(i64, Vec<usize>)> = Vec::new();
+    for (n, &c) in v.iter().enumerate() {
+        let cell = c >> shift;
+        match cells.iter_mut().find(|(k, _)| *k == cell) {
+            Some((_, at)) => at.push(n),
+            None => cells.push((cell, vec![n])),
+        }
+    }
+    cells
 }
 
 /// The 16 lattice points of the window of lattice cell `(i0, j0)`: point `a * 4 + b` at
