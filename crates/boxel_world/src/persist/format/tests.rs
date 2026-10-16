@@ -85,6 +85,24 @@ proptest! {
         let _ = decode_ticks(&bytes);
         let _ = decode_clock(&bytes);
         let _ = decode_entity(&bytes);
+        let _ = decode_worldgen(&bytes);
+    }
+
+    /// A world generation record whose checksum holds over any payload, or over a good one with
+    /// bytes changed, reads or is an error: never a panic.
+    #[test]
+    fn sealed_worldgen_payloads_are_errors_not_panics(
+        bytes in proptest::collection::vec(any::<u8>(), 0..300),
+        edits in proptest::collection::vec((any::<usize>(), any::<u8>()), 1..8),
+    ) {
+        let _ = decode_worldgen(&seal(WORLDGEN_MAGIC, WORLDGEN_VERSION, &bytes));
+        let good = encode_worldgen(&worldgen_record());
+        let mut payload = open(WORLDGEN_MAGIC, WORLDGEN_VERSION, &good).unwrap();
+        for (at, b) in edits {
+            let at = at % payload.len();
+            payload[at] = b;
+        }
+        let _ = decode_worldgen(&seal(WORLDGEN_MAGIC, WORLDGEN_VERSION, &payload));
     }
 
     /// Entity keys: a chunk's entities are one range, in id order, between the chunk's
@@ -559,5 +577,43 @@ fn any_damage_to_a_worldgen_record_is_an_error() {
     assert_eq!(
         decode_worldgen(&seal(WORLDGEN_MAGIC, WORLDGEN_VERSION, &payload)),
         Err(FormatError::Damaged("an invalid world generation id"))
+    );
+}
+
+/// The payload of a record with the preset line of [`worldgen_record`] and the dimension name
+/// table `names`, then no dimension.
+fn worldgen_with_names(names: &[String]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    put_line(&mut payload, &worldgen_record().preset);
+    put_varint(&mut payload, names.len() as u64);
+    for name in names {
+        put_str(&mut payload, name);
+    }
+    put_varint(&mut payload, 0);
+    seal(WORLDGEN_MAGIC, WORLDGEN_VERSION, &payload)
+}
+
+#[test]
+fn a_worldgen_name_table_holds_each_dimension_once_and_fits_its_numbers() {
+    let names: Vec<String> = (0..MAX_DIMENSIONS).map(|n| format!("test:d{n}")).collect();
+    let full = decode_worldgen(&worldgen_with_names(&names)).unwrap();
+    assert_eq!(full.names.len(), MAX_DIMENSIONS);
+    assert_eq!(full.number("test:d65535"), Some(DimensionId(u16::MAX)));
+    // One more name has no number to go with it.
+    let mut over = names.clone();
+    over.push("test:over".to_string());
+    assert_eq!(
+        decode_worldgen(&worldgen_with_names(&over)),
+        Err(FormatError::Damaged("count out of range"))
+    );
+    // A name twice would give two numbers to one dimension.
+    let twice = [
+        "test:a".to_string(),
+        "test:b".to_string(),
+        "test:a".to_string(),
+    ];
+    assert_eq!(
+        decode_worldgen(&worldgen_with_names(&twice)),
+        Err(FormatError::Damaged("a dimension named twice in the table"))
     );
 }

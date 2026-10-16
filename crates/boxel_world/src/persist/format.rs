@@ -14,7 +14,7 @@
 use boxel_voxel::{
     BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, ChunkKey, ChunkPos, DimensionId, Paletted,
 };
-use boxel_worldgen::preset::{DimensionRecord, SpecLine, WorldgenRecord};
+use boxel_worldgen::preset::{DimensionRecord, MAX_DIMENSIONS, SpecLine, WorldgenRecord};
 use boxel_worldgen::realm::RealmSpan;
 use boxel_worldgen::registry::{DigestEntry, DigestScope, GenId, RegistryDigest};
 use std::borrow::Cow;
@@ -809,19 +809,28 @@ pub fn encode_worldgen(record: &WorldgenRecord) -> Vec<u8> {
 }
 
 /// The inverse of [`encode_worldgen`]. Another record version is [`FormatError::Version`].
+///
+/// Total over any bytes, also with a checksum that holds: a count only bounds the loop that
+/// reads it (nothing is reserved from it, so a damaged count allocates no more than the items
+/// actually read), and the dimension name table holds each name once and at most
+/// [`MAX_DIMENSIONS`] of them, the numbers a dimension can have.
 pub fn decode_worldgen(bytes: &[u8]) -> Result<WorldgenRecord, FormatError> {
     let payload = open(WORLDGEN_MAGIC, WORLDGEN_VERSION, bytes)?;
     let max = payload.len();
     let mut r = Reader::new(&payload);
     let preset = r.line(max)?;
-    let n = r.count(max)?;
+    let n = r.count(max.min(MAX_DIMENSIONS))?;
     let names = (0..n).map(|_| r.id(max)).collect::<Result<Vec<_>, _>>()?;
+    let mut seen = std::collections::HashSet::with_capacity(names.len());
+    if !names.iter().all(|name| seen.insert(name.as_str())) {
+        return Err(FormatError::Damaged("a dimension named twice in the table"));
+    }
     let n = r.count(max)?;
-    let mut dimensions = Vec::with_capacity(n);
+    let mut dimensions = Vec::new();
     for _ in 0..n {
         let id = r.id(max)?;
         let n = r.count(max)?;
-        let mut realms = Vec::with_capacity(n);
+        let mut realms = Vec::new();
         for _ in 0..n {
             realms.push((r.id(max)?, r.span()?));
         }
