@@ -16,8 +16,13 @@ use std::fmt;
 pub const REALM_PLANE: i64 = 4096;
 
 /// At most this many planes per dimension, so finding the realm of a `y` stays a binary search
-/// of three steps.
+/// of at most four comparisons (nine realms).
 pub const MAX_REALM_PLANES: usize = 8;
+
+/// [`RealmSpan::wide`]'s bottom of an open span: the lowest `y`.
+const OPEN_LO: i128 = i64::MIN as i128;
+/// [`RealmSpan::wide`]'s top of an open span: one past the highest `y`.
+const OPEN_HI: i128 = i64::MAX as i128 + 1;
 
 /// A realm's slab of the dimension, `lo <= y < hi`. `None` is an open end: `lo = None` goes
 /// down forever, `hi = None` up forever.
@@ -53,15 +58,17 @@ impl RealmSpan {
         Self::new(Some(lo), None)
     }
 
-    /// The span as `[lo, hi)` in `i128`, open ends past every `i64`.
+    /// The `y` inside as `[lo, hi)` in `i128`: an open bottom is `i64::MIN`, an open top
+    /// `i64::MAX + 1`. So the bounds are exact on `i64`: `below(i64::MIN)` is empty, and
+    /// `between(i64::MIN, hi)` holds the same `y` as `below(hi)`.
     const fn wide(self) -> (i128, i128) {
         let lo = match self.lo {
             Some(lo) => lo as i128,
-            None => i128::MIN,
+            None => OPEN_LO,
         };
         let hi = match self.hi {
             Some(hi) => hi as i128,
-            None => i128::MAX,
+            None => OPEN_HI,
         };
         (lo, hi)
     }
@@ -288,15 +295,16 @@ fn check_cover(checks: &mut Checks, dimension: &GenId, realms: &[(&GenId, &Realm
         })
         .collect();
     spans.sort_by_key(|&(lo, hi, _)| (lo, hi));
-    // Everything under `covered` is covered; `top` is the realm that reaches it.
-    let (mut covered, mut top) = (i128::MIN, None);
+    // Every `y` under `covered` is covered; `top` is the realm that reaches it.
+    let (mut covered, mut top) = (OPEN_LO, None);
     let mut gap = |lo: i128, hi: i128, below: Option<&GenId>, above: Option<&GenId>| {
-        // Inside the sweep `lo` is a finite plane or -infinity and `hi` a finite plane or
-        // +infinity: both convert back to an `i64` plane or an open end.
+        // Inside the sweep `lo` is the open bottom or the top of a span that holds some `y`
+        // (so never `i64::MIN`), and `hi` a span's bottom plane or the open top: both convert
+        // back to an `i64` plane or an open end.
         let plane = |y: i128, open: i128| (y != open).then_some(y as i64);
         checks.push(Problem::Gap {
             dimension: dimension.clone(),
-            span: RealmSpan::new(plane(lo, i128::MIN), plane(hi, i128::MAX)),
+            span: RealmSpan::new(plane(lo, OPEN_LO), plane(hi, OPEN_HI)),
             below: below.cloned(),
             above: above.cloned(),
         });
@@ -309,8 +317,8 @@ fn check_cover(checks: &mut Checks, dimension: &GenId, realms: &[(&GenId, &Realm
             (covered, top) = (hi, Some(realm));
         }
     }
-    if covered < i128::MAX {
-        gap(covered, i128::MAX, top, None);
+    if covered < OPEN_HI {
+        gap(covered, OPEN_HI, top, None);
     }
 }
 

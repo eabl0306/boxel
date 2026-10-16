@@ -1,5 +1,6 @@
-//! Realm spans, and every layout check failing with its ids in the message (ADR 0039 "Cómo se
-//! prueba" 4 and 11), the realms covering every y exactly once. Then a whole world open over
+//! Realm spans, exact up to the ends of `i64`, and every layout check failing with its ids in the
+//! message (ADR 0039 "Cómo se prueba" 4 and 11), the realms covering every y exactly once (also
+//! against a brute force over random layouts). Then a whole world open over
 //! test registries (a preset, its dimensions, their realms and kinds): every problem of a bad mix
 //! reported at once, and the digest of a good one per dimension and realm, with a realm added as
 //! one more line. The real presets and dimension tables come with WG-SAVE; these are `test:`
@@ -9,6 +10,7 @@ use crate::registry::{
     DigestBuilder, DigestScope, FreezeError, GenEntry, GenRegistry, GenRegistryBuilder,
     RegistryDigest, WorldgenDiff,
 };
+use proptest::prelude::*;
 
 fn id(name: &str) -> GenId {
     GenId::new(name).expect(name)
@@ -508,6 +510,152 @@ fn layout_hashes_follow_every_field() {
             crate::registry::hash_params(&other),
             crate::registry::hash_params(&base)
         );
+    }
+}
+
+#[test]
+fn spans_are_exact_at_the_ends_of_i64() {
+    // No `y` is under `i64::MIN`: a span that ends there is empty and overlaps nothing.
+    assert!(RealmSpan::below(i64::MIN).is_empty());
+    assert!(!RealmSpan::below(i64::MIN).overlaps(RealmSpan::ALL));
+    assert!(!RealmSpan::below(i64::MIN).contains(i64::MIN));
+    // A span from `i64::MIN` holds every `y` an open bottom does, and the top is the other way.
+    assert!(RealmSpan::above(i64::MIN).contains(i64::MIN));
+    assert!(RealmSpan::above(i64::MIN).overlaps(RealmSpan::below(i64::MIN + 1)));
+    assert!(!RealmSpan::above(i64::MAX).is_empty());
+    assert!(!RealmSpan::between(i64::MIN, i64::MAX).contains(i64::MAX));
+    // So a layout over the whole of `i64` has no gap under `i64::MIN`, only planes outside the
+    // world, and an empty span at the bottom is refused as empty.
+    let outside = |realm: &str, y| Problem::PlaneOutsideWorld {
+        dimension: id("test:dim"),
+        realm: id(realm),
+        y,
+    };
+    let (problems, message) = check(&[
+        (
+            "test:all",
+            ground(RealmSpan::above(i64::MIN), RealmLod::Draw),
+        ),
+        (
+            "test:none",
+            ground(RealmSpan::below(i64::MIN), RealmLod::Off),
+        ),
+    ]);
+    assert_eq!(
+        problems,
+        [
+            outside("test:all", i64::MIN),
+            Problem::EmptySpan {
+                dimension: id("test:dim"),
+                realm: id("test:none"),
+                span: RealmSpan::below(i64::MIN),
+            },
+            outside("test:none", i64::MIN),
+        ],
+        "{message}"
+    );
+    // `i64::MAX` is a `y` like any other: a span that stops under it leaves it uncovered.
+    let (problems, _) = check(&[(
+        "test:all",
+        ground(RealmSpan::below(i64::MAX), RealmLod::Draw),
+    )]);
+    assert!(problems.contains(&Problem::Gap {
+        dimension: id("test:dim"),
+        span: RealmSpan::above(i64::MAX),
+        below: Some(id("test:all")),
+        above: None,
+    }));
+}
+
+/// A plane for [`layouts_match_a_brute_force`]: open, on the grid near 0, at the world limit or
+/// at the ends of `i64`.
+fn any_plane() -> impl Strategy<Value = Option<i64>> {
+    prop_oneof![
+        Just(None),
+        (-3i64..=3).prop_map(|k| Some(k * REALM_PLANE)),
+        prop::sample::select(vec![
+            i64::MIN,
+            i64::MIN + 1,
+            -MAX_BLOCK_COORD,
+            MAX_BLOCK_COORD,
+            i64::MAX - 1,
+            i64::MAX,
+        ])
+        .prop_map(Some),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1024))]
+
+    /// Empty spans, overlaps and gaps of up to 6 realms in any order (nested, touching, inverted,
+    /// at the ends of `i64`), against `contains` at every plane and the `y` under it, which is
+    /// enough: what covers a `y` changes only at planes.
+    #[test]
+    fn layouts_match_a_brute_force(
+        spans in prop::collection::vec((any_plane(), any_plane()), 0..6),
+    ) {
+        let span = |i: usize| RealmSpan::new(spans[i].0, spans[i].1);
+        let names: Vec<GenId> = (0..spans.len()).map(|i| id(&format!("test:r{i}"))).collect();
+        let layouts: Vec<RealmLayout> = (0..spans.len())
+            .map(|i| ground(span(i), if i == 0 { RealmLod::Draw } else { RealmLod::Off }))
+            .collect();
+        let mut ys = BTreeSet::from([i64::MIN, i64::MAX]);
+        for p in spans.iter().flat_map(|&(lo, hi)| lo.into_iter().chain(hi)) {
+            ys.extend([p, p.saturating_sub(1)]);
+        }
+        let mut checks = Checks::new();
+        check_realms(&mut checks, &id("test:dim"), names.iter().zip(&layouts));
+        let problems = checks.problems();
+
+        let empty: Vec<&GenId> = (0..spans.len())
+            .filter(|&i| !ys.iter().any(|&y| span(i).contains(y)))
+            .map(|i| &names[i])
+            .collect();
+        let found: Vec<&GenId> = problems
+            .iter()
+            .filter_map(|p| match p {
+                Problem::EmptySpan { realm, .. } => Some(realm),
+                _ => None,
+            })
+            .collect();
+        prop_assert_eq!(found, empty, "empty spans");
+
+        let mut overlaps = Vec::new();
+        for i in 0..spans.len() {
+            for j in i + 1..spans.len() {
+                if ys.iter().any(|&y| span(i).contains(y) && span(j).contains(y)) {
+                    overlaps.push((&names[i], &names[j]));
+                }
+            }
+        }
+        let found: Vec<(&GenId, &GenId)> = problems
+            .iter()
+            .filter_map(|p| match p {
+                Problem::Overlap { a, b, .. } => Some((a, b)),
+                _ => None,
+            })
+            .collect();
+        prop_assert_eq!(found, overlaps, "overlaps");
+
+        // Every uncovered `y` is in exactly one gap, every gap holds some `y` and none that a
+        // realm covers, and the gaps go bottom first.
+        let gaps: Vec<RealmSpan> = problems
+            .iter()
+            .filter_map(|p| match p {
+                Problem::Gap { span, .. } => Some(*span),
+                _ => None,
+            })
+            .collect();
+        for &y in &ys {
+            let covered = (0..spans.len()).any(|i| span(i).contains(y));
+            let holding = gaps.iter().filter(|g| g.contains(y)).count();
+            prop_assert_eq!(holding, usize::from(!covered), "y {}", y);
+        }
+        for gap in &gaps {
+            prop_assert!(ys.iter().any(|&y| gap.contains(y)), "gap {} holds no y", gap);
+        }
+        prop_assert!(gaps.is_sorted_by_key(|g| g.lo.map_or(i128::MIN, i128::from)));
     }
 }
 
