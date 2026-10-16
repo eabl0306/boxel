@@ -441,8 +441,24 @@ context -> select -> alturas de los tipos -> mezcla -> MODIFICADORES DE FORMA ->
   bit a bit. Solo hasta su apron: la superficie no tiene (cada columna la decide su chunk) y un
   carver declara el suyo. En debug, leer más allá falla, porque el camino hondo no cuenta ese
   suelo.
-- **Features**: anclas en celdas alineadas a chunks, con alcance y altura declarados. Decide el
-  bioma de la columna del ancla. Forma gruesa opcional (una copa como tramos sólidos).
+- **Features** (`FeatureStage`, desde WG-FEATURES, #134): árboles, plantas, rocas. Anclas en
+  celdas alineadas a chunks (de 8 o 16 bloques), y decide la columna del ancla (sus campos, su
+  bioma). Corren después de los carvers, en orden `(priority, id)`, cada una con la sal de su id y
+  su línea `feature_stage` en el digest, en todo chunk que toca su alcance: un árbol que cruza un
+  borde de capa lo escriben los dos chunks, cada uno sus bloques. Nunca corren en el camino hondo,
+  porque nada de lo que escriben queda bajo un suelo.
+  - Declaran su alcance (`FeatureReach`): `height`, cuántos bloques escriben sobre el suelo de cada
+    columna (solo de `suelo + 1` a `suelo + height` de la columna donde cae el bloque, así una copa
+    sobre una ladera cuenta la pendiente), y `apron`, cuántos bloques alrededor del chunk leen
+    columnas con `ChunkColumns::tops` (las anclas vecinas cuyas copas entran al chunk), a lo sumo
+    32. En debug, un bloque fuera de ese tramo falla.
+  - Sus bloques son una función pura de su sal, el Context y las columnas que leen (las del chunk y
+    las del apron), así todo chunk que cruza un árbol escribe el mismo árbol. Una etapa que además
+    lee los estados del chunk (un tronco solo sobre pasto) deja sus árboles dentro de su chunk, como
+    los del demo.
+  - Cuentan en la cota local de cada columna de chunk con `column_height` (sección 14).
+  - Forma gruesa opcional (`lod_runs`): un tramo sólido `(estado, bloques)` por columna de celdas,
+    una copa (sección 10).
 - **Pasos post**: reescrituras locales al chunk con consultas de solo lectura. Declaran que no
   mueven la superficie; si la mueven, necesitan forma gruesa.
 - Las reglas de colocación (lo que queda bajo el agua va mojado, los estados generados son puntos
@@ -487,8 +503,12 @@ nunca le pasa un nodo a un solo tipo. Por llamada, para las 35 x 35 esquinas del
      y con la retícula de 32 bloques dejaba en el nivel 6 esquinas a 43 bloques de los chunks y
      suelo grueso 33 bloques bajo el real.
 6. Las formas gruesas de los modificadores (ríos por nivel, costa, adaptación a estructuras),
-   después la regla de fluido del reino sobre las esquinas sin margen, y después el `lod_top` del
-   bioma.
+   después la regla de fluido del reino sobre las esquinas sin margen, después el `lod_top` del
+   bioma, y después los tramos de las features (`FeatureStage::lod_runs`). El tramo más alto de
+   una columna de celdas queda sobre su suelo grueso (con su margen y la subida de la superficie),
+   como celdas propias y nunca como margen, y la banda lo cubre. Una celda con un tramo es sólida
+   con su estado, salvo que el fluido del reino lo cubra dentro de la celda. Un tramo que no es
+   sólido de lejos no se dibuja.
 7. Volúmenes y volúmenes de núcleo: `lod_runs` da hasta 4 tramos sólidos por columna de celdas,
    que se unen a los de la superficie.
 8. Una pasada genérica de la regla de la celda (del motor: la `Surface` del demo, generalizada)
@@ -583,8 +603,10 @@ Además:
   columna de celdas en todo nivel (cualquier bloque sólido hace sólida su celda).
 
 **Harness exportado.** `boxel_worldgen` gana la feature `test-support` con
-`check_lod(generator, registry, columns, levels)` (`region::check_lod`), que arma chunks reales y
-compara en los niveles que se le piden (el plan pide 1 a 4):
+`check_lod(generator, registry, columns, levels)` (`region::check_lod`), que arma el terreno real
+(los chunks sin carvers ni features, `RegionGenerator::generate_terrain`: la lejanía deja fuera los
+carvers y dibuja las features como tramos propios) y lo compara con la pasada sin sus tramos, en los
+niveles que se le piden (el plan pide 1 a 4):
 
 - en celdas secas, el tope grueso nunca queda bajo el real, y lo pasa a lo sumo por el margen
   declarado más la profundidad de los valles que se dejaron de lado (`lod_left_out`), más un paso
@@ -595,8 +617,12 @@ compara en los niveles que se le piden (el plan pide 1 a 4):
   de fluido. Una columna que la pasada deja mojada cuenta como de fluido aunque su celda de arriba
   salga sólida (su suelo es el de la esquina más alta: en una costa poco honda la tierra entre las
   esquinas puede quedar sobre él);
-- bandas conservadoras, bordes iguales entre vecinos y tramos de volumen dentro de su cota (los
-  volúmenes llegan con WG-VOLUME).
+- los tramos de las features: sobre el suelo (sobre el bloque sólido real más alto de las columnas
+  de la celda, bajo el fluido si lo hay: en una celda mojada de una costa poco honda, un tramo
+  quedaría enterrado en la tierra que hay entre las esquinas), bajo la altura (a lo sumo la
+  `height` mayor de las features), dentro de la banda y dibujados;
+- bandas conservadoras, bordes iguales entre vecinos (con los tramos) y tramos de volumen dentro de
+  su cota (los volúmenes llegan con WG-VOLUME).
 
 `lod_corners` da las esquinas de la pasada, para comparar con las columnas de chunk.
 
@@ -664,11 +690,11 @@ mundo para el conjunto que resuelve su preset. Rechazan:
 - modificadores de forma aditivos cuyas pendientes sumadas pasan el tope solas, o sobre un tipo, un
   par o un trío de tipos que pasan sin ellos, y un modificador con tope cuyo tope, más las
   pendientes de los aditivos que corren después, pasa 3 (sección 6);
-- dos etapas de una fase con el mismo id (modificadores o carvers), y un carver con un apron de más
-  de 32 bloques;
+- dos etapas de una fase con el mismo id (modificadores, carvers o features), y un carver con un
+  apron de más de 32 bloques;
 - términos de núcleo cuyo cono o pendiente propia, sumados a la pendiente de su tipo, rompen el
   tope (sección 7);
-- features sin alcance o sin altura declarados;
+- features con una altura de 0 o un apron de más de 32 bloques;
 - spans de reinos que se pisan o que no están en planos de 4096 bloques, o más de 8 planos por
   dimensión (el tope que hace O(1) a `realm_of`);
 - reinos que dejan algún y sin cubrir, así `realm_of` siempre responde;
@@ -691,8 +717,10 @@ problemas salen en el mismo error. Solo una pila de reinos que no se arma la dej
 - **Chequeo de spans en debug.** En los builds de debug, `generate` comprueba que todo bloque que
   no es aire queda dentro de las cotas de columna del reino y bajo la cota local de aire, que la
   etapa de superficie escribe solo dentro de su alcance declarado (si no, deja costuras entre
-  chunks), y que los bloques de volumen están solo donde `d_f >= K`. Los tests del motor corren en
-  debug, así un tipo o un mod con una cota mal hecha falla sus tests.
+  chunks), que una feature escribe solo sobre el suelo de cada columna hasta su altura y que su
+  `column_height` no pasa esa altura, y que los bloques de volumen están solo donde `d_f >= K`.
+  Los tests del motor corren en debug, así un tipo o un mod con una cota mal hecha falla sus
+  tests.
 - **Lado de consultas.** `WorldQuery { height_at(x, z), realm_at(y), biome_at(x, y, z),
   column(x, z) -> ColumnInfo, environment_at(x, y, z) }`: puro, unos 2 us en caliente, por
   `as_query()`. Hasta que exista la tabla `BiomeRule`, `biome_at` da una etiqueta provisoria: el
@@ -708,11 +736,15 @@ Dentro del generador, sin cambiar el motor (desde WG-DECOR, #133):
   cotas de sus puntos. Se suma el efecto de cada modificador sobre esa columna de chunk
   (`ShapeModifier::column_effect`, dentro de su efecto declarado: un río dice `LowerOnly(0)` donde
   no llega ningún segmento), así un río de 128 bloques no baja la cota de todas las columnas. Las
-  features (la altura de los árboles, WG-FEATURES) y las estructuras (las cajas de sus piezas) se
-  suman cuando lleguen. Son enteros exactos.
+  features suman su altura sobre la cota de arriba del suelo (WG-FEATURES): `top` es el máximo de
+  `ground_hi` más la subida de la superficie, `ground_hi` más el `column_height` mayor de las
+  features sobre esa columna de chunk (0 donde nada crece, a lo sumo su `height`) y el nivel del
+  fluido, así los chunks sobre una llanura sin árboles siguen siendo aire `Uniform`. Las
+  estructuras (las cajas de sus piezas) se suman cuando lleguen. Son enteros exactos.
 - El memo guarda la última columna de chunk con sus cotas, y los puntos y los tipos de su celda de
   retícula: otra columna de chunk de la misma celda solo llama a los ganchos (una llamada por tipo
-  presente y por modificador, y otra por celda de retícula que toca el apron de los carvers).
+  presente, por modificador y por feature, y otra por celda de retícula que toca el apron de los
+  carvers).
 - Las mismas lecturas dan `ground_lo`, una cota de abajo del suelo: la cota más baja de los tipos
   menos los cortes de los modificadores (río o término de núcleo). Los carvers no la mueven: bajan
   el camino hondo. El piso del cielo (sección 15) tendrá que contar también su alcance.
@@ -1048,6 +1080,17 @@ no como tiempo de frame.
     bajo un techo de 6 bloques, apron de 3): un chunk hondo de 1 bit cuesta 2,25 us, y 2,04 de
     ellos son la máscara del carver; el chunk del suelo, 40,9 us contra 23,5 sin carver en la
     misma corrida (la máscara con su techo, el anillo del apron a pedido y el tallado denso).
+  - Medido en WG-FEATURES (criterion, contra feat/wg-decor f7cb704, antes del rebase sobre main;
+    `region_lod` dos corridas por lado, `region` una). Sin features, la fuente y el job quedan
+    dentro del ruido (de -10 a +13 us por nodo, sin signo fijo) y los chunks igual contra el gemelo
+    (superficie interior 23,1 us contra 23,3, el gemelo 22,5 contra 22,6). Con un tramo de 6
+    bloques sobre cada celda seca, la fuente sube una mediana de 2 us en el nivel 4 y de 1 us en el
+    6; en el nivel 1 sube unos 8 us, porque el tramo son 3 celdas más de la regla de la celda por
+    columna (el juego da tramos solo en los niveles 4 a 6). El job cambia solo por lo que se dibuja
+    (el nodo interior del nivel 1 mallea un nodo menos: de 317 a 198 us). Con los árboles y plantas
+    de test, el chunk del suelo cuesta 28,0 us contra 23,3 sin ellos, y el de arriba, que los
+    árboles pueden alcanzar, 15,2 us de etapa de columna en vez de los 37 ns del camino de aire: un
+    `column_height` de 0 donde nada crece lo evita.
 - WG4: a lo sumo 2 us en frío y 1 us en caliente por columna de chunk; unas 100 lecturas de retícula
   por columna de nodos.
 - Consultas: `biome_at` en la columna de la cámara, a lo sumo 20 us en frío y 2 us en caliente, una
@@ -1059,7 +1102,9 @@ no como tiempo de frame.
   y los chunks contra el gemelo de un solo tipo, y `headless_world` da los mismos quads y chunks en
   el demo. WG-REGIONLOD mide la fuente y el job en los niveles 1, 4 y 6. WG-DECOR mide la
   selección y los chunks contra el gemelo antes y después, y un carver (chunk hondo y de superficie);
-  `headless_world` sigue igual en el demo. No hay ronda de control
+  `headless_world` sigue igual en el demo. WG-FEATURES mide la fuente y el job de la lejanía en los
+  niveles 1, 4 y 6 con y sin tramos de features, y los chunks antes y después y con features de
+  test. No hay ronda de control
   hasta terminar la generación y el trabajo de bloques del motor.
 
 ## Cómo se prueba
@@ -1095,7 +1140,7 @@ Los tests del motor usan ids `test:`; los del juego, su contenido.
 9. **Lejanía**, por el harness exportado: celdas gruesas contra la regla de la celda en los niveles
    1 a 4, en nodos de borde de 2 y 3 tipos. Una divisoria entre dos valles cortados dentro de una
    celda deja el tope grueso sobre el real. Bandas conservadoras y tramos de volumen dentro de su
-   cota.
+   cota. Los tramos de las features, sobre el suelo, bajo su altura y dentro de la banda.
 10. **Guardado**: ida y vuelta de `boxel:worldgen`; `FORMAT_VERSION` sin cambios; un mundo sin la
     clave abre como legado con su generador viejo; una versión de entrada cambiada, un reino
     agregado y un mod quitado dan el `WorldgenDiff` esperado.
