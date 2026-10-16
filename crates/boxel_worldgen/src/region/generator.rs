@@ -1003,7 +1003,31 @@ impl<Cx: Context> RegionGenerator<Cx> {
             return ChunkData::uniform(BlockState::AIR);
         }
         let window = self.window((key.pos.x, key.pos.z));
-        self.column_stage(origin, &window, registry)
+        self.column_stage(origin, &window, &self.stages(registry, false), registry)
+    }
+
+    /// The chunk at `key` without the carvers and the feature stages: the terrain the far LOD
+    /// draws (the fill, the fluid and the surface stage), which the exported harness compares the
+    /// coarse cells with (`check_lod`).
+    #[cfg(feature = "test-support")]
+    pub fn generate_terrain(&self, key: ChunkKey, registry: &BlockRegistry) -> ChunkData {
+        let origin = key.pos.origin();
+        if !self.spec().span.contains(origin.y) {
+            return ChunkData::uniform(BlockState::AIR);
+        }
+        let window = self.window((key.pos.x, key.pos.z));
+        let stages = Stages {
+            carvers: &[],
+            features: &[],
+            ..self.stages(registry, false)
+        };
+        if origin.y > window.1.top {
+            ChunkData::uniform(BlockState::AIR)
+        } else if origin.y + i64::from(CHUNK_SIZE) - 1 <= window.1.deep {
+            super::decorate::deep(&self.cx, origin, window.1.apron_lo, &stages, registry)
+        } else {
+            self.column_stage(origin, &window, &stages, registry)
+        }
     }
 
     /// The stages of a chunk, with the realm's floor and fluid states (the fluid only where the
@@ -1027,11 +1051,12 @@ impl<Cx: Context> RegionGenerator<Cx> {
         }
     }
 
-    /// The chunk at `origin` from its columns.
+    /// The chunk at `origin` from its columns, with `stages`.
     fn column_stage(
         &self,
         origin: BlockPos,
         (points, bounds): &(WindowPoints, LocalBounds),
+        stages: &Stages<'_, Cx>,
         registry: &BlockRegistry,
     ) -> ChunkData {
         let (xs, zs) = chunk_axes(origin.x, origin.z);
@@ -1056,7 +1081,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
         let around = Around(self);
         let columns = ChunkColumns::new(origin, &ground, &fluid_top, &self.cx, &fields, &around)
             .with_apron_lo(bounds.apron_lo);
-        let chunk = super::decorate::decorate(&columns, &self.stages(registry, false), registry);
+        let chunk = super::decorate::decorate(&columns, stages, registry);
         if cfg!(debug_assertions) {
             self.check_top(origin, bounds, &chunk);
             self.check_vertical((origin.x, origin.z), bounds);
@@ -1399,7 +1424,7 @@ impl<Cx: Context> WorldGenerator for RegionGenerator<Cx> {
         if let Some(chunk) = fast(&window.1) {
             return chunk;
         }
-        self.column_stage(origin, &window, registry)
+        self.column_stage(origin, &window, &self.stages(registry, false), registry)
     }
 
     /// From the realm's span bottom to its highest kind height (plus the surface rise or the

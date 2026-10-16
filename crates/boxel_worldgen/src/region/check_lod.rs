@@ -1,8 +1,10 @@
 //! The exported harness of a realm's far LOD (ADR 0039 sec. 10, feature `test-support`):
-//! [`check_lod`] builds a region generator's real chunks around some columns and compares its
-//! coarse cells with the cell rule on them, so a game's or a mod's kinds, modifiers and surface
-//! stages get their far LOD checked without bespoke tests. [`lod_corners`] gives the pass's
-//! corner heights, for exactness tests against the chunk columns.
+//! [`check_lod`] builds a region generator's real terrain around some columns (its chunks without
+//! carvers and features, which the far LOD leaves out) and compares its coarse cells with the cell
+//! rule on them, and checks the runs of its feature stages, so a game's or a mod's kinds,
+//! modifiers, surface and feature stages get their far LOD checked without bespoke tests.
+//! [`lod_corners`] gives the pass's corner heights, for exactness tests against the chunk
+//! columns.
 
 use super::generator::RegionGenerator;
 use super::kind::{Context, HEIGHT_SHIFT, HeightQ};
@@ -45,6 +47,10 @@ pub struct LodReport {
     pub max_over: i64,
     /// Pairs of border cells compared between neighbor nodes.
     pub borders: usize,
+    /// Cell columns with a feature stage's run ([`FeatureStage::lod_runs`]), each checked.
+    ///
+    /// [`FeatureStage::lod_runs`]: super::FeatureStage::lod_runs
+    pub runs: usize,
 }
 
 /// A node as the source emitted it.
@@ -62,6 +68,42 @@ struct Coarse {
 }
 
 impl Coarse {
+    /// The node column `column` of `level` as the pass draws its terrain alone (its feature runs
+    /// left out), every layer of its band.
+    fn terrain<Cx: Context>(
+        generator: &RegionGenerator<Cx>,
+        registry: &BlockRegistry,
+        level: u8,
+        column: [i64; 2],
+    ) -> Self {
+        let mut scratch = LodScratch::default();
+        let mut memo = LodMemo::<Cx>::take(&mut scratch);
+        let slots = memo.slots(generator.key, false);
+        let mut req = LodRequest {
+            dim: DimensionId(0),
+            level,
+            column,
+            layers: RangeInclusive::new(1, 0),
+        };
+        generator.lod_prepare(&req, registry, slots);
+        slots.without_canopies();
+        let band = slots.band;
+        req.layers = band.lo..=band.hi - 1;
+        let mut nodes = HashMap::new();
+        let band = generator.lod_emit(&req, slots, &mut scratch.cells, &mut |layer, node| {
+            let node = match node {
+                LodNode::Uniform(state) => Node::Uniform(state),
+                LodNode::Cells(cells) => Node::Cells(Box::new(cells.clone())),
+            };
+            nodes.insert(layer, node);
+        });
+        Self {
+            band,
+            nodes,
+            shift: 5 + u32::from(level),
+        }
+    }
+
     /// The node column `column` of `level`, every layer of its band.
     fn of(source: &dyn LodSource, registry: &BlockRegistry, level: u8, column: [i64; 2]) -> Self {
         let mut req = LodRequest {
@@ -121,18 +163,19 @@ impl Coarse {
     }
 }
 
-/// The chunks of a generator, each generated once.
-struct Chunks<'a> {
-    generator: &'a dyn WorldGenerator,
+/// The terrain chunks of a generator ([`RegionGenerator::generate_terrain`]), each generated
+/// once.
+struct Chunks<'a, Cx: Context> {
+    generator: &'a RegionGenerator<Cx>,
     registry: &'a BlockRegistry,
     chunks: HashMap<[i64; 3], ChunkData>,
 }
 
-impl Chunks<'_> {
+impl<Cx: Context> Chunks<'_, Cx> {
     fn chunk(&mut self, at: [i64; 3]) -> &ChunkData {
         let (generator, registry) = (self.generator, self.registry);
         self.chunks.entry(at).or_insert_with(|| {
-            generator.generate(ChunkKey::new(ChunkPos::new(at[0], at[1], at[2])), registry)
+            generator.generate_terrain(ChunkKey::new(ChunkPos::new(at[0], at[1], at[2])), registry)
         })
     }
 
@@ -146,9 +189,9 @@ impl Chunks<'_> {
     }
 }
 
-/// The real chunks of a generator and the cell rule on them.
-struct Real<'a> {
-    chunks: Chunks<'a>,
+/// The real terrain of a generator and the cell rule on it.
+struct Real<'a, Cx: Context> {
+    chunks: Chunks<'a, Cx>,
     classes: LodClasses,
     /// Per block column, its highest non-Empty block and that block's class.
     tops: HashMap<(i64, i64), (i64, LodClass)>,
@@ -156,8 +199,8 @@ struct Real<'a> {
     top_layer: i64,
 }
 
-impl<'a> Real<'a> {
-    fn new(generator: &'a dyn WorldGenerator, registry: &'a BlockRegistry) -> Self {
+impl<'a, Cx: Context> Real<'a, Cx> {
+    fn new(generator: &'a RegionGenerator<Cx>, registry: &'a BlockRegistry) -> Self {
         Self {
             chunks: Chunks {
                 generator,
@@ -168,6 +211,21 @@ impl<'a> Real<'a> {
             tops: HashMap::new(),
             top_layer: *generator.vertical_chunks().end(),
         }
+    }
+
+    /// The highest Solid block of column `(x, z)`, under its fluid if it has one.
+    fn solid_top(&mut self, x: i64, z: i64) -> i64 {
+        let (top, class) = self.column_top(x, z);
+        if class == LodClass::Solid {
+            return top;
+        }
+        for y in (top - (4096 << CHUNK_SHIFT)..top).rev() {
+            let state = self.chunks.block([x, y, z]);
+            if self.classes.class(state) == LodClass::Solid {
+                return y;
+            }
+        }
+        panic!("check_lod: no solid block under ({x}, {top}, {z})");
     }
 
     /// The highest non-Empty block of column `(x, z)` and its class.
@@ -224,6 +282,18 @@ impl<'a> Real<'a> {
         Some(hi)
     }
 
+    /// The highest Solid block over the `s x s` columns from `[x, z]` (the ground under any
+    /// fluid).
+    fn solid(&mut self, s: i64, [x, z]: [i64; 2]) -> i64 {
+        let mut hi = i64::MIN;
+        for dx in 0..s {
+            for dz in 0..s {
+                hi = hi.max(self.solid_top(x + dx, z + dz));
+            }
+        }
+        hi
+    }
+
     /// The highest non-Empty block over the `s x s` columns from `[x, z]`, and the lowest one.
     fn span(&mut self, s: i64, [x, z]: [i64; 2]) -> (i64, i64) {
         let (mut hi, mut lo) = (i64::MIN, i64::MAX);
@@ -272,9 +342,11 @@ impl<'a> Real<'a> {
 }
 
 /// Checks the far LOD of `generator` at the block columns `columns`, at each level of `levels`
-/// (ADR 0039 sec. 10; the plan asks for levels 1 to 4), against its real chunks
-/// ([`WorldGenerator::generate`]) and the cell rule. For each column, the cell column of each
-/// level that holds it:
+/// (ADR 0039 sec. 10; the plan asks for levels 1 to 4), against its real terrain (its chunks
+/// without the carvers and the feature stages, [`RegionGenerator::generate_terrain`]: the far LOD
+/// leaves the carvers out and draws the features as runs of their own) and the cell rule. For
+/// each column, the cell column of each level that holds it, the pass's terrain alone (its
+/// feature runs left out):
 ///
 /// - dry (a solid top cell in both, and the pass's cell column over the realm's fluid: not all
 ///   its corners under the level): the coarse top is never under the real one, and stands over
@@ -292,12 +364,21 @@ impl<'a> Real<'a> {
 ///   hold both a fluid top and a solid one);
 /// - the band is conservative there: the real cells over it are air, and the real cell at the
 ///   top row of the layer under it is not;
-/// - the node's border cells equal its 4 neighbors' and the layers' over and under it.
+/// - the run of the feature stages, if the cell column has one ([`FeatureStage::lod_runs`]):
+///   over the ground (its lowest block over the highest real Solid block of the cell's columns,
+///   under any fluid: a run on a cell whose real land stands over its coarse ground, such as a wet
+///   cell of a shallow coast, would be buried), under the height (at most the feature stages'
+///   greatest [`FeatureReach::height`] blocks), inside the band, and drawn (the top cell of the
+///   column with the runs lies at or over it);
+/// - the node's border cells, runs included, equal its 4 neighbors' and the layers' over and
+///   under it.
 ///
 /// Returns what it compared, or every failure (the first few listed).
 ///
 /// [`TerrainKind::lod_left_out`]: super::TerrainKind::lod_left_out
 /// [`ShapeModifier::lod_left_out`]: super::ShapeModifier::lod_left_out
+/// [`FeatureStage::lod_runs`]: super::FeatureStage::lod_runs
+/// [`FeatureReach::height`]: super::FeatureReach::height
 pub fn check_lod<Cx: Context>(
     generator: &RegionGenerator<Cx>,
     registry: &BlockRegistry,
@@ -321,7 +402,9 @@ pub fn check_lod<Cx: Context>(
                 .map(|m| i64::from(m.modifier.lod_left_out(level)))
                 .sum::<i64>();
         let left_out = (left_out + (1 << HEIGHT_SHIFT) - 1) >> HEIGHT_SHIFT;
+        // As drawn (the runs included), and the terrain alone.
         let mut nodes: HashMap<[i64; 2], Coarse> = HashMap::new();
+        let mut terrain: HashMap<[i64; 2], Coarse> = HashMap::new();
         let node_of = |nodes: &mut HashMap<[i64; 2], Coarse>, at: [i64; 2]| {
             nodes
                 .entry(at)
@@ -335,7 +418,9 @@ pub fn check_lod<Cx: Context>(
             if !seen_nodes.contains(&node) {
                 seen_nodes.push(node);
             }
-            let coarse = &nodes[&node];
+            let coarse = terrain
+                .entry(node)
+                .or_insert_with(|| Coarse::terrain(generator, registry, level, node));
             let (cell_x, cell_z) = (((x >> level) & 31) as i32, ((z >> level) & 31) as i32);
             let (coarse_top, coarse_state) = coarse.top(cell_x, cell_z);
             let (real_top, real_state) = real.top(level, [cx, cz]);
@@ -426,6 +511,47 @@ pub fn check_lod<Cx: Context>(
                          under the band, is air",
                     band.lo - 1
                 ));
+            }
+            // The run of the feature stages.
+            if col.canopy_top > col.t {
+                report.runs += 1;
+                let (from, to) = (col.t + 1, col.canopy_top);
+                let ground = real.solid(s, [cx, cz]);
+                if from <= ground {
+                    failures.push(format!(
+                        "{at}: the feature run {from}..={to} ({:?}) is under the real ground at \
+                         y {ground}: the cell's coarse ground ({}, its highest corner's {}) lies \
+                         under real land",
+                        col.canopy, col.t, col.h
+                    ));
+                }
+                let height = generator
+                    .features
+                    .iter()
+                    .map(|f| i64::from(f.stage.reach().height))
+                    .max()
+                    .unwrap_or(0);
+                if to - col.t > height {
+                    failures.push(format!(
+                        "{at}: the feature run {from}..={to} is {} blocks tall, over the feature \
+                         stages' height {height}",
+                        to - col.t
+                    ));
+                }
+                if to >= (band.hi << shift) - s {
+                    failures.push(format!(
+                        "{at}: the feature run {from}..={to} reaches the padded block of layer {} \
+                         that the band says is air",
+                        band.hi
+                    ));
+                }
+                let (drawn, _) = nodes[&node].top(cell_x, cell_z);
+                if drawn <= to {
+                    failures.push(format!(
+                        "{at}: the feature run {from}..={to} is not drawn: the top of the cell \
+                         column with the runs is {drawn}"
+                    ));
+                }
             }
         }
         // Neighbor borders, for each node the columns fall in.

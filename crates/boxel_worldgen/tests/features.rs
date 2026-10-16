@@ -6,7 +6,9 @@
 //!   features only add blocks over the ground;
 //! - a tree across chunk and layer borders is whole whichever chunk is generated first, on any
 //!   thread, with the memo cold or off; the same chunks in any order on any thread with any memo;
-//! - the far LOD: a run over the coarse ground drawn as cells, under the fluid too;
+//! - the far LOD: a run over the coarse ground drawn as cells (under the fluid too), the exported
+//!   harness passing with a carver and a feature stage, and catching a run under the ground or
+//!   taller than the features;
 //! - the digest line, the order by priority, the block names, duplicates and the declared reach;
 //! - the debug checks: a block outside the reach, a column height under the features or over the
 //!   declared height.
@@ -22,8 +24,8 @@ use boxel_worldgen::lod::{LodNode, LodRequest, LodScratch, LodSource};
 use boxel_worldgen::noise::splitmix64;
 use boxel_worldgen::region::{
     ChunkColumns, Context, Decoration, Entry, FeatureReach, FeatureStage, FlatKind, FloorFill,
-    HEIGHT_ONE, NoSurface, RegionGenerator, RegionSettings, RegionSpec, RuleEntry, Scope,
-    SelectorRule, TerrainKind, clear_worker_memo,
+    HEIGHT_ONE, LodReport, NoSurface, RegionGenerator, RegionSettings, RegionSpec, RuleEntry,
+    Scope, SelectorRule, TerrainKind, check_lod, clear_worker_memo,
 };
 use boxel_worldgen::registry::{
     Checks, GenEntry, GenRegistryBuilder, HashParams, Order, ParamsHasher,
@@ -545,6 +547,97 @@ fn a_run_stands_over_the_coarse_ground_as_cells() {
         cells_up(&dry_runs, 1, (5, 7), -12, 3),
         [solid, fluid, fluid]
     );
+}
+
+/// The test world on region cells of 512 blocks with `decoration`.
+fn lod_world(decoration: Decoration<TestContext>) -> RegionGenerator<TestContext> {
+    generator_with(&world(9), SEED, RegionSettings::default(), decoration)
+}
+
+/// Block columns inside node column `column` of `level`: its corners, middle and a few more.
+fn columns_in(level: u8, column: [i64; 2], n: usize, seed: u64) -> Vec<(i64, i64)> {
+    let e = 32i64 << level;
+    let (x0, z0) = (column[0] * e, column[1] * e);
+    let mut out = vec![(x0, z0), (x0 + e - 1, z0 + e - 1), (x0 + e / 2, z0 + e / 2)];
+    for k in 0..n as u64 {
+        let r = splitmix64(seed ^ k);
+        out.push((
+            x0 + (r % e as u64) as i64,
+            z0 + ((r >> 32) % e as u64) as i64,
+        ));
+    }
+    out
+}
+
+#[test]
+fn the_harness_passes_with_a_carver_and_a_feature_stage() {
+    let registry = registry();
+    let decoration = decoration()
+        .with_carver(id("test:holes"), Arc::new(Holes::new(5, 6, 3)))
+        .with_feature(id("test:groves"), Arc::new(Groves::new(3, 6)))
+        .with_feature(id("test:tufts"), Arc::new(TUFTS));
+    let g = lod_world(decoration);
+    let mut total = LodReport::default();
+    let mut featured = 0;
+    for level in 1..=4u8 {
+        for kinds in [1, 2, 3] {
+            let node = nodes_with(&g, level, kinds, [3, -5], 1)[0];
+            let columns = columns_in(level, node, 6, u64::from(level) * 31 + kinds as u64);
+            let r = check_lod(&g, &registry, &columns, level..=level)
+                .unwrap_or_else(|e| panic!("level {level}, {kinds} kinds, node {node:?}: {e}"));
+            total.cells += r.cells;
+            total.dry += r.dry;
+            total.runs += r.runs;
+            total.borders += r.borders;
+            // The real chunks hold the features the far LOD compares without.
+            for &(x, z) in &columns {
+                let info = g.column_info(x, z);
+                let k = key(x >> 5, (info.ground + 3) >> 5, z >> 5);
+                featured +=
+                    usize::from(g.generate(k, &registry) != g.generate_terrain(k, &registry));
+            }
+        }
+    }
+    assert!(total.dry > 50 && total.runs > 50, "{total:?}");
+    assert!(total.borders > 0, "{total:?}");
+    assert!(featured >= 20, "{featured} chunks with features or caves");
+}
+
+#[test]
+fn the_harness_catches_a_run_under_the_ground_or_over_the_height() {
+    let registry = registry();
+    // A sea a few blocks deep along low land (`tests/region_lod.rs`): a wet cell's ground is its
+    // highest corner's, and land between its corners may stand over it.
+    let kinds: Vec<(&str, Arc<dyn TerrainKind<TestContext>>)> = vec![
+        ("test:plains", Arc::new(Relief::blocks(-1, 3, 96, 2))),
+        ("test:hills", Arc::new(Relief::blocks(1, 4, 128, 2))),
+        ("test:basin", Arc::new(Relief::blocks(-4, 3, 256, 2))),
+    ];
+    let world = world_of(vec![("test:surface", realm())], rules(9), Vec::new(), kinds);
+    let coast = |groves: Groves| {
+        generator_with(
+            &world,
+            SEED,
+            RegionSettings::default(),
+            decoration().with_feature(id("test:groves"), Arc::new(groves)),
+        )
+    };
+    let columns = [(800, -488), (803, -483)];
+    let wet = coast(Groves {
+        wet_runs: true,
+        ..Groves::new(3, 6)
+    });
+    let e = check_lod(&wet, &registry, &columns, 3..=3).expect_err("a buried run");
+    assert!(e.contains("under the real ground"), "{e}");
+    // The runs on dry cells only pass there.
+    let dry = coast(Groves::new(3, 6));
+    check_lod(&dry, &registry, &columns, 3..=3).expect("dry runs");
+    // A run taller than the feature stages reach.
+    let tall =
+        lod_world(decoration().with_feature(id("test:groves"), Arc::new(Groves::new(3, 13))));
+    let columns = columns_in(2, [3, -2], 8, 4);
+    let e = check_lod(&tall, &registry, &columns, 2..=2).expect_err("a tall run");
+    assert!(e.contains("over the feature stages' height 12"), "{e}");
 }
 
 // ---- Registries and order ---------------------------------------------------------------------

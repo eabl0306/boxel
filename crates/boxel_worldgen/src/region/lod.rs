@@ -272,6 +272,17 @@ impl<Cx: Context> Slots<Cx> {
         }
     }
 
+    /// The cell columns without their feature runs, for the exported harness (it compares the
+    /// terrain alone with the real one). The band keeps them; the next call starts again.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn without_canopies(&mut self) {
+        for c in &mut self.cols {
+            c.canopy_top = c.t;
+            c.canopy = BlockState::AIR;
+        }
+        self.at = None;
+    }
+
     /// Forgets everything kept (the allocations stay).
     fn clear(&mut self) {
         self.blocks = None;
@@ -1043,7 +1054,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
     }
 
     /// The layers of `req` inside the prepared band, each emitted as its cells or uniform.
-    fn lod_emit(
+    pub(crate) fn lod_emit(
         &self,
         req: &LodRequest,
         slots: &Slots<Cx>,

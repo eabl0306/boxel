@@ -18,7 +18,8 @@
 //!   whole realm (ADR 0039 sec. 10).
 //! - [`DimensionGenerator`]: a dimension's realm stack, one generator per realm.
 //! - With the `test-support` feature, `check_lod`: the exported harness that checks a realm's far
-//!   LOD against its real chunks.
+//!   LOD against its real terrain (the chunks without carvers and features,
+//!   `RegionGenerator::generate_terrain`) and the runs of its feature stages.
 //!
 //! Every per-worker memo is keyed by its generator's [`BuildKey`](crate::registry::BuildKey), so a
 //! world opened after another on the same workers never reads the first one's.
