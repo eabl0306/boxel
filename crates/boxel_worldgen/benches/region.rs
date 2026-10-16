@@ -16,6 +16,10 @@
 //! fill and the mask, 1 bit), the ground's chunk (the column stage, the carver reading its apron),
 //! and the carver's own mask without columns (what the deep chunk pays for the carver itself).
 //!
+//! `feature_*` (#134): the test world with the test trees (one cell of 16 x 16 columns in 12,
+//! canopies across chunk borders through an apron of 2) and plants (one dry column in 9) on the
+//! interior column: the ground's chunk and the chunk over it.
+//!
 //! Budgets: selection 0.5 us warm, 2 us cold amortized; interior chunks at most 5 % over the twin;
 //! on a border column the machinery (selection and blend: `region_heights_border` less
 //! `region_heights_interior` and one `kind_heights_*` per extra kind) at most 4 us per extra kind;
@@ -213,6 +217,27 @@ fn bench(c: &mut Criterion) {
         });
     });
     eprintln!("carved interior column ({cx}, {cz}): ground {ground}, {bounds:?}");
+
+    // The feature stages, on the interior column.
+    let featured = generator_with(
+        &world,
+        SEED,
+        RegionSettings::default(),
+        decoration()
+            .with_feature(id("test:groves"), Arc::new(Groves::new(12, 6)))
+            .with_feature(id("test:tufts"), Arc::new(Tufts { one_in: 9 })),
+    );
+    let (cx, cz) = find(&featured, (40, -40), 1);
+    let ground = featured.column_info(cx << 5, cz << 5).ground;
+    let bounds = featured.local_bounds(cx, cz);
+    let (surface, over) = (key(cx, ground >> 5, cz), key(cx, (ground >> 5) + 1, cz));
+    c.bench_function("feature_surface_interior", |b| {
+        b.iter(|| featured.generate(black_box(surface), &registry));
+    });
+    c.bench_function("feature_over_interior", |b| {
+        b.iter(|| featured.generate(black_box(over), &registry));
+    });
+    eprintln!("featured interior column ({cx}, {cz}): ground {ground}, {bounds:?}");
 }
 
 criterion_group!(benches, bench);

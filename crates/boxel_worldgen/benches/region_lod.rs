@@ -11,6 +11,9 @@
 //!   for each node with cells (at most 3, `MAX_NODES_PER_JOB`);
 //! - `cold_*`: the source call on an empty scratch (no memo at all: the registry's classes, the
 //!   lattice points);
+//! - `runs_source_*` and `runs_job_*` (#134): `source_*` and `job_*` with a test feature stage
+//!   whose far LOD stacks a run of 6 blocks over every dry cell (the test trees of
+//!   `tests/support/region.rs`): what the feature runs add to a node;
 //! - `coarse_*` (levels 4 and 6): the source call with the kinds' coarse form, which leaves the
 //!   detail out from level 3 (the game's lever for its kinds' cost far away);
 //! - `machinery_*`: the source call with kinds of no cost of their own (the Context's base plus
@@ -230,6 +233,13 @@ fn bench(c: &mut Criterion) {
         plain,
     );
     let plain = generator(&plain_world, SEED, RegionSettings::default());
+    // The detailed world with the test trees and their far LOD run on every dry cell.
+    let runs = generator_with(
+        &world,
+        SEED,
+        RegionSettings::default(),
+        decoration().with_feature(id("test:groves"), Arc::new(Groves::new(12, 6))),
+    );
     let materials = LodMaterials::from_registry(&registry);
     let mut padded = PaddedChunk::new();
     let mut mesher = Mesher::new();
@@ -330,6 +340,51 @@ fn bench(c: &mut Criterion) {
                         miss(&mut scratch);
                         let start = Instant::now();
                         black_box(job(&mut scratch));
+                        total += start.elapsed();
+                    }
+                    total
+                });
+            });
+            // The same node with the feature runs.
+            let mut runs_job = |scratch: &mut LodScratch| {
+                let (mut nodes, mut quads) = (0, 0);
+                runs.column(&req, &registry, scratch, &mut |_, node| {
+                    if let LodNode::Cells(cells) = node
+                        && nodes < NODES_PER_JOB
+                    {
+                        materials.fill(&cells.0[..], &mut padded);
+                        mesh_node(&mut mesher, &padded, &materials, level, &mut mesh);
+                        nodes += 1;
+                        quads += mesh.quads.len();
+                    }
+                });
+                (nodes, quads)
+            };
+            let (nodes, quads) = runs_job(&mut scratch);
+            let band = runs.column(&req, &registry, &mut scratch, &mut |_, _| {});
+            eprintln!(
+                "lod l{level} {name} with the runs: band {}..{}, {nodes} nodes meshed, {quads} quads",
+                band.lo, band.hi
+            );
+            g_bench.bench_function(format!("runs_source_{name}_l{level}"), |b| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        runs.column(&other, &registry, &mut scratch, &mut |_, _| {});
+                        let start = Instant::now();
+                        runs.column(black_box(&req), &registry, &mut scratch, &mut |_, _| {});
+                        total += start.elapsed();
+                    }
+                    total
+                });
+            });
+            g_bench.bench_function(format!("runs_job_{name}_l{level}"), |b| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        runs.column(&other, &registry, &mut scratch, &mut |_, _| {});
+                        let start = Instant::now();
+                        black_box(runs_job(&mut scratch));
                         total += start.elapsed();
                     }
                     total
