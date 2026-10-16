@@ -8,8 +8,9 @@
 //! - additivity: an added entry changes only the lattice points it now wins, and removing it gives
 //!   the old map and digest back;
 //! - seams and slope: heights stay within 3:1 (in 1/256 block, with the kinds' rounding) along
-//!   random lines across kind borders, diagonals and triple points included, and the border
-//!   columns of two chunks agree with the point query;
+//!   random lines across kind borders, diagonals and triple points included, and across the
+//!   walls of a shape modifier that passes the slope check, and the border columns of two chunks
+//!   agree with the point query;
 //! - bounds: the fast paths (air over the local top, the deep path) give what the column stage
 //!   gives, nothing but air lies over the local top, and every ground lies between the local
 //!   bounds;
@@ -34,8 +35,8 @@ use boxel_worldgen::realm::{FluidRule, RealmLod, RealmSky, RealmSpan, RealmSpec,
 use boxel_worldgen::region::{
     ChunkColumns, Decoration, DimensionGenerator, Entry, FlatKind, FloorFill, HEIGHT_ONE, HeightQ,
     Interval, KindForm, KindGrid, KindLimits, NoSurface, REALM_GENERATOR, RegionGenerator,
-    RegionSettings, RegionSpec, RuleEntry, Scope, SelectorRule, SurfaceReach, SurfaceStage,
-    TerrainKind, check_modifiers, clear_worker_memo,
+    RegionSettings, RegionSpec, RuleEntry, Scope, SelectorRule, ShapeModifier, SurfaceReach,
+    SurfaceStage, TerrainKind, check_modifiers, clear_worker_memo,
 };
 use boxel_worldgen::registry::{
     Checks, DigestBuilder, GenEntry, GenId, GenRegistryBuilder, HashParams, ParamsHasher, Problem,
@@ -486,6 +487,39 @@ fn heights_stay_within_three_to_one_across_borders() {
     }
     assert!(triples > 0, "no triple point");
     assert!(borders > 20, "{borders} border steps");
+}
+
+#[test]
+fn heights_stay_within_three_to_one_across_the_walls_of_a_shape_modifier() {
+    // Valleys whose walls pass the modifiers' slope check on the test kinds (the world opens with
+    // them): summed with the kinds' slopes and border reliefs, the heights keep 3:1 on any line.
+    let valleys = Valleys {
+        period: 4096,
+        gap: 1024,
+        width: 1024,
+        floor: -40 * HEIGHT_ONE,
+        depth: 320 * 256,
+        divide: true,
+    };
+    let g = generator_with(
+        &world(CELLS),
+        SEED,
+        RegionSettings::default(),
+        decoration().with_modifier(id("test:valleys"), Arc::new(valleys)),
+    );
+    let j = jitter(&g) + ShapeModifier::<TestContext>::slope(&valleys).jitter;
+    let mut borders = 0;
+    for n in 0..20u64 {
+        let seed = splitmix64(n);
+        let d = [(0, 1), (1, 1), (-1, 1), (2, 1), (1, 3)][(n % 5) as usize];
+        // From outside the first valley's outer wall to past the second valley's.
+        let start = (
+            (seed % 16_000) as i64 - 8000,
+            -1100 - ((seed >> 32) % 200) as i64,
+        );
+        borders += check_line(&g, start, d, 3300 / d.1, j);
+    }
+    assert!(borders > 5, "{borders} border steps");
 }
 
 #[test]
