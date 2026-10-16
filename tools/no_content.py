@@ -38,11 +38,12 @@ DEMO_DEPS = {'boxel_voxel', 'boxel_worldgen', 'boxel_pack', 'boxel_fog'}
 # Crates under crates/ that are not scanned.
 UNSCANNED = {DEMO, 'boxel_facade_check'}
 
-# Engine names that stay: the two built-in states and the save format keys.
+# Engine names that stay: the two built-in states, the save format keys and the realm (and its
+# environment) of a generator that declares none (ADR 0039).
 RESERVED = {
     'boxel:', 'boxel:air', 'boxel:unknown',
     'boxel:format', 'boxel:states', 'boxel:generator', 'boxel:ticks', 'boxel:clock',
-    'boxel:entities', 'boxel:body',
+    'boxel:entities', 'boxel:body', 'boxel:default',
 }
 IDENTS = {
     'default_blocks', 'with_default_blocks', 'BuiltinLamp', 'LAMPS', 'LAVA_EMISSION',

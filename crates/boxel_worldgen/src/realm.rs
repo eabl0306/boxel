@@ -1,15 +1,18 @@
-//! The layout of a dimension's realms along y (ADR 0039 sec. 2): each realm's slab between two
-//! planes ([`RealmSpan`]), its form ([`RealmForm`]) and whether the far LOD draws it
-//! ([`RealmLod`]), and the freeze checks of a layout ([`check_realms`]).
+//! The realms of a dimension along y (ADR 0039 sec. 2): each realm's slab between two planes
+//! ([`RealmSpan`]), its form ([`RealmForm`]), whether the far LOD draws it ([`RealmLod`]), the
+//! rest of its spec ([`RealmSpec`]: datum, [`FluidRule`], floor, [`RealmSky`], environment), the
+//! freeze checks of a layout ([`check_realms`]) and the stack that finds the realm of a `y`
+//! ([`RealmStack`]).
 //!
-//! Only what those checks need lives here so far. The rest of a realm's spec (datum, fluid
-//! rule, floor, sky, environment) and the realm stack that dispatches chunks by `y` come with
-//! WG-REGION, which builds on these types.
+//! A realm's terrain comes from its own generator, and the generator of a dimension dispatches each
+//! chunk to the generator of its realm (WG-REGION).
 
-use crate::registry::{Checks, GenId, HashParams, ParamsHasher, Problem};
-use boxel_voxel::MAX_BLOCK_COORD;
+use crate::registry::{Checks, GenEntry, GenId, HashParams, ParamsHasher, Problem};
+use boxel_voxel::{CHUNK_SHIFT, MAX_BLOCK_COORD};
 use std::collections::BTreeSet;
 use std::fmt;
+use std::ops::RangeInclusive;
+use std::sync::LazyLock;
 
 /// Planes between realms sit on multiples of this many blocks: no far LOD node up to level 7
 /// (4,096 blocks) straddles one, and a chunk is always in exactly one realm.
@@ -319,6 +322,306 @@ fn check_cover(checks: &mut Checks, dimension: &GenId, realms: &[(&GenId, &Realm
     }
     if covered < OPEN_HI {
         gap(covered, OPEN_HI, top, None);
+    }
+}
+
+impl RealmSpan {
+    /// The chunk layers inside the span (planes are multiples of [`REALM_PLANE`], so a chunk is
+    /// inside or outside as a whole), empty for an empty span.
+    pub fn chunk_layers(self) -> RangeInclusive<i64> {
+        let lo = self.lo.map_or(i64::MIN, |lo| lo >> CHUNK_SHIFT);
+        let hi = self.hi.map_or(i64::MAX, |hi| (hi >> CHUNK_SHIFT) - 1);
+        if self.is_empty() {
+            RangeInclusive::new(1, 0)
+        } else {
+            lo..=hi
+        }
+    }
+}
+
+/// The block name of air: a realm's [`RealmSpec::floor`] when nothing lies under its lowest
+/// surface ([`RealmForm::Ceiling`], [`RealmForm::Void`]).
+pub const AIR_NAME: &str = "boxel:air";
+
+/// How the sky lights a realm (ADR 0039 sec. 15). The direction only: the sky light reads it once
+/// EW-REALMSKY lands; until then every world is lit as today.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RealmSky {
+    /// Lit from above: a voxel has direct sky over the realm's own content in its column.
+    Open,
+    /// Lit from below: the air between the realm's bottom plane and its first blocker (the air
+    /// under a ceiling of the sky).
+    Under,
+    /// No direct sky (a game's nether); spread light still crosses the planes.
+    Closed,
+}
+
+impl RealmSky {
+    /// The stable number of the sky, for the parameter hash.
+    const fn code(self) -> u8 {
+        match self {
+            Self::Open => 0,
+            Self::Under => 1,
+            Self::Closed => 2,
+        }
+    }
+}
+
+impl HashParams for RealmSky {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&self.code());
+    }
+}
+
+/// The fluid of a realm, column by column (ADR 0039 sec. 2). Kinds never place fluid, so a
+/// border between kinds never makes a wall of water.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum FluidRule {
+    /// No fluid.
+    None,
+    /// A column whose ground lies under `level` holds `fluid` from the block over its ground up
+    /// to `level`, both included. It reads the column's height before the core terms (which do
+    /// not exist yet, so the blended height), so a lowering core stays dry.
+    SeaLevel {
+        /// The `y` of the highest fluid block.
+        level: i64,
+        /// The fluid's block name (its default state, a source).
+        fluid: String,
+    },
+}
+
+impl FluidRule {
+    /// The `y` of the highest fluid block a column of ground `ground` holds, `None` if it is dry.
+    pub const fn top(&self, ground: i64) -> Option<i64> {
+        match self {
+            Self::SeaLevel { level, .. } if ground < *level => Some(*level),
+            _ => None,
+        }
+    }
+}
+
+impl HashParams for FluidRule {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        match self {
+            Self::None => h.write(&0u8),
+            Self::SeaLevel { level, fluid } => h.write(&1u8).write(level).write(fluid),
+        };
+    }
+}
+
+/// A realm of a dimension (ADR 0039 sec. 2): registered under its id (`game:surface`) in the
+/// realms' registry, so its id is not a field.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RealmSpec {
+    /// The slab of `y`.
+    pub span: RealmSpan,
+    /// Which surfaces its kinds give. Only [`RealmForm::Ground`] is built.
+    pub form: RealmForm,
+    /// The origin of its heights (the sea level of a surface realm): kinds work in 1/256 of a
+    /// block over it, and a height `h` is the block `datum + (h >> 8)`.
+    pub datum: i64,
+    /// Its fluid, column by column.
+    pub fluid: FluidRule,
+    /// The block name of the state under its lowest surface (its rock), [`AIR_NAME`] for the forms
+    /// over air. The far LOD reports it under a column's band, and the deep path fills with it
+    /// unless the realm's fill stage says otherwise.
+    pub floor: String,
+    /// How the sky lights it.
+    pub sky: RealmSky,
+    /// Whether the far LOD draws it (exactly one realm per dimension does).
+    pub lod: RealmLod,
+    /// Its environment: an id in the game's table of environments (fog, daylight, LOD on or off).
+    pub env: GenId,
+    /// The version of its entry ([`GenEntry::version`]).
+    pub version: u32,
+}
+
+impl RealmSpec {
+    /// The part of the spec the layout checks read ([`check_realms`]).
+    pub const fn layout(&self) -> RealmLayout {
+        RealmLayout {
+            span: self.span,
+            form: self.form,
+            lod: self.lod,
+        }
+    }
+}
+
+impl HashParams for RealmSpec {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&self.span)
+            .write(&self.form)
+            .write(&self.datum)
+            .write(&self.fluid)
+            .write(&self.floor)
+            .write(&self.sky)
+            .write(&self.lod)
+            .write(&self.env);
+    }
+}
+
+impl GenEntry for RealmSpec {
+    fn version(&self) -> u32 {
+        self.version
+    }
+}
+
+/// The checks of each realm's floor against its form (ADR 0039 sec. 12), recorded in `checks`: a
+/// [`RealmForm::Ground`] or [`RealmForm::Cavern`] realm lies on rock, so its floor is not
+/// [`AIR_NAME`]; a [`RealmForm::Ceiling`] or [`RealmForm::Void`] realm lies over air, so its floor
+/// is ([`Problem::FloorPolicy`]). The far LOD reports the floor under the drawn realm's band, and
+/// it must agree between neighbor columns, so a realm has one.
+pub fn check_floors<'a>(
+    checks: &mut Checks,
+    dimension: &GenId,
+    realms: impl IntoIterator<Item = (&'a GenId, &'a RealmSpec)>,
+) {
+    for (realm, spec) in realms {
+        let over_air = matches!(spec.form, RealmForm::Ceiling | RealmForm::Void);
+        if over_air != (spec.floor == AIR_NAME) {
+            checks.push(Problem::FloorPolicy {
+                dimension: dimension.clone(),
+                realm: realm.clone(),
+                form: spec.form,
+                floor: spec.floor.clone(),
+            });
+        }
+    }
+}
+
+/// The realms of a dimension, bottom first, and the planes between them: what a dimension's
+/// generator dispatches by.
+///
+/// Built through the layout checks, its realms cover every `y` exactly once, so
+/// [`RealmStack::realm_of`] always answers: a binary search over at most [`MAX_REALM_PLANES`]
+/// planes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RealmStack {
+    /// Bottom first.
+    realms: Box<[(GenId, RealmSpec)]>,
+    /// `planes[i]` is the bottom plane of realm `i + 1`.
+    planes: Box<[i64]>,
+    /// The realm the far LOD draws.
+    drawn: usize,
+}
+
+/// The id of the realm (and its environment) of a generator that declares none.
+const DEFAULT_REALM: &str = "boxel:default";
+
+static SINGLE: LazyLock<RealmStack> = LazyLock::new(|| {
+    let id = GenId::new(DEFAULT_REALM).expect("a valid id");
+    RealmStack::of_one(
+        id.clone(),
+        RealmSpec {
+            span: RealmSpan::ALL,
+            form: RealmForm::Ground,
+            datum: 0,
+            fluid: FluidRule::None,
+            floor: AIR_NAME.to_owned(),
+            sky: RealmSky::Open,
+            lod: RealmLod::Draw,
+            env: id,
+            version: 0,
+        },
+    )
+});
+
+impl RealmStack {
+    /// The stack of `realms` in `dimension`, in any order, or `None` with the problems recorded in
+    /// `checks`: the layout checks ([`check_realms`]) and the floor checks ([`check_floors`]).
+    pub fn build(
+        checks: &mut Checks,
+        dimension: &GenId,
+        mut realms: Vec<(GenId, RealmSpec)>,
+    ) -> Option<Self> {
+        let before = checks.found();
+        let layouts: Vec<(&GenId, RealmLayout)> = realms
+            .iter()
+            .map(|(id, spec)| (id, spec.layout()))
+            .collect();
+        check_realms(checks, dimension, layouts.iter().map(|(id, l)| (*id, l)));
+        check_floors(
+            checks,
+            dimension,
+            realms.iter().map(|(id, spec)| (id, spec)),
+        );
+        if checks.found() > before {
+            return None;
+        }
+        // Covering every `y` once, the realms sort by their bottoms: only the first is open.
+        realms.sort_by_key(|(_, spec)| spec.span.lo);
+        let planes = realms[1..]
+            .iter()
+            .map(|(_, spec)| spec.span.lo.expect("only the bottom realm is open below"))
+            .collect();
+        let drawn = realms
+            .iter()
+            .position(|(_, spec)| spec.lod == RealmLod::Draw)
+            .expect("checked: one drawn realm");
+        Some(Self {
+            realms: realms.into(),
+            planes,
+            drawn,
+        })
+    }
+
+    /// One realm, unchecked: a realm generator's own view, where `realm_of` gives it for every
+    /// `y`.
+    pub(crate) fn of_one(id: GenId, spec: RealmSpec) -> Self {
+        Self {
+            realms: vec![(id, spec)].into(),
+            planes: Box::new([]),
+            drawn: 0,
+        }
+    }
+
+    /// The stack of a generator that declares no realm: one realm, `boxel:default`,
+    /// spanning every `y`, with the [`RealmForm::Ground`] form, an open sky and the far LOD on
+    /// (its own source, if any). Its floor is air: the engine does not know what lies under such
+    /// a generator's terrain.
+    pub fn single() -> &'static Self {
+        &SINGLE
+    }
+
+    /// The number of realms.
+    pub fn len(&self) -> usize {
+        self.realms.len()
+    }
+
+    /// Whether the stack has no realm (never: a stack covers every `y`).
+    pub fn is_empty(&self) -> bool {
+        self.realms.is_empty()
+    }
+
+    /// The index of the realm of `y`: the number of planes at or under it.
+    #[inline]
+    pub fn realm_of(&self, y: i64) -> usize {
+        self.planes.partition_point(|&plane| plane <= y)
+    }
+
+    /// The id of realm `ix`. Panics if out of range.
+    pub fn id(&self, ix: usize) -> &GenId {
+        &self.realms[ix].0
+    }
+
+    /// The spec of realm `ix`. Panics if out of range.
+    pub fn spec(&self, ix: usize) -> &RealmSpec {
+        &self.realms[ix].1
+    }
+
+    /// The index of the realm the far LOD draws.
+    pub const fn drawn(&self) -> usize {
+        self.drawn
+    }
+
+    /// The planes between the realms, ascending.
+    pub fn planes(&self) -> &[i64] {
+        &self.planes
+    }
+
+    /// Every realm with its id, bottom first.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&GenId, &RealmSpec)> {
+        self.realms.iter().map(|(id, spec)| (id, spec))
     }
 }
 

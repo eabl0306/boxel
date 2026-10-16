@@ -112,6 +112,18 @@ pub enum Problem {
         /// Its form.
         form: RealmForm,
     },
+    /// A realm whose floor does not fit its form: a `Ground` or `Cavern` realm lies on rock (a
+    /// floor that is not air), a `Ceiling` or `Void` realm over air.
+    FloorPolicy {
+        /// The dimension.
+        dimension: GenId,
+        /// The realm.
+        realm: GenId,
+        /// Its form.
+        form: RealmForm,
+        /// Its floor's block name.
+        floor: String,
+    },
     /// A check the engine does not define (the game's own), with its ids and message.
     Other {
         /// The ids the problem involves.
@@ -138,6 +150,9 @@ impl Problem {
                 dimension, realm, ..
             }
             | Self::FormNotBuilt {
+                dimension, realm, ..
+            }
+            | Self::FloorPolicy {
                 dimension, realm, ..
             } => vec![dimension, realm],
             Self::Overlap { dimension, a, b } => vec![dimension, a, b],
@@ -249,6 +264,23 @@ impl fmt::Display for Problem {
                 "realm {realm} of dimension {dimension} has the form {form}, which is not built \
                  yet"
             ),
+            Self::FloorPolicy {
+                dimension,
+                realm,
+                form,
+                floor,
+            } => {
+                let needs = if matches!(form, RealmForm::Ceiling | RealmForm::Void) {
+                    "air"
+                } else {
+                    "a floor that is not air"
+                };
+                write!(
+                    f,
+                    "realm {realm} of dimension {dimension} has the form {form} and the floor \
+                     {floor}; its form needs {needs}"
+                )
+            }
             Self::Other { message, .. } => f.write_str(message),
         }
     }
@@ -304,6 +336,8 @@ impl std::error::Error for FreezeError {}
 #[derive(Clone, Debug, Default)]
 pub struct Checks {
     problems: Vec<Problem>,
+    /// Every problem pushed so far, a repeated one counted again ([`Checks::found`]).
+    found: usize,
     /// The names of the registries frozen so far.
     registries: Vec<&'static str>,
 }
@@ -313,18 +347,32 @@ impl Checks {
     pub const fn new() -> Self {
         Self {
             problems: Vec::new(),
+            found: 0,
             registries: Vec::new(),
         }
     }
 
-    /// Records `problem`.
+    /// Records `problem`, once: a problem two checks find (a realm's form, checked by its stack
+    /// and by its generator) is reported once.
     pub fn push(&mut self, problem: Problem) {
-        self.problems.push(problem);
+        self.found += 1;
+        if !self.problems.contains(&problem) {
+            self.problems.push(problem);
+        }
     }
 
-    /// Records every problem of `error`.
+    /// How many problems the checks found so far, a repeated one counted again: a builder that
+    /// compares it before and after its checks knows whether they failed, even when a problem
+    /// was already reported.
+    pub const fn found(&self) -> usize {
+        self.found
+    }
+
+    /// Records every problem of `error` ([`Checks::push`]).
     pub fn extend(&mut self, error: FreezeError) {
-        self.problems.extend(error.problems);
+        for problem in error.problems {
+            self.push(problem);
+        }
     }
 
     /// Freezes `builder` ([`GenRegistryBuilder::freeze`]): the registry, or `None` with its

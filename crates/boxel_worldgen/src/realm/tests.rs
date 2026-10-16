@@ -1,6 +1,7 @@
 //! Realm spans, exact up to the ends of `i64`, and every layout check failing with its ids in the
 //! message (ADR 0039 "Cómo se prueba" 4 and 11), the realms covering every y exactly once (also
-//! against a brute force over random layouts). Then a whole world open over
+//! against a brute force over random layouts). The realm specs, their floor check and the stack
+//! that finds the realm of a `y` at and around every plane. Then a whole world open over
 //! test registries (a preset, its dimensions, their realms and kinds): every problem of a bad mix
 //! reported at once, and the digest of a good one per dimension and realm, with a realm added as
 //! one more line. The real presets and dimension tables come with WG-SAVE; these are `test:`
@@ -657,6 +658,264 @@ proptest! {
         }
         prop_assert!(gaps.is_sorted_by_key(|g| g.lo.map_or(i128::MIN, i128::from)));
     }
+}
+
+// ---- Realm specs and stacks -------------------------------------------------------------------
+
+fn spec(span: RealmSpan, form: RealmForm, lod: RealmLod, floor: &str) -> RealmSpec {
+    RealmSpec {
+        span,
+        form,
+        datum: 63,
+        fluid: FluidRule::SeaLevel {
+            level: 63,
+            fluid: "test:fluid".into(),
+        },
+        floor: floor.into(),
+        sky: RealmSky::Open,
+        lod,
+        env: id("test:env"),
+        version: 1,
+    }
+}
+
+#[test]
+fn a_stack_finds_the_realm_of_every_y() {
+    let realms = vec![
+        (
+            id("test:sky"),
+            spec(
+                RealmSpan::above(12288),
+                RealmForm::Ground,
+                RealmLod::Off,
+                "test:solid",
+            ),
+        ),
+        (
+            id("test:surface"),
+            spec(
+                RealmSpan::between(-4096, 12288),
+                RealmForm::Ground,
+                RealmLod::Draw,
+                "test:solid",
+            ),
+        ),
+        (
+            id("test:deep"),
+            spec(
+                RealmSpan::below(-4096),
+                RealmForm::Ground,
+                RealmLod::Off,
+                "test:solid",
+            ),
+        ),
+    ];
+    let mut checks = Checks::new();
+    let stack = RealmStack::build(&mut checks, &id("test:dim"), realms).expect("a good stack");
+    assert!(checks.is_empty());
+    // Bottom first, whatever order they came in.
+    let ids: Vec<&str> = stack.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, ["test:deep", "test:surface", "test:sky"]);
+    assert_eq!(stack.planes(), [-4096, 12288]);
+    assert_eq!((stack.len(), stack.drawn()), (3, 1));
+    for (y, realm) in [
+        (i64::MIN, 0),
+        (-4097, 0),
+        (-4096, 1),
+        (-4095, 1),
+        (0, 1),
+        (12287, 1),
+        (12288, 2),
+        (12289, 2),
+        (i64::MAX, 2),
+    ] {
+        assert_eq!(stack.realm_of(y), realm, "y {y}");
+        assert!(stack.spec(realm).span.contains(y), "y {y}");
+    }
+    // A chunk is in one realm: its lowest and highest voxels agree, at every plane.
+    for plane in [-4096i64, 12288] {
+        for layer in (plane >> 5) - 2..(plane >> 5) + 2 {
+            let (lo, hi) = (layer << 5, (layer << 5) + 31);
+            assert_eq!(stack.realm_of(lo), stack.realm_of(hi), "layer {layer}");
+        }
+    }
+    assert_eq!(stack.spec(1).span.chunk_layers(), -128..=383);
+    assert_eq!(stack.spec(0).span.chunk_layers(), i64::MIN..=-129);
+    assert!(RealmSpan::between(0, 0).chunk_layers().is_empty());
+
+    // A bad stack is refused with its problems, also when they were already reported (two
+    // realms open above, one gap under them, no drawn realm).
+    let mut checks = Checks::new();
+    let bad = vec![
+        (
+            id("test:only"),
+            spec(
+                RealmSpan::above(0),
+                RealmForm::Ground,
+                RealmLod::Off,
+                "test:solid",
+            ),
+        ),
+        (
+            id("test:open"),
+            spec(
+                RealmSpan::above(4096),
+                RealmForm::Ground,
+                RealmLod::Off,
+                "test:solid",
+            ),
+        ),
+    ];
+    assert!(RealmStack::build(&mut checks, &id("test:dim"), bad.clone()).is_none());
+    assert!(RealmStack::build(&mut checks, &id("test:dim"), bad).is_none());
+    let message = checks.finish().unwrap_err().to_string();
+    assert_eq!(
+        message.matches("no realm the far LOD draws").count(),
+        1,
+        "{message}"
+    );
+}
+
+#[test]
+fn a_floor_must_fit_its_form() {
+    let realms = [
+        (
+            id("test:ground"),
+            spec(RealmSpan::ALL, RealmForm::Ground, RealmLod::Draw, AIR_NAME),
+        ),
+        (
+            id("test:roof"),
+            spec(
+                RealmSpan::ALL,
+                RealmForm::Ceiling,
+                RealmLod::Off,
+                "test:solid",
+            ),
+        ),
+        (
+            id("test:void"),
+            spec(RealmSpan::ALL, RealmForm::Void, RealmLod::Off, AIR_NAME),
+        ),
+        (
+            id("test:cave"),
+            spec(
+                RealmSpan::ALL,
+                RealmForm::Cavern,
+                RealmLod::Off,
+                "test:solid",
+            ),
+        ),
+    ];
+    let mut checks = Checks::new();
+    check_floors(
+        &mut checks,
+        &id("test:dim"),
+        realms.iter().map(|(id, s)| (id, s)),
+    );
+    let message = checks.finish().unwrap_err().to_string();
+    names_all(
+        &message,
+        &[
+            "realm test:ground of dimension test:dim has the form Ground and the floor boxel:air; \
+             its form needs a floor that is not air",
+            "realm test:roof of dimension test:dim has the form Ceiling and the floor test:solid; \
+             its form needs air",
+        ],
+    );
+    assert!(
+        !message.contains("test:void") && !message.contains("test:cave"),
+        "{message}"
+    );
+}
+
+#[test]
+fn the_fluid_rule_wets_columns_under_its_level() {
+    let sea = FluidRule::SeaLevel {
+        level: 63,
+        fluid: "test:fluid".into(),
+    };
+    assert_eq!(sea.top(62), Some(63));
+    assert_eq!(sea.top(63), None);
+    assert_eq!(sea.top(i64::MIN), Some(63));
+    assert_eq!(FluidRule::None.top(0), None);
+}
+
+#[test]
+fn realm_spec_hashes_follow_every_field() {
+    let base = spec(
+        RealmSpan::ALL,
+        RealmForm::Ground,
+        RealmLod::Draw,
+        "test:solid",
+    );
+    let others = [
+        RealmSpec {
+            datum: 0,
+            ..base.clone()
+        },
+        RealmSpec {
+            fluid: FluidRule::None,
+            ..base.clone()
+        },
+        RealmSpec {
+            fluid: FluidRule::SeaLevel {
+                level: 62,
+                fluid: "test:fluid".into(),
+            },
+            ..base.clone()
+        },
+        RealmSpec {
+            floor: "test:glass".into(),
+            ..base.clone()
+        },
+        RealmSpec {
+            sky: RealmSky::Closed,
+            ..base.clone()
+        },
+        RealmSpec {
+            sky: RealmSky::Under,
+            ..base.clone()
+        },
+        RealmSpec {
+            env: id("test:dark"),
+            ..base.clone()
+        },
+        RealmSpec {
+            span: RealmSpan::above(0),
+            ..base.clone()
+        },
+    ];
+    let hash = crate::registry::hash_params(&base);
+    for other in &others {
+        assert_ne!(crate::registry::hash_params(other), hash, "{other:?}");
+    }
+    // The version is the entry's, not a parameter.
+    let newer = RealmSpec {
+        version: 2,
+        ..base.clone()
+    };
+    assert_eq!(crate::registry::hash_params(&newer), hash);
+    assert_eq!(newer.version(), 2);
+    assert_eq!(base.layout(), ground(RealmSpan::ALL, RealmLod::Draw));
+}
+
+#[test]
+fn the_default_stack_is_one_open_drawn_realm() {
+    let stack = RealmStack::single();
+    assert_eq!(stack.len(), 1);
+    assert_eq!(stack.id(0).as_str(), "boxel:default");
+    let spec = stack.spec(0);
+    assert_eq!(
+        (spec.span, spec.form, spec.sky, spec.lod),
+        (
+            RealmSpan::ALL,
+            RealmForm::Ground,
+            RealmSky::Open,
+            RealmLod::Draw
+        )
+    );
+    assert_eq!(stack.realm_of(i64::MIN), 0);
+    assert_eq!(stack.realm_of(i64::MAX), 0);
 }
 
 // ---- A world open over test registries ------------------------------------------------------

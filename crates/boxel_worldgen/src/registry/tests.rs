@@ -774,3 +774,18 @@ fn a_memo_resets_when_the_build_changes() {
     assert_eq!(*memo.get(a_again, Vec::clear), [] as [u32; 0]);
     assert_eq!(memo.key(), Some(a_again));
 }
+
+#[test]
+fn a_problem_found_twice_is_reported_once_and_counted_twice() {
+    let mut checks = Checks::new();
+    let problem = Problem::Unknown {
+        registry: "test_entry",
+        id: id("test:gone"),
+        by: id("test:by"),
+    };
+    checks.push(problem.clone());
+    checks.push(problem.clone());
+    checks.extend(FreezeError::new(vec![problem.clone()]));
+    assert_eq!(checks.problems(), [problem]);
+    assert_eq!(checks.found(), 3);
+}
