@@ -690,26 +690,20 @@ fn number(
     let mut names: Vec<GenId> = saved.map_or_else(Vec::new, |s| s.names.clone());
     let mut numbers = Vec::with_capacity(made.len());
     for Made { id, .. } in made {
-        let n = match names.iter().position(|n| n == id) {
-            Some(n) => n,
-            None if names.len() < MAX_DIMENSIONS => {
-                names.push(id.clone());
-                names.len() - 1
-            }
-            None => {
-                checks.push(Problem::Other {
-                    ids: vec![id.clone()],
-                    message: format!(
-                        "dimension {id} gets no number: the world's dimension table already \
-                         holds {MAX_DIMENSIONS} names"
-                    ),
-                });
-                continue;
-            }
-        };
-        numbers.push(DimensionId(
-            u16::try_from(n).expect("the table holds at most MAX_DIMENSIONS names"),
-        ));
+        let n = names.iter().position(|n| n == id).unwrap_or_else(|| {
+            names.push(id.clone());
+            names.len() - 1
+        });
+        match u16::try_from(n) {
+            Ok(n) => numbers.push(DimensionId(n)),
+            Err(_) => checks.push(Problem::Other {
+                ids: vec![id.clone()],
+                message: format!(
+                    "dimension {id} gets no number: it is name {n} of the world's dimension \
+                     table, which has {MAX_DIMENSIONS} numbers"
+                ),
+            }),
+        }
     }
     (names, numbers)
 }

@@ -306,9 +306,14 @@ fn a_full_dimension_table_is_an_error_not_a_panic() {
         .expect_err("no number left");
     assert_eq!(
         error.to_string(),
-        "world generation check failed: dimension test:overworld gets no number: the world's \
-         dimension table already holds 65536 names"
+        "world generation check failed: dimension test:overworld gets no number: it is name \
+         65536 of the world's dimension table, which has 65536 numbers"
     );
+    // A table made by hand may be longer than any saved one: a name past the numbers is the same
+    // problem.
+    let mut long = saved.clone();
+    long.names.push(id("test:overworld"));
+    assert!(w.open(&id("test:flat"), 1, &blocks(), Some(&long)).is_err());
     // The last number is still a number.
     saved.names.pop();
     let opened = w
