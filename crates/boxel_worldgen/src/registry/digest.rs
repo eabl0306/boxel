@@ -129,8 +129,9 @@ pub struct RegistryDigest {
 
 impl RegistryDigest {
     /// The digest of `entries`, in any order. A key (scope, registry, id) is listed once: of
-    /// lines with the same key, the first in line order stays (a damaged list, never one a
-    /// [`DigestBuilder`] makes).
+    /// lines with the same key, the first in line order stays. Only a damaged list has two
+    /// different ones: a [`DigestBuilder`] makes none from registries with unique names
+    /// ([`super::Checks::freeze`] refuses a name twice).
     pub fn from_entries(mut entries: Vec<DigestEntry>) -> Self {
         entries.sort();
         entries.dedup_by(|a, b| a.key() == b.key());

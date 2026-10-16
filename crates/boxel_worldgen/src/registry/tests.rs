@@ -435,6 +435,39 @@ fn checks_report_every_problem_of_every_registry_at_once() {
 }
 
 #[test]
+fn two_registries_with_one_name_are_refused() {
+    let (mut kinds, mut wrappers) = (
+        GenRegistryBuilder::new("test_kind"),
+        GenRegistryBuilder::new("test_kind"),
+    );
+    kinds.register(id("test:a"), Entry::new(1));
+    wrappers.register(id("test:a"), Entry::new(2));
+    let mut checks = Checks::new();
+    let kinds = checks.freeze(kinds).expect("no duplicate id");
+    let wrappers = checks.freeze(wrappers).expect("no duplicate id");
+    // Why: lines are keyed by the registry's name, so the two would be one line, and a change
+    // to the one left out would not show in the digest.
+    let mut digest = DigestBuilder::new();
+    let ix = GenIx::new(0);
+    digest
+        .add(&realm_scope(), &kinds, ix)
+        .add(&realm_scope(), &wrappers, ix);
+    assert_eq!(digest.finish().entries().len(), 1);
+    let error = checks.finish().expect_err("one name twice");
+    assert_eq!(
+        error.problems(),
+        [Problem::DuplicateRegistry {
+            registry: "test_kind"
+        }]
+    );
+    assert_eq!(
+        error.to_string(),
+        "world generation check failed: more than one registry is named test_kind"
+    );
+    assert!(error.problems()[0].ids().is_empty());
+}
+
+#[test]
 fn unknown_ids_name_who_asked_for_them() {
     let r = registry(&[(id("test:a"), Entry::new(1))]);
     let mut checks = Checks::new();

@@ -188,7 +188,8 @@ pub struct GenRegistryBuilder<T> {
 
 impl<T> GenRegistryBuilder<T> {
     /// An empty registry called `name` in messages and digest lines (`"realm"`,
-    /// `"terrain_kind"`). Names are unique among the app's registries.
+    /// `"terrain_kind"`). Names are unique among the app's registries ([`Checks::freeze`]
+    /// refuses one twice).
     pub const fn new(name: &'static str) -> Self {
         Self {
             name,

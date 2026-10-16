@@ -25,6 +25,12 @@ pub enum Problem {
         /// How many times it was registered.
         count: usize,
     },
+    /// Two registries frozen with one name ([`Checks::freeze`]): their digest lines and messages
+    /// could not be told apart.
+    DuplicateRegistry {
+        /// The name ([`GenRegistryBuilder::new`]).
+        registry: &'static str,
+    },
     /// An id that its registry does not hold, named by another entry.
     Unknown {
         /// The registry it was looked up in.
@@ -120,6 +126,7 @@ impl Problem {
     pub fn ids(&self) -> Vec<&GenId> {
         match self {
             Self::Duplicate { id, .. } => vec![id],
+            Self::DuplicateRegistry { .. } => Vec::new(),
             Self::Unknown { id, by, .. } => vec![id, by],
             Self::EmptySpan {
                 dimension, realm, ..
@@ -160,6 +167,9 @@ impl fmt::Display for Problem {
                 id,
                 count,
             } => write!(f, "{registry} {id} is registered {count} times"),
+            Self::DuplicateRegistry { registry } => {
+                write!(f, "more than one registry is named {registry}")
+            }
             Self::Unknown { registry, id, by } => {
                 write!(f, "{by} names {registry} {id}, which is not registered")
             }
@@ -294,6 +304,8 @@ impl std::error::Error for FreezeError {}
 #[derive(Clone, Debug, Default)]
 pub struct Checks {
     problems: Vec<Problem>,
+    /// The names of the registries frozen so far.
+    registries: Vec<&'static str>,
 }
 
 impl Checks {
@@ -301,6 +313,7 @@ impl Checks {
     pub const fn new() -> Self {
         Self {
             problems: Vec::new(),
+            registries: Vec::new(),
         }
     }
 
@@ -315,11 +328,19 @@ impl Checks {
     }
 
     /// Freezes `builder` ([`GenRegistryBuilder::freeze`]): the registry, or `None` with its
-    /// problems recorded.
+    /// problems recorded. A name another registry was frozen with here is a
+    /// [`Problem::DuplicateRegistry`]: digest lines are keyed by the registry's name, so two
+    /// registries with one name would merge their lines and hide a change.
     pub fn freeze<T: GenEntry>(
         &mut self,
         builder: GenRegistryBuilder<T>,
     ) -> Option<GenRegistry<T>> {
+        let registry = builder.name();
+        if self.registries.contains(&registry) {
+            self.push(Problem::DuplicateRegistry { registry });
+        } else {
+            self.registries.push(registry);
+        }
         builder.freeze().map_err(|e| self.extend(e)).ok()
     }
 
