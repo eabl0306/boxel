@@ -1,10 +1,10 @@
 //! The registries against ADR 0039 "Cómo se prueba" 3 to 5 (worldgen plan sec. 10, tests 4 and
-//! 5): registering in any order gives the same indices, salts and digest; duplicates and unknown
-//! ids fail with their ids in the message; an added entry changes no other entry's salt, seed or
-//! line, and removing it gives the old digest back; the diff of two digests; no two salts or
-//! octave seeds of the test entries collide; the fixed values of the salt and parameter hash; the
-//! build counter's memo rule. The checks of realm layouts and a whole world open are in
-//! `realm/tests.rs`.
+//! 5): registering in any order gives the same indices, salts and digest; duplicates, two
+//! registries with one name and unknown ids fail with their names in the message; an added entry
+//! changes no other entry's salt, seed or line, and removing it gives the old digest back; the
+//! diff of two digests; no two salts or octave seeds of the test entries collide; the fixed values
+//! of the salt and parameter hash; the build counter's memo rule, with a memo that fits a far LOD
+//! worker's scratch. The checks of realm layouts and a whole world open are in `realm/tests.rs`.
 use super::*;
 use crate::noise::{mix_seed, splitmix64};
 use boxel_voxel::RegistryError;
@@ -715,6 +715,23 @@ fn build_keys_are_unique_across_threads() {
     let all: BTreeSet<BuildKey> = keys.iter().flatten().copied().collect();
     assert_eq!(all.len(), 4000);
     assert!(all.iter().all(|k| k.get() != 0));
+}
+
+#[test]
+fn a_memo_fits_a_lod_workers_scratch() {
+    // `LodScratch::memo` is a `Box<dyn Any + Send>`: a far LOD source keeps its memo there.
+    let mut scratch = crate::lod::LodScratch {
+        memo: Some(Box::new(BuildMemo::new(Vec::<u32>::new()))),
+        ..Default::default()
+    };
+    let key = BuildKey::next();
+    let memo = scratch
+        .memo
+        .as_mut()
+        .and_then(|m| m.downcast_mut::<BuildMemo<Vec<u32>>>())
+        .expect("a build memo");
+    memo.get(key, Vec::clear).push(7);
+    assert_eq!(memo.key(), Some(key));
 }
 
 #[test]
