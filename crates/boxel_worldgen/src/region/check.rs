@@ -1,5 +1,5 @@
 //! The freeze checks of a realm's kinds (ADR 0039 sec. 6 and 12): their forms, their limits, and
-//! the slope and border relief of every pair and triple that can meet.
+//! the slope and border relief of every kind, pair and triple that can meet.
 
 use super::MAX_SLOPE;
 use super::kind::{HEIGHT_ONE, KindForm, KindLimits};
@@ -45,12 +45,14 @@ pub fn border_relief(a: &KindLimits, b: &KindLimits) -> u64 {
 /// The checks of the kinds of `realm` (each id with its form and limits), in `checks`:
 /// - every form is built ([`Problem::KindFormNotBuilt`]);
 /// - every band relief lies inside its relief ([`Problem::KindLimits`]);
-/// - every pair and every triple passes [`slope_passes`] with its steepest slope and largest
-///   border relief ([`Problem::KindSlope`]; a triple is reported only when its three pairs pass).
+/// - every kind alone, every pair and every triple passes [`slope_passes`] with its steepest slope
+///   and largest border relief ([`Problem::KindSlope`]; a pair is reported only when its two kinds
+///   pass alone, a triple only when its three pairs pass).
 ///
 /// Any two kinds of a realm may meet in a window: the rules' conditions cannot tell where they
 /// will hold, so the check takes every pair and triple of the realm. Triples are enough for any
-/// set: a set passes if the triple of its steepest kind and its farthest pair does.
+/// set: a set passes if the triple of its steepest kind and its farthest pair does. A kind alone
+/// is the interior of its regions, where its own slope is the terrain's.
 pub fn check_kinds(
     checks: &mut Checks,
     realm: &GenId,
@@ -82,9 +84,15 @@ pub fn check_kinds(
         });
     };
     let n = kinds.len();
+    let alone = |k: usize| slope_passes(slope(k), 0, lattice);
+    for k in 0..n {
+        if !alone(k) {
+            fail(checks, &[k], slope(k), 0);
+        }
+    }
     for a in 0..n {
         for b in a + 1..n {
-            if !pair(a, b) {
+            if alone(a) && alone(b) && !pair(a, b) {
                 fail(checks, &[a, b], slope(a).max(slope(b)), relief(a, b));
             }
         }

@@ -172,11 +172,11 @@ pub enum Problem {
     },
     /// Kinds of a realm that can meet whose slope and border relief break the 3:1 cap: the
     /// steepest one's slope plus the largest border relief over 543 blocks (at the default
-    /// lattice) is over 3 (ADR 0039 sec. 6).
+    /// lattice) is over 3 (ADR 0039 sec. 6). One kind: its own slope is over 3.
     KindSlope {
         /// The realm.
         realm: GenId,
-        /// The two or three kinds.
+        /// The one, two or three kinds.
         kinds: Vec<GenId>,
         /// The steepest one's slope, in 1/256 block per block, Q16 (the raw value of a `Q16`).
         slope: u64,
@@ -401,6 +401,19 @@ impl fmt::Display for Problem {
                 f,
                 "selector rule {rule} has region cells of 2^{shift} blocks, outside 2^{lattice} \
                  (the lattice) to 2^{max}"
+            ),
+            Self::KindSlope {
+                realm,
+                kinds,
+                slope,
+                relief: 0,
+                ..
+            } if kinds.len() == 1 => write!(
+                f,
+                "terrain kind {} of realm {realm} has a slope of {:.3}, over {MAX_SLOPE}",
+                kinds[0],
+                // Display only: the check itself is exact.
+                *slope as f64 / 65536.0 / 256.0
             ),
             Self::KindSlope {
                 realm,

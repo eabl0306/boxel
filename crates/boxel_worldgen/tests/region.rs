@@ -1368,6 +1368,42 @@ fn kinds_that_break_the_cap_where_they_meet_are_refused() {
     );
 }
 
+#[test]
+fn a_kind_alone_keeps_the_cap() {
+    // A kind steeper than 3:1 was refused beside any other kind (each pair holds the steeper
+    // slope) but opened alone.
+    let world = |kinds: Vec<(&'static str, Arc<dyn TerrainKind<TestContext>>)>| {
+        let entries = kinds
+            .iter()
+            .map(|&(name, _)| Entry::new(id(name), 1))
+            .collect();
+        world_of(
+            vec![("test:surface", realm())],
+            vec![("test:land", rule(0, Vec::new(), Scope::CELL, entries))],
+            Vec::new(),
+            kinds,
+        )
+    };
+    let alone = open(&world(vec![("test:steep", declared(3100, 0, 0))])).expect_err("too steep");
+    assert!(
+        alone
+            .contains("terrain kind test:steep of realm test:surface has a slope of 3.100, over 3"),
+        "{alone}"
+    );
+    // Beside a flat kind it is reported alone, not again with every pair it is in.
+    let beside = open(&world(vec![
+        ("test:steep", declared(3100, 0, 0)),
+        ("test:flat", declared(0, 0, 0)),
+    ]))
+    .expect_err("too steep");
+    assert!(beside.contains("terrain kind test:steep"), "{beside}");
+    assert!(!beside.contains("kinds test:"), "{beside}");
+    assert_eq!(
+        open(&world(vec![("test:steep", declared(3000, 0, 0))])),
+        Ok(())
+    );
+}
+
 fn declared_limits(slope_milli: u64, lo: i64, hi: i64) -> KindLimits {
     let relief = Span::new(lo << 8, hi << 8);
     KindLimits {

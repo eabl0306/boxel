@@ -271,7 +271,8 @@ grad H = suma_k w_k grad H_k + suma_k (H_k - m) grad w_k      (para cualquier co
 - El chequeo al congelar pide `max(slope) + max(D_ab) / 543 <= 3` para todo par y todo trío de
   tipos que las reglas puedan juntar en una misma ventana de 4 x 4 puntos de retícula, con los dos
   máximos tomados dentro del grupo. Con los tríos alcanza: un grupo más grande cumple si cumple el
-  trío de su tipo más empinado y su par más lejano.
+  trío de su tipo más empinado y su par más lejano. Cada tipo solo también pide `slope <= 3`: es
+  el interior de sus regiones.
 - Solo por pares no alcanza: con `a` en [90, 110], `b` en [-110, -90] y un `c` más empinado en
   [-10, 10], cada par pasa con la pendiente máxima que le deja el chequeo y el punto triple llega a
   3,08.
@@ -534,9 +535,9 @@ mundo para el conjunto que resuelve su preset. Rechazan:
   retícula;
 - un tipo cuya forma todavía no está hecha, o cuyo relieve en la banda sale de su relieve;
 - envoltorios que apuntan a ranuras que no existen;
-- un par o un trío de tipos que pueden juntarse y no pasan el chequeo de pendiente y relieve de
-  borde (sección 6). Las condiciones no dicen dónde se cumplen, así el chequeo toma todo par y
-  todo trío de tipos del reino;
+- un tipo con una pendiente de más de 3, o un par o un trío de tipos que pueden juntarse y no
+  pasan el chequeo de pendiente y relieve de borde (sección 6). Las condiciones no dicen dónde se
+  cumplen, así el chequeo toma todo par y todo trío de tipos del reino;
 - términos de núcleo cuyo cono o pendiente propia, sumados a la pendiente de su tipo, rompen el
   tope (sección 7);
 - features sin alcance o sin altura declarados;
