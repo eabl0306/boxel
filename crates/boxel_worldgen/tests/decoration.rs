@@ -9,9 +9,10 @@
 //!   any thread with the memo cold, warm and off; uniform rock and a mask give a 1-bit chunk; no
 //!   mask adds a block or drains the fluid; the digest line, the order, duplicates, block names
 //!   and the apron cap;
-//! - every debug check: a column bound under the heights, a column effect under the cut or
-//!   outside the modifier's effect, a read past the apron (a carver's, the surface stage's), a
-//!   carver whose rules read the surface deeper than its reach.
+//! - every debug check: a column bound under the heights, a column bound right over every chunk
+//!   column and under the heights over a carver's apron, a column effect under the cut or outside
+//!   the modifier's effect, a read past the apron (a carver's, the surface stage's), a carver
+//!   whose rules read the surface deeper than its reach.
 #[path = "support/region.rs"]
 mod support;
 
@@ -478,6 +479,14 @@ fn carved_chunks_are_the_same_in_any_order_on_any_thread_with_any_memo() {
 /// A dry realm of one flat kind at `height` blocks under `()`, on `test:solid`, with
 /// `decoration`.
 fn flat(height: i32, decoration: Decoration<()>) -> Result<RegionGenerator<()>, String> {
+    dry(Arc::new(FlatKind::blocks(height)), decoration)
+}
+
+/// A dry realm of the one kind `kind` under `()`, on `test:solid`, with `decoration`.
+fn dry(
+    kind: Arc<dyn TerrainKind<()>>,
+    decoration: Decoration<()>,
+) -> Result<RegionGenerator<()>, String> {
     let mut checks = Checks::new();
     let mut realms = GenRegistryBuilder::new("realm");
     realms.register(
@@ -500,10 +509,7 @@ fn flat(height: i32, decoration: Decoration<()>) -> Result<RegionGenerator<()>, 
         },
     );
     let mut kinds = GenRegistryBuilder::new("terrain_kind");
-    kinds.register(
-        id("test:flat"),
-        Arc::new(FlatKind::blocks(height)) as Arc<dyn TerrainKind<()>>,
-    );
+    kinds.register(id("test:flat"), kind);
     let (realms, rules, entries, kinds) = (
         checks.freeze(realms).unwrap(),
         checks.freeze(rules).unwrap(),
@@ -971,4 +977,105 @@ fn a_carver_reading_the_surface_past_its_reach_fails() {
         message.contains("test:holes") && message.contains("deeper than its reach"),
         "{message}"
     );
+}
+
+/// A slope falling toward +x and +z (about 2.2:1) with its bounds per chunk column. Right, they
+/// hold every column of `area`; `aligned`, they take `area` for the chunk column of its low
+/// corner: right over every chunk column, under the heights over a carver's apron, which reaches
+/// past the chunk column into the next ones.
+struct Ramp {
+    aligned: bool,
+}
+
+impl Ramp {
+    /// The height of column `(x, z)`.
+    const fn height(x: i64, z: i64) -> i64 {
+        -(x * 549) - (z * 85)
+    }
+}
+
+impl HashParams for Ramp {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&self.aligned);
+    }
+}
+
+impl GenEntry for Ramp {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+
+impl TerrainKind<()> for Ramp {
+    fn limits(&self, _: &()) -> KindLimits {
+        let range = Span::new(-1 << 21, 1 << 21);
+        KindLimits {
+            slope: Slope {
+                per_block: boxel_worldgen::field::Q16::from_raw(560 << 16),
+                jitter: 0,
+            },
+            relief: range,
+            band: range,
+        }
+    }
+    fn range(&self, _: &()) -> Span {
+        Span::new(-1 << 21, 1 << 21)
+    }
+    fn column_bounds(&self, _: &(), _: u64, area: Rect) -> Option<Span> {
+        let (x0, z0, x1, z1) = if self.aligned {
+            let (x0, z0) = (area.x0 & !31, area.z0 & !31);
+            (x0, z0, x0 + 31, z0 + 31)
+        } else {
+            (area.x0, area.z0, area.x1, area.z1)
+        };
+        Some(Span::new(Self::height(x1, z1), Self::height(x0, z0)))
+    }
+    fn heights(&self, grid: &KindGrid<'_, ()>, _: &[bool], out: &mut [HeightQ]) {
+        for (row, &x) in out.chunks_exact_mut(grid.zs.len()).zip(grid.xs) {
+            for (h, &z) in row.iter_mut().zip(grid.zs) {
+                *h = Self::height(x, z) as HeightQ;
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn an_apron_bound_under_the_heights_fails_the_span_check() {
+    let registry = registry();
+    let ramp = |aligned| {
+        dry(
+            Arc::new(Ramp { aligned }),
+            bare().with_carver(id("test:holes"), Arc::new(Holes::new(1, 6, 3))),
+        )
+        .expect("opens")
+    };
+    let (right, wrong) = (ramp(false), ramp(true));
+    // The highest chunk of each column at or under its deep bound. The chunk columns' own grounds
+    // lie in their bounds either way (the point query checks them); the aligned bounds put the
+    // deep bound of some over the grounds of the +x and +z columns of their apron, where the
+    // carver keeps its roof: the deep path would carve that chunk otherwise.
+    let mut caught = 0;
+    for cx in 1..7 {
+        for cz in 1..7 {
+            drop(wrong.column_info(cx << 5, cz << 5));
+            let deep =
+                |g: &RegionGenerator<()>| key(cx, (g.local_bounds(cx, cz).deep - 31) >> 5, cz);
+            let k = deep(&right);
+            assert_eq!(
+                right.generate(k, &registry),
+                right.generate_full(k, &registry),
+                "{k:?}"
+            );
+            let k = deep(&wrong);
+            if let Some(message) = panic_of(|| drop(wrong.generate_full(k, &registry))) {
+                assert!(
+                    message.contains("deep bound") && message.contains("over the apron"),
+                    "{message}"
+                );
+                caught += 1;
+            }
+        }
+    }
+    assert!(caught >= 3, "{caught} chunks caught");
 }

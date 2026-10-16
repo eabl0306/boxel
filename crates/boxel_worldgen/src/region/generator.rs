@@ -142,8 +142,10 @@ pub(super) struct RealmModifier<Cx: Context> {
 ///
 /// In debug builds every chunk of the column stage, and every point query, checks its column
 /// bounds: each column's ground lies between the bounds of its 16 points, nothing but air lies
-/// over the column's top, and that top lies in the realm's vertical range (the kinds' ranges). A
-/// kind or a mod with a bound or a range under its heights fails its tests there.
+/// over the column's top, and that top lies in the realm's vertical range (the kinds' ranges).
+/// A chunk of the column stage at or under its deep bound (one [`RegionGenerator::generate_full`]
+/// builds) also checks that every ground its carvers may read lies their surface reach over it.
+/// A kind or a mod with a bound or a range under its heights fails its tests there.
 pub struct RegionGenerator<Cx: Context> {
     pub(super) key: BuildKey,
     dimension: GenId,
@@ -943,6 +945,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
         let fluid_top = ground.map(|g| if g < level { level } else { g });
         if cfg!(debug_assertions) {
             self.check_grounds(origin, points, bounds, &ground);
+            self.check_deep(origin, bounds, &ground);
         }
         let around = Around(self);
         let columns = ChunkColumns::new(origin, &ground, &fluid_top, &self.cx, &fields, &around);
@@ -995,6 +998,54 @@ impl<Cx: Context> RegionGenerator<Cx> {
             bounds.ground_lo,
             bounds.ground_hi,
             self.window_kinds(points),
+        );
+    }
+
+    /// The debug span check of the deep bound, for a chunk at or under it (one
+    /// [`RegionGenerator::generate_full`] builds; [`WorldGenerator::generate`] takes the deep path
+    /// there): every ground the carvers may read, the chunk's and their widest apron's, lies their
+    /// surface reach or more over the chunk's top. The grounds' own check covers the chunk's
+    /// columns; this one covers the apron, whose bounds come from the hooks over rects that are
+    /// no chunk column ([`TerrainKind::column_bounds`], [`ShapeModifier::column_effect`]).
+    fn check_deep(&self, origin: BlockPos, bounds: &LocalBounds, ground: &[i64; CHUNK_AREA]) {
+        let y1 = origin.y + i64::from(CHUNK_SIZE) - 1;
+        let Some(carve) = self.carve.filter(|_| y1 <= bounds.deep) else {
+            return;
+        };
+        // The chunk's columns and the square of the apron around them, `(x, z)` of `ground[k]` at
+        // `(xs[k / zs.len()], zs[k % zs.len()])`.
+        let (a, size) = (i64::from(carve.apron), i64::from(CHUNK_SIZE));
+        let xs: Vec<i64> = (origin.x - a..origin.x + size + a).collect();
+        let zs: Vec<i64> = (origin.z - a..origin.z + size + a).collect();
+        let ground = if a == 0 {
+            ground.to_vec()
+        } else {
+            let n = xs.len() * zs.len();
+            let (mut ground, mut fluid) = (vec![0; n], vec![0; n]);
+            self.column_tops(&xs, &zs, &mut ground, &mut fluid);
+            ground
+        };
+        let (k, g) = ground
+            .iter()
+            .copied()
+            .enumerate()
+            .min_by_key(|&(_, g)| g)
+            .expect("columns");
+        assert!(
+            y1 <= g.saturating_sub(carve.surface.into()),
+            "{NAME} span check: realm {} chunk at ({}, {}, {}) lies at or under its deep bound {} \
+             (its top at y {y1}), but the column ({}, {}) its carvers may read (apron {a}) has its \
+             ground at y {g}, less than their surface reach {} over it: a kind's column bounds or \
+             a shape modifier's column effect over the apron around the chunk column are under \
+             its heights",
+            self.realm(),
+            origin.x,
+            origin.y,
+            origin.z,
+            bounds.deep,
+            xs[k / zs.len()],
+            zs[k % zs.len()],
+            carve.surface,
         );
     }
 

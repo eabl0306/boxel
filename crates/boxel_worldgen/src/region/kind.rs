@@ -202,13 +202,17 @@ pub trait TerrainKind<Cx: Context>: GenEntry + Send + Sync {
     }
 
     /// Every height it gives at the columns of `area` (a chunk column, or the part of a carver's
-    /// apron that lies in one lattice cell; ADR 0039 sec. 14), or `None` to leave them to
-    /// [`TerrainKind::bounds`] at the lattice points. The generator reads it once per (chunk
-    /// column, kind present) for the column's bounds, in place of the bounds of the kind's
-    /// lattice points (so with every kind present giving one, the column's bounds are their
-    /// union): a kind whose relief varies inside a lattice cell (hills in one corner) then does not
-    /// push every chunk column of the cell through the column stage. A bound under the truth is a
-    /// bug the debug span check catches. `None` by default.
+    /// apron that lies in one lattice cell, a rect that is no chunk column; ADR 0039 sec. 14), or
+    /// `None` to leave them to [`TerrainKind::bounds`] at the lattice points. The generator reads
+    /// it once per (chunk column, kind present) for the column's bounds, in place of the bounds of
+    /// the kind's lattice points (so with every kind present giving one, the column's bounds are
+    /// their union), and over the carvers' apron for the deep bound: a kind whose relief varies
+    /// inside a lattice cell (hills in one corner) then does not push every chunk column of the
+    /// cell through the column stage. A bound under the truth is a bug the debug span checks
+    /// catch: over a chunk column in its chunks and point queries, over an apron in the chunks at
+    /// or under the deep bound that [`RegionGenerator::generate_full`] builds. `None` by default.
+    ///
+    /// [`RegionGenerator::generate_full`]: super::RegionGenerator::generate_full
     fn column_bounds(&self, cx: &Cx, seed: u64, area: Rect) -> Option<Span> {
         let _ = (cx, seed, area);
         None

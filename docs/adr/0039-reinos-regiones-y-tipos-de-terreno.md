@@ -690,7 +690,7 @@ Dentro del generador, sin cambiar el motor (desde WG-DECOR, #133):
   suman cuando lleguen. Son enteros exactos.
 - El memo guarda la última columna de chunk con sus cotas, y los puntos y los tipos de su celda de
   retícula: otra columna de chunk de la misma celda solo llama a los ganchos (una llamada por tipo
-  presente y por modificador).
+  presente y por modificador, y otra por celda de retícula que toca el apron de los carvers).
 - Las mismas lecturas dan `ground_lo`, una cota de abajo del suelo: la cota más baja de los tipos
   menos los cortes de los modificadores (río o término de núcleo). Los carvers no la mueven: bajan
   el camino hondo. El piso del cielo (sección 15) tendrá que contar también su alcance.
@@ -700,7 +700,9 @@ Dentro del generador, sin cambiar el motor (desde WG-DECOR, #133):
   la superficie y bajo el suelo más bajo de la columna de chunk y del apron de los carvers menos su
   `surface`. El apron que cruza a otra celda de retícula lee la ventana de esa celda.
 - En debug, el chequeo de spans hace cumplir los ganchos: el suelo de cada columna queda entre las
-  cotas de su columna de chunk, y cada modificador dentro de su efecto en ella.
+  cotas de su columna de chunk, y cada modificador dentro de su efecto en ella. El apron no es una
+  columna de chunk, así que sus cotas solo las prueba `deep`: un chunk en o bajo `deep` que arma
+  `generate_full` comprueba que todo suelo que leen los carvers queda su `surface` o más sobre él.
 - Esto hace barato generar el aire de la banda, no transmitirlo: cada chunk de la banda sigue
   siendo una slot y un job de generación.
 
