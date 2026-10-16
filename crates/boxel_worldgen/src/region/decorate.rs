@@ -1,16 +1,18 @@
 //! The decoration hook of a realm (ADR 0039 sec. 9): the shape modifiers
 //! ([`ShapeModifier`](super::ShapeModifier), on the blended heights), the fill stage (the rock,
 //! [`FillStage`]), the surface stage (the top of each column, [`SurfaceStage`], with its far LOD
-//! form [`SurfaceStage::lod_top`]) and the carvers (caves, [`CarverStage`]), traits the game
-//! implements, and [`decorate`], which builds a chunk from its columns' grounds with them.
+//! form [`SurfaceStage::lod_top`]), the carvers (caves, [`CarverStage`]) and the features (trees
+//! and plants, [`FeatureStage`], with their far LOD form [`FeatureStage::lod_runs`]), traits the
+//! game implements, and [`decorate`], which builds a chunk from its columns' grounds with them.
 //!
-//! The rest of the decoration layer (biomes, features, structures and post steps, each a registry
-//! of stages by `(phase, priority, id)`) comes with the steps that first need it; none of it has a
-//! slot here yet.
+//! The rest of the decoration layer (biomes, structures and post steps, each a registry of stages
+//! by `(phase, priority, id)`) comes with the steps that first need it; none of it has a slot here
+//! yet.
 
 use super::kind::{Context, HeightQ};
 use super::modifier::ShapeModifier;
 use crate::block;
+use crate::field::Rect;
 use crate::registry::{GenEntry, GenId, HashParams, ParamsHasher};
 use boxel_voxel::{
     BlockPos, BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SHIFT, CHUNK_SIZE, CHUNK_VOLUME,
@@ -214,9 +216,9 @@ impl LodTop {
 }
 
 /// The cell columns of a far LOD node, as the region pass leaves them for the surface stage
-/// ([`SurfaceStage::lod_top`]): the node's padded `34 x 34` cell columns of `2^level` blocks, each
-/// with its ground, its fluid and the corner it takes its look from (the highest one: a steep
-/// cell shows what its top shows).
+/// ([`SurfaceStage::lod_top`]) and the feature stages ([`FeatureStage::lod_runs`]): the node's
+/// padded `34 x 34` cell columns of `2^level` blocks, each with its ground, its fluid and the
+/// corner it takes its look from (the highest one: a steep cell shows what its top shows).
 pub struct LodColumns<'a, Cx: Context> {
     /// The LOD level: cells are `2^level` blocks.
     pub level: u8,
@@ -399,8 +401,97 @@ pub struct RealmCarver<Cx: Context> {
     pub seed: u64,
 }
 
-/// A realm's decoration: its shape modifiers, fill stage, surface stage and carvers, each with
-/// the id of its digest line.
+/// How far a feature stage reaches ([`FeatureStage::reach`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FeatureReach {
+    /// Blocks over each column's ground it may write: it writes only `ground + 1..=ground +
+    /// height` of each column, the column a block lands on (a canopy over a lower neighbor
+    /// counts the slope). At least 1: the world open refuses 0.
+    pub height: u32,
+    /// How far around its chunk it reads columns ([`ChunkColumns::tops`]), in blocks
+    /// (Chebyshev), at most [`MAX_APRON`]: the anchors outside its chunk whose features reach
+    /// into it (a canopy across a chunk border).
+    pub apron: u32,
+}
+
+/// A feature stage of a realm (ADR 0039 sec. 9, FEATURES): trees, plants, boulders. It runs
+/// after the carvers in every chunk its reach touches, the features of other chunks included (a
+/// tree across a layer border is written by both chunks, each its own blocks), and writes only
+/// over each column's ground, as high as it declares. It never runs in the deep path: nothing it
+/// writes lies under a ground.
+///
+/// Its anchors lie in cells aligned with the chunks (8 or 16 blocks), and an anchor's column (its
+/// fields, its biome) decides its feature. Its blocks must be a pure function of its seed, the
+/// Context and the columns it reads (its chunk's and its apron's), so every chunk a tree crosses
+/// writes the same tree: a stage that also reads the chunk's states (a trunk only on the surface
+/// stage's top block) keeps its features inside their chunk, as no other chunk sees those states.
+pub trait FeatureStage<Cx: Context>: GenEntry + Send + Sync {
+    /// How far it reaches over the ground and around its chunk.
+    fn reach(&self) -> FeatureReach;
+
+    /// The most blocks it writes over the ground at the columns of `area` (a chunk column), at
+    /// most [`FeatureReach::height`]: 0 where nothing grows. The chunk column's local top
+    /// ([`LocalBounds::top`](super::LocalBounds::top)) counts it, so the chunks over a bare plain
+    /// stay `Uniform` air; it must count the features anchored outside `area` that reach into it.
+    /// In debug builds a block over it fails the span check of the chunk. By default the height
+    /// of [`FeatureStage::reach`].
+    fn column_height(&self, cx: &Cx, seed: u64, area: Rect) -> u32 {
+        let _ = (cx, seed, area);
+        self.reach().height
+    }
+
+    /// Writes its features into `out`, the chunk's states (`y << 10 | x << 5 | z`, after the
+    /// surface stage, the carvers and the features before it), inside each column's reach; `seed`
+    /// is the realm's seed mixed with the stage's salt. Called only for chunks its reach touches;
+    /// in debug builds [`decorate`] panics if it changed a block outside `ground + 1..=ground +
+    /// height` of its column.
+    fn apply(
+        &self,
+        columns: &ChunkColumns<'_, Cx>,
+        seed: u64,
+        registry: &BlockRegistry,
+        out: &mut [BlockState],
+    );
+
+    /// Every block name the stage looks up in the registry it gets, so the world open checks
+    /// them and a typo fails at load ([`RegionGenerator::build`](super::RegionGenerator::build)),
+    /// not in a worker.
+    fn block_names(&self) -> Vec<&str>;
+
+    /// The far LOD form (ADR 0039 sec. 10): per cell column of a node, a run of `(state,
+    /// blocks)` stacked over the cell column's coarse ground (a canopy), into `out` (one per cell
+    /// column, in `columns`' order, all `(AIR, 0)` on entry). The far LOD draws it as cells
+    /// over the ground, never as margin, and inside the band; a run of 0 blocks, or of a state
+    /// that is not Solid far away, draws nothing. Of the runs the stages give a cell column, the
+    /// tallest is drawn. It should be a pure function of the cell column (hashed per cell, not
+    /// per node), so two nodes and two jobs of a column agree, and at most
+    /// [`FeatureReach::height`] blocks (the exported harness checks both ends of each run).
+    ///
+    /// The default gives none: the stage is not seen far away.
+    fn lod_runs(
+        &self,
+        columns: &LodColumns<'_, Cx>,
+        seed: u64,
+        registry: &BlockRegistry,
+        out: &mut [(BlockState, u32)],
+    ) {
+        let _ = (columns, seed, registry, out);
+    }
+}
+
+/// A feature stage as a realm runs it: its id (for messages), its stage and its seed (the realm's
+/// seed mixed with the stage's salt).
+pub struct RealmFeature<Cx: Context> {
+    /// The stage's id.
+    pub id: GenId,
+    /// The stage.
+    pub stage: Arc<dyn FeatureStage<Cx>>,
+    /// Its seed.
+    pub seed: u64,
+}
+
+/// A realm's decoration: its shape modifiers, fill stage, surface stage, carvers and feature
+/// stages, each with the id of its digest line.
 pub struct Decoration<Cx: Context> {
     /// The fill stage.
     pub fill: (GenId, Arc<dyn FillStage<Cx>>),
@@ -411,10 +502,13 @@ pub struct Decoration<Cx: Context> {
     pub modifiers: Vec<(GenId, Arc<dyn ShapeModifier<Cx>>)>,
     /// The carvers, in any order: they run by `(priority, id)` too.
     pub carvers: Vec<(GenId, Arc<dyn CarverStage<Cx>>)>,
+    /// The feature stages, in any order: they run by `(priority, id)` too.
+    pub features: Vec<(GenId, Arc<dyn FeatureStage<Cx>>)>,
 }
 
 impl<Cx: Context> Decoration<Cx> {
-    /// The stages `fill` and `surface`, with their ids, and no shape modifier or carver.
+    /// The stages `fill` and `surface`, with their ids, and no shape modifier, carver or feature
+    /// stage.
     pub fn new(
         fill: (GenId, Arc<dyn FillStage<Cx>>),
         surface: (GenId, Arc<dyn SurfaceStage<Cx>>),
@@ -424,6 +518,7 @@ impl<Cx: Context> Decoration<Cx> {
             surface,
             modifiers: Vec::new(),
             carvers: Vec::new(),
+            features: Vec::new(),
         }
     }
 
@@ -438,6 +533,13 @@ impl<Cx: Context> Decoration<Cx> {
     #[must_use]
     pub fn with_carver(mut self, id: GenId, carver: Arc<dyn CarverStage<Cx>>) -> Self {
         self.carvers.push((id, carver));
+        self
+    }
+
+    /// The decoration with the feature stage `feature` under `id` too.
+    #[must_use]
+    pub fn with_feature(mut self, id: GenId, feature: Arc<dyn FeatureStage<Cx>>) -> Self {
+        self.features.push((id, feature));
         self
     }
 }
@@ -456,6 +558,11 @@ impl<Cx: Context> Clone for Decoration<Cx> {
                 .carvers
                 .iter()
                 .map(|(id, c)| (id.clone(), Arc::clone(c)))
+                .collect(),
+            features: self
+                .features
+                .iter()
+                .map(|(id, f)| (id.clone(), Arc::clone(f)))
                 .collect(),
         }
     }

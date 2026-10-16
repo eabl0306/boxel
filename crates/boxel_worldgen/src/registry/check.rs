@@ -261,6 +261,16 @@ pub enum Problem {
         /// Its apron, in blocks.
         apron: u32,
     },
+    /// A feature stage that declares no height (0) or an apron wider than
+    /// [`MAX_APRON`](crate::region::MAX_APRON) ([`FeatureReach`](crate::region::FeatureReach)).
+    FeatureReach {
+        /// The feature stage.
+        feature: GenId,
+        /// Its height, in blocks.
+        height: u32,
+        /// Its apron, in blocks.
+        apron: u32,
+    },
     /// A check the engine does not define (the game's own), with its ids and message.
     Other {
         /// The ids the problem involves.
@@ -320,6 +330,7 @@ impl Problem {
                 ..
             } => [realm, modifier].into_iter().chain(after).collect(),
             Self::CarverApron { carver, .. } => vec![carver],
+            Self::FeatureReach { feature, .. } => vec![feature],
             Self::Overlap { dimension, a, b } => vec![dimension, a, b],
             Self::Gap {
                 dimension,
@@ -606,6 +617,16 @@ impl fmt::Display for Problem {
             Self::CarverApron { carver, apron } => write!(
                 f,
                 "carver {carver} declares an apron of {apron} blocks, over {} (one chunk)",
+                crate::region::MAX_APRON
+            ),
+            Self::FeatureReach {
+                feature,
+                height,
+                apron,
+            } => write!(
+                f,
+                "feature stage {feature} declares a height of {height} blocks and an apron of \
+                 {apron}: it needs a height of at least 1 and an apron of at most {} (one chunk)",
                 crate::region::MAX_APRON
             ),
             Self::Other { message, .. } => f.write_str(message),

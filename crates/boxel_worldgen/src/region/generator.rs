@@ -2,8 +2,8 @@
 
 use super::blend::{self, WINDOW_POINTS, Window};
 use super::decorate::{
-    CarveReach, ChunkColumns, ColumnsAround, Decoration, FillStage, MAX_APRON, RealmCarver, Stages,
-    SurfaceReach, SurfaceStage,
+    CarveReach, ChunkColumns, ColumnsAround, Decoration, FillStage, MAX_APRON, RealmCarver,
+    RealmFeature, Stages, SurfaceReach, SurfaceStage,
 };
 use super::kind::{Context, HEIGHT_ONE, HeightQ, KindGrid, TerrainKind, block_of};
 use super::memo::{self, Point, WindowKinds, WindowPoints};
@@ -79,7 +79,8 @@ pub struct RegionSpec<'a, Cx: Context> {
     /// The blocks: every block name the realm and its stages use must be in it (the world's
     /// registry, the one chunks are generated with).
     pub blocks: &'a BlockRegistry,
-    /// The fill and surface stages.
+    /// The decoration: the fill and surface stages, the shape modifiers, the carvers and the
+    /// feature stages.
     pub decoration: Decoration<Cx>,
     /// The other knobs.
     pub settings: RegionSettings,
@@ -87,8 +88,9 @@ pub struct RegionSpec<'a, Cx: Context> {
 
 /// The vertical bounds of a chunk column of a realm (ADR 0039 sec. 14): exact integers, every one
 /// a block `y`. They come from the kinds present in the 16 lattice points around the column (each
-/// kind's [`TerrainKind::column_bounds`] over the chunk column, else its points' bounds) and the
-/// shape modifiers' [`ShapeModifier::column_effect`] there.
+/// kind's [`TerrainKind::column_bounds`] over the chunk column, else its points' bounds), the
+/// shape modifiers' [`ShapeModifier::column_effect`] there and the feature stages'
+/// [`FeatureStage::column_height`](super::FeatureStage::column_height).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LocalBounds {
     /// A block at or under the lowest ground of the column (the open surface): the realm's
@@ -96,8 +98,9 @@ pub struct LocalBounds {
     pub ground_lo: i64,
     /// A block at or over the highest ground.
     pub ground_hi: i64,
-    /// The highest block that may not be air (ground, surface rise, fluid): every chunk over it
-    /// is `Uniform` air, after the selection reads.
+    /// The highest block that may not be air: `ground_hi` plus the surface stage's rise or the
+    /// feature stages' height over the column, whichever is more, or the fluid. Every chunk over
+    /// it is `Uniform` air, after the selection reads.
     pub top: i64,
     /// A chunk whose highest block is at or under this one lies under every column's surface
     /// stage and every carver's surface reach ([`CarveReach::surface`] under `apron_lo`): it
@@ -141,7 +144,7 @@ pub(super) struct RealmModifier<Cx: Context> {
 /// - else the column stage: the Context's fields over the 32 x 32 columns, each present kind's
 ///   heights (one call when the 16 points hold one kind: the interior fast path, with no
 ///   multiply), the exact blend, the fluid rule, then [`decorate`](super::decorate) (rock,
-///   fluid, surface; `Uniform`, 1-bit or dense).
+///   fluid, surface, carvers, features; `Uniform`, 1-bit or dense).
 ///
 /// Its far LOD is the region pass ([`LodSource`], ADR 0039 sec. 10): the same selection, blend
 /// and shape modifiers at the cell corners of each node, a sound top per cell and the cell rule.
@@ -172,6 +175,8 @@ pub struct RegionGenerator<Cx: Context> {
     carvers: Box<[RealmCarver<Cx>]>,
     /// The carvers' widest surface reach and apron, `None` without carvers.
     carve: Option<CarveReach>,
+    /// In the order they run.
+    pub(super) features: Box<[RealmFeature<Cx>]>,
     digest: RegistryDigest,
     vertical: RangeInclusive<i64>,
     /// Whether debug builds hold its chunks to the 3:1 cap ([`RegionGenerator::check_slope`]).
@@ -186,10 +191,12 @@ impl<Cx: Context> RegionGenerator<Cx> {
     /// ids (each once) and the carvers' aprons ([`MAX_APRON`]), every added entry that names a
     /// missing rule ([`check_rule_entries`]), and every block name the realm (its floor and
     /// fluid) and its stages use ([`Problem::UnknownBlock`](crate::registry::Problem::UnknownBlock),
-    /// so a typo fails at world open and never in a worker). Its digest lines
+    /// so a typo fails at world open and never in a worker), and the feature stages' reach (a
+    /// height of at least 1, an apron of at most [`MAX_APRON`]). Its digest lines
     /// ([`RegionGenerator::digest`]) are those of the realm: the realm, its `region` settings,
     /// its `context`, its rules and entries, its kinds and its stages (`fill_stage`,
-    /// `surface_stage`, one `shape_modifier` and one `carver_stage` per modifier and carver).
+    /// `surface_stage`, one `shape_modifier`, `carver_stage` and `feature_stage` per modifier,
+    /// carver and feature stage).
     ///
     /// [`check_modifiers`]: super::check_modifiers
     ///
@@ -252,6 +259,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
             surface,
             mut modifiers,
             mut carvers,
+            mut features,
         } = decoration;
         for name in fill.1.block_names() {
             checks.block(blocks, name, &fill.0);
@@ -325,6 +333,36 @@ impl<Cx: Context> RegionGenerator<Cx> {
                 surface: a.surface.max(b.surface),
                 apron: a.apron.max(b.apron),
             });
+        sort_stages(checks, "feature_stage", &mut features);
+        let features: Vec<RealmFeature<Cx>> = features
+            .into_iter()
+            .map(|(id, stage)| {
+                for name in stage.block_names() {
+                    checks.block(blocks, name, &id);
+                }
+                let reach = stage.reach();
+                if reach.height == 0 || reach.apron > MAX_APRON {
+                    checks.push(Problem::FeatureReach {
+                        feature: id.clone(),
+                        height: reach.height,
+                        apron: reach.apron,
+                    });
+                }
+                let mut params = ParamsHasher::new();
+                params.write(&stage.order()).write(&*stage);
+                digest.push(line("feature_stage", &id, stage.version(), params.finish()));
+                RealmFeature {
+                    seed: id.seed(realm_seed),
+                    id,
+                    stage,
+                }
+            })
+            .collect();
+        let grow = features
+            .iter()
+            .map(|f| f.stage.reach().height)
+            .max()
+            .unwrap_or(0);
         // Once per world would do; a problem two realms find is reported once.
         check_rule_entries(checks, rules, entries);
         let resolved = select::resolve(
@@ -364,7 +402,13 @@ impl<Cx: Context> RegionGenerator<Cx> {
         }
         let selector = resolved.expect("no problem").selector;
         let reach = surface.1.reach();
-        let vertical = vertical(&realm_spec, &cx, &realm_kinds, reach, (lower, raise));
+        let vertical = vertical(
+            &realm_spec,
+            &cx,
+            &realm_kinds,
+            (reach, grow),
+            (lower, raise),
+        );
         Some(Self {
             key: BuildKey::next(),
             dimension: dimension.clone(),
@@ -380,6 +424,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
             reach,
             carvers: carvers.into(),
             carve,
+            features: features.into(),
             digest: digest.finish(),
             vertical,
             slope_check: true,
@@ -616,7 +661,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
             }
             lo
         });
-        self.assemble(span, apron)
+        self.assemble(span, apron, self.column_height(area))
     }
 
     /// [`RegionGenerator::bounds_of`] from the kinds of the chunk column's own lattice cell alone,
@@ -638,16 +683,41 @@ impl<Cx: Context> RegionGenerator<Cx> {
                 Some(self.ground_span(wide, kinds).0)
             }
         };
-        Some(self.assemble(span, apron))
+        Some(self.assemble(span, apron, self.column_height(area)))
+    }
+
+    /// The most blocks the feature stages write over the ground at the columns of `area` (a chunk
+    /// column): the largest of their [`FeatureStage::column_height`] there, 0 without them.
+    ///
+    /// [`FeatureStage::column_height`]: super::FeatureStage::column_height
+    fn column_height(&self, area: Rect) -> u32 {
+        let mut most = 0;
+        for f in &self.features {
+            let h = f.stage.column_height(&self.cx, f.seed, area);
+            if cfg!(debug_assertions) {
+                let height = f.stage.reach().height;
+                assert!(
+                    h <= height,
+                    "{NAME} span check: realm {} feature stage {} gives the columns {area:?} a \
+                     height of {h}, over its declared height {height}",
+                    self.realm(),
+                    f.id,
+                );
+            }
+            most = most.max(h);
+        }
+        most
     }
 
     /// The bounds of a chunk column whose heights span `(lo, hi)` (in [`HeightQ`], unclamped),
-    /// with the lowest height `apron` of the carvers' apron around it, if they have one.
-    fn assemble(&self, (lo, hi): (i64, i64), apron: Option<i64>) -> LocalBounds {
+    /// with the lowest height `apron` of the carvers' apron around it, if they have one, and
+    /// features up to `grow` blocks over its ground.
+    fn assemble(&self, (lo, hi): (i64, i64), apron: Option<i64>, grow: u32) -> LocalBounds {
         let spec = self.spec();
         let block = |h: i64| block_of(spec.datum, clamp_height(h));
         let (ground_lo, ground_hi) = (block(lo), block(hi));
-        let mut top = ground_hi.saturating_add(self.reach.rise.into());
+        let over = self.reach.rise.max(grow);
+        let mut top = ground_hi.saturating_add(over.into());
         if let FluidRule::SeaLevel { level, .. } = spec.fluid
             && ground_lo < level
         {
@@ -1158,8 +1228,8 @@ impl<Cx: Context> RegionGenerator<Cx> {
                     assert!(
                         state == BlockState::AIR,
                         "{NAME} span check: realm {} has a block at ({}, {}, {}) over the top \
-                         {} of its chunk column: a kind's bounds or the surface stage's rise are \
-                         under its blocks",
+                         {} of its chunk column: a kind's bounds, the surface stage's rise or a \
+                         feature stage's column height are under its blocks",
                         self.realm(),
                         origin.x + i64::from(x),
                         origin.y + i64::from(ly),
@@ -1274,12 +1344,13 @@ fn chunk_axes(x0: i64, z0: i64) -> ([i64; CHUNK_SIZE as usize], [i64; CHUNK_SIZE
 }
 
 /// The chunk layers of a realm that may hold something not air: from its span's bottom up to its
-/// highest kind height, surface rise or fluid, inside its span.
+/// highest kind height plus the surface rise or the features' height `grow`, or its fluid, inside
+/// its span.
 fn vertical<Cx: Context>(
     spec: &RealmSpec,
     cx: &Cx,
     kinds: &[RealmKind<Cx>],
-    reach: SurfaceReach,
+    (reach, grow): (SurfaceReach, u32),
     (lower, raise): (i64, i64),
 ) -> RangeInclusive<i64> {
     let span = spec.span.chunk_layers();
@@ -1289,7 +1360,7 @@ fn vertical<Cx: Context>(
     });
     let (lo, hi) = (lo.saturating_sub(lower), hi.saturating_add(raise));
     let clamp = clamp_height;
-    let mut top = block_of(spec.datum, clamp(hi)).saturating_add(reach.rise.into());
+    let mut top = block_of(spec.datum, clamp(hi)).saturating_add(reach.rise.max(grow).into());
     if let FluidRule::SeaLevel { level, .. } = spec.fluid
         && block_of(spec.datum, clamp(lo)) < level
     {
@@ -1329,8 +1400,8 @@ impl<Cx: Context> WorldGenerator for RegionGenerator<Cx> {
         self.column_stage(origin, &window, registry)
     }
 
-    /// From the realm's span bottom to its highest kind height (plus the surface rise and the
-    /// fluid), inside its span.
+    /// From the realm's span bottom to its highest kind height (plus the surface rise or the
+    /// features' height, and the fluid), inside its span.
     fn vertical_chunks(&self) -> RangeInclusive<i64> {
         self.vertical.clone()
     }
