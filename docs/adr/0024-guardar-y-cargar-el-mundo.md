@@ -5,8 +5,8 @@
 - Revisa: la sección 12 de `docs/architecture.md` (el trait `ChunkStore`), el punto de la
   descarga de ADR 0015 sección 7 (una edición que movió un techo ya no se pierde) y "Fuera de
   esta parte" de ADR 0021 (los ticks programados se guardan).
-- Revisado por: ADR 0039 (una clave de metadatos más del motor, `boxel:worldgen`, que llega con
-  WG-SAVE)
+- Revisado por: ADR 0039 (una clave de metadatos más del motor, `boxel:worldgen`, hecha en
+  WG-SAVE, #121)
 
 ## Contexto
 
@@ -238,7 +238,10 @@ marcador `Crate`, como haría un juego.
   mundo de otra versión no se abre y no se toca (`PersistError::Version`). Cada tipo de registro
   tiene su propia versión, para poder migrar registro por registro más adelante.
 - **Otros metadatos**: `boxel:generator` (el nombre del generador con que se creó: otro solo da un
-  aviso), `boxel:ticks`, `boxel:clock` y `boxel:entities` (el próximo id guardado).
+  aviso), `boxel:ticks`, `boxel:clock`, `boxel:entities` (el próximo id guardado) y
+  `boxel:worldgen` (el registro de la generación de un mundo hecho con un preset, ADR 0039
+  sección 17: se escribe solo al crearlo, con su propio sobre y versión, sin cambiar
+  `FORMAT_VERSION`).
 
 ### 5. Cómo corre sin frenar el frame
 
