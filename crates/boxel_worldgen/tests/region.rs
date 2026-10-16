@@ -561,6 +561,116 @@ proptest! {
     }
 }
 
+/// A flat kind at `height` blocks that declares bounds of `bounds` blocks and a range of `range`
+/// blocks: right or wrong.
+struct Declares {
+    height: i64,
+    bounds: i64,
+    range: i64,
+}
+
+impl HashParams for Declares {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&self.height).write(&self.bounds).write(&self.range);
+    }
+}
+impl GenEntry for Declares {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+impl TerrainKind<TestContext> for Declares {
+    fn limits(&self, _: &TestContext) -> KindLimits {
+        let h = Span::point(self.height << 8);
+        KindLimits {
+            slope: Slope::ZERO,
+            relief: h,
+            band: h,
+        }
+    }
+    fn range(&self, _: &TestContext) -> Span {
+        Span::point(self.range << 8)
+    }
+    fn bounds(&self, _: &TestContext, _: u64, _: (i64, i64), _: i64) -> Span {
+        Span::point(self.bounds << 8)
+    }
+    fn heights(&self, _: &KindGrid<'_, TestContext>, _: &[bool], out: &mut [HeightQ]) {
+        out.fill((self.height << 8) as HeightQ);
+    }
+}
+
+/// The generator of a map whose one kind is `kind`.
+fn declares(kind: Declares) -> RegionGenerator<TestContext> {
+    let world = world_of(
+        vec![("test:surface", realm())],
+        vec![(
+            "test:land",
+            rule(
+                0,
+                Vec::new(),
+                Scope::CELL,
+                vec![Entry::new(id("test:k"), 1)],
+            ),
+        )],
+        Vec::new(),
+        vec![(
+            "test:k",
+            Arc::new(kind) as Arc<dyn TerrainKind<TestContext>>,
+        )],
+    );
+    generator(&world, SEED, RegionSettings::default())
+}
+
+/// The panic message of `f`, `None` if it returns.
+fn panic_of(f: impl FnOnce()) -> Option<String> {
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).err()?;
+    Some(
+        err.downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default(),
+    )
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn the_span_check_catches_a_range_or_bound_under_the_heights() {
+    let registry = registry();
+    let right = declares(Declares {
+        height: 100,
+        bounds: 100,
+        range: 100,
+    });
+    assert_eq!(
+        panic_of(|| drop(right.generate(key(0, 3, 0), &registry))),
+        None
+    );
+    assert_eq!(panic_of(|| drop(right.column_info(5, 5))), None);
+    // Right bounds, so every local bound holds, but the realm's vertical range comes from the
+    // range: the world would never ask for the chunks of the ground, and leave them air.
+    let low_range = declares(Declares {
+        height: 100,
+        bounds: 100,
+        range: 0,
+    });
+    assert_eq!(*low_range.vertical_chunks().end(), 0);
+    let message = panic_of(|| drop(low_range.generate(key(0, 3, 0), &registry))).expect("caught");
+    assert!(message.contains("vertical range"), "{message}");
+    // Bounds under the heights: the chunk of the ground is air over the local top, so only the
+    // chunks the bounds cross ran the check. The query side computes the ground: it checks too.
+    let low_bounds = declares(Declares {
+        height: 100,
+        bounds: 0,
+        range: 100,
+    });
+    assert_eq!(
+        low_bounds.generate(key(0, 3, 0), &registry).as_uniform(),
+        Some(BlockState::AIR)
+    );
+    let message = panic_of(|| drop(low_bounds.column_info(5, 5))).expect("caught");
+    assert!(message.contains("span check"), "{message}");
+}
+
 // ---- Uniform and 1-bit chunks -----------------------------------------------------------------
 
 /// A world of `FlatKind`s under `()`: kinds at `heights` blocks, picked by region cells of

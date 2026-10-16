@@ -114,9 +114,10 @@ struct RealmKind<Cx: Context> {
 ///   multiply), the exact blend, the fluid rule, then [`decorate`](super::decorate) (rock,
 ///   fluid, surface; `Uniform`, 1-bit or dense).
 ///
-/// In debug builds every chunk of the column stage checks its column bounds: each column's ground
-/// lies between the bounds of its 16 points, and nothing but air lies over the column's top. A
-/// kind or a mod with a bound under its heights fails its tests there.
+/// In debug builds every chunk of the column stage, and every point query, checks its column
+/// bounds: each column's ground lies between the bounds of its 16 points, nothing but air lies
+/// over the column's top, and that top lies in the realm's vertical range (the kinds' ranges). A
+/// kind or a mod with a bound or a range under its heights fails its tests there.
 pub struct RegionGenerator<Cx: Context> {
     key: BuildKey,
     dimension: GenId,
@@ -486,6 +487,11 @@ impl<Cx: Context> RegionGenerator<Cx> {
         let m = (1i64 << self.shift) - 1;
         let window = Window(points.map(|p| p.kind));
         let kind = blend::dominant(&window.present(), blend::factors(x & m, z & m, self.shift));
+        if cfg!(debug_assertions) {
+            // The chunk of a ground outside its bounds may take a fast path, which checks nothing.
+            self.check_ground((x, z), ground, &points, &bounds);
+            self.check_vertical((x, z), &bounds);
+        }
         ColumnInfo {
             realm: self.realm().clone(),
             height: h[0],
@@ -551,6 +557,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
         let chunk = super::decorate::decorate(&columns, &stages, registry);
         if cfg!(debug_assertions) {
             self.check_top(origin, bounds, &chunk);
+            self.check_vertical((origin.x, origin.z), bounds);
         }
         chunk
     }
@@ -574,19 +581,49 @@ impl<Cx: Context> RegionGenerator<Cx> {
         ground: &[i64; CHUNK_AREA],
     ) {
         for (c, &g) in ground.iter().enumerate() {
-            assert!(
-                (bounds.ground_lo..=bounds.ground_hi).contains(&g),
-                "{NAME} span check: realm {} column ({}, {}) has its ground at y {g}, outside the \
-                 bounds {}..={} its kinds give at its 16 lattice points ({}): a kind's bounds \
-                 are under its heights",
-                self.realm(),
+            let column = (
                 origin.x + (c >> CHUNK_SHIFT) as i64,
                 origin.z + (c & (CHUNK_SIZE as usize - 1)) as i64,
-                bounds.ground_lo,
-                bounds.ground_hi,
-                self.window_kinds(points),
             );
+            self.check_ground(column, g, points, bounds);
         }
+    }
+
+    /// The debug span check of the ground `g` of column `(x, z)`: it lies between the bounds of
+    /// the window's points.
+    fn check_ground(
+        &self,
+        (x, z): (i64, i64),
+        g: i64,
+        points: &[Point; WINDOW_POINTS],
+        bounds: &LocalBounds,
+    ) {
+        assert!(
+            (bounds.ground_lo..=bounds.ground_hi).contains(&g),
+            "{NAME} span check: realm {} column ({x}, {z}) has its ground at y {g}, outside the \
+             bounds {}..={} its kinds give at its 16 lattice points ({}): a kind's bounds are \
+             under its heights",
+            self.realm(),
+            bounds.ground_lo,
+            bounds.ground_hi,
+            self.window_kinds(points),
+        );
+    }
+
+    /// The debug span check of the realm's range: the column's top lies in the realm's vertical
+    /// range (inside its span), which the world takes for air above without asking.
+    fn check_vertical(&self, (x, z): (i64, i64), bounds: &LocalBounds) {
+        let span_top = *self.spec().span.chunk_layers().end();
+        let layer = (bounds.top >> CHUNK_SHIFT).min(span_top);
+        assert!(
+            layer <= *self.vertical.end(),
+            "{NAME} span check: realm {} column ({x}, {z}) may hold blocks up to y {}, over its \
+             vertical range (chunk layers up to {}) that the kinds' ranges give: a kind's range \
+             is under its bounds",
+            self.realm(),
+            bounds.top,
+            self.vertical.end(),
+        );
     }
 
     /// The debug span check of the top: nothing but air over the column's top.
