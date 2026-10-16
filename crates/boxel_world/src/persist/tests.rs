@@ -1329,7 +1329,9 @@ fn a_new_world_saves_its_worldgen_record_once_without_a_new_format() {
     // Opened again with another live record (the registries changed), the saved one stays: it
     // is what the world was made with.
     drop(store);
-    let other = worldgen_record(4);
+    let mut other = worldgen_record(4);
+    other.preset.version += 1;
+    assert_ne!(other, record, "a live record the world was not made with");
     let store = WorldStore::open(
         Arc::clone(&backend) as Arc<dyn ChunkStore>,
         &boxel_demo::blocks::registry(),
@@ -1424,7 +1426,7 @@ fn an_unreadable_worldgen_record_opens_the_world_without_one() {
     newer[4] += 1;
     backend
         .save_batch(&SaveBatch {
-            meta: vec![("boxel:worldgen".to_string(), newer)],
+            meta: vec![("boxel:worldgen".to_string(), newer.clone())],
             ..SaveBatch::default()
         })
         .unwrap();
@@ -1438,4 +1440,16 @@ fn an_unreadable_worldgen_record_opens_the_world_without_one() {
         store.worldgen()
     );
     assert_eq!(store.worldgen().record(), None);
+    // Opened with a live record, it keeps the one it cannot read: a newer build wrote it, and
+    // that build still reads it.
+    drop(store);
+    let live = worldgen_record(3);
+    let store = WorldStore::open(
+        Arc::clone(&backend) as Arc<dyn ChunkStore>,
+        &boxel_demo::blocks::registry(),
+        GeneratorInfo::new("terrain").with_worldgen(&live),
+    )
+    .unwrap();
+    assert!(matches!(store.worldgen(), SavedWorldgen::Unreadable(_)));
+    assert_eq!(backend.load_meta("boxel:worldgen").unwrap(), Some(newer));
 }
