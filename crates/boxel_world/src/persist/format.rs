@@ -14,6 +14,10 @@
 use boxel_voxel::{
     BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, ChunkKey, ChunkPos, DimensionId, Paletted,
 };
+use boxel_worldgen::preset::{DimensionRecord, SpecLine, WorldgenRecord};
+use boxel_worldgen::realm::RealmSpan;
+use boxel_worldgen::registry::{DigestEntry, DigestScope, GenId, RegistryDigest};
+use std::borrow::Cow;
 use std::fmt;
 
 /// Version of the world layout (tables, keys and the meaning of the metadata). A world with
@@ -29,12 +33,17 @@ pub(crate) const CHUNK_MAGIC: [u8; 4] = *b"BXCK";
 pub(crate) const META_MAGIC: [u8; 4] = *b"BXMT";
 /// Magic of an entity record.
 pub(crate) const ENTITY_MAGIC: [u8; 4] = *b"BXEN";
+/// Magic of the world generation record (`boxel:worldgen`).
+pub(crate) const WORLDGEN_MAGIC: [u8; 4] = *b"BXWG";
 /// Version of the chunk record layout.
 pub(crate) const CHUNK_VERSION: u8 = 1;
 /// Version of the metadata blob layouts.
 pub(crate) const META_VERSION: u8 = 1;
 /// Version of the entity record layout (the codecs' own bytes have their own versions).
 pub(crate) const ENTITY_VERSION: u8 = 1;
+/// Version of the world generation record layout ([`encode_worldgen`]): its own, so the record
+/// can grow without a new [`FORMAT_VERSION`] (ADR 0039 sec. 17).
+pub const WORLDGEN_VERSION: u8 = 1;
 
 /// Bytes of an encoded entity key: its chunk's key ([`KEY_LEN`]) and its saved id (8).
 pub const ENTITY_KEY_LEN: usize = KEY_LEN + 8;
@@ -674,6 +683,168 @@ pub(crate) fn decode_clock(bytes: &[u8]) -> Result<u64, FormatError> {
     let tick = r.varint()?;
     r.finish()?;
     Ok(tick)
+}
+
+// ---- The world generation record -----------------------------------------------------------
+
+/// A string: its byte length and its bytes.
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    put_varint(out, s.len() as u64);
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// `None` as the byte 0, `Some(id)` as the byte 1 and the id.
+fn put_opt_id(out: &mut Vec<u8>, id: Option<&GenId>) {
+    match id {
+        None => out.push(0),
+        Some(id) => {
+            out.push(1);
+            put_str(out, id.as_str());
+        }
+    }
+}
+
+/// A digest line: its scope, registry, id, version and parameter hash.
+fn put_line(out: &mut Vec<u8>, line: &DigestEntry) {
+    put_opt_id(out, line.scope.dimension.as_ref());
+    put_opt_id(out, line.scope.realm.as_ref());
+    put_str(out, &line.registry);
+    put_str(out, line.id.as_str());
+    put_varint(out, u64::from(line.version));
+    out.extend_from_slice(&line.params.to_le_bytes());
+}
+
+/// A realm span: a byte of flags (1: a bottom plane, 2: a top plane), then the planes.
+fn put_span(out: &mut Vec<u8>, span: RealmSpan) {
+    out.push(u8::from(span.lo.is_some()) | (u8::from(span.hi.is_some()) << 1));
+    for plane in span.planes() {
+        out.extend_from_slice(&plane.to_le_bytes());
+    }
+}
+
+impl Reader<'_> {
+    /// A string of at most `max` bytes.
+    fn str(&mut self, max: usize) -> Result<&str, FormatError> {
+        let len = self.count(max)?;
+        std::str::from_utf8(self.take(len)?)
+            .map_err(|_| FormatError::Damaged("a name is not UTF-8"))
+    }
+
+    /// A world generation id.
+    fn id(&mut self, max: usize) -> Result<GenId, FormatError> {
+        GenId::new(self.str(max)?)
+            .map_err(|_| FormatError::Damaged("an invalid world generation id"))
+    }
+
+    /// [`put_opt_id`] back.
+    fn opt_id(&mut self, max: usize) -> Result<Option<GenId>, FormatError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => self.id(max).map(Some),
+            _ => Err(FormatError::Damaged("a bad option tag")),
+        }
+    }
+
+    /// A `u32` written as a varint.
+    fn u32(&mut self) -> Result<u32, FormatError> {
+        u32::try_from(self.varint()?).map_err(|_| FormatError::Damaged("a version out of range"))
+    }
+
+    /// [`put_line`] back.
+    fn line(&mut self, max: usize) -> Result<DigestEntry, FormatError> {
+        let scope = DigestScope {
+            dimension: self.opt_id(max)?,
+            realm: self.opt_id(max)?,
+        };
+        Ok(DigestEntry {
+            scope,
+            registry: Cow::Owned(self.str(max)?.to_owned()),
+            id: self.id(max)?,
+            version: self.u32()?,
+            params: self.u64()?,
+        })
+    }
+
+    /// [`put_span`] back.
+    fn span(&mut self) -> Result<RealmSpan, FormatError> {
+        let flags = self.u8()?;
+        if flags & !3 != 0 {
+            return Err(FormatError::Damaged("bad span flags"));
+        }
+        let lo = (flags & 1 != 0).then(|| self.i64()).transpose()?;
+        let hi = (flags & 2 != 0).then(|| self.i64()).transpose()?;
+        Ok(RealmSpan::new(lo, hi))
+    }
+}
+
+/// The world generation record blob (`boxel:worldgen`, ADR 0039 sec. 17), in its own envelope
+/// and record version ([`WORLDGEN_VERSION`]): the preset's line, the dimension name table, then
+/// per dimension its id, its realms (id and span), its spec (kind, version, parameter hash) and
+/// its digest lines.
+pub fn encode_worldgen(record: &WorldgenRecord) -> Vec<u8> {
+    let mut payload = Vec::new();
+    put_line(&mut payload, &record.preset);
+    put_varint(&mut payload, record.names.len() as u64);
+    for name in &record.names {
+        put_str(&mut payload, name.as_str());
+    }
+    put_varint(&mut payload, record.dimensions.len() as u64);
+    for dim in &record.dimensions {
+        put_str(&mut payload, dim.id.as_str());
+        put_varint(&mut payload, dim.realms.len() as u64);
+        for (realm, span) in &dim.realms {
+            put_str(&mut payload, realm.as_str());
+            put_span(&mut payload, *span);
+        }
+        put_str(&mut payload, dim.generator.kind.as_str());
+        put_varint(&mut payload, u64::from(dim.generator.version));
+        payload.extend_from_slice(&dim.generator.params.to_le_bytes());
+        let lines = dim.digest.entries();
+        put_varint(&mut payload, lines.len() as u64);
+        for line in lines {
+            put_line(&mut payload, line);
+        }
+    }
+    seal(WORLDGEN_MAGIC, WORLDGEN_VERSION, &payload)
+}
+
+/// The inverse of [`encode_worldgen`]. Another record version is [`FormatError::Version`].
+pub fn decode_worldgen(bytes: &[u8]) -> Result<WorldgenRecord, FormatError> {
+    let payload = open(WORLDGEN_MAGIC, WORLDGEN_VERSION, bytes)?;
+    let max = payload.len();
+    let mut r = Reader::new(&payload);
+    let preset = r.line(max)?;
+    let n = r.count(max)?;
+    let names = (0..n).map(|_| r.id(max)).collect::<Result<Vec<_>, _>>()?;
+    let n = r.count(max)?;
+    let mut dimensions = Vec::with_capacity(n);
+    for _ in 0..n {
+        let id = r.id(max)?;
+        let n = r.count(max)?;
+        let mut realms = Vec::with_capacity(n);
+        for _ in 0..n {
+            realms.push((r.id(max)?, r.span()?));
+        }
+        let generator = SpecLine {
+            kind: r.id(max)?,
+            version: r.u32()?,
+            params: r.u64()?,
+        };
+        let n = r.count(max)?;
+        let lines = (0..n).map(|_| r.line(max)).collect::<Result<Vec<_>, _>>()?;
+        dimensions.push(DimensionRecord {
+            id,
+            realms,
+            generator,
+            digest: RegistryDigest::from_entries(lines),
+        });
+    }
+    r.finish()?;
+    Ok(WorldgenRecord {
+        preset,
+        names,
+        dimensions,
+    })
 }
 
 #[cfg(test)]

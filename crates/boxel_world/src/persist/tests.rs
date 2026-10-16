@@ -1253,3 +1253,189 @@ fn a_close_whose_last_save_fails_gives_up_and_closes_the_file() {
     let keys = reopened.keys().unwrap();
     assert!(keys.contains(&ChunkKey::new(ChunkPos::containing(kept))));
 }
+
+// ---- The world generation record (ADR 0039 sec. 17) -----------------------------------------
+
+/// The live record of a test world: a flat world made through preset `test:flat`.
+fn worldgen_record(layers: u32) -> boxel_worldgen::preset::WorldgenRecord {
+    test_worldgen()
+        .open(
+            &boxel_worldgen::GenId::new("test:flat").unwrap(),
+            u64::from(layers),
+            &boxel_demo::blocks::registry(),
+            None,
+        )
+        .expect("opens")
+        .record
+}
+
+/// A test app of one legacy preset, `test:flat`: the demo's heightmap (`test:terrain`) made from
+/// the seed, as worlds were made before presets.
+fn test_worldgen() -> boxel_worldgen::preset::Worldgen {
+    use boxel_worldgen::GenId;
+    use boxel_worldgen::preset::{
+        DimensionDef, GeneratorKind, GeneratorSpec, WorldPreset, WorldgenBuilder,
+    };
+    let id = |name: &str| GenId::new(name).unwrap();
+    let mut builder = WorldgenBuilder::new();
+    builder
+        .preset(
+            id("test:flat"),
+            WorldPreset::one(
+                id("test:overworld"),
+                GeneratorSpec::new(id("test:terrain"), ()),
+            ),
+        )
+        .dimension(id("test:overworld"), DimensionDef::default())
+        .generator(
+            id("test:terrain"),
+            GeneratorKind::legacy(1, |seed| {
+                Arc::new(boxel_demo::worldgen::TerrainGenerator::new(
+                    seed,
+                    boxel_demo::worldgen::TerrainSettings::default(),
+                ))
+            }),
+        );
+    let mut checks = boxel_worldgen::registry::Checks::new();
+    builder.freeze(&mut checks, ()).expect("frozen")
+}
+
+#[test]
+fn a_new_world_saves_its_worldgen_record_once_without_a_new_format() {
+    let backend = Arc::new(MemoryStore::new());
+    let record = worldgen_record(3);
+    let store = WorldStore::open(
+        Arc::clone(&backend) as Arc<dyn ChunkStore>,
+        &boxel_demo::blocks::registry(),
+        GeneratorInfo::new("terrain").with_worldgen(&record),
+    )
+    .unwrap();
+    assert_eq!(store.worldgen(), &SavedWorldgen::Record(record.clone()));
+    assert_eq!(FORMAT_VERSION, 1, "no new format for the record");
+    assert_eq!(
+        backend.load_meta("boxel:format").unwrap(),
+        Some(FORMAT_VERSION.to_le_bytes().to_vec())
+    );
+    let bytes = backend.load_meta("boxel:worldgen").unwrap().expect("saved");
+    assert_eq!(format::decode_worldgen(&bytes).unwrap(), record);
+    // The engine's name: a game cannot write it.
+    assert_eq!(
+        store
+            .put_meta("boxel:worldgen", b"x".to_vec())
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    // Opened again with another live record (the registries changed), the saved one stays: it
+    // is what the world was made with.
+    drop(store);
+    let other = worldgen_record(4);
+    let store = WorldStore::open(
+        Arc::clone(&backend) as Arc<dyn ChunkStore>,
+        &boxel_demo::blocks::registry(),
+        GeneratorInfo::new("terrain").with_worldgen(&other),
+    )
+    .unwrap();
+    assert_eq!(store.worldgen(), &SavedWorldgen::Record(record.clone()));
+    assert_eq!(
+        SavedWorldgen::read(&*backend).unwrap().record(),
+        Some(&record)
+    );
+    assert_eq!(backend.load_meta("boxel:worldgen").unwrap(), Some(bytes));
+}
+
+#[test]
+fn a_world_without_the_record_opens_as_legacy_with_its_old_generator() {
+    use boxel_worldgen::{GenId, WorldGenerator};
+    let registry = boxel_demo::blocks::registry();
+    let seed = 7;
+    let old = boxel_demo::worldgen::TerrainGenerator::new(
+        seed,
+        boxel_demo::worldgen::TerrainSettings::default(),
+    );
+    // A world made before records: the store opened with the generator's name alone, a chunk
+    // edited and saved.
+    let backend = Arc::new(MemoryStore::new());
+    let store = WorldStore::open(
+        Arc::clone(&backend) as Arc<dyn ChunkStore>,
+        &registry,
+        old.name(),
+    )
+    .unwrap();
+    let edited = key(0, 1, 0);
+    store.stage(edited, stone_chunk());
+    store.write(&[edited], &[], &[]).unwrap();
+    drop(store);
+    assert_eq!(backend.load_meta("boxel:worldgen").unwrap(), None);
+
+    // Reopened the way a game with presets opens it: the saved record first (none), then the
+    // preset through its legacy factory, then the store with the live record.
+    let saved = SavedWorldgen::read(&*backend).unwrap();
+    assert_eq!(saved, SavedWorldgen::Legacy);
+    let opened = test_worldgen()
+        .open(
+            &GenId::new("test:flat").unwrap(),
+            seed,
+            &registry,
+            saved.record(),
+        )
+        .expect("opens");
+    assert!(
+        opened.diff.is_none(),
+        "a legacy world has nothing to compare"
+    );
+    let generator = &opened.first().generator;
+    let store = WorldStore::open(
+        Arc::clone(&backend) as Arc<dyn ChunkStore>,
+        &registry,
+        GeneratorInfo::new(generator.name()).with_worldgen(&opened.record),
+    )
+    .unwrap();
+    // It stays legacy: no record written into it, its generator's name unchanged.
+    assert_eq!(store.worldgen(), &SavedWorldgen::Legacy);
+    assert_eq!(backend.load_meta("boxel:worldgen").unwrap(), None);
+    assert_eq!(
+        backend.load_meta("boxel:generator").unwrap(),
+        Some(old.name().as_bytes().to_vec())
+    );
+    // The same generator: the same chunks, and the saved one still there.
+    for k in [key(0, 0, 0), key(3, 1, -2), key(-1, 2, 5), key(9, -1, 9)] {
+        assert_eq!(
+            generator.generate(k, &registry),
+            old.generate(k, &registry),
+            "{k:?}"
+        );
+    }
+    assert_eq!(
+        store
+            .read_chunk(edited)
+            .unwrap()
+            .get(LocalPos::new(4, 5, 6)),
+        registry.by_name("boxel:stone").unwrap()
+    );
+}
+
+#[test]
+fn an_unreadable_worldgen_record_opens_the_world_without_one() {
+    let backend = Arc::new(MemoryStore::new());
+    drop(open(&backend));
+    // A record of a newer layout (or damaged): the world opens, the record is not read.
+    let mut newer = format::encode_worldgen(&worldgen_record(3));
+    newer[4] += 1;
+    backend
+        .save_batch(&SaveBatch {
+            meta: vec![("boxel:worldgen".to_string(), newer)],
+            ..SaveBatch::default()
+        })
+        .unwrap();
+    let store = open(&backend);
+    assert!(
+        matches!(
+            store.worldgen(),
+            SavedWorldgen::Unreadable(FormatError::Version { .. })
+        ),
+        "{:?}",
+        store.worldgen()
+    );
+    assert_eq!(store.worldgen().record(), None);
+}

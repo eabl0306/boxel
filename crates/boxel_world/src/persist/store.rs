@@ -2,12 +2,14 @@
 use super::backend::{ChunkStore, RedbStore, SaveBatch, closed_error};
 use super::format::{
     self, FORMAT_VERSION, FormatError, IdMap, decode_chunk, decode_clock, decode_names,
-    decode_ticks, encode_chunk, encode_names, open_entity, seal_entity,
+    decode_ticks, decode_worldgen, encode_chunk, encode_names, encode_worldgen, open_entity,
+    seal_entity,
 };
 use super::saver::{SavedIndex, saved_index};
 use crate::lod::LodSeed;
 use boxel_ecs::prelude::*;
 use boxel_voxel::{BlockPos, BlockRegistry, ChunkData, ChunkKey};
+use boxel_worldgen::preset::WorldgenRecord;
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
@@ -31,6 +33,9 @@ pub(crate) const META_TICKS: &str = "boxel:ticks";
 pub(crate) const META_CLOCK: &str = "boxel:clock";
 /// The next saved entity id (ids are never given twice, also after their entity is gone).
 pub(crate) const META_ENTITIES: &str = "boxel:entities";
+/// The world generation record ([`WorldgenRecord`], ADR 0039 sec. 17): written only when the
+/// world is created, never into a world that lacks it (that one stays a legacy world).
+pub(crate) const META_WORLDGEN: &str = "boxel:worldgen";
 /// Prefix of the engine's metadata names.
 const RESERVED: &str = "boxel:";
 
@@ -86,6 +91,76 @@ impl std::error::Error for PersistError {
 impl From<io::Error> for PersistError {
     fn from(e: io::Error) -> Self {
         PersistError::Io(e)
+    }
+}
+
+/// What a world's generator is, for [`WorldStore::open`]: its name (`boxel:generator`, kept from
+/// when the world was made: another one only warns) and, for a world made through a preset, its
+/// world generation record (`boxel:worldgen`, ADR 0039 sec. 17), written only if the world is
+/// new. A name alone (`&str`) is a world without a record, as every world was before presets.
+#[derive(Clone, Copy, Debug)]
+pub struct GeneratorInfo<'a> {
+    /// The generator's name ([`WorldGenerator::name`](boxel_worldgen::WorldGenerator::name)).
+    pub name: &'a str,
+    /// The record a new world saves ([`OpenedWorld::record`](boxel_worldgen::preset::OpenedWorld)),
+    /// `None` for none.
+    pub worldgen: Option<&'a WorldgenRecord>,
+}
+
+impl<'a> GeneratorInfo<'a> {
+    /// The generator `name`, with no record.
+    pub const fn new(name: &'a str) -> Self {
+        Self {
+            name,
+            worldgen: None,
+        }
+    }
+
+    /// With the record `record`, saved if the world is new.
+    pub const fn with_worldgen(mut self, record: &'a WorldgenRecord) -> Self {
+        self.worldgen = Some(record);
+        self
+    }
+}
+
+impl<'a> From<&'a str> for GeneratorInfo<'a> {
+    fn from(name: &'a str) -> Self {
+        Self::new(name)
+    }
+}
+
+/// What a world holds under `boxel:worldgen` (ADR 0039 sec. 17).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SavedWorldgen {
+    /// No record: a world made before records, or by a game that saves none. It is a legacy
+    /// world and stays one: it opens through the legacy factory of its own type, unchanged.
+    Legacy,
+    /// The record it was made with.
+    Record(WorldgenRecord),
+    /// A record this build cannot read (damaged, or of a newer record version): the world opens
+    /// all the same, without a diff.
+    Unreadable(FormatError),
+}
+
+impl SavedWorldgen {
+    /// What `backend`'s world holds, read now (before [`WorldStore::open`], so its live record can
+    /// keep the saved dimension numbers).
+    pub fn read(backend: &dyn ChunkStore) -> io::Result<Self> {
+        Ok(match backend.load_meta(META_WORLDGEN)? {
+            None => Self::Legacy,
+            Some(bytes) => match decode_worldgen(&bytes) {
+                Ok(record) => Self::Record(record),
+                Err(e) => Self::Unreadable(e),
+            },
+        })
+    }
+
+    /// The record, if the world has a readable one.
+    pub fn record(&self) -> Option<&WorldgenRecord> {
+        match self {
+            Self::Record(record) => Some(record),
+            Self::Legacy | Self::Unreadable(_) => None,
+        }
     }
 }
 
@@ -187,6 +262,8 @@ pub(crate) struct Opened {
 struct Inner {
     backend: Arc<dyn ChunkStore>,
     ids: IdMap,
+    /// What the world holds under `boxel:worldgen`, as it opened.
+    worldgen: SavedWorldgen,
     /// Chunks handed over for saving and not written yet, by key: loads read them first, so a
     /// chunk that unloads and comes back before its save lands keeps its edits.
     pending: Mutex<HashMap<ChunkKey, Staged, foldhash::fast::FixedState>>,
@@ -237,10 +314,10 @@ fn damaged(what: &str, e: FormatError) -> PersistError {
 impl WorldStore {
     /// Opens the world in `dir` (the file [`WORLD_FILE`] there), creating both if needed.
     /// `registry` and `generator` are the world's (see [`WorldStore::open`]).
-    pub fn open_dir(
+    pub fn open_dir<'a>(
         dir: impl AsRef<Path>,
         registry: &BlockRegistry,
-        generator: &str,
+        generator: impl Into<GeneratorInfo<'a>>,
     ) -> Result<Self, PersistError> {
         let backend = RedbStore::open(dir.as_ref().join(WORLD_FILE))?;
         Self::open(Arc::new(backend), registry, generator)
@@ -248,20 +325,27 @@ impl WorldStore {
 
     /// Opens the world kept in `backend`, or starts a new one there. `registry` must be the
     /// world's (the `WorldPlugin`'s): saved state names are resolved against it ([`IdMap`]),
-    /// and its states missing from the world are added. `generator` is the generator's name: a
-    /// world made with another one opens with a warning (chunks that were not saved come from
-    /// the new generator).
+    /// and its states missing from the world are added. `generator` is the generator's name (a
+    /// world made with another one opens with a warning: chunks that were not saved come from
+    /// the new generator) and, for a world made through a preset, its world generation record
+    /// ([`GeneratorInfo`]): a new world saves it under `boxel:worldgen`, an existing one never
+    /// gets one, so a world made before records stays a legacy world
+    /// ([`WorldStore::worldgen`]). The format version does not change for it.
     ///
     /// Reads the version, the id map and the index of saved chunks (every key, once), and
     /// builds from it what the world's save state and its far LOD start with, so the world's
     /// open does not walk the saved chunks on the main thread (call this off it). A world with
     /// another format version or a damaged id map is an error and is not touched; damaged
     /// pending ticks or clock only warn (they are lost).
-    pub fn open(
+    pub fn open<'a>(
         backend: Arc<dyn ChunkStore>,
         registry: &BlockRegistry,
-        generator: &str,
+        generator: impl Into<GeneratorInfo<'a>>,
     ) -> Result<Self, PersistError> {
+        let GeneratorInfo {
+            name: generator,
+            worldgen,
+        } = generator.into();
         // Numbered before anything is read (see `opened_seq`).
         let opened_seq = OPENINGS.fetch_add(1, Ordering::Relaxed);
         let keys = backend.keys()?;
@@ -317,6 +401,11 @@ impl WorldStore {
                 META_FORMAT.to_string(),
                 FORMAT_VERSION.to_le_bytes().to_vec(),
             ));
+            if let Some(record) = worldgen {
+                batch
+                    .meta
+                    .push((META_WORLDGEN.to_string(), encode_worldgen(record)));
+            }
         }
         if saved_generator.is_none() {
             batch
@@ -329,6 +418,16 @@ impl WorldStore {
                 .push((META_STATES.to_string(), encode_names(ids.names())));
         }
         backend.save_batch(&batch)?;
+        // Only a new world gets a record: one made before records stays legacy. A record it
+        // cannot read only warns (the game opens the world without a diff).
+        let worldgen = match (new, worldgen) {
+            (true, Some(record)) => SavedWorldgen::Record(record.clone()),
+            (true, None) => SavedWorldgen::Legacy,
+            (false, _) => SavedWorldgen::read(&*backend)?,
+        };
+        if let SavedWorldgen::Unreadable(e) = &worldgen {
+            tracing::warn!("the world's generation record cannot be read: {e}");
+        }
         // Transient state: a damaged copy is dropped, not a reason to refuse the world.
         let ticks = backend.load_meta(META_TICKS)?.and_then(|b| {
             decode_ticks(&b)
@@ -363,6 +462,7 @@ impl WorldStore {
             inner: Arc::new(Inner {
                 backend,
                 ids,
+                worldgen,
                 pending: Mutex::default(),
                 pending_entities: Mutex::default(),
                 next_seq: AtomicU64::new(0),
@@ -455,6 +555,13 @@ impl WorldStore {
     /// The world's id map (stored state names and the states they load as).
     pub fn ids(&self) -> &IdMap {
         &self.inner.ids
+    }
+
+    /// What the world holds under `boxel:worldgen` (ADR 0039 sec. 17): the record it was made
+    /// with (for a new world, the one it was just made with), or none for a legacy world. The
+    /// game compares it with the live one (`Worldgen::open`'s diff); the store only keeps it.
+    pub fn worldgen(&self) -> &SavedWorldgen {
+        &self.inner.worldgen
     }
 
     /// The store underneath.

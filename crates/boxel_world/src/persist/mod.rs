@@ -5,7 +5,9 @@
 //! - [`format`](mod@format): the bytes. Blocks are saved by the stable name of their state
 //!   through the world's [`IdMap`] (ADR 0019), in versioned, checksummed records.
 //! - [`WorldStore`]: an open world (its store, id map and the chunks waiting to be written),
-//!   shared by the main thread and the jobs. [`WorldStore::open_dir`] opens a directory.
+//!   shared by the main thread and the jobs. [`WorldStore::open_dir`] opens a directory. A world
+//!   made through a preset keeps its world generation record (`boxel:worldgen`, ADR 0039
+//!   sec. 17), written only when it is created ([`GeneratorInfo`], [`SavedWorldgen`]).
 //! - [`PersistPlugin`]: saves the chunks with edits as they unload, with the autosave and on
 //!   exit, loads saved chunks instead of generating them, and keeps the pending block ticks and
 //!   the world clock. Chunks nobody edited are never saved: they come from the seed again. The
@@ -54,13 +56,13 @@ pub use backend::{
 pub(crate) use entities::SavedLog;
 pub(crate) use entities::put_away_all;
 pub use entities::{EntityCodec, EntityCodecs, Saved, SavedId, SavedIds, add_entity_codec};
-pub use format::{EntityPart, FORMAT_VERSION, FormatError, IdMap};
+pub use format::{EntityPart, FORMAT_VERSION, FormatError, IdMap, WORLDGEN_VERSION};
 pub(crate) use plugin::{PersistExecutor, close_store_on_exit};
 pub use plugin::{PersistPlugin, PersistSettings};
 #[cfg(test)]
 pub(crate) use saver::saved_index;
 pub(crate) use saver::{Persist, SavedIndex};
-pub use store::{PersistError, PersistStats, WORLD_FILE, WorldStore};
+pub use store::{GeneratorInfo, PersistError, PersistStats, SavedWorldgen, WORLD_FILE, WorldStore};
 pub(crate) use store::{WeakStore, openings};
 
 /// The `Shutdown` sets, now the lifecycle's (kept here for apps that named them through

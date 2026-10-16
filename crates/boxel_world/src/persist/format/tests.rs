@@ -440,3 +440,124 @@ fn a_tick_list_past_64_mib_reads_back() {
         FormatError::Damaged("bad header")
     );
 }
+
+/// A world generation record with every kind of field: two dimensions in a name table of
+/// three, realm spans with open and far ends, lines of every scope.
+fn worldgen_record() -> WorldgenRecord {
+    use boxel_worldgen::preset::{DimensionRecord, SpecLine};
+    use boxel_worldgen::registry::{DigestEntry, DigestScope, RegistryDigest};
+    let id = |name: &str| GenId::new(name).unwrap();
+    let line =
+        |scope: DigestScope, registry: &'static str, name: &str, version, params| DigestEntry {
+            scope,
+            registry: registry.into(),
+            id: id(name),
+            version,
+            params,
+        };
+    let (overworld, surface) = (id("test:overworld"), id("test:surface"));
+    WorldgenRecord {
+        preset: line(DigestScope::PRESET, "preset", "test:default", 1, 7),
+        names: vec![id("test:gone"), overworld.clone(), id("test:nether")],
+        dimensions: vec![
+            DimensionRecord {
+                id: overworld.clone(),
+                realms: vec![
+                    (id("test:deep"), RealmSpan::below(-4096)),
+                    (surface.clone(), RealmSpan::between(-4096, 12288)),
+                    (id("test:sky"), RealmSpan::above(i64::MAX)),
+                    (id("test:all"), RealmSpan::new(Some(i64::MIN), None)),
+                ],
+                generator: SpecLine {
+                    kind: id("test:regions"),
+                    version: u32::MAX,
+                    params: u64::MAX,
+                },
+                digest: RegistryDigest::from_entries(vec![
+                    line(
+                        DigestScope::of_dimension(&overworld),
+                        "generator_kind",
+                        "test:regions",
+                        u32::MAX,
+                        u64::MAX,
+                    ),
+                    line(
+                        DigestScope::of_realm(&overworld, &surface),
+                        "terrain_kind",
+                        "test:hills",
+                        3,
+                        0x0123_4567_89ab_cdef,
+                    ),
+                    line(
+                        DigestScope::of_realm(&overworld, &surface),
+                        "realm",
+                        "test:surface",
+                        1,
+                        0,
+                    ),
+                ]),
+            },
+            DimensionRecord {
+                id: id("test:nether"),
+                realms: Vec::new(),
+                generator: SpecLine {
+                    kind: id("test:legacy"),
+                    version: 0,
+                    params: 0,
+                },
+                digest: RegistryDigest::from_entries(Vec::new()),
+            },
+        ],
+    }
+}
+
+#[test]
+fn worldgen_records_round_trip() {
+    let record = worldgen_record();
+    let bytes = encode_worldgen(&record);
+    assert_eq!(&bytes[..4], b"BXWG");
+    assert_eq!(bytes[4], WORLDGEN_VERSION);
+    let back = decode_worldgen(&bytes).unwrap();
+    assert_eq!(back, record);
+    assert_eq!(back.digest(), record.digest());
+    assert!(back.diff(&record).is_empty());
+    assert_eq!(back.number("test:nether"), Some(DimensionId(2)));
+    // The record has its own version; the world's layout does not change for it.
+    assert_eq!(WORLDGEN_VERSION, 1);
+    assert_eq!(FORMAT_VERSION, 1);
+}
+
+#[test]
+fn any_damage_to_a_worldgen_record_is_an_error() {
+    let good = encode_worldgen(&worldgen_record());
+    for i in 0..good.len() {
+        let mut bad = good.clone();
+        bad[i] ^= 0x10;
+        assert!(decode_worldgen(&bad).is_err(), "byte {i}");
+    }
+    for len in 0..good.len() {
+        assert!(decode_worldgen(&good[..len]).is_err(), "cut at {len}");
+    }
+    let mut newer = good.clone();
+    newer[4] = WORLDGEN_VERSION + 1;
+    assert_eq!(
+        decode_worldgen(&newer),
+        Err(FormatError::Version {
+            found: WORLDGEN_VERSION + 1,
+            supported: WORLDGEN_VERSION
+        })
+    );
+    // Another blob is not a record, and a record is not another blob.
+    assert!(decode_worldgen(&encode_names(&["boxel:air".to_string()])).is_err());
+    assert!(decode_names(&good).is_err());
+    // A payload whose checksum holds but whose id breaks the name rule is damage too.
+    let mut payload = Vec::new();
+    put_line(&mut payload, &worldgen_record().preset);
+    let at = payload.iter().position(|&b| b == b':').unwrap();
+    payload[at] = b' ';
+    payload.extend([0, 0]);
+    assert_eq!(
+        decode_worldgen(&seal(WORLDGEN_MAGIC, WORLDGEN_VERSION, &payload)),
+        Err(FormatError::Damaged("an invalid world generation id"))
+    );
+}
