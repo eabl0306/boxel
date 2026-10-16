@@ -33,7 +33,7 @@ use boxel_worldgen::realm::{FluidRule, RealmLod, RealmSky, RealmSpan, RealmSpec,
 use boxel_worldgen::region::{
     Decoration, DimensionGenerator, Entry, FlatKind, FloorFill, HEIGHT_ONE, HeightQ, Interval,
     KindForm, KindGrid, KindLimits, NoSurface, RegionGenerator, RegionSettings, RegionSpec,
-    RuleEntry, Scope, SelectorRule, TerrainKind, check_rule_entries, clear_worker_memo,
+    RuleEntry, Scope, SelectorRule, TerrainKind, clear_worker_memo,
 };
 use boxel_worldgen::registry::{
     Checks, DigestBuilder, GenEntry, GenId, GenRegistryBuilder, HashParams, ParamsHasher,
@@ -1314,7 +1314,6 @@ fn declared(slope_milli: u64, lo: i64, hi: i64) -> Arc<dyn TerrainKind<TestConte
 
 fn open(world: &TestWorld) -> Result<(), String> {
     let mut checks = Checks::new();
-    check_rule_entries(&mut checks, &world.rules, &world.entries);
     let g = RegionGenerator::build(
         RegionSpec {
             seed: SEED,
@@ -1356,6 +1355,33 @@ fn rule(
         entries,
         version: 1,
     }
+}
+
+#[test]
+fn a_realm_generator_checks_the_added_entries_itself() {
+    // An entry for a rule that does not exist is never read: the build refuses it without the
+    // caller running `check_rule_entries` first.
+    let world = world_of(
+        vec![("test:surface", realm())],
+        rules(CELLS),
+        vec![(
+            "test:orphan",
+            RuleEntry {
+                rule: id("test:gone"),
+                entry: Entry::new(id("test:plains"), 1),
+                version: 1,
+            },
+        )],
+        kind_entries(),
+    );
+    let message = try_generator(&world, SEED, RegionSettings::default())
+        .err()
+        .expect("refused")
+        .to_string();
+    assert!(
+        message.contains("test:orphan names selector_rule test:gone, which is not registered"),
+        "{message}"
+    );
 }
 
 #[test]

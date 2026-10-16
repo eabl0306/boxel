@@ -414,8 +414,9 @@ pub(crate) fn resolve<Cx: Context>(
 }
 
 /// The check that every [`RuleEntry`] names a registered rule ([`Problem::Unknown`] with the
-/// entry as the one that names it): an entry for a missing rule would never be read. Run once at
-/// world open, not per realm.
+/// entry as the one that names it): an entry for a missing rule would never be read.
+/// [`RegionGenerator::build`](super::RegionGenerator::build) runs it (each realm's build finds the
+/// same problems, and [`Checks`] reports each once).
 pub fn check_rule_entries(
     checks: &mut Checks,
     rules: &GenRegistry<SelectorRule>,

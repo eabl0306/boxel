@@ -6,7 +6,7 @@ use super::decorate::{
 };
 use super::kind::{Context, HeightQ, KindGrid, TerrainKind, block_of};
 use super::memo::{self, Point, WindowPoints};
-use super::select::{self, RuleEntry, Selector, SelectorRule};
+use super::select::{self, RuleEntry, Selector, SelectorRule, check_rule_entries};
 use super::{CODE_VERSION, DEFAULT_LATTICE_SHIFT, MAX_LATTICE_SHIFT, MIN_LATTICE_SHIFT, check};
 use crate::query::{ColumnInfo, WorldQuery};
 use crate::realm::{FluidRule, RealmSpec, RealmStack, check_floors};
@@ -139,7 +139,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
     /// The generator of `spec.realm`, with the Context `context` builds from the realm's seed,
     /// or `None` with every problem recorded in `checks` (the realm, the rules and entries the
     /// realm reaches, their kinds and parameters, the kinds' forms, limits, slopes and border
-    /// reliefs). Its digest lines ([`RegionGenerator::digest`]) are those of the realm: the realm,
+    /// reliefs, and every added entry that names a missing rule: [`check_rule_entries`]). Its digest lines ([`RegionGenerator::digest`]) are those of the realm: the realm,
     /// its `region` settings, its `context`, its rules and entries, its kinds and its stages.
     ///
     /// # Panics
@@ -208,6 +208,8 @@ impl<Cx: Context> RegionGenerator<Cx> {
                 surface.1.version(),
                 hash_params(&*surface.1),
             ));
+        // Once per world would do; a problem two realms find is reported once.
+        check_rule_entries(checks, rules, entries);
         let resolved = select::resolve(
             checks,
             &mut digest,
