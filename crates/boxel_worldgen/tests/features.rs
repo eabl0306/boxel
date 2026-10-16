@@ -6,21 +6,28 @@
 //!   features only add blocks over the ground;
 //! - a tree across chunk and layer borders is whole whichever chunk is generated first, on any
 //!   thread, with the memo cold or off; the same chunks in any order on any thread with any memo;
+//! - the far LOD: a run over the coarse ground drawn as cells, under the fluid too;
 //! - the digest line, the order by priority, the block names, duplicates and the declared reach;
 //! - the debug checks: a block outside the reach, a column height under the features or over the
 //!   declared height.
 #[path = "support/region.rs"]
 mod support;
 
-use boxel_voxel::{BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, LocalPos};
+use boxel_voxel::{
+    BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, DimensionId, LocalPos,
+};
 use boxel_worldgen::WorldGenerator;
 use boxel_worldgen::field::Rect;
+use boxel_worldgen::lod::{LodNode, LodRequest, LodScratch, LodSource};
 use boxel_worldgen::noise::splitmix64;
 use boxel_worldgen::region::{
-    ChunkColumns, Context, Decoration, FeatureReach, FeatureStage, HEIGHT_ONE, RegionGenerator,
-    RegionSettings, RegionSpec, clear_worker_memo,
+    ChunkColumns, Context, Decoration, Entry, FeatureReach, FeatureStage, FlatKind, FloorFill,
+    HEIGHT_ONE, NoSurface, RegionGenerator, RegionSettings, RegionSpec, RuleEntry, Scope,
+    SelectorRule, TerrainKind, clear_worker_memo,
 };
-use boxel_worldgen::registry::{Checks, GenEntry, HashParams, Order, ParamsHasher};
+use boxel_worldgen::registry::{
+    Checks, GenEntry, GenRegistryBuilder, HashParams, Order, ParamsHasher,
+};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use support::*;
@@ -390,6 +397,154 @@ fn featured_chunks_are_the_same_in_any_order_on_any_thread_with_any_memo() {
         assert_eq!(fingerprints(&g, &order, threads, false), reference, "warm");
         assert_eq!(fingerprints(&off, &order, threads, false), reference, "off");
     }
+}
+
+// ---- The far LOD ------------------------------------------------------------------------------
+
+/// A realm of one flat kind at `height` blocks under `()`, with the test realm's sea at y 0, no
+/// surface stage and `features`.
+fn flat(height: i32, features: Groves) -> RegionGenerator<()> {
+    let mut checks = Checks::new();
+    let mut realms = GenRegistryBuilder::new("realm");
+    realms.register(id("test:surface"), realm());
+    let mut rules = GenRegistryBuilder::new("selector_rule");
+    rules.register(
+        id("test:all"),
+        SelectorRule {
+            realm: id("test:surface"),
+            priority: 0,
+            condition: Vec::new(),
+            scope: Scope::CELL,
+            entries: vec![Entry::new(id("test:flat"), 1)],
+            version: 1,
+        },
+    );
+    let mut kinds = GenRegistryBuilder::new("terrain_kind");
+    kinds.register(
+        id("test:flat"),
+        Arc::new(FlatKind::blocks(height)) as Arc<dyn TerrainKind<()>>,
+    );
+    let (realms, rules, entries, kinds) = (
+        checks.freeze(realms).unwrap(),
+        checks.freeze(rules).unwrap(),
+        checks
+            .freeze(GenRegistryBuilder::<RuleEntry>::new("selector_entry"))
+            .unwrap(),
+        checks.freeze(kinds).unwrap(),
+    );
+    let decoration = Decoration::new(
+        (id("test:fill"), Arc::new(FloorFill)),
+        (id("test:none"), Arc::new(NoSurface)),
+    )
+    .with_feature(id("test:groves"), Arc::new(features));
+    let g = RegionGenerator::build(
+        RegionSpec {
+            seed: SEED,
+            dimension: &id("test:overworld"),
+            realm: &id("test:surface"),
+            realms: &realms,
+            rules: &rules,
+            entries: &entries,
+            kinds: &kinds,
+            blocks: &registry(),
+            decoration,
+            settings: RegionSettings::default(),
+        },
+        |_| (),
+        &mut checks,
+    );
+    checks.finish().expect("opens");
+    g.expect("no problem")
+}
+
+/// The cells of cell column `(x, z)` (`0..32` each) of node column `[0, 0]` of `level`, from
+/// `y0` up by cells, `n` of them.
+fn cells_up(
+    g: &RegionGenerator<()>,
+    level: u8,
+    (x, z): (i32, i32),
+    y0: i64,
+    n: i64,
+) -> Vec<BlockState> {
+    let registry = registry();
+    let s = 1i64 << level;
+    let shift = 5 + u32::from(level);
+    let req = LodRequest {
+        dim: DimensionId(0),
+        level,
+        column: [0, 0],
+        layers: -4..=4,
+    };
+    let mut layers = std::collections::HashMap::new();
+    let band = g.column(
+        &req,
+        &registry,
+        &mut LodScratch::default(),
+        &mut |layer, node| {
+            let cells = match node {
+                LodNode::Uniform(state) => vec![state; 32],
+                LodNode::Cells(cells) => (0..32).map(|y| cells.get(x, y, z)).collect(),
+            };
+            layers.insert(layer, cells);
+        },
+    );
+    (0..n)
+        .map(|k| {
+            let y = y0 + k * s;
+            let layer = y >> shift;
+            match layers.get(&layer) {
+                Some(cells) => cells[((y - (layer << shift)) / s) as usize],
+                None => band
+                    .uniform_at(layer)
+                    .expect("in a layer or out of the band"),
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn a_run_stands_over_the_coarse_ground_as_cells() {
+    let registry = registry();
+    let (solid, cutout, fluid) = (
+        registry.by_name("test:solid").unwrap(),
+        registry.by_name("test:cutout").unwrap(),
+        registry.by_name("test:fluid").unwrap(),
+    );
+    let air = BlockState::AIR;
+    // Dry ground at y 40: the run of 6 is y 41 to 46.
+    let dry = flat(40, Groves::new(4, 6));
+    assert_eq!(
+        cells_up(&dry, 1, (5, 7), 36, 7),
+        [solid, solid, cutout, cutout, cutout, cutout, air],
+        "level 1, from y 36"
+    );
+    assert_eq!(
+        cells_up(&dry, 4, (5, 7), 16, 3),
+        [solid, cutout, air],
+        "level 4, from y 16"
+    );
+    // Without a run: the ground alone, its top cell y 40 and 41.
+    let bare = flat(40, Groves::new(4, 0));
+    assert_eq!(cells_up(&bare, 1, (5, 7), 38, 3), [solid, solid, air]);
+    // A sea floor at y -10 with a run on wet cells: the run up to y -4, the sea over it.
+    let wet = flat(
+        -10,
+        Groves {
+            wet_runs: true,
+            ..Groves::new(4, 6)
+        },
+    );
+    assert_eq!(
+        cells_up(&wet, 1, (5, 7), -12, 7),
+        [solid, cutout, cutout, cutout, fluid, fluid, fluid],
+        "level 1, from y -12"
+    );
+    // A dry run is not given on wet cells.
+    let dry_runs = flat(-10, Groves::new(4, 6));
+    assert_eq!(
+        cells_up(&dry_runs, 1, (5, 7), -12, 3),
+        [solid, fluid, fluid]
+    );
 }
 
 // ---- Registries and order ---------------------------------------------------------------------

@@ -24,14 +24,18 @@
 //! 6. The shape modifiers' coarse forms ([`ShapeModifier::lod`](super::ShapeModifier::lod)), then
 //!    the realm's fluid rule on the corners without margin (a cell is wet when its 4 corners lie
 //!    under the level, so coasts do not move with the level), then the surface stage's
-//!    [`SurfaceStage::lod_top`](super::SurfaceStage::lod_top). A wet cell's ground is its highest
-//!    corner's, without margin, so under the level: with a margin a shallow floor would reach the
-//!    surface row far away and the sea would show as land.
-//! 7. One pass of the cell rule (the demo's surface, generalized): a cell holding ground is solid
-//!    with the state of its highest Solid block (the runs of the surface stage, then the realm's
-//!    floor), or the fluid when the realm's fluid covers its ground; a cell over the ground is the
-//!    fluid if the fluid fills half of it, else air. A node with no air cell (border included)
-//!    and no fluid inside draws nothing and is emitted `Uniform(floor)`.
+//!    [`SurfaceStage::lod_top`](super::SurfaceStage::lod_top), then the feature stages'
+//!    [`FeatureStage::lod_runs`](super::FeatureStage::lod_runs): the tallest Solid run of a cell
+//!    column stands over its coarse ground (its margin and rise included), as cells of its own. A
+//!    wet cell's ground is its highest corner's, without margin, so under the level: with a margin
+//!    a shallow floor would reach the surface row far away and the sea would show as land.
+//! 7. One pass of the cell rule (the demo's surface, generalized): a cell holding a feature run
+//!    is solid with the run's state, unless the realm's fluid covers the run inside the cell; a
+//!    cell holding ground is solid with the state of its highest Solid block (the runs of the
+//!    surface stage, then the realm's floor), or the fluid when the realm's fluid covers its
+//!    ground; a cell over the ground and the run is the fluid if the fluid fills half of it, else
+//!    air. A node with no air cell (border included) and no fluid inside draws nothing and is
+//!    emitted `Uniform(floor)`.
 //!
 //! The band: under the rock of every padded column, the realm's floor (`below`); over every
 //! column's ground and fluid, air. Clipped to the realm's span: no cell at or over the top plane
@@ -95,6 +99,10 @@ pub(crate) struct Col {
     pub(crate) wet: i64,
     /// Its surface stage's runs from `h` down: an index into [`Slots::runs`] (columns share them).
     runs: u32,
+    /// The `y` of the top of its feature run (`t + 1..=canopy_top`), `t` without one.
+    pub(crate) canopy_top: i64,
+    /// Its feature run's state (Solid), air without one.
+    pub(crate) canopy: BlockState,
 }
 
 /// A surface stage's runs from a column's ground down, classified: state, blocks, Solid.
@@ -134,6 +142,8 @@ impl Col {
         rock: 0,
         wet: i64::MIN,
         runs: 0,
+        canopy_top: 0,
+        canopy: BlockState::AIR,
     };
 
     /// Whether the realm's fluid covers it.
@@ -141,9 +151,13 @@ impl Col {
         self.wet != i64::MIN
     }
 
-    /// Its highest block: ground or fluid.
+    /// Its highest block: ground, feature run or fluid.
     const fn top(&self) -> i64 {
-        if self.wet > self.t { self.wet } else { self.t }
+        if self.wet > self.canopy_top {
+            self.wet
+        } else {
+            self.canopy_top
+        }
     }
 }
 
@@ -197,13 +211,15 @@ impl LatticeCell {
     }
 }
 
-/// The buffers of the surface stage's call, per cell column ([`LodColumns`]).
+/// The buffers of the surface and feature stages' calls, per cell column ([`LodColumns`]).
 #[derive(Clone, Debug, Default)]
 struct Look {
     corner: Vec<u32>,
     ground: Vec<i64>,
     fluid_top: Vec<i64>,
     tops: Vec<LodTop>,
+    /// One feature stage's runs.
+    canopies: Vec<(BlockState, u32)>,
 }
 
 /// What one generator keeps on a LOD worker (module docs).
@@ -324,6 +340,7 @@ impl<Cx: Context> LodMemo<Cx> {
             + s.look.corner.capacity() * size_of::<u32>()
             + (s.look.ground.capacity() + s.look.fluid_top.capacity()) * size_of::<i64>()
             + s.look.tops.capacity() * size_of::<LodTop>()
+            + s.look.canopies.capacity() * size_of::<(BlockState, u32)>()
             + s.blocks.as_ref().map_or(0, |(_, b)| {
                 b.classes.len() * size_of::<(LodClass, BlockState)>()
             })
@@ -799,6 +816,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
             ground,
             fluid_top,
             tops,
+            canopies,
         } = &mut slots.look;
         corner.resize(EDGE * EDGE, 0);
         ground.resize(EDGE * EDGE, 0);
@@ -831,6 +849,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
                 col.h = h;
                 col.t = t;
                 col.wet = wet;
+                col.canopy_top = t;
             }
         }
         let columns = LodColumns {
@@ -846,6 +865,19 @@ impl<Cx: Context> RegionGenerator<Cx> {
         };
         self.surface.lod_top(&columns, registry, tops);
         let blocks = &slots.blocks.as_ref().expect("set by lod_prepare").1;
+        // The feature stages' runs over the coarse grounds: the tallest Solid one of each column.
+        for f in &self.features {
+            canopies.clear();
+            canopies.resize(EDGE * EDGE, (BlockState::AIR, 0));
+            f.stage.lod_runs(&columns, f.seed, registry, canopies);
+            for (col, &(state, n)) in slots.cols.iter_mut().zip(canopies.iter()) {
+                let top = col.t.saturating_add(i64::from(n));
+                if top > col.canopy_top && blocks.classes.class(state) == LodClass::Solid {
+                    col.canopy_top = top;
+                    col.canopy = state;
+                }
+            }
+        }
         // The runs, classified once for the columns that share them (most do): a column looks
         // among the last few kept, else keeps its own.
         slots.runs.clear();
@@ -894,17 +926,21 @@ impl<Cx: Context> RegionGenerator<Cx> {
         if y1 <= c.rock {
             return blocks.floor;
         }
-        if y0 > c.t {
-            // No ground: the fluid if it fills half of the cell.
-            return if c.is_wet() && 2 * (c.wet.min(y1) - y0.max(c.t + 1) + 1) >= s {
+        if y0 > c.canopy_top {
+            // No ground and no feature run: the fluid if it fills half of the cell.
+            return if c.is_wet() && 2 * (c.wet.min(y1) - y0.max(c.canopy_top + 1) + 1) >= s {
                 blocks.fluid
             } else {
                 BlockState::AIR
             };
         }
-        // The fluid over the ground, one block deep over every column at least.
-        if c.is_wet() && c.t < y1 && c.wet >= y0 {
+        // The fluid over the ground or the run, one block deep over every column at least.
+        if c.is_wet() && c.canopy_top < y1 && c.wet > c.canopy_top && c.wet >= y0 {
             return blocks.fluid;
+        }
+        // A feature run in the cell: its blocks lie over every block of the ground.
+        if c.canopy_top > c.t && y1 > c.t {
+            return c.canopy;
         }
         // The highest Solid block that may lie in `y0..=min(y1, t)`. A column's ground may stand
         // anywhere from `h` up to `t` (the margin and the rise), so a run `d` blocks under the
