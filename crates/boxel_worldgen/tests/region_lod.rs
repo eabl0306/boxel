@@ -26,8 +26,9 @@ use boxel_worldgen::lod::{LodColumn, LodNode, LodRequest, LodScratch, LodSource}
 use boxel_worldgen::realm::{FluidRule, RealmLod, RealmSpan, RealmSpec, RealmStack};
 use boxel_worldgen::region::{
     Decoration, DimensionGenerator, Entry, FlatKind, FloorFill, HEIGHT_ONE, HeightQ, KindGrid,
-    LodReport, NoSurface, RegionGenerator, RegionSettings, RegionSpec, RuleEntry, Scope,
-    SelectorRule, ShapeEffect, ShapeModifier, TerrainKind, TopLayers, check_lod, lod_corners,
+    LodReport, MIN_LATTICE_SHIFT, NoSurface, RegionGenerator, RegionSettings, RegionSpec,
+    RuleEntry, Scope, SelectorRule, ShapeEffect, ShapeModifier, TerrainKind, TopLayers, check_lod,
+    lod_corners,
 };
 use boxel_worldgen::registry::{
     Checks, DigestBuilder, GenEntry, GenRegistryBuilder, HashParams, Order, ParamsHasher,
@@ -513,9 +514,10 @@ fn a_shape_modifier_reaches_points_chunks_and_bounds() {
     );
 }
 
-/// Past cells of a lattice cell (level 9 and up at the default lattice) the pass reads the kinds
-/// at the corners alone: never asked for today (`MAX_LEVELS` is 6), but it answers, in bounded
-/// time, with its debug checks on (every top over its corners) and bands that hold the ground.
+/// Past cells of two lattice cells (level 10 and up at the default lattice) the pass reads the
+/// corners' boxes alone: never asked for today (`MAX_LEVELS` is 6), but it answers, in bounded
+/// time, with the chunks' corners, its debug checks on (every top over its corners) and bands
+/// that hold the ground.
 #[test]
 fn levels_beyond_a_lattice_cell_read_the_corners() {
     let registry = registry();
@@ -531,8 +533,76 @@ fn levels_beyond_a_lattice_cell_read_the_corners() {
             );
             assert!(band.lo < band.hi, "level {level} {column:?}: {band:?}");
             assert!(cells > 0, "level {level} {column:?}: no cells");
+            let corners = lod_corners(&g, &registry, &request(level, column));
+            for ((x, z), h) in corners.into_iter().step_by(5) {
+                assert_eq!(
+                    h,
+                    g.column_info(x, z).height,
+                    "level {level} corner ({x}, {z})"
+                );
+            }
         }
     }
+}
+
+/// The test world on the smallest lattice (32 blocks), with kinds whose relief the slope check
+/// lets meet there.
+fn small_lattice() -> RegionGenerator<TestContext> {
+    let kinds: Vec<(&str, Arc<dyn TerrainKind<TestContext>>)> = vec![
+        ("test:plains", Arc::new(Relief::blocks(6, 4, 512, 2))),
+        ("test:hills", Arc::new(Relief::blocks(80, 10, 256, 2))),
+        ("test:basin", Arc::new(Relief::blocks(-10, 5, 512, 2))),
+    ];
+    let world = world_of(
+        vec![("test:surface", realm())],
+        rules(CELLS),
+        Vec::new(),
+        kinds,
+    );
+    let settings = RegionSettings {
+        lattice: MIN_LATTICE_SHIFT,
+        ..RegionSettings::default()
+    };
+    generator(&world, SEED, settings)
+}
+
+#[test]
+fn cells_larger_than_the_lattice_keep_the_chunks_corners_and_sound_tops() {
+    let registry = registry();
+    let g = small_lattice();
+    // Level 6 (cells of 2 lattice cells: the pass reads every lattice point) and level 7 (the
+    // corners' boxes alone).
+    for level in [6u8, 7] {
+        for node in nodes_with(&g, level, 2, [3, -5], 2) {
+            for ((x, z), h) in lod_corners(&g, &registry, &request(level, node)) {
+                assert_eq!(
+                    h,
+                    g.column_info(x, z).height,
+                    "level {level} node {node:?} corner ({x}, {z})"
+                );
+            }
+        }
+    }
+    // Cells next to a corner whose box holds a kind other than its own (found by brute force:
+    // with the corners' own kinds alone, their coarse ground stood up to 33 blocks under the
+    // real one, and their corners up to 43 blocks off).
+    let columns = [
+        (6080, -10304),
+        (6016, -10304),
+        (10624, -7424),
+        (10560, -7424),
+        (11520, -7936),
+        (7552, -10048),
+        (7488, -10048),
+        (7552, -8192),
+        (7616, -8192),
+        (8832, 4736),
+        (8832, 4800),
+    ];
+    report(
+        "level 6 on a 32-block lattice",
+        check_lod(&g, &registry, &columns, 6..=6),
+    );
 }
 
 // ---- Determinism and the memo ------------------------------------------------------------------

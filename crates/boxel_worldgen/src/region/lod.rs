@@ -7,8 +7,8 @@
 //!    the chunks' formula, so a corner on a chunk column gets the chunk's bits. A lattice cell
 //!    whose window holds one kind is interior: no weight, no blend (the per-block interior test:
 //!    a lattice cell is `L / s` cells on a side, at least 4 x 4 cells up to level 6 at the default
-//!    lattice). From cells as large as the lattice, every corner is a lattice point and `c_k` is
-//!    a box count.
+//!    lattice). In cells larger than the lattice, every corner is a lattice point and `c_k` is
+//!    its box's count, so the corners stay the chunks' bit for bit at every level.
 //! 3. Per kind present, [`TerrainKind::lod_heights`](super::TerrainKind::lod_heights) on the
 //!    corners of the lattice cells whose window holds it (a mask), with its margin per cell.
 //! 4. The exact blend of the corner heights.
@@ -16,10 +16,11 @@
 //!    inside a cell `H <= sum_k c_k T_k / (9 L^2)`, with `T_k` the largest corner of kind `k` plus
 //!    its margin. While a cell lies in one lattice cell (cells of at most `L` blocks: level 8 at
 //!    the default lattice) the bound is bilinear and its largest value is at a corner: the top is
-//!    the largest of the 4 corners' `sum_k c_k T_k / (9 L^2)`. Beyond, the selection reads only
-//!    the corners (every corner is a lattice point) and the top is the largest `T_k` of the kinds
-//!    at the corners: an approximation that may miss a kind inside a cell, never asked for today
-//!    (`MAX_LEVELS` is 6).
+//!    the largest of the 4 corners' `sum_k c_k T_k / (9 L^2)`. A cell of 2 lattice cells a side
+//!    (level 9 at the default lattice, level 6 at the smallest) reads every lattice point and
+//!    takes the same bound over the lattice cells inside it. Larger cells read the corners' boxes
+//!    alone and take the largest `T_k` of their kinds: an approximation that may miss a kind two
+//!    lattice points or more from every corner, never asked for today (`MAX_LEVELS` is 6).
 //! 6. The shape modifiers' coarse forms ([`ShapeModifier::lod`](super::ShapeModifier::lod)), then
 //!    the realm's fluid rule on the corners without margin (a cell is wet when its 4 corners lie
 //!    under the level, so coasts do not move with the level), then the surface stage's
@@ -441,7 +442,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
         if s <= 1i64 << self.shift {
             self.lod_blend(level, (px, pz), slots);
         } else {
-            self.lod_corners_only(level, slots);
+            self.lod_lattice_corners(level, (px, pz), slots);
         }
         self.lod_shape(level, slots);
         self.lod_columns(level, registry, slots);
@@ -636,44 +637,113 @@ impl<Cx: Context> RegionGenerator<Cx> {
         }
     }
 
-    /// Steps 2 to 5 for cells larger than a lattice cell: the kinds at the corners alone (module
-    /// docs).
-    fn lod_corners_only(&self, level: u8, slots: &mut Slots<Cx>) {
+    /// Steps 2 to 5 for cells larger than a lattice cell, `m = s / L` lattice cells a side (module
+    /// docs). Every corner is a lattice point `q`, so its weights are its box's counts (`c_k =
+    /// n_k(q) L^2`, the chunks' formula at `fx = fz = 0`) and its height is the chunks'. With `m =
+    /// 2` the corners' boxes hold every lattice point, and inside each lattice cell of a cell the
+    /// bound `sum_k c_k T_k` is bilinear with its corners at lattice points: the top is the largest
+    /// `sum_k n_k(q) T_k / 9` over the lattice points of the closed cell. From `m = 4` the pass
+    /// reads the corners' boxes alone and the top is the largest `T_k` of their kinds.
+    fn lod_lattice_corners(&self, level: u8, (px, pz): (i64, i64), slots: &mut Slots<Cx>) {
         let ls = self.shift;
-        let mut at = vec![0u32; CORNERS * CORNERS];
-        for (a, row) in at.as_chunks_mut::<CORNERS>().0.iter_mut().enumerate() {
-            for (b, k) in row.iter_mut().enumerate() {
-                *k = self.selector.select(&self.cx, slots.xs[a], slots.zs[b]);
+        let m = 1i64 << (u32::from(level) - ls);
+        let full = m == 2;
+        // The lattice points read along an axis, ascending: each corner's and its two neighbors
+        // (with `m = 2`, every one), and the corners' positions among them.
+        let axis = |p: i64| {
+            let mut v: Vec<i64> = (0..CORNERS as i64)
+                .flat_map(|c| ((p >> ls) + c * m - 1)..=((p >> ls) + c * m + 1))
+                .collect();
+            v.dedup();
+            let at = (0..CORNERS as i64)
+                .map(|c| v.binary_search(&((p >> ls) + c * m)).expect("read"))
+                .collect::<Vec<usize>>();
+            (v, at)
+        };
+        let ((is, ca), (js, cb)) = (axis(px), axis(pz));
+        let nj = js.len();
+        let mut kinds = vec![0u32; is.len() * nj];
+        for (a, &i) in is.iter().enumerate() {
+            for (b, &j) in js.iter().enumerate() {
+                kinds[a * nj + b] = self.lod_lattice_kind(&mut slots.lattice, i, j);
             }
         }
-        debug_assert!(slots.xs.iter().all(|x| x & ((1 << ls) - 1) == 0));
+        // The points a cell's bound reads along an axis: the positions from its first corner to
+        // its last, by `step`: every one with `m = 2`, else the two corners.
+        let step = |c: &[usize], a: usize| if full { 1 } else { c[a + 1] - c[a] };
+        // The kinds and counts of the box around each point a bound reads (by kind index): the
+        // corners and, with `m = 2`, every point between them.
+        let used = |c: &[usize]| -> Vec<usize> {
+            if full {
+                (c[0]..=c[EDGE]).collect()
+            } else {
+                c.to_vec()
+            }
+        };
+        let mut boxes: Vec<Vec<(u32, i64)>> = vec![Vec::new(); is.len() * nj];
+        let ub = used(&cb);
+        for a in used(&ca) {
+            for &b in &ub {
+                let counts = &mut boxes[a * nj + b];
+                for &k in (a - 1..=a + 1).flat_map(|a| &kinds[a * nj + b - 1..=a * nj + b + 1]) {
+                    match counts.iter_mut().find(|c| c.0 == k) {
+                        Some(c) => c.1 += 1,
+                        None => counts.push((k, 1)),
+                    }
+                }
+            }
+        }
+        let (ca, cb) = (ca.as_slice(), cb.as_slice());
+        let points = |a: usize, b: usize| {
+            let (sa, sb) = (step(ca, a), step(cb, b));
+            (ca[a]..=ca[a + 1])
+                .step_by(sa)
+                .flat_map(move |i| (cb[b]..=cb[b + 1]).step_by(sb).map(move |j| i * nj + j))
+        };
+        // Each kind of a cell's boxes on the cell's 4 corners.
         for a in 0..EDGE {
             for b in 0..EDGE {
-                let corners = [(a, b), (a + 1, b), (a, b + 1), (a + 1, b + 1)];
-                for (ka, kb) in corners {
-                    let mask = slots.kinds[at[ka * CORNERS + kb] as usize].mark();
-                    for (ca, cb) in corners {
-                        mask[ca * CORNERS + cb] = true;
+                for q in points(a, b) {
+                    for &(k, _) in &boxes[q] {
+                        let mask = slots.kinds[k as usize].mark();
+                        for c in [a * CORNERS + b, (a + 1) * CORNERS + b] {
+                            mask[c..=c + 1].fill(true);
+                        }
                     }
                 }
             }
         }
         self.lod_kind_heights(level, slots);
-        for (c, &k) in at.iter().enumerate() {
-            slots.corners[c] = slots.kinds[k as usize].heights[c];
+        for a in 0..CORNERS {
+            for b in 0..CORNERS {
+                let c = a * CORNERS + b;
+                let sum: i64 = boxes[ca[a] * nj + cb[b]]
+                    .iter()
+                    .map(|&(k, n)| n * i64::from(slots.kinds[k as usize].heights[c]))
+                    .sum();
+                // `c_k = n_k L^2`: the chunks' blend, so their bits.
+                slots.corners[c] = blend::blend(sum << (2 * ls), ls);
+            }
         }
         for a in 0..EDGE {
             for b in 0..EDGE {
-                let k = a * CORNERS + b;
-                let mut top = i64::MIN;
-                for c in [k, k + CORNERS, k + 1, k + CORNERS + 1] {
-                    let slot = &slots.kinds[at[c] as usize];
-                    top = top.max(
-                        i64::from(max4(&slot.heights, a, b))
-                            + i64::from(slot.margins[a * EDGE + b]),
-                    );
-                }
-                slots.tops[a * EDGE + b] = top;
+                let at = a * EDGE + b;
+                let t = |k: u32| {
+                    let slot = &slots.kinds[k as usize];
+                    i64::from(max4(&slot.heights, a, b)) + i64::from(slot.margins[at])
+                };
+                slots.tops[at] = if full {
+                    points(a, b)
+                        .map(|q| boxes[q].iter().map(|&(k, n)| n * t(k)).sum::<i64>())
+                        .max()
+                        .expect("9 points")
+                        .div_euclid(blend::BOX)
+                } else {
+                    points(a, b)
+                        .flat_map(|q| boxes[q].iter().map(|&(k, _)| t(k)))
+                        .max()
+                        .expect("4 points")
+                };
             }
         }
     }
