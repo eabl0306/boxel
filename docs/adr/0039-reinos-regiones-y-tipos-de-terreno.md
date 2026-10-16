@@ -1,9 +1,10 @@
 # ADR 0039: reinos, regiones y tipos de terreno
 
 - Estado: aceptado (issue #117). El dueño aprobó el plan de generación v2 el 2026-10-15, con el
-  diseño B como base y todas las recomendaciones del plan. Es un contrato: el código todavía no
-  existe. Lo construyen los pasos de la sección 20, cada uno en su rama, y cada parte protegida
-  pide su propio OK cuando le toca.
+  diseño B como base y todas las recomendaciones del plan. Es un contrato. Lo construyen los
+  pasos de la sección 20, cada uno en su rama, y cada parte protegida pide su propio OK cuando le
+  toca. Hechos: WG1, WG-REG y WG-REGION (#119); donde el código precisó el contrato, este texto
+  ya lo dice.
 - Fecha: 2026-10-15
 - Revisa: ADR 0024 sección 4 y ADR 0029 sección 7 (una clave de metadatos reservada más,
   `boxel:worldgen`).
@@ -54,7 +55,8 @@ ejemplos de acá usan nombres `game:`.
 ```
 WorldPreset (game:default, game:large_biomes, ...)  se elige al crear el mundo, se guarda por id
  `- dimensión -> DimensionDef + spec del generador  una dimensión cargada a la vez
-    `- RealmStack: reinos ordenados por y           un generador por dimensión, despacha por reino
+    `- DimensionGenerator: RealmStack + un generador  un generador por dimensión, despacha por reino
+       por reino (RealmStack: los reinos ordenados por y)
        `- reino = RealmSpec + RegionGenerator<Cx>   su Context, su mapa de regiones, sus tipos,
                                                     su decoración y su entorno
 ```
@@ -104,7 +106,7 @@ ser +infinito e `y_lo`, -infinito.
   EW-SKYUNDER (secciones 14 y 15). Con un solo reino la unión es el rango de hoy y nada cambia en
   el streaming, la luz ni la lejanía.
 
-`RealmSpec { id, span, form, datum, fluid, floor, sky, lod, env, version }`:
+`RealmSpec { span, form, datum, fluid, floor, sky, lod, env, version }`, registrado bajo su id:
 
 - `span`: los dos planos.
 - `form`, la forma del reino. Los tipos de un reino dan las superficies que pide su forma, y la
@@ -183,18 +185,23 @@ imágenes de V1.
 
 - Una retícula de paso `Ls = 2^ls`, 256 por defecto. Cada punto `q` de la retícula recibe un tipo
   de terreno.
-- Las reglas son datos del juego, y los mods les agregan entradas: `SelectorRule { id, priority,
-  condition, scope, entries }`. `condition` es una conjunción de intervalos enteros sobre
-  parámetros con nombre del Context (`ParamId`, leídos como `i32` en los puntos de la retícula).
+- Las reglas son datos del juego, y los mods les agregan entradas: `SelectorRule { realm,
+  priority, condition, scope, entries, version }`, registrada bajo su id. Cada regla nombra el
+  reino de su mapa, así un mod agrega una regla a un reino sin tocarlo. Una entrada agregada a una
+  regla que ya existe es un `RuleEntry { rule, entry, version }` en su propio registro (un valor
+  registrado no se puede ampliar). `condition` es una conjunción de intervalos enteros sobre
+  parámetros con nombre del Context (ids que el Context declara, leídos como `i32` en los puntos
+  de la retícula).
   Decide la primera regla cuya condición se cumple, en orden `(priority, id)` (sección 11: la
   prioridad más alta primero). Todo mapa tiene una regla de reserva, de prioridad mínima, con
   alcance `Cell` y sin condición, así cada punto recibe un tipo; el chequeo al congelar rechaza un
   mapa sin ella.
 - Alcances (`scope`):
   - `Cell(cs)`: el tipo de la celda de región. Es un campo celular con jitter, de paso 2^cs (2^12
-    por defecto) y deformado por la deformación grande del Context. Cada punto va al sitio más
-    cercano de una ventana de 3 x 3, con distancias exactas en `i128`. Da regiones contiguas de 2 a
-    6 km.
+    por defecto, nunca menos que Ls) y deformado por la deformación grande del Context. Cada punto
+    va al sitio más cercano, exacto (`Cellular::nearest` de WG1). Las celdas salen de la semilla
+    del reino, así las reglas `Cell` de un tamaño leen las mismas celdas. Da regiones contiguas de
+    2 a 6 km.
   - `Point`: un contorno de un campo, muestreado cada Ls (por ejemplo, cordilleras donde el
     levantamiento de las placas pasa un umbral). Una regla `Point` tiene exactamente una entrada:
     con varias entradas con peso, elegía en cada punto y hacía confeti de 256 bloques. El chequeo
@@ -214,7 +221,9 @@ imágenes de V1.
 - `form`: `Height` o `HeightAndVolume`;
 - `limits`: la pendiente máxima, el rango de relieve y el rango de relieve dentro de una banda de
   mezcla;
-- `bounds(cx, q)`: sus cotas de altura, con la de abajo que da `ground_lo` (sección 14);
+- `bounds(cx, seed, q, reach)`: sus cotas de altura a menos de `reach` bloques del punto de
+  retícula q (dos celdas de retícula), con la de abajo que da `ground_lo` (sección 14), y
+  `range(cx)`, sus cotas en todo el mundo (el rango vertical del reino);
 - `heights(grid, mask, out)` y `lod_heights(grid, level, mask, out, margin)`;
 - en los tipos de volumen, `volume(...)` y `lod_runs(...)`.
 
@@ -487,7 +496,7 @@ a mano queda probado sin tests de lejanía a medida.
 
 - `GenId`: un nombre con espacio de nombres y la misma regla que los bloques (`validate_name` de
   `boxel_voxel::registry`). Se registran dimensiones, presets, reinos, tipos de generador,
-  parámetros del Context, reglas del selector, tipos de terreno, envoltorios de tipo, modificadores
+  reglas del selector y sus entradas agregadas, tipos de terreno, envoltorios de tipo, modificadores
   de forma, biomas, etapas de decoración, entornos y etiquetas; más adelante, sets de estructuras
   (#116).
 - `GenRegistry<T>`: lo arman los plugins al construir la app y se congela antes de abrir cualquier
@@ -509,17 +518,25 @@ a mano queda probado sin tests de lejanía a medida.
   su registro (un reino y su entorno pueden llamarse igual).
 - `WorldGenerator::version()` devuelve los 32 bits bajos del digest de su propia dimensión
   (`RegistryDigest::dimension`), así un cambio en otra dimensión no la sube.
+- Lo que no es una entrada de registro tiene igual su línea en el digest del reino: `context` (la
+  versión y los parámetros del Context, que declara sus propios parámetros con nombre), `region`
+  (la versión del código del motor y el paso de la retícula) y las etapas de la decoración.
 
 ### 12. Chequeos al congelar y al abrir
 
 Corren en tiempo de ejecución, no solo en CI: al construir la app para los registros, y al abrir un
 mundo para el conjunto que resuelve su preset. Rechazan:
 
-- ids desconocidos y duplicados;
-- una regla `Point` con más de una entrada;
+- ids desconocidos y duplicados (también un parámetro que el Context no declara y una entrada
+  agregada a una regla que no existe);
+- una regla `Point` con más de una entrada, o una regla `Cell` sin ninguna;
+- un peso fuera de 1 a 64, un tipo dos veces en una regla, y celdas de región más chicas que la
+  retícula;
+- un tipo cuya forma todavía no está hecha, o cuyo relieve en la banda sale de su relieve;
 - envoltorios que apuntan a ranuras que no existen;
 - un par o un trío de tipos que pueden juntarse y no pasan el chequeo de pendiente y relieve de
-  borde (sección 6);
+  borde (sección 6). Las condiciones no dicen dónde se cumplen, así el chequeo toma todo par y
+  todo trío de tipos del reino;
 - términos de núcleo cuyo cono o pendiente propia, sumados a la pendiente de su tipo, rompen el
   tope (sección 7);
 - features sin alcance o sin altura declarados;
@@ -547,8 +564,9 @@ vuelo.
   un mod con una cota mal hecha falla sus tests.
 - **Lado de consultas.** `WorldQuery { height_at(x, z), realm_at(y), biome_at(x, y, z),
   column(x, z) -> ColumnInfo, environment_at(x, y, z) }`: puro, unos 2 us en caliente, por
-  `as_query()`. La búsqueda del spawn, la línea del F3, la niebla y los cambios de entorno lo usan
-  en vez de tipos concretos del demo.
+  `as_query()`. Hasta que exista la tabla `BiomeRule`, `biome_at` da una etiqueta provisoria: el
+  tipo dominante de la columna, que es la entrada de esa tabla. La búsqueda del spawn, la línea
+  del F3, la niebla y los cambios de entorno lo usan en vez de tipos concretos del demo.
 
 ### 14. Cotas verticales por columna
 
@@ -789,7 +807,8 @@ El diseño de las estructuras es de #116. Acá queda solo la puerta.
      (todavía sin store), el contador de construcción y el marco de los chequeos.
   4. WG-REGION: el selector, la mezcla, `RegionGenerator` con tipos de test, `FluidRule`, la pila de
      reinos con la forma `Ground` (un reino `Draw`), las cotas locales, el chequeo de spans, los
-     métodos con defecto y el lado de consultas.
+     métodos con defecto y el lado de consultas. De la decoración, solo las etapas de relleno y
+     de superficie; el resto de las fases llega con quien las pida.
   5. WG-REGIONLOD: la pasada de celdas, las máscaras, el tope bilineal, el término de divisoria con
      el de la deformación, solo tramos de `Ground` y el harness.
   6. WG-SAVE: `boxel:worldgen` sin cambiar el formato y en `RESERVED`, presets, tablas de
