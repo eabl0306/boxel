@@ -22,14 +22,15 @@ use boxel_voxel::{
     BlockRegistry, BlockState, CHUNK_SIZE, ChunkData, ChunkKey, ChunkPos, DimensionId, LocalPos,
     MAX_BLOCK_COORD, MAX_CHUNK_COORD,
 };
-use boxel_worldgen::lod::{LodColumn, LodNode, LodRequest, LodScratch, LodSource};
+use boxel_worldgen::lod::{LodCells, LodColumn, LodNode, LodRequest, LodScratch, LodSource};
+use boxel_worldgen::noise::Warp;
 use boxel_worldgen::realm::{FluidRule, RealmLod, RealmSpan, RealmSpec, RealmStack};
 use boxel_worldgen::region::{
     CarveCorner, ChunkColumns, Decoration, DimensionGenerator, Entry, FlatKind, FloorFill,
     HEIGHT_ONE, HeightQ, KindGrid, LodColumns, LodReport, LodTop, MIN_LATTICE_SHIFT, NoSurface,
     RegionGenerator, RegionSettings, RegionSpec, RuleEntry, Scope, SelectorRule, ShapeEffect,
     ShapeModifier, SurfaceReach, SurfaceStage, TerrainKind, TopLayers, check_lod, divide_tops,
-    lod_corners,
+    lod_corners, warp_slack,
 };
 use boxel_worldgen::registry::{
     Checks, DigestBuilder, GenEntry, GenRegistryBuilder, HashParams, Order, ParamsHasher,
@@ -359,6 +360,11 @@ fn a_surface_reads_the_corners_for_steep_rock() {
 
 /// A flat kind at 40 blocks with the valleys of `valleys`, under `()`, dry.
 fn valley_world(valleys: Valleys) -> RegionGenerator<()> {
+    carved_world(Arc::new(valleys))
+}
+
+/// A flat kind at 40 blocks carved by `modifier`, under `()`, dry, with no surface stage.
+fn carved_world(modifier: Arc<dyn ShapeModifier<()>>) -> RegionGenerator<()> {
     let mut checks = Checks::new();
     let mut realms = GenRegistryBuilder::new("realm");
     realms.register(
@@ -407,7 +413,7 @@ fn valley_world(valleys: Valleys) -> RegionGenerator<()> {
                 (id("test:fill"), Arc::new(FloorFill)),
                 (id("test:none"), Arc::new(NoSurface)),
             )
-            .with_modifier(id("test:valleys"), Arc::new(valleys)),
+            .with_modifier(id("test:valleys"), modifier),
             settings: RegionSettings::default(),
         },
         |_| (),
@@ -457,6 +463,174 @@ fn a_divide_between_two_valleys_keeps_the_coarse_top_over_the_real_one() {
         "without, level 1",
         check_lod(&without, &registry, &columns, 1..=1),
     );
+}
+
+/// [`Valleys`] that meander: the distance of a column is its warped one's, `z` moved by a warp.
+/// Its coarse form takes the warp's slack ([`warp_slack`]) or not.
+#[derive(Clone, Debug)]
+struct Meander {
+    valleys: Valleys,
+    warp: Warp,
+    slack: bool,
+}
+
+impl HashParams for Meander {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&self.valleys)
+            .write(&self.warp.amplitude())
+            .write(&self.slack);
+    }
+}
+
+impl GenEntry for Meander {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+
+impl Meander {
+    /// The nearer valley of column `(x, z)`, warped, and the distance to it.
+    fn nearest(&self, x: i64, z: i64) -> (u64, i64) {
+        self.valleys.nearest(z + self.warp.offset(x, z).1)
+    }
+}
+
+impl ShapeModifier<()> for Meander {
+    fn effect(&self) -> ShapeEffect {
+        ShapeEffect::LowerOnly(self.valleys.depth)
+    }
+    fn apply(&self, grid: &KindGrid<'_, ()>, heights: &mut [HeightQ]) {
+        for (row, &x) in heights.chunks_exact_mut(grid.zs.len()).zip(grid.xs) {
+            for (h, &z) in row.iter_mut().zip(grid.zs) {
+                *h = self.valleys.carve(i64::from(*h), self.nearest(x, z).1) as HeightQ;
+            }
+        }
+    }
+    fn lod(&self, grid: &KindGrid<'_, ()>, level: u8, corners: &mut [HeightQ], tops: &mut [i64]) {
+        self.apply(grid, corners);
+        let at: Vec<CarveCorner> = grid
+            .xs
+            .iter()
+            .flat_map(|&x| grid.zs.iter().map(move |&z| (x, z)))
+            .map(|(x, z)| {
+                let (segment, n) = self.nearest(x, z);
+                CarveCorner { segment, n }
+            })
+            .collect();
+        let slack = if self.slack {
+            warp_slack(self.warp.displacement_slope(), 1 << level)
+        } else {
+            0
+        };
+        divide_tops(
+            (grid.xs.len() - 1, grid.zs.len() - 1),
+            &at,
+            slack,
+            tops,
+            |_, _, top, n| self.valleys.carve(top, n),
+        );
+    }
+}
+
+/// The cells of node column `column` of `level` whose coarse top lies under the highest real
+/// ground of their columns (a dry realm with no surface stage: the ground is the top solid
+/// block), as their min corners: every cell, from the chunk columns' heights.
+fn holes_in(g: &RegionGenerator<()>, level: u8, column: [i64; 2]) -> Vec<(i64, i64)> {
+    let registry = registry();
+    let (s, e, shift) = (1i64 << level, 32i64 << level, 5 + u32::from(level));
+    let mut req = request(level, column);
+    let band = g.column(&req, &registry, &mut LodScratch::default(), &mut |_, _| {});
+    req.layers = band.lo..=band.hi - 1;
+    let mut nodes: Vec<(i64, Result<BlockState, Box<LodCells>>)> = Vec::new();
+    g.column(
+        &req,
+        &registry,
+        &mut LodScratch::default(),
+        &mut |layer, node| {
+            let node = match node {
+                LodNode::Uniform(state) => Ok(state),
+                LodNode::Cells(cells) => Err(Box::new(cells.clone())),
+            };
+            nodes.push((layer, node));
+        },
+    );
+    nodes.sort_by_key(|n| std::cmp::Reverse(n.0));
+    let coarse_top = |x: i32, z: i32| {
+        for (layer, node) in &nodes {
+            for y in (0..32).rev() {
+                let state = node
+                    .as_ref()
+                    .map_or_else(|cells| cells.get(x, y, z), |&s| s);
+                if state != BlockState::AIR {
+                    return (layer << shift) + (i64::from(y) + 1) * s;
+                }
+            }
+        }
+        band.lo << shift
+    };
+    let (x0, z0) = (column[0] * e, column[1] * e);
+    let mut ground = vec![i64::MIN; 32 * 32];
+    let mut h = [0; boxel_voxel::CHUNK_AREA];
+    for cx in 0..e >> 5 {
+        for cz in 0..e >> 5 {
+            g.chunk_heights((x0 >> 5) + cx, (z0 >> 5) + cz, &mut h);
+            for (n, &h) in h.iter().enumerate() {
+                let (x, z) = (cx * 32 + (n >> 5) as i64, cz * 32 + (n & 31) as i64);
+                let cell = &mut ground[((x / s) * 32 + z / s) as usize];
+                *cell = (*cell).max(i64::from(h >> 8));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for x in 0..32 {
+        for z in 0..32 {
+            if ground[(x * 32 + z) as usize] >= coarse_top(x, z) {
+                out.push((x0 + i64::from(x) * s, z0 + i64::from(z) * s));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn a_meandering_divide_takes_the_warps_slack() {
+    let registry = registry();
+    let valleys = Valleys {
+        period: 96,
+        gap: 30,
+        width: 14,
+        ..VALLEYS
+    };
+    let nodes = [[0i64, 0], [3, -1], [-2, 1], [5, 2]];
+    let mut missed = Vec::new();
+    for (amplitude, wavelength) in [(12, 64), (20, 96)] {
+        let meander = |slack| Meander {
+            valleys,
+            warp: Warp::new(0x77, fbm(wavelength, 2), amplitude),
+            slack,
+        };
+        let with = carved_world(Arc::new(meander(true)));
+        let without = carved_world(Arc::new(meander(false)));
+        for level in 1..=4u8 {
+            for node in nodes {
+                assert_eq!(holes_in(&with, level, node), [], "level {level} {node:?}");
+                for at in holes_in(&without, level, node) {
+                    missed.push((amplitude, level, at));
+                }
+            }
+        }
+        // The harness sees the cells the coarse form without the slack leaves under the real
+        // ground, and passes them with it.
+        for &(_, level, at) in missed.iter().filter(|m| m.0 == amplitude) {
+            check_lod(&without, &registry, &[at], level..=level).expect_err("caught");
+            report(
+                "with the slack",
+                check_lod(&with, &registry, &[at], level..=level),
+            );
+        }
+    }
+    // Without the slack the warp moves the divide into cells whose corners share a valley.
+    assert!(!missed.is_empty(), "the warp never needed its slack");
 }
 
 #[test]
